@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="canonical" href="https://superbiche.github.io/safe/1.0.0/operations/">
+    <meta name="theme-color" content="#0d0e12">
+    <meta name="darkreader-lock">
+    <title>Operations - safe</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400;1,500;1,600&family=IBM+Plex+Serif:ital,wght@0,300;0,400;0,500;1,300;1,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../css/superbiche.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="site-header">
+      <div class="site-header__inner">
+        <a class="brand" href=".." aria-label="safe home">
+          <span class="brand__signal" aria-hidden="true"></span>
+          <span class="brand__name">safe</span>
+        </a>
+        <a class="header-repo" href="https://github.com/superbiche/safe" aria-label="Source repository">
+          <span>superbiche/safe</span>
+        </a>
+      </div>
+    </header>
+
+    <div class="layout-shell">
+      <aside class="sidebar" aria-label="Documentation navigation">
+        <div class="search-panel">
+          <label class="search-panel__label" for="mkdocs-search-query">Search</label>
+          <input id="mkdocs-search-query" class="search-panel__input" type="search" placeholder="Search docs" autocomplete="off">
+          <div id="mkdocs-search-results" class="search-panel__results" aria-live="polite"></div>
+        </div>
+
+        <nav class="side-nav">
+          
+          <ul class="side-nav__list side-nav__list--level-1">
+            <li class="side-nav__item">
+              <span class="side-nav__section">Home</span>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../architecture/">Architecture</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../installation/">Installation</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../safe-run/">safe-run</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../safe-audit/">safe-audit</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../install-wrappers/">Install Wrappers</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../integration-flows/">Integration Flows</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../configuration/">Configuration</a>
+            </li>
+            <li class="side-nav__item side-nav__item--active">
+              <a class="side-nav__link side-nav__link--current" href="./">Operations</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../publishing/">Publishing</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../command-reference/">Command Reference</a>
+            </li>
+          </ul>
+        </nav>
+      </aside>
+
+      <main id="main-content" class="content-wrap" tabindex="-1">
+        <div class="content-grid">
+          <article class="doc-content">
+            <div class="doc-kicker">
+              <span>operations.md</span>
+            </div>
+            <h1 id="operations">Operations</h1>
+<h2 id="readiness-checks">Readiness Checks</h2>
+<p>Human-readable:</p>
+<pre><code class="language-bash">safe doctor
+</code></pre>
+<p>Machine-readable:</p>
+<pre><code class="language-bash">safe doctor --json
+</code></pre>
+<p><code>doctor</code> checks dispatcher parity, installed component paths, core tools, verifier dependencies, sandbox readiness, installed wrappers, completions, and linked runner state. It does not create config or data directories.</p>
+<h2 id="status">Status</h2>
+<pre><code class="language-bash">safe status
+</code></pre>
+<p>Status combines:</p>
+<ul>
+<li>top-level <code>safe</code> version;</li>
+<li><code>safe-run status</code>;</li>
+<li><code>safe-audit status</code>;</li>
+<li>install-wrapper installation state.</li>
+</ul>
+<h2 id="scanner-setup">Scanner Setup</h2>
+<p>Install or detect scanners on the local default machine:</p>
+<pre><code class="language-bash">safe audit setup
+</code></pre>
+<p>Configured machine:</p>
+<pre><code class="language-bash">safe audit setup remote-a
+safe audit setup --machine remote-a,local
+safe audit setup --all
+</code></pre>
+<p>Create a scanner bundle for machines that cannot download tools directly:</p>
+<pre><code class="language-bash">safe audit setup --create-bundle
+safe audit setup --create-bundle ./scanners.tar.gz
+safe audit setup --machine remote-a --bundle ./scanners.tar.gz
+</code></pre>
+<h2 id="diff-recent-results">Diff Recent Results</h2>
+<pre><code class="language-bash">safe audit diff --machine local --since 30d
+safe audit diff --all --since 7d
+</code></pre>
+<h2 id="logs-and-evidence">Logs And Evidence</h2>
+<p>Runner decisions:</p>
+<pre><code class="language-text">~/.local/share/safe/run/audit.log
+</code></pre>
+<p>Host-allow executions:</p>
+<pre><code class="language-text">~/.local/share/safe/audit/host-allow-log.jsonl
+</code></pre>
+<p>Audit check outputs:</p>
+<pre><code class="language-text">~/.local/share/safe/audit/checks/
+</code></pre>
+<p>Scan results and SBOMs:</p>
+<pre><code class="language-text">~/.local/share/safe/audit/results/&lt;machine&gt;/
+~/.local/share/safe/audit/sbom/&lt;machine&gt;/
+</code></pre>
+<h2 id="maintenance-checks">Maintenance Checks</h2>
+<p>Before committing documentation or shell changes, run the smoke checks that match the touched area:</p>
+<pre><code class="language-bash">bash -n bin/safe bin/safe-run bin/safe-audit install.sh uninstall.sh
+zsh -n lib/install-wrappers.zsh lib/completions/_safe
+bash tests/integration/dispatcher.sh
+bash tests/install/run.sh
+bash tests/audit/smoke.sh
+bash tests/audit/external_binary.sh
+bash tests/run/safe_audit_integration.sh
+git diff --check
+</code></pre>
+<p>Some tests require optional tools such as <code>zsh</code>, <code>curl</code>, <code>tar</code>, <code>sha256sum</code>, or <code>timeout</code>. <code>safe doctor</code> reports feature readiness for the same operational dependencies.</p>
+            <nav class="page-nav" aria-label="Page navigation">
+              <div>
+                <span class="page-nav__label">Previous</span>
+                <a href="../configuration/">Configuration</a>
+              </div>
+              <div>
+                <span class="page-nav__label">Next</span>
+                <a href="../publishing/">Publishing</a>
+              </div>
+            </nav>
+          </article>
+          <aside class="toc-panel" aria-label="Table of contents">
+            <div class="toc-panel__title">On This Page</div>
+            <ul class="toc-panel__list">
+              <li>
+                <a href="#operations">Operations</a>
+                <ul>
+                  <li><a href="#readiness-checks">Readiness Checks</a></li>
+                  <li><a href="#status">Status</a></li>
+                  <li><a href="#scanner-setup">Scanner Setup</a></li>
+                  <li><a href="#diff-recent-results">Diff Recent Results</a></li>
+                  <li><a href="#logs-and-evidence">Logs And Evidence</a></li>
+                  <li><a href="#maintenance-checks">Maintenance Checks</a></li>
+                </ul>
+              </li>
+            </ul>
+          </aside>
+        </div>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <div class="site-footer__grid">
+        <div>
+          <span class="site-footer__label">License</span>
+          <span class="site-footer__value">MIT</span>
+        </div>
+        <div>
+          <span class="site-footer__label">Source</span>
+          <a class="site-footer__value" href="https://github.com/superbiche/safe">superbiche/safe</a>
+        </div>
+        <div>
+          <span class="site-footer__label">Built with</span>
+          <a class="site-footer__value" href="https://www.mkdocs.org">MkDocs</a>
+        </div>
+      </div>
+    </footer>
+    <script>
+      window.superbicheSearch = {
+        enabled: true,
+        baseUrl: ".."
+      };
+      window.superbicheVersions = {
+        enabled: true,
+        baseUrl: ".."
+      };
+    </script>
+    <script src="../js/superbiche.js"></script>
+    <script src="../search/main.js"></script>
+  </body>
+</html>

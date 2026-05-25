@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="canonical" href="https://superbiche.github.io/safe/1.0.0/">
+    <meta name="theme-color" content="#0d0e12">
+    <meta name="darkreader-lock">
+    <title>safe</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400;1,500;1,600&family=IBM+Plex+Serif:ital,wght@0,300;0,400;0,500;1,300;1,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/superbiche.css">
+  </head>
+  <body class="is-homepage">
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="site-header">
+      <div class="site-header__inner">
+        <a class="brand" href="." aria-label="safe home">
+          <span class="brand__signal" aria-hidden="true"></span>
+          <span class="brand__name">safe</span>
+        </a>
+        <a class="header-repo" href="https://github.com/superbiche/safe" aria-label="Source repository">
+          <span>superbiche/safe</span>
+        </a>
+      </div>
+    </header>
+
+    <div class="layout-shell">
+      <aside class="sidebar" aria-label="Documentation navigation">
+        <div class="search-panel">
+          <label class="search-panel__label" for="mkdocs-search-query">Search</label>
+          <input id="mkdocs-search-query" class="search-panel__input" type="search" placeholder="Search docs" autocomplete="off">
+          <div id="mkdocs-search-results" class="search-panel__results" aria-live="polite"></div>
+        </div>
+
+        <nav class="side-nav">
+          
+          <ul class="side-nav__list side-nav__list--level-1">
+            <li class="side-nav__item side-nav__item--active">
+              <span class="side-nav__section">Home</span>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="architecture/">Architecture</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="installation/">Installation</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="safe-run/">safe-run</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="safe-audit/">safe-audit</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="install-wrappers/">Install Wrappers</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="integration-flows/">Integration Flows</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="configuration/">Configuration</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="operations/">Operations</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="publishing/">Publishing</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="command-reference/">Command Reference</a>
+            </li>
+          </ul>
+        </nav>
+      </aside>
+
+      <main id="main-content" class="content-wrap" tabindex="-1">
+        <div class="content-grid">
+          <article class="doc-content">
+            <div class="doc-kicker">
+              <span>index.md</span>
+            </div>
+            <h1 id="safe">safe</h1>
+<p><code>safe</code> is a local security layer for package managers and external binaries.</p>
+<p>It combines three tools:</p>
+<ul>
+<li><code>safe-run</code>: sandboxed package execution for <code>npx</code>, <code>bunx</code>, <code>uvx</code>, and <code>pipx</code>-style workflows.</li>
+<li><code>safe-audit</code>: dependency, SBOM, release, binary, vulnerability, and IOC checks across local and SSH-accessible machines.</li>
+<li>install wrappers: zsh functions that guard persistent package-manager installs before the real command runs.</li>
+</ul>
+<p>The repo installs a top-level <code>safe</code> dispatcher, direct component binaries, one config tree under <code>~/.config/safe</code>, one data tree under <code>~/.local/share/safe</code>, and one zsh completion file.</p>
+<h2 id="start-here">Start Here</h2>
+<p>Clone, inspect, scan, then install:</p>
+<pre><code class="language-bash">git clone &lt;repo-url&gt; safe
+cd safe
+safe audit scan --project .
+bash install.sh
+</code></pre>
+<p>If <code>safe</code> is not already available on the machine, run equivalent local scanners
+before installing. The project is part of the same zero-trust model it enforces.</p>
+<p>Check local readiness:</p>
+<pre><code class="language-bash">safe doctor
+safe status
+</code></pre>
+<p>Run a package in a sandbox:</p>
+<pre><code class="language-bash">safe run repomix@latest -- --help
+</code></pre>
+<p>Scan the current project:</p>
+<pre><code class="language-bash">safe audit scan --project .
+</code></pre>
+<p>Guard persistent package installs:</p>
+<pre><code class="language-bash">source &quot;$HOME/.config/safe/install-wrappers.zsh&quot;
+npm install express
+</code></pre>
+<h2 id="main-safety-idea">Main Safety Idea</h2>
+<p>Unknown package code should not get host access by default. <code>safe</code> prefers sandboxed execution, explicit pinned host allowlists, package checks before install, and auditable records of decisions.</p>
+<p>For release binaries, <code>safe-audit</code> separates source/release review, checksum or Sigstore verification, and networkless binary smoke execution.</p>
+            <nav class="page-nav" aria-label="Page navigation">
+              <div>
+              </div>
+              <div>
+                <span class="page-nav__label">Next</span>
+                <a href="architecture/">Architecture</a>
+              </div>
+            </nav>
+          </article>
+          <aside class="toc-panel" aria-label="Table of contents">
+            <div class="toc-panel__title">On This Page</div>
+            <ul class="toc-panel__list">
+              <li>
+                <a href="#safe">safe</a>
+                <ul>
+                  <li><a href="#start-here">Start Here</a></li>
+                  <li><a href="#main-safety-idea">Main Safety Idea</a></li>
+                </ul>
+              </li>
+            </ul>
+          </aside>
+        </div>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <div class="site-footer__grid">
+        <div>
+          <span class="site-footer__label">License</span>
+          <span class="site-footer__value">MIT</span>
+        </div>
+        <div>
+          <span class="site-footer__label">Source</span>
+          <a class="site-footer__value" href="https://github.com/superbiche/safe">superbiche/safe</a>
+        </div>
+        <div>
+          <span class="site-footer__label">Built with</span>
+          <a class="site-footer__value" href="https://www.mkdocs.org">MkDocs</a>
+        </div>
+      </div>
+    </footer>
+    <script>
+      window.superbicheSearch = {
+        enabled: true,
+        baseUrl: "."
+      };
+      window.superbicheVersions = {
+        enabled: true,
+        baseUrl: "."
+      };
+    </script>
+    <script src="js/superbiche.js"></script>
+    <script src="search/main.js"></script>
+  </body>
+</html>
+
+<!--
+MkDocs version : 1.6.1
+Build Date UTC : 2026-05-25 20:50:47.201397+00:00
+-->

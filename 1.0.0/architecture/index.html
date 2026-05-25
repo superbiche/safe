@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="canonical" href="https://superbiche.github.io/safe/1.0.0/architecture/">
+    <meta name="theme-color" content="#0d0e12">
+    <meta name="darkreader-lock">
+    <title>Architecture - safe</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400;1,500;1,600&family=IBM+Plex+Serif:ital,wght@0,300;0,400;0,500;1,300;1,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../css/superbiche.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="site-header">
+      <div class="site-header__inner">
+        <a class="brand" href=".." aria-label="safe home">
+          <span class="brand__signal" aria-hidden="true"></span>
+          <span class="brand__name">safe</span>
+        </a>
+        <a class="header-repo" href="https://github.com/superbiche/safe" aria-label="Source repository">
+          <span>superbiche/safe</span>
+        </a>
+      </div>
+    </header>
+
+    <div class="layout-shell">
+      <aside class="sidebar" aria-label="Documentation navigation">
+        <div class="search-panel">
+          <label class="search-panel__label" for="mkdocs-search-query">Search</label>
+          <input id="mkdocs-search-query" class="search-panel__input" type="search" placeholder="Search docs" autocomplete="off">
+          <div id="mkdocs-search-results" class="search-panel__results" aria-live="polite"></div>
+        </div>
+
+        <nav class="side-nav">
+          
+          <ul class="side-nav__list side-nav__list--level-1">
+            <li class="side-nav__item">
+              <span class="side-nav__section">Home</span>
+            </li>
+            <li class="side-nav__item side-nav__item--active">
+              <a class="side-nav__link side-nav__link--current" href="./">Architecture</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../installation/">Installation</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../safe-run/">safe-run</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../safe-audit/">safe-audit</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../install-wrappers/">Install Wrappers</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../integration-flows/">Integration Flows</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../configuration/">Configuration</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../operations/">Operations</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../publishing/">Publishing</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../command-reference/">Command Reference</a>
+            </li>
+          </ul>
+        </nav>
+      </aside>
+
+      <main id="main-content" class="content-wrap" tabindex="-1">
+        <div class="content-grid">
+          <article class="doc-content">
+            <div class="doc-kicker">
+              <span>architecture.md</span>
+            </div>
+            <h1 id="architecture">Architecture</h1>
+<p><code>safe</code> is organized around one dispatcher and two direct component CLIs.</p>
+<pre><code class="language-text">safe
+  run      -&gt; safe-run
+  audit    -&gt; safe-audit
+  install  -&gt; safe-run install
+  setup    -&gt; safe-audit setup
+  status   -&gt; combined status
+  doctor   -&gt; local readiness diagnostics
+</code></pre>
+<p>The dispatcher forwards arguments without changing their meaning. Direct binaries remain installed for compatibility and for scripts that intentionally call <code>safe-run</code> or <code>safe-audit</code>.</p>
+<h2 id="components">Components</h2>
+<p><code>safe-run</code> decides how package execution is allowed:</p>
+<ul>
+<li>blocklist entries are refused;</li>
+<li>host allowlist entries run on the host with script execution suppressed where supported;</li>
+<li>unknown packages are checked through <code>safe-audit</code> when possible;</li>
+<li>sandbox-known packages run in Podman without another prompt;</li>
+<li>unknown non-TTY execution blocks unless explicitly allowed by flags.</li>
+</ul>
+<p><code>safe-audit</code> handles evidence gathering and verdicts:</p>
+<ul>
+<li>project and multi-machine scans;</li>
+<li>SBOM generation and vulnerability scans;</li>
+<li>package behavior checks;</li>
+<li>GitHub release and advisory review;</li>
+<li>release asset, Sigstore bundle, and TUF bootstrap verification;</li>
+<li>networkless binary execution;</li>
+<li>IOC updates and scans.</li>
+</ul>
+<p>Install wrappers are zsh functions that shadow package-manager commands. They run <code>safe-audit check</code> for package installs or <code>safe-audit scan --project .</code> for project-local installs, then delegate to the real command with <code>command &lt;tool&gt; "$@"</code>.</p>
+<h2 id="trust-tiers">Trust Tiers</h2>
+<p>Packages move through four persistent tiers:</p>
+<pre><code class="language-text">blocked        never run
+host-allow     pinned versions allowed on the host
+sandbox-known  known enough for sandbox execution
+unknown        prompt in TTY, block in non-TTY
+</code></pre>
+<p><code>blocked.json</code> is shared by <code>safe-run</code> and <code>safe-audit check</code>, so a package blocked during audit is also refused by the runner.</p>
+<h2 id="data-flow">Data Flow</h2>
+<p>Runtime decisions and audit output are intentionally separated from config:</p>
+<ul>
+<li>config: policy and machine state under <code>~/.config/safe</code>;</li>
+<li>data: logs, SBOMs, scan results, package checks, and IOC output under <code>~/.local/share/safe</code>.</li>
+</ul>
+<p>This keeps policy reviewable while allowing high-volume generated evidence to live in data directories.</p>
+            <nav class="page-nav" aria-label="Page navigation">
+              <div>
+                <span class="page-nav__label">Previous</span>
+                <a href="..">Home</a>
+              </div>
+              <div>
+                <span class="page-nav__label">Next</span>
+                <a href="../installation/">Installation</a>
+              </div>
+            </nav>
+          </article>
+          <aside class="toc-panel" aria-label="Table of contents">
+            <div class="toc-panel__title">On This Page</div>
+            <ul class="toc-panel__list">
+              <li>
+                <a href="#architecture">Architecture</a>
+                <ul>
+                  <li><a href="#components">Components</a></li>
+                  <li><a href="#trust-tiers">Trust Tiers</a></li>
+                  <li><a href="#data-flow">Data Flow</a></li>
+                </ul>
+              </li>
+            </ul>
+          </aside>
+        </div>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <div class="site-footer__grid">
+        <div>
+          <span class="site-footer__label">License</span>
+          <span class="site-footer__value">MIT</span>
+        </div>
+        <div>
+          <span class="site-footer__label">Source</span>
+          <a class="site-footer__value" href="https://github.com/superbiche/safe">superbiche/safe</a>
+        </div>
+        <div>
+          <span class="site-footer__label">Built with</span>
+          <a class="site-footer__value" href="https://www.mkdocs.org">MkDocs</a>
+        </div>
+      </div>
+    </footer>
+    <script>
+      window.superbicheSearch = {
+        enabled: true,
+        baseUrl: ".."
+      };
+      window.superbicheVersions = {
+        enabled: true,
+        baseUrl: ".."
+      };
+    </script>
+    <script src="../js/superbiche.js"></script>
+    <script src="../search/main.js"></script>
+  </body>
+</html>

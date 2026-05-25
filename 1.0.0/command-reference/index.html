@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="canonical" href="https://superbiche.github.io/safe/1.0.0/command-reference/">
+    <meta name="theme-color" content="#0d0e12">
+    <meta name="darkreader-lock">
+    <title>Command Reference - safe</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400;1,500;1,600&family=IBM+Plex+Serif:ital,wght@0,300;0,400;0,500;1,300;1,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../css/superbiche.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="site-header">
+      <div class="site-header__inner">
+        <a class="brand" href=".." aria-label="safe home">
+          <span class="brand__signal" aria-hidden="true"></span>
+          <span class="brand__name">safe</span>
+        </a>
+        <a class="header-repo" href="https://github.com/superbiche/safe" aria-label="Source repository">
+          <span>superbiche/safe</span>
+        </a>
+      </div>
+    </header>
+
+    <div class="layout-shell">
+      <aside class="sidebar" aria-label="Documentation navigation">
+        <div class="search-panel">
+          <label class="search-panel__label" for="mkdocs-search-query">Search</label>
+          <input id="mkdocs-search-query" class="search-panel__input" type="search" placeholder="Search docs" autocomplete="off">
+          <div id="mkdocs-search-results" class="search-panel__results" aria-live="polite"></div>
+        </div>
+
+        <nav class="side-nav">
+          
+          <ul class="side-nav__list side-nav__list--level-1">
+            <li class="side-nav__item">
+              <span class="side-nav__section">Home</span>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../architecture/">Architecture</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../installation/">Installation</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../safe-run/">safe-run</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../safe-audit/">safe-audit</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../install-wrappers/">Install Wrappers</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../integration-flows/">Integration Flows</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../configuration/">Configuration</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../operations/">Operations</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../publishing/">Publishing</a>
+            </li>
+            <li class="side-nav__item side-nav__item--active">
+              <a class="side-nav__link side-nav__link--current" href="./">Command Reference</a>
+            </li>
+          </ul>
+        </nav>
+      </aside>
+
+      <main id="main-content" class="content-wrap" tabindex="-1">
+        <div class="content-grid">
+          <article class="doc-content">
+            <div class="doc-kicker">
+              <span>command-reference.md</span>
+            </div>
+            <h1 id="command-reference">Command Reference</h1>
+<h2 id="dispatcher">Dispatcher</h2>
+<pre><code class="language-bash">safe run &lt;args...&gt;
+safe audit &lt;args...&gt;
+safe install [--allow-scripts] &lt;pkg&gt; [...]
+safe setup [&lt;machine&gt; | --all | --machine &lt;csv&gt;]
+safe status
+safe doctor [--json]
+safe version
+safe help
+</code></pre>
+<p>Unknown top-level commands are treated like <code>safe run &lt;args...&gt;</code>.</p>
+<h2 id="safe-run">safe-run</h2>
+<pre><code class="language-bash">safe-run [flags] &lt;package&gt;[@&lt;version&gt;] [-- args...]
+safe-run host-allow add &lt;pkg&gt;@&lt;ver&gt; [--reason &quot;...&quot;]
+safe-run host-allow update &lt;pkg&gt;@&lt;new&gt; [--reason &quot;...&quot;]
+safe-run host-allow remove &lt;pkg&gt;
+safe-run host-allow list
+safe-run block add &lt;pkg&gt; --reason &quot;...&quot;
+safe-run block remove &lt;pkg&gt;
+safe-run block list
+safe-run block import &lt;url-or-file&gt;
+safe-run audit [--blocked] [--since 24h]
+safe-run status
+safe-run link [--force]
+safe-run unlink
+safe-run install [-w -n] [--allow-scripts] &lt;pkg&gt;...
+</code></pre>
+<p>Runner flags:</p>
+<pre><code class="language-text">--strict
+-w, --write
+-n, --network
+-s, --allow-secrets
+--node22
+--py312
+--proxy
+-y, --yes
+-h, --help
+-v, --version
+</code></pre>
+<h2 id="safe-audit">safe-audit</h2>
+<pre><code class="language-bash">safe-audit capabilities [--json]
+safe-audit scan [--project &lt;path&gt;] [--all | --machine &lt;csv&gt;]
+safe-audit check &lt;pkg&gt;@&lt;version&gt; [--ecosystem &lt;name&gt;] [--json]
+safe-audit release github --repo OWNER/REPO --version TAG --asset NAME [--tag-regex REGEX] [--json]
+safe-audit vuln github-release --repo OWNER/REPO --version TAG [--json]
+safe-audit verify release-asset --artifact PATH --checksum PATH [--certificate PATH --signature PATH --certificate-identity-regexp REGEX --certificate-oidc-issuer URL] [--require-signature] [--json]
+safe-audit verify sigstore-bundle --artifact PATH --bundle PATH --identity VALUE --oidc-issuer URL [--json]
+safe-audit verify tuf-bootstrap --mirror PATH --root PATH --root-checksum SHA256 --target NAME=PATH [--target NAME=PATH ...] [--json]
+safe-audit binary exec PATH [--timeout SECONDS] [--json] -- [ARGS...]
+safe-audit ioc &lt;identifier&gt; [--all | --machine &lt;csv&gt;]
+safe-audit ioc --list &lt;ioc.json&gt; [--all | --machine &lt;csv&gt;]
+safe-audit ioc --update [--since &lt;duration&gt;] [--all | --machine &lt;csv&gt;]
+safe-audit setup [&lt;machine&gt; | --all | --machine &lt;csv&gt;] [--bundle &lt;scanners.tar.gz|latest&gt;]
+safe-audit setup --create-bundle [&lt;scanners.tar.gz&gt;]
+safe-audit diff [--all | --machine &lt;csv&gt;] [--since &lt;duration&gt;]
+safe-audit status
+safe-audit --version
+</code></pre>
+<h2 id="install-wrapper-coverage">Install Wrapper Coverage</h2>
+<p>The zsh wrappers cover these command families:</p>
+<pre><code class="language-text">npm, pnpm, yarn, bun
+uv, pip, pip3
+cargo
+go
+composer
+volta
+</code></pre>
+<p>They run package checks for explicit package installs and project scans for lockfile or manifest based project operations.</p>
+            <nav class="page-nav" aria-label="Page navigation">
+              <div>
+                <span class="page-nav__label">Previous</span>
+                <a href="../publishing/">Publishing</a>
+              </div>
+              <div>
+              </div>
+            </nav>
+          </article>
+          <aside class="toc-panel" aria-label="Table of contents">
+            <div class="toc-panel__title">On This Page</div>
+            <ul class="toc-panel__list">
+              <li>
+                <a href="#command-reference">Command Reference</a>
+                <ul>
+                  <li><a href="#dispatcher">Dispatcher</a></li>
+                  <li><a href="#safe-run">safe-run</a></li>
+                  <li><a href="#safe-audit">safe-audit</a></li>
+                  <li><a href="#install-wrapper-coverage">Install Wrapper Coverage</a></li>
+                </ul>
+              </li>
+            </ul>
+          </aside>
+        </div>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <div class="site-footer__grid">
+        <div>
+          <span class="site-footer__label">License</span>
+          <span class="site-footer__value">MIT</span>
+        </div>
+        <div>
+          <span class="site-footer__label">Source</span>
+          <a class="site-footer__value" href="https://github.com/superbiche/safe">superbiche/safe</a>
+        </div>
+        <div>
+          <span class="site-footer__label">Built with</span>
+          <a class="site-footer__value" href="https://www.mkdocs.org">MkDocs</a>
+        </div>
+      </div>
+    </footer>
+    <script>
+      window.superbicheSearch = {
+        enabled: true,
+        baseUrl: ".."
+      };
+      window.superbicheVersions = {
+        enabled: true,
+        baseUrl: ".."
+      };
+    </script>
+    <script src="../js/superbiche.js"></script>
+    <script src="../search/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="canonical" href="https://superbiche.github.io/safe/1.0.0/publishing/">
+    <meta name="theme-color" content="#0d0e12">
+    <meta name="darkreader-lock">
+    <title>Publishing - safe</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400;1,500;1,600&family=IBM+Plex+Serif:ital,wght@0,300;0,400;0,500;1,300;1,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../css/superbiche.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="site-header">
+      <div class="site-header__inner">
+        <a class="brand" href=".." aria-label="safe home">
+          <span class="brand__signal" aria-hidden="true"></span>
+          <span class="brand__name">safe</span>
+        </a>
+        <a class="header-repo" href="https://github.com/superbiche/safe" aria-label="Source repository">
+          <span>superbiche/safe</span>
+        </a>
+      </div>
+    </header>
+
+    <div class="layout-shell">
+      <aside class="sidebar" aria-label="Documentation navigation">
+        <div class="search-panel">
+          <label class="search-panel__label" for="mkdocs-search-query">Search</label>
+          <input id="mkdocs-search-query" class="search-panel__input" type="search" placeholder="Search docs" autocomplete="off">
+          <div id="mkdocs-search-results" class="search-panel__results" aria-live="polite"></div>
+        </div>
+
+        <nav class="side-nav">
+          
+          <ul class="side-nav__list side-nav__list--level-1">
+            <li class="side-nav__item">
+              <span class="side-nav__section">Home</span>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../architecture/">Architecture</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../installation/">Installation</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../safe-run/">safe-run</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../safe-audit/">safe-audit</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../install-wrappers/">Install Wrappers</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../integration-flows/">Integration Flows</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../configuration/">Configuration</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../operations/">Operations</a>
+            </li>
+            <li class="side-nav__item side-nav__item--active">
+              <a class="side-nav__link side-nav__link--current" href="./">Publishing</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../command-reference/">Command Reference</a>
+            </li>
+          </ul>
+        </nav>
+      </aside>
+
+      <main id="main-content" class="content-wrap" tabindex="-1">
+        <div class="content-grid">
+          <article class="doc-content">
+            <div class="doc-kicker">
+              <span>publishing.md</span>
+            </div>
+            <h1 id="publishing">Publishing</h1>
+<p>The docs are built with MkDocs and published to GitHub Pages with Mike. Mike
+keeps multiple versions on the <code>gh-pages</code> branch and writes the <code>versions.json</code>
+metadata that the <code>superbiche</code> theme uses for its version selector.</p>
+<h2 id="setup">Setup</h2>
+<p>Install the local docs toolchain from the repository root:</p>
+<pre><code class="language-bash">scripts/docs deps
+</code></pre>
+<p>This installs MkDocs, Mike, and the local <code>superbiche</code> theme package.</p>
+<h2 id="local-builds">Local Builds</h2>
+<p>Build the current docs:</p>
+<pre><code class="language-bash">scripts/docs build
+</code></pre>
+<p>Serve the current docs:</p>
+<pre><code class="language-bash">scripts/docs serve
+</code></pre>
+<p>Serve the versioned <code>gh-pages</code> output locally:</p>
+<pre><code class="language-bash">scripts/docs mike-serve
+</code></pre>
+<h2 id="publish">Publish</h2>
+<p>Publish a new release version and move the <code>latest</code> alias:</p>
+<pre><code class="language-bash">scripts/docs deploy-latest 0.1
+</code></pre>
+<p>Publish an additional named version without changing <code>latest</code>:</p>
+<pre><code class="language-bash">scripts/docs deploy dev
+</code></pre>
+<p>Set the root redirect:</p>
+<pre><code class="language-bash">scripts/docs set-default latest
+</code></pre>
+<p>List deployed versions:</p>
+<pre><code class="language-bash">scripts/docs list
+</code></pre>
+<h2 id="github-pages">GitHub Pages</h2>
+<p>Configure GitHub Pages to serve from the <code>gh-pages</code> branch. The published site
+URL is:</p>
+<pre><code class="language-text">https://superbiche.github.io/safe/
+</code></pre>
+<p>The root URL redirects to the version selected with <code>scripts/docs set-default</code>.</p>
+            <nav class="page-nav" aria-label="Page navigation">
+              <div>
+                <span class="page-nav__label">Previous</span>
+                <a href="../operations/">Operations</a>
+              </div>
+              <div>
+                <span class="page-nav__label">Next</span>
+                <a href="../command-reference/">Command Reference</a>
+              </div>
+            </nav>
+          </article>
+          <aside class="toc-panel" aria-label="Table of contents">
+            <div class="toc-panel__title">On This Page</div>
+            <ul class="toc-panel__list">
+              <li>
+                <a href="#publishing">Publishing</a>
+                <ul>
+                  <li><a href="#setup">Setup</a></li>
+                  <li><a href="#local-builds">Local Builds</a></li>
+                  <li><a href="#publish">Publish</a></li>
+                  <li><a href="#github-pages">GitHub Pages</a></li>
+                </ul>
+              </li>
+            </ul>
+          </aside>
+        </div>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <div class="site-footer__grid">
+        <div>
+          <span class="site-footer__label">License</span>
+          <span class="site-footer__value">MIT</span>
+        </div>
+        <div>
+          <span class="site-footer__label">Source</span>
+          <a class="site-footer__value" href="https://github.com/superbiche/safe">superbiche/safe</a>
+        </div>
+        <div>
+          <span class="site-footer__label">Built with</span>
+          <a class="site-footer__value" href="https://www.mkdocs.org">MkDocs</a>
+        </div>
+      </div>
+    </footer>
+    <script>
+      window.superbicheSearch = {
+        enabled: true,
+        baseUrl: ".."
+      };
+      window.superbicheVersions = {
+        enabled: true,
+        baseUrl: ".."
+      };
+    </script>
+    <script src="../js/superbiche.js"></script>
+    <script src="../search/main.js"></script>
+  </body>
+</html>
