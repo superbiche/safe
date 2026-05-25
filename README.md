@@ -2,6 +2,10 @@
 
 `safe` is a Bash toolkit for safer package execution, dependency auditing, and guarded installs. It provides `safe-run`, `safe-audit`, and persistent install wrappers behind one dispatcher, one installer, one config tree, and one zsh completion entry point.
 
+## Documentation
+
+Full documentation is published at <https://superbiche.github.io/safe/>.
+
 ## Quick Start
 
 ```bash
@@ -47,7 +51,7 @@ safe doctor
 
 to see the local readiness of sandbox, audit, verifier, and wrapper features.
 
-## Documentation
+## Local Docs
 
 Full MkDocs-ready documentation lives in [`docs/`](docs/index.md).
 
