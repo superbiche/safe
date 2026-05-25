@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG="$ROOT/mkdocs.yml"
+
+usage() {
+  cat >&2 <<'EOF'
+usage: scripts/docs <command> [args...]
+
+commands:
+  deps                         install local docs dependencies
+  build                        build the current docs
+  serve                        serve the current docs
+  deploy <version> [alias...]  deploy versioned docs to gh-pages and push
+  deploy-latest <version>      deploy a version and move the latest alias
+  set-default <version|alias>  set the root GitHub Pages redirect
+  list                         list deployed versions
+  mike-serve                   serve the versioned gh-pages docs locally
+EOF
+}
+
+ensure_mike() {
+  command -v mike >/dev/null 2>&1 || {
+    printf 'missing dependency: mike\nRun: scripts/docs deps\n' >&2
+    exit 1
+  }
+}
+
+with_python_mkdocs() {
+  local shim_dir
+  shim_dir="$(mktemp -d)"
+  trap 'rm -rf "$shim_dir"' RETURN
+  cat > "$shim_dir/mkdocs" <<'SH'
+#!/usr/bin/env bash
+exec python -m mkdocs "$@"
+SH
+  chmod +x "$shim_dir/mkdocs"
+  PATH="$shim_dir:$PATH" "$@"
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  deps)
+    cd "$ROOT"
+    python -m pip install -r docs/requirements.txt
+    ;;
+  build)
+    cd "$ROOT"
+    python -m mkdocs build --strict
+    ;;
+  serve)
+    cd "$ROOT"
+    python -m mkdocs serve
+    ;;
+  deploy)
+    shift
+    [[ $# -ge 1 ]] || { usage; exit 2; }
+    cd "$ROOT"
+    ensure_mike
+    with_python_mkdocs mike deploy --config-file "$CONFIG" --push "$@"
+    ;;
+  deploy-latest)
+    shift
+    [[ $# -eq 1 ]] || { usage; exit 2; }
+    cd "$ROOT"
+    ensure_mike
+    with_python_mkdocs mike deploy --config-file "$CONFIG" --update-aliases --push "$1" latest
+    with_python_mkdocs mike set-default --config-file "$CONFIG" --push latest
+    ;;
+  set-default)
+    shift
+    [[ $# -eq 1 ]] || { usage; exit 2; }
+    cd "$ROOT"
+    ensure_mike
+    with_python_mkdocs mike set-default --config-file "$CONFIG" --push "$1"
+    ;;
+  list)
+    cd "$ROOT"
+    ensure_mike
+    mike list --config-file "$CONFIG"
+    ;;
+  mike-serve)
+    cd "$ROOT"
+    ensure_mike
+    with_python_mkdocs mike serve --config-file "$CONFIG"
+    ;;
+  -h|--help|help|"")
+    usage
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

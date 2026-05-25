@@ -1,0 +1,64 @@
+# Installation
+
+Clone the repository, inspect it, scan it, then run the installer:
+
+```bash
+git clone <repo-url> safe
+cd safe
+safe audit scan --project .
+bash install.sh
+```
+
+If `safe` is not already available on the machine, run equivalent local scanners
+before installing. Treat this repository like any other supply-chain input.
+
+Default install mode is `--all`, which installs:
+
+- `safe`, `safe-run`, and `safe-audit` to `~/.local/bin`;
+- seed config under `~/.config/safe/run` and `~/.config/safe/audit`;
+- `~/.config/safe/install-wrappers.zsh`;
+- zsh completion `~/.local/share/zsh/site-functions/_safe`;
+- `.zshrc` source and completion `fpath` lines when missing.
+
+The installer is idempotent. It refreshes installed files, seeds only missing config, and preserves existing data.
+
+## Install Modes
+
+```bash
+bash install.sh --all
+bash install.sh --run
+bash install.sh --audit
+bash install.sh --wrappers
+bash install.sh --no-wrappers
+```
+
+`--no-wrappers` installs the run and audit tools but leaves persistent zsh package-manager wrappers disabled.
+
+## First Run
+
+After installation:
+
+```bash
+safe status
+safe doctor
+safe audit setup
+safe-run link
+```
+
+`safe-run link` replaces host package-runner commands with safe shims where supported. It is transactional and backs up originals before linking.
+
+## Uninstall
+
+Remove binaries and completions while preserving config and data:
+
+```bash
+bash uninstall.sh
+```
+
+Remove config and data as well:
+
+```bash
+bash uninstall.sh --all
+```
+
+`--purge` also requests source-line cleanup. The uninstall path calls `safe-run unlink` first when possible.

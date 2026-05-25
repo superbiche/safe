@@ -1,0 +1,1967 @@
+#!/usr/bin/env bash
+# safe-run: sandboxed package runner. Drop-in replacement for npx/bunx/uvx/pipx.
+# Context detected via argv[0]. Default action: Podman sandbox.
+
+set -euo pipefail
+
+SAFE_RUN_VERSION="0.1.0"
+SAFE_RUN_NO_INIT="${SAFE_RUN_NO_INIT:-0}"
+
+CONFIG_DIR="${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}"
+DATA_DIR="${SAFE_RUN_DATA_DIR:-${SAFE_DATA_DIR:-$HOME/.local/share/safe}/run}"
+HOST_ALLOW_FILE="$CONFIG_DIR/host-allow.json"
+SANDBOX_KNOWN_FILE="$CONFIG_DIR/sandbox-known.json"
+BLOCKED_FILE="$CONFIG_DIR/blocked.json"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+AUDIT_LOG="$DATA_DIR/audit.log"
+SEED_DIR="${SAFE_RUN_SEED_DIR:-}"
+SAFE_AUDIT_BIN="${SAFE_AUDIT_BIN:-safe-audit}"
+SAFE_AUDIT_DATA_DIR="${SAFE_AUDIT_DATA_DIR:-${SAFE_DATA_DIR:-$HOME/.local/share/safe}/audit}"
+SAFE_AUDIT_HOST_ALLOW_LOG="$SAFE_AUDIT_DATA_DIR/host-allow-log.jsonl"
+
+NODE_IMAGE_DEFAULT="docker.io/library/node:24"
+SAFE_AUDIT_IMAGE="${SAFE_AUDIT_IMAGE:-$NODE_IMAGE_DEFAULT}"
+NODE_IMAGE_ALT="docker.io/library/node:22"
+BUN_IMAGE="docker.io/oven/bun:1.3.14"
+# uv official image has uv + python preinstalled; required for uvx execution.
+UV_IMAGE_DEFAULT="ghcr.io/astral-sh/uv:python3.14-bookworm-slim"
+UV_IMAGE_ALT="ghcr.io/astral-sh/uv:python3.12-bookworm-slim"
+PYTHON_IMAGE_DEFAULT="docker.io/library/python:3.14"
+PYTHON_IMAGE_ALT="docker.io/library/python:3.12"
+
+# Default resource limits for sandboxed execution (overridable from config.json).
+SANDBOX_PIDS_LIMIT_DEFAULT=256
+SANDBOX_MEMORY_DEFAULT="2g"
+SANDBOX_CPUS_DEFAULT="2"
+SANDBOX_NOFILE_DEFAULT="1024:1024"
+SANDBOX_TIMEOUT_DEFAULT=300
+WARN_ENV_FILES_DEFAULT=1
+
+# Runtime state populated by parse_args / detect_runner.
+RUNNER_KIND=""
+PKG_NAME=""
+PKG_VERSION=""
+PKG_VERSION_USER_SPECIFIED=0
+STRICT_MODE=1
+ALLOW_WRITE=0
+ALLOW_NETWORK=0
+ALLOW_SECRETS=0
+NODE_VERSION_FLAG=""
+PY_VERSION_FLAG=""
+SKIP_PROMPT=0
+PROXY_PASSTHROUGH=0
+FORCE_LINK=0
+BLOCKED_REASON=""
+HOST_ALLOW_PINNED_VERSION=""
+SANDBOX_AUDIT_EXTRA="sbom_vulns=skipped"
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+err()  { printf '\033[31msafe-run:\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[33msafe-run:\033[0m %s\n' "$*" >&2; }
+info() { printf '\033[36msafe-run:\033[0m %s\n' "$*" >&2; }
+die()  { err "$@"; exit 1; }
+
+is_tty() { [[ -t 0 && -t 1 ]]; }
+now_iso() { date -Iseconds; }
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+}
+
+runner_ecosystem() {
+  case "$1" in
+    npm|bun) echo "npm" ;;
+    uv|pipx) echo "python" ;;
+    *) echo "npm" ;;
+  esac
+}
+
+safe_audit_spec() {
+  local pkg="$1" version="$2"
+  printf '%s@%s' "$pkg" "$version"
+}
+
+log_host_allow_execution() {
+  local pkg="$1" version="$2" runner="$3"
+  mkdir -p "$SAFE_AUDIT_DATA_DIR"
+  jq -cn \
+    --arg timestamp "$(now_iso)" \
+    --arg package "$pkg" \
+    --arg version "$version" \
+    --arg runner "$runner" \
+    '{timestamp:$timestamp,package:$package,version:$version,runner:$runner}' >> "$SAFE_AUDIT_HOST_ALLOW_LOG"
+}
+
+safe_audit_check_spec() {
+  local pkg="$1" version="$2" ecosystem="$3"
+  local spec check_json rc verdict restore_errexit=0 image audit_pkg audit_cmd
+  spec=$(safe_audit_spec "$pkg" "$version")
+
+  podman_available || return 2
+  image="$SAFE_AUDIT_IMAGE"
+  podman image exists "$image" 2>/dev/null || return 2
+  audit_pkg="$SAFE_AUDIT_BIN"
+  audit_cmd=$(printf 'npx --yes --ignore-scripts %q check %q --ecosystem %q --json' \
+    "$audit_pkg" "$spec" "$ecosystem")
+
+  [[ $- == *e* ]] && restore_errexit=1
+  set +e
+  check_json=$(podman run --rm \
+    --cap-drop=ALL \
+    --security-opt=no-new-privileges \
+    --read-only \
+    --tmpfs "/tmp:rw,size=256m" \
+    --tmpfs "/root:rw,size=256m" \
+    --pids-limit=128 \
+    --memory=512m \
+    --cpus=1 \
+    --ulimit "nofile=512:512" \
+    --http-proxy=false \
+    -e "HOME=/root" \
+    -e "npm_config_ignore_scripts=true" \
+    "$image" \
+    sh -c "$audit_cmd" 2>/dev/null)
+  rc=$?
+  if [[ "$restore_errexit" == "1" ]]; then
+    set -e
+  else
+    set +e
+  fi
+
+  [[ -n "$check_json" ]] || return 2
+  verdict=$(printf '%s' "$check_json" | jq -r '.verdict // empty' 2>/dev/null || true)
+  case "$verdict" in
+    GO)
+      return 0
+      ;;
+    WARN)
+      return 10
+      ;;
+    BLOCK)
+      return 20
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}
+
+safe_audit_check_unknown() {
+  local pkg="$1" version="$2" ecosystem
+  ecosystem=$(runner_ecosystem "$RUNNER_KIND")
+  safe_audit_check_spec "$pkg" "$version" "$ecosystem"
+}
+
+# ---------------------------------------------------------------------------
+# Audit log: append-only, pipe-delimited.
+# Fields: ts | runner | pkg@version | tier | context | decision | extra
+# ---------------------------------------------------------------------------
+audit_log() {
+  local runner="$1" pkgver="$2" tier="$3" context="$4" decision="$5" extra="${6:-}"
+  mkdir -p "$DATA_DIR"
+  printf '%s | %s | %s | %s | %s | %s%s\n' \
+    "$(now_iso)" "$runner" "$pkgver" "$tier" "$context" "$decision" \
+    "${extra:+ | $extra}" >> "$AUDIT_LOG"
+}
+
+context_label() {
+  if is_tty; then echo "interactive"; else echo "non-tty"; fi
+}
+
+caller_info() {
+  local ppid_cmd
+  ppid_cmd=$(tr '\0\n\r\t' '    ' </proc/$PPID/cmdline 2>/dev/null || true)
+  # Collapse runs of spaces and cap length so audit log stays one-line-per-entry.
+  ppid_cmd=$(printf '%s' "$ppid_cmd" | tr -s ' ' | cut -c1-160)
+  printf 'caller=pid:%d:%s' "$PPID" "${ppid_cmd:-unknown}"
+}
+
+# ---------------------------------------------------------------------------
+# Config bootstrap
+# ---------------------------------------------------------------------------
+ensure_dirs() {
+  mkdir -p "$CONFIG_DIR" "$DATA_DIR"
+  [[ -f "$HOST_ALLOW_FILE" ]]    || seed_file "$HOST_ALLOW_FILE"    '{"packages":{}}'
+  [[ -f "$SANDBOX_KNOWN_FILE" ]] || seed_file "$SANDBOX_KNOWN_FILE" '{"packages":{}}'
+  [[ -f "$BLOCKED_FILE" ]]       || seed_file "$BLOCKED_FILE"       "$(default_blocked_json)"
+  [[ -f "$CONFIG_FILE" ]]        || seed_file "$CONFIG_FILE"        "$(default_config_json)"
+  [[ -f "$AUDIT_LOG" ]]          || : > "$AUDIT_LOG"
+}
+
+seed_file() {
+  local path="$1" fallback_json="$2"
+  local seed_name
+  seed_name=$(basename "$path")
+  if [[ -n "$SEED_DIR" && -f "$SEED_DIR/$seed_name" ]]; then
+    cp "$SEED_DIR/$seed_name" "$path"
+  else
+    printf '%s\n' "$fallback_json" > "$path"
+  fi
+}
+
+default_blocked_json() {
+  printf '%s' '{"packages":{}}'
+}
+
+default_config_json() {
+  cat <<'JSON'
+{
+  "defaults": {
+    "node_version": "24",
+    "python_version": "3.14"
+  },
+  "runners": {
+    "npx_real": null,
+    "bunx_real": null,
+    "uvx_real": null,
+    "pipx_real": null
+  },
+  "sandbox": {
+    "pids_limit": 256,
+    "memory": "2g",
+    "cpus": "2",
+    "ulimit_nofile": "1024:1024",
+    "timeout_seconds": 300
+  },
+  "warn_env_files": true,
+  "linked_targets": []
+}
+JSON
+}
+
+# Read a sandbox config value with fallback to the corresponding default.
+config_get() {
+  local jq_path="$1" fallback="$2"
+  local v
+  v=$(jq -r "$jq_path // empty" "$CONFIG_FILE" 2>/dev/null || true)
+  [[ -z "$v" || "$v" == "null" ]] && v="$fallback"
+  printf '%s' "$v"
+}
+
+warn_invalid_sandbox_config() {
+  local key="$1" value="$2" default="$3"
+  warn "invalid sandbox.$key=$value; using default $default"
+}
+
+cpu_count() {
+  local count
+  count=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')
+  [[ "$count" =~ ^[0-9]+$ ]] || count=2
+  (( count >= 1 )) || count=1
+  printf '%s' "$count"
+}
+
+sanitize_pids_limit() {
+  local raw="$1"
+  if [[ "$raw" =~ ^[0-9]+$ ]] && (( raw >= 16 && raw <= 4096 )); then
+    printf '%s' "$raw"
+    return 0
+  fi
+  warn_invalid_sandbox_config "pids_limit" "$raw" "$SANDBOX_PIDS_LIMIT_DEFAULT"
+  printf '%s' "$SANDBOX_PIDS_LIMIT_DEFAULT"
+}
+
+memory_to_mebibytes() {
+  local raw unit number
+  raw=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  [[ "$raw" =~ ^([0-9]+)([mg])$ ]] || return 1
+  number="${BASH_REMATCH[1]}"
+  unit="${BASH_REMATCH[2]}"
+  case "$unit" in
+    m) printf '%s' "$number" ;;
+    g) printf '%s' $(( number * 1024 )) ;;
+    *) return 1 ;;
+  esac
+}
+
+sanitize_memory_limit() {
+  local raw="$1" normalized mebibytes
+  normalized=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+  if mebibytes=$(memory_to_mebibytes "$normalized"); then
+    if (( mebibytes >= 256 && mebibytes <= 16384 )); then
+      printf '%s' "$normalized"
+      return 0
+    fi
+  fi
+  warn_invalid_sandbox_config "memory" "$raw" "$SANDBOX_MEMORY_DEFAULT"
+  printf '%s' "$SANDBOX_MEMORY_DEFAULT"
+}
+
+sanitize_cpu_limit() {
+  local raw="$1" max_cpus default_cpus
+  max_cpus=$(cpu_count)
+  default_cpus="$SANDBOX_CPUS_DEFAULT"
+  if awk -v a="$default_cpus" -v b="$max_cpus" 'BEGIN { exit !(a > b) }'; then
+    default_cpus="$max_cpus"
+  fi
+  if [[ "$raw" =~ ^([0-9]+)(\.[0-9]+)?$ ]] && \
+     awk -v v="$raw" -v max="$max_cpus" 'BEGIN { exit !(v >= 0.5 && v <= max) }'; then
+    printf '%s' "$raw"
+    return 0
+  fi
+  warn_invalid_sandbox_config "cpus" "$raw" "$default_cpus"
+  printf '%s' "$default_cpus"
+}
+
+sanitize_nofile_limit() {
+  local raw="$1" soft hard
+  if [[ "$raw" =~ ^([0-9]+)(:([0-9]+))?$ ]]; then
+    soft="${BASH_REMATCH[1]}"
+    hard="${BASH_REMATCH[3]:-${BASH_REMATCH[1]}}"
+    if (( soft >= 64 && soft <= 65536 && hard >= 64 && hard <= 65536 && soft <= hard )); then
+      printf '%s:%s' "$soft" "$hard"
+      return 0
+    fi
+  fi
+  warn_invalid_sandbox_config "ulimit_nofile" "$raw" "$SANDBOX_NOFILE_DEFAULT"
+  printf '%s' "$SANDBOX_NOFILE_DEFAULT"
+}
+
+sanitize_timeout_limit() {
+  local raw="$1"
+  if [[ "$raw" =~ ^[0-9]+$ ]] && (( raw >= 30 && raw <= 3600 )); then
+    printf '%s' "$raw"
+    return 0
+  fi
+  warn_invalid_sandbox_config "timeout_seconds" "$raw" "$SANDBOX_TIMEOUT_DEFAULT"
+  printf '%s' "$SANDBOX_TIMEOUT_DEFAULT"
+}
+
+# ---------------------------------------------------------------------------
+# Runner detection and image selection
+# ---------------------------------------------------------------------------
+detect_runner() {
+  local name="$1"
+  case "$name" in
+    *pipx*)     RUNNER_KIND=pipx ;;
+    *bunx*)     RUNNER_KIND=bun ;;
+    *uvx*)      RUNNER_KIND=uv ;;
+    *npx*)      RUNNER_KIND=npm ;;
+    safe-run|*) RUNNER_KIND=npm ;;
+  esac
+}
+
+select_image() {
+  local kind="$1"
+  case "$kind" in
+    npm)
+      if [[ "$NODE_VERSION_FLAG" == "22" ]] || project_needs_node22; then
+        echo "$NODE_IMAGE_ALT"
+      else
+        echo "$NODE_IMAGE_DEFAULT"
+      fi
+      ;;
+    bun)  echo "$BUN_IMAGE" ;;
+    uv)
+      if [[ "$PY_VERSION_FLAG" == "312" ]]; then echo "$UV_IMAGE_ALT"
+      else echo "$UV_IMAGE_DEFAULT"; fi
+      ;;
+    pipx)
+      if [[ "$PY_VERSION_FLAG" == "312" ]]; then echo "$PYTHON_IMAGE_ALT"
+      else echo "$PYTHON_IMAGE_DEFAULT"; fi
+      ;;
+  esac
+}
+
+# Honor engines.node < 24 by falling back to node:22.
+project_needs_node22() {
+  local pkg_json="$PWD/package.json"
+  [[ -f "$pkg_json" ]] || return 1
+  local engines
+  engines=$(jq -r '.engines.node // empty' "$pkg_json" 2>/dev/null || true)
+  [[ -z "$engines" ]] && return 1
+  # Cheap heuristic: ranges like ^22, >=22 <24, 22.x
+  if [[ "$engines" =~ (^|[^0-9])(18|19|20|21|22|23)([^0-9]|$) ]] && \
+     ! [[ "$engines" =~ (^|[^0-9])(24|25|26)([^0-9]|$) ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Package parsing: handles scoped (@scope/pkg) and unscoped names.
+# Tracks whether user explicitly supplied a version (used for host-allow pinning).
+# ---------------------------------------------------------------------------
+parse_package() {
+  local input="$1"
+  PKG_VERSION_USER_SPECIFIED=0
+  if [[ "$input" == @* ]]; then
+    if [[ "$input" =~ ^(@[^/]+/[^@]+)(@(.+))?$ ]]; then
+      PKG_NAME="${BASH_REMATCH[1]}"
+      if [[ -n "${BASH_REMATCH[3]:-}" ]]; then
+        PKG_VERSION="${BASH_REMATCH[3]}"
+        PKG_VERSION_USER_SPECIFIED=1
+      else
+        PKG_VERSION="latest"
+      fi
+    else
+      die "invalid scoped package spec: $input"
+    fi
+  elif [[ "$input" =~ ^([^@]+)(@(.+))?$ ]]; then
+    PKG_NAME="${BASH_REMATCH[1]}"
+    if [[ -n "${BASH_REMATCH[3]:-}" ]]; then
+      PKG_VERSION="${BASH_REMATCH[3]}"
+      PKG_VERSION_USER_SPECIFIED=1
+    else
+      PKG_VERSION="latest"
+    fi
+  else
+    die "invalid package spec: $input"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Package name validation: defends against path traversal, encoded separators,
+# unicode tricks. Blocklist matching uses the validated, lowercased name.
+# Returns 0 if valid, 1 if not.
+# ---------------------------------------------------------------------------
+validate_package_name() {
+  local name="$1" kind="$2"
+  # Length cap (npm hard limit: 214; same cap for python is conservative).
+  if [[ ${#name} -gt 214 || ${#name} -lt 1 ]]; then
+    return 1
+  fi
+  # Reject any byte outside printable ASCII (rules out control chars + unicode).
+  if LC_ALL=C printf '%s' "$name" | grep -q '[^[:print:]]'; then
+    return 1
+  fi
+  # Reject percent-encoding, backslashes, whitespace.
+  case "$name" in
+    *%*|*\\*|*' '*|*$'\t'*) return 1 ;;
+  esac
+  case "$kind" in
+    npm|bun)
+      if [[ "$name" == @* ]]; then
+        # Exactly one slash (after scope) and strict char classes.
+        [[ "$name" =~ ^@[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$ ]] || return 1
+      else
+        [[ "$name" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || return 1
+      fi
+      ;;
+    uv|pipx)
+      # PEP 503 normalized: letters/digits with separators . _ - allowed inside.
+      [[ "$name" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ ]] || return 1
+      ;;
+  esac
+  return 0
+}
+
+# Normalize a package name for blocklist matching: trim + lowercase for npm/bun.
+normalize_package_name() {
+  local name="$1" kind="$2"
+  name="${name#"${name%%[![:space:]]*}"}"
+  name="${name%"${name##*[![:space:]]}"}"
+  case "$kind" in
+    npm|bun) printf '%s' "$name" | tr '[:upper:]' '[:lower:]' ;;
+    *)       printf '%s' "$name" ;;
+  esac
+}
+
+ecosystem_to_runner_kind() {
+  local ecosystem="$1"
+  case "$ecosystem" in
+    npm|bun) printf '%s' "$ecosystem" ;;
+    py|python|uv|pipx) printf 'uv' ;;
+    *) return 1 ;;
+  esac
+}
+
+guess_write_package_kind() {
+  local name="$1"
+  local npm_name
+  npm_name=$(normalize_package_name "$name" npm)
+  if validate_package_name "$npm_name" npm; then
+    printf 'npm'
+    return 0
+  fi
+  if validate_package_name "$name" uv; then
+    printf 'uv'
+    return 0
+  fi
+  printf 'npm'
+}
+
+normalize_and_validate_package_or_die() {
+  local name="$1" kind="$2" context="$3"
+  local normalized
+  normalized=$(normalize_package_name "$name" "$kind")
+  validate_package_name "$normalized" "$kind" || die "REJECTED: invalid package name: $context"
+  printf '%s' "$normalized"
+}
+
+normalize_and_validate_package_or_warn() {
+  local name="$1" kind="$2" context="$3"
+  local normalized
+  normalized=$(normalize_package_name "$name" "$kind")
+  if ! validate_package_name "$normalized" "$kind"; then
+    warn "skipping invalid package entry: $context"
+    return 1
+  fi
+  printf '%s' "$normalized"
+}
+
+validate_block_wildcard_pattern() {
+  local pattern="$1"
+  [[ "$pattern" =~ ^@[a-z0-9][a-z0-9._-]*/\*$ ]]
+}
+
+normalize_block_package_name_or_die() {
+  local pkg="$1"
+  local kind
+  local normalized
+  normalized=$(normalize_package_name "$pkg" npm)
+  if validate_block_wildcard_pattern "$normalized"; then
+    printf '%s' "$normalized"
+    return 0
+  fi
+  kind=$(guess_write_package_kind "$pkg")
+  normalize_and_validate_package_or_die "$pkg" "$kind" "$pkg"
+}
+
+normalize_block_package_name_or_warn() {
+  local pkg="$1"
+  local kind
+  local normalized
+  normalized=$(normalize_package_name "$pkg" npm)
+  if validate_block_wildcard_pattern "$normalized"; then
+    printf '%s' "$normalized"
+    return 0
+  fi
+  kind=$(guess_write_package_kind "$pkg")
+  normalize_and_validate_package_or_warn "$pkg" "$kind" "$pkg"
+}
+
+resolve_package_key_in_file() {
+  local file="$1" pkg="$2"
+  if jq -e --arg p "$pkg" '.packages[$p]' "$file" >/dev/null 2>&1; then
+    printf '%s' "$pkg"
+    return 0
+  fi
+
+  local normalized
+  normalized=$(normalize_block_package_name_or_die "$pkg")
+  printf '%s' "$normalized"
+}
+
+# ---------------------------------------------------------------------------
+# Tier lookups
+# ---------------------------------------------------------------------------
+in_host_allow() {
+  local pkg="$1" version="$2"
+  HOST_ALLOW_PINNED_VERSION=""
+  local entry
+  entry=$(jq -r --arg p "$pkg" '.packages[$p] // empty' "$HOST_ALLOW_FILE")
+  [[ -z "$entry" ]] && return 1
+  local allowed_version
+  allowed_version=$(printf '%s' "$entry" | jq -r '.version')
+  HOST_ALLOW_PINNED_VERSION="$allowed_version"
+  # No user-specified version (defaulted to "latest") -> caller will substitute.
+  if [[ "$PKG_VERSION_USER_SPECIFIED" == "0" || "$version" == "latest" ]]; then
+    return 0
+  fi
+  [[ "$allowed_version" == "$version" ]]
+}
+
+in_blocked() {
+  local pkg="$1"
+  local entry
+  entry=$(jq -r --arg p "$pkg" '.packages[$p] // empty' "$BLOCKED_FILE")
+  if [[ -n "$entry" ]]; then
+    BLOCKED_REASON=$(printf '%s' "$entry" | jq -r '.reason')
+    return 0
+  fi
+  if [[ "$pkg" == @*/* ]]; then
+    local scope_wildcard="${pkg%%/*}/*"
+    entry=$(jq -r --arg p "$scope_wildcard" '.packages[$p] // empty' "$BLOCKED_FILE")
+    if [[ -n "$entry" ]]; then
+      BLOCKED_REASON=$(printf '%s' "$entry" | jq -r '.reason')
+      return 0
+    fi
+  fi
+  return 1
+}
+
+in_sandbox_known() {
+  local pkg="$1"
+  jq -e --arg p "$pkg" '.packages[$p]' "$SANDBOX_KNOWN_FILE" >/dev/null 2>&1
+}
+
+mark_sandbox_known() {
+  local pkg="$1" version="$2"
+  local tmp
+  tmp=$(mktemp)
+  jq --arg p "$pkg" --arg v "$version" --arg d "$(date -I)" '
+    .packages[$p] = {
+      last_version: $v,
+      last_used: $d,
+      times_used: ((.packages[$p].times_used // 0) + 1)
+    }' "$SANDBOX_KNOWN_FILE" > "$tmp"
+  mv "$tmp" "$SANDBOX_KNOWN_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Execution: host (host-allow tier)
+# ---------------------------------------------------------------------------
+is_volta_shim_backup() {
+  local path="$1"
+  case "$path" in
+    "$HOME/.volta/bin/"*.original|*/.volta/bin/*.original) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_volta_npx_backup() {
+  local path="$1"
+  case "$path" in
+    "$HOME/.volta/tools/image/node/"*/bin/npx.original|*/.volta/tools/image/node/*/bin/npx.original) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+volta_npx_backup_for_version() {
+  local version="${1#v}"
+  local real_npx="$HOME/.volta/tools/image/node/${version}/bin/npx.original"
+  if [[ -x "$real_npx" ]]; then
+    printf '%s' "$real_npx"
+    return 0
+  fi
+  return 1
+}
+
+resolve_volta_npx_backup() {
+  local version path resolved candidate
+
+  if [[ -f "$PWD/package.json" ]]; then
+    version=$(jq -r '.volta.node // empty' "$PWD/package.json" 2>/dev/null || true)
+    if [[ -n "$version" ]]; then
+      if volta_npx_backup_for_version "$version"; then
+        return 0
+      fi
+      err "project pins Volta node $version, but its npx.original backup was not found"
+      err "expected: $HOME/.volta/tools/image/node/${version#v}/bin/npx.original"
+      return 1
+    fi
+
+    version=$(jq -r '.engines.node // empty' "$PWD/package.json" 2>/dev/null || true)
+    if [[ "$version" =~ ^v?[0-9]+(\.[0-9]+){2}$ ]] && volta_npx_backup_for_version "$version"; then
+      return 0
+    fi
+  fi
+
+  version=$(node --version 2>/dev/null | sed 's/^v//' || true)
+  if [[ -n "$version" ]] && volta_npx_backup_for_version "$version"; then
+    return 0
+  fi
+
+  if command -v volta >/dev/null 2>&1; then
+    path=$(volta which node 2>/dev/null || true)
+    if [[ "$path" =~ /node/([^/]+)/bin/node$ ]] && volta_npx_backup_for_version "${BASH_REMATCH[1]}"; then
+      return 0
+    fi
+  fi
+
+  path="$HOME/.volta/tools/user/packages/node/default"
+  if [[ -e "$path" ]]; then
+    resolved=$(readlink -f "$path" 2>/dev/null || true)
+    if [[ "$resolved" =~ /node/([^/]+)(/|$) ]] && volta_npx_backup_for_version "${BASH_REMATCH[1]}"; then
+      return 0
+    fi
+  fi
+
+  path="$HOME/.volta/tools/image/node"
+  if [[ -d "$path" ]]; then
+    candidate=$(find "$path" -mindepth 3 -maxdepth 3 -path '*/bin/npx.original' -type f -perm -u=x -print 2>/dev/null | sort -V | tail -n 1)
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+host_runner_binary() {
+  local kind="$1"
+  local saved
+  saved=$(jq -r --arg k "${kind}_real" '.runners[$k] // empty' "$CONFIG_FILE")
+  if [[ "$kind" == "npx" && -n "$saved" ]] && { is_volta_shim_backup "$saved" || is_volta_npx_backup "$saved"; }; then
+    local resolved
+    if resolved=$(resolve_volta_npx_backup); then
+      printf '%s' "$resolved"
+      return 0
+    fi
+    err "Volta npx backup cannot be resolved for the active Node version: $saved"
+    err "no executable per-version npx.original found under $HOME/.volta/tools/image/node"
+    return 1
+  fi
+  if [[ -n "$saved" && -x "$saved" ]]; then
+    printf '%s' "$saved"
+    return 0
+  fi
+  return 1
+}
+
+run_host_allow() {
+  local pkg="$1" version="$2"; shift 2
+  local args=("$@")
+  local runner_bin
+
+  case "$RUNNER_KIND" in
+    npm)
+      if ! runner_bin=$(host_runner_binary npx); then
+        die "real npx not configured. Run: safe-run link"
+      fi
+      # --yes silences npx's own confirm; --ignore-scripts blocks lifecycle.
+      "$runner_bin" --yes --ignore-scripts --package="${pkg}@${version}" \
+        -- "${pkg##*/}" "${args[@]}"
+      return $?
+      ;;
+    bun)
+      if ! runner_bin=$(host_runner_binary bunx); then
+        die "real bunx not configured. Run: safe-run link"
+      fi
+      # bun has no --ignore-scripts on bunx; trust is the whole point of host-allow.
+      "$runner_bin" "${pkg}@${version}" "${args[@]}"
+      return $?
+      ;;
+    uv)
+      if ! runner_bin=$(host_runner_binary uvx); then
+        die "real uvx not configured. Run: safe-run link"
+      fi
+      "$runner_bin" "${pkg}==${version}" "${args[@]}"
+      return $?
+      ;;
+    pipx)
+      if ! runner_bin=$(host_runner_binary pipx); then
+        die "real pipx not configured. Run: safe-run link"
+      fi
+      "$runner_bin" run --spec "${pkg}==${version}" "$pkg" "${args[@]}"
+      return $?
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Execution: Podman sandbox
+# ---------------------------------------------------------------------------
+podman_available() { command -v podman >/dev/null 2>&1; }
+
+ensure_image() {
+  local image="$1"
+  podman image exists "$image" 2>/dev/null && return 0
+  die "container image not pulled: $image
+  fix: podman pull $image"
+}
+
+build_runner_cmd_in_container() {
+  # Emits the in-container shell command that runs <pkg>@<version> args...
+  local pkg="$1" version="$2"; shift 2
+  case "$RUNNER_KIND" in
+    npm)
+      # npm_config_ignore_scripts also set via env; --yes auto-installs.
+      printf 'npx --yes --ignore-scripts %q@%q' "$pkg" "$version"
+      ;;
+    bun)
+      printf 'bunx %q@%q' "$pkg" "$version"
+      ;;
+    uv)
+      printf 'uvx %q==%q' "$pkg" "$version"
+      ;;
+    pipx)
+      # python image has no pipx; bootstrap it quietly.
+      printf 'pip install --quiet --root-user-action=ignore pipx && pipx run --spec %q==%q %q' \
+        "$pkg" "$version" "$pkg"
+      ;;
+  esac
+  local a
+  for a in "$@"; do
+    printf ' %q' "$a"
+  done
+}
+
+
+# Stop before exposing secret-like files to the sandbox, unless explicitly allowed.
+check_secrets_in_cwd() {
+  local enabled
+  enabled=$(jq -r '.warn_env_files // true' "$CONFIG_FILE" 2>/dev/null || echo true)
+  [[ "$enabled" == "true" ]] || return 0
+  [[ "$ALLOW_SECRETS" == "1" ]] && return 0
+
+  local found=()
+  local pattern
+  for pattern in .env .env.local .env.production .env.development .envrc credentials.json gha-credentials.json .npmrc .aws/credentials; do
+    [[ -e "$PWD/$pattern" ]] && found+=("$pattern")
+  done
+  if [[ ${#found[@]} -gt 0 ]]; then
+    warn "secret-like files in project dir: ${found[*]}"
+    warn "  the sandboxed package will be able to read them through the project mount"
+    warn "  pass -s/--allow-secrets to allow this without a prompt"
+    if ! is_tty; then
+      die "refusing to expose secret-like files in non-interactive mode"
+    fi
+    local ok
+    printf '  Continue and expose these files? [y/N] ' >&2
+    read -r ok </dev/tty
+    [[ "$ok" =~ ^[yY]$ ]] || die "aborted"
+  fi
+}
+
+# Common Podman flags shared by run_sandbox and cmd_install (--allow-scripts).
+build_podman_base_args() {
+  # Outputs flags separated by NULs. Caller: mapfile -d '' arr < <(build_podman_base_args)
+  local pids_limit memory cpus nofile timeout
+  pids_limit=$(sanitize_pids_limit \
+    "$(config_get '.sandbox.pids_limit' "$SANDBOX_PIDS_LIMIT_DEFAULT")")
+  memory=$(sanitize_memory_limit \
+    "$(config_get '.sandbox.memory' "$SANDBOX_MEMORY_DEFAULT")")
+  cpus=$(sanitize_cpu_limit \
+    "$(config_get '.sandbox.cpus' "$SANDBOX_CPUS_DEFAULT")")
+  nofile=$(sanitize_nofile_limit \
+    "$(config_get '.sandbox.ulimit_nofile' "$SANDBOX_NOFILE_DEFAULT")")
+  timeout=$(sanitize_timeout_limit \
+    "$(config_get '.sandbox.timeout_seconds' "$SANDBOX_TIMEOUT_DEFAULT")")
+
+  local args=(
+    --cap-drop=ALL
+    --security-opt=no-new-privileges
+    --read-only
+    --tmpfs "/tmp:rw,size=512m"
+    --tmpfs "/root:rw,size=256m"
+    --pids-limit="$pids_limit"
+    --memory="$memory"
+    --cpus="$cpus"
+    --ulimit "nofile=$nofile"
+    --timeout="$timeout"
+  )
+  if [[ "$ALLOW_NETWORK" != "1" || "$PROXY_PASSTHROUGH" != "1" ]]; then
+    args+=(--http-proxy=false)
+  fi
+  printf '%s\0' "${args[@]}"
+}
+
+run_sandbox() {
+  local pkg="$1" version="$2"; shift 2
+  podman_available || die "podman not available. install podman or add $pkg to host-allow."
+  SANDBOX_AUDIT_EXTRA="sbom_vulns=skipped"
+  check_secrets_in_cwd
+
+  local image
+  image=$(select_image "$RUNNER_KIND")
+  ensure_image "$image"
+
+  local mount_opt="ro"
+  local network_arg=()
+  if [[ "$ALLOW_NETWORK" != "1" ]]; then
+    network_arg=(--network=none)
+  fi
+  if [[ "$ALLOW_WRITE" == "1" ]]; then
+    mount_opt="rw"
+  fi
+  # With --network, let Podman pick rootless network (pasta on Podman 5+, slirp4netns on older).
+
+  local in_cmd
+  in_cmd=$(build_runner_cmd_in_container "$pkg" "$version" "$@")
+
+  local tty_flags=()
+  if is_tty; then tty_flags=(-it); fi
+
+  local base_args=()
+  mapfile -d '' -t base_args < <(build_podman_base_args)
+
+  local podman_args=(
+    create
+    "${tty_flags[@]}"
+    "${network_arg[@]}"
+    "${base_args[@]}"
+    -v "${PWD}:/work:Z,${mount_opt}"
+    -w /work
+    -e "HOME=/root"
+    -e "npm_config_ignore_scripts=true"
+    -e "PIP_DISABLE_PIP_VERSION_CHECK=1"
+    -e "PYTHONUNBUFFERED=1"
+    "$image"
+    sh -c "$in_cmd"
+  )
+
+  local container_id exit_code=0 sbom_tmp="" grype_json="" critical_count=0 grype_output=""
+  container_id=$(podman "${podman_args[@]}")
+  [[ -n "$container_id" ]] || die "failed to create sandbox container"
+
+  local start_args=(start -a)
+  if is_tty; then
+    start_args=(start -ai)
+  fi
+
+  set +e
+  podman "${start_args[@]}" "$container_id"
+  exit_code=$?
+  set -e
+
+  if command -v syft >/dev/null 2>&1; then
+    sbom_tmp="/tmp/safe-run-sbom-${container_id:0:12}.json"
+    if syft "podman:$container_id" -o cyclonedx-json > "$sbom_tmp" 2>/dev/null; then
+      if command -v grype >/dev/null 2>&1; then
+        grype_json=$(mktemp)
+        if grype "sbom:$sbom_tmp" -o json -q > "$grype_json" 2>/dev/null; then
+          critical_count=$(jq '[.matches[]? | select((.vulnerability.severity // "") == "Critical" or (.vulnerability.severity // "") == "CRITICAL")] | length' "$grype_json" 2>/dev/null || echo 0)
+          if (( critical_count > 0 )); then
+            warn "post-sandbox audit found critical CVEs in container:"
+            grype_output=$(grype "sbom:$sbom_tmp" --fail-on critical -q 2>&1 || true)
+            [[ -n "$grype_output" ]] && printf '%s\n' "$grype_output" >&2
+            SANDBOX_AUDIT_EXTRA="sbom_vulns=${critical_count}:critical"
+          else
+            SANDBOX_AUDIT_EXTRA="sbom_vulns=0"
+          fi
+        fi
+        [[ -n "$grype_json" ]] && rm -f "$grype_json"
+      fi
+    fi
+    [[ -n "$sbom_tmp" ]] && rm -f "$sbom_tmp"
+  fi
+
+  podman rm "$container_id" >/dev/null 2>&1 || true
+  return "$exit_code"
+}
+
+run_sandbox_with_audit_log() {
+  local runner_label="$1" pkgver="$2" pkg="$3" version="$4"
+  shift 4
+  local rc decision
+  set +e
+  run_sandbox "$pkg" "$version" "$@"
+  rc=$?
+  set -e
+  decision="OK"
+  [[ "$rc" -ne 0 ]] && decision="EXIT_${rc}"
+  audit_log "$runner_label" "$pkgver" "SANDBOX" "$(context_label)" "$decision" "$SANDBOX_AUDIT_EXTRA"
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Top-level dispatch for a runtime invocation
+# ---------------------------------------------------------------------------
+prompt_unknown() {
+  local pkg="$1" version="$2"
+  local choice
+  printf '\033[33msafe-run:\033[0m %s@%s is not in any list.\n' "$pkg" "$version" >&2
+  printf '  Run in Podman sandbox? [y]es / [a]lways / [N]o: ' >&2
+  read -r choice </dev/tty
+  case "$choice" in
+    y|Y|yes) return 0 ;;
+    a|A|always)
+      mark_sandbox_known "$pkg" "$version"
+      info "added $pkg to sandbox-known"
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+dispatch_run() {
+  local pkg version pkgver runner_label
+  pkg=$(normalize_package_name "$PKG_NAME" "$RUNNER_KIND")
+  PKG_NAME="$pkg"
+  version="$PKG_VERSION"
+  pkgver="${pkg}@${version}"
+  case "$RUNNER_KIND" in
+    npm) runner_label=npx ;;
+    bun) runner_label=bunx ;;
+    uv) runner_label=uvx ;;
+    pipx) runner_label=pipx ;;
+  esac
+
+  if ! validate_package_name "$pkg" "$RUNNER_KIND"; then
+    err "REJECTED: invalid package name (path traversal, encoded chars, or invalid charset)"
+    audit_log "$runner_label" "$pkgver" "REJECTED" "$(context_label)" "INVALID_PACKAGE_NAME" "$(caller_info)"
+    exit 103
+  fi
+
+  if in_blocked "$pkg"; then
+    err "BLOCKED: $pkgver — $BLOCKED_REASON"
+    audit_log "$runner_label" "$pkgver" "BLOCKED" "$(context_label)" "REFUSED" "reason=$BLOCKED_REASON"
+    exit 100
+  fi
+
+  # Host-allow tier is npm-only: only npx supports --ignore-scripts. For other
+  # runners, host-allow entries are ignored and we fall through to sandbox.
+  if [[ "$RUNNER_KIND" == "npm" ]]; then
+    if in_host_allow "$pkg" "$version"; then
+      local exec_version="$version" decision="OK"
+      if [[ "$PKG_VERSION_USER_SPECIFIED" == "0" || "$version" == "latest" ]]; then
+        exec_version="$HOST_ALLOW_PINNED_VERSION"
+        decision="HOST_ALLOW_PINNED pinned=$exec_version"
+        info "host-allow: substituting pinned version ${pkg}@${exec_version}"
+      fi
+      audit_log "$runner_label" "${pkg}@${exec_version}" "HOST_ALLOW" "$(context_label)" "$decision"
+      info "host-allow: running ${pkg}@${exec_version} on host with --ignore-scripts"
+      local rc
+      set +e
+      run_host_allow "$pkg" "$exec_version" "$@"
+      rc=$?
+      set -e
+      log_host_allow_execution "$pkg" "$exec_version" "$runner_label"
+      return "$rc"
+    fi
+
+    # Version mismatch: package is in host-allow but user requested a different version.
+    if [[ -n "$HOST_ALLOW_PINNED_VERSION" ]]; then
+      err "BLOCKED: $pkgver — host-allow pinned to ${pkg}@${HOST_ALLOW_PINNED_VERSION}"
+      err "  to update: safe-run host-allow update ${pkg}@${version} --reason \"...\""
+      audit_log "$runner_label" "$pkgver" "BLOCKED" "$(context_label)" "VERSION_MISMATCH" "pinned=$HOST_ALLOW_PINNED_VERSION"
+      exit 101
+    fi
+  else
+    # Note in audit if a host-allow entry was bypassed because runner lacks
+    # ignore-scripts support. (Only relevant info; not an error.)
+    local ha_entry
+    ha_entry=$(jq -r --arg p "$pkg" '.packages[$p] // empty' "$HOST_ALLOW_FILE")
+    if [[ -n "$ha_entry" ]]; then
+      audit_log "$runner_label" "$pkgver" "INFO" "$(context_label)" \
+        "HOST_ALLOW_SKIPPED_NO_IGNORE_SCRIPTS" "runner=$runner_label"
+      info "host-allow ignored for $runner_label (no --ignore-scripts equivalent); using sandbox"
+    fi
+  fi
+
+  local safe_audit_state=2
+  set +e
+  safe_audit_check_unknown "$pkg" "$version"
+  safe_audit_state=$?
+  set -e
+  case "$safe_audit_state" in
+    20)
+      err "BLOCKED: $pkgver — safe-audit reported BLOCK"
+      audit_log "$runner_label" "$pkgver" "BLOCKED" "$(context_label)" "SAFE_AUDIT_BLOCK"
+      exit 104
+      ;;
+    10)
+      warn "safe-audit flagged $pkgver for review before sandboxing"
+      ;;
+    2)
+      warn "safe-audit preflight unavailable or inconclusive; continuing with sandbox policy"
+      ;;
+  esac
+
+  if in_sandbox_known "$pkg"; then
+    info "sandbox-known: running $pkgver in Podman"
+    mark_sandbox_known "$pkg" "$version"
+    run_sandbox_with_audit_log "$runner_label" "$pkgver" "$pkg" "$version" "$@"
+    return $?
+  fi
+
+  if ! is_tty; then
+    err "BLOCKED: $pkgver is unknown and invocation is non-interactive"
+    err "  to allow: run interactively first, or: safe-run host-allow add ..."
+    audit_log "$runner_label" "$pkgver" "UNKNOWN" "$(context_label)" "BLOCKED" "$(caller_info)"
+    exit 102
+  fi
+
+  if [[ "$SKIP_PROMPT" == "1" ]] || prompt_unknown "$pkg" "$version"; then
+    info "sandboxing $pkgver"
+    [[ "$SKIP_PROMPT" == "1" ]] && mark_sandbox_known "$pkg" "$version"
+    run_sandbox_with_audit_log "$runner_label" "$pkgver" "$pkg" "$version" "$@"
+  else
+    audit_log "$runner_label" "$pkgver" "UNKNOWN" "$(context_label)" "USER_DECLINED"
+    err "declined"
+    exit 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# CLI: argument parsing for runner-style invocation
+# ---------------------------------------------------------------------------
+parse_runner_args() {
+  local positional=()
+  local saw_dashdash=0
+  local package_seen=0
+  while [[ $# -gt 0 ]]; do
+    if [[ "$package_seen" == "1" ]]; then
+      if [[ "$saw_dashdash" == "0" && "$1" == "--" ]]; then
+        saw_dashdash=1; shift; continue
+      fi
+      positional+=("$1"); shift; continue
+    fi
+    if [[ "$saw_dashdash" == "1" ]]; then
+      positional+=("$1"); shift; continue
+    fi
+    case "$1" in
+      --strict) STRICT_MODE=1; ALLOW_WRITE=0; ALLOW_NETWORK=0; shift ;;
+      -w|--write) ALLOW_WRITE=1; STRICT_MODE=0; shift ;;
+      -n|--network) ALLOW_NETWORK=1; STRICT_MODE=0; shift ;;
+      -s|--allow-secrets) ALLOW_SECRETS=1; shift ;;
+      --node22) NODE_VERSION_FLAG=22; shift ;;
+      --node24) NODE_VERSION_FLAG=24; shift ;;
+      --py312)  PY_VERSION_FLAG=312;  shift ;;
+      --py314)  PY_VERSION_FLAG=314;  shift ;;
+      --proxy)  PROXY_PASSTHROUGH=1;  shift ;;
+      -y|--yes) SKIP_PROMPT=1; shift ;;
+      --)       saw_dashdash=1; shift ;;
+      -h|--help) show_usage; exit 0 ;;
+      -v|--version) echo "safe-run $SAFE_RUN_VERSION"; exit 0 ;;
+      -*)
+        # Unknown safe-run flag before the package is treated as positional
+        # (npx passes flags through too). Once we have a package, treat the
+        # rest as args.
+        positional+=("$1"); package_seen=1; shift
+        ;;
+      *)
+        positional+=("$1"); package_seen=1; shift
+        ;;
+    esac
+  done
+  if [[ ${#positional[@]} -eq 0 ]]; then
+    show_usage
+    exit 1
+  fi
+  if [[ "$ALLOW_NETWORK" != "1" && "$PROXY_PASSTHROUGH" == "1" ]]; then
+    printf '%s\n' '[safe-run] WARNING: --proxy ignored because network is disabled' >&2
+    PROXY_PASSTHROUGH=0
+  fi
+  parse_package "${positional[0]}"
+  RUN_ARGS=("${positional[@]:1}")
+}
+
+handle_runner_invocation() {
+  parse_runner_args "$@"
+  dispatch_run "${RUN_ARGS[@]+"${RUN_ARGS[@]}"}"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands: host-allow
+# ---------------------------------------------------------------------------
+registry_integrity_npm() {
+  local pkg="$1" version="$2"
+  local url="https://registry.npmjs.org/${pkg}/${version}"
+  local body
+  body=$(curl -fsSL "$url" 2>/dev/null) || return 1
+  printf '%s' "$body" | jq -r '.dist.integrity // .dist.shasum // empty'
+}
+
+registry_integrity_pypi() {
+  local pkg="$1" version="$2"
+  local url="https://pypi.org/pypi/${pkg}/${version}/json"
+  local body
+  body=$(curl -fsSL "$url" 2>/dev/null) || return 1
+  printf '%s' "$body" | jq -r '.urls[0].digests.sha256 // empty' | \
+    sed 's/^/sha256-/'
+}
+
+host_allow_preflight_audit() {
+  local pkg="$1" version="$2" ecosystem="$3" reason="$4" action="$5"
+  local pkgver="${pkg}@${version}" state ok
+  set +e
+  safe_audit_check_spec "$pkg" "$version" "$ecosystem"
+  state=$?
+  set -e
+  case "$state" in
+    0)
+      ;;
+    10)
+      warn "safe-audit flagged $pkgver before host-allow"
+      [[ -n "$reason" ]] || die "--reason is required to override safe-audit WARN"
+      if ! is_tty; then
+        die "host-allow requires interactive confirmation for safe-audit WARN"
+      fi
+      printf '  %s host-allow anyway? [y/N] ' "$action" >&2
+      read -r ok </dev/tty
+      [[ "$ok" =~ ^[yY]$ ]] || die "aborted"
+      ;;
+    20)
+      warn "safe-audit reported BLOCK for $pkgver before host-allow"
+      [[ -n "$reason" ]] || die "--reason is required to override safe-audit BLOCK"
+      if ! is_tty; then
+        die "host-allow requires interactive confirmation for safe-audit BLOCK"
+      fi
+      printf '  %s host-allow anyway? [y/N] ' "$action" >&2
+      read -r ok </dev/tty
+      [[ "$ok" =~ ^[yY]$ ]] || die "aborted"
+      ;;
+    2)
+      warn "safe-audit preflight unavailable or inconclusive before host-allow"
+      [[ -n "$reason" ]] || die "--reason is required when safe-audit is unavailable or inconclusive"
+      ;;
+  esac
+}
+
+write_host_allow_entry() {
+  local pkg="$1" version="$2" sha="$3" reason="$4" ecosystem="$5"
+  local tmp
+  tmp=$(mktemp)
+  jq --arg p "$pkg" --arg v "$version" --arg s "$sha" \
+     --arg r "$reason" --arg d "$(date -I)" --arg e "$ecosystem" '
+    .packages[$p] = {
+      version: $v,
+      sha: $s,
+      ecosystem: $e,
+      added: $d,
+      reason: $r
+    }' "$HOST_ALLOW_FILE" > "$tmp"
+  mv "$tmp" "$HOST_ALLOW_FILE"
+}
+
+cmd_host_allow() {
+  local sub="${1:-list}"
+  shift || true
+  case "$sub" in
+    add)    cmd_host_allow_add "$@" ;;
+    remove|rm) cmd_host_allow_remove "$@" ;;
+    update) cmd_host_allow_update "$@" ;;
+    list|ls|"") cmd_host_allow_list ;;
+    *)      die "unknown host-allow subcommand: $sub" ;;
+  esac
+}
+
+cmd_host_allow_add() {
+  local spec="${1:-}"
+  shift || true
+  [[ -z "$spec" ]] && die "usage: safe-run host-allow add <pkg>@<version> [--reason \"...\"]"
+  local reason="" ecosystem="npm"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reason) reason="$2"; shift 2 ;;
+      --ecosystem) ecosystem="$2"; shift 2 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+  parse_package "$spec"
+  [[ "$PKG_VERSION" == "latest" ]] && die "host-allow requires an explicit version, not 'latest'"
+  local package_kind
+  package_kind=$(ecosystem_to_runner_kind "$ecosystem") || die "unknown --ecosystem: $ecosystem"
+  PKG_NAME=$(normalize_and_validate_package_or_die "$PKG_NAME" "$package_kind" "$spec")
+  host_allow_preflight_audit "$PKG_NAME" "$PKG_VERSION" "$ecosystem" "$reason" "Add to"
+
+  local sha=""
+  case "$ecosystem" in
+    npm|bun) sha=$(registry_integrity_npm "$PKG_NAME" "$PKG_VERSION") || true ;;
+    py|python|uv|pipx) sha=$(registry_integrity_pypi "$PKG_NAME" "$PKG_VERSION") || true ;;
+    *) die "unknown --ecosystem: $ecosystem" ;;
+  esac
+  [[ -z "$sha" ]] && warn "could not fetch integrity for ${PKG_NAME}@${PKG_VERSION} (added without SHA)"
+
+  write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem"
+  info "added ${PKG_NAME}@${PKG_VERSION} to host-allow"
+}
+
+cmd_host_allow_remove() {
+  local pkg="${1:-}"
+  [[ -z "$pkg" ]] && die "usage: safe-run host-allow remove <pkg>"
+  pkg=$(resolve_package_key_in_file "$HOST_ALLOW_FILE" "$pkg")
+  local tmp
+  tmp=$(mktemp)
+  jq --arg p "$pkg" 'del(.packages[$p])' "$HOST_ALLOW_FILE" > "$tmp"
+  mv "$tmp" "$HOST_ALLOW_FILE"
+  info "removed $pkg from host-allow"
+}
+
+cmd_host_allow_update() {
+  local spec="${1:-}"
+  shift || true
+  [[ -z "$spec" ]] && die "usage: safe-run host-allow update <pkg>@<new-version> [--reason \"...\"]"
+  local reason=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reason) reason="$2"; shift 2 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+  parse_package "$spec"
+  [[ "$PKG_VERSION" == "latest" ]] && die "host-allow requires an explicit version, not 'latest'"
+  PKG_NAME=$(resolve_package_key_in_file "$HOST_ALLOW_FILE" "$PKG_NAME")
+  local existing
+  existing=$(jq -r --arg p "$PKG_NAME" '.packages[$p] // empty' "$HOST_ALLOW_FILE")
+  [[ -z "$existing" ]] && die "$PKG_NAME not in host-allow"
+  local ecosystem
+  ecosystem=$(printf '%s' "$existing" | jq -r '.ecosystem // "npm"')
+  if is_tty; then
+    local old_version
+    old_version=$(printf '%s' "$existing" | jq -r '.version')
+    printf '\033[33msafe-run:\033[0m update %s from %s to %s? [y/N] ' "$PKG_NAME" "$old_version" "$PKG_VERSION" >&2
+    local ok; read -r ok </dev/tty
+    [[ "$ok" =~ ^[yY]$ ]] || die "aborted"
+  fi
+  host_allow_preflight_audit "$PKG_NAME" "$PKG_VERSION" "$ecosystem" "$reason" "Update"
+  local sha=""
+  case "$ecosystem" in
+    npm|bun) sha=$(registry_integrity_npm "$PKG_NAME" "$PKG_VERSION") || true ;;
+    py|python|uv|pipx) sha=$(registry_integrity_pypi "$PKG_NAME" "$PKG_VERSION") || true ;;
+    *) die "unknown --ecosystem: $ecosystem" ;;
+  esac
+  [[ -z "$sha" ]] && warn "could not fetch integrity for ${PKG_NAME}@${PKG_VERSION} (updated without SHA)"
+  write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem"
+  info "updated ${PKG_NAME}@${PKG_VERSION} in host-allow"
+}
+
+cmd_host_allow_list() {
+  jq -r '.packages | to_entries[] |
+    "\(.key)@\(.value.version)\t\(.value.ecosystem // "npm")\t\(.value.added)\t\(.value.reason)"' \
+    "$HOST_ALLOW_FILE" | \
+    awk -F'\t' 'BEGIN{printf "%-40s %-8s %-12s %s\n","PACKAGE","ECO","ADDED","REASON"}
+                {printf "%-40s %-8s %-12s %s\n",$1,$2,$3,$4}'
+  printf '\nnote: host-allow tier ONLY applies to npm/npx (uses --ignore-scripts).\n'
+  printf '      bunx/uvx/pipx invocations of these packages still go through the sandbox.\n'
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands: block
+# ---------------------------------------------------------------------------
+cmd_block() {
+  local sub="${1:-list}"
+  shift || true
+  case "$sub" in
+    add)        cmd_block_add "$@" ;;
+    remove|rm)  cmd_block_remove "$@" ;;
+    list|ls|"") cmd_block_list ;;
+    import)     cmd_block_import "$@" ;;
+    *)          die "unknown block subcommand: $sub" ;;
+  esac
+}
+
+cmd_block_add() {
+  local pkg="${1:-}"
+  shift || true
+  [[ -z "$pkg" ]] && die "usage: safe-run block add <pkg> --reason \"...\""
+  local reason=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reason) reason="$2"; shift 2 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+  [[ -z "$reason" ]] && die "--reason is required"
+  pkg=$(normalize_block_package_name_or_die "$pkg")
+  local tmp; tmp=$(mktemp)
+  jq --arg p "$pkg" --arg r "$reason" --arg d "$(date -I)" '
+    .packages[$p] = { reason: $r, added: $d }' "$BLOCKED_FILE" > "$tmp"
+  mv "$tmp" "$BLOCKED_FILE"
+  info "blocked $pkg"
+}
+
+cmd_block_remove() {
+  local pkg="${1:-}"
+  [[ -z "$pkg" ]] && die "usage: safe-run block remove <pkg>"
+  pkg=$(resolve_package_key_in_file "$BLOCKED_FILE" "$pkg")
+  local tmp; tmp=$(mktemp)
+  jq --arg p "$pkg" 'del(.packages[$p])' "$BLOCKED_FILE" > "$tmp"
+  mv "$tmp" "$BLOCKED_FILE"
+  info "unblocked $pkg"
+}
+
+cmd_block_list() {
+  jq -r '.packages | to_entries[] | "\(.key)\t\(.value.added)\t\(.value.reason)"' "$BLOCKED_FILE" | \
+    awk -F'\t' 'BEGIN{printf "%-40s %-12s %s\n","PACKAGE","ADDED","REASON"}
+                {printf "%-40s %-12s %s\n",$1,$2,$3}'
+}
+
+cmd_block_import() {
+  local source="${1:-}"
+  [[ -z "$source" ]] && die "usage: safe-run block import <url-or-file>"
+  local body
+  if [[ -f "$source" ]]; then
+    body=$(cat "$source")
+  else
+    body=$(curl -fsSL "$source") || die "fetch failed: $source"
+  fi
+  local tmp imported_tmp today
+  tmp=$(mktemp)
+  imported_tmp=$(mktemp)
+  today=$(date -I)
+
+  if printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
+    # JSON input: take .packages as-is.
+    printf '%s' "$body" > "$imported_tmp"
+  else
+    # Newline-delimited: each line is "pkg" or "pkg | reason".
+    # Use jq -R -s to parse safely; never construct JSON via string concat.
+    printf '%s' "$body" | jq -R -s --arg today "$today" '
+      split("\n")
+      | map(select(length > 0))
+      | map(
+          (split("|") | map(. | gsub("^ +| +$"; "")))
+          as $parts
+          | {
+              key: $parts[0],
+              value: { reason: ($parts[1] // "imported"), added: $today }
+            }
+        )
+      | map(select(.key | length > 0))
+      | { packages: from_entries }
+    ' > "$imported_tmp"
+  fi
+
+  local normalized_tmp
+  normalized_tmp=$(mktemp)
+  printf '%s\n' '{"packages":{}}' > "$normalized_tmp"
+  while IFS=$'\t' read -r pkg reason added; do
+    local normalized_pkg normalized_merge_tmp
+    normalized_pkg=$(normalize_block_package_name_or_warn "$pkg") || continue
+    normalized_merge_tmp=$(mktemp)
+    jq --arg p "$normalized_pkg" --arg r "$reason" --arg d "$added" '
+      .packages[$p] = { reason: $r, added: $d }' "$normalized_tmp" > "$normalized_merge_tmp"
+    mv "$normalized_merge_tmp" "$normalized_tmp"
+  done < <(
+    jq -r --arg today "$today" '
+      .packages
+      | to_entries[]
+      | [.key, (.value.reason // "imported"), (.value.added // $today)]
+      | @tsv
+    ' "$imported_tmp"
+  )
+
+  jq -s '.[0].packages = (.[0].packages + .[1].packages) | .[0]' \
+    "$BLOCKED_FILE" "$normalized_tmp" > "$tmp"
+  mv "$tmp" "$BLOCKED_FILE"
+  rm -f "$imported_tmp" "$normalized_tmp"
+  local count
+  count=$(jq '.packages | length' "$BLOCKED_FILE")
+  info "blocklist now has $count entries"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands: audit, status
+# ---------------------------------------------------------------------------
+cmd_audit() {
+  local filter_blocked=0 since=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --blocked) filter_blocked=1; shift ;;
+      --since)   since="$2"; shift 2 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+  [[ -f "$AUDIT_LOG" ]] || { echo "no audit log yet"; return 0; }
+  local awk_filter='1'
+  if [[ "$filter_blocked" == "1" ]]; then
+    awk_filter='/BLOCKED|REFUSED|VERSION_MISMATCH/'
+  fi
+  if [[ -n "$since" ]]; then
+    local cutoff
+    cutoff=$(date -Iseconds -d "$since ago" 2>/dev/null) || die "invalid --since value"
+    awk -v cutoff="$cutoff" -v base="$awk_filter" '
+      $0>=cutoff' "$AUDIT_LOG" | awk "$awk_filter"
+  else
+    awk "$awk_filter" "$AUDIT_LOG"
+  fi
+}
+
+cmd_status() {
+  local host_count sandbox_count blocked_count
+  host_count=$(jq '.packages | length' "$HOST_ALLOW_FILE")
+  sandbox_count=$(jq '.packages | length' "$SANDBOX_KNOWN_FILE")
+  blocked_count=$(jq '.packages | length' "$BLOCKED_FILE")
+
+  echo "safe-run $SAFE_RUN_VERSION"
+  echo "config: $CONFIG_DIR"
+  echo "log:    $AUDIT_LOG"
+  echo
+  printf "host-allow:     %d (npm-only; bunx/uvx/pipx ignore these)\n" "$host_count"
+  printf "sandbox-known:  %d\n" "$sandbox_count"
+  printf "blocked:        %d\n" "$blocked_count"
+  echo
+  if podman_available; then
+    echo "podman: $(podman --version)"
+    echo "images:"
+    local img
+    for img in "$NODE_IMAGE_DEFAULT" "$NODE_IMAGE_ALT" "$BUN_IMAGE" \
+               "$UV_IMAGE_DEFAULT" "$UV_IMAGE_ALT" \
+               "$PYTHON_IMAGE_DEFAULT" "$PYTHON_IMAGE_ALT"; do
+      if podman image exists "$img" 2>/dev/null; then
+        printf "  [x] %s\n" "$img"
+      else
+        printf "  [ ] %s\n" "$img"
+      fi
+    done
+  else
+    warn "podman not available"
+  fi
+  echo
+  echo "real runners (host-allow exec):"
+  local k
+  for k in npx bunx uvx; do
+    local path
+    path=$(jq -r --arg k "${k}_real" '.runners[$k] // empty' "$CONFIG_FILE")
+    if [[ -n "$path" && -x "$path" ]]; then
+      printf "  [x] %s -> %s\n" "$k" "$path"
+    else
+      printf "  [ ] %s (not linked; run: safe-run link)\n" "$k"
+    fi
+  done
+  printf "  [ ] pipx: use safe-pipx-run (not auto-linked)\n"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands: link / unlink (replace system runners with safe-run)
+# ---------------------------------------------------------------------------
+# Pipx is intentionally NOT linked: replacing /usr/bin/pipx would break
+# `pipx install/list/upgrade`. Users must invoke `safe-pipx-run` explicitly
+# when they want sandboxed `pipx run`.
+LINK_RUNNERS=(npx bunx uvx)
+
+backup_path_for() { printf '%s.original' "$1"; }
+
+# Privileged write wrapper: tries direct write, falls back to sudo.
+_sudo_if_needed() {
+  local dir="$1"; shift
+  if [[ -w "$dir" ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+# Rollback log: stack of completed ops stored in arrays to preserve spaces.
+# OPs: BACKUP <path> <backup>   (undo: move backup back to path)
+#      SYMLINK <path>           (undo: rm symlink)
+#      CONFIG_SET <key>         (undo: set key to null)
+LINK_ROLLBACK_ACTIVE=0
+LINK_ROLLBACK_OPS=()
+LINK_ROLLBACK_ARG1=()
+LINK_ROLLBACK_ARG2=()
+LINK_TARGET_KEYS=()
+LINK_TARGET_PATHS=()
+
+_link_rollback_init() {
+  LINK_ROLLBACK_ACTIVE=1
+  LINK_ROLLBACK_OPS=()
+  LINK_ROLLBACK_ARG1=()
+  LINK_ROLLBACK_ARG2=()
+  trap '_link_rollback_run' INT TERM ERR
+}
+
+_link_rollback_record() {
+  LINK_ROLLBACK_OPS+=("$1")
+  LINK_ROLLBACK_ARG1+=("${2:-}")
+  LINK_ROLLBACK_ARG2+=("${3:-}")
+}
+
+_link_rollback_clear() {
+  LINK_ROLLBACK_ACTIVE=0
+  trap - INT TERM ERR
+  LINK_ROLLBACK_OPS=()
+  LINK_ROLLBACK_ARG1=()
+  LINK_ROLLBACK_ARG2=()
+}
+
+_link_rollback_run() {
+  local code=$?
+  trap - INT TERM ERR
+  [[ "$LINK_ROLLBACK_ACTIVE" == "1" ]] || exit "$code"
+  LINK_ROLLBACK_ACTIVE=0
+  err "interrupted/failed during link; rolling back"
+  local i op a1 a2
+  for ((i=${#LINK_ROLLBACK_OPS[@]}-1; i>=0; i--)); do
+    op="${LINK_ROLLBACK_OPS[$i]}"
+    a1="${LINK_ROLLBACK_ARG1[$i]}"
+    a2="${LINK_ROLLBACK_ARG2[$i]}"
+    case "$op" in
+      SYMLINK)
+        if [[ -L "$a1" ]]; then
+          _sudo_if_needed "$(dirname "$a1")" rm -f "$a1"
+        fi
+        ;;
+      BACKUP)
+        if [[ -e "$a2" && ! -e "$a1" ]]; then
+          _sudo_if_needed "$(dirname "$a1")" mv "$a2" "$a1"
+        fi
+        ;;
+      CONFIG_SET)
+        local tmp; tmp=$(mktemp)
+        jq --arg k "$a1" '.runners[$k] = null' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+        ;;
+    esac
+  done
+  LINK_ROLLBACK_OPS=()
+  LINK_ROLLBACK_ARG1=()
+  LINK_ROLLBACK_ARG2=()
+  exit "$code"
+}
+
+_link_collect_targets() {
+  LINK_TARGET_KEYS=()
+  LINK_TARGET_PATHS=()
+
+  local k path
+  for k in "${LINK_RUNNERS[@]}"; do
+    path=$(command -v "$k" 2>/dev/null || true)
+    if [[ -z "$path" ]]; then
+      warn "$k: not found in PATH (skipping)"
+      continue
+    fi
+    LINK_TARGET_KEYS+=("$k")
+    LINK_TARGET_PATHS+=("$path")
+  done
+
+  local volta_dir="$HOME/.volta/tools/image/node"
+  if [[ -d "$volta_dir" ]]; then
+    while IFS= read -r -d '' path; do
+      LINK_TARGET_KEYS+=("npx-volta")
+      LINK_TARGET_PATHS+=("$path")
+    done < <(find "$volta_dir" -maxdepth 4 -name npx -print0 2>/dev/null)
+  fi
+}
+
+_link_preflight_targets() {
+  local target_script="$1"
+  local conflict_keys=() conflict_paths=() conflict_backups=()
+  local i k path backup real
+
+  for i in "${!LINK_TARGET_KEYS[@]}"; do
+    k="${LINK_TARGET_KEYS[$i]}"
+    path="${LINK_TARGET_PATHS[$i]}"
+    backup=$(backup_path_for "$path")
+    real=$(readlink -f "$path" 2>/dev/null || printf '%s' "$path")
+
+    [[ "$real" == "$target_script" ]] && continue
+
+    if [[ -e "$backup" && "$FORCE_LINK" != "1" ]]; then
+      if [[ -L "$path" ]] && [[ "$(readlink -f "$path")" == "$target_script" ]]; then
+        continue
+      fi
+      conflict_keys+=("$k")
+      conflict_paths+=("$path")
+      conflict_backups+=("$backup")
+    fi
+  done
+
+  if [[ ${#conflict_keys[@]} -gt 0 ]]; then
+    for i in "${!conflict_keys[@]}"; do
+      err "${conflict_keys[$i]}: ${conflict_backups[$i]} already exists but ${conflict_paths[$i]} is not a safe-run symlink"
+    done
+    err "refusing to overwrite. Investigate, then re-run with --force if intended."
+    return 1
+  fi
+}
+
+# Link a single binary path. Honors stale-backup safety + transactional rollback.
+_link_one() {
+  local k="$1" path="$2" target_script="$3"
+  local backup real
+  backup=$(backup_path_for "$path")
+  real=$(readlink -f "$path" 2>/dev/null || printf '%s' "$path")
+
+  if [[ "$real" == "$target_script" ]]; then
+    info "$k: already linked to safe-run (skipping $path)"
+    return 0
+  fi
+
+  if [[ -e "$backup" ]]; then
+    # Stale-backup case from WARNING 7:
+    # safe to proceed only if the current binary is already a safe-run symlink.
+    if [[ -L "$path" ]] && [[ "$(readlink -f "$path")" == "$target_script" ]]; then
+      info "$k: re-linking $path (existing $backup preserved)"
+    elif [[ "$FORCE_LINK" == "1" ]]; then
+      warn "$k: --force: overwriting current binary at $path; backup $backup preserved"
+    else
+      err "$k: $backup already exists but $path is not a safe-run symlink"
+      err "  refusing to overwrite. Investigate, then re-run with --force if intended."
+      return 1
+    fi
+  else
+    info "$k: backing up $path -> $backup"
+    _sudo_if_needed "$(dirname "$path")" mv "$path" "$backup" || return 1
+    _link_rollback_record BACKUP "$path" "$backup"
+  fi
+
+  local tmp; tmp=$(mktemp)
+  jq --arg k "${k}_real" --arg v "$backup" '.runners[$k] = $v' "$CONFIG_FILE" > "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+  _link_rollback_record CONFIG_SET "${k}_real"
+
+  _sudo_if_needed "$(dirname "$path")" ln -sf "$target_script" "$path" || return 1
+  _link_rollback_record SYMLINK "$path"
+  info "$k: linked $path -> safe-run"
+}
+
+_link_fix_volta_npx_real() {
+  local saved resolved tmp
+  saved=$(jq -r '.runners.npx_real // empty' "$CONFIG_FILE")
+  if [[ -n "$saved" ]] && is_volta_shim_backup "$saved"; then
+    if resolved=$(resolve_volta_npx_backup); then
+      tmp=$(mktemp)
+      jq --arg v "$resolved" '.runners.npx_real = $v' "$CONFIG_FILE" > "$tmp"
+      mv "$tmp" "$CONFIG_FILE"
+      info "npx: using Volta per-version backup for host-allow: $resolved"
+    else
+      warn "npx: Volta shim backup saved; host-allow will require a per-version npx.original"
+    fi
+  fi
+}
+
+cmd_link() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) FORCE_LINK=1; shift ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+
+  local target_script
+  target_script="$HOME/.local/bin/safe-run"
+  [[ -x "$target_script" ]] || die "safe-run not installed at $target_script. Run install.sh first."
+
+  _link_collect_targets
+  _link_preflight_targets "$target_script"
+  _link_rollback_init
+
+  local i k path
+  for i in "${!LINK_TARGET_KEYS[@]}"; do
+    k="${LINK_TARGET_KEYS[$i]}"
+    path="${LINK_TARGET_PATHS[$i]}"
+    _link_one "$k" "$path" "$target_script" || { _link_rollback_run; }
+  done
+  _link_fix_volta_npx_real
+
+  # Convenience symlinks under ~/.local/bin (does not affect pipx itself).
+  local convenience
+  for convenience in safe-npx safe-bunx safe-uvx safe-pipx-run; do
+    ln -sf "$target_script" "$HOME/.local/bin/$convenience"
+  done
+
+  _link_rollback_clear
+  info "link complete. Run: safe-run status"
+  info "note: pipx was intentionally not linked. Use 'safe-pipx-run' for sandboxed pipx execution."
+}
+
+cmd_unlink() {
+  local k path backup
+  for k in "${LINK_RUNNERS[@]}"; do
+    backup=$(jq -r --arg k "${k}_real" '.runners[$k] // empty' "$CONFIG_FILE")
+    [[ -z "$backup" || ! -e "$backup" ]] && continue
+    path="${backup%.original}"
+    if [[ -L "$path" ]]; then
+      local current_target
+      current_target=$(readlink -f "$path" 2>/dev/null || true)
+      if [[ "$current_target" != "$HOME/.local/bin/safe-run" ]]; then
+        warn "$k: $path is a symlink but does not point to safe-run ($current_target); skipping restore"
+        continue
+      fi
+      _sudo_if_needed "$(dirname "$path")" rm -f "$path"
+      _sudo_if_needed "$(dirname "$path")" mv "$backup" "$path"
+      info "$k: restored $path"
+    else
+      warn "$k: $path is not a symlink; not touching"
+      continue
+    fi
+    local tmp; tmp=$(mktemp)
+    jq --arg k "${k}_real" '.runners[$k] = null' "$CONFIG_FILE" > "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+  done
+
+  # If npx_real was corrected to a per-version Volta binary for host-allow,
+  # the top-level Volta npx shim still has its own backup to restore.
+  local volta_shim="$HOME/.volta/bin/npx"
+  local volta_shim_backup="$HOME/.volta/bin/npx.original"
+  if [[ -e "$volta_shim_backup" ]]; then
+    if [[ -L "$volta_shim" ]]; then
+      local target
+      target=$(readlink -f "$volta_shim" 2>/dev/null || true)
+      if [[ "$target" == "$HOME/.local/bin/safe-run" ]]; then
+        _sudo_if_needed "$(dirname "$volta_shim")" rm -f "$volta_shim"
+        _sudo_if_needed "$(dirname "$volta_shim")" mv "$volta_shim_backup" "$volta_shim"
+        info "volta: restored $volta_shim"
+      else
+        warn "volta: $volta_shim does not point to safe-run; skipping"
+      fi
+    elif [[ ! -e "$volta_shim" ]]; then
+      _sudo_if_needed "$(dirname "$volta_shim")" mv "$volta_shim_backup" "$volta_shim"
+      info "volta: restored $volta_shim"
+    else
+      warn "volta: $volta_shim exists and is not a symlink; not touching"
+    fi
+  fi
+
+  # Restore Volta npx shims (with same target-verification).
+  local volta_dir="$HOME/.volta/tools/image/node"
+  if [[ -d "$volta_dir" ]]; then
+    local backup_path original target
+    while IFS= read -r -d '' backup_path; do
+      original="${backup_path%.original}"
+      if [[ -L "$original" ]]; then
+        target=$(readlink -f "$original" 2>/dev/null || true)
+        if [[ "$target" != "$HOME/.local/bin/safe-run" ]]; then
+          warn "volta: $original does not point to safe-run; skipping"
+          continue
+        fi
+        rm -f "$original"
+      fi
+      mv "$backup_path" "$original"
+      info "volta: restored $original"
+    done < <(find "$volta_dir" -maxdepth 4 -name 'npx.original' -print0 2>/dev/null)
+  fi
+
+  local tmp; tmp=$(mktemp)
+  jq 'del(.runners["npx-volta_real"])' "$CONFIG_FILE" > "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+
+  info "unlink complete"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: install --allow-scripts <pkg> (runs npm install in sandbox WITH scripts)
+# ---------------------------------------------------------------------------
+cmd_install() {
+  local allow_scripts=0
+  local args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --allow-scripts) allow_scripts=1; shift ;;
+      --strict) STRICT_MODE=1; ALLOW_WRITE=0; ALLOW_NETWORK=0; shift ;;
+      -w|--write) ALLOW_WRITE=1; STRICT_MODE=0; shift ;;
+      -n|--network) ALLOW_NETWORK=1; STRICT_MODE=0; shift ;;
+      -s|--allow-secrets) ALLOW_SECRETS=1; shift ;;
+      --proxy) PROXY_PASSTHROUGH=1; shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  [[ ${#args[@]} -eq 0 ]] && die "usage: safe-run install [--allow-scripts] <pkg>@<version> [...]"
+  if [[ "$ALLOW_NETWORK" != "1" && "$PROXY_PASSTHROUGH" == "1" ]]; then
+    printf '%s\n' '[safe-run] WARNING: --proxy ignored because network is disabled' >&2
+    PROXY_PASSTHROUGH=0
+  fi
+
+  # Validate and normalize every package name passed to install.
+  local a normalized_name
+  local install_args=()
+  for a in "${args[@]}"; do
+    parse_package "$a"
+    normalized_name=$(normalize_and_validate_package_or_die "$PKG_NAME" npm "$a")
+    if [[ "$PKG_VERSION_USER_SPECIFIED" == "1" ]]; then
+      install_args+=("${normalized_name}@${PKG_VERSION}")
+    else
+      install_args+=("$normalized_name")
+    fi
+  done
+
+  podman_available || die "podman not available"
+  check_secrets_in_cwd
+  local image
+  case "$RUNNER_KIND" in
+    npm) image=$(select_image npm) ;;
+    bun) image=$(select_image bun) ;;
+    *)   image=$(select_image npm); RUNNER_KIND=npm ;;
+  esac
+  ensure_image "$image"
+
+  local scripts_flag="--ignore-scripts"
+  [[ "$allow_scripts" == "1" ]] && scripts_flag=""
+
+  local tty_flags=()
+  is_tty && tty_flags=(-it)
+
+  local base_args=()
+  mapfile -d '' -t base_args < <(build_podman_base_args)
+
+  audit_log "install" "${install_args[*]}" "SANDBOX" "$(context_label)" \
+    "$([[ $allow_scripts -eq 1 ]] && echo 'ALLOW_SCRIPTS' || echo 'NO_SCRIPTS')"
+
+  local mount_opt="ro"
+  [[ "$ALLOW_WRITE" == "1" ]] && mount_opt="rw"
+  local network_arg=()
+  [[ "$ALLOW_NETWORK" != "1" ]] && network_arg=(--network=none)
+
+  podman run --rm "${tty_flags[@]}" \
+    "${network_arg[@]}" \
+    "${base_args[@]}" \
+    -v "${PWD}:/work:Z,${mount_opt}" -w /work \
+    -e "HOME=/root" \
+    "$image" \
+    sh -c "npm install $scripts_flag $(printf '%q ' "${install_args[@]}")"
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+show_usage() {
+  cat <<'EOF'
+safe-run: sandboxed package runner
+
+USAGE
+  safe-run [flags] <package>[@<version>] [-- args...]
+  safe-npx / safe-bunx / safe-uvx / safe-pipx-run  (symlinks)
+  npx / bunx / uvx                                 (after `safe-run link`)
+  pipx                                             (not auto-linked; use `safe-pipx-run`)
+
+FLAGS
+  --strict          Strict sandbox: no network, read-only project mount (default)
+  -w, --write      Allow write access to the project mount
+  -n, --network    Allow network access for the package sandbox
+  -s, --allow-secrets
+                    Allow running when secret-like project files are present
+  --node22          Use node:22 image instead of node:24
+  --py312           Use python:3.12 / uv:python3.12 instead of 3.14
+  --proxy           Pass host HTTP(S)_PROXY env vars into network-enabled sandbox
+                    (default: blocked)
+  -y, --yes         Skip interactive prompt for unknown packages
+  -h, --help        This message
+  -v, --version     Print version
+
+SUBCOMMANDS
+  host-allow add <pkg>@<ver> [--reason "..."] Add package to host execution allowlist
+  host-allow update <pkg>@<new> [--reason "..."]
+                                              Update pinned version (prompts)
+  host-allow remove <pkg>                     Remove from allowlist
+  host-allow list                             Show allowlist
+
+  block add <pkg> --reason "..."              Block a package
+  block remove <pkg>                          Unblock
+  block list                                  Show blocklist
+  block import <url-or-file>                  Import JSON or newline list
+
+  audit [--blocked] [--since 24h]             Show audit log
+  status                                      Show config summary
+
+  link [--force]                              Replace system npx/bunx/uvx with
+                                              safe-run (transactional; backs up
+                                              originals). pipx is NOT linked;
+                                              use `safe-pipx-run` instead.
+  unlink                                      Restore originals (verifies the
+                                              current symlink points to safe-run)
+
+  install [-w -n] [--allow-scripts] <pkg>...  Run install in sandbox (allows
+                                              postinstall scripts for native bindings)
+
+DECISION TIERS (in order)
+  1. blocked        Refuse, log
+  2. host-allow     Execute on host with --ignore-scripts
+  3. safe-audit     Check unknown packages in an isolated audit sandbox;
+                    BLOCK refuses, WARN continues
+  4. sandbox-known  Podman sandbox, no prompt
+  5. unknown        TTY: prompt; non-TTY: BLOCK
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+main() {
+  require_cmd jq
+
+  local argv0
+  argv0=$(basename "$0")
+  detect_runner "$argv0"
+  if [[ "$SAFE_RUN_NO_INIT" != "1" ]]; then
+    ensure_dirs
+  fi
+
+  if [[ "$argv0" == "safe-run" ]]; then
+    if [[ $# -eq 0 ]]; then
+      show_usage; exit 0
+    fi
+    case "$1" in
+      host-allow) shift; cmd_host_allow "$@" ;;
+      block)      shift; cmd_block "$@" ;;
+      audit)      shift; cmd_audit "$@" ;;
+      status)     shift; cmd_status "$@" ;;
+      link)       shift; cmd_link "$@" ;;
+      unlink)     shift; cmd_unlink "$@" ;;
+      install)    shift; cmd_install "$@" ;;
+      help|--help|-h)   show_usage ;;
+      version|--version|-v) echo "safe-run $SAFE_RUN_VERSION" ;;
+      *)          handle_runner_invocation "$@" ;;
+    esac
+  else
+    handle_runner_invocation "$@"
+  fi
+}
+
+main "$@"

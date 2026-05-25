@@ -1,0 +1,506 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SAFE_VERSION="1.0.0"
+SAFE_SELF="$(readlink -f "$0")"
+SAFE_DIR="$(dirname "$SAFE_SELF")"
+SAFE_CONFIG_ROOT="${SAFE_CONFIG_DIR:-$HOME/.config/safe}"
+SAFE_DATA_ROOT="${SAFE_DATA_DIR:-$HOME/.local/share/safe}"
+SAFE_RUN_PATH="$SAFE_DIR/safe-run"
+SAFE_AUDIT_PATH="$SAFE_DIR/safe-audit"
+SAFE_ZSH_COMPLETION_DIR="${SAFE_ZSH_COMPLETION_DIR:-$HOME/.local/share/zsh/site-functions}"
+
+err() { printf 'safe: %s\n' "$*" >&2; }
+die() { err "$@"; exit 1; }
+
+show_usage() {
+  cat <<'EOF'
+safe: consolidated safe-run, safe-audit, and install wrapper tooling
+
+USAGE
+  safe run <args...>
+  safe audit <args...>
+  safe install [--allow-scripts] <pkg> [...]
+  safe setup [<machine> | --all | --machine <csv>]
+  safe status
+  safe doctor [--json]
+  safe version
+  safe help
+EOF
+}
+
+cmd_version() {
+  echo "safe $SAFE_VERSION"
+  "$SAFE_RUN_PATH" version
+  "$SAFE_AUDIT_PATH" --version
+}
+
+cmd_status() {
+  echo "safe $SAFE_VERSION"
+  echo
+  echo "=== run ==="
+  "$SAFE_RUN_PATH" status
+  echo
+  echo "=== audit ==="
+  "$SAFE_AUDIT_PATH" status
+  echo
+  echo "=== install ==="
+  if [[ -n "${ZSH_VERSION:-}" && -n "${functions[_safe_install_check]:-}" ]]; then
+    echo "wrappers:       loaded"
+  elif [[ -f "$SAFE_CONFIG_ROOT/install-wrappers.zsh" ]]; then
+    echo "wrappers:       installed"
+  else
+    echo "wrappers:       not installed"
+  fi
+}
+
+capture_command() {
+  local __out_var="$1"
+  shift
+  local output="" rc=0
+  set +e
+  output="$("$@" 2>/dev/null)"
+  rc=$?
+  set -e
+  printf -v "$__out_var" '%s' "$output"
+  return "$rc"
+}
+
+command_presence_json() {
+  local cmd="$1"
+  local version_cmd="${2:-}"
+  local path="" version=""
+  path=$(command -v "$cmd" 2>/dev/null || true)
+  if [[ -n "$path" ]]; then
+    path=$(readlink -f "$path" 2>/dev/null || printf '%s' "$path")
+  fi
+  if [[ -n "$path" && -n "$version_cmd" ]]; then
+    set +e
+    version="$($cmd $version_cmd 2>/dev/null | head -n 1)"
+    set -e
+  fi
+  jq -n \
+    --arg path "$path" \
+    --arg version "$version" \
+    '{
+      present: ($path != ""),
+      path: (if $path == "" then null else $path end)
+    } + (if $version == "" then {} else {version: $version} end)'
+}
+
+component_path_json() {
+  local path="$1"
+  local argv0="${2:-}"
+  local resolved exists executable
+  resolved=$(readlink -f "$path" 2>/dev/null || printf '%s' "$path")
+  [[ -e "$resolved" ]] && exists=true || exists=false
+  [[ -x "$resolved" ]] && executable=true || executable=false
+  jq -n \
+    --arg resolved "$resolved" \
+    --arg argv0 "$argv0" \
+    --argjson exists "$exists" \
+    --argjson executable "$executable" \
+    '{
+      resolved: $resolved,
+      exists: $exists,
+      executable: $executable
+    } + (if $argv0 == "" then {} else {argv0: $argv0} end)'
+}
+
+dispatch_parity_json() {
+  local direct_label="$1"
+  shift
+  local routed_label="$1"
+  shift
+  local direct_out="" routed_out="" direct_rc=0 routed_rc=0
+  capture_command direct_out "$@" || direct_rc=$?
+  capture_command routed_out "${PARITY_ROUTED_CMD[@]}" || routed_rc=$?
+  jq -n \
+    --arg direct_label "$direct_label" \
+    --arg routed_label "$routed_label" \
+    --arg direct_out "$direct_out" \
+    --arg routed_out "$routed_out" \
+    --argjson direct_rc "$direct_rc" \
+    --argjson routed_rc "$routed_rc" \
+    '{
+      supported: ($direct_rc == 0 and $routed_rc == 0),
+      ok: ($direct_rc == 0 and $routed_rc == 0 and $direct_out == $routed_out),
+      ($direct_label): (if $direct_rc == 0 then $direct_out else null end),
+      ($routed_label): (if $routed_rc == 0 then $routed_out else null end)
+    }'
+}
+
+safe_run_linked_runner() {
+  local key="$1"
+  local config_file="$SAFE_CONFIG_ROOT/run/config.json"
+  local path=""
+  if [[ -r "$config_file" ]] && command -v jq >/dev/null 2>&1; then
+    path=$(jq -r --arg k "${key}_real" '.runners[$k] // empty' "$config_file" 2>/dev/null || true)
+  fi
+  [[ -n "$path" && -x "$path" ]] && printf 'true' || printf 'false'
+}
+
+doctor_feature_json() {
+  local supported="$1"
+  local ready="$2"
+  shift 2
+  jq -n \
+    --argjson supported "$supported" \
+    --argjson ready "$ready" \
+    --argjson missing "$(printf '%s\n' "$@" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    '{supported: $supported, ready: $ready, missing: $missing}'
+}
+
+doctor_payload_json() {
+  command -v jq >/dev/null 2>&1 || die "doctor requires jq"
+
+  local base_config="$SAFE_CONFIG_ROOT"
+  local base_data="$SAFE_DATA_ROOT"
+  local run_config_dir="$base_config/run"
+  local audit_config_dir="$base_config/audit"
+  local install_wrapper="$base_config/install-wrappers.zsh"
+  local completion_file="$SAFE_ZSH_COMPLETION_DIR/_safe"
+
+  local paths_safe_json paths_run_json paths_audit_json
+  paths_safe_json=$(component_path_json "$SAFE_SELF" "$0")
+  paths_run_json=$(component_path_json "$SAFE_RUN_PATH")
+  paths_audit_json=$(component_path_json "$SAFE_AUDIT_PATH")
+
+  local PARITY_ROUTED_CMD=(env SAFE_AUDIT_NO_INIT=1 "$SAFE_SELF" audit --version)
+  local audit_parity_json
+  audit_parity_json=$(dispatch_parity_json "safe_audit_version" "safe_audit_via_dispatcher" env SAFE_AUDIT_NO_INIT=1 "$SAFE_AUDIT_PATH" --version)
+
+  PARITY_ROUTED_CMD=(env SAFE_RUN_NO_INIT=1 "$SAFE_SELF" run --version)
+  local run_parity_json
+  run_parity_json=$(dispatch_parity_json "safe_run_version" "safe_run_via_dispatcher" env SAFE_RUN_NO_INIT=1 "$SAFE_RUN_PATH" version)
+
+  local core_bash_json core_jq_json core_zsh_json
+  local audit_curl_json audit_tar_json audit_ssh_json
+  local verify_cosign_json verify_sha256sum_json verify_shasum_json verify_python3_json verify_python_json
+  local sandbox_podman_json sandbox_timeout_json
+  core_bash_json=$(command_presence_json bash)
+  core_jq_json=$(command_presence_json jq)
+  core_zsh_json=$(command_presence_json zsh)
+  audit_curl_json=$(command_presence_json curl)
+  audit_tar_json=$(command_presence_json tar)
+  audit_ssh_json=$(command_presence_json ssh)
+  verify_cosign_json=$(command_presence_json cosign)
+  verify_sha256sum_json=$(command_presence_json sha256sum)
+  verify_shasum_json=$(command_presence_json shasum)
+  verify_python3_json=$(command_presence_json python3 --version)
+  verify_python_json=$(command_presence_json python --version)
+  sandbox_podman_json=$(command_presence_json podman --version)
+  sandbox_timeout_json=$(command_presence_json timeout)
+
+  local capabilities_json="" capabilities_available=false
+  local capabilities_version=""
+  local capability_verify_release_asset=false
+  local capability_verify_sigstore_bundle=false
+  local capability_verify_tuf_bootstrap=false
+  local capability_binary_exec=false
+  if capture_command capabilities_json "$SAFE_SELF" audit capabilities --json; then
+    if jq -e . >/dev/null 2>&1 <<<"$capabilities_json"; then
+      capabilities_available=true
+      capabilities_version=$(jq -r '.version // empty' <<<"$capabilities_json")
+      capability_verify_release_asset=$(jq -r '.capabilities["verify.release-asset"] // false' <<<"$capabilities_json")
+      capability_verify_sigstore_bundle=$(jq -r '.capabilities["verify.sigstore-bundle"] // false' <<<"$capabilities_json")
+      capability_verify_tuf_bootstrap=$(jq -r '.capabilities["verify.tuf-bootstrap"] // false' <<<"$capabilities_json")
+      capability_binary_exec=$(jq -r '.capabilities["binary.exec"] // false' <<<"$capabilities_json")
+    fi
+  fi
+
+  local has_cosign has_sha256sum has_shasum has_checksum has_python3 has_python has_python_bridge has_podman has_timeout
+  has_cosign=$(jq -r '.present' <<<"$verify_cosign_json")
+  has_sha256sum=$(jq -r '.present' <<<"$verify_sha256sum_json")
+  has_shasum=$(jq -r '.present' <<<"$verify_shasum_json")
+  has_python3=$(jq -r '.present' <<<"$verify_python3_json")
+  has_python=$(jq -r '.present' <<<"$verify_python_json")
+  has_podman=$(jq -r '.present' <<<"$sandbox_podman_json")
+  has_timeout=$(jq -r '.present' <<<"$sandbox_timeout_json")
+  if [[ "$has_sha256sum" == "true" || "$has_shasum" == "true" ]]; then
+    has_checksum=true
+  else
+    has_checksum=false
+  fi
+  if [[ "$has_python3" == "true" || "$has_python" == "true" ]]; then
+    has_python_bridge=true
+  else
+    has_python_bridge=false
+  fi
+
+  local feature_capabilities_json
+  if [[ "$capabilities_available" == "true" ]]; then
+    feature_capabilities_json=$(
+      jq -n \
+        --arg version "$capabilities_version" \
+        --argjson caps "$(jq -c '.capabilities' <<<"$capabilities_json")" \
+        '{
+          available: true,
+          command: "safe audit capabilities",
+          version: $version,
+          capabilities: $caps
+        }'
+    )
+  else
+    feature_capabilities_json='{"available":false,"command":"safe audit capabilities","version":null,"capabilities":{}}'
+  fi
+
+  local verify_release_asset_json verify_sigstore_bundle_json verify_tuf_bootstrap_json
+  local binary_exec_json safe_run_sandbox_json
+  if [[ "$capabilities_available" != "true" ]]; then
+    verify_release_asset_json=$(doctor_feature_json false false "safe audit capabilities")
+  elif [[ "$capability_verify_release_asset" != "true" ]]; then
+    verify_release_asset_json=$(doctor_feature_json false false)
+  elif [[ "$has_checksum" != "true" ]]; then
+    verify_release_asset_json=$(doctor_feature_json true false "sha256sum|shasum")
+  else
+    verify_release_asset_json=$(doctor_feature_json true true)
+  fi
+
+  if [[ "$capabilities_available" != "true" ]]; then
+    verify_sigstore_bundle_json=$(doctor_feature_json false false "safe audit capabilities")
+  elif [[ "$capability_verify_sigstore_bundle" != "true" ]]; then
+    verify_sigstore_bundle_json=$(doctor_feature_json false false)
+  elif [[ "$has_cosign" != "true" ]]; then
+    verify_sigstore_bundle_json=$(doctor_feature_json true false "cosign")
+  else
+    verify_sigstore_bundle_json=$(doctor_feature_json true true)
+  fi
+
+  if [[ "$capabilities_available" != "true" ]]; then
+    verify_tuf_bootstrap_json=$(doctor_feature_json false false "safe audit capabilities")
+  elif [[ "$capability_verify_tuf_bootstrap" != "true" ]]; then
+    verify_tuf_bootstrap_json=$(doctor_feature_json false false)
+  else
+    local tuf_missing=()
+    [[ "$has_checksum" == "true" ]] || tuf_missing+=("sha256sum|shasum")
+    [[ "$has_cosign" == "true" ]] || tuf_missing+=("cosign")
+    [[ "$has_python_bridge" == "true" ]] || tuf_missing+=("python3|python")
+    if [[ ${#tuf_missing[@]} -eq 0 ]]; then
+      verify_tuf_bootstrap_json=$(doctor_feature_json true true)
+    else
+      verify_tuf_bootstrap_json=$(doctor_feature_json true false "${tuf_missing[@]}")
+    fi
+  fi
+
+  if [[ "$capabilities_available" != "true" ]]; then
+    binary_exec_json=$(doctor_feature_json false false "safe audit capabilities")
+  elif [[ "$capability_binary_exec" != "true" ]]; then
+    binary_exec_json=$(doctor_feature_json false false)
+  else
+    local binary_missing=()
+    [[ "$has_podman" == "true" ]] || binary_missing+=("podman")
+    [[ "$has_timeout" == "true" ]] || binary_missing+=("timeout")
+    if [[ ${#binary_missing[@]} -eq 0 ]]; then
+      binary_exec_json=$(doctor_feature_json true true)
+    else
+      binary_exec_json=$(doctor_feature_json true false "${binary_missing[@]}")
+    fi
+  fi
+
+  local run_missing=()
+  [[ "$has_podman" == "true" ]] || run_missing+=("podman")
+  if [[ ${#run_missing[@]} -eq 0 ]]; then
+    safe_run_sandbox_json=$(doctor_feature_json true true)
+  else
+    safe_run_sandbox_json=$(doctor_feature_json true false "${run_missing[@]}")
+  fi
+
+  local linked_npx linked_bunx linked_uvx linked_pipx
+  linked_npx=$(safe_run_linked_runner npx)
+  linked_bunx=$(safe_run_linked_runner bunx)
+  linked_uvx=$(safe_run_linked_runner uvx)
+  linked_pipx=$(safe_run_linked_runner pipx)
+
+  jq -n \
+    --arg version "$SAFE_VERSION" \
+    --arg config_dir "$base_config" \
+    --arg data_dir "$base_data" \
+    --argjson safe_path "$paths_safe_json" \
+    --argjson safe_run_path "$paths_run_json" \
+    --argjson safe_audit_path "$paths_audit_json" \
+    --argjson audit_parity "$audit_parity_json" \
+    --argjson run_parity "$run_parity_json" \
+    --argjson core_bash "$core_bash_json" \
+    --argjson core_jq "$core_jq_json" \
+    --argjson core_zsh "$core_zsh_json" \
+    --argjson audit_curl "$audit_curl_json" \
+    --argjson audit_tar "$audit_tar_json" \
+    --argjson audit_ssh "$audit_ssh_json" \
+    --argjson verify_cosign "$verify_cosign_json" \
+    --argjson verify_sha256sum "$verify_sha256sum_json" \
+    --argjson verify_shasum "$verify_shasum_json" \
+    --argjson verify_python3 "$verify_python3_json" \
+    --argjson verify_python "$verify_python_json" \
+    --argjson sandbox_podman "$sandbox_podman_json" \
+    --argjson sandbox_timeout "$sandbox_timeout_json" \
+    --argjson feature_capabilities "$feature_capabilities_json" \
+    --argjson verify_release_asset "$verify_release_asset_json" \
+    --argjson verify_sigstore_bundle "$verify_sigstore_bundle_json" \
+    --argjson verify_tuf_bootstrap "$verify_tuf_bootstrap_json" \
+    --argjson binary_exec "$binary_exec_json" \
+    --argjson safe_run_sandbox "$safe_run_sandbox_json" \
+    --argjson safe_run_config_present "$( [[ -f "$run_config_dir/config.json" ]] && printf 'true' || printf 'false' )" \
+    --argjson safe_run_host_allow_file "$( [[ -f "$run_config_dir/host-allow.json" ]] && printf 'true' || printf 'false' )" \
+    --argjson safe_run_sandbox_known_file "$( [[ -f "$run_config_dir/sandbox-known.json" ]] && printf 'true' || printf 'false' )" \
+    --argjson safe_run_blocked_file "$( [[ -f "$run_config_dir/blocked.json" ]] && printf 'true' || printf 'false' )" \
+    --argjson linked_npx "$linked_npx" \
+    --argjson linked_bunx "$linked_bunx" \
+    --argjson linked_uvx "$linked_uvx" \
+    --argjson linked_pipx "$linked_pipx" \
+    --argjson safe_audit_config_present "$( [[ -d "$audit_config_dir" ]] && printf 'true' || printf 'false' )" \
+    --argjson safe_audit_machines_file "$( [[ -f "$audit_config_dir/machines.json" ]] && printf 'true' || printf 'false' )" \
+    --argjson safe_audit_tools_file "$( [[ -f "$audit_config_dir/tools.json" ]] && printf 'true' || printf 'false' )" \
+    --argjson wrapper_present "$( [[ -f "$install_wrapper" ]] && printf 'true' || printf 'false' )" \
+    --argjson completion_present "$( [[ -f "$completion_file" ]] && printf 'true' || printf 'false' )" \
+    '{
+      command: "safe doctor",
+      version: $version,
+      paths: {
+        safe: $safe_path,
+        safe_run: $safe_run_path,
+        safe_audit: $safe_audit_path,
+        config_dir: $config_dir,
+        data_dir: $data_dir
+      },
+      dispatch: {
+        audit_version_parity: $audit_parity,
+        run_version_parity: $run_parity
+      },
+      dependencies: {
+        core: {
+          bash: $core_bash,
+          jq: $core_jq,
+          zsh: $core_zsh
+        },
+        audit: {
+          curl: $audit_curl,
+          tar: $audit_tar,
+          ssh: $audit_ssh
+        },
+        verify: {
+          cosign: $verify_cosign,
+          sha256sum: $verify_sha256sum,
+          shasum: $verify_shasum,
+          python3: $verify_python3,
+          python: $verify_python
+        },
+        sandbox: {
+          podman: $sandbox_podman,
+          timeout: $sandbox_timeout
+        }
+      },
+      features: {
+        safe_audit_capabilities: $feature_capabilities,
+        verify_release_asset: $verify_release_asset,
+        verify_sigstore_bundle: $verify_sigstore_bundle,
+        verify_tuf_bootstrap: $verify_tuf_bootstrap,
+        binary_exec: $binary_exec,
+        safe_run_sandbox: $safe_run_sandbox
+      },
+      environment: {
+        safe_run: {
+          config_present: $safe_run_config_present,
+          host_allow_file: $safe_run_host_allow_file,
+          sandbox_known_file: $safe_run_sandbox_known_file,
+          blocked_file: $safe_run_blocked_file,
+          linked_runners: {
+            npx: $linked_npx,
+            bunx: $linked_bunx,
+            uvx: $linked_uvx,
+            pipx: $linked_pipx
+          }
+        },
+        safe_audit: {
+          config_present: $safe_audit_config_present,
+          machines_file: $safe_audit_machines_file,
+          tools_file: $safe_audit_tools_file
+        },
+        install_wrappers: {
+          script_present: $wrapper_present,
+          completion_present: $completion_present
+        }
+      }
+    }'
+}
+
+print_doctor_human() {
+  local payload_json="$1"
+  printf 'safe %s\n' "$SAFE_VERSION"
+  printf 'command: safe doctor\n\n'
+  jq -r '
+    "paths:",
+    "  safe: " + .paths.safe.resolved,
+    "  safe-run: " + .paths.safe_run.resolved,
+    "  safe-audit: " + .paths.safe_audit.resolved,
+    "",
+    "dispatch:",
+    "  audit version parity: " + (if .dispatch.audit_version_parity.supported then (if .dispatch.audit_version_parity.ok then "ok" else "mismatch" end) else "unavailable" end),
+    "  run version parity: " + (if .dispatch.run_version_parity.supported then (if .dispatch.run_version_parity.ok then "ok" else "mismatch" end) else "unavailable" end),
+    "",
+    "feature readiness:",
+    "  safe audit capabilities: " + (if .features.safe_audit_capabilities.available then "available" else "unavailable" end),
+    "  verify release-asset: " + (if .features.verify_release_asset.ready then "ready" else "not ready" end),
+    "  verify sigstore-bundle: " + (if .features.verify_sigstore_bundle.ready then "ready" else "not ready" end),
+    "  verify tuf-bootstrap: " + (if .features.verify_tuf_bootstrap.ready then "ready" else "not ready" end),
+    "  binary exec: " + (if .features.binary_exec.ready then "ready" else "not ready" end),
+    "  safe-run sandbox: " + (if .features.safe_run_sandbox.ready then "ready" else "not ready" end),
+    "",
+    "missing prerequisites:",
+    (
+      [
+        .features.verify_release_asset.missing[],
+        .features.verify_sigstore_bundle.missing[],
+        .features.verify_tuf_bootstrap.missing[],
+        .features.binary_exec.missing[],
+        .features.safe_run_sandbox.missing[]
+      ]
+      | unique
+      | if length == 0 then ["  none"] else map("  " + .) end
+      | .[]
+    )
+  ' <<<"$payload_json"
+}
+
+cmd_doctor() {
+  local json_mode=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json)
+        json_mode=1
+        shift
+        ;;
+      -*)
+        die "unknown doctor flag: $1"
+        ;;
+      *)
+        die "unexpected argument for doctor: $1"
+        ;;
+    esac
+  done
+
+  local payload_json
+  payload_json=$(doctor_payload_json)
+  if [[ "$json_mode" == "1" ]]; then
+    printf '%s\n' "$payload_json"
+  else
+    print_doctor_human "$payload_json"
+  fi
+}
+
+argv0="$(basename "$0")"
+if [[ "$argv0" == safe-* && "$argv0" != "safe-run" && "$argv0" != "safe-audit" ]]; then
+  exec -a "$argv0" "$SAFE_RUN_PATH" "$@"
+fi
+
+case "${1:-}" in
+  run)      shift; exec "$SAFE_RUN_PATH" "$@" ;;
+  audit)    shift; exec "$SAFE_AUDIT_PATH" "$@" ;;
+  install)  shift; exec "$SAFE_RUN_PATH" install "$@" ;;
+  status)   shift; cmd_status "$@" ;;
+  setup)    shift; exec "$SAFE_AUDIT_PATH" setup "$@" ;;
+  doctor)   shift; cmd_doctor "$@" ;;
+  version|--version|-v) cmd_version ;;
+  help|-h|--help|"") show_usage ;;
+  *)        exec "$SAFE_RUN_PATH" "$@" ;;
+esac

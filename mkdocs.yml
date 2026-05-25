@@ -1,0 +1,19 @@
+site_name: safe
+site_url: https://superbiche.github.io/safe/
+copyright: MIT
+repo_url: https://github.com/superbiche/safe
+repo_name: superbiche/safe
+theme:
+  name: superbiche
+nav:
+  - Home: index.md
+  - Architecture: architecture.md
+  - Installation: installation.md
+  - safe-run: safe-run.md
+  - safe-audit: safe-audit.md
+  - Install Wrappers: install-wrappers.md
+  - Integration Flows: integration-flows.md
+  - Configuration: configuration.md
+  - Operations: operations.md
+  - Publishing: publishing.md
+  - Command Reference: command-reference.md

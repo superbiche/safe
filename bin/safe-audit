@@ -1,0 +1,5289 @@
+#!/usr/bin/env bash
+# safe-audit: multi-machine audit orchestrator for dependency and SBOM scanning.
+
+set -euo pipefail
+
+SAFE_AUDIT_VERSION="0.1.0"
+SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
+
+CONFIG_DIR="${SAFE_AUDIT_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/audit}"
+DATA_DIR="${SAFE_AUDIT_DATA_DIR:-${SAFE_DATA_DIR:-$HOME/.local/share/safe}/audit}"
+BIN_DIR="${SAFE_AUDIT_BIN_DIR:-$HOME/.local/bin}"
+MACHINES_FILE="$CONFIG_DIR/machines.json"
+TOOLS_FILE="$CONFIG_DIR/tools.json"
+
+RESULTS_DIR="$DATA_DIR/results"
+SBOM_DIR="$DATA_DIR/sbom"
+CHECKS_DIR="$DATA_DIR/checks"
+IOC_DIR="$DATA_DIR/ioc"
+IOC_CATALOG_DIR="$IOC_DIR/catalogs"
+TOOL_BUNDLE_DIR="$DATA_DIR/tool-bundles"
+DEFAULT_SCANNER_BUNDLE_PATH="$TOOL_BUNDLE_DIR/scanners.tar.gz"
+HOST_ALLOW_LOG="$DATA_DIR/host-allow-log.jsonl"
+LAST_IOC_UPDATE="$DATA_DIR/last-ioc-update"
+
+SAFE_RUN_CONFIG_DIR="${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}"
+SAFE_RUN_BLOCKED_FILE="$SAFE_RUN_CONFIG_DIR/blocked.json"
+
+DEFAULT_SCAN_ROOT="${SAFE_AUDIT_DEFAULT_SCAN_ROOT:-$HOME}"
+DEFAULT_LOCAL_MACHINE="${SAFE_AUDIT_LOCAL_MACHINE:-local}"
+DEFAULT_REMOTE_ROOT="${SAFE_AUDIT_REMOTE_ROOT:-\$HOME}"
+DEFAULT_CISA_KEV_URL="${SAFE_AUDIT_CISA_KEV_URL:-https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json}"
+GRYPE_DB_MAX_AGE_DAYS="${SAFE_AUDIT_GRYPE_DB_MAX_AGE_DAYS:-7}"
+SSH_CONNECT_TIMEOUT="${SAFE_AUDIT_SSH_CONNECT_TIMEOUT:-10}"
+SOCKET_CLI_PACKAGE="${SAFE_AUDIT_SOCKET_CLI_PACKAGE:-@socketsecurity/cli}"
+SOCKET_CLI_VERSION="${SAFE_AUDIT_SOCKET_CLI_VERSION:-latest}"
+GITHUB_API_BASE_URL="${SAFE_AUDIT_GITHUB_API_BASE_URL:-https://api.github.com}"
+GITHUB_RELEASE_MIN_AGE_DAYS="${SAFE_AUDIT_GITHUB_RELEASE_MIN_AGE_DAYS:-3}"
+GITHUB_HIGH_RISK_PATH_REGEX="${SAFE_AUDIT_GITHUB_HIGH_RISK_PATH_REGEX:-(^|/)\\.github/workflows/|(^|/)(install|setup|bootstrap|release|publish|sign|cosign|checksum|goreleaser)([^/]*)(\\.[^/]+)?$|(^|/)(Dockerfile|Makefile|magefile\\.go)$}"
+BINARY_AUDIT_IMAGE="${SAFE_AUDIT_BINARY_IMAGE:-docker.io/library/alpine:3.22}"
+BINARY_AUDIT_TIMEOUT_SECONDS="${SAFE_AUDIT_BINARY_TIMEOUT_SECONDS:-20}"
+BINARY_AUDIT_STDIO_LIMIT="${SAFE_AUDIT_BINARY_STDIO_LIMIT:-4000}"
+BINARY_AUDIT_STDIO_LINES="${SAFE_AUDIT_BINARY_STDIO_LINES:-40}"
+
+declare -ar SAFE_AUDIT_CAPABILITY_NAMES=(
+  scan
+  check
+  release.github
+  vuln.github-release
+  verify.release-asset
+  verify.sigstore-bundle
+  verify.tuf-bootstrap
+  binary.exec
+  ioc.lookup
+  ioc.list
+  ioc.update
+  setup.machine
+  setup.create-bundle
+  diff
+  status
+)
+
+declare -a MACHINE_TARGETS=()
+declare -A PROJECT_ECOSYSTEMS=()
+declare -A PROJECT_SCANNERS=()
+declare -a PROJECT_IGNORES=()
+declare -a CURRENT_LOCKFILES=()
+declare -a CURRENT_MANIFESTS=()
+declare -a CURRENT_PROJECT_ROOTS=()
+declare -a CURRENT_SYFT_EXCLUDES=()
+
+err()  { printf '\033[31msafe-audit:\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[33msafe-audit:\033[0m %s\n' "$*" >&2; }
+info() { printf '\033[36msafe-audit:\033[0m %s\n' "$*" >&2; }
+die()  { err "$@"; exit 1; }
+
+is_tty() { [[ -t 0 && -t 1 ]]; }
+now_iso() { date -Iseconds; }
+today_date() { date +%F; }
+
+ssh_batch() {
+  ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -o ConnectionAttempts=1 "$@"
+}
+
+scp_batch() {
+  scp -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -o ConnectionAttempts=1 "$@"
+}
+
+descendant_pids() {
+  local parent="$1"
+  ps -eo pid=,ppid= | awk -v root="$parent" '
+    {
+      pid=$1
+      ppid=$2
+      children[ppid] = children[ppid] " " pid
+    }
+    function walk(pid, list, n, i, child) {
+      n = split(children[pid], list, " ")
+      for (i = 1; i <= n; i++) {
+        child = list[i]
+        if (child == "") {
+          continue
+        }
+        print child
+        walk(child)
+      }
+    }
+    END {
+      walk(root)
+    }
+  '
+}
+
+terminate_descendants() {
+  local pids
+  pids=$(descendant_pids "$$" | sort -rn | tr '\n' ' ')
+  [[ -n "$pids" ]] || return 0
+  kill $pids 2>/dev/null || true
+  sleep 0.2
+  pids=$(descendant_pids "$$" | sort -rn | tr '\n' ' ')
+  [[ -n "$pids" ]] || return 0
+  kill -KILL $pids 2>/dev/null || true
+}
+
+handle_interrupt() {
+  trap - INT TERM EXIT
+  warn "interrupted; stopping active child processes"
+  terminate_descendants
+  exit 130
+}
+
+handle_exit() {
+  local rc=$?
+  trap - EXIT
+  terminate_descendants
+  exit "$rc"
+}
+
+install_process_cleanup_traps() {
+  trap handle_interrupt INT TERM
+  trap handle_exit EXIT
+}
+
+read_prompt_answer() {
+  local answer
+  if answer=$({ IFS= read -r line && printf '%s' "$line"; } 2>/dev/null </dev/tty); then
+    printf '%s' "$answer"
+    return 0
+  fi
+  IFS= read -r answer
+  printf '%s' "$answer"
+}
+
+json_string_or_null() {
+  local v="${1:-}"
+  if [[ -z "$v" ]]; then
+    printf 'null'
+  else
+    jq -Rn --arg v "$v" '$v'
+  fi
+}
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+slugify() {
+  local raw="$1"
+  raw="${raw//@/_at_}"
+  raw="${raw//\//_}"
+  raw="${raw//:/_}"
+  raw="${raw// /_}"
+  printf '%s' "$raw"
+}
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+urlencode() {
+  jq -nr --arg v "$1" '$v|@uri'
+}
+
+absolute_path() {
+  local path="$1"
+  if [[ -d "$path" ]]; then
+    (cd "$path" && pwd -P)
+  else
+    local dir base
+    dir=$(cd "$(dirname "$path")" && pwd -P)
+    base=$(basename "$path")
+    printf '%s/%s\n' "$dir" "$base"
+  fi
+}
+
+date_to_epoch() {
+  date -d "$1" +%s 2>/dev/null
+}
+
+days_between_epochs() {
+  local newer="$1" older="$2"
+  if (( newer < older )); then
+    printf '0\n'
+  else
+    printf '%s\n' $(((newer - older) / 86400))
+  fi
+}
+
+verdict_rank() {
+  case "$1" in
+    GO) printf '0\n' ;;
+    WARN) printf '1\n' ;;
+    BLOCK) printf '2\n' ;;
+    *) printf '3\n' ;;
+  esac
+}
+
+bump_verdict() {
+  local -n verdict_ref="$1"
+  local next="$2"
+  if (( $(verdict_rank "$next") > $(verdict_rank "$verdict_ref") )); then
+    verdict_ref="$next"
+  fi
+}
+
+verdict_exit_code() {
+  case "$1" in
+    GO) return 0 ;;
+    WARN) return 10 ;;
+    BLOCK) return 20 ;;
+    *) return 1 ;;
+  esac
+}
+
+audit_add_check() {
+  local file="$1" id="$2" verdict="$3" summary="$4" data_json="${5-}"
+  local data_compact
+  [[ -n "$data_json" ]] || data_json='{}'
+  data_compact=$(printf '%s' "$data_json" | jq -c . 2>/dev/null || printf '{}')
+  jq -cn \
+    --arg id "$id" \
+    --arg verdict "$verdict" \
+    --arg summary "$summary" \
+    --argjson data "$data_compact" \
+    '{id:$id,verdict:$verdict,summary:$summary,data:$data}' >> "$file"
+  printf '\n' >> "$file"
+}
+
+audit_add_reason() {
+  local file="$1" code="$2" verdict="$3" message="$4" data_json="${5-}"
+  local data_compact
+  [[ -n "$data_json" ]] || data_json='{}'
+  data_compact=$(printf '%s' "$data_json" | jq -c . 2>/dev/null || printf '{}')
+  jq -cn \
+    --arg code "$code" \
+    --arg verdict "$verdict" \
+    --arg message "$message" \
+    --argjson data "$data_compact" \
+    '{code:$code,verdict:$verdict,message:$message,data:$data}' >> "$file"
+  printf '\n' >> "$file"
+}
+
+jsonl_to_array() {
+  local file="$1"
+  if [[ -s "$file" ]]; then
+    jq -sc '.' "$file"
+  else
+    printf '[]\n'
+  fi
+}
+
+persist_audit_result() {
+  local command_name="$1" subject="$2" verdict="$3" checks_file="$4" reasons_file="$5" data_file="$6"
+  local checks_json reasons_json data_json result_json
+  checks_json=$(jsonl_to_array "$checks_file")
+  reasons_json=$(jsonl_to_array "$reasons_file")
+  data_json=$(cat "$data_file")
+  result_json="$CHECKS_DIR/$(today_date)-$(slugify "${command_name}-${subject}")".json
+
+  jq -n \
+    --arg timestamp "$(now_iso)" \
+    --arg command "$command_name" \
+    --arg verdict "$verdict" \
+    --arg subject "$subject" \
+    --argjson checks "$checks_json" \
+    --argjson reasons "$reasons_json" \
+    --argjson data "$data_json" \
+    '{
+      timestamp: $timestamp,
+      command: $command,
+      verdict: $verdict,
+      subject: $subject,
+      checks: $checks,
+      reasons: $reasons,
+      data: $data
+    }' > "$result_json"
+  printf '%s\n' "$result_json"
+}
+
+print_audit_result_human() {
+  local result_json="$1"
+  printf '[safe-audit] %s\n' "$(jq -r '.command + ": " + .subject' "$result_json")"
+  printf 'VERDICT: %s\n' "$(jq -r '.verdict' "$result_json")"
+
+  if jq -e '.checks | length > 0' "$result_json" >/dev/null 2>&1; then
+    printf '\nChecks:\n'
+    jq -r '.checks[] | "  - [" + .verdict + "] " + .id + ": " + .summary' "$result_json"
+  fi
+
+  if jq -e '.reasons | length > 0' "$result_json" >/dev/null 2>&1; then
+    printf '\nReasons:\n'
+    jq -r '.reasons[] | "  - [" + .verdict + "] " + .code + ": " + .message' "$result_json"
+  fi
+}
+
+emit_audit_result() {
+  local command_name="$1" subject="$2" verdict="$3" checks_file="$4" reasons_file="$5" data_file="$6" json_mode="${7:-0}"
+  local result_json
+  result_json=$(persist_audit_result "$command_name" "$subject" "$verdict" "$checks_file" "$reasons_file" "$data_file")
+  if [[ "$json_mode" == "1" ]]; then
+    cat "$result_json"
+  else
+    print_audit_result_human "$result_json"
+  fi
+  verdict_exit_code "$verdict"
+}
+
+github_api_get() {
+  local path="$1" output="$2"
+  local url
+  local -a headers
+  headers=(
+    -H 'Accept: application/vnd.github+json'
+    -H 'X-GitHub-Api-Version: 2022-11-28'
+    -H 'User-Agent: safe-audit'
+  )
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    headers+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+  fi
+  if [[ "$path" =~ ^https?:// ]]; then
+    url="$path"
+  else
+    url="${GITHUB_API_BASE_URL}${path}"
+  fi
+  local http_code
+  http_code=$(curl -sS -L "${headers[@]}" -o "$output" -w '%{http_code}' "$url" 2>"$output.stderr") || return 1
+  [[ "$http_code" =~ ^2[0-9][0-9]$ ]]
+}
+
+semver_normalize() {
+  local version="$1"
+  version="${version#v}"
+  version="${version%%+*}"
+  printf '%s' "$version"
+}
+
+version_cmp() {
+  local left right first
+  left=$(semver_normalize "$1")
+  right=$(semver_normalize "$2")
+  if [[ "$left" == "$right" ]]; then
+    printf '0\n'
+    return 0
+  fi
+  first=$(printf '%s\n%s\n' "$left" "$right" | sort -V | head -n 1)
+  if [[ "$first" == "$left" ]]; then
+    printf '%s\n' '-1'
+  else
+    printf '1\n'
+  fi
+}
+
+version_satisfies_constraint() {
+  local version="$1" constraint="$2"
+  constraint=$(trim "$constraint")
+  [[ -n "$constraint" ]] || return 2
+
+  local op rhs cmp
+  if [[ "$constraint" =~ ^(<=|>=|<|>|==|=)[[:space:]]*(v?[0-9][^[:space:],]*)$ ]]; then
+    op="${BASH_REMATCH[1]}"
+    rhs="${BASH_REMATCH[2]}"
+  elif [[ "$constraint" =~ ^(v?[0-9][^[:space:],]*)$ ]]; then
+    op="="
+    rhs="${BASH_REMATCH[1]}"
+  else
+    return 2
+  fi
+
+  cmp=$(version_cmp "$version" "$rhs")
+  case "$op" in
+    '<') (( cmp < 0 )) ;;
+    '<=') (( cmp <= 0 )) ;;
+    '>') (( cmp > 0 )) ;;
+    '>=') (( cmp >= 0 )) ;;
+    '='|'==') (( cmp == 0 )) ;;
+    *) return 2 ;;
+  esac
+}
+
+version_matches_range() {
+  local version="$1" range="$2"
+  local raw="$range" part
+  local -a range_parts=()
+  [[ "$range" == *"||"* ]] && return 2
+  IFS=',' read -r -a range_parts <<<"$raw"
+  [[ "${#range_parts[@]}" -gt 0 ]] || return 2
+  for part in "${range_parts[@]}"; do
+    part=$(trim "$part")
+    [[ -n "$part" ]] || continue
+    version_satisfies_constraint "$version" "$part" || return $?
+  done
+  return 0
+}
+
+first_line_summary() {
+  local text="$1" limit="${2:-240}"
+  printf '%s' "$text" | tr '\r\n' '  ' | tr -s ' ' | cut -c1-"$limit"
+}
+
+matches_high_risk_path() {
+  [[ "$1" =~ $GITHUB_HIGH_RISK_PATH_REGEX ]]
+}
+
+sha256_file() {
+  local path="$1"
+  if have_cmd sha256sum; then
+    sha256sum "$path" | awk '{print tolower($1)}'
+  elif have_cmd shasum; then
+    shasum -a 256 "$path" | awk '{print tolower($1)}'
+  else
+    return 127
+  fi
+}
+
+extract_checksum_for_artifact() {
+  local checksum_file="$1" artifact_name="$2"
+  awk -v artifact="$artifact_name" '
+    BEGIN { IGNORECASE = 1 }
+    /^[0-9A-Fa-f]{64}[[:space:]]+[*]?/ {
+      hash = tolower($1)
+      file = $2
+      sub(/^[*]/, "", file)
+      if (file == artifact || file == "./" artifact) {
+        print hash
+        exit
+      }
+      if (single == "") {
+        single = hash
+      }
+      next
+    }
+    /^SHA256[[:space:]]*\(/ {
+      line = $0
+      sub(/^SHA256[[:space:]]*\(/, "", line)
+      split(line, pair, "\\)[[:space:]]*=[[:space:]]*")
+      if (length(pair) == 2 && pair[2] ~ /^[0-9A-Fa-f]{64}$/) {
+        hash = tolower(pair[2])
+        if (pair[1] == artifact || pair[1] == "./" artifact) {
+          print hash
+          exit
+        }
+        if (single == "") {
+          single = hash
+        }
+      }
+      next
+    }
+    /^[0-9A-Fa-f]{64}$/ {
+      if (single == "") {
+        single = tolower($0)
+      }
+    }
+    END {
+      if (single != "") {
+        print single
+      }
+    }
+  ' "$checksum_file" | head -n 1
+}
+
+truncate_file_summary() {
+  local file="$1" max_lines="$2" max_chars="$3"
+  if [[ ! -s "$file" ]]; then
+    printf ''
+    return 0
+  fi
+  tr '\0' ' ' < "$file" | sed -n "1,${max_lines}p" | cut -c1-"$max_chars"
+}
+
+normalize_sha256_checksum() {
+  local raw="$1"
+  raw="${raw#sha256:}"
+  raw=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+  [[ "$raw" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s' "$raw"
+}
+
+file_size_bytes() {
+  wc -c < "$1" | tr -d '[:space:]'
+}
+
+base64_decode_to_file() {
+  local content="$1" output="$2"
+  if have_cmd base64; then
+    if printf '%s' "$content" | base64 --decode > "$output" 2>/dev/null; then
+      return 0
+    fi
+    if printf '%s' "$content" | base64 -d > "$output" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  if have_cmd openssl; then
+    printf '%s' "$content" | openssl base64 -d -A -out "$output" >/dev/null 2>&1
+    return $?
+  fi
+  return 127
+}
+
+extract_sigstore_bundle_metadata() {
+  local bundle="$1" output="$2"
+  jq -n \
+    '{
+      certificate_subject:null,
+      certificate_issuer:null,
+      san_emails:[],
+      san_uris:[]
+    }' > "$output"
+
+  have_cmd openssl || return 0
+
+  local raw_bytes
+  raw_bytes=$(jq -r '.verificationMaterial.certificate.rawBytes // empty' "$bundle" 2>/dev/null || true)
+  [[ -n "$raw_bytes" ]] || return 0
+
+  local scratch cert_der cert_pem san_dump subject issuer emails_json uris_json
+  scratch=$(mktemp -d)
+  cert_der="$scratch/cert.der"
+  cert_pem="$scratch/cert.pem"
+  san_dump="$scratch/san.txt"
+  if ! base64_decode_to_file "$raw_bytes" "$cert_der"; then
+    rm -rf "$scratch"
+    return 0
+  fi
+  if ! openssl x509 -inform DER -in "$cert_der" -out "$cert_pem" >/dev/null 2>&1; then
+    rm -rf "$scratch"
+    return 0
+  fi
+
+  subject=$(openssl x509 -in "$cert_pem" -noout -subject 2>/dev/null | sed 's/^subject=//')
+  issuer=$(openssl x509 -in "$cert_pem" -noout -issuer 2>/dev/null | sed 's/^issuer=//')
+  openssl x509 -in "$cert_pem" -noout -ext subjectAltName > "$san_dump" 2>/dev/null || true
+
+  emails_json=$(
+    { grep -oE 'email:[^,]+' "$san_dump" || true; } \
+      | sed 's/^email://' \
+      | jq -R . \
+      | jq -s . 2>/dev/null || printf '[]'
+  )
+  uris_json=$(
+    { grep -oE 'URI:[^,]+' "$san_dump" || true; } \
+      | sed 's/^URI://' \
+      | jq -R . \
+      | jq -s . 2>/dev/null || printf '[]'
+  )
+
+  jq -n \
+    --arg subject "$subject" \
+    --arg issuer "$issuer" \
+    --argjson san_emails "$emails_json" \
+    --argjson san_uris "$uris_json" \
+    '{
+      certificate_subject:(if $subject == "" then null else $subject end),
+      certificate_issuer:(if $issuer == "" then null else $issuer end),
+      san_emails:$san_emails,
+      san_uris:$san_uris
+    }' > "$output"
+  rm -rf "$scratch"
+}
+
+run_cosign_verify_blob_bundle() {
+  local artifact="$1" bundle="$2" output="$3"
+  shift 3
+  set +e
+  cosign verify-blob \
+    --bundle "$bundle" \
+    --new-bundle-format=true \
+    "$@" \
+    "$artifact" > "$output" 2>&1
+  local rc=$?
+  set -e
+  return "$rc"
+}
+
+find_cosign_tuf_targets_dir() {
+  local cosign_home="$1"
+  local tuf_repo_dir=""
+  tuf_repo_dir=$(find_cosign_tuf_repository_dir "$cosign_home" || true)
+  [[ -n "$tuf_repo_dir" ]] || return 1
+  printf '%s/targets\n' "$tuf_repo_dir"
+}
+
+find_cosign_tuf_repository_dir() {
+  local cosign_home="$1" metadata_path=""
+  metadata_path=$(find "$cosign_home/.sigstore/root" -mindepth 2 -maxdepth 2 -type f -name targets.json 2>/dev/null | head -n 1)
+  [[ -n "$metadata_path" ]] || return 1
+  dirname "$metadata_path"
+}
+
+find_cosign_tuf_targets_metadata_path() {
+  local cosign_home="$1" tuf_repo_dir=""
+  tuf_repo_dir=$(find_cosign_tuf_repository_dir "$cosign_home" || true)
+  [[ -n "$tuf_repo_dir" ]] || return 1
+  printf '%s/targets.json\n' "$tuf_repo_dir"
+}
+
+trust_target_allows_trimmed_newline_match() {
+  local target_name="${1:-}" target_path="${2:-}"
+  local lower_name="${target_name,,}" lower_path="${target_path,,}"
+  case "$lower_name" in
+    *.pub|*.pem|*.crt|*.cer|*.json) return 0 ;;
+  esac
+  case "$lower_path" in
+    *.pub|*.pem|*.crt|*.cer|*.json) return 0 ;;
+  esac
+  return 1
+}
+
+trim_trailing_crlf_from_file() {
+  local input_path="$1" output_path="$2" content=""
+  content=$(cat "$input_path")
+  while [[ "$content" == *$'\r' ]]; do
+    content="${content%$'\r'}"
+  done
+  printf '%s' "$content" > "$output_path"
+}
+
+files_match_after_trimming_newlines() {
+  local left_path="$1" right_path="$2"
+  local scratch left_trimmed right_trimmed left_sha right_sha left_size right_size
+  scratch=$(mktemp -d)
+  left_trimmed="$scratch/left"
+  right_trimmed="$scratch/right"
+  trim_trailing_crlf_from_file "$left_path" "$left_trimmed"
+  trim_trailing_crlf_from_file "$right_path" "$right_trimmed"
+  left_sha=$(sha256_file "$left_trimmed" 2>/dev/null || true)
+  right_sha=$(sha256_file "$right_trimmed" 2>/dev/null || true)
+  left_size=$(file_size_bytes "$left_trimmed")
+  right_size=$(file_size_bytes "$right_trimmed")
+  rm -rf "$scratch"
+  [[ -n "$left_sha" && "$left_sha" == "$right_sha" && "$left_size" == "$right_size" ]]
+}
+
+select_python_http_bridge_cmd() {
+  if have_cmd python3; then
+    printf 'python3\n'
+  elif have_cmd python; then
+    printf 'python\n'
+  else
+    return 1
+  fi
+}
+
+start_loopback_http_bridge() {
+  local python_cmd="$1" mirror_dir="$2" state_file="$3" log_file="$4"
+  "$python_cmd" - "$mirror_dir" "$state_file" >"$log_file" 2>&1 <<'PY' &
+import functools
+import http.server
+import socketserver
+import sys
+
+mirror_dir = sys.argv[1]
+state_file = sys.argv[2]
+
+Handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=mirror_dir)
+
+class LoopbackServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+with LoopbackServer(("127.0.0.1", 0), Handler) as httpd:
+    with open(state_file, "w", encoding="utf-8") as handle:
+        handle.write(f"http://127.0.0.1:{httpd.server_address[1]}")
+    httpd.serve_forever()
+PY
+  printf '%s\n' "$!"
+}
+
+http_url_reachable() {
+  local python_cmd="$1" url="$2"
+  "$python_cmd" - "$url" <<'PY' >/dev/null 2>&1
+import sys
+import urllib.request
+
+url = sys.argv[1]
+with urllib.request.urlopen(url, timeout=1) as response:
+    if response.status < 200 or response.status >= 400:
+        raise SystemExit(1)
+PY
+}
+
+wait_for_loopback_http_bridge() {
+  local python_cmd="$1" state_file="$2" probe_path="$3"
+  local attempts="${4:-30}"
+  local bridge_url="" attempt=0
+  while (( attempt < attempts )); do
+    if [[ -s "$state_file" ]]; then
+      bridge_url=$(cat "$state_file")
+      if [[ -n "$bridge_url" ]] && http_url_reachable "$python_cmd" "${bridge_url}${probe_path}"; then
+        printf '%s\n' "$bridge_url"
+        return 0
+      fi
+    fi
+    sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+stop_background_process() {
+  local pid="${1:-}"
+  [[ -n "$pid" ]] || return 0
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    sleep 0.2
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
+ensure_dependencies() {
+  command -v bash >/dev/null 2>&1 || die "missing dependency: bash"
+  command -v jq >/dev/null 2>&1 || die "missing dependency: jq"
+}
+
+default_machines_json() {
+  cat <<'JSON'
+{
+  "machines": {
+    "local": { "type": "local" }
+  }
+}
+JSON
+}
+
+seed_file_if_missing() {
+  local path="$1" content="$2"
+  [[ -e "$path" ]] && return 0
+  printf '%s\n' "$content" > "$path"
+}
+
+ensure_dirs() {
+  mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$RESULTS_DIR" "$SBOM_DIR" "$CHECKS_DIR" "$IOC_DIR" "$IOC_CATALOG_DIR" "$TOOL_BUNDLE_DIR"
+  seed_file_if_missing "$MACHINES_FILE" "$(default_machines_json)"
+  seed_file_if_missing "$TOOLS_FILE" '{}'
+  touch "$HOST_ALLOW_LOG"
+}
+
+capabilities_payload_json() {
+  local capabilities_json
+  capabilities_json=$(
+    printf '%s\n' "${SAFE_AUDIT_CAPABILITY_NAMES[@]}" \
+      | jq -Rn '[inputs | select(length > 0)] | reduce .[] as $name ({}; .[$name] = true)'
+  )
+
+  jq -n \
+    --argjson capabilities "$capabilities_json" \
+    '{
+      capabilities: $capabilities,
+      groups: {
+        top_level: {
+          scan: $capabilities.scan,
+          check: $capabilities.check,
+          diff: $capabilities.diff,
+          status: $capabilities.status
+        },
+        release: {
+          github: $capabilities["release.github"]
+        },
+        vuln: {
+          "github-release": $capabilities["vuln.github-release"]
+        },
+        verify: {
+          "release-asset": $capabilities["verify.release-asset"],
+          "sigstore-bundle": $capabilities["verify.sigstore-bundle"],
+          "tuf-bootstrap": $capabilities["verify.tuf-bootstrap"]
+        },
+        binary: {
+          exec: $capabilities["binary.exec"]
+        },
+        ioc: {
+          lookup: $capabilities["ioc.lookup"],
+          list: $capabilities["ioc.list"],
+          update: $capabilities["ioc.update"]
+        },
+        setup: {
+          machine: $capabilities["setup.machine"],
+          "create-bundle": $capabilities["setup.create-bundle"]
+        }
+      }
+    }'
+}
+
+capabilities_command_json() {
+  local payload_json
+  payload_json=$(capabilities_payload_json)
+
+  jq -n \
+    --arg command "safe audit capabilities" \
+    --arg version "$SAFE_AUDIT_VERSION" \
+    --argjson payload "$payload_json" \
+    '{
+      command: $command,
+      version: $version,
+      capabilities: $payload.capabilities,
+      groups: $payload.groups
+    }'
+}
+
+print_capabilities_human() {
+  local payload_json
+  payload_json=$(capabilities_payload_json)
+
+  printf 'safe-audit %s\n' "$SAFE_AUDIT_VERSION"
+  printf 'command: safe audit capabilities\n\n'
+  jq -r '
+    .groups
+    | to_entries[]
+    | .key + ":",
+      (.value | keys_unsorted[] | "  - " + .),
+      ""
+  ' <<<"$payload_json"
+}
+
+capabilities_command() {
+  local json_mode=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json)
+        json_mode=1
+        shift
+        ;;
+      -*)
+        die "unknown capabilities flag: $1"
+        ;;
+      *)
+        die "unexpected argument for capabilities: $1"
+        ;;
+    esac
+  done
+
+  if [[ "$json_mode" == "1" ]]; then
+    capabilities_command_json
+  else
+    print_capabilities_human
+  fi
+}
+
+machine_is_configured() {
+  jq -e --arg m "$1" '.machines[$m]' "$MACHINES_FILE" >/dev/null 2>&1
+}
+
+machine_type() {
+  if machine_is_configured "$1"; then
+    jq -r --arg m "$1" '.machines[$m].type // empty' "$MACHINES_FILE"
+  else
+    printf 'ssh'
+  fi
+}
+
+machine_host() {
+  if machine_is_configured "$1"; then
+    jq -r --arg m "$1" '.machines[$m].host // empty' "$MACHINES_FILE"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+machine_scan_root() {
+  local machine="$1" root
+  root=$(jq -r --arg m "$machine" '.machines[$m].scan_root // empty' "$MACHINES_FILE" 2>/dev/null || true)
+  if [[ -n "$root" ]]; then
+    printf '%s' "$root"
+  else
+    printf '%s' "$DEFAULT_SCAN_ROOT"
+  fi
+}
+
+detect_local_machine_name() {
+  local local_machine
+  local_machine=$(jq -r '.machines | to_entries[] | select(.value.type == "local") | .key' "$MACHINES_FILE" | head -n 1)
+  if [[ -n "$local_machine" ]]; then
+    printf '%s' "$local_machine"
+  else
+    printf '%s' "$DEFAULT_LOCAL_MACHINE"
+  fi
+}
+
+parse_machine_targets() {
+  local mode="${1:-default}"
+  shift || true
+  local explicit_all=0 explicit_csv=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all)
+        explicit_all=1
+        shift
+        ;;
+      --machine)
+        [[ $# -lt 2 ]] && die "--machine requires a comma-separated list"
+        explicit_csv="$2"
+        shift 2
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  MACHINE_TARGETS=()
+  if [[ "$explicit_all" == "1" ]]; then
+    mapfile -t MACHINE_TARGETS < <(jq -r '.machines | keys_unsorted[]' "$MACHINES_FILE")
+  elif [[ -n "$explicit_csv" ]]; then
+    IFS=',' read -r -a MACHINE_TARGETS <<<"$explicit_csv"
+  else
+    MACHINE_TARGETS=("$(detect_local_machine_name)")
+  fi
+
+  if [[ "${#MACHINE_TARGETS[@]}" -eq 0 ]]; then
+    die "no target machines resolved"
+  fi
+
+  local m
+  for m in "${MACHINE_TARGETS[@]}"; do
+    [[ "$(machine_type "$m")" == "local" || "$(machine_type "$m")" == "ssh" ]] || die "unknown machine: $m"
+  done
+}
+
+run_machine_capture() {
+  local machine="$1" cmd="$2"
+  if [[ "$(machine_type "$machine")" == "local" ]]; then
+    bash -lc "$cmd"
+  else
+    local host
+    host=$(machine_host "$machine")
+    ssh_batch "$host" "bash -lc $(printf '%q' "$cmd")"
+  fi
+}
+
+run_machine_stream() {
+  local machine="$1" cmd="$2"
+  if [[ "$(machine_type "$machine")" == "local" ]]; then
+    bash -lc "$cmd"
+  else
+    local host
+    host=$(machine_host "$machine")
+    ssh -t -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -o ConnectionAttempts=1 "$host" "bash -lc $(printf '%q' "$cmd")"
+  fi
+}
+
+machine_reachable() {
+  local machine="$1"
+  [[ "$(machine_type "$machine")" == "ssh" ]] || return 0
+  local host
+  host=$(machine_host "$machine")
+  ssh_batch "$host" true >/dev/null 2>&1
+}
+
+tool_cache_entry() {
+  jq -r --arg m "$1" '.[$m] // empty' "$TOOLS_FILE"
+}
+
+tool_cache_path() {
+  jq -r --arg m "$1" --arg t "$2" '.[$m][$t] // empty' "$TOOLS_FILE" 2>/dev/null || true
+}
+
+tool_cache_set() {
+  local machine="$1"
+  local entry_json="$2"
+  local tmp
+  tmp=$(mktemp)
+  jq --arg m "$machine" --argjson entry "$entry_json" '.[$m] = $entry' "$TOOLS_FILE" > "$tmp"
+  mv "$tmp" "$TOOLS_FILE"
+}
+
+build_tool_entry_json() {
+  local osv="${1:-}" grype="${2:-}" syft="${3:-}" govulncheck="${4:-}" cargo_audit="${5:-}" pip_audit="${6:-}" socket="${7:-}"
+  printf '{'
+  printf '"osv-scanner":%s,' "$(json_string_or_null "$osv")"
+  printf '"grype":%s,' "$(json_string_or_null "$grype")"
+  printf '"syft":%s,' "$(json_string_or_null "$syft")"
+  printf '"govulncheck":%s,' "$(json_string_or_null "$govulncheck")"
+  printf '"cargo-audit":%s,' "$(json_string_or_null "$cargo_audit")"
+  printf '"pip-audit":%s,' "$(json_string_or_null "$pip_audit")"
+  printf '"socket":%s' "$(json_string_or_null "$socket")"
+  printf '}'
+}
+
+detect_machine_tools() {
+  local machine="$1"
+  local refresh="${2:-0}"
+
+  if [[ "$refresh" != "1" ]] && jq -e --arg m "$machine" '.[$m]' "$TOOLS_FILE" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local output
+  output=$(run_machine_capture "$machine" '
+PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+for t in osv-scanner grype syft govulncheck cargo-audit pip-audit socket; do
+  if command -v "$t" >/dev/null 2>&1; then
+    printf "%s\t%s\n" "$t" "$(command -v "$t")"
+  else
+    printf "%s\t\n" "$t"
+  fi
+done
+')
+
+  local osv="" grype="" syft="" govulncheck="" cargo_audit="" pip_audit="" socket=""
+  local line tool path
+  while IFS=$'\t' read -r tool path; do
+    case "$tool" in
+      osv-scanner) osv="$path" ;;
+      grype) grype="$path" ;;
+      syft) syft="$path" ;;
+      govulncheck) govulncheck="$path" ;;
+      cargo-audit) cargo_audit="$path" ;;
+      pip-audit) pip_audit="$path" ;;
+      socket) socket="$path" ;;
+    esac
+  done <<<"$output"
+
+  tool_cache_set "$machine" "$(build_tool_entry_json "$osv" "$grype" "$syft" "$govulncheck" "$cargo_audit" "$pip_audit" "$socket")"
+}
+
+machine_missing_core_tools() {
+  local machine="$1"
+  local missing=()
+  local tool
+  for tool in osv-scanner grype syft; do
+    if [[ -z "$(tool_cache_path "$machine" "$tool")" ]]; then
+      missing+=("$tool")
+    fi
+  done
+  printf '%s\n' "${missing[*]:-}"
+}
+
+machine_missing_tools_from_list() {
+  local machine="$1"
+  shift
+  local missing=()
+  local tool
+  for tool in "$@"; do
+    if [[ -z "$(tool_cache_path "$machine" "$tool")" ]]; then
+      missing+=("$tool")
+    fi
+  done
+  printf '%s\n' "${missing[*]:-}"
+}
+
+warn_missing_scan_tools() {
+  local machine="$1"
+  local missing
+  missing=$(machine_missing_core_tools "$machine")
+  [[ -z "$missing" ]] && return 0
+  warn "$machine missing required scanners: $missing"
+  warn "$machine: install scanners first with: safe-audit setup $(printf '%q' "$machine")"
+}
+
+confirm_scan_with_missing_tools() {
+  local machine="$1"
+  local project_target="${2:-}"
+  local missing
+  missing=$(machine_missing_core_tools "$machine")
+  [[ -z "$missing" ]] && return 0
+
+  local setup_cmd scan_cmd
+  setup_cmd="safe-audit setup $(printf '%q' "$machine")"
+  scan_cmd="safe-audit scan --machine $(printf '%q' "$machine")"
+  if [[ -n "$project_target" ]]; then
+    scan_cmd+=" --project $(printf '%q' "$project_target")"
+  fi
+
+  warn "$machine missing required scanners: $missing"
+  warn "$machine: install scanners first, then run the scan:"
+  warn "  $setup_cmd"
+  warn "  $scan_cmd"
+  if ! is_tty; then
+    warn "$machine: skipping scan because required scanners are missing in non-TTY mode"
+    return 2
+  fi
+
+  printf 'Install missing scanners on %s now, proceed with partial audit, or skip? [I/y/n] ' "$machine" >&2
+  local answer
+  answer=$(read_prompt_answer)
+  case "$answer" in
+    ""|i|I|install|Install|INSTALL)
+      setup_machine "$machine" "" 0 0 || return 1
+      missing=$(machine_missing_core_tools "$machine")
+      if [[ -z "$missing" ]]; then
+        return 0
+      fi
+      warn "$machine: scanners are still missing after setup: $missing"
+      warn "$machine: scan skipped"
+      return 1
+      ;;
+    y|Y|yes) return 0 ;;
+    n|N|no) warn "$machine: scan skipped"; return 2 ;;
+    *) warn "$machine: unknown choice, scan skipped"; return 2 ;;
+  esac
+}
+
+relative_to() {
+  local base="$1" path="$2"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath --relative-to="$base" "$path"
+  elif command -v readlink >/dev/null 2>&1; then
+    local base_abs path_abs
+    base_abs=$(readlink -f "$base")
+    path_abs=$(readlink -f "$path")
+    printf '%s\n' "${path_abs#"$base_abs"/}"
+  else
+    local base_abs path_abs
+    base_abs=$(cd "$base" && pwd -P)
+    path_abs=$(cd "$(dirname "$path")" && pwd -P)/$(basename "$path")
+    printf '%s\n' "${path_abs#"$base_abs"/}"
+  fi
+}
+
+path_abs() {
+  local path="$1"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "$path"
+  elif command -v readlink >/dev/null 2>&1; then
+    readlink -f "$path"
+  else
+    (cd "$(dirname "$path")" && printf '%s/%s\n' "$(pwd -P)" "$(basename "$path")")
+  fi
+}
+
+reset_project_config() {
+  PROJECT_IGNORES=()
+  PROJECT_ECOSYSTEMS=(
+    [npm]=""
+    [python]=""
+    [php]=""
+    [rust]=""
+    [go]=""
+  )
+  PROJECT_SCANNERS=(
+    [python]="pip-audit"
+    [npm]="npm-audit"
+    [php]="composer-audit"
+    [rust]="cargo-audit"
+    [go]="govulncheck"
+  )
+}
+
+parse_project_config() {
+  local config="${1:-}"
+  reset_project_config
+  [[ -z "$config" || ! -f "$config" ]] && return 0
+
+  local section="" raw line key value
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line="${raw%%#*}"
+    line="$(trim "$line")"
+    [[ -z "$line" ]] && continue
+    case "$line" in
+      ecosystems:) section="ecosystems"; continue ;;
+      scanners:) section="scanners"; continue ;;
+      ignore:) section="ignore"; continue ;;
+    esac
+    case "$section" in
+      ecosystems)
+        if [[ "$line" =~ ^([A-Za-z0-9_-]+):[[:space:]]*(true|false)$ ]]; then
+          key="${BASH_REMATCH[1]}"
+          value="${BASH_REMATCH[2]}"
+          PROJECT_ECOSYSTEMS["$key"]="$value"
+        fi
+        ;;
+      scanners)
+        if [[ "$line" =~ ^([A-Za-z0-9_-]+):[[:space:]]*([A-Za-z0-9._-]+)$ ]]; then
+          key="${BASH_REMATCH[1]}"
+          value="${BASH_REMATCH[2]}"
+          PROJECT_SCANNERS["$key"]="$value"
+        fi
+        ;;
+      ignore)
+        if [[ "$line" =~ ^-[[:space:]]*(.+)$ ]]; then
+          PROJECT_IGNORES+=("${BASH_REMATCH[1]}")
+        fi
+        ;;
+    esac
+  done <"$config"
+}
+
+lockfile_ecosystem() {
+  local file
+  file=$(basename "$1")
+  case "$file" in
+    package-lock.json|pnpm-lock.yaml|yarn.lock) echo "npm" ;;
+    uv.lock|poetry.lock|Pipfile.lock) echo "python" ;;
+    composer.lock) echo "php" ;;
+    Cargo.lock) echo "rust" ;;
+    go.sum) echo "go" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+manifest_matches() {
+  local base
+  base=$(basename "$1")
+  case "$base" in
+    package.json|package-lock.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum|.safe-audit)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+path_matches_ignore() {
+  local rel="$1"
+  local pattern
+  for pattern in "${PROJECT_IGNORES[@]}"; do
+    if [[ "$rel" == $pattern || "$rel" == */$pattern || "$rel" == $pattern/* || "$rel" == */$pattern/* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+append_syft_excludes_for_config() {
+  local source_abs="$1" config="$2"
+  [[ -f "$config" ]] || return 0
+  local root rel_prefix pattern
+  root=$(dirname "$config")
+  rel_prefix=$(relative_to "$source_abs" "$root")
+  [[ "$rel_prefix" == "." ]] && rel_prefix=""
+  [[ -n "$rel_prefix" ]] && rel_prefix="${rel_prefix%/}/"
+
+  parse_project_config "$config"
+  for pattern in "${PROJECT_IGNORES[@]}"; do
+    [[ -z "$pattern" ]] && continue
+    CURRENT_SYFT_EXCLUDES+=("${rel_prefix}${pattern}")
+    CURRENT_SYFT_EXCLUDES+=("${rel_prefix}${pattern}/**")
+  done
+}
+
+syft_exclude_args_for_current_scan() {
+  local pattern
+  for pattern in "${CURRENT_SYFT_EXCLUDES[@]}"; do
+    printf '%s\0%s\0' '--exclude' "$pattern"
+  done
+}
+
+find_source_files_pruned() {
+  local source_abs="$1"
+  local root_config="$source_abs/.safe-audit"
+  local root_ignores=()
+  if [[ -f "$root_config" ]]; then
+    parse_project_config "$root_config"
+    root_ignores=("${PROJECT_IGNORES[@]}")
+  fi
+
+  local find_args=("$source_abs")
+  local pattern clean_pattern first=1
+  if [[ "${#root_ignores[@]}" -gt 0 ]]; then
+    find_args+=("(")
+    for pattern in "${root_ignores[@]}"; do
+      [[ -z "$pattern" ]] && continue
+      clean_pattern="${pattern#./}"
+      clean_pattern="${clean_pattern%/}"
+      [[ "$first" == "1" ]] || find_args+=("-o")
+      find_args+=("-path" "$source_abs/$clean_pattern" "-o" "-path" "$source_abs/$clean_pattern/*")
+      first=0
+    done
+    if [[ "$first" == "0" ]]; then
+      find_args+=(")" "-prune" "-o")
+    else
+      find_args=("$source_abs")
+    fi
+  fi
+
+  find "${find_args[@]}" -type f -print0 2>/dev/null
+}
+
+nearest_project_config() {
+  local start="$1" stop="$2"
+  local dir="$start"
+  while [[ "$dir" == "$stop"* || "$dir" == "$HOME"* ]]; do
+    if [[ -f "$dir/.safe-audit" ]]; then
+      printf '%s\n' "$dir/.safe-audit"
+      return 0
+    fi
+    [[ "$dir" == "/" || "$dir" == "$HOME" || "$dir" == "$stop" ]] && break
+    dir=$(dirname "$dir")
+  done
+  return 1
+}
+
+gather_stage_locally() {
+  local source="$1" stage="$2"
+  mkdir -p "$stage"
+  local source_abs
+  source_abs=$(path_abs "$source")
+  if ! gather_projects_from_source "$source_abs"; then
+    warn "bounded project discovery failed for $source; falling back to manifest staging"
+    (
+      cd "$source_abs"
+      find_source_files_pruned "$source_abs" | while IFS= read -r -d '' f; do f="./$(relative_to "$source_abs" "$f")"; manifest_matches "$f" && printf '%s\0' "$f"; done | tar --null -T - -czf - 2>/dev/null
+    ) | tar -xzf - -C "$stage" 2>/dev/null || true
+    return 0
+  fi
+
+  local manifest rel manifest_list
+  manifest_list=$(mktemp)
+  for manifest in "${CURRENT_MANIFESTS[@]}"; do
+    rel=$(relative_to "$source_abs" "$manifest")
+    printf './%s\0' "$rel" >> "$manifest_list"
+  done
+  if [[ -s "$manifest_list" ]]; then
+    (cd "$source_abs" && tar --null -T "$manifest_list" -czf - 2>/dev/null) | tar -xzf - -C "$stage" 2>/dev/null || true
+  else
+    warn "bounded project discovery found no manifests under $source; staged scan may be empty"
+  fi
+  rm -f "$manifest_list"
+}
+
+gather_stage_remotely() {
+  local machine="$1" target="$2" stage="$3"
+  mkdir -p "$stage"
+  local host
+  host=$(machine_host "$machine")
+  local rc=0
+  local statuses=()
+  set +e
+  remote_stage_helper_script | ssh_batch "$host" "bash -s -- $(printf '%q' "$target")" | tar -xzf - -C "$stage" 2>/dev/null
+  statuses=("${PIPESTATUS[@]}")
+  set -e
+  local status
+  for status in "${statuses[@]}"; do
+    [[ "$status" -ge 130 ]] && return "$status"
+  done
+  for ((i=${#statuses[@]} - 1; i >= 0; i--)); do
+    if [[ "${statuses[$i]}" -ne 0 ]]; then
+      rc="${statuses[$i]}"
+      break
+    fi
+  done
+  if [[ "$rc" -ne 0 ]]; then
+    warn "$machine: bounded remote staging failed; falling back to manifest staging"
+    set +e
+    ssh_batch "$host" "cd $(printf '%q' "$target") && find . -type f \( -name '.safe-audit' -o -name 'package.json' -o -name 'package-lock.json' -o -name 'pnpm-lock.yaml' -o -name 'yarn.lock' -o -name 'uv.lock' -o -name 'poetry.lock' -o -name 'Pipfile.lock' -o -name 'pyproject.toml' -o -name 'composer.json' -o -name 'composer.lock' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'go.mod' -o -name 'go.sum' -o -name 'requirements.txt' -o -name 'requirements-dev.txt' -o -name 'requirements.lock' \) -print0 | tar --null -T - -czf - 2>/dev/null" \
+      | tar -xzf - -C "$stage" 2>/dev/null
+    statuses=("${PIPESTATUS[@]}")
+    set -e
+    for status in "${statuses[@]}"; do
+      [[ "$status" -ge 130 ]] && return "$status"
+    done
+  fi
+}
+
+gather_projects_from_source() {
+  local source="$1"
+  local source_abs
+  source_abs=$(path_abs "$source")
+  CURRENT_LOCKFILES=()
+  CURRENT_MANIFESTS=()
+  CURRENT_PROJECT_ROOTS=()
+  CURRENT_SYFT_EXCLUDES=()
+  declare -A seen_roots=()
+
+  local cfg
+  while IFS= read -r -d '' cfg; do
+    append_syft_excludes_for_config "$source_abs" "$cfg"
+  done < <(find_source_files_pruned "$source_abs" | while IFS= read -r -d '' f; do [[ "$(basename "$f")" == ".safe-audit" ]] && printf '%s\0' "$f"; done)
+
+  local file rel project_cfg root
+  while IFS= read -r -d '' file; do
+    project_cfg=$(nearest_project_config "$(dirname "$file")" "$source_abs" || true)
+    if [[ -n "$project_cfg" ]]; then
+      root=$(dirname "$project_cfg")
+      parse_project_config "$project_cfg"
+      rel=$(relative_to "$root" "$file")
+      if path_matches_ignore "$rel"; then
+        continue
+      fi
+    else
+      root=$(dirname "$file")
+      rel=$(relative_to "$source_abs" "$file")
+    fi
+    CURRENT_MANIFESTS+=("$file")
+    [[ "$(basename "$file")" == ".safe-audit" ]] && continue
+    case "$(basename "$file")" in
+      package-lock.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
+        CURRENT_LOCKFILES+=("$file")
+        if [[ -z "${seen_roots[$root]:-}" ]]; then
+          seen_roots["$root"]=1
+          CURRENT_PROJECT_ROOTS+=("$root")
+        fi
+        ;;
+    esac
+  done < <(find_source_files_pruned "$source_abs")
+
+  if [[ "${#CURRENT_PROJECT_ROOTS[@]}" -eq 0 ]]; then
+    CURRENT_PROJECT_ROOTS=("$source_abs")
+  fi
+}
+
+ecosystem_enabled() {
+  local ecosystem="$1"
+  local v="${PROJECT_ECOSYSTEMS[$ecosystem]:-}"
+  [[ -z "$v" || "$v" == "true" ]]
+}
+
+tool_available_local() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+scanner_path_for_machine() {
+  local machine="$1" tool="$2"
+  local path
+  path=$(tool_cache_path "$machine" "$tool")
+  if [[ "$(machine_type "$machine")" == "local" && -n "$path" && -x "$path" ]]; then
+    printf '%s' "$path"
+  elif [[ "$(machine_type "$machine")" == "local" ]] && command -v "$tool" >/dev/null 2>&1; then
+    command -v "$tool"
+  fi
+}
+
+local_scanner_path() {
+  local tool="$1"
+  if command -v "$tool" >/dev/null 2>&1; then
+    command -v "$tool"
+  else
+    printf ''
+  fi
+}
+
+osv_scan_lockfiles() {
+  local machine="$1" output="$2"
+  shift 2
+  local lockfiles=("$@")
+  local osv
+  osv=$(scanner_path_for_machine "$machine" "osv-scanner")
+  if [[ -z "$osv" || "${#lockfiles[@]}" -eq 0 ]]; then
+    printf '{"results":[],"skipped":"osv-scanner unavailable or no lockfiles"}\n' > "$output"
+    return 0
+  fi
+
+  local args=(scan --format json)
+  local lf
+  for lf in "${lockfiles[@]}"; do
+    args+=("--lockfile=$lf")
+  done
+
+  if ! "$osv" "${args[@]}" > "$output" 2>"$output.stderr"; then
+    warn "osv-scanner failed; details: $output.stderr"
+    printf '{"results":[],"error":"osv-scanner failed"}\n' > "$output"
+  fi
+}
+
+syft_generate_sbom() {
+  local machine="$1" source="$2" sbom_path="$3"
+  local syft
+  syft=$(scanner_path_for_machine "$machine" "syft")
+  if [[ -z "$syft" ]]; then
+    printf '{"components":[],"metadata":{"tools":[{"name":"safe-audit","note":"syft unavailable"}]}}\n' > "$sbom_path"
+    return 0
+  fi
+  local exclude_args=()
+  mapfile -d '' -t exclude_args < <(syft_exclude_args_for_current_scan)
+  if ! "$syft" "dir:$source" -o cyclonedx-json "${exclude_args[@]}" > "$sbom_path" 2>"$sbom_path.stderr"; then
+    warn "syft failed for $source; details: $sbom_path.stderr"
+    printf '{"components":[],"metadata":{"tools":[{"name":"safe-audit","note":"syft failed"}]}}\n' > "$sbom_path"
+  fi
+}
+
+grype_scan_sbom() {
+  local machine="$1" sbom_path="$2" output="$3"
+  local grype
+  grype=$(scanner_path_for_machine "$machine" "grype")
+  if [[ -z "$grype" ]]; then
+    printf '{"matches":[],"skipped":"grype unavailable"}\n' > "$output"
+    return 0
+  fi
+  if ! "$grype" "sbom:$sbom_path" -o json -q > "$output" 2>"$output.stderr"; then
+    warn "grype failed for $sbom_path; details: $output.stderr"
+    printf '{"matches":[],"error":"grype failed"}\n' > "$output"
+  fi
+}
+
+grype_db_health_json() {
+  local machine="$1" output="$2"
+  local grype=""
+  if [[ "$(machine_type "$machine")" == "local" ]]; then
+    grype=$(scanner_path_for_machine "$machine" "grype")
+  else
+    grype=$(tool_cache_path "$machine" "grype")
+  fi
+  if [[ -z "$grype" ]]; then
+    printf '{"healthy":false,"status":"unavailable","note":"grype unavailable"}\n' > "$output"
+    return 0
+  fi
+
+  local raw
+  raw=$(mktemp)
+  local rc=0
+  run_machine_capture "$machine" "$(printf '%q' "$grype") db status -o json -q" > "$raw" 2>"$output.stderr" || rc=$?
+
+  if ! jq -e 'type == "object"' "$raw" >/dev/null 2>&1; then
+    jq -n --arg note "grype db status failed" --arg stderr "$(cat "$output.stderr" 2>/dev/null || true)" --argjson rc "$rc" '
+      {healthy:false,status:"error",note:$note,exit_code:$rc,stderr:$stderr}
+    ' > "$output"
+    return 0
+  fi
+
+  jq -n \
+    --argjson max_age_days "$GRYPE_DB_MAX_AGE_DAYS" \
+    --argjson exit_code "$rc" \
+    --slurpfile status "$raw" '
+    ($status[0] // {}) as $s |
+    (
+      if ($s.built // "") == "" then null
+      else (($s.built | fromdateiso8601? // null) as $built | if $built == null then null else ((now - $built) / 86400) end)
+      end
+    ) as $age_days |
+    ($s.valid == true) as $valid |
+    ($age_days == null or $age_days <= $max_age_days) as $fresh |
+    {
+      healthy: ($valid and $fresh),
+      status: (if ($valid and $fresh) then "ok" elif ($valid | not) then "invalid" else "stale" end),
+      valid: $valid,
+      age_days: $age_days,
+      max_age_days: $max_age_days,
+      built: ($s.built // null),
+      path: ($s.path // null),
+      schema_version: ($s.schemaVersion // null),
+      error: ($s.error // null),
+      exit_code: $exit_code
+    }
+  ' > "$output"
+}
+
+machine_grype_db_healthy() {
+  local machine="$1"
+  local health status detail
+  health=$(mktemp)
+  grype_db_health_json "$machine" "$health"
+  if jq -e '.healthy == true' "$health" >/dev/null 2>&1; then
+    return 0
+  fi
+  status=$(jq -r '.status // "unknown"' "$health" 2>/dev/null || printf 'unknown')
+  detail=$(jq -r '
+    if .built then "built=" + .built
+    elif .error then .error
+    elif .note then .note
+    else "no usable db metadata"
+    end
+  ' "$health" 2>/dev/null || printf 'no usable db metadata')
+  warn "$machine: grype db health check failed ($status, $detail)"
+  return 1
+}
+
+count_sbom_packages() {
+  jq '[.components[]? | select(.type != "file")] | length' "$1" 2>/dev/null || echo 0
+}
+
+count_sbom_ecosystem() {
+  local sbom="$1" kind="$2"
+  jq --arg kind "$kind" '
+    [.components[]? | select(.purl? and (.purl | startswith("pkg:" + $kind + "/")))] | length
+  ' "$sbom" 2>/dev/null || echo 0
+}
+
+severity_from_osv_entry() {
+  local raw
+  raw=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$raw" in
+    critical*) echo "critical" ;;
+    high*) echo "high" ;;
+    moderate*|medium*) echo "medium" ;;
+    low*) echo "low" ;;
+    *9.*|*10.*) echo "critical" ;;
+    *7.*|*8.*) echo "high" ;;
+    *4.*|*5.*|*6.*) echo "medium" ;;
+    *0.*|*1.*|*2.*|*3.*) echo "low" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+summarize_osv_counts() {
+  local osv_json="$1"
+  jq -r '
+    [.results[]?.packages[]?.vulnerabilities[]? |
+      (.database_specific.severity // .severity[0].score // "unknown")
+    ] | @tsv
+  ' "$osv_json" 2>/dev/null | tr '\t' '\n' | sed '/^$/d' || true
+}
+
+count_grype_severity() {
+  local grype_json="$1" severity="$2"
+  jq --arg s "$severity" '[.matches[]? | select((.vulnerability.severity // "" | ascii_downcase) == ($s | ascii_downcase))] | length' "$grype_json" 2>/dev/null || echo 0
+}
+
+render_ecosystem_audit_json() {
+  local scanner="$1" status="$2" total="$3" critical="$4" high="$5" medium="$6" low="$7" note="${8:-}"
+  printf '{'
+  printf '"scanner":%s,' "$(json_string_or_null "$scanner")"
+  printf '"status":%s,' "$(json_string_or_null "$status")"
+  printf '"total":%s,' "$total"
+  printf '"critical":%s,' "$critical"
+  printf '"high":%s,' "$high"
+  printf '"medium":%s,' "$medium"
+  printf '"low":%s,' "$low"
+  printf '"note":%s' "$(json_string_or_null "$note")"
+  printf '}'
+}
+
+run_npm_audit_dir() {
+  local dir="$1" output="$2"
+  if ! command -v npm >/dev/null 2>&1; then
+    printf '%s\n' "$(render_ecosystem_audit_json "npm-audit" "skipped" 0 0 0 0 0 "npm unavailable")" > "$output"
+    return 0
+  fi
+  if ! (cd "$dir" && npm audit --json) > "$output.raw" 2>"$output.stderr"; then
+    :
+  fi
+  jq -n --slurpfile data "$output.raw" '
+    ($data[0] // {}) as $r |
+    ($r.metadata.vulnerabilities.total // 0) as $total |
+    {
+      scanner: "npm-audit",
+      status: "ok",
+      total: $total,
+      critical: ($r.metadata.vulnerabilities.critical // 0),
+      high: ($r.metadata.vulnerabilities.high // 0),
+      medium: ($r.metadata.vulnerabilities.moderate // 0),
+      low: ($r.metadata.vulnerabilities.low // 0),
+      note: null
+    }
+  ' > "$output"
+}
+
+run_composer_audit_dir() {
+  local dir="$1" output="$2"
+  if ! command -v composer >/dev/null 2>&1; then
+    printf '%s\n' "$(render_ecosystem_audit_json "composer-audit" "skipped" 0 0 0 0 0 "composer unavailable")" > "$output"
+    return 0
+  fi
+  if ! (cd "$dir" && composer audit --format=json) > "$output.raw" 2>"$output.stderr"; then
+    :
+  fi
+  jq -n --slurpfile data "$output.raw" '
+    ($data[0] // {}) as $r |
+    ($r.advisories // []) as $a |
+    {
+      scanner: "composer-audit",
+      status: "ok",
+      total: ($a | length),
+      critical: ([$a[]? | select((.severity // "") | ascii_downcase == "critical")] | length),
+      high: ([$a[]? | select((.severity // "") | ascii_downcase == "high")] | length),
+      medium: ([$a[]? | select((.severity // "") | ascii_downcase == "medium")] | length),
+      low: ([$a[]? | select((.severity // "") | ascii_downcase == "low")] | length),
+      note: null
+    }
+  ' > "$output"
+}
+
+run_cargo_audit_dir() {
+  local dir="$1" output="$2"
+  if ! command -v cargo-audit >/dev/null 2>&1; then
+    printf '%s\n' "$(render_ecosystem_audit_json "cargo-audit" "skipped" 0 0 0 0 0 "cargo-audit unavailable")" > "$output"
+    return 0
+  fi
+  if ! (cd "$dir" && cargo audit --json) > "$output.raw" 2>"$output.stderr"; then
+    :
+  fi
+  jq -n --slurpfile data "$output.raw" '
+    ($data[0].vulnerabilities.list // []) as $list |
+    {
+      scanner: "cargo-audit",
+      status: "ok",
+      total: ($list | length),
+      critical: 0,
+      high: ([$list[]? | select((.advisory.severity // "") | ascii_downcase == "high")] | length),
+      medium: ([$list[]? | select((.advisory.severity // "") | ascii_downcase == "medium")] | length),
+      low: ([$list[]? | select((.advisory.severity // "") | ascii_downcase == "low")] | length),
+      note: null
+    }
+  ' > "$output"
+}
+
+run_govulncheck_dir() {
+  local dir="$1" output="$2"
+  if ! command -v govulncheck >/dev/null 2>&1; then
+    printf '%s\n' "$(render_ecosystem_audit_json "govulncheck" "skipped" 0 0 0 0 0 "govulncheck unavailable")" > "$output"
+    return 0
+  fi
+  if ! (cd "$dir" && govulncheck -json ./...) > "$output.raw" 2>"$output.stderr"; then
+    :
+  fi
+  jq -Rn --arg raw "$(cat "$output.raw" 2>/dev/null || true)" '
+    ($raw | split("\n") | map(select(length > 0) | fromjson? // empty)) as $entries |
+    ($entries | map(select(.finding?)) | length) as $total |
+    {
+      scanner: "govulncheck",
+      status: "ok",
+      total: $total,
+      critical: 0,
+      high: 0,
+      medium: $total,
+      low: 0,
+      note: null
+    }
+  ' > "$output"
+}
+
+run_pip_audit_dir() {
+  local dir="$1" output="$2"
+  if ! command -v pip-audit >/dev/null 2>&1; then
+    printf '%s\n' "$(render_ecosystem_audit_json "pip-audit" "skipped" 0 0 0 0 0 "pip-audit unavailable")" > "$output"
+    return 0
+  fi
+
+  local target=""
+  local candidate
+  for candidate in "$dir/requirements.txt" "$dir/requirements-dev.txt" "$dir/pyproject.toml"; do
+    if [[ -f "$candidate" ]]; then
+      target="$candidate"
+      break
+    fi
+  done
+
+  if [[ -z "$target" ]]; then
+    printf '%s\n' "$(render_ecosystem_audit_json "pip-audit" "skipped" 0 0 0 0 0 "no supported python audit target found")" > "$output"
+    return 0
+  fi
+
+  if [[ "$target" == *.txt ]]; then
+    if ! pip-audit -r "$target" -f json > "$output.raw" 2>"$output.stderr"; then
+      :
+    fi
+  else
+    if ! (cd "$dir" && pip-audit -f json) > "$output.raw" 2>"$output.stderr"; then
+      :
+    fi
+  fi
+
+  jq -n --slurpfile data "$output.raw" '
+    ($data[0] // []) as $list |
+    {
+      scanner: "pip-audit",
+      status: "ok",
+      total: ($list | length),
+      critical: 0,
+      high: 0,
+      medium: ($list | length),
+      low: 0,
+      note: null
+    }
+  ' > "$output"
+}
+
+run_project_ecosystem_audits() {
+  local project_root="$1" output_dir="$2"
+  mkdir -p "$output_dir"
+  local audits=()
+  local ecosystem scanner output
+
+  for ecosystem in npm python php rust go; do
+    if ! ecosystem_enabled "$ecosystem"; then
+      continue
+    fi
+    scanner="${PROJECT_SCANNERS[$ecosystem]}"
+    output="$output_dir/${ecosystem}.json"
+    case "$scanner" in
+      npm-audit) run_npm_audit_dir "$project_root" "$output" ;;
+      pip-audit) run_pip_audit_dir "$project_root" "$output" ;;
+      composer-audit) run_composer_audit_dir "$project_root" "$output" ;;
+      cargo-audit) run_cargo_audit_dir "$project_root" "$output" ;;
+      govulncheck) run_govulncheck_dir "$project_root" "$output" ;;
+      *)
+        printf '%s\n' "$(render_ecosystem_audit_json "$scanner" "skipped" 0 0 0 0 0 "unknown scanner")" > "$output"
+        ;;
+    esac
+    audits+=("$output")
+  done
+
+  if [[ "${#audits[@]}" -eq 0 ]]; then
+    printf '[]\n'
+    return 0
+  fi
+  jq -s '.' "${audits[@]}"
+}
+
+latest_previous_result() {
+  local machine="$1" current="$2"
+  find "$RESULTS_DIR/$machine" -maxdepth 1 -type f -name '*-scan.json' ! -path "$current" 2>/dev/null | sort | tail -n 1 || true
+}
+
+latest_previous_sbom() {
+  local machine="$1" current="$2"
+  find "$SBOM_DIR/$machine" -maxdepth 1 -type f -name '*-sbom.cdx.json' ! -path "$current" 2>/dev/null | sort | tail -n 1 || true
+}
+
+scan_result_path_for() {
+  local machine="$1" stamp="$2"
+  printf '%s/%s/%s-scan.json' "$RESULTS_DIR" "$machine" "$stamp"
+}
+
+scan_sbom_path_for() {
+  local machine="$1" stamp="$2"
+  printf '%s/%s/%s-sbom.cdx.json' "$SBOM_DIR" "$machine" "$stamp"
+}
+
+epoch_from_since_spec() {
+  local spec="$1"
+  case "$spec" in
+    *[!0-9smhdw-]*)
+      date -d "$spec" +%s 2>/dev/null || return 1
+      ;;
+    [0-9]*s)
+      date -d "${spec%s} seconds ago" +%s 2>/dev/null || return 1
+      ;;
+    [0-9]*m)
+      date -d "${spec%m} minutes ago" +%s 2>/dev/null || return 1
+      ;;
+    [0-9]*h)
+      date -d "${spec%h} hours ago" +%s 2>/dev/null || return 1
+      ;;
+    [0-9]*d)
+      date -d "${spec%d} days ago" +%s 2>/dev/null || return 1
+      ;;
+    [0-9]*w)
+      date -d "$(( ${spec%w} * 7 )) days ago" +%s 2>/dev/null || return 1
+      ;;
+    *)
+      date -d "$spec" +%s 2>/dev/null || return 1
+      ;;
+  esac
+}
+
+file_epoch() {
+  stat -c %Y "$1"
+}
+
+select_previous_sbom() {
+  local machine="$1" latest="$2" since="${3:-}"
+  if [[ -z "$since" ]]; then
+    find "$SBOM_DIR/$machine" -maxdepth 1 -type f -name '*-sbom.cdx.json' ! -path "$latest" 2>/dev/null | sort | tail -n 1 || true
+    return 0
+  fi
+
+  local cutoff
+  cutoff=$(epoch_from_since_spec "$since") || die "unsupported --since value: $since"
+  local candidate="" file epoch
+  while IFS= read -r file; do
+    [[ -z "$file" || "$file" == "$latest" ]] && continue
+    epoch=$(file_epoch "$file")
+    if (( epoch <= cutoff )); then
+      candidate="$file"
+    fi
+  done < <(find "$SBOM_DIR/$machine" -maxdepth 1 -type f -name '*-sbom.cdx.json' 2>/dev/null | sort)
+  printf '%s' "$candidate"
+}
+
+build_delta_json() {
+  local machine="$1" result_path="$2" sbom_path="$3"
+  local previous_result previous_sbom
+  previous_result=$(latest_previous_result "$machine" "$result_path")
+  previous_sbom=$(latest_previous_sbom "$machine" "$sbom_path")
+  if [[ -z "$previous_result" || -z "$previous_sbom" ]]; then
+    printf '{"previous_scan":null,"packages_added":0,"packages_removed":0,"new_cves":[]}\n'
+    return 0
+  fi
+
+  local added removed new_cves previous_scan
+  added=$(jq -n --slurpfile prev "$previous_sbom" --slurpfile cur "$sbom_path" '
+    ([($cur[0].components[]? | "\(.name)@\(.version // "unknown")")] - [($prev[0].components[]? | "\(.name)@\(.version // "unknown")")]) | length
+  ')
+  removed=$(jq -n --slurpfile prev "$previous_sbom" --slurpfile cur "$sbom_path" '
+    ([($prev[0].components[]? | "\(.name)@\(.version // "unknown")")] - [($cur[0].components[]? | "\(.name)@\(.version // "unknown")")]) | length
+  ')
+  previous_scan=$(jq -r '.date // .timestamp // empty' "$previous_result" 2>/dev/null || true)
+  [[ -z "$previous_scan" ]] && previous_scan=$(basename "$previous_result" | sed 's/-scan\.json$//')
+  new_cves=$(jq -n --slurpfile prev "$previous_result" --slurpfile cur "$result_path" '
+    ([ $cur[0].cve_scan.findings[]?.id ] - [ $prev[0].cve_scan.findings[]?.id ]) | unique
+  ')
+
+  jq -n \
+    --arg previous_scan "$previous_scan" \
+    --argjson added "$added" \
+    --argjson removed "$removed" \
+    --argjson new_cves "$new_cves" \
+    '{
+      previous_scan: ($previous_scan | select(length > 0) // null),
+      packages_added: $added,
+      packages_removed: $removed,
+      new_cves: $new_cves
+    }'
+}
+
+render_scan_summary() {
+  local result_path="$1"
+  local machine
+  machine=$(jq -r '.machine' "$result_path")
+  printf '=== SAFE-AUDIT SCAN - %s - %s ===\n\n' \
+    "$machine" "$(jq -r '.date' "$result_path")"
+  printf 'SBOM: %s packages cataloged (npm: %s, python: %s, go: %s, php: %s, rust: %s)\n\n' \
+    "$(jq -r '.summary.packages_total' "$result_path")" \
+    "$(jq -r '.summary.ecosystems.npm' "$result_path")" \
+    "$(jq -r '.summary.ecosystems.python' "$result_path")" \
+    "$(jq -r '.summary.ecosystems.go' "$result_path")" \
+    "$(jq -r '.summary.ecosystems.php' "$result_path")" \
+    "$(jq -r '.summary.ecosystems.rust' "$result_path")"
+  printf 'CVE SCAN (osv-scanner + grype):\n'
+  printf '  CRITICAL: %s\n' "$(jq -r '.cve_scan.critical' "$result_path")"
+  printf '  HIGH: %s\n' "$(jq -r '.cve_scan.high' "$result_path")"
+  printf '  MEDIUM: %s\n' "$(jq -r '.cve_scan.medium' "$result_path")"
+  printf '  LOW: %s\n\n' "$(jq -r '.cve_scan.low' "$result_path")"
+  printf 'ECOSYSTEM AUDITS:\n'
+  jq -r '
+    .ecosystem_audits[]? |
+    "  \(.scanner): \(.total) advisories (\(.critical) critical, \(.high) high, \(.medium) medium, \(.low) low)"
+  ' "$result_path"
+  if jq -e '.delta.previous_scan != null' "$result_path" >/dev/null 2>&1; then
+    printf '\nDELTA vs last scan (%s):\n' "$(jq -r '.delta.previous_scan' "$result_path")"
+    printf '  +%s packages added\n' "$(jq -r '.delta.packages_added' "$result_path")"
+    printf '  -%s packages removed\n' "$(jq -r '.delta.packages_removed' "$result_path")"
+    printf '  +%s new CVEs (%s)\n' \
+      "$(jq -r '.delta.new_cves | length' "$result_path")" \
+      "$(jq -r '.delta.new_cves[:5] | join(", ")' "$result_path")"
+  fi
+  printf '\nVERDICT: %s\n\n' "$(jq -r '.verdict' "$result_path")"
+  printf 'Details: %s\n' "$result_path"
+}
+
+build_scan_result_from_artifacts() {
+  local machine="$1" original_target="$2" strategy="$3" sbom_src="$4" osv_json="$5" grype_json="$6" ecosystem_audits_file="$7"
+  local stamp result_path sbom_path
+  stamp="$(today_date)"
+  mkdir -p "$RESULTS_DIR/$machine" "$SBOM_DIR/$machine"
+  result_path=$(scan_result_path_for "$machine" "$stamp")
+  sbom_path=$(scan_sbom_path_for "$machine" "$stamp")
+  cp "$sbom_src" "$sbom_path"
+
+  local ecosystem_audits_json
+  if [[ -f "$ecosystem_audits_file" ]]; then
+    ecosystem_audits_json=$(jq -c '.' "$ecosystem_audits_file")
+  else
+    ecosystem_audits_json='[]'
+  fi
+
+  local critical high medium low severity
+  critical=$(count_grype_severity "$grype_json" critical)
+  high=$(count_grype_severity "$grype_json" high)
+  medium=$(count_grype_severity "$grype_json" medium)
+  low=$(count_grype_severity "$grype_json" low)
+  while IFS= read -r severity; do
+    severity=$(severity_from_osv_entry "$severity")
+    case "$severity" in
+      critical) critical=$((critical + 1)) ;;
+      high) high=$((high + 1)) ;;
+      medium|unknown) medium=$((medium + 1)) ;;
+      low) low=$((low + 1)) ;;
+    esac
+  done < <(summarize_osv_counts "$osv_json")
+
+  local findings_json
+  findings_json=$(jq -n --slurpfile osv "$osv_json" --slurpfile grype "$grype_json" '
+    (
+      [($osv[0].results[]?.packages[]? // [])[]? as $pkg
+        | ($pkg.package.name // $pkg.name // "unknown") as $name
+        | ($pkg.package.version // $pkg.version // "unknown") as $version
+        | $pkg.vulnerabilities[]?
+        | {
+            source: "osv",
+            id: (.id // .aliases[0] // "unknown"),
+            severity: (.database_specific.severity // .severity[0].score // "unknown"),
+            package: $name,
+            version: $version
+          }
+      ] +
+      [($grype[0].matches[]? // [])[]?
+        | {
+            source: "grype",
+            id: (.vulnerability.id // "unknown"),
+            severity: (.vulnerability.severity // "unknown"),
+            package: (.artifact.name // "unknown"),
+            version: (.artifact.version // "unknown")
+          }
+      ]
+    ) | unique_by(.source + ":" + .id + ":" + .package + ":" + .version)
+  ')
+
+  local packages_total npm_total python_total php_total rust_total go_total verdict
+  packages_total=$(count_sbom_packages "$sbom_path")
+  npm_total=$(count_sbom_ecosystem "$sbom_path" npm)
+  python_total=$(count_sbom_ecosystem "$sbom_path" pypi)
+  php_total=$(count_sbom_ecosystem "$sbom_path" composer)
+  rust_total=$(count_sbom_ecosystem "$sbom_path" cargo)
+  go_total=$(count_sbom_ecosystem "$sbom_path" golang)
+
+  verdict="GO"
+  if (( critical > 0 )); then
+    verdict="WARN"
+  elif (( high > 0 || medium > 0 || low > 0 )); then
+    verdict="WARN"
+  fi
+
+  jq -n \
+    --arg machine "$machine" \
+    --arg date "$(today_date)" \
+    --arg timestamp "$(now_iso)" \
+    --arg target "$original_target" \
+    --arg strategy "$strategy" \
+    --arg sbom "$sbom_path" \
+    --argjson packages_total "$packages_total" \
+    --argjson npm_total "$npm_total" \
+    --argjson python_total "$python_total" \
+    --argjson php_total "$php_total" \
+    --argjson rust_total "$rust_total" \
+    --argjson go_total "$go_total" \
+    --argjson critical "$critical" \
+    --argjson high "$high" \
+    --argjson medium "$medium" \
+    --argjson low "$low" \
+    --arg verdict "$verdict" \
+    --argjson ecosystem_audits "$ecosystem_audits_json" \
+    --argjson findings "$findings_json" \
+    '{
+      machine: $machine,
+      date: $date,
+      timestamp: $timestamp,
+      target: $target,
+      strategy: $strategy,
+      sbom: $sbom,
+      summary: {
+        packages_total: $packages_total,
+        ecosystems: {
+          npm: $npm_total,
+          python: $python_total,
+          php: $php_total,
+          rust: $rust_total,
+          go: $go_total
+        }
+      },
+      cve_scan: {
+        critical: $critical,
+        high: $high,
+        medium: $medium,
+        low: $low,
+        findings: $findings
+      },
+      ecosystem_audits: $ecosystem_audits,
+      verdict: $verdict
+    }' > "$result_path"
+
+  local delta_json tmp
+  delta_json=$(build_delta_json "$machine" "$result_path" "$sbom_path")
+  tmp=$(mktemp)
+  jq --argjson delta "$delta_json" '. + {delta: $delta}' "$result_path" > "$tmp"
+  mv "$tmp" "$result_path"
+
+  render_scan_summary "$result_path"
+}
+
+scan_source_into_result() {
+  local machine="$1" source="$2" original_target="$3" strategy="$4"
+  gather_projects_from_source "$source"
+  detect_machine_tools "$machine"
+
+  local scratch osv_json grype_json sbom_tmp audits_tmp
+  scratch=$(mktemp -d)
+  osv_json="$scratch/osv.json"
+  grype_json="$scratch/grype.json"
+  sbom_tmp="$scratch/sbom.json"
+  audits_tmp="$scratch/ecosystem-audits.json"
+
+  osv_scan_lockfiles "$machine" "$osv_json" "${CURRENT_LOCKFILES[@]}"
+  syft_generate_sbom "$machine" "$source" "$sbom_tmp"
+  grype_scan_sbom "$machine" "$sbom_tmp" "$grype_json"
+
+  local root project_audits_files=()
+  for root in "${CURRENT_PROJECT_ROOTS[@]}"; do
+    parse_project_config "$root/.safe-audit"
+    run_project_ecosystem_audits "$root" "$scratch/$(slugify "$root")" > "$scratch/$(slugify "$root").audits.json"
+    project_audits_files+=("$scratch/$(slugify "$root").audits.json")
+  done
+
+  if [[ "${#project_audits_files[@]}" -eq 0 ]]; then
+    printf '[]\n' > "$audits_tmp"
+  else
+    jq -s 'add' "${project_audits_files[@]}" > "$audits_tmp"
+  fi
+
+  build_scan_result_from_artifacts "$machine" "$original_target" "$strategy" "$sbom_tmp" "$osv_json" "$grype_json" "$audits_tmp"
+}
+
+scan_source_with_external_sbom_into_result() {
+  local machine="$1" source="$2" original_target="$3" strategy="$4" sbom_src="$5"
+  gather_projects_from_source "$source"
+
+  local scratch osv_json grype_json audits_tmp local_machine
+  local_machine=$(detect_local_machine_name)
+  detect_machine_tools "$local_machine" 1
+
+  scratch=$(mktemp -d)
+  osv_json="$scratch/osv.json"
+  grype_json="$scratch/grype.json"
+  audits_tmp="$scratch/ecosystem-audits.json"
+
+  osv_scan_lockfiles "$local_machine" "$osv_json" "${CURRENT_LOCKFILES[@]}"
+  grype_scan_sbom "$local_machine" "$sbom_src" "$grype_json"
+
+  local root project_audits_files=()
+  for root in "${CURRENT_PROJECT_ROOTS[@]}"; do
+    parse_project_config "$root/.safe-audit"
+    run_project_ecosystem_audits "$root" "$scratch/$(slugify "$root")" > "$scratch/$(slugify "$root").audits.json"
+    project_audits_files+=("$scratch/$(slugify "$root").audits.json")
+  done
+
+  if [[ "${#project_audits_files[@]}" -eq 0 ]]; then
+    printf '[]\n' > "$audits_tmp"
+  else
+    jq -s 'add' "${project_audits_files[@]}" > "$audits_tmp"
+  fi
+
+  build_scan_result_from_artifacts "$machine" "$original_target" "$strategy" "$sbom_src" "$osv_json" "$grype_json" "$audits_tmp"
+}
+
+machine_supports_remote_direct_scan() {
+  local machine="$1"
+  [[ "$(machine_type "$machine")" == "ssh" ]] || return 1
+  [[ -n "$(tool_cache_path "$machine" "osv-scanner")" ]] || return 1
+  [[ -n "$(tool_cache_path "$machine" "syft")" ]] || return 1
+  [[ -n "$(tool_cache_path "$machine" "grype")" ]] || return 1
+  machine_grype_db_healthy "$machine" || return 1
+}
+
+remote_scan_helper_script() {
+  cat <<'EOF'
+set -euo pipefail
+target="$1"
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+
+if [[ -n "${SAFE_AUDIT_SCANNER_DIR:-}" ]]; then
+  PATH="$SAFE_AUDIT_SCANNER_DIR:$PATH"
+  export PATH
+fi
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+collect_syft_exclude_args() {
+  local cfg root rel_prefix raw line section="" pattern
+  while IFS= read -r -d '' cfg; do
+    root=$(dirname "$cfg")
+    rel_prefix="${root#"$target"/}"
+    [[ "$rel_prefix" == "$root" || "$rel_prefix" == "." ]] && rel_prefix=""
+    [[ -n "$rel_prefix" ]] && rel_prefix="${rel_prefix%/}/"
+    section=""
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+      line="${raw%%#*}"
+      line="$(trim "$line")"
+      [[ -z "$line" ]] && continue
+      case "$line" in
+        ecosystems:|scanners:) section=""; continue ;;
+        ignore:) section="ignore"; continue ;;
+      esac
+      if [[ "$section" == "ignore" && "$line" =~ ^-[[:space:]]*(.+)$ ]]; then
+        pattern="${BASH_REMATCH[1]}"
+        printf '%s\0%s\0' '--exclude' "${rel_prefix}${pattern}"
+        printf '%s\0%s\0' '--exclude' "${rel_prefix}${pattern}/**"
+      fi
+    done <"$cfg"
+  done < <(find "$target" -type f -name '.safe-audit' -print0 2>/dev/null)
+}
+
+if [[ "${SAFE_AUDIT_REMOTE_SBOM_ONLY:-0}" == "1" ]]; then
+  if command -v syft >/dev/null 2>&1; then
+    exclude_args=()
+    mapfile -d '' -t exclude_args < <(collect_syft_exclude_args)
+    if ! syft "dir:$target" -o cyclonedx-json "${exclude_args[@]}" > "$scratch/sbom.json" 2>"$scratch/sbom.stderr"; then
+      printf '{"components":[],"metadata":{"tools":[{"name":"safe-audit","note":"syft failed"}]}}\n' > "$scratch/sbom.json"
+    fi
+  else
+    printf '{"components":[],"metadata":{"tools":[{"name":"safe-audit","note":"syft unavailable"}]}}\n' > "$scratch/sbom.json"
+  fi
+  tar -C "$scratch" -czf - sbom.json
+  exit 0
+fi
+
+slugify() {
+  local raw="$1"
+  raw="${raw//@/_at_}"
+  raw="${raw//\//_}"
+  raw="${raw//:/_}"
+  raw="${raw// /_}"
+  printf '%s' "$raw"
+}
+
+json_string_or_null() {
+  local v="${1:-}"
+  if [[ -z "$v" ]]; then
+    printf 'null'
+  else
+    jq -Rn --arg v "$v" '$v'
+  fi
+}
+
+render_ecosystem_audit_json() {
+  local scanner="$1" status="$2" total="$3" critical="$4" high="$5" medium="$6" low="$7" note="${8:-}"
+  printf '{'
+  printf '"scanner":%s,' "$(json_string_or_null "$scanner")"
+  printf '"status":%s,' "$(json_string_or_null "$status")"
+  printf '"total":%s,' "$total"
+  printf '"critical":%s,' "$critical"
+  printf '"high":%s,' "$high"
+  printf '"medium":%s,' "$medium"
+  printf '"low":%s,' "$low"
+  printf '"note":%s' "$(json_string_or_null "$note")"
+  printf '}'
+}
+
+relative_to() {
+  local base="$1" path="$2"
+  path="${path#"$base"/}"
+  printf '%s' "$path"
+}
+
+declare -a PROJECT_IGNORES=()
+declare -A PROJECT_ECOSYSTEMS=()
+declare -A PROJECT_SCANNERS=()
+
+reset_project_config() {
+  PROJECT_IGNORES=()
+  PROJECT_ECOSYSTEMS=([npm]="" [python]="" [php]="" [rust]="" [go]="")
+  PROJECT_SCANNERS=([python]="pip-audit" [npm]="npm-audit" [php]="composer-audit" [rust]="cargo-audit" [go]="govulncheck")
+}
+
+parse_project_config() {
+  local config="${1:-}"
+  reset_project_config
+  [[ -f "$config" ]] || return 0
+  local section="" raw line key value
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line="${raw%%#*}"
+    line="$(trim "$line")"
+    [[ -z "$line" ]] && continue
+    case "$line" in
+      ecosystems:) section="ecosystems"; continue ;;
+      scanners:) section="scanners"; continue ;;
+      ignore:) section="ignore"; continue ;;
+    esac
+    case "$section" in
+      ecosystems)
+        if [[ "$line" =~ ^([A-Za-z0-9_-]+):[[:space:]]*(true|false)$ ]]; then
+          PROJECT_ECOSYSTEMS["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+        fi
+        ;;
+      scanners)
+        if [[ "$line" =~ ^([A-Za-z0-9_-]+):[[:space:]]*([A-Za-z0-9._-]+)$ ]]; then
+          PROJECT_SCANNERS["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+        fi
+        ;;
+      ignore)
+        if [[ "$line" =~ ^-[[:space:]]*(.+)$ ]]; then
+          PROJECT_IGNORES+=("${BASH_REMATCH[1]}")
+        fi
+        ;;
+    esac
+  done <"$config"
+}
+
+ecosystem_enabled() {
+  local ecosystem="$1"
+  local v="${PROJECT_ECOSYSTEMS[$ecosystem]:-}"
+  [[ -z "$v" || "$v" == "true" ]]
+}
+
+path_matches_ignore() {
+  local rel="$1" pattern
+  for pattern in "${PROJECT_IGNORES[@]}"; do
+    if [[ "$rel" == $pattern || "$rel" == */$pattern || "$rel" == $pattern/* || "$rel" == */$pattern/* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+nearest_project_config() {
+  local start="$1" stop="$2" dir
+  dir="$start"
+  while [[ "$dir" == "$stop"* ]]; do
+    if [[ -f "$dir/.safe-audit" ]]; then
+      printf '%s\n' "$dir/.safe-audit"
+      return 0
+    fi
+    [[ "$dir" == "$stop" || "$dir" == "/" ]] && break
+    dir=$(dirname "$dir")
+  done
+  return 1
+}
+
+run_npm_audit_dir() {
+  local dir="$1" output="$2"
+  if ! command -v npm >/dev/null 2>&1; then
+    printf '%s\n' "$(render_ecosystem_audit_json "npm-audit" "skipped" 0 0 0 0 0 "npm unavailable")" > "$output"
+    return 0
+  fi
+  if ! (cd "$dir" && npm audit --json) > "$output.raw" 2>"$output.stderr"; then :; fi
+  jq -n --slurpfile data "$output.raw" '
+    ($data[0] // {}) as $r |
+    {
+      scanner: "npm-audit",
+      status: "ok",
+      total: ($r.metadata.vulnerabilities.total // 0),
+      critical: ($r.metadata.vulnerabilities.critical // 0),
+      high: ($r.metadata.vulnerabilities.high // 0),
+      medium: ($r.metadata.vulnerabilities.moderate // 0),
+      low: ($r.metadata.vulnerabilities.low // 0),
+      note: null
+    }
+  ' > "$output"
+}
+
+run_composer_audit_dir() {
+  local dir="$1" output="$2"
+  if ! command -v composer >/dev/null 2>&1; then
+    printf '%s\n' "$(render_ecosystem_audit_json "composer-audit" "skipped" 0 0 0 0 0 "composer unavailable")" > "$output"
+    return 0
+  fi
+  if ! (cd "$dir" && composer audit --format=json) > "$output.raw" 2>"$output.stderr"; then :; fi
+  jq -n --slurpfile data "$output.raw" '
+    ($data[0].advisories // []) as $a |
+    {
+      scanner: "composer-audit",
+      status: "ok",
+      total: ($a | length),
+      critical: ([$a[]? | select((.severity // "") | ascii_downcase == "critical")] | length),
+      high: ([$a[]? | select((.severity // "") | ascii_downcase == "high")] | length),
+      medium: ([$a[]? | select((.severity // "") | ascii_downcase == "medium")] | length),
+      low: ([$a[]? | select((.severity // "") | ascii_downcase == "low")] | length),
+      note: null
+    }
+  ' > "$output"
+}
+
+run_cargo_audit_dir() {
+  local dir="$1" output="$2"
+  if ! command -v cargo-audit >/dev/null 2>&1; then
+    printf '%s\n' "$(render_ecosystem_audit_json "cargo-audit" "skipped" 0 0 0 0 0 "cargo-audit unavailable")" > "$output"
+    return 0
+  fi
+  if ! (cd "$dir" && cargo audit --json) > "$output.raw" 2>"$output.stderr"; then :; fi
+  jq -n --slurpfile data "$output.raw" '
+    ($data[0].vulnerabilities.list // []) as $list |
+    {
+      scanner: "cargo-audit",
+      status: "ok",
+      total: ($list | length),
+      critical: 0,
+      high: ([$list[]? | select((.advisory.severity // "") | ascii_downcase == "high")] | length),
+      medium: ([$list[]? | select((.advisory.severity // "") | ascii_downcase == "medium")] | length),
+      low: ([$list[]? | select((.advisory.severity // "") | ascii_downcase == "low")] | length),
+      note: null
+    }
+  ' > "$output"
+}
+
+run_govulncheck_dir() {
+  local dir="$1" output="$2"
+  if ! command -v govulncheck >/dev/null 2>&1; then
+    printf '%s\n' "$(render_ecosystem_audit_json "govulncheck" "skipped" 0 0 0 0 0 "govulncheck unavailable")" > "$output"
+    return 0
+  fi
+  if ! (cd "$dir" && govulncheck -json ./...) > "$output.raw" 2>"$output.stderr"; then :; fi
+  jq -Rn --arg raw "$(cat "$output.raw" 2>/dev/null || true)" '
+    ($raw | split("\n") | map(select(length > 0) | fromjson? // empty)) as $entries |
+    ($entries | map(select(.finding?)) | length) as $total |
+    {
+      scanner: "govulncheck",
+      status: "ok",
+      total: $total,
+      critical: 0,
+      high: 0,
+      medium: $total,
+      low: 0,
+      note: null
+    }
+  ' > "$output"
+}
+
+run_pip_audit_dir() {
+  local dir="$1" output="$2"
+  if ! command -v pip-audit >/dev/null 2>&1; then
+    printf '%s\n' "$(render_ecosystem_audit_json "pip-audit" "skipped" 0 0 0 0 0 "pip-audit unavailable")" > "$output"
+    return 0
+  fi
+  local target_file=""
+  for target_file in "$dir/requirements.txt" "$dir/requirements-dev.txt" "$dir/pyproject.toml"; do
+    [[ -f "$target_file" ]] && break
+  done
+  if [[ ! -f "$target_file" ]]; then
+    printf '%s\n' "$(render_ecosystem_audit_json "pip-audit" "skipped" 0 0 0 0 0 "no supported python audit target found")" > "$output"
+    return 0
+  fi
+  if [[ "$target_file" == *.txt ]]; then
+    if ! pip-audit -r "$target_file" -f json > "$output.raw" 2>"$output.stderr"; then :; fi
+  else
+    if ! (cd "$dir" && pip-audit -f json) > "$output.raw" 2>"$output.stderr"; then :; fi
+  fi
+  jq -n --slurpfile data "$output.raw" '
+    ($data[0] // []) as $list |
+    {
+      scanner: "pip-audit",
+      status: "ok",
+      total: ($list | length),
+      critical: 0,
+      high: 0,
+      medium: ($list | length),
+      low: 0,
+      note: null
+    }
+  ' > "$output"
+}
+
+run_project_ecosystem_audits() {
+  local project_root="$1" output_dir="$2"
+  mkdir -p "$output_dir"
+  local audits=() ecosystem scanner output
+  for ecosystem in npm python php rust go; do
+    ecosystem_enabled "$ecosystem" || continue
+    scanner="${PROJECT_SCANNERS[$ecosystem]}"
+    output="$output_dir/${ecosystem}.json"
+    case "$scanner" in
+      npm-audit) run_npm_audit_dir "$project_root" "$output" ;;
+      pip-audit) run_pip_audit_dir "$project_root" "$output" ;;
+      composer-audit) run_composer_audit_dir "$project_root" "$output" ;;
+      cargo-audit) run_cargo_audit_dir "$project_root" "$output" ;;
+      govulncheck) run_govulncheck_dir "$project_root" "$output" ;;
+      *) printf '%s\n' "$(render_ecosystem_audit_json "$scanner" "skipped" 0 0 0 0 0 "unknown scanner")" > "$output" ;;
+    esac
+    audits+=("$output")
+  done
+  if [[ "${#audits[@]}" -eq 0 ]]; then
+    printf '[]\n'
+  else
+    jq -s '.' "${audits[@]}"
+  fi
+}
+
+declare -a lockfiles=() roots=() audit_files=()
+declare -A seen_roots=()
+
+while IFS= read -r -d '' file; do
+  cfg=$(nearest_project_config "$(dirname "$file")" "$target" || true)
+  if [[ -n "$cfg" ]]; then
+    root=$(dirname "$cfg")
+    parse_project_config "$cfg"
+    rel=$(relative_to "$root" "$file")
+    if path_matches_ignore "$rel"; then
+      continue
+    fi
+  else
+    root=$(dirname "$file")
+  fi
+  case "$(basename "$file")" in
+    package-lock.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
+      lockfiles+=("$file")
+      if [[ -z "${seen_roots[$root]:-}" ]]; then
+        seen_roots["$root"]=1
+        roots+=("$root")
+      fi
+      ;;
+  esac
+done < <(find "$target" -type f \( -name 'package-lock.json' -o -name 'pnpm-lock.yaml' -o -name 'yarn.lock' -o -name 'uv.lock' -o -name 'poetry.lock' -o -name 'Pipfile.lock' -o -name 'composer.lock' -o -name 'Cargo.lock' -o -name 'go.sum' \) -print0)
+
+if [[ "${#roots[@]}" -eq 0 ]]; then
+  roots=("$target")
+fi
+
+if command -v osv-scanner >/dev/null 2>&1 && [[ "${#lockfiles[@]}" -gt 0 ]]; then
+  args=(scan --format json)
+  for lf in "${lockfiles[@]}"; do args+=("--lockfile=$lf"); done
+  if ! osv-scanner "${args[@]}" > "$scratch/osv.json" 2>"$scratch/osv.stderr"; then
+    printf '{"results":[],"error":"osv-scanner failed"}\n' > "$scratch/osv.json"
+  fi
+else
+  printf '{"results":[],"skipped":"osv-scanner unavailable or no lockfiles"}\n' > "$scratch/osv.json"
+fi
+
+if command -v syft >/dev/null 2>&1; then
+  exclude_args=()
+  mapfile -d '' -t exclude_args < <(collect_syft_exclude_args)
+  if ! syft "dir:$target" -o cyclonedx-json "${exclude_args[@]}" > "$scratch/sbom.json" 2>"$scratch/sbom.stderr"; then
+    printf '{"components":[],"metadata":{"tools":[{"name":"safe-audit","note":"syft failed"}]}}\n' > "$scratch/sbom.json"
+  fi
+else
+  printf '{"components":[],"metadata":{"tools":[{"name":"safe-audit","note":"syft unavailable"}]}}\n' > "$scratch/sbom.json"
+fi
+
+if command -v grype >/dev/null 2>&1; then
+  if ! grype "sbom:$scratch/sbom.json" -o json -q > "$scratch/grype.json" 2>"$scratch/grype.stderr"; then
+    printf '{"matches":[],"error":"grype failed"}\n' > "$scratch/grype.json"
+  fi
+else
+  printf '{"matches":[],"skipped":"grype unavailable"}\n' > "$scratch/grype.json"
+fi
+
+for root in "${roots[@]}"; do
+  parse_project_config "$root/.safe-audit"
+  run_project_ecosystem_audits "$root" "$scratch/$(slugify "$root")" > "$scratch/$(slugify "$root").audits.json"
+  audit_files+=("$scratch/$(slugify "$root").audits.json")
+done
+
+if [[ "${#audit_files[@]}" -eq 0 ]]; then
+  printf '[]\n' > "$scratch/ecosystem-audits.json"
+else
+  jq -s 'add' "${audit_files[@]}" > "$scratch/ecosystem-audits.json"
+fi
+
+tar -C "$scratch" -czf - osv.json grype.json sbom.json ecosystem-audits.json
+EOF
+}
+
+remote_stage_helper_script() {
+  cat <<'EOF'
+set -euo pipefail
+target="$1"
+cd "$target"
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+declare -a ignores=()
+while IFS= read -r -d '' cfg; do
+  root=$(dirname "$cfg")
+  rel_prefix="${root#./}"
+  [[ "$rel_prefix" == "." ]] && rel_prefix=""
+  [[ -n "$rel_prefix" ]] && rel_prefix="${rel_prefix%/}/"
+  section=""
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line="${raw%%#*}"
+    line="$(trim "$line")"
+    [[ -z "$line" ]] && continue
+    case "$line" in
+      ecosystems:|scanners:) section=""; continue ;;
+      ignore:) section="ignore"; continue ;;
+    esac
+    if [[ "$section" == "ignore" && "$line" =~ ^-[[:space:]]*(.+)$ ]]; then
+      ignores+=("${rel_prefix}${BASH_REMATCH[1]}")
+    fi
+  done <"$cfg"
+done < <(find . -type f -name '.safe-audit' -print0 2>/dev/null)
+
+matches_ignore() {
+  local rel="${1#./}" pattern
+  for pattern in "${ignores[@]}"; do
+    if [[ "$rel" == $pattern || "$rel" == */$pattern || "$rel" == $pattern/* || "$rel" == */$pattern/* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+manifest_matches() {
+  case "$(basename "$1")" in
+    package.json|package-lock.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum|.safe-audit)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+list=$(mktemp)
+while IFS= read -r -d '' file; do
+  manifest_matches "$file" || continue
+  if matches_ignore "$file"; then
+    continue
+  fi
+  printf '%s\0' "$file" >> "$list"
+done < <(find . -type f -print0)
+
+if [[ -s "$list" ]]; then
+  tar --null -T "$list" -czf - 2>/dev/null
+else
+  tar -czf - --files-from /dev/null
+fi
+EOF
+}
+
+machine_supports_remote_tunneled_scan() {
+  local machine="$1"
+  [[ "$(machine_type "$machine")" == "ssh" ]] || return 1
+  [[ -n "$(local_scanner_path "syft")" ]] || return 1
+  [[ -n "$(local_scanner_path "osv-scanner")" ]] || return 1
+  [[ -n "$(local_scanner_path "grype")" ]] || return 1
+}
+
+scan_remote_with_local_bundles_into_result() {
+  local machine="$1" target="$2"
+  local host scratch remote_tmp rc source
+  local statuses=()
+  host=$(machine_host "$machine")
+  scratch=$(mktemp -d)
+  source=$(mktemp -d)
+
+  remote_tmp=$(ssh_batch "$host" 'tmp=$(mktemp -d); mkdir -p "$tmp/bin"; printf "%s" "$tmp"')
+  [[ -n "$remote_tmp" ]] || return 1
+
+  if ! scp_batch -q \
+    "$(local_scanner_path "syft")" \
+    "$host:$remote_tmp/bin/"; then
+    ssh_batch "$host" "rm -rf $(printf '%q' "$remote_tmp")" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  set +e
+  remote_scan_helper_script \
+    | ssh_batch "$host" "SAFE_AUDIT_SCANNER_DIR=$(printf '%q' "$remote_tmp/bin") SAFE_AUDIT_REMOTE_SBOM_ONLY=1 bash -s -- $(printf '%q' "$target")" \
+    | tar -xzf - -C "$scratch"
+  statuses=("${PIPESTATUS[@]}")
+  set -e
+  ssh_batch "$host" "rm -rf $(printf '%q' "$remote_tmp")" >/dev/null 2>&1 || true
+  local status
+  for status in "${statuses[@]}"; do
+    [[ "$status" -ge 130 ]] && return "$status"
+  done
+  rc=0
+  for ((i=${#statuses[@]} - 1; i >= 0; i--)); do
+    if [[ "${statuses[$i]}" -ne 0 ]]; then
+      rc="${statuses[$i]}"
+      break
+    fi
+  done
+  if [[ "$rc" -ne 0 ]]; then
+    warn "$machine: tunneled remote scan failed, falling back"
+    return 1
+  fi
+
+  gather_stage_remotely "$machine" "$target" "$source"
+  scan_source_with_external_sbom_into_result \
+    "$machine" "$source" "$target" "ssh-remote-tunneled" "$scratch/sbom.json"
+}
+
+scan_remote_direct_into_result() {
+  local machine="$1" target="$2"
+  local host scratch rc
+  local statuses=()
+  host=$(machine_host "$machine")
+  scratch=$(mktemp -d)
+
+  set +e
+  remote_scan_helper_script | ssh_batch "$host" "bash -s -- $(printf '%q' "$target")" | tar -xzf - -C "$scratch"
+  statuses=("${PIPESTATUS[@]}")
+  set -e
+  local status
+  for status in "${statuses[@]}"; do
+    [[ "$status" -ge 130 ]] && return "$status"
+  done
+  rc=0
+  for ((i=${#statuses[@]} - 1; i >= 0; i--)); do
+    if [[ "${statuses[$i]}" -ne 0 ]]; then
+      rc="${statuses[$i]}"
+      break
+    fi
+  done
+  if [[ "$rc" -ne 0 ]]; then
+    warn "$machine: remote direct scan failed, falling back to staged local scan"
+    return 1
+  fi
+
+  build_scan_result_from_artifacts \
+    "$machine" "$target" "ssh-remote-direct" \
+    "$scratch/sbom.json" "$scratch/osv.json" "$scratch/grype.json" "$scratch/ecosystem-audits.json"
+}
+
+scan_machine() {
+  local machine="$1" project_target="${2:-}"
+  if ! machine_reachable "$machine"; then
+    warn "$machine: host unreachable; skipping scan"
+    return 0
+  fi
+  detect_machine_tools "$machine" 1
+  local confirm_rc
+  confirm_scan_with_missing_tools "$machine" "$project_target"
+  confirm_rc=$?
+  case "$confirm_rc" in
+    0) ;;
+    2) return 0 ;;
+    *) return "$confirm_rc" ;;
+  esac
+
+  local target="${project_target:-$(machine_scan_root "$machine")}"
+  local strategy="" source=""
+  if [[ "$(machine_type "$machine")" == "local" ]]; then
+    source=$(path_abs "$target")
+    strategy="local-direct"
+  elif machine_supports_remote_direct_scan "$machine"; then
+    if scan_remote_direct_into_result "$machine" "$target"; then
+      return 0
+    fi
+    if machine_supports_remote_tunneled_scan "$machine" && scan_remote_with_local_bundles_into_result "$machine" "$target"; then
+      return 0
+    fi
+    source=$(mktemp -d)
+    gather_stage_remotely "$machine" "$target" "$source"
+    strategy="ssh-stage-local"
+  elif machine_supports_remote_tunneled_scan "$machine"; then
+    if scan_remote_with_local_bundles_into_result "$machine" "$target"; then
+      return 0
+    fi
+    source=$(mktemp -d)
+    gather_stage_remotely "$machine" "$target" "$source"
+    strategy="ssh-stage-local"
+  else
+    source=$(mktemp -d)
+    gather_stage_remotely "$machine" "$target" "$source"
+    strategy="ssh-stage-local"
+  fi
+  scan_source_into_result "$machine" "$source" "$target" "$strategy"
+}
+
+guess_ecosystem_from_spec() {
+  local spec="$1"
+  if [[ "$spec" == @*/* ]]; then
+    echo "npm"
+  elif [[ "$spec" == *"::"* || "$spec" == *"-"* && "$spec" != *"@"* ]]; then
+    echo "python"
+  elif [[ "$spec" == *"/"* ]]; then
+    echo "go"
+  else
+    echo "npm"
+  fi
+}
+
+parse_pkg_spec() {
+  local spec="$1"
+  if [[ "$spec" == @*/*@* ]]; then
+    PKG_NAME="${spec%@*}"
+    PKG_VERSION="${spec##*@}"
+  elif [[ "$spec" == *@* ]]; then
+    PKG_NAME="${spec%@*}"
+    PKG_VERSION="${spec##*@}"
+  else
+    PKG_NAME="$spec"
+    PKG_VERSION="latest"
+  fi
+}
+
+blocked_entry_reason() {
+  local pkg="$1"
+  [[ -f "$SAFE_RUN_BLOCKED_FILE" ]] || return 1
+  local entry
+  entry=$(jq -r --arg p "$pkg" '.packages[$p] // empty' "$SAFE_RUN_BLOCKED_FILE")
+  if [[ -n "$entry" ]]; then
+    printf '%s' "$(printf '%s' "$entry" | jq -r '.reason // "blocked"')"
+    return 0
+  fi
+  if [[ "$pkg" == @*/* ]]; then
+    local wildcard="${pkg%%/*}/*"
+    entry=$(jq -r --arg p "$wildcard" '.packages[$p] // empty' "$SAFE_RUN_BLOCKED_FILE")
+    if [[ -n "$entry" ]]; then
+      printf '%s' "$(printf '%s' "$entry" | jq -r '.reason // "blocked"')"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+socket_score_json() {
+  local ecosystem="$1" spec="$2" output="$3"
+  local socket_cmd
+  socket_cmd=$(PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH" command -v socket 2>/dev/null || true)
+  if [[ -z "$socket_cmd" ]]; then
+    printf '{"available":false,"status":"skipped","note":"socket CLI not available"}\n' > "$output"
+    return 0
+  fi
+  if ! "$socket_cmd" package score "$ecosystem" "$spec" --json > "$output.raw" 2>"$output.stderr"; then
+    local note
+    note=$(jq -r '[.message?, .data?] | map(select(. != null and . != "")) | join(" ")' "$output.raw" 2>/dev/null | tr '\n' ' ' || true)
+    [[ -n "$note" ]] || note=$(jq -r '[.message?, .data?] | map(select(. != null and . != "")) | join(" ")' "$output.stderr" 2>/dev/null | tr '\n' ' ' || true)
+    [[ -n "$note" ]] || note=$(cat "$output.stderr" 2>/dev/null | tr '\n' ' ' || true)
+    [[ -n "$note" ]] || note="socket command failed"
+    printf '%s\n' "$(jq -n --arg note "$note" '{available:true,status:"error",note:$note}')" > "$output"
+    return 0
+  fi
+  jq -n --slurpfile data "$output.raw" '
+    ($data[0] // {}) as $r |
+    {
+      available: true,
+      status: "ok",
+      note: null,
+      raw: $r
+    }
+  ' > "$output"
+}
+
+osv_query_package_json() {
+  local ecosystem="$1" name="$2" version="$3" output="$4"
+  if ! command -v curl >/dev/null 2>&1; then
+    printf '{"status":"error","note":"curl not available","vulns":[]}\n' > "$output"
+    return 0
+  fi
+  local eco
+  case "$ecosystem" in
+    npm) eco="npm" ;;
+    python) eco="PyPI" ;;
+    php) eco="Packagist" ;;
+    rust) eco="crates.io" ;;
+    go) eco="Go" ;;
+    *) eco="$ecosystem" ;;
+  esac
+  if ! curl -fsS https://api.osv.dev/v1/query \
+    -H 'content-type: application/json' \
+    -d "$(jq -n --arg eco "$eco" --arg name "$name" --arg version "$version" '{package:{ecosystem:$eco,name:$name},version:$version}')" \
+    > "$output.raw"; then
+    printf '{"status":"error","note":"OSV query failed","vulns":[]}\n' > "$output"
+    return 0
+  fi
+  jq -n --slurpfile data "$output.raw" '
+    ($data[0] // {}) as $r |
+    {
+      status: "ok",
+      note: null,
+      vulns: ($r.vulns // [])
+    }
+  ' > "$output"
+}
+
+check_command() {
+  local ecosystem="" json_mode=0 spec=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ecosystem)
+        [[ $# -lt 2 ]] && die "--ecosystem requires a value"
+        ecosystem="$2"
+        shift 2
+        ;;
+      --json)
+        json_mode=1
+        shift
+        ;;
+      -*)
+        die "unknown check flag: $1"
+        ;;
+      *)
+        spec="$1"
+        shift
+        ;;
+    esac
+  done
+  [[ -z "$spec" ]] && die "usage: safe-audit check <pkg>@<version> [--ecosystem <name>] [--json]"
+
+  parse_pkg_spec "$spec"
+  [[ -z "$ecosystem" ]] && ecosystem=$(guess_ecosystem_from_spec "$spec")
+
+  local scratch socket_json osv_json block_reason verdict socket_line osv_line block_line socket_status osv_count blocked note_json
+  scratch=$(mktemp -d)
+  socket_json="$scratch/socket.json"
+  osv_json="$scratch/osv.json"
+
+  socket_score_json "$ecosystem" "$spec" "$socket_json"
+  osv_query_package_json "$ecosystem" "$PKG_NAME" "$PKG_VERSION" "$osv_json"
+
+  verdict="GO"
+  socket_line="PASS (no behavioral anomalies)"
+  if [[ "$(jq -r '.available // false' "$socket_json" 2>/dev/null)" != "true" ]]; then
+    socket_line='SKIP (socket CLI not available)'
+    verdict="WARN"
+  elif [[ "$(jq -r '.status' "$socket_json")" != "ok" ]]; then
+    local socket_note
+    socket_note=$(jq -r '.note // "socket check failed"' "$socket_json" 2>/dev/null || printf 'socket check failed')
+    case "$socket_note" in
+      *token*|*Token*|*API*) socket_line='WARN (socket authentication required)' ;;
+      *) socket_line='WARN (socket check failed)' ;;
+    esac
+    verdict="WARN"
+  else
+    local score_val
+    score_val=$(jq -r '.raw.score // .raw.riskScore // empty' "$socket_json" 2>/dev/null || true)
+    if [[ -n "$score_val" && "$score_val" =~ ^[0-9]+$ && "$score_val" -lt 70 ]]; then
+      socket_line="WARN (score=$score_val)"
+      verdict="WARN"
+    fi
+  fi
+
+  osv_count=$(jq '[.vulns[]?] | length' "$osv_json" 2>/dev/null || echo 0)
+  osv_line="PASS (${osv_count} known CVEs)"
+  if (( osv_count > 0 )); then
+    verdict="WARN"
+    osv_line="WARN (${osv_count} known CVEs)"
+    if jq -e '.vulns[]? | select((.database_specific.severity // "") | ascii_downcase == "critical")' "$osv_json" >/dev/null 2>&1; then
+      verdict="BLOCK"
+    fi
+  fi
+
+  block_line="PASS (not blocked)"
+  if block_reason=$(blocked_entry_reason "$PKG_NAME"); then
+    verdict="BLOCK"
+    block_line="BLOCKED ($block_reason)"
+  fi
+
+  local result_json
+  result_json="$CHECKS_DIR/$(today_date)-$(slugify "$PKG_NAME")-${PKG_VERSION}.json"
+  jq -n \
+    --arg timestamp "$(now_iso)" \
+    --arg spec "$spec" \
+    --arg ecosystem "$ecosystem" \
+    --arg verdict "$verdict" \
+    --arg socket_line "$socket_line" \
+    --arg osv_line "$osv_line" \
+    --arg block_line "$block_line" \
+    --slurpfile socket "$socket_json" \
+    --slurpfile osv "$osv_json" '
+    {
+      timestamp: $timestamp,
+      spec: $spec,
+      ecosystem: $ecosystem,
+      verdict: $verdict,
+      checks: {
+        socket: $socket_line,
+        osv: $osv_line,
+        blocklist: $block_line
+      },
+      socket: ($socket[0] // {}),
+      osv: ($osv[0] // {})
+    }' > "$result_json"
+
+  if [[ "$json_mode" == "1" ]]; then
+    cat "$result_json"
+  else
+    printf '[safe-audit] checking %s (%s)\n\n' "$spec" "$ecosystem"
+    printf 'Socket:      %s\n' "$socket_line"
+    printf 'OSV:         %s\n' "$osv_line"
+    printf 'Blocklist:   %s\n' "$block_line"
+    if [[ "$(jq -r '.available // false' "$socket_json" 2>/dev/null)" != "true" ]]; then
+      printf '\n[safe-audit] WARNING: socket CLI not available, skipping behavioral analysis\n'
+      printf '[safe-audit] Install: safe-audit setup local\n'
+    fi
+    printf '\nVERDICT: %s\n' "$verdict"
+  fi
+
+  case "$verdict" in
+    GO) return 0 ;;
+    WARN) return 10 ;;
+    BLOCK) return 20 ;;
+    *) return 1 ;;
+  esac
+}
+
+release_github_command() {
+  local repo="" version="" asset="" json_mode=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)
+        [[ $# -lt 2 ]] && die "--repo requires OWNER/REPO"
+        repo="$2"
+        shift 2
+        ;;
+      --version)
+        [[ $# -lt 2 ]] && die "--version requires a tag"
+        version="$2"
+        shift 2
+        ;;
+      --asset)
+        [[ $# -lt 2 ]] && die "--asset requires a filename"
+        asset="$2"
+        shift 2
+        ;;
+      --json)
+        json_mode=1
+        shift
+        ;;
+      -*)
+        die "unknown release github flag: $1"
+        ;;
+      *)
+        die "unexpected argument for release github: $1"
+        ;;
+    esac
+  done
+  [[ -n "$repo" && -n "$version" && -n "$asset" ]] || die "usage: safe-audit release github --repo OWNER/REPO --version TAG --asset NAME [--json]"
+
+  local subject="github:${repo}@${version}#${asset}"
+  local scratch checks_file reasons_file data_file
+  scratch=$(mktemp -d)
+  checks_file="$scratch/checks.jsonl"
+  reasons_file="$scratch/reasons.jsonl"
+  data_file="$scratch/data.json"
+  : > "$checks_file"
+  : > "$reasons_file"
+
+  local verdict="GO"
+  local release_json releases_json compare_json ref_json commit_json tag_json
+  release_json="$scratch/release.json"
+  releases_json="$scratch/releases.json"
+  compare_json="$scratch/compare.json"
+  ref_json="$scratch/ref.json"
+  commit_json="$scratch/commit.json"
+  tag_json="$scratch/tag.json"
+
+  local published_at="" published_epoch="" now_epoch="" release_age_days=""
+  local release_url="" release_notes_summary="" asset_url=""
+  local draft="false" prerelease="false" asset_present="false"
+  local tag_commit_sha="" commit_verified="" commit_verify_reason=""
+  local same_day_count=0 previous_tag=""
+  local changed_files_count=0 high_risk_paths_json='[]' high_risk_count=0
+
+  if ! have_cmd curl; then
+    verdict="BLOCK"
+    audit_add_check "$checks_file" "github_api" "BLOCK" "curl not available; cannot query GitHub metadata"
+    audit_add_reason "$reasons_file" "missing_tool" "BLOCK" "curl is required for GitHub release review"
+  else
+    if github_api_get "/repos/${repo}/releases/tags/$(urlencode "$version")" "$release_json"; then
+      draft=$(jq -r '.draft // false' "$release_json")
+      prerelease=$(jq -r '.prerelease // false' "$release_json")
+      published_at=$(jq -r '.published_at // .created_at // empty' "$release_json")
+      release_url=$(jq -r '.html_url // empty' "$release_json")
+      release_notes_summary=$(first_line_summary "$(jq -r '.body // empty' "$release_json")")
+      asset_present=$(jq -r --arg asset "$asset" 'any(.assets[]?; .name == $asset)' "$release_json")
+      asset_url=$(jq -r --arg asset "$asset" '.assets[]? | select(.name == $asset) | .browser_download_url' "$release_json" | head -n 1)
+
+      if [[ -n "$published_at" ]]; then
+        published_epoch=$(date_to_epoch "$published_at" || true)
+      fi
+      now_epoch=$(date_to_epoch "$(now_iso)" || true)
+      if [[ -n "$published_epoch" && -n "$now_epoch" ]]; then
+        release_age_days=$(days_between_epochs "$now_epoch" "$published_epoch")
+      fi
+
+      audit_add_check "$checks_file" "release_metadata" "GO" \
+        "release published ${published_at:-unknown}; age ${release_age_days:-unknown}d; draft=${draft}; prerelease=${prerelease}" \
+        "$(jq -cn --arg published_at "$published_at" --arg release_url "$release_url" --arg age_days "${release_age_days:-}" --arg notes "$release_notes_summary" --arg asset_url "$asset_url" '{published_at:(if $published_at == "" then null else $published_at end),release_url:(if $release_url == "" then null else $release_url end),age_days:(if $age_days == "" then null else ($age_days|tonumber) end),release_notes_summary:(if $notes == "" then null else $notes end),asset_url:(if $asset_url == "" then null else $asset_url end)}')"
+
+      if [[ "$draft" == "true" || "$prerelease" == "true" ]]; then
+        bump_verdict verdict "BLOCK"
+        audit_add_reason "$reasons_file" "release_channel" "BLOCK" "draft or prerelease releases are blocked" \
+          "$(jq -cn --argjson draft "$draft" --argjson prerelease "$prerelease" '{draft:$draft,prerelease:$prerelease}')"
+      fi
+      if [[ -z "$release_age_days" ]]; then
+        bump_verdict verdict "BLOCK"
+        audit_add_reason "$reasons_file" "release_age_unknown" "BLOCK" "release age could not be determined from GitHub metadata"
+      elif (( release_age_days < GITHUB_RELEASE_MIN_AGE_DAYS )); then
+        bump_verdict verdict "BLOCK"
+        audit_add_reason "$reasons_file" "release_too_new" "BLOCK" "release age ${release_age_days}d is below minimum ${GITHUB_RELEASE_MIN_AGE_DAYS}d" \
+          "$(jq -cn --argjson age_days "$release_age_days" --argjson minimum_days "$GITHUB_RELEASE_MIN_AGE_DAYS" '{age_days:$age_days,minimum_days:$minimum_days}')"
+      fi
+      if [[ "$asset_present" != "true" ]]; then
+        bump_verdict verdict "BLOCK"
+        audit_add_reason "$reasons_file" "asset_missing" "BLOCK" "asset $asset was not found in the GitHub release"
+      fi
+    else
+      verdict="BLOCK"
+      audit_add_check "$checks_file" "release_metadata" "BLOCK" "GitHub release metadata lookup failed"
+      audit_add_reason "$reasons_file" "metadata_unavailable" "BLOCK" "could not fetch release metadata for ${repo}@${version}"
+    fi
+
+    if github_api_get "/repos/${repo}/releases?per_page=100" "$releases_json"; then
+      same_day_count=$(jq -r --arg published_day "${published_at:0:10}" '
+        if $published_day == "" then 0 else
+          [.[] | select((.draft // false) == false and (.prerelease // false) == false and ((.published_at // "") | startswith($published_day)))] | length
+        end
+      ' "$releases_json")
+      previous_tag=$(jq -r --arg version "$version" '
+        [ .[] | select((.draft // false) == false) ] as $rels
+        | ([range(0; $rels|length) | select($rels[.].tag_name == $version)][0] // -1) as $idx
+        | if $idx >= 0 and ($idx + 1) < ($rels|length) then $rels[$idx + 1].tag_name // "" else "" end
+      ' "$releases_json")
+      if (( same_day_count > 1 )); then
+        bump_verdict verdict "BLOCK"
+        audit_add_reason "$reasons_file" "same_day_churn" "BLOCK" "found ${same_day_count} non-draft releases on ${published_at:0:10}" \
+          "$(jq -cn --argjson count "$same_day_count" --arg published_day "${published_at:0:10}" '{count:$count,published_day:$published_day}')"
+      fi
+      if [[ -z "$previous_tag" ]]; then
+        bump_verdict verdict "BLOCK"
+        audit_add_check "$checks_file" "previous_release_compare" "BLOCK" "previous release could not be resolved"
+        audit_add_reason "$reasons_file" "previous_release_unavailable" "BLOCK" "could not resolve previous release for ${repo}@${version}"
+      fi
+    else
+      bump_verdict verdict "BLOCK"
+      audit_add_check "$checks_file" "release_history" "BLOCK" "GitHub release history lookup failed"
+      audit_add_reason "$reasons_file" "metadata_unavailable" "BLOCK" "could not fetch release history for ${repo}"
+    fi
+
+    if [[ -n "$previous_tag" ]]; then
+      if github_api_get "/repos/${repo}/compare/$(urlencode "$previous_tag")...$(urlencode "$version")" "$compare_json"; then
+        changed_files_count=$(jq -r '.files | length' "$compare_json")
+        high_risk_paths_json=$(jq --arg regex "$GITHUB_HIGH_RISK_PATH_REGEX" '[.files[]? | .filename | select(test($regex))]' "$compare_json")
+        high_risk_count=$(jq 'length' <<<"$high_risk_paths_json")
+        if (( high_risk_count > 0 )); then
+          bump_verdict verdict "BLOCK"
+          audit_add_check "$checks_file" "previous_release_compare" "BLOCK" "${changed_files_count} files changed; ${high_risk_count} high-risk paths changed" \
+            "$(jq -cn --arg previous_tag "$previous_tag" --arg version "$version" --argjson changed_files_count "$changed_files_count" --argjson high_risk_paths "$high_risk_paths_json" '{previous_tag:$previous_tag,version:$version,changed_files_count:$changed_files_count,high_risk_paths:$high_risk_paths}')"
+          audit_add_reason "$reasons_file" "high_risk_paths" "BLOCK" "high-risk release paths changed between ${previous_tag} and ${version}" \
+            "$(jq -cn --argjson high_risk_paths "$high_risk_paths_json" '{paths:$high_risk_paths}')"
+        else
+          audit_add_check "$checks_file" "previous_release_compare" "GO" "${changed_files_count} files changed since ${previous_tag}; no high-risk paths matched" \
+            "$(jq -cn --arg previous_tag "$previous_tag" --arg version "$version" --argjson changed_files_count "$changed_files_count" '{previous_tag:$previous_tag,version:$version,changed_files_count:$changed_files_count}')"
+        fi
+      else
+        bump_verdict verdict "BLOCK"
+        audit_add_check "$checks_file" "previous_release_compare" "BLOCK" "GitHub compare lookup failed"
+        audit_add_reason "$reasons_file" "metadata_unavailable" "BLOCK" "could not compare ${previous_tag}...${version}"
+      fi
+    fi
+
+    if github_api_get "/repos/${repo}/git/ref/tags/$(urlencode "$version")" "$ref_json"; then
+      local ref_type tag_object_url
+      ref_type=$(jq -r '.object.type // empty' "$ref_json")
+      tag_commit_sha=$(jq -r '.object.sha // empty' "$ref_json")
+      if [[ "$ref_type" == "tag" ]]; then
+        tag_object_url=$(jq -r '.object.url // empty' "$ref_json")
+        if [[ -n "$tag_object_url" ]] && github_api_get "$tag_object_url" "$tag_json"; then
+          tag_commit_sha=$(jq -r 'if .object.type == "commit" then .object.sha // empty else "" end' "$tag_json")
+        else
+          tag_commit_sha=""
+        fi
+      elif [[ "$ref_type" != "commit" ]]; then
+        tag_commit_sha=""
+      fi
+
+      if [[ -z "$tag_commit_sha" ]]; then
+        bump_verdict verdict "BLOCK"
+        audit_add_check "$checks_file" "tag_commit" "BLOCK" "tag did not resolve cleanly to a commit SHA"
+        audit_add_reason "$reasons_file" "ambiguous_tag_mapping" "BLOCK" "GitHub tag ${version} could not be resolved to a commit"
+      else
+        audit_add_check "$checks_file" "tag_commit" "GO" "tag resolves to commit ${tag_commit_sha}" \
+          "$(jq -cn --arg tag_commit_sha "$tag_commit_sha" '{tag_commit_sha:$tag_commit_sha}')"
+      fi
+    else
+      bump_verdict verdict "BLOCK"
+      audit_add_check "$checks_file" "tag_commit" "BLOCK" "GitHub tag ref lookup failed"
+      audit_add_reason "$reasons_file" "metadata_unavailable" "BLOCK" "could not fetch git ref for tag ${version}"
+    fi
+
+    if [[ -n "$tag_commit_sha" ]]; then
+      if github_api_get "/repos/${repo}/commits/${tag_commit_sha}" "$commit_json"; then
+        commit_verified=$(jq -r '.commit.verification.verified // false' "$commit_json")
+        commit_verify_reason=$(jq -r '.commit.verification.reason // empty' "$commit_json")
+        if [[ "$commit_verified" == "true" ]]; then
+          audit_add_check "$checks_file" "commit_verification" "GO" "GitHub reports the tag commit as verified" \
+            "$(jq -cn --arg commit_verify_reason "$commit_verify_reason" '{verified:true,reason:(if $commit_verify_reason == "" then null else $commit_verify_reason end)}')"
+        else
+          bump_verdict verdict "BLOCK"
+          audit_add_check "$checks_file" "commit_verification" "BLOCK" "GitHub does not report the tag commit as verified" \
+            "$(jq -cn --arg commit_verify_reason "$commit_verify_reason" '{verified:false,reason:(if $commit_verify_reason == "" then null else $commit_verify_reason end)}')"
+          audit_add_reason "$reasons_file" "tag_verification_failed" "BLOCK" "commit verification failed: ${commit_verify_reason:-unverified}"
+        fi
+      else
+        bump_verdict verdict "BLOCK"
+        audit_add_check "$checks_file" "commit_verification" "BLOCK" "GitHub commit lookup failed"
+        audit_add_reason "$reasons_file" "metadata_unavailable" "BLOCK" "could not fetch commit verification for ${tag_commit_sha}"
+      fi
+    fi
+  fi
+
+  jq -n \
+    --arg repo "$repo" \
+    --arg version "$version" \
+    --arg asset "$asset" \
+    --arg release_url "$release_url" \
+    --arg published_at "$published_at" \
+    --arg release_age_days "${release_age_days:-}" \
+    --arg tag_commit_sha "$tag_commit_sha" \
+    --arg commit_verified "${commit_verified:-}" \
+    --arg commit_verify_reason "$commit_verify_reason" \
+    --arg release_notes_summary "$release_notes_summary" \
+    --arg previous_tag "$previous_tag" \
+    --argjson draft "$draft" \
+    --argjson prerelease "$prerelease" \
+    --argjson asset_present "$asset_present" \
+    --argjson same_day_count "${same_day_count:-0}" \
+    --argjson changed_files_count "${changed_files_count:-0}" \
+    --argjson high_risk_paths "$high_risk_paths_json" \
+    '{
+      repo:$repo,
+      version:$version,
+      asset:$asset,
+      release_url:(if $release_url == "" then null else $release_url end),
+      published_at:(if $published_at == "" then null else $published_at end),
+      release_age_days:(if $release_age_days == "" then null else ($release_age_days|tonumber) end),
+      tag_commit_sha:(if $tag_commit_sha == "" then null else $tag_commit_sha end),
+      commit_verified:(if $commit_verified == "" then null else ($commit_verified == "true") end),
+      commit_verification_reason:(if $commit_verify_reason == "" then null else $commit_verify_reason end),
+      draft:$draft,
+      prerelease:$prerelease,
+      asset_present:$asset_present,
+      previous_tag:(if $previous_tag == "" then null else $previous_tag end),
+      same_day_release_count:$same_day_count,
+      changed_files_count:$changed_files_count,
+      high_risk_paths:$high_risk_paths,
+      release_notes_summary:(if $release_notes_summary == "" then null else $release_notes_summary end)
+    }' > "$data_file"
+
+  local rc
+  set +e
+  emit_audit_result "release github" "$subject" "$verdict" "$checks_file" "$reasons_file" "$data_file" "$json_mode"
+  rc=$?
+  set -e
+  rm -rf "$scratch"
+  return "$rc"
+}
+
+severity_is_high_or_critical() {
+  case "${1,,}" in
+    critical|high) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+vuln_github_release_command() {
+  local repo="" version="" json_mode=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)
+        [[ $# -lt 2 ]] && die "--repo requires OWNER/REPO"
+        repo="$2"
+        shift 2
+        ;;
+      --version)
+        [[ $# -lt 2 ]] && die "--version requires a tag"
+        version="$2"
+        shift 2
+        ;;
+      --json)
+        json_mode=1
+        shift
+        ;;
+      -*)
+        die "unknown vuln github-release flag: $1"
+        ;;
+      *)
+        die "unexpected argument for vuln github-release: $1"
+        ;;
+    esac
+  done
+  [[ -n "$repo" && -n "$version" ]] || die "usage: safe-audit vuln github-release --repo OWNER/REPO --version TAG [--json]"
+
+  local subject="github:${repo}@${version}"
+  local scratch checks_file reasons_file data_file advisories_json findings_file
+  scratch=$(mktemp -d)
+  checks_file="$scratch/checks.jsonl"
+  reasons_file="$scratch/reasons.jsonl"
+  data_file="$scratch/data.json"
+  advisories_json="$scratch/advisories.json"
+  findings_file="$scratch/findings.jsonl"
+  : > "$checks_file"
+  : > "$reasons_file"
+  : > "$findings_file"
+
+  local verdict="GO"
+  local query_status="error" advisory_count=0 matched_count=0 ambiguous_count=0 matched_high_count=0 latest_advisory_update=""
+
+  if ! have_cmd curl; then
+    verdict="BLOCK"
+    audit_add_check "$checks_file" "advisory_feed" "BLOCK" "curl not available; cannot query advisories"
+    audit_add_reason "$reasons_file" "missing_tool" "BLOCK" "curl is required for GitHub advisory queries"
+  elif github_api_get "/repos/${repo}/security-advisories?per_page=100" "$advisories_json"; then
+    query_status="ok"
+    advisory_count=$(jq 'length' "$advisories_json")
+    latest_advisory_update=$(jq -r '[.[] | (.updated_at // .published_at // empty)] | map(select(. != "")) | sort | last // empty' "$advisories_json")
+    audit_add_check "$checks_file" "advisory_feed" "GO" "queried ${advisory_count} GitHub security advisories" \
+      "$(jq -cn --arg latest_advisory_update "$latest_advisory_update" --argjson advisory_count "$advisory_count" '{source:"github-security-advisories",advisory_count:$advisory_count,latest_advisory_update:(if $latest_advisory_update == "" then null else $latest_advisory_update end)}')"
+
+    local advisory advisory_id severity html_url summary cve_id
+    while IFS= read -r advisory; do
+      [[ -n "$advisory" ]] || continue
+      advisory_id=$(jq -r '.ghsa_id // empty' <<<"$advisory")
+      severity=$(jq -r '.severity // "unknown"' <<<"$advisory")
+      html_url=$(jq -r '.html_url // .url // empty' <<<"$advisory")
+      summary=$(jq -r '.summary // empty' <<<"$advisory")
+      cve_id=$(jq -r '.cve_id // empty' <<<"$advisory")
+
+      local matched=1 ambiguous=0 range_rc range
+      while IFS= read -r range; do
+        [[ -n "$range" ]] || continue
+        if version_matches_range "$version" "$range"; then
+          matched=0
+          break
+        else
+          range_rc=$?
+          [[ "$range_rc" == "2" ]] && ambiguous=1
+        fi
+      done < <(jq -r '.vulnerabilities[]?.vulnerable_version_range // empty' <<<"$advisory")
+
+      if jq -e '.vulnerabilities | length == 0' <<<"$advisory" >/dev/null 2>&1; then
+        ambiguous=1
+      fi
+
+      if (( ambiguous > 0 )); then
+        ambiguous_count=$((ambiguous_count + 1))
+        bump_verdict verdict "BLOCK"
+        audit_add_reason "$reasons_file" "version_mapping_ambiguous" "BLOCK" "could not map advisory ${advisory_id:-unknown} cleanly to version ${version}" \
+          "$(jq -cn --arg advisory_id "$advisory_id" --arg version "$version" '{advisory_id:$advisory_id,version:$version}')"
+      fi
+
+      if (( matched == 0 )); then
+        matched_count=$((matched_count + 1))
+        jq -cn \
+          --arg source "github-security-advisory" \
+          --arg id "$advisory_id" \
+          --arg severity "$severity" \
+          --arg url "$html_url" \
+          --arg summary "$summary" \
+          --arg cve_id "$cve_id" \
+          --arg repo "$repo" \
+          --arg version "$version" \
+          --argjson vulnerabilities "$(jq '[.vulnerabilities[]? | {package:(.package.name // null), ecosystem:(.package.ecosystem // null), vulnerable_version_range, patched_versions}]' <<<"$advisory")" \
+          '{
+            source:$source,
+            id:$id,
+            severity:$severity,
+            url:(if $url == "" then null else $url end),
+            summary:(if $summary == "" then null else $summary end),
+            cve_id:(if $cve_id == "" then null else $cve_id end),
+            affected_repo:$repo,
+            affected_version:$version,
+            vulnerabilities:$vulnerabilities
+          }' >> "$findings_file"
+        printf '\n' >> "$findings_file"
+
+        if severity_is_high_or_critical "$severity"; then
+          matched_high_count=$((matched_high_count + 1))
+          bump_verdict verdict "BLOCK"
+          audit_add_reason "$reasons_file" "known_advisory_high_severity" "BLOCK" "advisory ${advisory_id} affects ${version} with severity ${severity}" \
+            "$(jq -cn --arg advisory_id "$advisory_id" --arg severity "$severity" '{advisory_id:$advisory_id,severity:$severity}')"
+        else
+          bump_verdict verdict "WARN"
+          audit_add_reason "$reasons_file" "known_advisory" "WARN" "advisory ${advisory_id} affects ${version} with severity ${severity}" \
+            "$(jq -cn --arg advisory_id "$advisory_id" --arg severity "$severity" '{advisory_id:$advisory_id,severity:$severity}')"
+        fi
+      fi
+    done < <(jq -c '.[]' "$advisories_json")
+
+    if (( matched_count == 0 && ambiguous_count == 0 )); then
+      audit_add_check "$checks_file" "advisory_results" "GO" "no known GitHub advisories matched ${version}"
+    elif (( matched_count > 0 )); then
+      local findings_verdict="WARN"
+      if (( matched_high_count > 0 )); then
+        findings_verdict="BLOCK"
+      fi
+      audit_add_check "$checks_file" "advisory_results" "$findings_verdict" "${matched_count} advisories matched ${version}; ${ambiguous_count} ambiguous mappings"
+    else
+      audit_add_check "$checks_file" "advisory_results" "BLOCK" "no matched advisories, but ${ambiguous_count} advisory mappings were ambiguous"
+    fi
+  else
+    verdict="BLOCK"
+    audit_add_check "$checks_file" "advisory_feed" "BLOCK" "GitHub advisory query failed"
+    audit_add_reason "$reasons_file" "feed_unavailable" "BLOCK" "could not fetch GitHub security advisories for ${repo}"
+  fi
+
+  jq -n \
+    --arg repo "$repo" \
+    --arg version "$version" \
+    --arg query_status "$query_status" \
+    --arg latest_advisory_update "$latest_advisory_update" \
+    --argjson advisory_count "$advisory_count" \
+    --argjson matched_count "$matched_count" \
+    --argjson ambiguous_count "$ambiguous_count" \
+    --argjson matched_high_count "$matched_high_count" \
+    --argjson findings "$(jsonl_to_array "$findings_file")" \
+    '{
+      repo:$repo,
+      version:$version,
+      source:"github-security-advisories",
+      query_status:$query_status,
+      checked_at:(now | todateiso8601),
+      advisory_count:$advisory_count,
+      matched_advisory_count:$matched_count,
+      ambiguous_mapping_count:$ambiguous_count,
+      high_or_critical_match_count:$matched_high_count,
+      latest_advisory_update:(if $latest_advisory_update == "" then null else $latest_advisory_update end),
+      findings:$findings
+    }' > "$data_file"
+
+  local rc
+  set +e
+  emit_audit_result "vuln github-release" "$subject" "$verdict" "$checks_file" "$reasons_file" "$data_file" "$json_mode"
+  rc=$?
+  set -e
+  rm -rf "$scratch"
+  return "$rc"
+}
+
+verify_release_asset_command() {
+  local artifact="" checksum="" certificate="" signature="" identity_regexp="" oidc_issuer=""
+  local require_signature=0 json_mode=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --artifact)
+        [[ $# -lt 2 ]] && die "--artifact requires a path"
+        artifact="$2"
+        shift 2
+        ;;
+      --checksum)
+        [[ $# -lt 2 ]] && die "--checksum requires a path"
+        checksum="$2"
+        shift 2
+        ;;
+      --certificate)
+        [[ $# -lt 2 ]] && die "--certificate requires a path"
+        certificate="$2"
+        shift 2
+        ;;
+      --signature)
+        [[ $# -lt 2 ]] && die "--signature requires a path"
+        signature="$2"
+        shift 2
+        ;;
+      --certificate-identity-regexp)
+        [[ $# -lt 2 ]] && die "--certificate-identity-regexp requires a value"
+        identity_regexp="$2"
+        shift 2
+        ;;
+      --certificate-oidc-issuer)
+        [[ $# -lt 2 ]] && die "--certificate-oidc-issuer requires a value"
+        oidc_issuer="$2"
+        shift 2
+        ;;
+      --require-signature)
+        require_signature=1
+        shift
+        ;;
+      --json)
+        json_mode=1
+        shift
+        ;;
+      -*)
+        die "unknown verify release-asset flag: $1"
+        ;;
+      *)
+        die "unexpected argument for verify release-asset: $1"
+        ;;
+    esac
+  done
+  [[ -n "$artifact" && -n "$checksum" ]] || die "usage: safe-audit verify release-asset --artifact PATH --checksum PATH [--certificate PATH --signature PATH --certificate-identity-regexp REGEX --certificate-oidc-issuer URL] [--require-signature] [--json]"
+
+  local artifact_abs checksum_abs certificate_abs="" signature_abs=""
+  artifact_abs=$(absolute_path "$artifact")
+  checksum_abs=$(absolute_path "$checksum")
+  [[ -n "$certificate" ]] && certificate_abs=$(absolute_path "$certificate")
+  [[ -n "$signature" ]] && signature_abs=$(absolute_path "$signature")
+
+  local subject="release-asset:${artifact_abs}"
+  local scratch checks_file reasons_file data_file cosign_output
+  scratch=$(mktemp -d)
+  checks_file="$scratch/checks.jsonl"
+  reasons_file="$scratch/reasons.jsonl"
+  data_file="$scratch/data.json"
+  cosign_output="$scratch/cosign.out"
+  : > "$checks_file"
+  : > "$reasons_file"
+
+  local verdict="GO"
+  local expected_sha="" actual_sha="" signature_mode=0 signature_complete=0
+  local -a missing_inputs=()
+
+  [[ -f "$artifact_abs" ]] || missing_inputs+=("$artifact_abs")
+  [[ -f "$checksum_abs" ]] || missing_inputs+=("$checksum_abs")
+  if (( ${#missing_inputs[@]} > 0 )); then
+    verdict="BLOCK"
+    audit_add_check "$checks_file" "inputs" "BLOCK" "required artifact inputs are missing" \
+      "$(jq -cn --argjson missing "$(printf '%s\n' "${missing_inputs[@]}" | jq -R . | jq -s .)" '{missing:$missing}')"
+    audit_add_reason "$reasons_file" "missing_asset" "BLOCK" "required artifact or checksum file is missing"
+  else
+    audit_add_check "$checks_file" "inputs" "GO" "artifact and checksum files are present"
+  fi
+
+  if [[ -n "$certificate_abs" || -n "$signature_abs" || -n "$identity_regexp" || -n "$oidc_issuer" ]]; then
+    signature_mode=1
+  fi
+  if [[ -n "$certificate_abs" && -n "$signature_abs" && -n "$identity_regexp" && -n "$oidc_issuer" ]]; then
+    signature_complete=1
+  fi
+
+  if (( signature_mode == 1 && signature_complete == 0 )); then
+    bump_verdict verdict "BLOCK"
+    audit_add_check "$checks_file" "signature_verification" "BLOCK" "signature metadata is incomplete"
+    audit_add_reason "$reasons_file" "policy_mismatch" "BLOCK" "signed verification requires certificate, signature, certificate identity regexp, and OIDC issuer"
+  elif (( signature_mode == 0 && require_signature == 1 )); then
+    bump_verdict verdict "BLOCK"
+    audit_add_check "$checks_file" "signature_verification" "BLOCK" "signature metadata required but not provided"
+    audit_add_reason "$reasons_file" "policy_mismatch" "BLOCK" "--require-signature was set but signature metadata is missing"
+  fi
+
+  if (( signature_complete == 1 )); then
+    local -a missing_sidecars=()
+    [[ -f "$certificate_abs" ]] || missing_sidecars+=("$certificate_abs")
+    [[ -f "$signature_abs" ]] || missing_sidecars+=("$signature_abs")
+    if (( ${#missing_sidecars[@]} > 0 )); then
+      bump_verdict verdict "BLOCK"
+      audit_add_check "$checks_file" "signature_verification" "BLOCK" "signature sidecar files are missing"
+      audit_add_reason "$reasons_file" "missing_asset" "BLOCK" "certificate or signature sidecar file is missing"
+    elif ! have_cmd cosign; then
+      bump_verdict verdict "BLOCK"
+      audit_add_check "$checks_file" "signature_verification" "BLOCK" "cosign is not available"
+      audit_add_reason "$reasons_file" "missing_tool" "BLOCK" "cosign is required for signed release-asset verification"
+    else
+      local rc
+      set +e
+      cosign verify-blob \
+        --certificate "$certificate_abs" \
+        --signature "$signature_abs" \
+        --certificate-identity-regexp "$identity_regexp" \
+        --certificate-oidc-issuer "$oidc_issuer" \
+        "$checksum_abs" > "$cosign_output" 2>&1
+      rc=$?
+      set -e
+      if [[ "$rc" == "0" ]]; then
+        audit_add_check "$checks_file" "signature_verification" "GO" "cosign verified the checksum file signature"
+      else
+        bump_verdict verdict "BLOCK"
+        audit_add_check "$checks_file" "signature_verification" "BLOCK" "cosign failed to verify the checksum file signature"
+        audit_add_reason "$reasons_file" "signature_failure" "BLOCK" "$(first_line_summary "$(cat "$cosign_output")" 240)"
+      fi
+    fi
+  fi
+
+  if have_cmd sha256sum || have_cmd shasum; then
+    if actual_sha=$(sha256_file "$artifact_abs" 2>/dev/null); then
+      expected_sha=$(extract_checksum_for_artifact "$checksum_abs" "$(basename "$artifact_abs")" || true)
+      if [[ -z "$expected_sha" ]]; then
+        bump_verdict verdict "BLOCK"
+        audit_add_check "$checks_file" "checksum_verification" "BLOCK" "could not find a checksum entry for $(basename "$artifact_abs")"
+        audit_add_reason "$reasons_file" "checksum_failure" "BLOCK" "checksum file does not contain a usable entry for $(basename "$artifact_abs")"
+      elif [[ "$actual_sha" == "$expected_sha" ]]; then
+        if (( signature_complete == 1 )); then
+          audit_add_check "$checks_file" "checksum_verification" "GO" "artifact sha256 matches the verified checksum file"
+        else
+          bump_verdict verdict "WARN"
+          audit_add_check "$checks_file" "checksum_verification" "WARN" "artifact sha256 matches checksum file, but no signature metadata was provided"
+          audit_add_reason "$reasons_file" "policy_mismatch" "WARN" "checksum matched, but verification remained checksum-only"
+        fi
+      else
+        bump_verdict verdict "BLOCK"
+        audit_add_check "$checks_file" "checksum_verification" "BLOCK" "artifact sha256 does not match checksum file"
+        audit_add_reason "$reasons_file" "checksum_failure" "BLOCK" "artifact checksum mismatch" \
+          "$(jq -cn --arg expected_sha "$expected_sha" --arg actual_sha "$actual_sha" '{expected_sha:$expected_sha,actual_sha:$actual_sha}')"
+      fi
+    else
+      bump_verdict verdict "BLOCK"
+      audit_add_check "$checks_file" "checksum_verification" "BLOCK" "no sha256 tool is available"
+      audit_add_reason "$reasons_file" "missing_tool" "BLOCK" "sha256sum or shasum is required for checksum verification"
+    fi
+  else
+    bump_verdict verdict "BLOCK"
+    audit_add_check "$checks_file" "checksum_verification" "BLOCK" "no sha256 tool is available"
+    audit_add_reason "$reasons_file" "missing_tool" "BLOCK" "sha256sum or shasum is required for checksum verification"
+  fi
+
+  jq -n \
+    --arg artifact "$artifact_abs" \
+    --arg checksum "$checksum_abs" \
+    --arg certificate "$certificate_abs" \
+    --arg signature "$signature_abs" \
+    --arg identity_regexp "$identity_regexp" \
+    --arg oidc_issuer "$oidc_issuer" \
+    --arg expected_sha "$expected_sha" \
+    --arg actual_sha "$actual_sha" \
+    --argjson require_signature "$require_signature" \
+    --argjson signature_complete "$signature_complete" \
+    '{
+      artifact:$artifact,
+      checksum:$checksum,
+      certificate:(if $certificate == "" then null else $certificate end),
+      signature:(if $signature == "" then null else $signature end),
+      certificate_identity_regexp:(if $identity_regexp == "" then null else $identity_regexp end),
+      certificate_oidc_issuer:(if $oidc_issuer == "" then null else $oidc_issuer end),
+      require_signature:$require_signature,
+      signature_verified:($signature_complete == 1),
+      expected_sha256:(if $expected_sha == "" then null else $expected_sha end),
+      actual_sha256:(if $actual_sha == "" then null else $actual_sha end)
+    }' > "$data_file"
+
+  local rc
+  set +e
+  emit_audit_result "verify release-asset" "$subject" "$verdict" "$checks_file" "$reasons_file" "$data_file" "$json_mode"
+  rc=$?
+  set -e
+  rm -rf "$scratch"
+  return "$rc"
+}
+
+verify_sigstore_bundle_command() {
+  local artifact="" bundle="" identity="" oidc_issuer=""
+  local json_mode=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --artifact)
+        [[ $# -lt 2 ]] && die "--artifact requires a path"
+        artifact="$2"
+        shift 2
+        ;;
+      --bundle)
+        [[ $# -lt 2 ]] && die "--bundle requires a path"
+        bundle="$2"
+        shift 2
+        ;;
+      --identity)
+        [[ $# -lt 2 ]] && die "--identity requires a value"
+        identity="$2"
+        shift 2
+        ;;
+      --oidc-issuer)
+        [[ $# -lt 2 ]] && die "--oidc-issuer requires a value"
+        oidc_issuer="$2"
+        shift 2
+        ;;
+      --json)
+        json_mode=1
+        shift
+        ;;
+      -*)
+        die "unknown verify sigstore-bundle flag: $1"
+        ;;
+      *)
+        die "unexpected argument for verify sigstore-bundle: $1"
+        ;;
+    esac
+  done
+  [[ -n "$artifact" && -n "$bundle" && -n "$identity" && -n "$oidc_issuer" ]] || die "usage: safe-audit verify sigstore-bundle --artifact PATH --bundle PATH --identity VALUE --oidc-issuer URL [--json]"
+
+  local artifact_abs bundle_abs
+  artifact_abs=$(absolute_path "$artifact")
+  bundle_abs=$(absolute_path "$bundle")
+
+  local subject="sigstore-bundle:${artifact_abs}"
+  local scratch checks_file reasons_file data_file bundle_meta_file
+  local cosign_main_output cosign_any_output cosign_identity_output cosign_issuer_output
+  scratch=$(mktemp -d)
+  checks_file="$scratch/checks.jsonl"
+  reasons_file="$scratch/reasons.jsonl"
+  data_file="$scratch/data.json"
+  bundle_meta_file="$scratch/bundle-metadata.json"
+  cosign_main_output="$scratch/cosign-main.out"
+  cosign_any_output="$scratch/cosign-any.out"
+  cosign_identity_output="$scratch/cosign-identity.out"
+  cosign_issuer_output="$scratch/cosign-issuer.out"
+  : > "$checks_file"
+  : > "$reasons_file"
+  extract_sigstore_bundle_metadata "$bundle_abs" "$bundle_meta_file"
+
+  local verdict="GO"
+  local policy_status="matched"
+  local -a missing_inputs=()
+
+  [[ -f "$artifact_abs" ]] || missing_inputs+=("$artifact_abs")
+  [[ -f "$bundle_abs" ]] || missing_inputs+=("$bundle_abs")
+  if (( ${#missing_inputs[@]} > 0 )); then
+    verdict="BLOCK"
+    audit_add_check "$checks_file" "inputs" "BLOCK" "required artifact inputs are missing" \
+      "$(jq -cn --argjson missing "$(printf '%s\n' "${missing_inputs[@]}" | jq -R . | jq -s .)" '{missing:$missing}')"
+    audit_add_reason "$reasons_file" "missing_asset" "BLOCK" "required artifact or bundle file is missing"
+  else
+    audit_add_check "$checks_file" "inputs" "GO" "artifact and bundle files are present"
+  fi
+
+  if [[ "$verdict" == "GO" ]] && ! have_cmd cosign; then
+    verdict="BLOCK"
+    audit_add_check "$checks_file" "bundle_verification" "BLOCK" "cosign is not available"
+    audit_add_reason "$reasons_file" "missing_tool" "BLOCK" "cosign is required for sigstore bundle verification"
+  fi
+
+  if [[ "$verdict" == "GO" ]]; then
+    if jq -e . "$bundle_abs" >/dev/null 2>&1; then
+      audit_add_check "$checks_file" "bundle_format" "GO" "bundle JSON parsed successfully"
+    else
+      verdict="BLOCK"
+      audit_add_check "$checks_file" "bundle_format" "BLOCK" "bundle JSON could not be parsed"
+      audit_add_reason "$reasons_file" "invalid_bundle" "BLOCK" "bundle JSON is malformed or unreadable"
+    fi
+  fi
+
+  if [[ "$verdict" == "GO" ]]; then
+    if run_cosign_verify_blob_bundle "$artifact_abs" "$bundle_abs" "$cosign_main_output" \
+      --certificate-identity "$identity" \
+      --certificate-oidc-issuer "$oidc_issuer"; then
+      audit_add_check "$checks_file" "bundle_verification" "GO" "cosign verified the artifact against the bundle and signer policy"
+    elif run_cosign_verify_blob_bundle "$artifact_abs" "$bundle_abs" "$cosign_any_output" \
+      --certificate-identity-regexp '.*' \
+      --certificate-oidc-issuer-regexp '.*'; then
+      local identity_matches=0 issuer_matches=0
+      if run_cosign_verify_blob_bundle "$artifact_abs" "$bundle_abs" "$cosign_identity_output" \
+        --certificate-identity "$identity" \
+        --certificate-oidc-issuer-regexp '.*'; then
+        identity_matches=1
+      fi
+      if run_cosign_verify_blob_bundle "$artifact_abs" "$bundle_abs" "$cosign_issuer_output" \
+        --certificate-identity-regexp '.*' \
+        --certificate-oidc-issuer "$oidc_issuer"; then
+        issuer_matches=1
+      fi
+
+      verdict="BLOCK"
+      audit_add_check "$checks_file" "bundle_verification" "BLOCK" "cosign verified the bundle, but signer policy did not match"
+      if (( identity_matches == 0 && issuer_matches == 1 )); then
+        policy_status="identity_mismatch"
+        audit_add_reason "$reasons_file" "identity_mismatch" "BLOCK" "bundle signer identity did not match the expected identity" \
+          "$(jq -cn --arg expected_identity "$identity" '{expected_identity:$expected_identity}')"
+      elif (( identity_matches == 1 && issuer_matches == 0 )); then
+        policy_status="issuer_mismatch"
+        audit_add_reason "$reasons_file" "issuer_mismatch" "BLOCK" "bundle signer OIDC issuer did not match the expected issuer" \
+          "$(jq -cn --arg expected_oidc_issuer "$oidc_issuer" '{expected_oidc_issuer:$expected_oidc_issuer}')"
+      else
+        policy_status="identity_and_issuer_mismatch"
+        audit_add_reason "$reasons_file" "identity_mismatch" "BLOCK" "bundle signer identity did not match the expected identity" \
+          "$(jq -cn --arg expected_identity "$identity" '{expected_identity:$expected_identity}')"
+        audit_add_reason "$reasons_file" "issuer_mismatch" "BLOCK" "bundle signer OIDC issuer did not match the expected issuer" \
+          "$(jq -cn --arg expected_oidc_issuer "$oidc_issuer" '{expected_oidc_issuer:$expected_oidc_issuer}')"
+      fi
+    else
+      verdict="BLOCK"
+      policy_status="signature_failure"
+      audit_add_check "$checks_file" "bundle_verification" "BLOCK" "cosign failed to verify the artifact against the bundle"
+      audit_add_reason "$reasons_file" "signature_failure" "BLOCK" "$(first_line_summary "$(cat "$cosign_main_output")" 240)"
+    fi
+  fi
+
+  jq -n \
+    --arg artifact "$artifact_abs" \
+    --arg bundle "$bundle_abs" \
+    --arg expected_identity "$identity" \
+    --arg expected_oidc_issuer "$oidc_issuer" \
+    --arg verification_tool "cosign verify-blob" \
+    --arg policy_status "$policy_status" \
+    --argjson signer_metadata "$(cat "$bundle_meta_file")" \
+    '{
+      artifact:$artifact,
+      bundle:$bundle,
+      expected_identity:$expected_identity,
+      expected_oidc_issuer:$expected_oidc_issuer,
+      verification_tool:$verification_tool,
+      policy_status:$policy_status,
+      signer_metadata:$signer_metadata
+    }' > "$data_file"
+
+  local rc
+  set +e
+  emit_audit_result "verify sigstore-bundle" "$subject" "$verdict" "$checks_file" "$reasons_file" "$data_file" "$json_mode"
+  rc=$?
+  set -e
+  rm -rf "$scratch"
+  return "$rc"
+}
+
+verify_tuf_bootstrap_command() {
+  local mirror_input="" root="" root_checksum=""
+  local json_mode=0
+  local -a target_specs=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --mirror)
+        [[ $# -lt 2 ]] && die "--mirror requires a local path or file:// URL"
+        mirror_input="$2"
+        shift 2
+        ;;
+      --root)
+        [[ $# -lt 2 ]] && die "--root requires a path"
+        root="$2"
+        shift 2
+        ;;
+      --root-checksum)
+        [[ $# -lt 2 ]] && die "--root-checksum requires a sha256"
+        root_checksum="$2"
+        shift 2
+        ;;
+      --target)
+        [[ $# -lt 2 ]] && die "--target requires NAME=PATH"
+        target_specs+=("$2")
+        shift 2
+        ;;
+      --json)
+        json_mode=1
+        shift
+        ;;
+      -*)
+        die "unknown verify tuf-bootstrap flag: $1"
+        ;;
+      *)
+        die "unexpected argument for verify tuf-bootstrap: $1"
+        ;;
+    esac
+  done
+  [[ -n "$mirror_input" && -n "$root" && -n "$root_checksum" && "${#target_specs[@]}" -gt 0 ]] || die "usage: safe-audit verify tuf-bootstrap --mirror PATH --root PATH --root-checksum SHA256 --target NAME=PATH [--target NAME=PATH ...] [--json]"
+
+  local normalized_root_checksum
+  normalized_root_checksum=$(normalize_sha256_checksum "$root_checksum") || die "--root-checksum must be a sha256 digest"
+
+  if [[ "$mirror_input" == *"://"* && "$mirror_input" != file://* ]]; then
+    die "verify tuf-bootstrap only supports local mirror paths or file:// URLs in v1"
+  fi
+
+  local mirror_local="$mirror_input"
+  if [[ "$mirror_local" == file://* ]]; then
+    mirror_local="${mirror_local#file://}"
+  fi
+
+  local mirror_abs="$mirror_local"
+  if [[ -d "$mirror_local" ]]; then
+    mirror_abs=$(absolute_path "$mirror_local")
+  fi
+
+  local root_abs
+  root_abs=$(absolute_path "$root")
+
+  local mirror_identity="file://$mirror_abs"
+  local mirror_transport="http-bridge"
+  local effective_mirror_url=""
+  local subject="tuf-bootstrap:${root_abs}"
+  local scratch checks_file reasons_file data_file cosign_output
+  scratch=$(mktemp -d)
+  checks_file="$scratch/checks.jsonl"
+  reasons_file="$scratch/reasons.jsonl"
+  data_file="$scratch/data.json"
+  cosign_output="$scratch/cosign-init.out"
+  : > "$checks_file"
+  : > "$reasons_file"
+
+  local verdict="GO"
+  local actual_root_checksum=""
+  local trusted_tuf_repo_dir="" trusted_targets_dir="" trusted_targets_metadata_path=""
+  local target_name="" target_path="" target_abs="" trusted_path=""
+  local matched_targets=0 mismatched_targets=0
+  local bridge_python_cmd="" bridge_state_file="$scratch/mirror-bridge.url" bridge_log="$scratch/mirror-bridge.log" bridge_pid=""
+  local -a missing_inputs=()
+  local -a target_rows=()
+  local -a target_names=()
+
+  [[ -d "$mirror_abs" ]] || missing_inputs+=("$mirror_abs")
+  [[ -f "$root_abs" ]] || missing_inputs+=("$root_abs")
+  for spec in "${target_specs[@]}"; do
+    target_name="${spec%%=*}"
+    target_path="${spec#*=}"
+    [[ "$target_name" != "$spec" && -n "$target_name" && -n "$target_path" ]] || die "--target requires NAME=PATH"
+    target_names+=("$target_name")
+    target_abs=$(absolute_path "$target_path")
+    [[ -f "$target_abs" ]] || missing_inputs+=("$target_abs")
+  done
+
+  if (( ${#missing_inputs[@]} > 0 )); then
+    verdict="BLOCK"
+    audit_add_check "$checks_file" "inputs" "BLOCK" "required trust inputs are missing" \
+      "$(jq -cn --argjson missing "$(printf '%s\n' "${missing_inputs[@]}" | jq -R . | jq -s .)" '{missing:$missing}')"
+    audit_add_reason "$reasons_file" "missing_trust_input" "BLOCK" "required local trust material is missing"
+  else
+    audit_add_check "$checks_file" "inputs" "GO" "local mirror, root, and trust targets are present"
+  fi
+
+  if [[ "$verdict" == "GO" ]] && ! (have_cmd sha256sum || have_cmd shasum); then
+    verdict="BLOCK"
+    audit_add_check "$checks_file" "root_checksum" "BLOCK" "no sha256 tool is available"
+    audit_add_reason "$reasons_file" "missing_tool" "BLOCK" "sha256sum or shasum is required for TUF bootstrap verification"
+  fi
+
+  if [[ "$verdict" == "GO" ]] && ! have_cmd cosign; then
+    verdict="BLOCK"
+    audit_add_check "$checks_file" "tuf_initialize" "BLOCK" "cosign is not available"
+    audit_add_reason "$reasons_file" "missing_tool" "BLOCK" "cosign is required for TUF bootstrap verification"
+  fi
+
+  if [[ "$verdict" == "GO" ]]; then
+    if bridge_python_cmd=$(select_python_http_bridge_cmd); then
+      :
+    else
+      verdict="BLOCK"
+      audit_add_check "$checks_file" "mirror_bridge" "BLOCK" "python3 or python is not available for the local TUF mirror bridge"
+      audit_add_reason "$reasons_file" "missing_tool" "BLOCK" "python3 or python is required for local TUF bootstrap mirror bridging" \
+        "$(jq -cn '{missing:"python3|python"}')"
+    fi
+  fi
+
+  if [[ "$verdict" == "GO" ]]; then
+    actual_root_checksum=$(sha256_file "$root_abs" 2>/dev/null || true)
+    if [[ "$actual_root_checksum" == "$normalized_root_checksum" ]]; then
+      audit_add_check "$checks_file" "root_checksum" "GO" "root.json matches the expected sha256"
+    else
+      verdict="BLOCK"
+      audit_add_check "$checks_file" "root_checksum" "BLOCK" "root.json does not match the expected sha256"
+      audit_add_reason "$reasons_file" "trust_root_mismatch" "BLOCK" "root.json sha256 did not match the expected trust root checksum" \
+        "$(jq -cn --arg expected_root_checksum "$normalized_root_checksum" --arg actual_root_checksum "$actual_root_checksum" '{expected_root_checksum:$expected_root_checksum,actual_root_checksum:(if $actual_root_checksum == "" then null else $actual_root_checksum end)}')"
+    fi
+  fi
+
+  if [[ "$verdict" == "GO" ]]; then
+    bridge_pid=$(start_loopback_http_bridge "$bridge_python_cmd" "$mirror_abs" "$bridge_state_file" "$bridge_log")
+    if effective_mirror_url=$(wait_for_loopback_http_bridge "$bridge_python_cmd" "$bridge_state_file" "/"); then
+      audit_add_check "$checks_file" "mirror_bridge" "GO" "temporary loopback HTTP bridge is ready" \
+        "$(jq -cn --arg effective_mirror_url "$effective_mirror_url" --arg mirror_transport "$mirror_transport" '{effective_mirror_url:$effective_mirror_url,mirror_transport:$mirror_transport}')"
+    else
+      verdict="BLOCK"
+      stop_background_process "$bridge_pid"
+      bridge_pid=""
+      audit_add_check "$checks_file" "mirror_bridge" "BLOCK" "temporary loopback HTTP bridge did not become reachable" \
+        "$(jq -cn --arg mirror_transport "$mirror_transport" '{mirror_transport:$mirror_transport}')"
+      audit_add_reason "$reasons_file" "bootstrap_failure" "BLOCK" "$(first_line_summary "$(cat "$bridge_log" 2>/dev/null)" 240)"
+    fi
+  fi
+
+  if [[ "$verdict" == "GO" ]]; then
+    local cosign_home
+    cosign_home="$scratch/cosign-home"
+    mkdir -p "$cosign_home"
+    set +e
+    HOME="$cosign_home" cosign initialize \
+      --mirror "$effective_mirror_url" \
+      --root "$root_abs" \
+      --root-checksum "sha256:$normalized_root_checksum" > "$cosign_output" 2>&1
+    local init_rc=$?
+    set -e
+    stop_background_process "$bridge_pid"
+    bridge_pid=""
+    if [[ "$init_rc" == "0" ]]; then
+      trusted_tuf_repo_dir=$(find_cosign_tuf_repository_dir "$cosign_home" || true)
+      if [[ -n "$trusted_tuf_repo_dir" ]]; then
+        trusted_targets_dir="$trusted_tuf_repo_dir/targets"
+      else
+        trusted_targets_dir=""
+      fi
+      trusted_targets_metadata_path=$(find_cosign_tuf_targets_metadata_path "$cosign_home" || true)
+      if [[ -n "$trusted_targets_metadata_path" && -f "$trusted_targets_metadata_path" ]]; then
+        audit_add_check "$checks_file" "tuf_initialize" "GO" "cosign initialized the local TUF bootstrap mirror"
+      else
+        verdict="BLOCK"
+        audit_add_check "$checks_file" "tuf_initialize" "BLOCK" "cosign initialized, but no trusted targets metadata was cached"
+        audit_add_reason "$reasons_file" "bootstrap_failure" "BLOCK" "cosign did not cache trusted TUF targets metadata from the local mirror"
+      fi
+    else
+      verdict="BLOCK"
+      audit_add_check "$checks_file" "tuf_initialize" "BLOCK" "cosign failed to initialize the local TUF bootstrap mirror"
+      audit_add_reason "$reasons_file" "bootstrap_failure" "BLOCK" "$(first_line_summary "$(cat "$cosign_output")" 240)"
+    fi
+  fi
+
+  stop_background_process "$bridge_pid"
+
+  if [[ "$verdict" == "GO" ]]; then
+    local spec
+    for spec in "${target_specs[@]}"; do
+      local target_metadata_fields="" trusted_metadata_sha="" trusted_metadata_length=""
+      local trusted_mirror_blob_path="" target_materialized_path=""
+      local target_local_sha="" target_local_size="" target_trusted_sha="" target_trusted_size=""
+      local materialized_sha="" materialized_size="" mirror_blob_sha="" mirror_blob_size=""
+      local verification_source="" match_source="" comparison_mode=""
+      local trusted_metadata_present="false" materialized_available="false"
+      local materialized_matches_trusted_blob="false" mirror_blob_verified="false"
+      local -a candidate_paths=() candidate_sources=()
+
+      target_name="${spec%%=*}"
+      target_path="${spec#*=}"
+      target_abs=$(absolute_path "$target_path")
+      target_materialized_path="$trusted_targets_dir/$target_name"
+      target_metadata_fields=$(jq -r --arg name "$target_name" '
+        .signed.targets[$name] // empty
+        | [(.hashes.sha256 // ""), (.length // "")]
+        | @tsv
+      ' "$trusted_targets_metadata_path")
+      if [[ -z "$target_metadata_fields" ]]; then
+        verdict="BLOCK"
+        mismatched_targets=$((mismatched_targets + 1))
+        target_rows+=("$(jq -cn \
+          --arg name "$target_name" \
+          --arg local_path "$target_abs" \
+          --arg materialized_path "$target_materialized_path" \
+          '{name:$name,local_path:$local_path,materialized_path:$materialized_path,mirror_blob_path:null,trusted_path:null,matched:false,status:"policy_mismatch",trusted_metadata_present:false,materialized_available:false,materialized_matches_trusted_blob:false,mirror_blob_verified:false,verification_source:null,match_source:null,comparison_mode:null,trusted_metadata_sha256:null,trusted_metadata_length:null,local_sha256:null,trusted_sha256:null,local_size:null,trusted_size:null}')")
+        audit_add_reason "$reasons_file" "policy_mismatch" "BLOCK" "trusted TUF metadata did not name target ${target_name}" \
+          "$(jq -cn --arg target "$target_name" '{target:$target}')"
+        continue
+      fi
+      IFS=$'\t' read -r trusted_metadata_sha trusted_metadata_length <<<"$target_metadata_fields"
+      trusted_metadata_present="true"
+      trusted_mirror_blob_path="$mirror_abs/targets/${trusted_metadata_sha}.${target_name}"
+      if [[ ! -f "$trusted_mirror_blob_path" ]]; then
+        verdict="BLOCK"
+        mismatched_targets=$((mismatched_targets + 1))
+        target_rows+=("$(jq -cn \
+          --arg name "$target_name" \
+          --arg local_path "$target_abs" \
+          --arg materialized_path "$target_materialized_path" \
+          --arg mirror_blob_path "$trusted_mirror_blob_path" \
+          --arg trusted_metadata_sha256 "$trusted_metadata_sha" \
+          --argjson trusted_metadata_length "$trusted_metadata_length" \
+          '{name:$name,local_path:$local_path,materialized_path:$materialized_path,mirror_blob_path:$mirror_blob_path,trusted_path:$mirror_blob_path,matched:false,status:"trusted_mirror_target_invalid",trusted_metadata_present:true,materialized_available:false,materialized_matches_trusted_blob:false,mirror_blob_verified:false,verification_source:"mirror_blob",match_source:null,comparison_mode:null,trusted_metadata_sha256:$trusted_metadata_sha256,trusted_metadata_length:$trusted_metadata_length,local_sha256:null,trusted_sha256:null,local_size:null,trusted_size:null}')")
+        audit_add_reason "$reasons_file" "trusted_mirror_target_invalid" "BLOCK" "trusted mirror target ${target_name} was missing from the local TUF mirror" \
+          "$(jq -cn --arg target "$target_name" --arg mirror_blob_path "$trusted_mirror_blob_path" --arg trusted_metadata_sha256 "$trusted_metadata_sha" --argjson trusted_metadata_length "$trusted_metadata_length" '{target:$target,mirror_blob_path:$mirror_blob_path,trusted_metadata_sha256:$trusted_metadata_sha256,trusted_metadata_length:$trusted_metadata_length}')"
+        continue
+      fi
+
+      mirror_blob_sha=$(sha256_file "$trusted_mirror_blob_path" 2>/dev/null || true)
+      mirror_blob_size=$(file_size_bytes "$trusted_mirror_blob_path")
+      if [[ "$mirror_blob_sha" != "$trusted_metadata_sha" || "$mirror_blob_size" != "$trusted_metadata_length" ]]; then
+        verdict="BLOCK"
+        mismatched_targets=$((mismatched_targets + 1))
+        target_rows+=("$(jq -cn \
+          --arg name "$target_name" \
+          --arg local_path "$target_abs" \
+          --arg materialized_path "$target_materialized_path" \
+          --arg mirror_blob_path "$trusted_mirror_blob_path" \
+          --arg trusted_metadata_sha256 "$trusted_metadata_sha" \
+          --arg actual_mirror_blob_sha256 "$mirror_blob_sha" \
+          --argjson trusted_metadata_length "$trusted_metadata_length" \
+          --argjson actual_mirror_blob_length "$mirror_blob_size" \
+          '{name:$name,local_path:$local_path,materialized_path:$materialized_path,mirror_blob_path:$mirror_blob_path,trusted_path:$mirror_blob_path,matched:false,status:"trusted_mirror_target_invalid",trusted_metadata_present:true,materialized_available:false,materialized_matches_trusted_blob:false,mirror_blob_verified:false,verification_source:"mirror_blob",match_source:null,comparison_mode:null,trusted_metadata_sha256:$trusted_metadata_sha256,trusted_metadata_length:$trusted_metadata_length,local_sha256:null,trusted_sha256:(if $actual_mirror_blob_sha256 == "" then null else $actual_mirror_blob_sha256 end),local_size:null,trusted_size:$actual_mirror_blob_length}')")
+        audit_add_reason "$reasons_file" "trusted_mirror_target_invalid" "BLOCK" "trusted mirror target ${target_name} did not match trusted TUF metadata" \
+          "$(jq -cn --arg target "$target_name" --arg mirror_blob_path "$trusted_mirror_blob_path" --arg trusted_metadata_sha256 "$trusted_metadata_sha" --arg actual_mirror_blob_sha256 "$mirror_blob_sha" --argjson trusted_metadata_length "$trusted_metadata_length" --argjson actual_mirror_blob_length "$mirror_blob_size" '{target:$target,mirror_blob_path:$mirror_blob_path,trusted_metadata_sha256:$trusted_metadata_sha256,actual_mirror_blob_sha256:(if $actual_mirror_blob_sha256 == "" then null else $actual_mirror_blob_sha256 end),trusted_metadata_length:$trusted_metadata_length,actual_mirror_blob_length:$actual_mirror_blob_length}')"
+        continue
+      fi
+      mirror_blob_verified="true"
+
+      if [[ -f "$target_materialized_path" ]]; then
+        materialized_available="true"
+        materialized_sha=$(sha256_file "$target_materialized_path" 2>/dev/null || true)
+        materialized_size=$(file_size_bytes "$target_materialized_path")
+        if [[ "$materialized_sha" == "$mirror_blob_sha" && "$materialized_size" == "$mirror_blob_size" ]]; then
+          materialized_matches_trusted_blob="true"
+          candidate_paths+=("$target_materialized_path")
+          candidate_sources+=("materialized")
+        fi
+      fi
+
+      candidate_paths+=("$trusted_mirror_blob_path")
+      candidate_sources+=("mirror_blob")
+      target_local_sha=$(sha256_file "$target_abs" 2>/dev/null || true)
+      target_local_size=$(file_size_bytes "$target_abs")
+      trusted_path=""
+      verification_source=""
+      comparison_mode=""
+      match_source=""
+      for i in "${!candidate_paths[@]}"; do
+        trusted_path="${candidate_paths[$i]}"
+        verification_source="${candidate_sources[$i]}"
+        case "$verification_source" in
+          materialized)
+            target_trusted_sha="$materialized_sha"
+            target_trusted_size="$materialized_size"
+            ;;
+          *)
+            target_trusted_sha="$mirror_blob_sha"
+            target_trusted_size="$mirror_blob_size"
+            ;;
+        esac
+
+        if [[ "$target_local_sha" == "$target_trusted_sha" && "$target_local_size" == "$target_trusted_size" ]]; then
+          comparison_mode="strict"
+          match_source="${verification_source}_strict"
+          break
+        fi
+        if trust_target_allows_trimmed_newline_match "$target_name" "$target_abs" && files_match_after_trimming_newlines "$target_abs" "$trusted_path"; then
+          comparison_mode="trimmed_newline"
+          match_source="${verification_source}_trimmed_newline"
+          break
+        fi
+      done
+
+      if [[ -n "$match_source" ]]; then
+        matched_targets=$((matched_targets + 1))
+        target_rows+=("$(jq -cn \
+          --arg name "$target_name" \
+          --arg local_path "$target_abs" \
+          --arg trusted_path "$trusted_path" \
+          --arg materialized_path "$target_materialized_path" \
+          --arg mirror_blob_path "$trusted_mirror_blob_path" \
+          --arg local_sha256 "$target_local_sha" \
+          --arg trusted_sha256 "$target_trusted_sha" \
+          --arg trusted_metadata_sha256 "$trusted_metadata_sha" \
+          --arg verification_source "$verification_source" \
+          --arg match_source "$match_source" \
+          --arg comparison_mode "$comparison_mode" \
+          --argjson trusted_metadata_present "$trusted_metadata_present" \
+          --argjson materialized_available "$materialized_available" \
+          --argjson materialized_matches_trusted_blob "$materialized_matches_trusted_blob" \
+          --argjson mirror_blob_verified "$mirror_blob_verified" \
+          --argjson local_size "$target_local_size" \
+          --argjson trusted_metadata_length "$trusted_metadata_length" \
+          --argjson trusted_size "$target_trusted_size" \
+          '{name:$name,local_path:$local_path,trusted_path:$trusted_path,materialized_path:$materialized_path,mirror_blob_path:$mirror_blob_path,matched:true,status:"matched",trusted_metadata_present:$trusted_metadata_present,materialized_available:$materialized_available,materialized_matches_trusted_blob:$materialized_matches_trusted_blob,mirror_blob_verified:$mirror_blob_verified,verification_source:$verification_source,match_source:$match_source,comparison_mode:$comparison_mode,trusted_metadata_sha256:$trusted_metadata_sha256,trusted_metadata_length:$trusted_metadata_length,local_sha256:$local_sha256,trusted_sha256:$trusted_sha256,local_size:$local_size,trusted_size:$trusted_size}')")
+      else
+        verdict="BLOCK"
+        mismatched_targets=$((mismatched_targets + 1))
+        target_rows+=("$(jq -cn \
+          --arg name "$target_name" \
+          --arg local_path "$target_abs" \
+          --arg trusted_path "$trusted_mirror_blob_path" \
+          --arg materialized_path "$target_materialized_path" \
+          --arg mirror_blob_path "$trusted_mirror_blob_path" \
+          --arg local_sha256 "$target_local_sha" \
+          --arg trusted_sha256 "$mirror_blob_sha" \
+          --arg trusted_metadata_sha256 "$trusted_metadata_sha" \
+          --argjson trusted_metadata_present "$trusted_metadata_present" \
+          --argjson materialized_available "$materialized_available" \
+          --argjson materialized_matches_trusted_blob "$materialized_matches_trusted_blob" \
+          --argjson mirror_blob_verified "$mirror_blob_verified" \
+          --argjson local_size "$target_local_size" \
+          --argjson trusted_metadata_length "$trusted_metadata_length" \
+          --argjson trusted_size "$mirror_blob_size" \
+          '{name:$name,local_path:$local_path,trusted_path:$trusted_path,materialized_path:$materialized_path,mirror_blob_path:$mirror_blob_path,matched:false,status:"trust_material_mismatch",trusted_metadata_present:$trusted_metadata_present,materialized_available:$materialized_available,materialized_matches_trusted_blob:$materialized_matches_trusted_blob,mirror_blob_verified:$mirror_blob_verified,verification_source:"mirror_blob",match_source:null,comparison_mode:null,trusted_metadata_sha256:$trusted_metadata_sha256,trusted_metadata_length:$trusted_metadata_length,local_sha256:(if $local_sha256 == "" then null else $local_sha256 end),trusted_sha256:(if $trusted_sha256 == "" then null else $trusted_sha256 end),local_size:$local_size,trusted_size:$trusted_size}')")
+        audit_add_reason "$reasons_file" "trust_material_mismatch" "BLOCK" "local trust target ${target_name} did not match the trusted TUF target" \
+          "$(jq -cn --arg target "$target_name" --arg local_sha256 "$target_local_sha" --arg trusted_sha256 "$mirror_blob_sha" --argjson trusted_metadata_length "$trusted_metadata_length" '{target:$target,local_sha256:(if $local_sha256 == "" then null else $local_sha256 end),trusted_sha256:(if $trusted_sha256 == "" then null else $trusted_sha256 end),trusted_metadata_length:$trusted_metadata_length}')"
+      fi
+    done
+
+    if (( mismatched_targets == 0 )); then
+      audit_add_check "$checks_file" "trust_targets" "GO" "${matched_targets} trust targets matched the trusted TUF bootstrap material"
+    else
+      audit_add_check "$checks_file" "trust_targets" "BLOCK" "${mismatched_targets} trust targets did not match the trusted TUF bootstrap material"
+    fi
+  fi
+
+  jq -n \
+    --arg mirror "$mirror_identity" \
+    --arg mirror_input "$mirror_input" \
+    --arg mirror_transport "$mirror_transport" \
+    --arg effective_mirror_url "$effective_mirror_url" \
+    --arg root "$root_abs" \
+    --arg expected_root_checksum "$normalized_root_checksum" \
+    --arg actual_root_checksum "$actual_root_checksum" \
+    --arg verification_tool "cosign initialize" \
+    --arg trusted_targets_dir "$trusted_targets_dir" \
+    --arg trusted_targets_metadata "$trusted_targets_metadata_path" \
+    --argjson targets "$(printf '%s\n' "${target_rows[@]}" | jq -Rsc 'split("\n") | map(select(length > 0) | fromjson)')" \
+    '{
+      mirror:$mirror,
+      mirror_input:$mirror_input,
+      mirror_transport:$mirror_transport,
+      effective_mirror_url:(if $effective_mirror_url == "" then null else $effective_mirror_url end),
+      root:$root,
+      expected_root_checksum:$expected_root_checksum,
+      actual_root_checksum:(if $actual_root_checksum == "" then null else $actual_root_checksum end),
+      verification_tool:$verification_tool,
+      trusted_targets_dir:(if $trusted_targets_dir == "" then null else $trusted_targets_dir end),
+      trusted_targets_metadata:(if $trusted_targets_metadata == "" then null else $trusted_targets_metadata end),
+      targets:$targets
+    }' > "$data_file"
+
+  local rc
+  set +e
+  emit_audit_result "verify tuf-bootstrap" "$subject" "$verdict" "$checks_file" "$reasons_file" "$data_file" "$json_mode"
+  rc=$?
+  set -e
+  rm -rf "$scratch"
+  return "$rc"
+}
+
+binary_exec_command() {
+  local artifact="" json_mode=0 timeout_seconds="$BINARY_AUDIT_TIMEOUT_SECONDS"
+  local -a cmd_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json)
+        json_mode=1
+        shift
+        ;;
+      --timeout)
+        [[ $# -lt 2 ]] && die "--timeout requires seconds"
+        timeout_seconds="$2"
+        shift 2
+        ;;
+      --)
+        shift
+        cmd_args=("$@")
+        break
+        ;;
+      -*)
+        die "unknown binary exec flag: $1"
+        ;;
+      *)
+        if [[ -z "$artifact" ]]; then
+          artifact="$1"
+          shift
+        else
+          die "unexpected argument for binary exec: $1"
+        fi
+        ;;
+    esac
+  done
+  [[ -n "$artifact" ]] || die "usage: safe-audit binary exec PATH [--timeout SECONDS] [--json] -- [ARGS...]"
+
+  local artifact_abs
+  artifact_abs=$(absolute_path "$artifact")
+  local subject="binary:${artifact_abs}"
+  local scratch checks_file reasons_file data_file stdout_file stderr_file
+  scratch=$(mktemp -d)
+  checks_file="$scratch/checks.jsonl"
+  reasons_file="$scratch/reasons.jsonl"
+  data_file="$scratch/data.json"
+  stdout_file="$scratch/stdout.txt"
+  stderr_file="$scratch/stderr.txt"
+  : > "$checks_file"
+  : > "$reasons_file"
+
+  local verdict="GO"
+  local runtime_status="ok" exit_code=0 stdout_summary="" stderr_summary=""
+  local artifact_dir artifact_base
+  artifact_dir=$(dirname "$artifact_abs")
+  artifact_base=$(basename "$artifact_abs")
+
+  local -a sandbox_env sandbox_flags
+  sandbox_env=(
+    HOME=/tmp/home
+    XDG_CONFIG_HOME=/tmp/xdg-config
+    XDG_CACHE_HOME=/tmp/xdg-cache
+    XDG_STATE_HOME=/tmp/xdg-state
+  )
+  sandbox_flags=(
+    run --rm
+    --network=none
+    --read-only
+    --cap-drop=ALL
+    --security-opt=no-new-privileges
+    --env "${sandbox_env[0]}"
+    --env "${sandbox_env[1]}"
+    --env "${sandbox_env[2]}"
+    --env "${sandbox_env[3]}"
+    --tmpfs /tmp:rw,size=64m
+    --tmpfs /work:rw,size=64m
+    --workdir /work
+    -v "${artifact_dir}:/artifact:ro,z"
+  )
+
+  audit_add_check "$checks_file" "sandbox_policy" "GO" "podman run uses --network=none, read-only artifact bind, tmpfs scratch, writable HOME/XDG tmpfs env, and no project mount" \
+    "$(jq -cn \
+      --argjson flags "$(printf '%s\n' "${sandbox_flags[@]}" | jq -R . | jq -s .)" \
+      --argjson env "$(printf '%s\n' "${sandbox_env[@]}" | jq -R 'split("=") | {(.[0]): (.[1:] | join("="))}' | jq -s add)" \
+      '{flags:$flags,env:$env}')"
+
+  if [[ ! -f "$artifact_abs" ]]; then
+    verdict="WARN"
+    runtime_status="missing_artifact"
+    audit_add_check "$checks_file" "execution" "WARN" "artifact path does not exist"
+    audit_add_reason "$reasons_file" "runtime_failure" "WARN" "artifact path does not exist: $artifact_abs"
+  elif ! have_cmd podman; then
+    verdict="WARN"
+    runtime_status="missing_podman"
+    audit_add_check "$checks_file" "execution" "WARN" "podman is not available"
+    audit_add_reason "$reasons_file" "missing_tool" "WARN" "podman is required for binary sandbox execution"
+  elif ! have_cmd timeout; then
+    verdict="WARN"
+    runtime_status="missing_timeout"
+    audit_add_check "$checks_file" "execution" "WARN" "timeout is not available"
+    audit_add_reason "$reasons_file" "missing_tool" "WARN" "timeout is required to bound binary sandbox execution"
+  else
+    local rc
+    set +e
+    timeout --signal=TERM --kill-after=5s "${timeout_seconds}s" \
+      podman "${sandbox_flags[@]}" \
+      "$BINARY_AUDIT_IMAGE" \
+      sh -c "exec /artifact/${artifact_base} \"\$@\"" sh "${cmd_args[@]}" \
+      >"$stdout_file" 2>"$stderr_file"
+    rc=$?
+    set -e
+
+    stdout_summary=$(truncate_file_summary "$stdout_file" "$BINARY_AUDIT_STDIO_LINES" "$BINARY_AUDIT_STDIO_LIMIT")
+    stderr_summary=$(truncate_file_summary "$stderr_file" "$BINARY_AUDIT_STDIO_LINES" "$BINARY_AUDIT_STDIO_LIMIT")
+    exit_code="$rc"
+
+    if [[ "$rc" == "0" ]]; then
+      audit_add_check "$checks_file" "execution" "GO" "binary exited 0 inside the sandbox"
+    elif [[ "$rc" == "124" || "$rc" == "137" ]]; then
+      verdict="WARN"
+      runtime_status="timeout"
+      audit_add_check "$checks_file" "execution" "WARN" "binary timed out inside the sandbox"
+      audit_add_reason "$reasons_file" "timeout" "WARN" "sandbox execution exceeded ${timeout_seconds}s"
+    else
+      verdict="WARN"
+      runtime_status="nonzero_exit"
+      audit_add_check "$checks_file" "execution" "WARN" "binary exited nonzero inside the sandbox"
+      audit_add_reason "$reasons_file" "runtime_failure" "WARN" "sandbox execution exited with code ${rc}"
+    fi
+  fi
+
+  jq -n \
+    --arg artifact "$artifact_abs" \
+    --arg image "$BINARY_AUDIT_IMAGE" \
+    --arg timeout_seconds "$timeout_seconds" \
+    --arg runtime_status "$runtime_status" \
+    --arg stdout_summary "$stdout_summary" \
+    --arg stderr_summary "$stderr_summary" \
+    --argjson exit_code "$exit_code" \
+    --argjson command "$(printf '%s\n' "$artifact_abs" "${cmd_args[@]}" | jq -R . | jq -s .)" \
+    --argjson sandbox_flags "$(printf '%s\n' "${sandbox_flags[@]}" | jq -R . | jq -s .)" \
+    --argjson sandbox_env "$(printf '%s\n' "${sandbox_env[@]}" | jq -R 'split("=") | {(.[0]): (.[1:] | join("="))}' | jq -s add)" \
+    '{
+      artifact:$artifact,
+      image:$image,
+      timeout_seconds:($timeout_seconds|tonumber),
+      runtime_status:$runtime_status,
+      exit_code:$exit_code,
+      command:$command,
+      sandbox_flags:$sandbox_flags,
+      sandbox_env:$sandbox_env,
+      stdout_summary:(if $stdout_summary == "" then null else $stdout_summary end),
+      stderr_summary:(if $stderr_summary == "" then null else $stderr_summary end)
+    }' > "$data_file"
+
+  local rc
+  set +e
+  emit_audit_result "binary exec" "$subject" "$verdict" "$checks_file" "$reasons_file" "$data_file" "$json_mode"
+  rc=$?
+  set -e
+  rm -rf "$scratch"
+  return "$rc"
+}
+
+cmd_release() {
+  local sub="${1:-}"
+  case "$sub" in
+    github) shift; release_github_command "$@" ;;
+    *) die "unknown release subcommand: ${sub:-}" ;;
+  esac
+}
+
+cmd_vuln() {
+  local sub="${1:-}"
+  case "$sub" in
+    github-release) shift; vuln_github_release_command "$@" ;;
+    *) die "unknown vuln subcommand: ${sub:-}" ;;
+  esac
+}
+
+cmd_verify() {
+  local sub="${1:-}"
+  case "$sub" in
+    release-asset) shift; verify_release_asset_command "$@" ;;
+    sigstore-bundle) shift; verify_sigstore_bundle_command "$@" ;;
+    tuf-bootstrap) shift; verify_tuf_bootstrap_command "$@" ;;
+    *) die "unknown verify subcommand: ${sub:-}" ;;
+  esac
+}
+
+cmd_binary() {
+  local sub="${1:-}"
+  case "$sub" in
+    exec) shift; binary_exec_command "$@" ;;
+    *) die "unknown binary subcommand: ${sub:-}" ;;
+  esac
+}
+
+fetch_osv_vuln() {
+  local ident="$1" output="$2"
+  command -v curl >/dev/null 2>&1 || die "curl is required for advisory lookup"
+  curl -fsS "https://api.osv.dev/v1/vulns/$ident" > "$output"
+}
+
+build_ioc_from_osv() {
+  local ident="$1" advisory_json="$2" output="$3"
+  jq -n --arg id "$ident" --slurpfile advisory "$advisory_json" '
+    ($advisory[0] // {}) as $a |
+    {
+      id: $id,
+      packages: [
+        $a.affected[]? as $affected |
+        {
+          name: ($affected.package.name // "unknown"),
+          versions_affected: (
+            [$affected.ranges[]?.events[]? | .introduced // .fixed // .last_affected // empty] |
+            if length == 0 then "*" else join(",") end
+          )
+        }
+      ],
+      files: [],
+      strings: [],
+      processes: [],
+      dns: []
+    }' > "$output"
+}
+
+fetch_cisa_kev_catalog() {
+  local output="$1"
+  command -v curl >/dev/null 2>&1 || die "curl is required for IOC updates"
+  curl -fsS "$DEFAULT_CISA_KEV_URL" > "$output"
+  jq -e '.vulnerabilities | type == "array"' "$output" >/dev/null 2>&1 || die "CISA KEV feed did not return the expected JSON shape"
+}
+
+build_ioc_from_cisa_kev() {
+  local catalog_json="$1" output="$2" since="${3:-}"
+  local cutoff_epoch="0" since_json
+  if [[ -n "$since" ]]; then
+    cutoff_epoch=$(epoch_from_since_spec "$since") || die "invalid --since duration: $since"
+  fi
+  since_json=$(json_string_or_null "$since")
+
+  jq -n \
+    --arg timestamp "$(now_iso)" \
+    --arg source_url "$DEFAULT_CISA_KEV_URL" \
+    --argjson cutoff_epoch "$cutoff_epoch" \
+    --argjson since "$since_json" \
+    --slurpfile catalog "$catalog_json" '
+    ($catalog[0].vulnerabilities // []) as $vulns |
+    (
+      $vulns
+      | map(
+          select(
+            $cutoff_epoch == 0
+            or (((.dateAdded // "1970-01-01") + "T00:00:00Z" | fromdateiso8601) >= $cutoff_epoch)
+          )
+        )
+      | sort_by(.dateAdded // "", .cveID // "")
+    ) as $filtered |
+    {
+      id: "cisa-kev",
+      source: {
+        name: "CISA Known Exploited Vulnerabilities Catalog",
+        url: $source_url
+      },
+      updated: $timestamp,
+      since: $since,
+      packages: [],
+      files: [],
+      strings: ($filtered | map(.cveID // empty) | unique),
+      processes: [],
+      dns: [],
+      vulnerabilities: (
+        $filtered | map({
+          id: (.cveID // ""),
+          vendor_project: (.vendorProject // ""),
+          product: (.product // ""),
+          name: (.vulnerabilityName // ""),
+          date_added: (.dateAdded // ""),
+          due_date: (.dueDate // ""),
+          known_ransomware_campaign_use: (.knownRansomwareCampaignUse // ""),
+          required_action: (.requiredAction // ""),
+          notes: (.notes // ""),
+          cwes: (.cwes // [])
+        })
+      )
+    }' > "$output"
+}
+
+ioc_update_command() {
+  local since="${1:-}" scan_targets="${2:-0}"
+  local catalog_tmp ioc_tmp catalog_path ioc_path update_meta_path
+  catalog_tmp=$(mktemp)
+  ioc_tmp=$(mktemp)
+  catalog_path="$IOC_CATALOG_DIR/cisa-kev.json"
+  ioc_path="$IOC_DIR/cisa-kev-ioc.json"
+  update_meta_path="$IOC_CATALOG_DIR/cisa-kev-update.json"
+
+  fetch_cisa_kev_catalog "$catalog_tmp"
+  build_ioc_from_cisa_kev "$catalog_tmp" "$ioc_tmp" "$since"
+
+  cp "$catalog_tmp" "$catalog_path"
+  cp "$ioc_tmp" "$ioc_path"
+  jq -n \
+    --arg timestamp "$(now_iso)" \
+    --arg source "$DEFAULT_CISA_KEV_URL" \
+    --arg catalog "$catalog_path" \
+    --arg ioc "$ioc_path" \
+    --argjson total "$(jq '.vulnerabilities | length' "$catalog_path")" \
+    --argjson active "$(jq '.vulnerabilities | length' "$ioc_path")" '
+    {
+      timestamp: $timestamp,
+      source: $source,
+      catalog_path: $catalog,
+      ioc_path: $ioc,
+      total_vulnerabilities: $total,
+      active_ioc_vulnerabilities: $active
+    }' > "$update_meta_path"
+  printf '%s\n' "$(now_iso)" > "$LAST_IOC_UPDATE"
+
+  if [[ "$scan_targets" != "1" ]]; then
+    printf 'Updated IOC catalog: %s\n' "$ioc_path"
+    printf 'CISA KEV entries: %s total, %s active for scan\n' \
+      "$(jq -r '.total_vulnerabilities' "$update_meta_path")" \
+      "$(jq -r '.active_ioc_vulnerabilities' "$update_meta_path")"
+    return 0
+  fi
+
+  ioc_run_scan "cisa-kev" "$ioc_path"
+}
+
+ioc_machine_scan() {
+  local machine="$1" ioc_json="$2" output="$3"
+  local search_root
+  search_root="${SAFE_AUDIT_IOC_ROOT:-$DEFAULT_REMOTE_ROOT}"
+  local package_hits="" file_hits="" string_hits="" process_hits=""
+  local item output_chunk
+
+  while IFS= read -r item; do
+    [[ -z "$item" ]] && continue
+    output_chunk=$(run_machine_capture "$machine" "
+find ${search_root} -type f \\( -name 'package-lock.json' -o -name 'yarn.lock' -o -name 'pnpm-lock.yaml' -o -name 'uv.lock' -o -name 'poetry.lock' -o -name 'Pipfile.lock' -o -name 'composer.lock' -o -name 'Cargo.lock' -o -name 'go.sum' \\) -print0 2>/dev/null | xargs -0 grep -nH -- $(printf '%q' "$item") 2>/dev/null || true
+" || true)
+    [[ -n "$output_chunk" ]] && package_hits+="${output_chunk}"$'\n'
+  done < <(jq -r '.packages[]?.name' "$ioc_json")
+
+  while IFS= read -r item; do
+    [[ -z "$item" ]] && continue
+    output_chunk=$(run_machine_capture "$machine" "
+find ${search_root} -type f -name $(printf '%q' "$item") 2>/dev/null || true
+" || true)
+    [[ -n "$output_chunk" ]] && file_hits+="${output_chunk}"$'\n'
+  done < <(jq -r '.files[]?' "$ioc_json")
+
+  while IFS= read -r item; do
+    [[ -z "$item" ]] && continue
+    output_chunk=$(run_machine_capture "$machine" "
+grep -R -nH --binary-files=without-match -- $(printf '%q' "$item") ${search_root} 2>/dev/null || true
+" || true)
+    [[ -n "$output_chunk" ]] && string_hits+="${output_chunk}"$'\n'
+  done < <(jq -r '.strings[]?' "$ioc_json")
+
+  while IFS= read -r item; do
+    [[ -z "$item" ]] && continue
+    output_chunk=$(run_machine_capture "$machine" "
+ps aux | grep -F -- $(printf '%q' "$item") | grep -v grep || true
+" || true)
+    [[ -n "$output_chunk" ]] && process_hits+="${output_chunk}"$'\n'
+  done < <(jq -r '.processes[]?' "$ioc_json")
+
+  jq -n \
+    --arg machine "$machine" \
+    --arg timestamp "$(now_iso)" \
+    --arg package_hits "$package_hits" \
+    --arg file_hits "$file_hits" \
+    --arg string_hits "$string_hits" \
+    --arg process_hits "$process_hits" '
+    {
+      machine: $machine,
+      timestamp: $timestamp,
+      package_hits: ($package_hits | split("\n") | map(select(length > 0))),
+      file_hits: ($file_hits | split("\n") | map(select(length > 0))),
+      string_hits: ($string_hits | split("\n") | map(select(length > 0))),
+      process_hits: ($process_hits | split("\n") | map(select(length > 0)))
+    }' > "$output"
+}
+
+ioc_run_scan() {
+  local ident="$1" ioc_json="$2"
+  local result_path machine tmpfiles=()
+  result_path="$IOC_DIR/$(today_date)-$(slugify "$ident").json"
+  for machine in "${MACHINE_TARGETS[@]}"; do
+    local out
+    out=$(mktemp)
+    ioc_machine_scan "$machine" "$ioc_json" "$out"
+    tmpfiles+=("$out")
+  done
+
+  jq -n \
+    --arg timestamp "$(now_iso)" \
+    --arg identifier "$ident" \
+    --slurpfile ioc "$ioc_json" \
+    --slurpfile scans <(jq -s '.' "${tmpfiles[@]}") '
+    {
+      timestamp: $timestamp,
+      identifier: $identifier,
+      ioc: ($ioc[0] // {}),
+      scans: ($scans[0] // [])
+    }' > "$result_path"
+
+  printf '%s\n' "$result_path"
+}
+
+ioc_command() {
+  local list_file="" ident="" update_mode=0 since=""
+  local args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --list)
+        [[ $# -lt 2 ]] && die "--list requires a JSON file"
+        list_file="$2"
+        shift 2
+        ;;
+      --update)
+        update_mode=1
+        shift
+        ;;
+      --since)
+        [[ $# -lt 2 ]] && die "--since requires a duration"
+        since="$2"
+        shift 2
+        ;;
+      --all|--machine)
+        args+=("$1")
+        if [[ "$1" == "--machine" ]]; then
+          [[ $# -lt 2 ]] && die "--machine requires a comma-separated list"
+          args+=("$2")
+          shift
+        fi
+        shift
+        ;;
+      -*)
+        die "unknown ioc flag: $1"
+        ;;
+      *)
+        ident="$1"
+        shift
+        ;;
+    esac
+  done
+
+  if [[ "$update_mode" == "1" ]]; then
+    if [[ -n "$ident" || -n "$list_file" ]]; then
+      die "ioc --update cannot be combined with an identifier or --list"
+    fi
+    if [[ "${#args[@]}" -gt 0 ]]; then
+      parse_machine_targets default "${args[@]}"
+      ioc_update_command "$since" 1
+    else
+      ioc_update_command "$since" 0
+    fi
+    return 0
+  fi
+
+  parse_machine_targets default "${args[@]}"
+  local ioc_json advisory_json
+  advisory_json=$(mktemp)
+  ioc_json=$(mktemp)
+  if [[ -n "$list_file" ]]; then
+    cp "$list_file" "$ioc_json"
+    ident=$(jq -r '.id // "custom-ioc"' "$ioc_json")
+  else
+    [[ -n "$ident" ]] || die "usage: safe-audit ioc <identifier> [--all|--machine ...]"
+    fetch_osv_vuln "$ident" "$advisory_json"
+    build_ioc_from_osv "$ident" "$advisory_json" "$ioc_json"
+  fi
+
+  ioc_run_scan "$ident" "$ioc_json"
+}
+
+core_scanner_tools() {
+  printf '%s\n' osv-scanner grype syft
+}
+
+required_tools_for_machine() {
+  local machine="$1"
+  core_scanner_tools
+  if [[ "$(machine_type "$machine")" == "local" ]]; then
+    printf '%s\n' socket
+  fi
+}
+
+install_osv_scanner_release_script() {
+  cat <<'EOF'
+set -euo pipefail
+mkdir -p "$HOME/.local/bin"
+asset_json=$(curl -fsS https://api.github.com/repos/google/osv-scanner/releases/latest)
+url=$(jq -r '
+  .assets[]
+  | select(.name | test("^osv-scanner_linux_amd64(\\.tar\\.gz)?$"))
+  | .browser_download_url
+' <<<"$asset_json" | head -n 1)
+if [[ -z "$url" || "$url" == "null" ]]; then
+  printf 'could not resolve latest osv-scanner linux amd64 release asset\n' >&2
+  exit 1
+fi
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+case "$url" in
+  *.tar.gz|*.tgz)
+    curl -fsSL "$url" | tar -xzf - -C "$tmp"
+    candidate=$(find "$tmp" -type f -name osv-scanner -perm /111 | head -n 1)
+    ;;
+  *)
+    candidate="$tmp/osv-scanner"
+    curl -fsSL "$url" -o "$candidate"
+    chmod 0755 "$candidate"
+    ;;
+esac
+if [[ -z "${candidate:-}" || ! -f "$candidate" ]]; then
+  printf 'downloaded osv-scanner asset did not contain an executable\n' >&2
+  exit 1
+fi
+install -m 0755 "$candidate" "$HOME/.local/bin/osv-scanner"
+EOF
+}
+
+setup_install_script_local() {
+  local machine="$1" target_tool="$2"
+  case "$target_tool" in
+    osv-scanner)
+      if command -v go >/dev/null 2>&1; then
+        go install github.com/google/osv-scanner/v2/cmd/osv-scanner@latest
+      else
+        install_osv_scanner_release_script | bash
+      fi
+      ;;
+    syft)
+      curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b "$HOME/.local/bin"
+      ;;
+    grype)
+      curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b "$HOME/.local/bin"
+      ;;
+    socket)
+      install_socket_cli_local
+      ;;
+    govulncheck)
+      command -v go >/dev/null 2>&1 && go install golang.org/x/vuln/cmd/govulncheck@latest || true
+      ;;
+    cargo-audit)
+      command -v cargo >/dev/null 2>&1 && cargo install cargo-audit || true
+      ;;
+    pip-audit)
+      command -v pip >/dev/null 2>&1 && pip install pip-audit --break-system-packages || true
+      ;;
+  esac
+}
+
+resolve_socket_cli_spec() {
+  local version="$SOCKET_CLI_VERSION"
+  if [[ "$version" == "latest" ]]; then
+    version=$(npm view "$SOCKET_CLI_PACKAGE@latest" version)
+  fi
+  printf '%s@%s' "$SOCKET_CLI_PACKAGE" "$version"
+}
+
+audit_socket_cli_in_temp_project() {
+  local spec="$1"
+  local scratch sbom osv_json grype_json
+  scratch=$(mktemp -d)
+  sbom="$scratch/socket.sbom.cdx.json"
+  osv_json="$scratch/osv.json"
+  grype_json="$scratch/grype.json"
+
+  (
+    cd "$scratch"
+    npm init -y >/dev/null
+    npm install --package-lock-only --ignore-scripts >/dev/null
+    npm audit --audit-level=moderate >/dev/null
+
+    npm install --package-lock-only --ignore-scripts "$spec" >/dev/null
+    npm audit --audit-level=moderate >/dev/null
+
+    osv-scanner scan --format json --lockfile=package-lock.json > "$osv_json"
+    if jq -e '[.results[]?.packages[]?.vulnerabilities[]?] | length == 0' "$osv_json" >/dev/null; then
+      :
+    else
+      printf 'OSV found vulnerabilities while auditing %s\n' "$spec" >&2
+      return 1
+    fi
+
+    npm ci --ignore-scripts >/dev/null
+    syft "dir:$scratch" -o cyclonedx-json > "$sbom"
+    grype "sbom:$sbom" -o json -q > "$grype_json"
+    if jq -e '[.matches[]?] | length == 0' "$grype_json" >/dev/null; then
+      :
+    else
+      printf 'Grype found vulnerabilities while auditing %s\n' "$spec" >&2
+      return 1
+    fi
+  )
+  local rc=$?
+  rm -rf "$scratch"
+  return "$rc"
+}
+
+install_socket_cli_local() {
+  command -v npm >/dev/null 2>&1 || die "npm is required to install Socket CLI"
+  command -v osv-scanner >/dev/null 2>&1 || die "osv-scanner is required to pre-audit Socket CLI"
+  command -v syft >/dev/null 2>&1 || die "syft is required to pre-audit Socket CLI"
+  command -v grype >/dev/null 2>&1 || die "grype is required to pre-audit Socket CLI"
+
+  local spec
+  spec=$(resolve_socket_cli_spec)
+  info "pre-auditing $spec in an isolated temp npm project"
+  audit_socket_cli_in_temp_project "$spec" || die "Socket CLI pre-audit failed; not installing globally"
+
+  info "installing $spec globally"
+  npm install -g --ignore-scripts "$spec"
+}
+
+copy_local_tool_to_remote() {
+  local machine="$1" tool="$2"
+  local host local_path
+  host=$(machine_host "$machine")
+  local_path=$(local_scanner_path "$tool")
+  [[ -n "$local_path" ]] || return 1
+  ssh_batch "$host" 'mkdir -p "$HOME/.local/bin"' >/dev/null
+  scp_batch -q "$local_path" "$host:.local/bin/$tool" >/dev/null 2>&1 || return 1
+  ssh_batch "$host" "chmod 0755 \$HOME/.local/bin/$tool" >/dev/null 2>&1 || true
+}
+
+create_scanner_bundle() {
+  local bundle_path="$1"
+  [[ -n "$bundle_path" ]] || bundle_path="$DEFAULT_SCANNER_BUNDLE_PATH"
+  local scratch bin_dir manifest
+  scratch=$(mktemp -d)
+  bin_dir="$scratch/bin"
+  manifest="$scratch/manifest.json"
+  mkdir -p "$bin_dir" "$(dirname "$bundle_path")"
+
+  local tools=(osv-scanner syft grype) tool local_path version_output entries=()
+  for tool in "${tools[@]}"; do
+    local_path=$(local_scanner_path "$tool")
+    [[ -n "$local_path" ]] || die "cannot create scanner bundle: $tool is not available locally"
+    install -m 0755 "$local_path" "$bin_dir/$tool"
+    version_output=$("$local_path" --version 2>&1 | head -n 1 || true)
+    entries+=("$(jq -n --arg name "$tool" --arg source "$local_path" --arg version "$version_output" '{name:$name, source:$source, version:$version}')")
+  done
+
+  jq -n \
+    --arg created "$(now_iso)" \
+    --arg host "$(hostname 2>/dev/null || printf unknown)" \
+    --slurpfile tools <(printf '%s\n' "${entries[@]}") '
+    {
+      created: $created,
+      host: $host,
+      format: "safe-audit-scanner-bundle-v1",
+      tools: $tools
+    }' > "$manifest"
+
+  tar -C "$scratch" -czf "$bundle_path" manifest.json bin
+  printf '%s\n' "$bundle_path"
+}
+
+resolve_scanner_bundle_path() {
+  local bundle_path="${1:-}"
+  case "$bundle_path" in
+    ""|latest)
+      printf '%s' "$DEFAULT_SCANNER_BUNDLE_PATH"
+      ;;
+    *)
+      printf '%s' "$bundle_path"
+      ;;
+  esac
+}
+
+verify_installed_scanners_local() {
+  local tool path version_output
+  for tool in osv-scanner syft grype; do
+    path=$(PATH="$BIN_DIR:$PATH" command -v "$tool" 2>/dev/null || true)
+    [[ -n "$path" ]] || die "bundle install verification failed: $tool not found"
+    version_output=$("$path" --version 2>&1 | head -n 1 || true)
+    info "verified $tool: $path ${version_output:+($version_output)}"
+  done
+}
+
+verify_installed_scanners_remote() {
+  local machine="$1" host
+  host=$(machine_host "$machine")
+  ssh_batch "$host" 'PATH="$HOME/.local/bin:$PATH"; for t in osv-scanner syft grype; do p=$(command -v "$t" || true); [ -n "$p" ] || exit 20; v=$("$p" --version 2>&1 | head -n 1 || true); printf "%s\t%s\t%s\n" "$t" "$p" "$v"; done' \
+    | while IFS=$'\t' read -r tool path version_output; do
+        info "verified $machine:$tool: $path ${version_output:+($version_output)}"
+      done
+}
+
+ensure_grype_db_for_machine() {
+  local machine="$1"
+  local grype
+  grype=$(tool_cache_path "$machine" "grype")
+  [[ -n "$grype" ]] || return 1
+
+  if machine_grype_db_healthy "$machine"; then
+    return 0
+  fi
+
+  info "$machine: updating Grype vulnerability database"
+  if ! run_machine_capture "$machine" "PATH=\"\$HOME/.local/bin:\$PATH\" $(printf '%q' "$grype") db update" >/dev/null; then
+    warn "$machine: Grype DB update failed"
+    return 1
+  fi
+
+  if machine_grype_db_healthy "$machine"; then
+    return 0
+  fi
+
+  warn "$machine: Grype DB is still unusable after update"
+  return 1
+}
+
+install_scanner_bundle_local() {
+  local bundle_path="$1"
+  [[ -f "$bundle_path" ]] || die "scanner bundle not found: $bundle_path"
+  mkdir -p "$BIN_DIR"
+  tar -xzf "$bundle_path" -C "$BIN_DIR" --strip-components=1 'bin/osv-scanner' 'bin/syft' 'bin/grype'
+  chmod 0755 "$BIN_DIR/osv-scanner" "$BIN_DIR/syft" "$BIN_DIR/grype" 2>/dev/null || true
+  verify_installed_scanners_local
+}
+
+install_scanner_bundle_remote() {
+  local machine="$1" bundle_path="$2"
+  [[ -f "$bundle_path" ]] || die "scanner bundle not found: $bundle_path"
+  local host remote_tmp
+  host=$(machine_host "$machine")
+  remote_tmp=$(ssh_batch "$host" 'tmp=$(mktemp -d); printf "%s" "$tmp"')
+  [[ -n "$remote_tmp" ]] || return 1
+  if ! scp_batch -q "$bundle_path" "$host:$remote_tmp/scanners.tar.gz"; then
+    ssh_batch "$host" "rm -rf $(printf '%q' "$remote_tmp")" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if ! ssh_batch "$host" "mkdir -p \"\$HOME/.local/bin\" && tar -xzf $(printf '%q' "$remote_tmp/scanners.tar.gz") -C \"\$HOME/.local/bin\" --strip-components=1 bin/osv-scanner bin/syft bin/grype && chmod 0755 \"\$HOME/.local/bin/osv-scanner\" \"\$HOME/.local/bin/syft\" \"\$HOME/.local/bin/grype\""; then
+    ssh_batch "$host" "rm -rf $(printf '%q' "$remote_tmp")" >/dev/null 2>&1 || true
+    return 1
+  fi
+  ssh_batch "$host" "rm -rf $(printf '%q' "$remote_tmp")" >/dev/null 2>&1 || true
+  verify_installed_scanners_remote "$machine"
+}
+
+setup_machine() {
+  local machine="$1" bundle_path="${2:-}" validate_after="${3:-1}" prompt_before_install="${4:-1}"
+  detect_machine_tools "$machine" 1
+
+  if [[ -n "$bundle_path" ]]; then
+    bundle_path=$(resolve_scanner_bundle_path "$bundle_path")
+    info "$machine: installing scanner bundle $bundle_path"
+    if [[ "$(machine_type "$machine")" == "local" ]]; then
+      install_scanner_bundle_local "$bundle_path"
+    else
+      install_scanner_bundle_remote "$machine" "$bundle_path" || die "$machine: scanner bundle install failed"
+    fi
+    detect_machine_tools "$machine" 1
+  fi
+
+  local desired=()
+  mapfile -t desired < <(required_tools_for_machine "$machine")
+
+  local missing=() tool
+  for tool in "${desired[@]}"; do
+    [[ -n "$(tool_cache_path "$machine" "$tool")" ]] || missing+=("$tool")
+  done
+
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    info "$machine: required tools already present"
+  else
+    printf '[safe-audit] %s missing: %s\n' "$machine" "${missing[*]}"
+    if [[ "$prompt_before_install" == "1" ]] && is_tty; then
+      printf 'Proceed with install on %s? [y/N] ' "$machine" >&2
+      local answer
+      answer=$(read_prompt_answer)
+      case "$answer" in
+        y|Y|yes) ;;
+        *) warn "skipping setup for $machine"; return 0 ;;
+      esac
+    fi
+
+    if [[ "$(machine_type "$machine")" == "local" ]]; then
+      for tool in "${missing[@]}"; do
+        setup_install_script_local "$machine" "$tool"
+      done
+    else
+      local host
+      host=$(machine_host "$machine")
+      for tool in "${missing[@]}"; do
+        case "$tool" in
+          osv-scanner)
+            if ! ssh_batch "$host" "bash -lc $(printf '%q' '
+if command -v go >/dev/null 2>&1; then
+  go install github.com/google/osv-scanner/v2/cmd/osv-scanner@latest
+else
+  '"$(install_osv_scanner_release_script)"'
+fi
+')"; then
+              warn "$machine: remote install failed for $tool, trying local binary copy"
+              copy_local_tool_to_remote "$machine" "$tool" || { warn "$machine: local binary copy failed for $tool"; return 1; }
+            fi
+            ;;
+          syft|grype)
+            if ! ssh_batch "$host" "bash -lc $(printf '%q' "set -o pipefail; mkdir -p \"\$HOME/.local/bin\" && curl -sSfL https://raw.githubusercontent.com/anchore/$tool/main/install.sh | sh -s -- -b \"\$HOME/.local/bin\"")"; then
+              warn "$machine: remote install failed for $tool, trying local binary copy"
+              copy_local_tool_to_remote "$machine" "$tool" || { warn "$machine: local binary copy failed for $tool"; return 1; }
+            fi
+            ;;
+          socket)
+            warn "$machine: Socket CLI is required only on local check machines; skipping remote install"
+            ;;
+        esac
+      done
+    fi
+  fi
+
+  detect_machine_tools "$machine" 1
+  local still_missing
+  still_missing=$(machine_missing_tools_from_list "$machine" "${desired[@]}")
+  if [[ -n "$still_missing" ]]; then
+    warn "$machine: setup failed; still missing: $still_missing"
+    return 1
+  fi
+  ensure_grype_db_for_machine "$machine" || return 1
+  [[ "$validate_after" == "1" ]] || return 0
+
+  local validate_target
+  if [[ "$(machine_type "$machine")" == "local" ]]; then
+    validate_target="${SAFE_AUDIT_SETUP_VALIDATE_PATH:-$PWD}"
+  else
+    validate_target="${SAFE_AUDIT_SETUP_VALIDATE_PATH:-$HOME}"
+  fi
+  scan_machine "$machine" "$validate_target"
+}
+
+diff_command() {
+  local since="" project_target=""
+  local args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --since)
+        [[ $# -lt 2 ]] && die "--since requires a duration"
+        since="$2"
+        shift 2
+        ;;
+      --project)
+        [[ $# -lt 2 ]] && die "--project requires a path"
+        project_target="$2"
+        shift 2
+        ;;
+      --all|--machine)
+        args+=("$1")
+        if [[ "$1" == "--machine" ]]; then
+          [[ $# -lt 2 ]] && die "--machine requires a comma-separated list"
+          args+=("$2")
+          shift
+        fi
+        shift
+        ;;
+      *)
+        die "unknown diff flag: $1"
+        ;;
+    esac
+  done
+  parse_machine_targets default "${args[@]}"
+  local machine
+  for machine in "${MACHINE_TARGETS[@]}"; do
+    local latest previous
+    latest=$(find "$SBOM_DIR/$machine" -maxdepth 1 -type f -name '*-sbom.cdx.json' 2>/dev/null | sort | tail -n 1 || true)
+    if [[ -z "$latest" ]]; then
+      scan_machine "$machine" "${project_target:-$DEFAULT_SCAN_ROOT}"
+      latest=$(find "$SBOM_DIR/$machine" -maxdepth 1 -type f -name '*-sbom.cdx.json' 2>/dev/null | sort | tail -n 1 || true)
+    fi
+    previous=$(select_previous_sbom "$machine" "$latest" "$since")
+    if [[ -z "$previous" ]]; then
+      if [[ -n "$since" ]]; then
+        warn "$machine: no previous SBOM at or before --since $since"
+      else
+        warn "$machine: no previous SBOM to diff"
+      fi
+      continue
+    fi
+    local added removed changed current_result previous_result new_cves host_allow_changes
+    added=$(jq -n --slurpfile prev "$previous" --slurpfile cur "$latest" '
+      ([($cur[0].components[]? | "\(.name)@\(.version // "unknown")")] - [($prev[0].components[]? | "\(.name)@\(.version // "unknown")")]) | length
+    ')
+    removed=$(jq -n --slurpfile prev "$previous" --slurpfile cur "$latest" '
+      ([($prev[0].components[]? | "\(.name)@\(.version // "unknown")")] - [($cur[0].components[]? | "\(.name)@\(.version // "unknown")")]) | length
+    ')
+    changed=$(jq -n --slurpfile prev "$previous" --slurpfile cur "$latest" '
+      ($prev[0].components // []) as $p |
+      ($cur[0].components // []) as $c |
+      [
+        $c[]? as $cur_item |
+        ($p[]? | select(.name == $cur_item.name) | .version) as $prev_ver |
+        select($prev_ver != null and $prev_ver != ($cur_item.version // "unknown")) |
+        "\($cur_item.name): \($prev_ver) -> \($cur_item.version // "unknown")"
+      ] | unique
+    ')
+    current_result=$(scan_result_path_for "$machine" "$(basename "$latest" | sed 's/-sbom\.cdx\.json$//')")
+    previous_result=$(scan_result_path_for "$machine" "$(basename "$previous" | sed 's/-sbom\.cdx\.json$//')")
+    if [[ -f "$current_result" && -f "$previous_result" ]]; then
+      new_cves=$(jq -n --slurpfile prev "$previous_result" --slurpfile cur "$current_result" '
+        ([ $cur[0].cve_scan.findings[]?.id ] - [ $prev[0].cve_scan.findings[]?.id ]) | unique
+      ')
+    else
+      new_cves='[]'
+    fi
+    if [[ -f "$HOST_ALLOW_LOG" ]]; then
+      local cutoff_epoch
+      cutoff_epoch=$(file_epoch "$previous")
+      host_allow_changes=$(jq -s --argjson cutoff "$cutoff_epoch" '
+        map(select(.timestamp?)) |
+        map(select((.timestamp | strptime("%Y-%m-%dT%H:%M:%S%z") | mktime) >= $cutoff))
+      ' "$HOST_ALLOW_LOG" 2>/dev/null || printf '[]')
+    else
+      host_allow_changes='[]'
+    fi
+    printf '=== SAFE-AUDIT DIFF - %s ===\n' "$machine"
+    printf 'Current:  %s\n' "$latest"
+    printf 'Previous: %s\n' "$previous"
+    printf 'Added:    %s\n' "$added"
+    printf 'Removed:  %s\n' "$removed"
+    printf 'Changed:  %s\n' "$(jq 'length' <<<"$changed")"
+    if [[ "$(jq 'length' <<<"$changed")" -gt 0 ]]; then
+      jq -r '.[] | "  - " + .' <<<"$changed"
+    fi
+    printf 'New CVEs: %s\n' "$(jq 'length' <<<"$new_cves")"
+    if [[ "$(jq 'length' <<<"$new_cves")" -gt 0 ]]; then
+      jq -r '.[] | "  - " + .' <<<"$new_cves"
+    fi
+    if [[ "$(jq 'length' <<<"$host_allow_changes")" -gt 0 ]]; then
+      printf 'Host-allow installs since previous snapshot:\n'
+      jq -r '.[] | "  - \(.timestamp) \(.runner) \(.package)@\(.version)"' <<<"$host_allow_changes"
+    fi
+    printf '\n'
+  done
+}
+
+scan_command() {
+  local project_target=""
+  local args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project)
+        [[ $# -lt 2 ]] && die "--project requires a path"
+        project_target="$2"
+        shift 2
+        ;;
+      --all|--machine)
+        args+=("$1")
+        if [[ "$1" == "--machine" ]]; then
+          [[ $# -lt 2 ]] && die "--machine requires a comma-separated list"
+          args+=("$2")
+          shift
+        fi
+        shift
+        ;;
+      *)
+        die "unknown scan flag: $1"
+        ;;
+    esac
+  done
+  parse_machine_targets default "${args[@]}"
+  local machine
+  for machine in "${MACHINE_TARGETS[@]}"; do
+    info "scan: starting $machine"
+    scan_machine "$machine" "$project_target" || return 1
+    info "scan: finished $machine"
+  done
+}
+
+setup_command() {
+  local args=()
+  local positional="" bundle_path="" create_bundle_path=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --bundle)
+        [[ $# -lt 2 ]] && die "--bundle requires a scanner bundle path"
+        bundle_path="$2"
+        shift 2
+        ;;
+      --create-bundle)
+        if [[ $# -ge 2 && "$2" != -* ]]; then
+          create_bundle_path="$2"
+          shift 2
+        else
+          create_bundle_path="$DEFAULT_SCANNER_BUNDLE_PATH"
+          shift
+        fi
+        ;;
+      --all|--machine)
+        args+=("$1")
+        if [[ "$1" == "--machine" ]]; then
+          [[ $# -lt 2 ]] && die "--machine requires a comma-separated list"
+          args+=("$2")
+          shift
+        fi
+        shift
+        ;;
+      -*)
+        die "unknown setup flag: $1"
+        ;;
+      *)
+        positional="$1"
+        shift
+      ;;
+    esac
+  done
+  if [[ -n "$create_bundle_path" ]]; then
+    [[ -z "$positional" && "${#args[@]}" -eq 0 && -z "$bundle_path" ]] || die "--create-bundle cannot be combined with machine targets or --bundle"
+    create_scanner_bundle "$(resolve_scanner_bundle_path "$create_bundle_path")"
+    return 0
+  fi
+  if [[ -n "$positional" ]]; then
+    MACHINE_TARGETS=("$positional")
+  else
+    parse_machine_targets default "${args[@]}"
+  fi
+  local machine
+  for machine in "${MACHINE_TARGETS[@]}"; do
+    setup_machine "$machine" "$bundle_path"
+  done
+}
+
+cmd_status() {
+  local machine_count local_count ssh_count scanners last_scan last_machine
+
+  machine_count=$(jq '.machines | length' "$MACHINES_FILE" 2>/dev/null || printf '0')
+  local_count=$(jq '[.machines[] | select(.type == "local")] | length' "$MACHINES_FILE" 2>/dev/null || printf '0')
+  ssh_count=$(jq '[.machines[] | select(.type == "ssh")] | length' "$MACHINES_FILE" 2>/dev/null || printf '0')
+  scanners=$(jq -r '[to_entries[]? | .value | objects | to_entries[] | select(.value != null) | .key] | unique | join(", ")' "$TOOLS_FILE" 2>/dev/null || true)
+  [[ -n "$scanners" ]] || scanners="none detected"
+
+  last_scan=""
+  last_machine=""
+  if [[ -d "$RESULTS_DIR" ]]; then
+    local latest
+    latest=$(find "$RESULTS_DIR" -type f -name '*.json' -printf '%T@\t%p\n' 2>/dev/null | sort -nr | head -n 1 | cut -f2- || true)
+    if [[ -n "$latest" ]]; then
+      last_scan=$(basename "$latest" | sed -E 's/^([0-9]{4}-[0-9]{2}-[0-9]{2}).*/\1/')
+      last_machine=$(basename "$(dirname "$latest")")
+    fi
+  fi
+  [[ -n "$last_scan" ]] || last_scan="none"
+
+  echo "safe-audit $SAFE_AUDIT_VERSION"
+  echo "config: $CONFIG_DIR"
+  echo "data:   $DATA_DIR"
+  echo
+  printf "machines:       %d (%d local, %d ssh)\n" "$machine_count" "$local_count" "$ssh_count"
+  printf "scanners:       %s\n" "$scanners"
+  if [[ -n "$last_machine" ]]; then
+    printf "last scan:      %s (%s)\n" "$last_scan" "$last_machine"
+  else
+    printf "last scan:      %s\n" "$last_scan"
+  fi
+}
+
+show_usage() {
+  cat <<'EOF'
+safe-audit: multi-machine audit tooling
+
+USAGE
+  safe-audit capabilities [--json]
+  safe-audit scan [--project <path>] [--all | --machine <csv>]
+  safe-audit check <pkg>@<version> [--ecosystem <name>] [--json]
+  safe-audit release github --repo OWNER/REPO --version TAG --asset NAME [--json]
+  safe-audit vuln github-release --repo OWNER/REPO --version TAG [--json]
+  safe-audit verify release-asset --artifact PATH --checksum PATH [--certificate PATH --signature PATH --certificate-identity-regexp REGEX --certificate-oidc-issuer URL] [--require-signature] [--json]
+  safe-audit verify sigstore-bundle --artifact PATH --bundle PATH --identity VALUE --oidc-issuer URL [--json]
+  safe-audit verify tuf-bootstrap --mirror PATH --root PATH --root-checksum SHA256 --target NAME=PATH [--target NAME=PATH ...] [--json]
+  safe-audit binary exec PATH [--timeout SECONDS] [--json] -- [ARGS...]
+  safe-audit ioc <identifier> [--all | --machine <csv>]
+  safe-audit ioc --list <ioc.json> [--all | --machine <csv>]
+  safe-audit ioc --update [--since <duration>] [--all | --machine <csv>]
+  safe-audit setup [<machine> | --all | --machine <csv>] [--bundle <scanners.tar.gz|latest>]
+  safe-audit setup --create-bundle [<scanners.tar.gz>]
+  safe-audit diff [--all | --machine <csv>] [--since <duration>]
+  safe-audit status
+
+FILES
+  ~/.config/safe/audit/machines.json
+  ~/.config/safe/audit/tools.json
+  ~/.local/share/safe/audit/results/
+  ~/.local/share/safe/audit/sbom/
+  ~/.local/share/safe/audit/checks/
+  ~/.local/share/safe/audit/ioc/
+  ~/.local/share/safe/audit/tool-bundles/scanners.tar.gz
+EOF
+}
+
+main() {
+  ensure_dependencies
+  local cmd="${1:-}"
+  case "$cmd" in
+    capabilities)
+      shift
+      capabilities_command "$@"
+      return 0
+      ;;
+  esac
+  if [[ "$SAFE_AUDIT_NO_INIT" != "1" ]]; then
+    ensure_dirs
+  fi
+  case "$cmd" in
+    scan) shift; scan_command "$@" ;;
+    check) shift; check_command "$@" ;;
+    release) shift; cmd_release "$@" ;;
+    vuln) shift; cmd_vuln "$@" ;;
+    verify) shift; cmd_verify "$@" ;;
+    binary) shift; cmd_binary "$@" ;;
+    ioc) shift; ioc_command "$@" ;;
+    setup) shift; setup_command "$@" ;;
+    diff) shift; diff_command "$@" ;;
+    status) shift; cmd_status "$@" ;;
+    --help|-h|"") show_usage ;;
+    --version|-v) printf 'safe-audit %s\n' "$SAFE_AUDIT_VERSION" ;;
+    *)
+      die "unknown command: $cmd"
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  install_process_cleanup_traps
+fi
+
+main "$@"

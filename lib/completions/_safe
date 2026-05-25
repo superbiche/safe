@@ -1,0 +1,127 @@
+#compdef safe safe-npx safe-bunx safe-uvx safe-pipx-run
+
+local curcontext="$curcontext" state line
+typeset -A opt_args
+
+_safe_machines() {
+  local machines_file="${SAFE_CONFIG_DIR:-$HOME/.config/safe}/audit/machines.json"
+  [[ -r "$machines_file" ]] || return 0
+  jq -r '.machines | keys_unsorted[]' "$machines_file" 2>/dev/null
+}
+
+_safe_run() {
+  local -a run_cmds host_allow_cmds block_cmds opts
+  local subcmd="${words[3]:-}"
+  run_cmds=(host-allow block link unlink audit status install version help)
+  host_allow_cmds=(add list remove update)
+  block_cmds=(add list remove import)
+  opts=(--strict --node22 --py312 --proxy --allow-write --allow-network --allow-secrets --yes -h --help --version)
+
+  case "$subcmd" in
+    host-allow)
+      _describe -t commands 'host-allow command' host_allow_cmds
+      ;;
+    block)
+      _describe -t commands 'block command' block_cmds
+      ;;
+    *)
+      _alternative \
+        'commands:command:_describe -t commands "safe-run command" run_cmds' \
+        'options:option:_describe -t options "safe-run option" opts' \
+        'packages:package:_message package'
+      ;;
+  esac
+}
+
+_safe_audit() {
+  local -a audit_cmds scan_opts check_opts capabilities_opts ioc_opts release_subcmds vuln_subcmds verify_subcmds binary_subcmds
+  local -a release_github_opts vuln_github_release_opts verify_release_asset_opts verify_sigstore_bundle_opts verify_tuf_bootstrap_opts binary_exec_opts
+  local subcmd="${words[3]:-}"
+  local nested="${words[4]:-}"
+  audit_cmds=(scan check release vuln verify binary ioc setup diff status capabilities)
+  scan_opts=(--all --machine --project)
+  check_opts=(--ecosystem --json)
+  capabilities_opts=(--json)
+  ioc_opts=(--all --machine --list --update --since)
+  release_subcmds=(github)
+  vuln_subcmds=(github-release)
+  verify_subcmds=(release-asset sigstore-bundle tuf-bootstrap)
+  binary_subcmds=(exec)
+  release_github_opts=(--repo --version --asset --json)
+  vuln_github_release_opts=(--repo --version --json)
+  verify_release_asset_opts=(--artifact --checksum --certificate --signature --certificate-identity-regexp --certificate-oidc-issuer --require-signature --json)
+  verify_sigstore_bundle_opts=(--artifact --bundle --identity --oidc-issuer --json)
+  verify_tuf_bootstrap_opts=(--mirror --root --root-checksum --target --json)
+  binary_exec_opts=(--timeout --json)
+
+  case "$subcmd" in
+    scan) _describe -t options 'scan option' scan_opts ;;
+    check) _alternative 'options:option:_describe -t options "check option" check_opts' 'packages:package:_message package' ;;
+    capabilities) _describe -t options 'capabilities option' capabilities_opts ;;
+    release)
+      case "$nested" in
+        github) _alternative 'options:option:_describe -t options "release github option" release_github_opts' 'values:value:_message value' ;;
+        *) _describe -t commands 'release command' release_subcmds ;;
+      esac
+      ;;
+    vuln)
+      case "$nested" in
+        github-release) _alternative 'options:option:_describe -t options "vuln github-release option" vuln_github_release_opts' 'values:value:_message value' ;;
+        *) _describe -t commands 'vuln command' vuln_subcmds ;;
+      esac
+      ;;
+    verify)
+      case "$nested" in
+        release-asset) _alternative 'options:option:_describe -t options "verify release-asset option" verify_release_asset_opts' 'values:value:_message value' ;;
+        sigstore-bundle) _alternative 'options:option:_describe -t options "verify sigstore-bundle option" verify_sigstore_bundle_opts' 'values:value:_message value' ;;
+        tuf-bootstrap) _alternative 'options:option:_describe -t options "verify tuf-bootstrap option" verify_tuf_bootstrap_opts' 'values:value:_message value' ;;
+        *) _describe -t commands 'verify command' verify_subcmds ;;
+      esac
+      ;;
+    binary)
+      case "$nested" in
+        exec) _alternative 'options:option:_describe -t options "binary exec option" binary_exec_opts' 'files:file:_files' ;;
+        *) _describe -t commands 'binary command' binary_subcmds ;;
+      esac
+      ;;
+    ioc) _alternative 'options:option:_describe -t options "ioc option" ioc_opts' 'identifiers:identifier:_message "CVE or GHSA ID"' ;;
+    setup) _alternative 'options:option:_values "setup option" --all --machine --bundle --create-bundle' 'machines:machine:_safe_machines' ;;
+    *) _describe -t commands 'safe-audit command' audit_cmds ;;
+  esac
+}
+
+_safe_top() {
+  local -a commands
+  commands=(
+    'run:run a package through safe-run'
+    'audit:scan/check dependencies and machines'
+    'install:install a package through safe-run install'
+    'status:show consolidated status'
+    'doctor:show local readiness diagnostics'
+    'setup:setup safe-audit scanners'
+    'version:show versions'
+    'help:show help'
+  )
+  _describe -t commands 'safe command' commands
+}
+
+case "${words[2]:-}" in
+  run)
+    _safe_run
+    ;;
+  audit)
+    _safe_audit
+    ;;
+  install)
+    _alternative 'options:option:_values "install option" --allow-scripts' 'packages:package:_message package'
+    ;;
+  doctor)
+    _describe -t options 'doctor option' '--json'
+    ;;
+  setup)
+    _alternative 'options:option:_values "setup option" --all --machine --bundle --create-bundle' 'machines:machine:_safe_machines'
+    ;;
+  *)
+    _safe_top
+    ;;
+esac

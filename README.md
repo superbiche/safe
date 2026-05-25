@@ -1,0 +1,66 @@
+# safe
+
+`safe` is a Bash toolkit for safer package execution, dependency auditing, and guarded installs. It provides `safe-run`, `safe-audit`, and persistent install wrappers behind one dispatcher, one installer, one config tree, and one zsh completion entry point.
+
+## Quick Start
+
+```bash
+git clone <repo-url> safe
+cd safe
+safe audit scan --project .
+bash install.sh
+safe-run link
+safe audit setup
+safe status
+```
+
+If `safe` is not already available on the machine, inspect the clone and run
+equivalent local scanners before installing. This project is not exempt from its
+own zero-trust model: clone it, scan it, then install it.
+
+The installer is idempotent. Reruns refresh binaries and wrappers while preserving existing config and audit data.
+
+## Core Commands
+
+```bash
+safe run repomix@latest -- --help
+safe audit scan --project .
+safe audit check left-pad@1.3.0 --ecosystem npm
+safe install --allow-scripts cowsay@1.6.0
+safe setup
+safe doctor --json
+```
+
+`safe-run` protects ad hoc package execution. `safe-audit` scans projects, machines, releases, binaries, and IOCs. The install wrappers shadow package-manager install commands in zsh and call `safe-audit` before delegation.
+
+## Requirements
+
+Required: Bash 5+, `jq`, and zsh.
+
+Recommended: Podman for sandboxed execution, Go for scanner installs, `curl`, `tar`, `ssh`, and scanner binaries such as `osv-scanner`, `grype`, `syft`, `govulncheck`, and `cosign`.
+
+Run:
+
+```bash
+safe doctor
+```
+
+to see the local readiness of sandbox, audit, verifier, and wrapper features.
+
+## Documentation
+
+Full MkDocs-ready documentation lives in [`docs/`](docs/index.md).
+
+Build or serve it with MkDocs when available:
+
+```bash
+scripts/docs build
+scripts/docs serve
+```
+
+Versioned GitHub Pages publishing is documented in
+[`docs/publishing.md`](docs/publishing.md).
+
+## Status
+
+This is personal security tooling. It is designed to fail closed in the most sensitive paths, but it is not a substitute for reviewing what a package, binary, or installer will do on your machine.

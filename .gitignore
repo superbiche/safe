@@ -1,0 +1,10 @@
+*.log
+*.tmp
+tmp/
+test-output/
+.cache/
+coverage/
+site/
+config/run/*.json
+config/audit/*.json
+!config/seed/**/*.json
