@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DIST="$ROOT/dist"
+PROJECT="safe"
+
+usage() {
+  cat >&2 <<'EOF'
+usage: scripts/release <command>
+
+commands:
+  check             validate release metadata and required tools
+  package           create dist/safe-vX.Y.Z.tar.gz and dist/SHA256SUMS
+  sign-checksums    sign dist/SHA256SUMS with cosign
+  verify-checksums  verify dist/SHA256SUMS
+  verify-signature  verify dist/SHA256SUMS.sigstore.json with cosign
+
+environment:
+  COSIGN_VERIFY_ARGS  required identity and issuer args for cosign verify-blob
+EOF
+}
+
+version() {
+  tr -d '[:space:]' < "$ROOT/VERSION"
+}
+
+tag() {
+  printf 'v%s' "$(version)"
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    printf 'missing required command: %s\n' "$1" >&2
+    exit 1
+  }
+}
+
+check_version_sync() {
+  local v
+  v="$(version)"
+  grep -q "SAFE_VERSION=\"$v\"" "$ROOT/bin/safe" || {
+    printf 'VERSION does not match bin/safe SAFE_VERSION\n' >&2
+    exit 1
+  }
+}
+
+require_clean_worktree() {
+  git -C "$ROOT" diff --quiet --ignore-submodules -- || {
+    printf 'working tree has unstaged changes; commit before packaging\n' >&2
+    exit 1
+  }
+  git -C "$ROOT" diff --cached --quiet --ignore-submodules -- || {
+    printf 'index has staged changes; commit before packaging\n' >&2
+    exit 1
+  }
+}
+
+require_release_tag_at_head() {
+  local t head tagged
+  t="$(tag)"
+  git -C "$ROOT" rev-parse -q --verify "refs/tags/$t" >/dev/null || {
+    printf 'missing release tag: %s\n' "$t" >&2
+    printf 'create it with: git tag -s %s -m "%s"\n' "$t" "$t" >&2
+    exit 1
+  }
+  head="$(git -C "$ROOT" rev-parse HEAD)"
+  tagged="$(git -C "$ROOT" rev-parse "$t^{}")"
+  [[ "$head" == "$tagged" ]] || {
+    printf 'release tag %s does not point at HEAD\n' "$t" >&2
+    exit 1
+  }
+}
+
+cmd_check() {
+  require_cmd git
+  require_cmd tar
+  require_cmd sha256sum
+  check_version_sync
+  [[ -s "$ROOT/CHANGELOG.md" ]] || {
+    printf 'CHANGELOG.md is missing or empty\n' >&2
+    exit 1
+  }
+  printf '%s %s\n' "$PROJECT" "$(version)"
+}
+
+cmd_package() {
+  cmd_check >/dev/null
+  require_clean_worktree
+  require_release_tag_at_head
+  mkdir -p "$DIST"
+  rm -f "$DIST/$PROJECT-$(tag).tar" "$DIST/$PROJECT-$(tag).tar.gz" "$DIST/SHA256SUMS"
+
+  git -C "$ROOT" archive \
+    --format=tar \
+    --prefix="$PROJECT-$(tag)/" \
+    --output="$DIST/$PROJECT-$(tag).tar" \
+    "$(tag)"
+
+  gzip -n -9 "$DIST/$PROJECT-$(tag).tar"
+
+  (
+    cd "$DIST"
+    sha256sum "$PROJECT-$(tag).tar.gz" > SHA256SUMS
+  )
+
+  printf 'created %s\n' "$DIST/$PROJECT-$(tag).tar.gz"
+  printf 'created %s\n' "$DIST/SHA256SUMS"
+}
+
+cmd_sign_checksums() {
+  require_cmd cosign
+  [[ -f "$DIST/SHA256SUMS" ]] || {
+    printf 'missing %s; run scripts/release package first\n' "$DIST/SHA256SUMS" >&2
+    exit 1
+  }
+  cosign sign-blob \
+    --bundle "$DIST/SHA256SUMS.sigstore.json" \
+    "$DIST/SHA256SUMS"
+  printf 'created %s\n' "$DIST/SHA256SUMS.sigstore.json"
+}
+
+cmd_verify_checksums() {
+  [[ -f "$DIST/SHA256SUMS" ]] || {
+    printf 'missing %s\n' "$DIST/SHA256SUMS" >&2
+    exit 1
+  }
+  (cd "$DIST" && sha256sum -c SHA256SUMS)
+}
+
+cmd_verify_signature() {
+  require_cmd cosign
+  [[ -f "$DIST/SHA256SUMS" && -f "$DIST/SHA256SUMS.sigstore.json" ]] || {
+    printf 'missing signed checksum files in %s\n' "$DIST" >&2
+    exit 1
+  }
+  [[ -n "${COSIGN_VERIFY_ARGS:-}" ]] || {
+    printf 'COSIGN_VERIFY_ARGS is required for keyless verification\n' >&2
+    printf 'example: COSIGN_VERIFY_ARGS="--certificate-identity-regexp ... --certificate-oidc-issuer ..."\n' >&2
+    exit 2
+  }
+  # shellcheck disable=SC2206
+  local verify_args=(${COSIGN_VERIFY_ARGS:-})
+  cosign verify-blob \
+    --bundle "$DIST/SHA256SUMS.sigstore.json" \
+    "${verify_args[@]}" \
+    "$DIST/SHA256SUMS"
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  check) cmd_check ;;
+  package) cmd_package ;;
+  sign-checksums) cmd_sign_checksums ;;
+  verify-checksums) cmd_verify_checksums ;;
+  verify-signature) cmd_verify_signature ;;
+  -h|--help|help|"") usage ;;
+  *) usage; exit 2 ;;
+esac
