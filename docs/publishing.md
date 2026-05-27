@@ -1,5 +1,75 @@
 # Publishing
 
+## Release Artifacts
+
+`safe` releases are manual until the release process is proven. A release must
+be consumer-verifiable before it is published.
+
+Release baseline:
+
+- signed annotated tag `vX.Y.Z`;
+- immutable GitHub Release;
+- `safe-vX.Y.Z.tar.gz`;
+- `SHA256SUMS`;
+- `SHA256SUMS.sigstore.json`.
+
+Prepare release metadata and commit it:
+
+```bash
+scripts/release check
+git add VERSION CHANGELOG.md
+git commit -m "Release vX.Y.Z"
+```
+
+Create the signed tag:
+
+```bash
+git tag -s vX.Y.Z -m "vX.Y.Z"
+```
+
+Create release assets from the signed tag:
+
+```bash
+scripts/release package
+```
+
+Sign the checksum file:
+
+```bash
+scripts/release sign-checksums
+```
+
+Verify local outputs:
+
+```bash
+scripts/release verify-checksums
+COSIGN_VERIFY_ARGS="--certificate-identity-regexp REGEXP --certificate-oidc-issuer ISSUER" \
+  scripts/release verify-signature
+```
+
+Upload these release assets:
+
+```text
+dist/safe-vX.Y.Z.tar.gz
+dist/SHA256SUMS
+dist/SHA256SUMS.sigstore.json
+```
+
+Release notes must include checksum and signature verification commands:
+
+```bash
+sha256sum -c SHA256SUMS
+cosign verify-blob \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp REGEXP \
+  --certificate-oidc-issuer ISSUER \
+  SHA256SUMS
+```
+
+CI provenance is not claimed for manual releases.
+
+## Documentation
+
 The docs are built with MkDocs and published to GitHub Pages with Mike. Mike
 keeps multiple versions on the `gh-pages` branch and writes the `versions.json`
 metadata that the `superbiche` theme uses for its version selector.

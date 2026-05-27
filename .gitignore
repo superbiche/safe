@@ -5,6 +5,10 @@ test-output/
 .cache/
 coverage/
 site/
+dist/
+PROGRESS.md
+inbox/private/
+inbox/tmp/
 config/run/*.json
 config/audit/*.json
 !config/seed/**/*.json
