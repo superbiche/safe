@@ -21,6 +21,7 @@ USAGE
   safe run <args...>
   safe audit <args...>
   safe install [--allow-scripts] <pkg> [...]
+  safe vendor update --name NAME --path PATH --reason TEXT -- COMMAND...
   safe setup [<machine> | --all | --machine <csv>]
   safe status
   safe doctor [--json]
@@ -51,6 +52,133 @@ cmd_status() {
     echo "wrappers:       installed"
   else
     echo "wrappers:       not installed"
+  fi
+}
+
+sha256_file_or_null() {
+  local path="$1"
+  if [[ -f "$path" ]]; then
+    sha256sum "$path" | awk '{print $1}'
+  else
+    printf 'null'
+  fi
+}
+
+version_output_json() {
+  local path="$1" version_args="$2"
+  if [[ -z "$version_args" || ! -x "$path" ]]; then
+    jq -n 'null'
+    return
+  fi
+
+  # shellcheck disable=SC2206
+  local args=($version_args)
+  local output="" rc=0
+  set +e
+  output="$("$path" "${args[@]}" 2>&1 | head -n 1)"
+  rc=$?
+  set -e
+
+  jq -n --arg output "$output" --argjson rc "$rc" '{exit_code:$rc, output:$output}'
+}
+
+cmd_vendor() {
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    update) cmd_vendor_update "$@" ;;
+    -h|--help|help|"") cat <<'EOF'
+usage: safe vendor update --name NAME --path PATH --reason TEXT [--rollback TEXT] [--version-cmd ARGS] -- COMMAND...
+
+Runs a vendor-native update command while recording before/after binary hashes
+under ~/.local/share/safe/vendor/audit.log.
+EOF
+      ;;
+    *) die "unknown vendor subcommand: ${sub:-}" ;;
+  esac
+}
+
+cmd_vendor_update() {
+  local name="" path="" reason="" rollback="" version_cmd=""
+  local -a update_cmd=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) name="${2:-}"; shift 2 ;;
+      --name=*) name="${1#--name=}"; shift ;;
+      --path) path="${2:-}"; shift 2 ;;
+      --path=*) path="${1#--path=}"; shift ;;
+      --reason) reason="${2:-}"; shift 2 ;;
+      --reason=*) reason="${1#--reason=}"; shift ;;
+      --rollback) rollback="${2:-}"; shift 2 ;;
+      --rollback=*) rollback="${1#--rollback=}"; shift ;;
+      --version-cmd) version_cmd="${2:-}"; shift 2 ;;
+      --version-cmd=*) version_cmd="${1#--version-cmd=}"; shift ;;
+      --)
+        shift
+        update_cmd=("$@")
+        break
+        ;;
+      *) die "unknown vendor update flag: $1" ;;
+    esac
+  done
+
+  [[ -n "$name" ]] || die "vendor update requires --name"
+  [[ -n "$path" ]] || die "vendor update requires --path"
+  [[ -n "$reason" ]] || die "vendor update requires --reason"
+  [[ ${#update_cmd[@]} -gt 0 ]] || die "vendor update requires -- COMMAND..."
+
+  local resolved_path before_sha after_sha before_version_json after_version_json log_dir log_file timestamp rc
+  resolved_path="$(readlink -f "$path" 2>/dev/null || printf '%s' "$path")"
+  before_sha="$(sha256_file_or_null "$resolved_path")"
+  before_version_json="$(version_output_json "$resolved_path" "$version_cmd")"
+
+  set +e
+  "${update_cmd[@]}"
+  rc=$?
+  set -e
+
+  after_sha="$(sha256_file_or_null "$resolved_path")"
+  after_version_json="$(version_output_json "$resolved_path" "$version_cmd")"
+  timestamp="$(date -Iseconds)"
+  log_dir="$SAFE_DATA_ROOT/vendor"
+  log_file="$log_dir/audit.log"
+  mkdir -p "$log_dir"
+
+  jq -c -n \
+    --arg timestamp "$timestamp" \
+    --arg name "$name" \
+    --arg path "$resolved_path" \
+    --arg before_sha "$before_sha" \
+    --arg after_sha "$after_sha" \
+    --arg reason "$reason" \
+    --arg rollback "$rollback" \
+    --argjson before_version "$before_version_json" \
+    --argjson after_version "$after_version_json" \
+    --argjson exit_code "$rc" \
+    '{
+      timestamp: $timestamp,
+      name: $name,
+      path: $path,
+      reason: $reason,
+      rollback: (if $rollback == "" then null else $rollback end),
+      command: $ARGS.positional,
+      exit_code: $exit_code,
+      before: {sha256: (if $before_sha == "null" then null else $before_sha end), version: $before_version},
+      after: {sha256: (if $after_sha == "null" then null else $after_sha end), version: $after_version}
+    }' \
+    --args "${update_cmd[@]}" >> "$log_file"
+
+  if [[ "$rc" -ne 0 ]]; then
+    err "vendor update command exited $rc; audit log: $log_file"
+    return "$rc"
+  fi
+
+  if [[ "$before_sha" == "$after_sha" ]]; then
+    err "vendor update completed; tracked binary hash unchanged; audit log: $log_file"
+  else
+    printf 'safe: vendor update recorded %s -> %s\n' "$before_sha" "$after_sha" >&2
+    printf 'safe: audit log: %s\n' "$log_file" >&2
   fi
 }
 
@@ -497,6 +625,7 @@ case "${1:-}" in
   run)      shift; exec "$SAFE_RUN_PATH" "$@" ;;
   audit)    shift; exec "$SAFE_AUDIT_PATH" "$@" ;;
   install)  shift; exec "$SAFE_RUN_PATH" install "$@" ;;
+  vendor)   shift; cmd_vendor "$@" ;;
   status)   shift; cmd_status "$@" ;;
   setup)    shift; exec "$SAFE_AUDIT_PATH" setup "$@" ;;
   doctor)   shift; cmd_doctor "$@" ;;

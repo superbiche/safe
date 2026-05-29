@@ -6,6 +6,7 @@
 safe run <args...>
 safe audit <args...>
 safe install [--allow-scripts] <pkg> [...]
+safe vendor update --name NAME --path PATH --reason TEXT -- COMMAND...
 safe setup [<machine> | --all | --machine <csv>]
 safe status
 safe doctor [--json]
@@ -70,6 +71,37 @@ safe-audit diff [--all | --machine <csv>] [--since <duration>]
 safe-audit status
 safe-audit --version
 ```
+
+## Vendor Updates
+
+Package-manager wrappers cannot intercept binaries that update themselves from
+inside their own process. Use `safe vendor update` when deliberately running a
+vendor-native updater:
+
+```bash
+safe vendor update \
+  --name codex \
+  --path "$(command -v codex)" \
+  --version-cmd "--version" \
+  --reason "needed for a specific fixed bug" \
+  --rollback "reinstall previous pinned version" \
+  -- codex update
+```
+
+The command records before/after SHA-256 hashes, optional version output, the
+update command, exit code, reason, and rollback note in:
+
+```text
+~/.local/share/safe/vendor/audit.log
+```
+
+This is an audit trail for native vendor binaries, not a registry vulnerability
+verdict. Prefer pinned target versions over `latest` when the vendor supports
+them.
+
+This command does not automatically block in-app auto-updaters. If a tool can
+update itself while running, disable that tool's auto-update setting when
+possible and run deliberate updates through `safe vendor update`.
 
 ## Install Wrapper Coverage
 
