@@ -55,3 +55,7 @@ npm install express
 Unknown package code should not get host access by default. `safe` prefers sandboxed execution, explicit pinned host allowlists, package checks before install, and auditable records of decisions.
 
 For release binaries, `safe-audit` separates source/release review, checksum or Sigstore verification, and networkless binary smoke execution.
+
+For vendor-native tools that update themselves outside package managers, use
+`safe vendor update` to record intent, command, rollback note, and binary hashes
+before and after the updater runs.

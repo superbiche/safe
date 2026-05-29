@@ -58,6 +58,38 @@ grep -q '^safe 1.0.0$' < <("$shim/safe" version) || fail "safe version missing t
 grep -q '^=== audit ===$' < <("$shim/safe" status) || fail "safe status missing audit section"
 pass "dispatcher routes"
 
+vendor_home="$tmp/vendor-home"
+vendor_bin="$tmp/vendor-tool"
+printf 'old\n' > "$vendor_bin"
+chmod +x "$vendor_bin"
+HOME="$vendor_home" "$ROOT/bin/safe" vendor update \
+  --name fixture \
+  --path "$vendor_bin" \
+  --reason "test update" \
+  --rollback "restore old fixture" \
+  -- bash -c 'printf new > "$1"' _ "$vendor_bin" >/dev/null
+jq -e '
+  .name == "fixture"
+  and .reason == "test update"
+  and .rollback == "restore old fixture"
+  and .exit_code == 0
+  and .before.sha256 != .after.sha256
+  and (.command | length) > 0
+' "$vendor_home/.local/share/safe/vendor/audit.log" >/dev/null || fail "safe vendor update did not write audit record"
+pass "safe vendor update records before/after hashes"
+
+set +e
+HOME="$tmp/vendor-fail-home" "$ROOT/bin/safe" vendor update \
+  --name fixture \
+  --path "$vendor_bin" \
+  --reason "test failed update" \
+  -- bash -c 'exit 7' >/dev/null 2>/dev/null
+vendor_rc=$?
+set -e
+[[ "$vendor_rc" -eq 7 ]] || fail "safe vendor update did not preserve command exit"
+jq -e '.exit_code == 7' "$tmp/vendor-fail-home/.local/share/safe/vendor/audit.log" >/dev/null || fail "safe vendor update did not log failed command"
+pass "safe vendor update logs failed command"
+
 cap_tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp" "$cap_tmp"' EXIT
 direct_json="$(

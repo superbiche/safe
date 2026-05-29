@@ -7,6 +7,7 @@ safe
   run      -> safe-run
   audit    -> safe-audit
   install  -> safe-run install
+  vendor   -> safe vendor update
   setup    -> safe-audit setup
   status   -> combined status
   doctor   -> local readiness diagnostics
@@ -35,6 +36,10 @@ The dispatcher forwards arguments without changing their meaning. Direct binarie
 - IOC updates and scans.
 
 Install wrappers are zsh functions that shadow package-manager commands. They run `safe-audit check` for package installs or `safe-audit scan --project .` for project-local installs, then delegate to the real command with `command <tool> "$@"`.
+
+`safe vendor update` wraps explicit vendor-native updater commands. It cannot
+intercept in-process auto-updaters automatically, but it records a durable audit
+trail for intentional updates that bypass package-manager safeguards.
 
 ## Trust Tiers
 
