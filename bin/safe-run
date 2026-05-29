@@ -1220,7 +1220,9 @@ cmd_host_allow_add() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --reason) reason="$2"; shift 2 ;;
+      --reason=*) reason="${1#--reason=}"; shift ;;
       --ecosystem) ecosystem="$2"; shift 2 ;;
+      --ecosystem=*) ecosystem="${1#--ecosystem=}"; shift ;;
       *) die "unknown flag: $1" ;;
     esac
   done
@@ -1262,6 +1264,7 @@ cmd_host_allow_update() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --reason) reason="$2"; shift 2 ;;
+      --reason=*) reason="${1#--reason=}"; shift ;;
       *) die "unknown flag: $1" ;;
     esac
   done

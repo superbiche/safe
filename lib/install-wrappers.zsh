@@ -47,6 +47,48 @@ _safe_install_run_audit() {
   fi
 }
 
+_safe_install_host_allow_file() {
+  print -r -- "${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}/host-allow.json"
+}
+
+_safe_install_split_spec() {
+  local spec="$1"
+  local name version
+
+  if [[ "${spec}" == @*/*@* ]]; then
+    name="${spec%@*}"
+    version="${spec##*@}"
+  elif [[ "${spec}" == *@* && "${spec}" != @* ]]; then
+    name="${spec%@*}"
+    version="${spec##*@}"
+  else
+    name="${spec}"
+    version="latest"
+  fi
+
+  printf '%s\t%s\n' "${name}" "${version}"
+}
+
+_safe_install_host_allow_matches() {
+  local package="$1"
+  local ecosystem="$2"
+  local host_allow_file name version entry_version entry_ecosystem
+
+  [[ "${ecosystem}" == "npm" ]] || return 1
+  (( $+commands[jq] )) || return 1
+
+  host_allow_file="$(_safe_install_host_allow_file)"
+  [[ -r "${host_allow_file}" ]] || return 1
+
+  IFS=$'\t' read -r name version <<< "$(_safe_install_split_spec "${package}")"
+  [[ -n "${name}" && -n "${version}" && "${version}" != "latest" ]] || return 1
+
+  entry_version="$(jq -r --arg p "${name}" '.packages[$p].version // empty' "${host_allow_file}" 2>/dev/null || true)"
+  entry_ecosystem="$(jq -r --arg p "${name}" '.packages[$p].ecosystem // "npm"' "${host_allow_file}" 2>/dev/null || true)"
+
+  [[ "${entry_version}" == "${version}" && "${entry_ecosystem}" == "npm" ]]
+}
+
 _safe_install_confirm_critical() {
   if [[ -t 0 && -t 1 ]]; then
     local reply
@@ -195,6 +237,10 @@ _safe_install_check() {
       return 0
       ;;
     1|10)
+      if _safe_install_host_allow_matches "${package}" "${ecosystem}"; then
+        print -u2 -- "safe-install: safe-audit warned for ${package}; exact host-allow entry permits install"
+        return 0
+      fi
       print -u2 -- "safe-install: safe-audit warned for ${package}; aborting install"
       return 2
       ;;
@@ -403,7 +449,17 @@ _safe_install_npm_spec() {
   local spec="$1"
   local name version
 
-  if [[ "${spec}" == @*/*@* ]]; then
+  if [[ "${spec}" == *@npm:* ]]; then
+    spec="${spec#*@npm:}"
+  fi
+
+  if [[ "${spec}" == @*/*:* ]]; then
+    name="${spec%:*}"
+    version="${spec##*:}"
+  elif [[ "${spec}" != @* && "${spec}" == *:* ]]; then
+    name="${spec%:*}"
+    version="${spec##*:}"
+  elif [[ "${spec}" == @*/*@* ]]; then
     name="${spec%@*}"
     version="${spec##*@}"
   elif [[ "${spec}" == *@* && "${spec}" != @* ]]; then

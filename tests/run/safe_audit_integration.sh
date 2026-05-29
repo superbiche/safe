@@ -148,6 +148,23 @@ PATH="$mockbin:$PATH" \
   ' safe-run || fail "host-allow add GO required a reason"
 pass "host-allow add accepts safe-audit GO without reason"
 
+SAFE_RUN_CONFIG_DIR="$tmp/config-add-reason-equals" \
+SAFE_RUN_DATA_DIR="$tmp/data-add-reason-equals" \
+SAFE_AUDIT_VERDICT=GO \
+SAFE_AUDIT_CALL_LOG="$tmp/audit-calls-add-reason-equals.log" \
+SAFE_RUN_PATH="$SAFE_RUN" \
+PATH="$mockbin:$PATH" \
+  bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    ensure_dirs
+    registry_integrity_npm() { printf "sha512-fixture"; }
+    cmd_host_allow_add @qwen-code/qwen-code@0.16.2 --reason="misses only Socket that fails" >/dev/null 2>&1
+    [[ "$(jq -r ".packages[\"@qwen-code/qwen-code\"].version" "$HOST_ALLOW_FILE")" == "0.16.2" ]]
+    [[ "$(jq -r ".packages[\"@qwen-code/qwen-code\"].reason" "$HOST_ALLOW_FILE")" == "misses only Socket that fails" ]]
+  ' safe-run || fail "host-allow add rejected --reason=value"
+pass "host-allow add accepts --reason=value"
+
 SAFE_RUN_CONFIG_DIR="$tmp/config-update-go-no-reason" \
 SAFE_RUN_DATA_DIR="$tmp/data-update-go-no-reason" \
 SAFE_AUDIT_VERDICT=GO \

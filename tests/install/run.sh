@@ -214,6 +214,50 @@ case_warning_install_blocks() {
   pass "$FUNCNAME"
 }
 
+case_host_allow_warn_allows_exact_global_install() {
+  prepare_case "host-allow-warn-allows-exact-global-install"
+  mkdir -p "${HOME_DIR}/.config/safe/run"
+  cat > "${HOME_DIR}/.config/safe/run/host-allow.json" <<'JSON'
+{"packages":{"warnme":{"version":"1.0.0","ecosystem":"npm","reason":"fixture"}}}
+JSON
+  SAFE_INSTALL_TEST_SCRIPT='npm install -g warnme@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\twarnme@1.0.0\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tinstall\t-g\twarnme@1.0.0' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_host_allow_warn_requires_exact_version() {
+  prepare_case "host-allow-warn-requires-exact-version"
+  mkdir -p "${HOME_DIR}/.config/safe/run"
+  cat > "${HOME_DIR}/.config/safe/run/host-allow.json" <<'JSON'
+{"packages":{"warnme":{"version":"1.0.0","ecosystem":"npm","reason":"fixture"}}}
+JSON
+  SAFE_INSTALL_TEST_SCRIPT='npm install -g warnme@1.0.1' run_zsh
+  assert_status 2 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\twarnme@1.0.1\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_colon_version_global_install() {
+  prepare_case "npm-colon-version-global-install"
+  SAFE_INSTALL_TEST_SCRIPT='npm install -g @qwen-code/qwen-code:0.16.2' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\t@qwen-code/qwen-code@0.16.2\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tinstall\t-g\t@qwen-code/qwen-code:0.16.2' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_alias_audits_target_package() {
+  prepare_case "npm-alias-audits-target-package"
+  SAFE_INSTALL_TEST_SCRIPT='npm install -g qwen@npm:@qwen-code/qwen-code@0.16.2' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\t@qwen-code/qwen-code@0.16.2\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tinstall\t-g\tqwen@npm:@qwen-code/qwen-code@0.16.2' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_audit_failure_blocks() {
   prepare_case "audit-failure-blocks"
   SAFE_AUDIT_CHECK_STATUS=42 SAFE_INSTALL_TEST_SCRIPT='uv tool install repomix' run_zsh
@@ -493,6 +537,10 @@ main() {
     case_add_scans_and_checks \
     case_blocked_install \
     case_warning_install_blocks \
+    case_host_allow_warn_allows_exact_global_install \
+    case_host_allow_warn_requires_exact_version \
+    case_npm_colon_version_global_install \
+    case_npm_alias_audits_target_package \
     case_audit_failure_blocks \
     case_critical_scan_non_tty_aborts \
     case_missing_safe_audit_warns_once \
