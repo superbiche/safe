@@ -45,6 +45,10 @@ safe audit setup
 safe-run link
 ```
 
+`safe audit setup` detects already-installed scanners or installs scanners from
+an explicit local bundle. It does not download scanners or run upstream
+installer scripts.
+
 `safe-run link` replaces host package-runner commands with safe shims where supported. It is transactional and backs up originals before linking.
 
 ## Uninstall

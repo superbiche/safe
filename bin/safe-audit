@@ -31,8 +31,6 @@ DEFAULT_REMOTE_ROOT="${SAFE_AUDIT_REMOTE_ROOT:-\$HOME}"
 DEFAULT_CISA_KEV_URL="${SAFE_AUDIT_CISA_KEV_URL:-https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json}"
 GRYPE_DB_MAX_AGE_DAYS="${SAFE_AUDIT_GRYPE_DB_MAX_AGE_DAYS:-7}"
 SSH_CONNECT_TIMEOUT="${SAFE_AUDIT_SSH_CONNECT_TIMEOUT:-10}"
-SOCKET_CLI_PACKAGE="${SAFE_AUDIT_SOCKET_CLI_PACKAGE:-@socketsecurity/cli}"
-SOCKET_CLI_VERSION="${SAFE_AUDIT_SOCKET_CLI_VERSION:-latest}"
 GITHUB_API_BASE_URL="${SAFE_AUDIT_GITHUB_API_BASE_URL:-https://api.github.com}"
 GITHUB_RELEASE_MIN_AGE_DAYS="${SAFE_AUDIT_GITHUB_RELEASE_MIN_AGE_DAYS:-3}"
 GITHUB_HIGH_RISK_PATH_REGEX="${SAFE_AUDIT_GITHUB_HIGH_RISK_PATH_REGEX:-(^|/)\\.github/workflows/|(^|/)(install|setup|bootstrap|release|publish|sign|cosign|checksum|goreleaser)([^/]*)(\\.[^/]+)?$|(^|/)(Dockerfile|Makefile|magefile\\.go)$}"
@@ -1064,7 +1062,7 @@ warn_missing_scan_tools() {
   missing=$(machine_missing_core_tools "$machine")
   [[ -z "$missing" ]] && return 0
   warn "$machine missing required scanners: $missing"
-  warn "$machine: install scanners first with: safe-audit setup $(printf '%q' "$machine")"
+  warn "$machine: install scanners manually after verification, or use a local bundle with: safe-audit setup $(printf '%q' "$machine") --bundle <scanners.tar.gz>"
 }
 
 confirm_scan_with_missing_tools() {
@@ -1082,28 +1080,19 @@ confirm_scan_with_missing_tools() {
   fi
 
   warn "$machine missing required scanners: $missing"
-  warn "$machine: install scanners first, then run the scan:"
-  warn "  $setup_cmd"
+  warn "$machine: install scanners manually after verification, or install an audited local bundle:"
+  warn "  $setup_cmd --bundle <scanners.tar.gz>"
   warn "  $scan_cmd"
   if ! is_tty; then
     warn "$machine: skipping scan because required scanners are missing in non-TTY mode"
     return 2
   fi
 
-  printf 'Install missing scanners on %s now, proceed with partial audit, or skip? [I/y/n] ' "$machine" >&2
+  printf 'Proceed with partial audit on %s, or skip? [y/N] ' "$machine" >&2
   local answer
   answer=$(read_prompt_answer)
   case "$answer" in
-    ""|i|I|install|Install|INSTALL)
-      setup_machine "$machine" "" 0 0 || return 1
-      missing=$(machine_missing_core_tools "$machine")
-      if [[ -z "$missing" ]]; then
-        return 0
-      fi
-      warn "$machine: scanners are still missing after setup: $missing"
-      warn "$machine: scan skipped"
-      return 1
-      ;;
+    "") warn "$machine: scan skipped"; return 2 ;;
     y|Y|yes) return 0 ;;
     n|N|no) warn "$machine: scan skipped"; return 2 ;;
     *) warn "$machine: unknown choice, scan skipped"; return 2 ;;
@@ -4639,151 +4628,7 @@ core_scanner_tools() {
 }
 
 required_tools_for_machine() {
-  local machine="$1"
   core_scanner_tools
-  if [[ "$(machine_type "$machine")" == "local" ]]; then
-    printf '%s\n' socket
-  fi
-}
-
-install_osv_scanner_release_script() {
-  cat <<'EOF'
-set -euo pipefail
-mkdir -p "$HOME/.local/bin"
-asset_json=$(curl -fsS https://api.github.com/repos/google/osv-scanner/releases/latest)
-url=$(jq -r '
-  .assets[]
-  | select(.name | test("^osv-scanner_linux_amd64(\\.tar\\.gz)?$"))
-  | .browser_download_url
-' <<<"$asset_json" | head -n 1)
-if [[ -z "$url" || "$url" == "null" ]]; then
-  printf 'could not resolve latest osv-scanner linux amd64 release asset\n' >&2
-  exit 1
-fi
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
-case "$url" in
-  *.tar.gz|*.tgz)
-    curl -fsSL "$url" | tar -xzf - -C "$tmp"
-    candidate=$(find "$tmp" -type f -name osv-scanner -perm /111 | head -n 1)
-    ;;
-  *)
-    candidate="$tmp/osv-scanner"
-    curl -fsSL "$url" -o "$candidate"
-    chmod 0755 "$candidate"
-    ;;
-esac
-if [[ -z "${candidate:-}" || ! -f "$candidate" ]]; then
-  printf 'downloaded osv-scanner asset did not contain an executable\n' >&2
-  exit 1
-fi
-install -m 0755 "$candidate" "$HOME/.local/bin/osv-scanner"
-EOF
-}
-
-setup_install_script_local() {
-  local machine="$1" target_tool="$2"
-  case "$target_tool" in
-    osv-scanner)
-      if command -v go >/dev/null 2>&1; then
-        go install github.com/google/osv-scanner/v2/cmd/osv-scanner@latest
-      else
-        install_osv_scanner_release_script | bash
-      fi
-      ;;
-    syft)
-      curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b "$HOME/.local/bin"
-      ;;
-    grype)
-      curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b "$HOME/.local/bin"
-      ;;
-    socket)
-      install_socket_cli_local
-      ;;
-    govulncheck)
-      command -v go >/dev/null 2>&1 && go install golang.org/x/vuln/cmd/govulncheck@latest || true
-      ;;
-    cargo-audit)
-      command -v cargo >/dev/null 2>&1 && cargo install cargo-audit || true
-      ;;
-    pip-audit)
-      command -v pip >/dev/null 2>&1 && pip install pip-audit --break-system-packages || true
-      ;;
-  esac
-}
-
-resolve_socket_cli_spec() {
-  local version="$SOCKET_CLI_VERSION"
-  if [[ "$version" == "latest" ]]; then
-    version=$(npm view "$SOCKET_CLI_PACKAGE@latest" version)
-  fi
-  printf '%s@%s' "$SOCKET_CLI_PACKAGE" "$version"
-}
-
-audit_socket_cli_in_temp_project() {
-  local spec="$1"
-  local scratch sbom osv_json grype_json
-  scratch=$(mktemp -d)
-  sbom="$scratch/socket.sbom.cdx.json"
-  osv_json="$scratch/osv.json"
-  grype_json="$scratch/grype.json"
-
-  (
-    cd "$scratch"
-    npm init -y >/dev/null
-    npm install --package-lock-only --ignore-scripts >/dev/null
-    npm audit --audit-level=moderate >/dev/null
-
-    npm install --package-lock-only --ignore-scripts "$spec" >/dev/null
-    npm audit --audit-level=moderate >/dev/null
-
-    osv-scanner scan --format json --lockfile=package-lock.json > "$osv_json"
-    if jq -e '[.results[]?.packages[]?.vulnerabilities[]?] | length == 0' "$osv_json" >/dev/null; then
-      :
-    else
-      printf 'OSV found vulnerabilities while auditing %s\n' "$spec" >&2
-      return 1
-    fi
-
-    npm ci --ignore-scripts >/dev/null
-    syft "dir:$scratch" -o cyclonedx-json > "$sbom"
-    grype "sbom:$sbom" -o json -q > "$grype_json"
-    if jq -e '[.matches[]?] | length == 0' "$grype_json" >/dev/null; then
-      :
-    else
-      printf 'Grype found vulnerabilities while auditing %s\n' "$spec" >&2
-      return 1
-    fi
-  )
-  local rc=$?
-  rm -rf "$scratch"
-  return "$rc"
-}
-
-install_socket_cli_local() {
-  command -v npm >/dev/null 2>&1 || die "npm is required to install Socket CLI"
-  command -v osv-scanner >/dev/null 2>&1 || die "osv-scanner is required to pre-audit Socket CLI"
-  command -v syft >/dev/null 2>&1 || die "syft is required to pre-audit Socket CLI"
-  command -v grype >/dev/null 2>&1 || die "grype is required to pre-audit Socket CLI"
-
-  local spec
-  spec=$(resolve_socket_cli_spec)
-  info "pre-auditing $spec in an isolated temp npm project"
-  audit_socket_cli_in_temp_project "$spec" || die "Socket CLI pre-audit failed; not installing globally"
-
-  info "installing $spec globally"
-  npm install -g --ignore-scripts "$spec"
-}
-
-copy_local_tool_to_remote() {
-  local machine="$1" tool="$2"
-  local host local_path
-  host=$(machine_host "$machine")
-  local_path=$(local_scanner_path "$tool")
-  [[ -n "$local_path" ]] || return 1
-  ssh_batch "$host" 'mkdir -p "$HOME/.local/bin"' >/dev/null
-  scp_batch -q "$local_path" "$host:.local/bin/$tool" >/dev/null 2>&1 || return 1
-  ssh_batch "$host" "chmod 0755 \$HOME/.local/bin/$tool" >/dev/null 2>&1 || true
 }
 
 create_scanner_bundle() {
@@ -4929,49 +4774,10 @@ setup_machine() {
     info "$machine: required tools already present"
   else
     printf '[safe-audit] %s missing: %s\n' "$machine" "${missing[*]}"
-    if [[ "$prompt_before_install" == "1" ]] && is_tty; then
-      printf 'Proceed with install on %s? [y/N] ' "$machine" >&2
-      local answer
-      answer=$(read_prompt_answer)
-      case "$answer" in
-        y|Y|yes) ;;
-        *) warn "skipping setup for $machine"; return 0 ;;
-      esac
-    fi
-
-    if [[ "$(machine_type "$machine")" == "local" ]]; then
-      for tool in "${missing[@]}"; do
-        setup_install_script_local "$machine" "$tool"
-      done
-    else
-      local host
-      host=$(machine_host "$machine")
-      for tool in "${missing[@]}"; do
-        case "$tool" in
-          osv-scanner)
-            if ! ssh_batch "$host" "bash -lc $(printf '%q' '
-if command -v go >/dev/null 2>&1; then
-  go install github.com/google/osv-scanner/v2/cmd/osv-scanner@latest
-else
-  '"$(install_osv_scanner_release_script)"'
-fi
-')"; then
-              warn "$machine: remote install failed for $tool, trying local binary copy"
-              copy_local_tool_to_remote "$machine" "$tool" || { warn "$machine: local binary copy failed for $tool"; return 1; }
-            fi
-            ;;
-          syft|grype)
-            if ! ssh_batch "$host" "bash -lc $(printf '%q' "set -o pipefail; mkdir -p \"\$HOME/.local/bin\" && curl -sSfL https://raw.githubusercontent.com/anchore/$tool/main/install.sh | sh -s -- -b \"\$HOME/.local/bin\"")"; then
-              warn "$machine: remote install failed for $tool, trying local binary copy"
-              copy_local_tool_to_remote "$machine" "$tool" || { warn "$machine: local binary copy failed for $tool"; return 1; }
-            fi
-            ;;
-          socket)
-            warn "$machine: Socket CLI is required only on local check machines; skipping remote install"
-            ;;
-        esac
-      done
-    fi
+    warn "$machine: setup no longer downloads or runs external installers"
+    warn "$machine: install missing tools manually after verification, or provide a local scanner bundle with --bundle"
+    warn "$machine: create bundles from an audited machine with: safe-audit setup --create-bundle"
+    return 1
   fi
 
   detect_machine_tools "$machine" 1

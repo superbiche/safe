@@ -34,6 +34,24 @@ The current capability groups cover:
 - IOC lookup, list scanning, and updates;
 - machine setup and scanner bundle creation.
 
+## Scanner Setup
+
+`safe-audit setup` detects already-installed scanner tools and can install
+scanner binaries from an explicit local bundle. It does not download upstream
+release assets, run `curl | sh`, or run language package installers.
+
+Create a bundle from an audited machine:
+
+```bash
+safe audit setup --create-bundle ./scanners.tar.gz
+```
+
+Install that bundle on a target machine:
+
+```bash
+safe audit setup local --bundle ./scanners.tar.gz
+```
+
 ## Project And Machine Scans
 
 Local project scan:

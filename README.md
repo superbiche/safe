@@ -13,8 +13,8 @@ git clone <repo-url> safe
 cd safe
 safe audit scan --project .
 bash install.sh
-safe-run link
 safe audit setup
+safe-run link
 safe status
 ```
 
@@ -41,7 +41,9 @@ safe doctor --json
 
 Required: Bash 5+, `jq`, and zsh.
 
-Recommended: Podman for sandboxed execution, Go for scanner installs, `curl`, `tar`, `ssh`, and scanner binaries such as `osv-scanner`, `grype`, `syft`, `govulncheck`, and `cosign`.
+Recommended: Podman for sandboxed execution, `curl`, `tar`, `ssh`, and scanner binaries such as `osv-scanner`, `grype`, `syft`, `govulncheck`, and `cosign`.
+
+`safe audit setup` detects already-installed scanners or installs scanners from an explicit local bundle. It does not download scanners or run upstream installer scripts.
 
 Run:
 

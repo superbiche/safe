@@ -14,6 +14,10 @@ safe-run link
 safe status
 ```
 
+`safe audit setup` only detects scanners or installs from an explicit local
+bundle. Install scanners manually after verification before this step, or use
+`safe audit setup --bundle <scanners.tar.gz>`.
+
 Then review machine config:
 
 ```bash
