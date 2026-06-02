@@ -11,7 +11,7 @@ Release baseline:
 - immutable GitHub Release;
 - `safe-vX.Y.Z.tar.gz`;
 - `SHA256SUMS`;
-- `SHA256SUMS.sigstore.json`.
+- `SHA256SUMS.asc`.
 
 Prepare release metadata and commit it:
 
@@ -43,8 +43,7 @@ Verify local outputs:
 
 ```bash
 scripts/release verify-checksums
-COSIGN_VERIFY_ARGS="--certificate-identity-regexp REGEXP --certificate-oidc-issuer ISSUER" \
-  scripts/release verify-signature
+scripts/release verify-signature
 ```
 
 Upload these release assets:
@@ -52,18 +51,14 @@ Upload these release assets:
 ```text
 dist/safe-vX.Y.Z.tar.gz
 dist/SHA256SUMS
-dist/SHA256SUMS.sigstore.json
+dist/SHA256SUMS.asc
 ```
 
 Release notes must include checksum and signature verification commands:
 
 ```bash
 sha256sum -c SHA256SUMS
-cosign verify-blob \
-  --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity-regexp REGEXP \
-  --certificate-oidc-issuer ISSUER \
-  SHA256SUMS
+gpg --verify SHA256SUMS.asc SHA256SUMS
 ```
 
 CI provenance is not claimed for manual releases.
