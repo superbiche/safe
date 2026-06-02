@@ -49,6 +49,9 @@ safe-run link
 an explicit local bundle. It does not download scanners or run upstream
 installer scripts.
 
+Scanner dependency policy and upstream project links are documented in
+[External Dependencies](dependencies.md).
+
 `safe-run link` replaces host package-runner commands with safe shims where supported. It is transactional and backs up originals before linking.
 
 ## Uninstall

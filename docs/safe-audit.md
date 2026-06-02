@@ -40,6 +40,9 @@ The current capability groups cover:
 scanner binaries from an explicit local bundle. It does not download upstream
 release assets, run `curl | sh`, or run language package installers.
 
+Scanner dependency policy and upstream links are documented in
+[External Dependencies](dependencies.md).
+
 Create a bundle from an audited machine:
 
 ```bash

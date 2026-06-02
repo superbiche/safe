@@ -9,6 +9,7 @@ nav:
   - Home: index.md
   - Architecture: architecture.md
   - Installation: installation.md
+  - External Dependencies: dependencies.md
   - safe-run: safe-run.md
   - safe-audit: safe-audit.md
   - Install Wrappers: install-wrappers.md
