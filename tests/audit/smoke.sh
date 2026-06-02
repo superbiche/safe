@@ -384,10 +384,11 @@ missing_output="$(
     ' 2>&1 || true
 )"
 grep -q 'safe-audit setup local' <<<"$missing_output" || fail "missing tools advice omitted setup command"
+grep -q -- '--bundle <scanners.tar.gz>' <<<"$missing_output" || fail "missing tools advice omitted bundle guidance"
 grep -q "safe-audit scan --machine local --project /tmp/example\\\\ project" <<<"$missing_output" || fail "missing tools advice omitted scan rerun command"
-pass "missing tools install then scan advice"
+pass "missing tools bundle then scan advice"
 
-install_default_output="$(
+missing_default_output="$(
   SAFE_AUDIT_CONFIG_DIR="$tmp/config-missing-install" \
   SAFE_AUDIT_DATA_DIR="$tmp/data-missing-install" \
   SAFE_AUDIT_PATH="$SAFE_AUDIT" \
@@ -395,17 +396,16 @@ install_default_output="$(
       set -- --version
       source "$SAFE_AUDIT_PATH" >/dev/null
       is_tty() { return 0; }
-      setup_machine() {
-        printf "setup %s validate=%s prompt=%s\n" "$1" "$3" "$4"
-        tool_cache_set "$1" "{\"osv-scanner\":\"/bin/true\",\"grype\":\"/bin/true\",\"syft\":\"/bin/true\",\"govulncheck\":null,\"cargo-audit\":null,\"pip-audit\":null,\"socket\":null}"
-      }
+      setup_machine() { printf "unexpected setup\n"; return 1; }
       tool_cache_set local "{\"osv-scanner\":null,\"grype\":null,\"syft\":null,\"govulncheck\":null,\"cargo-audit\":null,\"pip-audit\":null,\"socket\":null}"
-      printf "\n" | confirm_scan_with_missing_tools local "/tmp/example project"
+      ! printf "\n" | confirm_scan_with_missing_tools local "/tmp/example project"
     ' 2>&1
-)" || fail "missing tools default install did not continue"
-grep -q '\[I/y/n\]' <<<"$install_default_output" || fail "missing tools prompt omitted install default"
-grep -q 'setup local validate=0 prompt=0' <<<"$install_default_output" || fail "missing tools default did not install without validation prompt"
-pass "missing tools install default"
+)" || fail "missing tools default skip did not return nonzero"
+grep -q '\[y/N\]' <<<"$missing_default_output" || fail "missing tools prompt omitted skip default"
+if grep -q 'unexpected setup' <<<"$missing_default_output"; then
+  fail "missing tools default triggered setup"
+fi
+pass "missing tools skip default"
 
 partial_choice_output="$(
   SAFE_AUDIT_CONFIG_DIR="$tmp/config-missing-partial" \
@@ -425,8 +425,25 @@ if grep -q 'unexpected setup' <<<"$partial_choice_output"; then
 fi
 pass "missing tools partial choice"
 
-SAFE_AUDIT_CONFIG_DIR="$tmp/config-missing-install-fail" \
-SAFE_AUDIT_DATA_DIR="$tmp/data-missing-install-fail" \
+setup_refusal_output="$(
+  SAFE_AUDIT_CONFIG_DIR="$tmp/config-missing-install-fail" \
+  SAFE_AUDIT_DATA_DIR="$tmp/data-missing-install-fail" \
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+    bash -c '
+      set -- --version
+      source "$SAFE_AUDIT_PATH" >/dev/null
+      detect_machine_tools() {
+        tool_cache_set "$1" "{\"osv-scanner\":null,\"grype\":null,\"syft\":null,\"govulncheck\":null,\"cargo-audit\":null,\"pip-audit\":null,\"socket\":null}"
+      }
+      ! setup_machine local "" 0 0
+    ' 2>&1
+)" || fail "setup missing tools refusal did not return nonzero"
+grep -q 'setup no longer downloads or runs external installers' <<<"$setup_refusal_output" || fail "setup refusal omitted external installer warning"
+grep -q 'safe-audit setup --create-bundle' <<<"$setup_refusal_output" || fail "setup refusal omitted bundle creation guidance"
+pass "setup refuses unauthenticated installers"
+
+SAFE_AUDIT_CONFIG_DIR="$tmp/config-missing-install-noop" \
+SAFE_AUDIT_DATA_DIR="$tmp/data-missing-install-noop" \
 SAFE_AUDIT_PATH="$SAFE_AUDIT" \
   bash -c '
     set -- --version
@@ -435,44 +452,8 @@ SAFE_AUDIT_PATH="$SAFE_AUDIT" \
     setup_machine() { return 1; }
     tool_cache_set local "{\"osv-scanner\":null,\"grype\":null,\"syft\":null,\"govulncheck\":null,\"cargo-audit\":null,\"pip-audit\":null,\"socket\":null}"
     ! printf "\n" | confirm_scan_with_missing_tools local
-  ' || fail "missing tools install failure did not stop"
-pass "missing tools install failure stops"
-
-osv_mockbin="$tmp/osv-mockbin"
-mkdir -p "$osv_mockbin"
-cat > "$osv_mockbin/curl" <<'SH'
-#!/usr/bin/env bash
-case "$*" in
-  *api.github.com/repos/google/osv-scanner/releases/latest*)
-    printf '{"assets":[{"name":"osv-scanner_linux_amd64","browser_download_url":"https://example.invalid/osv-scanner"}]}\n'
-    ;;
-  *https://example.invalid/osv-scanner*)
-    out=""
-    while [[ $# -gt 0 ]]; do
-      case "$1" in
-        -o) out="$2"; shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    [[ -n "$out" ]] || exit 2
-    printf '#!/usr/bin/env bash\nprintf "osv mock\\n"\n' > "$out"
-    ;;
-  *)
-    exit 2
-    ;;
-esac
-SH
-chmod +x "$osv_mockbin/curl"
-osv_home="$tmp/osv-home"
-mkdir -p "$osv_home"
-SAFE_AUDIT_CONFIG_DIR="$tmp/config-osv-install" \
-SAFE_AUDIT_DATA_DIR="$tmp/data-osv-install" \
-SAFE_AUDIT_PATH="$SAFE_AUDIT" \
-HOME="$osv_home" \
-PATH="$osv_mockbin:$PATH" \
-  bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; install_osv_scanner_release_script | bash'
-[[ -x "$osv_home/.local/bin/osv-scanner" ]] || fail "osv release installer did not install binary asset"
-pass "osv release binary asset installer"
+  ' || fail "missing tools default skip did not stop"
+pass "missing tools default skip stops"
 
 remote_interrupt_output="$(
   SAFE_AUDIT_CONFIG_DIR="$tmp/config-remote-interrupt" \
@@ -518,7 +499,9 @@ required_local_tools="$(
   SAFE_AUDIT_PATH="$SAFE_AUDIT" \
     bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; required_tools_for_machine local'
 )"
-grep -q '^socket$' <<<"$required_local_tools" || fail "local required tools omitted socket"
+if grep -q '^socket$' <<<"$required_local_tools"; then
+  fail "local scanner setup required optional socket CLI"
+fi
 required_remote_tools="$(
   SAFE_AUDIT_CONFIG_DIR="$tmp/config-required-remote" \
   SAFE_AUDIT_DATA_DIR="$tmp/data-required-remote" \
@@ -534,7 +517,7 @@ required_remote_tools="$(
 if grep -q '^socket$' <<<"$required_remote_tools"; then
   fail "remote required scanner tools included socket"
 fi
-pass "socket required for local checks"
+pass "socket optional for scanner setup"
 
 machine_root="$(
   SAFE_AUDIT_CONFIG_DIR="$tmp/config-machine-root" \

@@ -72,6 +72,10 @@ safe-audit status
 safe-audit --version
 ```
 
+`safe-audit setup` detects existing scanner tools and can install scanners from
+an explicit local bundle. It does not download upstream release assets, run
+`curl | sh`, or run language package installers.
+
 ## Vendor Updates
 
 Package-manager wrappers cannot intercept binaries that update themselves from

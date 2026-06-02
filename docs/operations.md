@@ -31,7 +31,7 @@ Status combines:
 
 ## Scanner Setup
 
-Install or detect scanners on the local default machine:
+Detect scanners on the local default machine:
 
 ```bash
 safe audit setup
@@ -45,7 +45,11 @@ safe audit setup --machine remote-a,local
 safe audit setup --all
 ```
 
-Create a scanner bundle for machines that cannot download tools directly:
+`safe audit setup` does not download scanners or run upstream installer scripts.
+Install scanner binaries manually after verification, or install from an audited
+local bundle.
+
+Create a scanner bundle from an audited machine:
 
 ```bash
 safe audit setup --create-bundle
