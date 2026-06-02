@@ -41,9 +41,14 @@ safe doctor --json
 
 Required: Bash 5+, `jq`, and zsh.
 
-Recommended: Podman for sandboxed execution, `curl`, `tar`, `ssh`, and scanner binaries such as `osv-scanner`, `grype`, `syft`, `govulncheck`, and `cosign`.
+Recommended: Podman for sandboxed execution, `curl`, `tar`, `ssh`, and
+user-managed scanner binaries such as `osv-scanner`, `grype`, `syft`,
+`govulncheck`, and `cosign`.
 
 `safe audit setup` detects already-installed scanners or installs scanners from an explicit local bundle. It does not download scanners or run upstream installer scripts.
+
+Scanner dependency policy and upstream links are documented in
+[`docs/dependencies.md`](docs/dependencies.md).
 
 Run:
 

@@ -47,7 +47,8 @@ safe audit setup --all
 
 `safe audit setup` does not download scanners or run upstream installer scripts.
 Install scanner binaries manually after verification, or install from an audited
-local bundle.
+local bundle. See [External Dependencies](dependencies.md) for upstream project
+links and the bootstrap policy.
 
 Create a scanner bundle from an audited machine:
 
