@@ -12,12 +12,9 @@ usage: scripts/release <command>
 commands:
   check             validate release metadata and required tools
   package           create dist/safe-vX.Y.Z.tar.gz and dist/SHA256SUMS
-  sign-checksums    sign dist/SHA256SUMS with cosign
+  sign-checksums    sign dist/SHA256SUMS with GPG
   verify-checksums  verify dist/SHA256SUMS
-  verify-signature  verify dist/SHA256SUMS.sigstore.json with cosign
-
-environment:
-  COSIGN_VERIFY_ARGS  required identity and issuer args for cosign verify-blob
+  verify-signature  verify dist/SHA256SUMS.asc with GPG
 EOF
 }
 
@@ -109,15 +106,14 @@ cmd_package() {
 }
 
 cmd_sign_checksums() {
-  require_cmd cosign
+  require_cmd gpg
   [[ -f "$DIST/SHA256SUMS" ]] || {
     printf 'missing %s; run scripts/release package first\n' "$DIST/SHA256SUMS" >&2
     exit 1
   }
-  cosign sign-blob \
-    --bundle "$DIST/SHA256SUMS.sigstore.json" \
-    "$DIST/SHA256SUMS"
-  printf 'created %s\n' "$DIST/SHA256SUMS.sigstore.json"
+  rm -f "$DIST/SHA256SUMS.asc"
+  gpg --armor --detach-sign --output "$DIST/SHA256SUMS.asc" "$DIST/SHA256SUMS"
+  printf 'created %s\n' "$DIST/SHA256SUMS.asc"
 }
 
 cmd_verify_checksums() {
@@ -129,22 +125,12 @@ cmd_verify_checksums() {
 }
 
 cmd_verify_signature() {
-  require_cmd cosign
-  [[ -f "$DIST/SHA256SUMS" && -f "$DIST/SHA256SUMS.sigstore.json" ]] || {
+  require_cmd gpg
+  [[ -f "$DIST/SHA256SUMS" && -f "$DIST/SHA256SUMS.asc" ]] || {
     printf 'missing signed checksum files in %s\n' "$DIST" >&2
     exit 1
   }
-  [[ -n "${COSIGN_VERIFY_ARGS:-}" ]] || {
-    printf 'COSIGN_VERIFY_ARGS is required for keyless verification\n' >&2
-    printf 'example: COSIGN_VERIFY_ARGS="--certificate-identity-regexp ... --certificate-oidc-issuer ..."\n' >&2
-    exit 2
-  }
-  # shellcheck disable=SC2206
-  local verify_args=(${COSIGN_VERIFY_ARGS:-})
-  cosign verify-blob \
-    --bundle "$DIST/SHA256SUMS.sigstore.json" \
-    "${verify_args[@]}" \
-    "$DIST/SHA256SUMS"
+  gpg --verify "$DIST/SHA256SUMS.asc" "$DIST/SHA256SUMS"
 }
 
 cmd="${1:-}"
