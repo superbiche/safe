@@ -46,6 +46,7 @@ safe audit scan --project .
 Guard persistent package installs:
 
 ```bash
+safe install -g cowsay@1.6.0
 source "$HOME/.config/safe/install-wrappers.zsh"
 npm install express
 ```

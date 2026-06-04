@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.0.1"
+SAFE_VERSION="1.1.0"
 SAFE_SELF="$(readlink -f "$0")"
 SAFE_DIR="$(dirname "$SAFE_SELF")"
 SAFE_CONFIG_ROOT="${SAFE_CONFIG_DIR:-$HOME/.config/safe}"
@@ -15,12 +15,14 @@ die() { err "$@"; exit 1; }
 
 show_usage() {
   cat <<'EOF'
-safe: consolidated safe-run, safe-audit, and install wrapper tooling
+safe: consolidated safe run, safe audit, and install wrapper tooling
 
 USAGE
   safe run <args...>
   safe audit <args...>
-  safe install [--allow-scripts] <pkg> [...]
+  safe install [-g|--global] [--yes] <pkg> [...]
+  safe install --manager npm|pnpm|yarn|bun|composer -g [--yes] [--trust-host] <pkg> [...]
+  safe install --sandbox [--allow-scripts] <pkg> [...]
   safe vendor update --name NAME --path PATH --reason TEXT -- COMMAND...
   safe setup [<machine> | --all | --machine <csv>]
   safe status
@@ -616,6 +618,473 @@ cmd_doctor() {
   fi
 }
 
+quote_command() {
+  local arg first=1
+  for arg in "$@"; do
+    if [[ "$first" == "0" ]]; then
+      printf ' '
+    fi
+    printf '%q' "$arg"
+    first=0
+  done
+}
+
+cmd_install_usage() {
+  cat <<'EOF'
+usage:
+  safe install [-g|--global] [--yes] <pkg> [...]
+  safe install --manager npm|pnpm|yarn|bun|composer -g [--yes] [--trust-host] <pkg> [...]
+  safe install --host [--yes] [package-manager flags...] <pkg> [...]
+  safe install --sandbox [safe run install flags...] <pkg> [...]
+
+Host installs are audited with `safe audit check` before the package manager runs.
+`--yes` skips the final confirmation prompt after a successful audit.
+`--trust-host` adds exact npm versions to safe run host-allow after install.
+EOF
+}
+
+safe_install_normalize_manager() {
+  case "$1" in
+    npm|pnpm|yarn|bun|composer) printf '%s\n' "$1" ;;
+    *) die "unsupported install manager: $1" ;;
+  esac
+}
+
+safe_install_has_arg() {
+  local needle="$1"
+  shift
+  local arg
+  for arg in "$@"; do
+    [[ "$arg" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+safe_install_npm_packages() {
+  local -a packages=()
+  local arg skip_next=0 after_double_dash=0
+
+  for arg in "$@"; do
+    if [[ "$skip_next" == "1" ]]; then
+      skip_next=0
+      continue
+    fi
+
+    if [[ "$after_double_dash" == "1" ]]; then
+      packages+=("$arg")
+      continue
+    fi
+
+    case "$arg" in
+      --)
+        after_double_dash=1
+        continue
+        ;;
+      -g|--global|-f|--force|-D|--dev|-P|--peer|-O|--optional|-E|--exact|-T|--tilde|--cached|--save|--save-prod|--save-dev|--save-optional|--save-peer|--no-save|--prefer-offline|--prefer-online|--legacy-peer-deps|--strict-peer-deps|--dry-run|--package-lock-only|--workspace-root|--ignore-scripts|--foreground-scripts)
+        continue
+        ;;
+      --tag|--registry|--cache|--prefix|--userconfig|--globalconfig|--workspace|-w|--filter|--omit|--include|--install-strategy|--save-prefix|--mode|--cwd)
+        skip_next=1
+        continue
+        ;;
+      --tag=*|--registry=*|--cache=*|--prefix=*|--userconfig=*|--globalconfig=*|--workspace=*|--filter=*|--omit=*|--include=*|--install-strategy=*|--save-prefix=*|--mode=*|--cwd=*|--ignore-scripts=*)
+        continue
+        ;;
+      -*)
+        continue
+        ;;
+      *)
+        packages+=("$arg")
+        ;;
+    esac
+  done
+
+  printf '%s\n' "${packages[@]}"
+}
+
+safe_install_npm_spec() {
+  local spec="$1" name version
+
+  if [[ "$spec" == *@npm:* ]]; then
+    spec="${spec#*@npm:}"
+  fi
+
+  if [[ "$spec" == @*/*:* ]]; then
+    name="${spec%:*}"
+    version="${spec##*:}"
+  elif [[ "$spec" != @* && "$spec" == *:* ]]; then
+    name="${spec%:*}"
+    version="${spec##*:}"
+  elif [[ "$spec" == @*/*@* ]]; then
+    name="${spec%@*}"
+    version="${spec##*@}"
+  elif [[ "$spec" == *@* && "$spec" != @* ]]; then
+    name="${spec%@*}"
+    version="${spec##*@}"
+  else
+    name="$spec"
+    version="latest"
+  fi
+
+  printf '%s@%s\n' "$name" "$version"
+}
+
+safe_install_colon_spec() {
+  local spec="$1" name version
+
+  if [[ "$spec" == *":"* ]]; then
+    name="${spec%%:*}"
+    version="${spec#*:}"
+  else
+    name="$spec"
+    version="latest"
+  fi
+
+  printf '%s@%s\n' "$name" "$version"
+}
+
+safe_install_composer_packages() {
+  local -a packages=()
+  local arg skip_next=0
+
+  for arg in "$@"; do
+    if [[ "$skip_next" == "1" ]]; then
+      skip_next=0
+      continue
+    fi
+
+    case "$arg" in
+      --dev|--update-no-dev|--update-with-dependencies|--update-with-all-dependencies|--ignore-platform-reqs|--no-update|--no-scripts|--no-progress|--no-install|--prefer-source|--prefer-dist|--prefer-install|--sort-packages|--optimize-autoloader|--classmap-authoritative|--apcu-autoloader)
+        continue
+        ;;
+      --working-dir|--repository)
+        skip_next=1
+        continue
+        ;;
+      --working-dir=*|--repository=*|--prefer-install=*)
+        continue
+        ;;
+      -*)
+        continue
+        ;;
+      *)
+        packages+=("$(safe_install_colon_spec "$arg")")
+        ;;
+    esac
+  done
+
+  printf '%s\n' "${packages[@]}"
+}
+
+safe_install_audit_specs() {
+  local manager="$1"
+  shift
+
+  case "$manager" in
+    npm|pnpm|yarn|bun)
+      safe_install_npm_packages "$@" | while IFS= read -r raw_package; do
+        [[ -n "$raw_package" ]] && safe_install_npm_spec "$raw_package"
+      done
+      ;;
+    composer)
+      safe_install_composer_packages "$@"
+      ;;
+  esac
+}
+
+safe_install_ecosystem() {
+  case "$1" in
+    npm|pnpm|yarn|bun) printf 'npm\n' ;;
+    composer) printf 'composer\n' ;;
+  esac
+}
+
+safe_install_build_command() {
+  local __out_var="$1" manager="$2" global_mode="$3"
+  shift 3
+  local -n out_ref="$__out_var"
+  local -a cmd=()
+
+  case "$manager:$global_mode" in
+    npm:1) cmd=(npm install -g "$@") ;;
+    npm:0) cmd=(npm install "$@") ;;
+    pnpm:1) cmd=(pnpm add -g "$@") ;;
+    pnpm:0) cmd=(pnpm add "$@") ;;
+    yarn:1) cmd=(yarn global add "$@") ;;
+    yarn:0) cmd=(yarn add "$@") ;;
+    bun:1) cmd=(bun add -g "$@") ;;
+    bun:0) cmd=(bun add "$@") ;;
+    composer:1) cmd=(composer global require "$@") ;;
+    composer:0) cmd=(composer require "$@") ;;
+  esac
+
+  out_ref=("${cmd[@]}")
+}
+
+safe_install_split_spec() {
+  local spec="$1" name version
+
+  if [[ "$spec" == @*/*@* ]]; then
+    name="${spec%@*}"
+    version="${spec##*@}"
+  elif [[ "$spec" == *@* && "$spec" != @* ]]; then
+    name="${spec%@*}"
+    version="${spec##*@}"
+  else
+    name="$spec"
+    version="latest"
+  fi
+
+  printf '%s\t%s\n' "$name" "$version"
+}
+
+safe_install_version_is_exact() {
+  local version="$1"
+  [[ "$version" =~ ^[0-9]+[.][0-9]+[.][0-9]+([-][0-9A-Za-z.-]+)?([+][0-9A-Za-z.-]+)?$ ]]
+}
+
+safe_install_trustable_package() {
+  local package="$1" ecosystem="$2"
+  local name version
+
+  [[ "$ecosystem" == "npm" ]] || return 1
+  IFS=$'\t' read -r name version <<< "$(safe_install_split_spec "$package")"
+  [[ -n "$name" && -n "$version" ]] || return 1
+  safe_install_version_is_exact "$version"
+}
+
+safe_install_host_allow_file() {
+  printf '%s/run/host-allow.json\n' "${SAFE_CONFIG_DIR:-$HOME/.config/safe}"
+}
+
+safe_install_ensure_host_allow_file() {
+  local host_allow_file
+  command -v jq >/dev/null 2>&1 || die "--trust-host requires jq"
+  host_allow_file="$(safe_install_host_allow_file)"
+  mkdir -p "$(dirname "$host_allow_file")"
+  if [[ ! -f "$host_allow_file" ]]; then
+    printf '{"packages":{}}\n' > "$host_allow_file"
+  fi
+}
+
+safe_install_write_host_allow() {
+  local package="$1" reason="$2"
+  local name version host_allow_file tmp
+
+  IFS=$'\t' read -r name version <<< "$(safe_install_split_spec "$package")"
+  safe_install_ensure_host_allow_file
+  host_allow_file="$(safe_install_host_allow_file)"
+  tmp="$(mktemp)"
+  jq --arg p "$name" --arg v "$version" --arg r "$reason" --arg d "$(date -I)" '
+    .packages[$p] = {
+      version: $v,
+      sha: "",
+      ecosystem: "npm",
+      added: $d,
+      reason: $r
+    }' "$host_allow_file" > "$tmp"
+  mv "$tmp" "$host_allow_file"
+  printf 'safe: added %s to safe run host-allow\n' "$package" >&2
+}
+
+safe_install_host_allow_matches() {
+  local package="$1"
+  local host_allow_file="${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run/host-allow.json"
+  local name version entry_version entry_ecosystem
+
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ -r "$host_allow_file" ]] || return 1
+
+  IFS=$'\t' read -r name version <<< "$(safe_install_split_spec "$package")"
+  [[ -n "$name" && -n "$version" && "$version" != "latest" ]] || return 1
+
+  entry_version="$(jq -r --arg p "$name" '.packages[$p].version // empty' "$host_allow_file" 2>/dev/null || true)"
+  entry_ecosystem="$(jq -r --arg p "$name" '.packages[$p].ecosystem // "npm"' "$host_allow_file" 2>/dev/null || true)"
+
+  [[ "$entry_version" == "$version" && "$entry_ecosystem" == "npm" ]]
+}
+
+safe_install_audit_package() {
+  local package="$1"
+  local ecosystem="$2"
+  local audit_status
+
+  [[ -x "$SAFE_AUDIT_PATH" ]] || die "safe install requires safe-audit at $SAFE_AUDIT_PATH"
+
+  set +e
+  "$SAFE_AUDIT_PATH" check "$package" --ecosystem "$ecosystem"
+  audit_status=$?
+  set -e
+
+  case "$audit_status" in
+    0)
+      return 0
+      ;;
+    1|10)
+      if [[ "$ecosystem" == "npm" ]] && safe_install_host_allow_matches "$package"; then
+        err "safe audit warned for $package; exact host-allow entry permits install"
+        return 0
+      fi
+      die "safe audit warned for $package; refusing host install"
+      ;;
+    2|20)
+      die "safe audit blocked $package; refusing host install"
+      ;;
+    *)
+      die "safe audit failed for $package with exit $audit_status; refusing host install"
+      ;;
+  esac
+}
+
+safe_install_confirm() {
+  local -a install_cmd=("$@")
+  local reply
+
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    die "host install requires a TTY confirmation; pass --yes to skip the prompt"
+  fi
+
+  printf 'safe: install with `%s`? [y/N] ' "$(quote_command "${install_cmd[@]}")" >&2
+  if ! IFS= read -r reply </dev/tty; then
+    return 1
+  fi
+
+  [[ "$reply" == "y" || "$reply" == "Y" || "$reply" == "yes" || "$reply" == "YES" ]]
+}
+
+safe_install_confirm_trust() {
+  local package="$1"
+  local reply
+
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    return 1
+  fi
+
+  printf 'safe: trust %s for future safe run host execution? [y/N] ' "$package" >&2
+  if ! IFS= read -r reply </dev/tty; then
+    return 1
+  fi
+
+  [[ "$reply" == "y" || "$reply" == "Y" || "$reply" == "yes" || "$reply" == "YES" ]]
+}
+
+cmd_install() {
+  local host_mode=0 sandbox_mode=0 yes=0
+  local trust_host=0
+  local manager=npm global_mode=0
+  local -a manager_args=()
+  local arg audit_package ecosystem
+  local -a audit_packages=()
+  local -a trust_packages=()
+  local -a install_cmd=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --sandbox)
+        sandbox_mode=1
+        shift
+        ;;
+      --host|--npm)
+        host_mode=1
+        if [[ "$1" == "--npm" ]]; then
+          manager=npm
+        fi
+        shift
+        ;;
+      --manager|--tool)
+        [[ $# -ge 2 ]] || die "$1 requires a value"
+        manager="$(safe_install_normalize_manager "$2")"
+        host_mode=1
+        shift 2
+        ;;
+      --manager=*|--tool=*)
+        manager="$(safe_install_normalize_manager "${1#*=}")"
+        host_mode=1
+        shift
+        ;;
+      --pnpm|--yarn|--bun|--composer)
+        manager="$(safe_install_normalize_manager "${1#--}")"
+        host_mode=1
+        shift
+        ;;
+      --yes|-y)
+        yes=1
+        shift
+        ;;
+      --trust-host)
+        trust_host=1
+        host_mode=1
+        shift
+        ;;
+      --help|-h)
+        cmd_install_usage
+        return 0
+        ;;
+      -g|--global)
+        global_mode=1
+        host_mode=1
+        shift
+        ;;
+      --allow-scripts|--strict|-w|--write|-n|--network|-s|--allow-secrets|--proxy)
+        sandbox_mode=1
+        manager_args+=("$1")
+        shift
+        ;;
+      *)
+        manager_args+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if [[ "$sandbox_mode" == "1" && "$host_mode" == "0" ]]; then
+    exec "$SAFE_RUN_PATH" install "${manager_args[@]}"
+  fi
+
+  [[ "$sandbox_mode" == "1" && "$trust_host" == "1" ]] && die "--trust-host cannot be used with --sandbox"
+
+  if [[ "$host_mode" != "1" ]]; then
+    exec "$SAFE_RUN_PATH" install "${manager_args[@]}"
+  fi
+
+  command -v "$manager" >/dev/null 2>&1 || die "safe install --host requires $manager"
+
+  mapfile -t audit_packages < <(safe_install_audit_specs "$manager" "${manager_args[@]}")
+
+  [[ "${#audit_packages[@]}" -gt 0 ]] || die "usage: safe install --host [package-manager flags...] <pkg> [...]"
+
+  ecosystem="$(safe_install_ecosystem "$manager")"
+  for audit_package in "${audit_packages[@]}"; do
+    safe_install_audit_package "$audit_package" "$ecosystem"
+    if safe_install_trustable_package "$audit_package" "$ecosystem"; then
+      trust_packages+=("$audit_package")
+    elif [[ "$trust_host" == "1" ]]; then
+      die "--trust-host requires exact npm versions; refusing to trust $audit_package"
+    fi
+  done
+
+  safe_install_build_command install_cmd "$manager" "$global_mode" "${manager_args[@]}"
+  if [[ "$yes" != "1" ]]; then
+    safe_install_confirm "${install_cmd[@]}" || die "install cancelled"
+  fi
+
+  local install_rc
+  set +e
+  "${install_cmd[@]}"
+  install_rc=$?
+  set -e
+  [[ "$install_rc" -eq 0 ]] || return "$install_rc"
+
+  if [[ "${#trust_packages[@]}" -gt 0 ]]; then
+    local reason="trusted after safe install"
+    for audit_package in "${trust_packages[@]}"; do
+      if [[ "$trust_host" == "1" ]] || { [[ "$yes" != "1" ]] && safe_install_confirm_trust "$audit_package"; }; then
+        safe_install_write_host_allow "$audit_package" "$reason"
+      fi
+    done
+  fi
+}
+
 argv0="$(basename "$0")"
 if [[ "$argv0" == safe-* && "$argv0" != "safe-run" && "$argv0" != "safe-audit" ]]; then
   exec -a "$argv0" "$SAFE_RUN_PATH" "$@"
@@ -624,7 +1093,7 @@ fi
 case "${1:-}" in
   run)      shift; exec "$SAFE_RUN_PATH" "$@" ;;
   audit)    shift; exec "$SAFE_AUDIT_PATH" "$@" ;;
-  install)  shift; exec "$SAFE_RUN_PATH" install "$@" ;;
+  install)  shift; cmd_install "$@" ;;
   vendor)   shift; cmd_vendor "$@" ;;
   status)   shift; cmd_status "$@" ;;
   setup)    shift; exec "$SAFE_AUDIT_PATH" setup "$@" ;;

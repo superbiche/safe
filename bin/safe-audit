@@ -1062,7 +1062,7 @@ warn_missing_scan_tools() {
   missing=$(machine_missing_core_tools "$machine")
   [[ -z "$missing" ]] && return 0
   warn "$machine missing required scanners: $missing"
-  warn "$machine: install scanners manually after verification, or use a local bundle with: safe-audit setup $(printf '%q' "$machine") --bundle <scanners.tar.gz>"
+  warn "$machine: install scanners manually after verification, or use a local bundle with: safe audit setup $(printf '%q' "$machine") --bundle <scanners.tar.gz>"
 }
 
 confirm_scan_with_missing_tools() {
@@ -1073,8 +1073,8 @@ confirm_scan_with_missing_tools() {
   [[ -z "$missing" ]] && return 0
 
   local setup_cmd scan_cmd
-  setup_cmd="safe-audit setup $(printf '%q' "$machine")"
-  scan_cmd="safe-audit scan --machine $(printf '%q' "$machine")"
+  setup_cmd="safe audit setup $(printf '%q' "$machine")"
+  scan_cmd="safe audit scan --machine $(printf '%q' "$machine")"
   if [[ -n "$project_target" ]]; then
     scan_cmd+=" --project $(printf '%q' "$project_target")"
   fi
@@ -2856,7 +2856,7 @@ check_command() {
         ;;
     esac
   done
-  [[ -z "$spec" ]] && die "usage: safe-audit check <pkg>@<version> [--ecosystem <name>] [--json]"
+  [[ -z "$spec" ]] && die "usage: safe audit check <pkg>@<version> [--ecosystem <name>] [--json]"
 
   parse_pkg_spec "$spec"
   [[ -z "$ecosystem" ]] && ecosystem=$(guess_ecosystem_from_spec "$spec")
@@ -2942,7 +2942,7 @@ check_command() {
     printf 'Blocklist:   %s\n' "$block_line"
     if [[ "$(jq -r '.available // false' "$socket_json" 2>/dev/null)" != "true" ]]; then
       printf '\n[safe-audit] WARNING: socket CLI not available, skipping behavioral analysis\n'
-      printf '[safe-audit] Install: safe-audit setup local\n'
+      printf '[safe-audit] Install: safe audit setup local\n'
     fi
     printf '\nVERDICT: %s\n' "$verdict"
   fi
@@ -2986,7 +2986,7 @@ release_github_command() {
         ;;
     esac
   done
-  [[ -n "$repo" && -n "$version" && -n "$asset" ]] || die "usage: safe-audit release github --repo OWNER/REPO --version TAG --asset NAME [--json]"
+  [[ -n "$repo" && -n "$version" && -n "$asset" ]] || die "usage: safe audit release github --repo OWNER/REPO --version TAG --asset NAME [--json]"
 
   local subject="github:${repo}@${version}#${asset}"
   local scratch checks_file reasons_file data_file
@@ -3241,7 +3241,7 @@ vuln_github_release_command() {
         ;;
     esac
   done
-  [[ -n "$repo" && -n "$version" ]] || die "usage: safe-audit vuln github-release --repo OWNER/REPO --version TAG [--json]"
+  [[ -n "$repo" && -n "$version" ]] || die "usage: safe audit vuln github-release --repo OWNER/REPO --version TAG [--json]"
 
   local subject="github:${repo}@${version}"
   local scratch checks_file reasons_file data_file advisories_json findings_file
@@ -3440,7 +3440,7 @@ verify_release_asset_command() {
         ;;
     esac
   done
-  [[ -n "$artifact" && -n "$checksum" ]] || die "usage: safe-audit verify release-asset --artifact PATH --checksum PATH [--certificate PATH --signature PATH --certificate-identity-regexp REGEX --certificate-oidc-issuer URL] [--require-signature] [--json]"
+  [[ -n "$artifact" && -n "$checksum" ]] || die "usage: safe audit verify release-asset --artifact PATH --checksum PATH [--certificate PATH --signature PATH --certificate-identity-regexp REGEX --certificate-oidc-issuer URL] [--require-signature] [--json]"
 
   local artifact_abs checksum_abs certificate_abs="" signature_abs=""
   artifact_abs=$(absolute_path "$artifact")
@@ -3625,7 +3625,7 @@ verify_sigstore_bundle_command() {
         ;;
     esac
   done
-  [[ -n "$artifact" && -n "$bundle" && -n "$identity" && -n "$oidc_issuer" ]] || die "usage: safe-audit verify sigstore-bundle --artifact PATH --bundle PATH --identity VALUE --oidc-issuer URL [--json]"
+  [[ -n "$artifact" && -n "$bundle" && -n "$identity" && -n "$oidc_issuer" ]] || die "usage: safe audit verify sigstore-bundle --artifact PATH --bundle PATH --identity VALUE --oidc-issuer URL [--json]"
 
   local artifact_abs bundle_abs
   artifact_abs=$(absolute_path "$artifact")
@@ -3788,7 +3788,7 @@ verify_tuf_bootstrap_command() {
         ;;
     esac
   done
-  [[ -n "$mirror_input" && -n "$root" && -n "$root_checksum" && "${#target_specs[@]}" -gt 0 ]] || die "usage: safe-audit verify tuf-bootstrap --mirror PATH --root PATH --root-checksum SHA256 --target NAME=PATH [--target NAME=PATH ...] [--json]"
+  [[ -n "$mirror_input" && -n "$root" && -n "$root_checksum" && "${#target_specs[@]}" -gt 0 ]] || die "usage: safe audit verify tuf-bootstrap --mirror PATH --root PATH --root-checksum SHA256 --target NAME=PATH [--target NAME=PATH ...] [--json]"
 
   local normalized_root_checksum
   normalized_root_checksum=$(normalize_sha256_checksum "$root_checksum") || die "--root-checksum must be a sha256 digest"
@@ -4179,7 +4179,7 @@ binary_exec_command() {
         ;;
     esac
   done
-  [[ -n "$artifact" ]] || die "usage: safe-audit binary exec PATH [--timeout SECONDS] [--json] -- [ARGS...]"
+  [[ -n "$artifact" ]] || die "usage: safe audit binary exec PATH [--timeout SECONDS] [--json] -- [ARGS...]"
 
   local artifact_abs
   artifact_abs=$(absolute_path "$artifact")
@@ -4615,7 +4615,7 @@ ioc_command() {
     cp "$list_file" "$ioc_json"
     ident=$(jq -r '.id // "custom-ioc"' "$ioc_json")
   else
-    [[ -n "$ident" ]] || die "usage: safe-audit ioc <identifier> [--all|--machine ...]"
+    [[ -n "$ident" ]] || die "usage: safe audit ioc <identifier> [--all|--machine ...]"
     fetch_osv_vuln "$ident" "$advisory_json"
     build_ioc_from_osv "$ident" "$advisory_json" "$ioc_json"
   fi
@@ -4776,7 +4776,7 @@ setup_machine() {
     printf '[safe-audit] %s missing: %s\n' "$machine" "${missing[*]}"
     warn "$machine: setup no longer downloads or runs external installers"
     warn "$machine: install missing tools manually after verification, or provide a local scanner bundle with --bundle"
-    warn "$machine: create bundles from an audited machine with: safe-audit setup --create-bundle"
+    warn "$machine: create bundles from an audited machine with: safe audit setup --create-bundle"
     return 1
   fi
 
@@ -5025,25 +5025,25 @@ cmd_status() {
 
 show_usage() {
   cat <<'EOF'
-safe-audit: multi-machine audit tooling
+safe audit: multi-machine audit tooling
 
 USAGE
-  safe-audit capabilities [--json]
-  safe-audit scan [--project <path>] [--all | --machine <csv>]
-  safe-audit check <pkg>@<version> [--ecosystem <name>] [--json]
-  safe-audit release github --repo OWNER/REPO --version TAG --asset NAME [--json]
-  safe-audit vuln github-release --repo OWNER/REPO --version TAG [--json]
-  safe-audit verify release-asset --artifact PATH --checksum PATH [--certificate PATH --signature PATH --certificate-identity-regexp REGEX --certificate-oidc-issuer URL] [--require-signature] [--json]
-  safe-audit verify sigstore-bundle --artifact PATH --bundle PATH --identity VALUE --oidc-issuer URL [--json]
-  safe-audit verify tuf-bootstrap --mirror PATH --root PATH --root-checksum SHA256 --target NAME=PATH [--target NAME=PATH ...] [--json]
-  safe-audit binary exec PATH [--timeout SECONDS] [--json] -- [ARGS...]
-  safe-audit ioc <identifier> [--all | --machine <csv>]
-  safe-audit ioc --list <ioc.json> [--all | --machine <csv>]
-  safe-audit ioc --update [--since <duration>] [--all | --machine <csv>]
-  safe-audit setup [<machine> | --all | --machine <csv>] [--bundle <scanners.tar.gz|latest>]
-  safe-audit setup --create-bundle [<scanners.tar.gz>]
-  safe-audit diff [--all | --machine <csv>] [--since <duration>]
-  safe-audit status
+  safe audit capabilities [--json]
+  safe audit scan [--project <path>] [--all | --machine <csv>]
+  safe audit check <pkg>@<version> [--ecosystem <name>] [--json]
+  safe audit release github --repo OWNER/REPO --version TAG --asset NAME [--json]
+  safe audit vuln github-release --repo OWNER/REPO --version TAG [--json]
+  safe audit verify release-asset --artifact PATH --checksum PATH [--certificate PATH --signature PATH --certificate-identity-regexp REGEX --certificate-oidc-issuer URL] [--require-signature] [--json]
+  safe audit verify sigstore-bundle --artifact PATH --bundle PATH --identity VALUE --oidc-issuer URL [--json]
+  safe audit verify tuf-bootstrap --mirror PATH --root PATH --root-checksum SHA256 --target NAME=PATH [--target NAME=PATH ...] [--json]
+  safe audit binary exec PATH [--timeout SECONDS] [--json] -- [ARGS...]
+  safe audit ioc <identifier> [--all | --machine <csv>]
+  safe audit ioc --list <ioc.json> [--all | --machine <csv>]
+  safe audit ioc --update [--since <duration>] [--all | --machine <csv>]
+  safe audit setup [<machine> | --all | --machine <csv>] [--bundle <scanners.tar.gz|latest>]
+  safe audit setup --create-bundle [<scanners.tar.gz>]
+  safe audit diff [--all | --machine <csv>] [--since <duration>]
+  safe audit status
 
 FILES
   ~/.config/safe/audit/machines.json

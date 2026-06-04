@@ -301,5 +301,5 @@ set -e
 pass "secret-like files block non-tty sandbox unless allowed"
 
 help_output="$("$SAFE_RUN" --help)"
-grep -q 'safe-audit' <<<"$help_output" || fail "help omits safe-audit integration"
-pass "help documents safe-audit integration"
+grep -q 'safe audit' <<<"$help_output" || fail "help omits safe audit integration"
+pass "help documents safe audit integration"

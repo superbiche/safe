@@ -26,8 +26,8 @@ _safe_run() {
       ;;
     *)
       _alternative \
-        'commands:command:_describe -t commands "safe-run command" run_cmds' \
-        'options:option:_describe -t options "safe-run option" opts' \
+        'commands:command:_describe -t commands "safe run command" run_cmds' \
+        'options:option:_describe -t options "safe run option" opts' \
         'packages:package:_message package'
       ;;
   esac
@@ -86,19 +86,19 @@ _safe_audit() {
       ;;
     ioc) _alternative 'options:option:_describe -t options "ioc option" ioc_opts' 'identifiers:identifier:_message "CVE or GHSA ID"' ;;
     setup) _alternative 'options:option:_values "setup option" --all --machine --bundle --create-bundle' 'machines:machine:_safe_machines' ;;
-    *) _describe -t commands 'safe-audit command' audit_cmds ;;
+    *) _describe -t commands 'safe audit command' audit_cmds ;;
   esac
 }
 
 _safe_top() {
   local -a commands
   commands=(
-    'run:run a package through safe-run'
+    'run:run a package through safe run'
     'audit:scan/check dependencies and machines'
-    'install:install a package through safe-run install'
+    'install:audit and install npm packages, or run sandbox installs'
     'status:show consolidated status'
     'doctor:show local readiness diagnostics'
-    'setup:setup safe-audit scanners'
+    'setup:setup safe audit scanners'
     'version:show versions'
     'help:show help'
   )
@@ -113,7 +113,7 @@ case "${words[2]:-}" in
     _safe_audit
     ;;
   install)
-    _alternative 'options:option:_values "install option" --allow-scripts' 'packages:package:_message package'
+    _alternative 'options:option:_values "install option" -g --global --host --manager --tool --npm --pnpm --yarn --bun --composer --yes --trust-host --sandbox --allow-scripts --write --network --allow-secrets' 'packages:package:_message package'
     ;;
   doctor)
     _describe -t options 'doctor option' '--json'

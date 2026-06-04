@@ -711,7 +711,7 @@ run_host_allow() {
   case "$RUNNER_KIND" in
     npm)
       if ! runner_bin=$(host_runner_binary npx); then
-        die "real npx not configured. Run: safe-run link"
+        die "real npx not configured. Run: safe run link"
       fi
       # --yes silences npx's own confirm; --ignore-scripts blocks lifecycle.
       "$runner_bin" --yes --ignore-scripts --package="${pkg}@${version}" \
@@ -720,7 +720,7 @@ run_host_allow() {
       ;;
     bun)
       if ! runner_bin=$(host_runner_binary bunx); then
-        die "real bunx not configured. Run: safe-run link"
+        die "real bunx not configured. Run: safe run link"
       fi
       # bun has no --ignore-scripts on bunx; trust is the whole point of host-allow.
       "$runner_bin" "${pkg}@${version}" "${args[@]}"
@@ -728,14 +728,14 @@ run_host_allow() {
       ;;
     uv)
       if ! runner_bin=$(host_runner_binary uvx); then
-        die "real uvx not configured. Run: safe-run link"
+        die "real uvx not configured. Run: safe run link"
       fi
       "$runner_bin" "${pkg}==${version}" "${args[@]}"
       return $?
       ;;
     pipx)
       if ! runner_bin=$(host_runner_binary pipx); then
-        die "real pipx not configured. Run: safe-run link"
+        die "real pipx not configured. Run: safe run link"
       fi
       "$runner_bin" run --spec "${pkg}==${version}" "$pkg" "${args[@]}"
       return $?
@@ -1486,7 +1486,7 @@ cmd_status() {
     if [[ -n "$path" && -x "$path" ]]; then
       printf "  [x] %s -> %s\n" "$k" "$path"
     else
-      printf "  [ ] %s (not linked; run: safe-run link)\n" "$k"
+      printf "  [ ] %s (not linked; run: safe run link)\n" "$k"
     fi
   done
   printf "  [ ] pipx: use safe-pipx-run (not auto-linked)\n"
@@ -1816,7 +1816,7 @@ cmd_install() {
       *) args+=("$1"); shift ;;
     esac
   done
-  [[ ${#args[@]} -eq 0 ]] && die "usage: safe-run install [--allow-scripts] <pkg>@<version> [...]"
+  [[ ${#args[@]} -eq 0 ]] && die "usage: safe run install [--allow-scripts] <pkg>@<version> [...]"
   if [[ "$ALLOW_NETWORK" != "1" && "$PROXY_PASSTHROUGH" == "1" ]]; then
     printf '%s\n' '[safe-run] WARNING: --proxy ignored because network is disabled' >&2
     PROXY_PASSTHROUGH=0
@@ -1876,12 +1876,15 @@ cmd_install() {
 # ---------------------------------------------------------------------------
 show_usage() {
   cat <<'EOF'
-safe-run: sandboxed package runner
+safe run: sandboxed package runner
 
 USAGE
-  safe-run [flags] <package>[@<version>] [-- args...]
+  safe run [flags] <package>[@<version>] [-- args...]
+  safe run host-allow <subcommand> [...]
+  safe run block <subcommand> [...]
+  safe run install [-w -n] [--allow-scripts] <pkg>...
   safe-npx / safe-bunx / safe-uvx / safe-pipx-run  (symlinks)
-  npx / bunx / uvx                                 (after `safe-run link`)
+  npx / bunx / uvx                                 (after `safe run link`)
   pipx                                             (not auto-linked; use `safe-pipx-run`)
 
 FLAGS
@@ -1914,11 +1917,11 @@ SUBCOMMANDS
   status                                      Show config summary
 
   link [--force]                              Replace system npx/bunx/uvx with
-                                              safe-run (transactional; backs up
+                                              safe run (transactional; backs up
                                               originals). pipx is NOT linked;
                                               use `safe-pipx-run` instead.
   unlink                                      Restore originals (verifies the
-                                              current symlink points to safe-run)
+                                              current symlink points to safe run)
 
   install [-w -n] [--allow-scripts] <pkg>...  Run install in sandbox (allows
                                               postinstall scripts for native bindings)
@@ -1926,7 +1929,7 @@ SUBCOMMANDS
 DECISION TIERS (in order)
   1. blocked        Refuse, log
   2. host-allow     Execute on host with --ignore-scripts
-  3. safe-audit     Check unknown packages in an isolated audit sandbox;
+  3. safe audit     Check unknown packages in an isolated audit sandbox;
                     BLOCK refuses, WARN continues
   4. sandbox-known  Podman sandbox, no prompt
   5. unknown        TTY: prompt; non-TTY: BLOCK

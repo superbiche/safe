@@ -6,26 +6,29 @@
 safe
   run      -> safe-run
   audit    -> safe-audit
-  install  -> safe-run install
+  install  -> audited npm host install, or safe-run install with --sandbox
   vendor   -> safe vendor update
-  setup    -> safe-audit setup
+  setup    -> safe audit setup
   status   -> combined status
   doctor   -> local readiness diagnostics
 ```
 
-The dispatcher forwards arguments without changing their meaning. Direct binaries remain installed for compatibility and for scripts that intentionally call `safe-run` or `safe-audit`.
+The dispatcher forwards `safe run`, `safe audit`, `safe setup`, and unknown
+runner invocations without changing their meaning. Direct binaries remain
+installed for compatibility and for scripts that intentionally call `safe-run`
+or `safe-audit`.
 
 ## Components
 
-`safe-run` decides how package execution is allowed:
+`safe run` decides how package execution is allowed:
 
 - blocklist entries are refused;
 - host allowlist entries run on the host with script execution suppressed where supported;
-- unknown packages are checked through `safe-audit` when possible;
+- unknown packages are checked through `safe audit` when possible;
 - sandbox-known packages run in Podman without another prompt;
 - unknown non-TTY execution blocks unless explicitly allowed by flags.
 
-`safe-audit` handles evidence gathering and verdicts:
+`safe audit` handles evidence gathering and verdicts:
 
 - project and multi-machine scans;
 - SBOM generation and vulnerability scans;
@@ -35,7 +38,17 @@ The dispatcher forwards arguments without changing their meaning. Direct binarie
 - networkless binary execution;
 - IOC updates and scans.
 
-Install wrappers are zsh functions that shadow package-manager commands. They run `safe-audit check` for package installs or `safe-audit scan --project .` for project-local installs, then delegate to the real command with `command <tool> "$@"`.
+`safe install -g` runs `safe audit check` for explicit package specs, prompts,
+then delegates to the selected package manager. npm is the default; `--pnpm`,
+`--yarn`, `--bun`, and `--composer` translate `-g` to each manager's native
+global command. After successful installs of exact npm versions, interactive
+runs can add that exact version to host-allow; `--trust-host` makes that step
+explicit. `safe install --sandbox` keeps the isolated `safe run install` workflow.
+
+Install wrappers are zsh functions that shadow package-manager commands. They
+run `safe audit check` for package installs or `safe audit scan --project .`
+for project-local installs, then delegate to the real command with `command
+<tool> "$@"`.
 
 `safe vendor update` wraps explicit vendor-native updater commands. It cannot
 intercept in-process auto-updaters automatically, but it records a durable audit
@@ -52,7 +65,8 @@ sandbox-known  known enough for sandbox execution
 unknown        prompt in TTY, block in non-TTY
 ```
 
-`blocked.json` is shared by `safe-run` and `safe-audit check`, so a package blocked during audit is also refused by the runner.
+`blocked.json` is shared by `safe run` and `safe audit check`, so a package
+blocked during audit is also refused by the runner.
 
 ## Data Flow
 

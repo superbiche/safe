@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.0 - 2026-06-04
+
+- Add audited `safe install -g` host installs with confirmation before
+  delegating to the package manager.
+- Add global install translation for npm, pnpm, yarn, bun, and Composer.
+- Add exact-version `--trust-host` support and post-install trust prompts for
+  npm packages while refusing to trust `latest`, omitted versions, dist-tags,
+  or ranges.
+- Update help, completions, and docs to prefer `safe run` and `safe audit`
+  over legacy hyphenated command names.
+
 ## 1.0.1 - 2026-06-02
 
 - Harden `safe-audit setup` so it no longer downloads scanner binaries, runs

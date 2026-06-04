@@ -34,11 +34,11 @@ SAFE_AUDIT_PATH="$SAFE_AUDIT" \
 pass "process cleanup stops child processes"
 
 help_output="$("$SAFE_AUDIT" --help)"
-grep -q 'safe-audit capabilities \[--json\]' <<<"$help_output" || fail "help omits capabilities"
-grep -q 'safe-audit ioc --update' <<<"$help_output" || fail "help omits ioc --update"
-grep -q 'safe-audit setup --create-bundle' <<<"$help_output" || fail "help omits setup --create-bundle"
-grep -q 'safe-audit verify sigstore-bundle' <<<"$help_output" || fail "help omits verify sigstore-bundle"
-grep -q 'safe-audit verify tuf-bootstrap' <<<"$help_output" || fail "help omits verify tuf-bootstrap"
+grep -q 'safe audit capabilities \[--json\]' <<<"$help_output" || fail "help omits capabilities"
+grep -q 'safe audit ioc --update' <<<"$help_output" || fail "help omits ioc --update"
+grep -q 'safe audit setup --create-bundle' <<<"$help_output" || fail "help omits setup --create-bundle"
+grep -q 'safe audit verify sigstore-bundle' <<<"$help_output" || fail "help omits verify sigstore-bundle"
+grep -q 'safe audit verify tuf-bootstrap' <<<"$help_output" || fail "help omits verify tuf-bootstrap"
 pass "help output"
 
 grep -q 'capabilities' "$ROOT/lib/completions/_safe" || fail "completion omits capabilities"
@@ -383,9 +383,9 @@ missing_output="$(
       confirm_scan_with_missing_tools local "/tmp/example project"
     ' 2>&1 || true
 )"
-grep -q 'safe-audit setup local' <<<"$missing_output" || fail "missing tools advice omitted setup command"
+grep -q 'safe audit setup local' <<<"$missing_output" || fail "missing tools advice omitted setup command"
 grep -q -- '--bundle <scanners.tar.gz>' <<<"$missing_output" || fail "missing tools advice omitted bundle guidance"
-grep -q "safe-audit scan --machine local --project /tmp/example\\\\ project" <<<"$missing_output" || fail "missing tools advice omitted scan rerun command"
+grep -q "safe audit scan --machine local --project /tmp/example\\\\ project" <<<"$missing_output" || fail "missing tools advice omitted scan rerun command"
 pass "missing tools bundle then scan advice"
 
 missing_default_output="$(
@@ -439,7 +439,7 @@ setup_refusal_output="$(
     ' 2>&1
 )" || fail "setup missing tools refusal did not return nonzero"
 grep -q 'setup no longer downloads or runs external installers' <<<"$setup_refusal_output" || fail "setup refusal omitted external installer warning"
-grep -q 'safe-audit setup --create-bundle' <<<"$setup_refusal_output" || fail "setup refusal omitted bundle creation guidance"
+grep -q 'safe audit setup --create-bundle' <<<"$setup_refusal_output" || fail "setup refusal omitted bundle creation guidance"
 pass "setup refuses unauthenticated installers"
 
 SAFE_AUDIT_CONFIG_DIR="$tmp/config-missing-install-noop" \
