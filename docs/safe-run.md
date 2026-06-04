@@ -16,7 +16,8 @@ safe-uvx
 safe-pipx-run
 ```
 
-After `safe-run link`, host `npx`, `bunx`, and `uvx` can be routed through `safe-run`. `pipx` is not auto-linked; use `safe-pipx-run`.
+After `safe run link`, host `npx`, `bunx`, and `uvx` can be routed through
+`safe run`. `pipx` is not auto-linked; use `safe-pipx-run`.
 
 ## Sandbox Defaults
 
@@ -79,15 +80,43 @@ safe-run block list
 safe-run block import ./blocked-packages.txt
 ```
 
-The blocklist supports JSON or newline-list imports and is shared with `safe-audit check`.
+The blocklist supports JSON or newline-list imports and is shared with
+`safe audit check`.
 
-## Sandboxed Installs
+## Host and Sandboxed Installs
 
-`safe install` routes to `safe-run install`:
+`safe install -g` audits explicit npm package specs with `safe audit check`,
+asks for confirmation, then delegates to `npm install -g` with the original npm
+flags preserved:
 
 ```bash
-safe install --allow-scripts cowsay@1.6.0
-safe-run install --write --network native-addon@1.0.0
+safe install -g cowsay@1.6.0
+safe install --trust-host -g cowsay@1.6.0
+safe install --host --yes --registry https://registry.example left-pad@1.3.0
 ```
 
-This is for isolated install workflows. Persistent host package-manager installs are covered by the zsh install wrappers.
+After a successful install of an exact npm version, interactive runs offer to add
+that exact package version to `safe run` host-allow. `--trust-host` performs that
+step without a second prompt after install. `latest`, omitted versions, dist-tags,
+and ranges are not trusted.
+
+For other supported global package managers, select the manager explicitly and
+`safe install` translates `-g` to the manager's native global command:
+
+```bash
+safe install --pnpm -g cowsay@1.6.0
+safe install --yarn -g typescript@5.0.0
+safe install --bun -g cowsay@1.6.0
+safe install --composer -g vendor/pkg:^1
+```
+
+`safe install --sandbox` routes to `safe run install` for isolated install
+workflows:
+
+```bash
+safe install --sandbox --allow-scripts cowsay@1.6.0
+safe run install --write --network native-addon@1.0.0
+```
+
+Persistent package-manager commands typed directly in zsh are still covered by
+the install wrappers.

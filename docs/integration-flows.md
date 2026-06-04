@@ -10,7 +10,7 @@ cd /path/to/safe
 bash install.sh
 safe doctor
 safe audit setup
-safe-run link
+safe run link
 safe status
 ```
 
@@ -41,7 +41,7 @@ safe run create-vite@latest -- my-app
 Flow:
 
 1. `safe-run` normalizes the package and checks `blocked.json`.
-2. If not host-allowed, it tries `safe-audit check` in an isolated audit container.
+2. If not host-allowed, it tries `safe audit check` in an isolated audit container.
 3. `BLOCK` refuses execution.
 4. `WARN` logs the warning and continues only in the sandbox path.
 5. Unknown TTY execution prompts; unknown non-TTY execution blocks.
@@ -55,8 +55,8 @@ safe-run host-allow add pnpm@10.11.0 --reason "daily package manager"
 
 Flow:
 
-1. `safe-run` validates the exact package version.
-2. It asks `safe-audit` for a package verdict.
+1. `safe run` validates the exact package version.
+2. It asks `safe audit` for a package verdict.
 3. It records the pinned version, ecosystem, integrity where available, and reason.
 4. Future executions of the exact version run on the host.
 5. Host executions are appended to `~/.local/share/safe/audit/host-allow-log.jsonl`.
@@ -72,8 +72,8 @@ npm install express
 Flow:
 
 1. The zsh wrapper detects a package install.
-2. If the current directory looks like an npm project, it runs `safe-audit scan --project .`.
-3. It extracts package specs and runs `safe-audit check <pkg>@<version> --ecosystem npm`.
+2. If the current directory looks like an npm project, it runs `safe audit scan --project .`.
+3. It extracts package specs and runs `safe audit check <pkg>@<version> --ecosystem npm`.
 4. Only `GO` proceeds for package checks.
 5. The real command runs through `command npm install express`.
 

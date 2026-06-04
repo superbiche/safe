@@ -11,7 +11,7 @@ safe audit scan --project .
 or directly:
 
 ```bash
-safe-audit scan --project .
+safe audit scan --project .
 ```
 
 ## Capabilities
@@ -36,7 +36,7 @@ The current capability groups cover:
 
 ## Scanner Setup
 
-`safe-audit setup` detects already-installed scanner tools and can install
+`safe audit setup` detects already-installed scanner tools and can install
 scanner binaries from an explicit local bundle. It does not download upstream
 release assets, run `curl | sh`, or run language package installers.
 

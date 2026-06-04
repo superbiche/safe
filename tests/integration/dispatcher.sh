@@ -46,15 +46,56 @@ cat > "$shim/safe-audit" <<'SH'
 case "${1:-}" in
   --version|-v) echo "safe-audit mock" ;;
   status) echo "config: ${SAFE_CONFIG_DIR:-$HOME/.config/safe}/audit" ;;
+  check) printf 'safe-audit'; for arg in "$@"; do printf '\t%s' "$arg"; done; printf '\n' ;;
   *) printf 'safe-audit'; for arg in "$@"; do printf '\t%s' "$arg"; done; printf '\n' ;;
 esac
 SH
 chmod +x "$shim/safe-audit"
 
+cat > "$shim/npm" <<'SH'
+#!/usr/bin/env bash
+printf '%s' "$(basename "$0")"
+for arg in "$@"; do
+  printf '\t%s' "$arg"
+done
+printf '\n'
+SH
+chmod +x "$shim/npm"
+ln -s npm "$shim/pnpm"
+ln -s npm "$shim/yarn"
+ln -s npm "$shim/bun"
+ln -s npm "$shim/composer"
+
 [[ "$("$shim/safe" run --version)" == "safe-run mock" ]] || fail "safe run did not route"
 [[ "$("$shim/safe" audit --version)" == "safe-audit mock" ]] || fail "safe audit did not route"
 [[ "$("$shim/safe" install --allow-scripts cowsay@1.6.0)" == $'safe-run\tinstall\t--allow-scripts\tcowsay@1.6.0' ]] || fail "safe install did not route to safe-run install"
-grep -q '^safe 1.0.0$' < <("$shim/safe" version) || fail "safe version missing top-level version"
+host_install_output="$(PATH="$shim:$PATH" "$shim/safe" install --yes -g cowsay@1.6.0)"
+grep -Fq $'safe-audit\tcheck\tcowsay@1.6.0\t--ecosystem\tnpm' <<<"$host_install_output" || fail "safe install did not audit global npm package"
+grep -Fq $'npm\tinstall\t-g\tcowsay@1.6.0' <<<"$host_install_output" || fail "safe install did not forward global npm flags"
+trust_config="$tmp/trust-config"
+trust_install_output="$(PATH="$shim:$PATH" SAFE_CONFIG_DIR="$trust_config" "$shim/safe" install --yes --trust-host -g cowsay@1.6.0)"
+grep -Fq $'npm\tinstall\t-g\tcowsay@1.6.0' <<<"$trust_install_output" || fail "safe install --trust-host did not install package"
+jq -e '.packages.cowsay.version == "1.6.0" and .packages.cowsay.ecosystem == "npm"' "$trust_config/run/host-allow.json" >/dev/null || fail "safe install --trust-host did not add exact host-allow entry"
+set +e
+latest_trust_output="$(PATH="$shim:$PATH" SAFE_CONFIG_DIR="$tmp/latest-trust-config" "$shim/safe" install --yes --trust-host -g cowsay 2>&1)"
+latest_trust_rc=$?
+set -e
+[[ "$latest_trust_rc" -ne 0 ]] || fail "safe install --trust-host allowed latest"
+! grep -Fq $'npm\tinstall\t-g\tcowsay' <<<"$latest_trust_output" || fail "safe install --trust-host installed latest before refusing trust"
+yarn_install_output="$(PATH="$shim:$PATH" "$shim/safe" install --yes --yarn -g typescript@5.0.0)"
+grep -Fq $'safe-audit\tcheck\ttypescript@5.0.0\t--ecosystem\tnpm' <<<"$yarn_install_output" || fail "safe install did not audit global yarn package"
+grep -Fq $'yarn\tglobal\tadd\ttypescript@5.0.0' <<<"$yarn_install_output" || fail "safe install did not translate global yarn install"
+pnpm_install_output="$(PATH="$shim:$PATH" "$shim/safe" install --yes --pnpm -g cowsay@1.6.0)"
+grep -Fq $'safe-audit\tcheck\tcowsay@1.6.0\t--ecosystem\tnpm' <<<"$pnpm_install_output" || fail "safe install did not audit global pnpm package"
+grep -Fq $'pnpm\tadd\t-g\tcowsay@1.6.0' <<<"$pnpm_install_output" || fail "safe install did not translate global pnpm install"
+bun_install_output="$(PATH="$shim:$PATH" "$shim/safe" install --yes --bun -g cowsay@1.6.0)"
+grep -Fq $'safe-audit\tcheck\tcowsay@1.6.0\t--ecosystem\tnpm' <<<"$bun_install_output" || fail "safe install did not audit global bun package"
+grep -Fq $'bun\tadd\t-g\tcowsay@1.6.0' <<<"$bun_install_output" || fail "safe install did not translate global bun install"
+composer_install_output="$(PATH="$shim:$PATH" "$shim/safe" install --yes --composer -g vendor/pkg:^1)"
+grep -Fq $'safe-audit\tcheck\tvendor/pkg@^1\t--ecosystem\tcomposer' <<<"$composer_install_output" || fail "safe install did not audit global composer package"
+grep -Fq $'composer\tglobal\trequire\tvendor/pkg:^1' <<<"$composer_install_output" || fail "safe install did not translate global composer install"
+expected_safe_version="$(awk -F'"' '/^SAFE_VERSION=/ {print $2; exit}' "$SAFE")"
+grep -q "^safe ${expected_safe_version}$" < <("$shim/safe" version) || fail "safe version missing top-level version"
 grep -q '^=== audit ===$' < <("$shim/safe" status) || fail "safe status missing audit section"
 pass "dispatcher routes"
 

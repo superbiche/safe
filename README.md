@@ -14,8 +14,9 @@ cd safe
 safe audit scan --project .
 bash install.sh
 safe audit setup
-safe-run link
+safe run link
 safe status
+safe install -g cowsay@1.6.0
 ```
 
 If `safe` is not already available on the machine, inspect the clone and run
@@ -30,12 +31,14 @@ The installer is idempotent. Reruns refresh binaries and wrappers while preservi
 safe run repomix@latest -- --help
 safe audit scan --project .
 safe audit check left-pad@1.3.0 --ecosystem npm
-safe install --allow-scripts cowsay@1.6.0
+safe install -g cowsay@1.6.0
+safe install --sandbox --allow-scripts native-addon@1.0.0
+safe install --trust-host -g cowsay@1.6.0
 safe setup
 safe doctor --json
 ```
 
-`safe-run` protects ad hoc package execution. `safe-audit` scans projects, machines, releases, binaries, and IOCs. The install wrappers shadow package-manager install commands in zsh and call `safe-audit` before delegation.
+`safe run` protects ad hoc package execution. `safe audit` scans projects, machines, releases, binaries, and IOCs. `safe install -g` audits npm packages, asks for confirmation, then delegates to `npm install -g` with flags preserved. Exact npm versions can be added to `safe run` host-allow after install with the trust prompt or `--trust-host`; `latest`, omitted versions, and ranges are never trusted. Use `--manager` or shortcuts such as `--yarn` and `--composer` to translate `-g` for other supported package managers. The install wrappers shadow package-manager install commands in zsh and call `safe audit` before delegation.
 
 ## Requirements
 
