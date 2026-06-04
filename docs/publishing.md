@@ -13,7 +13,7 @@ Release baseline:
 - `SHA256SUMS`;
 - `SHA256SUMS.asc`.
 
-Prepare release metadata and commit it:
+Prepare release metadata on a release branch and commit it:
 
 ```bash
 scripts/release check
@@ -21,13 +21,26 @@ git add VERSION CHANGELOG.md
 git commit -m "Release vX.Y.Z"
 ```
 
-Create the signed tag:
+Open a pull request, wait for review/checks, and merge it into `main` before
+creating any tag or release assets. This repository uses squash-only merges, so
+tagging the pre-merge release branch would produce a tag that is not in the
+published `main` history.
+
+After the PR is merged, fetch and check out the merged default branch:
+
+```bash
+git fetch origin main
+git switch main
+git merge --ff-only origin/main
+```
+
+Create the signed tag on the merged `main` commit:
 
 ```bash
 git tag -s vX.Y.Z -m "vX.Y.Z"
 ```
 
-Create release assets from the signed tag:
+Create release assets from that signed tag:
 
 ```bash
 scripts/release package
@@ -62,6 +75,10 @@ gpg --verify SHA256SUMS.asc SHA256SUMS
 ```
 
 CI provenance is not claimed for manual releases.
+
+Do not create or publish a release for a version that has not landed in
+`main`. The tag, archive, and GitHub Release should all describe the merged
+`main` commit.
 
 ## Documentation
 
