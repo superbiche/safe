@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1 - 2026-06-08
+
+- Preserve symlinked `.zshrc` files when installing, migrating, or uninstalling
+  safe shell integration lines.
+
 ## 1.1.0 - 2026-06-04
 
 - Add audited `safe install -g` host installs with confirmation before

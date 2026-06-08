@@ -27,10 +27,24 @@ EOF
 strip_zshrc_line() {
   local target="$1" line="$2"
   [[ -f "$target" ]] || return 0
-  local tmp
+  local tmp status
   tmp=$(mktemp)
-  grep -Fvx "$line" "$target" > "$tmp" || true
-  mv "$tmp" "$target"
+  if grep -Fvx "$line" "$target" > "$tmp"; then
+    :
+  else
+    status=$?
+    if [[ "$status" -gt 1 ]]; then
+      rm -f "$tmp"
+      return "$status"
+    fi
+  fi
+  if cat "$tmp" > "$target"; then
+    rm -f "$tmp"
+  else
+    status=$?
+    rm -f "$tmp"
+    return "$status"
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
