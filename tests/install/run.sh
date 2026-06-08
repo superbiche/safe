@@ -405,6 +405,34 @@ EOF
   pass "$FUNCNAME"
 }
 
+case_install_preserves_symlinked_zshrc() {
+  prepare_case "install-preserves-symlinked-zshrc"
+  local zshrc_target="${HOME_DIR}/MichelLinux/config/zsh/.zshrc"
+  mkdir -p "$(dirname "${zshrc_target}")" "${HOME_DIR}/.config/safe-run/completions" "${HOME_DIR}/.local/bin"
+  cat > "${zshrc_target}" <<'EOF'
+export SAFE_TEST_ZSHRC=1
+source "$HOME/.config/safe-run/install-wrappers.zsh"
+fpath=("$HOME/.config/safe-run/completions" $fpath)
+EOF
+  ln -s "${zshrc_target}" "${HOME_DIR}/.zshrc"
+  printf 'legacy wrapper\n' > "${HOME_DIR}/.config/safe-run/install-wrappers.zsh"
+  printf 'legacy completion\n' > "${HOME_DIR}/.config/safe-run/completions/_safe-install"
+  printf '#!/usr/bin/env bash\n' > "${HOME_DIR}/.local/bin/safe-install"
+  chmod +x "${HOME_DIR}/.local/bin/safe-install"
+
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+  [[ -L "${HOME_DIR}/.zshrc" ]] || { fail "$FUNCNAME"; return; }
+  [[ "$(readlink "${HOME_DIR}/.zshrc")" == "${zshrc_target}" ]] || { fail "$FUNCNAME"; return; }
+  grep -Fqx 'export SAFE_TEST_ZSHRC=1' "${zshrc_target}" || { fail "$FUNCNAME"; return; }
+  assert_count 0 'source "$HOME/.config/safe-run/install-wrappers.zsh"' "${zshrc_target}" "$FUNCNAME" || return
+  assert_count 0 'fpath=("$HOME/.config/safe-run/completions" $fpath)' "${zshrc_target}" "$FUNCNAME" || return
+  assert_count 1 'source "$HOME/.config/safe/install-wrappers.zsh"' "${zshrc_target}" "$FUNCNAME" || return
+  assert_count 1 'fpath=("$HOME/.local/share/zsh/site-functions" $fpath)' "${zshrc_target}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_install_merges_legacy_state_into_new_schema() {
   prepare_case "install-merges-legacy-state-into-new-schema"
   mkdir -p \
@@ -486,6 +514,34 @@ EOF
   pass "$FUNCNAME"
 }
 
+case_uninstall_preserves_symlinked_zshrc() {
+  prepare_case "uninstall-preserves-symlinked-zshrc"
+  local zshrc_target="${HOME_DIR}/MichelLinux/config/zsh/.zshrc"
+  mkdir -p "$(dirname "${zshrc_target}")" "${HOME_DIR}/.local/share/zsh/site-functions" "${HOME_DIR}/.config/safe-run/completions"
+  cat > "${zshrc_target}" <<'EOF'
+export SAFE_TEST_ZSHRC=1
+source "$HOME/.config/safe/install-wrappers.zsh"
+fpath=("$HOME/.local/share/zsh/site-functions" $fpath)
+source "$HOME/.config/safe-run/install-wrappers.zsh"
+fpath=("$HOME/.config/safe-run/completions" $fpath)
+EOF
+  ln -s "${zshrc_target}" "${HOME_DIR}/.zshrc"
+  printf 'current completion\n' > "${HOME_DIR}/.local/share/zsh/site-functions/_safe"
+  printf 'legacy completion\n' > "${HOME_DIR}/.config/safe-run/completions/_safe-install"
+
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/uninstall.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+  [[ -L "${HOME_DIR}/.zshrc" ]] || { fail "$FUNCNAME"; return; }
+  [[ "$(readlink "${HOME_DIR}/.zshrc")" == "${zshrc_target}" ]] || { fail "$FUNCNAME"; return; }
+  grep -Fqx 'export SAFE_TEST_ZSHRC=1' "${zshrc_target}" || { fail "$FUNCNAME"; return; }
+  assert_count 0 'source "$HOME/.config/safe/install-wrappers.zsh"' "${zshrc_target}" "$FUNCNAME" || return
+  assert_count 0 'fpath=("$HOME/.local/share/zsh/site-functions" $fpath)' "${zshrc_target}" "$FUNCNAME" || return
+  assert_count 0 'source "$HOME/.config/safe-run/install-wrappers.zsh"' "${zshrc_target}" "$FUNCNAME" || return
+  assert_count 0 'fpath=("$HOME/.config/safe-run/completions" $fpath)' "${zshrc_target}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_uninstall_cleans_shell_and_legacy_binaries() {
   prepare_case "uninstall-cleans-shell-and-legacy-binaries"
   mkdir -p "${HOME_DIR}/.local/bin" "${HOME_DIR}/.local/share/zsh/site-functions" "${HOME_DIR}/.config/safe-run/completions" "${HOME_DIR}/.config/safe" "${HOME_DIR}/.local/share/safe"
@@ -554,7 +610,9 @@ main() {
     case_install_idempotent_no_wrappers \
     case_install_idempotent_with_completions \
     case_install_cleans_legacy_safe_install_artifacts \
+    case_install_preserves_symlinked_zshrc \
     case_install_merges_legacy_state_into_new_schema \
+    case_uninstall_preserves_symlinked_zshrc \
     case_uninstall_cleans_shell_and_legacy_binaries
   do
     "$case"
