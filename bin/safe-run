@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# safe-run: sandboxed package runner. Drop-in replacement for npx/bunx/uvx/pipx.
+# safe run: sandboxed package runner. Drop-in replacement for npx/bunx/uvx/pipx.
 # Context detected via argv[0]. Default action: Podman sandbox.
 
 set -euo pipefail
@@ -58,9 +58,9 @@ SANDBOX_AUDIT_EXTRA="sbom_vulns=skipped"
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
-err()  { printf '\033[31msafe-run:\033[0m %s\n' "$*" >&2; }
-warn() { printf '\033[33msafe-run:\033[0m %s\n' "$*" >&2; }
-info() { printf '\033[36msafe-run:\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[31msafe run:\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[33msafe run:\033[0m %s\n' "$*" >&2; }
+info() { printf '\033[36msafe run:\033[0m %s\n' "$*" >&2; }
 die()  { err "$@"; exit 1; }
 
 is_tty() { [[ -t 0 && -t 1 ]]; }
@@ -945,7 +945,7 @@ run_sandbox_with_audit_log() {
 prompt_unknown() {
   local pkg="$1" version="$2"
   local choice
-  printf '\033[33msafe-run:\033[0m %s@%s is not in any list.\n' "$pkg" "$version" >&2
+  printf '\033[33msafe run:\033[0m %s@%s is not in any list.\n' "$pkg" "$version" >&2
   printf '  Run in Podman sandbox? [y]es / [a]lways / [N]o: ' >&2
   read -r choice </dev/tty
   case "$choice" in
@@ -1008,7 +1008,7 @@ dispatch_run() {
     # Version mismatch: package is in host-allow but user requested a different version.
     if [[ -n "$HOST_ALLOW_PINNED_VERSION" ]]; then
       err "BLOCKED: $pkgver — host-allow pinned to ${pkg}@${HOST_ALLOW_PINNED_VERSION}"
-      err "  to update: safe-run host-allow update ${pkg}@${version} --reason \"...\""
+      err "  to update: safe run host-allow update ${pkg}@${version} --reason \"...\""
       audit_log "$runner_label" "$pkgver" "BLOCKED" "$(context_label)" "VERSION_MISMATCH" "pinned=$HOST_ALLOW_PINNED_VERSION"
       exit 101
     fi
@@ -1031,15 +1031,15 @@ dispatch_run() {
   set -e
   case "$safe_audit_state" in
     20)
-      err "BLOCKED: $pkgver — safe-audit reported BLOCK"
+      err "BLOCKED: $pkgver — safe audit reported BLOCK"
       audit_log "$runner_label" "$pkgver" "BLOCKED" "$(context_label)" "SAFE_AUDIT_BLOCK"
       exit 104
       ;;
     10)
-      warn "safe-audit flagged $pkgver for review before sandboxing"
+      warn "safe audit flagged $pkgver for review before sandboxing"
       ;;
     2)
-      warn "safe-audit preflight unavailable or inconclusive; continuing with sandbox policy"
+      warn "safe audit preflight unavailable or inconclusive; continuing with sandbox policy"
       ;;
   esac
 
@@ -1052,7 +1052,7 @@ dispatch_run() {
 
   if ! is_tty; then
     err "BLOCKED: $pkgver is unknown and invocation is non-interactive"
-    err "  to allow: run interactively first, or: safe-run host-allow add ..."
+    err "  to allow: run interactively first, or: safe run host-allow add ..."
     audit_log "$runner_label" "$pkgver" "UNKNOWN" "$(context_label)" "BLOCKED" "$(caller_info)"
     exit 102
   fi
@@ -1098,9 +1098,9 @@ parse_runner_args() {
       -y|--yes) SKIP_PROMPT=1; shift ;;
       --)       saw_dashdash=1; shift ;;
       -h|--help) show_usage; exit 0 ;;
-      -v|--version) echo "safe-run $SAFE_RUN_VERSION"; exit 0 ;;
+      -v|--version) echo "safe run $SAFE_RUN_VERSION"; exit 0 ;;
       -*)
-        # Unknown safe-run flag before the package is treated as positional
+        # Unknown safe run flag before the package is treated as positional
         # (npx passes flags through too). Once we have a package, treat the
         # rest as args.
         positional+=("$1"); package_seen=1; shift
@@ -1115,7 +1115,7 @@ parse_runner_args() {
     exit 1
   fi
   if [[ "$ALLOW_NETWORK" != "1" && "$PROXY_PASSTHROUGH" == "1" ]]; then
-    printf '%s\n' '[safe-run] WARNING: --proxy ignored because network is disabled' >&2
+    printf '%s\n' '[safe run] WARNING: --proxy ignored because network is disabled' >&2
     PROXY_PASSTHROUGH=0
   fi
   parse_package "${positional[0]}"
@@ -1158,28 +1158,28 @@ host_allow_preflight_audit() {
     0)
       ;;
     10)
-      warn "safe-audit flagged $pkgver before host-allow"
-      [[ -n "$reason" ]] || die "--reason is required to override safe-audit WARN"
+      warn "safe audit flagged $pkgver before host-allow"
+      [[ -n "$reason" ]] || die "--reason is required to override safe audit WARN"
       if ! is_tty; then
-        die "host-allow requires interactive confirmation for safe-audit WARN"
+        die "host-allow requires interactive confirmation for safe audit WARN"
       fi
       printf '  %s host-allow anyway? [y/N] ' "$action" >&2
       read -r ok </dev/tty
       [[ "$ok" =~ ^[yY]$ ]] || die "aborted"
       ;;
     20)
-      warn "safe-audit reported BLOCK for $pkgver before host-allow"
-      [[ -n "$reason" ]] || die "--reason is required to override safe-audit BLOCK"
+      warn "safe audit reported BLOCK for $pkgver before host-allow"
+      [[ -n "$reason" ]] || die "--reason is required to override safe audit BLOCK"
       if ! is_tty; then
-        die "host-allow requires interactive confirmation for safe-audit BLOCK"
+        die "host-allow requires interactive confirmation for safe audit BLOCK"
       fi
       printf '  %s host-allow anyway? [y/N] ' "$action" >&2
       read -r ok </dev/tty
       [[ "$ok" =~ ^[yY]$ ]] || die "aborted"
       ;;
     2)
-      warn "safe-audit preflight unavailable or inconclusive before host-allow"
-      [[ -n "$reason" ]] || die "--reason is required when safe-audit is unavailable or inconclusive"
+      warn "safe audit preflight unavailable or inconclusive before host-allow"
+      [[ -n "$reason" ]] || die "--reason is required when safe audit is unavailable or inconclusive"
       ;;
   esac
 }
@@ -1215,7 +1215,7 @@ cmd_host_allow() {
 cmd_host_allow_add() {
   local spec="${1:-}"
   shift || true
-  [[ -z "$spec" ]] && die "usage: safe-run host-allow add <pkg>@<version> [--reason \"...\"]"
+  [[ -z "$spec" ]] && die "usage: safe run host-allow add <pkg>@<version> [--reason \"...\"]"
   local reason="" ecosystem="npm"
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1247,7 +1247,7 @@ cmd_host_allow_add() {
 
 cmd_host_allow_remove() {
   local pkg="${1:-}"
-  [[ -z "$pkg" ]] && die "usage: safe-run host-allow remove <pkg>"
+  [[ -z "$pkg" ]] && die "usage: safe run host-allow remove <pkg>"
   pkg=$(resolve_package_key_in_file "$HOST_ALLOW_FILE" "$pkg")
   local tmp
   tmp=$(mktemp)
@@ -1259,7 +1259,7 @@ cmd_host_allow_remove() {
 cmd_host_allow_update() {
   local spec="${1:-}"
   shift || true
-  [[ -z "$spec" ]] && die "usage: safe-run host-allow update <pkg>@<new-version> [--reason \"...\"]"
+  [[ -z "$spec" ]] && die "usage: safe run host-allow update <pkg>@<new-version> [--reason \"...\"]"
   local reason=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1279,7 +1279,7 @@ cmd_host_allow_update() {
   if is_tty; then
     local old_version
     old_version=$(printf '%s' "$existing" | jq -r '.version')
-    printf '\033[33msafe-run:\033[0m update %s from %s to %s? [y/N] ' "$PKG_NAME" "$old_version" "$PKG_VERSION" >&2
+    printf '\033[33msafe run:\033[0m update %s from %s to %s? [y/N] ' "$PKG_NAME" "$old_version" "$PKG_VERSION" >&2
     local ok; read -r ok </dev/tty
     [[ "$ok" =~ ^[yY]$ ]] || die "aborted"
   fi
@@ -1323,7 +1323,7 @@ cmd_block() {
 cmd_block_add() {
   local pkg="${1:-}"
   shift || true
-  [[ -z "$pkg" ]] && die "usage: safe-run block add <pkg> --reason \"...\""
+  [[ -z "$pkg" ]] && die "usage: safe run block add <pkg> --reason \"...\""
   local reason=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1342,7 +1342,7 @@ cmd_block_add() {
 
 cmd_block_remove() {
   local pkg="${1:-}"
-  [[ -z "$pkg" ]] && die "usage: safe-run block remove <pkg>"
+  [[ -z "$pkg" ]] && die "usage: safe run block remove <pkg>"
   pkg=$(resolve_package_key_in_file "$BLOCKED_FILE" "$pkg")
   local tmp; tmp=$(mktemp)
   jq --arg p "$pkg" 'del(.packages[$p])' "$BLOCKED_FILE" > "$tmp"
@@ -1358,7 +1358,7 @@ cmd_block_list() {
 
 cmd_block_import() {
   local source="${1:-}"
-  [[ -z "$source" ]] && die "usage: safe-run block import <url-or-file>"
+  [[ -z "$source" ]] && die "usage: safe run block import <url-or-file>"
   local body
   if [[ -f "$source" ]]; then
     body=$(cat "$source")
@@ -1453,7 +1453,7 @@ cmd_status() {
   sandbox_count=$(jq '.packages | length' "$SANDBOX_KNOWN_FILE")
   blocked_count=$(jq '.packages | length' "$BLOCKED_FILE")
 
-  echo "safe-run $SAFE_RUN_VERSION"
+  echo "safe run $SAFE_RUN_VERSION"
   echo "config: $CONFIG_DIR"
   echo "log:    $AUDIT_LOG"
   echo
@@ -1493,7 +1493,7 @@ cmd_status() {
 }
 
 # ---------------------------------------------------------------------------
-# Subcommands: link / unlink (replace system runners with safe-run)
+# Subcommands: link / unlink (replace system runners with safe run)
 # ---------------------------------------------------------------------------
 # Pipx is intentionally NOT linked: replacing /usr/bin/pipx would break
 # `pipx install/list/upgrade`. Users must invoke `safe-pipx-run` explicitly
@@ -1628,7 +1628,7 @@ _link_preflight_targets() {
 
   if [[ ${#conflict_keys[@]} -gt 0 ]]; then
     for i in "${!conflict_keys[@]}"; do
-      err "${conflict_keys[$i]}: ${conflict_backups[$i]} already exists but ${conflict_paths[$i]} is not a safe-run symlink"
+      err "${conflict_keys[$i]}: ${conflict_backups[$i]} already exists but ${conflict_paths[$i]} is not a safe run symlink"
     done
     err "refusing to overwrite. Investigate, then re-run with --force if intended."
     return 1
@@ -1643,19 +1643,19 @@ _link_one() {
   real=$(readlink -f "$path" 2>/dev/null || printf '%s' "$path")
 
   if [[ "$real" == "$target_script" ]]; then
-    info "$k: already linked to safe-run (skipping $path)"
+    info "$k: already linked to safe run (skipping $path)"
     return 0
   fi
 
   if [[ -e "$backup" ]]; then
     # Stale-backup case from WARNING 7:
-    # safe to proceed only if the current binary is already a safe-run symlink.
+    # safe to proceed only if the current binary is already a safe run symlink.
     if [[ -L "$path" ]] && [[ "$(readlink -f "$path")" == "$target_script" ]]; then
       info "$k: re-linking $path (existing $backup preserved)"
     elif [[ "$FORCE_LINK" == "1" ]]; then
       warn "$k: --force: overwriting current binary at $path; backup $backup preserved"
     else
-      err "$k: $backup already exists but $path is not a safe-run symlink"
+      err "$k: $backup already exists but $path is not a safe run symlink"
       err "  refusing to overwrite. Investigate, then re-run with --force if intended."
       return 1
     fi
@@ -1672,7 +1672,7 @@ _link_one() {
 
   _sudo_if_needed "$(dirname "$path")" ln -sf "$target_script" "$path" || return 1
   _link_rollback_record SYMLINK "$path"
-  info "$k: linked $path -> safe-run"
+  info "$k: linked $path -> safe run"
 }
 
 _link_fix_volta_npx_real() {
@@ -1700,7 +1700,7 @@ cmd_link() {
 
   local target_script
   target_script="$HOME/.local/bin/safe-run"
-  [[ -x "$target_script" ]] || die "safe-run not installed at $target_script. Run install.sh first."
+  [[ -x "$target_script" ]] || die "safe run compatibility binary not installed at $target_script. Run install.sh first."
 
   _link_collect_targets
   _link_preflight_targets "$target_script"
@@ -1721,7 +1721,7 @@ cmd_link() {
   done
 
   _link_rollback_clear
-  info "link complete. Run: safe-run status"
+  info "link complete. Run: safe run status"
   info "note: pipx was intentionally not linked. Use 'safe-pipx-run' for sandboxed pipx execution."
 }
 
@@ -1735,7 +1735,7 @@ cmd_unlink() {
       local current_target
       current_target=$(readlink -f "$path" 2>/dev/null || true)
       if [[ "$current_target" != "$HOME/.local/bin/safe-run" ]]; then
-        warn "$k: $path is a symlink but does not point to safe-run ($current_target); skipping restore"
+        warn "$k: $path is a symlink but does not point to safe run compatibility binary ($current_target); skipping restore"
         continue
       fi
       _sudo_if_needed "$(dirname "$path")" rm -f "$path"
@@ -1763,7 +1763,7 @@ cmd_unlink() {
         _sudo_if_needed "$(dirname "$volta_shim")" mv "$volta_shim_backup" "$volta_shim"
         info "volta: restored $volta_shim"
       else
-        warn "volta: $volta_shim does not point to safe-run; skipping"
+        warn "volta: $volta_shim does not point to safe run compatibility binary; skipping"
       fi
     elif [[ ! -e "$volta_shim" ]]; then
       _sudo_if_needed "$(dirname "$volta_shim")" mv "$volta_shim_backup" "$volta_shim"
@@ -1782,7 +1782,7 @@ cmd_unlink() {
       if [[ -L "$original" ]]; then
         target=$(readlink -f "$original" 2>/dev/null || true)
         if [[ "$target" != "$HOME/.local/bin/safe-run" ]]; then
-          warn "volta: $original does not point to safe-run; skipping"
+          warn "volta: $original does not point to safe run compatibility binary; skipping"
           continue
         fi
         rm -f "$original"
@@ -1818,7 +1818,7 @@ cmd_install() {
   done
   [[ ${#args[@]} -eq 0 ]] && die "usage: safe run install [--allow-scripts] <pkg>@<version> [...]"
   if [[ "$ALLOW_NETWORK" != "1" && "$PROXY_PASSTHROUGH" == "1" ]]; then
-    printf '%s\n' '[safe-run] WARNING: --proxy ignored because network is disabled' >&2
+    printf '%s\n' '[safe run] WARNING: --proxy ignored because network is disabled' >&2
     PROXY_PASSTHROUGH=0
   fi
 
@@ -1962,7 +1962,7 @@ main() {
       unlink)     shift; cmd_unlink "$@" ;;
       install)    shift; cmd_install "$@" ;;
       help|--help|-h)   show_usage ;;
-      version|--version|-v) echo "safe-run $SAFE_RUN_VERSION" ;;
+      version|--version|-v) echo "safe run $SAFE_RUN_VERSION" ;;
       *)          handle_runner_invocation "$@" ;;
     esac
   else

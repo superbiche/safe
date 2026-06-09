@@ -2,10 +2,10 @@
 
 `safe` is a local security layer for package managers and external binaries.
 
-It combines three tools:
+It combines three workflows:
 
-- `safe-run`: sandboxed package execution for `npx`, `bunx`, `uvx`, and `pipx`-style workflows.
-- `safe-audit`: dependency, SBOM, release, binary, vulnerability, and IOC checks across local and SSH-accessible machines.
+- `safe run`: sandboxed package execution for `npx`, `bunx`, `uvx`, and `pipx`-style workflows.
+- `safe audit`: dependency, SBOM, release, binary, vulnerability, and IOC checks across local and SSH-accessible machines.
 - install wrappers: zsh functions that guard persistent package-manager installs before the real command runs.
 
 The repo installs a top-level `safe` dispatcher, direct component binaries, one config tree under `~/.config/safe`, one data tree under `~/.local/share/safe`, and one zsh completion file.
@@ -55,7 +55,7 @@ npm install express
 
 Unknown package code should not get host access by default. `safe` prefers sandboxed execution, explicit pinned host allowlists, package checks before install, and auditable records of decisions.
 
-For release binaries, `safe-audit` separates source/release review, checksum or Sigstore verification, and networkless binary smoke execution.
+For release binaries, `safe audit` separates source/release review, checksum or Sigstore verification, and networkless binary smoke execution.
 
 For vendor-native tools that update themselves outside package managers, use
 `safe vendor update` to record intent, command, rollback note, and binary hashes

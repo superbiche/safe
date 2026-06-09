@@ -1,6 +1,6 @@
-# safe-audit
+# safe audit
 
-`safe-audit` is the evidence and verdict engine for the ecosystem.
+`safe audit` is the evidence and verdict engine for the ecosystem.
 
 Call it through the dispatcher:
 
@@ -8,11 +8,8 @@ Call it through the dispatcher:
 safe audit scan --project .
 ```
 
-or directly:
-
-```bash
-safe audit scan --project .
-```
+The compatibility `safe-audit` binary remains installed for scripts, but
+documentation and examples use the dispatcher form.
 
 ## Capabilities
 
@@ -88,7 +85,7 @@ Remote scan strategies are selected from available tools and connectivity:
 - remote SBOM generation with local vulnerability scanning;
 - staged local scanning of copied manifests.
 
-Before trusting a remote Grype scan, `safe-audit` checks `grype db status -o json -q`. The stale threshold defaults to 7 days and can be changed:
+Before trusting a remote Grype scan, `safe audit` checks `grype db status -o json -q`. The stale threshold defaults to 7 days and can be changed:
 
 ```bash
 SAFE_AUDIT_GRYPE_DB_MAX_AGE_DAYS=14 safe audit scan --machine remote-a --project /path/to/project
@@ -101,7 +98,7 @@ safe audit check express@4.21.0 --ecosystem npm
 safe audit check ruff@0.11.0 --ecosystem python --json
 ```
 
-Checks include OSV, Socket package scoring when available, and the shared `safe-run` blocklist. Verdicts are:
+Checks include OSV, Socket package scoring when available, and the shared `safe run` blocklist. Verdicts are:
 
 ```text
 GO

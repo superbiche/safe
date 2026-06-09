@@ -1,4 +1,4 @@
-# safe-install persistent install wrappers
+# safe persistent install wrappers
 # Source from .zshrc after installing with ./install.sh.
 
 typeset -g _SAFE_INSTALL_WARNED_MISSING=0
@@ -34,16 +34,16 @@ _safe_install_has_prefix_arg() {
 
 _safe_install_warn_missing() {
   if (( _SAFE_INSTALL_WARNED_MISSING == 0 )); then
-    print -u2 -- "safe-audit not installed, skipping pre-install check"
+    print -u2 -- "safe audit not installed, skipping pre-install check"
     _SAFE_INSTALL_WARNED_MISSING=1
   fi
 }
 
 _safe_install_run_audit() {
   if (( $+commands[timeout] )); then
-    command timeout "${_SAFE_INSTALL_TIMEOUT_SECONDS}" safe-audit check "$@"
+    command timeout "${_SAFE_INSTALL_TIMEOUT_SECONDS}" safe audit check "$@"
   else
-    command safe-audit check "$@"
+    command safe audit check "$@"
   fi
 }
 
@@ -98,7 +98,7 @@ _safe_install_confirm_critical() {
     return $?
   fi
 
-  print -u2 -- "safe-install: critical findings detected; aborting in non-TTY"
+  print -u2 -- "safe install: critical findings detected; aborting in non-TTY"
   return 1
 }
 
@@ -106,12 +106,12 @@ _safe_install_scan_project() {
   local scan_output
   local scan_status
 
-  if ! (( $+commands[safe-audit] )); then
+  if ! (( $+commands[safe] )); then
     _safe_install_warn_missing
     return 0
   fi
 
-  scan_output="$(command safe-audit scan --project . 2>&1)"
+  scan_output="$(command safe audit scan --project . 2>&1)"
   scan_status=$?
 
   [[ -n "${scan_output}" ]] && print -r -- "${scan_output}"
@@ -121,12 +121,12 @@ _safe_install_scan_project() {
   fi
 
   if [[ "${scan_output:l}" == *critical* || "${scan_status}" -ge 2 ]]; then
-    print -u2 -- "safe-install: safe-audit scan reported critical findings"
+    print -u2 -- "safe install: safe audit scan reported critical findings"
     _safe_install_confirm_critical
     return $?
   fi
 
-  print -u2 -- "safe-install: safe-audit scan failed with exit ${scan_status}; proceeding"
+  print -u2 -- "safe install: safe audit scan failed with exit ${scan_status}; proceeding"
   return 0
 }
 
@@ -217,14 +217,14 @@ _safe_install_pip_project_install() {
   return 1
 }
 
-# Check one package via safe-audit.
+# Check one package via safe audit.
 # Returns: 0=GO/proceed, 2=abort.
 _safe_install_check() {
   local package="$1"
   local ecosystem="$2"
   local audit_status
 
-  if ! (( $+commands[safe-audit] )); then
+  if ! (( $+commands[safe] )); then
     _safe_install_warn_missing
     return 0
   fi
@@ -238,22 +238,22 @@ _safe_install_check() {
       ;;
     1|10)
       if _safe_install_host_allow_matches "${package}" "${ecosystem}"; then
-        print -u2 -- "safe-install: safe-audit warned for ${package}; exact host-allow entry permits install"
+        print -u2 -- "safe install: safe audit warned for ${package}; exact host-allow entry permits install"
         return 0
       fi
-      print -u2 -- "safe-install: safe-audit warned for ${package}; aborting install"
+      print -u2 -- "safe install: safe audit warned for ${package}; aborting install"
       return 2
       ;;
     2|20)
-      print -u2 -- "safe-install: blocked install of ${package}"
+      print -u2 -- "safe install: blocked install of ${package}"
       return 2
       ;;
     124|137)
-      print -u2 -- "safe-install: safe-audit timed out for ${package}; aborting install"
+      print -u2 -- "safe install: safe audit timed out for ${package}; aborting install"
       return 2
       ;;
     *)
-      print -u2 -- "safe-install: safe-audit failed for ${package} with exit ${audit_status}; aborting install"
+      print -u2 -- "safe install: safe audit failed for ${package} with exit ${audit_status}; aborting install"
       return 2
       ;;
   esac

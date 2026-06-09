@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.2 - 2026-06-09
+
+- Prefer `safe run`, `safe audit`, and `safe install` across docs, help,
+  status, version, and wrapper output.
+- Route install wrappers through the `safe audit` dispatcher command.
+- Make `safe audit help` show audit help instead of erroring.
+
 ## 1.1.1 - 2026-06-08
 
 - Preserve symlinked `.zshrc` files when installing, migrating, or uninstalling
@@ -18,7 +25,7 @@
 
 ## 1.0.1 - 2026-06-02
 
-- Harden `safe-audit setup` so it no longer downloads scanner binaries, runs
+- Harden `safe audit setup` so it no longer downloads scanner binaries, runs
   upstream installer scripts, or runs language package installers.
 - Make scanner setup fail closed unless required scanners already exist or an
   explicit local scanner bundle is provided.

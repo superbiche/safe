@@ -25,8 +25,8 @@ safe status
 Status combines:
 
 - top-level `safe` version;
-- `safe-run status`;
-- `safe-audit status`;
+- `safe run status`;
+- `safe audit status`;
 - install-wrapper installation state.
 
 ## Scanner Setup

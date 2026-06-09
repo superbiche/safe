@@ -70,7 +70,7 @@ done
 
 if [[ -x "$BIN_DIR/safe-run" ]]; then
   if ! "$BIN_DIR/safe-run" unlink >/dev/null 2>&1; then
-    warn "safe-run unlink failed; PATH may still contain linked runner shims"
+    warn "safe run unlink failed; PATH may still contain linked runner shims"
   fi
 fi
 

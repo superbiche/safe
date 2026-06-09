@@ -19,16 +19,16 @@ The wrappers shadow package-manager commands with zsh functions, run a check or 
 Package installs run:
 
 ```bash
-safe-audit check <package>@<version> --ecosystem <ecosystem>
+safe audit check <package>@<version> --ecosystem <ecosystem>
 ```
 
 Project-local installs run:
 
 ```bash
-safe-audit scan --project .
+safe audit scan --project .
 ```
 
-If `safe-audit` is missing, wrappers warn once and continue. If package checks are available, package install checks fail closed: `WARN`, `BLOCK`, timeouts, and audit failures stop before the real install command runs.
+If `safe audit` is missing, wrappers warn once and continue. If package checks are available, package install checks fail closed: `WARN`, `BLOCK`, timeouts, and audit failures stop before the real install command runs.
 
 Project scans are stricter for critical findings. Non-critical scan failures warn and continue.
 

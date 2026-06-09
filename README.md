@@ -1,6 +1,6 @@
 # safe
 
-`safe` is a Bash toolkit for safer package execution, dependency auditing, and guarded installs. It provides `safe-run`, `safe-audit`, and persistent install wrappers behind one dispatcher, one installer, one config tree, and one zsh completion entry point.
+`safe` is a Bash toolkit for safer package execution, dependency auditing, and guarded installs. It provides `safe run`, `safe audit`, and persistent install wrappers behind one dispatcher, one installer, one config tree, and one zsh completion entry point.
 
 ## Documentation
 

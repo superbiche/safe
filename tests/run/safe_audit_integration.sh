@@ -67,7 +67,7 @@ run_fixture WARN '
   run_sandbox() { SANDBOX_AUDIT_EXTRA="sbom_vulns=0"; return 0; }
   dispatch_run
 '
-grep -q 'check warnpkg@1.0.0 --ecosystem npm --json' "$tmp/audit-calls-WARN.log" || fail "safe-audit check did not run before sandbox"
+grep -q 'check warnpkg@1.0.0 --ecosystem npm --json' "$tmp/audit-calls-WARN.log" || fail "safe audit check did not run before sandbox"
 grep -q 'SANDBOX.*OK.*sbom_vulns=0' "$tmp/data-WARN/audit.log" || fail "sandbox audit omitted sbom_vulns"
 pass "WARN continues to sandbox with sbom audit"
 
@@ -107,7 +107,7 @@ run_fixture GO '
   mv "$tmpfile" "$CONFIG_FILE"
   dispatch_run --flag
 '
-[[ ! -s "$tmp/audit-calls-GO.log" ]] || fail "safe-audit ran before host-allow"
+[[ ! -s "$tmp/audit-calls-GO.log" ]] || fail "safe audit ran before host-allow"
 jq -e 'select(.package == "hostpkg" and .version == "2.0.0" and .runner == "npx")' "$tmp/audit-data-GO/host-allow-log.jsonl" >/dev/null || fail "host-allow JSONL log missing"
 [[ "$(wc -l < "$tmp/audit-data-GO/host-allow-log.jsonl")" -eq 1 ]] || fail "host-allow JSONL contains blank lines"
 pass "host-allow JSONL logging"
@@ -146,7 +146,7 @@ PATH="$mockbin:$PATH" \
     [[ "$(jq -r ".packages.hostpkg.version" "$HOST_ALLOW_FILE")" == "2.0.0" ]]
     [[ "$(jq -r ".packages.hostpkg.reason" "$HOST_ALLOW_FILE")" == "" ]]
   ' safe-run || fail "host-allow add GO required a reason"
-pass "host-allow add accepts safe-audit GO without reason"
+pass "host-allow add accepts safe audit GO without reason"
 
 SAFE_RUN_CONFIG_DIR="$tmp/config-add-reason-equals" \
 SAFE_RUN_DATA_DIR="$tmp/data-add-reason-equals" \
@@ -183,7 +183,7 @@ PATH="$mockbin:$PATH" \
     [[ "$(jq -r ".packages.hostpkg.version" "$HOST_ALLOW_FILE")" == "2.1.0" ]]
     [[ "$(jq -r ".packages.hostpkg.reason" "$HOST_ALLOW_FILE")" == "" ]]
   ' safe-run || fail "host-allow update GO required or preserved a reason"
-pass "host-allow update accepts safe-audit GO without reason"
+pass "host-allow update accepts safe audit GO without reason"
 
 SAFE_RUN_CONFIG_DIR="$tmp/config-update-block" \
 SAFE_RUN_DATA_DIR="$tmp/data-update-block" \
@@ -204,7 +204,7 @@ PATH="$mockbin:$PATH" \
     set -e
     [[ "$rc" -ne 0 ]]
     [[ "$(jq -r ".packages.hostpkg.version" "$HOST_ALLOW_FILE")" == "2.0.0" ]]
-  ' safe-run || fail "host-allow update safe-audit BLOCK mutated allowlist"
+  ' safe-run || fail "host-allow update safe audit BLOCK mutated allowlist"
 pass "host-allow update audits before mutation"
 
 podman_log="$tmp/podman.log"

@@ -14,7 +14,7 @@ before installing. Treat this repository like any other supply-chain input.
 
 Default install mode is `--all`, which installs:
 
-- `safe`, `safe-run`, and `safe-audit` to `~/.local/bin`;
+- `safe`, plus compatibility component binaries, to `~/.local/bin`;
 - seed config under `~/.config/safe/run` and `~/.config/safe/audit`;
 - `~/.config/safe/install-wrappers.zsh`;
 - zsh completion `~/.local/share/zsh/site-functions/_safe`;
@@ -68,4 +68,4 @@ Remove config and data as well:
 bash uninstall.sh --all
 ```
 
-`--purge` also requests source-line cleanup. The uninstall path calls `safe-run unlink` first when possible.
+`--purge` also requests source-line cleanup. The uninstall path calls `safe run unlink` first when possible.

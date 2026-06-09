@@ -1,15 +1,16 @@
-# safe-run
+# safe run
 
-`safe-run` is the sandboxed package runner. It can be called directly or through the dispatcher:
+`safe run` is the sandboxed package runner:
 
 ```bash
 safe run cowsay@1.6.0
-safe-run cowsay@1.6.0
 ```
 
-It also supports runner-shaped symlinks:
+Compatibility binaries and runner-shaped symlinks remain installed for scripts
+and command interception:
 
 ```text
+safe-run
 safe-npx
 safe-bunx
 safe-uvx
@@ -48,36 +49,36 @@ safe run --py312 ruff@latest -- --version
 
 ## Decision Order
 
-`safe-run` evaluates package requests in this order:
+`safe run` evaluates package requests in this order:
 
 1. `blocked`: refuse and log.
 2. `host-allow`: execute the pinned version on the host with scripts suppressed where supported.
-3. `safe-audit`: check unknown packages in an isolated audit sandbox when available.
+3. `safe audit`: check unknown packages in an isolated audit sandbox when available.
 4. `sandbox-known`: run in Podman without another prompt.
 5. `unknown`: prompt in a TTY; block in non-TTY.
 
-`safe-audit` `BLOCK` refuses execution. `WARN` continues to sandbox execution but is logged.
+`safe audit` `BLOCK` refuses execution. `WARN` continues to sandbox execution but is logged.
 
 ## Host Allowlist
 
 Use host allow for pinned, reviewed tools that must execute outside the sandbox:
 
 ```bash
-safe-run host-allow add pnpm@10.11.0 --reason "daily package manager"
-safe-run host-allow update pnpm@10.12.0 --reason "reviewed update"
-safe-run host-allow list
-safe-run host-allow remove pnpm
+safe run host-allow add pnpm@10.11.0 --reason "daily package manager"
+safe run host-allow update pnpm@10.12.0 --reason "reviewed update"
+safe run host-allow list
+safe run host-allow remove pnpm
 ```
 
-`host-allow add` and `host-allow update` run `safe-audit` before mutating the allowlist. A `GO` result can proceed without a reason. `WARN`, `BLOCK`, or unavailable audit results require a reason and interactive confirmation.
+`host-allow add` and `host-allow update` run `safe audit` before mutating the allowlist. A `GO` result can proceed without a reason. `WARN`, `BLOCK`, or unavailable audit results require a reason and interactive confirmation.
 
 ## Blocklist
 
 ```bash
-safe-run block add bad-package --reason "known malicious package"
-safe-run block remove bad-package
-safe-run block list
-safe-run block import ./blocked-packages.txt
+safe run block add bad-package --reason "known malicious package"
+safe run block remove bad-package
+safe run block list
+safe run block import ./blocked-packages.txt
 ```
 
 The blocklist supports JSON or newline-list imports and is shared with
