@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# safe-audit: multi-machine audit orchestrator for dependency and SBOM scanning.
+# safe audit: multi-machine audit orchestrator for dependency and SBOM scanning.
 
 set -euo pipefail
 
@@ -66,9 +66,9 @@ declare -a CURRENT_MANIFESTS=()
 declare -a CURRENT_PROJECT_ROOTS=()
 declare -a CURRENT_SYFT_EXCLUDES=()
 
-err()  { printf '\033[31msafe-audit:\033[0m %s\n' "$*" >&2; }
-warn() { printf '\033[33msafe-audit:\033[0m %s\n' "$*" >&2; }
-info() { printf '\033[36msafe-audit:\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[31msafe audit:\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[33msafe audit:\033[0m %s\n' "$*" >&2; }
+info() { printf '\033[36msafe audit:\033[0m %s\n' "$*" >&2; }
 die()  { err "$@"; exit 1; }
 
 is_tty() { [[ -t 0 && -t 1 ]]; }
@@ -299,7 +299,7 @@ persist_audit_result() {
 
 print_audit_result_human() {
   local result_json="$1"
-  printf '[safe-audit] %s\n' "$(jq -r '.command + ": " + .subject' "$result_json")"
+  printf '[safe audit] %s\n' "$(jq -r '.command + ": " + .subject' "$result_json")"
   printf 'VERDICT: %s\n' "$(jq -r '.verdict' "$result_json")"
 
   if jq -e '.checks | length > 0' "$result_json" >/dev/null 2>&1; then
@@ -819,7 +819,7 @@ print_capabilities_human() {
   local payload_json
   payload_json=$(capabilities_payload_json)
 
-  printf 'safe-audit %s\n' "$SAFE_AUDIT_VERSION"
+  printf 'safe audit %s\n' "$SAFE_AUDIT_VERSION"
   printf 'command: safe audit capabilities\n\n'
   jq -r '
     .groups
@@ -2936,13 +2936,13 @@ check_command() {
   if [[ "$json_mode" == "1" ]]; then
     cat "$result_json"
   else
-    printf '[safe-audit] checking %s (%s)\n\n' "$spec" "$ecosystem"
+    printf '[safe audit] checking %s (%s)\n\n' "$spec" "$ecosystem"
     printf 'Socket:      %s\n' "$socket_line"
     printf 'OSV:         %s\n' "$osv_line"
     printf 'Blocklist:   %s\n' "$block_line"
     if [[ "$(jq -r '.available // false' "$socket_json" 2>/dev/null)" != "true" ]]; then
-      printf '\n[safe-audit] WARNING: socket CLI not available, skipping behavioral analysis\n'
-      printf '[safe-audit] Install: safe audit setup local\n'
+      printf '\n[safe audit] WARNING: socket CLI not available, skipping behavioral analysis\n'
+      printf '[safe audit] Install: safe audit setup local\n'
     fi
     printf '\nVERDICT: %s\n' "$verdict"
   fi
@@ -4773,7 +4773,7 @@ setup_machine() {
   if [[ "${#missing[@]}" -eq 0 ]]; then
     info "$machine: required tools already present"
   else
-    printf '[safe-audit] %s missing: %s\n' "$machine" "${missing[*]}"
+    printf '[safe audit] %s missing: %s\n' "$machine" "${missing[*]}"
     warn "$machine: setup no longer downloads or runs external installers"
     warn "$machine: install missing tools manually after verification, or provide a local scanner bundle with --bundle"
     warn "$machine: create bundles from an audited machine with: safe audit setup --create-bundle"
@@ -5010,7 +5010,7 @@ cmd_status() {
   fi
   [[ -n "$last_scan" ]] || last_scan="none"
 
-  echo "safe-audit $SAFE_AUDIT_VERSION"
+  echo "safe audit $SAFE_AUDIT_VERSION"
   echo "config: $CONFIG_DIR"
   echo "data:   $DATA_DIR"
   echo
@@ -5080,8 +5080,8 @@ main() {
     setup) shift; setup_command "$@" ;;
     diff) shift; diff_command "$@" ;;
     status) shift; cmd_status "$@" ;;
-    --help|-h|"") show_usage ;;
-    --version|-v) printf 'safe-audit %s\n' "$SAFE_AUDIT_VERSION" ;;
+    help|--help|-h|"") show_usage ;;
+    --version|-v) printf 'safe audit %s\n' "$SAFE_AUDIT_VERSION" ;;
     *)
       die "unknown command: $cmd"
       ;;

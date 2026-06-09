@@ -69,6 +69,18 @@ done
 exit "${SAFE_AUDIT_CHECK_STATUS:-0}"
 STUB
   chmod +x "${bin_dir}/safe-audit"
+
+  cat > "${bin_dir}/safe" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "audit" ]]; then
+  shift
+  exec safe-audit "$@"
+fi
+
+printf 'unexpected safe command: %s\n' "$*" >&2
+exit 99
+STUB
+  chmod +x "${bin_dir}/safe"
 }
 
 prepare_case() {
@@ -281,7 +293,7 @@ case_missing_safe_audit_warns_once() {
   prepare_case "missing-safe-audit-warns-once" no
   SAFE_INSTALL_TEST_SCRIPT='npm install -g one; npm install -g two' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_count 1 'safe-audit not installed, skipping pre-install check' "${ERR_FILE}" "$FUNCNAME" || return
+  assert_count 1 'safe audit not installed, skipping pre-install check' "${ERR_FILE}" "$FUNCNAME" || return
   assert_log_contains $'REAL\tnpm\tinstall\t-g\tone' "$FUNCNAME" || return
   assert_log_contains $'REAL\tnpm\tinstall\t-g\ttwo' "$FUNCNAME" || return
   pass "$FUNCNAME"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.1.1"
+SAFE_VERSION="1.1.2"
 SAFE_SELF="$(readlink -f "$0")"
 SAFE_DIR="$(dirname "$SAFE_SELF")"
 SAFE_CONFIG_ROOT="${SAFE_CONFIG_DIR:-$HOME/.config/safe}"
@@ -561,8 +561,8 @@ print_doctor_human() {
   jq -r '
     "paths:",
     "  safe: " + .paths.safe.resolved,
-    "  safe-run: " + .paths.safe_run.resolved,
-    "  safe-audit: " + .paths.safe_audit.resolved,
+    "  safe run binary: " + .paths.safe_run.resolved,
+    "  safe audit binary: " + .paths.safe_audit.resolved,
     "",
     "dispatch:",
     "  audit version parity: " + (if .dispatch.audit_version_parity.supported then (if .dispatch.audit_version_parity.ok then "ok" else "mismatch" end) else "unavailable" end),
@@ -574,7 +574,7 @@ print_doctor_human() {
     "  verify sigstore-bundle: " + (if .features.verify_sigstore_bundle.ready then "ready" else "not ready" end),
     "  verify tuf-bootstrap: " + (if .features.verify_tuf_bootstrap.ready then "ready" else "not ready" end),
     "  binary exec: " + (if .features.binary_exec.ready then "ready" else "not ready" end),
-    "  safe-run sandbox: " + (if .features.safe_run_sandbox.ready then "ready" else "not ready" end),
+    "  safe run sandbox: " + (if .features.safe_run_sandbox.ready then "ready" else "not ready" end),
     "",
     "missing prerequisites:",
     (
@@ -909,7 +909,7 @@ safe_install_audit_package() {
   local ecosystem="$2"
   local audit_status
 
-  [[ -x "$SAFE_AUDIT_PATH" ]] || die "safe install requires safe-audit at $SAFE_AUDIT_PATH"
+  [[ -x "$SAFE_AUDIT_PATH" ]] || die "safe install requires safe audit at $SAFE_AUDIT_PATH"
 
   set +e
   "$SAFE_AUDIT_PATH" check "$package" --ecosystem "$ecosystem"
@@ -1092,7 +1092,13 @@ fi
 
 case "${1:-}" in
   run)      shift; exec "$SAFE_RUN_PATH" "$@" ;;
-  audit)    shift; exec "$SAFE_AUDIT_PATH" "$@" ;;
+  audit)
+    shift
+    if [[ "${1:-}" == "help" ]]; then
+      exec "$SAFE_AUDIT_PATH" --help
+    fi
+    exec "$SAFE_AUDIT_PATH" "$@"
+    ;;
   install)  shift; cmd_install "$@" ;;
   vendor)   shift; cmd_vendor "$@" ;;
   status)   shift; cmd_status "$@" ;;

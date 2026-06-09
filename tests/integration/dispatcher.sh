@@ -19,6 +19,8 @@ pass "dispatcher syntax"
 
 completion_file="$ROOT/lib/completions/_safe"
 grep -Fq 'safe doctor [--json]' < <("$SAFE" --help) || fail "safe help missing doctor"
+grep -Fq 'safe run host-allow' < <(SAFE_RUN_NO_INIT=1 "$SAFE" run help) || fail "safe run help missing dispatcher form"
+grep -Fq 'safe audit scan' < <(SAFE_AUDIT_NO_INIT=1 "$SAFE" audit help) || fail "safe audit help missing dispatcher form"
 grep -Fq "'doctor:show local readiness diagnostics'" "$completion_file" || fail "top-level completion missing doctor"
 grep -Fq "doctor option' '--json'" "$completion_file" || fail "doctor completion missing --json"
 pass "help and completion"
@@ -68,7 +70,7 @@ ln -s npm "$shim/composer"
 
 [[ "$("$shim/safe" run --version)" == "safe-run mock" ]] || fail "safe run did not route"
 [[ "$("$shim/safe" audit --version)" == "safe-audit mock" ]] || fail "safe audit did not route"
-[[ "$("$shim/safe" install --allow-scripts cowsay@1.6.0)" == $'safe-run\tinstall\t--allow-scripts\tcowsay@1.6.0' ]] || fail "safe install did not route to safe-run install"
+[[ "$("$shim/safe" install --allow-scripts cowsay@1.6.0)" == $'safe-run\tinstall\t--allow-scripts\tcowsay@1.6.0' ]] || fail "safe install did not route to safe run install"
 host_install_output="$(PATH="$shim:$PATH" "$shim/safe" install --yes -g cowsay@1.6.0)"
 grep -Fq $'safe-audit\tcheck\tcowsay@1.6.0\t--ecosystem\tnpm' <<<"$host_install_output" || fail "safe install did not audit global npm package"
 grep -Fq $'npm\tinstall\t-g\tcowsay@1.6.0' <<<"$host_install_output" || fail "safe install did not forward global npm flags"
@@ -143,7 +145,7 @@ routed_json="$(
   SAFE_AUDIT_DATA_DIR="$cap_tmp/data" \
     "$ROOT/bin/safe" audit capabilities --json
 )"
-[[ "$(jq -cS . <<<"$direct_json")" == "$(jq -cS . <<<"$routed_json")" ]] || fail "safe audit capabilities did not match direct safe-audit output"
+[[ "$(jq -cS . <<<"$direct_json")" == "$(jq -cS . <<<"$routed_json")" ]] || fail "safe audit capabilities did not match direct compatibility binary output"
 jq -e '.command == "safe audit capabilities" and .groups.verify["sigstore-bundle"] == true and .groups.setup["create-bundle"] == true' <<<"$routed_json" >/dev/null || fail "safe audit capabilities returned an unexpected payload"
 [[ ! -e "$cap_tmp/data/checks" ]] || fail "safe audit capabilities wrote audit checks"
 pass "dispatcher capabilities"

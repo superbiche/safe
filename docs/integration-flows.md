@@ -40,7 +40,7 @@ safe run create-vite@latest -- my-app
 
 Flow:
 
-1. `safe-run` normalizes the package and checks `blocked.json`.
+1. `safe run` normalizes the package and checks `blocked.json`.
 2. If not host-allowed, it tries `safe audit check` in an isolated audit container.
 3. `BLOCK` refuses execution.
 4. `WARN` logs the warning and continues only in the sandbox path.
@@ -50,7 +50,7 @@ Flow:
 ## Host-Allow Promotion
 
 ```bash
-safe-run host-allow add pnpm@10.11.0 --reason "daily package manager"
+safe run host-allow add pnpm@10.11.0 --reason "daily package manager"
 ```
 
 Flow:

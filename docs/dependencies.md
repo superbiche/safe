@@ -5,7 +5,7 @@
 This is intentional. A security tool cannot establish trust in the binaries it
 uses by downloading and running upstream installers on the user's behalf.
 
-`safe-audit` can use these external tools when they are already available:
+`safe audit` can use these external tools when they are already available:
 
 | Tool | Purpose | Upstream |
 | --- | --- | --- |

@@ -4,9 +4,9 @@
 
 ```text
 safe
-  run      -> safe-run
-  audit    -> safe-audit
-  install  -> audited npm host install, or safe-run install with --sandbox
+  run      -> sandboxed package runner
+  audit    -> evidence and verdict engine
+  install  -> audited npm host install, or safe run install with --sandbox
   vendor   -> safe vendor update
   setup    -> safe audit setup
   status   -> combined status

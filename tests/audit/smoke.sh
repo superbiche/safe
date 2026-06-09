@@ -50,7 +50,7 @@ pass "completion output"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-audit_version="$("$SAFE_AUDIT" --version | awk '{print $2}')"
+audit_version="$("$SAFE_AUDIT" --version | awk '{print $NF}')"
 capabilities_json="$(
   SAFE_AUDIT_CONFIG_DIR="$tmp/cap-config" \
   SAFE_AUDIT_DATA_DIR="$tmp/cap-data" \
