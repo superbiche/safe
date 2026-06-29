@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="canonical" href="https://superbiche.github.io/safe/1.1.3/integration-flows/">
+    <meta name="theme-color" content="#0d0e12">
+    <meta name="darkreader-lock">
+    <title>Integration Flows - safe</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400;1,500;1,600&family=IBM+Plex+Serif:ital,wght@0,300;0,400;0,500;1,300;1,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../css/superbiche.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="site-header">
+      <div class="site-header__inner">
+        <a class="brand" href=".." aria-label="safe home">
+          <span class="brand__signal" aria-hidden="true"></span>
+          <span class="brand__name">safe</span>
+        </a>
+        <a class="header-repo" href="https://github.com/superbiche/safe" aria-label="Source repository">
+          <span>superbiche/safe</span>
+        </a>
+      </div>
+    </header>
+
+    <div class="layout-shell">
+      <aside class="sidebar" aria-label="Documentation navigation">
+        <div class="search-panel">
+          <label class="search-panel__label" for="mkdocs-search-query">Search</label>
+          <input id="mkdocs-search-query" class="search-panel__input" type="search" placeholder="Search docs" autocomplete="off">
+          <div id="mkdocs-search-results" class="search-panel__results" aria-live="polite"></div>
+        </div>
+
+        <nav class="side-nav">
+          
+          <ul class="side-nav__list side-nav__list--level-1">
+            <li class="side-nav__item">
+              <span class="side-nav__section">Home</span>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../architecture/">Architecture</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../installation/">Installation</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../dependencies/">External Dependencies</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../safe-run/">safe-run</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../safe-audit/">safe-audit</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../install-wrappers/">Install Wrappers</a>
+            </li>
+            <li class="side-nav__item side-nav__item--active">
+              <a class="side-nav__link side-nav__link--current" href="./">Integration Flows</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../configuration/">Configuration</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../operations/">Operations</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../publishing/">Publishing</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../command-reference/">Command Reference</a>
+            </li>
+          </ul>
+        </nav>
+      </aside>
+
+      <main id="main-content" class="content-wrap" tabindex="-1">
+        <div class="content-grid">
+          <article class="doc-content">
+            <div class="doc-kicker">
+              <span>integration-flows.md</span>
+            </div>
+            <h1 id="integration-flows">Integration Flows</h1>
+<p>This page shows how the pieces fit together in real workflows.</p>
+<h2 id="new-machine-onboarding">New Machine Onboarding</h2>
+<pre><code class="language-bash">git clone &lt;repo-url&gt; /path/to/safe
+cd /path/to/safe
+bash install.sh
+safe doctor
+safe audit setup
+safe run link
+safe status
+</code></pre>
+<p><code>safe audit setup</code> only detects scanners or installs from an explicit local
+bundle. Install scanners manually after verification before this step, or use
+<code>safe audit setup --bundle &lt;scanners.tar.gz&gt;</code>.</p>
+<p>Then review machine config:</p>
+<pre><code class="language-bash">$EDITOR ~/.config/safe/audit/machines.json
+safe audit setup --all
+safe audit scan --all
+</code></pre>
+<p>Enable persistent install protection by starting a new zsh session or sourcing:</p>
+<pre><code class="language-bash">source &quot;$HOME/.config/safe/install-wrappers.zsh&quot;
+</code></pre>
+<h2 id="unknown-package-execution">Unknown Package Execution</h2>
+<pre><code class="language-bash">safe run create-vite@latest -- my-app
+</code></pre>
+<p>Flow:</p>
+<ol>
+<li><code>safe run</code> normalizes the package and checks <code>blocked.json</code>.</li>
+<li>If not host-allowed, it tries <code>safe audit check</code> in an isolated audit container.</li>
+<li><code>BLOCK</code> refuses execution.</li>
+<li><code>WARN</code> logs the warning and continues only in the sandbox path.</li>
+<li>Unknown TTY execution prompts; unknown non-TTY execution blocks.</li>
+<li>Sandbox execution uses strict defaults unless flags relax them.</li>
+</ol>
+<h2 id="host-allow-promotion">Host-Allow Promotion</h2>
+<pre><code class="language-bash">safe run host-allow add pnpm@10.11.0 --reason &quot;daily package manager&quot;
+</code></pre>
+<p>Flow:</p>
+<ol>
+<li><code>safe run</code> validates the exact package version.</li>
+<li>It asks <code>safe audit</code> for a package verdict.</li>
+<li>It records the pinned version, ecosystem, integrity where available, and reason.</li>
+<li>Future executions of the exact version run on the host.</li>
+<li>Host executions are appended to <code>~/.local/share/safe/audit/host-allow-log.jsonl</code>.</li>
+</ol>
+<p>Use host allow sparingly. It is for tools that need real host access, not for convenience.</p>
+<h2 id="persistent-install-guard">Persistent Install Guard</h2>
+<pre><code class="language-bash">npm install express
+</code></pre>
+<p>Flow:</p>
+<ol>
+<li>The zsh wrapper detects a package install.</li>
+<li>If the current directory looks like an npm project, it runs <code>safe audit scan --project .</code>.</li>
+<li>It extracts package specs and runs <code>safe audit check &lt;pkg&gt;@&lt;version&gt; --ecosystem npm</code>.</li>
+<li>Only <code>GO</code> proceeds for package checks.</li>
+<li>The real command runs through <code>command npm install express</code>.</li>
+</ol>
+<p>Equivalent wrapper patterns exist for pnpm, yarn, bun, uv, pip, pip3, cargo, go, composer, and volta.</p>
+<h2 id="external-binary-review">External Binary Review</h2>
+<p>External binary installers should treat a reviewed manifest as desired state and
+call <code>safe audit</code> for review signals before install.</p>
+<p>Representative review sequence for a GitHub-backed binary:</p>
+<pre><code class="language-bash">safe audit capabilities --json
+safe audit release github --repo go-task/task --version v3.50.0 --asset task_linux_amd64.tar.gz --json
+safe audit vuln github-release --repo go-task/task --version v3.50.0 --json
+safe audit verify release-asset --artifact ./task --checksum ./task_checksums.txt --json
+safe audit binary exec ./task --json -- --version
+</code></pre>
+<p>For Sigstore bootstrap-shaped binaries such as <code>cosign</code>, the flow can include:</p>
+<pre><code class="language-bash">safe audit verify sigstore-bundle \
+  --artifact ./cosign-linux-amd64 \
+  --bundle ./cosign-linux-amd64.sigstore.json \
+  --identity keyless@projectsigstore.iam.gserviceaccount.com \
+  --oidc-issuer https://accounts.google.com
+
+safe audit verify tuf-bootstrap \
+  --mirror ./mirror \
+  --root ./root.json \
+  --root-checksum &quot;$(sha256sum ./root.json | awk '{print $1}')&quot; \
+  --target artifact.pub=./trust/artifact.pub
+</code></pre>
+<h2 id="ci-or-script-integration">CI Or Script Integration</h2>
+<p>Use <code>safe audit capabilities --json</code> before relying on advanced checks:</p>
+<pre><code class="language-bash">if safe audit capabilities --json | jq -e '.capabilities[&quot;verify.release-asset&quot;]'; then
+  safe audit verify release-asset --artifact ./tool --checksum ./checksums.txt --json
+fi
+</code></pre>
+<p>Use <code>safe doctor --json</code> for local readiness:</p>
+<pre><code class="language-bash">safe doctor --json | jq '.features'
+</code></pre>
+<p>Avoid parsing human status output in automation when JSON is available.</p>
+            <nav class="page-nav" aria-label="Page navigation">
+              <div>
+                <span class="page-nav__label">Previous</span>
+                <a href="../install-wrappers/">Install Wrappers</a>
+              </div>
+              <div>
+                <span class="page-nav__label">Next</span>
+                <a href="../configuration/">Configuration</a>
+              </div>
+            </nav>
+          </article>
+          <aside class="toc-panel" aria-label="Table of contents">
+            <div class="toc-panel__title">On This Page</div>
+            <ul class="toc-panel__list">
+              <li>
+                <a href="#integration-flows">Integration Flows</a>
+                <ul>
+                  <li><a href="#new-machine-onboarding">New Machine Onboarding</a></li>
+                  <li><a href="#unknown-package-execution">Unknown Package Execution</a></li>
+                  <li><a href="#host-allow-promotion">Host-Allow Promotion</a></li>
+                  <li><a href="#persistent-install-guard">Persistent Install Guard</a></li>
+                  <li><a href="#external-binary-review">External Binary Review</a></li>
+                  <li><a href="#ci-or-script-integration">CI Or Script Integration</a></li>
+                </ul>
+              </li>
+            </ul>
+          </aside>
+        </div>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <div class="site-footer__grid">
+        <div>
+          <span class="site-footer__label">License</span>
+          <span class="site-footer__value">MIT</span>
+        </div>
+        <div>
+          <span class="site-footer__label">Source</span>
+          <a class="site-footer__value" href="https://github.com/superbiche/safe">superbiche/safe</a>
+        </div>
+        <div>
+          <span class="site-footer__label">Built with</span>
+          <a class="site-footer__value" href="https://www.mkdocs.org">MkDocs</a>
+        </div>
+      </div>
+    </footer>
+    <script>
+      window.superbicheSearch = {
+        enabled: true,
+        baseUrl: ".."
+      };
+      window.superbicheVersions = {
+        enabled: true,
+        baseUrl: ".."
+      };
+    </script>
+    <script src="../js/superbiche.js"></script>
+    <script src="../search/main.js"></script>
+  </body>
+</html>

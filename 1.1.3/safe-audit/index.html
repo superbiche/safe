@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="canonical" href="https://superbiche.github.io/safe/1.1.3/safe-audit/">
+    <meta name="theme-color" content="#0d0e12">
+    <meta name="darkreader-lock">
+    <title>safe-audit - safe</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400;1,500;1,600&family=IBM+Plex+Serif:ital,wght@0,300;0,400;0,500;1,300;1,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../css/superbiche.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="site-header">
+      <div class="site-header__inner">
+        <a class="brand" href=".." aria-label="safe home">
+          <span class="brand__signal" aria-hidden="true"></span>
+          <span class="brand__name">safe</span>
+        </a>
+        <a class="header-repo" href="https://github.com/superbiche/safe" aria-label="Source repository">
+          <span>superbiche/safe</span>
+        </a>
+      </div>
+    </header>
+
+    <div class="layout-shell">
+      <aside class="sidebar" aria-label="Documentation navigation">
+        <div class="search-panel">
+          <label class="search-panel__label" for="mkdocs-search-query">Search</label>
+          <input id="mkdocs-search-query" class="search-panel__input" type="search" placeholder="Search docs" autocomplete="off">
+          <div id="mkdocs-search-results" class="search-panel__results" aria-live="polite"></div>
+        </div>
+
+        <nav class="side-nav">
+          
+          <ul class="side-nav__list side-nav__list--level-1">
+            <li class="side-nav__item">
+              <span class="side-nav__section">Home</span>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../architecture/">Architecture</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../installation/">Installation</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../dependencies/">External Dependencies</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../safe-run/">safe-run</a>
+            </li>
+            <li class="side-nav__item side-nav__item--active">
+              <a class="side-nav__link side-nav__link--current" href="./">safe-audit</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../install-wrappers/">Install Wrappers</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../integration-flows/">Integration Flows</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../configuration/">Configuration</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../operations/">Operations</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../publishing/">Publishing</a>
+            </li>
+            <li class="side-nav__item">
+              <a class="side-nav__link" href="../command-reference/">Command Reference</a>
+            </li>
+          </ul>
+        </nav>
+      </aside>
+
+      <main id="main-content" class="content-wrap" tabindex="-1">
+        <div class="content-grid">
+          <article class="doc-content">
+            <div class="doc-kicker">
+              <span>safe-audit.md</span>
+            </div>
+            <h1 id="safe-audit">safe audit</h1>
+<p><code>safe audit</code> is the evidence and verdict engine for the ecosystem.</p>
+<p>Call it through the dispatcher:</p>
+<pre><code class="language-bash">safe audit scan --project .
+</code></pre>
+<p>The compatibility <code>safe-audit</code> binary remains installed for scripts, but
+documentation and examples use the dispatcher form.</p>
+<h2 id="capabilities">Capabilities</h2>
+<p>Use the machine-readable capability command when integrating with other scripts:</p>
+<pre><code class="language-bash">safe audit capabilities --json
+</code></pre>
+<p>The current capability groups cover:</p>
+<ul>
+<li>scan, check, diff, and status;</li>
+<li>GitHub release review;</li>
+<li>GitHub repository advisory checks;</li>
+<li>release asset verification;</li>
+<li>Sigstore bundle verification;</li>
+<li>TUF bootstrap verification;</li>
+<li>binary sandbox execution;</li>
+<li>IOC lookup, list scanning, and updates;</li>
+<li>machine setup and scanner bundle creation.</li>
+</ul>
+<h2 id="scanner-setup">Scanner Setup</h2>
+<p><code>safe audit setup</code> detects already-installed scanner tools and can install
+scanner binaries from an explicit local bundle. It does not download upstream
+release assets, run <code>curl | sh</code>, or run language package installers.</p>
+<p>Scanner dependency policy and upstream links are documented in
+<a href="../dependencies/">External Dependencies</a>.</p>
+<p>Create a bundle from an audited machine:</p>
+<pre><code class="language-bash">safe audit setup --create-bundle ./scanners.tar.gz
+</code></pre>
+<p>Install that bundle on a target machine:</p>
+<pre><code class="language-bash">safe audit setup local --bundle ./scanners.tar.gz
+</code></pre>
+<h2 id="project-and-machine-scans">Project And Machine Scans</h2>
+<p>Local project scan:</p>
+<pre><code class="language-bash">safe audit scan --project .
+</code></pre>
+<p>Verbose project scan:</p>
+<pre><code class="language-bash">safe audit scan --verbose --project .
+</code></pre>
+<p>Default project and machine scans use <code>source</code> mode. This is the normal
+high-signal mode:</p>
+<ul>
+<li>audit dependency manifests and lockfiles;</li>
+<li>stage first-party source files for SBOM and source-risk checks;</li>
+<li>skip installed or generated dependency trees such as <code>node_modules/</code>,
+  <code>vendor/</code>, virtualenvs, caches, and build output.</li>
+</ul>
+<p>The staged source scan includes high-signal static checks for suspicious loaders
+and credential/network use. A default machine scan discovers projects under the
+configured scan root and scans those project roots; it does not fall back to
+scanning every random source file under the whole root unless you pass an
+explicit <code>--project</code> target or <code>--full</code>.</p>
+<p>Scan modes:</p>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Flag</th>
+<th>What it scans</th>
+<th>Main use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>source</code></td>
+<td>default</td>
+<td>Dependency evidence plus first-party source, excluding installed deps and generated trees.</td>
+<td>Normal project and machine scans.</td>
+</tr>
+<tr>
+<td><code>deps</code></td>
+<td><code>--deps-only</code></td>
+<td>Dependency manifests and lockfiles only.</td>
+<td>Fast dependency check when source-risk scanning is not needed.</td>
+</tr>
+<tr>
+<td><code>full</code></td>
+<td><code>--full</code></td>
+<td>Full target tree, including installed deps such as <code>node_modules/</code> and <code>vendor/</code>.</td>
+<td>Deep investigation when speed is secondary.</td>
+</tr>
+</tbody>
+</table>
+<p><code>--verbose</code> prints the resolved target, scan mode, project roots, lockfiles,
+manifests, staged source files, and scanner inputs. Use it when confirming that
+a scan is constrained to the intended project or machine root.</p>
+<p>When required scanners (<code>osv-scanner</code>, <code>syft</code>, <code>grype</code>) or discovered project
+ecosystems require audit commands that are missing (<code>npm</code>, <code>composer</code>,
+<code>pip-audit</code>, <code>cargo-audit</code>, <code>govulncheck</code>), <code>safe audit scan</code> stops by default
+and prints install guidance plus the rerun command. If you explicitly continue
+with a partial audit, missing tools are reported as <code>skipped</code> and the scan
+verdict is <code>WARN</code>; they are not presented as zero CVEs.</p>
+<p>Dependency-only scan:</p>
+<pre><code class="language-bash">safe audit scan --deps-only --project .
+</code></pre>
+<p>Full filesystem scan, including installed dependency trees:</p>
+<pre><code class="language-bash">safe audit scan --full --project .
+</code></pre>
+<p>Configured machine scan:</p>
+<pre><code class="language-bash">safe audit scan --machine remote-a --project /path/to/project
+</code></pre>
+<p>All configured machines:</p>
+<pre><code class="language-bash">safe audit scan --all
+</code></pre>
+<p>Results are written under:</p>
+<pre><code class="language-text">~/.local/share/safe/audit/results/&lt;machine&gt;/
+~/.local/share/safe/audit/sbom/&lt;machine&gt;/
+</code></pre>
+<p>Remote scan strategies are selected from available tools and connectivity:</p>
+<ul>
+<li>remote direct scanner execution;</li>
+<li>remote SBOM generation with local vulnerability scanning;</li>
+<li>staged local scanning of copied source evidence.</li>
+</ul>
+<p>Before trusting a remote Grype scan, <code>safe audit</code> checks <code>grype db status -o json -q</code>. The stale threshold defaults to 7 days and can be changed:</p>
+<pre><code class="language-bash">SAFE_AUDIT_GRYPE_DB_MAX_AGE_DAYS=14 safe audit scan --machine remote-a --project /path/to/project
+</code></pre>
+<h2 id="package-checks">Package Checks</h2>
+<pre><code class="language-bash">safe audit check express@4.21.0 --ecosystem npm
+safe audit check ruff@0.11.0 --ecosystem python --json
+</code></pre>
+<p>Checks include OSV, Socket package scoring when available, and the shared <code>safe run</code> blocklist. Verdicts are:</p>
+<pre><code class="language-text">GO
+WARN
+BLOCK
+</code></pre>
+<p>Socket is optional for command availability but improves package behavior scoring. Authenticate with:</p>
+<pre><code class="language-bash">socket login
+</code></pre>
+<p>For predictable repeated use, use a Socket account token. The practical token scope for <code>socket package score</code> is <code>packages:list</code>.</p>
+<h2 id="release-review">Release Review</h2>
+<p>Review a GitHub release before downloading assets:</p>
+<pre><code class="language-bash">safe audit release github \
+  --repo sigstore/cosign \
+  --version v3.0.5 \
+  --asset cosign-linux-amd64 \
+  --json
+</code></pre>
+<p>Checks include release age, draft/prerelease status, asset presence, release churn, previous release comparison, high-risk path changes, tag-to-commit resolution, and GitHub commit verification status.</p>
+<p>For repositories with multiple release streams:</p>
+<pre><code class="language-bash">safe audit release github \
+  --repo scaleway/scaleway-cli \
+  --version v2.55.0 \
+  --asset scaleway-cli_2.55.0_linux_amd64 \
+  --tag-regex '^v2\.'
+</code></pre>
+<h2 id="advisory-review">Advisory Review</h2>
+<pre><code class="language-bash">safe audit vuln github-release --repo OWNER/REPO --version v1.2.3 --json
+</code></pre>
+<p>The command maps GitHub repository security advisory ranges to the supplied release version where possible. High or critical matches block. Ambiguous advisory mappings block instead of being ignored.</p>
+<h2 id="verification">Verification</h2>
+<p>Checksum-only release asset verification:</p>
+<pre><code class="language-bash">safe audit verify release-asset \
+  --artifact ./tool-linux-amd64 \
+  --checksum ./checksums.txt \
+  --json
+</code></pre>
+<p>Checksum-only success returns <code>WARN</code> because no signature was verified. Add Sigstore certificate and signature data when available:</p>
+<pre><code class="language-bash">safe audit verify release-asset \
+  --artifact ./tool-linux-amd64 \
+  --checksum ./checksums.txt \
+  --certificate ./checksums.txt.pem \
+  --signature ./checksums.txt.sig \
+  --certificate-identity-regexp '^https://github.com/OWNER/REPO/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --require-signature
+</code></pre>
+<p>Verify a Sigstore bundle:</p>
+<pre><code class="language-bash">safe audit verify sigstore-bundle \
+  --artifact ./cosign-linux-amd64 \
+  --bundle ./cosign-linux-amd64.sigstore.json \
+  --identity keyless@projectsigstore.iam.gserviceaccount.com \
+  --oidc-issuer https://accounts.google.com
+</code></pre>
+<p>Verify a local TUF bootstrap:</p>
+<pre><code class="language-bash">safe audit verify tuf-bootstrap \
+  --mirror ./mirror \
+  --root ./root.json \
+  --root-checksum &quot;$(sha256sum ./root.json | awk '{print $1}')&quot; \
+  --target artifact.pub=./trust/artifact.pub \
+  --json
+</code></pre>
+<p><code>verify tuf-bootstrap</code> requires <code>cosign</code>, a checksum tool, and <code>python3</code> or <code>python</code>. Local mirror inputs can be paths or <code>file://...</code> URLs. The verifier serves local mirror content through a temporary loopback <code>http://127.0.0.1:&lt;port&gt;</code> bridge before calling <code>cosign initialize</code>, because Cosign does not bootstrap correctly from <code>file://</code> mirrors.</p>
+<h2 id="binary-execution">Binary Execution</h2>
+<p>Run an artifact in a networkless Podman sandbox:</p>
+<pre><code class="language-bash">safe audit binary exec ./tool --json -- --version
+</code></pre>
+<p>The sandbox uses a read-only artifact bind mount, no network, dropped capabilities, no-new-privileges, and tmpfs scratch space. Startup-shaped failures are classified with reason codes such as <code>missing_interpreter</code>, <code>missing_shared_library</code>, <code>sandbox_runtime_mismatch</code>, and <code>runtime_failure</code>.</p>
+<h2 id="ioc-workflows">IOC Workflows</h2>
+<p>Lookup one advisory and scan the default machine:</p>
+<pre><code class="language-bash">safe audit ioc GHSA-example-id
+</code></pre>
+<p>Scan with a custom IOC JSON file:</p>
+<pre><code class="language-bash">safe audit ioc --list ./ioc.json --machine remote-a
+</code></pre>
+<p>Update the CISA KEV-derived IOC catalog and scan:</p>
+<pre><code class="language-bash">safe audit ioc --update --since 7d --all
+</code></pre>
+            <nav class="page-nav" aria-label="Page navigation">
+              <div>
+                <span class="page-nav__label">Previous</span>
+                <a href="../safe-run/">safe-run</a>
+              </div>
+              <div>
+                <span class="page-nav__label">Next</span>
+                <a href="../install-wrappers/">Install Wrappers</a>
+              </div>
+            </nav>
+          </article>
+          <aside class="toc-panel" aria-label="Table of contents">
+            <div class="toc-panel__title">On This Page</div>
+            <ul class="toc-panel__list">
+              <li>
+                <a href="#safe-audit">safe audit</a>
+                <ul>
+                  <li><a href="#capabilities">Capabilities</a></li>
+                  <li><a href="#scanner-setup">Scanner Setup</a></li>
+                  <li><a href="#project-and-machine-scans">Project And Machine Scans</a></li>
+                  <li><a href="#package-checks">Package Checks</a></li>
+                  <li><a href="#release-review">Release Review</a></li>
+                  <li><a href="#advisory-review">Advisory Review</a></li>
+                  <li><a href="#verification">Verification</a></li>
+                  <li><a href="#binary-execution">Binary Execution</a></li>
+                  <li><a href="#ioc-workflows">IOC Workflows</a></li>
+                </ul>
+              </li>
+            </ul>
+          </aside>
+        </div>
+      </main>
+    </div>
+
+    <footer class="site-footer">
+      <div class="site-footer__grid">
+        <div>
+          <span class="site-footer__label">License</span>
+          <span class="site-footer__value">MIT</span>
+        </div>
+        <div>
+          <span class="site-footer__label">Source</span>
+          <a class="site-footer__value" href="https://github.com/superbiche/safe">superbiche/safe</a>
+        </div>
+        <div>
+          <span class="site-footer__label">Built with</span>
+          <a class="site-footer__value" href="https://www.mkdocs.org">MkDocs</a>
+        </div>
+      </div>
+    </footer>
+    <script>
+      window.superbicheSearch = {
+        enabled: true,
+        baseUrl: ".."
+      };
+      window.superbicheVersions = {
+        enabled: true,
+        baseUrl: ".."
+      };
+    </script>
+    <script src="../js/superbiche.js"></script>
+    <script src="../search/main.js"></script>
+  </body>
+</html>
