@@ -13,6 +13,8 @@ uses by downloading and running upstream installers on the user's behalf.
 | Syft | SBOM generation | <https://github.com/anchore/syft> |
 | Grype | Vulnerability scanning from SBOMs and filesystems | <https://github.com/anchore/grype> |
 | Socket CLI | Package behavioral and supply-chain signal | <https://docs.socket.dev/docs/socket-cli> |
+| npm | Node package audit support through `npm audit` | <https://docs.npmjs.com/cli/commands/npm-audit> |
+| Composer | PHP package audit support through `composer audit` | <https://getcomposer.org/doc/03-cli.md#audit> |
 | govulncheck | Go vulnerability checks | <https://github.com/golang/vuln> |
 | cargo-audit | Rust vulnerability checks | <https://github.com/rustsec/rustsec/tree/main/cargo-audit> |
 | pip-audit | Python vulnerability checks | <https://github.com/pypa/pip-audit> |
@@ -20,6 +22,11 @@ uses by downloading and running upstream installers on the user's behalf.
 Install these tools through a channel you trust. That may be an OS package
 manager, a pinned release asset, a source build you reviewed, or an internal
 tooling image. The right choice depends on your threat model.
+
+Project scans require the core scanners and only the ecosystem audit tools for
+ecosystems discovered in that project. Missing scanner coverage stops the scan by
+default; if you explicitly continue, the affected tool is shown as `skipped` and
+the result verdict is `WARN`.
 
 After installing tools, ask `safe` to detect them:
 

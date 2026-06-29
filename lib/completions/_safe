@@ -39,7 +39,7 @@ _safe_audit() {
   local subcmd="${words[3]:-}"
   local nested="${words[4]:-}"
   audit_cmds=(scan check release vuln verify binary ioc setup diff status capabilities)
-  scan_opts=(--all --machine --project)
+  scan_opts=(--all --machine --project --verbose --deps-only --full)
   check_opts=(--ecosystem --json)
   capabilities_opts=(--json)
   ioc_opts=(--all --machine --list --update --since)

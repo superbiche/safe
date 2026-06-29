@@ -56,7 +56,7 @@ Runner flags:
 
 ```bash
 safe audit capabilities [--json]
-safe audit scan [--project <path>] [--all | --machine <csv>]
+safe audit scan [--verbose] [--deps-only | --full] [--project <path>] [--all | --machine <csv>]
 safe audit check <pkg>@<version> [--ecosystem <name>] [--json]
 safe audit release github --repo OWNER/REPO --version TAG --asset NAME [--tag-regex REGEX] [--json]
 safe audit vuln github-release --repo OWNER/REPO --version TAG [--json]
@@ -77,6 +77,16 @@ safe audit --version
 `safe audit setup` detects existing scanner tools and can install scanners from
 an explicit local bundle. It does not download upstream release assets, run
 `curl | sh`, or run language package installers.
+
+`safe audit scan` defaults to `source` mode: dependency manifests and lockfiles
+plus first-party source, while skipping installed dependency trees and generated
+output. Use `--deps-only` for manifests and lockfiles only, `--full` to scan the
+complete target tree, and `--verbose` to print project discovery, staged files,
+and scanner inputs.
+
+Missing required scanners or audit tools for discovered project ecosystems stop
+the scan by default. If an interactive user explicitly continues, the missing
+tool coverage is reported as `skipped` and the verdict is `WARN`, not zero CVEs.
 
 ## Vendor Updates
 

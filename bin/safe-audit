@@ -5,6 +5,8 @@ set -euo pipefail
 
 SAFE_AUDIT_VERSION="0.1.0"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
+SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
+SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
 
 CONFIG_DIR="${SAFE_AUDIT_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/audit}"
 DATA_DIR="${SAFE_AUDIT_DATA_DIR:-${SAFE_DATA_DIR:-$HOME/.local/share/safe}/audit}"
@@ -64,12 +66,61 @@ declare -a PROJECT_IGNORES=()
 declare -a CURRENT_LOCKFILES=()
 declare -a CURRENT_MANIFESTS=()
 declare -a CURRENT_PROJECT_ROOTS=()
+declare -a CURRENT_SOURCE_FILES=()
 declare -a CURRENT_SYFT_EXCLUDES=()
+
+declare -ar DEFAULT_DERIVED_EXCLUDES=(
+  .git
+  .hg
+  .svn
+  node_modules
+  vendor
+  .venv
+  venv
+  env
+  .tox
+  .nox
+  __pycache__
+  .pytest_cache
+  .mypy_cache
+  .ruff_cache
+  .cache
+  .parcel-cache
+  .turbo
+  .next
+  .nuxt
+  .vite
+  dist
+  build
+  out
+  coverage
+  target
+)
 
 err()  { printf '\033[31msafe audit:\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[33msafe audit:\033[0m %s\n' "$*" >&2; }
 info() { printf '\033[36msafe audit:\033[0m %s\n' "$*" >&2; }
+vinfo() {
+  [[ "${SAFE_AUDIT_VERBOSE:-0}" == "1" ]] || return 0
+  printf '\033[36msafe audit:\033[0m verbose: %s\n' "$*" >&2
+}
 die()  { err "$@"; exit 1; }
+
+verbose_paths() {
+  [[ "${SAFE_AUDIT_VERBOSE:-0}" == "1" ]] || return 0
+  local label="$1"
+  shift || true
+  local total="$#" limit=20 count=0 path
+  vinfo "$label: $total"
+  for path in "$@"; do
+    if (( count >= limit )); then
+      vinfo "$label: ... $((total - limit)) more"
+      break
+    fi
+    vinfo "$label: $(printf '%q' "$path")"
+    ((count += 1))
+  done
+}
 
 is_tty() { [[ -t 0 && -t 1 ]]; }
 now_iso() { date -Iseconds; }
@@ -1056,6 +1107,28 @@ machine_missing_tools_from_list() {
   printf '%s\n' "${missing[*]:-}"
 }
 
+install_hint_for_tool() {
+  case "$1" in
+    osv-scanner) printf 'install OSV-Scanner from a verified release, or provide it through an audited scanner bundle' ;;
+    syft) printf 'install Syft from a verified release, or provide it through an audited scanner bundle' ;;
+    grype) printf 'install Grype from a verified release, or provide it through an audited scanner bundle' ;;
+    npm) printf 'install Node.js/npm from your trusted package manager; npm audit is provided by npm' ;;
+    composer) printf 'install Composer from your trusted package manager or a verified Composer release' ;;
+    cargo-audit) printf 'install RustSec cargo-audit after verification, for example: cargo install cargo-audit' ;;
+    govulncheck) printf 'install govulncheck after verification, for example: go install golang.org/x/vuln/cmd/govulncheck@latest' ;;
+    pip-audit) printf 'install pip-audit after verification, for example: python -m pipx install pip-audit' ;;
+    *) printf 'install %s from a trusted, verified source' "$1" ;;
+  esac
+}
+
+warn_install_hints_for_tools() {
+  local tool
+  for tool in "$@"; do
+    [[ -n "$tool" ]] || continue
+    warn "  - $tool: $(install_hint_for_tool "$tool")"
+  done
+}
+
 warn_missing_scan_tools() {
   local machine="$1"
   local missing
@@ -1063,6 +1136,7 @@ warn_missing_scan_tools() {
   [[ -z "$missing" ]] && return 0
   warn "$machine missing required scanners: $missing"
   warn "$machine: install scanners manually after verification, or use a local bundle with: safe audit setup $(printf '%q' "$machine") --bundle <scanners.tar.gz>"
+  warn_install_hints_for_tools $missing
 }
 
 confirm_scan_with_missing_tools() {
@@ -1081,6 +1155,7 @@ confirm_scan_with_missing_tools() {
 
   warn "$machine missing required scanners: $missing"
   warn "$machine: install scanners manually after verification, or install an audited local bundle:"
+  warn_install_hints_for_tools $missing
   warn "  $setup_cmd --bundle <scanners.tar.gz>"
   warn "  $scan_cmd"
   if ! is_tty; then
@@ -1210,15 +1285,73 @@ manifest_matches() {
   esac
 }
 
-path_matches_ignore() {
+lockfile_matches() {
+  local base
+  base=$(basename "$1")
+  case "$base" in
+    package-lock.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+project_root_manifest_matches() {
+  local base
+  base=$(basename "$1")
+  case "$base" in
+    .safe-audit|package.json|package-lock.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+source_file_matches() {
+  local base ext
+  base=$(basename "$1")
+  manifest_matches "$1" && return 0
+  case "$base" in
+    Dockerfile|Containerfile|Makefile|GNUmakefile|Gemfile|Rakefile|Procfile|Brewfile|Justfile|Taskfile.yml|Taskfile.yaml|Jenkinsfile|Vagrantfile|.envrc|.npmrc|.yarnrc|.yarnrc.yml|.pypirc|.gitignore|.dockerignore|.editorconfig)
+      return 0
+      ;;
+  esac
+  ext="${base##*.}"
+  case "$ext" in
+    sh|bash|zsh|fish|ps1|psm1|bat|cmd|js|mjs|cjs|jsx|ts|tsx|mts|cts|py|pyw|rb|php|go|rs|java|kt|kts|scala|c|cc|cpp|cxx|h|hh|hpp|cs|swift|m|mm|lua|pl|pm|r|R|dart|ex|exs|erl|hrl|clj|cljs|fs|fsx|sql|graphql|gql|html|htm|css|scss|sass|less|json|jsonc|json5|yaml|yml|toml|ini|cfg|conf|properties|xml|lock|md|mdx|rst|txt)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+path_matches_patterns() {
   local rel="$1"
+  shift || true
   local pattern
-  for pattern in "${PROJECT_IGNORES[@]}"; do
+  for pattern in "$@"; do
+    [[ -z "$pattern" ]] && continue
     if [[ "$rel" == $pattern || "$rel" == */$pattern || "$rel" == $pattern/* || "$rel" == */$pattern/* ]]; then
       return 0
     fi
   done
   return 1
+}
+
+path_matches_ignore() {
+  local rel="$1"
+  path_matches_patterns "$rel" "${PROJECT_IGNORES[@]}"
+}
+
+path_matches_default_exclude() {
+  local rel="$1"
+  path_matches_patterns "$rel" "${DEFAULT_DERIVED_EXCLUDES[@]}"
 }
 
 append_syft_excludes_for_config() {
@@ -1249,9 +1382,10 @@ find_source_files_pruned() {
   local source_abs="$1"
   local root_config="$source_abs/.safe-audit"
   local root_ignores=()
+  root_ignores=("${DEFAULT_DERIVED_EXCLUDES[@]}")
   if [[ -f "$root_config" ]]; then
     parse_project_config "$root_config"
-    root_ignores=("${PROJECT_IGNORES[@]}")
+    root_ignores+=("${PROJECT_IGNORES[@]}")
   fi
 
   local find_args=("$source_abs")
@@ -1263,7 +1397,11 @@ find_source_files_pruned() {
       clean_pattern="${pattern#./}"
       clean_pattern="${clean_pattern%/}"
       [[ "$first" == "1" ]] || find_args+=("-o")
-      find_args+=("-path" "$source_abs/$clean_pattern" "-o" "-path" "$source_abs/$clean_pattern/*")
+      if [[ "$clean_pattern" == */* ]]; then
+        find_args+=("-path" "$source_abs/$clean_pattern" "-o" "-path" "$source_abs/$clean_pattern/*")
+      else
+        find_args+=("-name" "$clean_pattern" "-o" "-path" "$source_abs/$clean_pattern" "-o" "-path" "$source_abs/$clean_pattern/*")
+      fi
       first=0
     done
     if [[ "$first" == "0" ]]; then
@@ -1290,12 +1428,90 @@ nearest_project_config() {
   return 1
 }
 
+file_ignored_by_nearest_project_config() {
+  local source_abs="$1" file="$2"
+  local project_cfg root rel
+  project_cfg=$(nearest_project_config "$(dirname "$file")" "$source_abs" || true)
+  [[ -n "$project_cfg" ]] || return 1
+  root=$(dirname "$project_cfg")
+  parse_project_config "$project_cfg"
+  rel=$(relative_to "$root" "$file")
+  path_matches_ignore "$rel"
+}
+
+file_under_current_project_roots() {
+  local file="$1" root
+  for root in "${CURRENT_PROJECT_ROOTS[@]}"; do
+    if [[ "$file" == "$root" || "$file" == "$root"/* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+collect_current_source_files() {
+  local source="$1" scan_mode="${2:-source}"
+  local source_abs
+  source_abs=$(path_abs "$source")
+  CURRENT_SOURCE_FILES=()
+
+  case "$scan_mode" in
+    deps)
+      CURRENT_SOURCE_FILES=("${CURRENT_MANIFESTS[@]}")
+      ;;
+    source)
+      local file
+      while IFS= read -r -d '' file; do
+        file_under_current_project_roots "$file" || continue
+        source_file_matches "$file" || continue
+        if file_ignored_by_nearest_project_config "$source_abs" "$file"; then
+          continue
+        fi
+        CURRENT_SOURCE_FILES+=("$file")
+      done < <(find_source_files_pruned "$source_abs")
+      ;;
+    full)
+      CURRENT_SOURCE_FILES=()
+      ;;
+    *)
+      die "unknown scan mode: $scan_mode"
+      ;;
+  esac
+
+  vinfo "source collection: mode=$scan_mode files=${#CURRENT_SOURCE_FILES[@]}"
+  verbose_paths "source file" "${CURRENT_SOURCE_FILES[@]}"
+}
+
+gather_scan_stage_from_current_files() {
+  local source="$1" stage="$2" scan_mode="${3:-source}"
+  local source_abs
+  source_abs=$(path_abs "$source")
+  mkdir -p "$stage"
+  collect_current_source_files "$source_abs" "$scan_mode"
+
+  local file rel file_list
+  file_list=$(mktemp)
+  for file in "${CURRENT_SOURCE_FILES[@]}"; do
+    [[ -f "$file" ]] || continue
+    rel=$(relative_to "$source_abs" "$file")
+    printf './%s\0' "$rel" >> "$file_list"
+  done
+
+  if [[ -s "$file_list" ]]; then
+    (cd "$source_abs" && tar --null -T "$file_list" -czf - 2>/dev/null) | tar -xzf - -C "$stage" 2>/dev/null || true
+  else
+    warn "bounded $scan_mode scan found no project files under $source"
+  fi
+  rm -f "$file_list"
+}
+
 gather_stage_locally() {
-  local source="$1" stage="$2"
+  local source="$1" stage="$2" scan_mode="${3:-source}" allow_source_fallback="${4:-1}"
   mkdir -p "$stage"
   local source_abs
   source_abs=$(path_abs "$source")
-  if ! gather_projects_from_source "$source_abs"; then
+  vinfo "local staging: source=$(printf '%q' "$source_abs") stage=$(printf '%q' "$stage") mode=$scan_mode"
+  if ! gather_projects_from_source "$source_abs" "$allow_source_fallback"; then
     warn "bounded project discovery failed for $source; falling back to manifest staging"
     (
       cd "$source_abs"
@@ -1304,29 +1520,19 @@ gather_stage_locally() {
     return 0
   fi
 
-  local manifest rel manifest_list
-  manifest_list=$(mktemp)
-  for manifest in "${CURRENT_MANIFESTS[@]}"; do
-    rel=$(relative_to "$source_abs" "$manifest")
-    printf './%s\0' "$rel" >> "$manifest_list"
-  done
-  if [[ -s "$manifest_list" ]]; then
-    (cd "$source_abs" && tar --null -T "$manifest_list" -czf - 2>/dev/null) | tar -xzf - -C "$stage" 2>/dev/null || true
-  else
-    warn "bounded project discovery found no manifests under $source; staged scan may be empty"
-  fi
-  rm -f "$manifest_list"
+  gather_scan_stage_from_current_files "$source_abs" "$stage" "$scan_mode"
 }
 
 gather_stage_remotely() {
-  local machine="$1" target="$2" stage="$3"
+  local machine="$1" target="$2" stage="$3" scan_mode="${4:-source}" allow_source_fallback="${5:-1}"
   mkdir -p "$stage"
   local host
   host=$(machine_host "$machine")
+  vinfo "$machine: remote staging target=$(printf '%q' "$target") stage=$(printf '%q' "$stage") host=$(printf '%q' "$host") mode=$scan_mode fallback=$allow_source_fallback"
   local rc=0
   local statuses=()
   set +e
-  remote_stage_helper_script | ssh_batch "$host" "bash -s -- $(printf '%q' "$target")" | tar -xzf - -C "$stage" 2>/dev/null
+  remote_stage_helper_script | ssh_batch "$host" "bash -s -- $(printf '%q' "$target") $(printf '%q' "$scan_mode") $(printf '%q' "$allow_source_fallback")" | tar -xzf - -C "$stage" 2>/dev/null
   statuses=("${PIPESTATUS[@]}")
   set -e
   local status
@@ -1353,14 +1559,25 @@ gather_stage_remotely() {
 }
 
 gather_projects_from_source() {
-  local source="$1"
+  local source="$1" allow_source_fallback="${2:-1}"
   local source_abs
   source_abs=$(path_abs "$source")
+  vinfo "project discovery: source=$(printf '%q' "$source_abs") fallback=$allow_source_fallback"
   CURRENT_LOCKFILES=()
   CURRENT_MANIFESTS=()
   CURRENT_PROJECT_ROOTS=()
+  CURRENT_SOURCE_FILES=()
   CURRENT_SYFT_EXCLUDES=()
   declare -A seen_roots=()
+
+  add_discovered_root() {
+    local root="$1"
+    [[ -n "$root" ]] || return 0
+    if [[ -z "${seen_roots[$root]:-}" ]]; then
+      seen_roots["$root"]=1
+      CURRENT_PROJECT_ROOTS+=("$root")
+    fi
+  }
 
   local cfg
   while IFS= read -r -d '' cfg; do
@@ -1369,6 +1586,7 @@ gather_projects_from_source() {
 
   local file rel project_cfg root
   while IFS= read -r -d '' file; do
+    manifest_matches "$file" || continue
     project_cfg=$(nearest_project_config "$(dirname "$file")" "$source_abs" || true)
     if [[ -n "$project_cfg" ]]; then
       root=$(dirname "$project_cfg")
@@ -1382,27 +1600,137 @@ gather_projects_from_source() {
       rel=$(relative_to "$source_abs" "$file")
     fi
     CURRENT_MANIFESTS+=("$file")
-    [[ "$(basename "$file")" == ".safe-audit" ]] && continue
-    case "$(basename "$file")" in
-      package-lock.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
+    if project_root_manifest_matches "$file"; then
+      add_discovered_root "$root"
+    fi
+    if lockfile_matches "$file"; then
         CURRENT_LOCKFILES+=("$file")
-        if [[ -z "${seen_roots[$root]:-}" ]]; then
-          seen_roots["$root"]=1
-          CURRENT_PROJECT_ROOTS+=("$root")
-        fi
-        ;;
-    esac
+    fi
   done < <(find_source_files_pruned "$source_abs")
 
-  if [[ "${#CURRENT_PROJECT_ROOTS[@]}" -eq 0 ]]; then
+  if [[ "${#CURRENT_PROJECT_ROOTS[@]}" -eq 0 && "$allow_source_fallback" == "1" ]]; then
     CURRENT_PROJECT_ROOTS=("$source_abs")
   fi
+
+  vinfo "project discovery: manifests=${#CURRENT_MANIFESTS[@]} lockfiles=${#CURRENT_LOCKFILES[@]} project_roots=${#CURRENT_PROJECT_ROOTS[@]} syft_excludes=${#CURRENT_SYFT_EXCLUDES[@]}"
+  verbose_paths "project root" "${CURRENT_PROJECT_ROOTS[@]}"
+  verbose_paths "lockfile" "${CURRENT_LOCKFILES[@]}"
+  verbose_paths "manifest" "${CURRENT_MANIFESTS[@]}"
+  verbose_paths "syft exclude" "${CURRENT_SYFT_EXCLUDES[@]}"
 }
 
 ecosystem_enabled() {
   local ecosystem="$1"
   local v="${PROJECT_ECOSYSTEMS[$ecosystem]:-}"
   [[ -z "$v" || "$v" == "true" ]]
+}
+
+project_ecosystem_detected() {
+  local root="$1" ecosystem="$2"
+  case "$ecosystem" in
+    npm)
+      [[ -f "$root/package.json" || -f "$root/package-lock.json" || -f "$root/pnpm-lock.yaml" || -f "$root/yarn.lock" ]]
+      ;;
+    python)
+      [[ -f "$root/pyproject.toml" || -f "$root/requirements.txt" || -f "$root/requirements-dev.txt" || -f "$root/requirements.lock" || -f "$root/uv.lock" || -f "$root/poetry.lock" || -f "$root/Pipfile.lock" ]]
+      ;;
+    php)
+      [[ -f "$root/composer.json" || -f "$root/composer.lock" ]]
+      ;;
+    rust)
+      [[ -f "$root/Cargo.toml" || -f "$root/Cargo.lock" ]]
+      ;;
+    go)
+      [[ -f "$root/go.mod" || -f "$root/go.sum" ]]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+project_ecosystem_should_audit() {
+  local root="$1" ecosystem="$2"
+  local configured="${PROJECT_ECOSYSTEMS[$ecosystem]:-}"
+  [[ "$configured" == "false" ]] && return 1
+  [[ "$configured" == "true" ]] && return 0
+  project_ecosystem_detected "$root" "$ecosystem"
+}
+
+audit_command_for_project_scanner() {
+  local scanner="$1"
+  case "$scanner" in
+    npm-audit) printf 'npm' ;;
+    composer-audit) printf 'composer' ;;
+    *) printf '%s' "$scanner" ;;
+  esac
+}
+
+project_audit_tool_available() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+required_project_audit_tools_for_current_projects() {
+  local root ecosystem scanner command
+  declare -A seen=()
+  for root in "${CURRENT_PROJECT_ROOTS[@]}"; do
+    parse_project_config "$root/.safe-audit"
+    for ecosystem in npm python php rust go; do
+      project_ecosystem_should_audit "$root" "$ecosystem" || continue
+      scanner="${PROJECT_SCANNERS[$ecosystem]:-}"
+      command=$(audit_command_for_project_scanner "$scanner")
+      [[ -n "$command" ]] || continue
+      if [[ -z "${seen[$command]:-}" ]]; then
+        seen["$command"]=1
+        printf '%s\n' "$command"
+      fi
+    done
+  done
+}
+
+missing_project_audit_tools_for_current_projects() {
+  local tool
+  while IFS= read -r tool; do
+    [[ -n "$tool" ]] || continue
+    if ! project_audit_tool_available "$tool"; then
+      printf '%s\n' "$tool"
+    fi
+  done < <(required_project_audit_tools_for_current_projects)
+}
+
+confirm_scan_with_missing_project_audit_tools() {
+  local machine="$1"
+  local project_target="${2:-}"
+  local -a missing=()
+  mapfile -t missing < <(missing_project_audit_tools_for_current_projects)
+  [[ "${#missing[@]}" -eq 0 ]] && return 0
+
+  local scan_cmd
+  scan_cmd="safe audit scan --machine $(printf '%q' "$machine")"
+  if [[ -n "$project_target" ]]; then
+    scan_cmd+=" --project $(printf '%q' "$project_target")"
+  fi
+
+  warn "$machine missing project audit tools for discovered ecosystems: ${missing[*]}"
+  warn "$machine: without these tools, ecosystem CVE counts would be incomplete."
+  warn "$machine: install missing tools manually after verification:"
+  warn_install_hints_for_tools "${missing[@]}"
+  warn "$machine: then rerun:"
+  warn "  $scan_cmd"
+  if ! is_tty; then
+    warn "$machine: skipping scan because project audit tools are missing in non-TTY mode"
+    return 2
+  fi
+
+  printf 'Proceed with incomplete ecosystem audit on %s, or skip? [y/N] ' "$machine" >&2
+  local answer
+  answer=$(read_prompt_answer)
+  case "$answer" in
+    "") warn "$machine: scan skipped"; return 2 ;;
+    y|Y|yes) return 0 ;;
+    n|N|no) warn "$machine: scan skipped"; return 2 ;;
+    *) warn "$machine: unknown choice, scan skipped"; return 2 ;;
+  esac
 }
 
 tool_available_local() {
@@ -1429,6 +1757,11 @@ local_scanner_path() {
   fi
 }
 
+osv_scan_output_valid() {
+  local output="$1"
+  jq -e 'type == "object" and ((.results? // null) | type == "array")' "$output" >/dev/null 2>&1
+}
+
 osv_scan_lockfiles() {
   local machine="$1" output="$2"
   shift 2
@@ -1436,19 +1769,36 @@ osv_scan_lockfiles() {
   local osv
   osv=$(scanner_path_for_machine "$machine" "osv-scanner")
   if [[ -z "$osv" || "${#lockfiles[@]}" -eq 0 ]]; then
-    printf '{"results":[],"skipped":"osv-scanner unavailable or no lockfiles"}\n' > "$output"
+    if [[ -z "$osv" ]]; then
+      vinfo "$machine: osv-scanner skipped: scanner unavailable"
+      printf '{"results":[],"skipped":"osv-scanner unavailable","skip_reason":"scanner_unavailable"}\n' > "$output"
+    else
+      vinfo "$machine: osv-scanner skipped: no lockfiles discovered"
+      printf '{"results":[],"skipped":"no lockfiles discovered","skip_reason":"no_lockfiles"}\n' > "$output"
+    fi
     return 0
   fi
 
-  local args=(scan --format json)
+  local args=(scan source --format json)
   local lf
   for lf in "${lockfiles[@]}"; do
     args+=("--lockfile=$lf")
   done
+  vinfo "$machine: osv-scanner=$(printf '%q' "$osv") lockfiles=${#lockfiles[@]} output=$(printf '%q' "$output")"
 
-  if ! "$osv" "${args[@]}" > "$output" 2>"$output.stderr"; then
-    warn "osv-scanner failed; details: $output.stderr"
-    printf '{"results":[],"error":"osv-scanner failed"}\n' > "$output"
+  local rc=0
+  set +e
+  "$osv" "${args[@]}" > "$output" 2>"$output.stderr"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    if osv_scan_output_valid "$output"; then
+      vinfo "$machine: osv-scanner exited $rc after producing valid JSON; keeping result"
+    else
+      warn "osv-scanner failed; details: $output.stderr"
+      warn "osv-scanner stderr: $(first_line_summary "$(cat "$output.stderr" 2>/dev/null || true)" 240)"
+      printf '{"results":[],"error":"osv-scanner failed"}\n' > "$output"
+    fi
   fi
 }
 
@@ -1457,11 +1807,13 @@ syft_generate_sbom() {
   local syft
   syft=$(scanner_path_for_machine "$machine" "syft")
   if [[ -z "$syft" ]]; then
+    vinfo "$machine: syft skipped: scanner unavailable for source=$(printf '%q' "$source")"
     printf '{"components":[],"metadata":{"tools":[{"name":"safe-audit","note":"syft unavailable"}]}}\n' > "$sbom_path"
     return 0
   fi
   local exclude_args=()
   mapfile -d '' -t exclude_args < <(syft_exclude_args_for_current_scan)
+  vinfo "$machine: syft=$(printf '%q' "$syft") source=$(printf '%q' "$source") excludes=$((${#exclude_args[@]} / 2)) output=$(printf '%q' "$sbom_path")"
   if ! "$syft" "dir:$source" -o cyclonedx-json "${exclude_args[@]}" > "$sbom_path" 2>"$sbom_path.stderr"; then
     warn "syft failed for $source; details: $sbom_path.stderr"
     printf '{"components":[],"metadata":{"tools":[{"name":"safe-audit","note":"syft failed"}]}}\n' > "$sbom_path"
@@ -1473,9 +1825,11 @@ grype_scan_sbom() {
   local grype
   grype=$(scanner_path_for_machine "$machine" "grype")
   if [[ -z "$grype" ]]; then
+    vinfo "$machine: grype skipped: scanner unavailable for sbom=$(printf '%q' "$sbom_path")"
     printf '{"matches":[],"skipped":"grype unavailable"}\n' > "$output"
     return 0
   fi
+  vinfo "$machine: grype=$(printf '%q' "$grype") sbom=$(printf '%q' "$sbom_path") output=$(printf '%q' "$output")"
   if ! "$grype" "sbom:$sbom_path" -o json -q > "$output" 2>"$output.stderr"; then
     warn "grype failed for $sbom_path; details: $output.stderr"
     printf '{"matches":[],"error":"grype failed"}\n' > "$output"
@@ -1759,9 +2113,10 @@ run_project_ecosystem_audits() {
   mkdir -p "$output_dir"
   local audits=()
   local ecosystem scanner output
+  parse_project_config "$project_root/.safe-audit"
 
   for ecosystem in npm python php rust go; do
-    if ! ecosystem_enabled "$ecosystem"; then
+    if ! project_ecosystem_should_audit "$project_root" "$ecosystem"; then
       continue
     fi
     scanner="${PROJECT_SCANNERS[$ecosystem]}"
@@ -1784,6 +2139,73 @@ run_project_ecosystem_audits() {
     return 0
   fi
   jq -s '.' "${audits[@]}"
+}
+
+write_empty_source_scan() {
+  local output="$1" status="${2:-skipped}" note="${3:-}"
+  jq -n \
+    --arg status "$status" \
+    --arg note "$note" \
+    '{status:$status,note:(if $note == "" then null else $note end),scanned_files:0,total:0,findings:[]}' > "$output"
+}
+
+source_scan_rule() {
+  local source="$1" findings_file="$2" rule="$3" severity="$4" summary="$5" regex="$6"
+  local file line_no text rel
+  while IFS= read -r -d '' file; do
+    while IFS=: read -r line_no text; do
+      [[ -n "$line_no" && "$line_no" =~ ^[0-9]+$ ]] || continue
+      rel=$(relative_to "$source" "$file")
+      jq -n \
+        --arg rule "$rule" \
+        --arg severity "$severity" \
+        --arg summary "$summary" \
+        --arg file "$rel" \
+        --argjson line "$line_no" \
+        --arg text "$(first_line_summary "$text" 180)" \
+        '{rule:$rule,severity:$severity,summary:$summary,file:$file,line:$line,text:$text}' >> "$findings_file"
+    done < <(LC_ALL=C grep -I -nE -- "$regex" "$file" 2>/dev/null || true)
+  done < <(find "$source" -type f -print0 2>/dev/null)
+}
+
+run_source_risk_scan() {
+  local source="$1" output="$2" scan_mode="${3:-source}"
+  if [[ "$scan_mode" == "deps" ]]; then
+    write_empty_source_scan "$output" "skipped" "source scan disabled in deps-only mode"
+    return 0
+  fi
+  if [[ ! -d "$source" ]]; then
+    write_empty_source_scan "$output" "skipped" "source directory unavailable"
+    return 0
+  fi
+
+  local findings_file findings_json scanned_files
+  findings_file=$(mktemp)
+  : > "$findings_file"
+  scanned_files=$(find "$source" -type f 2>/dev/null | wc -l | tr -d '[:space:]')
+
+  source_scan_rule "$source" "$findings_file" "remote_download_to_shell" "WARN" "remote download piped or chained to an interpreter" \
+    '(curl|wget)[^|;]*(https?|ftp)://[^|;]*(\||;[[:space:]]*)[[:space:]]*(sudo[[:space:]]+)?(sh|bash|zsh|python|node|perl|ruby)'
+  source_scan_rule "$source" "$findings_file" "remote_shell_exec" "WARN" "shell execution fetches a remote payload" \
+    '(sh|bash|zsh)[[:space:]]+-c[^#]*(curl|wget)[^#]*(https?|ftp)://'
+  source_scan_rule "$source" "$findings_file" "node_remote_exec" "WARN" "Node child_process call references a remote payload" \
+    'child_process\.(exec|execSync|spawn|spawnSync)[^#]*(curl|wget|https?://)'
+  source_scan_rule "$source" "$findings_file" "dynamic_eval_loader" "WARN" "dynamic evaluation references loader primitives" \
+    '(eval|new[[:space:]]+Function)[[:space:]]*\([^#]*(fetch|axios|atob|Buffer\.from)'
+  source_scan_rule "$source" "$findings_file" "credential_network_use" "WARN" "credential-like environment variable appears near network code" \
+    '((GITHUB_TOKEN|NPM_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|SSH_AUTH_SOCK)[^#]*(fetch|axios|curl|wget|https?://))|((fetch|axios|curl|wget|https?://)[^#]*(GITHUB_TOKEN|NPM_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|SSH_AUTH_SOCK))'
+
+  if [[ -s "$findings_file" ]]; then
+    findings_json=$(jq -s 'unique_by(.rule + ":" + .file + ":" + (.line|tostring))' "$findings_file")
+  else
+    findings_json='[]'
+  fi
+
+  jq -n \
+    --argjson scanned_files "$scanned_files" \
+    --argjson findings "$findings_json" \
+    '{status:"ok",note:null,scanned_files:$scanned_files,total:($findings | length),findings:$findings}' > "$output"
+  rm -f "$findings_file"
 }
 
 latest_previous_result() {
@@ -1899,6 +2321,9 @@ render_scan_summary() {
   machine=$(jq -r '.machine' "$result_path")
   printf '=== SAFE-AUDIT SCAN - %s - %s ===\n\n' \
     "$machine" "$(jq -r '.date' "$result_path")"
+  printf 'Mode: %s (%s)\n' \
+    "$(jq -r '.scan_mode // "source"' "$result_path")" \
+    "$(jq -r '.strategy' "$result_path")"
   printf 'SBOM: %s packages cataloged (npm: %s, python: %s, go: %s, php: %s, rust: %s)\n\n' \
     "$(jq -r '.summary.packages_total' "$result_path")" \
     "$(jq -r '.summary.ecosystems.npm' "$result_path")" \
@@ -1911,10 +2336,31 @@ render_scan_summary() {
   printf '  HIGH: %s\n' "$(jq -r '.cve_scan.high' "$result_path")"
   printf '  MEDIUM: %s\n' "$(jq -r '.cve_scan.medium' "$result_path")"
   printf '  LOW: %s\n\n' "$(jq -r '.cve_scan.low' "$result_path")"
+  jq -r '
+    .tool_status // {} |
+    to_entries[]? |
+    select((.value.status // "ok") != "ok") |
+    "  \(.key): \(.value.status)" + (if (.value.note // "") != "" then " (" + .value.note + ")" else "" end)
+  ' "$result_path"
+  if jq -e '(.tool_status // {} | to_entries | map(select((.value.status // "ok") != "ok")) | length) > 0' "$result_path" >/dev/null; then
+    printf '\n'
+  fi
   printf 'ECOSYSTEM AUDITS:\n'
   jq -r '
     .ecosystem_audits[]? |
-    "  \(.scanner): \(.total) advisories (\(.critical) critical, \(.high) high, \(.medium) medium, \(.low) low)"
+    if (.status // "ok") == "ok" then
+      "  \(.scanner): \(.total) advisories (\(.critical) critical, \(.high) high, \(.medium) medium, \(.low) low)"
+    else
+      "  \(.scanner): \(.status // "skipped")" + (if (.note // "") != "" then " (" + .note + ")" else "" end)
+    end
+  ' "$result_path"
+  printf '\nSOURCE SCAN:\n'
+  printf '  %s files scanned; %s suspicious patterns\n' \
+    "$(jq -r '.source_scan.scanned_files // 0' "$result_path")" \
+    "$(jq -r '.source_scan.total // 0' "$result_path")"
+  jq -r '
+    .source_scan.findings[:5][]? |
+    "  - [" + .severity + "] " + .rule + " " + .file + ":" + (.line|tostring) + " - " + .summary
   ' "$result_path"
   if jq -e '.delta.previous_scan != null' "$result_path" >/dev/null 2>&1; then
     printf '\nDELTA vs last scan (%s):\n' "$(jq -r '.delta.previous_scan' "$result_path")"
@@ -1929,7 +2375,7 @@ render_scan_summary() {
 }
 
 build_scan_result_from_artifacts() {
-  local machine="$1" original_target="$2" strategy="$3" sbom_src="$4" osv_json="$5" grype_json="$6" ecosystem_audits_file="$7"
+  local machine="$1" original_target="$2" strategy="$3" sbom_src="$4" osv_json="$5" grype_json="$6" ecosystem_audits_file="$7" scan_mode="${8:-source}" source_scan_file="${9:-}"
   local stamp result_path sbom_path
   stamp="$(today_date)"
   mkdir -p "$RESULTS_DIR/$machine" "$SBOM_DIR/$machine"
@@ -1943,6 +2389,62 @@ build_scan_result_from_artifacts() {
   else
     ecosystem_audits_json='[]'
   fi
+
+  local source_scan_json
+  if [[ -n "$source_scan_file" && -f "$source_scan_file" ]]; then
+    source_scan_json=$(jq -c '.' "$source_scan_file")
+  else
+    source_scan_json='{"status":"skipped","note":"source scan unavailable","scanned_files":0,"total":0,"findings":[]}'
+  fi
+
+  local tool_status_json
+  tool_status_json=$(jq -n --slurpfile osv "$osv_json" --slurpfile grype "$grype_json" --slurpfile sbom "$sbom_path" '
+    def osv_status($doc):
+      if (($doc.error // "") != "") then
+        {status:"error", note:$doc.error}
+      elif (($doc.skip_reason // "") == "scanner_unavailable") then
+        {status:"skipped", note:($doc.skipped // "scanner unavailable")}
+      elif (($doc.skip_reason // "") == "no_lockfiles") then
+        {status:"ok", note:$doc.skipped}
+      elif (($doc.skipped // "") != "") then
+        {status:"skipped", note:$doc.skipped}
+      else
+        {status:"ok", note:null}
+      end;
+    def scan_status($doc):
+      if (($doc.error // "") != "") then
+        {status:"error", note:$doc.error}
+      elif (($doc.skipped // "") != "") then
+        {status:"skipped", note:$doc.skipped}
+      else
+        {status:"ok", note:null}
+      end;
+    def syft_status($doc):
+      ([
+        (
+          if (($doc.metadata.tools? // null) | type) == "array" then
+            $doc.metadata.tools[]?
+          elif (($doc.metadata.tools.components? // null) | type) == "array" then
+            $doc.metadata.tools.components[]?
+          else
+            empty
+          end
+        )
+        | select(type == "object")
+        | select((.name // "") == "safe-audit")
+        | (.note // empty)
+      ][0] // "") as $note |
+      if ($note | test("unavailable|failed"; "i")) then
+        {status:"skipped", note:$note}
+      else
+        {status:"ok", note:(if $note == "" then null else $note end)}
+      end;
+    {
+      "osv-scanner": osv_status($osv[0] // {}),
+      syft: syft_status($sbom[0] // {}),
+      grype: scan_status($grype[0] // {})
+    }
+  ')
 
   local critical high medium low severity
   critical=$(count_grype_severity "$grype_json" critical)
@@ -1961,20 +2463,30 @@ build_scan_result_from_artifacts() {
 
   local findings_json
   findings_json=$(jq -n --slurpfile osv "$osv_json" --slurpfile grype "$grype_json" '
+    def osv_severity:
+      if ((.database_specific.severity? // "") != "") then .database_specific.severity
+      elif ((.severity? | type) == "array") then (.severity[0].score // .severity[0].type // "unknown")
+      elif ((.severity? | type) == "string") then .severity
+      else "unknown"
+      end;
     (
-      [($osv[0].results[]?.packages[]? // [])[]? as $pkg
+      [
+        (($osv[0].results // [])[]? | (.packages // [])[]? | select(type == "object")) as $pkg
         | ($pkg.package.name // $pkg.name // "unknown") as $name
         | ($pkg.package.version // $pkg.version // "unknown") as $version
-        | $pkg.vulnerabilities[]?
+        | ($pkg.vulnerabilities // [])[]?
+        | select(type == "object")
         | {
             source: "osv",
             id: (.id // .aliases[0] // "unknown"),
-            severity: (.database_specific.severity // .severity[0].score // "unknown"),
+            severity: osv_severity,
             package: $name,
             version: $version
           }
       ] +
-      [($grype[0].matches[]? // [])[]?
+      [
+        ($grype[0].matches // [])[]?
+        | select(type == "object")
         | {
             source: "grype",
             id: (.vulnerability.id // "unknown"),
@@ -1984,7 +2496,7 @@ build_scan_result_from_artifacts() {
           }
       ]
     ) | unique_by(.source + ":" + .id + ":" + .package + ":" + .version)
-  ')
+  ' 2>/dev/null || printf '[]')
 
   local packages_total npm_total python_total php_total rust_total go_total verdict
   packages_total=$(count_sbom_packages "$sbom_path")
@@ -2000,6 +2512,17 @@ build_scan_result_from_artifacts() {
   elif (( high > 0 || medium > 0 || low > 0 )); then
     verdict="WARN"
   fi
+  if [[ "$(jq -r '.total // 0' <<<"$source_scan_json")" -gt 0 ]]; then
+    verdict="WARN"
+  fi
+  if jq -e '
+    [.[]? | select((.status // "ok") != "ok") | select((.note // "") | test("unavailable|missing"; "i"))] | length > 0
+  ' <<<"$ecosystem_audits_json" >/dev/null; then
+    verdict="WARN"
+  fi
+  if jq -e '[to_entries[]? | select((.value.status // "ok") != "ok")] | length > 0' <<<"$tool_status_json" >/dev/null; then
+    verdict="WARN"
+  fi
 
   jq -n \
     --arg machine "$machine" \
@@ -2007,6 +2530,7 @@ build_scan_result_from_artifacts() {
     --arg timestamp "$(now_iso)" \
     --arg target "$original_target" \
     --arg strategy "$strategy" \
+    --arg scan_mode "$scan_mode" \
     --arg sbom "$sbom_path" \
     --argjson packages_total "$packages_total" \
     --argjson npm_total "$npm_total" \
@@ -2020,6 +2544,8 @@ build_scan_result_from_artifacts() {
     --argjson low "$low" \
     --arg verdict "$verdict" \
     --argjson ecosystem_audits "$ecosystem_audits_json" \
+    --argjson source_scan "$source_scan_json" \
+    --argjson tool_status "$tool_status_json" \
     --argjson findings "$findings_json" \
     '{
       machine: $machine,
@@ -2027,6 +2553,7 @@ build_scan_result_from_artifacts() {
       timestamp: $timestamp,
       target: $target,
       strategy: $strategy,
+      scan_mode: $scan_mode,
       sbom: $sbom,
       summary: {
         packages_total: $packages_total,
@@ -2045,7 +2572,9 @@ build_scan_result_from_artifacts() {
         low: $low,
         findings: $findings
       },
+      tool_status: $tool_status,
       ecosystem_audits: $ecosystem_audits,
+      source_scan: $source_scan,
       verdict: $verdict
     }' > "$result_path"
 
@@ -2059,24 +2588,43 @@ build_scan_result_from_artifacts() {
 }
 
 scan_source_into_result() {
-  local machine="$1" source="$2" original_target="$3" strategy="$4"
-  gather_projects_from_source "$source"
+  local machine="$1" source="$2" original_target="$3" strategy="$4" scan_mode="${5:-source}" allow_source_fallback="${6:-1}"
+  vinfo "$machine: scan source=$(printf '%q' "$source") target=$(printf '%q' "$original_target") strategy=$strategy mode=$scan_mode fallback=$allow_source_fallback"
+  gather_projects_from_source "$source" "$allow_source_fallback"
   detect_machine_tools "$machine"
+  local project_tools_rc
+  confirm_scan_with_missing_project_audit_tools "$machine" "$original_target"
+  project_tools_rc=$?
+  case "$project_tools_rc" in
+    0) ;;
+    2) return 2 ;;
+    *) return "$project_tools_rc" ;;
+  esac
 
-  local scratch osv_json grype_json sbom_tmp audits_tmp
+  local scratch osv_json grype_json sbom_tmp audits_tmp source_scan_tmp syft_source
   scratch=$(mktemp -d)
+  vinfo "$machine: scan scratch=$(printf '%q' "$scratch")"
   osv_json="$scratch/osv.json"
   grype_json="$scratch/grype.json"
   sbom_tmp="$scratch/sbom.json"
   audits_tmp="$scratch/ecosystem-audits.json"
+  source_scan_tmp="$scratch/source-scan.json"
+
+  syft_source="$source"
+  if [[ "$scan_mode" != "full" ]]; then
+    syft_source="$scratch/source-stage"
+    gather_scan_stage_from_current_files "$source" "$syft_source" "$scan_mode"
+  fi
 
   osv_scan_lockfiles "$machine" "$osv_json" "${CURRENT_LOCKFILES[@]}"
-  syft_generate_sbom "$machine" "$source" "$sbom_tmp"
+  run_source_risk_scan "$syft_source" "$source_scan_tmp" "$scan_mode"
+  syft_generate_sbom "$machine" "$syft_source" "$sbom_tmp"
   grype_scan_sbom "$machine" "$sbom_tmp" "$grype_json"
 
   local root project_audits_files=()
   for root in "${CURRENT_PROJECT_ROOTS[@]}"; do
     parse_project_config "$root/.safe-audit"
+    vinfo "$machine: ecosystem audits root=$(printf '%q' "$root")"
     run_project_ecosystem_audits "$root" "$scratch/$(slugify "$root")" > "$scratch/$(slugify "$root").audits.json"
     project_audits_files+=("$scratch/$(slugify "$root").audits.json")
   done
@@ -2087,28 +2635,41 @@ scan_source_into_result() {
     jq -s 'add' "${project_audits_files[@]}" > "$audits_tmp"
   fi
 
-  build_scan_result_from_artifacts "$machine" "$original_target" "$strategy" "$sbom_tmp" "$osv_json" "$grype_json" "$audits_tmp"
+  build_scan_result_from_artifacts "$machine" "$original_target" "$strategy" "$sbom_tmp" "$osv_json" "$grype_json" "$audits_tmp" "$scan_mode" "$source_scan_tmp"
 }
 
 scan_source_with_external_sbom_into_result() {
-  local machine="$1" source="$2" original_target="$3" strategy="$4" sbom_src="$5"
-  gather_projects_from_source "$source"
+  local machine="$1" source="$2" original_target="$3" strategy="$4" sbom_src="$5" scan_mode="${6:-source}" allow_source_fallback="${7:-1}"
+  vinfo "$machine: scan source=$(printf '%q' "$source") target=$(printf '%q' "$original_target") strategy=$strategy mode=$scan_mode external_sbom=$(printf '%q' "$sbom_src")"
+  gather_projects_from_source "$source" "$allow_source_fallback"
 
-  local scratch osv_json grype_json audits_tmp local_machine
+  local scratch osv_json grype_json audits_tmp source_scan_tmp local_machine
   local_machine=$(detect_local_machine_name)
   detect_machine_tools "$local_machine" 1
+  local project_tools_rc
+  confirm_scan_with_missing_project_audit_tools "$local_machine" "$original_target"
+  project_tools_rc=$?
+  case "$project_tools_rc" in
+    0) ;;
+    2) return 2 ;;
+    *) return "$project_tools_rc" ;;
+  esac
 
   scratch=$(mktemp -d)
+  vinfo "$machine: scan scratch=$(printf '%q' "$scratch") local_scanner_machine=$local_machine"
   osv_json="$scratch/osv.json"
   grype_json="$scratch/grype.json"
   audits_tmp="$scratch/ecosystem-audits.json"
+  source_scan_tmp="$scratch/source-scan.json"
 
   osv_scan_lockfiles "$local_machine" "$osv_json" "${CURRENT_LOCKFILES[@]}"
+  run_source_risk_scan "$source" "$source_scan_tmp" "$scan_mode"
   grype_scan_sbom "$local_machine" "$sbom_src" "$grype_json"
 
   local root project_audits_files=()
   for root in "${CURRENT_PROJECT_ROOTS[@]}"; do
     parse_project_config "$root/.safe-audit"
+    vinfo "$machine: ecosystem audits root=$(printf '%q' "$root")"
     run_project_ecosystem_audits "$root" "$scratch/$(slugify "$root")" > "$scratch/$(slugify "$root").audits.json"
     project_audits_files+=("$scratch/$(slugify "$root").audits.json")
   done
@@ -2119,7 +2680,7 @@ scan_source_with_external_sbom_into_result() {
     jq -s 'add' "${project_audits_files[@]}" > "$audits_tmp"
   fi
 
-  build_scan_result_from_artifacts "$machine" "$original_target" "$strategy" "$sbom_src" "$osv_json" "$grype_json" "$audits_tmp"
+  build_scan_result_from_artifacts "$machine" "$original_target" "$strategy" "$sbom_src" "$osv_json" "$grype_json" "$audits_tmp" "$scan_mode" "$source_scan_tmp"
 }
 
 machine_supports_remote_direct_scan() {
@@ -2277,6 +2838,38 @@ ecosystem_enabled() {
   [[ -z "$v" || "$v" == "true" ]]
 }
 
+project_ecosystem_detected() {
+  local root="$1" ecosystem="$2"
+  case "$ecosystem" in
+    npm)
+      [[ -f "$root/package.json" || -f "$root/package-lock.json" || -f "$root/pnpm-lock.yaml" || -f "$root/yarn.lock" ]]
+      ;;
+    python)
+      [[ -f "$root/pyproject.toml" || -f "$root/requirements.txt" || -f "$root/requirements-dev.txt" || -f "$root/requirements.lock" || -f "$root/uv.lock" || -f "$root/poetry.lock" || -f "$root/Pipfile.lock" ]]
+      ;;
+    php)
+      [[ -f "$root/composer.json" || -f "$root/composer.lock" ]]
+      ;;
+    rust)
+      [[ -f "$root/Cargo.toml" || -f "$root/Cargo.lock" ]]
+      ;;
+    go)
+      [[ -f "$root/go.mod" || -f "$root/go.sum" ]]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+project_ecosystem_should_audit() {
+  local root="$1" ecosystem="$2"
+  local configured="${PROJECT_ECOSYSTEMS[$ecosystem]:-}"
+  [[ "$configured" == "false" ]] && return 1
+  [[ "$configured" == "true" ]] && return 0
+  project_ecosystem_detected "$root" "$ecosystem"
+}
+
 path_matches_ignore() {
   local rel="$1" pattern
   for pattern in "${PROJECT_IGNORES[@]}"; do
@@ -2428,8 +3021,9 @@ run_project_ecosystem_audits() {
   local project_root="$1" output_dir="$2"
   mkdir -p "$output_dir"
   local audits=() ecosystem scanner output
+  parse_project_config "$project_root/.safe-audit"
   for ecosystem in npm python php rust go; do
-    ecosystem_enabled "$ecosystem" || continue
+    project_ecosystem_should_audit "$project_root" "$ecosystem" || continue
     scanner="${PROJECT_SCANNERS[$ecosystem]}"
     output="$output_dir/${ecosystem}.json"
     case "$scanner" in
@@ -2480,13 +3074,19 @@ if [[ "${#roots[@]}" -eq 0 ]]; then
 fi
 
 if command -v osv-scanner >/dev/null 2>&1 && [[ "${#lockfiles[@]}" -gt 0 ]]; then
-  args=(scan --format json)
+  args=(scan source --format json)
   for lf in "${lockfiles[@]}"; do args+=("--lockfile=$lf"); done
-  if ! osv-scanner "${args[@]}" > "$scratch/osv.json" 2>"$scratch/osv.stderr"; then
+  set +e
+  osv-scanner "${args[@]}" > "$scratch/osv.json" 2>"$scratch/osv.stderr"
+  osv_rc=$?
+  set -e
+  if [[ "$osv_rc" -ne 0 ]] && ! jq -e 'type == "object" and ((.results? // null) | type == "array")' "$scratch/osv.json" >/dev/null 2>&1; then
     printf '{"results":[],"error":"osv-scanner failed"}\n' > "$scratch/osv.json"
   fi
+elif ! command -v osv-scanner >/dev/null 2>&1; then
+  printf '{"results":[],"skipped":"osv-scanner unavailable","skip_reason":"scanner_unavailable"}\n' > "$scratch/osv.json"
 else
-  printf '{"results":[],"skipped":"osv-scanner unavailable or no lockfiles"}\n' > "$scratch/osv.json"
+  printf '{"results":[],"skipped":"no lockfiles discovered","skip_reason":"no_lockfiles"}\n' > "$scratch/osv.json"
 fi
 
 if command -v syft >/dev/null 2>&1; then
@@ -2527,6 +3127,8 @@ remote_stage_helper_script() {
   cat <<'EOF'
 set -euo pipefail
 target="$1"
+scan_mode="${2:-source}"
+allow_source_fallback="${3:-1}"
 cd "$target"
 
 trim() {
@@ -2536,26 +3138,89 @@ trim() {
   printf '%s' "$s"
 }
 
-declare -a ignores=()
-while IFS= read -r -d '' cfg; do
-  root=$(dirname "$cfg")
-  rel_prefix="${root#./}"
-  [[ "$rel_prefix" == "." ]] && rel_prefix=""
-  [[ -n "$rel_prefix" ]] && rel_prefix="${rel_prefix%/}/"
-  section=""
-  while IFS= read -r raw || [[ -n "$raw" ]]; do
-    line="${raw%%#*}"
-    line="$(trim "$line")"
-    [[ -z "$line" ]] && continue
-    case "$line" in
-      ecosystems:|scanners:) section=""; continue ;;
-      ignore:) section="ignore"; continue ;;
-    esac
-    if [[ "$section" == "ignore" && "$line" =~ ^-[[:space:]]*(.+)$ ]]; then
-      ignores+=("${rel_prefix}${BASH_REMATCH[1]}")
-    fi
-  done <"$cfg"
-done < <(find . -type f -name '.safe-audit' -print0 2>/dev/null)
+declare -a ignores=(
+  .git
+  .hg
+  .svn
+  node_modules
+  vendor
+  .venv
+  venv
+  env
+  .tox
+  .nox
+  __pycache__
+  .pytest_cache
+  .mypy_cache
+  .ruff_cache
+  .cache
+  .parcel-cache
+  .turbo
+  .next
+  .nuxt
+  .vite
+  dist
+  build
+  out
+  coverage
+  target
+)
+
+find_pruned_files() {
+  find . \( \
+    -name '.git' -o \
+    -name '.hg' -o \
+    -name '.svn' -o \
+    -name 'node_modules' -o \
+    -name 'vendor' -o \
+    -name '.venv' -o \
+    -name 'venv' -o \
+    -name 'env' -o \
+    -name '.tox' -o \
+    -name '.nox' -o \
+    -name '__pycache__' -o \
+    -name '.pytest_cache' -o \
+    -name '.mypy_cache' -o \
+    -name '.ruff_cache' -o \
+    -name '.cache' -o \
+    -name '.parcel-cache' -o \
+    -name '.turbo' -o \
+    -name '.next' -o \
+    -name '.nuxt' -o \
+    -name '.vite' -o \
+    -name 'dist' -o \
+    -name 'build' -o \
+    -name 'out' -o \
+    -name 'coverage' -o \
+    -name 'target' \
+  \) -prune -o -type f -print0 2>/dev/null
+}
+
+find_all_files() {
+  find . -type f -print0 2>/dev/null
+}
+
+if [[ "$scan_mode" != "full" ]]; then
+  while IFS= read -r -d '' cfg; do
+    root=$(dirname "$cfg")
+    rel_prefix="${root#./}"
+    [[ "$rel_prefix" == "." ]] && rel_prefix=""
+    [[ -n "$rel_prefix" ]] && rel_prefix="${rel_prefix%/}/"
+    section=""
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+      line="${raw%%#*}"
+      line="$(trim "$line")"
+      [[ -z "$line" ]] && continue
+      case "$line" in
+        ecosystems:|scanners:) section=""; continue ;;
+        ignore:) section="ignore"; continue ;;
+      esac
+      if [[ "$section" == "ignore" && "$line" =~ ^-[[:space:]]*(.+)$ ]]; then
+        ignores+=("${rel_prefix}${BASH_REMATCH[1]}")
+      fi
+    done <"$cfg"
+  done < <(find_pruned_files | while IFS= read -r -d '' f; do [[ "$(basename "$f")" == ".safe-audit" ]] && printf '%s\0' "$f"; done)
+fi
 
 matches_ignore() {
   local rel="${1#./}" pattern
@@ -2578,14 +3243,106 @@ manifest_matches() {
   esac
 }
 
-list=$(mktemp)
-while IFS= read -r -d '' file; do
-  manifest_matches "$file" || continue
-  if matches_ignore "$file"; then
-    continue
+lockfile_matches() {
+  case "$(basename "$1")" in
+    package-lock.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+project_root_manifest_matches() {
+  manifest_matches "$1"
+}
+
+source_file_matches() {
+  local base ext
+  base=$(basename "$1")
+  manifest_matches "$1" && return 0
+  case "$base" in
+    Dockerfile|Containerfile|Makefile|GNUmakefile|Gemfile|Rakefile|Procfile|Brewfile|Justfile|Taskfile.yml|Taskfile.yaml|Jenkinsfile|Vagrantfile|.envrc|.npmrc|.yarnrc|.yarnrc.yml|.pypirc|.gitignore|.dockerignore|.editorconfig)
+      return 0
+      ;;
+  esac
+  ext="${base##*.}"
+  case "$ext" in
+    sh|bash|zsh|fish|ps1|psm1|bat|cmd|js|mjs|cjs|jsx|ts|tsx|mts|cts|py|pyw|rb|php|go|rs|java|kt|kts|scala|c|cc|cpp|cxx|h|hh|hpp|cs|swift|m|mm|lua|pl|pm|r|R|dart|ex|exs|erl|hrl|clj|cljs|fs|fsx|sql|graphql|gql|html|htm|css|scss|sass|less|json|jsonc|json5|yaml|yml|toml|ini|cfg|conf|properties|xml|lock|md|mdx|rst|txt)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+declare -a manifests=() roots=()
+declare -A seen_roots=()
+
+add_root() {
+  local root="${1#./}"
+  [[ -n "$root" && "$root" != "." ]] || root="."
+  if [[ -z "${seen_roots[$root]:-}" ]]; then
+    seen_roots["$root"]=1
+    roots+=("$root")
   fi
-  printf '%s\0' "$file" >> "$list"
-done < <(find . -type f -print0)
+}
+
+under_root() {
+  local rel="${1#./}" root
+  for root in "${roots[@]}"; do
+    root="${root#./}"
+    if [[ "$root" == "." || "$rel" == "$root" || "$rel" == "$root"/* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+list=$(mktemp)
+if [[ "$scan_mode" != "full" ]]; then
+  while IFS= read -r -d '' file; do
+    if matches_ignore "$file"; then
+      continue
+    fi
+    if manifest_matches "$file"; then
+      manifests+=("$file")
+    fi
+    if project_root_manifest_matches "$file"; then
+      add_root "$(dirname "$file")"
+    fi
+  done < <(find_pruned_files)
+fi
+
+if [[ "${#roots[@]}" -eq 0 && "$allow_source_fallback" == "1" ]]; then
+  roots=(".")
+fi
+
+case "$scan_mode" in
+  deps)
+    for file in "${manifests[@]}"; do
+      printf '%s\0' "$file" >> "$list"
+    done
+    ;;
+  source)
+    while IFS= read -r -d '' file; do
+      matches_ignore "$file" && continue
+      under_root "$file" || continue
+      source_file_matches "$file" || continue
+      printf '%s\0' "$file" >> "$list"
+    done < <(find_pruned_files)
+    ;;
+  full)
+    find_all_files >> "$list"
+    ;;
+  *)
+    for file in "${manifests[@]}"; do
+      printf '%s\0' "$file" >> "$list"
+    done
+    ;;
+esac
 
 if [[ -s "$list" ]]; then
   tar --null -T "$list" -czf - 2>/dev/null
@@ -2604,12 +3361,13 @@ machine_supports_remote_tunneled_scan() {
 }
 
 scan_remote_with_local_bundles_into_result() {
-  local machine="$1" target="$2"
+  local machine="$1" target="$2" scan_mode="${3:-full}" allow_source_fallback="${4:-1}"
   local host scratch remote_tmp rc source
   local statuses=()
   host=$(machine_host "$machine")
   scratch=$(mktemp -d)
   source=$(mktemp -d)
+  vinfo "$machine: trying tunneled remote scan target=$(printf '%q' "$target") host=$(printf '%q' "$host")"
 
   remote_tmp=$(ssh_batch "$host" 'tmp=$(mktemp -d); mkdir -p "$tmp/bin"; printf "%s" "$tmp"')
   [[ -n "$remote_tmp" ]] || return 1
@@ -2644,17 +3402,18 @@ scan_remote_with_local_bundles_into_result() {
     return 1
   fi
 
-  gather_stage_remotely "$machine" "$target" "$source"
+  gather_stage_remotely "$machine" "$target" "$source" "$scan_mode" "$allow_source_fallback"
   scan_source_with_external_sbom_into_result \
-    "$machine" "$source" "$target" "ssh-remote-tunneled" "$scratch/sbom.json"
+    "$machine" "$source" "$target" "ssh-remote-tunneled" "$scratch/sbom.json" "$scan_mode" "$allow_source_fallback"
 }
 
 scan_remote_direct_into_result() {
-  local machine="$1" target="$2"
+  local machine="$1" target="$2" scan_mode="${3:-full}"
   local host scratch rc
   local statuses=()
   host=$(machine_host "$machine")
   scratch=$(mktemp -d)
+  vinfo "$machine: trying remote direct scan target=$(printf '%q' "$target") host=$(printf '%q' "$host")"
 
   set +e
   remote_scan_helper_script | ssh_batch "$host" "bash -s -- $(printf '%q' "$target")" | tar -xzf - -C "$scratch"
@@ -2678,11 +3437,12 @@ scan_remote_direct_into_result() {
 
   build_scan_result_from_artifacts \
     "$machine" "$target" "ssh-remote-direct" \
-    "$scratch/sbom.json" "$scratch/osv.json" "$scratch/grype.json" "$scratch/ecosystem-audits.json"
+    "$scratch/sbom.json" "$scratch/osv.json" "$scratch/grype.json" "$scratch/ecosystem-audits.json" "$scan_mode"
 }
 
 scan_machine() {
-  local machine="$1" project_target="${2:-}"
+  local machine="$1" project_target="${2:-}" scan_mode="${3:-$SAFE_AUDIT_SCAN_MODE}"
+  vinfo "$machine: configured type=$(machine_type "$machine") host=$(printf '%q' "$(machine_host "$machine")") project_target=$(printf '%q' "$project_target")"
   if ! machine_reachable "$machine"; then
     warn "$machine: host unreachable; skipping scan"
     return 0
@@ -2693,38 +3453,45 @@ scan_machine() {
   confirm_rc=$?
   case "$confirm_rc" in
     0) ;;
-    2) return 0 ;;
+    2) return 2 ;;
     *) return "$confirm_rc" ;;
   esac
 
   local target="${project_target:-$(machine_scan_root "$machine")}"
   local strategy="" source=""
+  local allow_source_fallback=0
+  [[ -n "$project_target" ]] && allow_source_fallback=1
+  vinfo "$machine: resolved target=$(printf '%q' "$target")"
   if [[ "$(machine_type "$machine")" == "local" ]]; then
     source=$(path_abs "$target")
     strategy="local-direct"
-  elif machine_supports_remote_direct_scan "$machine"; then
-    if scan_remote_direct_into_result "$machine" "$target"; then
+    vinfo "$machine: using local direct scan source=$(printf '%q' "$source")"
+  elif [[ "$scan_mode" == "full" ]] && machine_supports_remote_direct_scan "$machine"; then
+    if scan_remote_direct_into_result "$machine" "$target" "$scan_mode"; then
       return 0
     fi
-    if machine_supports_remote_tunneled_scan "$machine" && scan_remote_with_local_bundles_into_result "$machine" "$target"; then
-      return 0
-    fi
-    source=$(mktemp -d)
-    gather_stage_remotely "$machine" "$target" "$source"
-    strategy="ssh-stage-local"
-  elif machine_supports_remote_tunneled_scan "$machine"; then
-    if scan_remote_with_local_bundles_into_result "$machine" "$target"; then
+    if machine_supports_remote_tunneled_scan "$machine" && scan_remote_with_local_bundles_into_result "$machine" "$target" "$scan_mode" "$allow_source_fallback"; then
       return 0
     fi
     source=$(mktemp -d)
-    gather_stage_remotely "$machine" "$target" "$source"
+    gather_stage_remotely "$machine" "$target" "$source" "$scan_mode" "$allow_source_fallback"
     strategy="ssh-stage-local"
+    vinfo "$machine: using staged remote scan source=$(printf '%q' "$source")"
+  elif [[ "$scan_mode" == "full" ]] && machine_supports_remote_tunneled_scan "$machine"; then
+    if scan_remote_with_local_bundles_into_result "$machine" "$target" "$scan_mode" "$allow_source_fallback"; then
+      return 0
+    fi
+    source=$(mktemp -d)
+    gather_stage_remotely "$machine" "$target" "$source" "$scan_mode" "$allow_source_fallback"
+    strategy="ssh-stage-local"
+    vinfo "$machine: using staged remote scan source=$(printf '%q' "$source")"
   else
     source=$(mktemp -d)
-    gather_stage_remotely "$machine" "$target" "$source"
+    gather_stage_remotely "$machine" "$target" "$source" "$scan_mode" "$allow_source_fallback"
     strategy="ssh-stage-local"
+    vinfo "$machine: using staged remote scan source=$(printf '%q' "$source")"
   fi
-  scan_source_into_result "$machine" "$source" "$target" "$strategy"
+  scan_source_into_result "$machine" "$source" "$target" "$strategy" "$scan_mode" "$allow_source_fallback"
 }
 
 guess_ecosystem_from_spec() {
@@ -4834,7 +5601,11 @@ diff_command() {
     local latest previous
     latest=$(find "$SBOM_DIR/$machine" -maxdepth 1 -type f -name '*-sbom.cdx.json' 2>/dev/null | sort | tail -n 1 || true)
     if [[ -z "$latest" ]]; then
-      scan_machine "$machine" "${project_target:-$DEFAULT_SCAN_ROOT}"
+      if [[ -n "$project_target" ]]; then
+        scan_machine "$machine" "$project_target"
+      else
+        scan_machine "$machine"
+      fi
       latest=$(find "$SBOM_DIR/$machine" -maxdepth 1 -type f -name '*-sbom.cdx.json' 2>/dev/null | sort | tail -n 1 || true)
     fi
     previous=$(select_previous_sbom "$machine" "$latest" "$since")
@@ -4905,9 +5676,26 @@ diff_command() {
 
 scan_command() {
   local project_target=""
+  local scan_mode="${SAFE_AUDIT_SCAN_MODE:-source}" scan_mode_set=0
   local args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --verbose)
+        SAFE_AUDIT_VERBOSE=1
+        shift
+        ;;
+      --deps-only)
+        [[ "$scan_mode_set" == "0" ]] || die "scan mode flags are mutually exclusive"
+        scan_mode="deps"
+        scan_mode_set=1
+        shift
+        ;;
+      --full)
+        [[ "$scan_mode_set" == "0" ]] || die "scan mode flags are mutually exclusive"
+        scan_mode="full"
+        scan_mode_set=1
+        shift
+        ;;
       --project)
         [[ $# -lt 2 ]] && die "--project requires a path"
         project_target="$2"
@@ -4927,12 +5715,27 @@ scan_command() {
         ;;
     esac
   done
+  SAFE_AUDIT_SCAN_MODE="$scan_mode"
   parse_machine_targets default "${args[@]}"
+  vinfo "scan targets: ${MACHINE_TARGETS[*]}"
+  vinfo "scan mode: $scan_mode"
   local machine
   for machine in "${MACHINE_TARGETS[@]}"; do
-    info "scan: starting $machine"
-    scan_machine "$machine" "$project_target" || return 1
-    info "scan: finished $machine"
+    local target_label
+    if [[ -n "$project_target" ]]; then
+      target_label="project $(printf '%q' "$project_target")"
+    else
+      target_label="machine root $(printf '%q' "$(machine_scan_root "$machine")")"
+    fi
+    info "scan: starting $machine $target_label"
+    local scan_rc=0
+    if scan_machine "$machine" "$project_target" "$scan_mode"; then
+      info "scan: finished $machine $target_label"
+    else
+      scan_rc=$?
+      warn "scan: failed $machine $target_label"
+      return "$scan_rc"
+    fi
   done
 }
 
@@ -5029,7 +5832,7 @@ safe audit: multi-machine audit tooling
 
 USAGE
   safe audit capabilities [--json]
-  safe audit scan [--project <path>] [--all | --machine <csv>]
+  safe audit scan [--verbose] [--deps-only | --full] [--project <path>] [--all | --machine <csv>]
   safe audit check <pkg>@<version> [--ecosystem <name>] [--json]
   safe audit release github --repo OWNER/REPO --version TAG --asset NAME [--json]
   safe audit vuln github-release --repo OWNER/REPO --version TAG [--json]

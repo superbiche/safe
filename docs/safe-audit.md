@@ -60,6 +60,57 @@ Local project scan:
 safe audit scan --project .
 ```
 
+Verbose project scan:
+
+```bash
+safe audit scan --verbose --project .
+```
+
+Default project and machine scans use `source` mode. This is the normal
+high-signal mode:
+
+- audit dependency manifests and lockfiles;
+- stage first-party source files for SBOM and source-risk checks;
+- skip installed or generated dependency trees such as `node_modules/`,
+  `vendor/`, virtualenvs, caches, and build output.
+
+The staged source scan includes high-signal static checks for suspicious loaders
+and credential/network use. A default machine scan discovers projects under the
+configured scan root and scans those project roots; it does not fall back to
+scanning every random source file under the whole root unless you pass an
+explicit `--project` target or `--full`.
+
+Scan modes:
+
+| Mode | Flag | What it scans | Main use |
+| --- | --- | --- | --- |
+| `source` | default | Dependency evidence plus first-party source, excluding installed deps and generated trees. | Normal project and machine scans. |
+| `deps` | `--deps-only` | Dependency manifests and lockfiles only. | Fast dependency check when source-risk scanning is not needed. |
+| `full` | `--full` | Full target tree, including installed deps such as `node_modules/` and `vendor/`. | Deep investigation when speed is secondary. |
+
+`--verbose` prints the resolved target, scan mode, project roots, lockfiles,
+manifests, staged source files, and scanner inputs. Use it when confirming that
+a scan is constrained to the intended project or machine root.
+
+When required scanners (`osv-scanner`, `syft`, `grype`) or discovered project
+ecosystems require audit commands that are missing (`npm`, `composer`,
+`pip-audit`, `cargo-audit`, `govulncheck`), `safe audit scan` stops by default
+and prints install guidance plus the rerun command. If you explicitly continue
+with a partial audit, missing tools are reported as `skipped` and the scan
+verdict is `WARN`; they are not presented as zero CVEs.
+
+Dependency-only scan:
+
+```bash
+safe audit scan --deps-only --project .
+```
+
+Full filesystem scan, including installed dependency trees:
+
+```bash
+safe audit scan --full --project .
+```
+
 Configured machine scan:
 
 ```bash
@@ -83,7 +134,7 @@ Remote scan strategies are selected from available tools and connectivity:
 
 - remote direct scanner execution;
 - remote SBOM generation with local vulnerability scanning;
-- staged local scanning of copied manifests.
+- staged local scanning of copied source evidence.
 
 Before trusting a remote Grype scan, `safe audit` checks `grype db status -o json -q`. The stale threshold defaults to 7 days and can be changed:
 

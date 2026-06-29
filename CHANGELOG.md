@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.3 - 2026-06-29
+
+- Make `safe audit scan` default to `source` mode: dependency evidence plus
+  first-party source while skipping installed dependency trees and generated
+  output.
+- Add `safe audit scan --deps-only`, `--full`, and `--verbose` scan controls.
+- Make project and default machine scans discover package ecosystems, require
+  the matching audit tools, and fail closed instead of reporting missing tools
+  as zero CVEs.
+- Preserve valid `osv-scanner` JSON results when OSV exits nonzero because it
+  found vulnerabilities.
+- Fix scan result assembly for non-empty OSV and Grype findings.
+
 ## 1.1.2 - 2026-06-09
 
 - Prefer `safe run`, `safe audit`, and `safe install` across docs, help,

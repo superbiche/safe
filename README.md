@@ -23,6 +23,15 @@ If `safe` is not already available on the machine, inspect the clone and run
 equivalent local scanners before installing. This project is not exempt from its
 own zero-trust model: clone it, scan it, then install it.
 
+Project and machine scans default to dependency evidence plus first-party source
+files, while skipping installed dependency trees such as `node_modules/` and
+`vendor/`. Use `safe audit scan --verbose --project .` to see the resolved
+target, scan mode, staged files, and scanner inputs.
+
+When a required scanner or detected project ecosystem audit tool is missing, the
+scan stops by default and prints install guidance instead of reporting missing
+coverage as zero CVEs.
+
 The installer is idempotent. Reruns refresh binaries and wrappers while preserving existing config and audit data.
 
 ## Core Commands
@@ -30,6 +39,8 @@ The installer is idempotent. Reruns refresh binaries and wrappers while preservi
 ```bash
 safe run repomix@latest -- --help
 safe audit scan --project .
+safe audit scan --deps-only --project .
+safe audit scan --full --project .
 safe audit check left-pad@1.3.0 --ecosystem npm
 safe install -g cowsay@1.6.0
 safe install --sandbox --allow-scripts native-addon@1.0.0
