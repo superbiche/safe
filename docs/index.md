@@ -43,6 +43,13 @@ Scan the current project:
 safe audit scan --project .
 ```
 
+Project and machine scans default to dependency evidence plus first-party source
+files, while skipping installed dependency trees such as `node_modules/` and
+`vendor/`. Use `safe audit scan --deps-only --project .` for lockfile and
+manifest evidence only, `safe audit scan --full --project .` for the complete
+tree, and `safe audit scan --verbose --project .` to inspect the resolved scan
+scope.
+
 Guard persistent package installs:
 
 ```bash

