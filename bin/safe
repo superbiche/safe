@@ -55,12 +55,13 @@ WHAT IS GATED
                           delegating to the real tool: install/add/ci/require
                           (and global variants), update/up/upgrade families,
                           and exec-style fetch-and-run (npm exec|x, pnpm dlx,
-                          yarn dlx, bun x, uv run --with, uv tool run,
+                          yarn dlx, bun x, uv run --with|-w, uv tool run,
                           go run <module>@<version>). Project-local commands
-                          pass through, including npm exec of an installed
-                          ./node_modules/.bin tool, pnpm exec, composer exec
-                          (vendor binaries only), and volta run (official
-                          runtimes only).
+                          pass through, including npm exec of a bare-named
+                          installed ./node_modules/.bin tool (versioned specs
+                          are still audited), pnpm exec, composer exec (vendor
+                          binaries only), and volta run (official runtimes
+                          only).
   safe install <pkg>      Audited, confirmed install path (multi-manager).
 
 HOW A REFUSAL LOOKS

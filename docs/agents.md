@@ -29,13 +29,16 @@ the operator verbatim, wait, then retry the original command unchanged.
 Audited subcommand families: installs (`install`/`add`/`ci`/`require` and
 global variants), updates (`update`/`up`/`upgrade`, `npm it`), and
 exec-style fetch-and-run (`npm exec|x`, `pnpm dlx`, `yarn dlx`, `bun x`,
-`uv run --with`, `uv tool run`, `go run <module>@<version>`).
+`uv run --with|-w`, `uv tool run`, `go run <module>@<version>`). An
+unrecognized space-form value flag before the command fails closed
+(escapable with `--flag=value`).
 
 Passthrough by design (no registry fetch involved): non-install subcommands
-(`npm run`, `npm --version`, `volta list`, ...), `npm exec` of a tool
-already present in `./node_modules/.bin`, `pnpm exec` and `composer exec`
+(`npm run`, `npm --version`, `volta list`, ...), `npm exec <tool>` for a
+**bare** name already present in `./node_modules/.bin` (a versioned or
+aliased spec is still audited), `pnpm exec` and `composer exec`
 (project/vendor binaries only), `volta run` (fetches only official
-runtimes), and `uv run` without `--with`.
+runtimes), `uv run` without `--with`, and `go run` of local paths.
 
 ## Refusal format
 
@@ -70,10 +73,12 @@ wrappers detect this and degrade legibly instead of dying with a silent 127:
 - The audited subcommand families above refuse with a `safe: BLOCKED` line
   and exit 100 (degraded mode cannot audit, so it fails closed where a
   healthy shell would have audited).
-- Everything healthy shells pass through by design also passes through
-  degraded, including `uv run` without `--with` and `go run` of local paths.
-  One deliberate exception: `npm exec` of a local `./node_modules/.bin` tool
-  is refused in degraded mode, since the guard cannot safely verify it.
+- Degraded guards can't run the full parser, so they are conservative: they
+  may over-refuse a few non-fetch invocations but never under-refuse a real
+  fetch. Specifically `uv run` refuses if `--with`/`-w` appears anywhere,
+  `go run` refuses if any argument contains `@`, and `npm exec`/`bun x` of a
+  local `./node_modules/.bin` tool is refused. `pnpm exec`, `composer exec`,
+  and `volta run` pass through as in a healthy shell.
 
 If an agent still sees a bare, silent 127 from a wrapped tool, that is a bug
 worth reporting to the operator — never a reason to bypass.

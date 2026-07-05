@@ -538,23 +538,41 @@ safe_install_go_spec() {
   print -r -- "${name}@${version}"
 }
 
+# A bare command name has no package-spec syntax: no version/tag/alias.
+# Only such names are eligible for the local-bin passthrough, because a
+# versioned or aliased spec (foo@latest, foo@npm:bar) can still fetch
+# remotely even when a same-named local bin exists (npm matches a local
+# dep only on exact name AND version).
+safe_install_is_bare_name() {
+  case "$1" in
+    *@*|*:*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 # Gate exec-style invocations that can fetch and run registry packages
 # (npm exec/x, bun x, pnpm dlx, yarn dlx, uv tool run). Audits the named
-# package(s); the caller then delegates to the real tool unchanged.
-# Args: <ecosystem> <local_bin_ok> <pkg_flag> <skip_flags_pattern> <args...>
-# - Values of <pkg_flag> (space or = form; -p accepted when the flag is
-#   --package) are audited; the positional is then the command those
-#   packages provide and is not audited.
-# - Without <pkg_flag> values, the first positional is the package spec.
-#   With local_bin_ok=1 a positional resolving to ./node_modules/.bin/<name>
-#   is project-local (no fetch) and passes through unaudited.
-# - <skip_flags_pattern> is a case pattern of value-taking flags whose value
-#   must not be mistaken for the positional; pass '--@no-skip@' for none.
+# package(s), then the caller delegates to the real tool unchanged.
+#
+# Args: <label> <ecosystem> <local_bin_ok> <pkg_alt> <val_alt> <bool_alt> <args...>
+# - <pkg_alt> glob-alternation of flags whose value IS the package to audit
+#   (space and = forms), e.g. '--package|-p'. '' for none (package is the
+#   first positional).
+# - <val_alt> glob-alternation of known value-taking flags whose space-form
+#   value must be skipped. <bool_alt> glob-alternation of known switches.
+# - Any OTHER bare (space-form) flag before the package is ambiguous — we
+#   cannot tell its value from the package — so we FAIL CLOSED with a
+#   legible refusal. Escapable with the flag's =form. `--flag=value` is
+#   always unambiguous and skipped. Incomplete lists therefore only cause
+#   escapable over-refusal, never a silent bypass.
+# - With local_bin_ok=1 a BARE positional resolving to
+#   ./node_modules/.bin/<name> is project-local (no fetch) and skipped.
 safe_install_exec_gate() {
-  local ecosystem="$1" local_bin_ok="$2" pkg_flag="$3" skip_pattern="$4"
-  shift 4
+  local label="$1" ecosystem="$2" local_bin_ok="$3"
+  local pkg_alt="$4" val_alt="$5" bool_alt="$6"
+  shift 6
   local -a specs normalized
-  local arg spec positional="" expect_pkg=0 skip_next=0 after_dd=0
+  local arg flag spec positional="" expect_pkg=0 skip_next=0 after_dd=0
   specs=()
 
   for arg in "$@"; do
@@ -571,27 +589,33 @@ safe_install_exec_gate() {
       positional="${arg}"
       break
     fi
-    case "${arg}" in
-      --)
-        after_dd=1
-        ;;
-      "${pkg_flag}")
-        expect_pkg=1
-        ;;
-      "${pkg_flag}"=*)
+
+    if [[ "${arg}" == "--" ]]; then
+      after_dd=1
+      continue
+    fi
+
+    # Attached =form is always unambiguous.
+    if [[ "${arg}" == --*=* ]]; then
+      flag="${arg%%=*}"
+      if [[ -n "${pkg_alt}" && "${flag}" == (${~pkg_alt}) ]]; then
         specs+=("${arg#*=}")
-        ;;
-      -p)
-        if [[ "${pkg_flag}" == "--package" ]]; then
-          expect_pkg=1
-        else
-          skip_next=1
-        fi
-        ;;
-      ${~skip_pattern})
-        skip_next=1
-        ;;
+      fi
+      continue
+    fi
+
+    case "${arg}" in
       -*)
+        if [[ -n "${pkg_alt}" && "${arg}" == (${~pkg_alt}) ]]; then
+          expect_pkg=1
+        elif [[ -n "${val_alt}" && "${arg}" == (${~val_alt}) ]]; then
+          skip_next=1
+        elif [[ -n "${bool_alt}" && "${arg}" == (${~bool_alt}) ]]; then
+          :
+        else
+          print -u2 -- "safe: BLOCKED ${label} — cannot identify the package to audit past unrecognized option '${arg}'; to allow: rewrite it as '${arg}=<value>' (or pass the package via an explicit spec), then retry; details: safe explain"
+          return 100
+        fi
         ;;
       *)
         positional="${arg}"
@@ -602,7 +626,8 @@ safe_install_exec_gate() {
 
   if (( ${#specs[@]} == 0 )); then
     [[ -n "${positional}" ]] || return 0
-    if (( local_bin_ok )) && [[ "${positional}" != @* && -x "./node_modules/.bin/${positional%%@*}" ]]; then
+    if (( local_bin_ok )) && safe_install_is_bare_name "${positional}" && \
+       [[ -x "./node_modules/.bin/${positional}" ]]; then
       return 0
     fi
     specs=("${positional}")
@@ -630,24 +655,34 @@ safe_install_npm_like() {
 
   case "${tool}:${subcommand}" in
     npm:exec|npm:x)
-      safe_install_exec_gate npm 1 --package '-c|--call|-w|--workspace' "${@:2}" || return $?
+      safe_install_exec_gate "npm ${subcommand}" npm 1 \
+        '--package|-p' \
+        '-c|--call|-w|--workspace|--cache|--prefix|--registry|--userconfig|--globalconfig|--loglevel|--script-shell|--node-options|--omit|--include' \
+        '-y|--yes|--no|--offline|--prefer-offline|--prefer-online|--ignore-existing|--foreground-scripts|--silent|--quiet' \
+        "${@:2}" || return $?
       safe_install_real "${tool}" "$@"
       return $?
       ;;
     bun:x)
-      safe_install_exec_gate npm 1 --package '--@no-skip@' "${@:2}" || return $?
+      safe_install_exec_gate "bun x" npm 1 \
+        '' '' '--bun|--silent' \
+        "${@:2}" || return $?
       safe_install_real "${tool}" "$@"
       return $?
       ;;
     pnpm:dlx)
-      safe_install_exec_gate npm 0 --package '--@no-skip@' "${@:2}" || return $?
+      safe_install_exec_gate "pnpm dlx" npm 0 \
+        '' \
+        '--allow-build|--reporter|--package|--shell-mode|-c|--config' \
+        '--silent' \
+        "${@:2}" || return $?
       safe_install_real "${tool}" "$@"
       return $?
       ;;
   esac
 
   case "${subcommand}" in
-    install|i|it|install-test|add|ci|update|u|up|upgrade) ;;
+    install|i|it|install-test|add|ci|update|u|up|upgrade|udpate) ;;
     *) safe_install_real "${tool}" "$@"; return $? ;;
   esac
 
@@ -700,7 +735,7 @@ safe_install_npm_like() {
 npm() {
   if ! typeset -f safe_install_npm_like safe_install_check >/dev/null 2>&1; then
     case "${1:-}" in
-      install|i|it|install-test|add|ci|exec|x|u|update|up|upgrade)
+      install|i|it|install-test|add|ci|exec|x|u|update|up|upgrade|udpate)
         print -u2 -- "safe: BLOCKED npm ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
       *) command npm "$@"; return $? ;;
@@ -748,7 +783,9 @@ yarn() {
   local raw_package
 
   if [[ "${first}" == "dlx" ]]; then
-    safe_install_exec_gate npm 0 --package '--@no-skip@' "${@:2}" || return $?
+    safe_install_exec_gate "yarn dlx" npm 0 \
+      '--package|-p' '-q|--quiet' '' \
+      "${@:2}" || return $?
     safe_install_real yarn "$@"
     return $?
   fi
@@ -887,8 +924,11 @@ uv() {
         print -u2 -- "safe: BLOCKED uv ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
       run)
-        # Parity with the healthy wrapper: only --with pulls registry packages.
-        if [[ " ${*} " == *" --with "* || " ${*} " == *" --with="* ]]; then
+        # Only --with/-w pulls registry packages. Degraded mode can't parse
+        # the command boundary safely, so it is conservative: any --with/-w
+        # token anywhere refuses (may over-refuse a program's own --with arg;
+        # it never under-refuses a real fetch).
+        if [[ " ${*} " == *" --with "* || " ${*} " == *" --with="* || " ${*} " == *" -w "* ]]; then
           print -u2 -- "safe: BLOCKED uv run --with — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
           return 100
         fi
@@ -910,10 +950,16 @@ uv() {
   fi
 
   if [[ "${first}" == "run" ]]; then
-    # `uv run` executes project code; only --with pulls extra registry
-    # packages into the ephemeral environment, so only those are audited.
+    # `uv run [uv-options] <command> [command-args]` executes project code;
+    # only --with/-w pulls extra registry packages. uv options appear only
+    # BEFORE the command, so parsing must stop at the command token — else a
+    # `--with` in the program's own args gets mis-audited. Unknown bare
+    # options before the command are ambiguous → fail closed (safe: an
+    # incomplete list over-refuses but never lets a --with slip past).
     local -a with_specs normalized_with
-    local run_arg expect_with=0
+    local run_arg expect_with=0 skip_with_next=0
+    local uv_val='--python|-p|--with-editable|--with-requirements|--index|--index-url|--extra-index-url|--default-index|--constraint|-c|--index-strategy|--keyring-provider|--resolution|--prerelease|--exclude-newer|--config-setting|--refresh-package|--group|--only-group|--extra|--project|--directory|--python-preference'
+    local uv_bool='--frozen|--locked|--no-sync|--offline|--isolated|--no-project|--all-extras|--no-extra|--no-dev|--dev|--only-dev|--refresh|--reinstall|--upgrade|--all-packages|--no-editable|--exact|--inexact|--no-binary|--no-build|--compile-bytecode|--no-compile-bytecode|--native-tls|--no-cache|-n|-q|--quiet|-v|--verbose|--managed-python|--no-managed-python|--script|-s'
     with_specs=()
     for run_arg in "${@:2}"; do
       if (( expect_with )); then
@@ -921,10 +967,26 @@ uv() {
         expect_with=0
         continue
       fi
+      if (( skip_with_next )); then
+        skip_with_next=0
+        continue
+      fi
+      if [[ "${run_arg}" == "--" ]]; then
+        break
+      fi
+      if [[ "${run_arg}" == --*=* ]]; then
+        [[ "${run_arg}" == (--with=*) ]] && with_specs+=("${run_arg#--with=}")
+        continue
+      fi
       case "${run_arg}" in
-        --) break ;;
-        --with) expect_with=1 ;;
-        --with=*) with_specs+=("${run_arg#--with=}") ;;
+        --with|-w) expect_with=1 ;;
+        ${~uv_val}) skip_with_next=1 ;;
+        ${~uv_bool}) ;;
+        -*)
+          print -u2 -- "safe: BLOCKED uv run — cannot identify --with packages past unrecognized option '${run_arg}'; to allow: rewrite it as '${run_arg}=<value>', then retry; details: safe explain"
+          return 100
+          ;;
+        *) break ;;
       esac
     done
     if (( ${#with_specs[@]} > 0 )); then
@@ -939,7 +1001,11 @@ uv() {
   fi
 
   if [[ "${first}" == "tool" && "${second}" == "run" ]]; then
-    safe_install_exec_gate python 0 --from '--python|--with|--with-editable|--with-requirements|--index|--index-url|--extra-index-url|--default-index' "${@:3}" || return $?
+    safe_install_exec_gate "uv tool run" python 0 \
+      '--from' \
+      '--python|-p|--with|-w|--with-editable|--with-requirements|--index|--index-url|--extra-index-url|--default-index|--constraint|-c|--index-strategy|--keyring-provider|--resolution|--prerelease|--exclude-newer|--config-setting|--refresh-package' \
+      '--offline|--isolated|--system|--no-project|--refresh|--reinstall|--upgrade|-q|--quiet|-v|--verbose|--native-tls|--no-cache|-n' \
+      "${@:3}" || return $?
     safe_install_real uv "$@"
     return $?
   fi
@@ -1023,7 +1089,10 @@ go() {
         print -u2 -- "safe: BLOCKED go ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
       run)
-        # Parity with the healthy wrapper: only remote module@version fetches.
+        # Only remote module@version fetches. Degraded mode can't parse the
+        # run target safely, so it is conservative: any '@' in the args
+        # refuses (may over-refuse a local run whose program args contain @;
+        # it never under-refuses a real module@version fetch).
         if [[ "${*}" == *@* ]]; then
           print -u2 -- "safe: BLOCKED go run — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
           return 100
