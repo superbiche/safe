@@ -973,7 +973,8 @@ dispatch_run() {
   esac
 
   if ! validate_package_name "$pkg" "$RUNNER_KIND"; then
-    err "REJECTED: invalid package name (path traversal, encoded chars, or invalid charset)"
+    err "BLOCKED: invalid package name (path traversal, encoded chars, or invalid charset)"
+    err "  agent contract: safe explain"
     audit_log "$runner_label" "$pkgver" "REJECTED" "$(context_label)" "INVALID_PACKAGE_NAME" "$(caller_info)"
     exit 103
   fi

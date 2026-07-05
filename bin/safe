@@ -12,6 +12,8 @@ SAFE_ZSH_COMPLETION_DIR="${SAFE_ZSH_COMPLETION_DIR:-$HOME/.local/share/zsh/site-
 
 err() { printf 'safe: %s\n' "$*" >&2; }
 die() { err "$@"; exit 1; }
+# Policy refusal: legible one-line contract + dedicated exit code (see safe explain).
+refuse() { local code="$1"; shift; err "$@"; exit "$code"; }
 
 show_usage() {
   cat <<'EOF'
@@ -48,9 +50,13 @@ WHAT IS GATED
   npx / bunx / uvx        Binaries are symlinked to `safe run`: packages run
                           from an allowlist, a Podman sandbox, or not at all.
   npm / pnpm / yarn / bun / pip / pip3 / uv / cargo / go / composer / volta
-                          zsh wrapper functions audit install-like
-                          subcommands with `safe audit` before delegating to
-                          the real tool. Non-install subcommands pass through.
+                          zsh wrapper functions audit install subcommands
+                          (install/add/ci/require and global variants) with
+                          `safe audit` before delegating to the real tool.
+                          Other subcommands pass through. Known gap: exec-style
+                          subcommands (pnpm dlx, npm exec, yarn dlx, uv run)
+                          are not yet audited in healthy shells; gating them is
+                          planned, and degraded mode already refuses them.
   safe install <pkg>      Audited, confirmed install path (multi-manager).
 
 HOW A REFUSAL LOOKS
@@ -70,8 +76,9 @@ WHAT AN AGENT SHOULD DO
      verbatim. Trust escalations (safe run host-allow add/update) only work
      in the operator's interactive terminal — never attempt them yourself.
   3. After the operator allows, retry the original command unchanged.
-  4. If a wrapped tool exits 127 silently, the wrappers are partially
-     loaded (shell snapshot stripped helpers); report it, don't bypass.
+  4. Exit 127 from a wrapped tool means a genuinely missing command, never
+     a policy block — partial wrapper loads refuse legibly with exit 100.
+     A silent 127 would be a safe bug: report it, don't bypass.
 
 OPERATOR ALLOW FLOWS
   safe run host-allow add <pkg>@<version> --reason "..."   trusted host exec (npm)
@@ -974,15 +981,26 @@ safe_install_audit_package() {
         err "safe audit warned for $package; exact host-allow entry permits install"
         return 0
       fi
-      die "safe audit warned for $package; refusing host install"
+      refuse 100 "BLOCKED ${ecosystem} install of ${package} — safe audit verdict WARN; $(safe_install_allow_hint "$package" "$ecosystem"); details: safe explain"
       ;;
     2|20)
-      die "safe audit blocked $package; refusing host install"
+      refuse 104 "BLOCKED ${ecosystem} install of ${package} — safe audit verdict BLOCK; $(safe_install_allow_hint "$package" "$ecosystem"); details: safe explain"
       ;;
     *)
-      die "safe audit failed for $package with exit $audit_status; refusing host install"
+      refuse 100 "BLOCKED ${ecosystem} install of ${package} — safe audit failed with exit ${audit_status} (fail closed); ask the operator; details: safe explain"
       ;;
   esac
+}
+
+safe_install_allow_hint() {
+  local package="$1"
+  local ecosystem="$2"
+
+  if [[ "$ecosystem" == "npm" ]]; then
+    printf 'to allow: ask the operator to run: safe run host-allow add %s --reason "..." — then retry' "$package"
+  else
+    printf 'to allow: operator review — safe audit check %s --ecosystem %s' "$package" "$ecosystem"
+  fi
 }
 
 safe_install_confirm() {
@@ -990,7 +1008,7 @@ safe_install_confirm() {
   local reply
 
   if [[ ! -t 0 || ! -t 1 ]]; then
-    die "host install requires a TTY confirmation; pass --yes to skip the prompt"
+    refuse 102 "BLOCKED install — interactive confirmation required and this shell is non-interactive; to allow: ask the operator to run it interactively, or re-run with --yes after operator review; details: safe explain"
   fi
 
   printf 'safe: install with `%s`? [y/N] ' "$(quote_command "${install_cmd[@]}")" >&2

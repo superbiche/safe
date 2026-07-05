@@ -23,11 +23,17 @@ the operator verbatim, wait, then retry the original command unchanged.
 | Surface | Mechanism | Refusal source |
 | --- | --- | --- |
 | `npx`, `bunx`, `uvx` | Binaries symlinked to `safe run` | `safe run: BLOCKED ...` + exit 100–104 |
-| `npm`, `pnpm`, `yarn`, `bun`, `pip`, `pip3`, `uv`, `cargo`, `go`, `composer`, `volta` | zsh wrapper functions audit install-like subcommands via `safe audit` | `safe: BLOCKED ...` + exit 100/102/104 |
-| `safe install <pkg>` | Audited, confirmed install path | interactive prompts, fail closed non-TTY |
+| `npm`, `pnpm`, `yarn`, `bun`, `pip`, `pip3`, `uv`, `cargo`, `go`, `composer`, `volta` | zsh wrapper functions audit install subcommands (install/add/ci/require and global variants) via `safe audit` | `safe: BLOCKED ...` + exit 100/102/104 |
+| `safe install <pkg>` | Audited, confirmed install path | `safe: BLOCKED ...` + exit 100/102/104 |
 
 Non-install subcommands (`npm run`, `npm --version`, `volta list`, `composer
 validate`, ...) pass through to the real tool.
+
+Known gap: exec-style subcommands (`pnpm dlx`, `npm exec`, `yarn dlx`,
+`uv run --with`, `go run <module>@<version>`, `composer exec`, `volta run`)
+and update aliases are not yet audited by the healthy wrappers; gating them
+is a planned follow-up. Degraded mode (below) already refuses them, which
+makes it deliberately stricter than a healthy shell.
 
 ## Refusal format
 
@@ -59,8 +65,9 @@ Some agent harnesses snapshot the interactive shell and strip helper
 functions (Claude Code drops single-underscore function names). The public
 wrappers detect this and degrade legibly instead of dying with a silent 127:
 
-- Install/exec-ish subcommands (`npm install`, `pnpm dlx`, `bun x`,
-  `composer require`, ...) refuse with a `safe: BLOCKED` line and exit 100.
+- Install/exec-ish subcommands (`npm install`, `npm exec|x|update`,
+  `pnpm dlx`, `bun x`, `yarn dlx|upgrade`, `composer require`, ...) refuse
+  with a `safe: BLOCKED` line and exit 100.
 - Everything else passes through to the real tool.
 
 If an agent still sees a bare, silent 127 from a wrapped tool, that is a bug

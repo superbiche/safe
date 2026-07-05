@@ -18,6 +18,17 @@
   refuse with exit 102 so agents can suggest but never execute trust
   escalations.
 - Document policy exit codes in `safe run` help and the command reference.
+- Apply the same refusal contract to `safe install` host installs: audit
+  WARN/failure exit 100, audit BLOCK exits 104, non-TTY confirmation exits
+  102, each with a `safe: BLOCKED` line (previously generic exit 1).
+- Format `safe run` invalid-package-name rejections as `BLOCKED` with the
+  `safe explain` pointer (still exit 103).
+- Extend degraded-mode gated lists with update/exec aliases (`npm
+  x|it|install-test|update|up|upgrade`, `pnpm update|up|upgrade`,
+  `bun update`, `yarn up|upgrade|upgrade-interactive`).
+- Document the known healthy-shell gap: exec-style subcommands (`pnpm dlx`,
+  `npm exec`, `yarn dlx`, `uv run`, ...) are not yet audited; degraded mode
+  refusing them is intentional. Gating them is a planned follow-up.
 
 ## 1.1.3 - 2026-06-29
 

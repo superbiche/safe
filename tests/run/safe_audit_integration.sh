@@ -189,6 +189,17 @@ PATH="$mockbin:$PATH" \
   ' safe-run || fail "host-allow add non-TTY was not refused with exit 102"
 pass "host-allow add refuses non-TTY with legible exit 102"
 
+invalid_name_err="$tmp/invalid-name.err"
+set +e
+SAFE_RUN_CONFIG_DIR="$tmp/config-invalid-name" SAFE_RUN_DATA_DIR="$tmp/data-invalid-name" \
+  "$SAFE_RUN" "../bad" >/dev/null 2>"$invalid_name_err" </dev/null
+invalid_name_rc=$?
+set -e
+[[ "$invalid_name_rc" -eq 103 ]] || fail "invalid package name expected rc=103, got $invalid_name_rc"
+grep -q "BLOCKED: invalid package name" "$invalid_name_err" || fail "invalid package name refusal not BLOCKED-formatted"
+grep -q "safe explain" "$invalid_name_err" || fail "invalid package name refusal missing safe explain pointer"
+pass "invalid package name refuses with BLOCKED contract and exit 103"
+
 SAFE_RUN_CONFIG_DIR="$tmp/config-update-go-no-reason" \
 SAFE_RUN_DATA_DIR="$tmp/data-update-go-no-reason" \
 SAFE_AUDIT_VERDICT=GO \

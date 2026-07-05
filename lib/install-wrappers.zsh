@@ -121,7 +121,11 @@ safe_install_scan_project() {
   fi
 
   if [[ "${scan_output:l}" == *critical* || "${scan_status}" -ge 2 ]]; then
-    print -u2 -- "safe install: safe audit scan reported critical findings"
+    # Preamble only ahead of the interactive prompt; the non-TTY path emits a
+    # single self-contained BLOCKED line instead.
+    if [[ -t 0 && -t 1 ]]; then
+      print -u2 -- "safe install: safe audit scan reported critical findings"
+    fi
     safe_install_confirm_critical
     return $?
   fi
@@ -597,7 +601,7 @@ safe_install_npm_like() {
 npm() {
   if ! typeset -f safe_install_npm_like safe_install_check >/dev/null 2>&1; then
     case "${1:-}" in
-      install|i|add|ci|exec)
+      install|i|it|install-test|add|ci|exec|x|update|up|upgrade)
         print -u2 -- "safe: BLOCKED npm ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
       *) command npm "$@"; return $? ;;
@@ -609,7 +613,7 @@ npm() {
 pnpm() {
   if ! typeset -f safe_install_npm_like safe_install_check >/dev/null 2>&1; then
     case "${1:-}" in
-      install|i|add|ci|dlx|exec)
+      install|i|add|ci|dlx|exec|update|up|upgrade)
         print -u2 -- "safe: BLOCKED pnpm ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
       *) command pnpm "$@"; return $? ;;
@@ -621,7 +625,7 @@ pnpm() {
 bun() {
   if ! typeset -f safe_install_npm_like safe_install_check >/dev/null 2>&1; then
     case "${1:-}" in
-      install|i|add|ci|x)
+      install|i|add|ci|x|update)
         print -u2 -- "safe: BLOCKED bun ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
       *) command bun "$@"; return $? ;;
@@ -633,7 +637,7 @@ bun() {
 yarn() {
   if ! typeset -f safe_install_yarn_packages safe_install_check >/dev/null 2>&1; then
     case "${1:-}" in
-      ""|install|add|global|dlx)
+      ""|install|add|global|dlx|up|upgrade|upgrade-interactive)
         print -u2 -- "safe: BLOCKED yarn ${1:-install} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
       *) command yarn "$@"; return $? ;;

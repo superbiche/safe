@@ -190,6 +190,18 @@ assert_err_contains_fragment() {
   return 0
 }
 
+assert_err_not_contains_fragment() {
+  local fragment="$1"
+  local label="$2"
+  if grep -Fq "${fragment}" "${ERR_FILE}"; then
+    printf 'unexpected stderr fragment: %s\n' "${fragment}" >&2
+    printf 'stderr:\n%s\n' "$(cat "${ERR_FILE}")" >&2
+    fail "${label}"
+    return 1
+  fi
+  return 0
+}
+
 # Simulates a harness shell snapshot that keeps the public wrapper functions
 # but strips all safe_install_* helpers (the Claude Code silent-127 regression).
 STRIP_HELPERS='for f in ${(k)functions}; do [[ "$f" == safe_install_* ]] && unfunction "$f"; done; '
@@ -210,6 +222,22 @@ case_degraded_exec_blocks_legibly() {
   assert_status 100 "$FUNCNAME" || return
   assert_err_contains_fragment 'safe: BLOCKED pnpm dlx' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_degraded_alias_subcommands_block() {
+  prepare_case "degraded-alias-subcommands-block"
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm x cowsay" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe: BLOCKED npm x' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm update left-pad" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe: BLOCKED npm update' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}yarn dlx cowsay" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe: BLOCKED yarn dlx' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tyarn' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -341,6 +369,8 @@ case_critical_scan_non_tty_aborts() {
   assert_status 102 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tscan\t--project\t.' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe: BLOCKED install — safe audit scan found critical findings' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'safe install: safe audit scan reported critical findings' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -657,6 +687,7 @@ main() {
   for case in \
     case_degraded_install_blocks_legibly \
     case_degraded_exec_blocks_legibly \
+    case_degraded_alias_subcommands_block \
     case_degraded_non_install_passes_through \
     case_refusal_message_contract \
     case_global_package_check \
