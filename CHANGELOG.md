@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+- Fix silent exit-127 wrapper failures in agent shells: rename
+  `_safe_install_*` helpers to `safe_install_*` so harness shell snapshots
+  (Claude Code strips single-underscore functions) keep them loaded.
+- Add an inlined degraded-mode guard to every public wrapper: when helpers
+  are missing, install/exec-ish subcommands refuse with a legible
+  `safe: BLOCKED` line (exit 100) and everything else passes through.
+- Standardize wrapper refusals to one stderr line — `safe: BLOCKED <cmd> —
+  <reason>; to allow: <operator command>; details: safe explain` — with
+  policy exit codes 100/102/104 instead of a generic 2.
+- Add `safe explain`: prints the agent contract (gates, refusal format,
+  exit codes, operator-only allow flows), plus a new Agent Contract docs
+  page.
+- Make `safe run host-allow add/update` operator-only: non-TTY invocations
+  refuse with exit 102 so agents can suggest but never execute trust
+  escalations.
+- Document policy exit codes in `safe run` help and the command reference.
+- Apply the same refusal contract to `safe install` host installs: audit
+  WARN/failure exit 100, audit BLOCK exits 104, non-TTY confirmation exits
+  102, each with a `safe: BLOCKED` line (previously generic exit 1).
+- Format `safe run` invalid-package-name rejections as `BLOCKED` with the
+  `safe explain` pointer (still exit 103).
+- Extend degraded-mode gated lists with update/exec aliases (`npm
+  x|it|install-test|update|up|upgrade`, `pnpm update|up|upgrade`,
+  `bun update`, `yarn up|upgrade|upgrade-interactive`).
+- Document the known healthy-shell gap: exec-style subcommands (`pnpm dlx`,
+  `npm exec`, `yarn dlx`, `uv run`, ...) are not yet audited; degraded mode
+  refusing them is intentional. Gating them is a planned follow-up.
+
 ## 1.1.3 - 2026-06-29
 
 - Make `safe audit scan` default to `source` mode: dependency evidence plus

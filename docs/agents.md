@@ -1,0 +1,101 @@
+# Agent Contract
+
+Coding agents (Claude Code, Codex, local LLM harnesses) hit safe's gates
+constantly. This page is the machine-facing contract: what is gated, what a
+refusal looks like, and how to get unblocked without bypassing the safety
+net. The same content is available on any gated machine via:
+
+```bash
+safe explain
+```
+
+## The one rule
+
+A refusal is policy, not breakage. If a package-manager command fails with a
+line starting with `safe: BLOCKED` or `safe run: BLOCKED`, the toolchain is
+working as designed. Agents must not work around a refusal — no direct
+`node_modules/.bin` calls of packages that failed to install, no alternate
+installers, no `curl | sh`. Relay the refusal and its `to allow:` command to
+the operator verbatim, wait, then retry the original command unchanged.
+
+## What is gated
+
+| Surface | Mechanism | Refusal source |
+| --- | --- | --- |
+| `npx`, `bunx`, `uvx` | Binaries symlinked to `safe run` | `safe run: BLOCKED ...` + exit 100–104 |
+| `npm`, `pnpm`, `yarn`, `bun`, `pip`, `pip3`, `uv`, `cargo`, `go`, `composer`, `volta` | zsh wrapper functions audit install subcommands (install/add/ci/require and global variants) via `safe audit` | `safe: BLOCKED ...` + exit 100/102/104 |
+| `safe install <pkg>` | Audited, confirmed install path | `safe: BLOCKED ...` + exit 100/102/104 |
+
+Non-install subcommands (`npm run`, `npm --version`, `volta list`, `composer
+validate`, ...) pass through to the real tool.
+
+Known gap: exec-style subcommands (`pnpm dlx`, `npm exec`, `yarn dlx`,
+`uv run --with`, `go run <module>@<version>`, `composer exec`, `volta run`)
+and update aliases are not yet audited by the healthy wrappers; gating them
+is a planned follow-up. Degraded mode (below) already refuses them, which
+makes it deliberately stricter than a healthy shell.
+
+## Refusal format
+
+One stderr line, always the same shape:
+
+```text
+safe: BLOCKED <tool> <action> — <reason>; to allow: <operator command>; details: safe explain
+```
+
+`safe run` refusals use the same `BLOCKED:` keyword with follow-up hint
+lines, including `agent contract: safe explain`.
+
+## Exit codes
+
+Policy refusals use a dedicated 100-range so scripts and agents can
+distinguish a block from a missing binary (127):
+
+| Code | Meaning |
+| --- | --- |
+| 100 | Blocked by policy (blocklist, degraded wrappers, fail-closed audit) |
+| 101 | host-allow version pin mismatch |
+| 102 | Interactive operator confirmation required (non-TTY refusal) |
+| 103 | Invalid package name rejected |
+| 104 | `safe audit` BLOCK verdict |
+
+## Degraded wrappers (partial shell snapshots)
+
+Some agent harnesses snapshot the interactive shell and strip helper
+functions (Claude Code drops single-underscore function names). The public
+wrappers detect this and degrade legibly instead of dying with a silent 127:
+
+- Install/exec-ish subcommands (`npm install`, `npm exec|x|update`,
+  `pnpm dlx`, `bun x`, `yarn dlx|upgrade`, `composer require`, ...) refuse
+  with a `safe: BLOCKED` line and exit 100.
+- Everything else passes through to the real tool.
+
+If an agent still sees a bare, silent 127 from a wrapped tool, that is a bug
+worth reporting to the operator — never a reason to bypass.
+
+## Allow flows (operator only)
+
+Trust escalations require the operator's interactive terminal. `safe run
+host-allow add` and `update` refuse in non-TTY shells with exit 102, so an
+agent can suggest the command but never execute it:
+
+```bash
+safe run host-allow add <pkg>@<version> --reason "..."   # trusted host exec (npm)
+safe run -y <pkg>@<version> -- <args>                    # one-off sandbox run
+safe install [-g] <pkg>@<version>                        # audited install
+safe run block list && safe run audit --blocked          # review refusals
+```
+
+## Snippet for harness instruction files
+
+Paste into `AGENTS.md` / `CLAUDE.md` on gated machines:
+
+```markdown
+## Package manager gates
+
+This machine gates package execution/installation through `safe`. If a
+command fails with a `safe: BLOCKED` / `safe run: BLOCKED` line or exit code
+100–104, that is policy, not breakage: run `safe explain`, relay the refusal
+and its `to allow:` command to the operator verbatim, and never bypass
+(no direct node_modules/.bin calls, alternate installers, or curl|sh).
+```

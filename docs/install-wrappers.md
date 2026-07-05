@@ -74,6 +74,40 @@ composer update
 
 Non-install commands pass through unchanged.
 
+## Refusal Contract
+
+Every wrapper refusal is a single stderr line in the shape:
+
+```text
+safe: BLOCKED <tool> <action> — <reason>; to allow: <operator command>; details: safe explain
+```
+
+Refusals exit with dedicated codes so callers can distinguish a policy block
+from a missing binary (127): `100` policy block, `102` interactive operator
+confirmation required, `104` `safe audit` BLOCK verdict. See the
+[Agent Contract](agents.md) page and `safe explain`.
+
+## Degraded Mode (partial shell snapshots)
+
+Some agent harnesses (Claude Code) snapshot interactive shell functions but
+strip single-underscore names. The `safe_install_*` helpers deliberately
+avoid a leading underscore so snapshots keep them, and every public wrapper
+carries an inlined guard for the case where helpers are still missing:
+
+- Install/exec-ish subcommands (`npm install`, `npm exec|x|update`,
+  `pnpm dlx`, `bun x`, `yarn dlx|upgrade`, `composer require`, `uv tool`,
+  ...) refuse with a `safe: BLOCKED` line and exit 100 instead of failing
+  with a silent 127.
+- All other subcommands pass through to the real tool.
+
+Degraded mode is deliberately stricter than a healthy shell: exec-style
+subcommands (`pnpm dlx`, `npm exec`, `yarn dlx`, `uv run`) are not yet
+audited by the healthy wrappers (a planned follow-up), but a degraded
+environment cannot audit anything, so it refuses them outright.
+
+Do not rename wrapper helpers to `_`-prefixed names; that reintroduces the
+silent-127 failure inside harness snapshots.
+
 ## Timeouts
 
 Package checks are wrapped with `timeout` when it is available. Override the default 30 second timeout:

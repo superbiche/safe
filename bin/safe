@@ -12,6 +12,8 @@ SAFE_ZSH_COMPLETION_DIR="${SAFE_ZSH_COMPLETION_DIR:-$HOME/.local/share/zsh/site-
 
 err() { printf 'safe: %s\n' "$*" >&2; }
 die() { err "$@"; exit 1; }
+# Policy refusal: legible one-line contract + dedicated exit code (see safe explain).
+refuse() { local code="$1"; shift; err "$@"; exit "$code"; }
 
 show_usage() {
   cat <<'EOF'
@@ -27,8 +29,62 @@ USAGE
   safe setup [<machine> | --all | --machine <csv>]
   safe status
   safe doctor [--json]
+  safe explain
   safe version
   safe help
+EOF
+}
+
+cmd_explain() {
+  cat <<'EOF'
+safe: agent contract — what is gated, how refusals look, how to get unblocked
+
+This machine routes package execution and installation through `safe`, a
+supply-chain safety net. If a package-manager command fails with a message
+starting with `safe:` or `safe run:`, it was refused BY POLICY — the
+toolchain is not broken. Do not work around a refusal (no direct
+node_modules/.bin calls of packages that failed to install, no alternate
+installers, no curl|sh). Surface the refusal to the operator instead.
+
+WHAT IS GATED
+  npx / bunx / uvx        Binaries are symlinked to `safe run`: packages run
+                          from an allowlist, a Podman sandbox, or not at all.
+  npm / pnpm / yarn / bun / pip / pip3 / uv / cargo / go / composer / volta
+                          zsh wrapper functions audit install subcommands
+                          (install/add/ci/require and global variants) with
+                          `safe audit` before delegating to the real tool.
+                          Other subcommands pass through. Known gap: exec-style
+                          subcommands (pnpm dlx, npm exec, yarn dlx, uv run)
+                          are not yet audited in healthy shells; gating them is
+                          planned, and degraded mode already refuses them.
+  safe install <pkg>      Audited, confirmed install path (multi-manager).
+
+HOW A REFUSAL LOOKS
+  One stderr line starting with `safe: BLOCKED` or `safe run: BLOCKED`,
+  stating what was blocked, why, and the operator command that allows it.
+
+EXIT CODES (policy refusals; 127 means a genuinely missing command)
+  100  blocked by policy (blocklist, degraded wrappers, fail-closed audit)
+  101  host-allow version pin mismatch
+  102  interactive operator confirmation required (non-TTY refusal)
+  103  invalid package name rejected
+  104  safe audit BLOCK verdict
+
+WHAT AN AGENT SHOULD DO
+  1. Treat any BLOCKED line as policy, not breakage; do not retry blind.
+  2. Relay the refusal line and its `to allow:` command to the operator
+     verbatim. Trust escalations (safe run host-allow add/update) only work
+     in the operator's interactive terminal — never attempt them yourself.
+  3. After the operator allows, retry the original command unchanged.
+  4. Exit 127 from a wrapped tool means a genuinely missing command, never
+     a policy block — partial wrapper loads refuse legibly with exit 100.
+     A silent 127 would be a safe bug: report it, don't bypass.
+
+OPERATOR ALLOW FLOWS
+  safe run host-allow add <pkg>@<version> --reason "..."   trusted host exec (npm)
+  safe run -y <pkg>@<version> -- <args>                    one-off sandbox run
+  safe install [-g] <pkg>@<version>                        audited install
+  safe run block list / safe run audit --blocked           review refusals
 EOF
 }
 
@@ -48,7 +104,7 @@ cmd_status() {
   "$SAFE_AUDIT_PATH" status
   echo
   echo "=== install ==="
-  if [[ -n "${ZSH_VERSION:-}" && -n "${functions[_safe_install_check]:-}" ]]; then
+  if [[ -n "${ZSH_VERSION:-}" && -n "${functions[safe_install_check]:-}" ]]; then
     echo "wrappers:       loaded"
   elif [[ -f "$SAFE_CONFIG_ROOT/install-wrappers.zsh" ]]; then
     echo "wrappers:       installed"
@@ -925,15 +981,26 @@ safe_install_audit_package() {
         err "safe audit warned for $package; exact host-allow entry permits install"
         return 0
       fi
-      die "safe audit warned for $package; refusing host install"
+      refuse 100 "BLOCKED ${ecosystem} install of ${package} — safe audit verdict WARN; $(safe_install_allow_hint "$package" "$ecosystem"); details: safe explain"
       ;;
     2|20)
-      die "safe audit blocked $package; refusing host install"
+      refuse 104 "BLOCKED ${ecosystem} install of ${package} — safe audit verdict BLOCK; $(safe_install_allow_hint "$package" "$ecosystem"); details: safe explain"
       ;;
     *)
-      die "safe audit failed for $package with exit $audit_status; refusing host install"
+      refuse 100 "BLOCKED ${ecosystem} install of ${package} — safe audit failed with exit ${audit_status} (fail closed); ask the operator; details: safe explain"
       ;;
   esac
+}
+
+safe_install_allow_hint() {
+  local package="$1"
+  local ecosystem="$2"
+
+  if [[ "$ecosystem" == "npm" ]]; then
+    printf 'to allow: ask the operator to run: safe run host-allow add %s --reason "..." — then retry' "$package"
+  else
+    printf 'to allow: operator review — safe audit check %s --ecosystem %s' "$package" "$ecosystem"
+  fi
 }
 
 safe_install_confirm() {
@@ -941,7 +1008,7 @@ safe_install_confirm() {
   local reply
 
   if [[ ! -t 0 || ! -t 1 ]]; then
-    die "host install requires a TTY confirmation; pass --yes to skip the prompt"
+    refuse 102 "BLOCKED install — interactive confirmation required and this shell is non-interactive; to allow: ask the operator to run it interactively, or re-run with --yes after operator review; details: safe explain"
   fi
 
   printf 'safe: install with `%s`? [y/N] ' "$(quote_command "${install_cmd[@]}")" >&2
@@ -1104,6 +1171,7 @@ case "${1:-}" in
   status)   shift; cmd_status "$@" ;;
   setup)    shift; exec "$SAFE_AUDIT_PATH" setup "$@" ;;
   doctor)   shift; cmd_doctor "$@" ;;
+  explain)  shift; cmd_explain ;;
   version|--version|-v) cmd_version ;;
   help|-h|--help|"") show_usage ;;
   *)        exec "$SAFE_RUN_PATH" "$@" ;;

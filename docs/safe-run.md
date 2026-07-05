@@ -70,7 +70,7 @@ safe run host-allow list
 safe run host-allow remove pnpm
 ```
 
-`host-allow add` and `host-allow update` run `safe audit` before mutating the allowlist. A `GO` result can proceed without a reason. `WARN`, `BLOCK`, or unavailable audit results require a reason and interactive confirmation.
+`host-allow add` and `host-allow update` are operator-only trust escalations: they require an interactive terminal and refuse in non-TTY shells with exit 102, so agents can suggest the command verbatim but never execute it. Both run `safe audit` before mutating the allowlist. A `GO` result can proceed without a reason. `WARN`, `BLOCK`, or unavailable audit results require a reason and interactive confirmation.
 
 ## Blocklist
 

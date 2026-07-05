@@ -48,7 +48,7 @@ cat > "$shim/safe-audit" <<'SH'
 case "${1:-}" in
   --version|-v) echo "safe-audit mock" ;;
   status) echo "config: ${SAFE_CONFIG_DIR:-$HOME/.config/safe}/audit" ;;
-  check) printf 'safe-audit'; for arg in "$@"; do printf '\t%s' "$arg"; done; printf '\n' ;;
+  check) printf 'safe-audit'; for arg in "$@"; do printf '\t%s' "$arg"; done; printf '\n'; exit "${SAFE_AUDIT_STUB_STATUS:-0}" ;;
   *) printf 'safe-audit'; for arg in "$@"; do printf '\t%s' "$arg"; done; printf '\n' ;;
 esac
 SH
@@ -78,6 +78,28 @@ trust_config="$tmp/trust-config"
 trust_install_output="$(PATH="$shim:$PATH" SAFE_CONFIG_DIR="$trust_config" "$shim/safe" install --yes --trust-host -g cowsay@1.6.0)"
 grep -Fq $'npm\tinstall\t-g\tcowsay@1.6.0' <<<"$trust_install_output" || fail "safe install --trust-host did not install package"
 jq -e '.packages.cowsay.version == "1.6.0" and .packages.cowsay.ecosystem == "npm"' "$trust_config/run/host-allow.json" >/dev/null || fail "safe install --trust-host did not add exact host-allow entry"
+
+refusal_case() {
+  local label="$1" expected_rc="$2" stub_status="$3" fragment="$4"
+  shift 4
+  local rc=0 errfile="$tmp/refusal-$label.err"
+  PATH="$shim:$PATH" SAFE_CONFIG_DIR="$tmp/refusal-$label-config" SAFE_AUDIT_STUB_STATUS="$stub_status" \
+    "$shim/safe" install "$@" >/dev/null 2>"$errfile" </dev/null || rc=$?
+  [[ "$rc" -eq "$expected_rc" ]] || { cat "$errfile" >&2; fail "safe install $label expected rc=$expected_rc, got rc=$rc"; }
+  grep -Fq "$fragment" "$errfile" || { cat "$errfile" >&2; fail "safe install $label missing refusal fragment: $fragment"; }
+  grep -Fq "safe explain" "$errfile" || fail "safe install $label refusal missing safe explain pointer"
+}
+refusal_case audit-warn 100 10 'safe: BLOCKED npm install of warnme@1.0.0' --yes -g warnme@1.0.0
+refusal_case audit-block 104 20 'safe: BLOCKED npm install of blockme@1.0.0' --yes -g blockme@1.0.0
+refusal_case audit-fail 100 42 'safe audit failed with exit 42 (fail closed)' --yes -g failme@1.0.0
+refusal_case non-tty-confirm 102 0 'BLOCKED install — interactive confirmation required' -g okpkg@1.0.0
+pass "safe install policy refusals use BLOCKED contract and exit codes"
+
+explain_output="$("$SAFE" explain)"
+grep -Fq '100  blocked by policy' <<<"$explain_output" || fail "safe explain missing exit code table"
+grep -Fq 'never attempt them yourself' <<<"$explain_output" || fail "safe explain missing agent guidance"
+grep -Fq 'safe run host-allow add' <<<"$explain_output" || fail "safe explain missing allow flow"
+pass "safe explain prints the agent contract"
 set +e
 latest_trust_output="$(PATH="$shim:$PATH" SAFE_CONFIG_DIR="$tmp/latest-trust-config" "$shim/safe" install --yes --trust-host -g cowsay 2>&1)"
 latest_trust_rc=$?
