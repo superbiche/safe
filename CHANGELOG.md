@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Gate exec-style fetch-and-run subcommands in healthy wrappers: `npm
+  exec|x`, `pnpm dlx`, `yarn dlx`, `bun x`, `uv run --with`, `uv tool run`,
+  and `go run <module>@<version>` now audit the named package via `safe
+  audit check` before delegating (GO proceeds, WARN/BLOCK refuse with the
+  BLOCKED contract).
+- Gate update families like project installs: `npm update|u|up|upgrade`,
+  `npm it|install-test`, `pnpm update|up|upgrade`, `bun update`, `yarn
+  up|upgrade|upgrade-interactive`, `yarn global upgrade`.
+- Document passthrough-by-design commands that never fetch registry
+  packages (`pnpm exec`, `composer exec`, `volta run`, local `npm exec`,
+  `uv run` without `--with`) and align degraded-mode guards to parity:
+  `pnpm exec`/`composer exec`/`volta run` no longer blocked when degraded,
+  `uv run` blocked only with `--with`, `go run` only for `module@version`.
+
 - Fix silent exit-127 wrapper failures in agent shells: rename
   `_safe_install_*` helpers to `safe_install_*` so harness shell snapshots
   (Claude Code strips single-underscore functions) keep them loaded.

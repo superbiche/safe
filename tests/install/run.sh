@@ -261,6 +261,128 @@ case_refusal_message_contract() {
   pass "$FUNCNAME"
 }
 
+case_npm_exec_fetch_audits() {
+  prepare_case "npm-exec-fetch-audits"
+  SAFE_INSTALL_TEST_SCRIPT='npm exec create-foo' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tcreate-foo@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\texec\tcreate-foo' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_exec_local_bin_passthrough() {
+  prepare_case "npm-exec-local-bin-passthrough"
+  mkdir -p "${WORK_DIR}/node_modules/.bin"
+  printf '#!/bin/sh\n' > "${WORK_DIR}/node_modules/.bin/eslint"
+  chmod +x "${WORK_DIR}/node_modules/.bin/eslint"
+  SAFE_INSTALL_TEST_SCRIPT='npm exec eslint' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\texec\teslint' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_exec_package_flag_blocks() {
+  prepare_case "npm-exec-package-flag-blocks"
+  SAFE_INSTALL_TEST_SCRIPT='npm exec --package=blockme -- create' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_dlx_and_x_audit() {
+  prepare_case "dlx-and-x-audit"
+  SAFE_INSTALL_TEST_SCRIPT='pnpm dlx cowsay@1.6.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tcowsay@1.6.0\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tpnpm\tdlx\tcowsay@1.6.0' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='bun x cowsay' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tcowsay@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tbun\tx\tcowsay' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='yarn dlx blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tyarn' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_uv_run_and_tool_run_gate() {
+  prepare_case "uv-run-and-tool-run-gate"
+  SAFE_INSTALL_TEST_SCRIPT='uv run --with warnme script.py' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\twarnme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='uv run script.py' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tuv\trun\tscript.py' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='uv tool run ruff' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\truff@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='uv tool run --from blockme r' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_go_run_module_gates() {
+  prepare_case "go-run-module-gates"
+  write_tool_stub "${BIN_DIR}" go
+  SAFE_INSTALL_TEST_SCRIPT='go run example.com/blockme@v1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\texample.com/blockme@v1.0.0\t--ecosystem\tgo' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tgo' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='go run ./cmd' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tgo\trun\t./cmd' "$FUNCNAME" || return
+  assert_count 0 $'AUDIT\tcheck\t./cmd@latest\t--ecosystem\tgo' "${LOG_FILE}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_update_family_gates() {
+  prepare_case "update-family-gates"
+  touch "${WORK_DIR}/package.json"
+  SAFE_INSTALL_TEST_SCRIPT='npm update lodash' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tscan\t--project\t.' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tlodash@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tupdate\tlodash' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='yarn upgrade left-pad' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tleft-pad@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='npm u blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_exec_passthrough_by_design() {
+  prepare_case "exec-passthrough-by-design"
+  SAFE_INSTALL_TEST_SCRIPT='pnpm exec eslint && composer exec tool && volta run node -v' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tpnpm\texec\teslint' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\texec\ttool' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tvolta\trun\tnode\t-v' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_degraded_parity_refinements() {
+  prepare_case "degraded-parity-refinements"
+  write_tool_stub "${BIN_DIR}" go
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run --with extra script.py" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run script.py" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}go run example.com/m@v1" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}go run ./cmd" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}pnpm exec eslint && composer exec tool && volta run node -v" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm u" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_global_package_check() {
   prepare_case "global-package-check"
   SAFE_INSTALL_TEST_SCRIPT='npm install -g left-pad@1.3.0' run_zsh
@@ -690,6 +812,15 @@ main() {
     case_degraded_alias_subcommands_block \
     case_degraded_non_install_passes_through \
     case_refusal_message_contract \
+    case_npm_exec_fetch_audits \
+    case_npm_exec_local_bin_passthrough \
+    case_npm_exec_package_flag_blocks \
+    case_dlx_and_x_audit \
+    case_uv_run_and_tool_run_gate \
+    case_go_run_module_gates \
+    case_update_family_gates \
+    case_exec_passthrough_by_design \
+    case_degraded_parity_refinements \
     case_global_package_check \
     case_local_project_scan \
     case_add_scans_and_checks \

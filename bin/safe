@@ -50,13 +50,17 @@ WHAT IS GATED
   npx / bunx / uvx        Binaries are symlinked to `safe run`: packages run
                           from an allowlist, a Podman sandbox, or not at all.
   npm / pnpm / yarn / bun / pip / pip3 / uv / cargo / go / composer / volta
-                          zsh wrapper functions audit install subcommands
-                          (install/add/ci/require and global variants) with
-                          `safe audit` before delegating to the real tool.
-                          Other subcommands pass through. Known gap: exec-style
-                          subcommands (pnpm dlx, npm exec, yarn dlx, uv run)
-                          are not yet audited in healthy shells; gating them is
-                          planned, and degraded mode already refuses them.
+                          zsh wrapper functions audit install, update, and
+                          exec subcommands with `safe audit` before
+                          delegating to the real tool: install/add/ci/require
+                          (and global variants), update/up/upgrade families,
+                          and exec-style fetch-and-run (npm exec|x, pnpm dlx,
+                          yarn dlx, bun x, uv run --with, uv tool run,
+                          go run <module>@<version>). Project-local commands
+                          pass through, including npm exec of an installed
+                          ./node_modules/.bin tool, pnpm exec, composer exec
+                          (vendor binaries only), and volta run (official
+                          runtimes only).
   safe install <pkg>      Audited, confirmed install path (multi-manager).
 
 HOW A REFUSAL LOOKS

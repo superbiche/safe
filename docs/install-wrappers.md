@@ -74,6 +74,34 @@ composer update
 
 Non-install commands pass through unchanged.
 
+## Wrapped Exec and Update Commands
+
+Exec-style subcommands that fetch and run registry packages are audited the
+same way installs are — the named package goes through `safe audit check`
+before the real tool runs:
+
+```bash
+npm exec create-vite        # audited unless ./node_modules/.bin/create-vite exists
+npm x cowsay
+npm exec --package=cowsay -- cowsay hi
+pnpm dlx cowsay@1.6.0
+yarn dlx create-react-app
+bun x cowsay
+uv run --with rich script.py   # audits the --with packages only
+uv tool run ruff
+go run example.com/cmd/tool@latest
+```
+
+Update families are gated like project installs (scan, plus package checks
+for named specs): `npm update|u|up|upgrade`, `npm it|install-test`,
+`pnpm update|up|upgrade`, `bun update`, `yarn up|upgrade|upgrade-interactive`,
+`yarn global upgrade`.
+
+Passthrough by design — these never fetch registry packages: `pnpm exec`
+and `composer exec` (project/vendor binaries only), `volta run` (official
+runtimes only), `npm exec <tool>` when `./node_modules/.bin/<tool>` already
+exists, `uv run` without `--with`, and `go run` of local paths.
+
 ## Refusal Contract
 
 Every wrapper refusal is a single stderr line in the shape:
@@ -94,16 +122,15 @@ strip single-underscore names. The `safe_install_*` helpers deliberately
 avoid a leading underscore so snapshots keep them, and every public wrapper
 carries an inlined guard for the case where helpers are still missing:
 
-- Install/exec-ish subcommands (`npm install`, `npm exec|x|update`,
-  `pnpm dlx`, `bun x`, `yarn dlx|upgrade`, `composer require`, `uv tool`,
-  ...) refuse with a `safe: BLOCKED` line and exit 100 instead of failing
-  with a silent 127.
-- All other subcommands pass through to the real tool.
-
-Degraded mode is deliberately stricter than a healthy shell: exec-style
-subcommands (`pnpm dlx`, `npm exec`, `yarn dlx`, `uv run`) are not yet
-audited by the healthy wrappers (a planned follow-up), but a degraded
-environment cannot audit anything, so it refuses them outright.
+- The audited subcommand families (installs, updates, exec-style
+  fetch-and-run) refuse with a `safe: BLOCKED` line and exit 100 instead of
+  failing with a silent 127.
+- All other subcommands pass through to the real tool, mirroring what
+  healthy shells pass through by design: `pnpm exec`, `composer exec`,
+  `volta run`, `uv run` without `--with`, `go run` of local paths.
+- One deliberate exception to parity: `npm exec` of a local
+  `./node_modules/.bin` tool is refused in degraded mode because the guard
+  cannot safely verify the local-bin condition.
 
 Do not rename wrapper helpers to `_`-prefixed names; that reintroduces the
 silent-127 failure inside harness snapshots.

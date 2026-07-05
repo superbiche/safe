@@ -538,6 +538,87 @@ safe_install_go_spec() {
   print -r -- "${name}@${version}"
 }
 
+# Gate exec-style invocations that can fetch and run registry packages
+# (npm exec/x, bun x, pnpm dlx, yarn dlx, uv tool run). Audits the named
+# package(s); the caller then delegates to the real tool unchanged.
+# Args: <ecosystem> <local_bin_ok> <pkg_flag> <skip_flags_pattern> <args...>
+# - Values of <pkg_flag> (space or = form; -p accepted when the flag is
+#   --package) are audited; the positional is then the command those
+#   packages provide and is not audited.
+# - Without <pkg_flag> values, the first positional is the package spec.
+#   With local_bin_ok=1 a positional resolving to ./node_modules/.bin/<name>
+#   is project-local (no fetch) and passes through unaudited.
+# - <skip_flags_pattern> is a case pattern of value-taking flags whose value
+#   must not be mistaken for the positional; pass '--@no-skip@' for none.
+safe_install_exec_gate() {
+  local ecosystem="$1" local_bin_ok="$2" pkg_flag="$3" skip_pattern="$4"
+  shift 4
+  local -a specs normalized
+  local arg spec positional="" expect_pkg=0 skip_next=0 after_dd=0
+  specs=()
+
+  for arg in "$@"; do
+    if (( expect_pkg )); then
+      specs+=("${arg}")
+      expect_pkg=0
+      continue
+    fi
+    if (( skip_next )); then
+      skip_next=0
+      continue
+    fi
+    if (( after_dd )); then
+      positional="${arg}"
+      break
+    fi
+    case "${arg}" in
+      --)
+        after_dd=1
+        ;;
+      "${pkg_flag}")
+        expect_pkg=1
+        ;;
+      "${pkg_flag}"=*)
+        specs+=("${arg#*=}")
+        ;;
+      -p)
+        if [[ "${pkg_flag}" == "--package" ]]; then
+          expect_pkg=1
+        else
+          skip_next=1
+        fi
+        ;;
+      ${~skip_pattern})
+        skip_next=1
+        ;;
+      -*)
+        ;;
+      *)
+        positional="${arg}"
+        break
+        ;;
+    esac
+  done
+
+  if (( ${#specs[@]} == 0 )); then
+    [[ -n "${positional}" ]] || return 0
+    if (( local_bin_ok )) && [[ "${positional}" != @* && -x "./node_modules/.bin/${positional%%@*}" ]]; then
+      return 0
+    fi
+    specs=("${positional}")
+  fi
+
+  normalized=()
+  for spec in "${specs[@]}"; do
+    case "${ecosystem}" in
+      python) normalized+=("$(safe_install_python_spec "${spec}")") ;;
+      *) normalized+=("$(safe_install_npm_spec "${spec}")") ;;
+    esac
+  done
+
+  safe_install_check_many "${ecosystem}" "${normalized[@]}"
+}
+
 safe_install_npm_like() {
   local tool="$1"
   shift
@@ -547,8 +628,26 @@ safe_install_npm_like() {
   local raw_package
   local project_present=1
 
+  case "${tool}:${subcommand}" in
+    npm:exec|npm:x)
+      safe_install_exec_gate npm 1 --package '-c|--call|-w|--workspace' "${@:2}" || return $?
+      safe_install_real "${tool}" "$@"
+      return $?
+      ;;
+    bun:x)
+      safe_install_exec_gate npm 1 --package '--@no-skip@' "${@:2}" || return $?
+      safe_install_real "${tool}" "$@"
+      return $?
+      ;;
+    pnpm:dlx)
+      safe_install_exec_gate npm 0 --package '--@no-skip@' "${@:2}" || return $?
+      safe_install_real "${tool}" "$@"
+      return $?
+      ;;
+  esac
+
   case "${subcommand}" in
-    install|i|add|ci) ;;
+    install|i|it|install-test|add|ci|update|u|up|upgrade) ;;
     *) safe_install_real "${tool}" "$@"; return $? ;;
   esac
 
@@ -601,7 +700,7 @@ safe_install_npm_like() {
 npm() {
   if ! typeset -f safe_install_npm_like safe_install_check >/dev/null 2>&1; then
     case "${1:-}" in
-      install|i|it|install-test|add|ci|exec|x|update|up|upgrade)
+      install|i|it|install-test|add|ci|exec|x|u|update|up|upgrade)
         print -u2 -- "safe: BLOCKED npm ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
       *) command npm "$@"; return $? ;;
@@ -613,7 +712,7 @@ npm() {
 pnpm() {
   if ! typeset -f safe_install_npm_like safe_install_check >/dev/null 2>&1; then
     case "${1:-}" in
-      install|i|add|ci|dlx|exec|update|up|upgrade)
+      install|i|add|ci|dlx|update|up|upgrade)
         print -u2 -- "safe: BLOCKED pnpm ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
       *) command pnpm "$@"; return $? ;;
@@ -648,7 +747,13 @@ yarn() {
   local -a raw packages
   local raw_package
 
-  if [[ "${first}" == "global" && "${second}" == "add" ]]; then
+  if [[ "${first}" == "dlx" ]]; then
+    safe_install_exec_gate npm 0 --package '--@no-skip@' "${@:2}" || return $?
+    safe_install_real yarn "$@"
+    return $?
+  fi
+
+  if [[ "${first}" == "global" && ( "${second}" == "add" || "${second}" == "upgrade" ) ]]; then
     raw=("${(@f)$(safe_install_yarn_packages "${@:3}")}")
     packages=()
     for raw_package in "${raw[@]}"; do
@@ -663,23 +768,25 @@ yarn() {
     return $?
   fi
 
-  if [[ "${first}" == "install" || "${first}" == "add" || -z "${first}" ]]; then
-    if safe_install_yarn_project_present; then
-      safe_install_scan_project || return $?
-    fi
-
-    if [[ "${first}" == "add" ]]; then
-      raw=("${(@f)$(safe_install_yarn_packages "${@:2}")}")
-      packages=()
-      for raw_package in "${raw[@]}"; do
-        [[ -n "${raw_package}" ]] && packages+=("$(safe_install_npm_spec "${raw_package}")")
-      done
-
-      if (( ${#packages[@]} > 0 )); then
-        safe_install_check_many npm "${packages[@]}" || return $?
+  case "${first}" in
+    ""|install|add|up|upgrade|upgrade-interactive)
+      if safe_install_yarn_project_present; then
+        safe_install_scan_project || return $?
       fi
-    fi
-  fi
+
+      if [[ "${first}" == "add" || "${first}" == "up" || "${first}" == "upgrade" ]]; then
+        raw=("${(@f)$(safe_install_yarn_packages "${@:2}")}")
+        packages=()
+        for raw_package in "${raw[@]}"; do
+          [[ -n "${raw_package}" ]] && packages+=("$(safe_install_npm_spec "${raw_package}")")
+        done
+
+        if (( ${#packages[@]} > 0 )); then
+          safe_install_check_many npm "${packages[@]}" || return $?
+        fi
+      fi
+      ;;
+  esac
 
   safe_install_real yarn "$@"
 }
@@ -776,9 +883,16 @@ pip3() {
 uv() {
   if ! typeset -f safe_install_python_packages safe_install_check >/dev/null 2>&1; then
     case "${1:-}" in
-      sync|add|tool|pip|run)
+      sync|add|tool|pip)
         print -u2 -- "safe: BLOCKED uv ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
+      run)
+        # Parity with the healthy wrapper: only --with pulls registry packages.
+        if [[ " ${*} " == *" --with "* || " ${*} " == *" --with="* ]]; then
+          print -u2 -- "safe: BLOCKED uv run --with — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100
+        fi
+        command uv "$@"; return $? ;;
       *) command uv "$@"; return $? ;;
     esac
   fi
@@ -791,6 +905,41 @@ uv() {
       safe_install_scan_project || return $?
     fi
 
+    safe_install_real uv "$@"
+    return $?
+  fi
+
+  if [[ "${first}" == "run" ]]; then
+    # `uv run` executes project code; only --with pulls extra registry
+    # packages into the ephemeral environment, so only those are audited.
+    local -a with_specs normalized_with
+    local run_arg expect_with=0
+    with_specs=()
+    for run_arg in "${@:2}"; do
+      if (( expect_with )); then
+        with_specs+=("${run_arg}")
+        expect_with=0
+        continue
+      fi
+      case "${run_arg}" in
+        --) break ;;
+        --with) expect_with=1 ;;
+        --with=*) with_specs+=("${run_arg#--with=}") ;;
+      esac
+    done
+    if (( ${#with_specs[@]} > 0 )); then
+      normalized_with=()
+      for run_arg in "${with_specs[@]}"; do
+        normalized_with+=("$(safe_install_python_spec "${run_arg}")")
+      done
+      safe_install_check_many python "${normalized_with[@]}" || return $?
+    fi
+    safe_install_real uv "$@"
+    return $?
+  fi
+
+  if [[ "${first}" == "tool" && "${second}" == "run" ]]; then
+    safe_install_exec_gate python 0 --from '--python|--with|--with-editable|--with-requirements|--index|--index-url|--extra-index-url|--default-index' "${@:3}" || return $?
     safe_install_real uv "$@"
     return $?
   fi
@@ -870,15 +1019,45 @@ cargo() {
 go() {
   if ! typeset -f safe_install_go_packages safe_install_check >/dev/null 2>&1; then
     case "${1:-}" in
-      install|run)
+      install)
         print -u2 -- "safe: BLOCKED go ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
+      run)
+        # Parity with the healthy wrapper: only remote module@version fetches.
+        if [[ "${*}" == *@* ]]; then
+          print -u2 -- "safe: BLOCKED go run — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100
+        fi
+        command go "$@"; return $? ;;
       *) command go "$@"; return $? ;;
     esac
   fi
   local subcommand="${1:-}"
   local second="${2:-}"
   local -a packages
+
+  if [[ "${subcommand}" == "run" ]]; then
+    # `go run <module>@<version>` fetches and executes a remote module;
+    # local package paths pass through unaudited.
+    local run_arg run_target="" run_skip_next=0
+    for run_arg in "${@:2}"; do
+      if (( run_skip_next )); then
+        run_skip_next=0
+        continue
+      fi
+      case "${run_arg}" in
+        -exec|-tags|-modfile|-overlay|-p|-gcflags|-ldflags|-asmflags|-buildmode|-compiler|-gccgoflags)
+          run_skip_next=1 ;;
+        -*) ;;
+        *) run_target="${run_arg}"; break ;;
+      esac
+    done
+    if [[ -n "${run_target}" && "${run_target}" == *@* && "${run_target}" != .* && "${run_target}" != /* ]]; then
+      safe_install_check_many go "$(safe_install_go_spec "${run_target}")" || return $?
+    fi
+    safe_install_real go "$@"
+    return $?
+  fi
 
   if [[ "${subcommand}" != "install" ]]; then
     if [[ "${subcommand}" == "build" || "${subcommand}" == "test" ||
@@ -907,7 +1086,7 @@ go() {
 composer() {
   if ! typeset -f safe_install_composer_packages safe_install_check >/dev/null 2>&1; then
     case "${1:-}" in
-      install|update|require|global|exec)
+      install|update|require|global)
         print -u2 -- "safe: BLOCKED composer ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
       *) command composer "$@"; return $? ;;
@@ -946,7 +1125,7 @@ composer() {
 volta() {
   if ! typeset -f safe_install_volta_packages safe_install_check >/dev/null 2>&1; then
     case "${1:-}" in
-      install|run)
+      install)
         print -u2 -- "safe: BLOCKED volta ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
       *) command volta "$@"; return $? ;;
