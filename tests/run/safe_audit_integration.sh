@@ -123,6 +123,7 @@ SAFE_RUN_PATH="$SAFE_RUN" \
     jq --arg p hostpkg --arg v 2.0.0 ".packages[\$p] = {version:\$v, reason:\"fixture\", ecosystem:\"npm\"}" "$HOST_ALLOW_FILE" > "$tmpfile"
     mv "$tmpfile" "$HOST_ALLOW_FILE"
     set +e
+    require_operator_tty() { :; }
     ( cmd_host_allow_update hostpkg@latest ) >/dev/null 2>&1
     rc=$?
     set -e
@@ -142,6 +143,7 @@ PATH="$mockbin:$PATH" \
     source "$SAFE_RUN_PATH" >/dev/null
     ensure_dirs
     registry_integrity_npm() { printf "sha512-fixture"; }
+    require_operator_tty() { :; }
     cmd_host_allow_add hostpkg@2.0.0 >/dev/null 2>&1
     [[ "$(jq -r ".packages.hostpkg.version" "$HOST_ALLOW_FILE")" == "2.0.0" ]]
     [[ "$(jq -r ".packages.hostpkg.reason" "$HOST_ALLOW_FILE")" == "" ]]
@@ -159,11 +161,33 @@ PATH="$mockbin:$PATH" \
     source "$SAFE_RUN_PATH" >/dev/null
     ensure_dirs
     registry_integrity_npm() { printf "sha512-fixture"; }
+    require_operator_tty() { :; }
     cmd_host_allow_add @qwen-code/qwen-code@0.16.2 --reason="misses only Socket that fails" >/dev/null 2>&1
     [[ "$(jq -r ".packages[\"@qwen-code/qwen-code\"].version" "$HOST_ALLOW_FILE")" == "0.16.2" ]]
     [[ "$(jq -r ".packages[\"@qwen-code/qwen-code\"].reason" "$HOST_ALLOW_FILE")" == "misses only Socket that fails" ]]
   ' safe-run || fail "host-allow add rejected --reason=value"
 pass "host-allow add accepts --reason=value"
+
+SAFE_RUN_CONFIG_DIR="$tmp/config-add-non-tty" \
+SAFE_RUN_DATA_DIR="$tmp/data-add-non-tty" \
+SAFE_AUDIT_VERDICT=GO \
+SAFE_AUDIT_CALL_LOG="$tmp/audit-calls-add-non-tty.log" \
+SAFE_RUN_PATH="$SAFE_RUN" \
+ERR_FILE="$tmp/add-non-tty.err" \
+PATH="$mockbin:$PATH" \
+  bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    ensure_dirs
+    set +e
+    ( cmd_host_allow_add hostpkg@2.0.0 ) >/dev/null 2>"$ERR_FILE"
+    rc=$?
+    set -e
+    [[ "$rc" -eq 102 ]]
+    grep -q "interactive operator terminal" "$ERR_FILE"
+    [[ "$(jq -r ".packages | length" "$HOST_ALLOW_FILE")" == "0" ]]
+  ' safe-run || fail "host-allow add non-TTY was not refused with exit 102"
+pass "host-allow add refuses non-TTY with legible exit 102"
 
 SAFE_RUN_CONFIG_DIR="$tmp/config-update-go-no-reason" \
 SAFE_RUN_DATA_DIR="$tmp/data-update-go-no-reason" \
@@ -179,6 +203,7 @@ PATH="$mockbin:$PATH" \
     tmpfile=$(mktemp)
     jq --arg p hostpkg --arg v 2.0.0 ".packages[\$p] = {version:\$v, reason:\"old exception\", ecosystem:\"npm\"}" "$HOST_ALLOW_FILE" > "$tmpfile"
     mv "$tmpfile" "$HOST_ALLOW_FILE"
+    require_operator_tty() { :; }
     cmd_host_allow_update hostpkg@2.1.0 >/dev/null 2>&1
     [[ "$(jq -r ".packages.hostpkg.version" "$HOST_ALLOW_FILE")" == "2.1.0" ]]
     [[ "$(jq -r ".packages.hostpkg.reason" "$HOST_ALLOW_FILE")" == "" ]]
@@ -199,6 +224,7 @@ PATH="$mockbin:$PATH" \
     jq --arg p hostpkg --arg v 2.0.0 ".packages[\$p] = {version:\$v, reason:\"fixture\", ecosystem:\"npm\"}" "$HOST_ALLOW_FILE" > "$tmpfile"
     mv "$tmpfile" "$HOST_ALLOW_FILE"
     set +e
+    require_operator_tty() { :; }
     ( cmd_host_allow_update hostpkg@2.1.0 ) >/dev/null 2>&1
     rc=$?
     set -e

@@ -27,8 +27,57 @@ USAGE
   safe setup [<machine> | --all | --machine <csv>]
   safe status
   safe doctor [--json]
+  safe explain
   safe version
   safe help
+EOF
+}
+
+cmd_explain() {
+  cat <<'EOF'
+safe: agent contract — what is gated, how refusals look, how to get unblocked
+
+This machine routes package execution and installation through `safe`, a
+supply-chain safety net. If a package-manager command fails with a message
+starting with `safe:` or `safe run:`, it was refused BY POLICY — the
+toolchain is not broken. Do not work around a refusal (no direct
+node_modules/.bin calls of packages that failed to install, no alternate
+installers, no curl|sh). Surface the refusal to the operator instead.
+
+WHAT IS GATED
+  npx / bunx / uvx        Binaries are symlinked to `safe run`: packages run
+                          from an allowlist, a Podman sandbox, or not at all.
+  npm / pnpm / yarn / bun / pip / pip3 / uv / cargo / go / composer / volta
+                          zsh wrapper functions audit install-like
+                          subcommands with `safe audit` before delegating to
+                          the real tool. Non-install subcommands pass through.
+  safe install <pkg>      Audited, confirmed install path (multi-manager).
+
+HOW A REFUSAL LOOKS
+  One stderr line starting with `safe: BLOCKED` or `safe run: BLOCKED`,
+  stating what was blocked, why, and the operator command that allows it.
+
+EXIT CODES (policy refusals; 127 means a genuinely missing command)
+  100  blocked by policy (blocklist, degraded wrappers, fail-closed audit)
+  101  host-allow version pin mismatch
+  102  interactive operator confirmation required (non-TTY refusal)
+  103  invalid package name rejected
+  104  safe audit BLOCK verdict
+
+WHAT AN AGENT SHOULD DO
+  1. Treat any BLOCKED line as policy, not breakage; do not retry blind.
+  2. Relay the refusal line and its `to allow:` command to the operator
+     verbatim. Trust escalations (safe run host-allow add/update) only work
+     in the operator's interactive terminal — never attempt them yourself.
+  3. After the operator allows, retry the original command unchanged.
+  4. If a wrapped tool exits 127 silently, the wrappers are partially
+     loaded (shell snapshot stripped helpers); report it, don't bypass.
+
+OPERATOR ALLOW FLOWS
+  safe run host-allow add <pkg>@<version> --reason "..."   trusted host exec (npm)
+  safe run -y <pkg>@<version> -- <args>                    one-off sandbox run
+  safe install [-g] <pkg>@<version>                        audited install
+  safe run block list / safe run audit --blocked           review refusals
 EOF
 }
 
@@ -48,7 +97,7 @@ cmd_status() {
   "$SAFE_AUDIT_PATH" status
   echo
   echo "=== install ==="
-  if [[ -n "${ZSH_VERSION:-}" && -n "${functions[_safe_install_check]:-}" ]]; then
+  if [[ -n "${ZSH_VERSION:-}" && -n "${functions[safe_install_check]:-}" ]]; then
     echo "wrappers:       loaded"
   elif [[ -f "$SAFE_CONFIG_ROOT/install-wrappers.zsh" ]]; then
     echo "wrappers:       installed"
@@ -1104,6 +1153,7 @@ case "${1:-}" in
   status)   shift; cmd_status "$@" ;;
   setup)    shift; exec "$SAFE_AUDIT_PATH" setup "$@" ;;
   doctor)   shift; cmd_doctor "$@" ;;
+  explain)  shift; cmd_explain ;;
   version|--version|-v) cmd_version ;;
   help|-h|--help|"") show_usage ;;
   *)        exec "$SAFE_RUN_PATH" "$@" ;;

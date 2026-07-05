@@ -12,11 +12,26 @@ safe vendor update --name NAME --path PATH --reason TEXT -- COMMAND...
 safe setup [<machine> | --all | --machine <csv>]
 safe status
 safe doctor [--json]
+safe explain
 safe version
 safe help
 ```
 
 Unknown top-level commands are treated like `safe run <args...>`.
+
+`safe explain` prints the agent contract: what is gated, the refusal
+format, policy exit codes, and the operator-only allow flows. See
+[Agent Contract](agents.md).
+
+### Policy exit codes
+
+```text
+100  blocked by policy (blocklist, degraded wrappers, fail-closed audit)
+101  host-allow version pin mismatch
+102  interactive operator confirmation required (non-TTY refusal)
+103  invalid package name rejected
+104  safe audit BLOCK verdict
+```
 
 ## safe run
 

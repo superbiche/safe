@@ -980,6 +980,7 @@ dispatch_run() {
 
   if in_blocked "$pkg"; then
     err "BLOCKED: $pkgver — $BLOCKED_REASON"
+    err "  agent contract: safe explain"
     audit_log "$runner_label" "$pkgver" "BLOCKED" "$(context_label)" "REFUSED" "reason=$BLOCKED_REASON"
     exit 100
   fi
@@ -1009,6 +1010,7 @@ dispatch_run() {
     if [[ -n "$HOST_ALLOW_PINNED_VERSION" ]]; then
       err "BLOCKED: $pkgver — host-allow pinned to ${pkg}@${HOST_ALLOW_PINNED_VERSION}"
       err "  to update: safe run host-allow update ${pkg}@${version} --reason \"...\""
+      err "  agent contract: safe explain"
       audit_log "$runner_label" "$pkgver" "BLOCKED" "$(context_label)" "VERSION_MISMATCH" "pinned=$HOST_ALLOW_PINNED_VERSION"
       exit 101
     fi
@@ -1032,6 +1034,7 @@ dispatch_run() {
   case "$safe_audit_state" in
     20)
       err "BLOCKED: $pkgver — safe audit reported BLOCK"
+      err "  agent contract: safe explain"
       audit_log "$runner_label" "$pkgver" "BLOCKED" "$(context_label)" "SAFE_AUDIT_BLOCK"
       exit 104
       ;;
@@ -1052,7 +1055,8 @@ dispatch_run() {
 
   if ! is_tty; then
     err "BLOCKED: $pkgver is unknown and invocation is non-interactive"
-    err "  to allow: run interactively first, or: safe run host-allow add ..."
+    err "  to allow: ask the operator to run interactively first, or: safe run host-allow add ${pkg}@<version> --reason \"...\""
+    err "  agent contract: safe explain"
     audit_log "$runner_label" "$pkgver" "UNKNOWN" "$(context_label)" "BLOCKED" "$(caller_info)"
     exit 102
   fi
@@ -1212,10 +1216,22 @@ cmd_host_allow() {
   esac
 }
 
+require_operator_tty() {
+  # Trust escalations are operator-only: agents may suggest the command
+  # verbatim but must not be able to execute it from a non-interactive shell.
+  local action="$1" spec="$2"
+  is_tty && return 0
+  err "BLOCKED: host-allow $action requires an interactive operator terminal"
+  err "  ask the operator to run: safe run host-allow $action ${spec} --reason \"...\""
+  err "  agent contract: safe explain"
+  exit 102
+}
+
 cmd_host_allow_add() {
   local spec="${1:-}"
   shift || true
   [[ -z "$spec" ]] && die "usage: safe run host-allow add <pkg>@<version> [--reason \"...\"]"
+  require_operator_tty add "$spec"
   local reason="" ecosystem="npm"
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1260,6 +1276,7 @@ cmd_host_allow_update() {
   local spec="${1:-}"
   shift || true
   [[ -z "$spec" ]] && die "usage: safe run host-allow update <pkg>@<new-version> [--reason \"...\"]"
+  require_operator_tty update "$spec"
   local reason=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1933,6 +1950,14 @@ DECISION TIERS (in order)
                     BLOCK refuses, WARN continues
   4. sandbox-known  Podman sandbox, no prompt
   5. unknown        TTY: prompt; non-TTY: BLOCK
+
+EXIT CODES (policy refusals; distinguish from 127 = command not found)
+  100  blocked by policy (blocklist, degraded wrappers, fail-closed audit)
+  101  host-allow version pin mismatch
+  102  interactive operator confirmation required (non-TTY refusal)
+  103  invalid package name rejected
+  104  safe audit BLOCK verdict
+  Full agent contract: safe explain
 EOF
 }
 

@@ -98,6 +98,7 @@ _safe_top() {
     'install:audit and install npm packages, or run sandbox installs'
     'status:show consolidated status'
     'doctor:show local readiness diagnostics'
+    'explain:print the agent contract (gates, refusal format, allow flows)'
     'setup:setup safe audit scanners'
     'version:show versions'
     'help:show help'

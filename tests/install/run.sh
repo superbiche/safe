@@ -178,6 +178,61 @@ assert_count() {
   return 0
 }
 
+assert_err_contains_fragment() {
+  local fragment="$1"
+  local label="$2"
+  if ! grep -Fq "${fragment}" "${ERR_FILE}"; then
+    printf 'missing stderr fragment: %s\n' "${fragment}" >&2
+    printf 'stderr:\n%s\n' "$(cat "${ERR_FILE}")" >&2
+    fail "${label}"
+    return 1
+  fi
+  return 0
+}
+
+# Simulates a harness shell snapshot that keeps the public wrapper functions
+# but strips all safe_install_* helpers (the Claude Code silent-127 regression).
+STRIP_HELPERS='for f in ${(k)functions}; do [[ "$f" == safe_install_* ]] && unfunction "$f"; done; '
+
+case_degraded_install_blocks_legibly() {
+  prepare_case "degraded-install-blocks-legibly"
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm install left-pad" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe: BLOCKED npm install' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe explain' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_degraded_exec_blocks_legibly() {
+  prepare_case "degraded-exec-blocks-legibly"
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}pnpm dlx cowsay" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe: BLOCKED pnpm dlx' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_degraded_non_install_passes_through() {
+  prepare_case "degraded-non-install-passes-through"
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm --version && volta list node && composer validate" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\t--version' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tvolta\tlist\tnode' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\tvalidate' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_refusal_message_contract() {
+  prepare_case "refusal-message-contract"
+  SAFE_INSTALL_TEST_SCRIPT='npm install -g warnme@1.0.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe: BLOCKED npm install of warnme@1.0.0' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe run host-allow add warnme@1.0.0 --reason' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe explain' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_global_package_check() {
   prepare_case "global-package-check"
   SAFE_INSTALL_TEST_SCRIPT='npm install -g left-pad@1.3.0' run_zsh
@@ -211,7 +266,7 @@ case_add_scans_and_checks() {
 case_blocked_install() {
   prepare_case "blocked-install"
   SAFE_INSTALL_TEST_SCRIPT='npm install -g blockme' run_zsh
-  assert_status 2 "$FUNCNAME" || return
+  assert_status 104 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   pass "$FUNCNAME"
@@ -220,7 +275,7 @@ case_blocked_install() {
 case_warning_install_blocks() {
   prepare_case "warning-install-blocks"
   SAFE_INSTALL_TEST_SCRIPT='npm install -g warnme' run_zsh
-  assert_status 2 "$FUNCNAME" || return
+  assert_status 100 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tcheck\twarnme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   pass "$FUNCNAME"
@@ -246,7 +301,7 @@ case_host_allow_warn_requires_exact_version() {
 {"packages":{"warnme":{"version":"1.0.0","ecosystem":"npm","reason":"fixture"}}}
 JSON
   SAFE_INSTALL_TEST_SCRIPT='npm install -g warnme@1.0.1' run_zsh
-  assert_status 2 "$FUNCNAME" || return
+  assert_status 100 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tcheck\twarnme@1.0.1\t--ecosystem\tnpm' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   pass "$FUNCNAME"
@@ -273,7 +328,7 @@ case_npm_alias_audits_target_package() {
 case_audit_failure_blocks() {
   prepare_case "audit-failure-blocks"
   SAFE_AUDIT_CHECK_STATUS=42 SAFE_INSTALL_TEST_SCRIPT='uv tool install repomix' run_zsh
-  assert_status 2 "$FUNCNAME" || return
+  assert_status 100 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tcheck\trepomix@latest\t--ecosystem\tpython' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
   pass "$FUNCNAME"
@@ -283,7 +338,7 @@ case_critical_scan_non_tty_aborts() {
   prepare_case "critical-scan-non-tty-aborts"
   touch "${WORK_DIR}/package.json"
   SAFE_AUDIT_SCAN_OUTPUT='critical vulnerability' SAFE_AUDIT_SCAN_STATUS=1 SAFE_INSTALL_TEST_SCRIPT='npm ci' run_zsh
-  assert_status 1 "$FUNCNAME" || return
+  assert_status 102 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tscan\t--project\t.' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   pass "$FUNCNAME"
@@ -600,6 +655,10 @@ EOF
 main() {
   local case
   for case in \
+    case_degraded_install_blocks_legibly \
+    case_degraded_exec_blocks_legibly \
+    case_degraded_non_install_passes_through \
+    case_refusal_message_contract \
     case_global_package_check \
     case_local_project_scan \
     case_add_scans_and_checks \

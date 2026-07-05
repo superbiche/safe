@@ -13,6 +13,7 @@ nav:
   - safe-run: safe-run.md
   - safe-audit: safe-audit.md
   - Install Wrappers: install-wrappers.md
+  - Agent Contract: agents.md
   - Integration Flows: integration-flows.md
   - Configuration: configuration.md
   - Operations: operations.md
