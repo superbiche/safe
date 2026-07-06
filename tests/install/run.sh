@@ -261,6 +261,382 @@ case_refusal_message_contract() {
   pass "$FUNCNAME"
 }
 
+case_npm_exec_fetch_audits() {
+  prepare_case "npm-exec-fetch-audits"
+  SAFE_INSTALL_TEST_SCRIPT='npm exec create-foo' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tcreate-foo@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\texec\tcreate-foo' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_exec_local_bin_passthrough() {
+  prepare_case "npm-exec-local-bin-passthrough"
+  mkdir -p "${WORK_DIR}/node_modules/.bin"
+  printf '#!/bin/sh\n' > "${WORK_DIR}/node_modules/.bin/eslint"
+  chmod +x "${WORK_DIR}/node_modules/.bin/eslint"
+  # Bare name with a matching local bin: no fetch, passthrough.
+  SAFE_INSTALL_TEST_SCRIPT='npm exec eslint' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\texec\teslint' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_exec_versioned_spec_audits_despite_local_bin() {
+  prepare_case "npm-exec-versioned-spec-audits-despite-local-bin"
+  mkdir -p "${WORK_DIR}/node_modules/.bin"
+  printf '#!/bin/sh\n' > "${WORK_DIR}/node_modules/.bin/blockme"
+  chmod +x "${WORK_DIR}/node_modules/.bin/blockme"
+  # A versioned/aliased spec can still fetch remotely even with a same-named
+  # local bin, so it must be audited (review High 1).
+  SAFE_INSTALL_TEST_SCRIPT='npm exec blockme@latest' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='bun x blockme@1.2.3' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1.2.3\t--ecosystem\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_exec_package_flag_blocks() {
+  prepare_case "npm-exec-package-flag-blocks"
+  SAFE_INSTALL_TEST_SCRIPT='npm exec --package=blockme -- create' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_exec_value_flag_does_not_hide_package() {
+  prepare_case "exec-value-flag-does-not-hide-package"
+  # A known value-taking flag before the command must not be mistaken for the
+  # package; the real fetched package is audited (review High 2).
+  SAFE_INSTALL_TEST_SCRIPT='npm exec --cache /tmp/cache-ok blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='pnpm dlx --allow-build ok-builder blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME" || return
+  # =form is unambiguous and must not over-refuse.
+  SAFE_INSTALL_TEST_SCRIPT='npm exec --cache=/tmp/cache-ok cowsay' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tcowsay@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_exec_unknown_flag_fails_closed() {
+  prepare_case "exec-unknown-flag-fails-closed"
+  # An unrecognized space-form flag before the command is ambiguous → refuse,
+  # never guess and let the real package fetch unaudited.
+  SAFE_INSTALL_TEST_SCRIPT='npm exec --frobnicate val blockme' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'unrecognized option' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe explain' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_exec_package_selector_flags() {
+  prepare_case "exec-package-selector-flags"
+  # --package selects the fetched package; the positional is the command it
+  # provides and must not shadow it (re-review High 1/2).
+  SAFE_INSTALL_TEST_SCRIPT='pnpm dlx --package blockme benign' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='bun x --package=blockme benign' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tbun' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_exec_boolean_flags_do_not_eat_package() {
+  prepare_case "exec-boolean-flags-do-not-eat-package"
+  # A boolean flag must not consume the following package as its value
+  # (re-review High 1/3): the package still audits.
+  SAFE_INSTALL_TEST_SCRIPT='pnpm dlx -c blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='yarn dlx -q blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tyarn' "$FUNCNAME" || return
+  # Documented booleans pass through without over-refusing (re-review Med 1).
+  SAFE_INSTALL_TEST_SCRIPT='npm exec --workspaces cowsay' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tcowsay@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='bun x --verbose cowsay' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_exec_post_positional_package() {
+  prepare_case "npm-exec-post-positional-package"
+  # npm's config parser is greedy: --package after the command still selects
+  # the fetched package (round-3 High 1).
+  SAFE_INSTALL_TEST_SCRIPT='npm exec benign --package blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='npm exec benign --package=blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  # Even with a local bin as the command, a later --package is still audited.
+  mkdir -p "${WORK_DIR}/node_modules/.bin"
+  printf '#!/bin/sh\n' > "${WORK_DIR}/node_modules/.bin/eslint"
+  chmod +x "${WORK_DIR}/node_modules/.bin/eslint"
+  SAFE_INSTALL_TEST_SCRIPT='npm exec eslint --package blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  # The command's own flags after the command are ignored, not failed closed.
+  SAFE_INSTALL_TEST_SCRIPT='npm exec eslint --fix src' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\texec\teslint\t--fix\tsrc' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_exec_short_p_not_greedy_post_command() {
+  prepare_case "npm-exec-short-p-not-greedy-post-command"
+  # Short -p is NOT greedy post-command in real npm, so a trailing -p value
+  # must not shadow the actual fetched positional package (round-4 High 1).
+  SAFE_INSTALL_TEST_SCRIPT='npm exec blockme -p okpkg' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  # -p before the command IS a selector (audited); okpkg is the command.
+  SAFE_INSTALL_TEST_SCRIPT='npm exec -p blockme okpkg' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_uv_with_requirements_refused() {
+  prepare_case "uv-with-requirements-refused"
+  # A requirements file names packages we can't vet inline → fail closed
+  # (round-3 High 2), healthy and degraded.
+  SAFE_INSTALL_TEST_SCRIPT='uv run --with-requirements req.txt python' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'with-requirements' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='uv tool run --with-requirements=req.txt ruff' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run --with-requirements req.txt python" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_degraded_uv_attached_short_with() {
+  prepare_case "degraded-uv-attached-short-with"
+  # uv accepts -w blockme, -w=blockme, and -wblockme as --with; the degraded
+  # guard must refuse all three (round-4 High 2).
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run -w blockme python" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run -w=blockme python" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run -wblockme python" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  # A plain run with no --with still passes through.
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run python -c pass" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_dlx_and_x_audit() {
+  prepare_case "dlx-and-x-audit"
+  SAFE_INSTALL_TEST_SCRIPT='pnpm dlx cowsay@1.6.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tcowsay@1.6.0\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tpnpm\tdlx\tcowsay@1.6.0' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='bun x cowsay' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tcowsay@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tbun\tx\tcowsay' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='yarn dlx blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tyarn' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_uv_run_and_tool_run_gate() {
+  prepare_case "uv-run-and-tool-run-gate"
+  SAFE_INSTALL_TEST_SCRIPT='uv run --with warnme script.py' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\twarnme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='uv run script.py' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tuv\trun\tscript.py' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='uv tool run ruff' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\truff@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='uv tool run --from blockme r' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_uv_short_with_and_boundary() {
+  prepare_case "uv-short-with-and-boundary"
+  # -w is the short --with and must be audited (review High 3).
+  SAFE_INSTALL_TEST_SCRIPT='uv run -w blockme script.py' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
+  # A value flag before --with must not shift the boundary; --with rich audits.
+  SAFE_INSTALL_TEST_SCRIPT='uv run --python 3.12 --with rich pytest' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\trich@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tuv\trun\t--python\t3.12\t--with\trich\tpytest' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_uv_run_program_arg_not_audited() {
+  prepare_case "uv-run-program-arg-not-audited"
+  # --with appearing in the program's own args (after the command) is not a
+  # uv fetch and must not be audited (review Medium 2).
+  SAFE_INSTALL_TEST_SCRIPT='uv run python -c print --with blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tuv\trun\tpython\t-c\tprint\t--with\tblockme' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_uv_tool_run_short_with_keeps_tool() {
+  prepare_case "uv-tool-run-short-with-keeps-tool"
+  # -w extra must not become the audited package; the tool (blockme) is
+  # (review High 4).
+  SAFE_INSTALL_TEST_SCRIPT='uv tool run -w ok-extra blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_uv_tool_run_with_extra_is_audited() {
+  prepare_case "uv-tool-run-with-extra-is-audited"
+  # --with/-w extras are themselves fetched and must be audited alongside the
+  # tool (re-review High 4).
+  SAFE_INSTALL_TEST_SCRIPT='uv tool run -w blockme ruff' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
+  # Both clean → audited and delegated.
+  SAFE_INSTALL_TEST_SCRIPT='uv tool run --with ok ruff' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tok@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\truff@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_uv_run_value_flag_before_with() {
+  prepare_case "uv-run-value-flag-before-with"
+  # --no-extra takes a value; misclassifying it as boolean would stop the
+  # scan early and miss the later --with fetch (re-review High 5).
+  SAFE_INSTALL_TEST_SCRIPT='uv run --no-extra dev --with blockme python' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
+  # -m is a switch; it must not fail closed (re-review Med 1).
+  SAFE_INSTALL_TEST_SCRIPT='uv run -m pytest' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tuv\trun\t-m\tpytest' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_go_run_module_gates() {
+  prepare_case "go-run-module-gates"
+  write_tool_stub "${BIN_DIR}" go
+  SAFE_INSTALL_TEST_SCRIPT='go run example.com/blockme@v1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\texample.com/blockme@v1.0.0\t--ecosystem\tgo' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tgo' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='go run ./cmd' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tgo\trun\t./cmd' "$FUNCNAME" || return
+  assert_count 0 $'AUDIT\tcheck\t./cmd@latest\t--ecosystem\tgo' "${LOG_FILE}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_go_run_value_flag_does_not_hide_module() {
+  prepare_case "go-run-value-flag-does-not-hide-module"
+  write_tool_stub "${BIN_DIR}" go
+  # A space-form value build flag must not swallow the remote module target
+  # (round-5 High): -C/-mod take values, then the module@version still audits.
+  SAFE_INSTALL_TEST_SCRIPT='go run -C /tmp example.com/blockme@v1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\texample.com/blockme@v1.0.0\t--ecosystem\tgo' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tgo' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='go run -mod mod example.com/blockme@v1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  # Boolean build flags still pass a local run through.
+  SAFE_INSTALL_TEST_SCRIPT='go run -race ./cmd' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tgo\trun\t-race\t./cmd' "$FUNCNAME" || return
+  # An unrecognized dash flag before the target fails closed, not passthrough
+  # (status 100 = refused before delegating to the real tool).
+  SAFE_INSTALL_TEST_SCRIPT='go run -bogusflag val example.com/x@v1' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'unrecognized flag' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_update_family_gates() {
+  prepare_case "update-family-gates"
+  touch "${WORK_DIR}/package.json"
+  SAFE_INSTALL_TEST_SCRIPT='npm update lodash' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tscan\t--project\t.' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tlodash@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tupdate\tlodash' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='yarn upgrade left-pad' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tleft-pad@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='npm u blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  # npm ships `udpate` as a real alias of update (review Medium 1).
+  SAFE_INSTALL_TEST_SCRIPT='npm udpate blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_exec_passthrough_by_design() {
+  prepare_case "exec-passthrough-by-design"
+  SAFE_INSTALL_TEST_SCRIPT='pnpm exec eslint && composer exec tool && volta run node -v' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tpnpm\texec\teslint' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\texec\ttool' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tvolta\trun\tnode\t-v' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_degraded_parity_refinements() {
+  prepare_case "degraded-parity-refinements"
+  write_tool_stub "${BIN_DIR}" go
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run --with extra script.py" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run script.py" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}go run example.com/m@v1" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}go run ./cmd" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}pnpm exec eslint && composer exec tool && volta run node -v" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm u" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm udpate x" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  # Degraded -w must be caught like --with (review High 3).
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run -w extra script.py" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_global_package_check() {
   prepare_case "global-package-check"
   SAFE_INSTALL_TEST_SCRIPT='npm install -g left-pad@1.3.0' run_zsh
@@ -690,6 +1066,30 @@ main() {
     case_degraded_alias_subcommands_block \
     case_degraded_non_install_passes_through \
     case_refusal_message_contract \
+    case_npm_exec_fetch_audits \
+    case_npm_exec_local_bin_passthrough \
+    case_npm_exec_versioned_spec_audits_despite_local_bin \
+    case_npm_exec_package_flag_blocks \
+    case_exec_value_flag_does_not_hide_package \
+    case_exec_unknown_flag_fails_closed \
+    case_exec_package_selector_flags \
+    case_exec_boolean_flags_do_not_eat_package \
+    case_npm_exec_post_positional_package \
+    case_npm_exec_short_p_not_greedy_post_command \
+    case_uv_with_requirements_refused \
+    case_degraded_uv_attached_short_with \
+    case_dlx_and_x_audit \
+    case_uv_run_and_tool_run_gate \
+    case_uv_short_with_and_boundary \
+    case_uv_run_program_arg_not_audited \
+    case_uv_tool_run_short_with_keeps_tool \
+    case_uv_tool_run_with_extra_is_audited \
+    case_uv_run_value_flag_before_with \
+    case_go_run_module_gates \
+    case_go_run_value_flag_does_not_hide_module \
+    case_update_family_gates \
+    case_exec_passthrough_by_design \
+    case_degraded_parity_refinements \
     case_global_package_check \
     case_local_project_scan \
     case_add_scans_and_checks \

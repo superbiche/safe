@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- Gate exec-style fetch-and-run subcommands in healthy wrappers: `npm
+  exec|x`, `pnpm dlx`, `yarn dlx`, `bun x`, `uv run --with|-w`, `uv tool
+  run`, and `go run <module>@<version>` now audit the named package via
+  `safe audit check` before delegating (GO proceeds, WARN/BLOCK refuse with
+  the BLOCKED contract).
+- Identify the exec package by `--package`/`--from` value or the first
+  positional (npm's greedy parser also honors `--package` after the command,
+  so it is audited there too); an unrecognized space-form flag before the
+  command fails closed with a legible refusal (rewrite as `--flag=value`).
+  `uv --with`/`-w` extras are audited; `--with-requirements <file>` fails
+  closed since its packages can't be vetted inline. Per-tool flag tables are
+  validated against each tool's `--help` and are load-bearing (a
+  misclassified known flag can bypass), so they must track upstream.
+- Audit versioned/aliased exec specs (`tool@1.2.3`, `tool@npm:other`) even
+  when a same-named `./node_modules/.bin` binary exists; only a bare command
+  name backed by a local bin passes through.
+- `go run` classifies build flags (value vs switch, per `go help build`) and
+  fails closed on an unrecognized flag before the target, so a space-form
+  value flag (`-C`, `-mod`, ...) cannot hide a later `module@version` fetch.
+- Gate update families like project installs: `npm update|u|up|upgrade|udpate`,
+  `npm it|install-test`, `pnpm update|up|upgrade`, `bun update`, `yarn
+  up|upgrade|upgrade-interactive`, `yarn global upgrade`.
+- Document passthrough-by-design commands that never fetch registry
+  packages (`pnpm exec`, `composer exec`, `volta run`, `uv run` without
+  `--with`, local `go run`). Degraded-mode guards are conservative but
+  parity-aligned: `pnpm exec`/`composer exec`/`volta run` no longer blocked,
+  `uv run` blocked only when `--with`/`-w` appears, `go run` only when an
+  argument contains `@`.
+
 - Fix silent exit-127 wrapper failures in agent shells: rename
   `_safe_install_*` helpers to `safe_install_*` so harness shell snapshots
   (Claude Code strips single-underscore functions) keep them loaded.
@@ -26,9 +55,6 @@
 - Extend degraded-mode gated lists with update/exec aliases (`npm
   x|it|install-test|update|up|upgrade`, `pnpm update|up|upgrade`,
   `bun update`, `yarn up|upgrade|upgrade-interactive`).
-- Document the known healthy-shell gap: exec-style subcommands (`pnpm dlx`,
-  `npm exec`, `yarn dlx`, `uv run`, ...) are not yet audited; degraded mode
-  refusing them is intentional. Gating them is a planned follow-up.
 
 ## 1.1.3 - 2026-06-29
 

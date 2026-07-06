@@ -538,6 +538,149 @@ safe_install_go_spec() {
   print -r -- "${name}@${version}"
 }
 
+# A bare command name has no package-spec syntax: no version/tag/alias.
+# Only such names are eligible for the local-bin passthrough, because a
+# versioned or aliased spec (foo@latest, foo@npm:bar) can still fetch
+# remotely even when a same-named local bin exists (npm matches a local
+# dep only on exact name AND version).
+safe_install_is_bare_name() {
+  case "$1" in
+    *@*|*:*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Gate exec-style invocations that can fetch and run registry packages
+# (npm exec/x, bun x, pnpm dlx, yarn dlx, uv tool run). Audits every package
+# the invocation would fetch, then the caller delegates to the real tool.
+#
+# Args: <label> <ecosystem> <local_bin_ok> <post_positional> \
+#       <from_alt> <extra_alt> <val_alt> <bool_alt> <refuse_alt> <args...>
+#   Each *_alt is a glob-alternation of flags (e.g. '--package|-p'); '' = none.
+# - <from_alt>  flags whose value SELECTS the package to run (npm/pnpm/yarn/bun
+#   --package/-p, uv --from). Its value is audited AND it means the positional
+#   is the command name provided by that package, so the positional is NOT
+#   itself audited.
+# - <extra_alt> flags whose value is an ADDITIONAL fetched package (uv
+#   --with/-w). Audited on top of the from/positional package.
+# - <val_alt>   known value-taking flags whose space-form value is skipped.
+# - <bool_alt>  known switches (take no value).
+# - <refuse_alt> flags we cannot vet inline (e.g. --with-requirements names a
+#   file of packages); always FAIL CLOSED, space or =form.
+# - <post_positional> 1 for tools that parse option flags even AFTER the
+#   command (npm's greedy config parser: `npm exec cmd --package X` still
+#   fetches X). When 1, from/extra/refuse flags keep being collected after the
+#   first positional until `--`; other post-command tokens are the command's
+#   own args and ignored. 0 for tools that stop options at the command.
+# - Any OTHER bare (space-form) flag BEFORE the package is ambiguous — its
+#   value cannot be told from the package — so we FAIL CLOSED with a legible
+#   refusal (escapable with the flag's =form). Misclassifying a flag can
+#   bypass, so the per-tool lists are load-bearing and validated against each
+#   tool's --help; unknown flags fail closed rather than guess.
+# - With local_bin_ok=1 a BARE positional (no from-flag given) resolving to
+#   ./node_modules/.bin/<name> is project-local (no fetch) and skipped.
+safe_install_exec_gate() {
+  local label="$1" ecosystem="$2" local_bin_ok="$3" post_positional="$4"
+  local from_alt="$5" extra_alt="$6" val_alt="$7" bool_alt="$8" refuse_alt="$9"
+  shift 9
+  local -a from_specs extra_specs audit_specs normalized
+  local arg flag spec positional="" refuse_msg=""
+  local expect_from=0 expect_extra=0 skip_next=0 after_dd=0 seen_pos=0
+  refuse_msg="safe: BLOCKED ${label} — cannot vet the packages named by a requirements file inline; to allow: ask the operator to review them (safe audit check <pkg> --ecosystem ${ecosystem}), then retry; details: safe explain"
+
+  from_specs=(); extra_specs=()
+
+  for arg in "$@"; do
+    if (( expect_from )); then
+      from_specs+=("${arg}"); expect_from=0; continue
+    fi
+    if (( expect_extra )); then
+      extra_specs+=("${arg}"); expect_extra=0; continue
+    fi
+    if (( skip_next )); then
+      skip_next=0; continue
+    fi
+    if (( after_dd )); then
+      # Only a bare positional command (no from-flag yet) still matters here.
+      (( seen_pos )) || positional="${arg}"
+      break
+    fi
+
+    if [[ "${arg}" == "--" ]]; then
+      after_dd=1; continue
+    fi
+
+    # Attached =form is unambiguous (value cannot be mistaken for the package).
+    if [[ "${arg}" == --*=* ]]; then
+      flag="${arg%%=*}"
+      if [[ -n "${refuse_alt}" && "${flag}" == (${~refuse_alt}) ]]; then
+        print -u2 -- "${refuse_msg}"; return 100
+      elif [[ -n "${from_alt}" && "${flag}" == (${~from_alt}) ]]; then
+        from_specs+=("${arg#*=}")
+      elif [[ -n "${extra_alt}" && "${flag}" == (${~extra_alt}) ]]; then
+        extra_specs+=("${arg#*=}")
+      fi
+      continue
+    fi
+
+    case "${arg}" in
+      -*)
+        if [[ -n "${refuse_alt}" && "${arg}" == (${~refuse_alt}) ]]; then
+          print -u2 -- "${refuse_msg}"; return 100
+        elif (( seen_pos )) && [[ "${arg}" != --* ]]; then
+          # Phase 2 (post-command): only npm's greedy long-form config flags
+          # (--package) are parsed after the command; short flags like -p are
+          # NOT, so ignore them here rather than mistaking the value for the
+          # package. Everything short post-command is a command arg.
+          :
+        elif [[ -n "${from_alt}" && "${arg}" == (${~from_alt}) ]]; then
+          expect_from=1
+        elif [[ -n "${extra_alt}" && "${arg}" == (${~extra_alt}) ]]; then
+          expect_extra=1
+        elif (( seen_pos )); then
+          # Phase 2 unmatched long flag: the command's own option, ignored.
+          :
+        elif [[ -n "${val_alt}" && "${arg}" == (${~val_alt}) ]]; then
+          skip_next=1
+        elif [[ -n "${bool_alt}" && "${arg}" == (${~bool_alt}) ]]; then
+          :
+        else
+          print -u2 -- "safe: BLOCKED ${label} — cannot identify the package to audit past unrecognized option '${arg}'; to allow: rewrite it as '${arg}=<value>' (or pass the package via an explicit spec), then retry; details: safe explain"
+          return 100
+        fi
+        ;;
+      *)
+        if (( seen_pos == 0 )); then
+          positional="${arg}"; seen_pos=1
+          (( post_positional )) || break
+        fi
+        ;;
+    esac
+  done
+
+  audit_specs=("${extra_specs[@]}")
+  if (( ${#from_specs[@]} > 0 )); then
+    audit_specs+=("${from_specs[@]}")
+  elif [[ -n "${positional}" ]]; then
+    if ! { (( local_bin_ok )) && safe_install_is_bare_name "${positional}" && \
+           [[ -x "./node_modules/.bin/${positional}" ]]; }; then
+      audit_specs+=("${positional}")
+    fi
+  fi
+
+  (( ${#audit_specs[@]} > 0 )) || return 0
+
+  normalized=()
+  for spec in "${audit_specs[@]}"; do
+    case "${ecosystem}" in
+      python) normalized+=("$(safe_install_python_spec "${spec}")") ;;
+      *) normalized+=("$(safe_install_npm_spec "${spec}")") ;;
+    esac
+  done
+
+  safe_install_check_many "${ecosystem}" "${normalized[@]}"
+}
+
 safe_install_npm_like() {
   local tool="$1"
   shift
@@ -547,8 +690,42 @@ safe_install_npm_like() {
   local raw_package
   local project_present=1
 
+  case "${tool}:${subcommand}" in
+    npm:exec|npm:x)
+      # npm's config parser is greedy: --package is honored even after the
+      # command, so post_positional=1.
+      safe_install_exec_gate "npm ${subcommand}" npm 1 1 \
+        '--package|-p' '' \
+        '-c|--call|-w|--workspace|--cache|--prefix|--registry|--userconfig|--globalconfig|--loglevel|--script-shell|--node-options|--omit|--include' \
+        '-y|--yes|--no|--offline|--prefer-offline|--prefer-online|--ignore-existing|--foreground-scripts|--silent|--quiet|--workspaces|--include-workspace-root' \
+        '' \
+        "${@:2}" || return $?
+      safe_install_real "${tool}" "$@"
+      return $?
+      ;;
+    bun:x)
+      safe_install_exec_gate "bun x" npm 1 0 \
+        '--package|-p' '' '' \
+        '--bun|--silent|--no-install|--verbose' \
+        '' \
+        "${@:2}" || return $?
+      safe_install_real "${tool}" "$@"
+      return $?
+      ;;
+    pnpm:dlx)
+      safe_install_exec_gate "pnpm dlx" npm 0 0 \
+        '--package' '' \
+        '--allow-build|--reporter' \
+        '-c|--shell-mode|--silent|-s' \
+        '' \
+        "${@:2}" || return $?
+      safe_install_real "${tool}" "$@"
+      return $?
+      ;;
+  esac
+
   case "${subcommand}" in
-    install|i|add|ci) ;;
+    install|i|it|install-test|add|ci|update|u|up|upgrade|udpate) ;;
     *) safe_install_real "${tool}" "$@"; return $? ;;
   esac
 
@@ -601,7 +778,7 @@ safe_install_npm_like() {
 npm() {
   if ! typeset -f safe_install_npm_like safe_install_check >/dev/null 2>&1; then
     case "${1:-}" in
-      install|i|it|install-test|add|ci|exec|x|update|up|upgrade)
+      install|i|it|install-test|add|ci|exec|x|u|update|up|upgrade|udpate)
         print -u2 -- "safe: BLOCKED npm ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
       *) command npm "$@"; return $? ;;
@@ -613,7 +790,7 @@ npm() {
 pnpm() {
   if ! typeset -f safe_install_npm_like safe_install_check >/dev/null 2>&1; then
     case "${1:-}" in
-      install|i|add|ci|dlx|exec|update|up|upgrade)
+      install|i|add|ci|dlx|update|up|upgrade)
         print -u2 -- "safe: BLOCKED pnpm ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
       *) command pnpm "$@"; return $? ;;
@@ -648,7 +825,15 @@ yarn() {
   local -a raw packages
   local raw_package
 
-  if [[ "${first}" == "global" && "${second}" == "add" ]]; then
+  if [[ "${first}" == "dlx" ]]; then
+    safe_install_exec_gate "yarn dlx" npm 0 0 \
+      '--package|-p' '' '' '-q|--quiet' '' \
+      "${@:2}" || return $?
+    safe_install_real yarn "$@"
+    return $?
+  fi
+
+  if [[ "${first}" == "global" && ( "${second}" == "add" || "${second}" == "upgrade" ) ]]; then
     raw=("${(@f)$(safe_install_yarn_packages "${@:3}")}")
     packages=()
     for raw_package in "${raw[@]}"; do
@@ -663,23 +848,25 @@ yarn() {
     return $?
   fi
 
-  if [[ "${first}" == "install" || "${first}" == "add" || -z "${first}" ]]; then
-    if safe_install_yarn_project_present; then
-      safe_install_scan_project || return $?
-    fi
-
-    if [[ "${first}" == "add" ]]; then
-      raw=("${(@f)$(safe_install_yarn_packages "${@:2}")}")
-      packages=()
-      for raw_package in "${raw[@]}"; do
-        [[ -n "${raw_package}" ]] && packages+=("$(safe_install_npm_spec "${raw_package}")")
-      done
-
-      if (( ${#packages[@]} > 0 )); then
-        safe_install_check_many npm "${packages[@]}" || return $?
+  case "${first}" in
+    ""|install|add|up|upgrade|upgrade-interactive)
+      if safe_install_yarn_project_present; then
+        safe_install_scan_project || return $?
       fi
-    fi
-  fi
+
+      if [[ "${first}" == "add" || "${first}" == "up" || "${first}" == "upgrade" ]]; then
+        raw=("${(@f)$(safe_install_yarn_packages "${@:2}")}")
+        packages=()
+        for raw_package in "${raw[@]}"; do
+          [[ -n "${raw_package}" ]] && packages+=("$(safe_install_npm_spec "${raw_package}")")
+        done
+
+        if (( ${#packages[@]} > 0 )); then
+          safe_install_check_many npm "${packages[@]}" || return $?
+        fi
+      fi
+      ;;
+  esac
 
   safe_install_real yarn "$@"
 }
@@ -776,9 +963,21 @@ pip3() {
 uv() {
   if ! typeset -f safe_install_python_packages safe_install_check >/dev/null 2>&1; then
     case "${1:-}" in
-      sync|add|tool|pip|run)
+      sync|add|tool|pip)
         print -u2 -- "safe: BLOCKED uv ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
+      run)
+        # --with/-w and --with-requirements pull registry packages. Degraded
+        # mode can't parse the command boundary safely, so it is conservative:
+        # any such token anywhere refuses (may over-refuse a program's own
+        # --with arg; it never under-refuses a real fetch).
+        # `-w`, `-w=pkg`, and `-wpkg` are all short --with forms uv accepts.
+        if [[ " ${*} " == *" --with "* || " ${*} " == *" --with="* || " ${*} " == *" -w"* || \
+              " ${*} " == *" --with-requirements "* || " ${*} " == *" --with-requirements="* ]]; then
+          print -u2 -- "safe: BLOCKED uv run --with — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100
+        fi
+        command uv "$@"; return $? ;;
       *) command uv "$@"; return $? ;;
     esac
   fi
@@ -791,6 +990,73 @@ uv() {
       safe_install_scan_project || return $?
     fi
 
+    safe_install_real uv "$@"
+    return $?
+  fi
+
+  if [[ "${first}" == "run" ]]; then
+    # `uv run [uv-options] <command> [command-args]` executes project code;
+    # only --with/-w pulls extra registry packages. uv options appear only
+    # BEFORE the command, so parsing must stop at the command token — else a
+    # `--with` in the program's own args gets mis-audited. Unknown bare
+    # options before the command are ambiguous → fail closed (safe: an
+    # incomplete list over-refuses but never lets a --with slip past).
+    local -a with_specs normalized_with
+    local run_arg expect_with=0 skip_with_next=0
+    # --with-requirements names a file of packages we cannot vet inline → refuse.
+    local uv_val='--python|-p|--with-editable|--index|--index-url|--extra-index-url|--default-index|--constraint|-c|--index-strategy|--keyring-provider|--resolution|--prerelease|--exclude-newer|--config-setting|--refresh-package|--group|--only-group|--no-group|--extra|--no-extra|--project|--directory|--python-preference'
+    local uv_bool='--frozen|--locked|--no-sync|--offline|--isolated|--no-project|--all-extras|--no-dev|--dev|--only-dev|--no-default-groups|--all-groups|--refresh|--reinstall|--upgrade|--all-packages|--no-editable|--exact|--inexact|--no-binary|--no-build|--compile-bytecode|--no-compile-bytecode|--native-tls|--no-cache|-n|-q|--quiet|-v|--verbose|--managed-python|--no-managed-python|--script|-s|-m|--module'
+    with_specs=()
+    for run_arg in "${@:2}"; do
+      if (( expect_with )); then
+        with_specs+=("${run_arg}")
+        expect_with=0
+        continue
+      fi
+      if (( skip_with_next )); then
+        skip_with_next=0
+        continue
+      fi
+      if [[ "${run_arg}" == "--" ]]; then
+        break
+      fi
+      if [[ "${run_arg}" == "--with-requirements" || "${run_arg}" == --with-requirements=* ]]; then
+        print -u2 -- "safe: BLOCKED uv run — cannot vet the packages named by --with-requirements inline; to allow: ask the operator to review them (safe audit check <pkg> --ecosystem python), then retry; details: safe explain"
+        return 100
+      fi
+      if [[ "${run_arg}" == --*=* ]]; then
+        [[ "${run_arg}" == (--with=*) ]] && with_specs+=("${run_arg#--with=}")
+        continue
+      fi
+      case "${run_arg}" in
+        --with|-w) expect_with=1 ;;
+        ${~uv_val}) skip_with_next=1 ;;
+        ${~uv_bool}) ;;
+        -*)
+          print -u2 -- "safe: BLOCKED uv run — cannot identify --with packages past unrecognized option '${run_arg}'; to allow: rewrite it as '${run_arg}=<value>', then retry; details: safe explain"
+          return 100
+          ;;
+        *) break ;;
+      esac
+    done
+    if (( ${#with_specs[@]} > 0 )); then
+      normalized_with=()
+      for run_arg in "${with_specs[@]}"; do
+        normalized_with+=("$(safe_install_python_spec "${run_arg}")")
+      done
+      safe_install_check_many python "${normalized_with[@]}" || return $?
+    fi
+    safe_install_real uv "$@"
+    return $?
+  fi
+
+  if [[ "${first}" == "tool" && "${second}" == "run" ]]; then
+    safe_install_exec_gate "uv tool run" python 0 0 \
+      '--from' '--with|-w' \
+      '--python|-p|--with-editable|--index|--index-url|--extra-index-url|--default-index|--constraint|-c|--index-strategy|--keyring-provider|--resolution|--prerelease|--exclude-newer|--config-setting|--refresh-package' \
+      '--offline|--isolated|--system|--no-project|--refresh|--reinstall|--upgrade|-q|--quiet|-v|--verbose|--native-tls|--no-cache|-n' \
+      '--with-requirements' \
+      "${@:3}" || return $?
     safe_install_real uv "$@"
     return $?
   fi
@@ -870,15 +1136,65 @@ cargo() {
 go() {
   if ! typeset -f safe_install_go_packages safe_install_check >/dev/null 2>&1; then
     case "${1:-}" in
-      install|run)
+      install)
         print -u2 -- "safe: BLOCKED go ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
+      run)
+        # Only remote module@version fetches. Degraded mode can't parse the
+        # run target safely, so it is conservative: any '@' in the args
+        # refuses (may over-refuse a local run whose program args contain @;
+        # it never under-refuses a real module@version fetch).
+        if [[ "${*}" == *@* ]]; then
+          print -u2 -- "safe: BLOCKED go run — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100
+        fi
+        command go "$@"; return $? ;;
       *) command go "$@"; return $? ;;
     esac
   fi
   local subcommand="${1:-}"
   local second="${2:-}"
   local -a packages
+
+  if [[ "${subcommand}" == "run" ]]; then
+    # `go run <module>@<version>` fetches and executes a remote module; local
+    # package paths pass through unaudited. Build flags precede the target and
+    # some take a space-form value — a value flag NOT skipped would let its
+    # value become the "target" and hide a later module@version. So we
+    # classify go build flags (value vs boolean) and FAIL CLOSED on an
+    # unrecognized dash flag before the target rather than assume no value.
+    # Lists validated against `go help build`; =form values are unambiguous.
+    local run_arg run_target="" run_skip_next=0
+    local go_val='-C|-p|-asmflags|-buildmode|-compiler|-covermode|-coverpkg|-gccgoflags|-gcflags|-installsuffix|-ldflags|-mod|-modfile|-overlay|-pgo|-pkgdir|-tags|-toolexec|-exec'
+    local go_bool='-a|-n|-race|-msan|-asan|-cover|-v|-work|-x|-i|-linkshared|-modcacherw|-trimpath|-buildvcs|-json'
+    for run_arg in "${@:2}"; do
+      if (( run_skip_next )); then
+        run_skip_next=0
+        continue
+      fi
+      if [[ "${run_arg}" == "--" ]]; then
+        continue
+      fi
+      if [[ "${run_arg}" == -*=* ]]; then
+        # Attached =value is unambiguous.
+        continue
+      fi
+      case "${run_arg}" in
+        ${~go_val}) run_skip_next=1 ;;
+        ${~go_bool}) ;;
+        -*)
+          print -u2 -- "safe: BLOCKED go run — cannot identify the run target past unrecognized flag '${run_arg}'; to allow: rewrite it as '${run_arg}=<value>', then retry; details: safe explain"
+          return 100
+          ;;
+        *) run_target="${run_arg}"; break ;;
+      esac
+    done
+    if [[ -n "${run_target}" && "${run_target}" == *@* && "${run_target}" != .* && "${run_target}" != /* ]]; then
+      safe_install_check_many go "$(safe_install_go_spec "${run_target}")" || return $?
+    fi
+    safe_install_real go "$@"
+    return $?
+  fi
 
   if [[ "${subcommand}" != "install" ]]; then
     if [[ "${subcommand}" == "build" || "${subcommand}" == "test" ||
@@ -907,7 +1223,7 @@ go() {
 composer() {
   if ! typeset -f safe_install_composer_packages safe_install_check >/dev/null 2>&1; then
     case "${1:-}" in
-      install|update|require|global|exec)
+      install|update|require|global)
         print -u2 -- "safe: BLOCKED composer ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
       *) command composer "$@"; return $? ;;
@@ -946,7 +1262,7 @@ composer() {
 volta() {
   if ! typeset -f safe_install_volta_packages safe_install_check >/dev/null 2>&1; then
     case "${1:-}" in
-      install|run)
+      install)
         print -u2 -- "safe: BLOCKED volta ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
       *) command volta "$@"; return $? ;;

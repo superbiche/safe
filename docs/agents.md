@@ -23,17 +23,22 @@ the operator verbatim, wait, then retry the original command unchanged.
 | Surface | Mechanism | Refusal source |
 | --- | --- | --- |
 | `npx`, `bunx`, `uvx` | Binaries symlinked to `safe run` | `safe run: BLOCKED ...` + exit 100–104 |
-| `npm`, `pnpm`, `yarn`, `bun`, `pip`, `pip3`, `uv`, `cargo`, `go`, `composer`, `volta` | zsh wrapper functions audit install subcommands (install/add/ci/require and global variants) via `safe audit` | `safe: BLOCKED ...` + exit 100/102/104 |
+| `npm`, `pnpm`, `yarn`, `bun`, `pip`, `pip3`, `uv`, `cargo`, `go`, `composer`, `volta` | zsh wrapper functions audit install, update, and exec-style subcommands via `safe audit` | `safe: BLOCKED ...` + exit 100/102/104 |
 | `safe install <pkg>` | Audited, confirmed install path | `safe: BLOCKED ...` + exit 100/102/104 |
 
-Non-install subcommands (`npm run`, `npm --version`, `volta list`, `composer
-validate`, ...) pass through to the real tool.
+Audited subcommand families: installs (`install`/`add`/`ci`/`require` and
+global variants), updates (`update`/`up`/`upgrade`, `npm it`), and
+exec-style fetch-and-run (`npm exec|x`, `pnpm dlx`, `yarn dlx`, `bun x`,
+`uv run --with|-w`, `uv tool run`, `go run <module>@<version>`). An
+unrecognized space-form value flag before the command fails closed
+(escapable with `--flag=value`).
 
-Known gap: exec-style subcommands (`pnpm dlx`, `npm exec`, `yarn dlx`,
-`uv run --with`, `go run <module>@<version>`, `composer exec`, `volta run`)
-and update aliases are not yet audited by the healthy wrappers; gating them
-is a planned follow-up. Degraded mode (below) already refuses them, which
-makes it deliberately stricter than a healthy shell.
+Passthrough by design (no registry fetch involved): non-install subcommands
+(`npm run`, `npm --version`, `volta list`, ...), `npm exec <tool>` for a
+**bare** name already present in `./node_modules/.bin` (a versioned or
+aliased spec is still audited), `pnpm exec` and `composer exec`
+(project/vendor binaries only), `volta run` (fetches only official
+runtimes), `uv run` without `--with`, and `go run` of local paths.
 
 ## Refusal format
 
@@ -65,10 +70,15 @@ Some agent harnesses snapshot the interactive shell and strip helper
 functions (Claude Code drops single-underscore function names). The public
 wrappers detect this and degrade legibly instead of dying with a silent 127:
 
-- Install/exec-ish subcommands (`npm install`, `npm exec|x|update`,
-  `pnpm dlx`, `bun x`, `yarn dlx|upgrade`, `composer require`, ...) refuse
-  with a `safe: BLOCKED` line and exit 100.
-- Everything else passes through to the real tool.
+- The audited subcommand families above refuse with a `safe: BLOCKED` line
+  and exit 100 (degraded mode cannot audit, so it fails closed where a
+  healthy shell would have audited).
+- Degraded guards can't run the full parser, so they are conservative: they
+  may over-refuse a few non-fetch invocations but never under-refuse a real
+  fetch. Specifically `uv run` refuses if `--with`/`-w` appears anywhere,
+  `go run` refuses if any argument contains `@`, and `npm exec`/`bun x` of a
+  local `./node_modules/.bin` tool is refused. `pnpm exec`, `composer exec`,
+  and `volta run` pass through as in a healthy shell.
 
 If an agent still sees a bare, silent 127 from a wrapped tool, that is a bug
 worth reporting to the operator — never a reason to bypass.
