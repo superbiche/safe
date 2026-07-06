@@ -98,6 +98,12 @@ positional); `uv --with`/`-w` extras are audited too. An **unknown** bare
 closed** with a legible refusal — rewrite it as `--flag=value` to
 disambiguate.
 
+`npm exec` uses npm's greedy config parser, so a `--package` even *after* the
+command still selects the fetched package and is audited; the command's own
+flags after it are ignored. `--with-requirements <file>` (uv) names a file of
+packages that cannot be vetted inline, so it fails closed with a legible
+refusal in both healthy and degraded modes.
+
 The per-tool flag tables (which flags select a package, take a value, or are
 switches) are validated against each tool's `--help` and are load-bearing:
 an unknown flag fails closed, but a *misclassified* known flag can bypass (a

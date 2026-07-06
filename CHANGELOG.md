@@ -8,9 +8,13 @@
   `safe audit check` before delegating (GO proceeds, WARN/BLOCK refuse with
   the BLOCKED contract).
 - Identify the exec package by `--package`/`--from` value or the first
-  positional; an unrecognized space-form value flag before the command is
-  ambiguous and fails closed with a legible refusal (rewrite as
-  `--flag=value`). Incomplete flag lists over-refuse but never bypass.
+  positional (npm's greedy parser also honors `--package` after the command,
+  so it is audited there too); an unrecognized space-form flag before the
+  command fails closed with a legible refusal (rewrite as `--flag=value`).
+  `uv --with`/`-w` extras are audited; `--with-requirements <file>` fails
+  closed since its packages can't be vetted inline. Per-tool flag tables are
+  validated against each tool's `--help` and are load-bearing (a
+  misclassified known flag can bypass), so they must track upstream.
 - Audit versioned/aliased exec specs (`tool@1.2.3`, `tool@npm:other`) even
   when a same-named `./node_modules/.bin` binary exists; only a bare command
   name backed by a local bin passes through.

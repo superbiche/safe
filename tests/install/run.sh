@@ -376,6 +376,45 @@ case_exec_boolean_flags_do_not_eat_package() {
   pass "$FUNCNAME"
 }
 
+case_npm_exec_post_positional_package() {
+  prepare_case "npm-exec-post-positional-package"
+  # npm's config parser is greedy: --package after the command still selects
+  # the fetched package (round-3 High 1).
+  SAFE_INSTALL_TEST_SCRIPT='npm exec benign --package blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='npm exec benign --package=blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  # Even with a local bin as the command, a later --package is still audited.
+  mkdir -p "${WORK_DIR}/node_modules/.bin"
+  printf '#!/bin/sh\n' > "${WORK_DIR}/node_modules/.bin/eslint"
+  chmod +x "${WORK_DIR}/node_modules/.bin/eslint"
+  SAFE_INSTALL_TEST_SCRIPT='npm exec eslint --package blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  # The command's own flags after the command are ignored, not failed closed.
+  SAFE_INSTALL_TEST_SCRIPT='npm exec eslint --fix src' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\texec\teslint\t--fix\tsrc' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_uv_with_requirements_refused() {
+  prepare_case "uv-with-requirements-refused"
+  # A requirements file names packages we can't vet inline → fail closed
+  # (round-3 High 2), healthy and degraded.
+  SAFE_INSTALL_TEST_SCRIPT='uv run --with-requirements req.txt python' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'with-requirements' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='uv tool run --with-requirements=req.txt ruff' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run --with-requirements req.txt python" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_dlx_and_x_audit() {
   prepare_case "dlx-and-x-audit"
   SAFE_INSTALL_TEST_SCRIPT='pnpm dlx cowsay@1.6.0' run_zsh
@@ -982,6 +1021,8 @@ main() {
     case_exec_unknown_flag_fails_closed \
     case_exec_package_selector_flags \
     case_exec_boolean_flags_do_not_eat_package \
+    case_npm_exec_post_positional_package \
+    case_uv_with_requirements_refused \
     case_dlx_and_x_audit \
     case_uv_run_and_tool_run_gate \
     case_uv_short_with_and_boundary \
