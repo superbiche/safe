@@ -11,7 +11,18 @@ subcommand as `$1`, so a global flag placed before it slips past routing:
 `pnpm --package=evil dlx cmd`, `npm --loglevel=error install evil`,
 `yarn --cwd sub add evil`. The fix is first-non-flag subcommand detection
 with per-tool value-flag skip lists, touching the hot path of every wrapper;
-it wants its own parser test matrix. This is the one real remaining bypass.
+it wants its own parser test matrix.
+
+## Flag-table maintenance surface
+
+Exec/run gating classifies each tool's flags (package-selector vs
+value-taking vs boolean) against the tool's `--help`. Unknown flags fail
+closed, but a *misclassified* known flag can bypass — so the tables are
+load-bearing and must track upstream. Two review rounds corrected several
+(pnpm `-c`/`--shell-mode`, yarn `-q`, bun `--package`, uv `--with`/`-w`,
+`--no-extra`). Adding a new managed tool or a new upstream flag needs a
+matching table update plus a regression test. Consider periodically
+diffing the tables against `<tool> --help` in CI.
 
 ## Resolved since first captured
 

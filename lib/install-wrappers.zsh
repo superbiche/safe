@@ -551,63 +551,71 @@ safe_install_is_bare_name() {
 }
 
 # Gate exec-style invocations that can fetch and run registry packages
-# (npm exec/x, bun x, pnpm dlx, yarn dlx, uv tool run). Audits the named
-# package(s), then the caller delegates to the real tool unchanged.
+# (npm exec/x, bun x, pnpm dlx, yarn dlx, uv tool run). Audits every package
+# the invocation would fetch, then the caller delegates to the real tool.
 #
-# Args: <label> <ecosystem> <local_bin_ok> <pkg_alt> <val_alt> <bool_alt> <args...>
-# - <pkg_alt> glob-alternation of flags whose value IS the package to audit
-#   (space and = forms), e.g. '--package|-p'. '' for none (package is the
-#   first positional).
-# - <val_alt> glob-alternation of known value-taking flags whose space-form
-#   value must be skipped. <bool_alt> glob-alternation of known switches.
-# - Any OTHER bare (space-form) flag before the package is ambiguous — we
-#   cannot tell its value from the package — so we FAIL CLOSED with a
-#   legible refusal. Escapable with the flag's =form. `--flag=value` is
-#   always unambiguous and skipped. Incomplete lists therefore only cause
-#   escapable over-refusal, never a silent bypass.
-# - With local_bin_ok=1 a BARE positional resolving to
+# Args: <label> <ecosystem> <local_bin_ok> <from_alt> <extra_alt> <val_alt> <bool_alt> <args...>
+#   Each *_alt is a glob-alternation of flags (e.g. '--package|-p'); '' = none.
+# - <from_alt>  flags whose value SELECTS the package to run (npm/pnpm/yarn/bun
+#   --package/-p, uv --from). Its value is audited AND it means the positional
+#   is the command name provided by that package, so the positional is NOT
+#   itself audited.
+# - <extra_alt> flags whose value is an ADDITIONAL fetched package (uv
+#   --with/-w). Audited on top of the from/positional package.
+# - <val_alt>   known value-taking flags whose space-form value is skipped.
+# - <bool_alt>  known switches (take no value).
+# - Any OTHER bare (space-form) flag before the package is ambiguous — its
+#   value cannot be told from the package — so we FAIL CLOSED with a legible
+#   refusal (escapable with the flag's =form). Misclassifying a flag can
+#   bypass, so the per-tool lists are load-bearing and validated against each
+#   tool's --help; unknown flags fail closed rather than guess.
+# - With local_bin_ok=1 a BARE positional (no from-flag given) resolving to
 #   ./node_modules/.bin/<name> is project-local (no fetch) and skipped.
 safe_install_exec_gate() {
   local label="$1" ecosystem="$2" local_bin_ok="$3"
-  local pkg_alt="$4" val_alt="$5" bool_alt="$6"
-  shift 6
-  local -a specs normalized
-  local arg flag spec positional="" expect_pkg=0 skip_next=0 after_dd=0
-  specs=()
+  local from_alt="$4" extra_alt="$5" val_alt="$6" bool_alt="$7"
+  shift 7
+  local -a from_specs extra_specs audit_specs normalized
+  local arg flag spec positional=""
+  local expect_from=0 expect_extra=0 skip_next=0 after_dd=0
+  from_specs=(); extra_specs=()
 
   for arg in "$@"; do
-    if (( expect_pkg )); then
-      specs+=("${arg}")
-      expect_pkg=0
-      continue
+    if (( expect_from )); then
+      from_specs+=("${arg}"); expect_from=0; continue
+    fi
+    if (( expect_extra )); then
+      extra_specs+=("${arg}"); expect_extra=0; continue
     fi
     if (( skip_next )); then
-      skip_next=0
-      continue
+      skip_next=0; continue
     fi
     if (( after_dd )); then
-      positional="${arg}"
-      break
+      positional="${arg}"; break
     fi
 
     if [[ "${arg}" == "--" ]]; then
-      after_dd=1
-      continue
+      after_dd=1; continue
     fi
 
-    # Attached =form is always unambiguous.
+    # Attached =form is always unambiguous (value cannot be mistaken for the
+    # package), so only from/extra selectors capture it; anything else skips.
     if [[ "${arg}" == --*=* ]]; then
       flag="${arg%%=*}"
-      if [[ -n "${pkg_alt}" && "${flag}" == (${~pkg_alt}) ]]; then
-        specs+=("${arg#*=}")
+      if [[ -n "${from_alt}" && "${flag}" == (${~from_alt}) ]]; then
+        from_specs+=("${arg#*=}")
+      elif [[ -n "${extra_alt}" && "${flag}" == (${~extra_alt}) ]]; then
+        extra_specs+=("${arg#*=}")
       fi
       continue
     fi
 
     case "${arg}" in
       -*)
-        if [[ -n "${pkg_alt}" && "${arg}" == (${~pkg_alt}) ]]; then
-          expect_pkg=1
+        if [[ -n "${from_alt}" && "${arg}" == (${~from_alt}) ]]; then
+          expect_from=1
+        elif [[ -n "${extra_alt}" && "${arg}" == (${~extra_alt}) ]]; then
+          expect_extra=1
         elif [[ -n "${val_alt}" && "${arg}" == (${~val_alt}) ]]; then
           skip_next=1
         elif [[ -n "${bool_alt}" && "${arg}" == (${~bool_alt}) ]]; then
@@ -618,23 +626,25 @@ safe_install_exec_gate() {
         fi
         ;;
       *)
-        positional="${arg}"
-        break
+        positional="${arg}"; break
         ;;
     esac
   done
 
-  if (( ${#specs[@]} == 0 )); then
-    [[ -n "${positional}" ]] || return 0
-    if (( local_bin_ok )) && safe_install_is_bare_name "${positional}" && \
-       [[ -x "./node_modules/.bin/${positional}" ]]; then
-      return 0
+  audit_specs=("${extra_specs[@]}")
+  if (( ${#from_specs[@]} > 0 )); then
+    audit_specs+=("${from_specs[@]}")
+  elif [[ -n "${positional}" ]]; then
+    if ! { (( local_bin_ok )) && safe_install_is_bare_name "${positional}" && \
+           [[ -x "./node_modules/.bin/${positional}" ]]; }; then
+      audit_specs+=("${positional}")
     fi
-    specs=("${positional}")
   fi
 
+  (( ${#audit_specs[@]} > 0 )) || return 0
+
   normalized=()
-  for spec in "${specs[@]}"; do
+  for spec in "${audit_specs[@]}"; do
     case "${ecosystem}" in
       python) normalized+=("$(safe_install_python_spec "${spec}")") ;;
       *) normalized+=("$(safe_install_npm_spec "${spec}")") ;;
@@ -656,25 +666,26 @@ safe_install_npm_like() {
   case "${tool}:${subcommand}" in
     npm:exec|npm:x)
       safe_install_exec_gate "npm ${subcommand}" npm 1 \
-        '--package|-p' \
+        '--package|-p' '' \
         '-c|--call|-w|--workspace|--cache|--prefix|--registry|--userconfig|--globalconfig|--loglevel|--script-shell|--node-options|--omit|--include' \
-        '-y|--yes|--no|--offline|--prefer-offline|--prefer-online|--ignore-existing|--foreground-scripts|--silent|--quiet' \
+        '-y|--yes|--no|--offline|--prefer-offline|--prefer-online|--ignore-existing|--foreground-scripts|--silent|--quiet|--workspaces|--include-workspace-root' \
         "${@:2}" || return $?
       safe_install_real "${tool}" "$@"
       return $?
       ;;
     bun:x)
       safe_install_exec_gate "bun x" npm 1 \
-        '' '' '--bun|--silent' \
+        '--package|-p' '' '' \
+        '--bun|--silent|--no-install|--verbose' \
         "${@:2}" || return $?
       safe_install_real "${tool}" "$@"
       return $?
       ;;
     pnpm:dlx)
       safe_install_exec_gate "pnpm dlx" npm 0 \
-        '' \
-        '--allow-build|--reporter|--package|--shell-mode|-c|--config' \
-        '--silent' \
+        '--package' '' \
+        '--allow-build|--reporter' \
+        '-c|--shell-mode|--silent|-s' \
         "${@:2}" || return $?
       safe_install_real "${tool}" "$@"
       return $?
@@ -784,7 +795,7 @@ yarn() {
 
   if [[ "${first}" == "dlx" ]]; then
     safe_install_exec_gate "yarn dlx" npm 0 \
-      '--package|-p' '-q|--quiet' '' \
+      '--package|-p' '' '' '-q|--quiet' \
       "${@:2}" || return $?
     safe_install_real yarn "$@"
     return $?
@@ -958,8 +969,8 @@ uv() {
     # incomplete list over-refuses but never lets a --with slip past).
     local -a with_specs normalized_with
     local run_arg expect_with=0 skip_with_next=0
-    local uv_val='--python|-p|--with-editable|--with-requirements|--index|--index-url|--extra-index-url|--default-index|--constraint|-c|--index-strategy|--keyring-provider|--resolution|--prerelease|--exclude-newer|--config-setting|--refresh-package|--group|--only-group|--extra|--project|--directory|--python-preference'
-    local uv_bool='--frozen|--locked|--no-sync|--offline|--isolated|--no-project|--all-extras|--no-extra|--no-dev|--dev|--only-dev|--refresh|--reinstall|--upgrade|--all-packages|--no-editable|--exact|--inexact|--no-binary|--no-build|--compile-bytecode|--no-compile-bytecode|--native-tls|--no-cache|-n|-q|--quiet|-v|--verbose|--managed-python|--no-managed-python|--script|-s'
+    local uv_val='--python|-p|--with-editable|--with-requirements|--index|--index-url|--extra-index-url|--default-index|--constraint|-c|--index-strategy|--keyring-provider|--resolution|--prerelease|--exclude-newer|--config-setting|--refresh-package|--group|--only-group|--no-group|--extra|--no-extra|--project|--directory|--python-preference'
+    local uv_bool='--frozen|--locked|--no-sync|--offline|--isolated|--no-project|--all-extras|--no-dev|--dev|--only-dev|--no-default-groups|--all-groups|--refresh|--reinstall|--upgrade|--all-packages|--no-editable|--exact|--inexact|--no-binary|--no-build|--compile-bytecode|--no-compile-bytecode|--native-tls|--no-cache|-n|-q|--quiet|-v|--verbose|--managed-python|--no-managed-python|--script|-s|-m|--module'
     with_specs=()
     for run_arg in "${@:2}"; do
       if (( expect_with )); then
@@ -1002,8 +1013,8 @@ uv() {
 
   if [[ "${first}" == "tool" && "${second}" == "run" ]]; then
     safe_install_exec_gate "uv tool run" python 0 \
-      '--from' \
-      '--python|-p|--with|-w|--with-editable|--with-requirements|--index|--index-url|--extra-index-url|--default-index|--constraint|-c|--index-strategy|--keyring-provider|--resolution|--prerelease|--exclude-newer|--config-setting|--refresh-package' \
+      '--from' '--with|-w' \
+      '--python|-p|--with-editable|--with-requirements|--index|--index-url|--extra-index-url|--default-index|--constraint|-c|--index-strategy|--keyring-provider|--resolution|--prerelease|--exclude-newer|--config-setting|--refresh-package' \
       '--offline|--isolated|--system|--no-project|--refresh|--reinstall|--upgrade|-q|--quiet|-v|--verbose|--native-tls|--no-cache|-n' \
       "${@:3}" || return $?
     safe_install_real uv "$@"

@@ -340,6 +340,42 @@ case_exec_unknown_flag_fails_closed() {
   pass "$FUNCNAME"
 }
 
+case_exec_package_selector_flags() {
+  prepare_case "exec-package-selector-flags"
+  # --package selects the fetched package; the positional is the command it
+  # provides and must not shadow it (re-review High 1/2).
+  SAFE_INSTALL_TEST_SCRIPT='pnpm dlx --package blockme benign' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='bun x --package=blockme benign' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tbun' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_exec_boolean_flags_do_not_eat_package() {
+  prepare_case "exec-boolean-flags-do-not-eat-package"
+  # A boolean flag must not consume the following package as its value
+  # (re-review High 1/3): the package still audits.
+  SAFE_INSTALL_TEST_SCRIPT='pnpm dlx -c blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='yarn dlx -q blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tyarn' "$FUNCNAME" || return
+  # Documented booleans pass through without over-refusing (re-review Med 1).
+  SAFE_INSTALL_TEST_SCRIPT='npm exec --workspaces cowsay' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tcowsay@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='bun x --verbose cowsay' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_dlx_and_x_audit() {
   prepare_case "dlx-and-x-audit"
   SAFE_INSTALL_TEST_SCRIPT='pnpm dlx cowsay@1.6.0' run_zsh
@@ -407,6 +443,37 @@ case_uv_tool_run_short_with_keeps_tool() {
   assert_status 104 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_uv_tool_run_with_extra_is_audited() {
+  prepare_case "uv-tool-run-with-extra-is-audited"
+  # --with/-w extras are themselves fetched and must be audited alongside the
+  # tool (re-review High 4).
+  SAFE_INSTALL_TEST_SCRIPT='uv tool run -w blockme ruff' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
+  # Both clean → audited and delegated.
+  SAFE_INSTALL_TEST_SCRIPT='uv tool run --with ok ruff' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tok@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\truff@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_uv_run_value_flag_before_with() {
+  prepare_case "uv-run-value-flag-before-with"
+  # --no-extra takes a value; misclassifying it as boolean would stop the
+  # scan early and miss the later --with fetch (re-review High 5).
+  SAFE_INSTALL_TEST_SCRIPT='uv run --no-extra dev --with blockme python' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
+  # -m is a switch; it must not fail closed (re-review Med 1).
+  SAFE_INSTALL_TEST_SCRIPT='uv run -m pytest' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tuv\trun\t-m\tpytest' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -913,11 +980,15 @@ main() {
     case_npm_exec_package_flag_blocks \
     case_exec_value_flag_does_not_hide_package \
     case_exec_unknown_flag_fails_closed \
+    case_exec_package_selector_flags \
+    case_exec_boolean_flags_do_not_eat_package \
     case_dlx_and_x_audit \
     case_uv_run_and_tool_run_gate \
     case_uv_short_with_and_boundary \
     case_uv_run_program_arg_not_audited \
     case_uv_tool_run_short_with_keeps_tool \
+    case_uv_tool_run_with_extra_is_audited \
+    case_uv_run_value_flag_before_with \
     case_go_run_module_gates \
     case_update_family_gates \
     case_exec_passthrough_by_design \

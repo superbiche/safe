@@ -93,11 +93,17 @@ go run example.com/cmd/tool@latest
 ```
 
 The package is identified as the value of `--package`/`--from` (or the first
-positional). A value-taking flag written in space form that the wrapper does
-not recognize (e.g. a novel `--flag value` before the command) is ambiguous,
-so the wrapper **fails closed** with a legible refusal — rewrite it as
-`--flag=value` to disambiguate. An incomplete flag list therefore only ever
-causes an escapable over-refusal, never a silent bypass.
+positional); `uv --with`/`-w` extras are audited too. An **unknown** bare
+(space-form) flag before the command is ambiguous, so the wrapper **fails
+closed** with a legible refusal — rewrite it as `--flag=value` to
+disambiguate.
+
+The per-tool flag tables (which flags select a package, take a value, or are
+switches) are validated against each tool's `--help` and are load-bearing:
+an unknown flag fails closed, but a *misclassified* known flag can bypass (a
+boolean wrongly listed as value-taking would consume the package). Keep the
+tables in sync with upstream when adding tools or flags; the test suite pins
+the known cases.
 
 Update families are gated like project installs (scan, plus package checks
 for named specs): `npm update|u|up|upgrade|udpate`, `npm it|install-test`,
