@@ -102,7 +102,10 @@ disambiguate.
 command still selects the fetched package and is audited; the command's own
 flags after it are ignored. `--with-requirements <file>` (uv) names a file of
 packages that cannot be vetted inline, so it fails closed with a legible
-refusal in both healthy and degraded modes.
+refusal in both healthy and degraded modes. `go run` classifies build flags
+the same way (value vs switch, validated against `go help build`) and fails
+closed on an unrecognized flag before the run target, so a value flag like
+`-C dir` or `-mod mode` cannot hide a later `module@version`.
 
 The per-tool flag tables (which flags select a package, take a value, or are
 switches) are validated against each tool's `--help` and are load-bearing:

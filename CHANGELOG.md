@@ -18,6 +18,9 @@
 - Audit versioned/aliased exec specs (`tool@1.2.3`, `tool@npm:other`) even
   when a same-named `./node_modules/.bin` binary exists; only a bare command
   name backed by a local bin passes through.
+- `go run` classifies build flags (value vs switch, per `go help build`) and
+  fails closed on an unrecognized flag before the target, so a space-form
+  value flag (`-C`, `-mod`, ...) cannot hide a later `module@version` fetch.
 - Gate update families like project installs: `npm update|u|up|upgrade|udpate`,
   `npm it|install-test`, `pnpm update|up|upgrade`, `bun update`, `yarn
   up|upgrade|upgrade-interactive`, `yarn global upgrade`.

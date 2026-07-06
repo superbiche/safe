@@ -560,6 +560,29 @@ case_go_run_module_gates() {
   pass "$FUNCNAME"
 }
 
+case_go_run_value_flag_does_not_hide_module() {
+  prepare_case "go-run-value-flag-does-not-hide-module"
+  write_tool_stub "${BIN_DIR}" go
+  # A space-form value build flag must not swallow the remote module target
+  # (round-5 High): -C/-mod take values, then the module@version still audits.
+  SAFE_INSTALL_TEST_SCRIPT='go run -C /tmp example.com/blockme@v1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\texample.com/blockme@v1.0.0\t--ecosystem\tgo' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tgo' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='go run -mod mod example.com/blockme@v1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  # Boolean build flags still pass a local run through.
+  SAFE_INSTALL_TEST_SCRIPT='go run -race ./cmd' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tgo\trun\t-race\t./cmd' "$FUNCNAME" || return
+  # An unrecognized dash flag before the target fails closed, not passthrough
+  # (status 100 = refused before delegating to the real tool).
+  SAFE_INSTALL_TEST_SCRIPT='go run -bogusflag val example.com/x@v1' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'unrecognized flag' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_update_family_gates() {
   prepare_case "update-family-gates"
   touch "${WORK_DIR}/package.json"
@@ -1063,6 +1086,7 @@ main() {
     case_uv_tool_run_with_extra_is_audited \
     case_uv_run_value_flag_before_with \
     case_go_run_module_gates \
+    case_go_run_value_flag_does_not_hide_module \
     case_update_family_gates \
     case_exec_passthrough_by_design \
     case_degraded_parity_refinements \

@@ -1157,18 +1157,35 @@ go() {
   local -a packages
 
   if [[ "${subcommand}" == "run" ]]; then
-    # `go run <module>@<version>` fetches and executes a remote module;
-    # local package paths pass through unaudited.
+    # `go run <module>@<version>` fetches and executes a remote module; local
+    # package paths pass through unaudited. Build flags precede the target and
+    # some take a space-form value — a value flag NOT skipped would let its
+    # value become the "target" and hide a later module@version. So we
+    # classify go build flags (value vs boolean) and FAIL CLOSED on an
+    # unrecognized dash flag before the target rather than assume no value.
+    # Lists validated against `go help build`; =form values are unambiguous.
     local run_arg run_target="" run_skip_next=0
+    local go_val='-C|-p|-asmflags|-buildmode|-compiler|-covermode|-coverpkg|-gccgoflags|-gcflags|-installsuffix|-ldflags|-mod|-modfile|-overlay|-pgo|-pkgdir|-tags|-toolexec|-exec'
+    local go_bool='-a|-n|-race|-msan|-asan|-cover|-v|-work|-x|-i|-linkshared|-modcacherw|-trimpath|-buildvcs|-json'
     for run_arg in "${@:2}"; do
       if (( run_skip_next )); then
         run_skip_next=0
         continue
       fi
+      if [[ "${run_arg}" == "--" ]]; then
+        continue
+      fi
+      if [[ "${run_arg}" == -*=* ]]; then
+        # Attached =value is unambiguous.
+        continue
+      fi
       case "${run_arg}" in
-        -exec|-tags|-modfile|-overlay|-p|-gcflags|-ldflags|-asmflags|-buildmode|-compiler|-gccgoflags)
-          run_skip_next=1 ;;
-        -*) ;;
+        ${~go_val}) run_skip_next=1 ;;
+        ${~go_bool}) ;;
+        -*)
+          print -u2 -- "safe: BLOCKED go run — cannot identify the run target past unrecognized flag '${run_arg}'; to allow: rewrite it as '${run_arg}=<value>', then retry; details: safe explain"
+          return 100
+          ;;
         *) run_target="${run_arg}"; break ;;
       esac
     done
