@@ -627,13 +627,18 @@ safe_install_exec_gate() {
       -*)
         if [[ -n "${refuse_alt}" && "${arg}" == (${~refuse_alt}) ]]; then
           print -u2 -- "${refuse_msg}"; return 100
+        elif (( seen_pos )) && [[ "${arg}" != --* ]]; then
+          # Phase 2 (post-command): only npm's greedy long-form config flags
+          # (--package) are parsed after the command; short flags like -p are
+          # NOT, so ignore them here rather than mistaking the value for the
+          # package. Everything short post-command is a command arg.
+          :
         elif [[ -n "${from_alt}" && "${arg}" == (${~from_alt}) ]]; then
           expect_from=1
         elif [[ -n "${extra_alt}" && "${arg}" == (${~extra_alt}) ]]; then
           expect_extra=1
         elif (( seen_pos )); then
-          # Phase 2 (post-command): only selector flags above matter; the
-          # command's own flags are ignored, never failed closed.
+          # Phase 2 unmatched long flag: the command's own option, ignored.
           :
         elif [[ -n "${val_alt}" && "${arg}" == (${~val_alt}) ]]; then
           skip_next=1
@@ -966,7 +971,8 @@ uv() {
         # mode can't parse the command boundary safely, so it is conservative:
         # any such token anywhere refuses (may over-refuse a program's own
         # --with arg; it never under-refuses a real fetch).
-        if [[ " ${*} " == *" --with "* || " ${*} " == *" --with="* || " ${*} " == *" -w "* || \
+        # `-w`, `-w=pkg`, and `-wpkg` are all short --with forms uv accepts.
+        if [[ " ${*} " == *" --with "* || " ${*} " == *" --with="* || " ${*} " == *" -w"* || \
               " ${*} " == *" --with-requirements "* || " ${*} " == *" --with-requirements="* ]]; then
           print -u2 -- "safe: BLOCKED uv run --with — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
           return 100

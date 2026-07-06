@@ -399,6 +399,20 @@ case_npm_exec_post_positional_package() {
   pass "$FUNCNAME"
 }
 
+case_npm_exec_short_p_not_greedy_post_command() {
+  prepare_case "npm-exec-short-p-not-greedy-post-command"
+  # Short -p is NOT greedy post-command in real npm, so a trailing -p value
+  # must not shadow the actual fetched positional package (round-4 High 1).
+  SAFE_INSTALL_TEST_SCRIPT='npm exec blockme -p okpkg' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  # -p before the command IS a selector (audited); okpkg is the command.
+  SAFE_INSTALL_TEST_SCRIPT='npm exec -p blockme okpkg' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_uv_with_requirements_refused() {
   prepare_case "uv-with-requirements-refused"
   # A requirements file names packages we can't vet inline → fail closed
@@ -412,6 +426,22 @@ case_uv_with_requirements_refused() {
   assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run --with-requirements req.txt python" run_zsh
   assert_status 100 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_degraded_uv_attached_short_with() {
+  prepare_case "degraded-uv-attached-short-with"
+  # uv accepts -w blockme, -w=blockme, and -wblockme as --with; the degraded
+  # guard must refuse all three (round-4 High 2).
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run -w blockme python" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run -w=blockme python" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run -wblockme python" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  # A plain run with no --with still passes through.
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run python -c pass" run_zsh
+  assert_status 0 "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -1022,7 +1052,9 @@ main() {
     case_exec_package_selector_flags \
     case_exec_boolean_flags_do_not_eat_package \
     case_npm_exec_post_positional_package \
+    case_npm_exec_short_p_not_greedy_post_command \
     case_uv_with_requirements_refused \
+    case_degraded_uv_attached_short_with \
     case_dlx_and_x_audit \
     case_uv_run_and_tool_run_gate \
     case_uv_short_with_and_boundary \
