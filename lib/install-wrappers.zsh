@@ -550,6 +550,26 @@ safe_install_is_bare_name() {
   esac
 }
 
+# Project-local bin lookup for the exec-gate passthrough: walk
+# node_modules/.bin from the PHYSICAL cwd upward, nearest first — npm's own
+# bin resolution, so hoisted monorepo workspaces resolve their tools.
+# Builtins and parameter expansion only: exported functions or PATH shadowing
+# must never steer the walk (mirrors find_local_project_bin in bin/safe-run;
+# see PR #19 review rounds 1-3 for the symlinked-cwd and shadowing attacks).
+safe_install_local_bin_exists() {
+  local name="$1" dir
+  dir=$(builtin pwd -P 2>/dev/null) || return 1
+  [[ -n "$dir" ]] || return 1
+  while :; do
+    if [[ -x "$dir/node_modules/.bin/$name" && -f "$dir/node_modules/.bin/$name" ]]; then
+      return 0
+    fi
+    [[ "$dir" == "/" ]] && return 1
+    dir="${dir%/*}"
+    [[ -n "$dir" ]] || dir="/"
+  done
+}
+
 # Gate exec-style invocations that can fetch and run registry packages
 # (npm exec/x, bun x, pnpm dlx, yarn dlx, uv tool run). Audits every package
 # the invocation would fetch, then the caller delegates to the real tool.
@@ -578,7 +598,8 @@ safe_install_is_bare_name() {
 #   bypass, so the per-tool lists are load-bearing and validated against each
 #   tool's --help; unknown flags fail closed rather than guess.
 # - With local_bin_ok=1 a BARE positional (no from-flag given) resolving to
-#   ./node_modules/.bin/<name> is project-local (no fetch) and skipped.
+#   node_modules/.bin/<name> in the physical cwd or a parent (npm's own bin
+#   resolution) is project-local (no fetch) and skipped.
 safe_install_exec_gate() {
   local label="$1" ecosystem="$2" local_bin_ok="$3" post_positional="$4"
   local from_alt="$5" extra_alt="$6" val_alt="$7" bool_alt="$8" refuse_alt="$9"
@@ -663,7 +684,7 @@ safe_install_exec_gate() {
     audit_specs+=("${from_specs[@]}")
   elif [[ -n "${positional}" ]]; then
     if ! { (( local_bin_ok )) && safe_install_is_bare_name "${positional}" && \
-           [[ -x "./node_modules/.bin/${positional}" ]]; }; then
+           safe_install_local_bin_exists "${positional}"; }; then
       audit_specs+=("${positional}")
     fi
   fi
