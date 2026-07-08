@@ -52,9 +52,11 @@ safe run --py312 ruff@latest -- --version
 `safe run` evaluates package requests in this order:
 
 1. `blocked`: refuse and log.
-2. `local bin`: a bare, unversioned name backed by `./node_modules/.bin`
-   (npx/bunx invocations) runs the already-installed local binary directly —
-   nothing is fetched. Versioned or scoped specs never use this tier.
+2. `local bin`: a bare, unversioned name backed by `node_modules/.bin` in
+   the current **or a parent** directory (npm's own bin resolution, so
+   hoisted monorepo workspaces resolve their tools) runs the
+   already-installed local binary directly — nothing is fetched. Versioned
+   or scoped specs never use this tier.
 3. `host-allow`: execute the pinned version on the host with scripts suppressed where supported.
 4. `safe audit`: check unknown packages in an isolated audit sandbox when available.
 5. `sandbox-known`: run in Podman without another prompt.
@@ -68,8 +70,8 @@ When invoked as `npx`/`bunx`/`uvx`, flags that belong to the replaced runner
 are handled explicitly instead of being mistaken for the package name:
 
 - `--no-install` / `--no` — npx/bunx only, honored strictly: run the local
-  `./node_modules/.bin` binary, or refuse with exit 100 if it is not
-  installed. (Modern npx maps `--no-install` to a prompt setting and still
+  `node_modules/.bin` binary (current or parent directory), or refuse with
+  exit 100 if it is not installed. (Modern npx maps `--no-install` to a prompt setting and still
   resolves against the registry; `safe run` restores the flag's original
   never-fetch meaning.) This keeps husky-era `npx --no-install lint-staged`
   pre-commit hooks working. Via `uvx`/`pipx` the flag is refused through the

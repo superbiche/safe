@@ -162,9 +162,13 @@ safe_audit_check_unknown() {
 audit_log() {
   local runner="$1" pkgver="$2" tier="$3" context="$4" decision="$5" extra="${6:-}"
   mkdir -p "$DATA_DIR"
-  printf '%s | %s | %s | %s | %s | %s%s\n' \
+  local line
+  line=$(printf '%s | %s | %s | %s | %s | %s%s' \
     "$(now_iso)" "$runner" "$pkgver" "$tier" "$context" "$decision" \
-    "${extra:+ | $extra}" >> "$AUDIT_LOG"
+    "${extra:+ | $extra}")
+  # One decision = one physical line: untrusted values (e.g. resolved bin
+  # paths) may embed newlines that would split the append-only record.
+  printf '%s\n' "${line//[$'\r\n']/ }" >> "$AUDIT_LOG"
 }
 
 context_label() {
@@ -352,6 +356,32 @@ runner_label_for_kind() {
     pipx) printf pipx ;;
     *) printf safe-run ;;
   esac
+}
+
+# Resolve a bare tool name against node_modules/.bin in the current directory
+# or any parent, nearest first — the same upward walk npm itself performs, so
+# hoisted monorepo workspaces resolve their tools. Prints the executable path.
+# Seeded from the PHYSICAL cwd (pwd -P): npm resolves from process.cwd() with
+# symlinks resolved, so walking logical $PWD parents could execute a bin from
+# a directory tree the project does not live in (e.g. a symlinked checkout
+# under /tmp with a planted /tmp/node_modules). Fail closed if unavailable.
+# Only bash builtins and parameter expansion here: exported shell functions
+# shadow builtins and PATH can shadow external dirname, which would let a
+# caller-controlled environment steer the walk somewhere npm's process.cwd()
+# ancestry would never go.
+find_local_project_bin() {
+  local name="$1" dir
+  dir=$(builtin pwd -P 2>/dev/null) || return 1
+  [[ -n "$dir" ]] || return 1
+  while :; do
+    if [[ -x "$dir/node_modules/.bin/$name" && -f "$dir/node_modules/.bin/$name" ]]; then
+      printf '%s' "$dir/node_modules/.bin/$name"
+      return 0
+    fi
+    [[ "$dir" == "/" ]] && return 1
+    dir="${dir%/*}"
+    [[ -n "$dir" ]] || dir="/"
+  done
 }
 
 # Fail closed: an unrecognized flag before the package must never be parsed
@@ -1016,25 +1046,31 @@ dispatch_run() {
     exit 100
   fi
 
-  # Local project bin: a bare, unversioned name backed by ./node_modules/.bin
-  # runs the already-installed binary directly — nothing is fetched. Mirrors
-  # the install-wrapper local-bin rule; versioned or scoped specs stay in the
+  # Local project bin: a bare, unversioned name backed by node_modules/.bin
+  # in the current or a parent directory (npm's own bin resolution, which is
+  # how hoisted monorepo workspaces find their tools) runs the
+  # already-installed binary directly — nothing is fetched. Mirrors the
+  # install-wrapper local-bin rule; versioned or scoped specs stay in the
   # audit pipeline, and the blocklist above still wins.
+  local local_bin=""
   if [[ ( "$RUNNER_KIND" == "npm" || "$RUNNER_KIND" == "bun" ) \
         && "$PKG_VERSION_USER_SPECIFIED" == "0" \
-        && "$pkg" != @* && "$pkg" != */* \
-        && -x "./node_modules/.bin/$pkg" ]]; then
-    audit_log "$runner_label" "${pkg}@local" "LOCAL_BIN" "$(context_label)" "OK"
+        && "$pkg" != @* && "$pkg" != */* ]]; then
+    local_bin=$(find_local_project_bin "$pkg") || local_bin=""
+  fi
+  if [[ -n "$local_bin" ]]; then
+    audit_log "$runner_label" "${pkg}@local" "LOCAL_BIN" "$(context_label)" "OK" "bin=$local_bin"
     local rc
     set +e
-    PATH="$PWD/node_modules/.bin:$PATH" "./node_modules/.bin/$pkg" "$@"
+    # Parameter expansion, not dirname: see find_local_project_bin.
+    PATH="${local_bin%/*}:$PATH" "$local_bin" "$@"
     rc=$?
     set -e
     return "$rc"
   fi
 
   if [[ "$NPX_NO_INSTALL" == "1" ]]; then
-    err "BLOCKED: $pkgver — --no-install requested but ./node_modules/.bin/${pkg} does not exist"
+    err "BLOCKED: $pkgver — --no-install requested but node_modules/.bin/${pkg} exists neither here nor in a parent directory"
     err "  modern npx would fetch from the registry despite --no-install; safe run refuses instead"
     err "  to run: install the package in this project first (the install is wrapped), or drop --no-install"
     err "  agent contract: safe explain"
@@ -1994,8 +2030,9 @@ FLAGS
   -v, --version     Print version
 
 RUNNER-NATIVE FLAGS (when invoked as npx/bunx/uvx)
-  --no-install, --no    npx/bunx only: run ./node_modules/.bin/<pkg> or refuse
-                        (exit 100); via uvx/pipx it is refused as unrecognized
+  --no-install, --no    npx/bunx only: run node_modules/.bin/<pkg> (current or
+                        parent dir) or refuse (exit 100); via uvx/pipx it is
+                        refused as unrecognized
   -q, --quiet, --silent Accepted and dropped
   anything else         Refused legibly (exit 100) — a flag is never
                         mistaken for the package name
@@ -2027,8 +2064,9 @@ SUBCOMMANDS
 
 DECISION TIERS (in order)
   1. blocked        Refuse, log
-  2. local bin      Bare unversioned name backed by ./node_modules/.bin
-                    (npx/bunx): run the local binary directly, no fetch
+  2. local bin      Bare unversioned name backed by node_modules/.bin in the
+                    current or a parent directory (npx/bunx): run the local
+                    binary directly, no fetch
   3. host-allow     Execute on host with --ignore-scripts
   4. safe audit     Check unknown packages in an isolated audit sandbox;
                     BLOCK refuses, WARN continues
