@@ -50,7 +50,7 @@ safe vendor update --preset op --reason "CVE fix" -- op update
 safe vendor update --preset uv --reason "new resolver" -- uv self update
 
 # codex CLI
-safe vendor update --preset codex --reason "bugfix" -- codex --upgrade
+safe vendor update --preset codex --reason "bugfix" -- codex update
 ```
 
 If a preset cannot find the binary on `PATH`, it refuses with a legible error;
@@ -76,7 +76,7 @@ drift.
 | --- | --- |
 | Claude Code (`claude`) | Set `DISABLE_AUTOUPDATER=1` in the environment (or `autoUpdates: false` in the Claude Code settings). Versions live in `~/.local/share/claude/versions/`. |
 | GitHub CLI (`gh`) | No in-app auto-updater; updates come via the OS package manager or `gh extension upgrade`. Pin the package where possible. |
-| 1Password CLI (`op`) | Distributed as a standalone binary with no self-updater; managed by the package manager or manual download. Pin the package. |
+| 1Password CLI (`op`) | Has an explicit `op update` self-update command (no background auto-updater observed). Run it deliberately through the `op` preset; on managed machines prefer pinning via the package manager. |
 | uv (`uv`) | `uv self update` is explicit (no background updater). Distro packages may disable `self update` entirely — prefer the package manager on managed machines. |
 | codex CLI (`codex`) | Update explicitly; avoid any `--auto-update`/background flag the vendor offers. |
 
