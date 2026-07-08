@@ -261,3 +261,62 @@ jq -e '
   and .features.binary_exec.supported == false
 ' <<<"$failed_capabilities_json" >/dev/null || fail "doctor did not handle capabilities lookup failure"
 pass "doctor capabilities downgrade"
+
+# ---------------------------------------------------------------------------
+# safe vendor update presets
+# ---------------------------------------------------------------------------
+vendor_tmp="$tmp/vendor"
+mkdir -p "$vendor_tmp/bin"
+cat > "$vendor_tmp/bin/faketool" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --version) echo "faketool 9.9.9" ;;
+  *) : ;;
+esac
+SH
+chmod +x "$vendor_tmp/bin/faketool"
+
+# Unknown preset is refused legibly.
+set +e
+PATH="$vendor_tmp/bin:$PATH" SAFE_DATA_DIR="$vendor_tmp/data" \
+  "$SAFE" vendor update --preset bogus --reason x -- true 2>"$vendor_tmp/bogus.err"
+rc=$?
+set -e
+[[ "$rc" -ne 0 ]] || fail "unknown vendor preset was not refused"
+grep -q 'unknown vendor preset' "$vendor_tmp/bogus.err" || fail "unknown preset error not legible"
+pass "vendor preset: unknown name refused"
+
+# A preset whose binary is not on PATH refuses asking for --path. Use a clean
+# PATH with only safe's own dependencies so the vendor tool is guaranteed
+# absent regardless of what is installed on the host.
+cleanbin="$vendor_tmp/cleanbin"
+mkdir -p "$cleanbin"
+for dep in bash jq sha256sum readlink date awk head mkdir true env dirname basename cat; do
+  dep_path="$(command -v "$dep" 2>/dev/null)" && ln -sf "$dep_path" "$cleanbin/$dep"
+done
+set +e
+PATH="$cleanbin" SAFE_DATA_DIR="$vendor_tmp/data" \
+  bash "$SAFE" vendor update --preset gh --reason x -- true 2>"$vendor_tmp/nopath.err"
+rc=$?
+set -e
+[[ "$rc" -ne 0 ]] || fail "preset with missing binary was not refused"
+grep -q 'pass --path' "$vendor_tmp/nopath.err" || fail "missing-binary error does not point to --path"
+pass "vendor preset: missing binary asks for --path"
+
+# --preset resolves name/path/version-cmd; the audit log records the resolved
+# fields and the version probe output.
+cat > "$vendor_tmp/bin/codex" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --version) echo "codex 1.2.3" ;;
+  *) : ;;
+esac
+SH
+chmod +x "$vendor_tmp/bin/codex"
+PATH="$vendor_tmp/bin:$PATH" SAFE_DATA_DIR="$vendor_tmp/data2" \
+  "$SAFE" vendor update --preset codex --reason "preset test" -- true >/dev/null 2>&1
+log="$vendor_tmp/data2/vendor/audit.log"
+[[ -s "$log" ]] || fail "vendor preset run wrote no audit log"
+jq -e '.name == "codex" and (.path | endswith("/codex")) and .reason == "preset test" and .exit_code == 0 and (.before.version.output | test("codex 1.2.3"))' "$log" >/dev/null \
+  || fail "vendor preset audit entry missing resolved fields"
+pass "vendor preset: resolves fields and logs version probe"

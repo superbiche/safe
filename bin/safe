@@ -153,22 +153,52 @@ cmd_vendor() {
   case "$sub" in
     update) cmd_vendor_update "$@" ;;
     -h|--help|help|"") cat <<'EOF'
-usage: safe vendor update --name NAME --path PATH --reason TEXT [--rollback TEXT] [--version-cmd ARGS] -- COMMAND...
+usage: safe vendor update [--preset NAME] --name NAME --path PATH --reason TEXT \
+                          [--rollback TEXT] [--version-cmd ARGS] -- COMMAND...
 
 Runs a vendor-native update command while recording before/after binary hashes
 under ~/.local/share/safe/vendor/audit.log.
+
+--preset fills --name, --path (auto-detected on PATH), and --version-cmd for a
+known vendor so you only supply --reason and the command. Explicit flags still
+override the preset. Presets: claude, gh, op, uv, codex.
+
+  safe vendor update --preset claude --reason "unlock /run-skill-generator" \
+    -- claude install 2.1.205
+
+Native vendor binaries are outside safe audit's registry scope; this is an
+audit trail, not a gate. Disable each tool's in-app auto-update where possible
+and run deliberate updates through this command. See docs/vendor.md.
 EOF
       ;;
     *) die "unknown vendor subcommand: ${sub:-}" ;;
   esac
 }
 
+# Known-vendor presets: set name / path (auto-detected) / version-cmd so the
+# caller supplies only --reason and the command. Path is resolved on PATH at
+# call time; an empty result means the caller must pass --path explicitly.
+safe_vendor_apply_preset() {
+  local preset="$1"
+  case "$preset" in
+    claude|gh|op|uv|codex)
+      PRESET_NAME="$preset"
+      PRESET_PATH="$(command -v "$preset" 2>/dev/null || printf '')"
+      PRESET_VERSION_CMD="--version"
+      ;;
+    *) die "unknown vendor preset: $preset (known: claude, gh, op, uv, codex)" ;;
+  esac
+}
+
 cmd_vendor_update() {
-  local name="" path="" reason="" rollback="" version_cmd=""
+  local name="" path="" reason="" rollback="" version_cmd="" preset=""
   local -a update_cmd=()
+  local PRESET_NAME="" PRESET_PATH="" PRESET_VERSION_CMD=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --preset) preset="${2:-}"; shift 2 ;;
+      --preset=*) preset="${1#--preset=}"; shift ;;
       --name) name="${2:-}"; shift 2 ;;
       --name=*) name="${1#--name=}"; shift ;;
       --path) path="${2:-}"; shift 2 ;;
@@ -188,8 +218,17 @@ cmd_vendor_update() {
     esac
   done
 
-  [[ -n "$name" ]] || die "vendor update requires --name"
-  [[ -n "$path" ]] || die "vendor update requires --path"
+  # A preset fills any field the caller did not set explicitly.
+  if [[ -n "$preset" ]]; then
+    safe_vendor_apply_preset "$preset"
+    [[ -n "$name" ]] || name="$PRESET_NAME"
+    [[ -n "$path" ]] || path="$PRESET_PATH"
+    [[ -n "$version_cmd" ]] || version_cmd="$PRESET_VERSION_CMD"
+    [[ -n "$path" ]] || die "vendor preset '$preset' could not find '$PRESET_NAME' on PATH; pass --path explicitly"
+  fi
+
+  [[ -n "$name" ]] || die "vendor update requires --name (or --preset)"
+  [[ -n "$path" ]] || die "vendor update requires --path (or --preset)"
   [[ -n "$reason" ]] || die "vendor update requires --reason"
   [[ ${#update_cmd[@]} -gt 0 ]] || die "vendor update requires -- COMMAND..."
 
