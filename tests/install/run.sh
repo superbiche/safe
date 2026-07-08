@@ -467,6 +467,21 @@ case_pip_use_feature_takes_value() {
   pass "$FUNCNAME"
 }
 
+case_bun_equals_only_flag_not_space_value() {
+  prepare_case "bun-equals-only-flag-not-space-value"
+  # bun --config/--cwd/-c are equals-only; the space form must not be treated
+  # as a value flag (it would eat the subcommand). =form still works; bare
+  # space form fails closed (review round 2 High).
+  SAFE_INSTALL_TEST_SCRIPT='bun --config add blockme' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'cannot find the subcommand' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tbun' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='bun --config=bunfig.toml add blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_npm_exec_package_flag_blocks() {
   prepare_case "npm-exec-package-flag-blocks"
   SAFE_INSTALL_TEST_SCRIPT='npm exec --package=blockme -- create' run_zsh
@@ -1248,6 +1263,7 @@ main() {
     case_optional_boolean_without_value_still_gates \
     case_pnpm_config_switch_not_value \
     case_pip_use_feature_takes_value \
+    case_bun_equals_only_flag_not_space_value \
     case_npm_exec_hoisted_parent_bin_passthrough \
     case_npm_exec_parent_walk_resists_shadowing \
     case_npm_exec_package_flag_blocks \

@@ -643,7 +643,11 @@ safe_install_global_flags() {
       SAFE_INSTALL_GVAL='--filter|-F|--dir|-C|--reporter|--workspace-concurrency'
       SAFE_INSTALL_GBOOL='-w|--workspace-root|-r|--recursive|--stream|--silent|--no-color|--global|-g|--aggregate-output|--config' ;;
     bun)
-      SAFE_INSTALL_GVAL='--cwd|--config|-c'
+      # bun's --cwd/--config/-c are EQUALS-ONLY (`--config=<val>`); bun does
+      # not consume a following space-form token, so they must not sit in the
+      # space-form value table (that would eat the subcommand). The =form is
+      # covered by the generic --*=* skip; bare space-form fails closed.
+      SAFE_INSTALL_GVAL=''
       SAFE_INSTALL_GBOOL='--silent|--global|-g|--no-cache|--no-progress' ;;
     yarn)
       SAFE_INSTALL_GVAL='--cwd|--registry|--modules-folder|--cache-folder|--mutex|--network-timeout|--network-concurrency|--proxy|--https-proxy'
