@@ -48,8 +48,9 @@ installers, no curl|sh). Surface the refusal to the operator instead.
 
 WHAT IS GATED
   npx / bunx / uvx        Binaries are symlinked to `safe run`: packages run
-                          from a local ./node_modules/.bin (bare unversioned
-                          names), an allowlist, a Podman sandbox, or not at all.
+                          from a project node_modules/.bin (bare unversioned
+                          names, current or parent dir), an allowlist, a Podman
+                          sandbox, or not at all.
   npm / pnpm / yarn / bun / pip / pip3 / uv / cargo / go / composer / volta
                           zsh wrapper functions audit install, update, and
                           exec subcommands with `safe audit` before

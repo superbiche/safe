@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Extend the `safe run` local-bin tier to walk parent directories for
+  `node_modules/.bin/<name>` (nearest first), matching npm's own bin
+  resolution so hoisted monorepo workspaces resolve their installed tools
+  instead of falling into the sandbox pipeline (`npx envsub` from a
+  workspace subdirectory previously prompted to sandbox and then failed to
+  fetch under strict no-network). Guards unchanged: bare unversioned
+  unscoped names only, blocklist first; the audit log records the resolved
+  bin path.
+
 - Fix a false positive that broke husky-era pre-commit hooks: `npx
   --no-install lint-staged ...` was parsed with the flag as the package name
   and refused as exit 103 "invalid package name". Runner-native flags are now

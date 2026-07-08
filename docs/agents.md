@@ -36,7 +36,8 @@ unrecognized space-form value flag before the command fails closed
 Passthrough by design (no registry fetch involved): non-install subcommands
 (`npm run`, `npm --version`, `volta list`, ...), `npm exec <tool>` and
 `npx <tool>` for a **bare, unversioned** name already present in
-`./node_modules/.bin` (a versioned or aliased spec is still audited),
+`node_modules/.bin` of the current or a parent directory (a versioned or
+aliased spec is still audited),
 `pnpm exec` and `composer exec` (project/vendor binaries only), `volta run`
 (fetches only official runtimes), `uv run` without `--with`, and `go run`
 of local paths. `npx --no-install <tool>` / `--no` are honored strictly:

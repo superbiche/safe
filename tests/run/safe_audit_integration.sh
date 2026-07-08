@@ -467,3 +467,50 @@ set -e
 grep -q "unrecognized flag '--no-install'" "$tmp/uvx-noinstall.err" || fail "uvx --no-install not refused as unrecognized"
 grep -q 'node_modules' "$tmp/uvx-noinstall.err" && fail "uvx --no-install took the npm-specific refusal path"
 pass "uvx --no-install refuses as unrecognized flag (npm-specific path not taken)"
+
+# Hoisted monorepo: the bin lives in a parent directory's node_modules/.bin
+# (npm's own upward resolution). Regression for the agentrh envsub case.
+mono="$tmp/mono"
+mkdir -p "$mono/node_modules/.bin" "$mono/apps/web"
+cat > "$mono/node_modules/.bin/envsub" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$LOCAL_BIN_CALL_LOG"
+exit 0
+SH
+chmod +x "$mono/node_modules/.bin/envsub"
+set +e
+(
+  cd "$mono/apps/web"
+  SAFE_RUN_CONFIG_DIR="$tmp/config-mono" \
+  SAFE_RUN_DATA_DIR="$tmp/data-mono" \
+  LOCAL_BIN_CALL_LOG="$tmp/mono-call.log" \
+    "$SAFE_RUN" envsub in.json out.json
+) </dev/null >/dev/null 2>"$tmp/mono.err"
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] || fail "hoisted monorepo bin failed rc=$rc: $(cat "$tmp/mono.err")"
+grep -q 'in.json out.json' "$tmp/mono-call.log" || fail "hoisted bin did not receive args"
+grep -q "bin=$mono/node_modules/.bin/envsub" "$tmp/data-mono/audit.log" || fail "audit log missing resolved bin path"
+pass "hoisted monorepo bin resolves via parent walk (envsub regression)"
+
+# Nearest node_modules/.bin wins over an ancestor's.
+mkdir -p "$mono/apps/web/node_modules/.bin"
+cat > "$mono/apps/web/node_modules/.bin/envsub" <<'SH'
+#!/usr/bin/env bash
+printf 'NEAREST %s\n' "$*" > "$LOCAL_BIN_CALL_LOG"
+exit 0
+SH
+chmod +x "$mono/apps/web/node_modules/.bin/envsub"
+set +e
+(
+  cd "$mono/apps/web"
+  SAFE_RUN_CONFIG_DIR="$tmp/config-mono-nearest" \
+  SAFE_RUN_DATA_DIR="$tmp/data-mono-nearest" \
+  LOCAL_BIN_CALL_LOG="$tmp/mono-nearest-call.log" \
+    "$SAFE_RUN" envsub x
+) </dev/null >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] || fail "nearest-bin case failed rc=$rc"
+grep -q '^NEAREST x' "$tmp/mono-nearest-call.log" || fail "nearest bin did not win over ancestor"
+pass "nearest node_modules/.bin wins over ancestor"
