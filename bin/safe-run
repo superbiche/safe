@@ -365,9 +365,13 @@ runner_label_for_kind() {
 # symlinks resolved, so walking logical $PWD parents could execute a bin from
 # a directory tree the project does not live in (e.g. a symlinked checkout
 # under /tmp with a planted /tmp/node_modules). Fail closed if unavailable.
+# Only bash builtins and parameter expansion here: exported shell functions
+# shadow builtins and PATH can shadow external dirname, which would let a
+# caller-controlled environment steer the walk somewhere npm's process.cwd()
+# ancestry would never go.
 find_local_project_bin() {
   local name="$1" dir
-  dir=$(pwd -P 2>/dev/null) || return 1
+  dir=$(builtin pwd -P 2>/dev/null) || return 1
   [[ -n "$dir" ]] || return 1
   while :; do
     if [[ -x "$dir/node_modules/.bin/$name" && -f "$dir/node_modules/.bin/$name" ]]; then
@@ -375,7 +379,8 @@ find_local_project_bin() {
       return 0
     fi
     [[ "$dir" == "/" ]] && return 1
-    dir=$(dirname "$dir")
+    dir="${dir%/*}"
+    [[ -n "$dir" ]] || dir="/"
   done
 }
 
@@ -1057,7 +1062,8 @@ dispatch_run() {
     audit_log "$runner_label" "${pkg}@local" "LOCAL_BIN" "$(context_label)" "OK" "bin=$local_bin"
     local rc
     set +e
-    PATH="$(dirname "$local_bin"):$PATH" "$local_bin" "$@"
+    # Parameter expansion, not dirname: see find_local_project_bin.
+    PATH="${local_bin%/*}:$PATH" "$local_bin" "$@"
     rc=$?
     set -e
     return "$rc"

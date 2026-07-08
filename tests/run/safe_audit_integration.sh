@@ -604,3 +604,54 @@ set -e
 [[ "$(grep -c 'LOCAL_BIN' "$tmp/data-nl/audit.log")" -eq 1 ]] || fail "LOCAL_BIN entry count wrong"
 [[ "$(wc -l < "$tmp/data-nl/audit.log")" -eq "$(grep -c ' | ' "$tmp/data-nl/audit.log")" ]] || fail "audit log contains split records"
 pass "audit log records stay single-line for hostile bin paths"
+
+# Shell/PATH shadowing must not steer the walk: exported pwd/dirname
+# functions and a PATH-shadowed dirname point at an attacker tree, but the
+# builtin-only walk must still resolve from the real physical cwd.
+attacker="$tmp/steer-attacker"
+victim="$tmp/steer-victim/apps/web"
+mkdir -p "$attacker/node_modules/.bin" "$victim"
+cat > "$attacker/node_modules/.bin/probe" <<'SH'
+#!/usr/bin/env bash
+printf 'STEERED %s\n' "$*" > "$LOCAL_BIN_CALL_LOG"
+SH
+chmod +x "$attacker/node_modules/.bin/probe"
+shadowbin="$tmp/steer-shadowbin"
+mkdir -p "$shadowbin"
+printf '#!/usr/bin/env bash\necho %s\n' "$attacker" > "$shadowbin/dirname"
+chmod +x "$shadowbin/dirname"
+set +e
+(
+  cd "$victim"
+  pwd() { echo "$attacker"; }
+  dirname() { echo "$attacker"; }
+  export -f pwd dirname
+  SAFE_RUN_CONFIG_DIR="$tmp/config-steer" \
+  SAFE_RUN_DATA_DIR="$tmp/data-steer" \
+  LOCAL_BIN_CALL_LOG="$tmp/steer-call.log" \
+  PATH="$shadowbin:$PATH" \
+    "$SAFE_RUN" probe
+) </dev/null >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 102 ]] || fail "steered walk expected rc=102, got $rc"
+[[ ! -e "$tmp/steer-call.log" ]] || fail "shell/PATH shadowing steered the local-bin walk"
+pass "exported pwd/dirname and PATH shadowing cannot steer the walk"
+
+# Same steering against the strict --no-install path.
+set +e
+(
+  cd "$victim"
+  pwd() { echo "$attacker"; }
+  export -f pwd
+  SAFE_RUN_CONFIG_DIR="$tmp/config-steer-ni" \
+  SAFE_RUN_DATA_DIR="$tmp/data-steer-ni" \
+  LOCAL_BIN_CALL_LOG="$tmp/steer-ni-call.log" \
+  PATH="$shadowbin:$PATH" \
+    "$SAFE_RUN" --no-install probe
+) </dev/null >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 100 ]] || fail "steered --no-install expected rc=100, got $rc"
+[[ ! -e "$tmp/steer-ni-call.log" ]] || fail "shadowing steered the --no-install local-bin path"
+pass "steering cannot reach the strict --no-install path either"
