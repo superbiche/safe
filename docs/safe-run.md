@@ -67,12 +67,13 @@ safe run --py312 ruff@latest -- --version
 When invoked as `npx`/`bunx`/`uvx`, flags that belong to the replaced runner
 are handled explicitly instead of being mistaken for the package name:
 
-- `--no-install` / `--no` — honored strictly: run the local
+- `--no-install` / `--no` — npx/bunx only, honored strictly: run the local
   `./node_modules/.bin` binary, or refuse with exit 100 if it is not
-  installed. (Modern npx silently ignores `--no-install` and fetches from the
-  registry anyway; `safe run` restores the flag's original never-fetch
-  meaning.) This keeps husky-era `npx --no-install lint-staged` pre-commit
-  hooks working.
+  installed. (Modern npx maps `--no-install` to a prompt setting and still
+  resolves against the registry; `safe run` restores the flag's original
+  never-fetch meaning.) This keeps husky-era `npx --no-install lint-staged`
+  pre-commit hooks working. Via `uvx`/`pipx` the flag is refused through the
+  unrecognized-flag path.
 - `-q` / `--quiet` / `--silent` — accepted and dropped.
 - `--package`, `-p`, `-c`/`--call`, `--workspace`, `--workspaces`,
   `--include-workspace-root` — refused with exit 100: they change what would

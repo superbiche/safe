@@ -465,5 +465,5 @@ rc=$?
 set -e
 [[ "$rc" -eq 100 ]] || fail "uvx --no-install expected rc=100, got $rc"
 grep -q "unrecognized flag '--no-install'" "$tmp/uvx-noinstall.err" || fail "uvx --no-install not refused as unrecognized"
-grep -qv 'node_modules' "$tmp/uvx-noinstall.err" || true
+grep -q 'node_modules' "$tmp/uvx-noinstall.err" && fail "uvx --no-install took the npm-specific refusal path"
 pass "uvx --no-install refuses as unrecognized flag (npm-specific path not taken)"

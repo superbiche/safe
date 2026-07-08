@@ -1994,8 +1994,8 @@ FLAGS
   -v, --version     Print version
 
 RUNNER-NATIVE FLAGS (when invoked as npx/bunx/uvx)
-  --no-install, --no    Honored strictly: run ./node_modules/.bin/<pkg> only;
-                        refuse (exit 100) if it is not installed locally
+  --no-install, --no    npx/bunx only: run ./node_modules/.bin/<pkg> or refuse
+                        (exit 100); via uvx/pipx it is refused as unrecognized
   -q, --quiet, --silent Accepted and dropped
   anything else         Refused legibly (exit 100) — a flag is never
                         mistaken for the package name
