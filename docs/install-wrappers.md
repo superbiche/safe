@@ -81,7 +81,7 @@ same way installs are — the named package goes through `safe audit check`
 before the real tool runs:
 
 ```bash
-npm exec create-vite        # bare name: passthrough if ./node_modules/.bin/create-vite exists
+npm exec create-vite        # bare name: passthrough if node_modules/.bin/create-vite exists (cwd or parent)
 npm x cowsay
 npm exec --package=cowsay -- cowsay hi
 pnpm dlx cowsay@1.6.0
@@ -123,7 +123,8 @@ Passthrough by design — these never fetch registry packages: `pnpm exec`
 and `composer exec` (project/vendor binaries only), `volta run` (official
 runtimes only), `uv run` without `--with`/`-w`, and `go run` of local paths.
 `npm exec <tool>` / `bun x <tool>` pass through only for a **bare** command
-name backed by `./node_modules/.bin/<tool>`; a versioned or aliased spec
+name backed by `node_modules/.bin/<tool>` in the physical cwd or a parent
+directory (npm's own bin resolution, covering hoisted monorepos); a versioned or aliased spec
 (`tool@1.2.3`, `tool@npm:other`) can still resolve to a remote fetch, so it
 is always audited even when a same-named local bin exists.
 
@@ -164,7 +165,7 @@ fetch. Concretely versus a healthy shell:
 - `go run` refuses if any argument contains `@` (a healthy shell parses the
   run target, so degraded may over-refuse a local run whose program args
   contain `@`).
-- `npm exec`/`bun x` of a local `./node_modules/.bin` tool is refused,
+- `npm exec`/`bun x` of a local `node_modules/.bin` tool is refused,
   because the guard cannot safely verify the local-bin condition.
 
 Do not rename wrapper helpers to `_`-prefixed names; that reintroduces the

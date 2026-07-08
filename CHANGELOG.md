@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Wrapper parity with `safe run`: the `npm exec`/`bun x` bare-name local-bin
+  passthrough now walks `node_modules/.bin` from the physical cwd upward
+  (npm's own bin resolution), so hoisted monorepo tools pass through instead
+  of being audited as remote fetches. Builtin-only walk, immune to shell
+  function/PATH shadowing, mirroring `find_local_project_bin` in safe-run.
+
 - Extend the `safe run` local-bin tier to walk parent directories for
   `node_modules/.bin/<name>` (nearest first), matching npm's own bin
   resolution so hoisted monorepo workspaces resolve their installed tools

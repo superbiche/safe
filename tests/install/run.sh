@@ -300,6 +300,40 @@ case_npm_exec_versioned_spec_audits_despite_local_bin() {
   pass "$FUNCNAME"
 }
 
+case_npm_exec_hoisted_parent_bin_passthrough() {
+  prepare_case "npm-exec-hoisted-parent-bin-passthrough"
+  # Hoisted monorepo: the bin lives at the workspace root, the command runs
+  # from a workspace subdirectory (agentrh envsub shape, PR #19 parity).
+  mkdir -p "${WORK_DIR}/node_modules/.bin" "${WORK_DIR}/apps/web"
+  printf '#!/bin/sh\n' > "${WORK_DIR}/node_modules/.bin/envsub"
+  chmod +x "${WORK_DIR}/node_modules/.bin/envsub"
+  SAFE_INSTALL_TEST_SCRIPT='cd apps/web && npm exec envsub' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\texec\tenvsub' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_exec_parent_walk_resists_shadowing() {
+  prepare_case "npm-exec-parent-walk-resists-shadowing"
+  # Shadowed pwd/dirname must not steer the walk into an attacker tree: with
+  # no real local bin anywhere in the physical ancestry, the bare name is
+  # still audited (and blocked here) despite the attacker-planted bin.
+  mkdir -p "${WORK_DIR}/attacker/node_modules/.bin" "${WORK_DIR}/victim"
+  printf '#!/bin/sh\n' > "${WORK_DIR}/attacker/node_modules/.bin/blockme"
+  chmod +x "${WORK_DIR}/attacker/node_modules/.bin/blockme"
+  SAFE_INSTALL_TEST_SCRIPT='
+    cd victim
+    pwd() { print -r -- "'"${WORK_DIR}"'/attacker"; }
+    dirname() { print -r -- "'"${WORK_DIR}"'/attacker"; }
+    npm exec blockme
+  ' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_npm_exec_package_flag_blocks() {
   prepare_case "npm-exec-package-flag-blocks"
   SAFE_INSTALL_TEST_SCRIPT='npm exec --package=blockme -- create' run_zsh
@@ -1069,6 +1103,8 @@ main() {
     case_npm_exec_fetch_audits \
     case_npm_exec_local_bin_passthrough \
     case_npm_exec_versioned_spec_audits_despite_local_bin \
+    case_npm_exec_hoisted_parent_bin_passthrough \
+    case_npm_exec_parent_walk_resists_shadowing \
     case_npm_exec_package_flag_blocks \
     case_exec_value_flag_does_not_hide_package \
     case_exec_unknown_flag_fails_closed \
