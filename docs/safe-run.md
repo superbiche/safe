@@ -52,12 +52,35 @@ safe run --py312 ruff@latest -- --version
 `safe run` evaluates package requests in this order:
 
 1. `blocked`: refuse and log.
-2. `host-allow`: execute the pinned version on the host with scripts suppressed where supported.
-3. `safe audit`: check unknown packages in an isolated audit sandbox when available.
-4. `sandbox-known`: run in Podman without another prompt.
-5. `unknown`: prompt in a TTY; block in non-TTY.
+2. `local bin`: a bare, unversioned name backed by `./node_modules/.bin`
+   (npx/bunx invocations) runs the already-installed local binary directly —
+   nothing is fetched. Versioned or scoped specs never use this tier.
+3. `host-allow`: execute the pinned version on the host with scripts suppressed where supported.
+4. `safe audit`: check unknown packages in an isolated audit sandbox when available.
+5. `sandbox-known`: run in Podman without another prompt.
+6. `unknown`: prompt in a TTY; block in non-TTY.
 
 `safe audit` `BLOCK` refuses execution. `WARN` continues to sandbox execution but is logged.
+
+## Runner-Native Flags
+
+When invoked as `npx`/`bunx`/`uvx`, flags that belong to the replaced runner
+are handled explicitly instead of being mistaken for the package name:
+
+- `--no-install` / `--no` — npx/bunx only, honored strictly: run the local
+  `./node_modules/.bin` binary, or refuse with exit 100 if it is not
+  installed. (Modern npx maps `--no-install` to a prompt setting and still
+  resolves against the registry; `safe run` restores the flag's original
+  never-fetch meaning.) This keeps husky-era `npx --no-install lint-staged`
+  pre-commit hooks working. Via `uvx`/`pipx` the flag is refused through the
+  unrecognized-flag path.
+- `-q` / `--quiet` / `--silent` — accepted and dropped.
+- `--package`, `-p`, `-c`/`--call`, `--workspace`, `--workspaces`,
+  `--include-workspace-root` — refused with exit 100: they change what would
+  execute, and the shim cannot honor them safely. Use the wrapped `npm exec`
+  or `safe run <pkg> [-- args]` instead.
+- Any other flag before the package name fails closed with a legible exit-100
+  refusal — never a misleading exit-103 "invalid package name".
 
 ## Host Allowlist
 

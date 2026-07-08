@@ -26,7 +26,7 @@ format, policy exit codes, and the operator-only allow flows. See
 ### Policy exit codes
 
 ```text
-100  blocked by policy (blocklist, degraded wrappers, fail-closed audit)
+100  blocked by policy (blocklist, degraded wrappers, fail-closed audit, unrecognized/unsupported runner-native flags)
 101  host-allow version pin mismatch
 102  interactive operator confirmation required (non-TTY refusal)
 103  invalid package name rejected

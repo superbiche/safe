@@ -50,6 +50,7 @@ NODE_VERSION_FLAG=""
 PY_VERSION_FLAG=""
 SKIP_PROMPT=0
 PROXY_PASSTHROUGH=0
+NPX_NO_INSTALL=0
 FORCE_LINK=0
 BLOCKED_REASON=""
 HOST_ALLOW_PINNED_VERSION=""
@@ -341,6 +342,30 @@ detect_runner() {
     *npx*)      RUNNER_KIND=npm ;;
     safe-run|*) RUNNER_KIND=npm ;;
   esac
+}
+
+runner_label_for_kind() {
+  case "$RUNNER_KIND" in
+    npm) printf npx ;;
+    bun) printf bunx ;;
+    uv) printf uvx ;;
+    pipx) printf pipx ;;
+    *) printf safe-run ;;
+  esac
+}
+
+# Fail closed: an unrecognized flag before the package must never be parsed
+# as the package name (husky-era `npx --no-install <pkg>` used to die that
+# way as exit 103 "invalid package name").
+refuse_unrecognized_runner_flag() {
+  local flag="$1"
+  err "BLOCKED: unrecognized flag '$flag' before the package name"
+  err "  safe run replaces npx/bunx/uvx; runner-native flags are not forwarded"
+  err "  accepted: --no-install/--no (npx/bunx, local bin only), -q/--quiet/--silent (dropped)"
+  err "  to run: safe run <pkg>[@<version>] [-- args...]"
+  err "  agent contract: safe explain"
+  audit_log "$(runner_label_for_kind)" "unknown@unknown" "REJECTED" "$(context_label)" "UNRECOGNIZED_FLAG" "flag=$flag"
+  exit 100
 }
 
 select_image() {
@@ -761,6 +786,11 @@ build_runner_cmd_in_container() {
   case "$RUNNER_KIND" in
     npm)
       # npm_config_ignore_scripts also set via env; --yes auto-installs.
+      # No `--` barrier before the args: npm >=7's npx shim inserts its own
+      # `--` in front of the first positional (npx-cli.js), so post-command
+      # flags like `--package evil` reach the child verbatim and are never
+      # parsed as npm selectors. Adding our own `--` here would pass a
+      # literal `--` through to the child (verified empirically on npm 11).
       printf 'npx --yes --ignore-scripts %q@%q' "$pkg" "$version"
       ;;
     bun)
@@ -986,6 +1016,32 @@ dispatch_run() {
     exit 100
   fi
 
+  # Local project bin: a bare, unversioned name backed by ./node_modules/.bin
+  # runs the already-installed binary directly — nothing is fetched. Mirrors
+  # the install-wrapper local-bin rule; versioned or scoped specs stay in the
+  # audit pipeline, and the blocklist above still wins.
+  if [[ ( "$RUNNER_KIND" == "npm" || "$RUNNER_KIND" == "bun" ) \
+        && "$PKG_VERSION_USER_SPECIFIED" == "0" \
+        && "$pkg" != @* && "$pkg" != */* \
+        && -x "./node_modules/.bin/$pkg" ]]; then
+    audit_log "$runner_label" "${pkg}@local" "LOCAL_BIN" "$(context_label)" "OK"
+    local rc
+    set +e
+    PATH="$PWD/node_modules/.bin:$PATH" "./node_modules/.bin/$pkg" "$@"
+    rc=$?
+    set -e
+    return "$rc"
+  fi
+
+  if [[ "$NPX_NO_INSTALL" == "1" ]]; then
+    err "BLOCKED: $pkgver — --no-install requested but ./node_modules/.bin/${pkg} does not exist"
+    err "  modern npx would fetch from the registry despite --no-install; safe run refuses instead"
+    err "  to run: install the package in this project first (the install is wrapped), or drop --no-install"
+    err "  agent contract: safe explain"
+    audit_log "$runner_label" "$pkgver" "BLOCKED" "$(context_label)" "NO_INSTALL_NOT_LOCAL"
+    exit 100
+  fi
+
   # Host-allow tier is npm-only: only npx supports --ignore-scripts. For other
   # runners, host-allow entries are ignored and we fall through to sandbox.
   if [[ "$RUNNER_KIND" == "npm" ]]; then
@@ -1104,11 +1160,29 @@ parse_runner_args() {
       --)       saw_dashdash=1; shift ;;
       -h|--help) show_usage; exit 0 ;;
       -v|--version) echo "safe run $SAFE_RUN_VERSION"; exit 0 ;;
+      --no-install|--no)
+        # npm/bun only. Honored strictly: run the local ./node_modules/.bin
+        # binary or refuse. Modern npx (npm >=7) maps --no-install to
+        # --yes=false but still resolves against the registry.
+        if [[ "$RUNNER_KIND" == "npm" || "$RUNNER_KIND" == "bun" ]]; then
+          NPX_NO_INSTALL=1; shift
+        else
+          refuse_unrecognized_runner_flag "$1"
+        fi
+        ;;
+      -q|--quiet|--silent)
+        # Cosmetic runner flags: accepted and dropped.
+        shift ;;
+      --package|--package=*|-p|-p=*|-c|--call|--call=*|--workspace|--workspace=*|--workspaces|--include-workspace-root)
+        err "BLOCKED: npx flag '$1' is not supported through safe run"
+        err "  it changes what would execute; the shim cannot honor it safely"
+        err "  to run: use the wrapped npm exec, or: safe run <pkg>[@<version>] [-- args...]"
+        err "  agent contract: safe explain"
+        audit_log "$(runner_label_for_kind)" "unknown@unknown" "REJECTED" "$(context_label)" "UNSUPPORTED_RUNNER_FLAG" "flag=$1"
+        exit 100
+        ;;
       -*)
-        # Unknown safe run flag before the package is treated as positional
-        # (npx passes flags through too). Once we have a package, treat the
-        # rest as args.
-        positional+=("$1"); package_seen=1; shift
+        refuse_unrecognized_runner_flag "$1"
         ;;
       *)
         positional+=("$1"); package_seen=1; shift
@@ -1919,6 +1993,13 @@ FLAGS
   -h, --help        This message
   -v, --version     Print version
 
+RUNNER-NATIVE FLAGS (when invoked as npx/bunx/uvx)
+  --no-install, --no    npx/bunx only: run ./node_modules/.bin/<pkg> or refuse
+                        (exit 100); via uvx/pipx it is refused as unrecognized
+  -q, --quiet, --silent Accepted and dropped
+  anything else         Refused legibly (exit 100) — a flag is never
+                        mistaken for the package name
+
 SUBCOMMANDS
   host-allow add <pkg>@<ver> [--reason "..."] Add package to host execution allowlist
   host-allow update <pkg>@<new> [--reason "..."]
@@ -1946,14 +2027,16 @@ SUBCOMMANDS
 
 DECISION TIERS (in order)
   1. blocked        Refuse, log
-  2. host-allow     Execute on host with --ignore-scripts
-  3. safe audit     Check unknown packages in an isolated audit sandbox;
+  2. local bin      Bare unversioned name backed by ./node_modules/.bin
+                    (npx/bunx): run the local binary directly, no fetch
+  3. host-allow     Execute on host with --ignore-scripts
+  4. safe audit     Check unknown packages in an isolated audit sandbox;
                     BLOCK refuses, WARN continues
-  4. sandbox-known  Podman sandbox, no prompt
-  5. unknown        TTY: prompt; non-TTY: BLOCK
+  5. sandbox-known  Podman sandbox, no prompt
+  6. unknown        TTY: prompt; non-TTY: BLOCK
 
 EXIT CODES (policy refusals; distinguish from 127 = command not found)
-  100  blocked by policy (blocklist, degraded wrappers, fail-closed audit)
+  100  blocked by policy (blocklist, degraded wrappers, fail-closed audit, unrecognized/unsupported runner-native flags)
   101  host-allow version pin mismatch
   102  interactive operator confirmation required (non-TTY refusal)
   103  invalid package name rejected

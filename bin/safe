@@ -48,7 +48,8 @@ installers, no curl|sh). Surface the refusal to the operator instead.
 
 WHAT IS GATED
   npx / bunx / uvx        Binaries are symlinked to `safe run`: packages run
-                          from an allowlist, a Podman sandbox, or not at all.
+                          from a local ./node_modules/.bin (bare unversioned
+                          names), an allowlist, a Podman sandbox, or not at all.
   npm / pnpm / yarn / bun / pip / pip3 / uv / cargo / go / composer / volta
                           zsh wrapper functions audit install, update, and
                           exec subcommands with `safe audit` before
@@ -69,7 +70,7 @@ HOW A REFUSAL LOOKS
   stating what was blocked, why, and the operator command that allows it.
 
 EXIT CODES (policy refusals; 127 means a genuinely missing command)
-  100  blocked by policy (blocklist, degraded wrappers, fail-closed audit)
+  100  blocked by policy (blocklist, degraded wrappers, fail-closed audit, unrecognized/unsupported runner-native flags)
   101  host-allow version pin mismatch
   102  interactive operator confirmation required (non-TTY refusal)
   103  invalid package name rejected

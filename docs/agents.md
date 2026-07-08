@@ -34,11 +34,14 @@ unrecognized space-form value flag before the command fails closed
 (escapable with `--flag=value`).
 
 Passthrough by design (no registry fetch involved): non-install subcommands
-(`npm run`, `npm --version`, `volta list`, ...), `npm exec <tool>` for a
-**bare** name already present in `./node_modules/.bin` (a versioned or
-aliased spec is still audited), `pnpm exec` and `composer exec`
-(project/vendor binaries only), `volta run` (fetches only official
-runtimes), `uv run` without `--with`, and `go run` of local paths.
+(`npm run`, `npm --version`, `volta list`, ...), `npm exec <tool>` and
+`npx <tool>` for a **bare, unversioned** name already present in
+`./node_modules/.bin` (a versioned or aliased spec is still audited),
+`pnpm exec` and `composer exec` (project/vendor binaries only), `volta run`
+(fetches only official runtimes), `uv run` without `--with`, and `go run`
+of local paths. `npx --no-install <tool>` / `--no` are honored strictly:
+the local binary runs, or the refusal is exit 100 — never a registry fetch
+(modern npx would fetch anyway; safe restores the flag's meaning).
 
 ## Refusal format
 
@@ -58,7 +61,7 @@ distinguish a block from a missing binary (127):
 
 | Code | Meaning |
 | --- | --- |
-| 100 | Blocked by policy (blocklist, degraded wrappers, fail-closed audit) |
+| 100 | Blocked by policy (blocklist, degraded wrappers, fail-closed audit, unrecognized/unsupported runner-native flags) |
 | 101 | host-allow version pin mismatch |
 | 102 | Interactive operator confirmation required (non-TTY refusal) |
 | 103 | Invalid package name rejected |
