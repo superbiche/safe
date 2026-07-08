@@ -107,17 +107,27 @@ tool coverage is reported as `skipped` and the verdict is `WARN`, not zero CVEs.
 
 Package-manager wrappers cannot intercept binaries that update themselves from
 inside their own process. Use `safe vendor update` when deliberately running a
-vendor-native updater:
+vendor-native updater. A `--preset` (claude, gh, op, uv, codex) fills
+`--name`, `--path`, and `--version-cmd` for a known vendor:
+
+```bash
+safe vendor update --preset codex --reason "needed for a specific fixed bug" \
+  --rollback "reinstall previous pinned version" -- codex update
+```
+
+Or spell the fields out for a vendor without a preset:
 
 ```bash
 safe vendor update \
-  --name codex \
-  --path "$(command -v codex)" \
-  --version-cmd "--version" \
-  --reason "needed for a specific fixed bug" \
-  --rollback "reinstall previous pinned version" \
-  -- codex update
+  --name pulumi \
+  --path "$(command -v pulumi)" \
+  --version-cmd "version" \
+  --reason "pin to 3.x" \
+  -- pulumi plugin install ...
 ```
+
+See [Vendor Updates](vendor.md) for recipes and per-tool auto-update
+disablement.
 
 The command records before/after SHA-256 hashes, optional version output, the
 update command, exit code, reason, and rollback note in:

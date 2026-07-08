@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add `safe vendor update --preset <vendor>` for claude, gh, op, uv, and
+  codex: fills `--name`, `--path` (auto-detected on PATH), and `--version-cmd`
+  so a native vendor update needs only `--reason` and the command; explicit
+  flags still override. New `docs/vendor.md` collects the recipes, the
+  trust calculus, and per-tool auto-update disablement.
+
 - Close a universal bypass in the zsh install wrappers: every wrapper read
   its subcommand as `$1`, so a leading global flag hid the real command
   (`npm --loglevel=error install evil`, `yarn --cwd sub add evil`,
