@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Close a universal bypass in the zsh install wrappers: every wrapper read
+  its subcommand as `$1`, so a leading global flag hid the real command
+  (`npm --loglevel=error install evil`, `yarn --cwd sub add evil`,
+  `pnpm --filter=x dlx cmd`) and slipped the whole gate. A shared resolver
+  now finds the first non-flag token, skipping leading global flags:
+  `=`-form flags are unambiguous, per-tool value/boolean tables are skipped
+  correctly, and any unrecognized space-form flag fails closed with a
+  legible exit-100 refusal (escapable as `--flag=value`). Tables are kept
+  small and are load-bearing (a MISclassified flag bypasses; a gap only
+  over-refuses); `go` accepts no pre-command flags so any leading flag fails
+  closed. Degraded-mode guards are unchanged (they match `$1` only, the
+  conservative broken-shell fallback).
+
 - Wrapper parity with `safe run`: the `npm exec`/`bun x` bare-name local-bin
   passthrough now walks `node_modules/.bin` from the physical cwd upward
   (npm's own bin resolution), so hoisted monorepo tools pass through instead

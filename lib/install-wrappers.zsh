@@ -570,6 +570,105 @@ safe_install_local_bin_exists() {
   done
 }
 
+# Locate the real subcommand token, skipping any leading GLOBAL flags a tool
+# accepts before its command (`npm --loglevel=error install evil`,
+# `yarn --cwd sub add evil`, `pnpm --filter x dlx cmd`). Without this the
+# wrappers read the subcommand as $1 and a leading flag slips the whole gate.
+#
+# Sets SAFE_INSTALL_SUBCMD (token, "" if none) and SAFE_INSTALL_SUBCMD_IDX
+# (1-based index in "$@", 0 if none). Returns 0 on success (subcommand found
+# or genuinely absent), 2 fail-closed on an ambiguous unrecognized space-form
+# flag (SAFE_INSTALL_SUBCMD_BADFLAG names it).
+#
+# Classification discipline (both directions can bypass, so correctness — not
+# completeness — is load-bearing):
+# - `=`-form flags (`--x=y`) are unambiguous → always skipped.
+# - <val_alt>: flags KNOWN to take a space-form value → skip flag + its value.
+#   A boolean wrongly listed here eats the real subcommand → bypass.
+# - <bool_alt>: flags KNOWN to take NO value → skip flag only.
+#   A value-taker wrongly listed here exposes its value as the subcommand →
+#   bypass.
+# - Any OTHER space-form dash flag is ambiguous → FAIL CLOSED (return 2),
+#   escapable by rewriting as `--flag=value`. So gaps in either list merely
+#   over-refuse; only MISCLASSIFICATION bypasses. Lists validated per tool
+#   against its --help and are load-bearing.
+safe_install_locate_subcommand() {
+  local val_alt="$1" bool_alt="$2"; shift 2
+  local arg i=0 skip=0
+  SAFE_INSTALL_SUBCMD=""; SAFE_INSTALL_SUBCMD_IDX=0; SAFE_INSTALL_SUBCMD_BADFLAG=""
+  for arg in "$@"; do
+    i=$((i + 1))
+    if (( skip )); then skip=0; continue; fi
+    case "${arg}" in
+      --)
+        # Options terminated: the next token, if any, is the subcommand.
+        if (( i < $# )); then
+          SAFE_INSTALL_SUBCMD="${@[i+1]}"; SAFE_INSTALL_SUBCMD_IDX=$((i + 1))
+        fi
+        return 0 ;;
+      --*=*|-*=*) continue ;;
+      ${~val_alt}) skip=1; continue ;;
+      ${~bool_alt}) continue ;;
+      -?*) SAFE_INSTALL_SUBCMD_BADFLAG="${arg}"; return 2 ;;
+      *) SAFE_INSTALL_SUBCMD="${arg}"; SAFE_INSTALL_SUBCMD_IDX=$i; return 0 ;;
+    esac
+  done
+  return 0
+}
+
+# Per-tool leading-global-flag tables (val|bool), kept deliberately small: a
+# gap only over-refuses (fail-closed, escapable via =form); a MISclassified
+# flag bypasses. `go` accepts no pre-command flags → empty tables (any leading
+# flag fails closed, matching go's own grammar).
+safe_install_global_flags() {
+  case "$1" in
+    npm)
+      SAFE_INSTALL_GVAL='--loglevel|--prefix|--cache|--registry|--userconfig|--globalconfig|--workspace|-w|--script-shell|--node-options|--omit|--include|--tag'
+      SAFE_INSTALL_GBOOL='-q|--quiet|--silent|-d|-dd|-ddd|--verbose|--global|-g|--foreground-scripts|--no-fund|--no-audit|--offline|--prefer-offline|--prefer-online|--ignore-scripts|--workspaces|--include-workspace-root|--no-workspaces|--no-color|--json' ;;
+    pnpm)
+      SAFE_INSTALL_GVAL='--filter|-F|--dir|-C|--reporter|--config|--workspace-concurrency'
+      SAFE_INSTALL_GBOOL='-w|--workspace-root|-r|--recursive|--stream|--silent|--no-color|--global|-g|--aggregate-output' ;;
+    bun)
+      SAFE_INSTALL_GVAL='--cwd|--config|-c'
+      SAFE_INSTALL_GBOOL='--silent|--global|-g|--no-cache|--no-progress' ;;
+    yarn)
+      SAFE_INSTALL_GVAL='--cwd|--registry|--modules-folder|--cache-folder|--mutex|--network-timeout|--network-concurrency|--proxy|--https-proxy'
+      SAFE_INSTALL_GBOOL='--verbose|--silent|-s|--offline|--prefer-offline|--no-progress|--json|--flat|--force|--ignore-scripts|--non-interactive|--no-lockfile|--frozen-lockfile' ;;
+    pip|pip3)
+      SAFE_INSTALL_GVAL='--log|--proxy|--retries|--timeout|--cache-dir|--python|--index-url|-i|--cert|--client-cert'
+      SAFE_INSTALL_GBOOL='-q|--quiet|-v|-vv|-vvv|--verbose|--isolated|--no-input|--no-color|--require-virtualenv|--no-cache-dir|--disable-pip-version-check|--use-feature' ;;
+    uv)
+      SAFE_INSTALL_GVAL='--cache-dir|--config-file|--directory|--project|--color'
+      SAFE_INSTALL_GBOOL='--offline|-q|--quiet|-v|--verbose|--native-tls|--no-cache|-n|--no-progress|--no-config' ;;
+    cargo)
+      SAFE_INSTALL_GVAL='--color|--config|-Z|-C'
+      SAFE_INSTALL_GBOOL='-v|--verbose|-q|--quiet|--offline|--frozen|--locked' ;;
+    composer)
+      SAFE_INSTALL_GVAL='-d|--working-dir'
+      SAFE_INSTALL_GBOOL='-v|-vv|-vvv|--verbose|-q|--quiet|-n|--no-interaction|--profile|--no-plugins|--no-scripts|--ansi|--no-ansi|-h|--help|-V|--version' ;;
+    volta)
+      SAFE_INSTALL_GVAL=''
+      SAFE_INSTALL_GBOOL='-v|--verbose|-q|--quiet' ;;
+    go|*)
+      SAFE_INSTALL_GVAL=''
+      SAFE_INSTALL_GBOOL='' ;;
+  esac
+}
+
+# Resolve the subcommand for <tool> over "$@"; on ambiguity print the legible
+# fail-closed refusal and return 100 so the caller can `|| return $?`.
+safe_install_route() {
+  local tool="$1"; shift
+  safe_install_global_flags "${tool}"
+  safe_install_locate_subcommand "${SAFE_INSTALL_GVAL}" "${SAFE_INSTALL_GBOOL}" "$@"
+  case $? in
+    2)
+      print -u2 -- "safe: BLOCKED ${tool} — cannot find the subcommand past unrecognized flag '${SAFE_INSTALL_SUBCMD_BADFLAG}'; to allow: rewrite it as '${SAFE_INSTALL_SUBCMD_BADFLAG}=<value>', then retry; details: safe explain"
+      return 100 ;;
+  esac
+  return 0
+}
+
 # Gate exec-style invocations that can fetch and run registry packages
 # (npm exec/x, bun x, pnpm dlx, yarn dlx, uv tool run). Audits every package
 # the invocation would fetch, then the caller delegates to the real tool.
@@ -705,8 +804,10 @@ safe_install_exec_gate() {
 safe_install_npm_like() {
   local tool="$1"
   shift
-  local subcommand="${1:-}"
-  local -a raw packages
+  safe_install_route "${tool}" "$@" || return $?
+  local subcommand="${SAFE_INSTALL_SUBCMD}"
+  local -a rest raw packages
+  rest=("${@:$((SAFE_INSTALL_SUBCMD_IDX + 1))}")
   local parser="safe_install_${tool}_packages"
   local raw_package
   local project_present=1
@@ -720,7 +821,7 @@ safe_install_npm_like() {
         '-c|--call|-w|--workspace|--cache|--prefix|--registry|--userconfig|--globalconfig|--loglevel|--script-shell|--node-options|--omit|--include' \
         '-y|--yes|--no|--offline|--prefer-offline|--prefer-online|--ignore-existing|--foreground-scripts|--silent|--quiet|--workspaces|--include-workspace-root' \
         '' \
-        "${@:2}" || return $?
+        "${rest[@]}" || return $?
       safe_install_real "${tool}" "$@"
       return $?
       ;;
@@ -729,7 +830,7 @@ safe_install_npm_like() {
         '--package|-p' '' '' \
         '--bun|--silent|--no-install|--verbose' \
         '' \
-        "${@:2}" || return $?
+        "${rest[@]}" || return $?
       safe_install_real "${tool}" "$@"
       return $?
       ;;
@@ -739,7 +840,7 @@ safe_install_npm_like() {
         '--allow-build|--reporter' \
         '-c|--shell-mode|--silent|-s' \
         '' \
-        "${@:2}" || return $?
+        "${rest[@]}" || return $?
       safe_install_real "${tool}" "$@"
       return $?
       ;;
@@ -751,7 +852,7 @@ safe_install_npm_like() {
   esac
 
   if safe_install_has_arg "-g" "$@" || safe_install_has_arg "--global" "$@"; then
-    raw=("${(@f)$(${parser} "${@:2}")}")
+    raw=("${(@f)$(${parser} "${rest[@]}")}")
     packages=()
     for raw_package in "${raw[@]}"; do
       [[ -n "${raw_package}" ]] && packages+=("$(safe_install_npm_spec "${raw_package}")")
@@ -775,7 +876,7 @@ safe_install_npm_like() {
     safe_install_scan_project || return $?
   fi
 
-  raw=("${(@f)$(${parser} "${@:2}")}")
+  raw=("${(@f)$(${parser} "${rest[@]}")}")
   packages=()
   for raw_package in "${raw[@]}"; do
     [[ -n "${raw_package}" ]] && packages+=("$(safe_install_npm_spec "${raw_package}")")
@@ -841,21 +942,23 @@ yarn() {
       *) command yarn "$@"; return $? ;;
     esac
   fi
-  local first="${1:-}"
-  local second="${2:-}"
+  safe_install_route yarn "$@" || return $?
+  local first="${SAFE_INSTALL_SUBCMD}"
+  local subidx=$SAFE_INSTALL_SUBCMD_IDX
+  local second="${@[subidx+1]:-}"
   local -a raw packages
   local raw_package
 
   if [[ "${first}" == "dlx" ]]; then
     safe_install_exec_gate "yarn dlx" npm 0 0 \
       '--package|-p' '' '' '-q|--quiet' '' \
-      "${@:2}" || return $?
+      "${@:$((subidx + 1))}" || return $?
     safe_install_real yarn "$@"
     return $?
   fi
 
   if [[ "${first}" == "global" && ( "${second}" == "add" || "${second}" == "upgrade" ) ]]; then
-    raw=("${(@f)$(safe_install_yarn_packages "${@:3}")}")
+    raw=("${(@f)$(safe_install_yarn_packages "${@:$((subidx + 2))}")}")
     packages=()
     for raw_package in "${raw[@]}"; do
       [[ -n "${raw_package}" ]] && packages+=("$(safe_install_npm_spec "${raw_package}")")
@@ -876,7 +979,7 @@ yarn() {
       fi
 
       if [[ "${first}" == "add" || "${first}" == "up" || "${first}" == "upgrade" ]]; then
-        raw=("${(@f)$(safe_install_yarn_packages "${@:2}")}")
+        raw=("${(@f)$(safe_install_yarn_packages "${@:$((subidx + 1))}")}")
         packages=()
         for raw_package in "${raw[@]}"; do
           [[ -n "${raw_package}" ]] && packages+=("$(safe_install_npm_spec "${raw_package}")")
@@ -936,18 +1039,20 @@ safe_install_python_packages() {
 safe_install_pip_like() {
   local tool="$1"
   shift
-  local subcommand="${1:-}"
+  safe_install_route "${tool}" "$@" || return $?
+  local subcommand="${SAFE_INSTALL_SUBCMD}"
+  local subidx=$SAFE_INSTALL_SUBCMD_IDX
   local -a packages
 
   [[ "${subcommand}" == "install" || "${subcommand}" == "upgrade" ]] || { safe_install_real "${tool}" "$@"; return $?; }
 
-  if safe_install_pip_project_install "${@:2}"; then
+  if safe_install_pip_project_install "${@:$((subidx + 1))}"; then
     safe_install_scan_project || return $?
     safe_install_real "${tool}" "$@"
     return $?
   fi
 
-  packages=("${(@f)$(safe_install_python_packages "${@:2}")}")
+  packages=("${(@f)$(safe_install_python_packages "${@:$((subidx + 1))}")}")
   if (( $? != 0 || ${#packages[@]} == 0 )); then
     safe_install_real "${tool}" "$@"
     return $?
@@ -1002,8 +1107,10 @@ uv() {
       *) command uv "$@"; return $? ;;
     esac
   fi
-  local first="${1:-}"
-  local second="${2:-}"
+  safe_install_route uv "$@" || return $?
+  local first="${SAFE_INSTALL_SUBCMD}"
+  local subidx=$SAFE_INSTALL_SUBCMD_IDX
+  local second="${@[subidx+1]:-}"
   local -a packages
 
   if [[ "${first}" == "sync" ]]; then
@@ -1028,7 +1135,7 @@ uv() {
     local uv_val='--python|-p|--with-editable|--index|--index-url|--extra-index-url|--default-index|--constraint|-c|--index-strategy|--keyring-provider|--resolution|--prerelease|--exclude-newer|--config-setting|--refresh-package|--group|--only-group|--no-group|--extra|--no-extra|--project|--directory|--python-preference'
     local uv_bool='--frozen|--locked|--no-sync|--offline|--isolated|--no-project|--all-extras|--no-dev|--dev|--only-dev|--no-default-groups|--all-groups|--refresh|--reinstall|--upgrade|--all-packages|--no-editable|--exact|--inexact|--no-binary|--no-build|--compile-bytecode|--no-compile-bytecode|--native-tls|--no-cache|-n|-q|--quiet|-v|--verbose|--managed-python|--no-managed-python|--script|-s|-m|--module'
     with_specs=()
-    for run_arg in "${@:2}"; do
+    for run_arg in "${@:$((subidx + 1))}"; do
       if (( expect_with )); then
         with_specs+=("${run_arg}")
         expect_with=0
@@ -1077,13 +1184,13 @@ uv() {
       '--python|-p|--with-editable|--index|--index-url|--extra-index-url|--default-index|--constraint|-c|--index-strategy|--keyring-provider|--resolution|--prerelease|--exclude-newer|--config-setting|--refresh-package' \
       '--offline|--isolated|--system|--no-project|--refresh|--reinstall|--upgrade|-q|--quiet|-v|--verbose|--native-tls|--no-cache|-n' \
       '--with-requirements' \
-      "${@:3}" || return $?
+      "${@:$((subidx + 2))}" || return $?
     safe_install_real uv "$@"
     return $?
   fi
 
   if [[ "${first}" == "tool" && "${second}" == "install" ]]; then
-    packages=("${(@f)$(safe_install_python_packages "${@:3}")}")
+    packages=("${(@f)$(safe_install_python_packages "${@:$((subidx + 2))}")}")
     if (( $? != 0 || ${#packages[@]} == 0 )); then
       safe_install_real uv "$@"
       return $?
@@ -1095,13 +1202,13 @@ uv() {
   fi
 
   if [[ "${first}" == "pip" && "${second}" == "install" ]]; then
-    if safe_install_pip_project_install "${@:3}"; then
+    if safe_install_pip_project_install "${@:$((subidx + 2))}"; then
       safe_install_scan_project || return $?
       safe_install_real uv "$@"
       return $?
     fi
 
-    packages=("${(@f)$(safe_install_python_packages "${@:3}")}")
+    packages=("${(@f)$(safe_install_python_packages "${@:$((subidx + 2))}")}")
     if (( $? != 0 || ${#packages[@]} == 0 )); then
       safe_install_real uv "$@"
       return $?
@@ -1124,7 +1231,9 @@ cargo() {
       *) command cargo "$@"; return $? ;;
     esac
   fi
-  local subcommand="${1:-}"
+  safe_install_route cargo "$@" || return $?
+  local subcommand="${SAFE_INSTALL_SUBCMD}"
+  local subidx=$SAFE_INSTALL_SUBCMD_IDX
   local -a packages
 
   if [[ "${subcommand}" != "install" ]]; then
@@ -1146,7 +1255,7 @@ cargo() {
     return $?
   fi
 
-  packages=("${(@f)$(safe_install_cargo_packages "${@:2}")}")
+  packages=("${(@f)$(safe_install_cargo_packages "${@:$((subidx + 1))}")}")
   if (( ${#packages[@]} > 0 )); then
     safe_install_check_many cargo "${packages[@]}" || return $?
   fi
@@ -1173,8 +1282,10 @@ go() {
       *) command go "$@"; return $? ;;
     esac
   fi
-  local subcommand="${1:-}"
-  local second="${2:-}"
+  safe_install_route go "$@" || return $?
+  local subcommand="${SAFE_INSTALL_SUBCMD}"
+  local subidx=$SAFE_INSTALL_SUBCMD_IDX
+  local second="${@[subidx+1]:-}"
   local -a packages
 
   if [[ "${subcommand}" == "run" ]]; then
@@ -1188,7 +1299,7 @@ go() {
     local run_arg run_target="" run_skip_next=0
     local go_val='-C|-p|-asmflags|-buildmode|-compiler|-covermode|-coverpkg|-gccgoflags|-gcflags|-installsuffix|-ldflags|-mod|-modfile|-overlay|-pgo|-pkgdir|-tags|-toolexec|-exec'
     local go_bool='-a|-n|-race|-msan|-asan|-cover|-v|-work|-x|-i|-linkshared|-modcacherw|-trimpath|-buildvcs|-json'
-    for run_arg in "${@:2}"; do
+    for run_arg in "${@:$((subidx + 1))}"; do
       if (( run_skip_next )); then
         run_skip_next=0
         continue
@@ -1229,7 +1340,7 @@ go() {
     return $?
   fi
 
-  packages=("${(@f)$(safe_install_go_packages "${@:2}")}") || {
+  packages=("${(@f)$(safe_install_go_packages "${@:$((subidx + 1))}")}") || {
     safe_install_real go "$@"
     return $?
   }
@@ -1250,8 +1361,10 @@ composer() {
       *) command composer "$@"; return $? ;;
     esac
   fi
-  local first="${1:-}"
-  local second="${2:-}"
+  safe_install_route composer "$@" || return $?
+  local first="${SAFE_INSTALL_SUBCMD}"
+  local subidx=$SAFE_INSTALL_SUBCMD_IDX
+  local second="${@[subidx+1]:-}"
   local -a packages
 
   if [[ "${first}" != "global" || "${second}" != "require" ]]; then
@@ -1261,7 +1374,7 @@ composer() {
       fi
 
       if [[ "${first}" == "require" ]]; then
-        packages=("${(@f)$(safe_install_composer_packages "${@:2}")}")
+        packages=("${(@f)$(safe_install_composer_packages "${@:$((subidx + 1))}")}")
         if (( ${#packages[@]} > 0 )); then
           safe_install_check_many composer "${packages[@]}" || return $?
         fi
@@ -1272,7 +1385,7 @@ composer() {
     return $?
   fi
 
-  packages=("${(@f)$(safe_install_composer_packages "${@:3}")}")
+  packages=("${(@f)$(safe_install_composer_packages "${@:$((subidx + 2))}")}")
   if (( ${#packages[@]} > 0 )); then
     safe_install_check_many composer "${packages[@]}" || return $?
   fi
@@ -1289,7 +1402,9 @@ volta() {
       *) command volta "$@"; return $? ;;
     esac
   fi
-  local subcommand="${1:-}"
+  safe_install_route volta "$@" || return $?
+  local subcommand="${SAFE_INSTALL_SUBCMD}"
+  local subidx=$SAFE_INSTALL_SUBCMD_IDX
   local -a packages
   local -a raw
   local raw_package
@@ -1299,7 +1414,7 @@ volta() {
     return $?
   fi
 
-  raw=("${(@f)$(safe_install_volta_packages "${@:2}")}")
+  raw=("${(@f)$(safe_install_volta_packages "${@:$((subidx + 1))}")}")
   packages=()
   for raw_package in "${raw[@]}"; do
     [[ -n "${raw_package}" ]] && packages+=("$(safe_install_npm_spec "${raw_package}")")

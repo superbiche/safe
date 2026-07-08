@@ -334,6 +334,90 @@ case_npm_exec_parent_walk_resists_shadowing() {
   pass "$FUNCNAME"
 }
 
+case_leading_global_flag_gates_npm_install() {
+  prepare_case "leading-global-flag-gates-npm-install"
+  # The inbox bypass: a leading global flag made the subcommand read as the
+  # flag, so `install` slipped the gate. =form and space-form both gate now.
+  SAFE_INSTALL_TEST_SCRIPT='npm --loglevel=error install -g blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='npm --loglevel error install -g blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_leading_global_flag_gates_pnpm_dlx() {
+  prepare_case "leading-global-flag-gates-pnpm-dlx"
+  SAFE_INSTALL_TEST_SCRIPT='pnpm --filter=web dlx blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_leading_global_flag_gates_yarn_add() {
+  prepare_case "leading-global-flag-gates-yarn-add"
+  # The verbatim inbox shape: yarn --cwd <dir> add <pkg>.
+  SAFE_INSTALL_TEST_SCRIPT='yarn --cwd sub add blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tyarn' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_leading_global_flag_gates_uv_tool_run() {
+  prepare_case "leading-global-flag-gates-uv-tool-run"
+  SAFE_INSTALL_TEST_SCRIPT='uv --offline tool run blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_value_flag_consumes_its_value() {
+  prepare_case "value-flag-consumes-its-value"
+  # A known value-taking leading flag must skip its value so the real
+  # subcommand is still found. `install` here happens to also be a plausible
+  # value; the resolver must not stop on it.
+  SAFE_INSTALL_TEST_SCRIPT='npm --registry https://r.example install -g blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_unknown_leading_flag_fails_closed() {
+  prepare_case "unknown-leading-flag-fails-closed"
+  # An unrecognized space-form leading flag is ambiguous → refuse (exit 100),
+  # never silently pass the command through unaudited.
+  SAFE_INSTALL_TEST_SCRIPT='npm --totally-unknown-flag value install -g blockme' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'cannot find the subcommand' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe explain' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_unknown_leading_flag_eqform_escapes() {
+  prepare_case "unknown-leading-flag-eqform-escapes"
+  # The =form of an unknown flag is unambiguous → the gate proceeds and the
+  # real install is still audited.
+  SAFE_INSTALL_TEST_SCRIPT='npm --totally-unknown-flag=value install -g blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_leading_flag_benign_command_passes() {
+  prepare_case "leading-flag-benign-command-passes"
+  # A non-gated subcommand behind a known leading flag still passes through.
+  SAFE_INSTALL_TEST_SCRIPT='npm --loglevel=error run build' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\t--loglevel=error\trun\tbuild' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_npm_exec_package_flag_blocks() {
   prepare_case "npm-exec-package-flag-blocks"
   SAFE_INSTALL_TEST_SCRIPT='npm exec --package=blockme -- create' run_zsh
@@ -1103,6 +1187,14 @@ main() {
     case_npm_exec_fetch_audits \
     case_npm_exec_local_bin_passthrough \
     case_npm_exec_versioned_spec_audits_despite_local_bin \
+    case_leading_global_flag_gates_npm_install \
+    case_leading_global_flag_gates_pnpm_dlx \
+    case_leading_global_flag_gates_yarn_add \
+    case_leading_global_flag_gates_uv_tool_run \
+    case_value_flag_consumes_its_value \
+    case_unknown_leading_flag_fails_closed \
+    case_unknown_leading_flag_eqform_escapes \
+    case_leading_flag_benign_command_passes \
     case_npm_exec_hoisted_parent_bin_passthrough \
     case_npm_exec_parent_walk_resists_shadowing \
     case_npm_exec_package_flag_blocks \
