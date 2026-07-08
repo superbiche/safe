@@ -514,3 +514,93 @@ set -e
 [[ "$rc" -eq 0 ]] || fail "nearest-bin case failed rc=$rc"
 grep -q '^NEAREST x' "$tmp/mono-nearest-call.log" || fail "nearest bin did not win over ancestor"
 pass "nearest node_modules/.bin wins over ancestor"
+
+# Symlinked cwd: the walk must follow the PHYSICAL path (npm's process.cwd()),
+# never logical $PWD parents — a planted node_modules in the symlink's parent
+# tree must not execute, while a physical ancestor bin must still resolve.
+sym_physical="$tmp/sym-physical"
+sym_logical_root="$tmp/sym-logical-root"
+mkdir -p "$sym_physical/project/apps/web" "$sym_physical/project/node_modules/.bin" "$sym_logical_root"
+ln -s "$sym_physical/project" "$sym_logical_root/project-link"
+mkdir -p "$sym_logical_root/node_modules/.bin"
+cat > "$sym_logical_root/node_modules/.bin/probe" <<'SH'
+#!/usr/bin/env bash
+printf 'LOGICAL %s\n' "$*" > "$LOCAL_BIN_CALL_LOG"
+SH
+chmod +x "$sym_logical_root/node_modules/.bin/probe"
+cat > "$sym_physical/project/node_modules/.bin/probe" <<'SH'
+#!/usr/bin/env bash
+printf 'PHYSICAL %s\n' "$*" > "$LOCAL_BIN_CALL_LOG"
+SH
+chmod +x "$sym_physical/project/node_modules/.bin/probe"
+set +e
+(
+  cd "$sym_logical_root/project-link/apps/web"
+  SAFE_RUN_CONFIG_DIR="$tmp/config-symcwd" \
+  SAFE_RUN_DATA_DIR="$tmp/data-symcwd" \
+  LOCAL_BIN_CALL_LOG="$tmp/symcwd-call.log" \
+    "$SAFE_RUN" probe hello
+) </dev/null >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] || fail "symlinked-cwd physical resolution failed rc=$rc"
+grep -q '^PHYSICAL hello' "$tmp/symcwd-call.log" || fail "walk did not resolve the physical ancestor bin"
+grep -q "bin=$sym_physical/project/node_modules/.bin/probe" "$tmp/data-symcwd/audit.log" || fail "audit log did not record the physical bin path"
+pass "symlinked cwd resolves physical ancestors, never logical parents"
+
+# Same layout with NO physical bin: the planted logical-parent bin must not
+# run; the request stays in the pipeline (non-TTY unknown => 102).
+rm "$sym_physical/project/node_modules/.bin/probe"
+set +e
+(
+  cd "$sym_logical_root/project-link/apps/web"
+  SAFE_RUN_CONFIG_DIR="$tmp/config-symcwd-miss" \
+  SAFE_RUN_DATA_DIR="$tmp/data-symcwd-miss" \
+  LOCAL_BIN_CALL_LOG="$tmp/symcwd-miss-call.log" \
+    "$SAFE_RUN" probe
+) </dev/null >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 102 ]] || fail "planted logical-parent bin case expected rc=102, got $rc"
+[[ ! -e "$tmp/symcwd-miss-call.log" ]] || fail "planted logical-parent bin was executed"
+pass "planted bin in a logical parent never executes"
+
+# Blocklist beats a PARENT-resolved bin too (not just a cwd-local one).
+mkdir -p "$tmp/config-blocked-parent"
+printf '{"packages":{"envsub":{"reason":"parent fixture block"}}}' > "$tmp/config-blocked-parent/blocked.json"
+set +e
+(
+  cd "$mono/apps/web"
+  SAFE_RUN_CONFIG_DIR="$tmp/config-blocked-parent" \
+  SAFE_RUN_DATA_DIR="$tmp/data-blocked-parent" \
+  LOCAL_BIN_CALL_LOG="$tmp/blocked-parent-call.log" \
+    "$SAFE_RUN" envsub
+) </dev/null >/dev/null 2>"$tmp/blocked-parent.err"
+rc=$?
+set -e
+[[ "$rc" -eq 100 ]] || fail "blocked parent-resolved bin expected rc=100, got $rc"
+[[ ! -e "$tmp/blocked-parent-call.log" ]] || fail "blocked package executed a parent-resolved bin"
+grep -q 'parent fixture block' "$tmp/blocked-parent.err" || fail "parent blocklist reason missing"
+pass "blocklist wins over a parent-resolved bin"
+
+# Audit log stays one-physical-line per decision even for hostile paths.
+nl_dir="$tmp/nl-$(printf 'a\nb')"
+mkdir -p "$nl_dir/node_modules/.bin"
+cat > "$nl_dir/node_modules/.bin/nltool" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$nl_dir/node_modules/.bin/nltool"
+set +e
+(
+  cd "$nl_dir"
+  SAFE_RUN_CONFIG_DIR="$tmp/config-nl" \
+  SAFE_RUN_DATA_DIR="$tmp/data-nl" \
+    "$SAFE_RUN" nltool
+) </dev/null >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] || fail "newline-path local bin failed rc=$rc"
+[[ "$(grep -c 'LOCAL_BIN' "$tmp/data-nl/audit.log")" -eq 1 ]] || fail "LOCAL_BIN entry count wrong"
+[[ "$(wc -l < "$tmp/data-nl/audit.log")" -eq "$(grep -c ' | ' "$tmp/data-nl/audit.log")" ]] || fail "audit log contains split records"
+pass "audit log records stay single-line for hostile bin paths"

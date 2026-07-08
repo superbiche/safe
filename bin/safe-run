@@ -162,9 +162,13 @@ safe_audit_check_unknown() {
 audit_log() {
   local runner="$1" pkgver="$2" tier="$3" context="$4" decision="$5" extra="${6:-}"
   mkdir -p "$DATA_DIR"
-  printf '%s | %s | %s | %s | %s | %s%s\n' \
+  local line
+  line=$(printf '%s | %s | %s | %s | %s | %s%s' \
     "$(now_iso)" "$runner" "$pkgver" "$tier" "$context" "$decision" \
-    "${extra:+ | $extra}" >> "$AUDIT_LOG"
+    "${extra:+ | $extra}")
+  # One decision = one physical line: untrusted values (e.g. resolved bin
+  # paths) may embed newlines that would split the append-only record.
+  printf '%s\n' "${line//[$'\r\n']/ }" >> "$AUDIT_LOG"
 }
 
 context_label() {
@@ -357,8 +361,14 @@ runner_label_for_kind() {
 # Resolve a bare tool name against node_modules/.bin in the current directory
 # or any parent, nearest first — the same upward walk npm itself performs, so
 # hoisted monorepo workspaces resolve their tools. Prints the executable path.
+# Seeded from the PHYSICAL cwd (pwd -P): npm resolves from process.cwd() with
+# symlinks resolved, so walking logical $PWD parents could execute a bin from
+# a directory tree the project does not live in (e.g. a symlinked checkout
+# under /tmp with a planted /tmp/node_modules). Fail closed if unavailable.
 find_local_project_bin() {
-  local name="$1" dir="$PWD"
+  local name="$1" dir
+  dir=$(pwd -P 2>/dev/null) || return 1
+  [[ -n "$dir" ]] || return 1
   while :; do
     if [[ -x "$dir/node_modules/.bin/$name" && -f "$dir/node_modules/.bin/$name" ]]; then
       printf '%s' "$dir/node_modules/.bin/$name"
