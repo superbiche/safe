@@ -453,3 +453,17 @@ set -e
 [[ ! -e "$tmp/local-bin-blocked-call.log" ]] || fail "blocked package executed the local bin"
 grep -q 'fixture block' "$tmp/blocked-local.err" || fail "blocklist reason missing from refusal"
 pass "blocklist wins over local-bin passthrough"
+
+# --no-install is npm/bun-only: via a uvx-shaped invocation it is refused as
+# an unrecognized flag (generic message), not the npm-specific refusal.
+ln -sf "$SAFE_RUN" "$tmp/uvx"
+set +e
+SAFE_RUN_CONFIG_DIR="$tmp/config-uvx-noinstall" \
+SAFE_RUN_DATA_DIR="$tmp/data-uvx-noinstall" \
+  "$tmp/uvx" --no-install ruff </dev/null >/dev/null 2>"$tmp/uvx-noinstall.err"
+rc=$?
+set -e
+[[ "$rc" -eq 100 ]] || fail "uvx --no-install expected rc=100, got $rc"
+grep -q "unrecognized flag '--no-install'" "$tmp/uvx-noinstall.err" || fail "uvx --no-install not refused as unrecognized"
+grep -qv 'node_modules' "$tmp/uvx-noinstall.err" || true
+pass "uvx --no-install refuses as unrecognized flag (npm-specific path not taken)"

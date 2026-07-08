@@ -354,6 +354,20 @@ runner_label_for_kind() {
   esac
 }
 
+# Fail closed: an unrecognized flag before the package must never be parsed
+# as the package name (husky-era `npx --no-install <pkg>` used to die that
+# way as exit 103 "invalid package name").
+refuse_unrecognized_runner_flag() {
+  local flag="$1"
+  err "BLOCKED: unrecognized flag '$flag' before the package name"
+  err "  safe run replaces npx/bunx/uvx; runner-native flags are not forwarded"
+  err "  accepted: --no-install/--no (npx/bunx, local bin only), -q/--quiet/--silent (dropped)"
+  err "  to run: safe run <pkg>[@<version>] [-- args...]"
+  err "  agent contract: safe explain"
+  audit_log "$(runner_label_for_kind)" "unknown@unknown" "REJECTED" "$(context_label)" "UNRECOGNIZED_FLAG" "flag=$flag"
+  exit 100
+}
+
 select_image() {
   local kind="$1"
   case "$kind" in
@@ -772,6 +786,11 @@ build_runner_cmd_in_container() {
   case "$RUNNER_KIND" in
     npm)
       # npm_config_ignore_scripts also set via env; --yes auto-installs.
+      # No `--` barrier before the args: npm >=7's npx shim inserts its own
+      # `--` in front of the first positional (npx-cli.js), so post-command
+      # flags like `--package evil` reach the child verbatim and are never
+      # parsed as npm selectors. Adding our own `--` here would pass a
+      # literal `--` through to the child (verified empirically on npm 11).
       printf 'npx --yes --ignore-scripts %q@%q' "$pkg" "$version"
       ;;
     bun)
@@ -1142,9 +1161,15 @@ parse_runner_args() {
       -h|--help) show_usage; exit 0 ;;
       -v|--version) echo "safe run $SAFE_RUN_VERSION"; exit 0 ;;
       --no-install|--no)
-        # Honored strictly: run the local ./node_modules/.bin binary or refuse.
-        # Modern npx (npm >=7) silently ignores --no-install and fetches anyway.
-        NPX_NO_INSTALL=1; shift ;;
+        # npm/bun only. Honored strictly: run the local ./node_modules/.bin
+        # binary or refuse. Modern npx (npm >=7) maps --no-install to
+        # --yes=false but still resolves against the registry.
+        if [[ "$RUNNER_KIND" == "npm" || "$RUNNER_KIND" == "bun" ]]; then
+          NPX_NO_INSTALL=1; shift
+        else
+          refuse_unrecognized_runner_flag "$1"
+        fi
+        ;;
       -q|--quiet|--silent)
         # Cosmetic runner flags: accepted and dropped.
         shift ;;
@@ -1157,16 +1182,7 @@ parse_runner_args() {
         exit 100
         ;;
       -*)
-        # Fail closed: an unrecognized flag before the package must never be
-        # parsed as the package name (husky-era `npx --no-install <pkg>` used
-        # to die here as exit 103 "invalid package name").
-        err "BLOCKED: unrecognized flag '$1' before the package name"
-        err "  safe run replaces npx/bunx/uvx; runner-native flags are not forwarded"
-        err "  accepted: --no-install/--no (local bin only), -q/--quiet/--silent (dropped)"
-        err "  to run: safe run <pkg>[@<version>] [-- args...]"
-        err "  agent contract: safe explain"
-        audit_log "$(runner_label_for_kind)" "unknown@unknown" "REJECTED" "$(context_label)" "UNRECOGNIZED_FLAG" "flag=$1"
-        exit 100
+        refuse_unrecognized_runner_flag "$1"
         ;;
       *)
         positional+=("$1"); package_seen=1; shift
