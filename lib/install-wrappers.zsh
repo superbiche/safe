@@ -570,6 +570,124 @@ safe_install_local_bin_exists() {
   done
 }
 
+# Locate the real subcommand token, skipping any leading GLOBAL flags a tool
+# accepts before its command (`npm --loglevel=error install evil`,
+# `yarn --cwd sub add evil`, `pnpm --filter x dlx cmd`). Without this the
+# wrappers read the subcommand as $1 and a leading flag slips the whole gate.
+#
+# Sets SAFE_INSTALL_SUBCMD (token, "" if none) and SAFE_INSTALL_SUBCMD_IDX
+# (1-based index in "$@", 0 if none). Returns 0 on success (subcommand found
+# or genuinely absent), 2 fail-closed on an ambiguous unrecognized space-form
+# flag (SAFE_INSTALL_SUBCMD_BADFLAG names it).
+#
+# Classification discipline (both directions can bypass, so correctness — not
+# completeness — is load-bearing):
+# - `=`-form flags (`--x=y`) are unambiguous → always skipped.
+# - <val_alt>: flags KNOWN to take a space-form value → skip flag + its value.
+#   A boolean wrongly listed here eats the real subcommand → bypass.
+# - <bool_alt>: flags KNOWN to take NO value → skip flag only.
+#   A value-taker wrongly listed here exposes its value as the subcommand →
+#   bypass.
+# - Any OTHER space-form dash flag is ambiguous → FAIL CLOSED (return 2),
+#   escapable by rewriting as `--flag=value`. So gaps in either list merely
+#   over-refuse; only MISCLASSIFICATION bypasses. Lists validated per tool
+#   against its --help and are load-bearing.
+safe_install_locate_subcommand() {
+  local val_alt="$1" bool_alt="$2"; shift 2
+  local arg i=0 skip=0 boolval=0
+  SAFE_INSTALL_SUBCMD=""; SAFE_INSTALL_SUBCMD_IDX=0; SAFE_INSTALL_SUBCMD_BADFLAG=""
+  for arg in "$@"; do
+    i=$((i + 1))
+    if (( skip )); then skip=0; continue; fi
+    if (( boolval )); then
+      boolval=0
+      # A bare true/false immediately after a boolean flag is that flag's
+      # explicit space-form value: npm/pnpm config booleans accept it
+      # (`npm --global false install ...` means --global=false, subcommand
+      # install). Consume it. This can never swallow a real subcommand — no
+      # gated subcommand is named true/false — so it is safe on every tool;
+      # any OTHER token here is the subcommand or next flag → fall through.
+      case "${arg:l}" in
+        true|false) continue ;;
+      esac
+    fi
+    case "${arg}" in
+      --)
+        # Options terminated: the next token, if any, is the subcommand.
+        if (( i < $# )); then
+          SAFE_INSTALL_SUBCMD="${@[i+1]}"; SAFE_INSTALL_SUBCMD_IDX=$((i + 1))
+        fi
+        return 0 ;;
+      --*=*|-*=*) continue ;;
+      ${~val_alt}) skip=1; continue ;;
+      ${~bool_alt}) boolval=1; continue ;;
+      -?*) SAFE_INSTALL_SUBCMD_BADFLAG="${arg}"; return 2 ;;
+      *) SAFE_INSTALL_SUBCMD="${arg}"; SAFE_INSTALL_SUBCMD_IDX=$i; return 0 ;;
+    esac
+  done
+  return 0
+}
+
+# Per-tool leading-global-flag tables (val|bool), kept deliberately small: a
+# gap only over-refuses (fail-closed, escapable via =form); a MISclassified
+# flag bypasses. `go` accepts no pre-command flags → empty tables (any leading
+# flag fails closed, matching go's own grammar).
+safe_install_global_flags() {
+  case "$1" in
+    npm)
+      SAFE_INSTALL_GVAL='--loglevel|--prefix|--cache|--registry|--userconfig|--globalconfig|--workspace|-w|--script-shell|--node-options|--omit|--include|--tag'
+      SAFE_INSTALL_GBOOL='-q|--quiet|--silent|-d|-dd|-ddd|--verbose|--global|-g|--foreground-scripts|--no-fund|--no-audit|--offline|--prefer-offline|--prefer-online|--ignore-scripts|--workspaces|--include-workspace-root|--no-workspaces|--no-color|--json' ;;
+    pnpm)
+      # --config is a no-value switch on `pnpm add` (configurational deps),
+      # NOT a value-taker — keep it out of GVAL or it eats the subcommand.
+      SAFE_INSTALL_GVAL='--filter|-F|--dir|-C|--reporter|--workspace-concurrency'
+      SAFE_INSTALL_GBOOL='-w|--workspace-root|-r|--recursive|--stream|--silent|--no-color|--global|-g|--aggregate-output|--config' ;;
+    bun)
+      # bun's --cwd/--config/-c are EQUALS-ONLY (`--config=<val>`); bun does
+      # not consume a following space-form token, so they must not sit in the
+      # space-form value table (that would eat the subcommand). The =form is
+      # covered by the generic --*=* skip; bare space-form fails closed.
+      SAFE_INSTALL_GVAL=''
+      SAFE_INSTALL_GBOOL='--silent|--global|-g|--no-cache|--no-progress' ;;
+    yarn)
+      SAFE_INSTALL_GVAL='--cwd|--registry|--modules-folder|--cache-folder|--mutex|--network-timeout|--network-concurrency|--proxy|--https-proxy'
+      SAFE_INSTALL_GBOOL='--verbose|--silent|-s|--offline|--prefer-offline|--no-progress|--json|--flat|--force|--ignore-scripts|--non-interactive|--no-lockfile|--frozen-lockfile' ;;
+    pip|pip3)
+      # --use-feature takes a value (e.g. fast-deps) — GVAL, not GBOOL.
+      SAFE_INSTALL_GVAL='--log|--proxy|--retries|--timeout|--cache-dir|--python|--index-url|-i|--cert|--client-cert|--use-feature'
+      SAFE_INSTALL_GBOOL='-q|--quiet|-v|-vv|-vvv|--verbose|--isolated|--no-input|--no-color|--require-virtualenv|--no-cache-dir|--disable-pip-version-check' ;;
+    uv)
+      SAFE_INSTALL_GVAL='--cache-dir|--config-file|--directory|--project|--color'
+      SAFE_INSTALL_GBOOL='--offline|-q|--quiet|-v|--verbose|--native-tls|--no-cache|-n|--no-progress|--no-config' ;;
+    cargo)
+      SAFE_INSTALL_GVAL='--color|--config|-Z|-C'
+      SAFE_INSTALL_GBOOL='-v|--verbose|-q|--quiet|--offline|--frozen|--locked' ;;
+    composer)
+      SAFE_INSTALL_GVAL='-d|--working-dir'
+      SAFE_INSTALL_GBOOL='-v|-vv|-vvv|--verbose|-q|--quiet|-n|--no-interaction|--profile|--no-plugins|--no-scripts|--ansi|--no-ansi|-h|--help|-V|--version' ;;
+    volta)
+      SAFE_INSTALL_GVAL=''
+      SAFE_INSTALL_GBOOL='-v|--verbose|-q|--quiet' ;;
+    go|*)
+      SAFE_INSTALL_GVAL=''
+      SAFE_INSTALL_GBOOL='' ;;
+  esac
+}
+
+# Resolve the subcommand for <tool> over "$@"; on ambiguity print the legible
+# fail-closed refusal and return 100 so the caller can `|| return $?`.
+safe_install_route() {
+  local tool="$1"; shift
+  safe_install_global_flags "${tool}"
+  safe_install_locate_subcommand "${SAFE_INSTALL_GVAL}" "${SAFE_INSTALL_GBOOL}" "$@"
+  case $? in
+    2)
+      print -u2 -- "safe: BLOCKED ${tool} — cannot find the subcommand past unrecognized flag '${SAFE_INSTALL_SUBCMD_BADFLAG}'; to allow: rewrite it as '${SAFE_INSTALL_SUBCMD_BADFLAG}=<value>', then retry; details: safe explain"
+      return 100 ;;
+  esac
+  return 0
+}
+
 # Gate exec-style invocations that can fetch and run registry packages
 # (npm exec/x, bun x, pnpm dlx, yarn dlx, uv tool run). Audits every package
 # the invocation would fetch, then the caller delegates to the real tool.
@@ -705,8 +823,10 @@ safe_install_exec_gate() {
 safe_install_npm_like() {
   local tool="$1"
   shift
-  local subcommand="${1:-}"
-  local -a raw packages
+  safe_install_route "${tool}" "$@" || return $?
+  local subcommand="${SAFE_INSTALL_SUBCMD}"
+  local -a rest raw packages
+  rest=("${@:$((SAFE_INSTALL_SUBCMD_IDX + 1))}")
   local parser="safe_install_${tool}_packages"
   local raw_package
   local project_present=1
@@ -720,7 +840,7 @@ safe_install_npm_like() {
         '-c|--call|-w|--workspace|--cache|--prefix|--registry|--userconfig|--globalconfig|--loglevel|--script-shell|--node-options|--omit|--include' \
         '-y|--yes|--no|--offline|--prefer-offline|--prefer-online|--ignore-existing|--foreground-scripts|--silent|--quiet|--workspaces|--include-workspace-root' \
         '' \
-        "${@:2}" || return $?
+        "${rest[@]}" || return $?
       safe_install_real "${tool}" "$@"
       return $?
       ;;
@@ -729,7 +849,7 @@ safe_install_npm_like() {
         '--package|-p' '' '' \
         '--bun|--silent|--no-install|--verbose' \
         '' \
-        "${@:2}" || return $?
+        "${rest[@]}" || return $?
       safe_install_real "${tool}" "$@"
       return $?
       ;;
@@ -739,7 +859,7 @@ safe_install_npm_like() {
         '--allow-build|--reporter' \
         '-c|--shell-mode|--silent|-s' \
         '' \
-        "${@:2}" || return $?
+        "${rest[@]}" || return $?
       safe_install_real "${tool}" "$@"
       return $?
       ;;
@@ -751,7 +871,7 @@ safe_install_npm_like() {
   esac
 
   if safe_install_has_arg "-g" "$@" || safe_install_has_arg "--global" "$@"; then
-    raw=("${(@f)$(${parser} "${@:2}")}")
+    raw=("${(@f)$(${parser} "${rest[@]}")}")
     packages=()
     for raw_package in "${raw[@]}"; do
       [[ -n "${raw_package}" ]] && packages+=("$(safe_install_npm_spec "${raw_package}")")
@@ -775,7 +895,7 @@ safe_install_npm_like() {
     safe_install_scan_project || return $?
   fi
 
-  raw=("${(@f)$(${parser} "${@:2}")}")
+  raw=("${(@f)$(${parser} "${rest[@]}")}")
   packages=()
   for raw_package in "${raw[@]}"; do
     [[ -n "${raw_package}" ]] && packages+=("$(safe_install_npm_spec "${raw_package}")")
@@ -794,68 +914,93 @@ safe_install_npm_like() {
 # Without the guard a partial load dies with a silent 127 mid-function and
 # agents read it as a broken toolchain. The guard refuses install/exec-ish
 # subcommands legibly (exit 100) and passes everything else to the real tool.
-# It must stay inlined — a shared guard helper could be stripped too.
+# It must stay inlined — a shared guard helper could be stripped too. Each
+# guard scans EVERY token (not just $1) for its gated keywords so a leading
+# global flag can't hide the subcommand in degraded mode either; this is
+# conservative (may over-refuse a positional literally named like a
+# subcommand) but never under-refuses. yarn (bare/flags-only installs) and go
+# (run <mod>@<ver>) need slightly different inline shapes, noted at each.
 
 npm() {
   if ! typeset -f safe_install_npm_like safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      install|i|it|install-test|add|ci|exec|x|u|update|up|upgrade|udpate)
-        print -u2 -- "safe: BLOCKED npm ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      *) command npm "$@"; return $? ;;
-    esac
+    # Degraded mode can't run the leading-flag resolver (helpers stripped), so
+    # it scans EVERY token for a gated subcommand — a gated keyword is always
+    # present regardless of leading flags, so a leading flag can no longer hide
+    # it. Conservative: may over-refuse (e.g. a positional literally named
+    # "install"); never under-refuses a real install/exec.
+    local __a
+    for __a in "$@"; do
+      case "${__a}" in
+        install|i|it|install-test|add|ci|exec|x|u|update|up|upgrade|udpate)
+          print -u2 -- "safe: BLOCKED npm ${__a} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+      esac
+    done
+    command npm "$@"; return $?
   fi
   safe_install_npm_like npm "$@"
 }
 
 pnpm() {
   if ! typeset -f safe_install_npm_like safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      install|i|add|ci|dlx|update|up|upgrade)
-        print -u2 -- "safe: BLOCKED pnpm ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      *) command pnpm "$@"; return $? ;;
-    esac
+    local __a
+    for __a in "$@"; do
+      case "${__a}" in
+        install|i|add|ci|dlx|update|up|upgrade)
+          print -u2 -- "safe: BLOCKED pnpm ${__a} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+      esac
+    done
+    command pnpm "$@"; return $?
   fi
   safe_install_npm_like pnpm "$@"
 }
 
 bun() {
   if ! typeset -f safe_install_npm_like safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      install|i|add|ci|x|update)
-        print -u2 -- "safe: BLOCKED bun ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      *) command bun "$@"; return $? ;;
-    esac
+    local __a
+    for __a in "$@"; do
+      case "${__a}" in
+        install|i|add|ci|x|update)
+          print -u2 -- "safe: BLOCKED bun ${__a} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+      esac
+    done
+    command bun "$@"; return $?
   fi
   safe_install_npm_like bun "$@"
 }
 
 yarn() {
   if ! typeset -f safe_install_yarn_packages safe_install_check >/dev/null 2>&1; then
+    # yarn is the one tool where a bare or flags-only invocation installs, so a
+    # positional-scan is not enough (`yarn --cwd sub` installs with no gated
+    # keyword). Conservative rule: refuse when the first token is absent, a
+    # leading flag (can't parse safely without helpers), or a gated keyword.
     case "${1:-}" in
-      ""|install|add|global|dlx|up|upgrade|upgrade-interactive)
+      ""|-*|install|add|global|dlx|up|upgrade|upgrade-interactive)
         print -u2 -- "safe: BLOCKED yarn ${1:-install} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
       *) command yarn "$@"; return $? ;;
     esac
   fi
-  local first="${1:-}"
-  local second="${2:-}"
+  safe_install_route yarn "$@" || return $?
+  local first="${SAFE_INSTALL_SUBCMD}"
+  local subidx=$SAFE_INSTALL_SUBCMD_IDX
+  local second="${@[subidx+1]:-}"
   local -a raw packages
   local raw_package
 
   if [[ "${first}" == "dlx" ]]; then
     safe_install_exec_gate "yarn dlx" npm 0 0 \
       '--package|-p' '' '' '-q|--quiet' '' \
-      "${@:2}" || return $?
+      "${@:$((subidx + 1))}" || return $?
     safe_install_real yarn "$@"
     return $?
   fi
 
   if [[ "${first}" == "global" && ( "${second}" == "add" || "${second}" == "upgrade" ) ]]; then
-    raw=("${(@f)$(safe_install_yarn_packages "${@:3}")}")
+    raw=("${(@f)$(safe_install_yarn_packages "${@:$((subidx + 2))}")}")
     packages=()
     for raw_package in "${raw[@]}"; do
       [[ -n "${raw_package}" ]] && packages+=("$(safe_install_npm_spec "${raw_package}")")
@@ -876,7 +1021,7 @@ yarn() {
       fi
 
       if [[ "${first}" == "add" || "${first}" == "up" || "${first}" == "upgrade" ]]; then
-        raw=("${(@f)$(safe_install_yarn_packages "${@:2}")}")
+        raw=("${(@f)$(safe_install_yarn_packages "${@:$((subidx + 1))}")}")
         packages=()
         for raw_package in "${raw[@]}"; do
           [[ -n "${raw_package}" ]] && packages+=("$(safe_install_npm_spec "${raw_package}")")
@@ -936,18 +1081,20 @@ safe_install_python_packages() {
 safe_install_pip_like() {
   local tool="$1"
   shift
-  local subcommand="${1:-}"
+  safe_install_route "${tool}" "$@" || return $?
+  local subcommand="${SAFE_INSTALL_SUBCMD}"
+  local subidx=$SAFE_INSTALL_SUBCMD_IDX
   local -a packages
 
   [[ "${subcommand}" == "install" || "${subcommand}" == "upgrade" ]] || { safe_install_real "${tool}" "$@"; return $?; }
 
-  if safe_install_pip_project_install "${@:2}"; then
+  if safe_install_pip_project_install "${@:$((subidx + 1))}"; then
     safe_install_scan_project || return $?
     safe_install_real "${tool}" "$@"
     return $?
   fi
 
-  packages=("${(@f)$(safe_install_python_packages "${@:2}")}")
+  packages=("${(@f)$(safe_install_python_packages "${@:$((subidx + 1))}")}")
   if (( $? != 0 || ${#packages[@]} == 0 )); then
     safe_install_real "${tool}" "$@"
     return $?
@@ -959,51 +1106,62 @@ safe_install_pip_like() {
 
 pip() {
   if ! typeset -f safe_install_pip_like safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      install|upgrade)
-        print -u2 -- "safe: BLOCKED pip ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      *) command pip "$@"; return $? ;;
-    esac
+    local __a
+    for __a in "$@"; do
+      case "${__a}" in
+        install|upgrade)
+          print -u2 -- "safe: BLOCKED pip ${__a} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+      esac
+    done
+    command pip "$@"; return $?
   fi
   safe_install_pip_like pip "$@"
 }
 
 pip3() {
   if ! typeset -f safe_install_pip_like safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      install|upgrade)
-        print -u2 -- "safe: BLOCKED pip3 ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      *) command pip3 "$@"; return $? ;;
-    esac
+    local __a
+    for __a in "$@"; do
+      case "${__a}" in
+        install|upgrade)
+          print -u2 -- "safe: BLOCKED pip3 ${__a} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+      esac
+    done
+    command pip3 "$@"; return $?
   fi
   safe_install_pip_like pip3 "$@"
 }
 
 uv() {
   if ! typeset -f safe_install_python_packages safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      sync|add|tool|pip)
-        print -u2 -- "safe: BLOCKED uv ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      run)
-        # --with/-w and --with-requirements pull registry packages. Degraded
-        # mode can't parse the command boundary safely, so it is conservative:
-        # any such token anywhere refuses (may over-refuse a program's own
-        # --with arg; it never under-refuses a real fetch).
-        # `-w`, `-w=pkg`, and `-wpkg` are all short --with forms uv accepts.
-        if [[ " ${*} " == *" --with "* || " ${*} " == *" --with="* || " ${*} " == *" -w"* || \
-              " ${*} " == *" --with-requirements "* || " ${*} " == *" --with-requirements="* ]]; then
-          print -u2 -- "safe: BLOCKED uv run --with — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-          return 100
-        fi
-        command uv "$@"; return $? ;;
-      *) command uv "$@"; return $? ;;
-    esac
+    # Scan every token for a gated subcommand so a leading global flag can't
+    # hide it (`uv --offline tool run x`). `tool` covers tool run/install.
+    local __a
+    for __a in "$@"; do
+      case "${__a}" in
+        sync|add|tool|pip)
+          print -u2 -- "safe: BLOCKED uv ${__a} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+      esac
+    done
+    # uv run --with/-w and --with-requirements pull registry packages. Degraded
+    # mode can't parse the command boundary safely, so it is conservative: any
+    # such token anywhere refuses (may over-refuse a program's own --with; it
+    # never under-refuses a real fetch). `-w`, `-w=pkg`, `-wpkg` are short
+    # --with forms uv accepts.
+    if [[ " ${*} " == *" --with "* || " ${*} " == *" --with="* || " ${*} " == *" -w"* || \
+          " ${*} " == *" --with-requirements "* || " ${*} " == *" --with-requirements="* ]]; then
+      print -u2 -- "safe: BLOCKED uv run --with — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+      return 100
+    fi
+    command uv "$@"; return $?
   fi
-  local first="${1:-}"
-  local second="${2:-}"
+  safe_install_route uv "$@" || return $?
+  local first="${SAFE_INSTALL_SUBCMD}"
+  local subidx=$SAFE_INSTALL_SUBCMD_IDX
+  local second="${@[subidx+1]:-}"
   local -a packages
 
   if [[ "${first}" == "sync" ]]; then
@@ -1028,7 +1186,7 @@ uv() {
     local uv_val='--python|-p|--with-editable|--index|--index-url|--extra-index-url|--default-index|--constraint|-c|--index-strategy|--keyring-provider|--resolution|--prerelease|--exclude-newer|--config-setting|--refresh-package|--group|--only-group|--no-group|--extra|--no-extra|--project|--directory|--python-preference'
     local uv_bool='--frozen|--locked|--no-sync|--offline|--isolated|--no-project|--all-extras|--no-dev|--dev|--only-dev|--no-default-groups|--all-groups|--refresh|--reinstall|--upgrade|--all-packages|--no-editable|--exact|--inexact|--no-binary|--no-build|--compile-bytecode|--no-compile-bytecode|--native-tls|--no-cache|-n|-q|--quiet|-v|--verbose|--managed-python|--no-managed-python|--script|-s|-m|--module'
     with_specs=()
-    for run_arg in "${@:2}"; do
+    for run_arg in "${@:$((subidx + 1))}"; do
       if (( expect_with )); then
         with_specs+=("${run_arg}")
         expect_with=0
@@ -1077,13 +1235,13 @@ uv() {
       '--python|-p|--with-editable|--index|--index-url|--extra-index-url|--default-index|--constraint|-c|--index-strategy|--keyring-provider|--resolution|--prerelease|--exclude-newer|--config-setting|--refresh-package' \
       '--offline|--isolated|--system|--no-project|--refresh|--reinstall|--upgrade|-q|--quiet|-v|--verbose|--native-tls|--no-cache|-n' \
       '--with-requirements' \
-      "${@:3}" || return $?
+      "${@:$((subidx + 2))}" || return $?
     safe_install_real uv "$@"
     return $?
   fi
 
   if [[ "${first}" == "tool" && "${second}" == "install" ]]; then
-    packages=("${(@f)$(safe_install_python_packages "${@:3}")}")
+    packages=("${(@f)$(safe_install_python_packages "${@:$((subidx + 2))}")}")
     if (( $? != 0 || ${#packages[@]} == 0 )); then
       safe_install_real uv "$@"
       return $?
@@ -1095,13 +1253,13 @@ uv() {
   fi
 
   if [[ "${first}" == "pip" && "${second}" == "install" ]]; then
-    if safe_install_pip_project_install "${@:3}"; then
+    if safe_install_pip_project_install "${@:$((subidx + 2))}"; then
       safe_install_scan_project || return $?
       safe_install_real uv "$@"
       return $?
     fi
 
-    packages=("${(@f)$(safe_install_python_packages "${@:3}")}")
+    packages=("${(@f)$(safe_install_python_packages "${@:$((subidx + 2))}")}")
     if (( $? != 0 || ${#packages[@]} == 0 )); then
       safe_install_real uv "$@"
       return $?
@@ -1117,14 +1275,19 @@ uv() {
 
 cargo() {
   if ! typeset -f safe_install_cargo_packages safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      install)
-        print -u2 -- "safe: BLOCKED cargo ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      *) command cargo "$@"; return $? ;;
-    esac
+    local __a
+    for __a in "$@"; do
+      case "${__a}" in
+        install)
+          print -u2 -- "safe: BLOCKED cargo ${__a} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+      esac
+    done
+    command cargo "$@"; return $?
   fi
-  local subcommand="${1:-}"
+  safe_install_route cargo "$@" || return $?
+  local subcommand="${SAFE_INSTALL_SUBCMD}"
+  local subidx=$SAFE_INSTALL_SUBCMD_IDX
   local -a packages
 
   if [[ "${subcommand}" != "install" ]]; then
@@ -1146,7 +1309,7 @@ cargo() {
     return $?
   fi
 
-  packages=("${(@f)$(safe_install_cargo_packages "${@:2}")}")
+  packages=("${(@f)$(safe_install_cargo_packages "${@:$((subidx + 1))}")}")
   if (( ${#packages[@]} > 0 )); then
     safe_install_check_many cargo "${packages[@]}" || return $?
   fi
@@ -1156,25 +1319,29 @@ cargo() {
 
 go() {
   if ! typeset -f safe_install_go_packages safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      install)
-        print -u2 -- "safe: BLOCKED go ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      run)
-        # Only remote module@version fetches. Degraded mode can't parse the
-        # run target safely, so it is conservative: any '@' in the args
-        # refuses (may over-refuse a local run whose program args contain @;
-        # it never under-refuses a real module@version fetch).
-        if [[ "${*}" == *@* ]]; then
-          print -u2 -- "safe: BLOCKED go run — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-          return 100
-        fi
-        command go "$@"; return $? ;;
-      *) command go "$@"; return $? ;;
-    esac
+    # Scan every token: `go install` (any position) and `go run <mod>@<ver>`
+    # fetch. `go get` stays out of scope (its fetch runs no code), so the '@'
+    # check is scoped to a `run` present — not any '@' anywhere.
+    local __a __has_run=0 __has_at=0
+    for __a in "$@"; do
+      case "${__a}" in
+        install)
+          print -u2 -- "safe: BLOCKED go install — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+        run) __has_run=1 ;;
+        *@*) __has_at=1 ;;
+      esac
+    done
+    if (( __has_run && __has_at )); then
+      print -u2 -- "safe: BLOCKED go run — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+      return 100
+    fi
+    command go "$@"; return $?
   fi
-  local subcommand="${1:-}"
-  local second="${2:-}"
+  safe_install_route go "$@" || return $?
+  local subcommand="${SAFE_INSTALL_SUBCMD}"
+  local subidx=$SAFE_INSTALL_SUBCMD_IDX
+  local second="${@[subidx+1]:-}"
   local -a packages
 
   if [[ "${subcommand}" == "run" ]]; then
@@ -1188,7 +1355,7 @@ go() {
     local run_arg run_target="" run_skip_next=0
     local go_val='-C|-p|-asmflags|-buildmode|-compiler|-covermode|-coverpkg|-gccgoflags|-gcflags|-installsuffix|-ldflags|-mod|-modfile|-overlay|-pgo|-pkgdir|-tags|-toolexec|-exec'
     local go_bool='-a|-n|-race|-msan|-asan|-cover|-v|-work|-x|-i|-linkshared|-modcacherw|-trimpath|-buildvcs|-json'
-    for run_arg in "${@:2}"; do
+    for run_arg in "${@:$((subidx + 1))}"; do
       if (( run_skip_next )); then
         run_skip_next=0
         continue
@@ -1229,7 +1396,7 @@ go() {
     return $?
   fi
 
-  packages=("${(@f)$(safe_install_go_packages "${@:2}")}") || {
+  packages=("${(@f)$(safe_install_go_packages "${@:$((subidx + 1))}")}") || {
     safe_install_real go "$@"
     return $?
   }
@@ -1243,15 +1410,20 @@ go() {
 
 composer() {
   if ! typeset -f safe_install_composer_packages safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      install|update|require|global)
-        print -u2 -- "safe: BLOCKED composer ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      *) command composer "$@"; return $? ;;
-    esac
+    local __a
+    for __a in "$@"; do
+      case "${__a}" in
+        install|update|require|global)
+          print -u2 -- "safe: BLOCKED composer ${__a} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+      esac
+    done
+    command composer "$@"; return $?
   fi
-  local first="${1:-}"
-  local second="${2:-}"
+  safe_install_route composer "$@" || return $?
+  local first="${SAFE_INSTALL_SUBCMD}"
+  local subidx=$SAFE_INSTALL_SUBCMD_IDX
+  local second="${@[subidx+1]:-}"
   local -a packages
 
   if [[ "${first}" != "global" || "${second}" != "require" ]]; then
@@ -1261,7 +1433,7 @@ composer() {
       fi
 
       if [[ "${first}" == "require" ]]; then
-        packages=("${(@f)$(safe_install_composer_packages "${@:2}")}")
+        packages=("${(@f)$(safe_install_composer_packages "${@:$((subidx + 1))}")}")
         if (( ${#packages[@]} > 0 )); then
           safe_install_check_many composer "${packages[@]}" || return $?
         fi
@@ -1272,7 +1444,7 @@ composer() {
     return $?
   fi
 
-  packages=("${(@f)$(safe_install_composer_packages "${@:3}")}")
+  packages=("${(@f)$(safe_install_composer_packages "${@:$((subidx + 2))}")}")
   if (( ${#packages[@]} > 0 )); then
     safe_install_check_many composer "${packages[@]}" || return $?
   fi
@@ -1282,14 +1454,19 @@ composer() {
 
 volta() {
   if ! typeset -f safe_install_volta_packages safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      install)
-        print -u2 -- "safe: BLOCKED volta ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      *) command volta "$@"; return $? ;;
-    esac
+    local __a
+    for __a in "$@"; do
+      case "${__a}" in
+        install)
+          print -u2 -- "safe: BLOCKED volta ${__a} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+      esac
+    done
+    command volta "$@"; return $?
   fi
-  local subcommand="${1:-}"
+  safe_install_route volta "$@" || return $?
+  local subcommand="${SAFE_INSTALL_SUBCMD}"
+  local subidx=$SAFE_INSTALL_SUBCMD_IDX
   local -a packages
   local -a raw
   local raw_package
@@ -1299,7 +1476,7 @@ volta() {
     return $?
   fi
 
-  raw=("${(@f)$(safe_install_volta_packages "${@:2}")}")
+  raw=("${(@f)$(safe_install_volta_packages "${@:$((subidx + 1))}")}")
   packages=()
   for raw_package in "${raw[@]}"; do
     [[ -n "${raw_package}" ]] && packages+=("$(safe_install_npm_spec "${raw_package}")")

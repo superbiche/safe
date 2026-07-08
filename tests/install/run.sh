@@ -251,6 +251,37 @@ case_degraded_non_install_passes_through() {
   pass "$FUNCNAME"
 }
 
+case_degraded_leading_flag_still_blocks() {
+  prepare_case "degraded-leading-flag-still-blocks"
+  # Degraded mode scans all tokens, so a leading global flag no longer hides
+  # the gated subcommand (round-3 review High).
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm --loglevel error install -g blockme" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}pnpm --filter=web dlx cowsay" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv --offline tool run cowsay" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}yarn --cwd sub add left-pad" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}go -C dir install evil@v1" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_degraded_leading_flag_benign_passes() {
+  prepare_case "degraded-leading-flag-benign-passes"
+  # A non-gated command with a leading flag (and no gated keyword token) still
+  # passes through in degraded mode — version/help must not be refused.
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm --version" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\t--version' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}go get example.com/x@v1" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tgo\tget\texample.com/x@v1' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_refusal_message_contract() {
   prepare_case "refusal-message-contract"
   SAFE_INSTALL_TEST_SCRIPT='npm install -g warnme@1.0.0' run_zsh
@@ -331,6 +362,154 @@ case_npm_exec_parent_walk_resists_shadowing() {
   assert_status 104 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_leading_global_flag_gates_npm_install() {
+  prepare_case "leading-global-flag-gates-npm-install"
+  # The inbox bypass: a leading global flag made the subcommand read as the
+  # flag, so `install` slipped the gate. =form and space-form both gate now.
+  SAFE_INSTALL_TEST_SCRIPT='npm --loglevel=error install -g blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='npm --loglevel error install -g blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_leading_global_flag_gates_pnpm_dlx() {
+  prepare_case "leading-global-flag-gates-pnpm-dlx"
+  SAFE_INSTALL_TEST_SCRIPT='pnpm --filter=web dlx blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_leading_global_flag_gates_yarn_add() {
+  prepare_case "leading-global-flag-gates-yarn-add"
+  # The verbatim inbox shape: yarn --cwd <dir> add <pkg>.
+  SAFE_INSTALL_TEST_SCRIPT='yarn --cwd sub add blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tyarn' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_leading_global_flag_gates_uv_tool_run() {
+  prepare_case "leading-global-flag-gates-uv-tool-run"
+  SAFE_INSTALL_TEST_SCRIPT='uv --offline tool run blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_value_flag_consumes_its_value() {
+  prepare_case "value-flag-consumes-its-value"
+  # A known value-taking leading flag must skip its value so the real
+  # subcommand is still found. `install` here happens to also be a plausible
+  # value; the resolver must not stop on it.
+  SAFE_INSTALL_TEST_SCRIPT='npm --registry https://r.example install -g blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_unknown_leading_flag_fails_closed() {
+  prepare_case "unknown-leading-flag-fails-closed"
+  # An unrecognized space-form leading flag is ambiguous → refuse (exit 100),
+  # never silently pass the command through unaudited.
+  SAFE_INSTALL_TEST_SCRIPT='npm --totally-unknown-flag value install -g blockme' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'cannot find the subcommand' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe explain' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_unknown_leading_flag_eqform_escapes() {
+  prepare_case "unknown-leading-flag-eqform-escapes"
+  # The =form of an unknown flag is unambiguous → the gate proceeds and the
+  # real install is still audited.
+  SAFE_INSTALL_TEST_SCRIPT='npm --totally-unknown-flag=value install -g blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_leading_flag_benign_command_passes() {
+  prepare_case "leading-flag-benign-command-passes"
+  # A non-gated subcommand behind a known leading flag still passes through.
+  SAFE_INSTALL_TEST_SCRIPT='npm --loglevel=error run build' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\t--loglevel=error\trun\tbuild' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_optional_boolean_explicit_value_gates() {
+  prepare_case "optional-boolean-explicit-value-gates"
+  # npm/pnpm config booleans accept an explicit space-form true/false
+  # (npm --global false install ...). The value must be consumed so the real
+  # subcommand is still found and gated (review round 1 High 1/High 3).
+  SAFE_INSTALL_TEST_SCRIPT='npm --global false install blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='npm --workspaces false install blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='pnpm --recursive false add blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_optional_boolean_without_value_still_gates() {
+  prepare_case "optional-boolean-without-value-still-gates"
+  # The common form (no explicit value): the subcommand directly follows the
+  # boolean flag and must not be consumed as a value.
+  SAFE_INSTALL_TEST_SCRIPT='npm --global install blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_pnpm_config_switch_not_value() {
+  prepare_case "pnpm-config-switch-not-value"
+  # --config is a no-value switch on `pnpm add`; misclassifying it as a value
+  # flag ate the `add` subcommand and bypassed the gate (review round 1 High 2).
+  SAFE_INSTALL_TEST_SCRIPT='pnpm --config add blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_pip_use_feature_takes_value() {
+  prepare_case "pip-use-feature-takes-value"
+  # --use-feature takes a value; misclassifying it as boolean exposed the
+  # value as the subcommand and bypassed the gate (review round 1 High 4).
+  SAFE_INSTALL_TEST_SCRIPT='pip --use-feature fast-deps install blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tpip' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_bun_equals_only_flag_not_space_value() {
+  prepare_case "bun-equals-only-flag-not-space-value"
+  # bun --config/--cwd/-c are equals-only; the space form must not be treated
+  # as a value flag (it would eat the subcommand). =form still works; bare
+  # space form fails closed (review round 2 High).
+  SAFE_INSTALL_TEST_SCRIPT='bun --config add blockme' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'cannot find the subcommand' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tbun' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='bun --config=bunfig.toml add blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -1099,10 +1278,25 @@ main() {
     case_degraded_exec_blocks_legibly \
     case_degraded_alias_subcommands_block \
     case_degraded_non_install_passes_through \
+    case_degraded_leading_flag_still_blocks \
+    case_degraded_leading_flag_benign_passes \
     case_refusal_message_contract \
     case_npm_exec_fetch_audits \
     case_npm_exec_local_bin_passthrough \
     case_npm_exec_versioned_spec_audits_despite_local_bin \
+    case_leading_global_flag_gates_npm_install \
+    case_leading_global_flag_gates_pnpm_dlx \
+    case_leading_global_flag_gates_yarn_add \
+    case_leading_global_flag_gates_uv_tool_run \
+    case_value_flag_consumes_its_value \
+    case_unknown_leading_flag_fails_closed \
+    case_unknown_leading_flag_eqform_escapes \
+    case_leading_flag_benign_command_passes \
+    case_optional_boolean_explicit_value_gates \
+    case_optional_boolean_without_value_still_gates \
+    case_pnpm_config_switch_not_value \
+    case_pip_use_feature_takes_value \
+    case_bun_equals_only_flag_not_space_value \
     case_npm_exec_hoisted_parent_bin_passthrough \
     case_npm_exec_parent_walk_resists_shadowing \
     case_npm_exec_package_flag_blocks \
