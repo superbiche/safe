@@ -914,48 +914,71 @@ safe_install_npm_like() {
 # Without the guard a partial load dies with a silent 127 mid-function and
 # agents read it as a broken toolchain. The guard refuses install/exec-ish
 # subcommands legibly (exit 100) and passes everything else to the real tool.
-# It must stay inlined — a shared guard helper could be stripped too.
+# It must stay inlined — a shared guard helper could be stripped too. Each
+# guard scans EVERY token (not just $1) for its gated keywords so a leading
+# global flag can't hide the subcommand in degraded mode either; this is
+# conservative (may over-refuse a positional literally named like a
+# subcommand) but never under-refuses. yarn (bare/flags-only installs) and go
+# (run <mod>@<ver>) need slightly different inline shapes, noted at each.
 
 npm() {
   if ! typeset -f safe_install_npm_like safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      install|i|it|install-test|add|ci|exec|x|u|update|up|upgrade|udpate)
-        print -u2 -- "safe: BLOCKED npm ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      *) command npm "$@"; return $? ;;
-    esac
+    # Degraded mode can't run the leading-flag resolver (helpers stripped), so
+    # it scans EVERY token for a gated subcommand — a gated keyword is always
+    # present regardless of leading flags, so a leading flag can no longer hide
+    # it. Conservative: may over-refuse (e.g. a positional literally named
+    # "install"); never under-refuses a real install/exec.
+    local __a
+    for __a in "$@"; do
+      case "${__a}" in
+        install|i|it|install-test|add|ci|exec|x|u|update|up|upgrade|udpate)
+          print -u2 -- "safe: BLOCKED npm ${__a} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+      esac
+    done
+    command npm "$@"; return $?
   fi
   safe_install_npm_like npm "$@"
 }
 
 pnpm() {
   if ! typeset -f safe_install_npm_like safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      install|i|add|ci|dlx|update|up|upgrade)
-        print -u2 -- "safe: BLOCKED pnpm ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      *) command pnpm "$@"; return $? ;;
-    esac
+    local __a
+    for __a in "$@"; do
+      case "${__a}" in
+        install|i|add|ci|dlx|update|up|upgrade)
+          print -u2 -- "safe: BLOCKED pnpm ${__a} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+      esac
+    done
+    command pnpm "$@"; return $?
   fi
   safe_install_npm_like pnpm "$@"
 }
 
 bun() {
   if ! typeset -f safe_install_npm_like safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      install|i|add|ci|x|update)
-        print -u2 -- "safe: BLOCKED bun ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      *) command bun "$@"; return $? ;;
-    esac
+    local __a
+    for __a in "$@"; do
+      case "${__a}" in
+        install|i|add|ci|x|update)
+          print -u2 -- "safe: BLOCKED bun ${__a} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+      esac
+    done
+    command bun "$@"; return $?
   fi
   safe_install_npm_like bun "$@"
 }
 
 yarn() {
   if ! typeset -f safe_install_yarn_packages safe_install_check >/dev/null 2>&1; then
+    # yarn is the one tool where a bare or flags-only invocation installs, so a
+    # positional-scan is not enough (`yarn --cwd sub` installs with no gated
+    # keyword). Conservative rule: refuse when the first token is absent, a
+    # leading flag (can't parse safely without helpers), or a gated keyword.
     case "${1:-}" in
-      ""|install|add|global|dlx|up|upgrade|upgrade-interactive)
+      ""|-*|install|add|global|dlx|up|upgrade|upgrade-interactive)
         print -u2 -- "safe: BLOCKED yarn ${1:-install} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
         return 100 ;;
       *) command yarn "$@"; return $? ;;
@@ -1083,48 +1106,57 @@ safe_install_pip_like() {
 
 pip() {
   if ! typeset -f safe_install_pip_like safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      install|upgrade)
-        print -u2 -- "safe: BLOCKED pip ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      *) command pip "$@"; return $? ;;
-    esac
+    local __a
+    for __a in "$@"; do
+      case "${__a}" in
+        install|upgrade)
+          print -u2 -- "safe: BLOCKED pip ${__a} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+      esac
+    done
+    command pip "$@"; return $?
   fi
   safe_install_pip_like pip "$@"
 }
 
 pip3() {
   if ! typeset -f safe_install_pip_like safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      install|upgrade)
-        print -u2 -- "safe: BLOCKED pip3 ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      *) command pip3 "$@"; return $? ;;
-    esac
+    local __a
+    for __a in "$@"; do
+      case "${__a}" in
+        install|upgrade)
+          print -u2 -- "safe: BLOCKED pip3 ${__a} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+      esac
+    done
+    command pip3 "$@"; return $?
   fi
   safe_install_pip_like pip3 "$@"
 }
 
 uv() {
   if ! typeset -f safe_install_python_packages safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      sync|add|tool|pip)
-        print -u2 -- "safe: BLOCKED uv ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      run)
-        # --with/-w and --with-requirements pull registry packages. Degraded
-        # mode can't parse the command boundary safely, so it is conservative:
-        # any such token anywhere refuses (may over-refuse a program's own
-        # --with arg; it never under-refuses a real fetch).
-        # `-w`, `-w=pkg`, and `-wpkg` are all short --with forms uv accepts.
-        if [[ " ${*} " == *" --with "* || " ${*} " == *" --with="* || " ${*} " == *" -w"* || \
-              " ${*} " == *" --with-requirements "* || " ${*} " == *" --with-requirements="* ]]; then
-          print -u2 -- "safe: BLOCKED uv run --with — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-          return 100
-        fi
-        command uv "$@"; return $? ;;
-      *) command uv "$@"; return $? ;;
-    esac
+    # Scan every token for a gated subcommand so a leading global flag can't
+    # hide it (`uv --offline tool run x`). `tool` covers tool run/install.
+    local __a
+    for __a in "$@"; do
+      case "${__a}" in
+        sync|add|tool|pip)
+          print -u2 -- "safe: BLOCKED uv ${__a} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+      esac
+    done
+    # uv run --with/-w and --with-requirements pull registry packages. Degraded
+    # mode can't parse the command boundary safely, so it is conservative: any
+    # such token anywhere refuses (may over-refuse a program's own --with; it
+    # never under-refuses a real fetch). `-w`, `-w=pkg`, `-wpkg` are short
+    # --with forms uv accepts.
+    if [[ " ${*} " == *" --with "* || " ${*} " == *" --with="* || " ${*} " == *" -w"* || \
+          " ${*} " == *" --with-requirements "* || " ${*} " == *" --with-requirements="* ]]; then
+      print -u2 -- "safe: BLOCKED uv run --with — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+      return 100
+    fi
+    command uv "$@"; return $?
   fi
   safe_install_route uv "$@" || return $?
   local first="${SAFE_INSTALL_SUBCMD}"
@@ -1243,12 +1275,15 @@ uv() {
 
 cargo() {
   if ! typeset -f safe_install_cargo_packages safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      install)
-        print -u2 -- "safe: BLOCKED cargo ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      *) command cargo "$@"; return $? ;;
-    esac
+    local __a
+    for __a in "$@"; do
+      case "${__a}" in
+        install)
+          print -u2 -- "safe: BLOCKED cargo ${__a} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+      esac
+    done
+    command cargo "$@"; return $?
   fi
   safe_install_route cargo "$@" || return $?
   local subcommand="${SAFE_INSTALL_SUBCMD}"
@@ -1284,22 +1319,24 @@ cargo() {
 
 go() {
   if ! typeset -f safe_install_go_packages safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      install)
-        print -u2 -- "safe: BLOCKED go ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      run)
-        # Only remote module@version fetches. Degraded mode can't parse the
-        # run target safely, so it is conservative: any '@' in the args
-        # refuses (may over-refuse a local run whose program args contain @;
-        # it never under-refuses a real module@version fetch).
-        if [[ "${*}" == *@* ]]; then
-          print -u2 -- "safe: BLOCKED go run — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-          return 100
-        fi
-        command go "$@"; return $? ;;
-      *) command go "$@"; return $? ;;
-    esac
+    # Scan every token: `go install` (any position) and `go run <mod>@<ver>`
+    # fetch. `go get` stays out of scope (its fetch runs no code), so the '@'
+    # check is scoped to a `run` present — not any '@' anywhere.
+    local __a __has_run=0 __has_at=0
+    for __a in "$@"; do
+      case "${__a}" in
+        install)
+          print -u2 -- "safe: BLOCKED go install — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+        run) __has_run=1 ;;
+        *@*) __has_at=1 ;;
+      esac
+    done
+    if (( __has_run && __has_at )); then
+      print -u2 -- "safe: BLOCKED go run — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+      return 100
+    fi
+    command go "$@"; return $?
   fi
   safe_install_route go "$@" || return $?
   local subcommand="${SAFE_INSTALL_SUBCMD}"
@@ -1373,12 +1410,15 @@ go() {
 
 composer() {
   if ! typeset -f safe_install_composer_packages safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      install|update|require|global)
-        print -u2 -- "safe: BLOCKED composer ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      *) command composer "$@"; return $? ;;
-    esac
+    local __a
+    for __a in "$@"; do
+      case "${__a}" in
+        install|update|require|global)
+          print -u2 -- "safe: BLOCKED composer ${__a} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+      esac
+    done
+    command composer "$@"; return $?
   fi
   safe_install_route composer "$@" || return $?
   local first="${SAFE_INSTALL_SUBCMD}"
@@ -1414,12 +1454,15 @@ composer() {
 
 volta() {
   if ! typeset -f safe_install_volta_packages safe_install_check >/dev/null 2>&1; then
-    case "${1:-}" in
-      install)
-        print -u2 -- "safe: BLOCKED volta ${1} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
-        return 100 ;;
-      *) command volta "$@"; return $? ;;
-    esac
+    local __a
+    for __a in "$@"; do
+      case "${__a}" in
+        install)
+          print -u2 -- "safe: BLOCKED volta ${__a} — safe install wrappers are partially loaded (helpers stripped by shell snapshot); ask the operator to run this in a regular terminal; details: safe explain"
+          return 100 ;;
+      esac
+    done
+    command volta "$@"; return $?
   fi
   safe_install_route volta "$@" || return $?
   local subcommand="${SAFE_INSTALL_SUBCMD}"

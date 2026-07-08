@@ -251,6 +251,37 @@ case_degraded_non_install_passes_through() {
   pass "$FUNCNAME"
 }
 
+case_degraded_leading_flag_still_blocks() {
+  prepare_case "degraded-leading-flag-still-blocks"
+  # Degraded mode scans all tokens, so a leading global flag no longer hides
+  # the gated subcommand (round-3 review High).
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm --loglevel error install -g blockme" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}pnpm --filter=web dlx cowsay" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv --offline tool run cowsay" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}yarn --cwd sub add left-pad" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}go -C dir install evil@v1" run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_degraded_leading_flag_benign_passes() {
+  prepare_case "degraded-leading-flag-benign-passes"
+  # A non-gated command with a leading flag (and no gated keyword token) still
+  # passes through in degraded mode — version/help must not be refused.
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm --version" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\t--version' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}go get example.com/x@v1" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tgo\tget\texample.com/x@v1' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_refusal_message_contract() {
   prepare_case "refusal-message-contract"
   SAFE_INSTALL_TEST_SCRIPT='npm install -g warnme@1.0.0' run_zsh
@@ -1247,6 +1278,8 @@ main() {
     case_degraded_exec_blocks_legibly \
     case_degraded_alias_subcommands_block \
     case_degraded_non_install_passes_through \
+    case_degraded_leading_flag_still_blocks \
+    case_degraded_leading_flag_benign_passes \
     case_refusal_message_contract \
     case_npm_exec_fetch_audits \
     case_npm_exec_local_bin_passthrough \
