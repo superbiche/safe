@@ -340,3 +340,116 @@ pass "secret-like files block non-tty sandbox unless allowed"
 help_output="$("$SAFE_RUN" --help)"
 grep -q 'safe audit' <<<"$help_output" || fail "help omits safe audit integration"
 pass "help documents safe audit integration"
+
+# ---------------------------------------------------------------------------
+# npx-native flag handling and local-bin passthrough (hermes false positive)
+# ---------------------------------------------------------------------------
+
+localbin_proj="$tmp/proj-local-bin"
+mkdir -p "$localbin_proj/node_modules/.bin"
+cat > "$localbin_proj/node_modules/.bin/lint-staged" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$LOCAL_BIN_CALL_LOG"
+exit 0
+SH
+chmod +x "$localbin_proj/node_modules/.bin/lint-staged"
+
+# Verbatim hermes/api husky invocation: local bin runs, args forwarded, exit 0.
+set +e
+(
+  cd "$localbin_proj"
+  SAFE_RUN_CONFIG_DIR="$tmp/config-localbin" \
+  SAFE_RUN_DATA_DIR="$tmp/data-localbin" \
+  LOCAL_BIN_CALL_LOG="$tmp/local-bin-call.log" \
+    "$SAFE_RUN" --no-install lint-staged --config .tooling/lint-staged.config.cjs
+) </dev/null >/dev/null 2>"$tmp/localbin.err"
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] || fail "hermes husky invocation failed rc=$rc: $(cat "$tmp/localbin.err")"
+grep -q -- '--config .tooling/lint-staged.config.cjs' "$tmp/local-bin-call.log" || fail "local bin did not receive its args"
+grep -q 'LOCAL_BIN' "$tmp/data-localbin/audit.log" || fail "local-bin audit entry missing"
+pass "npx --no-install <local pkg> runs local bin (hermes regression)"
+
+# Cosmetic flags are dropped; local bin still runs.
+set +e
+(
+  cd "$localbin_proj"
+  SAFE_RUN_CONFIG_DIR="$tmp/config-localbin-quiet" \
+  SAFE_RUN_DATA_DIR="$tmp/data-localbin-quiet" \
+  LOCAL_BIN_CALL_LOG="$tmp/local-bin-quiet-call.log" \
+    "$SAFE_RUN" -q --silent lint-staged
+) </dev/null >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] || fail "-q/--silent were not dropped (rc=$rc)"
+[[ -s "$tmp/local-bin-quiet-call.log" ]] || fail "local bin not called after cosmetic flags"
+pass "cosmetic npx flags (-q/--silent) are dropped"
+
+# --no-install without a local bin refuses legibly with exit 100 (never fetches).
+set +e
+SAFE_RUN_CONFIG_DIR="$tmp/config-noinstall-miss" \
+SAFE_RUN_DATA_DIR="$tmp/data-noinstall-miss" \
+  "$SAFE_RUN" --no-install definitely-not-installed-xyz </dev/null >/dev/null 2>"$tmp/noinstall-miss.err"
+rc=$?
+set -e
+[[ "$rc" -eq 100 ]] || fail "--no-install without local bin expected rc=100, got $rc"
+grep -q 'BLOCKED' "$tmp/noinstall-miss.err" || fail "--no-install refusal not BLOCKED-formatted"
+grep -q 'node_modules/.bin' "$tmp/noinstall-miss.err" || fail "--no-install refusal not actionable"
+pass "--no-install without local bin refuses with exit 100"
+
+# Unknown runner-native flag fails closed with exit 100, not bogus 103.
+set +e
+SAFE_RUN_CONFIG_DIR="$tmp/config-unknown-flag" \
+SAFE_RUN_DATA_DIR="$tmp/data-unknown-flag" \
+  "$SAFE_RUN" --loglevel=error lint-staged </dev/null >/dev/null 2>"$tmp/unknown-flag.err"
+rc=$?
+set -e
+[[ "$rc" -eq 100 ]] || fail "unknown flag expected rc=100, got $rc"
+grep -q "unrecognized flag '--loglevel=error'" "$tmp/unknown-flag.err" || fail "unknown-flag refusal not legible"
+grep -q 'safe explain' "$tmp/unknown-flag.err" || fail "unknown-flag refusal missing safe explain pointer"
+pass "unknown runner flag fails closed with exit 100 (not 103)"
+
+# npm-exec selector/context flags are refused explicitly.
+set +e
+SAFE_RUN_CONFIG_DIR="$tmp/config-package-flag" \
+SAFE_RUN_DATA_DIR="$tmp/data-package-flag" \
+  "$SAFE_RUN" --package=cowsay moo </dev/null >/dev/null 2>"$tmp/package-flag.err"
+rc=$?
+set -e
+[[ "$rc" -eq 100 ]] || fail "--package= expected rc=100, got $rc"
+grep -q 'not supported through safe run' "$tmp/package-flag.err" || fail "--package refusal not legible"
+pass "npm exec selector flags (--package) refuse with exit 100"
+
+# A versioned spec never uses the local bin: it stays in the audit pipeline
+# (here: unknown + non-TTY => exit 102) and the local stub must not run.
+set +e
+(
+  cd "$localbin_proj"
+  SAFE_RUN_CONFIG_DIR="$tmp/config-versioned" \
+  SAFE_RUN_DATA_DIR="$tmp/data-versioned" \
+  LOCAL_BIN_CALL_LOG="$tmp/local-bin-versioned-call.log" \
+    "$SAFE_RUN" lint-staged@1.0.0
+) </dev/null >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 102 ]] || fail "versioned spec with local bin expected rc=102, got $rc"
+[[ ! -e "$tmp/local-bin-versioned-call.log" ]] || fail "versioned spec executed the local bin"
+pass "versioned spec bypasses local bin and stays in the audit pipeline"
+
+# Blocklist beats the local bin.
+mkdir -p "$tmp/config-blocked-local"
+printf '{"packages":{"lint-staged":{"reason":"fixture block"}}}' > "$tmp/config-blocked-local/blocked.json"
+set +e
+(
+  cd "$localbin_proj"
+  SAFE_RUN_CONFIG_DIR="$tmp/config-blocked-local" \
+  SAFE_RUN_DATA_DIR="$tmp/data-blocked-local" \
+  LOCAL_BIN_CALL_LOG="$tmp/local-bin-blocked-call.log" \
+    "$SAFE_RUN" lint-staged
+) </dev/null >/dev/null 2>"$tmp/blocked-local.err"
+rc=$?
+set -e
+[[ "$rc" -eq 100 ]] || fail "blocked package with local bin expected rc=100, got $rc"
+[[ ! -e "$tmp/local-bin-blocked-call.log" ]] || fail "blocked package executed the local bin"
+grep -q 'fixture block' "$tmp/blocked-local.err" || fail "blocklist reason missing from refusal"
+pass "blocklist wins over local-bin passthrough"

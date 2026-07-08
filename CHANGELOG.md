@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Fix a false positive that broke husky-era pre-commit hooks: `npx
+  --no-install lint-staged ...` was parsed with the flag as the package name
+  and refused as exit 103 "invalid package name". Runner-native flags are now
+  handled explicitly: `--no-install`/`--no` run the local
+  `./node_modules/.bin` binary or refuse legibly (modern npx ignores the flag
+  and fetches anyway; `safe run` restores its never-fetch meaning),
+  `-q`/`--quiet`/`--silent` are dropped, npm-exec selector flags
+  (`--package`, `-c`, workspace flags) refuse with exit 100, and any other
+  unrecognized flag before the package fails closed with a legible exit-100
+  refusal instead of a bogus 103.
+- Add a local-bin decision tier to `safe run` (npx/bunx): a bare, unversioned
+  name backed by `./node_modules/.bin` runs the already-installed local
+  binary directly with no fetch, mirroring the install-wrapper rule. The
+  blocklist still wins, and versioned or scoped specs stay in the audit
+  pipeline.
 - Gate exec-style fetch-and-run subcommands in healthy wrappers: `npm
   exec|x`, `pnpm dlx`, `yarn dlx`, `bun x`, `uv run --with|-w`, `uv tool
   run`, and `go run <module>@<version>` now audit the named package via
