@@ -418,6 +418,55 @@ case_leading_flag_benign_command_passes() {
   pass "$FUNCNAME"
 }
 
+case_optional_boolean_explicit_value_gates() {
+  prepare_case "optional-boolean-explicit-value-gates"
+  # npm/pnpm config booleans accept an explicit space-form true/false
+  # (npm --global false install ...). The value must be consumed so the real
+  # subcommand is still found and gated (review round 1 High 1/High 3).
+  SAFE_INSTALL_TEST_SCRIPT='npm --global false install blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='npm --workspaces false install blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='pnpm --recursive false add blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_optional_boolean_without_value_still_gates() {
+  prepare_case "optional-boolean-without-value-still-gates"
+  # The common form (no explicit value): the subcommand directly follows the
+  # boolean flag and must not be consumed as a value.
+  SAFE_INSTALL_TEST_SCRIPT='npm --global install blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_pnpm_config_switch_not_value() {
+  prepare_case "pnpm-config-switch-not-value"
+  # --config is a no-value switch on `pnpm add`; misclassifying it as a value
+  # flag ate the `add` subcommand and bypassed the gate (review round 1 High 2).
+  SAFE_INSTALL_TEST_SCRIPT='pnpm --config add blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_pip_use_feature_takes_value() {
+  prepare_case "pip-use-feature-takes-value"
+  # --use-feature takes a value; misclassifying it as boolean exposed the
+  # value as the subcommand and bypassed the gate (review round 1 High 4).
+  SAFE_INSTALL_TEST_SCRIPT='pip --use-feature fast-deps install blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tpip' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_npm_exec_package_flag_blocks() {
   prepare_case "npm-exec-package-flag-blocks"
   SAFE_INSTALL_TEST_SCRIPT='npm exec --package=blockme -- create' run_zsh
@@ -1195,6 +1244,10 @@ main() {
     case_unknown_leading_flag_fails_closed \
     case_unknown_leading_flag_eqform_escapes \
     case_leading_flag_benign_command_passes \
+    case_optional_boolean_explicit_value_gates \
+    case_optional_boolean_without_value_still_gates \
+    case_pnpm_config_switch_not_value \
+    case_pip_use_feature_takes_value \
     case_npm_exec_hoisted_parent_bin_passthrough \
     case_npm_exec_parent_walk_resists_shadowing \
     case_npm_exec_package_flag_blocks \

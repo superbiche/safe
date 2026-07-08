@@ -594,11 +594,23 @@ safe_install_local_bin_exists() {
 #   against its --help and are load-bearing.
 safe_install_locate_subcommand() {
   local val_alt="$1" bool_alt="$2"; shift 2
-  local arg i=0 skip=0
+  local arg i=0 skip=0 boolval=0
   SAFE_INSTALL_SUBCMD=""; SAFE_INSTALL_SUBCMD_IDX=0; SAFE_INSTALL_SUBCMD_BADFLAG=""
   for arg in "$@"; do
     i=$((i + 1))
     if (( skip )); then skip=0; continue; fi
+    if (( boolval )); then
+      boolval=0
+      # A bare true/false immediately after a boolean flag is that flag's
+      # explicit space-form value: npm/pnpm config booleans accept it
+      # (`npm --global false install ...` means --global=false, subcommand
+      # install). Consume it. This can never swallow a real subcommand — no
+      # gated subcommand is named true/false — so it is safe on every tool;
+      # any OTHER token here is the subcommand or next flag → fall through.
+      case "${arg:l}" in
+        true|false) continue ;;
+      esac
+    fi
     case "${arg}" in
       --)
         # Options terminated: the next token, if any, is the subcommand.
@@ -608,7 +620,7 @@ safe_install_locate_subcommand() {
         return 0 ;;
       --*=*|-*=*) continue ;;
       ${~val_alt}) skip=1; continue ;;
-      ${~bool_alt}) continue ;;
+      ${~bool_alt}) boolval=1; continue ;;
       -?*) SAFE_INSTALL_SUBCMD_BADFLAG="${arg}"; return 2 ;;
       *) SAFE_INSTALL_SUBCMD="${arg}"; SAFE_INSTALL_SUBCMD_IDX=$i; return 0 ;;
     esac
@@ -626,8 +638,10 @@ safe_install_global_flags() {
       SAFE_INSTALL_GVAL='--loglevel|--prefix|--cache|--registry|--userconfig|--globalconfig|--workspace|-w|--script-shell|--node-options|--omit|--include|--tag'
       SAFE_INSTALL_GBOOL='-q|--quiet|--silent|-d|-dd|-ddd|--verbose|--global|-g|--foreground-scripts|--no-fund|--no-audit|--offline|--prefer-offline|--prefer-online|--ignore-scripts|--workspaces|--include-workspace-root|--no-workspaces|--no-color|--json' ;;
     pnpm)
-      SAFE_INSTALL_GVAL='--filter|-F|--dir|-C|--reporter|--config|--workspace-concurrency'
-      SAFE_INSTALL_GBOOL='-w|--workspace-root|-r|--recursive|--stream|--silent|--no-color|--global|-g|--aggregate-output' ;;
+      # --config is a no-value switch on `pnpm add` (configurational deps),
+      # NOT a value-taker — keep it out of GVAL or it eats the subcommand.
+      SAFE_INSTALL_GVAL='--filter|-F|--dir|-C|--reporter|--workspace-concurrency'
+      SAFE_INSTALL_GBOOL='-w|--workspace-root|-r|--recursive|--stream|--silent|--no-color|--global|-g|--aggregate-output|--config' ;;
     bun)
       SAFE_INSTALL_GVAL='--cwd|--config|-c'
       SAFE_INSTALL_GBOOL='--silent|--global|-g|--no-cache|--no-progress' ;;
@@ -635,8 +649,9 @@ safe_install_global_flags() {
       SAFE_INSTALL_GVAL='--cwd|--registry|--modules-folder|--cache-folder|--mutex|--network-timeout|--network-concurrency|--proxy|--https-proxy'
       SAFE_INSTALL_GBOOL='--verbose|--silent|-s|--offline|--prefer-offline|--no-progress|--json|--flat|--force|--ignore-scripts|--non-interactive|--no-lockfile|--frozen-lockfile' ;;
     pip|pip3)
-      SAFE_INSTALL_GVAL='--log|--proxy|--retries|--timeout|--cache-dir|--python|--index-url|-i|--cert|--client-cert'
-      SAFE_INSTALL_GBOOL='-q|--quiet|-v|-vv|-vvv|--verbose|--isolated|--no-input|--no-color|--require-virtualenv|--no-cache-dir|--disable-pip-version-check|--use-feature' ;;
+      # --use-feature takes a value (e.g. fast-deps) — GVAL, not GBOOL.
+      SAFE_INSTALL_GVAL='--log|--proxy|--retries|--timeout|--cache-dir|--python|--index-url|-i|--cert|--client-cert|--use-feature'
+      SAFE_INSTALL_GBOOL='-q|--quiet|-v|-vv|-vvv|--verbose|--isolated|--no-input|--no-color|--require-virtualenv|--no-cache-dir|--disable-pip-version-check' ;;
     uv)
       SAFE_INSTALL_GVAL='--cache-dir|--config-file|--directory|--project|--color'
       SAFE_INSTALL_GBOOL='--offline|-q|--quiet|-v|--verbose|--native-tls|--no-cache|-n|--no-progress|--no-config' ;;
