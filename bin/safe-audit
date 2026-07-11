@@ -3549,7 +3549,19 @@ socket_score_json() {
     printf '{"available":false,"status":"skipped","note":"socket CLI not available"}\n' > "$output"
     return 0
   fi
-  if ! "$socket_cmd" package score "$ecosystem" "$spec" --json > "$output.raw" 2>"$output.stderr"; then
+  # Socket needs SOCKET_SECURITY_API_TOKEN for authenticated package scores.
+  # Interactive shells get it from the socket() zsh wrapper, but safe invokes
+  # the CLI binary directly — inject it from Bitwarden via bw-env-run when the
+  # helper and its mapping file exist and the token is not already in the env.
+  local -a socket_invocation=("$socket_cmd")
+  if [[ -z "${SOCKET_SECURITY_API_TOKEN:-}" ]]; then
+    local bw_env_run socket_mapping="$HOME/.config/setup-new-machines/bw-env.d/socket.env"
+    bw_env_run=$(PATH="$HOME/.local/bin:$PATH" command -v bw-env-run 2>/dev/null || true)
+    if [[ -n "$bw_env_run" && -f "$socket_mapping" ]]; then
+      socket_invocation=("$bw_env_run" --file "$socket_mapping" -- "$socket_cmd")
+    fi
+  fi
+  if ! "${socket_invocation[@]}" package score "$ecosystem" "$spec" --json > "$output.raw" 2>"$output.stderr"; then
     local note
     note=$(jq -r '[.message?, .data?] | map(select(. != null and . != "")) | join(" ")' "$output.raw" 2>/dev/null | tr '\n' ' ' || true)
     [[ -n "$note" ]] || note=$(jq -r '[.message?, .data?] | map(select(. != null and . != "")) | join(" ")' "$output.stderr" 2>/dev/null | tr '\n' ' ' || true)
