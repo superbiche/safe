@@ -3553,19 +3553,37 @@ socket_score_json() {
   # Interactive shells get it from the socket() zsh wrapper, but safe invokes
   # the CLI binary directly — inject it from Bitwarden via bw-env-run when the
   # helper and its mapping file exist and the token is not already in the env.
+  local bw_env_run socket_mapping="$HOME/.config/setup-new-machines/bw-env.d/socket.env"
+  bw_env_run=$(PATH="$HOME/.local/bin:$PATH" command -v bw-env-run 2>/dev/null || true)
+  local can_inject=false
+  [[ -n "$bw_env_run" && -f "$socket_mapping" ]] && can_inject=true
+
   local -a socket_invocation=("$socket_cmd")
-  if [[ -z "${SOCKET_SECURITY_API_TOKEN:-}" ]]; then
-    local bw_env_run socket_mapping="$HOME/.config/setup-new-machines/bw-env.d/socket.env"
-    bw_env_run=$(PATH="$HOME/.local/bin:$PATH" command -v bw-env-run 2>/dev/null || true)
-    if [[ -n "$bw_env_run" && -f "$socket_mapping" ]]; then
-      socket_invocation=("$bw_env_run" --file "$socket_mapping" -- "$socket_cmd")
-    fi
+  local injected=false
+  if [[ -z "${SOCKET_SECURITY_API_TOKEN:-}" && "$can_inject" == "true" ]]; then
+    socket_invocation=("$bw_env_run" --file "$socket_mapping" -- "$socket_cmd")
+    injected=true
   fi
   # stdin closed: stdout/stderr go to files, so any interactive prompt from the
   # invocation (socket itself, or bw-env-run's master-password fallback when the
   # session cache fails) would otherwise hang invisibly waiting on the terminal.
   # With EOF stdin those paths fail fast and the error lands in $output.stderr.
-  if ! "${socket_invocation[@]}" package score "$ecosystem" "$spec" --json > "$output.raw" 2>"$output.stderr" </dev/null; then
+  local score_ok=true
+  "${socket_invocation[@]}" package score "$ecosystem" "$spec" --json > "$output.raw" 2>"$output.stderr" </dev/null || score_ok=false
+
+  # An ambient SOCKET_SECURITY_API_TOKEN can be stale (e.g. a long-lived shell
+  # still exporting a pre-rotation value). If we trusted it and socket failed
+  # on auth, retry once with the vault-injected token.
+  if [[ "$score_ok" == "false" && "$injected" == "false" && "$can_inject" == "true" ]] \
+    && grep -qiE "token|api key|auth" "$output.raw" "$output.stderr" 2>/dev/null; then
+    if env -u SOCKET_SECURITY_API_TOKEN "$bw_env_run" --file "$socket_mapping" -- \
+      "$socket_cmd" package score "$ecosystem" "$spec" --json \
+      > "$output.raw" 2>"$output.stderr" </dev/null; then
+      score_ok=true
+    fi
+  fi
+
+  if [[ "$score_ok" == "false" ]]; then
     local note
     note=$(jq -r '[.message?, .data?] | map(select(. != null and . != "")) | join(" ")' "$output.raw" 2>/dev/null | tr '\n' ' ' || true)
     [[ -n "$note" ]] || note=$(jq -r '[.message?, .data?] | map(select(. != null and . != "")) | join(" ")' "$output.stderr" 2>/dev/null | tr '\n' ' ' || true)
