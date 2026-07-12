@@ -3585,8 +3585,11 @@ socket_score_json() {
 
   if [[ "$score_ok" == "false" ]]; then
     local note
-    note=$(jq -r '[.message?, .data?] | map(select(. != null and . != "")) | join(" ")' "$output.raw" 2>/dev/null | tr '\n' ' ' || true)
-    [[ -n "$note" ]] || note=$(jq -r '[.message?, .data?] | map(select(. != null and . != "")) | join(" ")' "$output.stderr" 2>/dev/null | tr '\n' ' ' || true)
+    # .cause carries the real reason (401 Unauthorized, 429 Too Many Requests,
+    # ...); .data can be an object, which would crash join(" ") and lose the
+    # note to the spinner text on stderr.
+    note=$(jq -r '[.message?, .cause?] | map(select(type == "string" and . != "")) | join(" — ")' "$output.raw" 2>/dev/null | tr '\n' ' ' || true)
+    [[ -n "$note" ]] || note=$(jq -r '[.message?, .cause?] | map(select(type == "string" and . != "")) | join(" — ")' "$output.stderr" 2>/dev/null | tr '\n' ' ' || true)
     [[ -n "$note" ]] || note=$(cat "$output.stderr" 2>/dev/null | tr '\n' ' ' || true)
     [[ -n "$note" ]] || note="socket command failed"
     printf '%s\n' "$(jq -n --arg note "$note" '{available:true,status:"error",note:$note}')" > "$output"
@@ -3679,7 +3682,10 @@ check_command() {
     local socket_note
     socket_note=$(jq -r '.note // "socket check failed"' "$socket_json" 2>/dev/null || printf 'socket check failed')
     case "$socket_note" in
-      *token*|*Token*|*API*) socket_line='WARN (socket authentication required)' ;;
+      # 429 first: its message never mentions auth, and a bare *API* match
+      # used to relabel any failure (even spinner text) as an auth problem
+      *"Too Many Requests"*|*" 429"*|*"rate limit"*) socket_line='WARN (socket rate-limited, retry later)' ;;
+      *Unauthorized*|*" 401"*|*token*|*Token*) socket_line='WARN (socket authentication required)' ;;
       *) socket_line='WARN (socket check failed)' ;;
     esac
     verdict="WARN"
