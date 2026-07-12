@@ -3561,7 +3561,11 @@ socket_score_json() {
       socket_invocation=("$bw_env_run" --file "$socket_mapping" -- "$socket_cmd")
     fi
   fi
-  if ! "${socket_invocation[@]}" package score "$ecosystem" "$spec" --json > "$output.raw" 2>"$output.stderr"; then
+  # stdin closed: stdout/stderr go to files, so any interactive prompt from the
+  # invocation (socket itself, or bw-env-run's master-password fallback when the
+  # session cache fails) would otherwise hang invisibly waiting on the terminal.
+  # With EOF stdin those paths fail fast and the error lands in $output.stderr.
+  if ! "${socket_invocation[@]}" package score "$ecosystem" "$spec" --json > "$output.raw" 2>"$output.stderr" </dev/null; then
     local note
     note=$(jq -r '[.message?, .data?] | map(select(. != null and . != "")) | join(" ")' "$output.raw" 2>/dev/null | tr '\n' ' ' || true)
     [[ -n "$note" ]] || note=$(jq -r '[.message?, .data?] | map(select(. != null and . != "")) | join(" ")' "$output.stderr" 2>/dev/null | tr '\n' ' ' || true)
