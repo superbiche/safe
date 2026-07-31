@@ -57,6 +57,17 @@ safe_install_run_audit() {
 # judged the wrong target (PR#29 review finding 3). Scan the original argv
 # (never inside a $() parser subshell: globals must survive) and thread the
 # values into the audit; safe-audit resolves with them or fails closed.
+# Source selectors are cumulative (pip considers --find-links AND the index):
+# accumulate every one — a later trusted selector must never erase an earlier
+# untrusted one (PR#29 delta-2 finding 3).
+safe_install_add_source() {
+  local value="$1"
+  case " ${SAFE_INSTALL_REGISTRY} " in
+    *" ${value} "*) return 0 ;;
+  esac
+  SAFE_INSTALL_REGISTRY="${SAFE_INSTALL_REGISTRY:+${SAFE_INSTALL_REGISTRY} }${value}"
+}
+
 safe_install_scan_target_flags() {
   local family="$1"
   shift
@@ -69,41 +80,41 @@ safe_install_scan_target_flags() {
       npm)
         case "${prev}" in
           --tag) SAFE_INSTALL_DIST_TAG="${arg}" ;;
-          --registry) SAFE_INSTALL_REGISTRY="${arg}" ;;
+          --registry) safe_install_add_source "${arg}" ;;
           --prefix|-C|--cwd|--dir) SAFE_INSTALL_PROJECT_DIR="${arg}" ;;
         esac
         case "${arg}" in
           --tag=*) SAFE_INSTALL_DIST_TAG="${arg#*=}" ;;
-          --registry=*) SAFE_INSTALL_REGISTRY="${arg#*=}" ;;
+          --registry=*) safe_install_add_source "${arg#*=}" ;;
           --prefix=*|--cwd=*|--dir=*) SAFE_INSTALL_PROJECT_DIR="${arg#*=}" ;;
         esac
         ;;
       python)
         case "${prev}" in
-          --index-url|-i|--extra-index-url|--default-index|--index) SAFE_INSTALL_REGISTRY="${arg}" ;;
-          --find-links|-f) SAFE_INSTALL_REGISTRY="local:find-links" ;;
+          --index-url|-i|--extra-index-url|--default-index|--index) safe_install_add_source "${arg}" ;;
+          --find-links|-f) safe_install_add_source "local:find-links" ;;
         esac
         case "${arg}" in
-          --index-url=*|--extra-index-url=*|--default-index=*|--index=*) SAFE_INSTALL_REGISTRY="${arg#*=}" ;;
-          --find-links=*) SAFE_INSTALL_REGISTRY="local:find-links" ;;
-          --no-index) SAFE_INSTALL_REGISTRY="local:no-index" ;;
+          --index-url=*|--extra-index-url=*|--default-index=*|--index=*) safe_install_add_source "${arg#*=}" ;;
+          --find-links=*) safe_install_add_source "local:find-links" ;;
+          --no-index) safe_install_add_source "local:no-index" ;;
         esac
         ;;
       cargo)
         case "${prev}" in
-          --registry|--index) SAFE_INSTALL_REGISTRY="${arg}" ;;
+          --registry|--index) safe_install_add_source "${arg}" ;;
         esac
         case "${arg}" in
-          --registry=*|--index=*) SAFE_INSTALL_REGISTRY="${arg#*=}" ;;
+          --registry=*|--index=*) safe_install_add_source "${arg#*=}" ;;
         esac
         ;;
       composer)
         case "${prev}" in
-          --repository) SAFE_INSTALL_REGISTRY="${arg}" ;;
+          --repository) safe_install_add_source "${arg}" ;;
           --working-dir|-d) SAFE_INSTALL_PROJECT_DIR="${arg}" ;;
         esac
         case "${arg}" in
-          --repository=*) SAFE_INSTALL_REGISTRY="${arg#*=}" ;;
+          --repository=*) safe_install_add_source "${arg#*=}" ;;
           --working-dir=*) SAFE_INSTALL_PROJECT_DIR="${arg#*=}" ;;
         esac
         ;;
@@ -163,8 +174,9 @@ safe_install_known_matches() {
 
   # Only fully clean GO evidence may satisfy the offline fallback — a
   # tolerated-WARN record is not clean evidence (PR#29 review finding 5).
-  entry="$(jq -r --arg k "${ecosystem}:${name}" --arg v "${version}" \
-    '.packages[$k] | select(.version == $v and .verdict == "GO") | .first_allowed // empty' "${known_file}" 2>/dev/null || true)"
+  local current_source="${SAFE_INSTALL_REGISTRY:-default}"
+  entry="$(jq -r --arg k "${ecosystem}:${name}" --arg v "${version}" --arg src "${current_source}" \
+    '.packages[$k] | select(.version == $v and .verdict == "GO" and ((.source // "default") == $src)) | .first_allowed // empty' "${known_file}" 2>/dev/null || true)"
   [[ -n "${entry}" ]] || return 1
 
   ttl_days="$(jq -r '.install.auto_allow_ttl_days // 30' \

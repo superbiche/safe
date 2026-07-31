@@ -3659,7 +3659,14 @@ osv_query_package_json() {
     if ! jq -e '
       (type == "object")
       and ((has("vulns") | not) or (.vulns | type == "array"))
-      and ((has("next_page_token") | not) or (.next_page_token | (type == "string") and (length > 0)))
+      and ((has("next_page_token") | not)
+           or (.next_page_token
+               | (type == "string") and (length > 0)
+               # Tokens travel through shell command substitution, which is
+               # lossy for whitespace/control characters (a "\n" token would
+               # strip to empty and read as end-of-pagination): only accept
+               # tokens that survive the trip intact.
+               and (test("^[[:graph:]]+$"))))
     ' "$output.raw" >/dev/null 2>&1; then
       printf '{"status":"error","note":"OSV response malformed","vulns":[]}\n' > "$output"
       return 0
@@ -3717,8 +3724,12 @@ def vparse:
        # comparison over (number|string) elements matches all three rules
        # (numbers sort before strings; arrays compare element-wise with
        # shorter-prefix-first) — a single lexical string did not
-       # (alpha.10 < alpha.2, PR#29 delta finding 4).
-       then ($p[1:] | join("-") | split(".") | map(tonumber? // .))
+       # (alpha.10 < alpha.2, PR#29 delta finding 4). Convert ONLY on the
+       # SemVer numeric grammar (0|[1-9][0-9]*): jq numbers are broader, so
+       # tonumber? would type "1e-2" numeric while npm treats it as
+       # alphanumeric (delta-2 finding 4).
+       then ($p[1:] | join("-") | split(".")
+             | map(if test("^(0|[1-9][0-9]*)$") then tonumber else . end))
        else []
        end];
 def vlt($a; $b): ($a | vparse) < ($b | vparse);
@@ -3738,9 +3749,11 @@ install_policy_json() {
 # of the same name@version.
 registry_is_trusted() {
   local url="${1%/}" ecosystem="$2"
+  # Origin-boundary matching only: a glob like pypi.org* would trust
+  # pypi.org.evil.example and https://pypi.org@evil.example (userinfo trick).
   case "${ecosystem}:${url}" in
     npm:https://registry.npmjs.org) return 0 ;;
-    python:https://pypi.org*) return 0 ;;
+    python:https://pypi.org|python:https://pypi.org/*) return 0 ;;
   esac
   local trusted
   while IFS= read -r trusted; do
@@ -3774,9 +3787,12 @@ version_is_exact() {
 npm_registry_url() {
   # Explicit --registry from the audited command line wins: auditing the
   # default registry while npm installs from another one audits the wrong
-  # artifact (PR#29 review finding 3).
+  # artifact (PR#29 review finding 3). Multiple accumulated sources: resolve
+  # via the first (the custom-source floor already covers the ambiguity).
   if [[ -n "${CHECK_REGISTRY:-}" ]]; then
-    printf '%s' "${CHECK_REGISTRY%/}"
+    local first_src
+    read -r first_src _ <<<"${CHECK_REGISTRY}"
+    printf '%s' "${first_src%/}"
     return 0
   fi
   if [[ -n "${NPM_CONFIG_REGISTRY:-}" ]]; then
@@ -4262,13 +4278,18 @@ revoke_install_known() {
 
 mark_install_known() {
   local ecosystem="$1" name="$2" version="$3" verdict="$4" reasons_json="$5" evidence="$6"
-  local tmp key
+  local tmp key source_id
   key="$ecosystem:$name"
+  # Evidence is scoped to the source it was gathered against: a receipt from
+  # the default registry must never satisfy a later custom-index request
+  # (delta-2 finding 5).
+  source_id="${CHECK_REGISTRY:-default}"
   mkdir -p "$SAFE_RUN_CONFIG_DIR"
   [[ -f "$INSTALL_KNOWN_FILE" ]] || printf '{"packages":{}}\n' > "$INSTALL_KNOWN_FILE"
   tmp=$(mktemp)
   jq --arg k "$key" --arg v "$version" --arg verdict "$verdict" \
     --argjson reasons "$reasons_json" --arg ev "$evidence" \
+    --arg src "$source_id" \
     --arg now "$(now_iso)" --arg d "$(today_date)" '
     (.packages[$k] // {}) as $old |
     .packages[$k] = {
@@ -4276,6 +4297,7 @@ mark_install_known() {
       verdict: $verdict,
       reasons: $reasons,
       evidence: $ev,
+      source: $src,
       first_allowed: (if ($old.version // "") == $v then ($old.first_allowed // $now) else $now end),
       last_used: $d,
       times_used: (if ($old.version // "") == $v then (($old.times_used // 0) + 1) else 1 end)
@@ -4525,14 +4547,20 @@ check_command() {
   # A custom source floors the verdict at WARN regardless of resolution or
   # exactness: OSV/Socket evidence covers the public registry identity, not
   # whatever a private index serves under that name@version (delta finding
-  # 3). Operator escape hatches: install.trusted_registries, or a pinned
+  # 3). CHECK_REGISTRY may carry MULTIPLE space-separated sources (pip/uv
+  # selectors are cumulative — a later trusted selector must never erase an
+  # earlier untrusted one, delta-2 finding 3): every source must be trusted.
+  # Operator escape hatches: install.trusted_registries, or a pinned
   # host-allow.
-  local custom_source=0
-  if [[ -n "$CHECK_REGISTRY" ]] && ! registry_is_trusted "$CHECK_REGISTRY" "$ecosystem"; then
-    custom_source=1
-    warn_causes+=("custom_source")
-    bump_verdict verdict "WARN"
-  fi
+  local custom_source=0 check_src
+  for check_src in ${CHECK_REGISTRY:-}; do
+    if ! registry_is_trusted "$check_src" "$ecosystem"; then
+      custom_source=1
+      warn_causes+=("custom_source")
+      bump_verdict verdict "WARN"
+      break
+    fi
+  done
 
   block_line="PASS (not blocked)"
   if block_reason=$(blocked_entry_reason "$PKG_NAME"); then
@@ -4633,11 +4661,19 @@ check_command() {
         gate_exit=0
         ;;
       WARN)
-        # Adverse ADVISORY knowledge supersedes recorded clean evidence
-        # BEFORE any override decides this one invocation (delta finding 5).
-        # Infra-only WARNs (socket outage, OSV outage) do not revoke: the
-        # stale-evidence fallback exists precisely for those windows.
-        if (( aff_count > 0 )) || [[ "$block_line" != PASS* ]]; then
+        # Adverse SECURITY knowledge (affecting advisory, blocklist hit, low
+        # Socket score) supersedes recorded clean evidence BEFORE any
+        # override decides this one invocation (delta finding 5).
+        # Enumerated pure-infrastructure WARNs (socket/OSV outage) do not
+        # revoke: the stale-evidence fallback exists precisely for those
+        # windows.
+        local adverse=0 adverse_cause
+        (( aff_count > 0 )) && adverse=1
+        [[ "$block_line" != PASS* ]] && adverse=1
+        for adverse_cause in ${warn_causes[@]+"${warn_causes[@]}"}; do
+          [[ "$adverse_cause" == "socket_low_score" ]] && adverse=1
+        done
+        if (( adverse )); then
           revoke_install_known "$ecosystem" "$PKG_NAME" "$primary_version" ${RESOLVED_VERSIONS[@]+"${RESOLVED_VERSIONS[@]}"}
         fi
         HOST_ALLOW_RESOLVED_VERSION=""

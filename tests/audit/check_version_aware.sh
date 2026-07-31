@@ -80,6 +80,7 @@ cat > "$MOCKBIN/socket" <<'MOCK'
 #!/usr/bin/env bash
 case "${MOCK_SOCKET_MODE:-ok}" in
   ok) printf '{"score": 95}\n'; exit 0 ;;
+  low) printf '{"score": 40}\n'; exit 0 ;;
   auth) printf '{"message":"Unauthorized","cause":"401 Unauthorized"}\n'; exit 1 ;;
   rate) printf '{"message":"Too Many Requests","cause":"429"}\n'; exit 1 ;;
   *) exit 1 ;;
@@ -851,6 +852,131 @@ if jq -e '.packages["npm:brace-expansion"] == null' "$CASE_RUN_CONFIG/install-kn
 else
   cat "$CASE_RUN_CONFIG/install-known.json" >&2
   fail "stale clean evidence is revoked even when host-allow overrides"
+fi
+
+
+# ---------------------------------------------------------------------------
+# 28. A whitespace-only pagination token is rejected, not read as completion
+# ---------------------------------------------------------------------------
+prepare_case pagination-ws-token
+PAGES="$CASE_DIR/pages"
+mkdir -p "$PAGES"
+printf '{"vulns": [], "next_page_token": "\n"}' > "$PAGES/page1.json"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_PAGES="$PAGES" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 10 "whitespace pagination token fails closed"; then
+  pass "whitespace pagination token fails closed"
+fi
+
+# ---------------------------------------------------------------------------
+# 29. jq-numeric-but-SemVer-alphanumeric prerelease ids ("1e-2") never let
+#     the resolver pick a version npm would reject
+# ---------------------------------------------------------------------------
+prepare_case semver-numeric-grammar
+cat > "$FIXTURES/packument-1e2.json" <<'JSON'
+{
+  "dist-tags": {"latest": "1.0.0-1e-2"},
+  "versions": {"1.0.0-1e-2": {}, "1.0.0-1": {}}
+}
+JSON
+printf '{"dependencies": {"demo-pkg": "<=1.0.0-1"}}\n' > "$CASE_PROJECT/package.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument-1e2.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- demo-pkg --ecosystem npm --op update --gate install
+if expect_status 10 "alphanumeric 1e-2 prerelease cannot satisfy a numeric bound"; then
+  pass "alphanumeric 1e-2 prerelease cannot satisfy a numeric bound"
+fi
+if expect_no_grep "$OUT_FILE" 'Resolved:.*1e-2' "the wrong tagged version is never audited as the target"; then
+  pass "the wrong tagged version is never audited as the target"
+fi
+
+# ---------------------------------------------------------------------------
+# 30. Trust matching is origin-bounded: pypi.org.evil.example is NOT PyPI
+# ---------------------------------------------------------------------------
+prepare_case evil-hostname
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --registry https://pypi.org.evil.example/simple --gate install
+if expect_status 10 "a pypi.org-prefixed attacker hostname is not trusted"; then
+  pass "a pypi.org-prefixed attacker hostname is not trusted"
+fi
+
+prepare_case real-pypi-trusted
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --registry https://pypi.org/simple --gate install
+if expect_status 0 "the real PyPI origin stays trusted"; then
+  pass "the real PyPI origin stays trusted"
+fi
+
+# ---------------------------------------------------------------------------
+# 31. Cumulative sources: one untrusted source floors even beside a trusted one
+# ---------------------------------------------------------------------------
+prepare_case multi-source
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --registry 'local:find-links https://pypi.org/simple' --gate install
+if expect_status 10 "an untrusted source in a cumulative set floors at WARN"; then
+  pass "an untrusted source in a cumulative set floors at WARN"
+fi
+
+# ---------------------------------------------------------------------------
+# 32. A low Socket score is adverse evidence: it revokes stale clean receipts
+# ---------------------------------------------------------------------------
+prepare_case low-score-revokes
+printf '{"packages": {"npm:brace-expansion": {"version": "2.1.4", "verdict": "GO", "reasons": [], "evidence": "x", "source": "default", "first_allowed": "2026-07-31T10:00:00+02:00", "last_used": "2026-07-31", "times_used": 1}}}\n' \
+  > "$CASE_RUN_CONFIG/install-known.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=low \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 10 "low socket score refuses"; then
+  pass "low socket score refuses"
+fi
+if jq -e '.packages["npm:brace-expansion"] == null' "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "low socket score revokes stale clean evidence"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2
+  fail "low socket score revokes stale clean evidence"
+fi
+
+# ---------------------------------------------------------------------------
+# 33. Receipts are source-scoped on write
+# ---------------------------------------------------------------------------
+prepare_case receipt-source-scope
+printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion --ecosystem npm --registry https://mirror.example --gate install
+if expect_status 0 "trusted mirror gates GO"; then
+  pass "trusted mirror gates GO"
+fi
+if jq -e '.packages["npm:brace-expansion"].source == "https://mirror.example"' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "receipt records the source it was gathered against"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2
+  fail "receipt records the source it was gathered against"
 fi
 
 # ---------------------------------------------------------------------------
