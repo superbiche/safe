@@ -562,7 +562,8 @@ if expect_grep "$OUT_FILE" 'Resolved:.*2\.1\.3' "--dist-tag beta audits the beta
 fi
 
 # ---------------------------------------------------------------------------
-# 14. --registry is used as the npm resolution source
+# 14. --registry is used as the npm resolution source, and an UNTRUSTED
+#     custom source floors at WARN even though resolution succeeded
 # ---------------------------------------------------------------------------
 prepare_case registry-flag
 fixture="$(osv_fixture_empty)"
@@ -572,8 +573,8 @@ run_check \
   MOCK_OSV_FIXTURE="$fixture" \
   MOCK_SOCKET_MODE=ok \
   -- brace-expansion --ecosystem npm --registry https://registry.example --gate install
-if expect_status 0 "--registry resolution gates GO"; then
-  pass "--registry resolution gates GO"
+if expect_status 10 "untrusted custom registry floors at WARN"; then
+  pass "untrusted custom registry floors at WARN"
 fi
 if expect_grep "$CASE_DIR/urls.log" '^https://registry\.example/brace-expansion$' "packument fetched from the command-line registry"; then
   pass "packument fetched from the command-line registry"
@@ -741,6 +742,115 @@ if jq -e '.verdict == "GO" and .resolution.status == "ok" and (.osv.classificati
 else
   cat "$OUT_FILE" >&2
   fail "check --json exposes resolution and classification"
+fi
+
+# ---------------------------------------------------------------------------
+# 22. Malformed pagination token shape must not read as zero advisories
+# ---------------------------------------------------------------------------
+prepare_case pagination-bad-token
+PAGES="$CASE_DIR/pages"
+mkdir -p "$PAGES"
+printf '{"next_page_token": false}' > "$PAGES/page1.json"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_PAGES="$PAGES" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 10 "non-string pagination token fails closed"; then
+  pass "non-string pagination token fails closed"
+fi
+
+# ---------------------------------------------------------------------------
+# 23. vparse orders SemVer prerelease identifiers per spec (unit-level)
+# ---------------------------------------------------------------------------
+sed '$d' "$SAFE_AUDIT" > "$TEST_ROOT/audit-lib.sh"
+if (
+  SAFE_AUDIT_NO_INIT=1
+  # shellcheck source=/dev/null
+  source "$TEST_ROOT/audit-lib.sh" >/dev/null 2>&1
+  jq -n "$JQ_VSEMVER"'
+    vlt("1.0.0-alpha.2"; "1.0.0-alpha.10")
+    and vlt("1.0.0-alpha.10"; "1.0.0")
+    and vlt("1.0.0-alpha"; "1.0.0-alpha.1")
+    and vlt("1.0.0-alpha.beta"; "1.0.0-beta")
+  ' | grep -q '^true$'
+); then
+  pass "prerelease identifiers compare per SemVer, not lexically"
+else
+  fail "prerelease identifiers compare per SemVer, not lexically"
+fi
+
+# ---------------------------------------------------------------------------
+# 24. Version-qualified override keys degrade resolution too
+# ---------------------------------------------------------------------------
+prepare_case overrides-qualified
+printf '{"dependencies": {"brace-expansion": "^2.0.0"}, "overrides": {"brace-expansion@^2.0.0": "1.1.11"}}\n' > "$CASE_PROJECT/package.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion --ecosystem npm --op update --gate install
+if expect_status 10 "version-qualified override key degrades resolution"; then
+  pass "version-qualified override key degrades resolution"
+fi
+
+# ---------------------------------------------------------------------------
+# 25. Custom source floors at WARN even for exact versions (delta finding 3)
+# ---------------------------------------------------------------------------
+prepare_case custom-source-exact
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --registry https://private.example --gate install
+if expect_status 10 "exact version from a custom source still floors at WARN"; then
+  pass "exact version from a custom source still floors at WARN"
+fi
+if expect_grep "$ERR_FILE" 'trusted_registries' "custom-source refusal names the trust knob"; then
+  pass "custom-source refusal names the trust knob"
+fi
+
+# ---------------------------------------------------------------------------
+# 26. install.trusted_registries lifts the custom-source floor
+# ---------------------------------------------------------------------------
+prepare_case trusted-registry
+printf '{"install": {"trusted_registries": ["https://registry.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion --ecosystem npm --registry https://registry.example --gate install
+if expect_status 0 "an operator-trusted registry audits like the default source"; then
+  pass "an operator-trusted registry audits like the default source"
+fi
+
+# ---------------------------------------------------------------------------
+# 27. Host-allow override still revokes stale clean evidence (delta finding 5)
+# ---------------------------------------------------------------------------
+prepare_case override-still-revokes
+printf '{"dependencies": {"brace-expansion": "^2.0.0"}}\n' > "$CASE_PROJECT/package.json"
+printf '{"packages": {"brace-expansion": {"version": "2.1.4", "ecosystem": "npm", "added": "2026-07-31", "reason": "test"}}}\n' \
+  > "$CASE_RUN_CONFIG/host-allow.json"
+printf '{"packages": {"npm:brace-expansion": {"version": "2.1.4", "verdict": "GO", "reasons": [], "evidence": "x", "first_allowed": "2026-07-31T10:00:00+02:00", "last_used": "2026-07-31", "times_used": 1}}}\n' \
+  > "$CASE_RUN_CONFIG/install-known.json"
+fixture="$(osv_fixture_affecting_moderate)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 0 "pinned host-allow still permits this invocation"; then
+  pass "pinned host-allow still permits this invocation"
+fi
+if jq -e '.packages["npm:brace-expansion"] == null' "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "stale clean evidence is revoked even when host-allow overrides"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2
+  fail "stale clean evidence is revoked even when host-allow overrides"
 fi
 
 # ---------------------------------------------------------------------------

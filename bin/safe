@@ -1063,6 +1063,12 @@ safe_install_gate_log() {
 safe_install_known_matches() {
   local package="$1" ecosystem="$2"
   local known_file name version first_allowed ttl_days entry_epoch now_epoch
+  # install-known entries are keyed by the canonical resolver ecosystem.
+  case "$ecosystem" in
+    cargo) ecosystem="rust" ;;
+    composer) ecosystem="php" ;;
+    pip|uv) ecosystem="python" ;;
+  esac
   known_file="${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}/install-known.json"
 
   command -v jq >/dev/null 2>&1 || return 1
@@ -1086,6 +1092,44 @@ safe_install_known_matches() {
   (( now_epoch - entry_epoch <= ttl_days * 86400 ))
 }
 
+# Target-altering selectors in the manager args must reach the audit
+# (PR#29 delta finding 3): scan and thread exactly like the shell wrappers.
+safe_install_scan_target_flags() {
+  local family="$1"
+  shift
+  SAFE_INSTALL_DIST_TAG=""
+  SAFE_INSTALL_REGISTRY=""
+  SAFE_INSTALL_PROJECT_DIR=""
+  local prev="" arg
+  for arg in "$@"; do
+    case "$family" in
+      npm)
+        case "$prev" in
+          --tag) SAFE_INSTALL_DIST_TAG="$arg" ;;
+          --registry) SAFE_INSTALL_REGISTRY="$arg" ;;
+          --prefix|-C|--cwd|--dir) SAFE_INSTALL_PROJECT_DIR="$arg" ;;
+        esac
+        case "$arg" in
+          --tag=*) SAFE_INSTALL_DIST_TAG="${arg#*=}" ;;
+          --registry=*) SAFE_INSTALL_REGISTRY="${arg#*=}" ;;
+          --prefix=*|--cwd=*|--dir=*) SAFE_INSTALL_PROJECT_DIR="${arg#*=}" ;;
+        esac
+        ;;
+      composer)
+        case "$prev" in
+          --repository) SAFE_INSTALL_REGISTRY="$arg" ;;
+          --working-dir|-d) SAFE_INSTALL_PROJECT_DIR="$arg" ;;
+        esac
+        case "$arg" in
+          --repository=*) SAFE_INSTALL_REGISTRY="${arg#*=}" ;;
+          --working-dir=*) SAFE_INSTALL_PROJECT_DIR="${arg#*=}" ;;
+        esac
+        ;;
+    esac
+    prev="$arg"
+  done
+}
+
 safe_install_audit_package() {
   local package="$1"
   local ecosystem="$2"
@@ -1093,8 +1137,13 @@ safe_install_audit_package() {
 
   [[ -x "$SAFE_AUDIT_PATH" ]] || die "safe install requires safe audit at $SAFE_AUDIT_PATH"
 
+  local -a extra=()
+  [[ -n "${SAFE_INSTALL_DIST_TAG:-}" ]] && extra+=(--dist-tag "$SAFE_INSTALL_DIST_TAG")
+  [[ -n "${SAFE_INSTALL_REGISTRY:-}" ]] && extra+=(--registry "$SAFE_INSTALL_REGISTRY")
+  [[ -n "${SAFE_INSTALL_PROJECT_DIR:-}" ]] && extra+=(--project-dir "$SAFE_INSTALL_PROJECT_DIR")
+
   set +e
-  "$SAFE_AUDIT_PATH" check "$package" --ecosystem "$ecosystem" --gate install --op install
+  "$SAFE_AUDIT_PATH" check "$package" --ecosystem "$ecosystem" --gate install --op install ${extra[@]+"${extra[@]}"}
   audit_status=$?
   set -e
 
@@ -1269,6 +1318,10 @@ cmd_install() {
   [[ "${#audit_packages[@]}" -gt 0 ]] || die "usage: safe install --host [package-manager flags...] <pkg> [...]"
 
   ecosystem="$(safe_install_ecosystem "$manager")"
+  case "$manager" in
+    composer) safe_install_scan_target_flags composer "${manager_args[@]}" ;;
+    *) safe_install_scan_target_flags npm "${manager_args[@]}" ;;
+  esac
   for audit_package in "${audit_packages[@]}"; do
     safe_install_audit_package "$audit_package" "$ecosystem"
     if safe_install_trustable_package "$audit_package" "$ecosystem"; then

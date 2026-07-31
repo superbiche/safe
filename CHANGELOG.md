@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Second review round (PR#29 delta findings): custom package sources
+  (`--registry`, `--index-url`, `--find-links`, `--no-index`, composer
+  `--repository`) now floor the verdict at WARN for every ecosystem — exact
+  versions included — because public advisory data cannot vouch for a
+  private artifact of the same name@version; the operator lifts the floor
+  per source via `install.trusted_registries` (or per version via a pinned
+  host-allow). `safe install` and the uv wrapper thread the same selectors.
+  OSV pagination rejects non-string/repeated tokens (a malformed
+  completeness token no longer reads as zero advisories). SemVer prerelease
+  identifiers compare per spec (identifier-by-identifier, numeric before
+  alphanumeric) instead of lexically, and version-qualified `overrides` keys
+  (`"pkg@^2.0.0"`) degrade resolution like bare ones. An adverse advisory
+  result revokes recorded clean install-known evidence even when a pinned
+  host-allow permits the current invocation, and the stale readers use the
+  canonical ecosystem key (cargo/composer entries are findable again).
+
 - Orthogonal-review hardening of the version-aware gate (PR#29 findings):
   version-scoped OSV results are server-authoritative — the local range
   comparator annotates but can never downgrade a hit to GO; OSV pagination is

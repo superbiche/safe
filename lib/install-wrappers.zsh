@@ -81,9 +81,12 @@ safe_install_scan_target_flags() {
       python)
         case "${prev}" in
           --index-url|-i|--extra-index-url|--default-index|--index) SAFE_INSTALL_REGISTRY="${arg}" ;;
+          --find-links|-f) SAFE_INSTALL_REGISTRY="local:find-links" ;;
         esac
         case "${arg}" in
           --index-url=*|--extra-index-url=*|--default-index=*|--index=*) SAFE_INSTALL_REGISTRY="${arg#*=}" ;;
+          --find-links=*) SAFE_INSTALL_REGISTRY="local:find-links" ;;
+          --no-index) SAFE_INSTALL_REGISTRY="local:no-index" ;;
         esac
         ;;
       cargo)
@@ -142,6 +145,14 @@ safe_install_known_matches() {
   local package="$1"
   local ecosystem="$2"
   local known_file name version entry ttl_days entry_epoch now_epoch
+
+  # install-known entries are keyed by the canonical resolver ecosystem
+  # (safe-audit normalizes at check entry); the wrappers speak tool labels.
+  case "${ecosystem}" in
+    cargo) ecosystem="rust" ;;
+    composer) ecosystem="php" ;;
+    pip|uv) ecosystem="python" ;;
+  esac
 
   (( $+commands[jq] )) || return 1
   known_file="$(safe_install_known_file)"
@@ -1339,6 +1350,7 @@ uv() {
     command uv "$@"; return $?
   fi
   safe_install_route uv "$@" || return $?
+  safe_install_scan_target_flags python "$@"
   local first="${SAFE_INSTALL_SUBCMD}"
   local subidx=$SAFE_INSTALL_SUBCMD_IDX
   local second="${@[subidx+1]:-}"

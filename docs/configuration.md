@@ -62,6 +62,7 @@ unchanged.
   "install": {
     "auto_allow": true,
     "auto_allow_tolerate": [],
+    "trusted_registries": [],
     "auto_allow_ttl_days": 30,
     "block_severities": ["critical"]
   }
@@ -72,6 +73,11 @@ unchanged.
   proceeds either way).
 - `auto_allow_tolerate`: opt-in WARN causes (e.g. `socket_unavailable`) that
   may proceed when no advisory affects the resolved version. Default: none.
+- `trusted_registries`: package sources (URL prefixes) the operator trusts
+  like the default public registry. Any other custom source
+  (`--registry`, `--index-url`, `--find-links`, `--no-index`,
+  `--repository`) floors the verdict at WARN — public advisory data cannot
+  vouch for a private artifact of the same name@version.
 - `auto_allow_ttl_days`: freshness window for the offline/timeout fallback.
 - `block_severities`: affecting-advisory severities that hard-BLOCK instead
   of WARN.

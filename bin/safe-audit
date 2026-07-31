@@ -3626,7 +3626,7 @@ osv_query_package_json() {
   # would let a token-only page read as "zero advisories" — follow the token
   # chain, merge, and fail closed on any anomaly (bad page, non-array vulns,
   # repeated token, unbounded chain).
-  local base_body body page_token="" vulns='[]' pages=0
+  local base_body body page_token="" vulns='[]' pages=0 seen_tokens=""
   if [[ -n "$version" && "$version" != "latest" ]]; then
     base_body=$(jq -n --arg eco "$eco" --arg name "$name" --arg version "$version" '{package:{ecosystem:$eco,name:$name},version:$version}')
   else
@@ -3652,8 +3652,16 @@ osv_query_package_json() {
       printf '{"status":"error","note":"OSV query failed","vulns":[]}\n' > "$output"
       return 0
     fi
-    if ! jq -e '(has("vulns") | not) or (.vulns | type == "array")' "$output.raw" >/dev/null 2>&1; then
-      printf '{"status":"error","note":"OSV response malformed (vulns not an array)","vulns":[]}\n' > "$output"
+    # A page must be an object; vulns (when present) an array; and
+    # next_page_token (when present) a non-empty string — any other token
+    # shape (false, numbers, objects) is a malformed page that must not
+    # read as "complete with zero advisories".
+    if ! jq -e '
+      (type == "object")
+      and ((has("vulns") | not) or (.vulns | type == "array"))
+      and ((has("next_page_token") | not) or (.next_page_token | (type == "string") and (length > 0)))
+    ' "$output.raw" >/dev/null 2>&1; then
+      printf '{"status":"error","note":"OSV response malformed","vulns":[]}\n' > "$output"
       return 0
     fi
     if ! vulns=$(jq -cn --argjson acc "$vulns" --slurpfile r "$output.raw" '$acc + (($r[0].vulns) // [])' 2>/dev/null); then
@@ -3663,10 +3671,13 @@ osv_query_package_json() {
     local next_token
     next_token=$(jq -r '.next_page_token // empty' "$output.raw" 2>/dev/null || true)
     [[ -z "$next_token" ]] && break
-    if [[ "$next_token" == "$page_token" ]]; then
-      printf '{"status":"error","note":"OSV pagination token repeated","vulns":[]}\n' > "$output"
-      return 0
-    fi
+    case " ${seen_tokens:-} " in
+      *" $next_token "*)
+        printf '{"status":"error","note":"OSV pagination token repeated","vulns":[]}\n' > "$output"
+        return 0
+        ;;
+    esac
+    seen_tokens="${seen_tokens:-} $next_token"
     page_token="$next_token"
   done
   jq -cn --argjson v "$vulns" '{status: "ok", note: null, vulns: $v}' > "$output"
@@ -3699,7 +3710,17 @@ def vparse:
   | split("-") as $p
   | ((($p[0] | split(".") | map(tonumber? // 0)) + [0, 0, 0])[0:3])
     + [if ($p | length) > 1 then 0 else 1 end]
-    + [if ($p | length) > 1 then ($p[1:] | join("-")) else "" end];
+    + [if ($p | length) > 1
+       # SemVer prerelease precedence is identifier-by-identifier: numeric
+       # identifiers compare numerically and rank below alphanumeric ones,
+       # and a shorter identifier list ranks below its extension. jq array
+       # comparison over (number|string) elements matches all three rules
+       # (numbers sort before strings; arrays compare element-wise with
+       # shorter-prefix-first) — a single lexical string did not
+       # (alpha.10 < alpha.2, PR#29 delta finding 4).
+       then ($p[1:] | join("-") | split(".") | map(tonumber? // .))
+       else []
+       end];
 def vlt($a; $b): ($a | vparse) < ($b | vparse);
 def vle($a; $b): ($a | vparse) <= ($b | vparse);
 def vge($a; $b): ($a | vparse) >= ($b | vparse);
@@ -3709,6 +3730,27 @@ def veq($a; $b): ($a | vparse) == ($b | vparse);
 
 install_policy_json() {
   jq -c '.install // {}' "$SAFE_RUN_CONFIG_FILE" 2>/dev/null || printf '{}'
+}
+
+# A source is trusted when it is the ecosystem's default public registry or
+# the operator listed it in install.trusted_registries. Anything else changes
+# artifact identity: public advisory data cannot vouch for a private artifact
+# of the same name@version.
+registry_is_trusted() {
+  local url="${1%/}" ecosystem="$2"
+  case "${ecosystem}:${url}" in
+    npm:https://registry.npmjs.org) return 0 ;;
+    python:https://pypi.org*) return 0 ;;
+  esac
+  local trusted
+  while IFS= read -r trusted; do
+    [[ -n "$trusted" ]] || continue
+    trusted="${trusted%/}"
+    if [[ "$url" == "$trusted" || "$url" == "$trusted"/* ]]; then
+      return 0
+    fi
+  done < <(install_policy_json | jq -r '(.trusted_registries // [])[]' 2>/dev/null || true)
+  return 1
 }
 
 version_is_exact() {
@@ -3949,8 +3991,12 @@ npm_project_ranges() {
 npm_overrides_mention() {
   local name="$1" dir="${CHECK_PROJECT_DIR:-.}"
   [[ -f "$dir/package.json" ]] || return 1
+  # Override keys can be version-qualified specs ("demo@^2.0.0" targets
+  # package demo); match on the parsed package name, not literal keys.
   jq -e --arg n "$name" '
-    (.overrides // {}) | [.. | objects | keys[]] | index($n) != null
+    (.overrides // {})
+    | [.. | objects | keys[]]
+    | any(. == $n or startswith($n + "@"))
   ' "$dir/package.json" >/dev/null 2>&1
 }
 
@@ -4292,6 +4338,9 @@ check_command() {
       --project-dir)
         [[ $# -lt 2 ]] && die "--project-dir requires a value"
         CHECK_PROJECT_DIR="$2"
+        # A path starting with '-' would be parsed as an option by the jq/
+        # grep readers downstream; anchor it.
+        [[ "$CHECK_PROJECT_DIR" == -* ]] && CHECK_PROJECT_DIR="./${CHECK_PROJECT_DIR}"
         shift 2
         ;;
       -*)
@@ -4473,6 +4522,18 @@ check_command() {
     fi
   fi
 
+  # A custom source floors the verdict at WARN regardless of resolution or
+  # exactness: OSV/Socket evidence covers the public registry identity, not
+  # whatever a private index serves under that name@version (delta finding
+  # 3). Operator escape hatches: install.trusted_registries, or a pinned
+  # host-allow.
+  local custom_source=0
+  if [[ -n "$CHECK_REGISTRY" ]] && ! registry_is_trusted "$CHECK_REGISTRY" "$ecosystem"; then
+    custom_source=1
+    warn_causes+=("custom_source")
+    bump_verdict verdict "WARN"
+  fi
+
   block_line="PASS (not blocked)"
   if block_reason=$(blocked_entry_reason "$PKG_NAME"); then
     bump_verdict verdict "BLOCK"
@@ -4546,6 +4607,9 @@ check_command() {
     printf 'Socket:      %s\n' "$socket_line"
     printf 'OSV:         %s\n' "$osv_line"
     printf 'Blocklist:   %s\n' "$block_line"
+    if (( custom_source )); then
+      printf '\n[safe audit] custom source: %s — advisory evidence covers the public registry identity only\n' "$CHECK_REGISTRY"
+    fi
     if [[ "$(jq -r '.available // false' "$socket_json" 2>/dev/null)" != "true" ]]; then
       printf '\n[safe audit] WARNING: socket CLI not available, skipping behavioral analysis\n'
       printf '[safe audit] Install: safe audit setup local\n'
@@ -4569,6 +4633,13 @@ check_command() {
         gate_exit=0
         ;;
       WARN)
+        # Adverse ADVISORY knowledge supersedes recorded clean evidence
+        # BEFORE any override decides this one invocation (delta finding 5).
+        # Infra-only WARNs (socket outage, OSV outage) do not revoke: the
+        # stale-evidence fallback exists precisely for those windows.
+        if (( aff_count > 0 )) || [[ "$block_line" != PASS* ]]; then
+          revoke_install_known "$ecosystem" "$PKG_NAME" "$primary_version" ${RESOLVED_VERSIONS[@]+"${RESOLVED_VERSIONS[@]}"}
+        fi
         HOST_ALLOW_RESOLVED_VERSION=""
         if (( resolution_ok )) && host_allow_matches_resolved "$ecosystem" "$PKG_NAME" "${RESOLVED_VERSIONS[@]}"; then
           printf '[safe audit] host-allow entry %s@%s matches the resolved version; allowing\n' \
@@ -4584,7 +4655,6 @@ check_command() {
           gate_exit=0
         else
           gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" "$aff_count" "$socket_detail" "${warn_causes[@]}"
-          revoke_install_known "$ecosystem" "$PKG_NAME" "$primary_version" ${RESOLVED_VERSIONS[@]+"${RESOLVED_VERSIONS[@]}"}
           gate_exit=10
         fi
         ;;
@@ -4617,7 +4687,7 @@ gate_emit_refusal_hints() {
   local ecosystem="$1" name="$2" primary_version="$3" resolution_ok="$4" aff_count="$5" socket_detail="$6"
   shift 6
   local -a causes=("$@")
-  local cause has_socket_infra=0 has_unresolved=0 has_affecting=0 has_osv_down=0 has_low_score=0
+  local cause has_socket_infra=0 has_unresolved=0 has_affecting=0 has_osv_down=0 has_low_score=0 has_custom_source=0
   for cause in "${causes[@]}"; do
     case "$cause" in
       socket_unavailable|socket_auth_failed|socket_rate_limited|socket_error) has_socket_infra=1 ;;
@@ -4625,8 +4695,13 @@ gate_emit_refusal_hints() {
       osv_affecting) has_affecting=1 ;;
       osv_unavailable) has_osv_down=1 ;;
       socket_low_score) has_low_score=1 ;;
+      custom_source) has_custom_source=1 ;;
     esac
   done
+  if (( has_custom_source )); then
+    printf 'safe audit: custom package source — public advisory evidence cannot vouch for a private artifact\n' >&2
+    printf 'safe audit: to trust this source permanently: add it to install.trusted_registries in ~/.config/safe/run/config.json (operator)\n' >&2
+  fi
   if (( has_affecting )); then
     if [[ "$ecosystem" == "npm" ]]; then
       printf 'safe audit: to allow this exact version: safe run host-allow add %s@%s --reason "..."\n' \
