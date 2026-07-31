@@ -692,12 +692,25 @@ host_runner_binary() {
     return 0
   fi
   # Fallback: resolve through mise, the runtime manager that replaced Volta.
-  # Per-project/per-shell versions resolve exactly as the user's own shell
-  # would, and the path never goes stale in config.
+  # CONSTRAINED to the runner's expected provider tool: a bare `mise which
+  # npx` is a bin-name lookup across every active tool, so any backend whose
+  # bin set ships a colliding `npx` could be executed on the host with
+  # npx-shaped flags it need not honor (PR#30 review finding 4).
+  local expected_tool=""
+  case "$kind" in
+    npx) expected_tool="node" ;;
+    bunx) expected_tool="bun" ;;
+    uvx) expected_tool="uv" ;;
+    *) return 1 ;;
+  esac
   if command -v mise >/dev/null 2>&1; then
     local mise_real
-    mise_real=$(mise which "$kind" 2>/dev/null || true)
+    mise_real=$(mise which "$kind" --tool="$expected_tool" 2>/dev/null || true)
     if [[ -n "$mise_real" && -x "$mise_real" ]]; then
+      case "$(readlink -f "$mise_real")" in
+        */installs/"$expected_tool"/*) ;;
+        *) return 1 ;;
+      esac
       printf '%s' "$mise_real"
       return 0
     fi
@@ -1558,10 +1571,12 @@ cmd_status() {
   echo "real runners (host-allow exec):"
   local k
   for k in npx bunx uvx; do
-    local path
+    local path fallback
     path=$(jq -r --arg k "${k}_real" '.runners[$k] // empty' "$CONFIG_FILE")
-    if [[ -n "$path" && -x "$path" ]]; then
+    if [[ -n "$path" && -x "$path" ]] && ! is_stale_volta_path "$path"; then
       printf "  [x] %s -> %s\n" "$k" "$path"
+    elif fallback=$(host_runner_binary "$k" 2>/dev/null); then
+      printf "  [x] %s -> %s (mise, resolved at exec time)\n" "$k" "$fallback"
     else
       printf "  [ ] %s (not linked; run: safe run link)\n" "$k"
     fi
@@ -1979,7 +1994,7 @@ DECISION TIERS (in order)
   6. unknown        TTY: prompt; non-TTY: BLOCK
 
 EXIT CODES (policy refusals; distinguish from 127 = command not found)
-  100  blocked by policy (blocklist, degraded wrappers, fail-closed audit, unrecognized/unsupported runner-native flags)
+  100  blocked by policy (blocklist, missing gate library, fail-closed audit, unrecognized/unsupported runner-native flags)
   101  host-allow version pin mismatch
   102  interactive operator confirmation required (non-TTY refusal)
   103  invalid package name rejected

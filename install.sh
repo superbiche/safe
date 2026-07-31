@@ -102,10 +102,14 @@ done
 [[ -f "$REPO_DIR/lib/gate-lib.sh" ]] || die "missing gate library source"
 [[ -f "$REPO_DIR/lib/completions/_safe" ]] || die "missing zsh completion"
 
+# Ownership check: a regular (never symlinked) file whose second line is
+# EXACTLY our per-tool marker. A loose substring match let a foreign file
+# carrying the phrase be overwritten/deleted, and a marked symlink let a
+# reinstall truncate its target outside BIN_DIR (PR#30 review finding 5).
 gate_wrapper_marked() {
-  local path="$1"
-  [[ -f "$path" ]] || return 1
-  head -n 2 "$path" 2>/dev/null | grep -Fq '# safe-gate-wrapper'
+  local path="$1" tool="$2"
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  [[ "$(sed -n '2p' "$path" 2>/dev/null)" == "# safe-gate-wrapper v1 tool=${tool}" ]]
 }
 
 # PATH wrappers are what makes gating work in every shell (bash -c, Makefiles,
@@ -118,10 +122,11 @@ install_gate_wrappers() {
   mkdir -p "$BIN_DIR"
   for tool in "${GATE_TOOLS[@]}"; do
     target="$BIN_DIR/$tool"
-    if [[ -e "$target" || -L "$target" ]] && ! gate_wrapper_marked "$target"; then
+    if [[ -e "$target" || -L "$target" ]] && ! gate_wrapper_marked "$target" "$tool"; then
       skipped+=("$tool")
       continue
     fi
+    rm -f "$target"
     cat > "$target" <<EOF
 #!/usr/bin/env bash
 # safe-gate-wrapper v1 tool=${tool}
@@ -377,6 +382,17 @@ migrate_dir "$LEGACY_SAFE_AUDIT_DATA_DIR" "$AUDIT_DATA_DIR"
 merge_legacy_state
 
 mkdir -p "$BIN_DIR"
+# The dispatcher and its installed gate library are ONE upgrade unit: a
+# selective mode (--run, --audit, --no-wrappers) that refreshes `safe` while
+# active wrappers keep loading an older library would leave a fixed
+# dispatcher routing through vulnerable tables (PR#30 review finding 2).
+# Refresh the library FIRST (never a new dispatcher with an old library),
+# whenever an installed copy or marked wrappers already exist.
+if [[ -f "$GATE_LIB_TARGET" ]] || gate_wrapper_marked "$BIN_DIR/npm" npm; then
+  mkdir -p "$CONFIG_BASE"
+  install -m 0644 "$REPO_DIR/lib/gate-lib.sh" "$GATE_LIB_TARGET"
+  info "refreshed gate library at $GATE_LIB_TARGET"
+fi
 install -m 0755 "$REPO_DIR/bin/safe" "$BIN_DIR/safe"
 install -m 0755 "$REPO_DIR/bin/safe-run" "$BIN_DIR/safe-run"
 install -m 0755 "$REPO_DIR/bin/safe-audit" "$BIN_DIR/safe-audit"

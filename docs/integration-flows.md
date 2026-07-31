@@ -71,7 +71,7 @@ npm install express
 
 Flow:
 
-1. The zsh wrapper detects a package install.
+1. The PATH wrapper execs `safe gate npm`, which detects a package install.
 2. If the current directory looks like an npm project, it runs `safe audit scan --project .`.
 3. It extracts package specs and runs `safe audit check <pkg> --ecosystem npm --gate install`.
 4. Only a passing gate proceeds.

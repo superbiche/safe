@@ -1071,6 +1071,107 @@ case_install_writes_gate_wrappers() {
   pass "$FUNCNAME"
 }
 
+case_selective_install_refreshes_gate_lib() {
+  prepare_case "selective-install-refreshes-gate-lib"
+  # Release A: full install, then simulate a stale installed gate library.
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+  printf '# STALE SENTINEL — release A library\n' > "${HOME_DIR}/.config/safe/gate-lib.sh"
+
+  # Release B run in a selective mode that skips wrapper generation: the
+  # dispatcher and its active library are one upgrade unit, so the library
+  # must be refreshed anyway (review finding: wrappers kept loading an old
+  # vulnerable library after `install.sh --run`).
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" --run >>"${OUT_FILE}" 2>>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+  if grep -Fq 'STALE SENTINEL' "${HOME_DIR}/.config/safe/gate-lib.sh"; then
+    fail "$FUNCNAME"
+    return
+  fi
+  cmp -s "${ROOT_DIR}/lib/gate-lib.sh" "${HOME_DIR}/.config/safe/gate-lib.sh" || { fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
+case_loose_marker_is_not_ownership() {
+  prepare_case "loose-marker-not-ownership"
+  mkdir -p "${HOME_DIR}/.local/bin"
+  # A foreign file merely MENTIONING the marker phrase is not ours: neither
+  # install (overwrite) nor uninstall (delete) may touch it. Exact per-tool
+  # second-line markers only (review finding 5).
+  printf '#!/usr/bin/env bash\n# vendored helper based on safe-gate-wrapper ideas\necho real-yarn "$@"\n' > "${HOME_DIR}/.local/bin/yarn"
+  chmod +x "${HOME_DIR}/.local/bin/yarn"
+  # A wrapper-marked file for the WRONG tool is foreign too.
+  printf '#!/usr/bin/env bash\n# safe-gate-wrapper v1 tool=npm\nexec safe gate npm -- "$@"\n' > "${HOME_DIR}/.local/bin/cargo"
+  chmod +x "${HOME_DIR}/.local/bin/cargo"
+  # A symlink to a marked file must never be followed and truncated.
+  printf '#!/usr/bin/env bash\n# safe-gate-wrapper v1 tool=go\nexec safe gate go -- "$@"\n' > "${HOME_DIR}/marked-target"
+  ln -s "${HOME_DIR}/marked-target" "${HOME_DIR}/.local/bin/go"
+
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+  grep -Fq 'echo real-yarn' "${HOME_DIR}/.local/bin/yarn" || { fail "$FUNCNAME"; return; }
+  grep -Fq 'tool=npm' "${HOME_DIR}/.local/bin/cargo" || { fail "$FUNCNAME"; return; }
+  [[ -L "${HOME_DIR}/.local/bin/go" ]] || { fail "$FUNCNAME"; return; }
+  grep -Fq 'tool=go' "${HOME_DIR}/marked-target" || { fail "$FUNCNAME"; return; }
+  assert_err_contains_fragment 'gating NOT active for:' "$FUNCNAME" || return
+
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/uninstall.sh" >>"${OUT_FILE}" 2>>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+  [[ -f "${HOME_DIR}/.local/bin/yarn" ]] || { fail "$FUNCNAME"; return; }
+  [[ -f "${HOME_DIR}/.local/bin/cargo" ]] || { fail "$FUNCNAME"; return; }
+  [[ -L "${HOME_DIR}/.local/bin/go" && -f "${HOME_DIR}/marked-target" ]] || { fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
+case_status_probes_every_wrapper() {
+  prepare_case "status-probes-every-wrapper"
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+
+  # Healthy: every wrapper resolves to its owned file.
+  local status_out
+  status_out="$(cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" "${HOME_DIR}/.local/bin/safe" status 2>/dev/null)"
+  grep -Fq 'wrappers:       ok (11/11' <<<"${status_out}" || { printf '%s\n' "${status_out}" >&2; fail "$FUNCNAME"; return; }
+
+  # A missing non-npm wrapper must flip the aggregate (review finding: an
+  # npm-only probe concealed ungated siblings).
+  rm -f "${HOME_DIR}/.local/bin/pnpm"
+  status_out="$(cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" "${HOME_DIR}/.local/bin/safe" status 2>/dev/null)"
+  grep -Fq 'DEGRADED' <<<"${status_out}" || { printf '%s\n' "${status_out}" >&2; fail "$FUNCNAME"; return; }
+  grep -Fq 'pnpm:missing' <<<"${status_out}" || { printf '%s\n' "${status_out}" >&2; fail "$FUNCNAME"; return; }
+
+  # doctor --json reports the same per-tool map.
+  local doctor_out
+  doctor_out="$(cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" "${HOME_DIR}/.local/bin/safe" doctor --json 2>/dev/null)"
+  jq -e '.environment.install_wrappers.gate_wrappers.pnpm == "missing" and .environment.install_wrappers.gate_wrappers_healthy == false' <<<"${doctor_out}" >/dev/null || { printf '%s\n' "${doctor_out}" >&2; fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
+case_uv_index_selectors_reach_audit() {
+  prepare_case "uv-index-selectors-reach-audit"
+  # Every uv fetch path accepts index selectors; dropping them audited PyPI
+  # while uv installed from the custom index (review finding 1).
+  SAFE_INSTALL_TEST_SCRIPT='uv tool install --default-index https://packages.example blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://packages.example' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='uv pip install --index-url=https://pypi.example blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://pypi.example' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='uv run --index https://idx.example --with blockme script.py' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://idx.example' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_uninstall_removes_gate_wrappers() {
   prepare_case "uninstall-removes-gate-wrappers"
   HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
@@ -1492,6 +1593,10 @@ main() {
     case_install_idempotent_no_wrappers \
     case_install_idempotent_with_completions \
     case_install_writes_gate_wrappers \
+    case_selective_install_refreshes_gate_lib \
+    case_loose_marker_is_not_ownership \
+    case_status_probes_every_wrapper \
+    case_uv_index_selectors_reach_audit \
     case_uninstall_removes_gate_wrappers \
     case_install_cleans_legacy_safe_install_artifacts \
     case_install_preserves_symlinked_zshrc \

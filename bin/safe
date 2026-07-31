@@ -163,11 +163,38 @@ cmd_version() {
   "$SAFE_AUDIT_PATH" --version
 }
 
-# A generated install wrapper carries the marker in its first two lines.
+# Keep in sync with GATE_TOOLS in install.sh and the gate-lib routing table.
+SAFE_GATE_TOOL_LIST=(npm pnpm pnpx yarn bun pip pip3 uv cargo go composer)
+
+# A generated install wrapper: regular (never symlinked) file whose second
+# line is EXACTLY the per-tool marker (loose substring matching let foreign
+# files pass as ours — PR#30 review finding 5).
 gate_wrapper_marked() {
-  local path="$1"
-  [[ -f "$path" ]] || return 1
-  head -n 2 "$path" 2>/dev/null | grep -Fq '# safe-gate-wrapper'
+  local path="$1" tool="$2"
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  [[ "$(sed -n '2p' "$path" 2>/dev/null)" == "# safe-gate-wrapper v1 tool=${tool}" ]]
+}
+
+# Per-tool wrapper state: installed | shadowed | missing | foreign.
+# The wrapper set is healthy only when EVERY tool resolves to its owned
+# wrapper — one ungated tool defeats the seatbelt (PR#30 review finding 3).
+gate_wrapper_state() {
+  local tool="$1" wrapper="$SAFE_BIN_ROOT/$1" resolved=""
+  if [[ -e "$wrapper" || -L "$wrapper" ]]; then
+    if ! gate_wrapper_marked "$wrapper" "$tool"; then
+      printf 'foreign'
+      return 0
+    fi
+  else
+    printf 'missing'
+    return 0
+  fi
+  resolved="$(command -v "$tool" 2>/dev/null || true)"
+  if [[ -n "$resolved" && "$(readlink -f "$resolved")" != "$(readlink -f "$wrapper")" ]]; then
+    printf 'shadowed'
+    return 0
+  fi
+  printf 'installed'
 }
 
 cmd_status() {
@@ -180,20 +207,22 @@ cmd_status() {
   "$SAFE_AUDIT_PATH" status
   echo
   echo "=== install ==="
-  # Probe the PATH wrappers, not shell state: gating is executable-based, so
-  # the answer must be the same from any shell.
-  local wrapper="$SAFE_BIN_ROOT/npm" resolved=""
-  if gate_wrapper_marked "$wrapper"; then
-    resolved="$(command -v npm 2>/dev/null || true)"
-    if [[ -n "$resolved" ]] && [[ "$(readlink -f "$resolved")" == "$(readlink -f "$wrapper")" ]]; then
-      echo "wrappers:       installed ($SAFE_BIN_ROOT)"
-    elif [[ -n "$resolved" ]]; then
-      echo "wrappers:       shadowed (npm resolves to $resolved, not $wrapper)"
+  # Probe EVERY PATH wrapper, not shell state and not just npm: gating is
+  # executable-based and one ungated tool defeats the seatbelt.
+  local tool state healthy=0 unhealthy=()
+  for tool in "${SAFE_GATE_TOOL_LIST[@]}"; do
+    state="$(gate_wrapper_state "$tool")"
+    if [[ "$state" == "installed" ]]; then
+      healthy=$((healthy + 1))
     else
-      echo "wrappers:       installed ($SAFE_BIN_ROOT; $SAFE_BIN_ROOT not on PATH)"
+      unhealthy+=("$tool:$state")
     fi
+  done
+  if [[ "${#unhealthy[@]}" -eq 0 ]]; then
+    echo "wrappers:       ok (${healthy}/${#SAFE_GATE_TOOL_LIST[@]} installed in $SAFE_BIN_ROOT)"
   else
-    echo "wrappers:       not installed"
+    echo "wrappers:       DEGRADED (${healthy}/${#SAFE_GATE_TOOL_LIST[@]} healthy) — ${unhealthy[*]}"
+    echo "                foreign/shadowed/missing tools are NOT gated; fix and re-run install.sh"
   fi
 }
 
@@ -468,6 +497,16 @@ doctor_payload_json() {
   local run_config_dir="$base_config/run"
   local audit_config_dir="$base_config/audit"
   local install_wrapper="$base_config/install-wrappers.zsh"
+
+  # Per-tool wrapper states for the executable gate (finding: an aggregate
+  # derived from npm alone concealed missing/shadowed siblings).
+  local gate_wrappers_json='{}' gate_wrappers_healthy=true
+  local gw_tool gw_state
+  for gw_tool in "${SAFE_GATE_TOOL_LIST[@]}"; do
+    gw_state="$(gate_wrapper_state "$gw_tool")"
+    [[ "$gw_state" == "installed" ]] || gate_wrappers_healthy=false
+    gate_wrappers_json=$(jq -cn --argjson acc "$gate_wrappers_json" --arg t "$gw_tool" --arg s "$gw_state" '$acc + {($t): $s}')
+  done
   local completion_file="$SAFE_ZSH_COMPLETION_DIR/_safe"
 
   local paths_safe_json paths_run_json paths_audit_json
@@ -675,6 +714,8 @@ doctor_payload_json() {
     --argjson safe_audit_machines_file "$( [[ -f "$audit_config_dir/machines.json" ]] && printf 'true' || printf 'false' )" \
     --argjson safe_audit_tools_file "$( [[ -f "$audit_config_dir/tools.json" ]] && printf 'true' || printf 'false' )" \
     --argjson wrapper_present "$( [[ -f "$install_wrapper" ]] && printf 'true' || printf 'false' )" \
+    --argjson gate_wrappers "$gate_wrappers_json" \
+    --argjson gate_wrappers_healthy "$gate_wrappers_healthy" \
     --argjson completion_present "$( [[ -f "$completion_file" ]] && printf 'true' || printf 'false' )" \
     '{
       command: "safe doctor",
@@ -741,6 +782,8 @@ doctor_payload_json() {
           tools_file: $safe_audit_tools_file
         },
         install_wrappers: {
+          gate_wrappers: $gate_wrappers,
+          gate_wrappers_healthy: $gate_wrappers_healthy,
           script_present: $wrapper_present,
           completion_present: $completion_present
         },

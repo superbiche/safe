@@ -26,7 +26,7 @@ format, policy exit codes, and the operator-only allow flows. See
 ### Policy exit codes
 
 ```text
-100  blocked by policy (blocklist, degraded wrappers, fail-closed audit, unrecognized/unsupported runner-native flags)
+100  blocked by policy (blocklist, missing gate library, fail-closed audit, unrecognized/unsupported runner-native flags)
 101  host-allow version pin mismatch
 102  interactive operator confirmation required (non-TTY refusal)
 103  invalid package name rejected
@@ -169,7 +169,7 @@ safe install --trust-host -g cowsay@1.6.0
 
 `safe install --sandbox ...` preserves the isolated `safe run install` workflow.
 
-The zsh wrappers cover these command families:
+The PATH-executable gate wrappers cover these command families:
 
 ```text
 npm, pnpm, yarn, bun

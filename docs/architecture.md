@@ -45,10 +45,11 @@ global command. After successful installs of exact npm versions, interactive
 runs can add that exact version to host-allow; `--trust-host` makes that step
 explicit. `safe install --sandbox` keeps the isolated `safe run install` workflow.
 
-Install wrappers are zsh functions that shadow package-manager commands. They
-run `safe audit check` for package installs or `safe audit scan --project .`
-for project-local installs, then delegate to the real command with `command
-<tool> "$@"`.
+Install wrappers are executable shims on PATH that exec `safe gate <tool>`.
+The gate runs `safe audit check` (install-gate mode) for package installs or
+`safe audit scan --project .` for project-local installs, then delegates to
+the first non-wrapper executable of that name on PATH — so mise/asdf shims
+and per-project tool versions keep working, in every shell.
 
 `safe vendor update` wraps explicit vendor-native updater commands. It cannot
 intercept in-process auto-updaters automatically, but it records a durable audit

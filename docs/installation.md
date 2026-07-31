@@ -32,7 +32,12 @@ bash install.sh --wrappers
 bash install.sh --no-wrappers
 ```
 
-`--no-wrappers` installs the run and audit tools but leaves persistent zsh package-manager wrappers disabled.
+`--no-wrappers` installs the run and audit tools without generating the
+PATH gate wrappers. On an existing installation the gate library
+(`~/.config/safe/gate-lib.sh`) is still refreshed together with the `safe`
+binary — the dispatcher and its routing library are one upgrade unit, so
+already-installed wrappers always load the library matching the installed
+`safe`.
 
 ## First Run
 

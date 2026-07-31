@@ -6,9 +6,9 @@ It combines three workflows:
 
 - `safe run`: sandboxed package execution for `npx`, `bunx`, `uvx`, and `pipx`-style workflows.
 - `safe audit`: dependency, SBOM, release, binary, vulnerability, and IOC checks across local and SSH-accessible machines.
-- install wrappers: zsh functions that guard persistent package-manager installs before the real command runs.
+- install wrappers: executable PATH wrappers (`~/.local/bin/npm` and friends) that route every install, update, and exec-style fetch through `safe gate` in every shell — interactive or not — before the real command runs.
 
-The repo installs a top-level `safe` dispatcher, direct component binaries, one config tree under `~/.config/safe`, one data tree under `~/.local/share/safe`, and one zsh completion file.
+The repo installs a top-level `safe` dispatcher, direct component binaries, one config tree under `~/.config/safe` (including the gate routing library `gate-lib.sh`), one data tree under `~/.local/share/safe`, and one zsh completion file.
 
 ## Start Here
 

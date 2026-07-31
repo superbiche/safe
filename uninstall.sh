@@ -87,17 +87,18 @@ rm -f "$COMPLETION_DIR/_safe"
 rm -f "$LEGACY_SAFE_RUN_CONFIG_DIR/completions/_safe-install"
 info "removed binaries and zsh completions"
 
-# Only files we generated: a same-named binary that lacks the marker belongs to
-# somebody else and stays.
+# Only files we generated: a regular (never symlinked) file whose second line
+# is EXACTLY our per-tool marker. Anything else belongs to somebody else and
+# stays (PR#30 review finding 5).
 gate_wrapper_marked() {
-  local path="$1"
-  [[ -f "$path" ]] || return 1
-  head -n 2 "$path" 2>/dev/null | grep -Fq '# safe-gate-wrapper'
+  local path="$1" tool="$2"
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  [[ "$(sed -n '2p' "$path" 2>/dev/null)" == "# safe-gate-wrapper v1 tool=${tool}" ]]
 }
 
 removed_wrappers=()
 for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer; do
-  if gate_wrapper_marked "$BIN_DIR/$tool"; then
+  if gate_wrapper_marked "$BIN_DIR/$tool" "$tool"; then
     rm -f "$BIN_DIR/$tool"
     removed_wrappers+=("$tool")
   fi

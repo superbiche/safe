@@ -178,6 +178,17 @@ safe_gate_run_audit() {
 # from the audit while staying in the real command — the audit then judged
 # the wrong target (PR#29 review finding 3). Scanned from the original argv;
 # safe-audit resolves with them or fails closed.
+# Source selectors are cumulative (pip considers --find-links AND the index):
+# accumulate every one — a later trusted selector must never erase an earlier
+# untrusted one (PR#29 delta-2 finding 3).
+safe_gate_add_source() {
+  local value="$1"
+  case " ${SAFE_GATE_REGISTRY} " in
+    *" ${value} "*) return 0 ;;
+  esac
+  SAFE_GATE_REGISTRY="${SAFE_GATE_REGISTRY:+${SAFE_GATE_REGISTRY} }${value}"
+}
+
 safe_gate_scan_target_flags() {
   local family="$1"
   shift
@@ -190,38 +201,41 @@ safe_gate_scan_target_flags() {
       npm)
         case "${prev}" in
           --tag) SAFE_GATE_DIST_TAG="${arg}" ;;
-          --registry) SAFE_GATE_REGISTRY="${arg}" ;;
+          --registry) safe_gate_add_source "${arg}" ;;
           --prefix|-C|--cwd|--dir) SAFE_GATE_PROJECT_DIR="${arg}" ;;
         esac
         case "${arg}" in
           --tag=*) SAFE_GATE_DIST_TAG="${arg#*=}" ;;
-          --registry=*) SAFE_GATE_REGISTRY="${arg#*=}" ;;
+          --registry=*) safe_gate_add_source "${arg#*=}" ;;
           --prefix=*|--cwd=*|--dir=*) SAFE_GATE_PROJECT_DIR="${arg#*=}" ;;
         esac
         ;;
       python)
         case "${prev}" in
-          --index-url|-i|--extra-index-url|--default-index|--index) SAFE_GATE_REGISTRY="${arg}" ;;
+          --index-url|-i|--extra-index-url|--default-index|--index) safe_gate_add_source "${arg}" ;;
+          --find-links|-f) safe_gate_add_source "local:find-links" ;;
         esac
         case "${arg}" in
-          --index-url=*|--extra-index-url=*|--default-index=*|--index=*) SAFE_GATE_REGISTRY="${arg#*=}" ;;
+          --index-url=*|--extra-index-url=*|--default-index=*|--index=*) safe_gate_add_source "${arg#*=}" ;;
+          --find-links=*) safe_gate_add_source "local:find-links" ;;
+          --no-index) safe_gate_add_source "local:no-index" ;;
         esac
         ;;
       cargo)
         case "${prev}" in
-          --registry|--index) SAFE_GATE_REGISTRY="${arg}" ;;
+          --registry|--index) safe_gate_add_source "${arg}" ;;
         esac
         case "${arg}" in
-          --registry=*|--index=*) SAFE_GATE_REGISTRY="${arg#*=}" ;;
+          --registry=*|--index=*) safe_gate_add_source "${arg#*=}" ;;
         esac
         ;;
       composer)
         case "${prev}" in
-          --repository) SAFE_GATE_REGISTRY="${arg}" ;;
+          --repository) safe_gate_add_source "${arg}" ;;
           --working-dir|-d) SAFE_GATE_PROJECT_DIR="${arg}" ;;
         esac
         case "${arg}" in
-          --repository=*) SAFE_GATE_REGISTRY="${arg#*=}" ;;
+          --repository=*) safe_gate_add_source "${arg#*=}" ;;
           --working-dir=*) SAFE_GATE_PROJECT_DIR="${arg#*=}" ;;
         esac
         ;;
@@ -286,6 +300,14 @@ safe_gate_known_matches() {
   local ecosystem="$2"
   local known_file name version entry ttl_days entry_epoch now_epoch
 
+  # install-known entries are keyed by the canonical resolver ecosystem
+  # (safe-audit normalizes at check entry); the gate speaks tool labels.
+  case "${ecosystem}" in
+    cargo) ecosystem="rust" ;;
+    composer) ecosystem="php" ;;
+    pip|uv) ecosystem="python" ;;
+  esac
+
   command -v jq >/dev/null 2>&1 || return 1
   known_file="$(safe_gate_run_config_dir)/install-known.json"
   [[ -r "${known_file}" ]] || return 1
@@ -295,8 +317,11 @@ safe_gate_known_matches() {
 
   # Only fully clean GO evidence may satisfy the offline fallback — a
   # tolerated-WARN record is not clean evidence (PR#29 review finding 5).
-  entry="$(jq -r --arg k "${ecosystem}:${name}" --arg v "${version}" \
-    '.packages[$k] | select(.version == $v and .verdict == "GO") | .first_allowed // empty' "${known_file}" 2>/dev/null || true)"
+  # Evidence is source-scoped: a default-registry receipt must never vouch
+  # for a custom index (PR#29 delta-2 finding 5).
+  local current_source="${SAFE_GATE_REGISTRY:-default}"
+  entry="$(jq -r --arg k "${ecosystem}:${name}" --arg v "${version}" --arg src "${current_source}" \
+    '.packages[$k] | select(.version == $v and .verdict == "GO" and ((.source // "default") == $src)) | .first_allowed // empty' "${known_file}" 2>/dev/null || true)"
   [[ -n "${entry}" ]] || return 1
 
   ttl_days="$(jq -r '.install.auto_allow_ttl_days // 30' \
@@ -754,11 +779,15 @@ safe_gate_python_packages() {
       -r|--requirement|--requirement=*|-e|--editable|--editable=*)
         return 1
         ;;
-      -c|--constraint|--index-url|--extra-index-url|--find-links|--trusted-host|--platform|--python-version|--implementation|--abi|--target|--prefix|--src|--upgrade-strategy|--config-settings|-C)
+      -c|--constraint|-i|--index-url|--index|--default-index|--extra-index-url|--find-links|--trusted-host|--platform|--python-version|--implementation|--abi|--target|--prefix|--src|--upgrade-strategy|--config-settings|-C)
+        # -i/--index/--default-index take a value: dropping it made the URL
+        # look like a package spec and fail-opened the extractor (PR#30
+        # review finding 1 sibling). The selector itself is threaded to the
+        # audit by safe_gate_scan_target_flags.
         skip_next=1
         continue
         ;;
-      --constraint=*|--index-url=*|--extra-index-url=*|--find-links=*|--trusted-host=*|--platform=*|--python-version=*|--implementation=*|--abi=*|--target=*|--prefix=*|--src=*|--upgrade-strategy=*|--config-settings=*)
+      --constraint=*|--index-url=*|--index=*|--default-index=*|--extra-index-url=*|--find-links=*|--trusted-host=*|--platform=*|--python-version=*|--implementation=*|--abi=*|--target=*|--prefix=*|--src=*|--upgrade-strategy=*|--config-settings=*)
         continue
         ;;
       --upgrade|-U|--force-reinstall|--ignore-installed|--user|--break-system-packages|--no-deps|--pre)
@@ -1371,6 +1400,10 @@ safe_gate_pip_like() {
 
 safe_gate_uv() {
   safe_gate_route uv "$@" || return $?
+  # uv accepts index selectors on every fetch path (tool install/run, run
+  # --with, pip install); dropping them audited PyPI while uv installed from
+  # elsewhere (PR#30 review finding 1).
+  safe_gate_scan_target_flags python "$@"
   local first="${SAFE_GATE_SUBCMD}"
   local subidx=$SAFE_GATE_SUBCMD_IDX
   local second="${@:subidx+1:1}"

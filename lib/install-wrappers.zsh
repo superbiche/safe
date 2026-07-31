@@ -23,9 +23,20 @@ _safe_gate_shell_check() {
   [[ -o interactive ]] || return 0
   (( $+commands[safe] )) || return 0
 
-  local wrapper="${SAFE_BIN_DIR:-$HOME/.local/bin}/npm"
-  if [[ ! -r "${wrapper}" ]] || ! head -n 2 "${wrapper}" 2>/dev/null | grep -Fq '# safe-gate-wrapper'; then
-    print -u2 -- "safe: install gating is NOT active — no gate wrapper at ${wrapper}; to restore it, run safe's install.sh (details: safe status)"
+  # Check the FULL wrapper set with the exact per-tool marker — an npm-only
+  # probe concealed missing or foreign sibling wrappers.
+  local bin_dir="${SAFE_BIN_DIR:-$HOME/.local/bin}"
+  local tool wrapper
+  local -a broken=()
+  for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer; do
+    wrapper="${bin_dir}/${tool}"
+    if [[ ! -f "${wrapper}" || -L "${wrapper}" ]] \
+      || [[ "$(sed -n '2p' "${wrapper}" 2>/dev/null)" != "# safe-gate-wrapper v1 tool=${tool}" ]]; then
+      broken+=("${tool}")
+    fi
+  done
+  if (( ${#broken[@]} > 0 )); then
+    print -u2 -- "safe: install gating is NOT active for: ${broken[*]} — run safe's install.sh; details: safe status"
     _SAFE_GATE_WARNED=1
   fi
 
