@@ -41,6 +41,14 @@ delegates to the real tool: the first executable of that name on PATH that is
 not itself a wrapper. For node tools that is normally the mise/asdf shim, so
 per-project tool versions keep resolving.
 
+`mise` itself is wrapped too: backend package installs (`npm:*`, `pipx:*`,
+`cargo:*`, `go:*`) are audited on `mise install`/`up`/`use` — bare
+invocations preflight the configured tools and audit not-yet-installed (and,
+on `up`, floating-version) backend entries — and a gated command behind
+`mise exec --` gets the routing/audit pass while mise keeps the execution.
+Official runtime installs (`node@22`) pass through; non-registry backends
+(aqua/ubi/gem) pass with an explicit notice that they are not audit-gated.
+
 Package installs run:
 
 ```bash

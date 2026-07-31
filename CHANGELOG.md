@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Gate `mise` backend installs: `mise install`/`up`/`use`/`exec` previously
+  installed registry packages (`npm:*`, `pipx:*`, `cargo:*`, `go:*` backends,
+  lifecycle scripts included) with no audit at all. A `mise` PATH wrapper now
+  routes through `safe gate`: explicit backend specs are audited like any
+  install; bare `mise install`/`up` preflights the configured tools (via
+  `mise ls --current --json`) and audits not-yet-installed entries — plus
+  floating-version entries on `up` (a pinned installed entry cannot change
+  without a config edit, so a fully pinned manifest audits nothing); a gated
+  command behind `mise exec --` gets the full routing/audit pass with the
+  exec left to mise (which owns the tool env). Official runtime installs
+  (`node@22`) pass through untouched; non-registry backends (aqua/ubi/gem)
+  pass with an explicit not-audit-gated notice.
+
 - Second review round (PR#29 delta findings): custom package sources
   (`--registry`, `--index-url`, `--find-links`, `--no-index`, composer
   `--repository`) now floor the verdict at WARN for every ecosystem — exact

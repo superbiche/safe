@@ -116,11 +116,19 @@ safe_gate_resolve_real() {
   return 1
 }
 
-# Delegate to the real tool. Never returns.
+# Delegate to the real tool. Never returns — except in audit-only mode
+# (SAFE_GATE_NO_EXEC=1, used when mise wraps an inner gated command: the
+# routing/audit runs, the exec is the outer tool's job). A stray external
+# SAFE_GATE_NO_EXEC makes commands audit-then-not-run: fail-safe, not a
+# bypass.
 safe_gate_exec_real() {
   local tool="$1"
   shift
   local real
+
+  if [[ "${SAFE_GATE_NO_EXEC:-}" == "1" ]]; then
+    return 0
+  fi
 
   real="$(safe_gate_resolve_real "$tool")"
   if [[ -z "$real" ]]; then
@@ -1728,6 +1736,196 @@ safe_gate_composer() {
 # Entry point
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# mise: the runtime manager also installs BACKEND packages (npm:*, pipx:*,
+# cargo:*, go:*) with lifecycle scripts — completely unaudited before this.
+# Runtime installs (node@22, python@3.12) pass through: official runtimes,
+# not registry packages. Non-registry backends (aqua/ubi/gem/asdf plugins)
+# have no advisory source to audit against; they pass with a notice.
+# ---------------------------------------------------------------------------
+
+safe_gate_mise_backend_ecosystem() {
+  case "$1" in
+    npm) printf '%s' "npm" ;;
+    pipx|pip) printf '%s' "python" ;;
+    cargo) printf '%s' "rust" ;;
+    go) printf '%s' "go" ;;
+    *) return 1 ;;
+  esac
+}
+
+# npm:@scope/pkg@1.2.3 -> backend \t name \t version (version may be empty).
+safe_gate_mise_parse_spec() {
+  local spec="$1" backend rest name version=""
+  [[ "$spec" == *:* ]] || return 1
+  backend="${spec%%:*}"
+  rest="${spec#*:}"
+  [[ -n "$backend" && -n "$rest" ]] || return 1
+  if [[ "$rest" == @*/*@* ]]; then
+    name="${rest%@*}"
+    version="${rest##*@}"
+  elif [[ "$rest" == *@* && "$rest" != @* ]]; then
+    name="${rest%@*}"
+    version="${rest##*@}"
+  else
+    name="$rest"
+  fi
+  printf '%s\t%s\t%s\n' "$backend" "$name" "$version"
+}
+
+safe_gate_mise_check_spec() {
+  local spec="$1" backend name version eco pkg
+  IFS=$'\t' read -r backend name version <<<"$(safe_gate_mise_parse_spec "$spec")"
+  # No colon = an official runtime (node@22): not a registry package.
+  [[ -n "${backend}" && -n "${name}" ]] || return 0
+  if ! eco="$(safe_gate_mise_backend_ecosystem "$backend")"; then
+    safe_gate_err "safe: mise ${spec}: '${backend}' backend has no registry advisory source; not audit-gated — review manually if untrusted"
+    return 0
+  fi
+  pkg="$name"
+  # "latest" is the unpinned marker, not a version: audit the bare name and
+  # let safe-audit resolve the real target (never audit a literal @latest).
+  [[ -n "$version" && "$version" != "latest" ]] && pkg="${name}@${version}"
+  safe_gate_check "$pkg" "$eco"
+}
+
+# Backend entries a bare `mise install`/`mise up` could fetch: not-installed
+# entries always; for upgrades, also entries whose requested version floats
+# (a pinned+installed entry cannot change without a config edit).
+safe_gate_mise_config_specs() {
+  local include_floating="$1" mise_real
+  mise_real="$(safe_gate_resolve_real mise)" || return 0
+  "$mise_real" ls --current --json 2>/dev/null | jq -r --argjson floating "$include_floating" '
+    to_entries[]
+    | select(.key | contains(":"))
+    | .key as $k
+    | .value[]?
+    | select(
+        (((.installed // false)) | not)
+        or ($floating == 1 and (((.requested_version // "") | test("^[0-9]")) | not))
+      )
+    | ($k + (if (.requested_version // "") != "" then "@" + .requested_version else "" end))
+  ' 2>/dev/null || true
+}
+
+safe_gate_mise_gate_install() {
+  local include_floating="$1"
+  shift
+  local -a specs=()
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -*) ;;
+      *) specs+=("$arg") ;;
+    esac
+  done
+  if (( ${#specs[@]} == 0 )); then
+    local line
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && specs+=("$line")
+    done < <(safe_gate_mise_config_specs "$include_floating")
+  fi
+  local spec
+  for spec in ${specs[@]+"${specs[@]}"}; do
+    safe_gate_mise_check_spec "$spec" || return $?
+  done
+  return 0
+}
+
+safe_gate_mise_gate_exec() {
+  local -a specs=() cmd=()
+  local seen_dashdash=0 arg
+  for arg in "$@"; do
+    if (( seen_dashdash )); then
+      cmd+=("$arg")
+      continue
+    fi
+    if [[ "$arg" == "--" ]]; then
+      seen_dashdash=1
+      continue
+    fi
+    case "$arg" in
+      -*) ;;
+      *) specs+=("$arg") ;;
+    esac
+  done
+  # Tool specs before -- install on demand when missing: audit them.
+  local spec
+  for spec in ${specs[@]+"${specs[@]}"}; do
+    safe_gate_mise_check_spec "$spec" || return $?
+  done
+  # A gated tool behind -- gets the full routing/audit pass with the exec
+  # suppressed (the outer mise owns execution and its env).
+  if (( ${#cmd[@]} > 0 )); then
+    case "${cmd[0]}" in
+      npm|pnpm|pnpx|bun|yarn|pip|pip3|uv|cargo|go|composer)
+        ( SAFE_GATE_NO_EXEC=1 && safe_gate_main "${cmd[0]}" "${cmd[@]:1}" ) || return $?
+        ;;
+    esac
+  fi
+  return 0
+}
+
+safe_gate_mise() {
+  local -a args=("$@")
+  local i=0 subcommand="" subidx=-1 arg
+  while (( i < ${#args[@]} )); do
+    arg="${args[$i]}"
+    case "$arg" in
+      -C|--cd|-E|--env|-j|--jobs|--log-level|--output)
+        i=$((i + 2))
+        continue
+        ;;
+      -*=*)
+        i=$((i + 1))
+        continue
+        ;;
+      -q|--quiet|-v|--verbose|-y|--yes|-n|--dry-run|--raw|--debug|--trace|--silent|--no-config|-V|--version|-h|--help)
+        i=$((i + 1))
+        continue
+        ;;
+      -*)
+        safe_gate_err "safe: BLOCKED mise — unrecognized leading flag '${arg}' hides the subcommand (rewrite as --flag=value); details: safe explain"
+        return 100
+        ;;
+      *)
+        subcommand="$arg"
+        subidx=$i
+        break
+        ;;
+    esac
+  done
+
+  if [[ -z "$subcommand" ]]; then
+    safe_gate_exec_real mise "$@"
+    return $?
+  fi
+
+  local -a rest=("${args[@]:$((subidx + 1))}")
+  case "$subcommand" in
+    install|i)
+      safe_gate_mise_gate_install 0 ${rest[@]+"${rest[@]}"} || return $?
+      ;;
+    upgrade|up)
+      safe_gate_mise_gate_install 1 ${rest[@]+"${rest[@]}"} || return $?
+      ;;
+    use|u)
+      local use_arg
+      for use_arg in ${rest[@]+"${rest[@]}"}; do
+        case "$use_arg" in
+          -*) ;;
+          *) safe_gate_mise_check_spec "$use_arg" || return $? ;;
+        esac
+      done
+      ;;
+    exec|x)
+      safe_gate_mise_gate_exec ${rest[@]+"${rest[@]}"} || return $?
+      ;;
+  esac
+
+  safe_gate_exec_real mise "$@"
+}
+
 safe_gate_main() {
   local tool="${1:-}"
   shift || true
@@ -1755,6 +1953,7 @@ safe_gate_main() {
     cargo) safe_gate_cargo "$@" ;;
     go) safe_gate_go "$@" ;;
     composer) safe_gate_composer "$@" ;;
+    mise) safe_gate_mise "$@" ;;
     *)
       # Fail closed: a wrapper exists for a tool this library has no routing
       # table for, so nothing can vouch for the command.

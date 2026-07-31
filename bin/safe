@@ -108,7 +108,7 @@ Audits the install, update, and exec-style subcommands of <tool> with
 `safe audit`, then delegates to the real <tool> on PATH. Called by the
 generated wrappers in ~/.local/bin (see install.sh); not normally run by hand.
 
-Supported tools: npm pnpm pnpx yarn bun pip pip3 uv cargo go composer
+Supported tools: npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise
 EOF
 }
 

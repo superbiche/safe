@@ -86,13 +86,36 @@ STUB
   chmod +x "${bin_dir}/safe-audit"
 }
 
+# mise needs a smarter stub: the gate enumerates configured backend tools
+# via `mise ls --current --json` on the REAL mise before delegating.
+write_mise_stub() {
+  local bin_dir="$1"
+
+  cat > "${bin_dir}/mise" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "ls" ]]; then
+  printf '%s\n' "${MISE_LS_JSON:-{\}}"
+  exit 0
+fi
+{
+  printf 'REAL\tmise'
+  for arg in "$@"; do
+    printf '\t%s' "${arg}"
+  done
+  printf '\n'
+} >> "${SAFE_INSTALL_COMMAND_LOG}"
+exit "${SAFE_INSTALL_REAL_STATUS:-0}"
+STUB
+  chmod +x "${bin_dir}/mise"
+}
+
 # The wrappers install.sh generates. Shape must stay in sync with
 # install_gate_wrappers() in install.sh — that is what the suite exercises.
 write_gate_wrappers() {
   local wrapper_dir="$1"
   local tool
 
-  for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer; do
+  for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise; do
     cat > "${wrapper_dir}/${tool}" <<EOF
 #!/usr/bin/env bash
 # safe-gate-wrapper v1 tool=${tool}
@@ -123,6 +146,7 @@ prepare_case() {
   for tool in npm pnpm pnpx yarn bun uv pip pip3 cargo go composer volta; do
     write_tool_stub "${BIN_DIR}" "${tool}"
   done
+  write_mise_stub "${BIN_DIR}"
 
   # The real dispatcher: `safe gate` is under test, so nothing about it is
   # stubbed. Only safe-audit is (via SAFE_AUDIT_PATH, see run_zsh).
@@ -152,6 +176,7 @@ run_zsh() {
     SAFE_AUDIT_SCAN_STATUS="${SAFE_AUDIT_SCAN_STATUS:-}" \
     SAFE_AUDIT_CHECK_STATUS="${SAFE_AUDIT_CHECK_STATUS:-}" \
     SAFE_INSTALL_REAL_STATUS="${SAFE_INSTALL_REAL_STATUS:-}" \
+    MISE_LS_JSON="${MISE_LS_JSON:-}" \
     "${ZSH_BIN}" -fc 'eval "${SAFE_INSTALL_TEST_SCRIPT}"'
   ) >"${OUT_FILE}" 2>"${ERR_FILE}"
   STATUS=$?
@@ -1692,6 +1717,113 @@ case_stale_evidence_is_source_scoped() {
   pass "$FUNCNAME"
 }
 
+case_mise_use_backend_audits() {
+  prepare_case "mise-use-backend-audits"
+  SAFE_INSTALL_TEST_SCRIPT='mise use npm:blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+
+  SAFE_INSTALL_TEST_SCRIPT='mise use npm:okpkg@1.2.3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg@1.2.3\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tuse\tnpm:okpkg@1.2.3' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_runtime_and_other_backends_pass() {
+  prepare_case "mise-runtime-passes"
+  # Official runtimes are not registry packages; no audit.
+  SAFE_INSTALL_TEST_SCRIPT='mise install node@22' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tinstall\tnode@22' "$FUNCNAME" || return
+
+  # Non-registry backends pass with a notice (no advisory source).
+  SAFE_INSTALL_TEST_SCRIPT='mise install ubi:owner/tool' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'no registry advisory source' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_bare_install_preflights_config() {
+  prepare_case "mise-bare-install-preflight"
+  # One backend tool not installed yet -> audited; blockme blocks the run.
+  MISE_LS_JSON='{"node": [{"version": "22.0.0", "requested_version": "22.0.0", "installed": true}], "npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": false}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+
+  # Everything installed and pinned -> nothing audited, delegate runs.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:okpkg": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tinstall' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_bare_upgrade_audits_floating() {
+  prepare_case "mise-bare-upgrade-floating"
+  # Installed but floating (requested "latest") can change on `mise up`.
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "latest", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise up' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # Pinned + installed cannot change without a config edit -> no audit.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise up' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_exec_gates_inner_command() {
+  prepare_case "mise-exec-gates-inner"
+  SAFE_INSTALL_TEST_SCRIPT='mise exec -- npm install blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+
+  # Tool specs before -- install on demand: audited too.
+  SAFE_INSTALL_TEST_SCRIPT='mise exec npm:blockme -- blockme --help' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+
+  # Non-gated inner command passes through to the real mise (which owns env).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise exec -- node script.js' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\texec\t--\tnode\tscript.js' "$FUNCNAME" || return
+
+  # Gated-but-clean inner command: audited once, then the ORIGINAL mise
+  # command runs (the gate must not exec the inner npm itself).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise exec -- npm install okpkg' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\texec\t--\tnpm\tinstall\tokpkg' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_leading_flag_fails_closed() {
+  prepare_case "mise-leading-flag"
+  SAFE_INSTALL_TEST_SCRIPT='mise --frobnicate value install npm:blockme' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'REAL' "$FUNCNAME" || return
+  # -C consumes its value; the subcommand is still found and gated.
+  SAFE_INSTALL_TEST_SCRIPT='mise -C sub install npm:blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_uninstall_cleans_shell_and_legacy_binaries() {
   prepare_case "uninstall-cleans-shell-and-legacy-binaries"
   mkdir -p "${HOME_DIR}/.local/bin" "${HOME_DIR}/.local/share/zsh/site-functions" "${HOME_DIR}/.config/safe-run/completions" "${HOME_DIR}/.config/safe" "${HOME_DIR}/.local/share/safe"
@@ -1818,6 +1950,12 @@ main() {
     case_install_preserves_symlinked_zshrc \
     case_install_merges_legacy_state_into_new_schema \
     case_uninstall_preserves_symlinked_zshrc \
+    case_mise_use_backend_audits \
+    case_mise_runtime_and_other_backends_pass \
+    case_mise_bare_install_preflights_config \
+    case_mise_bare_upgrade_audits_floating \
+    case_mise_exec_gates_inner_command \
+    case_mise_leading_flag_fails_closed \
     case_uninstall_cleans_shell_and_legacy_binaries
   do
     "$case"
