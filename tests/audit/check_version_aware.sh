@@ -1694,5 +1694,115 @@ if expect_status 0 "a 0/0 no-index pair never floors"; then
 fi
 
 # ---------------------------------------------------------------------------
+# 57. Alternate npm config files are threaded as PATHS with npm's config
+#     tiers — scoped keys resolve per package, generic keys reach the floor
+#     (delta-7 finding 3.2b)
+# ---------------------------------------------------------------------------
+prepare_case userconfig-scoped-resolution
+printf '@foo:registry=https://foo.example\n@bar:registry=https://bar.example\n' > "$CASE_DIR/alt-npmrc"
+printf '{"install": {"trusted_registries": ["https://foo.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_REGISTRY_URL_LOG="$CASE_DIR/registry-urls.log" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- @foo/pkg --ecosystem npm --npm-userconfig "$CASE_DIR/alt-npmrc" --gate install
+if expect_status 0 "userconfig scoped key resolves the matching scope only"; then
+  pass "userconfig scoped key resolves the matching scope only"
+fi
+if grep -q '^https://foo\.example/' "$CASE_DIR/registry-urls.log" \
+  && ! grep -q 'bar\.example' "$CASE_DIR/registry-urls.log"; then
+  pass "npm-oracle: the matching scope's key wins from an alternate file"
+else
+  cat "$CASE_DIR/registry-urls.log" >&2
+  fail "npm-oracle: the matching scope's key wins from an alternate file"
+fi
+prepare_case userconfig-generic-floor
+printf 'registry=https://evil.example\n' > "$CASE_DIR/alt-npmrc"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --npm-userconfig "$CASE_DIR/alt-npmrc" --gate install
+if expect_status 10 "a generic registry in an argv userconfig floors"; then
+  pass "a generic registry in an argv userconfig floors"
+fi
+
+# ---------------------------------------------------------------------------
+# 58. pip config semantics: [install] overrides [global] regardless of file
+#     order, keys normalize (case, underscores), spaced paths survive
+#     (delta-7 finding 3.2c)
+# ---------------------------------------------------------------------------
+prepare_case pip-section-precedence
+cat > "$CASE_DIR/pip.conf" <<'CONF'
+[install]
+index-url = https://evil.example/simple
+
+[global]
+index-url = https://pypi.org/simple
+CONF
+run_check \
+  PIP_CONFIG_FILE="$CASE_DIR/pip.conf" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 10 "the install section overrides a trailing global section"; then
+  pass "the install section overrides a trailing global section"
+fi
+prepare_case pip-key-normalization
+cat > "$CASE_DIR/pip.conf" <<'CONF'
+[global]
+INDEX_URL: https://evil.example/simple
+CONF
+run_check \
+  PIP_CONFIG_FILE="$CASE_DIR/pip.conf" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 10 "pip-style key normalization (case + underscores) applies"; then
+  pass "pip-style key normalization (case + underscores) applies"
+fi
+prepare_case pip-spaced-path
+mkdir -p "$CASE_DIR/conf dir"
+cat > "$CASE_DIR/conf dir/pip.conf" <<'CONF'
+[global]
+index-url = https://evil.example/simple
+CONF
+run_check \
+  PIP_CONFIG_FILE="$CASE_DIR/conf dir/pip.conf" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 10 "a config path containing spaces is still swept"; then
+  pass "a config path containing spaces is still swept"
+fi
+
+# ---------------------------------------------------------------------------
+# 59. pip's full boolean vocabulary: y and t are true too (delta-7 N3)
+# ---------------------------------------------------------------------------
+prepare_case pip-noindex-y
+run_check \
+  PIP_NO_INDEX=y \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 10 "PIP_NO_INDEX=y floors"; then
+  pass "PIP_NO_INDEX=y floors"
+fi
+prepare_case pip-noindex-t-config
+cat > "$CASE_DIR/pip.conf" <<'CONF'
+[global]
+no-index: t
+CONF
+run_check \
+  PIP_CONFIG_FILE="$CASE_DIR/pip.conf" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 10 "a config-file no-index: t floors"; then
+  pass "a config-file no-index: t floors"
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

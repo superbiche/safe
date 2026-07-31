@@ -3888,10 +3888,15 @@ normalize_source_set() {
   printf '%s' "$out"
 }
 
-# The user-level npm config file: --userconfig's env forms replace it
-# entirely (lowercase wins, npm's own env precedence; delta-6 finding 3.2b).
+# The user-level npm config file: an argv --userconfig (threaded as a PATH
+# via --npm-userconfig, never flattened into values — delta-7 finding 3.2b)
+# wins, then the env forms (lowercase first, npm's own env precedence),
+# then the default. The global tier is analogous, with no default file
+# modeled (npm's builtin /usr/etc/npmrc is operator-owned machine state).
 npm_user_rc() {
-  if [[ -n "${npm_config_userconfig:-}" ]]; then
+  if [[ -n "${CHECK_NPM_USERCONFIG:-}" ]]; then
+    printf '%s' "$CHECK_NPM_USERCONFIG"
+  elif [[ -n "${npm_config_userconfig:-}" ]]; then
     printf '%s' "$npm_config_userconfig"
   elif [[ -n "${NPM_CONFIG_USERCONFIG:-}" ]]; then
     printf '%s' "$NPM_CONFIG_USERCONFIG"
@@ -3900,17 +3905,14 @@ npm_user_rc() {
   fi
 }
 
-# Every registry value (generic and scoped keys) declared in an npm config
-# file — the conservative sweep for alternate config files whose keys all
-# become effective (mirrors the wrappers' --userconfig handling).
-npm_rcfile_registry_values() {
-  local rc_file="$1" line
-  [[ -f "$rc_file" ]] || return 0
-  while IFS= read -r line; do
-    line="${line#*=}"
-    line="${line//[[:space:]]/}"
-    [[ -n "$line" ]] && printf '%s\n' "$line"
-  done < <(grep -E '^[[:space:]]*(@[^=[:space:]]+:)?registry[[:space:]]*=' "$rc_file" 2>/dev/null || true)
+npm_global_rc() {
+  if [[ -n "${CHECK_NPM_GLOBALCONFIG:-}" ]]; then
+    printf '%s' "$CHECK_NPM_GLOBALCONFIG"
+  elif [[ -n "${npm_config_globalconfig:-}" ]]; then
+    printf '%s' "$npm_config_globalconfig"
+  elif [[ -n "${NPM_CONFIG_GLOBALCONFIG:-}" ]]; then
+    printf '%s' "$NPM_CONFIG_GLOBALCONFIG"
+  fi
 }
 
 npm_registry_url() {
@@ -3933,8 +3935,8 @@ npm_registry_url() {
     [[ -n "$scoped_src" ]] || scoped_src=$(printenv "NPM_CONFIG_${scope}:registry" 2>/dev/null || true)
     if [[ -z "$scoped_src" ]]; then
       local rc line scope_re="${scope//./\\.}"
-      for rc in "${CHECK_PROJECT_DIR:-.}/.npmrc" "$(npm_user_rc)"; do
-        [[ -f "$rc" ]] || continue
+      for rc in "${CHECK_PROJECT_DIR:-.}/.npmrc" "$(npm_user_rc)" "$(npm_global_rc)"; do
+        [[ -n "$rc" && -f "$rc" ]] || continue
         line=$(grep -E "^[[:space:]]*${scope_re}:registry[[:space:]]*=" "$rc" 2>/dev/null | tail -n 1 || true)
         if [[ -n "$line" ]]; then
           scoped_src=$(trim "${line#*=}")
@@ -3979,8 +3981,8 @@ npm_registry_url() {
     return 0
   fi
   local rc line
-  for rc in "${CHECK_PROJECT_DIR:-.}/.npmrc" "$(npm_user_rc)"; do
-    [[ -f "$rc" ]] || continue
+  for rc in "${CHECK_PROJECT_DIR:-.}/.npmrc" "$(npm_user_rc)" "$(npm_global_rc)"; do
+    [[ -n "$rc" && -f "$rc" ]] || continue
     line=$(grep -E '^[[:space:]]*registry[[:space:]]*=' "$rc" 2>/dev/null | tail -n 1 || true)
     if [[ -n "$line" ]]; then
       printf '%s' "$(trim "${line#*=}")" | sed 's:/*$::'
@@ -4005,32 +4007,42 @@ python_bool_truthy() {
   local v
   v=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   case "$v" in
-    1|true|yes|on) return 0 ;;
+    1|true|t|yes|y|on) return 0 ;;
   esac
   return 1
 }
 
-# Values for one key from a pip config file, with pip/configparser syntax:
-# both '=' and ':' delimiters, comments, and indented continuation lines
-# (multi-line find-links lists are idiomatic). Line-grep missed the colon
-# and continuation forms pip itself accepts (delta-6 finding 3.2c).
-# Sections are ignored: the swept keys only occur meaningfully in
-# [global]/[install]/[download].
+# Effective value lines for one key from a pip config file, with
+# pip/configparser semantics (delta-6 finding 3.2c; delta-7 tightened):
+# '=' and ':' delimiters, comments, indented continuation lines (multi-line
+# find-links lists are idiomatic), option names normalized the way pip does
+# (ASCII lowercase, '_' -> '-'), and SECTION precedence — [install] (the
+# audited command's section) overrides [global] regardless of file order;
+# within a section a later duplicate key wins. Other sections do not apply
+# to installs and are ignored.
 pip_config_values() {
   local rc_file="$1" key="$2"
   [[ -f "$rc_file" ]] || return 0
   awk -v key="$key" '
+    function norm(s) { s = tolower(s); gsub(/_/, "-", s); return s }
+    function trimmed(s) { sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+    BEGIN { sect = "" }
+    /^[ \t]*[#;]/ { next }
+    /^[ \t]*\[/ {
+      line = $0
+      sub(/^[ \t]*\[/, "", line); sub(/\].*$/, "", line)
+      sect = tolower(trimmed(line))
+      grab = 0
+      next
+    }
     /^[ \t]/ {
       if (grab) {
-        line = $0
-        sub(/^[ \t]+/, "", line); sub(/[ \t\r]+$/, "", line)
-        if (line != "") print line
+        line = trimmed($0)
+        if (line != "") vals[grabsect] = vals[grabsect] "\n" line
       }
       next
     }
     { grab = 0 }
-    /^[ \t]*[#;]/ { next }
-    /^[ \t]*\[/ { next }
     {
       line = $0
       sub(/^[ \t]+/, "", line)
@@ -4039,12 +4051,16 @@ pip_config_values() {
       if (d == 0 || (c > 0 && c < p)) d = c
       if (d == 0) next
       k = substr(line, 1, d - 1); sub(/[ \t]+$/, "", k)
-      if (k == key) {
+      if (norm(k) == key && (sect == "global" || sect == "install")) {
         grab = 1
-        v = substr(line, d + 1)
-        sub(/^[ \t]+/, "", v); sub(/[ \t\r]+$/, "", v)
-        if (v != "") print v
+        grabsect = sect
+        vals[sect] = trimmed(substr(line, d + 1))
       }
+    }
+    END {
+      out = ("install" in vals) ? vals["install"] : (("global" in vals) ? vals["global"] : "")
+      n = split(out, a, "\n")
+      for (i = 1; i <= n; i++) if (a[i] != "") print a[i]
     }
   ' "$rc_file" 2>/dev/null || true
 }
@@ -4060,11 +4076,17 @@ python_env_sources() {
   if python_bool_truthy "${PIP_NO_INDEX:-}" || python_bool_truthy "${UV_NO_INDEX:-}"; then
     out="${out:+$out }local:no-index"
   fi
+  # Config paths are iterated as a quoted array: word-splitting an injected
+  # PIP_CONFIG_FILE containing spaces silently missed the file entirely
+  # (delta-7 finding 3.2c).
+  local -a py_rc_files=()
+  [[ -n "${PIP_CONFIG_FILE:-}" ]] && py_rc_files+=("$PIP_CONFIG_FILE")
+  [[ -n "${VIRTUAL_ENV:-}" ]] && py_rc_files+=("$VIRTUAL_ENV/pip.conf")
+  py_rc_files+=("$HOME/.config/pip/pip.conf" "$HOME/.pip/pip.conf")
   local rc val
   if [[ -z "${PIP_INDEX_URL:-}" ]]; then
-    for rc in ${PIP_CONFIG_FILE:-} ${VIRTUAL_ENV:+${VIRTUAL_ENV}/pip.conf} "$HOME/.config/pip/pip.conf" "$HOME/.pip/pip.conf"; do
+    for rc in "${py_rc_files[@]}"; do
       [[ -f "$rc" ]] || continue
-      # Later duplicate keys win within a file (configparser semantics).
       val=$(pip_config_values "$rc" index-url | tail -n 1)
       if [[ -n "$val" ]]; then
         out="${out:+$out }$val"
@@ -4072,7 +4094,7 @@ python_env_sources() {
       fi
     done
   fi
-  for rc in ${PIP_CONFIG_FILE:-} ${VIRTUAL_ENV:+${VIRTUAL_ENV}/pip.conf} "$HOME/.config/pip/pip.conf" "$HOME/.pip/pip.conf"; do
+  for rc in "${py_rc_files[@]}"; do
     [[ -f "$rc" ]] || continue
     while IFS= read -r val; do
       [[ -n "$val" ]] && out="${out:+$out }$val"
@@ -4114,14 +4136,11 @@ derive_effective_sources() {
   CHECK_EFFECTIVE_SOURCES=$(normalize_source_set "${CHECK_REGISTRY:-}")
   case "$ecosystem" in
     npm)
+      # The effective endpoint for THIS package, resolved with npm's config
+      # tiers (argv/env-selected alternate config files included via
+      # npm_user_rc/npm_global_rc). All-keys sweeps of alternate files were
+      # both wrong-precedence and over-flooring (delta-7 finding 3.2b).
       extra=$(npm_registry_url "$name")
-      # An env-selected alternate user config file makes every registry key
-      # inside it effective — same conservative all-keys sweep the wrappers
-      # apply to argv --userconfig (delta-6 finding 3.2b).
-      local env_userconfig="${npm_config_userconfig:-${NPM_CONFIG_USERCONFIG:-}}"
-      if [[ -n "$env_userconfig" ]]; then
-        extra="$extra $(npm_rcfile_registry_values "$env_userconfig" | tr '\n' ' ')"
-      fi
       ;;
     python) extra=$(python_env_sources) ;;
     go) extra=$(go_env_sources) ;;
@@ -4705,12 +4724,23 @@ host_allow_matches_resolved() {
 effective_sources_command() {
   local ecosystem="" spec=""
   local CHECK_DIST_TAG="" CHECK_REGISTRY="" CHECK_PROJECT_DIR=""
+  local CHECK_NPM_USERCONFIG="" CHECK_NPM_GLOBALCONFIG=""
   local CHECK_EFFECTIVE_SOURCES=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --ecosystem)
         [[ $# -lt 2 ]] && die "--ecosystem requires a value"
         ecosystem="$2"
+        shift 2
+        ;;
+      --npm-userconfig)
+        [[ $# -lt 2 ]] && die "--npm-userconfig requires a value"
+        CHECK_NPM_USERCONFIG="$2"
+        shift 2
+        ;;
+      --npm-globalconfig)
+        [[ $# -lt 2 ]] && die "--npm-globalconfig requires a value"
+        CHECK_NPM_GLOBALCONFIG="$2"
         shift 2
         ;;
       --registry)
@@ -4753,12 +4783,23 @@ check_command() {
   # argv set plus any env/npmrc-configured npm source, computed at the trust
   # floor; the receipt writer derives evidence identity from it.
   local CHECK_DIST_TAG="" CHECK_REGISTRY="" CHECK_PROJECT_DIR=""
+  local CHECK_NPM_USERCONFIG="" CHECK_NPM_GLOBALCONFIG=""
   local CHECK_EFFECTIVE_SOURCES=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --ecosystem)
         [[ $# -lt 2 ]] && die "--ecosystem requires a value"
         ecosystem="$2"
+        shift 2
+        ;;
+      --npm-userconfig)
+        [[ $# -lt 2 ]] && die "--npm-userconfig requires a value"
+        CHECK_NPM_USERCONFIG="$2"
+        shift 2
+        ;;
+      --npm-globalconfig)
+        [[ $# -lt 2 ]] && die "--npm-globalconfig requires a value"
+        CHECK_NPM_GLOBALCONFIG="$2"
         shift 2
         ;;
       --json)

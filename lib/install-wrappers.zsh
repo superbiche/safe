@@ -44,6 +44,8 @@ safe_install_run_audit() {
   [[ -n "${SAFE_INSTALL_DIST_TAG:-}" ]] && extra+=(--dist-tag "${SAFE_INSTALL_DIST_TAG}")
   [[ -n "${SAFE_INSTALL_REGISTRY:-}" ]] && extra+=(--registry "${SAFE_INSTALL_REGISTRY}")
   [[ -n "${SAFE_INSTALL_PROJECT_DIR:-}" ]] && extra+=(--project-dir "${SAFE_INSTALL_PROJECT_DIR}")
+  [[ -n "${SAFE_INSTALL_NPM_USERCONFIG:-}" ]] && extra+=(--npm-userconfig "${SAFE_INSTALL_NPM_USERCONFIG}")
+  [[ -n "${SAFE_INSTALL_NPM_GLOBALCONFIG:-}" ]] && extra+=(--npm-globalconfig "${SAFE_INSTALL_NPM_GLOBALCONFIG}")
   if (( $+commands[timeout] )); then
     command timeout "${_SAFE_INSTALL_TIMEOUT_SECONDS:-${SAFE_INSTALL_TIMEOUT_SECONDS:-30}}" safe audit check "$@" "${extra[@]}"
   else
@@ -82,18 +84,12 @@ safe_install_add_source() {
   SAFE_INSTALL_REGISTRY="${kept[*]}"
 }
 
-# An alternate npm config file (--userconfig/--globalconfig) makes every
-# registry key inside it effective; surface those as sources (delta-5
-# finding 3.2). Generic and scoped keys both count.
-safe_install_add_npmrc_sources() {
-  local rc_file="$1" line
-  [[ -f "${rc_file}" ]] || return 0
-  while IFS= read -r line; do
-    line="${line#*=}"
-    line="${line//[[:space:]]/}"
-    [[ -n "${line}" ]] && safe_install_add_source "${line}"
-  done < <(command grep -E '^[[:space:]]*(@[^=[:space:]]+:)?registry[[:space:]]*=' "${rc_file}" 2>/dev/null || true)
-}
+# Alternate npm config files are threaded to safe-audit AS PATHS, never
+# flattened into the source set: extracting their values here lost the
+# key/scope and npm's config-tier precedence (wrong-registry resolution),
+# and copied any inline credentials out of the protected file into argv and
+# shell state (delta-7 findings 3.2b and N2). safe-audit resolves the
+# effective endpoint from the file itself.
 
 safe_install_scan_target_flags() {
   local family="$1"
@@ -101,6 +97,8 @@ safe_install_scan_target_flags() {
   typeset -g SAFE_INSTALL_DIST_TAG=""
   typeset -g SAFE_INSTALL_REGISTRY=""
   typeset -g SAFE_INSTALL_PROJECT_DIR=""
+  typeset -g SAFE_INSTALL_NPM_USERCONFIG=""
+  typeset -g SAFE_INSTALL_NPM_GLOBALCONFIG=""
   local prev="" arg
   for arg in "$@"; do
     case "${family}" in
@@ -115,14 +113,16 @@ safe_install_scan_target_flags() {
           # whole config files whose registry keys become effective.
           --registry) safe_install_add_source "${arg}" ;;
           --@*:registry) safe_install_add_source "${prev#--}=${arg}" ;;
-          --userconfig|--globalconfig) safe_install_add_npmrc_sources "${arg}" ;;
+          --userconfig) SAFE_INSTALL_NPM_USERCONFIG="${arg}" ;;
+          --globalconfig) SAFE_INSTALL_NPM_GLOBALCONFIG="${arg}" ;;
           --prefix|-C|--cwd|--dir) SAFE_INSTALL_PROJECT_DIR="${arg}" ;;
         esac
         case "${arg}" in
           --tag=*) SAFE_INSTALL_DIST_TAG="${arg#*=}" ;;
           --registry=*) safe_install_add_source "${arg#*=}" ;;
           --@*:registry=*) safe_install_add_source "${arg#--}" ;;
-          --userconfig=*|--globalconfig=*) safe_install_add_npmrc_sources "${arg#*=}" ;;
+          --userconfig=*) SAFE_INSTALL_NPM_USERCONFIG="${arg#*=}" ;;
+          --globalconfig=*) SAFE_INSTALL_NPM_GLOBALCONFIG="${arg#*=}" ;;
           --prefix=*|--cwd=*|--dir=*) SAFE_INSTALL_PROJECT_DIR="${arg#*=}" ;;
         esac
         ;;
@@ -223,6 +223,8 @@ safe_install_known_matches() {
   local -a es_args=("${name}" --ecosystem "${ecosystem}")
   [[ -n "${SAFE_INSTALL_REGISTRY:-}" ]] && es_args+=(--registry "${SAFE_INSTALL_REGISTRY}")
   [[ -n "${SAFE_INSTALL_PROJECT_DIR:-}" ]] && es_args+=(--project-dir "${SAFE_INSTALL_PROJECT_DIR}")
+  [[ -n "${SAFE_INSTALL_NPM_USERCONFIG:-}" ]] && es_args+=(--npm-userconfig "${SAFE_INSTALL_NPM_USERCONFIG}")
+  [[ -n "${SAFE_INSTALL_NPM_GLOBALCONFIG:-}" ]] && es_args+=(--npm-globalconfig "${SAFE_INSTALL_NPM_GLOBALCONFIG}")
   local current_source
   current_source="$(command safe audit effective-sources "${es_args[@]}" 2>/dev/null)" || return 1
   [[ -n "${current_source}" ]] || return 1
@@ -489,16 +491,31 @@ safe_install_check() {
   esac
 }
 
+# Scanned target state (which may carry an operational credential from an
+# argv --registry) never outlives the gate decision: this shell is
+# long-lived, and a lingering global is a credential-lifetime leak
+# (delta-7 finding N2). Cleared on EVERY exit path, after the last package.
+safe_install_clear_target_flags() {
+  SAFE_INSTALL_DIST_TAG=""
+  SAFE_INSTALL_REGISTRY=""
+  SAFE_INSTALL_PROJECT_DIR=""
+  SAFE_INSTALL_NPM_USERCONFIG=""
+  SAFE_INSTALL_NPM_GLOBALCONFIG=""
+}
+
 safe_install_check_many() {
   local ecosystem="$1"
   shift
-  local package
+  local package rc=0
 
   for package in "$@"; do
-    safe_install_check "${package}" "${ecosystem}" || return $?
+    safe_install_check "${package}" "${ecosystem}"
+    rc=$?
+    (( rc != 0 )) && break
   done
 
-  return 0
+  safe_install_clear_target_flags
+  return "${rc}"
 }
 
 safe_install_check_packages() {
@@ -531,7 +548,7 @@ safe_install_npm_like_packages() {
       -g|--global|-f|--force|-D|--dev|-P|--peer|-O|--optional|-E|--exact|-T|--tilde|--cached|--save|--save-prod|--save-dev|--save-optional|--save-peer|--no-save|--prefer-offline|--prefer-online|--legacy-peer-deps|--strict-peer-deps|--dry-run|--package-lock-only|--workspace-root|--ignore-scripts|--foreground-scripts)
         continue
         ;;
-      --tag|--registry|--cache|--prefix|--userconfig|--globalconfig|--workspace|-w|--filter|--omit|--include|--install-strategy|--save-prefix|--mode|--cwd)
+      --tag|--registry|--@*:registry|--cache|--prefix|--userconfig|--globalconfig|--workspace|-w|--filter|--omit|--include|--install-strategy|--save-prefix|--mode|--cwd)
         skip_next=1
         continue
         ;;

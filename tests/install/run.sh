@@ -1256,10 +1256,30 @@ case_npm_scoped_and_userconfig_sources_reach_audit() {
   SAFE_INSTALL_TEST_SCRIPT='npm install --@demo:registry=https://scoped.example @demo/pkg@1.2.3' run_zsh
   assert_log_contains $'AUDIT\tcheck\t@demo/pkg@1.2.3\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--registry\t@demo:registry=https://scoped.example' "$FUNCNAME" || return
 
+  # The prev-form scoped flag consumes its value: without that, the URL is
+  # parsed as an extra PACKAGE and audited (delta-7 finding 3.2b).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm install --@foo:registry https://foo.example @foo/pkg@1.2.3' run_zsh
+  assert_log_contains $'AUDIT\tcheck\t@foo/pkg@1.2.3\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--registry\t@foo:registry=https://foo.example' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'check\thttps://foo.example' "$FUNCNAME" || return
+
+  # Alternate config files thread as PATHS — value extraction lost key and
+  # precedence semantics and copied credentials into argv (delta-7 findings
+  # 3.2b/N2).
   : > "${LOG_FILE}"
   printf 'registry=https://userconf.example/\n@demo:registry=https://scopedconf.example\n' > "${WORK_DIR}/alt-npmrc"
   SAFE_INSTALL_TEST_SCRIPT='npm install --userconfig alt-npmrc okpkg@1.0.0' run_zsh
-  assert_log_contains $'AUDIT\tcheck\tokpkg@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--registry\thttps://userconf.example https://scopedconf.example' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--npm-userconfig\talt-npmrc' "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'userconf.example' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_wrapper_state_cleared_after_gate() {
+  prepare_case "wrapper-state-cleared"
+  # A long-lived interactive shell must not retain the scanned source set
+  # (possibly credential-bearing) after the gate decision (delta-7 N2).
+  SAFE_INSTALL_TEST_SCRIPT='npm install --registry https://alice:sekret@mirror.example okpkg@1.0.0; print -r -u2 -- "POST_REG=[${SAFE_INSTALL_REGISTRY:-}][${SAFE_INSTALL_NPM_USERCONFIG:-}]"' run_zsh
+  assert_err_contains_fragment 'POST_REG=[][]' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -1444,6 +1464,7 @@ main() {
     case_pip_cumulative_sources_all_reach_audit \
     case_npm_scoped_and_userconfig_sources_reach_audit \
     case_source_credentials_preserved_for_audit \
+    case_wrapper_state_cleared_after_gate \
     case_npm_repeated_registry_keeps_true_last \
     case_stale_evidence_is_source_scoped \
     case_install_idempotent_no_wrappers \
