@@ -1237,7 +1237,7 @@ case_status_probes_every_wrapper() {
   # Healthy: every wrapper resolves to its owned file.
   local status_out
   status_out="$(cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" "${HOME_DIR}/.local/bin/safe" status 2>/dev/null)"
-  grep -Fq 'wrappers:       ok (11/11' <<<"${status_out}" || { printf '%s\n' "${status_out}" >&2; fail "$FUNCNAME"; return; }
+  grep -Fq 'wrappers:       ok (12/12' <<<"${status_out}" || { printf '%s\n' "${status_out}" >&2; fail "$FUNCNAME"; return; }
 
   # A missing non-npm wrapper must flip the aggregate (review finding: an
   # npm-only probe concealed ungated siblings).

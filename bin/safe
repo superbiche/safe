@@ -164,7 +164,7 @@ cmd_version() {
 }
 
 # Keep in sync with GATE_TOOLS in install.sh and the gate-lib routing table.
-SAFE_GATE_TOOL_LIST=(npm pnpm pnpx yarn bun pip pip3 uv cargo go composer)
+SAFE_GATE_TOOL_LIST=(npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise)
 
 # A generated install wrapper: regular (never symlinked) file whose second
 # line is EXACTLY the per-tool marker (loose substring matching let foreign
