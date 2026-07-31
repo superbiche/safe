@@ -105,6 +105,29 @@ Dependency-only scan:
 safe audit scan --deps-only --project .
 ```
 
+### Scan cache (`--deps-only`)
+
+A dependency-only scan reads exactly one thing: the dependency evidence
+(lockfiles and manifests). When that evidence hashes to a set already scanned
+within 24 hours, re-running the scanners cannot produce a different verdict, so
+the recorded result is replayed instead:
+
+```text
+[safe audit] scan cache hit (17m) — dependency evidence unchanged; --no-cache forces a fresh scan
+```
+
+The verdict, counts, and exit code are the recorded ones. Entries live in
+`~/.local/share/safe/audit/scan-cache/<sha256>.json`, keyed on the machine,
+target, mode, and each evidence file's own hash — touch a lockfile or a
+manifest and the next scan is a real one. `--no-cache` skips the lookup, and
+`SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS` overrides the 24h TTL.
+
+The cache can only ever skip work, never invent a verdict: a missing, expired,
+corrupt, or structurally unrecognizable entry falls through to a real scan, and
+a scan with no dependency evidence at all is never cached. Source and `--full`
+scans are never cached — they stage arbitrary files whose set the evidence hash
+does not capture.
+
 Full filesystem scan, including installed dependency trees:
 
 ```bash

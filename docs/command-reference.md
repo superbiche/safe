@@ -5,6 +5,7 @@
 ```bash
 safe run <args...>
 safe audit <args...>
+safe install [--project] [--yes]
 safe install [-g|--global] [--yes] <pkg> [...]
 safe install --manager npm|pnpm|yarn|bun|composer -g [--yes] [--trust-host] <pkg> [...]
 safe install --sandbox [--allow-scripts] <pkg> [...]
@@ -166,6 +167,37 @@ safe install --bun -g cowsay@1.6.0
 safe install --composer -g vendor/pkg:^1
 safe install --trust-host -g cowsay@1.6.0
 ```
+
+### Project mode (bulk audit)
+
+With no package named and a manifest in the current directory — `package.json`,
+`requirements.txt`, `pyproject.toml`, `Cargo.toml`, `composer.json`, or
+`go.mod` — `safe install` bulk-audits what the project already depends on
+instead of printing usage. `--project` forces the same mode.
+
+```bash
+safe install            # in a project directory
+safe install --project
+```
+
+It runs `safe audit scan --deps-only --project .` (so it benefits from the scan
+cache) and prints a one-screen summary: audited manifests, package count,
+finding counts by severity, verdict, and the top critical/high findings with
+package and advisory id.
+
+This mode **audits only** — it never runs a package manager, so there is
+nothing to install afterwards; the confirmation records that an operator saw
+the findings.
+
+| Outcome | Interactive | Non-interactive |
+| --- | --- | --- |
+| Verdict `GO` | prompt to accept (exit 0 / 1 if declined) | exit 0, quietly |
+| Verdict `WARN` | prompt to accept, or `--yes` | exit 102 unless `--yes` |
+| Critical findings | exit 104 | exit 104 |
+| Scan unreadable or failed | exit 100 | exit 100 |
+
+Critical findings are the project-scale equivalent of a `BLOCK` verdict:
+`--yes` accepts WARNs, never those.
 
 `safe install --sandbox ...` preserves the isolated `safe run install` workflow.
 

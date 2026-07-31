@@ -16,6 +16,10 @@ TOOLS_FILE="$CONFIG_DIR/tools.json"
 
 RESULTS_DIR="$DATA_DIR/results"
 SBOM_DIR="$DATA_DIR/sbom"
+SCAN_CACHE_DIR="$DATA_DIR/scan-cache"
+# A dependency-evidence scan is deterministic in its inputs, so an unchanged
+# lockfile set within the TTL may reuse the previous verdict.
+SCAN_CACHE_TTL_SECONDS="${SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS:-86400}"
 CHECKS_DIR="$DATA_DIR/checks"
 IOC_DIR="$DATA_DIR/ioc"
 IOC_CATALOG_DIR="$IOC_DIR/catalogs"
@@ -63,6 +67,7 @@ declare -a MACHINE_TARGETS=()
 declare -A PROJECT_ECOSYSTEMS=()
 declare -A PROJECT_SCANNERS=()
 declare -a PROJECT_IGNORES=()
+LAST_SCAN_RESULT_PATH=""
 declare -a CURRENT_LOCKFILES=()
 declare -a CURRENT_MANIFESTS=()
 declare -a CURRENT_PROJECT_ROOTS=()
@@ -2584,13 +2589,129 @@ build_scan_result_from_artifacts() {
   jq --argjson delta "$delta_json" '. + {delta: $delta}' "$result_path" > "$tmp"
   mv "$tmp" "$result_path"
 
+  LAST_SCAN_RESULT_PATH="$result_path"
   render_scan_summary "$result_path"
+}
+
+# --------------------------------------------------------------------------
+# Scan cache (deps-only)
+#
+# A --deps-only scan reads exactly one thing: the dependency evidence
+# (lockfiles + manifests). When that evidence hashes to something already
+# scanned inside the TTL, re-running the scanners cannot produce a different
+# verdict, so the recorded result is replayed instead.
+#
+# Discipline: the cache may only ever SKIP work, never invent a verdict. Every
+# failure mode here — missing jq, unreadable entry, corrupt JSON, absent or
+# malformed timestamp, empty evidence — falls through to a real scan. Source
+# scans are never cached: they stage arbitrary files whose set is not captured
+# by the evidence hash.
+# --------------------------------------------------------------------------
+
+scan_cache_enabled() {
+  local scan_mode="$1"
+  [[ "$scan_mode" == "deps" ]] || return 1
+  [[ "${SAFE_AUDIT_SCAN_NO_CACHE:-0}" != "1" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  command -v sha256sum >/dev/null 2>&1 || return 1
+  return 0
+}
+
+# sha256 over machine, target, mode, and every evidence file's own sha256.
+# Empty evidence is NOT cacheable: there would be nothing to invalidate on.
+scan_cache_key() {
+  local machine="$1" target="$2" scan_mode="$3"
+  shift 3
+  local tmp file digest
+  tmp=$(mktemp) || return 1
+  printf '%s\n%s\n%s\n' "$machine" "$target" "$scan_mode" > "$tmp"
+  local -a evidence=()
+  mapfile -t evidence < <(printf '%s\n' "$@" | LC_ALL=C sort -u)
+  local counted=0
+  for file in "${evidence[@]}"; do
+    [[ -n "$file" ]] || continue
+    if [[ ! -r "$file" ]]; then
+      rm -f "$tmp"
+      return 1
+    fi
+    printf '%s  %s\n' "$(sha256sum "$file" | awk '{print $1}')" "$file" >> "$tmp"
+    counted=$((counted + 1))
+  done
+  if (( counted == 0 )); then
+    rm -f "$tmp"
+    return 1
+  fi
+  digest=$(sha256sum "$tmp" | awk '{print $1}')
+  rm -f "$tmp"
+  [[ -n "$digest" ]] || return 1
+  printf '%s' "$digest"
+}
+
+scan_cache_human_age() {
+  local seconds="$1"
+  if (( seconds < 60 )); then
+    printf '%ds' "$seconds"
+  elif (( seconds < 3600 )); then
+    printf '%dm' "$((seconds / 60))"
+  else
+    printf '%dh %dm' "$((seconds / 3600))" "$(((seconds % 3600) / 60))"
+  fi
+}
+
+# Replay a cached result. Returns 1 for ANY doubt so the caller runs a real
+# scan; returns 0 only after rendering a structurally valid, fresh entry.
+scan_cache_replay() {
+  local key="$1"
+  local path="$SCAN_CACHE_DIR/$key.json"
+  [[ -n "$key" && -r "$path" ]] || return 1
+
+  local created now age
+  created="$(jq -r '._cache.created_epoch // empty' "$path" 2>/dev/null || true)"
+  [[ "$created" =~ ^[0-9]+$ ]] || return 1
+  now="$(date +%s)"
+  age=$((now - created))
+  (( age >= 0 )) || return 1
+  (( age < SCAN_CACHE_TTL_SECONDS )) || return 1
+  jq -e 'has("verdict") and has("summary") and has("cve_scan")' "$path" >/dev/null 2>&1 || return 1
+
+  printf '[safe audit] scan cache hit (%s) — dependency evidence unchanged; --no-cache forces a fresh scan\n' \
+    "$(scan_cache_human_age "$age")"
+  LAST_SCAN_RESULT_PATH="$path"
+  render_scan_summary "$path"
+}
+
+# Cache writes never fail a scan: a full result was already produced.
+scan_cache_store() {
+  local key="$1" result="$2"
+  [[ -n "$key" && -n "$result" && -r "$result" ]] || return 0
+  mkdir -p "$SCAN_CACHE_DIR" 2>/dev/null || return 0
+  local tmp
+  tmp=$(mktemp "$SCAN_CACHE_DIR/.tmp.XXXXXX" 2>/dev/null) || return 0
+  if jq --arg k "$key" --argjson t "$(date +%s)" \
+      '. + {_cache: {key: $k, created_epoch: $t}}' "$result" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$SCAN_CACHE_DIR/$key.json" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
+  return 0
 }
 
 scan_source_into_result() {
   local machine="$1" source="$2" original_target="$3" strategy="$4" scan_mode="${5:-source}" allow_source_fallback="${6:-1}"
   vinfo "$machine: scan source=$(printf '%q' "$source") target=$(printf '%q' "$original_target") strategy=$strategy mode=$scan_mode fallback=$allow_source_fallback"
   gather_projects_from_source "$source" "$allow_source_fallback"
+
+  local cache_key=""
+  if scan_cache_enabled "$scan_mode"; then
+    cache_key="$(scan_cache_key "$machine" "$original_target" "$scan_mode" \
+      ${CURRENT_LOCKFILES[@]+"${CURRENT_LOCKFILES[@]}"} \
+      ${CURRENT_MANIFESTS[@]+"${CURRENT_MANIFESTS[@]}"} || true)"
+    vinfo "$machine: scan cache key=${cache_key:-<none>}"
+    if [[ -n "$cache_key" ]] && scan_cache_replay "$cache_key"; then
+      return 0
+    fi
+  fi
+
   detect_machine_tools "$machine"
   local project_tools_rc
   confirm_scan_with_missing_project_audit_tools "$machine" "$original_target"
@@ -2635,7 +2756,12 @@ scan_source_into_result() {
     jq -s 'add' "${project_audits_files[@]}" > "$audits_tmp"
   fi
 
-  build_scan_result_from_artifacts "$machine" "$original_target" "$strategy" "$sbom_tmp" "$osv_json" "$grype_json" "$audits_tmp" "$scan_mode" "$source_scan_tmp"
+  local build_rc=0
+  build_scan_result_from_artifacts "$machine" "$original_target" "$strategy" "$sbom_tmp" "$osv_json" "$grype_json" "$audits_tmp" "$scan_mode" "$source_scan_tmp" || build_rc=$?
+  if [[ -n "$cache_key" && "$build_rc" -eq 0 ]]; then
+    scan_cache_store "$cache_key" "$LAST_SCAN_RESULT_PATH"
+  fi
+  return "$build_rc"
 }
 
 scan_source_with_external_sbom_into_result() {
@@ -7234,6 +7360,10 @@ scan_command() {
         scan_mode_set=1
         shift
         ;;
+      --no-cache)
+        SAFE_AUDIT_SCAN_NO_CACHE=1
+        shift
+        ;;
       --project)
         [[ $# -lt 2 ]] && die "--project requires a path"
         project_target="$2"
@@ -7370,7 +7500,7 @@ safe audit: multi-machine audit tooling
 
 USAGE
   safe audit capabilities [--json]
-  safe audit scan [--verbose] [--deps-only | --full] [--project <path>] [--all | --machine <csv>]
+  safe audit scan [--verbose] [--deps-only | --full] [--no-cache] [--project <path>] [--all | --machine <csv>]
   safe audit check <pkg>@<version> [--ecosystem <name>] [--json]
   safe audit release github --repo OWNER/REPO --version TAG --asset NAME [--json]
   safe audit vuln github-release --repo OWNER/REPO --version TAG [--json]

@@ -49,6 +49,32 @@ case "${1:-}" in
   --version|-v) echo "safe-audit mock" ;;
   status) echo "config: ${SAFE_CONFIG_DIR:-$HOME/.config/safe}/audit" ;;
   check) printf 'safe-audit'; for arg in "$@"; do printf '\t%s' "$arg"; done; printf '\n'; exit "${SAFE_AUDIT_STUB_STATUS:-0}" ;;
+  scan)
+    { printf 'safe-audit'; for arg in "$@"; do printf '\t%s' "$arg"; done; printf '\n'; } >> "${SAFE_AUDIT_STUB_SCAN_LOG:-/dev/null}"
+    { printf 'safe-audit'; for arg in "$@"; do printf '\t%s' "$arg"; done; printf '\n'; }
+    result="${SAFE_AUDIT_STUB_SCAN_RESULT:-}"
+    if [[ -n "$result" ]]; then
+      cat > "$result" <<JSON
+{
+  "machine": "local",
+  "verdict": "${SAFE_AUDIT_STUB_SCAN_VERDICT:-GO}",
+  "summary": {"packages_total": ${SAFE_AUDIT_STUB_SCAN_PACKAGES:-12}},
+  "cve_scan": {
+    "critical": ${SAFE_AUDIT_STUB_SCAN_CRITICAL:-0},
+    "high": ${SAFE_AUDIT_STUB_SCAN_HIGH:-0},
+    "medium": 0,
+    "low": 0,
+    "findings": [
+      {"source": "osv", "id": "GHSA-test-crit", "severity": "CRITICAL", "package": "evilpkg", "version": "1.2.3"},
+      {"source": "grype", "id": "CVE-2026-0001", "severity": "High", "package": "warnpkg", "version": "2.0.0"}
+    ]
+  }
+}
+JSON
+      [[ "${SAFE_AUDIT_STUB_SCAN_NO_DETAILS:-0}" == "1" ]] || printf 'Details: %s\n' "$result"
+    fi
+    exit "${SAFE_AUDIT_STUB_SCAN_EXIT:-0}"
+    ;;
   *) printf 'safe-audit'; for arg in "$@"; do printf '\t%s' "$arg"; done; printf '\n' ;;
 esac
 SH
@@ -94,6 +120,94 @@ refusal_case audit-block 104 20 'safe: BLOCKED npm install of blockme@1.0.0' --y
 refusal_case audit-fail 100 42 'safe audit failed with exit 42 (fail closed)' --yes -g failme@1.0.0
 refusal_case non-tty-confirm 102 0 'BLOCKED install — interactive confirmation required' -g okpkg@1.0.0
 pass "safe install policy refusals use BLOCKED contract and exit codes"
+
+# --- safe install project mode ---------------------------------------------
+# No package spec + a manifest in cwd = bulk audit of the project's dependency
+# evidence. Audits only: it must never run a package manager.
+project_case() {
+  local label="$1" expected_rc="$2" dir="$3"
+  shift 3
+  local rc=0
+  PROJECT_OUT="$tmp/project-$label.out"
+  PROJECT_ERR="$tmp/project-$label.err"
+  PROJECT_SCAN_LOG="$tmp/project-$label.scan.log"
+  : > "$PROJECT_SCAN_LOG"
+  (
+    cd "$dir" || exit 99
+    PATH="$shim:$PATH" \
+    SAFE_CONFIG_DIR="$tmp/project-$label-config" \
+    SAFE_DATA_DIR="$tmp/project-$label-data" \
+    SAFE_AUDIT_STUB_SCAN_RESULT="$tmp/project-$label-result.json" \
+    SAFE_AUDIT_STUB_SCAN_LOG="$PROJECT_SCAN_LOG" \
+    "$@" \
+    "$shim/safe" install "${PROJECT_ARGS[@]}"
+  ) >"$PROJECT_OUT" 2>"$PROJECT_ERR" </dev/null || rc=$?
+  [[ "$rc" -eq "$expected_rc" ]] || {
+    printf 'stdout:\n%s\nstderr:\n%s\n' "$(cat "$PROJECT_OUT")" "$(cat "$PROJECT_ERR")" >&2
+    fail "safe install project $label expected rc=$expected_rc, got rc=$rc"
+  }
+}
+
+project_dir="$tmp/project-src"
+mkdir -p "$project_dir"
+printf '{"name":"demo"}\n' > "$project_dir/package.json"
+
+# Clean project, non-interactive: exit 0 quietly, scan run in deps-only mode.
+PROJECT_ARGS=()
+project_case clean 0 "$project_dir" env SAFE_AUDIT_STUB_SCAN_VERDICT=GO
+grep -Fq $'safe-audit\tscan\t--deps-only\t--project\t.' "$PROJECT_SCAN_LOG" || fail "project mode did not run a deps-only scan"
+grep -Fq 'safe install: project audit' "$PROJECT_OUT" || fail "project mode printed no summary"
+grep -Fq 'manifests: package.json' "$PROJECT_OUT" || fail "project mode summary omits the audited manifests"
+grep -Fq 'verdict:   GO' "$PROJECT_OUT" || fail "project mode summary omits the verdict"
+
+# The explicit flag forces the same mode.
+PROJECT_ARGS=(--project)
+project_case flag 0 "$project_dir" env SAFE_AUDIT_STUB_SCAN_VERDICT=GO
+grep -Fq $'safe-audit\tscan\t--deps-only\t--project\t.' "$PROJECT_SCAN_LOG" || fail "safe install --project did not scan"
+
+# WARN needs an operator: non-TTY refuses 102, --yes accepts.
+PROJECT_ARGS=()
+project_case warn-nontty 102 "$project_dir" env SAFE_AUDIT_STUB_SCAN_VERDICT=WARN SAFE_AUDIT_STUB_SCAN_HIGH=2
+grep -Fq 'safe: BLOCKED project audit' "$PROJECT_ERR" || fail "project WARN refusal missing BLOCKED contract"
+grep -Fq 'safe explain' "$PROJECT_ERR" || fail "project WARN refusal missing safe explain pointer"
+grep -Fq 'top findings:' "$PROJECT_OUT" || fail "project summary omits top findings for high severity"
+grep -Fq 'CVE-2026-0001' "$PROJECT_OUT" || fail "project summary omits the advisory id"
+
+PROJECT_ARGS=(--yes)
+project_case warn-yes 0 "$project_dir" env SAFE_AUDIT_STUB_SCAN_VERDICT=WARN SAFE_AUDIT_STUB_SCAN_HIGH=2
+
+# Critical findings are the project-scale BLOCK: 104 even under --yes.
+PROJECT_ARGS=()
+project_case critical 104 "$project_dir" env SAFE_AUDIT_STUB_SCAN_VERDICT=WARN SAFE_AUDIT_STUB_SCAN_CRITICAL=1
+grep -Fq 'critical finding(s)' "$PROJECT_ERR" || fail "project critical refusal does not name the finding count"
+grep -Fq 'GHSA-test-crit' "$PROJECT_OUT" || fail "project summary omits the critical advisory id"
+
+PROJECT_ARGS=(--yes)
+project_case critical-yes 104 "$project_dir" env SAFE_AUDIT_STUB_SCAN_VERDICT=WARN SAFE_AUDIT_STUB_SCAN_CRITICAL=3
+
+# Fail closed when the scan cannot be trusted: no result document, or a
+# scanner that failed outright.
+PROJECT_ARGS=()
+project_case no-details 100 "$project_dir" env SAFE_AUDIT_STUB_SCAN_NO_DETAILS=1
+grep -Fq 'no readable result' "$PROJECT_ERR" || fail "unreadable scan result did not fail closed legibly"
+PROJECT_ARGS=()
+project_case scan-failed 100 "$project_dir" env SAFE_AUDIT_STUB_SCAN_EXIT=3
+grep -Fq 'BLOCKED project audit' "$PROJECT_ERR" || fail "failed scan did not fail closed"
+
+# A directory with no manifest is not a project: the old usage error stands.
+empty_dir="$tmp/project-empty"
+mkdir -p "$empty_dir"
+PROJECT_ARGS=(--project)
+project_case no-manifest 1 "$empty_dir" env
+grep -Fq 'found no manifest' "$PROJECT_ERR" || fail "--project without a manifest did not explain itself"
+
+# A named package still takes the spec path, manifest or not.
+PROJECT_ARGS=(--yes -g cowsay@1.6.0)
+project_case spec-still-audits 0 "$project_dir" env
+grep -Fq $'safe-audit\tcheck\tcowsay@1.6.0\t--ecosystem\tnpm' "$PROJECT_OUT" || fail "spec install stopped auditing in a project dir"
+grep -Fq $'npm\tinstall\t-g\tcowsay@1.6.0' "$PROJECT_OUT" || fail "spec install stopped delegating in a project dir"
+[[ ! -s "$PROJECT_SCAN_LOG" ]] || fail "spec install ran a project scan"
+pass "safe install project mode audits, refuses, and fails closed"
 
 explain_output="$("$SAFE" explain)"
 grep -Fq '100  blocked by policy' <<<"$explain_output" || fail "safe explain missing exit code table"

@@ -929,7 +929,7 @@ case_update_family_gates() {
   touch "${WORK_DIR}/package.json"
   SAFE_INSTALL_TEST_SCRIPT='npm update lodash' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tscan\t--project\t.' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tscan\t--deps-only\t--project\t.' "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tcheck\tlodash\t--ecosystem\tnpm\t--gate\tinstall\t--op\tupdate' "$FUNCNAME" || return
   assert_log_contains $'REAL\tnpm\tupdate\tlodash' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='yarn upgrade left-pad' run_zsh
@@ -969,7 +969,7 @@ case_local_project_scan() {
   touch "${WORK_DIR}/package.json"
   SAFE_INSTALL_TEST_SCRIPT='npm ci' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tscan\t--project\t.' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tscan\t--deps-only\t--project\t.' "$FUNCNAME" || return
   assert_log_contains $'REAL\tnpm\tci' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -979,7 +979,7 @@ case_add_scans_and_checks() {
   touch "${WORK_DIR}/package.json"
   SAFE_INSTALL_TEST_SCRIPT='pnpm add --filter web --workspace-root lodash' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tscan\t--project\t.' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tscan\t--deps-only\t--project\t.' "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tcheck\tlodash\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\tweb\t--ecosystem' "$FUNCNAME" || return
   pass "$FUNCNAME"
@@ -1061,7 +1061,7 @@ case_critical_scan_non_tty_aborts() {
   touch "${WORK_DIR}/package.json"
   SAFE_AUDIT_SCAN_OUTPUT='critical vulnerability' SAFE_AUDIT_SCAN_STATUS=1 SAFE_INSTALL_TEST_SCRIPT='npm ci' run_zsh
   assert_status 102 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tscan\t--project\t.' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tscan\t--deps-only\t--project\t.' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   assert_err_contains_fragment 'safe: BLOCKED install — safe audit scan found critical findings' "$FUNCNAME" || return
   assert_err_not_contains_fragment 'safe install: safe audit scan reported critical findings' "$FUNCNAME" || return
@@ -1118,7 +1118,7 @@ case_requirement_install_scans() {
   prepare_case "requirement-install-scans"
   SAFE_INSTALL_TEST_SCRIPT='pip install -r requirements.txt' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tscan\t--project\t.' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tscan\t--deps-only\t--project\t.' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'AUDIT\tcheck' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }

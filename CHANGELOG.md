@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- `safe install` gains a project mode: with no package named and a manifest in
+  the current directory (`package.json`, `requirements.txt`, `pyproject.toml`,
+  `Cargo.toml`, `composer.json`, `go.mod`), it bulk-audits what the project
+  already depends on instead of printing a usage error. `--project` forces the
+  mode. It runs `safe audit scan --deps-only --project .` and prints a
+  one-screen summary — audited manifests, package count, findings by severity,
+  verdict, and the top critical/high findings with package and advisory id.
+  The mode audits only and never runs a package manager. Critical findings
+  refuse with exit 104 even under `--yes` (`--yes` accepts WARNs only); a WARN
+  verdict prompts interactively and refuses with 102 in a non-interactive
+  shell; a clean verdict exits 0 quietly there. A scan that fails or leaves no
+  readable result document fails closed with exit 100 rather than reporting a
+  clean project. Decisions are recorded in the safe-run audit log as
+  `install:project`.
+
+- Lockfile-keyed scan cache for `--deps-only` scans: when the dependency
+  evidence hashes to a set already scanned within 24 hours, the recorded result
+  is replayed (`[safe audit] scan cache hit (<age>)`) with the same verdict and
+  exit code instead of re-running osv-scanner, syft, and grype — a repeat scan
+  of an unchanged tree drops from tens of seconds to well under one. Entries
+  live in `~/.local/share/safe/audit/scan-cache/`, keyed on machine, target,
+  mode, and each evidence file's own hash, so touching any lockfile or manifest
+  forces a real scan. `safe audit scan --no-cache` bypasses the lookup and
+  `SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS` overrides the TTL. The cache can only
+  skip work, never invent a verdict: missing, expired, corrupt, or
+  unrecognizable entries fall through to a real scan, evidence-free scans are
+  never cached, and source/`--full` scans are excluded entirely (they stage
+  arbitrary files the evidence hash does not capture).
+
+- The wrapper project-scan preflight now runs `safe audit scan --deps-only`, so
+  a bare `npm ci` / `pnpm install` in an unchanged tree costs a cache hit
+  instead of a full scanner run.
+
 - Gate `mise` backend installs: `mise install`/`up`/`use`/`exec` previously
   installed registry packages (`npm:*`, `pipx:*`, `cargo:*`, `go:*` backends,
   lifecycle scripts included) with no audit at all. A `mise` PATH wrapper now

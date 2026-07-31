@@ -452,7 +452,11 @@ safe_gate_scan_project() {
     return 0
   fi
 
-  scan_output="$("${SAFE_GATE_AUDIT_BIN}" scan --project . 2>&1)"
+  # --deps-only: the preflight only cares about the dependency evidence the
+  # install is about to change, and that mode is the one the scan cache can
+  # replay — a bare `npm ci` in an unchanged tree costs a cache hit, not a
+  # full scanner run.
+  scan_output="$("${SAFE_GATE_AUDIT_BIN}" scan --deps-only --project . 2>&1)"
   scan_status=$?
 
   [[ -n "${scan_output}" ]] && printf '%s\n' "${scan_output}"

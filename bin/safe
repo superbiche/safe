@@ -905,10 +905,17 @@ quote_command() {
 cmd_install_usage() {
   cat <<'EOF'
 usage:
+  safe install [--project] [--yes]
   safe install [-g|--global] [--yes] <pkg> [...]
   safe install --manager npm|pnpm|yarn|bun|composer -g [--yes] [--trust-host] <pkg> [...]
   safe install --host [--yes] [package-manager flags...] <pkg> [...]
   safe install --sandbox [safe run install flags...] <pkg> [...]
+
+With no package and a manifest in the current directory (or with `--project`),
+safe bulk-audits the project's dependency evidence and reports; it audits only
+and never runs a package manager. Critical findings refuse with exit 104 even
+under `--yes`; a WARN verdict needs `--yes` or an interactive accept (exit 102
+in a non-interactive shell).
 
 Host installs are audited with `safe audit check` before the package manager runs.
 `--yes` skips the final confirmation prompt after a successful audit.
@@ -1436,8 +1443,140 @@ safe_install_confirm_trust() {
   [[ "$reply" == "y" || "$reply" == "Y" || "$reply" == "yes" || "$reply" == "YES" ]]
 }
 
+# Manifests that make a directory a project worth bulk-auditing. Order is the
+# display order in the project-mode summary.
+SAFE_INSTALL_PROJECT_MANIFESTS=(package.json requirements.txt pyproject.toml Cargo.toml composer.json go.mod)
+
+safe_install_project_manifests() {
+  local manifest
+  for manifest in "${SAFE_INSTALL_PROJECT_MANIFESTS[@]}"; do
+    [[ -f "$manifest" ]] && printf '%s\n' "$manifest"
+  done
+  return 0
+}
+
+safe_install_project_manifest_present() {
+  local manifest
+  for manifest in "${SAFE_INSTALL_PROJECT_MANIFESTS[@]}"; do
+    [[ -f "$manifest" ]] && return 0
+  done
+  return 1
+}
+
+safe_install_project_confirm() {
+  local reply
+
+  printf 'safe: accept these audit results for this project? [y/N] ' >&2
+  if ! IFS= read -r reply </dev/tty; then
+    return 1
+  fi
+
+  [[ "$reply" == "y" || "$reply" == "Y" || "$reply" == "yes" || "$reply" == "YES" ]]
+}
+
+# Bulk audit of the current project's dependency evidence. This mode AUDITS
+# ONLY — it never runs a package manager, so there is nothing to delegate to
+# after a confirmation; the confirmation records that an operator saw the
+# findings.
+cmd_install_project() {
+  local yes="$1"
+  local -a manifests=()
+  mapfile -t manifests < <(safe_install_project_manifests)
+
+  [[ "${#manifests[@]}" -gt 0 ]] || die "safe install --project found no manifest in $(pwd) (looked for: ${SAFE_INSTALL_PROJECT_MANIFESTS[*]})"
+  [[ -x "$SAFE_AUDIT_PATH" ]] || die "safe install --project requires safe audit at $SAFE_AUDIT_PATH"
+
+  local scan_output scan_rc=0
+  set +e
+  scan_output="$("$SAFE_AUDIT_PATH" scan --deps-only --project . 2>&1)"
+  scan_rc=$?
+  set -e
+
+  # The structured verdict comes from the result document the scan wrote; the
+  # rendered text is a human summary, not a contract. No readable result means
+  # we cannot claim the project is clean -> fail closed.
+  local result_path=""
+  result_path="$(printf '%s\n' "$scan_output" | sed -n 's/^Details: //p' | tail -n 1)"
+  if [[ "$scan_rc" -ne 0 || -z "$result_path" || ! -r "$result_path" ]]; then
+    printf '%s\n' "$scan_output" >&2
+    safe_install_gate_log "project" "$(pwd)" "REFUSED_SCAN_UNREADABLE" "exit=${scan_rc}"
+    refuse 100 "BLOCKED project audit — safe audit scan produced no readable result (exit ${scan_rc}); ask the operator; details: safe explain"
+  fi
+
+  local verdict packages critical high medium low
+  verdict="$(jq -r '.verdict // "UNKNOWN"' "$result_path" 2>/dev/null || printf 'UNKNOWN')"
+  packages="$(jq -r '.summary.packages_total // 0' "$result_path" 2>/dev/null || printf '0')"
+  critical="$(jq -r '.cve_scan.critical // 0' "$result_path" 2>/dev/null || printf '0')"
+  high="$(jq -r '.cve_scan.high // 0' "$result_path" 2>/dev/null || printf '0')"
+  medium="$(jq -r '.cve_scan.medium // 0' "$result_path" 2>/dev/null || printf '0')"
+  low="$(jq -r '.cve_scan.low // 0' "$result_path" 2>/dev/null || printf '0')"
+
+  # An unparseable verdict is not a clean one.
+  if [[ ! "$critical" =~ ^[0-9]+$ || "$verdict" == "UNKNOWN" ]]; then
+    safe_install_gate_log "project" "$(pwd)" "REFUSED_SCAN_UNPARSEABLE"
+    refuse 100 "BLOCKED project audit — safe audit result at ${result_path} is not readable as a verdict; ask the operator; details: safe explain"
+  fi
+
+  # One-screen summary. The scan's own render is not echoed: it says the same
+  # thing at ten times the length.
+  printf 'safe install: project audit — %s\n' "$(pwd)"
+  printf '  manifests: %s\n' "${manifests[*]}"
+  printf '  packages:  %s\n' "$packages"
+  printf '  findings:  critical %s, high %s, medium %s, low %s\n' "$critical" "$high" "$medium" "$low"
+  printf '  verdict:   %s\n' "$verdict"
+  local cache_note
+  cache_note="$(printf '%s\n' "$scan_output" | grep -F '[safe audit] scan cache hit' | tail -n 1 || true)"
+  [[ -n "$cache_note" ]] && printf '  %s\n' "${cache_note#\[safe audit\] }"
+  if [[ "$critical" -gt 0 ]] || [[ "$high" -gt 0 ]]; then
+    printf '  top findings:\n'
+    jq -r '
+      [.cve_scan.findings[]? | select((.severity // "") | ascii_downcase | test("critical|high"))]
+      | sort_by(if ((.severity // "") | ascii_downcase | test("critical")) then 0 else 1 end)
+      | .[:5][]
+      | "    - [" + (.severity // "unknown") + "] " + (.package // "unknown") + "@" + (.version // "unknown") + "  " + (.id // "unknown") + " (" + (.source // "?") + ")"
+    ' "$result_path" 2>/dev/null || true
+  fi
+  printf '  details:   %s\n' "$result_path"
+
+  # Critical findings are the project-scale equivalent of a BLOCK verdict:
+  # --yes accepts WARNs, never these.
+  if [[ "$critical" -gt 0 ]]; then
+    safe_install_gate_log "project" "$(pwd)" "REFUSED_BLOCK" "critical=${critical}"
+    refuse 104 "BLOCKED project audit — ${critical} critical finding(s) in this project's dependencies; to allow: operator review — safe audit scan --deps-only --project .; details: safe explain"
+  fi
+
+  if [[ "$verdict" == "GO" ]]; then
+    safe_install_gate_log "project" "$(pwd)" "PROCEED" "verdict=GO"
+    if [[ "$yes" == "1" || ! -t 0 || ! -t 1 ]]; then
+      return 0
+    fi
+    safe_install_project_confirm || { err "project audit not accepted"; return 1; }
+    return 0
+  fi
+
+  if [[ "$yes" == "1" ]]; then
+    safe_install_gate_log "project" "$(pwd)" "ACCEPTED_WARN" "verdict=${verdict}"
+    return 0
+  fi
+
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    safe_install_gate_log "project" "$(pwd)" "REFUSED_WARN" "verdict=${verdict}"
+    refuse 102 "BLOCKED project audit — verdict ${verdict} needs operator review and this shell is non-interactive; to allow: ask the operator to re-run it interactively, or re-run with --yes after review; details: safe explain"
+  fi
+
+  if safe_install_project_confirm; then
+    safe_install_gate_log "project" "$(pwd)" "ACCEPTED_WARN" "verdict=${verdict}"
+    return 0
+  fi
+
+  safe_install_gate_log "project" "$(pwd)" "DECLINED" "verdict=${verdict}"
+  err "project audit not accepted"
+  return 1
+}
+
 cmd_install() {
   local host_mode=0 sandbox_mode=0 yes=0
+  local project_mode=0
   local trust_host=0
   local manager=npm global_mode=0
   local -a manager_args=()
@@ -1479,6 +1618,10 @@ cmd_install() {
         yes=1
         shift
         ;;
+      --project)
+        project_mode=1
+        shift
+        ;;
       --trust-host)
         trust_host=1
         host_mode=1
@@ -1504,6 +1647,21 @@ cmd_install() {
         ;;
     esac
   done
+
+  # Project mode: no package named, but a manifest here. Bulk-audit what the
+  # project already depends on instead of dying with usage. --project forces
+  # it (and says so if there is no manifest).
+  if [[ "$sandbox_mode" == "0" ]]; then
+    local -a project_specs=()
+    mapfile -t project_specs < <(safe_install_audit_specs "$manager" ${manager_args[@]+"${manager_args[@]}"})
+    if [[ "$project_mode" == "1" ]] ||
+       { [[ "${#project_specs[@]}" -eq 0 ]] && safe_install_project_manifest_present; }; then
+      cmd_install_project "$yes"
+      return $?
+    fi
+  elif [[ "$project_mode" == "1" ]]; then
+    die "--project cannot be used with --sandbox"
+  fi
 
   if [[ "$sandbox_mode" == "1" && "$host_mode" == "0" ]]; then
     exec "$SAFE_RUN_PATH" install "${manager_args[@]}"
