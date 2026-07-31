@@ -1238,9 +1238,41 @@ case_pip_cumulative_sources_all_reach_audit() {
   prepare_case "pip-cumulative-sources"
   # pip considers BOTH --find-links and the index; a later trusted selector
   # must not erase the earlier untrusted one (delta-2 finding 3).
+  # find-links records its actual endpoint (not a blanket sentinel) so an
+  # operator can trust the specific location (delta-5 finding 3.2).
   SAFE_INSTALL_TEST_SCRIPT='pip install --find-links https://evil.example/wheels --index-url https://pypi.org/simple blockme==1.0.0' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\tlocal:find-links https://pypi.org/simple' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://evil.example/wheels https://pypi.org/simple' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_scoped_and_userconfig_sources_reach_audit() {
+  prepare_case "npm-scoped-userconfig-sources"
+  # Raw scoped registry flags are source selectors npm honors on the
+  # command line; --userconfig swaps in a whole config file whose registry
+  # keys become effective (delta-5 finding 3.2).
+  SAFE_INSTALL_TEST_SCRIPT='npm install --@demo:registry=https://scoped.example @demo/pkg@1.2.3' run_zsh
+  assert_log_contains $'AUDIT\tcheck\t@demo/pkg@1.2.3\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--registry\thttps://scoped.example' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  printf 'registry=https://userconf.example/\n@demo:registry=https://scopedconf.example\n' > "${WORK_DIR}/alt-npmrc"
+  SAFE_INSTALL_TEST_SCRIPT='npm install --userconfig alt-npmrc okpkg@1.0.0' run_zsh
+  assert_log_contains $'AUDIT\tcheck\tokpkg@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--registry\thttps://userconf.example https://scopedconf.example' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_source_credentials_never_reach_logs() {
+  prepare_case "source-credentials-stripped"
+  # Inline URL credentials must not survive into the accumulated set — it
+  # feeds the audit invocation log and every downstream sink (delta-5
+  # finding N2). npm's own REAL invocation keeps them: it needs them.
+  SAFE_INSTALL_TEST_SCRIPT='npm install --registry https://alice:sekret@mirror.example/ okpkg@1.0.0' run_zsh
+  assert_log_contains $'AUDIT\tcheck\tokpkg@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--registry\thttps://mirror.example' "$FUNCNAME" || return
+  if grep '^AUDIT' "${LOG_FILE}" | grep -q 'sekret'; then
+    printf 'credential leaked into an AUDIT line:\n%s\n' "$(grep '^AUDIT' "${LOG_FILE}")" >&2
+    fail "$FUNCNAME"
+    return
+  fi
   pass "$FUNCNAME"
 }
 
@@ -1411,6 +1443,8 @@ main() {
     case_go_parser \
     case_composer_parser \
     case_pip_cumulative_sources_all_reach_audit \
+    case_npm_scoped_and_userconfig_sources_reach_audit \
+    case_source_credentials_never_reach_logs \
     case_npm_repeated_registry_keeps_true_last \
     case_stale_evidence_is_source_scoped \
     case_install_idempotent_no_wrappers \

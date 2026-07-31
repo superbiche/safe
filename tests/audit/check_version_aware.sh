@@ -1363,5 +1363,153 @@ if expect_status 0 "a trusted pip mirror gates GO without friction"; then
 fi
 
 # ---------------------------------------------------------------------------
+# 49. When both env case forms are set, the LOWERCASE one wins — npm's own
+#     precedence (delta-5 finding 3.2)
+# ---------------------------------------------------------------------------
+prepare_case env-registry-case-precedence
+printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  NPM_CONFIG_REGISTRY=https://mirror.example \
+  npm_config_registry=https://evil.example \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 10 "lowercase env wins over a trusted uppercase mirror"; then
+  pass "lowercase env wins over a trusted uppercase mirror"
+fi
+
+# ---------------------------------------------------------------------------
+# 50. node-semver limits: a numeric core beyond MAX_SAFE_INTEGER is a TAG to
+#     npm, never a version (delta-5 finding 4)
+# ---------------------------------------------------------------------------
+if (
+  SAFE_AUDIT_NO_INIT=1
+  # shellcheck source=/dev/null
+  source "$TEST_ROOT/audit-lib.sh" >/dev/null 2>&1
+  version_is_exact npm 9007199254740991.0.0 || exit 1
+  ! version_is_exact npm 9007199254740992.0.0 || exit 1
+  long_pre=$(printf 'a%.0s' {1..260})
+  ! version_is_exact npm "1.0.0-${long_pre}" || exit 1
+); then
+  pass "npm version grammar enforces node-semver limits"
+else
+  fail "npm version grammar enforces node-semver limits"
+fi
+prepare_case huge-core-tag
+cat > "$FIXTURES/packument-hugetag.json" <<'JSON'
+{
+  "dist-tags": {"latest": "1.0.0", "9007199254740992.0.0": "1.0.0"},
+  "versions": {"1.0.0": {}}
+}
+JSON
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument-hugetag.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- demo-pkg@9007199254740992.0.0 --ecosystem npm --gate install
+if expect_status 0 "an over-limit numeric spec resolves as the dist-tag npm sees"; then
+  pass "an over-limit numeric spec resolves as the dist-tag npm sees"
+fi
+if expect_grep "$OUT_FILE" 'Resolved:.*1\.0\.0 \(dist-tag' "npm-oracle: the tag's target version is audited"; then
+  pass "npm-oracle: the tag's target version is audited"
+fi
+prepare_case huge-core-range
+cat > "$FIXTURES/packument-hugelatest.json" <<'JSON'
+{
+  "dist-tags": {"latest": "9007199254740992.0.0"},
+  "versions": {"9007199254740992.0.0": {}, "1.0.0": {}}
+}
+JSON
+printf '{"dependencies": {"demo-pkg": ">=1.0.0"}}\n' > "$CASE_PROJECT/package.json"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument-hugelatest.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- demo-pkg --ecosystem npm --op update --gate install
+if expect_status 0 "an over-limit candidate is excluded from range selection"; then
+  pass "an over-limit candidate is excluded from range selection"
+fi
+if expect_grep "$OUT_FILE" 'Resolved:.*1\.0\.0' "npm-oracle: the valid candidate wins the range"; then
+  pass "npm-oracle: the valid candidate wins the range"
+fi
+if expect_no_grep "$OUT_FILE" '9007199254740992' "the over-limit value is never the audited target"; then
+  pass "the over-limit value is never the audited target"
+fi
+
+# ---------------------------------------------------------------------------
+# 51. Python find-links / extra-index env selectors reach the floor
+#     (delta-5 finding 3.2)
+# ---------------------------------------------------------------------------
+prepare_case pip-findlinks-floor
+fixture="$(osv_fixture_empty)"
+run_check \
+  PIP_FIND_LINKS=https://evil.example/wheels \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 10 "PIP_FIND_LINKS floors an exact python pin at WARN"; then
+  pass "PIP_FIND_LINKS floors an exact python pin at WARN"
+fi
+prepare_case uv-extra-index-floor
+run_check \
+  UV_EXTRA_INDEX_URL=https://evil.example/simple \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 10 "UV_EXTRA_INDEX_URL floors an exact python pin at WARN"; then
+  pass "UV_EXTRA_INDEX_URL floors an exact python pin at WARN"
+fi
+prepare_case pip-noindex-floor
+run_check \
+  PIP_NO_INDEX=1 \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 10 "PIP_NO_INDEX floors at WARN (local resolution)"; then
+  pass "PIP_NO_INDEX floors at WARN (local resolution)"
+fi
+
+# ---------------------------------------------------------------------------
+# 52. Inline credentials never reach output, receipts, or identities
+#     (delta-5 finding N2)
+# ---------------------------------------------------------------------------
+prepare_case creds-redacted-refusal
+fixture="$(osv_fixture_empty)"
+run_check \
+  PIP_INDEX_URL=https://alice:sekret@evil.example/simple \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 10 "a credentialed custom index still floors"; then
+  pass "a credentialed custom index still floors"
+fi
+if expect_no_grep "$OUT_FILE" 'sekret' "credentials never reach stdout"; then
+  pass "credentials never reach stdout"
+fi
+if expect_no_grep "$ERR_FILE" 'sekret' "credentials never reach stderr"; then
+  pass "credentials never reach stderr"
+fi
+prepare_case creds-redacted-receipt
+printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check \
+  PIP_INDEX_URL=https://alice:sekret@mirror.example/simple \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 0 "trust matches the credential-free canonical endpoint"; then
+  pass "trust matches the credential-free canonical endpoint"
+fi
+if jq -e '.packages["python:requests"].source == "explicit:https://mirror.example/simple"' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1 \
+  && ! grep -q 'sekret' "$CASE_RUN_CONFIG/install-known.json"; then
+  pass "receipt identity is credential-free"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2
+  fail "receipt identity is credential-free"
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

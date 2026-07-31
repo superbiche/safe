@@ -1113,12 +1113,30 @@ safe_install_known_matches() {
 safe_install_add_source() {
   local value="$1"
   while [[ "$value" == */ ]]; do value="${value%/}"; done
+  # URL userinfo never enters the accumulated set: it would otherwise reach
+  # the audit log and every downstream sink (delta-5 finding N2).
+  if [[ "$value" =~ ^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@]+@)(.+)$ ]]; then
+    value="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
+  fi
   [[ -n "$value" ]] || return 0
   local out="" w
   for w in ${SAFE_INSTALL_REGISTRY}; do
     [[ "$w" == "$value" ]] || out="${out:+$out }$w"
   done
   SAFE_INSTALL_REGISTRY="${out:+$out }$value"
+}
+
+# An alternate npm config file (--userconfig/--globalconfig) makes every
+# registry key inside it effective; surface those as sources (delta-5
+# finding 3.2). Generic and scoped keys both count.
+safe_install_add_npmrc_sources() {
+  local rc_file="$1" line
+  [[ -f "$rc_file" ]] || return 0
+  while IFS= read -r line; do
+    line="${line#*=}"
+    line="${line//[[:space:]]/}"
+    [[ -n "$line" ]] && safe_install_add_source "$line"
+  done < <(grep -E '^[[:space:]]*(@[^=[:space:]]+:)?registry[[:space:]]*=' "$rc_file" 2>/dev/null || true)
 }
 
 # Target-altering selectors in the manager args must reach the audit
@@ -1135,12 +1153,17 @@ safe_install_scan_target_flags() {
       npm)
         case "$prev" in
           --tag) SAFE_INSTALL_DIST_TAG="$arg" ;;
-          --registry) safe_install_add_source "$arg" ;;
+          # --@scope:registry is a scoped source selector npm accepts on the
+          # command line (delta-5 finding 3.2); --userconfig/--globalconfig
+          # swap in whole config files whose registry keys become effective.
+          --registry|--@*:registry) safe_install_add_source "$arg" ;;
+          --userconfig|--globalconfig) safe_install_add_npmrc_sources "$arg" ;;
           --prefix|-C|--cwd|--dir) SAFE_INSTALL_PROJECT_DIR="$arg" ;;
         esac
         case "$arg" in
           --tag=*) SAFE_INSTALL_DIST_TAG="${arg#*=}" ;;
-          --registry=*) safe_install_add_source "${arg#*=}" ;;
+          --registry=*|--@*:registry=*) safe_install_add_source "${arg#*=}" ;;
+          --userconfig=*|--globalconfig=*) safe_install_add_npmrc_sources "${arg#*=}" ;;
           --prefix=*|--cwd=*|--dir=*) SAFE_INSTALL_PROJECT_DIR="${arg#*=}" ;;
         esac
         ;;

@@ -68,6 +68,11 @@ safe_install_run_audit() {
 safe_install_add_source() {
   local value="$1"
   while [[ "${value}" == */ ]]; do value="${value%/}"; done
+  # URL userinfo never enters the accumulated set: it would otherwise reach
+  # the wrapper's audit log and every downstream sink (delta-5 finding N2).
+  if [[ "${value}" =~ '^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@]+@)(.+)$' ]]; then
+    value="${match[1]}${match[3]}"
+  fi
   [[ -n "${value}" ]] || return 0
   local -a kept=()
   local w
@@ -76,6 +81,19 @@ safe_install_add_source() {
   done
   kept+=("${value}")
   SAFE_INSTALL_REGISTRY="${kept[*]}"
+}
+
+# An alternate npm config file (--userconfig/--globalconfig) makes every
+# registry key inside it effective; surface those as sources (delta-5
+# finding 3.2). Generic and scoped keys both count.
+safe_install_add_npmrc_sources() {
+  local rc_file="$1" line
+  [[ -f "${rc_file}" ]] || return 0
+  while IFS= read -r line; do
+    line="${line#*=}"
+    line="${line//[[:space:]]/}"
+    [[ -n "${line}" ]] && safe_install_add_source "${line}"
+  done < <(command grep -E '^[[:space:]]*(@[^=[:space:]]+:)?registry[[:space:]]*=' "${rc_file}" 2>/dev/null || true)
 }
 
 safe_install_scan_target_flags() {
@@ -90,23 +108,31 @@ safe_install_scan_target_flags() {
       npm)
         case "${prev}" in
           --tag) SAFE_INSTALL_DIST_TAG="${arg}" ;;
-          --registry) safe_install_add_source "${arg}" ;;
+          # --@scope:registry is a scoped source selector npm accepts on the
+          # command line (delta-5 finding 3.2); --userconfig/--globalconfig
+          # swap in whole config files whose registry keys become effective.
+          --registry|--@*:registry) safe_install_add_source "${arg}" ;;
+          --userconfig|--globalconfig) safe_install_add_npmrc_sources "${arg}" ;;
           --prefix|-C|--cwd|--dir) SAFE_INSTALL_PROJECT_DIR="${arg}" ;;
         esac
         case "${arg}" in
           --tag=*) SAFE_INSTALL_DIST_TAG="${arg#*=}" ;;
-          --registry=*) safe_install_add_source "${arg#*=}" ;;
+          --registry=*|--@*:registry=*) safe_install_add_source "${arg#*=}" ;;
+          --userconfig=*|--globalconfig=*) safe_install_add_npmrc_sources "${arg#*=}" ;;
           --prefix=*|--cwd=*|--dir=*) SAFE_INSTALL_PROJECT_DIR="${arg#*=}" ;;
         esac
         ;;
       python)
         case "${prev}" in
           --index-url|-i|--extra-index-url|--default-index|--index) safe_install_add_source "${arg}" ;;
-          --find-links|-f) safe_install_add_source "local:find-links" ;;
+          # find-links names a real endpoint: record it so operators can
+          # trust a specific location instead of a blanket sentinel
+          # (delta-5 finding 3.2 mitigation).
+          --find-links|-f) safe_install_add_source "${arg}" ;;
         esac
         case "${arg}" in
           --index-url=*|--extra-index-url=*|--default-index=*|--index=*) safe_install_add_source "${arg#*=}" ;;
-          --find-links=*) safe_install_add_source "local:find-links" ;;
+          --find-links=*) safe_install_add_source "${arg#*=}" ;;
           --no-index) safe_install_add_source "local:no-index" ;;
         esac
         ;;

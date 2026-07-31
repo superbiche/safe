@@ -3779,10 +3779,31 @@ registry_is_trusted() {
 # here would audit a version the manager never installs (delta-4 finding 4).
 SEMVER_STRICT_RE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
 
+# node-semver refuses versions longer than 256 characters and numeric core
+# components above Number.MAX_SAFE_INTEGER — npm classifies anything beyond
+# as a dist-TAG, so accepting it as a version here audits a string npm
+# resolves to a different artifact (delta-5 finding 4). npm-only: other
+# ecosystems' parsers have different limits.
+npm_semver_within_limits() {
+  local version="$1"
+  (( ${#version} <= 256 )) || return 1
+  local core="${version%%[-+]*}" c
+  local IFS='.'
+  for c in $core; do
+    if (( ${#c} > 16 )) || { (( ${#c} == 16 )) && [[ "$c" > "9007199254740991" ]]; }; then
+      return 1
+    fi
+  done
+  return 0
+}
+
 version_is_exact() {
   local ecosystem="$1" version="$2"
   case "$ecosystem" in
-    npm|rust|php)
+    npm)
+      [[ "${version#v}" =~ $SEMVER_STRICT_RE ]] && npm_semver_within_limits "${version#v}"
+      ;;
+    rust|php)
       [[ "${version#v}" =~ $SEMVER_STRICT_RE ]]
       ;;
     python)
@@ -3803,6 +3824,21 @@ strip_trailing_slashes() {
   printf '%s' "$v"
 }
 
+# Canonical source form for identities, receipts, trust matching, and every
+# printed message: trailing slashes stripped AND URL userinfo dropped —
+# index URLs routinely carry inline credentials (PIP_INDEX_URL tokens) and
+# those must never reach refusal output, install-known.json, or config.json
+# trust entries (delta-5 finding N2). Operational fetch URLs keep their
+# credentials; only identities and sinks go through here.
+canonicalize_source() {
+  local v
+  v=$(strip_trailing_slashes "$1")
+  if [[ "$v" =~ ^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@]+@)(.+)$ ]]; then
+    v="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
+  fi
+  printf '%s' "$v"
+}
+
 # Canonicalize a space-separated source set: strip trailing slashes per
 # element and keep the LAST occurrence of a repeated element — npm options
 # are last-wins, so ordering carries meaning for resolution while the trust
@@ -3811,7 +3847,7 @@ strip_trailing_slashes() {
 normalize_source_set() {
   local out="" w x kept
   for w in $1; do
-    w=$(strip_trailing_slashes "$w")
+    w=$(canonicalize_source "$w")
     [[ -n "$w" ]] || continue
     kept=""
     for x in $out; do
@@ -3864,14 +3900,17 @@ npm_registry_url() {
     strip_trailing_slashes "$last_src"
     return 0
   fi
-  # npm reads its config environment case-insensitively; the lowercase form
-  # is the canonical one npm itself emits (delta-4 finding 3.2).
-  if [[ -n "${NPM_CONFIG_REGISTRY:-}" ]]; then
-    strip_trailing_slashes "$NPM_CONFIG_REGISTRY"
-    return 0
-  fi
+  # npm reads its config environment case-insensitively and the LOWERCASE
+  # form wins when both are set (verified against npm's own resolution,
+  # delta-5 finding 3.2) — matching that order is load-bearing: auditing
+  # the uppercase value while npm fetches from the lowercase one audits
+  # the wrong artifact.
   if [[ -n "${npm_config_registry:-}" ]]; then
     strip_trailing_slashes "$npm_config_registry"
+    return 0
+  fi
+  if [[ -n "${NPM_CONFIG_REGISTRY:-}" ]]; then
+    strip_trailing_slashes "$NPM_CONFIG_REGISTRY"
     return 0
   fi
   local rc line
@@ -3896,9 +3935,16 @@ npm_registry_url() {
 # (delta-4 finding 3.2).
 python_env_sources() {
   local out="" v
-  for v in ${PIP_INDEX_URL:-} ${PIP_EXTRA_INDEX_URL:-} ${UV_DEFAULT_INDEX:-} ${UV_INDEX_URL:-} ${UV_INDEX:-}; do
+  for v in ${PIP_INDEX_URL:-} ${PIP_EXTRA_INDEX_URL:-} ${UV_DEFAULT_INDEX:-} ${UV_INDEX_URL:-} ${UV_INDEX:-} \
+    ${PIP_FIND_LINKS:-} ${UV_FIND_LINKS:-} ${UV_EXTRA_INDEX_URL:-}; do
     out="${out:+$out }$v"
   done
+  # no-index flips resolution to find-links/local sources entirely; the
+  # sentinel mirrors the argv scanner's marker (delta-5 finding 3.2).
+  case "${PIP_NO_INDEX:-}${UV_NO_INDEX:-}" in
+    ""|0|false|no|off) : ;;
+    *) out="${out:+$out }local:no-index" ;;
+  esac
   local rc line
   if [[ -z "${PIP_INDEX_URL:-}" ]]; then
     for rc in ${PIP_CONFIG_FILE:-} ${VIRTUAL_ENV:+${VIRTUAL_ENV}/pip.conf} "$HOME/.config/pip/pip.conf" "$HOME/.pip/pip.conf"; do
@@ -3914,7 +3960,10 @@ python_env_sources() {
     [[ -f "$rc" ]] || continue
     while IFS= read -r line; do
       out="${out:+$out }$(trim "${line#*=}")"
-    done < <(grep -E '^[[:space:]]*extra-index-url[[:space:]]*=' "$rc" 2>/dev/null || true)
+    done < <(grep -E '^[[:space:]]*(extra-index-url|find-links)[[:space:]]*=' "$rc" 2>/dev/null || true)
+    if grep -qE '^[[:space:]]*no-index[[:space:]]*=[[:space:]]*(1|true|yes|on)[[:space:]]*$' "$rc" 2>/dev/null; then
+      out="${out:+$out }local:no-index"
+    fi
   done
   printf '%s' "$out"
 }
@@ -3953,7 +4002,7 @@ derive_effective_sources() {
   esac
   local w
   for w in $extra; do
-    w=$(strip_trailing_slashes "$w")
+    w=$(canonicalize_source "$w")
     [[ -n "$w" ]] || continue
     # The ecosystem default never makes an identity explicit.
     case "${ecosystem}:${w}" in
@@ -4123,8 +4172,14 @@ npm_max_satisfying() {
     # selector, which rejects malformed cores (\"0e0.0.0\") AND malformed
     # prereleases — leading-zero numeric identifiers (\"1.0.0-01\") and
     # empty identifiers (\"1.0.0-alpha..1\") — outright (delta-4 finding 4).
+    # node-semver limits mirror npm_semver_within_limits: <=256 chars and
+    # numeric core components <= Number.MAX_SAFE_INTEGER (as strings — jq
+    # numbers lose precision exactly at that boundary; delta-5 finding 4).
     def semver_ok:
-      test(\"^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)([-](0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)([.](0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?([+][0-9A-Za-z-]+([.][0-9A-Za-z-]+)*)?\$\");
+      (length <= 256)
+      and test(\"^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)([-](0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)([.](0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?([+][0-9A-Za-z-]+([.][0-9A-Za-z-]+)*)?\$\")
+      and ((split(\"+\")[0] | split(\"-\")[0] | split(\".\"))
+           | all((length < 16) or ((length == 16) and (. <= \"9007199254740991\"))));
     def satisfies(\$ver):
       all(\$cons[];
         . as \$c |
@@ -4265,7 +4320,9 @@ resolve_npm_versions() {
   enc_name="${name//\//%2F}"
   curl -fsS --max-time 5 -H 'Accept: application/vnd.npm.install-v1+json' \
     "$registry/$enc_name" -o "$packument" 2>/dev/null || return 1
-  RESOLUTION_SOURCE="$registry"
+  # The fetch keeps any inline credentials; the receipt/display field never
+  # does (delta-5 finding N2).
+  RESOLUTION_SOURCE=$(canonicalize_source "$registry")
   local -a ranges=()
   if [[ -n "$requested" && "$requested" != "latest" ]]; then
     local tag_version
