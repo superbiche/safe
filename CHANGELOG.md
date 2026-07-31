@@ -13,7 +13,23 @@
   command behind `mise exec --` gets the full routing/audit pass with the
   exec left to mise (which owns the tool env). Official runtime installs
   (`node@22`) pass through untouched; non-registry backends (aqua/ubi/gem)
-  pass with an explicit not-audit-gated notice.
+  pass with an explicit not-audit-gated notice. Review round: bare
+  shorthands (`mise install prettier`) resolve through `mise registry` to
+  their effective backend before the runtime-vs-package call (registry
+  shorthands were installing npm packages unaudited); the audited identity
+  is canonicalized (tool `[options]` stripped; `pipx:owner/repo` GitHub
+  shorthands and `git+`/URL forms take the notice path instead of a false
+  registry audit); enumeration and env-derivation failures refuse as
+  infrastructure breakage instead of falling open; install/up/use/exec get
+  exact flag tables (a value flag's value no longer reads as a tool spec,
+  `-C`/`-E` thread into the preflight, `--monorepo`-class scope flags
+  refuse, unknown equals-forms fail closed, `--locked` and friends are
+  legal); non-exact pins ("3", ranges) count as floating on `up` and
+  `up --bump` audits everything; `mise exec` preflights configured tools
+  unless `exec_auto_install` is verifiably off; audits run under mise's
+  project `[env]` package-source variables; `mise exec -c` and bare
+  interactive `mise use` fail closed with rewrite hints (launcher first
+  words behind `exec --` stay a documented residual).
 
 - Second review round (PR#29 delta findings): custom package sources
   (`--registry`, `--index-url`, `--find-links`, `--no-index`, composer

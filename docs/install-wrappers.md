@@ -44,10 +44,27 @@ per-project tool versions keep resolving.
 `mise` itself is wrapped too: backend package installs (`npm:*`, `pipx:*`,
 `cargo:*`, `go:*`) are audited on `mise install`/`up`/`use` — bare
 invocations preflight the configured tools and audit not-yet-installed (and,
-on `up`, floating-version) backend entries — and a gated command behind
-`mise exec --` gets the routing/audit pass while mise keeps the execution.
+on `up`, non-exactly-pinned; on `up --bump`, all) backend entries — and a
+gated command behind `mise exec --` gets the routing/audit pass while mise
+keeps the execution. `mise exec` also preflights configured tools unless
+`exec_auto_install` is verifiably disabled, since exec installs missing
+tools on demand. Bare shorthands (`mise install prettier`) resolve to their
+effective backend via `mise registry` before the runtime-vs-package call is
+made; audits run with mise's project `[env]` package-source variables
+applied, so the verdict covers the source mise will actually install from.
 Official runtime installs (`node@22`) pass through; non-registry backends
-(aqua/ubi/gem) pass with an explicit notice that they are not audit-gated.
+(aqua/ubi/gem) and source-bearing specs (`pipx:owner/repo` GitHub
+shorthands, `git+`/URL forms) pass with an explicit notice that they are
+not audit-gated — a public-registry audit must never vouch for them.
+Fail-closed refusals: enumeration or env-derivation failure (refused as
+infrastructure breakage, never a package verdict), `mise exec -c '<shell
+string>'` (rewrite as `mise exec -- <argv…>`), bare interactive `mise use`
+(rerun as `mise use <tool>@<version>`), and scope-changing flags the
+preflight cannot model (`--monorepo`, `--inactive`, `--local`; per-directory
+`-C` is threaded and supported). A launcher first word behind `mise exec --`
+(`env`, `sh`, wrapper scripts) is a documented residual, same class as
+absolute-path invocation: this is a seatbelt for cooperative agents, not a
+jail.
 
 Package installs run:
 
