@@ -76,14 +76,25 @@ them, so the bare preflight reads each entry's options with
 `mise tool --json` before trusting `key@version`.
 
 Advisory sources safe can resolve against today are npm, Python (PyPI), and
-Go. When the mise environment selects a Cargo, pipx, Composer, or Bun
-registry, safe does not pretend to have checked it: that spec takes the
-not-audit-gated notice path rather than reporting a verdict computed
-against the default public source.
+Go. When a Cargo, pipx, Composer, or Bun registry is selected — by mise's
+own environment *or inherited from the surrounding shell*, and on the
+`mise exec -- <tool>` route as well as direct installs — safe does not
+pretend to have checked it: that spec takes the not-audit-gated notice
+path rather than reporting a verdict computed against the default public
+source. Directory-scoped Cargo/Composer config files are not yet detected;
+extending the audit's source derivation to those ecosystems is tracked
+separately.
 
-Display-only invocations pass through untouched: `--help`, `--version`, and
-`--dry-run`/`--dry-run-code` install nothing (a `--help` *after* `--`
-belongs to the inner command and does not disarm the gate).
+Display-only invocations pass through untouched: `--help` (including a
+leading global one), a bare `--version`, and `--dry-run`/`--dry-run-code`
+install nothing. A `--help` *after* `--` belongs to the inner command and
+does not disarm the gate, and a leading `--version` *followed by a
+subcommand* is not display-only — mise still installs, so it is gated.
+
+An unversioned explicit `mise upgrade <tool>` upgrades within the tool's
+configured request, so safe checks that configured version rather than the
+latest one; a target with no configured request is refused rather than
+guessed.
 
 Fail-closed refusals: enumeration or env-derivation failure (refused as
 infrastructure breakage, never a package verdict — this includes a missing

@@ -1857,6 +1857,12 @@ safe_gate_mise_env_overlay() {
     | map(
         if (.value | type) != "string" then error("schema")
         elif (.key | test("^[A-Za-z_][A-Za-z0-9_]*$") | not) then error("schema")
+        # A NUL cannot exist in an environment value: reject it HERE, before
+        # decoded bytes reach a command substitution, so bash never prints
+        # its own "ignored null byte" warning alongside the one-line
+        # refusal (delta-3 finding F2). NOTE: this jq program is a
+        # single-quoted bash string — no apostrophes in these comments.
+        elif (.value | contains("\u0000")) then error("schema")
         else .key + " " + (.value | @base64) end
       )
     | .[]
@@ -1878,12 +1884,14 @@ safe_gate_mise_apply_overlay() {
     # exist in an environment value at all: that is malformed, not empty.
     value="$(printf '%s' "$b64" | base64 -d 2>/dev/null; printf 'x')" || return 1
     value="${value%x}"
-    # A NUL cannot live in a shell variable (bash truncates there, and
-    # `$'\0'` is the EMPTY string, so pattern-matching for it matches
-    # everything). Compare decoded byte count against what was captured:
-    # any mismatch means the value did not survive intact.
+    # Byte-for-byte, in BYTES on both sides: ${#value} counts CHARACTERS in
+    # the caller's locale, so a valid UTF-8 path like /tmp/café.conf was
+    # rejected as malformed (delta-3 finding F2). A local LC_ALL makes the
+    # parameter expansion count bytes too. (NUL is rejected earlier, in the
+    # jq producer, so bash never has to warn about it here.)
     local decoded_len
     decoded_len="$(printf '%s' "$b64" | base64 -d 2>/dev/null | LC_ALL=C wc -c)" || return 1
+    local LC_ALL=C
     (( decoded_len == ${#value} )) || return 1
     export "${name}=${value}" 2>/dev/null || return 1
   done <<<"$overlay"
@@ -1896,18 +1904,49 @@ safe_gate_mise_apply_overlay() {
 # into a confident default-source verdict (delta-2 finding F4). Until the
 # derivation covers them, an audit under such a source is not honest: the
 # spec takes the not-audit-gated notice path instead.
+# The environment the delegate actually runs under is the union of what
+# mise computes AND what it inherits: mise env --json omits inherited
+# variables, so an ambient CARGO_REGISTRY_DEFAULT reached the installer
+# while the detector saw nothing (delta-3 finding F4).
 safe_gate_mise_unmodeled_source() {
   local eco="$1" overlay="$2" name
-  [[ -n "$overlay" ]] || return 1
-  while IFS=' ' read -r name _; do
+  local -a names=()
+  if [[ -n "$overlay" ]]; then
+    while IFS=' ' read -r name _; do
+      [[ -n "$name" ]] && names+=("$name")
+    done <<<"$overlay"
+  fi
+  local ambient
+  while IFS= read -r ambient; do
+    [[ -n "$ambient" ]] && names+=("$ambient")
+  done < <(compgen -e 2>/dev/null || true)
+  for name in ${names[@]+"${names[@]}"}; do
     case "${eco}:${name}" in
-      rust:CARGO_*) printf '%s' "$name"; return 0 ;;
-      python:MISE_PIPX_REGISTRY_URL) printf '%s' "$name"; return 0 ;;
-      php:COMPOSER_*) printf '%s' "$name"; return 0 ;;
-      npm:BUN_CONFIG_REGISTRY) printf '%s' "$name"; return 0 ;;
+      rust:CARGO_REGISTRY_DEFAULT|rust:CARGO_REGISTRIES_*|rust:CARGO_HOME)
+        printf '%s' "$name"; return 0 ;;
+      python:MISE_PIPX_REGISTRY_URL)
+        printf '%s' "$name"; return 0 ;;
+      php:COMPOSER_HOME|php:COMPOSER_AUTH|php:COMPOSER_REPOSITORIES)
+        printf '%s' "$name"; return 0 ;;
+      npm:BUN_CONFIG_REGISTRY|npm:MISE_NPM_PACKAGE_MANAGER)
+        printf '%s' "$name"; return 0 ;;
     esac
-  done <<<"$overlay"
+  done
   return 1
+}
+
+# Ecosystem a gated inner `mise exec -- <tool>` command installs for, so
+# the same unmodeled-source honesty applies there (delta-3 finding F4: the
+# Composer and bun routes reached a package verdict through inner exec).
+safe_gate_mise_tool_ecosystem() {
+  case "$1" in
+    npm|pnpm|pnpx|bun|yarn) printf 'npm' ;;
+    pip|pip3|uv) printf 'python' ;;
+    cargo) printf 'rust' ;;
+    go) printf 'go' ;;
+    composer) printf 'php' ;;
+    *) return 1 ;;
+  esac
 }
 
 # Run one audit under mise's computed source environment AND its effective
@@ -2153,7 +2192,7 @@ safe_gate_mise_parse_sub() {
       -*)
         base="${arg%%=*}"
         if [[ -n "$grefuse_interactive" ]] && safe_gate_alt_match "$base" "$grefuse_interactive"; then
-          safe_gate_err "safe: BLOCKED mise ${sub} — interactive selection cannot be audited; rerun naming the tools, e.g. mise ${sub} <tool>[@<version>]; details: safe explain"
+          safe_gate_err "safe: BLOCKED mise ${sub} — interactive selection cannot be audited; rerun naming each tool with an exact version, e.g. mise ${sub} <tool>@<version>; details: safe explain"
           return 100
         fi
         if [[ -n "$grefuse" ]] && safe_gate_alt_match "$base" "$grefuse"; then
@@ -2269,9 +2308,12 @@ safe_gate_mise_entry_option_offender() {
   mise_real="$(safe_gate_resolve_real mise)" || return 2
   command -v jq >/dev/null 2>&1 || return 2
   json="$("$mise_real" ${SAFE_GATE_MISE_CTX[@]+"${SAFE_GATE_MISE_CTX[@]}"} tool --json -- "$key" 2>/dev/null)" || return 2
+  # tool_options must be PRESENT: defaulting a missing field to {} read
+  # malformed helper output as "no options" and produced a package verdict
+  # for an entry safe could not actually read (delta-3 finding F1).
   printf '%s' "$json" | jq -r --arg neutral "$SAFE_GATE_MISE_NEUTRAL_OPTS" '
     if type != "object" then error("schema") else . end
-    | (.tool_options // {})
+    | (if has("tool_options") then .tool_options else error("schema") end)
     | if type != "object" then error("schema") else . end
     | ($neutral | split("|")) as $ok
     | to_entries
@@ -2282,6 +2324,61 @@ safe_gate_mise_entry_option_offender() {
       ))
     | if length > 0 then .[0].key else "" end
   ' 2>/dev/null || return 2
+}
+
+# ONE option-aware enumerator for every configured-tool preflight (bare
+# install/upgrade AND exec auto-install, which previously reconstructed
+# entries straight from `mise ls` and never asked about options — delta-3
+# finding F1). Appends audit-eligible specs to the named array; prints a
+# notice and skips an entry whose options safe cannot model, or whose key
+# carries several requested versions (mise tool --json reports one option
+# set per KEY, so it cannot say which version the options belong to).
+# Returns 100 if the enumeration or an option query fails.
+safe_gate_mise_collect_entries() {
+  local mode="$1" what="$2"
+  local -n _out="$3"
+  local entries rc key req offender orc
+  entries="$(safe_gate_mise_config_entries "$mode" ${SAFE_GATE_MISE_CTX[@]+"${SAFE_GATE_MISE_CTX[@]}"})"
+  rc=$?
+  if (( rc != 0 )); then
+    safe_gate_mise_infra_refuse "cannot enumerate configured tools (mise ls or jq unavailable, or malformed output) — ${what} would install unaudited"
+    return 100
+  fi
+  local -a keys=() reqs=()
+  while IFS=$'\t' read -r key req; do
+    [[ -n "$key" ]] || continue
+    keys+=("$key")
+    reqs+=("$req")
+  done <<<"$entries"
+  local i j count
+  for (( i = 0; i < ${#keys[@]}; i++ )); do
+    key="${keys[$i]}"
+    req="${reqs[$i]}"
+    count=0
+    for (( j = 0; j < ${#keys[@]}; j++ )); do
+      [[ "${keys[$j]}" == "$key" ]] && count=$((count + 1))
+    done
+    offender="$(safe_gate_mise_entry_option_offender "$key")"
+    orc=$?
+    if (( orc != 0 )); then
+      safe_gate_mise_infra_refuse "cannot read the configured tool options for '${key}' (mise tool --json failed or returned no tool_options) — ${what} would install without knowing its source"
+      return 100
+    fi
+    if (( count > 1 )); then
+      safe_gate_err "safe: mise ${key}: several configured versions share this tool and mise reports one option set for all of them — safe cannot tell which install carries which source; not audit-gated, review manually"
+      continue
+    fi
+    if [[ -n "$offender" ]]; then
+      safe_gate_err "safe: mise ${key}: configured tool option '${offender}' can change the install source or run installer arguments safe cannot model — not audit-gated; review manually"
+      continue
+    fi
+    if [[ -n "$req" ]]; then
+      _out+=("${key}@${req}")
+    else
+      _out+=("$key")
+    fi
+  done
+  return 0
 }
 
 # --minimum-release-age makes mise pick an older release than the newest
@@ -2310,6 +2407,49 @@ safe_gate_mise_overlay_or_refuse() {
   return 0
 }
 
+# `mise upgrade npm:pkg` (no version) upgrades WITHIN the configured
+# request, but a bare package check resolves the install/latest target —
+# safe would report a verdict for a version mise will not select (delta-3
+# finding F3). Replace each unversioned explicit upgrade target with its
+# configured request; refuse if it cannot be found.
+safe_gate_mise_pin_upgrade_targets() {
+  local -n _specs="$1"
+  local -a pinned=()
+  local spec entries rc key req found
+  local need=0
+  for spec in ${_specs[@]+"${_specs[@]}"}; do
+    [[ "$(safe_gate_mise_spec_name "$spec")" == "$spec" ]] && need=1
+  done
+  if (( need == 0 )); then
+    return 0
+  fi
+  entries="$(safe_gate_mise_config_entries 2 ${SAFE_GATE_MISE_CTX[@]+"${SAFE_GATE_MISE_CTX[@]}"})"
+  rc=$?
+  if (( rc != 0 )); then
+    safe_gate_mise_infra_refuse "cannot read the configured request for an unversioned upgrade target (mise ls or jq unavailable, or malformed output)"
+    return 100
+  fi
+  for spec in ${_specs[@]+"${_specs[@]}"}; do
+    if [[ "$(safe_gate_mise_spec_name "$spec")" != "$spec" ]]; then
+      pinned+=("$spec")
+      continue
+    fi
+    found=""
+    while IFS=$'\t' read -r key req; do
+      [[ "$key" == "$spec" ]] || continue
+      found="${req}"
+      break
+    done <<<"$entries"
+    if [[ -z "$found" ]]; then
+      safe_gate_err "safe: BLOCKED mise upgrade — '${spec}' has no configured version request to check against; name the exact version: mise upgrade ${spec}@<version>; details: safe explain"
+      return 100
+    fi
+    pinned+=("${spec}@${found}")
+  done
+  _specs=(${pinned[@]+"${pinned[@]}"})
+  return 0
+}
+
 safe_gate_mise_gate_install() {
   local sub="$1"
   shift
@@ -2317,35 +2457,14 @@ safe_gate_mise_gate_install() {
 
   local -a specs=("${SAFE_GATE_MISE_SPECS[@]+"${SAFE_GATE_MISE_SPECS[@]}"}")
   if (( ${#specs[@]} == 0 )); then
-    local entries rc line key req
-    entries="$(safe_gate_mise_config_entries "$SAFE_GATE_MISE_MODE" ${SAFE_GATE_MISE_CTX[@]+"${SAFE_GATE_MISE_CTX[@]}"})"
-    rc=$?
-    if (( rc != 0 )); then
-      safe_gate_mise_infra_refuse "cannot enumerate configured tools (mise ls or jq unavailable, or malformed output) — a bare ${sub} would install unaudited"
-      return 100
+    safe_gate_mise_collect_entries "$SAFE_GATE_MISE_MODE" "a bare ${sub}" specs || return $?
+  else
+    # An explicit UNVERSIONED upgrade target keeps its configured range in
+    # mise, while a bare package check resolves the install/latest target:
+    # audit the configured request instead (delta-3 finding F3).
+    if [[ "$sub" == "upgrade" ]]; then
+      safe_gate_mise_pin_upgrade_targets specs || return $?
     fi
-    local offender orc
-    while IFS=$'\t' read -r key req; do
-      [[ -n "$key" ]] || continue
-      # A configured entry's tool options are not in `ls` output; ask for
-      # them before treating the reconstructed key@version as the whole
-      # truth (delta-2 finding F1).
-      offender="$(safe_gate_mise_entry_option_offender "$key")"
-      orc=$?
-      if (( orc != 0 )); then
-        safe_gate_mise_infra_refuse "cannot read the configured tool options for '${key}' (mise tool --json failed) — a bare ${sub} would install without knowing its source"
-        return 100
-      fi
-      if [[ -n "$offender" ]]; then
-        safe_gate_err "safe: mise ${key}: configured tool option '${offender}' can change the install source or run installer arguments safe cannot model — not audit-gated; review manually"
-        continue
-      fi
-      if [[ -n "$req" ]]; then
-        specs+=("${key}@${req}")
-      else
-        specs+=("$key")
-      fi
-    done <<<"$entries"
   fi
 
   safe_gate_mise_filter_excluded specs || return $?
@@ -2400,21 +2519,11 @@ safe_gate_mise_gate_exec() {
   # exec auto-installs missing configured tools before running the command
   # (unless the setting disables it): enumerate them like a bare install.
   if safe_gate_mise_exec_auto_install_enabled ${ctx[@]+"${ctx[@]}"}; then
-    local entries rc key req
-    entries="$(safe_gate_mise_config_entries 0 ${ctx[@]+"${ctx[@]}"})"
-    rc=$?
-    if (( rc != 0 )); then
-      safe_gate_mise_infra_refuse "cannot enumerate configured tools (mise ls or jq unavailable, or malformed output) — exec auto-install would fetch unaudited"
-      return 100
-    fi
-    while IFS=$'\t' read -r key req; do
-      [[ -n "$key" ]] || continue
-      if [[ -n "$req" ]]; then
-        audit+=("${key}@${req}")
-      else
-        audit+=("$key")
-      fi
-    done <<<"$entries"
+    # Same option-aware enumerator as bare install: reconstructing entries
+    # straight from `mise ls` here skipped the option check entirely
+    # (delta-3 finding F1).
+    SAFE_GATE_MISE_CTX=("${ctx[@]+"${ctx[@]}"}")
+    safe_gate_mise_collect_entries 0 "exec auto-install" audit || return $?
   fi
 
   local need_overlay=0
@@ -2441,6 +2550,15 @@ safe_gate_mise_gate_exec() {
   # A launcher first word (env, sh, time, ...) is a documented residual:
   # refusing it would break ordinary `mise exec -- <binary>` use.
   if (( gate_inner )); then
+    # The inner route reaches ecosystems whose sources safe-audit does not
+    # model (Composer, bun-backed npm, Cargo): auditing there would report
+    # a default-source verdict for a private one (delta-3 finding F4).
+    local inner_eco inner_unmodeled
+    if inner_eco="$(safe_gate_mise_tool_ecosystem "${cmd[0]}")" \
+       && inner_unmodeled="$(safe_gate_mise_unmodeled_source "$inner_eco" "$SAFE_GATE_MISE_OVERLAY")"; then
+      safe_gate_err "safe: mise exec ${cmd[0]}: ${inner_unmodeled} selects a ${inner_eco} source safe cannot resolve advisories against — not audit-gated; review manually"
+      return 0
+    fi
     (
       if [[ -n "${SAFE_GATE_MISE_CD:-}" ]]; then
         cd -- "${SAFE_GATE_MISE_CD}" 2>/dev/null || {
@@ -2528,11 +2646,16 @@ safe_gate_mise() {
           # findings 6/8).
           case "$arg" in
             --no-config|--no-env|--no-hooks) SAFE_GATE_MISE_CTX+=("$arg") ;;
-            # A LEADING global help/version prints and installs nothing —
+            # A LEADING global help prints and installs nothing —
             # `mise --help install npm:x` exits 0 with help — but the
             # subcommand scan never saw it, so the install gate ran and
             # could block a display-only command (delta-2 finding F5).
-            -h|--help|-V|--version)
+            # --version does NOT get this treatment: verified against mise
+            # 2026.7.16, `mise --version install npm:cowsay@1.6.0` still
+            # installs, so early-delegating it was an unaudited bypass
+            # (delta-3 finding F5). With no subcommand it falls through to
+            # the no-subcommand delegate below anyway.
+            -h|--help)
               safe_gate_exec_real mise "$@"
               return $?
               ;;
