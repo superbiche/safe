@@ -28,8 +28,11 @@ no wrapper installed), but it defines no wrapper functions.
 An existing file of a wrapped name that does not carry the
 `# safe-gate-wrapper` marker is never overwritten: `install.sh` reports it and
 skips, leaving that tool ungated. `uninstall.sh` removes only marked wrappers.
-Check the wiring with `safe status`, which reports `installed`, `shadowed`
-(something earlier on PATH wins), or `not installed`.
+Check the wiring with `safe status`, which reports one of five states per
+tool: `installed`, `shadowed` (something earlier on PATH wins),
+`not-on-path` (the wrapper exists but nothing resolves — the bin directory
+is missing from PATH), `missing` (no wrapper file), or `foreign` (a file of
+that name exists but safe does not own it).
 
 ## Behavior
 

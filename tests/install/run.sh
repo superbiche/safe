@@ -38,7 +38,8 @@ tool="$(basename -- "$0")"
   # Any source-set variable reaching the delegated tool's environment is a
   # credential leak: the gate accumulates them, the real tool must never see
   # them. Logged only when non-empty so existing assertions are unaffected.
-  for leak in SAFE_GATE_REGISTRY SAFE_INSTALL_REGISTRY SAFE_GATE_NPM_USERCONFIG; do
+  for leak in SAFE_GATE_REGISTRY SAFE_GATE_DIST_TAG SAFE_GATE_PROJECT_DIR \
+    SAFE_GATE_NPM_USERCONFIG SAFE_GATE_NPM_GLOBALCONFIG SAFE_INSTALL_REGISTRY; do
     if [[ -n "${!leak:-}" ]]; then
       printf 'ENVLEAK\t%s=%s\n' "${leak}" "${!leak}"
     fi
@@ -1227,6 +1228,48 @@ case_status_probes_every_wrapper() {
   pass "$FUNCNAME"
 }
 
+case_dash_bin_root_never_reports_healthy() {
+  prepare_case "dash-bin-root-state"
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+
+  # A relative dash-leading SAFE_BIN_DIR made both readlink calls parse the
+  # path as options: empty == empty reported `installed` while spraying
+  # readlink diagnostics (delta-2 finding N2). With anchored operands the
+  # state must be COMPUTED, not defaulted: from a cwd where the relative
+  # path resolves, `installed` is truthful and stderr stays clean; from a
+  # cwd where it does not, the wrapper canonicalization fails and the state
+  # must be the unhealthy `not-on-path`, never a false `installed`.
+  mkdir -p "${WORK_DIR}/-gate"
+  cp "${HOME_DIR}/.local/bin/npm" "${WORK_DIR}/-gate/npm"
+  local status_out status_err
+  status_out="$(cd "${WORK_DIR}" && HOME="${HOME_DIR}" SAFE_BIN_DIR='-gate' PATH="-gate:/usr/bin:/bin" "${HOME_DIR}/.local/bin/safe" status 2>"${CASE_DIR}/status-err.log")"
+  status_err="$(cat "${CASE_DIR}/status-err.log")"
+  if grep -Eq '(^|[[:space:]])npm:(foreign|missing|not-on-path|shadowed)' <<<"${status_out}"; then
+    printf 'resolvable relative bin root misreported npm:\n%s\n' "${status_out}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  if grep -q 'readlink' <<<"${status_err}"; then
+    printf 'readlink diagnostics leaked:\n%s\n' "${status_err}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  status_out="$(cd "${HOME_DIR}" && HOME="${HOME_DIR}" SAFE_BIN_DIR='-gate' PATH="/usr/bin:/bin" "${HOME_DIR}/.local/bin/safe" status 2>"${CASE_DIR}/status-err2.log")"
+  if grep -Fq 'npm:installed' <<<"${status_out}"; then
+    printf 'unresolvable relative bin root reported healthy:\n%s\n' "${status_out}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  if grep -q 'readlink' "${CASE_DIR}/status-err2.log"; then
+    printf 'readlink diagnostics leaked (second probe)\n' >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
 case_wrappers_not_on_path_are_unhealthy() {
   prepare_case "wrappers-not-on-path"
   HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
@@ -1565,6 +1608,20 @@ case_gate_never_leaks_sources_to_the_real_tool() {
   # And the credential must not reach the calling shell either.
   SAFE_INSTALL_TEST_SCRIPT='npm install --registry https://alice:sekret@mirror.example okpkg@1.0.0; print -r -u2 -- "POST=[${SAFE_GATE_REGISTRY:-}][${SAFE_INSTALL_REGISTRY:-}]"' run_zsh
   assert_err_contains_fragment 'POST=[][]' "$FUNCNAME" || return
+
+  # Bash assignment preserves a pre-existing EXPORT attribute: a caller that
+  # exported a scanner name must not turn the gate's overwrite into an
+  # inherited credential in the delegate (delta-2 finding P2). Both routes;
+  # the calling shell keeps only its original sentinel.
+  SAFE_INSTALL_TEST_SCRIPT='export SAFE_GATE_REGISTRY=sentinel SAFE_GATE_DIST_TAG=sentinel SAFE_GATE_PROJECT_DIR=sentinel SAFE_GATE_NPM_USERCONFIG=sentinel SAFE_GATE_NPM_GLOBALCONFIG=sentinel; npm install --registry https://alice:sekret@mirror.example okpkg@1.0.0; print -r -u2 -- "POSTX=[${SAFE_GATE_REGISTRY:-}]"' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--registry\thttps://alice:sekret@mirror.example' "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'ENVLEAK' "$FUNCNAME" || return
+  assert_err_contains_fragment 'POSTX=[sentinel]' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='export SAFE_GATE_REGISTRY=sentinel; npm install --registry https://alice:sekret@mirror.example' run_zsh
+  assert_log_not_contains_fragment 'ENVLEAK' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -1754,6 +1811,7 @@ main() {
     case_loose_marker_is_not_ownership \
     case_status_probes_every_wrapper \
     case_wrappers_not_on_path_are_unhealthy \
+    case_dash_bin_root_never_reports_healthy \
     case_uv_index_selectors_reach_audit \
     case_uninstall_removes_gate_wrappers \
     case_install_cleans_legacy_safe_install_artifacts \

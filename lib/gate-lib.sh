@@ -130,6 +130,14 @@ safe_gate_exec_real() {
     exit 127
   fi
 
+  # Bash assignment PRESERVES a pre-existing export attribute: if the caller
+  # exported any scanner name, the scan would overwrite it with the
+  # credential-bearing operational set and the delegate would inherit it
+  # (PR#30 delta-2 finding P2). De-export all five before every delegate
+  # exec — the audit child receives its values via argv flags, never env.
+  export -n SAFE_GATE_DIST_TAG SAFE_GATE_REGISTRY SAFE_GATE_PROJECT_DIR \
+    SAFE_GATE_NPM_USERCONFIG SAFE_GATE_NPM_GLOBALCONFIG 2>/dev/null || true
+
   exec "$real" "$@"
 }
 

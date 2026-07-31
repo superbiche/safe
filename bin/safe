@@ -204,7 +204,18 @@ gate_wrapper_state() {
     printf 'not-on-path'
     return 0
   fi
-  if [[ "$(readlink -f "$resolved")" != "$(readlink -f "$wrapper")" ]]; then
+  # Anchor both operands (SAFE_BIN_DIR is operator-settable and a relative
+  # dash-leading value reads as readlink options) and require BOTH
+  # canonicalizations to succeed — empty==empty would otherwise report a
+  # falsely healthy `installed` (PR#30 delta-2 finding N2).
+  local resolved_canon wrapper_canon
+  resolved_canon="$(readlink -f -- "$resolved" 2>/dev/null || true)"
+  wrapper_canon="$(readlink -f -- "$wrapper" 2>/dev/null || true)"
+  if [[ -z "$resolved_canon" || -z "$wrapper_canon" ]]; then
+    printf 'not-on-path'
+    return 0
+  fi
+  if [[ "$resolved_canon" != "$wrapper_canon" ]]; then
     printf 'shadowed'
     return 0
   fi
