@@ -3715,7 +3715,14 @@ def vparse:
   | sub("^[vV]"; "")
   | split("+")[0]
   | split("-") as $p
-  | ((($p[0] | split(".") | map(tonumber? // 0)) + [0, 0, 0])[0:3])
+  # Core segments convert only on the strict numeric grammar; anything else
+  # maps to -1 so a malformed core ("0e0.0.0") can never outrank a valid
+  # version — jq tonumber would read "0e0" as numeric 0 (delta-3 finding 4).
+  # Selection paths additionally validate their candidates upfront
+  # (npm_max_satisfying, resolve_target_versions); a hard error here instead
+  # would fail closed on every annotation over PEP440-style OSV event
+  # versions ("1.0.post1"), which are annotation-only and server-authoritative.
+  | ((($p[0] | split(".") | map(if test("^(0|[1-9][0-9]*)$") then tonumber else -1 end)) + [0, 0, 0])[0:3])
     + [if ($p | length) > 1 then 0 else 1 end]
     + [if ($p | length) > 1
        # SemVer prerelease precedence is identifier-by-identifier: numeric
@@ -3787,12 +3794,16 @@ version_is_exact() {
 npm_registry_url() {
   # Explicit --registry from the audited command line wins: auditing the
   # default registry while npm installs from another one audits the wrong
-  # artifact (PR#29 review finding 3). Multiple accumulated sources: resolve
-  # via the first (the custom-source floor already covers the ambiguity).
+  # artifact (PR#29 review finding 3). npm options are LAST-wins — with
+  # repeated --registry flags npm fetches from the final one, so resolving
+  # any other source audits an artifact npm does not install (delta-3
+  # finding 3.1); the custom-source floor still checks every seen selector.
   if [[ -n "${CHECK_REGISTRY:-}" ]]; then
-    local first_src
-    read -r first_src _ <<<"${CHECK_REGISTRY}"
-    printf '%s' "${first_src%/}"
+    local last_src="" src_word
+    for src_word in ${CHECK_REGISTRY}; do
+      last_src="$src_word"
+    done
+    printf '%s' "${last_src%/}"
     return 0
   fi
   if [[ -n "${NPM_CONFIG_REGISTRY:-}" ]]; then
@@ -3954,6 +3965,11 @@ npm_max_satisfying() {
   local packument="$1" constraints="$2"
   jq -r --argjson cons "$constraints" "
     $JQ_VSEMVER
+    # Packument keys and dist-tags are registry-writable data: only strict
+    # SemVer participates in selection, matching npm's own selector, which
+    # rejects malformed versions like \"0e0.0.0\" outright (delta-3 finding 4).
+    def semver_ok:
+      test(\"^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)([-][0-9A-Za-z.-]+)?([+][0-9A-Za-z.-]+)?\$\");
     def satisfies(\$ver):
       all(\$cons[];
         . as \$c |
@@ -3965,10 +3981,11 @@ npm_max_satisfying() {
         else false
         end);
     (.\"dist-tags\".latest // \"\") as \$latest
-    | if (\$latest != \"\") and ((.versions // {}) | has(\$latest)) and satisfies(\$latest)
+    | if (\$latest != \"\") and (\$latest | semver_ok) and ((.versions // {}) | has(\$latest)) and satisfies(\$latest)
       then \$latest
       else
         [ (.versions // {}) | keys[]
+          | select(semver_ok)
           | select(contains(\"-\") | not)
           | select(satisfies(.)) ]
         | sort_by(vparse) | last // empty
@@ -4032,13 +4049,22 @@ resolve_target_versions() {
   fi
   command -v curl >/dev/null 2>&1 || return 1
   case "$ecosystem" in
-    npm) resolve_npm_versions "$name" "$requested" "$op" "$scratch" ;;
-    python) resolve_registry_latest "$requested" "https://pypi.org/pypi/${name}/json" '.info.version // empty' pypi.org "$scratch" ;;
-    rust) resolve_registry_latest "$requested" "https://crates.io/api/v1/crates/${name}" '.crate.max_stable_version // .crate.newest_version // empty' crates.io "$scratch" ;;
-    php) resolve_registry_latest "$requested" "https://repo.packagist.org/p2/${name}.json" --arg-name "$name" packagist.org "$scratch" ;;
-    go) resolve_registry_latest "$requested" "https://proxy.golang.org/${name}/@latest" '.Version // empty' proxy.golang.org "$scratch" ;;
+    npm) resolve_npm_versions "$name" "$requested" "$op" "$scratch" || return 1 ;;
+    python) resolve_registry_latest "$requested" "https://pypi.org/pypi/${name}/json" '.info.version // empty' pypi.org "$scratch" || return 1 ;;
+    rust) resolve_registry_latest "$requested" "https://crates.io/api/v1/crates/${name}" '.crate.max_stable_version // .crate.newest_version // empty' crates.io "$scratch" || return 1 ;;
+    php) resolve_registry_latest "$requested" "https://repo.packagist.org/p2/${name}.json" --arg-name "$name" packagist.org "$scratch" || return 1 ;;
+    go) resolve_registry_latest "$requested" "https://proxy.golang.org/${name}/@latest" '.Version // empty' proxy.golang.org "$scratch" || return 1 ;;
     *) return 1 ;;
   esac
+  # Every registry-supplied target (dist-tag value, range-resolved candidate,
+  # registry latest) must satisfy the same version grammar an exact pin does:
+  # this data is registry-writable, and a malformed selected target means we
+  # no longer model the manager's selector — degrade (delta-3 finding 4).
+  local rv
+  for rv in ${RESOLVED_VERSIONS[@]+"${RESOLVED_VERSIONS[@]}"}; do
+    version_is_exact "$ecosystem" "$rv" || return 1
+  done
+  return 0
 }
 
 resolve_registry_latest() {
@@ -4282,8 +4308,16 @@ mark_install_known() {
   key="$ecosystem:$name"
   # Evidence is scoped to the source it was gathered against: a receipt from
   # the default registry must never satisfy a later custom-index request
-  # (delta-2 finding 5).
-  source_id="${CHECK_REGISTRY:-default}"
+  # (delta-2 finding 5). Discriminated identity: a literal selector spelled
+  # "default" (cargo named registries) must never collide with the
+  # implicit-default sentinel (delta-3 finding 5). Legacy receipts with no
+  # source field map to implicit-default only.
+  local source_set="${CHECK_EFFECTIVE_SOURCES:-${CHECK_REGISTRY:-}}"
+  if [[ -n "$source_set" ]]; then
+    source_id="explicit:${source_set}"
+  else
+    source_id="implicit-default"
+  fi
   mkdir -p "$SAFE_RUN_CONFIG_DIR"
   [[ -f "$INSTALL_KNOWN_FILE" ]] || printf '{"packages":{}}\n' > "$INSTALL_KNOWN_FILE"
   tmp=$(mktemp)
@@ -4324,8 +4358,11 @@ host_allow_matches_resolved() {
 check_command() {
   local ecosystem="" json_mode=0 spec="" op="install" gate=""
   # Target-context selectors from the audited command line (dynamically
-  # scoped: the resolver helpers read them).
+  # scoped: the resolver helpers read them). CHECK_EFFECTIVE_SOURCES is the
+  # argv set plus any env/npmrc-configured npm source, computed at the trust
+  # floor; the receipt writer derives evidence identity from it.
   local CHECK_DIST_TAG="" CHECK_REGISTRY="" CHECK_PROJECT_DIR=""
+  local CHECK_EFFECTIVE_SOURCES=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --ecosystem)
@@ -4550,10 +4587,25 @@ check_command() {
   # 3). CHECK_REGISTRY may carry MULTIPLE space-separated sources (pip/uv
   # selectors are cumulative — a later trusted selector must never erase an
   # earlier untrusted one, delta-2 finding 3): every source must be trusted.
+  # For npm the EFFECTIVE source can also come from NPM_CONFIG_REGISTRY or a
+  # project/user .npmrc with no argv selector at all, and exact pins skip
+  # resolution entirely — so the effective source is computed here on every
+  # check (env + npmrc read only, no network; delta-3 finding 3.2).
   # Operator escape hatches: install.trusted_registries, or a pinned
   # host-allow.
   local custom_source=0 check_src
-  for check_src in ${CHECK_REGISTRY:-}; do
+  CHECK_EFFECTIVE_SOURCES="${CHECK_REGISTRY:-}"
+  if [[ "$ecosystem" == "npm" ]]; then
+    local npm_effective
+    npm_effective=$(npm_registry_url)
+    if [[ -n "$npm_effective" && "$npm_effective" != "https://registry.npmjs.org" ]]; then
+      case " ${CHECK_EFFECTIVE_SOURCES} " in
+        *" ${npm_effective} "*) : ;;
+        *) CHECK_EFFECTIVE_SOURCES="${CHECK_EFFECTIVE_SOURCES:+${CHECK_EFFECTIVE_SOURCES} }${npm_effective}" ;;
+      esac
+    fi
+  fi
+  for check_src in ${CHECK_EFFECTIVE_SOURCES}; do
     if ! registry_is_trusted "$check_src" "$ecosystem"; then
       custom_source=1
       warn_causes+=("custom_source")
@@ -4636,7 +4688,7 @@ check_command() {
     printf 'OSV:         %s\n' "$osv_line"
     printf 'Blocklist:   %s\n' "$block_line"
     if (( custom_source )); then
-      printf '\n[safe audit] custom source: %s — advisory evidence covers the public registry identity only\n' "$CHECK_REGISTRY"
+      printf '\n[safe audit] custom source: %s — advisory evidence covers the public registry identity only\n' "$CHECK_EFFECTIVE_SOURCES"
     fi
     if [[ "$(jq -r '.available // false' "$socket_json" 2>/dev/null)" != "true" ]]; then
       printf '\n[safe audit] WARNING: socket CLI not available, skipping behavioral analysis\n'

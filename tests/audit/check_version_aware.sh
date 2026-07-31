@@ -774,6 +774,8 @@ if (
     and vlt("1.0.0-alpha.10"; "1.0.0")
     and vlt("1.0.0-alpha"; "1.0.0-alpha.1")
     and vlt("1.0.0-alpha.beta"; "1.0.0-beta")
+    and vlt("0e0.0.0"; "0.0.1")
+    and vlt("1e2.0.0"; "1.0.0")
   ' | grep -q '^true$'
 ); then
   pass "prerelease identifiers compare per SemVer, not lexically"
@@ -861,7 +863,10 @@ fi
 prepare_case pagination-ws-token
 PAGES="$CASE_DIR/pages"
 mkdir -p "$PAGES"
-printf '{"vulns": [], "next_page_token": "\n"}' > "$PAGES/page1.json"
+# printf '%s' so the file is VALID JSON whose decoded token is a real
+# newline — a format-string \n would break the JSON itself and exercise the
+# generic malformed-JSON path instead (delta-3 F2 test nit).
+printf '%s' '{"vulns": [], "next_page_token": "\n"}' > "$PAGES/page1.json"
 run_check \
   MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
   MOCK_OSV_PAGES="$PAGES" \
@@ -971,12 +976,175 @@ run_check \
 if expect_status 0 "trusted mirror gates GO"; then
   pass "trusted mirror gates GO"
 fi
-if jq -e '.packages["npm:brace-expansion"].source == "https://mirror.example"' \
+if jq -e '.packages["npm:brace-expansion"].source == "explicit:https://mirror.example"' \
   "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
   pass "receipt records the source it was gathered against"
 else
   cat "$CASE_RUN_CONFIG/install-known.json" >&2
   fail "receipt records the source it was gathered against"
+fi
+
+# ---------------------------------------------------------------------------
+# 34. npm repeated --registry: resolution follows npm's LAST-wins semantics
+#     (delta-3 finding 3.1) while the floor still sees every selector
+# ---------------------------------------------------------------------------
+prepare_case npm-registry-last-wins
+printf '{"install": {"trusted_registries": ["https://first.example", "https://second.example"]}}\n' \
+  > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_REGISTRY_URL_LOG="$CASE_DIR/registry-urls.log" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion --ecosystem npm --registry 'https://first.example https://second.example' --gate install
+if expect_status 0 "two operator-trusted registries still gate GO"; then
+  pass "two operator-trusted registries still gate GO"
+fi
+if grep -q '^https://second\.example/' "$CASE_DIR/registry-urls.log" \
+  && ! grep -q '^https://first\.example/' "$CASE_DIR/registry-urls.log"; then
+  pass "npm resolution fetches from the LAST registry (npm last-wins)"
+else
+  cat "$CASE_DIR/registry-urls.log" >&2
+  fail "npm resolution fetches from the LAST registry (npm last-wins)"
+fi
+
+# ---------------------------------------------------------------------------
+# 35. NPM_CONFIG_REGISTRY reaches the trust floor even on an exact pin
+#     (delta-3 finding 3.2: effective sources outside argv)
+# ---------------------------------------------------------------------------
+prepare_case env-registry-floor
+fixture="$(osv_fixture_empty)"
+run_check \
+  NPM_CONFIG_REGISTRY=https://evil.example \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 10 "env-configured registry floors an exact pin at WARN"; then
+  pass "env-configured registry floors an exact pin at WARN"
+fi
+if expect_grep "$ERR_FILE" 'custom package source' "env-registry refusal names the custom source"; then
+  pass "env-registry refusal names the custom source"
+fi
+
+# ---------------------------------------------------------------------------
+# 36. A project .npmrc registry line reaches the trust floor too
+# ---------------------------------------------------------------------------
+prepare_case npmrc-registry-floor
+printf 'registry=https://corp.example/npm/\n' > "$CASE_PROJECT/.npmrc"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 10 "project .npmrc registry floors an exact pin at WARN"; then
+  pass "project .npmrc registry floors an exact pin at WARN"
+fi
+
+# ---------------------------------------------------------------------------
+# 37. A trusted env-configured mirror stays frictionless and the receipt is
+#     scoped to it (UX-preserving mitigation for finding 3.2)
+# ---------------------------------------------------------------------------
+prepare_case env-registry-trusted
+printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  NPM_CONFIG_REGISTRY=https://mirror.example \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 0 "a trusted env-configured mirror gates GO"; then
+  pass "a trusted env-configured mirror gates GO"
+fi
+if jq -e '.packages["npm:brace-expansion"].source == "explicit:https://mirror.example"' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "receipt identity carries the env-configured source"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2
+  fail "receipt identity carries the env-configured source"
+fi
+
+# ---------------------------------------------------------------------------
+# 38. Malformed packument core versions never win selection: npm's selector
+#     rejects "0e0.0.0"; ours must pick what npm actually installs
+#     (delta-3 finding 4)
+# ---------------------------------------------------------------------------
+prepare_case malformed-core
+cat > "$FIXTURES/packument-malformed.json" <<'JSON'
+{
+  "dist-tags": {"latest": "0e0.0.0"},
+  "versions": {"0e0.0.0": {}, "1.0.0": {}}
+}
+JSON
+printf '{"dependencies": {"demo-pkg": "<=1.0.0"}}\n' > "$CASE_PROJECT/package.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument-malformed.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- demo-pkg --ecosystem npm --op update --gate install
+if expect_status 0 "malformed candidates are excluded from selection"; then
+  pass "malformed candidates are excluded from selection"
+fi
+if expect_grep "$OUT_FILE" 'Resolved:.*1\.0\.0' "the well-formed in-range version is audited"; then
+  pass "the well-formed in-range version is audited"
+fi
+if expect_no_grep "$OUT_FILE" '0e0' "the malformed version is never the audited target"; then
+  pass "the malformed version is never the audited target"
+fi
+
+# ---------------------------------------------------------------------------
+# 39. A malformed dist-tag TARGET degrades instead of being audited
+# ---------------------------------------------------------------------------
+prepare_case malformed-dist-tag
+cat > "$FIXTURES/packument-malformed-only.json" <<'JSON'
+{
+  "dist-tags": {"latest": "0e0.0.0"},
+  "versions": {"0e0.0.0": {}}
+}
+JSON
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument-malformed-only.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- demo-pkg --ecosystem npm --gate install
+if expect_status 10 "a malformed dist-tag target degrades to unresolved"; then
+  pass "a malformed dist-tag target degrades to unresolved"
+fi
+if expect_grep "$ERR_FILE" 'pin an exact version' "degraded refusal keeps the pin guidance"; then
+  pass "degraded refusal keeps the pin guidance"
+fi
+
+# ---------------------------------------------------------------------------
+# 40. Default-source receipts carry the implicit-default sentinel; a literal
+#     "--registry default" floors (untrusted) and never writes a colliding
+#     receipt (delta-3 finding 5)
+# ---------------------------------------------------------------------------
+prepare_case implicit-default-sentinel
+printf '{"dependencies": {"brace-expansion": "^2.0.0"}}\n' > "$CASE_PROJECT/package.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 0 "default-source exact pin gates GO"; then
+  pass "default-source exact pin gates GO"
+fi
+if jq -e '.packages["npm:brace-expansion"].source == "implicit-default"' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "default-source receipt carries the implicit-default sentinel"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2
+  fail "default-source receipt carries the implicit-default sentinel"
+fi
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- ripgrep@14.1.1 --ecosystem cargo --registry default --gate install
+if expect_status 10 "a literal 'default' selector is an untrusted explicit source"; then
+  pass "a literal 'default' selector is an untrusted explicit source"
 fi
 
 # ---------------------------------------------------------------------------

