@@ -50,12 +50,14 @@ manifest evidence only, `safe audit scan --full --project .` for the complete
 tree, and `safe audit scan --verbose --project .` to inspect the resolved scan
 scope.
 
-Guard persistent package installs:
+Guard persistent package installs. `install.sh` writes PATH wrappers to
+`~/.local/bin`, so every shell — interactive or not — routes package managers
+through the gate once that directory precedes the real tools on PATH:
 
 ```bash
 safe install -g cowsay@1.6.0
-source "$HOME/.config/safe/install-wrappers.zsh"
-npm install express
+safe status          # confirm: wrappers: ok (11/11 installed)
+npm install express  # gated by ~/.local/bin/npm -> safe gate npm
 ```
 
 ## Main Safety Idea

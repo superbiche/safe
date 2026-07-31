@@ -183,10 +183,16 @@ safe_gate_run_audit() {
 # untrusted one (PR#29 delta-2 finding 3).
 safe_gate_add_source() {
   local value="$1"
-  case " ${SAFE_GATE_REGISTRY} " in
-    *" ${value} "*) return 0 ;;
-  esac
-  SAFE_GATE_REGISTRY="${SAFE_GATE_REGISTRY:+${SAFE_GATE_REGISTRY} }${value}"
+  while [[ "${value}" == */ ]]; do value="${value%/}"; done
+  [[ -n "${value}" ]] || return 0
+  # A repeat moves to the END rather than being dropped: npm is last-wins, so
+  # `--registry A --registry B --registry A` installs from A, and the
+  # resolver's last-word read must see A last (delta-4 finding 3.1).
+  local out="" w
+  for w in ${SAFE_GATE_REGISTRY}; do
+    [[ "$w" == "$value" ]] || out="${out:+$out }$w"
+  done
+  SAFE_GATE_REGISTRY="${out:+$out }$value"
 }
 
 safe_gate_scan_target_flags() {
@@ -317,11 +323,21 @@ safe_gate_known_matches() {
 
   # Only fully clean GO evidence may satisfy the offline fallback — a
   # tolerated-WARN record is not clean evidence (PR#29 review finding 5).
-  # Evidence is source-scoped: a default-registry receipt must never vouch
-  # for a custom index (PR#29 delta-2 finding 5).
-  local current_source="${SAFE_GATE_REGISTRY:-default}"
+  # The source identity (implicit-default vs explicit:<set>, delta-3
+  # finding 5) must be byte-identical to what safe-audit's receipt writer
+  # recorded; the derivation (argv + env + rc precedence, per ecosystem) is
+  # centralized in safe-audit — ask it instead of mirroring (delta-4
+  # findings 3.2 and N1). Local-only plumbing, no network. No identity ->
+  # fail closed: stale evidence never applies without a trustworthy match.
+  safe_gate_audit_available || return 1
+  local -a es_args=("${name}" --ecosystem "${ecosystem}")
+  [[ -n "${SAFE_GATE_REGISTRY:-}" ]] && es_args+=(--registry "${SAFE_GATE_REGISTRY}")
+  [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]] && es_args+=(--project-dir "${SAFE_GATE_PROJECT_DIR}")
+  local current_source
+  current_source="$("${SAFE_GATE_AUDIT_BIN}" effective-sources "${es_args[@]}" 2>/dev/null)" || return 1
+  [[ -n "${current_source}" ]] || return 1
   entry="$(jq -r --arg k "${ecosystem}:${name}" --arg v "${version}" --arg src "${current_source}" \
-    '.packages[$k] | select(.version == $v and .verdict == "GO" and ((.source // "default") == $src)) | .first_allowed // empty' "${known_file}" 2>/dev/null || true)"
+    '.packages[$k] | select(.version == $v and .verdict == "GO" and ((.source // "implicit-default") == $src)) | .first_allowed // empty' "${known_file}" 2>/dev/null || true)"
   [[ -n "${entry}" ]] || return 1
 
   ttl_days="$(jq -r '.install.auto_allow_ttl_days // 30' \

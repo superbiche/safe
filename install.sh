@@ -112,6 +112,18 @@ gate_wrapper_marked() {
   [[ "$(sed -n '2p' "$path" 2>/dev/null)" == "# safe-gate-wrapper v1 tool=${tool}" ]]
 }
 
+# Any owned wrapper anywhere in the set means gating is live on this machine
+# and the library it loads must be refreshed. Probing npm alone missed an
+# installation that kept, say, an owned pnpm wrapper and no npm one, leaving
+# the library unrestored (PR#30 delta finding 2).
+gate_wrappers_exist() {
+  local tool
+  for tool in "${GATE_TOOLS[@]}"; do
+    gate_wrapper_marked "$BIN_DIR/$tool" "$tool" && return 0
+  done
+  return 1
+}
+
 # PATH wrappers are what makes gating work in every shell (bash -c, Makefiles,
 # CI, agent harnesses), not just an interactive zsh. A pre-existing file
 # without our marker is somebody else's binary: report it and leave it alone.
@@ -388,7 +400,7 @@ mkdir -p "$BIN_DIR"
 # dispatcher routing through vulnerable tables (PR#30 review finding 2).
 # Refresh the library FIRST (never a new dispatcher with an old library),
 # whenever an installed copy or marked wrappers already exist.
-if [[ -f "$GATE_LIB_TARGET" ]] || gate_wrapper_marked "$BIN_DIR/npm" npm; then
+if [[ -f "$GATE_LIB_TARGET" ]] || gate_wrappers_exist; then
   mkdir -p "$CONFIG_BASE"
   install -m 0644 "$REPO_DIR/lib/gate-lib.sh" "$GATE_LIB_TARGET"
   info "refreshed gate library at $GATE_LIB_TARGET"

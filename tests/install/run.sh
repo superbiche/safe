@@ -1091,6 +1091,31 @@ case_selective_install_refreshes_gate_lib() {
     return
   fi
   cmp -s "${ROOT_DIR}/lib/gate-lib.sh" "${HOME_DIR}/.config/safe/gate-lib.sh" || { fail "$FUNCNAME"; return; }
+
+  # Damaged installation: NO installed library and NO npm wrapper, but one
+  # owned non-npm wrapper still gating. The npm-only probe missed this and
+  # left the library unrestored, so pnpm refused for want of a library
+  # (delta finding 2). Any owned wrapper must trigger the refresh, in every
+  # selective mode.
+  local mode
+  for mode in --run --audit --no-wrappers; do
+    rm -f "${HOME_DIR}/.config/safe/gate-lib.sh" "${HOME_DIR}/.local/bin/npm"
+    printf '#!/usr/bin/env bash\n# safe-gate-wrapper v1 tool=pnpm\nexec safe gate pnpm -- "$@"\n' > "${HOME_DIR}/.local/bin/pnpm"
+    chmod +x "${HOME_DIR}/.local/bin/pnpm"
+    HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" "${mode}" >>"${OUT_FILE}" 2>>"${ERR_FILE}"
+    STATUS=$?
+    assert_status 0 "$FUNCNAME" || return
+    [[ -f "${HOME_DIR}/.config/safe/gate-lib.sh" ]] || {
+      printf 'mode %s did not restore the gate library for a non-npm wrapper\n' "${mode}" >&2
+      fail "$FUNCNAME"
+      return
+    }
+    cmp -s "${ROOT_DIR}/lib/gate-lib.sh" "${HOME_DIR}/.config/safe/gate-lib.sh" || {
+      printf 'mode %s restored a library that is not the shipped one\n' "${mode}" >&2
+      fail "$FUNCNAME"
+      return
+    }
+  done
   pass "$FUNCNAME"
 }
 
@@ -1149,6 +1174,77 @@ case_status_probes_every_wrapper() {
   local doctor_out
   doctor_out="$(cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" "${HOME_DIR}/.local/bin/safe" doctor --json 2>/dev/null)"
   jq -e '.environment.install_wrappers.gate_wrappers.pnpm == "missing" and .environment.install_wrappers.gate_wrappers_healthy == false' <<<"${doctor_out}" >/dev/null || { printf '%s\n' "${doctor_out}" >&2; fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
+case_wrappers_not_on_path_are_unhealthy() {
+  prepare_case "wrappers-not-on-path"
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+
+  # The cron/service shape: installed `safe` invoked by ABSOLUTE path from a
+  # PATH that omits ~/.local/bin. The owned wrapper files exist but do not
+  # resolve, so they gate nothing — reporting "installed" claimed health for an
+  # ungated machine (delta finding 3).
+  #
+  # PATH must keep /usr/bin:/bin (safe's own `#!/usr/bin/env bash` and its jq /
+  # sed / date calls live there), so which managers still resolve depends on
+  # the host: those found under /usr/bin are `shadowed`, the rest are
+  # `not-on-path`. The expectation is therefore computed from the same PATH
+  # rather than hardcoded — and the case fails loudly if the host cannot
+  # exercise the not-on-path branch at all.
+  local probe_path="/usr/bin:/bin"
+  local -a expect_unresolved=() expect_shadowed=()
+  local tool
+  for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer; do
+    if [[ -n "$(PATH="${probe_path}" command -v "${tool}" 2>/dev/null || true)" ]]; then
+      expect_shadowed+=("${tool}")
+    else
+      expect_unresolved+=("${tool}")
+    fi
+  done
+  if [[ "${#expect_unresolved[@]}" -eq 0 ]]; then
+    printf 'host resolves all 11 managers under %s; cannot exercise not-on-path\n' "${probe_path}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+
+  local status_out doctor_out
+  status_out="$(cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${probe_path}" "${HOME_DIR}/.local/bin/safe" status 2>/dev/null)"
+  grep -Fq 'DEGRADED' <<<"${status_out}" || { printf '%s\n' "${status_out}" >&2; fail "$FUNCNAME"; return; }
+  for tool in "${expect_unresolved[@]}"; do
+    grep -Fq "${tool}:not-on-path" <<<"${status_out}" || {
+      printf 'expected %s:not-on-path in status:\n%s\n' "${tool}" "${status_out}" >&2
+      fail "$FUNCNAME"
+      return
+    }
+  done
+  for tool in "${expect_shadowed[@]}"; do
+    grep -Fq "${tool}:shadowed" <<<"${status_out}" || {
+      printf 'expected %s:shadowed in status:\n%s\n' "${tool}" "${status_out}" >&2
+      fail "$FUNCNAME"
+      return
+    }
+  done
+
+  # No tool may report installed here, and the aggregate must be unhealthy.
+  doctor_out="$(cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${probe_path}" "${HOME_DIR}/.local/bin/safe" doctor --json 2>/dev/null)"
+  jq -e --arg t "${expect_unresolved[0]}" '
+    .environment.install_wrappers.gate_wrappers_healthy == false
+    and .environment.install_wrappers.gate_wrappers[$t] == "not-on-path"
+    and ([.environment.install_wrappers.gate_wrappers[] | select(. == "installed")] | length == 0)
+  ' <<<"${doctor_out}" >/dev/null || { printf '%s\n' "${doctor_out}" >&2; fail "$FUNCNAME"; return; }
+
+  # A non-npm tool shadowed by an EARLIER PATH entry is unhealthy too, and is
+  # reported as shadowed rather than not-on-path.
+  local shadow_bin="${CASE_DIR}/shadow"
+  mkdir -p "${shadow_bin}"
+  printf '#!/usr/bin/env bash\necho foreign-cargo\n' > "${shadow_bin}/cargo"
+  chmod +x "${shadow_bin}/cargo"
+  status_out="$(cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${shadow_bin}:${HOME_DIR}/.local/bin:/usr/bin:/bin" "${HOME_DIR}/.local/bin/safe" status 2>/dev/null)"
+  grep -Fq 'cargo:shadowed' <<<"${status_out}" || { printf '%s\n' "${status_out}" >&2; fail "$FUNCNAME"; return; }
+  grep -Fq 'DEGRADED' <<<"${status_out}" || { fail "$FUNCNAME"; return; }
   pass "$FUNCNAME"
 }
 
@@ -1596,6 +1692,7 @@ main() {
     case_selective_install_refreshes_gate_lib \
     case_loose_marker_is_not_ownership \
     case_status_probes_every_wrapper \
+    case_wrappers_not_on_path_are_unhealthy \
     case_uv_index_selectors_reach_audit \
     case_uninstall_removes_gate_wrappers \
     case_install_cleans_legacy_safe_install_artifacts \

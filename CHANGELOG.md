@@ -31,8 +31,12 @@
   PATH, so mise/asdf shims and per-project tool versions keep working.
   `install.sh` refuses to overwrite an unmarked file of a wrapped name (it
   reports and skips); `uninstall.sh` removes only marked wrappers.
-  `safe status` now probes the wrappers (`installed` / `shadowed` /
-  `not installed`) instead of shell function state.
+  `safe status` and `safe doctor --json` now probe every wrapper in the set
+  (`installed` / `shadowed` / `not-on-path` / `missing` / `foreign`) instead of
+  shell function state, and report the set healthy only when every tool
+  resolves to its own wrapper — `not-on-path` covers the cron/service shape
+  where the wrapper files exist but `$SAFE_BIN_DIR` is not on PATH, so nothing
+  is actually gated.
   `lib/install-wrappers.zsh` remains, as a stub that defines no wrappers and
   warns once in an interactive shell when gating is absent.
   Two consequences of the process model: the "safe audit not installed" warning

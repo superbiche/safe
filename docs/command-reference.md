@@ -172,7 +172,7 @@ safe install --trust-host -g cowsay@1.6.0
 The PATH-executable gate wrappers cover these command families:
 
 ```text
-npm, pnpm, yarn, bun
+npm, pnpm, pnpx, yarn, bun
 uv, pip, pip3
 cargo
 go

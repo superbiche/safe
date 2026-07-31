@@ -26,11 +26,22 @@ safe audit setup --all
 safe audit scan --all
 ```
 
-Enable persistent install protection by starting a new zsh session or sourcing:
+Install protection is active as soon as `install.sh` has written the PATH
+wrappers — no shell integration and no sourcing involved. Each wrapper in
+`$SAFE_BIN_DIR` (default `~/.local/bin`) execs `safe gate <tool>`, which loads
+the routing tables from `~/.config/safe/gate-lib.sh` and delegates to the real
+tool. What activates it is PATH order: `$SAFE_BIN_DIR` must precede the
+directory holding the real package managers (a version-manager shim dir, for
+instance). Verify with:
 
 ```bash
-source "$HOME/.config/safe/install-wrappers.zsh"
+safe status   # wrappers: ok (11/11 installed in ~/.local/bin)
 ```
+
+`~/.config/safe/install-wrappers.zsh` is a compatibility stub for existing
+`.zshrc` lines. It defines no wrapper functions and cannot enable protection;
+it only prints a one-time warning in an interactive shell when the wrappers are
+missing.
 
 ## Unknown Package Execution
 

@@ -175,9 +175,13 @@ gate_wrapper_marked() {
   [[ "$(sed -n '2p' "$path" 2>/dev/null)" == "# safe-gate-wrapper v1 tool=${tool}" ]]
 }
 
-# Per-tool wrapper state: installed | shadowed | missing | foreign.
+# Per-tool wrapper state: installed | shadowed | not-on-path | missing | foreign.
 # The wrapper set is healthy only when EVERY tool resolves to its owned
 # wrapper — one ungated tool defeats the seatbelt (PR#30 review finding 3).
+# An owned wrapper that resolves to NOTHING is not installed in any useful
+# sense: invoked from a cron/service PATH without $SAFE_BIN_ROOT the file
+# exists but gates nothing, and reporting it as installed made doctor claim
+# health for a fully ungated machine (PR#30 delta finding 3).
 gate_wrapper_state() {
   local tool="$1" wrapper="$SAFE_BIN_ROOT/$1" resolved=""
   if [[ -e "$wrapper" || -L "$wrapper" ]]; then
@@ -190,7 +194,11 @@ gate_wrapper_state() {
     return 0
   fi
   resolved="$(command -v "$tool" 2>/dev/null || true)"
-  if [[ -n "$resolved" && "$(readlink -f "$resolved")" != "$(readlink -f "$wrapper")" ]]; then
+  if [[ -z "$resolved" ]]; then
+    printf 'not-on-path'
+    return 0
+  fi
+  if [[ "$(readlink -f "$resolved")" != "$(readlink -f "$wrapper")" ]]; then
     printf 'shadowed'
     return 0
   fi
@@ -222,7 +230,8 @@ cmd_status() {
     echo "wrappers:       ok (${healthy}/${#SAFE_GATE_TOOL_LIST[@]} installed in $SAFE_BIN_ROOT)"
   else
     echo "wrappers:       DEGRADED (${healthy}/${#SAFE_GATE_TOOL_LIST[@]} healthy) — ${unhealthy[*]}"
-    echo "                foreign/shadowed/missing tools are NOT gated; fix and re-run install.sh"
+    echo "                foreign/shadowed/missing/not-on-path tools are NOT gated; fix and re-run install.sh"
+    echo "                not-on-path means the wrapper exists but $SAFE_BIN_ROOT is not on PATH here"
   fi
 }
 
