@@ -81,9 +81,18 @@ own environment *or inherited from the surrounding shell*, and on the
 `mise exec -- <tool>` route as well as direct installs — safe does not
 pretend to have checked it: that spec takes the not-audit-gated notice
 path rather than reporting a verdict computed against the default public
-source. Directory-scoped Cargo/Composer config files are not yet detected;
-extending the audit's source derivation to those ecosystems is tracked
-separately.
+source. Selectors apply to the installer that actually reads them: bun's
+registry variable affects a bun install, not an npm one, and an exported
+but empty selector chooses nothing, so neither suppresses an audit safe
+can honestly perform. Directory-scoped config files (Cargo's `config.toml`,
+Composer's, bun's `bunfig.toml`) are not yet detected; extending the
+audit's source derivation to those ecosystems is tracked separately.
+
+An unversioned explicit `mise upgrade <tool>` is checked at each of the
+tool's configured requests that can actually move — an exact pin cannot,
+so it is not reported as a verdict for a no-op — while `upgrade --bump`
+is checked at the target it will move to rather than the request it is
+leaving.
 
 Display-only invocations pass through untouched: `--help` (including a
 leading global one), a bare `--version`, and `--dry-run`/`--dry-run-code`

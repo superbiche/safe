@@ -2356,11 +2356,13 @@ case_mise_scoped_exclusion_and_interactive() {
   # An npm scope starts with '@': a blind version split reduced every
   # unversioned scoped name to "npm:" and made unrelated tools compare
   # equal, so an unrelated --exclude silenced the audit (delta-2 F3).
-  local scoped_ls='{"npm:@scope/blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}]}'
+  # A floating request can move on a plain upgrade; an exact one cannot
+  # (delta-4 finding F3), so the movable case is what proves the audit.
+  local scoped_ls='{"npm:@scope/blockme": [{"version": "1.0.0", "requested_version": "1", "installed": true}]}'
   MISE_LS_JSON="${scoped_ls}" \
     SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:@scope/blockme --exclude npm:@other/safe' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\t@scope/blockme@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\t@scope/blockme@1\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
 
   # The matching exclusion still drops its own target.
   : > "${LOG_FILE}"
@@ -2374,10 +2376,18 @@ case_mise_scoped_exclusion_and_interactive() {
   # finding F3): the configured version is what gets checked, and a target
   # with no configured request refuses rather than guessing.
   : > "${LOG_FILE}"
-  MISE_LS_JSON='{"npm:blockme": [{"version": "2.0.0", "requested_version": "2.0.0", "installed": true}]}' \
+  MISE_LS_JSON='{"npm:blockme": [{"version": "2.0.0", "requested_version": "2", "installed": true}]}' \
     SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@2\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # An EXACT configured request cannot move on a plain upgrade: auditing it
+  # reported a verdict for a no-op (delta-4 finding F3).
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "2.0.0", "requested_version": "2.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
 
   : > "${LOG_FILE}"
   MISE_LS_JSON='{}' SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:blockme' run_zsh
@@ -2525,9 +2535,23 @@ case_mise_unmodeled_sources_cover_ambient_and_inner() {
   assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
 
   : > "${LOG_FILE}"
-  SAFE_INSTALL_TEST_SCRIPT='export BUN_CONFIG_REGISTRY=https://private.example; mise exec -- npm install blockme' run_zsh
+  SAFE_INSTALL_TEST_SCRIPT='export BUN_CONFIG_REGISTRY=https://private.example; mise exec -- bun add blockme' run_zsh
   assert_status 0 "$FUNCNAME" || return
   assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+
+  # ...but npm does not read that variable, so an npm install still gets
+  # its audit: applying selectors by ecosystem removed the gate from
+  # artifacts safe can model (delta-4 finding F4).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='export BUN_CONFIG_REGISTRY=https://private.example; mise exec -- npm install blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # An exported but EMPTY selector chooses nothing: it must not suppress
+  # the audit either.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='export BUN_CONFIG_REGISTRY=; mise exec -- bun add blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
 
   # Without an unmodeled source the inner route audits normally.
   : > "${LOG_FILE}"
@@ -2559,6 +2583,82 @@ case_mise_env_transport_handles_unicode_and_nul() {
     return
   fi
   assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_option_attribution_covers_cli_and_hidden_rows() {
+  prepare_case "mise-option-attribution"
+  # An explicit CLI target INHERITS the configured options for its key, so
+  # the attribution check must run there too (delta-4 finding F1).
+  MISE_TOOL_JSON='{"tool_options": {"npm_args": "--registry=https://evil.example"}}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install npm:blockme@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+
+  # Multiplicity must be counted BEFORE the operation mode hides sibling
+  # rows: one installed + one missing row share a single reported option
+  # set, so the key is still unattributable (delta-4 finding F1).
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}, {"version": "2.0.0", "requested_version": "2.0.0", "installed": false}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'several configured versions' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_bump_audits_the_moved_target() {
+  prepare_case "mise-bump-target"
+  # --bump moves to the LATEST release, outside the configured request:
+  # auditing the old pin checked a version that will not be installed
+  # (delta-4 finding F3). A bare name lets safe-audit resolve the same
+  # target mise will pick.
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade --bump' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade --bump npm:blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # install --force reinstalls the CONFIGURED version, so it keeps its
+  # request rather than resolving latest.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install --force' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_upgrade_lookup_is_canonical_and_ordered() {
+  prepare_case "mise-upgrade-lookup"
+  # A supported bare shorthand names the same tool as its configured
+  # backend key: comparing the raw spec refused it as unconfigured
+  # (delta-4 finding F3).
+  MISE_LS_JSON='{"npm:prettier": [{"version": "3.0.0", "requested_version": "3", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade prettier' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tprettier@3\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # Every configured request for the key can move, not just the first.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}, {"version": "2.0.0", "requested_version": "2", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@2\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # Exclusions apply BEFORE the configured-request lookup: a target mise
+  # will not touch must not be refused for being unconfigured.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:unconfigured --exclude npm:unconfigured' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tupgrade\tnpm:unconfigured\t--exclude\tnpm:unconfigured' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -2774,6 +2874,9 @@ main() {
     case_mise_option_checks_cover_every_preflight \
     case_mise_unmodeled_sources_cover_ambient_and_inner \
     case_mise_env_transport_handles_unicode_and_nul \
+    case_mise_option_attribution_covers_cli_and_hidden_rows \
+    case_mise_bump_audits_the_moved_target \
+    case_mise_upgrade_lookup_is_canonical_and_ordered \
     case_zsh_stub_warns_on_missing_mise_wrapper \
     case_uninstall_cleans_shell_and_legacy_binaries
   do
