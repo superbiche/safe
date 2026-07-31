@@ -45,6 +45,22 @@
   `--minimum-release-age` refuses non-exact targets; `--help`/`--version`/
   `--dry-run` pass through; counted verbosity (`-vvv`) is legal again;
   Cargo/pipx/composer registry variables joined the source allowlist.
+  Third review round: `package_manager` is no longer treated as
+  identity-neutral (it selects an installer with different registry
+  inputs), and the bare preflight reads each configured entry's options
+  via `mise tool --json` since `mise ls` hides them; a mise-selected
+  Cargo/pipx/Composer/Bun registry takes the not-audit-gated notice path
+  instead of a verdict computed against the default public source (safe's
+  effective-source derivation covers npm/Python/Go only — extending it is
+  tracked separately); env values round-trip byte-exactly (a trailing
+  newline was being stripped by command substitution) and a value that
+  cannot survive intact refuses; `requested_version` is required rather
+  than defaulted; exclusion matching is backend-aware so an npm scope is
+  not mistaken for a version; `use` honors `--minimum-release-age` like
+  install/upgrade; `upgrade --interactive` declines with an
+  explicit-target hint (same class as bare `mise use`); a leading global
+  `--help`/`--version` passes through; and an unusable `-C` directory
+  refuses with a real one-line message instead of a silent exit.
 
 - Second review round (PR#29 delta findings): custom package sources
   (`--registry`, `--index-url`, `--find-links`, `--no-index`, composer

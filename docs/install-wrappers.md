@@ -66,12 +66,20 @@ audits every configured tool (it reinstalls installed ones), `upgrade
 --exclude` drops the excluded tool from the audit set, and
 `--minimum-release-age` refuses for non-exact targets because mise
 deliberately selects an older release than safe would check. Tool options
-are honored, not discarded: an identity-neutral option
-(`package_manager`, `bin_path`, `exe`, `platform`, …) keeps the audit,
-while any other option can pass installer arguments or an install
-environment that changes the source, so the spec takes the not-audit-gated
+are honored, not discarded: an identity-neutral option (`bin_path`, `exe`,
+`platform`, `os`, …) keeps the audit, while any other option — including
+`package_manager`, which selects an installer whose own registry inputs
+differ — can change the source, so the spec takes the not-audit-gated
 notice path instead of a verdict for a package that may come from
-elsewhere.
+elsewhere. Configured tools carry options too, and `mise ls` does not show
+them, so the bare preflight reads each entry's options with
+`mise tool --json` before trusting `key@version`.
+
+Advisory sources safe can resolve against today are npm, Python (PyPI), and
+Go. When the mise environment selects a Cargo, pipx, Composer, or Bun
+registry, safe does not pretend to have checked it: that spec takes the
+not-audit-gated notice path rather than reporting a verdict computed
+against the default public source.
 
 Display-only invocations pass through untouched: `--help`, `--version`, and
 `--dry-run`/`--dry-run-code` install nothing (a `--help` *after* `--`
