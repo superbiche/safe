@@ -109,7 +109,13 @@ done
 gate_wrapper_marked() {
   local path="$1" tool="$2"
   [[ -f "$path" && ! -L "$path" ]] || return 1
-  [[ "$(sed -n '2p' "$path" 2>/dev/null)" == "# safe-gate-wrapper v1 tool=${tool}" ]]
+  # Byte-stream comparison, never a command substitution: these paths hold
+  # arbitrary foreign executables, and capturing an ELF second line into a
+  # shell variable made bash emit "ignored null byte in input" warnings from
+  # status/doctor/install (PR#30 round regression R1). Same exact whole-line
+  # test, no capture.
+  LC_ALL=C sed -n '2p' "$path" 2>/dev/null \
+    | LC_ALL=C grep -qxF -- "# safe-gate-wrapper v1 tool=${tool}"
 }
 
 # Any owned wrapper anywhere in the set means gating is live on this machine

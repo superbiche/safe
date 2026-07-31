@@ -1133,6 +1133,12 @@ case_loose_marker_is_not_ownership() {
   # A symlink to a marked file must never be followed and truncated.
   printf '#!/usr/bin/env bash\n# safe-gate-wrapper v1 tool=go\nexec safe gate go -- "$@"\n' > "${HOME_DIR}/marked-target"
   ln -s "${HOME_DIR}/marked-target" "${HOME_DIR}/.local/bin/go"
+  # A foreign BINARY whose second line carries NUL bytes: reading it into a
+  # shell variable made bash warn "ignored null byte in input" from every
+  # ownership probe (round regression R1). It is foreign, it survives, and the
+  # probe must stay quiet about it.
+  printf '#!/usr/bin/env bash\n\0\0binary\0payload\n' > "${HOME_DIR}/.local/bin/bun"
+  chmod +x "${HOME_DIR}/.local/bin/bun"
 
   HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
   STATUS=$?
@@ -1141,7 +1147,11 @@ case_loose_marker_is_not_ownership() {
   grep -Fq 'tool=npm' "${HOME_DIR}/.local/bin/cargo" || { fail "$FUNCNAME"; return; }
   [[ -L "${HOME_DIR}/.local/bin/go" ]] || { fail "$FUNCNAME"; return; }
   grep -Fq 'tool=go' "${HOME_DIR}/marked-target" || { fail "$FUNCNAME"; return; }
+  grep -Fq 'binary' "${HOME_DIR}/.local/bin/bun" || { fail "$FUNCNAME"; return; }
   assert_err_contains_fragment 'gating NOT active for:' "$FUNCNAME" || return
+  # R1: the ownership probe must not narrate about binary neighbours.
+  assert_err_not_contains_fragment 'null byte' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'warning:' "$FUNCNAME" || return
 
   HOME="${HOME_DIR}" bash "${ROOT_DIR}/uninstall.sh" >>"${OUT_FILE}" 2>>"${ERR_FILE}"
   STATUS=$?
@@ -1149,6 +1159,38 @@ case_loose_marker_is_not_ownership() {
   [[ -f "${HOME_DIR}/.local/bin/yarn" ]] || { fail "$FUNCNAME"; return; }
   [[ -f "${HOME_DIR}/.local/bin/cargo" ]] || { fail "$FUNCNAME"; return; }
   [[ -L "${HOME_DIR}/.local/bin/go" && -f "${HOME_DIR}/marked-target" ]] || { fail "$FUNCNAME"; return; }
+  [[ -f "${HOME_DIR}/.local/bin/bun" ]] || { fail "$FUNCNAME"; return; }
+  assert_err_not_contains_fragment 'null byte' "$FUNCNAME" || return
+
+  # The binary occupant must READ as foreign — an ownership probe that cannot
+  # parse it must not fall back to owning it — and status/doctor must stay
+  # quiet while saying so.
+  local probe_err="${CASE_DIR}/probe.err" probe_out="${CASE_DIR}/probe.out"
+  (cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" \
+    "${ROOT_DIR}/bin/safe" status >"${probe_out}") 2>"${probe_err}" || true
+  grep -Fq 'bun:foreign' "${probe_out}" || {
+    printf 'binary occupant did not read as foreign:\n%s\n' "$(cat "${probe_out}")" >&2
+    fail "$FUNCNAME"
+    return
+  }
+  if grep -Fq 'null byte' "${probe_err}"; then
+    printf 'status narrated about a binary neighbour:\n%s\n' "$(cat "${probe_err}")" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  (cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" \
+    "${ROOT_DIR}/bin/safe" doctor --json >"${probe_out}") 2>"${probe_err}" || true
+  jq -e '.environment.install_wrappers.gate_wrappers.bun == "foreign"
+     and .environment.install_wrappers.gate_wrappers_healthy == false' "${probe_out}" >/dev/null || {
+    printf 'doctor did not report the binary occupant as foreign:\n%s\n' "$(cat "${probe_out}")" >&2
+    fail "$FUNCNAME"
+    return
+  }
+  if grep -Fq 'null byte' "${probe_err}"; then
+    printf 'doctor narrated about a binary neighbour:\n%s\n' "$(cat "${probe_err}")" >&2
+    fail "$FUNCNAME"
+    return
+  fi
   pass "$FUNCNAME"
 }
 

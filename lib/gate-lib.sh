@@ -329,13 +329,24 @@ safe_gate_known_matches() {
   # centralized in safe-audit — ask it instead of mirroring (delta-4
   # findings 3.2 and N1). Local-only plumbing, no network. No identity ->
   # fail closed: stale evidence never applies without a trustworthy match.
-  safe_gate_audit_available || return 1
+  #
+  # A disabled reuse path must not be invisible: silently never reusing
+  # evidence looks like flaky refusals, so the failure says so once, on
+  # stderr, without changing the fail-closed outcome (same principle as the
+  # Socket-outage ruling).
+  if ! safe_gate_audit_available; then
+    safe_gate_err "safe gate: effective-sources unavailable — stale-evidence reuse disabled, run safe doctor"
+    return 1
+  fi
   local -a es_args=("${name}" --ecosystem "${ecosystem}")
   [[ -n "${SAFE_GATE_REGISTRY:-}" ]] && es_args+=(--registry "${SAFE_GATE_REGISTRY}")
   [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]] && es_args+=(--project-dir "${SAFE_GATE_PROJECT_DIR}")
   local current_source
-  current_source="$("${SAFE_GATE_AUDIT_BIN}" effective-sources "${es_args[@]}" 2>/dev/null)" || return 1
-  [[ -n "${current_source}" ]] || return 1
+  if ! current_source="$("${SAFE_GATE_AUDIT_BIN}" effective-sources "${es_args[@]}" 2>/dev/null)" \
+     || [[ -z "${current_source}" ]]; then
+    safe_gate_err "safe gate: effective-sources unavailable — stale-evidence reuse disabled, run safe doctor"
+    return 1
+  fi
   entry="$(jq -r --arg k "${ecosystem}:${name}" --arg v "${version}" --arg src "${current_source}" \
     '.packages[$k] | select(.version == $v and .verdict == "GO" and ((.source // "implicit-default") == $src)) | .first_allowed // empty' "${known_file}" 2>/dev/null || true)"
   [[ -n "${entry}" ]] || return 1

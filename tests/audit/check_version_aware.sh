@@ -2021,6 +2021,30 @@ else
   fail "a custom-source receipt never vouches for a default install"
 fi
 
+# Round 5 canonicalizes each source element (trailing slashes stripped). Writer
+# and reader must canonicalize identically or a trailing slash silently splits
+# the identity — the exact boundary that broke before centralization.
+prepare_case gate-reader-canonicalized-source
+printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --registry https://mirror.example/ --gate install
+if jq -e '.packages["npm:brace-expansion"].source == "explicit:https://mirror.example"' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "a trailing-slash selector is canonicalized on the receipt"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2
+  fail "a trailing-slash selector is canonicalized on the receipt"
+fi
+if [[ "$(gate_known_rc brace-expansion@2.1.4 npm PROBE_SOURCE_SET=https://mirror.example/)" == "0" ]]; then
+  pass "the reader canonicalizes a trailing-slash selector the same way"
+else
+  fail "the reader canonicalizes a trailing-slash selector the same way"
+fi
+
 # ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
