@@ -1071,8 +1071,10 @@ safe_install_known_matches() {
   IFS=$'\t' read -r name version <<< "$(safe_install_split_spec "$package")"
   [[ -n "$name" && -n "$version" && "$version" != "latest" ]] || return 1
 
+  # Only fully clean GO evidence may satisfy the offline fallback — a
+  # tolerated-WARN record is not clean evidence (PR#29 review finding 5).
   first_allowed="$(jq -r --arg k "${ecosystem}:${name}" --arg v "$version" \
-    '.packages[$k] | select(.version == $v) | .first_allowed // empty' "$known_file" 2>/dev/null || true)"
+    '.packages[$k] | select(.version == $v and .verdict == "GO") | .first_allowed // empty' "$known_file" 2>/dev/null || true)"
   [[ -n "$first_allowed" ]] || return 1
 
   ttl_days="$(jq -r '.install.auto_allow_ttl_days // 30' \

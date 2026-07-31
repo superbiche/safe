@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Orthogonal-review hardening of the version-aware gate (PR#29 findings):
+  version-scoped OSV results are server-authoritative — the local range
+  comparator annotates but can never downgrade a hit to GO; OSV pagination is
+  followed (a token-only page no longer reads as zero advisories, anomalies
+  fail closed); target-altering selectors are threaded into the audit
+  (`--tag` → dist-tag resolution, `--registry` → packument source,
+  `--prefix`/`--working-dir` → project dir; custom pip/uv/cargo/composer
+  indexes degrade to the unresolved refusal instead of auditing the default
+  registry); the npm resolver follows npm-pick-manifest's latest-tag
+  preference, no longer globs range tokens against cwd files, and degrades
+  when root `overrides` mention the package; a WARN/BLOCK check revokes any
+  stale install-known entry for that version and the timeout fallback only
+  accepts verdict-GO evidence; severity now normalizes from qualitative
+  labels AND standard CVSS v3 vectors (computed base score, most severe
+  wins; v4-only floors at high); `cargo`/`composer` ecosystem labels map to
+  their resolvers and OSV names, and `cargo install --version X` audits the
+  pinned crate.
+
 - Version-aware install verdicts: `safe audit check` now resolves the version
   the package manager would actually install (exact spec as-is; npm dist-tag
   for installs; the **in-range** target from `package.json`/lockfile ranges

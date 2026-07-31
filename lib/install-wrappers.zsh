@@ -40,11 +40,73 @@ safe_install_warn_missing() {
 }
 
 safe_install_run_audit() {
+  local -a extra=()
+  [[ -n "${SAFE_INSTALL_DIST_TAG:-}" ]] && extra+=(--dist-tag "${SAFE_INSTALL_DIST_TAG}")
+  [[ -n "${SAFE_INSTALL_REGISTRY:-}" ]] && extra+=(--registry "${SAFE_INSTALL_REGISTRY}")
+  [[ -n "${SAFE_INSTALL_PROJECT_DIR:-}" ]] && extra+=(--project-dir "${SAFE_INSTALL_PROJECT_DIR}")
   if (( $+commands[timeout] )); then
-    command timeout "${_SAFE_INSTALL_TIMEOUT_SECONDS:-${SAFE_INSTALL_TIMEOUT_SECONDS:-30}}" safe audit check "$@"
+    command timeout "${_SAFE_INSTALL_TIMEOUT_SECONDS:-${SAFE_INSTALL_TIMEOUT_SECONDS:-30}}" safe audit check "$@" "${extra[@]}"
   else
-    command safe audit check "$@"
+    command safe audit check "$@" "${extra[@]}"
   fi
+}
+
+# Target-altering selectors change what the package manager actually
+# installs (tag, source registry/index, project dir). They were previously
+# stripped from the audit while staying in the real command — the audit then
+# judged the wrong target (PR#29 review finding 3). Scan the original argv
+# (never inside a $() parser subshell: globals must survive) and thread the
+# values into the audit; safe-audit resolves with them or fails closed.
+safe_install_scan_target_flags() {
+  local family="$1"
+  shift
+  typeset -g SAFE_INSTALL_DIST_TAG=""
+  typeset -g SAFE_INSTALL_REGISTRY=""
+  typeset -g SAFE_INSTALL_PROJECT_DIR=""
+  local prev="" arg
+  for arg in "$@"; do
+    case "${family}" in
+      npm)
+        case "${prev}" in
+          --tag) SAFE_INSTALL_DIST_TAG="${arg}" ;;
+          --registry) SAFE_INSTALL_REGISTRY="${arg}" ;;
+          --prefix|-C|--cwd|--dir) SAFE_INSTALL_PROJECT_DIR="${arg}" ;;
+        esac
+        case "${arg}" in
+          --tag=*) SAFE_INSTALL_DIST_TAG="${arg#*=}" ;;
+          --registry=*) SAFE_INSTALL_REGISTRY="${arg#*=}" ;;
+          --prefix=*|--cwd=*|--dir=*) SAFE_INSTALL_PROJECT_DIR="${arg#*=}" ;;
+        esac
+        ;;
+      python)
+        case "${prev}" in
+          --index-url|-i|--extra-index-url|--default-index|--index) SAFE_INSTALL_REGISTRY="${arg}" ;;
+        esac
+        case "${arg}" in
+          --index-url=*|--extra-index-url=*|--default-index=*|--index=*) SAFE_INSTALL_REGISTRY="${arg#*=}" ;;
+        esac
+        ;;
+      cargo)
+        case "${prev}" in
+          --registry|--index) SAFE_INSTALL_REGISTRY="${arg}" ;;
+        esac
+        case "${arg}" in
+          --registry=*|--index=*) SAFE_INSTALL_REGISTRY="${arg#*=}" ;;
+        esac
+        ;;
+      composer)
+        case "${prev}" in
+          --repository) SAFE_INSTALL_REGISTRY="${arg}" ;;
+          --working-dir|-d) SAFE_INSTALL_PROJECT_DIR="${arg}" ;;
+        esac
+        case "${arg}" in
+          --repository=*) SAFE_INSTALL_REGISTRY="${arg#*=}" ;;
+          --working-dir=*) SAFE_INSTALL_PROJECT_DIR="${arg#*=}" ;;
+        esac
+        ;;
+    esac
+    prev="${arg}"
+  done
 }
 
 # Update-family subcommands resolve in-range instead of to the dist-tag; the
@@ -88,8 +150,10 @@ safe_install_known_matches() {
   IFS=$'\t' read -r name version <<< "$(safe_install_split_spec "${package}")"
   [[ -n "${name}" && -n "${version}" && "${version}" != "latest" ]] || return 1
 
+  # Only fully clean GO evidence may satisfy the offline fallback — a
+  # tolerated-WARN record is not clean evidence (PR#29 review finding 5).
   entry="$(jq -r --arg k "${ecosystem}:${name}" --arg v "${version}" \
-    '.packages[$k] | select(.version == $v) | .first_allowed // empty' "${known_file}" 2>/dev/null || true)"
+    '.packages[$k] | select(.version == $v and .verdict == "GO") | .first_allowed // empty' "${known_file}" 2>/dev/null || true)"
   [[ -n "${entry}" ]] || return 1
 
   ttl_days="$(jq -r '.install.auto_allow_ttl_days // 30' \
@@ -436,20 +500,37 @@ safe_install_cargo_packages() {
   local -a packages
   local arg
   local skip_next=0
+  local capture_version=0
+  local crate_version=""
 
   packages=()
   for arg in "$@"; do
+    if (( capture_version )); then
+      crate_version="${arg}"
+      capture_version=0
+      continue
+    fi
     if (( skip_next )); then
       skip_next=0
       continue
     fi
 
     case "${arg}" in
-      --version|--vers|--index|--registry|--root|--target|--features|--bin|--example)
+      --version|--vers)
+        # `cargo install <crate> --version <v>` pins the crate; dropping the
+        # value would audit the bare name (PR#29 review finding 7).
+        capture_version=1
+        continue
+        ;;
+      --version=*|--vers=*)
+        crate_version="${arg#*=}"
+        continue
+        ;;
+      --index|--registry|--root|--target|--features|--bin|--example)
         skip_next=1
         continue
         ;;
-      --version=*|--vers=*|--index=*|--registry=*|--root=*|--target=*|--features=*|--bin=*|--example=*)
+      --index=*|--registry=*|--root=*|--target=*|--features=*|--bin=*|--example=*)
         continue
         ;;
       --locked|--offline|--quiet|--debug|--force|-f|--list|--no-track|--all-features|--no-default-features)
@@ -463,6 +544,14 @@ safe_install_cargo_packages() {
         ;;
     esac
   done
+
+  if [[ -n "${crate_version}" ]]; then
+    local -a versioned=()
+    for arg in "${packages[@]}"; do
+      versioned+=("${arg}@${crate_version}")
+    done
+    packages=("${versioned[@]}")
+  fi
 
   print -r -l -- "${packages[@]}"
 }
@@ -913,6 +1002,7 @@ safe_install_npm_like() {
   local tool="$1"
   shift
   safe_install_route "${tool}" "$@" || return $?
+  safe_install_scan_target_flags npm "$@"
   local subcommand="${SAFE_INSTALL_SUBCMD}"
   local -a rest raw packages
   rest=("${@:$((SAFE_INSTALL_SUBCMD_IDX + 1))}")
@@ -1171,6 +1261,7 @@ safe_install_pip_like() {
   local tool="$1"
   shift
   safe_install_route "${tool}" "$@" || return $?
+  safe_install_scan_target_flags python "$@"
   local subcommand="${SAFE_INSTALL_SUBCMD}"
   local subidx=$SAFE_INSTALL_SUBCMD_IDX
   local -a packages
@@ -1375,6 +1466,7 @@ cargo() {
     command cargo "$@"; return $?
   fi
   safe_install_route cargo "$@" || return $?
+  safe_install_scan_target_flags cargo "$@"
   local subcommand="${SAFE_INSTALL_SUBCMD}"
   local subidx=$SAFE_INSTALL_SUBCMD_IDX
   local -a packages
@@ -1428,6 +1520,7 @@ go() {
     command go "$@"; return $?
   fi
   safe_install_route go "$@" || return $?
+  safe_install_scan_target_flags go "$@"
   local subcommand="${SAFE_INSTALL_SUBCMD}"
   local subidx=$SAFE_INSTALL_SUBCMD_IDX
   local second="${@[subidx+1]:-}"
@@ -1510,6 +1603,7 @@ composer() {
     command composer "$@"; return $?
   fi
   safe_install_route composer "$@" || return $?
+  safe_install_scan_target_flags composer "$@"
   local first="${SAFE_INSTALL_SUBCMD}"
   local subidx=$SAFE_INSTALL_SUBCMD_IDX
   local second="${@[subidx+1]:-}"

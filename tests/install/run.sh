@@ -413,7 +413,7 @@ case_value_flag_consumes_its_value() {
   # value; the resolver must not stop on it.
   SAFE_INSTALL_TEST_SCRIPT='npm --registry https://r.example install -g blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--registry\thttps://r.example' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -986,7 +986,7 @@ case_npm_complex_flags() {
   prepare_case "npm-complex-flags"
   SAFE_INSTALL_TEST_SCRIPT='npm install --registry https://registry.example --tag beta --omit dev left-pad' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tleft-pad\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tleft-pad\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--dist-tag\tbeta\t--registry\thttps://registry.example' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\thttps://registry.example@latest' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\tbeta@latest' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\tdev@latest' "$FUNCNAME" || return
@@ -998,7 +998,7 @@ case_pip_complex_flags() {
   prepare_case "pip-complex-flags"
   SAFE_INSTALL_TEST_SCRIPT='pip install --index-url https://pypi.example --constraint constraints.txt requests==2.32.0' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\trequests@2.32.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\trequests@2.32.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://pypi.example' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\thttps://pypi.example@latest' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\tconstraints.txt@latest' "$FUNCNAME" || return
   pass "$FUNCNAME"
@@ -1017,7 +1017,7 @@ case_cargo_parser() {
   prepare_case "cargo-parser"
   SAFE_INSTALL_TEST_SCRIPT='cargo install ripgrep --version 14.1.1' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tripgrep\t--ecosystem\tcargo\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tripgrep@14.1.1\t--ecosystem\tcargo\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\t14.1.1@latest' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -1035,7 +1035,7 @@ case_composer_parser() {
   prepare_case "composer-parser"
   SAFE_INSTALL_TEST_SCRIPT='composer global require --working-dir /tmp vendor/pkg:^1' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tvendor/pkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tvendor/pkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall\t--project-dir\t/tmp' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\t/tmp@latest' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
