@@ -29,7 +29,22 @@
   unless `exec_auto_install` is verifiably off; audits run under mise's
   project `[env]` package-source variables; `mise exec -c` and bare
   interactive `mise use` fail closed with rewrite hints (launcher first
-  words behind `exec --` stay a documented residual).
+  words behind `exec --` stay a documented residual). Second review round:
+  every helper query (`registry`/`ls`/`env`/`settings`) runs under the
+  delegate's full context, including `--no-config`/`--no-env`/`--no-hooks`,
+  and the audit runs from the `-C` directory so directory-scoped config
+  files count as source; tool options are allowlisted rather than
+  discarded (`npm_args`-class options take the notice path instead of
+  vouching for a redirected install); env values travel base64-framed with
+  strict typing (a newline in one value could otherwise export a second
+  variable, and a non-string source value now refuses instead of auditing
+  the default); `mise ls` entries require their fields (a missing
+  `installed` no longer reports a package verdict for unreadable output)
+  and jq diagnostics stay internal; `install --force` audits every
+  configured tool, `upgrade --exclude` drops excluded targets,
+  `--minimum-release-age` refuses non-exact targets; `--help`/`--version`/
+  `--dry-run` pass through; counted verbosity (`-vvv`) is legal again;
+  Cargo/pipx/composer registry variables joined the source allowlist.
 
 - Second review round (PR#29 delta findings): custom package sources
   (`--registry`, `--index-url`, `--find-links`, `--no-index`, composer

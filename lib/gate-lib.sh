@@ -1762,15 +1762,41 @@ safe_gate_mise_infra_refuse() {
 # mise tool options attach in brackets (npm:prettier[package_manager=npm]@3);
 # the audited identity must be the canonical name, never name-plus-options.
 # Only "@version" (or nothing) may follow the option group.
+#
+# Options are not decoration: mise passes some straight to the installer
+# (npm_args, install_env, ...), so they can change the SOURCE the package
+# comes from. Discarding them silently made a default-registry verdict
+# vouch for a redirected install (delta-1 finding 2). Only an allowlist of
+# identity-neutral keys keeps the audit; anything else takes the honest
+# not-audit-gated notice path. Prints "canonical<TAB>opts-verdict" where the
+# verdict is empty (neutral) or the first non-neutral key.
+SAFE_GATE_MISE_NEUTRAL_OPTS='package_manager|bin_path|exe|strip_components|platform|version_prefix|os|arch'
+
 safe_gate_mise_strip_opts() {
-  local spec="$1" head tail
-  [[ "$spec" == *'['* ]] || { printf '%s\n' "$spec"; return 0; }
+  local spec="$1" head tail opts offender="" kv key
+  [[ "$spec" == *'['* ]] || { printf '%s\t\n' "$spec"; return 0; }
   head="${spec%%\[*}"
   tail="${spec#*\[}"
   [[ "$tail" == *']'* ]] || return 1
+  opts="${tail%%\]*}"
   tail="${tail#*\]}"
   [[ -z "$tail" || "$tail" == @* ]] || return 1
-  printf '%s\n' "${head}${tail}"
+  local old_ifs="$IFS"
+  IFS=','
+  for kv in $opts; do
+    IFS="$old_ifs"
+    [[ -n "$kv" ]] || continue
+    key="${kv%%=*}"
+    key="${key# }"
+    key="${key% }"
+    if ! safe_gate_alt_match "$key" "$SAFE_GATE_MISE_NEUTRAL_OPTS"; then
+      offender="$key"
+      break
+    fi
+    IFS=','
+  done
+  IFS="$old_ifs"
+  printf '%s\t%s\n' "${head}${tail}" "$offender"
 }
 
 # Effective backend for a colonless shorthand: `mise registry <name>` prints
@@ -1781,7 +1807,10 @@ safe_gate_mise_strip_opts() {
 safe_gate_mise_resolve_bare() {
   local name="$1" mise_real out first
   mise_real="$(safe_gate_resolve_real mise)" || return 1
-  out="$("$mise_real" registry -- "$name" 2>/dev/null)" || return 1
+  # Under the SAME context as the delegate: a project's disable_backends
+  # changes which backend mise picks, so a context-free query can classify a
+  # registry package as a runtime (delta-1 finding 1).
+  out="$("$mise_real" ${SAFE_GATE_MISE_CTX[@]+"${SAFE_GATE_MISE_CTX[@]}"} registry -- "$name" 2>/dev/null)" || return 1
   first="${out%%[[:space:]]*}"
   [[ -n "$first" && "$first" == *:* ]] || return 1
   printf '%s\n' "$first"
@@ -1790,44 +1819,73 @@ safe_gate_mise_resolve_bare() {
 # Source-relevant vars from mise's computed environment (project [env] can
 # set NPM_CONFIG_REGISTRY, PIP_INDEX_URL, ...). The audit must see the same
 # sources mise will install under, or a clean default-registry verdict
-# vouches for a different artifact. Allowlisted, shell-legal names only;
-# exotic key shapes (npm scoped env keys) are a documented residual.
+# vouches for a different artifact.
+#
+# Framing is base64 per value, one "NAME<space>b64" record per line: a raw
+# key=value stream let a single value containing a newline split into two
+# exported variables and inject a source the original never named (delta-1
+# finding N2). A relevant key whose value is not a string is malformed
+# helper output, not "absent": the whole derivation fails so the caller
+# refuses instead of auditing a default source.
 safe_gate_mise_env_overlay() {
   local mise_real json
   mise_real="$(safe_gate_resolve_real mise)" || return 1
   command -v jq >/dev/null 2>&1 || return 1
+  command -v base64 >/dev/null 2>&1 || return 1
   json="$("$mise_real" "$@" env --json 2>/dev/null)" || return 1
   printf '%s' "$json" | jq -r '
+    def relevant:
+      (test("^(npm_config_|NPM_CONFIG_)"))
+      or IN("PIP_INDEX_URL","PIP_EXTRA_INDEX_URL","PIP_FIND_LINKS",
+            "PIP_NO_INDEX","PIP_CONFIG_FILE","UV_INDEX_URL",
+            "UV_DEFAULT_INDEX","UV_INDEX","UV_EXTRA_INDEX_URL",
+            "UV_FIND_LINKS","UV_NO_INDEX","GOPROXY","GOPRIVATE",
+            "GONOSUMDB","GONOSUMCHECK","GOFLAGS","GONOSUMVERIFY",
+            "CARGO_REGISTRY_DEFAULT","CARGO_REGISTRIES_CRATES_IO_PROTOCOL",
+            "CARGO_HOME","COMPOSER_HOME","COMPOSER_AUTH",
+            "MISE_PIPX_REGISTRY_URL","MISE_NPM_REGISTRY_URL",
+            "MISE_CARGO_REGISTRY_URL","MISE_GO_PROXY")
+      or (test("^CARGO_REGISTRIES_[A-Za-z0-9_]+$"));
     if type != "object" then error("schema") else . end
-    | to_entries[]
-    | select(.value | type == "string")
-    | select(.key | test("^[A-Za-z_][A-Za-z0-9_]*$"))
-    | select(
-        (.key | test("^(npm_config_|NPM_CONFIG_)"))
-        or (.key | IN("PIP_INDEX_URL","PIP_EXTRA_INDEX_URL","PIP_FIND_LINKS",
-                      "PIP_NO_INDEX","PIP_CONFIG_FILE","UV_INDEX_URL",
-                      "UV_DEFAULT_INDEX","UV_INDEX","UV_EXTRA_INDEX_URL",
-                      "UV_FIND_LINKS","UV_NO_INDEX","GOPROXY","GOPRIVATE",
-                      "GONOSUMDB","GONOSUMCHECK","GOFLAGS"))
+    | to_entries
+    | map(select(.key | relevant))
+    | map(
+        if (.value | type) != "string" then error("schema")
+        elif (.key | test("^[A-Za-z_][A-Za-z0-9_]*$") | not) then error("schema")
+        else .key + " " + (.value | @base64) end
       )
-    | .key + "=" + .value
+    | .[]
   ' 2>/dev/null || return 1
 }
 
-# Run one audit with the mise env overlay exported, so safe-audit's own
-# effective-source derivation and resolution see mise's [env] sources.
+# Export one overlay record set into the current (sub)shell. Any decode or
+# export failure is fatal: a partially applied source environment is the
+# wrong-source class all over again.
+safe_gate_mise_apply_overlay() {
+  local overlay="$1" line name b64 value
+  [[ -n "$overlay" ]] || return 0
+  while IFS=' ' read -r name b64; do
+    [[ -n "$name" ]] || continue
+    value="$(printf '%s' "$b64" | base64 -d 2>/dev/null)" || return 1
+    export "${name}=${value}" 2>/dev/null || return 1
+  done <<<"$overlay"
+  return 0
+}
+
+# Run one audit under mise's computed source environment AND its effective
+# directory: -C changes which npmrc / Cargo config / pip config the audit's
+# own source derivation reads, so the audit process must stand where the
+# install will happen (delta-1 finding 8).
 safe_gate_mise_check_with_env() {
   local overlay="$1" pkg="$2" eco="$3"
-  if [[ -z "$overlay" ]]; then
-    safe_gate_check "$pkg" "$eco"
-    return $?
-  fi
-  local kv
   (
-    while IFS= read -r kv; do
-      [[ "$kv" == [A-Za-z_]*=* ]] || continue
-      export "${kv?}" 2>/dev/null || true
-    done <<<"$overlay"
+    if [[ -n "${SAFE_GATE_MISE_CD:-}" ]]; then
+      cd -- "${SAFE_GATE_MISE_CD}" 2>/dev/null || exit 100
+    fi
+    safe_gate_mise_apply_overlay "$overlay" || {
+      safe_gate_mise_infra_refuse "cannot apply the mise environment (malformed value transport)"
+      exit 100
+    }
     safe_gate_check "$pkg" "$eco"
   )
 }
@@ -1838,10 +1896,16 @@ safe_gate_mise_check_with_env() {
 # shorthand owner/repo, non-registry name shapes) take the notice path — a
 # public-registry audit must never vouch for code fetched elsewhere.
 safe_gate_mise_check_spec() {
-  local spec="$1" overlay="${2:-}" stripped backend rest name version="" eco pkg
-  if ! stripped="$(safe_gate_mise_strip_opts "$spec")"; then
+  local spec="$1" overlay="${2:-}" stripped opt_offender backend rest name version="" eco pkg
+  local parsed
+  if ! parsed="$(safe_gate_mise_strip_opts "$spec")"; then
     safe_gate_err "safe: BLOCKED mise — malformed tool options in '${spec}'; details: safe explain"
     return 100
+  fi
+  IFS=$'\t' read -r stripped opt_offender <<<"$parsed"
+  if [[ -n "$opt_offender" ]]; then
+    safe_gate_err "safe: mise ${spec}: tool option '${opt_offender}' can change the install source or run installer arguments safe cannot model — not audit-gated; review manually, or install without the option to get a checked verdict"
+    return 0
   fi
   if [[ "$stripped" != *:* ]]; then
     local bare_name="$stripped" bare_ver=""
@@ -1913,21 +1977,28 @@ safe_gate_mise_config_entries() {
   mise_real="$(safe_gate_resolve_real mise)" || return 2
   command -v jq >/dev/null 2>&1 || return 2
   json="$("$mise_real" "$@" ls --current --json 2>/dev/null)" || return 2
+  # Every field selection depends on must be PRESENT and correctly typed:
+  # defaulting a missing `installed` to false silently reclassified a
+  # malformed entry as installable and reported a package verdict for it
+  # (delta-1 finding 3). jq diagnostics stay internal so a refusal is still
+  # exactly one line.
   out="$(printf '%s' "$json" | jq -r --argjson mode "$mode" '
     if type != "object" then error("schema") else . end
     | to_entries[]
-    | .key as $k
+    | (.key | if (type == "string" and length > 0) then . else error("schema") end) as $k
     | (.value | if type != "array" then error("schema") else . end)[]
     | if type != "object" then error("schema") else . end
-    | ((.installed // false) | if type != "boolean" then error("schema") else . end) as $inst
-    | ((.requested_version // "") | if type != "string" then error("schema") else . end) as $req
+    | (if has("installed") then .installed else error("schema") end
+       | if type != "boolean" then error("schema") else . end) as $inst
+    | (if has("requested_version") then .requested_version else "" end
+       | if type != "string" then error("schema") else . end) as $req
     | select(
         $mode == 2
         or ($inst | not)
         or ($mode == 1 and (($req | test("^v?[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.-]+)?$")) | not))
       )
     | $k + "\t" + $req
-  ')" || return 2
+  ' 2>/dev/null)" || return 2
   printf '%s\n' "$out"
 }
 
@@ -1939,17 +2010,54 @@ safe_gate_mise_config_entries() {
 SAFE_GATE_MISE_SPECS=()
 SAFE_GATE_MISE_CMD=()
 SAFE_GATE_MISE_CTX=()
+SAFE_GATE_MISE_EXCLUDE=()
 SAFE_GATE_MISE_MODE=0
 SAFE_GATE_MISE_SAW_REMOVE=0
 SAFE_GATE_MISE_OVERLAY=""
+SAFE_GATE_MISE_CD=""
+
+# One place where a recognized value flag's SEMANTICS are recorded. Being in
+# the table only means safe can parse it; a flag that changes the target set
+# or the resolved version must also change what safe audits, or safe audits
+# one thing while mise installs another (delta-1 findings 4/N1).
+safe_gate_mise_record_ctx() {
+  local sub="$1" flag="$2" value="$3"
+  case "$flag" in
+    -C|--cd)
+      SAFE_GATE_MISE_CTX+=(-C "$value")
+      SAFE_GATE_MISE_CD="$value"
+      ;;
+    -E|--env)
+      SAFE_GATE_MISE_CTX+=(-E "$value")
+      ;;
+    -e)
+      # `use -e` is the config-environment selector, same as top-level -E.
+      [[ "$sub" == "use" ]] && SAFE_GATE_MISE_CTX+=(-E "$value")
+      ;;
+    -x|--exclude)
+      # mise will NOT touch these: auditing them blocks an install that is
+      # not happening.
+      SAFE_GATE_MISE_EXCLUDE+=("$value")
+      ;;
+    --minimum-release-age)
+      # mise deliberately selects an OLDER release than the newest matching
+      # one; safe's resolver has no such notion, so for anything but an
+      # exact pin it would audit a version mise will not install.
+      SAFE_GATE_MISE_MIN_AGE=1
+      ;;
+  esac
+  return 0
+}
 
 safe_gate_mise_parse_sub() {
   local sub="$1"
   shift
   SAFE_GATE_MISE_SPECS=()
   SAFE_GATE_MISE_CMD=()
+  SAFE_GATE_MISE_EXCLUDE=()
   SAFE_GATE_MISE_MODE=0
   SAFE_GATE_MISE_SAW_REMOVE=0
+  SAFE_GATE_MISE_MIN_AGE=0
 
   local gval gbool grefuse=""
   case "$sub" in
@@ -2004,13 +2112,25 @@ safe_gate_mise_parse_sub() {
           i=$((i + 1))
           continue
         fi
+        # --force reinstalls entries mise already reports as installed, so
+        # the not-installed-only enumeration audits nothing while every
+        # configured package (lifecycle scripts included) is refetched
+        # (delta-1 finding N1).
+        if [[ "$sub" == "install" ]] && { [[ "$arg" == "-f" || "$arg" == "--force" ]]; }; then
+          SAFE_GATE_MISE_MODE=2
+          i=$((i + 1))
+          continue
+        fi
         [[ "$arg" == "--remove" || "$arg" == --remove=* ]] && SAFE_GATE_MISE_SAW_REMOVE=1
+        # Counted verbosity: clap accepts -v, -vv, -vvv, ... Refusing -vvv
+        # was an avoidable usability regression (delta-1 finding 10).
+        if [[ "$arg" =~ ^-v+$ ]]; then
+          i=$((i + 1))
+          continue
+        fi
         if [[ "$arg" == *=* ]]; then
           if safe_gate_alt_match "$base" "$gval"; then
-            case "$base" in
-              -C|--cd) SAFE_GATE_MISE_CTX+=(-C "${arg#*=}") ;;
-              -E|--env|-e) SAFE_GATE_MISE_CTX+=(-E "${arg#*=}") ;;
-            esac
+            safe_gate_mise_record_ctx "$sub" "$base" "${arg#*=}" || return $?
             i=$((i + 1))
             continue
           fi
@@ -2022,10 +2142,7 @@ safe_gate_mise_parse_sub() {
             safe_gate_err "safe: BLOCKED mise ${sub} — flag '${arg}' is missing its value; details: safe explain"
             return 100
           fi
-          case "$arg" in
-            -C|--cd) SAFE_GATE_MISE_CTX+=(-C "${args[$((i + 1))]}") ;;
-            -E|--env|-e) SAFE_GATE_MISE_CTX+=(-E "${args[$((i + 1))]}") ;;
-          esac
+          safe_gate_mise_record_ctx "$sub" "$arg" "${args[$((i + 1))]}" || return $?
           i=$((i + 2))
           continue
         fi
@@ -2050,6 +2167,45 @@ safe_gate_mise_parse_sub() {
 # audited (mise env is a subprocess; passthroughs stay cheap). Refusing on
 # failure is deliberate: an audit that cannot see the effective sources
 # would vouch for the wrong artifact.
+
+# Drop excluded targets from an enumerated set (name-of-array argument;
+# bash 4.3+ nameref, matching the rest of this file's helpers).
+safe_gate_mise_filter_excluded() {
+  local -n _specs="$1"
+  (( ${#SAFE_GATE_MISE_EXCLUDE[@]} == 0 )) && return 0
+  local -a kept=()
+  local spec ex ex_name spec_name
+  for spec in ${_specs[@]+"${_specs[@]}"}; do
+    spec_name="${spec%@*}"
+    local skip=0
+    for ex in "${SAFE_GATE_MISE_EXCLUDE[@]}"; do
+      ex_name="${ex%@*}"
+      [[ "$spec_name" == "$ex_name" || "$spec" == "$ex" ]] && { skip=1; break; }
+    done
+    (( skip )) || kept+=("$spec")
+  done
+  _specs=(${kept[@]+"${kept[@]}"})
+  return 0
+}
+
+# --minimum-release-age makes mise pick an older release than the newest
+# matching one. safe's resolver has no equivalent, so a non-exact target
+# would be audited at a version mise will not install: refuse rather than
+# report a verdict for the wrong version. Exact pins are unaffected.
+safe_gate_mise_min_age_guard() {
+  (( ${SAFE_GATE_MISE_MIN_AGE:-0} )) || return 0
+  local spec ver
+  for spec in "$@"; do
+    ver=""
+    [[ "$spec" == *@* ]] && ver="${spec##*@}"
+    if [[ ! "$ver" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+      safe_gate_err "safe: BLOCKED mise — --minimum-release-age selects an older release than safe would check for '${spec}'; pin the exact version you want installed; details: safe explain"
+      return 100
+    fi
+  done
+  return 0
+}
+
 safe_gate_mise_overlay_or_refuse() {
   if ! SAFE_GATE_MISE_OVERLAY="$(safe_gate_mise_env_overlay ${SAFE_GATE_MISE_CTX[@]+"${SAFE_GATE_MISE_CTX[@]}"})"; then
     safe_gate_mise_infra_refuse "cannot derive the mise environment (mise env failed) — audits would not see project [env] package sources"
@@ -2082,7 +2238,9 @@ safe_gate_mise_gate_install() {
     done <<<"$entries"
   fi
 
+  safe_gate_mise_filter_excluded specs || return $?
   (( ${#specs[@]} == 0 )) && return 0
+  safe_gate_mise_min_age_guard ${specs[@]+"${specs[@]}"} || return $?
   safe_gate_mise_overlay_or_refuse || return $?
   local spec
   for spec in "${specs[@]}"; do
@@ -2170,14 +2328,14 @@ safe_gate_mise_gate_exec() {
   # A launcher first word (env, sh, time, ...) is a documented residual:
   # refusing it would break ordinary `mise exec -- <binary>` use.
   if (( gate_inner )); then
-    local kv
     (
-      if [[ -n "$SAFE_GATE_MISE_OVERLAY" ]]; then
-        while IFS= read -r kv; do
-          [[ "$kv" == [A-Za-z_]*=* ]] || continue
-          export "${kv?}" 2>/dev/null || true
-        done <<<"$SAFE_GATE_MISE_OVERLAY"
+      if [[ -n "${SAFE_GATE_MISE_CD:-}" ]]; then
+        cd -- "${SAFE_GATE_MISE_CD}" 2>/dev/null || exit 100
       fi
+      safe_gate_mise_apply_overlay "$SAFE_GATE_MISE_OVERLAY" || {
+        safe_gate_mise_infra_refuse "cannot apply the mise environment (malformed value transport)"
+        exit 100
+      }
       SAFE_GATE_NO_EXEC=1
       safe_gate_main "${cmd[0]}" "${cmd[@]:1}"
     ) || return $?
@@ -2185,11 +2343,35 @@ safe_gate_mise_gate_exec() {
   return 0
 }
 
+# Display-only and no-install invocations: mise prints help/version or
+# reports a plan and installs nothing, so gating them blocked a read-only
+# command (delta-1 finding N3) — and blocking `--help` hides the very hints
+# the refusals point at. Scanned before `--` only: flags after it belong to
+# the inner command.
+safe_gate_mise_is_noop_invocation() {
+  local sub="$1"
+  shift
+  local arg
+  for arg in "$@"; do
+    [[ "$arg" == "--" ]] && break
+    case "$arg" in
+      -h|--help|-V|--version) return 0 ;;
+      -n|--dry-run|--dry-run-code|-n=*|--dry-run=*|--dry-run-code=*)
+        case "$sub" in
+          install|i|upgrade|up|use|u) return 0 ;;
+        esac
+        ;;
+    esac
+  done
+  return 1
+}
+
 safe_gate_mise() {
   local -a args=("$@")
   local i=0 subcommand="" subidx=-1 arg base
   SAFE_GATE_MISE_CTX=()
   SAFE_GATE_MISE_OVERLAY=""
+  SAFE_GATE_MISE_CD=""
   # Exact top-level table from `mise --help` (2026.7): value flags consume,
   # switches step over, anything else fails closed — including unknown
   # equals-forms (a blanket -*=* accept violated the fail-closed contract).
@@ -2200,12 +2382,14 @@ safe_gate_mise() {
     case "$arg" in
       -*)
         base="${arg%%=*}"
+        # Counted verbosity (-vvv) is legal mise (delta-1 finding 10).
+        if [[ "$arg" =~ ^-v+$ ]]; then
+          i=$((i + 1))
+          continue
+        fi
         if [[ "$arg" == *=* ]]; then
           if safe_gate_alt_match "$base" "$gval"; then
-            case "$base" in
-              -C|--cd) SAFE_GATE_MISE_CTX+=(-C "${arg#*=}") ;;
-              -E|--env) SAFE_GATE_MISE_CTX+=(-E "${arg#*=}") ;;
-            esac
+            safe_gate_mise_record_ctx "" "$base" "${arg#*=}"
             i=$((i + 1))
             continue
           fi
@@ -2217,14 +2401,18 @@ safe_gate_mise() {
             safe_gate_err "safe: BLOCKED mise — flag '${arg}' is missing its value; details: safe explain"
             return 100
           fi
-          case "$arg" in
-            -C|--cd) SAFE_GATE_MISE_CTX+=(-C "${args[$((i + 1))]}") ;;
-            -E|--env) SAFE_GATE_MISE_CTX+=(-E "${args[$((i + 1))]}") ;;
-          esac
+          safe_gate_mise_record_ctx "" "$arg" "${args[$((i + 1))]}"
           i=$((i + 2))
           continue
         fi
         if safe_gate_alt_match "$arg" "$gbool"; then
+          # Config/env-disabling switches change what every helper query
+          # sees: they must travel with the context or safe enumerates and
+          # audits a configuration the delegate never loads (delta-1
+          # findings 6/8).
+          case "$arg" in
+            --no-config|--no-env|--no-hooks) SAFE_GATE_MISE_CTX+=("$arg") ;;
+          esac
           i=$((i + 1))
           continue
         fi
@@ -2247,6 +2435,12 @@ safe_gate_mise() {
   # Top-level -C/-E context carries into the gated subcommand's preflight
   # and env derivation; the subcommand parser appends its own.
   local -a rest=("${args[@]:$((subidx + 1))}")
+
+  if safe_gate_mise_is_noop_invocation "$subcommand" ${rest[@]+"${rest[@]}"}; then
+    safe_gate_exec_real mise "$@"
+    return $?
+  fi
+
   case "$subcommand" in
     install|i)
       safe_gate_mise_gate_install install ${rest[@]+"${rest[@]}"} || return $?

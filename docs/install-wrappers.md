@@ -56,8 +56,31 @@ Official runtime installs (`node@22`) pass through; non-registry backends
 (aqua/ubi/gem) and source-bearing specs (`pipx:owner/repo` GitHub
 shorthands, `git+`/URL forms) pass with an explicit notice that they are
 not audit-gated — a public-registry audit must never vouch for them.
+Every helper query safe makes (`registry`, `ls`, `env`, `settings`) runs
+under the same context as the delegated command — `-C`, `-E`, and the
+config/env-disabling switches (`--no-config`, `--no-env`, `--no-hooks`) —
+and the audit itself runs from the `-C` directory, since directory-scoped
+config files (`.npmrc`, Cargo config, pip config) are part of the source.
+Flags that change the target set change what safe audits: `install --force`
+audits every configured tool (it reinstalls installed ones), `upgrade
+--exclude` drops the excluded tool from the audit set, and
+`--minimum-release-age` refuses for non-exact targets because mise
+deliberately selects an older release than safe would check. Tool options
+are honored, not discarded: an identity-neutral option
+(`package_manager`, `bin_path`, `exe`, `platform`, …) keeps the audit,
+while any other option can pass installer arguments or an install
+environment that changes the source, so the spec takes the not-audit-gated
+notice path instead of a verdict for a package that may come from
+elsewhere.
+
+Display-only invocations pass through untouched: `--help`, `--version`, and
+`--dry-run`/`--dry-run-code` install nothing (a `--help` *after* `--`
+belongs to the inner command and does not disarm the gate).
+
 Fail-closed refusals: enumeration or env-derivation failure (refused as
-infrastructure breakage, never a package verdict), `mise exec -c '<shell
+infrastructure breakage, never a package verdict — this includes a missing
+required field in `mise ls` output, a non-string value for a source
+variable, and a `-C` directory that does not exist), `mise exec -c '<shell
 string>'` (rewrite as `mise exec -- <argv…>`), bare interactive `mise use`
 (rerun as `mise use <tool>@<version>`), and scope-changing flags the
 preflight cannot model (`--monorepo`, `--inactive`, `--local`; per-directory
