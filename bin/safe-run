@@ -11,6 +11,7 @@ CONFIG_DIR="${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}"
 DATA_DIR="${SAFE_RUN_DATA_DIR:-${SAFE_DATA_DIR:-$HOME/.local/share/safe}/run}"
 HOST_ALLOW_FILE="$CONFIG_DIR/host-allow.json"
 SANDBOX_KNOWN_FILE="$CONFIG_DIR/sandbox-known.json"
+INSTALL_KNOWN_FILE="$CONFIG_DIR/install-known.json"
 BLOCKED_FILE="$CONFIG_DIR/blocked.json"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 AUDIT_LOG="$DATA_DIR/audit.log"
@@ -190,6 +191,7 @@ ensure_dirs() {
   mkdir -p "$CONFIG_DIR" "$DATA_DIR"
   [[ -f "$HOST_ALLOW_FILE" ]]    || seed_file "$HOST_ALLOW_FILE"    '{"packages":{}}'
   [[ -f "$SANDBOX_KNOWN_FILE" ]] || seed_file "$SANDBOX_KNOWN_FILE" '{"packages":{}}'
+  [[ -f "$INSTALL_KNOWN_FILE" ]] || seed_file "$INSTALL_KNOWN_FILE" '{"packages":{}}'
   [[ -f "$BLOCKED_FILE" ]]       || seed_file "$BLOCKED_FILE"       "$(default_blocked_json)"
   [[ -f "$CONFIG_FILE" ]]        || seed_file "$CONFIG_FILE"        "$(default_config_json)"
   [[ -f "$AUDIT_LOG" ]]          || : > "$AUDIT_LOG"
@@ -231,7 +233,13 @@ default_config_json() {
     "timeout_seconds": 300
   },
   "warn_env_files": true,
-  "linked_targets": []
+  "linked_targets": [],
+  "install": {
+    "auto_allow": true,
+    "auto_allow_tolerate": [],
+    "auto_allow_ttl_days": 30,
+    "block_severities": ["critical"]
+  }
 }
 JSON
 }
@@ -1576,9 +1584,10 @@ cmd_audit() {
 }
 
 cmd_status() {
-  local host_count sandbox_count blocked_count
+  local host_count sandbox_count install_count blocked_count
   host_count=$(jq '.packages | length' "$HOST_ALLOW_FILE")
   sandbox_count=$(jq '.packages | length' "$SANDBOX_KNOWN_FILE")
+  install_count=$(jq '.packages | length' "$INSTALL_KNOWN_FILE" 2>/dev/null || echo 0)
   blocked_count=$(jq '.packages | length' "$BLOCKED_FILE")
 
   echo "safe run $SAFE_RUN_VERSION"
@@ -1587,6 +1596,7 @@ cmd_status() {
   echo
   printf "host-allow:     %d (npm-only; bunx/uvx/pipx ignore these)\n" "$host_count"
   printf "sandbox-known:  %d\n" "$sandbox_count"
+  printf "install-known:  %d (recorded clean install checks)\n" "$install_count"
   printf "blocked:        %d\n" "$blocked_count"
   echo
   if podman_available; then

@@ -3621,9 +3621,17 @@ osv_query_package_json() {
     go) eco="Go" ;;
     *) eco="$ecosystem" ;;
   esac
-  if ! curl -fsS https://api.osv.dev/v1/query \
+  local body
+  if [[ -n "$version" && "$version" != "latest" ]]; then
+    body=$(jq -n --arg eco "$eco" --arg name "$name" --arg version "$version" '{package:{ecosystem:$eco,name:$name},version:$version}')
+  else
+    # Package-only query: returns every advisory ever filed for the package.
+    # Only used on the degraded path when no target version could be resolved.
+    body=$(jq -n --arg eco "$eco" --arg name "$name" '{package:{ecosystem:$eco,name:$name}}')
+  fi
+  if ! curl -fsS --max-time 8 https://api.osv.dev/v1/query \
     -H 'content-type: application/json' \
-    -d "$(jq -n --arg eco "$eco" --arg name "$name" --arg version "$version" '{package:{ecosystem:$eco,name:$name},version:$version}')" \
+    -d "$body" \
     > "$output.raw"; then
     printf '{"status":"error","note":"OSV query failed","vulns":[]}\n' > "$output"
     return 0
@@ -3638,8 +3646,467 @@ osv_query_package_json() {
   ' > "$output"
 }
 
+# ---------------------------------------------------------------------------
+# Target-version resolution and version-aware advisory matching.
+#
+# `safe audit check` used to post version:"latest" to OSV, which cannot parse
+# it and returns every advisory ever filed for the package — so the verdict
+# was a version-blind count that WARN-blocked the very bumps remediating a
+# CVE. The resolver below determines the version the package manager would
+# actually install; advisories are then matched per-version against their
+# affected ranges. When resolution fails the check degrades to a package-only
+# query with a WARN floor (reason: version_unresolved) — never a silent GO.
+# ---------------------------------------------------------------------------
+
+SAFE_RUN_CONFIG_FILE="$SAFE_RUN_CONFIG_DIR/config.json"
+SAFE_RUN_HOST_ALLOW_FILE="$SAFE_RUN_CONFIG_DIR/host-allow.json"
+INSTALL_KNOWN_FILE="$SAFE_RUN_CONFIG_DIR/install-known.json"
+
+# Shared jq prelude: semver-ish comparison usable for npm/PyPI/crates/go
+# release versions. Prerelease versions sort before their release
+# ([x,y,z,0,"pre"] < [x,y,z,1,""]); build metadata is ignored.
+JQ_VSEMVER='
+def vparse:
+  tostring
+  | sub("^[vV]"; "")
+  | split("+")[0]
+  | split("-") as $p
+  | ((($p[0] | split(".") | map(tonumber? // 0)) + [0, 0, 0])[0:3])
+    + [if ($p | length) > 1 then 0 else 1 end]
+    + [if ($p | length) > 1 then ($p[1:] | join("-")) else "" end];
+def vlt($a; $b): ($a | vparse) < ($b | vparse);
+def vle($a; $b): ($a | vparse) <= ($b | vparse);
+def vge($a; $b): ($a | vparse) >= ($b | vparse);
+def vgt($a; $b): ($a | vparse) > ($b | vparse);
+def veq($a; $b): ($a | vparse) == ($b | vparse);
+'
+
+install_policy_json() {
+  jq -c '.install // {}' "$SAFE_RUN_CONFIG_FILE" 2>/dev/null || printf '{}'
+}
+
+version_is_exact() {
+  local ecosystem="$1" version="$2"
+  case "$ecosystem" in
+    npm|rust|php)
+      [[ "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-][0-9A-Za-z.-]+)?([+][0-9A-Za-z.-]+)?$ ]]
+      ;;
+    python)
+      [[ "$version" =~ ^[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?$ ]]
+      ;;
+    go)
+      [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-][0-9A-Za-z.-]+)?([+][0-9A-Za-z.-]+)?$ ]]
+      ;;
+    *)
+      [[ "$version" =~ ^v?[0-9]+(\.[0-9]+)+$ ]]
+      ;;
+  esac
+}
+
+npm_registry_url() {
+  if [[ -n "${NPM_CONFIG_REGISTRY:-}" ]]; then
+    printf '%s' "${NPM_CONFIG_REGISTRY%/}"
+    return 0
+  fi
+  local rc line
+  for rc in .npmrc "$HOME/.npmrc"; do
+    [[ -f "$rc" ]] || continue
+    line=$(grep -E '^[[:space:]]*registry[[:space:]]*=' "$rc" 2>/dev/null | tail -n 1 || true)
+    if [[ -n "$line" ]]; then
+      printf '%s' "$(trim "${line#*=}")" | sed 's:/*$::'
+      return 0
+    fi
+  done
+  printf 'https://registry.npmjs.org'
+}
+
+# Desugar one npm range token (^1.2.3, ~1.2, >=1.0.0, 1.x, 1.2, 2, =1.0.0)
+# into JSON [{op,v}] constraints. Fails (return 1) on anything it cannot
+# faithfully express — the caller then degrades to the unresolved path.
+npm_desugar_token() {
+  local t op v
+  t=$(trim "$1")
+  case "$t" in
+    ">="*) op="ge"; v="${t#>=}" ;;
+    "<="*) op="le"; v="${t#<=}" ;;
+    ">"*)  op="gt"; v="${t#>}" ;;
+    "<"*)  op="lt"; v="${t#<}" ;;
+    "="*)  op="eq"; v="${t#=}" ;;
+    "^"*)  op="caret"; v="${t:1}" ;;
+    "~"*)  op="tilde"; v="${t:1}" ;;
+    *)     op="plain"; v="$t" ;;
+  esac
+  v=$(trim "$v")
+  v="${v#v}"
+  local maj min pat rest
+  IFS='.' read -r maj min pat rest <<<"$v"
+  [[ -n "$rest" ]] && return 1
+  local pat_num="${pat%%[-+]*}"
+  # wild = index of first wildcard/missing segment (3 = fully specified)
+  local wild=3
+  if [[ -z "$min" || "$min" == "x" || "$min" == "X" || "$min" == "*" ]]; then
+    wild=1
+  elif [[ -z "$pat" || "$pat" == "x" || "$pat" == "X" || "$pat" == "*" ]]; then
+    wild=2
+  fi
+  [[ "$maj" =~ ^[0-9]+$ ]] || return 1
+  if (( wild == 3 )); then
+    [[ "$min" =~ ^[0-9]+$ && "$pat_num" =~ ^[0-9]+$ ]] || return 1
+  elif (( wild == 2 )); then
+    [[ "$min" =~ ^[0-9]+$ ]] || return 1
+  fi
+  local lo hi
+  case "$op" in
+    plain|eq)
+      case "$wild" in
+        3) jq -cn --arg v "$v" '[{op:"eq", v:$v}]'; return 0 ;;
+        2) lo="$maj.$min.0"; hi="$maj.$((min + 1)).0" ;;
+        1) lo="$maj.0.0"; hi="$((maj + 1)).0.0" ;;
+      esac
+      ;;
+    ge)
+      case "$wild" in
+        3) jq -cn --arg v "$v" '[{op:"ge", v:$v}]'; return 0 ;;
+        2) jq -cn --arg v "$maj.$min.0" '[{op:"ge", v:$v}]'; return 0 ;;
+        1) jq -cn --arg v "$maj.0.0" '[{op:"ge", v:$v}]'; return 0 ;;
+      esac
+      ;;
+    gt)
+      case "$wild" in
+        3) jq -cn --arg v "$v" '[{op:"gt", v:$v}]'; return 0 ;;
+        2) jq -cn --arg v "$maj.$((min + 1)).0" '[{op:"ge", v:$v}]'; return 0 ;;
+        1) jq -cn --arg v "$((maj + 1)).0.0" '[{op:"ge", v:$v}]'; return 0 ;;
+      esac
+      ;;
+    le)
+      case "$wild" in
+        3) jq -cn --arg v "$v" '[{op:"le", v:$v}]'; return 0 ;;
+        2) jq -cn --arg v "$maj.$((min + 1)).0" '[{op:"lt", v:$v}]'; return 0 ;;
+        1) jq -cn --arg v "$((maj + 1)).0.0" '[{op:"lt", v:$v}]'; return 0 ;;
+      esac
+      ;;
+    lt)
+      case "$wild" in
+        3) jq -cn --arg v "$v" '[{op:"lt", v:$v}]'; return 0 ;;
+        2) jq -cn --arg v "$maj.$min.0" '[{op:"lt", v:$v}]'; return 0 ;;
+        1) jq -cn --arg v "$maj.0.0" '[{op:"lt", v:$v}]'; return 0 ;;
+      esac
+      ;;
+    caret)
+      case "$wild" in
+        3)
+          lo="$v"
+          if (( maj > 0 )); then
+            hi="$((maj + 1)).0.0"
+          elif (( min > 0 )); then
+            hi="0.$((min + 1)).0"
+          else
+            hi="0.0.$((pat_num + 1))"
+          fi
+          ;;
+        2)
+          lo="$maj.$min.0"
+          if (( maj > 0 )); then hi="$((maj + 1)).0.0"; else hi="0.$((min + 1)).0"; fi
+          ;;
+        1) lo="$maj.0.0"; hi="$((maj + 1)).0.0" ;;
+      esac
+      ;;
+    tilde)
+      case "$wild" in
+        3) lo="$v"; hi="$maj.$((min + 1)).0" ;;
+        2) lo="$maj.$min.0"; hi="$maj.$((min + 1)).0" ;;
+        1) lo="$maj.0.0"; hi="$((maj + 1)).0.0" ;;
+      esac
+      ;;
+  esac
+  jq -cn --arg lo "$lo" --arg hi "$hi" '[{op:"ge", v:$lo}, {op:"lt", v:$hi}]'
+}
+
+# Desugar a full npm range expression into a JSON constraint conjunction.
+# `||` alternatives, git/file/workspace specs, and unknown syntax fail.
+npm_desugar_range() {
+  local raw
+  raw=$(trim "$1")
+  [[ "$raw" == *"||"* ]] && return 1
+  case "$raw" in
+    ""|\*|x|X|latest) printf '[]'; return 0 ;;
+    *:*|git+*|http://*|https://*|github:*|file:*|link:*|workspace:*) return 1 ;;
+  esac
+  if [[ "$raw" == *" - "* ]]; then
+    local lo_part hi_part lo_cons hi_cons
+    lo_part="${raw%% - *}"
+    hi_part="${raw#* - }"
+    lo_cons=$(npm_desugar_token ">=$lo_part") || return 1
+    hi_cons=$(npm_desugar_token "<=$hi_part") || return 1
+    jq -cn --argjson a "$lo_cons" --argjson b "$hi_cons" '$a + $b'
+    return 0
+  fi
+  local token cons
+  local -a all=()
+  for token in $raw; do
+    cons=$(npm_desugar_token "$token") || return 1
+    all+=("$cons")
+  done
+  (( ${#all[@]} > 0 )) || return 1
+  printf '%s\n' "${all[@]}" | jq -cs 'add'
+}
+
+# Max non-prerelease version in an npm packument satisfying a constraint set.
+npm_max_satisfying() {
+  local packument="$1" constraints="$2"
+  jq -r --argjson cons "$constraints" "
+    $JQ_VSEMVER
+    def satisfies(\$ver):
+      all(\$cons[];
+        . as \$c |
+        if   \$c.op == \"ge\" then vge(\$ver; \$c.v)
+        elif \$c.op == \"gt\" then vgt(\$ver; \$c.v)
+        elif \$c.op == \"le\" then vle(\$ver; \$c.v)
+        elif \$c.op == \"lt\" then vlt(\$ver; \$c.v)
+        elif \$c.op == \"eq\" then veq(\$ver; \$c.v)
+        else false
+        end);
+    [ (.versions // {}) | keys[]
+      | select(contains(\"-\") | not)
+      | select(satisfies(.)) ]
+    | sort_by(vparse) | last // empty
+  " "$packument"
+}
+
+# Ranges constraining a package in the current project: package.json declared
+# deps plus dependent ranges recorded in package-lock.json / npm-shrinkwrap.
+npm_project_ranges() {
+  local name="$1"
+  {
+    if [[ -f package.json ]]; then
+      jq -r --arg n "$name" '
+        [.dependencies, .devDependencies, .optionalDependencies, .peerDependencies]
+        | map(select(. != null) | .[$n] // empty)
+        | .[]' package.json 2>/dev/null || true
+    fi
+    local lockfile
+    for lockfile in npm-shrinkwrap.json package-lock.json; do
+      [[ -f "$lockfile" ]] || continue
+      jq -r --arg n "$name" '
+        [ (.packages // {}) | to_entries[]
+          | (.value.dependencies[$n]?, .value.devDependencies[$n]?, .value.optionalDependencies[$n]?)
+          | select(. != null and type == "string") ]
+        | .[]' "$lockfile" 2>/dev/null || true
+      break
+    done
+  } | sort -u | grep -v '^$' || true
+}
+
+# Resolve the versions the package manager would actually install.
+# Sets RESOLVED_VERSIONS (unique, max 4), RESOLUTION_METHOD, RESOLUTION_SOURCE,
+# RESOLUTION_RANGE. Returns 1 when resolution is not possible.
+resolve_target_versions() {
+  local ecosystem="$1" name="$2" requested="$3" op="$4" scratch="$5"
+  RESOLVED_VERSIONS=()
+  RESOLUTION_METHOD=""
+  RESOLUTION_SOURCE=""
+  RESOLUTION_RANGE=""
+  if [[ -n "$requested" && "$requested" != "latest" ]] && version_is_exact "$ecosystem" "$requested"; then
+    RESOLVED_VERSIONS=("$requested")
+    RESOLUTION_METHOD="exact"
+    return 0
+  fi
+  command -v curl >/dev/null 2>&1 || return 1
+  case "$ecosystem" in
+    npm) resolve_npm_versions "$name" "$requested" "$op" "$scratch" ;;
+    python) resolve_registry_latest "$requested" "https://pypi.org/pypi/${name}/json" '.info.version // empty' pypi.org "$scratch" ;;
+    rust) resolve_registry_latest "$requested" "https://crates.io/api/v1/crates/${name}" '.crate.max_stable_version // .crate.newest_version // empty' crates.io "$scratch" ;;
+    php) resolve_registry_latest "$requested" "https://repo.packagist.org/p2/${name}.json" --arg-name "$name" packagist.org "$scratch" ;;
+    go) resolve_registry_latest "$requested" "https://proxy.golang.org/${name}/@latest" '.Version // empty' proxy.golang.org "$scratch" ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_registry_latest() {
+  local requested="$1" url="$2" filter="$3" source_label="$4" scratch="$5"
+  local pkg_name=""
+  if [[ "$filter" == "--arg-name" ]]; then
+    pkg_name="$4"
+    source_label="$5"
+    scratch="$6"
+  fi
+  # Only an unpinned request can resolve to "latest"; ranges are unresolvable
+  # here in v1 and degrade to the package-level audit.
+  [[ -z "$requested" || "$requested" == "latest" ]] || return 1
+  local out="$scratch/resolve.json"
+  curl -fsS --max-time 5 "$url" -o "$out" 2>/dev/null || return 1
+  local version
+  if [[ -n "$pkg_name" ]]; then
+    version=$(jq -r --arg n "$pkg_name" '.packages[$n][0].version // empty' "$out" 2>/dev/null || true)
+    version="${version#v}"
+  else
+    version=$(jq -r "$filter" "$out" 2>/dev/null || true)
+  fi
+  [[ -n "$version" ]] || return 1
+  RESOLVED_VERSIONS=("$version")
+  RESOLUTION_METHOD="registry-latest"
+  RESOLUTION_SOURCE="$source_label"
+  return 0
+}
+
+resolve_npm_versions() {
+  local name="$1" requested="$2" op="$3" scratch="$4"
+  local registry packument enc_name
+  registry=$(npm_registry_url)
+  packument="$scratch/packument.json"
+  enc_name="${name//\//%2F}"
+  curl -fsS --max-time 5 -H 'Accept: application/vnd.npm.install-v1+json' \
+    "$registry/$enc_name" -o "$packument" 2>/dev/null || return 1
+  RESOLUTION_SOURCE="$registry"
+  local -a ranges=()
+  if [[ -n "$requested" && "$requested" != "latest" ]]; then
+    local tag_version
+    tag_version=$(jq -r --arg t "$requested" '."dist-tags"[$t] // empty' "$packument" 2>/dev/null || true)
+    if [[ -n "$tag_version" ]]; then
+      RESOLVED_VERSIONS=("$tag_version")
+      RESOLUTION_METHOD="dist-tag"
+      RESOLUTION_RANGE="$requested"
+      return 0
+    fi
+    ranges=("$requested")
+    RESOLUTION_METHOD="range"
+  elif [[ "$op" == "update" ]]; then
+    local range
+    while IFS= read -r range; do
+      [[ -n "$range" ]] && ranges+=("$range")
+    done < <(npm_project_ranges "$name")
+    if (( ${#ranges[@]} == 0 )); then
+      # Not declared in the project: `npm update <pkg>` is then a no-op or
+      # behaves like an install; audit the dist-tag as the outer bound.
+      RESOLUTION_METHOD="dist-tag"
+    else
+      RESOLUTION_METHOD="project-range"
+    fi
+  else
+    RESOLUTION_METHOD="dist-tag"
+  fi
+  if [[ "$RESOLUTION_METHOD" == "dist-tag" ]]; then
+    local latest_version
+    latest_version=$(jq -r '."dist-tags".latest // empty' "$packument" 2>/dev/null || true)
+    [[ -n "$latest_version" ]] || return 1
+    RESOLVED_VERSIONS=("$latest_version")
+    return 0
+  fi
+  RESOLUTION_RANGE=$(printf '%s, ' "${ranges[@]}")
+  RESOLUTION_RANGE="${RESOLUTION_RANGE%, }"
+  local r cons v
+  local -a resolved=()
+  for r in "${ranges[@]}"; do
+    cons=$(npm_desugar_range "$r") || return 1
+    v=$(npm_max_satisfying "$packument" "$cons" 2>/dev/null || true)
+    [[ -n "$v" ]] || return 1
+    resolved+=("$v")
+  done
+  local seen=""
+  RESOLVED_VERSIONS=()
+  for v in "${resolved[@]}"; do
+    case " $seen " in
+      *" $v "*) continue ;;
+    esac
+    seen="$seen $v"
+    RESOLVED_VERSIONS+=("$v")
+  done
+  # A wall of distinct in-range targets means we no longer understand what
+  # the resolver will do; degrade instead of pretending.
+  (( ${#RESOLVED_VERSIONS[@]} <= 4 )) || return 1
+  return 0
+}
+
+# Classify OSV advisories against a resolved version.
+# trust_server=1: the OSV query was version-scoped, so an advisory whose
+# ranges we cannot parse is trusted as affecting (tagged ambiguous).
+# trust_server=0 (package-only query): unparseable advisories stay ambiguous.
+osv_classify() {
+  local osv_file="$1" osv_eco="$2" name="$3" version="$4" trust_server="$5"
+  jq -c --arg eco "$osv_eco" --arg name "$name" --arg ver "$version" --argjson trust "$trust_server" "
+    $JQ_VSEMVER
+    def sev: ((.database_specific.severity // \"unknown\") | ascii_downcase);
+    def matching_affected: [ .affected[]? | select((.package.ecosystem // \"\") == \$eco and (.package.name // \"\") == \$name) ];
+    def usable_ranges: [ .[].ranges[]? | select(.type == \"SEMVER\" or .type == \"ECOSYSTEM\") | select((.events | length) > 0) ];
+    def range_affected(\$r):
+      reduce (\$r.events // [])[] as \$e (false;
+        if (\$e.introduced? != null) and vge(\$ver; \$e.introduced) then true
+        elif (\$e.fixed? != null) and vge(\$ver; \$e.fixed) then false
+        elif (\$e.last_affected? != null) and vgt(\$ver; \$e.last_affected) then false
+        else .
+        end);
+    def range_fixed_events(\$r): [ (\$r.events // [])[] | .fixed? | select(. != null) ];
+    [ .vulns[]?
+      | matching_affected as \$aff
+      | (\$aff | usable_ranges) as \$ranges
+      | ([ \$aff[].versions[]? ]) as \$version_list
+      | ((\$ranges | length) > 0 or (\$version_list | length) > 0) as \$parseable
+      | (
+          (\$version_list | index(\$ver) != null)
+          or ([ \$ranges[] | range_affected(.) ] | any)
+        ) as \$range_hit
+      | (if \$parseable then \$range_hit else (\$trust == 1) end) as \$affects
+      | ([ \$ranges[] | range_fixed_events(.)[] ] | sort_by(vparse) | last) as \$fixed_max
+      | {
+          id: .id,
+          severity: sev,
+          affects: \$affects,
+          ambiguous: (\$parseable | not),
+          unfixed: (\$affects and ((\$fixed_max // \"\") == \"\")),
+          fixed: (\$fixed_max // null),
+          remediated: ((\$affects | not) and \$parseable and \$fixed_max != null and vle(\$fixed_max; \$ver))
+        }
+    ]
+    | {
+        affecting:  [ .[] | select(.affects) ],
+        remediated: [ .[] | select(.remediated) ],
+        ambiguous:  [ .[] | select(.ambiguous) ],
+        unaffected: [ .[] | select((.affects or .remediated or .ambiguous) | not) ]
+      }
+  " "$osv_file"
+}
+
+mark_install_known() {
+  local ecosystem="$1" name="$2" version="$3" verdict="$4" reasons_json="$5" evidence="$6"
+  local tmp key
+  key="$ecosystem:$name"
+  mkdir -p "$SAFE_RUN_CONFIG_DIR"
+  [[ -f "$INSTALL_KNOWN_FILE" ]] || printf '{"packages":{}}\n' > "$INSTALL_KNOWN_FILE"
+  tmp=$(mktemp)
+  jq --arg k "$key" --arg v "$version" --arg verdict "$verdict" \
+    --argjson reasons "$reasons_json" --arg ev "$evidence" \
+    --arg now "$(now_iso)" --arg d "$(today_date)" '
+    (.packages[$k] // {}) as $old |
+    .packages[$k] = {
+      version: $v,
+      verdict: $verdict,
+      reasons: $reasons,
+      evidence: $ev,
+      first_allowed: (if ($old.version // "") == $v then ($old.first_allowed // $now) else $now end),
+      last_used: $d,
+      times_used: (if ($old.version // "") == $v then (($old.times_used // 0) + 1) else 1 end)
+    }' "$INSTALL_KNOWN_FILE" > "$tmp" && mv "$tmp" "$INSTALL_KNOWN_FILE"
+}
+
+# Operator-pinned host-allow entry matching one of the resolved versions.
+host_allow_matches_resolved() {
+  local ecosystem="$1" name="$2"
+  shift 2
+  [[ "$ecosystem" == "npm" ]] || return 1
+  [[ -f "$SAFE_RUN_HOST_ALLOW_FILE" ]] || return 1
+  local entry_version entry_ecosystem
+  entry_version=$(jq -r --arg p "$name" '.packages[$p].version // empty' "$SAFE_RUN_HOST_ALLOW_FILE" 2>/dev/null || true)
+  entry_ecosystem=$(jq -r --arg p "$name" '.packages[$p].ecosystem // "npm"' "$SAFE_RUN_HOST_ALLOW_FILE" 2>/dev/null || true)
+  [[ -n "$entry_version" && "$entry_ecosystem" == "npm" ]] || return 1
+  local v
+  for v in "$@"; do
+    [[ "$v" == "$entry_version" ]] && { HOST_ALLOW_RESOLVED_VERSION="$entry_version"; return 0; }
+  done
+  return 1
+}
+
 check_command() {
-  local ecosystem="" json_mode=0 spec=""
+  local ecosystem="" json_mode=0 spec="" op="install" gate=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --ecosystem)
@@ -3651,6 +4118,16 @@ check_command() {
         json_mode=1
         shift
         ;;
+      --op)
+        [[ $# -lt 2 ]] && die "--op requires a value"
+        op="$2"
+        shift 2
+        ;;
+      --gate)
+        [[ $# -lt 2 ]] && die "--gate requires a value"
+        gate="$2"
+        shift 2
+        ;;
       -*)
         die "unknown check flag: $1"
         ;;
@@ -3660,23 +4137,47 @@ check_command() {
         ;;
     esac
   done
-  [[ -z "$spec" ]] && die "usage: safe audit check <pkg>@<version> [--ecosystem <name>] [--json]"
+  [[ -z "$spec" ]] && die "usage: safe audit check <pkg>[@<version>] [--ecosystem <name>] [--op install|update] [--gate install] [--json]"
+  [[ "$op" == "install" || "$op" == "update" ]] || die "--op must be install or update"
+  [[ -z "$gate" || "$gate" == "install" ]] || die "--gate supports only: install"
 
   parse_pkg_spec "$spec"
   [[ -z "$ecosystem" ]] && ecosystem=$(guess_ecosystem_from_spec "$spec")
 
-  local scratch socket_json osv_json block_reason verdict socket_line osv_line block_line socket_status osv_count blocked note_json
+  local scratch socket_json osv_json block_reason verdict socket_line osv_line block_line
   scratch=$(mktemp -d)
   socket_json="$scratch/socket.json"
   osv_json="$scratch/osv.json"
 
-  socket_score_json "$ecosystem" "$spec" "$socket_json"
-  osv_query_package_json "$ecosystem" "$PKG_NAME" "$PKG_VERSION" "$osv_json"
+  # --- resolve the version(s) the package manager would actually install
+  local resolution_ok=1 primary_version resolved_label=""
+  RESOLVED_VERSIONS=()
+  RESOLUTION_METHOD=""
+  RESOLUTION_SOURCE=""
+  RESOLUTION_RANGE=""
+  if ! resolve_target_versions "$ecosystem" "$PKG_NAME" "$PKG_VERSION" "$op" "$scratch"; then
+    resolution_ok=0
+  fi
+  if (( resolution_ok )); then
+    primary_version="${RESOLVED_VERSIONS[0]}"
+    resolved_label=$(printf '%s, ' "${RESOLVED_VERSIONS[@]}")
+    resolved_label="${resolved_label%, }"
+  else
+    primary_version="$PKG_VERSION"
+  fi
+
+  local socket_spec="$spec"
+  (( resolution_ok )) && socket_spec="${PKG_NAME}@${primary_version}"
+  socket_score_json "$ecosystem" "$socket_spec" "$socket_json"
 
   verdict="GO"
+  local -a warn_causes=()
+  local socket_detail=""
   socket_line="PASS (no behavioral anomalies)"
   if [[ "$(jq -r '.available // false' "$socket_json" 2>/dev/null)" != "true" ]]; then
     socket_line='SKIP (socket CLI not available)'
+    warn_causes+=("socket_unavailable")
+    socket_detail="socket CLI not available"
     verdict="WARN"
   elif [[ "$(jq -r '.status' "$socket_json")" != "ok" ]]; then
     local socket_note
@@ -3684,69 +4185,197 @@ check_command() {
     case "$socket_note" in
       # 429 first: its message never mentions auth, and a bare *API* match
       # used to relabel any failure (even spinner text) as an auth problem
-      *"Too Many Requests"*|*" 429"*|*"rate limit"*) socket_line='WARN (socket rate-limited, retry later)' ;;
-      *Unauthorized*|*" 401"*|*token*|*Token*) socket_line='WARN (socket authentication required)' ;;
-      *) socket_line='WARN (socket check failed)' ;;
+      *"Too Many Requests"*|*" 429"*|*"rate limit"*)
+        socket_line='WARN (socket rate-limited, retry later)'
+        warn_causes+=("socket_rate_limited")
+        ;;
+      *Unauthorized*|*" 401"*|*token*|*Token*)
+        socket_line='WARN (socket authentication required)'
+        warn_causes+=("socket_auth_failed")
+        ;;
+      *)
+        socket_line='WARN (socket check failed)'
+        warn_causes+=("socket_error")
+        ;;
     esac
+    socket_detail="$socket_note"
     verdict="WARN"
   else
     local score_val
     score_val=$(jq -r '.raw.score // .raw.riskScore // empty' "$socket_json" 2>/dev/null || true)
     if [[ -n "$score_val" && "$score_val" =~ ^[0-9]+$ && "$score_val" -lt 70 ]]; then
       socket_line="WARN (score=$score_val)"
+      warn_causes+=("socket_low_score")
       verdict="WARN"
     fi
   fi
 
-  osv_count=$(jq '[.vulns[]?] | length' "$osv_json" 2>/dev/null || echo 0)
-  osv_line="PASS (${osv_count} known CVEs)"
-  if (( osv_count > 0 )); then
-    verdict="WARN"
-    osv_line="WARN (${osv_count} known CVEs)"
+  # --- version-aware OSV evaluation
+  local osv_eco
+  case "$ecosystem" in
+    npm) osv_eco="npm" ;;
+    python) osv_eco="PyPI" ;;
+    php) osv_eco="Packagist" ;;
+    rust) osv_eco="crates.io" ;;
+    go) osv_eco="Go" ;;
+    *) osv_eco="$ecosystem" ;;
+  esac
+
+  local osv_status="ok" classifications='[]' combined='{"affecting":[],"remediated":[],"ambiguous":[],"unaffected":[]}'
+  local aff_count=0 rem_count=0 amb_count=0 total_count=0 osv_primary_file=""
+  if (( resolution_ok )); then
+    local v idx=0 cls vfile
+    for v in "${RESOLVED_VERSIONS[@]}"; do
+      vfile="$scratch/osv-$idx.json"
+      osv_query_package_json "$ecosystem" "$PKG_NAME" "$v" "$vfile"
+      [[ "$(jq -r '.status' "$vfile" 2>/dev/null)" == "ok" ]] || osv_status="error"
+      cls=$(osv_classify "$vfile" "$osv_eco" "$PKG_NAME" "$v" 1 2>/dev/null) || cls=""
+      if [[ -z "$cls" ]]; then
+        # Classification failure is advisory-data failure: fail closed.
+        osv_status="error"
+        cls='{"affecting":[],"remediated":[],"ambiguous":[],"unaffected":[]}'
+      fi
+      classifications=$(jq -cn --argjson acc "$classifications" --argjson c "$cls" --arg v "$v" '$acc + [{version: $v, classification: $c}]')
+      idx=$((idx + 1))
+    done
+    osv_primary_file="$scratch/osv-0.json"
+    cp "$osv_primary_file" "$osv_json"
+    combined=$(jq -cn --argjson cs "$classifications" '{
+      affecting:  ([ $cs[].classification.affecting[] ]  | unique_by(.id)),
+      remediated: ([ $cs[].classification.remediated[] ] | unique_by(.id)),
+      ambiguous:  ([ $cs[].classification.ambiguous[] ]  | unique_by(.id)),
+      unaffected: ([ $cs[].classification.unaffected[] ] | unique_by(.id))
+    }')
+    aff_count=$(jq -r '.affecting | length' <<<"$combined")
+    rem_count=$(jq -r '.remediated | length' <<<"$combined")
+    amb_count=$(jq -r '.ambiguous | length' <<<"$combined")
+    total_count=$(jq -r '[.affecting, .remediated, .ambiguous, .unaffected] | map(length) | add' <<<"$combined")
+  else
+    osv_query_package_json "$ecosystem" "$PKG_NAME" "" "$osv_json"
+    [[ "$(jq -r '.status' "$osv_json" 2>/dev/null)" == "ok" ]] || osv_status="error"
+    total_count=$(jq '[.vulns[]?] | length' "$osv_json" 2>/dev/null || echo 0)
+  fi
+
+  local block_severities affecting_blocked=""
+  block_severities=$(install_policy_json | jq -c '.block_severities // ["critical"]')
+  if (( resolution_ok )); then
+    if [[ "$osv_status" != "ok" ]]; then
+      # Previously an OSV outage silently counted as zero CVEs; fail closed.
+      osv_line="WARN (OSV query failed; advisory data unavailable)"
+      warn_causes+=("osv_unavailable")
+      bump_verdict verdict "WARN"
+    elif (( aff_count > 0 )); then
+      local aff_summary
+      aff_summary=$(jq -r '[.affecting[] | "\(.id) (\(.severity))"] | .[0:3] | join(", ")' <<<"$combined")
+      osv_line="WARN (${aff_count} of ${total_count} advisories affect ${resolved_label}: ${aff_summary})"
+      warn_causes+=("osv_affecting")
+      bump_verdict verdict "WARN"
+      affecting_blocked=$(jq -r --argjson block "$block_severities" '[.affecting[] | select(.severity as $s | $block | index($s))] | length' <<<"$combined")
+      if (( affecting_blocked > 0 )); then
+        osv_line="BLOCK (${aff_count} of ${total_count} advisories affect ${resolved_label}: ${aff_summary})"
+        bump_verdict verdict "BLOCK"
+      fi
+    elif (( total_count > 0 )); then
+      if (( rem_count > 0 )); then
+        osv_line="PASS (0 of ${total_count} advisories affect ${resolved_label}; ${rem_count} fixed at or below it)"
+      else
+        osv_line="PASS (0 of ${total_count} advisories affect ${resolved_label})"
+      fi
+    else
+      osv_line="PASS (no known advisories for ${resolved_label})"
+    fi
+  else
+    if [[ "$osv_status" != "ok" ]]; then
+      osv_line="WARN (version unresolved and OSV query failed)"
+      warn_causes+=("osv_unavailable")
+    else
+      osv_line="WARN (version unresolved; ${total_count} historical advisories for package)"
+    fi
+    warn_causes+=("version_unresolved")
+    bump_verdict verdict "WARN"
     if jq -e '.vulns[]? | select((.database_specific.severity // "") | ascii_downcase == "critical")' "$osv_json" >/dev/null 2>&1; then
-      verdict="BLOCK"
+      bump_verdict verdict "BLOCK"
     fi
   fi
 
   block_line="PASS (not blocked)"
   if block_reason=$(blocked_entry_reason "$PKG_NAME"); then
-    verdict="BLOCK"
+    bump_verdict verdict "BLOCK"
     block_line="BLOCKED ($block_reason)"
   fi
 
-  local result_json
-  result_json="$CHECKS_DIR/$(today_date)-$(slugify "$PKG_NAME")-${PKG_VERSION}.json"
+  local warn_causes_json='[]'
+  if (( ${#warn_causes[@]} > 0 )); then
+    warn_causes_json=$(printf '%s\n' "${warn_causes[@]}" | jq -cR . | jq -cs .)
+  fi
+
+  local result_json resolved_versions_json='[]'
+  if (( resolution_ok )); then
+    resolved_versions_json=$(printf '%s\n' "${RESOLVED_VERSIONS[@]}" | jq -cR . | jq -cs .)
+  fi
+  local version_slug="${primary_version//[^0-9A-Za-z._-]/-}"
+  result_json="$CHECKS_DIR/$(today_date)-$(slugify "$PKG_NAME")-${version_slug}.json"
   jq -n \
     --arg timestamp "$(now_iso)" \
     --arg spec "$spec" \
+    --arg op "$op" \
     --arg ecosystem "$ecosystem" \
     --arg verdict "$verdict" \
     --arg socket_line "$socket_line" \
     --arg osv_line "$osv_line" \
     --arg block_line "$block_line" \
+    --arg resolution_method "$RESOLUTION_METHOD" \
+    --arg resolution_source "$RESOLUTION_SOURCE" \
+    --arg resolution_range "$RESOLUTION_RANGE" \
+    --arg resolution_status "$( (( resolution_ok )) && printf 'ok' || printf 'unresolved')" \
+    --argjson resolved_versions "$resolved_versions_json" \
+    --argjson classification "$combined" \
+    --argjson versions "$classifications" \
+    --argjson warn_causes "$warn_causes_json" \
     --slurpfile socket "$socket_json" \
     --slurpfile osv "$osv_json" '
     {
       timestamp: $timestamp,
       spec: $spec,
+      op: $op,
       ecosystem: $ecosystem,
       verdict: $verdict,
+      resolved_versions: $resolved_versions,
+      resolution: {
+        status: $resolution_status,
+        method: $resolution_method,
+        source: $resolution_source,
+        range: $resolution_range
+      },
+      warn_causes: $warn_causes,
       checks: {
         socket: $socket_line,
         osv: $osv_line,
         blocklist: $block_line
       },
       socket: ($socket[0] // {}),
-      osv: ($osv[0] // {})
+      osv: (($osv[0] // {}) + {classification: $classification, versions: $versions})
     }' > "$result_json"
 
   if [[ "$json_mode" == "1" ]]; then
     cat "$result_json"
   else
     printf '[safe audit] checking %s (%s)\n\n' "$spec" "$ecosystem"
+    if (( resolution_ok )); then
+      local resolution_extra=""
+      [[ -n "$RESOLUTION_RANGE" ]] && resolution_extra="; range ${RESOLUTION_RANGE}"
+      printf 'Resolved:    %s (%s%s%s)\n' "$resolved_label" "$RESOLUTION_METHOD" "${RESOLUTION_SOURCE:+ via $RESOLUTION_SOURCE}" "$resolution_extra"
+    else
+      printf 'Resolved:    (unresolved — auditing at package level)\n'
+    fi
     printf 'Socket:      %s\n' "$socket_line"
     printf 'OSV:         %s\n' "$osv_line"
     printf 'Blocklist:   %s\n' "$block_line"
+    if (( resolution_ok )) && (( rem_count > 0 )) && (( aff_count == 0 )); then
+      local rem_summary
+      rem_summary=$(jq -r '[.remediated[] | "\(.id) (fixed \(.fixed // "?"))"] | .[0:4] | join(", ")' <<<"$combined")
+      printf '\n[safe audit] this version fixes: %s\n' "$rem_summary"
+    fi
     if [[ "$(jq -r '.available // false' "$socket_json" 2>/dev/null)" != "true" ]]; then
       printf '\n[safe audit] WARNING: socket CLI not available, skipping behavioral analysis\n'
       printf '[safe audit] Install: safe audit setup local\n'
@@ -3754,12 +4383,102 @@ check_command() {
     printf '\nVERDICT: %s\n' "$verdict"
   fi
 
+  # --- install-gate mode: apply allow policy, emit actionable hints
+  if [[ "$gate" == "install" ]]; then
+    local policy auto_allow gate_exit=-1
+    policy=$(install_policy_json)
+    auto_allow=$(jq -r 'if .auto_allow == false then "false" else "true" end' <<<"$policy")
+    case "$verdict" in
+      GO)
+        if [[ "$auto_allow" == "true" ]] && (( resolution_ok )); then
+          mark_install_known "$ecosystem" "$PKG_NAME" "$primary_version" "GO" \
+            '["osv_clean_for_version","socket_ok","blocklist_pass"]' "$result_json"
+          printf '[safe audit] recorded clean check: %s:%s@%s (install-known)\n' \
+            "$ecosystem" "$PKG_NAME" "$primary_version" >&2
+        fi
+        gate_exit=0
+        ;;
+      WARN)
+        HOST_ALLOW_RESOLVED_VERSION=""
+        if (( resolution_ok )) && host_allow_matches_resolved "$ecosystem" "$PKG_NAME" "${RESOLVED_VERSIONS[@]}"; then
+          printf '[safe audit] host-allow entry %s@%s matches the resolved version; allowing\n' \
+            "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION" >&2
+          gate_exit=0
+        elif [[ "$auto_allow" == "true" ]] && (( resolution_ok )) && (( aff_count == 0 )) \
+          && [[ "$block_line" == PASS* ]] && (( ${#warn_causes[@]} > 0 )) \
+          && [[ "$(jq -r --argjson causes "$warn_causes_json" '((.auto_allow_tolerate // []) | map(tostring)) as $tol | $causes | all(. as $c | $tol | index($c) != null)' <<<"$policy")" == "true" ]]; then
+          mark_install_known "$ecosystem" "$PKG_NAME" "$primary_version" "WARN_TOLERATED" \
+            "$warn_causes_json" "$result_json"
+          printf '[safe audit] WARN causes tolerated by install.auto_allow_tolerate (%s); allowing %s@%s\n' \
+            "$(printf '%s,' "${warn_causes[@]}" | sed 's/,$//')" "$PKG_NAME" "$primary_version" >&2
+          gate_exit=0
+        else
+          gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" "$aff_count" "$socket_detail" "${warn_causes[@]}"
+          gate_exit=10
+        fi
+        ;;
+      BLOCK)
+        printf 'safe audit: operator review required: safe audit check %s --ecosystem %s --json\n' \
+          "$( (( resolution_ok )) && printf '%s@%s' "$PKG_NAME" "$primary_version" || printf '%s' "$spec")" "$ecosystem" >&2
+        gate_exit=20
+        ;;
+    esac
+    if (( gate_exit >= 0 )); then
+      rm -rf "$scratch"
+      return "$gate_exit"
+    fi
+  fi
+
+  rm -rf "$scratch"
   case "$verdict" in
     GO) return 0 ;;
     WARN) return 10 ;;
     BLOCK) return 20 ;;
     *) return 1 ;;
   esac
+}
+
+# Actionable refusal hints for install-gate mode, printed to stderr in cause
+# priority order. Socket failures are infrastructure breakage — the wording
+# must never read as a package vulnerability finding.
+gate_emit_refusal_hints() {
+  local ecosystem="$1" name="$2" primary_version="$3" resolution_ok="$4" aff_count="$5" socket_detail="$6"
+  shift 6
+  local -a causes=("$@")
+  local cause has_socket_infra=0 has_unresolved=0 has_affecting=0 has_osv_down=0 has_low_score=0
+  for cause in "${causes[@]}"; do
+    case "$cause" in
+      socket_unavailable|socket_auth_failed|socket_rate_limited|socket_error) has_socket_infra=1 ;;
+      version_unresolved) has_unresolved=1 ;;
+      osv_affecting) has_affecting=1 ;;
+      osv_unavailable) has_osv_down=1 ;;
+      socket_low_score) has_low_score=1 ;;
+    esac
+  done
+  if (( has_affecting )); then
+    if [[ "$ecosystem" == "npm" ]]; then
+      printf 'safe audit: to allow this exact version: safe run host-allow add %s@%s --reason "..."\n' \
+        "$name" "$primary_version" >&2
+    else
+      printf 'safe audit: operator review: safe audit check %s@%s --ecosystem %s --json\n' \
+        "$name" "$primary_version" "$ecosystem" >&2
+    fi
+  fi
+  if (( has_socket_infra )); then
+    printf 'safe audit: socket score unavailable (%s) — infrastructure failure, NOT a package finding\n' \
+      "${socket_detail:-unknown cause}" >&2
+    printf 'safe audit: fix now: socket login (auth) / wait and retry (rate limit) / safe doctor (wiring); escalate to the operator if it persists\n' >&2
+  fi
+  if (( has_unresolved )); then
+    printf 'safe audit: could not resolve the target version for %s — pin an exact version and retry\n' "$name" >&2
+    printf 'safe audit: inspect: safe audit check %s@<x.y.z> --ecosystem %s\n' "$name" "$ecosystem" >&2
+  fi
+  if (( has_osv_down )); then
+    printf 'safe audit: OSV advisory service unreachable — retry; if persistent, operator review\n' >&2
+  fi
+  if (( has_low_score )); then
+    printf 'safe audit: socket behavioral score is low — operator review required (not auto-allowable)\n' >&2
+  fi
 }
 
 release_github_command() {

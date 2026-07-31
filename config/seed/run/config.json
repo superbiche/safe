@@ -17,5 +17,11 @@
     "timeout_seconds": 300
   },
   "warn_env_files": true,
-  "linked_targets": []
+  "linked_targets": [],
+  "install": {
+    "auto_allow": true,
+    "auto_allow_tolerate": [],
+    "auto_allow_ttl_days": 30,
+    "block_severities": ["critical"]
+  }
 }

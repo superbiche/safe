@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+- Version-aware install verdicts: `safe audit check` now resolves the version
+  the package manager would actually install (exact spec as-is; npm dist-tag
+  for installs; the **in-range** target from `package.json`/lockfile ranges
+  for `--op update`; registry latest for pip/uv, cargo, composer, go) and
+  matches OSV advisories against that exact version's affected ranges.
+  Previously the query sent `version:"latest"`, OSV returned every advisory
+  ever filed, and the verdict was a version-blind count — which WARN-blocked
+  the very bumps that remediate a CVE (inbox 2026-07-31, third occurrence).
+  Advisories are classified `affecting`/`remediated`/`unfixed`/`ambiguous`;
+  only affecting ones drive the verdict, with `install.block_severities`
+  (default critical) escalating to BLOCK. Resolution failure degrades to a
+  package-level audit with a WARN floor (`version_unresolved`), and an OSV
+  outage now fails closed (it used to count as zero CVEs). Exit codes and
+  plain `check` semantics are unchanged for consumers.
+
+- New install gate mode (`safe audit check --gate install`), used by the zsh
+  wrappers and `safe install`: GO proceeds with no operator terminal and
+  records the pinned resolved version in machine-written
+  `~/.config/safe/run/install-known.json` (evidence pointing at the check
+  receipt; consulted only as an offline fallback when the audit times out,
+  within `install.auto_allow_ttl_days`). WARN proceeds only on a pinned
+  host-allow entry matching the **resolved** version — fixing the dead end
+  where `npm update` audited `pkg@latest` and a pinned allow could never
+  match — or via the opt-in `install.auto_allow_tolerate` causes. Refusal
+  hints are always pinned (`host-allow add <pkg>@<resolved>`); nothing ever
+  suggests `@latest`. Socket scoring failures refuse with an explicit
+  infrastructure-failure message and recovery path (`socket login`,
+  `safe doctor` now reports the Socket CLI/token wiring), clearly
+  distinguished from a package finding. Wrapper and `safe install` gate
+  decisions now leave a persistent record in the safe-run audit log
+  (`install:<ecosystem> | ... | GATE | ... | PROCEED/REFUSED_*`).
+
 - Add `safe vendor update --preset <vendor>` for claude, gh, op, uv, and
   codex: fills `--name`, `--path` (auto-detected on PATH), and `--version-cmd`
   so a native vendor update needs only `--reason` and the command; explicit

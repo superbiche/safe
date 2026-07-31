@@ -47,6 +47,60 @@ safe_install_run_audit() {
   fi
 }
 
+# Update-family subcommands resolve in-range instead of to the dist-tag; the
+# audit needs to know which semantics apply to resolve the real target.
+safe_install_audit_op() {
+  case "${SAFE_INSTALL_SUBCMD:-}" in
+    update|u|up|upgrade|udpate) print -rn -- "update" ;;
+    *) print -rn -- "install" ;;
+  esac
+}
+
+# Persistent record of install-gate decisions, mirroring safe-run's audit_log
+# field format (ts | runner | pkg | tier | context | decision | extra).
+safe_install_audit_log() {
+  local ecosystem="$1" package="$2" decision="$3" extra="${4:-}"
+  local data_dir="${SAFE_RUN_DATA_DIR:-${SAFE_DATA_DIR:-$HOME/.local/share/safe}/run}"
+  local context="non-tty"
+  [[ -t 0 && -t 1 ]] && context="interactive"
+  mkdir -p "${data_dir}" 2>/dev/null || return 0
+  local line
+  line="$(command date -Iseconds) | install:${ecosystem} | ${package} | GATE | ${context} | ${decision}${extra:+ | ${extra}}"
+  print -r -- "${line//[$'\r\n']/ }" >> "${data_dir}/audit.log" 2>/dev/null || true
+}
+
+safe_install_known_file() {
+  print -r -- "${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}/install-known.json"
+}
+
+# Offline fallback: when the audit itself timed out, an exact-version request
+# matching a fresh install-known entry (a previously recorded clean check) may
+# proceed on that stale evidence. Unpinned requests never qualify.
+safe_install_known_matches() {
+  local package="$1"
+  local ecosystem="$2"
+  local known_file name version entry ttl_days entry_epoch now_epoch
+
+  (( $+commands[jq] )) || return 1
+  known_file="$(safe_install_known_file)"
+  [[ -r "${known_file}" ]] || return 1
+
+  IFS=$'\t' read -r name version <<< "$(safe_install_split_spec "${package}")"
+  [[ -n "${name}" && -n "${version}" && "${version}" != "latest" ]] || return 1
+
+  entry="$(jq -r --arg k "${ecosystem}:${name}" --arg v "${version}" \
+    '.packages[$k] | select(.version == $v) | .first_allowed // empty' "${known_file}" 2>/dev/null || true)"
+  [[ -n "${entry}" ]] || return 1
+
+  ttl_days="$(jq -r '.install.auto_allow_ttl_days // 30' \
+    "${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}/config.json" 2>/dev/null || print -rn 30)"
+  [[ "${ttl_days}" == <-> ]] || ttl_days=30
+  entry_epoch="$(command date -d "${entry}" +%s 2>/dev/null || true)"
+  [[ -n "${entry_epoch}" ]] || return 1
+  now_epoch="$(command date +%s)"
+  (( now_epoch - entry_epoch <= ttl_days * 86400 ))
+}
+
 safe_install_host_allow_file() {
   print -r -- "${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}/host-allow.json"
 }
@@ -223,18 +277,27 @@ safe_install_pip_project_install() {
 
 # One-line operator hint for a refused package. host-allow only unlocks npm
 # installs, so other ecosystems point at the audit detail command instead.
+# Fallback hint when the audit could not supply a pinned suggestion (the gate
+# prints resolved-version hints itself). Must never render an @latest shape:
+# allow entries are always pinned to an exact resolved version.
 safe_install_allow_hint() {
   local package="$1"
   local ecosystem="$2"
+  local name version
 
+  IFS=$'\t' read -r name version <<< "$(safe_install_split_spec "${package}")"
   if [[ "${ecosystem}" == "npm" ]]; then
-    print -rn -- "to allow: ask the operator to run: safe run host-allow add ${package} --reason \"...\" — then retry"
+    if [[ -n "${version}" && "${version}" != "latest" ]]; then
+      print -rn -- "to allow: ask the operator to run: safe run host-allow add ${package} --reason \"...\" — then retry"
+    else
+      print -rn -- "to allow: pin an exact version first (see the resolved-version hint above) — allow entries are never @latest"
+    fi
   else
     print -rn -- "to allow: operator review — safe audit check ${package} --ecosystem ${ecosystem}"
   fi
 }
 
-# Check one package via safe audit.
+# Check one package via safe audit's install gate.
 # Returns: 0=GO/proceed, 100=policy refusal, 104=audit BLOCK verdict.
 safe_install_check() {
   local package="$1"
@@ -246,31 +309,43 @@ safe_install_check() {
     return 0
   fi
 
-  safe_install_run_audit "${package}" --ecosystem "${ecosystem}"
+  safe_install_run_audit "${package}" --ecosystem "${ecosystem}" \
+    --gate install --op "$(safe_install_audit_op)"
   audit_status=$?
 
   case "${audit_status}" in
     0)
+      safe_install_audit_log "${ecosystem}" "${package}" "PROCEED"
       return 0
       ;;
     1|10)
       if safe_install_host_allow_matches "${package}" "${ecosystem}"; then
         print -u2 -- "safe install: safe audit warned for ${package}; exact host-allow entry permits install"
+        safe_install_audit_log "${ecosystem}" "${package}" "HOST_ALLOW_OVERRIDE"
         return 0
       fi
       print -u2 -- "safe: BLOCKED ${ecosystem} install of ${package} — safe audit verdict WARN; $(safe_install_allow_hint "${package}" "${ecosystem}"); details: safe explain"
+      safe_install_audit_log "${ecosystem}" "${package}" "REFUSED_WARN"
       return 100
       ;;
     2|20)
       print -u2 -- "safe: BLOCKED ${ecosystem} install of ${package} — safe audit verdict BLOCK; $(safe_install_allow_hint "${package}" "${ecosystem}"); details: safe explain"
+      safe_install_audit_log "${ecosystem}" "${package}" "REFUSED_BLOCK"
       return 104
       ;;
     124|137)
+      if safe_install_known_matches "${package}" "${ecosystem}"; then
+        print -u2 -- "safe install: safe audit timed out; proceeding on recorded clean check for ${package} (stale evidence)"
+        safe_install_audit_log "${ecosystem}" "${package}" "STALE_EVIDENCE"
+        return 0
+      fi
       print -u2 -- "safe: BLOCKED ${ecosystem} install of ${package} — safe audit timed out (fail closed); retry or ask the operator; details: safe explain"
+      safe_install_audit_log "${ecosystem}" "${package}" "TIMEOUT_FAILCLOSED"
       return 100
       ;;
     *)
       print -u2 -- "safe: BLOCKED ${ecosystem} install of ${package} — safe audit failed with exit ${audit_status} (fail closed); ask the operator; details: safe explain"
+      safe_install_audit_log "${ecosystem}" "${package}" "REFUSED_AUDIT_ERROR" "exit=${audit_status}"
       return 100
       ;;
   esac
@@ -384,7 +459,7 @@ safe_install_cargo_packages() {
         continue
         ;;
       *)
-        packages+=("${arg}@latest")
+        packages+=("${arg}")
         ;;
     esac
   done
@@ -487,7 +562,7 @@ safe_install_npm_spec() {
     version="latest"
   fi
 
-  print -r -- "${name}@${version}"
+  safe_install_print_spec "${name}" "${version}"
 }
 
 safe_install_python_spec() {
@@ -505,7 +580,7 @@ safe_install_python_spec() {
     version="latest"
   fi
 
-  print -r -- "${name}@${version}"
+  safe_install_print_spec "${name}" "${version}"
 }
 
 safe_install_colon_spec() {
@@ -520,7 +595,7 @@ safe_install_colon_spec() {
     version="latest"
   fi
 
-  print -r -- "${name}@${version}"
+  safe_install_print_spec "${name}" "${version}"
 }
 
 safe_install_go_spec() {
@@ -535,7 +610,21 @@ safe_install_go_spec() {
     version="latest"
   fi
 
-  print -r -- "${name}@${version}"
+  safe_install_print_spec "${name}" "${version}"
+}
+
+# An unpinned request is audited as the bare name: safe audit resolves the
+# real target version itself (a fabricated @latest is version-blind and made
+# pinned host-allow entries unmatchable).
+safe_install_print_spec() {
+  local name="$1"
+  local version="$2"
+
+  if [[ -z "${version}" || "${version}" == "latest" ]]; then
+    print -r -- "${name}"
+  else
+    print -r -- "${name}@${version}"
+  fi
 }
 
 # A bare command name has no package-spec syntax: no version/tag/alias.

@@ -296,7 +296,7 @@ case_npm_exec_fetch_audits() {
   prepare_case "npm-exec-fetch-audits"
   SAFE_INSTALL_TEST_SCRIPT='npm exec create-foo' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tcreate-foo@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tcreate-foo\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_contains $'REAL\tnpm\texec\tcreate-foo' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -323,11 +323,11 @@ case_npm_exec_versioned_spec_audits_despite_local_bin() {
   # local bin, so it must be audited (review High 1).
   SAFE_INSTALL_TEST_SCRIPT='npm exec blockme@latest' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='bun x blockme@1.2.3' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@1.2.3\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1.2.3\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -360,7 +360,7 @@ case_npm_exec_parent_walk_resists_shadowing() {
     npm exec blockme
   ' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -371,7 +371,7 @@ case_leading_global_flag_gates_npm_install() {
   # flag, so `install` slipped the gate. =form and space-form both gate now.
   SAFE_INSTALL_TEST_SCRIPT='npm --loglevel=error install -g blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='npm --loglevel error install -g blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
@@ -382,7 +382,7 @@ case_leading_global_flag_gates_pnpm_dlx() {
   prepare_case "leading-global-flag-gates-pnpm-dlx"
   SAFE_INSTALL_TEST_SCRIPT='pnpm --filter=web dlx blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -392,7 +392,7 @@ case_leading_global_flag_gates_yarn_add() {
   # The verbatim inbox shape: yarn --cwd <dir> add <pkg>.
   SAFE_INSTALL_TEST_SCRIPT='yarn --cwd sub add blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tyarn' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -401,7 +401,7 @@ case_leading_global_flag_gates_uv_tool_run() {
   prepare_case "leading-global-flag-gates-uv-tool-run"
   SAFE_INSTALL_TEST_SCRIPT='uv --offline tool run blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -413,7 +413,7 @@ case_value_flag_consumes_its_value() {
   # value; the resolver must not stop on it.
   SAFE_INSTALL_TEST_SCRIPT='npm --registry https://r.example install -g blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -435,7 +435,7 @@ case_unknown_leading_flag_eqform_escapes() {
   # real install is still audited.
   SAFE_INSTALL_TEST_SCRIPT='npm --totally-unknown-flag=value install -g blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -456,13 +456,13 @@ case_optional_boolean_explicit_value_gates() {
   # subcommand is still found and gated (review round 1 High 1/High 3).
   SAFE_INSTALL_TEST_SCRIPT='npm --global false install blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='npm --workspaces false install blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='pnpm --recursive false add blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -472,7 +472,7 @@ case_optional_boolean_without_value_still_gates() {
   # boolean flag and must not be consumed as a value.
   SAFE_INSTALL_TEST_SCRIPT='npm --global install blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -482,7 +482,7 @@ case_pnpm_config_switch_not_value() {
   # flag ate the `add` subcommand and bypassed the gate (review round 1 High 2).
   SAFE_INSTALL_TEST_SCRIPT='pnpm --config add blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -493,7 +493,7 @@ case_pip_use_feature_takes_value() {
   # value as the subcommand and bypassed the gate (review round 1 High 4).
   SAFE_INSTALL_TEST_SCRIPT='pip --use-feature fast-deps install blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tpip' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -509,7 +509,7 @@ case_bun_equals_only_flag_not_space_value() {
   assert_log_not_contains_fragment $'REAL\tbun' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='bun --config=bunfig.toml add blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -517,7 +517,7 @@ case_npm_exec_package_flag_blocks() {
   prepare_case "npm-exec-package-flag-blocks"
   SAFE_INSTALL_TEST_SCRIPT='npm exec --package=blockme -- create' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -528,16 +528,16 @@ case_exec_value_flag_does_not_hide_package() {
   # package; the real fetched package is audited (review High 2).
   SAFE_INSTALL_TEST_SCRIPT='npm exec --cache /tmp/cache-ok blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='pnpm dlx --allow-build ok-builder blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME" || return
   # =form is unambiguous and must not over-refuse.
   SAFE_INSTALL_TEST_SCRIPT='npm exec --cache=/tmp/cache-ok cowsay' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tcowsay@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tcowsay\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -559,11 +559,11 @@ case_exec_package_selector_flags() {
   # provides and must not shadow it (re-review High 1/2).
   SAFE_INSTALL_TEST_SCRIPT='pnpm dlx --package blockme benign' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='bun x --package=blockme benign' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tbun' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -574,16 +574,16 @@ case_exec_boolean_flags_do_not_eat_package() {
   # (re-review High 1/3): the package still audits.
   SAFE_INSTALL_TEST_SCRIPT='pnpm dlx -c blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='yarn dlx -q blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tyarn' "$FUNCNAME" || return
   # Documented booleans pass through without over-refusing (re-review Med 1).
   SAFE_INSTALL_TEST_SCRIPT='npm exec --workspaces cowsay' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tcowsay@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tcowsay\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='bun x --verbose cowsay' run_zsh
   assert_status 0 "$FUNCNAME" || return
   pass "$FUNCNAME"
@@ -595,7 +595,7 @@ case_npm_exec_post_positional_package() {
   # the fetched package (round-3 High 1).
   SAFE_INSTALL_TEST_SCRIPT='npm exec benign --package blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='npm exec benign --package=blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
@@ -618,7 +618,7 @@ case_npm_exec_short_p_not_greedy_post_command() {
   # must not shadow the actual fetched positional package (round-4 High 1).
   SAFE_INSTALL_TEST_SCRIPT='npm exec blockme -p okpkg' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   # -p before the command IS a selector (audited); okpkg is the command.
   SAFE_INSTALL_TEST_SCRIPT='npm exec -p blockme okpkg' run_zsh
@@ -662,11 +662,11 @@ case_dlx_and_x_audit() {
   prepare_case "dlx-and-x-audit"
   SAFE_INSTALL_TEST_SCRIPT='pnpm dlx cowsay@1.6.0' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tcowsay@1.6.0\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tcowsay@1.6.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_contains $'REAL\tpnpm\tdlx\tcowsay@1.6.0' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='bun x cowsay' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tcowsay@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tcowsay\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_contains $'REAL\tbun\tx\tcowsay' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='yarn dlx blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
@@ -678,14 +678,14 @@ case_uv_run_and_tool_run_gate() {
   prepare_case "uv-run-and-tool-run-gate"
   SAFE_INSTALL_TEST_SCRIPT='uv run --with warnme script.py' run_zsh
   assert_status 100 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\twarnme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\twarnme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='uv run script.py' run_zsh
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'REAL\tuv\trun\tscript.py' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='uv tool run ruff' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\truff@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\truff\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='uv tool run --from blockme r' run_zsh
   assert_status 104 "$FUNCNAME" || return
   pass "$FUNCNAME"
@@ -696,12 +696,12 @@ case_uv_short_with_and_boundary() {
   # -w is the short --with and must be audited (review High 3).
   SAFE_INSTALL_TEST_SCRIPT='uv run -w blockme script.py' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
   # A value flag before --with must not shift the boundary; --with rich audits.
   SAFE_INSTALL_TEST_SCRIPT='uv run --python 3.12 --with rich pytest' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\trich@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\trich\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_contains $'REAL\tuv\trun\t--python\t3.12\t--with\trich\tpytest' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -723,7 +723,7 @@ case_uv_tool_run_short_with_keeps_tool() {
   # (review High 4).
   SAFE_INSTALL_TEST_SCRIPT='uv tool run -w ok-extra blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -734,13 +734,13 @@ case_uv_tool_run_with_extra_is_audited() {
   # tool (re-review High 4).
   SAFE_INSTALL_TEST_SCRIPT='uv tool run -w blockme ruff' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
   # Both clean → audited and delegated.
   SAFE_INSTALL_TEST_SCRIPT='uv tool run --with ok ruff' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tok@latest\t--ecosystem\tpython' "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\truff@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tok\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\truff\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -750,7 +750,7 @@ case_uv_run_value_flag_before_with() {
   # scan early and miss the later --with fetch (re-review High 5).
   SAFE_INSTALL_TEST_SCRIPT='uv run --no-extra dev --with blockme python' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
   # -m is a switch; it must not fail closed (re-review Med 1).
   SAFE_INSTALL_TEST_SCRIPT='uv run -m pytest' run_zsh
@@ -764,7 +764,7 @@ case_go_run_module_gates() {
   write_tool_stub "${BIN_DIR}" go
   SAFE_INSTALL_TEST_SCRIPT='go run example.com/blockme@v1.0.0' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\texample.com/blockme@v1.0.0\t--ecosystem\tgo' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\texample.com/blockme@v1.0.0\t--ecosystem\tgo\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tgo' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='go run ./cmd' run_zsh
   assert_status 0 "$FUNCNAME" || return
@@ -780,7 +780,7 @@ case_go_run_value_flag_does_not_hide_module() {
   # (round-5 High): -C/-mod take values, then the module@version still audits.
   SAFE_INSTALL_TEST_SCRIPT='go run -C /tmp example.com/blockme@v1.0.0' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\texample.com/blockme@v1.0.0\t--ecosystem\tgo' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\texample.com/blockme@v1.0.0\t--ecosystem\tgo\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tgo' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='go run -mod mod example.com/blockme@v1.0.0' run_zsh
   assert_status 104 "$FUNCNAME" || return
@@ -802,17 +802,17 @@ case_update_family_gates() {
   SAFE_INSTALL_TEST_SCRIPT='npm update lodash' run_zsh
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tscan\t--project\t.' "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tlodash@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tlodash\t--ecosystem\tnpm\t--gate\tinstall\t--op\tupdate' "$FUNCNAME" || return
   assert_log_contains $'REAL\tnpm\tupdate\tlodash' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='yarn upgrade left-pad' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tleft-pad@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tleft-pad\t--ecosystem\tnpm\t--gate\tinstall\t--op\tupdate' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='npm u blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
   # npm ships `udpate` as a real alias of update (review Medium 1).
   SAFE_INSTALL_TEST_SCRIPT='npm udpate blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tupdate' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -854,7 +854,7 @@ case_global_package_check() {
   prepare_case "global-package-check"
   SAFE_INSTALL_TEST_SCRIPT='npm install -g left-pad@1.3.0' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tleft-pad@1.3.0\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tleft-pad@1.3.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_contains $'REAL\tnpm\tinstall\t-g\tleft-pad@1.3.0' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -875,7 +875,7 @@ case_add_scans_and_checks() {
   SAFE_INSTALL_TEST_SCRIPT='pnpm add --filter web --workspace-root lodash' run_zsh
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tscan\t--project\t.' "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tlodash@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tlodash\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\tweb\t--ecosystem' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -884,7 +884,7 @@ case_blocked_install() {
   prepare_case "blocked-install"
   SAFE_INSTALL_TEST_SCRIPT='npm install -g blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -893,7 +893,7 @@ case_warning_install_blocks() {
   prepare_case "warning-install-blocks"
   SAFE_INSTALL_TEST_SCRIPT='npm install -g warnme' run_zsh
   assert_status 100 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\twarnme@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\twarnme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -906,7 +906,7 @@ case_host_allow_warn_allows_exact_global_install() {
 JSON
   SAFE_INSTALL_TEST_SCRIPT='npm install -g warnme@1.0.0' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\twarnme@1.0.0\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\twarnme@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_contains $'REAL\tnpm\tinstall\t-g\twarnme@1.0.0' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -919,7 +919,7 @@ case_host_allow_warn_requires_exact_version() {
 JSON
   SAFE_INSTALL_TEST_SCRIPT='npm install -g warnme@1.0.1' run_zsh
   assert_status 100 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\twarnme@1.0.1\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\twarnme@1.0.1\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -928,7 +928,7 @@ case_npm_colon_version_global_install() {
   prepare_case "npm-colon-version-global-install"
   SAFE_INSTALL_TEST_SCRIPT='npm install -g @qwen-code/qwen-code:0.16.2' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\t@qwen-code/qwen-code@0.16.2\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\t@qwen-code/qwen-code@0.16.2\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_contains $'REAL\tnpm\tinstall\t-g\t@qwen-code/qwen-code:0.16.2' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -937,7 +937,7 @@ case_npm_alias_audits_target_package() {
   prepare_case "npm-alias-audits-target-package"
   SAFE_INSTALL_TEST_SCRIPT='npm install -g qwen@npm:@qwen-code/qwen-code@0.16.2' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\t@qwen-code/qwen-code@0.16.2\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\t@qwen-code/qwen-code@0.16.2\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_contains $'REAL\tnpm\tinstall\t-g\tqwen@npm:@qwen-code/qwen-code@0.16.2' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -946,7 +946,7 @@ case_audit_failure_blocks() {
   prepare_case "audit-failure-blocks"
   SAFE_AUDIT_CHECK_STATUS=42 SAFE_INSTALL_TEST_SCRIPT='uv tool install repomix' run_zsh
   assert_status 100 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\trepomix@latest\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\trepomix\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -986,7 +986,7 @@ case_npm_complex_flags() {
   prepare_case "npm-complex-flags"
   SAFE_INSTALL_TEST_SCRIPT='npm install --registry https://registry.example --tag beta --omit dev left-pad' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tleft-pad@latest\t--ecosystem\tnpm' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tleft-pad\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\thttps://registry.example@latest' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\tbeta@latest' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\tdev@latest' "$FUNCNAME" || return
@@ -998,7 +998,7 @@ case_pip_complex_flags() {
   prepare_case "pip-complex-flags"
   SAFE_INSTALL_TEST_SCRIPT='pip install --index-url https://pypi.example --constraint constraints.txt requests==2.32.0' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\trequests@2.32.0\t--ecosystem\tpython' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\trequests@2.32.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\thttps://pypi.example@latest' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\tconstraints.txt@latest' "$FUNCNAME" || return
   pass "$FUNCNAME"
@@ -1017,7 +1017,7 @@ case_cargo_parser() {
   prepare_case "cargo-parser"
   SAFE_INSTALL_TEST_SCRIPT='cargo install ripgrep --version 14.1.1' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tripgrep@latest\t--ecosystem\tcargo' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tripgrep\t--ecosystem\tcargo\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\t14.1.1@latest' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -1026,7 +1026,7 @@ case_go_parser() {
   prepare_case "go-parser"
   SAFE_INSTALL_TEST_SCRIPT='go install -tags netgo example.com/tool@v1.2.3' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\texample.com/tool@v1.2.3\t--ecosystem\tgo' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\texample.com/tool@v1.2.3\t--ecosystem\tgo\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\tnetgo@latest' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -1035,7 +1035,7 @@ case_composer_parser() {
   prepare_case "composer-parser"
   SAFE_INSTALL_TEST_SCRIPT='composer global require --working-dir /tmp vendor/pkg:^1' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tvendor/pkg@^1\t--ecosystem\tcomposer' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tvendor/pkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\t/tmp@latest' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }

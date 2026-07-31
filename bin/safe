@@ -424,6 +424,15 @@ doctor_payload_json() {
   sandbox_podman_json=$(command_presence_json podman --version)
   sandbox_timeout_json=$(command_presence_json timeout)
 
+  # Socket wiring: a failing socket score WARN-refuses installs, so the
+  # doctor must make the auth/injection chain verifiable in one command.
+  local socket_cmd socket_mapping="$HOME/.config/setup-new-machines/bw-env.d/socket.env"
+  socket_cmd=$(PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH" command -v socket 2>/dev/null || true)
+  local socket_cli_present=false socket_token_env_set=false socket_vault_mapping_present=false
+  [[ -n "$socket_cmd" ]] && socket_cli_present=true
+  [[ -n "${SOCKET_SECURITY_API_TOKEN:-}" ]] && socket_token_env_set=true
+  [[ -f "$socket_mapping" ]] && socket_vault_mapping_present=true
+
   local capabilities_json="" capabilities_available=false
   local capabilities_version=""
   local capability_verify_release_asset=false
@@ -575,7 +584,12 @@ doctor_payload_json() {
     --argjson safe_run_config_present "$( [[ -f "$run_config_dir/config.json" ]] && printf 'true' || printf 'false' )" \
     --argjson safe_run_host_allow_file "$( [[ -f "$run_config_dir/host-allow.json" ]] && printf 'true' || printf 'false' )" \
     --argjson safe_run_sandbox_known_file "$( [[ -f "$run_config_dir/sandbox-known.json" ]] && printf 'true' || printf 'false' )" \
+    --argjson safe_run_install_known_file "$( [[ -f "$run_config_dir/install-known.json" ]] && printf 'true' || printf 'false' )" \
     --argjson safe_run_blocked_file "$( [[ -f "$run_config_dir/blocked.json" ]] && printf 'true' || printf 'false' )" \
+    --arg socket_cli_path "${socket_cmd:-}" \
+    --argjson socket_cli_present "$socket_cli_present" \
+    --argjson socket_token_env_set "$socket_token_env_set" \
+    --argjson socket_vault_mapping_present "$socket_vault_mapping_present" \
     --argjson linked_npx "$linked_npx" \
     --argjson linked_bunx "$linked_bunx" \
     --argjson linked_uvx "$linked_uvx" \
@@ -635,6 +649,7 @@ doctor_payload_json() {
           config_present: $safe_run_config_present,
           host_allow_file: $safe_run_host_allow_file,
           sandbox_known_file: $safe_run_sandbox_known_file,
+          install_known_file: $safe_run_install_known_file,
           blocked_file: $safe_run_blocked_file,
           linked_runners: {
             npx: $linked_npx,
@@ -651,6 +666,12 @@ doctor_payload_json() {
         install_wrappers: {
           script_present: $wrapper_present,
           completion_present: $completion_present
+        },
+        socket: {
+          cli_present: $socket_cli_present,
+          cli_path: $socket_cli_path,
+          token_env_set: $socket_token_env_set,
+          vault_mapping_present: $socket_vault_mapping_present
         }
       }
     }'
@@ -677,6 +698,10 @@ print_doctor_human() {
     "  verify tuf-bootstrap: " + (if .features.verify_tuf_bootstrap.ready then "ready" else "not ready" end),
     "  binary exec: " + (if .features.binary_exec.ready then "ready" else "not ready" end),
     "  safe run sandbox: " + (if .features.safe_run_sandbox.ready then "ready" else "not ready" end),
+    "",
+    "socket wiring (install gate scoring):",
+    "  cli: " + (if .environment.socket.cli_present then .environment.socket.cli_path else "MISSING — install socket CLI" end),
+    "  token: " + (if .environment.socket.token_env_set then "env" elif .environment.socket.vault_mapping_present then "vault mapping" else "MISSING — socket login or add bw-env socket mapping" end),
     "",
     "missing prerequisites:",
     (
@@ -828,7 +853,7 @@ safe_install_npm_spec() {
     version="latest"
   fi
 
-  printf '%s@%s\n' "$name" "$version"
+  safe_install_print_spec "$name" "$version"
 }
 
 safe_install_colon_spec() {
@@ -842,7 +867,20 @@ safe_install_colon_spec() {
     version="latest"
   fi
 
-  printf '%s@%s\n' "$name" "$version"
+  safe_install_print_spec "$name" "$version"
+}
+
+# An unpinned request is audited as the bare name: safe audit resolves the
+# real target version itself (a fabricated @latest is version-blind and made
+# pinned host-allow entries unmatchable).
+safe_install_print_spec() {
+  local name="$1" version="$2"
+
+  if [[ -z "$version" || "$version" == "latest" ]]; then
+    printf '%s\n' "$name"
+  else
+    printf '%s@%s\n' "$name" "$version"
+  fi
 }
 
 safe_install_composer_packages() {
@@ -1006,6 +1044,46 @@ safe_install_host_allow_matches() {
   [[ "$entry_version" == "$version" && "$entry_ecosystem" == "npm" ]]
 }
 
+# Persistent record of install-gate decisions, mirroring safe-run's audit_log
+# field format (ts | runner | pkg | tier | context | decision | extra).
+safe_install_gate_log() {
+  local ecosystem="$1" package="$2" decision="$3" extra="${4:-}"
+  local data_dir="${SAFE_RUN_DATA_DIR:-${SAFE_DATA_DIR:-$HOME/.local/share/safe}/run}"
+  local context="non-tty"
+  [[ -t 0 && -t 1 ]] && context="interactive"
+  mkdir -p "$data_dir" 2>/dev/null || return 0
+  local line
+  line="$(date -Iseconds) | install:${ecosystem} | ${package} | GATE | ${context} | ${decision}${extra:+ | ${extra}}"
+  printf '%s\n' "${line//[$'\r\n']/ }" >> "$data_dir/audit.log" 2>/dev/null || true
+}
+
+# Offline fallback: an exact-version request matching a fresh install-known
+# entry (previously recorded clean check) may proceed when the audit itself
+# timed out. Unpinned requests never qualify.
+safe_install_known_matches() {
+  local package="$1" ecosystem="$2"
+  local known_file name version first_allowed ttl_days entry_epoch now_epoch
+  known_file="${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}/install-known.json"
+
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ -r "$known_file" ]] || return 1
+
+  IFS=$'\t' read -r name version <<< "$(safe_install_split_spec "$package")"
+  [[ -n "$name" && -n "$version" && "$version" != "latest" ]] || return 1
+
+  first_allowed="$(jq -r --arg k "${ecosystem}:${name}" --arg v "$version" \
+    '.packages[$k] | select(.version == $v) | .first_allowed // empty' "$known_file" 2>/dev/null || true)"
+  [[ -n "$first_allowed" ]] || return 1
+
+  ttl_days="$(jq -r '.install.auto_allow_ttl_days // 30' \
+    "${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}/config.json" 2>/dev/null || echo 30)"
+  [[ "$ttl_days" =~ ^[0-9]+$ ]] || ttl_days=30
+  entry_epoch="$(date -d "$first_allowed" +%s 2>/dev/null || true)"
+  [[ -n "$entry_epoch" ]] || return 1
+  now_epoch="$(date +%s)"
+  (( now_epoch - entry_epoch <= ttl_days * 86400 ))
+}
+
 safe_install_audit_package() {
   local package="$1"
   local ecosystem="$2"
@@ -1014,36 +1092,58 @@ safe_install_audit_package() {
   [[ -x "$SAFE_AUDIT_PATH" ]] || die "safe install requires safe audit at $SAFE_AUDIT_PATH"
 
   set +e
-  "$SAFE_AUDIT_PATH" check "$package" --ecosystem "$ecosystem"
+  "$SAFE_AUDIT_PATH" check "$package" --ecosystem "$ecosystem" --gate install --op install
   audit_status=$?
   set -e
 
   case "$audit_status" in
     0)
+      safe_install_gate_log "$ecosystem" "$package" "PROCEED"
       return 0
       ;;
     1|10)
       if [[ "$ecosystem" == "npm" ]] && safe_install_host_allow_matches "$package"; then
         err "safe audit warned for $package; exact host-allow entry permits install"
+        safe_install_gate_log "$ecosystem" "$package" "HOST_ALLOW_OVERRIDE"
         return 0
       fi
+      safe_install_gate_log "$ecosystem" "$package" "REFUSED_WARN"
       refuse 100 "BLOCKED ${ecosystem} install of ${package} — safe audit verdict WARN; $(safe_install_allow_hint "$package" "$ecosystem"); details: safe explain"
       ;;
     2|20)
+      safe_install_gate_log "$ecosystem" "$package" "REFUSED_BLOCK"
       refuse 104 "BLOCKED ${ecosystem} install of ${package} — safe audit verdict BLOCK; $(safe_install_allow_hint "$package" "$ecosystem"); details: safe explain"
       ;;
+    124|137)
+      if safe_install_known_matches "$package" "$ecosystem"; then
+        err "safe audit timed out; proceeding on recorded clean check for $package (stale evidence)"
+        safe_install_gate_log "$ecosystem" "$package" "STALE_EVIDENCE"
+        return 0
+      fi
+      safe_install_gate_log "$ecosystem" "$package" "TIMEOUT_FAILCLOSED"
+      refuse 100 "BLOCKED ${ecosystem} install of ${package} — safe audit timed out (fail closed); retry or ask the operator; details: safe explain"
+      ;;
     *)
+      safe_install_gate_log "$ecosystem" "$package" "REFUSED_AUDIT_ERROR" "exit=${audit_status}"
       refuse 100 "BLOCKED ${ecosystem} install of ${package} — safe audit failed with exit ${audit_status} (fail closed); ask the operator; details: safe explain"
       ;;
   esac
 }
 
+# Fallback hint when the audit could not supply a pinned suggestion (the gate
+# prints resolved-version hints itself). Never renders an @latest shape.
 safe_install_allow_hint() {
   local package="$1"
   local ecosystem="$2"
+  local name version
 
+  IFS=$'\t' read -r name version <<< "$(safe_install_split_spec "$package")"
   if [[ "$ecosystem" == "npm" ]]; then
-    printf 'to allow: ask the operator to run: safe run host-allow add %s --reason "..." — then retry' "$package"
+    if [[ -n "$version" && "$version" != "latest" ]]; then
+      printf 'to allow: ask the operator to run: safe run host-allow add %s --reason "..." — then retry' "$package"
+    else
+      printf 'to allow: pin an exact version first (see the resolved-version hint above) — allow entries are never @latest'
+    fi
   else
     printf 'to allow: operator review — safe audit check %s --ecosystem %s' "$package" "$ecosystem"
   fi
