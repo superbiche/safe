@@ -209,8 +209,11 @@ assert_err_not_contains_fragment() {
 }
 
 # Simulates a harness shell snapshot that keeps the public wrapper functions
-# but strips all safe_install_* helpers (the Claude Code silent-127 regression).
-STRIP_HELPERS='for f in ${(k)functions}; do [[ "$f" == safe_install_* ]] && unfunction "$f"; done; '
+# but strips all safe_install_* helpers (the Claude Code silent-127
+# regression) AND the *_impl helpers behind the public wrappers — a public-
+# only snapshot must refuse legibly, never die 127 mid-function or leak
+# command-not-found noise (delta-9 finding N4).
+STRIP_HELPERS='for f in ${(k)functions}; do [[ "$f" == safe_install_* || "$f" == *_impl ]] && unfunction "$f"; done; '
 
 case_degraded_install_blocks_legibly() {
   prepare_case "degraded-install-blocks-legibly"
@@ -219,6 +222,7 @@ case_degraded_install_blocks_legibly() {
   assert_err_contains_fragment 'safe: BLOCKED npm install' "$FUNCNAME" || return
   assert_err_contains_fragment 'safe explain' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'command not found' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -228,6 +232,7 @@ case_degraded_exec_blocks_legibly() {
   assert_status 100 "$FUNCNAME" || return
   assert_err_contains_fragment 'safe: BLOCKED pnpm dlx' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'command not found' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -244,6 +249,7 @@ case_degraded_alias_subcommands_block() {
   assert_err_contains_fragment 'safe: BLOCKED yarn dlx' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tyarn' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'command not found' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -254,6 +260,7 @@ case_degraded_non_install_passes_through() {
   assert_log_contains $'REAL\tnpm\t--version' "$FUNCNAME" || return
   assert_log_contains $'REAL\tvolta\tlist\tnode' "$FUNCNAME" || return
   assert_log_contains $'REAL\tcomposer\tvalidate' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'command not found' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -272,6 +279,7 @@ case_degraded_leading_flag_still_blocks() {
   assert_status 100 "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}go -C dir install evil@v1" run_zsh
   assert_status 100 "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'command not found' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -285,6 +293,7 @@ case_degraded_leading_flag_benign_passes() {
   SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}go get example.com/x@v1" run_zsh
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'REAL\tgo\tget\texample.com/x@v1' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'command not found' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 

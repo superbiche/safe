@@ -1097,7 +1097,13 @@ safe_install_npm_like() {
   {
     safe_install_npm_like_impl "$@"
   } always {
-    safe_install_clear_target_flags
+    # Inline assignments — a cleanup HELPER could itself be stripped by a
+    # partial shell snapshot (delta-9 finding N4).
+    SAFE_INSTALL_DIST_TAG=""
+    SAFE_INSTALL_REGISTRY=""
+    SAFE_INSTALL_PROJECT_DIR=""
+    SAFE_INSTALL_NPM_USERCONFIG=""
+    SAFE_INSTALL_NPM_GLOBALCONFIG=""
   }
 }
 
@@ -1368,7 +1374,13 @@ safe_install_pip_like() {
   {
     safe_install_pip_like_impl "$@"
   } always {
-    safe_install_clear_target_flags
+    # Inline assignments — a cleanup HELPER could itself be stripped by a
+    # partial shell snapshot (delta-9 finding N4).
+    SAFE_INSTALL_DIST_TAG=""
+    SAFE_INSTALL_REGISTRY=""
+    SAFE_INSTALL_PROJECT_DIR=""
+    SAFE_INSTALL_NPM_USERCONFIG=""
+    SAFE_INSTALL_NPM_GLOBALCONFIG=""
   }
 }
 
@@ -1430,19 +1442,10 @@ pip3() {
 }
 
 uv() {
-  # Scanned target state (possibly credential-bearing) is cleared on EVERY
-  # exit of a scanning route — project scans, parser fallbacks, unsupported
-  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
-  # cleanup tied only to check_many missed the project-install paths).
-  {
-    uv_impl "$@"
-  } always {
-    safe_install_clear_target_flags
-  }
-}
-
-uv_impl() {
-  if ! typeset -f safe_install_python_packages safe_install_check >/dev/null 2>&1; then
+  # INLINE degraded guard (see the contract comment above npm()): the
+  # impl and cleanup helpers can be stripped by shell snapshots, so the
+  # public wrapper must refuse legibly on its own (delta-9 finding N4).
+  if ! typeset -f uv_impl safe_install_python_packages safe_install_check >/dev/null 2>&1; then
     # Scan every token for a gated subcommand so a leading global flag can't
     # hide it (`uv --offline tool run x`). `tool` covers tool run/install.
     local __a
@@ -1465,6 +1468,24 @@ uv_impl() {
     fi
     command uv "$@"; return $?
   fi
+  # Scanned target state (possibly credential-bearing) is cleared on EVERY
+  # exit of a scanning route — project scans, parser fallbacks, unsupported
+  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
+  # cleanup tied only to check_many missed the project-install paths).
+  {
+    uv_impl "$@"
+  } always {
+    # Inline assignments — a cleanup HELPER could itself be stripped by a
+    # partial shell snapshot (delta-9 finding N4).
+    SAFE_INSTALL_DIST_TAG=""
+    SAFE_INSTALL_REGISTRY=""
+    SAFE_INSTALL_PROJECT_DIR=""
+    SAFE_INSTALL_NPM_USERCONFIG=""
+    SAFE_INSTALL_NPM_GLOBALCONFIG=""
+  }
+}
+
+uv_impl() {
   safe_install_route uv "$@" || return $?
   safe_install_scan_target_flags python "$@"
   local first="${SAFE_INSTALL_SUBCMD}"
@@ -1582,19 +1603,10 @@ uv_impl() {
 }
 
 cargo() {
-  # Scanned target state (possibly credential-bearing) is cleared on EVERY
-  # exit of a scanning route — project scans, parser fallbacks, unsupported
-  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
-  # cleanup tied only to check_many missed the project-install paths).
-  {
-    cargo_impl "$@"
-  } always {
-    safe_install_clear_target_flags
-  }
-}
-
-cargo_impl() {
-  if ! typeset -f safe_install_cargo_packages safe_install_check >/dev/null 2>&1; then
+  # INLINE degraded guard (see the contract comment above npm()): the
+  # impl and cleanup helpers can be stripped by shell snapshots, so the
+  # public wrapper must refuse legibly on its own (delta-9 finding N4).
+  if ! typeset -f cargo_impl safe_install_cargo_packages safe_install_check >/dev/null 2>&1; then
     local __a
     for __a in "$@"; do
       case "${__a}" in
@@ -1605,6 +1617,24 @@ cargo_impl() {
     done
     command cargo "$@"; return $?
   fi
+  # Scanned target state (possibly credential-bearing) is cleared on EVERY
+  # exit of a scanning route — project scans, parser fallbacks, unsupported
+  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
+  # cleanup tied only to check_many missed the project-install paths).
+  {
+    cargo_impl "$@"
+  } always {
+    # Inline assignments — a cleanup HELPER could itself be stripped by a
+    # partial shell snapshot (delta-9 finding N4).
+    SAFE_INSTALL_DIST_TAG=""
+    SAFE_INSTALL_REGISTRY=""
+    SAFE_INSTALL_PROJECT_DIR=""
+    SAFE_INSTALL_NPM_USERCONFIG=""
+    SAFE_INSTALL_NPM_GLOBALCONFIG=""
+  }
+}
+
+cargo_impl() {
   safe_install_route cargo "$@" || return $?
   safe_install_scan_target_flags cargo "$@"
   local subcommand="${SAFE_INSTALL_SUBCMD}"
@@ -1639,19 +1669,10 @@ cargo_impl() {
 }
 
 go() {
-  # Scanned target state (possibly credential-bearing) is cleared on EVERY
-  # exit of a scanning route — project scans, parser fallbacks, unsupported
-  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
-  # cleanup tied only to check_many missed the project-install paths).
-  {
-    go_impl "$@"
-  } always {
-    safe_install_clear_target_flags
-  }
-}
-
-go_impl() {
-  if ! typeset -f safe_install_go_packages safe_install_check >/dev/null 2>&1; then
+  # INLINE degraded guard (see the contract comment above npm()): the
+  # impl and cleanup helpers can be stripped by shell snapshots, so the
+  # public wrapper must refuse legibly on its own (delta-9 finding N4).
+  if ! typeset -f go_impl safe_install_go_packages safe_install_check >/dev/null 2>&1; then
     # Scan every token: `go install` (any position) and `go run <mod>@<ver>`
     # fetch. `go get` stays out of scope (its fetch runs no code), so the '@'
     # check is scoped to a `run` present — not any '@' anywhere.
@@ -1671,6 +1692,24 @@ go_impl() {
     fi
     command go "$@"; return $?
   fi
+  # Scanned target state (possibly credential-bearing) is cleared on EVERY
+  # exit of a scanning route — project scans, parser fallbacks, unsupported
+  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
+  # cleanup tied only to check_many missed the project-install paths).
+  {
+    go_impl "$@"
+  } always {
+    # Inline assignments — a cleanup HELPER could itself be stripped by a
+    # partial shell snapshot (delta-9 finding N4).
+    SAFE_INSTALL_DIST_TAG=""
+    SAFE_INSTALL_REGISTRY=""
+    SAFE_INSTALL_PROJECT_DIR=""
+    SAFE_INSTALL_NPM_USERCONFIG=""
+    SAFE_INSTALL_NPM_GLOBALCONFIG=""
+  }
+}
+
+go_impl() {
   safe_install_route go "$@" || return $?
   safe_install_scan_target_flags go "$@"
   local subcommand="${SAFE_INSTALL_SUBCMD}"
@@ -1743,19 +1782,10 @@ go_impl() {
 }
 
 composer() {
-  # Scanned target state (possibly credential-bearing) is cleared on EVERY
-  # exit of a scanning route — project scans, parser fallbacks, unsupported
-  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
-  # cleanup tied only to check_many missed the project-install paths).
-  {
-    composer_impl "$@"
-  } always {
-    safe_install_clear_target_flags
-  }
-}
-
-composer_impl() {
-  if ! typeset -f safe_install_composer_packages safe_install_check >/dev/null 2>&1; then
+  # INLINE degraded guard (see the contract comment above npm()): the
+  # impl and cleanup helpers can be stripped by shell snapshots, so the
+  # public wrapper must refuse legibly on its own (delta-9 finding N4).
+  if ! typeset -f composer_impl safe_install_composer_packages safe_install_check >/dev/null 2>&1; then
     local __a
     for __a in "$@"; do
       case "${__a}" in
@@ -1766,6 +1796,24 @@ composer_impl() {
     done
     command composer "$@"; return $?
   fi
+  # Scanned target state (possibly credential-bearing) is cleared on EVERY
+  # exit of a scanning route — project scans, parser fallbacks, unsupported
+  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
+  # cleanup tied only to check_many missed the project-install paths).
+  {
+    composer_impl "$@"
+  } always {
+    # Inline assignments — a cleanup HELPER could itself be stripped by a
+    # partial shell snapshot (delta-9 finding N4).
+    SAFE_INSTALL_DIST_TAG=""
+    SAFE_INSTALL_REGISTRY=""
+    SAFE_INSTALL_PROJECT_DIR=""
+    SAFE_INSTALL_NPM_USERCONFIG=""
+    SAFE_INSTALL_NPM_GLOBALCONFIG=""
+  }
+}
+
+composer_impl() {
   safe_install_route composer "$@" || return $?
   safe_install_scan_target_flags composer "$@"
   local first="${SAFE_INSTALL_SUBCMD}"
