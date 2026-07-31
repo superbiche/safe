@@ -46,6 +46,12 @@ write_safe_audit_stub() {
 
   cat > "${bin_dir}/safe-audit" <<'STUB'
 #!/usr/bin/env bash
+# effective-sources is local-only plumbing the stale readers depend on:
+# forward it to the REAL implementation so the tests exercise the real
+# source-identity derivation (delta-4 findings 3.2/N1).
+if [[ "${1:-}" == "effective-sources" ]]; then
+  exec "${ROOT_DIR}/bin/safe-audit" "$@"
+fi
 {
   printf 'AUDIT'
   for arg in "$@"; do
@@ -1238,6 +1244,16 @@ case_pip_cumulative_sources_all_reach_audit() {
   pass "$FUNCNAME"
 }
 
+case_npm_repeated_registry_keeps_true_last() {
+  prepare_case "npm-repeated-registry-last"
+  # npm is last-wins: A B A means npm installs from A. Deduplication must
+  # move the repeat to the END so the resolver's last-word read matches
+  # npm's choice (delta-4 finding 3.1).
+  SAFE_INSTALL_TEST_SCRIPT='npm install -g --registry https://a.example --registry https://b.example --registry https://a.example okpkg@1.0.0' run_zsh
+  assert_log_contains $'AUDIT\tcheck\tokpkg@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--registry\thttps://b.example https://a.example' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_stale_evidence_is_source_scoped() {
   prepare_case "stale-evidence-source-scoped"
   mkdir -p "${HOME_DIR}/.config/safe/run"
@@ -1395,6 +1411,7 @@ main() {
     case_go_parser \
     case_composer_parser \
     case_pip_cumulative_sources_all_reach_audit \
+    case_npm_repeated_registry_keeps_true_last \
     case_stale_evidence_is_source_scoped \
     case_install_idempotent_no_wrappers \
     case_install_idempotent_with_completions \

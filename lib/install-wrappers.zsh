@@ -59,13 +59,23 @@ safe_install_run_audit() {
 # values into the audit; safe-audit resolves with them or fails closed.
 # Source selectors are cumulative (pip considers --find-links AND the index):
 # accumulate every one — a later trusted selector must never erase an earlier
-# untrusted one (PR#29 delta-2 finding 3).
+# untrusted one (PR#29 delta-2 finding 3). A REPEATED selector moves to the
+# END: npm options are last-wins, and the resolver reads the last word to
+# audit what npm actually fetches (delta-4 finding 3.1) — the trust sweep is
+# order-independent, so the move is safe for cumulative families too.
+# Trailing slashes normalize away so writer and readers derive identical
+# source identities (delta-4 finding N1).
 safe_install_add_source() {
   local value="$1"
-  case " ${SAFE_INSTALL_REGISTRY} " in
-    *" ${value} "*) return 0 ;;
-  esac
-  SAFE_INSTALL_REGISTRY="${SAFE_INSTALL_REGISTRY:+${SAFE_INSTALL_REGISTRY} }${value}"
+  while [[ "${value}" == */ ]]; do value="${value%/}"; done
+  [[ -n "${value}" ]] || return 0
+  local -a kept=()
+  local w
+  for w in ${=SAFE_INSTALL_REGISTRY}; do
+    [[ "${w}" == "${value}" ]] || kept+=("${w}")
+  done
+  kept+=("${value}")
+  SAFE_INSTALL_REGISTRY="${kept[*]}"
 }
 
 safe_install_scan_target_flags() {
@@ -174,34 +184,18 @@ safe_install_known_matches() {
 
   # Only fully clean GO evidence may satisfy the offline fallback — a
   # tolerated-WARN record is not clean evidence (PR#29 review finding 5).
-  # Source identity is discriminated (implicit-default vs explicit:<set>) so
-  # a literal selector spelled "default" never collides with the sentinel
-  # (delta-3 finding 5); it mirrors safe-audit's derivation, including the
-  # env/.npmrc-configured npm source that argv scanning cannot see (delta-3
-  # finding 3.2). Legacy source-less receipts map to implicit-default only.
-  local src_set="${SAFE_INSTALL_REGISTRY:-}"
-  if [[ "${ecosystem}" == "npm" && -z "${src_set}" ]]; then
-    local npm_src="${NPM_CONFIG_REGISTRY:-}"
-    if [[ -n "${npm_src}" ]]; then
-      npm_src="${npm_src%/}"
-    else
-      local rc_file rc_line
-      for rc_file in ./.npmrc "${HOME}/.npmrc"; do
-        [[ -f "${rc_file}" ]] || continue
-        rc_line="$(command grep -E '^[[:space:]]*registry[[:space:]]*=' "${rc_file}" 2>/dev/null | command tail -n 1 || true)"
-        if [[ -n "${rc_line}" ]]; then
-          npm_src="${rc_line#*=}"
-          npm_src="${npm_src//[[:space:]]/}"
-          while [[ "${npm_src}" == */ ]]; do npm_src="${npm_src%/}"; done
-          break
-        fi
-      done
-    fi
-    [[ "${npm_src}" == "https://registry.npmjs.org" ]] && npm_src=""
-    src_set="${npm_src}"
-  fi
-  local current_source="implicit-default"
-  [[ -n "${src_set}" ]] && current_source="explicit:${src_set}"
+  # The source identity (implicit-default vs explicit:<set>, delta-3
+  # finding 5) must be byte-identical to what safe-audit's receipt writer
+  # recorded; the derivation (argv + env + rc precedence, per ecosystem) is
+  # centralized in safe-audit — ask it instead of mirroring (delta-4
+  # findings 3.2 and N1). Local-only plumbing, no network. No identity ->
+  # fail closed: stale evidence never applies without a trustworthy match.
+  local -a es_args=("${name}" --ecosystem "${ecosystem}")
+  [[ -n "${SAFE_INSTALL_REGISTRY:-}" ]] && es_args+=(--registry "${SAFE_INSTALL_REGISTRY}")
+  [[ -n "${SAFE_INSTALL_PROJECT_DIR:-}" ]] && es_args+=(--project-dir "${SAFE_INSTALL_PROJECT_DIR}")
+  local current_source
+  current_source="$(command safe audit effective-sources "${es_args[@]}" 2>/dev/null)" || return 1
+  [[ -n "${current_source}" ]] || return 1
   entry="$(jq -r --arg k "${ecosystem}:${name}" --arg v "${version}" --arg src "${current_source}" \
     '.packages[$k] | select(.version == $v and .verdict == "GO" and ((.source // "implicit-default") == $src)) | .first_allowed // empty' "${known_file}" 2>/dev/null || true)"
   [[ -n "${entry}" ]] || return 1

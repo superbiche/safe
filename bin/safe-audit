@@ -3773,17 +3773,23 @@ registry_is_trusted() {
   return 1
 }
 
+# Full SemVer 2.0.0 grammar for the semver ecosystems: no leading zeros in
+# core or numeric prerelease identifiers, no empty dot-separated identifiers
+# — npm/cargo/composer selectors reject those outright, so accepting them
+# here would audit a version the manager never installs (delta-4 finding 4).
+SEMVER_STRICT_RE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+
 version_is_exact() {
   local ecosystem="$1" version="$2"
   case "$ecosystem" in
     npm|rust|php)
-      [[ "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-][0-9A-Za-z.-]+)?([+][0-9A-Za-z.-]+)?$ ]]
+      [[ "${version#v}" =~ $SEMVER_STRICT_RE ]]
       ;;
     python)
       [[ "$version" =~ ^[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?$ ]]
       ;;
     go)
-      [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-][0-9A-Za-z.-]+)?([+][0-9A-Za-z.-]+)?$ ]]
+      [[ "$version" == v* && "${version#v}" =~ $SEMVER_STRICT_RE ]]
       ;;
     *)
       [[ "$version" =~ ^v?[0-9]+(\.[0-9]+)+$ ]]
@@ -3791,23 +3797,81 @@ version_is_exact() {
   esac
 }
 
+strip_trailing_slashes() {
+  local v="$1"
+  while [[ "$v" == */ ]]; do v="${v%/}"; done
+  printf '%s' "$v"
+}
+
+# Canonicalize a space-separated source set: strip trailing slashes per
+# element and keep the LAST occurrence of a repeated element — npm options
+# are last-wins, so ordering carries meaning for resolution while the trust
+# sweep stays order-independent (delta-4 findings 3.1 and N1: writer and
+# readers must derive byte-identical identities for the same invocation).
+normalize_source_set() {
+  local out="" w x kept
+  for w in $1; do
+    w=$(strip_trailing_slashes "$w")
+    [[ -n "$w" ]] || continue
+    kept=""
+    for x in $out; do
+      [[ "$x" == "$w" ]] || kept="${kept:+$kept }$x"
+    done
+    out="${kept:+$kept }$w"
+  done
+  printf '%s' "$out"
+}
+
 npm_registry_url() {
-  # Explicit --registry from the audited command line wins: auditing the
-  # default registry while npm installs from another one audits the wrong
-  # artifact (PR#29 review finding 3). npm options are LAST-wins — with
-  # repeated --registry flags npm fetches from the final one, so resolving
-  # any other source audits an artifact npm does not install (delta-3
+  local name="${1:-${PKG_NAME:-}}"
+  # A scope-specific registry beats every generic source INCLUDING an
+  # explicit --registry: npm resolves the @scope:registry config KEY, which
+  # argv never sets, so a scoped package routes to it regardless of the
+  # command line (delta-4 finding 3.2). Env first (both case forms npm
+  # accepts), then project/user .npmrc.
+  local scope=""
+  [[ "$name" == @*/* ]] && scope="${name%%/*}"
+  if [[ -n "$scope" ]]; then
+    local scoped_src
+    scoped_src=$(printenv "npm_config_${scope}:registry" 2>/dev/null || true)
+    [[ -n "$scoped_src" ]] || scoped_src=$(printenv "NPM_CONFIG_${scope}:registry" 2>/dev/null || true)
+    if [[ -z "$scoped_src" ]]; then
+      local rc line scope_re="${scope//./\\.}"
+      for rc in "${CHECK_PROJECT_DIR:-.}/.npmrc" "$HOME/.npmrc"; do
+        [[ -f "$rc" ]] || continue
+        line=$(grep -E "^[[:space:]]*${scope_re}:registry[[:space:]]*=" "$rc" 2>/dev/null | tail -n 1 || true)
+        if [[ -n "$line" ]]; then
+          scoped_src=$(trim "${line#*=}")
+          break
+        fi
+      done
+    fi
+    if [[ -n "$scoped_src" ]]; then
+      strip_trailing_slashes "$scoped_src"
+      return 0
+    fi
+  fi
+  # Explicit --registry from the audited command line wins over env/rc:
+  # auditing the default registry while npm installs from another one audits
+  # the wrong artifact (PR#29 review finding 3). npm options are LAST-wins —
+  # with repeated --registry flags npm fetches from the final one (delta-3
   # finding 3.1); the custom-source floor still checks every seen selector.
   if [[ -n "${CHECK_REGISTRY:-}" ]]; then
     local last_src="" src_word
     for src_word in ${CHECK_REGISTRY}; do
       last_src="$src_word"
     done
-    printf '%s' "${last_src%/}"
+    strip_trailing_slashes "$last_src"
     return 0
   fi
+  # npm reads its config environment case-insensitively; the lowercase form
+  # is the canonical one npm itself emits (delta-4 finding 3.2).
   if [[ -n "${NPM_CONFIG_REGISTRY:-}" ]]; then
-    printf '%s' "${NPM_CONFIG_REGISTRY%/}"
+    strip_trailing_slashes "$NPM_CONFIG_REGISTRY"
+    return 0
+  fi
+  if [[ -n "${npm_config_registry:-}" ]]; then
+    strip_trailing_slashes "$npm_config_registry"
     return 0
   fi
   local rc line
@@ -3820,6 +3884,95 @@ npm_registry_url() {
     fi
   done
   printf 'https://registry.npmjs.org'
+}
+
+# Recognized python source controls outside argv: pip/uv environment
+# variables plus the pip config files pip itself merges (PIP_CONFIG_FILE,
+# then venv, then user; index-url is last-wins per file precedence,
+# extra-index-url accumulates). uv.toml / pyproject [tool.uv] index tables
+# and system-level /etc pip.conf are NOT swept: TOML parsing on one side,
+# operator-owned machine state on the other — argv + env + these files are
+# the surfaces a hostile project or environment can silently inject
+# (delta-4 finding 3.2).
+python_env_sources() {
+  local out="" v
+  for v in ${PIP_INDEX_URL:-} ${PIP_EXTRA_INDEX_URL:-} ${UV_DEFAULT_INDEX:-} ${UV_INDEX_URL:-} ${UV_INDEX:-}; do
+    out="${out:+$out }$v"
+  done
+  local rc line
+  if [[ -z "${PIP_INDEX_URL:-}" ]]; then
+    for rc in ${PIP_CONFIG_FILE:-} ${VIRTUAL_ENV:+${VIRTUAL_ENV}/pip.conf} "$HOME/.config/pip/pip.conf" "$HOME/.pip/pip.conf"; do
+      [[ -f "$rc" ]] || continue
+      line=$(grep -E '^[[:space:]]*index-url[[:space:]]*=' "$rc" 2>/dev/null | tail -n 1 || true)
+      if [[ -n "$line" ]]; then
+        out="${out:+$out }$(trim "${line#*=}")"
+        break
+      fi
+    done
+  fi
+  for rc in ${PIP_CONFIG_FILE:-} ${VIRTUAL_ENV:+${VIRTUAL_ENV}/pip.conf} "$HOME/.config/pip/pip.conf" "$HOME/.pip/pip.conf"; do
+    [[ -f "$rc" ]] || continue
+    while IFS= read -r line; do
+      out="${out:+$out }$(trim "${line#*=}")"
+    done < <(grep -E '^[[:space:]]*extra-index-url[[:space:]]*=' "$rc" 2>/dev/null || true)
+  done
+  printf '%s' "$out"
+}
+
+# GOPROXY is a comma/pipe-separated fallback chain; anything that is not
+# the public proxy or a keyword changes where modules come from.
+go_env_sources() {
+  local out="" part proxy="${GOPROXY:-}"
+  for part in ${proxy//[,|]/ }; do
+    case "$part" in
+      https://proxy.golang.org|https://proxy.golang.org/|direct|off) ;;
+      *) out="${out:+$out }$part" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# Effective sources for this check: the normalized argv set plus manager
+# sources that act outside argv (env, rc files). Computed on EVERY check —
+# exact-pin resolution shortcuts must not skip the trust floor (delta-3/4
+# finding 3.2). This is the single derivation behind the trust floor, the
+# receipt writer, and (via the effective-sources plumbing command) every
+# stale-evidence reader; sweeping surfaces we cannot represent (cargo
+# config.toml registries, composer.json repositories declared by the
+# project itself, yarn/bun native config) stays out by design — those
+# either require argv selectors we already scan or are operator-committed
+# project architecture, not injectable state.
+derive_effective_sources() {
+  local ecosystem="$1" name="$2"
+  local extra=""
+  CHECK_EFFECTIVE_SOURCES=$(normalize_source_set "${CHECK_REGISTRY:-}")
+  case "$ecosystem" in
+    npm) extra=$(npm_registry_url "$name") ;;
+    python) extra=$(python_env_sources) ;;
+    go) extra=$(go_env_sources) ;;
+  esac
+  local w
+  for w in $extra; do
+    w=$(strip_trailing_slashes "$w")
+    [[ -n "$w" ]] || continue
+    # The ecosystem default never makes an identity explicit.
+    case "${ecosystem}:${w}" in
+      npm:https://registry.npmjs.org) continue ;;
+      python:https://pypi.org|python:https://pypi.org/simple) continue ;;
+    esac
+    case " ${CHECK_EFFECTIVE_SOURCES} " in
+      *" ${w} "*) : ;;
+      *) CHECK_EFFECTIVE_SOURCES="${CHECK_EFFECTIVE_SOURCES:+${CHECK_EFFECTIVE_SOURCES} }${w}" ;;
+    esac
+  done
+}
+
+source_identity() {
+  if [[ -n "${CHECK_EFFECTIVE_SOURCES:-}" ]]; then
+    printf 'explicit:%s' "$CHECK_EFFECTIVE_SOURCES"
+  else
+    printf 'implicit-default'
+  fi
 }
 
 # Desugar one npm range token (^1.2.3, ~1.2, >=1.0.0, 1.x, 1.2, 2, =1.0.0)
@@ -3966,10 +4119,12 @@ npm_max_satisfying() {
   jq -r --argjson cons "$constraints" "
     $JQ_VSEMVER
     # Packument keys and dist-tags are registry-writable data: only strict
-    # SemVer participates in selection, matching npm's own selector, which
-    # rejects malformed versions like \"0e0.0.0\" outright (delta-3 finding 4).
+    # full-grammar SemVer participates in selection, matching npm's own
+    # selector, which rejects malformed cores (\"0e0.0.0\") AND malformed
+    # prereleases — leading-zero numeric identifiers (\"1.0.0-01\") and
+    # empty identifiers (\"1.0.0-alpha..1\") — outright (delta-4 finding 4).
     def semver_ok:
-      test(\"^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)([-][0-9A-Za-z.-]+)?([+][0-9A-Za-z.-]+)?\$\");
+      test(\"^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)([-](0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)([.](0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?([+][0-9A-Za-z-]+([.][0-9A-Za-z-]+)*)?\$\");
     def satisfies(\$ver):
       all(\$cons[];
         . as \$c |
@@ -4105,7 +4260,7 @@ resolve_npm_versions() {
   if npm_overrides_mention "$name"; then
     return 1
   fi
-  registry=$(npm_registry_url)
+  registry=$(npm_registry_url "$name")
   packument="$scratch/packument.json"
   enc_name="${name//\//%2F}"
   curl -fsS --max-time 5 -H 'Accept: application/vnd.npm.install-v1+json' \
@@ -4311,13 +4466,10 @@ mark_install_known() {
   # (delta-2 finding 5). Discriminated identity: a literal selector spelled
   # "default" (cargo named registries) must never collide with the
   # implicit-default sentinel (delta-3 finding 5). Legacy receipts with no
-  # source field map to implicit-default only.
-  local source_set="${CHECK_EFFECTIVE_SOURCES:-${CHECK_REGISTRY:-}}"
-  if [[ -n "$source_set" ]]; then
-    source_id="explicit:${source_set}"
-  else
-    source_id="implicit-default"
-  fi
+  # source field map to implicit-default only. CHECK_EFFECTIVE_SOURCES was
+  # derived at the trust floor; the same identity is served to the stale
+  # readers by the effective-sources plumbing command (delta-4 finding N1).
+  source_id=$(source_identity)
   mkdir -p "$SAFE_RUN_CONFIG_DIR"
   [[ -f "$INSTALL_KNOWN_FILE" ]] || printf '{"packages":{}}\n' > "$INSTALL_KNOWN_FILE"
   tmp=$(mktemp)
@@ -4353,6 +4505,55 @@ host_allow_matches_resolved() {
     [[ "$v" == "$entry_version" ]] && { HOST_ALLOW_RESOLVED_VERSION="$entry_version"; return 0; }
   done
   return 1
+}
+
+# Plumbing for the stale-evidence readers (install wrappers, bin/safe,
+# gate-lib): print the discriminated source identity this invocation would
+# audit under. Local-only — env + rc files, no network. Keeping the readers
+# on this single derivation is what prevents writer/reader identity drift
+# (delta-4 findings 3.2 and N1).
+effective_sources_command() {
+  local ecosystem="" spec=""
+  local CHECK_DIST_TAG="" CHECK_REGISTRY="" CHECK_PROJECT_DIR=""
+  local CHECK_EFFECTIVE_SOURCES=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ecosystem)
+        [[ $# -lt 2 ]] && die "--ecosystem requires a value"
+        ecosystem="$2"
+        shift 2
+        ;;
+      --registry)
+        [[ $# -lt 2 ]] && die "--registry requires a value"
+        CHECK_REGISTRY="$2"
+        shift 2
+        ;;
+      --project-dir)
+        [[ $# -lt 2 ]] && die "--project-dir requires a value"
+        CHECK_PROJECT_DIR="$2"
+        [[ "$CHECK_PROJECT_DIR" == -* ]] && CHECK_PROJECT_DIR="./${CHECK_PROJECT_DIR}"
+        shift 2
+        ;;
+      -*)
+        die "unknown effective-sources flag: $1"
+        ;;
+      *)
+        spec="$1"
+        shift
+        ;;
+    esac
+  done
+  [[ -z "$spec" ]] && die "usage: safe audit effective-sources <pkg> [--ecosystem <name>] [--registry <set>] [--project-dir <dir>]"
+  parse_pkg_spec "$spec"
+  [[ -z "$ecosystem" ]] && ecosystem=$(guess_ecosystem_from_spec "$spec")
+  case "$ecosystem" in
+    cargo) ecosystem="rust" ;;
+    composer) ecosystem="php" ;;
+    pip|pypi|uv) ecosystem="python" ;;
+  esac
+  derive_effective_sources "$ecosystem" "$PKG_NAME"
+  source_identity
+  printf '\n'
 }
 
 check_command() {
@@ -4587,24 +4788,14 @@ check_command() {
   # 3). CHECK_REGISTRY may carry MULTIPLE space-separated sources (pip/uv
   # selectors are cumulative — a later trusted selector must never erase an
   # earlier untrusted one, delta-2 finding 3): every source must be trusted.
-  # For npm the EFFECTIVE source can also come from NPM_CONFIG_REGISTRY or a
-  # project/user .npmrc with no argv selector at all, and exact pins skip
-  # resolution entirely — so the effective source is computed here on every
-  # check (env + npmrc read only, no network; delta-3 finding 3.2).
-  # Operator escape hatches: install.trusted_registries, or a pinned
-  # host-allow.
+  # The EFFECTIVE source can also come from env/rc config with no argv
+  # selector at all (npm: NPM_CONFIG_REGISTRY/.npmrc incl. scoped keys;
+  # python: pip/uv env + pip.conf; go: GOPROXY), and exact pins skip
+  # resolution entirely — so it is derived here on every check (env + rc
+  # read only, no network; delta-3/4 finding 3.2). Operator escape hatches:
+  # install.trusted_registries, or a pinned host-allow.
   local custom_source=0 check_src
-  CHECK_EFFECTIVE_SOURCES="${CHECK_REGISTRY:-}"
-  if [[ "$ecosystem" == "npm" ]]; then
-    local npm_effective
-    npm_effective=$(npm_registry_url)
-    if [[ -n "$npm_effective" && "$npm_effective" != "https://registry.npmjs.org" ]]; then
-      case " ${CHECK_EFFECTIVE_SOURCES} " in
-        *" ${npm_effective} "*) : ;;
-        *) CHECK_EFFECTIVE_SOURCES="${CHECK_EFFECTIVE_SOURCES:+${CHECK_EFFECTIVE_SOURCES} }${npm_effective}" ;;
-      esac
-    fi
-  fi
+  derive_effective_sources "$ecosystem" "$PKG_NAME"
   for check_src in ${CHECK_EFFECTIVE_SOURCES}; do
     if ! registry_is_trusted "$check_src" "$ecosystem"; then
       custom_source=1
@@ -6960,6 +7151,11 @@ main() {
     capabilities)
       shift
       capabilities_command "$@"
+      return 0
+      ;;
+    effective-sources)
+      shift
+      effective_sources_command "$@"
       return 0
       ;;
   esac

@@ -1148,5 +1148,220 @@ if expect_status 10 "a literal 'default' selector is an untrusted explicit sourc
 fi
 
 # ---------------------------------------------------------------------------
+# 41. Lowercase npm_config_registry is as effective as the uppercase form
+#     (delta-4 finding 3.2)
+# ---------------------------------------------------------------------------
+prepare_case env-registry-lowercase
+fixture="$(osv_fixture_empty)"
+run_check \
+  npm_config_registry=https://evil.example \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 10 "lowercase npm_config_registry floors an exact pin at WARN"; then
+  pass "lowercase npm_config_registry floors an exact pin at WARN"
+fi
+
+# ---------------------------------------------------------------------------
+# 42. A scoped @scope:registry .npmrc key routes the scoped package to a
+#     custom registry — it must reach the floor even beside argv selectors
+#     (delta-4 finding 3.2)
+# ---------------------------------------------------------------------------
+prepare_case scoped-registry-floor
+printf '@demo:registry=https://scoped.example\n' > "$CASE_PROJECT/.npmrc"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- @demo/pkg@1.2.3 --ecosystem npm --gate install
+if expect_status 10 "a scoped .npmrc registry floors the scoped package"; then
+  pass "a scoped .npmrc registry floors the scoped package"
+fi
+: > "$CASE_DIR/stderr.log"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- @demo/pkg@1.2.3 --ecosystem npm --registry https://registry.npmjs.org --gate install
+if expect_status 10 "the scoped key floors even beside a trusted argv selector"; then
+  pass "the scoped key floors even beside a trusted argv selector"
+fi
+
+# ---------------------------------------------------------------------------
+# 43. Malformed PRERELEASE identifiers never win selection either: npm
+#     rejects leading-zero numeric identifiers like 1.0.0-01
+#     (delta-4 finding 4)
+# ---------------------------------------------------------------------------
+prepare_case malformed-prerelease
+cat > "$FIXTURES/packument-pre01.json" <<'JSON'
+{
+  "dist-tags": {"latest": "1.0.0-01"},
+  "versions": {"1.0.0-01": {}, "1.0.0": {}}
+}
+JSON
+printf '{"dependencies": {"demo-pkg": "<=1.0.0"}}\n' > "$CASE_PROJECT/package.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument-pre01.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- demo-pkg --ecosystem npm --op update --gate install
+if expect_status 0 "a leading-zero prerelease candidate is excluded"; then
+  pass "a leading-zero prerelease candidate is excluded"
+fi
+if expect_grep "$OUT_FILE" 'Resolved:.*1\.0\.0' "npm-oracle: the valid version npm installs is audited"; then
+  pass "npm-oracle: the valid version npm installs is audited"
+fi
+if expect_no_grep "$OUT_FILE" '1\.0\.0-01' "the malformed prerelease is never the target"; then
+  pass "the malformed prerelease is never the target"
+fi
+prepare_case malformed-prerelease-tag
+cat > "$FIXTURES/packument-pre01-only.json" <<'JSON'
+{
+  "dist-tags": {"latest": "1.0.0-01"},
+  "versions": {"1.0.0-01": {}}
+}
+JSON
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument-pre01-only.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- demo-pkg --ecosystem npm --gate install
+if expect_status 10 "a malformed prerelease dist-tag target degrades"; then
+  pass "a malformed prerelease dist-tag target degrades"
+fi
+
+# ---------------------------------------------------------------------------
+# 44. version_is_exact enforces full SemVer grammar (unit-level)
+# ---------------------------------------------------------------------------
+if (
+  SAFE_AUDIT_NO_INIT=1
+  # shellcheck source=/dev/null
+  source "$TEST_ROOT/audit-lib.sh" >/dev/null 2>&1
+  for bad in 1.0.0-01 01.0.0 1.0.0-alpha..1 1.0.0-.alpha 1.0.0-alpha. 0e0.0.0; do
+    ! version_is_exact npm "$bad" || exit 1
+  done
+  for good in 1.0.0 1.0.0-alpha.1 1.0.0-0 1.0.0+build.1 v1.0.0-rc.1+meta.2; do
+    version_is_exact npm "$good" || exit 1
+  done
+  version_is_exact go v1.2.3 || exit 1
+  ! version_is_exact go 1.2.3 || exit 1
+); then
+  pass "version_is_exact enforces full SemVer grammar"
+else
+  fail "version_is_exact enforces full SemVer grammar"
+fi
+
+# ---------------------------------------------------------------------------
+# 45. effective-sources plumbing: single derivation for readers
+#     (delta-4 findings 3.2 and N1)
+# ---------------------------------------------------------------------------
+prepare_case effective-sources-plumbing
+run_es() {
+  (
+    cd "$CASE_PROJECT" || exit 99
+    env \
+      HOME="$CASE_HOME" \
+      PATH="$MOCKBIN:/usr/bin:/bin" \
+      SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" \
+      SAFE_AUDIT_CONFIG_DIR="$CASE_DIR/audit-config" \
+      SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
+      "$@" \
+      "$SAFE_AUDIT" effective-sources "${ES_ARGS[@]}"
+  )
+}
+ES_ARGS=(okpkg --ecosystem npm)
+if [[ "$(run_es)" == "implicit-default" ]]; then
+  pass "plumbing: no sources -> implicit-default"
+else
+  fail "plumbing: no sources -> implicit-default"
+fi
+ES_ARGS=(okpkg --ecosystem npm --registry 'https://a.example/ https://a.example')
+if [[ "$(run_es)" == "explicit:https://a.example" ]]; then
+  pass "plumbing: trailing slashes and repeats canonicalize (N1)"
+else
+  fail "plumbing: trailing slashes and repeats canonicalize (N1)"
+fi
+ES_ARGS=(okpkg --ecosystem npm --registry 'https://a.example https://b.example https://a.example')
+if [[ "$(run_es)" == "explicit:https://b.example https://a.example" ]]; then
+  pass "plumbing: a repeated selector keeps its LAST position (3.1)"
+else
+  fail "plumbing: a repeated selector keeps its LAST position (3.1)"
+fi
+ES_ARGS=(okpkg --ecosystem npm)
+if [[ "$(run_es NPM_CONFIG_REGISTRY=https://mirror.example/)" == "explicit:https://mirror.example" ]]; then
+  pass "plumbing: env registry becomes an explicit identity"
+else
+  fail "plumbing: env registry becomes an explicit identity"
+fi
+ES_ARGS=(okpkg --ecosystem cargo --registry default)
+if [[ "$(run_es)" == "explicit:default" ]]; then
+  pass "plumbing: a literal default selector stays explicit"
+else
+  fail "plumbing: a literal default selector stays explicit"
+fi
+
+# ---------------------------------------------------------------------------
+# 46. Receipt identity is canonicalized: a trailing-slash argv selector and
+#     its slashless twin are the same source (delta-4 finding N1)
+# ---------------------------------------------------------------------------
+prepare_case receipt-canonical
+printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --registry https://mirror.example/ --gate install
+if expect_status 0 "trailing-slash trusted mirror gates GO"; then
+  pass "trailing-slash trusted mirror gates GO"
+fi
+if jq -e '.packages["npm:brace-expansion"].source == "explicit:https://mirror.example"' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "receipt identity is slash-canonical"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2
+  fail "receipt identity is slash-canonical"
+fi
+
+# ---------------------------------------------------------------------------
+# 47. Sibling manager env sources reach the floor: PIP_INDEX_URL and GOPROXY
+#     (delta-4 finding 3.2)
+# ---------------------------------------------------------------------------
+prepare_case pip-env-floor
+fixture="$(osv_fixture_empty)"
+run_check \
+  PIP_INDEX_URL=https://evil.example/simple \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 10 "PIP_INDEX_URL floors an exact python pin at WARN"; then
+  pass "PIP_INDEX_URL floors an exact python pin at WARN"
+fi
+prepare_case goproxy-floor
+run_check \
+  GOPROXY='https://corp.example,direct' \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- golang.org/x/tools@v0.1.0 --ecosystem go --gate install
+if expect_status 10 "a custom GOPROXY floors a go pin at WARN"; then
+  pass "a custom GOPROXY floors a go pin at WARN"
+fi
+
+# ---------------------------------------------------------------------------
+# 48. A trusted pip mirror stays frictionless (UX preservation for 3.2)
+# ---------------------------------------------------------------------------
+prepare_case pip-env-trusted
+printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  PIP_INDEX_URL=https://mirror.example/simple \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 0 "a trusted pip mirror gates GO without friction"; then
+  pass "a trusted pip mirror gates GO without friction"
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
