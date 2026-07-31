@@ -177,7 +177,7 @@ gate_wrapper_marked() {
   # shell variable made bash emit "ignored null byte in input" warnings from
   # status/doctor/install (PR#30 round regression R1). Same exact whole-line
   # test, no capture.
-  LC_ALL=C sed -n '2p' "$path" 2>/dev/null \
+  LC_ALL=C sed -n '2p' -- "$path" 2>/dev/null \
     | LC_ALL=C grep -qxF -- "# safe-gate-wrapper v1 tool=${tool}"
 }
 

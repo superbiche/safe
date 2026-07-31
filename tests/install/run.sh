@@ -35,6 +35,14 @@ tool="$(basename -- "$0")"
     printf '\t%s' "${arg}"
   done
   printf '\n'
+  # Any source-set variable reaching the delegated tool's environment is a
+  # credential leak: the gate accumulates them, the real tool must never see
+  # them. Logged only when non-empty so existing assertions are unaffected.
+  for leak in SAFE_GATE_REGISTRY SAFE_INSTALL_REGISTRY SAFE_GATE_NPM_USERCONFIG; do
+    if [[ -n "${!leak:-}" ]]; then
+      printf 'ENVLEAK\t%s=%s\n' "${leak}" "${!leak}"
+    fi
+  done
 } >> "${SAFE_INSTALL_COMMAND_LOG}"
 exit "${SAFE_INSTALL_REAL_STATUS:-0}"
 STUB
@@ -1535,17 +1543,28 @@ case_npm_scoped_and_userconfig_sources_reach_audit() {
   pass "$FUNCNAME"
 }
 
-case_wrapper_state_cleared_after_gate() {
-  prepare_case "wrapper-state-cleared"
-  # A long-lived interactive shell must not retain the scanned source set
-  # (possibly credential-bearing) after the gate decision (delta-7 N2).
-  SAFE_INSTALL_TEST_SCRIPT='npm install --registry https://alice:sekret@mirror.example okpkg@1.0.0; print -r -u2 -- "POST_REG=[${SAFE_INSTALL_REGISTRY:-}][${SAFE_INSTALL_NPM_USERCONFIG:-}]"' run_zsh
-  assert_err_contains_fragment 'POST_REG=[][]' "$FUNCNAME" || return
+case_gate_never_leaks_sources_to_the_real_tool() {
+  prepare_case "gate-no-source-leak"
+  # The zsh suite asserts the wrapper CLEARS SAFE_INSTALL_REGISTRY after the
+  # gate, because a long-lived interactive shell would otherwise retain a
+  # credential-bearing set (delta-7 N2 / delta-8 N2). Gate mode has no such
+  # state to clear — the scan happens inside the `safe gate` process, which
+  # exits — so that assertion is structurally unfalsifiable here and was
+  # passing vacuously after the merge. The equivalent live risk on this
+  # branch is the set reaching the DELEGATED tool's environment, which the
+  # stub reports as ENVLEAK.
+  SAFE_INSTALL_TEST_SCRIPT='npm install --registry https://alice:sekret@mirror.example okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tinstall\t--registry\thttps://alice:sekret@mirror.example\tokpkg@1.0.0' "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'ENVLEAK' "$FUNCNAME" || return
 
-  # The PROJECT-install route (no positional packages) scans too and must
-  # clear equally — cleanup tied to check_many missed it (delta-8 N2).
-  SAFE_INSTALL_TEST_SCRIPT='npm install --registry https://alice:sekret@mirror.example; print -r -u2 -- "POST_PROJ=[${SAFE_INSTALL_REGISTRY:-}]"' run_zsh
-  assert_err_contains_fragment 'POST_PROJ=[]' "$FUNCNAME" || return
+  # The project-install route (no positional package) scans too.
+  SAFE_INSTALL_TEST_SCRIPT='npm install --registry https://alice:sekret@mirror.example' run_zsh
+  assert_log_not_contains_fragment 'ENVLEAK' "$FUNCNAME" || return
+
+  # And the credential must not reach the calling shell either.
+  SAFE_INSTALL_TEST_SCRIPT='npm install --registry https://alice:sekret@mirror.example okpkg@1.0.0; print -r -u2 -- "POST=[${SAFE_GATE_REGISTRY:-}][${SAFE_INSTALL_REGISTRY:-}]"' run_zsh
+  assert_err_contains_fragment 'POST=[][]' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -1725,7 +1744,7 @@ main() {
     case_pip_cumulative_sources_all_reach_audit \
     case_npm_scoped_and_userconfig_sources_reach_audit \
     case_source_credentials_preserved_for_audit \
-    case_wrapper_state_cleared_after_gate \
+    case_gate_never_leaks_sources_to_the_real_tool \
     case_npm_repeated_registry_keeps_true_last \
     case_stale_evidence_is_source_scoped \
     case_install_idempotent_no_wrappers \

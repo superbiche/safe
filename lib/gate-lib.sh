@@ -23,6 +23,8 @@ SAFE_GATE_SUBCMD_IDX=0
 SAFE_GATE_SUBCMD_BADFLAG=""
 SAFE_GATE_GVAL=""
 SAFE_GATE_GBOOL=""
+SAFE_GATE_NPM_USERCONFIG=""
+SAFE_GATE_NPM_GLOBALCONFIG=""
 
 safe_gate_err() {
   printf '%s\n' "$*" >&2
@@ -163,6 +165,8 @@ safe_gate_run_audit() {
   [[ -n "${SAFE_GATE_DIST_TAG:-}" ]] && extra+=(--dist-tag "${SAFE_GATE_DIST_TAG}")
   [[ -n "${SAFE_GATE_REGISTRY:-}" ]] && extra+=(--registry "${SAFE_GATE_REGISTRY}")
   [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]] && extra+=(--project-dir "${SAFE_GATE_PROJECT_DIR}")
+  [[ -n "${SAFE_GATE_NPM_USERCONFIG:-}" ]] && extra+=(--npm-userconfig "${SAFE_GATE_NPM_USERCONFIG}")
+  [[ -n "${SAFE_GATE_NPM_GLOBALCONFIG:-}" ]] && extra+=(--npm-globalconfig "${SAFE_GATE_NPM_GLOBALCONFIG}")
   if command -v timeout >/dev/null 2>&1; then
     timeout "${SAFE_GATE_TIMEOUT_SECONDS}" "${SAFE_GATE_AUDIT_BIN}" check "$@" "${extra[@]}"
     rc=$?
@@ -184,6 +188,10 @@ safe_gate_run_audit() {
 safe_gate_add_source() {
   local value="$1"
   while [[ "${value}" == */ ]]; do value="${value%/}"; done
+  # The accumulated set stays OPERATIONAL (credentials included): safe-audit
+  # fetches packuments from it, and pre-redacting here broke authenticated
+  # registries (PR#29 delta-6 finding N2). Redaction happens centrally in
+  # safe-audit at every identity/receipt/display sink — never here.
   [[ -n "${value}" ]] || return 0
   # A repeat moves to the END rather than being dropped: npm is last-wins, so
   # `--registry A --registry B --registry A` installs from A, and the
@@ -201,29 +209,49 @@ safe_gate_scan_target_flags() {
   SAFE_GATE_DIST_TAG=""
   SAFE_GATE_REGISTRY=""
   SAFE_GATE_PROJECT_DIR=""
+  SAFE_GATE_NPM_USERCONFIG=""
+  SAFE_GATE_NPM_GLOBALCONFIG=""
   local prev="" arg
   for arg in "$@"; do
     case "${family}" in
       npm)
         case "${prev}" in
           --tag) SAFE_GATE_DIST_TAG="${arg}" ;;
+          # --@scope:registry is a scoped source selector npm accepts on the
+          # command line. It is threaded as a KEYED token (@scope:registry=URL)
+          # — flattening the bare URL loses the key and lets the resolver pick
+          # a different scope's registry (PR#29 delta-6 finding 3.2b).
+          # --userconfig/--globalconfig swap in whole config files whose
+          # registry keys become effective; the PATH is threaded to safe-audit,
+          # which reads them (delta-7/8 config-path threading) — the gate never
+          # parses a config file itself.
           --registry) safe_gate_add_source "${arg}" ;;
+          --@*:registry) safe_gate_add_source "${prev#--}=${arg}" ;;
+          --userconfig) SAFE_GATE_NPM_USERCONFIG="${arg}" ;;
+          --globalconfig) SAFE_GATE_NPM_GLOBALCONFIG="${arg}" ;;
           --prefix|-C|--cwd|--dir) SAFE_GATE_PROJECT_DIR="${arg}" ;;
         esac
         case "${arg}" in
           --tag=*) SAFE_GATE_DIST_TAG="${arg#*=}" ;;
           --registry=*) safe_gate_add_source "${arg#*=}" ;;
+          --@*:registry=*) safe_gate_add_source "${arg#--}" ;;
+          --userconfig=*) SAFE_GATE_NPM_USERCONFIG="${arg#*=}" ;;
+          --globalconfig=*) SAFE_GATE_NPM_GLOBALCONFIG="${arg#*=}" ;;
           --prefix=*|--cwd=*|--dir=*) SAFE_GATE_PROJECT_DIR="${arg#*=}" ;;
         esac
         ;;
       python)
         case "${prev}" in
           --index-url|-i|--extra-index-url|--default-index|--index) safe_gate_add_source "${arg}" ;;
-          --find-links|-f) safe_gate_add_source "local:find-links" ;;
+          # find-links names a real endpoint: record it so operators can trust
+          # a specific location instead of a blanket sentinel (PR#29 delta-5
+          # finding 3.2 mitigation). --no-index keeps its sentinel: it is a
+          # boolean switch with no endpoint to record.
+          --find-links|-f) safe_gate_add_source "${arg}" ;;
         esac
         case "${arg}" in
           --index-url=*|--extra-index-url=*|--default-index=*|--index=*) safe_gate_add_source "${arg#*=}" ;;
-          --find-links=*) safe_gate_add_source "local:find-links" ;;
+          --find-links=*) safe_gate_add_source "${arg#*=}" ;;
           --no-index) safe_gate_add_source "local:no-index" ;;
         esac
         ;;
@@ -341,6 +369,8 @@ safe_gate_known_matches() {
   local -a es_args=("${name}" --ecosystem "${ecosystem}")
   [[ -n "${SAFE_GATE_REGISTRY:-}" ]] && es_args+=(--registry "${SAFE_GATE_REGISTRY}")
   [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]] && es_args+=(--project-dir "${SAFE_GATE_PROJECT_DIR}")
+  [[ -n "${SAFE_GATE_NPM_USERCONFIG:-}" ]] && es_args+=(--npm-userconfig "${SAFE_GATE_NPM_USERCONFIG}")
+  [[ -n "${SAFE_GATE_NPM_GLOBALCONFIG:-}" ]] && es_args+=(--npm-globalconfig "${SAFE_GATE_NPM_GLOBALCONFIG}")
   local current_source
   if ! current_source="$("${SAFE_GATE_AUDIT_BIN}" effective-sources "${es_args[@]}" 2>/dev/null)" \
      || [[ -z "${current_source}" ]]; then
@@ -629,7 +659,7 @@ safe_gate_npm_like_packages() {
       -g|--global|-f|--force|-D|--dev|-P|--peer|-O|--optional|-E|--exact|-T|--tilde|--cached|--save|--save-prod|--save-dev|--save-optional|--save-peer|--no-save|--prefer-offline|--prefer-online|--legacy-peer-deps|--strict-peer-deps|--dry-run|--package-lock-only|--workspace-root|--ignore-scripts|--foreground-scripts)
         continue
         ;;
-      --tag|--registry|--cache|--prefix|--userconfig|--globalconfig|--workspace|-w|--filter|--omit|--include|--install-strategy|--save-prefix|--mode|--cwd)
+      --tag|--registry|--@*:registry|--cache|--prefix|--userconfig|--globalconfig|--workspace|-w|--filter|--omit|--include|--install-strategy|--save-prefix|--mode|--cwd)
         skip_next=1
         continue
         ;;

@@ -31,7 +31,7 @@ _safe_gate_shell_check() {
   for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer; do
     wrapper="${bin_dir}/${tool}"
     if [[ ! -f "${wrapper}" || -L "${wrapper}" ]] \
-      || ! LC_ALL=C sed -n '2p' "${wrapper}" 2>/dev/null \
+      || ! LC_ALL=C sed -n '2p' -- "${wrapper}" 2>/dev/null \
            | LC_ALL=C grep -qxF -- "# safe-gate-wrapper v1 tool=${tool}"; then
       broken+=("${tool}")
     fi
