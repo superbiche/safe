@@ -3893,13 +3893,22 @@ normalize_source_set() {
 # wins, then the env forms (lowercase first, npm's own env precedence),
 # then the default. The global tier is analogous, with no default file
 # modeled (npm's builtin /usr/etc/npmrc is operator-owned machine state).
+# Config paths anchor a leading dash to ./ — a file literally named "-q"
+# is a valid config target to npm but reads as an OPTION to grep/awk,
+# silently yielding no sources (fail-open; delta-8 finding 3.2b).
+anchor_path() {
+  local p="$1"
+  [[ "$p" == -* ]] && p="./$p"
+  printf '%s' "$p"
+}
+
 npm_user_rc() {
   if [[ -n "${CHECK_NPM_USERCONFIG:-}" ]]; then
-    printf '%s' "$CHECK_NPM_USERCONFIG"
+    anchor_path "$CHECK_NPM_USERCONFIG"
   elif [[ -n "${npm_config_userconfig:-}" ]]; then
-    printf '%s' "$npm_config_userconfig"
+    anchor_path "$npm_config_userconfig"
   elif [[ -n "${NPM_CONFIG_USERCONFIG:-}" ]]; then
-    printf '%s' "$NPM_CONFIG_USERCONFIG"
+    anchor_path "$NPM_CONFIG_USERCONFIG"
   else
     printf '%s' "$HOME/.npmrc"
   fi
@@ -3907,11 +3916,11 @@ npm_user_rc() {
 
 npm_global_rc() {
   if [[ -n "${CHECK_NPM_GLOBALCONFIG:-}" ]]; then
-    printf '%s' "$CHECK_NPM_GLOBALCONFIG"
+    anchor_path "$CHECK_NPM_GLOBALCONFIG"
   elif [[ -n "${npm_config_globalconfig:-}" ]]; then
-    printf '%s' "$npm_config_globalconfig"
+    anchor_path "$npm_config_globalconfig"
   elif [[ -n "${NPM_CONFIG_GLOBALCONFIG:-}" ]]; then
-    printf '%s' "$NPM_CONFIG_GLOBALCONFIG"
+    anchor_path "$NPM_CONFIG_GLOBALCONFIG"
   fi
 }
 
@@ -4024,28 +4033,35 @@ pip_config_values() {
   local rc_file="$1" key="$2"
   [[ -f "$rc_file" ]] || return 0
   awk -v key="$key" '
-    function norm(s) { s = tolower(s); gsub(/_/, "-", s); return s }
+    # pip _normalize_name: ASCII lowercase, underscores to hyphens, and ONE
+    # leading -- removed ("--index-url =" is a valid pip config key,
+    # delta-8 finding 3.2c).
+    function norm(s) { s = tolower(s); gsub(/_/, "-", s); sub(/^--/, "", s); return s }
     function trimmed(s) { sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
-    BEGIN { sect = "" }
-    /^[ \t]*[#;]/ { next }
-    /^[ \t]*\[/ {
-      line = $0
-      sub(/^[ \t]*\[/, "", line); sub(/\].*$/, "", line)
-      sect = tolower(trimmed(line))
-      grab = 0
-      next
-    }
-    /^[ \t]/ {
-      if (grab) {
-        line = trimmed($0)
-        if (line != "") vals[grabsect] = vals[grabsect] "\n" line
-      }
-      next
-    }
-    { grab = 0 }
+    function indent_of(s) { match(s, /^[ \t]*/); return RLENGTH }
+    BEGIN { sect = ""; grab = 0; grabind = -1 }
     {
-      line = $0
-      sub(/^[ \t]+/, "", line)
+      raw = $0
+      line = trimmed(raw)
+      if (line == "") next
+      # Full-line comments are dropped everywhere, indented or not, without
+      # ending a value block (ConfigParser semantics).
+      if (line ~ /^[#;]/) next
+      ind = indent_of(raw)
+      # ConfigParser: a line continues a value only when indented DEEPER
+      # than its option line; options themselves may sit at any base
+      # indent (delta-8 finding 3.2c — leading whitespace is not, by
+      # itself, a continuation marker).
+      if (grab && ind > grabind) {
+        vals[grabsect] = vals[grabsect] "\n" line
+        next
+      }
+      grab = 0
+      if (line ~ /^\[/) {
+        sub(/^\[/, "", line); sub(/\].*$/, "", line)
+        sect = tolower(trimmed(line))
+        next
+      }
       p = index(line, "="); c = index(line, ":")
       d = p
       if (d == 0 || (c > 0 && c < p)) d = c
@@ -4053,6 +4069,7 @@ pip_config_values() {
       k = substr(line, 1, d - 1); sub(/[ \t]+$/, "", k)
       if (norm(k) == key && (sect == "global" || sect == "install")) {
         grab = 1
+        grabind = ind
         grabsect = sect
         vals[sect] = trimmed(substr(line, d + 1))
       }
@@ -4080,8 +4097,8 @@ python_env_sources() {
   # PIP_CONFIG_FILE containing spaces silently missed the file entirely
   # (delta-7 finding 3.2c).
   local -a py_rc_files=()
-  [[ -n "${PIP_CONFIG_FILE:-}" ]] && py_rc_files+=("$PIP_CONFIG_FILE")
-  [[ -n "${VIRTUAL_ENV:-}" ]] && py_rc_files+=("$VIRTUAL_ENV/pip.conf")
+  [[ -n "${PIP_CONFIG_FILE:-}" ]] && py_rc_files+=("$(anchor_path "$PIP_CONFIG_FILE")")
+  [[ -n "${VIRTUAL_ENV:-}" ]] && py_rc_files+=("$(anchor_path "$VIRTUAL_ENV")/pip.conf")
   py_rc_files+=("$HOME/.config/pip/pip.conf" "$HOME/.pip/pip.conf")
   local rc val
   if [[ -z "${PIP_INDEX_URL:-}" ]]; then
@@ -4736,11 +4753,13 @@ effective_sources_command() {
       --npm-userconfig)
         [[ $# -lt 2 ]] && die "--npm-userconfig requires a value"
         CHECK_NPM_USERCONFIG="$2"
+        [[ "$CHECK_NPM_USERCONFIG" == -* ]] && CHECK_NPM_USERCONFIG="./${CHECK_NPM_USERCONFIG}"
         shift 2
         ;;
       --npm-globalconfig)
         [[ $# -lt 2 ]] && die "--npm-globalconfig requires a value"
         CHECK_NPM_GLOBALCONFIG="$2"
+        [[ "$CHECK_NPM_GLOBALCONFIG" == -* ]] && CHECK_NPM_GLOBALCONFIG="./${CHECK_NPM_GLOBALCONFIG}"
         shift 2
         ;;
       --registry)
@@ -4795,11 +4814,13 @@ check_command() {
       --npm-userconfig)
         [[ $# -lt 2 ]] && die "--npm-userconfig requires a value"
         CHECK_NPM_USERCONFIG="$2"
+        [[ "$CHECK_NPM_USERCONFIG" == -* ]] && CHECK_NPM_USERCONFIG="./${CHECK_NPM_USERCONFIG}"
         shift 2
         ;;
       --npm-globalconfig)
         [[ $# -lt 2 ]] && die "--npm-globalconfig requires a value"
         CHECK_NPM_GLOBALCONFIG="$2"
+        [[ "$CHECK_NPM_GLOBALCONFIG" == -* ]] && CHECK_NPM_GLOBALCONFIG="./${CHECK_NPM_GLOBALCONFIG}"
         shift 2
         ;;
       --json)

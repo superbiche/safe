@@ -1280,6 +1280,11 @@ case_wrapper_state_cleared_after_gate() {
   # (possibly credential-bearing) after the gate decision (delta-7 N2).
   SAFE_INSTALL_TEST_SCRIPT='npm install --registry https://alice:sekret@mirror.example okpkg@1.0.0; print -r -u2 -- "POST_REG=[${SAFE_INSTALL_REGISTRY:-}][${SAFE_INSTALL_NPM_USERCONFIG:-}]"' run_zsh
   assert_err_contains_fragment 'POST_REG=[][]' "$FUNCNAME" || return
+
+  # The PROJECT-install route (no positional packages) scans too and must
+  # clear equally — cleanup tied to check_many missed it (delta-8 N2).
+  SAFE_INSTALL_TEST_SCRIPT='npm install --registry https://alice:sekret@mirror.example; print -r -u2 -- "POST_PROJ=[${SAFE_INSTALL_REGISTRY:-}]"' run_zsh
+  assert_err_contains_fragment 'POST_PROJ=[]' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 

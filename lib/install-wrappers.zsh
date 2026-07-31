@@ -1090,6 +1090,18 @@ safe_install_exec_gate() {
 }
 
 safe_install_npm_like() {
+  # Scanned target state (possibly credential-bearing) is cleared on EVERY
+  # exit of a scanning route — project scans, parser fallbacks, unsupported
+  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
+  # cleanup tied only to check_many missed the project-install paths).
+  {
+    safe_install_npm_like_impl "$@"
+  } always {
+    safe_install_clear_target_flags
+  }
+}
+
+safe_install_npm_like_impl() {
   local tool="$1"
   shift
   safe_install_route "${tool}" "$@" || return $?
@@ -1349,6 +1361,18 @@ safe_install_python_packages() {
 }
 
 safe_install_pip_like() {
+  # Scanned target state (possibly credential-bearing) is cleared on EVERY
+  # exit of a scanning route — project scans, parser fallbacks, unsupported
+  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
+  # cleanup tied only to check_many missed the project-install paths).
+  {
+    safe_install_pip_like_impl "$@"
+  } always {
+    safe_install_clear_target_flags
+  }
+}
+
+safe_install_pip_like_impl() {
   local tool="$1"
   shift
   safe_install_route "${tool}" "$@" || return $?
@@ -1406,6 +1430,18 @@ pip3() {
 }
 
 uv() {
+  # Scanned target state (possibly credential-bearing) is cleared on EVERY
+  # exit of a scanning route — project scans, parser fallbacks, unsupported
+  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
+  # cleanup tied only to check_many missed the project-install paths).
+  {
+    uv_impl "$@"
+  } always {
+    safe_install_clear_target_flags
+  }
+}
+
+uv_impl() {
   if ! typeset -f safe_install_python_packages safe_install_check >/dev/null 2>&1; then
     # Scan every token for a gated subcommand so a leading global flag can't
     # hide it (`uv --offline tool run x`). `tool` covers tool run/install.
@@ -1546,6 +1582,18 @@ uv() {
 }
 
 cargo() {
+  # Scanned target state (possibly credential-bearing) is cleared on EVERY
+  # exit of a scanning route — project scans, parser fallbacks, unsupported
+  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
+  # cleanup tied only to check_many missed the project-install paths).
+  {
+    cargo_impl "$@"
+  } always {
+    safe_install_clear_target_flags
+  }
+}
+
+cargo_impl() {
   if ! typeset -f safe_install_cargo_packages safe_install_check >/dev/null 2>&1; then
     local __a
     for __a in "$@"; do
@@ -1591,6 +1639,18 @@ cargo() {
 }
 
 go() {
+  # Scanned target state (possibly credential-bearing) is cleared on EVERY
+  # exit of a scanning route — project scans, parser fallbacks, unsupported
+  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
+  # cleanup tied only to check_many missed the project-install paths).
+  {
+    go_impl "$@"
+  } always {
+    safe_install_clear_target_flags
+  }
+}
+
+go_impl() {
   if ! typeset -f safe_install_go_packages safe_install_check >/dev/null 2>&1; then
     # Scan every token: `go install` (any position) and `go run <mod>@<ver>`
     # fetch. `go get` stays out of scope (its fetch runs no code), so the '@'
@@ -1683,6 +1743,18 @@ go() {
 }
 
 composer() {
+  # Scanned target state (possibly credential-bearing) is cleared on EVERY
+  # exit of a scanning route — project scans, parser fallbacks, unsupported
+  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
+  # cleanup tied only to check_many missed the project-install paths).
+  {
+    composer_impl "$@"
+  } always {
+    safe_install_clear_target_flags
+  }
+}
+
+composer_impl() {
   if ! typeset -f safe_install_composer_packages safe_install_check >/dev/null 2>&1; then
     local __a
     for __a in "$@"; do

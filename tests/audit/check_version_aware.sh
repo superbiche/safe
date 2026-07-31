@@ -1804,5 +1804,87 @@ if expect_status 10 "a config-file no-index: t floors"; then
 fi
 
 # ---------------------------------------------------------------------------
+# 60. Option-like config paths cannot fail the sweep open: a file literally
+#     named "-q" is a valid config target to the managers (delta-8 3.2b/c)
+# ---------------------------------------------------------------------------
+prepare_case dash-userconfig
+printf 'registry=https://evil.example\n' > "$CASE_PROJECT/-q"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --npm-userconfig -q --gate install
+if expect_status 10 "an argv userconfig named -q still floors"; then
+  pass "an argv userconfig named -q still floors"
+fi
+: > "$CASE_DIR/stderr.log"
+run_check \
+  NPM_CONFIG_USERCONFIG=-q \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 10 "an env userconfig named -q still floors"; then
+  pass "an env userconfig named -q still floors"
+fi
+prepare_case dash-pip-config
+cat > "$CASE_PROJECT/-q" <<'CONF'
+[global]
+index-url = https://evil.example/simple
+CONF
+run_check \
+  PIP_CONFIG_FILE=-q \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 10 "a PIP_CONFIG_FILE named -q still floors"; then
+  pass "a PIP_CONFIG_FILE named -q still floors"
+fi
+
+# ---------------------------------------------------------------------------
+# 61. ConfigParser layouts pip accepts: indented base options and a --key
+#     spelling (delta-8 finding 3.2c)
+# ---------------------------------------------------------------------------
+prepare_case pip-indented-option
+cat > "$CASE_DIR/pip.conf" <<'CONF'
+[global]
+  index-url = https://indent.example/simple
+CONF
+run_check \
+  PIP_CONFIG_FILE="$CASE_DIR/pip.conf" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 10 "an indented base option is still an option, not a continuation"; then
+  pass "an indented base option is still an option, not a continuation"
+fi
+prepare_case pip-dashdash-key
+cat > "$CASE_DIR/pip.conf" <<'CONF'
+[global]
+--index-url = https://dashkey.example/simple
+CONF
+run_check \
+  PIP_CONFIG_FILE="$CASE_DIR/pip.conf" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 10 "a --index-url key spelling is normalized like pip does"; then
+  pass "a --index-url key spelling is normalized like pip does"
+fi
+prepare_case pip-continuation-still-works
+cat > "$CASE_DIR/pip.conf" <<'CONF'
+[global]
+find-links =
+    https://evil.example/wheels
+CONF
+run_check \
+  PIP_CONFIG_FILE="$CASE_DIR/pip.conf" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 10 "deeper-indent continuations still attach to their option"; then
+  pass "deeper-indent continuations still attach to their option"
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
