@@ -73,11 +73,11 @@ Flow:
 
 1. The zsh wrapper detects a package install.
 2. If the current directory looks like an npm project, it runs `safe audit scan --project .`.
-3. It extracts package specs and runs `safe audit check <pkg>@<version> --ecosystem npm`.
-4. Only `GO` proceeds for package checks.
-5. The real command runs through `command npm install express`.
+3. It extracts package specs and runs `safe audit check <pkg> --ecosystem npm --gate install`.
+4. Only a passing gate proceeds.
+5. The real command runs through the first non-wrapper `npm` on PATH.
 
-Equivalent wrapper patterns exist for pnpm, yarn, bun, uv, pip, pip3, cargo, go, composer, and volta.
+Equivalent gate routing exists for pnpm, pnpx, yarn, bun, uv, pip, pip3, cargo, go, and composer (Volta is retired).
 
 ## External Binary Review
 

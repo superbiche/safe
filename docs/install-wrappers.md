@@ -1,20 +1,42 @@
 # Install Wrappers
 
-The install wrappers protect persistent host installs in zsh. They are installed at:
+The install wrappers protect persistent host installs in **every shell** —
+interactive zsh, `bash -c`, Makefile recipes, CI steps, and agent harnesses
+alike. They are executables on PATH, installed by `install.sh` at:
 
 ```text
-~/.config/safe/install-wrappers.zsh
+~/.local/bin/{npm,pnpm,pnpx,yarn,bun,pip,pip3,uv,cargo,go,composer}
 ```
 
-and loaded from `.zshrc` with:
+Each one is a three-line shim:
 
 ```bash
-source "$HOME/.config/safe/install-wrappers.zsh"
+#!/usr/bin/env bash
+# safe-gate-wrapper v1 tool=npm
+exec safe gate npm -- "$@"
 ```
+
+All routing lives in `safe gate` (`~/.config/safe/gate-lib.sh`), so upgrading
+safe upgrades the gate — the wrappers themselves never need rewriting.
+
+They used to be zsh functions sourced from `.zshrc`. That only gated an
+interactive zsh: a non-interactive shell went straight to the version-manager
+shim and was never audited. `~/.config/safe/install-wrappers.zsh` still exists
+and is still sourced (it now only warns, once, when an interactive shell finds
+no wrapper installed), but it defines no wrapper functions.
+
+An existing file of a wrapped name that does not carry the
+`# safe-gate-wrapper` marker is never overwritten: `install.sh` reports it and
+skips, leaving that tool ungated. `uninstall.sh` removes only marked wrappers.
+Check the wiring with `safe status`, which reports `installed`, `shadowed`
+(something earlier on PATH wins), or `not installed`.
 
 ## Behavior
 
-The wrappers shadow package-manager commands with zsh functions, run a check or scan, then delegate to the real command with `command <tool> "$@"`.
+A wrapper execs `safe gate <tool> -- "$@"`, which runs a check or scan, then
+delegates to the real tool: the first executable of that name on PATH that is
+not itself a wrapper. For node tools that is normally the mise/asdf shim, so
+per-project tool versions keep resolving.
 
 Package installs run:
 
@@ -49,7 +71,6 @@ pip3 install pytest==8.3.0
 cargo install cargo-edit
 go install golang.org/x/tools/cmd/stringer@latest
 composer require vendor/package
-volta install pnpm@10.11.0
 ```
 
 ## Wrapped Project Operations
@@ -102,7 +123,7 @@ disambiguate.
 command still selects the fetched package and is audited; the command's own
 flags after it are ignored. `--with-requirements <file>` (uv) names a file of
 packages that cannot be vetted inline, so it fails closed with a legible
-refusal in both healthy and degraded modes. `go run` classifies build flags
+refusal. `go run` classifies build flags
 the same way (value vs switch, validated against `go help build`) and fails
 closed on an unrecognized flag before the run target, so a value flag like
 `-C dir` or `-mod mode` cannot hide a later `module@version`.
@@ -120,8 +141,8 @@ for named specs): `npm update|u|up|upgrade|udpate`, `npm it|install-test`,
 `yarn global upgrade`.
 
 Passthrough by design — these never fetch registry packages: `pnpm exec`
-and `composer exec` (project/vendor binaries only), `volta run` (official
-runtimes only), `uv run` without `--with`/`-w`, and `go run` of local paths.
+and `composer exec` (project/vendor binaries only), `uv run` without
+`--with`/`-w`, and `go run` of local paths.
 `npm exec <tool>` / `bun x <tool>` pass through only for a **bare** command
 name backed by `node_modules/.bin/<tool>` in the physical cwd or a parent
 directory (npm's own bin resolution, covering hoisted monorepos); a versioned or aliased spec
@@ -130,7 +151,7 @@ is always audited even when a same-named local bin exists.
 
 ## Refusal Contract
 
-Every wrapper refusal is a single stderr line in the shape:
+Every gate refusal is a single stderr line in the shape:
 
 ```text
 safe: BLOCKED <tool> <action> — <reason>; to allow: <operator command>; details: safe explain
@@ -141,35 +162,17 @@ from a missing binary (127): `100` policy block, `102` interactive operator
 confirmation required, `104` `safe audit` BLOCK verdict. See the
 [Agent Contract](agents.md) page and `safe explain`.
 
-## Degraded Mode (partial shell snapshots)
+## Snapshot-stripped shells are no longer a special case
 
-Some agent harnesses (Claude Code) snapshot interactive shell functions but
-strip single-underscore names. The `safe_install_*` helpers deliberately
-avoid a leading underscore so snapshots keep them, and every public wrapper
-carries an inlined guard for the case where helpers are still missing:
+The zsh wrappers carried inlined "degraded mode" guards for harnesses that
+snapshot interactive shell functions but strip helpers, which used to produce
+a silent 127 mid-install. Executable wrappers have no such state: a wrapper
+either exists on PATH and execs `safe gate`, or it does not exist and the tool
+is ungated. Nothing can be half-loaded.
 
-- The audited subcommand families (installs, updates, exec-style
-  fetch-and-run) refuse with a `safe: BLOCKED` line and exit 100 instead of
-  failing with a silent 127.
-- All other subcommands pass through, mirroring what healthy shells pass
-  through by design: `pnpm exec`, `composer exec`, `volta run`.
-
-Degraded guards cannot run the full argument parser, so they are
-**conservative**: they refuse whenever a fetch *might* be requested and may
-over-refuse a few non-fetch invocations. They never under-refuse a real
-fetch. Concretely versus a healthy shell:
-
-- `uv run` refuses if `--with`/`-w` appears anywhere (a healthy shell only
-  audits `--with` before the command, so degraded may over-refuse a `--with`
-  that is actually the program's own argument).
-- `go run` refuses if any argument contains `@` (a healthy shell parses the
-  run target, so degraded may over-refuse a local run whose program args
-  contain `@`).
-- `npm exec`/`bun x` of a local `node_modules/.bin` tool is refused,
-  because the guard cannot safely verify the local-bin condition.
-
-Do not rename wrapper helpers to `_`-prefixed names; that reintroduces the
-silent-127 failure inside harness snapshots.
+The one comparable failure — `safe gate` unable to find its routing tables
+(`gate-lib.sh` missing) — fails closed with the usual `safe: BLOCKED` line and
+exit 100, never a silent passthrough.
 
 ## Timeouts
 

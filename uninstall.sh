@@ -87,6 +87,26 @@ rm -f "$COMPLETION_DIR/_safe"
 rm -f "$LEGACY_SAFE_RUN_CONFIG_DIR/completions/_safe-install"
 info "removed binaries and zsh completions"
 
+# Only files we generated: a same-named binary that lacks the marker belongs to
+# somebody else and stays.
+gate_wrapper_marked() {
+  local path="$1"
+  [[ -f "$path" ]] || return 1
+  head -n 2 "$path" 2>/dev/null | grep -Fq '# safe-gate-wrapper'
+}
+
+removed_wrappers=()
+for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer; do
+  if gate_wrapper_marked "$BIN_DIR/$tool"; then
+    rm -f "$BIN_DIR/$tool"
+    removed_wrappers+=("$tool")
+  fi
+done
+rm -f "$CONFIG_BASE/gate-lib.sh"
+if [[ "${#removed_wrappers[@]}" -gt 0 ]]; then
+  info "removed gate wrappers: ${removed_wrappers[*]}"
+fi
+
 if [[ -f "$ZSHRC" ]]; then
   strip_zshrc_line "$ZSHRC" 'source "$HOME/.config/safe/install-wrappers.zsh"'
   strip_zshrc_line "$ZSHRC" 'source ~/.config/safe/install-wrappers.zsh'

@@ -668,101 +668,39 @@ mark_sandbox_known() {
 # ---------------------------------------------------------------------------
 # Execution: host (host-allow tier)
 # ---------------------------------------------------------------------------
-is_volta_shim_backup() {
+# A saved runner path under a retired Volta install is stale by definition
+# (Volta was replaced by mise, 2026-07; its shim-backup resolution logic is
+# gone). Refuse legibly and point at the repair.
+is_stale_volta_path() {
   local path="$1"
   case "$path" in
-    "$HOME/.volta/bin/"*.original|*/.volta/bin/*.original) return 0 ;;
+    "$HOME/.volta/"*|*/.volta/*) return 0 ;;
     *) return 1 ;;
   esac
-}
-
-is_volta_npx_backup() {
-  local path="$1"
-  case "$path" in
-    "$HOME/.volta/tools/image/node/"*/bin/npx.original|*/.volta/tools/image/node/*/bin/npx.original) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-volta_npx_backup_for_version() {
-  local version="${1#v}"
-  local real_npx="$HOME/.volta/tools/image/node/${version}/bin/npx.original"
-  if [[ -x "$real_npx" ]]; then
-    printf '%s' "$real_npx"
-    return 0
-  fi
-  return 1
-}
-
-resolve_volta_npx_backup() {
-  local version path resolved candidate
-
-  if [[ -f "$PWD/package.json" ]]; then
-    version=$(jq -r '.volta.node // empty' "$PWD/package.json" 2>/dev/null || true)
-    if [[ -n "$version" ]]; then
-      if volta_npx_backup_for_version "$version"; then
-        return 0
-      fi
-      err "project pins Volta node $version, but its npx.original backup was not found"
-      err "expected: $HOME/.volta/tools/image/node/${version#v}/bin/npx.original"
-      return 1
-    fi
-
-    version=$(jq -r '.engines.node // empty' "$PWD/package.json" 2>/dev/null || true)
-    if [[ "$version" =~ ^v?[0-9]+(\.[0-9]+){2}$ ]] && volta_npx_backup_for_version "$version"; then
-      return 0
-    fi
-  fi
-
-  version=$(node --version 2>/dev/null | sed 's/^v//' || true)
-  if [[ -n "$version" ]] && volta_npx_backup_for_version "$version"; then
-    return 0
-  fi
-
-  if command -v volta >/dev/null 2>&1; then
-    path=$(volta which node 2>/dev/null || true)
-    if [[ "$path" =~ /node/([^/]+)/bin/node$ ]] && volta_npx_backup_for_version "${BASH_REMATCH[1]}"; then
-      return 0
-    fi
-  fi
-
-  path="$HOME/.volta/tools/user/packages/node/default"
-  if [[ -e "$path" ]]; then
-    resolved=$(readlink -f "$path" 2>/dev/null || true)
-    if [[ "$resolved" =~ /node/([^/]+)(/|$) ]] && volta_npx_backup_for_version "${BASH_REMATCH[1]}"; then
-      return 0
-    fi
-  fi
-
-  path="$HOME/.volta/tools/image/node"
-  if [[ -d "$path" ]]; then
-    candidate=$(find "$path" -mindepth 3 -maxdepth 3 -path '*/bin/npx.original' -type f -perm -u=x -print 2>/dev/null | sort -V | tail -n 1)
-    if [[ -n "$candidate" && -x "$candidate" ]]; then
-      printf '%s' "$candidate"
-      return 0
-    fi
-  fi
-
-  return 1
 }
 
 host_runner_binary() {
   local kind="$1"
   local saved
   saved=$(jq -r --arg k "${kind}_real" '.runners[$k] // empty' "$CONFIG_FILE")
-  if [[ "$kind" == "npx" && -n "$saved" ]] && { is_volta_shim_backup "$saved" || is_volta_npx_backup "$saved"; }; then
-    local resolved
-    if resolved=$(resolve_volta_npx_backup); then
-      printf '%s' "$resolved"
-      return 0
-    fi
-    err "Volta npx backup cannot be resolved for the active Node version: $saved"
-    err "no executable per-version npx.original found under $HOME/.volta/tools/image/node"
-    return 1
+  if [[ -n "$saved" ]] && is_stale_volta_path "$saved"; then
+    warn "configured ${kind}_real points into a retired Volta install: $saved (repair: safe run link)"
+    saved=""
   fi
   if [[ -n "$saved" && -x "$saved" ]]; then
     printf '%s' "$saved"
     return 0
+  fi
+  # Fallback: resolve through mise, the runtime manager that replaced Volta.
+  # Per-project/per-shell versions resolve exactly as the user's own shell
+  # would, and the path never goes stale in config.
+  if command -v mise >/dev/null 2>&1; then
+    local mise_real
+    mise_real=$(mise which "$kind" 2>/dev/null || true)
+    if [[ -n "$mise_real" && -x "$mise_real" ]]; then
+      printf '%s' "$mise_real"
+      return 0
+    fi
   fi
   return 1
 }
@@ -1733,13 +1671,6 @@ _link_collect_targets() {
     LINK_TARGET_PATHS+=("$path")
   done
 
-  local volta_dir="$HOME/.volta/tools/image/node"
-  if [[ -d "$volta_dir" ]]; then
-    while IFS= read -r -d '' path; do
-      LINK_TARGET_KEYS+=("npx-volta")
-      LINK_TARGET_PATHS+=("$path")
-    done < <(find "$volta_dir" -maxdepth 4 -name npx -print0 2>/dev/null)
-  fi
 }
 
 _link_preflight_targets() {
@@ -1814,19 +1745,23 @@ _link_one() {
   info "$k: linked $path -> safe run"
 }
 
-_link_fix_volta_npx_real() {
-  local saved resolved tmp
-  saved=$(jq -r '.runners.npx_real // empty' "$CONFIG_FILE")
-  if [[ -n "$saved" ]] && is_volta_shim_backup "$saved"; then
-    if resolved=$(resolve_volta_npx_backup); then
+# Clear runner entries left pointing into a retired Volta install (replaced
+# by mise, 2026-07): the paths are dead and host-allow exec would fail on
+# them. host_runner_binary falls back to `mise which` at exec time.
+_link_repair_stale_runners() {
+  local k saved tmp
+  for k in npx bunx uvx pipx; do
+    saved=$(jq -r --arg k "${k}_real" '.runners[$k] // empty' "$CONFIG_FILE")
+    if [[ -n "$saved" ]] && is_stale_volta_path "$saved"; then
       tmp=$(mktemp)
-      jq --arg v "$resolved" '.runners.npx_real = $v' "$CONFIG_FILE" > "$tmp"
+      jq --arg k "${k}_real" '.runners[$k] = null' "$CONFIG_FILE" > "$tmp"
       mv "$tmp" "$CONFIG_FILE"
-      info "npx: using Volta per-version backup for host-allow: $resolved"
-    else
-      warn "npx: Volta shim backup saved; host-allow will require a per-version npx.original"
+      info "$k: cleared stale Volta runner path ($saved)"
     fi
-  fi
+  done
+  tmp=$(mktemp)
+  jq 'del(.runners["npx-volta_real"])' "$CONFIG_FILE" > "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
 }
 
 cmd_link() {
@@ -1851,7 +1786,7 @@ cmd_link() {
     path="${LINK_TARGET_PATHS[$i]}"
     _link_one "$k" "$path" "$target_script" || { _link_rollback_run; }
   done
-  _link_fix_volta_npx_real
+  _link_repair_stale_runners
 
   # Convenience symlinks under ~/.local/bin (does not affect pipx itself).
   local convenience
@@ -1889,48 +1824,7 @@ cmd_unlink() {
     mv "$tmp" "$CONFIG_FILE"
   done
 
-  # If npx_real was corrected to a per-version Volta binary for host-allow,
-  # the top-level Volta npx shim still has its own backup to restore.
-  local volta_shim="$HOME/.volta/bin/npx"
-  local volta_shim_backup="$HOME/.volta/bin/npx.original"
-  if [[ -e "$volta_shim_backup" ]]; then
-    if [[ -L "$volta_shim" ]]; then
-      local target
-      target=$(readlink -f "$volta_shim" 2>/dev/null || true)
-      if [[ "$target" == "$HOME/.local/bin/safe-run" ]]; then
-        _sudo_if_needed "$(dirname "$volta_shim")" rm -f "$volta_shim"
-        _sudo_if_needed "$(dirname "$volta_shim")" mv "$volta_shim_backup" "$volta_shim"
-        info "volta: restored $volta_shim"
-      else
-        warn "volta: $volta_shim does not point to safe run compatibility binary; skipping"
-      fi
-    elif [[ ! -e "$volta_shim" ]]; then
-      _sudo_if_needed "$(dirname "$volta_shim")" mv "$volta_shim_backup" "$volta_shim"
-      info "volta: restored $volta_shim"
-    else
-      warn "volta: $volta_shim exists and is not a symlink; not touching"
-    fi
-  fi
-
-  # Restore Volta npx shims (with same target-verification).
-  local volta_dir="$HOME/.volta/tools/image/node"
-  if [[ -d "$volta_dir" ]]; then
-    local backup_path original target
-    while IFS= read -r -d '' backup_path; do
-      original="${backup_path%.original}"
-      if [[ -L "$original" ]]; then
-        target=$(readlink -f "$original" 2>/dev/null || true)
-        if [[ "$target" != "$HOME/.local/bin/safe-run" ]]; then
-          warn "volta: $original does not point to safe run compatibility binary; skipping"
-          continue
-        fi
-        rm -f "$original"
-      fi
-      mv "$backup_path" "$original"
-      info "volta: restored $original"
-    done < <(find "$volta_dir" -maxdepth 4 -name 'npx.original' -print0 2>/dev/null)
-  fi
-
+  # Drop the retired Volta bookkeeping key if it survived an old install.
   local tmp; tmp=$(mktemp)
   jq 'del(.runners["npx-volta_real"])' "$CONFIG_FILE" > "$tmp"
   mv "$tmp" "$CONFIG_FILE"

@@ -95,6 +95,7 @@ _safe_top() {
   commands=(
     'run:run a package through safe run'
     'audit:scan/check dependencies and machines'
+    'gate:audit a package-manager command, then delegate (used by the PATH wrappers)'
     'install:audit and install npm packages, or run sandbox installs'
     'status:show consolidated status'
     'doctor:show local readiness diagnostics'
@@ -115,6 +116,9 @@ case "${words[2]:-}" in
     ;;
   install)
     _alternative 'options:option:_values "install option" -g --global --host --manager --tool --npm --pnpm --yarn --bun --composer --yes --trust-host --sandbox --allow-scripts --write --network --allow-secrets' 'packages:package:_message package'
+    ;;
+  gate)
+    _describe -t tools 'gated tool' 'npm pnpm pnpx yarn bun pip pip3 uv cargo go composer'
     ;;
   doctor)
     _describe -t options 'doctor option' '--json'
