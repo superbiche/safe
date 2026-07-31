@@ -169,7 +169,19 @@ case "$sub" in
     ;;
   settings)
     log_line MISEQ "$@"
-    printf '%s\n' "${MISE_EXEC_AUTO_INSTALL:-false}"
+    setting=""
+    for arg in "$@"; do
+      case "$arg" in
+        exec_auto_install|npm.package_manager) setting="$arg" ;;
+      esac
+    done
+    case "$setting" in
+      npm.package_manager)
+        [[ "${MISE_NPM_PM_STATUS:-0}" != 0 ]] && exit "${MISE_NPM_PM_STATUS}"
+        printf '%s\n' "${MISE_NPM_PM:-auto}"
+        ;;
+      *) printf '%s\n' "${MISE_EXEC_AUTO_INSTALL:-false}" ;;
+    esac
     exit 0
     ;;
   tool)
@@ -2625,6 +2637,15 @@ case_mise_bump_audits_the_moved_target() {
   assert_status 104 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
 
+  # A VERSIONED argv target under --bump is a backend filter, not the
+  # audited target: mise still moves it to the latest release (delta-5 F3).
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade --bump npm:blockme@0.5.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'blockme@0.5.0' "$FUNCNAME" || return
+
   # install --force reinstalls the CONFIGURED version, so it keeps its
   # request rather than resolving latest.
   : > "${LOG_FILE}"
@@ -2645,12 +2666,32 @@ case_mise_upgrade_lookup_is_canonical_and_ordered() {
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tcheck\tprettier@3\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
 
-  # Every configured request for the key can move, not just the first.
+  # A key with SEVERAL configured requests shares one reported option set,
+  # so it cannot be attributed to the target being upgraded: the
+  # multiplicity rule (delta-5 finding F1) takes precedence over expanding
+  # the movable requests, and the invocation is flagged rather than
+  # audited against a source safe cannot confirm.
   : > "${LOG_FILE}"
   MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}, {"version": "2.0.0", "requested_version": "2", "installed": true}]}' \
     SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'several configured versions' "$FUNCNAME" || return
+
+  # A bracket option must not end up inside the key compared against the
+  # configured rows: that refused a supported invocation (delta-5 F3).
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade "npm:blockme[bin_path=bin]"' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@2\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # Exclusions are canonical too: one tool, two spellings.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade blockme --exclude npm:blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
 
   # Exclusions apply BEFORE the configured-request lookup: a target mise
   # will not touch must not be refused for being unconfigured.
@@ -2659,6 +2700,39 @@ case_mise_upgrade_lookup_is_canonical_and_ordered() {
     SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:unconfigured --exclude npm:unconfigured' run_zsh
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'REAL\tmise\tupgrade\tnpm:unconfigured\t--exclude\tnpm:unconfigured' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_npm_installer_reads_mise_settings() {
+  prepare_case "mise-npm-installer-setting"
+  # `mise env --json` does not export npm.package_manager, so a configured
+  # bun installer was invisible and safe audited npm's source for a bun
+  # install (delta-5 finding F4).
+  MISE_NPM_PM=bun \
+    SAFE_INSTALL_TEST_SCRIPT='export BUN_CONFIG_REGISTRY=https://private.example; mise install npm:okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+
+  # The default installer reads no bun variable, so the audit proceeds.
+  : > "${LOG_FILE}"
+  MISE_NPM_PM=auto \
+    SAFE_INSTALL_TEST_SCRIPT='export BUN_CONFIG_REGISTRY=https://private.example; mise install npm:blockme@1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # The environment still wins over the setting.
+  : > "${LOG_FILE}"
+  MISE_NPM_PM=bun MISE_ENV_JSON='{"MISE_NPM_PACKAGE_MANAGER": "npm"}' \
+    SAFE_INSTALL_TEST_SCRIPT='export BUN_CONFIG_REGISTRY=https://private.example; mise install npm:blockme@1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+
+  # An unreadable or unrecognized setting fails closed.
+  : > "${LOG_FILE}"
+  MISE_NPM_PM='not-a-manager' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install npm:okpkg@1.0.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -2877,6 +2951,7 @@ main() {
     case_mise_option_attribution_covers_cli_and_hidden_rows \
     case_mise_bump_audits_the_moved_target \
     case_mise_upgrade_lookup_is_canonical_and_ordered \
+    case_mise_npm_installer_reads_mise_settings \
     case_zsh_stub_warns_on_missing_mise_wrapper \
     case_uninstall_cleans_shell_and_legacy_binaries
   do

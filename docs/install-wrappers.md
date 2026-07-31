@@ -84,7 +84,13 @@ path rather than reporting a verdict computed against the default public
 source. Selectors apply to the installer that actually reads them: bun's
 registry variable affects a bun install, not an npm one, and an exported
 but empty selector chooses nothing, so neither suppresses an audit safe
-can honestly perform. Directory-scoped config files (Cargo's `config.toml`,
+can honestly perform. Which installer runs an npm-backend install comes
+from the environment first and then from mise's own
+`npm.package_manager` setting (which `mise env --json` does not export);
+an unreadable or unrecognized value refuses rather than assuming npm.
+A tool with several configured version requests is not audited at all but
+flagged: mise reports one option set per tool, so safe cannot tell which
+request carries which source. Directory-scoped config files (Cargo's `config.toml`,
 Composer's, bun's `bunfig.toml`) are not yet detected; extending the
 audit's source derivation to those ecosystems is tracked separately.
 

@@ -1966,11 +1966,28 @@ safe_gate_mise_unmodeled_source() {
 # Which installer actually performs an npm-backend install: mise's
 # package-manager setting selects npm/pnpm/bun, and only bun reads
 # BUN_CONFIG_REGISTRY.
+# Environment/overlay first, then mise's own setting: `mise env --json`
+# does not export npm.package_manager, so a configured `bun` was invisible
+# and safe audited npm's source for a bun install (delta-5 finding F4).
+# An unreadable or unrecognized value fails closed. "auto" resolves per
+# directory (lockfile-driven), which is part of the documented
+# directory-config residual.
 safe_gate_mise_npm_installer() {
-  local overlay="$1" pm
+  local overlay="$1" pm mise_real out
   pm="$(safe_gate_mise_env_value MISE_NPM_PACKAGE_MANAGER "$overlay")"
-  [[ -n "$pm" ]] && { printf '%s' "$pm"; return 0; }
-  printf 'npm'
+  if [[ -n "$pm" ]]; then
+    printf '%s' "$pm"
+    return 0
+  fi
+  mise_real="$(safe_gate_resolve_real mise)" || return 2
+  out="$("$mise_real" ${SAFE_GATE_MISE_CTX[@]+"${SAFE_GATE_MISE_CTX[@]}"} settings get npm.package_manager 2>/dev/null)" || return 2
+  out="${out%%$'\n'*}"
+  case "$out" in
+    auto|npm) printf 'npm' ;;
+    pnpm|yarn|bun) printf '%s' "$out" ;;
+    *) return 2 ;;
+  esac
+  return 0
 }
 
 # Installer behind a mise BACKEND spec (npm:/pipx:/cargo:/go:).
@@ -1982,6 +1999,46 @@ safe_gate_mise_backend_installer() {
     cargo) printf 'cargo' ;;
     *) return 1 ;;
   esac
+}
+
+# One validated snapshot of every configured row, shared by enumeration,
+# selection and attribution so they cannot disagree with one another
+# (delta-5 finding F1). Cached per invocation; returns 2 on failure.
+safe_gate_mise_rows() {
+  if (( ${SAFE_GATE_MISE_ROWS_LOADED:-0} == 0 )); then
+    SAFE_GATE_MISE_ROWS="$(safe_gate_mise_config_entries 3 ${SAFE_GATE_MISE_CTX[@]+"${SAFE_GATE_MISE_CTX[@]}"})" || return 2
+    SAFE_GATE_MISE_ROWS_LOADED=1
+  fi
+  printf '%s\n' "$SAFE_GATE_MISE_ROWS"
+  return 0
+}
+
+# How many configured requests a key has. `mise tool --json` reports ONE
+# option set per key, so more than one request means its options cannot be
+# attributed to the target being installed.
+safe_gate_mise_key_multiplicity() {
+  local want="$1" rows key count=0
+  rows="$(safe_gate_mise_rows)" || return 2
+  while IFS=$'\t' read -r key _; do
+    [[ "$key" == "$want" ]] && count=$((count + 1))
+  done <<<"$rows"
+  printf '%s' "$count"
+  return 0
+}
+
+# Canonical backend key of a spec: options stripped, version dropped, bare
+# shorthand resolved. Exclusions and targets must be compared as keys, not
+# as the strings the user happened to type (delta-5 finding F3).
+safe_gate_mise_canon_key() {
+  local spec="$1" parsed stripped name
+  parsed="$(safe_gate_mise_strip_opts "$spec")" || return 1
+  IFS=$'\t' read -r stripped _ <<<"$parsed"
+  name="$(safe_gate_mise_spec_name "$stripped")"
+  if [[ "$name" != *:* ]]; then
+    name="$(safe_gate_mise_resolve_bare "$name")" || return 1
+  fi
+  printf '%s' "$name"
+  return 0
 }
 
 # Ecosystem a gated inner `mise exec -- <tool>` command installs for, so
@@ -2094,8 +2151,21 @@ safe_gate_mise_check_spec() {
   # must run here too (delta-4 finding F1). The collector already asked for
   # its own entries, so it passes skip_config_opts=1.
   if (( skip_config_opts == 0 )); then
-    local ckey coffender corc
+    local ckey coffender corc cmult cmrc
     ckey="${backend}:${name}"
+    # Several configured requests share one reported option set, so the
+    # options cannot be attributed to THIS target (delta-5 finding F1).
+    # Zero rows is a new install and stays auditable.
+    cmult="$(safe_gate_mise_key_multiplicity "$ckey")"
+    cmrc=$?
+    if (( cmrc != 0 )); then
+      safe_gate_mise_infra_refuse "cannot enumerate configured tools to attribute the options of '${ckey}' (mise ls or jq unavailable, or malformed output)"
+      return 100
+    fi
+    if (( cmult > 1 )); then
+      safe_gate_err "safe: mise ${spec}: several configured versions share this tool and mise reports one option set for all of them — safe cannot tell which install carries which source; not audit-gated, review manually"
+      return 0
+    fi
     coffender="$(safe_gate_mise_entry_option_offender "$ckey")"
     corc=$?
     if (( corc != 0 )); then
@@ -2111,8 +2181,17 @@ safe_gate_mise_check_spec() {
   # "latest" is the unpinned marker, not a version: audit the bare name and
   # let safe-audit resolve the real target (never audit a literal @latest).
   [[ -n "$version" && "$version" != "latest" ]] && pkg="${name}@${version}"
-  local installer=""
-  installer="$(safe_gate_mise_backend_installer "$backend" "$overlay" 2>/dev/null || true)"
+  # rc 1 = this backend has no installer-specific source surface (go);
+  # rc 2 = the installer could NOT be determined, which must fail closed
+  # rather than silently audit the default source (delta-5 finding F4).
+  local installer="" irc
+  installer="$(safe_gate_mise_backend_installer "$backend" "$overlay")"
+  irc=$?
+  if (( irc == 2 )); then
+    safe_gate_mise_infra_refuse "cannot determine which installer mise will use for '${spec}' (npm.package_manager unreadable or unrecognized)"
+    return 100
+  fi
+  (( irc != 0 )) && installer=""
   safe_gate_mise_check_with_env "$overlay" "$pkg" "$eco" "$installer"
 }
 
@@ -2174,6 +2253,8 @@ SAFE_GATE_MISE_MODE=0
 SAFE_GATE_MISE_SAW_REMOVE=0
 SAFE_GATE_MISE_OVERLAY=""
 SAFE_GATE_MISE_CD=""
+SAFE_GATE_MISE_ROWS=""
+SAFE_GATE_MISE_ROWS_LOADED=0
 
 # One place where a recognized value flag's SEMANTICS are recorded. Being in
 # the table only means safe can parse it; a flag that changes the target set
@@ -2365,10 +2446,12 @@ safe_gate_mise_filter_excluded() {
   local -a kept=()
   local spec ex ex_name spec_name
   for spec in ${_specs[@]+"${_specs[@]}"}; do
-    spec_name="$(safe_gate_mise_spec_name "$spec")"
+    # Compare canonical KEYS: `mise upgrade blockme --exclude npm:blockme`
+    # names one tool in two spellings, and mise excludes it (delta-5 F3).
+    spec_name="$(safe_gate_mise_canon_key "$spec" 2>/dev/null || safe_gate_mise_spec_name "$spec")"
     local skip=0
     for ex in "${SAFE_GATE_MISE_EXCLUDE[@]}"; do
-      ex_name="$(safe_gate_mise_spec_name "$ex")"
+      ex_name="$(safe_gate_mise_canon_key "$ex" 2>/dev/null || safe_gate_mise_spec_name "$ex")"
       [[ "$spec_name" == "$ex_name" || "$spec" == "$ex" ]] && { skip=1; break; }
     done
     (( skip )) || kept+=("$spec")
@@ -2432,7 +2515,7 @@ safe_gate_mise_collect_entries() {
   # Multiplicity comes from the UNFILTERED row set: mode selection hides
   # sibling requests that still share one reported option set (delta-4 F1).
   local all_rows arc
-  all_rows="$(safe_gate_mise_config_entries 3 ${SAFE_GATE_MISE_CTX[@]+"${SAFE_GATE_MISE_CTX[@]}"})"
+  all_rows="$(safe_gate_mise_rows)"
   arc=$?
   if (( arc != 0 )); then
     safe_gate_mise_infra_refuse "cannot enumerate configured tools (mise ls or jq unavailable, or malformed output) — ${what} would install unaudited"
@@ -2516,44 +2599,59 @@ safe_gate_mise_overlay_or_refuse() {
 safe_gate_mise_pin_upgrade_targets() {
   local -n _specs="$1"
   local -a pinned=()
-  local spec entries rc key req canon matched
-  local need=0
-  for spec in ${_specs[@]+"${_specs[@]}"}; do
-    [[ "$(safe_gate_mise_spec_name "$spec")" == "$spec" ]] && need=1
-  done
+  local spec entries rc key req canon matched parsed stripped offender name version
+  # Under --bump EVERY target moves to the latest release, so an argv
+  # version is a backend filter, not the audited target (delta-5 F3).
+  local need="${SAFE_GATE_MISE_BUMP:-0}"
+  if (( need == 0 )); then
+    for spec in ${_specs[@]+"${_specs[@]}"}; do
+      [[ "$(safe_gate_mise_spec_name "$spec")" == "$spec" ]] && need=1
+    done
+  fi
   if (( need == 0 )); then
     return 0
   fi
-  entries="$(safe_gate_mise_config_entries 3 ${SAFE_GATE_MISE_CTX[@]+"${SAFE_GATE_MISE_CTX[@]}"})"
+  entries="$(safe_gate_mise_rows)"
   rc=$?
   if (( rc != 0 )); then
-    safe_gate_mise_infra_refuse "cannot read the configured request for an unversioned upgrade target (mise ls or jq unavailable, or malformed output)"
+    safe_gate_mise_infra_refuse "cannot read the configured request for an upgrade target (mise ls or jq unavailable, or malformed output)"
     return 100
   fi
   for spec in ${_specs[@]+"${_specs[@]}"}; do
-    if [[ "$(safe_gate_mise_spec_name "$spec")" != "$spec" ]]; then
+    # Normalize ONCE: a bracket option must not end up inside the key that
+    # is compared against configured rows, which refused a supported
+    # invocation as unconfigured (delta-5 finding F3).
+    parsed="$(safe_gate_mise_strip_opts "$spec")" || {
+      pinned+=("$spec")
+      continue
+    }
+    IFS=$'\t' read -r stripped offender <<<"$parsed"
+    if [[ -n "$offender" ]]; then
+      # A source-changing option reaches its notice path through check_spec.
       pinned+=("$spec")
       continue
     fi
-    # `mise upgrade prettier` names the same tool as configured
-    # `npm:prettier`: compare canonical keys, or a supported shorthand was
-    # refused as unconfigured (delta-4 finding F3).
-    canon="$spec"
-    if [[ "$spec" != *:* ]]; then
-      canon="$(safe_gate_mise_resolve_bare "$spec")" || {
-        safe_gate_mise_infra_refuse "cannot resolve '${spec}' to its backend (mise registry unavailable or unknown tool); use an explicit backend spec"
+    name="$(safe_gate_mise_spec_name "$stripped")"
+    version=""
+    [[ "$stripped" != "$name" ]] && version="${stripped#${name}@}"
+    canon="$name"
+    if [[ "$canon" != *:* ]]; then
+      canon="$(safe_gate_mise_resolve_bare "$canon")" || {
+        safe_gate_mise_infra_refuse "cannot resolve '${name}' to its backend (mise registry unavailable or unknown tool); use an explicit backend spec"
         return 100
       }
     fi
-    # --bump moves to the latest release regardless of the configured
-    # request: audit the bare name so safe-audit resolves that same target.
     if (( ${SAFE_GATE_MISE_BUMP:-0} )); then
       pinned+=("$canon")
       continue
     fi
+    if [[ -n "$version" ]]; then
+      pinned+=("${canon}@${version}")
+      continue
+    fi
     # EVERY configured request for the key can move on a plain upgrade,
-    # not just the first one; an exact pin cannot move at all, so auditing
-    # it reported a verdict for a no-op (delta-4 finding F3).
+    # not just the first; an exact pin cannot move at all, so auditing it
+    # reported a verdict for a no-op (delta-4 finding F3).
     matched=0
     while IFS=$'\t' read -r key req; do
       [[ "$key" == "$canon" ]] || continue
@@ -2566,7 +2664,7 @@ safe_gate_mise_pin_upgrade_targets() {
       fi
     done <<<"$entries"
     if (( matched == 0 )); then
-      safe_gate_err "safe: BLOCKED mise upgrade — '${spec}' has no configured version request to check against; name the exact version: mise upgrade ${spec}@<version>; details: safe explain"
+      safe_gate_err "safe: BLOCKED mise upgrade — '${spec}' has no configured version request to check against; name the exact version: mise upgrade ${canon}@<version>; details: safe explain"
       return 100
     fi
   done
@@ -2741,6 +2839,10 @@ safe_gate_mise() {
   SAFE_GATE_MISE_CTX=()
   SAFE_GATE_MISE_OVERLAY=""
   SAFE_GATE_MISE_CD=""
+  # The row snapshot is per invocation: context flags parsed below
+  # change which configuration it must describe.
+  SAFE_GATE_MISE_ROWS=""
+  SAFE_GATE_MISE_ROWS_LOADED=0
   # Exact top-level table from `mise --help` (2026.7): value flags consume,
   # switches step over, anything else fails closed — including unknown
   # equals-forms (a blanket -*=* accept violated the fail-closed contract).
