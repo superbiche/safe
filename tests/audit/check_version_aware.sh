@@ -1299,6 +1299,13 @@ if [[ "$(run_es)" == "explicit:default" ]]; then
 else
   fail "plumbing: a literal default selector stays explicit"
 fi
+ES_ARGS=(@demo/pkg --ecosystem npm --registry '@demo:registry=https://alice:pw@scoped.example/')
+if [[ "$(run_es)" == "explicit:@demo:registry=https://scoped.example" ]]; then
+  pass "plumbing: scoped tokens keep their key, redacted and canonical"
+else
+  printf 'got: %s\n' "$(run_es)" >&2
+  fail "plumbing: scoped tokens keep their key, redacted and canonical"
+fi
 
 # ---------------------------------------------------------------------------
 # 46. Receipt identity is canonicalized: a trailing-slash argv selector and
@@ -1391,6 +1398,12 @@ if (
   ! version_is_exact npm 9007199254740992.0.0 || exit 1
   long_pre=$(printf 'a%.0s' {1..260})
   ! version_is_exact npm "1.0.0-${long_pre}" || exit 1
+  # node-semver measures the 256-char ceiling on the RAW input, v included
+  # (delta-6 finding 4): v1.0.0- plus 249 chars = 256 raw (ok), 250 = 257.
+  pre_249=$(printf 'a%.0s' {1..249})
+  pre_250=$(printf 'a%.0s' {1..250})
+  version_is_exact npm "v1.0.0-${pre_249}" || exit 1
+  ! version_is_exact npm "v1.0.0-${pre_250}" || exit 1
 ); then
   pass "npm version grammar enforces node-semver limits"
 else
@@ -1508,6 +1521,176 @@ if jq -e '.packages["python:requests"].source == "explicit:https://mirror.exampl
 else
   cat "$CASE_RUN_CONFIG/install-known.json" >&2
   fail "receipt identity is credential-free"
+fi
+
+# ---------------------------------------------------------------------------
+# 53. Scoped selectors keep their KEY end-to-end: resolution uses the
+#     matching scope's registry, CLI beats env for the same key
+#     (delta-6 finding 3.2b)
+# ---------------------------------------------------------------------------
+prepare_case scoped-key-resolution
+printf '{"install": {"trusted_registries": ["https://foo.example", "https://bar.example"]}}\n' \
+  > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_REGISTRY_URL_LOG="$CASE_DIR/registry-urls.log" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- @foo/pkg --ecosystem npm --registry '@foo:registry=https://foo.example @bar:registry=https://bar.example' --gate install
+if expect_status 0 "two trusted scoped registries still gate GO"; then
+  pass "two trusted scoped registries still gate GO"
+fi
+if grep -q '^https://foo\.example/' "$CASE_DIR/registry-urls.log" \
+  && ! grep -q '^https://bar\.example/' "$CASE_DIR/registry-urls.log"; then
+  pass "npm-oracle: the MATCHING scope's registry resolves the package"
+else
+  cat "$CASE_DIR/registry-urls.log" >&2
+  fail "npm-oracle: the MATCHING scope's registry resolves the package"
+fi
+prepare_case scoped-cli-over-env
+printf '{"install": {"trusted_registries": ["https://cli.example", "https://env.example"]}}\n' \
+  > "$CASE_RUN_CONFIG/config.json"
+run_check \
+  'npm_config_@demo:registry=https://env.example' \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_REGISTRY_URL_LOG="$CASE_DIR/registry-urls.log" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- @demo/pkg --ecosystem npm --registry '@demo:registry=https://cli.example' --gate install
+if expect_status 0 "trusted scoped CLI + env gate GO"; then
+  pass "trusted scoped CLI + env gate GO"
+fi
+if grep -q '^https://cli\.example/' "$CASE_DIR/registry-urls.log"; then
+  pass "npm-oracle: a CLI scoped selector beats the env one"
+else
+  cat "$CASE_DIR/registry-urls.log" >&2
+  fail "npm-oracle: a CLI scoped selector beats the env one"
+fi
+
+# ---------------------------------------------------------------------------
+# 54. An env-selected alternate userconfig file reaches the floor
+#     (delta-6 finding 3.2b)
+# ---------------------------------------------------------------------------
+prepare_case env-userconfig-floor
+printf 'registry=https://evil.example\n' > "$CASE_DIR/alt-npmrc"
+fixture="$(osv_fixture_empty)"
+run_check \
+  npm_config_userconfig="$CASE_DIR/alt-npmrc" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 10 "npm_config_userconfig registry floors an exact pin"; then
+  pass "npm_config_userconfig registry floors an exact pin"
+fi
+
+# ---------------------------------------------------------------------------
+# 55. Query-string credentials are redacted like userinfo; operational
+#     fetches keep their credentials (delta-6 finding N2)
+# ---------------------------------------------------------------------------
+prepare_case query-token-redacted
+fixture="$(osv_fixture_empty)"
+run_check \
+  PIP_INDEX_URL='https://evil.example/simple?token=sekret2' \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 10 "a query-credentialed custom index still floors"; then
+  pass "a query-credentialed custom index still floors"
+fi
+if expect_no_grep "$OUT_FILE" 'sekret2' "query tokens never reach stdout" \
+  && expect_no_grep "$ERR_FILE" 'sekret2' "query tokens never reach stderr"; then
+  pass "query tokens never reach output"
+fi
+prepare_case authed-registry-operational
+printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_REGISTRY_URL_LOG="$CASE_DIR/registry-urls.log" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion --ecosystem npm --registry https://alice:pw@mirror.example --gate install
+if expect_status 0 "an authenticated trusted registry gates GO"; then
+  pass "an authenticated trusted registry gates GO"
+fi
+if grep -q '^https://alice:pw@mirror\.example/' "$CASE_DIR/registry-urls.log"; then
+  pass "the packument fetch keeps its credentials (operational URL)"
+else
+  cat "$CASE_DIR/registry-urls.log" >&2
+  fail "the packument fetch keeps its credentials (operational URL)"
+fi
+if jq -e '.packages["npm:brace-expansion"].source == "explicit:https://mirror.example"' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1 \
+  && ! grep -q 'alice' "$CASE_RUN_CONFIG/install-known.json"; then
+  pass "the receipt identity is credential-free while the fetch was authed"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2
+  fail "the receipt identity is credential-free while the fetch was authed"
+fi
+
+# ---------------------------------------------------------------------------
+# 56. pip config syntax: colon delimiters, continuations, and pip's boolean
+#     vocabulary (delta-6 findings 3.2c and N3)
+# ---------------------------------------------------------------------------
+prepare_case pip-colon-config
+cat > "$CASE_DIR/pip.conf" <<'CONF'
+[global]
+find-links: https://evil.example/wheels
+CONF
+fixture="$(osv_fixture_empty)"
+run_check \
+  PIP_CONFIG_FILE="$CASE_DIR/pip.conf" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 10 "a colon-delimited find-links floors"; then
+  pass "a colon-delimited find-links floors"
+fi
+prepare_case pip-continuation-config
+cat > "$CASE_DIR/pip.conf" <<'CONF'
+[global]
+find-links =
+    https://evil.example/wheels
+CONF
+run_check \
+  PIP_CONFIG_FILE="$CASE_DIR/pip.conf" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 10 "a continuation-line find-links floors"; then
+  pass "a continuation-line find-links floors"
+fi
+prepare_case pip-noindex-colon
+cat > "$CASE_DIR/pip.conf" <<'CONF'
+[install]
+no-index: yes
+CONF
+run_check \
+  PIP_CONFIG_FILE="$CASE_DIR/pip.conf" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 10 "no-index: yes floors"; then
+  pass "no-index: yes floors"
+fi
+prepare_case pip-noindex-false
+run_check \
+  PIP_NO_INDEX=False \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 0 "PIP_NO_INDEX=False preserves the default-source GO"; then
+  pass "PIP_NO_INDEX=False preserves the default-source GO"
+fi
+prepare_case pip-noindex-zero-pair
+run_check \
+  PIP_NO_INDEX=0 \
+  UV_NO_INDEX=0 \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- requests@2.32.0 --ecosystem python --gate install
+if expect_status 0 "a 0/0 no-index pair never floors"; then
+  pass "a 0/0 no-index pair never floors"
 fi
 
 # ---------------------------------------------------------------------------

@@ -3512,6 +3512,12 @@ parse_pkg_spec() {
   if [[ "$spec" == @*/*@* ]]; then
     PKG_NAME="${spec%@*}"
     PKG_VERSION="${spec##*@}"
+  elif [[ "$spec" == @* ]]; then
+    # A bare scoped name (@scope/pkg) has no version separator — its
+    # leading @ is part of the name, not a split point (delta-6, exposed by
+    # the scoped-key resolution tests).
+    PKG_NAME="$spec"
+    PKG_VERSION="latest"
   elif [[ "$spec" == *@* ]]; then
     PKG_NAME="${spec%@*}"
     PKG_VERSION="${spec##*@}"
@@ -3801,7 +3807,11 @@ version_is_exact() {
   local ecosystem="$1" version="$2"
   case "$ecosystem" in
     npm)
-      [[ "${version#v}" =~ $SEMVER_STRICT_RE ]] && npm_semver_within_limits "${version#v}"
+      # node-semver measures its 256-char ceiling on the RAW input, before
+      # the v prefix is stripped (delta-6 finding 4).
+      (( ${#version} <= 256 )) \
+        && [[ "${version#v}" =~ $SEMVER_STRICT_RE ]] \
+        && npm_semver_within_limits "${version#v}"
       ;;
     rust|php)
       [[ "${version#v}" =~ $SEMVER_STRICT_RE ]]
@@ -3825,17 +3835,37 @@ strip_trailing_slashes() {
 }
 
 # Canonical source form for identities, receipts, trust matching, and every
-# printed message: trailing slashes stripped AND URL userinfo dropped —
-# index URLs routinely carry inline credentials (PIP_INDEX_URL tokens) and
-# those must never reach refusal output, install-known.json, or config.json
-# trust entries (delta-5 finding N2). Operational fetch URLs keep their
-# credentials; only identities and sinks go through here.
+# printed message: trailing slashes stripped, and for URLs the userinfo,
+# query string, and fragment dropped — index URLs routinely carry inline
+# credentials (userinfo or ?token= query values) and those must never reach
+# refusal output, install-known.json, or config.json trust entries (delta-5
+# finding N2; delta-6 extended to query/fragment). Operational fetch URLs
+# keep their credentials — ONLY identities and sinks go through here
+# (delta-6: the wrappers no longer pre-redact, which broke authenticated
+# packument fetches). A scoped selector token (@scope:registry=URL) keeps
+# its key and canonicalizes its URL part.
 canonicalize_source() {
-  local v
-  v=$(strip_trailing_slashes "$1")
-  if [[ "$v" =~ ^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@]+@)(.+)$ ]]; then
-    v="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
+  local v="$1" scoped_prefix=""
+  if [[ "$v" == @*:registry=* ]]; then
+    scoped_prefix="${v%%=*}="
+    v="${v#*=}"
   fi
+  if [[ "$v" == *://* ]]; then
+    v="${v%%\#*}"
+    v="${v%%\?*}"
+    if [[ "$v" =~ ^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@]+@)(.+)$ ]]; then
+      v="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
+    fi
+  fi
+  v=$(strip_trailing_slashes "$v")
+  printf '%s%s' "$scoped_prefix" "$v"
+}
+
+# The URL half of a source element: scoped selector tokens carry their key
+# inline; trust decisions apply to the endpoint itself.
+source_element_url() {
+  local v="$1"
+  [[ "$v" == @*:registry=* ]] && v="${v#*=}"
   printf '%s' "$v"
 }
 
@@ -3858,22 +3888,52 @@ normalize_source_set() {
   printf '%s' "$out"
 }
 
+# The user-level npm config file: --userconfig's env forms replace it
+# entirely (lowercase wins, npm's own env precedence; delta-6 finding 3.2b).
+npm_user_rc() {
+  if [[ -n "${npm_config_userconfig:-}" ]]; then
+    printf '%s' "$npm_config_userconfig"
+  elif [[ -n "${NPM_CONFIG_USERCONFIG:-}" ]]; then
+    printf '%s' "$NPM_CONFIG_USERCONFIG"
+  else
+    printf '%s' "$HOME/.npmrc"
+  fi
+}
+
+# Every registry value (generic and scoped keys) declared in an npm config
+# file — the conservative sweep for alternate config files whose keys all
+# become effective (mirrors the wrappers' --userconfig handling).
+npm_rcfile_registry_values() {
+  local rc_file="$1" line
+  [[ -f "$rc_file" ]] || return 0
+  while IFS= read -r line; do
+    line="${line#*=}"
+    line="${line//[[:space:]]/}"
+    [[ -n "$line" ]] && printf '%s\n' "$line"
+  done < <(grep -E '^[[:space:]]*(@[^=[:space:]]+:)?registry[[:space:]]*=' "$rc_file" 2>/dev/null || true)
+}
+
 npm_registry_url() {
   local name="${1:-${PKG_NAME:-}}"
-  # A scope-specific registry beats every generic source INCLUDING an
-  # explicit --registry: npm resolves the @scope:registry config KEY, which
-  # argv never sets, so a scoped package routes to it regardless of the
-  # command line (delta-4 finding 3.2). Env first (both case forms npm
-  # accepts), then project/user .npmrc.
+  # A scope-specific registry beats every generic source INCLUDING a
+  # generic --registry: npm resolves the @scope:registry config KEY, which
+  # a generic selector never sets (delta-4 finding 3.2). Key precedence
+  # follows npm: CLI scoped selectors (threaded as @scope:registry=URL
+  # tokens in CHECK_REGISTRY, LAST occurrence wins — delta-6 finding 3.2b),
+  # then env (lowercase first), then project rc, then the user rc (which
+  # --userconfig's env forms replace).
   local scope=""
   [[ "$name" == @*/* ]] && scope="${name%%/*}"
   if [[ -n "$scope" ]]; then
-    local scoped_src
-    scoped_src=$(printenv "npm_config_${scope}:registry" 2>/dev/null || true)
+    local scoped_src="" src_word
+    for src_word in ${CHECK_REGISTRY:-}; do
+      [[ "$src_word" == "${scope}:registry="* ]] && scoped_src="${src_word#*=}"
+    done
+    [[ -n "$scoped_src" ]] || scoped_src=$(printenv "npm_config_${scope}:registry" 2>/dev/null || true)
     [[ -n "$scoped_src" ]] || scoped_src=$(printenv "NPM_CONFIG_${scope}:registry" 2>/dev/null || true)
     if [[ -z "$scoped_src" ]]; then
       local rc line scope_re="${scope//./\\.}"
-      for rc in "${CHECK_PROJECT_DIR:-.}/.npmrc" "$HOME/.npmrc"; do
+      for rc in "${CHECK_PROJECT_DIR:-.}/.npmrc" "$(npm_user_rc)"; do
         [[ -f "$rc" ]] || continue
         line=$(grep -E "^[[:space:]]*${scope_re}:registry[[:space:]]*=" "$rc" 2>/dev/null | tail -n 1 || true)
         if [[ -n "$line" ]]; then
@@ -3887,18 +3947,23 @@ npm_registry_url() {
       return 0
     fi
   fi
-  # Explicit --registry from the audited command line wins over env/rc:
+  # Generic --registry from the audited command line wins over env/rc:
   # auditing the default registry while npm installs from another one audits
   # the wrong artifact (PR#29 review finding 3). npm options are LAST-wins —
   # with repeated --registry flags npm fetches from the final one (delta-3
-  # finding 3.1); the custom-source floor still checks every seen selector.
+  # finding 3.1); scoped tokens carry a different KEY and never participate
+  # in the generic selection. The custom-source floor still checks every
+  # seen selector.
   if [[ -n "${CHECK_REGISTRY:-}" ]]; then
     local last_src="" src_word
     for src_word in ${CHECK_REGISTRY}; do
+      [[ "$src_word" == @*:registry=* ]] && continue
       last_src="$src_word"
     done
-    strip_trailing_slashes "$last_src"
-    return 0
+    if [[ -n "$last_src" ]]; then
+      strip_trailing_slashes "$last_src"
+      return 0
+    fi
   fi
   # npm reads its config environment case-insensitively and the LOWERCASE
   # form wins when both are set (verified against npm's own resolution,
@@ -3914,7 +3979,7 @@ npm_registry_url() {
     return 0
   fi
   local rc line
-  for rc in "${CHECK_PROJECT_DIR:-.}/.npmrc" "$HOME/.npmrc"; do
+  for rc in "${CHECK_PROJECT_DIR:-.}/.npmrc" "$(npm_user_rc)"; do
     [[ -f "$rc" ]] || continue
     line=$(grep -E '^[[:space:]]*registry[[:space:]]*=' "$rc" 2>/dev/null | tail -n 1 || true)
     if [[ -n "$line" ]]; then
@@ -3933,6 +3998,57 @@ npm_registry_url() {
 # operator-owned machine state on the other — argv + env + these files are
 # the surfaces a hostile project or environment can silently inject
 # (delta-4 finding 3.2).
+# pip's boolean vocabulary, case-insensitive, one variable at a time —
+# concatenating variables invented truth from "False"/"0 0" pairs (delta-6
+# finding N3: a false value must preserve default-source UX).
+python_bool_truthy() {
+  local v
+  v=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$v" in
+    1|true|yes|on) return 0 ;;
+  esac
+  return 1
+}
+
+# Values for one key from a pip config file, with pip/configparser syntax:
+# both '=' and ':' delimiters, comments, and indented continuation lines
+# (multi-line find-links lists are idiomatic). Line-grep missed the colon
+# and continuation forms pip itself accepts (delta-6 finding 3.2c).
+# Sections are ignored: the swept keys only occur meaningfully in
+# [global]/[install]/[download].
+pip_config_values() {
+  local rc_file="$1" key="$2"
+  [[ -f "$rc_file" ]] || return 0
+  awk -v key="$key" '
+    /^[ \t]/ {
+      if (grab) {
+        line = $0
+        sub(/^[ \t]+/, "", line); sub(/[ \t\r]+$/, "", line)
+        if (line != "") print line
+      }
+      next
+    }
+    { grab = 0 }
+    /^[ \t]*[#;]/ { next }
+    /^[ \t]*\[/ { next }
+    {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      p = index(line, "="); c = index(line, ":")
+      d = p
+      if (d == 0 || (c > 0 && c < p)) d = c
+      if (d == 0) next
+      k = substr(line, 1, d - 1); sub(/[ \t]+$/, "", k)
+      if (k == key) {
+        grab = 1
+        v = substr(line, d + 1)
+        sub(/^[ \t]+/, "", v); sub(/[ \t\r]+$/, "", v)
+        if (v != "") print v
+      }
+    }
+  ' "$rc_file" 2>/dev/null || true
+}
+
 python_env_sources() {
   local out="" v
   for v in ${PIP_INDEX_URL:-} ${PIP_EXTRA_INDEX_URL:-} ${UV_DEFAULT_INDEX:-} ${UV_INDEX_URL:-} ${UV_INDEX:-} \
@@ -3941,27 +4057,28 @@ python_env_sources() {
   done
   # no-index flips resolution to find-links/local sources entirely; the
   # sentinel mirrors the argv scanner's marker (delta-5 finding 3.2).
-  case "${PIP_NO_INDEX:-}${UV_NO_INDEX:-}" in
-    ""|0|false|no|off) : ;;
-    *) out="${out:+$out }local:no-index" ;;
-  esac
-  local rc line
+  if python_bool_truthy "${PIP_NO_INDEX:-}" || python_bool_truthy "${UV_NO_INDEX:-}"; then
+    out="${out:+$out }local:no-index"
+  fi
+  local rc val
   if [[ -z "${PIP_INDEX_URL:-}" ]]; then
     for rc in ${PIP_CONFIG_FILE:-} ${VIRTUAL_ENV:+${VIRTUAL_ENV}/pip.conf} "$HOME/.config/pip/pip.conf" "$HOME/.pip/pip.conf"; do
       [[ -f "$rc" ]] || continue
-      line=$(grep -E '^[[:space:]]*index-url[[:space:]]*=' "$rc" 2>/dev/null | tail -n 1 || true)
-      if [[ -n "$line" ]]; then
-        out="${out:+$out }$(trim "${line#*=}")"
+      # Later duplicate keys win within a file (configparser semantics).
+      val=$(pip_config_values "$rc" index-url | tail -n 1)
+      if [[ -n "$val" ]]; then
+        out="${out:+$out }$val"
         break
       fi
     done
   fi
   for rc in ${PIP_CONFIG_FILE:-} ${VIRTUAL_ENV:+${VIRTUAL_ENV}/pip.conf} "$HOME/.config/pip/pip.conf" "$HOME/.pip/pip.conf"; do
     [[ -f "$rc" ]] || continue
-    while IFS= read -r line; do
-      out="${out:+$out }$(trim "${line#*=}")"
-    done < <(grep -E '^[[:space:]]*(extra-index-url|find-links)[[:space:]]*=' "$rc" 2>/dev/null || true)
-    if grep -qE '^[[:space:]]*no-index[[:space:]]*=[[:space:]]*(1|true|yes|on)[[:space:]]*$' "$rc" 2>/dev/null; then
+    while IFS= read -r val; do
+      [[ -n "$val" ]] && out="${out:+$out }$val"
+    done < <(pip_config_values "$rc" extra-index-url; pip_config_values "$rc" find-links)
+    val=$(pip_config_values "$rc" no-index | tail -n 1)
+    if [[ -n "$val" ]] && python_bool_truthy "$val"; then
       out="${out:+$out }local:no-index"
     fi
   done
@@ -3996,11 +4113,20 @@ derive_effective_sources() {
   local extra=""
   CHECK_EFFECTIVE_SOURCES=$(normalize_source_set "${CHECK_REGISTRY:-}")
   case "$ecosystem" in
-    npm) extra=$(npm_registry_url "$name") ;;
+    npm)
+      extra=$(npm_registry_url "$name")
+      # An env-selected alternate user config file makes every registry key
+      # inside it effective — same conservative all-keys sweep the wrappers
+      # apply to argv --userconfig (delta-6 finding 3.2b).
+      local env_userconfig="${npm_config_userconfig:-${NPM_CONFIG_USERCONFIG:-}}"
+      if [[ -n "$env_userconfig" ]]; then
+        extra="$extra $(npm_rcfile_registry_values "$env_userconfig" | tr '\n' ' ')"
+      fi
+      ;;
     python) extra=$(python_env_sources) ;;
     go) extra=$(go_env_sources) ;;
   esac
-  local w
+  local w existing seen
   for w in $extra; do
     w=$(canonicalize_source "$w")
     [[ -n "$w" ]] || continue
@@ -4009,10 +4135,17 @@ derive_effective_sources() {
       npm:https://registry.npmjs.org) continue ;;
       python:https://pypi.org|python:https://pypi.org/simple) continue ;;
     esac
-    case " ${CHECK_EFFECTIVE_SOURCES} " in
-      *" ${w} "*) : ;;
-      *) CHECK_EFFECTIVE_SOURCES="${CHECK_EFFECTIVE_SOURCES:+${CHECK_EFFECTIVE_SOURCES} }${w}" ;;
-    esac
+    # Membership is endpoint-level: a scoped token already carrying this
+    # URL must not gain a redundant bare twin (the effective npm source of
+    # a scoped package IS that token's URL).
+    seen=0
+    for existing in ${CHECK_EFFECTIVE_SOURCES}; do
+      if [[ "$(source_element_url "$existing")" == "$(source_element_url "$w")" ]]; then
+        seen=1
+        break
+      fi
+    done
+    (( seen )) || CHECK_EFFECTIVE_SOURCES="${CHECK_EFFECTIVE_SOURCES:+${CHECK_EFFECTIVE_SOURCES} }${w}"
   done
 }
 
@@ -4854,7 +4987,8 @@ check_command() {
   local custom_source=0 check_src
   derive_effective_sources "$ecosystem" "$PKG_NAME"
   for check_src in ${CHECK_EFFECTIVE_SOURCES}; do
-    if ! registry_is_trusted "$check_src" "$ecosystem"; then
+    # Trust applies to the endpoint; a scoped token carries its key inline.
+    if ! registry_is_trusted "$(source_element_url "$check_src")" "$ecosystem"; then
       custom_source=1
       warn_causes+=("custom_source")
       bump_verdict verdict "WARN"

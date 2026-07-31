@@ -1251,8 +1251,10 @@ case_npm_scoped_and_userconfig_sources_reach_audit() {
   # Raw scoped registry flags are source selectors npm honors on the
   # command line; --userconfig swaps in a whole config file whose registry
   # keys become effective (delta-5 finding 3.2).
+  # The scoped selector keeps its KEY: flattening the bare URL let the
+  # resolver pick a different scope's registry (delta-6 finding 3.2b).
   SAFE_INSTALL_TEST_SCRIPT='npm install --@demo:registry=https://scoped.example @demo/pkg@1.2.3' run_zsh
-  assert_log_contains $'AUDIT\tcheck\t@demo/pkg@1.2.3\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--registry\thttps://scoped.example' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\t@demo/pkg@1.2.3\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--registry\t@demo:registry=https://scoped.example' "$FUNCNAME" || return
 
   : > "${LOG_FILE}"
   printf 'registry=https://userconf.example/\n@demo:registry=https://scopedconf.example\n' > "${WORK_DIR}/alt-npmrc"
@@ -1261,18 +1263,15 @@ case_npm_scoped_and_userconfig_sources_reach_audit() {
   pass "$FUNCNAME"
 }
 
-case_source_credentials_never_reach_logs() {
-  prepare_case "source-credentials-stripped"
-  # Inline URL credentials must not survive into the accumulated set — it
-  # feeds the audit invocation log and every downstream sink (delta-5
-  # finding N2). npm's own REAL invocation keeps them: it needs them.
+case_source_credentials_preserved_for_audit() {
+  prepare_case "source-credentials-operational"
+  # The accumulated set is OPERATIONAL: safe-audit needs the credentials to
+  # fetch packuments from authenticated registries — pre-redacting here
+  # broke those installs (delta-6 finding N2). Redaction happens centrally
+  # in safe-audit at every identity/receipt/display sink (covered in the
+  # audit suite).
   SAFE_INSTALL_TEST_SCRIPT='npm install --registry https://alice:sekret@mirror.example/ okpkg@1.0.0' run_zsh
-  assert_log_contains $'AUDIT\tcheck\tokpkg@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--registry\thttps://mirror.example' "$FUNCNAME" || return
-  if grep '^AUDIT' "${LOG_FILE}" | grep -q 'sekret'; then
-    printf 'credential leaked into an AUDIT line:\n%s\n' "$(grep '^AUDIT' "${LOG_FILE}")" >&2
-    fail "$FUNCNAME"
-    return
-  fi
+  assert_log_contains $'AUDIT\tcheck\tokpkg@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--registry\thttps://alice:sekret@mirror.example' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -1444,7 +1443,7 @@ main() {
     case_composer_parser \
     case_pip_cumulative_sources_all_reach_audit \
     case_npm_scoped_and_userconfig_sources_reach_audit \
-    case_source_credentials_never_reach_logs \
+    case_source_credentials_preserved_for_audit \
     case_npm_repeated_registry_keeps_true_last \
     case_stale_evidence_is_source_scoped \
     case_install_idempotent_no_wrappers \
