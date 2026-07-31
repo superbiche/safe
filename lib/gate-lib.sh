@@ -159,14 +159,75 @@ safe_gate_audit_available() {
 
 safe_gate_run_audit() {
   local rc=0
+  local -a extra=()
+  [[ -n "${SAFE_GATE_DIST_TAG:-}" ]] && extra+=(--dist-tag "${SAFE_GATE_DIST_TAG}")
+  [[ -n "${SAFE_GATE_REGISTRY:-}" ]] && extra+=(--registry "${SAFE_GATE_REGISTRY}")
+  [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]] && extra+=(--project-dir "${SAFE_GATE_PROJECT_DIR}")
   if command -v timeout >/dev/null 2>&1; then
-    timeout "${SAFE_GATE_TIMEOUT_SECONDS}" "${SAFE_GATE_AUDIT_BIN}" check "$@"
+    timeout "${SAFE_GATE_TIMEOUT_SECONDS}" "${SAFE_GATE_AUDIT_BIN}" check "$@" "${extra[@]}"
     rc=$?
   else
-    "${SAFE_GATE_AUDIT_BIN}" check "$@"
+    "${SAFE_GATE_AUDIT_BIN}" check "$@" "${extra[@]}"
     rc=$?
   fi
   return "$rc"
+}
+
+# Target-altering selectors change what the package manager actually installs
+# (tag, source registry/index, project dir). They were previously stripped
+# from the audit while staying in the real command — the audit then judged
+# the wrong target (PR#29 review finding 3). Scanned from the original argv;
+# safe-audit resolves with them or fails closed.
+safe_gate_scan_target_flags() {
+  local family="$1"
+  shift
+  SAFE_GATE_DIST_TAG=""
+  SAFE_GATE_REGISTRY=""
+  SAFE_GATE_PROJECT_DIR=""
+  local prev="" arg
+  for arg in "$@"; do
+    case "${family}" in
+      npm)
+        case "${prev}" in
+          --tag) SAFE_GATE_DIST_TAG="${arg}" ;;
+          --registry) SAFE_GATE_REGISTRY="${arg}" ;;
+          --prefix|-C|--cwd|--dir) SAFE_GATE_PROJECT_DIR="${arg}" ;;
+        esac
+        case "${arg}" in
+          --tag=*) SAFE_GATE_DIST_TAG="${arg#*=}" ;;
+          --registry=*) SAFE_GATE_REGISTRY="${arg#*=}" ;;
+          --prefix=*|--cwd=*|--dir=*) SAFE_GATE_PROJECT_DIR="${arg#*=}" ;;
+        esac
+        ;;
+      python)
+        case "${prev}" in
+          --index-url|-i|--extra-index-url|--default-index|--index) SAFE_GATE_REGISTRY="${arg}" ;;
+        esac
+        case "${arg}" in
+          --index-url=*|--extra-index-url=*|--default-index=*|--index=*) SAFE_GATE_REGISTRY="${arg#*=}" ;;
+        esac
+        ;;
+      cargo)
+        case "${prev}" in
+          --registry|--index) SAFE_GATE_REGISTRY="${arg}" ;;
+        esac
+        case "${arg}" in
+          --registry=*|--index=*) SAFE_GATE_REGISTRY="${arg#*=}" ;;
+        esac
+        ;;
+      composer)
+        case "${prev}" in
+          --repository) SAFE_GATE_REGISTRY="${arg}" ;;
+          --working-dir|-d) SAFE_GATE_PROJECT_DIR="${arg}" ;;
+        esac
+        case "${arg}" in
+          --repository=*) SAFE_GATE_REGISTRY="${arg#*=}" ;;
+          --working-dir=*) SAFE_GATE_PROJECT_DIR="${arg#*=}" ;;
+        esac
+        ;;
+    esac
+    prev="${arg}"
+  done
 }
 
 # Update-family subcommands resolve in-range instead of to the dist-tag; the
@@ -232,8 +293,10 @@ safe_gate_known_matches() {
   IFS=$'\t' read -r name version <<< "$(safe_gate_split_spec "${package}")"
   [[ -n "${name}" && -n "${version}" && "${version}" != "latest" ]] || return 1
 
+  # Only fully clean GO evidence may satisfy the offline fallback — a
+  # tolerated-WARN record is not clean evidence (PR#29 review finding 5).
   entry="$(jq -r --arg k "${ecosystem}:${name}" --arg v "${version}" \
-    '.packages[$k] | select(.version == $v) | .first_allowed // empty' "${known_file}" 2>/dev/null || true)"
+    '.packages[$k] | select(.version == $v and .verdict == "GO") | .first_allowed // empty' "${known_file}" 2>/dev/null || true)"
   [[ -n "${entry}" ]] || return 1
 
   ttl_days="$(jq -r '.install.auto_allow_ttl_days // 30' \
@@ -553,19 +616,36 @@ safe_gate_cargo_packages() {
   local -a packages=()
   local arg
   local skip_next=0
+  local capture_version=0
+  local crate_version=""
 
   for arg in "$@"; do
+    if (( capture_version )); then
+      crate_version="${arg}"
+      capture_version=0
+      continue
+    fi
     if (( skip_next )); then
       skip_next=0
       continue
     fi
 
     case "${arg}" in
-      --version|--vers|--index|--registry|--root|--target|--features|--bin|--example)
+      --version|--vers)
+        # `cargo install <crate> --version <v>` pins the crate; dropping the
+        # value would audit the bare name (PR#29 review finding 7).
+        capture_version=1
+        continue
+        ;;
+      --version=*|--vers=*)
+        crate_version="${arg#*=}"
+        continue
+        ;;
+      --index|--registry|--root|--target|--features|--bin|--example)
         skip_next=1
         continue
         ;;
-      --version=*|--vers=*|--index=*|--registry=*|--root=*|--target=*|--features=*|--bin=*|--example=*)
+      --index=*|--registry=*|--root=*|--target=*|--features=*|--bin=*|--example=*)
         continue
         ;;
       --locked|--offline|--quiet|--debug|--force|-f|--list|--no-track|--all-features|--no-default-features)
@@ -579,6 +659,14 @@ safe_gate_cargo_packages() {
         ;;
     esac
   done
+
+  if [[ -n "${crate_version}" && ${#packages[@]} -gt 0 ]]; then
+    local -a versioned=()
+    for arg in "${packages[@]}"; do
+      versioned+=("${arg}@${crate_version}")
+    done
+    packages=("${versioned[@]}")
+  fi
 
   safe_gate_print_list "${packages[@]}"
 }
@@ -1105,6 +1193,7 @@ safe_gate_npm_like() {
   local tool="$1"
   shift
   safe_gate_route "${tool}" "$@" || return $?
+  safe_gate_scan_target_flags npm "$@"
   local subcommand="${SAFE_GATE_SUBCMD}"
   local -a rest=() raw=() packages=()
   rest=("${@:SAFE_GATE_SUBCMD_IDX+1}")
@@ -1201,6 +1290,7 @@ safe_gate_pnpx() {
 
 safe_gate_yarn() {
   safe_gate_route yarn "$@" || return $?
+  safe_gate_scan_target_flags npm "$@"
   local first="${SAFE_GATE_SUBCMD}"
   local subidx=$SAFE_GATE_SUBCMD_IDX
   local second="${@:subidx+1:1}"
@@ -1255,6 +1345,7 @@ safe_gate_pip_like() {
   local tool="$1"
   shift
   safe_gate_route "${tool}" "$@" || return $?
+  safe_gate_scan_target_flags python "$@"
   local subcommand="${SAFE_GATE_SUBCMD}"
   local subidx=$SAFE_GATE_SUBCMD_IDX
   local -a packages=()
@@ -1395,6 +1486,7 @@ safe_gate_uv() {
 
 safe_gate_cargo() {
   safe_gate_route cargo "$@" || return $?
+  safe_gate_scan_target_flags cargo "$@"
   local subcommand="${SAFE_GATE_SUBCMD}"
   local subidx=$SAFE_GATE_SUBCMD_IDX
   local -a packages=()
@@ -1426,6 +1518,7 @@ safe_gate_cargo() {
 
 safe_gate_go() {
   safe_gate_route go "$@" || return $?
+  safe_gate_scan_target_flags go "$@"
   local subcommand="${SAFE_GATE_SUBCMD}"
   local subidx=$SAFE_GATE_SUBCMD_IDX
   local second="${@:subidx+1:1}"
@@ -1502,6 +1595,7 @@ safe_gate_go() {
 
 safe_gate_composer() {
   safe_gate_route composer "$@" || return $?
+  safe_gate_scan_target_flags composer "$@"
   local first="${SAFE_GATE_SUBCMD}"
   local subidx=$SAFE_GATE_SUBCMD_IDX
   local second="${@:subidx+1:1}"

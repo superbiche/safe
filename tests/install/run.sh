@@ -405,10 +405,11 @@ case_leading_global_flag_gates_pnpm_dlx() {
 
 case_leading_global_flag_gates_yarn_add() {
   prepare_case "leading-global-flag-gates-yarn-add"
-  # The verbatim inbox shape: yarn --cwd <dir> add <pkg>.
+  # The verbatim inbox shape: yarn --cwd <dir> add <pkg>. The --cwd value is
+  # the effective project dir and must reach resolution (review finding 3).
   SAFE_INSTALL_TEST_SCRIPT='yarn --cwd sub add blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--project-dir\tsub' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tyarn' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
