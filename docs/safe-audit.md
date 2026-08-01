@@ -173,9 +173,13 @@ result describes a project that no longer matches the key, and is not cached. A 
 window is not detected — the residual is the same class as absolute-path
 invocation, documented in [Install Wrappers](install-wrappers.md).
 
-Evidence paths enter the key relative to the scan root, so a remote scan —
-which stages its target into a fresh temporary directory on every run — hits
-the cache like a local one.
+Evidence paths enter the key relative to the scan root rather than by absolute
+path, so a target staged into a fresh temporary directory on every run derives
+a stable key. Remote scans do not benefit from this yet: a staged remote scan
+cannot select the core scanners through the remote machine identity, so its
+core tool status is not `ok` and the result is never stored. Remote
+`--deps-only` scans therefore re-scan every time; the cache is a local-target
+feature today.
 
 ### Ecosystem audits and `audit_totals`
 

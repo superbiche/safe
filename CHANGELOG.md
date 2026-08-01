@@ -75,12 +75,16 @@
   core scanner did not return `ok` (missing coverage is not a cacheable
   answer), or when a project holds known evidence that discovery did not hash
   — a symlinked lockfile, for instance, which `npm audit` reads and the file
-  walk skips: those are hashed directly now, alongside `.npmrc` (which selects
-  the registry `npm audit` queries) and `.safe-audit` (which decides what is
-  audited at all). `npm-shrinkwrap.json` is recognized as evidence. Evidence paths
-  enter the key relative to the scan root, so a remote scan (staged into a
-  fresh temporary directory every run) can hit the cache at all. A malformed
-  TTL disables the cache rather than silently defaulting.
+  walk skips: those are hashed directly now, alongside the project-root
+  `.npmrc` (which selects the registry `npm audit` queries) and `.safe-audit`
+  (which decides what is audited at all). `npm-shrinkwrap.json` is recognized
+  as evidence. Evidence paths enter the key relative to the scan root rather
+  than by absolute path, so a staged target derives a stable key. A malformed
+  TTL disables the cache rather than silently defaulting. Known residuals: the
+  cache is a local-target feature (a staged remote scan cannot select the core
+  scanners and is never stored), user-level npm/pip configuration outside the
+  project root is not keyed, and the advisory-database window is bounded only
+  by the TTL.
 
 - The PATH-wrapper project preflight decides from the scan's result document
   instead of its exit code. A scan that finds a critical advisory exits 0 (the
