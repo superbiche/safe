@@ -16,6 +16,12 @@ safe explain --json   # the contract as data
 > `docs/contract/agent-contract.json`, which is also what `safe explain`
 > renders at runtime. Edit the JSON, then run `scripts/render-contract.sh`.
 > Do not hand-edit generated blocks — `tests/contract/drift.sh` fails on it.
+>
+> That suite also cross-checks the contract against the code, but only
+> partially: it compares documented exit codes against the `refuse` calls in
+> `bin/safe` (not `bin/safe-run` or `lib/gate-lib.sh`) and checks that every
+> wrapped tool is documented (not that every documented tool is wrapped). A
+> claim can still drift in the directions it does not cover.
 
 ## The one rule
 
@@ -67,7 +73,7 @@ distinguish a block from a missing binary (127):
 | 101 | Host-allow version pin mismatch | The allowlist pins a different version than the one requested. Report both versions; re-pin is an operator decision. |
 | 102 | Interactive operator confirmation required (non-TTY refusal) | Nothing an agent can do in this shell. Ask the operator to run it in their terminal. |
 | 103 | Invalid package name rejected | Check the spec for a typo before escalating — this one is usually the caller's error. |
-| 104 | Safe audit BLOCK verdict | A critical advisory affects the version that would be installed. Verify the advisory hits the RESOLVED version; if it does not, this is a false positive — run `safe report-fp <spec>`. |
+| 104 | Safe audit BLOCK verdict | The audit returned BLOCK. That can be a critical advisory affecting the resolved version, a blocklist entry, or a critical advisory safe could not tie to a resolved version — the reason is in the receipt. Inspect it, and use `safe report-fp <spec>` only when its resolved-version and advisory evidence are inconsistent with the refusal. |
 | 127 | Genuinely missing command (never a policy refusal) | The command is not installed, or `safe` is missing from PATH. Report it; never treat it as a reason to bypass. |
 <!-- END GENERATED: exit-codes -->
 
@@ -99,7 +105,7 @@ When resolution fails (a private registry, a git or workspace spec, a compound r
 safe report-fp <spec> [--ecosystem <eco>] [--source <agent>]
 ```
 
-Re-runs the check as JSON, saves the receipt, and writes inbox/YYYY-MM-DD-<source>-fp-<slug>.md in safe's repo with the command, the verbatim refusal, the exit code, the resolved version, the advisory IDs and their fixed bounds, and the receipt path.
+Re-runs the check as JSON, saves the receipt, and writes inbox/YYYY-MM-DD-<source>-fp-<slug>.md in safe's repo with the command it ran, its exit code, the resolved version, every advisory with its fixed bound, and the receipt path. It re-runs the check rather than capturing the original refusal, so quote that refusal to the operator yourself if it matters.
 
 **The note IS the escalation. Nothing auto-applies and no behaviour changes until the operator validates it.**
 <!-- END GENERATED: report-fp -->

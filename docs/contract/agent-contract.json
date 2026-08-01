@@ -47,7 +47,7 @@
     {
       "code": 104,
       "meaning": "safe audit BLOCK verdict",
-      "agent_action": "A critical advisory affects the version that would be installed. Verify the advisory hits the RESOLVED version; if it does not, this is a false positive — run `safe report-fp <spec>`."
+      "agent_action": "The audit returned BLOCK. That can be a critical advisory affecting the resolved version, a blocklist entry, or a critical advisory safe could not tie to a resolved version — the reason is in the receipt. Inspect it, and use `safe report-fp <spec>` only when its resolved-version and advisory evidence are inconsistent with the refusal."
     },
     {
       "code": 127,
@@ -92,7 +92,7 @@
   ],
   "report_fp": {
     "command": "safe report-fp <spec> [--ecosystem <eco>] [--source <agent>]",
-    "what_it_does": "Re-runs the check as JSON, saves the receipt, and writes inbox/YYYY-MM-DD-<source>-fp-<slug>.md in safe's repo with the command, the verbatim refusal, the exit code, the resolved version, the advisory IDs and their fixed bounds, and the receipt path.",
+    "what_it_does": "Re-runs the check as JSON, saves the receipt, and writes inbox/YYYY-MM-DD-<source>-fp-<slug>.md in safe's repo with the command it ran, its exit code, the resolved version, every advisory with its fixed bound, and the receipt path. It re-runs the check rather than capturing the original refusal, so quote that refusal to the operator yourself if it matters.",
     "contract": "The note IS the escalation. Nothing auto-applies and no behaviour changes until the operator validates it."
   },
   "allow_flows": [

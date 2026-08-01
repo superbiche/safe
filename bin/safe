@@ -168,7 +168,20 @@ cmd_report_fp() {
 
   local payload status=0
   payload="$("$SAFE_AUDIT_PATH" "${args[@]}" 2>/dev/null)" || status=$?
-  if ! jq -e . >/dev/null 2>&1 <<<"$payload"; then
+  # Parseable is not the same as usable. `jq -e .` accepts the scalar
+  # `"not-an-object"`, and the renderer below then dies indexing it — AFTER the
+  # note has been created, leaving a truncated half-report and breaking the
+  # "nothing was written" guarantee this command makes. Validate the shape the
+  # renderer actually consumes, before anything is created.
+  if ! jq -e '
+    type == "object"
+    and ((.osv? // {}) | type == "object")
+    and (((.osv? // {}).classification? // {}) | type == "object")
+    and ((.resolution? // {}) | type == "object")
+    and ((.socket? // {}) | type == "object")
+    and ((.resolved_versions? // []) | type == "array")
+    and ((.warn_causes? // []) | type == "array")
+  ' >/dev/null 2>&1 <<<"$payload"; then
     printf 'safe: report-fp: the check produced no readable JSON (exit %s); nothing was written\n' "$status" >&2
     return 1
   fi
@@ -178,12 +191,22 @@ cmd_report_fp() {
   date_str="$(date +%F)"
   mkdir -p "$repo_dir/inbox"
   note="$repo_dir/inbox/${date_str}-${source}-fp-${slug}.md"
+  # -e is FALSE for a dangling symlink, so the old existence test walked right
+  # past one and `>` then wrote through it — the note landed wherever the link
+  # pointed, outside the inbox entirely. Test the link itself, and create the
+  # file exclusively (set -C) so the check and the open cannot be raced apart.
   local n=2
-  while [[ -e "$note" ]]; do
+  while [[ -e "$note" || -L "$note" ]]; do
     note="$repo_dir/inbox/${date_str}-${source}-fp-${slug}-${n}.md"
     n=$((n + 1))
+    if (( n > 100 )); then
+      printf 'safe: report-fp: too many notes for %s today; nothing was written\n' "$slug" >&2
+      return 1
+    fi
   done
 
+  local body
+  body="$(mktemp)" || { printf 'safe: report-fp: cannot allocate a scratch file; nothing was written\n' >&2; return 1; }
   {
     jq -r --arg spec "$spec" --arg source "$source" --arg date "$date_str" --arg status "$status" '
       def bounds:
@@ -230,7 +253,10 @@ cmd_report_fp() {
        else empty end),
       "## Verdict inputs",
       "",
-      "- Socket: `\(.socket.status // "n/a")`\((if .socket.note then " — \(.socket.note)" else "" end))",
+      "- Socket: `\(.socket.status // "n/a")`" +
+        (if ((.socket.status // "ok") != "ok")
+         then " — the check failed; its raw error text is in the receipt, not here"
+         else "" end),
       "- OSV: `\(.osv.status // "n/a")`, \((.osv.vulns // []) | length) advisories fetched",
       ""
     ' <<<"$payload"
@@ -240,7 +266,18 @@ cmd_report_fp() {
     printf 'This note IS the escalation. Nothing was auto-applied: no allowlist entry was\n'
     printf 'written, no verdict was changed, and the gate still refuses. The operator\n'
     printf 'validates before any behaviour changes.\n'
-  } > "$note"
+  } > "$body"
+
+  # Exclusive create: between the loop above and this open, another process
+  # could have put a symlink at the path. noclobber makes the open fail rather
+  # than follow it.
+  if ! (set -C; : > "$note") 2>/dev/null; then
+    rm -f "$body"
+    printf 'safe: report-fp: %s appeared while writing it; nothing was written\n' "$note" >&2
+    return 1
+  fi
+  cat "$body" > "$note"
+  rm -f "$body"
 
   printf 'safe: report-fp: wrote %s\n' "$note"
   printf 'safe: report-fp: nothing was allowed or changed — the operator validates this note\n'

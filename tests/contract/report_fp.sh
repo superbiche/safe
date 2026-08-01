@@ -70,7 +70,7 @@ new_repo() {
 run_report_fp() {
   local repo="$1"; shift
   STUB_ARGV_LOG="$TEST_ROOT/argv.log" \
-  STUB_PAYLOAD="$TEST_ROOT/payload.json" \
+  STUB_PAYLOAD="${STUB_PAYLOAD:-$TEST_ROOT/payload.json}" \
   STUB_EXIT="${STUB_EXIT:-104}" \
   STUB_EMIT_GARBAGE="${STUB_EMIT_GARBAGE:-0}" \
   SAFE_REPO_DIR="$repo" \
@@ -160,6 +160,69 @@ case_scoped_spec_slug_is_filesystem_safe() {
   fi
 }
 
+case_valid_but_wrong_shape_output_writes_nothing() {
+  # `jq -e .` accepts the scalar `"not-an-object"`. The renderer then dies
+  # indexing it — but the old code had already created the note, leaving a
+  # truncated half-report that reads like adjudicable evidence and breaking the
+  # "nothing was written" guarantee. Shape is validated before anything opens.
+  local repo; repo="$(new_repo repo-wrongshape)"
+  printf '"not-an-object"\n' > "$TEST_ROOT/scalar.json"
+  local status=0
+  STUB_PAYLOAD="$TEST_ROOT/scalar.json" run_report_fp "$repo" demo >/dev/null 2>"$TEST_ROOT/err-shape" || status=$?
+  if (( status == 0 )); then
+    fail "$FUNCNAME (exited 0 on a scalar payload)"
+    return
+  fi
+  if [[ -n "$(find "$repo/inbox" -name '*.md' 2>/dev/null)" ]]; then
+    fail "$FUNCNAME (wrote a partial note)"
+    return
+  fi
+  grep -Fq 'nothing was written' "$TEST_ROOT/err-shape" || { fail "$FUNCNAME (no legible cause)"; return; }
+  pass "$FUNCNAME"
+}
+
+case_dangling_symlink_at_the_note_path_is_not_followed() {
+  # `-e` is false for a dangling symlink, so the old existence test walked past
+  # one and `>` wrote THROUGH it — the note landed wherever the link pointed,
+  # outside the inbox entirely. That turned an inert escalation into a
+  # caller-selected write primitive.
+  local repo; repo="$(new_repo repo-symlink)"
+  mkdir -p "$repo/inbox" "$TEST_ROOT/elsewhere"
+  local target="$TEST_ROOT/elsewhere/captured.md"
+  ln -s "$target" "$repo/inbox/$(date +%F)-agent-fp-demo.md"
+  run_report_fp "$repo" demo >/dev/null 2>&1 || true
+  if [[ -e "$target" ]]; then
+    fail "$FUNCNAME (wrote through the symlink to $target)"
+    return
+  fi
+  # It must still succeed, into a suffixed path that is a real file.
+  local written
+  written="$(find "$repo/inbox" -name '*.md' -type f | head -1)"
+  if [[ -n "$written" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (no note written at all)"
+  fi
+}
+
+case_socket_failure_text_is_not_copied_into_the_note() {
+  # socket.note is raw stderr from a failed CLI or vault invocation and can
+  # carry a token. The receipt keeps it; the inbox is a far broader surface.
+  local repo; repo="$(new_repo repo-socket)"
+  jq '.socket = {"status": "error", "note": "auth failed: token sk-SECRET-DO-NOT-LEAK rejected"}' \
+    < "$TEST_ROOT/payload.json" > "$TEST_ROOT/socket-fail.json"
+  STUB_PAYLOAD="$TEST_ROOT/socket-fail.json" run_report_fp "$repo" demo >/dev/null 2>&1 || true
+  local note
+  note="$(find "$repo/inbox" -name '*.md' -type f | head -1)"
+  [[ -n "$note" ]] || { fail "$FUNCNAME (no note)"; return; }
+  if grep -Fq 'sk-SECRET-DO-NOT-LEAK' "$note"; then
+    fail "$FUNCNAME (secret-like socket text reached the note)"
+    return
+  fi
+  grep -Fq 'in the receipt, not here' "$note" || { fail "$FUNCNAME (no pointer to the receipt)"; return; }
+  pass "$FUNCNAME"
+}
+
 case_unreadable_check_output_writes_nothing() {
   # Half a report is worse than none: it would look like adjudicable evidence.
   local repo; repo="$(new_repo repo-garbage)"
@@ -205,6 +268,9 @@ case_changes_nothing
 case_note_states_that_nothing_was_applied
 case_same_day_collision_suffixes
 case_scoped_spec_slug_is_filesystem_safe
+case_valid_but_wrong_shape_output_writes_nothing
+case_dangling_symlink_at_the_note_path_is_not_followed
+case_socket_failure_text_is_not_copied_into_the_note
 case_unreadable_check_output_writes_nothing
 case_missing_repo_refuses_legibly
 case_no_spec_is_a_usage_error
