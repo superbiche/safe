@@ -2843,7 +2843,7 @@ case_mise_multi_target_shares_one_snapshot() {
   fi
   assert_log_contains $'AUDIT\tcheck\toktwo@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
 
-  # Same for `use` and for exec tool specs.
+  # Same for `use`.
   : > "${LOG_FILE}"
   rm -f "${LOG_FILE}.lsonce"
   MISE_LS_JSON='{}' MISE_LS_JSON_2='{"npm:oktwo": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}, {"version": "2.0.0", "requested_version": "2", "installed": true}]}' \
@@ -2856,6 +2856,22 @@ case_mise_multi_target_shares_one_snapshot() {
     fail "$FUNCNAME"
     return
   fi
+
+  # ...and for exec tool specs, which install on demand.
+  : > "${LOG_FILE}"
+  rm -f "${LOG_FILE}.lsonce"
+  MISE_EXEC_AUTO_INSTALL=false MISE_LS_JSON='{}' \
+    MISE_LS_JSON_2='{"npm:oktwo": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}, {"version": "2.0.0", "requested_version": "2", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise exec npm:okone@1.0.0 npm:oktwo@2.0.0 -- node script.js' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  ls_queries="$(grep -c $'MISEQ\tls\t--current\t--json' "${LOG_FILE}" 2>/dev/null || printf '0')"
+  if [[ "${ls_queries}" != "1" ]]; then
+    printf 'exec: expected exactly one mise ls query, got %s:\n' "${ls_queries}" >&2
+    cat "${LOG_FILE}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  assert_log_contains $'AUDIT\tcheck\toktwo@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
