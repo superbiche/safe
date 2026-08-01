@@ -2,6 +2,176 @@
 
 ## Unreleased
 
+- `safe install` gains a project mode: with no package named and a manifest in
+  the current directory (`package.json`, `requirements.txt`, `pyproject.toml`,
+  `Cargo.toml`, `composer.json`, `go.mod`), it bulk-audits what the project
+  already depends on instead of printing a usage error. `--project` forces the
+  mode. It runs `safe audit scan --deps-only --project .` and prints a
+  one-screen summary — audited manifests, package count, findings by severity,
+  verdict, and the top critical/high findings with package and advisory id.
+  The mode audits only and never runs a package manager. Critical findings
+  refuse with exit 104 even under `--yes` (`--yes` accepts WARNs only); a WARN
+  verdict prompts interactively and refuses with 102 in a non-interactive
+  shell; a clean verdict exits 0 quietly there. A scan that fails or leaves no
+  readable result document fails closed with exit 100 rather than reporting a
+  clean project. Decisions are recorded in the safe-run audit log as
+  `install:project`.
+
+- Lockfile-keyed scan cache for `--deps-only` scans: when the dependency
+  evidence hashes to a set already scanned within 24 hours, the recorded result
+  is replayed (`[safe audit] scan cache hit (<age>)`) with the same verdict and
+  exit code instead of re-running osv-scanner, syft, and grype — a repeat scan
+  of an unchanged tree drops from tens of seconds to well under one. Entries
+  live in `~/.local/share/safe/audit/scan-cache/`, keyed on machine, target,
+  mode, and each evidence file's own hash, so touching any lockfile or manifest
+  forces a real scan. `safe audit scan --no-cache` bypasses the lookup and
+  `SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS` overrides the TTL. The cache can only
+  skip work, never invent a verdict: missing, expired, corrupt, or
+  unrecognizable entries fall through to a real scan, evidence-free scans are
+  never cached, and source/`--full` scans are excluded entirely (they stage
+  arbitrary files the evidence hash does not capture).
+
+- The wrapper project-scan preflight now runs `safe audit scan --deps-only`, so
+  a bare `npm ci` / `pnpm install` in an unchanged tree costs a cache hit
+  instead of a full scanner run.
+
+- Scan results carry `audit_totals`: the CVE-scan counts plus every ecosystem
+  audit that ran (`npm audit`, `composer audit`, `cargo-audit`, `govulncheck`,
+  `pip-audit`), with a per-scanner breakdown. Those advisory counts previously
+  reached the result document but no verdict — a critical only `npm audit` saw
+  left the scan at `GO`. The verdict and `safe install --project` both read the
+  aggregate now. The counts are scanner *reports*, not deduplicated advisories
+  (only osv and grype carry comparable ids), so anything shown to a human is
+  broken down per source rather than summed.
+
+- Ecosystem audits are normalized properly, which wiring them into the verdict
+  made load-bearing. Previously every runner emitted `status:"ok"` regardless
+  of what happened: a scanner that could not reach its advisory database was
+  reported as a successful zero-finding scan — indistinguishable from a clean
+  project. Now each runner keeps the exit status and validates the output
+  shape, and unreadable output is `status:"error"` (which also makes the scan
+  verdict `WARN` and blocks caching). Counts moved from containers to
+  advisories: `pip-audit` lists one entry per *dependency* with its advisories
+  under `vulns`, so a clean Python project used to score one `medium` per
+  installed package; `composer audit` keys advisories by package, so its
+  findings were invisible; `cargo audit` severities now come from the CVSS
+  vector RustSec actually ships; `govulncheck` findings are deduplicated by
+  OSV id. A severity that cannot be determined counts as `unknown` — it warns,
+  it does not invent a band. An unrecognized scanner name is a configuration
+  error rather than a silent skip. The remote scan helper carries the same
+  normalizers, and a test compares the two copies verbatim.
+
+- Scan cache hardening. An entry stores its schema, key, machine, target and
+  mode, and every field is validated against the current request before replay,
+  so an entry belonging to another project — or written by a safe that scored
+  verdicts differently — misses instead of answering. Validation happens in a
+  single jq predicate: a malformed timestamp used to be read into bash
+  arithmetic, where `08` is a fatal error, which aborted the scan (exit 1) and
+  read to a PATH wrapper as a scan failure it was willing to proceed past.
+  Evidence is re-hashed after the scanners finish, so a result whose lockfiles
+  changed mid-scan is not filed under the key those lockfiles produced. Results
+  including a `govulncheck` run are never cached at all: it reads Go source,
+  which no evidence hash covers. Nor is anything cached when an ecosystem or
+  core scanner did not return `ok` (missing coverage is not a cacheable
+  answer), or when a project holds known evidence that discovery did not hash
+  — a symlinked lockfile, for instance, which `npm audit` reads and the file
+  walk skips: those are hashed directly now, alongside the project-root
+  `.npmrc` (which selects the registry `npm audit` queries) and `.safe-audit`
+  (which decides what is audited at all). `npm-shrinkwrap.json` is recognized
+  as evidence. Evidence paths enter the key relative to the scan root rather
+  than by absolute path, so a staged target derives a stable key. A malformed
+  TTL disables the cache rather than silently defaulting. Known residuals: the
+  cache is a local-target feature (a staged remote scan cannot select the core
+  scanners and is never stored), user-level npm/pip configuration outside the
+  project root is not keyed, and the advisory-database window is bounded only
+  by the TTL.
+
+- The PATH-wrapper project preflight decides from the scan's result document
+  instead of its exit code. A scan that finds a critical advisory exits 0 (the
+  verdict lives in the document), so the preflight treated every finding as a
+  clean scan and ran the package manager. It now refuses on a critical count
+  (interactive confirm, exit 102 non-interactive) and names a scanner that ran
+  and failed while still proceeding, per the documented policy that only
+  critical findings stop an install.
+
+- `safe audit scan --allow-missing-tools` turns an uninstalled ecosystem
+  auditor from an abort into a reported gap, and both gating callers pass it.
+  Without it a Rust or Go project on a machine without cargo-audit or
+  govulncheck could not be audited from any non-interactive shell at all: the
+  scan refused to run, and `safe install --project` reported it as a broken
+  scan rather than the documented "not run" WARN.
+
+- `npm audit` needs an npm lockfile, so a pnpm, Yarn or not-yet-locked project
+  is reported as coverage it structurally cannot provide rather than as a
+  broken scanner — and that state leaves the verdict alone, so a pnpm project
+  is not pushed behind an operator prompt for an answer npm was never going to
+  give. Absent tools still warn; failed ones still warn and block caching.
+
+- `pip-audit` audits every declared target instead of the first one found: a
+  vulnerable dependency present only in `requirements-dev.txt` was never
+  submitted. A `pyproject.toml` project is audited by path — a bare
+  `pip-audit -f json` audits the active Python environment, not the project.
+  Advisories are merged across targets and deduplicated by package and id.
+
+- `govulncheck` output is rejected whole if any non-blank line fails to parse
+  or the stream is not govulncheck's: tolerating an unparsable tail turned a
+  process that died halfway into a confident "zero findings".
+
+- The scan cache keys the **scanner set** as well as the evidence: each tool's
+  presence, path, size and mtime. Removing `pip-audit` (or installing it) now
+  misses instead of replaying a verdict produced by a different set of tools —
+  neither event touches an evidence file. Evidence is also re-enumerated after
+  the scan, not just re-hashed, so a `.safe-audit` created mid-scan (switching
+  an ecosystem off) cannot be stored under the key of the project that did not
+  have it.
+
+- Ecosystem coverage has explicit machine-readable states. `unsupported` is a
+  scanner that structurally cannot read this evidence — `npm audit` facing a
+  pnpm or Yarn lockfile — which osv-scanner covers anyway, so it neither warns
+  nor defeats the cache. `partial` keeps the advisories a run did find when
+  another target failed: a critical in `requirements.txt` no longer disappears
+  because `requirements-dev.txt` broke. A `package.json` with **no lockfile at
+  all** now WARNs instead of reporting `GO`: neither osv-scanner nor npm audit
+  can read it, so a clean verdict would mean "we looked at nothing".
+
+- `govulncheck` must exit 0. In `-json` mode findings are reported in the
+  stream, so a nonzero exit means the run failed — and the complete-looking
+  prefix it had already written used to be normalized to zero findings.
+
+- The wrapper preflight never proceeds on silence. If it cannot allocate a
+  private result destination it falls back to safe's own state directory, and
+  if that fails too it says the project was NOT audit-gated instead of reading
+  a scan's exit 0 as "clean". A failed scan is described as a failed scan:
+  the old heuristic labelled any scan exiting >= 2 "critical findings", which
+  is exactly the infrastructure-as-vulnerability conflation the refusal
+  contract forbids.
+
+- `--result-out` and `--allow-missing-tools` are completable, and the
+  completion test now derives its expectation from `--help` instead of pinning
+  a literal list that passed *because* new flags were missing.
+
+- `safe audit scan --result-out <file>` hands the caller its own copy of the
+  result document, and scans now assemble that document privately before
+  publishing it. The per-machine result path is one file per day: a concurrent
+  scan of another project could replace it between the scan and the read, so
+  `safe install --project` grades its own copy instead of parsing a path out of
+  the rendered summary.
+
+- `safe install --project` no longer swallows an install request. Combining it
+  with package arguments or with `-g`/`--host`/`--manager`/`--trust-host` is a
+  usage error instead of an audit-only exit 0 that installs nothing;
+  auto-detection applies only to a bare `safe install`. A scanner that ran and
+  failed now refuses with exit 100 naming the scanner and a recovery path
+  (`--yes` could previously accept it as an ordinary WARN), an unknown verdict
+  string refuses instead of being treated as acceptable, and a missing
+  `safe audit` refuses with the `BLOCKED` contract rather than a bare exit 1.
+  Scanner diagnostics go to a log file named in the refusal, keeping refusals
+  to the contractual single stderr line — as does the audit-log write, whose
+  own failure could previously add a second line. The refusal names the actual
+  failure (nonzero exit, absent result, unreadable verdict) rather than always
+  claiming no result was produced, and a critical refusal attributes the
+  advisories to the scanners that reported them.
+
 - Gate `mise` backend installs: `mise install`/`up`/`use`/`exec` previously
   installed registry packages (`npm:*`, `pipx:*`, `cargo:*`, `go:*` backends,
   lifecycle scripts included) with no audit at all. A `mise` PATH wrapper now

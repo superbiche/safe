@@ -16,6 +16,14 @@ TOOLS_FILE="$CONFIG_DIR/tools.json"
 
 RESULTS_DIR="$DATA_DIR/results"
 SBOM_DIR="$DATA_DIR/sbom"
+SCAN_CACHE_DIR="$DATA_DIR/scan-cache"
+# A dependency-evidence scan is deterministic in its inputs, so an unchanged
+# lockfile set within the TTL may reuse the previous verdict.
+SCAN_CACHE_TTL_SECONDS="${SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS:-86400}"
+# Bump whenever the shape or the semantics of a scan result change: entries
+# written by an older safe compute their verdict under different rules, so
+# they must miss rather than replay.
+SCAN_CACHE_SCHEMA=1
 CHECKS_DIR="$DATA_DIR/checks"
 IOC_DIR="$DATA_DIR/ioc"
 IOC_CATALOG_DIR="$IOC_DIR/catalogs"
@@ -63,6 +71,13 @@ declare -a MACHINE_TARGETS=()
 declare -A PROJECT_ECOSYSTEMS=()
 declare -A PROJECT_SCANNERS=()
 declare -a PROJECT_IGNORES=()
+LAST_SCAN_RESULT_PATH=""
+# Private, immutable copy of the document a scan just produced. The shared
+# per-day result file can be overwritten by a concurrent scan at any instant,
+# so every consumer that DECIDES on a result (cache store, --result-out)
+# reads the snapshot instead.
+LAST_SCAN_RESULT_SNAPSHOT=""
+SCAN_RESULT_OUT=""
 declare -a CURRENT_LOCKFILES=()
 declare -a CURRENT_MANIFESTS=()
 declare -a CURRENT_PROJECT_ROOTS=()
@@ -1263,7 +1278,7 @@ lockfile_ecosystem() {
   local file
   file=$(basename "$1")
   case "$file" in
-    package-lock.json|pnpm-lock.yaml|yarn.lock) echo "npm" ;;
+    package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock) echo "npm" ;;
     uv.lock|poetry.lock|Pipfile.lock) echo "python" ;;
     composer.lock) echo "php" ;;
     Cargo.lock) echo "rust" ;;
@@ -1276,7 +1291,7 @@ manifest_matches() {
   local base
   base=$(basename "$1")
   case "$base" in
-    package.json|package-lock.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum|.safe-audit)
+    package.json|package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum|.safe-audit)
       return 0
       ;;
     *)
@@ -1289,7 +1304,7 @@ lockfile_matches() {
   local base
   base=$(basename "$1")
   case "$base" in
-    package-lock.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
+    package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
       return 0
       ;;
     *)
@@ -1705,6 +1720,16 @@ confirm_scan_with_missing_project_audit_tools() {
   mapfile -t missing < <(missing_project_audit_tools_for_current_projects)
   [[ "${#missing[@]}" -eq 0 ]] && return 0
 
+  # A caller that gates on the RESULT (safe install --project, the PATH
+  # wrapper preflight) needs the document, not an abort: the missing tools
+  # come back as skipped records, the verdict warns, and that caller's own
+  # policy decides. Without this, a Rust or Go project on a machine without
+  # cargo-audit could not be audited at all from a non-interactive shell.
+  if [[ "${SAFE_AUDIT_ALLOW_MISSING_TOOLS:-0}" == "1" ]]; then
+    warn "$machine: continuing without ${missing[*]}; their coverage is reported as not run"
+    return 0
+  fi
+
   local scan_cmd
   scan_cmd="safe audit scan --machine $(printf '%q' "$machine")"
   if [[ -n "$project_target" ]]; then
@@ -1950,7 +1975,7 @@ count_grype_severity() {
 }
 
 render_ecosystem_audit_json() {
-  local scanner="$1" status="$2" total="$3" critical="$4" high="$5" medium="$6" low="$7" note="${8:-}"
+  local scanner="$1" status="$2" total="$3" critical="$4" high="$5" medium="$6" low="$7" note="${8:-}" unknown="${9:-0}"
   printf '{'
   printf '"scanner":%s,' "$(json_string_or_null "$scanner")"
   printf '"status":%s,' "$(json_string_or_null "$status")"
@@ -1959,154 +1984,267 @@ render_ecosystem_audit_json() {
   printf '"high":%s,' "$high"
   printf '"medium":%s,' "$medium"
   printf '"low":%s,' "$low"
+  printf '"unknown":%s,' "$unknown"
   printf '"note":%s' "$(json_string_or_null "$note")"
   printf '}'
+}
+
+# --- ecosystem audit normalizers (shared local/remote; keep both copies identical) ---
+# Each runner turns one scanner's native output into the same record. Three
+# rules, all learned the hard way:
+#   1. A scanner's EXIT STATUS is retained. These tools exit nonzero when they
+#      find something AND when they break, so the shape of the output decides:
+#      output we can read is a result, anything else is `status:"error"`.
+#      "Ran, failed, reported zero findings" is the one answer that must never
+#      be produced — it is indistinguishable from a clean project.
+#   2. Counts are ADVISORIES, not dependencies. pip-audit lists every dependency
+#      with its own `vulns` array, and composer keys advisories by package;
+#      counting the outer container turns a clean project into findings.
+#   3. A severity that cannot be determined is `unknown`, never `medium`.
+#      Unknown severities warn; they never manufacture a severity band.
+# shellcheck disable=SC2016
+ECO_AUDIT_JQ_DEFS='
+def sev_norm:
+  (tostring | ascii_downcase)
+  | if . == "critical" then "critical"
+    elif . == "high" then "high"
+    elif . == "moderate" or . == "medium" then "medium"
+    elif . == "low" then "low"
+    else "unknown" end;
+def audit_doc($scanner; $sevs):
+  {
+    scanner: $scanner,
+    status: "ok",
+    total: ($sevs | length),
+    critical: ([$sevs[] | select(. == "critical")] | length),
+    high: ([$sevs[] | select(. == "high")] | length),
+    medium: ([$sevs[] | select(. == "medium")] | length),
+    low: ([$sevs[] | select(. == "low")] | length),
+    unknown: ([$sevs[] | select(. == "unknown")] | length),
+    note: null
+  };
+'
+
+# ecosystem_audit_error <scanner> <exit-code> <stderr-file> <output>
+# The note always contains "failed": consumers key their infrastructure
+# refusal off the status, older readers off the note.
+ecosystem_audit_error() {
+  local scanner="$1" rc="$2" stderr_file="$3" output="$4"
+  local detail=""
+  if [[ -r "$stderr_file" ]]; then
+    detail="$(tr -d '\r' < "$stderr_file" | grep -v '^[[:space:]]*$' | tail -n 1)"
+    detail="${detail:0:160}"
+  fi
+  printf '%s\n' "$(render_ecosystem_audit_json "$scanner" "error" 0 0 0 0 0 \
+    "${scanner} failed (exit ${rc})${detail:+: ${detail}}" 0)" > "$output"
 }
 
 run_npm_audit_dir() {
   local dir="$1" output="$2"
   if ! command -v npm >/dev/null 2>&1; then
-    printf '%s\n' "$(render_ecosystem_audit_json "npm-audit" "skipped" 0 0 0 0 0 "npm unavailable")" > "$output"
+    printf '%s\n' "$(render_ecosystem_audit_json "npm-audit" "skipped" 0 0 0 0 0 "npm unavailable" 0)" > "$output"
     return 0
   fi
-  if ! (cd "$dir" && npm audit --json) > "$output.raw" 2>"$output.stderr"; then
-    :
+  # `npm audit` reads an npm lockfile and nothing else. That is not a broken
+  # scanner — it is evidence npm cannot read — but the two cases behind it are
+  # very different:
+  #   - a pnpm or Yarn lockfile: osv-scanner audits that lockfile, so the
+  #     project IS covered. Deterministic, decided by files that are in the
+  #     cache key: "unsupported", no verdict change, still cacheable.
+  #   - no lockfile at all: nothing covers these dependencies. Reporting GO
+  #     would mean "we looked at nothing and found nothing".
+  if [[ ! -f "$dir/package-lock.json" && ! -f "$dir/npm-shrinkwrap.json" ]]; then
+    if [[ -f "$dir/pnpm-lock.yaml" || -f "$dir/yarn.lock" ]]; then
+      printf '%s\n' "$(render_ecosystem_audit_json "npm-audit" "unsupported" 0 0 0 0 0 "npm audit cannot read pnpm/yarn lockfiles; osv-scanner covers that evidence" 0)" > "$output"
+    else
+      printf '%s\n' "$(render_ecosystem_audit_json "npm-audit" "unsupported" 0 0 0 0 0 "no lockfile: these npm dependencies are not audited" 0)" > "$output"
+    fi
+    return 0
   fi
-  jq -n --slurpfile data "$output.raw" '
-    ($data[0] // {}) as $r |
-    ($r.metadata.vulnerabilities.total // 0) as $total |
-    {
-      scanner: "npm-audit",
-      status: "ok",
-      total: $total,
-      critical: ($r.metadata.vulnerabilities.critical // 0),
-      high: ($r.metadata.vulnerabilities.high // 0),
-      medium: ($r.metadata.vulnerabilities.moderate // 0),
-      low: ($r.metadata.vulnerabilities.low // 0),
-      note: null
-    }
-  ' > "$output"
+  local rc=0
+  (cd "$dir" && npm audit --json) > "$output.raw" 2>"$output.stderr" || rc=$?
+  # npm audit exits 1 when it finds something, so only the shape can tell a
+  # result from a failure.
+  if ! jq -e '(.metadata.vulnerabilities | type) == "object"' "$output.raw" >/dev/null 2>&1; then
+    ecosystem_audit_error "npm-audit" "$rc" "$output.stderr" "$output"
+    return 0
+  fi
+  jq "$ECO_AUDIT_JQ_DEFS"'
+    (.metadata.vulnerabilities) as $v
+    | ( [ range(0; $v.critical // 0) | "critical" ]
+      + [ range(0; $v.high // 0)     | "high" ]
+      + [ range(0; $v.moderate // 0) | "medium" ]
+      + [ range(0; $v.low // 0)      | "low" ]
+      + [ range(0; $v.info // 0)     | "unknown" ] ) as $sevs
+    | audit_doc("npm-audit"; $sevs)
+  ' "$output.raw" > "$output" 2>/dev/null || ecosystem_audit_error "npm-audit" "$rc" "$output.stderr" "$output"
 }
 
 run_composer_audit_dir() {
   local dir="$1" output="$2"
   if ! command -v composer >/dev/null 2>&1; then
-    printf '%s\n' "$(render_ecosystem_audit_json "composer-audit" "skipped" 0 0 0 0 0 "composer unavailable")" > "$output"
+    printf '%s\n' "$(render_ecosystem_audit_json "composer-audit" "skipped" 0 0 0 0 0 "composer unavailable" 0)" > "$output"
     return 0
   fi
-  if ! (cd "$dir" && composer audit --format=json) > "$output.raw" 2>"$output.stderr"; then
-    :
+  local rc=0
+  (cd "$dir" && composer audit --format=json) > "$output.raw" 2>"$output.stderr" || rc=$?
+  # composer keys advisories BY PACKAGE: {"advisories":{"vendor/pkg":[...]}}.
+  # Read as a flat array it finds nothing at all.
+  if ! jq -e 'has("advisories")' "$output.raw" >/dev/null 2>&1; then
+    ecosystem_audit_error "composer-audit" "$rc" "$output.stderr" "$output"
+    return 0
   fi
-  jq -n --slurpfile data "$output.raw" '
-    ($data[0] // {}) as $r |
-    ($r.advisories // []) as $a |
-    {
-      scanner: "composer-audit",
-      status: "ok",
-      total: ($a | length),
-      critical: ([$a[]? | select((.severity // "") | ascii_downcase == "critical")] | length),
-      high: ([$a[]? | select((.severity // "") | ascii_downcase == "high")] | length),
-      medium: ([$a[]? | select((.severity // "") | ascii_downcase == "medium")] | length),
-      low: ([$a[]? | select((.severity // "") | ascii_downcase == "low")] | length),
-      note: null
-    }
-  ' > "$output"
+  jq "$ECO_AUDIT_JQ_DEFS"'
+    ( .advisories // {} ) as $a
+    | [ if ($a | type) == "object" then ($a[] | .[]?) else ($a[]?) end ] as $adv
+    | [ $adv[] | ((.severity // "unknown") | sev_norm) ] as $sevs
+    | audit_doc("composer-audit"; $sevs)
+  ' "$output.raw" > "$output" 2>/dev/null || ecosystem_audit_error "composer-audit" "$rc" "$output.stderr" "$output"
 }
 
 run_cargo_audit_dir() {
   local dir="$1" output="$2"
   if ! command -v cargo-audit >/dev/null 2>&1; then
-    printf '%s\n' "$(render_ecosystem_audit_json "cargo-audit" "skipped" 0 0 0 0 0 "cargo-audit unavailable")" > "$output"
+    printf '%s\n' "$(render_ecosystem_audit_json "cargo-audit" "skipped" 0 0 0 0 0 "cargo-audit unavailable" 0)" > "$output"
     return 0
   fi
-  if ! (cd "$dir" && cargo audit --json) > "$output.raw" 2>"$output.stderr"; then
-    :
+  local rc=0
+  (cd "$dir" && cargo audit --json) > "$output.raw" 2>"$output.stderr" || rc=$?
+  if ! jq -e '(.vulnerabilities.list | type) == "array"' "$output.raw" >/dev/null 2>&1; then
+    ecosystem_audit_error "cargo-audit" "$rc" "$output.stderr" "$output"
+    return 0
   fi
-  jq -n --slurpfile data "$output.raw" '
-    ($data[0].vulnerabilities.list // []) as $list |
-    {
-      scanner: "cargo-audit",
-      status: "ok",
-      total: ($list | length),
-      critical: 0,
-      high: ([$list[]? | select((.advisory.severity // "") | ascii_downcase == "high")] | length),
-      medium: ([$list[]? | select((.advisory.severity // "") | ascii_downcase == "medium")] | length),
-      low: ([$list[]? | select((.advisory.severity // "") | ascii_downcase == "low")] | length),
-      note: null
-    }
-  ' > "$output"
+  # RustSec advisories carry a CVSS vector far more often than a severity
+  # word; scoring the vector is the only way most of them get a band at all.
+  jq "$JQ_SEVERITY_DEFS$ECO_AUDIT_JQ_DEFS"'
+    [ .vulnerabilities.list[]?
+      | .advisory as $a
+      | ( [ ($a.severity // empty | sev_norm) ]
+        + [ ($a.cvss // empty | cvss3_band | sev_norm) ] ) as $cands
+      | ( [ $cands[] | select(. != "unknown") ] + ["unknown"] )[0]
+    ] as $sevs
+    | audit_doc("cargo-audit"; $sevs)
+  ' "$output.raw" > "$output" 2>/dev/null || ecosystem_audit_error "cargo-audit" "$rc" "$output.stderr" "$output"
 }
 
 run_govulncheck_dir() {
   local dir="$1" output="$2"
   if ! command -v govulncheck >/dev/null 2>&1; then
-    printf '%s\n' "$(render_ecosystem_audit_json "govulncheck" "skipped" 0 0 0 0 0 "govulncheck unavailable")" > "$output"
+    printf '%s\n' "$(render_ecosystem_audit_json "govulncheck" "skipped" 0 0 0 0 0 "govulncheck unavailable" 0)" > "$output"
     return 0
   fi
-  if ! (cd "$dir" && govulncheck -json ./...) > "$output.raw" 2>"$output.stderr"; then
-    :
+  local rc=0
+  (cd "$dir" && govulncheck -json ./...) > "$output.raw" 2>"$output.stderr" || rc=$?
+  # In -json mode govulncheck reports findings IN the stream and exits 0; a
+  # nonzero exit means the run itself failed (module loading, database), and
+  # the stream it already wrote may be a complete-looking prefix.
+  if (( rc != 0 )); then
+    ecosystem_audit_error "govulncheck" "$rc" "$output.stderr" "$output"
+    return 0
   fi
-  jq -Rn --arg raw "$(cat "$output.raw" 2>/dev/null || true)" '
-    ($raw | split("\n") | map(select(length > 0) | fromjson? // empty)) as $entries |
-    ($entries | map(select(.finding?)) | length) as $total |
-    {
-      scanner: "govulncheck",
-      status: "ok",
-      total: $total,
-      critical: 0,
-      high: 0,
-      medium: $total,
-      low: 0,
-      note: null
-    }
-  ' > "$output"
+  # NDJSON, and every non-blank line must parse. Tolerating unparsable lines
+  # would turn a stream that died halfway — config record written, findings
+  # truncated — into a confident "zero findings". The stream must also look
+  # like govulncheck: at least one record it actually emits.
+  jq -Rs "$ECO_AUDIT_JQ_DEFS"'
+    ( split("\n") | map(select(test("[^[:space:]]"))) ) as $lines
+    | ( $lines | map(fromjson? // null) ) as $parsed
+    | if ($parsed | length) == 0 then error("empty govulncheck stream") else . end
+    | if ($parsed | map(select(. == null)) | length) > 0
+      then error("unparsable govulncheck records") else . end
+    | if ([ $parsed[] | select(type == "object")
+            | select(has("config") or has("progress") or has("osv") or has("finding")) ] | length) == 0
+      then error("stream is not govulncheck output") else . end
+    | ( [ $parsed[] | select(type == "object") | select(has("finding"))
+          | (.finding.osv // "unknown") ] | unique ) as $ids
+    | [ $ids[] | "unknown" ] as $sevs
+    | audit_doc("govulncheck"; $sevs)
+  ' < "$output.raw" > "$output" 2>/dev/null || ecosystem_audit_error "govulncheck" "$rc" "$output.stderr" "$output"
 }
 
 run_pip_audit_dir() {
   local dir="$1" output="$2"
   if ! command -v pip-audit >/dev/null 2>&1; then
-    printf '%s\n' "$(render_ecosystem_audit_json "pip-audit" "skipped" 0 0 0 0 0 "pip-audit unavailable")" > "$output"
+    printf '%s\n' "$(render_ecosystem_audit_json "pip-audit" "skipped" 0 0 0 0 0 "pip-audit unavailable" 0)" > "$output"
     return 0
   fi
 
-  local target=""
+  # EVERY declared target is audited, not the first one found: a vulnerable
+  # dependency that appears only in requirements-dev.txt was never submitted
+  # when the loop stopped at requirements.txt. A bare `pip-audit -f json`
+  # audits the ACTIVE PYTHON ENVIRONMENT rather than the project, so a
+  # pyproject is audited by path.
+  local -a invocations=()
   local candidate
-  for candidate in "$dir/requirements.txt" "$dir/requirements-dev.txt" "$dir/pyproject.toml"; do
-    if [[ -f "$candidate" ]]; then
-      target="$candidate"
-      break
+  for candidate in requirements.txt requirements-dev.txt; do
+    [[ -f "$dir/$candidate" ]] && invocations+=("-r|$dir/$candidate")
+  done
+  [[ -f "$dir/pyproject.toml" ]] && invocations+=("project|$dir")
+
+  if [[ "${#invocations[@]}" -eq 0 ]]; then
+    printf '%s\n' "$(render_ecosystem_audit_json "pip-audit" "skipped" 0 0 0 0 0 "no supported python audit target found" 0)" > "$output"
+    return 0
+  fi
+
+  local rc=0 invocation kind value index=0 last_rc=0
+  local -a parts=()
+  local -a failed=()
+  for invocation in "${invocations[@]}"; do
+    kind="${invocation%%|*}"
+    value="${invocation#*|}"
+    index=$((index + 1))
+    rc=0
+    if [[ "$kind" == "-r" ]]; then
+      pip-audit -r "$value" -f json > "$output.raw.$index" 2>"$output.stderr" || rc=$?
+    else
+      pip-audit -f json "$value" > "$output.raw.$index" 2>"$output.stderr" || rc=$?
+    fi
+    # Both shapes are valid pip-audit: a bare list of dependencies, or
+    # {"dependencies":[...]}. Either way the advisories live in each
+    # dependency's `vulns` — the outer length is a package count, and counting
+    # it made every clean Python project a pile of medium findings.
+    if jq -e 'type == "array" or ((.dependencies | type) == "array")' "$output.raw.$index" >/dev/null 2>&1; then
+      parts+=("$output.raw.$index")
+    else
+      # One target failing must not erase what another target FOUND: a
+      # critical from requirements.txt has to survive requirements-dev.txt
+      # breaking, or a real finding disappears behind an unrelated failure.
+      failed+=("$(basename -- "$value") (exit ${rc})")
+      last_rc="$rc"
     fi
   done
 
-  if [[ -z "$target" ]]; then
-    printf '%s\n' "$(render_ecosystem_audit_json "pip-audit" "skipped" 0 0 0 0 0 "no supported python audit target found")" > "$output"
+  if [[ "${#parts[@]}" -eq 0 ]]; then
+    ecosystem_audit_error "pip-audit" "$last_rc" "$output.stderr" "$output"
     return 0
   fi
 
-  if [[ "$target" == *.txt ]]; then
-    if ! pip-audit -r "$target" -f json > "$output.raw" 2>"$output.stderr"; then
-      :
-    fi
-  else
-    if ! (cd "$dir" && pip-audit -f json) > "$output.raw" 2>"$output.stderr"; then
-      :
-    fi
+  # Advisories are merged across targets and deduplicated by package+id: the
+  # same dependency pinned in two requirements files is one advisory. If some
+  # target failed, the counts are real but incomplete: "partial" keeps them
+  # counted while still telling every consumer that coverage is missing.
+  local partial_note=""
+  local audit_status="ok"
+  if [[ "${#failed[@]}" -gt 0 ]]; then
+    audit_status="partial"
+    partial_note="pip-audit failed for: ${failed[*]}"
   fi
-
-  jq -n --slurpfile data "$output.raw" '
-    ($data[0] // []) as $list |
-    {
-      scanner: "pip-audit",
-      status: "ok",
-      total: ($list | length),
-      critical: 0,
-      high: 0,
-      medium: ($list | length),
-      low: 0,
-      note: null
-    }
-  ' > "$output"
+  jq -s --arg status "$audit_status" --arg note "$partial_note" "$ECO_AUDIT_JQ_DEFS"'
+    [ .[]
+      | (if type == "array" then . else (.dependencies // []) end)
+      | .[]?
+      | . as $dep
+      | (.vulns // [])[]?
+      | { key: (($dep.name // "?") + "@" + ($dep.version // "?") + "/" + (.id // "?")),
+          severity: ((.severity // "unknown") | sev_norm) }
+    ] as $all
+    | ( $all | group_by(.key) | map(.[0].severity) ) as $sevs
+    | audit_doc("pip-audit"; $sevs)
+    | .status = $status
+    | .note = (if $note == "" then null else $note end)
+  ' "${parts[@]}" > "$output" 2>/dev/null || ecosystem_audit_error "pip-audit" "$last_rc" "$output.stderr" "$output"
 }
+# --- end ecosystem audit normalizers ---
 
 run_project_ecosystem_audits() {
   local project_root="$1" output_dir="$2"
@@ -2128,7 +2266,7 @@ run_project_ecosystem_audits() {
       cargo-audit) run_cargo_audit_dir "$project_root" "$output" ;;
       govulncheck) run_govulncheck_dir "$project_root" "$output" ;;
       *)
-        printf '%s\n' "$(render_ecosystem_audit_json "$scanner" "skipped" 0 0 0 0 0 "unknown scanner")" > "$output"
+        printf '%s\n' "$(render_ecosystem_audit_json "$scanner" "error" 0 0 0 0 0 "unknown scanner ${scanner}: audit configuration failed" 0)" > "$output"
         ;;
     esac
     audits+=("$output")
@@ -2280,7 +2418,10 @@ select_previous_sbom() {
 }
 
 build_delta_json() {
-  local machine="$1" result_path="$2" sbom_path="$3"
+  # $2 is the path the finished result WILL occupy (excluded when looking for
+  # the previous scan); $4 (default $2) is where its content is read from,
+  # which during a build is the private in-progress document.
+  local machine="$1" result_path="$2" sbom_path="$3" current_doc="${4:-$2}" current_sbom="${5:-$3}"
   local previous_result previous_sbom
   previous_result=$(latest_previous_result "$machine" "$result_path")
   previous_sbom=$(latest_previous_sbom "$machine" "$sbom_path")
@@ -2290,15 +2431,15 @@ build_delta_json() {
   fi
 
   local added removed new_cves previous_scan
-  added=$(jq -n --slurpfile prev "$previous_sbom" --slurpfile cur "$sbom_path" '
+  added=$(jq -n --slurpfile prev "$previous_sbom" --slurpfile cur "$current_sbom" '
     ([($cur[0].components[]? | "\(.name)@\(.version // "unknown")")] - [($prev[0].components[]? | "\(.name)@\(.version // "unknown")")]) | length
   ')
-  removed=$(jq -n --slurpfile prev "$previous_sbom" --slurpfile cur "$sbom_path" '
+  removed=$(jq -n --slurpfile prev "$previous_sbom" --slurpfile cur "$current_sbom" '
     ([($prev[0].components[]? | "\(.name)@\(.version // "unknown")")] - [($cur[0].components[]? | "\(.name)@\(.version // "unknown")")]) | length
   ')
   previous_scan=$(jq -r '.date // .timestamp // empty' "$previous_result" 2>/dev/null || true)
   [[ -z "$previous_scan" ]] && previous_scan=$(basename "$previous_result" | sed 's/-scan\.json$//')
-  new_cves=$(jq -n --slurpfile prev "$previous_result" --slurpfile cur "$result_path" '
+  new_cves=$(jq -n --slurpfile prev "$previous_result" --slurpfile cur "$current_doc" '
     ([ $cur[0].cve_scan.findings[]?.id ] - [ $prev[0].cve_scan.findings[]?.id ]) | unique
   ')
 
@@ -2316,7 +2457,11 @@ build_delta_json() {
 }
 
 render_scan_summary() {
+  # $1 is read for the numbers; $2 (default $1) is the path shown to a human.
+  # They differ while a scan renders its private snapshot but points the reader
+  # at the published per-day result file.
   local result_path="$1"
+  local display_path="${2:-$1}"
   local machine
   machine=$(jq -r '.machine' "$result_path")
   printf '=== SAFE-AUDIT SCAN - %s - %s ===\n\n' \
@@ -2335,7 +2480,24 @@ render_scan_summary() {
   printf '  CRITICAL: %s\n' "$(jq -r '.cve_scan.critical' "$result_path")"
   printf '  HIGH: %s\n' "$(jq -r '.cve_scan.high' "$result_path")"
   printf '  MEDIUM: %s\n' "$(jq -r '.cve_scan.medium' "$result_path")"
-  printf '  LOW: %s\n\n' "$(jq -r '.cve_scan.low' "$result_path")"
+  printf '  LOW: %s\n' "$(jq -r '.cve_scan.low' "$result_path")"
+  # Ecosystem audits report their own advisories; without this line a
+  # govulncheck or cargo-audit finding appears in the totals and the verdict
+  # while every printed bucket reads zero.
+  local eco_summary
+  eco_summary="$(jq -r '
+    [ .audit_totals.ecosystem[]?
+      | select((.total // 0) > 0)
+      | .scanner + " " + (.total | tostring)
+        + " (critical " + ((.critical // 0) | tostring)
+        + ", high " + ((.high // 0) | tostring)
+        + ", medium " + ((.medium // 0) | tostring)
+        + ", low " + ((.low // 0) | tostring)
+        + ", unknown " + ((.unknown // 0) | tostring) + ")"
+    ] | join("; ")
+  ' "$result_path" 2>/dev/null || printf '')"
+  [[ -n "$eco_summary" ]] && printf '  ECOSYSTEM AUDITS: %s\n' "$eco_summary"
+  printf '\n'
   jq -r '
     .tool_status // {} |
     to_entries[]? |
@@ -2371,15 +2533,16 @@ render_scan_summary() {
       "$(jq -r '.delta.new_cves[:5] | join(", ")' "$result_path")"
   fi
   printf '\nVERDICT: %s\n\n' "$(jq -r '.verdict' "$result_path")"
-  printf 'Details: %s\n' "$result_path"
+  printf 'Details: %s\n' "$display_path"
 }
 
 build_scan_result_from_artifacts() {
   local machine="$1" original_target="$2" strategy="$3" sbom_src="$4" osv_json="$5" grype_json="$6" ecosystem_audits_file="$7" scan_mode="${8:-source}" source_scan_file="${9:-}"
-  local stamp result_path sbom_path
+  local stamp result_path sbom_path build_tmp
   stamp="$(today_date)"
   mkdir -p "$RESULTS_DIR/$machine" "$SBOM_DIR/$machine"
   result_path=$(scan_result_path_for "$machine" "$stamp")
+  build_tmp=$(mktemp)
   sbom_path=$(scan_sbom_path_for "$machine" "$stamp")
   cp "$sbom_src" "$sbom_path"
 
@@ -2398,7 +2561,7 @@ build_scan_result_from_artifacts() {
   fi
 
   local tool_status_json
-  tool_status_json=$(jq -n --slurpfile osv "$osv_json" --slurpfile grype "$grype_json" --slurpfile sbom "$sbom_path" '
+  tool_status_json=$(jq -n --slurpfile osv "$osv_json" --slurpfile grype "$grype_json" --slurpfile sbom "$sbom_src" '
     def osv_status($doc):
       if (($doc.error // "") != "") then
         {status:"error", note:$doc.error}
@@ -2499,12 +2662,12 @@ build_scan_result_from_artifacts() {
   ' 2>/dev/null || printf '[]')
 
   local packages_total npm_total python_total php_total rust_total go_total verdict
-  packages_total=$(count_sbom_packages "$sbom_path")
-  npm_total=$(count_sbom_ecosystem "$sbom_path" npm)
-  python_total=$(count_sbom_ecosystem "$sbom_path" pypi)
-  php_total=$(count_sbom_ecosystem "$sbom_path" composer)
-  rust_total=$(count_sbom_ecosystem "$sbom_path" cargo)
-  go_total=$(count_sbom_ecosystem "$sbom_path" golang)
+  packages_total=$(count_sbom_packages "$sbom_src")
+  npm_total=$(count_sbom_ecosystem "$sbom_src" npm)
+  python_total=$(count_sbom_ecosystem "$sbom_src" pypi)
+  php_total=$(count_sbom_ecosystem "$sbom_src" composer)
+  rust_total=$(count_sbom_ecosystem "$sbom_src" cargo)
+  go_total=$(count_sbom_ecosystem "$sbom_src" golang)
 
   verdict="GO"
   if (( critical > 0 )); then
@@ -2515,12 +2678,77 @@ build_scan_result_from_artifacts() {
   if [[ "$(jq -r '.total // 0' <<<"$source_scan_json")" -gt 0 ]]; then
     verdict="WARN"
   fi
+  # Coverage that is missing because something BROKE, or because a tool the
+  # project needs is not installed, is not a clean verdict. (A broken scanner
+  # used to require its note to say "unavailable" to count, so a scanner that
+  # ran and failed left the scan at GO.)
+  #
+  # Evidence a scanner structurally cannot audit — npm audit facing a pnpm
+  # lockfile — is a third thing: reported as not run, no verdict change.
+  # Warning on it would put every pnpm project behind an operator prompt for
+  # a tool that was never going to say anything.
   if jq -e '
-    [.[]? | select((.status // "ok") != "ok") | select((.note // "") | test("unavailable|missing"; "i"))] | length > 0
+    [ .[]?
+      | select((.status // "ok") != "ok")
+      | select((.status == "error") or (.status == "partial")
+               or (((.note // "") | test("unavailable|missing"; "i"))))
+    ] | length > 0
+  ' <<<"$ecosystem_audits_json" >/dev/null; then
+    verdict="WARN"
+  fi
+
+  # "unsupported" means a scanner cannot read this project's evidence. That is
+  # fine when something else can — osv-scanner reads the pnpm lockfile npm
+  # audit refuses — and it is a false clean when nothing can. A package.json
+  # with no lockfile at all has no npm coverage from any scanner, so GO would
+  # mean "we looked at nothing".
+  local npm_lockfiles=0 file
+  for file in ${CURRENT_LOCKFILES[@]+"${CURRENT_LOCKFILES[@]}"}; do
+    case "$(basename -- "$file")" in
+      package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock)
+        npm_lockfiles=$((npm_lockfiles + 1)) ;;
+    esac
+  done
+  if (( npm_lockfiles == 0 )) && jq -e '
+    [ .[]? | select(.status == "unsupported") | select((.scanner // "") == "npm-audit") ] | length > 0
   ' <<<"$ecosystem_audits_json" >/dev/null; then
     verdict="WARN"
   fi
   if jq -e '[to_entries[]? | select((.value.status // "ok") != "ok")] | length > 0' <<<"$tool_status_json" >/dev/null; then
+    verdict="WARN"
+  fi
+
+  # `cve_scan` counts only what osv-scanner and grype found. The ecosystem
+  # audits (npm audit, composer audit, cargo-audit, govulncheck) report their
+  # own advisory counts and were never folded in, so a critical seen only by
+  # npm audit left the verdict at GO. `audit_totals` is the aggregate every
+  # gating consumer reads: CVE scan + every ecosystem audit that actually ran.
+  #
+  # These are SCANNER REPORTS, not distinct advisories: only osv and grype
+  # carry ids we can compare, so one advisory reported by three scanners
+  # counts three times. The aggregate decides "is there a critical anywhere",
+  # which double counting cannot change; consumers that show a number to a
+  # human show the per-source breakdown instead.
+  local audit_totals_json
+  audit_totals_json=$(jq -n \
+    --argjson critical "$critical" --argjson high "$high" \
+    --argjson medium "$medium" --argjson low "$low" \
+    --argjson audits "$ecosystem_audits_json" '
+    def counted: (.status // "") as $s | ($s == "ok") or ($s == "partial");
+    def sum(f): ([$audits[]? | select(counted) | (f // 0)] | add) // 0;
+    {
+      critical: ($critical + sum(.critical)),
+      high: ($high + sum(.high)),
+      medium: ($medium + sum(.medium)),
+      low: ($low + sum(.low)),
+      unknown: sum(.unknown),
+      cve_scan: {critical: $critical, high: $high, medium: $medium, low: $low},
+      ecosystem: [$audits[]? | select(counted)
+                  | {scanner, status, total, critical, high, medium, low, unknown: (.unknown // 0)}],
+      deduplicated: false
+    }' 2>/dev/null || printf '{"critical":%s,"high":%s,"medium":%s,"low":%s,"unknown":0,"deduplicated":false}' \
+      "$critical" "$high" "$medium" "$low")
+  if jq -e '(.critical + .high + .medium + .low + (.unknown // 0)) > 0' <<<"$audit_totals_json" >/dev/null 2>&1; then
     verdict="WARN"
   fi
 
@@ -2546,6 +2774,7 @@ build_scan_result_from_artifacts() {
     --argjson ecosystem_audits "$ecosystem_audits_json" \
     --argjson source_scan "$source_scan_json" \
     --argjson tool_status "$tool_status_json" \
+    --argjson audit_totals "$audit_totals_json" \
     --argjson findings "$findings_json" \
     '{
       machine: $machine,
@@ -2572,25 +2801,301 @@ build_scan_result_from_artifacts() {
         low: $low,
         findings: $findings
       },
+      audit_totals: $audit_totals,
       tool_status: $tool_status,
       ecosystem_audits: $ecosystem_audits,
       source_scan: $source_scan,
       verdict: $verdict
-    }' > "$result_path"
+    }' > "$build_tmp"
 
-  local delta_json tmp
-  delta_json=$(build_delta_json "$machine" "$result_path" "$sbom_path")
-  tmp=$(mktemp)
-  jq --argjson delta "$delta_json" '. + {delta: $delta}' "$result_path" > "$tmp"
-  mv "$tmp" "$result_path"
+  # The document is assembled in a private file and only then published to the
+  # shared per-day path: `<date>-scan.json` is one file per machine per day, so
+  # a concurrent scan of another project can replace it between any two reads.
+  # Nothing that decides anything may re-read the shared path.
+  local delta_json snapshot
+  delta_json=$(build_delta_json "$machine" "$result_path" "$sbom_path" "$build_tmp" "$sbom_src")
+  snapshot=$(mktemp)
+  jq --argjson delta "$delta_json" '. + {delta: $delta}' "$build_tmp" > "$snapshot"
+  rm -f "$build_tmp"
+  cp "$snapshot" "$result_path"
 
-  render_scan_summary "$result_path"
+  LAST_SCAN_RESULT_PATH="$result_path"
+  LAST_SCAN_RESULT_SNAPSHOT="$snapshot"
+  write_scan_result_out "$snapshot"
+  # Rendered from the snapshot, addressed as the shared path: the numbers are
+  # this scan's, the path a human can open afterwards.
+  render_scan_summary "$snapshot" "$result_path"
+}
+
+# --------------------------------------------------------------------------
+# Scan cache (deps-only)
+#
+# A --deps-only scan is keyed by the dependency evidence it reads: the
+# lockfiles and manifests, each hashed by content. An unchanged evidence set
+# inside the TTL replays the recorded result instead of re-running scanners.
+#
+# Discipline: the cache may only ever SKIP work, never invent a verdict. Every
+# failure mode here — missing jq, unreadable entry, corrupt JSON, malformed
+# timestamp, envelope belonging to another request, entry written by an older
+# safe, empty evidence — falls through to a real scan, and never aborts the
+# scan it was supposed to accelerate.
+#
+# What the key does NOT cover, and how each gap is handled:
+#   - Source files. govulncheck reads `./...`, not just go.mod/go.sum, so a
+#     result containing a govulncheck run is never stored (see
+#     scan_cache_result_is_cacheable).
+#   - Advisory databases. npm/composer/cargo audits and OSV consult live data
+#     that can gain an advisory while an entry is fresh. That window is exactly
+#     the TTL and is the deliberate cost of the cache: `--no-cache` (and the
+#     TTL knob) is the escape hatch, and a hit says so on stdout.
+#   - Full/source scans, which stage arbitrary files no evidence hash captures:
+#     never cached at all.
+# --------------------------------------------------------------------------
+
+# Deliver the caller's copy atomically: a reader watching the path sees either
+# no file or a complete document, never half of one.
+write_scan_result_out() {
+  local source_doc="$1"
+  [[ -n "$SCAN_RESULT_OUT" ]] || return 0
+  local dir tmp
+  dir="$(dirname -- "$SCAN_RESULT_OUT")"
+  tmp="$(mktemp "$dir/.safe-result.XXXXXX")" || die "cannot write scan result to $SCAN_RESULT_OUT"
+  if ! cp "$source_doc" "$tmp" || ! mv "$tmp" "$SCAN_RESULT_OUT"; then
+    rm -f "$tmp"
+    die "cannot write scan result to $SCAN_RESULT_OUT"
+  fi
+  return 0
+}
+
+scan_cache_ttl_seconds() {
+  local ttl="${SCAN_CACHE_TTL_SECONDS:-}"
+  # A malformed TTL disables the cache rather than defaulting silently: the
+  # operator asked for a specific window and we could not honor it.
+  [[ "$ttl" =~ ^[0-9]+$ ]] || return 1
+  (( 10#$ttl > 0 )) || return 1
+  printf '%s' "$((10#$ttl))"
+}
+
+scan_cache_enabled() {
+  local scan_mode="$1"
+  [[ "$scan_mode" == "deps" ]] || return 1
+  [[ "${SAFE_AUDIT_SCAN_NO_CACHE:-0}" != "1" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  command -v sha256sum >/dev/null 2>&1 || return 1
+  scan_cache_ttl_seconds >/dev/null || return 1
+  return 0
+}
+
+# A result is replayable only if every scanner that contributed to it read
+# nothing outside the hashed evidence, and only if the scanner set itself was
+# complete. Three exclusions:
+#   - govulncheck at all (any status): it analyses Go SOURCE, which the key
+#     does not cover, and if it was merely absent, installing it later must
+#     not be masked by a replay of the run that lacked it.
+#   - any ecosystem audit that did not return "ok": a tool that was missing
+#     or broken is coverage the key cannot represent, so the next scan runs
+#     for real rather than replaying a partial answer.
+#   - any core tool (osv-scanner, syft, grype) in a non-ok state, for the
+#     same reason.
+scan_cache_result_is_cacheable() {
+  local result="$1"
+  jq -e '
+    ([.ecosystem_audits[]? | select((.scanner // "") == "govulncheck")] | length == 0)
+    and ([.ecosystem_audits[]?
+          | select((.status // "ok") != "ok")
+          | select((.status // "") != "unsupported")] | length == 0)
+    and ([.tool_status // {} | to_entries[]? | select((.value.status // "ok") != "ok")] | length == 0)
+  ' "$result" >/dev/null 2>&1
+}
+
+# Every input a scanner reads must be in the key, and discovery is not that
+# list: it walks regular files, so a lockfile that exists as a SYMLINK is read
+# by `npm audit` while being invisible to the hash, and it has no reason to
+# track files that are not dependency evidence but still change what a scanner
+# asks (`.npmrc` selects the registry npm audit queries; `.safe-audit` decides
+# which ecosystems are audited at all). This enumerates both.
+SCAN_CACHE_EXTRA_EVIDENCE=(
+  package.json package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock .npmrc
+  requirements.txt requirements-dev.txt pyproject.toml uv.lock poetry.lock Pipfile.lock
+  composer.json composer.lock Cargo.toml Cargo.lock go.mod go.sum .safe-audit
+)
+
+# The scanner set is an input too. Install pip-audit and a project that was
+# GO gains Python coverage; remove it and that coverage disappears — neither
+# touches a single evidence file, so without this the cache would replay a
+# verdict produced by a different set of tools.
+#
+# Identity is path + size + mtime: no subprocess, and an upgrade in place
+# changes it. Nothing here is secret — only whether a tool exists and which
+# build it is.
+scan_cache_scanner_fingerprint() {
+  local tool path
+  for tool in osv-scanner syft grype npm composer cargo cargo-audit govulncheck pip-audit; do
+    path="$(command -v "$tool" 2>/dev/null || true)"
+    if [[ -n "$path" && -e "$path" ]]; then
+      printf '%s\t%s\n' "$tool" "$(stat -Lc '%s:%Y:%n' "$path" 2>/dev/null || printf '%s' "$path")"
+    else
+      printf '%s\t<absent>\n' "$tool"
+    fi
+  done
+}
+
+scan_cache_evidence_paths() {
+  local root name path
+  for path in ${CURRENT_LOCKFILES[@]+"${CURRENT_LOCKFILES[@]}"} \
+              ${CURRENT_MANIFESTS[@]+"${CURRENT_MANIFESTS[@]}"}; do
+    [[ -n "$path" ]] && printf '%s\n' "$path"
+  done
+  for root in ${CURRENT_PROJECT_ROOTS[@]+"${CURRENT_PROJECT_ROOTS[@]}"}; do
+    for name in "${SCAN_CACHE_EXTRA_EVIDENCE[@]}"; do
+      path="$root/$name"
+      # -e follows symlinks, and so does the hash: what the scanner will read
+      # is what gets hashed.
+      [[ -e "$path" ]] && printf '%s\n' "$path"
+    done
+  done
+}
+
+# sha256 over machine, target, mode, and every evidence file's own sha256.
+# Empty evidence is NOT cacheable: there would be nothing to invalidate on.
+#
+# Paths enter the key RELATIVE to the scan root. A remote scan stages its files
+# into a fresh mktemp directory every run, so absolute paths would make two
+# scans of an unchanged remote target hash differently and the cache would
+# never hit where it is most expensive to miss.
+scan_cache_key() {
+  local machine="$1" target="$2" scan_mode="$3" root="$4"
+  shift 4
+  local tmp file digest rel
+  tmp=$(mktemp) || return 1
+  printf '%s\n%s\n%s\n' "$machine" "$target" "$scan_mode" > "$tmp"
+  scan_cache_scanner_fingerprint >> "$tmp"
+  local -a evidence=()
+  mapfile -t evidence < <(printf '%s\n' "$@" | LC_ALL=C sort -u)
+  local counted=0
+  for file in "${evidence[@]}"; do
+    [[ -n "$file" ]] || continue
+    if [[ ! -r "$file" ]]; then
+      rm -f "$tmp"
+      return 1
+    fi
+    rel="$file"
+    [[ -n "$root" ]] && rel="${file#"$root"/}"
+    printf '%s  %s\n' "$(sha256sum "$file" | awk '{print $1}')" "$rel" >> "$tmp"
+    counted=$((counted + 1))
+  done
+  if (( counted == 0 )); then
+    rm -f "$tmp"
+    return 1
+  fi
+  digest=$(sha256sum "$tmp" | awk '{print $1}')
+  rm -f "$tmp"
+  [[ -n "$digest" ]] || return 1
+  printf '%s' "$digest"
+}
+
+scan_cache_human_age() {
+  local seconds="$1"
+  if (( seconds < 60 )); then
+    printf '%ds' "$seconds"
+  elif (( seconds < 3600 )); then
+    printf '%dm' "$((seconds / 60))"
+  else
+    printf '%dh %dm' "$((seconds / 3600))" "$(((seconds % 3600) / 60))"
+  fi
+}
+
+# Replay a cached result. Returns 1 for ANY doubt so the caller runs a real
+# scan; returns 0 only after rendering a valid, fresh entry that belongs to
+# THIS request. Every check is inside one jq predicate on purpose: bash
+# arithmetic on a value taken from a cache file is itself an abort risk
+# (`$((now - 08))` is a fatal "value too great for base"), and an aborted
+# scan reads to a caller as "scan failed", not as "no cache".
+scan_cache_replay() {
+  local key="$1" machine="$2" target="$3" scan_mode="$4"
+  local path="$SCAN_CACHE_DIR/$key.json"
+  [[ -n "$key" && -r "$path" ]] || return 1
+
+  local ttl
+  ttl="$(scan_cache_ttl_seconds)" || return 1
+
+  jq -e \
+    --arg key "$key" --arg machine "$machine" --arg target "$target" \
+    --arg mode "$scan_mode" --argjson ttl "$ttl" --argjson schema "$SCAN_CACHE_SCHEMA" '
+    (._cache // {}) as $c
+    | ($c.schema == $schema)
+      and ($c.key == $key)
+      and ($c.machine == $machine)
+      and ($c.target == $target)
+      and ($c.mode == $mode)
+      and (($c.created_epoch | type) == "number")
+      and ($c.created_epoch <= now)
+      and ((now - $c.created_epoch) < $ttl)
+      and ((.verdict | type) == "string")
+      and ((.verdict == "GO") or (.verdict == "WARN") or (.verdict == "BLOCK"))
+      and ((.summary | type) == "object")
+      and ((.cve_scan | type) == "object")
+      and ((.cve_scan.critical | type) == "number")
+      and ((.cve_scan.high | type) == "number")
+      and ((.cve_scan.medium | type) == "number")
+      and ((.cve_scan.low | type) == "number")
+      and ((.audit_totals | type) == "object")
+      and ((.audit_totals.critical | type) == "number")
+      and ((.ecosystem_audits | type) == "array")
+      and ((.tool_status | type) == "object")
+  ' "$path" >/dev/null 2>&1 || return 1
+
+  local age
+  age="$(jq -r '((now - ._cache.created_epoch) | floor)' "$path" 2>/dev/null || true)"
+  [[ "$age" =~ ^[0-9]+$ ]] || return 1
+
+  printf '[safe audit] scan cache hit (%s old) — dependency evidence unchanged; --no-cache forces a fresh scan\n' \
+    "$(scan_cache_human_age "$((10#$age))")"
+  LAST_SCAN_RESULT_PATH="$path"
+  LAST_SCAN_RESULT_SNAPSHOT="$path"
+  write_scan_result_out "$path" || return 1
+  render_scan_summary "$path"
+}
+
+# Cache writes never fail a scan: a full result was already produced.
+scan_cache_store() {
+  local key="$1" result="$2" machine="$3" target="$4" scan_mode="$5"
+  [[ -n "$key" && -n "$result" && -r "$result" ]] || return 0
+  scan_cache_result_is_cacheable "$result" || {
+    vinfo "scan cache: result reads beyond the hashed evidence; not stored"
+    return 0
+  }
+  mkdir -p "$SCAN_CACHE_DIR" 2>/dev/null || return 0
+  local tmp
+  tmp=$(mktemp "$SCAN_CACHE_DIR/.tmp.XXXXXX" 2>/dev/null) || return 0
+  if jq --arg k "$key" --arg m "$machine" --arg t "$target" --arg mode "$scan_mode" \
+      --argjson schema "$SCAN_CACHE_SCHEMA" --argjson epoch "$(date +%s)" \
+      '. + {_cache: {schema: $schema, key: $k, machine: $m, target: $t, mode: $mode, created_epoch: $epoch}}' \
+      "$result" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$SCAN_CACHE_DIR/$key.json" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
+  return 0
 }
 
 scan_source_into_result() {
   local machine="$1" source="$2" original_target="$3" strategy="$4" scan_mode="${5:-source}" allow_source_fallback="${6:-1}"
   vinfo "$machine: scan source=$(printf '%q' "$source") target=$(printf '%q' "$original_target") strategy=$strategy mode=$scan_mode fallback=$allow_source_fallback"
   gather_projects_from_source "$source" "$allow_source_fallback"
+
+  local cache_key=""
+  local -a cache_evidence=()
+  if scan_cache_enabled "$scan_mode"; then
+    mapfile -t cache_evidence < <(scan_cache_evidence_paths)
+    cache_key="$(scan_cache_key "$machine" "$original_target" "$scan_mode" "$source" \
+      ${cache_evidence[@]+"${cache_evidence[@]}"} || true)"
+    vinfo "$machine: scan cache key=${cache_key:-<none>}"
+    if [[ -n "$cache_key" ]] && scan_cache_replay "$cache_key" "$machine" "$original_target" "$scan_mode"; then
+      return 0
+    fi
+  fi
+
   detect_machine_tools "$machine"
   local project_tools_rc
   confirm_scan_with_missing_project_audit_tools "$machine" "$original_target"
@@ -2635,7 +3140,31 @@ scan_source_into_result() {
     jq -s 'add' "${project_audits_files[@]}" > "$audits_tmp"
   fi
 
-  build_scan_result_from_artifacts "$machine" "$original_target" "$strategy" "$sbom_tmp" "$osv_json" "$grype_json" "$audits_tmp" "$scan_mode" "$source_scan_tmp"
+  local build_rc=0
+  build_scan_result_from_artifacts "$machine" "$original_target" "$strategy" "$sbom_tmp" "$osv_json" "$grype_json" "$audits_tmp" "$scan_mode" "$source_scan_tmp" || build_rc=$?
+  if [[ -n "$cache_key" && "$build_rc" -eq 0 ]]; then
+    # The key was computed before the scanners ran. If the evidence changed
+    # underneath them, this result describes bytes that are no longer on disk
+    # and must not be filed under the original key — that is how a clean
+    # verdict ends up answering for a vulnerable lockfile.
+    local verify_key=""
+    local -a verify_evidence=()
+    mapfile -t verify_evidence < <(scan_cache_evidence_paths)
+    verify_key="$(scan_cache_key "$machine" "$original_target" "$scan_mode" "$source" \
+      ${verify_evidence[@]+"${verify_evidence[@]}"} || true)"
+    # The path SET is compared too: a `.safe-audit` created mid-scan changes
+    # which ecosystems ran while every previously-known file still hashes the
+    # same, and the frozen list would never notice.
+    local before after
+    before="$(printf '%s\n' ${cache_evidence[@]+"${cache_evidence[@]}"} | LC_ALL=C sort -u)"
+    after="$(printf '%s\n' ${verify_evidence[@]+"${verify_evidence[@]}"} | LC_ALL=C sort -u)"
+    if [[ -n "$verify_key" && "$verify_key" == "$cache_key" && "$before" == "$after" ]]; then
+      scan_cache_store "$cache_key" "$LAST_SCAN_RESULT_SNAPSHOT" "$machine" "$original_target" "$scan_mode"
+    else
+      vinfo "$machine: evidence changed during the scan; result not cached"
+    fi
+  fi
+  return "$build_rc"
 }
 
 scan_source_with_external_sbom_into_result() {
@@ -2769,7 +3298,7 @@ json_string_or_null() {
 }
 
 render_ecosystem_audit_json() {
-  local scanner="$1" status="$2" total="$3" critical="$4" high="$5" medium="$6" low="$7" note="${8:-}"
+  local scanner="$1" status="$2" total="$3" critical="$4" high="$5" medium="$6" low="$7" note="${8:-}" unknown="${9:-0}"
   printf '{'
   printf '"scanner":%s,' "$(json_string_or_null "$scanner")"
   printf '"status":%s,' "$(json_string_or_null "$status")"
@@ -2778,6 +3307,7 @@ render_ecosystem_audit_json() {
   printf '"high":%s,' "$high"
   printf '"medium":%s,' "$medium"
   printf '"low":%s,' "$low"
+  printf '"unknown":%s,' "$unknown"
   printf '"note":%s' "$(json_string_or_null "$note")"
   printf '}'
 }
@@ -2894,128 +3424,303 @@ nearest_project_config() {
   return 1
 }
 
+# The remote payload is a standalone script: it carries its own copy of the
+# severity primitives and of the normalizers below. Both copies are compared
+# by tests/audit/scan_cache.sh, so an edit to one must be made to the other.
+# shellcheck disable=SC2016
+JQ_SEVERITY_DEFS='
+def band_rank(b): ({critical: 4, high: 3, moderate: 2, low: 1}[b]) // 0;
+def norm_qual:
+  (tostring | ascii_downcase)
+  | (if . == "medium" then "moderate" else . end)
+  | select(. == "critical" or . == "high" or . == "moderate" or . == "low");
+def cvss3_metrics: split("/") | map(split(":") | select(length == 2) | {(.[0]): .[1]}) | add // {};
+def cvss3_band:
+  cvss3_metrics as $m
+  | ({N: 0.85, A: 0.62, L: 0.55, P: 0.2}[$m["AV"]?]) as $av
+  | ({L: 0.77, H: 0.44}[$m["AC"]?]) as $ac
+  | ({N: 0.85, R: 0.62}[$m["UI"]?]) as $ui
+  | ($m["S"]? == "C") as $chg
+  | ((if $chg then {N: 0.85, L: 0.68, H: 0.5} else {N: 0.85, L: 0.62, H: 0.27} end)[$m["PR"]?]) as $pr
+  | ({H: 0.56, L: 0.22, N: 0}[$m["C"]?]) as $c
+  | ({H: 0.56, L: 0.22, N: 0}[$m["I"]?]) as $i
+  | ({H: 0.56, L: 0.22, N: 0}[$m["A"]?]) as $a
+  | if ($av == null or $ac == null or $ui == null or $pr == null or $c == null or $i == null or $a == null)
+    then empty
+    else
+      (1 - ((1 - $c) * (1 - $i) * (1 - $a))) as $iss
+      | (if $chg then (7.52 * ($iss - 0.029)) - (3.25 * pow($iss - 0.02; 15)) else 6.42 * $iss end) as $impact
+      | (8.22 * $av * $ac * $pr * $ui) as $expl
+      | (if $impact <= 0 then 0
+         else
+           (($impact + $expl) * (if $chg then 1.08 else 1 end)) as $sum
+           | (if $sum < 10 then $sum else 10 end)
+         end) as $rawscore
+      | ((($rawscore * 10) | ceil) / 10) as $score
+      | (if $score >= 9 then "critical"
+         elif $score >= 7 then "high"
+         elif $score >= 4 then "moderate"
+         elif $score > 0 then "low"
+         else empty
+         end)
+    end;
+'
+# --- ecosystem audit normalizers (shared local/remote; keep both copies identical) ---
+# Each runner turns one scanner's native output into the same record. Three
+# rules, all learned the hard way:
+#   1. A scanner's EXIT STATUS is retained. These tools exit nonzero when they
+#      find something AND when they break, so the shape of the output decides:
+#      output we can read is a result, anything else is `status:"error"`.
+#      "Ran, failed, reported zero findings" is the one answer that must never
+#      be produced — it is indistinguishable from a clean project.
+#   2. Counts are ADVISORIES, not dependencies. pip-audit lists every dependency
+#      with its own `vulns` array, and composer keys advisories by package;
+#      counting the outer container turns a clean project into findings.
+#   3. A severity that cannot be determined is `unknown`, never `medium`.
+#      Unknown severities warn; they never manufacture a severity band.
+# shellcheck disable=SC2016
+ECO_AUDIT_JQ_DEFS='
+def sev_norm:
+  (tostring | ascii_downcase)
+  | if . == "critical" then "critical"
+    elif . == "high" then "high"
+    elif . == "moderate" or . == "medium" then "medium"
+    elif . == "low" then "low"
+    else "unknown" end;
+def audit_doc($scanner; $sevs):
+  {
+    scanner: $scanner,
+    status: "ok",
+    total: ($sevs | length),
+    critical: ([$sevs[] | select(. == "critical")] | length),
+    high: ([$sevs[] | select(. == "high")] | length),
+    medium: ([$sevs[] | select(. == "medium")] | length),
+    low: ([$sevs[] | select(. == "low")] | length),
+    unknown: ([$sevs[] | select(. == "unknown")] | length),
+    note: null
+  };
+'
+
+# ecosystem_audit_error <scanner> <exit-code> <stderr-file> <output>
+# The note always contains "failed": consumers key their infrastructure
+# refusal off the status, older readers off the note.
+ecosystem_audit_error() {
+  local scanner="$1" rc="$2" stderr_file="$3" output="$4"
+  local detail=""
+  if [[ -r "$stderr_file" ]]; then
+    detail="$(tr -d '\r' < "$stderr_file" | grep -v '^[[:space:]]*$' | tail -n 1)"
+    detail="${detail:0:160}"
+  fi
+  printf '%s\n' "$(render_ecosystem_audit_json "$scanner" "error" 0 0 0 0 0 \
+    "${scanner} failed (exit ${rc})${detail:+: ${detail}}" 0)" > "$output"
+}
+
 run_npm_audit_dir() {
   local dir="$1" output="$2"
   if ! command -v npm >/dev/null 2>&1; then
-    printf '%s\n' "$(render_ecosystem_audit_json "npm-audit" "skipped" 0 0 0 0 0 "npm unavailable")" > "$output"
+    printf '%s\n' "$(render_ecosystem_audit_json "npm-audit" "skipped" 0 0 0 0 0 "npm unavailable" 0)" > "$output"
     return 0
   fi
-  if ! (cd "$dir" && npm audit --json) > "$output.raw" 2>"$output.stderr"; then :; fi
-  jq -n --slurpfile data "$output.raw" '
-    ($data[0] // {}) as $r |
-    {
-      scanner: "npm-audit",
-      status: "ok",
-      total: ($r.metadata.vulnerabilities.total // 0),
-      critical: ($r.metadata.vulnerabilities.critical // 0),
-      high: ($r.metadata.vulnerabilities.high // 0),
-      medium: ($r.metadata.vulnerabilities.moderate // 0),
-      low: ($r.metadata.vulnerabilities.low // 0),
-      note: null
-    }
-  ' > "$output"
+  # `npm audit` reads an npm lockfile and nothing else. That is not a broken
+  # scanner — it is evidence npm cannot read — but the two cases behind it are
+  # very different:
+  #   - a pnpm or Yarn lockfile: osv-scanner audits that lockfile, so the
+  #     project IS covered. Deterministic, decided by files that are in the
+  #     cache key: "unsupported", no verdict change, still cacheable.
+  #   - no lockfile at all: nothing covers these dependencies. Reporting GO
+  #     would mean "we looked at nothing and found nothing".
+  if [[ ! -f "$dir/package-lock.json" && ! -f "$dir/npm-shrinkwrap.json" ]]; then
+    if [[ -f "$dir/pnpm-lock.yaml" || -f "$dir/yarn.lock" ]]; then
+      printf '%s\n' "$(render_ecosystem_audit_json "npm-audit" "unsupported" 0 0 0 0 0 "npm audit cannot read pnpm/yarn lockfiles; osv-scanner covers that evidence" 0)" > "$output"
+    else
+      printf '%s\n' "$(render_ecosystem_audit_json "npm-audit" "unsupported" 0 0 0 0 0 "no lockfile: these npm dependencies are not audited" 0)" > "$output"
+    fi
+    return 0
+  fi
+  local rc=0
+  (cd "$dir" && npm audit --json) > "$output.raw" 2>"$output.stderr" || rc=$?
+  # npm audit exits 1 when it finds something, so only the shape can tell a
+  # result from a failure.
+  if ! jq -e '(.metadata.vulnerabilities | type) == "object"' "$output.raw" >/dev/null 2>&1; then
+    ecosystem_audit_error "npm-audit" "$rc" "$output.stderr" "$output"
+    return 0
+  fi
+  jq "$ECO_AUDIT_JQ_DEFS"'
+    (.metadata.vulnerabilities) as $v
+    | ( [ range(0; $v.critical // 0) | "critical" ]
+      + [ range(0; $v.high // 0)     | "high" ]
+      + [ range(0; $v.moderate // 0) | "medium" ]
+      + [ range(0; $v.low // 0)      | "low" ]
+      + [ range(0; $v.info // 0)     | "unknown" ] ) as $sevs
+    | audit_doc("npm-audit"; $sevs)
+  ' "$output.raw" > "$output" 2>/dev/null || ecosystem_audit_error "npm-audit" "$rc" "$output.stderr" "$output"
 }
 
 run_composer_audit_dir() {
   local dir="$1" output="$2"
   if ! command -v composer >/dev/null 2>&1; then
-    printf '%s\n' "$(render_ecosystem_audit_json "composer-audit" "skipped" 0 0 0 0 0 "composer unavailable")" > "$output"
+    printf '%s\n' "$(render_ecosystem_audit_json "composer-audit" "skipped" 0 0 0 0 0 "composer unavailable" 0)" > "$output"
     return 0
   fi
-  if ! (cd "$dir" && composer audit --format=json) > "$output.raw" 2>"$output.stderr"; then :; fi
-  jq -n --slurpfile data "$output.raw" '
-    ($data[0].advisories // []) as $a |
-    {
-      scanner: "composer-audit",
-      status: "ok",
-      total: ($a | length),
-      critical: ([$a[]? | select((.severity // "") | ascii_downcase == "critical")] | length),
-      high: ([$a[]? | select((.severity // "") | ascii_downcase == "high")] | length),
-      medium: ([$a[]? | select((.severity // "") | ascii_downcase == "medium")] | length),
-      low: ([$a[]? | select((.severity // "") | ascii_downcase == "low")] | length),
-      note: null
-    }
-  ' > "$output"
+  local rc=0
+  (cd "$dir" && composer audit --format=json) > "$output.raw" 2>"$output.stderr" || rc=$?
+  # composer keys advisories BY PACKAGE: {"advisories":{"vendor/pkg":[...]}}.
+  # Read as a flat array it finds nothing at all.
+  if ! jq -e 'has("advisories")' "$output.raw" >/dev/null 2>&1; then
+    ecosystem_audit_error "composer-audit" "$rc" "$output.stderr" "$output"
+    return 0
+  fi
+  jq "$ECO_AUDIT_JQ_DEFS"'
+    ( .advisories // {} ) as $a
+    | [ if ($a | type) == "object" then ($a[] | .[]?) else ($a[]?) end ] as $adv
+    | [ $adv[] | ((.severity // "unknown") | sev_norm) ] as $sevs
+    | audit_doc("composer-audit"; $sevs)
+  ' "$output.raw" > "$output" 2>/dev/null || ecosystem_audit_error "composer-audit" "$rc" "$output.stderr" "$output"
 }
 
 run_cargo_audit_dir() {
   local dir="$1" output="$2"
   if ! command -v cargo-audit >/dev/null 2>&1; then
-    printf '%s\n' "$(render_ecosystem_audit_json "cargo-audit" "skipped" 0 0 0 0 0 "cargo-audit unavailable")" > "$output"
+    printf '%s\n' "$(render_ecosystem_audit_json "cargo-audit" "skipped" 0 0 0 0 0 "cargo-audit unavailable" 0)" > "$output"
     return 0
   fi
-  if ! (cd "$dir" && cargo audit --json) > "$output.raw" 2>"$output.stderr"; then :; fi
-  jq -n --slurpfile data "$output.raw" '
-    ($data[0].vulnerabilities.list // []) as $list |
-    {
-      scanner: "cargo-audit",
-      status: "ok",
-      total: ($list | length),
-      critical: 0,
-      high: ([$list[]? | select((.advisory.severity // "") | ascii_downcase == "high")] | length),
-      medium: ([$list[]? | select((.advisory.severity // "") | ascii_downcase == "medium")] | length),
-      low: ([$list[]? | select((.advisory.severity // "") | ascii_downcase == "low")] | length),
-      note: null
-    }
-  ' > "$output"
+  local rc=0
+  (cd "$dir" && cargo audit --json) > "$output.raw" 2>"$output.stderr" || rc=$?
+  if ! jq -e '(.vulnerabilities.list | type) == "array"' "$output.raw" >/dev/null 2>&1; then
+    ecosystem_audit_error "cargo-audit" "$rc" "$output.stderr" "$output"
+    return 0
+  fi
+  # RustSec advisories carry a CVSS vector far more often than a severity
+  # word; scoring the vector is the only way most of them get a band at all.
+  jq "$JQ_SEVERITY_DEFS$ECO_AUDIT_JQ_DEFS"'
+    [ .vulnerabilities.list[]?
+      | .advisory as $a
+      | ( [ ($a.severity // empty | sev_norm) ]
+        + [ ($a.cvss // empty | cvss3_band | sev_norm) ] ) as $cands
+      | ( [ $cands[] | select(. != "unknown") ] + ["unknown"] )[0]
+    ] as $sevs
+    | audit_doc("cargo-audit"; $sevs)
+  ' "$output.raw" > "$output" 2>/dev/null || ecosystem_audit_error "cargo-audit" "$rc" "$output.stderr" "$output"
 }
 
 run_govulncheck_dir() {
   local dir="$1" output="$2"
   if ! command -v govulncheck >/dev/null 2>&1; then
-    printf '%s\n' "$(render_ecosystem_audit_json "govulncheck" "skipped" 0 0 0 0 0 "govulncheck unavailable")" > "$output"
+    printf '%s\n' "$(render_ecosystem_audit_json "govulncheck" "skipped" 0 0 0 0 0 "govulncheck unavailable" 0)" > "$output"
     return 0
   fi
-  if ! (cd "$dir" && govulncheck -json ./...) > "$output.raw" 2>"$output.stderr"; then :; fi
-  jq -Rn --arg raw "$(cat "$output.raw" 2>/dev/null || true)" '
-    ($raw | split("\n") | map(select(length > 0) | fromjson? // empty)) as $entries |
-    ($entries | map(select(.finding?)) | length) as $total |
-    {
-      scanner: "govulncheck",
-      status: "ok",
-      total: $total,
-      critical: 0,
-      high: 0,
-      medium: $total,
-      low: 0,
-      note: null
-    }
-  ' > "$output"
+  local rc=0
+  (cd "$dir" && govulncheck -json ./...) > "$output.raw" 2>"$output.stderr" || rc=$?
+  # In -json mode govulncheck reports findings IN the stream and exits 0; a
+  # nonzero exit means the run itself failed (module loading, database), and
+  # the stream it already wrote may be a complete-looking prefix.
+  if (( rc != 0 )); then
+    ecosystem_audit_error "govulncheck" "$rc" "$output.stderr" "$output"
+    return 0
+  fi
+  # NDJSON, and every non-blank line must parse. Tolerating unparsable lines
+  # would turn a stream that died halfway — config record written, findings
+  # truncated — into a confident "zero findings". The stream must also look
+  # like govulncheck: at least one record it actually emits.
+  jq -Rs "$ECO_AUDIT_JQ_DEFS"'
+    ( split("\n") | map(select(test("[^[:space:]]"))) ) as $lines
+    | ( $lines | map(fromjson? // null) ) as $parsed
+    | if ($parsed | length) == 0 then error("empty govulncheck stream") else . end
+    | if ($parsed | map(select(. == null)) | length) > 0
+      then error("unparsable govulncheck records") else . end
+    | if ([ $parsed[] | select(type == "object")
+            | select(has("config") or has("progress") or has("osv") or has("finding")) ] | length) == 0
+      then error("stream is not govulncheck output") else . end
+    | ( [ $parsed[] | select(type == "object") | select(has("finding"))
+          | (.finding.osv // "unknown") ] | unique ) as $ids
+    | [ $ids[] | "unknown" ] as $sevs
+    | audit_doc("govulncheck"; $sevs)
+  ' < "$output.raw" > "$output" 2>/dev/null || ecosystem_audit_error "govulncheck" "$rc" "$output.stderr" "$output"
 }
 
 run_pip_audit_dir() {
   local dir="$1" output="$2"
   if ! command -v pip-audit >/dev/null 2>&1; then
-    printf '%s\n' "$(render_ecosystem_audit_json "pip-audit" "skipped" 0 0 0 0 0 "pip-audit unavailable")" > "$output"
+    printf '%s\n' "$(render_ecosystem_audit_json "pip-audit" "skipped" 0 0 0 0 0 "pip-audit unavailable" 0)" > "$output"
     return 0
   fi
-  local target_file=""
-  for target_file in "$dir/requirements.txt" "$dir/requirements-dev.txt" "$dir/pyproject.toml"; do
-    [[ -f "$target_file" ]] && break
+
+  # EVERY declared target is audited, not the first one found: a vulnerable
+  # dependency that appears only in requirements-dev.txt was never submitted
+  # when the loop stopped at requirements.txt. A bare `pip-audit -f json`
+  # audits the ACTIVE PYTHON ENVIRONMENT rather than the project, so a
+  # pyproject is audited by path.
+  local -a invocations=()
+  local candidate
+  for candidate in requirements.txt requirements-dev.txt; do
+    [[ -f "$dir/$candidate" ]] && invocations+=("-r|$dir/$candidate")
   done
-  if [[ ! -f "$target_file" ]]; then
-    printf '%s\n' "$(render_ecosystem_audit_json "pip-audit" "skipped" 0 0 0 0 0 "no supported python audit target found")" > "$output"
+  [[ -f "$dir/pyproject.toml" ]] && invocations+=("project|$dir")
+
+  if [[ "${#invocations[@]}" -eq 0 ]]; then
+    printf '%s\n' "$(render_ecosystem_audit_json "pip-audit" "skipped" 0 0 0 0 0 "no supported python audit target found" 0)" > "$output"
     return 0
   fi
-  if [[ "$target_file" == *.txt ]]; then
-    if ! pip-audit -r "$target_file" -f json > "$output.raw" 2>"$output.stderr"; then :; fi
-  else
-    if ! (cd "$dir" && pip-audit -f json) > "$output.raw" 2>"$output.stderr"; then :; fi
+
+  local rc=0 invocation kind value index=0 last_rc=0
+  local -a parts=()
+  local -a failed=()
+  for invocation in "${invocations[@]}"; do
+    kind="${invocation%%|*}"
+    value="${invocation#*|}"
+    index=$((index + 1))
+    rc=0
+    if [[ "$kind" == "-r" ]]; then
+      pip-audit -r "$value" -f json > "$output.raw.$index" 2>"$output.stderr" || rc=$?
+    else
+      pip-audit -f json "$value" > "$output.raw.$index" 2>"$output.stderr" || rc=$?
+    fi
+    # Both shapes are valid pip-audit: a bare list of dependencies, or
+    # {"dependencies":[...]}. Either way the advisories live in each
+    # dependency's `vulns` — the outer length is a package count, and counting
+    # it made every clean Python project a pile of medium findings.
+    if jq -e 'type == "array" or ((.dependencies | type) == "array")' "$output.raw.$index" >/dev/null 2>&1; then
+      parts+=("$output.raw.$index")
+    else
+      # One target failing must not erase what another target FOUND: a
+      # critical from requirements.txt has to survive requirements-dev.txt
+      # breaking, or a real finding disappears behind an unrelated failure.
+      failed+=("$(basename -- "$value") (exit ${rc})")
+      last_rc="$rc"
+    fi
+  done
+
+  if [[ "${#parts[@]}" -eq 0 ]]; then
+    ecosystem_audit_error "pip-audit" "$last_rc" "$output.stderr" "$output"
+    return 0
   fi
-  jq -n --slurpfile data "$output.raw" '
-    ($data[0] // []) as $list |
-    {
-      scanner: "pip-audit",
-      status: "ok",
-      total: ($list | length),
-      critical: 0,
-      high: 0,
-      medium: ($list | length),
-      low: 0,
-      note: null
-    }
-  ' > "$output"
+
+  # Advisories are merged across targets and deduplicated by package+id: the
+  # same dependency pinned in two requirements files is one advisory. If some
+  # target failed, the counts are real but incomplete: "partial" keeps them
+  # counted while still telling every consumer that coverage is missing.
+  local partial_note=""
+  local audit_status="ok"
+  if [[ "${#failed[@]}" -gt 0 ]]; then
+    audit_status="partial"
+    partial_note="pip-audit failed for: ${failed[*]}"
+  fi
+  jq -s --arg status "$audit_status" --arg note "$partial_note" "$ECO_AUDIT_JQ_DEFS"'
+    [ .[]
+      | (if type == "array" then . else (.dependencies // []) end)
+      | .[]?
+      | . as $dep
+      | (.vulns // [])[]?
+      | { key: (($dep.name // "?") + "@" + ($dep.version // "?") + "/" + (.id // "?")),
+          severity: ((.severity // "unknown") | sev_norm) }
+    ] as $all
+    | ( $all | group_by(.key) | map(.[0].severity) ) as $sevs
+    | audit_doc("pip-audit"; $sevs)
+    | .status = $status
+    | .note = (if $note == "" then null else $note end)
+  ' "${parts[@]}" > "$output" 2>/dev/null || ecosystem_audit_error "pip-audit" "$last_rc" "$output.stderr" "$output"
 }
+# --- end ecosystem audit normalizers ---
 
 run_project_ecosystem_audits() {
   local project_root="$1" output_dir="$2"
@@ -3032,7 +3737,7 @@ run_project_ecosystem_audits() {
       composer-audit) run_composer_audit_dir "$project_root" "$output" ;;
       cargo-audit) run_cargo_audit_dir "$project_root" "$output" ;;
       govulncheck) run_govulncheck_dir "$project_root" "$output" ;;
-      *) printf '%s\n' "$(render_ecosystem_audit_json "$scanner" "skipped" 0 0 0 0 0 "unknown scanner")" > "$output" ;;
+      *) printf '%s\n' "$(render_ecosystem_audit_json "$scanner" "error" 0 0 0 0 0 "unknown scanner ${scanner}: audit configuration failed" 0)" > "$output" ;;
     esac
     audits+=("$output")
   done
@@ -3059,7 +3764,7 @@ while IFS= read -r -d '' file; do
     root=$(dirname "$file")
   fi
   case "$(basename "$file")" in
-    package-lock.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
+    package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
       lockfiles+=("$file")
       if [[ -z "${seen_roots[$root]:-}" ]]; then
         seen_roots["$root"]=1
@@ -3234,7 +3939,7 @@ matches_ignore() {
 
 manifest_matches() {
   case "$(basename "$1")" in
-    package.json|package-lock.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum|.safe-audit)
+    package.json|package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum|.safe-audit)
       return 0
       ;;
     *)
@@ -3245,7 +3950,7 @@ manifest_matches() {
 
 lockfile_matches() {
   case "$(basename "$1")" in
-    package-lock.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
+    package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
       return 0
       ;;
     *)
@@ -4554,14 +5259,10 @@ resolve_npm_versions() {
   return 0
 }
 
-# Severity + classification jq program (single-quoted: no shell escaping).
-# Severity ladder, most-severe candidate wins (fail-closed): the qualitative
-# database_specific/ecosystem_specific labels AND any computable standard
-# CVSS v3 base score are all candidates; a CVSS v4-only advisory with no
-# other parsable severity floors at "high" (v4 scoring not implemented; the
-# receipt carries the raw data). Nothing parsable -> "unknown".
+# Severity primitives, shared by the OSV classifier and the ecosystem-audit
+# normalizers so a CVSS vector means the same thing wherever it appears.
 # shellcheck disable=SC2016
-JQ_OSV_CLASSIFY='
+JQ_SEVERITY_DEFS='
 def band_rank(b): ({critical: 4, high: 3, moderate: 2, low: 1}[b]) // 0;
 def norm_qual:
   (tostring | ascii_downcase)
@@ -4597,6 +5298,16 @@ def cvss3_band:
          else empty
          end)
     end;
+'
+
+# Severity + classification jq program (single-quoted: no shell escaping).
+# Severity ladder, most-severe candidate wins (fail-closed): the qualitative
+# database_specific/ecosystem_specific labels AND any computable standard
+# CVSS v3 base score are all candidates; a CVSS v4-only advisory with no
+# other parsable severity floors at "high" (v4 scoring not implemented; the
+# receipt carries the raw data). Nothing parsable -> "unknown".
+# shellcheck disable=SC2016
+JQ_OSV_CLASSIFY="$JQ_SEVERITY_DEFS"'
 def std_sev_entries($aff): (.severity // []) + ([ $aff[].severity? // empty ] | add // []);
 def vuln_sev($aff):
   (
@@ -7234,6 +7945,22 @@ scan_command() {
         scan_mode_set=1
         shift
         ;;
+      --no-cache)
+        SAFE_AUDIT_SCAN_NO_CACHE=1
+        shift
+        ;;
+      --allow-missing-tools)
+        SAFE_AUDIT_ALLOW_MISSING_TOOLS=1
+        shift
+        ;;
+      --result-out)
+        # Hand the caller its own copy of the result document. The published
+        # per-day file is shared and can be replaced by a concurrent scan
+        # before the caller reads it; this copy cannot.
+        [[ $# -lt 2 ]] && die "--result-out requires a path"
+        SCAN_RESULT_OUT="$2"
+        shift 2
+        ;;
       --project)
         [[ $# -lt 2 ]] && die "--project requires a path"
         project_target="$2"
@@ -7254,7 +7981,21 @@ scan_command() {
     esac
   done
   SAFE_AUDIT_SCAN_MODE="$scan_mode"
+  if [[ -n "$SCAN_RESULT_OUT" ]]; then
+    # Checked before the scan runs: a caller that cannot receive the result
+    # must not learn this after several minutes of scanning.
+    local result_out_dir
+    result_out_dir="$(dirname -- "$SCAN_RESULT_OUT")"
+    [[ -d "$result_out_dir" && -w "$result_out_dir" ]] || die "--result-out directory is not writable: $result_out_dir"
+    # A directory (or anything that is not a regular file) would silently
+    # become "a file created somewhere near where you asked".
+    [[ ! -e "$SCAN_RESULT_OUT" || -f "$SCAN_RESULT_OUT" ]] || die "--result-out must name a regular file: $SCAN_RESULT_OUT"
+    [[ ! -e "$SCAN_RESULT_OUT" || -w "$SCAN_RESULT_OUT" ]] || die "--result-out is not writable: $SCAN_RESULT_OUT"
+  fi
   parse_machine_targets default "${args[@]}"
+  if [[ -n "$SCAN_RESULT_OUT" && "${#MACHINE_TARGETS[@]}" -gt 1 ]]; then
+    die "--result-out writes one result document; it cannot be combined with a multi-machine scan"
+  fi
   vinfo "scan targets: ${MACHINE_TARGETS[*]}"
   vinfo "scan mode: $scan_mode"
   local machine
@@ -7370,7 +8111,7 @@ safe audit: multi-machine audit tooling
 
 USAGE
   safe audit capabilities [--json]
-  safe audit scan [--verbose] [--deps-only | --full] [--project <path>] [--all | --machine <csv>]
+  safe audit scan [--verbose] [--deps-only | --full] [--no-cache] [--result-out <file>] [--allow-missing-tools] [--project <path>] [--all | --machine <csv>]
   safe audit check <pkg>@<version> [--ecosystem <name>] [--json]
   safe audit release github --repo OWNER/REPO --version TAG --asset NAME [--json]
   safe audit vuln github-release --repo OWNER/REPO --version TAG [--json]

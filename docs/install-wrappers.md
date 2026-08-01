@@ -132,12 +132,28 @@ safe audit check <package>@<version> --ecosystem <ecosystem>
 Project-local installs run:
 
 ```bash
-safe audit scan --project .
+safe audit scan --deps-only --project .
 ```
+
+The preflight is deps-only on purpose: what an install is about to change is
+the dependency evidence, and that mode is the one the scan cache can replay, so
+a bare `npm ci` in an unchanged tree costs a cache hit rather than a full
+scanner run. The source-level risk scan a `--full` scan performs is not part of
+the preflight; run `safe audit scan --project .` for that.
 
 If `safe audit` is missing, wrappers warn once and continue. If package checks are available, package install checks fail closed: `WARN`, `BLOCK`, timeouts, and audit failures stop before the real install command runs.
 
-Project scans are stricter for critical findings. Non-critical scan failures warn and continue.
+Project scans are stricter for critical findings. The preflight reads the
+scan's **result document**, not its exit code — a scan that finds a critical
+advisory still exits 0, since its verdict lives in the document — so a critical
+count above zero prompts interactively and refuses with exit 102 in a
+non-interactive shell. Non-critical scan failures warn and continue, and a
+scanner that ran and failed is named in that warning rather than passing
+silently: the install proceeds, but what was not checked is said out loud. The
+same holds when no verdict can be read at all — an unwritable result
+destination, or a scan that failed outright: the preflight says the project was
+not audit-gated instead of treating silence as a clean result, and it never
+describes infrastructure breakage as a vulnerability finding.
 
 ## Wrapped Package Installs
 

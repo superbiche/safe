@@ -81,6 +81,36 @@ fi
 
 if [[ "${1:-}" == "scan" ]]; then
   [[ -n "${SAFE_AUDIT_SCAN_OUTPUT:-}" ]] && printf '%s\n' "${SAFE_AUDIT_SCAN_OUTPUT}"
+  # The gate decides from the result document, not from this exit code: a scan
+  # that finds a critical advisory still exits 0.
+  result_out=""
+  prev=""
+  for arg in "$@"; do
+    [[ "${prev}" == "--result-out" ]] && result_out="${arg}"
+    prev="${arg}"
+  done
+  if [[ -n "${result_out}" && "${SAFE_AUDIT_SCAN_NO_RESULT:-0}" != "1" ]]; then
+    # Defaults are assigned first: inside a heredoc, ${var:-'{"a":1}'} keeps
+    # the quotes literally and the document stops being JSON.
+    stub_tool_status="${SAFE_AUDIT_SCAN_TOOL_STATUS:-}"
+    [[ -n "${stub_tool_status}" ]] || stub_tool_status='{"osv-scanner":{"status":"ok","note":null}}'
+    stub_eco_audits="${SAFE_AUDIT_SCAN_ECOSYSTEM_AUDITS:-}"
+    [[ -n "${stub_eco_audits}" ]] || stub_eco_audits='[]'
+    cat > "${result_out}" <<JSON
+{
+  "verdict": "${SAFE_AUDIT_SCAN_VERDICT:-GO}",
+  "summary": {"packages_total": 3},
+  "cve_scan": {"critical": ${SAFE_AUDIT_SCAN_CRITICAL:-0}, "high": 0, "medium": 0, "low": 0, "findings": []},
+  "audit_totals": {
+    "critical": ${SAFE_AUDIT_SCAN_CRITICAL:-0}, "high": 0, "medium": 0, "low": 0, "unknown": 0,
+    "cve_scan": {"critical": ${SAFE_AUDIT_SCAN_CRITICAL:-0}, "high": 0, "medium": 0, "low": 0},
+    "ecosystem": [], "deduplicated": false
+  },
+  "tool_status": ${stub_tool_status},
+  "ecosystem_audits": ${stub_eco_audits}
+}
+JSON
+  fi
   exit "${SAFE_AUDIT_SCAN_STATUS:-0}"
 fi
 
@@ -269,6 +299,11 @@ run_zsh() {
     SAFE_INSTALL_TEST_SCRIPT="${SAFE_INSTALL_TEST_SCRIPT:-}" \
     SAFE_AUDIT_SCAN_OUTPUT="${SAFE_AUDIT_SCAN_OUTPUT:-}" \
     SAFE_AUDIT_SCAN_STATUS="${SAFE_AUDIT_SCAN_STATUS:-}" \
+    SAFE_AUDIT_SCAN_CRITICAL="${SAFE_AUDIT_SCAN_CRITICAL:-}" \
+    SAFE_AUDIT_SCAN_VERDICT="${SAFE_AUDIT_SCAN_VERDICT:-}" \
+    SAFE_AUDIT_SCAN_TOOL_STATUS="${SAFE_AUDIT_SCAN_TOOL_STATUS:-}" \
+    SAFE_AUDIT_SCAN_ECOSYSTEM_AUDITS="${SAFE_AUDIT_SCAN_ECOSYSTEM_AUDITS:-}" \
+    SAFE_AUDIT_SCAN_NO_RESULT="${SAFE_AUDIT_SCAN_NO_RESULT:-}" \
     SAFE_AUDIT_CHECK_STATUS="${SAFE_AUDIT_CHECK_STATUS:-}" \
     SAFE_INSTALL_REAL_STATUS="${SAFE_INSTALL_REAL_STATUS:-}" \
     MISE_LS_JSON="${MISE_LS_JSON:-}" \
@@ -295,6 +330,22 @@ assert_log_contains() {
   local label="$2"
   if ! grep -Fqx "${needle}" "${LOG_FILE}"; then
     printf 'missing log line: %s\n' "${needle}" >&2
+    printf 'log:\n%s\n' "$(cat "${LOG_FILE}")" >&2
+    fail "${label}"
+    return 1
+  fi
+  return 0
+}
+
+# The preflight scan carries a private --result-out path, so its argv cannot
+# be matched whole; the parts that are contractual are the mode flags and the
+# project target.
+assert_project_scan_logged() {
+  local label="$1"
+  local line
+  line="$(grep -F $'AUDIT\tscan\t' "${LOG_FILE}" | tail -n 1)"
+  if [[ "${line}" != *$'--deps-only'* || "${line}" != *$'--allow-missing-tools'* || "${line}" != *$'--project\t.'* ]]; then
+    printf 'project scan not logged with the expected flags; got: %s\n' "${line:-<none>}" >&2
     printf 'log:\n%s\n' "$(cat "${LOG_FILE}")" >&2
     fail "${label}"
     return 1
@@ -929,7 +980,7 @@ case_update_family_gates() {
   touch "${WORK_DIR}/package.json"
   SAFE_INSTALL_TEST_SCRIPT='npm update lodash' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tscan\t--project\t.' "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tcheck\tlodash\t--ecosystem\tnpm\t--gate\tinstall\t--op\tupdate' "$FUNCNAME" || return
   assert_log_contains $'REAL\tnpm\tupdate\tlodash' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='yarn upgrade left-pad' run_zsh
@@ -969,7 +1020,7 @@ case_local_project_scan() {
   touch "${WORK_DIR}/package.json"
   SAFE_INSTALL_TEST_SCRIPT='npm ci' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tscan\t--project\t.' "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
   assert_log_contains $'REAL\tnpm\tci' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -979,7 +1030,7 @@ case_add_scans_and_checks() {
   touch "${WORK_DIR}/package.json"
   SAFE_INSTALL_TEST_SCRIPT='pnpm add --filter web --workspace-root lodash' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tscan\t--project\t.' "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tcheck\tlodash\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\tweb\t--ecosystem' "$FUNCNAME" || return
   pass "$FUNCNAME"
@@ -1061,10 +1112,53 @@ case_critical_scan_non_tty_aborts() {
   touch "${WORK_DIR}/package.json"
   SAFE_AUDIT_SCAN_OUTPUT='critical vulnerability' SAFE_AUDIT_SCAN_STATUS=1 SAFE_INSTALL_TEST_SCRIPT='npm ci' run_zsh
   assert_status 102 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tscan\t--project\t.' "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   assert_err_contains_fragment 'safe: BLOCKED install — safe audit scan found critical findings' "$FUNCNAME" || return
-  assert_err_not_contains_fragment 'safe install: safe audit scan reported critical findings' "$FUNCNAME" || return
+  # Non-TTY refusals are exactly one line: the interactive preamble (which
+  # says the scan FAILED, never that it "found" something) stays out.
+  assert_err_not_contains_fragment 'after reporting critical findings' "$FUNCNAME" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+  pass "$FUNCNAME"
+}
+
+# The scan EXITS 0 when it finds a critical advisory — the verdict lives in
+# the result document. Gating on the exit code let every finding through.
+case_critical_in_result_blocks_despite_exit_zero() {
+  prepare_case "critical-result-blocks"
+  touch "${WORK_DIR}/package.json"
+  SAFE_AUDIT_SCAN_STATUS=0 SAFE_AUDIT_SCAN_VERDICT=WARN SAFE_AUDIT_SCAN_CRITICAL=2 \
+    SAFE_INSTALL_TEST_SCRIPT='npm ci' run_zsh
+  assert_status 102 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe: BLOCKED install — safe audit scan found critical findings' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# A scanner that broke does not stop the install (documented policy: only
+# critical findings do), but what was not checked is said out loud.
+case_broken_scanner_warns_and_proceeds() {
+  prepare_case "broken-scanner-warns"
+  touch "${WORK_DIR}/package.json"
+  SAFE_AUDIT_SCAN_STATUS=0 SAFE_AUDIT_SCAN_VERDICT=WARN \
+    SAFE_AUDIT_SCAN_ECOSYSTEM_AUDITS='[{"scanner":"npm-audit","status":"error","total":0,"critical":0,"high":0,"medium":0,"low":0,"unknown":0,"note":"npm-audit failed (exit 1)"}]' \
+    SAFE_INSTALL_TEST_SCRIPT='npm ci' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_err_contains_fragment 'scanner failure (npm-audit)' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tci' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# A clean result still proceeds silently: no new noise on the common path.
+case_clean_result_proceeds_quietly() {
+  prepare_case "clean-result-proceeds"
+  touch "${WORK_DIR}/package.json"
+  SAFE_AUDIT_SCAN_STATUS=0 SAFE_INSTALL_TEST_SCRIPT='npm ci' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'scanner failure' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'BLOCKED' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tci' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -1118,7 +1212,7 @@ case_requirement_install_scans() {
   prepare_case "requirement-install-scans"
   SAFE_INSTALL_TEST_SCRIPT='pip install -r requirements.txt' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tscan\t--project\t.' "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
   assert_log_not_contains_fragment $'AUDIT\tcheck' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -3043,6 +3137,9 @@ main() {
     case_npm_alias_audits_target_package \
     case_audit_failure_blocks \
     case_critical_scan_non_tty_aborts \
+    case_critical_in_result_blocks_despite_exit_zero \
+    case_broken_scanner_warns_and_proceeds \
+    case_clean_result_proceeds_quietly \
     case_missing_safe_audit_warns_per_command \
     case_non_install_passthrough \
     case_npm_complex_flags \

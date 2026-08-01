@@ -452,26 +452,88 @@ safe_gate_scan_project() {
     return 0
   fi
 
-  scan_output="$("${SAFE_GATE_AUDIT_BIN}" scan --project . 2>&1)"
+  # The decision comes from the RESULT DOCUMENT, not the exit code: a scan
+  # that finds a critical advisory still exits 0 (its verdict lives in the
+  # document), so gating on the exit code let every finding through. The copy
+  # is private because the published result is one file per machine per day.
+  local result_file=""
+  local fallback_dir="${SAFE_DATA_DIR:-${HOME}/.local/share/safe}/gate"
+  result_file="$(mktemp "${TMPDIR:-/tmp}/safe-gate-scan.XXXXXX" 2>/dev/null)" || result_file=""
+  if [[ -z "${result_file}" ]]; then
+    # Fall back to safe's own state directory before giving up: a full or
+    # unwritable TMPDIR must not quietly downgrade the gate.
+    mkdir -p "${fallback_dir}" 2>/dev/null &&
+      result_file="$(mktemp "${fallback_dir}/scan.XXXXXX" 2>/dev/null)" || result_file=""
+  fi
+  if [[ -z "${result_file}" ]]; then
+    # Without a private destination there is no verdict to read, and a scan
+    # that exits 0 says nothing about what it found. Say that plainly rather
+    # than treating "no answer" as "clean".
+    safe_gate_err "safe install: cannot allocate a scan result file (TMPDIR and ${fallback_dir} both unwritable); the project was NOT audit-gated — safe doctor"
+    "${SAFE_GATE_AUDIT_BIN}" scan --deps-only --allow-missing-tools --project . 2>&1 || true
+    return 0
+  fi
+
+  # --deps-only: the preflight only cares about the dependency evidence the
+  # install is about to change, and that mode is the one the scan cache can
+  # replay — a bare `npm ci` in an unchanged tree costs a cache hit, not a
+  # full scanner run. --allow-missing-tools keeps an uninstalled ecosystem
+  # auditor from aborting the scan: it comes back as reported-but-not-run.
+  scan_output="$("${SAFE_GATE_AUDIT_BIN}" scan --deps-only --allow-missing-tools \
+    --result-out "${result_file}" --project . 2>&1)"
   scan_status=$?
 
   [[ -n "${scan_output}" ]] && printf '%s\n' "${scan_output}"
 
-  if (( scan_status == 0 )); then
-    return 0
+  local critical=0 broken="" have_verdict=0
+  if [[ -s "${result_file}" ]] && command -v jq >/dev/null 2>&1; then
+    have_verdict=1
+    critical="$(jq -r '.audit_totals.critical // .cve_scan.critical // 0' "${result_file}" 2>/dev/null || printf '0')"
+    [[ "${critical}" =~ ^[0-9]+$ ]] || critical=0
+    broken="$(jq -r '
+      def broken: (.status // "ok") as $s
+        | ($s == "error") or (($s != "ok") and (((.note // "") | test("fail|error"; "i"))));
+      [ (.tool_status // {} | to_entries[]? | select(.value | broken) | .key),
+        (.ecosystem_audits[]? | select(broken) | (.scanner // "unknown"))
+      ] | unique | join(", ")
+    ' "${result_file}" 2>/dev/null || printf '')"
   fi
+  rm -f "${result_file}"
 
-  if [[ "${scan_output,,}" == *critical* || "${scan_status}" -ge 2 ]]; then
-    # Preamble only ahead of the interactive prompt; the non-TTY path emits a
-    # single self-contained BLOCKED line instead.
+  if (( critical > 0 )); then
     if [[ -t 0 && -t 1 ]]; then
-      safe_gate_err "safe install: safe audit scan reported critical findings"
+      safe_gate_err "safe install: safe audit scan reported ${critical} critical finding(s) in this project's dependencies"
     fi
     safe_gate_confirm_critical
     return $?
   fi
 
-  safe_gate_err "safe install: safe audit scan failed with exit ${scan_status}; proceeding"
+  if (( scan_status == 0 )); then
+    if (( have_verdict == 0 )); then
+      safe_gate_err "safe install: safe audit scan produced no readable result; the project was NOT audit-gated — safe doctor"
+      return 0
+    fi
+    # A scanner that broke does not stop an install — the documented policy is
+    # that non-critical scan failures warn and continue — but it is never
+    # silent: what was not checked is said out loud.
+    [[ -n "${broken}" ]] && safe_gate_err "safe install: scanner failure (${broken}); that coverage is missing — safe doctor"
+    return 0
+  fi
+
+  # The scan failed, so there is no verdict to read. If it managed to say
+  # "critical" before dying, that is still the strongest evidence available
+  # and it gates — but the wording says the scan FAILED, because calling
+  # infrastructure breakage a vulnerability finding is the one thing a
+  # security tool must never do.
+  if [[ "${scan_output,,}" == *critical* ]]; then
+    if [[ -t 0 && -t 1 ]]; then
+      safe_gate_err "safe install: safe audit scan failed with exit ${scan_status} after reporting critical findings"
+    fi
+    safe_gate_confirm_critical
+    return $?
+  fi
+
+  safe_gate_err "safe install: safe audit scan failed with exit ${scan_status}; the project was not fully audited — safe doctor; proceeding"
   return 0
 }
 

@@ -5,6 +5,7 @@
 ```bash
 safe run <args...>
 safe audit <args...>
+safe install [--project] [--yes]
 safe install [-g|--global] [--yes] <pkg> [...]
 safe install --manager npm|pnpm|yarn|bun|composer -g [--yes] [--trust-host] <pkg> [...]
 safe install --sandbox [--allow-scripts] <pkg> [...]
@@ -166,6 +167,54 @@ safe install --bun -g cowsay@1.6.0
 safe install --composer -g vendor/pkg:^1
 safe install --trust-host -g cowsay@1.6.0
 ```
+
+### Project mode (bulk audit)
+
+With no package named and a manifest in the current directory — `package.json`,
+`requirements.txt`, `pyproject.toml`, `Cargo.toml`, `composer.json`, or
+`go.mod` — `safe install` bulk-audits what the project already depends on
+instead of printing usage. `--project` forces the same mode.
+
+```bash
+safe install            # in a project directory
+safe install --project
+```
+
+It runs `safe audit scan --deps-only --project .` (so it benefits from the scan
+cache) and prints a one-screen summary: audited manifests, package count,
+finding counts by severity, verdict, and the top critical/high findings with
+package and advisory id.
+
+This mode **audits only** — it never runs a package manager, so there is
+nothing to install afterwards; the confirmation records that an operator saw
+the findings.
+
+| Outcome | Interactive | Non-interactive |
+| --- | --- | --- |
+| Verdict `GO` | prompt to accept (exit 0 / 1 if declined) | exit 0, quietly |
+| Verdict `WARN` | prompt to accept, or `--yes` | exit 102 unless `--yes` |
+| Critical findings, or verdict `BLOCK` | exit 104 | exit 104 |
+| Scan unreadable, failed, or unknown verdict | exit 100 | exit 100 |
+| A scanner ran and failed | exit 100 | exit 100 |
+
+Critical findings are the project-scale equivalent of a `BLOCK` verdict:
+`--yes` accepts WARNs, never those. The count that decides is `audit_totals` —
+the CVE scan plus every ecosystem audit that ran — so a critical only `npm
+audit` or `composer audit` saw still refuses.
+
+A scanner that ran and *failed* is broken infrastructure, not a finding: its
+silence is not evidence of a clean project, so it refuses with exit 100, names
+the scanner, and points at `safe doctor`. A scanner that is merely *absent* is
+different — it is listed under `not run:` in the summary and leaves the verdict
+at `WARN`, which still needs `--yes` or an operator. Evidence a scanner cannot
+structurally read (`npm audit` facing a pnpm or Yarn lockfile) is reported the
+same way but does not move the verdict at all.
+
+Because it installs nothing, `--project` cannot be combined with package
+arguments or with `-g`/`--host`/`--manager`/`--trust-host`/`--sandbox`; those
+combinations are a usage error rather than a silent audit-only success. For the
+same reason auto-detection only applies to a bare `safe install`: with any
+install flag present and no package named, the usage error stands.
 
 `safe install --sandbox ...` preserves the isolated `safe run install` workflow.
 
