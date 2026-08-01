@@ -28,6 +28,32 @@ no wrapper installed), but it defines no wrapper functions.
 An existing file of a wrapped name that does not carry the
 `# safe-gate-wrapper` marker is never overwritten: `install.sh` reports it and
 skips, leaving that tool ungated. `uninstall.sh` removes only marked wrappers.
+
+## Displaced binaries
+
+That rule has one exception, because for some tools it would mean the tool can
+never be gated at all. `uv` installs itself to `~/.local/bin/uv` — exactly the
+path its wrapper needs — so skipping left `uv add` and `uv sync` permanently
+outside the gate.
+
+For those tools `install.sh` moves the real binary aside instead:
+
+```text
+~/.local/bin/uv            # the wrapper
+~/.local/bin/uv.original   # the binary that was there
+```
+
+`safe gate` resolves the delegate by walking PATH and skipping its own
+wrappers; when that walk finds nothing, it falls back to `<tool>.original`.
+The fallback is genuinely last — a real tool further along PATH, such as a
+mise shim, still wins, so per-project versions are never overridden by the
+displaced copy.
+
+Two safeguards apply. If a `<tool>.original` already exists, nothing is moved
+or overwritten: `install.sh` reports the conflict and leaves the tool ungated,
+because that file may not be ours. And `uninstall.sh` moves the displaced
+binary back when it removes the wrapper — removing the gate must not uninstall
+the tool.
 Check the wiring with `safe status`, which reports one of five states per
 tool: `installed`, `shadowed` (something earlier on PATH wins),
 `not-on-path` (the wrapper exists but nothing resolves — the bin directory

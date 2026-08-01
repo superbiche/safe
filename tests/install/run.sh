@@ -89,6 +89,12 @@ if [[ "${1:-}" == "scan" ]]; then
     [[ "${prev}" == "--result-out" ]] && result_out="${arg}"
     prev="${arg}"
   done
+  if [[ -n "${result_out}" && "${SAFE_AUDIT_SCAN_MALFORMED_RESULT:-0}" == "1" ]]; then
+    # A truncated write: non-empty, so the "is there a file" test passes, but
+    # every jq expression against it falls back to its default.
+    printf '{"verdict": "GO", "audit_totals": {"critic' > "${result_out}"
+    exit "${SAFE_AUDIT_SCAN_STATUS:-0}"
+  fi
   if [[ -n "${result_out}" && "${SAFE_AUDIT_SCAN_NO_RESULT:-0}" != "1" ]]; then
     # Defaults are assigned first: inside a heredoc, ${var:-'{"a":1}'} keeps
     # the quotes literally and the document stops being JSON.
@@ -1136,6 +1142,24 @@ case_critical_in_result_blocks_despite_exit_zero() {
   pass "$FUNCNAME"
 }
 
+# A result document that is present but not readable is NOT a clean verdict.
+# Every jq read against a truncated document falls back to its default, and
+# defaulted zeros are indistinguishable from "scanned it, found nothing" — so
+# the gate used to announce a clean project it had never actually read.
+case_malformed_result_document_is_not_read_as_clean() {
+  prepare_case "malformed-result-not-clean"
+  touch "${WORK_DIR}/package.json"
+  SAFE_AUDIT_SCAN_STATUS=0 SAFE_AUDIT_SCAN_MALFORMED_RESULT=1 \
+    SAFE_INSTALL_TEST_SCRIPT='npm ci' run_zsh
+  # Policy is unchanged: a scan that produced no verdict warns and proceeds.
+  # What must never happen is proceeding SILENTLY.
+  assert_status 0 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_err_contains_fragment 'produced no readable result' "$FUNCNAME" || return
+  assert_err_contains_fragment 'NOT audit-gated' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 # A scanner that broke does not stop the install (documented policy: only
 # critical findings do), but what was not checked is said out loud.
 case_broken_scanner_warns_and_proceeds() {
@@ -1291,6 +1315,106 @@ case_install_writes_gate_wrappers() {
   [[ -f "${HOME_DIR}/.config/safe/gate-lib.sh" ]] || { fail "$FUNCNAME"; return; }
   # No volta wrapper: the volta integration is retired.
   [[ ! -e "${HOME_DIR}/.local/bin/volta" ]] || { fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
+# uv installs itself to exactly the path its wrapper needs, so the ordinary
+# rule — an unmarked file belongs to somebody else, leave it and report — meant
+# uv could never be gated at all: `uv add` and `uv sync` bypassed safe on every
+# machine. Those tools are moved aside instead, the convention already used for
+# uvx, and the resolver falls back to <tool>.original.
+case_uv_binary_is_displaced_and_gated() {
+  prepare_case "uv-binary-displaced"
+  mkdir -p "${HOME_DIR}/.local/bin"
+  printf '#!/usr/bin/env bash\n# the real uv\necho uv-real\n' > "${HOME_DIR}/.local/bin/uv"
+  chmod +x "${HOME_DIR}/.local/bin/uv"
+
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+
+  head -n 2 "${HOME_DIR}/.local/bin/uv" | grep -Fq '# safe-gate-wrapper v1 tool=uv' || { fail "$FUNCNAME"; return; }
+  # The displaced copy must be the original binary, byte for byte, and still
+  # executable: this is the user's uv, not a backup we may mangle.
+  grep -Fqx '# the real uv' "${HOME_DIR}/.local/bin/uv.original" || { fail "$FUNCNAME"; return; }
+  [[ -x "${HOME_DIR}/.local/bin/uv.original" ]] || { fail "$FUNCNAME"; return; }
+  assert_err_contains_fragment 'moved real binaries aside to <tool>.original and gated them: uv' "$FUNCNAME" || return
+  # And it must NOT be reported as ungated, which is what the old path said.
+  assert_err_not_contains_fragment 'gating NOT active for: uv' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_uv_displacement_refuses_to_clobber_an_existing_original() {
+  prepare_case "uv-displacement-no-clobber"
+  mkdir -p "${HOME_DIR}/.local/bin"
+  printf '#!/usr/bin/env bash\n# a newer uv\n' > "${HOME_DIR}/.local/bin/uv"
+  chmod +x "${HOME_DIR}/.local/bin/uv"
+  printf '#!/usr/bin/env bash\n# an older displaced uv\n' > "${HOME_DIR}/.local/bin/uv.original"
+  chmod +x "${HOME_DIR}/.local/bin/uv.original"
+
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+
+  # Both files survive untouched and the tool is honestly reported ungated:
+  # overwriting either one would destroy a binary safe does not own.
+  grep -Fqx '# a newer uv' "${HOME_DIR}/.local/bin/uv" || { fail "$FUNCNAME"; return; }
+  grep -Fqx '# an older displaced uv' "${HOME_DIR}/.local/bin/uv.original" || { fail "$FUNCNAME"; return; }
+  assert_err_contains_fragment 'found an existing <tool>.original for: uv' "$FUNCNAME" || return
+  assert_err_contains_fragment 'gating NOT active for: uv' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_uninstall_restores_the_displaced_binary() {
+  prepare_case "uninstall-restores-displaced"
+  mkdir -p "${HOME_DIR}/.local/bin"
+  printf '#!/usr/bin/env bash\n# the real uv\necho uv-real\n' > "${HOME_DIR}/.local/bin/uv"
+  chmod +x "${HOME_DIR}/.local/bin/uv"
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/uninstall.sh" >>"${OUT_FILE}" 2>>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+
+  # Removing the gate must not uninstall the tool: uv goes back where its owner
+  # put it, and the .original scaffolding disappears with the wrapper.
+  grep -Fqx '# the real uv' "${HOME_DIR}/.local/bin/uv" || { fail "$FUNCNAME"; return; }
+  [[ -x "${HOME_DIR}/.local/bin/uv" ]] || { fail "$FUNCNAME"; return; }
+  [[ ! -e "${HOME_DIR}/.local/bin/uv.original" ]] || { fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
+case_gate_resolves_a_displaced_original() {
+  prepare_case "gate-resolves-displaced-original"
+  local dir="${WORK_DIR}/displaced"
+  mkdir -p "${dir}"
+  printf '#!/usr/bin/env bash\n# safe-gate-wrapper v1 tool=uv\nexec safe gate uv -- "$@"\n' > "${dir}/uv"
+  chmod +x "${dir}/uv"
+  printf '#!/usr/bin/env bash\necho real\n' > "${dir}/uv.original"
+  chmod +x "${dir}/uv.original"
+
+  local got
+  got="$(PATH="${dir}:/usr/bin:/bin" GATE_LIB="${ROOT_DIR}/lib/gate-lib.sh" \
+    bash -c 'source "${GATE_LIB}"; safe_gate_resolve_real uv')"
+  [[ "${got}" == "${dir}/uv.original" ]] || {
+    printf 'resolved to %s, expected %s\n' "${got:-<empty>}" "${dir}/uv.original" >&2
+    fail "$FUNCNAME"; return
+  }
+
+  # A real tool further along PATH still wins: the displaced copy is a last
+  # resort, never an override of a version manager's shim.
+  local shim="${WORK_DIR}/shimdir"
+  mkdir -p "${shim}"
+  printf '#!/usr/bin/env bash\necho shim\n' > "${shim}/uv"
+  chmod +x "${shim}/uv"
+  got="$(PATH="${dir}:${shim}:/usr/bin:/bin" GATE_LIB="${ROOT_DIR}/lib/gate-lib.sh" \
+    bash -c 'source "${GATE_LIB}"; safe_gate_resolve_real uv')"
+  [[ "${got}" == "${shim}/uv" ]] || {
+    printf 'resolved to %s, expected %s\n' "${got:-<empty>}" "${shim}/uv" >&2
+    fail "$FUNCNAME"; return
+  }
   pass "$FUNCNAME"
 }
 
@@ -3139,6 +3263,7 @@ main() {
     case_critical_scan_non_tty_aborts \
     case_critical_in_result_blocks_despite_exit_zero \
     case_broken_scanner_warns_and_proceeds \
+    case_malformed_result_document_is_not_read_as_clean \
     case_clean_result_proceeds_quietly \
     case_missing_safe_audit_warns_per_command \
     case_non_install_passthrough \
@@ -3157,6 +3282,10 @@ main() {
     case_install_idempotent_no_wrappers \
     case_install_idempotent_with_completions \
     case_install_writes_gate_wrappers \
+    case_uv_binary_is_displaced_and_gated \
+    case_uv_displacement_refuses_to_clobber_an_existing_original \
+    case_uninstall_restores_the_displaced_binary \
+    case_gate_resolves_a_displaced_original \
     case_selective_install_refreshes_gate_lib \
     case_loose_marker_is_not_ownership \
     case_status_probes_every_wrapper \

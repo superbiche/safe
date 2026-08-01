@@ -15,6 +15,9 @@ GATE_LIB_TARGET="$CONFIG_BASE/gate-lib.sh"
 # `safe gate`; all routing lives in gate-lib.sh, so upgrading safe upgrades the
 # gate without rewriting a single wrapper.
 GATE_TOOLS=(npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise)
+# Tools installed at exactly the path their wrapper must occupy, so the only
+# way to gate them is to move the real binary to <tool>.original.
+GATE_DISPLACE_TOOLS=(uv)
 COMPLETION_DIR="${SAFE_ZSH_COMPLETION_DIR:-$HOME/.local/share/zsh/site-functions}"
 COMPLETION_TARGET="$COMPLETION_DIR/_safe"
 ZSHRC="${SAFE_ZSHRC:-$HOME/.zshrc}"
@@ -133,16 +136,44 @@ gate_wrappers_exist() {
 # PATH wrappers are what makes gating work in every shell (bash -c, Makefiles,
 # CI, agent harnesses), not just an interactive zsh. A pre-existing file
 # without our marker is somebody else's binary: report it and leave it alone.
+gate_tool_displaceable() {
+  local tool="$1" candidate
+  for candidate in "${GATE_DISPLACE_TOOLS[@]}"; do
+    [[ "$candidate" == "$tool" ]] && return 0
+  done
+  return 1
+}
+
 install_gate_wrappers() {
   local tool target
-  local -a written=() skipped=()
+  local -a written=() skipped=() displaced=() conflicted=()
 
   mkdir -p "$BIN_DIR"
   for tool in "${GATE_TOOLS[@]}"; do
     target="$BIN_DIR/$tool"
     if [[ -e "$target" || -L "$target" ]] && ! gate_wrapper_marked "$target" "$tool"; then
-      skipped+=("$tool")
-      continue
+      # For most tools an unmarked file is somebody else's binary and the tool
+      # goes ungated. For a tool whose ONLY installation sits at exactly the
+      # path the wrapper needs, that rule means it can never be gated at all —
+      # uv installs itself to $BIN_DIR/uv, so skipping left `uv add`/`uv sync`
+      # permanently outside the gate. Those tools are moved aside instead, and
+      # safe_gate_resolve_real falls back to <tool>.original: the convention
+      # already in use for uvx.
+      if gate_tool_displaceable "$tool" && [[ -f "$target" && ! -L "$target" ]]; then
+        if [[ -e "$target.original" || -L "$target.original" ]]; then
+          # Never clobber: an existing .original means either a prior
+          # displacement whose wrapper was overwritten (a self-update), or a
+          # foreign file. Leave both alone and say the tool is ungated.
+          conflicted+=("$tool")
+          skipped+=("$tool")
+          continue
+        fi
+        mv -- "$target" "$target.original"
+        displaced+=("$tool")
+      else
+        skipped+=("$tool")
+        continue
+      fi
     fi
     rm -f "$target"
     cat > "$target" <<EOF
@@ -156,6 +187,12 @@ EOF
 
   if [[ "${#written[@]}" -gt 0 ]]; then
     info "installed gate wrappers in $BIN_DIR: ${written[*]}"
+  fi
+  if [[ "${#displaced[@]}" -gt 0 ]]; then
+    info "moved real binaries aside to <tool>.original and gated them: ${displaced[*]}"
+  fi
+  if [[ "${#conflicted[@]}" -gt 0 ]]; then
+    warn "found an existing <tool>.original for: ${conflicted[*]} — left it and the current binary untouched, so these stay ungated"
   fi
   if [[ "${#skipped[@]}" -gt 0 ]]; then
     warn "kept existing non-safe files, gating NOT active for: ${skipped[*]} (remove them and re-run to gate these tools)"
