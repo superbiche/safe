@@ -26,11 +26,22 @@ safe audit setup --all
 safe audit scan --all
 ```
 
-Enable persistent install protection by starting a new zsh session or sourcing:
+Install protection is active as soon as `install.sh` has written the PATH
+wrappers — no shell integration and no sourcing involved. Each wrapper in
+`$SAFE_BIN_DIR` (default `~/.local/bin`) execs `safe gate <tool>`, which loads
+the routing tables from `~/.config/safe/gate-lib.sh` and delegates to the real
+tool. What activates it is PATH order: `$SAFE_BIN_DIR` must precede the
+directory holding the real package managers (a version-manager shim dir, for
+instance). Verify with:
 
 ```bash
-source "$HOME/.config/safe/install-wrappers.zsh"
+safe status   # wrappers: ok (11/11 installed in ~/.local/bin)
 ```
+
+`~/.config/safe/install-wrappers.zsh` is a compatibility stub for existing
+`.zshrc` lines. It defines no wrapper functions and cannot enable protection;
+it only prints a one-time warning in an interactive shell when the wrappers are
+missing.
 
 ## Unknown Package Execution
 
@@ -71,13 +82,13 @@ npm install express
 
 Flow:
 
-1. The zsh wrapper detects a package install.
+1. The PATH wrapper execs `safe gate npm`, which detects a package install.
 2. If the current directory looks like an npm project, it runs `safe audit scan --project .`.
-3. It extracts package specs and runs `safe audit check <pkg>@<version> --ecosystem npm`.
-4. Only `GO` proceeds for package checks.
-5. The real command runs through `command npm install express`.
+3. It extracts package specs and runs `safe audit check <pkg> --ecosystem npm --gate install`.
+4. Only a passing gate proceeds.
+5. The real command runs through the first non-wrapper `npm` on PATH.
 
-Equivalent wrapper patterns exist for pnpm, yarn, bun, uv, pip, pip3, cargo, go, composer, and volta.
+Equivalent gate routing exists for pnpm, pnpx, yarn, bun, uv, pip, pip3, cargo, go, and composer (Volta is retired).
 
 ## External Binary Review
 

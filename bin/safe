@@ -7,7 +7,10 @@ SAFE_DIR="$(dirname "$SAFE_SELF")"
 SAFE_CONFIG_ROOT="${SAFE_CONFIG_DIR:-$HOME/.config/safe}"
 SAFE_DATA_ROOT="${SAFE_DATA_DIR:-$HOME/.local/share/safe}"
 SAFE_RUN_PATH="$SAFE_DIR/safe-run"
-SAFE_AUDIT_PATH="$SAFE_DIR/safe-audit"
+# Env override so a test harness (or a side-by-side build) can point the
+# dispatcher and the install gate at a specific safe-audit.
+SAFE_AUDIT_PATH="${SAFE_AUDIT_PATH:-$SAFE_DIR/safe-audit}"
+SAFE_BIN_ROOT="${SAFE_BIN_DIR:-$HOME/.local/bin}"
 SAFE_ZSH_COMPLETION_DIR="${SAFE_ZSH_COMPLETION_DIR:-$HOME/.local/share/zsh/site-functions}"
 
 err() { printf 'safe: %s\n' "$*" >&2; }
@@ -22,6 +25,7 @@ safe: consolidated safe run, safe audit, and install wrapper tooling
 USAGE
   safe run <args...>
   safe audit <args...>
+  safe gate <tool> -- <args...>
   safe install [-g|--global] [--yes] <pkg> [...]
   safe install --manager npm|pnpm|yarn|bun|composer -g [--yes] [--trust-host] <pkg> [...]
   safe install --sandbox [--allow-scripts] <pkg> [...]
@@ -51,19 +55,20 @@ WHAT IS GATED
                           from a project node_modules/.bin (bare unversioned
                           names, current or parent dir), an allowlist, a Podman
                           sandbox, or not at all.
-  npm / pnpm / yarn / bun / pip / pip3 / uv / cargo / go / composer / volta
-                          zsh wrapper functions audit install, update, and
-                          exec subcommands with `safe audit` before
-                          delegating to the real tool: install/add/ci/require
-                          (and global variants), update/up/upgrade families,
-                          and exec-style fetch-and-run (npm exec|x, pnpm dlx,
-                          yarn dlx, bun x, uv run --with|-w, uv tool run,
-                          go run <module>@<version>). Project-local commands
-                          pass through, including npm exec of a bare-named
-                          installed ./node_modules/.bin tool (versioned specs
-                          are still audited), pnpm exec, composer exec (vendor
-                          binaries only), and volta run (official runtimes
-                          only).
+  npm / pnpm / pnpx / yarn / bun / pip / pip3 / uv / cargo / go / composer
+                          PATH wrappers (~/.local/bin) exec `safe gate <tool>`,
+                          which audits install, update, and exec subcommands
+                          with `safe audit` before delegating to the real tool:
+                          install/add/ci/require (and global variants),
+                          update/up/upgrade families, and exec-style
+                          fetch-and-run (npm exec|x, pnpm dlx, pnpx, yarn dlx,
+                          bun x, uv run --with|-w, uv tool run,
+                          go run <module>@<version>). This applies in every
+                          shell, not just interactive zsh. Project-local
+                          commands pass through, including npm exec of a
+                          bare-named installed ./node_modules/.bin tool
+                          (versioned specs are still audited), pnpm exec, and
+                          composer exec (vendor binaries only).
   safe install <pkg>      Audited, confirmed install path (multi-manager).
 
 HOW A REFUSAL LOOKS
@@ -71,7 +76,7 @@ HOW A REFUSAL LOOKS
   stating what was blocked, why, and the operator command that allows it.
 
 EXIT CODES (policy refusals; 127 means a genuinely missing command)
-  100  blocked by policy (blocklist, degraded wrappers, fail-closed audit, unrecognized/unsupported runner-native flags)
+  100  blocked by policy (blocklist, fail-closed audit, unrecognized/unsupported runner-native flags)
   101  host-allow version pin mismatch
   102  interactive operator confirmation required (non-TTY refusal)
   103  invalid package name rejected
@@ -83,9 +88,9 @@ WHAT AN AGENT SHOULD DO
      verbatim. Trust escalations (safe run host-allow add/update) only work
      in the operator's interactive terminal — never attempt them yourself.
   3. After the operator allows, retry the original command unchanged.
-  4. Exit 127 from a wrapped tool means a genuinely missing command, never
-     a policy block — partial wrapper loads refuse legibly with exit 100.
-     A silent 127 would be a safe bug: report it, don't bypass.
+  4. Exit 127 from a wrapped tool means a genuinely missing command (or a
+     `safe` missing from PATH), never a policy block — the gate always
+     refuses legibly with exit 100. Report a silent 127, don't bypass.
 
 OPERATOR ALLOW FLOWS
   safe run host-allow add <pkg>@<version> --reason "..."   trusted host exec (npm)
@@ -95,10 +100,126 @@ OPERATOR ALLOW FLOWS
 EOF
 }
 
+cmd_gate_usage() {
+  cat <<'EOF'
+usage: safe gate <tool> -- <args...>
+
+Audits the install, update, and exec-style subcommands of <tool> with
+`safe audit`, then delegates to the real <tool> on PATH. Called by the
+generated wrappers in ~/.local/bin (see install.sh); not normally run by hand.
+
+Supported tools: npm pnpm pnpx yarn bun pip pip3 uv cargo go composer
+EOF
+}
+
+# Installed layout keeps the library beside the other safe config
+# (~/.config/safe/gate-lib.sh); a dev checkout runs it straight from lib/.
+gate_lib_path() {
+  local candidate
+  for candidate in \
+    "${SAFE_GATE_LIB:-}" \
+    "$SAFE_DIR/../lib/gate-lib.sh" \
+    "$SAFE_CONFIG_ROOT/gate-lib.sh"; do
+    [[ -n "$candidate" && -r "$candidate" ]] || continue
+    printf '%s' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+cmd_gate() {
+  local tool="${1:-}"
+
+  case "$tool" in
+    ""|-h|--help)
+      cmd_gate_usage
+      return 0
+      ;;
+  esac
+  shift
+
+  if [[ "${1:-}" == "--" ]]; then
+    shift
+  fi
+
+  local lib
+  # Fail closed: without the routing tables nothing can vouch for the command.
+  lib="$(gate_lib_path)" || refuse 100 "BLOCKED ${tool} — safe gate library not found (looked beside safe and in $SAFE_CONFIG_ROOT); to allow: ask the operator to re-run safe's install.sh; details: safe explain"
+
+  # shellcheck source=/dev/null
+  source "$lib"
+
+  local rc=0
+  set +e
+  safe_gate_main "$tool" "$@"
+  rc=$?
+  set -e
+  exit "$rc"
+}
+
 cmd_version() {
   echo "safe $SAFE_VERSION"
   "$SAFE_RUN_PATH" version
   "$SAFE_AUDIT_PATH" --version
+}
+
+# Keep in sync with GATE_TOOLS in install.sh and the gate-lib routing table.
+SAFE_GATE_TOOL_LIST=(npm pnpm pnpx yarn bun pip pip3 uv cargo go composer)
+
+# A generated install wrapper: regular (never symlinked) file whose second
+# line is EXACTLY the per-tool marker (loose substring matching let foreign
+# files pass as ours — PR#30 review finding 5).
+gate_wrapper_marked() {
+  local path="$1" tool="$2"
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  # Byte-stream comparison, never a command substitution: these paths hold
+  # arbitrary foreign executables, and capturing an ELF second line into a
+  # shell variable made bash emit "ignored null byte in input" warnings from
+  # status/doctor/install (PR#30 round regression R1). Same exact whole-line
+  # test, no capture.
+  LC_ALL=C sed -n '2p' -- "$path" 2>/dev/null \
+    | LC_ALL=C grep -qxF -- "# safe-gate-wrapper v1 tool=${tool}"
+}
+
+# Per-tool wrapper state: installed | shadowed | not-on-path | missing | foreign.
+# The wrapper set is healthy only when EVERY tool resolves to its owned
+# wrapper — one ungated tool defeats the seatbelt (PR#30 review finding 3).
+# An owned wrapper that resolves to NOTHING is not installed in any useful
+# sense: invoked from a cron/service PATH without $SAFE_BIN_ROOT the file
+# exists but gates nothing, and reporting it as installed made doctor claim
+# health for a fully ungated machine (PR#30 delta finding 3).
+gate_wrapper_state() {
+  local tool="$1" wrapper="$SAFE_BIN_ROOT/$1" resolved=""
+  if [[ -e "$wrapper" || -L "$wrapper" ]]; then
+    if ! gate_wrapper_marked "$wrapper" "$tool"; then
+      printf 'foreign'
+      return 0
+    fi
+  else
+    printf 'missing'
+    return 0
+  fi
+  resolved="$(command -v "$tool" 2>/dev/null || true)"
+  if [[ -z "$resolved" ]]; then
+    printf 'not-on-path'
+    return 0
+  fi
+  # Anchor both operands (SAFE_BIN_DIR is operator-settable and a relative
+  # dash-leading value reads as readlink options) and require BOTH
+  # canonicalizations to succeed — empty==empty would otherwise report a
+  # falsely healthy `installed` (PR#30 delta-2 finding N2).
+  local resolved_canon wrapper_canon
+  resolved_canon="$(readlink -f -- "$resolved" 2>/dev/null || true)"
+  wrapper_canon="$(readlink -f -- "$wrapper" 2>/dev/null || true)"
+  if [[ -z "$resolved_canon" || -z "$wrapper_canon" ]]; then
+    printf 'not-on-path'
+    return 0
+  fi
+  if [[ "$resolved_canon" != "$wrapper_canon" ]]; then
+    printf 'shadowed'
+    return 0
+  fi
+  printf 'installed'
 }
 
 cmd_status() {
@@ -111,12 +232,23 @@ cmd_status() {
   "$SAFE_AUDIT_PATH" status
   echo
   echo "=== install ==="
-  if [[ -n "${ZSH_VERSION:-}" && -n "${functions[safe_install_check]:-}" ]]; then
-    echo "wrappers:       loaded"
-  elif [[ -f "$SAFE_CONFIG_ROOT/install-wrappers.zsh" ]]; then
-    echo "wrappers:       installed"
+  # Probe EVERY PATH wrapper, not shell state and not just npm: gating is
+  # executable-based and one ungated tool defeats the seatbelt.
+  local tool state healthy=0 unhealthy=()
+  for tool in "${SAFE_GATE_TOOL_LIST[@]}"; do
+    state="$(gate_wrapper_state "$tool")"
+    if [[ "$state" == "installed" ]]; then
+      healthy=$((healthy + 1))
+    else
+      unhealthy+=("$tool:$state")
+    fi
+  done
+  if [[ "${#unhealthy[@]}" -eq 0 ]]; then
+    echo "wrappers:       ok (${healthy}/${#SAFE_GATE_TOOL_LIST[@]} installed in $SAFE_BIN_ROOT)"
   else
-    echo "wrappers:       not installed"
+    echo "wrappers:       DEGRADED (${healthy}/${#SAFE_GATE_TOOL_LIST[@]} healthy) — ${unhealthy[*]}"
+    echo "                foreign/shadowed/missing/not-on-path tools are NOT gated; fix and re-run install.sh"
+    echo "                not-on-path means the wrapper exists but $SAFE_BIN_ROOT is not on PATH here"
   fi
 }
 
@@ -391,6 +523,16 @@ doctor_payload_json() {
   local run_config_dir="$base_config/run"
   local audit_config_dir="$base_config/audit"
   local install_wrapper="$base_config/install-wrappers.zsh"
+
+  # Per-tool wrapper states for the executable gate (finding: an aggregate
+  # derived from npm alone concealed missing/shadowed siblings).
+  local gate_wrappers_json='{}' gate_wrappers_healthy=true
+  local gw_tool gw_state
+  for gw_tool in "${SAFE_GATE_TOOL_LIST[@]}"; do
+    gw_state="$(gate_wrapper_state "$gw_tool")"
+    [[ "$gw_state" == "installed" ]] || gate_wrappers_healthy=false
+    gate_wrappers_json=$(jq -cn --argjson acc "$gate_wrappers_json" --arg t "$gw_tool" --arg s "$gw_state" '$acc + {($t): $s}')
+  done
   local completion_file="$SAFE_ZSH_COMPLETION_DIR/_safe"
 
   local paths_safe_json paths_run_json paths_audit_json
@@ -598,6 +740,8 @@ doctor_payload_json() {
     --argjson safe_audit_machines_file "$( [[ -f "$audit_config_dir/machines.json" ]] && printf 'true' || printf 'false' )" \
     --argjson safe_audit_tools_file "$( [[ -f "$audit_config_dir/tools.json" ]] && printf 'true' || printf 'false' )" \
     --argjson wrapper_present "$( [[ -f "$install_wrapper" ]] && printf 'true' || printf 'false' )" \
+    --argjson gate_wrappers "$gate_wrappers_json" \
+    --argjson gate_wrappers_healthy "$gate_wrappers_healthy" \
     --argjson completion_present "$( [[ -f "$completion_file" ]] && printf 'true' || printf 'false' )" \
     '{
       command: "safe doctor",
@@ -664,6 +808,8 @@ doctor_payload_json() {
           tools_file: $safe_audit_tools_file
         },
         install_wrappers: {
+          gate_wrappers: $gate_wrappers,
+          gate_wrappers_healthy: $gate_wrappers_healthy,
           script_present: $wrapper_present,
           completion_present: $completion_present
         },
@@ -1425,6 +1571,7 @@ case "${1:-}" in
     fi
     exec "$SAFE_AUDIT_PATH" "$@"
     ;;
+  gate)     shift; cmd_gate "$@" ;;
   install)  shift; cmd_install "$@" ;;
   vendor)   shift; cmd_vendor "$@" ;;
   status)   shift; cmd_status "$@" ;;

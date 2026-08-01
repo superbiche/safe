@@ -1886,5 +1886,165 @@ if expect_status 10 "deeper-indent continuations still attach to their option"; 
 fi
 
 # ---------------------------------------------------------------------------
+# 62. Writer/reader loop: the gate's stale-evidence reader honors the exact
+#     source identity safe-audit stamped on the receipt.
+#
+# The receipt producer and the offline-fallback consumer live in different
+# files (bin/safe-audit mark_install_known, lib/gate-lib.sh
+# safe_gate_known_matches). Testing them apart let provenance be lost at the
+# boundary: an unscoped receipt read as "default" let a custom-index receipt
+# vouch for a default-index install (PR#30 delta finding 1). These cases run
+# the REAL writer and then the REAL reader over the receipt it wrote.
+# ---------------------------------------------------------------------------
+
+# gate_known_rc <spec> <ecosystem> [VAR=value ...] -> prints the reader's rc.
+# PROBE_SOURCE_SET stands in for the argv-derived source set the gate
+# accumulates from --registry/--index-url/... selectors.
+gate_known_rc() {
+  local spec="$1" eco="$2"
+  shift 2
+  local rc=0
+  (
+    cd "$CASE_PROJECT" || exit 99
+    env HOME="$CASE_HOME" SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" \
+      SAFE_AUDIT_PATH="$SAFE_AUDIT" "$@" \
+      bash -c '
+        set -u
+        . "$0"
+        SAFE_GATE_REGISTRY="${PROBE_SOURCE_SET:-}"
+        safe_gate_known_matches "$1" "$2"
+      ' "$ROOT/lib/gate-lib.sh" "$spec" "$eco"
+  ) >/dev/null 2>&1 || rc=$?
+  printf '%s' "$rc"
+}
+
+prepare_case gate-reader-default-source
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if jq -e '.packages["npm:brace-expansion"].source == "implicit-default"' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "default-source receipt is stamped implicit-default"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2
+  fail "default-source receipt is stamped implicit-default"
+fi
+
+if [[ "$(gate_known_rc brace-expansion@2.1.4 npm)" == "0" ]]; then
+  pass "gate reuses a same-source receipt on timeout"
+else
+  fail "gate reuses a same-source receipt on timeout"
+fi
+
+# An env-configured registry the argv never mentions still changes identity.
+if [[ "$(gate_known_rc brace-expansion@2.1.4 npm NPM_CONFIG_REGISTRY=https://evil.example)" != "0" ]]; then
+  pass "NPM_CONFIG_REGISTRY invalidates a default-source receipt"
+else
+  fail "NPM_CONFIG_REGISTRY invalidates a default-source receipt"
+fi
+
+# A .npmrc registry the argv never mentions does too (project file wins).
+printf 'registry = https://evil.example/\n' > "$CASE_PROJECT/.npmrc"
+if [[ "$(gate_known_rc brace-expansion@2.1.4 npm)" != "0" ]]; then
+  pass ".npmrc registry invalidates a default-source receipt"
+else
+  fail ".npmrc registry invalidates a default-source receipt"
+fi
+rm -f "$CASE_PROJECT/.npmrc"
+
+# An explicit selector (what --registry would accumulate) invalidates it.
+if [[ "$(gate_known_rc brace-expansion@2.1.4 npm PROBE_SOURCE_SET=https://evil.example)" != "0" ]]; then
+  pass "an explicit source selector invalidates a default-source receipt"
+else
+  fail "an explicit source selector invalidates a default-source receipt"
+fi
+
+# The default registry spelled out explicitly is still the default identity.
+if [[ "$(gate_known_rc brace-expansion@2.1.4 npm NPM_CONFIG_REGISTRY=https://registry.npmjs.org/)" == "0" ]]; then
+  pass "an explicit npmjs.org registry normalizes to implicit-default"
+else
+  fail "an explicit npmjs.org registry normalizes to implicit-default"
+fi
+
+# ---------------------------------------------------------------------------
+# 63. A literal selector spelled "default" is NOT the implicit-default sentinel
+# ---------------------------------------------------------------------------
+prepare_case gate-reader-literal-default
+printf '{"install": {"trusted_registries": ["default"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- ripgrep@14.1.1 --ecosystem cargo --registry default --gate install
+if jq -e '.packages["rust:ripgrep"].source == "explicit:default"' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "a literal 'default' selector is stamped explicit:default"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2
+  fail "a literal 'default' selector is stamped explicit:default"
+fi
+if [[ "$(gate_known_rc ripgrep@14.1.1 cargo)" != "0" ]]; then
+  pass "explicit:default never satisfies an implicit-default request"
+else
+  fail "explicit:default never satisfies an implicit-default request"
+fi
+if [[ "$(gate_known_rc ripgrep@14.1.1 cargo PROBE_SOURCE_SET=default)" == "0" ]]; then
+  pass "explicit:default satisfies the same literal selector"
+else
+  fail "explicit:default satisfies the same literal selector"
+fi
+
+# ---------------------------------------------------------------------------
+# 64. A custom-source receipt is reusable only from that same custom source
+# ---------------------------------------------------------------------------
+prepare_case gate-reader-custom-source
+printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --registry https://mirror.example --gate install
+if [[ "$(gate_known_rc brace-expansion@2.1.4 npm PROBE_SOURCE_SET=https://mirror.example)" == "0" ]]; then
+  pass "a custom-source receipt is reusable from the same source"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2
+  fail "a custom-source receipt is reusable from the same source"
+fi
+if [[ "$(gate_known_rc brace-expansion@2.1.4 npm)" != "0" ]]; then
+  pass "a custom-source receipt never vouches for a default install"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2
+  fail "a custom-source receipt never vouches for a default install"
+fi
+
+# Round 5 canonicalizes each source element (trailing slashes stripped). Writer
+# and reader must canonicalize identically or a trailing slash silently splits
+# the identity — the exact boundary that broke before centralization.
+prepare_case gate-reader-canonicalized-source
+printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --registry https://mirror.example/ --gate install
+if jq -e '.packages["npm:brace-expansion"].source == "explicit:https://mirror.example"' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "a trailing-slash selector is canonicalized on the receipt"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2
+  fail "a trailing-slash selector is canonicalized on the receipt"
+fi
+if [[ "$(gate_known_rc brace-expansion@2.1.4 npm PROBE_SOURCE_SET=https://mirror.example/)" == "0" ]]; then
+  pass "the reader canonicalizes a trailing-slash selector the same way"
+else
+  fail "the reader canonicalizes a trailing-slash selector the same way"
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

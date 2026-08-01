@@ -87,6 +87,33 @@ rm -f "$COMPLETION_DIR/_safe"
 rm -f "$LEGACY_SAFE_RUN_CONFIG_DIR/completions/_safe-install"
 info "removed binaries and zsh completions"
 
+# Only files we generated: a regular (never symlinked) file whose second line
+# is EXACTLY our per-tool marker. Anything else belongs to somebody else and
+# stays (PR#30 review finding 5).
+gate_wrapper_marked() {
+  local path="$1" tool="$2"
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  # Byte-stream comparison, never a command substitution: these paths hold
+  # arbitrary foreign executables, and capturing an ELF second line into a
+  # shell variable made bash emit "ignored null byte in input" warnings from
+  # status/doctor/install (PR#30 round regression R1). Same exact whole-line
+  # test, no capture.
+  LC_ALL=C sed -n '2p' -- "$path" 2>/dev/null \
+    | LC_ALL=C grep -qxF -- "# safe-gate-wrapper v1 tool=${tool}"
+}
+
+removed_wrappers=()
+for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer; do
+  if gate_wrapper_marked "$BIN_DIR/$tool" "$tool"; then
+    rm -f "$BIN_DIR/$tool"
+    removed_wrappers+=("$tool")
+  fi
+done
+rm -f "$CONFIG_BASE/gate-lib.sh"
+if [[ "${#removed_wrappers[@]}" -gt 0 ]]; then
+  info "removed gate wrappers: ${removed_wrappers[*]}"
+fi
+
 if [[ -f "$ZSHRC" ]]; then
   strip_zshrc_line "$ZSHRC" 'source "$HOME/.config/safe/install-wrappers.zsh"'
   strip_zshrc_line "$ZSHRC" 'source ~/.config/safe/install-wrappers.zsh'

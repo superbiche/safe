@@ -10,6 +10,11 @@ RUN_DATA_DIR="$DATA_BASE/run"
 AUDIT_CONFIG_DIR="$CONFIG_BASE/audit"
 AUDIT_DATA_DIR="$DATA_BASE/audit"
 WRAPPER_TARGET="$CONFIG_BASE/install-wrappers.zsh"
+GATE_LIB_TARGET="$CONFIG_BASE/gate-lib.sh"
+# Tools that get a PATH wrapper. Every wrapper is a dumb 3-line shim into
+# `safe gate`; all routing lives in gate-lib.sh, so upgrading safe upgrades the
+# gate without rewriting a single wrapper.
+GATE_TOOLS=(npm pnpm pnpx yarn bun pip pip3 uv cargo go composer)
 COMPLETION_DIR="${SAFE_ZSH_COMPLETION_DIR:-$HOME/.local/share/zsh/site-functions}"
 COMPLETION_TARGET="$COMPLETION_DIR/_safe"
 ZSHRC="${SAFE_ZSHRC:-$HOME/.zshrc}"
@@ -94,7 +99,68 @@ for script in "$REPO_DIR/bin/safe" "$REPO_DIR/bin/safe-run" "$REPO_DIR/bin/safe-
   [[ -f "$script" ]] || die "missing source file: $script"
 done
 [[ -f "$REPO_DIR/lib/install-wrappers.zsh" ]] || die "missing wrapper source"
+[[ -f "$REPO_DIR/lib/gate-lib.sh" ]] || die "missing gate library source"
 [[ -f "$REPO_DIR/lib/completions/_safe" ]] || die "missing zsh completion"
+
+# Ownership check: a regular (never symlinked) file whose second line is
+# EXACTLY our per-tool marker. A loose substring match let a foreign file
+# carrying the phrase be overwritten/deleted, and a marked symlink let a
+# reinstall truncate its target outside BIN_DIR (PR#30 review finding 5).
+gate_wrapper_marked() {
+  local path="$1" tool="$2"
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  # Byte-stream comparison, never a command substitution: these paths hold
+  # arbitrary foreign executables, and capturing an ELF second line into a
+  # shell variable made bash emit "ignored null byte in input" warnings from
+  # status/doctor/install (PR#30 round regression R1). Same exact whole-line
+  # test, no capture.
+  LC_ALL=C sed -n '2p' -- "$path" 2>/dev/null \
+    | LC_ALL=C grep -qxF -- "# safe-gate-wrapper v1 tool=${tool}"
+}
+
+# Any owned wrapper anywhere in the set means gating is live on this machine
+# and the library it loads must be refreshed. Probing npm alone missed an
+# installation that kept, say, an owned pnpm wrapper and no npm one, leaving
+# the library unrestored (PR#30 delta finding 2).
+gate_wrappers_exist() {
+  local tool
+  for tool in "${GATE_TOOLS[@]}"; do
+    gate_wrapper_marked "$BIN_DIR/$tool" "$tool" && return 0
+  done
+  return 1
+}
+
+# PATH wrappers are what makes gating work in every shell (bash -c, Makefiles,
+# CI, agent harnesses), not just an interactive zsh. A pre-existing file
+# without our marker is somebody else's binary: report it and leave it alone.
+install_gate_wrappers() {
+  local tool target
+  local -a written=() skipped=()
+
+  mkdir -p "$BIN_DIR"
+  for tool in "${GATE_TOOLS[@]}"; do
+    target="$BIN_DIR/$tool"
+    if [[ -e "$target" || -L "$target" ]] && ! gate_wrapper_marked "$target" "$tool"; then
+      skipped+=("$tool")
+      continue
+    fi
+    rm -f "$target"
+    cat > "$target" <<EOF
+#!/usr/bin/env bash
+# safe-gate-wrapper v1 tool=${tool}
+exec safe gate ${tool} -- "\$@"
+EOF
+    chmod 0755 "$target"
+    written+=("$tool")
+  done
+
+  if [[ "${#written[@]}" -gt 0 ]]; then
+    info "installed gate wrappers in $BIN_DIR: ${written[*]}"
+  fi
+  if [[ "${#skipped[@]}" -gt 0 ]]; then
+    warn "kept existing non-safe files, gating NOT active for: ${skipped[*]} (remove them and re-run to gate these tools)"
+  fi
+}
 
 migrate_dir() {
   local old="$1" new="$2"
@@ -334,6 +400,17 @@ migrate_dir "$LEGACY_SAFE_AUDIT_DATA_DIR" "$AUDIT_DATA_DIR"
 merge_legacy_state
 
 mkdir -p "$BIN_DIR"
+# The dispatcher and its installed gate library are ONE upgrade unit: a
+# selective mode (--run, --audit, --no-wrappers) that refreshes `safe` while
+# active wrappers keep loading an older library would leave a fixed
+# dispatcher routing through vulnerable tables (PR#30 review finding 2).
+# Refresh the library FIRST (never a new dispatcher with an old library),
+# whenever an installed copy or marked wrappers already exist.
+if [[ -f "$GATE_LIB_TARGET" ]] || gate_wrappers_exist; then
+  mkdir -p "$CONFIG_BASE"
+  install -m 0644 "$REPO_DIR/lib/gate-lib.sh" "$GATE_LIB_TARGET"
+  info "refreshed gate library at $GATE_LIB_TARGET"
+fi
 install -m 0755 "$REPO_DIR/bin/safe" "$BIN_DIR/safe"
 install -m 0755 "$REPO_DIR/bin/safe-run" "$BIN_DIR/safe-run"
 install -m 0755 "$REPO_DIR/bin/safe-audit" "$BIN_DIR/safe-audit"
@@ -366,6 +443,8 @@ fi
 if (( DO_WRAPPERS )); then
   mkdir -p "$CONFIG_BASE"
   install -m 0644 "$REPO_DIR/lib/install-wrappers.zsh" "$WRAPPER_TARGET"
+  install -m 0644 "$REPO_DIR/lib/gate-lib.sh" "$GATE_LIB_TARGET"
+  install_gate_wrappers
   touch "$ZSHRC"
   if grep -Fqx "$SOURCE_LINE" "$ZSHRC" || grep -Fqx 'source ~/.config/safe/install-wrappers.zsh' "$ZSHRC"; then
     info "wrapper source line already present in $ZSHRC"

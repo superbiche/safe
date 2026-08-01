@@ -23,7 +23,7 @@ the operator verbatim, wait, then retry the original command unchanged.
 | Surface | Mechanism | Refusal source |
 | --- | --- | --- |
 | `npx`, `bunx`, `uvx` | Binaries symlinked to `safe run` | `safe run: BLOCKED ...` + exit 100–104 |
-| `npm`, `pnpm`, `yarn`, `bun`, `pip`, `pip3`, `uv`, `cargo`, `go`, `composer`, `volta` | zsh wrapper functions audit install, update, and exec-style subcommands via `safe audit` | `safe: BLOCKED ...` + exit 100/102/104 |
+| `npm`, `pnpm`, `pnpx`, `yarn`, `bun`, `pip`, `pip3`, `uv`, `cargo`, `go`, `composer` | PATH wrappers exec `safe gate <tool>`, which audits install, update, and exec-style subcommands via `safe audit` before delegating | `safe: BLOCKED ...` + exit 100/102/104 |
 | `safe install <pkg>` | Audited, confirmed install path | `safe: BLOCKED ...` + exit 100/102/104 |
 
 Audited subcommand families: installs (`install`/`add`/`ci`/`require` and
@@ -33,14 +33,17 @@ exec-style fetch-and-run (`npm exec|x`, `pnpm dlx`, `yarn dlx`, `bun x`,
 unrecognized space-form value flag before the command fails closed
 (escapable with `--flag=value`).
 
+The wrappers are executables on PATH, so gating applies in every shell —
+`bash -c`, Makefiles, CI, and agent harnesses included, not just an
+interactive zsh.
+
 Passthrough by design (no registry fetch involved): non-install subcommands
-(`npm run`, `npm --version`, `volta list`, ...), `npm exec <tool>` and
+(`npm run`, `npm --version`, ...), `npm exec <tool>` and
 `npx <tool>` for a **bare, unversioned** name already present in
 `node_modules/.bin` of the current or a parent directory (a versioned or
 aliased spec is still audited),
-`pnpm exec` and `composer exec` (project/vendor binaries only), `volta run`
-(fetches only official runtimes), `uv run` without `--with`, and `go run`
-of local paths. `npx --no-install <tool>` / `--no` are honored strictly:
+`pnpm exec` and `composer exec` (project/vendor binaries only), `uv run`
+without `--with`, and `go run` of local paths. `npx --no-install <tool>` / `--no` are honored strictly:
 the local binary runs, or the refusal is exit 100 — never a registry fetch
 (modern npx would fetch anyway; safe restores the flag's meaning).
 
@@ -62,30 +65,23 @@ distinguish a block from a missing binary (127):
 
 | Code | Meaning |
 | --- | --- |
-| 100 | Blocked by policy (blocklist, degraded wrappers, fail-closed audit, unrecognized/unsupported runner-native flags) |
+| 100 | Blocked by policy (blocklist, fail-closed audit, unrecognized/unsupported runner-native flags) |
 | 101 | host-allow version pin mismatch |
 | 102 | Interactive operator confirmation required (non-TTY refusal) |
 | 103 | Invalid package name rejected |
 | 104 | `safe audit` BLOCK verdict |
 
-## Degraded wrappers (partial shell snapshots)
+## No partial-load state
 
-Some agent harnesses snapshot the interactive shell and strip helper
-functions (Claude Code drops single-underscore function names). The public
-wrappers detect this and degrade legibly instead of dying with a silent 127:
+Gating is executable-based, so the old "degraded wrapper" mode (a shell
+snapshot keeping wrapper functions while stripping their helpers, which died
+with a silent 127) no longer exists: a wrapper either runs the full gate or is
+not on PATH at all. If `safe gate` cannot load its routing tables it refuses
+with the usual `safe: BLOCKED` line and exit 100 rather than delegating.
 
-- The audited subcommand families above refuse with a `safe: BLOCKED` line
-  and exit 100 (degraded mode cannot audit, so it fails closed where a
-  healthy shell would have audited).
-- Degraded guards can't run the full parser, so they are conservative: they
-  may over-refuse a few non-fetch invocations but never under-refuse a real
-  fetch. Specifically `uv run` refuses if `--with`/`-w` appears anywhere,
-  `go run` refuses if any argument contains `@`, and `npm exec`/`bun x` of a
-  local `./node_modules/.bin` tool is refused. `pnpm exec`, `composer exec`,
-  and `volta run` pass through as in a healthy shell.
-
-If an agent still sees a bare, silent 127 from a wrapped tool, that is a bug
-worth reporting to the operator — never a reason to bypass.
+If an agent sees a bare, silent 127 from a wrapped tool, that means the command
+genuinely is not installed — or that `safe` itself is missing from PATH, which
+is worth reporting to the operator. It is never a reason to bypass.
 
 ## Allow flows (operator only)
 

@@ -35,6 +35,15 @@ tool="$(basename -- "$0")"
     printf '\t%s' "${arg}"
   done
   printf '\n'
+  # Any source-set variable reaching the delegated tool's environment is a
+  # credential leak: the gate accumulates them, the real tool must never see
+  # them. Logged only when non-empty so existing assertions are unaffected.
+  for leak in SAFE_GATE_REGISTRY SAFE_GATE_DIST_TAG SAFE_GATE_PROJECT_DIR \
+    SAFE_GATE_NPM_USERCONFIG SAFE_GATE_NPM_GLOBALCONFIG SAFE_INSTALL_REGISTRY; do
+    if [[ -n "${!leak:-}" ]]; then
+      printf 'ENVLEAK\t%s=%s\n' "${leak}" "${!leak}"
+    fi
+  done
 } >> "${SAFE_INSTALL_COMMAND_LOG}"
 exit "${SAFE_INSTALL_REAL_STATUS:-0}"
 STUB
@@ -75,18 +84,22 @@ done
 exit "${SAFE_AUDIT_CHECK_STATUS:-0}"
 STUB
   chmod +x "${bin_dir}/safe-audit"
+}
 
-  cat > "${bin_dir}/safe" <<'STUB'
+# The wrappers install.sh generates. Shape must stay in sync with
+# install_gate_wrappers() in install.sh — that is what the suite exercises.
+write_gate_wrappers() {
+  local wrapper_dir="$1"
+  local tool
+
+  for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer; do
+    cat > "${wrapper_dir}/${tool}" <<EOF
 #!/usr/bin/env bash
-if [[ "${1:-}" == "audit" ]]; then
-  shift
-  exec safe-audit "$@"
-fi
-
-printf 'unexpected safe command: %s\n' "$*" >&2
-exit 99
-STUB
-  chmod +x "${bin_dir}/safe"
+# safe-gate-wrapper v1 tool=${tool}
+exec safe gate ${tool} -- "\$@"
+EOF
+    chmod +x "${wrapper_dir}/${tool}"
+  done
 }
 
 prepare_case() {
@@ -94,40 +107,52 @@ prepare_case() {
   local with_safe_audit="${2:-yes}"
   CASE_DIR="${TEST_ROOT}/${name}"
   BIN_DIR="${CASE_DIR}/bin"
+  WRAPPER_DIR="${CASE_DIR}/wrappers"
   WORK_DIR="${CASE_DIR}/work"
   HOME_DIR="${CASE_DIR}/home"
   LOG_FILE="${CASE_DIR}/commands.log"
   OUT_FILE="${CASE_DIR}/stdout.log"
   ERR_FILE="${CASE_DIR}/stderr.log"
 
-  mkdir -p "${BIN_DIR}" "${WORK_DIR}" "${HOME_DIR}"
+  mkdir -p "${BIN_DIR}" "${WRAPPER_DIR}" "${WORK_DIR}" "${HOME_DIR}"
   : > "${LOG_FILE}"
   : > "${OUT_FILE}"
   : > "${ERR_FILE}"
 
   local tool
-  for tool in npm pnpm yarn bun uv pip pip3 cargo go composer volta; do
+  for tool in npm pnpm pnpx yarn bun uv pip pip3 cargo go composer volta; do
     write_tool_stub "${BIN_DIR}" "${tool}"
   done
+
+  # The real dispatcher: `safe gate` is under test, so nothing about it is
+  # stubbed. Only safe-audit is (via SAFE_AUDIT_PATH, see run_zsh).
+  ln -sf "${ROOT_DIR}/bin/safe" "${BIN_DIR}/safe"
+
+  write_gate_wrappers "${WRAPPER_DIR}"
 
   if [[ "${with_safe_audit}" == "yes" ]]; then
     write_safe_audit_stub "${BIN_DIR}"
   fi
 }
 
+# Gate mode: the wrappers sit ahead of the tool stubs on PATH, so a command
+# resolves to the wrapper executable, which execs `safe gate <tool>`. Nothing
+# is sourced into the shell — that is the point of the port, and running the
+# script under `zsh -fc` proves the gate no longer depends on shell state.
 run_zsh() {
   (
     cd "${WORK_DIR}" || exit 99
     ROOT_DIR="${ROOT_DIR}" \
     HOME="${HOME_DIR}" \
-    PATH="${BIN_DIR}:/usr/bin:/bin" \
+    PATH="${WRAPPER_DIR}:${BIN_DIR}:/usr/bin:/bin" \
+    SAFE_AUDIT_PATH="${BIN_DIR}/safe-audit" \
     SAFE_INSTALL_COMMAND_LOG="${LOG_FILE}" \
     SAFE_INSTALL_TEST_SCRIPT="${SAFE_INSTALL_TEST_SCRIPT:-}" \
     SAFE_AUDIT_SCAN_OUTPUT="${SAFE_AUDIT_SCAN_OUTPUT:-}" \
     SAFE_AUDIT_SCAN_STATUS="${SAFE_AUDIT_SCAN_STATUS:-}" \
     SAFE_AUDIT_CHECK_STATUS="${SAFE_AUDIT_CHECK_STATUS:-}" \
     SAFE_INSTALL_REAL_STATUS="${SAFE_INSTALL_REAL_STATUS:-}" \
-    "${ZSH_BIN}" -fc 'source "${ROOT_DIR}/lib/install-wrappers.zsh"; eval "${SAFE_INSTALL_TEST_SCRIPT}"'
+    "${ZSH_BIN}" -fc 'eval "${SAFE_INSTALL_TEST_SCRIPT}"'
   ) >"${OUT_FILE}" 2>"${ERR_FILE}"
   STATUS=$?
 }
@@ -208,92 +233,52 @@ assert_err_not_contains_fragment() {
   return 0
 }
 
-# Simulates a harness shell snapshot that keeps the public wrapper functions
-# but strips all safe_install_* helpers (the Claude Code silent-127
-# regression) AND the *_impl helpers behind the public wrappers — a public-
-# only snapshot must refuse legibly, never die 127 mid-function or leak
-# command-not-found noise (delta-9 finding N4).
-STRIP_HELPERS='for f in ${(k)functions}; do [[ "$f" == safe_install_* || "$f" == *_impl ]] && unfunction "$f"; done; '
+# The degraded-mode cases that used to live here (STRIP_HELPERS: a shell
+# snapshot keeping the public wrapper functions while stripping the
+# safe_install_* helpers) are gone with the zsh functions themselves. An
+# executable wrapper cannot be half-loaded: it either exists on PATH and execs
+# `safe gate`, or it does not exist and the tool is simply ungated. The
+# remaining failure mode with the same shape — the gate routing tables being
+# unavailable — is covered by case_gate_lib_missing_fails_closed below.
 
-case_degraded_install_blocks_legibly() {
-  prepare_case "degraded-install-blocks-legibly"
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm install left-pad" run_zsh
+case_gate_lib_missing_fails_closed() {
+  prepare_case "gate-lib-missing-fails-closed"
+  # `safe` resolving to a copy outside the repo (no ../lib/gate-lib.sh, no
+  # ~/.config/safe/gate-lib.sh) must refuse legibly, never delegate unaudited.
+  rm -f "${BIN_DIR}/safe"
+  cp "${ROOT_DIR}/bin/safe" "${BIN_DIR}/safe"
+  chmod +x "${BIN_DIR}/safe"
+  SAFE_INSTALL_TEST_SCRIPT='npm install -g left-pad' run_zsh
   assert_status 100 "$FUNCNAME" || return
-  assert_err_contains_fragment 'safe: BLOCKED npm install' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe: BLOCKED npm' "$FUNCNAME" || return
   assert_err_contains_fragment 'safe explain' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   assert_err_not_contains_fragment 'command not found' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
-case_degraded_exec_blocks_legibly() {
-  prepare_case "degraded-exec-blocks-legibly"
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}pnpm dlx cowsay" run_zsh
-  assert_status 100 "$FUNCNAME" || return
-  assert_err_contains_fragment 'safe: BLOCKED pnpm dlx' "$FUNCNAME" || return
-  assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME" || return
-  assert_err_not_contains_fragment 'command not found' "$FUNCNAME" || return
-  pass "$FUNCNAME"
-}
-
-case_degraded_alias_subcommands_block() {
-  prepare_case "degraded-alias-subcommands-block"
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm x cowsay" run_zsh
-  assert_status 100 "$FUNCNAME" || return
-  assert_err_contains_fragment 'safe: BLOCKED npm x' "$FUNCNAME" || return
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm update left-pad" run_zsh
-  assert_status 100 "$FUNCNAME" || return
-  assert_err_contains_fragment 'safe: BLOCKED npm update' "$FUNCNAME" || return
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}yarn dlx cowsay" run_zsh
-  assert_status 100 "$FUNCNAME" || return
-  assert_err_contains_fragment 'safe: BLOCKED yarn dlx' "$FUNCNAME" || return
-  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
-  assert_log_not_contains_fragment $'REAL\tyarn' "$FUNCNAME" || return
-  assert_err_not_contains_fragment 'command not found' "$FUNCNAME" || return
-  pass "$FUNCNAME"
-}
-
-case_degraded_non_install_passes_through() {
-  prepare_case "degraded-non-install-passes-through"
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm --version && volta list node && composer validate" run_zsh
+case_wrapper_passthrough_is_cheap() {
+  prepare_case "wrapper-passthrough-is-cheap"
+  # Perf guard: a non-gated command must reach the real tool with zero audit
+  # invocations. Timed without the zsh layer, so it measures the wrapper path
+  # itself (wrapper -> bin/safe -> gate-lib -> exec).
+  local start end elapsed
+  start="$(date +%s%N)"
+  (
+    cd "${WORK_DIR}" || exit 99
+    HOME="${HOME_DIR}" \
+    PATH="${WRAPPER_DIR}:${BIN_DIR}:/usr/bin:/bin" \
+    SAFE_AUDIT_PATH="${BIN_DIR}/safe-audit" \
+    SAFE_INSTALL_COMMAND_LOG="${LOG_FILE}" \
+    "${WRAPPER_DIR}/npm" --version
+  ) >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  end="$(date +%s%N)"
+  elapsed=$(( (end - start) / 1000000 ))
   assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
   assert_log_contains $'REAL\tnpm\t--version' "$FUNCNAME" || return
-  assert_log_contains $'REAL\tvolta\tlist\tnode' "$FUNCNAME" || return
-  assert_log_contains $'REAL\tcomposer\tvalidate' "$FUNCNAME" || return
-  assert_err_not_contains_fragment 'command not found' "$FUNCNAME" || return
-  pass "$FUNCNAME"
-}
-
-case_degraded_leading_flag_still_blocks() {
-  prepare_case "degraded-leading-flag-still-blocks"
-  # Degraded mode scans all tokens, so a leading global flag no longer hides
-  # the gated subcommand (round-3 review High).
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm --loglevel error install -g blockme" run_zsh
-  assert_status 100 "$FUNCNAME" || return
-  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}pnpm --filter=web dlx cowsay" run_zsh
-  assert_status 100 "$FUNCNAME" || return
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv --offline tool run cowsay" run_zsh
-  assert_status 100 "$FUNCNAME" || return
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}yarn --cwd sub add left-pad" run_zsh
-  assert_status 100 "$FUNCNAME" || return
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}go -C dir install evil@v1" run_zsh
-  assert_status 100 "$FUNCNAME" || return
-  assert_err_not_contains_fragment 'command not found' "$FUNCNAME" || return
-  pass "$FUNCNAME"
-}
-
-case_degraded_leading_flag_benign_passes() {
-  prepare_case "degraded-leading-flag-benign-passes"
-  # A non-gated command with a leading flag (and no gated keyword token) still
-  # passes through in degraded mode — version/help must not be refused.
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm --version" run_zsh
-  assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'REAL\tnpm\t--version' "$FUNCNAME" || return
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}go get example.com/x@v1" run_zsh
-  assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'REAL\tgo\tget\texample.com/x@v1' "$FUNCNAME" || return
-  assert_err_not_contains_fragment 'command not found' "$FUNCNAME" || return
+  printf '# passthrough wall time: %s ms\n' "${elapsed}"
   pass "$FUNCNAME"
 }
 
@@ -365,6 +350,9 @@ case_npm_exec_parent_walk_resists_shadowing() {
   # Shadowed pwd/dirname must not steer the walk into an attacker tree: with
   # no real local bin anywhere in the physical ancestry, the bare name is
   # still audited (and blocked here) despite the attacker-planted bin.
+  # Two shadowing vectors now: shell functions in the calling shell (which the
+  # gate process no longer inherits at all), and a bash exported-function env
+  # var, which the gate process DOES import — `builtin pwd -P` defeats both.
   mkdir -p "${WORK_DIR}/attacker/node_modules/.bin" "${WORK_DIR}/victim"
   printf '#!/bin/sh\n' > "${WORK_DIR}/attacker/node_modules/.bin/blockme"
   chmod +x "${WORK_DIR}/attacker/node_modules/.bin/blockme"
@@ -377,6 +365,28 @@ case_npm_exec_parent_walk_resists_shadowing() {
   assert_status 104 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='
+    cd victim
+    env "BASH_FUNC_pwd%%=() { echo '"${WORK_DIR}"'/attacker; }" npm exec blockme
+  ' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_pnpx_audits_like_dlx() {
+  prepare_case "pnpx-audits-like-dlx"
+  # pnpx is pnpm dlx with the subcommand implied: same exec gate, same tables.
+  SAFE_INSTALL_TEST_SCRIPT='pnpx cowsay@1.6.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tcowsay@1.6.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tpnpx\tcowsay@1.6.0' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='pnpx blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tpnpx\tblockme' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='pnpx --package blockme benign' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -404,10 +414,11 @@ case_leading_global_flag_gates_pnpm_dlx() {
 
 case_leading_global_flag_gates_yarn_add() {
   prepare_case "leading-global-flag-gates-yarn-add"
-  # The verbatim inbox shape: yarn --cwd <dir> add <pkg>.
+  # The verbatim inbox shape: yarn --cwd <dir> add <pkg>. The --cwd value is
+  # the effective project dir and must reach resolution (review finding 3).
   SAFE_INSTALL_TEST_SCRIPT='yarn --cwd sub add blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--project-dir\tsub' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tyarn' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -652,24 +663,6 @@ case_uv_with_requirements_refused() {
   SAFE_INSTALL_TEST_SCRIPT='uv tool run --with-requirements=req.txt ruff' run_zsh
   assert_status 100 "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run --with-requirements req.txt python" run_zsh
-  assert_status 100 "$FUNCNAME" || return
-  pass "$FUNCNAME"
-}
-
-case_degraded_uv_attached_short_with() {
-  prepare_case "degraded-uv-attached-short-with"
-  # uv accepts -w blockme, -w=blockme, and -wblockme as --with; the degraded
-  # guard must refuse all three (round-4 High 2).
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run -w blockme python" run_zsh
-  assert_status 100 "$FUNCNAME" || return
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run -w=blockme python" run_zsh
-  assert_status 100 "$FUNCNAME" || return
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run -wblockme python" run_zsh
-  assert_status 100 "$FUNCNAME" || return
-  # A plain run with no --with still passes through.
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run python -c pass" run_zsh
-  assert_status 0 "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -842,29 +835,6 @@ case_exec_passthrough_by_design() {
   pass "$FUNCNAME"
 }
 
-case_degraded_parity_refinements() {
-  prepare_case "degraded-parity-refinements"
-  write_tool_stub "${BIN_DIR}" go
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run --with extra script.py" run_zsh
-  assert_status 100 "$FUNCNAME" || return
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run script.py" run_zsh
-  assert_status 0 "$FUNCNAME" || return
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}go run example.com/m@v1" run_zsh
-  assert_status 100 "$FUNCNAME" || return
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}go run ./cmd" run_zsh
-  assert_status 0 "$FUNCNAME" || return
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}pnpm exec eslint && composer exec tool && volta run node -v" run_zsh
-  assert_status 0 "$FUNCNAME" || return
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm u" run_zsh
-  assert_status 100 "$FUNCNAME" || return
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}npm udpate x" run_zsh
-  assert_status 100 "$FUNCNAME" || return
-  # Degraded -w must be caught like --with (review High 3).
-  SAFE_INSTALL_TEST_SCRIPT="${STRIP_HELPERS}uv run -w extra script.py" run_zsh
-  assert_status 100 "$FUNCNAME" || return
-  pass "$FUNCNAME"
-}
-
 case_global_package_check() {
   prepare_case "global-package-check"
   SAFE_INSTALL_TEST_SCRIPT='npm install -g left-pad@1.3.0' run_zsh
@@ -978,11 +948,16 @@ case_critical_scan_non_tty_aborts() {
   pass "$FUNCNAME"
 }
 
-case_missing_safe_audit_warns_once() {
-  prepare_case "missing-safe-audit-warns-once" no
+case_missing_safe_audit_warns_per_command() {
+  prepare_case "missing-safe-audit-warns-per-command" no
   SAFE_INSTALL_TEST_SCRIPT='npm install -g one; npm install -g two' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_count 1 'safe audit not installed, skipping pre-install check' "${ERR_FILE}" "$FUNCNAME" || return
+  # SEMANTIC DIFFERENCE vs the zsh wrappers: the "warn once" flag was a
+  # variable in one long-lived interactive shell. Each gated command is now its
+  # own process, so the warning is once per command (2 here, was 1). The
+  # behaviour that matters — no audit available means warn, then proceed — is
+  # unchanged.
+  assert_count 2 'safe audit not installed, skipping pre-install check' "${ERR_FILE}" "$FUNCNAME" || return
   assert_log_contains $'REAL\tnpm\tinstall\t-g\tone' "$FUNCNAME" || return
   assert_log_contains $'REAL\tnpm\tinstall\t-g\ttwo' "$FUNCNAME" || return
   pass "$FUNCNAME"
@@ -1076,6 +1051,334 @@ case_install_idempotent_with_completions() {
   assert_count 1 'source "$HOME/.config/safe/install-wrappers.zsh"' "${HOME_DIR}/.zshrc" "$FUNCNAME" || return
   assert_count 1 'fpath=("$HOME/.local/share/zsh/site-functions" $fpath)' "${HOME_DIR}/.zshrc" "$FUNCNAME" || return
   [[ -f "${HOME_DIR}/.local/share/zsh/site-functions/_safe" ]] || { fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
+case_install_writes_gate_wrappers() {
+  prepare_case "install-writes-gate-wrappers"
+  mkdir -p "${HOME_DIR}/.local/bin"
+  # A pre-existing foreign binary of a wrapped name must survive untouched:
+  # overwriting somebody else's npm would be destructive, so we report instead.
+  printf '#!/usr/bin/env bash\n# not ours\n' > "${HOME_DIR}/.local/bin/pnpm"
+  chmod +x "${HOME_DIR}/.local/bin/pnpm"
+
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+
+  local tool
+  for tool in npm pnpx yarn bun pip pip3 uv cargo go composer; do
+    head -n 2 "${HOME_DIR}/.local/bin/${tool}" | grep -Fq '# safe-gate-wrapper' || { fail "$FUNCNAME"; return; }
+    [[ -x "${HOME_DIR}/.local/bin/${tool}" ]] || { fail "$FUNCNAME"; return; }
+    grep -Fq "exec safe gate ${tool} -- \"\$@\"" "${HOME_DIR}/.local/bin/${tool}" || { fail "$FUNCNAME"; return; }
+  done
+  grep -Fqx '# not ours' "${HOME_DIR}/.local/bin/pnpm" || { fail "$FUNCNAME"; return; }
+  assert_err_contains_fragment 'gating NOT active for: pnpm' "$FUNCNAME" || return
+  [[ -f "${HOME_DIR}/.config/safe/gate-lib.sh" ]] || { fail "$FUNCNAME"; return; }
+  # No volta wrapper: the volta integration is retired.
+  [[ ! -e "${HOME_DIR}/.local/bin/volta" ]] || { fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
+case_selective_install_refreshes_gate_lib() {
+  prepare_case "selective-install-refreshes-gate-lib"
+  # Release A: full install, then simulate a stale installed gate library.
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+  printf '# STALE SENTINEL — release A library\n' > "${HOME_DIR}/.config/safe/gate-lib.sh"
+
+  # Release B run in a selective mode that skips wrapper generation: the
+  # dispatcher and its active library are one upgrade unit, so the library
+  # must be refreshed anyway (review finding: wrappers kept loading an old
+  # vulnerable library after `install.sh --run`).
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" --run >>"${OUT_FILE}" 2>>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+  if grep -Fq 'STALE SENTINEL' "${HOME_DIR}/.config/safe/gate-lib.sh"; then
+    fail "$FUNCNAME"
+    return
+  fi
+  cmp -s "${ROOT_DIR}/lib/gate-lib.sh" "${HOME_DIR}/.config/safe/gate-lib.sh" || { fail "$FUNCNAME"; return; }
+
+  # Damaged installation: NO installed library and NO npm wrapper, but one
+  # owned non-npm wrapper still gating. The npm-only probe missed this and
+  # left the library unrestored, so pnpm refused for want of a library
+  # (delta finding 2). Any owned wrapper must trigger the refresh, in every
+  # selective mode.
+  local mode
+  for mode in --run --audit --no-wrappers; do
+    rm -f "${HOME_DIR}/.config/safe/gate-lib.sh" "${HOME_DIR}/.local/bin/npm"
+    printf '#!/usr/bin/env bash\n# safe-gate-wrapper v1 tool=pnpm\nexec safe gate pnpm -- "$@"\n' > "${HOME_DIR}/.local/bin/pnpm"
+    chmod +x "${HOME_DIR}/.local/bin/pnpm"
+    HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" "${mode}" >>"${OUT_FILE}" 2>>"${ERR_FILE}"
+    STATUS=$?
+    assert_status 0 "$FUNCNAME" || return
+    [[ -f "${HOME_DIR}/.config/safe/gate-lib.sh" ]] || {
+      printf 'mode %s did not restore the gate library for a non-npm wrapper\n' "${mode}" >&2
+      fail "$FUNCNAME"
+      return
+    }
+    cmp -s "${ROOT_DIR}/lib/gate-lib.sh" "${HOME_DIR}/.config/safe/gate-lib.sh" || {
+      printf 'mode %s restored a library that is not the shipped one\n' "${mode}" >&2
+      fail "$FUNCNAME"
+      return
+    }
+  done
+  pass "$FUNCNAME"
+}
+
+case_loose_marker_is_not_ownership() {
+  prepare_case "loose-marker-not-ownership"
+  mkdir -p "${HOME_DIR}/.local/bin"
+  # A foreign file merely MENTIONING the marker phrase is not ours: neither
+  # install (overwrite) nor uninstall (delete) may touch it. Exact per-tool
+  # second-line markers only (review finding 5).
+  printf '#!/usr/bin/env bash\n# vendored helper based on safe-gate-wrapper ideas\necho real-yarn "$@"\n' > "${HOME_DIR}/.local/bin/yarn"
+  chmod +x "${HOME_DIR}/.local/bin/yarn"
+  # A wrapper-marked file for the WRONG tool is foreign too.
+  printf '#!/usr/bin/env bash\n# safe-gate-wrapper v1 tool=npm\nexec safe gate npm -- "$@"\n' > "${HOME_DIR}/.local/bin/cargo"
+  chmod +x "${HOME_DIR}/.local/bin/cargo"
+  # A symlink to a marked file must never be followed and truncated.
+  printf '#!/usr/bin/env bash\n# safe-gate-wrapper v1 tool=go\nexec safe gate go -- "$@"\n' > "${HOME_DIR}/marked-target"
+  ln -s "${HOME_DIR}/marked-target" "${HOME_DIR}/.local/bin/go"
+  # A foreign BINARY whose second line carries NUL bytes: reading it into a
+  # shell variable made bash warn "ignored null byte in input" from every
+  # ownership probe (round regression R1). It is foreign, it survives, and the
+  # probe must stay quiet about it.
+  printf '#!/usr/bin/env bash\n\0\0binary\0payload\n' > "${HOME_DIR}/.local/bin/bun"
+  chmod +x "${HOME_DIR}/.local/bin/bun"
+
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+  grep -Fq 'echo real-yarn' "${HOME_DIR}/.local/bin/yarn" || { fail "$FUNCNAME"; return; }
+  grep -Fq 'tool=npm' "${HOME_DIR}/.local/bin/cargo" || { fail "$FUNCNAME"; return; }
+  [[ -L "${HOME_DIR}/.local/bin/go" ]] || { fail "$FUNCNAME"; return; }
+  grep -Fq 'tool=go' "${HOME_DIR}/marked-target" || { fail "$FUNCNAME"; return; }
+  grep -Fq 'binary' "${HOME_DIR}/.local/bin/bun" || { fail "$FUNCNAME"; return; }
+  assert_err_contains_fragment 'gating NOT active for:' "$FUNCNAME" || return
+  # R1: the ownership probe must not narrate about binary neighbours.
+  assert_err_not_contains_fragment 'null byte' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'warning:' "$FUNCNAME" || return
+
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/uninstall.sh" >>"${OUT_FILE}" 2>>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+  [[ -f "${HOME_DIR}/.local/bin/yarn" ]] || { fail "$FUNCNAME"; return; }
+  [[ -f "${HOME_DIR}/.local/bin/cargo" ]] || { fail "$FUNCNAME"; return; }
+  [[ -L "${HOME_DIR}/.local/bin/go" && -f "${HOME_DIR}/marked-target" ]] || { fail "$FUNCNAME"; return; }
+  [[ -f "${HOME_DIR}/.local/bin/bun" ]] || { fail "$FUNCNAME"; return; }
+  assert_err_not_contains_fragment 'null byte' "$FUNCNAME" || return
+
+  # The binary occupant must READ as foreign — an ownership probe that cannot
+  # parse it must not fall back to owning it — and status/doctor must stay
+  # quiet while saying so.
+  local probe_err="${CASE_DIR}/probe.err" probe_out="${CASE_DIR}/probe.out"
+  (cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" \
+    "${ROOT_DIR}/bin/safe" status >"${probe_out}") 2>"${probe_err}" || true
+  grep -Fq 'bun:foreign' "${probe_out}" || {
+    printf 'binary occupant did not read as foreign:\n%s\n' "$(cat "${probe_out}")" >&2
+    fail "$FUNCNAME"
+    return
+  }
+  if grep -Fq 'null byte' "${probe_err}"; then
+    printf 'status narrated about a binary neighbour:\n%s\n' "$(cat "${probe_err}")" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  (cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" \
+    "${ROOT_DIR}/bin/safe" doctor --json >"${probe_out}") 2>"${probe_err}" || true
+  jq -e '.environment.install_wrappers.gate_wrappers.bun == "foreign"
+     and .environment.install_wrappers.gate_wrappers_healthy == false' "${probe_out}" >/dev/null || {
+    printf 'doctor did not report the binary occupant as foreign:\n%s\n' "$(cat "${probe_out}")" >&2
+    fail "$FUNCNAME"
+    return
+  }
+  if grep -Fq 'null byte' "${probe_err}"; then
+    printf 'doctor narrated about a binary neighbour:\n%s\n' "$(cat "${probe_err}")" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
+case_status_probes_every_wrapper() {
+  prepare_case "status-probes-every-wrapper"
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+
+  # Healthy: every wrapper resolves to its owned file.
+  local status_out
+  status_out="$(cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" "${HOME_DIR}/.local/bin/safe" status 2>/dev/null)"
+  grep -Fq 'wrappers:       ok (11/11' <<<"${status_out}" || { printf '%s\n' "${status_out}" >&2; fail "$FUNCNAME"; return; }
+
+  # A missing non-npm wrapper must flip the aggregate (review finding: an
+  # npm-only probe concealed ungated siblings).
+  rm -f "${HOME_DIR}/.local/bin/pnpm"
+  status_out="$(cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" "${HOME_DIR}/.local/bin/safe" status 2>/dev/null)"
+  grep -Fq 'DEGRADED' <<<"${status_out}" || { printf '%s\n' "${status_out}" >&2; fail "$FUNCNAME"; return; }
+  grep -Fq 'pnpm:missing' <<<"${status_out}" || { printf '%s\n' "${status_out}" >&2; fail "$FUNCNAME"; return; }
+
+  # doctor --json reports the same per-tool map.
+  local doctor_out
+  doctor_out="$(cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" "${HOME_DIR}/.local/bin/safe" doctor --json 2>/dev/null)"
+  jq -e '.environment.install_wrappers.gate_wrappers.pnpm == "missing" and .environment.install_wrappers.gate_wrappers_healthy == false' <<<"${doctor_out}" >/dev/null || { printf '%s\n' "${doctor_out}" >&2; fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
+case_dash_bin_root_never_reports_healthy() {
+  prepare_case "dash-bin-root-state"
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+
+  # A relative dash-leading SAFE_BIN_DIR made both readlink calls parse the
+  # path as options: empty == empty reported `installed` while spraying
+  # readlink diagnostics (delta-2 finding N2). With anchored operands the
+  # state must be COMPUTED, not defaulted: from a cwd where the relative
+  # path resolves, `installed` is truthful and stderr stays clean; from a
+  # cwd where it does not, the wrapper canonicalization fails and the state
+  # must be the unhealthy `not-on-path`, never a false `installed`.
+  mkdir -p "${WORK_DIR}/-gate"
+  cp "${HOME_DIR}/.local/bin/npm" "${WORK_DIR}/-gate/npm"
+  local status_out status_err
+  status_out="$(cd "${WORK_DIR}" && HOME="${HOME_DIR}" SAFE_BIN_DIR='-gate' PATH="-gate:/usr/bin:/bin" "${HOME_DIR}/.local/bin/safe" status 2>"${CASE_DIR}/status-err.log")"
+  status_err="$(cat "${CASE_DIR}/status-err.log")"
+  if grep -Eq '(^|[[:space:]])npm:(foreign|missing|not-on-path|shadowed)' <<<"${status_out}"; then
+    printf 'resolvable relative bin root misreported npm:\n%s\n' "${status_out}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  if grep -q 'readlink' <<<"${status_err}"; then
+    printf 'readlink diagnostics leaked:\n%s\n' "${status_err}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  status_out="$(cd "${HOME_DIR}" && HOME="${HOME_DIR}" SAFE_BIN_DIR='-gate' PATH="/usr/bin:/bin" "${HOME_DIR}/.local/bin/safe" status 2>"${CASE_DIR}/status-err2.log")"
+  if grep -Fq 'npm:installed' <<<"${status_out}"; then
+    printf 'unresolvable relative bin root reported healthy:\n%s\n' "${status_out}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  if grep -q 'readlink' "${CASE_DIR}/status-err2.log"; then
+    printf 'readlink diagnostics leaked (second probe)\n' >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
+case_wrappers_not_on_path_are_unhealthy() {
+  prepare_case "wrappers-not-on-path"
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+
+  # The cron/service shape: installed `safe` invoked by ABSOLUTE path from a
+  # PATH that omits ~/.local/bin. The owned wrapper files exist but do not
+  # resolve, so they gate nothing — reporting "installed" claimed health for an
+  # ungated machine (delta finding 3).
+  #
+  # PATH must keep /usr/bin:/bin (safe's own `#!/usr/bin/env bash` and its jq /
+  # sed / date calls live there), so which managers still resolve depends on
+  # the host: those found under /usr/bin are `shadowed`, the rest are
+  # `not-on-path`. The expectation is therefore computed from the same PATH
+  # rather than hardcoded — and the case fails loudly if the host cannot
+  # exercise the not-on-path branch at all.
+  local probe_path="/usr/bin:/bin"
+  local -a expect_unresolved=() expect_shadowed=()
+  local tool
+  for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer; do
+    if [[ -n "$(PATH="${probe_path}" command -v "${tool}" 2>/dev/null || true)" ]]; then
+      expect_shadowed+=("${tool}")
+    else
+      expect_unresolved+=("${tool}")
+    fi
+  done
+  if [[ "${#expect_unresolved[@]}" -eq 0 ]]; then
+    printf 'host resolves all 11 managers under %s; cannot exercise not-on-path\n' "${probe_path}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+
+  local status_out doctor_out
+  status_out="$(cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${probe_path}" "${HOME_DIR}/.local/bin/safe" status 2>/dev/null)"
+  grep -Fq 'DEGRADED' <<<"${status_out}" || { printf '%s\n' "${status_out}" >&2; fail "$FUNCNAME"; return; }
+  for tool in "${expect_unresolved[@]}"; do
+    grep -Fq "${tool}:not-on-path" <<<"${status_out}" || {
+      printf 'expected %s:not-on-path in status:\n%s\n' "${tool}" "${status_out}" >&2
+      fail "$FUNCNAME"
+      return
+    }
+  done
+  for tool in "${expect_shadowed[@]}"; do
+    grep -Fq "${tool}:shadowed" <<<"${status_out}" || {
+      printf 'expected %s:shadowed in status:\n%s\n' "${tool}" "${status_out}" >&2
+      fail "$FUNCNAME"
+      return
+    }
+  done
+
+  # No tool may report installed here, and the aggregate must be unhealthy.
+  doctor_out="$(cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${probe_path}" "${HOME_DIR}/.local/bin/safe" doctor --json 2>/dev/null)"
+  jq -e --arg t "${expect_unresolved[0]}" '
+    .environment.install_wrappers.gate_wrappers_healthy == false
+    and .environment.install_wrappers.gate_wrappers[$t] == "not-on-path"
+    and ([.environment.install_wrappers.gate_wrappers[] | select(. == "installed")] | length == 0)
+  ' <<<"${doctor_out}" >/dev/null || { printf '%s\n' "${doctor_out}" >&2; fail "$FUNCNAME"; return; }
+
+  # A non-npm tool shadowed by an EARLIER PATH entry is unhealthy too, and is
+  # reported as shadowed rather than not-on-path.
+  local shadow_bin="${CASE_DIR}/shadow"
+  mkdir -p "${shadow_bin}"
+  printf '#!/usr/bin/env bash\necho foreign-cargo\n' > "${shadow_bin}/cargo"
+  chmod +x "${shadow_bin}/cargo"
+  status_out="$(cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${shadow_bin}:${HOME_DIR}/.local/bin:/usr/bin:/bin" "${HOME_DIR}/.local/bin/safe" status 2>/dev/null)"
+  grep -Fq 'cargo:shadowed' <<<"${status_out}" || { printf '%s\n' "${status_out}" >&2; fail "$FUNCNAME"; return; }
+  grep -Fq 'DEGRADED' <<<"${status_out}" || { fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
+case_uv_index_selectors_reach_audit() {
+  prepare_case "uv-index-selectors-reach-audit"
+  # Every uv fetch path accepts index selectors; dropping them audited PyPI
+  # while uv installed from the custom index (review finding 1).
+  SAFE_INSTALL_TEST_SCRIPT='uv tool install --default-index https://packages.example blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://packages.example' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='uv pip install --index-url=https://pypi.example blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://pypi.example' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='uv run --index https://idx.example --with blockme script.py' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://idx.example' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_uninstall_removes_gate_wrappers() {
+  prepare_case "uninstall-removes-gate-wrappers"
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+  printf '#!/usr/bin/env bash\n# not ours\n' > "${HOME_DIR}/.local/bin/composer"
+
+  HOME="${HOME_DIR}" bash "${ROOT_DIR}/uninstall.sh" >>"${OUT_FILE}" 2>>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+
+  local tool
+  for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go; do
+    [[ ! -e "${HOME_DIR}/.local/bin/${tool}" ]] || { fail "$FUNCNAME"; return; }
+  done
+  # Unmarked file of a wrapped name: not ours, not removed.
+  grep -Fqx '# not ours' "${HOME_DIR}/.local/bin/composer" || { fail "$FUNCNAME"; return; }
+  [[ ! -e "${HOME_DIR}/.config/safe/gate-lib.sh" ]] || { fail "$FUNCNAME"; return; }
   pass "$FUNCNAME"
 }
 
@@ -1283,17 +1586,42 @@ case_npm_scoped_and_userconfig_sources_reach_audit() {
   pass "$FUNCNAME"
 }
 
-case_wrapper_state_cleared_after_gate() {
-  prepare_case "wrapper-state-cleared"
-  # A long-lived interactive shell must not retain the scanned source set
-  # (possibly credential-bearing) after the gate decision (delta-7 N2).
-  SAFE_INSTALL_TEST_SCRIPT='npm install --registry https://alice:sekret@mirror.example okpkg@1.0.0; print -r -u2 -- "POST_REG=[${SAFE_INSTALL_REGISTRY:-}][${SAFE_INSTALL_NPM_USERCONFIG:-}]"' run_zsh
-  assert_err_contains_fragment 'POST_REG=[][]' "$FUNCNAME" || return
+case_gate_never_leaks_sources_to_the_real_tool() {
+  prepare_case "gate-no-source-leak"
+  # The zsh suite asserts the wrapper CLEARS SAFE_INSTALL_REGISTRY after the
+  # gate, because a long-lived interactive shell would otherwise retain a
+  # credential-bearing set (delta-7 N2 / delta-8 N2). Gate mode has no such
+  # state to clear — the scan happens inside the `safe gate` process, which
+  # exits — so that assertion is structurally unfalsifiable here and was
+  # passing vacuously after the merge. The equivalent live risk on this
+  # branch is the set reaching the DELEGATED tool's environment, which the
+  # stub reports as ENVLEAK.
+  SAFE_INSTALL_TEST_SCRIPT='npm install --registry https://alice:sekret@mirror.example okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tinstall\t--registry\thttps://alice:sekret@mirror.example\tokpkg@1.0.0' "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'ENVLEAK' "$FUNCNAME" || return
 
-  # The PROJECT-install route (no positional packages) scans too and must
-  # clear equally — cleanup tied to check_many missed it (delta-8 N2).
-  SAFE_INSTALL_TEST_SCRIPT='npm install --registry https://alice:sekret@mirror.example; print -r -u2 -- "POST_PROJ=[${SAFE_INSTALL_REGISTRY:-}]"' run_zsh
-  assert_err_contains_fragment 'POST_PROJ=[]' "$FUNCNAME" || return
+  # The project-install route (no positional package) scans too.
+  SAFE_INSTALL_TEST_SCRIPT='npm install --registry https://alice:sekret@mirror.example' run_zsh
+  assert_log_not_contains_fragment 'ENVLEAK' "$FUNCNAME" || return
+
+  # And the credential must not reach the calling shell either.
+  SAFE_INSTALL_TEST_SCRIPT='npm install --registry https://alice:sekret@mirror.example okpkg@1.0.0; print -r -u2 -- "POST=[${SAFE_GATE_REGISTRY:-}][${SAFE_INSTALL_REGISTRY:-}]"' run_zsh
+  assert_err_contains_fragment 'POST=[][]' "$FUNCNAME" || return
+
+  # Bash assignment preserves a pre-existing EXPORT attribute: a caller that
+  # exported a scanner name must not turn the gate's overwrite into an
+  # inherited credential in the delegate (delta-2 finding P2). Both routes;
+  # the calling shell keeps only its original sentinel.
+  SAFE_INSTALL_TEST_SCRIPT='export SAFE_GATE_REGISTRY=sentinel SAFE_GATE_DIST_TAG=sentinel SAFE_GATE_PROJECT_DIR=sentinel SAFE_GATE_NPM_USERCONFIG=sentinel SAFE_GATE_NPM_GLOBALCONFIG=sentinel; npm install --registry https://alice:sekret@mirror.example okpkg@1.0.0; print -r -u2 -- "POSTX=[${SAFE_GATE_REGISTRY:-}]"' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--registry\thttps://alice:sekret@mirror.example' "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'ENVLEAK' "$FUNCNAME" || return
+  assert_err_contains_fragment 'POSTX=[sentinel]' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='export SAFE_GATE_REGISTRY=sentinel; npm install --registry https://alice:sekret@mirror.example' run_zsh
+  assert_log_not_contains_fragment 'ENVLEAK' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -1410,12 +1738,8 @@ EOF
 main() {
   local case
   for case in \
-    case_degraded_install_blocks_legibly \
-    case_degraded_exec_blocks_legibly \
-    case_degraded_alias_subcommands_block \
-    case_degraded_non_install_passes_through \
-    case_degraded_leading_flag_still_blocks \
-    case_degraded_leading_flag_benign_passes \
+    case_gate_lib_missing_fails_closed \
+    case_wrapper_passthrough_is_cheap \
     case_refusal_message_contract \
     case_npm_exec_fetch_audits \
     case_npm_exec_local_bin_passthrough \
@@ -1443,7 +1767,7 @@ main() {
     case_npm_exec_post_positional_package \
     case_npm_exec_short_p_not_greedy_post_command \
     case_uv_with_requirements_refused \
-    case_degraded_uv_attached_short_with \
+    case_pnpx_audits_like_dlx \
     case_dlx_and_x_audit \
     case_uv_run_and_tool_run_gate \
     case_uv_short_with_and_boundary \
@@ -1455,7 +1779,6 @@ main() {
     case_go_run_value_flag_does_not_hide_module \
     case_update_family_gates \
     case_exec_passthrough_by_design \
-    case_degraded_parity_refinements \
     case_global_package_check \
     case_local_project_scan \
     case_add_scans_and_checks \
@@ -1467,7 +1790,7 @@ main() {
     case_npm_alias_audits_target_package \
     case_audit_failure_blocks \
     case_critical_scan_non_tty_aborts \
-    case_missing_safe_audit_warns_once \
+    case_missing_safe_audit_warns_per_command \
     case_non_install_passthrough \
     case_npm_complex_flags \
     case_pip_complex_flags \
@@ -1478,11 +1801,19 @@ main() {
     case_pip_cumulative_sources_all_reach_audit \
     case_npm_scoped_and_userconfig_sources_reach_audit \
     case_source_credentials_preserved_for_audit \
-    case_wrapper_state_cleared_after_gate \
+    case_gate_never_leaks_sources_to_the_real_tool \
     case_npm_repeated_registry_keeps_true_last \
     case_stale_evidence_is_source_scoped \
     case_install_idempotent_no_wrappers \
     case_install_idempotent_with_completions \
+    case_install_writes_gate_wrappers \
+    case_selective_install_refreshes_gate_lib \
+    case_loose_marker_is_not_ownership \
+    case_status_probes_every_wrapper \
+    case_wrappers_not_on_path_are_unhealthy \
+    case_dash_bin_root_never_reports_healthy \
+    case_uv_index_selectors_reach_audit \
+    case_uninstall_removes_gate_wrappers \
     case_install_cleans_legacy_safe_install_artifacts \
     case_install_preserves_symlinked_zshrc \
     case_install_merges_legacy_state_into_new_schema \

@@ -18,6 +18,37 @@
   host-allow permits the current invocation, and the stale readers use the
   canonical ecosystem key (cargo/composer entries are findable again).
 
+- Install gating now works in **every shell**, not just interactive zsh. The
+  zsh wrapper functions are retired and replaced by executable PATH wrappers
+  (`~/.local/bin/{npm,pnpm,pnpx,yarn,bun,pip,pip3,uv,cargo,go,composer}`), each
+  a three-line shim that execs the new `safe gate <tool> -- <args...>`
+  subcommand. Previously `bash -c 'npm i evil'`, a Makefile recipe, a CI step,
+  or an agent harness bypassed the gate entirely by hitting the version-manager
+  shim directly. All routing lives in `lib/gate-lib.sh` (installed at
+  `~/.config/safe/gate-lib.sh`), a faithful bash port of the reviewed zsh
+  routing tables, so gate upgrades ship with `safe` and the wrappers are never
+  rewritten. The real tool is the first non-wrapper executable of that name on
+  PATH, so mise/asdf shims and per-project tool versions keep working.
+  `install.sh` refuses to overwrite an unmarked file of a wrapped name (it
+  reports and skips); `uninstall.sh` removes only marked wrappers.
+  `safe status` and `safe doctor --json` now probe every wrapper in the set
+  (`installed` / `shadowed` / `not-on-path` / `missing` / `foreign`) instead of
+  shell function state, and report the set healthy only when every tool
+  resolves to its own wrapper — `not-on-path` covers the cron/service shape
+  where the wrapper files exist but `$SAFE_BIN_DIR` is not on PATH, so nothing
+  is actually gated.
+  `lib/install-wrappers.zsh` remains, as a stub that defines no wrappers and
+  warns once in an interactive shell when gating is absent.
+  Two consequences of the process model: the "safe audit not installed" warning
+  is now once per command rather than once per shell, and the degraded-mode
+  guards are gone — an executable wrapper cannot be half-loaded. The Volta
+  wrapper is retired (no `volta` wrapper is installed). The version/help
+  switches (`--version`, `-v`/`-V`, `--help`, `-h`) are now classified as the
+  valueless switches they are, so `npm --version` and friends pass through
+  instead of failing closed. Volta's dead shim-backup resolution is deleted
+  from `bin/safe-run`; `safe run link` clears stale Volta runner paths and
+  host-allow exec resolves the real runner through `mise which` at exec time.
+
 - Orthogonal-review hardening of the version-aware gate (PR#29 findings):
   version-scoped OSV results are server-authoritative — the local range
   comparator annotates but can never downgrade a hit to GO; OSV pagination is
