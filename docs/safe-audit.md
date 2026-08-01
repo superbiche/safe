@@ -141,14 +141,23 @@ represented by the key. Nothing is cached when:
 - **govulncheck is involved at all.** It analyses `./...` — Go source, which no
   evidence hash covers. That holds even when it was merely absent, so
   installing it later is never masked by a replay of the run that lacked it.
-- **any ecosystem audit did not return `ok`**, or any of osv-scanner, syft and
-  grype is in a non-ok state. Missing coverage is not a cacheable answer.
+- **an ecosystem audit failed, was absent, or returned partial coverage**, or
+  any of osv-scanner, syft and grype is in a non-ok state. Missing coverage is
+  not a cacheable answer. (A deterministic `unsupported` record — npm audit
+  facing a pnpm lockfile — *is* cacheable: it is decided by files that are in
+  the key.)
 
 Beyond the manifests and lockfiles discovery finds, the key also hashes the
 per-root inputs that decide what a scanner *asks*: `.npmrc` (which registry
 `npm audit` queries), `.safe-audit` (which ecosystems are audited at all), and
 every known evidence name that exists as a **symlink** — discovery walks
 regular files, but `npm audit` reads the link happily.
+
+The **scanner set** is part of the key too: each tool's presence and, when
+present, its path, size and mtime. Installing pip-audit gains a project Python
+coverage it did not have; removing it loses that coverage. Neither touches an
+evidence file, so without this a cache hit would replay a verdict produced by a
+different set of tools.
 
 One input remains deliberately outside the key: **advisory databases**. OSV and
 the ecosystem audits consult live data that can gain an advisory while an entry
@@ -157,9 +166,10 @@ cache: lower `SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS`, or pass `--no-cache`, when a
 scan must reflect advisories published in the last hours. A replay always says
 so on stdout, with the entry's age.
 
-Evidence is re-hashed after the scanners finish: if a lockfile or manifest
-changed while they ran, the result describes bytes that are no longer on disk
-and is not cached. A file that is swapped out and restored inside that same
+Evidence is re-enumerated and re-hashed after the scanners finish: if a
+lockfile or manifest changed while they ran — or a file that was not there
+before appeared, like a `.safe-audit` that switches an ecosystem off — the
+result describes a project that no longer matches the key, and is not cached. A file that is swapped out and restored inside that same
 window is not detected — the residual is the same class as absolute-path
 invocation, documented in [Install Wrappers](install-wrappers.md).
 
@@ -183,11 +193,18 @@ record with per-severity counts. Four rules govern that normalization:
   with its own `vulns`, and composer keys advisories by package.
 - A severity that cannot be determined is `unknown`, never `medium`.
   cargo-audit advisories usually carry only a CVSS vector, which safe scores.
-- Evidence a scanner **structurally cannot read** is a third state, distinct
-  from both a finding and a breakage: `npm audit` needs an npm lockfile, so a
-  pnpm or Yarn project is reported as not run rather than as a broken scanner.
-  It does not change the verdict — warning there would put every pnpm project
-  behind an operator prompt for a tool that was never going to answer.
+- Evidence a scanner **structurally cannot read** is its own state,
+  `unsupported`, distinct from both a finding and a breakage: `npm audit` needs
+  an npm lockfile, so a pnpm or Yarn project is reported as not run rather than
+  as a broken scanner. It does not change the verdict — osv-scanner reads that
+  lockfile, so the project IS covered, and warning there would put every pnpm
+  project behind an operator prompt for a tool that was never going to answer.
+  A `package.json` with **no lockfile at all** is different: nothing covers
+  those dependencies, so that WARNs rather than reporting a clean project.
+- Coverage that is partly missing is `partial`: when pip-audit audits two
+  requirements files and one fails, the advisories the other one found are
+  still counted. A failure in one target must not erase a critical found in
+  another.
 
 A scanner that is **absent** does warn (its coverage is genuinely missing), and
 a scanner that **failed** warns and blocks caching. `pip-audit` audits every
@@ -195,6 +212,10 @@ declared target — `requirements.txt`, `requirements-dev.txt`, and a
 `pyproject.toml` *by path* — because a bare `pip-audit` audits the active
 Python environment rather than the project, and stopping at the first target
 hid every dev-only advisory.
+
+`govulncheck` is required to exit 0: in `-json` mode it reports findings in
+the stream, so a nonzero exit means the run itself failed, whatever prefix it
+managed to write.
 
 `safe audit scan --allow-missing-tools` turns a missing ecosystem auditor from
 an abort into a reported gap. Callers that gate on the result document

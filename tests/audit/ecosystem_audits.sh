@@ -211,7 +211,7 @@ case_govulncheck_counts_unique_findings() {
   prepare_case "go"
   printf 'module demo\n\ngo 1.22\n' > "$CASE_PROJECT/go.mod"
   printf 'package main\nfunc main() {}\n' > "$CASE_PROJECT/main.go"
-  run_scan GOVULNCHECK_RC=3 GOVULNCHECK_OUT='{"config":{"protocol_version":"v1.0.0"}}
+  run_scan GOVULNCHECK_RC=0 GOVULNCHECK_OUT='{"config":{"protocol_version":"v1.0.0"}}
 {"finding":{"osv":"GO-2026-0001","trace":[{"module":"x"}]}}
 {"finding":{"osv":"GO-2026-0001","trace":[{"module":"x","function":"f"}]}}
 {"finding":{"osv":"GO-2026-0002"}}'
@@ -298,7 +298,7 @@ case_pnpm_project_is_unsupported_coverage_not_breakage() {
   run_scan NPM_RC=1 NPM_OUT=''
   assert_jq "$FUNCNAME" '
     (.ecosystem_audits[] | select(.scanner == "npm-audit")
-      | .status == "skipped" and ((.note // "") | test("lockfile")))
+      | .status == "unsupported" and ((.note // "") | test("pnpm/yarn")))
     and .verdict == "GO"
   ' || return
   pass "$FUNCNAME"
@@ -375,6 +375,90 @@ case_govulncheck_partial_stream_is_an_error() {
   assert_jq "$FUNCNAME" '
     .ecosystem_audits[] | select(.scanner == "govulncheck") | .status == "error"
   ' || return
+  pass "$FUNCNAME"
+}
+
+case_govulncheck_nonzero_exit_is_an_error() {
+  prepare_case "go-rc"
+  printf 'module demo\n\ngo 1.22\n' > "$CASE_PROJECT/go.mod"
+  printf 'package main\nfunc main() {}\n' > "$CASE_PROJECT/main.go"
+  # A complete-looking prefix and then a failed run: in -json mode findings
+  # are reported IN the stream, so a nonzero exit is the run breaking.
+  run_scan GOVULNCHECK_RC=1 GOVULNCHECK_OUT='{"config":{"protocol_version":"v1.0.0"}}'
+  assert_jq "$FUNCNAME" '
+    .ecosystem_audits[] | select(.scanner == "govulncheck") | .status == "error"
+  ' || return
+  pass "$FUNCNAME"
+}
+
+case_pip_audit_partial_failure_keeps_what_was_found() {
+  prepare_case "pip-partial"
+  printf 'app==1.0.0\n' > "$CASE_PROJECT/requirements.txt"
+  printf 'devtool==2.0.0\n' > "$CASE_PROJECT/requirements-dev.txt"
+  # requirements.txt finds a critical; requirements-dev.txt then breaks. The
+  # critical must survive: erasing it behind an unrelated failure is how a
+  # real finding disappears.
+  cat > "$MOCKBIN/pip-audit" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *requirements-dev.txt*) printf 'resolution error
+' >&2; exit 2 ;;
+  *) printf '%s' '{"dependencies":[{"name":"app","version":"1.0.0","vulns":[{"id":"PYSEC-1","severity":"critical"}]}]}'; exit 1 ;;
+esac
+STUB
+  chmod +x "$MOCKBIN/pip-audit"
+  run_scan
+  cat > "$MOCKBIN/pip-audit" <<'STUB'
+#!/usr/bin/env bash
+printf '%s' "${PIP_AUDIT_OUT:-}"
+exit "${PIP_AUDIT_RC:-0}"
+STUB
+  chmod +x "$MOCKBIN/pip-audit"
+
+  assert_jq "$FUNCNAME" '
+    (.ecosystem_audits[] | select(.scanner == "pip-audit")
+      | .status == "partial" and .critical == 1 and ((.note // "") | test("requirements-dev")))
+    and .audit_totals.critical == 1
+    and .verdict == "WARN"
+  ' || return
+  pass "$FUNCNAME"
+}
+
+case_lockless_npm_project_is_not_clean() {
+  prepare_case "no-lock"
+  # package.json only: osv-scanner has no lockfile to read and npm audit has
+  # none either, so NOTHING covers these dependencies. GO would mean "we
+  # looked at nothing".
+  printf '{"name":"demo","dependencies":{"left-pad":"^1.0.0"}}\n' > "$CASE_PROJECT/package.json"
+  run_scan
+  assert_jq "$FUNCNAME" '
+    (.ecosystem_audits[] | select(.scanner == "npm-audit")
+      | .status == "unsupported" and ((.note // "") | test("not audited")))
+    and .verdict == "WARN"
+  ' || return
+  pass "$FUNCNAME"
+}
+
+case_pnpm_project_still_caches() {
+  prepare_case "pnpm-cache"
+  printf '{"name":"demo","version":"1.0.0"}\n' > "$CASE_PROJECT/package.json"
+  printf "lockfileVersion: '9.0'\n" > "$CASE_PROJECT/pnpm-lock.yaml"
+  # A deterministic "unsupported" record is decided by files that are in the
+  # cache key, so it must not defeat caching for every pnpm user.
+  set +e
+  (
+    cd "$CASE_PROJECT" || exit 99
+    env HOME="$CASE_DIR/home" PATH="$MOCKBIN:/usr/bin:/bin" \
+      SAFE_AUDIT_CONFIG_DIR="$CASE_DIR/audit-config" \
+      SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
+      "$SAFE_AUDIT" scan --deps-only --project . --result-out "$RESULT"
+  ) > "$CASE_DIR/scan-cached.out" 2>&1
+  local rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || { printf 'scan exited %s\n%s\n' "$rc" "$(cat "$CASE_DIR/scan-cached.out")" >&2; fail "$FUNCNAME"; return; }
+  local entries
+  entries="$(find "$CASE_DIR/audit-data/scan-cache" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+  [[ "$entries" -eq 1 ]] || { printf 'expected 1 cache entry for a pnpm project, got %s\n' "$entries" >&2; fail "$FUNCNAME"; return; }
   pass "$FUNCNAME"
 }
 
@@ -466,6 +550,10 @@ main() {
     case_pip_audit_covers_every_declared_target \
     case_pyproject_is_audited_by_path_not_by_environment \
     case_govulncheck_partial_stream_is_an_error \
+    case_govulncheck_nonzero_exit_is_an_error \
+    case_pip_audit_partial_failure_keeps_what_was_found \
+    case_lockless_npm_project_is_not_clean \
+    case_pnpm_project_still_caches \
     case_missing_tool_is_reported_not_fatal_when_allowed \
     case_local_and_remote_normalizers_stay_identical
   do

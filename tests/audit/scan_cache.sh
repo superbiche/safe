@@ -580,6 +580,64 @@ case_registry_config_is_part_of_the_key() {
   pass "$FUNCNAME"
 }
 
+case_scanner_set_change_invalidates() {
+  prepare_case "scanner-set"
+  printf 'requests==2.32.0\n' > "$CASE_PROJECT/requirements.txt"
+  run_scan
+  run_scan
+  assert_hit "$FUNCNAME" || return
+
+  # Remove a scanner without touching a single evidence file. The uncached
+  # answer changes — that ecosystem is no longer covered — so replaying the
+  # old GO would suppress a warning the real scan now produces.
+  local stashed="$CASE_DIR/pip-audit.stashed"
+  mv "$MOCKBIN/pip-audit" "$stashed"
+  run_scan --allow-missing-tools
+  local missed=0
+  grep -Fq 'scan cache hit' "$OUT_FILE" || missed=1
+  mv "$stashed" "$MOCKBIN/pip-audit"
+  [[ "$missed" -eq 1 ]] || { printf 'a removed scanner still replayed the cached verdict\n' >&2; fail "$FUNCNAME"; return; }
+
+  # Restoring it restores the original key, so the first entry is reusable.
+  run_scan
+  assert_hit "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_config_created_during_the_scan_is_not_cached() {
+  prepare_case "config-race"
+  # `.safe-audit` decides which ecosystems run. Creating it mid-scan changes
+  # what the scanners did while every previously-known file still hashes the
+  # same — only re-enumerating the evidence SET catches that.
+  MUTATE_TARGET="" run_scan
+  local entry_count_before
+  entry_count_before="$(cache_entries)"
+  [[ "$entry_count_before" -ge 1 ]] || { fail "$FUNCNAME"; return; }
+
+  rm -f "$CASE_DIR/audit-data/scan-cache"/*.json
+  cat > "$MOCKBIN/syft" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "syft" >> "\${SCANNER_LOG:-/dev/null}"
+printf 'ecosystems:\n  npm: false\n' > "$CASE_PROJECT/.safe-audit"
+printf '{"components":[],"metadata":{"tools":[{"name":"syft"}]}}\n'
+exit 0
+STUB
+  chmod +x "$MOCKBIN/syft"
+  run_scan
+  # Restore the shared stub before asserting, so a failure cannot cascade.
+  cat > "$MOCKBIN/syft" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "syft" >> "${SCANNER_LOG:-/dev/null}"
+printf '{"components":[],"metadata":{"tools":[{"name":"syft"}]}}\n'
+exit 0
+STUB
+  chmod +x "$MOCKBIN/syft"
+  rm -f "$CASE_PROJECT/.safe-audit"
+
+  [[ "$(cache_entries)" -eq 0 ]] || { printf 'cached a result whose config appeared mid-scan\n' >&2; fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
 case_ecosystem_audit_counts_reach_the_totals() {
   prepare_case "audit-totals"
   run_scan
@@ -620,6 +678,8 @@ main() {
     case_key_is_independent_of_the_staging_directory \
     case_symlinked_evidence_is_hashed \
     case_registry_config_is_part_of_the_key \
+    case_scanner_set_change_invalidates \
+    case_config_created_during_the_scan_is_not_cached \
     case_ecosystem_audit_counts_reach_the_totals
   do
     "$case"

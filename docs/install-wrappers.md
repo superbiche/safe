@@ -149,7 +149,11 @@ advisory still exits 0, since its verdict lives in the document — so a critica
 count above zero prompts interactively and refuses with exit 102 in a
 non-interactive shell. Non-critical scan failures warn and continue, and a
 scanner that ran and failed is named in that warning rather than passing
-silently: the install proceeds, but what was not checked is said out loud.
+silently: the install proceeds, but what was not checked is said out loud. The
+same holds when no verdict can be read at all — an unwritable result
+destination, or a scan that failed outright: the preflight says the project was
+not audit-gated instead of treating silence as a clean result, and it never
+describes infrastructure breakage as a vulnerability finding.
 
 ## Wrapped Package Installs
 

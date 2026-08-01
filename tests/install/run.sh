@@ -1115,7 +1115,10 @@ case_critical_scan_non_tty_aborts() {
   assert_project_scan_logged "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   assert_err_contains_fragment 'safe: BLOCKED install — safe audit scan found critical findings' "$FUNCNAME" || return
-  assert_err_not_contains_fragment 'safe install: safe audit scan reported critical findings' "$FUNCNAME" || return
+  # Non-TTY refusals are exactly one line: the interactive preamble (which
+  # says the scan FAILED, never that it "found" something) stays out.
+  assert_err_not_contains_fragment 'after reporting critical findings' "$FUNCNAME" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
   pass "$FUNCNAME"
 }
 

@@ -113,6 +113,39 @@
   or the stream is not govulncheck's: tolerating an unparsable tail turned a
   process that died halfway into a confident "zero findings".
 
+- The scan cache keys the **scanner set** as well as the evidence: each tool's
+  presence, path, size and mtime. Removing `pip-audit` (or installing it) now
+  misses instead of replaying a verdict produced by a different set of tools —
+  neither event touches an evidence file. Evidence is also re-enumerated after
+  the scan, not just re-hashed, so a `.safe-audit` created mid-scan (switching
+  an ecosystem off) cannot be stored under the key of the project that did not
+  have it.
+
+- Ecosystem coverage has explicit machine-readable states. `unsupported` is a
+  scanner that structurally cannot read this evidence — `npm audit` facing a
+  pnpm or Yarn lockfile — which osv-scanner covers anyway, so it neither warns
+  nor defeats the cache. `partial` keeps the advisories a run did find when
+  another target failed: a critical in `requirements.txt` no longer disappears
+  because `requirements-dev.txt` broke. A `package.json` with **no lockfile at
+  all** now WARNs instead of reporting `GO`: neither osv-scanner nor npm audit
+  can read it, so a clean verdict would mean "we looked at nothing".
+
+- `govulncheck` must exit 0. In `-json` mode findings are reported in the
+  stream, so a nonzero exit means the run failed — and the complete-looking
+  prefix it had already written used to be normalized to zero findings.
+
+- The wrapper preflight never proceeds on silence. If it cannot allocate a
+  private result destination it falls back to safe's own state directory, and
+  if that fails too it says the project was NOT audit-gated instead of reading
+  a scan's exit 0 as "clean". A failed scan is described as a failed scan:
+  the old heuristic labelled any scan exiting >= 2 "critical findings", which
+  is exactly the infrastructure-as-vulnerability conflation the refusal
+  contract forbids.
+
+- `--result-out` and `--allow-missing-tools` are completable, and the
+  completion test now derives its expectation from `--help` instead of pinning
+  a literal list that passed *because* new flags were missing.
+
 - `safe audit scan --result-out <file>` hands the caller its own copy of the
   result document, and scans now assemble that document privately before
   publishing it. The per-machine result path is one file per day: a concurrent

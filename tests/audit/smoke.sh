@@ -46,7 +46,13 @@ pass "help output"
 
 grep -q 'capabilities' "$ROOT/lib/completions/_safe" || fail "completion omits capabilities"
 grep -q 'capabilities_opts=(--json)' "$ROOT/lib/completions/_safe" || fail "completion omits capabilities --json"
-grep -q 'scan_opts=(--all --machine --project --verbose --deps-only --full --no-cache)' "$ROOT/lib/completions/_safe" || fail "completion omits scan mode options"
+grep -q 'scan_opts=(--all --machine --project --verbose --deps-only --full --no-cache --result-out --allow-missing-tools)' "$ROOT/lib/completions/_safe" || fail "completion omits scan mode options"
+# Every option safe audit scan advertises in --help must be completable: the
+# old assertion pinned an exact list, so it passed precisely BECAUSE new flags
+# were missing.
+for scan_flag in $(SAFE_AUDIT_NO_INIT=1 "$ROOT/bin/safe-audit" help 2>/dev/null | grep -oE '^\s+safe audit scan .*' | grep -oE '\-\-[a-z-]+' | sort -u); do
+  grep -q -- "$scan_flag" <<<"$(grep -E '^\s+scan_opts=' "$ROOT/lib/completions/_safe")" || fail "completion omits scan flag: $scan_flag"
+done
 grep -q 'sigstore-bundle' "$ROOT/lib/completions/_safe" || fail "completion omits sigstore-bundle"
 grep -q 'tuf-bootstrap' "$ROOT/lib/completions/_safe" || fail "completion omits tuf-bootstrap"
 pass "completion output"
