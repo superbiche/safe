@@ -287,6 +287,58 @@ case_exhausted_names_leave_no_note_and_no_temp() {
   pass "$FUNCNAME"
 }
 
+case_symlink_to_a_directory_is_not_published_into() {
+  # `ln target` where target is a symlink TO A DIRECTORY creates the link
+  # INSIDE that directory — the report landed outside the inbox while the
+  # command reported writing to the inbox path. -T forbids the directory
+  # interpretation, so the candidate is simply taken and the suffix advances.
+  local repo; repo="$(new_repo repo-dirlink)"
+  mkdir -p "$repo/inbox" "$TEST_ROOT/outside-dir"
+  ln -s "$TEST_ROOT/outside-dir" "$repo/inbox/$(date +%F)-agent-fp-demo.md"
+  run_report_fp "$repo" demo >/dev/null 2>&1 || { fail "$FUNCNAME (command failed)"; return; }
+  if [[ -n "$(ls -A "$TEST_ROOT/outside-dir" 2>/dev/null)" ]]; then
+    fail "$FUNCNAME (published into the symlinked directory)"
+    return
+  fi
+  if [[ -f "$repo/inbox/$(date +%F)-agent-fp-demo-2.md" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (did not fall through to a suffixed name)"
+  fi
+}
+
+case_renderer_failure_publishes_nothing() {
+  # The renderer used to sit in a brace group whose status was the trailing
+  # printf's, so a failed jq was masked and a note containing only the static
+  # tail — no evidence at all — was published with exit 0 and a "wrote" line.
+  local repo; repo="$(new_repo repo-render)"
+  local stub="$TEST_ROOT/jqstub"
+  mkdir -p "$stub"
+  cat > "$stub/jq" <<'STUB'
+#!/usr/bin/env bash
+# Shape validation (-e) delegates; the rendering call (-r) fails.
+for a in "$@"; do [[ "$a" == "-r" ]] && exit 3; done
+exec /usr/bin/jq "$@"
+STUB
+  chmod +x "$stub/jq"
+  local status=0
+  PATH="$stub:$PATH" run_report_fp "$repo" demo >/dev/null 2>"$TEST_ROOT/err-render" || status=$?
+  if (( status == 0 )); then
+    fail "$FUNCNAME (reported success after a failed render)"
+    return
+  fi
+  if [[ -n "$(find "$repo/inbox" -name '*.md' 2>/dev/null)" ]]; then
+    fail "$FUNCNAME (published a note with no evidence in it)"
+    return
+  fi
+  grep -Fq 'nothing was written' "$TEST_ROOT/err-render" || { fail "$FUNCNAME (no legible cause)"; return; }
+  if [[ -n "$(find "$repo/inbox" -name '.report-fp.*' 2>/dev/null)" ]]; then
+    fail "$FUNCNAME (temp leaked)"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
 case_success_leaves_no_temp_behind() {
   local repo; repo="$(new_repo repo-clean)"
   run_report_fp "$repo" happy-dom >/dev/null 2>&1 || { fail "$FUNCNAME (command failed)"; return; }
@@ -331,6 +383,8 @@ case_socket_failure_text_is_not_copied_into_the_note
 case_unreadable_check_output_writes_nothing
 case_hundredth_note_is_allowed
 case_exhausted_names_leave_no_note_and_no_temp
+case_symlink_to_a_directory_is_not_published_into
+case_renderer_failure_publishes_nothing
 case_success_leaves_no_temp_behind
 case_missing_repo_refuses_legibly
 case_no_spec_is_a_usage_error

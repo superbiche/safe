@@ -211,8 +211,8 @@ cmd_report_fp() {
   }
   # Removed on every path out of here, including the failures below.
   trap 'rm -f "$body"' RETURN
-  {
-    jq -r --arg spec "$spec" --arg source "$source" --arg date "$date_str" --arg status "$status" '
+
+  jq -r --arg spec "$spec" --arg source "$source" --arg date "$date_str" --arg status "$status" '
       def bounds:
         [ .[]? | "- `\(.id)` (\(.severity // "unknown")) — fixed at `\(.fixed // "no fixed version")`" ] | join("\n");
       "# Suspected false positive: \($spec)",
@@ -263,15 +263,23 @@ cmd_report_fp() {
          else "" end),
       "- OSV: `\(.osv.status // "n/a")`, \((.osv.vulns // []) | length) advisories fetched",
       ""
-    ' <<<"$payload"
+    ' <<<"$payload" > "$body" || {
+    # Checked on its own. Inside a brace group the renderer's status was the
+    # group's only until the next command ran, so a failed jq was masked by the
+    # trailing printfs and a note holding nothing but the static tail got
+    # published — with exit 0 and a "wrote" line.
+    printf 'safe: report-fp: could not render the evidence; nothing was written\n' >&2
+    return 1
+  }
+  {
     printf '## Receipt\n\n'
     printf 'Full evidence: `%s`\n\n' "${SAFE_DATA_ROOT:-$HOME/.local/share/safe}/audit/checks/${date_str}-${slug}.json"
     printf '## Contract\n\n'
     printf 'This note IS the escalation. Nothing was auto-applied: no allowlist entry was\n'
     printf 'written, no verdict was changed, and the gate still refuses. The operator\n'
     printf 'validates before any behaviour changes.\n'
-  } > "$body" || {
-    printf 'safe: report-fp: could not render the note; nothing was written\n' >&2
+  } >> "$body" || {
+    printf 'safe: report-fp: could not finish the note; nothing was written\n' >&2
     return 1
   }
 
@@ -285,7 +293,11 @@ cmd_report_fp() {
     else
       candidate="$inbox/${date_str}-${source}-fp-${slug}-${n}.md"
     fi
-    if ln "$body" "$candidate" 2>/dev/null; then
+    # -T: never treat the destination as a directory. Without it, a candidate
+    # that is a symlink to a directory makes ln create the link INSIDE that
+    # directory — the report lands outside the inbox and this loop reports
+    # success. (GNU coreutils, already assumed throughout: stat -c, sed -i.)
+    if ln -T -- "$body" "$candidate" 2>/dev/null; then
       note="$candidate"
       break
     fi
