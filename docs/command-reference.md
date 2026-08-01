@@ -13,7 +13,8 @@ safe vendor update --name NAME --path PATH --reason TEXT -- COMMAND...
 safe setup [<machine> | --all | --machine <csv>]
 safe status
 safe doctor [--json]
-safe explain
+safe explain [--json]
+safe report-fp <spec> [--ecosystem <eco>] [--source <agent>]
 safe version
 safe help
 ```
@@ -21,18 +22,20 @@ safe help
 Unknown top-level commands are treated like `safe run <args...>`.
 
 `safe explain` prints the agent contract: what is gated, the refusal
-format, policy exit codes, and the operator-only allow flows. See
-[Agent Contract](agents.md).
+format, policy exit codes, version resolution, when to escalate, and the
+operator-only allow flows. `--json` emits the same contract as data.
+
+`safe report-fp <spec>` files a suspected false positive: it re-runs the
+check, captures the evidence while it is still true, and writes a dated note
+in safe's own `inbox/` for the operator to validate. It changes nothing —
+no allowlist entry, no verdict, no trust state.
 
 ### Policy exit codes
 
-```text
-100  blocked by policy (blocklist, missing gate library, fail-closed audit, unrecognized/unsupported runner-native flags)
-101  host-allow version pin mismatch
-102  interactive operator confirmation required (non-TTY refusal)
-103  invalid package name rejected
-104  safe audit BLOCK verdict
-```
+The exit-code table is **generated** into [Agent Contract](agents.md) from
+`docs/contract/agent-contract.json`, which is also what `safe explain`
+renders. It is deliberately not repeated here: this page carried its own copy
+and the two drifted.
 
 ## safe run
 

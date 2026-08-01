@@ -323,9 +323,17 @@ pass "safe install project mode audits, refuses, and fails closed"
 
 explain_output="$("$SAFE" explain)"
 grep -Fq '100  blocked by policy' <<<"$explain_output" || fail "safe explain missing exit code table"
-grep -Fq 'never attempt them yourself' <<<"$explain_output" || fail "safe explain missing agent guidance"
 grep -Fq 'safe run host-allow add' <<<"$explain_output" || fail "safe explain missing allow flow"
-pass "safe explain prints the agent contract"
+grep -Fq 'safe report-fp' <<<"$explain_output" || fail "safe explain missing the false-positive path"
+# Prose is wrapped at render time, so a multi-word phrase can straddle a line
+# break. Content assertions go against the JSON, which is the actual contract;
+# the text is checked for structure only.
+explain_json="$("$SAFE" explain --json)"
+jq -e '.agent_rules | any(test("never attempt them yourself"))' >/dev/null <<<"$explain_json" ||
+  fail "safe explain --json missing agent guidance"
+jq -e '.schema_version == 1 and (.exit_codes | length) > 0' >/dev/null <<<"$explain_json" ||
+  fail "safe explain --json is not a usable contract document"
+pass "safe explain prints the agent contract in text and JSON"
 set +e
 latest_trust_output="$(PATH="$shim:$PATH" SAFE_CONFIG_DIR="$tmp/latest-trust-config" "$shim/safe" install --yes --trust-host -g cowsay 2>&1)"
 latest_trust_rc=$?
