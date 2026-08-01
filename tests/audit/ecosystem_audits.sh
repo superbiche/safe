@@ -143,6 +143,7 @@ case_pip_audit_counts_advisories_not_dependencies() {
 case_npm_audit_maps_severity_bands() {
   prepare_case "npm-sev"
   printf '{"name":"demo","version":"1.0.0"}\n' > "$CASE_PROJECT/package.json"
+  printf '{"lockfileVersion":3,"packages":{}}\n' > "$CASE_PROJECT/package-lock.json"
   run_scan NPM_RC=1 NPM_OUT='{"metadata":{"vulnerabilities":{"info":0,"low":2,"moderate":1,"high":0,"critical":3,"total":6}}}'
   assert_jq "$FUNCNAME" '
     (.ecosystem_audits[] | select(.scanner == "npm-audit")
@@ -156,6 +157,7 @@ case_npm_audit_maps_severity_bands() {
 case_broken_scanner_is_an_error_not_a_clean_result() {
   prepare_case "npm-broken"
   printf '{"name":"demo","version":"1.0.0"}\n' > "$CASE_PROJECT/package.json"
+  printf '{"lockfileVersion":3,"packages":{}}\n' > "$CASE_PROJECT/package-lock.json"
   # Cannot reach its advisory database: nonzero exit, nothing on stdout.
   run_scan NPM_RC=1 NPM_OUT=''
   assert_jq "$FUNCNAME" '
@@ -171,6 +173,7 @@ case_broken_scanner_is_an_error_not_a_clean_result() {
 case_garbage_output_is_an_error() {
   prepare_case "npm-garbage"
   printf '{"name":"demo","version":"1.0.0"}\n' > "$CASE_PROJECT/package.json"
+  printf '{"lockfileVersion":3,"packages":{}}\n' > "$CASE_PROJECT/package-lock.json"
   # Exit 0 with output that is not an audit document at all.
   run_scan NPM_RC=0 NPM_OUT='<!DOCTYPE html><html>proxy login page</html>'
   assert_jq "$FUNCNAME" '
@@ -233,6 +236,7 @@ case_govulncheck_empty_stream_is_an_error() {
 case_project_mode_refuses_a_broken_scanner_under_yes() {
   prepare_case "install-broken"
   printf '{"name":"demo","version":"1.0.0"}\n' > "$CASE_PROJECT/package.json"
+  printf '{"lockfileVersion":3,"packages":{}}\n' > "$CASE_PROJECT/package-lock.json"
   local rc=0
   set +e
   (
@@ -285,6 +289,138 @@ case_project_mode_accepts_a_clean_python_project() {
   pass "$FUNCNAME"
 }
 
+case_pnpm_project_is_unsupported_coverage_not_breakage() {
+  prepare_case "pnpm"
+  printf '{"name":"demo","version":"1.0.0"}\n' > "$CASE_PROJECT/package.json"
+  printf "lockfileVersion: '9.0'\n" > "$CASE_PROJECT/pnpm-lock.yaml"
+  # npm audit cannot read a pnpm lockfile. Reporting that as scanner breakage
+  # would put every pnpm project behind an operator prompt.
+  run_scan NPM_RC=1 NPM_OUT=''
+  assert_jq "$FUNCNAME" '
+    (.ecosystem_audits[] | select(.scanner == "npm-audit")
+      | .status == "skipped" and ((.note // "") | test("lockfile")))
+    and .verdict == "GO"
+  ' || return
+  pass "$FUNCNAME"
+}
+
+case_pip_audit_covers_every_declared_target() {
+  prepare_case "pip-multi"
+  printf 'app==1.0.0\n' > "$CASE_PROJECT/requirements.txt"
+  printf 'devtool==2.0.0\n' > "$CASE_PROJECT/requirements-dev.txt"
+  # The runner used to stop at the first target it found, so an advisory that
+  # only affects a dev dependency was never submitted at all.
+  local argv_log="$CASE_DIR/pip-argv.log"
+  cat > "$MOCKBIN/pip-audit" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$argv_log"
+case "\$*" in
+  *requirements-dev.txt*) printf '%s' '{"dependencies":[{"name":"devtool","version":"2.0.0","vulns":[{"id":"PYSEC-DEV","severity":"critical"}]}]}' ;;
+  *) printf '%s' '{"dependencies":[{"name":"app","version":"1.0.0","vulns":[]}]}' ;;
+esac
+exit 1
+STUB
+  chmod +x "$MOCKBIN/pip-audit"
+  run_scan
+  # Restore the shared stub for later cases.
+  cat > "$MOCKBIN/pip-audit" <<'STUB'
+#!/usr/bin/env bash
+printf '%s' "${PIP_AUDIT_OUT:-}"
+exit "${PIP_AUDIT_RC:-0}"
+STUB
+  chmod +x "$MOCKBIN/pip-audit"
+
+  grep -Fq 'requirements-dev.txt' "$argv_log" || { printf 'pip-audit was never asked about the dev requirements:\n%s\n' "$(cat "$argv_log")" >&2; fail "$FUNCNAME"; return; }
+  assert_jq "$FUNCNAME" '
+    (.ecosystem_audits[] | select(.scanner == "pip-audit")
+      | .status == "ok" and .total == 1 and .critical == 1)
+  ' || return
+  pass "$FUNCNAME"
+}
+
+case_pyproject_is_audited_by_path_not_by_environment() {
+  prepare_case "pip-pyproject"
+  printf '[project]\nname = "demo"\n' > "$CASE_PROJECT/pyproject.toml"
+  local argv_log="$CASE_DIR/pip-argv.log"
+  cat > "$MOCKBIN/pip-audit" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$argv_log"
+printf '%s' '{"dependencies":[]}'
+exit 0
+STUB
+  chmod +x "$MOCKBIN/pip-audit"
+  run_scan
+  cat > "$MOCKBIN/pip-audit" <<'STUB'
+#!/usr/bin/env bash
+printf '%s' "${PIP_AUDIT_OUT:-}"
+exit "${PIP_AUDIT_RC:-0}"
+STUB
+  chmod +x "$MOCKBIN/pip-audit"
+
+  # A bare `pip-audit -f json` audits the ACTIVE ENVIRONMENT, not the project.
+  local argv
+  argv="$(cat "$argv_log")"
+  [[ "$argv" == *"$CASE_PROJECT"* ]] || { printf 'pyproject audit did not name the project path: %s\n' "$argv" >&2; fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
+case_govulncheck_partial_stream_is_an_error() {
+  prepare_case "go-partial"
+  printf 'module demo\n\ngo 1.22\n' > "$CASE_PROJECT/go.mod"
+  printf 'package main\nfunc main() {}\n' > "$CASE_PROJECT/main.go"
+  # Valid config record, then the process dies mid-write. Tolerating the
+  # unparsable tail would report a confident zero findings.
+  run_scan GOVULNCHECK_RC=1 GOVULNCHECK_OUT='{"config":{"protocol_version":"v1.0.0"}}
+{"finding":{"osv":"GO-2026-000'
+  assert_jq "$FUNCNAME" '
+    .ecosystem_audits[] | select(.scanner == "govulncheck") | .status == "error"
+  ' || return
+  pass "$FUNCNAME"
+}
+
+case_missing_tool_is_reported_not_fatal_when_allowed() {
+  prepare_case "missing-tool"
+  printf '[package]\nname = "demo"\n' > "$CASE_PROJECT/Cargo.toml"
+  # cargo-audit absent: without --allow-missing-tools a non-interactive scan
+  # refuses to run at all, which made a Rust project unauditable from any
+  # non-TTY caller. With it, the gap is a record the caller can act on.
+  rm -f "$MOCKBIN/cargo-audit" "$MOCKBIN/cargo"
+  run_scan
+  local rc_without="$STATUS"
+  set +e
+  (
+    cd "$CASE_PROJECT" || exit 99
+    env HOME="$CASE_DIR/home" PATH="$MOCKBIN:/usr/bin:/bin" \
+      SAFE_AUDIT_CONFIG_DIR="$CASE_DIR/audit-config" \
+      SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
+      SAFE_AUDIT_SCAN_NO_CACHE=1 \
+      "$SAFE_AUDIT" scan --deps-only --project . --allow-missing-tools --result-out "$RESULT"
+  ) > "$CASE_DIR/scan-allowed.out" 2>&1
+  local rc_with=$?
+  set -e
+  # Restore the stubs for later cases.
+  cat > "$MOCKBIN/cargo" <<'STUB'
+#!/usr/bin/env bash
+[[ "${1:-}" == "audit" ]] || exit 0
+printf '%s' "${CARGO_AUDIT_OUT:-}"
+exit "${CARGO_AUDIT_RC:-0}"
+STUB
+  cat > "$MOCKBIN/cargo-audit" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+  chmod +x "$MOCKBIN/cargo" "$MOCKBIN/cargo-audit"
+
+  [[ "$rc_without" -ne 0 ]] || { printf 'a missing scanner silently produced a result\n' >&2; fail "$FUNCNAME"; return; }
+  [[ "$rc_with" -eq 0 ]] || { printf '--allow-missing-tools still refused (exit %s):\n%s\n' "$rc_with" "$(cat "$CASE_DIR/scan-allowed.out")" >&2; fail "$FUNCNAME"; return; }
+  assert_jq "$FUNCNAME" '
+    (.ecosystem_audits[] | select(.scanner == "cargo-audit")
+      | .status == "skipped" and ((.note // "") | test("unavailable")))
+    and .verdict == "WARN"
+  ' || return
+  pass "$FUNCNAME"
+}
+
 case_local_and_remote_normalizers_stay_identical() {
   # The remote scan helper ships its own copy of these functions. A fix applied
   # to one copy and not the other is a silent divergence in what a remote scan
@@ -326,6 +462,11 @@ main() {
     case_govulncheck_empty_stream_is_an_error \
     case_project_mode_refuses_a_broken_scanner_under_yes \
     case_project_mode_accepts_a_clean_python_project \
+    case_pnpm_project_is_unsupported_coverage_not_breakage \
+    case_pip_audit_covers_every_declared_target \
+    case_pyproject_is_audited_by_path_not_by_environment \
+    case_govulncheck_partial_stream_is_an_error \
+    case_missing_tool_is_reported_not_fatal_when_allowed \
     case_local_and_remote_normalizers_stay_identical
   do
     "$case"

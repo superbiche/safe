@@ -143,7 +143,13 @@ the preflight; run `safe audit scan --project .` for that.
 
 If `safe audit` is missing, wrappers warn once and continue. If package checks are available, package install checks fail closed: `WARN`, `BLOCK`, timeouts, and audit failures stop before the real install command runs.
 
-Project scans are stricter for critical findings. Non-critical scan failures warn and continue.
+Project scans are stricter for critical findings. The preflight reads the
+scan's **result document**, not its exit code — a scan that finds a critical
+advisory still exits 0, since its verdict lives in the document — so a critical
+count above zero prompts interactively and refuses with exit 102 in a
+non-interactive shell. Non-critical scan failures warn and continue, and a
+scanner that ran and failed is named in that warning rather than passing
+silently: the install proceeds, but what was not checked is said out loud.
 
 ## Wrapped Package Installs
 

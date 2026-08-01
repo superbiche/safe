@@ -185,7 +185,10 @@ printf '{"name":"demo"}\n' > "$project_dir/package.json"
 # Clean project, non-interactive: exit 0 quietly, scan run in deps-only mode.
 PROJECT_ARGS=()
 project_case clean 0 "$project_dir" env SAFE_AUDIT_STUB_SCAN_VERDICT=GO
-grep -Fq $'safe-audit\tscan\t--deps-only\t--project\t.' "$PROJECT_SCAN_LOG" || fail "project mode did not run a deps-only scan"
+grep -Fq $'safe-audit\tscan\t--deps-only\t--allow-missing-tools\t--project\t.' "$PROJECT_SCAN_LOG" || fail "project mode did not run a deps-only scan"
+# An ecosystem auditor that is not installed must not abort the scan: this
+# mode reports it as not run and lets its own policy decide.
+grep -Fq -- '--allow-missing-tools' "$PROJECT_SCAN_LOG" || fail "project scan can be aborted by a missing scanner"
 grep -Fq 'safe install: project audit' "$PROJECT_OUT" || fail "project mode printed no summary"
 grep -Fq 'manifests: package.json' "$PROJECT_OUT" || fail "project mode summary omits the audited manifests"
 grep -Fq 'verdict:   GO' "$PROJECT_OUT" || fail "project mode summary omits the verdict"
@@ -193,7 +196,7 @@ grep -Fq 'verdict:   GO' "$PROJECT_OUT" || fail "project mode summary omits the 
 # The explicit flag forces the same mode.
 PROJECT_ARGS=(--project)
 project_case flag 0 "$project_dir" env SAFE_AUDIT_STUB_SCAN_VERDICT=GO
-grep -Fq $'safe-audit\tscan\t--deps-only\t--project\t.' "$PROJECT_SCAN_LOG" || fail "safe install --project did not scan"
+grep -Fq $'safe-audit\tscan\t--deps-only\t--allow-missing-tools\t--project\t.' "$PROJECT_SCAN_LOG" || fail "safe install --project did not scan"
 
 # WARN needs an operator: non-TTY refuses 102, --yes accepts.
 PROJECT_ARGS=()

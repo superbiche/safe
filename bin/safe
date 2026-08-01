@@ -1513,7 +1513,11 @@ cmd_install_project() {
 
   local scan_rc=0
   set +e
-  "$SAFE_AUDIT_PATH" scan --deps-only --project . --result-out "$result_path" > "$scan_log" 2>&1
+  # --allow-missing-tools: an ecosystem auditor that is not installed comes
+  # back as a "not run" record this mode reports, rather than aborting the
+  # scan and leaving a Rust or Go project unauditable from any script.
+  "$SAFE_AUDIT_PATH" scan --deps-only --allow-missing-tools --project . \
+    --result-out "$result_path" > "$scan_log" 2>&1
   scan_rc=$?
   set -e
 
@@ -1590,24 +1594,28 @@ cmd_install_project() {
 
   # One-screen summary. The scan's own render is not echoed: it says the same
   # thing at ten times the length.
+  local cve_high cve_medium cve_low
+  cve_high="$(jq -r '.cve_scan.high // 0' "$result_path" 2>/dev/null || printf '0')"
+  cve_medium="$(jq -r '.cve_scan.medium // 0' "$result_path" 2>/dev/null || printf '0')"
+  cve_low="$(jq -r '.cve_scan.low // 0' "$result_path" 2>/dev/null || printf '0')"
   printf 'safe install: project audit — %s\n' "$(pwd)"
   printf '  manifests: %s\n' "${manifests[*]}"
   printf '  packages:  %s\n' "$packages"
   # Per source, because only osv and grype carry advisory ids: the same
   # advisory reported by three scanners is three reports, not three
   # vulnerabilities, and one summed number would say the wrong thing.
-  local cve_high cve_medium cve_low
-  cve_high="$(jq -r '.cve_scan.high // 0' "$result_path" 2>/dev/null || printf '0')"
-  cve_medium="$(jq -r '.cve_scan.medium // 0' "$result_path" 2>/dev/null || printf '0')"
-  cve_low="$(jq -r '.cve_scan.low // 0' "$result_path" 2>/dev/null || printf '0')"
   printf '  cve scan:  critical %s, high %s, medium %s, low %s\n' \
     "$cve_critical" "$cve_high" "$cve_medium" "$cve_low"
   local eco_line
+  # Every bucket, always: a lone medium advisory rendered as "critical 0,
+  # high 0, unknown 0" reads as an empty finding list that still warns.
   eco_line="$(jq -r '
     [ .audit_totals.ecosystem[]?
       | select(.total > 0)
-      | .scanner + " (critical " + (.critical | tostring)
+      | .scanner + " (" + (.total | tostring) + ": critical " + (.critical | tostring)
         + ", high " + (.high | tostring)
+        + ", medium " + (.medium | tostring)
+        + ", low " + (.low | tostring)
         + ", unknown " + ((.unknown // 0) | tostring) + ")"
     ] | join(", ")
   ' "$result_path" 2>/dev/null || printf '')"
@@ -1617,7 +1625,7 @@ cmd_install_project() {
   local cache_note
   cache_note="$(printf '%s\n' "$scan_output" | grep -F '[safe audit] scan cache hit' | tail -n 1 || true)"
   [[ -n "$cache_note" ]] && printf '  %s\n' "${cache_note#\[safe audit\] }"
-  if [[ "$cve_critical" -gt 0 ]] || [[ "$high" -gt 0 ]]; then
+  if [[ "$cve_critical" -gt 0 ]] || [[ "$cve_high" -gt 0 ]]; then
     printf '  top findings:\n'
     jq -r '
       [.cve_scan.findings[]? | select((.severity // "") | ascii_downcase | test("critical|high"))]

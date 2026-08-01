@@ -452,22 +452,59 @@ safe_gate_scan_project() {
     return 0
   fi
 
+  # The decision comes from the RESULT DOCUMENT, not the exit code: a scan
+  # that finds a critical advisory still exits 0 (its verdict lives in the
+  # document), so gating on the exit code let every finding through. The copy
+  # is private because the published result is one file per machine per day.
+  local result_file=""
+  result_file="$(mktemp "${TMPDIR:-/tmp}/safe-gate-scan.XXXXXX" 2>/dev/null)" || result_file=""
+
   # --deps-only: the preflight only cares about the dependency evidence the
   # install is about to change, and that mode is the one the scan cache can
   # replay — a bare `npm ci` in an unchanged tree costs a cache hit, not a
-  # full scanner run.
-  scan_output="$("${SAFE_GATE_AUDIT_BIN}" scan --deps-only --project . 2>&1)"
+  # full scanner run. --allow-missing-tools keeps an uninstalled ecosystem
+  # auditor from aborting the scan: it comes back as reported-but-not-run.
+  if [[ -n "${result_file}" ]]; then
+    scan_output="$("${SAFE_GATE_AUDIT_BIN}" scan --deps-only --allow-missing-tools \
+      --result-out "${result_file}" --project . 2>&1)"
+  else
+    scan_output="$("${SAFE_GATE_AUDIT_BIN}" scan --deps-only --allow-missing-tools --project . 2>&1)"
+  fi
   scan_status=$?
 
   [[ -n "${scan_output}" ]] && printf '%s\n' "${scan_output}"
 
+  local critical=0 broken=""
+  if [[ -n "${result_file}" && -s "${result_file}" ]] && command -v jq >/dev/null 2>&1; then
+    critical="$(jq -r '.audit_totals.critical // .cve_scan.critical // 0' "${result_file}" 2>/dev/null || printf '0')"
+    [[ "${critical}" =~ ^[0-9]+$ ]] || critical=0
+    broken="$(jq -r '
+      def broken: (.status // "ok") as $s
+        | ($s == "error") or (($s != "ok") and (((.note // "") | test("fail|error"; "i"))));
+      [ (.tool_status // {} | to_entries[]? | select(.value | broken) | .key),
+        (.ecosystem_audits[]? | select(broken) | (.scanner // "unknown"))
+      ] | unique | join(", ")
+    ' "${result_file}" 2>/dev/null || printf '')"
+  fi
+  [[ -n "${result_file}" ]] && rm -f "${result_file}"
+
+  if (( critical > 0 )); then
+    if [[ -t 0 && -t 1 ]]; then
+      safe_gate_err "safe install: safe audit scan reported ${critical} critical finding(s) in this project's dependencies"
+    fi
+    safe_gate_confirm_critical
+    return $?
+  fi
+
   if (( scan_status == 0 )); then
+    # A scanner that broke does not stop an install — the documented policy is
+    # that non-critical scan failures warn and continue — but it is never
+    # silent: what was not checked is said out loud.
+    [[ -n "${broken}" ]] && safe_gate_err "safe install: scanner failure (${broken}); that coverage is missing — safe doctor"
     return 0
   fi
 
   if [[ "${scan_output,,}" == *critical* || "${scan_status}" -ge 2 ]]; then
-    # Preamble only ahead of the interactive prompt; the non-TTY path emits a
-    # single self-contained BLOCKED line instead.
     if [[ -t 0 && -t 1 ]]; then
       safe_gate_err "safe install: safe audit scan reported critical findings"
     fi

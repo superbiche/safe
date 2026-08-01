@@ -75,10 +75,43 @@
   core scanner did not return `ok` (missing coverage is not a cacheable
   answer), or when a project holds known evidence that discovery did not hash
   — a symlinked lockfile, for instance, which `npm audit` reads and the file
-  walk skips. `npm-shrinkwrap.json` is recognized as evidence. Evidence paths
+  walk skips: those are hashed directly now, alongside `.npmrc` (which selects
+  the registry `npm audit` queries) and `.safe-audit` (which decides what is
+  audited at all). `npm-shrinkwrap.json` is recognized as evidence. Evidence paths
   enter the key relative to the scan root, so a remote scan (staged into a
   fresh temporary directory every run) can hit the cache at all. A malformed
   TTL disables the cache rather than silently defaulting.
+
+- The PATH-wrapper project preflight decides from the scan's result document
+  instead of its exit code. A scan that finds a critical advisory exits 0 (the
+  verdict lives in the document), so the preflight treated every finding as a
+  clean scan and ran the package manager. It now refuses on a critical count
+  (interactive confirm, exit 102 non-interactive) and names a scanner that ran
+  and failed while still proceeding, per the documented policy that only
+  critical findings stop an install.
+
+- `safe audit scan --allow-missing-tools` turns an uninstalled ecosystem
+  auditor from an abort into a reported gap, and both gating callers pass it.
+  Without it a Rust or Go project on a machine without cargo-audit or
+  govulncheck could not be audited from any non-interactive shell at all: the
+  scan refused to run, and `safe install --project` reported it as a broken
+  scan rather than the documented "not run" WARN.
+
+- `npm audit` needs an npm lockfile, so a pnpm, Yarn or not-yet-locked project
+  is reported as coverage it structurally cannot provide rather than as a
+  broken scanner — and that state leaves the verdict alone, so a pnpm project
+  is not pushed behind an operator prompt for an answer npm was never going to
+  give. Absent tools still warn; failed ones still warn and block caching.
+
+- `pip-audit` audits every declared target instead of the first one found: a
+  vulnerable dependency present only in `requirements-dev.txt` was never
+  submitted. A `pyproject.toml` project is audited by path — a bare
+  `pip-audit -f json` audits the active Python environment, not the project.
+  Advisories are merged across targets and deduplicated by package and id.
+
+- `govulncheck` output is rejected whole if any non-blank line fails to parse
+  or the stream is not govulncheck's: tolerating an unparsable tail turned a
+  process that died halfway into a confident "zero findings".
 
 - `safe audit scan --result-out <file>` hands the caller its own copy of the
   result document, and scans now assemble that document privately before

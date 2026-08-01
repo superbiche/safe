@@ -27,7 +27,7 @@ mkdir -p "$MOCKBIN"
 
 # Every scanner logs its invocation and emits the minimal valid document the
 # scan pipeline expects on stdout.
-for tool in osv-scanner grype syft govulncheck cargo-audit pip-audit socket; do
+for tool in osv-scanner grype syft govulncheck cargo-audit pip-audit socket npm composer cargo; do
   cat > "$MOCKBIN/$tool" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$(basename -- "$0")" >> "${SCANNER_LOG:-/dev/null}"
@@ -38,6 +38,14 @@ case "$(basename -- "$0")" in
   osv-scanner) printf '{"results":[]}\n' ;;
   grype)       printf '{"matches":[]}\n' ;;
   syft)        printf '{"components":[],"metadata":{"tools":[{"name":"syft"}]}}\n' ;;
+  # Clean, VALID output in each scanner own shape: an unreadable answer would
+  # be status:"error", which correctly refuses to cache and would make every
+  # assertion here about the wrong thing.
+  npm)         printf '{"metadata":{"vulnerabilities":{"info":0,"low":0,"moderate":0,"high":0,"critical":0,"total":0}}}\n' ;;
+  composer)    printf '{"advisories":{}}\n' ;;
+  cargo)       printf '{"vulnerabilities":{"list":[]}}\n' ;;
+  pip-audit)   printf '{"dependencies":[]}\n' ;;
+  govulncheck) printf '{"config":{"protocol_version":"v1.0.0"}}\n' ;;
   *)           printf '{}\n' ;;
 esac
 exit 0
@@ -536,19 +544,36 @@ case_key_is_independent_of_the_staging_directory() {
   pass "$FUNCNAME"
 }
 
-case_unhashed_evidence_blocks_caching() {
-  prepare_case "hidden-evidence"
-  run_scan
-  [[ "$(cache_entries)" -eq 1 ]] || { printf 'baseline did not cache\n' >&2; fail "$FUNCNAME"; return; }
-
-  # A lockfile that discovery cannot see (it walks regular files only) is
-  # still read by npm audit. Evidence we did not hash means no caching.
+case_symlinked_evidence_is_hashed() {
+  prepare_case "symlinked-evidence"
+  # Discovery walks regular files, so a symlinked lockfile is invisible to it
+  # while `npm audit` reads it happily. It has to reach the key some other
+  # way, or a change behind the link would replay the old verdict.
   local elsewhere="$CASE_DIR/elsewhere-lock.json"
   printf '{"lockfileVersion":3,"packages":{}}\n' > "$elsewhere"
   ln -s "$elsewhere" "$CASE_PROJECT/npm-shrinkwrap.json"
-  rm -f "$CASE_DIR/audit-data/scan-cache"/*.json
+
   run_scan
-  [[ "$(cache_entries)" -eq 0 ]] || { printf 'cached a project holding evidence that was never hashed\n' >&2; fail "$FUNCNAME"; return; }
+  [[ "$(cache_entries)" -eq 1 ]] || { printf 'expected 1 cache entry, got %s\n%s\n' "$(cache_entries)" "$(cat "$OUT_FILE")" >&2; fail "$FUNCNAME"; return; }
+  run_scan
+  assert_hit "$FUNCNAME" || return
+
+  # Change only the symlink TARGET: same paths, different bytes.
+  printf '{"lockfileVersion":3,"packages":{"node_modules/x":{"version":"1.0.0"}}}\n' > "$elsewhere"
+  run_scan
+  assert_no_hit "$FUNCNAME" || return
+  assert_scanners_ran "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_registry_config_is_part_of_the_key() {
+  prepare_case "npmrc-evidence"
+  run_scan
+  run_scan
+  assert_hit "$FUNCNAME" || return
+  # .npmrc is not dependency evidence, but it selects the registry npm audit
+  # asks — a different registry can return a different answer.
+  printf 'registry=https://registry.example.test/\n' > "$CASE_PROJECT/.npmrc"
   run_scan
   assert_no_hit "$FUNCNAME" || return
   assert_scanners_ran "$FUNCNAME" || return
@@ -593,7 +618,8 @@ main() {
     case_source_reading_scanner_is_not_cached \
     case_result_out_hands_back_a_private_copy \
     case_key_is_independent_of_the_staging_directory \
-    case_unhashed_evidence_blocks_caching \
+    case_symlinked_evidence_is_hashed \
+    case_registry_config_is_part_of_the_key \
     case_ecosystem_audit_counts_reach_the_totals
   do
     "$case"

@@ -206,7 +206,9 @@ A scanner that ran and *failed* is broken infrastructure, not a finding: its
 silence is not evidence of a clean project, so it refuses with exit 100, names
 the scanner, and points at `safe doctor`. A scanner that is merely *absent* is
 different — it is listed under `not run:` in the summary and leaves the verdict
-at `WARN`, which still needs `--yes` or an operator.
+at `WARN`, which still needs `--yes` or an operator. Evidence a scanner cannot
+structurally read (`npm audit` facing a pnpm or Yarn lockfile) is reported the
+same way but does not move the verdict at all.
 
 Because it installs nothing, `--project` cannot be combined with package
 arguments or with `-g`/`--host`/`--manager`/`--trust-host`/`--sandbox`; those

@@ -143,8 +143,12 @@ represented by the key. Nothing is cached when:
   installing it later is never masked by a replay of the run that lacked it.
 - **any ecosystem audit did not return `ok`**, or any of osv-scanner, syft and
   grype is in a non-ok state. Missing coverage is not a cacheable answer.
-- **the project holds evidence that discovery did not hash** — a lockfile that
-  exists as a symlink, say, which `npm audit` reads but the file walk skips.
+
+Beyond the manifests and lockfiles discovery finds, the key also hashes the
+per-root inputs that decide what a scanner *asks*: `.npmrc` (which registry
+`npm audit` queries), `.safe-audit` (which ecosystems are audited at all), and
+every known evidence name that exists as a **symlink** — discovery walks
+regular files, but `npm audit` reads the link happily.
 
 One input remains deliberately outside the key: **advisory databases**. OSV and
 the ecosystem audits consult live data that can gain an advisory while an entry
@@ -168,7 +172,7 @@ the cache like a local one.
 Beside osv-scanner and grype, a scan runs each ecosystem's own auditor in the
 project root: `npm audit`, `composer audit`, `cargo audit`, `govulncheck`,
 `pip-audit`. Each reports in its own shape, and safe normalizes them to one
-record with per-severity counts. Three rules govern that normalization:
+record with per-severity counts. Four rules govern that normalization:
 
 - A scanner's **exit status is not trusted alone** — npm audit and pip-audit
   exit nonzero when they *find* something. Output that parses as a result is a
@@ -179,6 +183,24 @@ record with per-severity counts. Three rules govern that normalization:
   with its own `vulns`, and composer keys advisories by package.
 - A severity that cannot be determined is `unknown`, never `medium`.
   cargo-audit advisories usually carry only a CVSS vector, which safe scores.
+- Evidence a scanner **structurally cannot read** is a third state, distinct
+  from both a finding and a breakage: `npm audit` needs an npm lockfile, so a
+  pnpm or Yarn project is reported as not run rather than as a broken scanner.
+  It does not change the verdict — warning there would put every pnpm project
+  behind an operator prompt for a tool that was never going to answer.
+
+A scanner that is **absent** does warn (its coverage is genuinely missing), and
+a scanner that **failed** warns and blocks caching. `pip-audit` audits every
+declared target — `requirements.txt`, `requirements-dev.txt`, and a
+`pyproject.toml` *by path* — because a bare `pip-audit` audits the active
+Python environment rather than the project, and stopping at the first target
+hid every dev-only advisory.
+
+`safe audit scan --allow-missing-tools` turns a missing ecosystem auditor from
+an abort into a reported gap. Callers that gate on the result document
+(`safe install --project`, the PATH-wrapper preflight) pass it: without it, a
+Rust project on a machine without cargo-audit could not be audited at all from
+a non-interactive shell.
 
 `audit_totals` is the aggregate every gating consumer reads: the CVE scan plus
 each ecosystem audit that returned `ok`, with a per-scanner breakdown under
