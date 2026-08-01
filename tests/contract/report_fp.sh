@@ -240,6 +240,63 @@ case_unreadable_check_output_writes_nothing() {
   pass "$FUNCNAME"
 }
 
+case_hundredth_note_is_allowed() {
+  # The first bounded loop incremented before comparing and refused the 100th
+  # note while announcing a bound of 100. The retry IS the existence check now,
+  # so the last attempt is a real one.
+  local repo; repo="$(new_repo repo-boundary)"
+  mkdir -p "$repo/inbox"
+  local d; d="$(date +%F)"
+  : > "$repo/inbox/${d}-agent-fp-demo.md"
+  local i
+  for ((i = 2; i <= 99; i++)); do : > "$repo/inbox/${d}-agent-fp-demo-${i}.md"; done
+  run_report_fp "$repo" demo >/dev/null 2>&1 || { fail "$FUNCNAME (100th note refused)"; return; }
+  if [[ -s "$repo/inbox/${d}-agent-fp-demo-100.md" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (no 100th note written)"
+  fi
+}
+
+case_exhausted_names_leave_no_note_and_no_temp() {
+  # The failure path AFTER the body is rendered: the publish must claim nothing
+  # and clean up after itself. The previous design leaked its temp here and, on
+  # a copy failure, left a zero-byte note behind as well.
+  local repo; repo="$(new_repo repo-exhausted)"
+  mkdir -p "$repo/inbox"
+  local d; d="$(date +%F)"
+  : > "$repo/inbox/${d}-agent-fp-demo.md"
+  local i
+  for ((i = 2; i <= 100; i++)); do : > "$repo/inbox/${d}-agent-fp-demo-${i}.md"; done
+  local status=0
+  run_report_fp "$repo" demo >/dev/null 2>"$TEST_ROOT/err-exhaust" || status=$?
+  if (( status == 0 )); then
+    fail "$FUNCNAME (reported success with no filename claimed)"
+    return
+  fi
+  grep -Fq 'nothing was written' "$TEST_ROOT/err-exhaust" || { fail "$FUNCNAME (no legible cause)"; return; }
+  if [[ -n "$(find "$repo/inbox" -name '.report-fp.*' 2>/dev/null)" ]]; then
+    fail "$FUNCNAME (temp file leaked into the inbox)"
+    return
+  fi
+  # Every pre-existing note is still empty: nothing was overwritten.
+  if [[ -s "$repo/inbox/${d}-agent-fp-demo.md" ]]; then
+    fail "$FUNCNAME (clobbered an existing note)"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
+case_success_leaves_no_temp_behind() {
+  local repo; repo="$(new_repo repo-clean)"
+  run_report_fp "$repo" happy-dom >/dev/null 2>&1 || { fail "$FUNCNAME (command failed)"; return; }
+  if [[ -n "$(find "$repo/inbox" -name '.report-fp.*' 2>/dev/null)" ]]; then
+    fail "$FUNCNAME (temp file left in the inbox)"
+  else
+    pass "$FUNCNAME"
+  fi
+}
+
 case_missing_repo_refuses_legibly() {
   local status=0
   STUB_ARGV_LOG="$TEST_ROOT/argv.log" STUB_PAYLOAD="$TEST_ROOT/payload.json" \
@@ -272,6 +329,9 @@ case_valid_but_wrong_shape_output_writes_nothing
 case_dangling_symlink_at_the_note_path_is_not_followed
 case_socket_failure_text_is_not_copied_into_the_note
 case_unreadable_check_output_writes_nothing
+case_hundredth_note_is_allowed
+case_exhausted_names_leave_no_note_and_no_temp
+case_success_leaves_no_temp_behind
 case_missing_repo_refuses_legibly
 case_no_spec_is_a_usage_error
 

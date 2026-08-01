@@ -186,27 +186,31 @@ cmd_report_fp() {
     return 1
   fi
 
-  local slug date_str note
+  local slug date_str inbox
   slug="$(printf '%s' "$spec" | tr '[:upper:]' '[:lower:]' | sed -e 's|^@||' -e 's|[/@]|-|g' -e 's|[^a-z0-9.-]|-|g' -e 's|-\{2,\}|-|g' -e 's|^-||' -e 's|-$||')"
   date_str="$(date +%F)"
-  mkdir -p "$repo_dir/inbox"
-  note="$repo_dir/inbox/${date_str}-${source}-fp-${slug}.md"
-  # -e is FALSE for a dangling symlink, so the old existence test walked right
-  # past one and `>` then wrote through it — the note landed wherever the link
-  # pointed, outside the inbox entirely. Test the link itself, and create the
-  # file exclusively (set -C) so the check and the open cannot be raced apart.
-  local n=2
-  while [[ -e "$note" || -L "$note" ]]; do
-    note="$repo_dir/inbox/${date_str}-${source}-fp-${slug}-${n}.md"
-    n=$((n + 1))
-    if (( n > 100 )); then
-      printf 'safe: report-fp: too many notes for %s today; nothing was written\n' "$slug" >&2
-      return 1
-    fi
-  done
+  inbox="$repo_dir/inbox"
+  mkdir -p "$inbox"
 
+  # The note is rendered to a temp file IN THE DESTINATION DIRECTORY and then
+  # published with a hard link. `ln` fails if the target exists and never
+  # follows a symlink, so the existence check, the symlink check and the
+  # exclusive create are the same syscall that does the publish — there is no
+  # window between deciding the name is free and taking it.
+  #
+  # This replaced four cooperating mechanisms (a collision loop, an -e/-L test,
+  # a `set -C` create, then a second non-exclusive open to copy the body). That
+  # arrangement had a race of its own: the exclusive create closed the file and
+  # the copy re-opened the path, so a symlink swapped in between them was
+  # followed with the full report. Publishing what is already complete, in one
+  # operation, is both smaller and correct.
   local body
-  body="$(mktemp)" || { printf 'safe: report-fp: cannot allocate a scratch file; nothing was written\n' >&2; return 1; }
+  body="$(mktemp "$inbox/.report-fp.XXXXXX")" || {
+    printf 'safe: report-fp: cannot write to %s; nothing was written\n' "$inbox" >&2
+    return 1
+  }
+  # Removed on every path out of here, including the failures below.
+  trap 'rm -f "$body"' RETURN
   {
     jq -r --arg spec "$spec" --arg source "$source" --arg date "$date_str" --arg status "$status" '
       def bounds:
@@ -266,18 +270,32 @@ cmd_report_fp() {
     printf 'This note IS the escalation. Nothing was auto-applied: no allowlist entry was\n'
     printf 'written, no verdict was changed, and the gate still refuses. The operator\n'
     printf 'validates before any behaviour changes.\n'
-  } > "$body"
+  } > "$body" || {
+    printf 'safe: report-fp: could not render the note; nothing was written\n' >&2
+    return 1
+  }
 
-  # Exclusive create: between the loop above and this open, another process
-  # could have put a symlink at the path. noclobber makes the open fail rather
-  # than follow it.
-  if ! (set -C; : > "$note") 2>/dev/null; then
-    rm -f "$body"
-    printf 'safe: report-fp: %s appeared while writing it; nothing was written\n' "$note" >&2
+  # Publish. Suffix on collision — the retry IS the existence check, so there is
+  # no separate counter to get off by one. The bound is on attempts, and the
+  # last attempt is a real one.
+  local note="" candidate n=1
+  while (( n <= 100 )); do
+    if (( n == 1 )); then
+      candidate="$inbox/${date_str}-${source}-fp-${slug}.md"
+    else
+      candidate="$inbox/${date_str}-${source}-fp-${slug}-${n}.md"
+    fi
+    if ln "$body" "$candidate" 2>/dev/null; then
+      note="$candidate"
+      break
+    fi
+    n=$((n + 1))
+  done
+  if [[ -z "$note" ]]; then
+    printf 'safe: report-fp: could not claim a filename for %s in %s; nothing was written\n' \
+      "$slug" "$inbox" >&2
     return 1
   fi
-  cat "$body" > "$note"
-  rm -f "$body"
 
   printf 'safe: report-fp: wrote %s\n' "$note"
   printf 'safe: report-fp: nothing was allowed or changed — the operator validates this note\n'
