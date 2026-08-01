@@ -14,7 +14,7 @@ GATE_LIB_TARGET="$CONFIG_BASE/gate-lib.sh"
 # Tools that get a PATH wrapper. Every wrapper is a dumb 3-line shim into
 # `safe gate`; all routing lives in gate-lib.sh, so upgrading safe upgrades the
 # gate without rewriting a single wrapper.
-GATE_TOOLS=(npm pnpm pnpx yarn bun pip pip3 uv cargo go composer)
+GATE_TOOLS=(npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise)
 COMPLETION_DIR="${SAFE_ZSH_COMPLETION_DIR:-$HOME/.local/share/zsh/site-functions}"
 COMPLETION_TARGET="$COMPLETION_DIR/_safe"
 ZSHRC="${SAFE_ZSHRC:-$HOME/.zshrc}"

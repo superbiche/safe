@@ -2,6 +2,66 @@
 
 ## Unreleased
 
+- Gate `mise` backend installs: `mise install`/`up`/`use`/`exec` previously
+  installed registry packages (`npm:*`, `pipx:*`, `cargo:*`, `go:*` backends,
+  lifecycle scripts included) with no audit at all. A `mise` PATH wrapper now
+  routes through `safe gate`: explicit backend specs are audited like any
+  install; bare `mise install`/`up` preflights the configured tools (via
+  `mise ls --current --json`) and audits not-yet-installed entries — plus
+  floating-version entries on `up` (a pinned installed entry cannot change
+  without a config edit, so a fully pinned manifest audits nothing); a gated
+  command behind `mise exec --` gets the full routing/audit pass with the
+  exec left to mise (which owns the tool env). Official runtime installs
+  (`node@22`) pass through untouched; non-registry backends (aqua/ubi/gem)
+  pass with an explicit not-audit-gated notice. Review round: bare
+  shorthands (`mise install prettier`) resolve through `mise registry` to
+  their effective backend before the runtime-vs-package call (registry
+  shorthands were installing npm packages unaudited); the audited identity
+  is canonicalized (tool `[options]` stripped; `pipx:owner/repo` GitHub
+  shorthands and `git+`/URL forms take the notice path instead of a false
+  registry audit); enumeration and env-derivation failures refuse as
+  infrastructure breakage instead of falling open; install/up/use/exec get
+  exact flag tables (a value flag's value no longer reads as a tool spec,
+  `-C`/`-E` thread into the preflight, `--monorepo`-class scope flags
+  refuse, unknown equals-forms fail closed, `--locked` and friends are
+  legal); non-exact pins ("3", ranges) count as floating on `up` and
+  `up --bump` audits everything; `mise exec` preflights configured tools
+  unless `exec_auto_install` is verifiably off; audits run under mise's
+  project `[env]` package-source variables; `mise exec -c` and bare
+  interactive `mise use` fail closed with rewrite hints (launcher first
+  words behind `exec --` stay a documented residual). Second review round:
+  every helper query (`registry`/`ls`/`env`/`settings`) runs under the
+  delegate's full context, including `--no-config`/`--no-env`/`--no-hooks`,
+  and the audit runs from the `-C` directory so directory-scoped config
+  files count as source; tool options are allowlisted rather than
+  discarded (`npm_args`-class options take the notice path instead of
+  vouching for a redirected install); env values travel base64-framed with
+  strict typing (a newline in one value could otherwise export a second
+  variable, and a non-string source value now refuses instead of auditing
+  the default); `mise ls` entries require their fields (a missing
+  `installed` no longer reports a package verdict for unreadable output)
+  and jq diagnostics stay internal; `install --force` audits every
+  configured tool, `upgrade --exclude` drops excluded targets,
+  `--minimum-release-age` refuses non-exact targets; `--help`/`--version`/
+  `--dry-run` pass through; counted verbosity (`-vvv`) is legal again;
+  Cargo/pipx/composer registry variables joined the source allowlist.
+  Third review round: `package_manager` is no longer treated as
+  identity-neutral (it selects an installer with different registry
+  inputs), and the bare preflight reads each configured entry's options
+  via `mise tool --json` since `mise ls` hides them; a mise-selected
+  Cargo/pipx/Composer/Bun registry takes the not-audit-gated notice path
+  instead of a verdict computed against the default public source (safe's
+  effective-source derivation covers npm/Python/Go only — extending it is
+  tracked separately); env values round-trip byte-exactly (a trailing
+  newline was being stripped by command substitution) and a value that
+  cannot survive intact refuses; `requested_version` is required rather
+  than defaulted; exclusion matching is backend-aware so an npm scope is
+  not mistaken for a version; `use` honors `--minimum-release-age` like
+  install/upgrade; `upgrade --interactive` declines with an
+  explicit-target hint (same class as bare `mise use`); a leading global
+  `--help`/`--version` passes through; and an unusable `-C` directory
+  refuses with a real one-line message instead of a silent exit.
+
 - Second review round (PR#29 delta findings): custom package sources
   (`--registry`, `--index-url`, `--find-links`, `--no-index`, composer
   `--repository`) now floor the verdict at WARN for every ecosystem — exact

@@ -28,7 +28,7 @@ _safe_gate_shell_check() {
   local bin_dir="${SAFE_BIN_DIR:-$HOME/.local/bin}"
   local tool wrapper
   local -a broken=()
-  for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer; do
+  for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise; do
     wrapper="${bin_dir}/${tool}"
     if [[ ! -f "${wrapper}" || -L "${wrapper}" ]] \
       || ! LC_ALL=C sed -n '2p' -- "${wrapper}" 2>/dev/null \

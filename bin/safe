@@ -108,7 +108,7 @@ Audits the install, update, and exec-style subcommands of <tool> with
 `safe audit`, then delegates to the real <tool> on PATH. Called by the
 generated wrappers in ~/.local/bin (see install.sh); not normally run by hand.
 
-Supported tools: npm pnpm pnpx yarn bun pip pip3 uv cargo go composer
+Supported tools: npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise
 EOF
 }
 
@@ -164,7 +164,7 @@ cmd_version() {
 }
 
 # Keep in sync with GATE_TOOLS in install.sh and the gate-lib routing table.
-SAFE_GATE_TOOL_LIST=(npm pnpm pnpx yarn bun pip pip3 uv cargo go composer)
+SAFE_GATE_TOOL_LIST=(npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise)
 
 # A generated install wrapper: regular (never symlinked) file whose second
 # line is EXACTLY the per-tool marker (loose substring matching let foreign

@@ -103,7 +103,7 @@ gate_wrapper_marked() {
 }
 
 removed_wrappers=()
-for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer; do
+for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise; do
   if gate_wrapper_marked "$BIN_DIR/$tool" "$tool"; then
     rm -f "$BIN_DIR/$tool"
     removed_wrappers+=("$tool")

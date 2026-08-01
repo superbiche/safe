@@ -67,6 +67,16 @@ fi
     printf '\t%s' "${arg}"
   done
   printf '\n'
+  # The mise routes overlay project [env] sources onto the audit process:
+  # surface what this invocation actually saw so tests can assert it.
+  for env_name in NPM_CONFIG_REGISTRY PIP_INDEX_URL PIP_CONFIG_FILE GOPROXY; do
+    if [[ -n "${!env_name:-}" ]]; then
+      printf 'AUDITENV\t%s=%s\n' "${env_name}" "${!env_name}"
+      # Byte-exact form: the plain line cannot show a trailing newline or
+      # distinguish empty from unset.
+      printf 'AUDITENV_B64\t%s=%s\n' "${env_name}" "$(printf '%s' "${!env_name}" | base64 -w0)"
+    fi
+  done
 } >> "${SAFE_INSTALL_COMMAND_LOG}"
 
 if [[ "${1:-}" == "scan" ]]; then
@@ -86,13 +96,121 @@ STUB
   chmod +x "${bin_dir}/safe-audit"
 }
 
+# mise needs a smarter stub: the gate queries the REAL mise for config
+# enumeration (ls), env derivation (env --json), bare-name backend
+# resolution (registry) and the exec auto-install setting before
+# delegating. Helper queries answer from MISE_* vars and log MISEQ lines
+# (so tests can assert the exact query argv, context flags included);
+# anything else is a delegated command and logs REAL.
+write_mise_stub() {
+  local bin_dir="$1"
+
+  cat > "${bin_dir}/mise" <<'STUB'
+#!/usr/bin/env bash
+log_line() {
+  {
+    printf '%s' "$1"
+    shift
+    for arg in "$@"; do
+      printf '\t%s' "${arg}"
+    done
+    printf '\n'
+  } >> "${SAFE_INSTALL_COMMAND_LOG}"
+}
+args=("$@")
+sub=""
+i=0
+while (( i < ${#args[@]} )); do
+  case "${args[$i]}" in
+    -C|--cd|-E|--env|-j|--jobs|--output|--log-level) i=$((i + 2)) ;;
+    -*) i=$((i + 1)) ;;
+    *) sub="${args[$i]}"; break ;;
+  esac
+done
+case "$sub" in
+  ls)
+    log_line MISEQ "$@"
+    [[ "${MISE_LS_STATUS:-0}" != 0 ]] && exit "${MISE_LS_STATUS}"
+    # A second answer proves whether callers re-query: if the snapshot is
+    # shared, MISE_LS_JSON_2 is never observed.
+    if [[ -n "${MISE_LS_JSON_2:-}" && -f "${SAFE_INSTALL_COMMAND_LOG}.lsonce" ]]; then
+      printf '%s\n' "${MISE_LS_JSON_2}"
+      exit 0
+    fi
+    : > "${SAFE_INSTALL_COMMAND_LOG}.lsonce"
+    printf '%s\n' "${MISE_LS_JSON:-{\}}"
+    exit 0
+    ;;
+  env)
+    log_line MISEQ "$@"
+    [[ "${MISE_ENV_STATUS:-0}" != 0 ]] && exit "${MISE_ENV_STATUS}"
+    printf '%s\n' "${MISE_ENV_JSON:-{\}}"
+    exit 0
+    ;;
+  registry)
+    log_line MISEQ "$@"
+    if [[ -n "${MISE_REGISTRY_OUT:-}" ]]; then
+      printf '%s\n' "${MISE_REGISTRY_OUT}"
+      exit "${MISE_REGISTRY_STATUS:-0}"
+    fi
+    name=""
+    seen=0
+    for arg in "$@"; do
+      if (( seen )) && [[ "$arg" != "--" ]]; then
+        name="$arg"
+        break
+      fi
+      [[ "$arg" == "registry" ]] && seen=1
+    done
+    case "$name" in
+      node|python|ruby|go|rust|java|bun|deno|erlang|elixir|zig|swift)
+        printf 'core:%s\n' "$name"
+        exit 0
+        ;;
+      prettier) printf 'npm:prettier\n'; exit 0 ;;
+      cowsay) printf 'npm:cowsay\n'; exit 0 ;;
+      blockme) printf 'npm:blockme\n'; exit 0 ;;
+      ripgrep) printf 'aqua:BurntSushi/ripgrep cargo:ripgrep\n'; exit 0 ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  settings)
+    log_line MISEQ "$@"
+    setting=""
+    for arg in "$@"; do
+      case "$arg" in
+        exec_auto_install|npm.package_manager) setting="$arg" ;;
+      esac
+    done
+    case "$setting" in
+      npm.package_manager)
+        [[ "${MISE_NPM_PM_STATUS:-0}" != 0 ]] && exit "${MISE_NPM_PM_STATUS}"
+        printf '%s\n' "${MISE_NPM_PM:-auto}"
+        ;;
+      *) printf '%s\n' "${MISE_EXEC_AUTO_INSTALL:-false}" ;;
+    esac
+    exit 0
+    ;;
+  tool)
+    log_line MISEQ "$@"
+    [[ "${MISE_TOOL_STATUS:-0}" != 0 ]] && exit "${MISE_TOOL_STATUS}"
+    printf '%s\n' "${MISE_TOOL_JSON:-{\"tool_options\": {\}\}}"
+    exit 0
+    ;;
+esac
+log_line REAL mise "$@"
+exit "${SAFE_INSTALL_REAL_STATUS:-0}"
+STUB
+  chmod +x "${bin_dir}/mise"
+}
+
 # The wrappers install.sh generates. Shape must stay in sync with
 # install_gate_wrappers() in install.sh — that is what the suite exercises.
 write_gate_wrappers() {
   local wrapper_dir="$1"
   local tool
 
-  for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer; do
+  for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise; do
     cat > "${wrapper_dir}/${tool}" <<EOF
 #!/usr/bin/env bash
 # safe-gate-wrapper v1 tool=${tool}
@@ -123,6 +241,7 @@ prepare_case() {
   for tool in npm pnpm pnpx yarn bun uv pip pip3 cargo go composer volta; do
     write_tool_stub "${BIN_DIR}" "${tool}"
   done
+  write_mise_stub "${BIN_DIR}"
 
   # The real dispatcher: `safe gate` is under test, so nothing about it is
   # stubbed. Only safe-audit is (via SAFE_AUDIT_PATH, see run_zsh).
@@ -152,6 +271,7 @@ run_zsh() {
     SAFE_AUDIT_SCAN_STATUS="${SAFE_AUDIT_SCAN_STATUS:-}" \
     SAFE_AUDIT_CHECK_STATUS="${SAFE_AUDIT_CHECK_STATUS:-}" \
     SAFE_INSTALL_REAL_STATUS="${SAFE_INSTALL_REAL_STATUS:-}" \
+    MISE_LS_JSON="${MISE_LS_JSON:-}" \
     "${ZSH_BIN}" -fc 'eval "${SAFE_INSTALL_TEST_SCRIPT}"'
   ) >"${OUT_FILE}" 2>"${ERR_FILE}"
   STATUS=$?
@@ -1067,7 +1187,7 @@ case_install_writes_gate_wrappers() {
   assert_status 0 "$FUNCNAME" || return
 
   local tool
-  for tool in npm pnpx yarn bun pip pip3 uv cargo go composer; do
+  for tool in npm pnpx yarn bun pip pip3 uv cargo go composer mise; do
     head -n 2 "${HOME_DIR}/.local/bin/${tool}" | grep -Fq '# safe-gate-wrapper' || { fail "$FUNCNAME"; return; }
     [[ -x "${HOME_DIR}/.local/bin/${tool}" ]] || { fail "$FUNCNAME"; return; }
     grep -Fq "exec safe gate ${tool} -- \"\$@\"" "${HOME_DIR}/.local/bin/${tool}" || { fail "$FUNCNAME"; return; }
@@ -1212,7 +1332,7 @@ case_status_probes_every_wrapper() {
   # Healthy: every wrapper resolves to its owned file.
   local status_out
   status_out="$(cd "${WORK_DIR}" && HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" "${HOME_DIR}/.local/bin/safe" status 2>/dev/null)"
-  grep -Fq 'wrappers:       ok (11/11' <<<"${status_out}" || { printf '%s\n' "${status_out}" >&2; fail "$FUNCNAME"; return; }
+  grep -Fq 'wrappers:       ok (12/12' <<<"${status_out}" || { printf '%s\n' "${status_out}" >&2; fail "$FUNCNAME"; return; }
 
   # A missing non-npm wrapper must flip the aggregate (review finding: an
   # npm-only probe concealed ungated siblings).
@@ -1290,7 +1410,7 @@ case_wrappers_not_on_path_are_unhealthy() {
   local probe_path="/usr/bin:/bin"
   local -a expect_unresolved=() expect_shadowed=()
   local tool
-  for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer; do
+  for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise; do
     if [[ -n "$(PATH="${probe_path}" command -v "${tool}" 2>/dev/null || true)" ]]; then
       expect_shadowed+=("${tool}")
     else
@@ -1373,7 +1493,7 @@ case_uninstall_removes_gate_wrappers() {
   assert_status 0 "$FUNCNAME" || return
 
   local tool
-  for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go; do
+  for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go mise; do
     [[ ! -e "${HOME_DIR}/.local/bin/${tool}" ]] || { fail "$FUNCNAME"; return; }
   done
   # Unmarked file of a wrapped name: not ours, not removed.
@@ -1692,6 +1812,1139 @@ case_stale_evidence_is_source_scoped() {
   pass "$FUNCNAME"
 }
 
+case_mise_use_backend_audits() {
+  prepare_case "mise-use-backend-audits"
+  SAFE_INSTALL_TEST_SCRIPT='mise use npm:blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+
+  SAFE_INSTALL_TEST_SCRIPT='mise use npm:okpkg@1.2.3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg@1.2.3\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tuse\tnpm:okpkg@1.2.3' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_runtime_and_other_backends_pass() {
+  prepare_case "mise-runtime-passes"
+  # Official runtimes are not registry packages; no audit.
+  SAFE_INSTALL_TEST_SCRIPT='mise install node@22' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tinstall\tnode@22' "$FUNCNAME" || return
+
+  # Non-registry backends pass with a notice (no advisory source).
+  SAFE_INSTALL_TEST_SCRIPT='mise install ubi:owner/tool' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'no registry advisory source' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_bare_install_preflights_config() {
+  prepare_case "mise-bare-install-preflight"
+  # One backend tool not installed yet -> audited; blockme blocks the run.
+  MISE_LS_JSON='{"node": [{"version": "22.0.0", "requested_version": "22.0.0", "installed": true}], "npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": false}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+
+  # Everything installed and pinned -> nothing audited, delegate runs.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:okpkg": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tinstall' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_bare_upgrade_audits_floating() {
+  prepare_case "mise-bare-upgrade-floating"
+  # Installed but floating (requested "latest") can change on `mise up`.
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "latest", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise up' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # Pinned + installed cannot change without a config edit -> no audit.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise up' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_exec_gates_inner_command() {
+  prepare_case "mise-exec-gates-inner"
+  SAFE_INSTALL_TEST_SCRIPT='mise exec -- npm install blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+
+  # Tool specs before -- install on demand: audited too.
+  SAFE_INSTALL_TEST_SCRIPT='mise exec npm:blockme -- blockme --help' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+
+  # Non-gated inner command passes through to the real mise (which owns env).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise exec -- node script.js' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\texec\t--\tnode\tscript.js' "$FUNCNAME" || return
+
+  # Gated-but-clean inner command: audited once, then the ORIGINAL mise
+  # command runs (the gate must not exec the inner npm itself).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise exec -- npm install okpkg' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\texec\t--\tnpm\tinstall\tokpkg' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_leading_flag_fails_closed() {
+  prepare_case "mise-leading-flag"
+  SAFE_INSTALL_TEST_SCRIPT='mise --frobnicate value install npm:blockme' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'REAL' "$FUNCNAME" || return
+  # -C consumes its value; the subcommand is still found and gated. The
+  # audit runs FROM that directory (delta-1 finding 8), so it must exist —
+  # a -C into a nonexistent directory is a broken command either way.
+  SAFE_INSTALL_TEST_SCRIPT='mkdir -p sub; mise -C sub install npm:blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+
+  # A -C target that does not exist refuses as infrastructure rather than
+  # auditing from the wrong directory.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise -C no-such-dir install npm:blockme' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_bare_shorthand_resolves_backend() {
+  prepare_case "mise-bare-shorthand"
+  # Bare shorthands resolve to their effective backend via `mise registry`
+  # (which reflects MISE_BACKENDS_* overrides itself): a registry shorthand
+  # is a registry install and must be audited (review finding 1).
+  SAFE_INSTALL_TEST_SCRIPT='mise install prettier@3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tprettier@3\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tinstall\tprettier@3' "$FUNCNAME" || return
+
+  # A blocked package blocks through the shorthand too.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise install blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+
+  # Backend override visible through registry resolution: what mise would
+  # actually install is what gets audited, not the runtime the name suggests.
+  : > "${LOG_FILE}"
+  MISE_REGISTRY_OUT='npm:cowsay' SAFE_INSTALL_TEST_SCRIPT='mise install node@22' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tcowsay@22\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # A true runtime still passes without an audit.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise install node@22' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tinstall\tnode@22' "$FUNCNAME" || return
+
+  # Unresolvable name: refuse with infrastructure wording, never guess.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise install no-such-tool-xyz' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'REAL' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_spec_canonicalization() {
+  prepare_case "mise-spec-canonicalization"
+  # Tool options are mise syntax, not package identity (review finding 2):
+  # the audit must see the canonical name.
+  SAFE_INSTALL_TEST_SCRIPT='mise use "npm:okpkg[platform=linux]@1.2.3"' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg@1.2.3\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # Unbalanced bracket syntax fails closed.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use "npm:okpkg[package_manager=npm@1.2.3"' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'REAL' "$FUNCNAME" || return
+
+  # pipx owner/repo is a GitHub shorthand, not a PyPI identity: a clean
+  # PyPI audit of the unrelated name must never vouch for it; same for
+  # git+/URL forms in any backend (review finding 2). Notice path instead.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use pipx:psf/blockme@24.3.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tuse\tpipx:psf/blockme@24.3.0' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise install cargo:https://github.com/x/blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_preflight_fails_closed() {
+  prepare_case "mise-preflight-fails-closed"
+  # Enumeration failure must refuse, not fall open as "nothing configured"
+  # (review finding 3); the refusal reads as infrastructure, never a CVE.
+  MISE_LS_STATUS=1 SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='this is not json' SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='[]' SAFE_INSTALL_TEST_SCRIPT='mise up' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+
+  # A validated empty enumeration is a real empty set: delegate.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{}' SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tinstall' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_install_flags_are_modeled() {
+  prepare_case "mise-install-flags"
+  # A value flag's value must not read as a tool spec — that skipped the
+  # bare-install preflight entirely (review finding 4).
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": false}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install --jobs 1' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+
+  # Scope-changing flags the preflight cannot model refuse.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise install --monorepo' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'REAL' "$FUNCNAME" || return
+
+  # -C threads into the enumeration query: the preflight sees the same
+  # config scope the delegated command will install from.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{}' SAFE_INSTALL_TEST_SCRIPT='mise install -C sub' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'MISEQ\t-C\tsub\tls\t--current\t--json' "$FUNCNAME" || return
+
+  # Unknown equals-forms fail closed (review finding 10)...
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise --frobnicate=value install npm:blockme' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'REAL' "$FUNCNAME" || return
+
+  # ...while current global switches stay legal (refusing --locked would
+  # regress a security-conscious invocation).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise --locked install npm:blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_up_numeric_floating_and_bump() {
+  prepare_case "mise-up-numeric-floating"
+  # "3" is a floating selector under mise semantics — a first-character
+  # digit heuristic called it a pin and skipped the audit (review finding 5).
+  MISE_LS_JSON='{"npm:blockme": [{"version": "3.0.0", "requested_version": "3", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise up' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@3\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # An exact pin cannot move on plain `up`...
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise up' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+
+  # ...but `up --bump` can move even exact pins: everything is audited.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise up --bump' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_exec_auto_install_preflight() {
+  prepare_case "mise-exec-auto-install"
+  # exec auto-installs missing configured tools before running the command
+  # (review finding 6): with the setting on, the missing entry is audited.
+  MISE_EXEC_AUTO_INSTALL=true \
+    MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": false}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise exec -- node script.js' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+
+  # Setting validated off: no preflight, straight delegate.
+  : > "${LOG_FILE}"
+  MISE_EXEC_AUTO_INSTALL=false SAFE_INSTALL_TEST_SCRIPT='mise exec -- node script.js' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\texec\t--\tnode\tscript.js' "$FUNCNAME" || return
+
+  # -c hides the command in a shell string safe cannot parse: fail closed
+  # with the argv rewrite hint (operator-ratified; review finding 7).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise exec -c "npm install blockme"' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'REAL' "$FUNCNAME" || return
+  assert_err_contains_fragment 'mise exec -- <command>' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_env_overlay_reaches_audit() {
+  prepare_case "mise-env-overlay"
+  # Project [env] selects the sources mise installs under: the audit runs
+  # with the same vars exported, or a default-registry GO vouches for a
+  # different artifact (review finding 8).
+  MISE_ENV_JSON='{"NPM_CONFIG_REGISTRY": "https://mirror.example", "PATH": "/x"}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install npm:okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDITENV\tNPM_CONFIG_REGISTRY=https://mirror.example' "$FUNCNAME" || return
+
+  # The inner exec gate scans under the same overlay.
+  : > "${LOG_FILE}"
+  MISE_ENV_JSON='{"NPM_CONFIG_REGISTRY": "https://mirror.example"}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise exec -- npm install okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDITENV\tNPM_CONFIG_REGISTRY=https://mirror.example' "$FUNCNAME" || return
+
+  # Deriving the env is load-bearing: failure refuses with infrastructure
+  # wording, never audits against the wrong default source.
+  : > "${LOG_FILE}"
+  MISE_ENV_STATUS=1 SAFE_INSTALL_TEST_SCRIPT='mise install npm:okpkg@1.0.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_bare_use_refused() {
+  prepare_case "mise-bare-use"
+  # Bare `mise use` opens the interactive registry selector and installs
+  # the choice after safe already returned: unauditable, refuse with the
+  # explicit-spec hint (operator-ratified; review finding 9).
+  SAFE_INSTALL_TEST_SCRIPT='mise use' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'REAL' "$FUNCNAME" || return
+  assert_err_contains_fragment 'mise use <tool>@<version>' "$FUNCNAME" || return
+
+  # Removal installs nothing: still delegates.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use --remove node' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tuse\t--remove\tnode' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_flag_semantics_match_delegate() {
+  prepare_case "mise-flag-semantics"
+  # --force reinstalls entries mise reports as INSTALLED: a
+  # not-installed-only enumeration audited nothing while everything was
+  # refetched (delta-1 finding N1).
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install --force' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+
+  # --exclude names what mise will NOT touch: auditing it blocked an
+  # install that is not happening (delta-1 finding 4).
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "latest", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade --exclude npm:blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tupgrade\t--exclude\tnpm:blockme' "$FUNCNAME" || return
+
+  # --minimum-release-age makes mise pick an older release than safe would
+  # check: refuse for anything but an exact pin.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise install --minimum-release-age 7d npm:okpkg' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'REAL' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise install --minimum-release-age 7d npm:okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # Counted verbosity is legal mise; refusing -vvv was a usability
+  # regression (delta-1 finding 10).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise -vvv install npm:blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_display_only_invocations_pass() {
+  prepare_case "mise-display-only"
+  # help/version/dry-run install nothing: gating them blocked read-only
+  # commands and hid the rewrite hints the refusals point at (delta-1
+  # finding N3).
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": false}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install --help' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tinstall\t--help' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use --help' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tuse\t--help' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": false}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install --dry-run' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+
+  # A --help AFTER -- belongs to the inner command and must not disarm the
+  # gate.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise exec -- npm install blockme --help' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_helper_queries_use_delegate_context() {
+  prepare_case "mise-helper-context"
+  # Every helper query must run under the SAME context as the delegate: a
+  # project's disable_backends changes which backend mise picks, so a
+  # context-free registry query can classify a package as a runtime
+  # (delta-1 finding 1).
+  SAFE_INSTALL_TEST_SCRIPT='mkdir -p sub; mise -C sub install prettier' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'MISEQ\t-C\tsub\tregistry\t--\tprettier' "$FUNCNAME" || return
+
+  # Config/env-disabling switches travel too, or safe enumerates a config
+  # the delegate never loads (delta-1 findings 6/8).
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{}' SAFE_INSTALL_TEST_SCRIPT='mise --no-env install' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'MISEQ\t--no-env\tls\t--current\t--json' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{}' SAFE_INSTALL_TEST_SCRIPT='mise --no-config install' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'MISEQ\t--no-config\tls\t--current\t--json' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_env_transport_is_lossless() {
+  prepare_case "mise-env-transport"
+  # A value containing a newline must not split into two exported
+  # variables — that injected a source mise's single value never named
+  # (delta-1 finding N2). Base64 framing keeps it one value.
+  MISE_ENV_JSON='{"PIP_CONFIG_FILE": "/tmp/intended\nPIP_INDEX_URL=https://injected.example"}' \
+    SAFE_INSTALL_TEST_SCRIPT='pip install okpkg==1.0.0' run_zsh >/dev/null 2>&1
+  : > "${LOG_FILE}"
+  MISE_ENV_JSON='{"PIP_CONFIG_FILE": "/tmp/intended\nPIP_INDEX_URL=https://injected.example"}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install pipx:okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDITENV\tPIP_INDEX_URL=https://injected.example' "$FUNCNAME" || return
+
+  # A relevant key whose value is not a string is malformed helper output,
+  # not "absent": refuse instead of auditing the default source.
+  : > "${LOG_FILE}"
+  MISE_ENV_JSON='{"NPM_CONFIG_REGISTRY": 42}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install npm:okpkg@1.0.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+
+  # Cargo registry selection is a source too — safe-audit cannot resolve
+  # advisories against it yet, so it takes the notice path rather than a
+  # default-source verdict (delta-2 finding F4; asserted in full by
+  # case_mise_unmodeled_sources_are_not_vouched).
+  : > "${LOG_FILE}"
+  MISE_ENV_JSON='{"CARGO_REGISTRIES_PRIVATE_INDEX": "sparse+https://private.example/"}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install cargo:okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_tool_options_are_not_discarded() {
+  prepare_case "mise-tool-options"
+  # Options like npm_args reach the installer and can redirect the source:
+  # auditing the plain name would vouch for a different artifact (delta-1
+  # finding 2). Only identity-neutral keys keep the audit.
+  SAFE_INSTALL_TEST_SCRIPT='mise use "npm:okpkg[npm_args=--registry=https://evil.example]@1.0.0"' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+
+  # An identity-neutral option still gets a real audit.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use "npm:blockme[bin_path=bin]@1.0.0"' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # package_manager selects npm/pnpm/bun, whose native source inputs differ
+  # (bun reads BUN_CONFIG_REGISTRY, which safe-audit does not model): it is
+  # NOT identity-neutral (delta-2 finding F1).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use "npm:okpkg[package_manager=bun]@1.0.0"' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+
+  # Options on a CONFIGURED tool are invisible in `mise ls`: the bare
+  # preflight must ask `mise tool --json` before trusting key@version.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": false}]}' \
+    MISE_TOOL_JSON='{"tool_options": {"npm_args": "--registry=https://evil.example"}}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tinstall' "$FUNCNAME" || return
+
+  # A failed option query fails closed.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": false}]}' \
+    MISE_TOOL_STATUS=1 SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+
+  # Neutral configured options keep the audit.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": false}]}' \
+    MISE_TOOL_JSON='{"tool_options": {"os": null, "install_env": {}, "platform": "linux"}}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_unmodeled_sources_are_not_vouched() {
+  prepare_case "mise-unmodeled-sources"
+  # safe-audit's effective-source derivation covers npm/Python/Go. Exporting
+  # a Cargo/pipx/Composer/bun source into a consumer that ignores it would
+  # turn a private source into a confident default-source verdict (delta-2
+  # finding F4): take the honest notice path instead.
+  MISE_ENV_JSON='{"CARGO_REGISTRIES_PRIVATE_INDEX": "sparse+https://private.example/"}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install cargo:okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  MISE_ENV_JSON='{"MISE_PIPX_REGISTRY_URL": "https://private.example/pypi/{}/json"}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install pipx:okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+
+  # Without such a source, the same install audits normally.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise install cargo:blockme@1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1.0.0\t--ecosystem\trust\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # npm sources safe-audit DOES model still reach the audit.
+  : > "${LOG_FILE}"
+  MISE_ENV_JSON='{"NPM_CONFIG_REGISTRY": "https://mirror.example"}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install npm:okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDITENV\tNPM_CONFIG_REGISTRY=https://mirror.example' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_scoped_exclusion_and_interactive() {
+  prepare_case "mise-scoped-exclusion"
+  # An npm scope starts with '@': a blind version split reduced every
+  # unversioned scoped name to "npm:" and made unrelated tools compare
+  # equal, so an unrelated --exclude silenced the audit (delta-2 F3).
+  # A floating request can move on a plain upgrade; an exact one cannot
+  # (delta-4 finding F3), so the movable case is what proves the audit.
+  local scoped_ls='{"npm:@scope/blockme": [{"version": "1.0.0", "requested_version": "1", "installed": true}]}'
+  MISE_LS_JSON="${scoped_ls}" \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:@scope/blockme --exclude npm:@other/safe' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\t@scope/blockme@1\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # The matching exclusion still drops its own target.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON="${scoped_ls}" \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:@scope/blockme --exclude npm:@scope/blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+
+  # An unversioned explicit upgrade target keeps its CONFIGURED request in
+  # mise, so auditing a bare name would check the latest instead (delta-3
+  # finding F3): the configured version is what gets checked, and a target
+  # with no configured request refuses rather than guessing.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "2.0.0", "requested_version": "2", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@2\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # An EXACT configured request cannot move on a plain upgrade: auditing it
+  # reported a verdict for a no-op (delta-4 finding F3).
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "2.0.0", "requested_version": "2.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{}' SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:blockme' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'REAL' "$FUNCNAME" || return
+
+  # `use` honors --minimum-release-age too.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use --minimum-release-age 7d npm:blockme' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+
+  # An interactive upgrade selects targets safe never sees; auditing every
+  # candidate would block the picker over a tool the user may not choose.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise upgrade --interactive' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'REAL' "$FUNCNAME" || return
+  # The rewrite hint must name an EXACT version: an optional-version hint
+  # steers the user into the unversioned-target problem above (delta-3 F3).
+  assert_err_contains_fragment 'rerun naming each tool with an exact version' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_infra_refusals_are_one_line() {
+  prepare_case "mise-infra-one-line"
+  # A -C directory that cannot be entered must produce exactly one refusal
+  # line, not a silent exit 100 (delta-2 finding F6).
+  SAFE_INSTALL_TEST_SCRIPT='mise -C no-such-dir install npm:okpkg@1.0.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  local lines
+  lines="$(grep -c 'safe:' "${ERR_FILE}" 2>/dev/null || printf '0')"
+  if [[ "${lines}" != "1" ]]; then
+    printf 'expected exactly one safe: line, got %s:\n' "${lines}" >&2
+    cat "${ERR_FILE}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+
+  # The inner-exec route refuses the same way.
+  : > "${ERR_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise -C no-such-dir exec -- npm install okpkg' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_leading_global_help_passes() {
+  prepare_case "mise-leading-help"
+  # `mise --help install npm:x` prints global help and installs nothing:
+  # the subcommand scan never saw the flag, so the install gate ran
+  # (delta-2 finding F5).
+  SAFE_INSTALL_TEST_SCRIPT='mise --help install npm:blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\t--help\tinstall\tnpm:blockme' "$FUNCNAME" || return
+
+  # --version is NOT display-only with a subcommand: verified against mise
+  # 2026.7.16, `mise --version install <pkg>` still installs, so
+  # early-delegating it was an unaudited bypass (delta-3 finding F5).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise --version install npm:blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+
+  # With no subcommand it is a plain version print: delegated.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise --version' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\t--version' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_env_values_round_trip_exactly() {
+  prepare_case "mise-env-round-trip"
+  # Command substitution strips trailing newlines: a value ending in LF
+  # reached the audit truncated and could name a different config file
+  # than mise loads (delta-2 finding F2).
+  MISE_ENV_JSON='{"NPM_CONFIG_REGISTRY": "https://mirror.example/trail\n"}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install npm:okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  grep -Fq 'AUDITENV_B64	NPM_CONFIG_REGISTRY=aHR0cHM6Ly9taXJyb3IuZXhhbXBsZS90cmFpbAo=' "${LOG_FILE}" || {
+    printf 'trailing newline lost in transport:\n%s\n' "$(cat "${LOG_FILE}")" >&2
+    fail "$FUNCNAME"
+    return
+  }
+
+  # An empty value survives as empty rather than becoming unset.
+  : > "${LOG_FILE}"
+  MISE_ENV_JSON='{"NPM_CONFIG_REGISTRY": ""}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install npm:okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_option_checks_cover_every_preflight() {
+  prepare_case "mise-option-preflight-siblings"
+  # exec auto-install reconstructed entries straight from `mise ls` and
+  # never asked about options — one shared enumerator now covers both
+  # routes (delta-3 finding F1).
+  MISE_EXEC_AUTO_INSTALL=true \
+    MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": false}]}' \
+    MISE_TOOL_JSON='{"tool_options": {"npm_args": "--registry=https://evil.example"}}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise exec -- node script.js' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+
+  # `mise tool --json` reports ONE option set per key, so a key with
+  # several configured versions cannot be attributed: notice, never vouch.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:cowsay": [{"version": "1.5.0", "requested_version": "1.5.0", "installed": false}, {"version": "1.6.0", "requested_version": "1.6.0", "installed": false}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'several configured versions' "$FUNCNAME" || return
+
+  # Missing tool_options is malformed helper output, not "no options".
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": false}]}' \
+    MISE_TOOL_JSON='{}' SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_unmodeled_sources_cover_ambient_and_inner() {
+  prepare_case "mise-unmodeled-siblings"
+  # mise env --json omits INHERITED variables, but the delegate still gets
+  # them: the detector reads the effective union (delta-3 finding F4).
+  SAFE_INSTALL_TEST_SCRIPT='export CARGO_REGISTRY_DEFAULT=private; mise install cargo:okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+
+  # The inner exec route reaches Composer and bun-backed npm, whose
+  # sources safe-audit does not model either.
+  : > "${LOG_FILE}"
+  MISE_ENV_JSON='{"COMPOSER_HOME": "/tmp/composer-home"}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise exec -- composer require vendor/blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='export BUN_CONFIG_REGISTRY=https://private.example; mise exec -- bun add blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+
+  # ...but npm does not read that variable, so an npm install still gets
+  # its audit: applying selectors by ecosystem removed the gate from
+  # artifacts safe can model (delta-4 finding F4).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='export BUN_CONFIG_REGISTRY=https://private.example; mise exec -- npm install blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # An exported but EMPTY selector chooses nothing: it must not suppress
+  # the audit either.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='export BUN_CONFIG_REGISTRY=; mise exec -- bun add blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+
+  # Without an unmodeled source the inner route audits normally.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise exec -- npm install blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_env_transport_handles_unicode_and_nul() {
+  prepare_case "mise-env-unicode-nul"
+  # Byte-vs-character length comparison rejected a valid UTF-8 path
+  # (delta-3 finding F2): non-ASCII values must survive intact.
+  MISE_ENV_JSON='{"PIP_CONFIG_FILE": "/tmp/café.conf"}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install pipx:okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDITENV\tPIP_CONFIG_FILE=/tmp/café.conf' "$FUNCNAME" || return
+
+  # A NUL cannot exist in an environment value: rejected in the producer,
+  # so exactly one refusal line appears (no bash null-byte warning).
+  : > "${ERR_FILE}"
+  MISE_ENV_JSON='{"PIP_CONFIG_FILE": "a\u0000b"}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install pipx:okpkg@1.0.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  if grep -qi 'null byte' "${ERR_FILE}"; then
+    printf 'bash null-byte warning leaked next to the refusal:\n' >&2
+    cat "${ERR_FILE}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_option_attribution_covers_cli_and_hidden_rows() {
+  prepare_case "mise-option-attribution"
+  # An explicit CLI target INHERITS the configured options for its key, so
+  # the attribution check must run there too (delta-4 finding F1).
+  MISE_TOOL_JSON='{"tool_options": {"npm_args": "--registry=https://evil.example"}}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install npm:blockme@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+
+  # Multiplicity must be counted BEFORE the operation mode hides sibling
+  # rows: one installed + one missing row share a single reported option
+  # set, so the key is still unattributable (delta-4 finding F1).
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}, {"version": "2.0.0", "requested_version": "2.0.0", "installed": false}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'several configured versions' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_bump_audits_the_moved_target() {
+  prepare_case "mise-bump-target"
+  # --bump moves to the LATEST release, outside the configured request:
+  # auditing the old pin checked a version that will not be installed
+  # (delta-4 finding F3). A bare name lets safe-audit resolve the same
+  # target mise will pick.
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade --bump' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade --bump npm:blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # A VERSIONED argv target under --bump is a backend filter, not the
+  # audited target: mise still moves it to the latest release (delta-5 F3).
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade --bump npm:blockme@0.5.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'blockme@0.5.0' "$FUNCNAME" || return
+
+  # install --force reinstalls the CONFIGURED version, so it keeps its
+  # request rather than resolving latest.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install --force' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_upgrade_lookup_is_canonical_and_ordered() {
+  prepare_case "mise-upgrade-lookup"
+  # A supported bare shorthand names the same tool as its configured
+  # backend key: comparing the raw spec refused it as unconfigured
+  # (delta-4 finding F3).
+  MISE_LS_JSON='{"npm:prettier": [{"version": "3.0.0", "requested_version": "3", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade prettier' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tprettier@3\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # A key with SEVERAL configured requests shares one reported option set,
+  # so it cannot be attributed to the target being upgraded: the
+  # multiplicity rule (delta-5 finding F1) takes precedence over expanding
+  # the movable requests, and the invocation is flagged rather than
+  # audited against a source safe cannot confirm.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}, {"version": "2.0.0", "requested_version": "2", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'several configured versions' "$FUNCNAME" || return
+
+  # A bracket option must not end up inside the key compared against the
+  # configured rows: that refused a supported invocation (delta-5 F3).
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade "npm:blockme[bin_path=bin]"' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # Exclusions are canonical too: one tool, two spellings.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade blockme --exclude npm:blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+
+  # Exclusions apply BEFORE the configured-request lookup: a target mise
+  # will not touch must not be refused for being unconfigured.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:unconfigured --exclude npm:unconfigured' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tupgrade\tnpm:unconfigured\t--exclude\tnpm:unconfigured' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_npm_installer_reads_mise_settings() {
+  prepare_case "mise-npm-installer-setting"
+  # `mise env --json` does not export npm.package_manager, so a configured
+  # bun installer was invisible and safe audited npm's source for a bun
+  # install (delta-5 finding F4).
+  MISE_NPM_PM=bun \
+    SAFE_INSTALL_TEST_SCRIPT='export BUN_CONFIG_REGISTRY=https://private.example; mise install npm:okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+
+  # The default installer reads no bun variable, so the audit proceeds.
+  : > "${LOG_FILE}"
+  MISE_NPM_PM=auto \
+    SAFE_INSTALL_TEST_SCRIPT='export BUN_CONFIG_REGISTRY=https://private.example; mise install npm:blockme@1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # The environment still wins over the setting.
+  : > "${LOG_FILE}"
+  MISE_NPM_PM=bun MISE_ENV_JSON='{"MISE_NPM_PACKAGE_MANAGER": "npm"}' \
+    SAFE_INSTALL_TEST_SCRIPT='export BUN_CONFIG_REGISTRY=https://private.example; mise install npm:blockme@1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+
+  # An unreadable or unrecognized setting fails closed.
+  : > "${LOG_FILE}"
+  MISE_NPM_PM='not-a-manager' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install npm:okpkg@1.0.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_rows_snapshot_is_shared() {
+  prepare_case "mise-rows-snapshot"
+  # Selection and attribution must read ONE snapshot: capturing the loader
+  # with $(...) ran its assignments in a subshell, so the cache never
+  # survived and each reader re-queried mise, which could disagree with
+  # the first answer (delta-6 finding F1).
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  local ls_queries
+  ls_queries="$(grep -c $'MISEQ\tls\t--current\t--json' "${LOG_FILE}" 2>/dev/null || printf '0')"
+  if [[ "${ls_queries}" != "1" ]]; then
+    printf 'expected exactly one mise ls query, got %s:\n' "${ls_queries}" >&2
+    cat "${LOG_FILE}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
+case_mise_exclusion_canonicalization_fails_closed() {
+  prepare_case "mise-exclusion-fail-closed"
+  # An exclusion that cannot be canonicalized must not silently match: the
+  # old fallback rewrote it as the current target (bash expands every RHS
+  # of one `local` before the new locals exist), dropping a real target
+  # from the audit set entirely (delta-6 finding F3).
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:blockme --exclude nonsense' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_bump_requires_a_configured_target() {
+  prepare_case "mise-bump-configured"
+  # --bump moves a CONFIGURED request; with none, mise installs nothing,
+  # so auditing the latest release reported a verdict for a no-op
+  # (delta-6 finding F3).
+  MISE_LS_JSON='{}' SAFE_INSTALL_TEST_SCRIPT='mise upgrade --bump npm:blockme' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{}' SAFE_INSTALL_TEST_SCRIPT='mise upgrade --bump npm:blockme@0.5.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_installer_values_are_validated() {
+  prepare_case "mise-installer-values"
+  # An environment value was passed through unvalidated, so an invalid
+  # selector became a package verdict instead of an infrastructure
+  # refusal (delta-6 finding F4).
+  MISE_ENV_JSON='{"MISE_NPM_PACKAGE_MANAGER": "not-a-manager"}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install npm:blockme@1.0.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+
+  # Aube is a valid mise installer reading npm-compatible sources: it
+  # audits normally rather than being refused as unrecognized.
+  : > "${LOG_FILE}"
+  MISE_NPM_PM=aube SAFE_INSTALL_TEST_SCRIPT='mise install npm:blockme@1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  MISE_NPM_PM=aube_cli SAFE_INSTALL_TEST_SCRIPT='mise install npm:blockme@1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+
+  # A nonzero settings command fails closed.
+  : > "${LOG_FILE}"
+  MISE_NPM_PM_STATUS=1 SAFE_INSTALL_TEST_SCRIPT='mise install npm:okpkg@1.0.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_multi_target_shares_one_snapshot() {
+  prepare_case "mise-multi-target-snapshot"
+  # Every explicit target of a multi-target command must attribute options
+  # against the SAME configuration: the multiplicity capture reloaded rows
+  # in a subshell, so each target re-queried mise (delta-7 finding F1).
+  # The stub's second answer would make the second target look ambiguous;
+  # with one snapshot it is never read.
+  MISE_LS_JSON='{}' \
+    MISE_LS_JSON_2='{"npm:oktwo": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}, {"version": "2.0.0", "requested_version": "2", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install npm:okone@1.0.0 npm:oktwo@2.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  local ls_queries
+  ls_queries="$(grep -c $'MISEQ\tls\t--current\t--json' "${LOG_FILE}" 2>/dev/null || printf '0')"
+  if [[ "${ls_queries}" != "1" ]]; then
+    printf 'expected exactly one mise ls query, got %s:\n' "${ls_queries}" >&2
+    cat "${LOG_FILE}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  assert_log_contains $'AUDIT\tcheck\toktwo@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # Same for `use`.
+  : > "${LOG_FILE}"
+  rm -f "${LOG_FILE}.lsonce"
+  MISE_LS_JSON='{}' MISE_LS_JSON_2='{"npm:oktwo": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}, {"version": "2.0.0", "requested_version": "2", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise use npm:okone@1.0.0 npm:oktwo@2.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  ls_queries="$(grep -c $'MISEQ\tls\t--current\t--json' "${LOG_FILE}" 2>/dev/null || printf '0')"
+  if [[ "${ls_queries}" != "1" ]]; then
+    printf 'use: expected exactly one mise ls query, got %s:\n' "${ls_queries}" >&2
+    cat "${LOG_FILE}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+
+  # ...and for exec tool specs, which install on demand.
+  : > "${LOG_FILE}"
+  rm -f "${LOG_FILE}.lsonce"
+  MISE_EXEC_AUTO_INSTALL=false MISE_LS_JSON='{}' \
+    MISE_LS_JSON_2='{"npm:oktwo": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}, {"version": "2.0.0", "requested_version": "2", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise exec npm:okone@1.0.0 npm:oktwo@2.0.0 -- node script.js' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  ls_queries="$(grep -c $'MISEQ\tls\t--current\t--json' "${LOG_FILE}" 2>/dev/null || printf '0')"
+  if [[ "${ls_queries}" != "1" ]]; then
+    printf 'exec: expected exactly one mise ls query, got %s:\n' "${ls_queries}" >&2
+    cat "${LOG_FILE}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  assert_log_contains $'AUDIT\tcheck\toktwo@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_setting_output_is_strict() {
+  prepare_case "mise-setting-strict"
+  # Truncating the setting to its first line turned malformed multi-line
+  # helper output into an apparently valid installer identity (delta-7
+  # finding F4): it must refuse as infrastructure breakage instead.
+  MISE_NPM_PM=$'npm\nbun' SAFE_INSTALL_TEST_SCRIPT='mise install npm:blockme@1.0.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_entry_requires_requested_version() {
+  prepare_case "mise-entry-requires-version"
+  # A missing requested_version was defaulted to "": safe audited a bare
+  # name and reported a package VERDICT for unreadable helper output
+  # (delta-2 finding F2).
+  MISE_LS_JSON='{"npm:blockme": [{"installed": false}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_entry_schema_is_strict() {
+  prepare_case "mise-entry-schema"
+  # A missing required field is malformed helper output: defaulting it
+  # reported a package VERDICT for an entry safe could not read (delta-1
+  # finding 3).
+  MISE_LS_JSON='{"npm:blockme": [{}]}' SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+
+  # jq's own diagnostics must not leak: the refusal contract is one line.
+  : > "${ERR_FILE}"
+  MISE_LS_JSON='{"npm:blockme": "not-an-array"}' SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  if grep -qiE 'jq: error|parse error' "${ERR_FILE}"; then
+    printf 'jq diagnostics leaked into the refusal:\n' >&2
+    cat "${ERR_FILE}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
+case_zsh_stub_warns_on_missing_mise_wrapper() {
+  prepare_case "zsh-stub-warns-mise"
+  # The zsh stub's full-set probe includes mise: an interactive shell with
+  # every wrapper present EXCEPT mise must warn for mise by name.
+  local stub_home="${WORK_DIR}/stub-home"
+  mkdir -p "${stub_home}/.local/bin"
+  local tool
+  for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer; do
+    printf '#!/usr/bin/env bash\n# safe-gate-wrapper v1 tool=%s\nexec safe gate %s -- "$@"\n' "$tool" "$tool" > "${stub_home}/.local/bin/${tool}"
+    chmod +x "${stub_home}/.local/bin/${tool}"
+  done
+  printf '#!/usr/bin/env bash\nexit 0\n' > "${stub_home}/.local/bin/safe"
+  chmod +x "${stub_home}/.local/bin/safe"
+  local err_out
+  err_out="$(HOME="${stub_home}" ZDOTDIR="${stub_home}" SAFE_BIN_DIR="${stub_home}/.local/bin" \
+    PATH="${stub_home}/.local/bin:${PATH}" \
+    zsh -i -c "source '${ROOT_DIR}/lib/install-wrappers.zsh'" 2>&1 >/dev/null)" || true
+  [[ "$err_out" == *"NOT active for: mise"* ]] || { printf '%s\n' "$err_out" >&2; fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
 case_uninstall_cleans_shell_and_legacy_binaries() {
   prepare_case "uninstall-cleans-shell-and-legacy-binaries"
   mkdir -p "${HOME_DIR}/.local/bin" "${HOME_DIR}/.local/share/zsh/site-functions" "${HOME_DIR}/.config/safe-run/completions" "${HOME_DIR}/.config/safe" "${HOME_DIR}/.local/share/safe"
@@ -1818,6 +3071,46 @@ main() {
     case_install_preserves_symlinked_zshrc \
     case_install_merges_legacy_state_into_new_schema \
     case_uninstall_preserves_symlinked_zshrc \
+    case_mise_use_backend_audits \
+    case_mise_runtime_and_other_backends_pass \
+    case_mise_bare_install_preflights_config \
+    case_mise_bare_upgrade_audits_floating \
+    case_mise_exec_gates_inner_command \
+    case_mise_leading_flag_fails_closed \
+    case_mise_bare_shorthand_resolves_backend \
+    case_mise_spec_canonicalization \
+    case_mise_preflight_fails_closed \
+    case_mise_install_flags_are_modeled \
+    case_mise_up_numeric_floating_and_bump \
+    case_mise_exec_auto_install_preflight \
+    case_mise_env_overlay_reaches_audit \
+    case_mise_bare_use_refused \
+    case_mise_flag_semantics_match_delegate \
+    case_mise_display_only_invocations_pass \
+    case_mise_helper_queries_use_delegate_context \
+    case_mise_env_transport_is_lossless \
+    case_mise_tool_options_are_not_discarded \
+    case_mise_entry_schema_is_strict \
+    case_mise_unmodeled_sources_are_not_vouched \
+    case_mise_scoped_exclusion_and_interactive \
+    case_mise_infra_refusals_are_one_line \
+    case_mise_leading_global_help_passes \
+    case_mise_env_values_round_trip_exactly \
+    case_mise_entry_requires_requested_version \
+    case_mise_option_checks_cover_every_preflight \
+    case_mise_unmodeled_sources_cover_ambient_and_inner \
+    case_mise_env_transport_handles_unicode_and_nul \
+    case_mise_option_attribution_covers_cli_and_hidden_rows \
+    case_mise_bump_audits_the_moved_target \
+    case_mise_upgrade_lookup_is_canonical_and_ordered \
+    case_mise_npm_installer_reads_mise_settings \
+    case_mise_rows_snapshot_is_shared \
+    case_mise_exclusion_canonicalization_fails_closed \
+    case_mise_bump_requires_a_configured_target \
+    case_mise_installer_values_are_validated \
+    case_mise_multi_target_shares_one_snapshot \
+    case_mise_setting_output_is_strict \
+    case_zsh_stub_warns_on_missing_mise_wrapper \
     case_uninstall_cleans_shell_and_legacy_binaries
   do
     "$case"

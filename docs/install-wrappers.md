@@ -41,6 +41,88 @@ delegates to the real tool: the first executable of that name on PATH that is
 not itself a wrapper. For node tools that is normally the mise/asdf shim, so
 per-project tool versions keep resolving.
 
+`mise` itself is wrapped too: backend package installs (`npm:*`, `pipx:*`,
+`cargo:*`, `go:*`) are audited on `mise install`/`up`/`use` — bare
+invocations preflight the configured tools and audit not-yet-installed (and,
+on `up`, non-exactly-pinned; on `up --bump`, all) backend entries — and a
+gated command behind `mise exec --` gets the routing/audit pass while mise
+keeps the execution. `mise exec` also preflights configured tools unless
+`exec_auto_install` is verifiably disabled, since exec installs missing
+tools on demand. Bare shorthands (`mise install prettier`) resolve to their
+effective backend via `mise registry` before the runtime-vs-package call is
+made; audits run with mise's project `[env]` package-source variables
+applied, so the verdict covers the source mise will actually install from.
+Official runtime installs (`node@22`) pass through; non-registry backends
+(aqua/ubi/gem) and source-bearing specs (`pipx:owner/repo` GitHub
+shorthands, `git+`/URL forms) pass with an explicit notice that they are
+not audit-gated — a public-registry audit must never vouch for them.
+Every helper query safe makes (`registry`, `ls`, `env`, `settings`) runs
+under the same context as the delegated command — `-C`, `-E`, and the
+config/env-disabling switches (`--no-config`, `--no-env`, `--no-hooks`) —
+and the audit itself runs from the `-C` directory, since directory-scoped
+config files (`.npmrc`, Cargo config, pip config) are part of the source.
+Flags that change the target set change what safe audits: `install --force`
+audits every configured tool (it reinstalls installed ones), `upgrade
+--exclude` drops the excluded tool from the audit set, and
+`--minimum-release-age` refuses for non-exact targets because mise
+deliberately selects an older release than safe would check. Tool options
+are honored, not discarded: an identity-neutral option (`bin_path`, `exe`,
+`platform`, `os`, …) keeps the audit, while any other option — including
+`package_manager`, which selects an installer whose own registry inputs
+differ — can change the source, so the spec takes the not-audit-gated
+notice path instead of a verdict for a package that may come from
+elsewhere. Configured tools carry options too, and `mise ls` does not show
+them, so the bare preflight reads each entry's options with
+`mise tool --json` before trusting `key@version`.
+
+Advisory sources safe can resolve against today are npm, Python (PyPI), and
+Go. When a Cargo, pipx, Composer, or Bun registry is selected — by mise's
+own environment *or inherited from the surrounding shell*, and on the
+`mise exec -- <tool>` route as well as direct installs — safe does not
+pretend to have checked it: that spec takes the not-audit-gated notice
+path rather than reporting a verdict computed against the default public
+source. Selectors apply to the installer that actually reads them: bun's
+registry variable affects a bun install, not an npm one, and an exported
+but empty selector chooses nothing, so neither suppresses an audit safe
+can honestly perform. Which installer runs an npm-backend install comes
+from the environment first and then from mise's own
+`npm.package_manager` setting (which `mise env --json` does not export);
+an unreadable or unrecognized value refuses rather than assuming npm.
+A tool with several configured version requests is not audited at all but
+flagged: mise reports one option set per tool, so safe cannot tell which
+request carries which source. Directory-scoped config files (Cargo's `config.toml`,
+Composer's, bun's `bunfig.toml`) are not yet detected; extending the
+audit's source derivation to those ecosystems is tracked separately.
+
+An unversioned explicit `mise upgrade <tool>` is checked at each of the
+tool's configured requests that can actually move — an exact pin cannot,
+so it is not reported as a verdict for a no-op — while `upgrade --bump`
+is checked at the target it will move to rather than the request it is
+leaving.
+
+Display-only invocations pass through untouched: `--help` (including a
+leading global one), a bare `--version`, and `--dry-run`/`--dry-run-code`
+install nothing. A `--help` *after* `--` belongs to the inner command and
+does not disarm the gate, and a leading `--version` *followed by a
+subcommand* is not display-only — mise still installs, so it is gated.
+
+An unversioned explicit `mise upgrade <tool>` upgrades within the tool's
+configured request, so safe checks that configured version rather than the
+latest one; a target with no configured request is refused rather than
+guessed.
+
+Fail-closed refusals: enumeration or env-derivation failure (refused as
+infrastructure breakage, never a package verdict — this includes a missing
+required field in `mise ls` output, a non-string value for a source
+variable, and a `-C` directory that does not exist), `mise exec -c '<shell
+string>'` (rewrite as `mise exec -- <argv…>`), bare interactive `mise use`
+(rerun as `mise use <tool>@<version>`), and scope-changing flags the
+preflight cannot model (`--monorepo`, `--inactive`, `--local`; per-directory
+`-C` is threaded and supported). A launcher first word behind `mise exec --`
+(`env`, `sh`, wrapper scripts) is a documented residual, same class as
+absolute-path invocation: this is a seatbelt for cooperative agents, not a
+jail.
+
 Package installs run:
 
 ```bash
