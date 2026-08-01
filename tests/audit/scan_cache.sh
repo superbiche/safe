@@ -477,10 +477,81 @@ case_result_out_hands_back_a_private_copy() {
   [[ -s "$replayed" ]] || { printf 'cache replay did not honor --result-out\n' >&2; fail "$FUNCNAME"; return; }
   [[ "$(jq -r '.verdict' "$replayed")" == "$(jq -r '.verdict' "$out")" ]] || { fail "$FUNCNAME"; return; }
 
-  # An unwritable destination is refused before any scanning happens.
+  # A destination that cannot receive the result is refused BEFORE any
+  # scanning happens — proven by the scanner log staying empty, not by the
+  # exit code alone.
   : > "$SCANNER_LOG"
   run_scan --result-out "$CASE_DIR/nope/deeper/result.json"
   [[ "$STATUS" -ne 0 ]] || { printf 'unwritable --result-out did not fail\n' >&2; fail "$FUNCNAME"; return; }
+  assert_no_scanners "$FUNCNAME" || return
+
+  # A directory would otherwise become "a file created inside it", and the
+  # caller would read a path that is still a directory.
+  : > "$SCANNER_LOG"
+  mkdir -p "$CASE_DIR/adir"
+  run_scan --result-out "$CASE_DIR/adir"
+  [[ "$STATUS" -ne 0 ]] || { printf 'a directory was accepted as --result-out\n' >&2; fail "$FUNCNAME"; return; }
+  [[ -d "$CASE_DIR/adir" ]] || { fail "$FUNCNAME"; return; }
+  [[ -z "$(find "$CASE_DIR/adir" -mindepth 1 2>/dev/null)" ]] || { printf 'wrote into the directory instead of refusing\n' >&2; fail "$FUNCNAME"; return; }
+  assert_no_scanners "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# derive_key <logical target> <staging root>
+# Calls the key function directly: staging-path independence is a property of
+# the key, not something a local scan can express (its root IS its target).
+derive_key() {
+  local target="$1" root="$2"
+  SA="$SAFE_AUDIT" TARGET="$target" ROOT="$root" SAFE_AUDIT_NO_INIT=1 bash -c '
+    set -euo pipefail
+    source "$SA" help >/dev/null 2>&1
+    scan_cache_key local "$TARGET" deps "$ROOT" "$ROOT/package.json" "$ROOT/package-lock.json"
+  ' 2>/dev/null
+}
+
+case_key_is_independent_of_the_staging_directory() {
+  prepare_case "staging-independence"
+  # A remote scan stages the target into a fresh mktemp directory every run.
+  # If the absolute staging path entered the key, two scans of an unchanged
+  # remote target would never hit — exactly where a hit is worth most.
+  local a="$CASE_DIR/stage-a" b="$CASE_DIR/stage-b"
+  mkdir -p "$a" "$b"
+  printf '{"name":"demo","version":"1.0.0"}\n' | tee "$a/package.json" > "$b/package.json"
+  printf '{"lockfileVersion":3,"packages":{}}\n' | tee "$a/package-lock.json" > "$b/package-lock.json"
+
+  local key_a key_b key_other
+  key_a="$(derive_key "/remote/project" "$a")"
+  key_b="$(derive_key "/remote/project" "$b")"
+  key_other="$(derive_key "/a/different/project" "$b")"
+
+  [[ -n "$key_a" && "$key_a" == "$key_b" ]] || { printf 'staging path leaked into the key: %s vs %s\n' "$key_a" "$key_b" >&2; fail "$FUNCNAME"; return; }
+  # The logical target still separates projects.
+  [[ "$key_a" != "$key_other" ]] || { printf 'different targets produced the same key\n' >&2; fail "$FUNCNAME"; return; }
+
+  # Content still decides: change a byte, get a different key.
+  printf '{"lockfileVersion":3,"packages":{"x":{}}}\n' > "$b/package-lock.json"
+  local key_changed
+  key_changed="$(derive_key "/remote/project" "$b")"
+  [[ "$key_changed" != "$key_a" ]] || { printf 'content change did not change the key\n' >&2; fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
+case_unhashed_evidence_blocks_caching() {
+  prepare_case "hidden-evidence"
+  run_scan
+  [[ "$(cache_entries)" -eq 1 ]] || { printf 'baseline did not cache\n' >&2; fail "$FUNCNAME"; return; }
+
+  # A lockfile that discovery cannot see (it walks regular files only) is
+  # still read by npm audit. Evidence we did not hash means no caching.
+  local elsewhere="$CASE_DIR/elsewhere-lock.json"
+  printf '{"lockfileVersion":3,"packages":{}}\n' > "$elsewhere"
+  ln -s "$elsewhere" "$CASE_PROJECT/npm-shrinkwrap.json"
+  rm -f "$CASE_DIR/audit-data/scan-cache"/*.json
+  run_scan
+  [[ "$(cache_entries)" -eq 0 ]] || { printf 'cached a project holding evidence that was never hashed\n' >&2; fail "$FUNCNAME"; return; }
+  run_scan
+  assert_no_hit "$FUNCNAME" || return
+  assert_scanners_ran "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -521,6 +592,8 @@ main() {
     case_evidence_changed_during_scan_is_not_cached \
     case_source_reading_scanner_is_not_cached \
     case_result_out_hands_back_a_private_copy \
+    case_key_is_independent_of_the_staging_directory \
+    case_unhashed_evidence_blocks_caching \
     case_ecosystem_audit_counts_reach_the_totals
   do
     "$case"

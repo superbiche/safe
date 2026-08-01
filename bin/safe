@@ -1208,7 +1208,10 @@ safe_install_gate_log() {
   mkdir -p "$data_dir" 2>/dev/null || return 0
   local line
   line="$(date -Iseconds) | install:${ecosystem} | ${package} | GATE | ${context} | ${decision}${extra:+ | ${extra}}"
-  printf '%s\n' "${line//[$'\r\n']/ }" >> "$data_dir/audit.log" 2>/dev/null || true
+  # stderr is redirected FIRST: if the log file cannot be opened, the shell
+  # reports that failure on stderr, and a best-effort log must never add a
+  # second line to a refusal that is contractually one line.
+  printf '%s\n' "${line//[$'\r\n']/ }" 2>/dev/null >> "$data_dir/audit.log" || true
 }
 
 # Offline fallback: an exact-version request matching a fresh install-known
@@ -1521,9 +1524,20 @@ cmd_install_project() {
   # closed. The scanner's own diagnostics go to a file, not to stderr: a
   # refusal is one line, and a broken scanner can print hundreds.
   if [[ "$scan_rc" -ne 0 || ! -r "$result_path" || ! -s "$result_path" ]]; then
+    # Name the actual failure: "produced no result" is false when the scan
+    # wrote one and then exited nonzero, and a wrong cause sends whoever
+    # reads this refusal to the wrong place.
+    local cause
+    if [[ "$scan_rc" -ne 0 && -s "$result_path" ]]; then
+      cause="safe audit scan exited ${scan_rc} after writing its result"
+    elif [[ "$scan_rc" -ne 0 ]]; then
+      cause="safe audit scan failed (exit ${scan_rc}) and produced no result"
+    else
+      cause="safe audit scan reported success but produced no result document"
+    fi
     rm -f "$result_path"
     safe_install_gate_log "project" "$(pwd)" "REFUSED_SCAN_UNREADABLE" "exit=${scan_rc}"
-    refuse 100 "BLOCKED project audit — safe audit scan failed (exit ${scan_rc}) and produced no result, so nothing was checked; to allow: fix the scanner — safe doctor, output in ${scan_log}; details: safe explain"
+    refuse 100 "BLOCKED project audit — ${cause}, so nothing was checked; to allow: fix the scanner — safe doctor, output in ${scan_log}; details: safe explain"
   fi
 
   local verdict packages critical high medium low cve_critical
@@ -1551,14 +1565,10 @@ cmd_install_project() {
   # (reported below, and already WARNs the verdict).
   local broken_tools
   broken_tools="$(jq -r '
-    [ (.tool_status // {} | to_entries[]?
-        | select((.value.status // "ok") != "ok")
-        | select((.value.note // "") | test("fail|error"; "i"))
-        | .key),
-      (.ecosystem_audits[]?
-        | select((.status // "ok") != "ok")
-        | select((.note // "") | test("fail|error"; "i"))
-        | (.scanner // "unknown"))
+    def broken: (.status // "ok") as $s
+      | ($s == "error") or (($s != "ok") and (((.note // "") | test("fail|error"; "i"))));
+    [ (.tool_status // {} | to_entries[]? | select(.value | broken) | .key),
+      (.ecosystem_audits[]? | select(broken) | (.scanner // "unknown"))
     ] | unique | join(", ")
   ' "$result_path" 2>/dev/null || printf '')"
   if [[ -n "$broken_tools" ]]; then
@@ -1573,6 +1583,7 @@ cmd_install_project() {
   unrun_tools="$(jq -r '
     [ .ecosystem_audits[]?
       | select((.status // "ok") != "ok")
+      | select((.status // "") != "error")
       | (.scanner // "unknown") + " (" + ((.note // "not run")) + ")"
     ] | unique | join(", ")
   ' "$result_path" 2>/dev/null || printf '')"
@@ -1582,7 +1593,25 @@ cmd_install_project() {
   printf 'safe install: project audit — %s\n' "$(pwd)"
   printf '  manifests: %s\n' "${manifests[*]}"
   printf '  packages:  %s\n' "$packages"
-  printf '  findings:  critical %s, high %s, medium %s, low %s\n' "$critical" "$high" "$medium" "$low"
+  # Per source, because only osv and grype carry advisory ids: the same
+  # advisory reported by three scanners is three reports, not three
+  # vulnerabilities, and one summed number would say the wrong thing.
+  local cve_high cve_medium cve_low
+  cve_high="$(jq -r '.cve_scan.high // 0' "$result_path" 2>/dev/null || printf '0')"
+  cve_medium="$(jq -r '.cve_scan.medium // 0' "$result_path" 2>/dev/null || printf '0')"
+  cve_low="$(jq -r '.cve_scan.low // 0' "$result_path" 2>/dev/null || printf '0')"
+  printf '  cve scan:  critical %s, high %s, medium %s, low %s\n' \
+    "$cve_critical" "$cve_high" "$cve_medium" "$cve_low"
+  local eco_line
+  eco_line="$(jq -r '
+    [ .audit_totals.ecosystem[]?
+      | select(.total > 0)
+      | .scanner + " (critical " + (.critical | tostring)
+        + ", high " + (.high | tostring)
+        + ", unknown " + ((.unknown // 0) | tostring) + ")"
+    ] | join(", ")
+  ' "$result_path" 2>/dev/null || printf '')"
+  [[ -n "$eco_line" ]] && printf '  ecosystem: %s\n' "$eco_line"
   printf '  verdict:   %s\n' "$verdict"
   [[ -n "$unrun_tools" ]] && printf '  not run:   %s\n' "$unrun_tools"
   local cache_note
@@ -1607,9 +1636,15 @@ cmd_install_project() {
   # Critical findings are the project-scale equivalent of a BLOCK verdict:
   # --yes accepts WARNs, never these.
   if [[ "$critical" -gt 0 || "$verdict" == "BLOCK" ]]; then
+    local critical_sources
+    critical_sources="$(jq -r '
+      [ (if (.cve_scan.critical // 0) > 0 then "osv/grype " + ((.cve_scan.critical) | tostring) else empty end),
+        (.audit_totals.ecosystem[]? | select((.critical // 0) > 0) | .scanner + " " + ((.critical) | tostring))
+      ] | join(", ")
+    ' "$result_path" 2>/dev/null || printf '')"
     safe_install_gate_log "project" "$(pwd)" "REFUSED_BLOCK" "critical=${critical} verdict=${verdict}"
     rm -f "$result_path"
-    refuse 104 "BLOCKED project audit — ${critical} critical finding(s) in this project's dependencies; to allow: operator review — safe audit scan --deps-only --project .; details: safe explain"
+    refuse 104 "BLOCKED project audit — critical advisories in this project's dependencies (${critical_sources:-verdict ${verdict}}); to allow: operator review — safe audit scan --deps-only --project .; details: safe explain"
   fi
   rm -f "$result_path"
 

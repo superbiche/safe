@@ -69,6 +69,8 @@ case "${1:-}" in
       [[ -n "$tool_status" ]] || tool_status='{"osv-scanner":{"status":"ok","note":null},"syft":{"status":"ok","note":null},"grype":{"status":"ok","note":null}}'
       eco_audits="${SAFE_AUDIT_STUB_ECOSYSTEM_AUDITS:-}"
       [[ -n "$eco_audits" ]] || eco_audits='[]'
+      eco_totals="${SAFE_AUDIT_STUB_ECO_TOTALS:-}"
+      [[ -n "$eco_totals" ]] || eco_totals='[]'
       cat > "$result" <<JSON
 {
   "machine": "local",
@@ -89,7 +91,10 @@ case "${1:-}" in
     "high": ${cve_high},
     "medium": 0,
     "low": 0,
-    "sources": ["cve_scan", "ecosystem_audits"]
+    "unknown": 0,
+    "cve_scan": {"critical": ${cve_critical}, "high": ${cve_high}, "medium": 0, "low": 0},
+    "ecosystem": ${eco_totals},
+    "deduplicated": false
   },
   "tool_status": ${tool_status},
   "ecosystem_audits": ${eco_audits}
@@ -204,7 +209,8 @@ project_case warn-yes 0 "$project_dir" env SAFE_AUDIT_STUB_SCAN_VERDICT=WARN SAF
 # Critical findings are the project-scale BLOCK: 104 even under --yes.
 PROJECT_ARGS=()
 project_case critical 104 "$project_dir" env SAFE_AUDIT_STUB_SCAN_VERDICT=WARN SAFE_AUDIT_STUB_SCAN_CRITICAL=1
-grep -Fq 'critical finding(s)' "$PROJECT_ERR" || fail "project critical refusal does not name the finding count"
+grep -Fq 'critical advisories' "$PROJECT_ERR" || fail "project critical refusal does not name the finding count"
+grep -Fq 'osv/grype 1' "$PROJECT_ERR" || fail "project critical refusal does not attribute the finding to a source"
 grep -Fq 'GHSA-test-crit' "$PROJECT_OUT" || fail "project summary omits the critical advisory id"
 
 PROJECT_ARGS=(--yes)
@@ -216,8 +222,13 @@ PROJECT_ARGS=(--yes)
 project_case ecosystem-critical 104 "$project_dir" env \
   SAFE_AUDIT_STUB_SCAN_VERDICT=WARN \
   SAFE_AUDIT_STUB_SCAN_ECO_CRITICAL=2 \
-  SAFE_AUDIT_STUB_ECOSYSTEM_AUDITS='[{"scanner":"npm-audit","status":"ok","total":2,"critical":2,"high":0,"medium":0,"low":0,"note":null}]'
-grep -Fq 'critical finding(s)' "$PROJECT_ERR" || fail "ecosystem-only critical was not refused as critical"
+  SAFE_AUDIT_STUB_ECOSYSTEM_AUDITS='[{"scanner":"npm-audit","status":"ok","total":2,"critical":2,"high":0,"medium":0,"low":0,"unknown":0,"note":null}]' \
+  SAFE_AUDIT_STUB_ECO_TOTALS='[{"scanner":"npm-audit","total":2,"critical":2,"high":0,"medium":0,"low":0,"unknown":0}]'
+grep -Fq 'critical advisories' "$PROJECT_ERR" || fail "ecosystem-only critical was not refused as critical"
+# The refusal names WHICH scanner saw it: a summed number would double-count
+# an advisory that osv, grype and npm audit all report.
+grep -Fq 'npm-audit 2' "$PROJECT_ERR" || fail "critical refusal does not attribute the finding to a scanner"
+grep -Fq 'ecosystem: npm-audit' "$PROJECT_OUT" || fail "project summary omits the per-scanner breakdown"
 
 # A BLOCK verdict is a refusal even when the CVE counts are zero.
 PROJECT_ARGS=(--yes)

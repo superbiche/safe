@@ -135,22 +135,58 @@ scored verdicts differently, is a miss. A malformed entry never aborts the scan
 it was meant to accelerate — the failure mode of a cache must be slowness, not
 an error a caller reads as "the scan failed".
 
-Two inputs are deliberately outside the key:
+A result is stored only when the scanner set that produced it is fully
+represented by the key. Nothing is cached when:
 
-- **Go source.** `govulncheck` analyses `./...`, not just `go.mod`/`go.sum`, so
-  a result that includes a govulncheck run is never stored at all.
-- **Advisory databases.** OSV and the ecosystem audits consult live data that
-  can gain an advisory while an entry is still fresh. That window is exactly
-  the TTL, and it is the price of the cache: lower
-  `SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS`, or pass `--no-cache`, when a scan must
-  reflect advisories published in the last hours. A replay always says so on
-  stdout, with the entry's age.
+- **govulncheck is involved at all.** It analyses `./...` — Go source, which no
+  evidence hash covers. That holds even when it was merely absent, so
+  installing it later is never masked by a replay of the run that lacked it.
+- **any ecosystem audit did not return `ok`**, or any of osv-scanner, syft and
+  grype is in a non-ok state. Missing coverage is not a cacheable answer.
+- **the project holds evidence that discovery did not hash** — a lockfile that
+  exists as a symlink, say, which `npm audit` reads but the file walk skips.
+
+One input remains deliberately outside the key: **advisory databases**. OSV and
+the ecosystem audits consult live data that can gain an advisory while an entry
+is still fresh. That window is exactly the TTL, and it is the price of the
+cache: lower `SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS`, or pass `--no-cache`, when a
+scan must reflect advisories published in the last hours. A replay always says
+so on stdout, with the entry's age.
 
 Evidence is re-hashed after the scanners finish: if a lockfile or manifest
 changed while they ran, the result describes bytes that are no longer on disk
 and is not cached. A file that is swapped out and restored inside that same
 window is not detected — the residual is the same class as absolute-path
 invocation, documented in [Install Wrappers](install-wrappers.md).
+
+Evidence paths enter the key relative to the scan root, so a remote scan —
+which stages its target into a fresh temporary directory on every run — hits
+the cache like a local one.
+
+### Ecosystem audits and `audit_totals`
+
+Beside osv-scanner and grype, a scan runs each ecosystem's own auditor in the
+project root: `npm audit`, `composer audit`, `cargo audit`, `govulncheck`,
+`pip-audit`. Each reports in its own shape, and safe normalizes them to one
+record with per-severity counts. Three rules govern that normalization:
+
+- A scanner's **exit status is not trusted alone** — npm audit and pip-audit
+  exit nonzero when they *find* something. Output that parses as a result is a
+  result; anything else (empty, HTML from a proxy, an unknown shape) is
+  `status: "error"`. "Ran, failed, found nothing" is never reported, because it
+  is indistinguishable from a clean project.
+- Counts are **advisories, not dependencies**. pip-audit lists every dependency
+  with its own `vulns`, and composer keys advisories by package.
+- A severity that cannot be determined is `unknown`, never `medium`.
+  cargo-audit advisories usually carry only a CVSS vector, which safe scores.
+
+`audit_totals` is the aggregate every gating consumer reads: the CVE scan plus
+each ecosystem audit that returned `ok`, with a per-scanner breakdown under
+`.audit_totals.ecosystem`. These are **scanner reports, not distinct
+advisories** (`deduplicated: false`): only osv and grype carry comparable ids,
+so one advisory seen by three scanners counts three times. The aggregate
+answers "is there a critical anywhere", which double counting cannot change;
+anything showing a number to a human shows the per-scanner breakdown instead.
 
 ### `--result-out <file>`
 

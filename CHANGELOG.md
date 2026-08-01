@@ -36,10 +36,30 @@
   instead of a full scanner run.
 
 - Scan results carry `audit_totals`: the CVE-scan counts plus every ecosystem
-  audit that ran (`npm audit`, `composer audit`, `cargo-audit`, `govulncheck`).
-  Those advisory counts previously reached the result document but no verdict —
-  a critical only `npm audit` saw left the scan at `GO`. The verdict and
-  `safe install --project` both read the aggregate now.
+  audit that ran (`npm audit`, `composer audit`, `cargo-audit`, `govulncheck`,
+  `pip-audit`), with a per-scanner breakdown. Those advisory counts previously
+  reached the result document but no verdict — a critical only `npm audit` saw
+  left the scan at `GO`. The verdict and `safe install --project` both read the
+  aggregate now. The counts are scanner *reports*, not deduplicated advisories
+  (only osv and grype carry comparable ids), so anything shown to a human is
+  broken down per source rather than summed.
+
+- Ecosystem audits are normalized properly, which wiring them into the verdict
+  made load-bearing. Previously every runner emitted `status:"ok"` regardless
+  of what happened: a scanner that could not reach its advisory database was
+  reported as a successful zero-finding scan — indistinguishable from a clean
+  project. Now each runner keeps the exit status and validates the output
+  shape, and unreadable output is `status:"error"` (which also makes the scan
+  verdict `WARN` and blocks caching). Counts moved from containers to
+  advisories: `pip-audit` lists one entry per *dependency* with its advisories
+  under `vulns`, so a clean Python project used to score one `medium` per
+  installed package; `composer audit` keys advisories by package, so its
+  findings were invisible; `cargo audit` severities now come from the CVSS
+  vector RustSec actually ships; `govulncheck` findings are deduplicated by
+  OSV id. A severity that cannot be determined counts as `unknown` — it warns,
+  it does not invent a band. An unrecognized scanner name is a configuration
+  error rather than a silent skip. The remote scan helper carries the same
+  normalizers, and a test compares the two copies verbatim.
 
 - Scan cache hardening. An entry stores its schema, key, machine, target and
   mode, and every field is validated against the current request before replay,
@@ -51,8 +71,14 @@
   Evidence is re-hashed after the scanners finish, so a result whose lockfiles
   changed mid-scan is not filed under the key those lockfiles produced. Results
   including a `govulncheck` run are never cached at all: it reads Go source,
-  which no evidence hash covers. A malformed TTL disables the cache rather than
-  silently defaulting.
+  which no evidence hash covers. Nor is anything cached when an ecosystem or
+  core scanner did not return `ok` (missing coverage is not a cacheable
+  answer), or when a project holds known evidence that discovery did not hash
+  — a symlinked lockfile, for instance, which `npm audit` reads and the file
+  walk skips. `npm-shrinkwrap.json` is recognized as evidence. Evidence paths
+  enter the key relative to the scan root, so a remote scan (staged into a
+  fresh temporary directory every run) can hit the cache at all. A malformed
+  TTL disables the cache rather than silently defaulting.
 
 - `safe audit scan --result-out <file>` hands the caller its own copy of the
   result document, and scans now assemble that document privately before
@@ -70,7 +96,11 @@
   string refuses instead of being treated as acceptable, and a missing
   `safe audit` refuses with the `BLOCKED` contract rather than a bare exit 1.
   Scanner diagnostics go to a log file named in the refusal, keeping refusals
-  to the contractual single stderr line.
+  to the contractual single stderr line — as does the audit-log write, whose
+  own failure could previously add a second line. The refusal names the actual
+  failure (nonzero exit, absent result, unreadable verdict) rather than always
+  claiming no result was produced, and a critical refusal attributes the
+  advisories to the scanners that reported them.
 
 - Gate `mise` backend installs: `mise install`/`up`/`use`/`exec` previously
   installed registry packages (`npm:*`, `pipx:*`, `cargo:*`, `go:*` backends,
