@@ -52,6 +52,31 @@ Install that bundle on a target machine:
 safe audit setup local --bundle ./scanners.tar.gz
 ```
 
+### How a scanner is resolved
+
+A scanner that does not resolve is reported missing, and a missing scanner
+degrades the verdict to WARN — which looks exactly like a finding. Because
+callers routinely arrive with a PATH that is not the machine's (agents, CI
+steps, Makefile recipes, `bash -c` children), resolution goes through three
+steps in this order:
+
+1. **The caller's PATH.** An explicit PATH is an expressed preference: a mise
+   shim, a project-local build or a test mock must keep winning.
+2. **The machine's tool cache** (`~/.config/safe/audit/tools.json`), which
+   records the absolute path of each scanner found at detection time. This is
+   the step that makes a trimmed PATH survivable.
+3. **The standard install directories** — `~/.local/bin`, `~/.npm-global/bin`,
+   `~/go/bin`, `~/.cargo/bin`, `~/.local/share/mise/shims` — for a scanner
+   installed since the last detection.
+
+Detection (`safe audit setup`, and the automatic refresh) probes the same
+directories, and it never erases a cached path that still resolves to an
+executable file. Without that, a single probe from a trimmed environment would
+rewrite the machine's cache to nulls and every later scan would report the
+scanners missing until someone refreshed by hand. A tool that genuinely
+disappeared is still dropped: claiming coverage safe does not have is the worse
+failure.
+
 ## Project And Machine Scans
 
 Local project scan:

@@ -15,6 +15,12 @@ GATE_LIB_TARGET="$CONFIG_BASE/gate-lib.sh"
 # `safe gate`; all routing lives in gate-lib.sh, so upgrading safe upgrades the
 # gate without rewriting a single wrapper.
 GATE_TOOLS=(npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise)
+# Tools installed at exactly the path their wrapper must occupy, so the only
+# way to gate them is to move the real binary to <tool>.original.
+GATE_DISPLACE_TOOLS=(uv)
+# Tools whose wrapper could not be written. Non-empty means the install did not
+# achieve what it was asked to, and the exit status must say so.
+GATE_WRAPPER_FAILURES=()
 COMPLETION_DIR="${SAFE_ZSH_COMPLETION_DIR:-$HOME/.local/share/zsh/site-functions}"
 COMPLETION_TARGET="$COMPLETION_DIR/_safe"
 ZSHRC="${SAFE_ZSHRC:-$HOME/.zshrc}"
@@ -133,29 +139,96 @@ gate_wrappers_exist() {
 # PATH wrappers are what makes gating work in every shell (bash -c, Makefiles,
 # CI, agent harnesses), not just an interactive zsh. A pre-existing file
 # without our marker is somebody else's binary: report it and leave it alone.
-install_gate_wrappers() {
-  local tool target
-  local -a written=() skipped=()
+gate_tool_displaceable() {
+  local tool="$1" candidate
+  for candidate in "${GATE_DISPLACE_TOOLS[@]}"; do
+    [[ "$candidate" == "$tool" ]] && return 0
+  done
+  return 1
+}
 
-  mkdir -p "$BIN_DIR"
-  for tool in "${GATE_TOOLS[@]}"; do
-    target="$BIN_DIR/$tool"
-    if [[ -e "$target" || -L "$target" ]] && ! gate_wrapper_marked "$target" "$tool"; then
-      skipped+=("$tool")
-      continue
-    fi
-    rm -f "$target"
-    cat > "$target" <<EOF
+write_gate_wrapper() {
+  local target="$1" tool="$2"
+  cat > "$target" <<EOF || return 1
 #!/usr/bin/env bash
 # safe-gate-wrapper v1 tool=${tool}
 exec safe gate ${tool} -- "\$@"
 EOF
-    chmod 0755 "$target"
-    written+=("$tool")
+  chmod 0755 "$target" || return 1
+}
+
+install_gate_wrappers() {
+  local tool target moved
+  local -a written=() skipped=() displaced=() conflicted=() failed=()
+
+  mkdir -p "$BIN_DIR"
+  for tool in "${GATE_TOOLS[@]}"; do
+    target="$BIN_DIR/$tool"
+    moved=""
+    if [[ -e "$target" || -L "$target" ]] && ! gate_wrapper_marked "$target" "$tool"; then
+      # For most tools an unmarked file is somebody else's binary and the tool
+      # goes ungated. For a tool whose ONLY installation sits at exactly the
+      # path the wrapper needs, that rule means it can never be gated at all —
+      # uv installs itself to $BIN_DIR/uv, so skipping left `uv add`/`uv sync`
+      # permanently outside the gate. Those tools are moved aside instead, and
+      # safe_gate_resolve_real falls back to <tool>.original: the convention
+      # already in use for uvx.
+      if gate_tool_displaceable "$tool" && [[ -f "$target" && ! -L "$target" ]]; then
+        if [[ -e "$target.original" || -L "$target.original" ]]; then
+          # Never clobber: an existing .original means either a prior
+          # displacement whose wrapper was overwritten (a self-update), or a
+          # foreign file. Leave both alone and say the tool is ungated.
+          conflicted+=("$tool")
+          skipped+=("$tool")
+          continue
+        fi
+        if ! mv -- "$target" "$target.original"; then
+          skipped+=("$tool")
+          continue
+        fi
+        moved="$target.original"
+      else
+        skipped+=("$tool")
+        continue
+      fi
+    fi
+    rm -f "$target"
+    if write_gate_wrapper "$target" "$tool"; then
+      [[ -n "$moved" ]] && displaced+=("$tool")
+      written+=("$tool")
+    else
+      # The displacement is only complete once the wrapper is on disk and
+      # executable. If the write or the chmod fails — a full filesystem, an I/O
+      # error — the user is left with a truncated `uv` and their real binary
+      # stranded at uv.original, and every later `uv` call breaks until they
+      # find it. Undo both halves: a failed install must never cost the
+      # operator their tool.
+      rm -f "$target"
+      if [[ -n "$moved" ]] && ! mv -- "$moved" "$target"; then
+        warn "could not restore $moved to $target — the real $tool binary is at $moved"
+      fi
+      failed+=("$tool")
+    fi
   done
 
   if [[ "${#written[@]}" -gt 0 ]]; then
     info "installed gate wrappers in $BIN_DIR: ${written[*]}"
+  fi
+  if [[ "${#displaced[@]}" -gt 0 ]]; then
+    info "moved real binaries aside to <tool>.original and gated them: ${displaced[*]}"
+  fi
+  if [[ "${#failed[@]}" -gt 0 ]]; then
+    warn "could not write gate wrappers for: ${failed[*]} — nothing was left half-installed, and these tools stay ungated"
+    # Remembered, not raised here: the remaining install steps still run so the
+    # machine is left in the most complete state we can reach. The exit status
+    # is settled at the end. Before the rollback existed, `set -e` turned a
+    # failed wrapper write into a non-zero exit; swallowing it would tell
+    # automation, and an operator reading $?, that gating is active when it is
+    # not.
+    GATE_WRAPPER_FAILURES=("${failed[@]}")
+  fi
+  if [[ "${#conflicted[@]}" -gt 0 ]]; then
+    warn "found an existing <tool>.original for: ${conflicted[*]} — left it and the current binary untouched, so these stay ungated"
   fi
   if [[ "${#skipped[@]}" -gt 0 ]]; then
     warn "kept existing non-safe files, gating NOT active for: ${skipped[*]} (remove them and re-run to gate these tools)"
@@ -480,3 +553,8 @@ info "  2. Run: safe run link"
 info "  3. Review: $AUDIT_CONFIG_DIR/machines.json"
 info "  4. Run: safe audit setup"
 info "  5. Verify: safe status"
+
+if [[ "${#GATE_WRAPPER_FAILURES[@]}" -gt 0 ]]; then
+  err "gate wrappers could not be installed for: ${GATE_WRAPPER_FAILURES[*]} — these tools are NOT gated"
+  exit 1
+fi

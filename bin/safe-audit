@@ -185,10 +185,40 @@ terminate_descendants() {
   kill -KILL $pids 2>/dev/null || true
 }
 
+# Every scratch directory this process created, so one cleanup can remove them
+# all. Call sites used to rm their own, and seven scan paths simply did not —
+# any early return, refusal or die() left the tree behind. The leak was
+# unbounded rather than cosmetic: 1382 orphaned scan scratches accumulated on
+# one workstation, scanner bundles among them at hundreds of megabytes each,
+# until /tmp hit its quota and every suite failed at once.
+SAFE_AUDIT_SCRATCH_DIRS=()
+
+# Usage: new_scratch_dir <varname>. The path comes back through a named
+# variable rather than stdout on purpose: `dir=$(new_scratch_dir)` would run
+# the function in a command-substitution subshell, the registry append would
+# die with it, and cleanup would silently do nothing — which is the failure
+# mode this whole mechanism exists to prevent.
+new_scratch_dir() {
+  local __scratch_out_var="$1" __scratch_dir
+  __scratch_dir=$(mktemp -d) || return 1
+  SAFE_AUDIT_SCRATCH_DIRS+=("$__scratch_dir")
+  printf -v "$__scratch_out_var" '%s' "$__scratch_dir"
+}
+
+remove_scratch_dirs() {
+  local dir
+  for dir in ${SAFE_AUDIT_SCRATCH_DIRS[@]+"${SAFE_AUDIT_SCRATCH_DIRS[@]}"}; do
+    [[ -n "$dir" && -d "$dir" ]] || continue
+    rm -rf "$dir"
+  done
+  SAFE_AUDIT_SCRATCH_DIRS=()
+}
+
 handle_interrupt() {
   trap - INT TERM EXIT
   warn "interrupted; stopping active child processes"
   terminate_descendants
+  remove_scratch_dirs
   exit 130
 }
 
@@ -196,6 +226,7 @@ handle_exit() {
   local rc=$?
   trap - EXIT
   terminate_descendants
+  remove_scratch_dirs
   exit "$rc"
 }
 
@@ -599,7 +630,7 @@ extract_sigstore_bundle_metadata() {
   [[ -n "$raw_bytes" ]] || return 0
 
   local scratch cert_der cert_pem san_dump subject issuer emails_json uris_json
-  scratch=$(mktemp -d)
+  new_scratch_dir scratch
   cert_der="$scratch/cert.der"
   cert_pem="$scratch/cert.pem"
   san_dump="$scratch/san.txt"
@@ -703,7 +734,7 @@ trim_trailing_crlf_from_file() {
 files_match_after_trimming_newlines() {
   local left_path="$1" right_path="$2"
   local scratch left_trimmed right_trimmed left_sha right_sha left_size right_size
-  scratch=$(mktemp -d)
+  new_scratch_dir scratch
   left_trimmed="$scratch/left"
   right_trimmed="$scratch/right"
   trim_trailing_crlf_from_file "$left_path" "$left_trimmed"
@@ -1038,6 +1069,56 @@ tool_cache_path() {
   jq -r --arg m "$1" --arg t "$2" '.[$m][$t] // empty' "$TOOLS_FILE" 2>/dev/null || true
 }
 
+# The directories a scanner is expected to live in on a machine safe manages.
+#
+# A caller's PATH is not the machine's PATH. Agents, CI steps, Makefiles and
+# `bash -c` children routinely run with a trimmed PATH that resolves none of
+# these — and a scanner that does not resolve is reported missing, which
+# degrades the verdict to WARN. The failure is silent and it looks exactly
+# like a real finding, so every local resolution and the detection probe
+# itself go through this set rather than the caller's bare PATH.
+TOOL_PROBE_DIRS=(
+  "$HOME/.local/bin"
+  "$HOME/.npm-global/bin"
+  "$HOME/go/bin"
+  "$HOME/.cargo/bin"
+  "$HOME/.local/share/mise/shims"
+)
+
+# Appended, never prepended: PATH order is the caller's expressed preference,
+# and a test harness, a mise shim or a project-local build that puts a scanner
+# earlier must keep winning. These directories are the fallback for a PATH that
+# resolves nothing, not an override of one that does.
+tool_probe_path() {
+  local IFS=':'
+  printf '%s:%s' "$PATH" "${TOOL_PROBE_DIRS[*]}"
+}
+
+# Resolve a tool on the local machine, in order of what the answer means:
+#
+#   1. the caller's PATH — an explicit PATH is an expressed preference, and a
+#      mise shim, a test mock or a project-local build must keep winning;
+#   2. tools.json — the absolute path captured when the machine was detected.
+#      This is the step that makes a trimmed PATH survivable: without it, an
+#      agent or CI step whose PATH resolves no scanner gets "tool missing",
+#      which degrades the verdict to WARN and reads exactly like a finding;
+#   3. the standard install directories, for a tool added since detection.
+resolve_local_tool() {
+  local tool="$1" machine="${2:-}" found cached
+  found="$(command -v "$tool" 2>/dev/null || true)"
+  if [[ -n "$found" ]]; then
+    printf '%s' "$found"
+    return 0
+  fi
+  [[ -n "$machine" ]] || machine=$(detect_local_machine_name)
+  cached=$(tool_cache_path "$machine" "$tool")
+  if [[ -n "$cached" && -x "$cached" ]]; then
+    printf '%s' "$cached"
+    return 0
+  fi
+  PATH="$(tool_probe_path)" command -v "$tool" 2>/dev/null || printf ''
+}
+
 tool_cache_set() {
   local machine="$1"
   local entry_json="$2"
@@ -1068,9 +1149,12 @@ detect_machine_tools() {
     return 0
   fi
 
+  # Probes the same directory set as tool_probe_path. Detection runs remotely
+  # too, so the list is spelled out here rather than shared through the array —
+  # keep the two in sync.
   local output
   output=$(run_machine_capture "$machine" '
-PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+PATH="$PATH:$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/go/bin:$HOME/.cargo/bin:$HOME/.local/share/mise/shims"
 for t in osv-scanner grype syft govulncheck cargo-audit pip-audit socket; do
   if command -v "$t" >/dev/null 2>&1; then
     printf "%s\t%s\n" "$t" "$(command -v "$t")"
@@ -1093,6 +1177,39 @@ done
       socket) socket="$path" ;;
     esac
   done <<<"$output"
+
+  # A detection that found nothing must not erase a path that still works.
+  # Otherwise one probe from a trimmed environment — an agent, a CI step, a
+  # `bash -c` child — rewrites the machine's cache to nulls, and every later
+  # scan reports the scanners missing until someone refreshes by hand. Only
+  # the local machine can be checked this way; a remote tool that stopped
+  # resolving is genuinely gone as far as this host can tell.
+  if [[ "$(machine_type "$machine")" == "local" ]]; then
+    local kept
+    for tool in osv-scanner grype syft govulncheck cargo-audit pip-audit socket; do
+      case "$tool" in
+        osv-scanner) [[ -n "$osv" ]] && continue ;;
+        grype) [[ -n "$grype" ]] && continue ;;
+        syft) [[ -n "$syft" ]] && continue ;;
+        govulncheck) [[ -n "$govulncheck" ]] && continue ;;
+        cargo-audit) [[ -n "$cargo_audit" ]] && continue ;;
+        pip-audit) [[ -n "$pip_audit" ]] && continue ;;
+        socket) [[ -n "$socket" ]] && continue ;;
+      esac
+      kept=$(tool_cache_path "$machine" "$tool")
+      [[ -n "$kept" && -x "$kept" ]] || continue
+      vinfo "$machine: detection missed $tool; keeping cached $(printf '%q' "$kept")"
+      case "$tool" in
+        osv-scanner) osv="$kept" ;;
+        grype) grype="$kept" ;;
+        syft) syft="$kept" ;;
+        govulncheck) govulncheck="$kept" ;;
+        cargo-audit) cargo_audit="$kept" ;;
+        pip-audit) pip_audit="$kept" ;;
+        socket) socket="$kept" ;;
+      esac
+    done
+  fi
 
   tool_cache_set "$machine" "$(build_tool_entry_json "$osv" "$grype" "$syft" "$govulncheck" "$cargo_audit" "$pip_audit" "$socket")"
 }
@@ -1758,28 +1875,14 @@ confirm_scan_with_missing_project_audit_tools() {
   esac
 }
 
-tool_available_local() {
-  command -v "$1" >/dev/null 2>&1
-}
-
 scanner_path_for_machine() {
   local machine="$1" tool="$2"
-  local path
-  path=$(tool_cache_path "$machine" "$tool")
-  if [[ "$(machine_type "$machine")" == "local" && -n "$path" && -x "$path" ]]; then
-    printf '%s' "$path"
-  elif [[ "$(machine_type "$machine")" == "local" ]] && command -v "$tool" >/dev/null 2>&1; then
-    command -v "$tool"
-  fi
+  [[ "$(machine_type "$machine")" == "local" ]] || return 0
+  resolve_local_tool "$tool" "$machine"
 }
 
 local_scanner_path() {
-  local tool="$1"
-  if command -v "$tool" >/dev/null 2>&1; then
-    command -v "$tool"
-  else
-    printf ''
-  fi
+  resolve_local_tool "$1"
 }
 
 osv_scan_output_valid() {
@@ -3107,7 +3210,7 @@ scan_source_into_result() {
   esac
 
   local scratch osv_json grype_json sbom_tmp audits_tmp source_scan_tmp syft_source
-  scratch=$(mktemp -d)
+  new_scratch_dir scratch
   vinfo "$machine: scan scratch=$(printf '%q' "$scratch")"
   osv_json="$scratch/osv.json"
   grype_json="$scratch/grype.json"
@@ -3184,7 +3287,7 @@ scan_source_with_external_sbom_into_result() {
     *) return "$project_tools_rc" ;;
   esac
 
-  scratch=$(mktemp -d)
+  new_scratch_dir scratch
   vinfo "$machine: scan scratch=$(printf '%q' "$scratch") local_scanner_machine=$local_machine"
   osv_json="$scratch/osv.json"
   grype_json="$scratch/grype.json"
@@ -4070,8 +4173,8 @@ scan_remote_with_local_bundles_into_result() {
   local host scratch remote_tmp rc source
   local statuses=()
   host=$(machine_host "$machine")
-  scratch=$(mktemp -d)
-  source=$(mktemp -d)
+  new_scratch_dir scratch
+  new_scratch_dir source
   vinfo "$machine: trying tunneled remote scan target=$(printf '%q' "$target") host=$(printf '%q' "$host")"
 
   remote_tmp=$(ssh_batch "$host" 'tmp=$(mktemp -d); mkdir -p "$tmp/bin"; printf "%s" "$tmp"')
@@ -4117,7 +4220,7 @@ scan_remote_direct_into_result() {
   local host scratch rc
   local statuses=()
   host=$(machine_host "$machine")
-  scratch=$(mktemp -d)
+  new_scratch_dir scratch
   vinfo "$machine: trying remote direct scan target=$(printf '%q' "$target") host=$(printf '%q' "$host")"
 
   set +e
@@ -4178,7 +4281,7 @@ scan_machine() {
     if machine_supports_remote_tunneled_scan "$machine" && scan_remote_with_local_bundles_into_result "$machine" "$target" "$scan_mode" "$allow_source_fallback"; then
       return 0
     fi
-    source=$(mktemp -d)
+    new_scratch_dir source
     gather_stage_remotely "$machine" "$target" "$source" "$scan_mode" "$allow_source_fallback"
     strategy="ssh-stage-local"
     vinfo "$machine: using staged remote scan source=$(printf '%q' "$source")"
@@ -4186,12 +4289,12 @@ scan_machine() {
     if scan_remote_with_local_bundles_into_result "$machine" "$target" "$scan_mode" "$allow_source_fallback"; then
       return 0
     fi
-    source=$(mktemp -d)
+    new_scratch_dir source
     gather_stage_remotely "$machine" "$target" "$source" "$scan_mode" "$allow_source_fallback"
     strategy="ssh-stage-local"
     vinfo "$machine: using staged remote scan source=$(printf '%q' "$source")"
   else
-    source=$(mktemp -d)
+    new_scratch_dir source
     gather_stage_remotely "$machine" "$target" "$source" "$scan_mode" "$allow_source_fallback"
     strategy="ssh-stage-local"
     vinfo "$machine: using staged remote scan source=$(printf '%q' "$source")"
@@ -4255,7 +4358,11 @@ blocked_entry_reason() {
 socket_score_json() {
   local ecosystem="$1" spec="$2" output="$3"
   local socket_cmd
-  socket_cmd=$(PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH" command -v socket 2>/dev/null || true)
+  # Resolved through the tool cache, not a bespoke PATH: socket is commonly a
+  # mise shim, which the old two-directory prepend never covered, so a caller
+  # whose PATH lacked the shim dir got "socket CLI not available" — a WARN
+  # that reads like a supply-chain signal rather than a missing binary.
+  socket_cmd=$(resolve_local_tool socket)
   if [[ -z "$socket_cmd" ]]; then
     printf '{"available":false,"status":"skipped","note":"socket CLI not available"}\n' > "$output"
     return 0
@@ -5592,7 +5699,7 @@ check_command() {
   esac
 
   local scratch socket_json osv_json block_reason verdict socket_line osv_line block_line
-  scratch=$(mktemp -d)
+  new_scratch_dir scratch
   socket_json="$scratch/socket.json"
   osv_json="$scratch/osv.json"
 
@@ -6006,7 +6113,7 @@ release_github_command() {
 
   local subject="github:${repo}@${version}#${asset}"
   local scratch checks_file reasons_file data_file
-  scratch=$(mktemp -d)
+  new_scratch_dir scratch
   checks_file="$scratch/checks.jsonl"
   reasons_file="$scratch/reasons.jsonl"
   data_file="$scratch/data.json"
@@ -6261,7 +6368,7 @@ vuln_github_release_command() {
 
   local subject="github:${repo}@${version}"
   local scratch checks_file reasons_file data_file advisories_json findings_file
-  scratch=$(mktemp -d)
+  new_scratch_dir scratch
   checks_file="$scratch/checks.jsonl"
   reasons_file="$scratch/reasons.jsonl"
   data_file="$scratch/data.json"
@@ -6466,7 +6573,7 @@ verify_release_asset_command() {
 
   local subject="release-asset:${artifact_abs}"
   local scratch checks_file reasons_file data_file cosign_output
-  scratch=$(mktemp -d)
+  new_scratch_dir scratch
   checks_file="$scratch/checks.jsonl"
   reasons_file="$scratch/reasons.jsonl"
   data_file="$scratch/data.json"
@@ -6650,7 +6757,7 @@ verify_sigstore_bundle_command() {
   local subject="sigstore-bundle:${artifact_abs}"
   local scratch checks_file reasons_file data_file bundle_meta_file
   local cosign_main_output cosign_any_output cosign_identity_output cosign_issuer_output
-  scratch=$(mktemp -d)
+  new_scratch_dir scratch
   checks_file="$scratch/checks.jsonl"
   reasons_file="$scratch/reasons.jsonl"
   data_file="$scratch/data.json"
@@ -6831,7 +6938,7 @@ verify_tuf_bootstrap_command() {
   local effective_mirror_url=""
   local subject="tuf-bootstrap:${root_abs}"
   local scratch checks_file reasons_file data_file cosign_output
-  scratch=$(mktemp -d)
+  new_scratch_dir scratch
   checks_file="$scratch/checks.jsonl"
   reasons_file="$scratch/reasons.jsonl"
   data_file="$scratch/data.json"
@@ -7201,7 +7308,7 @@ binary_exec_command() {
   artifact_abs=$(absolute_path "$artifact")
   local subject="binary:${artifact_abs}"
   local scratch checks_file reasons_file data_file stdout_file stderr_file
-  scratch=$(mktemp -d)
+  new_scratch_dir scratch
   checks_file="$scratch/checks.jsonl"
   reasons_file="$scratch/reasons.jsonl"
   data_file="$scratch/data.json"
@@ -7651,7 +7758,7 @@ create_scanner_bundle() {
   local bundle_path="$1"
   [[ -n "$bundle_path" ]] || bundle_path="$DEFAULT_SCANNER_BUNDLE_PATH"
   local scratch bin_dir manifest
-  scratch=$(mktemp -d)
+  new_scratch_dir scratch
   bin_dir="$scratch/bin"
   manifest="$scratch/manifest.json"
   mkdir -p "$bin_dir" "$(dirname "$bundle_path")"

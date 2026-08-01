@@ -103,15 +103,25 @@ gate_wrapper_marked() {
 }
 
 removed_wrappers=()
+restored_originals=()
 for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise; do
   if gate_wrapper_marked "$BIN_DIR/$tool" "$tool"; then
     rm -f "$BIN_DIR/$tool"
     removed_wrappers+=("$tool")
+    # A displaced binary is put back where its owner installed it. Removing the
+    # wrapper without this would uninstall the tool itself, not just the gate.
+    if [[ -f "$BIN_DIR/$tool.original" && ! -L "$BIN_DIR/$tool.original" ]]; then
+      mv -- "$BIN_DIR/$tool.original" "$BIN_DIR/$tool"
+      restored_originals+=("$tool")
+    fi
   fi
 done
 rm -f "$CONFIG_BASE/gate-lib.sh"
 if [[ "${#removed_wrappers[@]}" -gt 0 ]]; then
   info "removed gate wrappers: ${removed_wrappers[*]}"
+fi
+if [[ "${#restored_originals[@]}" -gt 0 ]]; then
+  info "restored displaced binaries: ${restored_originals[*]}"
 fi
 
 if [[ -f "$ZSHRC" ]]; then

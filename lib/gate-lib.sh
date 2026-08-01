@@ -101,6 +101,7 @@ safe_gate_is_wrapper() {
 # want: per-project tool versions keep resolving.
 safe_gate_resolve_real() {
   local tool="$1" dir candidate
+  local displaced=""
   local -a dirs=()
 
   IFS=':' read -r -a dirs <<< "${PATH}"
@@ -108,12 +109,23 @@ safe_gate_resolve_real() {
     [[ -n "$dir" ]] || dir="."
     candidate="${dir}/${tool}"
     [[ -f "$candidate" && -x "$candidate" ]] || continue
-    safe_gate_is_wrapper "$candidate" && continue
+    if safe_gate_is_wrapper "$candidate"; then
+      # A tool whose only installation sits at the path the wrapper occupies is
+      # moved to <tool>.original at install time (uv, which installs itself to
+      # ~/.local/bin/uv). Remember it and keep walking: a real tool further
+      # along PATH — a mise shim, say — must still win, so per-project versions
+      # are never overridden by the displaced copy.
+      if [[ -z "$displaced" && -f "${candidate}.original" && -x "${candidate}.original" ]]; then
+        displaced="${candidate}.original"
+      fi
+      continue
+    fi
     printf '%s\n' "$candidate"
     return 0
   done
 
-  return 1
+  [[ -n "$displaced" ]] || return 1
+  printf '%s\n' "$displaced"
 }
 
 # Delegate to the real tool. Never returns — except in audit-only mode
@@ -486,7 +498,17 @@ safe_gate_scan_project() {
   [[ -n "${scan_output}" ]] && printf '%s\n' "${scan_output}"
 
   local critical=0 broken="" have_verdict=0
-  if [[ -s "${result_file}" ]] && command -v jq >/dev/null 2>&1; then
+  # Non-empty is not the same as readable. Against a truncated or malformed
+  # document every jq expression below falls back to its default, and a
+  # defaulted 0 criticals with no broken scanners is indistinguishable from
+  # "scanned the project, found nothing" — the gate would report a clean
+  # verdict it never read. Require parseable JSON carrying the exact field
+  # the decision is made from; anything else is no verdict at all, which the
+  # have_verdict==0 branch already says out loud.
+  if [[ -s "${result_file}" ]] && command -v jq >/dev/null 2>&1 &&
+     jq -e 'type == "object"
+            and ((.audit_totals.critical? // .cve_scan.critical? // null) | type == "number")' \
+       "${result_file}" >/dev/null 2>&1; then
     have_verdict=1
     critical="$(jq -r '.audit_totals.critical // .cve_scan.critical // 0' "${result_file}" 2>/dev/null || printf '0')"
     [[ "${critical}" =~ ^[0-9]+$ ]] || critical=0
