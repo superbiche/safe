@@ -1392,7 +1392,11 @@ STUB
 
   PATH="${stubdir}:${PATH}" HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
   STATUS=$?
-  assert_status 0 "$FUNCNAME" || return
+  # An install that could not gate what it was asked to gate exits non-zero.
+  # Before the rollback existed, `set -e` did this; swallowing it would tell
+  # automation and an operator reading $? that gating is active when it is not.
+  assert_status 1 "$FUNCNAME" || return
+  assert_err_contains_fragment 'these tools are NOT gated' "$FUNCNAME" || return
 
   # uv is back where its owner put it, executable, with no wrapper and no
   # leftover .original — and the installer said so instead of claiming success.

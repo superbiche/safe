@@ -18,6 +18,9 @@ GATE_TOOLS=(npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise)
 # Tools installed at exactly the path their wrapper must occupy, so the only
 # way to gate them is to move the real binary to <tool>.original.
 GATE_DISPLACE_TOOLS=(uv)
+# Tools whose wrapper could not be written. Non-empty means the install did not
+# achieve what it was asked to, and the exit status must say so.
+GATE_WRAPPER_FAILURES=()
 COMPLETION_DIR="${SAFE_ZSH_COMPLETION_DIR:-$HOME/.local/share/zsh/site-functions}"
 COMPLETION_TARGET="$COMPLETION_DIR/_safe"
 ZSHRC="${SAFE_ZSHRC:-$HOME/.zshrc}"
@@ -216,6 +219,13 @@ install_gate_wrappers() {
   fi
   if [[ "${#failed[@]}" -gt 0 ]]; then
     warn "could not write gate wrappers for: ${failed[*]} — nothing was left half-installed, and these tools stay ungated"
+    # Remembered, not raised here: the remaining install steps still run so the
+    # machine is left in the most complete state we can reach. The exit status
+    # is settled at the end. Before the rollback existed, `set -e` turned a
+    # failed wrapper write into a non-zero exit; swallowing it would tell
+    # automation, and an operator reading $?, that gating is active when it is
+    # not.
+    GATE_WRAPPER_FAILURES=("${failed[@]}")
   fi
   if [[ "${#conflicted[@]}" -gt 0 ]]; then
     warn "found an existing <tool>.original for: ${conflicted[*]} — left it and the current binary untouched, so these stay ungated"
@@ -543,3 +553,8 @@ info "  2. Run: safe run link"
 info "  3. Review: $AUDIT_CONFIG_DIR/machines.json"
 info "  4. Run: safe audit setup"
 info "  5. Verify: safe status"
+
+if [[ "${#GATE_WRAPPER_FAILURES[@]}" -gt 0 ]]; then
+  err "gate wrappers could not be installed for: ${GATE_WRAPPER_FAILURES[*]} — these tools are NOT gated"
+  exit 1
+fi
