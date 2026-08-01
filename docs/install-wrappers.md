@@ -132,8 +132,14 @@ safe audit check <package>@<version> --ecosystem <ecosystem>
 Project-local installs run:
 
 ```bash
-safe audit scan --project .
+safe audit scan --deps-only --project .
 ```
+
+The preflight is deps-only on purpose: what an install is about to change is
+the dependency evidence, and that mode is the one the scan cache can replay, so
+a bare `npm ci` in an unchanged tree costs a cache hit rather than a full
+scanner run. The source-level risk scan a `--full` scan performs is not part of
+the preflight; run `safe audit scan --project .` for that.
 
 If `safe audit` is missing, wrappers warn once and continue. If package checks are available, package install checks fail closed: `WARN`, `BLOCK`, timeouts, and audit failures stop before the real install command runs.
 

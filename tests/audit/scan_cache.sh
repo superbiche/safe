@@ -31,6 +31,9 @@ for tool in osv-scanner grype syft govulncheck cargo-audit pip-audit socket; do
   cat > "$MOCKBIN/$tool" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$(basename -- "$0")" >> "${SCANNER_LOG:-/dev/null}"
+# Lets a case mutate the dependency evidence WHILE the scanners are running,
+# which is the window between key derivation and cache store.
+[[ -n "${MUTATE_TARGET:-}" && -f "${MUTATE_TARGET:-}" ]] && printf '\n' >> "$MUTATE_TARGET"
 case "$(basename -- "$0")" in
   osv-scanner) printf '{"results":[]}\n' ;;
   grype)       printf '{"matches":[]}\n' ;;
@@ -71,6 +74,8 @@ run_scan() {
       HOME="$CASE_HOME" \
       PATH="$MOCKBIN:/usr/bin:/bin" \
       SCANNER_LOG="$SCANNER_LOG" \
+      MUTATE_TARGET="${MUTATE_TARGET:-}" \
+      SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS="${SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS:-86400}" \
       SAFE_AUDIT_CONFIG_DIR="$CASE_DIR/audit-config" \
       SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
       "$SAFE_AUDIT" scan --deps-only --project . "$@"
@@ -88,6 +93,8 @@ run_scan_source_mode() {
       HOME="$CASE_HOME" \
       PATH="$MOCKBIN:/usr/bin:/bin" \
       SCANNER_LOG="$SCANNER_LOG" \
+      MUTATE_TARGET="${MUTATE_TARGET:-}" \
+      SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS="${SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS:-86400}" \
       SAFE_AUDIT_CONFIG_DIR="$CASE_DIR/audit-config" \
       SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
       "$SAFE_AUDIT" scan --project .
@@ -315,6 +322,184 @@ case_no_evidence_is_not_cacheable() {
   pass "$FUNCNAME"
 }
 
+# --------------------------------------------------------------------------
+# An entry is only replayable for the request that produced it, from a safe
+# that computes verdicts the same way. Everything else is a miss — never an
+# error, and never someone else's verdict.
+# --------------------------------------------------------------------------
+
+# edit_entry <jq program>
+edit_entry() {
+  local entry tmp
+  entry="$(cache_entry_path)"
+  [[ -n "$entry" ]] || return 1
+  tmp="$entry.tmp"
+  jq "$1" "$entry" > "$tmp" && mv "$tmp" "$entry"
+}
+
+# assert_miss_after_edit <label> <jq program>
+assert_miss_after_edit() {
+  local label="$1" program="$2"
+  edit_entry "$program" || { printf 'no cache entry to edit\n' >&2; fail "$label"; return 1; }
+  run_scan
+  # Exit status matters as much as the miss: a cache problem that aborts the
+  # scan reads to a PATH wrapper as "scan failed", and the wrapper's
+  # non-critical-failure branch then lets the install proceed unscanned.
+  [[ "$STATUS" -eq 0 ]] || { printf 'scan exited %s after cache edit\n%s\n' "$STATUS" "$(cat "$OUT_FILE")" >&2; fail "$label"; return 1; }
+  assert_no_hit "$label" || return 1
+  assert_scanners_ran "$label" || return 1
+  return 0
+}
+
+case_foreign_envelope_falls_through() {
+  prepare_case "foreign-envelope"
+  run_scan
+  run_scan
+  assert_hit "$FUNCNAME" || return
+
+  # A full, fresh, structurally perfect document that answers a DIFFERENT
+  # question: same file, wrong key.
+  assert_miss_after_edit "$FUNCNAME" '._cache.key = "wrong-key"' || return
+  run_scan
+  assert_hit "$FUNCNAME" || return
+  assert_miss_after_edit "$FUNCNAME" '._cache.target = "/somewhere/else"' || return
+  run_scan
+  assert_hit "$FUNCNAME" || return
+  assert_miss_after_edit "$FUNCNAME" '._cache.machine = "other-host"' || return
+  run_scan
+  assert_hit "$FUNCNAME" || return
+  assert_miss_after_edit "$FUNCNAME" '._cache.mode = "full"' || return
+  pass "$FUNCNAME"
+}
+
+case_schema_drift_falls_through() {
+  prepare_case "schema-drift"
+  run_scan
+  run_scan
+  assert_hit "$FUNCNAME" || return
+  # An entry written by a safe that scored verdicts differently.
+  assert_miss_after_edit "$FUNCNAME" '._cache.schema = 0' || return
+  run_scan
+  assert_hit "$FUNCNAME" || return
+  assert_miss_after_edit "$FUNCNAME" 'del(._cache.schema)' || return
+  pass "$FUNCNAME"
+}
+
+case_malformed_timestamp_falls_through() {
+  prepare_case "bad-timestamp"
+  run_scan
+  run_scan
+  assert_hit "$FUNCNAME" || return
+  # "08" is not a bash number in arithmetic context: read carelessly it aborts
+  # the scan instead of missing the cache.
+  assert_miss_after_edit "$FUNCNAME" '._cache.created_epoch = "08"' || return
+  run_scan
+  assert_hit "$FUNCNAME" || return
+  assert_miss_after_edit "$FUNCNAME" '._cache.created_epoch = "not-a-time"' || return
+  run_scan
+  assert_hit "$FUNCNAME" || return
+  # A timestamp from the future is a broken clock, not a fresh entry.
+  assert_miss_after_edit "$FUNCNAME" '._cache.created_epoch = (now + 86400 | floor)' || return
+  pass "$FUNCNAME"
+}
+
+case_invalid_verdict_falls_through() {
+  prepare_case "bad-verdict"
+  run_scan
+  run_scan
+  assert_hit "$FUNCNAME" || return
+  assert_miss_after_edit "$FUNCNAME" '.verdict = "MAYBE"' || return
+  run_scan
+  assert_hit "$FUNCNAME" || return
+  assert_miss_after_edit "$FUNCNAME" '.cve_scan.critical = "0"' || return
+  run_scan
+  assert_hit "$FUNCNAME" || return
+  assert_miss_after_edit "$FUNCNAME" 'del(.audit_totals)' || return
+  pass "$FUNCNAME"
+}
+
+case_invalid_ttl_disables_cache() {
+  prepare_case "bad-ttl"
+  SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS="abc" run_scan
+  [[ "$STATUS" -eq 0 ]] || { printf 'bad TTL broke the scan (exit %s)\n' "$STATUS" >&2; fail "$FUNCNAME"; return; }
+  [[ "$(cache_entries)" -eq 0 ]] || { printf 'stored an entry under an unusable TTL\n' >&2; fail "$FUNCNAME"; return; }
+  SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS="abc" run_scan
+  assert_no_hit "$FUNCNAME" || return
+  assert_scanners_ran "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_evidence_changed_during_scan_is_not_cached() {
+  prepare_case "evidence-race"
+  # The scanners mutate the lockfile while they run: the result describes
+  # bytes that are no longer on disk, so it must not be filed under the key
+  # those bytes produced.
+  MUTATE_TARGET="$CASE_PROJECT/package-lock.json" run_scan
+  [[ "$STATUS" -eq 0 ]] || { printf 'scan exited %s\n' "$STATUS" >&2; fail "$FUNCNAME"; return; }
+  [[ "$(cache_entries)" -eq 0 ]] || { printf 'cached a result whose evidence changed mid-scan\n' >&2; fail "$FUNCNAME"; return; }
+
+  # Once the evidence settles, the next scan caches normally.
+  run_scan
+  [[ "$(cache_entries)" -eq 1 ]] || { printf 'expected 1 entry after a settled scan, got %s\n' "$(cache_entries)" >&2; fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
+case_source_reading_scanner_is_not_cached() {
+  prepare_case "govulncheck"
+  # govulncheck reads ./... — Go source the evidence hash does not cover — so
+  # a Go project's result is never replayable.
+  rm -f "$CASE_PROJECT/package.json" "$CASE_PROJECT/package-lock.json"
+  printf 'module demo\n\ngo 1.22\n' > "$CASE_PROJECT/go.mod"
+  printf 'package main\n\nfunc main() {}\n' > "$CASE_PROJECT/main.go"
+  run_scan
+  [[ "$STATUS" -eq 0 ]] || { printf 'scan exited %s\n%s\n' "$STATUS" "$(cat "$OUT_FILE")" >&2; fail "$FUNCNAME"; return; }
+  grep -Fq 'govulncheck' "$SCANNER_LOG" || { printf 'govulncheck never ran; nothing was proven\n%s\n' "$(cat "$SCANNER_LOG")" >&2; fail "$FUNCNAME"; return; }
+  [[ "$(cache_entries)" -eq 0 ]] || { printf 'cached a result that read Go source\n' >&2; fail "$FUNCNAME"; return; }
+  run_scan
+  assert_no_hit "$FUNCNAME" || return
+  assert_scanners_ran "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_result_out_hands_back_a_private_copy() {
+  prepare_case "result-out"
+  local out="$CASE_DIR/result-copy.json"
+  run_scan --result-out "$out"
+  [[ -s "$out" ]] || { printf '--result-out wrote nothing\n' >&2; fail "$FUNCNAME"; return; }
+  jq -e '(.verdict | type) == "string" and ((.audit_totals.critical | type) == "number")' "$out" >/dev/null || {
+    printf '--result-out copy is not a result document:\n%s\n' "$(cat "$out")" >&2; fail "$FUNCNAME"; return; }
+
+  # A replay must hand back the same copy, or a caller that decides from the
+  # file would be reading a stale one from an earlier run.
+  local replayed="$CASE_DIR/result-copy-2.json"
+  run_scan --result-out "$replayed"
+  assert_hit "$FUNCNAME" || return
+  [[ -s "$replayed" ]] || { printf 'cache replay did not honor --result-out\n' >&2; fail "$FUNCNAME"; return; }
+  [[ "$(jq -r '.verdict' "$replayed")" == "$(jq -r '.verdict' "$out")" ]] || { fail "$FUNCNAME"; return; }
+
+  # An unwritable destination is refused before any scanning happens.
+  : > "$SCANNER_LOG"
+  run_scan --result-out "$CASE_DIR/nope/deeper/result.json"
+  [[ "$STATUS" -ne 0 ]] || { printf 'unwritable --result-out did not fail\n' >&2; fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
+case_ecosystem_audit_counts_reach_the_totals() {
+  prepare_case "audit-totals"
+  run_scan
+  local entry
+  entry="$(cache_entry_path)"
+  [[ -n "$entry" ]] || { fail "$FUNCNAME"; return; }
+  # audit_totals is the aggregate gating consumers read: it must exist and
+  # never sit below the CVE-scan counts it contains.
+  jq -e '
+    (.audit_totals | type) == "object"
+    and (.audit_totals.critical >= .cve_scan.critical)
+    and (.audit_totals.high >= .cve_scan.high)
+  ' "$entry" >/dev/null || { printf 'audit_totals missing or below cve_scan:\n%s\n' "$(jq -c '{audit_totals, cve_scan: {critical: .cve_scan.critical, high: .cve_scan.high}}' "$entry")" >&2; fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
 main() {
   local case
   for case in \
@@ -327,7 +512,16 @@ main() {
     case_expired_entry_falls_through \
     case_corrupt_entry_falls_through \
     case_missing_timestamp_falls_through \
-    case_no_evidence_is_not_cacheable
+    case_no_evidence_is_not_cacheable \
+    case_foreign_envelope_falls_through \
+    case_schema_drift_falls_through \
+    case_malformed_timestamp_falls_through \
+    case_invalid_verdict_falls_through \
+    case_invalid_ttl_disables_cache \
+    case_evidence_changed_during_scan_is_not_cached \
+    case_source_reading_scanner_is_not_cached \
+    case_result_out_hands_back_a_private_copy \
+    case_ecosystem_audit_counts_reach_the_totals
   do
     "$case"
   done

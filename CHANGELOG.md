@@ -35,6 +35,43 @@
   a bare `npm ci` / `pnpm install` in an unchanged tree costs a cache hit
   instead of a full scanner run.
 
+- Scan results carry `audit_totals`: the CVE-scan counts plus every ecosystem
+  audit that ran (`npm audit`, `composer audit`, `cargo-audit`, `govulncheck`).
+  Those advisory counts previously reached the result document but no verdict —
+  a critical only `npm audit` saw left the scan at `GO`. The verdict and
+  `safe install --project` both read the aggregate now.
+
+- Scan cache hardening. An entry stores its schema, key, machine, target and
+  mode, and every field is validated against the current request before replay,
+  so an entry belonging to another project — or written by a safe that scored
+  verdicts differently — misses instead of answering. Validation happens in a
+  single jq predicate: a malformed timestamp used to be read into bash
+  arithmetic, where `08` is a fatal error, which aborted the scan (exit 1) and
+  read to a PATH wrapper as a scan failure it was willing to proceed past.
+  Evidence is re-hashed after the scanners finish, so a result whose lockfiles
+  changed mid-scan is not filed under the key those lockfiles produced. Results
+  including a `govulncheck` run are never cached at all: it reads Go source,
+  which no evidence hash covers. A malformed TTL disables the cache rather than
+  silently defaulting.
+
+- `safe audit scan --result-out <file>` hands the caller its own copy of the
+  result document, and scans now assemble that document privately before
+  publishing it. The per-machine result path is one file per day: a concurrent
+  scan of another project could replace it between the scan and the read, so
+  `safe install --project` grades its own copy instead of parsing a path out of
+  the rendered summary.
+
+- `safe install --project` no longer swallows an install request. Combining it
+  with package arguments or with `-g`/`--host`/`--manager`/`--trust-host` is a
+  usage error instead of an audit-only exit 0 that installs nothing;
+  auto-detection applies only to a bare `safe install`. A scanner that ran and
+  failed now refuses with exit 100 naming the scanner and a recovery path
+  (`--yes` could previously accept it as an ordinary WARN), an unknown verdict
+  string refuses instead of being treated as acceptable, and a missing
+  `safe audit` refuses with the `BLOCKED` contract rather than a bare exit 1.
+  Scanner diagnostics go to a log file named in the refusal, keeping refusals
+  to the contractual single stderr line.
+
 - Gate `mise` backend installs: `mise install`/`up`/`use`/`exec` previously
   installed registry packages (`npm:*`, `pipx:*`, `cargo:*`, `go:*` backends,
   lifecycle scripts included) with no audit at all. A `mise` PATH wrapper now

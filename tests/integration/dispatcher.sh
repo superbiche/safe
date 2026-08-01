@@ -52,25 +52,50 @@ case "${1:-}" in
   scan)
     { printf 'safe-audit'; for arg in "$@"; do printf '\t%s' "$arg"; done; printf '\n'; } >> "${SAFE_AUDIT_STUB_SCAN_LOG:-/dev/null}"
     { printf 'safe-audit'; for arg in "$@"; do printf '\t%s' "$arg"; done; printf '\n'; }
+    # The caller receives its own copy through --result-out; the published
+    # per-day path is only ever a display string.
+    result_out=""
+    prev=""
+    for arg in "$@"; do
+      [[ "$prev" == "--result-out" ]] && result_out="$arg"
+      prev="$arg"
+    done
     result="${SAFE_AUDIT_STUB_SCAN_RESULT:-}"
-    if [[ -n "$result" ]]; then
+    if [[ -n "$result" && "${SAFE_AUDIT_STUB_SCAN_NO_RESULT:-0}" != "1" ]]; then
+      cve_critical="${SAFE_AUDIT_STUB_SCAN_CRITICAL:-0}"
+      cve_high="${SAFE_AUDIT_STUB_SCAN_HIGH:-0}"
+      eco_critical="${SAFE_AUDIT_STUB_SCAN_ECO_CRITICAL:-0}"
+      tool_status="${SAFE_AUDIT_STUB_TOOL_STATUS:-}"
+      [[ -n "$tool_status" ]] || tool_status='{"osv-scanner":{"status":"ok","note":null},"syft":{"status":"ok","note":null},"grype":{"status":"ok","note":null}}'
+      eco_audits="${SAFE_AUDIT_STUB_ECOSYSTEM_AUDITS:-}"
+      [[ -n "$eco_audits" ]] || eco_audits='[]'
       cat > "$result" <<JSON
 {
   "machine": "local",
   "verdict": "${SAFE_AUDIT_STUB_SCAN_VERDICT:-GO}",
   "summary": {"packages_total": ${SAFE_AUDIT_STUB_SCAN_PACKAGES:-12}},
   "cve_scan": {
-    "critical": ${SAFE_AUDIT_STUB_SCAN_CRITICAL:-0},
-    "high": ${SAFE_AUDIT_STUB_SCAN_HIGH:-0},
+    "critical": ${cve_critical},
+    "high": ${cve_high},
     "medium": 0,
     "low": 0,
     "findings": [
       {"source": "osv", "id": "GHSA-test-crit", "severity": "CRITICAL", "package": "evilpkg", "version": "1.2.3"},
       {"source": "grype", "id": "CVE-2026-0001", "severity": "High", "package": "warnpkg", "version": "2.0.0"}
     ]
-  }
+  },
+  "audit_totals": {
+    "critical": $((cve_critical + eco_critical)),
+    "high": ${cve_high},
+    "medium": 0,
+    "low": 0,
+    "sources": ["cve_scan", "ecosystem_audits"]
+  },
+  "tool_status": ${tool_status},
+  "ecosystem_audits": ${eco_audits}
 }
 JSON
+      [[ -n "$result_out" ]] && cp "$result" "$result_out"
       [[ "${SAFE_AUDIT_STUB_SCAN_NO_DETAILS:-0}" == "1" ]] || printf 'Details: %s\n' "$result"
     fi
     exit "${SAFE_AUDIT_STUB_SCAN_EXIT:-0}"
@@ -185,14 +210,63 @@ grep -Fq 'GHSA-test-crit' "$PROJECT_OUT" || fail "project summary omits the crit
 PROJECT_ARGS=(--yes)
 project_case critical-yes 104 "$project_dir" env SAFE_AUDIT_STUB_SCAN_VERDICT=WARN SAFE_AUDIT_STUB_SCAN_CRITICAL=3
 
-# Fail closed when the scan cannot be trusted: no result document, or a
-# scanner that failed outright.
+# A critical seen only by an ecosystem audit (npm audit, composer audit) is
+# still a critical: cve_scan alone would have reported a clean project.
+PROJECT_ARGS=(--yes)
+project_case ecosystem-critical 104 "$project_dir" env \
+  SAFE_AUDIT_STUB_SCAN_VERDICT=WARN \
+  SAFE_AUDIT_STUB_SCAN_ECO_CRITICAL=2 \
+  SAFE_AUDIT_STUB_ECOSYSTEM_AUDITS='[{"scanner":"npm-audit","status":"ok","total":2,"critical":2,"high":0,"medium":0,"low":0,"note":null}]'
+grep -Fq 'critical finding(s)' "$PROJECT_ERR" || fail "ecosystem-only critical was not refused as critical"
+
+# A BLOCK verdict is a refusal even when the CVE counts are zero.
+PROJECT_ARGS=(--yes)
+project_case block-verdict 104 "$project_dir" env SAFE_AUDIT_STUB_SCAN_VERDICT=BLOCK
+
+# Fail closed when the scan cannot be trusted: no result document, a scanner
+# that failed outright, an unknown verdict, or a broken scanner.
 PROJECT_ARGS=()
-project_case no-details 100 "$project_dir" env SAFE_AUDIT_STUB_SCAN_NO_DETAILS=1
-grep -Fq 'no readable result' "$PROJECT_ERR" || fail "unreadable scan result did not fail closed legibly"
+project_case no-result 100 "$project_dir" env SAFE_AUDIT_STUB_SCAN_NO_RESULT=1
+grep -Fq 'produced no result' "$PROJECT_ERR" || fail "unreadable scan result did not fail closed legibly"
 PROJECT_ARGS=()
 project_case scan-failed 100 "$project_dir" env SAFE_AUDIT_STUB_SCAN_EXIT=3
 grep -Fq 'BLOCKED project audit' "$PROJECT_ERR" || fail "failed scan did not fail closed"
+
+# An unknown verdict string is not a clean project.
+PROJECT_ARGS=(--yes)
+project_case unknown-verdict 100 "$project_dir" env SAFE_AUDIT_STUB_SCAN_VERDICT=PROBABLY_FINE
+grep -Fq 'not readable as a verdict' "$PROJECT_ERR" || fail "unknown verdict was not refused as unreadable"
+
+# A scanner that ran and FAILED is broken infrastructure: --yes cannot accept
+# it, and it must not read as a vulnerability.
+PROJECT_ARGS=(--yes)
+project_case scanner-broken 100 "$project_dir" env \
+  SAFE_AUDIT_STUB_SCAN_VERDICT=WARN \
+  SAFE_AUDIT_STUB_TOOL_STATUS='{"osv-scanner":{"status":"ok","note":null},"syft":{"status":"ok","note":null},"grype":{"status":"skipped","note":"grype failed"}}'
+grep -Fq 'scanner failure (grype)' "$PROJECT_ERR" || fail "broken scanner was not named as infrastructure breakage"
+grep -Fq 'safe doctor' "$PROJECT_ERR" || fail "scanner failure refusal offers no recovery path"
+! grep -Fqi 'critical' "$PROJECT_ERR" || fail "infrastructure failure reads as a vulnerability finding"
+[[ "$(wc -l < "$PROJECT_ERR")" -eq 1 ]] || {
+  cat "$PROJECT_ERR" >&2
+  fail "scanner failure refusal is not a single stderr line"
+}
+
+# A scanner that is merely absent is reported, not refused: the verdict is
+# already WARN and the operator is told what was not looked at.
+PROJECT_ARGS=(--yes)
+project_case scanner-absent 0 "$project_dir" env \
+  SAFE_AUDIT_STUB_SCAN_VERDICT=WARN \
+  SAFE_AUDIT_STUB_ECOSYSTEM_AUDITS='[{"scanner":"cargo-audit","status":"skipped","total":0,"critical":0,"high":0,"medium":0,"low":0,"note":"cargo-audit unavailable"}]'
+grep -Fq 'not run:' "$PROJECT_OUT" || fail "project summary hides a scanner that never ran"
+grep -Fq 'cargo-audit' "$PROJECT_OUT" || fail "project summary does not name the missing scanner"
+
+# safe audit missing entirely: policy refusal with the contract shape, not a
+# bare usage error.
+PROJECT_ARGS=()
+project_case audit-missing 100 "$project_dir" env SAFE_AUDIT_PATH="$tmp/definitely-not-here"
+grep -Fq 'safe: BLOCKED project audit' "$PROJECT_ERR" || fail "missing safe audit did not use the BLOCKED contract"
+grep -Fq 'to allow:' "$PROJECT_ERR" || fail "missing safe audit refusal has no allow clause"
+[[ "$(wc -l < "$PROJECT_ERR")" -eq 1 ]] || fail "missing safe audit refusal is not a single stderr line"
 
 # A directory with no manifest is not a project: the old usage error stands.
 empty_dir="$tmp/project-empty"
@@ -207,6 +281,30 @@ project_case spec-still-audits 0 "$project_dir" env
 grep -Fq $'safe-audit\tcheck\tcowsay@1.6.0\t--ecosystem\tnpm' "$PROJECT_OUT" || fail "spec install stopped auditing in a project dir"
 grep -Fq $'npm\tinstall\t-g\tcowsay@1.6.0' "$PROJECT_OUT" || fail "spec install stopped delegating in a project dir"
 [[ ! -s "$PROJECT_SCAN_LOG" ]] || fail "spec install ran a project scan"
+
+# Project mode installs NOTHING, so it must never absorb an install request.
+# "exit 0, audit printed, package never installed" is the failure to avoid.
+PROJECT_ARGS=(--project --yes cowsay@1.6.0)
+project_case mixed-spec 1 "$project_dir" env
+grep -Fq 'takes no package arguments' "$PROJECT_ERR" || fail "--project silently swallowed a package spec"
+[[ ! -s "$PROJECT_SCAN_LOG" ]] || fail "--project with a spec still ran a scan"
+! grep -Fq $'npm\tinstall' "$PROJECT_OUT" || fail "--project with a spec ran a package manager"
+
+PROJECT_ARGS=(--project --yes -g cowsay@1.6.0)
+project_case mixed-global 1 "$project_dir" env
+grep -Fq 'cannot be combined' "$PROJECT_ERR" || fail "--project accepted a global install request"
+[[ ! -s "$PROJECT_SCAN_LOG" ]] || fail "--project with -g still ran a scan"
+
+PROJECT_ARGS=(--project --host)
+project_case mixed-host 1 "$project_dir" env
+grep -Fq 'cannot be combined' "$PROJECT_ERR" || fail "--project accepted an install-mode flag"
+
+# An install-mode flag with no package is still an install request: the usual
+# usage error stands rather than a silent audit-only success.
+PROJECT_ARGS=(--yes -g)
+project_case flags-without-spec 1 "$project_dir" env
+grep -Fq 'usage: safe install --host' "$PROJECT_ERR" || fail "-g with no package became a project audit"
+[[ ! -s "$PROJECT_SCAN_LOG" ]] || fail "-g with no package ran a project scan"
 pass "safe install project mode audits, refuses, and fails closed"
 
 explain_output="$("$SAFE" explain)"

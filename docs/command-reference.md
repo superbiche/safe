@@ -193,11 +193,26 @@ the findings.
 | --- | --- | --- |
 | Verdict `GO` | prompt to accept (exit 0 / 1 if declined) | exit 0, quietly |
 | Verdict `WARN` | prompt to accept, or `--yes` | exit 102 unless `--yes` |
-| Critical findings | exit 104 | exit 104 |
-| Scan unreadable or failed | exit 100 | exit 100 |
+| Critical findings, or verdict `BLOCK` | exit 104 | exit 104 |
+| Scan unreadable, failed, or unknown verdict | exit 100 | exit 100 |
+| A scanner ran and failed | exit 100 | exit 100 |
 
 Critical findings are the project-scale equivalent of a `BLOCK` verdict:
-`--yes` accepts WARNs, never those.
+`--yes` accepts WARNs, never those. The count that decides is `audit_totals` —
+the CVE scan plus every ecosystem audit that ran — so a critical only `npm
+audit` or `composer audit` saw still refuses.
+
+A scanner that ran and *failed* is broken infrastructure, not a finding: its
+silence is not evidence of a clean project, so it refuses with exit 100, names
+the scanner, and points at `safe doctor`. A scanner that is merely *absent* is
+different — it is listed under `not run:` in the summary and leaves the verdict
+at `WARN`, which still needs `--yes` or an operator.
+
+Because it installs nothing, `--project` cannot be combined with package
+arguments or with `-g`/`--host`/`--manager`/`--trust-host`/`--sandbox`; those
+combinations are a usage error rather than a silent audit-only success. For the
+same reason auto-detection only applies to a bare `safe install`: with any
+install flag present and no package named, the usage error stands.
 
 `safe install --sandbox ...` preserves the isolated `safe run install` workflow.
 

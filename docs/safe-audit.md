@@ -128,6 +128,38 @@ a scan with no dependency evidence at all is never cached. Source and `--full`
 scans are never cached — they stage arbitrary files whose set the evidence hash
 does not capture.
 
+An entry is replayed only for the request that produced it. The stored envelope
+records the schema, key, machine, target, and mode, and every field is checked
+before replay; an entry belonging to another project, or written by a safe that
+scored verdicts differently, is a miss. A malformed entry never aborts the scan
+it was meant to accelerate — the failure mode of a cache must be slowness, not
+an error a caller reads as "the scan failed".
+
+Two inputs are deliberately outside the key:
+
+- **Go source.** `govulncheck` analyses `./...`, not just `go.mod`/`go.sum`, so
+  a result that includes a govulncheck run is never stored at all.
+- **Advisory databases.** OSV and the ecosystem audits consult live data that
+  can gain an advisory while an entry is still fresh. That window is exactly
+  the TTL, and it is the price of the cache: lower
+  `SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS`, or pass `--no-cache`, when a scan must
+  reflect advisories published in the last hours. A replay always says so on
+  stdout, with the entry's age.
+
+Evidence is re-hashed after the scanners finish: if a lockfile or manifest
+changed while they ran, the result describes bytes that are no longer on disk
+and is not cached. A file that is swapped out and restored inside that same
+window is not detected — the residual is the same class as absolute-path
+invocation, documented in [Install Wrappers](install-wrappers.md).
+
+### `--result-out <file>`
+
+Writes the result document to a caller-owned path. The published result lives
+at `~/.local/share/safe/audit/results/<machine>/<date>-scan.json`, one file per
+machine per day: a concurrent scan of another project replaces it. Any caller
+that *decides* something from a scan (`safe install --project` does) must read
+its own copy instead. Single-target scans only.
+
 Full filesystem scan, including installed dependency trees:
 
 ```bash

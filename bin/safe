@@ -913,9 +913,10 @@ usage:
 
 With no package and a manifest in the current directory (or with `--project`),
 safe bulk-audits the project's dependency evidence and reports; it audits only
-and never runs a package manager. Critical findings refuse with exit 104 even
-under `--yes`; a WARN verdict needs `--yes` or an interactive accept (exit 102
-in a non-interactive shell).
+and never runs a package manager, so it takes no package arguments and no
+install flags. Critical findings refuse with exit 104 even under `--yes`; a
+WARN verdict needs `--yes` or an interactive accept (exit 102 in a
+non-interactive shell); a scanner that ran and failed refuses with exit 100.
 
 Host installs are audited with `safe audit check` before the package manager runs.
 `--yes` skips the final confirmation prompt after a successful audit.
@@ -1463,6 +1464,17 @@ safe_install_project_manifest_present() {
   return 1
 }
 
+# Where a project scan's own output is kept. Refusals name this file instead
+# of echoing a scanner's diagnostics: the refusal contract is one stderr line.
+safe_install_project_log_path() {
+  local dir="${SAFE_DATA_DIR:-$HOME/.local/share/safe}/install/project-scans"
+  if mkdir -p "$dir" 2>/dev/null; then
+    printf '%s/%s-%s.log' "$dir" "$(date +%Y%m%dT%H%M%S)" "$$"
+  else
+    mktemp "${TMPDIR:-/tmp}/safe-project-scan.XXXXXX.log"
+  fi
+}
+
 safe_install_project_confirm() {
   local reply
 
@@ -1484,38 +1496,86 @@ cmd_install_project() {
   mapfile -t manifests < <(safe_install_project_manifests)
 
   [[ "${#manifests[@]}" -gt 0 ]] || die "safe install --project found no manifest in $(pwd) (looked for: ${SAFE_INSTALL_PROJECT_MANIFESTS[*]})"
-  [[ -x "$SAFE_AUDIT_PATH" ]] || die "safe install --project requires safe audit at $SAFE_AUDIT_PATH"
+  if [[ ! -x "$SAFE_AUDIT_PATH" ]]; then
+    safe_install_gate_log "project" "$(pwd)" "REFUSED_AUDIT_MISSING"
+    refuse 100 "BLOCKED project audit — safe audit is not executable at ${SAFE_AUDIT_PATH}, so nothing was checked; to allow: repair the install — safe doctor; details: safe explain"
+  fi
 
-  local scan_output scan_rc=0
+  # The scan hands us our own copy of the result document. The published
+  # per-day file is shared: a concurrent scan of another project can replace
+  # it between the scan and this read, and we would grade the wrong project.
+  local result_path scan_log
+  result_path="$(mktemp "${TMPDIR:-/tmp}/safe-project-scan.XXXXXX")"
+  scan_log="$(safe_install_project_log_path)"
+
+  local scan_rc=0
   set +e
-  scan_output="$("$SAFE_AUDIT_PATH" scan --deps-only --project . 2>&1)"
+  "$SAFE_AUDIT_PATH" scan --deps-only --project . --result-out "$result_path" > "$scan_log" 2>&1
   scan_rc=$?
   set -e
 
-  # The structured verdict comes from the result document the scan wrote; the
-  # rendered text is a human summary, not a contract. No readable result means
-  # we cannot claim the project is clean -> fail closed.
-  local result_path=""
-  result_path="$(printf '%s\n' "$scan_output" | sed -n 's/^Details: //p' | tail -n 1)"
-  if [[ "$scan_rc" -ne 0 || -z "$result_path" || ! -r "$result_path" ]]; then
-    printf '%s\n' "$scan_output" >&2
+  local scan_output=""
+  [[ -r "$scan_log" ]] && scan_output="$(cat "$scan_log")"
+
+  # No readable result means we cannot claim the project is clean -> fail
+  # closed. The scanner's own diagnostics go to a file, not to stderr: a
+  # refusal is one line, and a broken scanner can print hundreds.
+  if [[ "$scan_rc" -ne 0 || ! -r "$result_path" || ! -s "$result_path" ]]; then
+    rm -f "$result_path"
     safe_install_gate_log "project" "$(pwd)" "REFUSED_SCAN_UNREADABLE" "exit=${scan_rc}"
-    refuse 100 "BLOCKED project audit — safe audit scan produced no readable result (exit ${scan_rc}); ask the operator; details: safe explain"
+    refuse 100 "BLOCKED project audit — safe audit scan failed (exit ${scan_rc}) and produced no result, so nothing was checked; to allow: fix the scanner — safe doctor, output in ${scan_log}; details: safe explain"
   fi
 
-  local verdict packages critical high medium low
+  local verdict packages critical high medium low cve_critical
   verdict="$(jq -r '.verdict // "UNKNOWN"' "$result_path" 2>/dev/null || printf 'UNKNOWN')"
   packages="$(jq -r '.summary.packages_total // 0' "$result_path" 2>/dev/null || printf '0')"
-  critical="$(jq -r '.cve_scan.critical // 0' "$result_path" 2>/dev/null || printf '0')"
-  high="$(jq -r '.cve_scan.high // 0' "$result_path" 2>/dev/null || printf '0')"
-  medium="$(jq -r '.cve_scan.medium // 0' "$result_path" 2>/dev/null || printf '0')"
-  low="$(jq -r '.cve_scan.low // 0' "$result_path" 2>/dev/null || printf '0')"
+  # audit_totals aggregates the CVE scan AND every ecosystem audit that ran;
+  # cve_scan alone misses an advisory only npm audit or composer audit saw.
+  critical="$(jq -r '.audit_totals.critical // .cve_scan.critical // "x"' "$result_path" 2>/dev/null || printf 'x')"
+  high="$(jq -r '.audit_totals.high // .cve_scan.high // "x"' "$result_path" 2>/dev/null || printf 'x')"
+  medium="$(jq -r '.audit_totals.medium // .cve_scan.medium // "x"' "$result_path" 2>/dev/null || printf 'x')"
+  low="$(jq -r '.audit_totals.low // .cve_scan.low // "x"' "$result_path" 2>/dev/null || printf 'x')"
+  cve_critical="$(jq -r '.cve_scan.critical // 0' "$result_path" 2>/dev/null || printf '0')"
 
-  # An unparseable verdict is not a clean one.
-  if [[ ! "$critical" =~ ^[0-9]+$ || "$verdict" == "UNKNOWN" ]]; then
-    safe_install_gate_log "project" "$(pwd)" "REFUSED_SCAN_UNPARSEABLE"
-    refuse 100 "BLOCKED project audit — safe audit result at ${result_path} is not readable as a verdict; ask the operator; details: safe explain"
+  # An unparseable or unknown verdict is not a clean one.
+  if [[ ! "$critical" =~ ^[0-9]+$ || ! "$high" =~ ^[0-9]+$ ]] ||
+     [[ "$verdict" != "GO" && "$verdict" != "WARN" && "$verdict" != "BLOCK" ]]; then
+    safe_install_gate_log "project" "$(pwd)" "REFUSED_SCAN_UNPARSEABLE" "verdict=${verdict}"
+    rm -f "$result_path"
+    refuse 100 "BLOCKED project audit — the safe audit result is not readable as a verdict (got '${verdict}'), so nothing was checked; to allow: fix the scanner — safe doctor, output in ${scan_log}; details: safe explain"
   fi
+
+  # A scanner that RAN AND FAILED is broken infrastructure, not a finding:
+  # its silence is not evidence of a clean project, and --yes must not be
+  # able to accept it. A scanner that is merely absent is a different thing
+  # (reported below, and already WARNs the verdict).
+  local broken_tools
+  broken_tools="$(jq -r '
+    [ (.tool_status // {} | to_entries[]?
+        | select((.value.status // "ok") != "ok")
+        | select((.value.note // "") | test("fail|error"; "i"))
+        | .key),
+      (.ecosystem_audits[]?
+        | select((.status // "ok") != "ok")
+        | select((.note // "") | test("fail|error"; "i"))
+        | (.scanner // "unknown"))
+    ] | unique | join(", ")
+  ' "$result_path" 2>/dev/null || printf '')"
+  if [[ -n "$broken_tools" ]]; then
+    safe_install_gate_log "project" "$(pwd)" "REFUSED_SCANNER_BROKEN" "tools=${broken_tools}"
+    rm -f "$result_path"
+    refuse 100 "BLOCKED project audit — scanner failure (${broken_tools}); the project was not fully checked; to allow: fix the scanner — safe doctor, output in ${scan_log}; details: safe explain"
+  fi
+
+  # Scanners that are absent rather than broken. Not a refusal — the operator
+  # is told what was NOT looked at, and the verdict is already WARN.
+  local unrun_tools
+  unrun_tools="$(jq -r '
+    [ .ecosystem_audits[]?
+      | select((.status // "ok") != "ok")
+      | (.scanner // "unknown") + " (" + ((.note // "not run")) + ")"
+    ] | unique | join(", ")
+  ' "$result_path" 2>/dev/null || printf '')"
 
   # One-screen summary. The scan's own render is not echoed: it says the same
   # thing at ten times the length.
@@ -1524,10 +1584,11 @@ cmd_install_project() {
   printf '  packages:  %s\n' "$packages"
   printf '  findings:  critical %s, high %s, medium %s, low %s\n' "$critical" "$high" "$medium" "$low"
   printf '  verdict:   %s\n' "$verdict"
+  [[ -n "$unrun_tools" ]] && printf '  not run:   %s\n' "$unrun_tools"
   local cache_note
   cache_note="$(printf '%s\n' "$scan_output" | grep -F '[safe audit] scan cache hit' | tail -n 1 || true)"
   [[ -n "$cache_note" ]] && printf '  %s\n' "${cache_note#\[safe audit\] }"
-  if [[ "$critical" -gt 0 ]] || [[ "$high" -gt 0 ]]; then
+  if [[ "$cve_critical" -gt 0 ]] || [[ "$high" -gt 0 ]]; then
     printf '  top findings:\n'
     jq -r '
       [.cve_scan.findings[]? | select((.severity // "") | ascii_downcase | test("critical|high"))]
@@ -1536,14 +1597,21 @@ cmd_install_project() {
       | "    - [" + (.severity // "unknown") + "] " + (.package // "unknown") + "@" + (.version // "unknown") + "  " + (.id // "unknown") + " (" + (.source // "?") + ")"
     ' "$result_path" 2>/dev/null || true
   fi
-  printf '  details:   %s\n' "$result_path"
+  # Display only: the published result path is read out of the rendered text
+  # purely so a human can open it. Nothing is decided from it.
+  local published=""
+  published="$(printf '%s\n' "$scan_output" | sed -n 's/^Details: //p' | tail -n 1)"
+  [[ -n "$published" ]] && printf '  details:   %s\n' "$published"
+  printf '  scan log:  %s\n' "$scan_log"
 
   # Critical findings are the project-scale equivalent of a BLOCK verdict:
   # --yes accepts WARNs, never these.
-  if [[ "$critical" -gt 0 ]]; then
-    safe_install_gate_log "project" "$(pwd)" "REFUSED_BLOCK" "critical=${critical}"
+  if [[ "$critical" -gt 0 || "$verdict" == "BLOCK" ]]; then
+    safe_install_gate_log "project" "$(pwd)" "REFUSED_BLOCK" "critical=${critical} verdict=${verdict}"
+    rm -f "$result_path"
     refuse 104 "BLOCKED project audit — ${critical} critical finding(s) in this project's dependencies; to allow: operator review — safe audit scan --deps-only --project .; details: safe explain"
   fi
+  rm -f "$result_path"
 
   if [[ "$verdict" == "GO" ]]; then
     safe_install_gate_log "project" "$(pwd)" "PROCEED" "verdict=GO"
@@ -1648,19 +1716,30 @@ cmd_install() {
     esac
   done
 
-  # Project mode: no package named, but a manifest here. Bulk-audit what the
-  # project already depends on instead of dying with usage. --project forces
-  # it (and says so if there is no manifest).
-  if [[ "$sandbox_mode" == "0" ]]; then
-    local -a project_specs=()
-    mapfile -t project_specs < <(safe_install_audit_specs "$manager" ${manager_args[@]+"${manager_args[@]}"})
-    if [[ "$project_mode" == "1" ]] ||
-       { [[ "${#project_specs[@]}" -eq 0 ]] && safe_install_project_manifest_present; }; then
-      cmd_install_project "$yes"
-      return $?
+  # Project mode audits what the project already depends on and installs
+  # NOTHING. It therefore cannot absorb an install request: combining it with
+  # packages or install-mode flags would end in "exit 0, nothing installed,
+  # user believes it was".
+  if [[ "$project_mode" == "1" ]]; then
+    [[ "$sandbox_mode" == "0" ]] || die "--project cannot be used with --sandbox"
+    if [[ "$host_mode" == "1" || "$global_mode" == "1" || "$trust_host" == "1" ]]; then
+      die "--project audits this project and installs nothing; it cannot be combined with -g/--host/--manager/--trust-host"
     fi
-  elif [[ "$project_mode" == "1" ]]; then
-    die "--project cannot be used with --sandbox"
+    if [[ "${#manager_args[@]}" -gt 0 ]]; then
+      die "--project takes no package arguments (got: ${manager_args[*]}); drop --project to install them"
+    fi
+    cmd_install_project "$yes"
+    return $?
+  fi
+
+  # Auto-detection: a bare `safe install` inside a project bulk-audits it.
+  # Any install-mode flag means the caller asked for an install, so the usual
+  # usage error is the right answer — never a silent audit-only success.
+  if [[ "$sandbox_mode" == "0" && "$host_mode" == "0" && "$global_mode" == "0" &&
+        "$trust_host" == "0" && "${#manager_args[@]}" -eq 0 ]] &&
+     safe_install_project_manifest_present; then
+    cmd_install_project "$yes"
+    return $?
   fi
 
   if [[ "$sandbox_mode" == "1" && "$host_mode" == "0" ]]; then

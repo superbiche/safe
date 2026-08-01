@@ -20,6 +20,10 @@ SCAN_CACHE_DIR="$DATA_DIR/scan-cache"
 # A dependency-evidence scan is deterministic in its inputs, so an unchanged
 # lockfile set within the TTL may reuse the previous verdict.
 SCAN_CACHE_TTL_SECONDS="${SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS:-86400}"
+# Bump whenever the shape or the semantics of a scan result change: entries
+# written by an older safe compute their verdict under different rules, so
+# they must miss rather than replay.
+SCAN_CACHE_SCHEMA=1
 CHECKS_DIR="$DATA_DIR/checks"
 IOC_DIR="$DATA_DIR/ioc"
 IOC_CATALOG_DIR="$IOC_DIR/catalogs"
@@ -68,6 +72,12 @@ declare -A PROJECT_ECOSYSTEMS=()
 declare -A PROJECT_SCANNERS=()
 declare -a PROJECT_IGNORES=()
 LAST_SCAN_RESULT_PATH=""
+# Private, immutable copy of the document a scan just produced. The shared
+# per-day result file can be overwritten by a concurrent scan at any instant,
+# so every consumer that DECIDES on a result (cache store, --result-out)
+# reads the snapshot instead.
+LAST_SCAN_RESULT_SNAPSHOT=""
+SCAN_RESULT_OUT=""
 declare -a CURRENT_LOCKFILES=()
 declare -a CURRENT_MANIFESTS=()
 declare -a CURRENT_PROJECT_ROOTS=()
@@ -2285,7 +2295,10 @@ select_previous_sbom() {
 }
 
 build_delta_json() {
-  local machine="$1" result_path="$2" sbom_path="$3"
+  # $2 is the path the finished result WILL occupy (excluded when looking for
+  # the previous scan); $4 (default $2) is where its content is read from,
+  # which during a build is the private in-progress document.
+  local machine="$1" result_path="$2" sbom_path="$3" current_doc="${4:-$2}"
   local previous_result previous_sbom
   previous_result=$(latest_previous_result "$machine" "$result_path")
   previous_sbom=$(latest_previous_sbom "$machine" "$sbom_path")
@@ -2303,7 +2316,7 @@ build_delta_json() {
   ')
   previous_scan=$(jq -r '.date // .timestamp // empty' "$previous_result" 2>/dev/null || true)
   [[ -z "$previous_scan" ]] && previous_scan=$(basename "$previous_result" | sed 's/-scan\.json$//')
-  new_cves=$(jq -n --slurpfile prev "$previous_result" --slurpfile cur "$result_path" '
+  new_cves=$(jq -n --slurpfile prev "$previous_result" --slurpfile cur "$current_doc" '
     ([ $cur[0].cve_scan.findings[]?.id ] - [ $prev[0].cve_scan.findings[]?.id ]) | unique
   ')
 
@@ -2321,7 +2334,11 @@ build_delta_json() {
 }
 
 render_scan_summary() {
+  # $1 is read for the numbers; $2 (default $1) is the path shown to a human.
+  # They differ while a scan renders its private snapshot but points the reader
+  # at the published per-day result file.
   local result_path="$1"
+  local display_path="${2:-$1}"
   local machine
   machine=$(jq -r '.machine' "$result_path")
   printf '=== SAFE-AUDIT SCAN - %s - %s ===\n\n' \
@@ -2376,15 +2393,16 @@ render_scan_summary() {
       "$(jq -r '.delta.new_cves[:5] | join(", ")' "$result_path")"
   fi
   printf '\nVERDICT: %s\n\n' "$(jq -r '.verdict' "$result_path")"
-  printf 'Details: %s\n' "$result_path"
+  printf 'Details: %s\n' "$display_path"
 }
 
 build_scan_result_from_artifacts() {
   local machine="$1" original_target="$2" strategy="$3" sbom_src="$4" osv_json="$5" grype_json="$6" ecosystem_audits_file="$7" scan_mode="${8:-source}" source_scan_file="${9:-}"
-  local stamp result_path sbom_path
+  local stamp result_path sbom_path build_tmp
   stamp="$(today_date)"
   mkdir -p "$RESULTS_DIR/$machine" "$SBOM_DIR/$machine"
   result_path=$(scan_result_path_for "$machine" "$stamp")
+  build_tmp=$(mktemp)
   sbom_path=$(scan_sbom_path_for "$machine" "$stamp")
   cp "$sbom_src" "$sbom_path"
 
@@ -2529,6 +2547,29 @@ build_scan_result_from_artifacts() {
     verdict="WARN"
   fi
 
+  # `cve_scan` counts only what osv-scanner and grype found. The ecosystem
+  # audits (npm audit, composer audit, cargo-audit, govulncheck) report their
+  # own advisory counts and were never folded in, so a critical seen only by
+  # npm audit left the verdict at GO. `audit_totals` is the aggregate every
+  # gating consumer reads: CVE scan + every ecosystem audit that actually ran.
+  local audit_totals_json
+  audit_totals_json=$(jq -n \
+    --argjson critical "$critical" --argjson high "$high" \
+    --argjson medium "$medium" --argjson low "$low" \
+    --argjson audits "$ecosystem_audits_json" '
+    def sum(f): ([$audits[]? | select((.status // "") == "ok") | (f // 0)] | add) // 0;
+    {
+      critical: ($critical + sum(.critical)),
+      high: ($high + sum(.high)),
+      medium: ($medium + sum(.medium)),
+      low: ($low + sum(.low)),
+      sources: ["cve_scan", "ecosystem_audits"]
+    }' 2>/dev/null || printf '{"critical":%s,"high":%s,"medium":%s,"low":%s,"sources":["cve_scan"]}' \
+      "$critical" "$high" "$medium" "$low")
+  if jq -e '(.critical + .high + .medium + .low) > 0' <<<"$audit_totals_json" >/dev/null 2>&1; then
+    verdict="WARN"
+  fi
+
   jq -n \
     --arg machine "$machine" \
     --arg date "$(today_date)" \
@@ -2551,6 +2592,7 @@ build_scan_result_from_artifacts() {
     --argjson ecosystem_audits "$ecosystem_audits_json" \
     --argjson source_scan "$source_scan_json" \
     --argjson tool_status "$tool_status_json" \
+    --argjson audit_totals "$audit_totals_json" \
     --argjson findings "$findings_json" \
     '{
       machine: $machine,
@@ -2577,36 +2619,68 @@ build_scan_result_from_artifacts() {
         low: $low,
         findings: $findings
       },
+      audit_totals: $audit_totals,
       tool_status: $tool_status,
       ecosystem_audits: $ecosystem_audits,
       source_scan: $source_scan,
       verdict: $verdict
-    }' > "$result_path"
+    }' > "$build_tmp"
 
-  local delta_json tmp
-  delta_json=$(build_delta_json "$machine" "$result_path" "$sbom_path")
-  tmp=$(mktemp)
-  jq --argjson delta "$delta_json" '. + {delta: $delta}' "$result_path" > "$tmp"
-  mv "$tmp" "$result_path"
+  # The document is assembled in a private file and only then published to the
+  # shared per-day path: `<date>-scan.json` is one file per machine per day, so
+  # a concurrent scan of another project can replace it between any two reads.
+  # Nothing that decides anything may re-read the shared path.
+  local delta_json snapshot
+  delta_json=$(build_delta_json "$machine" "$result_path" "$sbom_path" "$build_tmp")
+  snapshot=$(mktemp)
+  jq --argjson delta "$delta_json" '. + {delta: $delta}' "$build_tmp" > "$snapshot"
+  rm -f "$build_tmp"
+  cp "$snapshot" "$result_path"
 
   LAST_SCAN_RESULT_PATH="$result_path"
-  render_scan_summary "$result_path"
+  LAST_SCAN_RESULT_SNAPSHOT="$snapshot"
+  if [[ -n "$SCAN_RESULT_OUT" ]]; then
+    cp "$snapshot" "$SCAN_RESULT_OUT" 2>/dev/null || \
+      die "cannot write scan result to $SCAN_RESULT_OUT"
+  fi
+  # Rendered from the snapshot, addressed as the shared path: the numbers are
+  # this scan's, the path a human can open afterwards.
+  render_scan_summary "$snapshot" "$result_path"
 }
 
 # --------------------------------------------------------------------------
 # Scan cache (deps-only)
 #
-# A --deps-only scan reads exactly one thing: the dependency evidence
-# (lockfiles + manifests). When that evidence hashes to something already
-# scanned inside the TTL, re-running the scanners cannot produce a different
-# verdict, so the recorded result is replayed instead.
+# A --deps-only scan is keyed by the dependency evidence it reads: the
+# lockfiles and manifests, each hashed by content. An unchanged evidence set
+# inside the TTL replays the recorded result instead of re-running scanners.
 #
 # Discipline: the cache may only ever SKIP work, never invent a verdict. Every
-# failure mode here — missing jq, unreadable entry, corrupt JSON, absent or
-# malformed timestamp, empty evidence — falls through to a real scan. Source
-# scans are never cached: they stage arbitrary files whose set is not captured
-# by the evidence hash.
+# failure mode here — missing jq, unreadable entry, corrupt JSON, malformed
+# timestamp, envelope belonging to another request, entry written by an older
+# safe, empty evidence — falls through to a real scan, and never aborts the
+# scan it was supposed to accelerate.
+#
+# What the key does NOT cover, and how each gap is handled:
+#   - Source files. govulncheck reads `./...`, not just go.mod/go.sum, so a
+#     result containing a govulncheck run is never stored (see
+#     scan_cache_result_is_cacheable).
+#   - Advisory databases. npm/composer/cargo audits and OSV consult live data
+#     that can gain an advisory while an entry is fresh. That window is exactly
+#     the TTL and is the deliberate cost of the cache: `--no-cache` (and the
+#     TTL knob) is the escape hatch, and a hit says so on stdout.
+#   - Full/source scans, which stage arbitrary files no evidence hash captures:
+#     never cached at all.
 # --------------------------------------------------------------------------
+
+scan_cache_ttl_seconds() {
+  local ttl="${SCAN_CACHE_TTL_SECONDS:-}"
+  # A malformed TTL disables the cache rather than defaulting silently: the
+  # operator asked for a specific window and we could not honor it.
+  [[ "$ttl" =~ ^[0-9]+$ ]] || return 1
+  (( 10#$ttl > 0 )) || return 1
+  printf '%s' "$((10#$ttl))"
+}
 
 scan_cache_enabled() {
   local scan_mode="$1"
@@ -2614,7 +2688,21 @@ scan_cache_enabled() {
   [[ "${SAFE_AUDIT_SCAN_NO_CACHE:-0}" != "1" ]] || return 1
   command -v jq >/dev/null 2>&1 || return 1
   command -v sha256sum >/dev/null 2>&1 || return 1
+  scan_cache_ttl_seconds >/dev/null || return 1
   return 0
+}
+
+# A result is replayable only if every scanner that contributed to it read
+# nothing outside the hashed evidence. govulncheck analyses Go SOURCE, so a
+# vulnerable call introduced in a .go file would be invisible to the key.
+scan_cache_result_is_cacheable() {
+  local result="$1"
+  jq -e '
+    [.ecosystem_audits[]?
+      | select((.scanner // "") == "govulncheck")
+      | select((.status // "") == "ok")
+    ] | length == 0
+  ' "$result" >/dev/null 2>&1
 }
 
 # sha256 over machine, target, mode, and every evidence file's own sha256.
@@ -2659,36 +2747,74 @@ scan_cache_human_age() {
 }
 
 # Replay a cached result. Returns 1 for ANY doubt so the caller runs a real
-# scan; returns 0 only after rendering a structurally valid, fresh entry.
+# scan; returns 0 only after rendering a valid, fresh entry that belongs to
+# THIS request. Every check is inside one jq predicate on purpose: bash
+# arithmetic on a value taken from a cache file is itself an abort risk
+# (`$((now - 08))` is a fatal "value too great for base"), and an aborted
+# scan reads to a caller as "scan failed", not as "no cache".
 scan_cache_replay() {
-  local key="$1"
+  local key="$1" machine="$2" target="$3" scan_mode="$4"
   local path="$SCAN_CACHE_DIR/$key.json"
   [[ -n "$key" && -r "$path" ]] || return 1
 
-  local created now age
-  created="$(jq -r '._cache.created_epoch // empty' "$path" 2>/dev/null || true)"
-  [[ "$created" =~ ^[0-9]+$ ]] || return 1
-  now="$(date +%s)"
-  age=$((now - created))
-  (( age >= 0 )) || return 1
-  (( age < SCAN_CACHE_TTL_SECONDS )) || return 1
-  jq -e 'has("verdict") and has("summary") and has("cve_scan")' "$path" >/dev/null 2>&1 || return 1
+  local ttl
+  ttl="$(scan_cache_ttl_seconds)" || return 1
 
-  printf '[safe audit] scan cache hit (%s) — dependency evidence unchanged; --no-cache forces a fresh scan\n' \
-    "$(scan_cache_human_age "$age")"
+  jq -e \
+    --arg key "$key" --arg machine "$machine" --arg target "$target" \
+    --arg mode "$scan_mode" --argjson ttl "$ttl" --argjson schema "$SCAN_CACHE_SCHEMA" '
+    (._cache // {}) as $c
+    | ($c.schema == $schema)
+      and ($c.key == $key)
+      and ($c.machine == $machine)
+      and ($c.target == $target)
+      and ($c.mode == $mode)
+      and (($c.created_epoch | type) == "number")
+      and ($c.created_epoch <= now)
+      and ((now - $c.created_epoch) < $ttl)
+      and ((.verdict | type) == "string")
+      and ((.verdict == "GO") or (.verdict == "WARN") or (.verdict == "BLOCK"))
+      and ((.summary | type) == "object")
+      and ((.cve_scan | type) == "object")
+      and ((.cve_scan.critical | type) == "number")
+      and ((.cve_scan.high | type) == "number")
+      and ((.cve_scan.medium | type) == "number")
+      and ((.cve_scan.low | type) == "number")
+      and ((.audit_totals | type) == "object")
+      and ((.audit_totals.critical | type) == "number")
+      and ((.ecosystem_audits | type) == "array")
+      and ((.tool_status | type) == "object")
+  ' "$path" >/dev/null 2>&1 || return 1
+
+  local age
+  age="$(jq -r '((now - ._cache.created_epoch) | floor)' "$path" 2>/dev/null || true)"
+  [[ "$age" =~ ^[0-9]+$ ]] || return 1
+
+  printf '[safe audit] scan cache hit (%s old) — dependency evidence unchanged; --no-cache forces a fresh scan\n' \
+    "$(scan_cache_human_age "$((10#$age))")"
   LAST_SCAN_RESULT_PATH="$path"
+  LAST_SCAN_RESULT_SNAPSHOT="$path"
+  if [[ -n "$SCAN_RESULT_OUT" ]]; then
+    cp "$path" "$SCAN_RESULT_OUT" 2>/dev/null || return 1
+  fi
   render_scan_summary "$path"
 }
 
 # Cache writes never fail a scan: a full result was already produced.
 scan_cache_store() {
-  local key="$1" result="$2"
+  local key="$1" result="$2" machine="$3" target="$4" scan_mode="$5"
   [[ -n "$key" && -n "$result" && -r "$result" ]] || return 0
+  scan_cache_result_is_cacheable "$result" || {
+    vinfo "scan cache: result reads beyond the hashed evidence; not stored"
+    return 0
+  }
   mkdir -p "$SCAN_CACHE_DIR" 2>/dev/null || return 0
   local tmp
   tmp=$(mktemp "$SCAN_CACHE_DIR/.tmp.XXXXXX" 2>/dev/null) || return 0
-  if jq --arg k "$key" --argjson t "$(date +%s)" \
-      '. + {_cache: {key: $k, created_epoch: $t}}' "$result" > "$tmp" 2>/dev/null; then
+  if jq --arg k "$key" --arg m "$machine" --arg t "$target" --arg mode "$scan_mode" \
+      --argjson schema "$SCAN_CACHE_SCHEMA" --argjson epoch "$(date +%s)" \
+      '. + {_cache: {schema: $schema, key: $k, machine: $m, target: $t, mode: $mode, created_epoch: $epoch}}' \
+      "$result" > "$tmp" 2>/dev/null; then
     mv "$tmp" "$SCAN_CACHE_DIR/$key.json" 2>/dev/null || rm -f "$tmp"
   else
     rm -f "$tmp"
@@ -2707,7 +2833,7 @@ scan_source_into_result() {
       ${CURRENT_LOCKFILES[@]+"${CURRENT_LOCKFILES[@]}"} \
       ${CURRENT_MANIFESTS[@]+"${CURRENT_MANIFESTS[@]}"} || true)"
     vinfo "$machine: scan cache key=${cache_key:-<none>}"
-    if [[ -n "$cache_key" ]] && scan_cache_replay "$cache_key"; then
+    if [[ -n "$cache_key" ]] && scan_cache_replay "$cache_key" "$machine" "$original_target" "$scan_mode"; then
       return 0
     fi
   fi
@@ -2759,7 +2885,19 @@ scan_source_into_result() {
   local build_rc=0
   build_scan_result_from_artifacts "$machine" "$original_target" "$strategy" "$sbom_tmp" "$osv_json" "$grype_json" "$audits_tmp" "$scan_mode" "$source_scan_tmp" || build_rc=$?
   if [[ -n "$cache_key" && "$build_rc" -eq 0 ]]; then
-    scan_cache_store "$cache_key" "$LAST_SCAN_RESULT_PATH"
+    # The key was computed before the scanners ran. If the evidence changed
+    # underneath them, this result describes bytes that are no longer on disk
+    # and must not be filed under the original key — that is how a clean
+    # verdict ends up answering for a vulnerable lockfile.
+    local verify_key=""
+    verify_key="$(scan_cache_key "$machine" "$original_target" "$scan_mode" \
+      ${CURRENT_LOCKFILES[@]+"${CURRENT_LOCKFILES[@]}"} \
+      ${CURRENT_MANIFESTS[@]+"${CURRENT_MANIFESTS[@]}"} || true)"
+    if [[ -n "$verify_key" && "$verify_key" == "$cache_key" ]]; then
+      scan_cache_store "$cache_key" "$LAST_SCAN_RESULT_SNAPSHOT" "$machine" "$original_target" "$scan_mode"
+    else
+      vinfo "$machine: evidence changed during the scan; result not cached"
+    fi
   fi
   return "$build_rc"
 }
@@ -7364,6 +7502,14 @@ scan_command() {
         SAFE_AUDIT_SCAN_NO_CACHE=1
         shift
         ;;
+      --result-out)
+        # Hand the caller its own copy of the result document. The published
+        # per-day file is shared and can be replaced by a concurrent scan
+        # before the caller reads it; this copy cannot.
+        [[ $# -lt 2 ]] && die "--result-out requires a path"
+        SCAN_RESULT_OUT="$2"
+        shift 2
+        ;;
       --project)
         [[ $# -lt 2 ]] && die "--project requires a path"
         project_target="$2"
@@ -7384,7 +7530,17 @@ scan_command() {
     esac
   done
   SAFE_AUDIT_SCAN_MODE="$scan_mode"
+  if [[ -n "$SCAN_RESULT_OUT" ]]; then
+    # Checked before the scan runs: a caller that cannot receive the result
+    # must not learn this after several minutes of scanning.
+    local result_out_dir
+    result_out_dir="$(dirname -- "$SCAN_RESULT_OUT")"
+    [[ -d "$result_out_dir" && -w "$result_out_dir" ]] || die "--result-out directory is not writable: $result_out_dir"
+  fi
   parse_machine_targets default "${args[@]}"
+  if [[ -n "$SCAN_RESULT_OUT" && "${#MACHINE_TARGETS[@]}" -gt 1 ]]; then
+    die "--result-out writes one result document; it cannot be combined with a multi-machine scan"
+  fi
   vinfo "scan targets: ${MACHINE_TARGETS[*]}"
   vinfo "scan mode: $scan_mode"
   local machine
@@ -7500,7 +7656,7 @@ safe audit: multi-machine audit tooling
 
 USAGE
   safe audit capabilities [--json]
-  safe audit scan [--verbose] [--deps-only | --full] [--no-cache] [--project <path>] [--all | --machine <csv>]
+  safe audit scan [--verbose] [--deps-only | --full] [--no-cache] [--result-out <file>] [--project <path>] [--all | --machine <csv>]
   safe audit check <pkg>@<version> [--ecosystem <name>] [--json]
   safe audit release github --repo OWNER/REPO --version TAG --asset NAME [--json]
   safe audit vuln github-release --repo OWNER/REPO --version TAG [--json]
