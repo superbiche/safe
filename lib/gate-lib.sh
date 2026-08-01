@@ -1972,22 +1972,34 @@ safe_gate_mise_unmodeled_source() {
 # An unreadable or unrecognized value fails closed. "auto" resolves per
 # directory (lockfile-driven), which is part of the documented
 # directory-config residual.
+# ONE strict validator for both inputs: an unvalidated environment value
+# was passed through verbatim, so an invalid selector became a package
+# verdict instead of an infrastructure refusal (delta-6 finding F4). The
+# accepted set is the pinned mise contract (2026.7.16, verified live:
+# `aube`/`aube_cli` are accepted, `yarn` is rejected by mise itself).
+# Only bun has a source surface safe-audit cannot model; the others read
+# npm-compatible sources and audit normally.
+safe_gate_mise_valid_npm_installer() {
+  case "$1" in
+    auto|npm|aube|aube_cli) printf 'npm'; return 0 ;;
+    pnpm) printf 'pnpm'; return 0 ;;
+    bun) printf 'bun'; return 0 ;;
+    *) return 2 ;;
+  esac
+}
+
 safe_gate_mise_npm_installer() {
   local overlay="$1" pm mise_real out
   pm="$(safe_gate_mise_env_value MISE_NPM_PACKAGE_MANAGER "$overlay")"
   if [[ -n "$pm" ]]; then
-    printf '%s' "$pm"
-    return 0
+    safe_gate_mise_valid_npm_installer "$pm"
+    return $?
   fi
   mise_real="$(safe_gate_resolve_real mise)" || return 2
   out="$("$mise_real" ${SAFE_GATE_MISE_CTX[@]+"${SAFE_GATE_MISE_CTX[@]}"} settings get npm.package_manager 2>/dev/null)" || return 2
   out="${out%%$'\n'*}"
-  case "$out" in
-    auto|npm) printf 'npm' ;;
-    pnpm|yarn|bun) printf '%s' "$out" ;;
-    *) return 2 ;;
-  esac
-  return 0
+  safe_gate_mise_valid_npm_installer "$out"
+  return $?
 }
 
 # Installer behind a mise BACKEND spec (npm:/pipx:/cargo:/go:).
@@ -2004,12 +2016,36 @@ safe_gate_mise_backend_installer() {
 # One validated snapshot of every configured row, shared by enumeration,
 # selection and attribution so they cannot disagree with one another
 # (delta-5 finding F1). Cached per invocation; returns 2 on failure.
-safe_gate_mise_rows() {
-  if (( ${SAFE_GATE_MISE_ROWS_LOADED:-0} == 0 )); then
-    SAFE_GATE_MISE_ROWS="$(safe_gate_mise_config_entries 3 ${SAFE_GATE_MISE_CTX[@]+"${SAFE_GATE_MISE_CTX[@]}"})" || return 2
-    SAFE_GATE_MISE_ROWS_LOADED=1
-  fi
-  printf '%s\n' "$SAFE_GATE_MISE_ROWS"
+# One validated snapshot of every configured row, shared by enumeration,
+# selection and attribution so they cannot disagree. Loaded in the CURRENT
+# shell: a `$(...)` capture ran the assignments in a subshell, so the cache
+# never survived and every reader re-queried mise (delta-6 finding F1).
+# Returns 2 on failure; the rows live in SAFE_GATE_MISE_ROWS.
+safe_gate_mise_load_rows() {
+  (( ${SAFE_GATE_MISE_ROWS_LOADED:-0} )) && return 0
+  local rows
+  rows="$(safe_gate_mise_config_entries ${SAFE_GATE_MISE_CTX[@]+"${SAFE_GATE_MISE_CTX[@]}"})" || return 2
+  SAFE_GATE_MISE_ROWS="$rows"
+  SAFE_GATE_MISE_ROWS_LOADED=1
+  return 0
+}
+
+# Rows an operation could fetch, selected from that same snapshot rather
+# than a second `mise ls`: 0 = not installed; 1 = also installed entries
+# whose request is not an exact pin (mise can move "3", ranges, tags on
+# `up`); 2 = every row (`up --bump`, `install --force`).
+safe_gate_mise_select_rows() {
+  local mode="$1" key req inst
+  while IFS=$'\t' read -r key req inst; do
+    [[ -n "$key" ]] || continue
+    if (( mode == 2 )) || [[ "$inst" != "1" ]]; then
+      printf '%s\t%s\n' "$key" "$req"
+      continue
+    fi
+    if (( mode == 1 )) && [[ ! "$req" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+      printf '%s\t%s\n' "$key" "$req"
+    fi
+  done <<<"$SAFE_GATE_MISE_ROWS"
   return 0
 }
 
@@ -2017,11 +2053,11 @@ safe_gate_mise_rows() {
 # option set per key, so more than one request means its options cannot be
 # attributed to the target being installed.
 safe_gate_mise_key_multiplicity() {
-  local want="$1" rows key count=0
-  rows="$(safe_gate_mise_rows)" || return 2
+  local want="$1" key count=0
+  safe_gate_mise_load_rows || return 2
   while IFS=$'\t' read -r key _; do
     [[ "$key" == "$want" ]] && count=$((count + 1))
-  done <<<"$rows"
+  done <<<"$SAFE_GATE_MISE_ROWS"
   printf '%s' "$count"
   return 0
 }
@@ -2208,8 +2244,6 @@ safe_gate_mise_check_spec() {
 # producer/schema failure returns 2 and the caller refuses — only a
 # validated (possibly empty) enumeration returns 0.
 safe_gate_mise_config_entries() {
-  local mode="$1"
-  shift
   local mise_real json out
   mise_real="$(safe_gate_resolve_real mise)" || return 2
   command -v jq >/dev/null 2>&1 || return 2
@@ -2219,7 +2253,7 @@ safe_gate_mise_config_entries() {
   # malformed entry as installable and reported a package verdict for it
   # (delta-1 finding 3). jq diagnostics stay internal so a refusal is still
   # exactly one line.
-  out="$(printf '%s' "$json" | jq -r --argjson mode "$mode" '
+  out="$(printf '%s' "$json" | jq -r '
     if type != "object" then error("schema") else . end
     | to_entries[]
     | (.key | if (type == "string" and length > 0) then . else error("schema") end) as $k
@@ -2229,13 +2263,7 @@ safe_gate_mise_config_entries() {
        | if type != "boolean" then error("schema") else . end) as $inst
     | (if has("requested_version") then .requested_version else error("schema") end
        | if type != "string" then error("schema") else . end) as $req
-    | select(
-        $mode == 3
-        or $mode == 2
-        or ($inst | not)
-        or ($mode == 1 and (($req | test("^v?[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.-]+)?$")) | not))
-      )
-    | $k + "\t" + $req
+    | $k + "\t" + $req + "\t" + (if $inst then "1" else "0" end)
   ' 2>/dev/null)" || return 2
   printf '%s\n' "$out"
 }
@@ -2427,7 +2455,14 @@ safe_gate_mise_parse_sub() {
 # blind ${spec%@*} reduced every unversioned scoped name to "npm:" and made
 # unrelated tools compare equal (delta-2 finding F3).
 safe_gate_mise_spec_name() {
-  local spec="$1" backend="" rest="$spec"
+  # Separate statements on purpose: bash expands every RHS of a single
+  # `local` before the new locals exist, so `local spec="$1" rest="$spec"`
+  # gave `rest` the value of an OUTER `spec` — which, called for an
+  # exclusion from inside the target loop, rewrote the exclusion as the
+  # current target and dropped it from the audit set (delta-6 finding F3).
+  local spec="$1"
+  local backend=""
+  local rest="$spec"
   if [[ "$spec" == *:* ]]; then
     backend="${spec%%:*}:"
     rest="${spec#*:}"
@@ -2448,10 +2483,20 @@ safe_gate_mise_filter_excluded() {
   for spec in ${_specs[@]+"${_specs[@]}"}; do
     # Compare canonical KEYS: `mise upgrade blockme --exclude npm:blockme`
     # names one tool in two spellings, and mise excludes it (delta-5 F3).
-    spec_name="$(safe_gate_mise_canon_key "$spec" 2>/dev/null || safe_gate_mise_spec_name "$spec")"
+    # No fallback on canonicalization failure: manufacturing a name here
+    # once matched an unrelated exclusion and silently dropped a real
+    # target (delta-6 finding F3). A resolution failure is infrastructure
+    # breakage, and the caller refuses.
+    spec_name="$(safe_gate_mise_canon_key "$spec")" || {
+      safe_gate_mise_infra_refuse "cannot resolve '${spec}' to its backend to compare it against --exclude (mise registry unavailable or unknown tool)"
+      return 100
+    }
     local skip=0
     for ex in "${SAFE_GATE_MISE_EXCLUDE[@]}"; do
-      ex_name="$(safe_gate_mise_canon_key "$ex" 2>/dev/null || safe_gate_mise_spec_name "$ex")"
+      ex_name="$(safe_gate_mise_canon_key "$ex")" || {
+        safe_gate_mise_infra_refuse "cannot resolve the --exclude target '${ex}' to its backend (mise registry unavailable or unknown tool); name it as <backend>:<tool>"
+        return 100
+      }
       [[ "$spec_name" == "$ex_name" || "$spec" == "$ex" ]] && { skip=1; break; }
     done
     (( skip )) || kept+=("$spec")
@@ -2499,13 +2544,15 @@ safe_gate_mise_entry_option_offender() {
 safe_gate_mise_collect_entries() {
   local mode="$1" what="$2"
   local -n _out="$3"
-  local entries rc key req offender orc
-  entries="$(safe_gate_mise_config_entries "$mode" ${SAFE_GATE_MISE_CTX[@]+"${SAFE_GATE_MISE_CTX[@]}"})"
-  rc=$?
-  if (( rc != 0 )); then
+  local entries key req offender orc
+  # ONE snapshot: selection and multiplicity attribution must describe the
+  # same configuration, and a second `mise ls` could disagree with the
+  # first (delta-6 finding F1).
+  if ! safe_gate_mise_load_rows; then
     safe_gate_mise_infra_refuse "cannot enumerate configured tools (mise ls or jq unavailable, or malformed output) — ${what} would install unaudited"
     return 100
   fi
+  entries="$(safe_gate_mise_select_rows "$mode")"
   local -a keys=() reqs=()
   while IFS=$'\t' read -r key req; do
     [[ -n "$key" ]] || continue
@@ -2514,18 +2561,11 @@ safe_gate_mise_collect_entries() {
   done <<<"$entries"
   # Multiplicity comes from the UNFILTERED row set: mode selection hides
   # sibling requests that still share one reported option set (delta-4 F1).
-  local all_rows arc
-  all_rows="$(safe_gate_mise_rows)"
-  arc=$?
-  if (( arc != 0 )); then
-    safe_gate_mise_infra_refuse "cannot enumerate configured tools (mise ls or jq unavailable, or malformed output) — ${what} would install unaudited"
-    return 100
-  fi
   local -a all_keys=()
   local akey
   while IFS=$'\t' read -r akey _; do
     [[ -n "$akey" ]] && all_keys+=("$akey")
-  done <<<"$all_rows"
+  done <<<"$SAFE_GATE_MISE_ROWS"
   local i j count
   for (( i = 0; i < ${#keys[@]}; i++ )); do
     key="${keys[$i]}"
@@ -2611,12 +2651,11 @@ safe_gate_mise_pin_upgrade_targets() {
   if (( need == 0 )); then
     return 0
   fi
-  entries="$(safe_gate_mise_rows)"
-  rc=$?
-  if (( rc != 0 )); then
+  if ! safe_gate_mise_load_rows; then
     safe_gate_mise_infra_refuse "cannot read the configured request for an upgrade target (mise ls or jq unavailable, or malformed output)"
     return 100
   fi
+  entries="$SAFE_GATE_MISE_ROWS"
   for spec in ${_specs[@]+"${_specs[@]}"}; do
     # Normalize ONCE: a bracket option must not end up inside the key that
     # is compared against configured rows, which refused a supported
@@ -2642,6 +2681,17 @@ safe_gate_mise_pin_upgrade_targets() {
       }
     fi
     if (( ${SAFE_GATE_MISE_BUMP:-0} )); then
+      # --bump moves a CONFIGURED request; with none, mise installs
+      # nothing, so auditing the latest release reported a verdict for a
+      # no-op (delta-6 finding F3).
+      matched=0
+      while IFS=$'\t' read -r key _; do
+        [[ "$key" == "$canon" ]] && { matched=1; break; }
+      done <<<"$entries"
+      if (( matched == 0 )); then
+        safe_gate_err "safe: BLOCKED mise upgrade — '${spec}' has no configured version request to check against; name the exact version: mise upgrade ${canon}@<version>; details: safe explain"
+        return 100
+      fi
       pinned+=("$canon")
       continue
     fi
@@ -2653,7 +2703,7 @@ safe_gate_mise_pin_upgrade_targets() {
     # not just the first; an exact pin cannot move at all, so auditing it
     # reported a verdict for a no-op (delta-4 finding F3).
     matched=0
-    while IFS=$'\t' read -r key req; do
+    while IFS=$'\t' read -r key req _; do
       [[ "$key" == "$canon" ]] || continue
       matched=1
       [[ "$req" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] && continue

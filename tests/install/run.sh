@@ -2736,6 +2736,85 @@ case_mise_npm_installer_reads_mise_settings() {
   pass "$FUNCNAME"
 }
 
+case_mise_rows_snapshot_is_shared() {
+  prepare_case "mise-rows-snapshot"
+  # Selection and attribution must read ONE snapshot: capturing the loader
+  # with $(...) ran its assignments in a subshell, so the cache never
+  # survived and each reader re-queried mise, which could disagree with
+  # the first answer (delta-6 finding F1).
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  local ls_queries
+  ls_queries="$(grep -c $'MISEQ\tls\t--current\t--json' "${LOG_FILE}" 2>/dev/null || printf '0')"
+  if [[ "${ls_queries}" != "1" ]]; then
+    printf 'expected exactly one mise ls query, got %s:\n' "${ls_queries}" >&2
+    cat "${LOG_FILE}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
+case_mise_exclusion_canonicalization_fails_closed() {
+  prepare_case "mise-exclusion-fail-closed"
+  # An exclusion that cannot be canonicalized must not silently match: the
+  # old fallback rewrote it as the current target (bash expands every RHS
+  # of one `local` before the new locals exist), dropping a real target
+  # from the audit set entirely (delta-6 finding F3).
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade npm:blockme --exclude nonsense' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_bump_requires_a_configured_target() {
+  prepare_case "mise-bump-configured"
+  # --bump moves a CONFIGURED request; with none, mise installs nothing,
+  # so auditing the latest release reported a verdict for a no-op
+  # (delta-6 finding F3).
+  MISE_LS_JSON='{}' SAFE_INSTALL_TEST_SCRIPT='mise upgrade --bump npm:blockme' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{}' SAFE_INSTALL_TEST_SCRIPT='mise upgrade --bump npm:blockme@0.5.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_installer_values_are_validated() {
+  prepare_case "mise-installer-values"
+  # An environment value was passed through unvalidated, so an invalid
+  # selector became a package verdict instead of an infrastructure
+  # refusal (delta-6 finding F4).
+  MISE_ENV_JSON='{"MISE_NPM_PACKAGE_MANAGER": "not-a-manager"}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install npm:blockme@1.0.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+
+  # Aube is a valid mise installer reading npm-compatible sources: it
+  # audits normally rather than being refused as unrecognized.
+  : > "${LOG_FILE}"
+  MISE_NPM_PM=aube SAFE_INSTALL_TEST_SCRIPT='mise install npm:blockme@1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  MISE_NPM_PM=aube_cli SAFE_INSTALL_TEST_SCRIPT='mise install npm:blockme@1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+
+  # A nonzero settings command fails closed.
+  : > "${LOG_FILE}"
+  MISE_NPM_PM_STATUS=1 SAFE_INSTALL_TEST_SCRIPT='mise install npm:okpkg@1.0.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_mise_entry_requires_requested_version() {
   prepare_case "mise-entry-requires-version"
   # A missing requested_version was defaulted to "": safe audited a bare
@@ -2952,6 +3031,10 @@ main() {
     case_mise_bump_audits_the_moved_target \
     case_mise_upgrade_lookup_is_canonical_and_ordered \
     case_mise_npm_installer_reads_mise_settings \
+    case_mise_rows_snapshot_is_shared \
+    case_mise_exclusion_canonicalization_fails_closed \
+    case_mise_bump_requires_a_configured_target \
+    case_mise_installer_values_are_validated \
     case_zsh_stub_warns_on_missing_mise_wrapper \
     case_uninstall_cleans_shell_and_legacy_binaries
   do
