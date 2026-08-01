@@ -1365,6 +1365,45 @@ case_uv_displacement_refuses_to_clobber_an_existing_original() {
   pass "$FUNCNAME"
 }
 
+# Displacing a binary and then failing to write its wrapper would leave the
+# user with a truncated uv and their real one stranded at uv.original — every
+# later `uv` call broken until they went looking for it. The two halves are one
+# operation or neither.
+case_failed_wrapper_write_restores_the_displaced_binary() {
+  prepare_case "failed-wrapper-write-restores"
+  mkdir -p "${HOME_DIR}/.local/bin"
+  printf '#!/usr/bin/env bash\n# the real uv\necho uv-real\n' > "${HOME_DIR}/.local/bin/uv"
+  chmod +x "${HOME_DIR}/.local/bin/uv"
+
+  # Fail the chmod for the uv wrapper only, delegating everything else to the
+  # real one: this exercises install.sh's own failure path, not a stub of it.
+  local stubdir="${WORK_DIR}/failing-chmod"
+  mkdir -p "${stubdir}"
+  cat > "${stubdir}/chmod" <<'STUB'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  case "${arg}" in
+    */uv) exit 1 ;;
+  esac
+done
+exec /usr/bin/chmod "$@"
+STUB
+  chmod +x "${stubdir}/chmod"
+
+  PATH="${stubdir}:${PATH}" HOME="${HOME_DIR}" bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME" || return
+
+  # uv is back where its owner put it, executable, with no wrapper and no
+  # leftover .original — and the installer said so instead of claiming success.
+  grep -Fqx '# the real uv' "${HOME_DIR}/.local/bin/uv" || { fail "$FUNCNAME"; return; }
+  [[ -x "${HOME_DIR}/.local/bin/uv" ]] || { fail "$FUNCNAME"; return; }
+  [[ ! -e "${HOME_DIR}/.local/bin/uv.original" ]] || { fail "$FUNCNAME"; return; }
+  assert_err_contains_fragment 'could not write gate wrappers for: uv' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'gated them: uv' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_uninstall_restores_the_displaced_binary() {
   prepare_case "uninstall-restores-displaced"
   mkdir -p "${HOME_DIR}/.local/bin"
@@ -3284,6 +3323,7 @@ main() {
     case_install_writes_gate_wrappers \
     case_uv_binary_is_displaced_and_gated \
     case_uv_displacement_refuses_to_clobber_an_existing_original \
+    case_failed_wrapper_write_restores_the_displaced_binary \
     case_uninstall_restores_the_displaced_binary \
     case_gate_resolves_a_displaced_original \
     case_selective_install_refreshes_gate_lib \

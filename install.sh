@@ -144,13 +144,24 @@ gate_tool_displaceable() {
   return 1
 }
 
+write_gate_wrapper() {
+  local target="$1" tool="$2"
+  cat > "$target" <<EOF || return 1
+#!/usr/bin/env bash
+# safe-gate-wrapper v1 tool=${tool}
+exec safe gate ${tool} -- "\$@"
+EOF
+  chmod 0755 "$target" || return 1
+}
+
 install_gate_wrappers() {
-  local tool target
-  local -a written=() skipped=() displaced=() conflicted=()
+  local tool target moved
+  local -a written=() skipped=() displaced=() conflicted=() failed=()
 
   mkdir -p "$BIN_DIR"
   for tool in "${GATE_TOOLS[@]}"; do
     target="$BIN_DIR/$tool"
+    moved=""
     if [[ -e "$target" || -L "$target" ]] && ! gate_wrapper_marked "$target" "$tool"; then
       # For most tools an unmarked file is somebody else's binary and the tool
       # goes ungated. For a tool whose ONLY installation sits at exactly the
@@ -168,21 +179,33 @@ install_gate_wrappers() {
           skipped+=("$tool")
           continue
         fi
-        mv -- "$target" "$target.original"
-        displaced+=("$tool")
+        if ! mv -- "$target" "$target.original"; then
+          skipped+=("$tool")
+          continue
+        fi
+        moved="$target.original"
       else
         skipped+=("$tool")
         continue
       fi
     fi
     rm -f "$target"
-    cat > "$target" <<EOF
-#!/usr/bin/env bash
-# safe-gate-wrapper v1 tool=${tool}
-exec safe gate ${tool} -- "\$@"
-EOF
-    chmod 0755 "$target"
-    written+=("$tool")
+    if write_gate_wrapper "$target" "$tool"; then
+      [[ -n "$moved" ]] && displaced+=("$tool")
+      written+=("$tool")
+    else
+      # The displacement is only complete once the wrapper is on disk and
+      # executable. If the write or the chmod fails — a full filesystem, an I/O
+      # error — the user is left with a truncated `uv` and their real binary
+      # stranded at uv.original, and every later `uv` call breaks until they
+      # find it. Undo both halves: a failed install must never cost the
+      # operator their tool.
+      rm -f "$target"
+      if [[ -n "$moved" ]] && ! mv -- "$moved" "$target"; then
+        warn "could not restore $moved to $target — the real $tool binary is at $moved"
+      fi
+      failed+=("$tool")
+    fi
   done
 
   if [[ "${#written[@]}" -gt 0 ]]; then
@@ -190,6 +213,9 @@ EOF
   fi
   if [[ "${#displaced[@]}" -gt 0 ]]; then
     info "moved real binaries aside to <tool>.original and gated them: ${displaced[*]}"
+  fi
+  if [[ "${#failed[@]}" -gt 0 ]]; then
+    warn "could not write gate wrappers for: ${failed[*]} — nothing was left half-installed, and these tools stay ungated"
   fi
   if [[ "${#conflicted[@]}" -gt 0 ]]; then
     warn "found an existing <tool>.original for: ${conflicted[*]} — left it and the current binary untouched, so these stay ungated"
