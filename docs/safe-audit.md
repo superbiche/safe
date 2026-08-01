@@ -146,24 +146,74 @@ SAFE_AUDIT_GRYPE_DB_MAX_AGE_DAYS=14 safe audit scan --machine remote-a --project
 
 ```bash
 safe audit check express@4.21.0 --ecosystem npm
+safe audit check express --ecosystem npm            # unpinned: resolves the target first
 safe audit check ruff@0.11.0 --ecosystem python --json
 ```
 
-Checks include OSV, Socket package scoring when available, and the shared `safe run` blocklist. Verdicts are:
+Checks are **version-aware**: the command first resolves the version the
+package manager would actually install, then matches OSV advisories against
+that exact version's affected ranges.
+
+- An exact version in the spec is used as-is (no network).
+- An unpinned npm spec resolves through the registry packument: dist-tag for
+  installs, and with `--op update` the **in-range** target derived from the
+  project's `package.json` and lockfile ranges (what `npm update` would
+  install, not the dist-tag).
+- pip/uv, cargo, composer, and go unpinned specs resolve to the registry's
+  latest release.
+- When resolution fails (network, private registry, `||` ranges, git/workspace
+  specs), the check degrades to a package-level audit with a WARN floor and
+  reason `version_unresolved` — never a silent GO.
+
+Advisories are classified per resolved version as `affecting`, `remediated`
+(fixed at or below the resolved version), `unfixed`, or `ambiguous`. Only
+**affecting** advisories drive the verdict: a bump that is itself the
+remediation gets a PASS with a notice naming the fixed advisories. An
+affecting advisory whose severity is listed in `install.block_severities`
+(default: `critical`) produces BLOCK; other affecting advisories produce
+WARN. An OSV outage produces WARN (fail closed), never a zero-CVE PASS.
+
+Verdicts and exit codes are unchanged for consumers:
 
 ```text
-GO
-WARN
-BLOCK
+GO    (exit 0)
+WARN  (exit 10)
+BLOCK (exit 20)
 ```
 
-Socket is optional for command availability but improves package behavior scoring. Authenticate with:
+### Install gate mode
+
+The shell install wrappers and `safe install` invoke the check as a gate:
+
+```bash
+safe audit check <pkg> --ecosystem npm --gate install --op install|update
+```
+
+Gate mode applies the allow policy itself and exits 0 when the install may
+proceed:
+
+- **GO** proceeds and records the pinned resolved version in
+  `~/.config/safe/run/install-known.json` (machine-written evidence with a
+  pointer to the check receipt) — no operator terminal involved.
+- **WARN** proceeds only when a pinned `host-allow` entry matches the
+  **resolved** version, or when every WARN cause is listed in the opt-in
+  `install.auto_allow_tolerate` config and no advisory affects the resolved
+  version. Otherwise it refuses (exit 10) with an actionable, always-pinned
+  hint — suggestions never use `@latest`.
+- **BLOCK** refuses (exit 20) and points at operator review.
+
+A Socket scoring failure (missing CLI, auth, rate limit) is reported as an
+infrastructure failure with a recovery path (`socket login`, `safe doctor`),
+explicitly distinguished from a package finding. It still refuses by default:
+fix the wiring rather than tolerating blind installs.
+
+Socket improves behavioral scoring. Authenticate with:
 
 ```bash
 socket login
 ```
 
-For predictable repeated use, use a Socket account token. The practical token scope for `socket package score` is `packages:list`.
+For predictable repeated use, use a Socket account token. The practical token scope for `socket package score` is `packages:list`. `safe doctor` reports the Socket CLI and token wiring.
 
 ## Release Review
 

@@ -40,11 +40,205 @@ safe_install_warn_missing() {
 }
 
 safe_install_run_audit() {
+  local -a extra=()
+  [[ -n "${SAFE_INSTALL_DIST_TAG:-}" ]] && extra+=(--dist-tag "${SAFE_INSTALL_DIST_TAG}")
+  [[ -n "${SAFE_INSTALL_REGISTRY:-}" ]] && extra+=(--registry "${SAFE_INSTALL_REGISTRY}")
+  [[ -n "${SAFE_INSTALL_PROJECT_DIR:-}" ]] && extra+=(--project-dir "${SAFE_INSTALL_PROJECT_DIR}")
+  [[ -n "${SAFE_INSTALL_NPM_USERCONFIG:-}" ]] && extra+=(--npm-userconfig "${SAFE_INSTALL_NPM_USERCONFIG}")
+  [[ -n "${SAFE_INSTALL_NPM_GLOBALCONFIG:-}" ]] && extra+=(--npm-globalconfig "${SAFE_INSTALL_NPM_GLOBALCONFIG}")
   if (( $+commands[timeout] )); then
-    command timeout "${_SAFE_INSTALL_TIMEOUT_SECONDS:-${SAFE_INSTALL_TIMEOUT_SECONDS:-30}}" safe audit check "$@"
+    command timeout "${_SAFE_INSTALL_TIMEOUT_SECONDS:-${SAFE_INSTALL_TIMEOUT_SECONDS:-30}}" safe audit check "$@" "${extra[@]}"
   else
-    command safe audit check "$@"
+    command safe audit check "$@" "${extra[@]}"
   fi
+}
+
+# Target-altering selectors change what the package manager actually
+# installs (tag, source registry/index, project dir). They were previously
+# stripped from the audit while staying in the real command — the audit then
+# judged the wrong target (PR#29 review finding 3). Scan the original argv
+# (never inside a $() parser subshell: globals must survive) and thread the
+# values into the audit; safe-audit resolves with them or fails closed.
+# Source selectors are cumulative (pip considers --find-links AND the index):
+# accumulate every one — a later trusted selector must never erase an earlier
+# untrusted one (PR#29 delta-2 finding 3). A REPEATED selector moves to the
+# END: npm options are last-wins, and the resolver reads the last word to
+# audit what npm actually fetches (delta-4 finding 3.1) — the trust sweep is
+# order-independent, so the move is safe for cumulative families too.
+# Trailing slashes normalize away so writer and readers derive identical
+# source identities (delta-4 finding N1).
+safe_install_add_source() {
+  local value="$1"
+  while [[ "${value}" == */ ]]; do value="${value%/}"; done
+  # The accumulated set stays OPERATIONAL (credentials included): safe-audit
+  # fetches packuments from it, and pre-redacting here broke authenticated
+  # registries (delta-6 finding N2). Redaction happens centrally in
+  # safe-audit at every identity/receipt/display sink.
+  [[ -n "${value}" ]] || return 0
+  local -a kept=()
+  local w
+  for w in ${=SAFE_INSTALL_REGISTRY}; do
+    [[ "${w}" == "${value}" ]] || kept+=("${w}")
+  done
+  kept+=("${value}")
+  SAFE_INSTALL_REGISTRY="${kept[*]}"
+}
+
+# Alternate npm config files are threaded to safe-audit AS PATHS, never
+# flattened into the source set: extracting their values here lost the
+# key/scope and npm's config-tier precedence (wrong-registry resolution),
+# and copied any inline credentials out of the protected file into argv and
+# shell state (delta-7 findings 3.2b and N2). safe-audit resolves the
+# effective endpoint from the file itself.
+
+safe_install_scan_target_flags() {
+  local family="$1"
+  shift
+  typeset -g SAFE_INSTALL_DIST_TAG=""
+  typeset -g SAFE_INSTALL_REGISTRY=""
+  typeset -g SAFE_INSTALL_PROJECT_DIR=""
+  typeset -g SAFE_INSTALL_NPM_USERCONFIG=""
+  typeset -g SAFE_INSTALL_NPM_GLOBALCONFIG=""
+  local prev="" arg
+  for arg in "$@"; do
+    case "${family}" in
+      npm)
+        case "${prev}" in
+          --tag) SAFE_INSTALL_DIST_TAG="${arg}" ;;
+          # --@scope:registry is a scoped source selector npm accepts on the
+          # command line (delta-5 finding 3.2). It is threaded as a KEYED
+          # token (@scope:registry=URL) — flattening the bare URL loses the
+          # key and lets the resolver pick a different scope's registry
+          # (delta-6 finding 3.2b). --userconfig/--globalconfig swap in
+          # whole config files whose registry keys become effective.
+          --registry) safe_install_add_source "${arg}" ;;
+          --@*:registry) safe_install_add_source "${prev#--}=${arg}" ;;
+          --userconfig) SAFE_INSTALL_NPM_USERCONFIG="${arg}" ;;
+          --globalconfig) SAFE_INSTALL_NPM_GLOBALCONFIG="${arg}" ;;
+          --prefix|-C|--cwd|--dir) SAFE_INSTALL_PROJECT_DIR="${arg}" ;;
+        esac
+        case "${arg}" in
+          --tag=*) SAFE_INSTALL_DIST_TAG="${arg#*=}" ;;
+          --registry=*) safe_install_add_source "${arg#*=}" ;;
+          --@*:registry=*) safe_install_add_source "${arg#--}" ;;
+          --userconfig=*) SAFE_INSTALL_NPM_USERCONFIG="${arg#*=}" ;;
+          --globalconfig=*) SAFE_INSTALL_NPM_GLOBALCONFIG="${arg#*=}" ;;
+          --prefix=*|--cwd=*|--dir=*) SAFE_INSTALL_PROJECT_DIR="${arg#*=}" ;;
+        esac
+        ;;
+      python)
+        case "${prev}" in
+          --index-url|-i|--extra-index-url|--default-index|--index) safe_install_add_source "${arg}" ;;
+          # find-links names a real endpoint: record it so operators can
+          # trust a specific location instead of a blanket sentinel
+          # (delta-5 finding 3.2 mitigation).
+          --find-links|-f) safe_install_add_source "${arg}" ;;
+        esac
+        case "${arg}" in
+          --index-url=*|--extra-index-url=*|--default-index=*|--index=*) safe_install_add_source "${arg#*=}" ;;
+          --find-links=*) safe_install_add_source "${arg#*=}" ;;
+          --no-index) safe_install_add_source "local:no-index" ;;
+        esac
+        ;;
+      cargo)
+        case "${prev}" in
+          --registry|--index) safe_install_add_source "${arg}" ;;
+        esac
+        case "${arg}" in
+          --registry=*|--index=*) safe_install_add_source "${arg#*=}" ;;
+        esac
+        ;;
+      composer)
+        case "${prev}" in
+          --repository) safe_install_add_source "${arg}" ;;
+          --working-dir|-d) SAFE_INSTALL_PROJECT_DIR="${arg}" ;;
+        esac
+        case "${arg}" in
+          --repository=*) safe_install_add_source "${arg#*=}" ;;
+          --working-dir=*) SAFE_INSTALL_PROJECT_DIR="${arg#*=}" ;;
+        esac
+        ;;
+    esac
+    prev="${arg}"
+  done
+}
+
+# Update-family subcommands resolve in-range instead of to the dist-tag; the
+# audit needs to know which semantics apply to resolve the real target.
+safe_install_audit_op() {
+  case "${SAFE_INSTALL_SUBCMD:-}" in
+    update|u|up|upgrade|udpate) print -rn -- "update" ;;
+    *) print -rn -- "install" ;;
+  esac
+}
+
+# Persistent record of install-gate decisions, mirroring safe-run's audit_log
+# field format (ts | runner | pkg | tier | context | decision | extra).
+safe_install_audit_log() {
+  local ecosystem="$1" package="$2" decision="$3" extra="${4:-}"
+  local data_dir="${SAFE_RUN_DATA_DIR:-${SAFE_DATA_DIR:-$HOME/.local/share/safe}/run}"
+  local context="non-tty"
+  [[ -t 0 && -t 1 ]] && context="interactive"
+  mkdir -p "${data_dir}" 2>/dev/null || return 0
+  local line
+  line="$(command date -Iseconds) | install:${ecosystem} | ${package} | GATE | ${context} | ${decision}${extra:+ | ${extra}}"
+  print -r -- "${line//[$'\r\n']/ }" >> "${data_dir}/audit.log" 2>/dev/null || true
+}
+
+safe_install_known_file() {
+  print -r -- "${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}/install-known.json"
+}
+
+# Offline fallback: when the audit itself timed out, an exact-version request
+# matching a fresh install-known entry (a previously recorded clean check) may
+# proceed on that stale evidence. Unpinned requests never qualify.
+safe_install_known_matches() {
+  local package="$1"
+  local ecosystem="$2"
+  local known_file name version entry ttl_days entry_epoch now_epoch
+
+  # install-known entries are keyed by the canonical resolver ecosystem
+  # (safe-audit normalizes at check entry); the wrappers speak tool labels.
+  case "${ecosystem}" in
+    cargo) ecosystem="rust" ;;
+    composer) ecosystem="php" ;;
+    pip|uv) ecosystem="python" ;;
+  esac
+
+  (( $+commands[jq] )) || return 1
+  known_file="$(safe_install_known_file)"
+  [[ -r "${known_file}" ]] || return 1
+
+  IFS=$'\t' read -r name version <<< "$(safe_install_split_spec "${package}")"
+  [[ -n "${name}" && -n "${version}" && "${version}" != "latest" ]] || return 1
+
+  # Only fully clean GO evidence may satisfy the offline fallback — a
+  # tolerated-WARN record is not clean evidence (PR#29 review finding 5).
+  # The source identity (implicit-default vs explicit:<set>, delta-3
+  # finding 5) must be byte-identical to what safe-audit's receipt writer
+  # recorded; the derivation (argv + env + rc precedence, per ecosystem) is
+  # centralized in safe-audit — ask it instead of mirroring (delta-4
+  # findings 3.2 and N1). Local-only plumbing, no network. No identity ->
+  # fail closed: stale evidence never applies without a trustworthy match.
+  local -a es_args=("${name}" --ecosystem "${ecosystem}")
+  [[ -n "${SAFE_INSTALL_REGISTRY:-}" ]] && es_args+=(--registry "${SAFE_INSTALL_REGISTRY}")
+  [[ -n "${SAFE_INSTALL_PROJECT_DIR:-}" ]] && es_args+=(--project-dir "${SAFE_INSTALL_PROJECT_DIR}")
+  [[ -n "${SAFE_INSTALL_NPM_USERCONFIG:-}" ]] && es_args+=(--npm-userconfig "${SAFE_INSTALL_NPM_USERCONFIG}")
+  [[ -n "${SAFE_INSTALL_NPM_GLOBALCONFIG:-}" ]] && es_args+=(--npm-globalconfig "${SAFE_INSTALL_NPM_GLOBALCONFIG}")
+  local current_source
+  current_source="$(command safe audit effective-sources "${es_args[@]}" 2>/dev/null)" || return 1
+  [[ -n "${current_source}" ]] || return 1
+  entry="$(jq -r --arg k "${ecosystem}:${name}" --arg v "${version}" --arg src "${current_source}" \
+    '.packages[$k] | select(.version == $v and .verdict == "GO" and ((.source // "implicit-default") == $src)) | .first_allowed // empty' "${known_file}" 2>/dev/null || true)"
+  [[ -n "${entry}" ]] || return 1
+
+  ttl_days="$(jq -r '.install.auto_allow_ttl_days // 30' \
+    "${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}/config.json" 2>/dev/null || print -rn 30)"
+  [[ "${ttl_days}" == <-> ]] || ttl_days=30
+  entry_epoch="$(command date -d "${entry}" +%s 2>/dev/null || true)"
+  [[ -n "${entry_epoch}" ]] || return 1
+  now_epoch="$(command date +%s)"
+  (( now_epoch - entry_epoch <= ttl_days * 86400 ))
 }
 
 safe_install_host_allow_file() {
@@ -223,18 +417,27 @@ safe_install_pip_project_install() {
 
 # One-line operator hint for a refused package. host-allow only unlocks npm
 # installs, so other ecosystems point at the audit detail command instead.
+# Fallback hint when the audit could not supply a pinned suggestion (the gate
+# prints resolved-version hints itself). Must never render an @latest shape:
+# allow entries are always pinned to an exact resolved version.
 safe_install_allow_hint() {
   local package="$1"
   local ecosystem="$2"
+  local name version
 
+  IFS=$'\t' read -r name version <<< "$(safe_install_split_spec "${package}")"
   if [[ "${ecosystem}" == "npm" ]]; then
-    print -rn -- "to allow: ask the operator to run: safe run host-allow add ${package} --reason \"...\" — then retry"
+    if [[ -n "${version}" && "${version}" != "latest" ]]; then
+      print -rn -- "to allow: ask the operator to run: safe run host-allow add ${package} --reason \"...\" — then retry"
+    else
+      print -rn -- "to allow: pin an exact version first (see the resolved-version hint above) — allow entries are never @latest"
+    fi
   else
     print -rn -- "to allow: operator review — safe audit check ${package} --ecosystem ${ecosystem}"
   fi
 }
 
-# Check one package via safe audit.
+# Check one package via safe audit's install gate.
 # Returns: 0=GO/proceed, 100=policy refusal, 104=audit BLOCK verdict.
 safe_install_check() {
   local package="$1"
@@ -246,46 +449,73 @@ safe_install_check() {
     return 0
   fi
 
-  safe_install_run_audit "${package}" --ecosystem "${ecosystem}"
+  safe_install_run_audit "${package}" --ecosystem "${ecosystem}" \
+    --gate install --op "$(safe_install_audit_op)"
   audit_status=$?
 
   case "${audit_status}" in
     0)
+      safe_install_audit_log "${ecosystem}" "${package}" "PROCEED"
       return 0
       ;;
     1|10)
       if safe_install_host_allow_matches "${package}" "${ecosystem}"; then
         print -u2 -- "safe install: safe audit warned for ${package}; exact host-allow entry permits install"
+        safe_install_audit_log "${ecosystem}" "${package}" "HOST_ALLOW_OVERRIDE"
         return 0
       fi
       print -u2 -- "safe: BLOCKED ${ecosystem} install of ${package} — safe audit verdict WARN; $(safe_install_allow_hint "${package}" "${ecosystem}"); details: safe explain"
+      safe_install_audit_log "${ecosystem}" "${package}" "REFUSED_WARN"
       return 100
       ;;
     2|20)
       print -u2 -- "safe: BLOCKED ${ecosystem} install of ${package} — safe audit verdict BLOCK; $(safe_install_allow_hint "${package}" "${ecosystem}"); details: safe explain"
+      safe_install_audit_log "${ecosystem}" "${package}" "REFUSED_BLOCK"
       return 104
       ;;
     124|137)
+      if safe_install_known_matches "${package}" "${ecosystem}"; then
+        print -u2 -- "safe install: safe audit timed out; proceeding on recorded clean check for ${package} (stale evidence)"
+        safe_install_audit_log "${ecosystem}" "${package}" "STALE_EVIDENCE"
+        return 0
+      fi
       print -u2 -- "safe: BLOCKED ${ecosystem} install of ${package} — safe audit timed out (fail closed); retry or ask the operator; details: safe explain"
+      safe_install_audit_log "${ecosystem}" "${package}" "TIMEOUT_FAILCLOSED"
       return 100
       ;;
     *)
       print -u2 -- "safe: BLOCKED ${ecosystem} install of ${package} — safe audit failed with exit ${audit_status} (fail closed); ask the operator; details: safe explain"
+      safe_install_audit_log "${ecosystem}" "${package}" "REFUSED_AUDIT_ERROR" "exit=${audit_status}"
       return 100
       ;;
   esac
 }
 
+# Scanned target state (which may carry an operational credential from an
+# argv --registry) never outlives the gate decision: this shell is
+# long-lived, and a lingering global is a credential-lifetime leak
+# (delta-7 finding N2). Cleared on EVERY exit path, after the last package.
+safe_install_clear_target_flags() {
+  SAFE_INSTALL_DIST_TAG=""
+  SAFE_INSTALL_REGISTRY=""
+  SAFE_INSTALL_PROJECT_DIR=""
+  SAFE_INSTALL_NPM_USERCONFIG=""
+  SAFE_INSTALL_NPM_GLOBALCONFIG=""
+}
+
 safe_install_check_many() {
   local ecosystem="$1"
   shift
-  local package
+  local package rc=0
 
   for package in "$@"; do
-    safe_install_check "${package}" "${ecosystem}" || return $?
+    safe_install_check "${package}" "${ecosystem}"
+    rc=$?
+    (( rc != 0 )) && break
   done
 
-  return 0
+  safe_install_clear_target_flags
+  return "${rc}"
 }
 
 safe_install_check_packages() {
@@ -318,7 +548,7 @@ safe_install_npm_like_packages() {
       -g|--global|-f|--force|-D|--dev|-P|--peer|-O|--optional|-E|--exact|-T|--tilde|--cached|--save|--save-prod|--save-dev|--save-optional|--save-peer|--no-save|--prefer-offline|--prefer-online|--legacy-peer-deps|--strict-peer-deps|--dry-run|--package-lock-only|--workspace-root|--ignore-scripts|--foreground-scripts)
         continue
         ;;
-      --tag|--registry|--cache|--prefix|--userconfig|--globalconfig|--workspace|-w|--filter|--omit|--include|--install-strategy|--save-prefix|--mode|--cwd)
+      --tag|--registry|--@*:registry|--cache|--prefix|--userconfig|--globalconfig|--workspace|-w|--filter|--omit|--include|--install-strategy|--save-prefix|--mode|--cwd)
         skip_next=1
         continue
         ;;
@@ -361,20 +591,37 @@ safe_install_cargo_packages() {
   local -a packages
   local arg
   local skip_next=0
+  local capture_version=0
+  local crate_version=""
 
   packages=()
   for arg in "$@"; do
+    if (( capture_version )); then
+      crate_version="${arg}"
+      capture_version=0
+      continue
+    fi
     if (( skip_next )); then
       skip_next=0
       continue
     fi
 
     case "${arg}" in
-      --version|--vers|--index|--registry|--root|--target|--features|--bin|--example)
+      --version|--vers)
+        # `cargo install <crate> --version <v>` pins the crate; dropping the
+        # value would audit the bare name (PR#29 review finding 7).
+        capture_version=1
+        continue
+        ;;
+      --version=*|--vers=*)
+        crate_version="${arg#*=}"
+        continue
+        ;;
+      --index|--registry|--root|--target|--features|--bin|--example)
         skip_next=1
         continue
         ;;
-      --version=*|--vers=*|--index=*|--registry=*|--root=*|--target=*|--features=*|--bin=*|--example=*)
+      --index=*|--registry=*|--root=*|--target=*|--features=*|--bin=*|--example=*)
         continue
         ;;
       --locked|--offline|--quiet|--debug|--force|-f|--list|--no-track|--all-features|--no-default-features)
@@ -384,10 +631,18 @@ safe_install_cargo_packages() {
         continue
         ;;
       *)
-        packages+=("${arg}@latest")
+        packages+=("${arg}")
         ;;
     esac
   done
+
+  if [[ -n "${crate_version}" ]]; then
+    local -a versioned=()
+    for arg in "${packages[@]}"; do
+      versioned+=("${arg}@${crate_version}")
+    done
+    packages=("${versioned[@]}")
+  fi
 
   print -r -l -- "${packages[@]}"
 }
@@ -487,7 +742,7 @@ safe_install_npm_spec() {
     version="latest"
   fi
 
-  print -r -- "${name}@${version}"
+  safe_install_print_spec "${name}" "${version}"
 }
 
 safe_install_python_spec() {
@@ -505,7 +760,7 @@ safe_install_python_spec() {
     version="latest"
   fi
 
-  print -r -- "${name}@${version}"
+  safe_install_print_spec "${name}" "${version}"
 }
 
 safe_install_colon_spec() {
@@ -520,7 +775,7 @@ safe_install_colon_spec() {
     version="latest"
   fi
 
-  print -r -- "${name}@${version}"
+  safe_install_print_spec "${name}" "${version}"
 }
 
 safe_install_go_spec() {
@@ -535,7 +790,21 @@ safe_install_go_spec() {
     version="latest"
   fi
 
-  print -r -- "${name}@${version}"
+  safe_install_print_spec "${name}" "${version}"
+}
+
+# An unpinned request is audited as the bare name: safe audit resolves the
+# real target version itself (a fabricated @latest is version-blind and made
+# pinned host-allow entries unmatchable).
+safe_install_print_spec() {
+  local name="$1"
+  local version="$2"
+
+  if [[ -z "${version}" || "${version}" == "latest" ]]; then
+    print -r -- "${name}"
+  else
+    print -r -- "${name}@${version}"
+  fi
 }
 
 # A bare command name has no package-spec syntax: no version/tag/alias.
@@ -821,9 +1090,28 @@ safe_install_exec_gate() {
 }
 
 safe_install_npm_like() {
+  # Scanned target state (possibly credential-bearing) is cleared on EVERY
+  # exit of a scanning route — project scans, parser fallbacks, unsupported
+  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
+  # cleanup tied only to check_many missed the project-install paths).
+  {
+    safe_install_npm_like_impl "$@"
+  } always {
+    # Inline assignments — a cleanup HELPER could itself be stripped by a
+    # partial shell snapshot (delta-9 finding N4).
+    SAFE_INSTALL_DIST_TAG=""
+    SAFE_INSTALL_REGISTRY=""
+    SAFE_INSTALL_PROJECT_DIR=""
+    SAFE_INSTALL_NPM_USERCONFIG=""
+    SAFE_INSTALL_NPM_GLOBALCONFIG=""
+  }
+}
+
+safe_install_npm_like_impl() {
   local tool="$1"
   shift
   safe_install_route "${tool}" "$@" || return $?
+  safe_install_scan_target_flags npm "$@"
   local subcommand="${SAFE_INSTALL_SUBCMD}"
   local -a rest raw packages
   rest=("${@:$((SAFE_INSTALL_SUBCMD_IDX + 1))}")
@@ -1079,9 +1367,28 @@ safe_install_python_packages() {
 }
 
 safe_install_pip_like() {
+  # Scanned target state (possibly credential-bearing) is cleared on EVERY
+  # exit of a scanning route — project scans, parser fallbacks, unsupported
+  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
+  # cleanup tied only to check_many missed the project-install paths).
+  {
+    safe_install_pip_like_impl "$@"
+  } always {
+    # Inline assignments — a cleanup HELPER could itself be stripped by a
+    # partial shell snapshot (delta-9 finding N4).
+    SAFE_INSTALL_DIST_TAG=""
+    SAFE_INSTALL_REGISTRY=""
+    SAFE_INSTALL_PROJECT_DIR=""
+    SAFE_INSTALL_NPM_USERCONFIG=""
+    SAFE_INSTALL_NPM_GLOBALCONFIG=""
+  }
+}
+
+safe_install_pip_like_impl() {
   local tool="$1"
   shift
   safe_install_route "${tool}" "$@" || return $?
+  safe_install_scan_target_flags python "$@"
   local subcommand="${SAFE_INSTALL_SUBCMD}"
   local subidx=$SAFE_INSTALL_SUBCMD_IDX
   local -a packages
@@ -1135,7 +1442,10 @@ pip3() {
 }
 
 uv() {
-  if ! typeset -f safe_install_python_packages safe_install_check >/dev/null 2>&1; then
+  # INLINE degraded guard (see the contract comment above npm()): the
+  # impl and cleanup helpers can be stripped by shell snapshots, so the
+  # public wrapper must refuse legibly on its own (delta-9 finding N4).
+  if ! typeset -f uv_impl safe_install_python_packages safe_install_check >/dev/null 2>&1; then
     # Scan every token for a gated subcommand so a leading global flag can't
     # hide it (`uv --offline tool run x`). `tool` covers tool run/install.
     local __a
@@ -1158,7 +1468,26 @@ uv() {
     fi
     command uv "$@"; return $?
   fi
+  # Scanned target state (possibly credential-bearing) is cleared on EVERY
+  # exit of a scanning route — project scans, parser fallbacks, unsupported
+  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
+  # cleanup tied only to check_many missed the project-install paths).
+  {
+    uv_impl "$@"
+  } always {
+    # Inline assignments — a cleanup HELPER could itself be stripped by a
+    # partial shell snapshot (delta-9 finding N4).
+    SAFE_INSTALL_DIST_TAG=""
+    SAFE_INSTALL_REGISTRY=""
+    SAFE_INSTALL_PROJECT_DIR=""
+    SAFE_INSTALL_NPM_USERCONFIG=""
+    SAFE_INSTALL_NPM_GLOBALCONFIG=""
+  }
+}
+
+uv_impl() {
   safe_install_route uv "$@" || return $?
+  safe_install_scan_target_flags python "$@"
   local first="${SAFE_INSTALL_SUBCMD}"
   local subidx=$SAFE_INSTALL_SUBCMD_IDX
   local second="${@[subidx+1]:-}"
@@ -1274,7 +1603,10 @@ uv() {
 }
 
 cargo() {
-  if ! typeset -f safe_install_cargo_packages safe_install_check >/dev/null 2>&1; then
+  # INLINE degraded guard (see the contract comment above npm()): the
+  # impl and cleanup helpers can be stripped by shell snapshots, so the
+  # public wrapper must refuse legibly on its own (delta-9 finding N4).
+  if ! typeset -f cargo_impl safe_install_cargo_packages safe_install_check >/dev/null 2>&1; then
     local __a
     for __a in "$@"; do
       case "${__a}" in
@@ -1285,7 +1617,26 @@ cargo() {
     done
     command cargo "$@"; return $?
   fi
+  # Scanned target state (possibly credential-bearing) is cleared on EVERY
+  # exit of a scanning route — project scans, parser fallbacks, unsupported
+  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
+  # cleanup tied only to check_many missed the project-install paths).
+  {
+    cargo_impl "$@"
+  } always {
+    # Inline assignments — a cleanup HELPER could itself be stripped by a
+    # partial shell snapshot (delta-9 finding N4).
+    SAFE_INSTALL_DIST_TAG=""
+    SAFE_INSTALL_REGISTRY=""
+    SAFE_INSTALL_PROJECT_DIR=""
+    SAFE_INSTALL_NPM_USERCONFIG=""
+    SAFE_INSTALL_NPM_GLOBALCONFIG=""
+  }
+}
+
+cargo_impl() {
   safe_install_route cargo "$@" || return $?
+  safe_install_scan_target_flags cargo "$@"
   local subcommand="${SAFE_INSTALL_SUBCMD}"
   local subidx=$SAFE_INSTALL_SUBCMD_IDX
   local -a packages
@@ -1318,7 +1669,10 @@ cargo() {
 }
 
 go() {
-  if ! typeset -f safe_install_go_packages safe_install_check >/dev/null 2>&1; then
+  # INLINE degraded guard (see the contract comment above npm()): the
+  # impl and cleanup helpers can be stripped by shell snapshots, so the
+  # public wrapper must refuse legibly on its own (delta-9 finding N4).
+  if ! typeset -f go_impl safe_install_go_packages safe_install_check >/dev/null 2>&1; then
     # Scan every token: `go install` (any position) and `go run <mod>@<ver>`
     # fetch. `go get` stays out of scope (its fetch runs no code), so the '@'
     # check is scoped to a `run` present — not any '@' anywhere.
@@ -1338,7 +1692,26 @@ go() {
     fi
     command go "$@"; return $?
   fi
+  # Scanned target state (possibly credential-bearing) is cleared on EVERY
+  # exit of a scanning route — project scans, parser fallbacks, unsupported
+  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
+  # cleanup tied only to check_many missed the project-install paths).
+  {
+    go_impl "$@"
+  } always {
+    # Inline assignments — a cleanup HELPER could itself be stripped by a
+    # partial shell snapshot (delta-9 finding N4).
+    SAFE_INSTALL_DIST_TAG=""
+    SAFE_INSTALL_REGISTRY=""
+    SAFE_INSTALL_PROJECT_DIR=""
+    SAFE_INSTALL_NPM_USERCONFIG=""
+    SAFE_INSTALL_NPM_GLOBALCONFIG=""
+  }
+}
+
+go_impl() {
   safe_install_route go "$@" || return $?
+  safe_install_scan_target_flags go "$@"
   local subcommand="${SAFE_INSTALL_SUBCMD}"
   local subidx=$SAFE_INSTALL_SUBCMD_IDX
   local second="${@[subidx+1]:-}"
@@ -1409,7 +1782,10 @@ go() {
 }
 
 composer() {
-  if ! typeset -f safe_install_composer_packages safe_install_check >/dev/null 2>&1; then
+  # INLINE degraded guard (see the contract comment above npm()): the
+  # impl and cleanup helpers can be stripped by shell snapshots, so the
+  # public wrapper must refuse legibly on its own (delta-9 finding N4).
+  if ! typeset -f composer_impl safe_install_composer_packages safe_install_check >/dev/null 2>&1; then
     local __a
     for __a in "$@"; do
       case "${__a}" in
@@ -1420,7 +1796,26 @@ composer() {
     done
     command composer "$@"; return $?
   fi
+  # Scanned target state (possibly credential-bearing) is cleared on EVERY
+  # exit of a scanning route — project scans, parser fallbacks, unsupported
+  # subcommands, refusals, and successful gates alike (delta-8 finding N2:
+  # cleanup tied only to check_many missed the project-install paths).
+  {
+    composer_impl "$@"
+  } always {
+    # Inline assignments — a cleanup HELPER could itself be stripped by a
+    # partial shell snapshot (delta-9 finding N4).
+    SAFE_INSTALL_DIST_TAG=""
+    SAFE_INSTALL_REGISTRY=""
+    SAFE_INSTALL_PROJECT_DIR=""
+    SAFE_INSTALL_NPM_USERCONFIG=""
+    SAFE_INSTALL_NPM_GLOBALCONFIG=""
+  }
+}
+
+composer_impl() {
   safe_install_route composer "$@" || return $?
+  safe_install_scan_target_flags composer "$@"
   local first="${SAFE_INSTALL_SUBCMD}"
   local subidx=$SAFE_INSTALL_SUBCMD_IDX
   local second="${@[subidx+1]:-}"

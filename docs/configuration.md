@@ -8,6 +8,7 @@ Unified config lives under:
     host-allow.json
     blocked.json
     sandbox-known.json
+    install-known.json
     config.json
   audit/
     machines.json
@@ -46,7 +47,40 @@ SAFE_CONFIG_DIR=/tmp/safe-config SAFE_DATA_DIR=/tmp/safe-data safe status
 
 `sandbox-known.json` stores packages accepted for future sandbox execution.
 
-`config.json` stores runtime defaults, linked runner paths, sandbox limits, and warning behavior.
+`install-known.json` is machine-written by `safe audit check --gate install`:
+one entry per `ecosystem:name` recording the pinned resolved version that
+passed a clean version-aware check, the reasons, and a pointer to the check
+receipt. It smooths the install gate only (offline/timeout fallback within
+`install.auto_allow_ttl_days`); no `safe run` exec path consults it. Operator
+host-execution trust stays in `host-allow.json`, which is TTY-gated and
+unchanged.
+
+`config.json` stores runtime defaults, linked runner paths, sandbox limits, warning behavior, and the install-gate policy:
+
+```json
+{
+  "install": {
+    "auto_allow": true,
+    "auto_allow_tolerate": [],
+    "trusted_registries": [],
+    "auto_allow_ttl_days": 30,
+    "block_severities": ["critical"]
+  }
+}
+```
+
+- `auto_allow`: record clean checks in `install-known.json` (GO still
+  proceeds either way).
+- `auto_allow_tolerate`: opt-in WARN causes (e.g. `socket_unavailable`) that
+  may proceed when no advisory affects the resolved version. Default: none.
+- `trusted_registries`: package sources (URL prefixes) the operator trusts
+  like the default public registry. Any other custom source
+  (`--registry`, `--index-url`, `--find-links`, `--no-index`,
+  `--repository`) floors the verdict at WARN — public advisory data cannot
+  vouch for a private artifact of the same name@version.
+- `auto_allow_ttl_days`: freshness window for the offline/timeout fallback.
+- `block_severities`: affecting-advisory severities that hard-BLOCK instead
+  of WARN.
 
 Common sandbox settings include:
 
