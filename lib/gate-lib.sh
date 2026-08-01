@@ -1997,7 +1997,9 @@ safe_gate_mise_npm_installer() {
   fi
   mise_real="$(safe_gate_resolve_real mise)" || return 2
   out="$("$mise_real" ${SAFE_GATE_MISE_CTX[@]+"${SAFE_GATE_MISE_CTX[@]}"} settings get npm.package_manager 2>/dev/null)" || return 2
-  out="${out%%$'\n'*}"
+  # No first-line truncation: command substitution already strips trailing
+  # newlines, so truncating here only turned malformed multi-line output
+  # into an apparently valid scalar (delta-7 finding F4).
   safe_gate_mise_valid_npm_installer "$out"
   return $?
 }
@@ -2192,6 +2194,14 @@ safe_gate_mise_check_spec() {
     # Several configured requests share one reported option set, so the
     # options cannot be attributed to THIS target (delta-5 finding F1).
     # Zero rows is a new install and stays auditable.
+    # Load in the CURRENT shell first: the capture below would otherwise
+    # run the loader in a subshell and lose the snapshot, so every target
+    # of a multi-target command re-queried mise and could see a different
+    # configuration (delta-7 finding F1).
+    if ! safe_gate_mise_load_rows; then
+      safe_gate_mise_infra_refuse "cannot enumerate configured tools to attribute the options of '${ckey}' (mise ls or jq unavailable, or malformed output)"
+      return 100
+    fi
     cmult="$(safe_gate_mise_key_multiplicity "$ckey")"
     cmrc=$?
     if (( cmrc != 0 )); then

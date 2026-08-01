@@ -131,6 +131,13 @@ case "$sub" in
   ls)
     log_line MISEQ "$@"
     [[ "${MISE_LS_STATUS:-0}" != 0 ]] && exit "${MISE_LS_STATUS}"
+    # A second answer proves whether callers re-query: if the snapshot is
+    # shared, MISE_LS_JSON_2 is never observed.
+    if [[ -n "${MISE_LS_JSON_2:-}" && -f "${SAFE_INSTALL_COMMAND_LOG}.lsonce" ]]; then
+      printf '%s\n' "${MISE_LS_JSON_2}"
+      exit 0
+    fi
+    : > "${SAFE_INSTALL_COMMAND_LOG}.lsonce"
     printf '%s\n' "${MISE_LS_JSON:-{\}}"
     exit 0
     ;;
@@ -2815,6 +2822,56 @@ case_mise_installer_values_are_validated() {
   pass "$FUNCNAME"
 }
 
+case_mise_multi_target_shares_one_snapshot() {
+  prepare_case "mise-multi-target-snapshot"
+  # Every explicit target of a multi-target command must attribute options
+  # against the SAME configuration: the multiplicity capture reloaded rows
+  # in a subshell, so each target re-queried mise (delta-7 finding F1).
+  # The stub's second answer would make the second target look ambiguous;
+  # with one snapshot it is never read.
+  MISE_LS_JSON='{}' \
+    MISE_LS_JSON_2='{"npm:oktwo": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}, {"version": "2.0.0", "requested_version": "2", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install npm:okone@1.0.0 npm:oktwo@2.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  local ls_queries
+  ls_queries="$(grep -c $'MISEQ\tls\t--current\t--json' "${LOG_FILE}" 2>/dev/null || printf '0')"
+  if [[ "${ls_queries}" != "1" ]]; then
+    printf 'expected exactly one mise ls query, got %s:\n' "${ls_queries}" >&2
+    cat "${LOG_FILE}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  assert_log_contains $'AUDIT\tcheck\toktwo@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # Same for `use` and for exec tool specs.
+  : > "${LOG_FILE}"
+  rm -f "${LOG_FILE}.lsonce"
+  MISE_LS_JSON='{}' MISE_LS_JSON_2='{"npm:oktwo": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}, {"version": "2.0.0", "requested_version": "2", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise use npm:okone@1.0.0 npm:oktwo@2.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  ls_queries="$(grep -c $'MISEQ\tls\t--current\t--json' "${LOG_FILE}" 2>/dev/null || printf '0')"
+  if [[ "${ls_queries}" != "1" ]]; then
+    printf 'use: expected exactly one mise ls query, got %s:\n' "${ls_queries}" >&2
+    cat "${LOG_FILE}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
+case_mise_setting_output_is_strict() {
+  prepare_case "mise-setting-strict"
+  # Truncating the setting to its first line turned malformed multi-line
+  # helper output into an apparently valid installer identity (delta-7
+  # finding F4): it must refuse as infrastructure breakage instead.
+  MISE_NPM_PM=$'npm\nbun' SAFE_INSTALL_TEST_SCRIPT='mise install npm:blockme@1.0.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_mise_entry_requires_requested_version() {
   prepare_case "mise-entry-requires-version"
   # A missing requested_version was defaulted to "": safe audited a bare
@@ -3035,6 +3092,8 @@ main() {
     case_mise_exclusion_canonicalization_fails_closed \
     case_mise_bump_requires_a_configured_target \
     case_mise_installer_values_are_validated \
+    case_mise_multi_target_shares_one_snapshot \
+    case_mise_setting_output_is_strict \
     case_zsh_stub_warns_on_missing_mise_wrapper \
     case_uninstall_cleans_shell_and_legacy_binaries
   do
