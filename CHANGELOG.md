@@ -1,6 +1,49 @@
 # Changelog
 
-## Unreleased
+## 1.2.0 - 2026-08-02
+
+- Scanners and helper CLIs (osv-scanner, socket, jq, …) resolve through the
+  machine tool cache (`audit/tools.json`) with caller PATH taking precedence,
+  so a caller whose PATH lacks the mise shim directory no longer sees a
+  missing-scanner WARN that reads like a supply-chain signal. `uv` joins the
+  gated tools: `install.sh` displaces the real binary to `uv.original` and
+  installs a gate wrapper, with rollback if any wrapper write fails, and a
+  hard error naming every tool left ungated.
+- The agent contract became a single machine-readable source
+  (`docs/contract/agent-contract.json`): `safe explain --json` emits it
+  verbatim, `safe explain` and the docs render from it, and a drift suite
+  fails when they diverge. New `safe report-fp <spec>` files a suspected
+  false positive as an evidence note in safe's inbox — it re-runs the check,
+  records the receipt, and can never quiet the gate or touch trust state.
+- The effective-source derivation behind the trust floor now models Cargo,
+  Composer, and Bun selectors, keyed by the installer that actually reads
+  them: cargo registry names resolve through `CARGO_REGISTRIES_<NAME>_INDEX`
+  or become the trustable opaque identity `cargo-registry:<name>`; composer
+  repositories in `$COMPOSER_HOME/config.json` are read directly (every
+  dist/source endpoint, packagist-disable shapes included); bun installs
+  judge bun's own registry chain (`BUN_CONFIG_REGISTRY`, npm env forms,
+  its two npmrc files) via `--installer bun`, and resolution fetches the
+  packument from bun's registry. mise-only selectors (`cargo.registry_name`,
+  `pipx.registry_url`) translate into the same argv plumbing, so those
+  backend installs get real verdicts instead of the not-audit-gated notice
+  (only `CARGO_HOME` keeps it — an unread config.toml). Per-invocation
+  config injection fails closed: `cargo install --config` and bun
+  `--config=<file>` on gated subcommands are refused. Cargo argv-name
+  identities changed shape (`explicit:<name>` →
+  `explicit:cargo-registry:<name>`): old install-known entries for named
+  cargo registries stop matching and re-audit fresh; `trusted_registries`
+  entries for cargo names need the `cargo-registry:` prefix.
+- The socket score call is wall-clock bounded everywhere
+  (`SAFE_AUDIT_SOCKET_TIMEOUT`, default 30s), including the vault-injected
+  retry; with no `timeout` binary the call is not started at all and the
+  WARN names the lost coverage. A wedged socket CLI used to hang a direct
+  `safe audit check` for minutes with zero output.
+- The contract documents the preflight surface: exit codes 0/10/20 are
+  `safe audit check` verdict codes (not refusals), a direct WARN/BLOCK
+  check prints the same next-step hints the gate prints, refusals are
+  defined as the final `safe: BLOCKED` stderr line, advisory+infra hints
+  firing together resolve infrastructure-first, and an affecting list
+  longer than three IDs says `+N more`.
 
 - `safe install` gains a project mode: with no package named and a manifest in
   the current directory (`package.json`, `requirements.txt`, `pyproject.toml`,
