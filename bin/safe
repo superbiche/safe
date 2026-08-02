@@ -771,6 +771,20 @@ doctor_payload_json() {
   done
   local completion_file="$SAFE_ZSH_COMPLETION_DIR/_safe"
 
+  # mise shims bound to the gate wrapper (a reshim ran while the wrapper sat
+  # first on PATH). The wrapper's argv0-dispatch branch keeps them working,
+  # but each shimmed call pays an extra exec; surface the drift for repair.
+  local mise_shim_dir="${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims"
+  local mise_shims_bound=0 mise_wrapper="$HOME/.local/bin/mise" shim shim_real wrapper_real
+  if [[ -d "$mise_shim_dir" ]] && [[ "$(gate_wrapper_state mise)" == "installed" ]]; then
+    wrapper_real="$(readlink -f "$mise_wrapper" 2>/dev/null || true)"
+    for shim in "$mise_shim_dir"/*; do
+      [[ -L "$shim" ]] || continue
+      shim_real="$(readlink -f "$shim" 2>/dev/null || true)"
+      [[ -n "$shim_real" && "$shim_real" == "$wrapper_real" ]] && mise_shims_bound=$((mise_shims_bound + 1))
+    done
+  fi
+
   local paths_safe_json paths_run_json paths_audit_json
   paths_safe_json=$(component_path_json "$SAFE_SELF" "$0")
   paths_run_json=$(component_path_json "$SAFE_RUN_PATH")
@@ -978,6 +992,7 @@ doctor_payload_json() {
     --argjson wrapper_present "$( [[ -f "$install_wrapper" ]] && printf 'true' || printf 'false' )" \
     --argjson gate_wrappers "$gate_wrappers_json" \
     --argjson gate_wrappers_healthy "$gate_wrappers_healthy" \
+    --argjson mise_shims_bound "$mise_shims_bound" \
     --argjson completion_present "$( [[ -f "$completion_file" ]] && printf 'true' || printf 'false' )" \
     '{
       command: "safe doctor",
@@ -1046,6 +1061,7 @@ doctor_payload_json() {
         install_wrappers: {
           gate_wrappers: $gate_wrappers,
           gate_wrappers_healthy: $gate_wrappers_healthy,
+          mise_shims_bound_to_wrapper: $mise_shims_bound,
           script_present: $wrapper_present,
           completion_present: $completion_present
         },
@@ -1084,6 +1100,10 @@ print_doctor_human() {
     "socket wiring (install gate scoring):",
     "  cli: " + (if .environment.socket.cli_present then .environment.socket.cli_path else "MISSING — install socket CLI" end),
     "  token: " + (if .environment.socket.token_env_set then "env" elif .environment.socket.vault_mapping_present then "vault mapping" else "MISSING — socket login or add bw-env socket mapping" end),
+    (if (.environment.install_wrappers.mise_shims_bound_to_wrapper // 0) > 0 then
+      "\nmise shims: " + (.environment.install_wrappers.mise_shims_bound_to_wrapper | tostring)
+      + " bound to the gate wrapper — dispatch still works (argv0 branch) but pays an extra exec per call; repoint the shims at the real mise binary"
+    else empty end),
     "",
     "missing prerequisites:",
     (

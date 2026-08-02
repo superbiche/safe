@@ -248,7 +248,7 @@ write_gate_wrappers() {
   local wrapper_dir="$1"
   local tool
 
-  for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise; do
+  for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer; do
     cat > "${wrapper_dir}/${tool}" <<EOF
 #!/usr/bin/env bash
 # safe-gate-wrapper v1 tool=${tool}
@@ -256,6 +256,28 @@ exec safe gate ${tool} -- "\$@"
 EOF
     chmod +x "${wrapper_dir}/${tool}"
   done
+  # The mise wrapper carries the argv0-dispatch branch: mise shims are
+  # symlinks to whatever `mise` resolves to, and a shim dispatch must reach
+  # the real binary with argv[0] intact, never the gate.
+  cat > "${wrapper_dir}/mise" <<'EOF'
+#!/usr/bin/env bash
+# safe-gate-wrapper v1 tool=mise
+if [[ "${0##*/}" != "mise" ]]; then
+  IFS=: read -ra __dirs <<< "$PATH"
+  for __d in "${__dirs[@]}"; do
+    [[ -n "$__d" ]] || continue
+    __c="${__d%/}/mise"
+    [[ -f "$__c" && -x "$__c" ]] || continue
+    [[ "$__c" -ef "${BASH_SOURCE[0]}" ]] && continue
+    LC_ALL=C head -n 2 -- "$__c" 2>/dev/null | grep -q '^# safe-gate-wrapper' && continue
+    exec -a "$0" "$__c" "$@"
+  done
+  printf 'safe gate: real mise not found on PATH (argv0 dispatch for %s)\n' "${0##*/}" >&2
+  exit 127
+fi
+exec safe gate mise -- "$@"
+EOF
+  chmod +x "${wrapper_dir}/mise"
 }
 
 prepare_case() {
@@ -3233,6 +3255,58 @@ case_zsh_stub_warns_on_missing_mise_wrapper() {
   pass "$FUNCNAME"
 }
 
+case_mise_wrapper_dispatches_foreign_argv0() {
+  # A mise shim (symlink named after a tool) bound to the gate wrapper must
+  # reach the real mise with argv[0] intact and never enter the gate — the
+  # 2026-08-02 reshim breakage where every shimmed tool executed mise bare.
+  local dir="${TEST_ROOT}/${FUNCNAME}"
+  mkdir -p "${dir}/wrap" "${dir}/real"
+  write_gate_wrappers "${dir}/wrap"
+  cat > "${dir}/real/mise" <<'STUB'
+#!/usr/bin/env bash
+printf 'REALMISE args=%s\n' "$*"
+STUB
+  chmod +x "${dir}/real/mise"
+  ln -s "${dir}/wrap/mise" "${dir}/wrap/node"
+  local out
+  out=$(PATH="${dir}/wrap:${dir}/real:/usr/bin:/bin" "${dir}/wrap/node" --version 2>&1)
+  # A shebang-script stub cannot OBSERVE the preserved argv[0] — the kernel
+  # rebuilds argv for the interpreter of a script, so only a native binary
+  # (like the real mise) receives it. The functional half proves the shim
+  # dispatch reaches the real binary with args intact and never enters the
+  # gate; the textual half pins the argv0-preserving exec form itself.
+  if [[ "$out" != "REALMISE args=--version" ]]; then
+    printf 'got: %s\n' "$out" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  if ! grep -Fq 'exec -a "$0" "$__c" "$@"' "${dir}/wrap/mise"; then
+    fail "$FUNCNAME"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
+case_mise_wrapper_dispatch_without_real_mise_is_legible() {
+  # No real mise anywhere on PATH: the dispatch must refuse legibly with
+  # 127, not loop back into itself or fall through to the gate.
+  local dir="${TEST_ROOT}/${FUNCNAME}"
+  mkdir -p "${dir}/wrap"
+  write_gate_wrappers "${dir}/wrap"
+  ln -s "${dir}/wrap/mise" "${dir}/wrap/npmshim"
+  # PATH must resolve bash for the wrapper's shebang but carry no real mise.
+  mkdir -p "${dir}/sysbin"
+  ln -s "$(command -v bash)" "${dir}/sysbin/bash"
+  local out shim_status=0
+  out=$(PATH="${dir}/wrap:${dir}/sysbin" "${dir}/wrap/npmshim" --version 2>&1) || shim_status=$?
+  if [[ $shim_status -ne 127 ]] || ! grep -q 'real mise not found' <<<"$out"; then
+    printf 'status=%s out=%s\n' "$shim_status" "$out" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
 case_uninstall_cleans_shell_and_legacy_binaries() {
   prepare_case "uninstall-cleans-shell-and-legacy-binaries"
   mkdir -p "${HOME_DIR}/.local/bin" "${HOME_DIR}/.local/share/zsh/site-functions" "${HOME_DIR}/.config/safe-run/completions" "${HOME_DIR}/.config/safe" "${HOME_DIR}/.local/share/safe"
@@ -3408,6 +3482,8 @@ main() {
     case_mise_multi_target_shares_one_snapshot \
     case_mise_setting_output_is_strict \
     case_zsh_stub_warns_on_missing_mise_wrapper \
+    case_mise_wrapper_dispatches_foreign_argv0 \
+    case_mise_wrapper_dispatch_without_real_mise_is_legible \
     case_uninstall_cleans_shell_and_legacy_binaries
   do
     "$case"
