@@ -192,6 +192,7 @@ safe_gate_run_audit() {
   local -a extra=()
   [[ -n "${SAFE_GATE_DIST_TAG:-}" ]] && extra+=(--dist-tag "${SAFE_GATE_DIST_TAG}")
   [[ -n "${SAFE_GATE_REGISTRY:-}" ]] && extra+=(--registry "${SAFE_GATE_REGISTRY}")
+  [[ -n "${SAFE_GATE_INSTALLER:-}" ]] && extra+=(--installer "${SAFE_GATE_INSTALLER}")
   [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]] && extra+=(--project-dir "${SAFE_GATE_PROJECT_DIR}")
   [[ -n "${SAFE_GATE_NPM_USERCONFIG:-}" ]] && extra+=(--npm-userconfig "${SAFE_GATE_NPM_USERCONFIG}")
   [[ -n "${SAFE_GATE_NPM_GLOBALCONFIG:-}" ]] && extra+=(--npm-globalconfig "${SAFE_GATE_NPM_GLOBALCONFIG}")
@@ -239,6 +240,10 @@ safe_gate_scan_target_flags() {
   SAFE_GATE_PROJECT_DIR=""
   SAFE_GATE_NPM_USERCONFIG=""
   SAFE_GATE_NPM_GLOBALCONFIG=""
+  # The installer is set by the tool handler AFTER this reset (bun for the
+  # bun wrapper and bun-selected mise npm installs); safe-audit defaults it
+  # from the ecosystem otherwise.
+  SAFE_GATE_INSTALLER=""
   local prev="" arg
   for arg in "$@"; do
     case "${family}" in
@@ -396,6 +401,7 @@ safe_gate_known_matches() {
   fi
   local -a es_args=("${name}" --ecosystem "${ecosystem}")
   [[ -n "${SAFE_GATE_REGISTRY:-}" ]] && es_args+=(--registry "${SAFE_GATE_REGISTRY}")
+  [[ -n "${SAFE_GATE_INSTALLER:-}" ]] && es_args+=(--installer "${SAFE_GATE_INSTALLER}")
   [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]] && es_args+=(--project-dir "${SAFE_GATE_PROJECT_DIR}")
   [[ -n "${SAFE_GATE_NPM_USERCONFIG:-}" ]] && es_args+=(--npm-userconfig "${SAFE_GATE_NPM_USERCONFIG}")
   [[ -n "${SAFE_GATE_NPM_GLOBALCONFIG:-}" ]] && es_args+=(--npm-globalconfig "${SAFE_GATE_NPM_GLOBALCONFIG}")
@@ -1380,7 +1386,31 @@ safe_gate_npm_like() {
   shift
   safe_gate_route "${tool}" "$@" || return $?
   safe_gate_scan_target_flags npm "$@"
+  # bun reads its own source config (BUN_CONFIG_REGISTRY, its npmrc chain)
+  # for the same npm ecosystem; the audit models that only when told which
+  # installer runs (delta-4 finding F4: selectors key off the installer).
+  [[ "${tool}" == "bun" ]] && SAFE_GATE_INSTALLER="bun"
   local subcommand="${SAFE_GATE_SUBCMD}"
+  # bun --config=<file> swaps in an arbitrary bunfig.toml — a TOML surface
+  # the source derivation does not read, and install.registry there
+  # redirects the fetch. Same class as cargo --config: per-invocation
+  # config injection must not become a default-source verdict, so gated
+  # subcommands fail closed. (The implicit ./bunfig.toml is host/project
+  # state and stays under the documented boundary.)
+  if [[ "${tool}" == "bun" ]]; then
+    case "${subcommand}" in
+      x|install|i|it|install-test|add|ci|update|u|up|upgrade|udpate)
+        local bun_arg
+        for bun_arg in "$@"; do
+          [[ "${bun_arg}" == "--" ]] && break
+          if [[ "${bun_arg}" == --config=* || "${bun_arg}" == -c=* ]]; then
+            safe_gate_err "safe: BLOCKED bun ${subcommand} — --config swaps in a bunfig.toml whose install.registry can redirect the install source in ways safe cannot audit; use the project bunfig.toml or drop the flag, then retry; details: safe explain"
+            return 100
+          fi
+        done
+        ;;
+    esac
+  fi
   local -a rest=() raw=() packages=()
   rest=("${@:SAFE_GATE_SUBCMD_IDX+1}")
   local parser="safe_gate_${tool}_packages"
@@ -1698,6 +1728,17 @@ safe_gate_cargo() {
     safe_gate_exec_real cargo "$@"
   fi
 
+  # `--config KEY=VALUE` injects any cargo config key from the command line
+  # — [source] replacement and registry.default included, which redirect the
+  # install to a source the audit cannot see (cargo docs: --config takes
+  # precedence over environment variables and config files). Those keys are
+  # not env-settable, so this flag is the one argv route around the source
+  # model: fail closed on installs rather than vouch for the wrong source.
+  if safe_gate_has_arg "--config" "$@" || safe_gate_has_prefix_arg "--config=" "$@"; then
+    safe_gate_err "safe: BLOCKED cargo install — --config can redirect the install source ([source] replacement, registry.default) in ways safe cannot audit; put persistent configuration in a config.toml and drop --config, then retry; details: safe explain"
+    return 100
+  fi
+
   safe_gate_collect packages "$(safe_gate_cargo_packages "${@:subidx+1}")"
   if (( ${#packages[@]} > 0 )); then
     safe_gate_check_many cargo "${packages[@]}" || return $?
@@ -1855,9 +1896,10 @@ safe_gate_mise_infra_refuse() {
 # not-audit-gated notice path. Prints "canonical<TAB>opts-verdict" where the
 # verdict is empty (neutral) or the first non-neutral key.
 # `package_manager` is NOT neutral: it selects npm/pnpm/bun, whose native
-# source inputs differ (bun reads BUN_CONFIG_REGISTRY, which safe-audit does
-# not model) — a "neutral" classification audited npm's default source for a
-# bun-selected install (delta-2 finding F1).
+# source inputs differ — a "neutral" classification audited npm's default
+# source for a bun-selected install (delta-2 finding F1). The CONFIGURED
+# npm.package_manager setting routes through the installer-aware audit; a
+# per-spec bracket option still takes the notice path.
 SAFE_GATE_MISE_NEUTRAL_OPTS='bin_path|exe|strip_components|platform|version_prefix|os|arch|depends'
 
 safe_gate_mise_strip_opts() {
@@ -1931,9 +1973,9 @@ safe_gate_mise_env_overlay() {
             "GONOSUMDB","GONOSUMCHECK","GOFLAGS","GONOSUMVERIFY",
             "CARGO_REGISTRY_DEFAULT","CARGO_REGISTRIES_CRATES_IO_PROTOCOL",
             "CARGO_HOME","COMPOSER_HOME","COMPOSER_AUTH",
-            "MISE_PIPX_REGISTRY_URL","MISE_NPM_REGISTRY_URL",
+            "MISE_PIPX_REGISTRY_URL",
             "MISE_CARGO_REGISTRY_NAME","MISE_GO_PROXY",
-            "BUN_CONFIG_REGISTRY","COMPOSER_REPOSITORIES",
+            "BUN_CONFIG_REGISTRY","XDG_CONFIG_HOME",
             "MISE_NPM_PACKAGE_MANAGER")
       or (test("^CARGO_REGISTRIES_[A-Za-z0-9_]+$"));
     if type != "object" then error("schema") else . end
@@ -1983,16 +2025,15 @@ safe_gate_mise_apply_overlay() {
   return 0
 }
 
-# Sources that reach the installer but that safe-audit's effective-source
-# derivation does not model yet (it covers npm/Python/Go). Exporting them
-# into a consumer that ignores them would turn an unmodeled private source
-# into a confident default-source verdict (delta-2 finding F4). Until the
-# derivation covers them, an audit under such a source is not honest: the
-# spec takes the not-audit-gated notice path instead.
-# The environment the delegate actually runs under is the union of what
-# mise computes AND what it inherits: mise env --json omits inherited
-# variables, so an ambient CARGO_REGISTRY_DEFAULT reached the installer
-# while the detector saw nothing (delta-3 finding F4).
+# Effective-value reader for one selector variable. Historically the
+# derivation covered npm/Python/Go only and every other selector took the
+# not-audit-gated notice path (delta-2 finding F4); it now models cargo,
+# composer and bun sources too, and the notice survives only for CARGO_HOME
+# (an unread config.toml). The union rule still matters: the delegate's
+# environment is what mise computes AND what it inherits — mise env --json
+# omits inherited variables, so an ambient CARGO_REGISTRY_DEFAULT reached
+# the installer while a pure-overlay detector saw nothing (delta-3 finding
+# F4).
 # Effective value of one variable: the mise overlay wins over the ambient
 # environment (that is the precedence the delegate sees). Empty counts as
 # unset — an exported but empty selector chooses nothing, and treating it
@@ -2015,36 +2056,57 @@ safe_gate_mise_env_value() {
 # them, not by a coarse ecosystem: bun's variable does not affect an npm
 # install, and pipx's does not affect pip, so applying them by ecosystem
 # removed the gate from artifacts safe can model (delta-4 finding F4).
+# Since the source derivation learned cargo/composer/bun env selectors and
+# the gate translates the mise-only ones (registry_name, pipx registry_url)
+# into audit argv, the only survivor is CARGO_HOME: it points cargo at a
+# config.toml safe does not read — [source] replacement included — which no
+# env sweep can represent. (COMPOSER_AUTH carried credentials, not a
+# source, and COMPOSER_REPOSITORIES does not exist in composer at all;
+# both were over-refusals.)
 safe_gate_mise_unmodeled_source() {
-  local installer="$1" overlay="$2" name value
-  local -a candidates=()
+  local installer="$1" overlay="$2" value
   case "$installer" in
     cargo)
-      candidates=(CARGO_REGISTRY_DEFAULT CARGO_HOME MISE_CARGO_REGISTRY_NAME)
-      # Any per-registry index definition counts too.
-      local n
-      for n in $(compgen -e 2>/dev/null | grep -E '^CARGO_REGISTRIES_' || true); do
-        candidates+=("$n")
-      done
-      if [[ -n "$overlay" ]]; then
-        while IFS=' ' read -r n _; do
-          [[ "$n" == CARGO_REGISTRIES_* ]] && candidates+=("$n")
-        done <<<"$overlay"
+      value="$(safe_gate_mise_env_value CARGO_HOME "$overlay")"
+      if [[ -n "$value" ]]; then
+        printf '%s' "CARGO_HOME"
+        return 0
       fi
       ;;
-    pipx) candidates=(MISE_PIPX_REGISTRY_URL) ;;
-    composer) candidates=(COMPOSER_HOME COMPOSER_AUTH COMPOSER_REPOSITORIES) ;;
-    bun) candidates=(BUN_CONFIG_REGISTRY) ;;
-    *) return 1 ;;
   esac
-  for name in ${candidates[@]+"${candidates[@]}"}; do
-    value="$(safe_gate_mise_env_value "$name" "$overlay")"
-    if [[ -n "$value" ]]; then
-      printf '%s' "$name"
-      return 0
-    fi
-  done
   return 1
+}
+
+# Mirror of mise's pipx get_index_url() (src/backend/pipx.rs): the raw
+# pipx.registry_url setting is a {}-templated LISTING url, but the
+# installer receives the normalized PEP-503 /simple endpoint via
+# PIP_INDEX_URL (pipx) / UV_INDEX (uvx) — that endpoint is the source
+# identity the audit must judge. Normalization: strip {} and trailing
+# slashes; pypi.org URLs collapse /pypi/<x>/json|simple tails (or anything
+# before a /simple segment) to <base>/simple; other hosts replace every
+# /json segment with /simple when the URL ends in /json, else append
+# /simple.
+safe_gate_pipx_index_url() {
+  local url="${1//\{\}/}"
+  while [[ "$url" == */ ]]; do url="${url%/}"; done
+  if [[ "$url" == *pypi.org* ]]; then
+    if [[ "$url" == */pypi/* ]]; then
+      if [[ "$url" =~ ^(.*)/pypi/[^/]*/(json|simple)$ ]]; then
+        url="${BASH_REMATCH[1]}/simple"
+      fi
+    elif [[ "$url" != */simple ]]; then
+      url="${url%%/simple*}"
+      while [[ "$url" == */ ]]; do url="${url%/}"; done
+      url="${url}/simple"
+    fi
+  else
+    if [[ "$url" == */json ]]; then
+      url="${url//\/json//simple}"
+    elif [[ "$url" != */simple ]]; then
+      url="${url}/simple"
+    fi
+  fi
+  printf '%s' "$url"
 }
 
 # Which installer actually performs an npm-backend install: mise's
@@ -2061,7 +2123,8 @@ safe_gate_mise_unmodeled_source() {
 # verdict instead of an infrastructure refusal (delta-6 finding F4). The
 # accepted set is the pinned mise contract (2026.7.16, verified live:
 # `aube`/`aube_cli` are accepted, `yarn` is rejected by mise itself).
-# Only bun has a source surface safe-audit cannot model; the others read
+# bun reads its own source surface (BUN_CONFIG_REGISTRY, its npmrc chain),
+# which the audit models when passed --installer bun; the others read
 # npm-compatible sources and audit normally.
 safe_gate_mise_valid_npm_installer() {
   case "$1" in
@@ -2197,6 +2260,23 @@ safe_gate_mise_check_with_env() {
       safe_gate_mise_infra_refuse "cannot apply the mise environment (malformed value transport)"
       exit 100
     }
+    # mise-only selectors reach the installer as cargo argv / pip env the
+    # audit process will not see — translate them into the audit's own argv
+    # selector so they floor and degrade like any other custom source.
+    # Real installer env (BUN_CONFIG_REGISTRY, CARGO_REGISTRY_DEFAULT,
+    # COMPOSER_HOME, ...) needs no translation: the overlay is applied and
+    # safe-audit's derivation reads it directly.
+    case "$installer" in
+      bun) SAFE_GATE_INSTALLER="bun" ;;
+      cargo)
+        SAFE_GATE_INSTALLER="cargo"
+        [[ -n "${MISE_CARGO_REGISTRY_NAME:-}" ]] && SAFE_GATE_REGISTRY="${MISE_CARGO_REGISTRY_NAME}"
+        ;;
+      pipx)
+        SAFE_GATE_INSTALLER="pipx"
+        [[ -n "${MISE_PIPX_REGISTRY_URL:-}" ]] && SAFE_GATE_REGISTRY="$(safe_gate_pipx_index_url "${MISE_PIPX_REGISTRY_URL}")"
+        ;;
+    esac
     safe_gate_check "$pkg" "$eco"
   )
 }
@@ -2927,9 +3007,10 @@ safe_gate_mise_gate_exec() {
   # A launcher first word (env, sh, time, ...) is a documented residual:
   # refusing it would break ordinary `mise exec -- <binary>` use.
   if (( gate_inner )); then
-    # The inner route reaches ecosystems whose sources safe-audit does not
-    # model (Composer, bun-backed npm, Cargo): auditing there would report
-    # a default-source verdict for a private one (delta-3 finding F4).
+    # The source derivation models cargo/composer/bun env selectors, so the
+    # inner route audits them like any other tool; the one survivor is
+    # CARGO_HOME (an unread config.toml, [source] replacement included) —
+    # same honesty rule as the backend-install path (delta-3 finding F4).
     local inner_installer inner_unmodeled
     if inner_installer="$(safe_gate_mise_tool_installer "${cmd[0]}")" \
        && inner_unmodeled="$(safe_gate_mise_unmodeled_source "$inner_installer" "$SAFE_GATE_MISE_OVERLAY")"; then

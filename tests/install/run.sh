@@ -69,7 +69,9 @@ fi
   printf '\n'
   # The mise routes overlay project [env] sources onto the audit process:
   # surface what this invocation actually saw so tests can assert it.
-  for env_name in NPM_CONFIG_REGISTRY PIP_INDEX_URL PIP_CONFIG_FILE GOPROXY; do
+  for env_name in NPM_CONFIG_REGISTRY PIP_INDEX_URL PIP_CONFIG_FILE GOPROXY \
+                  CARGO_REGISTRY_DEFAULT CARGO_REGISTRIES_PRIVATE_INDEX \
+                  BUN_CONFIG_REGISTRY COMPOSER_HOME; do
     if [[ -n "${!env_name:-}" ]]; then
       printf 'AUDITENV\t%s=%s\n' "${env_name}" "${!env_name}"
       # Byte-exact form: the plain line cannot show a trailing newline or
@@ -504,7 +506,7 @@ case_npm_exec_versioned_spec_audits_despite_local_bin() {
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='bun x blockme@1.2.3' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@1.2.3\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1.2.3\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--installer\tbun' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -710,9 +712,15 @@ case_bun_equals_only_flag_not_space_value() {
   assert_status 100 "$FUNCNAME" || return
   assert_err_contains_fragment 'cannot find the subcommand' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tbun' "$FUNCNAME" || return
+  # The =form parses cleanly but swaps in a bunfig.toml whose
+  # install.registry can redirect the source — per-invocation config
+  # injection fails closed rather than earning a default-source verdict
+  # (same class as cargo --config).
   SAFE_INSTALL_TEST_SCRIPT='bun --config=bunfig.toml add blockme' run_zsh
-  assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tbun' "$FUNCNAME" || return
+  assert_err_contains_fragment 'bunfig.toml' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -851,7 +859,7 @@ case_dlx_and_x_audit() {
   assert_log_contains $'REAL\tpnpm\tdlx\tcowsay@1.6.0' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='bun x cowsay' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tcowsay\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tcowsay\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--installer\tbun' "$FUNCNAME" || return
   assert_log_contains $'REAL\tbun\tx\tcowsay' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='yarn dlx blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
@@ -2532,15 +2540,15 @@ case_mise_env_transport_is_lossless() {
   assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
   assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
 
-  # Cargo registry selection is a source too — safe-audit cannot resolve
-  # advisories against it yet, so it takes the notice path rather than a
-  # default-source verdict (delta-2 finding F4; asserted in full by
-  # case_mise_unmodeled_sources_are_not_vouched).
+  # A DEFINED cargo registry index is inert until something selects it —
+  # defining is not selecting — but it must still ride the overlay so the
+  # audit's own derivation sees it if registry.default names it (PR6).
   : > "${LOG_FILE}"
   MISE_ENV_JSON='{"CARGO_REGISTRIES_PRIVATE_INDEX": "sparse+https://private.example/"}' \
     SAFE_INSTALL_TEST_SCRIPT='mise install cargo:okpkg@1.0.0' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg@1.0.0\t--ecosystem\trust\t--gate\tinstall\t--op\tinstall\t--installer\tcargo' "$FUNCNAME" || return
+  assert_log_contains $'AUDITENV\tCARGO_REGISTRIES_PRIVATE_INDEX=sparse+https://private.example/' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -2600,27 +2608,41 @@ case_mise_tool_options_are_not_discarded() {
 
 case_mise_unmodeled_sources_are_not_vouched() {
   prepare_case "mise-unmodeled-sources"
-  # safe-audit's effective-source derivation covers npm/Python/Go. Exporting
-  # a Cargo/pipx/Composer/bun source into a consumer that ignores it would
-  # turn a private source into a confident default-source verdict (delta-2
-  # finding F4): take the honest notice path instead.
-  MISE_ENV_JSON='{"CARGO_REGISTRIES_PRIVATE_INDEX": "sparse+https://private.example/"}' \
+  # The derivation models cargo/composer/bun sources now (PR6): mise-only
+  # selectors are translated into the audit's own --registry argv, and the
+  # only surviving notice is CARGO_HOME (an unread config.toml, [source]
+  # replacement included).
+  MISE_ENV_JSON='{"MISE_PIPX_REGISTRY_URL": "https://private.example/pypi/{}/json"}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install pipx:okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  # The raw setting is a {}-templated LISTING url; the installer receives
+  # the normalized PEP-503 /simple endpoint (mise get_index_url — the
+  # double slash is mise's own artifact and byte-faithful here), so that is
+  # the identity the audit judges.
+  assert_log_contains $'AUDIT\tcheck\tokpkg@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://private.example/pypi//simple\t--installer\tpipx' "$FUNCNAME" || return
+
+  # A mise cargo registry NAME rides the same argv selector; the audit maps
+  # it to its env-defined index or an opaque cargo-registry:<name> identity.
+  : > "${LOG_FILE}"
+  MISE_ENV_JSON='{"MISE_CARGO_REGISTRY_NAME": "private"}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install cargo:okpkg@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg@1.0.0\t--ecosystem\trust\t--gate\tinstall\t--op\tinstall\t--registry\tprivate\t--installer\tcargo' "$FUNCNAME" || return
+
+  # CARGO_HOME keeps the honest notice: it points cargo at a config.toml
+  # the derivation does not read.
+  : > "${LOG_FILE}"
+  MISE_ENV_JSON='{"CARGO_HOME": "/tmp/cargo-home"}' \
     SAFE_INSTALL_TEST_SCRIPT='mise install cargo:okpkg@1.0.0' run_zsh
   assert_status 0 "$FUNCNAME" || return
   assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
   assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
 
-  : > "${LOG_FILE}"
-  MISE_ENV_JSON='{"MISE_PIPX_REGISTRY_URL": "https://private.example/pypi/{}/json"}' \
-    SAFE_INSTALL_TEST_SCRIPT='mise install pipx:okpkg@1.0.0' run_zsh
-  assert_status 0 "$FUNCNAME" || return
-  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
-
   # Without such a source, the same install audits normally.
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='mise install cargo:blockme@1.0.0' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tcheck\tblockme@1.0.0\t--ecosystem\trust\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@1.0.0\t--ecosystem\trust\t--gate\tinstall\t--op\tinstall\t--installer\tcargo' "$FUNCNAME" || return
 
   # npm sources safe-audit DOES model still reach the audit.
   : > "${LOG_FILE}"
@@ -2799,29 +2821,32 @@ case_mise_option_checks_cover_every_preflight() {
 case_mise_unmodeled_sources_cover_ambient_and_inner() {
   prepare_case "mise-unmodeled-siblings"
   # mise env --json omits INHERITED variables, but the delegate still gets
-  # them: the detector reads the effective union (delta-3 finding F4).
+  # them: the audit runs under the effective union, so an ambient
+  # registry.default reaches its derivation (delta-3 finding F4 / PR6).
   SAFE_INSTALL_TEST_SCRIPT='export CARGO_REGISTRY_DEFAULT=private; mise install cargo:okpkg@1.0.0' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
-  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg@1.0.0\t--ecosystem\trust\t--gate\tinstall\t--op\tinstall\t--installer\tcargo' "$FUNCNAME" || return
+  assert_log_contains $'AUDITENV\tCARGO_REGISTRY_DEFAULT=private' "$FUNCNAME" || return
 
-  # The inner exec route reaches Composer and bun-backed npm, whose
-  # sources safe-audit does not model either.
+  # The inner exec route audits Composer and bun-backed npm now: their
+  # sources are modeled (COMPOSER_HOME/config.json is read by the
+  # derivation; bun via --installer bun).
   : > "${LOG_FILE}"
   MISE_ENV_JSON='{"COMPOSER_HOME": "/tmp/composer-home"}' \
     SAFE_INSTALL_TEST_SCRIPT='mise exec -- composer require vendor/blockme' run_zsh
-  assert_status 0 "$FUNCNAME" || return
-  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
-  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tvendor/blockme\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDITENV\tCOMPOSER_HOME=/tmp/composer-home' "$FUNCNAME" || return
 
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='export BUN_CONFIG_REGISTRY=https://private.example; mise exec -- bun add blockme' run_zsh
-  assert_status 0 "$FUNCNAME" || return
-  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--installer\tbun' "$FUNCNAME" || return
+  assert_log_contains $'AUDITENV\tBUN_CONFIG_REGISTRY=https://private.example' "$FUNCNAME" || return
 
-  # ...but npm does not read that variable, so an npm install still gets
-  # its audit: applying selectors by ecosystem removed the gate from
-  # artifacts safe can model (delta-4 finding F4).
+  # ...and npm does not read bun's variable: same audit, no bun installer —
+  # applying selectors by ecosystem removed the gate from artifacts safe
+  # can model (delta-4 finding F4).
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='export BUN_CONFIG_REGISTRY=https://private.example; mise exec -- npm install blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
@@ -2833,7 +2858,7 @@ case_mise_unmodeled_sources_cover_ambient_and_inner() {
   SAFE_INSTALL_TEST_SCRIPT='export BUN_CONFIG_REGISTRY=; mise exec -- bun add blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
 
-  # Without an unmodeled source the inner route audits normally.
+  # Without any selector the inner route audits normally.
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='mise exec -- npm install blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
@@ -2975,12 +3000,14 @@ case_mise_npm_installer_reads_mise_settings() {
   prepare_case "mise-npm-installer-setting"
   # `mise env --json` does not export npm.package_manager, so a configured
   # bun installer was invisible and safe audited npm's source for a bun
-  # install (delta-5 finding F4).
+  # install (delta-5 finding F4). The bun surface is modeled now: the
+  # install audits with --installer bun and the audit judges bun's
+  # registry, not npm's.
   MISE_NPM_PM=bun \
     SAFE_INSTALL_TEST_SCRIPT='export BUN_CONFIG_REGISTRY=https://private.example; mise install npm:okpkg@1.0.0' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
-  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall\t--installer\tbun' "$FUNCNAME" || return
+  assert_log_contains $'AUDITENV\tBUN_CONFIG_REGISTRY=https://private.example' "$FUNCNAME" || return
 
   # The default installer reads no bun variable, so the audit proceeds.
   : > "${LOG_FILE}"
