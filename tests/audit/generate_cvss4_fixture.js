@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 // Fixture oracle: FIRSTdotorg/cvss-v4-calculator at c5b0d409ae9f57c44264c6ce5f27d89298e1d32a.
+// The reference lives outside the tree; tests/audit/fetch_cvss4_ref.sh
+// bootstraps it (hash-pinned) into tmp/cvss4-ref from a fresh clone.
 
 const fs = require("fs");
 const path = require("path");

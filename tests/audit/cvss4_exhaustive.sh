@@ -12,6 +12,14 @@ if ! command -v node >/dev/null 2>&1; then
   exit 0
 fi
 
+# The oracle is not in the tree (tmp/ is gitignored): bootstrap it, hash-
+# pinned, so a fresh clone can run this and regenerate the fixture. Offline
+# is a legible skip — the committed known-answer suite still guards.
+if ! bash "$ROOT/tests/audit/fetch_cvss4_ref.sh" >/dev/null 2>&1; then
+  printf 'SKIP - CVSS v4 reference oracle unavailable; run tests/audit/fetch_cvss4_ref.sh\n'
+  exit 0
+fi
+
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
