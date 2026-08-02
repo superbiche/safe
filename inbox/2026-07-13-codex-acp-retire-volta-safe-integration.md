@@ -54,3 +54,26 @@ continuing to add Volta-only fixes increases migration cost.
 
 - Volta retirement notice: https://github.com/volta-cli/volta/issues/2080
 - mise npm backend: https://mise.jdx.dev/dev-tools/backends/npm.html
+
+---
+
+## Resolution — 2026-08-02, verified on `main` @ 939c22f (v1.2.0)
+
+Closed by the safe overhaul. Mapping the suggested actions:
+
+1. The `volta --version` parser bug is moot: the `volta()` wrapper no longer
+   exists (no zsh function, no PATH wrapper — `tests/install/run.sh` asserts
+   `~/.local/bin/volta` is absent).
+2–5. Volta-specific discovery/repair logic is deleted; runner resolution
+   falls back through mise (`bin/safe-run` resolves via mise, the manager
+   that replaced Volta). The remaining `volta` references in the codebase are
+   intentional retirement machinery: `is_stale_volta_path` detects and clears
+   runner config still pointing into a retired `~/.volta` install
+   (`safe run link` repairs `npx_real`), plus docs/tests stating the
+   retirement. The mise boundary is defined and gated (PR #31: config.toml
+   preflight, `mise use`/`exec` routing, env-selector translation), and
+   coverage is manager-neutral via PATH wrappers + `lib/gate-lib.sh`
+   (PR #30) with parity suites.
+6. The sibling postinstall-allowlist capture is reconciled in its own note
+   (superseded as Volta-specific; manager-neutral residual surfaced for
+   ruling).
