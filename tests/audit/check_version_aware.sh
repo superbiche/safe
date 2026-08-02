@@ -2386,6 +2386,100 @@ else
   fail "the ecosystem default installer lands on the receipt"
 fi
 
+# 57a. Review round 1 regressions (findings 1, 2, 4) + the verified bun
+#      scoped-vs-CLI semantics that survived challenge (finding 3 refuted).
+
+# F1: a package repository whose `package` is an ARRAY of definitions must
+# contribute every endpoint — never implicit-default.
+prepare_case composer-package-array
+mkdir -p "$CASE_DIR/composer-home"
+printf '{"repositories":[{"type":"package","package":[{"name":"vendor/pkg","version":"1.0.0","dist":{"url":"https://evil.example/pkg.zip","type":"zip"}}]}]}\n' \
+  > "$CASE_DIR/composer-home/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  COMPOSER_HOME="$CASE_DIR/composer-home" \
+  -- vendor/pkg@1.0.0 --ecosystem composer
+if expect_status 10 "an array-form package repository floors WARN"; then
+  pass "an array-form package repository floors WARN"
+fi
+if grep -q 'custom source: https://evil.example/pkg.zip' "$OUT_FILE"; then
+  pass "the array-form package endpoint reaches the floor"
+else
+  cat "$OUT_FILE" >&2
+  fail "the array-form package endpoint reaches the floor"
+fi
+
+# F2: an inline package with BOTH dist and source metadata contributes both
+# endpoints (composer can fetch either: --prefer-source, dist fallback).
+prepare_case composer-dist-and-source
+mkdir -p "$CASE_DIR/composer-home"
+printf '{"repositories":[{"type":"package","package":{"name":"vendor/pkg","version":"1.0.0","dist":{"url":"https://trusted.example/pkg.zip","type":"zip"},"source":{"url":"https://evil.example/repo.git","type":"git","reference":"main"}}}]}\n' \
+  > "$CASE_DIR/composer-home/config.json"
+printf '{"install": {"trusted_registries": ["https://trusted.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  COMPOSER_HOME="$CASE_DIR/composer-home" \
+  -- vendor/pkg@1.0.0 --ecosystem composer
+if expect_status 10 "an untrusted source URL floors WARN despite a trusted dist"; then
+  pass "an untrusted source URL floors WARN despite a trusted dist"
+fi
+if grep -q 'https://evil.example/repo.git' "$OUT_FILE"; then
+  pass "both dist and source endpoints reach the floor"
+else
+  cat "$OUT_FILE" >&2
+  fail "both dist and source endpoints reach the floor"
+fi
+
+# F4: an explicit crates-io selection overrides an ambient registry.default
+# — cargo ignores the env key whenever argv selected, even the default.
+ES_ARGS=(okpkg --ecosystem cargo --registry crates-io)
+if [[ "$(run_es CARGO_REGISTRY_DEFAULT=private)" == "implicit-default" ]]; then
+  pass "explicit crates-io overrides an ambient registry.default"
+else
+  printf 'got: %s\n' "$(run_es CARGO_REGISTRY_DEFAULT=private)" >&2
+  fail "explicit crates-io overrides an ambient registry.default"
+fi
+prepare_case cargo-argv-beats-env-default
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/crates.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  CARGO_REGISTRY_DEFAULT=private \
+  -- okpkg@1.0.0 --ecosystem cargo --registry crates-io
+if expect_status 0 "explicit crates-io under an ambient default gates GO"; then
+  pass "explicit crates-io under an ambient default gates GO"
+fi
+
+# F3 (refuted — semantics pinned): bun's scoped npmrc registry beats the
+# generic CLI --registry, exactly as in npm: bun's CLI flag rewrites only
+# the default scope (pmopt.rs `cli.registry` -> `self.scope`) and the
+# scoped map is consulted first. The packument for a scoped package must
+# come from the scoped registry even with a CLI selector present.
+prepare_case bun-scoped-beats-cli
+printf '@demo:registry=https://scoped.example\n' > "$CASE_PROJECT/.npmrc"
+cat > "$FIXTURES/scoped-packument.json" <<'JSON'
+{"dist-tags": {"latest": "1.0.0"}, "versions": {"1.0.0": {}}}
+JSON
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/scoped-packument.json" \
+  MOCK_REGISTRY_URL_LOG="$CASE_DIR/urls.log" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- @demo/pkg --ecosystem npm --installer bun --registry https://cli.example
+if grep -q '^https://scoped.example/@demo%2Fpkg$' "$CASE_DIR/urls.log"; then
+  pass "bun scoped npmrc registry beats the CLI selector"
+else
+  cat "$CASE_DIR/urls.log" >&2
+  fail "bun scoped npmrc registry beats the CLI selector"
+fi
+rm -f "$CASE_PROJECT/.npmrc"
+
 # 57. Plumbing parity: the identity readers derive the same PR6 sources.
 ES_ARGS=(okpkg --ecosystem cargo)
 if [[ "$(run_es CARGO_REGISTRY_DEFAULT=private)" == "explicit:cargo-registry:private" ]]; then

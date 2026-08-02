@@ -5029,6 +5029,12 @@ composer_env_sources() {
   local cfg
   cfg="$(composer_home_dir)/config.json"
   [[ -f "$cfg" ]] || return 0
+  # Every endpoint a repository can fetch from is emitted, not the first
+  # one found: an inline package definition carries dist AND source URLs
+  # and composer can select either (--prefer-source, dist fallback), and
+  # the `package` value is an object OR an array of definitions — an
+  # elif chain over those shapes left endpoints out of the trust floor
+  # (PR6 review round 1, findings 1-2).
   jq -r '
     (.repositories // empty)
     | (if type == "array" then to_entries | map({key: (.value.name // (.key | tostring)), value: .value})
@@ -5041,10 +5047,17 @@ composer_env_sources() {
         (if ((.value | keys) | length) == 1 and ((.value | to_entries[0].value) == false) then
            (if ((.value | to_entries[0].key) == "packagist.org" or (.value | to_entries[0].key) == "packagist")
             then "local:packagist-disabled" else empty end)
-         elif (.value.url? | type) == "string" then .value.url
-         elif (.value.package?.dist?.url? | type) == "string" then .value.package.dist.url
-         elif (.value.package?.source?.url? | type) == "string" then .value.package.source.url
-         else empty end)
+         else
+           (
+             (.value.url? | select(type == "string")),
+             (.value.package?
+              | (if type == "object" then [.] elif type == "array" then . else [] end)
+              | .[]
+              | select(type == "object")
+              | ((.dist?.url? | select(type == "string")),
+                 (.source?.url? | select(type == "string"))))
+           )
+         end)
       else empty end
   ' "$cfg" 2>/dev/null | tr '\n' ' ' || true
 }
@@ -5061,16 +5074,21 @@ bun_user_rc() {
   fi
 }
 
-# Effective registry for a bun-driven install (--installer bun). Precedence
-# per bun's source (PackageManagerOptions REGISTRY_KEYS + the npmrc loader):
-# CLI --registry, then BUN_CONFIG_REGISTRY / NPM_CONFIG_REGISTRY /
-# npm_config_registry — that order, upper BEFORE lower, the reverse of npm's
-# own env precedence — each honored only when it starts with http:// or
-# https:// (bun silently ignores other shapes), then project .npmrc, then
-# bun's user npmrc. Scoped @scope:registry keys come from CLI tokens and
-# npmrc files only (bun has no scoped env form). bunfig.toml
-# (install.registry, install.scopes) is TOML and stays un-swept — the same
-# reviewed boundary as uv.toml; documented in install-wrappers.md.
+# Effective registry for a bun-driven install (--installer bun). A SCOPED
+# registry beats every generic selector INCLUDING the CLI --registry, in
+# bun exactly as in npm: bun's CLI flag rewrites only the default scope
+# (PackageManagerOptions.rs — `cli.registry` assigns `self.scope`), while
+# scoped registries live in a separate map that `scope_for_package_name`
+# consults first and the CLI never touches. Generic precedence per bun's
+# source (REGISTRY_KEYS + the npmrc loader): CLI --registry, then
+# BUN_CONFIG_REGISTRY / NPM_CONFIG_REGISTRY / npm_config_registry — that
+# order, upper BEFORE lower, the reverse of npm's own env precedence —
+# each honored only when it starts with http:// or https:// (bun silently
+# ignores other shapes), then project .npmrc, then bun's user npmrc.
+# Scoped @scope:registry keys come from CLI tokens and npmrc files only
+# (bun has no scoped env form). bunfig.toml (install.registry,
+# install.scopes) is TOML and stays un-swept — the same reviewed boundary
+# as uv.toml; documented in install-wrappers.md.
 bun_registry_url() {
   local name="${1:-${PKG_NAME:-}}"
   local scope=""
@@ -5195,9 +5213,13 @@ derive_effective_sources() {
         fi
       done
       CHECK_EFFECTIVE_SOURCES=$(normalize_source_set "$rw")
-      # registry.default applies only when argv selected nothing (cargo's
-      # selection is single-valued; the CLI beats the config key).
-      if [[ -z "$CHECK_EFFECTIVE_SOURCES" && -n "${CARGO_REGISTRY_DEFAULT:-}" ]]; then
+      # registry.default applies only when argv selected NOTHING — judged
+      # on the RAW argv set, not the rewritten one: an explicit
+      # `--registry crates-io` rewrites to empty (it IS the default
+      # source) yet still overrides an ambient registry.default, and
+      # treating the empty rewrite as no-selection reapplied the env
+      # default cargo ignores (PR6 review round 1, finding 4).
+      if [[ -z "${CHECK_REGISTRY:-}" && -n "${CARGO_REGISTRY_DEFAULT:-}" ]]; then
         if mapped=$(cargo_source_for_name "$CARGO_REGISTRY_DEFAULT"); then
           CHECK_EFFECTIVE_SOURCES=$(normalize_source_set "$mapped")
         fi
