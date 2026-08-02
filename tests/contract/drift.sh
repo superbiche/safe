@@ -178,6 +178,20 @@ case_exit_codes_match_the_dispatcher() {
   fi
 }
 
+case_version_constant_matches_version_file() {
+  # Two version sources drifted at the 1.2.0 cut: the VERSION file was
+  # bumped and the SAFE_VERSION constant in bin/safe was not, so the
+  # installed binary reported the old release.
+  local file_v const_v
+  file_v="$(tr -d '[:space:]' < "$ROOT/VERSION")"
+  const_v="$(sed -n 's/^SAFE_VERSION="\(.*\)"$/\1/p' "$ROOT/bin/safe" | head -n 1)"
+  if [[ -n "$file_v" && "$file_v" == "$const_v" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (VERSION file '$file_v' vs bin/safe SAFE_VERSION '$const_v')"
+  fi
+}
+
 case_contract_never_suggests_latest() {
   # The standing operator ruling: allow entries are pinned to resolved
   # versions, and nothing safe prints may model `@latest` as acceptable.
@@ -223,6 +237,7 @@ case_explain_fails_loudly_without_a_contract
 case_malformed_contract_is_refused
 case_exit_codes_match_the_dispatcher
 case_contract_never_suggests_latest
+case_version_constant_matches_version_file
 case_gated_tools_match_the_installed_wrapper_set
 
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
