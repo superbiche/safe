@@ -153,6 +153,35 @@ gate_tool_displaceable() {
 
 write_gate_wrapper() {
   local target="$1" tool="$2"
+  if [[ "$tool" == "mise" ]]; then
+    # mise multiplexes on argv[0]: its shims are symlinks to whatever `mise`
+    # resolves to on PATH, and a reshim run while this wrapper shadows the
+    # real binary binds every shim here (2026-08-02: all 36 shims broke and
+    # every node-family tool executed mise bare). A shim dispatch must reach
+    # the real mise with argv[0] intact and must never enter the gate. The
+    # branch is self-contained (no `safe gate` involvement) so a gate bug
+    # can never take the whole shim fleet down with it.
+    cat > "$target" <<'EOF' || return 1
+#!/usr/bin/env bash
+# safe-gate-wrapper v1 tool=mise
+if [[ "${0##*/}" != "mise" ]]; then
+  IFS=: read -ra __dirs <<< "$PATH"
+  for __d in "${__dirs[@]}"; do
+    [[ -n "$__d" ]] || continue
+    __c="${__d%/}/mise"
+    [[ -f "$__c" && -x "$__c" ]] || continue
+    [[ "$__c" -ef "${BASH_SOURCE[0]}" ]] && continue
+    LC_ALL=C head -n 2 -- "$__c" 2>/dev/null | grep -q '^# safe-gate-wrapper' && continue
+    exec -a "$0" "$__c" "$@"
+  done
+  printf 'safe gate: real mise not found on PATH (argv0 dispatch for %s)\n' "${0##*/}" >&2
+  exit 127
+fi
+exec safe gate mise -- "$@"
+EOF
+    chmod 0755 "$target" || return 1
+    return 0
+  fi
   cat > "$target" <<EOF || return 1
 #!/usr/bin/env bash
 # safe-gate-wrapper v1 tool=${tool}

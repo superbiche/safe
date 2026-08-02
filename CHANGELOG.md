@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- The mise gate wrapper is argv0-aware: mise shims are symlinks to whatever
+  `mise` resolves to on PATH, and a `mise reshim` run while the wrapper
+  shadowed the real binary bound all 36 shims to the wrapper, which dropped
+  argv[0] — every shimmed tool (node, npm, acpx, …) executed mise bare.
+  A shim dispatch (argv[0] ≠ mise) now reaches the real mise with argv[0]
+  intact and never enters the gate; `safe doctor` reports shims still bound
+  to the wrapper (functional but one exec slower) for repair.
+
 - npm override resolution: a single top-level exact-version `overrides` entry
   with no conflicting direct dependency now resolves (`override-pin`, no
   fetch) instead of degrading to the package-level WARN; override ranges,
