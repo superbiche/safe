@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "title": "safe: agent contract — what is gated, how refusals look, how to get unblocked",
+  "intro": "This machine routes package execution and installation through `safe`, a supply-chain safety net. If a package-manager command fails with a message starting with `safe:` or `safe run:`, it was refused BY POLICY — the toolchain is not broken.",
+  "one_rule": "A refusal is policy, not breakage. Do not work around it: no direct node_modules/.bin calls of packages that failed to install, no alternate installers, no curl|sh. Relay the refusal and its `to allow:` command to the operator verbatim, wait, then retry the original command unchanged.",
+  "gated_surfaces": [
+    {
+      "surface": "npx, bunx, uvx",
+      "mechanism": "Binaries are symlinked to `safe run`: packages run from a project node_modules/.bin (bare unversioned names, current or parent dir), an allowlist, a Podman sandbox, or not at all.",
+      "refusal": "`safe run: BLOCKED ...` + exit 100-104"
+    },
+    {
+      "surface": "npm, pnpm, pnpx, yarn, bun, pip, pip3, uv, cargo, go, composer, mise",
+      "mechanism": "PATH wrappers in ~/.local/bin exec `safe gate <tool>`, which audits install, update, and exec-style subcommands with `safe audit` before delegating to the real tool. This applies in every shell, not just interactive zsh.",
+      "refusal": "`safe: BLOCKED ...` + exit 100/102/104"
+    },
+    {
+      "surface": "safe install <pkg>",
+      "mechanism": "Audited, confirmed install path (multi-manager). With no specs in a project directory it audits the project's dependencies instead.",
+      "refusal": "`safe: BLOCKED ...` + exit 100/102/104"
+    }
+  ],
+  "audited_subcommands": "Installs (install/add/ci/require and global variants), updates (update/up/upgrade, npm it), and exec-style fetch-and-run (npm exec|x, pnpm dlx, pnpx, yarn dlx, bun x, uv run --with|-w, uv tool run, go run <module>@<version>). An unrecognized space-form value flag before the command fails closed (escapable with --flag=value).",
+  "passthrough": "No registry fetch, no gate: non-install subcommands (npm run, npm --version, ...), npm exec/npx of a bare unversioned name already in node_modules/.bin of the current or a parent directory (a versioned or aliased spec is still audited), pnpm exec and composer exec (project/vendor binaries only), uv run without --with, and go run of local paths. npx --no-install/--no is honored strictly: the local binary runs or the refusal is exit 100, never a registry fetch.",
+  "refusal_format": "safe: BLOCKED <tool> <action> — <reason>; to allow: <operator command>; details: safe explain",
+  "exit_codes": [
+    {
+      "code": 100,
+      "meaning": "blocked by policy (blocklist, fail-closed audit, unrecognized/unsupported runner-native flags)",
+      "agent_action": "Relay the refusal line verbatim to the operator. Do not retry, do not reword the command."
+    },
+    {
+      "code": 101,
+      "meaning": "host-allow version pin mismatch",
+      "agent_action": "The allowlist pins a different version than the one requested. Report both versions; re-pin is an operator decision."
+    },
+    {
+      "code": 102,
+      "meaning": "interactive operator confirmation required (non-TTY refusal)",
+      "agent_action": "Nothing an agent can do in this shell. Ask the operator to run it in their terminal."
+    },
+    {
+      "code": 103,
+      "meaning": "invalid package name rejected",
+      "agent_action": "Check the spec for a typo before escalating — this one is usually the caller's error."
+    },
+    {
+      "code": 104,
+      "meaning": "safe audit BLOCK verdict",
+      "agent_action": "The audit returned BLOCK. That can be a critical advisory affecting the resolved version, a blocklist entry, or a critical advisory safe could not tie to a resolved version — the reason is in the receipt. Inspect it, and use `safe report-fp <spec>` only when its resolved-version and advisory evidence are inconsistent with the refusal."
+    },
+    {
+      "code": 127,
+      "meaning": "genuinely missing command (never a policy refusal)",
+      "agent_action": "The command is not installed, or `safe` is missing from PATH. Report it; never treat it as a reason to bypass."
+    }
+  ],
+  "agent_rules": [
+    "Treat any BLOCKED line as policy, not breakage; do not retry blind.",
+    "Relay the refusal line and its `to allow:` command to the operator verbatim. Trust escalations (safe run host-allow add/update) only work in the operator's interactive terminal — never attempt them yourself.",
+    "After the operator allows, retry the original command unchanged.",
+    "Exit 127 from a wrapped tool means a genuinely missing command (or a `safe` missing from PATH), never a policy block — the gate always refuses legibly with exit 100. Report a silent 127, don't bypass.",
+    "Never construct or request `<pkg>@latest`; use the pinned version the refusal names.",
+    "If the advisories do not affect the resolved version, run `safe report-fp <spec>` instead of arguing with the gate."
+  ],
+  "version_resolution": {
+    "rule": "safe audits the version that will actually be installed, never the literal string `latest`. An unversioned spec is resolved through the registry first (dist-tag for installs, the max version satisfying the declared range for updates), and the advisory match is evaluated against that resolved version.",
+    "never_latest": "Never suggest, request, or construct an allow entry for `<pkg>@latest`. Allow entries are pinned to resolved versions. A refusal that needs an allow will name the exact pinned version in its `to allow:` command — use that string as-is.",
+    "unresolvable": "When resolution fails (a private registry, a git or workspace spec, a compound range), the verdict floors at WARN with reason `version_unresolved` and is never auto-allowed. Pin an exact version and retry."
+  },
+  "escalation": [
+    {
+      "situation": "Audit backend is down or unauthenticated",
+      "signal": "The refusal names a Socket auth failure, a rate limit, or a network error — not an advisory.",
+      "action": "Escalate to the operator immediately. Do not park it, do not retry around it, do not treat it as a vulnerability finding. Recovery is usually `socket login` or a vault-injection fix; `safe doctor` checks the wiring."
+    },
+    {
+      "situation": "A critical advisory affects the resolved version",
+      "signal": "Exit 104 with an advisory ID and the resolved version.",
+      "action": "This is the gate working. Report the advisory to the operator and propose a fixed version if one exists."
+    },
+    {
+      "situation": "The advisory does not affect the resolved version",
+      "signal": "Exit 104 or a WARN whose advisories all have fixed bounds at or below the resolved version.",
+      "action": "Suspected false positive. Run `safe report-fp <spec>` — it re-runs the check, saves the receipt, and writes a dated note in safe's inbox for the operator to validate. Nothing auto-applies."
+    },
+    {
+      "situation": "A scanner is missing or broke",
+      "signal": "The output names a broken or unrun scanner and the verdict degraded to WARN.",
+      "action": "Coverage is missing, not a finding. Run `safe doctor` and report; do not read the WARN as a vulnerability."
+    }
+  ],
+  "report_fp": {
+    "command": "safe report-fp <spec> [--ecosystem <eco>] [--source <agent>]",
+    "what_it_does": "Re-runs the check as JSON, saves the receipt, and writes inbox/YYYY-MM-DD-<source>-fp-<slug>.md in safe's repo with the command it ran, its exit code, the resolved version, every advisory with its fixed bound, and the receipt path. It re-runs the check rather than capturing the original refusal, so quote that refusal to the operator yourself if it matters.",
+    "contract": "The note IS the escalation. Nothing auto-applies and no behaviour changes until the operator validates it."
+  },
+  "allow_flows": [
+    {
+      "command": "safe run host-allow add <pkg>@<version> --reason \"...\"",
+      "purpose": "trusted host exec (npm)"
+    },
+    {
+      "command": "safe run -y <pkg>@<version> -- <args>",
+      "purpose": "one-off sandbox run"
+    },
+    {
+      "command": "safe install [-g] <pkg>@<version>",
+      "purpose": "audited install"
+    },
+    {
+      "command": "safe run block list && safe run audit --blocked",
+      "purpose": "review refusals"
+    }
+  ],
+  "allow_flows_note": "Trust escalations require the operator's interactive terminal. `safe run host-allow add` and `update` refuse in non-TTY shells with exit 102, so an agent can suggest the command but never execute it.",
+  "no_partial_load": "Gating is executable-based: a wrapper either runs the full gate or is not on PATH at all. If `safe gate` cannot load its routing tables it refuses with the usual `safe: BLOCKED` line and exit 100 rather than delegating. A bare silent 127 therefore means the command genuinely is not installed — or that `safe` itself is missing from PATH, which is worth reporting.",
+  "harness_snippet": "## Package manager gates\n\nThis machine gates package execution/installation through `safe`. If a\ncommand fails with a `safe: BLOCKED` / `safe run: BLOCKED` line or exit code\n100–104, that is policy, not breakage: run `safe explain`, relay the refusal\nand its `to allow:` command to the operator verbatim, and never bypass\n(no direct node_modules/.bin calls, alternate installers, or curl|sh).\nSuspected false positive: `safe report-fp <spec>`."
+}

@@ -11,6 +11,9 @@ AUDIT_CONFIG_DIR="$CONFIG_BASE/audit"
 AUDIT_DATA_DIR="$DATA_BASE/audit"
 WRAPPER_TARGET="$CONFIG_BASE/install-wrappers.zsh"
 GATE_LIB_TARGET="$CONFIG_BASE/gate-lib.sh"
+# The agent contract travels with the dispatcher: `safe explain` runs from
+# ~/.local/bin, which has no ../docs, so the single source is installed here.
+AGENT_CONTRACT_TARGET="$CONFIG_BASE/agent-contract.json"
 # Tools that get a PATH wrapper. Every wrapper is a dumb 3-line shim into
 # `safe gate`; all routing lives in gate-lib.sh, so upgrading safe upgrades the
 # gate without rewriting a single wrapper.
@@ -106,6 +109,7 @@ for script in "$REPO_DIR/bin/safe" "$REPO_DIR/bin/safe-run" "$REPO_DIR/bin/safe-
 done
 [[ -f "$REPO_DIR/lib/install-wrappers.zsh" ]] || die "missing wrapper source"
 [[ -f "$REPO_DIR/lib/gate-lib.sh" ]] || die "missing gate library source"
+[[ -f "$REPO_DIR/docs/contract/agent-contract.json" ]] || die "missing agent contract source"
 [[ -f "$REPO_DIR/lib/completions/_safe" ]] || die "missing zsh completion"
 
 # Ownership check: a regular (never symlinked) file whose second line is
@@ -484,6 +488,8 @@ if [[ -f "$GATE_LIB_TARGET" ]] || gate_wrappers_exist; then
   install -m 0644 "$REPO_DIR/lib/gate-lib.sh" "$GATE_LIB_TARGET"
   info "refreshed gate library at $GATE_LIB_TARGET"
 fi
+mkdir -p "$CONFIG_BASE"
+install -m 0644 "$REPO_DIR/docs/contract/agent-contract.json" "$AGENT_CONTRACT_TARGET"
 install -m 0755 "$REPO_DIR/bin/safe" "$BIN_DIR/safe"
 install -m 0755 "$REPO_DIR/bin/safe-run" "$BIN_DIR/safe-run"
 install -m 0755 "$REPO_DIR/bin/safe-audit" "$BIN_DIR/safe-audit"

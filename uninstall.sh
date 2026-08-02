@@ -117,6 +117,7 @@ for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise; do
   fi
 done
 rm -f "$CONFIG_BASE/gate-lib.sh"
+rm -f "$CONFIG_BASE/agent-contract.json"
 if [[ "${#removed_wrappers[@]}" -gt 0 ]]; then
   info "removed gate wrappers: ${removed_wrappers[*]}"
 fi

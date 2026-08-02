@@ -33,71 +33,305 @@ USAGE
   safe setup [<machine> | --all | --machine <csv>]
   safe status
   safe doctor [--json]
-  safe explain
+  safe explain [--json]
+  safe report-fp <spec> [--ecosystem <eco>] [--source <agent>]
   safe version
   safe help
 EOF
 }
 
+# The agent contract has ONE source: docs/contract/agent-contract.json. The
+# text below, `safe explain --json`, and the tables in docs/agents.md are all
+# rendered from it. They used to be hand-duplicated, and they drifted — an
+# agent reading the docs and an agent reading `safe explain` were told
+# different things about the same gate.
+agent_contract_path() {
+  local candidate
+  for candidate in \
+    "${SAFE_AGENT_CONTRACT:-}" \
+    "$SAFE_DIR/../docs/contract/agent-contract.json" \
+    "$SAFE_CONFIG_ROOT/agent-contract.json"; do
+    [[ -n "$candidate" && -r "$candidate" ]] || continue
+    printf '%s' "$candidate"
+    return 0
+  done
+  return 1
+}
+
 cmd_explain() {
-  cat <<'EOF'
-safe: agent contract — what is gated, how refusals look, how to get unblocked
+  local json=0
+  case "${1:-}" in
+    --json) json=1 ;;
+    "") ;;
+    *) printf 'usage: safe explain [--json]\n' >&2; return 2 ;;
+  esac
 
-This machine routes package execution and installation through `safe`, a
-supply-chain safety net. If a package-manager command fails with a message
-starting with `safe:` or `safe run:`, it was refused BY POLICY — the
-toolchain is not broken. Do not work around a refusal (no direct
-node_modules/.bin calls of packages that failed to install, no alternate
-installers, no curl|sh). Surface the refusal to the operator instead.
+  local contract
+  if ! contract="$(agent_contract_path)"; then
+    printf 'safe: agent contract not found (looked beside safe and in %s); repair the install — safe doctor\n' \
+      "$SAFE_CONFIG_ROOT" >&2
+    return 1
+  fi
+  if ! jq -e . >/dev/null 2>&1 < "$contract"; then
+    printf 'safe: agent contract at %s is not readable JSON; repair the install — safe doctor\n' "$contract" >&2
+    return 1
+  fi
 
-WHAT IS GATED
-  npx / bunx / uvx        Binaries are symlinked to `safe run`: packages run
-                          from a project node_modules/.bin (bare unversioned
-                          names, current or parent dir), an allowlist, a Podman
-                          sandbox, or not at all.
-  npm / pnpm / pnpx / yarn / bun / pip / pip3 / uv / cargo / go / composer
-                          PATH wrappers (~/.local/bin) exec `safe gate <tool>`,
-                          which audits install, update, and exec subcommands
-                          with `safe audit` before delegating to the real tool:
-                          install/add/ci/require (and global variants),
-                          update/up/upgrade families, and exec-style
-                          fetch-and-run (npm exec|x, pnpm dlx, pnpx, yarn dlx,
-                          bun x, uv run --with|-w, uv tool run,
-                          go run <module>@<version>). This applies in every
-                          shell, not just interactive zsh. Project-local
-                          commands pass through, including npm exec of a
-                          bare-named installed ./node_modules/.bin tool
-                          (versioned specs are still audited), pnpm exec, and
-                          composer exec (vendor binaries only).
-  safe install <pkg>      Audited, confirmed install path (multi-manager).
+  if (( json )); then
+    jq . < "$contract"
+    return 0
+  fi
 
-HOW A REFUSAL LOOKS
-  One stderr line starting with `safe: BLOCKED` or `safe run: BLOCKED`,
-  stating what was blocked, why, and the operator command that allows it.
+  jq -r '
+    # Greedy wrap. The indent counts against the width, or every indented
+    # block overruns the column it was supposed to respect.
+    def wrap($width; $indent):
+      ($width - ($indent | length)) as $room
+      | [splits(" ")] | reduce .[] as $w ([[]];
+        (.[-1] | map(length) | add // -1) + 1 + ($w | length) as $len
+        | if ($len > $room) then . + [[$w]] else .[0:-1] + [.[-1] + [$w]] end)
+      | map($indent + join(" ")) | join("\n");
 
-EXIT CODES (policy refusals; 127 means a genuinely missing command)
-  100  blocked by policy (blocklist, fail-closed audit, unrecognized/unsupported runner-native flags)
-  101  host-allow version pin mismatch
-  102  interactive operator confirmation required (non-TTY refusal)
-  103  invalid package name rejected
-  104  safe audit BLOCK verdict
+    "safe: " + (.title | sub("^safe: "; "")),
+    "",
+    (.intro | wrap(72; "")),
+    "",
+    (.one_rule | wrap(72; "")),
+    "",
+    "WHAT IS GATED",
+    (.gated_surfaces[] | "  " + .surface, (.mechanism | wrap(68; "    "))),
+    "",
+    "  audited subcommands",
+    (.audited_subcommands | wrap(68; "    ")),
+    "",
+    "  passthrough",
+    (.passthrough | wrap(68; "    ")),
+    "",
+    "HOW A REFUSAL LOOKS",
+    "  " + .refusal_format,
+    "",
+    "EXIT CODES (policy refusals; 127 means a genuinely missing command)",
+    (.exit_codes[] | "  \(.code)  \(.meaning)"),
+    "",
+    "VERSION RESOLUTION",
+    (.version_resolution.rule | wrap(70; "  ")),
+    (.version_resolution.never_latest | wrap(70; "  ")),
+    "",
+    "WHAT AN AGENT SHOULD DO",
+    (to_entries[] | select(.key == "agent_rules") | .value | to_entries[]
+      | "  \(.key + 1). " + (.value | wrap(66; "     ") | sub("^ +"; ""))),
+    "",
+    "WHEN TO ESCALATE",
+    (.escalation[] | "  " + .situation, (.action | wrap(68; "    "))),
+    "",
+    "SUSPECTED FALSE POSITIVE",
+    "  " + .report_fp.command,
+    (.report_fp.contract | wrap(70; "  ")),
+    "",
+    "OPERATOR ALLOW FLOWS",
+    (.allow_flows[] | "  \(.command)\n      \(.purpose)")
+  ' < "$contract"
+}
 
-WHAT AN AGENT SHOULD DO
-  1. Treat any BLOCKED line as policy, not breakage; do not retry blind.
-  2. Relay the refusal line and its `to allow:` command to the operator
-     verbatim. Trust escalations (safe run host-allow add/update) only work
-     in the operator's interactive terminal — never attempt them yourself.
-  3. After the operator allows, retry the original command unchanged.
-  4. Exit 127 from a wrapped tool means a genuinely missing command (or a
-     `safe` missing from PATH), never a policy block — the gate always
-     refuses legibly with exit 100. Report a silent 127, don't bypass.
+# A false-positive report is an ESCALATION, not a fix: it re-runs the check,
+# captures the evidence while it is still true, and writes a dated note for the
+# operator to validate. Nothing here changes a verdict, touches an allowlist, or
+# alters behaviour — an agent that could quiet the gate by filing a report would
+# be an agent that can bypass it.
+cmd_report_fp() {
+  local spec="" ecosystem="" source="agent"
+  while (( $# )); do
+    case "$1" in
+      --ecosystem) ecosystem="${2:-}"; shift 2 ;;
+      --source) source="${2:-}"; shift 2 ;;
+      -h|--help)
+        printf 'usage: safe report-fp <spec> [--ecosystem <eco>] [--source <agent>]\n'
+        return 0
+        ;;
+      -*) printf 'safe: report-fp: unknown flag: %s\n' "$1" >&2; return 2 ;;
+      *)
+        [[ -z "$spec" ]] || { printf 'safe: report-fp takes one spec\n' >&2; return 2; }
+        spec="$1"; shift
+        ;;
+    esac
+  done
+  [[ -n "$spec" ]] || { printf 'usage: safe report-fp <spec> [--ecosystem <eco>] [--source <agent>]\n' >&2; return 2; }
 
-OPERATOR ALLOW FLOWS
-  safe run host-allow add <pkg>@<version> --reason "..."   trusted host exec (npm)
-  safe run -y <pkg>@<version> -- <args>                    one-off sandbox run
-  safe install [-g] <pkg>@<version>                        audited install
-  safe run block list / safe run audit --blocked           review refusals
-EOF
+  local repo_dir
+  repo_dir="$(report_fp_repo_dir)" || {
+    printf 'safe: report-fp: safe'\''s repo is not on this machine (set SAFE_REPO_DIR); nothing was written\n' >&2
+    return 1
+  }
+
+  local -a args=(check "$spec" --json)
+  [[ -n "$ecosystem" ]] && args+=(--ecosystem "$ecosystem")
+
+  local payload status=0
+  payload="$("$SAFE_AUDIT_PATH" "${args[@]}" 2>/dev/null)" || status=$?
+  # Parseable is not the same as usable. `jq -e .` accepts the scalar
+  # `"not-an-object"`, and the renderer below then dies indexing it — AFTER the
+  # note has been created, leaving a truncated half-report and breaking the
+  # "nothing was written" guarantee this command makes. Validate the shape the
+  # renderer actually consumes, before anything is created.
+  if ! jq -e '
+    type == "object"
+    and ((.osv? // {}) | type == "object")
+    and (((.osv? // {}).classification? // {}) | type == "object")
+    and ((.resolution? // {}) | type == "object")
+    and ((.socket? // {}) | type == "object")
+    and ((.resolved_versions? // []) | type == "array")
+    and ((.warn_causes? // []) | type == "array")
+  ' >/dev/null 2>&1 <<<"$payload"; then
+    printf 'safe: report-fp: the check produced no readable JSON (exit %s); nothing was written\n' "$status" >&2
+    return 1
+  fi
+
+  local slug date_str inbox
+  slug="$(printf '%s' "$spec" | tr '[:upper:]' '[:lower:]' | sed -e 's|^@||' -e 's|[/@]|-|g' -e 's|[^a-z0-9.-]|-|g' -e 's|-\{2,\}|-|g' -e 's|^-||' -e 's|-$||')"
+  date_str="$(date +%F)"
+  inbox="$repo_dir/inbox"
+  mkdir -p "$inbox"
+
+  # The note is rendered to a temp file IN THE DESTINATION DIRECTORY and then
+  # published with a hard link. `ln` fails if the target exists and never
+  # follows a symlink, so the existence check, the symlink check and the
+  # exclusive create are the same syscall that does the publish — there is no
+  # window between deciding the name is free and taking it.
+  #
+  # This replaced four cooperating mechanisms (a collision loop, an -e/-L test,
+  # a `set -C` create, then a second non-exclusive open to copy the body). That
+  # arrangement had a race of its own: the exclusive create closed the file and
+  # the copy re-opened the path, so a symlink swapped in between them was
+  # followed with the full report. Publishing what is already complete, in one
+  # operation, is both smaller and correct.
+  local body
+  body="$(mktemp "$inbox/.report-fp.XXXXXX")" || {
+    printf 'safe: report-fp: cannot write to %s; nothing was written\n' "$inbox" >&2
+    return 1
+  }
+  # Removed on every path out of here, including the failures below.
+  trap 'rm -f "$body"' RETURN
+
+  jq -r --arg spec "$spec" --arg source "$source" --arg date "$date_str" --arg status "$status" '
+      def bounds:
+        [ .[]? | "- `\(.id)` (\(.severity // "unknown")) — fixed at `\(.fixed // "no fixed version")`" ] | join("\n");
+      "# Suspected false positive: \($spec)",
+      "",
+      "**Date:** \($date)",
+      "**Source:** \($source)",
+      "**Affects:** safe audit verdict logic",
+      "",
+      "## What was checked",
+      "",
+      "```",
+      "safe audit check \($spec)" + (if .ecosystem then " --ecosystem \(.ecosystem)" else "" end),
+      "```",
+      "",
+      "Exit code: `\($status)`  ·  Verdict: **\(.verdict // "unknown")**",
+      "",
+      "## Resolution",
+      "",
+      "Requested spec: `\($spec)`",
+      "Resolved to: `\((.resolved_versions // []) | join(", ") | if . == "" then "unresolved" else . end)`",
+      "Method: `\(.resolution.method // "unknown")` (status `\(.resolution.status // "unknown")`)",
+      "",
+      "## Why this looks wrong",
+      "",
+      (if ((.osv.classification.affecting // []) | length) > 0 then
+        "OSV advisories reported as AFFECTING the resolved version:\n\n"
+          + ((.osv.classification.affecting) | bounds)
+          + "\n\nIf every fixed bound above is at or below the resolved version, none of "
+          + "them affect it and the verdict is wrong."
+       else
+        "No advisory is classified as affecting the resolved version, yet the "
+          + "command was refused — so the verdict did not come from the OSV "
+          + "classification. Check the Socket and blocklist sections of the receipt."
+       end),
+      "",
+      (if ((.osv.classification.remediated // []) | length) > 0 then
+        "Advisories already remediated at this version (correctly not counted):\n\n"
+          + ((.osv.classification.remediated) | bounds) + "\n"
+       else empty end),
+      (if ((.warn_causes // []) | length) > 0 then
+        "Recorded WARN causes: " + ((.warn_causes | map("`\(.)`")) | join(", ")) + "\n"
+       else empty end),
+      "## Verdict inputs",
+      "",
+      "- Socket: `\(.socket.status // "n/a")`" +
+        (if ((.socket.status // "ok") != "ok")
+         then " — the check failed; its raw error text is in the receipt, not here"
+         else "" end),
+      "- OSV: `\(.osv.status // "n/a")`, \((.osv.vulns // []) | length) advisories fetched",
+      ""
+    ' <<<"$payload" > "$body" || {
+    # Checked on its own. Inside a brace group the renderer's status was the
+    # group's only until the next command ran, so a failed jq was masked by the
+    # trailing printfs and a note holding nothing but the static tail got
+    # published — with exit 0 and a "wrote" line.
+    printf 'safe: report-fp: could not render the evidence; nothing was written\n' >&2
+    return 1
+  }
+  {
+    printf '## Receipt\n\n'
+    printf 'Full evidence: `%s`\n\n' "${SAFE_DATA_ROOT:-$HOME/.local/share/safe}/audit/checks/${date_str}-${slug}.json"
+    printf '## Contract\n\n'
+    printf 'This note IS the escalation. Nothing was auto-applied: no allowlist entry was\n'
+    printf 'written, no verdict was changed, and the gate still refuses. The operator\n'
+    printf 'validates before any behaviour changes.\n'
+  } >> "$body" || {
+    printf 'safe: report-fp: could not finish the note; nothing was written\n' >&2
+    return 1
+  }
+
+  # Publish. Suffix on collision — the retry IS the existence check, so there is
+  # no separate counter to get off by one. The bound is on attempts, and the
+  # last attempt is a real one.
+  local note="" candidate n=1
+  while (( n <= 100 )); do
+    if (( n == 1 )); then
+      candidate="$inbox/${date_str}-${source}-fp-${slug}.md"
+    else
+      candidate="$inbox/${date_str}-${source}-fp-${slug}-${n}.md"
+    fi
+    # -T: never treat the destination as a directory. Without it, a candidate
+    # that is a symlink to a directory makes ln create the link INSIDE that
+    # directory — the report lands outside the inbox and this loop reports
+    # success. (GNU coreutils, already assumed throughout: stat -c, sed -i.)
+    if ln -T -- "$body" "$candidate" 2>/dev/null; then
+      note="$candidate"
+      break
+    fi
+    n=$((n + 1))
+  done
+  if [[ -z "$note" ]]; then
+    printf 'safe: report-fp: could not claim a filename for %s in %s; nothing was written\n' \
+      "$slug" "$inbox" >&2
+    return 1
+  fi
+
+  printf 'safe: report-fp: wrote %s\n' "$note"
+  printf 'safe: report-fp: nothing was allowed or changed — the operator validates this note\n'
+}
+
+report_fp_repo_dir() {
+  # An explicitly configured SAFE_REPO_DIR is authoritative: if it is set and
+  # wrong, that is an error, not a licence to fall back. Silently writing the
+  # report into a DIFFERENT checkout than the operator named would file the
+  # escalation where nobody is looking for it.
+  if [[ -n "${SAFE_REPO_DIR:-}" ]]; then
+    [[ -d "$SAFE_REPO_DIR/.git" && -d "$SAFE_REPO_DIR/bin" ]] || return 1
+    (cd "$SAFE_REPO_DIR" && pwd)
+    return 0
+  fi
+  local candidate
+  for candidate in \
+    "$SAFE_DIR/.." \
+    "$HOME/dev/personal/safe"; do
+    [[ -d "$candidate/.git" && -d "$candidate/bin" ]] || continue
+    (cd "$candidate" && pwd)
+    return 0
+  done
+  return 1
 }
 
 cmd_gate_usage() {
@@ -1857,7 +2091,8 @@ case "${1:-}" in
   status)   shift; cmd_status "$@" ;;
   setup)    shift; exec "$SAFE_AUDIT_PATH" setup "$@" ;;
   doctor)   shift; cmd_doctor "$@" ;;
-  explain)  shift; cmd_explain ;;
+  explain)  shift; cmd_explain "$@" ;;
+  report-fp) shift; cmd_report_fp "$@" ;;
   version|--version|-v) cmd_version ;;
   help|-h|--help|"") show_usage ;;
   *)        exec "$SAFE_RUN_PATH" "$@" ;;
