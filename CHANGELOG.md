@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2.1 - 2026-08-02
 
 - The mise gate wrapper is argv0-aware: mise shims are symlinks to whatever
   `mise` resolves to on PATH, and a `mise reshim` run while the wrapper
