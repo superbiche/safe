@@ -41,3 +41,23 @@ Implement a fail-closed audited Volta install path in `safe`:
 - npm 12 `allow-scripts`: https://docs.npmjs.com/cli/v12/using-npm/config/#allow-scripts
 - npm 12 `npm approve-scripts`: https://docs.npmjs.com/cli/v12/commands/npm-approve-scripts/
 - Volta hooks scope: https://docs.volta.sh/advanced/hooks
+
+---
+
+## Status — 2026-08-02: Volta path superseded; manager-neutral residual open
+
+The Volta-specific implementation proposed here was never built and is now
+moot: the Volta integration was retired from safe (v1.2.0; see the sibling
+note's resolution). Do not implement steps 3/5–6 as written.
+
+The underlying gap is manager-neutral and REMAINS OPEN: with
+`ignore-scripts=true` in `~/.npmrc`, an audited GO install still skips a
+package's required lifecycle script, producing an apparently-successful but
+broken install — the same failure now reachable via mise npm-backend tools or
+plain `npm i -g`. Nothing in the v1.2.0 verdict/gate work touches lifecycle
+scripts.
+
+Needs an operator ruling: re-scope this as a manager-neutral proposal
+(exact-identity script allow via npm 12 `allow-scripts` under the audited-GO
+receipt, steps 1/2/4/7 carry over) or park it. No behavior change until
+ruled.
