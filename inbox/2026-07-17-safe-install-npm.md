@@ -44,3 +44,19 @@ Two cheap moves, either or both:
    recovery, same shape as the refusal contract elsewhere.
 
 Belongs with the agent-legibility family (cf. the `npm` shim silent-127 note).
+
+---
+
+## Resolution — 2026-08-02 (PR #44)
+
+Both proposed moves implemented in `cmd_install` (`bin/safe-run`):
+
+1. Up front: a strict sandbox with networking disabled announces itself
+   before handing off to npm ("network disabled — the install cannot reach
+   any registry; pass -n/--network to allow it").
+2. After: a nonzero child exit with networking disabled gets a trailer
+   naming the network-error class (EAI_AGAIN, ENOTFOUND, ECONNREFUSED
+   against a registry host) as the sandbox's doing, with the `-n` recovery.
+   The child's exit code is preserved.
+
+Orthogonally reviewed (terra-medium, SHIP). Closed.

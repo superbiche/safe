@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- npm override resolution: a single top-level exact-version `overrides` entry
+  with no conflicting direct dependency now resolves (`override-pin`, no
+  fetch) instead of degrading to the package-level WARN; override ranges,
+  nested/qualified overrides, and requested-range-beside-override still
+  degrade fail-closed.
+- Sandboxed installs (`safe run install`) announce up front when the strict
+  sandbox has networking disabled, and trailer a failed install with the
+  DNS/network cause and the `-n/--network` recovery — a registry `EAI_AGAIN`
+  no longer reads as a broken install with no hint.
+
 ## 1.2.0 - 2026-08-02
 
 - Scanners and helper CLIs (osv-scanner, socket, jq, …) resolve through the

@@ -1908,15 +1908,26 @@ cmd_install() {
   local mount_opt="ro"
   [[ "$ALLOW_WRITE" == "1" ]] && mount_opt="rw"
   local network_arg=()
-  [[ "$ALLOW_NETWORK" != "1" ]] && network_arg=(--network=none)
+  if [[ "$ALLOW_NETWORK" != "1" ]]; then
+    network_arg=(--network=none)
+    # Announced up front: otherwise the first visible symptom is the
+    # registry's DNS failure (EAI_AGAIN), which reads as a broken install,
+    # not as the sandbox doing its job.
+    info "strict sandbox: network disabled — the install cannot reach any registry; pass -n/--network to allow it"
+  fi
 
+  local rc=0
   podman run --rm "${tty_flags[@]}" \
     "${network_arg[@]}" \
     "${base_args[@]}" \
     -v "${PWD}:/work:Z,${mount_opt}" -w /work \
     -e "HOME=/root" \
     "$image" \
-    sh -c "npm install $scripts_flag $(printf '%q ' "${install_args[@]}")"
+    sh -c "npm install $scripts_flag $(printf '%q ' "${install_args[@]}")" || rc=$?
+  if (( rc != 0 )) && [[ "$ALLOW_NETWORK" != "1" ]]; then
+    warn "the sandbox ran with networking disabled; a DNS/network error above (EAI_AGAIN, ENOTFOUND, ECONNREFUSED against a registry host) means the sandbox cut the network — re-run with -n/--network to allow it"
+  fi
+  return $rc
 }
 
 # ---------------------------------------------------------------------------
