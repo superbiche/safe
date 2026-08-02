@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.3.0 - 2026-08-03
 
 - CVSS v4.0 vectors now use a self-contained port of the pinned FIRST
   calculator, so v4-only critical advisories reach BLOCK while malformed
