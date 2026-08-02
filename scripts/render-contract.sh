@@ -36,6 +36,9 @@ section_body() {
         "**Passthrough.** " + .passthrough
       ' < "$CONTRACT"
       ;;
+    preflight)
+      jq -r '.preflight' < "$CONTRACT"
+      ;;
     exit-codes)
       jq -r '
         "| Code | Meaning | What an agent should do |",

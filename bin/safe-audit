@@ -4386,18 +4386,51 @@ socket_score_json() {
   # invocation (socket itself, or bw-env-run's master-password fallback when the
   # session cache fails) would otherwise hang invisibly waiting on the terminal.
   # With EOF stdin those paths fail fast and the error lands in $output.stderr.
-  local score_ok=true
-  "${socket_invocation[@]}" package score "$ecosystem" "$spec" --json > "$output.raw" 2>"$output.stderr" </dev/null || score_ok=false
+  # The call is also WALL-CLOCK bounded: the gate wrapper leashes the whole
+  # check at 30s, but a direct `safe-audit check` had no bound at all, and an
+  # intermittently wedged socket CLI hung it for minutes with zero output —
+  # which reads as breakage and teaches an agent to route around the gate
+  # (contract-test finding 1). A timeout is an infrastructure failure like any
+  # other socket failure: legible note, WARN, never a package finding.
+  local -a socket_leash=()
+  local socket_budget="${SAFE_AUDIT_SOCKET_TIMEOUT:-30}"
+  if command -v timeout >/dev/null 2>&1; then
+    socket_leash=(timeout "$socket_budget")
+  else
+    # No way to bound the call: refusing to start it is the only shape
+    # that cannot hang. The WARN says exactly what coverage was lost and
+    # why — never a package finding (PR7 review F2). Every other network
+    # primitive in a check is individually curl --max-time bounded, so
+    # this was the last unboundable call.
+    printf '{"available":true,"status":"error","note":"socket score skipped: no timeout binary to bound the call (install coreutils)"}\n' > "$output"
+    return 0
+  fi
+  local score_ok=true score_rc=0
+  "${socket_leash[@]}" "${socket_invocation[@]}" package score "$ecosystem" "$spec" --json > "$output.raw" 2>"$output.stderr" </dev/null || { score_rc=$?; score_ok=false; }
+  if [[ "$score_ok" == "false" && ( "$score_rc" == "124" || "$score_rc" == "137" ) ]]; then
+    printf '%s\n' "$(jq -n --arg note "socket score timed out after ${socket_budget}s" '{available:true,status:"error",note:$note}')" > "$output"
+    return 0
+  fi
 
   # An ambient SOCKET_SECURITY_API_TOKEN can be stale (e.g. a long-lived shell
   # still exporting a pre-rotation value). If we trusted it and socket failed
   # on auth, retry once with the vault-injected token.
   if [[ "$score_ok" == "false" && "$injected" == "false" && "$can_inject" == "true" ]] \
     && grep -qiE "token|api key|auth" "$output.raw" "$output.stderr" 2>/dev/null; then
-    if env -u SOCKET_SECURITY_API_TOKEN "$bw_env_run" --file "$socket_mapping" -- \
+    local retry_rc=0
+    if "${socket_leash[@]}" env -u SOCKET_SECURITY_API_TOKEN "$bw_env_run" --file "$socket_mapping" -- \
       "$socket_cmd" package score "$ecosystem" "$spec" --json \
       > "$output.raw" 2>"$output.stderr" </dev/null; then
       score_ok=true
+    else
+      retry_rc=$?
+      # A retry that hit the leash must keep the timeout diagnosis: the
+      # generic path below would read the (empty) kill-time output and
+      # report a bare "socket command failed" (PR7 review F1).
+      if [[ "$retry_rc" == "124" || "$retry_rc" == "137" ]]; then
+        printf '%s\n' "$(jq -n --arg note "socket score timed out after ${socket_budget}s" '{available:true,status:"error",note:$note}')" > "$output"
+        return 0
+      fi
     fi
   fi
 
@@ -6047,6 +6080,14 @@ check_command() {
         socket_line='WARN (socket authentication required)'
         warn_causes+=("socket_auth_failed")
         ;;
+      *"timed out"*)
+        socket_line='WARN (socket score timed out)'
+        warn_causes+=("socket_error")
+        ;;
+      *"no timeout binary"*)
+        socket_line='WARN (socket score skipped: cannot be bounded)'
+        warn_causes+=("socket_error")
+        ;;
       *)
         socket_line='WARN (socket check failed)'
         warn_causes+=("socket_error")
@@ -6121,6 +6162,9 @@ check_command() {
     elif (( aff_count > 0 )); then
       local aff_summary
       aff_summary=$(jq -r '[.affecting[] | "\(.id) (\(.severity))"] | .[0:3] | join(", ")' <<<"$combined")
+      # The text line shows at most three IDs; say so instead of truncating
+      # silently — the full set lives in --json and the receipt.
+      (( aff_count > 3 )) && aff_summary="${aff_summary}, +$((aff_count - 3)) more"
       osv_line="WARN (${aff_count} of ${total_count} advisories affect ${resolved_label}: ${aff_summary})"
       warn_causes+=("osv_affecting")
       bump_verdict verdict "WARN"
@@ -6259,6 +6303,17 @@ check_command() {
       printf '[safe audit] Install: safe audit setup local\n'
     fi
     printf '\nVERDICT: %s\n' "$verdict"
+    if [[ -z "$gate" && "$verdict" != "GO" ]]; then
+      # Identical conditions used to print a bare VERDICT here while the
+      # gate route explained itself — a direct check is the agent's
+      # preflight and deserves the same next-step hints (contract-test
+      # findings 5/7).
+      gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" "$aff_count" "$socket_detail" ${warn_causes[@]+"${warn_causes[@]}"}
+      if [[ "$verdict" == "BLOCK" ]]; then
+        printf 'safe audit: operator review required: safe audit check %s --ecosystem %s --json\n' \
+          "$( (( resolution_ok )) && printf '%s@%s' "$PKG_NAME" "$primary_version" || printf '%s' "$spec")" "$ecosystem" >&2
+      fi
+    fi
   fi
 
   # --- install-gate mode: apply allow policy, emit actionable hints

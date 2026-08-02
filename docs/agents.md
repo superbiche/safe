@@ -52,24 +52,37 @@ interactive zsh.
 
 ## Refusal format
 
-One stderr line, always the same shape:
+The refusal is the FINAL stderr line, always the same shape:
 
 ```text
 safe: BLOCKED <tool> <action> — <reason>; to allow: <operator command>; details: safe explain
 ```
 
-`safe run` refusals use the same `BLOCKED:` keyword with follow-up hint
-lines, including `agent contract: safe explain`.
+It may be preceded by the audit's own report and `safe audit:` hint lines
+— relay the BLOCKED line (plus the hints) to the operator; the lines above
+it are supporting evidence, not the refusal. `safe run` refusals use the
+same `BLOCKED:` keyword with follow-up hint lines, including `agent
+contract: safe explain`.
+
+## Preflight
+
+<!-- BEGIN GENERATED: preflight -->
+Before proposing an install, an agent can check a spec directly: `safe audit check <pkg>@<version> --ecosystem <eco>` (add `--json` for the receipt). It prints per-scanner lines, `VERDICT: GO|WARN|BLOCK`, next-step hints on WARN/BLOCK, and exits 0/10/20 — those are verdict codes, not refusals. The gate turns the same WARN into a refusal with exit 100 (unless an allow matches) and BLOCK into exit 104.
+<!-- END GENERATED: preflight -->
 
 ## Exit codes
 
-Policy refusals use a dedicated 100-range so scripts and agents can
-distinguish a block from a missing binary (127):
+Verdict codes (0/10/20) come from `safe audit check`; policy refusals use
+a dedicated 100-range so scripts and agents can distinguish a block from
+a missing binary (127):
 
 <!-- BEGIN GENERATED: exit-codes -->
 | Code | Meaning | What an agent should do |
 | --- | --- | --- |
-| 100 | Blocked by policy (blocklist, fail-closed audit, unrecognized/unsupported runner-native flags) | Relay the refusal line verbatim to the operator. Do not retry, do not reword the command. |
+| 0 | Clean verdict (GO) from `safe audit check`, or a gated command that passed and ran | Proceed. |
+| 10 | `safe audit check` verdict WARN (advisory affecting the resolved version, custom source, unresolved version, or an audit-infrastructure failure — the per-scanner lines say which) | Read the `safe audit:` hint lines: an infrastructure cause is breakage to escalate, an advisory cause is the gate working. Via the gate this same state refuses with exit 100. |
+| 20 | `safe audit check` verdict BLOCK (critical advisory affecting the resolved version, or blocklist) | Do not install. Via the gate this refuses with exit 104; the receipt carries the evidence. |
+| 100 | Blocked by policy: an audit WARN with no matching allow entry, blocklist, fail-closed audit, or unrecognized/unsupported runner-native flags — the refusal line names which | Relay the refusal line verbatim to the operator. Do not retry, do not reword the command. |
 | 101 | Host-allow version pin mismatch | The allowlist pins a different version than the one requested. Report both versions; re-pin is an operator decision. |
 | 102 | Interactive operator confirmation required (non-TTY refusal) | Nothing an agent can do in this shell. Ask the operator to run it in their terminal. |
 | 103 | Invalid package name rejected | Check the spec for a typo before escalating — this one is usually the caller's error. |
@@ -94,7 +107,8 @@ When resolution fails (a private registry, a git or workspace spec, a compound r
 | --- | --- | --- |
 | Audit backend is down or unauthenticated | The refusal names a Socket auth failure, a rate limit, or a network error — not an advisory. | Escalate to the operator immediately. Do not park it, do not retry around it, do not treat it as a vulnerability finding. Recovery is usually `socket login` or a vault-injection fix; `safe doctor` checks the wiring. |
 | A critical advisory affects the resolved version | Exit 104 with an advisory ID and the resolved version. | This is the gate working. Report the advisory to the operator and propose a fixed version if one exists. |
-| The advisory does not affect the resolved version | Exit 104 or a WARN whose advisories all have fixed bounds at or below the resolved version. | Suspected false positive. Run `safe report-fp <spec>` — it re-runs the check, saves the receipt, and writes a dated note in safe's inbox for the operator to validate. Nothing auto-applies. |
+| The advisory does not affect the resolved version | In the receipt (`--json`), an advisory listed as affecting carries a fixed bound at or below the resolved version — the advisory's own range data contradicts the verdict. | Suspected false positive. Run `safe report-fp <spec>` — it re-runs the check, saves the receipt, and writes a dated note in safe's inbox listing every advisory's fixed bound so the operator can apply the disqualifying test. Nothing auto-applies. |
+| A refusal carries BOTH an advisory hint and an infrastructure hint | One `safe audit:` line offers a pinned allow command while another names a Socket/OSV failure as infrastructure breakage. | Infrastructure first: get the broken check fixed (or escalate it), then re-run — the verdict may change once full evidence is available. Only pursue the allow lane on a verdict computed with all checks working. |
 | A scanner is missing or broke | The output names a broken or unrun scanner and the verdict degraded to WARN. | Coverage is missing, not a finding. Run `safe doctor` and report; do not read the WARN as a vulnerability. |
 <!-- END GENERATED: escalation -->
 
