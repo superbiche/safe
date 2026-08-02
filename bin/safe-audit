@@ -5514,6 +5514,31 @@ npm_overrides_mention() {
   ' "$dir/package.json" >/dev/null 2>&1
 }
 
+# The predictable override subset: a single top-level exact-version string
+# override, not scoped or qualified anywhere else, and not conflicting with a
+# declared direct dependency (npm refuses to install on such a conflict, so
+# nothing would land). npm forces that version for every instance in the
+# tree — resolving it is reading the manifest, not guessing.
+npm_override_exact_pin() {
+  local name="$1" dir="${CHECK_PROJECT_DIR:-.}"
+  [[ -f "$dir/package.json" ]] || return 1
+  local pin
+  pin=$(jq -r --arg n "$name" '
+    (.overrides // {}) as $o
+    | ($o[$n] // empty) as $top
+    | select(($top | type) == "string")
+    | select(([$o | .. | objects | keys[] | select(. == $n or startswith($n + "@"))]
+              | length) == 1)
+    | ([.dependencies, .devDependencies, .optionalDependencies, .peerDependencies]
+       | map(select(. != null) | .[$n] // empty)) as $declared
+    | select($declared | all(. == $top))
+    | $top
+  ' "$dir/package.json" 2>/dev/null) || return 1
+  [[ -n "$pin" ]] || return 1
+  version_is_exact npm "$pin" || return 1
+  printf '%s\n' "$pin"
+}
+
 # Resolve the versions the package manager would actually install.
 # Sets RESOLVED_VERSIONS (unique, max 4), RESOLUTION_METHOD, RESOLUTION_SOURCE,
 # RESOLUTION_RANGE. Returns 1 when resolution is not possible.
@@ -5591,8 +5616,22 @@ resolve_npm_versions() {
   local name="$1" requested="$2" op="$3" scratch="$4"
   local registry packument enc_name
   # Root overrides can force npm to a version (or package) this resolver
-  # cannot predict: degrade rather than audit a guess.
+  # cannot predict: degrade rather than audit a guess. Exception: the
+  # predictable subset (npm_override_exact_pin) resolves without a fetch —
+  # but only when no explicit constraint was requested, since a requested
+  # range interacting with an override is back in unpredictable territory.
   if npm_overrides_mention "$name"; then
+    local override_pin=""
+    if [[ -z "$requested" || "$requested" == "latest" ]]; then
+      override_pin=$(npm_override_exact_pin "$name") || override_pin=""
+    fi
+    if [[ -n "$override_pin" ]]; then
+      RESOLVED_VERSIONS=("$override_pin")
+      RESOLUTION_METHOD="override-pin"
+      RESOLUTION_RANGE="$override_pin"
+      RESOLUTION_SOURCE="package.json overrides"
+      return 0
+    fi
     return 1
   fi
   # A bun-driven install fetches from bun's effective registry (bun

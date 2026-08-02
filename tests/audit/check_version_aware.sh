@@ -2675,5 +2675,62 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 58. Predictable override subset: a single top-level exact-version override
+#     with no conflicting direct dep resolves without a fetch (the cdk8s
+#     transitive-pin shape from the CVE catch-22 note).
+# ---------------------------------------------------------------------------
+prepare_case override-pin-resolves
+printf '{"devDependencies": {"tsx": "^4.19.0"}, "overrides": {"brace-expansion": "2.1.3"}}\n' > "$CASE_PROJECT/package.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion --ecosystem npm --op update --gate install
+if expect_status 0 "a lone top-level exact override resolves instead of degrading"; then
+  pass "a lone top-level exact override resolves instead of degrading"
+fi
+if expect_grep "$OUT_FILE" 'override-pin' "override resolution names its method"; then
+  pass "override resolution names its method"
+fi
+if expect_grep "$OUT_FILE" '2\.1\.3' "override resolution audits the pinned version"; then
+  pass "override resolution audits the pinned version"
+fi
+
+# ---------------------------------------------------------------------------
+# 59. An override RANGE is not the predictable subset: still degrades.
+# ---------------------------------------------------------------------------
+prepare_case override-range-degrades
+printf '{"overrides": {"brace-expansion": "^2.0.0"}}\n' > "$CASE_PROJECT/package.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion --ecosystem npm --op update --gate install
+if expect_status 10 "an override range still degrades resolution"; then
+  pass "an override range still degrades resolution"
+fi
+if expect_grep "$OUT_FILE" 'version unresolved' "override-range degrade is explicit"; then
+  pass "override-range degrade is explicit"
+fi
+
+# ---------------------------------------------------------------------------
+# 60. An explicit requested range beside an override pin still degrades:
+#     the range/override interplay is back in unpredictable territory.
+# ---------------------------------------------------------------------------
+prepare_case override-pin-requested-range
+printf '{"overrides": {"brace-expansion": "2.1.3"}}\n' > "$CASE_PROJECT/package.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- 'brace-expansion@^2.0.0' --ecosystem npm --gate install
+if expect_status 10 "a requested range beside an override pin degrades"; then
+  pass "a requested range beside an override pin degrades"
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
