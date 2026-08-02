@@ -4394,7 +4394,17 @@ socket_score_json() {
   # other socket failure: legible note, WARN, never a package finding.
   local -a socket_leash=()
   local socket_budget="${SAFE_AUDIT_SOCKET_TIMEOUT:-30}"
-  command -v timeout >/dev/null 2>&1 && socket_leash=(timeout "$socket_budget")
+  if command -v timeout >/dev/null 2>&1; then
+    socket_leash=(timeout "$socket_budget")
+  else
+    # No way to bound the call: refusing to start it is the only shape
+    # that cannot hang. The WARN says exactly what coverage was lost and
+    # why — never a package finding (PR7 review F2). Every other network
+    # primitive in a check is individually curl --max-time bounded, so
+    # this was the last unboundable call.
+    printf '{"available":true,"status":"error","note":"socket score skipped: no timeout binary to bound the call (install coreutils)"}\n' > "$output"
+    return 0
+  fi
   local score_ok=true score_rc=0
   "${socket_leash[@]}" "${socket_invocation[@]}" package score "$ecosystem" "$spec" --json > "$output.raw" 2>"$output.stderr" </dev/null || { score_rc=$?; score_ok=false; }
   if [[ "$score_ok" == "false" && ( "$score_rc" == "124" || "$score_rc" == "137" ) ]]; then
@@ -4407,10 +4417,20 @@ socket_score_json() {
   # on auth, retry once with the vault-injected token.
   if [[ "$score_ok" == "false" && "$injected" == "false" && "$can_inject" == "true" ]] \
     && grep -qiE "token|api key|auth" "$output.raw" "$output.stderr" 2>/dev/null; then
+    local retry_rc=0
     if "${socket_leash[@]}" env -u SOCKET_SECURITY_API_TOKEN "$bw_env_run" --file "$socket_mapping" -- \
       "$socket_cmd" package score "$ecosystem" "$spec" --json \
       > "$output.raw" 2>"$output.stderr" </dev/null; then
       score_ok=true
+    else
+      retry_rc=$?
+      # A retry that hit the leash must keep the timeout diagnosis: the
+      # generic path below would read the (empty) kill-time output and
+      # report a bare "socket command failed" (PR7 review F1).
+      if [[ "$retry_rc" == "124" || "$retry_rc" == "137" ]]; then
+        printf '%s\n' "$(jq -n --arg note "socket score timed out after ${socket_budget}s" '{available:true,status:"error",note:$note}')" > "$output"
+        return 0
+      fi
     fi
   fi
 
@@ -6062,6 +6082,10 @@ check_command() {
         ;;
       *"timed out"*)
         socket_line='WARN (socket score timed out)'
+        warn_causes+=("socket_error")
+        ;;
+      *"no timeout binary"*)
+        socket_line='WARN (socket score skipped: cannot be bounded)'
         warn_causes+=("socket_error")
         ;;
       *)

@@ -84,6 +84,16 @@ case "${MOCK_SOCKET_MODE:-ok}" in
   auth) printf '{"message":"Unauthorized","cause":"401 Unauthorized"}\n'; exit 1 ;;
   rate) printf '{"message":"Too Many Requests","cause":"429"}\n'; exit 1 ;;
   hang) sleep 300; exit 0 ;;
+  # First call: auth failure (triggers the vault-injected retry); the
+  # retry then hangs. State lives in a per-case file.
+  auth-then-hang)
+    if [[ -e "${MOCK_SOCKET_STATE:?}" ]]; then
+      sleep 300
+      exit 0
+    fi
+    : > "${MOCK_SOCKET_STATE}"
+    printf '{"message":"Unauthorized","cause":"401 Unauthorized"}\n'
+    exit 1 ;;
   *) exit 1 ;;
 esac
 MOCK
@@ -2515,6 +2525,79 @@ if grep -q 'infrastructure failure, NOT a package finding' "$ERR_FILE"; then
 else
   cat "$ERR_FILE" >&2
   fail "a direct check carries the infra hint lines"
+fi
+
+# F1 (PR7 review): a vault-injected RETRY that hits the leash keeps the
+# timeout diagnosis instead of degrading to "socket command failed".
+prepare_case socket-retry-hang
+mkdir -p "$CASE_HOME/.local/bin" "$CASE_HOME/.config/setup-new-machines/bw-env.d"
+cat > "$CASE_HOME/.local/bin/bw-env-run" <<'BWMOCK'
+#!/usr/bin/env bash
+while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done
+shift
+exec "$@"
+BWMOCK
+chmod +x "$CASE_HOME/.local/bin/bw-env-run"
+: > "$CASE_HOME/.config/setup-new-machines/bw-env.d/socket.env"
+fixture="$(osv_fixture_empty)"
+retry_start=$SECONDS
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=auth-then-hang \
+  MOCK_SOCKET_STATE="$CASE_DIR/socket-called-once" \
+  SOCKET_SECURITY_API_TOKEN=stale-ambient-token \
+  SAFE_AUDIT_SOCKET_TIMEOUT=2 \
+  -- brace-expansion@2.1.4 --ecosystem npm
+retry_elapsed=$((SECONDS - retry_start))
+if expect_status 10 "a hanging vault retry degrades to WARN"; then
+  pass "a hanging vault retry degrades to WARN"
+fi
+if (( retry_elapsed < 30 )); then
+  pass "the vault retry is wall-clock bounded ($retry_elapsed s)"
+else
+  fail "the vault retry is wall-clock bounded ($retry_elapsed s)"
+fi
+if grep -q 'WARN (socket score timed out)' "$OUT_FILE"; then
+  pass "the retry timeout keeps its diagnosis"
+else
+  cat "$OUT_FILE" >&2
+  fail "the retry timeout keeps its diagnosis"
+fi
+
+# F2 (PR7 review): with no timeout binary on PATH the socket call is not
+# started at all — a legible skipped-coverage WARN, never a hang.
+NOTIMEOUT_BIN="$TEST_ROOT/no-timeout-bin"
+mkdir -p "$NOTIMEOUT_BIN"
+for _b in /usr/bin/* /bin/*; do
+  [[ -e "$NOTIMEOUT_BIN/$(basename "$_b")" ]] && continue
+  ln -s "$_b" "$NOTIMEOUT_BIN/$(basename "$_b")" 2>/dev/null || true
+done
+rm -f "$NOTIMEOUT_BIN/timeout"
+prepare_case socket-no-timeout-binary
+fixture="$(osv_fixture_empty)"
+nt_start=$SECONDS
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=hang \
+  PATH="$MOCKBIN:$NOTIMEOUT_BIN" \
+  -- brace-expansion@2.1.4 --ecosystem npm
+nt_elapsed=$((SECONDS - nt_start))
+if expect_status 10 "no timeout binary degrades to WARN"; then
+  pass "no timeout binary degrades to WARN"
+fi
+if (( nt_elapsed < 30 )); then
+  pass "the unboundable call is never started ($nt_elapsed s)"
+else
+  fail "the unboundable call is never started ($nt_elapsed s)"
+fi
+if grep -q 'WARN (socket score skipped: cannot be bounded)' "$OUT_FILE" \
+   && jq -e '.socket.note | test("no timeout binary")' "$(ls "$CASE_CHECKS_DIR"/*.json | head -1)" >/dev/null 2>&1; then
+  pass "the skipped score names its cause"
+else
+  cat "$OUT_FILE" >&2
+  fail "the skipped score names its cause"
 fi
 
 prepare_case direct-warn-hints
