@@ -197,6 +197,42 @@ JSON
   printf '%s' "$FIXTURES/osv-cvss-crit.json"
 }
 
+osv_fixture_cvss4_critical() {
+  cat > "$FIXTURES/osv-cvss4-crit.json" <<'JSON'
+{"vulns": [
+  {"id": "GHSA-CVSS4-CRITICAL",
+   "severity": [{"type": "CVSS_V4", "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H"}],
+   "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
+     "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}]}]}]}
+]}
+JSON
+  printf '%s' "$FIXTURES/osv-cvss4-crit.json"
+}
+
+osv_fixture_cvss4_moderate() {
+  cat > "$FIXTURES/osv-cvss4-moderate.json" <<'JSON'
+{"vulns": [
+  {"id": "GHSA-CVSS4-MODERATE",
+   "severity": [{"type": "CVSS_V4", "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:A/VC:N/VI:N/VA:N/SC:L/SI:L/SA:N"}],
+   "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
+     "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}]}]}]}
+]}
+JSON
+  printf '%s' "$FIXTURES/osv-cvss4-moderate.json"
+}
+
+osv_fixture_cvss4_malformed() {
+  cat > "$FIXTURES/osv-cvss4-malformed.json" <<'JSON'
+{"vulns": [
+  {"id": "GHSA-CVSS4-MALFORMED",
+   "severity": [{"type": "CVSS_V4", "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H"}],
+   "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
+     "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}]}]}]}
+]}
+JSON
+  printf '%s' "$FIXTURES/osv-cvss4-malformed.json"
+}
+
 CASE_DIR=""
 CASE_RUN_CONFIG=""
 CASE_HOME=""
@@ -365,6 +401,51 @@ run_check \
   -- brace-expansion@2.1.4 --ecosystem npm --gate install
 if expect_status 20 "standard CVSS v3 critical blocks without database_specific"; then
   pass "standard CVSS v3 critical blocks without database_specific"
+fi
+
+# ---------------------------------------------------------------------------
+# 5a. Standard CVSS v4 critical with no qualitative label -> BLOCK
+# ---------------------------------------------------------------------------
+prepare_case cvss4-critical
+fixture="$(osv_fixture_cvss4_critical)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 20 "standard CVSS v4 critical blocks without a qualitative label"; then
+  pass "standard CVSS v4 critical blocks without a qualitative label"
+fi
+
+# ---------------------------------------------------------------------------
+# 5b. Standard CVSS v4 moderate with no qualitative label -> WARN
+# ---------------------------------------------------------------------------
+prepare_case cvss4-moderate
+fixture="$(osv_fixture_cvss4_moderate)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 10 "standard CVSS v4 moderate warns without a qualitative label"; then
+  pass "standard CVSS v4 moderate warns without a qualitative label"
+fi
+
+# ---------------------------------------------------------------------------
+# 5c. A malformed CVSS v4 vector retains the high WARN floor
+# ---------------------------------------------------------------------------
+prepare_case cvss4-malformed
+fixture="$(osv_fixture_cvss4_malformed)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 10 "malformed CVSS v4 vector retains the high floor"; then
+  pass "malformed CVSS v4 vector retains the high floor"
 fi
 
 # ---------------------------------------------------------------------------

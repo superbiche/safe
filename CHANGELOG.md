@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- CVSS v4.0 vectors now use a self-contained port of the pinned FIRST
+  calculator, so v4-only critical advisories reach BLOCK while malformed
+  vectors retain the fail-closed high floor.
+
 ## 1.2.1 - 2026-08-02
 
 - The mise gate wrapper is argv0-aware: mise shims are symlinks to whatever
