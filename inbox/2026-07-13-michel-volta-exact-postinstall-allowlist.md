@@ -57,7 +57,6 @@ broken install — the same failure now reachable via mise npm-backend tools or
 plain `npm i -g`. Nothing in the v1.2.0 verdict/gate work touches lifecycle
 scripts.
 
-Needs an operator ruling: re-scope this as a manager-neutral proposal
-(exact-identity script allow via npm 12 `allow-scripts` under the audited-GO
-receipt, steps 1/2/4/7 carry over) or park it. No behavior change until
-ruled.
+Ruled 2026-08-02: re-scope. Superseded by the manager-neutral note
+`2026-08-02-michel-lifecycle-scripts-audited-go.md`; this capture is closed
+as historical.
