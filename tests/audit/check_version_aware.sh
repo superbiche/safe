@@ -1293,10 +1293,14 @@ if [[ "$(run_es NPM_CONFIG_REGISTRY=https://mirror.example/)" == "explicit:https
 else
   fail "plumbing: env registry becomes an explicit identity"
 fi
+# A cargo --registry value is a NAME; one that happens to be the literal
+# string "default" maps to the opaque cargo-registry:<name> identity — still
+# explicit, never conflated with the implicit default source.
 ES_ARGS=(okpkg --ecosystem cargo --registry default)
-if [[ "$(run_es)" == "explicit:default" ]]; then
+if [[ "$(run_es)" == "explicit:cargo-registry:default" ]]; then
   pass "plumbing: a literal default selector stays explicit"
 else
+  printf 'got: %s\n' "$(run_es)" >&2
   fail "plumbing: a literal default selector stays explicit"
 fi
 ES_ARGS=(@demo/pkg --ecosystem npm --registry '@demo:registry=https://alice:pw@scoped.example/')
@@ -1972,29 +1976,33 @@ fi
 # ---------------------------------------------------------------------------
 # 63. A literal selector spelled "default" is NOT the implicit-default sentinel
 # ---------------------------------------------------------------------------
+# A cargo --registry value is a NAME: a literal "default" maps to the
+# opaque cargo-registry:default identity (PR6), which is what gets trusted,
+# stamped, and re-derived by the reader — never conflated with the implicit
+# default source.
 prepare_case gate-reader-literal-default
-printf '{"install": {"trusted_registries": ["default"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"trusted_registries": ["cargo-registry:default"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 fixture="$(osv_fixture_empty)"
 run_check \
   MOCK_OSV_FIXTURE="$fixture" \
   MOCK_SOCKET_MODE=ok \
   -- ripgrep@14.1.1 --ecosystem cargo --registry default --gate install
-if jq -e '.packages["rust:ripgrep"].source == "explicit:default"' \
+if jq -e '.packages["rust:ripgrep"].source == "explicit:cargo-registry:default"' \
   "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
-  pass "a literal 'default' selector is stamped explicit:default"
+  pass "a literal 'default' selector is stamped explicit:cargo-registry:default"
 else
-  cat "$CASE_RUN_CONFIG/install-known.json" >&2
-  fail "a literal 'default' selector is stamped explicit:default"
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2 || true
+  fail "a literal 'default' selector is stamped explicit:cargo-registry:default"
 fi
 if [[ "$(gate_known_rc ripgrep@14.1.1 cargo)" != "0" ]]; then
-  pass "explicit:default never satisfies an implicit-default request"
+  pass "explicit:cargo-registry:default never satisfies an implicit-default request"
 else
-  fail "explicit:default never satisfies an implicit-default request"
+  fail "explicit:cargo-registry:default never satisfies an implicit-default request"
 fi
 if [[ "$(gate_known_rc ripgrep@14.1.1 cargo PROBE_SOURCE_SET=default)" == "0" ]]; then
-  pass "explicit:default satisfies the same literal selector"
+  pass "the reader derives the same opaque identity from the same selector"
 else
-  fail "explicit:default satisfies the same literal selector"
+  fail "the reader derives the same opaque identity from the same selector"
 fi
 
 # ---------------------------------------------------------------------------
@@ -2043,6 +2051,456 @@ if [[ "$(gate_known_rc brace-expansion@2.1.4 npm PROBE_SOURCE_SET=https://mirror
   pass "the reader canonicalizes a trailing-slash selector the same way"
 else
   fail "the reader canonicalizes a trailing-slash selector the same way"
+fi
+
+# ---------------------------------------------------------------------------
+# PR6: cargo / composer / bun source derivation (installer-keyed selectors)
+# ---------------------------------------------------------------------------
+
+# 48. Cargo env pair (registry.default + registries.<name>.index) selects a
+#     custom source: floors WARN, degrades resolution, records the URL.
+prepare_case cargo-env-pair
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  CARGO_REGISTRY_DEFAULT=private \
+  CARGO_REGISTRIES_PRIVATE_INDEX=https://private.example/index/ \
+  -- okpkg@1.0.0 --ecosystem cargo
+if expect_status 10 "cargo env pair floors WARN"; then
+  pass "cargo env pair floors WARN"
+fi
+if grep -q 'custom source: https://private.example/index' "$OUT_FILE"; then
+  pass "cargo env pair resolves the name to its index URL"
+else
+  cat "$OUT_FILE" >&2
+  fail "cargo env pair resolves the name to its index URL"
+fi
+
+# An UNPINNED spec under the same selection must not resolve from crates.io:
+# the default-registry lookup degrades to the package-level path.
+prepare_case cargo-env-degrades-resolution
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/crates.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  CARGO_REGISTRY_DEFAULT=private \
+  CARGO_REGISTRIES_PRIVATE_INDEX=https://private.example/index/ \
+  -- okpkg --ecosystem cargo
+if expect_status 10 "cargo env selection degrades resolution"; then
+  pass "cargo env selection degrades resolution"
+fi
+if grep -q 'unresolved — auditing at package level' "$OUT_FILE"; then
+  pass "cargo env selection audits at package level"
+else
+  cat "$OUT_FILE" >&2
+  fail "cargo env selection audits at package level"
+fi
+
+# 49. A selected name with no env-defined index is the opaque identity
+#     cargo-registry:<name>; trusting that exact token lifts the floor.
+prepare_case cargo-opaque-name
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  CARGO_REGISTRY_DEFAULT=private \
+  -- okpkg@1.0.0 --ecosystem cargo
+if expect_status 10 "cargo name without index floors as opaque identity"; then
+  pass "cargo name without index floors as opaque identity"
+fi
+if grep -q 'custom source: cargo-registry:private' "$OUT_FILE"; then
+  pass "cargo opaque identity is cargo-registry:<name>"
+else
+  cat "$OUT_FILE" >&2
+  fail "cargo opaque identity is cargo-registry:<name>"
+fi
+prepare_case cargo-opaque-trusted
+printf '{"install": {"trusted_registries": ["cargo-registry:private"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  CARGO_REGISTRY_DEFAULT=private \
+  -- okpkg@1.0.0 --ecosystem cargo
+if expect_status 0 "a trusted cargo-registry token lifts the floor"; then
+  pass "a trusted cargo-registry token lifts the floor"
+fi
+
+# 50. Defining is not selecting: an index variable alone is inert, and so
+#     are the crates-io protocol/name forms (cargo hardcodes that source).
+prepare_case cargo-defined-not-selected
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  CARGO_REGISTRIES_PRIVATE_INDEX=https://private.example/index/ \
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
+  -- okpkg@1.0.0 --ecosystem cargo
+if expect_status 0 "a defined-but-unselected cargo registry is inert"; then
+  pass "a defined-but-unselected cargo registry is inert"
+fi
+prepare_case cargo-crates-io-selected
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  CARGO_REGISTRY_DEFAULT=crates-io \
+  -- okpkg@1.0.0 --ecosystem cargo
+if expect_status 0 "selecting crates-io by name is the default source"; then
+  pass "selecting crates-io by name is the default source"
+fi
+
+# 51. Env-name mapping uppercases and maps dashes/dots to underscores
+#     (cargo context/key.rs) — my-reg reads CARGO_REGISTRIES_MY_REG_INDEX.
+prepare_case cargo-dashed-name
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  CARGO_REGISTRIES_MY_REG_INDEX=https://dashed.example/index \
+  -- okpkg@1.0.0 --ecosystem cargo --registry my-reg
+if grep -q 'custom source: https://dashed.example/index' "$OUT_FILE"; then
+  pass "a dashed registry name maps to its underscore env index"
+else
+  cat "$OUT_FILE" >&2
+  fail "a dashed registry name maps to its underscore env index"
+fi
+
+# 52. Composer: repositories in $COMPOSER_HOME/config.json floor the
+#     verdict (array shape), a disabled packagist emits its sentinel
+#     (object-map shape), and COMPOSER_AUTH alone floors nothing.
+prepare_case composer-home-repos
+mkdir -p "$CASE_DIR/composer-home"
+printf '{"repositories": [{"type": "composer", "url": "https://repo.private.example/"}]}\n' \
+  > "$CASE_DIR/composer-home/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  COMPOSER_HOME="$CASE_DIR/composer-home" \
+  -- vendor/pkg@2.5.0 --ecosystem composer
+if expect_status 10 "composer global config repositories floor WARN"; then
+  pass "composer global config repositories floor WARN"
+fi
+if grep -q 'custom source: https://repo.private.example' "$OUT_FILE"; then
+  pass "composer repo URL is the recorded source"
+else
+  cat "$OUT_FILE" >&2
+  fail "composer repo URL is the recorded source"
+fi
+prepare_case composer-packagist-disabled
+mkdir -p "$CASE_DIR/composer-home"
+printf '{"repositories": {"packagist.org": false}}\n' > "$CASE_DIR/composer-home/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  COMPOSER_HOME="$CASE_DIR/composer-home" \
+  -- vendor/pkg@2.5.0 --ecosystem composer
+if expect_status 10 "a disabled packagist floors WARN"; then
+  pass "a disabled packagist floors WARN"
+fi
+if grep -q 'custom source: local:packagist-disabled' "$OUT_FILE"; then
+  pass "packagist disable emits its sentinel"
+else
+  cat "$OUT_FILE" >&2
+  fail "packagist disable emits its sentinel"
+fi
+prepare_case composer-auth-only
+mkdir -p "$CASE_DIR/composer-home"
+printf '{}\n' > "$CASE_DIR/composer-home/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packagist.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  COMPOSER_HOME="$CASE_DIR/composer-home" \
+  COMPOSER_AUTH='{"http-basic": {"repo.example": {"username": "u", "password": "p"}}}' \
+  -- vendor/pkg@2.5.0 --ecosystem composer
+if expect_status 0 "COMPOSER_AUTH alone floors nothing"; then
+  pass "COMPOSER_AUTH alone floors nothing"
+fi
+
+# A packagist-URL composer repo is composer's own auto-disable-and-replace
+# shape: same endpoint, default source.
+prepare_case composer-packagist-redefined
+mkdir -p "$CASE_DIR/composer-home"
+printf '{"repositories": [{"type": "composer", "url": "https://repo.packagist.org"}]}\n' \
+  > "$CASE_DIR/composer-home/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  COMPOSER_HOME="$CASE_DIR/composer-home" \
+  -- vendor/pkg@2.5.0 --ecosystem composer
+if expect_status 0 "a packagist-URL composer repo is the default source"; then
+  pass "a packagist-URL composer repo is the default source"
+fi
+
+# 53. Bun: --installer bun makes BUN_CONFIG_REGISTRY the effective source —
+#     floor + packument fetched FROM it; without the installer flag the
+#     same variable is ignored (selectors key off the installer, delta-4
+#     finding F4).
+prepare_case bun-registry-selected
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_REGISTRY_URL_LOG="$CASE_DIR/urls.log" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  BUN_CONFIG_REGISTRY=https://bunreg.example \
+  -- brace-expansion --ecosystem npm --installer bun
+if expect_status 10 "bun registry floors WARN under --installer bun"; then
+  pass "bun registry floors WARN under --installer bun"
+fi
+if grep -q '^https://bunreg.example/brace-expansion$' "$CASE_DIR/urls.log"; then
+  pass "bun resolution fetches the packument from bun's registry"
+else
+  cat "$CASE_DIR/urls.log" >&2
+  fail "bun resolution fetches the packument from bun's registry"
+fi
+prepare_case bun-var-ignored-for-npm
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_REGISTRY_URL_LOG="$CASE_DIR/urls.log" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  BUN_CONFIG_REGISTRY=https://bunreg.example \
+  -- brace-expansion --ecosystem npm
+if expect_status 0 "an npm install ignores bun's registry variable"; then
+  pass "an npm install ignores bun's registry variable"
+fi
+if grep -q '^https://registry.npmjs.org/brace-expansion$' "$CASE_DIR/urls.log"; then
+  pass "npm resolution stays on the npm registry"
+else
+  cat "$CASE_DIR/urls.log" >&2
+  fail "npm resolution stays on the npm registry"
+fi
+
+# 54. Bun env precedence is upper-before-lower (the reverse of npm), and a
+#     non-http(s) value is silently ignored, falling through the chain.
+prepare_case bun-env-precedence
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  BUN_CONFIG_REGISTRY=https://bunreg.example \
+  npm_config_registry=https://lower.example \
+  -- brace-expansion@2.1.4 --ecosystem npm --installer bun
+if grep -q 'custom source: https://bunreg.example' "$OUT_FILE"; then
+  pass "BUN_CONFIG_REGISTRY beats the lowercase npm env form"
+else
+  cat "$OUT_FILE" >&2
+  fail "BUN_CONFIG_REGISTRY beats the lowercase npm env form"
+fi
+prepare_case bun-nonhttp-ignored
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  BUN_CONFIG_REGISTRY=file:///srv/registry \
+  npm_config_registry=https://lower.example \
+  -- brace-expansion@2.1.4 --ecosystem npm --installer bun
+if grep -q 'custom source: https://lower.example' "$OUT_FILE"; then
+  pass "a non-http bun value is ignored and the chain falls through"
+else
+  cat "$OUT_FILE" >&2
+  fail "a non-http bun value is ignored and the chain falls through"
+fi
+
+# 55. Bun's user npmrc lives under XDG_CONFIG_HOME when set (bun diverges
+#     from npm here); npm keeps reading ~/.npmrc.
+prepare_case bun-xdg-npmrc
+mkdir -p "$CASE_HOME/xdg"
+printf 'registry=https://xdgreg.example\n' > "$CASE_HOME/xdg/.npmrc"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  XDG_CONFIG_HOME="$CASE_HOME/xdg" \
+  -- brace-expansion@2.1.4 --ecosystem npm --installer bun
+if grep -q 'custom source: https://xdgreg.example' "$OUT_FILE"; then
+  pass "bun reads its user npmrc from XDG_CONFIG_HOME"
+else
+  cat "$OUT_FILE" >&2
+  fail "bun reads its user npmrc from XDG_CONFIG_HOME"
+fi
+prepare_case npm-ignores-xdg-npmrc
+fixture="$(osv_fixture_empty)"
+mkdir -p "$CASE_HOME/xdg"
+printf 'registry=https://xdgreg.example\n' > "$CASE_HOME/xdg/.npmrc"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  XDG_CONFIG_HOME="$CASE_HOME/xdg" \
+  -- brace-expansion@2.1.4 --ecosystem npm
+if expect_status 0 "npm does not read the XDG npmrc"; then
+  pass "npm does not read the XDG npmrc"
+fi
+
+# 56. --installer is validated; the receipt records the resolved installer.
+prepare_case installer-validated
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- okpkg@1.0.0 --ecosystem npm --installer frobnicator
+if [[ "$STATUS" -ne 0 && -z "$(ls "$CASE_CHECKS_DIR" 2>/dev/null)" ]]; then
+  pass "an unknown --installer dies before any receipt"
+else
+  printf 'status=%s checks=%s\n' "$STATUS" "$(ls "$CASE_CHECKS_DIR" 2>/dev/null)" >&2
+  fail "an unknown --installer dies before any receipt"
+fi
+prepare_case installer-on-receipt
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  BUN_CONFIG_REGISTRY=https://bunreg.example \
+  -- brace-expansion@2.1.4 --ecosystem npm --installer bun --json
+if jq -e '.installer == "bun"' "$OUT_FILE" >/dev/null 2>&1; then
+  pass "the receipt records the installer"
+else
+  cat "$OUT_FILE" >&2
+  fail "the receipt records the installer"
+fi
+prepare_case installer-default-on-receipt
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/crates.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- okpkg@1.0.0 --ecosystem cargo --json
+if jq -e '.installer == "cargo"' "$OUT_FILE" >/dev/null 2>&1; then
+  pass "the ecosystem default installer lands on the receipt"
+else
+  cat "$OUT_FILE" >&2
+  fail "the ecosystem default installer lands on the receipt"
+fi
+
+# 57a. Review round 1 regressions (findings 1, 2, 4) + the verified bun
+#      scoped-vs-CLI semantics that survived challenge (finding 3 refuted).
+
+# F1: a package repository whose `package` is an ARRAY of definitions must
+# contribute every endpoint — never implicit-default.
+prepare_case composer-package-array
+mkdir -p "$CASE_DIR/composer-home"
+printf '{"repositories":[{"type":"package","package":[{"name":"vendor/pkg","version":"1.0.0","dist":{"url":"https://evil.example/pkg.zip","type":"zip"}}]}]}\n' \
+  > "$CASE_DIR/composer-home/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  COMPOSER_HOME="$CASE_DIR/composer-home" \
+  -- vendor/pkg@1.0.0 --ecosystem composer
+if expect_status 10 "an array-form package repository floors WARN"; then
+  pass "an array-form package repository floors WARN"
+fi
+if grep -q 'custom source: https://evil.example/pkg.zip' "$OUT_FILE"; then
+  pass "the array-form package endpoint reaches the floor"
+else
+  cat "$OUT_FILE" >&2
+  fail "the array-form package endpoint reaches the floor"
+fi
+
+# F2: an inline package with BOTH dist and source metadata contributes both
+# endpoints (composer can fetch either: --prefer-source, dist fallback).
+prepare_case composer-dist-and-source
+mkdir -p "$CASE_DIR/composer-home"
+printf '{"repositories":[{"type":"package","package":{"name":"vendor/pkg","version":"1.0.0","dist":{"url":"https://trusted.example/pkg.zip","type":"zip"},"source":{"url":"https://evil.example/repo.git","type":"git","reference":"main"}}}]}\n' \
+  > "$CASE_DIR/composer-home/config.json"
+printf '{"install": {"trusted_registries": ["https://trusted.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  COMPOSER_HOME="$CASE_DIR/composer-home" \
+  -- vendor/pkg@1.0.0 --ecosystem composer
+if expect_status 10 "an untrusted source URL floors WARN despite a trusted dist"; then
+  pass "an untrusted source URL floors WARN despite a trusted dist"
+fi
+if grep -q 'https://evil.example/repo.git' "$OUT_FILE"; then
+  pass "both dist and source endpoints reach the floor"
+else
+  cat "$OUT_FILE" >&2
+  fail "both dist and source endpoints reach the floor"
+fi
+
+# F4: an explicit crates-io selection overrides an ambient registry.default
+# — cargo ignores the env key whenever argv selected, even the default.
+ES_ARGS=(okpkg --ecosystem cargo --registry crates-io)
+if [[ "$(run_es CARGO_REGISTRY_DEFAULT=private)" == "implicit-default" ]]; then
+  pass "explicit crates-io overrides an ambient registry.default"
+else
+  printf 'got: %s\n' "$(run_es CARGO_REGISTRY_DEFAULT=private)" >&2
+  fail "explicit crates-io overrides an ambient registry.default"
+fi
+prepare_case cargo-argv-beats-env-default
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/crates.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  CARGO_REGISTRY_DEFAULT=private \
+  -- okpkg@1.0.0 --ecosystem cargo --registry crates-io
+if expect_status 0 "explicit crates-io under an ambient default gates GO"; then
+  pass "explicit crates-io under an ambient default gates GO"
+fi
+
+# F3 (refuted — semantics pinned): bun's scoped npmrc registry beats the
+# generic CLI --registry, exactly as in npm: bun's CLI flag rewrites only
+# the default scope (pmopt.rs `cli.registry` -> `self.scope`) and the
+# scoped map is consulted first. The packument for a scoped package must
+# come from the scoped registry even with a CLI selector present.
+prepare_case bun-scoped-beats-cli
+printf '@demo:registry=https://scoped.example\n' > "$CASE_PROJECT/.npmrc"
+cat > "$FIXTURES/scoped-packument.json" <<'JSON'
+{"dist-tags": {"latest": "1.0.0"}, "versions": {"1.0.0": {}}}
+JSON
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/scoped-packument.json" \
+  MOCK_REGISTRY_URL_LOG="$CASE_DIR/urls.log" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- @demo/pkg --ecosystem npm --installer bun --registry https://cli.example
+if grep -q '^https://scoped.example/@demo%2Fpkg$' "$CASE_DIR/urls.log"; then
+  pass "bun scoped npmrc registry beats the CLI selector"
+else
+  cat "$CASE_DIR/urls.log" >&2
+  fail "bun scoped npmrc registry beats the CLI selector"
+fi
+rm -f "$CASE_PROJECT/.npmrc"
+
+# 57. Plumbing parity: the identity readers derive the same PR6 sources.
+ES_ARGS=(okpkg --ecosystem cargo)
+if [[ "$(run_es CARGO_REGISTRY_DEFAULT=private)" == "explicit:cargo-registry:private" ]]; then
+  pass "plumbing: cargo env selection becomes the opaque identity"
+else
+  printf 'got: %s\n' "$(run_es CARGO_REGISTRY_DEFAULT=private)" >&2
+  fail "plumbing: cargo env selection becomes the opaque identity"
+fi
+ES_ARGS=(brace-expansion --ecosystem npm --installer bun)
+if [[ "$(run_es BUN_CONFIG_REGISTRY=https://bunreg.example)" == "explicit:https://bunreg.example" ]]; then
+  pass "plumbing: bun installer identity follows bun's registry"
+else
+  printf 'got: %s\n' "$(run_es BUN_CONFIG_REGISTRY=https://bunreg.example)" >&2
+  fail "plumbing: bun installer identity follows bun's registry"
+fi
+ES_ARGS=(brace-expansion --ecosystem npm)
+if [[ "$(run_es BUN_CONFIG_REGISTRY=https://bunreg.example)" == "implicit-default" ]]; then
+  pass "plumbing: without the installer, bun's variable is invisible"
+else
+  printf 'got: %s\n' "$(run_es BUN_CONFIG_REGISTRY=https://bunreg.example)" >&2
+  fail "plumbing: without the installer, bun's variable is invisible"
 fi
 
 # ---------------------------------------------------------------------------

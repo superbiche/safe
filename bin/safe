@@ -1478,6 +1478,7 @@ safe_install_known_matches() {
   # fail closed: stale evidence never applies without a trustworthy match.
   [[ -x "$SAFE_AUDIT_PATH" ]] || return 1
   local -a es_args=("$name" --ecosystem "$ecosystem")
+  [[ -n "${SAFE_INSTALL_INSTALLER:-}" ]] && es_args+=(--installer "$SAFE_INSTALL_INSTALLER")
   [[ -n "${SAFE_INSTALL_REGISTRY:-}" ]] && es_args+=(--registry "$SAFE_INSTALL_REGISTRY")
   [[ -n "${SAFE_INSTALL_PROJECT_DIR:-}" ]] && es_args+=(--project-dir "$SAFE_INSTALL_PROJECT_DIR")
   [[ -n "${SAFE_INSTALL_NPM_USERCONFIG:-}" ]] && es_args+=(--npm-userconfig "$SAFE_INSTALL_NPM_USERCONFIG")
@@ -1586,6 +1587,7 @@ safe_install_audit_package() {
 
   local -a extra=()
   [[ -n "${SAFE_INSTALL_DIST_TAG:-}" ]] && extra+=(--dist-tag "$SAFE_INSTALL_DIST_TAG")
+  [[ -n "${SAFE_INSTALL_INSTALLER:-}" ]] && extra+=(--installer "$SAFE_INSTALL_INSTALLER")
   [[ -n "${SAFE_INSTALL_REGISTRY:-}" ]] && extra+=(--registry "$SAFE_INSTALL_REGISTRY")
   [[ -n "${SAFE_INSTALL_PROJECT_DIR:-}" ]] && extra+=(--project-dir "$SAFE_INSTALL_PROJECT_DIR")
   [[ -n "${SAFE_INSTALL_NPM_USERCONFIG:-}" ]] && extra+=(--npm-userconfig "$SAFE_INSTALL_NPM_USERCONFIG")
@@ -2040,6 +2042,10 @@ cmd_install() {
     composer) safe_install_scan_target_flags composer "${manager_args[@]}" ;;
     *) safe_install_scan_target_flags npm "${manager_args[@]}" ;;
   esac
+  # bun reads its own source config for the npm ecosystem; the audit models
+  # it only when told which installer runs.
+  SAFE_INSTALL_INSTALLER=""
+  [[ "$manager" == "bun" ]] && SAFE_INSTALL_INSTALLER="bun"
   for audit_package in "${audit_packages[@]}"; do
     safe_install_audit_package "$audit_package" "$ecosystem"
     if safe_install_trustable_package "$audit_package" "$ecosystem"; then

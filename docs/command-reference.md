@@ -76,7 +76,7 @@ Runner flags:
 ```bash
 safe audit capabilities [--json]
 safe audit scan [--verbose] [--deps-only | --full] [--project <path>] [--all | --machine <csv>]
-safe audit check <pkg>@<version> [--ecosystem <name>] [--json]
+safe audit check <pkg>@<version> [--ecosystem <name>] [--installer <name>] [--json]
 safe audit release github --repo OWNER/REPO --version TAG --asset NAME [--tag-regex REGEX] [--json]
 safe audit vuln github-release --repo OWNER/REPO --version TAG [--json]
 safe audit verify release-asset --artifact PATH --checksum PATH [--certificate PATH --signature PATH --certificate-identity-regexp REGEX --certificate-oidc-issuer URL] [--require-signature] [--json]

@@ -101,24 +101,43 @@ elsewhere. Configured tools carry options too, and `mise ls` does not show
 them, so the bare preflight reads each entry's options with
 `mise tool --json` before trusting `key@version`.
 
-Advisory sources safe can resolve against today are npm, Python (PyPI), and
-Go. When a Cargo, pipx, Composer, or Bun registry is selected — by mise's
-own environment *or inherited from the surrounding shell*, and on the
-`mise exec -- <tool>` route as well as direct installs — safe does not
-pretend to have checked it: that spec takes the not-audit-gated notice
-path rather than reporting a verdict computed against the default public
-source. Selectors apply to the installer that actually reads them: bun's
-registry variable affects a bun install, not an npm one, and an exported
-but empty selector chooses nothing, so neither suppresses an audit safe
-can honestly perform. Which installer runs an npm-backend install comes
-from the environment first and then from mise's own
-`npm.package_manager` setting (which `mise env --json` does not export);
-an unreadable or unrecognized value refuses rather than assuming npm.
-A tool with several configured version requests is not audited at all but
-flagged: mise reports one option set per tool, so safe cannot tell which
-request carries which source. Directory-scoped config files (Cargo's `config.toml`,
-Composer's, bun's `bunfig.toml`) are not yet detected; extending the
-audit's source derivation to those ecosystems is tracked separately.
+The audit's source derivation covers every wrapped ecosystem: npm, Python
+(pip/uv env and config), Go (GOPROXY), Cargo, Composer, and Bun — env
+selectors, argv selectors, and the parseable config files each installer
+reads. Cargo registry selection (`--registry`/`--index`, the
+`registry.default` key via `CARGO_REGISTRY_DEFAULT`, or mise's
+`cargo.registry_name` setting) resolves the selected name through its
+`CARGO_REGISTRIES_<NAME>_INDEX` environment definition; a name whose index
+safe cannot see becomes the opaque identity `cargo-registry:<name>`, which
+floors the verdict like any custom source and can be trusted verbatim in
+`install.trusted_registries`. Composer repositories declared in
+`$COMPOSER_HOME/config.json` (composer merges them into every run, global
+and per-project) are read directly, including the packagist-disable
+shapes; `COMPOSER_AUTH` carries credentials, not a source, and floors
+nothing. Bun reads its own chain — `BUN_CONFIG_REGISTRY`, then npm's env
+forms upper-before-lower, then its two npmrc files (the user one under
+`XDG_CONFIG_HOME` when set) — and the audit judges that chain when the
+installer is bun: selectors apply to the installer that actually reads
+them, so bun's registry variable affects a bun install, not an npm one,
+and an exported but empty selector chooses nothing. mise's
+`pipx.registry_url` reaches the installer as a normalized PEP-503
+`/simple` index and is judged as that endpoint. Which installer runs an
+npm-backend install comes from the environment first and then from mise's
+own `npm.package_manager` setting (which `mise env --json` does not
+export); an unreadable or unrecognized value refuses rather than assuming
+npm. A tool with several configured version requests is not audited at
+all but flagged: mise reports one option set per tool, so safe cannot
+tell which request carries which source.
+
+What stays outside the model is TOML config: Cargo's `config.toml`
+(`[source]` replacement and `registry.default` are not env-settable, so a
+config file is the only way to set them) and bun's `bunfig.toml`. Ambient
+config files are operator-owned machine state under the reviewed
+boundary, but per-invocation injection of those surfaces fails closed
+instead of earning a default-source verdict: `cargo install --config …`
+and bun's `--config=<file>` on gated subcommands are refused, and a
+`CARGO_HOME` set on the mise route keeps the not-audit-gated notice,
+since it swaps in a config.toml safe does not read.
 
 An unversioned explicit `mise upgrade <tool>` is checked at each of the
 tool's configured requests that can actually move — an exact pin cannot,

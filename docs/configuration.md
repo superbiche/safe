@@ -76,8 +76,13 @@ unchanged.
 - `trusted_registries`: package sources (URL prefixes) the operator trusts
   like the default public registry. Any other custom source
   (`--registry`, `--index-url`, `--find-links`, `--no-index`,
-  `--repository`) floors the verdict at WARN — public advisory data cannot
-  vouch for a private artifact of the same name@version.
+  `--repository`, env selectors like `CARGO_REGISTRY_DEFAULT` or
+  `BUN_CONFIG_REGISTRY`, and composer's global `config.json` repositories)
+  floors the verdict at WARN — public advisory data cannot vouch for a
+  private artifact of the same name@version. Non-URL identities are
+  trusted verbatim: a cargo registry whose index URL safe cannot see is
+  `cargo-registry:<name>`, and a disabled packagist is
+  `local:packagist-disabled`.
 - `auto_allow_ttl_days`: freshness window for the offline/timeout fallback.
 - `block_severities`: affecting-advisory severities that hard-BLOCK instead
   of WARN.

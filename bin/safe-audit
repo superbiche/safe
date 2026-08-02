@@ -4949,19 +4949,239 @@ go_env_sources() {
   printf '%s' "$out"
 }
 
+# Cargo's registry selection is single-valued: --registry NAME / --index URL
+# on argv (the gate threads both; mise's cargo backend passes its
+# registry_name setting the same way), else the registry.default key — env
+# CARGO_REGISTRY_DEFAULT redirects `cargo install` on its own (verified in
+# cargo's command_prelude/install source). A NAME maps to its index URL via
+# registries.<name>.index, whose env form uppercases the name and turns -/.
+# into _ (cargo context/key.rs) — so my-reg and my_reg collide, which cargo
+# itself cannot distinguish either. A selected name with no env-defined
+# index may still resolve from a config.toml safe does not read: it becomes
+# the opaque identity cargo-registry:<name> — floors like any custom source
+# and is trustable verbatim in install.trusted_registries. The literal name
+# crates-io short-circuits inside cargo to the built-in source (even
+# registries.crates-io.index is a no-op), so selecting it is the default
+# source, not a custom one. [source] replacement and registry.default in
+# config.toml files are NOT env-settable (cargo docs: "Environment: not
+# supported") and stay behind the reviewed config-file boundary — CARGO_HOME
+# and --config included (the gate refuses --config on installs).
+# Defined-but-unselected CARGO_REGISTRIES_* variables are inert: defining a
+# registry does not select it.
+cargo_registry_env_name() {
+  local name="${1//-/_}"
+  name="${name//./_}"
+  printf 'CARGO_REGISTRIES_%s_INDEX' "$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')"
+}
+
+# Prints the source identity for a selected cargo registry NAME; returns 1
+# for the built-in default.
+cargo_source_for_name() {
+  local name="$1" idx
+  [[ "$name" == "crates-io" ]] && return 1
+  idx=$(printenv "$(cargo_registry_env_name "$name")" 2>/dev/null || true)
+  if [[ -n "$idx" ]]; then
+    printf '%s' "$idx"
+  else
+    printf 'cargo-registry:%s' "$name"
+  fi
+}
+
+# Composer's home directory, mirroring Factory::getHomeDir(): an explicit
+# COMPOSER_HOME wins; otherwise the XDG candidate applies when any XDG_*
+# variable is exported or /etc/xdg exists, and the first candidate that
+# EXISTS as a directory is chosen (that existence probe is what decides on
+# machines having both ~/.config/composer and ~/.composer), falling back to
+# the first candidate.
+composer_home_dir() {
+  if [[ -n "${COMPOSER_HOME:-}" ]]; then
+    printf '%s' "$COMPOSER_HOME"
+    return 0
+  fi
+  local -a candidates=()
+  if compgen -e 2>/dev/null | grep -q '^XDG_' || [[ -d /etc/xdg ]]; then
+    candidates+=("${XDG_CONFIG_HOME:-$HOME/.config}/composer")
+  fi
+  candidates+=("$HOME/.composer")
+  local c
+  for c in "${candidates[@]}"; do
+    if [[ -d "$c" ]]; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done
+  printf '%s' "${candidates[0]}"
+}
+
+# Repositories from $COMPOSER_HOME/config.json — composer merges that file's
+# repositories key into EVERY install/update/require run, global and
+# per-project alike (Factory.php loads it unconditionally). Array and
+# (deprecated) object-map shapes both occur; a single-key entry set to false
+# disables a named repository, and a disabled packagist with no replacement
+# is itself source-changing, so it emits a sentinel. Project composer.json
+# repositories stay behind the reviewed boundary: committed project
+# architecture, not injectable state. COMPOSER_AUTH is credentials only and
+# never names a source; the COMPOSER_REPOSITORIES variable the gate once
+# guarded does not exist in composer at all (verified against composer
+# main). A config.json composer itself cannot parse aborts the install, so
+# an unreadable file contributes nothing here.
+composer_env_sources() {
+  local cfg
+  cfg="$(composer_home_dir)/config.json"
+  [[ -f "$cfg" ]] || return 0
+  # Every endpoint a repository can fetch from is emitted, not the first
+  # one found: an inline package definition carries dist AND source URLs
+  # and composer can select either (--prefer-source, dist fallback), and
+  # the `package` value is an object OR an array of definitions — an
+  # elif chain over those shapes left endpoints out of the trust floor
+  # (PR6 review round 1, findings 1-2).
+  jq -r '
+    (.repositories // empty)
+    | (if type == "array" then to_entries | map({key: (.value.name // (.key | tostring)), value: .value})
+       elif type == "object" then to_entries
+       else [] end)
+    | .[]
+    | if (.value | type) == "boolean" and (.value | not) then
+        (if (.key == "packagist.org" or .key == "packagist") then "local:packagist-disabled" else empty end)
+      elif (.value | type) == "object" then
+        (if ((.value | keys) | length) == 1 and ((.value | to_entries[0].value) == false) then
+           (if ((.value | to_entries[0].key) == "packagist.org" or (.value | to_entries[0].key) == "packagist")
+            then "local:packagist-disabled" else empty end)
+         else
+           (
+             (.value.url? | select(type == "string")),
+             (.value.package?
+              | (if type == "object" then [.] elif type == "array" then . else [] end)
+              | .[]
+              | select(type == "object")
+              | ((.dist?.url? | select(type == "string")),
+                 (.source?.url? | select(type == "string"))))
+           )
+         end)
+      else empty end
+  ' "$cfg" 2>/dev/null | tr '\n' ' ' || true
+}
+
+# bun's user-level npmrc: $XDG_CONFIG_HOME/.npmrc when XDG_CONFIG_HOME is
+# set, else ~/.npmrc — bun's own loader order, which diverges from npm
+# (npm always reads ~/.npmrc). bun reads exactly two npmrc files (project,
+# then user) and no globalconfig, and ignores npm's --userconfig overrides.
+bun_user_rc() {
+  if [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+    printf '%s' "${XDG_CONFIG_HOME}/.npmrc"
+  else
+    printf '%s' "$HOME/.npmrc"
+  fi
+}
+
+# Effective registry for a bun-driven install (--installer bun). A SCOPED
+# registry beats every generic selector INCLUDING the CLI --registry, in
+# bun exactly as in npm: bun's CLI flag rewrites only the default scope
+# (PackageManagerOptions.rs — `cli.registry` assigns `self.scope`), while
+# scoped registries live in a separate map that `scope_for_package_name`
+# consults first and the CLI never touches. Generic precedence per bun's
+# source (REGISTRY_KEYS + the npmrc loader): CLI --registry, then
+# BUN_CONFIG_REGISTRY / NPM_CONFIG_REGISTRY / npm_config_registry — that
+# order, upper BEFORE lower, the reverse of npm's own env precedence —
+# each honored only when it starts with http:// or https:// (bun silently
+# ignores other shapes), then project .npmrc, then bun's user npmrc.
+# Scoped @scope:registry keys come from CLI tokens and npmrc files only
+# (bun has no scoped env form). bunfig.toml (install.registry,
+# install.scopes) is TOML and stays un-swept — the same reviewed boundary
+# as uv.toml; documented in install-wrappers.md.
+bun_registry_url() {
+  local name="${1:-${PKG_NAME:-}}"
+  local scope=""
+  [[ "$name" == @*/* ]] && scope="${name%%/*}"
+  if [[ -n "$scope" ]]; then
+    local scoped_src="" src_word
+    for src_word in ${CHECK_REGISTRY:-}; do
+      [[ "$src_word" == "${scope}:registry="* ]] && scoped_src="${src_word#*=}"
+    done
+    if [[ -z "$scoped_src" ]]; then
+      local rc line scope_re="${scope//./\\.}"
+      for rc in "${CHECK_PROJECT_DIR:-.}/.npmrc" "$(bun_user_rc)"; do
+        [[ -n "$rc" && -f "$rc" ]] || continue
+        line=$(grep -E "^[[:space:]]*${scope_re}:registry[[:space:]]*=" "$rc" 2>/dev/null | tail -n 1 || true)
+        if [[ -n "$line" ]]; then
+          scoped_src=$(trim "${line#*=}")
+          break
+        fi
+      done
+    fi
+    if [[ -n "$scoped_src" ]]; then
+      strip_trailing_slashes "$scoped_src"
+      return 0
+    fi
+  fi
+  if [[ -n "${CHECK_REGISTRY:-}" ]]; then
+    local last_src="" src_word
+    for src_word in ${CHECK_REGISTRY}; do
+      [[ "$src_word" == @*:registry=* ]] && continue
+      last_src="$src_word"
+    done
+    if [[ -n "$last_src" ]]; then
+      strip_trailing_slashes "$last_src"
+      return 0
+    fi
+  fi
+  local v
+  for v in "${BUN_CONFIG_REGISTRY:-}" "${NPM_CONFIG_REGISTRY:-}" "${npm_config_registry:-}"; do
+    if [[ "$v" == http://* || "$v" == https://* ]]; then
+      strip_trailing_slashes "$v"
+      return 0
+    fi
+  done
+  local rc line
+  for rc in "${CHECK_PROJECT_DIR:-.}/.npmrc" "$(bun_user_rc)"; do
+    [[ -n "$rc" && -f "$rc" ]] || continue
+    line=$(grep -E '^[[:space:]]*registry[[:space:]]*=' "$rc" 2>/dev/null | tail -n 1 || true)
+    if [[ -n "$line" ]]; then
+      printf '%s' "$(trim "${line#*=}")" | sed 's:/*$::'
+      return 0
+    fi
+  done
+  printf 'https://registry.npmjs.org'
+}
+
+# Which installer performs the install this check gates. Source selectors
+# key off the INSTALLER, not the ecosystem — bun installs npm packages but
+# reads different source config, and applying bun's selectors to an npm
+# install removed the gate from artifacts safe can model (PR#30 delta-4
+# finding F4). The gate passes --installer when it knows; the ecosystem
+# default covers direct invocations.
+default_installer_for() {
+  case "$1" in
+    npm) printf 'npm' ;;
+    python) printf 'pip' ;;
+    rust) printf 'cargo' ;;
+    php) printf 'composer' ;;
+    go) printf 'go' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+validate_installer() {
+  case "$1" in
+    npm|pnpm|yarn|bun|pip|pip3|uv|pipx|cargo|go|composer) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Effective sources for this check: the normalized argv set plus manager
 # sources that act outside argv (env, rc files). Computed on EVERY check —
 # exact-pin resolution shortcuts must not skip the trust floor (delta-3/4
 # finding 3.2). This is the single derivation behind the trust floor, the
 # receipt writer, and (via the effective-sources plumbing command) every
-# stale-evidence reader; sweeping surfaces we cannot represent (cargo
-# config.toml registries, composer.json repositories declared by the
-# project itself, yarn/bun native config) stays out by design — those
-# either require argv selectors we already scan or are operator-committed
-# project architecture, not injectable state.
+# stale-evidence reader; sweeping config-file surfaces we cannot represent
+# (cargo config.toml — CARGO_HOME and --config included, bunfig.toml,
+# repositories declared by a project's own composer.json, uv.toml) stays
+# out by design — TOML parsing on one side, operator-committed project
+# architecture on the other; the injectable surfaces are argv + env + the
+# parseable config files swept here.
 derive_effective_sources() {
   local ecosystem="$1" name="$2"
-  local extra=""
+  local extra="" rw tok mapped
   CHECK_EFFECTIVE_SOURCES=$(normalize_source_set "${CHECK_REGISTRY:-}")
   case "$ecosystem" in
     npm)
@@ -4969,10 +5189,43 @@ derive_effective_sources() {
       # tiers (argv/env-selected alternate config files included via
       # npm_user_rc/npm_global_rc). All-keys sweeps of alternate files were
       # both wrong-precedence and over-flooring (delta-7 finding 3.2b).
-      extra=$(npm_registry_url "$name")
+      # A bun-driven install reads bun's config surface for the same
+      # ecosystem — selectors key off the installer (delta-4 finding F4).
+      if [[ "${CHECK_INSTALLER:-npm}" == "bun" ]]; then
+        extra=$(bun_registry_url "$name")
+      else
+        extra=$(npm_registry_url "$name")
+      fi
       ;;
     python) extra=$(python_env_sources) ;;
     go) extra=$(go_env_sources) ;;
+    rust)
+      # Rewrite pass over the argv set: --registry carries a NAME, --index a
+      # URL. Names resolve through their env-defined index or become opaque
+      # cargo-registry:<name> identities; an explicit crates-io selection is
+      # the built-in default source, not a custom one, and drops out.
+      rw=""
+      for tok in ${CHECK_EFFECTIVE_SOURCES}; do
+        if [[ "$tok" == *://* || "$tok" == local:* || "$tok" == cargo-registry:* ]]; then
+          rw="${rw:+$rw }$tok"
+        elif mapped=$(cargo_source_for_name "$tok"); then
+          rw="${rw:+$rw }${mapped}"
+        fi
+      done
+      CHECK_EFFECTIVE_SOURCES=$(normalize_source_set "$rw")
+      # registry.default applies only when argv selected NOTHING — judged
+      # on the RAW argv set, not the rewritten one: an explicit
+      # `--registry crates-io` rewrites to empty (it IS the default
+      # source) yet still overrides an ambient registry.default, and
+      # treating the empty rewrite as no-selection reapplied the env
+      # default cargo ignores (PR6 review round 1, finding 4).
+      if [[ -z "${CHECK_REGISTRY:-}" && -n "${CARGO_REGISTRY_DEFAULT:-}" ]]; then
+        if mapped=$(cargo_source_for_name "$CARGO_REGISTRY_DEFAULT"); then
+          CHECK_EFFECTIVE_SOURCES=$(normalize_source_set "$mapped")
+        fi
+      fi
+      ;;
+    php) extra=$(composer_env_sources) ;;
   esac
   local w existing seen
   for w in $extra; do
@@ -4982,6 +5235,10 @@ derive_effective_sources() {
     case "${ecosystem}:${w}" in
       npm:https://registry.npmjs.org) continue ;;
       python:https://pypi.org|python:https://pypi.org/simple) continue ;;
+      # A composer repo redefining packagist by its own URL triggers
+      # composer's packagist auto-disable and replaces it with the same
+      # endpoint — the default source either way.
+      php:https://repo.packagist.org|php:https://packagist.org) continue ;;
     esac
     # Membership is endpoint-level: a scoped token already carrying this
     # URL must not gain a redundant bare twin (the effective npm source of
@@ -5242,8 +5499,17 @@ resolve_target_versions() {
   case "$ecosystem" in
     npm) resolve_npm_versions "$name" "$requested" "$op" "$scratch" || return 1 ;;
     python) resolve_registry_latest "$requested" "https://pypi.org/pypi/${name}/json" '.info.version // empty' pypi.org "$scratch" || return 1 ;;
-    rust) resolve_registry_latest "$requested" "https://crates.io/api/v1/crates/${name}" '.crate.max_stable_version // .crate.newest_version // empty' crates.io "$scratch" || return 1 ;;
-    php) resolve_registry_latest "$requested" "https://repo.packagist.org/p2/${name}.json" --arg-name "$name" packagist.org "$scratch" || return 1 ;;
+    rust)
+      # An effective custom source — argv, env-selected registry.default, or
+      # a gate-threaded mise registry name — means this default-registry
+      # lookup would resolve against the wrong source: degrade to the
+      # package-level path, the same rule the argv selector always had.
+      # (python/go keep their reviewed argv-only degrade semantics.)
+      [[ -z "${CHECK_EFFECTIVE_SOURCES:-}" ]] || return 1
+      resolve_registry_latest "$requested" "https://crates.io/api/v1/crates/${name}" '.crate.max_stable_version // .crate.newest_version // empty' crates.io "$scratch" || return 1 ;;
+    php)
+      [[ -z "${CHECK_EFFECTIVE_SOURCES:-}" ]] || return 1
+      resolve_registry_latest "$requested" "https://repo.packagist.org/p2/${name}.json" --arg-name "$name" packagist.org "$scratch" || return 1 ;;
     go) resolve_registry_latest "$requested" "https://proxy.golang.org/${name}/@latest" '.Version // empty' proxy.golang.org "$scratch" || return 1 ;;
     *) return 1 ;;
   esac
@@ -5296,7 +5562,14 @@ resolve_npm_versions() {
   if npm_overrides_mention "$name"; then
     return 1
   fi
-  registry=$(npm_registry_url "$name")
+  # A bun-driven install fetches from bun's effective registry (bun
+  # registries speak the npm packument protocol, so resolution works the
+  # same way against it).
+  if [[ "${CHECK_INSTALLER:-npm}" == "bun" ]]; then
+    registry=$(bun_registry_url "$name")
+  else
+    registry=$(npm_registry_url "$name")
+  fi
   packument="$scratch/packument.json"
   enc_name="${name//\//%2F}"
   curl -fsS --max-time 5 -H 'Accept: application/vnd.npm.install-v1+json' \
@@ -5560,12 +5833,17 @@ effective_sources_command() {
   local ecosystem="" spec=""
   local CHECK_DIST_TAG="" CHECK_REGISTRY="" CHECK_PROJECT_DIR=""
   local CHECK_NPM_USERCONFIG="" CHECK_NPM_GLOBALCONFIG=""
-  local CHECK_EFFECTIVE_SOURCES=""
+  local CHECK_EFFECTIVE_SOURCES="" CHECK_INSTALLER=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --ecosystem)
         [[ $# -lt 2 ]] && die "--ecosystem requires a value"
         ecosystem="$2"
+        shift 2
+        ;;
+      --installer)
+        [[ $# -lt 2 ]] && die "--installer requires a value"
+        CHECK_INSTALLER="$2"
         shift 2
         ;;
       --npm-userconfig)
@@ -5600,7 +5878,7 @@ effective_sources_command() {
         ;;
     esac
   done
-  [[ -z "$spec" ]] && die "usage: safe audit effective-sources <pkg> [--ecosystem <name>] [--registry <set>] [--project-dir <dir>]"
+  [[ -z "$spec" ]] && die "usage: safe audit effective-sources <pkg> [--ecosystem <name>] [--installer <name>] [--registry <set>] [--project-dir <dir>]"
   parse_pkg_spec "$spec"
   [[ -z "$ecosystem" ]] && ecosystem=$(guess_ecosystem_from_spec "$spec")
   case "$ecosystem" in
@@ -5608,6 +5886,11 @@ effective_sources_command() {
     composer) ecosystem="php" ;;
     pip|pypi|uv) ecosystem="python" ;;
   esac
+  if [[ -n "$CHECK_INSTALLER" ]]; then
+    validate_installer "$CHECK_INSTALLER" || die "unknown --installer: $CHECK_INSTALLER"
+  else
+    CHECK_INSTALLER=$(default_installer_for "$ecosystem")
+  fi
   derive_effective_sources "$ecosystem" "$PKG_NAME"
   source_identity
   printf '\n'
@@ -5621,12 +5904,17 @@ check_command() {
   # floor; the receipt writer derives evidence identity from it.
   local CHECK_DIST_TAG="" CHECK_REGISTRY="" CHECK_PROJECT_DIR=""
   local CHECK_NPM_USERCONFIG="" CHECK_NPM_GLOBALCONFIG=""
-  local CHECK_EFFECTIVE_SOURCES=""
+  local CHECK_EFFECTIVE_SOURCES="" CHECK_INSTALLER=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --ecosystem)
         [[ $# -lt 2 ]] && die "--ecosystem requires a value"
         ecosystem="$2"
+        shift 2
+        ;;
+      --installer)
+        [[ $# -lt 2 ]] && die "--installer requires a value"
+        CHECK_INSTALLER="$2"
         shift 2
         ;;
       --npm-userconfig)
@@ -5682,7 +5970,7 @@ check_command() {
         ;;
     esac
   done
-  [[ -z "$spec" ]] && die "usage: safe audit check <pkg>[@<version>] [--ecosystem <name>] [--op install|update] [--gate install] [--dist-tag <t>] [--registry <url>] [--project-dir <dir>] [--json]"
+  [[ -z "$spec" ]] && die "usage: safe audit check <pkg>[@<version>] [--ecosystem <name>] [--installer <name>] [--op install|update] [--gate install] [--dist-tag <t>] [--registry <url>] [--project-dir <dir>] [--json]"
   [[ "$op" == "install" || "$op" == "update" ]] || die "--op must be install or update"
   [[ -z "$gate" || "$gate" == "install" ]] || die "--gate supports only: install"
 
@@ -5697,11 +5985,23 @@ check_command() {
     composer) ecosystem="php" ;;
     pip|pypi|uv) ecosystem="python" ;;
   esac
+  if [[ -n "$CHECK_INSTALLER" ]]; then
+    validate_installer "$CHECK_INSTALLER" || die "unknown --installer: $CHECK_INSTALLER"
+  else
+    CHECK_INSTALLER=$(default_installer_for "$ecosystem")
+  fi
 
   local scratch socket_json osv_json block_reason verdict socket_line osv_line block_line
   new_scratch_dir scratch
   socket_json="$scratch/socket.json"
   osv_json="$scratch/osv.json"
+
+  # The effective sources are derived BEFORE resolution: an env/rc-selected
+  # custom source must degrade the rust/php default-registry lookups the
+  # same way an argv selector always has, and the npm resolver reads the
+  # bun-effective registry through the same derivation inputs. Env + rc +
+  # parseable config only, no network.
+  derive_effective_sources "$ecosystem" "$PKG_NAME"
 
   # --- resolve the version(s) the package manager would actually install
   local resolution_ok=1 primary_version resolved_label=""
@@ -5864,8 +6164,8 @@ check_command() {
   # resolution entirely — so it is derived here on every check (env + rc
   # read only, no network; delta-3/4 finding 3.2). Operator escape hatches:
   # install.trusted_registries, or a pinned host-allow.
+  # (CHECK_EFFECTIVE_SOURCES was derived before resolution, above.)
   local custom_source=0 check_src
-  derive_effective_sources "$ecosystem" "$PKG_NAME"
   for check_src in ${CHECK_EFFECTIVE_SOURCES}; do
     # Trust applies to the endpoint; a scoped token carries its key inline.
     if ! registry_is_trusted "$(source_element_url "$check_src")" "$ecosystem"; then
@@ -5898,6 +6198,7 @@ check_command() {
     --arg spec "$spec" \
     --arg op "$op" \
     --arg ecosystem "$ecosystem" \
+    --arg installer "$CHECK_INSTALLER" \
     --arg verdict "$verdict" \
     --arg socket_line "$socket_line" \
     --arg osv_line "$osv_line" \
@@ -5917,6 +6218,7 @@ check_command() {
       spec: $spec,
       op: $op,
       ecosystem: $ecosystem,
+      installer: $installer,
       verdict: $verdict,
       resolved_versions: $resolved_versions,
       resolution: {
