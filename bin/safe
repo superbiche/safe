@@ -775,7 +775,7 @@ doctor_payload_json() {
   # first on PATH). The wrapper's argv0-dispatch branch keeps them working,
   # but each shimmed call pays an extra exec; surface the drift for repair.
   local mise_shim_dir="${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims"
-  local mise_shims_bound=0 mise_wrapper="$HOME/.local/bin/mise" shim shim_real wrapper_real
+  local mise_shims_bound=0 mise_wrapper="$SAFE_BIN_ROOT/mise" shim shim_real wrapper_real
   if [[ -d "$mise_shim_dir" ]] && [[ "$(gate_wrapper_state mise)" == "installed" ]]; then
     wrapper_real="$(readlink -f "$mise_wrapper" 2>/dev/null || true)"
     for shim in "$mise_shim_dir"/*; do

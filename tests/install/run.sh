@@ -3307,6 +3307,22 @@ case_mise_wrapper_dispatch_without_real_mise_is_legible() {
   pass "$FUNCNAME"
 }
 
+case_mise_wrapper_helper_matches_installer_output() {
+  # The suite helper duplicates install.sh's mise wrapper body; the two new
+  # behavioral cases exercise the helper's copy, so byte-identity with the
+  # installer's output is what makes them evidence about production
+  # (review PR#46 F2).
+  local dir="${TEST_ROOT}/${FUNCNAME}"
+  mkdir -p "${dir}/home" "${dir}/helper"
+  HOME="${dir}/home" SAFE_ZSHRC="${dir}/zshrc" bash "${ROOT_DIR}/install.sh" --wrappers >/dev/null 2>&1
+  write_gate_wrappers "${dir}/helper"
+  if ! diff -u "${dir}/helper/mise" "${dir}/home/.local/bin/mise" >&2; then
+    fail "$FUNCNAME"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
 case_uninstall_cleans_shell_and_legacy_binaries() {
   prepare_case "uninstall-cleans-shell-and-legacy-binaries"
   mkdir -p "${HOME_DIR}/.local/bin" "${HOME_DIR}/.local/share/zsh/site-functions" "${HOME_DIR}/.config/safe-run/completions" "${HOME_DIR}/.config/safe" "${HOME_DIR}/.local/share/safe"
@@ -3484,6 +3500,7 @@ main() {
     case_zsh_stub_warns_on_missing_mise_wrapper \
     case_mise_wrapper_dispatches_foreign_argv0 \
     case_mise_wrapper_dispatch_without_real_mise_is_legible \
+    case_mise_wrapper_helper_matches_installer_output \
     case_uninstall_cleans_shell_and_legacy_binaries
   do
     "$case"
