@@ -32,3 +32,25 @@ happens to look finds the stale grants.
   and the blocklist, but host-allow is the trust-bearing surface — start
   there.
 - Immediate manual candidate once ruled: remove `brace-expansion@2.1.4`.
+
+## Resolution (2026-08-03)
+
+Shipped in 1.4.0 (PR #50, merge 05bc6f3; review chain
+`~/.liaison/reviews/2026-08-03-safe-pr50-host-allow-review`, terra-high,
+round1 FIX-FIRST → 2 deltas → SHIP):
+
+1. `safe run host-allow review` — age, usage (execution log + install-gate
+   overrides), re-audit per pinned entry (`removable` / `keep` /
+   `review-urgent` / `unknown`); infra failure always `unknown`, never
+   staleness evidence. `--json`, `--no-audit`.
+2. `--digest` writes `inbox/<date>-safe-host-allow-digest.md` here when
+   removable or review-urgent entries exist; never overwrites.
+3. `install.sh --review-timer` (opt-in) installs the weekly systemd user
+   timer; enabled on this machine 2026-08-03
+   (`systemctl --user list-timers safe-host-allow-review.timer` → next
+   Mon 09:17).
+
+Deferred: CalDav pairing à la park-remind (digest note is the nudge for
+now); extending the same review shape to install-known/blocklist.
+Manual candidate once ruled: remove `brace-expansion@2.1.4` (currently
+reports `unknown` under the Socket 429; expect `removable` when it clears).

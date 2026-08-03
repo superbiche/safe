@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.4.0 - 2026-08-03
 
 - `safe run host-allow review`: read-only staleness report for host-allow
   entries — age, observed usage (executions + install-gate overrides), and a
