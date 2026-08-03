@@ -524,6 +524,10 @@ if [[ -f "$GATE_LIB_TARGET" ]] || gate_wrappers_exist; then
 fi
 mkdir -p "$CONFIG_BASE"
 install -m 0644 "$REPO_DIR/docs/contract/agent-contract.json" "$AGENT_CONTRACT_TARGET"
+# Bun Security Scanner API adapter: consumed by hosts implementing Bun's
+# scanner contract (mise aube via AUBE_SECURITY_SCANNER, bun >= 1.3 via
+# bunfig). The gate injects the env var when this file is present.
+install -m 0644 "$REPO_DIR/share/scanner.mjs" "$CONFIG_BASE/scanner.mjs"
 install -m 0755 "$REPO_DIR/bin/safe" "$BIN_DIR/safe"
 install -m 0755 "$REPO_DIR/bin/safe-run" "$BIN_DIR/safe-run"
 install -m 0755 "$REPO_DIR/bin/safe-audit" "$BIN_DIR/safe-audit"

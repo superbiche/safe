@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.10.0 - 2026-08-04
+
+- Bun Security Scanner API integration: `safe audit scanner-batch` (stdin
+  package set → Bun-shaped advisory array; local blocklist + version-scoped
+  OSV querybatch with per-advisory severity classification honoring
+  `install.block_severities`; MAL-* records fatal unconditionally) plus the
+  `share/scanner.mjs` adapter, installed to `~/.config/safe/scanner.mjs`.
+  Hosts implementing Bun's scanner contract — mise's embedded aube
+  installer (`AUBE_SECURITY_SCANNER`), bun >= 1.3 — get fail-closed
+  install-time scanning of the fully resolved dependency tree. The gate
+  injects `AUBE_SECURITY_SCANNER` into every delegate when the adapter is
+  deployed and the caller has not set its own. Infrastructure failure
+  (OSV unreachable, malformed responses) exits nonzero without advisories:
+  the host blocks the install and the cause reads as audit-infrastructure
+  breakage, never as a package finding.
+
 ## 1.9.2 - 2026-08-03
 
 - Gate delegate discovery accepts a mise shim that a reshim re-linked onto

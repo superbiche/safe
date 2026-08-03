@@ -1537,6 +1537,10 @@ case_uninstall_restores_the_displaced_binary() {
   grep -Fqx '# the real uv' "${HOME_DIR}/.local/bin/uv" || { fail "$FUNCNAME"; return; }
   [[ -x "${HOME_DIR}/.local/bin/uv" ]] || { fail "$FUNCNAME"; return; }
   [[ ! -e "${HOME_DIR}/.local/bin/uv.original" ]] || { fail "$FUNCNAME"; return; }
+  # Managed scanner adapter follows the managed-file lifecycle: deployed by
+  # install, removed by uninstall — a leftover with safe-audit gone makes
+  # every scanner-configured host fail closed (PR#64 review F8).
+  [[ ! -e "${HOME_DIR}/.config/safe/scanner.mjs" ]] || { fail "$FUNCNAME"; return; }
   pass "$FUNCNAME"
 }
 
