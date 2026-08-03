@@ -78,6 +78,7 @@ chmod +x "$MOCKBIN/curl"
 # --- mock socket CLI ---------------------------------------------------------
 cat > "$MOCKBIN/socket" <<'MOCK'
 #!/usr/bin/env bash
+[[ -n "${MOCK_SOCKET_ARGS_LOG:-}" ]] && printf '%s\n' "$*" >> "$MOCK_SOCKET_ARGS_LOG"
 case "${MOCK_SOCKET_MODE:-ok}" in
   ok) printf '{"score": 95}\n'; exit 0 ;;
   low) printf '{"score": 40}\n'; exit 0 ;;
@@ -2880,6 +2881,37 @@ if expect_status 0 "scriptless package passes" ; then
 fi
 if expect_no_grep "$ERR_FILE" 'declares install scripts' "no hint without scripts"; then
   pass "no hint without scripts"
+fi
+
+# ---------------------------------------------------------------------------
+# 64. Socket receives purl types, not safe ecosystem names: "python" must be
+#     scored as pkg:pypi (the API 400s on pkg:python), npm stays npm.
+# ---------------------------------------------------------------------------
+prepare_case socket-purl-type
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" \
+  -- requests@2.32.0 --ecosystem python --registry https://pypi.org/simple --gate install
+if expect_status 0 "python check with socket ok gates GO"; then
+  pass "python check with socket ok gates GO"
+fi
+if expect_grep "$CASE_DIR/socket-args.log" '^package score pypi requests@2\.32\.0' "socket is invoked with purl type pypi"; then
+  pass "socket is invoked with purl type pypi"
+fi
+
+prepare_case socket-purl-npm
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_grep "$CASE_DIR/socket-args.log" '^package score npm brace-expansion@2\.1\.4' "npm purl type is unchanged"; then
+  pass "npm purl type is unchanged"
 fi
 
 # ---------------------------------------------------------------------------

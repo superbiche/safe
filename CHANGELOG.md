@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.1 - 2026-08-03
+
+- Socket scores for non-npm ecosystems reach the API again: the socket CLI
+  takes a purl type, and safe passed its own ecosystem names, so `python`,
+  `rust`, `go`, and `php` produced `pkg:python/...` etc. — a 400 Bad Request
+  that degraded every non-npm score to an infra-WARN. They now map to
+  `pypi`/`cargo`/`golang`/`composer` (npm was already correct).
+
 ## 1.5.0 - 2026-08-03
 
 - `safe run scripts-allow`: operator-reviewed lifecycle-script grants for
