@@ -24,7 +24,7 @@
   "passthrough": "No registry fetch, no gate: non-install subcommands (npm run, npm --version, ...), npm exec/npx of a bare unversioned name already in node_modules/.bin of the current or a parent directory (a versioned or aliased spec is still audited), pnpm exec and composer exec (project/vendor binaries only), uv run without --with, and go run of local paths. npx --no-install/--no is honored strictly: the local binary runs or the refusal is exit 100, never a registry fetch.",
   "refusal_format": "safe: BLOCKED <tool> <action> — <reason>; to allow: <operator command>; details: safe explain",
   "refusal_note": "The refusal is the FINAL stderr line in that shape. It may be preceded by the audit's own report and `safe audit:` hint lines — relay the BLOCKED line (plus any `safe audit:` hints) to the operator; the lines above it are supporting evidence, not the refusal.",
-  "preflight": "Before proposing an install, an agent can check a spec directly: `safe audit check <pkg>@<version> --ecosystem <eco>` (add `--json` for the receipt). It prints per-scanner lines, `VERDICT: GO|WARN|BLOCK`, next-step hints on WARN/BLOCK, and exits 0/10/20 — those are verdict codes, not refusals. The gate turns the same WARN into a refusal with exit 100 (unless an allow matches) and BLOCK into exit 104.",
+  "preflight": "Before proposing an install, an agent can check a spec directly: `safe audit check <pkg>@<version> --ecosystem <eco>` (add `--json` for the receipt). It prints per-scanner lines, including GuardDog for exact npm/PyPI versions, `VERDICT: GO|WARN|BLOCK`, next-step hints on WARN/BLOCK, and exits 0/10/20 — those are verdict codes, not refusals. GuardDog hints name the risk-forming rules. The gate turns the same WARN into a refusal with exit 100 (unless an allow matches) and BLOCK into exit 104.",
   "exit_codes": [
     {
       "code": 0,
@@ -33,12 +33,12 @@
     },
     {
       "code": 10,
-      "meaning": "`safe audit check` verdict WARN (advisory affecting the resolved version, custom source, unresolved version, or an audit-infrastructure failure — the per-scanner lines say which)",
+      "meaning": "`safe audit check` verdict WARN (advisory affecting the resolved version, lower-confidence GuardDog behavioral findings, custom source, unresolved version, or an audit-infrastructure failure — the per-scanner lines say which)",
       "agent_action": "Read the `safe audit:` hint lines: an infrastructure cause is breakage to escalate, an advisory cause is the gate working. Via the gate this same state refuses with exit 100."
     },
     {
       "code": 20,
-      "meaning": "`safe audit check` verdict BLOCK (critical advisory affecting the resolved version, a known-malware `MAL-*` record, or blocklist)",
+      "meaning": "`safe audit check` verdict BLOCK (critical advisory affecting the resolved version, a known-malware `MAL-*` record, GuardDog `high_risk` behavior, or blocklist)",
       "agent_action": "Do not install. Via the gate this refuses with exit 104; the receipt carries the evidence."
     },
     {
@@ -64,7 +64,7 @@
     {
       "code": 104,
       "meaning": "safe audit BLOCK verdict",
-      "agent_action": "The audit returned BLOCK. That can be a critical advisory affecting the resolved version, a blocklist entry, or a critical advisory safe could not tie to a resolved version — the reason is in the receipt. Inspect it, and use `safe report-fp <spec>` only when its resolved-version and advisory evidence are inconsistent with the refusal."
+      "agent_action": "The audit returned BLOCK. That can be a critical advisory affecting the resolved version, a known-malware or blocklist entry, GuardDog high-risk behavior, or a critical advisory safe could not tie to a resolved version — the reason is in the receipt. Inspect it, and use `safe report-fp <spec>` only when its resolved-version and advisory evidence are inconsistent with the refusal."
     },
     {
       "code": 127,
@@ -109,8 +109,8 @@
     },
     {
       "situation": "A scanner is missing or broke",
-      "signal": "The output names a broken or unrun scanner and the verdict degraded to WARN.",
-      "action": "Coverage is missing, not a finding. Run `safe doctor` and report; do not read the WARN as a vulnerability."
+      "signal": "The output names a broken scanner and the verdict degraded to WARN. The explicit `guarddog not installed — behavioral tier skipped` note is the temporary exception in the current slice: Socket is still always-on, so that missing binary alone is not a WARN.",
+      "action": "Coverage is missing, not a finding. Run `safe doctor` and report a present scanner that failed. For the explicit missing-GuardDog skip, relay the install note if behavioral coverage is wanted; do not read the skip as a vulnerability."
     }
   ],
   "report_fp": {

@@ -64,7 +64,11 @@ unchanged.
     "auto_allow_tolerate": [],
     "trusted_registries": [],
     "auto_allow_ttl_days": 30,
-    "block_severities": ["critical"]
+    "block_severities": ["critical"],
+    "guarddog": {
+      "enabled": true,
+      "timeout_seconds": 120
+    }
   }
 }
 ```
@@ -86,6 +90,19 @@ unchanged.
 - `auto_allow_ttl_days`: freshness window for the offline/timeout fallback.
 - `block_severities`: affecting-advisory severities that hard-BLOCK instead
   of WARN.
+- `guarddog.enabled`: run GuardDog for exact resolved npm/PyPI versions.
+  Default: `true`. A missing binary is reported as a non-adverse skip while
+  Socket remains enabled in the current tiered-scoring slice.
+- `guarddog.timeout_seconds`: wall-clock limit for each GuardDog scan and its
+  version probe. Default: `120`. Successful complete results are cached
+  permanently under `~/.cache/safe/guarddog/`, keyed by the exact public
+  registry artifact integrity, GuardDog version, and safe-owned scanner
+  profile. Safe currently accepts GuardDog 3.1.0 and removes ambient
+  `GUARDDOG_*` configuration before invoking it, so a caller cannot weaken a
+  scan and seed reusable evidence. Override the cache root with
+  `SAFE_AUDIT_GUARDDOG_CACHE_DIR` (primarily for tests). Because replay is
+  permanent, GuardDog metadata-source updates alone do not invalidate an
+  existing artifact/scanner/profile entry.
 
 Common sandbox settings include:
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.6.0"
+SAFE_VERSION="1.7.0"
 SAFE_SELF="$(readlink -f "$0")"
 SAFE_DIR="$(dirname "$SAFE_SELF")"
 SAFE_CONFIG_ROOT="${SAFE_CONFIG_DIR:-$HOME/.config/safe}"
@@ -181,6 +181,7 @@ cmd_report_fp() {
     and (((.osv? // {}).classification? // {}) | type == "object")
     and ((.resolution? // {}) | type == "object")
     and ((.socket? // {}) | type == "object")
+    and ((.guarddog? // {}) | type == "object")
     and ((.resolved_versions? // []) | type == "array")
     and ((.warn_causes? // []) | type == "array")
   ' >/dev/null 2>&1 <<<"$payload"; then
@@ -247,7 +248,7 @@ cmd_report_fp() {
        else
         "No advisory is classified as affecting the resolved version, yet the "
           + "command was refused — so the verdict did not come from the OSV "
-          + "classification. Check the Socket and blocklist sections of the receipt."
+          + "classification. Check the GuardDog, Socket, and blocklist sections of the receipt."
        end),
       "",
       (if ((.osv.classification.remediated // []) | length) > 0 then
@@ -262,6 +263,12 @@ cmd_report_fp() {
       "- Socket: `\(.socket.status // "n/a")`" +
         (if ((.socket.status // "ok") != "ok")
          then " — the check failed; its raw error text is in the receipt, not here"
+         else "" end),
+      "- GuardDog: `\(.guarddog.status // "n/a")`" +
+        (if (.guarddog.rules // [] | length) > 0
+         then " — rules: " + ((.guarddog.rules // []) | join(", "))
+         elif ((.guarddog.infra_error // false) == true)
+         then " — infrastructure failure; raw details are in the receipt"
          else "" end),
       "- OSV: `\(.osv.status // "n/a")`, \((.osv.vulns // []) | length) advisories fetched",
       ""
@@ -757,7 +764,7 @@ doctor_payload_json() {
   local base_config="$SAFE_CONFIG_ROOT"
   local base_data="$SAFE_DATA_ROOT"
   local run_config_dir="$base_config/run"
-  local audit_config_dir="$base_config/audit"
+  local audit_config_dir="${SAFE_AUDIT_CONFIG_DIR:-$base_config/audit}"
   local install_wrapper="$base_config/install-wrappers.zsh"
 
   # Per-tool wrapper states for the executable gate (finding: an aggregate
@@ -824,6 +831,52 @@ doctor_payload_json() {
   [[ -n "$socket_cmd" ]] && socket_cli_present=true
   [[ -n "${SOCKET_SECURITY_API_TOKEN:-}" ]] && socket_token_env_set=true
   [[ -f "$socket_mapping" ]] && socket_vault_mapping_present=true
+
+  # Match safe-audit's local tool resolution: caller PATH, the detected local
+  # tools.json entry, then managed fallback directories. Probe the selected
+  # executable under the same safe-owned GuardDog environment as the audit.
+  local guarddog_presence_json guarddog_cmd="" guarddog_version=""
+  local guarddog_machine="${SAFE_AUDIT_LOCAL_MACHINE:-local}" guarddog_cached=""
+  guarddog_cmd=$(command -v guarddog 2>/dev/null || true)
+  if [[ -z "$guarddog_cmd" && -r "$audit_config_dir/machines.json" ]]; then
+    guarddog_machine=$(jq -r --arg fallback "$guarddog_machine" \
+      '[.machines | to_entries[] | select(.value.type == "local") | .key][0] // $fallback' \
+      "$audit_config_dir/machines.json" 2>/dev/null || printf '%s' "$guarddog_machine")
+  fi
+  if [[ -z "$guarddog_cmd" && -r "$audit_config_dir/tools.json" ]]; then
+    guarddog_cached=$(jq -r --arg m "$guarddog_machine" '.[$m].guarddog // empty' \
+      "$audit_config_dir/tools.json" 2>/dev/null || true)
+    [[ -n "$guarddog_cached" && -x "$guarddog_cached" ]] && guarddog_cmd="$guarddog_cached"
+  fi
+  if [[ -z "$guarddog_cmd" ]]; then
+    guarddog_cmd=$(PATH="$PATH:$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/go/bin:$HOME/.cargo/bin:$HOME/.local/share/mise/shims" \
+      command -v guarddog 2>/dev/null || true)
+  fi
+  if [[ -n "$guarddog_cmd" ]] && command -v timeout >/dev/null 2>&1; then
+    guarddog_cmd=$(readlink -f "$guarddog_cmd" 2>/dev/null || printf '%s' "$guarddog_cmd")
+    local guarddog_probe_ok=true
+    if ! guarddog_version=$(timeout --kill-after=1s 2s env \
+        -u GUARDDOG_PARALLELISM \
+        -u GUARDDOG_VERIFY_EXHAUSTIVE_DEPENDENCIES \
+        -u GUARDDOG_NEW_DEPENDENCY_RISK_THRESHOLD \
+        -u GUARDDOG_TOP_PACKAGES_CACHE_LOCATION \
+        -u GUARDDOG_YARA_EXT_EXCLUDE \
+        -u GUARDDOG_MAX_UNCOMPRESSED_SIZE \
+        -u GUARDDOG_MAX_COMPRESSION_RATIO \
+        -u GUARDDOG_MAX_FILE_COUNT \
+        -u GUARDDOG_SUBSCAN_SANDBOX \
+        "$guarddog_cmd" --version </dev/null 2>/dev/null \
+      | head -c 256 | head -n 1); then
+      guarddog_probe_ok=false
+    fi
+    [[ "$guarddog_probe_ok" == "true" && "$guarddog_version" == guarddog,\ version\ * ]] \
+      || guarddog_version=""
+  elif [[ -n "$guarddog_cmd" ]]; then
+    guarddog_cmd=$(readlink -f "$guarddog_cmd" 2>/dev/null || printf '%s' "$guarddog_cmd")
+  fi
+  guarddog_presence_json=$(jq -n --arg path "$guarddog_cmd" --arg version "$guarddog_version" '
+    {present:($path != ""),path:(if $path == "" then null else $path end)}
+    + (if $version == "" then {} else {version:$version} end)')
 
   local capabilities_json="" capabilities_available=false
   local capabilities_version=""
@@ -982,6 +1035,7 @@ doctor_payload_json() {
     --argjson socket_cli_present "$socket_cli_present" \
     --argjson socket_token_env_set "$socket_token_env_set" \
     --argjson socket_vault_mapping_present "$socket_vault_mapping_present" \
+    --argjson guarddog_presence "$guarddog_presence_json" \
     --argjson linked_npx "$linked_npx" \
     --argjson linked_bunx "$linked_bunx" \
     --argjson linked_uvx "$linked_uvx" \
@@ -1070,6 +1124,11 @@ doctor_payload_json() {
           cli_path: $socket_cli_path,
           token_env_set: $socket_token_env_set,
           vault_mapping_present: $socket_vault_mapping_present
+        },
+        guarddog: {
+          cli_present: $guarddog_presence.present,
+          cli_path: $guarddog_presence.path,
+          version: ($guarddog_presence.version // null)
         }
       }
     }'
@@ -1100,6 +1159,10 @@ print_doctor_human() {
     "socket wiring (install gate scoring):",
     "  cli: " + (if .environment.socket.cli_present then .environment.socket.cli_path else "MISSING — install socket CLI" end),
     "  token: " + (if .environment.socket.token_env_set then "env" elif .environment.socket.vault_mapping_present then "vault mapping" else "MISSING — socket login or add bw-env socket mapping" end),
+    "",
+    "guarddog wiring (npm/PyPI behavioral tier):",
+    "  cli: " + (if .environment.guarddog.cli_present then .environment.guarddog.cli_path else "MISSING — uv tool install guarddog" end),
+    "  version: " + (.environment.guarddog.version // "unavailable"),
     (if (.environment.install_wrappers.mise_shims_bound_to_wrapper // 0) > 0 then
       "\nmise shims: " + (.environment.install_wrappers.mise_shims_bound_to_wrapper | tostring)
       + " bound to the gate wrapper — dispatch still works (argv0 branch) but pays an extra exec per call; repoint the shims at the real mise binary"
