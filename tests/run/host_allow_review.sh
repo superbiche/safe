@@ -48,14 +48,16 @@ LOG
 
 cat > "$tmp/bin/safe-audit-stub" <<'SH'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >> "${STUB_CALL_LOG:-/dev/null}"
+printf 'noinit=%s %s\n' "${SAFE_AUDIT_NO_INIT:-}" "$*" >> "${STUB_CALL_LOG:-/dev/null}"
 spec="$2"
 case "$spec" in
-  clean-pkg@*) printf '{"verdict":"GO","warn_causes":[]}\n'; exit 0 ;;
-  warn-pkg@*)  printf '{"verdict":"WARN","warn_causes":["osv_affecting"]}\n'; exit 10 ;;
-  block-pkg@*) printf '{"verdict":"BLOCK","warn_causes":[]}\n'; exit 20 ;;
-  infra-pkg@*) printf '{"verdict":"WARN","warn_causes":["socket_rate_limited"]}\n'; exit 10 ;;
-  slow-pkg@*)  sleep 5; printf '{"verdict":"GO","warn_causes":[]}\n'; exit 0 ;;
+  clean-pkg@*)   printf '{"verdict":"GO","warn_causes":[]}\n'; exit 0 ;;
+  warn-pkg@*)    printf '{"verdict":"WARN","warn_causes":["osv_affecting"]}\n'; exit 10 ;;
+  block-pkg@*)   printf '{"verdict":"BLOCK","warn_causes":[]}\n'; exit 20 ;;
+  infra-pkg@*)   printf '{"verdict":"WARN","warn_causes":["socket_rate_limited"]}\n'; exit 10 ;;
+  slow-pkg@*)    sleep 5; printf '{"verdict":"GO","warn_causes":[]}\n'; exit 0 ;;
+  empty-pkg@*)   exit 0 ;;
+  garbage-pkg@*) printf 'not json at all\n'; exit 20 ;;
 esac
 SH
 chmod +x "$tmp/bin/safe-audit-stub"
@@ -153,5 +155,73 @@ JSON
 run_review --digest >/dev/null 2>&1
 [[ ! -f "$note" ]] || fail "digest note written with nothing actionable"
 pass "no digest note when nothing actionable"
+
+# --- probe payload corroboration (F2) -------------------------------------
+cat > "$tmp/config/host-allow.json" <<'JSON'
+{"packages":{
+  "empty-pkg":{"version":"1.0.0","sha":"f","ecosystem":"npm","added":"2026-07-01","reason":"probe lies"},
+  "garbage-pkg":{"version":"2.0.0","sha":"g","ecosystem":"npm","added":"2026-07-01","reason":"probe garbage"}
+}}
+JSON
+report=$(run_review --json)
+[[ "$(status_of empty-pkg)" == "unknown" ]] || fail "exit-0 probe with empty stdout must be unknown, not removable"
+pass "exit 0 without corroborating GO payload is unknown"
+[[ "$(status_of garbage-pkg)" == "unknown" ]] || fail "exit-20 probe with garbage stdout must be unknown"
+pass "exit 20 without corroborating BLOCK payload is unknown"
+
+# --- probes must not seed audit state (F1b) -------------------------------
+grep -q '^noinit=1 ' "$tmp/stub-calls.log" || fail "probes must run with SAFE_AUDIT_NO_INIT=1"
+pass "probes pass SAFE_AUDIT_NO_INIT=1"
+
+# --- review must not seed run state (F1a) ---------------------------------
+fresh="$tmp/fresh"
+SAFE_RUN_CONFIG_DIR="$fresh/config" \
+SAFE_RUN_DATA_DIR="$fresh/data" \
+SAFE_AUDIT_DATA_DIR="$fresh/audit-data" \
+SAFE_AUDIT_BIN="$tmp/bin/safe-audit-stub" \
+SAFE_REPO_DIR="$tmp/repo" \
+  "$SAFE_RUN" host-allow review --no-audit >/dev/null 2>&1 || true
+[[ ! -e "$fresh/config/host-allow.json" ]] || fail "review seeded host-allow.json on a fresh machine"
+[[ ! -e "$fresh/data/audit.log" ]] || fail "review seeded audit.log on a fresh machine"
+pass "review does not seed trust or audit state (no SAFE_RUN_NO_INIT)"
+
+# --- chronological last_used across offsets (F3) --------------------------
+# Append order is chronological; the second line is the later instant
+# (01:15Z) but the lexically smaller string. A lexical max would pick line 1.
+cat > "$tmp/config/host-allow.json" <<'JSON'
+{"packages":{
+  "clean-pkg":{"version":"2.1.4","sha":"a","ecosystem":"npm","added":"2026-07-01","reason":"dst pair"}
+}}
+JSON
+cat > "$tmp/audit-data/host-allow-log.jsonl" <<'JSON'
+{"timestamp":"2026-10-25T02:30:00+02:00","package":"clean-pkg","version":"2.1.4","runner":"npx"}
+{"timestamp":"2026-10-25T02:15:00+01:00","package":"clean-pkg","version":"2.1.4","runner":"npx"}
+JSON
+: >| "$tmp/data/audit.log"
+report=$(run_review --json)
+last=$(jq -r '.entries[0].last_used' <<<"$report")
+[[ "$last" == "2026-10-25T02:15:00+01:00" ]] || fail "last_used picked lexical, not chronological: $last"
+pass "last_used is chronological across UTC offsets"
+
+# --- malformed entries degrade, not abort (F4) ----------------------------
+cat > "$tmp/config/host-allow.json" <<'JSON'
+{"packages":{
+  "broken-entry":"not an object",
+  "block-pkg":{"version":"0.0.1","sha":"c","ecosystem":"npm","added":"2026-06-01","reason":"went bad"}
+}}
+JSON
+report=$(run_review --json)
+[[ "$(status_of broken-entry)" == "unknown" ]] || fail "malformed entry should report unknown"
+[[ "$(status_of block-pkg)" == "review-urgent" ]] || fail "entries after a malformed one must still be classified"
+pass "malformed entry degrades to unknown; the rest of the list survives"
+
+cat > "$tmp/config/host-allow.json" <<'JSON'
+{"packages":"nope"}
+JSON
+if run_review --json >/dev/null 2>"$tmp/malformed-err"; then
+  fail "unreadable host-allow file must be a legible error, not an empty report"
+fi
+grep -q "unreadable or malformed" "$tmp/malformed-err" || fail "missing legible malformed-file error"
+pass "unreadable host-allow file errors legibly"
 
 printf 'host-allow review: all cases passed\n'

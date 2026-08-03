@@ -1418,12 +1418,15 @@ host_allow_review_probe() {
   # Direct safe-audit checks carry no timeout of their own (the gate wrapper
   # adds the leash); bound the probe so one wedged Socket call cannot hang
   # the whole review. stdin closed: a hidden interactive prompt must fail,
-  # not wait.
+  # not wait. SAFE_AUDIT_NO_INIT: the probe must not seed audit state on a
+  # machine that has none — the dated check receipt safe-audit writes for
+  # every check stays (it is the probe's verifiable evidence, same as for
+  # any other check consumer), but nothing else may be created.
   if command -v timeout >/dev/null 2>&1; then
-    out=$(timeout "$leash" "$SAFE_AUDIT_BIN" check "${pkg}@${version}" \
+    out=$(SAFE_AUDIT_NO_INIT=1 timeout "$leash" "$SAFE_AUDIT_BIN" check "${pkg}@${version}" \
       --ecosystem "$ecosystem" --json </dev/null 2>/dev/null) || rc=$?
   else
-    out=$("$SAFE_AUDIT_BIN" check "${pkg}@${version}" \
+    out=$(SAFE_AUDIT_NO_INIT=1 "$SAFE_AUDIT_BIN" check "${pkg}@${version}" \
       --ecosystem "$ecosystem" --json </dev/null 2>/dev/null) || rc=$?
   fi
   REVIEW_AUDIT_EXIT=$rc
@@ -1431,23 +1434,35 @@ host_allow_review_probe() {
     REVIEW_AUDIT_VERDICT=$(printf '%s' "$out" | jq -r '.verdict // empty' 2>/dev/null || true)
     REVIEW_WARN_CAUSES=$(printf '%s' "$out" | jq -c '.warn_causes // []' 2>/dev/null) || REVIEW_WARN_CAUSES="[]"
   fi
+  # An actionable status requires the parsed verdict to corroborate the exit
+  # code: a probe that exits 0 with empty or unparsable output is an
+  # untrustworthy result, not a clean one, and must land in the
+  # conservative arm.
   case "$rc" in
     0)
-      REVIEW_STATUS="removable"
+      if [[ "$REVIEW_AUDIT_VERDICT" == "GO" ]]; then
+        REVIEW_STATUS="removable"
+      else
+        REVIEW_STATUS="unknown"
+      fi
       ;;
     10)
       local non_infra
       non_infra=$(printf '%s' "$REVIEW_WARN_CAUSES" | jq -r --argjson infra "$HOST_ALLOW_REVIEW_INFRA_CAUSES" \
         '[.[] | select(. as $c | $infra | index($c) | not)] | length' 2>/dev/null) || non_infra=""
-      if [[ "$non_infra" =~ ^[0-9]+$ ]] && (( non_infra > 0 )); then
+      if [[ "$REVIEW_AUDIT_VERDICT" == "WARN" && "$non_infra" =~ ^[0-9]+$ ]] && (( non_infra > 0 )); then
         REVIEW_STATUS="keep"
       else
-        # Infra-only WARN, or a WARN whose causes we could not read: unknown.
+        # Infra-only WARN, or a WARN whose payload we could not read: unknown.
         REVIEW_STATUS="unknown"
       fi
       ;;
     20)
-      REVIEW_STATUS="review-urgent"
+      if [[ "$REVIEW_AUDIT_VERDICT" == "BLOCK" ]]; then
+        REVIEW_STATUS="review-urgent"
+      else
+        REVIEW_STATUS="unknown"
+      fi
       ;;
     *)
       REVIEW_STATUS="unknown"
@@ -1466,7 +1481,9 @@ host_allow_review_usage() {
   if [[ -f "$SAFE_AUDIT_HOST_ALLOW_LOG" ]]; then
     exec_count=$(jq -rs --arg p "$pkg" '[.[] | select(.package == $p)] | length' \
       "$SAFE_AUDIT_HOST_ALLOW_LOG" 2>/dev/null) || exec_count=0
-    exec_last=$(jq -rs --arg p "$pkg" '[.[] | select(.package == $p) | .timestamp] | max // empty' \
+    # Append-only log: the last matching line is the chronologically latest
+    # record (a lexical max over offset-bearing timestamps is not).
+    exec_last=$(jq -rs --arg p "$pkg" '[.[] | select(.package == $p) | .timestamp] | last // empty' \
       "$SAFE_AUDIT_HOST_ALLOW_LOG" 2>/dev/null) || exec_last=""
   fi
   if [[ -f "$AUDIT_LOG" ]]; then
@@ -1479,9 +1496,20 @@ host_allow_review_usage() {
     gate_last="${gate_stats#*	}"
   fi
   REVIEW_TIMES_USED=$(( exec_count + gate_count ))
-  REVIEW_LAST_USED="$exec_last"
-  if [[ -n "$gate_last" && ( -z "$REVIEW_LAST_USED" || "$gate_last" > "$REVIEW_LAST_USED" ) ]]; then
+  # The two logs are each chronological (append-only), but picking across
+  # them needs instant comparison: timestamps carry UTC offsets, so lexical
+  # order is not chronological (DST transitions, timezone changes).
+  local exec_epoch=-1 gate_epoch=-1
+  if [[ -n "$exec_last" ]]; then
+    exec_epoch=$(date -d "$exec_last" +%s 2>/dev/null) || exec_epoch=-1
+  fi
+  if [[ -n "$gate_last" ]]; then
+    gate_epoch=$(date -d "$gate_last" +%s 2>/dev/null) || gate_epoch=-1
+  fi
+  if (( gate_epoch > exec_epoch )); then
     REVIEW_LAST_USED="$gate_last"
+  else
+    REVIEW_LAST_USED="$exec_last"
   fi
 }
 
@@ -1567,25 +1595,45 @@ cmd_host_allow_review() {
     esac
   done
 
+  # An unreadable trust file is a legible error, not an empty report that
+  # would read as "no entries to review".
+  if [[ -f "$HOST_ALLOW_FILE" ]] && ! jq -e '.packages | type == "object"' "$HOST_ALLOW_FILE" >/dev/null 2>&1; then
+    die "host-allow file is unreadable or malformed: $HOST_ALLOW_FILE"
+  fi
+
   local entries_tmp report_json now_epoch
   entries_tmp=$(mktemp)
   now_epoch=$(date +%s)
 
-  local entry name version ecosystem added reason age_days added_epoch
+  local entry name version ecosystem added reason age_days added_epoch malformed
   while IFS= read -r entry; do
     [[ -n "$entry" ]] || continue
-    name=$(jq -r '.key' <<<"$entry")
-    version=$(jq -r '.value.version' <<<"$entry")
-    ecosystem=$(jq -r '.value.ecosystem // "npm"' <<<"$entry")
-    added=$(jq -r '.value.added // empty' <<<"$entry")
-    reason=$(jq -r '.value.reason // empty' <<<"$entry")
+    # A malformed entry degrades to one unknown row and the review
+    # continues: aborting mid-list would hide the rest of the trust surface.
+    name=$(jq -r '.key // empty' <<<"$entry" 2>/dev/null) || name=""
+    [[ -n "$name" ]] || name="(invalid)"
+    version=$(jq -r '.value.version // empty' <<<"$entry" 2>/dev/null) || version=""
+    ecosystem=$(jq -r '.value.ecosystem // "npm"' <<<"$entry" 2>/dev/null) || ecosystem="npm"
+    added=$(jq -r '.value.added // empty' <<<"$entry" 2>/dev/null) || added=""
+    reason=$(jq -r '.value.reason // empty' <<<"$entry" 2>/dev/null) || reason=""
+    malformed=0
+    if [[ -z "$version" ]]; then
+      malformed=1
+      version="?"
+      reason="malformed host-allow entry"
+    fi
     age_days=-1
     if [[ -n "$added" ]] && added_epoch=$(date -d "$added" +%s 2>/dev/null); then
       age_days=$(( (now_epoch - added_epoch) / 86400 ))
     fi
 
     host_allow_review_usage "$name"
-    if (( no_audit )); then
+    if (( malformed )); then
+      REVIEW_STATUS="unknown"
+      REVIEW_AUDIT_EXIT=-1
+      REVIEW_AUDIT_VERDICT=""
+      REVIEW_WARN_CAUSES="[]"
+    elif (( no_audit )); then
       REVIEW_STATUS="unaudited"
       REVIEW_AUDIT_EXIT=-1
       REVIEW_AUDIT_VERDICT=""
@@ -2280,7 +2328,14 @@ main() {
   argv0=$(basename "$0")
   detect_runner "$argv0"
   if [[ "$SAFE_RUN_NO_INIT" != "1" ]]; then
-    ensure_dirs
+    # host-allow review is a read-only report over the trust surface: on a
+    # machine with no run state it must not seed trust files as a side
+    # effect of being asked what that state is.
+    if [[ "$argv0" == "safe-run" && "${1:-}" == "host-allow" && "${2:-}" == "review" ]]; then
+      :
+    else
+      ensure_dirs
+    fi
   fi
 
   if [[ "$argv0" == "safe-run" ]]; then
