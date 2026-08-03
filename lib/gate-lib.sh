@@ -177,8 +177,9 @@ safe_gate_exec_real() {
   # Inert everywhere else — only aube reads the variable — and deliberately
   # injected for every delegate: any child of the delegate that ends up
   # running an aube install inherits the gate.
-  if [[ -z "${AUBE_SECURITY_SCANNER:-}" && -f "${HOME}/.config/safe/scanner.mjs" ]]; then
-    export AUBE_SECURITY_SCANNER="${HOME}/.config/safe/scanner.mjs"
+  if [[ -z "${AUBE_SECURITY_SCANNER:-}" \
+    && -f "${SAFE_CONFIG_DIR:-${HOME}/.config/safe}/scanner.mjs" ]]; then
+    export AUBE_SECURITY_SCANNER="${SAFE_CONFIG_DIR:-${HOME}/.config/safe}/scanner.mjs"
   fi
 
   # Bash assignment PRESERVES a pre-existing export attribute: if the caller

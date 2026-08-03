@@ -118,6 +118,10 @@ for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise; do
 done
 rm -f "$CONFIG_BASE/gate-lib.sh"
 rm -f "$CONFIG_BASE/agent-contract.json"
+# Managed scanner adapter: leaving it behind with safe-audit gone would make
+# any host still configured to load it (bunfig, AUBE_SECURITY_SCANNER) fail
+# closed on every install until the stale module is diagnosed.
+rm -f "$CONFIG_BASE/scanner.mjs"
 if [[ "${#removed_wrappers[@]}" -gt 0 ]]; then
   info "removed gate wrappers: ${removed_wrappers[*]}"
 fi

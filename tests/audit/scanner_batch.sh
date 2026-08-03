@@ -44,7 +44,14 @@ done
 case "$url" in
   *api.osv.dev/v1/querybatch*)
     [[ "${MOCK_BATCH_STATUS:-0}" == "0" ]] || exit 22
-    cat "${MOCK_BATCH_FIXTURE:?}"
+    if [[ -n "${MOCK_BATCH_DIR:-}" ]]; then
+      count_file="${MOCK_BATCH_DIR}/.count"
+      count=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$count" > "$count_file"
+      cat "${MOCK_BATCH_DIR}/batch${count}.json"
+    else
+      cat "${MOCK_BATCH_FIXTURE:?}"
+    fi
     ;;
   *api.osv.dev/v1/vulns/*)
     [[ "${MOCK_VULN_STATUS:-0}" == "0" ]] || exit 22
@@ -80,6 +87,7 @@ run_batch() {
     SAFE_RUN_CONFIG_DIR="$RUN_DIR" \
     MOCK_FIXDIR="$FIXDIR" \
     MOCK_BATCH_FIXTURE="${MOCK_BATCH_FIXTURE:-}" \
+    MOCK_BATCH_DIR="${MOCK_BATCH_DIR:-}" \
     MOCK_BATCH_STATUS="${MOCK_BATCH_STATUS:-0}" \
     MOCK_VULN_STATUS="${MOCK_VULN_STATUS:-0}" \
     MOCK_QUERY_FIXTURE="${MOCK_QUERY_FIXTURE:-}" \
@@ -159,11 +167,11 @@ case_critical_advisory_is_fatal_medium_is_warn() {
   if [[ "$rc" == "0" ]] \
     && jq -e '[.[] | select(.package == "aaa")][0].level == "fatal"' <<<"$out" >/dev/null \
     && jq -e '[.[] | select(.package == "bbb")][0].level == "warn"' <<<"$out" >/dev/null \
-    && jq -e '[.[] | select(.package == "bbb")][0].description | contains("GHSA-med-0002 (medium)")' <<<"$out" >/dev/null; then
-    pass "critical is fatal, medium is warn (default block_severities)"
+    && jq -e '[.[] | select(.package == "bbb")][0].description | contains("GHSA-med-0002 (moderate)")' <<<"$out" >/dev/null; then
+    pass "critical is fatal, moderate is warn (default block_severities)"
   else
     printf 'rc=%s out=%s\n' "$rc" "$out" >&2
-    fail "critical is fatal, medium is warn (default block_severities)"
+    fail "critical is fatal, moderate is warn (default block_severities)"
   fi
 }
 
@@ -233,6 +241,203 @@ case_pagination_token_triggers_complete_requery() {
   else
     printf 'rc=%s out=%s\n' "$rc" "$out" >&2
     fail "next_page_token result is re-queried to completeness"
+  fi
+}
+
+case_cvss_vector_critical_is_fatal() {
+  # PR#64 review F1: the legacy substring matcher read "CVSS:3.1/..." as
+  # "low". The classifier must band the vector itself, matching check's
+  # policy for the identical record.
+  setup_case cvssvec
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-cvssvec.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-vect-0007"}]}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": "GHSA-vect-0007", "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]}\n' > "$FIXDIR/vuln-GHSA-vect-0007.json"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"ggg","version":"1.0.0"}]}' | run_batch) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e '.[0].level == "fatal" and (.[0].description | contains("(critical)"))' <<<"$out" >/dev/null; then
+    pass "CVSS v3 vector-only critical is fatal"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "CVSS v3 vector-only critical is fatal"
+  fi
+}
+
+case_conflicting_severity_candidates_max_wins() {
+  setup_case sevmax
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-sevmax.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-mixd-0008"}]}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": "GHSA-mixd-0008", "database_specific": {"severity": "LOW"}, "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]}\n' > "$FIXDIR/vuln-GHSA-mixd-0008.json"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"hhh","version":"1.0.0"}]}' | run_batch) || rc=$?
+  if [[ "$rc" == "0" ]] && jq -e '.[0].level == "fatal"' <<<"$out" >/dev/null; then
+    pass "conflicting severity candidates: the maximum wins"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "conflicting severity candidates: the maximum wins"
+  fi
+}
+
+case_unknown_severity_respects_knob() {
+  # A record with no severity candidates is legitimately "unknown" — warn by
+  # default, fatal only when the operator lists unknown in the knob.
+  setup_case unk
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-unk.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-nosev-0009"}]}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": "GHSA-nosev-0009"}\n' > "$FIXDIR/vuln-GHSA-nosev-0009.json"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"iii","version":"1.0.0"}]}' | run_batch) || rc=$?
+  local first_ok=0
+  [[ "$rc" == "0" ]] && jq -e '.[0].level == "warn" and (.[0].description | contains("(unknown)"))' <<<"$out" >/dev/null && first_ok=1
+  printf '{"install": {"block_severities": ["critical", "unknown"]}}\n' > "$RUN_DIR/config.json"
+  rc=0
+  out=$(printf '{"packages":[{"name":"iii","version":"1.0.0"}]}' | run_batch) || rc=$?
+  if [[ "$first_ok" == "1" && "$rc" == "0" ]] && jq -e '.[0].level == "fatal"' <<<"$out" >/dev/null; then
+    pass "no-candidate severity is unknown: warn by default, knob can promote"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "no-candidate severity is unknown: warn by default, knob can promote"
+  fi
+}
+
+case_malformed_batch_entries_fail_closed() {
+  # PR#64 review F2: null entries, non-array vulns, and wrong-shape tokens
+  # must exit 4 — optional iterators would read each as "no advisories".
+  setup_case entries
+  local shape rc out ok=1
+  for shape in '{"results":[null]}' '{"results":[{"vulns":null}]}' '{"results":[{"next_page_token":7}]}' '{"results":[{"vulns":[{"id":42}]}]}'; do
+    MOCK_BATCH_FIXTURE="$FIXDIR/batch-entry.json"
+    printf '%s\n' "$shape" > "$MOCK_BATCH_FIXTURE"
+    rc=0
+    out=$(printf '{"packages":[{"name":"jjj","version":"1.0.0"}]}' | run_batch 2>"$TEST_ROOT/entry.err") || rc=$?
+    if [[ "$rc" != "4" || -n "$out" ]] || ! grep -q "audit-infrastructure breakage" "$TEST_ROOT/entry.err"; then
+      printf 'shape=%s rc=%s out=%s\n' "$shape" "$rc" "$out" >&2
+      ok=0
+    fi
+  done
+  if [[ "$ok" == "1" ]]; then
+    pass "malformed batch entries fail closed (null result, null vulns, bad token, non-string id)"
+  else
+    fail "malformed batch entries fail closed (null result, null vulns, bad token, non-string id)"
+  fi
+}
+
+case_malformed_advisory_record_fails_closed() {
+  # PR#64 review F3: an unparseable or mismatched detail record is
+  # infrastructure breakage, never an unknown-severity warn.
+  setup_case badrec
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-badrec.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-bad-0010"}]}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf 'not-json\n' > "$FIXDIR/vuln-GHSA-bad-0010.json"
+  local rc=0 out ok=1
+  out=$(printf '{"packages":[{"name":"kkk","version":"1.0.0"}]}' | run_batch 2>"$TEST_ROOT/badrec.err") || rc=$?
+  { [[ "$rc" == "4" && -z "$out" ]] && grep -q "audit-infrastructure breakage" "$TEST_ROOT/badrec.err"; } || ok=0
+  # Parseable but claiming a different id.
+  printf '{"id": "GHSA-other-9999"}\n' > "$FIXDIR/vuln-GHSA-bad-0010.json"
+  rc=0
+  out=$(printf '{"packages":[{"name":"kkk","version":"1.0.0"}]}' | run_batch 2>"$TEST_ROOT/badrec2.err") || rc=$?
+  { [[ "$rc" == "4" && -z "$out" ]] && grep -q "audit-infrastructure breakage" "$TEST_ROOT/badrec2.err"; } || ok=0
+  if [[ "$ok" == "1" ]]; then
+    pass "malformed or mismatched advisory record fails closed"
+  else
+    fail "malformed or mismatched advisory record fails closed"
+  fi
+}
+
+case_unreadable_blocklist_fails_closed() {
+  # PR#64 review F4: a blocklist that exists but cannot parse must never
+  # read as "not blocked".
+  setup_case badblock
+  printf 'not-json{' > "$RUN_DIR/blocked.json"
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-clean-bb.json"
+  printf '{"results": [{}]}\n' > "$MOCK_BATCH_FIXTURE"
+  local rc=0 out
+  out=$(printf '{"packages":[{"name":"lll","version":"1.0.0"}]}' | run_batch 2>"$TEST_ROOT/bb.err") || rc=$?
+  if [[ "$rc" == "4" && -z "$out" ]] && grep -q "blocklist file unreadable" "$TEST_ROOT/bb.err"; then
+    pass "unreadable blocklist fails closed as local infrastructure breakage"
+  else
+    printf 'rc=%s out=%s err=%s\n' "$rc" "$out" "$(cat "$TEST_ROOT/bb.err")" >&2
+    fail "unreadable blocklist fails closed as local infrastructure breakage"
+  fi
+}
+
+case_hostile_advisory_ids_fail_closed() {
+  # PR#64 review F7: dot-only sentinels and malformed MAL ids must be
+  # rejected before URL or output construction.
+  setup_case hostile
+  local shape rc out ok=1
+  for shape in '{"results":[{"vulns":[{"id":".."}]}]}' '{"results":[{"vulns":[{"id":"MAL-../bad"}]}]}'; do
+    MOCK_BATCH_FIXTURE="$FIXDIR/batch-hostile.json"
+    printf '%s\n' "$shape" > "$MOCK_BATCH_FIXTURE"
+    rc=0
+    out=$(printf '{"packages":[{"name":"mmm","version":"1.0.0"}]}' | run_batch 2>"$TEST_ROOT/hostile.err") || rc=$?
+    if [[ "$rc" != "4" || -n "$out" ]] || ! grep -q "malformed advisory id" "$TEST_ROOT/hostile.err"; then
+      printf 'shape=%s rc=%s out=%s\n' "$shape" "$rc" "$out" >&2
+      ok=0
+    fi
+  done
+  if [[ "$ok" == "1" ]]; then
+    pass "hostile advisory ids (dot sentinels, malformed MAL) fail closed"
+  else
+    fail "hostile advisory ids (dot sentinels, malformed MAL) fail closed"
+  fi
+}
+
+case_chunk_alignment_across_batches() {
+  # 150 packages → two querybatch calls; the only advisory sits on the
+  # LAST package of the second chunk. Misalignment anywhere in the
+  # chunk/transpose/accumulate pipeline would attribute it elsewhere or
+  # lose it.
+  setup_case chunks
+  local batchdir="$FIXDIR/chunks"
+  mkdir -p "$batchdir"; rm -f "$batchdir/.count"
+  jq -n '{results: [range(100) | {}]}' > "$batchdir/batch1.json"
+  jq -n '{results: ([range(49) | {}] + [{vulns: [{id: "GHSA-last-0011"}]}])}' > "$batchdir/batch2.json"
+  printf '{"id": "GHSA-last-0011", "database_specific": {"severity": "CRITICAL"}}\n' > "$FIXDIR/vuln-GHSA-last-0011.json"
+  local input out rc=0 expected
+  input=$(jq -n '{packages: [range(150) | {name: ("pkg-" + (. | tostring)), version: "1.0.0"}]}')
+  # scanner-batch queries in dedupe order (jq unique SORTS); the advisory
+  # sits on the last entry of the second batch call, i.e. sorted position
+  # 149 — compute it the same way rather than assuming input order.
+  expected=$(jq -r '[.packages[] | {name, version}] | unique | .[149].name' <<<"$input")
+  out=$(printf '%s' "$input" | MOCK_BATCH_DIR="$batchdir" MOCK_BATCH_FIXTURE= run_batch) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e --arg exp "$expected" 'length == 1 and .[0].package == $exp and .[0].level == "fatal"' <<<"$out" >/dev/null; then
+    pass "chunk alignment holds across 150 packages / two batch calls"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "chunk alignment holds across 150 packages / two batch calls"
+  fi
+}
+
+# --- cases: gate env injection -----------------------------------------------
+
+case_gate_injects_scanner_env() {
+  # PR#64 review F6: the probe must honor SAFE_CONFIG_DIR, not hardcode
+  # ~/.config/safe; a caller-set value is preserved; no file → no export.
+  setup_case gateinj
+  local confdir="$TEST_ROOT/gateconf" tooldir="$TEST_ROOT/gatetools"
+  mkdir -p "$confdir" "$tooldir"
+  printf '// adapter placeholder\n' > "$confdir/scanner.mjs"
+  cat > "$tooldir/faketool" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "${AUBE_SECURITY_SCANNER:-UNSET}"
+STUB
+  chmod +x "$tooldir/faketool"
+  local lib="$ROOT/lib/gate-lib.sh" out ok=1
+  out=$(PATH="$tooldir:/usr/bin:/bin" SAFE_CONFIG_DIR="$confdir" \
+    bash -c "source '$lib'; safe_gate_exec_real faketool")
+  [[ "$out" == "$confdir/scanner.mjs" ]] || { printf 'custom dir: %s\n' "$out" >&2; ok=0; }
+  out=$(PATH="$tooldir:/usr/bin:/bin" SAFE_CONFIG_DIR="$confdir" AUBE_SECURITY_SCANNER=/caller/own.mjs \
+    bash -c "source '$lib'; safe_gate_exec_real faketool")
+  [[ "$out" == "/caller/own.mjs" ]] || { printf 'caller-set: %s\n' "$out" >&2; ok=0; }
+  out=$(PATH="$tooldir:/usr/bin:/bin" SAFE_CONFIG_DIR="$TEST_ROOT/gate-empty" \
+    bash -c "source '$lib'; safe_gate_exec_real faketool")
+  [[ "$out" == "UNSET" ]] || { printf 'no file: %s\n' "$out" >&2; ok=0; }
+  if [[ "$ok" == "1" ]]; then
+    pass "gate injects AUBE_SECURITY_SCANNER (SAFE_CONFIG_DIR honored, caller wins, no file no export)"
+  else
+    fail "gate injects AUBE_SECURITY_SCANNER (SAFE_CONFIG_DIR honored, caller wins, no file no export)"
   fi
 }
 
@@ -310,6 +515,36 @@ STUB
   fi
 }
 
+case_adapter_rejects_partial_request_channel() {
+  # PR#64 review F5: a child that stops reading stdin (EPIPE) and still
+  # exits 0 with valid output must REJECT — the package list may not have
+  # arrived in full, so its "clean" answer covers an unknown subset.
+  local node; node=$(node_bin) || { pass "adapter EPIPE (SKIPPED: node not available)"; return; }
+  cat > "$TEST_ROOT/driver-big.mjs" <<DRIVER
+import { scanner } from "$ROOT/share/scanner.mjs";
+const packages = Array.from({ length: 4000 }, (_, i) => ({
+  name: "pkg-" + i, version: "1.0.0",
+}));
+const advisories = await scanner.scan({ packages });
+console.log(JSON.stringify(advisories));
+DRIVER
+  cat > "$MOCKBIN/safe-audit-stub" <<'STUB'
+#!/usr/bin/env bash
+exec 0<&-
+printf '[]\n'
+exit 0
+STUB
+  chmod +x "$MOCKBIN/safe-audit-stub"
+  local out rc=0
+  out=$(SAFE_AUDIT_BIN="$MOCKBIN/safe-audit-stub" "$node" "$TEST_ROOT/driver-big.mjs" 2>&1) || rc=$?
+  if [[ "$rc" != "0" && "$out" == *"did not receive the full package list"* ]]; then
+    pass "adapter rejects when the request channel breaks (EPIPE, zero-exit child)"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "adapter rejects when the request channel breaks (EPIPE, zero-exit child)"
+  fi
+}
+
 # --- run ---------------------------------------------------------------------
 
 case_clean_tree_returns_empty_array
@@ -321,9 +556,19 @@ case_block_severities_knob_promotes_high
 case_batch_failure_is_infra_breakage_not_cve
 case_vuln_fetch_failure_fails_closed
 case_pagination_token_triggers_complete_requery
+case_cvss_vector_critical_is_fatal
+case_conflicting_severity_candidates_max_wins
+case_unknown_severity_respects_knob
+case_malformed_batch_entries_fail_closed
+case_malformed_advisory_record_fails_closed
+case_unreadable_blocklist_fails_closed
+case_hostile_advisory_ids_fail_closed
+case_chunk_alignment_across_batches
+case_gate_injects_scanner_env
 case_adapter_maps_advisories
 case_adapter_throws_on_nonzero_exit
 case_adapter_throws_on_malformed_payload
+case_adapter_rejects_partial_request_channel
 
 printf '%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 (( FAIL_COUNT == 0 ))

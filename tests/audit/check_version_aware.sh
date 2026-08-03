@@ -3277,5 +3277,29 @@ if expect_status 20 "bad token cannot demote history malware on the degraded pat
 fi
 
 # ---------------------------------------------------------------------------
+# Unreadable blocklist -> WARN with its own cause, never "not blocked"
+# (PR#64 review F4 sibling sweep: blocked_entry_reason runs as a
+# conditional, so a jq parse failure was indistinguishable from a miss and
+# operator blocklist evidence vanished silently).
+# ---------------------------------------------------------------------------
+prepare_case blocklist-unreadable
+printf 'not-json{' > "$CASE_RUN_CONFIG/blocked.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm
+if expect_status 10 "unreadable blocklist demotes clean check to WARN"; then
+  pass "unreadable blocklist demotes clean check to WARN"
+fi
+if expect_grep "$OUT_FILE" "blocklist file unreadable" "unreadable blocklist names its cause"; then
+  pass "unreadable blocklist names its cause"
+fi
+if expect_no_grep "$OUT_FILE" "PASS \(not blocked\)" "unreadable blocklist never reads as not-blocked"; then
+  pass "unreadable blocklist never reads as not-blocked"
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

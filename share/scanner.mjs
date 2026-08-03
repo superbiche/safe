@@ -26,6 +26,11 @@ function runSafeAudit(payload) {
     let stdout = "";
     let stderr = "";
     let settled = false;
+    // A request-channel failure (EPIPE from a child that stopped reading)
+    // means the package list may not have arrived in full — a zero exit
+    // with valid output must still reject then, or a partial scan would
+    // resolve as complete (PR#64 review F5).
+    let stdinError = null;
     const timer = setTimeout(() => {
       settled = true;
       child.kill("SIGKILL");
@@ -51,9 +56,19 @@ function runSafeAudit(payload) {
         );
         return;
       }
+      if (stdinError) {
+        reject(
+          new Error(
+            `safe-audit scanner-batch did not receive the full package list: ${stdinError.message}`,
+          ),
+        );
+        return;
+      }
       resolve(stdout);
     });
-    child.stdin.on("error", () => {});
+    child.stdin.on("error", (err) => {
+      stdinError = err;
+    });
     child.stdin.end(payload);
   });
 }

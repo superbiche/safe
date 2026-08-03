@@ -8152,7 +8152,18 @@ check_command() {
   done
 
   block_line="PASS (not blocked)"
-  if block_reason=$(blocked_entry_reason "$PKG_NAME"); then
+  # An unreadable blocklist must not read as "not blocked": the conditional
+  # call below swallows jq failures, so a corrupt file would silently erase
+  # operator blocklist evidence (PR#64 review F4, sibling of the
+  # scanner-batch preflight). Local state breakage is a WARN with its own
+  # cause — infrastructure to fix, never a clean pass.
+  if [[ -f "$SAFE_RUN_BLOCKED_FILE" ]] \
+    && ! jq -e '(type == "object") and ((.packages // {}) | type == "object")' \
+      "$SAFE_RUN_BLOCKED_FILE" >/dev/null 2>&1; then
+    block_line="WARN (blocklist file unreadable — repair or remove ${SAFE_RUN_BLOCKED_FILE})"
+    warn_causes+=("blocklist_unreadable")
+    bump_verdict verdict "WARN"
+  elif block_reason=$(blocked_entry_reason "$PKG_NAME"); then
     bump_verdict verdict "BLOCK"
     block_line="BLOCKED ($block_reason)"
   fi
@@ -9928,6 +9939,17 @@ scanner_batch_command() {
   local pkgs advisories='[]' name reason
   pkgs=$(jq -c '[.packages[] | {name, version}] | unique' <<<"$input")
 
+  # A blocklist that exists but cannot be parsed is local audit-infrastructure
+  # breakage, not "not blocked": blocked_entry_reason runs as a conditional,
+  # where a jq failure is indistinguishable from a miss, and operator
+  # blocklist evidence would vanish silently (PR#64 review F4).
+  if [[ -f "$SAFE_RUN_BLOCKED_FILE" ]] \
+    && ! jq -e '(type == "object") and ((.packages // {}) | type == "object")' \
+      "$SAFE_RUN_BLOCKED_FILE" >/dev/null 2>&1; then
+    printf 'safe audit: scanner-batch: blocklist file unreadable (%s) — local audit-infrastructure breakage, not a package finding; repair or remove the file\n' "$SAFE_RUN_BLOCKED_FILE" >&2
+    return 4
+  fi
+
   while IFS= read -r name; do
     if reason=$(blocked_entry_reason "$name"); then
       advisories=$(jq -c --arg p "$name" --arg d "blocklisted on this host: $reason" \
@@ -9951,14 +9973,31 @@ scanner_batch_command() {
       printf 'safe audit: scanner-batch: OSV batch query failed (network/timeout/HTTP error) — audit-infrastructure breakage, not a package finding; check connectivity or run safe doctor\n' >&2
       return 4
     fi
-    if ! jq -e --argjson n "$chunk_len" \
-      '(.results | type == "array") and (.results | length == $n)' \
-      "$scratch/batch.json" >/dev/null 2>&1; then
+    # Every result entry is validated to the shape the classification below
+    # relies on BEFORE any optional iteration touches it: a null entry, a
+    # non-array vulns, a vuln without a string id, or a token of the wrong
+    # shape must fail closed here — optional iterators (`.vulns[]?`) would
+    # otherwise read each of those as "no advisories" and exit 0 clean
+    # (PR#64 review F2).
+    if ! jq -e --argjson n "$chunk_len" '
+      (.results | type == "array") and (.results | length == $n)
+      and ([.results[]
+            | (type == "object")
+              and ((has("vulns") | not)
+                   or (.vulns | (type == "array")
+                       and ([.[] | (type == "object")
+                             and ((.id? | type) == "string")
+                             and (.id | length > 0)] | all)))
+              and ((has("next_page_token") | not)
+                   or (.next_page_token | (type == "string") and (length > 0)
+                       and test("^[[:graph:]]+$")))
+           ] | all)
+    ' "$scratch/batch.json" >/dev/null 2>&1; then
       printf 'safe audit: scanner-batch: malformed OSV batch response — audit-infrastructure breakage, not a package finding\n' >&2
       return 4
     fi
     paired=$(jq -cn --argjson acc "$paired" --argjson chunk "$chunk" --slurpfile b "$scratch/batch.json" \
-      '$acc + ([$chunk, $b[0].results] | transpose | map({pkg: .[0], res: (.[1] // {})}))')
+      '$acc + ([$chunk, $b[0].results] | transpose | map({pkg: .[0], res: .[1]}))')
     chunk_start=$((chunk_start + 100))
   done
 
@@ -9980,21 +10019,56 @@ scanner_batch_command() {
       '.[$i].res = {vulns: ($p[0].vulns // [])}' <<<"$paired")
   done < <(jq -r 'to_entries[] | select(.value.res.next_page_token? | strings | length > 0) | .key' <<<"$paired")
 
-  # Severity classification needs full records; querybatch returns only ids.
-  # MAL-* ids are known-malware and need no fetch. Everything else is
-  # fetched once per distinct id.
-  local id sev_map='{}' sev_raw label
+  # Every advisory id — MAL-* included — is validated before any use: ids
+  # reach a URL path and the output advisories, and the previous guard both
+  # allowed dot-only sentinels ("..") and never saw MAL ids at all (PR#64
+  # review F7). Leading alnum excludes "." and ".."; the class excludes
+  # slashes, escapes, whitespace, and controls.
+  local id
   while IFS= read -r id; do
-    if ! [[ "$id" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    if ! [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
       printf 'safe audit: scanner-batch: malformed advisory id in OSV response — audit-infrastructure breakage, not a package finding\n' >&2
       return 4
     fi
+  done < <(jq -r '[.[].res.vulns[]? | .id] | unique | .[]' <<<"$paired")
+
+  # Severity classification needs full records; querybatch returns only ids.
+  # MAL-* ids are known-malware and need no fetch. Everything else is
+  # fetched once per distinct id, the record validated as the advisory it
+  # claims to be, and classified by the SAME most-severe-candidate-wins
+  # ladder check_command uses (qualitative labels + every CVSS v3/v4
+  # vector) — the legacy substring matcher read a raw "CVSS:3.1/..." vector
+  # as "low" and downgraded criticals to warn (PR#64 review F1). A record
+  # that cannot be parsed is infrastructure breakage, never an
+  # unknown-severity finding (PR#64 review F3).
+  local sev_map='{}' label
+  while IFS= read -r id; do
     if ! curl -fsS --max-time 8 "https://api.osv.dev/v1/vulns/$id" > "$scratch/vuln.json"; then
       printf 'safe audit: scanner-batch: OSV advisory fetch failed (%s) — audit-infrastructure breakage, not a package finding; check connectivity or run safe doctor\n' "$id" >&2
       return 4
     fi
-    sev_raw=$(jq -r '(.database_specific.severity // .severity[0].score // "unknown") | tostring' "$scratch/vuln.json" 2>/dev/null || printf 'unknown')
-    label=$(severity_from_osv_entry "$sev_raw")
+    if ! jq -e --arg id "$id" '(type == "object") and ((.id // "" | tostring) == $id)' \
+      "$scratch/vuln.json" >/dev/null 2>&1; then
+      printf 'safe audit: scanner-batch: OSV advisory record malformed (%s) — audit-infrastructure breakage, not a package finding\n' "$id" >&2
+      return 4
+    fi
+    # Candidates from the whole record (top-level + every affected entry):
+    # cross-package advisories classify by their most severe candidate —
+    # the fail-closed direction.
+    if ! label=$(jq -r "$JQ_SEVERITY_DEFS"'
+      def sev_entries: (.severity // []) + ([ .affected[]?.severity? // empty ] | add // []);
+      (
+        [ .database_specific.severity? // empty | norm_qual ]
+        + [ sev_entries[] | select(.type == "CVSS_V3") | (.score // empty) | cvss3_band ]
+        + [ sev_entries[] | select(.type == "CVSS_V4")
+            | ((try ((.score // "") | cvss4_band) catch empty) // "high") ]
+        + [ .affected[]?.ecosystem_specific.severity? // empty | norm_qual ]
+      ) as $cands
+      | if ($cands | length) > 0 then ($cands | max_by(band_rank(.))) else "unknown" end
+    ' "$scratch/vuln.json" 2>/dev/null) || [[ -z "$label" ]]; then
+      printf 'safe audit: scanner-batch: OSV advisory severity unreadable (%s) — audit-infrastructure breakage, not a package finding\n' "$id" >&2
+      return 4
+    fi
     sev_map=$(jq -c --arg id "$id" --arg l "$label" '. + {($id): $l}' <<<"$sev_map")
   done < <(jq -r '[.[].res.vulns[]? | .id | strings | select(test("^MAL-") | not)] | unique | .[]' <<<"$paired")
 
