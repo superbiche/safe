@@ -410,6 +410,130 @@ case_chunk_alignment_across_batches() {
   fi
 }
 
+case_multidoc_responses_fail_closed() {
+  # PR#64 delta F10: a JSON stream validates on its last document while
+  # consumption reads the first — both response paths must enforce exactly
+  # one document.
+  setup_case multidoc
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-multidoc.json"
+  printf '{"results": [{}]}\n{"results": [{"vulns": [{"id": "GHSA-dropped-0012"}]}]}\n' > "$MOCK_BATCH_FIXTURE"
+  local rc=0 out ok=1
+  out=$(printf '{"packages":[{"name":"nnn","version":"1.0.0"}]}' | run_batch 2>"$TEST_ROOT/md.err") || rc=$?
+  { [[ "$rc" == "4" && -z "$out" ]] && grep -q "not a single JSON document" "$TEST_ROOT/md.err"; } || ok=0
+  # Detail path: two matching documents (critical then low) must not
+  # concatenate into an unrecognized label warn.
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-multidoc2.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-multi-0013"}]}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": "GHSA-multi-0013", "database_specific": {"severity": "CRITICAL"}}\n{"id": "GHSA-multi-0013", "database_specific": {"severity": "LOW"}}\n' > "$FIXDIR/vuln-GHSA-multi-0013.json"
+  rc=0
+  out=$(printf '{"packages":[{"name":"ooo","version":"1.0.0"}]}' | run_batch 2>"$TEST_ROOT/md2.err") || rc=$?
+  { [[ "$rc" == "4" && -z "$out" ]] && grep -q "advisory record malformed" "$TEST_ROOT/md2.err"; } || ok=0
+  if [[ "$ok" == "1" ]]; then
+    pass "multi-document batch and detail responses fail closed"
+  else
+    fail "multi-document batch and detail responses fail closed"
+  fi
+}
+
+case_paginated_requery_enforces_id_schema() {
+  # PR#64 delta F11: the pagination fallback replaces validated results, so
+  # its entries must satisfy the same string-id schema — a numeric id was
+  # stringified by jq -r and rode past the upfront guard.
+  setup_case pagschema
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-pagschema.json"
+  printf '{"results": [{"next_page_token": "tok"}]}\n' > "$MOCK_BATCH_FIXTURE"
+  MOCK_QUERY_FIXTURE="$FIXDIR/query-pagschema.json"
+  printf '{"vulns": [{"id": 42}]}\n' > "$MOCK_QUERY_FIXTURE"
+  local rc=0 out
+  out=$(printf '{"packages":[{"name":"ppp","version":"1.0.0"}]}' | run_batch 2>"$TEST_ROOT/ps.err") || rc=$?
+  if [[ "$rc" == "4" && -z "$out" ]] && grep -q "malformed paginated OSV response" "$TEST_ROOT/ps.err"; then
+    pass "paginated re-query entries must satisfy the id schema"
+  else
+    printf 'rc=%s out=%s err=%s\n' "$rc" "$out" "$(cat "$TEST_ROOT/ps.err")" >&2
+    fail "paginated re-query entries must satisfy the id schema"
+  fi
+}
+
+case_severity_scoped_to_queried_package() {
+  # PR#64 delta F12: another affected package's critical must not classify
+  # the queried package — check_command scopes to matching_affected, and
+  # the scanner must agree.
+  setup_case sevscope
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-sevscope.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-scope-0014"}]}]}\n' > "$MOCK_BATCH_FIXTURE"
+  cat > "$FIXDIR/vuln-GHSA-scope-0014.json" <<'JSON'
+{"id": "GHSA-scope-0014",
+ "affected": [
+   {"package": {"ecosystem": "npm", "name": "qqq"},
+    "ecosystem_specific": {"severity": "LOW"}},
+   {"package": {"ecosystem": "npm", "name": "other-pkg"},
+    "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}],
+    "ecosystem_specific": {"severity": "CRITICAL"}}
+ ]}
+JSON
+  local rc=0 out
+  out=$(printf '{"packages":[{"name":"qqq","version":"1.0.0"}]}' | run_batch) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e '.[0].level == "warn" and (.[0].description | contains("(low)"))' <<<"$out" >/dev/null; then
+    pass "severity is scoped to the queried package, not the whole record"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "severity is scoped to the queried package, not the whole record"
+  fi
+}
+
+case_numeric_detail_id_fails_closed() {
+  # Delta re-check F3 residual: a numeric detail id must not impersonate
+  # its string form through tostring.
+  setup_case numid
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-numid.json"
+  printf '{"results": [{"vulns": [{"id": "42"}]}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": 42}\n' > "$FIXDIR/vuln-42.json"
+  local rc=0 out
+  out=$(printf '{"packages":[{"name":"rrr","version":"1.0.0"}]}' | run_batch 2>"$TEST_ROOT/numid.err") || rc=$?
+  if [[ "$rc" == "4" && -z "$out" ]] && grep -q "advisory record malformed" "$TEST_ROOT/numid.err"; then
+    pass "numeric detail id does not impersonate its string form"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "numeric detail id does not impersonate its string form"
+  fi
+}
+
+case_blocklist_entry_schema_fails_closed() {
+  # Delta re-check F4 residual: a parseable blocklist whose ENTRY is not an
+  # object silently reads as "not blocked" through `// empty`.
+  setup_case entrycorrupt
+  printf '{"packages": {"sss": ""}}\n' > "$RUN_DIR/blocked.json"
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-entrycorrupt.json"
+  printf '{"results": [{}]}\n' > "$MOCK_BATCH_FIXTURE"
+  local rc=0 out
+  out=$(printf '{"packages":[{"name":"sss","version":"1.0.0"}]}' | run_batch 2>"$TEST_ROOT/ec.err") || rc=$?
+  if [[ "$rc" == "4" && -z "$out" ]] && grep -q "blocklist file unreadable" "$TEST_ROOT/ec.err"; then
+    pass "non-object blocklist entry fails closed"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "non-object blocklist entry fails closed"
+  fi
+}
+
+case_same_name_different_versions_stay_distinct() {
+  setup_case twovers
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-twovers.json"
+  # Dedupe keys on {name, version}: two versions of one package are two
+  # queries; the duplicate pair collapses to one.
+  printf '{"results": [{"vulns": [{"id": "GHSA-v1-0015"}]}, {}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": "GHSA-v1-0015", "database_specific": {"severity": "CRITICAL"}}\n' > "$FIXDIR/vuln-GHSA-v1-0015.json"
+  local rc=0 out
+  out=$(printf '{"packages":[{"name":"ttt","version":"1.0.0"},{"name":"ttt","version":"2.0.0"},{"name":"ttt","version":"1.0.0"}]}' | run_batch) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e 'length == 1 and (.[0].description | contains("ttt@1.0.0"))' <<<"$out" >/dev/null; then
+    pass "same-name different-version stay distinct; exact duplicates collapse"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "same-name different-version stay distinct; exact duplicates collapse"
+  fi
+}
+
 # --- cases: gate env injection -----------------------------------------------
 
 case_gate_injects_scanner_env() {
@@ -515,6 +639,38 @@ STUB
   fi
 }
 
+case_adapter_throws_on_missing_binary() {
+  local node; node=$(node_bin) || { pass "adapter ENOENT (SKIPPED: node not available)"; return; }
+  adapter_driver
+  local out rc=0
+  out=$(SAFE_AUDIT_BIN="$TEST_ROOT/does-not-exist" "$node" "$TEST_ROOT/driver.mjs" 2>&1) || rc=$?
+  if [[ "$rc" != "0" && "$out" == *"could not start"* ]]; then
+    pass "adapter throws when safe-audit is missing (ENOENT)"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "adapter throws when safe-audit is missing (ENOENT)"
+  fi
+}
+
+case_adapter_times_out_hung_child() {
+  local node; node=$(node_bin) || { pass "adapter timeout (SKIPPED: node not available)"; return; }
+  adapter_driver
+  cat > "$MOCKBIN/safe-audit-stub" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null
+sleep 60
+STUB
+  chmod +x "$MOCKBIN/safe-audit-stub"
+  local out rc=0
+  out=$(SAFE_SCANNER_TIMEOUT_MS=1500 SAFE_AUDIT_BIN="$MOCKBIN/safe-audit-stub" "$node" "$TEST_ROOT/driver.mjs" 2>&1) || rc=$?
+  if [[ "$rc" != "0" && "$out" == *"timed out"* ]]; then
+    pass "adapter kills and rejects a hung safe-audit"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "adapter kills and rejects a hung safe-audit"
+  fi
+}
+
 case_adapter_rejects_partial_request_channel() {
   # PR#64 review F5: a child that stops reading stdin (EPIPE) and still
   # exits 0 with valid output must REJECT — the package list may not have
@@ -564,10 +720,18 @@ case_malformed_advisory_record_fails_closed
 case_unreadable_blocklist_fails_closed
 case_hostile_advisory_ids_fail_closed
 case_chunk_alignment_across_batches
+case_multidoc_responses_fail_closed
+case_paginated_requery_enforces_id_schema
+case_severity_scoped_to_queried_package
+case_numeric_detail_id_fails_closed
+case_blocklist_entry_schema_fails_closed
+case_same_name_different_versions_stay_distinct
 case_gate_injects_scanner_env
 case_adapter_maps_advisories
 case_adapter_throws_on_nonzero_exit
 case_adapter_throws_on_malformed_payload
+case_adapter_throws_on_missing_binary
+case_adapter_times_out_hung_child
 case_adapter_rejects_partial_request_channel
 
 printf '%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"

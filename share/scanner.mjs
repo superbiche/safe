@@ -14,8 +14,12 @@
 import { spawn } from "node:child_process";
 
 // The host SIGKILLs the scanner process at 30s; killing safe-audit at 25s
-// keeps the error legible (our stderr, not a silent SIGKILL).
-const SAFE_AUDIT_TIMEOUT_MS = 25_000;
+// keeps the error legible (our stderr, not a silent SIGKILL). The env
+// override exists for the test suite; values are clamped into (0, 25s].
+const SAFE_AUDIT_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.SAFE_SCANNER_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 25_000) : 25_000;
+})();
 
 function runSafeAudit(payload) {
   const bin = process.env.SAFE_AUDIT_BIN || "safe-audit";
