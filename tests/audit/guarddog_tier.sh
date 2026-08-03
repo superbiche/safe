@@ -156,7 +156,15 @@ fi
 [[ -n "${MOCK_GUARDDOG_LOG:-}" ]] && printf '%s\n' "$*" >> "$MOCK_GUARDDOG_LOG"
 no_sandbox=0
 for a in "$@"; do [[ "$a" == "--no-sandbox" ]] && no_sandbox=1; done
-if [[ "${MOCK_GUARDDOG_SANDBOX_BROKEN:-0}" == "1" && "$no_sandbox" == "0" ]]; then
+broken_for_version=0
+[[ "${MOCK_GUARDDOG_SANDBOX_BROKEN:-0}" == "1" ]] && broken_for_version=1
+if [[ -n "${MOCK_GUARDDOG_SANDBOX_BROKEN_VERSION:-}" ]]; then
+  broken_for_version=0
+  for a in "$@"; do
+    [[ "$a" == "${MOCK_GUARDDOG_SANDBOX_BROKEN_VERSION}" ]] && broken_for_version=1
+  done
+fi
+if [[ "$broken_for_version" == "1" && "$no_sandbox" == "0" ]]; then
   printf '{"package": "demo", "issues": 0, "errors": {"download-package": "Sandboxed extraction failed: no entropy"}}\n'
   exit 0
 fi
@@ -169,6 +177,16 @@ for ((i = 0; i < ${#args[@]}; i++)); do
   fi
 done
 case "${MOCK_GUARDDOG_MODE:-clean}" in
+  valid-block-with-sandbox-text)
+    # Shape-valid, retains a high_risk finding, AND carries an error value
+    # containing a fallback marker. The sandboxed attempt must stand.
+    if [[ "$no_sandbox" == "1" ]]; then
+      printf '{"package":"demo","issues":0,"errors":{},"results":{},"risk_score":{"score":0,"label":"no_risks_detected","findings_count":0,"score_breakdown":{}},"risks":[]}\n'
+    else
+      printf '{"package":"demo","issues":1,"errors":{"metadata_mismatch":"--no-sandbox"},"results":{},"risk_score":{"score":9,"label":"high_risk","findings_count":1,"score_breakdown":{}},"risks":[{"threat_rule":"threat-exfiltrate-secrets","capability_rule":null}]}\n'
+    fi
+    exit 0
+    ;;
   scan-error-shape)
     # GuardDog's real failure shape: no risk fields, cause in .errors.
     printf '{"package": "demo", "issues": 0, "errors": {"download-package": "Sandboxed extraction failed: no entropy"}}\n'
@@ -1147,6 +1165,73 @@ expect_json '.guarddog.cache.hits == 0 and .guarddog.cache.misses == 1' \
   "an unsandboxed run does not replay the sandboxed cache entry"
 run_check 1 -- demo@1.0.0 --ecosystem npm --json
 expect_json '.guarddog.cache.hits == 1' "the unsandboxed profile caches on its own key"
+
+# F6: a shape-valid result — even a partial one whose error text mentions the
+# sandbox — must never be discarded by the fallback retry.
+prepare_case sandbox-no-retry-over-valid-block
+run_check 1 MOCK_GUARDDOG_MODE=valid-block-with-sandbox-text -- \
+  demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 20 "a valid partial BLOCK survives a sandbox-marker error value"
+expect_json '.guarddog.contribution == "BLOCK"
+  and .guarddog.sandbox.fell_back == false
+  and (.guarddog.rules | index("threat-exfiltrate-secrets") != null)' \
+  "the sandboxed findings are retained, not replaced by a retry"
+if grep -q -- '--no-sandbox' "$CASE_LOG"; then
+  cat "$CASE_LOG" >&2
+  fail "no unsandboxed retry happens over a valid result"
+else
+  pass "no unsandboxed retry happens over a valid result"
+fi
+
+# F7: the retry shares the version's wall-clock budget instead of doubling it.
+prepare_case sandbox-retry-shares-budget
+printf '{"install": {"guarddog": {"timeout_seconds": 3}}}\n' > "$CASE_RUN_CONFIG/config.json"
+SECONDS_BEFORE=$(date +%s)
+run_check 1 MOCK_GUARDDOG_SANDBOX_BROKEN=1 MOCK_GUARDDOG_MODE=hang -- \
+  demo@1.0.0 --ecosystem npm --json
+SECONDS_AFTER=$(date +%s)
+if (( SECONDS_AFTER - SECONDS_BEFORE <= 8 )); then
+  pass "an auto retry stays inside one scan budget (plus grace)"
+else
+  printf 'elapsed %ss for a 3s budget\n' "$(( SECONDS_AFTER - SECONDS_BEFORE ))" >&2
+  fail "an auto retry stays inside one scan budget (plus grace)"
+fi
+
+# F8: provenance is per attempt — a sibling version that scanned sandboxed
+# must not inherit the run's no-sandbox profile, and a repeated auto fallback
+# must consume its own cache instead of rescanning.
+prepare_case sandbox-repeat-fallback-hits-cache
+run_check 1 MOCK_GUARDDOG_SANDBOX_BROKEN=1 -- demo@1.0.0 --ecosystem npm --json
+expect_json '.guarddog.sandbox.fell_back == true and .guarddog.cache.misses == 1' \
+  "first auto fallback populates the no-sandbox profile"
+run_check 1 MOCK_GUARDDOG_SANDBOX_BROKEN=1 -- demo@1.0.0 --ecosystem npm --json
+expect_json '.guarddog.cache.hits == 1' "a repeated auto fallback replays its own cache entry"
+
+# A sandboxed sibling in the same run keeps the sandboxed profile: after
+# falling back for one version, a later sandbox-clean version's entry must
+# still be rejected by a sandbox=off read.
+prepare_case sandbox-mixed-version-provenance
+printf '{"dependencies":{"multi":"^1.0.0"}}\n' > "$CASE_DIR/project/package.json"
+printf '{"packages":{"node_modules/consumer":{"dependencies":{"multi":"^2.0.0"}}}}\n' > "$CASE_DIR/project/package-lock.json"
+run_check 1 MOCK_PACKUMENT_MODE=multi MOCK_GUARDDOG_SANDBOX_BROKEN_VERSION=1.5.0 -- \
+  multi --ecosystem npm --op update --project-dir "$CASE_DIR/project" --json
+printf '{"install": {"guarddog": {"sandbox": "off"}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 MOCK_PACKUMENT_MODE=multi -- \
+  multi --ecosystem npm --op update --project-dir "$CASE_DIR/project" --json
+expect_json '.guarddog.cache.hits < 2' \
+  "a sandbox-off run cannot consume a sibling scanned under the sandbox"
+
+# F9: provenance reaches recorded evidence.
+prepare_case sandbox-fallback-install-known-reason
+run_check 1 MOCK_GUARDDOG_SANDBOX_BROKEN=1 -- demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "auto fallback still gates GO"
+if jq -e '.packages["npm:demo"].reasons | index("guarddog_clean_for_versions_nosandbox") != null' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "install-known records the unsandboxed provenance"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2 || true
+  fail "install-known records the unsandboxed provenance"
+fi
 
 if (( FAIL_COUNT > 0 )); then
   printf 'guarddog tier: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT" >&2

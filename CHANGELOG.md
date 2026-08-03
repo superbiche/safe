@@ -10,6 +10,18 @@
   degrade those checks — and the skip is recorded honestly in receipts and
   install-known reasons (`socket_skipped_tier3`/`socket_disabled`, never
   `socket_ok`). `never` disables Socket outright.
+- `install.guarddog.sandbox` (`auto` default, `required`, `off`): GuardDog
+  extracts archives inside a kernel sandbox and refuses to scan when that
+  sandbox is unavailable — on hosts where its sandboxed child cannot start
+  that meant zero behavioral coverage, which silently kept Socket
+  load-bearing. `auto` retries once with `--no-sandbox` (never over a
+  shape-valid result, and within the same wall-clock budget), discloses the
+  weaker isolation on every surface — human output, receipt
+  `guarddog.sandbox.fell_back`, `safe report-fp`, and a distinct
+  `guarddog_clean_for_versions_nosandbox` install-known reason — and binds
+  the result to a separate cache profile so it can never replay as a
+  sandboxed result. `required` keeps the hard failure; `off` never
+  sandboxes.
 - Release-age cooldown (`install.cooldown_days`, default 3): a resolved
   version published fewer than N days ago WARNs (`release_too_new`,
   overridable via exact host-allow pin or `auto_allow_tolerate`) — the

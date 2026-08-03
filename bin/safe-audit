@@ -5159,75 +5159,110 @@ guarddog_error_record() {
      artifact_identity:$artifact,raw:null}' > "$output"
 }
 
+# Per-attempt profile: the cache identity must describe the isolation the
+# result was ACTUALLY produced under, never the run's aggregate state
+# (delta-2 F8 — a global flag mislabelled a sandboxed sibling version).
+guarddog_profile_for_flag() {
+  if [[ "$1" == "nosandbox" ]]; then
+    printf '%s' "$GUARDDOG_CACHE_PROFILE_NOSANDBOX"
+  else
+    printf '%s' "$GUARDDOG_CACHE_PROFILE"
+  fi
+}
+
 guarddog_scan_one_json() {
   local ecosystem="$1" name="$2" version="$3" guarddog_cmd="$4"
   local scanner_version="$5" budget="$6" scratch="$7" slot="$8" output="$9"
   local artifact_file="$scratch/guarddog-artifact-${slot}-identity.json"
-  local artifact_json='null' cache_eligible=false cache_key="" cache_file=""
+  local artifact_json='null'
   local key_material="$scratch/guarddog-cache-key-${slot}.json"
   if guarddog_artifact_identity_json "$ecosystem" "$name" "$version" "$scratch" "$slot" > "$artifact_file"; then
     artifact_json=$(cat "$artifact_file")
-    if [[ -n "$scanner_version" ]] \
-      && cache_key=$(GUARDDOG_CACHE_PROFILE="$(guarddog_active_profile)" \
+  fi
+
+  local raw="$scratch/guarddog-${slot}.raw.json"
+  local cli_ecosystem="$ecosystem" stderr_file="$scratch/guarddog-${slot}.stderr" rc=0
+  [[ "$ecosystem" == "python" ]] && cli_ecosystem="pypi"
+
+  # One deadline for the whole version scan: an auto retry must fit inside
+  # the configured wall-clock budget, not double it (delta-2 F7).
+  local scan_deadline=$(( $(date +%s) + budget ))
+  local cache_eligible=false cache_key="" cache_file="" attempt_profile=""
+  local attempt_kind="sandbox"
+  [[ "$GUARDDOG_SANDBOX_MODE" == "off" ]] && attempt_kind="nosandbox"
+
+  # Prepare one attempt: derive its profile, cache key and file, then try the
+  # cache. Returns 0 when a valid cached result was replayed into $raw.
+  guarddog_attempt_prepare() {
+    attempt_profile=$(guarddog_profile_for_flag "$attempt_kind")
+    cache_eligible=false
+    cache_key=""
+    cache_file=""
+    if [[ "$artifact_json" != "null" && -n "$scanner_version" ]] \
+      && cache_key=$(GUARDDOG_CACHE_PROFILE="$attempt_profile" \
         guarddog_cache_key "$artifact_json" "$scanner_version" "$key_material" 2>/dev/null) \
       && [[ -n "$cache_key" ]]; then
       cache_eligible=true
       cache_file="$GUARDDOG_CACHE_DIR/${cache_key}.json"
     fi
-  fi
-
-  local raw="$scratch/guarddog-${slot}.raw.json"
-  if [[ "$cache_eligible" == "true" && -r "$cache_file" ]] \
-    && jq -e --argjson identity "$artifact_json" --arg scanner_version "$scanner_version" \
-      --arg profile "$(guarddog_active_profile)" '
+    [[ "$cache_eligible" == "true" && -r "$cache_file" ]] || return 1
+    jq -e --argjson identity "$artifact_json" --arg scanner_version "$scanner_version" \
+      --arg profile "$attempt_profile" '
       .schema == 1 and .identity == $identity
       and .scanner == {name:"guarddog",version:$scanner_version,profile:$profile}
       and (.result | type == "object")
     ' "$cache_file" >/dev/null 2>&1 \
-    && jq -c '.result' "$cache_file" > "$raw" \
-    && guarddog_result_shape_valid "$raw" \
-    && jq -e '(.errors | length) == 0' "$raw" >/dev/null 2>&1; then
-    guarddog_record_from_raw "$raw" "$version" true true "$artifact_json" "$scanner_version" "" "$output"
-    return 0
-  fi
+      && jq -c '.result' "$cache_file" > "$raw" \
+      && guarddog_result_shape_valid "$raw" \
+      && jq -e '(.errors | length) == 0' "$raw" >/dev/null 2>&1
+  }
 
-  local cli_ecosystem="$ecosystem" stderr_file="$scratch/guarddog-${slot}.stderr" rc=0
-  [[ "$ecosystem" == "python" ]] && cli_ecosystem="pypi"
-  local -a sandbox_flag=()
-  [[ "$GUARDDOG_SANDBOX_MODE" == "off" ]] && sandbox_flag=(--no-sandbox)
   guarddog_run_scan() {
+    local -a sandbox_flag=()
+    [[ "$attempt_kind" == "nosandbox" ]] && sandbox_flag=(--no-sandbox)
+    local remaining=$(( scan_deadline - $(date +%s) ))
     rc=0
-    timeout --kill-after=2s "$budget" bash -c \
+    if (( remaining <= 0 )); then
+      rc=124
+      : > "$raw"
+      printf 'guarddog scan budget exhausted before this attempt\n' > "$stderr_file"
+      return 0
+    fi
+    timeout --kill-after=2s "$remaining" bash -c \
       'ulimit -f "$1" || exit 125; shift; exec "$@"' \
       safe-guarddog "$GUARDDOG_OUTPUT_LIMIT_KIB" \
       env "${GUARDDOG_ENV_UNSET[@]}" "$guarddog_cmd" "$cli_ecosystem" scan "$name" \
       --version "$version" --output-format=json ${sandbox_flag[@]+"${sandbox_flag[@]}"} \
       > "$raw" 2> "$stderr_file" </dev/null || rc=$?
   }
+
+  if guarddog_attempt_prepare; then
+    guarddog_record_from_raw "$raw" "$version" true true "$artifact_json" "$scanner_version" "" "$output"
+    return 0
+  fi
   guarddog_run_scan
+
   # Sandbox fallback (operator-configurable, default auto): GuardDog refuses
   # to scan when the kernel sandbox is unavailable, and on some hosts its
   # Landlock child cannot even start — which yields ZERO behavioral coverage
-  # rather than weaker coverage. In auto mode the retry runs with
-  # --no-sandbox, is loudly disclosed, and is bound to a DIFFERENT cache
-  # profile so it can never replay as a sandboxed result. mode=required
-  # keeps the hard failure; mode=off never sandboxes.
-  if [[ "$GUARDDOG_SANDBOX_MODE" == "auto" && ${#sandbox_flag[@]} -eq 0 ]] \
+  # rather than weaker coverage. The retry is bound to a DIFFERENT cache
+  # profile so it can never replay as a sandboxed result, and it NEVER runs
+  # over a shape-valid result: a partial scan that retained real findings
+  # (including a high-risk BLOCK) must not be discarded because its error
+  # text happened to mention the sandbox (delta-2 F6). mode=required keeps
+  # the hard failure; mode=off never sandboxes.
+  if [[ "$GUARDDOG_SANDBOX_MODE" == "auto" && "$attempt_kind" == "sandbox" ]] \
+    && ! { (( rc == 0 )) && guarddog_result_shape_valid "$raw"; } \
     && guarddog_scan_sandbox_failed "$raw" "$stderr_file" "$rc"; then
-    sandbox_flag=(--no-sandbox)
+    attempt_kind="nosandbox"
     GUARDDOG_SANDBOX_FELL_BACK=1
-    cache_key=""
-    cache_file=""
-    cache_eligible=false
-    if [[ -n "$artifact_json" && "$artifact_json" != "null" && -n "$scanner_version" ]] \
-      && cache_key=$(GUARDDOG_CACHE_PROFILE="$GUARDDOG_CACHE_PROFILE_NOSANDBOX" \
-        guarddog_cache_key "$artifact_json" "$scanner_version" "$key_material" 2>/dev/null) \
-      && [[ -n "$cache_key" ]]; then
-      cache_eligible=true
-      cache_file="$GUARDDOG_CACHE_DIR/${cache_key}.json"
+    if guarddog_attempt_prepare; then
+      guarddog_record_from_raw "$raw" "$version" true true "$artifact_json" "$scanner_version" "" "$output"
+      return 0
     fi
     guarddog_run_scan
   fi
+
   if (( rc != 0 )); then
     local failure_note
     local raw_size stderr_size output_limit_bytes=$((GUARDDOG_OUTPUT_LIMIT_KIB * 1024))
@@ -5275,7 +5310,7 @@ guarddog_scan_one_json() {
       cache_tmp=$(mktemp "$GUARDDOG_CACHE_DIR/.guarddog.XXXXXX" 2>/dev/null || true)
       if [[ -n "$cache_tmp" ]] \
         && jq -n --argjson identity "$artifact_json" --arg scanner_version "$scanner_version" \
-          --arg profile "$(guarddog_active_profile)" \
+          --arg profile "$attempt_profile" \
           --slurpfile result "$raw" '
           {schema:1,scanner:{name:"guarddog",version:$scanner_version,profile:$profile},
            identity:$identity,result:($result[0] // {})}' > "$cache_tmp" \
@@ -8170,7 +8205,17 @@ check_command() {
         if [[ "$auto_allow" == "true" ]] && (( resolution_ok )); then
           local guarddog_reason
           case "$guarddog_status" in
-            ok) guarddog_reason="guarddog_clean_for_versions" ;;
+            ok)
+              # Provenance must survive into recorded evidence: a clean
+              # verdict produced without the kernel sandbox is not the same
+              # evidence as a sandboxed one (delta-2 F9).
+              if [[ "$(jq -r '.sandbox.fell_back // false' "$guarddog_json" 2>/dev/null)" == "true" \
+                || "$(jq -r '.sandbox.mode // ""' "$guarddog_json" 2>/dev/null)" == "off" ]]; then
+                guarddog_reason="guarddog_clean_for_versions_nosandbox"
+              else
+                guarddog_reason="guarddog_clean_for_versions"
+              fi
+              ;;
             disabled) guarddog_reason="guarddog_disabled" ;;
             not_applicable) guarddog_reason="guarddog_not_applicable" ;;
             skipped) guarddog_reason="guarddog_skipped_not_installed" ;;
