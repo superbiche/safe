@@ -644,6 +644,25 @@ case_value_flag_consumes_its_value() {
   pass "$FUNCNAME"
 }
 
+case_uv_python_selector_not_a_package() {
+  prepare_case "uv-python-selector-not-a-package"
+  # --python/-p selects an interpreter; its value ("3.12") must never be
+  # collected as a package spec — that produced a false unresolvable-package
+  # refusal on `uv tool install guarddog==3.1.0 --python 3.12` (live
+  # 2026-08-03). The real package must still be audited.
+  SAFE_INSTALL_TEST_SCRIPT='uv tool install --python 3.12 okpkg==1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'AUDIT\tcheck\t3.12' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='uv tool install okpkg==1.0.0 --python 3.12' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'AUDIT\tcheck\t3.12' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='uv tool install --python=3.12 -p 3.12 okpkg==1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'AUDIT\tcheck\t3.12' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_unknown_leading_flag_fails_closed() {
   prepare_case "unknown-leading-flag-fails-closed"
   # An unrecognized space-form leading flag is ambiguous → refuse (exit 100),
@@ -3394,6 +3413,7 @@ main() {
     case_leading_global_flag_gates_yarn_add \
     case_leading_global_flag_gates_uv_tool_run \
     case_value_flag_consumes_its_value \
+    case_uv_python_selector_not_a_package \
     case_unknown_leading_flag_fails_closed \
     case_unknown_leading_flag_eqform_escapes \
     case_leading_flag_benign_command_passes \

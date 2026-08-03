@@ -1152,15 +1152,18 @@ safe_gate_python_packages() {
       -r|--requirement|--requirement=*|-e|--editable|--editable=*)
         return 1
         ;;
-      -c|--constraint|-i|--index-url|--index|--default-index|--extra-index-url|--find-links|--trusted-host|--platform|--python-version|--implementation|--abi|--target|--prefix|--src|--upgrade-strategy|--config-settings|-C)
+      -c|--constraint|-i|--index-url|--index|--default-index|--extra-index-url|--find-links|--trusted-host|--platform|--python-version|--implementation|--abi|--target|--prefix|--src|--upgrade-strategy|--config-settings|-C|--python|-p)
         # -i/--index/--default-index take a value: dropping it made the URL
         # look like a package spec and fail-opened the extractor (PR#30
         # review finding 1 sibling). The selector itself is threaded to the
         # audit by safe_gate_scan_target_flags.
+        # --python/-p (uv everywhere, pip >= 23): interpreter selector whose
+        # value ("3.12") otherwise reads as a package positional and turns
+        # the invocation into a false refusal for an unresolvable package.
         skip_next=1
         continue
         ;;
-      --constraint=*|--index-url=*|--index=*|--default-index=*|--extra-index-url=*|--find-links=*|--trusted-host=*|--platform=*|--python-version=*|--implementation=*|--abi=*|--target=*|--prefix=*|--src=*|--upgrade-strategy=*|--config-settings=*)
+      --constraint=*|--index-url=*|--index=*|--default-index=*|--extra-index-url=*|--find-links=*|--trusted-host=*|--platform=*|--python-version=*|--implementation=*|--abi=*|--target=*|--prefix=*|--src=*|--upgrade-strategy=*|--config-settings=*|--python=*)
         continue
         ;;
       --upgrade|-U|--force-reinstall|--ignore-installed|--user|--break-system-packages|--no-deps|--pre)
