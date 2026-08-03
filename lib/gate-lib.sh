@@ -2213,7 +2213,11 @@ safe_gate_mise_env_overlay() {
   json="$("$mise_real" "$@" env --json 2>/dev/null)" || return 1
   printf '%s' "$json" | jq -r '
     def relevant:
-      (test("^(npm_config_|NPM_CONFIG_)"))
+      # npm parses npm_config_* env keys case-insensitively: the collector
+      # must too, or a mixed-case [env] key (a valid identifier mise will
+      # export) slips past the script-policy refusal while npm honors it
+      # (PR#52 delta-3 finding F3).
+      (test("^npm_config_"; "i"))
       or IN("PIP_INDEX_URL","PIP_EXTRA_INDEX_URL","PIP_FIND_LINKS",
             "PIP_NO_INDEX","PIP_CONFIG_FILE","UV_INDEX_URL",
             "UV_DEFAULT_INDEX","UV_INDEX","UV_EXTRA_INDEX_URL",

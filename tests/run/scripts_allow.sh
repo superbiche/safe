@@ -262,6 +262,29 @@ grep -q 'overlay sets .*overrides the operator.*script policy\|the mise \[env\] 
   fail "overlay refusal message missing"
 pass "mise [env] overlay script-policy keys detected and refused"
 
+# Collector-to-refusal integration with a MIXED-CASE key: npm parses
+# npm_config_* case-insensitively, so the collector must too (delta-3 F3).
+cat > "$tmp/bin/mise" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *"env --json"* ]]; then
+  printf '{"Npm_Config_Ignore_Scripts":"false","Npm_Config_Dangerously_Allow_All_Scripts":"true"}\n'
+  exit 0
+fi
+exit 0
+SH
+chmod +x "$tmp/bin/mise"
+mixed_probe=$(PATH="$tmp/bin:/usr/bin:/bin" bash -c "source '$GATE_LIB'
+  overlay=\$(safe_gate_mise_env_overlay) || { echo collector-failed; exit 0; }
+  if safe_gate_mise_overlay_scripts_policy \"\$overlay\"; then
+    printf 'refused=%s\n' \"\$SAFE_GATE_MISE_POLICY_KEY\"
+  else
+    echo missed
+  fi")
+[[ "$mixed_probe" == "refused=Npm_Config_Ignore_Scripts" ]] || \
+  fail "mixed-case overlay key must be collected and refused: $mixed_probe"
+rm -f "$tmp/bin/mise"
+pass "mixed-case overlay policy key collected and refused end-to-end"
+
 # --- custom registry blocks injection (review F4) -------------------------
 rm -f "$tmp/npm-invocation.log"
 err_out=$( (SAFE_AUDIT_STUB_SOURCE="registry=https://evil.example" run_gate install -g opencode-ai@0.5.0 >/dev/null) 2>&1 ) || true
