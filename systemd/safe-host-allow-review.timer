@@ -1,0 +1,9 @@
+[Unit]
+Description=Weekly safe host-allow staleness review
+
+[Timer]
+OnCalendar=Mon *-*-* 09:17
+Persistent=true
+
+[Install]
+WantedBy=timers.target
