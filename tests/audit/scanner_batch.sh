@@ -366,20 +366,81 @@ case_hostile_advisory_ids_fail_closed() {
   # rejected before URL or output construction.
   setup_case hostile
   local shape rc out ok=1
-  for shape in '{"results":[{"vulns":[{"id":".."}]}]}' '{"results":[{"vulns":[{"id":"MAL-../bad"}]}]}'; do
+  # Embedded-newline ids included (delta-2 F14): the id shape is enforced
+  # inside the schema validator, never by a line-oriented loop that would
+  # validate fragments separately.
+  for shape in '{"results":[{"vulns":[{"id":".."}]}]}' '{"results":[{"vulns":[{"id":"MAL-../bad"}]}]}' '{"results":[{"vulns":[{"id":"MAL-good\nMAL-bad"}]}]}'; do
     MOCK_BATCH_FIXTURE="$FIXDIR/batch-hostile.json"
     printf '%s\n' "$shape" > "$MOCK_BATCH_FIXTURE"
     rc=0
     out=$(printf '{"packages":[{"name":"mmm","version":"1.0.0"}]}' | run_batch 2>"$TEST_ROOT/hostile.err") || rc=$?
-    if [[ "$rc" != "4" || -n "$out" ]] || ! grep -q "malformed advisory id" "$TEST_ROOT/hostile.err"; then
+    if [[ "$rc" != "4" || -n "$out" ]] || ! grep -q "audit-infrastructure breakage" "$TEST_ROOT/hostile.err"; then
       printf 'shape=%s rc=%s out=%s\n' "$shape" "$rc" "$out" >&2
       ok=0
     fi
   done
   if [[ "$ok" == "1" ]]; then
-    pass "hostile advisory ids (dot sentinels, malformed MAL) fail closed"
+    pass "hostile advisory ids (dot sentinels, malformed MAL, embedded newline) fail closed"
   else
-    fail "hostile advisory ids (dot sentinels, malformed MAL) fail closed"
+    fail "hostile advisory ids (dot sentinels, malformed MAL, embedded newline) fail closed"
+  fi
+}
+
+case_multidoc_raw_page_fails_closed() {
+  # PR#64 delta-2 F13: the shared paginated /v1/query helper must reject a
+  # JSON stream page — plain jq validated the tail while the merge slurped
+  # only the first document, silently dropping the later advisory.
+  setup_case rawmultidoc
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-rawmd.json"
+  printf '{"results": [{"next_page_token": "tok"}]}\n' > "$MOCK_BATCH_FIXTURE"
+  MOCK_QUERY_FIXTURE="$FIXDIR/query-rawmd.json"
+  printf '{"vulns": []}\n{"vulns": [{"id": "GHSA-paged-drop-0016"}]}\n' > "$MOCK_QUERY_FIXTURE"
+  local rc=0 out
+  out=$(printf '{"packages":[{"name":"uuu","version":"1.0.0"}]}' | run_batch 2>"$TEST_ROOT/rawmd.err") || rc=$?
+  if [[ "$rc" == "4" && -z "$out" ]] && grep -q "OSV pagination re-query failed" "$TEST_ROOT/rawmd.err"; then
+    pass "multi-document raw /v1/query page fails closed through the shared helper"
+  else
+    printf 'rc=%s out=%s err=%s\n' "$rc" "$out" "$(cat "$TEST_ROOT/rawmd.err")" >&2
+    fail "multi-document raw /v1/query page fails closed through the shared helper"
+  fi
+}
+
+case_shared_advisory_scopes_per_package() {
+  # One advisory affecting two queried packages classifies each by its own
+  # affected entry (delta-2 verified this manually; pin it).
+  setup_case sharedid
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-sharedid.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-shared-0017"}]}, {"vulns": [{"id": "GHSA-shared-0017"}]}]}\n' > "$MOCK_BATCH_FIXTURE"
+  cat > "$FIXDIR/vuln-GHSA-shared-0017.json" <<'JSON'
+{"id": "GHSA-shared-0017",
+ "affected": [
+   {"package": {"ecosystem": "npm", "name": "vvv"},
+    "ecosystem_specific": {"severity": "LOW"}},
+   {"package": {"ecosystem": "npm", "name": "www"},
+    "ecosystem_specific": {"severity": "CRITICAL"}}
+ ]}
+JSON
+  local rc=0 out
+  out=$(printf '{"packages":[{"name":"vvv","version":"1.0.0"},{"name":"www","version":"2.0.0"}]}' | run_batch) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e '[.[] | select(.package == "vvv")][0].level == "warn"' <<<"$out" >/dev/null \
+    && jq -e '[.[] | select(.package == "www")][0].level == "fatal"' <<<"$out" >/dev/null; then
+    pass "one advisory shared by two packages scopes severity per package"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "one advisory shared by two packages scopes severity per package"
+  fi
+}
+
+case_whitespace_package_names_refused() {
+  setup_case wsnames
+  local rc=0 err
+  err=$(printf '{"packages":[{"name":"evil\\ngood","version":"1.0.0"}]}' | run_batch 2>&1 >/dev/null) || rc=$?
+  if [[ "$rc" == "2" && "$err" == *"malformed input"* ]]; then
+    pass "whitespace/control characters in package names are refused at the door"
+  else
+    printf 'rc=%s err=%s\n' "$rc" "$err" >&2
+    fail "whitespace/control characters in package names are refused at the door"
   fi
 }
 
@@ -639,6 +700,31 @@ STUB
   fi
 }
 
+case_adapter_rejects_malformed_advisory_elements() {
+  local node; node=$(node_bin) || { pass "adapter element shape (SKIPPED: node not available)"; return; }
+  adapter_driver
+  local shape out rc ok=1
+  for shape in '{}' '[42]' '[{"level":"fatal"}]'; do
+    cat > "$MOCKBIN/safe-audit-stub" <<STUB
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' '$shape'
+STUB
+    chmod +x "$MOCKBIN/safe-audit-stub"
+    rc=0
+    out=$(SAFE_AUDIT_BIN="$MOCKBIN/safe-audit-stub" "$node" "$TEST_ROOT/driver.mjs" 2>&1) || rc=$?
+    if [[ "$rc" == "0" ]] || [[ "$out" != *"non-array payload"* && "$out" != *"malformed advisory element"* ]]; then
+      printf 'shape=%s rc=%s out=%s\n' "$shape" "$rc" "$out" >&2
+      ok=0
+    fi
+  done
+  if [[ "$ok" == "1" ]]; then
+    pass "adapter rejects non-array payloads and malformed advisory elements"
+  else
+    fail "adapter rejects non-array payloads and malformed advisory elements"
+  fi
+}
+
 case_adapter_throws_on_missing_binary() {
   local node; node=$(node_bin) || { pass "adapter ENOENT (SKIPPED: node not available)"; return; }
   adapter_driver
@@ -726,10 +812,14 @@ case_severity_scoped_to_queried_package
 case_numeric_detail_id_fails_closed
 case_blocklist_entry_schema_fails_closed
 case_same_name_different_versions_stay_distinct
+case_multidoc_raw_page_fails_closed
+case_shared_advisory_scopes_per_package
+case_whitespace_package_names_refused
 case_gate_injects_scanner_env
 case_adapter_maps_advisories
 case_adapter_throws_on_nonzero_exit
 case_adapter_throws_on_malformed_payload
+case_adapter_rejects_malformed_advisory_elements
 case_adapter_throws_on_missing_binary
 case_adapter_times_out_hung_child
 case_adapter_rejects_partial_request_channel

@@ -3301,5 +3301,24 @@ if expect_no_grep "$OUT_FILE" "PASS \(not blocked\)" "unreadable blocklist never
 fi
 
 # ---------------------------------------------------------------------------
+# Parseable blocklist with a non-object ENTRY -> same WARN, never a silent
+# miss through `.packages[$p] // empty` (PR#64 delta-1 F4 residual).
+# ---------------------------------------------------------------------------
+prepare_case blocklist-entry-corrupt
+printf '{"packages": {"brace-expansion": ""}}\n' > "$CASE_RUN_CONFIG/blocked.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm
+if expect_status 10 "non-object blocklist entry demotes clean check to WARN"; then
+  pass "non-object blocklist entry demotes clean check to WARN"
+fi
+if expect_grep "$OUT_FILE" "blocklist file unreadable" "non-object blocklist entry names its cause"; then
+  pass "non-object blocklist entry names its cause"
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

@@ -93,6 +93,16 @@ export const scanner = {
     if (!Array.isArray(advisories)) {
       throw new Error("safe-audit scanner-batch returned a non-array payload");
     }
+    for (const advisory of advisories) {
+      if (
+        typeof advisory !== "object" ||
+        advisory === null ||
+        typeof advisory.level !== "string" ||
+        typeof advisory.package !== "string"
+      ) {
+        throw new Error("safe-audit scanner-batch returned a malformed advisory element");
+      }
+    }
     return advisories;
   },
 };

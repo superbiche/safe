@@ -5613,6 +5613,15 @@ osv_query_package_json() {
       jq -cn --argjson v "$vulns" '{status:"error",note:"OSV query failed",vulns:$v}' > "$output"
       return 0
     fi
+    # A JSON stream is a malformed response: plain jq validates every
+    # document and reports the last one's status while the merge below
+    # slurps only the first — later documents' advisories would vanish
+    # into a clean answer (PR#64 delta-2 F13; same class as the
+    # querybatch/detail guards).
+    if ! jq -es 'length == 1' "$output.raw" >/dev/null 2>&1; then
+      jq -cn --argjson v "$vulns" '{status:"error",note:"OSV response is not a single JSON document",vulns:$v}' > "$output"
+      return 0
+    fi
     # Validation is two-stage with the merge in between (delta-2 F1): the
     # vulns payload is judged first, its records merged into the
     # accumulator, and only THEN is the pagination token judged — so a
@@ -9920,12 +9929,19 @@ binary_exec_command() {
 scanner_batch_command() {
   local input
   input=$(cat 2>/dev/null) || input=""
+  # Names and versions must be whitespace/control-free: they travel through
+  # line-oriented read loops (blocklist names, per-package severity scoping)
+  # and into advisory descriptions, where an embedded newline would split
+  # one value into separately-processed fragments — the same fragment
+  # defect class as delta-2 F14.
   if ! jq -e '
     (.packages | type == "array") and (.packages | length > 0)
     and ([.packages[]
           | (type == "object")
             and ((.name? | type) == "string") and (.name | length > 0)
-            and ((.version? | type) == "string") and (.version | length > 0)]
+            and ((.name | test("[[:space:][:cntrl:]]")) | not)
+            and ((.version? | type) == "string") and (.version | length > 0)
+            and ((.version | test("[[:space:][:cntrl:]]")) | not)]
          | all)
   ' <<<"$input" >/dev/null 2>&1; then
     printf 'safe audit: scanner-batch: malformed input — expected {"packages":[{"name":…,"version":…},…]} on stdin\n' >&2
@@ -10000,7 +10016,8 @@ scanner_batch_command() {
                    or (.vulns | (type == "array")
                        and ([.[] | (type == "object")
                              and ((.id? | type) == "string")
-                             and (.id | length > 0)] | all)))
+                             and (.id | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))
+                             and ((.id | test("[\\n\\r]")) | not)] | all)))
               and ((has("next_page_token") | not)
                    or (.next_page_token | (type == "string") and (length > 0)
                        and test("^[[:graph:]]+$")))
@@ -10034,7 +10051,10 @@ scanner_batch_command() {
     # stringified warning (PR#64 delta F11).
     if ! jq -e '
       (.vulns // []) | (type == "array")
-      and ([.[] | (type == "object") and ((.id? | type) == "string") and (.id | length > 0)] | all)
+      and ([.[] | (type == "object")
+            and ((.id? | type) == "string")
+            and (.id | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))
+            and ((.id | test("[\\n\\r]")) | not)] | all)
     ' "$pagefile" >/dev/null 2>&1; then
       printf 'safe audit: scanner-batch: malformed paginated OSV response for %s — audit-infrastructure breakage, not a package finding\n' "$pkg_name" >&2
       return 4
@@ -10043,18 +10063,12 @@ scanner_batch_command() {
       '.[$i].res = {vulns: ($p[0].vulns // [])}' <<<"$paired")
   done < <(jq -r 'to_entries[] | select(.value.res.next_page_token? | strings | length > 0) | .key' <<<"$paired")
 
-  # Every advisory id — MAL-* included — is validated before any use: ids
-  # reach a URL path and the output advisories, and the previous guard both
-  # allowed dot-only sentinels ("..") and never saw MAL ids at all (PR#64
-  # review F7). Leading alnum excludes "." and ".."; the class excludes
-  # slashes, escapes, whitespace, and controls.
-  local id
-  while IFS= read -r id; do
-    if ! [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-      printf 'safe audit: scanner-batch: malformed advisory id in OSV response — audit-infrastructure breakage, not a package finding\n' >&2
-      return 4
-    fi
-  done < <(jq -r '[.[].res.vulns[]? | .id] | unique | .[]' <<<"$paired")
+  # Advisory-id shape — MAL-* included — is enforced INSIDE the two schema
+  # validators above (batch entries and pagination replacements): a
+  # line-oriented bash loop over `jq -r` output validated embedded-newline
+  # ids as separately valid fragments (PR#64 delta-2 F14). Every id that
+  # reaches this point matches ^[A-Za-z0-9][A-Za-z0-9._-]*$ with no
+  # CR/LF, so URL and output construction below are safe by construction.
 
   # Severity classification needs full records; querybatch returns only ids.
   # MAL-* ids are known-malware and need no fetch. Everything else is
