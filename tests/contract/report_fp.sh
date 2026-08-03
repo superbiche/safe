@@ -223,6 +223,27 @@ case_socket_failure_text_is_not_copied_into_the_note() {
   pass "$FUNCNAME"
 }
 
+case_deliberate_socket_skip_is_not_reported_as_a_failure() {
+  # A tier-3 policy skip carries available:null/status:skipped_tier3. Calling
+  # that "the check failed" would send the operator chasing a Socket outage
+  # that never happened (PR#60 review F3).
+  local repo; repo="$(new_repo repo-socket-skip)"
+  jq '.socket = {"available": null, "status": "skipped_tier3",
+        "note": "tier 3 — behavioral verdict from GuardDog; not consulted"}' \
+    < "$TEST_ROOT/payload.json" > "$TEST_ROOT/socket-skip.json"
+  STUB_PAYLOAD="$TEST_ROOT/socket-skip.json" run_report_fp "$repo" demo >/dev/null 2>&1 || true
+  local note
+  note="$(find "$repo/inbox" -name '*.md' -type f | head -1)"
+  [[ -n "$note" ]] || { fail "$FUNCNAME (no note)"; return; }
+  grep -Fq 'deliberately not consulted' "$note" \
+    || { fail "$FUNCNAME (skip not described as deliberate)"; return; }
+  if grep -Fq 'the check failed' "$note"; then
+    fail "$FUNCNAME (policy skip described as a failure)"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
 case_unreadable_check_output_writes_nothing() {
   # Half a report is worse than none: it would look like adjudicable evidence.
   local repo; repo="$(new_repo repo-garbage)"
@@ -380,6 +401,7 @@ case_scoped_spec_slug_is_filesystem_safe
 case_valid_but_wrong_shape_output_writes_nothing
 case_dangling_symlink_at_the_note_path_is_not_followed
 case_socket_failure_text_is_not_copied_into_the_note
+case_deliberate_socket_skip_is_not_reported_as_a_failure
 case_unreadable_check_output_writes_nothing
 case_hundredth_note_is_allowed
 case_exhausted_names_leave_no_note_and_no_temp

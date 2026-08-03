@@ -63,7 +63,13 @@ case "$url" in
         ;;
       *)
         if [[ "${MOCK_PACKUMENT_MODE:-single}" == "multi" ]]; then
-          emit '{"dist-tags":{"latest":"2.5.0"},"versions":{"1.0.0":{},"1.5.0":{},"2.0.0":{},"2.5.0":{}}}'
+          if [[ -n "${MOCK_NPM_TIME_MULTI:-}" ]]; then
+            emit "{\"dist-tags\":{\"latest\":\"2.5.0\"},\"versions\":{\"1.0.0\":{},\"1.5.0\":{},\"2.0.0\":{},\"2.5.0\":{}},\"time\":{\"1.5.0\":\"${MOCK_NPM_TIME_MULTI%%|*}\",\"2.5.0\":\"${MOCK_NPM_TIME_MULTI##*|}\"}}"
+          else
+            emit '{"dist-tags":{"latest":"2.5.0"},"versions":{"1.0.0":{},"1.5.0":{},"2.0.0":{},"2.5.0":{}}}'
+          fi
+        elif [[ -n "${MOCK_NPM_TIME:-}" ]]; then
+          emit "{\"dist-tags\":{\"latest\":\"1.0.0\"},\"versions\":{\"1.0.0\":{}},\"time\":{\"1.0.0\":\"${MOCK_NPM_TIME}\"}}"
         else
           emit '{"dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{}}}'
         fi
@@ -72,7 +78,22 @@ case "$url" in
     ;;
   *pypi.org/pypi/*)
     digest="${MOCK_PYPI_DIGEST:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
-    emit "{\"info\":{\"version\":\"1.0.0\"},\"releases\":{\"1.0.0\":[{\"filename\":\"demo-1.0.0.metadata\",\"digests\":{\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}},{\"filename\":\"demo-1.0.0-py3-none-any.whl\",\"digests\":{\"sha256\":\"$digest\"},\"url\":\"https://files.pythonhosted.org/demo.whl\"}]}}"
+    case "$url" in
+      */1.0.0/json)
+        # Per-version endpoint (release-age lookup): .urls carries one entry
+        # per distribution file, each with its own upload time.
+        old_up="${MOCK_PYPI_UPLOAD_OLD:-}"
+        new_up="${MOCK_PYPI_UPLOAD_NEW:-}"
+        if [[ -z "$old_up" && -z "$new_up" ]]; then
+          emit '{"info":{"version":"1.0.0"},"urls":[]}'
+        else
+          emit "{\"info\":{\"version\":\"1.0.0\"},\"urls\":[{\"filename\":\"demo-1.0.0.tar.gz\",\"upload_time_iso_8601\":\"${old_up:-$new_up}\"},{\"filename\":\"demo-1.0.0-py3-none-any.whl\",\"upload_time_iso_8601\":\"${new_up:-$old_up}\"}]}"
+        fi
+        ;;
+      *)
+        emit "{\"info\":{\"version\":\"1.0.0\"},\"releases\":{\"1.0.0\":[{\"filename\":\"demo-1.0.0.metadata\",\"digests\":{\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}},{\"filename\":\"demo-1.0.0-py3-none-any.whl\",\"digests\":{\"sha256\":\"$digest\"},\"url\":\"https://files.pythonhosted.org/demo.whl\"}]}}"
+        ;;
+    esac
     ;;
   *) exit 22 ;;
 esac
@@ -81,6 +102,7 @@ chmod +x "$COMMONBIN/curl"
 
 cat > "$COMMONBIN/socket" <<'MOCK'
 #!/usr/bin/env bash
+[[ -n "${MOCK_SOCKET_ARGS_LOG:-}" ]] && printf '%s\n' "$*" >> "$MOCK_SOCKET_ARGS_LOG"
 if [[ "${MOCK_SOCKET_MODE:-ok}" == "error" ]]; then
   printf 'socket backend failed\n' >&2
   exit 1
@@ -124,10 +146,28 @@ if [[ "${1:-}" == "--version" ]]; then
       while :; do printf '0123456789abcdef'; done
       ;;
   esac
-  printf 'guarddog, version %s\n' "${MOCK_GUARDDOG_VERSION:-3.1.0}"
+  if [[ "${MOCK_GUARDDOG_VERSION_SPELLING:-click}" == "bare" ]]; then
+    printf '%s\n' "${MOCK_GUARDDOG_VERSION:-3.1.0}"
+  else
+    printf 'guarddog, version %s\n' "${MOCK_GUARDDOG_VERSION:-3.1.0}"
+  fi
   exit 0
 fi
 [[ -n "${MOCK_GUARDDOG_LOG:-}" ]] && printf '%s\n' "$*" >> "$MOCK_GUARDDOG_LOG"
+no_sandbox=0
+for a in "$@"; do [[ "$a" == "--no-sandbox" ]] && no_sandbox=1; done
+broken_for_version=0
+[[ "${MOCK_GUARDDOG_SANDBOX_BROKEN:-0}" == "1" ]] && broken_for_version=1
+if [[ -n "${MOCK_GUARDDOG_SANDBOX_BROKEN_VERSION:-}" ]]; then
+  broken_for_version=0
+  for a in "$@"; do
+    [[ "$a" == "${MOCK_GUARDDOG_SANDBOX_BROKEN_VERSION}" ]] && broken_for_version=1
+  done
+fi
+if [[ "$broken_for_version" == "1" && "$no_sandbox" == "0" ]]; then
+  printf '{"package": "demo", "issues": 0, "errors": {"download-package": "Sandboxed extraction failed: no entropy"}}\n'
+  exit 0
+fi
 scan_version=""
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
@@ -137,6 +177,31 @@ for ((i = 0; i < ${#args[@]}; i++)); do
   fi
 done
 case "${MOCK_GUARDDOG_MODE:-clean}" in
+  valid-block-with-sandbox-text)
+    # Shape-valid, retains a high_risk finding, AND carries an error value
+    # containing a fallback marker. The sandboxed attempt must stand.
+    if [[ "$no_sandbox" == "1" ]]; then
+      printf '{"package":"demo","issues":0,"errors":{},"results":{},"risk_score":{"score":0,"label":"no_risks_detected","findings_count":0,"score_breakdown":{}},"risks":[]}\n'
+    else
+      printf '{"package":"demo","issues":1,"errors":{"metadata_mismatch":"--no-sandbox"},"results":{},"risk_score":{"score":9,"label":"high_risk","findings_count":1,"score_breakdown":{}},"risks":[{"threat_rule":"threat-exfiltrate-secrets","capability_rule":null}]}\n'
+    fi
+    exit 0
+    ;;
+  slow-then-sandbox-fail)
+    # Consumes most of the budget, THEN reports a sandbox failure.
+    if [[ "$no_sandbox" == "1" ]]; then
+      sleep 30
+      exit 0
+    fi
+    sleep 2
+    printf '{"package": "demo", "issues": 0, "errors": {"download-package": "Sandboxed extraction failed: no entropy"}}\n'
+    exit 0
+    ;;
+  scan-error-shape)
+    # GuardDog's real failure shape: no risk fields, cause in .errors.
+    printf '{"package": "demo", "issues": 0, "errors": {"download-package": "Sandboxed extraction failed: no entropy"}}\n'
+    exit 0
+    ;;
   clean)
     printf '{"issues":0,"errors":{},"results":{},"risk_score":{"score":0.0,"label":"no_risks_detected","findings_count":0,"score_breakdown":{}},"risks":[]}\n'
     ;;
@@ -704,6 +769,532 @@ if jq -e '.environment.guarddog.cli_present == true and .environment.guarddog.ve
 else
   printf '%s\n' "$doctor_json" >&2
   fail "safe doctor rejects a valid-prefix flooding probe that does not exit cleanly"
+fi
+
+# --- tier-3 socket decision --------------------------------------------------
+
+# A clean GuardDog verdict makes Socket unnecessary: it is not consulted at
+# all, so a Socket outage cannot degrade the check (the tiered-scoring
+# headline). The recorded evidence says skipped, never ok.
+prepare_case tier3-skip-on-clean
+run_check 1 MOCK_SOCKET_MODE=error MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "clean GuardDog verdict gates GO with Socket broken"
+expect_grep "$OUT_FILE" '^Socket:      SKIP \(tier 3' "socket line reads as a deliberate tier-3 skip"
+if [[ ! -s "$CASE_DIR/socket-args.log" ]]; then
+  pass "socket is not invoked when the behavioral tier concluded"
+else
+  cat "$CASE_DIR/socket-args.log" >&2
+  fail "socket is not invoked when the behavioral tier concluded"
+fi
+if jq -e '.packages["npm:demo"].reasons | index("socket_skipped_tier3") != null and index("socket_ok") == null' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "install-known reasons record the tier-3 skip honestly"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2 || true
+  fail "install-known reasons record the tier-3 skip honestly"
+fi
+
+# Behavioral tier unavailable -> Socket is consulted (guarddog absent).
+prepare_case tier3-consult-when-missing
+run_check 0 MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "guarddog-missing check with Socket ok gates GO"
+expect_grep "$CASE_DIR/socket-args.log" '^package score npm demo@1\.0\.0' \
+  "socket is consulted when the behavioral tier did not run"
+
+# install.socket.mode=always restores always-on Socket beside a clean scan.
+prepare_case tier3-mode-always
+printf '{"install": {"socket": {"mode": "always"}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "mode=always with socket ok gates GO"
+expect_grep "$CASE_DIR/socket-args.log" '^package score npm demo@1\.0\.0' \
+  "mode=always consults socket despite a clean behavioral verdict"
+if jq -e '.packages["npm:demo"].reasons | index("socket_ok") != null' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "mode=always records socket_ok"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2 || true
+  fail "mode=always records socket_ok"
+fi
+
+# install.socket.mode=never disables Socket entirely, honestly recorded.
+prepare_case tier3-mode-never
+printf '{"install": {"socket": {"mode": "never"}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 0 MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "mode=never with no behavioral tier still gates GO by operator choice"
+expect_grep "$OUT_FILE" '^Socket:      SKIP \(disabled by install.socket.mode=never' \
+  "mode=never skip names the knob"
+if [[ ! -s "$CASE_DIR/socket-args.log" ]]; then
+  pass "mode=never never invokes socket"
+else
+  fail "mode=never never invokes socket"
+fi
+if jq -e '.packages["npm:demo"].reasons | index("socket_disabled") != null' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "mode=never records socket_disabled"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2 || true
+  fail "mode=never records socket_disabled"
+fi
+
+# --- release-age cooldown ----------------------------------------------------
+
+# Fresh release inside the cooldown -> WARN with the named override paths.
+prepare_case cooldown-too-new
+run_check 1 MOCK_NPM_TIME="$(date -d '1 day ago' -Is)" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 10 "release younger than the cooldown refuses at the gate"
+expect_grep "$OUT_FILE" '^Release age: WARN \(1\.0\.0 published [01]d ago' \
+  "release line names the version and age"
+expect_grep "$ERR_FILE" 'younger than the release cooldown' "cooldown hint printed"
+expect_grep "$ERR_FILE" 'release_too_new to install.auto_allow_tolerate' \
+  "cooldown hint names the tolerate override"
+if jq -e '.packages["npm:demo"]' "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  fail "cooldown WARN never records clean evidence"
+else
+  pass "cooldown WARN never records clean evidence"
+fi
+
+# Tolerating release_too_new allows the same check.
+prepare_case cooldown-tolerated
+printf '{"install": {"auto_allow_tolerate": ["release_too_new"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 MOCK_NPM_TIME="$(date -d '1 day ago' -Is)" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "tolerated cooldown WARN allows the exact version"
+
+# Old release passes; lookup failure skips with disclosure, never a WARN.
+prepare_case cooldown-old-release
+run_check 1 MOCK_NPM_TIME="$(date -d '30 days ago' -Is)" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "release older than the cooldown gates GO"
+expect_grep "$OUT_FILE" '^Release age: PASS \(published 30d ago\)' "age is reported"
+
+prepare_case cooldown-lookup-fails
+run_check 1 -- demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "missing publish date skips the cooldown without refusing"
+expect_grep "$OUT_FILE" '^Release age: SKIP \(publish date unavailable' \
+  "cooldown skip is disclosed"
+
+# cooldown_days=0 disables the check entirely (no line, no fetch dependency).
+prepare_case cooldown-disabled
+printf '{"install": {"cooldown_days": 0}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 MOCK_NPM_TIME="$(date -d '1 hour ago' -Is)" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "cooldown disabled ignores a brand-new release"
+if grep -q '^Release age:' "$OUT_FILE"; then
+  fail "no release-age line when the cooldown is disabled"
+else
+  pass "no release-age line when the cooldown is disabled"
+fi
+
+# --- review closures (PR#60 round 1) ----------------------------------------
+
+# F1: a PyPI release that gained a fresh wheel is as new as that wheel — an
+# old sdist in the same release must not lend it age.
+prepare_case cooldown-pypi-newest-file
+run_check 1 MOCK_PYPI_UPLOAD_OLD="$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%S.%6NZ)" \
+  MOCK_PYPI_UPLOAD_NEW="$(date -u -d '1 day ago' +%Y-%m-%dT%H:%M:%S.%6NZ)" -- \
+  demo@1.0.0 --ecosystem python --gate install
+expect_status 10 "newest PyPI distribution upload anchors the release age"
+expect_grep "$OUT_FILE" '^Release age: WARN' "fresh wheel beside an old sdist warns"
+
+prepare_case cooldown-pypi-all-old
+run_check 1 MOCK_PYPI_UPLOAD_OLD="$(date -u -d '40 days ago' +%Y-%m-%dT%H:%M:%S.%6NZ)" \
+  MOCK_PYPI_UPLOAD_NEW="$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%S.%6NZ)" -- \
+  demo@1.0.0 --ecosystem python --gate install
+expect_status 0 "a wholly old PyPI release passes the cooldown"
+
+# F2: learning that a pin is too new must revoke stale clean evidence, or the
+# timeout fallback would reuse the superseded GO.
+prepare_case cooldown-revokes-stale-go
+mkdir -p "$CASE_RUN_CONFIG"
+cat > "$CASE_RUN_CONFIG/install-known.json" <<'JSON'
+{"packages":{"npm:demo":{"version":"1.0.0","verdict":"GO","reasons":["osv_clean_for_version"],"evidence":"seeded","source":"implicit-default","first_allowed":"2026-08-01T00:00:00+02:00","last_used":"2026-08-01","times_used":1}}}
+JSON
+run_check 1 MOCK_NPM_TIME="$(date -d '1 day ago' -Is)" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 10 "cooldown WARN refuses despite a seeded clean entry"
+if jq -e '.packages["npm:demo"]' "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2
+  fail "cooldown WARN revokes the stale install-known GO"
+else
+  pass "cooldown WARN revokes the stale install-known GO"
+fi
+
+# Tolerating the cause must record WHAT was tolerated (not merely exit 0).
+prepare_case cooldown-tolerated-records-cause
+printf '{"install": {"auto_allow_tolerate": ["release_too_new"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 MOCK_NPM_TIME="$(date -d '1 day ago' -Is)" -- \
+  demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 0 "tolerated cooldown allows the exact version"
+expect_json '(.warn_causes | index("release_too_new") != null) and .verdict == "WARN"' \
+  "receipt still records the tolerated cooldown cause"
+if jq -e '.packages["npm:demo"] | .verdict == "WARN_TOLERATED"
+  and (.reasons | index("release_too_new") != null)' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "tolerated record is not disguised as clean evidence"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2 || true
+  fail "tolerated record is not disguised as clean evidence"
+fi
+
+# F3: a deliberate skip must never render as an outage on either surface.
+prepare_case tier3-skip-not-an-outage
+run_check 1 -- demo@1.0.0 --ecosystem npm
+expect_status 0 "clean tier-3 check succeeds"
+if grep -q 'socket CLI not available' "$OUT_FILE"; then
+  cat "$OUT_FILE" >&2
+  fail "tier-3 skip does not print the CLI-unavailable outage warning"
+else
+  pass "tier-3 skip does not print the CLI-unavailable outage warning"
+fi
+
+prepare_case tier3-never-not-an-outage
+printf '{"install": {"socket": {"mode": "never"}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 -- demo@1.0.0 --ecosystem npm
+if grep -q 'socket CLI not available' "$OUT_FILE"; then
+  fail "mode=never does not print the CLI-unavailable outage warning"
+else
+  pass "mode=never does not print the CLI-unavailable outage warning"
+fi
+
+# A genuinely absent CLI must still warn (the discriminator must not silence it).
+prepare_case socket-absent-still-warns
+printf '{"install": {"guarddog": {"enabled": false}}}\n' > "$CASE_RUN_CONFIG/config.json"
+(
+  cd "$CASE_DIR/project" || exit 99
+  env HOME="$CASE_HOME" PATH="/usr/bin:/bin" \
+    SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" \
+    SAFE_AUDIT_CONFIG_DIR="$CASE_DIR/audit-config" \
+    SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
+    "$SAFE_AUDIT" check demo@1.0.0 --ecosystem npm
+) > "$CASE_DIR/stdout.log" 2>&1 || true
+if grep -q 'socket CLI not available' "$CASE_DIR/stdout.log"; then
+  pass "a truly missing socket CLI still reports the outage"
+else
+  cat "$CASE_DIR/stdout.log" >&2
+  fail "a truly missing socket CLI still reports the outage"
+fi
+
+# F4: socket-consultation matrix across every GuardDog conclusiveness state.
+# ok -> skip; every other status -> consult.
+for gd_case in \
+  "clean:ok:skip" \
+  "error:error:consult" \
+  "partial-block:partial:consult"
+do
+  gd_mode="${gd_case%%:*}"
+  rest="${gd_case#*:}"
+  gd_status="${rest%%:*}"
+  expectation="${rest##*:}"
+  prepare_case "tier3-matrix-$gd_mode"
+  run_check 1 MOCK_GUARDDOG_MODE="$gd_mode" MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+    demo@1.0.0 --ecosystem npm --json
+  if jq -e --arg s "$gd_status" '.guarddog.status == $s' "$OUT_FILE" >/dev/null 2>&1; then
+    pass "matrix $gd_mode yields guarddog status $gd_status"
+  else
+    jq -r '.guarddog.status' "$OUT_FILE" >&2 || true
+    fail "matrix $gd_mode yields guarddog status $gd_status"
+  fi
+  if [[ "$expectation" == "consult" ]]; then
+    if [[ -s "$CASE_DIR/socket-args.log" ]]; then
+      pass "matrix $gd_mode (status $gd_status) consults socket"
+    else
+      fail "matrix $gd_mode (status $gd_status) consults socket"
+    fi
+  else
+    if [[ -s "$CASE_DIR/socket-args.log" ]]; then
+      fail "matrix $gd_mode (status $gd_status) skips socket"
+    else
+      pass "matrix $gd_mode (status $gd_status) skips socket"
+    fi
+  fi
+done
+
+# not_applicable (non-npm/PyPI ecosystem) and disabled must both consult.
+prepare_case tier3-matrix-not-applicable
+run_check 1 MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  libc@0.2.150 --ecosystem rust --json
+if jq -e '.guarddog.status == "not_applicable"' "$OUT_FILE" >/dev/null 2>&1 \
+  && [[ -s "$CASE_DIR/socket-args.log" ]]; then
+  pass "not_applicable ecosystem keeps socket coverage"
+else
+  jq -r '.guarddog.status' "$OUT_FILE" >&2 || true
+  fail "not_applicable ecosystem keeps socket coverage"
+fi
+
+prepare_case tier3-matrix-disabled
+printf '{"install": {"guarddog": {"enabled": false}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --json
+if jq -e '.guarddog.status == "disabled"' "$OUT_FILE" >/dev/null 2>&1 \
+  && [[ -s "$CASE_DIR/socket-args.log" ]]; then
+  pass "disabled behavioral tier keeps socket coverage"
+else
+  fail "disabled behavioral tier keeps socket coverage"
+fi
+
+# Cooldown edges: boundary day, future timestamp, offset timezone, and the
+# multi-version minimum age driving the all-versions host-allow scope.
+# Exactly 3*86400s old: derived from one captured epoch so neither the local
+# time of day nor a DST transition decides which side of the boundary is
+# tested (review F5). A few seconds past the boundary keeps age == 3.
+prepare_case cooldown-boundary
+BOUNDARY_EPOCH=$(( $(date +%s) - 3 * 86400 - 60 ))
+run_check 1 MOCK_NPM_TIME="$(date -u -d "@$BOUNDARY_EPOCH" +%Y-%m-%dT%H:%M:%SZ)" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "a release exactly at the cooldown boundary passes"
+expect_grep "$OUT_FILE" '^Release age: PASS \(published 3d ago\)' \
+  "the boundary case really sits at the boundary"
+
+# One minute inside the boundary must warn — the pair pins the comparison.
+prepare_case cooldown-just-inside-boundary
+INSIDE_EPOCH=$(( $(date +%s) - 3 * 86400 + 60 ))
+run_check 1 MOCK_NPM_TIME="$(date -u -d "@$INSIDE_EPOCH" +%Y-%m-%dT%H:%M:%SZ)" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 10 "one minute short of the cooldown still warns"
+expect_grep "$OUT_FILE" 'published 2d ago' "just-inside case reports age 2"
+
+prepare_case cooldown-future-timestamp
+run_check 1 MOCK_NPM_TIME="$(date -d '2 days' -Is)" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 10 "a future publish timestamp clamps to age 0 and warns"
+expect_grep "$OUT_FILE" 'published 0d ago' "future timestamp is clamped, not negative"
+
+prepare_case cooldown-offset-timezone
+run_check 1 MOCK_NPM_TIME="$(date -u -d '1 day ago' +%Y-%m-%dT%H:%M:%S+05:30)" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 10 "an offset-bearing publish timestamp is parsed, not ignored"
+
+prepare_case cooldown-multiversion-min-age
+printf '{"dependencies":{"multi":"^1.0.0"}}\n' > "$CASE_DIR/project/package.json"
+printf '{"packages":{"node_modules/consumer":{"dependencies":{"multi":"^2.0.0"}}}}\n' > "$CASE_DIR/project/package-lock.json"
+printf '{"packages":{"multi":{"version":"2.5.0","ecosystem":"npm"}}}\n' \
+  > "$CASE_RUN_CONFIG/host-allow.json"
+run_check 1 MOCK_PACKUMENT_MODE=multi \
+  MOCK_NPM_TIME_MULTI="$(date -d '40 days ago' -Is)|$(date -d '1 day ago' -Is)" -- \
+  multi --ecosystem npm --op update --project-dir "$CASE_DIR/project" --gate install
+expect_status 10 "the youngest resolved version drives the cooldown and one pin cannot cover all versions"
+expect_grep "$OUT_FILE" '^Release age: WARN \(2\.5\.0 published' \
+  "the release line names the youngest resolved version"
+
+# The real guarddog 3.1.0 prints a BARE version; parsing only Click's
+# "prog, version x" form made a correct install read as unsupported, which
+# silently disabled the tier (live adoption 2026-08-03).
+prepare_case version-bare-spelling
+run_check 1 MOCK_GUARDDOG_VERSION_SPELLING=bare MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 0 "a bare-version guarddog is accepted"
+expect_json '.guarddog.status == "ok" and .guarddog.scanner_version == "3.1.0"' \
+  "bare version parses into the supported scanner version"
+if [[ -s "$CASE_DIR/socket-args.log" ]]; then
+  fail "bare-version guarddog still drives the tier-3 socket skip"
+else
+  pass "bare-version guarddog still drives the tier-3 socket skip"
+fi
+
+prepare_case version-bare-unsupported
+run_check 1 MOCK_GUARDDOG_VERSION_SPELLING=bare MOCK_GUARDDOG_VERSION=4.0.0 -- \
+  demo@1.0.0 --ecosystem npm --json
+expect_json '.guarddog.status == "error" and (.guarddog.note | contains("unsupported guarddog version 4.0.0"))' \
+  "an unsupported bare version is still refused by version"
+
+# GuardDog's own error envelope must surface its cause, not read as a parser
+# complaint (live: sandboxed extraction failure returns {package,issues,errors}).
+prepare_case scan-error-shape-names-cause
+run_check 1 MOCK_GUARDDOG_MODE=scan-error-shape MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --json
+expect_json '.guarddog.status == "error"
+  and (.guarddog.note | contains("Sandboxed extraction failed"))
+  and (.guarddog.note | contains("download-package"))' \
+  "guarddog error envelope names the underlying cause"
+if [[ -s "$CASE_DIR/socket-args.log" ]]; then
+  pass "an errored behavioral scan falls back to socket (tier-3 contract)"
+else
+  fail "an errored behavioral scan falls back to socket (tier-3 contract)"
+fi
+
+# --- sandbox fallback (operator ruling 2026-08-03) ---------------------------
+
+# auto: a broken kernel sandbox retries once with --no-sandbox, discloses the
+# weaker isolation everywhere, and still concludes (so Socket stays skipped).
+prepare_case sandbox-auto-fallback
+run_check 1 MOCK_GUARDDOG_SANDBOX_BROKEN=1 MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 0 "auto mode recovers behavioral coverage on a sandbox-broken host"
+expect_json '.guarddog.status == "ok" and .guarddog.sandbox.mode == "auto"
+  and .guarddog.sandbox.fell_back == true
+  and (.guarddog.note | contains("weaker isolation"))' \
+  "the fallback is disclosed in the receipt"
+if grep -q -- '--no-sandbox' "$CASE_LOG"; then
+  pass "the retry passes --no-sandbox"
+else
+  cat "$CASE_LOG" >&2 || true
+  fail "the retry passes --no-sandbox"
+fi
+if [[ -s "$CASE_DIR/socket-args.log" ]]; then
+  fail "a fallback-but-conclusive scan still skips socket"
+else
+  pass "a fallback-but-conclusive scan still skips socket"
+fi
+
+# Human output must show the weaker isolation even on a clean PASS.
+prepare_case sandbox-auto-fallback-human
+run_check 1 MOCK_GUARDDOG_SANDBOX_BROKEN=1 -- demo@1.0.0 --ecosystem npm
+expect_grep "$OUT_FILE" 'weaker isolation' "human output discloses the fallback on a PASS"
+
+# required: no fallback — the tier reports breakage and Socket is consulted.
+prepare_case sandbox-required-no-fallback
+printf '{"install": {"guarddog": {"sandbox": "required"}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 MOCK_GUARDDOG_SANDBOX_BROKEN=1 MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --json
+expect_json '.guarddog.status == "error" and .guarddog.sandbox.fell_back == false' \
+  "required mode keeps the hard failure"
+if grep -q -- '--no-sandbox' "$CASE_LOG"; then
+  fail "required mode never retries unsandboxed"
+else
+  pass "required mode never retries unsandboxed"
+fi
+if [[ -s "$CASE_DIR/socket-args.log" ]]; then
+  pass "required-mode breakage falls back to socket"
+else
+  fail "required-mode breakage falls back to socket"
+fi
+
+# off: always unsandboxed, and its results live under a SEPARATE cache
+# profile — a sandboxed cache entry must never satisfy an unsandboxed run.
+prepare_case sandbox-off-separate-cache
+run_check 1 -- demo@1.0.0 --ecosystem npm --json
+expect_json '.guarddog.cache.misses == 1' "sandboxed run populates the sandboxed profile"
+printf '{"install": {"guarddog": {"sandbox": "off"}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 -- demo@1.0.0 --ecosystem npm --json
+expect_json '.guarddog.cache.hits == 0 and .guarddog.cache.misses == 1' \
+  "an unsandboxed run does not replay the sandboxed cache entry"
+run_check 1 -- demo@1.0.0 --ecosystem npm --json
+expect_json '.guarddog.cache.hits == 1' "the unsandboxed profile caches on its own key"
+
+# F6: a shape-valid result — even a partial one whose error text mentions the
+# sandbox — must never be discarded by the fallback retry.
+prepare_case sandbox-no-retry-over-valid-block
+run_check 1 MOCK_GUARDDOG_MODE=valid-block-with-sandbox-text -- \
+  demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 20 "a valid partial BLOCK survives a sandbox-marker error value"
+expect_json '.guarddog.contribution == "BLOCK"
+  and .guarddog.sandbox.fell_back == false
+  and (.guarddog.rules | index("threat-exfiltrate-secrets") != null)' \
+  "the sandboxed findings are retained, not replaced by a retry"
+if grep -q -- '--no-sandbox' "$CASE_LOG"; then
+  cat "$CASE_LOG" >&2
+  fail "no unsandboxed retry happens over a valid result"
+else
+  pass "no unsandboxed retry happens over a valid result"
+fi
+
+# F7: the retry shares the version's wall-clock budget instead of doubling it.
+prepare_case sandbox-retry-shares-budget
+printf '{"install": {"guarddog": {"timeout_seconds": 3}}}\n' > "$CASE_RUN_CONFIG/config.json"
+SECONDS_BEFORE=$(date +%s)
+run_check 1 MOCK_GUARDDOG_SANDBOX_BROKEN=1 MOCK_GUARDDOG_MODE=hang -- \
+  demo@1.0.0 --ecosystem npm --json
+SECONDS_AFTER=$(date +%s)
+if (( SECONDS_AFTER - SECONDS_BEFORE <= 8 )); then
+  pass "an auto retry stays inside one scan budget (plus grace)"
+else
+  printf 'elapsed %ss for a 3s budget\n' "$(( SECONDS_AFTER - SECONDS_BEFORE ))" >&2
+  fail "an auto retry stays inside one scan budget (plus grace)"
+fi
+
+# F8: provenance is per attempt — a sibling version that scanned sandboxed
+# must not inherit the run's no-sandbox profile, and a repeated auto fallback
+# must consume its own cache instead of rescanning.
+prepare_case sandbox-repeat-fallback-hits-cache
+run_check 1 MOCK_GUARDDOG_SANDBOX_BROKEN=1 -- demo@1.0.0 --ecosystem npm --json
+expect_json '.guarddog.sandbox.fell_back == true and .guarddog.cache.misses == 1' \
+  "first auto fallback populates the no-sandbox profile"
+run_check 1 MOCK_GUARDDOG_SANDBOX_BROKEN=1 -- demo@1.0.0 --ecosystem npm --json
+expect_json '.guarddog.cache.hits == 1' "a repeated auto fallback replays its own cache entry"
+
+# A sandboxed sibling in the same run keeps the sandboxed profile: after
+# falling back for one version, a later sandbox-clean version's entry must
+# still be rejected by a sandbox=off read.
+prepare_case sandbox-mixed-version-provenance
+printf '{"dependencies":{"multi":"^1.0.0"}}\n' > "$CASE_DIR/project/package.json"
+printf '{"packages":{"node_modules/consumer":{"dependencies":{"multi":"^2.0.0"}}}}\n' > "$CASE_DIR/project/package-lock.json"
+run_check 1 MOCK_PACKUMENT_MODE=multi MOCK_GUARDDOG_SANDBOX_BROKEN_VERSION=1.5.0 -- \
+  multi --ecosystem npm --op update --project-dir "$CASE_DIR/project" --json
+printf '{"install": {"guarddog": {"sandbox": "off"}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 MOCK_PACKUMENT_MODE=multi -- \
+  multi --ecosystem npm --op update --project-dir "$CASE_DIR/project" --json
+expect_json '.guarddog.cache.hits < 2' \
+  "a sandbox-off run cannot consume a sibling scanned under the sandbox"
+
+# F9: provenance reaches recorded evidence.
+prepare_case sandbox-fallback-install-known-reason
+run_check 1 MOCK_GUARDDOG_SANDBOX_BROKEN=1 -- demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "auto fallback still gates GO"
+if jq -e '.packages["npm:demo"].reasons | index("guarddog_clean_for_versions_nosandbox") != null' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "install-known records the unsandboxed provenance"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2 || true
+  fail "install-known records the unsandboxed provenance"
+fi
+
+# F11: the budget is shared, and it starts at the FIRST LAUNCH (cache
+# preparation must not consume it). First attempt burns ~2s of a 3s budget,
+# then the retry hangs: shared-budget code finishes near 3s; per-attempt
+# budgets would take ~5s. The scanner must actually have been invoked.
+prepare_case sandbox-budget-is-shared-not-doubled
+printf '{"install": {"guarddog": {"timeout_seconds": 3}}}\n' > "$CASE_RUN_CONFIG/config.json"
+BUDGET_BEFORE=$(date +%s)
+run_check 1 MOCK_GUARDDOG_MODE=slow-then-sandbox-fail -- demo@1.0.0 --ecosystem npm --json
+BUDGET_ELAPSED=$(( $(date +%s) - BUDGET_BEFORE ))
+if (( BUDGET_ELAPSED <= 4 )); then
+  pass "both attempts share one budget (elapsed ${BUDGET_ELAPSED}s for a 3s budget)"
+else
+  printf 'elapsed %ss — per-attempt budgets would show ~5s\n' "$BUDGET_ELAPSED" >&2
+  fail "both attempts share one budget"
+fi
+if grep -q 'scan demo' "$CASE_LOG" 2>/dev/null; then
+  pass "the first attempt actually invoked the scanner"
+else
+  cat "$CASE_LOG" >&2 || true
+  fail "the first attempt actually invoked the scanner"
+fi
+
+# A tiny budget must still reach the scanner: the deadline may not be spent
+# by cache-key derivation before the first launch.
+prepare_case sandbox-tiny-budget-still-scans
+printf '{"install": {"guarddog": {"timeout_seconds": 1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 -- demo@1.0.0 --ecosystem npm --json
+if grep -q 'scan demo' "$CASE_LOG" 2>/dev/null; then
+  pass "a 1s budget still launches the scanner after cache preparation"
+else
+  cat "$CASE_LOG" >&2 || true
+  fail "a 1s budget still launches the scanner after cache preparation"
+fi
+
+# F9 residual: reuse of recorded evidence discloses unsandboxed provenance.
+prepare_case sandbox-stale-reuse-discloses
+run_check 1 MOCK_GUARDDOG_SANDBOX_BROKEN=1 -- demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "auto fallback records evidence"
+STALE_OUT="$CASE_DIR/stale.log"
+(
+  cd "$CASE_DIR/project" || exit 99
+  env HOME="$CASE_HOME" PATH="$GUARDDOGBIN:$COMMONBIN:/usr/bin:/bin" \
+    SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" \
+    SAFE_AUDIT_CHECK_STATUS=124 \
+    bash -c 'source "$0"; safe_gate_known_provenance demo@1.0.0 npm' \
+    "$ROOT/lib/gate-lib.sh"
+) > "$STALE_OUT" 2>&1 || true
+if grep -q 'WITHOUT the kernel sandbox' "$STALE_OUT"; then
+  pass "stale-evidence reuse discloses unsandboxed provenance"
+else
+  cat "$STALE_OUT" >&2
+  fail "stale-evidence reuse discloses unsandboxed provenance"
 fi
 
 if (( FAIL_COUNT > 0 )); then

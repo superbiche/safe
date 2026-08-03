@@ -28,6 +28,12 @@ CHECKS_DIR="$DATA_DIR/checks"
 GUARDDOG_CACHE_DIR="${SAFE_AUDIT_GUARDDOG_CACHE_DIR:-$HOME/.cache/safe/guarddog}"
 GUARDDOG_SUPPORTED_VERSION="3.1.0"
 GUARDDOG_CACHE_PROFILE="safe-default-v1"
+# Profile used when the kernel sandbox is unavailable and the operator allows
+# the documented fallback. It is a DIFFERENT cache identity on purpose:
+# results gathered with weaker isolation must never replay as sandboxed ones.
+GUARDDOG_CACHE_PROFILE_NOSANDBOX="safe-nosandbox-v1"
+GUARDDOG_SANDBOX_MODE="auto"
+GUARDDOG_SANDBOX_FELL_BACK=0
 # Bound each GuardDog output stream. The raw JSON is later copied into both
 # the permanent cache and the receipt, so an unbounded scanner stream would
 # turn package-controlled match volume into a disk-exhaustion path.
@@ -5038,6 +5044,22 @@ guarddog_artifact_identity_json() {
   esac
 }
 
+# A sandbox-origin failure: GuardDog either refuses up front because the
+# kernel sandbox is unavailable, or its sandboxed child dies before running.
+guarddog_scan_sandbox_failed() {
+  local raw="$1" stderr_file="$2" rc="$3"
+  local haystack=""
+  haystack=$(cat "$stderr_file" 2>/dev/null || true)
+  if [[ -s "$raw" ]]; then
+    haystack+=$(jq -r 'if (type == "object") and ((.errors? // null) | type == "object")
+      then [.errors[] | tostring] | join(" ") else "" end' "$raw" 2>/dev/null || true)
+  fi
+  [[ "$haystack" == *"Sandboxed extraction failed"* \
+    || "$haystack" == *"sandbox is unavailable"* \
+    || "$haystack" == *"sandbox unavailable"* \
+    || "$haystack" == *"--no-sandbox"* ]]
+}
+
 guarddog_result_shape_valid() {
   local result="$1"
   jq -e '
@@ -5064,6 +5086,14 @@ guarddog_result_shape_valid() {
            .risk_score.score >= 7 and (.risks | length) > 0
          end)
   ' "$result" >/dev/null 2>&1
+}
+
+guarddog_active_profile() {
+  if (( GUARDDOG_SANDBOX_FELL_BACK )) || [[ "$GUARDDOG_SANDBOX_MODE" == "off" ]]; then
+    printf '%s' "$GUARDDOG_CACHE_PROFILE_NOSANDBOX"
+  else
+    printf '%s' "$GUARDDOG_CACHE_PROFILE"
+  fi
 }
 
 guarddog_cache_key() {
@@ -5129,45 +5159,115 @@ guarddog_error_record() {
      artifact_identity:$artifact,raw:null}' > "$output"
 }
 
+# Per-attempt profile: the cache identity must describe the isolation the
+# result was ACTUALLY produced under, never the run's aggregate state
+# (delta-2 F8 — a global flag mislabelled a sandboxed sibling version).
+guarddog_profile_for_flag() {
+  if [[ "$1" == "nosandbox" ]]; then
+    printf '%s' "$GUARDDOG_CACHE_PROFILE_NOSANDBOX"
+  else
+    printf '%s' "$GUARDDOG_CACHE_PROFILE"
+  fi
+}
+
 guarddog_scan_one_json() {
   local ecosystem="$1" name="$2" version="$3" guarddog_cmd="$4"
   local scanner_version="$5" budget="$6" scratch="$7" slot="$8" output="$9"
   local artifact_file="$scratch/guarddog-artifact-${slot}-identity.json"
-  local artifact_json='null' cache_eligible=false cache_key="" cache_file=""
+  local artifact_json='null'
   local key_material="$scratch/guarddog-cache-key-${slot}.json"
   if guarddog_artifact_identity_json "$ecosystem" "$name" "$version" "$scratch" "$slot" > "$artifact_file"; then
     artifact_json=$(cat "$artifact_file")
-    if [[ -n "$scanner_version" ]] \
-      && cache_key=$(guarddog_cache_key "$artifact_json" "$scanner_version" "$key_material" 2>/dev/null) \
+  fi
+
+  local raw="$scratch/guarddog-${slot}.raw.json"
+  local cli_ecosystem="$ecosystem" stderr_file="$scratch/guarddog-${slot}.stderr" rc=0
+  [[ "$ecosystem" == "python" ]] && cli_ecosystem="pypi"
+
+  # One deadline for the whole version scan: an auto retry must fit inside
+  # the configured wall-clock budget, not double it (delta-2 F7). It starts
+  # immediately before the FIRST launch, never before cache preparation —
+  # a slow hash/cache probe must not eat the first attempt's budget
+  # (delta-3 F11).
+  local scan_deadline=0
+  local cache_eligible=false cache_key="" cache_file="" attempt_profile=""
+  local attempt_kind="sandbox"
+  [[ "$GUARDDOG_SANDBOX_MODE" == "off" ]] && attempt_kind="nosandbox"
+
+  # Prepare one attempt: derive its profile, cache key and file, then try the
+  # cache. Returns 0 when a valid cached result was replayed into $raw.
+  guarddog_attempt_prepare() {
+    attempt_profile=$(guarddog_profile_for_flag "$attempt_kind")
+    cache_eligible=false
+    cache_key=""
+    cache_file=""
+    if [[ "$artifact_json" != "null" && -n "$scanner_version" ]] \
+      && cache_key=$(GUARDDOG_CACHE_PROFILE="$attempt_profile" \
+        guarddog_cache_key "$artifact_json" "$scanner_version" "$key_material" 2>/dev/null) \
       && [[ -n "$cache_key" ]]; then
       cache_eligible=true
       cache_file="$GUARDDOG_CACHE_DIR/${cache_key}.json"
     fi
-  fi
-
-  local raw="$scratch/guarddog-${slot}.raw.json"
-  if [[ "$cache_eligible" == "true" && -r "$cache_file" ]] \
-    && jq -e --argjson identity "$artifact_json" --arg scanner_version "$scanner_version" \
-      --arg profile "$GUARDDOG_CACHE_PROFILE" '
+    [[ "$cache_eligible" == "true" && -r "$cache_file" ]] || return 1
+    jq -e --argjson identity "$artifact_json" --arg scanner_version "$scanner_version" \
+      --arg profile "$attempt_profile" '
       .schema == 1 and .identity == $identity
       and .scanner == {name:"guarddog",version:$scanner_version,profile:$profile}
       and (.result | type == "object")
     ' "$cache_file" >/dev/null 2>&1 \
-    && jq -c '.result' "$cache_file" > "$raw" \
-    && guarddog_result_shape_valid "$raw" \
-    && jq -e '(.errors | length) == 0' "$raw" >/dev/null 2>&1; then
+      && jq -c '.result' "$cache_file" > "$raw" \
+      && guarddog_result_shape_valid "$raw" \
+      && jq -e '(.errors | length) == 0' "$raw" >/dev/null 2>&1
+  }
+
+  guarddog_run_scan() {
+    local -a sandbox_flag=()
+    [[ "$attempt_kind" == "nosandbox" ]] && sandbox_flag=(--no-sandbox)
+    # The first launch defines the window; later attempts share what is left.
+    (( scan_deadline == 0 )) && scan_deadline=$(( $(date +%s) + budget ))
+    local remaining=$(( scan_deadline - $(date +%s) ))
+    rc=0
+    if (( remaining <= 0 )); then
+      rc=124
+      : > "$raw"
+      printf 'guarddog scan budget exhausted before this attempt\n' > "$stderr_file"
+      return 0
+    fi
+    timeout --kill-after=2s "$remaining" bash -c \
+      'ulimit -f "$1" || exit 125; shift; exec "$@"' \
+      safe-guarddog "$GUARDDOG_OUTPUT_LIMIT_KIB" \
+      env "${GUARDDOG_ENV_UNSET[@]}" "$guarddog_cmd" "$cli_ecosystem" scan "$name" \
+      --version "$version" --output-format=json ${sandbox_flag[@]+"${sandbox_flag[@]}"} \
+      > "$raw" 2> "$stderr_file" </dev/null || rc=$?
+  }
+
+  if guarddog_attempt_prepare; then
     guarddog_record_from_raw "$raw" "$version" true true "$artifact_json" "$scanner_version" "" "$output"
     return 0
   fi
+  guarddog_run_scan
 
-  local cli_ecosystem="$ecosystem" stderr_file="$scratch/guarddog-${slot}.stderr" rc=0
-  [[ "$ecosystem" == "python" ]] && cli_ecosystem="pypi"
-  timeout --kill-after=2s "$budget" bash -c \
-    'ulimit -f "$1" || exit 125; shift; exec "$@"' \
-    safe-guarddog "$GUARDDOG_OUTPUT_LIMIT_KIB" \
-    env "${GUARDDOG_ENV_UNSET[@]}" "$guarddog_cmd" "$cli_ecosystem" scan "$name" \
-    --version "$version" --output-format=json \
-    > "$raw" 2> "$stderr_file" </dev/null || rc=$?
+  # Sandbox fallback (operator-configurable, default auto): GuardDog refuses
+  # to scan when the kernel sandbox is unavailable, and on some hosts its
+  # Landlock child cannot even start — which yields ZERO behavioral coverage
+  # rather than weaker coverage. The retry is bound to a DIFFERENT cache
+  # profile so it can never replay as a sandboxed result, and it NEVER runs
+  # over a shape-valid result: a partial scan that retained real findings
+  # (including a high-risk BLOCK) must not be discarded because its error
+  # text happened to mention the sandbox (delta-2 F6). mode=required keeps
+  # the hard failure; mode=off never sandboxes.
+  if [[ "$GUARDDOG_SANDBOX_MODE" == "auto" && "$attempt_kind" == "sandbox" ]] \
+    && ! { (( rc == 0 )) && guarddog_result_shape_valid "$raw"; } \
+    && guarddog_scan_sandbox_failed "$raw" "$stderr_file" "$rc"; then
+    attempt_kind="nosandbox"
+    GUARDDOG_SANDBOX_FELL_BACK=1
+    if guarddog_attempt_prepare; then
+      guarddog_record_from_raw "$raw" "$version" true true "$artifact_json" "$scanner_version" "" "$output"
+      return 0
+    fi
+    guarddog_run_scan
+  fi
+
   if (( rc != 0 )); then
     local failure_note
     local raw_size stderr_size output_limit_bytes=$((GUARDDOG_OUTPUT_LIMIT_KIB * 1024))
@@ -5185,8 +5285,24 @@ guarddog_scan_one_json() {
     return 0
   fi
   if ! guarddog_result_shape_valid "$raw"; then
-    guarddog_error_record "$version" "$scanner_version" \
-      "guarddog returned malformed or inconsistent JSON" "$artifact_json" "$output"
+    # GuardDog's own failure shape omits the risk fields entirely and carries
+    # the cause in .errors (verified live: a failed sandboxed extraction
+    # returns {package, issues, errors}). Reporting that as "malformed JSON"
+    # hid an actionable infrastructure cause behind a parser complaint —
+    # audit-infrastructure failure must always name the breakage to fix.
+    local declared_errors=""
+    declared_errors=$(jq -r '
+      if (type == "object") and ((.errors? // null) | type == "object")
+         and ((.errors | length) > 0)
+      then [.errors | to_entries[] | "\(.key): \(.value | tostring)"] | join("; ")
+      else empty end' "$raw" 2>/dev/null || true)
+    if [[ -n "$declared_errors" ]]; then
+      guarddog_error_record "$version" "$scanner_version" \
+        "guarddog scan failed — ${declared_errors:0:500}" "$artifact_json" "$output"
+    else
+      guarddog_error_record "$version" "$scanner_version" \
+        "guarddog returned malformed or inconsistent JSON" "$artifact_json" "$output"
+    fi
     return 0
   fi
 
@@ -5199,7 +5315,7 @@ guarddog_scan_one_json() {
       cache_tmp=$(mktemp "$GUARDDOG_CACHE_DIR/.guarddog.XXXXXX" 2>/dev/null || true)
       if [[ -n "$cache_tmp" ]] \
         && jq -n --argjson identity "$artifact_json" --arg scanner_version "$scanner_version" \
-          --arg profile "$GUARDDOG_CACHE_PROFILE" \
+          --arg profile "$attempt_profile" \
           --slurpfile result "$raw" '
           {schema:1,scanner:{name:"guarddog",version:$scanner_version,profile:$profile},
            identity:$identity,result:($result[0] // {})}' > "$cache_tmp" \
@@ -5226,6 +5342,9 @@ guarddog_tier_json() {
   policy=$(install_policy_json)
   enabled=$(jq -r 'if .guarddog.enabled == false then "false" else "true" end' <<<"$policy")
   budget=$(jq -r '.guarddog.timeout_seconds // 120' <<<"$policy")
+  GUARDDOG_SANDBOX_MODE=$(jq -r '.guarddog.sandbox // "auto"' <<<"$policy")
+  case "$GUARDDOG_SANDBOX_MODE" in auto|required|off) ;; *) GUARDDOG_SANDBOX_MODE="auto" ;; esac
+  GUARDDOG_SANDBOX_FELL_BACK=0
   if [[ ! "$budget" =~ ^[1-9][0-9]*$ ]]; then
     config_note="invalid install.guarddog.timeout_seconds; using default 120"
     budget=120
@@ -5306,7 +5425,16 @@ guarddog_tier_json() {
   fi
   local version_line scanner_version
   version_line=$(head -n 1 "$version_out" | tr -d '\r')
+  # Accept both spellings: the installed guarddog 3.1.0 prints a BARE
+  # version (verified live), while Click's default `--version` renders
+  # "<prog>, version <x>". Parsing only the Click form made a correct
+  # install read as an unsupported scanner, silently disabling the whole
+  # behavioral tier — and, under tier-3, silently restoring Socket as the
+  # only behavioral signal (live adoption 2026-08-03).
   scanner_version=$(sed -n 's/^guarddog, version \([^[:space:]]\+\).*$/\1/p' <<<"$version_line")
+  if [[ -z "$scanner_version" ]]; then
+    scanner_version=$(sed -n 's/^\([0-9]\+\.[0-9]\+\.[0-9]\+[0-9A-Za-z.+-]*\)[[:space:]]*$/\1/p' <<<"$version_line")
+  fi
   if [[ "$scanner_version" != "$GUARDDOG_SUPPORTED_VERSION" ]]; then
     local unsupported_note
     if [[ -n "$scanner_version" ]]; then
@@ -5334,7 +5462,11 @@ guarddog_tier_json() {
     slot=$((slot + 1))
   done
 
+  if (( GUARDDOG_SANDBOX_FELL_BACK )); then
+    config_note="${config_note:+$config_note; }kernel sandbox unavailable — scanned with --no-sandbox (weaker isolation; cached separately). Set install.guarddog.sandbox=required to fail instead"
+  fi
   jq -s --arg scanner_version "$scanner_version" --arg config_note "$config_note" \
+    --arg sandbox_mode "$GUARDDOG_SANDBOX_MODE" --argjson fell_back "$(( GUARDDOG_SANDBOX_FELL_BACK ? 1 : 0 ))" \
     --argjson budget "$budget" '
     . as $versions
     | (if any($versions[]; .contribution == "BLOCK") then "BLOCK"
@@ -5353,6 +5485,7 @@ guarddog_tier_json() {
         infra_error:any($versions[]; .infra_error),
         note:(if ($notes | length) == 0 then null else ($notes | join("; ")) end),
         timeout_seconds:$budget,
+        sandbox:{mode:$sandbox_mode,fell_back:($fell_back == 1)},
         scanner_version:(if $scanner_version == "" then null else $scanner_version end),
         rules:$rules,
         risk_label:($top.risk_label // null),risk_score:($top.risk_score // null),
@@ -5364,6 +5497,65 @@ guarddog_tier_json() {
         versions:$versions
       }
   ' "${version_files[@]}" > "$output"
+}
+
+# Release-age lookup for the cooldown check: the minimum age (days) across
+# the resolved versions, from the public registry's publish timestamps.
+# Best-effort cache plumbing for a WARN-tier heuristic: rc=1 (lookup failed)
+# means the cooldown is skipped with a disclosed note, never a refusal.
+# rc=2: no publish-time source for this ecosystem — check not applicable.
+# stdout on success: "<age_days>\t<version>\t<published_iso>".
+release_min_age_days() {
+  local ecosystem="$1" name="$2" scratch="$3"
+  shift 3
+  local -a versions=()
+  local v
+  versions=("$@")
+  local encoded_name meta now_epoch published epoch age
+  local min_age="" min_version="" min_published=""
+  now_epoch=$(date +%s)
+  encoded_name=$(urlencode "$name")
+  case "$ecosystem" in
+    npm)
+      meta="$scratch/release-times.json"
+      curl -fsSL --max-time 5 "https://registry.npmjs.org/${encoded_name}" \
+        -o "$meta" 2>/dev/null || return 1
+      for v in "${versions[@]}"; do
+        published=$(jq -r --arg v "$v" '.time[$v] // empty | strings' "$meta" 2>/dev/null || true)
+        [[ -n "$published" ]] || return 1
+        epoch=$(date -d "$published" +%s 2>/dev/null) || return 1
+        age=$(( (now_epoch - epoch) / 86400 ))
+        (( age < 0 )) && age=0
+        if [[ -z "$min_age" ]] || (( age < min_age )); then
+          min_age="$age"; min_version="$v"; min_published="$published"
+        fi
+      done
+      ;;
+    python)
+      local slot=0
+      for v in "${versions[@]}"; do
+        meta="$scratch/release-times-${slot}.json"
+        slot=$((slot + 1))
+        curl -fsSL --max-time 5 "https://pypi.org/pypi/${encoded_name}/$(urlencode "$v")/json" \
+          -o "$meta" 2>/dev/null || return 1
+        # The NEWEST distribution upload anchors the age: PyPI releases can
+        # gain files after first publish, and pip may select exactly the
+        # fresh artifact — an old sdist must not lend its age to a
+        # yesterday wheel (PR#60 review F1).
+        published=$(jq -r '[.urls[]?.upload_time_iso_8601 | strings] | max // empty' "$meta" 2>/dev/null || true)
+        [[ -n "$published" ]] || return 1
+        epoch=$(date -d "$published" +%s 2>/dev/null) || return 1
+        age=$(( (now_epoch - epoch) / 86400 ))
+        (( age < 0 )) && age=0
+        if [[ -z "$min_age" ]] || (( age < min_age )); then
+          min_age="$age"; min_version="$v"; min_published="$published"
+        fi
+      done
+      ;;
+    *) return 2 ;;
+  esac
+  [[ -n "$min_age" ]] || return 1
+  printf '%s\t%s\t%s\n' "$min_age" "$min_version" "$min_published"
 }
 
 osv_query_package_json() {
@@ -7324,7 +7516,7 @@ host_allow_required_versions_json() {
        | any(. as $c | $causes | index($c) != null)) as $socket_applies
     | ((($causes | index("guarddog_error")) != null)
        and (($guarddog_result.versions // []) | length) == 0) as $guarddog_applies_to_all
-    | (["osv_unavailable","custom_source"]
+    | (["osv_unavailable","custom_source","release_too_new"]
        | any(. as $c | $causes | index($c) != null)) as $other_all_apply
     | ($guarddog_versions + $osv_versions
        + (if $socket_applies and $primary != "" then [$primary] else [] end)
@@ -7551,9 +7743,6 @@ check_command() {
       "$scratch/packument.json" 2>/dev/null) || has_install_script=""
   fi
 
-  local socket_spec="$spec"
-  (( resolution_ok )) && socket_spec="${PKG_NAME}@${primary_version}"
-  socket_score_json "$ecosystem" "$socket_spec" "$socket_json"
   if (( resolution_ok )); then
     guarddog_tier_json "$ecosystem" "$PKG_NAME" "$scratch" "$guarddog_json" \
       "${RESOLVED_VERSIONS[@]}"
@@ -7561,11 +7750,39 @@ check_command() {
     guarddog_tier_json "$ecosystem" "$PKG_NAME" "$scratch" "$guarddog_json"
   fi
 
+  # --- tier-3 socket decision (make Socket optional, not load-bearing)
+  # GuardDog is the behavioral tier. Socket is consulted only when the
+  # behavioral tier produced no complete verdict (not installed, disabled,
+  # unsupported ecosystem, unresolved version, error, partial) — or when the
+  # operator forces it. A Socket outage then degrades only those rare
+  # consultations instead of every check (two full days of 429-degraded
+  # verdicts were the trigger; inbox 2026-08-03 tiered-scoring note).
+  local socket_mode socket_skip_reason=""
+  socket_mode=$(install_policy_json | jq -r '.socket.mode // "auto"')
+  case "$socket_mode" in always|auto|never) ;; *) socket_mode="auto" ;; esac
+  if [[ "$socket_mode" == "never" ]]; then
+    socket_skip_reason="disabled by install.socket.mode=never"
+  elif [[ "$socket_mode" == "auto" ]] \
+    && [[ "$(jq -r '.status' "$guarddog_json" 2>/dev/null)" == "ok" ]]; then
+    socket_skip_reason="tier 3 — behavioral verdict from GuardDog; not consulted"
+  fi
+  if [[ -n "$socket_skip_reason" ]]; then
+    jq -n --arg reason "$socket_skip_reason" \
+      '{available: null, status: "skipped_tier3", note: $reason}' > "$socket_json"
+  else
+    local socket_spec="$spec"
+    (( resolution_ok )) && socket_spec="${PKG_NAME}@${primary_version}"
+    socket_score_json "$ecosystem" "$socket_spec" "$socket_json"
+  fi
+
   verdict="GO"
   local -a warn_causes=()
   local socket_detail=""
   socket_line="PASS (no behavioral anomalies)"
-  if [[ "$(jq -r '.available // false' "$socket_json" 2>/dev/null)" != "true" ]]; then
+  if [[ "$(jq -r '.status // empty' "$socket_json" 2>/dev/null)" == "skipped_tier3" ]]; then
+    # A deliberate tier-3 skip is not an outage: no cause, no verdict bump.
+    socket_line="SKIP ($(jq -r '.note' "$socket_json"))"
+  elif [[ "$(jq -r '.available // false' "$socket_json" 2>/dev/null)" != "true" ]]; then
     socket_line='SKIP (socket CLI not available)'
     warn_causes+=("socket_unavailable")
     socket_detail="socket CLI not available"
@@ -7804,6 +8021,30 @@ check_command() {
     fi
   fi
 
+  # --- release-age cooldown: a brand-new release is the compromised-publish
+  # window (malicious versions are usually caught and yanked within days).
+  # WARN-tier and overridable; a failed lookup is disclosed and skipped,
+  # never a refusal — the cooldown is a heuristic, not advisory evidence.
+  local cooldown_days release_line="" release_age="" release_version="" release_published=""
+  cooldown_days=$(install_policy_json | jq -r '.cooldown_days // 3')
+  [[ "$cooldown_days" =~ ^[0-9]+$ ]] || cooldown_days=3
+  if (( resolution_ok )) && (( cooldown_days > 0 )); then
+    local release_info release_rc=0
+    release_info=$(release_min_age_days "$ecosystem" "$PKG_NAME" "$scratch" "${RESOLVED_VERSIONS[@]}") || release_rc=$?
+    if (( release_rc == 0 )); then
+      IFS=$'\t' read -r release_age release_version release_published <<<"$release_info"
+      if (( release_age < cooldown_days )); then
+        release_line="WARN (${release_version} published ${release_age}d ago — younger than the ${cooldown_days}d cooldown)"
+        warn_causes+=("release_too_new")
+        bump_verdict verdict "WARN"
+      else
+        release_line="PASS (published ${release_age}d ago)"
+      fi
+    elif (( release_rc == 1 )); then
+      release_line="SKIP (publish date unavailable — cooldown not evaluated)"
+    fi
+  fi
+
   # A custom source floors the verdict at WARN regardless of resolution or
   # exactness: OSV/Socket evidence covers the public registry identity, not
   # whatever a private index serves under that name@version (delta finding
@@ -7856,6 +8097,11 @@ check_command() {
     --arg guarddog_line "$guarddog_line" \
     --arg osv_line "$osv_line" \
     --arg block_line "$block_line" \
+    --arg release_line "$release_line" \
+    --arg release_age "$release_age" \
+    --arg release_version "$release_version" \
+    --arg release_published "$release_published" \
+    --argjson cooldown_days "$cooldown_days" \
     --arg resolution_method "$RESOLUTION_METHOD" \
     --arg resolution_source "$RESOLUTION_SOURCE" \
     --arg resolution_range "$RESOLUTION_RANGE" \
@@ -7888,8 +8134,15 @@ check_command() {
         socket: $socket_line,
         guarddog: $guarddog_line,
         osv: $osv_line,
-        blocklist: $block_line
+        blocklist: $block_line,
+        release_age: (if $release_line == "" then null else $release_line end)
       },
+      release: (if $release_line == "" then null else {
+        cooldown_days: $cooldown_days,
+        age_days: (if $release_age == "" then null else ($release_age | tonumber) end),
+        version: (if $release_version == "" then null else $release_version end),
+        published: (if $release_published == "" then null else $release_published end)
+      } end),
       socket: ($socket[0] // {}),
       guarddog: ($guarddog[0] // {}),
       osv: (($osv[0] // {}) + {classification: $classification, versions: $versions})
@@ -7909,13 +8162,21 @@ check_command() {
     printf 'Socket:      %s\n' "$socket_line"
     printf 'GuardDog:    %s\n' "$guarddog_line"
     printf 'OSV:         %s\n' "$osv_line"
+    [[ -n "$release_line" ]] && printf 'Release age: %s\n' "$release_line"
     printf 'Blocklist:   %s\n' "$block_line"
     if (( custom_source )); then
       printf '\n[safe audit] custom source: %s — advisory evidence covers the public registry identity only\n' "$CHECK_EFFECTIVE_SOURCES"
     fi
-    if [[ "$(jq -r '.available // false' "$socket_json" 2>/dev/null)" != "true" ]]; then
+    # Branch on the discriminated status first: a deliberate tier-3/never
+    # skip carries available:null and must not render as an outage
+    # (PR#60 review F3).
+    if [[ "$(jq -r '.available' "$socket_json" 2>/dev/null)" == "false" ]]; then
       printf '\n[safe audit] WARNING: socket CLI not available, skipping behavioral analysis\n'
       printf '[safe audit] Install: safe audit setup local\n'
+    fi
+    # Weaker isolation must never pass silently, even on a clean PASS.
+    if [[ "$(jq -r '.sandbox.fell_back // false' "$guarddog_json" 2>/dev/null)" == "true" ]]; then
+      printf '\n[safe audit] guarddog: %s\n' "$guarddog_detail"
     fi
     if [[ "$guarddog_status" == "skipped" && "$(jq -r '.available' "$guarddog_json")" == "false" ]]; then
       printf '\n[safe audit] %s\n' "$guarddog_detail"
@@ -7949,15 +8210,35 @@ check_command() {
         if [[ "$auto_allow" == "true" ]] && (( resolution_ok )); then
           local guarddog_reason
           case "$guarddog_status" in
-            ok) guarddog_reason="guarddog_clean_for_versions" ;;
+            ok)
+              # Provenance must survive into recorded evidence: a clean
+              # verdict produced without the kernel sandbox is not the same
+              # evidence as a sandboxed one (delta-2 F9).
+              if [[ "$(jq -r '.sandbox.fell_back // false' "$guarddog_json" 2>/dev/null)" == "true" \
+                || "$(jq -r '.sandbox.mode // ""' "$guarddog_json" 2>/dev/null)" == "off" ]]; then
+                guarddog_reason="guarddog_clean_for_versions_nosandbox"
+              else
+                guarddog_reason="guarddog_clean_for_versions"
+              fi
+              ;;
             disabled) guarddog_reason="guarddog_disabled" ;;
             not_applicable) guarddog_reason="guarddog_not_applicable" ;;
             skipped) guarddog_reason="guarddog_skipped_not_installed" ;;
             *) guarddog_reason="guarddog_state_${guarddog_status}" ;;
           esac
+          # The recorded evidence must say what Socket actually did: a
+          # tier-3 skip is not a green score and must never read as one.
+          local socket_reason="socket_ok"
+          if [[ -n "$socket_skip_reason" ]]; then
+            if [[ "$socket_mode" == "never" ]]; then
+              socket_reason="socket_disabled"
+            else
+              socket_reason="socket_skipped_tier3"
+            fi
+          fi
           mark_install_known "$ecosystem" "$PKG_NAME" "$primary_version" "GO" \
-            "$(jq -cn --arg guarddog_reason "$guarddog_reason" \
-              '["osv_clean_for_version","socket_ok","blocklist_pass",$guarddog_reason]')" "$result_json"
+            "$(jq -cn --arg guarddog_reason "$guarddog_reason" --arg socket_reason "$socket_reason" \
+              '["osv_clean_for_version",$socket_reason,"blocklist_pass",$guarddog_reason]')" "$result_json"
           printf '[safe audit] recorded clean check: %s:%s@%s (install-known)\n' \
             "$ecosystem" "$PKG_NAME" "$primary_version" >&2
         fi
@@ -7985,7 +8266,8 @@ check_command() {
         for adverse_cause in ${warn_causes[@]+"${warn_causes[@]}"}; do
           [[ "$adverse_cause" == "socket_low_score" \
             || "$adverse_cause" == "guarddog_findings" \
-            || "$adverse_cause" == "guarddog_high_risk" ]] && adverse=1
+            || "$adverse_cause" == "guarddog_high_risk" \
+            || "$adverse_cause" == "release_too_new" ]] && adverse=1
         done
         if (( adverse )); then
           revoke_install_known "$ecosystem" "$PKG_NAME" "$primary_version" ${RESOLVED_VERSIONS[@]+"${RESOLVED_VERSIONS[@]}"}
@@ -8067,7 +8349,7 @@ gate_emit_refusal_hints() {
   shift 9
   local -a causes=("$@")
   local cause has_socket_infra=0 has_unresolved=0 has_affecting=0 has_osv_down=0 has_low_score=0 has_custom_source=0 has_malware=0
-  local has_guarddog_findings=0 has_guarddog_high_risk=0 has_guarddog_error=0
+  local has_guarddog_findings=0 has_guarddog_high_risk=0 has_guarddog_error=0 has_too_new=0
   for cause in "${causes[@]}"; do
     case "$cause" in
       socket_unavailable|socket_auth_failed|socket_rate_limited|socket_error) has_socket_infra=1 ;;
@@ -8080,8 +8362,18 @@ gate_emit_refusal_hints() {
       guarddog_findings) has_guarddog_findings=1 ;;
       guarddog_high_risk) has_guarddog_high_risk=1 ;;
       guarddog_error) has_guarddog_error=1 ;;
+      release_too_new) has_too_new=1 ;;
     esac
   done
+  if (( has_too_new )); then
+    printf 'safe audit: resolved version is younger than the release cooldown — waiting out install.cooldown_days is the default protection against compromised releases\n' >&2
+    if [[ "$ecosystem" == "npm" && "$resolution_ok" == "1" && -n "$primary_version" ]]; then
+      printf 'safe audit: operator overrides: safe run host-allow add %s@%s --reason "..." / add release_too_new to install.auto_allow_tolerate\n' \
+        "$name" "$primary_version" >&2
+    else
+      printf 'safe audit: operator override: add release_too_new to install.auto_allow_tolerate\n' >&2
+    fi
+  fi
   if (( has_malware )); then
     printf 'safe audit: known-malware record (OSV MAL-*) — do not install, do not pin around it; operator review only\n' >&2
   fi

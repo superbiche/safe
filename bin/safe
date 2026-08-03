@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.7.0"
+SAFE_VERSION="1.8.0"
 SAFE_SELF="$(readlink -f "$0")"
 SAFE_DIR="$(dirname "$SAFE_SELF")"
 SAFE_CONFIG_ROOT="${SAFE_CONFIG_DIR:-$HOME/.config/safe}"
@@ -261,10 +261,15 @@ cmd_report_fp() {
       "## Verdict inputs",
       "",
       "- Socket: `\(.socket.status // "n/a")`" +
-        (if ((.socket.status // "ok") != "ok")
+        (if (.socket.status // "") == "skipped_tier3"
+         then " — deliberately not consulted (tier 3 policy skip); not a failure"
+         elif ((.socket.status // "ok") != "ok")
          then " — the check failed; its raw error text is in the receipt, not here"
          else "" end),
       "- GuardDog: `\(.guarddog.status // "n/a")`" +
+        (if ((.guarddog.sandbox.fell_back // false) == true)
+         then " (scanned WITHOUT the kernel sandbox — weaker isolation)"
+         else "" end) +
         (if (.guarddog.rules // [] | length) > 0
          then " — rules: " + ((.guarddog.rules // []) | join(", "))
          elif ((.guarddog.infra_error // false) == true)
@@ -1536,6 +1541,28 @@ safe_install_gate_log() {
 # Offline fallback: an exact-version request matching a fresh install-known
 # entry (previously recorded clean check) may proceed when the audit itself
 # timed out. Unpinned requests never qualify.
+# Disclose weaker-isolation provenance when reusing recorded evidence: a
+# clean behavioral verdict produced without the kernel sandbox must say so
+# at the moment it is REUSED, not only in the receipt (review F9).
+safe_install_known_provenance() {
+  local package="$1" ecosystem="$2" known_file name version
+  case "$ecosystem" in
+    cargo) ecosystem="rust" ;;
+    composer) ecosystem="php" ;;
+    pip|uv) ecosystem="python" ;;
+  esac
+  known_file="${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}/install-known.json"
+  command -v jq >/dev/null 2>&1 || return 0
+  [[ -r "$known_file" ]] || return 0
+  IFS=$'\t' read -r name version <<< "$(safe_install_split_spec "$package")"
+  [[ -n "$name" ]] || return 0
+  if jq -e --arg k "${ecosystem}:${name}" \
+    '(.packages[$k].reasons // []) | index("guarddog_clean_for_versions_nosandbox") != null' \
+    "$known_file" >/dev/null 2>&1; then
+    printf '%s' " — behavioral evidence was gathered WITHOUT the kernel sandbox"
+  fi
+}
+
 safe_install_known_matches() {
   local package="$1" ecosystem="$2"
   local known_file name version first_allowed ttl_days entry_epoch now_epoch
@@ -1706,7 +1733,7 @@ safe_install_audit_package() {
       ;;
     124|137)
       if safe_install_known_matches "$package" "$ecosystem"; then
-        err "safe audit timed out; proceeding on recorded clean check for $package (stale evidence)"
+        err "safe audit timed out; proceeding on recorded clean check for $package (stale evidence)$(safe_install_known_provenance "$package" "$ecosystem")"
         safe_install_gate_log "$ecosystem" "$package" "STALE_EVIDENCE"
         return 0
       fi

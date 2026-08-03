@@ -65,9 +65,14 @@ unchanged.
     "trusted_registries": [],
     "auto_allow_ttl_days": 30,
     "block_severities": ["critical"],
+    "cooldown_days": 3,
     "guarddog": {
       "enabled": true,
-      "timeout_seconds": 120
+      "timeout_seconds": 120,
+      "sandbox": "auto"
+    },
+    "socket": {
+      "mode": "auto"
     }
   }
 }
@@ -90,9 +95,33 @@ unchanged.
 - `auto_allow_ttl_days`: freshness window for the offline/timeout fallback.
 - `block_severities`: affecting-advisory severities that hard-BLOCK instead
   of WARN.
+- `cooldown_days`: WARN when any resolved version was published fewer than
+  this many days ago (the compromised-release window; malicious versions are
+  usually caught and yanked within days). Default: `3`; `0` disables. The
+  WARN is overridable (exact host-allow pin, or `release_too_new` in
+  `auto_allow_tolerate`); a failed publish-date lookup skips the check with
+  a disclosed note, never a refusal.
+- `socket.mode`: when to consult Socket. `auto` (default) is tier 3 —
+  Socket runs only when the GuardDog behavioral tier produced no complete
+  verdict (not installed, disabled, unsupported ecosystem, unresolved
+  version, error/partial), so a Socket outage degrades only those rare
+  consultations. `always` restores the pre-1.8 always-on behavior;
+  `never` disables Socket entirely. A deliberate skip is recorded honestly
+  in receipts and install-known reasons (`socket_skipped_tier3`, never
+  `socket_ok`).
 - `guarddog.enabled`: run GuardDog for exact resolved npm/PyPI versions.
   Default: `true`. A missing binary is reported as a non-adverse skip while
   Socket remains enabled in the current tiered-scoring slice.
+- `guarddog.sandbox`: `auto` (default), `required`, or `off`. GuardDog
+  extracts archives inside a kernel sandbox and refuses to scan when that
+  sandbox is unavailable — on hosts where its sandboxed child cannot start,
+  that means ZERO behavioral coverage rather than weaker coverage. `auto`
+  retries once with `--no-sandbox`, discloses the weaker isolation on every
+  surface (human output, receipt, `sandbox.fell_back`), and binds the result
+  to a separate cache profile (`safe-nosandbox-v1`) so it can never replay
+  as a sandboxed result. `required` keeps the hard failure (the tier then
+  reports infrastructure breakage and Socket is consulted instead); `off`
+  never sandboxes.
 - `guarddog.timeout_seconds`: wall-clock limit for each GuardDog scan and its
   version probe. Default: `120`. Successful complete results are cached
   permanently under `~/.cache/safe/guarddog/`, keyed by the exact public
