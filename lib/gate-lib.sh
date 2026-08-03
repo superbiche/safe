@@ -376,6 +376,26 @@ safe_gate_split_spec() {
 # Offline fallback: when the audit itself timed out, an exact-version request
 # matching a fresh install-known entry (a previously recorded clean check) may
 # proceed on that stale evidence. Unpinned requests never qualify.
+# Disclose weaker-isolation provenance at REUSE time (review F9).
+safe_gate_known_provenance() {
+  local package="$1" ecosystem="$2" known_file name version
+  case "${ecosystem}" in
+    cargo) ecosystem="rust" ;;
+    composer) ecosystem="php" ;;
+    pip|uv) ecosystem="python" ;;
+  esac
+  command -v jq >/dev/null 2>&1 || return 0
+  known_file="$(safe_gate_run_config_dir)/install-known.json"
+  [[ -r "${known_file}" ]] || return 0
+  IFS=$'\t' read -r name version <<< "$(safe_gate_split_spec "${package}")"
+  [[ -n "${name}" ]] || return 0
+  if jq -e --arg k "${ecosystem}:${name}" \
+    '(.packages[$k].reasons // []) | index("guarddog_clean_for_versions_nosandbox") != null' \
+    "${known_file}" >/dev/null 2>&1; then
+    printf '%s' " — behavioral evidence was gathered WITHOUT the kernel sandbox"
+  fi
+}
+
 safe_gate_known_matches() {
   local package="$1"
   local ecosystem="$2"
@@ -899,7 +919,7 @@ safe_gate_check() {
       ;;
     124|137)
       if safe_gate_known_matches "${package}" "${ecosystem}"; then
-        safe_gate_err "safe install: safe audit timed out; proceeding on recorded clean check for ${package} (stale evidence)"
+        safe_gate_err "safe install: safe audit timed out; proceeding on recorded clean check for ${package} (stale evidence)$(safe_gate_known_provenance "${package}" "${ecosystem}")"
         safe_gate_audit_log "${ecosystem}" "${package}" "STALE_EVIDENCE"
         return 0
       fi

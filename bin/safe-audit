@@ -5185,8 +5185,11 @@ guarddog_scan_one_json() {
   [[ "$ecosystem" == "python" ]] && cli_ecosystem="pypi"
 
   # One deadline for the whole version scan: an auto retry must fit inside
-  # the configured wall-clock budget, not double it (delta-2 F7).
-  local scan_deadline=$(( $(date +%s) + budget ))
+  # the configured wall-clock budget, not double it (delta-2 F7). It starts
+  # immediately before the FIRST launch, never before cache preparation —
+  # a slow hash/cache probe must not eat the first attempt's budget
+  # (delta-3 F11).
+  local scan_deadline=0
   local cache_eligible=false cache_key="" cache_file="" attempt_profile=""
   local attempt_kind="sandbox"
   [[ "$GUARDDOG_SANDBOX_MODE" == "off" ]] && attempt_kind="nosandbox"
@@ -5220,6 +5223,8 @@ guarddog_scan_one_json() {
   guarddog_run_scan() {
     local -a sandbox_flag=()
     [[ "$attempt_kind" == "nosandbox" ]] && sandbox_flag=(--no-sandbox)
+    # The first launch defines the window; later attempts share what is left.
+    (( scan_deadline == 0 )) && scan_deadline=$(( $(date +%s) + budget ))
     local remaining=$(( scan_deadline - $(date +%s) ))
     rc=0
     if (( remaining <= 0 )); then

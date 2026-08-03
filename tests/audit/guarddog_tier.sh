@@ -187,6 +187,16 @@ case "${MOCK_GUARDDOG_MODE:-clean}" in
     fi
     exit 0
     ;;
+  slow-then-sandbox-fail)
+    # Consumes most of the budget, THEN reports a sandbox failure.
+    if [[ "$no_sandbox" == "1" ]]; then
+      sleep 30
+      exit 0
+    fi
+    sleep 2
+    printf '{"package": "demo", "issues": 0, "errors": {"download-package": "Sandboxed extraction failed: no entropy"}}\n'
+    exit 0
+    ;;
   scan-error-shape)
     # GuardDog's real failure shape: no risk fields, cause in .errors.
     printf '{"package": "demo", "issues": 0, "errors": {"download-package": "Sandboxed extraction failed: no entropy"}}\n'
@@ -1231,6 +1241,60 @@ if jq -e '.packages["npm:demo"].reasons | index("guarddog_clean_for_versions_nos
 else
   cat "$CASE_RUN_CONFIG/install-known.json" >&2 || true
   fail "install-known records the unsandboxed provenance"
+fi
+
+# F11: the budget is shared, and it starts at the FIRST LAUNCH (cache
+# preparation must not consume it). First attempt burns ~2s of a 3s budget,
+# then the retry hangs: shared-budget code finishes near 3s; per-attempt
+# budgets would take ~5s. The scanner must actually have been invoked.
+prepare_case sandbox-budget-is-shared-not-doubled
+printf '{"install": {"guarddog": {"timeout_seconds": 3}}}\n' > "$CASE_RUN_CONFIG/config.json"
+BUDGET_BEFORE=$(date +%s)
+run_check 1 MOCK_GUARDDOG_MODE=slow-then-sandbox-fail -- demo@1.0.0 --ecosystem npm --json
+BUDGET_ELAPSED=$(( $(date +%s) - BUDGET_BEFORE ))
+if (( BUDGET_ELAPSED <= 4 )); then
+  pass "both attempts share one budget (elapsed ${BUDGET_ELAPSED}s for a 3s budget)"
+else
+  printf 'elapsed %ss — per-attempt budgets would show ~5s\n' "$BUDGET_ELAPSED" >&2
+  fail "both attempts share one budget"
+fi
+if grep -q 'scan demo' "$CASE_LOG" 2>/dev/null; then
+  pass "the first attempt actually invoked the scanner"
+else
+  cat "$CASE_LOG" >&2 || true
+  fail "the first attempt actually invoked the scanner"
+fi
+
+# A tiny budget must still reach the scanner: the deadline may not be spent
+# by cache-key derivation before the first launch.
+prepare_case sandbox-tiny-budget-still-scans
+printf '{"install": {"guarddog": {"timeout_seconds": 1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 -- demo@1.0.0 --ecosystem npm --json
+if grep -q 'scan demo' "$CASE_LOG" 2>/dev/null; then
+  pass "a 1s budget still launches the scanner after cache preparation"
+else
+  cat "$CASE_LOG" >&2 || true
+  fail "a 1s budget still launches the scanner after cache preparation"
+fi
+
+# F9 residual: reuse of recorded evidence discloses unsandboxed provenance.
+prepare_case sandbox-stale-reuse-discloses
+run_check 1 MOCK_GUARDDOG_SANDBOX_BROKEN=1 -- demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "auto fallback records evidence"
+STALE_OUT="$CASE_DIR/stale.log"
+(
+  cd "$CASE_DIR/project" || exit 99
+  env HOME="$CASE_HOME" PATH="$GUARDDOGBIN:$COMMONBIN:/usr/bin:/bin" \
+    SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" \
+    SAFE_AUDIT_CHECK_STATUS=124 \
+    bash -c 'source "$0"; safe_gate_known_provenance demo@1.0.0 npm' \
+    "$ROOT/lib/gate-lib.sh"
+) > "$STALE_OUT" 2>&1 || true
+if grep -q 'WITHOUT the kernel sandbox' "$STALE_OUT"; then
+  pass "stale-evidence reuse discloses unsandboxed provenance"
+else
+  cat "$STALE_OUT" >&2
+  fail "stale-evidence reuse discloses unsandboxed provenance"
 fi
 
 if (( FAIL_COUNT > 0 )); then
