@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.9.0"
+SAFE_VERSION="1.9.1"
 SAFE_SELF="$(readlink -f "$0")"
 SAFE_DIR="$(dirname "$SAFE_SELF")"
 SAFE_CONFIG_ROOT="${SAFE_CONFIG_DIR:-$HOME/.config/safe}"
@@ -825,7 +825,17 @@ doctor_payload_json() {
   verify_shasum_json=$(command_presence_json shasum)
   verify_python3_json=$(command_presence_json python3 --version)
   verify_python_json=$(command_presence_json python --version)
-  sandbox_podman_json=$(command_presence_json podman --version)
+  # Exec'ing podman from a no-new-privs process (Codex/bwrap sandboxes) needs
+  # an SELinux domain transition that nnp/nosuid forbids: every probe is
+  # denied and logs an AVC (setroubleshoot storms during sandboxed test
+  # runs), and the failed exec made doctor report podman as broken. Presence
+  # comes from PATH lookup alone there, with the reason disclosed.
+  if grep -q '^NoNewPrivs:[[:space:]]*1' /proc/self/status 2>/dev/null; then
+    sandbox_podman_json=$(command_presence_json podman | jq -c \
+      'if .present then . + {probed: false, note: "present but not probed: this process runs no-new-privs (sandbox) and podman needs a privilege transition the sandbox denies"} else . end')
+  else
+    sandbox_podman_json=$(command_presence_json podman --version)
+  fi
   sandbox_timeout_json=$(command_presence_json timeout)
 
   # Socket wiring: a failing socket score WARN-refuses installs, so the

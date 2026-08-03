@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.9.1 - 2026-08-03
+
+- `safe doctor` no longer execs `podman --version` from a no-new-privs
+  process (Codex/bwrap sandboxes): the SELinux domain transition podman
+  needs is denied there, so every probe logged an AVC (setroubleshoot storms
+  during sandboxed test runs) and doctor misreported podman as broken.
+  Sandboxed runs answer from PATH lookup and report
+  `present, probed: false` with the reason; unsandboxed probing is
+  unchanged.
+- `tests/run-all.sh`: parallel suite runner — 15 hermetic suites,
+  wall-clock ≈ the slowest suite (~2 min) instead of the serial sum
+  (~7 min).
+
 ## 1.9.0 - 2026-08-03
 
 - `install.cooldown_security_fix` (`exempt` default, `enforce`): a resolved

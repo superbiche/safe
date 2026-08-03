@@ -19,6 +19,16 @@ The installed gate is a COPY: repo edits change nothing live until `install.sh` 
 - Refusals: single final stderr line; exit 100 (policy) / 102 (operator TTY needed) / 104 (audit BLOCK); 0/10/20 are `safe audit check` verdict codes; 127 = genuinely missing command.
 - Fail-closed stays for malice signals (blocklist, critical advisory affecting the resolved version, Socket BLOCK). Resolution that cannot be predicted degrades honestly (package-level WARN + pin hint), never silently passes.
 
+## Reviews (repo default, ruled 2026-08-03)
+
+ONE orthogonal review round per PR: sol/xhigh for verdict-affecting changes,
+terra/medium for routine. Corrective findings close in-slice; the closure
+evidence is the regression test + green suite, not a re-review. A delta
+round runs only when round 1 found a BLOCKER or a fix is non-mechanical.
+Rationale (24h data, 2026-08-03): multi-round chains produced ~21%
+fix-caused findings while every operator-blocking defect arrived from live
+use, not review rounds.
+
 ## Contract and docs single-source
 
 `docs/contract/agent-contract.json` is the only source for the agent contract. Rendered surfaces (`docs/agents.md` generated blocks, `safe explain`) regenerate via `scripts/render-contract.sh`; never hand-edit generated blocks. `tests/contract/drift.sh` enforces this.
@@ -29,7 +39,7 @@ The installed gate is a COPY: repo edits change nothing live until `install.sh` 
 
 ## Tests
 
-Bash suites, no framework: `tests/install/run.sh`, `tests/audit/*.sh`, `tests/contract/drift.sh`. Run the suites touching your change before any PR; new behavior gets a case in the matching suite.
+Bash suites, no framework: `tests/install/run.sh`, `tests/audit/*.sh`, `tests/contract/drift.sh`. Run the suites touching your change before any PR; new behavior gets a case in the matching suite. `tests/run-all.sh` runs every hermetic suite in parallel (~2 min wall-clock) — use it when a change touches more than one surface.
 
 ## Git
 
