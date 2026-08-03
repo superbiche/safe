@@ -20,6 +20,7 @@ SUITES=(
   tests/audit/scan_cache.sh
   tests/audit/tool_resolution.sh
   tests/audit/cvss4_known_answers.sh
+  tests/audit/scanner_batch.sh
   tests/contract/drift.sh
   tests/contract/report_fp.sh
   tests/run/host_allow_review.sh

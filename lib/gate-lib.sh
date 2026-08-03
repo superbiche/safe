@@ -171,6 +171,16 @@ safe_gate_exec_real() {
     exit 127
   fi
 
+  # Install-time security scanner (Bun Security Scanner API): when the safe
+  # adapter is deployed and the caller has not chosen its own scanner, point
+  # hosts that honor the contract (mise's embedded aube installer) at it.
+  # Inert everywhere else — only aube reads the variable — and deliberately
+  # injected for every delegate: any child of the delegate that ends up
+  # running an aube install inherits the gate.
+  if [[ -z "${AUBE_SECURITY_SCANNER:-}" && -f "${HOME}/.config/safe/scanner.mjs" ]]; then
+    export AUBE_SECURITY_SCANNER="${HOME}/.config/safe/scanner.mjs"
+  fi
+
   # Bash assignment PRESERVES a pre-existing export attribute: if the caller
   # exported any scanner name, the scan would overwrite it with the
   # credential-bearing operational set and the delegate would inherit it
