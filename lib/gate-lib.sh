@@ -445,6 +445,66 @@ safe_gate_host_allow_matches() {
 }
 
 # ---------------------------------------------------------------------------
+# scripts-allow: operator-reviewed lifecycle-script grants (exact identity)
+# ---------------------------------------------------------------------------
+
+safe_gate_scripts_allow_file() {
+  printf '%s/scripts-allow.json' "$(safe_gate_run_config_dir)"
+}
+
+# Prints the granted version for a package name; fails when none.
+safe_gate_scripts_allow_version() {
+  local name="$1" file version
+  command -v jq >/dev/null 2>&1 || return 1
+  file="$(safe_gate_scripts_allow_file)"
+  [[ -r "${file}" ]] || return 1
+  version="$(jq -r --arg p "${name}" \
+    '.packages[$p] | select((.ecosystem // "npm") == "npm") | .version // empty' \
+    "${file}" 2>/dev/null || true)"
+  [[ -n "${version}" ]] || return 1
+  printf '%s' "${version}"
+}
+
+# For an npm global install whose requested spec exactly matches an operator
+# scripts grant: inject npm 12's per-command allow-scripts policy so the
+# reviewed scripts run. The allow list carries every granted identity (a
+# reviewed transitive dependency may run too); any script-bearing dependency
+# OUTSIDE the list hard-fails the install (strict). The global
+# ignore-scripts default is never touched — the policy lives and dies with
+# this one invocation. npm < 12 has no per-command policy: state the manual
+# fallback instead of silently skipping scripts.
+safe_gate_npm_scripts_env() {
+  local package matched="" name version granted
+  for package in "$@"; do
+    IFS=$'\t' read -r name version <<< "$(safe_gate_split_spec "${package}")"
+    granted="$(safe_gate_scripts_allow_version "${name}")" || continue
+    if [[ "${version}" == "${granted}" ]]; then
+      matched="${matched:+${matched},}${name}@${version}"
+    else
+      safe_gate_err "safe: scripts grant for ${name} is pinned to ${name}@${granted} — run npm i -g ${name}@${granted} to execute its reviewed install scripts"
+    fi
+  done
+  [[ -n "${matched}" ]] || return 0
+  local real npm_version major allow_list
+  real="$(safe_gate_resolve_real npm)" || real=""
+  npm_version="$("${real:-npm}" --version 2>/dev/null || true)"
+  major="${npm_version%%.*}"
+  if [[ ! "${major}" =~ ^[0-9]+$ ]] || (( major < 12 )); then
+    safe_gate_err "safe: scripts grant matched (${matched}) but npm ${npm_version:-unknown} has no per-command allow-scripts (needs >= 12) — scripts stay skipped; fallback: after the install, run only the audited script from the package directory"
+    return 0
+  fi
+  allow_list="$(jq -r \
+    '[.packages | to_entries[] | select((.value.ecosystem // "npm") == "npm") | "\(.key)@\(.value.version)"] | join(",")' \
+    "$(safe_gate_scripts_allow_file)" 2>/dev/null || true)"
+  [[ -n "${allow_list}" ]] || return 0
+  export npm_config_ignore_scripts=false
+  export npm_config_allow_scripts="${allow_list}"
+  export npm_config_strict_allow_scripts=true
+  safe_gate_audit_log "npm" "${matched}" "SCRIPTS_ALLOW_INJECTED"
+  safe_gate_err "safe: running operator-reviewed install scripts for ${matched} (npm allow-scripts, strict; unreviewed script-bearing dependencies fail the install)"
+}
+
+# ---------------------------------------------------------------------------
 # Project scan preflight
 # ---------------------------------------------------------------------------
 
@@ -1464,6 +1524,9 @@ safe_gate_npm_like() {
       safe_gate_check_many npm "${packages[@]}" || return $?
     fi
 
+    if [[ "${tool}" == "npm" ]] && (( ${#packages[@]} > 0 )); then
+      safe_gate_npm_scripts_env "${packages[@]}"
+    fi
     safe_gate_exec_real "${tool}" "$@"
   fi
 

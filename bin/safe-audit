@@ -5020,6 +5020,7 @@ osv_query_package_json() {
 
 SAFE_RUN_CONFIG_FILE="$SAFE_RUN_CONFIG_DIR/config.json"
 SAFE_RUN_HOST_ALLOW_FILE="$SAFE_RUN_CONFIG_DIR/host-allow.json"
+SAFE_RUN_SCRIPTS_ALLOW_FILE="$SAFE_RUN_CONFIG_DIR/scripts-allow.json"
 INSTALL_KNOWN_FILE="$SAFE_RUN_CONFIG_DIR/install-known.json"
 
 # Shared jq prelude: semver-ish comparison usable for npm/PyPI/crates/go
@@ -6825,6 +6826,17 @@ host_allow_matches_resolved() {
   return 1
 }
 
+# Operator scripts grant (safe run scripts-allow) matching the resolved
+# version exactly. Read-only here: the audit only decides whether the
+# install-scripts hint is needed — the grant is consumed by the gate.
+scripts_allow_matches_resolved() {
+  local name="$1" version="$2"
+  [[ -f "$SAFE_RUN_SCRIPTS_ALLOW_FILE" ]] || return 1
+  local entry_version
+  entry_version=$(jq -r --arg p "$name" '.packages[$p].version // empty' "$SAFE_RUN_SCRIPTS_ALLOW_FILE" 2>/dev/null || true)
+  [[ -n "$entry_version" && "$entry_version" == "$version" ]]
+}
+
 # Plumbing for the stale-evidence readers (install wrappers, bin/safe,
 # gate-lib): print the discriminated source identity this invocation would
 # audit under. Local-only — env + rc files, no network. Keeping the readers
@@ -7019,6 +7031,16 @@ check_command() {
     resolved_label="${resolved_label%, }"
   else
     primary_version="$PKG_VERSION"
+  fi
+
+  # Whether the resolved version declares install-time lifecycle scripts
+  # (abbreviated-packument hasInstallScript). Known only when the packument
+  # was fetched — exact-version specs skip that fetch, and "" means unknown.
+  local has_install_script=""
+  if (( resolution_ok )) && [[ "$ecosystem" == "npm" && -f "$scratch/packument.json" ]]; then
+    has_install_script=$(jq -r --arg v "$primary_version" \
+      'if (.versions[$v] | type) == "object" then ((.versions[$v].hasInstallScript // false) | tostring) else "" end' \
+      "$scratch/packument.json" 2>/dev/null) || has_install_script=""
   fi
 
   local socket_spec="$spec"
@@ -7219,6 +7241,7 @@ check_command() {
     --arg resolution_source "$RESOLUTION_SOURCE" \
     --arg resolution_range "$RESOLUTION_RANGE" \
     --arg resolution_status "$( (( resolution_ok )) && printf 'ok' || printf 'unresolved')" \
+    --arg has_install_script "$has_install_script" \
     --argjson resolved_versions "$resolved_versions_json" \
     --argjson classification "$combined" \
     --argjson versions "$classifications" \
@@ -7240,6 +7263,7 @@ check_command() {
         range: $resolution_range
       },
       warn_causes: $warn_causes,
+      has_install_script: (if $has_install_script == "" then null else ($has_install_script == "true") end),
       checks: {
         socket: $socket_line,
         osv: $osv_line,
@@ -7296,6 +7320,15 @@ check_command() {
             '["osv_clean_for_version","socket_ok","blocklist_pass"]' "$result_json"
           printf '[safe audit] recorded clean check: %s:%s@%s (install-known)\n' \
             "$ecosystem" "$PKG_NAME" "$primary_version" >&2
+        fi
+        # Legibility, not policy: the install proceeds either way, but a
+        # package that declares install scripts will land with them skipped
+        # (global ignore-scripts). Name the operator command that authorizes
+        # them, so a later "installed but broken" has a visible cause.
+        if [[ "$ecosystem" == "npm" && "$has_install_script" == "true" ]] && (( resolution_ok )) \
+          && ! scripts_allow_matches_resolved "$PKG_NAME" "$primary_version"; then
+          printf '[safe audit] %s@%s declares install scripts — they will be SKIPPED (global ignore-scripts); if the tool needs them: safe run scripts-allow add %s@%s --reason "..." (operator, TTY)\n' \
+            "$PKG_NAME" "$primary_version" "$PKG_NAME" "$primary_version" >&2
         fi
         gate_exit=0
         ;;

@@ -10,6 +10,7 @@ SAFE_RUN_NO_INIT="${SAFE_RUN_NO_INIT:-0}"
 CONFIG_DIR="${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}"
 DATA_DIR="${SAFE_RUN_DATA_DIR:-${SAFE_DATA_DIR:-$HOME/.local/share/safe}/run}"
 HOST_ALLOW_FILE="$CONFIG_DIR/host-allow.json"
+SCRIPTS_ALLOW_FILE="$CONFIG_DIR/scripts-allow.json"
 SANDBOX_KNOWN_FILE="$CONFIG_DIR/sandbox-known.json"
 INSTALL_KNOWN_FILE="$CONFIG_DIR/install-known.json"
 BLOCKED_FILE="$CONFIG_DIR/blocked.json"
@@ -190,6 +191,7 @@ caller_info() {
 ensure_dirs() {
   mkdir -p "$CONFIG_DIR" "$DATA_DIR"
   [[ -f "$HOST_ALLOW_FILE" ]]    || seed_file "$HOST_ALLOW_FILE"    '{"packages":{}}'
+  [[ -f "$SCRIPTS_ALLOW_FILE" ]] || seed_file "$SCRIPTS_ALLOW_FILE" '{"packages":{}}'
   [[ -f "$SANDBOX_KNOWN_FILE" ]] || seed_file "$SANDBOX_KNOWN_FILE" '{"packages":{}}'
   [[ -f "$INSTALL_KNOWN_FILE" ]] || seed_file "$INSTALL_KNOWN_FILE" '{"packages":{}}'
   [[ -f "$BLOCKED_FILE" ]]       || seed_file "$BLOCKED_FILE"       "$(default_blocked_json)"
@@ -1702,6 +1704,133 @@ cmd_host_allow_review() {
 }
 
 # ---------------------------------------------------------------------------
+# Subcommands: scripts-allow (operator grant: run lifecycle scripts)
+#
+# ~/.npmrc keeps ignore-scripts=true globally; a package whose functioning
+# REQUIRES its install scripts (platform-binary postinstalls) installs
+# "successfully" but broken. A scripts-allow entry is an operator-reviewed
+# grant for one exact identity: the gate injects npm 12's per-command
+# allow-scripts overrides so exactly the reviewed scripts run — the global
+# ignore-scripts default never changes. Operator-only (TTY), like host-allow:
+# an audit GO does not read script contents, so machines never self-grant.
+# ---------------------------------------------------------------------------
+
+cmd_scripts_allow() {
+  local sub="${1:-list}"
+  shift || true
+  case "$sub" in
+    add)    cmd_scripts_allow_add "$@" ;;
+    remove|rm) cmd_scripts_allow_remove "$@" ;;
+    list|ls|"") cmd_scripts_allow_list ;;
+    *)      die "unknown scripts-allow subcommand: $sub" ;;
+  esac
+}
+
+scripts_allow_fetch_scripts() {
+  # Prints the lifecycle-relevant scripts of one exact npm identity as a
+  # JSON object (may be empty). Fails when the registry document cannot be
+  # fetched — the caller decides whether a blind grant is acceptable.
+  local pkg="$1" version="$2"
+  local body
+  body=$(curl -fsSL --max-time 10 "https://registry.npmjs.org/${pkg}/${version}" 2>/dev/null) || return 1
+  printf '%s' "$body" | jq -c '(.scripts // {})
+    | with_entries(select(.key | IN("preinstall","install","postinstall","prepare")))' 2>/dev/null
+}
+
+cmd_scripts_allow_add() {
+  local spec="${1:-}"
+  shift || true
+  [[ -z "$spec" ]] && die "usage: safe run scripts-allow add <pkg>@<x.y.z> [--reason \"...\"]"
+  is_tty || {
+    err "BLOCKED: scripts-allow add requires an interactive operator terminal"
+    err "  ask the operator to run: safe run scripts-allow add ${spec} --reason \"...\""
+    err "  agent contract: safe explain"
+    exit 102
+  }
+  local reason="" ecosystem="npm"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reason) reason="$2"; shift 2 ;;
+      --reason=*) reason="${1#--reason=}"; shift ;;
+      --ecosystem) ecosystem="$2"; shift 2 ;;
+      --ecosystem=*) ecosystem="${1#--ecosystem=}"; shift ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+  [[ "$ecosystem" == "npm" ]] || die "scripts-allow supports only --ecosystem npm (npm 12 allow-scripts)"
+  parse_package "$spec"
+  # Exact identity only: the grant authorizes the scripts the operator saw,
+  # which exist at exactly one version. Never names, ranges, or tags.
+  [[ "$PKG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]] || \
+    die "scripts-allow requires an exact version (got '${PKG_VERSION}'); never names, ranges, or tags"
+  PKG_NAME=$(normalize_and_validate_package_or_die "$PKG_NAME" "npx" "$spec")
+
+  host_allow_preflight_audit "$PKG_NAME" "$PKG_VERSION" "$ecosystem" "$reason" "Grant scripts for"
+
+  # The review step: show the operator what would be authorized. A grant is
+  # a statement that these scripts were seen.
+  local scripts_json
+  if scripts_json=$(scripts_allow_fetch_scripts "$PKG_NAME" "$PKG_VERSION") && [[ -n "$scripts_json" ]]; then
+    if [[ "$scripts_json" == "{}" ]]; then
+      warn "${PKG_NAME}@${PKG_VERSION} declares no install-time lifecycle scripts at the registry"
+      warn "  (a grant is harmless but only transitive-dependency scripts could ever match it)"
+    else
+      printf '\ninstall-time lifecycle scripts of %s@%s:\n' "$PKG_NAME" "$PKG_VERSION" >&2
+      jq -r 'to_entries[] | "  \(.key): \(.value)"' <<<"$scripts_json" >&2
+      printf '\n' >&2
+    fi
+  else
+    scripts_json="null"
+    warn "could not fetch the script list for ${PKG_NAME}@${PKG_VERSION} — you would be authorizing scripts sight unseen"
+  fi
+  printf 'Authorize these install scripts to run on the host? [y/N] ' >&2
+  local answer
+  read -r answer
+  [[ "$answer" == "y" || "$answer" == "Y" ]] || die "scripts-allow add cancelled"
+
+  local sha=""
+  sha=$(registry_integrity_npm "$PKG_NAME" "$PKG_VERSION") || true
+  [[ -z "$sha" ]] && warn "could not fetch integrity for ${PKG_NAME}@${PKG_VERSION} (added without SHA)"
+
+  local tmp
+  tmp=$(mktemp)
+  jq --arg p "$PKG_NAME" --arg v "$PKG_VERSION" --arg s "$sha" \
+     --arg r "$reason" --arg d "$(date -I)" --argjson scripts "$scripts_json" '
+    .packages[$p] = {
+      version: $v,
+      sha: $s,
+      ecosystem: "npm",
+      added: $d,
+      reason: $r,
+      scripts: $scripts
+    }' "$SCRIPTS_ALLOW_FILE" > "$tmp"
+  mv "$tmp" "$SCRIPTS_ALLOW_FILE"
+  info "granted install scripts for ${PKG_NAME}@${PKG_VERSION}"
+  info "runs via: npm i -g ${PKG_NAME}@${PKG_VERSION} in a gated shell (npm >= 12; strict allow-scripts)"
+}
+
+cmd_scripts_allow_remove() {
+  local pkg="${1:-}"
+  [[ -z "$pkg" ]] && die "usage: safe run scripts-allow remove <pkg>"
+  pkg=$(resolve_package_key_in_file "$SCRIPTS_ALLOW_FILE" "$pkg")
+  local tmp
+  tmp=$(mktemp)
+  jq --arg p "$pkg" 'del(.packages[$p])' "$SCRIPTS_ALLOW_FILE" > "$tmp"
+  mv "$tmp" "$SCRIPTS_ALLOW_FILE"
+  info "removed scripts grant for $pkg"
+}
+
+cmd_scripts_allow_list() {
+  jq -r '.packages | to_entries[] |
+    "\(.key)@\(.value.version)\t\(.value.added)\t\(if .value.scripts == null then "unreviewed(fetch failed)" else ((.value.scripts | keys | join(",")) // "none") end)\t\(.value.reason)"' \
+    "$SCRIPTS_ALLOW_FILE" | \
+    awk -F'\t' 'BEGIN{printf "%-40s %-12s %-28s %s\n","PACKAGE","ADDED","SCRIPTS","REASON"}
+                {printf "%-40s %-12s %-28s %s\n",$1,$2,($3==""?"none":$3),$4}'
+  printf '\nnote: grants apply to npm global installs in gated shells (npm >= 12 allow-scripts, strict).\n'
+  printf '      the global ignore-scripts default never changes.\n'
+}
+
+# ---------------------------------------------------------------------------
 # Subcommands: block
 # ---------------------------------------------------------------------------
 cmd_block() {
@@ -2287,6 +2416,14 @@ SUBCOMMANDS
                                               whether each pin still needs its
                                               entry (re-audit); --digest writes
                                               an inbox note when actionable
+  scripts-allow add <pkg>@<x.y.z> [--reason "..."]
+                                              Operator grant (TTY): reviewed
+                                              install scripts for one exact
+                                              identity run on npm -g installs
+                                              (npm >= 12 allow-scripts, strict);
+                                              global ignore-scripts unchanged
+  scripts-allow remove <pkg>                  Revoke scripts grant
+  scripts-allow list                          Show scripts grants
 
   block add <pkg> --reason "..."              Block a package
   block remove <pkg>                          Unblock
@@ -2353,6 +2490,7 @@ main() {
     fi
     case "$1" in
       host-allow) shift; cmd_host_allow "$@" ;;
+      scripts-allow) shift; cmd_scripts_allow "$@" ;;
       block)      shift; cmd_block "$@" ;;
       audit)      shift; cmd_audit "$@" ;;
       status)     shift; cmd_status "$@" ;;

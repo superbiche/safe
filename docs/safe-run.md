@@ -128,6 +128,41 @@ entries; an existing note for the day is never overwritten. `install.sh
 --review-timer` installs a weekly systemd user timer
 (`safe-host-allow-review.timer`) that runs `review --digest`.
 
+## Scripts Allowlist
+
+`~/.npmrc` keeps `ignore-scripts=true` globally, so a package whose
+functioning requires its install scripts (platform-binary postinstalls)
+installs "successfully" but broken. A scripts-allow entry is an
+operator-reviewed grant for one exact identity:
+
+```bash
+safe run scripts-allow add opencode-ai@0.5.0 --reason "fetches platform binary"
+safe run scripts-allow list
+safe run scripts-allow remove opencode-ai
+```
+
+`add` is operator-only (TTY, exit 102 otherwise), requires an exact version
+(never names, ranges, or tags), runs the audit preflight, then fetches and
+**displays the package's install-time lifecycle scripts** for review before
+asking for confirmation — the grant is a statement that these scripts were
+seen. The reviewed scripts and the registry integrity hash are snapshotted
+into the entry.
+
+Consumption: on a gated `npm install -g <pkg>@<granted-version>` (npm ≥ 12),
+the gate injects npm's per-command policy for that one invocation —
+`ignore-scripts=false`, `allow-scripts=<every granted identity>`,
+`strict-allow-scripts=true` — so exactly the reviewed scripts run and any
+script-bearing dependency outside the grant list fails the install. The
+global `ignore-scripts` default never changes. With npm < 12 (no per-command
+policy) the gate states the manual fallback and installs script-less as
+before. An unpinned install of a granted package gets a hint naming the
+pinned grant.
+
+`safe audit check --gate install` prints a hint when a resolved version
+declares install scripts and no grant exists (`has_install_script` is also
+recorded in the check receipt), so "installed but broken" has a visible
+cause and the exact operator command to fix it.
+
 ## Blocklist
 
 ```bash

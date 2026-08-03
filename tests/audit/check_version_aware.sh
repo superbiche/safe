@@ -2813,5 +2813,75 @@ if expect_status 10 "a requested range beside an override pin degrades"; then
 fi
 
 # ---------------------------------------------------------------------------
+# 61. Resolved version declares install scripts, no scripts grant: GO with
+#     the operator hint (scripts are skipped, name the grant command) and
+#     has_install_script recorded in the receipt.
+# ---------------------------------------------------------------------------
+cat > "$FIXTURES/packument-installscript.json" <<'JSON'
+{
+  "dist-tags": {"latest": "0.5.0"},
+  "versions": {"0.4.0": {"hasInstallScript": true}, "0.5.0": {"hasInstallScript": true}}
+}
+JSON
+prepare_case install-script-hint
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument-installscript.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- opencode-ai --ecosystem npm --gate install
+if expect_status 0 "install-script package still passes on GO"; then
+  pass "install-script package still passes on GO"
+fi
+if expect_grep "$ERR_FILE" 'declares install scripts.*SKIPPED' "hint names the skip"; then
+  pass "hint names the skip"
+fi
+if expect_grep "$ERR_FILE" 'safe run scripts-allow add opencode-ai@0\.5\.0' "hint carries the exact grant command"; then
+  pass "hint carries the exact grant command"
+fi
+if [[ "$(jq -r '.has_install_script' "$CASE_CHECKS_DIR"/*.json 2>/dev/null | head -1)" == "true" ]]; then
+  pass "receipt records has_install_script"
+else
+  fail "receipt records has_install_script"
+fi
+
+# ---------------------------------------------------------------------------
+# 62. Same package with a matching scripts grant: no hint (the gate will
+#     inject the reviewed policy; nagging a granted identity is noise).
+# ---------------------------------------------------------------------------
+prepare_case install-script-granted
+printf '{"packages":{"opencode-ai":{"version":"0.5.0","ecosystem":"npm"}}}\n' \
+  > "$CASE_RUN_CONFIG/scripts-allow.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument-installscript.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- opencode-ai --ecosystem npm --gate install
+if expect_status 0 "granted install-script package passes"; then
+  pass "granted install-script package passes"
+fi
+if expect_no_grep "$ERR_FILE" 'scripts-allow add' "no hint when the grant matches"; then
+  pass "no hint when the grant matches"
+fi
+
+# ---------------------------------------------------------------------------
+# 63. No install scripts declared: no hint, receipt false.
+# ---------------------------------------------------------------------------
+prepare_case no-install-script
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@beta --ecosystem npm --gate install
+if expect_status 0 "scriptless package passes" ; then
+  pass "scriptless package passes"
+fi
+if expect_no_grep "$ERR_FILE" 'declares install scripts' "no hint without scripts"; then
+  pass "no hint without scripts"
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
