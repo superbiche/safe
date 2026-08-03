@@ -42,6 +42,7 @@ LEGACY_FPATH_LINE='fpath=("$HOME/.config/safe-run/completions" $fpath)'
 DO_RUN=0
 DO_AUDIT=0
 DO_WRAPPERS=0
+DO_REVIEW_TIMER=0
 
 err()  { printf '\033[31minstall:\033[0m %s\n' "$*" >&2; }
 info() { printf '\033[36minstall:\033[0m %s\n' "$*" >&2; }
@@ -50,9 +51,10 @@ die()  { err "$@"; exit 1; }
 
 usage() {
   cat <<'EOF'
-usage: bash install.sh [--all] [--run] [--audit] [--wrappers] [--no-wrappers] [--uninstall]
+usage: bash install.sh [--all] [--run] [--audit] [--wrappers] [--no-wrappers] [--review-timer] [--uninstall]
 
-Default is --all.
+Default is --all. --review-timer additionally installs and enables the weekly
+host-allow staleness review as a systemd user timer (opt-in; machine state).
 EOF
 }
 
@@ -77,6 +79,9 @@ while [[ $# -gt 0 ]]; do
       ;;
     --wrappers)
       DO_WRAPPERS=1
+      ;;
+    --review-timer)
+      DO_REVIEW_TIMER=1
       ;;
     --no-wrappers)
       DO_RUN=1
@@ -578,6 +583,20 @@ else
     printf '%s\n' "$FPATH_LINE"
   } >> "$ZSHRC"
   info "added completion fpath line to $ZSHRC"
+fi
+
+if (( DO_REVIEW_TIMER )); then
+  SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  mkdir -p "$SYSTEMD_USER_DIR"
+  install -m 0644 "$REPO_DIR/systemd/safe-host-allow-review.service" "$SYSTEMD_USER_DIR/"
+  install -m 0644 "$REPO_DIR/systemd/safe-host-allow-review.timer" "$SYSTEMD_USER_DIR/"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user daemon-reload
+    systemctl --user enable --now safe-host-allow-review.timer
+    info "enabled weekly host-allow review timer (safe-host-allow-review.timer)"
+  else
+    warn "systemctl not found; timer units installed to $SYSTEMD_USER_DIR but not enabled"
+  fi
 fi
 
 info ""

@@ -1,0 +1,6 @@
+[Unit]
+Description=safe host-allow staleness review (digest to safe repo inbox when actionable)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/safe-run host-allow review --digest

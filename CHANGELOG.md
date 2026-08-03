@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- `safe run host-allow review`: read-only staleness report for host-allow
+  entries — age, observed usage (executions + install-gate overrides), and a
+  re-audit of each pinned version (`removable` / `keep` / `review-urgent` /
+  `unknown`; audit-infrastructure failure is always `unknown`, never
+  staleness evidence). `--json` for machines, `--digest` writes a dated
+  inbox note into the safe repo when it finds removable or review-urgent
+  entries, `--no-audit` skips the probes. `install.sh --review-timer`
+  installs an opt-in weekly systemd user timer running `review --digest`.
+  Removal stays operator-only (TTY-gated).
+
 ## 1.3.0 - 2026-08-03
 
 - CVSS v4.0 vectors now use a self-contained port of the pinned FIRST

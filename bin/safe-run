@@ -1282,6 +1282,7 @@ cmd_host_allow() {
     add)    cmd_host_allow_add "$@" ;;
     remove|rm) cmd_host_allow_remove "$@" ;;
     update) cmd_host_allow_update "$@" ;;
+    review) cmd_host_allow_review "$@" ;;
     list|ls|"") cmd_host_allow_list ;;
     *)      die "unknown host-allow subcommand: $sub" ;;
   esac
@@ -1391,6 +1392,313 @@ cmd_host_allow_list() {
                 {printf "%-40s %-8s %-12s %s\n",$1,$2,$3,$4}'
   printf '\nnote: host-allow tier ONLY applies to npm/npx (uses --ignore-scripts).\n'
   printf '      bunx/uvx/pipx invocations of these packages still go through the sandbox.\n'
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands: host-allow review (read-only staleness report)
+#
+# Entries outlive their reason: a pin added to override a WARN keeps granting
+# host exec long after the pinned version audits clean on its own. The review
+# reports, per entry, its age, observed usage, and whether the pinned version
+# still needs the entry — removal itself stays operator-only (TTY-gated).
+# ---------------------------------------------------------------------------
+
+# WARN causes that are audit-infrastructure breakage, not package findings
+# (operator ruling): an infra-only WARN means the entry's true state is
+# UNKNOWN — it is never evidence of staleness, and never "still needed".
+HOST_ALLOW_REVIEW_INFRA_CAUSES='["socket_unavailable","socket_auth_failed","socket_rate_limited","socket_error","osv_unavailable"]'
+
+host_allow_review_probe() {
+  # Re-audits one pinned entry; sets REVIEW_STATUS, REVIEW_AUDIT_EXIT,
+  # REVIEW_AUDIT_VERDICT, REVIEW_WARN_CAUSES.
+  local pkg="$1" version="$2" ecosystem="$3"
+  local out rc=0 leash="${SAFE_HOST_ALLOW_REVIEW_TIMEOUT:-90}"
+  REVIEW_AUDIT_VERDICT=""
+  REVIEW_WARN_CAUSES="[]"
+  # Direct safe-audit checks carry no timeout of their own (the gate wrapper
+  # adds the leash); bound the probe so one wedged Socket call cannot hang
+  # the whole review. stdin closed: a hidden interactive prompt must fail,
+  # not wait. SAFE_AUDIT_NO_INIT: the probe must not seed audit state on a
+  # machine that has none — the dated check receipt safe-audit writes for
+  # every check stays (it is the probe's verifiable evidence, same as for
+  # any other check consumer), but nothing else may be created.
+  if command -v timeout >/dev/null 2>&1; then
+    out=$(SAFE_AUDIT_NO_INIT=1 timeout "$leash" "$SAFE_AUDIT_BIN" check "${pkg}@${version}" \
+      --ecosystem "$ecosystem" --json </dev/null 2>/dev/null) || rc=$?
+  else
+    out=$(SAFE_AUDIT_NO_INIT=1 "$SAFE_AUDIT_BIN" check "${pkg}@${version}" \
+      --ecosystem "$ecosystem" --json </dev/null 2>/dev/null) || rc=$?
+  fi
+  REVIEW_AUDIT_EXIT=$rc
+  if [[ -n "$out" ]]; then
+    REVIEW_AUDIT_VERDICT=$(printf '%s' "$out" | jq -r '.verdict // empty' 2>/dev/null || true)
+    REVIEW_WARN_CAUSES=$(printf '%s' "$out" | jq -c '.warn_causes // []' 2>/dev/null) || REVIEW_WARN_CAUSES="[]"
+  fi
+  # An actionable status requires the parsed verdict to corroborate the exit
+  # code: a probe that exits 0 with empty or unparsable output is an
+  # untrustworthy result, not a clean one, and must land in the
+  # conservative arm.
+  case "$rc" in
+    0)
+      # A true GO carries no warn causes; exit 0 with a cause list (e.g. an
+      # infra cause) is internally contradictory probe output — distrust it.
+      if [[ "$REVIEW_AUDIT_VERDICT" == "GO" \
+        && "$(printf '%s' "$REVIEW_WARN_CAUSES" | jq -r 'length' 2>/dev/null)" == "0" ]]; then
+        REVIEW_STATUS="removable"
+      else
+        REVIEW_STATUS="unknown"
+      fi
+      ;;
+    10)
+      local non_infra
+      non_infra=$(printf '%s' "$REVIEW_WARN_CAUSES" | jq -r --argjson infra "$HOST_ALLOW_REVIEW_INFRA_CAUSES" \
+        '[.[] | select(. as $c | $infra | index($c) | not)] | length' 2>/dev/null) || non_infra=""
+      if [[ "$REVIEW_AUDIT_VERDICT" == "WARN" && "$non_infra" =~ ^[0-9]+$ ]] && (( non_infra > 0 )); then
+        REVIEW_STATUS="keep"
+      else
+        # Infra-only WARN, or a WARN whose payload we could not read: unknown.
+        REVIEW_STATUS="unknown"
+      fi
+      ;;
+    20)
+      if [[ "$REVIEW_AUDIT_VERDICT" == "BLOCK" ]]; then
+        REVIEW_STATUS="review-urgent"
+      else
+        REVIEW_STATUS="unknown"
+      fi
+      ;;
+    *)
+      REVIEW_STATUS="unknown"
+      ;;
+  esac
+}
+
+host_allow_review_usage() {
+  # Observed usage for one entry; sets REVIEW_TIMES_USED, REVIEW_LAST_USED.
+  # Executions come from the host-allow execution log (canonical, one JSON
+  # line per exec); install-gate WARN overrides come from the audit log
+  # (`GATE` tier, `HOST_ALLOW_OVERRIDE` decision). The audit log's own
+  # HOST_ALLOW tier lines duplicate the execution log — not counted twice.
+  local pkg="$1"
+  local exec_count=0 gate_count=0
+  # Concurrent writers can append out of timestamp order, and timestamps
+  # carry UTC offsets so lexical order is not chronological either: the only
+  # sound pick is the greatest instant, parsed per record.
+  local ts ts_epoch exec_epoch=-1 gate_epoch=-1 exec_last="" gate_last=""
+  if [[ -f "$SAFE_AUDIT_HOST_ALLOW_LOG" ]]; then
+    exec_count=$(jq -rs --arg p "$pkg" '[.[] | select(.package == $p)] | length' \
+      "$SAFE_AUDIT_HOST_ALLOW_LOG" 2>/dev/null) || exec_count=0
+    while IFS= read -r ts; do
+      [[ -n "$ts" ]] || continue
+      ts_epoch=$(date -d "$ts" +%s 2>/dev/null) || continue
+      if (( ts_epoch > exec_epoch )); then
+        exec_epoch=$ts_epoch
+        exec_last="$ts"
+      fi
+    done < <(jq -rs --arg p "$pkg" '.[] | select(.package == $p) | .timestamp // empty' \
+      "$SAFE_AUDIT_HOST_ALLOW_LOG" 2>/dev/null)
+  fi
+  if [[ -f "$AUDIT_LOG" ]]; then
+    gate_count=$(awk -F' \\| ' -v pkg="$pkg" '
+      $4 == "GATE" && $6 == "HOST_ALLOW_OVERRIDE" \
+        && ($3 == pkg || index($3, pkg "@") == 1) { count++ }
+      END { print count + 0 }' "$AUDIT_LOG" 2>/dev/null) || gate_count=0
+    while IFS= read -r ts; do
+      [[ -n "$ts" ]] || continue
+      ts_epoch=$(date -d "$ts" +%s 2>/dev/null) || continue
+      if (( ts_epoch > gate_epoch )); then
+        gate_epoch=$ts_epoch
+        gate_last="$ts"
+      fi
+    done < <(awk -F' \\| ' -v pkg="$pkg" '
+      $4 == "GATE" && $6 == "HOST_ALLOW_OVERRIDE" \
+        && ($3 == pkg || index($3, pkg "@") == 1) { print $1 }' "$AUDIT_LOG" 2>/dev/null)
+  fi
+  REVIEW_TIMES_USED=$(( exec_count + gate_count ))
+  if (( gate_epoch > exec_epoch )); then
+    REVIEW_LAST_USED="$gate_last"
+  else
+    REVIEW_LAST_USED="$exec_last"
+  fi
+}
+
+host_allow_review_repo_dir() {
+  # Where the digest note lands: the safe repo's inbox. Mirrors bin/safe's
+  # report_fp_repo_dir contract — an explicitly configured SAFE_REPO_DIR is
+  # authoritative (if it is wrong, that is an error, not a licence to fall
+  # back to a checkout nobody is watching).
+  if [[ -n "${SAFE_REPO_DIR:-}" ]]; then
+    [[ -d "$SAFE_REPO_DIR/.git" && -d "$SAFE_REPO_DIR/bin" ]] || return 1
+    (cd "$SAFE_REPO_DIR" && pwd)
+    return 0
+  fi
+  local script_dir candidate
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  for candidate in "$script_dir/.." "$HOME/dev/personal/safe"; do
+    [[ -d "$candidate/.git" && -d "$candidate/bin" ]] || continue
+    (cd "$candidate" && pwd)
+    return 0
+  done
+  return 1
+}
+
+host_allow_review_write_digest() {
+  # Writes the digest inbox note when the review found decisions to queue.
+  # The note is the nudge; nothing is removed automatically.
+  local report_json="$1"
+  local actionable
+  actionable=$(jq -r '(.summary.removable + .summary."review-urgent")' <<<"$report_json")
+  if (( actionable == 0 )); then
+    info "digest: nothing actionable (no removable or review-urgent entries); no note written"
+    return 0
+  fi
+  local repo_dir
+  if ! repo_dir=$(host_allow_review_repo_dir); then
+    err "digest: safe's repo is not on this machine (set SAFE_REPO_DIR); no note written"
+    return 1
+  fi
+  local note="$repo_dir/inbox/$(date -I)-safe-host-allow-digest.md"
+  if [[ -f "$note" ]]; then
+    info "digest: $note already exists; not overwriting"
+    return 0
+  fi
+  mkdir -p "$repo_dir/inbox"
+  jq -r '
+    def row: "| \(.name)@\(.version) | \(.ecosystem) | \(.age_days)d | \(.times_used) | \(.last_used // "never") | \(.status) |";
+    "# Host-allow review digest — " + (.generated | split("T")[0]),
+    "",
+    "**Source:** `safe run host-allow review --digest` (automated)",
+    "",
+    "## Summary",
+    "",
+    "\(.summary.total) entries — \(.summary.removable) removable, \(.summary.keep) keep, \(.summary."review-urgent") review-urgent, \(.summary.unknown) unknown, \(.summary.never_used) never used.",
+    "",
+    "## Entries",
+    "",
+    "| Entry | Eco | Age | Uses | Last used | Status |",
+    "|---|---|---|---|---|---|",
+    (.entries[] | row),
+    "",
+    "## Suggested actions",
+    "",
+    ( [.entries[] | select(.status == "review-urgent")
+        | "- **URGENT** `\(.name)@\(.version)` now audits BLOCK — standing host trust contradicts current knowledge; review immediately."],
+      [.entries[] | select(.status == "removable")
+        | "- `\(.name)@\(.version)` audits GO on its own — removable: `safe run host-allow remove \(.name)`"]
+      | .[] ),
+    "",
+    "Removal is operator-only (TTY-gated); this digest only queues the decisions.",
+    "Statuses marked `unknown` reflect audit-infrastructure failure — retry later, never treat as stale."
+  ' <<<"$report_json" > "$note"
+  info "digest written: $note"
+}
+
+cmd_host_allow_review() {
+  local json_mode=0 digest_mode=0 no_audit=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) json_mode=1; shift ;;
+      --digest) digest_mode=1; shift ;;
+      --no-audit) no_audit=1; shift ;;
+      *) die "unknown host-allow review flag: $1" ;;
+    esac
+  done
+
+  # An unreadable trust file is a legible error, not an empty report that
+  # would read as "no entries to review".
+  if [[ -f "$HOST_ALLOW_FILE" ]] && ! jq -e '.packages | type == "object"' "$HOST_ALLOW_FILE" >/dev/null 2>&1; then
+    die "host-allow file is unreadable or malformed: $HOST_ALLOW_FILE"
+  fi
+
+  local entries_tmp report_json now_epoch
+  entries_tmp=$(mktemp)
+  now_epoch=$(date +%s)
+
+  local entry name version ecosystem added reason age_days added_epoch malformed
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    # A malformed entry degrades to one unknown row and the review
+    # continues: aborting mid-list would hide the rest of the trust surface.
+    name=$(jq -r '.key // empty' <<<"$entry" 2>/dev/null) || name=""
+    [[ -n "$name" ]] || name="(invalid)"
+    version=$(jq -r '.value.version // empty' <<<"$entry" 2>/dev/null) || version=""
+    ecosystem=$(jq -r '.value.ecosystem // "npm"' <<<"$entry" 2>/dev/null) || ecosystem="npm"
+    added=$(jq -r '.value.added // empty' <<<"$entry" 2>/dev/null) || added=""
+    reason=$(jq -r '.value.reason // empty' <<<"$entry" 2>/dev/null) || reason=""
+    malformed=0
+    if [[ -z "$version" ]]; then
+      malformed=1
+      version="?"
+      reason="malformed host-allow entry"
+    fi
+    age_days=-1
+    if [[ -n "$added" ]] && added_epoch=$(date -d "$added" +%s 2>/dev/null); then
+      age_days=$(( (now_epoch - added_epoch) / 86400 ))
+    fi
+
+    host_allow_review_usage "$name"
+    if (( malformed )); then
+      REVIEW_STATUS="unknown"
+      REVIEW_AUDIT_EXIT=-1
+      REVIEW_AUDIT_VERDICT=""
+      REVIEW_WARN_CAUSES="[]"
+    elif (( no_audit )); then
+      REVIEW_STATUS="unaudited"
+      REVIEW_AUDIT_EXIT=-1
+      REVIEW_AUDIT_VERDICT=""
+      REVIEW_WARN_CAUSES="[]"
+    else
+      host_allow_review_probe "$name" "$version" "$ecosystem"
+    fi
+
+    jq -cn \
+      --arg name "$name" --arg version "$version" --arg ecosystem "$ecosystem" \
+      --arg added "$added" --argjson age_days "$age_days" --arg reason "$reason" \
+      --argjson times_used "$REVIEW_TIMES_USED" --arg last_used "$REVIEW_LAST_USED" \
+      --arg status "$REVIEW_STATUS" --argjson audit_exit "$REVIEW_AUDIT_EXIT" \
+      --arg audit_verdict "$REVIEW_AUDIT_VERDICT" --argjson warn_causes "$REVIEW_WARN_CAUSES" \
+      '{name:$name, version:$version, ecosystem:$ecosystem, added:$added,
+        age_days:$age_days, reason:$reason, times_used:$times_used,
+        last_used:(if $last_used == "" then null else $last_used end),
+        never_used:($times_used == 0), status:$status,
+        audit:{exit:$audit_exit, verdict:$audit_verdict, warn_causes:$warn_causes}}' >> "$entries_tmp"
+  done < <(jq -c '.packages | to_entries[]' "$HOST_ALLOW_FILE" 2>/dev/null)
+
+  report_json=$(jq -sc --arg generated "$(now_iso)" '
+    {generated:$generated, entries:.,
+     summary:{
+       total: length,
+       removable: [.[] | select(.status == "removable")] | length,
+       keep: [.[] | select(.status == "keep")] | length,
+       "review-urgent": [.[] | select(.status == "review-urgent")] | length,
+       unknown: [.[] | select(.status == "unknown")] | length,
+       unaudited: [.[] | select(.status == "unaudited")] | length,
+       never_used: [.[] | select(.never_used)] | length}}' "$entries_tmp")
+  rm -f "$entries_tmp"
+
+  if (( json_mode )); then
+    jq . <<<"$report_json"
+  else
+    jq -r '
+      ["ENTRY","ECO","AGE","USES","LAST USED","STATUS"],
+      (.entries[] | ["\(.name)@\(.version)", .ecosystem, "\(.age_days)d", "\(.times_used)",
+                     (.last_used // "never"), .status])
+      | @tsv' <<<"$report_json" | \
+      awk -F'\t' '{printf "%-40s %-6s %-6s %-5s %-26s %s\n",$1,$2,$3,$4,$5,$6}'
+    printf '\n'
+    jq -r '
+      (.entries[] | select(.status == "review-urgent")
+        | "URGENT: \(.name)@\(.version) now audits BLOCK — review immediately"),
+      (.entries[] | select(.status == "removable")
+        | "removable: \(.name)@\(.version) audits GO on its own — safe run host-allow remove \(.name)"),
+      (if ([.entries[] | select(.status == "unknown")] | length) > 0
+        then "note: unknown = audit infrastructure failure — retry later; never evidence of staleness"
+        else empty end)' <<<"$report_json"
+  fi
+
+  if (( digest_mode )); then
+    host_allow_review_write_digest "$report_json"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1974,6 +2282,11 @@ SUBCOMMANDS
                                               Update pinned version (prompts)
   host-allow remove <pkg>                     Remove from allowlist
   host-allow list                             Show allowlist
+  host-allow review [--json] [--digest] [--no-audit]
+                                              Staleness report: age, usage, and
+                                              whether each pin still needs its
+                                              entry (re-audit); --digest writes
+                                              an inbox note when actionable
 
   block add <pkg> --reason "..."              Block a package
   block remove <pkg>                          Unblock
@@ -2024,7 +2337,14 @@ main() {
   argv0=$(basename "$0")
   detect_runner "$argv0"
   if [[ "$SAFE_RUN_NO_INIT" != "1" ]]; then
-    ensure_dirs
+    # host-allow review is a read-only report over the trust surface: on a
+    # machine with no run state it must not seed trust files as a side
+    # effect of being asked what that state is.
+    if [[ "$argv0" == "safe-run" && "${1:-}" == "host-allow" && "${2:-}" == "review" ]]; then
+      :
+    else
+      ensure_dirs
+    fi
   fi
 
   if [[ "$argv0" == "safe-run" ]]; then

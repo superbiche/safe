@@ -97,6 +97,37 @@ safe run host-allow remove pnpm
 
 `host-allow add` and `host-allow update` are operator-only trust escalations: they require an interactive terminal and refuse in non-TTY shells with exit 102, so agents can suggest the command verbatim but never execute it. Both run `safe audit` before mutating the allowlist. A `GO` result can proceed without a reason. `WARN`, `BLOCK`, or unavailable audit results require a reason and interactive confirmation.
 
+### Staleness review
+
+Entries outlive their reason: a pin added to override a WARN keeps granting host
+execution long after the pinned version audits clean on its own.
+
+```bash
+safe run host-allow review            # human table
+safe run host-allow review --json     # machine-readable report
+safe run host-allow review --digest   # + inbox note in the safe repo when actionable
+safe run host-allow review --no-audit # age/usage only, no re-audit probes
+```
+
+Per entry the review reports age, observed usage (host executions plus
+install-gate overrides, joined from the audit logs), and a status from
+re-auditing the pinned version:
+
+- `removable` — audits GO on its own; the entry is dead weight.
+- `keep` — still overriding a real WARN finding.
+- `review-urgent` — the pinned version now audits BLOCK; standing host trust
+  contradicts current knowledge.
+- `unknown` — audit infrastructure failure (Socket/OSV outage, timeout). This
+  is breakage to fix, never evidence of staleness; retry later.
+
+The review is read-only — removal stays operator-only and TTY-gated. Each
+re-audit probe is bounded (`SAFE_HOST_ALLOW_REVIEW_TIMEOUT`, default 90s).
+`--digest` writes `inbox/<date>-safe-host-allow-digest.md` into the safe repo
+(`SAFE_REPO_DIR` overrides discovery) when it finds removable or review-urgent
+entries; an existing note for the day is never overwritten. `install.sh
+--review-timer` installs a weekly systemd user timer
+(`safe-host-allow-review.timer`) that runs `review --digest`.
+
 ## Blocklist
 
 ```bash
