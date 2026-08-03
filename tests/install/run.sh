@@ -1609,6 +1609,37 @@ case_gate_resolves_a_wrapped_mise_shim() {
   pass "$FUNCNAME"
 }
 
+case_gate_exec_delegates_through_a_wrapped_mise_shim() {
+  # End-to-end over the previous case (PR#63 review F1): discovery acceptance
+  # and the argv0-dispatch contract are separate mechanisms — this drives
+  # safe_gate_exec_real through the PRODUCTION-shaped mise wrapper and proves
+  # the accepted shim delegate actually reaches the real mise with the tool's
+  # args intact, never the gate.
+  prepare_case "gate-exec-through-wrapped-mise-shim"
+  local wrap="${WORK_DIR}/wrap" shimdir="${WORK_DIR}/miseshims" realbin="${WORK_DIR}/realbin"
+  mkdir -p "${wrap}" "${shimdir}" "${realbin}"
+  write_gate_wrappers "${wrap}"
+  ln -s "${wrap}/mise" "${shimdir}/pnpm"
+  cat > "${realbin}/mise" <<'STUB'
+#!/usr/bin/env bash
+printf 'REALMISE args=%s\n' "$*"
+STUB
+  chmod +x "${realbin}/mise"
+
+  local out
+  out="$(PATH="${wrap}:${shimdir}:${realbin}:/usr/bin:/bin" GATE_LIB="${ROOT_DIR}/lib/gate-lib.sh" \
+    bash -c 'source "${GATE_LIB}"; safe_gate_exec_real pnpm --version' 2>&1)"
+  # The shim dispatches argv0=pnpm through the wrapper's preamble to the real
+  # mise, which receives the delegate's args. Any gate re-entry or dispatch
+  # failure surfaces as different output (or the preamble's 127 message).
+  if [[ "$out" != "REALMISE args=--version" ]]; then
+    printf 'got: %s\n' "$out" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
 case_selective_install_refreshes_gate_lib() {
   prepare_case "selective-install-refreshes-gate-lib"
   # Release A: full install, then simulate a stale installed gate library.
@@ -3568,6 +3599,7 @@ main() {
     case_uninstall_restores_the_displaced_binary \
     case_gate_resolves_a_displaced_original \
     case_gate_resolves_a_wrapped_mise_shim \
+    case_gate_exec_delegates_through_a_wrapped_mise_shim \
     case_selective_install_refreshes_gate_lib \
     case_loose_marker_is_not_ownership \
     case_status_probes_every_wrapper \
