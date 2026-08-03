@@ -243,6 +243,7 @@ default_config_json() {
     "auto_allow_ttl_days": 30,
     "block_severities": ["critical"],
     "cooldown_days": 3,
+    "cooldown_security_fix": "exempt",
     "guarddog": {
       "enabled": true,
       "timeout_seconds": 120,

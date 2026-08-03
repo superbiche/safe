@@ -66,6 +66,7 @@ unchanged.
     "auto_allow_ttl_days": 30,
     "block_severities": ["critical"],
     "cooldown_days": 3,
+    "cooldown_security_fix": "exempt",
     "guarddog": {
       "enabled": true,
       "timeout_seconds": 120,
@@ -101,6 +102,17 @@ unchanged.
   WARN is overridable (exact host-allow pin, or `release_too_new` in
   `auto_allow_tolerate`); a failed publish-date lookup skips the check with
   a disclosed note, never a refusal.
+- `cooldown_security_fix`: `exempt` (default) or `enforce`. A cooldown that
+  blocks the release fixing a published CVE recreates the catch-22 this gate
+  was built to end. When the resolved version IS the remediation — an
+  advisory's `fixed` version equals it — `exempt` waives the cooldown and
+  names the advisories it remediates, on the verdict line and in the
+  receipt (`release.cooldown_waived`, `release.remediates`). `enforce`
+  keeps the wait, on the reasoning that a compromised-maintainer release
+  can carry a genuine fix as cover; the refusal then says the version does
+  remediate and that this setting caused the refusal. The exemption only
+  applies to advisories fixed AT a resolved version — it never waives the
+  cooldown for an ordinary feature release.
 - `socket.mode`: when to consult Socket. `auto` (default) is tier 3 —
   Socket runs only when the GuardDog behavioral tier produced no complete
   verdict (not installed, disabled, unsupported ecosystem, unresolved

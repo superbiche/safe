@@ -7480,15 +7480,26 @@ mark_install_known() {
 # Operator-pinned host-allow entry matching every version whose evidence the
 # caller asks it to override. The schema stores one exact version, so a single
 # pin can never authorize adverse evidence attached to multiple versions.
+# Ecosystem spellings differ between grant time (--ecosystem py|uv|pipx…) and
+# audit time (python); collapse both to one canonical name before comparing so
+# an operator grant never goes silently inert on a spelling mismatch.
+host_allow_canonical_eco() {
+  case "$1" in
+    py|python|uv|pipx|pypi) printf 'python' ;;
+    npm|bun) printf 'npm' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
 host_allow_matches_resolved() {
   local ecosystem="$1" name="$2"
   shift 2
-  [[ "$ecosystem" == "npm" ]] || return 1
   [[ -f "$SAFE_RUN_HOST_ALLOW_FILE" ]] || return 1
   local entry_version entry_ecosystem
   entry_version=$(jq -r --arg p "$name" '.packages[$p].version // empty' "$SAFE_RUN_HOST_ALLOW_FILE" 2>/dev/null || true)
   entry_ecosystem=$(jq -r --arg p "$name" '.packages[$p].ecosystem // "npm"' "$SAFE_RUN_HOST_ALLOW_FILE" 2>/dev/null || true)
-  [[ -n "$entry_version" && "$entry_ecosystem" == "npm" ]] || return 1
+  [[ -n "$entry_version" ]] || return 1
+  [[ "$(host_allow_canonical_eco "$entry_ecosystem")" == "$(host_allow_canonical_eco "$ecosystem")" ]] || return 1
   (( $# > 0 )) || return 1
   local v
   for v in "$@"; do
@@ -8025,18 +8036,58 @@ check_command() {
   # window (malicious versions are usually caught and yanked within days).
   # WARN-tier and overridable; a failed lookup is disclosed and skipped,
   # never a refusal — the cooldown is a heuristic, not advisory evidence.
-  local cooldown_days release_line="" release_age="" release_version="" release_published=""
+  local cooldown_days cooldown_security_fix release_line="" release_age="" release_version="" release_published=""
+  local release_security_fix_ids="" release_exempt=0
   cooldown_days=$(install_policy_json | jq -r '.cooldown_days // 3')
   [[ "$cooldown_days" =~ ^[0-9]+$ ]] || cooldown_days=3
+  # A cooldown that blocks the release fixing a published CVE recreates the
+  # exact catch-22 this gate was built to end: safe used to WARN-refuse the
+  # very bump that remediated the advisory it was warning about. So when the
+  # resolved version IS the fix — an advisory's fixed version equals it —
+  # the cooldown is waived by default and says so. `enforce` keeps the wait
+  # (compromised-maintainer releases can carry a real fix as cover); the
+  # operator picks which risk they prefer.
+  cooldown_security_fix=$(install_policy_json | jq -r '.cooldown_security_fix // "exempt"')
+  case "$cooldown_security_fix" in exempt|enforce) ;; *) cooldown_security_fix="exempt" ;; esac
   if (( resolution_ok )) && (( cooldown_days > 0 )); then
     local release_info release_rc=0
     release_info=$(release_min_age_days "$ecosystem" "$PKG_NAME" "$scratch" "${RESOLVED_VERSIONS[@]}") || release_rc=$?
     if (( release_rc == 0 )); then
       IFS=$'\t' read -r release_age release_version release_published <<<"$release_info"
       if (( release_age < cooldown_days )); then
-        release_line="WARN (${release_version} published ${release_age}d ago — younger than the ${cooldown_days}d cooldown)"
-        warn_causes+=("release_too_new")
-        bump_verdict verdict "WARN"
+        # Is this young release the remediation itself? An advisory counted
+        # as remediated whose `fixed` equals a resolved version means that
+        # version shipped the fix.
+        # The version-scoped OSV query only returns advisories AFFECTING the
+        # version, so a release that fixes a CVE returns nothing there. Ask
+        # the package-level question instead — but only inside the cooldown
+        # window, so the extra query stays off the common path.
+        local cooldown_resolved_json cooldown_osv="$scratch/osv-cooldown.json"
+        cooldown_resolved_json=$(printf '%s\n' "${RESOLVED_VERSIONS[@]}" | jq -cR . | jq -cs .)
+        if osv_query_package_json "$ecosystem" "$PKG_NAME" "" "$cooldown_osv" \
+          && [[ "$(jq -r '.status' "$cooldown_osv" 2>/dev/null)" == "ok" ]]; then
+          release_security_fix_ids=$(jq -r \
+            --argjson resolved "$cooldown_resolved_json" --arg eco "$osv_eco" --arg name "$PKG_NAME" '
+            [ .vulns[]?
+              | . as $v
+              | [ $v.affected[]?
+                  | select((.package.ecosystem // "") == $eco and (.package.name // "") == $name)
+                  | .ranges[]? | select(.type == "SEMVER" or .type == "ECOSYSTEM")
+                  | .events[]? | .fixed? | strings ] as $fixes
+              | select([ $fixes[] | select(. as $f | $resolved | index($f) != null) ] | length > 0)
+              | ($v.id? // "" | tostring) | select(length > 0) ]
+            | unique | join(", ")' "$cooldown_osv" 2>/dev/null || true)
+        fi
+        if [[ -n "$release_security_fix_ids" && "$cooldown_security_fix" == "exempt" ]]; then
+          release_exempt=1
+          release_line="PASS (${release_version} published ${release_age}d ago — inside the ${cooldown_days}d cooldown, waived: it remediates ${release_security_fix_ids})"
+        else
+          release_line="WARN (${release_version} published ${release_age}d ago — younger than the ${cooldown_days}d cooldown)"
+          [[ -n "$release_security_fix_ids" ]] \
+            && release_line="${release_line}; it remediates ${release_security_fix_ids} but install.cooldown_security_fix=enforce"
+          warn_causes+=("release_too_new")
+          bump_verdict verdict "WARN"
+        fi
       else
         release_line="PASS (published ${release_age}d ago)"
       fi
@@ -8102,6 +8153,9 @@ check_command() {
     --arg release_version "$release_version" \
     --arg release_published "$release_published" \
     --argjson cooldown_days "$cooldown_days" \
+    --arg cooldown_security_fix "$cooldown_security_fix" \
+    --arg release_security_fix_ids "$release_security_fix_ids" \
+    --argjson release_exempt "$release_exempt" \
     --arg resolution_method "$RESOLUTION_METHOD" \
     --arg resolution_source "$RESOLUTION_SOURCE" \
     --arg resolution_range "$RESOLUTION_RANGE" \
@@ -8139,6 +8193,9 @@ check_command() {
       },
       release: (if $release_line == "" then null else {
         cooldown_days: $cooldown_days,
+        security_fix_policy: $cooldown_security_fix,
+        remediates: (if $release_security_fix_ids == "" then [] else ($release_security_fix_ids | split(", ")) end),
+        cooldown_waived: ($release_exempt == 1),
         age_days: (if $release_age == "" then null else ($release_age | tonumber) end),
         version: (if $release_version == "" then null else $release_version end),
         published: (if $release_published == "" then null else $release_published end)
@@ -8192,7 +8249,7 @@ check_command() {
       # findings 5/7).
       gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" "$aff_count" \
         "$socket_detail" "$guarddog_rules" "$guarddog_detail" "$guarddog_finding_versions" \
-        ${warn_causes[@]+"${warn_causes[@]}"}
+        "$release_security_fix_ids" ${warn_causes[@]+"${warn_causes[@]}"}
       if [[ "$verdict" == "BLOCK" ]]; then
         printf 'safe audit: operator review required: safe audit check %s --ecosystem %s --json\n' \
           "$( (( resolution_ok )) && printf '%s@%s' "$PKG_NAME" "$primary_version" || printf '%s' "$spec")" "$ecosystem" >&2
@@ -8297,7 +8354,7 @@ check_command() {
         else
           gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" "$aff_count" \
             "$socket_detail" "$guarddog_rules" "$guarddog_detail" "$guarddog_finding_versions" \
-            "${warn_causes[@]}"
+            "$release_security_fix_ids" "${warn_causes[@]}"
           gate_exit=10
         fi
         ;;
@@ -8316,7 +8373,7 @@ check_command() {
         if (( ${#guarddog_block_causes[@]} > 0 )); then
           gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" 0 \
             "" "$guarddog_rules" "$guarddog_detail" "$guarddog_finding_versions" \
-            "${guarddog_block_causes[@]}"
+            "" "${guarddog_block_causes[@]}"
         fi
         printf 'safe audit: operator review required: safe audit check %s --ecosystem %s --json\n' \
           "$( (( resolution_ok )) && printf '%s@%s' "$PKG_NAME" "$primary_version" || printf '%s' "$spec")" "$ecosystem" >&2
@@ -8339,6 +8396,18 @@ check_command() {
   esac
 }
 
+# Prints the pinned host-allow add command when the store supports this
+# ecosystem (npm + python families today); returns 1 otherwise so the caller
+# falls back to the operator-review hint instead of a command that dies.
+gate_host_allow_add_cmd() {
+  local name="$1" version="$2" ecosystem="$3"
+  case "$(host_allow_canonical_eco "$ecosystem")" in
+    npm) printf 'safe run host-allow add %s@%s --reason "..."' "$name" "$version" ;;
+    python) printf 'safe run host-allow add %s@%s --ecosystem python --reason "..."' "$name" "$version" ;;
+    *) return 1 ;;
+  esac
+}
+
 # Actionable refusal hints for install-gate mode, printed to stderr in cause
 # priority order. Socket failures are infrastructure breakage — the wording
 # must never read as a package vulnerability finding.
@@ -8346,7 +8415,8 @@ gate_emit_refusal_hints() {
   local ecosystem="$1" name="$2" primary_version="$3" resolution_ok="$4" aff_count="$5" socket_detail="$6"
   local guarddog_rules="$7" guarddog_detail="$8"
   local guarddog_finding_versions="$9"
-  shift 9
+  local cooldown_remediates="${10}"
+  shift 10
   local -a causes=("$@")
   local cause has_socket_infra=0 has_unresolved=0 has_affecting=0 has_osv_down=0 has_low_score=0 has_custom_source=0 has_malware=0
   local has_guarddog_findings=0 has_guarddog_high_risk=0 has_guarddog_error=0 has_too_new=0
@@ -8367,9 +8437,17 @@ gate_emit_refusal_hints() {
   done
   if (( has_too_new )); then
     printf 'safe audit: resolved version is younger than the release cooldown — waiting out install.cooldown_days is the default protection against compromised releases\n' >&2
-    if [[ "$ecosystem" == "npm" && "$resolution_ok" == "1" && -n "$primary_version" ]]; then
-      printf 'safe audit: operator overrides: safe run host-allow add %s@%s --reason "..." / add release_too_new to install.auto_allow_tolerate\n' \
-        "$name" "$primary_version" >&2
+    if [[ -n "$cooldown_remediates" ]]; then
+      printf 'safe audit: NOTE this version remediates %s — install.cooldown_security_fix=exempt (the default) would let a security fix through; this refusal comes from the enforce setting\n' \
+        "$cooldown_remediates" >&2
+    fi
+    local too_new_allow_cmd=""
+    if [[ "$resolution_ok" == "1" && -n "$primary_version" ]]; then
+      too_new_allow_cmd=$(gate_host_allow_add_cmd "$name" "$primary_version" "$ecosystem") || too_new_allow_cmd=""
+    fi
+    if [[ -n "$too_new_allow_cmd" ]]; then
+      printf 'safe audit: operator overrides: %s / add release_too_new to install.auto_allow_tolerate\n' \
+        "$too_new_allow_cmd" >&2
     else
       printf 'safe audit: operator override: add release_too_new to install.auto_allow_tolerate\n' >&2
     fi
@@ -8382,9 +8460,10 @@ gate_emit_refusal_hints() {
     printf 'safe audit: to trust this source permanently: add it to install.trusted_registries in ~/.config/safe/run/config.json (operator)\n' >&2
   fi
   if (( has_affecting )) && (( ! has_malware )); then
-    if [[ "$ecosystem" == "npm" ]]; then
-      printf 'safe audit: to allow this exact version: safe run host-allow add %s@%s --reason "..."\n' \
-        "$name" "$primary_version" >&2
+    local affecting_allow_cmd=""
+    affecting_allow_cmd=$(gate_host_allow_add_cmd "$name" "$primary_version" "$ecosystem") || affecting_allow_cmd=""
+    if [[ -n "$affecting_allow_cmd" ]]; then
+      printf 'safe audit: to allow this exact version: %s\n' "$affecting_allow_cmd" >&2
     else
       printf 'safe audit: operator review: safe audit check %s@%s --ecosystem %s --json\n' \
         "$name" "$primary_version" "$ecosystem" >&2
@@ -8411,13 +8490,15 @@ gate_emit_refusal_hints() {
   elif (( has_guarddog_findings )); then
     printf 'safe audit: guarddog behavioral findings (%s) — operator review required\n' \
       "${guarddog_rules:-unknown rules}" >&2
-    if [[ "$ecosystem" == "npm" && "$resolution_ok" == "1" ]]; then
+    if [[ "$resolution_ok" == "1" ]]; then
       if [[ "$guarddog_finding_versions" == *,* ]]; then
         printf 'safe audit: guarddog findings affect multiple resolved versions (%s) — one host-allow pin cannot authorize the aggregate operation\n' \
           "$guarddog_finding_versions" >&2
       else
-        printf 'safe audit: to allow this exact version: safe run host-allow add %s@%s --reason "..."\n' \
-          "$name" "${guarddog_finding_versions:-$primary_version}" >&2
+        local guarddog_allow_cmd=""
+        guarddog_allow_cmd=$(gate_host_allow_add_cmd "$name" "${guarddog_finding_versions:-$primary_version}" "$ecosystem") || guarddog_allow_cmd=""
+        [[ -n "$guarddog_allow_cmd" ]] \
+          && printf 'safe audit: to allow this exact version: %s\n' "$guarddog_allow_cmd" >&2
       fi
     fi
     printf 'safe audit: alternate operator policy: add guarddog_findings to install.auto_allow_tolerate, then retry this exact version\n' >&2

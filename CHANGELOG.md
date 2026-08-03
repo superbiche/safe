@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.9.0 - 2026-08-03
+
+- `install.cooldown_security_fix` (`exempt` default, `enforce`): a resolved
+  version inside the release-age cooldown that FIXES a published advisory
+  (an OSV record whose `fixed` event equals that version) is waived by
+  default — a cooldown that blocks the release remediating a CVE recreates
+  the catch-22 the gate exists to end. The verdict line and the receipt
+  (`release.remediates`, `release.security_fix_policy`,
+  `release.cooldown_waived`) name the advisory ids; `enforce` keeps the wait
+  and the refusal says the fix exists and which setting held it back. The
+  package-level OSV lookup runs only inside the cooldown window and never
+  feeds verdict classification.
+- host-allow grants now work outside npm (graphifyy regression): all three
+  gate matchers were npm-only while `safe run host-allow add --ecosystem
+  python` happily recorded grants — the operator pin existed but was never
+  consulted, so a WARN-tier cause (cooldown, GuardDog findings) refused a
+  host-allowed python package. Matchers now compare ecosystems with spelling
+  normalization (`py`/`uv`/`pipx`/`pypi` ≡ `python`, `bun` ≡ `npm`; an npm
+  pin can never authorize a same-named python package), and refusal hints
+  offer the ecosystem-qualified `host-allow add` command for the python
+  family instead of steering non-npm to operator review.
+
 ## 1.8.0 - 2026-08-03
 
 - Socket is demoted to tier 3 (`install.socket.mode`, default `auto`): it is

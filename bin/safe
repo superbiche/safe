@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.8.0"
+SAFE_VERSION="1.9.0"
 SAFE_SELF="$(readlink -f "$0")"
 SAFE_DIR="$(dirname "$SAFE_SELF")"
 SAFE_CONFIG_ROOT="${SAFE_CONFIG_DIR:-$HOME/.config/safe}"
@@ -1505,8 +1505,19 @@ safe_install_write_host_allow() {
   printf 'safe: added %s to safe run host-allow\n' "$package" >&2
 }
 
+# Grant-time spellings (py|uv|pipx…) and audit-time spellings (python) must
+# compare equal, or an operator grant goes silently inert.
+safe_install_canonical_eco() {
+  case "$1" in
+    py|python|uv|pipx|pypi) printf 'python' ;;
+    npm|bun) printf 'npm' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
 safe_install_host_allow_matches() {
   local package="$1"
+  local ecosystem="${2:-npm}"
   local host_allow_file="${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run/host-allow.json"
   local name version entry_version entry_ecosystem
 
@@ -1519,7 +1530,8 @@ safe_install_host_allow_matches() {
   entry_version="$(jq -r --arg p "$name" '.packages[$p].version // empty' "$host_allow_file" 2>/dev/null || true)"
   entry_ecosystem="$(jq -r --arg p "$name" '.packages[$p].ecosystem // "npm"' "$host_allow_file" 2>/dev/null || true)"
 
-  [[ "$entry_version" == "$version" && "$entry_ecosystem" == "npm" ]]
+  [[ "$entry_version" == "$version" ]] || return 1
+  [[ "$(safe_install_canonical_eco "$entry_ecosystem")" == "$(safe_install_canonical_eco "$ecosystem")" ]]
 }
 
 # Persistent record of install-gate decisions, mirroring safe-run's audit_log
@@ -1716,7 +1728,7 @@ safe_install_audit_package() {
       return 0
       ;;
     1|10)
-      if [[ "$ecosystem" == "npm" ]] && safe_install_host_allow_matches "$package"; then
+      if safe_install_host_allow_matches "$package" "$ecosystem"; then
         err "safe audit warned for $package; exact host-allow entry permits install"
         safe_install_gate_log "$ecosystem" "$package" "HOST_ALLOW_OVERRIDE"
         return 0
@@ -1755,15 +1767,25 @@ safe_install_allow_hint() {
   local name version
 
   IFS=$'\t' read -r name version <<< "$(safe_install_split_spec "$package")"
-  if [[ "$ecosystem" == "npm" ]]; then
-    if [[ -n "$version" && "$version" != "latest" ]]; then
-      printf 'to allow: ask the operator to run: safe run host-allow add %s --reason "..." — then retry' "$package"
-    else
-      printf 'to allow: pin an exact version first (see the resolved-version hint above) — allow entries are never @latest'
-    fi
-  else
-    printf 'to allow: operator review — safe audit check %s --ecosystem %s' "$package" "$ecosystem"
-  fi
+  case "$(safe_install_canonical_eco "$ecosystem")" in
+    npm)
+      if [[ -n "$version" && "$version" != "latest" ]]; then
+        printf 'to allow: ask the operator to run: safe run host-allow add %s --reason "..." — then retry' "$package"
+      else
+        printf 'to allow: pin an exact version first (see the resolved-version hint above) — allow entries are never @latest'
+      fi
+      ;;
+    python)
+      if [[ -n "$version" && "$version" != "latest" ]]; then
+        printf 'to allow: ask the operator to run: safe run host-allow add %s --ecosystem python --reason "..." — then retry' "$package"
+      else
+        printf 'to allow: pin an exact version first (see the resolved-version hint above) — allow entries are never @latest'
+      fi
+      ;;
+    *)
+      printf 'to allow: operator review — safe audit check %s --ecosystem %s' "$package" "$ecosystem"
+      ;;
+  esac
 }
 
 safe_install_confirm() {

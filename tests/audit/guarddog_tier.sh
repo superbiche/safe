@@ -26,11 +26,13 @@ cat > "$COMMONBIN/curl" <<'MOCK'
 #!/usr/bin/env bash
 url=""
 outfile=""
+data=""
 args=("$@")
 i=0
 while (( i < ${#args[@]} )); do
   case "${args[$i]}" in
-    -H|--max-time|-d) i=$((i + 2)); continue ;;
+    -H|--max-time) i=$((i + 2)); continue ;;
+    -d) data="${args[$((i + 1))]}"; i=$((i + 2)); continue ;;
     -o) outfile="${args[$((i + 1))]}"; i=$((i + 2)); continue ;;
     http*://*) url="${args[$i]}" ;;
   esac
@@ -45,7 +47,14 @@ emit() {
 }
 case "$url" in
   *api.osv.dev*)
-    emit '{"vulns":[]}'
+    body_version=$(printf '%s' "$data" | tr -d ' \n' | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+    if [[ "${MOCK_OSV_REMEDIATED_AT:-}" != "" && -z "$body_version" ]]; then
+      # Advisory introduced earlier and FIXED exactly at the resolved
+      # version: the version under audit IS the security fix.
+      emit "{\"vulns\":[{\"id\":\"GHSA-fix-here\",\"database_specific\":{\"severity\":\"HIGH\"},\"affected\":[{\"package\":{\"ecosystem\":\"npm\",\"name\":\"demo\"},\"ranges\":[{\"type\":\"SEMVER\",\"events\":[{\"introduced\":\"0\"},{\"fixed\":\"${MOCK_OSV_REMEDIATED_AT}\"}]}]}]}]}"
+    else
+      emit '{"vulns":[]}'
+    fi
     ;;
   *registry.npmjs.org*)
     sri_a="sha512-$(printf 'A%.0s' {1..86})=="
@@ -1296,6 +1305,84 @@ else
   cat "$STALE_OUT" >&2
   fail "stale-evidence reuse discloses unsandboxed provenance"
 fi
+
+# --- cooldown vs security fixes (operator ruling 2026-08-03) -----------------
+#
+# A cooldown that blocks the release fixing a published CVE is the same
+# catch-22 the gate exists to end. Default `exempt` lets the fix through and
+# names the advisory; `enforce` keeps the wait and says why.
+
+prepare_case cooldown-waives-the-security-fix
+run_check 1 MOCK_NPM_TIME="$(date -d '1 day ago' -Is)" MOCK_OSV_REMEDIATED_AT=1.0.0 -- \
+  demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 0 "a day-old release that IS the fix installs by default"
+expect_json '.release.cooldown_waived == true
+  and (.release.remediates | index("GHSA-fix-here") != null)
+  and ((.warn_causes // []) | index("release_too_new") == null)' \
+  "the receipt records the waiver and the advisory it remediates"
+
+prepare_case cooldown-waiver-is-visible
+run_check 1 MOCK_NPM_TIME="$(date -d '1 day ago' -Is)" MOCK_OSV_REMEDIATED_AT=1.0.0 -- \
+  demo@1.0.0 --ecosystem npm
+expect_grep "$OUT_FILE" 'waived: it remediates GHSA-fix-here' \
+  "the verdict line explains why the cooldown did not apply"
+
+prepare_case cooldown-enforce-keeps-the-wait
+printf '{"install": {"cooldown_security_fix": "enforce"}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 MOCK_NPM_TIME="$(date -d '1 day ago' -Is)" MOCK_OSV_REMEDIATED_AT=1.0.0 -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 10 "enforce keeps the cooldown even for a security fix"
+expect_grep "$OUT_FILE" 'but install.cooldown_security_fix=enforce' \
+  "the verdict line names the setting that caused the refusal"
+expect_grep "$ERR_FILE" 'this version remediates GHSA-fix-here' \
+  "the refusal discloses that the blocked version is a fix"
+
+# The exemption must NOT cover an ordinary young release with no remediation.
+prepare_case cooldown-no-waiver-without-a-fix
+run_check 1 MOCK_NPM_TIME="$(date -d '1 day ago' -Is)" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 10 "a plain young release still waits out the cooldown"
+
+# ...nor an advisory fixed at a DIFFERENT version than the one resolved.
+prepare_case cooldown-no-waiver-for-other-version-fix
+run_check 1 MOCK_NPM_TIME="$(date -d '1 day ago' -Is)" MOCK_OSV_REMEDIATED_AT=0.9.0 -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 10 "an advisory fixed at another version does not waive the cooldown"
+
+# --- host-allow works outside npm (graphifyy regression, 2026-08-03) --------
+#
+# The gate's matcher was npm-only while `host-allow add --ecosystem python`
+# happily recorded grants: the operator pin existed but was never consulted.
+# An exact pin must waive WARN-tier causes in every supported ecosystem.
+
+prepare_case python-warn-hints-host-allow
+run_check 1 MOCK_GUARDDOG_MODE=warn -- demo@1.0.0 --ecosystem python --gate install
+expect_status 10 "python GuardDog WARN refuses without a pin"
+expect_grep "$ERR_FILE" 'host-allow add demo@1\.0\.0 --ecosystem python' \
+  "python refusal hint offers the ecosystem-qualified host-allow command"
+
+prepare_case python-host-allow-waives-warn
+printf '{"packages":{"demo":{"version":"1.0.0","ecosystem":"python"}}}\n' \
+  > "$CASE_RUN_CONFIG/host-allow.json"
+run_check 1 MOCK_GUARDDOG_MODE=warn -- demo@1.0.0 --ecosystem python --gate install
+expect_status 0 "python host-allow pin waives a WARN-tier refusal"
+expect_grep "$ERR_FILE" 'host-allow entry demo@1\.0\.0 matches every warned resolved version; allowing' \
+  "override notice names the python pin"
+
+# Grant-time spelling (uv/py/pipx) must match audit-time spelling (python).
+prepare_case python-host-allow-uv-spelling
+printf '{"packages":{"demo":{"version":"1.0.0","ecosystem":"uv"}}}\n' \
+  > "$CASE_RUN_CONFIG/host-allow.json"
+run_check 1 MOCK_GUARDDOG_MODE=warn -- demo@1.0.0 --ecosystem python --gate install
+expect_status 0 "a uv-spelled grant matches a python-ecosystem audit"
+
+# An npm-scoped pin must NOT leak into another ecosystem's package of the
+# same name.
+prepare_case python-host-allow-npm-entry-no-crossover
+printf '{"packages":{"demo":{"version":"1.0.0","ecosystem":"npm"}}}\n' \
+  > "$CASE_RUN_CONFIG/host-allow.json"
+run_check 1 MOCK_GUARDDOG_MODE=warn -- demo@1.0.0 --ecosystem python --gate install
+expect_status 10 "an npm pin cannot authorize the same-named python package"
 
 if (( FAIL_COUNT > 0 )); then
   printf 'guarddog tier: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT" >&2
