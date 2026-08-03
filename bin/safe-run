@@ -1763,7 +1763,7 @@ cmd_scripts_allow_add() {
   # which exist at exactly one version. Never names, ranges, or tags.
   [[ "$PKG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]] || \
     die "scripts-allow requires an exact version (got '${PKG_VERSION}'); never names, ranges, or tags"
-  PKG_NAME=$(normalize_and_validate_package_or_die "$PKG_NAME" "npx" "$spec")
+  PKG_NAME=$(normalize_and_validate_package_or_die "$PKG_NAME" "npm" "$spec")
 
   host_allow_preflight_audit "$PKG_NAME" "$PKG_VERSION" "$ecosystem" "$reason" "Grant scripts for"
 
@@ -1780,8 +1780,9 @@ cmd_scripts_allow_add() {
       printf '\n' >&2
     fi
   else
-    scripts_json="null"
-    warn "could not fetch the script list for ${PKG_NAME}@${PKG_VERSION} — you would be authorizing scripts sight unseen"
+    # A grant is a statement that the scripts were seen: no scripts, no
+    # grant. Sight-unseen authorization is never an option here.
+    die "could not fetch the script list for ${PKG_NAME}@${PKG_VERSION} — refusing a sight-unseen grant; retry when registry.npmjs.org is reachable"
   fi
   printf 'Authorize these install scripts to run on the host? [y/N] ' >&2
   local answer
@@ -1790,7 +1791,7 @@ cmd_scripts_allow_add() {
 
   local sha=""
   sha=$(registry_integrity_npm "$PKG_NAME" "$PKG_VERSION") || true
-  [[ -z "$sha" ]] && warn "could not fetch integrity for ${PKG_NAME}@${PKG_VERSION} (added without SHA)"
+  [[ -z "$sha" ]] && die "could not fetch registry integrity for ${PKG_NAME}@${PKG_VERSION} — refusing a grant not bound to the reviewed artifact"
 
   local tmp
   tmp=$(mktemp)

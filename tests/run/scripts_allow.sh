@@ -133,9 +133,19 @@ SH
   chmod +x "$tmp/bin/npm"
 }
 
+# Stub safe-audit: gate checks pass (exit 0) and the effective source
+# reports the default registry unless SAFE_AUDIT_STUB_SOURCE overrides it.
+cat > "$tmp/bin/safe-audit" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  effective-sources) printf '%s\n' "${SAFE_AUDIT_STUB_SOURCE:-implicit-default}"; exit 0 ;;
+  check) exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$tmp/bin/safe-audit"
+
 run_gate() {
-  # No safe-audit on PATH: the gate warns and proceeds, which is exactly the
-  # path that must still perform the scripts-env injection.
   PATH="$tmp/bin:/usr/bin:/bin" \
   SAFE_RUN_CONFIG_DIR="$tmp/config" \
   SAFE_RUN_DATA_DIR="$tmp/data" \
@@ -168,5 +178,66 @@ err_out=$( (run_gate install -g opencode-ai@0.5.0 >/dev/null) 2>&1 ) || true
 grep -q '^ignore_scripts=unset$' "$tmp/npm-invocation.log" || fail "npm 11 must not receive injection"
 grep -q "needs >= 12" <<<"$err_out" || fail "npm 11 fallback message missing"
 pass "npm < 12: no injection, legible fallback"
+
+# --- script-policy argv is refused (review F3) ----------------------------
+make_npm_stub 12.0.2
+for flag in --allow-scripts=evil@1.0.0 --dangerously-allow-all-scripts --strict-allow-scripts=false; do
+  rm -f "$tmp/npm-invocation.log"
+  set +e
+  err_out=$( (run_gate install -g opencode-ai@0.5.0 "$flag" >/dev/null) 2>&1 )
+  rc=$?
+  set -e
+  [[ "$rc" == "100" ]] || fail "$flag must be refused with exit 100 (got $rc)"
+  grep -q "overrides the operator's script policy" <<<"$err_out" || fail "$flag refusal not legible"
+  [[ ! -f "$tmp/npm-invocation.log" ]] || fail "$flag must never reach npm"
+done
+pass "script-policy argv refused (allow-scripts, dangerously-allow-all, strict off)"
+
+# --- inherited script-policy env is scrubbed (review F3) ------------------
+rm -f "$tmp/npm-invocation.log"
+env npm_config_dangerously_allow_all_scripts=true NPM_CONFIG_IGNORE_SCRIPTS=false \
+  bash -c "PATH='$tmp/bin:/usr/bin:/bin' SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' \
+    bash -c \"source '$GATE_LIB'; safe_gate_main npm install -g left-pad@9.9.9\"" >/dev/null 2>&1 || true
+grep -q '^ignore_scripts=unset$' "$tmp/npm-invocation.log" || fail "inherited NPM_CONFIG_IGNORE_SCRIPTS must be scrubbed"
+env_dump=$(env npm_config_dangerously_allow_all_scripts=true \
+  bash -c "PATH='$tmp/bin:/usr/bin:/bin' SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' \
+    bash -c \"source '$GATE_LIB'; SAFE_GATE_NO_EXEC=1 safe_gate_main npm install -g left-pad@9.9.9; env\"" 2>/dev/null)
+grep -q "dangerously_allow_all" <<<"$env_dump" && fail "inherited dangerously-allow-all env must be scrubbed"
+pass "inherited script-policy env scrubbed before the delegate"
+
+# --- custom registry blocks injection (review F4) -------------------------
+rm -f "$tmp/npm-invocation.log"
+err_out=$( (SAFE_AUDIT_STUB_SOURCE="registry=https://evil.example" run_gate install -g opencode-ai@0.5.0 >/dev/null) 2>&1 ) || true
+grep -q '^ignore_scripts=unset$' "$tmp/npm-invocation.log" || fail "custom source must not receive injection"
+grep -q "reviewed against the default registry" <<<"$err_out" || fail "custom-source skip not legible"
+pass "non-default effective source: no injection, legible skip"
+
+# --- --global false is a project install (review F6) ----------------------
+rm -f "$tmp/npm-invocation.log"
+run_gate --global false install opencode-ai@0.5.0 >/dev/null 2>&1 || true
+if [[ -f "$tmp/npm-invocation.log" ]]; then
+  grep -q '^ignore_scripts=unset$' "$tmp/npm-invocation.log" || fail "--global false must not receive injection"
+fi
+pass "--global false does not trigger injection"
+
+# --- sight-unseen grants refused (review F5, needs pty) -------------------
+if command -v python3 >/dev/null 2>&1; then
+  cat > "$tmp/bin/curl" <<'SH'
+#!/usr/bin/env bash
+exit 22
+SH
+  chmod +x "$tmp/bin/curl"
+  out=$(pty_run "SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' scripts-allow add ghost-pkg@1.0.0 --reason x" 2>&1) && \
+    fail "fetch failure must refuse the grant"
+  grep -q "sight-unseen" <<<"$out" || fail "sight-unseen refusal not legible: $out"
+  [[ "$(jq -r '.packages | has("ghost-pkg")' "$tmp/config/scripts-allow.json")" == "false" ]] || fail "sight-unseen grant was written"
+  pass "registry fetch failure refuses the grant (no sight-unseen authorization)"
+
+  out=$(pty_run "SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' scripts-allow add 'Not/A,Npm?Name@1.0.0' --reason x" 2>&1) && \
+    fail "invalid npm name must be rejected"
+  pass "invalid npm names rejected at the trust boundary (review F7)"
+else
+  printf 'SKIP - python3 unavailable; F5/F7 pty cases untested\n'
+fi
 
 printf 'scripts-allow: all cases passed\n'
