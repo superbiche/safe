@@ -261,7 +261,9 @@ cmd_report_fp() {
       "## Verdict inputs",
       "",
       "- Socket: `\(.socket.status // "n/a")`" +
-        (if ((.socket.status // "ok") != "ok")
+        (if (.socket.status // "") == "skipped_tier3"
+         then " — deliberately not consulted (tier 3 policy skip); not a failure"
+         elif ((.socket.status // "ok") != "ok")
          then " — the check failed; its raw error text is in the receipt, not here"
          else "" end),
       "- GuardDog: `\(.guarddog.status // "n/a")`" +

@@ -5185,8 +5185,24 @@ guarddog_scan_one_json() {
     return 0
   fi
   if ! guarddog_result_shape_valid "$raw"; then
-    guarddog_error_record "$version" "$scanner_version" \
-      "guarddog returned malformed or inconsistent JSON" "$artifact_json" "$output"
+    # GuardDog's own failure shape omits the risk fields entirely and carries
+    # the cause in .errors (verified live: a failed sandboxed extraction
+    # returns {package, issues, errors}). Reporting that as "malformed JSON"
+    # hid an actionable infrastructure cause behind a parser complaint —
+    # audit-infrastructure failure must always name the breakage to fix.
+    local declared_errors=""
+    declared_errors=$(jq -r '
+      if (type == "object") and ((.errors? // null) | type == "object")
+         and ((.errors | length) > 0)
+      then [.errors | to_entries[] | "\(.key): \(.value | tostring)"] | join("; ")
+      else empty end' "$raw" 2>/dev/null || true)
+    if [[ -n "$declared_errors" ]]; then
+      guarddog_error_record "$version" "$scanner_version" \
+        "guarddog scan failed — ${declared_errors:0:500}" "$artifact_json" "$output"
+    else
+      guarddog_error_record "$version" "$scanner_version" \
+        "guarddog returned malformed or inconsistent JSON" "$artifact_json" "$output"
+    fi
     return 0
   fi
 
@@ -5306,7 +5322,16 @@ guarddog_tier_json() {
   fi
   local version_line scanner_version
   version_line=$(head -n 1 "$version_out" | tr -d '\r')
+  # Accept both spellings: the installed guarddog 3.1.0 prints a BARE
+  # version (verified live), while Click's default `--version` renders
+  # "<prog>, version <x>". Parsing only the Click form made a correct
+  # install read as an unsupported scanner, silently disabling the whole
+  # behavioral tier — and, under tier-3, silently restoring Socket as the
+  # only behavioral signal (live adoption 2026-08-03).
   scanner_version=$(sed -n 's/^guarddog, version \([^[:space:]]\+\).*$/\1/p' <<<"$version_line")
+  if [[ -z "$scanner_version" ]]; then
+    scanner_version=$(sed -n 's/^\([0-9]\+\.[0-9]\+\.[0-9]\+[0-9A-Za-z.+-]*\)[[:space:]]*$/\1/p' <<<"$version_line")
+  fi
   if [[ "$scanner_version" != "$GUARDDOG_SUPPORTED_VERSION" ]]; then
     local unsupported_note
     if [[ -n "$scanner_version" ]]; then
@@ -5405,7 +5430,11 @@ release_min_age_days() {
         slot=$((slot + 1))
         curl -fsSL --max-time 5 "https://pypi.org/pypi/${encoded_name}/$(urlencode "$v")/json" \
           -o "$meta" 2>/dev/null || return 1
-        published=$(jq -r '[.urls[]?.upload_time_iso_8601 | strings] | min // empty' "$meta" 2>/dev/null || true)
+        # The NEWEST distribution upload anchors the age: PyPI releases can
+        # gain files after first publish, and pip may select exactly the
+        # fresh artifact — an old sdist must not lend its age to a
+        # yesterday wheel (PR#60 review F1).
+        published=$(jq -r '[.urls[]?.upload_time_iso_8601 | strings] | max // empty' "$meta" 2>/dev/null || true)
         [[ -n "$published" ]] || return 1
         epoch=$(date -d "$published" +%s 2>/dev/null) || return 1
         age=$(( (now_epoch - epoch) / 86400 ))
@@ -8030,7 +8059,10 @@ check_command() {
     if (( custom_source )); then
       printf '\n[safe audit] custom source: %s — advisory evidence covers the public registry identity only\n' "$CHECK_EFFECTIVE_SOURCES"
     fi
-    if [[ "$(jq -r '.available // false' "$socket_json" 2>/dev/null)" != "true" ]]; then
+    # Branch on the discriminated status first: a deliberate tier-3/never
+    # skip carries available:null and must not render as an outage
+    # (PR#60 review F3).
+    if [[ "$(jq -r '.available' "$socket_json" 2>/dev/null)" == "false" ]]; then
       printf '\n[safe audit] WARNING: socket CLI not available, skipping behavioral analysis\n'
       printf '[safe audit] Install: safe audit setup local\n'
     fi
@@ -8112,7 +8144,8 @@ check_command() {
         for adverse_cause in ${warn_causes[@]+"${warn_causes[@]}"}; do
           [[ "$adverse_cause" == "socket_low_score" \
             || "$adverse_cause" == "guarddog_findings" \
-            || "$adverse_cause" == "guarddog_high_risk" ]] && adverse=1
+            || "$adverse_cause" == "guarddog_high_risk" \
+            || "$adverse_cause" == "release_too_new" ]] && adverse=1
         done
         if (( adverse )); then
           revoke_install_known "$ecosystem" "$PKG_NAME" "$primary_version" ${RESOLVED_VERSIONS[@]+"${RESOLVED_VERSIONS[@]}"}
