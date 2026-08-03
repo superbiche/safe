@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.5.0 - 2026-08-03
 
 - `safe run scripts-allow`: operator-reviewed lifecycle-script grants for
   exact npm identities. `add` (TTY-only) displays the package's install
