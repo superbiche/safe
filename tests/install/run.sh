@@ -1572,6 +1572,43 @@ case_gate_resolves_a_displaced_original() {
   pass "$FUNCNAME"
 }
 
+case_gate_resolves_a_wrapped_mise_shim() {
+  prepare_case "gate-resolves-wrapped-mise-shim"
+  local bindir="${WORK_DIR}/gatebin" shimdir="${WORK_DIR}/miseshims"
+  mkdir -p "${bindir}" "${shimdir}"
+  # Our pnpm gate wrapper occupies the tool name in BIN_DIR.
+  printf '#!/usr/bin/env bash\n# safe-gate-wrapper v1 tool=pnpm\nexec safe gate pnpm -- "$@"\n' > "${bindir}/pnpm"
+  chmod +x "${bindir}/pnpm"
+  # Our mise wrapper, with a mise shim symlinked onto it — the layout a mise
+  # reshim produces while the wrapper shadows the real binary (2026-08-03:
+  # discovery classified the shim as ours and every node tool exited 127).
+  printf '#!/usr/bin/env bash\n# safe-gate-wrapper v1 tool=mise\nexec safe gate mise -- "$@"\n' > "${bindir}/mise"
+  chmod +x "${bindir}/mise"
+  ln -s "${bindir}/mise" "${shimdir}/pnpm"
+
+  local got
+  got="$(PATH="${bindir}:${shimdir}:/usr/bin:/bin" GATE_LIB="${ROOT_DIR}/lib/gate-lib.sh" \
+    bash -c 'source "${GATE_LIB}"; safe_gate_resolve_real pnpm')"
+  [[ "${got}" == "${shimdir}/pnpm" ]] || {
+    printf 'resolved to %s, expected %s\n' "${got:-<empty>}" "${shimdir}/pnpm" >&2
+    fail "$FUNCNAME"; return
+  }
+
+  # Resolving mise itself must still skip every wrapper: the real binary
+  # further along PATH wins, never the wrapper occupying the name.
+  local realbin="${WORK_DIR}/realbin"
+  mkdir -p "${realbin}"
+  printf '#!/usr/bin/env bash\necho real-mise\n' > "${realbin}/mise"
+  chmod +x "${realbin}/mise"
+  got="$(PATH="${bindir}:${shimdir}:${realbin}:/usr/bin:/bin" GATE_LIB="${ROOT_DIR}/lib/gate-lib.sh" \
+    bash -c 'source "${GATE_LIB}"; safe_gate_resolve_real mise')"
+  [[ "${got}" == "${realbin}/mise" ]] || {
+    printf 'resolved to %s, expected %s\n' "${got:-<empty>}" "${realbin}/mise" >&2
+    fail "$FUNCNAME"; return
+  }
+  pass "$FUNCNAME"
+}
+
 case_selective_install_refreshes_gate_lib() {
   prepare_case "selective-install-refreshes-gate-lib"
   # Release A: full install, then simulate a stale installed gate library.
@@ -3530,6 +3567,7 @@ main() {
     case_failed_wrapper_write_restores_the_displaced_binary \
     case_uninstall_restores_the_displaced_binary \
     case_gate_resolves_a_displaced_original \
+    case_gate_resolves_a_wrapped_mise_shim \
     case_selective_install_refreshes_gate_lib \
     case_loose_marker_is_not_ownership \
     case_status_probes_every_wrapper \

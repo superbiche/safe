@@ -97,6 +97,16 @@ safe_gate_is_wrapper() {
   return 1
 }
 
+# Tool field of a wrapper's canonical marker line (line 2, per install.sh
+# gate_wrapper_marked). Empty output when the line is not a marker.
+safe_gate_wrapper_marker_tool() {
+  local path="$1" line
+  line="$(LC_ALL=C sed -n '2p' -- "$path" 2>/dev/null)"
+  case "$line" in
+    '# safe-gate-wrapper '*' tool='*) printf '%s\n' "${line##* tool=}" ;;
+  esac
+}
+
 # First executable <tool> on PATH that is not one of our wrappers. For node
 # tools that is normally the version-manager shim (mise), which is what we
 # want: per-project tool versions keep resolving.
@@ -111,6 +121,16 @@ safe_gate_resolve_real() {
     candidate="${dir}/${tool}"
     [[ -f "$candidate" && -x "$candidate" ]] || continue
     if safe_gate_is_wrapper "$candidate"; then
+      # A mise reshim run while our mise wrapper shadows the real binary
+      # binds every shim to the wrapper: a file named <tool> whose marker
+      # says tool=mise. Its argv0 dispatch still reaches the real mise, so
+      # it IS the version-manager shim we want as the delegate — skipping
+      # it left node tools with zero candidates and exit 127 (2026-08-03).
+      if [[ "$tool" != "mise" ]] \
+        && [[ "$(safe_gate_wrapper_marker_tool "$candidate")" == "mise" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
       # A tool whose only installation sits at the path the wrapper occupies is
       # moved to <tool>.original at install time (uv, which installs itself to
       # ~/.local/bin/uv). Remember it and keep walking: a real tool further
