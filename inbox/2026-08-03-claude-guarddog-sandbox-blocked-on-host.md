@@ -59,6 +59,31 @@ coverage the cache-bound `safe-default-v1` profile promises).
 Until then `install.socket.mode=auto` keeps Socket in play automatically —
 no config change needed, and no false sense of coverage.
 
-## Resolution
+## Resolution — 2026-08-03 (operator ruling: pin GuardDog, unblock the work)
 
-(pending)
+Ruled by michel: a security gate that blocks the security tooling meant to
+replace the rate-limited scanner is a deal breaker. Actions taken:
+
+- `npm@12.0.2` installed with an explicitly authorized one-time gate bypass
+  (OSV + blocklist were clean; only the Socket infra-WARN stood in the way).
+  This also activates the 1.5.0 scripts-allow per-command injection.
+- `guarddog==3.1.0` installed (pinned; `GUARDDOG_SUPPORTED_VERSION` in
+  `bin/safe-audit` already gates the accepted version, and the machine-setup
+  inbox carries the pinned install line).
+- Root cause addressed in-product rather than worked around by hand: GuardDog
+  exposes `--no-sandbox` ("scan fails if the sandbox is unavailable unless
+  --no-sandbox is passed"). New knob `install.guarddog.sandbox`:
+  `auto` (default) retries once unsandboxed when the kernel sandbox is
+  broken, discloses the weaker isolation on every surface (human line,
+  receipt `sandbox.fell_back`, note), and binds the result to a SEPARATE
+  cache profile (`safe-nosandbox-v1`) so it can never replay as a sandboxed
+  result; `required` keeps the hard failure; `off` never sandboxes.
+
+Verified live on this host: `safe audit check left-pad@1.3.0 --ecosystem npm`
+→ `GuardDog: PASS`, `Socket: SKIP (tier 3 — behavioral verdict from
+GuardDog; not consulted)`, VERDICT GO, with the weaker-isolation disclosure
+printed. **The tiered design now delivers its purpose: a Socket 429 cannot
+degrade a check whose behavioral tier concluded.**
+
+Still worth doing (not blocking): report the Landlock/nono_py sandbox
+failure upstream so `auto` can stop falling back on this host.

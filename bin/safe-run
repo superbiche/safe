@@ -245,7 +245,8 @@ default_config_json() {
     "cooldown_days": 3,
     "guarddog": {
       "enabled": true,
-      "timeout_seconds": 120
+      "timeout_seconds": 120,
+      "sandbox": "auto"
     },
     "socket": {
       "mode": "auto"

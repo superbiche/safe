@@ -154,6 +154,12 @@ if [[ "${1:-}" == "--version" ]]; then
   exit 0
 fi
 [[ -n "${MOCK_GUARDDOG_LOG:-}" ]] && printf '%s\n' "$*" >> "$MOCK_GUARDDOG_LOG"
+no_sandbox=0
+for a in "$@"; do [[ "$a" == "--no-sandbox" ]] && no_sandbox=1; done
+if [[ "${MOCK_GUARDDOG_SANDBOX_BROKEN:-0}" == "1" && "$no_sandbox" == "0" ]]; then
+  printf '{"package": "demo", "issues": 0, "errors": {"download-package": "Sandboxed extraction failed: no entropy"}}\n'
+  exit 0
+fi
 scan_version=""
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
@@ -1005,10 +1011,24 @@ fi
 
 # Cooldown edges: boundary day, future timestamp, offset timezone, and the
 # multi-version minimum age driving the all-versions host-allow scope.
+# Exactly 3*86400s old: derived from one captured epoch so neither the local
+# time of day nor a DST transition decides which side of the boundary is
+# tested (review F5). A few seconds past the boundary keeps age == 3.
 prepare_case cooldown-boundary
-run_check 1 MOCK_NPM_TIME="$(date -d '3 days ago 12:00' -Is)" -- \
+BOUNDARY_EPOCH=$(( $(date +%s) - 3 * 86400 - 60 ))
+run_check 1 MOCK_NPM_TIME="$(date -u -d "@$BOUNDARY_EPOCH" +%Y-%m-%dT%H:%M:%SZ)" -- \
   demo@1.0.0 --ecosystem npm --gate install
 expect_status 0 "a release exactly at the cooldown boundary passes"
+expect_grep "$OUT_FILE" '^Release age: PASS \(published 3d ago\)' \
+  "the boundary case really sits at the boundary"
+
+# One minute inside the boundary must warn — the pair pins the comparison.
+prepare_case cooldown-just-inside-boundary
+INSIDE_EPOCH=$(( $(date +%s) - 3 * 86400 + 60 ))
+run_check 1 MOCK_NPM_TIME="$(date -u -d "@$INSIDE_EPOCH" +%Y-%m-%dT%H:%M:%SZ)" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 10 "one minute short of the cooldown still warns"
+expect_grep "$OUT_FILE" 'published 2d ago' "just-inside case reports age 2"
 
 prepare_case cooldown-future-timestamp
 run_check 1 MOCK_NPM_TIME="$(date -d '2 days' -Is)" -- \
@@ -1068,6 +1088,65 @@ if [[ -s "$CASE_DIR/socket-args.log" ]]; then
 else
   fail "an errored behavioral scan falls back to socket (tier-3 contract)"
 fi
+
+# --- sandbox fallback (operator ruling 2026-08-03) ---------------------------
+
+# auto: a broken kernel sandbox retries once with --no-sandbox, discloses the
+# weaker isolation everywhere, and still concludes (so Socket stays skipped).
+prepare_case sandbox-auto-fallback
+run_check 1 MOCK_GUARDDOG_SANDBOX_BROKEN=1 MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 0 "auto mode recovers behavioral coverage on a sandbox-broken host"
+expect_json '.guarddog.status == "ok" and .guarddog.sandbox.mode == "auto"
+  and .guarddog.sandbox.fell_back == true
+  and (.guarddog.note | contains("weaker isolation"))' \
+  "the fallback is disclosed in the receipt"
+if grep -q -- '--no-sandbox' "$CASE_LOG"; then
+  pass "the retry passes --no-sandbox"
+else
+  cat "$CASE_LOG" >&2 || true
+  fail "the retry passes --no-sandbox"
+fi
+if [[ -s "$CASE_DIR/socket-args.log" ]]; then
+  fail "a fallback-but-conclusive scan still skips socket"
+else
+  pass "a fallback-but-conclusive scan still skips socket"
+fi
+
+# Human output must show the weaker isolation even on a clean PASS.
+prepare_case sandbox-auto-fallback-human
+run_check 1 MOCK_GUARDDOG_SANDBOX_BROKEN=1 -- demo@1.0.0 --ecosystem npm
+expect_grep "$OUT_FILE" 'weaker isolation' "human output discloses the fallback on a PASS"
+
+# required: no fallback — the tier reports breakage and Socket is consulted.
+prepare_case sandbox-required-no-fallback
+printf '{"install": {"guarddog": {"sandbox": "required"}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 MOCK_GUARDDOG_SANDBOX_BROKEN=1 MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --json
+expect_json '.guarddog.status == "error" and .guarddog.sandbox.fell_back == false' \
+  "required mode keeps the hard failure"
+if grep -q -- '--no-sandbox' "$CASE_LOG"; then
+  fail "required mode never retries unsandboxed"
+else
+  pass "required mode never retries unsandboxed"
+fi
+if [[ -s "$CASE_DIR/socket-args.log" ]]; then
+  pass "required-mode breakage falls back to socket"
+else
+  fail "required-mode breakage falls back to socket"
+fi
+
+# off: always unsandboxed, and its results live under a SEPARATE cache
+# profile — a sandboxed cache entry must never satisfy an unsandboxed run.
+prepare_case sandbox-off-separate-cache
+run_check 1 -- demo@1.0.0 --ecosystem npm --json
+expect_json '.guarddog.cache.misses == 1' "sandboxed run populates the sandboxed profile"
+printf '{"install": {"guarddog": {"sandbox": "off"}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 -- demo@1.0.0 --ecosystem npm --json
+expect_json '.guarddog.cache.hits == 0 and .guarddog.cache.misses == 1' \
+  "an unsandboxed run does not replay the sandboxed cache entry"
+run_check 1 -- demo@1.0.0 --ecosystem npm --json
+expect_json '.guarddog.cache.hits == 1' "the unsandboxed profile caches on its own key"
 
 if (( FAIL_COUNT > 0 )); then
   printf 'guarddog tier: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT" >&2

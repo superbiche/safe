@@ -28,6 +28,12 @@ CHECKS_DIR="$DATA_DIR/checks"
 GUARDDOG_CACHE_DIR="${SAFE_AUDIT_GUARDDOG_CACHE_DIR:-$HOME/.cache/safe/guarddog}"
 GUARDDOG_SUPPORTED_VERSION="3.1.0"
 GUARDDOG_CACHE_PROFILE="safe-default-v1"
+# Profile used when the kernel sandbox is unavailable and the operator allows
+# the documented fallback. It is a DIFFERENT cache identity on purpose:
+# results gathered with weaker isolation must never replay as sandboxed ones.
+GUARDDOG_CACHE_PROFILE_NOSANDBOX="safe-nosandbox-v1"
+GUARDDOG_SANDBOX_MODE="auto"
+GUARDDOG_SANDBOX_FELL_BACK=0
 # Bound each GuardDog output stream. The raw JSON is later copied into both
 # the permanent cache and the receipt, so an unbounded scanner stream would
 # turn package-controlled match volume into a disk-exhaustion path.
@@ -5038,6 +5044,22 @@ guarddog_artifact_identity_json() {
   esac
 }
 
+# A sandbox-origin failure: GuardDog either refuses up front because the
+# kernel sandbox is unavailable, or its sandboxed child dies before running.
+guarddog_scan_sandbox_failed() {
+  local raw="$1" stderr_file="$2" rc="$3"
+  local haystack=""
+  haystack=$(cat "$stderr_file" 2>/dev/null || true)
+  if [[ -s "$raw" ]]; then
+    haystack+=$(jq -r 'if (type == "object") and ((.errors? // null) | type == "object")
+      then [.errors[] | tostring] | join(" ") else "" end' "$raw" 2>/dev/null || true)
+  fi
+  [[ "$haystack" == *"Sandboxed extraction failed"* \
+    || "$haystack" == *"sandbox is unavailable"* \
+    || "$haystack" == *"sandbox unavailable"* \
+    || "$haystack" == *"--no-sandbox"* ]]
+}
+
 guarddog_result_shape_valid() {
   local result="$1"
   jq -e '
@@ -5064,6 +5086,14 @@ guarddog_result_shape_valid() {
            .risk_score.score >= 7 and (.risks | length) > 0
          end)
   ' "$result" >/dev/null 2>&1
+}
+
+guarddog_active_profile() {
+  if (( GUARDDOG_SANDBOX_FELL_BACK )) || [[ "$GUARDDOG_SANDBOX_MODE" == "off" ]]; then
+    printf '%s' "$GUARDDOG_CACHE_PROFILE_NOSANDBOX"
+  else
+    printf '%s' "$GUARDDOG_CACHE_PROFILE"
+  fi
 }
 
 guarddog_cache_key() {
@@ -5138,7 +5168,8 @@ guarddog_scan_one_json() {
   if guarddog_artifact_identity_json "$ecosystem" "$name" "$version" "$scratch" "$slot" > "$artifact_file"; then
     artifact_json=$(cat "$artifact_file")
     if [[ -n "$scanner_version" ]] \
-      && cache_key=$(guarddog_cache_key "$artifact_json" "$scanner_version" "$key_material" 2>/dev/null) \
+      && cache_key=$(GUARDDOG_CACHE_PROFILE="$(guarddog_active_profile)" \
+        guarddog_cache_key "$artifact_json" "$scanner_version" "$key_material" 2>/dev/null) \
       && [[ -n "$cache_key" ]]; then
       cache_eligible=true
       cache_file="$GUARDDOG_CACHE_DIR/${cache_key}.json"
@@ -5148,7 +5179,7 @@ guarddog_scan_one_json() {
   local raw="$scratch/guarddog-${slot}.raw.json"
   if [[ "$cache_eligible" == "true" && -r "$cache_file" ]] \
     && jq -e --argjson identity "$artifact_json" --arg scanner_version "$scanner_version" \
-      --arg profile "$GUARDDOG_CACHE_PROFILE" '
+      --arg profile "$(guarddog_active_profile)" '
       .schema == 1 and .identity == $identity
       and .scanner == {name:"guarddog",version:$scanner_version,profile:$profile}
       and (.result | type == "object")
@@ -5162,12 +5193,41 @@ guarddog_scan_one_json() {
 
   local cli_ecosystem="$ecosystem" stderr_file="$scratch/guarddog-${slot}.stderr" rc=0
   [[ "$ecosystem" == "python" ]] && cli_ecosystem="pypi"
-  timeout --kill-after=2s "$budget" bash -c \
-    'ulimit -f "$1" || exit 125; shift; exec "$@"' \
-    safe-guarddog "$GUARDDOG_OUTPUT_LIMIT_KIB" \
-    env "${GUARDDOG_ENV_UNSET[@]}" "$guarddog_cmd" "$cli_ecosystem" scan "$name" \
-    --version "$version" --output-format=json \
-    > "$raw" 2> "$stderr_file" </dev/null || rc=$?
+  local -a sandbox_flag=()
+  [[ "$GUARDDOG_SANDBOX_MODE" == "off" ]] && sandbox_flag=(--no-sandbox)
+  guarddog_run_scan() {
+    rc=0
+    timeout --kill-after=2s "$budget" bash -c \
+      'ulimit -f "$1" || exit 125; shift; exec "$@"' \
+      safe-guarddog "$GUARDDOG_OUTPUT_LIMIT_KIB" \
+      env "${GUARDDOG_ENV_UNSET[@]}" "$guarddog_cmd" "$cli_ecosystem" scan "$name" \
+      --version "$version" --output-format=json ${sandbox_flag[@]+"${sandbox_flag[@]}"} \
+      > "$raw" 2> "$stderr_file" </dev/null || rc=$?
+  }
+  guarddog_run_scan
+  # Sandbox fallback (operator-configurable, default auto): GuardDog refuses
+  # to scan when the kernel sandbox is unavailable, and on some hosts its
+  # Landlock child cannot even start — which yields ZERO behavioral coverage
+  # rather than weaker coverage. In auto mode the retry runs with
+  # --no-sandbox, is loudly disclosed, and is bound to a DIFFERENT cache
+  # profile so it can never replay as a sandboxed result. mode=required
+  # keeps the hard failure; mode=off never sandboxes.
+  if [[ "$GUARDDOG_SANDBOX_MODE" == "auto" && ${#sandbox_flag[@]} -eq 0 ]] \
+    && guarddog_scan_sandbox_failed "$raw" "$stderr_file" "$rc"; then
+    sandbox_flag=(--no-sandbox)
+    GUARDDOG_SANDBOX_FELL_BACK=1
+    cache_key=""
+    cache_file=""
+    cache_eligible=false
+    if [[ -n "$artifact_json" && "$artifact_json" != "null" && -n "$scanner_version" ]] \
+      && cache_key=$(GUARDDOG_CACHE_PROFILE="$GUARDDOG_CACHE_PROFILE_NOSANDBOX" \
+        guarddog_cache_key "$artifact_json" "$scanner_version" "$key_material" 2>/dev/null) \
+      && [[ -n "$cache_key" ]]; then
+      cache_eligible=true
+      cache_file="$GUARDDOG_CACHE_DIR/${cache_key}.json"
+    fi
+    guarddog_run_scan
+  fi
   if (( rc != 0 )); then
     local failure_note
     local raw_size stderr_size output_limit_bytes=$((GUARDDOG_OUTPUT_LIMIT_KIB * 1024))
@@ -5215,7 +5275,7 @@ guarddog_scan_one_json() {
       cache_tmp=$(mktemp "$GUARDDOG_CACHE_DIR/.guarddog.XXXXXX" 2>/dev/null || true)
       if [[ -n "$cache_tmp" ]] \
         && jq -n --argjson identity "$artifact_json" --arg scanner_version "$scanner_version" \
-          --arg profile "$GUARDDOG_CACHE_PROFILE" \
+          --arg profile "$(guarddog_active_profile)" \
           --slurpfile result "$raw" '
           {schema:1,scanner:{name:"guarddog",version:$scanner_version,profile:$profile},
            identity:$identity,result:($result[0] // {})}' > "$cache_tmp" \
@@ -5242,6 +5302,9 @@ guarddog_tier_json() {
   policy=$(install_policy_json)
   enabled=$(jq -r 'if .guarddog.enabled == false then "false" else "true" end' <<<"$policy")
   budget=$(jq -r '.guarddog.timeout_seconds // 120' <<<"$policy")
+  GUARDDOG_SANDBOX_MODE=$(jq -r '.guarddog.sandbox // "auto"' <<<"$policy")
+  case "$GUARDDOG_SANDBOX_MODE" in auto|required|off) ;; *) GUARDDOG_SANDBOX_MODE="auto" ;; esac
+  GUARDDOG_SANDBOX_FELL_BACK=0
   if [[ ! "$budget" =~ ^[1-9][0-9]*$ ]]; then
     config_note="invalid install.guarddog.timeout_seconds; using default 120"
     budget=120
@@ -5359,7 +5422,11 @@ guarddog_tier_json() {
     slot=$((slot + 1))
   done
 
+  if (( GUARDDOG_SANDBOX_FELL_BACK )); then
+    config_note="${config_note:+$config_note; }kernel sandbox unavailable — scanned with --no-sandbox (weaker isolation; cached separately). Set install.guarddog.sandbox=required to fail instead"
+  fi
   jq -s --arg scanner_version "$scanner_version" --arg config_note "$config_note" \
+    --arg sandbox_mode "$GUARDDOG_SANDBOX_MODE" --argjson fell_back "$(( GUARDDOG_SANDBOX_FELL_BACK ? 1 : 0 ))" \
     --argjson budget "$budget" '
     . as $versions
     | (if any($versions[]; .contribution == "BLOCK") then "BLOCK"
@@ -5378,6 +5445,7 @@ guarddog_tier_json() {
         infra_error:any($versions[]; .infra_error),
         note:(if ($notes | length) == 0 then null else ($notes | join("; ")) end),
         timeout_seconds:$budget,
+        sandbox:{mode:$sandbox_mode,fell_back:($fell_back == 1)},
         scanner_version:(if $scanner_version == "" then null else $scanner_version end),
         rules:$rules,
         risk_label:($top.risk_label // null),risk_score:($top.risk_score // null),
@@ -8065,6 +8133,10 @@ check_command() {
     if [[ "$(jq -r '.available' "$socket_json" 2>/dev/null)" == "false" ]]; then
       printf '\n[safe audit] WARNING: socket CLI not available, skipping behavioral analysis\n'
       printf '[safe audit] Install: safe audit setup local\n'
+    fi
+    # Weaker isolation must never pass silently, even on a clean PASS.
+    if [[ "$(jq -r '.sandbox.fell_back // false' "$guarddog_json" 2>/dev/null)" == "true" ]]; then
+      printf '\n[safe audit] guarddog: %s\n' "$guarddog_detail"
     fi
     if [[ "$guarddog_status" == "skipped" && "$(jq -r '.available' "$guarddog_json")" == "false" ]]; then
       printf '\n[safe audit] %s\n' "$guarddog_detail"

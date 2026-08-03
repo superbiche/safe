@@ -68,7 +68,8 @@ unchanged.
     "cooldown_days": 3,
     "guarddog": {
       "enabled": true,
-      "timeout_seconds": 120
+      "timeout_seconds": 120,
+      "sandbox": "auto"
     },
     "socket": {
       "mode": "auto"
@@ -111,6 +112,16 @@ unchanged.
 - `guarddog.enabled`: run GuardDog for exact resolved npm/PyPI versions.
   Default: `true`. A missing binary is reported as a non-adverse skip while
   Socket remains enabled in the current tiered-scoring slice.
+- `guarddog.sandbox`: `auto` (default), `required`, or `off`. GuardDog
+  extracts archives inside a kernel sandbox and refuses to scan when that
+  sandbox is unavailable — on hosts where its sandboxed child cannot start,
+  that means ZERO behavioral coverage rather than weaker coverage. `auto`
+  retries once with `--no-sandbox`, discloses the weaker isolation on every
+  surface (human output, receipt, `sandbox.fell_back`), and binds the result
+  to a separate cache profile (`safe-nosandbox-v1`) so it can never replay
+  as a sandboxed result. `required` keeps the hard failure (the tier then
+  reports infrastructure breakage and Socket is consulted instead); `off`
+  never sandboxes.
 - `guarddog.timeout_seconds`: wall-clock limit for each GuardDog scan and its
   version probe. Default: `120`. Successful complete results are cached
   permanently under `~/.cache/safe/guarddog/`, keyed by the exact public
