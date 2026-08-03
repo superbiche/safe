@@ -58,6 +58,7 @@ case "$spec" in
   slow-pkg@*)    sleep 5; printf '{"verdict":"GO","warn_causes":[]}\n'; exit 0 ;;
   empty-pkg@*)   exit 0 ;;
   garbage-pkg@*) printf 'not json at all\n'; exit 20 ;;
+  contradict-pkg@*) printf '{"verdict":"GO","warn_causes":["socket_rate_limited"]}\n'; exit 0 ;;
 esac
 SH
 chmod +x "$tmp/bin/safe-audit-stub"
@@ -169,6 +170,15 @@ pass "exit 0 without corroborating GO payload is unknown"
 [[ "$(status_of garbage-pkg)" == "unknown" ]] || fail "exit-20 probe with garbage stdout must be unknown"
 pass "exit 20 without corroborating BLOCK payload is unknown"
 
+cat > "$tmp/config/host-allow.json" <<'JSON'
+{"packages":{
+  "contradict-pkg":{"version":"1.0.0","sha":"h","ecosystem":"npm","added":"2026-07-01","reason":"go with causes"}
+}}
+JSON
+report=$(run_review --json)
+[[ "$(status_of contradict-pkg)" == "unknown" ]] || fail "GO with warn causes must be unknown, not removable"
+pass "GO payload carrying warn causes is unknown"
+
 # --- probes must not seed audit state (F1b) -------------------------------
 grep -q '^noinit=1 ' "$tmp/stub-calls.log" || fail "probes must run with SAFE_AUDIT_NO_INIT=1"
 pass "probes pass SAFE_AUDIT_NO_INIT=1"
@@ -202,6 +212,17 @@ report=$(run_review --json)
 last=$(jq -r '.entries[0].last_used' <<<"$report")
 [[ "$last" == "2026-10-25T02:15:00+01:00" ]] || fail "last_used picked lexical, not chronological: $last"
 pass "last_used is chronological across UTC offsets"
+
+# Concurrent writers can append out of timestamp order: the later instant
+# sits on the FIRST line here, and must still win.
+cat > "$tmp/audit-data/host-allow-log.jsonl" <<'JSON'
+{"timestamp":"2026-10-25T02:15:00+01:00","package":"clean-pkg","version":"2.1.4","runner":"npx"}
+{"timestamp":"2026-10-25T02:30:00+02:00","package":"clean-pkg","version":"2.1.4","runner":"npx"}
+JSON
+report=$(run_review --json)
+last=$(jq -r '.entries[0].last_used' <<<"$report")
+[[ "$last" == "2026-10-25T02:15:00+01:00" ]] || fail "last_used must pick the greatest instant, not the last line: $last"
+pass "last_used survives out-of-order appends"
 
 # --- malformed entries degrade, not abort (F4) ----------------------------
 cat > "$tmp/config/host-allow.json" <<'JSON'

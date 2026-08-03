@@ -1440,7 +1440,10 @@ host_allow_review_probe() {
   # conservative arm.
   case "$rc" in
     0)
-      if [[ "$REVIEW_AUDIT_VERDICT" == "GO" ]]; then
+      # A true GO carries no warn causes; exit 0 with a cause list (e.g. an
+      # infra cause) is internally contradictory probe output — distrust it.
+      if [[ "$REVIEW_AUDIT_VERDICT" == "GO" \
+        && "$(printf '%s' "$REVIEW_WARN_CAUSES" | jq -r 'length' 2>/dev/null)" == "0" ]]; then
         REVIEW_STATUS="removable"
       else
         REVIEW_STATUS="unknown"
@@ -1477,35 +1480,41 @@ host_allow_review_usage() {
   # (`GATE` tier, `HOST_ALLOW_OVERRIDE` decision). The audit log's own
   # HOST_ALLOW tier lines duplicate the execution log — not counted twice.
   local pkg="$1"
-  local exec_count=0 exec_last="" gate_count=0 gate_last=""
+  local exec_count=0 gate_count=0
+  # Concurrent writers can append out of timestamp order, and timestamps
+  # carry UTC offsets so lexical order is not chronological either: the only
+  # sound pick is the greatest instant, parsed per record.
+  local ts ts_epoch exec_epoch=-1 gate_epoch=-1 exec_last="" gate_last=""
   if [[ -f "$SAFE_AUDIT_HOST_ALLOW_LOG" ]]; then
     exec_count=$(jq -rs --arg p "$pkg" '[.[] | select(.package == $p)] | length' \
       "$SAFE_AUDIT_HOST_ALLOW_LOG" 2>/dev/null) || exec_count=0
-    # Append-only log: the last matching line is the chronologically latest
-    # record (a lexical max over offset-bearing timestamps is not).
-    exec_last=$(jq -rs --arg p "$pkg" '[.[] | select(.package == $p) | .timestamp] | last // empty' \
-      "$SAFE_AUDIT_HOST_ALLOW_LOG" 2>/dev/null) || exec_last=""
+    while IFS= read -r ts; do
+      [[ -n "$ts" ]] || continue
+      ts_epoch=$(date -d "$ts" +%s 2>/dev/null) || continue
+      if (( ts_epoch > exec_epoch )); then
+        exec_epoch=$ts_epoch
+        exec_last="$ts"
+      fi
+    done < <(jq -rs --arg p "$pkg" '.[] | select(.package == $p) | .timestamp // empty' \
+      "$SAFE_AUDIT_HOST_ALLOW_LOG" 2>/dev/null)
   fi
   if [[ -f "$AUDIT_LOG" ]]; then
-    local gate_stats
-    gate_stats=$(awk -F' \\| ' -v pkg="$pkg" '
+    gate_count=$(awk -F' \\| ' -v pkg="$pkg" '
       $4 == "GATE" && $6 == "HOST_ALLOW_OVERRIDE" \
-        && ($3 == pkg || index($3, pkg "@") == 1) { count++; last = $1 }
-      END { printf "%d\t%s", count, last }' "$AUDIT_LOG" 2>/dev/null) || gate_stats="0	"
-    gate_count="${gate_stats%%	*}"
-    gate_last="${gate_stats#*	}"
+        && ($3 == pkg || index($3, pkg "@") == 1) { count++ }
+      END { print count + 0 }' "$AUDIT_LOG" 2>/dev/null) || gate_count=0
+    while IFS= read -r ts; do
+      [[ -n "$ts" ]] || continue
+      ts_epoch=$(date -d "$ts" +%s 2>/dev/null) || continue
+      if (( ts_epoch > gate_epoch )); then
+        gate_epoch=$ts_epoch
+        gate_last="$ts"
+      fi
+    done < <(awk -F' \\| ' -v pkg="$pkg" '
+      $4 == "GATE" && $6 == "HOST_ALLOW_OVERRIDE" \
+        && ($3 == pkg || index($3, pkg "@") == 1) { print $1 }' "$AUDIT_LOG" 2>/dev/null)
   fi
   REVIEW_TIMES_USED=$(( exec_count + gate_count ))
-  # The two logs are each chronological (append-only), but picking across
-  # them needs instant comparison: timestamps carry UTC offsets, so lexical
-  # order is not chronological (DST transitions, timezone changes).
-  local exec_epoch=-1 gate_epoch=-1
-  if [[ -n "$exec_last" ]]; then
-    exec_epoch=$(date -d "$exec_last" +%s 2>/dev/null) || exec_epoch=-1
-  fi
-  if [[ -n "$gate_last" ]]; then
-    gate_epoch=$(date -d "$gate_last" +%s 2>/dev/null) || gate_epoch=-1
-  fi
   if (( gate_epoch > exec_epoch )); then
     REVIEW_LAST_USED="$gate_last"
   else
