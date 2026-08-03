@@ -242,9 +242,13 @@ default_config_json() {
     "trusted_registries": [],
     "auto_allow_ttl_days": 30,
     "block_severities": ["critical"],
+    "cooldown_days": 3,
     "guarddog": {
       "enabled": true,
       "timeout_seconds": 120
+    },
+    "socket": {
+      "mode": "auto"
     }
   }
 }

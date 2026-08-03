@@ -65,9 +65,13 @@ unchanged.
     "trusted_registries": [],
     "auto_allow_ttl_days": 30,
     "block_severities": ["critical"],
+    "cooldown_days": 3,
     "guarddog": {
       "enabled": true,
       "timeout_seconds": 120
+    },
+    "socket": {
+      "mode": "auto"
     }
   }
 }
@@ -90,6 +94,20 @@ unchanged.
 - `auto_allow_ttl_days`: freshness window for the offline/timeout fallback.
 - `block_severities`: affecting-advisory severities that hard-BLOCK instead
   of WARN.
+- `cooldown_days`: WARN when any resolved version was published fewer than
+  this many days ago (the compromised-release window; malicious versions are
+  usually caught and yanked within days). Default: `3`; `0` disables. The
+  WARN is overridable (exact host-allow pin, or `release_too_new` in
+  `auto_allow_tolerate`); a failed publish-date lookup skips the check with
+  a disclosed note, never a refusal.
+- `socket.mode`: when to consult Socket. `auto` (default) is tier 3 —
+  Socket runs only when the GuardDog behavioral tier produced no complete
+  verdict (not installed, disabled, unsupported ecosystem, unresolved
+  version, error/partial), so a Socket outage degrades only those rare
+  consultations. `always` restores the pre-1.8 always-on behavior;
+  `never` disables Socket entirely. A deliberate skip is recorded honestly
+  in receipts and install-known reasons (`socket_skipped_tier3`, never
+  `socket_ok`).
 - `guarddog.enabled`: run GuardDog for exact resolved npm/PyPI versions.
   Default: `true`. A missing binary is reported as a non-adverse skip while
   Socket remains enabled in the current tiered-scoring slice.

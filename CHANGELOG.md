@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.8.0 - 2026-08-03
+
+- Socket is demoted to tier 3 (`install.socket.mode`, default `auto`): it is
+  consulted only when the GuardDog behavioral tier produced no complete
+  verdict (not installed, disabled, unsupported ecosystem, unresolved
+  version, error/partial) or when the operator forces `always`. A clean
+  GuardDog verdict skips Socket entirely — a Socket outage can no longer
+  degrade those checks — and the skip is recorded honestly in receipts and
+  install-known reasons (`socket_skipped_tier3`/`socket_disabled`, never
+  `socket_ok`). `never` disables Socket outright.
+- Release-age cooldown (`install.cooldown_days`, default 3): a resolved
+  version published fewer than N days ago WARNs (`release_too_new`,
+  overridable via exact host-allow pin or `auto_allow_tolerate`) — the
+  compromised-release window. A failed publish-date lookup skips the check
+  with a disclosed note, never a refusal; `0` disables.
+
 ## 1.7.0 - 2026-08-03
 
 - `safe audit check` adds GuardDog as the npm/PyPI behavioral tier. Exact

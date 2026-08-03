@@ -64,6 +64,8 @@ case "$url" in
       *)
         if [[ "${MOCK_PACKUMENT_MODE:-single}" == "multi" ]]; then
           emit '{"dist-tags":{"latest":"2.5.0"},"versions":{"1.0.0":{},"1.5.0":{},"2.0.0":{},"2.5.0":{}}}'
+        elif [[ -n "${MOCK_NPM_TIME:-}" ]]; then
+          emit "{\"dist-tags\":{\"latest\":\"1.0.0\"},\"versions\":{\"1.0.0\":{}},\"time\":{\"1.0.0\":\"${MOCK_NPM_TIME}\"}}"
         else
           emit '{"dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{}}}'
         fi
@@ -81,6 +83,7 @@ chmod +x "$COMMONBIN/curl"
 
 cat > "$COMMONBIN/socket" <<'MOCK'
 #!/usr/bin/env bash
+[[ -n "${MOCK_SOCKET_ARGS_LOG:-}" ]] && printf '%s\n' "$*" >> "$MOCK_SOCKET_ARGS_LOG"
 if [[ "${MOCK_SOCKET_MODE:-ok}" == "error" ]]; then
   printf 'socket backend failed\n' >&2
   exit 1
@@ -704,6 +707,125 @@ if jq -e '.environment.guarddog.cli_present == true and .environment.guarddog.ve
 else
   printf '%s\n' "$doctor_json" >&2
   fail "safe doctor rejects a valid-prefix flooding probe that does not exit cleanly"
+fi
+
+# --- tier-3 socket decision --------------------------------------------------
+
+# A clean GuardDog verdict makes Socket unnecessary: it is not consulted at
+# all, so a Socket outage cannot degrade the check (the tiered-scoring
+# headline). The recorded evidence says skipped, never ok.
+prepare_case tier3-skip-on-clean
+run_check 1 MOCK_SOCKET_MODE=error MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "clean GuardDog verdict gates GO with Socket broken"
+expect_grep "$OUT_FILE" '^Socket:      SKIP \(tier 3' "socket line reads as a deliberate tier-3 skip"
+if [[ ! -s "$CASE_DIR/socket-args.log" ]]; then
+  pass "socket is not invoked when the behavioral tier concluded"
+else
+  cat "$CASE_DIR/socket-args.log" >&2
+  fail "socket is not invoked when the behavioral tier concluded"
+fi
+if jq -e '.packages["npm:demo"].reasons | index("socket_skipped_tier3") != null and index("socket_ok") == null' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "install-known reasons record the tier-3 skip honestly"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2 || true
+  fail "install-known reasons record the tier-3 skip honestly"
+fi
+
+# Behavioral tier unavailable -> Socket is consulted (guarddog absent).
+prepare_case tier3-consult-when-missing
+run_check 0 MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "guarddog-missing check with Socket ok gates GO"
+expect_grep "$CASE_DIR/socket-args.log" '^package score npm demo@1\.0\.0' \
+  "socket is consulted when the behavioral tier did not run"
+
+# install.socket.mode=always restores always-on Socket beside a clean scan.
+prepare_case tier3-mode-always
+printf '{"install": {"socket": {"mode": "always"}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "mode=always with socket ok gates GO"
+expect_grep "$CASE_DIR/socket-args.log" '^package score npm demo@1\.0\.0' \
+  "mode=always consults socket despite a clean behavioral verdict"
+if jq -e '.packages["npm:demo"].reasons | index("socket_ok") != null' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "mode=always records socket_ok"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2 || true
+  fail "mode=always records socket_ok"
+fi
+
+# install.socket.mode=never disables Socket entirely, honestly recorded.
+prepare_case tier3-mode-never
+printf '{"install": {"socket": {"mode": "never"}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 0 MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "mode=never with no behavioral tier still gates GO by operator choice"
+expect_grep "$OUT_FILE" '^Socket:      SKIP \(disabled by install.socket.mode=never' \
+  "mode=never skip names the knob"
+if [[ ! -s "$CASE_DIR/socket-args.log" ]]; then
+  pass "mode=never never invokes socket"
+else
+  fail "mode=never never invokes socket"
+fi
+if jq -e '.packages["npm:demo"].reasons | index("socket_disabled") != null' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "mode=never records socket_disabled"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2 || true
+  fail "mode=never records socket_disabled"
+fi
+
+# --- release-age cooldown ----------------------------------------------------
+
+# Fresh release inside the cooldown -> WARN with the named override paths.
+prepare_case cooldown-too-new
+run_check 1 MOCK_NPM_TIME="$(date -d '1 day ago' -Is)" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 10 "release younger than the cooldown refuses at the gate"
+expect_grep "$OUT_FILE" '^Release age: WARN \(1\.0\.0 published [01]d ago' \
+  "release line names the version and age"
+expect_grep "$ERR_FILE" 'younger than the release cooldown' "cooldown hint printed"
+expect_grep "$ERR_FILE" 'release_too_new to install.auto_allow_tolerate' \
+  "cooldown hint names the tolerate override"
+if jq -e '.packages["npm:demo"]' "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  fail "cooldown WARN never records clean evidence"
+else
+  pass "cooldown WARN never records clean evidence"
+fi
+
+# Tolerating release_too_new allows the same check.
+prepare_case cooldown-tolerated
+printf '{"install": {"auto_allow_tolerate": ["release_too_new"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 MOCK_NPM_TIME="$(date -d '1 day ago' -Is)" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "tolerated cooldown WARN allows the exact version"
+
+# Old release passes; lookup failure skips with disclosure, never a WARN.
+prepare_case cooldown-old-release
+run_check 1 MOCK_NPM_TIME="$(date -d '30 days ago' -Is)" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "release older than the cooldown gates GO"
+expect_grep "$OUT_FILE" '^Release age: PASS \(published 30d ago\)' "age is reported"
+
+prepare_case cooldown-lookup-fails
+run_check 1 -- demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "missing publish date skips the cooldown without refusing"
+expect_grep "$OUT_FILE" '^Release age: SKIP \(publish date unavailable' \
+  "cooldown skip is disclosed"
+
+# cooldown_days=0 disables the check entirely (no line, no fetch dependency).
+prepare_case cooldown-disabled
+printf '{"install": {"cooldown_days": 0}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 MOCK_NPM_TIME="$(date -d '1 hour ago' -Is)" -- \
+  demo@1.0.0 --ecosystem npm --gate install
+expect_status 0 "cooldown disabled ignores a brand-new release"
+if grep -q '^Release age:' "$OUT_FILE"; then
+  fail "no release-age line when the cooldown is disabled"
+else
+  pass "no release-age line when the cooldown is disabled"
 fi
 
 if (( FAIL_COUNT > 0 )); then

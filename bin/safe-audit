@@ -5366,6 +5366,61 @@ guarddog_tier_json() {
   ' "${version_files[@]}" > "$output"
 }
 
+# Release-age lookup for the cooldown check: the minimum age (days) across
+# the resolved versions, from the public registry's publish timestamps.
+# Best-effort cache plumbing for a WARN-tier heuristic: rc=1 (lookup failed)
+# means the cooldown is skipped with a disclosed note, never a refusal.
+# rc=2: no publish-time source for this ecosystem — check not applicable.
+# stdout on success: "<age_days>\t<version>\t<published_iso>".
+release_min_age_days() {
+  local ecosystem="$1" name="$2" scratch="$3"
+  shift 3
+  local -a versions=()
+  local v
+  versions=("$@")
+  local encoded_name meta now_epoch published epoch age
+  local min_age="" min_version="" min_published=""
+  now_epoch=$(date +%s)
+  encoded_name=$(urlencode "$name")
+  case "$ecosystem" in
+    npm)
+      meta="$scratch/release-times.json"
+      curl -fsSL --max-time 5 "https://registry.npmjs.org/${encoded_name}" \
+        -o "$meta" 2>/dev/null || return 1
+      for v in "${versions[@]}"; do
+        published=$(jq -r --arg v "$v" '.time[$v] // empty | strings' "$meta" 2>/dev/null || true)
+        [[ -n "$published" ]] || return 1
+        epoch=$(date -d "$published" +%s 2>/dev/null) || return 1
+        age=$(( (now_epoch - epoch) / 86400 ))
+        (( age < 0 )) && age=0
+        if [[ -z "$min_age" ]] || (( age < min_age )); then
+          min_age="$age"; min_version="$v"; min_published="$published"
+        fi
+      done
+      ;;
+    python)
+      local slot=0
+      for v in "${versions[@]}"; do
+        meta="$scratch/release-times-${slot}.json"
+        slot=$((slot + 1))
+        curl -fsSL --max-time 5 "https://pypi.org/pypi/${encoded_name}/$(urlencode "$v")/json" \
+          -o "$meta" 2>/dev/null || return 1
+        published=$(jq -r '[.urls[]?.upload_time_iso_8601 | strings] | min // empty' "$meta" 2>/dev/null || true)
+        [[ -n "$published" ]] || return 1
+        epoch=$(date -d "$published" +%s 2>/dev/null) || return 1
+        age=$(( (now_epoch - epoch) / 86400 ))
+        (( age < 0 )) && age=0
+        if [[ -z "$min_age" ]] || (( age < min_age )); then
+          min_age="$age"; min_version="$v"; min_published="$published"
+        fi
+      done
+      ;;
+    *) return 2 ;;
+  esac
+  [[ -n "$min_age" ]] || return 1
+  printf '%s\t%s\t%s\n' "$min_age" "$min_version" "$min_published"
+}
+
 osv_query_package_json() {
   local ecosystem="$1" name="$2" version="$3" output="$4"
   if ! command -v curl >/dev/null 2>&1; then
@@ -7324,7 +7379,7 @@ host_allow_required_versions_json() {
        | any(. as $c | $causes | index($c) != null)) as $socket_applies
     | ((($causes | index("guarddog_error")) != null)
        and (($guarddog_result.versions // []) | length) == 0) as $guarddog_applies_to_all
-    | (["osv_unavailable","custom_source"]
+    | (["osv_unavailable","custom_source","release_too_new"]
        | any(. as $c | $causes | index($c) != null)) as $other_all_apply
     | ($guarddog_versions + $osv_versions
        + (if $socket_applies and $primary != "" then [$primary] else [] end)
@@ -7551,9 +7606,6 @@ check_command() {
       "$scratch/packument.json" 2>/dev/null) || has_install_script=""
   fi
 
-  local socket_spec="$spec"
-  (( resolution_ok )) && socket_spec="${PKG_NAME}@${primary_version}"
-  socket_score_json "$ecosystem" "$socket_spec" "$socket_json"
   if (( resolution_ok )); then
     guarddog_tier_json "$ecosystem" "$PKG_NAME" "$scratch" "$guarddog_json" \
       "${RESOLVED_VERSIONS[@]}"
@@ -7561,11 +7613,39 @@ check_command() {
     guarddog_tier_json "$ecosystem" "$PKG_NAME" "$scratch" "$guarddog_json"
   fi
 
+  # --- tier-3 socket decision (make Socket optional, not load-bearing)
+  # GuardDog is the behavioral tier. Socket is consulted only when the
+  # behavioral tier produced no complete verdict (not installed, disabled,
+  # unsupported ecosystem, unresolved version, error, partial) — or when the
+  # operator forces it. A Socket outage then degrades only those rare
+  # consultations instead of every check (two full days of 429-degraded
+  # verdicts were the trigger; inbox 2026-08-03 tiered-scoring note).
+  local socket_mode socket_skip_reason=""
+  socket_mode=$(install_policy_json | jq -r '.socket.mode // "auto"')
+  case "$socket_mode" in always|auto|never) ;; *) socket_mode="auto" ;; esac
+  if [[ "$socket_mode" == "never" ]]; then
+    socket_skip_reason="disabled by install.socket.mode=never"
+  elif [[ "$socket_mode" == "auto" ]] \
+    && [[ "$(jq -r '.status' "$guarddog_json" 2>/dev/null)" == "ok" ]]; then
+    socket_skip_reason="tier 3 — behavioral verdict from GuardDog; not consulted"
+  fi
+  if [[ -n "$socket_skip_reason" ]]; then
+    jq -n --arg reason "$socket_skip_reason" \
+      '{available: null, status: "skipped_tier3", note: $reason}' > "$socket_json"
+  else
+    local socket_spec="$spec"
+    (( resolution_ok )) && socket_spec="${PKG_NAME}@${primary_version}"
+    socket_score_json "$ecosystem" "$socket_spec" "$socket_json"
+  fi
+
   verdict="GO"
   local -a warn_causes=()
   local socket_detail=""
   socket_line="PASS (no behavioral anomalies)"
-  if [[ "$(jq -r '.available // false' "$socket_json" 2>/dev/null)" != "true" ]]; then
+  if [[ "$(jq -r '.status // empty' "$socket_json" 2>/dev/null)" == "skipped_tier3" ]]; then
+    # A deliberate tier-3 skip is not an outage: no cause, no verdict bump.
+    socket_line="SKIP ($(jq -r '.note' "$socket_json"))"
+  elif [[ "$(jq -r '.available // false' "$socket_json" 2>/dev/null)" != "true" ]]; then
     socket_line='SKIP (socket CLI not available)'
     warn_causes+=("socket_unavailable")
     socket_detail="socket CLI not available"
@@ -7804,6 +7884,30 @@ check_command() {
     fi
   fi
 
+  # --- release-age cooldown: a brand-new release is the compromised-publish
+  # window (malicious versions are usually caught and yanked within days).
+  # WARN-tier and overridable; a failed lookup is disclosed and skipped,
+  # never a refusal — the cooldown is a heuristic, not advisory evidence.
+  local cooldown_days release_line="" release_age="" release_version="" release_published=""
+  cooldown_days=$(install_policy_json | jq -r '.cooldown_days // 3')
+  [[ "$cooldown_days" =~ ^[0-9]+$ ]] || cooldown_days=3
+  if (( resolution_ok )) && (( cooldown_days > 0 )); then
+    local release_info release_rc=0
+    release_info=$(release_min_age_days "$ecosystem" "$PKG_NAME" "$scratch" "${RESOLVED_VERSIONS[@]}") || release_rc=$?
+    if (( release_rc == 0 )); then
+      IFS=$'\t' read -r release_age release_version release_published <<<"$release_info"
+      if (( release_age < cooldown_days )); then
+        release_line="WARN (${release_version} published ${release_age}d ago — younger than the ${cooldown_days}d cooldown)"
+        warn_causes+=("release_too_new")
+        bump_verdict verdict "WARN"
+      else
+        release_line="PASS (published ${release_age}d ago)"
+      fi
+    elif (( release_rc == 1 )); then
+      release_line="SKIP (publish date unavailable — cooldown not evaluated)"
+    fi
+  fi
+
   # A custom source floors the verdict at WARN regardless of resolution or
   # exactness: OSV/Socket evidence covers the public registry identity, not
   # whatever a private index serves under that name@version (delta finding
@@ -7856,6 +7960,11 @@ check_command() {
     --arg guarddog_line "$guarddog_line" \
     --arg osv_line "$osv_line" \
     --arg block_line "$block_line" \
+    --arg release_line "$release_line" \
+    --arg release_age "$release_age" \
+    --arg release_version "$release_version" \
+    --arg release_published "$release_published" \
+    --argjson cooldown_days "$cooldown_days" \
     --arg resolution_method "$RESOLUTION_METHOD" \
     --arg resolution_source "$RESOLUTION_SOURCE" \
     --arg resolution_range "$RESOLUTION_RANGE" \
@@ -7888,8 +7997,15 @@ check_command() {
         socket: $socket_line,
         guarddog: $guarddog_line,
         osv: $osv_line,
-        blocklist: $block_line
+        blocklist: $block_line,
+        release_age: (if $release_line == "" then null else $release_line end)
       },
+      release: (if $release_line == "" then null else {
+        cooldown_days: $cooldown_days,
+        age_days: (if $release_age == "" then null else ($release_age | tonumber) end),
+        version: (if $release_version == "" then null else $release_version end),
+        published: (if $release_published == "" then null else $release_published end)
+      } end),
       socket: ($socket[0] // {}),
       guarddog: ($guarddog[0] // {}),
       osv: (($osv[0] // {}) + {classification: $classification, versions: $versions})
@@ -7909,6 +8025,7 @@ check_command() {
     printf 'Socket:      %s\n' "$socket_line"
     printf 'GuardDog:    %s\n' "$guarddog_line"
     printf 'OSV:         %s\n' "$osv_line"
+    [[ -n "$release_line" ]] && printf 'Release age: %s\n' "$release_line"
     printf 'Blocklist:   %s\n' "$block_line"
     if (( custom_source )); then
       printf '\n[safe audit] custom source: %s — advisory evidence covers the public registry identity only\n' "$CHECK_EFFECTIVE_SOURCES"
@@ -7955,9 +8072,19 @@ check_command() {
             skipped) guarddog_reason="guarddog_skipped_not_installed" ;;
             *) guarddog_reason="guarddog_state_${guarddog_status}" ;;
           esac
+          # The recorded evidence must say what Socket actually did: a
+          # tier-3 skip is not a green score and must never read as one.
+          local socket_reason="socket_ok"
+          if [[ -n "$socket_skip_reason" ]]; then
+            if [[ "$socket_mode" == "never" ]]; then
+              socket_reason="socket_disabled"
+            else
+              socket_reason="socket_skipped_tier3"
+            fi
+          fi
           mark_install_known "$ecosystem" "$PKG_NAME" "$primary_version" "GO" \
-            "$(jq -cn --arg guarddog_reason "$guarddog_reason" \
-              '["osv_clean_for_version","socket_ok","blocklist_pass",$guarddog_reason]')" "$result_json"
+            "$(jq -cn --arg guarddog_reason "$guarddog_reason" --arg socket_reason "$socket_reason" \
+              '["osv_clean_for_version",$socket_reason,"blocklist_pass",$guarddog_reason]')" "$result_json"
           printf '[safe audit] recorded clean check: %s:%s@%s (install-known)\n' \
             "$ecosystem" "$PKG_NAME" "$primary_version" >&2
         fi
@@ -8067,7 +8194,7 @@ gate_emit_refusal_hints() {
   shift 9
   local -a causes=("$@")
   local cause has_socket_infra=0 has_unresolved=0 has_affecting=0 has_osv_down=0 has_low_score=0 has_custom_source=0 has_malware=0
-  local has_guarddog_findings=0 has_guarddog_high_risk=0 has_guarddog_error=0
+  local has_guarddog_findings=0 has_guarddog_high_risk=0 has_guarddog_error=0 has_too_new=0
   for cause in "${causes[@]}"; do
     case "$cause" in
       socket_unavailable|socket_auth_failed|socket_rate_limited|socket_error) has_socket_infra=1 ;;
@@ -8080,8 +8207,18 @@ gate_emit_refusal_hints() {
       guarddog_findings) has_guarddog_findings=1 ;;
       guarddog_high_risk) has_guarddog_high_risk=1 ;;
       guarddog_error) has_guarddog_error=1 ;;
+      release_too_new) has_too_new=1 ;;
     esac
   done
+  if (( has_too_new )); then
+    printf 'safe audit: resolved version is younger than the release cooldown — waiting out install.cooldown_days is the default protection against compromised releases\n' >&2
+    if [[ "$ecosystem" == "npm" && "$resolution_ok" == "1" && -n "$primary_version" ]]; then
+      printf 'safe audit: operator overrides: safe run host-allow add %s@%s --reason "..." / add release_too_new to install.auto_allow_tolerate\n' \
+        "$name" "$primary_version" >&2
+    else
+      printf 'safe audit: operator override: add release_too_new to install.auto_allow_tolerate\n' >&2
+    fi
+  fi
   if (( has_malware )); then
     printf 'safe audit: known-malware record (OSV MAL-*) — do not install, do not pin around it; operator review only\n' >&2
   fi
