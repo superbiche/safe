@@ -153,10 +153,14 @@ entry.
 
 Consumption: on a gated `npm install -g <pkg>@<granted-version>` (npm ≥ 12),
 the gate injects npm's per-command policy for that one invocation —
-`ignore-scripts=false`, `allow-scripts=<every granted identity>`,
-`strict-allow-scripts=true` — so exactly the reviewed scripts run and any
-script-bearing dependency outside the grant list fails the install. The
-global `ignore-scripts` default never changes. With npm < 12 (no per-command
+`ignore-scripts=false`, `allow-scripts=<every source-verified granted
+identity>`, `strict-allow-scripts=true` — so exactly the reviewed scripts
+run and any script-bearing dependency outside the grant list fails the
+install. Every identity entering the list is verified to resolve from the
+default public registry (the source the add-time review fetched from);
+identities bound elsewhere are excluded, and if the requested package
+itself fails that binding, no injection happens at all. The global
+`ignore-scripts` default never changes. With npm < 12 (no per-command
 policy) the gate states the manual fallback and installs script-less as
 before. An unpinned install of a granted package gets a hint naming the
 pinned grant.

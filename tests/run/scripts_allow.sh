@@ -236,6 +236,32 @@ env 'npm_config_ignore-scripts=false' \
 grep -q '^hyphen_ignore=0$' "$tmp/npm-invocation.log" || fail "hyphenated npm_config_ignore-scripts must be stripped at exec: $(cat "$tmp/npm-invocation.log")"
 pass "hyphenated script-policy env stripped via env -u at exec"
 
+# The mise route runs the inner npm gate in a subshell: the scrub must ALSO
+# run in the parent that execs mise, or the hostile env survives into
+# mise's managed npm (delta-2 F3). Function-level probe + textual pin of
+# the parent-process call site.
+scrub_probe=$(env npm_config_dangerously_allow_all_scripts=true 'npm_config_ignore-scripts=false' \
+  bash -c "source '$GATE_LIB'
+    safe_gate_npm_scrub_script_env
+    printf 'valid=%s scrub_count=%s\n' \"\${npm_config_dangerously_allow_all_scripts:-unset}\" \"\${#SAFE_GATE_ENV_SCRUB[@]}\"")
+[[ "$scrub_probe" == "valid=unset scrub_count=1" ]] || fail "parent-process scrub probe wrong: $scrub_probe"
+grep -B2 'safe_gate_exec_real mise "\$@"' "$GATE_LIB" | grep -q 'safe_gate_npm_scrub_script_env' || \
+  fail "mise outer exec must be preceded by the parent-process scrub"
+pass "scrub runs in the process that execs mise (subshell loss closed)"
+
+# mise [env] overlays re-apply after exec, beyond the scrub's reach: a
+# script-policy key in the overlay must be detected (the gate refuses the
+# inner npm route on it).
+overlay_hit="npm_config_ignore-scripts $(printf 'false' | base64)"
+overlay_ok="SOME_VAR $(printf 'x' | base64)"
+bash -c "source '$GATE_LIB'; safe_gate_mise_overlay_scripts_policy '$overlay_hit' && [[ \"\$SAFE_GATE_MISE_POLICY_KEY\" == 'npm_config_ignore-scripts' ]]" || \
+  fail "overlay policy key not detected"
+bash -c "source '$GATE_LIB'; safe_gate_mise_overlay_scripts_policy '$overlay_ok'" && \
+  fail "benign overlay flagged"
+grep -q 'overlay sets .*overrides the operator.*script policy\|the mise \[env\] overlay sets' "$GATE_LIB" || \
+  fail "overlay refusal message missing"
+pass "mise [env] overlay script-policy keys detected and refused"
+
 # --- custom registry blocks injection (review F4) -------------------------
 rm -f "$tmp/npm-invocation.log"
 err_out=$( (SAFE_AUDIT_STUB_SOURCE="registry=https://evil.example" run_gate install -g opencode-ai@0.5.0 >/dev/null) 2>&1 ) || true
@@ -258,6 +284,16 @@ rm -f "$tmp/npm-invocation.log"
 run_gate --global=true install opencode-ai@0.5.0 >/dev/null 2>&1 || true
 grep -q '^ignore_scripts=false$' "$tmp/npm-invocation.log" || fail "--global=true must route as global and inject: $(cat "$tmp/npm-invocation.log" 2>/dev/null)"
 pass "--global=true routes as global and injects"
+
+# Separated boolean AFTER the subcommand: the npm extractor must consume
+# the value, not audit a package named "true" (delta-2 F6 sibling).
+extracted=$(bash -c "source '$GATE_LIB'; safe_gate_npm_packages install --global true opencode-ai@0.5.0" | tr '\n' ' ')
+grep -q "opencode-ai@0.5.0" <<<"$extracted" || fail "extractor lost the real package: $extracted"
+grep -qw "true" <<<"$extracted" && fail "extractor emitted the boolean value as a package: $extracted"
+rm -f "$tmp/npm-invocation.log"
+run_gate install --global true opencode-ai@0.5.0 >/dev/null 2>&1 || true
+grep -q '^ignore_scripts=false$' "$tmp/npm-invocation.log" || fail "post-subcommand '--global true' must still inject: $(cat "$tmp/npm-invocation.log" 2>/dev/null)"
+pass "post-subcommand separated --global value never becomes a package"
 
 # --- scoped transitive grant from a custom source is excluded (review F4) --
 jq -n '{packages:{

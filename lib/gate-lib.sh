@@ -479,6 +479,51 @@ safe_gate_scripts_allow_version() {
   printf '%s' "${version}"
 }
 
+# Scrub inherited npm script-policy env from THIS process. npm accepts
+# npm_config_* keys in any case and with hyphen or underscore spellings;
+# hyphenated names are not valid shell identifiers and cannot be unset from
+# bash, so they are recorded in SAFE_GATE_ENV_SCRUB and stripped at exec
+# time via env -u (safe_gate_exec_real). Must run in the process that will
+# exec the delegate — a subshell's scrub dies with the subshell.
+safe_gate_npm_scrub_script_env() {
+  SAFE_GATE_ENV_SCRUB=()
+  local env_name env_key
+  while IFS='=' read -r env_name _; do
+    env_key="${env_name,,}"
+    env_key="${env_key//-/_}"
+    case "${env_key}" in
+      npm_config_ignore_scripts|npm_config_allow_scripts|npm_config_strict_allow_scripts|npm_config_dangerously_allow_all_scripts)
+        if [[ "${env_name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+          unset "${env_name}" 2>/dev/null || true
+        else
+          SAFE_GATE_ENV_SCRUB+=("${env_name}")
+        fi
+        ;;
+    esac
+  done < <(env)
+}
+
+# True when a mise [env] overlay (name b64 lines) defines an npm
+# script-policy key under any spelling; sets SAFE_GATE_MISE_POLICY_KEY to
+# the offending name.
+safe_gate_mise_overlay_scripts_policy() {
+  local overlay="$1" name _ key
+  SAFE_GATE_MISE_POLICY_KEY=""
+  [[ -n "${overlay}" ]] || return 1
+  while IFS=' ' read -r name _; do
+    [[ -n "${name}" ]] || continue
+    key="${name,,}"
+    key="${key//-/_}"
+    case "${key}" in
+      npm_config_ignore_scripts|npm_config_allow_scripts|npm_config_strict_allow_scripts|npm_config_dangerously_allow_all_scripts)
+        SAFE_GATE_MISE_POLICY_KEY="${name}"
+        return 0
+        ;;
+    esac
+  done <<<"${overlay}"
+  return 1
+}
+
 # npm's effective --global value across its boolean grammar: bare flag,
 # `=value`, a following true/false token, and the --no- negation. Last
 # occurrence wins, matching npm's parser. npm-only — pnpm/bun would parse a
@@ -507,12 +552,13 @@ safe_gate_npm_global_true() {
 
 # For an npm global install whose requested spec exactly matches an operator
 # scripts grant: inject npm 12's per-command allow-scripts policy so the
-# reviewed scripts run. The allow list carries every granted identity (a
-# reviewed transitive dependency may run too); any script-bearing dependency
-# OUTSIDE the list hard-fails the install (strict). The global
-# ignore-scripts default is never touched — the policy lives and dies with
-# this one invocation. npm < 12 has no per-command policy: state the manual
-# fallback instead of silently skipping scripts.
+# reviewed scripts run. The allow list carries every SOURCE-VERIFIED granted
+# identity (a reviewed transitive dependency may run too, but only when its
+# effective source is the default registry the review fetched from); any
+# script-bearing dependency OUTSIDE the list hard-fails the install
+# (strict). The global ignore-scripts default is never touched — the policy
+# lives and dies with this one invocation. npm < 12 has no per-command
+# policy: state the manual fallback instead of silently skipping scripts.
 safe_gate_npm_scripts_env() {
   local package matched="" name version granted
   for package in "$@"; do
@@ -931,7 +977,21 @@ safe_gate_npm_like_packages() {
 }
 
 safe_gate_npm_packages() {
-  safe_gate_npm_like_packages "$@"
+  # npm's boolean grammar allows `--global true|false` after the subcommand;
+  # the shared extractor would misread the value as a package name and audit
+  # a spurious package "true"/"false" (fail-closed friction). Consume the
+  # pair here — npm only; pnpm/bun parse a following token as a package.
+  local -a args=("$@") filtered=()
+  local i
+  for (( i=0; i<${#args[@]}; i++ )); do
+    filtered+=("${args[$i]}")
+    if [[ "${args[$i]}" == "-g" || "${args[$i]}" == "--global" ]] \
+      && (( i + 1 < ${#args[@]} )) \
+      && [[ "${args[$((i+1))]}" == "true" || "${args[$((i+1))]}" == "false" ]]; then
+      i=$((i + 1))
+    fi
+  done
+  safe_gate_npm_like_packages ${filtered[@]+"${filtered[@]}"}
 }
 
 safe_gate_pnpm_packages() {
@@ -1626,26 +1686,9 @@ safe_gate_npm_like() {
       esac
     done
     # Inherited script-policy env survives into the delegate with
-    # env-over-rc precedence. npm accepts npm_config_* keys in any case and
-    # with hyphen or underscore spellings; hyphenated names are not valid
-    # shell identifiers and cannot be unset here, so they are recorded and
-    # stripped at exec time via env -u. The gate's own injection re-exports
+    # env-over-rc precedence: scrub it. The gate's own injection re-exports
     # after this.
-    SAFE_GATE_ENV_SCRUB=()
-    local env_name env_key
-    while IFS='=' read -r env_name _; do
-      env_key="${env_name,,}"
-      env_key="${env_key//-/_}"
-      case "${env_key}" in
-        npm_config_ignore_scripts|npm_config_allow_scripts|npm_config_strict_allow_scripts|npm_config_dangerously_allow_all_scripts)
-          if [[ "${env_name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-            unset "${env_name}" 2>/dev/null || true
-          else
-            SAFE_GATE_ENV_SCRUB+=("${env_name}")
-          fi
-          ;;
-      esac
-    done < <(env)
+    safe_gate_npm_scrub_script_env
   fi
 
   local global_requested=1
@@ -3222,6 +3265,18 @@ safe_gate_mise_gate_exec() {
       safe_gate_err "safe: mise exec ${cmd[0]}: ${inner_unmodeled} selects a ${inner_installer} source safe cannot resolve advisories against — not audit-gated; review manually"
       return 0
     fi
+    # mise re-applies its [env] tables after the outer exec, where the
+    # gate's own scrub cannot reach: a script-policy key in the overlay
+    # would resurrect exactly what the scrub removed. Fail closed and name
+    # the key — the operator removes it from the mise config if intended.
+    case "${cmd[0]}" in
+      npm|pnpm|bun)
+        if safe_gate_mise_overlay_scripts_policy "$SAFE_GATE_MISE_OVERLAY"; then
+          safe_gate_err "safe: BLOCKED mise exec ${cmd[0]} — the mise [env] overlay sets ${SAFE_GATE_MISE_POLICY_KEY}, which overrides the operator's script policy; remove it from the mise config (operator) and retry; details: safe explain"
+          return 100
+        fi
+        ;;
+    esac
     (
       if [[ -n "${SAFE_GATE_MISE_CD:-}" ]]; then
         cd -- "${SAFE_GATE_MISE_CD}" 2>/dev/null || {
@@ -3370,6 +3425,11 @@ safe_gate_mise() {
       ;;
   esac
 
+  # The inner gate ran in a subshell (audit only, exec suppressed): its env
+  # scrub died there. The scrub must happen HERE, in the process that execs
+  # mise, or inherited script-policy env reaches mise's managed npm intact
+  # (delta-2 finding F3).
+  safe_gate_npm_scrub_script_env
   safe_gate_exec_real mise "$@"
 }
 
