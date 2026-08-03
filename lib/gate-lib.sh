@@ -485,7 +485,12 @@ safe_gate_host_allow_matches() {
   entry_ecosystem="$(jq -r --arg p "${name}" '.packages[$p].ecosystem // "npm"' "${host_allow_file}" 2>/dev/null || true)"
 
   [[ "${entry_version}" == "${version}" ]] || return 1
-  [[ "$(safe_gate_canonical_eco "${entry_ecosystem}")" == "$(safe_gate_canonical_eco "${ecosystem}")" ]]
+  # Only grantable ecosystems are matchable: hand-edited entries for
+  # unsupported ecosystems carry no authority (review PR#61 F3).
+  local canon_eco
+  canon_eco="$(safe_gate_canonical_eco "${ecosystem}")"
+  case "${canon_eco}" in npm|python) ;; *) return 1 ;; esac
+  [[ "$(safe_gate_canonical_eco "${entry_ecosystem}")" == "${canon_eco}" ]]
 }
 
 # ---------------------------------------------------------------------------

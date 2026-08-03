@@ -5504,7 +5504,9 @@ guarddog_tier_json() {
 # Best-effort cache plumbing for a WARN-tier heuristic: rc=1 (lookup failed)
 # means the cooldown is skipped with a disclosed note, never a refusal.
 # rc=2: no publish-time source for this ecosystem — check not applicable.
-# stdout on success: "<age_days>\t<version>\t<published_iso>".
+# stdout on success: "<age_days>\t<version>\t<published_iso>\t<ages_json>"
+# where ages_json maps EVERY resolved version to its age — the security-fix
+# exemption must know the full young set, not just the youngest member.
 release_min_age_days() {
   local ecosystem="$1" name="$2" scratch="$3"
   shift 3
@@ -5513,6 +5515,7 @@ release_min_age_days() {
   versions=("$@")
   local encoded_name meta now_epoch published epoch age
   local min_age="" min_version="" min_published=""
+  local -a age_entries=()
   now_epoch=$(date +%s)
   encoded_name=$(urlencode "$name")
   case "$ecosystem" in
@@ -5526,6 +5529,7 @@ release_min_age_days() {
         epoch=$(date -d "$published" +%s 2>/dev/null) || return 1
         age=$(( (now_epoch - epoch) / 86400 ))
         (( age < 0 )) && age=0
+        age_entries+=("$v"$'\t'"$age")
         if [[ -z "$min_age" ]] || (( age < min_age )); then
           min_age="$age"; min_version="$v"; min_published="$published"
         fi
@@ -5547,6 +5551,7 @@ release_min_age_days() {
         epoch=$(date -d "$published" +%s 2>/dev/null) || return 1
         age=$(( (now_epoch - epoch) / 86400 ))
         (( age < 0 )) && age=0
+        age_entries+=("$v"$'\t'"$age")
         if [[ -z "$min_age" ]] || (( age < min_age )); then
           min_age="$age"; min_version="$v"; min_published="$published"
         fi
@@ -5555,7 +5560,11 @@ release_min_age_days() {
     *) return 2 ;;
   esac
   [[ -n "$min_age" ]] || return 1
-  printf '%s\t%s\t%s\n' "$min_age" "$min_version" "$min_published"
+  local ages_json
+  ages_json=$(printf '%s\n' "${age_entries[@]}" \
+    | jq -Rcn '[inputs | split("\t") | {(.[0]): (.[1] | tonumber)}] | add // {}' 2>/dev/null) \
+    || return 1
+  printf '%s\t%s\t%s\t%s\n' "$min_age" "$min_version" "$min_published" "$ages_json"
 }
 
 osv_query_package_json() {
@@ -7499,7 +7508,13 @@ host_allow_matches_resolved() {
   entry_version=$(jq -r --arg p "$name" '.packages[$p].version // empty' "$SAFE_RUN_HOST_ALLOW_FILE" 2>/dev/null || true)
   entry_ecosystem=$(jq -r --arg p "$name" '.packages[$p].ecosystem // "npm"' "$SAFE_RUN_HOST_ALLOW_FILE" 2>/dev/null || true)
   [[ -n "$entry_version" ]] || return 1
-  [[ "$(host_allow_canonical_eco "$entry_ecosystem")" == "$(host_allow_canonical_eco "$ecosystem")" ]] || return 1
+  # Only ecosystems `host-allow add` can actually grant are matchable
+  # (review PR#61 F3): a hand-edited entry for an unsupported ecosystem must
+  # not gain authority the TTY-gated add path would refuse to record.
+  local canon_eco
+  canon_eco=$(host_allow_canonical_eco "$ecosystem")
+  case "$canon_eco" in npm|python) ;; *) return 1 ;; esac
+  [[ "$(host_allow_canonical_eco "$entry_ecosystem")" == "$canon_eco" ]] || return 1
   (( $# > 0 )) || return 1
   local v
   for v in "$@"; do
@@ -8053,30 +8068,46 @@ check_command() {
     local release_info release_rc=0
     release_info=$(release_min_age_days "$ecosystem" "$PKG_NAME" "$scratch" "${RESOLVED_VERSIONS[@]}") || release_rc=$?
     if (( release_rc == 0 )); then
-      IFS=$'\t' read -r release_age release_version release_published <<<"$release_info"
+      local release_ages_json
+      IFS=$'\t' read -r release_age release_version release_published release_ages_json <<<"$release_info"
+      [[ -n "$release_ages_json" ]] || release_ages_json='{}'
       if (( release_age < cooldown_days )); then
-        # Is this young release the remediation itself? An advisory counted
-        # as remediated whose `fixed` equals a resolved version means that
-        # version shipped the fix.
-        # The version-scoped OSV query only returns advisories AFFECTING the
-        # version, so a release that fixes a CVE returns nothing there. Ask
-        # the package-level question instead — but only inside the cooldown
+        # Is this young release the remediation itself? The version-scoped
+        # OSV query only returns advisories AFFECTING the version, so a
+        # release that fixes a CVE returns nothing there. Ask the
+        # package-level question instead — but only inside the cooldown
         # window, so the extra query stays off the common path.
-        local cooldown_resolved_json cooldown_osv="$scratch/osv-cooldown.json"
-        cooldown_resolved_json=$(printf '%s\n' "${RESOLVED_VERSIONS[@]}" | jq -cR . | jq -cs .)
-        if osv_query_package_json "$ecosystem" "$PKG_NAME" "" "$cooldown_osv" \
+        # Fail-closed shape (review PR#61 F1+F2): the waiver requires EVERY
+        # resolved version inside the window to be a fix target — an old
+        # fix must not launder an unrelated young sibling — and a `fixed`
+        # event only counts when its range also opened an affected interval
+        # (`introduced`); a bare fixed token is not remediation evidence.
+        local cooldown_young_json cooldown_osv="$scratch/osv-cooldown.json" cooldown_fix_json=""
+        cooldown_young_json=$(jq -cn --argjson ages "$release_ages_json" --argjson d "$cooldown_days" \
+          '$ages | to_entries | map(select(.value < $d) | .key)' 2>/dev/null) || cooldown_young_json='[]'
+        if [[ "$cooldown_young_json" != "[]" ]] \
+          && osv_query_package_json "$ecosystem" "$PKG_NAME" "" "$cooldown_osv" \
           && [[ "$(jq -r '.status' "$cooldown_osv" 2>/dev/null)" == "ok" ]]; then
-          release_security_fix_ids=$(jq -r \
-            --argjson resolved "$cooldown_resolved_json" --arg eco "$osv_eco" --arg name "$PKG_NAME" '
+          cooldown_fix_json=$(jq -c \
+            --argjson young "$cooldown_young_json" --arg eco "$osv_eco" --arg name "$PKG_NAME" '
             [ .vulns[]?
               | . as $v
               | [ $v.affected[]?
                   | select((.package.ecosystem // "") == $eco and (.package.name // "") == $name)
                   | .ranges[]? | select(.type == "SEMVER" or .type == "ECOSYSTEM")
+                  | select([.events[]? | .introduced? | strings] | length > 0)
                   | .events[]? | .fixed? | strings ] as $fixes
-              | select([ $fixes[] | select(. as $f | $resolved | index($f) != null) ] | length > 0)
-              | ($v.id? // "" | tostring) | select(length > 0) ]
-            | unique | join(", ")' "$cooldown_osv" 2>/dev/null || true)
+              | select([ $fixes[] | select(. as $f | $young | index($f) != null) ] | length > 0)
+              | {id: (($v.id? // "" | tostring) | select(length > 0)), fixes: $fixes} ]
+            | {ids: ([.[].id] | unique | join(", ")),
+               covered: ((([.[].fixes[]] | unique) // []) as $all
+                         | ($young | length > 0)
+                           and ($young | all(. as $y | $all | index($y) != null)))}' \
+            "$cooldown_osv" 2>/dev/null || true)
+          if [[ -n "$cooldown_fix_json" ]] \
+            && [[ "$(jq -r '.covered' <<<"$cooldown_fix_json" 2>/dev/null)" == "true" ]]; then
+            release_security_fix_ids=$(jq -r '.ids // ""' <<<"$cooldown_fix_json" 2>/dev/null || true)
+          fi
         fi
         if [[ -n "$release_security_fix_ids" && "$cooldown_security_fix" == "exempt" ]]; then
           release_exempt=1
