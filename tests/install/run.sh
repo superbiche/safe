@@ -670,11 +670,25 @@ case_doctor_podman_probe_skips_exec_under_no_new_privs() {
     fail "$FUNCNAME"
     return
   fi
-  # Outside a sandbox the version probe still runs.
+  # The default human output must carry the same disclosure — a bare
+  # "sandbox: ready" from a process that cannot exec podman misleads
+  # (review PR#62 F1) — and must not list podman as missing.
+  local doctor_human
+  doctor_human="$(setpriv --no-new-privs env HOME="${HOME_DIR}" PATH="${bindir}:/usr/bin:/bin" \
+    bash "${ROOT_DIR}/bin/safe" doctor 2>/dev/null)"
+  grep -Fq 'podman present but unprobed' <<<"${doctor_human}" \
+    || { printf '%s\n' "${doctor_human}" >&2; fail "$FUNCNAME"; return; }
+  grep -A2 'missing prerequisites:' <<<"${doctor_human}" | grep -Fq 'podman' \
+    && { printf '%s\n' "${doctor_human}" >&2; fail "$FUNCNAME"; return; }
+  # Outside a sandbox the version probe still runs and no caveat renders.
   doctor_out="$(env HOME="${HOME_DIR}" PATH="${bindir}:/usr/bin:/bin" \
     bash "${ROOT_DIR}/bin/safe" doctor --json 2>/dev/null)"
   jq -e '.dependencies.sandbox.podman.version == "podman version 5.0.0"' \
     <<<"${doctor_out}" >/dev/null || { printf '%s\n' "${doctor_out}" >&2; fail "$FUNCNAME"; return; }
+  doctor_human="$(env HOME="${HOME_DIR}" PATH="${bindir}:/usr/bin:/bin" \
+    bash "${ROOT_DIR}/bin/safe" doctor 2>/dev/null)"
+  grep -Fq 'podman present but unprobed' <<<"${doctor_human}" \
+    && { printf '%s\n' "${doctor_human}" >&2; fail "$FUNCNAME"; return; }
   pass "$FUNCNAME"
 }
 

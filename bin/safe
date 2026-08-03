@@ -1168,8 +1168,11 @@ print_doctor_human() {
     "  verify release-asset: " + (if .features.verify_release_asset.ready then "ready" else "not ready" end),
     "  verify sigstore-bundle: " + (if .features.verify_sigstore_bundle.ready then "ready" else "not ready" end),
     "  verify tuf-bootstrap: " + (if .features.verify_tuf_bootstrap.ready then "ready" else "not ready" end),
-    "  binary exec: " + (if .features.binary_exec.ready then "ready" else "not ready" end),
-    "  safe run sandbox: " + (if .features.safe_run_sandbox.ready then "ready" else "not ready" end),
+    ((if .dependencies.sandbox.podman.probed == false
+      then " (podman present but unprobed: this doctor runs no-new-privs — sandboxed execs fail from THIS process, unaffected outside it)"
+      else "" end) as $podman_caveat
+    | "  binary exec: " + (if .features.binary_exec.ready then "ready" else "not ready" end) + $podman_caveat,
+      "  safe run sandbox: " + (if .features.safe_run_sandbox.ready then "ready" else "not ready" end) + $podman_caveat),
     "",
     "socket wiring (install gate scoring):",
     "  cli: " + (if .environment.socket.cli_present then .environment.socket.cli_path else "MISSING — install socket CLI" end),

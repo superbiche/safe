@@ -29,6 +29,10 @@ SUITES=(
 )
 
 JOBS="${SAFE_TEST_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+if ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'run-all: SAFE_TEST_JOBS must be a positive integer (got %s)\n' "$JOBS" >&2
+  exit 2
+fi
 logdir=$(mktemp -d "${TMPDIR:-/tmp}/safe-tests.XXXXXX")
 
 slug() { printf '%s' "$1" | tr '/' '_'; }
