@@ -41,3 +41,29 @@ Fail-closed, exact-identity only:
 
 - Original Volta-scoped capture: `2026-07-13-michel-volta-exact-postinstall-allowlist.md` (superseded)
 - npm 12 `allow-scripts`: https://docs.npmjs.com/cli/v12/using-npm/config/#allow-scripts
+
+## Resolution (2026-08-03)
+
+Shipped in 1.5.0 (PR #52, merge d8cbe07; DEEP review chain
+`~/.liaison/reviews/2026-08-03-safe-pr52-scripts-allow`, sol-xhigh, 4
+rounds to the D339 cap + operator-ruled post-cap closure). Operator ruling
+(a): grants are operator-TTY, machines never self-grant.
+
+- `safe run scripts-allow add <pkg>@<x.y.z>` (TTY, exact identity only)
+  displays the package's lifecycle scripts before confirmation — no
+  sight-unseen grants — and snapshots scripts + registry integrity.
+- Gated `npm install -g` of a granted identity injects npm 12's
+  per-command policy (ignore-scripts=false, allow-scripts=<source-verified
+  granted identities>, strict-allow-scripts=true): exactly the reviewed
+  scripts run, unreviewed script-bearing deps hard-fail (sketch item 4),
+  global ignore-scripts never changes (item 3). npm < 12: legible manual
+  fallback (item 6).
+- Script-policy argv/env overrides are refused/scrubbed on every gated
+  route incl. mise; audit GO hints when a resolved version declares
+  install scripts without a grant.
+
+Deferred from the sketch: item 5 (post-install artifact verification) and
+item 7 (bubblewrap script-shell). Related parked consideration:
+`2026-08-03-claude-trust-store-hardening-consideration.md`.
+npm 12 itself still pending on this host (Socket rate limit; the feature
+degrades legibly on npm 11).
