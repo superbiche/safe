@@ -95,7 +95,7 @@ safe run host-allow list
 safe run host-allow remove pnpm
 ```
 
-`host-allow add` and `host-allow update` are operator-only trust escalations: they require an interactive terminal and refuse in non-TTY shells with exit 102, so agents can suggest the command verbatim but never execute it. Both run `safe audit` before mutating the allowlist. A `GO` result can proceed without a reason. `WARN`, `BLOCK`, or unavailable audit results require a reason and interactive confirmation.
+`host-allow add` and `host-allow update` are operator-only trust escalations: they require an interactive terminal and refuse in non-TTY shells with exit 102, so a cooperative agent can suggest the command verbatim but not execute it. (The TTY check is a cooperative-agent boundary, not proof of operator presence — a process that allocates a pseudo-terminal can satisfy it; see the residual-risk note in `install-wrappers.md`.) Both run `safe audit` before mutating the allowlist. A `GO` result can proceed without a reason. `WARN`, `BLOCK`, or unavailable audit results require a reason and interactive confirmation.
 
 ### Staleness review
 
@@ -141,12 +141,15 @@ safe run scripts-allow list
 safe run scripts-allow remove opencode-ai
 ```
 
-`add` is operator-only (TTY, exit 102 otherwise), requires an exact version
-(never names, ranges, or tags), runs the audit preflight, then fetches and
-**displays the package's install-time lifecycle scripts** for review before
-asking for confirmation — the grant is a statement that these scripts were
-seen. The reviewed scripts and the registry integrity hash are snapshotted
-into the entry.
+`add` is operator-only (TTY, exit 102 otherwise; the same cooperative-agent
+boundary as host-allow — see the residual-risk note in
+`install-wrappers.md`), requires an exact version (never names, ranges, or
+tags), runs the audit preflight, then fetches and **displays the package's
+install-time lifecycle scripts** for review before asking for confirmation —
+the grant is a statement that these scripts were seen. A registry fetch
+failure refuses the grant: sight-unseen authorization is not an option. The
+reviewed scripts and the registry integrity hash are snapshotted into the
+entry.
 
 Consumption: on a gated `npm install -g <pkg>@<granted-version>` (npm ≥ 12),
 the gate injects npm's per-command policy for that one invocation —

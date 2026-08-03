@@ -25,6 +25,7 @@ SAFE_GATE_GVAL=""
 SAFE_GATE_GBOOL=""
 SAFE_GATE_NPM_USERCONFIG=""
 SAFE_GATE_NPM_GLOBALCONFIG=""
+SAFE_GATE_ENV_SCRUB=()
 
 safe_gate_err() {
   printf '%s\n' "$*" >&2
@@ -157,6 +158,19 @@ safe_gate_exec_real() {
   # exec — the audit child receives its values via argv flags, never env.
   export -n SAFE_GATE_DIST_TAG SAFE_GATE_REGISTRY SAFE_GATE_PROJECT_DIR \
     SAFE_GATE_NPM_USERCONFIG SAFE_GATE_NPM_GLOBALCONFIG 2>/dev/null || true
+
+  # Environment names that are not valid shell identifiers (npm accepts
+  # hyphenated npm_config_* keys) cannot be unset from bash: the scrub
+  # records them and the delegate is exec'd through env -u so they never
+  # reach the child.
+  if (( ${#SAFE_GATE_ENV_SCRUB[@]} > 0 )); then
+    local -a env_u=()
+    local scrub_name
+    for scrub_name in "${SAFE_GATE_ENV_SCRUB[@]}"; do
+      env_u+=(-u "${scrub_name}")
+    done
+    exec env "${env_u[@]}" "$real" "$@"
+  fi
 
   exec "$real" "$@"
 }
@@ -465,8 +479,10 @@ safe_gate_scripts_allow_version() {
   printf '%s' "${version}"
 }
 
-# npm boolean flags accept a following value: `npm --global false install`
-# is a project install. Last occurrence wins, matching npm's parser.
+# npm's effective --global value across its boolean grammar: bare flag,
+# `=value`, a following true/false token, and the --no- negation. Last
+# occurrence wins, matching npm's parser. npm-only — pnpm/bun would parse a
+# following "false" as a package name.
 safe_gate_npm_global_true() {
   local -a args=("$@")
   local i state=1
@@ -480,8 +496,10 @@ safe_gate_npm_global_true() {
           state=0
         fi
         ;;
-      --global=true) state=0 ;;
-      --global=false) state=1 ;;
+      --global=true|-g=true) state=0 ;;
+      --global=false|-g=false) state=1 ;;
+      --no-global|--no-global=true) state=1 ;;
+      --no-global=false) state=0 ;;
     esac
   done
   return "${state}"
@@ -508,19 +526,22 @@ safe_gate_npm_scripts_env() {
   done
   [[ -n "${matched}" ]] || return 0
 
-  # The grant was reviewed against the default public registry. A custom
-  # effective source (argv/env/rc registry, scoped overrides) can serve a
-  # DIFFERENT artifact under the same name@version — no script authorization
-  # applies there, and an unverifiable source fails closed (the install
-  # proceeds script-less, exactly as without a grant).
+  # Grants were reviewed against the default public registry, and npm's
+  # allow matcher binds name@version but NOT registry host: any identity in
+  # the injected list whose effective source is custom (argv/env/rc
+  # registry, ambient @scope:registry overrides) could resolve a DIFFERENT
+  # artifact. So EVERY identity entering the allow list is source-verified
+  # per name; unbound identities are excluded, and if a requested match is
+  # excluded, injection is skipped entirely. Unverifiable fails closed (the
+  # install proceeds script-less, exactly as without a grant).
   if ! safe_gate_audit_available; then
     safe_gate_err "safe: scripts grant matched (${matched}) but the effective install source cannot be verified (safe audit unavailable) — install scripts stay skipped"
     return 0
   fi
   local granted_spec granted_name current_source
-  local -a matched_specs=()
-  IFS=',' read -r -a matched_specs <<< "${matched}"
-  for granted_spec in "${matched_specs[@]}"; do
+  local -a verified=()
+  while IFS= read -r granted_spec; do
+    [[ -n "${granted_spec}" ]] || continue
     IFS=$'\t' read -r granted_name _ <<< "$(safe_gate_split_spec "${granted_spec}")"
     local -a es_args=("${granted_name}" --ecosystem npm)
     [[ -n "${SAFE_GATE_REGISTRY:-}" ]] && es_args+=(--registry "${SAFE_GATE_REGISTRY}")
@@ -528,9 +549,26 @@ safe_gate_npm_scripts_env() {
     [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]] && es_args+=(--project-dir "${SAFE_GATE_PROJECT_DIR}")
     [[ -n "${SAFE_GATE_NPM_USERCONFIG:-}" ]] && es_args+=(--npm-userconfig "${SAFE_GATE_NPM_USERCONFIG}")
     [[ -n "${SAFE_GATE_NPM_GLOBALCONFIG:-}" ]] && es_args+=(--npm-globalconfig "${SAFE_GATE_NPM_GLOBALCONFIG}")
-    if ! current_source="$("${SAFE_GATE_AUDIT_BIN}" effective-sources "${es_args[@]}" 2>/dev/null)" \
-      || [[ "${current_source}" != "implicit-default" ]]; then
-      safe_gate_err "safe: scripts grant for ${granted_spec} was reviewed against the default registry; effective source here is '${current_source:-unverifiable}' — install scripts stay skipped"
+    if current_source="$("${SAFE_GATE_AUDIT_BIN}" effective-sources "${es_args[@]}" 2>/dev/null)" \
+      && [[ "${current_source}" == "implicit-default" ]]; then
+      verified+=("${granted_spec}")
+    else
+      safe_gate_err "safe: scripts grant ${granted_spec} is not bound to the default registry here (source '${current_source:-unverifiable}') — excluded from script authorization"
+    fi
+  done < <(jq -r \
+    '.packages | to_entries[] | select((.value.ecosystem // "npm") == "npm") | "\(.key)@\(.value.version)"' \
+    "$(safe_gate_scripts_allow_file)" 2>/dev/null)
+
+  local requested_match match_verified
+  local -a matched_specs=()
+  IFS=',' read -r -a matched_specs <<< "${matched}"
+  for requested_match in "${matched_specs[@]}"; do
+    match_verified=1
+    for granted_spec in ${verified[@]+"${verified[@]}"}; do
+      [[ "${granted_spec}" == "${requested_match}" ]] && match_verified=0
+    done
+    if (( match_verified != 0 )); then
+      safe_gate_err "safe: scripts grant for ${requested_match} was reviewed against the default registry; the effective source here differs — install scripts stay skipped"
       return 0
     fi
   done
@@ -543,9 +581,7 @@ safe_gate_npm_scripts_env() {
     safe_gate_err "safe: scripts grant matched (${matched}) but npm ${npm_version:-unknown} has no per-command allow-scripts (needs >= 12) — scripts stay skipped; fallback: after the install, run only the audited script from the package directory"
     return 0
   fi
-  allow_list="$(jq -r \
-    '[.packages | to_entries[] | select((.value.ecosystem // "npm") == "npm") | "\(.key)@\(.value.version)"] | join(",")' \
-    "$(safe_gate_scripts_allow_file)" 2>/dev/null || true)"
+  allow_list="$(IFS=,; printf '%s' "${verified[*]}")"
   [[ -n "${allow_list}" ]] || return 0
   export npm_config_ignore_scripts=false
   export npm_config_allow_scripts="${allow_list}"
@@ -1566,33 +1602,60 @@ safe_gate_npm_like() {
   if [[ "${tool}" == "npm" ]]; then
     # Script-policy argv on a gated install could widen or replace the
     # operator's script policy (npm gives CLI config precedence over env):
-    # refuse legibly. An explicit --ignore-scripts stays allowed — it only
-    # narrows execution.
-    local scripts_flag
-    for scripts_flag in "$@"; do
+    # refuse legibly. An explicit narrowing --ignore-scripts (bare, =true)
+    # stays allowed; the widening forms (=false, separated false,
+    # --no-ignore-scripts) are refused like the rest.
+    local -a gate_args=("$@")
+    local arg_i scripts_flag
+    for (( arg_i=0; arg_i<${#gate_args[@]}; arg_i++ )); do
+      scripts_flag="${gate_args[$arg_i]}"
       case "${scripts_flag}" in
-        --allow-scripts|--allow-scripts=*|--strict-allow-scripts|--strict-allow-scripts=*|--no-strict-allow-scripts|--dangerously-allow-all-scripts|--dangerously-allow-all-scripts=*)
+        --allow-scripts|--allow-scripts=*|--no-allow-scripts|--no-allow-scripts=*|\
+        --strict-allow-scripts|--strict-allow-scripts=*|--no-strict-allow-scripts|--no-strict-allow-scripts=*|\
+        --dangerously-allow-all-scripts|--dangerously-allow-all-scripts=*|--no-dangerously-allow-all-scripts|--no-dangerously-allow-all-scripts=*|\
+        --ignore-scripts=false|--no-ignore-scripts|--no-ignore-scripts=*)
           safe_gate_err "safe: BLOCKED npm ${subcommand} — ${scripts_flag%%=*} overrides the operator's script policy; install scripts run only via an operator grant (safe run scripts-allow add <pkg>@<x.y.z>); details: safe explain"
           return 100
+          ;;
+        --ignore-scripts)
+          if (( arg_i + 1 < ${#gate_args[@]} )) && [[ "${gate_args[$((arg_i+1))]}" == "false" ]]; then
+            safe_gate_err "safe: BLOCKED npm ${subcommand} — --ignore-scripts false overrides the operator's script policy; install scripts run only via an operator grant (safe run scripts-allow add <pkg>@<x.y.z>); details: safe explain"
+            return 100
+          fi
           ;;
       esac
     done
     # Inherited script-policy env survives into the delegate with
-    # env-over-rc precedence, and npm reads npm_config_* keys
-    # case-insensitively: scrub every case variant so a caller export can
-    # never widen script execution. The gate's own injection re-exports
+    # env-over-rc precedence. npm accepts npm_config_* keys in any case and
+    # with hyphen or underscore spellings; hyphenated names are not valid
+    # shell identifiers and cannot be unset here, so they are recorded and
+    # stripped at exec time via env -u. The gate's own injection re-exports
     # after this.
-    local env_name
+    SAFE_GATE_ENV_SCRUB=()
+    local env_name env_key
     while IFS='=' read -r env_name _; do
-      case "${env_name,,}" in
+      env_key="${env_name,,}"
+      env_key="${env_key//-/_}"
+      case "${env_key}" in
         npm_config_ignore_scripts|npm_config_allow_scripts|npm_config_strict_allow_scripts|npm_config_dangerously_allow_all_scripts)
-          unset "${env_name}" 2>/dev/null || true
+          if [[ "${env_name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            unset "${env_name}" 2>/dev/null || true
+          else
+            SAFE_GATE_ENV_SCRUB+=("${env_name}")
+          fi
           ;;
       esac
     done < <(env)
   fi
 
-  if safe_gate_has_arg "-g" "$@" || safe_gate_has_arg "--global" "$@"; then
+  local global_requested=1
+  if [[ "${tool}" == "npm" ]]; then
+    safe_gate_npm_global_true "$@" && global_requested=0
+  elif safe_gate_has_arg "-g" "$@" || safe_gate_has_arg "--global" "$@"; then
+    global_requested=0
+  fi
+
+  if (( global_requested == 0 )); then
     safe_gate_collect raw "$("${parser}" "${rest[@]}")"
     packages=()
     for raw_package in "${raw[@]}"; do
@@ -1603,7 +1666,7 @@ safe_gate_npm_like() {
       safe_gate_check_many npm "${packages[@]}" || return $?
     fi
 
-    if [[ "${tool}" == "npm" ]] && (( ${#packages[@]} > 0 )) && safe_gate_npm_global_true "$@"; then
+    if [[ "${tool}" == "npm" ]] && (( ${#packages[@]} > 0 )); then
       safe_gate_npm_scripts_env "${packages[@]}"
     fi
     safe_gate_exec_real "${tool}" "$@"
