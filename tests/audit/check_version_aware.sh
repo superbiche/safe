@@ -3220,5 +3220,62 @@ if expect_grep "$OUT_FILE" 'known-malware record in package history: MAL-2026-99
 fi
 
 # ---------------------------------------------------------------------------
+# 74. A malformed pagination token must not discard its OWN page's evidence:
+#     page 1 carries a MAL record AND next_page_token:false. The payload
+#     merges before the token is judged (delta-2 F1).
+# ---------------------------------------------------------------------------
+prepare_case malware-bad-token-same-page
+printf '{"packages":{"brace-expansion":{"version":"2.1.4","ecosystem":"npm"}}}\n' \
+  > "$CASE_RUN_CONFIG/host-allow.json"
+printf '{"install": {"auto_allow_tolerate": ["osv_unavailable"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+PAGES_DIR="$CASE_DIR/osv-pages"
+mkdir -p "$PAGES_DIR"
+cat > "$PAGES_DIR/page1.json" <<'JSON'
+{"vulns": [
+  {"id": "MAL-2026-99999",
+   "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
+     "versions": ["2.1.4"]}]}
+], "next_page_token": false}
+JSON
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_PAGES="$PAGES_DIR" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 20 "bad token on the same page cannot discard its MAL record"; then
+  pass "bad token on the same page cannot discard its MAL record"
+fi
+if expect_grep "$OUT_FILE" 'known-malware record affects .*MAL-2026-99999' "MAL id survives its own page's bad token"; then
+  pass "MAL id survives its own page's bad token"
+fi
+if expect_grep "$OUT_FILE" 'OSV data incomplete' "bad-token incompleteness is disclosed"; then
+  pass "bad-token incompleteness is disclosed"
+fi
+
+# ---------------------------------------------------------------------------
+# 75. Package-only unresolved variant of the same shape: history MAL beside
+#     a bad token still blocks the degraded path.
+# ---------------------------------------------------------------------------
+prepare_case malware-bad-token-unresolved
+printf '{"dependencies": {"brace-expansion": "^1.0.0 || ^2.0.0"}}\n' > "$CASE_PROJECT/package.json"
+PAGES_DIR="$CASE_DIR/osv-pages"
+mkdir -p "$PAGES_DIR"
+cat > "$PAGES_DIR/page1.json" <<'JSON'
+{"vulns": [
+  {"id": "MAL-2026-99999",
+   "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
+     "versions": ["1.1.12"]}]}
+], "next_page_token": false}
+JSON
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_PAGES="$PAGES_DIR" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion --ecosystem npm --op update --gate install
+if expect_status 20 "bad token cannot demote history malware on the degraded path"; then
+  pass "bad token cannot demote history malware on the degraded path"
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

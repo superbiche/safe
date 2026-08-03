@@ -4980,27 +4980,34 @@ osv_query_package_json() {
       jq -cn --argjson v "$vulns" '{status:"error",note:"OSV query failed",vulns:$v}' > "$output"
       return 0
     fi
-    # A page must be an object; vulns (when present) an array; and
-    # next_page_token (when present) a non-empty string — any other token
-    # shape (false, numbers, objects) is a malformed page that must not
-    # read as "complete with zero advisories".
+    # Validation is two-stage with the merge in between (delta-2 F1): the
+    # vulns payload is judged first, its records merged into the
+    # accumulator, and only THEN is the pagination token judged — so a
+    # malformed token can never discard the evidence its own page carried.
+    # A page must be an object and vulns (when present) an array.
     if ! jq -e '
       (type == "object")
       and ((has("vulns") | not) or (.vulns | type == "array"))
-      and ((has("next_page_token") | not)
-           or (.next_page_token
-               | (type == "string") and (length > 0)
-               # Tokens travel through shell command substitution, which is
-               # lossy for whitespace/control characters (a "\n" token would
-               # strip to empty and read as end-of-pagination): only accept
-               # tokens that survive the trip intact.
-               and (test("^[[:graph:]]+$"))))
     ' "$output.raw" >/dev/null 2>&1; then
       jq -cn --argjson v "$vulns" '{status:"error",note:"OSV response malformed",vulns:$v}' > "$output"
       return 0
     fi
     if ! vulns=$(jq -cn --argjson acc "$vulns" --slurpfile r "$output.raw" '$acc + (($r[0].vulns) // [])' 2>/dev/null); then
       jq -cn --argjson v "$vulns" '{status:"error",note:"OSV response merge failed",vulns:$v}' > "$output"
+      return 0
+    fi
+    # next_page_token (when present) must be a non-empty string — any other
+    # shape (false, numbers, objects) is malformed and must not read as
+    # "complete". Tokens travel through shell command substitution, which is
+    # lossy for whitespace/control characters (a "\n" token would strip to
+    # empty and read as end-of-pagination): only accept tokens that survive
+    # the trip intact.
+    if ! jq -e '
+      (has("next_page_token") | not)
+      or (.next_page_token
+          | (type == "string") and (length > 0) and (test("^[[:graph:]]+$")))
+    ' "$output.raw" >/dev/null 2>&1; then
+      jq -cn --argjson v "$vulns" '{status:"error",note:"OSV pagination token malformed",vulns:$v}' > "$output"
       return 0
     fi
     local next_token
