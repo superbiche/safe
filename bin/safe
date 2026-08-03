@@ -1635,8 +1635,11 @@ safe_install_audit_package() {
       refuse 100 "BLOCKED ${ecosystem} install of ${package} — safe audit verdict WARN; $(safe_install_allow_hint "$package" "$ecosystem"); details: safe explain"
       ;;
     2|20)
+      # No allow hint on BLOCK: host-allow only clears WARN, and for a
+      # known-malware record the hint would contradict the audit's own
+      # "do not pin around it" (review PR#55 F2).
       safe_install_gate_log "$ecosystem" "$package" "REFUSED_BLOCK"
-      refuse 104 "BLOCKED ${ecosystem} install of ${package} — safe audit verdict BLOCK; $(safe_install_allow_hint "$package" "$ecosystem"); details: safe explain"
+      refuse 104 "BLOCKED ${ecosystem} install of ${package} — safe audit verdict BLOCK; operator review required: safe audit check ${package} --ecosystem ${ecosystem} --json; details: safe explain"
       ;;
     124|137)
       if safe_install_known_matches "$package" "$ecosystem"; then

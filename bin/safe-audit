@@ -4965,7 +4965,7 @@ osv_query_package_json() {
   while :; do
     pages=$((pages + 1))
     if (( pages > 10 )); then
-      printf '{"status":"error","note":"OSV pagination exceeded 10 pages","vulns":[]}\n' > "$output"
+      jq -cn --argjson v "$vulns" '{status:"error",note:"OSV pagination exceeded 10 pages",vulns:$v}' > "$output"
       return 0
     fi
     if [[ -n "$page_token" ]]; then
@@ -4977,7 +4977,7 @@ osv_query_package_json() {
       -H 'content-type: application/json' \
       -d "$body" \
       > "$output.raw"; then
-      printf '{"status":"error","note":"OSV query failed","vulns":[]}\n' > "$output"
+      jq -cn --argjson v "$vulns" '{status:"error",note:"OSV query failed",vulns:$v}' > "$output"
       return 0
     fi
     # A page must be an object; vulns (when present) an array; and
@@ -4996,11 +4996,11 @@ osv_query_package_json() {
                # tokens that survive the trip intact.
                and (test("^[[:graph:]]+$"))))
     ' "$output.raw" >/dev/null 2>&1; then
-      printf '{"status":"error","note":"OSV response malformed","vulns":[]}\n' > "$output"
+      jq -cn --argjson v "$vulns" '{status:"error",note:"OSV response malformed",vulns:$v}' > "$output"
       return 0
     fi
     if ! vulns=$(jq -cn --argjson acc "$vulns" --slurpfile r "$output.raw" '$acc + (($r[0].vulns) // [])' 2>/dev/null); then
-      printf '{"status":"error","note":"OSV response merge failed","vulns":[]}\n' > "$output"
+      jq -cn --argjson v "$vulns" '{status:"error",note:"OSV response merge failed",vulns:$v}' > "$output"
       return 0
     fi
     local next_token
@@ -5008,7 +5008,7 @@ osv_query_package_json() {
     [[ -z "$next_token" ]] && break
     case " ${seen_tokens:-} " in
       *" $next_token "*)
-        printf '{"status":"error","note":"OSV pagination token repeated","vulns":[]}\n' > "$output"
+        jq -cn --argjson v "$vulns" '{status:"error",note:"OSV pagination token repeated",vulns:$v}' > "$output"
         return 0
         ;;
     esac
@@ -7157,12 +7157,13 @@ check_command() {
   local block_severities affecting_blocked=""
   block_severities=$(install_policy_json | jq -c '.block_severities // ["critical"]')
   if (( resolution_ok )); then
-    if [[ "$osv_status" != "ok" ]]; then
-      # Previously an OSV outage silently counted as zero CVEs; fail closed.
-      osv_line="WARN (OSV query failed; advisory data unavailable)"
-      warn_causes+=("osv_unavailable")
-      bump_verdict verdict "WARN"
-    elif (( aff_count > 0 )); then
+    # Adverse evidence outranks infrastructure failure: a partial OSV outage
+    # (one failed sibling-version query, a failed later page) must never
+    # demote an already-retained affecting/malware hit to a plain
+    # OSV-unavailable WARN — that WARN is host-allowable, and a known MAL
+    # hit would ride through (review PR#55 F1). Classify what was received
+    # FIRST; the outage then only adds its own cause on top.
+    if (( aff_count > 0 )); then
       local aff_summary
       aff_summary=$(jq -r '[.affecting[] | "\(.id) (\(.severity))"] | .[0:3] | join(", ")' <<<"$combined")
       # The text line shows at most three IDs; say so instead of truncating
@@ -7188,6 +7189,17 @@ check_command() {
         warn_causes+=("osv_malware")
         bump_verdict verdict "BLOCK"
       fi
+      if [[ "$osv_status" != "ok" ]]; then
+        # Partial data: the retained evidence above stands; the failure is
+        # additionally disclosed and keeps the incomplete check un-allowable.
+        osv_line="${osv_line}; OSV data incomplete (query failure)"
+        warn_causes+=("osv_unavailable")
+      fi
+    elif [[ "$osv_status" != "ok" ]]; then
+      # Previously an OSV outage silently counted as zero CVEs; fail closed.
+      osv_line="WARN (OSV query failed; advisory data unavailable)"
+      warn_causes+=("osv_unavailable")
+      bump_verdict verdict "WARN"
     elif (( total_count > 0 )); then
       if (( rem_count > 0 )); then
         osv_line="PASS (0 of ${total_count} advisories affect ${resolved_label}; ${rem_count} fixed at or below it)"

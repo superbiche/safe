@@ -3080,5 +3080,72 @@ if expect_grep "$OUT_FILE" 'known-malware record in package history: MAL-2026-99
 fi
 
 # ---------------------------------------------------------------------------
+# 69. Pagination partial failure never discards retained malware evidence:
+#     page 1 carries a MAL hit, page 2 is malformed. The outage may not
+#     demote the hit to a host-allowable OSV-unavailable WARN (review F1).
+# ---------------------------------------------------------------------------
+prepare_case malware-pagination-partial
+printf '{"packages":{"brace-expansion":{"version":"2.1.4","ecosystem":"npm"}}}\n' \
+  > "$CASE_RUN_CONFIG/host-allow.json"
+PAGES_DIR="$CASE_DIR/osv-pages"
+mkdir -p "$PAGES_DIR"
+cat > "$PAGES_DIR/page1.json" <<'JSON'
+{"vulns": [
+  {"id": "MAL-2026-99999",
+   "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
+     "versions": ["2.1.4"]}]}
+], "next_page_token": "more"}
+JSON
+printf '{"vulns": "malformed"}\n' > "$PAGES_DIR/page2.json"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_PAGES="$PAGES_DIR" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 20 "retained MAL evidence blocks despite a failed later page"; then
+  pass "retained MAL evidence blocks despite a failed later page"
+fi
+if expect_grep "$OUT_FILE" 'known-malware record affects .*MAL-2026-99999' "partial-failure line still names the MAL id"; then
+  pass "partial-failure line still names the MAL id"
+fi
+if expect_grep "$OUT_FILE" 'OSV data incomplete' "partial failure is disclosed"; then
+  pass "partial failure is disclosed"
+fi
+
+# ---------------------------------------------------------------------------
+# 70. Multi-version partial failure: one resolved version's query returns a
+#     MAL hit, the sibling query fails. The sibling outage may not demote
+#     the hit, and a matching host-allow pin may not clear it (review F1).
+# ---------------------------------------------------------------------------
+prepare_case malware-multiversion-partial
+printf '{"dependencies": {"brace-expansion": "^1.0.0"}}\n' > "$CASE_PROJECT/package.json"
+cat > "$CASE_PROJECT/package-lock.json" <<'JSON'
+{"packages": {"node_modules/minimatch": {"dependencies": {"brace-expansion": "^2.0.0"}}}}
+JSON
+printf '{"packages":{"brace-expansion":{"version":"1.1.12","ecosystem":"npm"}}}\n' \
+  > "$CASE_RUN_CONFIG/host-allow.json"
+PAGES_DIR="$CASE_DIR/osv-pages"
+mkdir -p "$PAGES_DIR"
+cat > "$PAGES_DIR/page1.json" <<'JSON'
+{"vulns": [
+  {"id": "MAL-2026-99999",
+   "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
+     "versions": ["1.1.12", "2.1.4"]}]}
+]}
+JSON
+printf '{"vulns": "malformed"}\n' > "$PAGES_DIR/page2.json"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_PAGES="$PAGES_DIR" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion --ecosystem npm --op update --gate install
+if expect_status 20 "MAL hit blocks despite a failed sibling-version query"; then
+  pass "MAL hit blocks despite a failed sibling-version query"
+fi
+if expect_no_grep "$ERR_FILE" 'host-allow entry .* matches the resolved version; allowing' "host-allow never clears the partial-failure malware verdict"; then
+  pass "host-allow never clears the partial-failure malware verdict"
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
