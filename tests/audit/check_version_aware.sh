@@ -3147,5 +3147,78 @@ if expect_no_grep "$ERR_FILE" 'host-allow entry .* matches the resolved version;
 fi
 
 # ---------------------------------------------------------------------------
+# 71. One malformed sibling record (numeric id) must not cancel a valid MAL
+#     classification: previously the whole jq program failed, the check
+#     demoted to OSV-unavailable WARN, and host-allow/tolerate cleared it
+#     (delta-1 F1).
+# ---------------------------------------------------------------------------
+prepare_case malware-malformed-sibling
+printf '{"packages":{"brace-expansion":{"version":"2.1.4","ecosystem":"npm"}}}\n' \
+  > "$CASE_RUN_CONFIG/host-allow.json"
+printf '{"install": {"auto_allow_tolerate": ["osv_unavailable"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+cat > "$FIXTURES/osv-malware-malformed-sibling.json" <<'JSON'
+{"vulns": [
+  {"id": "MAL-2026-99999",
+   "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
+     "versions": ["2.1.4"]}]},
+  {"id": 7, "affected": []}
+]}
+JSON
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$FIXTURES/osv-malware-malformed-sibling.json" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 20 "malformed sibling cannot cancel a MAL classification"; then
+  pass "malformed sibling cannot cancel a MAL classification"
+fi
+if expect_grep "$OUT_FILE" 'known-malware record affects .*MAL-2026-99999' "MAL id survives the malformed sibling"; then
+  pass "MAL id survives the malformed sibling"
+fi
+
+# ---------------------------------------------------------------------------
+# 72. Same defect class, scored advisory: a malformed sibling must not cancel
+#     a critical GHSA either.
+# ---------------------------------------------------------------------------
+prepare_case critical-malformed-sibling
+cat > "$FIXTURES/osv-critical-malformed-sibling.json" <<'JSON'
+{"vulns": [
+  {"id": "GHSA-crit-1234",
+   "database_specific": {"severity": "CRITICAL"},
+   "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
+     "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}]}]}]},
+  {"id": 7, "affected": []}
+]}
+JSON
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$FIXTURES/osv-critical-malformed-sibling.json" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 20 "malformed sibling cannot cancel a critical advisory"; then
+  pass "malformed sibling cannot cancel a critical advisory"
+fi
+
+# ---------------------------------------------------------------------------
+# 73. Unresolved degraded path, same defect class: the raw package-history
+#     scans skip malformed records instead of failing whole.
+# ---------------------------------------------------------------------------
+prepare_case malware-unresolved-malformed-sibling
+printf '{"dependencies": {"brace-expansion": "^1.0.0 || ^2.0.0"}}\n' > "$CASE_PROJECT/package.json"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$FIXTURES/osv-malware-malformed-sibling.json" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion --ecosystem npm --op update --gate install
+if expect_status 20 "malformed sibling cannot cancel history malware on the degraded path"; then
+  pass "malformed sibling cannot cancel history malware on the degraded path"
+fi
+if expect_grep "$OUT_FILE" 'known-malware record in package history: MAL-2026-99999' "degraded line still names the MAL id beside a malformed sibling"; then
+  pass "degraded line still names the MAL id beside a malformed sibling"
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

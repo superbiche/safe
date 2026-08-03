@@ -6725,26 +6725,44 @@ def range_affected($r):
     end);
 def range_fixed_events($r): [ ($r.events // [])[] | .fixed? | select(. != null) ];
 [ .vulns[]?
-  | matching_affected as $aff
-  | ($aff | usable_ranges) as $ranges
-  | ([ $aff[].versions[]? ]) as $version_list
-  | (($ranges | length) > 0 or ($version_list | length) > 0) as $parseable
-  | (
-      ($version_list | index($ver) != null)
-      or ([ $ranges[] | range_affected(.) ] | any)
-    ) as $range_hit
-  | (if $trust == 1 then true else ($parseable and $range_hit) end) as $affects
-  | ([ $ranges[] | range_fixed_events(.)[] ] | sort_by(vparse) | last) as $fixed_max
-  | {
-      id: .id,
-      severity: vuln_sev($aff),
-      malware: (.id | test("^MAL-")),
-      affects: $affects,
-      ambiguous: ($parseable | not),
-      unfixed: ($affects and (($fixed_max // "") == "")),
-      fixed: ($fixed_max // null),
-      remediated: (($trust == 0) and ($affects | not) and $parseable and $fixed_max != null and vle($fixed_max; $ver))
-    }
+  # One malformed record must degrade ITSELF, never its siblings: a whole-
+  # program jq failure here used to erase an already-received MAL/critical
+  # classification and demote the check to a host-allowable WARN (PR#55
+  # delta-1 F1). The catch record fails closed: version-scoped hits stay
+  # affecting (the server matched them), severity floors at unknown, and a
+  # string MAL id keeps its malware flag.
+  | . as $v
+  | try (
+      matching_affected as $aff
+      | ($aff | usable_ranges) as $ranges
+      | ([ $aff[].versions[]? ]) as $version_list
+      | (($ranges | length) > 0 or ($version_list | length) > 0) as $parseable
+      | (
+          ($version_list | index($ver) != null)
+          or ([ $ranges[] | range_affected(.) ] | any)
+        ) as $range_hit
+      | (if $trust == 1 then true else ($parseable and $range_hit) end) as $affects
+      | ([ $ranges[] | range_fixed_events(.)[] ] | sort_by(vparse) | last) as $fixed_max
+      | {
+          id: .id,
+          severity: vuln_sev($aff),
+          malware: ((.id // "" | tostring) | test("^MAL-")),
+          affects: $affects,
+          ambiguous: ($parseable | not),
+          unfixed: ($affects and (($fixed_max // "") == "")),
+          fixed: ($fixed_max // null),
+          remediated: (($trust == 0) and ($affects | not) and $parseable and $fixed_max != null and vle($fixed_max; $ver))
+        }
+    ) catch ($v | {
+        id: ((.id? // "unknown") | tostring),
+        severity: "unknown",
+        malware: (((.id? // "") | tostring) | test("^MAL-")),
+        affects: ($trust == 1),
+        ambiguous: ($trust != 1),
+        unfixed: false,
+        fixed: null,
+        remediated: false
+      })
 ]
 | {
     affecting:  [ .[] | select(.affects) ],
@@ -7132,6 +7150,19 @@ check_command() {
         # Classification failure is advisory-data failure: fail closed.
         osv_status="error"
         cls='{"affecting":[],"remediated":[],"ambiguous":[],"unaffected":[]}'
+        # Backstop (delta-1 F1): even a whole-program classification failure
+        # must not erase authoritative malware evidence. This response was
+        # version-scoped — every record in it was server-matched against
+        # $v — so retain raw string MAL-* ids as affecting.
+        local raw_mal
+        raw_mal=$(jq -c '[.vulns[]? | .id? | strings | select(test("^MAL-"))
+          | {id: ., severity: "unknown", malware: true, affects: true,
+             ambiguous: false, unfixed: false, fixed: null, remediated: false}]' \
+          "$vfile" 2>/dev/null) || raw_mal='[]'
+        if [[ -n "$raw_mal" && "$raw_mal" != "[]" ]]; then
+          cls=$(jq -cn --argjson m "$raw_mal" \
+            '{affecting: $m, remediated: [], ambiguous: [], unaffected: []}')
+        fi
       fi
       classifications=$(jq -cn --argjson acc "$classifications" --argjson c "$cls" --arg v "$v" '$acc + [{version: $v, classification: $c}]')
       idx=$((idx + 1))
@@ -7218,14 +7249,18 @@ check_command() {
     fi
     warn_causes+=("version_unresolved")
     bump_verdict verdict "WARN"
-    if jq -e '.vulns[]? | select((.database_specific.severity // "") | ascii_downcase == "critical")' "$osv_json" >/dev/null 2>&1; then
+    # Per-record guards (`?` + strings): one malformed sibling record must
+    # not cancel a valid critical/MAL escalation by failing the whole jq
+    # program (PR#55 delta-1 F1 — same defect class as classification).
+    if jq -e '[.vulns[]? | .database_specific?.severity? | strings
+      | ascii_downcase | select(. == "critical")] | length > 0' "$osv_json" >/dev/null 2>&1; then
       bump_verdict verdict "BLOCK"
     fi
     # Same fail-closed rule as historical criticals: a package whose history
     # carries a MAL-* known-malware record never proceeds on an unresolved
     # version. A clean pinned version still GOes via the resolved path.
     local hist_malware_ids
-    hist_malware_ids=$(jq -r '[.vulns[]? | select(.id | test("^MAL-")) | .id] | join(", ")' "$osv_json" 2>/dev/null || true)
+    hist_malware_ids=$(jq -r '[.vulns[]? | .id? | strings | select(test("^MAL-"))] | join(", ")' "$osv_json" 2>/dev/null || true)
     if [[ -n "$hist_malware_ids" ]]; then
       osv_line="BLOCK (version unresolved; known-malware record in package history: ${hist_malware_ids})"
       warn_causes+=("osv_malware")
