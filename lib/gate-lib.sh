@@ -458,12 +458,21 @@ safe_gate_known_matches() {
   (( now_epoch - entry_epoch <= ttl_days * 86400 ))
 }
 
+# Grant-time spellings (py|uv|pipx…) and audit-time spellings (python) must
+# compare equal, or an operator grant goes silently inert.
+safe_gate_canonical_eco() {
+  case "$1" in
+    py|python|uv|pipx|pypi) printf 'python' ;;
+    npm|bun) printf 'npm' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
 safe_gate_host_allow_matches() {
   local package="$1"
   local ecosystem="$2"
   local host_allow_file name version entry_version entry_ecosystem
 
-  [[ "${ecosystem}" == "npm" ]] || return 1
   command -v jq >/dev/null 2>&1 || return 1
 
   host_allow_file="$(safe_gate_run_config_dir)/host-allow.json"
@@ -475,7 +484,13 @@ safe_gate_host_allow_matches() {
   entry_version="$(jq -r --arg p "${name}" '.packages[$p].version // empty' "${host_allow_file}" 2>/dev/null || true)"
   entry_ecosystem="$(jq -r --arg p "${name}" '.packages[$p].ecosystem // "npm"' "${host_allow_file}" 2>/dev/null || true)"
 
-  [[ "${entry_version}" == "${version}" && "${entry_ecosystem}" == "npm" ]]
+  [[ "${entry_version}" == "${version}" ]] || return 1
+  # Only grantable ecosystems are matchable: hand-edited entries for
+  # unsupported ecosystems carry no authority (review PR#61 F3).
+  local canon_eco
+  canon_eco="$(safe_gate_canonical_eco "${ecosystem}")"
+  case "${canon_eco}" in npm|python) ;; *) return 1 ;; esac
+  [[ "$(safe_gate_canonical_eco "${entry_ecosystem}")" == "${canon_eco}" ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -855,8 +870,8 @@ safe_gate_pip_project_install() {
 # Gate decision
 # ---------------------------------------------------------------------------
 
-# One-line operator hint for a refused package. host-allow only unlocks npm
-# installs, so other ecosystems point at the audit detail command instead.
+# One-line operator hint for a refused package. host-allow covers the npm and
+# python families; other ecosystems point at the audit detail command instead.
 # Fallback hint when the audit could not supply a pinned suggestion (the gate
 # prints resolved-version hints itself). Must never render an @latest shape:
 # allow entries are always pinned to an exact resolved version.
@@ -866,15 +881,25 @@ safe_gate_allow_hint() {
   local name version
 
   IFS=$'\t' read -r name version <<< "$(safe_gate_split_spec "${package}")"
-  if [[ "${ecosystem}" == "npm" ]]; then
-    if [[ -n "${version}" && "${version}" != "latest" ]]; then
-      printf 'to allow: ask the operator to run: safe run host-allow add %s --reason "..." — then retry' "${package}"
-    else
-      printf 'to allow: pin an exact version first (see the resolved-version hint above) — allow entries are never @latest'
-    fi
-  else
-    printf 'to allow: operator review — safe audit check %s --ecosystem %s' "${package}" "${ecosystem}"
-  fi
+  case "$(safe_gate_canonical_eco "${ecosystem}")" in
+    npm)
+      if [[ -n "${version}" && "${version}" != "latest" ]]; then
+        printf 'to allow: ask the operator to run: safe run host-allow add %s --reason "..." — then retry' "${package}"
+      else
+        printf 'to allow: pin an exact version first (see the resolved-version hint above) — allow entries are never @latest'
+      fi
+      ;;
+    python)
+      if [[ -n "${version}" && "${version}" != "latest" ]]; then
+        printf 'to allow: ask the operator to run: safe run host-allow add %s --ecosystem python --reason "..." — then retry' "${package}"
+      else
+        printf 'to allow: pin an exact version first (see the resolved-version hint above) — allow entries are never @latest'
+      fi
+      ;;
+    *)
+      printf 'to allow: operator review — safe audit check %s --ecosystem %s' "${package}" "${ecosystem}"
+      ;;
+  esac
 }
 
 # Check one package via safe audit's install gate.
