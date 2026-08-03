@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.6.0 - 2026-08-03
+
+- `safe audit check`: OSV `MAL-*` records (OpenSSF malicious-packages) are
+  now blocklist-class. They usually carry no CVSS, so the severity ladder
+  ranked them `unknown` — an overridable WARN. A MAL record affecting the
+  resolved version now BLOCKs unconditionally: `install.block_severities`
+  cannot downgrade it, host-allow never overrides it, and the refusal names
+  the malware record instead of suggesting an allowlist pin. On the
+  degraded unresolved-version path, a MAL record anywhere in the package's
+  history BLOCKs (same fail-closed rule as historical criticals). First
+  slice of the tiered-scoring direction (make Socket optional, not
+  load-bearing).
+
 ## 1.5.1 - 2026-08-03
 
 - Socket scores for non-npm ecosystems reach the API again: the socket CLI

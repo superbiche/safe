@@ -243,6 +243,20 @@ JSON
   printf '%s' "$FIXTURES/osv-cvss4-malformed.json"
 }
 
+# Live MAL-* shape (e.g. MAL-2025-20690 on flatmap-stream@0.1.1): no severity
+# array, no database_specific.severity — nothing the CVSS ladder can rank.
+osv_fixture_malware() {
+  cat > "$FIXTURES/osv-malware.json" <<'JSON'
+{"vulns": [
+  {"id": "MAL-2026-99999",
+   "summary": "Malicious code in brace-expansion (npm)",
+   "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
+     "versions": ["2.1.4"]}]}
+]}
+JSON
+  printf '%s' "$FIXTURES/osv-malware.json"
+}
+
 CASE_DIR=""
 CASE_RUN_CONFIG=""
 CASE_HOME=""
@@ -2972,6 +2986,97 @@ if [[ "$(grep -c '^package score pypi requests@2\.32\.0' "$CASE_DIR/socket-args.
 else
   cat "$CASE_DIR/socket-args.log" >&2 || true
   fail "retry invocation also uses the mapped purl type"
+fi
+
+# ---------------------------------------------------------------------------
+# 65. OSV MAL-* record with no CVSS affecting the resolved version -> BLOCK
+#     (severity ladder would say "unknown"/WARN; malware is blocklist-class).
+# ---------------------------------------------------------------------------
+prepare_case malware-blocks
+fixture="$(osv_fixture_malware)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 20 "unscored MAL record on resolved version blocks"; then
+  pass "unscored MAL record on resolved version blocks"
+fi
+if expect_grep "$OUT_FILE" 'BLOCK \(known-malware record affects .*MAL-2026-99999' "verdict line names the MAL id"; then
+  pass "verdict line names the MAL id"
+fi
+if expect_grep "$ERR_FILE" 'known-malware record \(OSV MAL-\*\)' "refusal hint names malware explicitly"; then
+  pass "refusal hint names malware explicitly"
+fi
+if expect_no_grep "$ERR_FILE" 'host-allow add' "no allowlisting hint for malware"; then
+  pass "no allowlisting hint for malware"
+fi
+receipt="$CASE_CHECKS_DIR/$(date +%F)-brace-expansion-2.1.4.json"
+if [[ -f "$receipt" ]] && jq -e '.osv.classification.affecting[0].malware == true' "$receipt" >/dev/null; then
+  pass "receipt classification carries the malware flag"
+else
+  ls "$CASE_CHECKS_DIR" >&2 || true
+  fail "receipt classification carries the malware flag"
+fi
+if jq -e '.packages["npm:brace-expansion"]' "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  fail "malware BLOCK never records install-known evidence"
+else
+  pass "malware BLOCK never records install-known evidence"
+fi
+
+# ---------------------------------------------------------------------------
+# 66. install.block_severities cannot downgrade malware: an empty severity
+#     policy still blocks a MAL hit (the knob governs scored CVEs only).
+# ---------------------------------------------------------------------------
+prepare_case malware-knob-immune
+printf '{"install": {"block_severities": []}}\n' > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_malware)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 20 "empty block_severities cannot downgrade a MAL hit"; then
+  pass "empty block_severities cannot downgrade a MAL hit"
+fi
+
+# ---------------------------------------------------------------------------
+# 67. A pinned host-allow entry never overrides a malware BLOCK (host-allow
+#     is a WARN-tier escape hatch; BLOCK is not its business).
+# ---------------------------------------------------------------------------
+prepare_case malware-hostallow-immune
+printf '{"packages":{"brace-expansion":{"version":"2.1.4","ecosystem":"npm"}}}\n' \
+  > "$CASE_RUN_CONFIG/host-allow.json"
+fixture="$(osv_fixture_malware)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 20 "host-allow pin never overrides a malware BLOCK"; then
+  pass "host-allow pin never overrides a malware BLOCK"
+fi
+
+# ---------------------------------------------------------------------------
+# 68. Unresolved version + MAL record in package history -> BLOCK (same
+#     fail-closed rule as historical criticals on the degraded path).
+# ---------------------------------------------------------------------------
+prepare_case malware-unresolved
+printf '{"dependencies": {"brace-expansion": "^1.0.0 || ^2.0.0"}}\n' > "$CASE_PROJECT/package.json"
+fixture="$(osv_fixture_malware)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion --ecosystem npm --op update --gate install
+if expect_status 20 "malware history blocks the unresolved degraded path"; then
+  pass "malware history blocks the unresolved degraded path"
+fi
+if expect_grep "$OUT_FILE" 'known-malware record in package history: MAL-2026-99999' "degraded line names the historical MAL id"; then
+  pass "degraded line names the historical MAL id"
 fi
 
 # ---------------------------------------------------------------------------

@@ -38,7 +38,7 @@
     },
     {
       "code": 20,
-      "meaning": "`safe audit check` verdict BLOCK (critical advisory affecting the resolved version, or blocklist)",
+      "meaning": "`safe audit check` verdict BLOCK (critical advisory affecting the resolved version, a known-malware `MAL-*` record, or blocklist)",
       "agent_action": "Do not install. Via the gate this refuses with exit 104; the receipt carries the evidence."
     },
     {

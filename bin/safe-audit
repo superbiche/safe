@@ -6738,6 +6738,7 @@ def range_fixed_events($r): [ ($r.events // [])[] | .fixed? | select(. != null) 
   | {
       id: .id,
       severity: vuln_sev($aff),
+      malware: (.id | test("^MAL-")),
       affects: $affects,
       ambiguous: ($parseable | not),
       unfixed: ($affects and (($fixed_max // "") == "")),
@@ -7175,6 +7176,18 @@ check_command() {
         osv_line="BLOCK (${aff_count} of ${total_count} advisories affect ${resolved_label}: ${aff_summary})"
         bump_verdict verdict "BLOCK"
       fi
+      # OSV MAL-* records (OpenSSF malicious-packages) are blocklist-class:
+      # known malware, not a scored vulnerability. They usually carry no CVSS
+      # at all, so the severity ladder ranks them "unknown" — which the
+      # install.block_severities knob would leave overridable. Malware is
+      # never severity-policy business: BLOCK unconditionally, no knob.
+      local malware_ids
+      malware_ids=$(jq -r '[.affecting[] | select(.malware) | .id] | join(", ")' <<<"$combined")
+      if [[ -n "$malware_ids" ]]; then
+        osv_line="BLOCK (known-malware record affects ${resolved_label}: ${malware_ids})"
+        warn_causes+=("osv_malware")
+        bump_verdict verdict "BLOCK"
+      fi
     elif (( total_count > 0 )); then
       if (( rem_count > 0 )); then
         osv_line="PASS (0 of ${total_count} advisories affect ${resolved_label}; ${rem_count} fixed at or below it)"
@@ -7194,6 +7207,16 @@ check_command() {
     warn_causes+=("version_unresolved")
     bump_verdict verdict "WARN"
     if jq -e '.vulns[]? | select((.database_specific.severity // "") | ascii_downcase == "critical")' "$osv_json" >/dev/null 2>&1; then
+      bump_verdict verdict "BLOCK"
+    fi
+    # Same fail-closed rule as historical criticals: a package whose history
+    # carries a MAL-* known-malware record never proceeds on an unresolved
+    # version. A clean pinned version still GOes via the resolved path.
+    local hist_malware_ids
+    hist_malware_ids=$(jq -r '[.vulns[]? | select(.id | test("^MAL-")) | .id] | join(", ")' "$osv_json" 2>/dev/null || true)
+    if [[ -n "$hist_malware_ids" ]]; then
+      osv_line="BLOCK (version unresolved; known-malware record in package history: ${hist_malware_ids})"
+      warn_causes+=("osv_malware")
       bump_verdict verdict "BLOCK"
     fi
   fi
@@ -7379,6 +7402,13 @@ check_command() {
         fi
         ;;
       BLOCK)
+        local block_cause
+        for block_cause in ${warn_causes[@]+"${warn_causes[@]}"}; do
+          if [[ "$block_cause" == "osv_malware" ]]; then
+            printf 'safe audit: known-malware record (OSV MAL-*) — do not install, do not pin around it; operator review only\n' >&2
+            break
+          fi
+        done
         printf 'safe audit: operator review required: safe audit check %s --ecosystem %s --json\n' \
           "$( (( resolution_ok )) && printf '%s@%s' "$PKG_NAME" "$primary_version" || printf '%s' "$spec")" "$ecosystem" >&2
         revoke_install_known "$ecosystem" "$PKG_NAME" "$primary_version" ${RESOLVED_VERSIONS[@]+"${RESOLVED_VERSIONS[@]}"}
@@ -7407,7 +7437,7 @@ gate_emit_refusal_hints() {
   local ecosystem="$1" name="$2" primary_version="$3" resolution_ok="$4" aff_count="$5" socket_detail="$6"
   shift 6
   local -a causes=("$@")
-  local cause has_socket_infra=0 has_unresolved=0 has_affecting=0 has_osv_down=0 has_low_score=0 has_custom_source=0
+  local cause has_socket_infra=0 has_unresolved=0 has_affecting=0 has_osv_down=0 has_low_score=0 has_custom_source=0 has_malware=0
   for cause in "${causes[@]}"; do
     case "$cause" in
       socket_unavailable|socket_auth_failed|socket_rate_limited|socket_error) has_socket_infra=1 ;;
@@ -7416,13 +7446,17 @@ gate_emit_refusal_hints() {
       osv_unavailable) has_osv_down=1 ;;
       socket_low_score) has_low_score=1 ;;
       custom_source) has_custom_source=1 ;;
+      osv_malware) has_malware=1 ;;
     esac
   done
+  if (( has_malware )); then
+    printf 'safe audit: known-malware record (OSV MAL-*) — do not install, do not pin around it; operator review only\n' >&2
+  fi
   if (( has_custom_source )); then
     printf 'safe audit: custom package source — public advisory evidence cannot vouch for a private artifact\n' >&2
     printf 'safe audit: to trust this source permanently: add it to install.trusted_registries in ~/.config/safe/run/config.json (operator)\n' >&2
   fi
-  if (( has_affecting )); then
+  if (( has_affecting )) && (( ! has_malware )); then
     if [[ "$ecosystem" == "npm" ]]; then
       printf 'safe audit: to allow this exact version: safe run host-allow add %s@%s --reason "..."\n' \
         "$name" "$primary_version" >&2

@@ -81,7 +81,7 @@ a missing binary (127):
 | --- | --- | --- |
 | 0 | Clean verdict (GO) from `safe audit check`, or a gated command that passed and ran | Proceed. |
 | 10 | `safe audit check` verdict WARN (advisory affecting the resolved version, custom source, unresolved version, or an audit-infrastructure failure — the per-scanner lines say which) | Read the `safe audit:` hint lines: an infrastructure cause is breakage to escalate, an advisory cause is the gate working. Via the gate this same state refuses with exit 100. |
-| 20 | `safe audit check` verdict BLOCK (critical advisory affecting the resolved version, or blocklist) | Do not install. Via the gate this refuses with exit 104; the receipt carries the evidence. |
+| 20 | `safe audit check` verdict BLOCK (critical advisory affecting the resolved version, a known-malware `MAL-*` record, or blocklist) | Do not install. Via the gate this refuses with exit 104; the receipt carries the evidence. |
 | 100 | Blocked by policy: an audit WARN with no matching allow entry, blocklist, fail-closed audit, or unrecognized/unsupported runner-native flags — the refusal line names which | Relay the refusal line verbatim to the operator. Do not retry, do not reword the command. |
 | 101 | Host-allow version pin mismatch | The allowlist pins a different version than the one requested. Report both versions; re-pin is an operator decision. |
 | 102 | Interactive operator confirmation required (non-TTY refusal) | Nothing an agent can do in this shell. Ask the operator to run it in their terminal. |
