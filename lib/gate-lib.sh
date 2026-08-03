@@ -889,7 +889,11 @@ safe_gate_check() {
       return 100
       ;;
     2|20)
-      safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — safe audit verdict BLOCK; $(safe_gate_allow_hint "${package}" "${ecosystem}"); details: safe explain"
+      # No allow hint on BLOCK: host-allow is a WARN-tier escape hatch and
+      # can never clear a BLOCK verdict — and for a known-malware record the
+      # hint would contradict the audit's own "do not pin around it"
+      # (review PR#55 F2). Operator review is the only next step.
+      safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — safe audit verdict BLOCK; operator review required: safe audit check ${package} --ecosystem ${ecosystem} --json; details: safe explain"
       safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_BLOCK"
       return 104
       ;;

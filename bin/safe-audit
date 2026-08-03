@@ -4965,7 +4965,7 @@ osv_query_package_json() {
   while :; do
     pages=$((pages + 1))
     if (( pages > 10 )); then
-      printf '{"status":"error","note":"OSV pagination exceeded 10 pages","vulns":[]}\n' > "$output"
+      jq -cn --argjson v "$vulns" '{status:"error",note:"OSV pagination exceeded 10 pages",vulns:$v}' > "$output"
       return 0
     fi
     if [[ -n "$page_token" ]]; then
@@ -4977,30 +4977,37 @@ osv_query_package_json() {
       -H 'content-type: application/json' \
       -d "$body" \
       > "$output.raw"; then
-      printf '{"status":"error","note":"OSV query failed","vulns":[]}\n' > "$output"
+      jq -cn --argjson v "$vulns" '{status:"error",note:"OSV query failed",vulns:$v}' > "$output"
       return 0
     fi
-    # A page must be an object; vulns (when present) an array; and
-    # next_page_token (when present) a non-empty string — any other token
-    # shape (false, numbers, objects) is a malformed page that must not
-    # read as "complete with zero advisories".
+    # Validation is two-stage with the merge in between (delta-2 F1): the
+    # vulns payload is judged first, its records merged into the
+    # accumulator, and only THEN is the pagination token judged — so a
+    # malformed token can never discard the evidence its own page carried.
+    # A page must be an object and vulns (when present) an array.
     if ! jq -e '
       (type == "object")
       and ((has("vulns") | not) or (.vulns | type == "array"))
-      and ((has("next_page_token") | not)
-           or (.next_page_token
-               | (type == "string") and (length > 0)
-               # Tokens travel through shell command substitution, which is
-               # lossy for whitespace/control characters (a "\n" token would
-               # strip to empty and read as end-of-pagination): only accept
-               # tokens that survive the trip intact.
-               and (test("^[[:graph:]]+$"))))
     ' "$output.raw" >/dev/null 2>&1; then
-      printf '{"status":"error","note":"OSV response malformed","vulns":[]}\n' > "$output"
+      jq -cn --argjson v "$vulns" '{status:"error",note:"OSV response malformed",vulns:$v}' > "$output"
       return 0
     fi
     if ! vulns=$(jq -cn --argjson acc "$vulns" --slurpfile r "$output.raw" '$acc + (($r[0].vulns) // [])' 2>/dev/null); then
-      printf '{"status":"error","note":"OSV response merge failed","vulns":[]}\n' > "$output"
+      jq -cn --argjson v "$vulns" '{status:"error",note:"OSV response merge failed",vulns:$v}' > "$output"
+      return 0
+    fi
+    # next_page_token (when present) must be a non-empty string — any other
+    # shape (false, numbers, objects) is malformed and must not read as
+    # "complete". Tokens travel through shell command substitution, which is
+    # lossy for whitespace/control characters (a "\n" token would strip to
+    # empty and read as end-of-pagination): only accept tokens that survive
+    # the trip intact.
+    if ! jq -e '
+      (has("next_page_token") | not)
+      or (.next_page_token
+          | (type == "string") and (length > 0) and (test("^[[:graph:]]+$")))
+    ' "$output.raw" >/dev/null 2>&1; then
+      jq -cn --argjson v "$vulns" '{status:"error",note:"OSV pagination token malformed",vulns:$v}' > "$output"
       return 0
     fi
     local next_token
@@ -5008,7 +5015,7 @@ osv_query_package_json() {
     [[ -z "$next_token" ]] && break
     case " ${seen_tokens:-} " in
       *" $next_token "*)
-        printf '{"status":"error","note":"OSV pagination token repeated","vulns":[]}\n' > "$output"
+        jq -cn --argjson v "$vulns" '{status:"error",note:"OSV pagination token repeated",vulns:$v}' > "$output"
         return 0
         ;;
     esac
@@ -6725,25 +6732,44 @@ def range_affected($r):
     end);
 def range_fixed_events($r): [ ($r.events // [])[] | .fixed? | select(. != null) ];
 [ .vulns[]?
-  | matching_affected as $aff
-  | ($aff | usable_ranges) as $ranges
-  | ([ $aff[].versions[]? ]) as $version_list
-  | (($ranges | length) > 0 or ($version_list | length) > 0) as $parseable
-  | (
-      ($version_list | index($ver) != null)
-      or ([ $ranges[] | range_affected(.) ] | any)
-    ) as $range_hit
-  | (if $trust == 1 then true else ($parseable and $range_hit) end) as $affects
-  | ([ $ranges[] | range_fixed_events(.)[] ] | sort_by(vparse) | last) as $fixed_max
-  | {
-      id: .id,
-      severity: vuln_sev($aff),
-      affects: $affects,
-      ambiguous: ($parseable | not),
-      unfixed: ($affects and (($fixed_max // "") == "")),
-      fixed: ($fixed_max // null),
-      remediated: (($trust == 0) and ($affects | not) and $parseable and $fixed_max != null and vle($fixed_max; $ver))
-    }
+  # One malformed record must degrade ITSELF, never its siblings: a whole-
+  # program jq failure here used to erase an already-received MAL/critical
+  # classification and demote the check to a host-allowable WARN (PR#55
+  # delta-1 F1). The catch record fails closed: version-scoped hits stay
+  # affecting (the server matched them), severity floors at unknown, and a
+  # string MAL id keeps its malware flag.
+  | . as $v
+  | try (
+      matching_affected as $aff
+      | ($aff | usable_ranges) as $ranges
+      | ([ $aff[].versions[]? ]) as $version_list
+      | (($ranges | length) > 0 or ($version_list | length) > 0) as $parseable
+      | (
+          ($version_list | index($ver) != null)
+          or ([ $ranges[] | range_affected(.) ] | any)
+        ) as $range_hit
+      | (if $trust == 1 then true else ($parseable and $range_hit) end) as $affects
+      | ([ $ranges[] | range_fixed_events(.)[] ] | sort_by(vparse) | last) as $fixed_max
+      | {
+          id: .id,
+          severity: vuln_sev($aff),
+          malware: ((.id // "" | tostring) | test("^MAL-")),
+          affects: $affects,
+          ambiguous: ($parseable | not),
+          unfixed: ($affects and (($fixed_max // "") == "")),
+          fixed: ($fixed_max // null),
+          remediated: (($trust == 0) and ($affects | not) and $parseable and $fixed_max != null and vle($fixed_max; $ver))
+        }
+    ) catch ($v | {
+        id: ((.id? // "unknown") | tostring),
+        severity: "unknown",
+        malware: (((.id? // "") | tostring) | test("^MAL-")),
+        affects: ($trust == 1),
+        ambiguous: ($trust != 1),
+        unfixed: false,
+        fixed: null,
+        remediated: false
+      })
 ]
 | {
     affecting:  [ .[] | select(.affects) ],
@@ -7131,6 +7157,19 @@ check_command() {
         # Classification failure is advisory-data failure: fail closed.
         osv_status="error"
         cls='{"affecting":[],"remediated":[],"ambiguous":[],"unaffected":[]}'
+        # Backstop (delta-1 F1): even a whole-program classification failure
+        # must not erase authoritative malware evidence. This response was
+        # version-scoped — every record in it was server-matched against
+        # $v — so retain raw string MAL-* ids as affecting.
+        local raw_mal
+        raw_mal=$(jq -c '[.vulns[]? | .id? | strings | select(test("^MAL-"))
+          | {id: ., severity: "unknown", malware: true, affects: true,
+             ambiguous: false, unfixed: false, fixed: null, remediated: false}]' \
+          "$vfile" 2>/dev/null) || raw_mal='[]'
+        if [[ -n "$raw_mal" && "$raw_mal" != "[]" ]]; then
+          cls=$(jq -cn --argjson m "$raw_mal" \
+            '{affecting: $m, remediated: [], ambiguous: [], unaffected: []}')
+        fi
       fi
       classifications=$(jq -cn --argjson acc "$classifications" --argjson c "$cls" --arg v "$v" '$acc + [{version: $v, classification: $c}]')
       idx=$((idx + 1))
@@ -7156,12 +7195,13 @@ check_command() {
   local block_severities affecting_blocked=""
   block_severities=$(install_policy_json | jq -c '.block_severities // ["critical"]')
   if (( resolution_ok )); then
-    if [[ "$osv_status" != "ok" ]]; then
-      # Previously an OSV outage silently counted as zero CVEs; fail closed.
-      osv_line="WARN (OSV query failed; advisory data unavailable)"
-      warn_causes+=("osv_unavailable")
-      bump_verdict verdict "WARN"
-    elif (( aff_count > 0 )); then
+    # Adverse evidence outranks infrastructure failure: a partial OSV outage
+    # (one failed sibling-version query, a failed later page) must never
+    # demote an already-retained affecting/malware hit to a plain
+    # OSV-unavailable WARN — that WARN is host-allowable, and a known MAL
+    # hit would ride through (review PR#55 F1). Classify what was received
+    # FIRST; the outage then only adds its own cause on top.
+    if (( aff_count > 0 )); then
       local aff_summary
       aff_summary=$(jq -r '[.affecting[] | "\(.id) (\(.severity))"] | .[0:3] | join(", ")' <<<"$combined")
       # The text line shows at most three IDs; say so instead of truncating
@@ -7175,6 +7215,29 @@ check_command() {
         osv_line="BLOCK (${aff_count} of ${total_count} advisories affect ${resolved_label}: ${aff_summary})"
         bump_verdict verdict "BLOCK"
       fi
+      # OSV MAL-* records (OpenSSF malicious-packages) are blocklist-class:
+      # known malware, not a scored vulnerability. They usually carry no CVSS
+      # at all, so the severity ladder ranks them "unknown" — which the
+      # install.block_severities knob would leave overridable. Malware is
+      # never severity-policy business: BLOCK unconditionally, no knob.
+      local malware_ids
+      malware_ids=$(jq -r '[.affecting[] | select(.malware) | .id] | join(", ")' <<<"$combined")
+      if [[ -n "$malware_ids" ]]; then
+        osv_line="BLOCK (known-malware record affects ${resolved_label}: ${malware_ids})"
+        warn_causes+=("osv_malware")
+        bump_verdict verdict "BLOCK"
+      fi
+      if [[ "$osv_status" != "ok" ]]; then
+        # Partial data: the retained evidence above stands; the failure is
+        # additionally disclosed and keeps the incomplete check un-allowable.
+        osv_line="${osv_line}; OSV data incomplete (query failure)"
+        warn_causes+=("osv_unavailable")
+      fi
+    elif [[ "$osv_status" != "ok" ]]; then
+      # Previously an OSV outage silently counted as zero CVEs; fail closed.
+      osv_line="WARN (OSV query failed; advisory data unavailable)"
+      warn_causes+=("osv_unavailable")
+      bump_verdict verdict "WARN"
     elif (( total_count > 0 )); then
       if (( rem_count > 0 )); then
         osv_line="PASS (0 of ${total_count} advisories affect ${resolved_label}; ${rem_count} fixed at or below it)"
@@ -7193,7 +7256,21 @@ check_command() {
     fi
     warn_causes+=("version_unresolved")
     bump_verdict verdict "WARN"
-    if jq -e '.vulns[]? | select((.database_specific.severity // "") | ascii_downcase == "critical")' "$osv_json" >/dev/null 2>&1; then
+    # Per-record guards (`?` + strings): one malformed sibling record must
+    # not cancel a valid critical/MAL escalation by failing the whole jq
+    # program (PR#55 delta-1 F1 — same defect class as classification).
+    if jq -e '[.vulns[]? | .database_specific?.severity? | strings
+      | ascii_downcase | select(. == "critical")] | length > 0' "$osv_json" >/dev/null 2>&1; then
+      bump_verdict verdict "BLOCK"
+    fi
+    # Same fail-closed rule as historical criticals: a package whose history
+    # carries a MAL-* known-malware record never proceeds on an unresolved
+    # version. A clean pinned version still GOes via the resolved path.
+    local hist_malware_ids
+    hist_malware_ids=$(jq -r '[.vulns[]? | .id? | strings | select(test("^MAL-"))] | join(", ")' "$osv_json" 2>/dev/null || true)
+    if [[ -n "$hist_malware_ids" ]]; then
+      osv_line="BLOCK (version unresolved; known-malware record in package history: ${hist_malware_ids})"
+      warn_causes+=("osv_malware")
       bump_verdict verdict "BLOCK"
     fi
   fi
@@ -7379,6 +7456,13 @@ check_command() {
         fi
         ;;
       BLOCK)
+        local block_cause
+        for block_cause in ${warn_causes[@]+"${warn_causes[@]}"}; do
+          if [[ "$block_cause" == "osv_malware" ]]; then
+            printf 'safe audit: known-malware record (OSV MAL-*) — do not install, do not pin around it; operator review only\n' >&2
+            break
+          fi
+        done
         printf 'safe audit: operator review required: safe audit check %s --ecosystem %s --json\n' \
           "$( (( resolution_ok )) && printf '%s@%s' "$PKG_NAME" "$primary_version" || printf '%s' "$spec")" "$ecosystem" >&2
         revoke_install_known "$ecosystem" "$PKG_NAME" "$primary_version" ${RESOLVED_VERSIONS[@]+"${RESOLVED_VERSIONS[@]}"}
@@ -7407,7 +7491,7 @@ gate_emit_refusal_hints() {
   local ecosystem="$1" name="$2" primary_version="$3" resolution_ok="$4" aff_count="$5" socket_detail="$6"
   shift 6
   local -a causes=("$@")
-  local cause has_socket_infra=0 has_unresolved=0 has_affecting=0 has_osv_down=0 has_low_score=0 has_custom_source=0
+  local cause has_socket_infra=0 has_unresolved=0 has_affecting=0 has_osv_down=0 has_low_score=0 has_custom_source=0 has_malware=0
   for cause in "${causes[@]}"; do
     case "$cause" in
       socket_unavailable|socket_auth_failed|socket_rate_limited|socket_error) has_socket_infra=1 ;;
@@ -7416,13 +7500,17 @@ gate_emit_refusal_hints() {
       osv_unavailable) has_osv_down=1 ;;
       socket_low_score) has_low_score=1 ;;
       custom_source) has_custom_source=1 ;;
+      osv_malware) has_malware=1 ;;
     esac
   done
+  if (( has_malware )); then
+    printf 'safe audit: known-malware record (OSV MAL-*) — do not install, do not pin around it; operator review only\n' >&2
+  fi
   if (( has_custom_source )); then
     printf 'safe audit: custom package source — public advisory evidence cannot vouch for a private artifact\n' >&2
     printf 'safe audit: to trust this source permanently: add it to install.trusted_registries in ~/.config/safe/run/config.json (operator)\n' >&2
   fi
-  if (( has_affecting )); then
+  if (( has_affecting )) && (( ! has_malware )); then
     if [[ "$ecosystem" == "npm" ]]; then
       printf 'safe audit: to allow this exact version: safe run host-allow add %s@%s --reason "..."\n' \
         "$name" "$primary_version" >&2

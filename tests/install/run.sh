@@ -1081,6 +1081,20 @@ case_blocked_install() {
   pass "$FUNCNAME"
 }
 
+case_block_refusal_never_hints_allow() {
+  prepare_case "block-refusal-never-hints-allow"
+  # BLOCK is not host-allow's business: host-allow only clears WARN, and for
+  # a known-malware record an allowlist hint would contradict the audit's
+  # "do not pin around it" (review PR#55 F2). The final refusal routes to
+  # operator review only.
+  SAFE_INSTALL_TEST_SCRIPT='npm install -g blockme@1.2.3' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_err_contains_fragment 'operator review required' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'host-allow add' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'to allow' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_warning_install_blocks() {
   prepare_case "warning-install-blocks"
   SAFE_INSTALL_TEST_SCRIPT='npm install -g warnme' run_zsh
@@ -3414,6 +3428,7 @@ main() {
     case_local_project_scan \
     case_add_scans_and_checks \
     case_blocked_install \
+    case_block_refusal_never_hints_allow \
     case_warning_install_blocks \
     case_host_allow_warn_allows_exact_global_install \
     case_host_allow_warn_requires_exact_version \

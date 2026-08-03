@@ -243,6 +243,20 @@ JSON
   printf '%s' "$FIXTURES/osv-cvss4-malformed.json"
 }
 
+# Live MAL-* shape (e.g. MAL-2025-20690 on flatmap-stream@0.1.1): no severity
+# array, no database_specific.severity — nothing the CVSS ladder can rank.
+osv_fixture_malware() {
+  cat > "$FIXTURES/osv-malware.json" <<'JSON'
+{"vulns": [
+  {"id": "MAL-2026-99999",
+   "summary": "Malicious code in brace-expansion (npm)",
+   "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
+     "versions": ["2.1.4"]}]}
+]}
+JSON
+  printf '%s' "$FIXTURES/osv-malware.json"
+}
+
 CASE_DIR=""
 CASE_RUN_CONFIG=""
 CASE_HOME=""
@@ -2972,6 +2986,294 @@ if [[ "$(grep -c '^package score pypi requests@2\.32\.0' "$CASE_DIR/socket-args.
 else
   cat "$CASE_DIR/socket-args.log" >&2 || true
   fail "retry invocation also uses the mapped purl type"
+fi
+
+# ---------------------------------------------------------------------------
+# 65. OSV MAL-* record with no CVSS affecting the resolved version -> BLOCK
+#     (severity ladder would say "unknown"/WARN; malware is blocklist-class).
+# ---------------------------------------------------------------------------
+prepare_case malware-blocks
+fixture="$(osv_fixture_malware)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 20 "unscored MAL record on resolved version blocks"; then
+  pass "unscored MAL record on resolved version blocks"
+fi
+if expect_grep "$OUT_FILE" 'BLOCK \(known-malware record affects .*MAL-2026-99999' "verdict line names the MAL id"; then
+  pass "verdict line names the MAL id"
+fi
+if expect_grep "$ERR_FILE" 'known-malware record \(OSV MAL-\*\)' "refusal hint names malware explicitly"; then
+  pass "refusal hint names malware explicitly"
+fi
+if expect_no_grep "$ERR_FILE" 'host-allow add' "no allowlisting hint for malware"; then
+  pass "no allowlisting hint for malware"
+fi
+receipt="$CASE_CHECKS_DIR/$(date +%F)-brace-expansion-2.1.4.json"
+if [[ -f "$receipt" ]] && jq -e '.osv.classification.affecting[0].malware == true' "$receipt" >/dev/null; then
+  pass "receipt classification carries the malware flag"
+else
+  ls "$CASE_CHECKS_DIR" >&2 || true
+  fail "receipt classification carries the malware flag"
+fi
+if jq -e '.packages["npm:brace-expansion"]' "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  fail "malware BLOCK never records install-known evidence"
+else
+  pass "malware BLOCK never records install-known evidence"
+fi
+
+# ---------------------------------------------------------------------------
+# 66. install.block_severities cannot downgrade malware: an empty severity
+#     policy still blocks a MAL hit (the knob governs scored CVEs only).
+# ---------------------------------------------------------------------------
+prepare_case malware-knob-immune
+printf '{"install": {"block_severities": []}}\n' > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_malware)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 20 "empty block_severities cannot downgrade a MAL hit"; then
+  pass "empty block_severities cannot downgrade a MAL hit"
+fi
+
+# ---------------------------------------------------------------------------
+# 67. A pinned host-allow entry never overrides a malware BLOCK (host-allow
+#     is a WARN-tier escape hatch; BLOCK is not its business).
+# ---------------------------------------------------------------------------
+prepare_case malware-hostallow-immune
+printf '{"packages":{"brace-expansion":{"version":"2.1.4","ecosystem":"npm"}}}\n' \
+  > "$CASE_RUN_CONFIG/host-allow.json"
+fixture="$(osv_fixture_malware)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 20 "host-allow pin never overrides a malware BLOCK"; then
+  pass "host-allow pin never overrides a malware BLOCK"
+fi
+
+# ---------------------------------------------------------------------------
+# 68. Unresolved version + MAL record in package history -> BLOCK (same
+#     fail-closed rule as historical criticals on the degraded path).
+# ---------------------------------------------------------------------------
+prepare_case malware-unresolved
+printf '{"dependencies": {"brace-expansion": "^1.0.0 || ^2.0.0"}}\n' > "$CASE_PROJECT/package.json"
+fixture="$(osv_fixture_malware)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion --ecosystem npm --op update --gate install
+if expect_status 20 "malware history blocks the unresolved degraded path"; then
+  pass "malware history blocks the unresolved degraded path"
+fi
+if expect_grep "$OUT_FILE" 'known-malware record in package history: MAL-2026-99999' "degraded line names the historical MAL id"; then
+  pass "degraded line names the historical MAL id"
+fi
+
+# ---------------------------------------------------------------------------
+# 69. Pagination partial failure never discards retained malware evidence:
+#     page 1 carries a MAL hit, page 2 is malformed. The outage may not
+#     demote the hit to a host-allowable OSV-unavailable WARN (review F1).
+# ---------------------------------------------------------------------------
+prepare_case malware-pagination-partial
+printf '{"packages":{"brace-expansion":{"version":"2.1.4","ecosystem":"npm"}}}\n' \
+  > "$CASE_RUN_CONFIG/host-allow.json"
+PAGES_DIR="$CASE_DIR/osv-pages"
+mkdir -p "$PAGES_DIR"
+cat > "$PAGES_DIR/page1.json" <<'JSON'
+{"vulns": [
+  {"id": "MAL-2026-99999",
+   "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
+     "versions": ["2.1.4"]}]}
+], "next_page_token": "more"}
+JSON
+printf '{"vulns": "malformed"}\n' > "$PAGES_DIR/page2.json"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_PAGES="$PAGES_DIR" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 20 "retained MAL evidence blocks despite a failed later page"; then
+  pass "retained MAL evidence blocks despite a failed later page"
+fi
+if expect_grep "$OUT_FILE" 'known-malware record affects .*MAL-2026-99999' "partial-failure line still names the MAL id"; then
+  pass "partial-failure line still names the MAL id"
+fi
+if expect_grep "$OUT_FILE" 'OSV data incomplete' "partial failure is disclosed"; then
+  pass "partial failure is disclosed"
+fi
+
+# ---------------------------------------------------------------------------
+# 70. Multi-version partial failure: one resolved version's query returns a
+#     MAL hit, the sibling query fails. The sibling outage may not demote
+#     the hit, and a matching host-allow pin may not clear it (review F1).
+# ---------------------------------------------------------------------------
+prepare_case malware-multiversion-partial
+printf '{"dependencies": {"brace-expansion": "^1.0.0"}}\n' > "$CASE_PROJECT/package.json"
+cat > "$CASE_PROJECT/package-lock.json" <<'JSON'
+{"packages": {"node_modules/minimatch": {"dependencies": {"brace-expansion": "^2.0.0"}}}}
+JSON
+printf '{"packages":{"brace-expansion":{"version":"1.1.12","ecosystem":"npm"}}}\n' \
+  > "$CASE_RUN_CONFIG/host-allow.json"
+PAGES_DIR="$CASE_DIR/osv-pages"
+mkdir -p "$PAGES_DIR"
+cat > "$PAGES_DIR/page1.json" <<'JSON'
+{"vulns": [
+  {"id": "MAL-2026-99999",
+   "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
+     "versions": ["1.1.12", "2.1.4"]}]}
+]}
+JSON
+printf '{"vulns": "malformed"}\n' > "$PAGES_DIR/page2.json"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_PAGES="$PAGES_DIR" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion --ecosystem npm --op update --gate install
+if expect_status 20 "MAL hit blocks despite a failed sibling-version query"; then
+  pass "MAL hit blocks despite a failed sibling-version query"
+fi
+if expect_no_grep "$ERR_FILE" 'host-allow entry .* matches the resolved version; allowing' "host-allow never clears the partial-failure malware verdict"; then
+  pass "host-allow never clears the partial-failure malware verdict"
+fi
+
+# ---------------------------------------------------------------------------
+# 71. One malformed sibling record (numeric id) must not cancel a valid MAL
+#     classification: previously the whole jq program failed, the check
+#     demoted to OSV-unavailable WARN, and host-allow/tolerate cleared it
+#     (delta-1 F1).
+# ---------------------------------------------------------------------------
+prepare_case malware-malformed-sibling
+printf '{"packages":{"brace-expansion":{"version":"2.1.4","ecosystem":"npm"}}}\n' \
+  > "$CASE_RUN_CONFIG/host-allow.json"
+printf '{"install": {"auto_allow_tolerate": ["osv_unavailable"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+cat > "$FIXTURES/osv-malware-malformed-sibling.json" <<'JSON'
+{"vulns": [
+  {"id": "MAL-2026-99999",
+   "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
+     "versions": ["2.1.4"]}]},
+  {"id": 7, "affected": []}
+]}
+JSON
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$FIXTURES/osv-malware-malformed-sibling.json" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 20 "malformed sibling cannot cancel a MAL classification"; then
+  pass "malformed sibling cannot cancel a MAL classification"
+fi
+if expect_grep "$OUT_FILE" 'known-malware record affects .*MAL-2026-99999' "MAL id survives the malformed sibling"; then
+  pass "MAL id survives the malformed sibling"
+fi
+
+# ---------------------------------------------------------------------------
+# 72. Same defect class, scored advisory: a malformed sibling must not cancel
+#     a critical GHSA either.
+# ---------------------------------------------------------------------------
+prepare_case critical-malformed-sibling
+cat > "$FIXTURES/osv-critical-malformed-sibling.json" <<'JSON'
+{"vulns": [
+  {"id": "GHSA-crit-1234",
+   "database_specific": {"severity": "CRITICAL"},
+   "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
+     "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}]}]}]},
+  {"id": 7, "affected": []}
+]}
+JSON
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$FIXTURES/osv-critical-malformed-sibling.json" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 20 "malformed sibling cannot cancel a critical advisory"; then
+  pass "malformed sibling cannot cancel a critical advisory"
+fi
+
+# ---------------------------------------------------------------------------
+# 73. Unresolved degraded path, same defect class: the raw package-history
+#     scans skip malformed records instead of failing whole.
+# ---------------------------------------------------------------------------
+prepare_case malware-unresolved-malformed-sibling
+printf '{"dependencies": {"brace-expansion": "^1.0.0 || ^2.0.0"}}\n' > "$CASE_PROJECT/package.json"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$FIXTURES/osv-malware-malformed-sibling.json" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion --ecosystem npm --op update --gate install
+if expect_status 20 "malformed sibling cannot cancel history malware on the degraded path"; then
+  pass "malformed sibling cannot cancel history malware on the degraded path"
+fi
+if expect_grep "$OUT_FILE" 'known-malware record in package history: MAL-2026-99999' "degraded line still names the MAL id beside a malformed sibling"; then
+  pass "degraded line still names the MAL id beside a malformed sibling"
+fi
+
+# ---------------------------------------------------------------------------
+# 74. A malformed pagination token must not discard its OWN page's evidence:
+#     page 1 carries a MAL record AND next_page_token:false. The payload
+#     merges before the token is judged (delta-2 F1).
+# ---------------------------------------------------------------------------
+prepare_case malware-bad-token-same-page
+printf '{"packages":{"brace-expansion":{"version":"2.1.4","ecosystem":"npm"}}}\n' \
+  > "$CASE_RUN_CONFIG/host-allow.json"
+printf '{"install": {"auto_allow_tolerate": ["osv_unavailable"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+PAGES_DIR="$CASE_DIR/osv-pages"
+mkdir -p "$PAGES_DIR"
+cat > "$PAGES_DIR/page1.json" <<'JSON'
+{"vulns": [
+  {"id": "MAL-2026-99999",
+   "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
+     "versions": ["2.1.4"]}]}
+], "next_page_token": false}
+JSON
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_PAGES="$PAGES_DIR" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 20 "bad token on the same page cannot discard its MAL record"; then
+  pass "bad token on the same page cannot discard its MAL record"
+fi
+if expect_grep "$OUT_FILE" 'known-malware record affects .*MAL-2026-99999' "MAL id survives its own page's bad token"; then
+  pass "MAL id survives its own page's bad token"
+fi
+if expect_grep "$OUT_FILE" 'OSV data incomplete' "bad-token incompleteness is disclosed"; then
+  pass "bad-token incompleteness is disclosed"
+fi
+
+# ---------------------------------------------------------------------------
+# 75. Package-only unresolved variant of the same shape: history MAL beside
+#     a bad token still blocks the degraded path.
+# ---------------------------------------------------------------------------
+prepare_case malware-bad-token-unresolved
+printf '{"dependencies": {"brace-expansion": "^1.0.0 || ^2.0.0"}}\n' > "$CASE_PROJECT/package.json"
+PAGES_DIR="$CASE_DIR/osv-pages"
+mkdir -p "$PAGES_DIR"
+cat > "$PAGES_DIR/page1.json" <<'JSON'
+{"vulns": [
+  {"id": "MAL-2026-99999",
+   "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
+     "versions": ["1.1.12"]}]}
+], "next_page_token": false}
+JSON
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_PAGES="$PAGES_DIR" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion --ecosystem npm --op update --gate install
+if expect_status 20 "bad token cannot demote history malware on the degraded path"; then
+  pass "bad token cannot demote history malware on the degraded path"
 fi
 
 # ---------------------------------------------------------------------------
