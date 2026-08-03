@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.7.0 - 2026-08-03
+
+- `safe audit check` adds GuardDog as the npm/PyPI behavioral tier. Exact
+  resolved versions are scanned with GuardDog's correlated risk model:
+  formed `low`/`suspicious` risks WARN with named rules, while `high_risk`
+  source behavior BLOCKs; raw capability matches that form no risk remain GO.
+  Complete results are cached permanently per public-registry artifact
+  integrity and GuardDog version; missing integrity scans without caching. A
+  missing binary is an explicit non-adverse skip while Socket remains
+  always-on, but a present scanner that fails or times out is reported as
+  infrastructure breakage. Receipts, install-known reasons, configuration,
+  refusal hints, and `safe doctor` expose the tier. Safe currently accepts
+  GuardDog 3.1.0, scrubs its behavior-changing ambient variables into a
+  cache-bound safe profile, force-terminates overrunning scans, and bounds each
+  scanner output stream at 16 MiB.
+
 ## 1.6.0 - 2026-08-03
 
 - `safe audit check`: OSV `MAL-*` records (OpenSSF malicious-packages) are

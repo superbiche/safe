@@ -336,6 +336,28 @@ affecting advisory whose severity is listed in `install.block_severities`
 (default: `critical`) produces BLOCK; other affecting advisories produce
 WARN. An OSV outage produces WARN (fail closed), never a zero-CVE PASS.
 
+For exact resolved npm and PyPI versions, GuardDog supplies the local
+behavioral tier. GuardDog's correlated `low`/`suspicious` risks WARN with
+cause `guarddog_findings`; `high_risk` behavior BLOCKs with cause
+`guarddog_high_risk`. Receipts name the risk-forming rules. Capability-only
+raw matches that GuardDog did not form into a risk remain visible in the
+receipt but do not change the verdict. Complete scans are cached permanently
+per public-registry artifact integrity, GuardDog version, and safe-owned
+scanner profile. Safe currently supports GuardDog 3.1.0, removes ambient
+`GUARDDOG_*` overrides before its version probe and scan, force-terminates a
+scanner that outlives the configured leash, and limits each output stream to
+16 MiB. If integrity is unavailable or invalid, the scan still runs without
+caching. Permanent replay deliberately does not refresh GuardDog's mutable
+metadata inputs for an unchanged artifact/scanner/profile identity.
+
+A missing GuardDog binary is a non-adverse skip in this slice because Socket
+remains always-on. Install it with `uv tool install guarddog`. If an installed
+GuardDog fails, times out, or returns unusable output, the check WARNs with
+`guarddog_error` and explicitly identifies the condition as infrastructure
+breakage, not a package finding. Configure the tier under
+`install.guarddog.enabled` and `install.guarddog.timeout_seconds`; `safe
+doctor` reports the CLI path and version.
+
 Verdicts and exit codes are unchanged for consumers:
 
 ```text
