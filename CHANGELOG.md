@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- `safe run scripts-allow`: operator-reviewed lifecycle-script grants for
+  exact npm identities. `add` (TTY-only) displays the package's install
+  scripts before confirmation and snapshots them with the registry
+  integrity hash; on a gated `npm install -g` of a granted identity the
+  gate injects npm 12's per-command policy (`ignore-scripts=false`,
+  `allow-scripts=<granted identities>`, `strict-allow-scripts=true`) so
+  exactly the reviewed scripts run and unreviewed script-bearing
+  dependencies fail the install — the global `ignore-scripts` default
+  never changes. npm < 12 gets a legible manual fallback. `safe audit
+  check --gate install` now hints when a resolved version declares
+  install scripts without a grant, and records `has_install_script` in
+  the check receipt. Closes the manager-neutral lifecycle-scripts gap
+  (originally observed via Volta).
+
 ## 1.4.0 - 2026-08-03
 
 - `safe run host-allow review`: read-only staleness report for host-allow

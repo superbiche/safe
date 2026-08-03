@@ -95,7 +95,7 @@ safe run host-allow list
 safe run host-allow remove pnpm
 ```
 
-`host-allow add` and `host-allow update` are operator-only trust escalations: they require an interactive terminal and refuse in non-TTY shells with exit 102, so agents can suggest the command verbatim but never execute it. Both run `safe audit` before mutating the allowlist. A `GO` result can proceed without a reason. `WARN`, `BLOCK`, or unavailable audit results require a reason and interactive confirmation.
+`host-allow add` and `host-allow update` are operator-only trust escalations: they require an interactive terminal and refuse in non-TTY shells with exit 102, so a cooperative agent can suggest the command verbatim but not execute it. (The TTY check is a cooperative-agent boundary, not proof of operator presence — a process that allocates a pseudo-terminal can satisfy it; see the residual-risk note in `install-wrappers.md`.) Both run `safe audit` before mutating the allowlist. A `GO` result can proceed without a reason. `WARN`, `BLOCK`, or unavailable audit results require a reason and interactive confirmation.
 
 ### Staleness review
 
@@ -127,6 +127,48 @@ re-audit probe is bounded (`SAFE_HOST_ALLOW_REVIEW_TIMEOUT`, default 90s).
 entries; an existing note for the day is never overwritten. `install.sh
 --review-timer` installs a weekly systemd user timer
 (`safe-host-allow-review.timer`) that runs `review --digest`.
+
+## Scripts Allowlist
+
+`~/.npmrc` keeps `ignore-scripts=true` globally, so a package whose
+functioning requires its install scripts (platform-binary postinstalls)
+installs "successfully" but broken. A scripts-allow entry is an
+operator-reviewed grant for one exact identity:
+
+```bash
+safe run scripts-allow add opencode-ai@0.5.0 --reason "fetches platform binary"
+safe run scripts-allow list
+safe run scripts-allow remove opencode-ai
+```
+
+`add` is operator-only (TTY, exit 102 otherwise; the same cooperative-agent
+boundary as host-allow — see the residual-risk note in
+`install-wrappers.md`), requires an exact version (never names, ranges, or
+tags), runs the audit preflight, then fetches and **displays the package's
+install-time lifecycle scripts** for review before asking for confirmation —
+the grant is a statement that these scripts were seen. A registry fetch
+failure refuses the grant: sight-unseen authorization is not an option. The
+reviewed scripts and the registry integrity hash are snapshotted into the
+entry.
+
+Consumption: on a gated `npm install -g <pkg>@<granted-version>` (npm ≥ 12),
+the gate injects npm's per-command policy for that one invocation —
+`ignore-scripts=false`, `allow-scripts=<every source-verified granted
+identity>`, `strict-allow-scripts=true` — so exactly the reviewed scripts
+run and any script-bearing dependency outside the grant list fails the
+install. Every identity entering the list is verified to resolve from the
+default public registry (the source the add-time review fetched from);
+identities bound elsewhere are excluded, and if the requested package
+itself fails that binding, no injection happens at all. The global
+`ignore-scripts` default never changes. With npm < 12 (no per-command
+policy) the gate states the manual fallback and installs script-less as
+before. An unpinned install of a granted package gets a hint naming the
+pinned grant.
+
+`safe audit check --gate install` prints a hint when a resolved version
+declares install scripts and no grant exists (`has_install_script` is also
+recorded in the check receipt), so "installed but broken" has a visible
+cause and the exact operator command to fix it.
 
 ## Blocklist
 

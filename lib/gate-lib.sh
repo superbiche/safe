@@ -25,6 +25,7 @@ SAFE_GATE_GVAL=""
 SAFE_GATE_GBOOL=""
 SAFE_GATE_NPM_USERCONFIG=""
 SAFE_GATE_NPM_GLOBALCONFIG=""
+SAFE_GATE_ENV_SCRUB=()
 
 safe_gate_err() {
   printf '%s\n' "$*" >&2
@@ -157,6 +158,19 @@ safe_gate_exec_real() {
   # exec — the audit child receives its values via argv flags, never env.
   export -n SAFE_GATE_DIST_TAG SAFE_GATE_REGISTRY SAFE_GATE_PROJECT_DIR \
     SAFE_GATE_NPM_USERCONFIG SAFE_GATE_NPM_GLOBALCONFIG 2>/dev/null || true
+
+  # Environment names that are not valid shell identifiers (npm accepts
+  # hyphenated npm_config_* keys) cannot be unset from bash: the scrub
+  # records them and the delegate is exec'd through env -u so they never
+  # reach the child.
+  if (( ${#SAFE_GATE_ENV_SCRUB[@]} > 0 )); then
+    local -a env_u=()
+    local scrub_name
+    for scrub_name in "${SAFE_GATE_ENV_SCRUB[@]}"; do
+      env_u+=(-u "${scrub_name}")
+    done
+    exec env "${env_u[@]}" "$real" "$@"
+  fi
 
   exec "$real" "$@"
 }
@@ -442,6 +456,184 @@ safe_gate_host_allow_matches() {
   entry_ecosystem="$(jq -r --arg p "${name}" '.packages[$p].ecosystem // "npm"' "${host_allow_file}" 2>/dev/null || true)"
 
   [[ "${entry_version}" == "${version}" && "${entry_ecosystem}" == "npm" ]]
+}
+
+# ---------------------------------------------------------------------------
+# scripts-allow: operator-reviewed lifecycle-script grants (exact identity)
+# ---------------------------------------------------------------------------
+
+safe_gate_scripts_allow_file() {
+  printf '%s/scripts-allow.json' "$(safe_gate_run_config_dir)"
+}
+
+# Prints the granted version for a package name; fails when none.
+safe_gate_scripts_allow_version() {
+  local name="$1" file version
+  command -v jq >/dev/null 2>&1 || return 1
+  file="$(safe_gate_scripts_allow_file)"
+  [[ -r "${file}" ]] || return 1
+  version="$(jq -r --arg p "${name}" \
+    '.packages[$p] | select((.ecosystem // "npm") == "npm") | .version // empty' \
+    "${file}" 2>/dev/null || true)"
+  [[ -n "${version}" ]] || return 1
+  printf '%s' "${version}"
+}
+
+# Scrub inherited npm script-policy env from THIS process. npm accepts
+# npm_config_* keys in any case and with hyphen or underscore spellings;
+# hyphenated names are not valid shell identifiers and cannot be unset from
+# bash, so they are recorded in SAFE_GATE_ENV_SCRUB and stripped at exec
+# time via env -u (safe_gate_exec_real). Must run in the process that will
+# exec the delegate — a subshell's scrub dies with the subshell.
+safe_gate_npm_scrub_script_env() {
+  SAFE_GATE_ENV_SCRUB=()
+  local env_name env_key
+  while IFS='=' read -r env_name _; do
+    env_key="${env_name,,}"
+    env_key="${env_key//-/_}"
+    case "${env_key}" in
+      npm_config_ignore_scripts|npm_config_allow_scripts|npm_config_strict_allow_scripts|npm_config_dangerously_allow_all_scripts)
+        if [[ "${env_name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+          unset "${env_name}" 2>/dev/null || true
+        else
+          SAFE_GATE_ENV_SCRUB+=("${env_name}")
+        fi
+        ;;
+    esac
+  done < <(env)
+}
+
+# True when a mise [env] overlay (name b64 lines) defines an npm
+# script-policy key under any spelling; sets SAFE_GATE_MISE_POLICY_KEY to
+# the offending name.
+safe_gate_mise_overlay_scripts_policy() {
+  local overlay="$1" name _ key
+  SAFE_GATE_MISE_POLICY_KEY=""
+  [[ -n "${overlay}" ]] || return 1
+  while IFS=' ' read -r name _; do
+    [[ -n "${name}" ]] || continue
+    key="${name,,}"
+    key="${key//-/_}"
+    case "${key}" in
+      npm_config_ignore_scripts|npm_config_allow_scripts|npm_config_strict_allow_scripts|npm_config_dangerously_allow_all_scripts)
+        SAFE_GATE_MISE_POLICY_KEY="${name}"
+        return 0
+        ;;
+    esac
+  done <<<"${overlay}"
+  return 1
+}
+
+# npm's effective --global value across its boolean grammar: bare flag,
+# `=value`, a following true/false token, and the --no- negation. Last
+# occurrence wins, matching npm's parser. npm-only — pnpm/bun would parse a
+# following "false" as a package name.
+safe_gate_npm_global_true() {
+  local -a args=("$@")
+  local i state=1
+  for (( i=0; i<${#args[@]}; i++ )); do
+    case "${args[$i]}" in
+      -g|--global)
+        if (( i + 1 < ${#args[@]} )) && [[ "${args[$((i+1))]}" == "true" || "${args[$((i+1))]}" == "false" ]]; then
+          if [[ "${args[$((i+1))]}" == "true" ]]; then state=0; else state=1; fi
+          i=$((i + 1))
+        else
+          state=0
+        fi
+        ;;
+      --global=true|-g=true) state=0 ;;
+      --global=false|-g=false) state=1 ;;
+      --no-global|--no-global=true) state=1 ;;
+      --no-global=false) state=0 ;;
+    esac
+  done
+  return "${state}"
+}
+
+# For an npm global install whose requested spec exactly matches an operator
+# scripts grant: inject npm 12's per-command allow-scripts policy so the
+# reviewed scripts run. The allow list carries every SOURCE-VERIFIED granted
+# identity (a reviewed transitive dependency may run too, but only when its
+# effective source is the default registry the review fetched from); any
+# script-bearing dependency OUTSIDE the list hard-fails the install
+# (strict). The global ignore-scripts default is never touched — the policy
+# lives and dies with this one invocation. npm < 12 has no per-command
+# policy: state the manual fallback instead of silently skipping scripts.
+safe_gate_npm_scripts_env() {
+  local package matched="" name version granted
+  for package in "$@"; do
+    IFS=$'\t' read -r name version <<< "$(safe_gate_split_spec "${package}")"
+    granted="$(safe_gate_scripts_allow_version "${name}")" || continue
+    if [[ "${version}" == "${granted}" ]]; then
+      matched="${matched:+${matched},}${name}@${version}"
+    else
+      safe_gate_err "safe: scripts grant for ${name} is pinned to ${name}@${granted} — run npm i -g ${name}@${granted} to execute its reviewed install scripts"
+    fi
+  done
+  [[ -n "${matched}" ]] || return 0
+
+  # Grants were reviewed against the default public registry, and npm's
+  # allow matcher binds name@version but NOT registry host: any identity in
+  # the injected list whose effective source is custom (argv/env/rc
+  # registry, ambient @scope:registry overrides) could resolve a DIFFERENT
+  # artifact. So EVERY identity entering the allow list is source-verified
+  # per name; unbound identities are excluded, and if a requested match is
+  # excluded, injection is skipped entirely. Unverifiable fails closed (the
+  # install proceeds script-less, exactly as without a grant).
+  if ! safe_gate_audit_available; then
+    safe_gate_err "safe: scripts grant matched (${matched}) but the effective install source cannot be verified (safe audit unavailable) — install scripts stay skipped"
+    return 0
+  fi
+  local granted_spec granted_name current_source
+  local -a verified=()
+  while IFS= read -r granted_spec; do
+    [[ -n "${granted_spec}" ]] || continue
+    IFS=$'\t' read -r granted_name _ <<< "$(safe_gate_split_spec "${granted_spec}")"
+    local -a es_args=("${granted_name}" --ecosystem npm)
+    [[ -n "${SAFE_GATE_REGISTRY:-}" ]] && es_args+=(--registry "${SAFE_GATE_REGISTRY}")
+    [[ -n "${SAFE_GATE_INSTALLER:-}" ]] && es_args+=(--installer "${SAFE_GATE_INSTALLER}")
+    [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]] && es_args+=(--project-dir "${SAFE_GATE_PROJECT_DIR}")
+    [[ -n "${SAFE_GATE_NPM_USERCONFIG:-}" ]] && es_args+=(--npm-userconfig "${SAFE_GATE_NPM_USERCONFIG}")
+    [[ -n "${SAFE_GATE_NPM_GLOBALCONFIG:-}" ]] && es_args+=(--npm-globalconfig "${SAFE_GATE_NPM_GLOBALCONFIG}")
+    if current_source="$("${SAFE_GATE_AUDIT_BIN}" effective-sources "${es_args[@]}" 2>/dev/null)" \
+      && [[ "${current_source}" == "implicit-default" ]]; then
+      verified+=("${granted_spec}")
+    else
+      safe_gate_err "safe: scripts grant ${granted_spec} is not bound to the default registry here (source '${current_source:-unverifiable}') — excluded from script authorization"
+    fi
+  done < <(jq -r \
+    '.packages | to_entries[] | select((.value.ecosystem // "npm") == "npm") | "\(.key)@\(.value.version)"' \
+    "$(safe_gate_scripts_allow_file)" 2>/dev/null)
+
+  local requested_match match_verified
+  local -a matched_specs=()
+  IFS=',' read -r -a matched_specs <<< "${matched}"
+  for requested_match in "${matched_specs[@]}"; do
+    match_verified=1
+    for granted_spec in ${verified[@]+"${verified[@]}"}; do
+      [[ "${granted_spec}" == "${requested_match}" ]] && match_verified=0
+    done
+    if (( match_verified != 0 )); then
+      safe_gate_err "safe: scripts grant for ${requested_match} was reviewed against the default registry; the effective source here differs — install scripts stay skipped"
+      return 0
+    fi
+  done
+
+  local real npm_version major allow_list
+  real="$(safe_gate_resolve_real npm)" || real=""
+  npm_version="$("${real:-npm}" --version 2>/dev/null || true)"
+  major="${npm_version%%.*}"
+  if [[ ! "${major}" =~ ^[0-9]+$ ]] || (( major < 12 )); then
+    safe_gate_err "safe: scripts grant matched (${matched}) but npm ${npm_version:-unknown} has no per-command allow-scripts (needs >= 12) — scripts stay skipped; fallback: after the install, run only the audited script from the package directory"
+    return 0
+  fi
+  allow_list="$(IFS=,; printf '%s' "${verified[*]}")"
+  [[ -n "${allow_list}" ]] || return 0
+  export npm_config_ignore_scripts=false
+  export npm_config_allow_scripts="${allow_list}"
+  export npm_config_strict_allow_scripts=true
+  safe_gate_audit_log "npm" "${matched}" "SCRIPTS_ALLOW_INJECTED"
+  safe_gate_err "safe: running operator-reviewed install scripts for ${matched} (npm allow-scripts, strict; unreviewed script-bearing dependencies fail the install)"
 }
 
 # ---------------------------------------------------------------------------
@@ -785,7 +977,21 @@ safe_gate_npm_like_packages() {
 }
 
 safe_gate_npm_packages() {
-  safe_gate_npm_like_packages "$@"
+  # npm's boolean grammar allows `--global true|false` after the subcommand;
+  # the shared extractor would misread the value as a package name and audit
+  # a spurious package "true"/"false" (fail-closed friction). Consume the
+  # pair here — npm only; pnpm/bun parse a following token as a package.
+  local -a args=("$@") filtered=()
+  local i
+  for (( i=0; i<${#args[@]}; i++ )); do
+    filtered+=("${args[$i]}")
+    if [[ "${args[$i]}" == "-g" || "${args[$i]}" == "--global" ]] \
+      && (( i + 1 < ${#args[@]} )) \
+      && [[ "${args[$((i+1))]}" == "true" || "${args[$((i+1))]}" == "false" ]]; then
+      i=$((i + 1))
+    fi
+  done
+  safe_gate_npm_like_packages ${filtered[@]+"${filtered[@]}"}
 }
 
 safe_gate_pnpm_packages() {
@@ -1453,7 +1659,46 @@ safe_gate_npm_like() {
     *) safe_gate_exec_real "${tool}" "$@" ;;
   esac
 
-  if safe_gate_has_arg "-g" "$@" || safe_gate_has_arg "--global" "$@"; then
+  if [[ "${tool}" == "npm" ]]; then
+    # Script-policy argv on a gated install could widen or replace the
+    # operator's script policy (npm gives CLI config precedence over env):
+    # refuse legibly. An explicit narrowing --ignore-scripts (bare, =true)
+    # stays allowed; the widening forms (=false, separated false,
+    # --no-ignore-scripts) are refused like the rest.
+    local -a gate_args=("$@")
+    local arg_i scripts_flag
+    for (( arg_i=0; arg_i<${#gate_args[@]}; arg_i++ )); do
+      scripts_flag="${gate_args[$arg_i]}"
+      case "${scripts_flag}" in
+        --allow-scripts|--allow-scripts=*|--no-allow-scripts|--no-allow-scripts=*|\
+        --strict-allow-scripts|--strict-allow-scripts=*|--no-strict-allow-scripts|--no-strict-allow-scripts=*|\
+        --dangerously-allow-all-scripts|--dangerously-allow-all-scripts=*|--no-dangerously-allow-all-scripts|--no-dangerously-allow-all-scripts=*|\
+        --ignore-scripts=false|--no-ignore-scripts|--no-ignore-scripts=*)
+          safe_gate_err "safe: BLOCKED npm ${subcommand} — ${scripts_flag%%=*} overrides the operator's script policy; install scripts run only via an operator grant (safe run scripts-allow add <pkg>@<x.y.z>); details: safe explain"
+          return 100
+          ;;
+        --ignore-scripts)
+          if (( arg_i + 1 < ${#gate_args[@]} )) && [[ "${gate_args[$((arg_i+1))]}" == "false" ]]; then
+            safe_gate_err "safe: BLOCKED npm ${subcommand} — --ignore-scripts false overrides the operator's script policy; install scripts run only via an operator grant (safe run scripts-allow add <pkg>@<x.y.z>); details: safe explain"
+            return 100
+          fi
+          ;;
+      esac
+    done
+    # Inherited script-policy env survives into the delegate with
+    # env-over-rc precedence: scrub it. The gate's own injection re-exports
+    # after this.
+    safe_gate_npm_scrub_script_env
+  fi
+
+  local global_requested=1
+  if [[ "${tool}" == "npm" ]]; then
+    safe_gate_npm_global_true "$@" && global_requested=0
+  elif safe_gate_has_arg "-g" "$@" || safe_gate_has_arg "--global" "$@"; then
+    global_requested=0
+  fi
+
+  if (( global_requested == 0 )); then
     safe_gate_collect raw "$("${parser}" "${rest[@]}")"
     packages=()
     for raw_package in "${raw[@]}"; do
@@ -1464,6 +1709,9 @@ safe_gate_npm_like() {
       safe_gate_check_many npm "${packages[@]}" || return $?
     fi
 
+    if [[ "${tool}" == "npm" ]] && (( ${#packages[@]} > 0 )); then
+      safe_gate_npm_scripts_env "${packages[@]}"
+    fi
     safe_gate_exec_real "${tool}" "$@"
   fi
 
@@ -1965,7 +2213,11 @@ safe_gate_mise_env_overlay() {
   json="$("$mise_real" "$@" env --json 2>/dev/null)" || return 1
   printf '%s' "$json" | jq -r '
     def relevant:
-      (test("^(npm_config_|NPM_CONFIG_)"))
+      # npm parses npm_config_* env keys case-insensitively: the collector
+      # must too, or a mixed-case [env] key (a valid identifier mise will
+      # export) slips past the script-policy refusal while npm honors it
+      # (PR#52 delta-3 finding F3).
+      (test("^npm_config_"; "i"))
       or IN("PIP_INDEX_URL","PIP_EXTRA_INDEX_URL","PIP_FIND_LINKS",
             "PIP_NO_INDEX","PIP_CONFIG_FILE","UV_INDEX_URL",
             "UV_DEFAULT_INDEX","UV_INDEX","UV_EXTRA_INDEX_URL",
@@ -3017,6 +3269,18 @@ safe_gate_mise_gate_exec() {
       safe_gate_err "safe: mise exec ${cmd[0]}: ${inner_unmodeled} selects a ${inner_installer} source safe cannot resolve advisories against — not audit-gated; review manually"
       return 0
     fi
+    # mise re-applies its [env] tables after the outer exec, where the
+    # gate's own scrub cannot reach: a script-policy key in the overlay
+    # would resurrect exactly what the scrub removed. Fail closed and name
+    # the key — the operator removes it from the mise config if intended.
+    case "${cmd[0]}" in
+      npm|pnpm|bun)
+        if safe_gate_mise_overlay_scripts_policy "$SAFE_GATE_MISE_OVERLAY"; then
+          safe_gate_err "safe: BLOCKED mise exec ${cmd[0]} — the mise [env] overlay sets ${SAFE_GATE_MISE_POLICY_KEY}, which overrides the operator's script policy; remove it from the mise config (operator) and retry; details: safe explain"
+          return 100
+        fi
+        ;;
+    esac
     (
       if [[ -n "${SAFE_GATE_MISE_CD:-}" ]]; then
         cd -- "${SAFE_GATE_MISE_CD}" 2>/dev/null || {
@@ -3165,6 +3429,11 @@ safe_gate_mise() {
       ;;
   esac
 
+  # The inner gate ran in a subshell (audit only, exec suppressed): its env
+  # scrub died there. The scrub must happen HERE, in the process that execs
+  # mise, or inherited script-policy env reaches mise's managed npm intact
+  # (delta-2 finding F3).
+  safe_gate_npm_scrub_script_env
   safe_gate_exec_real mise "$@"
 }
 

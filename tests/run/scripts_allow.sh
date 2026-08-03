@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# scripts-allow: operator grant surface + gate-side npm 12 allow-scripts
+# injection. The global ignore-scripts default must never change; grants are
+# exact-identity; agents can never self-grant (TTY gate).
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SAFE_RUN="$ROOT/bin/safe-run"
+GATE_LIB="$ROOT/lib/gate-lib.sh"
+
+pass() { printf 'ok - %s\n' "$*"; }
+fail() { printf 'not ok - %s\n' "$*" >&2; exit 1; }
+
+require() {
+  command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
+}
+
+require bash
+require jq
+
+bash -n "$SAFE_RUN"
+bash -n "$GATE_LIB"
+pass "bash syntax"
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+mkdir -p "$tmp/config" "$tmp/data" "$tmp/audit-data" "$tmp/bin"
+printf '{"packages":{}}\n' > "$tmp/config/scripts-allow.json"
+
+run_safe_run() {
+  SAFE_RUN_CONFIG_DIR="$tmp/config" \
+  SAFE_RUN_DATA_DIR="$tmp/data" \
+  SAFE_AUDIT_DATA_DIR="$tmp/audit-data" \
+  SAFE_RUN_NO_INIT=1 \
+    "$SAFE_RUN" "$@"
+}
+
+# --- operator gate --------------------------------------------------------
+set +e
+out=$(run_safe_run scripts-allow add left-pad@1.3.0 </dev/null 2>&1)
+rc=$?
+set -e
+[[ "$rc" == "102" ]] || fail "non-TTY add must exit 102 (got $rc)"
+grep -q "interactive operator terminal" <<<"$out" || fail "non-TTY refusal not legible"
+grep -q "scripts-allow add left-pad@1.3.0" <<<"$out" || fail "refusal must name the exact operator command"
+pass "non-TTY add refused with exit 102 and the verbatim operator command"
+
+# --- TTY flow (pty via python3) -------------------------------------------
+pty_run() {
+  # Runs a shell command on a real pty, feeding "y\n" as operator input.
+  printf 'y\n' | python3 -c '
+import pty, sys, os
+status = pty.spawn(sys.argv[1:])
+sys.exit(os.waitstatus_to_exitcode(status))
+' bash -c "$1"
+}
+
+if command -v python3 >/dev/null 2>&1; then
+  # Stubs: podman (audit preflight GO) and curl (registry version doc +
+  # integrity fetch) — the add must show the scripts it authorizes.
+  cat > "$tmp/bin/podman" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  image) exit 0 ;;
+  run) printf '{"verdict":"GO"}\n' ;;
+  *) exit 1 ;;
+esac
+SH
+  cat > "$tmp/bin/curl" <<'SH'
+#!/usr/bin/env bash
+url="${!#}"
+case "$url" in
+  *registry.npmjs.org/left-pad/1.3.0)
+    printf '{"name":"left-pad","version":"1.3.0","scripts":{"postinstall":"node fetch-binary.js","test":"tap"},"dist":{"integrity":"sha512-STUB"}}\n' ;;
+  *) exit 22 ;;
+esac
+SH
+  chmod +x "$tmp/bin/podman" "$tmp/bin/curl"
+
+  add_cmd="SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' scripts-allow add left-pad@1.3.0 --reason 'needs binary fetch'"
+  out=$(pty_run "$add_cmd" 2>&1) || fail "TTY add failed: $out"
+  grep -q "postinstall: node fetch-binary.js" <<<"$out" || fail "add must display the scripts being authorized"
+  grep -q "granted install scripts for left-pad@1.3.0" <<<"$out" || fail "add did not confirm the grant"
+
+  entry=$(jq -c '.packages["left-pad"]' "$tmp/config/scripts-allow.json")
+  [[ "$(jq -r '.version' <<<"$entry")" == "1.3.0" ]] || fail "grant entry version wrong: $entry"
+  [[ "$(jq -r '.scripts.postinstall' <<<"$entry")" == "node fetch-binary.js" ]] || fail "grant must snapshot the reviewed scripts"
+  [[ "$(jq -r '.scripts | has("test")' <<<"$entry")" == "false" ]] || fail "non-lifecycle scripts must not be stored"
+  [[ "$(jq -r '.sha' <<<"$entry")" == "sha512-STUB" ]] || fail "grant entry missing integrity"
+  pass "TTY add reviews scripts, snapshots them, records integrity"
+
+  out=$(pty_run "SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' scripts-allow add left-pad@^1.3.0 --reason x" 2>&1) && \
+    fail "range spec must be rejected"
+  grep -q "exact version" <<<"$out" || fail "range rejection not legible: $out"
+  pass "range/tag specs rejected (exact identity only)"
+else
+  printf 'SKIP - python3 unavailable; TTY add flow untested\n'
+  jq -n '{packages:{"left-pad":{version:"1.3.0",sha:"sha512-STUB",ecosystem:"npm",added:"2026-08-03",reason:"seeded",scripts:{postinstall:"node fetch-binary.js"}}}}' \
+    > "$tmp/config/scripts-allow.json"
+fi
+
+# --- list / remove --------------------------------------------------------
+out=$(run_safe_run scripts-allow list)
+grep -q "left-pad@1.3.0" <<<"$out" || fail "list missing entry"
+grep -q "postinstall" <<<"$out" || fail "list must show which scripts were reviewed"
+grep -q "ignore-scripts default never changes" <<<"$out" || fail "list missing invariant note"
+pass "list shows entry with reviewed scripts"
+
+run_safe_run scripts-allow remove left-pad >/dev/null 2>&1
+[[ "$(jq -r '.packages | length' "$tmp/config/scripts-allow.json")" == "0" ]] || fail "remove did not delete entry"
+pass "remove deletes the grant"
+
+# --- gate injection -------------------------------------------------------
+jq -n '{packages:{
+  "opencode-ai":{version:"0.5.0",sha:"s",ecosystem:"npm",added:"2026-08-03",reason:"platform binary",scripts:{postinstall:"node install.js"}},
+  "sharp":{version:"0.34.0",sha:"s2",ecosystem:"npm",added:"2026-08-03",reason:"native dep",scripts:{install:"node-gyp"}}
+}}' > "$tmp/config/scripts-allow.json"
+
+make_npm_stub() {
+  local version="$1"
+  cat > "$tmp/bin/npm" <<SH
+#!/usr/bin/env bash
+if [[ "\$1" == "--version" ]]; then printf '%s\n' "$version"; exit 0; fi
+{
+  printf 'args=%s\n' "\$*"
+  printf 'ignore_scripts=%s\n' "\${npm_config_ignore_scripts:-unset}"
+  printf 'allow_scripts=%s\n' "\${npm_config_allow_scripts:-unset}"
+  printf 'strict=%s\n' "\${npm_config_strict_allow_scripts:-unset}"
+  printf 'hyphen_ignore=%s\n' "\$(env | grep -c '^npm_config_ignore-scripts=' || true)"
+} > "$tmp/npm-invocation.log"
+SH
+  chmod +x "$tmp/bin/npm"
+}
+
+# Stub safe-audit: gate checks pass (exit 0) and the effective source
+# reports the default registry unless SAFE_AUDIT_STUB_SOURCE overrides it.
+# SAFE_AUDIT_STUB_SCOPED_SOURCE overrides ONLY scoped (@...) names, to model
+# an ambient @scope:registry (name-sensitive source derivation).
+cat > "$tmp/bin/safe-audit" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  effective-sources)
+    if [[ "$2" == @* && -n "${SAFE_AUDIT_STUB_SCOPED_SOURCE:-}" ]]; then
+      printf '%s\n' "${SAFE_AUDIT_STUB_SCOPED_SOURCE}"
+    else
+      printf '%s\n' "${SAFE_AUDIT_STUB_SOURCE:-implicit-default}"
+    fi
+    exit 0
+    ;;
+  check) exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$tmp/bin/safe-audit"
+
+run_gate() {
+  PATH="$tmp/bin:/usr/bin:/bin" \
+  SAFE_RUN_CONFIG_DIR="$tmp/config" \
+  SAFE_RUN_DATA_DIR="$tmp/data" \
+    bash -c "source '$GATE_LIB'; safe_gate_main npm \"\$@\"" gate "$@"
+}
+
+make_npm_stub 12.0.2
+rm -f "$tmp/npm-invocation.log"
+run_gate install -g opencode-ai@0.5.0 >/dev/null 2>&1 || true
+[[ -f "$tmp/npm-invocation.log" ]] || fail "gate did not exec npm"
+grep -q '^ignore_scripts=false$' "$tmp/npm-invocation.log" || fail "injection missing ignore_scripts=false: $(cat "$tmp/npm-invocation.log")"
+grep -q '^allow_scripts=opencode-ai@0.5.0,sharp@0.34.0$' "$tmp/npm-invocation.log" || fail "allow list must carry every granted identity: $(cat "$tmp/npm-invocation.log")"
+grep -q '^strict=true$' "$tmp/npm-invocation.log" || fail "strict mode not set"
+pass "exact grant match injects npm 12 allow-scripts (strict, full grant list)"
+
+rm -f "$tmp/npm-invocation.log"
+err_out=$( (run_gate install -g opencode-ai >/dev/null) 2>&1 ) || true
+grep -q '^ignore_scripts=unset$' "$tmp/npm-invocation.log" || fail "bare name must not inject: $(cat "$tmp/npm-invocation.log")"
+grep -q "pinned to opencode-ai@0.5.0" <<<"$err_out" || fail "bare-name install must hint the pinned grant"
+pass "unpinned spec gets the pinned-grant hint, no injection"
+
+rm -f "$tmp/npm-invocation.log"
+run_gate install -g left-pad@9.9.9 >/dev/null 2>&1 || true
+grep -q '^ignore_scripts=unset$' "$tmp/npm-invocation.log" || fail "ungranted package must not inject"
+pass "no grant, no injection"
+
+make_npm_stub 11.6.1
+rm -f "$tmp/npm-invocation.log"
+err_out=$( (run_gate install -g opencode-ai@0.5.0 >/dev/null) 2>&1 ) || true
+grep -q '^ignore_scripts=unset$' "$tmp/npm-invocation.log" || fail "npm 11 must not receive injection"
+grep -q "needs >= 12" <<<"$err_out" || fail "npm 11 fallback message missing"
+pass "npm < 12: no injection, legible fallback"
+
+# --- script-policy argv is refused (review F3) ----------------------------
+make_npm_stub 12.0.2
+for flag in --allow-scripts=evil@1.0.0 --dangerously-allow-all-scripts --strict-allow-scripts=false \
+  --no-strict-allow-scripts=true --ignore-scripts=false --no-ignore-scripts; do
+  rm -f "$tmp/npm-invocation.log"
+  set +e
+  err_out=$( (run_gate install -g opencode-ai@0.5.0 "$flag" >/dev/null) 2>&1 )
+  rc=$?
+  set -e
+  [[ "$rc" == "100" ]] || fail "$flag must be refused with exit 100 (got $rc)"
+  grep -q "overrides the operator's script policy" <<<"$err_out" || fail "$flag refusal not legible"
+  [[ ! -f "$tmp/npm-invocation.log" ]] || fail "$flag must never reach npm"
+done
+pass "script-policy argv refused (allow-scripts, dangerously-allow-all, strict off, ignore-scripts widening)"
+
+# Separated widening form; bare --ignore-scripts (narrowing) must pass.
+set +e
+err_out=$( (run_gate install -g opencode-ai@0.5.0 --ignore-scripts false >/dev/null) 2>&1 )
+rc=$?
+set -e
+[[ "$rc" == "100" ]] || fail "--ignore-scripts false must be refused (got $rc)"
+rm -f "$tmp/npm-invocation.log"
+run_gate install -g opencode-ai@0.5.0 --ignore-scripts >/dev/null 2>&1 || true
+[[ -f "$tmp/npm-invocation.log" ]] || fail "bare --ignore-scripts (narrowing) must still reach npm"
+pass "separated --ignore-scripts false refused; narrowing bare form allowed"
+
+# --- inherited script-policy env is scrubbed (review F3) ------------------
+rm -f "$tmp/npm-invocation.log"
+env npm_config_dangerously_allow_all_scripts=true NPM_CONFIG_IGNORE_SCRIPTS=false \
+  bash -c "PATH='$tmp/bin:/usr/bin:/bin' SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' \
+    bash -c \"source '$GATE_LIB'; safe_gate_main npm install -g left-pad@9.9.9\"" >/dev/null 2>&1 || true
+grep -q '^ignore_scripts=unset$' "$tmp/npm-invocation.log" || fail "inherited NPM_CONFIG_IGNORE_SCRIPTS must be scrubbed"
+env_dump=$(env npm_config_dangerously_allow_all_scripts=true \
+  bash -c "PATH='$tmp/bin:/usr/bin:/bin' SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' \
+    bash -c \"source '$GATE_LIB'; SAFE_GATE_NO_EXEC=1 safe_gate_main npm install -g left-pad@9.9.9; env\"" 2>/dev/null)
+grep -q "dangerously_allow_all" <<<"$env_dump" && fail "inherited dangerously-allow-all env must be scrubbed"
+pass "inherited script-policy env scrubbed before the delegate"
+
+# Hyphenated env keys are not valid shell identifiers: they must be
+# stripped at exec time (env -u), never reach the delegate.
+rm -f "$tmp/npm-invocation.log"
+env 'npm_config_ignore-scripts=false' \
+  bash -c "PATH='$tmp/bin:/usr/bin:/bin' SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' \
+    bash -c \"source '$GATE_LIB'; safe_gate_main npm install -g left-pad@9.9.9\"" >/dev/null 2>&1 || true
+grep -q '^hyphen_ignore=0$' "$tmp/npm-invocation.log" || fail "hyphenated npm_config_ignore-scripts must be stripped at exec: $(cat "$tmp/npm-invocation.log")"
+pass "hyphenated script-policy env stripped via env -u at exec"
+
+# The mise route runs the inner npm gate in a subshell: the scrub must ALSO
+# run in the parent that execs mise, or the hostile env survives into
+# mise's managed npm (delta-2 F3). Function-level probe + textual pin of
+# the parent-process call site.
+scrub_probe=$(env npm_config_dangerously_allow_all_scripts=true 'npm_config_ignore-scripts=false' \
+  bash -c "source '$GATE_LIB'
+    safe_gate_npm_scrub_script_env
+    printf 'valid=%s scrub_count=%s\n' \"\${npm_config_dangerously_allow_all_scripts:-unset}\" \"\${#SAFE_GATE_ENV_SCRUB[@]}\"")
+[[ "$scrub_probe" == "valid=unset scrub_count=1" ]] || fail "parent-process scrub probe wrong: $scrub_probe"
+grep -B2 'safe_gate_exec_real mise "\$@"' "$GATE_LIB" | grep -q 'safe_gate_npm_scrub_script_env' || \
+  fail "mise outer exec must be preceded by the parent-process scrub"
+pass "scrub runs in the process that execs mise (subshell loss closed)"
+
+# mise [env] overlays re-apply after exec, beyond the scrub's reach: a
+# script-policy key in the overlay must be detected (the gate refuses the
+# inner npm route on it).
+overlay_hit="npm_config_ignore-scripts $(printf 'false' | base64)"
+overlay_ok="SOME_VAR $(printf 'x' | base64)"
+bash -c "source '$GATE_LIB'; safe_gate_mise_overlay_scripts_policy '$overlay_hit' && [[ \"\$SAFE_GATE_MISE_POLICY_KEY\" == 'npm_config_ignore-scripts' ]]" || \
+  fail "overlay policy key not detected"
+bash -c "source '$GATE_LIB'; safe_gate_mise_overlay_scripts_policy '$overlay_ok'" && \
+  fail "benign overlay flagged"
+grep -q 'overlay sets .*overrides the operator.*script policy\|the mise \[env\] overlay sets' "$GATE_LIB" || \
+  fail "overlay refusal message missing"
+pass "mise [env] overlay script-policy keys detected and refused"
+
+# Collector-to-refusal integration with a MIXED-CASE key: npm parses
+# npm_config_* case-insensitively, so the collector must too (delta-3 F3).
+cat > "$tmp/bin/mise" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *"env --json"* ]]; then
+  printf '{"Npm_Config_Ignore_Scripts":"false","Npm_Config_Dangerously_Allow_All_Scripts":"true"}\n'
+  exit 0
+fi
+exit 0
+SH
+chmod +x "$tmp/bin/mise"
+mixed_probe=$(PATH="$tmp/bin:/usr/bin:/bin" bash -c "source '$GATE_LIB'
+  overlay=\$(safe_gate_mise_env_overlay) || { echo collector-failed; exit 0; }
+  if safe_gate_mise_overlay_scripts_policy \"\$overlay\"; then
+    printf 'refused=%s\n' \"\$SAFE_GATE_MISE_POLICY_KEY\"
+  else
+    echo missed
+  fi")
+[[ "$mixed_probe" == "refused=Npm_Config_Ignore_Scripts" ]] || \
+  fail "mixed-case overlay key must be collected and refused: $mixed_probe"
+rm -f "$tmp/bin/mise"
+pass "mixed-case overlay policy key collected and refused end-to-end"
+
+# --- custom registry blocks injection (review F4) -------------------------
+rm -f "$tmp/npm-invocation.log"
+err_out=$( (SAFE_AUDIT_STUB_SOURCE="registry=https://evil.example" run_gate install -g opencode-ai@0.5.0 >/dev/null) 2>&1 ) || true
+grep -q '^ignore_scripts=unset$' "$tmp/npm-invocation.log" || fail "custom source must not receive injection"
+grep -q "reviewed against the default registry" <<<"$err_out" || fail "custom-source skip not legible"
+pass "non-default effective source: no injection, legible skip"
+
+# --- boolean-global grammar (review F6) -----------------------------------
+for form in "--global false" "--global --no-global" "--global=false"; do
+  rm -f "$tmp/npm-invocation.log"
+  # shellcheck disable=SC2086
+  run_gate $form install opencode-ai@0.5.0 >/dev/null 2>&1 || true
+  if [[ -f "$tmp/npm-invocation.log" ]]; then
+    grep -q '^ignore_scripts=unset$' "$tmp/npm-invocation.log" || fail "$form must not receive injection"
+  fi
+done
+pass "project-scope boolean forms (--global false, --no-global, --global=false) never inject"
+
+rm -f "$tmp/npm-invocation.log"
+run_gate --global=true install opencode-ai@0.5.0 >/dev/null 2>&1 || true
+grep -q '^ignore_scripts=false$' "$tmp/npm-invocation.log" || fail "--global=true must route as global and inject: $(cat "$tmp/npm-invocation.log" 2>/dev/null)"
+pass "--global=true routes as global and injects"
+
+# Separated boolean AFTER the subcommand: the npm extractor must consume
+# the value, not audit a package named "true" (delta-2 F6 sibling).
+extracted=$(bash -c "source '$GATE_LIB'; safe_gate_npm_packages install --global true opencode-ai@0.5.0" | tr '\n' ' ')
+grep -q "opencode-ai@0.5.0" <<<"$extracted" || fail "extractor lost the real package: $extracted"
+grep -qw "true" <<<"$extracted" && fail "extractor emitted the boolean value as a package: $extracted"
+rm -f "$tmp/npm-invocation.log"
+run_gate install --global true opencode-ai@0.5.0 >/dev/null 2>&1 || true
+grep -q '^ignore_scripts=false$' "$tmp/npm-invocation.log" || fail "post-subcommand '--global true' must still inject: $(cat "$tmp/npm-invocation.log" 2>/dev/null)"
+pass "post-subcommand separated --global value never becomes a package"
+
+# --- scoped transitive grant from a custom source is excluded (review F4) --
+jq -n '{packages:{
+  "opencode-ai":{version:"0.5.0",sha:"s",ecosystem:"npm",added:"2026-08-03",reason:"platform binary",scripts:{postinstall:"node install.js"}},
+  "@acme/native":{version:"1.0.0",sha:"s3",ecosystem:"npm",added:"2026-08-03",reason:"native scoped dep",scripts:{install:"node-gyp"}}
+}}' > "$tmp/config/scripts-allow.json"
+rm -f "$tmp/npm-invocation.log"
+err_out=$( (SAFE_AUDIT_STUB_SCOPED_SOURCE="registry=https://scoped.example" run_gate install -g opencode-ai@0.5.0 >/dev/null) 2>&1 ) || true
+grep -q '^allow_scripts=opencode-ai@0.5.0$' "$tmp/npm-invocation.log" || fail "custom-source scoped grant must be excluded from the allow list: $(cat "$tmp/npm-invocation.log")"
+grep -q "@acme/native@1.0.0 is not bound to the default registry" <<<"$err_out" || fail "scoped-grant exclusion not legible"
+pass "every injected identity is source-verified; unbound scoped grant excluded"
+
+jq -n '{packages:{
+  "opencode-ai":{version:"0.5.0",sha:"s",ecosystem:"npm",added:"2026-08-03",reason:"platform binary",scripts:{postinstall:"node install.js"}},
+  "sharp":{version:"0.34.0",sha:"s2",ecosystem:"npm",added:"2026-08-03",reason:"native dep",scripts:{install:"node-gyp"}}
+}}' > "$tmp/config/scripts-allow.json"
+
+# --- sight-unseen grants refused (review F5, needs pty) -------------------
+if command -v python3 >/dev/null 2>&1; then
+  cat > "$tmp/bin/curl" <<'SH'
+#!/usr/bin/env bash
+url="${!#}"
+case "$url" in
+  *registry.npmjs.org/int-pkg/2.0.0)
+    printf '{"name":"int-pkg","version":"2.0.0","scripts":{"postinstall":"node x.js"}}\n' ;;
+  *) exit 22 ;;
+esac
+SH
+  chmod +x "$tmp/bin/curl"
+  out=$(pty_run "SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' scripts-allow add ghost-pkg@1.0.0 --reason x" 2>&1) && \
+    fail "fetch failure must refuse the grant"
+  grep -q "sight-unseen" <<<"$out" || fail "sight-unseen refusal not legible: $out"
+  [[ "$(jq -r '.packages | has("ghost-pkg")' "$tmp/config/scripts-allow.json")" == "false" ]] || fail "sight-unseen grant was written"
+  pass "registry fetch failure refuses the grant (no sight-unseen authorization)"
+
+  out=$(pty_run "SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' scripts-allow add int-pkg@2.0.0 --reason x" 2>&1) && \
+    fail "integrity fetch failure must refuse the grant"
+  grep -q "not bound to the reviewed artifact" <<<"$out" || fail "integrity refusal not legible: $out"
+  [[ "$(jq -r '.packages | has("int-pkg")' "$tmp/config/scripts-allow.json")" == "false" ]] || fail "integrity-less grant was written"
+  pass "integrity fetch failure refuses the grant"
+
+  out=$(pty_run "SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' scripts-allow add 'Not/A,Npm?Name@1.0.0' --reason x" 2>&1) && \
+    fail "invalid npm name must be rejected"
+  grep -qi "invalid package name" <<<"$out" || fail "invalid-name rejection must name the cause: $out"
+  pass "invalid npm names rejected at the trust boundary (review F7)"
+else
+  printf 'SKIP - python3 unavailable; F5/F7 pty cases untested\n'
+fi
+
+printf 'scripts-allow: all cases passed\n'

@@ -533,6 +533,7 @@ info "installed binaries to $BIN_DIR"
 if (( DO_RUN )); then
   mkdir -p "$RUN_CONFIG_DIR" "$RUN_DATA_DIR"
   seed_file "$REPO_DIR/config/seed/run/host-allow.json" "$RUN_CONFIG_DIR/host-allow.json"
+  seed_file "$REPO_DIR/config/seed/run/scripts-allow.json" "$RUN_CONFIG_DIR/scripts-allow.json"
   seed_file "$REPO_DIR/config/seed/run/sandbox-known.json" "$RUN_CONFIG_DIR/sandbox-known.json"
   seed_file "$REPO_DIR/config/seed/run/blocked.json" "$RUN_CONFIG_DIR/blocked.json"
   seed_file "$REPO_DIR/config/seed/run/config.json" "$RUN_CONFIG_DIR/config.json"
