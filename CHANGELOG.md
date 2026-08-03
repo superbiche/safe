@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.9.2 - 2026-08-03
+
+- Gate delegate discovery accepts a mise shim that a reshim re-linked onto
+  our mise wrapper (a `<tool>` file whose marker says `tool=mise`): its
+  argv0 dispatch still reaches the real mise, so it is the version-manager
+  shim the gate wants to delegate to. Previously it was classified as one
+  of our wrappers and skipped, leaving every node-family tool with zero
+  non-wrapper candidates — `safe gate pnpm` (and npm, npx, …) exited 127
+  even though the audit returned GO.
+
 ## 1.9.1 - 2026-08-03
 
 - `safe doctor` no longer execs `podman --version` from a no-new-privs
