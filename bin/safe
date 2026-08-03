@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.5.0"
+SAFE_VERSION="1.5.1"
 SAFE_SELF="$(readlink -f "$0")"
 SAFE_DIR="$(dirname "$SAFE_SELF")"
 SAFE_CONFIG_ROOT="${SAFE_CONFIG_DIR:-$HOME/.config/safe}"

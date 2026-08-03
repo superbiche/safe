@@ -78,10 +78,20 @@ chmod +x "$MOCKBIN/curl"
 # --- mock socket CLI ---------------------------------------------------------
 cat > "$MOCKBIN/socket" <<'MOCK'
 #!/usr/bin/env bash
+[[ -n "${MOCK_SOCKET_ARGS_LOG:-}" ]] && printf '%s\n' "$*" >> "$MOCK_SOCKET_ARGS_LOG"
 case "${MOCK_SOCKET_MODE:-ok}" in
   ok) printf '{"score": 95}\n'; exit 0 ;;
   low) printf '{"score": 40}\n'; exit 0 ;;
   auth) printf '{"message":"Unauthorized","cause":"401 Unauthorized"}\n'; exit 1 ;;
+  # First call: auth failure (triggers the vault-injected retry); retry: ok.
+  auth-then-ok)
+    if [[ -e "${MOCK_SOCKET_STATE:?}" ]]; then
+      printf '{"score": 95}\n'
+      exit 0
+    fi
+    : > "${MOCK_SOCKET_STATE}"
+    printf '{"message":"Unauthorized","cause":"401 Unauthorized"}\n'
+    exit 1 ;;
   rate) printf '{"message":"Too Many Requests","cause":"429"}\n'; exit 1 ;;
   hang) sleep 300; exit 0 ;;
   # First call: auth failure (triggers the vault-injected retry); the
@@ -2880,6 +2890,88 @@ if expect_status 0 "scriptless package passes" ; then
 fi
 if expect_no_grep "$ERR_FILE" 'declares install scripts' "no hint without scripts"; then
   pass "no hint without scripts"
+fi
+
+# ---------------------------------------------------------------------------
+# 64. Socket receives purl types, not safe ecosystem names: "python" must be
+#     scored as pkg:pypi (the API 400s on pkg:python), npm stays npm.
+# ---------------------------------------------------------------------------
+prepare_case socket-purl-type
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" \
+  -- requests@2.32.0 --ecosystem python --registry https://pypi.org/simple --gate install
+if expect_status 0 "python check with socket ok gates GO"; then
+  pass "python check with socket ok gates GO"
+fi
+if expect_grep "$CASE_DIR/socket-args.log" '^package score pypi requests@2\.32\.0' "socket is invoked with purl type pypi"; then
+  pass "socket is invoked with purl type pypi"
+fi
+
+prepare_case socket-purl-npm
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=ok \
+  MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_grep "$CASE_DIR/socket-args.log" '^package score npm brace-expansion@2\.1\.4' "npm purl type is unchanged"; then
+  pass "npm purl type is unchanged"
+fi
+
+# Exact specs skip registry resolution, so the remaining purl arms need no
+# registry fixture: rust -> cargo, go -> golang, php -> composer.
+for eco_pair in "rust:cargo:libc@0.2.150" "go:golang:golang.org/x/mod@0.14.0" "php:composer:vendor/pkg@2.5.0"; do
+  eco="${eco_pair%%:*}"
+  rest="${eco_pair#*:}"
+  purl="${rest%%:*}"
+  spec="${rest#*:}"
+  prepare_case "socket-purl-$eco"
+  fixture="$(osv_fixture_empty)"
+  run_check \
+    MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+    MOCK_OSV_FIXTURE="$fixture" \
+    MOCK_SOCKET_MODE=ok \
+    MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" \
+    -- "$spec" --ecosystem "$eco"
+  if expect_grep "$CASE_DIR/socket-args.log" "^package score $purl " "socket purl type for $eco is $purl"; then
+    pass "socket purl type for $eco is $purl"
+  fi
+done
+
+# The vault-injected auth retry must use the mapped purl type too: ambient
+# stale token -> primary call fails auth -> retry through bw-env-run succeeds.
+prepare_case socket-purl-retry
+mkdir -p "$CASE_HOME/.config/setup-new-machines/bw-env.d" "$CASE_HOME/.local/bin"
+: > "$CASE_HOME/.config/setup-new-machines/bw-env.d/socket.env"
+cat > "$CASE_HOME/.local/bin/bw-env-run" <<'SH'
+#!/usr/bin/env bash
+while [[ $# -gt 0 && "$1" != "--" ]]; do shift; done
+shift
+exec "$@"
+SH
+chmod +x "$CASE_HOME/.local/bin/bw-env-run"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_MODE=auth-then-ok \
+  MOCK_SOCKET_STATE="$CASE_DIR/socket-state" \
+  MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" \
+  SOCKET_SECURITY_API_TOKEN=stale-ambient-token \
+  -- requests@2.32.0 --ecosystem python --registry https://pypi.org/simple --gate install
+if expect_status 0 "vault-injected retry recovers the score"; then
+  pass "vault-injected retry recovers the score"
+fi
+if [[ "$(grep -c '^package score pypi requests@2\.32\.0' "$CASE_DIR/socket-args.log" 2>/dev/null)" == "2" ]]; then
+  pass "retry invocation also uses the mapped purl type"
+else
+  cat "$CASE_DIR/socket-args.log" >&2 || true
+  fail "retry invocation also uses the mapped purl type"
 fi
 
 # ---------------------------------------------------------------------------

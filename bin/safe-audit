@@ -4822,6 +4822,18 @@ blocked_entry_reason() {
 
 socket_score_json() {
   local ecosystem="$1" spec="$2" output="$3"
+  # The socket CLI takes a purl type, not safe's ecosystem name. Only npm
+  # coincides: "python"/"rust"/"go"/"php" produced pkg:python/... etc., which
+  # the API rejects with 400 Bad Request — every non-npm score has been
+  # degrading to an infra-WARN since the socket path landed.
+  local purl_type
+  case "$ecosystem" in
+    python) purl_type="pypi" ;;
+    rust) purl_type="cargo" ;;
+    go) purl_type="golang" ;;
+    php) purl_type="composer" ;;
+    *) purl_type="$ecosystem" ;;
+  esac
   local socket_cmd
   # Resolved through the tool cache, not a bespoke PATH: socket is commonly a
   # mise shim, which the old two-directory prepend never covered, so a caller
@@ -4871,7 +4883,7 @@ socket_score_json() {
     return 0
   fi
   local score_ok=true score_rc=0
-  "${socket_leash[@]}" "${socket_invocation[@]}" package score "$ecosystem" "$spec" --json > "$output.raw" 2>"$output.stderr" </dev/null || { score_rc=$?; score_ok=false; }
+  "${socket_leash[@]}" "${socket_invocation[@]}" package score "$purl_type" "$spec" --json > "$output.raw" 2>"$output.stderr" </dev/null || { score_rc=$?; score_ok=false; }
   if [[ "$score_ok" == "false" && ( "$score_rc" == "124" || "$score_rc" == "137" ) ]]; then
     printf '%s\n' "$(jq -n --arg note "socket score timed out after ${socket_budget}s" '{available:true,status:"error",note:$note}')" > "$output"
     return 0
@@ -4884,7 +4896,7 @@ socket_score_json() {
     && grep -qiE "token|api key|auth" "$output.raw" "$output.stderr" 2>/dev/null; then
     local retry_rc=0
     if "${socket_leash[@]}" env -u SOCKET_SECURITY_API_TOKEN "$bw_env_run" --file "$socket_mapping" -- \
-      "$socket_cmd" package score "$ecosystem" "$spec" --json \
+      "$socket_cmd" package score "$purl_type" "$spec" --json \
       > "$output.raw" 2>"$output.stderr" </dev/null; then
       score_ok=true
     else
