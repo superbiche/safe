@@ -644,6 +644,54 @@ case_value_flag_consumes_its_value() {
   pass "$FUNCNAME"
 }
 
+case_doctor_podman_probe_skips_exec_under_no_new_privs() {
+  prepare_case "doctor-podman-nnp"
+  if ! command -v setpriv >/dev/null 2>&1; then
+    pass "$FUNCNAME (setpriv unavailable — sandbox probe not exercised)"
+    return
+  fi
+  # Exec'ing podman from a no-new-privs process draws one SELinux AVC per
+  # attempt on enforcing hosts and reads as broken; the sandboxed probe must
+  # answer from PATH lookup alone. The stub logs any invocation.
+  local bindir="${HOME_DIR}/stub-bin"
+  mkdir -p "${bindir}"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s/podman-invocations.log"\nprintf "podman version 5.0.0\\n"\n' \
+    "${HOME_DIR}" > "${bindir}/podman"
+  chmod +x "${bindir}/podman"
+  local doctor_out
+  doctor_out="$(setpriv --no-new-privs env HOME="${HOME_DIR}" PATH="${bindir}:/usr/bin:/bin" \
+    bash "${ROOT_DIR}/bin/safe" doctor --json 2>/dev/null)"
+  jq -e '.dependencies.sandbox.podman.present == true
+    and .dependencies.sandbox.podman.probed == false
+    and (.dependencies.sandbox.podman.note | test("no-new-privs"))' \
+    <<<"${doctor_out}" >/dev/null || { printf '%s\n' "${doctor_out}" >&2; fail "$FUNCNAME"; return; }
+  if [[ -f "${HOME_DIR}/podman-invocations.log" ]]; then
+    cat "${HOME_DIR}/podman-invocations.log" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  # The default human output must carry the same disclosure — a bare
+  # "sandbox: ready" from a process that cannot exec podman misleads
+  # (review PR#62 F1) — and must not list podman as missing.
+  local doctor_human
+  doctor_human="$(setpriv --no-new-privs env HOME="${HOME_DIR}" PATH="${bindir}:/usr/bin:/bin" \
+    bash "${ROOT_DIR}/bin/safe" doctor 2>/dev/null)"
+  grep -Fq 'podman present but unprobed' <<<"${doctor_human}" \
+    || { printf '%s\n' "${doctor_human}" >&2; fail "$FUNCNAME"; return; }
+  grep -A2 'missing prerequisites:' <<<"${doctor_human}" | grep -Fq 'podman' \
+    && { printf '%s\n' "${doctor_human}" >&2; fail "$FUNCNAME"; return; }
+  # Outside a sandbox the version probe still runs and no caveat renders.
+  doctor_out="$(env HOME="${HOME_DIR}" PATH="${bindir}:/usr/bin:/bin" \
+    bash "${ROOT_DIR}/bin/safe" doctor --json 2>/dev/null)"
+  jq -e '.dependencies.sandbox.podman.version == "podman version 5.0.0"' \
+    <<<"${doctor_out}" >/dev/null || { printf '%s\n' "${doctor_out}" >&2; fail "$FUNCNAME"; return; }
+  doctor_human="$(env HOME="${HOME_DIR}" PATH="${bindir}:/usr/bin:/bin" \
+    bash "${ROOT_DIR}/bin/safe" doctor 2>/dev/null)"
+  grep -Fq 'podman present but unprobed' <<<"${doctor_human}" \
+    && { printf '%s\n' "${doctor_human}" >&2; fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
 case_uv_python_selector_not_a_package() {
   prepare_case "uv-python-selector-not-a-package"
   # --python/-p selects an interpreter; its value ("3.12") must never be
@@ -3487,6 +3535,7 @@ main() {
     case_status_probes_every_wrapper \
     case_wrappers_not_on_path_are_unhealthy \
     case_dash_bin_root_never_reports_healthy \
+    case_doctor_podman_probe_skips_exec_under_no_new_privs \
     case_uv_index_selectors_reach_audit \
     case_uninstall_removes_gate_wrappers \
     case_install_cleans_legacy_safe_install_artifacts \
