@@ -142,10 +142,11 @@ is worth reporting to the operator. It is never a reason to bypass.
 Trust escalations require the operator's interactive terminal. `safe run host-allow add` and `update` refuse in non-TTY shells with exit 102, so an agent can suggest the command but never execute it.
 
 ```bash
-safe run host-allow add <pkg>@<version> --reason "..."   # trusted host exec (npm)
-safe run -y <pkg>@<version> -- <args>                    # one-off sandbox run
-safe install [-g] <pkg>@<version>                        # audited install
-safe run block list && safe run audit --blocked          # review refusals
+safe run host-allow add <pkg>@<version> --reason "..."                            # trusted host exec (npm)
+safe run host-allow add <pkg>@<version> --acknowledge-behavioral --reason "..."   # operator-only behavioral-FP lane: downgrades a GuardDog high-risk BLOCK to a host-allowable WARN for one reviewed exact version; engages only while the live rule set stays within the acknowledged one, OSV shows nothing affecting, and a forced Socket second opinion is clean. Agents relay this command to the operator, never run it
+safe run -y <pkg>@<version> -- <args>                                             # one-off sandbox run
+safe install [-g] <pkg>@<version>                                                 # audited install
+safe run block list && safe run audit --blocked                                   # review refusals
 ```
 <!-- END GENERATED: allow-flows -->
 
