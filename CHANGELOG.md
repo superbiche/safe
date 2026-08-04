@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.10.1 - 2026-08-04
+
+- Gate audit leash is now computed from the audit's sequential worst case
+  (Socket sub-budget × 2 attempts + GuardDog budget × (version probe + up
+  to 4 resolved versions) + 80s paginated OSV per version and cooldown
+  re-query + 120s bounded-fetch overhead; 1150s with defaults) instead of a
+  flat 30s that
+  was smaller than the Socket probe's own 30s timeout — a hanging Socket
+  backend consumed the entire leash and every uncached install died as an
+  illegible `TIMEOUT_FAILCLOSED` that host-allow cannot rescue (live during
+  the 2026-08-04 Socket scoring outage). The gate now also hands the audit
+  child a 15s Socket budget (`SAFE_AUDIT_SOCKET_TIMEOUT`, caller value
+  wins), so a Socket hang degrades to its legible per-component infra WARN
+  inside a completed audit. `SAFE_INSTALL_TIMEOUT_SECONDS` still overrides
+  the leash absolutely; timeout values are accepted only in 1..99999s —
+  out-of-range or malformed values fall back to defaults rather than being
+  passed to `timeout(1)`, where garbage fails every audit and an
+  arithmetic-wrapped 0 disables the backstop entirely. The gate leash and
+  the Socket score leash both escalate TERM to KILL (`--kill-after=2s`): a
+  TERM-only timeout is no backstop against a TERM-resistant child. The
+  shell's own job-death diagnostic on KILL escalation is suppressed so the
+  refusal stays the single final stderr line.
+
 ## 1.10.0 - 2026-08-04
 
 - Bun Security Scanner API integration: `safe audit scanner-batch` (stdin

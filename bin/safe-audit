@@ -4891,8 +4891,12 @@ socket_score_json() {
   # invocation (socket itself, or bw-env-run's master-password fallback when the
   # session cache fails) would otherwise hang invisibly waiting on the terminal.
   # With EOF stdin those paths fail fast and the error lands in $output.stderr.
-  # The call is also WALL-CLOCK bounded: the gate wrapper leashes the whole
-  # check at 30s, but a direct `safe-audit check` had no bound at all, and an
+  # The call is also WALL-CLOCK bounded: the gate wrapper hands this probe a
+  # 15s sub-budget via SAFE_AUDIT_SOCKET_TIMEOUT and leashes the whole check
+  # with a computed backstop that exceeds the sum of all component budgets
+  # (safe_gate_audit_leash_seconds in lib/gate-lib.sh) — this budget is the
+  # operative bound, never the gate leash. A direct `safe-audit check` had no
+  # bound at all, and an
   # intermittently wedged socket CLI hung it for minutes with zero output —
   # which reads as breakage and teaches an agent to route around the gate
   # (contract-test finding 1). A timeout is an infrastructure failure like any
@@ -4900,7 +4904,9 @@ socket_score_json() {
   local -a socket_leash=()
   local socket_budget="${SAFE_AUDIT_SOCKET_TIMEOUT:-30}"
   if command -v timeout >/dev/null 2>&1; then
-    socket_leash=(timeout "$socket_budget")
+    # --kill-after: a TERM-resistant socket child would otherwise outlive
+    # its budget indefinitely (same class as the gate leash, PR#65 delta N2).
+    socket_leash=(timeout --kill-after=2s "$socket_budget")
   else
     # No way to bound the call: refusing to start it is the only shape
     # that cannot hang. The WARN says exactly what coverage was lost and
@@ -4911,7 +4917,10 @@ socket_score_json() {
     return 0
   fi
   local score_ok=true score_rc=0
-  "${socket_leash[@]}" "${socket_invocation[@]}" package score "$purl_type" "$spec" --json > "$output.raw" 2>"$output.stderr" </dev/null || { score_rc=$?; score_ok=false; }
+  # Group stderr to /dev/null: the child's own stderr already goes to a
+  # file, so this discards only the SHELL's job-death diagnostic when the
+  # KILL escalation fires (timeout signals its own group — PR#65 delta-2 N3).
+  { "${socket_leash[@]}" "${socket_invocation[@]}" package score "$purl_type" "$spec" --json > "$output.raw" 2>"$output.stderr" </dev/null || { score_rc=$?; score_ok=false; }; } 2>/dev/null
   if [[ "$score_ok" == "false" && ( "$score_rc" == "124" || "$score_rc" == "137" ) ]]; then
     printf '%s\n' "$(jq -n --arg note "socket score timed out after ${socket_budget}s" '{available:true,status:"error",note:$note}')" > "$output"
     return 0
@@ -4922,13 +4931,14 @@ socket_score_json() {
   # on auth, retry once with the vault-injected token.
   if [[ "$score_ok" == "false" && "$injected" == "false" && "$can_inject" == "true" ]] \
     && grep -qiE "token|api key|auth" "$output.raw" "$output.stderr" 2>/dev/null; then
-    local retry_rc=0
-    if "${socket_leash[@]}" env -u SOCKET_SECURITY_API_TOKEN "$bw_env_run" --file "$socket_mapping" -- \
+    local retry_rc=0 retry_ok=true
+    # Same group-stderr silencing as the first attempt (delta-2 N3).
+    { "${socket_leash[@]}" env -u SOCKET_SECURITY_API_TOKEN "$bw_env_run" --file "$socket_mapping" -- \
       "$socket_cmd" package score "$purl_type" "$spec" --json \
-      > "$output.raw" 2>"$output.stderr" </dev/null; then
+      > "$output.raw" 2>"$output.stderr" </dev/null || { retry_rc=$?; retry_ok=false; }; } 2>/dev/null
+    if [[ "$retry_ok" == "true" ]]; then
       score_ok=true
     else
-      retry_rc=$?
       # A retry that hit the leash must keep the timeout diagnosis: the
       # generic path below would read the (empty) kill-time output and
       # report a bare "socket command failed" (PR7 review F1).

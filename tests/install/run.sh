@@ -71,7 +71,7 @@ fi
   # surface what this invocation actually saw so tests can assert it.
   for env_name in NPM_CONFIG_REGISTRY PIP_INDEX_URL PIP_CONFIG_FILE GOPROXY \
                   CARGO_REGISTRY_DEFAULT CARGO_REGISTRIES_PRIVATE_INDEX \
-                  BUN_CONFIG_REGISTRY COMPOSER_HOME; do
+                  BUN_CONFIG_REGISTRY COMPOSER_HOME SAFE_AUDIT_SOCKET_TIMEOUT; do
     if [[ -n "${!env_name:-}" ]]; then
       printf 'AUDITENV\t%s=%s\n' "${env_name}" "${!env_name}"
       # Byte-exact form: the plain line cannot show a trailing newline or
@@ -128,6 +128,21 @@ for arg in "$@"; do
     *warnme*) exit 10 ;;
   esac
 done
+
+# Bounded sleeper for leash-liveness cases: proves the gate's timeout(1)
+# actually wraps this child (PR#65 review F3). The TERM-resistant variant
+# ignores TERM and keeps re-spawning short sleeps (timeout signals the whole
+# process group, so a single long sleep would die cooperatively) — only the
+# --kill-after KILL escalation can end it (delta N2).
+if [[ -n "${SAFE_AUDIT_CHECK_SLEEP:-}" ]]; then
+  if [[ "${SAFE_AUDIT_CHECK_TRAP_TERM:-0}" == "1" ]]; then
+    trap '' TERM
+    deadline=$(( SECONDS + SAFE_AUDIT_CHECK_SLEEP ))
+    while (( SECONDS < deadline )); do sleep 0.2 || true; done
+  else
+    sleep "${SAFE_AUDIT_CHECK_SLEEP}"
+  fi
+fi
 
 exit "${SAFE_AUDIT_CHECK_STATUS:-0}"
 STUB
@@ -280,6 +295,26 @@ EOF
   chmod +x "${wrapper_dir}/mise"
 }
 
+# PATH-injected timeout recorder: logs the exact argv the gate hands
+# timeout(1), so the leash value is pinned at the real call site instead of
+# self-reported by the code under test (PR#65 delta N2), then delegates to
+# the real binary.
+write_timeout_recorder() {
+  local bin_dir="$1"
+  cat > "${bin_dir}/timeout" <<'STUB'
+#!/usr/bin/env bash
+{
+  printf 'TIMEOUTARGV'
+  for arg in "$@"; do
+    printf '\t%s' "${arg}"
+  done
+  printf '\n'
+} >> "${SAFE_INSTALL_COMMAND_LOG}"
+exec /usr/bin/timeout "$@"
+STUB
+  chmod +x "${bin_dir}/timeout"
+}
+
 prepare_case() {
   local name="$1"
   local with_safe_audit="${2:-yes}"
@@ -335,6 +370,10 @@ run_zsh() {
     SAFE_AUDIT_SCAN_ECOSYSTEM_AUDITS="${SAFE_AUDIT_SCAN_ECOSYSTEM_AUDITS:-}" \
     SAFE_AUDIT_SCAN_NO_RESULT="${SAFE_AUDIT_SCAN_NO_RESULT:-}" \
     SAFE_AUDIT_CHECK_STATUS="${SAFE_AUDIT_CHECK_STATUS:-}" \
+    SAFE_AUDIT_CHECK_SLEEP="${SAFE_AUDIT_CHECK_SLEEP:-}" \
+    SAFE_AUDIT_CHECK_TRAP_TERM="${SAFE_AUDIT_CHECK_TRAP_TERM:-}" \
+    SAFE_AUDIT_SOCKET_TIMEOUT="${SAFE_AUDIT_SOCKET_TIMEOUT:-}" \
+    SAFE_INSTALL_TIMEOUT_SECONDS="${SAFE_INSTALL_TIMEOUT_SECONDS:-}" \
     SAFE_INSTALL_REAL_STATUS="${SAFE_INSTALL_REAL_STATUS:-}" \
     MISE_LS_JSON="${MISE_LS_JSON:-}" \
     "${ZSH_BIN}" -fc 'eval "${SAFE_INSTALL_TEST_SCRIPT}"'
@@ -1638,6 +1677,196 @@ STUB
   # failure surfaces as different output (or the preamble's 127 message).
   if [[ "$out" != "REALMISE args=--version" ]]; then
     printf 'got: %s\n' "$out" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
+case_gate_audit_leash_fits_component_budgets() {
+  # The leash must exceed the sum of the audit's internal budgets (Socket +
+  # GuardDog + bounded-curl overhead), or a single hanging component turns a
+  # legible infra WARN into TIMEOUT_FAILCLOSED (Socket outage 2026-08-04:
+  # socket 30s hang vs 30s leash killed every uncached install).
+  prepare_case "gate-audit-leash-arithmetic"
+  local cfg="${WORK_DIR}/runcfg"
+  mkdir -p "${cfg}"
+
+  leash() {
+    SAFE_RUN_CONFIG_DIR="${cfg}" GATE_LIB="${ROOT_DIR}/lib/gate-lib.sh" \
+      "$@" bash -c 'source "${GATE_LIB}"; safe_gate_audit_leash_seconds'
+  }
+
+  local got
+  # No config: socket 15 x 2 attempts (auth-failure vault retry)
+  # + guarddog 120*(1 probe + 4 versions)
+  # + OSV 80*(4 versions + 1 cooldown re-query) + overhead 120.
+  got="$(leash env)"
+  [[ "${got}" == "1150" ]] || { printf 'default leash %s, expected 1150\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+
+  # An operator-raised GuardDog budget grows the leash with it — times the
+  # probe+versions multiplicity: a constant leash goes silently stale the
+  # day the budget moves.
+  printf '{"install":{"guarddog":{"timeout_seconds":300}}}\n' > "${cfg}/config.json"
+  got="$(leash env)"
+  [[ "${got}" == "2050" ]] || { printf 'guarddog-300 leash %s, expected 2050\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+
+  # The explicit operator override wins absolutely.
+  got="$(leash env SAFE_INSTALL_TIMEOUT_SECONDS=42)"
+  [[ "${got}" == "42" ]] || { printf 'override leash %s, expected 42\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+
+  # An invalid override is ignored, never handed to timeout(1) where it
+  # would fail every audit as exit 125.
+  got="$(leash env SAFE_INSTALL_TIMEOUT_SECONDS=soon)"
+  [[ "${got}" == "2050" ]] || { printf 'invalid-override leash %s, expected 2050\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+
+  # An oversized override (>5 digits) is rejected the same way: unbounded
+  # integers can wrap the arithmetic, and timeout(1) treats 0 as DISABLED.
+  got="$(leash env SAFE_INSTALL_TIMEOUT_SECONDS=999999)"
+  [[ "${got}" == "2050" ]] || { printf 'oversized-override leash %s, expected 2050\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+
+  # A corrupt guarddog budget in config falls back to the default 120.
+  printf '{"install":{"guarddog":{"timeout_seconds":"soon"}}}\n' > "${cfg}/config.json"
+  got="$(leash env)"
+  [[ "${got}" == "1150" ]] || { printf 'corrupt-config leash %s, expected 1150\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+
+  # An overflow-sized guarddog budget is clamped to the default, never
+  # allowed to wrap the leash to zero.
+  printf '{"install":{"guarddog":{"timeout_seconds":18446744073709551436}}}\n' > "${cfg}/config.json"
+  got="$(leash env)"
+  [[ "${got}" == "1150" ]] || { printf 'overflow-config leash %s, expected 1150\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+
+  # A caller-set socket budget participates in the arithmetic — counted
+  # once per attempt.
+  rm -f "${cfg}/config.json"
+  got="$(leash env SAFE_AUDIT_SOCKET_TIMEOUT=9)"
+  [[ "${got}" == "1138" ]] || { printf 'socket-9 leash %s, expected 1138\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+
+  # An overflow-sized socket budget falls back to 15, keeping the leash sane
+  # (a raw 20-digit value wrapped the computed leash to exactly 0).
+  got="$(leash env SAFE_AUDIT_SOCKET_TIMEOUT=18446744073709551436)"
+  [[ "${got}" == "1150" ]] || { printf 'overflow-socket leash %s, expected 1150\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
+case_gate_audit_receives_socket_budget() {
+  # The gate hands the audit child its Socket sub-budget so the component
+  # bound the leash arithmetic assumed is the one that actually applies —
+  # and the PATH-injected timeout recorder pins the exact leash argv at the
+  # REAL call site (a self-reported mirror could lie if the call site
+  # regressed to a constant — delta N2).
+  prepare_case "gate-audit-socket-budget"
+  write_timeout_recorder "${BIN_DIR}"
+  SAFE_INSTALL_TEST_SCRIPT='npm install left-pad@1.2.3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDITENV\tSAFE_AUDIT_SOCKET_TIMEOUT=15' "$FUNCNAME" || return
+  if ! grep -Fq $'TIMEOUTARGV\t--kill-after=2s\t1150\t' "${LOG_FILE}"; then
+    printf 'no timeout argv with the computed default leash\nlog:\n%s\n' "$(cat "${LOG_FILE}")" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+
+  # A caller-set budget survives — the gate default never clobbers it — and
+  # flows into the leash the call site actually applied (25*2 + 1120).
+  prepare_case "gate-audit-socket-budget-caller"
+  write_timeout_recorder "${BIN_DIR}"
+  SAFE_AUDIT_SOCKET_TIMEOUT=25 SAFE_INSTALL_TEST_SCRIPT='npm install left-pad@1.2.3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDITENV\tSAFE_AUDIT_SOCKET_TIMEOUT=25' "$FUNCNAME" || return
+  if ! grep -Fq $'TIMEOUTARGV\t--kill-after=2s\t1170\t' "${LOG_FILE}"; then
+    printf 'no timeout argv with the caller-budget leash\nlog:\n%s\n' "$(cat "${LOG_FILE}")" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+
+  # A malformed caller value degrades to the gate default, not to garbage
+  # reaching the audit's arithmetic.
+  prepare_case "gate-audit-socket-budget-invalid"
+  SAFE_AUDIT_SOCKET_TIMEOUT=soon SAFE_INSTALL_TEST_SCRIPT='npm install left-pad@1.2.3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDITENV\tSAFE_AUDIT_SOCKET_TIMEOUT=15' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_gate_audit_fd_exhaustion_fails_closed() {
+  # The audit status is assigned INSIDE the fd-shuffle group; if the group's
+  # own redirection setup fails (fd exhaustion), the body never runs — a
+  # zero-initialized status returned as a false audit GO (delta-3 N4,
+  # fail-open reproduced at ulimit -n 4..5 on the pre-fix commit). The rc
+  # must be nonzero whenever the audit did not complete.
+  prepare_case "gate-audit-fd-exhaustion"
+  printf '#!/usr/bin/env bash\nexit 10\n' > "${WORK_DIR}/safe-audit"
+  chmod +x "${WORK_DIR}/safe-audit"
+
+  run_audit_rc() {
+    bash -c 'exec 2>/dev/null; ulimit -n "$1" || exit 97
+      source "$2"
+      SAFE_GATE_AUDIT_BIN="$3"
+      safe_gate_run_audit pkg --ecosystem npm >/dev/null
+      printf "%s\n" "$?"' fd-case "$1" "${ROOT_DIR}/lib/gate-lib.sh" "${WORK_DIR}/safe-audit" 2>/dev/null | tail -n 1
+  }
+
+  local lim got
+  for lim in 4 5 6; do
+    got="$(run_audit_rc "${lim}")"
+    if [[ -z "${got}" || "${got}" == "0" ]]; then
+      printf 'ulimit -n %s: audit rc %s — fd-setup failure returned as GO\n' "${lim}" "${got:-<none>}" >&2
+      fail "$FUNCNAME"
+      return
+    fi
+  done
+
+  # Sanity: with enough descriptors the same harness reports the stub's
+  # real WARN status, proving the assertion above exercised the gate and
+  # not a broken fixture.
+  got="$(run_audit_rc 64)"
+  if [[ "${got}" != "10" ]]; then
+    printf 'ulimit -n 64: audit rc %s, expected the stub 10\n' "${got:-<none>}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
+case_gate_leash_kills_a_wedged_audit() {
+  # Hard liveness of the backstop: the operator override reaches timeout(1)
+  # at the call site (recorder argv), and a TERM-RESISTANT child dies to the
+  # --kill-after escalation into the legible fail-closed refusal within
+  # leash + kill-after + slack — never the child's own 15s, never a hang.
+  prepare_case "gate-leash-kills-wedged-audit"
+  write_timeout_recorder "${BIN_DIR}"
+  local start_ts elapsed
+  start_ts=${SECONDS}
+  SAFE_INSTALL_TIMEOUT_SECONDS=1 SAFE_AUDIT_CHECK_SLEEP=15 SAFE_AUDIT_CHECK_TRAP_TERM=1 \
+    SAFE_INSTALL_TEST_SCRIPT='npm install left-pad@1.2.3' run_zsh
+  elapsed=$(( SECONDS - start_ts ))
+  assert_status 100 "$FUNCNAME" || return
+  if ! grep -Fq 'safe audit timed out (fail closed)' "${ERR_FILE}"; then
+    printf 'stderr:\n%s\n' "$(cat "${ERR_FILE}")" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  # Single final stderr line (operator contract): the KILL escalation must
+  # not leak the shell's own "Killed ..." job diagnostic ahead of the
+  # refusal (delta-2 N3 — GNU timeout signals its own group and dies of the
+  # KILL it sends).
+  if [[ "$(wc -l < "${ERR_FILE}")" != "1" ]] || grep -q 'Killed' "${ERR_FILE}"; then
+    printf 'refusal is not the single stderr line:\n%s\n' "$(cat "${ERR_FILE}")" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  if ! grep -Fq $'TIMEOUTARGV\t--kill-after=2s\t1\t' "${LOG_FILE}"; then
+    printf 'override leash never reached the call site\nlog:\n%s\n' "$(cat "${LOG_FILE}")" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  if (( elapsed > 10 )); then
+    printf 'refusal took %ss — the KILL escalation did not bound the TERM-resistant child\n' "${elapsed}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  if grep -F $'REAL\tnpm' "${LOG_FILE}" | grep -q install; then
+    printf 'delegate ran despite the timeout refusal\n' >&2
     fail "$FUNCNAME"
     return
   fi
@@ -3604,6 +3833,10 @@ main() {
     case_gate_resolves_a_displaced_original \
     case_gate_resolves_a_wrapped_mise_shim \
     case_gate_exec_delegates_through_a_wrapped_mise_shim \
+    case_gate_audit_leash_fits_component_budgets \
+    case_gate_audit_receives_socket_budget \
+    case_gate_audit_fd_exhaustion_fails_closed \
+    case_gate_leash_kills_a_wedged_audit \
     case_selective_install_refreshes_gate_lib \
     case_loose_marker_is_not_ownership \
     case_status_probes_every_wrapper \
