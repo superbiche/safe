@@ -661,6 +661,23 @@ expect_status 20 "an incomplete GuardDog scan is never ack-eligible (PR#67 F2)"
 expect_json '((.warn_causes | index("guarddog_high_risk_acknowledged")) == null) and ((.warn_causes | index("guarddog_high_risk")) != null)' \
   "the partial scan keeps the plain BLOCK cause"
 
+prepare_case ack-partial-scan-suppresses-hint
+run_check 1 MOCK_GUARDDOG_MODE=partial-block -- demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 20 "a partial high-risk scan still refuses at the gate"
+if grep -q 'acknowledge-behavioral' "$ERR_FILE"; then
+  printf 'stderr:\n%s\n' "$(cat "$ERR_FILE")" >&2
+  fail "no add-suggestion for a scan an ack can never engage on (PR#67 F5 delta-2)"
+else
+  pass "no add-suggestion for a scan an ack can never engage on (PR#67 F5 delta-2)"
+fi
+
+prepare_case ack-uncovered-rules-refresh-hint
+write_ack_entry 1.0.0 '["threat-network-exfiltration"]'
+run_check 1 MOCK_GUARDDOG_MODE=block -- demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 20 "uncovered rules refuse at the gate"
+expect_grep "$ERR_FILE" 'acknowledge-behavioral' \
+  "the uncovered-rules veto keeps the refresh command — re-adding IS its recovery (PR#67 delta-2 N1)"
+
 prepare_case ack-hint-suppressed-beside-independent-block
 run_check 1 MOCK_GUARDDOG_MODE=block MOCK_OSV_AFFECTING=1 -- demo@1.0.0 --ecosystem npm --gate install --json
 expect_status 20 "combined guarddog + affecting-advisory BLOCK still refuses"
