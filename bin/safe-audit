@@ -4917,7 +4917,10 @@ socket_score_json() {
     return 0
   fi
   local score_ok=true score_rc=0
-  "${socket_leash[@]}" "${socket_invocation[@]}" package score "$purl_type" "$spec" --json > "$output.raw" 2>"$output.stderr" </dev/null || { score_rc=$?; score_ok=false; }
+  # Group stderr to /dev/null: the child's own stderr already goes to a
+  # file, so this discards only the SHELL's job-death diagnostic when the
+  # KILL escalation fires (timeout signals its own group — PR#65 delta-2 N3).
+  { "${socket_leash[@]}" "${socket_invocation[@]}" package score "$purl_type" "$spec" --json > "$output.raw" 2>"$output.stderr" </dev/null || { score_rc=$?; score_ok=false; }; } 2>/dev/null
   if [[ "$score_ok" == "false" && ( "$score_rc" == "124" || "$score_rc" == "137" ) ]]; then
     printf '%s\n' "$(jq -n --arg note "socket score timed out after ${socket_budget}s" '{available:true,status:"error",note:$note}')" > "$output"
     return 0
@@ -4928,13 +4931,14 @@ socket_score_json() {
   # on auth, retry once with the vault-injected token.
   if [[ "$score_ok" == "false" && "$injected" == "false" && "$can_inject" == "true" ]] \
     && grep -qiE "token|api key|auth" "$output.raw" "$output.stderr" 2>/dev/null; then
-    local retry_rc=0
-    if "${socket_leash[@]}" env -u SOCKET_SECURITY_API_TOKEN "$bw_env_run" --file "$socket_mapping" -- \
+    local retry_rc=0 retry_ok=true
+    # Same group-stderr silencing as the first attempt (delta-2 N3).
+    { "${socket_leash[@]}" env -u SOCKET_SECURITY_API_TOKEN "$bw_env_run" --file "$socket_mapping" -- \
       "$socket_cmd" package score "$purl_type" "$spec" --json \
-      > "$output.raw" 2>"$output.stderr" </dev/null; then
+      > "$output.raw" 2>"$output.stderr" </dev/null || { retry_rc=$?; retry_ok=false; }; } 2>/dev/null
+    if [[ "$retry_ok" == "true" ]]; then
       score_ok=true
     else
-      retry_rc=$?
       # A retry that hit the leash must keep the timeout diagnosis: the
       # generic path below would read the (empty) kill-time output and
       # report a bare "socket command failed" (PR7 review F1).

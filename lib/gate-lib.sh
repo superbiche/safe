@@ -318,10 +318,18 @@ safe_gate_run_audit() {
   # timeout recorder, so the leash value handed here is pinned at the real
   # call site, not self-reported.
   if command -v timeout >/dev/null 2>&1; then
-    SAFE_AUDIT_SOCKET_TIMEOUT="${socket_budget}" \
-      timeout --kill-after=2s "$(safe_gate_audit_leash_seconds)" \
-      "${SAFE_GATE_AUDIT_BIN}" check "$@" "${extra[@]}"
-    rc=$?
+    # fd shuffle: the audit child's stderr stays on the real stderr (via fd
+    # 3) while the SHELL's own job-death diagnostic is discarded — GNU
+    # timeout without --foreground signals its own process group, so a KILL
+    # escalation kills timeout itself and bash prints "Killed ..." before
+    # the refusal, breaking the single-final-stderr-line contract
+    # (delta-2 N3).
+    {
+      SAFE_AUDIT_SOCKET_TIMEOUT="${socket_budget}" \
+        timeout --kill-after=2s "$(safe_gate_audit_leash_seconds)" \
+        "${SAFE_GATE_AUDIT_BIN}" check "$@" "${extra[@]}" 2>&3
+      rc=$?
+    } 3>&2 2>/dev/null
   else
     SAFE_AUDIT_SOCKET_TIMEOUT="${socket_budget}" \
       "${SAFE_GATE_AUDIT_BIN}" check "$@" "${extra[@]}"

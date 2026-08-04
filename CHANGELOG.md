@@ -19,7 +19,9 @@
   passed to `timeout(1)`, where garbage fails every audit and an
   arithmetic-wrapped 0 disables the backstop entirely. The gate leash and
   the Socket score leash both escalate TERM to KILL (`--kill-after=2s`): a
-  TERM-only timeout is no backstop against a TERM-resistant child.
+  TERM-only timeout is no backstop against a TERM-resistant child. The
+  shell's own job-death diagnostic on KILL escalation is suppressed so the
+  refusal stays the single final stderr line.
 
 ## 1.10.0 - 2026-08-04
 

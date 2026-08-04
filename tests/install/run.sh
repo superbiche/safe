@@ -1806,6 +1806,15 @@ case_gate_leash_kills_a_wedged_audit() {
     fail "$FUNCNAME"
     return
   fi
+  # Single final stderr line (operator contract): the KILL escalation must
+  # not leak the shell's own "Killed ..." job diagnostic ahead of the
+  # refusal (delta-2 N3 — GNU timeout signals its own group and dies of the
+  # KILL it sends).
+  if [[ "$(wc -l < "${ERR_FILE}")" != "1" ]] || grep -q 'Killed' "${ERR_FILE}"; then
+    printf 'refusal is not the single stderr line:\n%s\n' "$(cat "${ERR_FILE}")" >&2
+    fail "$FUNCNAME"
+    return
+  fi
   if ! grep -Fq $'TIMEOUTARGV\t--kill-after=2s\t1\t' "${LOG_FILE}"; then
     printf 'override leash never reached the call site\nlog:\n%s\n' "$(cat "${LOG_FILE}")" >&2
     fail "$FUNCNAME"
