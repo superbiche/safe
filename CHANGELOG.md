@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.10.2 - 2026-08-04
+
+- GuardDog invocations no longer run under `ulimit -f` (RLIMIT_FSIZE):
+  the limit bound every file the process tree writes — including the
+  package tarball GuardDog downloads before scanning — so any npm package
+  whose tarball (or any single extracted file) exceeded 16 MiB died
+  mid-download as `download-package: [Errno 27] File too large`, silently
+  zeroing behavioral coverage for large packages (found live on
+  `@qwen-code/qwen-code@0.21.5`, 24.6 MB; GuardDog v3.1.0 itself imposes no
+  file-size limit — source audit). Both output streams are now live-capped
+  by `head -c` pipes on what safe keeps: runaway JSON still fails with the
+  same legible per-stream-limit note, a stderr flood stops at the limit
+  instead of running its wall-clock budget against the scratch filesystem,
+  the scan's own exit status is carried through the pipe structure (a
+  failing capture — e.g. `head` on a full filesystem — is named "check
+  free space" via an in-memory note instead of masking GuardDog's status
+  or being written to the very filesystem it diagnoses). GuardDog's
+  internal writes are bounded by its own archive-bomb limits and the
+  wall-clock budget — the same disk-exposure class its workdir always had.
+
 ## 1.10.1 - 2026-08-04
 
 - Gate audit leash is now computed from the audit's sequential worst case

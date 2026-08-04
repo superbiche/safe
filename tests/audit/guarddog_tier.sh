@@ -269,11 +269,38 @@ case "${MOCK_GUARDDOG_MODE:-clean}" in
       printf '{"issues":1,"errors":{},"results":{"typosquatting":[{"package":"multi"}]},"risk_score":{"score":6.4,"label":"suspicious","findings_count":1,"score_breakdown":{}},"risks":[{"threat_rule":"typosquatting","capability_rule":null}]}\n'
     fi
     ;;
+  big-internal-write)
+    # Simulates the package-tarball download: a >16MiB write to guarddog's
+    # own scratch. The retired RLIMIT_FSIZE wrapper killed this as
+    # `download-package: [Errno 27] File too large` before any scan ran
+    # (qwen-code 0.21.5, 2026-08-04); the pipe-cap bounding must not.
+    bigfile="${TMPDIR:-/tmp}/guarddog-mock-big.$$"
+    if ! dd if=/dev/zero of="$bigfile" bs=1048576 count=20 2>/dev/null; then
+      rm -f "$bigfile"
+      printf 'download-package: [Errno 27] File too large\n' >&2
+      exit 1
+    fi
+    rm -f "$bigfile"
+    printf '{"issues":0,"errors":{},"results":{},"risk_score":{"score":0.0,"label":"no_risks_detected","findings_count":0,"score_breakdown":{}},"risks":[]}\n'
+    ;;
   malformed) printf '{not-json\n' ;;
   error) printf 'registry request failed\n' >&2; exit 1 ;;
   hang) sleep 30 ;;
   stubborn) trap '' TERM; while :; do :; done ;;
-  flood) while :; do printf '0123456789abcdef'; done ;;
+  flood)
+    # 8 KiB chunks: the flood must cross the 16 MiB cap well inside the
+    # case's 1s budget so the size branch (not the timeout branch) is the
+    # note under test.
+    flood_chunk=$(printf 'x%.0s' {1..8192})
+    while :; do printf '%s' "$flood_chunk"; done
+    ;;
+  flood-stderr)
+    # Same flood aimed at stderr: the live cap must stop scratch growth at
+    # the per-stream limit instead of letting the flood run its budget
+    # against the filesystem (PR#66 F1 delta).
+    flood_chunk=$(printf 'x%.0s' {1..8192})
+    while :; do printf '%s' "$flood_chunk" >&2; done
+    ;;
   *) exit 2 ;;
 esac
 MOCK
@@ -501,10 +528,118 @@ expect_json '.guarddog.infra_error == true and (.guarddog.note | contains("timed
 (( stubborn_elapsed < 8 )) && pass "TERM-resistant GuardDog remains wall-clock bounded" || fail "TERM-resistant GuardDog remains wall-clock bounded"
 
 prepare_case output-bound
+# 1s budget + elapsed bound: the stub's flood loop survives SIGPIPE (bash
+# builtin printf), so without the short budget this case burned the full
+# 120s production default proving only the wall-clock leash (PR#66 F3).
+printf '{"install":{"guarddog":{"timeout_seconds":1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+SECONDS=0
 run_check 1 MOCK_GUARDDOG_MODE=flood -- demo@1.0.0 --ecosystem npm --json
+flood_elapsed=$SECONDS
 expect_status 10 "unbounded GuardDog stdout is refused"
-expect_json '.guarddog.infra_error == true and (.guarddog.note | contains("output exceeded the 16384 KiB per-stream limit")) and .guarddog.cache.misses == 0' \
+# Size-or-timeout: under parallel suite load the 1s budget can expire
+# before the flood crosses 16 MiB — which note wins is a race. The exact
+# live-cap byte count is pinned by the bounded-capture oracle below.
+expect_json '.guarddog.infra_error == true and ((.guarddog.note | contains("output exceeded the 16384 KiB per-stream limit")) or (.guarddog.note | contains("timed out"))) and .guarddog.cache.misses == 0' \
   "GuardDog output bound becomes uncached infrastructure evidence"
+(( flood_elapsed < 10 )) && pass "flood refusal stays wall-clock bounded" || fail "flood refusal stays wall-clock bounded"
+
+prepare_case stderr-output-bound
+printf '{"install":{"guarddog":{"timeout_seconds":1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+SECONDS=0
+run_check 1 MOCK_GUARDDOG_MODE=flood-stderr -- demo@1.0.0 --ecosystem npm --json
+stderr_flood_elapsed=$SECONDS
+expect_status 10 "unbounded GuardDog stderr is refused"
+expect_json '.guarddog.infra_error == true and ((.guarddog.note | contains("per-stream limit")) or (.guarddog.note | contains("timed out")))' \
+  "stderr flood lands on a legible size or timeout note"
+(( stderr_flood_elapsed < 10 )) && pass "stderr flood refusal stays wall-clock bounded" || fail "stderr flood refusal stays wall-clock bounded"
+
+# Direct oracle for guarddog_bounded_capture (PR#66 N1): the downstream
+# receipt cannot distinguish a live cap from an unbounded write a later
+# consumer shrank, and an inner (stderr-head) capture failure must be
+# visible in the three-status contract, not silently discarded.
+prepare_case bounded-capture-oracle
+cap_out="$CASE_DIR/cap.out"
+cap_err="$CASE_DIR/cap.err"
+cap_st="$CASE_DIR/cap.status"
+probe_capture() {
+  # Hermetic source: SAFE_AUDIT_NO_INIT=1 keeps `main help` from seeding
+  # config/data trees, and the scratch HOME + dir overrides keep any stray
+  # write inside the case (PR#66 delta-3 N3 — the probe touched the real
+  # ~/.config/safe on an uninitialized host).
+  SA="$SAFE_AUDIT" OUT="$cap_out" ERR="${2:-$cap_err}" ST="$cap_st" MODE="$1" \
+    SAFE_AUDIT_NO_INIT=1 HOME="$CASE_HOME" \
+    SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" \
+    SAFE_AUDIT_CONFIG_DIR="$CASE_DIR/audit-config" \
+    SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
+    bash -c '
+    set -euo pipefail
+    source "$SA" help >/dev/null 2>&1
+    case "$MODE" in
+      clean)
+        producer() { printf "hello\n" >&2; printf "{}"; }
+        ;;
+      stderr-flood)
+        producer() {
+          chunk=$(printf "x%.0s" {1..8192})
+          for ((i = 0; i < 3000; i++)); do
+            printf "%s" "$chunk" >&2 || exit 141
+          done
+          printf "{}"
+        }
+        ;;
+    esac
+    guarddog_bounded_capture "$OUT" "$ERR" "$ST" producer
+    printf "%s|%s|%s\n" "${GUARDDOG_CAPTURE[0]:-x}" "${GUARDDOG_CAPTURE[1]:-x}" "${GUARDDOG_CAPTURE[2]:-x}"
+  ' 2>/dev/null
+}
+
+got="$(probe_capture clean)"
+[[ "$got" == "0|0|0" ]] && pass "bounded capture reports a clean three-status contract" || { printf 'got %s\n' "$got" >&2; fail "bounded capture reports a clean three-status contract"; }
+grep -q hello "$cap_err" && grep -q '{}' "$cap_out" \
+  && pass "bounded capture keeps the streams separated" || fail "bounded capture keeps the streams separated"
+
+got="$(probe_capture stderr-flood)"
+[[ "$got" == "141|0|0" ]] && pass "a stderr flood dies on the closed cap, statuses intact" || { printf 'got %s\n' "$got" >&2; fail "a stderr flood dies on the closed cap, statuses intact"; }
+cap_err_size=$(stat -c %s "$cap_err")
+[[ "$cap_err_size" == "16777216" ]] && pass "stderr capture is live-capped at exactly the per-stream limit" || { printf 'stderr size %s\n' "$cap_err_size" >&2; fail "stderr capture is live-capped at exactly the per-stream limit"; }
+
+got="$(probe_capture clean /dev/full)"
+[[ "$got" == "0|0|1" ]] && pass "an inner stderr-head failure is visible in the contract" || { printf 'got %s\n' "$got" >&2; fail "an inner stderr-head failure is visible in the contract"; }
+
+# Direct safe-audit coverage of the version-probe pipeline's failure paths:
+# the doctor cases exercising these mock modes run bin/safe's SEPARATE
+# implementation, so the changed check-side probe had none (PR#66 F4).
+prepare_case version-probe-error
+run_check 1 MOCK_GUARDDOG_VERSION_MODE=valid-error -- demo@1.0.0 --ecosystem npm --json
+expect_status 10 "a version probe that exits nonzero after a valid banner is infra failure"
+expect_json '.guarddog.infra_error == true and (.guarddog.note | contains("guarddog version check failed (exit 7)"))' \
+  "probe exit status is captured through the pipe, not read off the banner"
+
+prepare_case version-probe-flood
+printf '{"install":{"guarddog":{"timeout_seconds":1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+SECONDS=0
+run_check 1 MOCK_GUARDDOG_VERSION_MODE=valid-flood -- demo@1.0.0 --ecosystem npm --json
+version_flood_elapsed=$SECONDS
+expect_status 10 "a flooding version probe is refused"
+expect_json '.guarddog.infra_error == true and ((.guarddog.note | contains("per-stream limit")) or (.guarddog.note | contains("timed out")))' \
+  "flooding probe lands on a legible size or timeout note"
+(( version_flood_elapsed < 10 )) && pass "flooding version probe stays wall-clock bounded" || fail "flooding version probe stays wall-clock bounded"
+
+prepare_case version-probe-stubborn
+printf '{"install":{"guarddog":{"timeout_seconds":1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+SECONDS=0
+run_check 1 MOCK_GUARDDOG_VERSION_MODE=valid-stubborn -- demo@1.0.0 --ecosystem npm --json
+version_stubborn_elapsed=$SECONDS
+expect_status 10 "a TERM-resistant version probe is force-killed and refused"
+expect_json '.guarddog.infra_error == true and (.guarddog.note | contains("timed out after 1s"))' \
+  "forced probe kill keeps the timeout diagnosis"
+(( version_stubborn_elapsed < 10 )) && pass "TERM-resistant version probe stays wall-clock bounded" || fail "TERM-resistant version probe stays wall-clock bounded"
+
+prepare_case big-internal-write
+run_check 1 MOCK_GUARDDOG_MODE=big-internal-write -- demo@1.0.0 --ecosystem npm --json
+expect_status 0 "a >16MiB internal write (tarball download) no longer kills the scan"
+expect_json '.verdict == "GO" and .guarddog.status == "ok" and (.guarddog.infra_error // false) == false' \
+  "large-package behavioral coverage is real, not an EFBIG infra WARN"
 
 prepare_case malformed
 run_check 1 MOCK_GUARDDOG_MODE=malformed -- demo@1.0.0 --ecosystem npm --json
