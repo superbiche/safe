@@ -71,7 +71,8 @@ fi
   # surface what this invocation actually saw so tests can assert it.
   for env_name in NPM_CONFIG_REGISTRY PIP_INDEX_URL PIP_CONFIG_FILE GOPROXY \
                   CARGO_REGISTRY_DEFAULT CARGO_REGISTRIES_PRIVATE_INDEX \
-                  BUN_CONFIG_REGISTRY COMPOSER_HOME SAFE_AUDIT_SOCKET_TIMEOUT; do
+                  BUN_CONFIG_REGISTRY COMPOSER_HOME SAFE_AUDIT_SOCKET_TIMEOUT \
+                  SAFE_GATE_AUDIT_LEASH; do
     if [[ -n "${!env_name:-}" ]]; then
       printf 'AUDITENV\t%s=%s\n' "${env_name}" "${!env_name}"
       # Byte-exact form: the plain line cannot show a trailing newline or
@@ -128,6 +129,10 @@ for arg in "$@"; do
     *warnme*) exit 10 ;;
   esac
 done
+
+# Bounded sleeper for leash-liveness cases: proves the gate's timeout(1)
+# actually wraps this child (PR#65 review F3).
+[[ -n "${SAFE_AUDIT_CHECK_SLEEP:-}" ]] && sleep "${SAFE_AUDIT_CHECK_SLEEP}"
 
 exit "${SAFE_AUDIT_CHECK_STATUS:-0}"
 STUB
@@ -335,6 +340,7 @@ run_zsh() {
     SAFE_AUDIT_SCAN_ECOSYSTEM_AUDITS="${SAFE_AUDIT_SCAN_ECOSYSTEM_AUDITS:-}" \
     SAFE_AUDIT_SCAN_NO_RESULT="${SAFE_AUDIT_SCAN_NO_RESULT:-}" \
     SAFE_AUDIT_CHECK_STATUS="${SAFE_AUDIT_CHECK_STATUS:-}" \
+    SAFE_AUDIT_CHECK_SLEEP="${SAFE_AUDIT_CHECK_SLEEP:-}" \
     SAFE_AUDIT_SOCKET_TIMEOUT="${SAFE_AUDIT_SOCKET_TIMEOUT:-}" \
     SAFE_INSTALL_TIMEOUT_SECONDS="${SAFE_INSTALL_TIMEOUT_SECONDS:-}" \
     SAFE_INSTALL_REAL_STATUS="${SAFE_INSTALL_REAL_STATUS:-}" \
@@ -1661,15 +1667,17 @@ case_gate_audit_leash_fits_component_budgets() {
   }
 
   local got
-  # No config: default socket (15) + default guarddog (120) + overhead (60).
+  # No config: socket 15 + guarddog 120*(1 probe + 4 versions)
+  # + OSV 80*(4 versions + 1 cooldown re-query) + overhead 120.
   got="$(leash env)"
-  [[ "${got}" == "195" ]] || { printf 'default leash %s, expected 195\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+  [[ "${got}" == "1135" ]] || { printf 'default leash %s, expected 1135\n' "${got}" >&2; fail "$FUNCNAME"; return; }
 
-  # An operator-raised GuardDog budget grows the leash with it: a constant
-  # leash goes silently stale the day the budget moves.
+  # An operator-raised GuardDog budget grows the leash with it — times the
+  # probe+versions multiplicity: a constant leash goes silently stale the
+  # day the budget moves.
   printf '{"install":{"guarddog":{"timeout_seconds":300}}}\n' > "${cfg}/config.json"
   got="$(leash env)"
-  [[ "${got}" == "375" ]] || { printf 'guarddog-300 leash %s, expected 375\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+  [[ "${got}" == "2035" ]] || { printf 'guarddog-300 leash %s, expected 2035\n' "${got}" >&2; fail "$FUNCNAME"; return; }
 
   # The explicit operator override wins absolutely.
   got="$(leash env SAFE_INSTALL_TIMEOUT_SECONDS=42)"
@@ -1678,33 +1686,55 @@ case_gate_audit_leash_fits_component_budgets() {
   # An invalid override is ignored, never handed to timeout(1) where it
   # would fail every audit as exit 125.
   got="$(leash env SAFE_INSTALL_TIMEOUT_SECONDS=soon)"
-  [[ "${got}" == "375" ]] || { printf 'invalid-override leash %s, expected 375\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+  [[ "${got}" == "2035" ]] || { printf 'invalid-override leash %s, expected 2035\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+
+  # An oversized override (>5 digits) is rejected the same way: unbounded
+  # integers can wrap the arithmetic, and timeout(1) treats 0 as DISABLED.
+  got="$(leash env SAFE_INSTALL_TIMEOUT_SECONDS=999999)"
+  [[ "${got}" == "2035" ]] || { printf 'oversized-override leash %s, expected 2035\n' "${got}" >&2; fail "$FUNCNAME"; return; }
 
   # A corrupt guarddog budget in config falls back to the default 120.
   printf '{"install":{"guarddog":{"timeout_seconds":"soon"}}}\n' > "${cfg}/config.json"
   got="$(leash env)"
-  [[ "${got}" == "195" ]] || { printf 'corrupt-config leash %s, expected 195\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+  [[ "${got}" == "1135" ]] || { printf 'corrupt-config leash %s, expected 1135\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+
+  # An overflow-sized guarddog budget is clamped to the default, never
+  # allowed to wrap the leash to zero.
+  printf '{"install":{"guarddog":{"timeout_seconds":18446744073709551436}}}\n' > "${cfg}/config.json"
+  got="$(leash env)"
+  [[ "${got}" == "1135" ]] || { printf 'overflow-config leash %s, expected 1135\n' "${got}" >&2; fail "$FUNCNAME"; return; }
 
   # A caller-set socket budget participates in the arithmetic.
   rm -f "${cfg}/config.json"
   got="$(leash env SAFE_AUDIT_SOCKET_TIMEOUT=9)"
-  [[ "${got}" == "189" ]] || { printf 'socket-9 leash %s, expected 189\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+  [[ "${got}" == "1129" ]] || { printf 'socket-9 leash %s, expected 1129\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+
+  # An overflow-sized socket budget falls back to 15, keeping the leash sane
+  # (a raw 20-digit value wrapped the computed leash to exactly 0).
+  got="$(leash env SAFE_AUDIT_SOCKET_TIMEOUT=18446744073709551436)"
+  [[ "${got}" == "1135" ]] || { printf 'overflow-socket leash %s, expected 1135\n' "${got}" >&2; fail "$FUNCNAME"; return; }
   pass "$FUNCNAME"
 }
 
 case_gate_audit_receives_socket_budget() {
   # The gate hands the audit child its Socket sub-budget so the component
-  # bound the leash arithmetic assumed is the one that actually applies.
+  # bound the leash arithmetic assumed is the one that actually applies —
+  # and mirrors the exact timeout(1) argument as SAFE_GATE_AUDIT_LEASH, so
+  # this REAL gated install observes which leash the call site used (the
+  # helper matrix alone cannot catch a call site regressed to a constant).
   prepare_case "gate-audit-socket-budget"
   SAFE_INSTALL_TEST_SCRIPT='npm install left-pad@1.2.3' run_zsh
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'AUDITENV\tSAFE_AUDIT_SOCKET_TIMEOUT=15' "$FUNCNAME" || return
+  assert_log_contains $'AUDITENV\tSAFE_GATE_AUDIT_LEASH=1135' "$FUNCNAME" || return
 
-  # A caller-set budget survives — the gate default never clobbers it.
+  # A caller-set budget survives — the gate default never clobbers it — and
+  # flows into the leash the call site actually applied.
   prepare_case "gate-audit-socket-budget-caller"
   SAFE_AUDIT_SOCKET_TIMEOUT=25 SAFE_INSTALL_TEST_SCRIPT='npm install left-pad@1.2.3' run_zsh
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'AUDITENV\tSAFE_AUDIT_SOCKET_TIMEOUT=25' "$FUNCNAME" || return
+  assert_log_contains $'AUDITENV\tSAFE_GATE_AUDIT_LEASH=1145' "$FUNCNAME" || return
 
   # A malformed caller value degrades to the gate default, not to garbage
   # reaching the audit's arithmetic.
@@ -1712,6 +1742,27 @@ case_gate_audit_receives_socket_budget() {
   SAFE_AUDIT_SOCKET_TIMEOUT=soon SAFE_INSTALL_TEST_SCRIPT='npm install left-pad@1.2.3' run_zsh
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'AUDITENV\tSAFE_AUDIT_SOCKET_TIMEOUT=15' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_gate_leash_kills_a_wedged_audit() {
+  # Liveness of the timeout itself: the operator override reaches timeout(1)
+  # and a child that outlives it dies into the legible fail-closed refusal,
+  # never a hang. Also proves the 124 branch still refuses at exit 100.
+  prepare_case "gate-leash-kills-wedged-audit"
+  SAFE_INSTALL_TIMEOUT_SECONDS=1 SAFE_AUDIT_CHECK_SLEEP=15 \
+    SAFE_INSTALL_TEST_SCRIPT='npm install left-pad@1.2.3' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  if ! grep -Fq 'safe audit timed out (fail closed)' "${ERR_FILE}"; then
+    printf 'stderr:\n%s\n' "$(cat "${ERR_FILE}")" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  if grep -F $'REAL\tnpm' "${LOG_FILE}" | grep -q install; then
+    printf 'delegate ran despite the timeout refusal\n' >&2
+    fail "$FUNCNAME"
+    return
+  fi
   pass "$FUNCNAME"
 }
 
@@ -3677,6 +3728,7 @@ main() {
     case_gate_exec_delegates_through_a_wrapped_mise_shim \
     case_gate_audit_leash_fits_component_budgets \
     case_gate_audit_receives_socket_budget \
+    case_gate_leash_kills_a_wedged_audit \
     case_selective_install_refreshes_gate_lib \
     case_loose_marker_is_not_ownership \
     case_status_probes_every_wrapper \

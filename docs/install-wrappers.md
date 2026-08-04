@@ -323,13 +323,17 @@ exit 100, never a silent passthrough.
 ## Timeouts
 
 Package checks are wrapped with `timeout` when it is available. The leash is
-computed so it always exceeds the sum of the audit's own component budgets —
-Socket score (15s under the gate, `SAFE_AUDIT_SOCKET_TIMEOUT`), the GuardDog
-wall-clock budget (`install.guarddog.timeout_seconds`, default 120s), plus a
-60s allowance for the individually bounded OSV/registry fetches. With defaults
-that is 195s. A hanging component therefore degrades to its own legible infra
-WARN inside a completed audit; the leash only fires as a backstop against
-genuinely unbounded regressions.
+computed so it always exceeds the audit's sequential worst case — Socket
+score (15s under the gate, `SAFE_AUDIT_SOCKET_TIMEOUT`), the GuardDog
+wall-clock budget (`install.guarddog.timeout_seconds`, default 120s) times
+its version probe plus up to four resolved versions, the paginated OSV query
+budget (80s) per resolved version plus the cooldown re-query, and a 120s
+allowance for the remaining individually bounded registry fetches. With
+defaults that is 1135s. The number is deliberately generous: the component
+budgets are the operative bounds, so a hanging component degrades to its own
+legible infra WARN inside a completed audit, and the leash only fires as a
+backstop against a component escaping its own bound — which previously meant
+an indefinite hang.
 
 `SAFE_INSTALL_TIMEOUT_SECONDS` overrides the computed leash absolutely:
 
