@@ -4904,7 +4904,9 @@ socket_score_json() {
   local -a socket_leash=()
   local socket_budget="${SAFE_AUDIT_SOCKET_TIMEOUT:-30}"
   if command -v timeout >/dev/null 2>&1; then
-    socket_leash=(timeout "$socket_budget")
+    # --kill-after: a TERM-resistant socket child would otherwise outlive
+    # its budget indefinitely (same class as the gate leash, PR#65 delta N2).
+    socket_leash=(timeout --kill-after=2s "$socket_budget")
   else
     # No way to bound the call: refusing to start it is the only shape
     # that cannot hang. The WARN says exactly what coverage was lost and

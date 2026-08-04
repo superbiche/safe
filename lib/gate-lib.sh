@@ -24,12 +24,15 @@ SAFE_GATE_SOCKET_BUDGET_DEFAULT=15
 # Sequential multiplicity inside one `safe-audit check`, mirrored from
 # bin/safe-audit (PR#65 review F1 — the leash must cover the real bounded
 # path, not a one-of-each sketch):
+# - socket_score_json can run TWICE with the full budget: the first attempt
+#   plus the vault-injected retry after a late auth failure (delta N1).
 # - resolve_target_versions caps RESOLVED_VERSIONS at 4; GuardDog runs a
 #   --version probe plus one scan per resolved version, each with the full
 #   configured budget.
 # - osv_query_package_json is bounded at 10 pages x curl --max-time 8 = 80s
 #   per invocation; it runs once per resolved version plus once more for the
 #   cooldown security-fix exemption.
+SAFE_GATE_SOCKET_ATTEMPTS=2
 SAFE_GATE_MAX_RESOLVED_VERSIONS=4
 SAFE_GATE_OSV_QUERY_BUDGET=80
 # Fixed allowance for the remaining individually bounded fetches: packument
@@ -277,7 +280,7 @@ safe_gate_socket_budget() {
 # timeout instead of completing with "socket unavailable — infra WARN".
 # The leash is therefore a BACKSTOP against unbounded regressions, not the
 # operative timeout; the component budgets are. With defaults it computes to
-# 15 + 120*(1+4) + 80*(4+1) + 120 = 1135s — deliberately generous: it only
+# 15*2 + 120*(1+4) + 80*(4+1) + 120 = 1150s — deliberately generous: it only
 # fires when a component escapes its own bound, which previously meant an
 # indefinite hang. SAFE_INSTALL_TIMEOUT_SECONDS still overrides the
 # computation absolutely (an out-of-range value is ignored, not passed to
@@ -292,7 +295,7 @@ safe_gate_audit_leash_seconds() {
   guarddog_budget="$(jq -r '.install.guarddog.timeout_seconds // 120' \
     "$(safe_gate_run_config_dir)/config.json" 2>/dev/null || true)"
   safe_gate_timeout_value_ok "${guarddog_budget}" || guarddog_budget=120
-  printf '%s\n' "$(( $(safe_gate_socket_budget) \
+  printf '%s\n' "$(( $(safe_gate_socket_budget) * SAFE_GATE_SOCKET_ATTEMPTS \
     + guarddog_budget * (1 + SAFE_GATE_MAX_RESOLVED_VERSIONS) \
     + SAFE_GATE_OSV_QUERY_BUDGET * (SAFE_GATE_MAX_RESOLVED_VERSIONS + 1) \
     + SAFE_GATE_AUDIT_OVERHEAD_SECONDS ))"
@@ -307,17 +310,16 @@ safe_gate_run_audit() {
   [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]] && extra+=(--project-dir "${SAFE_GATE_PROJECT_DIR}")
   [[ -n "${SAFE_GATE_NPM_USERCONFIG:-}" ]] && extra+=(--npm-userconfig "${SAFE_GATE_NPM_USERCONFIG}")
   [[ -n "${SAFE_GATE_NPM_GLOBALCONFIG:-}" ]] && extra+=(--npm-globalconfig "${SAFE_GATE_NPM_GLOBALCONFIG}")
-  local socket_budget leash
+  local socket_budget
   socket_budget="$(safe_gate_socket_budget)"
-  leash="$(safe_gate_audit_leash_seconds)"
-  # SAFE_GATE_AUDIT_LEASH mirrors the exact value handed to timeout(1) so a
-  # test can observe from inside the child which leash the call site really
-  # used — the helper matrix alone cannot catch a call site regressing to a
-  # constant (PR#65 review F3). Both uses MUST come from the same variable.
+  # --kill-after: TERM-only timeout is not a backstop — a TERM-resistant
+  # child outlives it indefinitely (delta N2; reproduced with
+  # `trap '' TERM`). Tests observe the exact argv through a PATH-injected
+  # timeout recorder, so the leash value handed here is pinned at the real
+  # call site, not self-reported.
   if command -v timeout >/dev/null 2>&1; then
     SAFE_AUDIT_SOCKET_TIMEOUT="${socket_budget}" \
-      SAFE_GATE_AUDIT_LEASH="${leash}" \
-      timeout "${leash}" \
+      timeout --kill-after=2s "$(safe_gate_audit_leash_seconds)" \
       "${SAFE_GATE_AUDIT_BIN}" check "$@" "${extra[@]}"
     rc=$?
   else

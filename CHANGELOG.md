@@ -3,9 +3,10 @@
 ## 1.10.1 - 2026-08-04
 
 - Gate audit leash is now computed from the audit's sequential worst case
-  (Socket sub-budget + GuardDog budget × (version probe + up to 4 resolved
-  versions) + 80s paginated OSV per version and cooldown re-query + 120s
-  bounded-fetch overhead; 1135s with defaults) instead of a flat 30s that
+  (Socket sub-budget × 2 attempts + GuardDog budget × (version probe + up
+  to 4 resolved versions) + 80s paginated OSV per version and cooldown
+  re-query + 120s bounded-fetch overhead; 1150s with defaults) instead of a
+  flat 30s that
   was smaller than the Socket probe's own 30s timeout — a hanging Socket
   backend consumed the entire leash and every uncached install died as an
   illegible `TIMEOUT_FAILCLOSED` that host-allow cannot rescue (live during
@@ -16,7 +17,9 @@
   the leash absolutely; timeout values are accepted only in 1..99999s —
   out-of-range or malformed values fall back to defaults rather than being
   passed to `timeout(1)`, where garbage fails every audit and an
-  arithmetic-wrapped 0 disables the backstop entirely.
+  arithmetic-wrapped 0 disables the backstop entirely. The gate leash and
+  the Socket score leash both escalate TERM to KILL (`--kill-after=2s`): a
+  TERM-only timeout is no backstop against a TERM-resistant child.
 
 ## 1.10.0 - 2026-08-04
 
