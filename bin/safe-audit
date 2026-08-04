@@ -8020,17 +8020,20 @@ check_command() {
     "$guarddog_json")
   # Behavioral-ack engagement: all conditions evaluable now except the OSV
   # one, which re-escalates below once classification has run.
-  local behavioral_ack_engaged=0 behavioral_ack_veto="" behavioral_ack_veto_kind=""
+  # Independent facts, then derivation (delta-3 N2 simplification): a
+  # first-match veto ladder conflated display priority with actionability
+  # whenever multiple vetoes coexisted. Engagement and hint refreshability
+  # both derive from the same two booleans; the veto TEXT concatenates
+  # every standing reason.
+  local behavioral_ack_engaged=0 behavioral_ack_veto=""
+  local behavioral_rules_covered=0 behavioral_socket_ok=0 behavioral_socket_veto=""
   if (( behavioral_ack_candidate )); then
     local behavioral_new_rules
     behavioral_new_rules=$(jq -cn --slurpfile g "$guarddog_json" --argjson ack "$behavioral_ack_rules" \
       '[(($g[0].rules // [])[]) | select(. as $r | ($ack | index($r)) | not)]' 2>/dev/null || printf '[]')
-    if [[ "$behavioral_new_rules" != "[]" ]]; then
-      behavioral_ack_veto_kind="rules"
-      behavioral_ack_veto="rules not covered by the acknowledgement: $(jq -r 'join(", ")' <<<"$behavioral_new_rules")"
-    elif [[ "$(jq -r '.status // empty' "$socket_json" 2>/dev/null)" != "ok" ]]; then
-      behavioral_ack_veto_kind="socket"
-      behavioral_ack_veto="the acknowledgement requires a Socket second opinion and Socket is unavailable"
+    [[ "$behavioral_new_rules" == "[]" ]] && behavioral_rules_covered=1
+    if [[ "$(jq -r '.status // empty' "$socket_json" 2>/dev/null)" != "ok" ]]; then
+      behavioral_socket_veto="the acknowledgement requires a Socket second opinion and Socket is unavailable"
     elif ! jq -e '
         (.raw.ok == true)
         and ((.raw.data.self.alerts // null) | type == "array")
@@ -8047,17 +8050,23 @@ check_command() {
       # Socket's enum values — "HIGH", "urgent", an empty string, or a
       # Unicode lookalike is an UNKNOWN alert class, and an alert we cannot
       # classify must veto, never count as not-high (F1 delta residual).
-      behavioral_ack_veto_kind="socket"
-      behavioral_ack_veto="the Socket second opinion returned an unrecognized result — cannot vouch for this version"
+      behavioral_socket_veto="the Socket second opinion returned an unrecognized result — cannot vouch for this version"
       socket_line='WARN (socket returned an unrecognized result — second opinion unusable)'
       warn_causes+=("socket_error")
       socket_detail="unrecognized socket result shape"
       bump_verdict verdict "WARN"
     elif [[ "$(jq -r '[.raw.data.self.alerts[] | select(.severity == "high" or .severity == "critical")] | length' "$socket_json" 2>/dev/null)" != "0" ]]; then
-      behavioral_ack_veto_kind="socket"
-      behavioral_ack_veto="Socket reports high-severity alerts for this version"
+      behavioral_socket_veto="Socket reports high-severity alerts for this version"
     else
+      behavioral_socket_ok=1
+    fi
+    if (( behavioral_rules_covered && behavioral_socket_ok )); then
       behavioral_ack_engaged=1
+    elif (( ! behavioral_rules_covered )); then
+      behavioral_ack_veto="rules not covered by the acknowledgement: $(jq -r 'join(", ")' <<<"$behavioral_new_rules")"
+      [[ -n "$behavioral_socket_veto" ]] && behavioral_ack_veto+="; ${behavioral_socket_veto}"
+    else
+      behavioral_ack_veto="$behavioral_socket_veto"
     fi
   fi
   case "$guarddog_status:$guarddog_contribution" in
@@ -8206,14 +8215,17 @@ check_command() {
   # entry-independent prerequisites must hold (complete single-version
   # GuardDog BLOCK — a partial scan or multi-version resolution can never
   # engage, so suggesting an add there is a dead end) and OSV must be able
-  # to verify the version. An existing entry closes the lane UNLESS its
-  # veto is the uncovered-rules one — re-adding with the refreshed receipt
-  # is exactly that veto's recovery (delta-2 N1); the Socket vetoes are not
-  # recoverable by re-adding.
+  # to verify the version. An existing entry closes the lane UNLESS
+  # uncovered rules are its ONLY standing veto — re-adding with the
+  # refreshed receipt is exactly that veto's recovery (delta-2 N1) — and a
+  # simultaneous Socket veto closes it regardless: re-adding cannot repair
+  # the second opinion (delta-3 N2, derived from the independent facts,
+  # never from a first-rendered veto).
   local behavioral_ack_lane_open=0
   if (( behavioral_ack_prereqs )) && [[ "$osv_status" == "ok" ]]; then
     behavioral_ack_lane_open=1
-    if (( behavioral_ack_candidate )) && [[ "$behavioral_ack_veto_kind" != "rules" ]]; then
+    if (( behavioral_ack_candidate )) \
+      && ! (( ! behavioral_rules_covered && behavioral_socket_ok )); then
       behavioral_ack_lane_open=0
     fi
   fi

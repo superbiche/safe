@@ -678,6 +678,20 @@ expect_status 20 "uncovered rules refuse at the gate"
 expect_grep "$ERR_FILE" 'acknowledge-behavioral' \
   "the uncovered-rules veto keeps the refresh command — re-adding IS its recovery (PR#67 delta-2 N1)"
 
+prepare_case ack-uncovered-plus-socket-veto-suppresses-hint
+write_ack_entry 1.0.0 '["threat-network-exfiltration"]'
+run_check 1 MOCK_GUARDDOG_MODE=block MOCK_SOCKET_MODE=high-alert -- demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 20 "coexisting rule and Socket vetoes still refuse"
+if grep -q 'acknowledge-behavioral' "$ERR_FILE"; then
+  printf 'stderr:\n%s\n' "$(cat "$ERR_FILE")" >&2
+  fail "re-add cannot repair the Socket veto — no refresh hint beside it (PR#67 delta-3 N2)"
+else
+  pass "re-add cannot repair the Socket veto — no refresh hint beside it (PR#67 delta-3 N2)"
+fi
+run_check 1 MOCK_GUARDDOG_MODE=block MOCK_SOCKET_MODE=high-alert -- demo@1.0.0 --ecosystem npm --json
+expect_grep "$OUT_FILE" 'rules not covered by the acknowledgement.*Socket reports high-severity alerts' \
+  "the veto text names BOTH standing reasons"
+
 prepare_case ack-hint-suppressed-beside-independent-block
 run_check 1 MOCK_GUARDDOG_MODE=block MOCK_OSV_AFFECTING=1 -- demo@1.0.0 --ecosystem npm --gate install --json
 expect_status 20 "combined guarddog + affecting-advisory BLOCK still refuses"
