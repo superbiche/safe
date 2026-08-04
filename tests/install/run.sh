@@ -1788,6 +1788,46 @@ case_gate_audit_receives_socket_budget() {
   pass "$FUNCNAME"
 }
 
+case_gate_audit_fd_exhaustion_fails_closed() {
+  # The audit status is assigned INSIDE the fd-shuffle group; if the group's
+  # own redirection setup fails (fd exhaustion), the body never runs — a
+  # zero-initialized status returned as a false audit GO (delta-3 N4,
+  # fail-open reproduced at ulimit -n 4..5 on the pre-fix commit). The rc
+  # must be nonzero whenever the audit did not complete.
+  prepare_case "gate-audit-fd-exhaustion"
+  printf '#!/usr/bin/env bash\nexit 10\n' > "${WORK_DIR}/safe-audit"
+  chmod +x "${WORK_DIR}/safe-audit"
+
+  run_audit_rc() {
+    bash -c 'exec 2>/dev/null; ulimit -n "$1" || exit 97
+      source "$2"
+      SAFE_GATE_AUDIT_BIN="$3"
+      safe_gate_run_audit pkg --ecosystem npm >/dev/null
+      printf "%s\n" "$?"' fd-case "$1" "${ROOT_DIR}/lib/gate-lib.sh" "${WORK_DIR}/safe-audit" 2>/dev/null | tail -n 1
+  }
+
+  local lim got
+  for lim in 4 5 6; do
+    got="$(run_audit_rc "${lim}")"
+    if [[ -z "${got}" || "${got}" == "0" ]]; then
+      printf 'ulimit -n %s: audit rc %s — fd-setup failure returned as GO\n' "${lim}" "${got:-<none>}" >&2
+      fail "$FUNCNAME"
+      return
+    fi
+  done
+
+  # Sanity: with enough descriptors the same harness reports the stub's
+  # real WARN status, proving the assertion above exercised the gate and
+  # not a broken fixture.
+  got="$(run_audit_rc 64)"
+  if [[ "${got}" != "10" ]]; then
+    printf 'ulimit -n 64: audit rc %s, expected the stub 10\n' "${got:-<none>}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
 case_gate_leash_kills_a_wedged_audit() {
   # Hard liveness of the backstop: the operator override reaches timeout(1)
   # at the call site (recorder argv), and a TERM-RESISTANT child dies to the
@@ -3795,6 +3835,7 @@ main() {
     case_gate_exec_delegates_through_a_wrapped_mise_shim \
     case_gate_audit_leash_fits_component_budgets \
     case_gate_audit_receives_socket_budget \
+    case_gate_audit_fd_exhaustion_fails_closed \
     case_gate_leash_kills_a_wedged_audit \
     case_selective_install_refreshes_gate_lib \
     case_loose_marker_is_not_ownership \

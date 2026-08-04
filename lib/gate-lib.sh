@@ -302,7 +302,11 @@ safe_gate_audit_leash_seconds() {
 }
 
 safe_gate_run_audit() {
-  local rc=0
+  # 125, not 0: the real status is assigned INSIDE the redirected group
+  # below, and a group whose own fd setup fails (fd exhaustion) never runs
+  # its body — a 0 here would return as a false audit GO (delta-3 N4,
+  # reproduced under ulimit -n 4). 125 lands in the generic fail-closed arm.
+  local rc=125
   local -a extra=()
   [[ -n "${SAFE_GATE_DIST_TAG:-}" ]] && extra+=(--dist-tag "${SAFE_GATE_DIST_TAG}")
   [[ -n "${SAFE_GATE_REGISTRY:-}" ]] && extra+=(--registry "${SAFE_GATE_REGISTRY}")
