@@ -9,15 +9,16 @@
   mid-download as `download-package: [Errno 27] File too large`, silently
   zeroing behavioral coverage for large packages (found live on
   `@qwen-code/qwen-code@0.21.5`, 24.6 MB; GuardDog v3.1.0 itself imposes no
-  file-size limit — source audit). stdout is now live-capped by a `head -c`
-  pipe on what safe keeps (runaway JSON still fails with the same legible
-  per-stream-limit note; the scan's own exit status is taken from
-  `PIPESTATUS`, so a failing capture — e.g. `head` on a full scratch
-  filesystem — is named as such instead of masking GuardDog's status);
-  stderr grows only for the wall-clock budget and is truncated to the
-  per-stream limit before anything reads or keeps it. GuardDog's internal
-  writes are bounded by its own archive-bomb limits and the wall-clock
-  budget — the same disk-exposure class its workdir always had.
+  file-size limit — source audit). Both output streams are now live-capped
+  by `head -c` pipes on what safe keeps: runaway JSON still fails with the
+  same legible per-stream-limit note, a stderr flood stops at the limit
+  instead of running its wall-clock budget against the scratch filesystem,
+  the scan's own exit status is carried through the pipe structure (a
+  failing capture — e.g. `head` on a full filesystem — is named "check
+  free space" via an in-memory note instead of masking GuardDog's status
+  or being written to the very filesystem it diagnoses). GuardDog's
+  internal writes are bounded by its own archive-bomb limits and the
+  wall-clock budget — the same disk-exposure class its workdir always had.
 
 ## 1.10.1 - 2026-08-04
 

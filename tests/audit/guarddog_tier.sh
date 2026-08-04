@@ -294,6 +294,13 @@ case "${MOCK_GUARDDOG_MODE:-clean}" in
     flood_chunk=$(printf 'x%.0s' {1..8192})
     while :; do printf '%s' "$flood_chunk"; done
     ;;
+  flood-stderr)
+    # Same flood aimed at stderr: the live cap must stop scratch growth at
+    # the per-stream limit instead of letting the flood run its budget
+    # against the filesystem (PR#66 F1 delta).
+    flood_chunk=$(printf 'x%.0s' {1..8192})
+    while :; do printf '%s' "$flood_chunk" >&2; done
+    ;;
   *) exit 2 ;;
 esac
 MOCK
@@ -532,6 +539,16 @@ expect_status 10 "unbounded GuardDog stdout is refused"
 expect_json '.guarddog.infra_error == true and (.guarddog.note | contains("output exceeded the 16384 KiB per-stream limit")) and .guarddog.cache.misses == 0' \
   "GuardDog output bound becomes uncached infrastructure evidence"
 (( flood_elapsed < 10 )) && pass "flood refusal stays wall-clock bounded" || fail "flood refusal stays wall-clock bounded"
+
+prepare_case stderr-output-bound
+printf '{"install":{"guarddog":{"timeout_seconds":1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+SECONDS=0
+run_check 1 MOCK_GUARDDOG_MODE=flood-stderr -- demo@1.0.0 --ecosystem npm --json
+stderr_flood_elapsed=$SECONDS
+expect_status 10 "unbounded GuardDog stderr is refused"
+expect_json '.guarddog.infra_error == true and ((.guarddog.note | contains("per-stream limit")) or (.guarddog.note | contains("timed out")))' \
+  "stderr flood lands on a legible size or timeout note"
+(( stderr_flood_elapsed < 10 )) && pass "stderr flood refusal stays wall-clock bounded" || fail "stderr flood refusal stays wall-clock bounded"
 
 # Direct safe-audit coverage of the version-probe pipeline's failure paths:
 # the doctor cases exercising these mock modes run bin/safe's SEPARATE
