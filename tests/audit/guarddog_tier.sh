@@ -562,7 +562,16 @@ cap_out="$CASE_DIR/cap.out"
 cap_err="$CASE_DIR/cap.err"
 cap_st="$CASE_DIR/cap.status"
 probe_capture() {
-  SA="$SAFE_AUDIT" OUT="$cap_out" ERR="${2:-$cap_err}" ST="$cap_st" MODE="$1" bash -c '
+  # Hermetic source: SAFE_AUDIT_NO_INIT=1 keeps `main help` from seeding
+  # config/data trees, and the scratch HOME + dir overrides keep any stray
+  # write inside the case (PR#66 delta-3 N3 — the probe touched the real
+  # ~/.config/safe on an uninitialized host).
+  SA="$SAFE_AUDIT" OUT="$cap_out" ERR="${2:-$cap_err}" ST="$cap_st" MODE="$1" \
+    SAFE_AUDIT_NO_INIT=1 HOME="$CASE_HOME" \
+    SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" \
+    SAFE_AUDIT_CONFIG_DIR="$CASE_DIR/audit-config" \
+    SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
+    bash -c '
     set -euo pipefail
     source "$SA" help >/dev/null 2>&1
     case "$MODE" in
