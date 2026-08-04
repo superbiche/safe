@@ -287,7 +287,13 @@ case "${MOCK_GUARDDOG_MODE:-clean}" in
   error) printf 'registry request failed\n' >&2; exit 1 ;;
   hang) sleep 30 ;;
   stubborn) trap '' TERM; while :; do :; done ;;
-  flood) while :; do printf '0123456789abcdef'; done ;;
+  flood)
+    # 8 KiB chunks: the flood must cross the 16 MiB cap well inside the
+    # case's 1s budget so the size branch (not the timeout branch) is the
+    # note under test.
+    flood_chunk=$(printf 'x%.0s' {1..8192})
+    while :; do printf '%s' "$flood_chunk"; done
+    ;;
   *) exit 2 ;;
 esac
 MOCK
@@ -515,10 +521,46 @@ expect_json '.guarddog.infra_error == true and (.guarddog.note | contains("timed
 (( stubborn_elapsed < 8 )) && pass "TERM-resistant GuardDog remains wall-clock bounded" || fail "TERM-resistant GuardDog remains wall-clock bounded"
 
 prepare_case output-bound
+# 1s budget + elapsed bound: the stub's flood loop survives SIGPIPE (bash
+# builtin printf), so without the short budget this case burned the full
+# 120s production default proving only the wall-clock leash (PR#66 F3).
+printf '{"install":{"guarddog":{"timeout_seconds":1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+SECONDS=0
 run_check 1 MOCK_GUARDDOG_MODE=flood -- demo@1.0.0 --ecosystem npm --json
+flood_elapsed=$SECONDS
 expect_status 10 "unbounded GuardDog stdout is refused"
 expect_json '.guarddog.infra_error == true and (.guarddog.note | contains("output exceeded the 16384 KiB per-stream limit")) and .guarddog.cache.misses == 0' \
   "GuardDog output bound becomes uncached infrastructure evidence"
+(( flood_elapsed < 10 )) && pass "flood refusal stays wall-clock bounded" || fail "flood refusal stays wall-clock bounded"
+
+# Direct safe-audit coverage of the version-probe pipeline's failure paths:
+# the doctor cases exercising these mock modes run bin/safe's SEPARATE
+# implementation, so the changed check-side probe had none (PR#66 F4).
+prepare_case version-probe-error
+run_check 1 MOCK_GUARDDOG_VERSION_MODE=valid-error -- demo@1.0.0 --ecosystem npm --json
+expect_status 10 "a version probe that exits nonzero after a valid banner is infra failure"
+expect_json '.guarddog.infra_error == true and (.guarddog.note | contains("guarddog version check failed (exit 7)"))' \
+  "probe exit status is captured through the pipe, not read off the banner"
+
+prepare_case version-probe-flood
+printf '{"install":{"guarddog":{"timeout_seconds":1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+SECONDS=0
+run_check 1 MOCK_GUARDDOG_VERSION_MODE=valid-flood -- demo@1.0.0 --ecosystem npm --json
+version_flood_elapsed=$SECONDS
+expect_status 10 "a flooding version probe is refused"
+expect_json '.guarddog.infra_error == true and ((.guarddog.note | contains("per-stream limit")) or (.guarddog.note | contains("timed out")))' \
+  "flooding probe lands on a legible size or timeout note"
+(( version_flood_elapsed < 10 )) && pass "flooding version probe stays wall-clock bounded" || fail "flooding version probe stays wall-clock bounded"
+
+prepare_case version-probe-stubborn
+printf '{"install":{"guarddog":{"timeout_seconds":1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+SECONDS=0
+run_check 1 MOCK_GUARDDOG_VERSION_MODE=valid-stubborn -- demo@1.0.0 --ecosystem npm --json
+version_stubborn_elapsed=$SECONDS
+expect_status 10 "a TERM-resistant version probe is force-killed and refused"
+expect_json '.guarddog.infra_error == true and (.guarddog.note | contains("timed out after 1s"))' \
+  "forced probe kill keeps the timeout diagnosis"
+(( version_stubborn_elapsed < 10 )) && pass "TERM-resistant version probe stays wall-clock bounded" || fail "TERM-resistant version probe stays wall-clock bounded"
 
 prepare_case big-internal-write
 run_check 1 MOCK_GUARDDOG_MODE=big-internal-write -- demo@1.0.0 --ecosystem npm --json
