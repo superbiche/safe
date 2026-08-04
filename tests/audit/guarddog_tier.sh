@@ -269,6 +269,20 @@ case "${MOCK_GUARDDOG_MODE:-clean}" in
       printf '{"issues":1,"errors":{},"results":{"typosquatting":[{"package":"multi"}]},"risk_score":{"score":6.4,"label":"suspicious","findings_count":1,"score_breakdown":{}},"risks":[{"threat_rule":"typosquatting","capability_rule":null}]}\n'
     fi
     ;;
+  big-internal-write)
+    # Simulates the package-tarball download: a >16MiB write to guarddog's
+    # own scratch. The retired RLIMIT_FSIZE wrapper killed this as
+    # `download-package: [Errno 27] File too large` before any scan ran
+    # (qwen-code 0.21.5, 2026-08-04); the pipe-cap bounding must not.
+    bigfile="${TMPDIR:-/tmp}/guarddog-mock-big.$$"
+    if ! dd if=/dev/zero of="$bigfile" bs=1048576 count=20 2>/dev/null; then
+      rm -f "$bigfile"
+      printf 'download-package: [Errno 27] File too large\n' >&2
+      exit 1
+    fi
+    rm -f "$bigfile"
+    printf '{"issues":0,"errors":{},"results":{},"risk_score":{"score":0.0,"label":"no_risks_detected","findings_count":0,"score_breakdown":{}},"risks":[]}\n'
+    ;;
   malformed) printf '{not-json\n' ;;
   error) printf 'registry request failed\n' >&2; exit 1 ;;
   hang) sleep 30 ;;
@@ -505,6 +519,12 @@ run_check 1 MOCK_GUARDDOG_MODE=flood -- demo@1.0.0 --ecosystem npm --json
 expect_status 10 "unbounded GuardDog stdout is refused"
 expect_json '.guarddog.infra_error == true and (.guarddog.note | contains("output exceeded the 16384 KiB per-stream limit")) and .guarddog.cache.misses == 0' \
   "GuardDog output bound becomes uncached infrastructure evidence"
+
+prepare_case big-internal-write
+run_check 1 MOCK_GUARDDOG_MODE=big-internal-write -- demo@1.0.0 --ecosystem npm --json
+expect_status 0 "a >16MiB internal write (tarball download) no longer kills the scan"
+expect_json '.verdict == "GO" and .guarddog.status == "ok" and (.guarddog.infra_error // false) == false' \
+  "large-package behavioral coverage is real, not an EFBIG infra WARN"
 
 prepare_case malformed
 run_check 1 MOCK_GUARDDOG_MODE=malformed -- demo@1.0.0 --ecosystem npm --json

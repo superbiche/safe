@@ -5243,12 +5243,30 @@ guarddog_scan_one_json() {
       printf 'guarddog scan budget exhausted before this attempt\n' > "$stderr_file"
       return 0
     fi
-    timeout --kill-after=2s "$remaining" bash -c \
-      'ulimit -f "$1" || exit 125; shift; exec "$@"' \
-      safe-guarddog "$GUARDDOG_OUTPUT_LIMIT_KIB" \
-      env "${GUARDDOG_ENV_UNSET[@]}" "$guarddog_cmd" "$cli_ecosystem" scan "$name" \
-      --version "$version" --output-format=json ${sandbox_flag[@]+"${sandbox_flag[@]}"} \
-      > "$raw" 2> "$stderr_file" </dev/null || rc=$?
+    # Output bounding via a stdout pipe cap, NOT RLIMIT_FSIZE: `ulimit -f`
+    # bound EVERY file the process tree writes — including the tarball
+    # GuardDog downloads before scanning — so any package artifact over the
+    # limit died mid-download as `download-package: [Errno 27] File too
+    # large` and behavioral coverage was silently zero for large packages
+    # (qwen-code 0.21.5 = 24.6 MB vs 16 MiB; GuardDog v3.1.0 imposes no size
+    # limit of its own — source audit 2026-08-04). head -c caps what WE
+    # keep: a JSON stream over the limit is truncated (the shape check
+    # fails, and the size probe below still names the per-stream limit)
+    # while the writer dies on SIGPIPE — the old EFBIG-on-stdout semantics
+    # without limiting GuardDog's internal writes. stderr stays file-bound,
+    # covered by the wall-clock leash. pipefail makes rc guarddog's own
+    # status (124/137 timeout diagnosis preserved); the group discards only
+    # the shell's job-death diagnostic on KILL escalation (PR#65 delta-2 N3
+    # class). If the group's own fd setup fails, rc stays 0 with an empty
+    # $raw and the shape check turns that into the error record — never a
+    # pass (PR#65 delta-3 N4 class).
+    {
+      timeout --kill-after=2s "$remaining" \
+        env "${GUARDDOG_ENV_UNSET[@]}" "$guarddog_cmd" "$cli_ecosystem" scan "$name" \
+        --version "$version" --output-format=json ${sandbox_flag[@]+"${sandbox_flag[@]}"} \
+        2> "$stderr_file" </dev/null \
+        | head -c "$(( GUARDDOG_OUTPUT_LIMIT_KIB * 1024 ))" > "$raw" || rc=$?
+    } 2>/dev/null
   }
 
   if guarddog_attempt_prepare; then
@@ -5408,11 +5426,15 @@ guarddog_tier_json() {
   fi
 
   local version_out="$scratch/guarddog-version.stdout" version_err="$scratch/guarddog-version.stderr" version_rc=0
-  timeout --kill-after=2s "$budget" bash -c \
-    'ulimit -f "$1" || exit 125; shift; exec "$@"' \
-    safe-guarddog "$GUARDDOG_OUTPUT_LIMIT_KIB" \
-    env "${GUARDDOG_ENV_UNSET[@]}" "$guarddog_cmd" --version \
-    > "$version_out" 2> "$version_err" </dev/null || version_rc=$?
+  # Same pipe-cap shape as guarddog_run_scan (no RLIMIT_FSIZE — see the
+  # comment there); the probe has no downloads, but one bounding idiom
+  # keeps the failure-note size probes below truthful for both sites.
+  {
+    timeout --kill-after=2s "$budget" \
+      env "${GUARDDOG_ENV_UNSET[@]}" "$guarddog_cmd" --version \
+      2> "$version_err" </dev/null \
+      | head -c "$(( GUARDDOG_OUTPUT_LIMIT_KIB * 1024 ))" > "$version_out" || version_rc=$?
+  } 2>/dev/null
   if (( version_rc != 0 )); then
     local version_note
     local version_out_size version_err_size output_limit_bytes=$((GUARDDOG_OUTPUT_LIMIT_KIB * 1024))
