@@ -48,7 +48,11 @@ emit() {
 case "$url" in
   *api.osv.dev*)
     body_version=$(printf '%s' "$data" | tr -d ' \n' | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
-    if [[ "${MOCK_OSV_REMEDIATED_AT:-}" != "" && -z "$body_version" ]]; then
+    if [[ "${MOCK_OSV_AFFECTING:-0}" == "1" ]]; then
+      # An open-range advisory affecting every version: the behavioral-ack
+      # OSV condition must void the acknowledgement.
+      emit '{"vulns":[{"id":"GHSA-affects-all","database_specific":{"severity":"MODERATE"},"affected":[{"package":{"ecosystem":"npm","name":"demo"},"ranges":[{"type":"SEMVER","events":[{"introduced":"0"}]}]}]}]}'
+    elif [[ "${MOCK_OSV_REMEDIATED_AT:-}" != "" && -z "$body_version" ]]; then
       # Advisory introduced earlier and FIXED exactly at the resolved
       # version: the version under audit IS the security fix. BARE drops the
       # introduced event (malformed range with only a fixed token).
@@ -118,6 +122,10 @@ cat > "$COMMONBIN/socket" <<'MOCK'
 if [[ "${MOCK_SOCKET_MODE:-ok}" == "error" ]]; then
   printf 'socket backend failed\n' >&2
   exit 1
+fi
+if [[ "${MOCK_SOCKET_MODE:-ok}" == "high-alert" ]]; then
+  printf '{"ok":true,"data":{"self":{"score":{"overall":20},"alerts":[{"name":"didYouMean","severity":"high","category":"supplyChainRisk"}]}}}\n'
+  exit 0
 fi
 printf '{"score":95}\n'
 MOCK
@@ -552,6 +560,72 @@ expect_status 10 "unbounded GuardDog stderr is refused"
 expect_json '.guarddog.infra_error == true and ((.guarddog.note | contains("per-stream limit")) or (.guarddog.note | contains("timed out")))' \
   "stderr flood lands on a legible size or timeout note"
 (( stderr_flood_elapsed < 10 )) && pass "stderr flood refusal stays wall-clock bounded" || fail "stderr flood refusal stays wall-clock bounded"
+
+# --- behavioral acknowledgement (operator FP lane, ruled 2026-08-04) ---------
+# A GuardDog BLOCK downgrades to a host-allowable WARN only via an operator
+# behavioral_ack pinned to exactly this version, with the live rule set a
+# subset of the acknowledged one, a clean forced Socket second opinion, and
+# zero affecting OSV advisories.
+ack_full_rules='["capability-network-outbound","threat-network-exfiltration","threat-runtime-obfuscation-general"]'
+write_ack_entry() {
+  printf '{"packages":{"demo":{"version":"%s","sha":"","ecosystem":"npm","added":"2026-08-04","reason":"fp","behavioral_ack":{"rules":%s,"added":"2026-08-04"}}}}\n' \
+    "$1" "$2" > "$CASE_RUN_CONFIG/host-allow.json"
+}
+
+prepare_case ack-engages
+write_ack_entry 1.0.0 "$ack_full_rules"
+run_check 1 MOCK_GUARDDOG_MODE=block MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --json
+expect_status 10 "acknowledged high-risk findings downgrade BLOCK to WARN"
+expect_json '.verdict == "WARN" and (.warn_causes | index("guarddog_high_risk_acknowledged") != null) and ((.warn_causes | index("guarddog_high_risk")) == null)' \
+  "the downgrade is explicit in warn_causes, never an erased finding"
+expect_grep "$OUT_FILE" 'acknowledged by operator' "guarddog line names the acknowledgement"
+[[ -s "$CASE_DIR/socket-args.log" ]] && pass "the ack forces the Socket second opinion (no tier-3 skip)" \
+  || fail "the ack forces the Socket second opinion (no tier-3 skip)"
+
+prepare_case ack-gate-allows
+write_ack_entry 1.0.0 "$ack_full_rules"
+run_check 1 MOCK_GUARDDOG_MODE=block -- demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 0 "gate allows the acknowledged version through the same host-allow entry"
+expect_grep "$ERR_FILE" 'host-allow entry demo@1.0.0' "gate names the authorizing entry"
+
+prepare_case ack-new-rule-veto
+write_ack_entry 1.0.0 '["threat-network-exfiltration"]'
+run_check 1 MOCK_GUARDDOG_MODE=block -- demo@1.0.0 --ecosystem npm --json
+expect_status 20 "rules outside the acknowledged set keep the BLOCK"
+expect_grep "$OUT_FILE" 'behavioral acknowledgement NOT applied — rules not covered' \
+  "the veto names the uncovered rules"
+
+prepare_case ack-socket-unavailable-veto
+write_ack_entry 1.0.0 "$ack_full_rules"
+run_check 1 MOCK_GUARDDOG_MODE=block MOCK_SOCKET_MODE=error -- demo@1.0.0 --ecosystem npm --json
+expect_status 20 "no Socket second opinion, no downgrade"
+expect_grep "$OUT_FILE" 'requires a Socket second opinion' "the veto names the missing second opinion"
+
+prepare_case ack-socket-high-alert-veto
+write_ack_entry 1.0.0 "$ack_full_rules"
+run_check 1 MOCK_GUARDDOG_MODE=block MOCK_SOCKET_MODE=high-alert -- demo@1.0.0 --ecosystem npm --json
+expect_status 20 "a high-severity Socket alert vetoes the downgrade"
+expect_grep "$OUT_FILE" 'Socket reports high-severity alerts' "the veto names the Socket alerts"
+
+prepare_case ack-osv-void
+write_ack_entry 1.0.0 "$ack_full_rules"
+run_check 1 MOCK_GUARDDOG_MODE=block MOCK_OSV_AFFECTING=1 -- demo@1.0.0 --ecosystem npm --json
+expect_status 20 "an affecting OSV advisory voids the acknowledgement"
+expect_grep "$OUT_FILE" 'behavioral acknowledgement void' "the void names the OSV condition"
+
+prepare_case ack-version-mismatch
+write_ack_entry 2.0.0 "$ack_full_rules"
+run_check 1 MOCK_GUARDDOG_MODE=block -- demo@1.0.0 --ecosystem npm --json
+expect_status 20 "an ack pinned to another version never matches"
+expect_json '(.warn_causes | index("guarddog_high_risk")) != null' \
+  "the mismatched ack leaves the plain BLOCK cause"
+
+prepare_case ack-hint
+run_check 1 MOCK_GUARDDOG_MODE=block -- demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 20 "unacknowledged high-risk findings still BLOCK at the gate"
+expect_grep "$ERR_FILE" 'acknowledge-behavioral' \
+  "the gate refusal names the operator FP lane recipe"
 
 # Direct oracle for guarddog_bounded_capture (PR#66 N1): the downstream
 # receipt cannot distinguish a live cap from an unbounded write a later

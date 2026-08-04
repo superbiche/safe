@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.11.0 - 2026-08-04
+
+- Behavioral acknowledgement (operator FP lane, ruled 2026-08-04 after
+  GuardDog's popular-package behavioral false positives reached BLOCK tier:
+  graphifyy, prettier, qwen-code). `safe run host-allow add <pkg>@<version>
+  --acknowledge-behavioral --reason "..."` (TTY-gated) records the exact
+  GuardDog rule set from a check receipt as operator-reviewed false
+  positives for that exact version. `safe audit check` then downgrades a
+  GuardDog high-risk BLOCK to a host-allowable WARN
+  (`guarddog_high_risk_acknowledged`) only while ALL of: the live rule set
+  stays a subset of the acknowledged one (new rules veto), OSV reports
+  nothing affecting the version and is reachable (any affecting advisory or
+  OSV outage voids the ack), and Socket — force-consulted as the second
+  opinion whenever the ack is a candidate, tier-3 skip suspended — reports
+  nothing high/critical. Blocklist, MAL-* records and OSV-critical stay
+  unoverridable; multi-version resolutions never match; `host-allow update`
+  drops the ack (it never carries to an unreviewed version). Gate BLOCK
+  refusals for behavioral findings now name the lane; the agent contract
+  documents it as operator-only (agents relay, never run).
+
 ## 1.10.2 - 2026-08-04
 
 - GuardDog invocations no longer run under `ulimit -f` (RLIMIT_FSIZE):

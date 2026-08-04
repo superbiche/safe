@@ -42,6 +42,15 @@ SAFE_CONFIG_DIR=/tmp/safe-config SAFE_DATA_DIR=/tmp/safe-data safe status
 ## Run Config
 
 `host-allow.json` stores pinned package versions allowed to execute on the host.
+An entry may carry an operator-recorded `behavioral_ack` (written by
+`host-allow add --acknowledge-behavioral`, TTY-gated): the exact GuardDog
+rule set reviewed as false positives for that exact version, sourced from a
+check receipt. The audit downgrades a GuardDog high-risk BLOCK to a
+host-allowable WARN only while the live rule set stays a subset of the
+acknowledged one, OSV shows nothing affecting the version, and a forced
+Socket second opinion reports nothing high/critical — blocklist, MAL-*
+records and OSV-critical remain unoverridable. `host-allow update` drops the
+ack: it never carries to a version the operator did not review.
 
 `blocked.json` stores package names or patterns that should never run.
 

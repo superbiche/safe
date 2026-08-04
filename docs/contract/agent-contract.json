@@ -124,6 +124,10 @@
       "purpose": "trusted host exec (npm)"
     },
     {
+      "command": "safe run host-allow add <pkg>@<version> --acknowledge-behavioral --reason \"...\"",
+      "purpose": "operator-only behavioral-FP lane: downgrades a GuardDog high-risk BLOCK to a host-allowable WARN for one reviewed exact version; engages only while the live rule set stays within the acknowledged one, OSV shows nothing affecting, and a forced Socket second opinion is clean. Agents relay this command to the operator, never run it"
+    },
+    {
       "command": "safe run -y <pkg>@<version> -- <args>",
       "purpose": "one-off sandbox run"
     },

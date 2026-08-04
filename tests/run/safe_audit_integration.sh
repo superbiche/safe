@@ -189,6 +189,99 @@ PATH="$mockbin:$PATH" \
   ' safe-run || fail "host-allow add non-TTY was not refused with exit 102"
 pass "host-allow add refuses non-TTY with legible exit 102"
 
+SAFE_RUN_CONFIG_DIR="$tmp/config-add-ack" \
+SAFE_RUN_DATA_DIR="$tmp/data-add-ack" \
+SAFE_AUDIT_DATA_DIR="$tmp/audit-data-ack" \
+SAFE_AUDIT_VERDICT=BLOCK \
+SAFE_AUDIT_CALL_LOG="$tmp/audit-calls-add-ack.log" \
+SAFE_RUN_PATH="$SAFE_RUN" \
+PATH="$mockbin:$PATH" \
+  bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    ensure_dirs
+    mkdir -p "$SAFE_AUDIT_DATA_DIR/checks"
+    printf %s "{\"spec\":\"ackpkg@3.1.4\",\"ecosystem\":\"npm\",\"resolved_versions\":[\"3.1.4\"],\"verdict\":\"BLOCK\",\"guarddog\":{\"contribution\":\"BLOCK\",\"rules\":[\"threat-network-exfiltration\",\"threat-runtime-obfuscation-general\"]}}" \
+      > "$SAFE_AUDIT_DATA_DIR/checks/2026-08-04-ackpkg-3.1.4.json"
+    registry_integrity_npm() { printf "sha512-fixture"; }
+    require_operator_tty() { :; }
+    host_allow_preflight_audit() { :; }
+    cmd_host_allow_add ackpkg@3.1.4 --acknowledge-behavioral --reason "reviewed: AI CLI capabilities, FP" >/dev/null 2>&1
+    [[ "$(jq -r ".packages.ackpkg.behavioral_ack.rules | join(\",\")" "$HOST_ALLOW_FILE")" == "threat-network-exfiltration,threat-runtime-obfuscation-general" ]]
+    [[ "$(jq -r ".packages.ackpkg.behavioral_ack.receipt" "$HOST_ALLOW_FILE")" == *2026-08-04-ackpkg-3.1.4.json ]]
+  ' safe-run || fail "acknowledge-behavioral did not record the receipt rule set"
+pass "host-allow add --acknowledge-behavioral records the reviewed rule set"
+
+SAFE_RUN_CONFIG_DIR="$tmp/config-add-ack-noreceipt" \
+SAFE_RUN_DATA_DIR="$tmp/data-add-ack-noreceipt" \
+SAFE_AUDIT_DATA_DIR="$tmp/audit-data-ack-noreceipt" \
+SAFE_AUDIT_VERDICT=BLOCK \
+SAFE_AUDIT_CALL_LOG="$tmp/audit-calls-add-ack-noreceipt.log" \
+SAFE_RUN_PATH="$SAFE_RUN" \
+ERR_FILE="$tmp/add-ack-noreceipt.err" \
+PATH="$mockbin:$PATH" \
+  bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    ensure_dirs
+    registry_integrity_npm() { printf "sha512-fixture"; }
+    require_operator_tty() { :; }
+    host_allow_preflight_audit() { :; }
+    set +e
+    ( cmd_host_allow_add ackpkg@3.1.4 --acknowledge-behavioral --reason "x" ) >/dev/null 2>"$ERR_FILE"
+    rc=$?
+    set -e
+    [[ "$rc" -ne 0 ]]
+    grep -q "no check receipt with GuardDog behavioral findings" "$ERR_FILE"
+    [[ "$(jq -r ".packages | length" "$HOST_ALLOW_FILE")" == "0" ]]
+  ' safe-run || fail "acknowledge-behavioral without a receipt was not refused"
+pass "host-allow add --acknowledge-behavioral refuses without a reviewed receipt"
+
+SAFE_RUN_CONFIG_DIR="$tmp/config-add-ack-noreason" \
+SAFE_RUN_DATA_DIR="$tmp/data-add-ack-noreason" \
+SAFE_AUDIT_VERDICT=BLOCK \
+SAFE_AUDIT_CALL_LOG="$tmp/audit-calls-add-ack-noreason.log" \
+SAFE_RUN_PATH="$SAFE_RUN" \
+ERR_FILE="$tmp/add-ack-noreason.err" \
+PATH="$mockbin:$PATH" \
+  bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    ensure_dirs
+    require_operator_tty() { :; }
+    set +e
+    ( cmd_host_allow_add ackpkg@3.1.4 --acknowledge-behavioral ) >/dev/null 2>"$ERR_FILE"
+    rc=$?
+    set -e
+    [[ "$rc" -ne 0 ]]
+    grep -q "requires --reason" "$ERR_FILE"
+    [[ "$(jq -r ".packages | length" "$HOST_ALLOW_FILE")" == "0" ]]
+  ' safe-run || fail "acknowledge-behavioral without a reason was not refused"
+pass "host-allow add --acknowledge-behavioral requires a reason"
+
+SAFE_RUN_CONFIG_DIR="$tmp/config-update-drops-ack" \
+SAFE_RUN_DATA_DIR="$tmp/data-update-drops-ack" \
+SAFE_AUDIT_VERDICT=GO \
+SAFE_AUDIT_CALL_LOG="$tmp/audit-calls-update-drops-ack.log" \
+SAFE_RUN_PATH="$SAFE_RUN" \
+PATH="$mockbin:$PATH" \
+  bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    ensure_dirs
+    tmpfile=$(mktemp)
+    jq ".packages.ackpkg = {version:\"3.1.4\", reason:\"fixture\", ecosystem:\"npm\", behavioral_ack:{rules:[\"threat-network-exfiltration\"], added:\"2026-08-04\"}}" \
+      "$HOST_ALLOW_FILE" > "$tmpfile"
+    mv "$tmpfile" "$HOST_ALLOW_FILE"
+    registry_integrity_npm() { printf "sha512-fixture"; }
+    require_operator_tty() { :; }
+    host_allow_preflight_audit() { :; }
+    cmd_host_allow_update ackpkg@3.2.0 --reason "bump" >/dev/null 2>&1
+    [[ "$(jq -r ".packages.ackpkg.version" "$HOST_ALLOW_FILE")" == "3.2.0" ]]
+    [[ "$(jq -r ".packages.ackpkg.behavioral_ack // \"gone\"" "$HOST_ALLOW_FILE")" == "gone" ]]
+  ' safe-run || fail "host-allow update carried a behavioral ack to an unreviewed version"
+pass "host-allow update drops the behavioral acknowledgement"
+
 invalid_name_err="$tmp/invalid-name.err"
 set +e
 SAFE_RUN_CONFIG_DIR="$tmp/config-invalid-name" SAFE_RUN_DATA_DIR="$tmp/data-invalid-name" \
