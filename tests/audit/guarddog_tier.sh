@@ -127,6 +127,13 @@ if [[ "${MOCK_SOCKET_MODE:-ok}" == "high-alert" ]]; then
   printf '{"ok":true,"data":{"self":{"score":{"overall":20},"alerts":[{"name":"didYouMean","severity":"high","category":"supplyChainRisk"}]}}}\n'
   exit 0
 fi
+if [[ "${MOCK_SOCKET_MODE:-ok}" == "unknown-severity" ]]; then
+  # ok:true envelope whose alert severity is outside Socket's enum: an
+  # alert safe cannot classify must veto, never count as not-high
+  # (PR#67 F1 delta residual — "HIGH", "urgent", Unicode lookalikes).
+  printf '{"ok":true,"data":{"self":{"score":{"overall":40},"alerts":[{"name":"didYouMean","severity":"HIGH","category":"supplyChainRisk"}]}}}\n'
+  exit 0
+fi
 if [[ "${MOCK_SOCKET_MODE:-ok}" == "bare" ]]; then
   # Schema-less exit-0 body: says nothing about the package and must never
   # count as the clean second opinion (PR#67 F1).
@@ -627,6 +634,25 @@ write_ack_entry 1.0.0 "$ack_full_rules"
 run_check 1 MOCK_GUARDDOG_MODE=block MOCK_SOCKET_MODE=bare -- demo@1.0.0 --ecosystem npm --json
 expect_status 20 "a schema-less Socket success is a vacuous second opinion, not a clean one"
 expect_grep "$OUT_FILE" 'unrecognized result' "the veto names the unrecognized Socket envelope (PR#67 F1)"
+
+prepare_case ack-unknown-severity-veto
+write_ack_entry 1.0.0 "$ack_full_rules"
+run_check 1 MOCK_GUARDDOG_MODE=block MOCK_SOCKET_MODE=unknown-severity -- demo@1.0.0 --ecosystem npm --json
+expect_status 20 "an out-of-enum Socket severity is unclassifiable, not clean"
+expect_grep "$OUT_FILE" 'unrecognized result' "the veto treats unknown severities as an unrecognized envelope"
+expect_json '.checks.socket | startswith("WARN (socket returned an unrecognized result")' \
+  "the Socket line matches the veto instead of claiming PASS"
+
+prepare_case ack-vetoed-entry-suppresses-hint
+write_ack_entry 1.0.0 "$ack_full_rules"
+run_check 1 MOCK_GUARDDOG_MODE=block MOCK_SOCKET_MODE=high-alert -- demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 20 "a Socket-vetoed acknowledgement still refuses at the gate"
+if grep -q 'acknowledge-behavioral' "$ERR_FILE"; then
+  printf 'stderr:\n%s\n' "$(cat "$ERR_FILE")" >&2
+  fail "no add-suggestion while a vetoed entry already exists (PR#67 F5 delta)"
+else
+  pass "no add-suggestion while a vetoed entry already exists (PR#67 F5 delta)"
+fi
 
 prepare_case ack-partial-scan-veto
 write_ack_entry 1.0.0 "$ack_full_rules"

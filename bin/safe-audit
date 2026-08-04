@@ -8029,15 +8029,24 @@ check_command() {
         (.raw.ok == true)
         and ((.raw.data.self.alerts // null) | type == "array")
         and ([.raw.data.self.alerts[]
-              | select((type == "object") and ((.severity? | type) == "string"))]
+              | select((type == "object")
+                and (.severity == "critical" or .severity == "high"
+                     or .severity == "middle" or .severity == "low"))]
              | length) == (.raw.data.self.alerts | length)
       ' "$socket_json" >/dev/null 2>&1; then
       # The second opinion must be a RECOGNIZED success envelope: a bare
       # exit-0 with {}, a score-only body, or an ok:false error envelope
       # says nothing about the package, and a vacuous second opinion must
-      # veto, not engage (PR#67 F1).
+      # veto, not engage (PR#67 F1). Every severity must be exactly one of
+      # Socket's enum values — "HIGH", "urgent", an empty string, or a
+      # Unicode lookalike is an UNKNOWN alert class, and an alert we cannot
+      # classify must veto, never count as not-high (F1 delta residual).
       behavioral_ack_veto="the Socket second opinion returned an unrecognized result — cannot vouch for this version"
-    elif [[ "$(jq -r '[.raw.data.self.alerts[] | select((.severity // "") == "high" or (.severity // "") == "critical")] | length' "$socket_json" 2>/dev/null)" != "0" ]]; then
+      socket_line='WARN (socket returned an unrecognized result — second opinion unusable)'
+      warn_causes+=("socket_error")
+      socket_detail="unrecognized socket result shape"
+      bump_verdict verdict "WARN"
+    elif [[ "$(jq -r '[.raw.data.self.alerts[] | select(.severity == "high" or .severity == "critical")] | length' "$socket_json" 2>/dev/null)" != "0" ]]; then
       behavioral_ack_veto="Socket reports high-severity alerts for this version"
     else
       behavioral_ack_engaged=1
@@ -8183,6 +8192,16 @@ check_command() {
     warn_causes+=("guarddog_high_risk")
     bump_verdict verdict "BLOCK"
   fi
+
+  # Whether a FRESH acknowledgement could engage right now (hint gating,
+  # PR#67 F5): closed while an entry already exists for this version — its
+  # veto is already named on the verdict line, and suggesting another add
+  # is a dead end — or while OSV cannot verify the version. The Socket
+  # second-opinion vetoes are covered by the entry-exists condition: Socket
+  # is only force-consulted for candidates.
+  local behavioral_ack_lane_open=1
+  (( behavioral_ack_candidate )) && behavioral_ack_lane_open=0
+  [[ "$osv_status" == "ok" ]] || behavioral_ack_lane_open=0
 
   local block_severities affecting_blocked=""
   block_severities=$(install_policy_json | jq -c '.block_severities // ["critical"]')
@@ -8514,6 +8533,7 @@ check_command() {
       gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" "$aff_count" \
         "$socket_detail" "$guarddog_rules" "$guarddog_detail" "$guarddog_finding_versions" \
         "$release_security_fix_ids" "$([[ "$block_line" == PASS* ]] && printf 1 || printf 0)" \
+        "$behavioral_ack_lane_open" \
         ${warn_causes[@]+"${warn_causes[@]}"}
       if [[ "$verdict" == "BLOCK" ]]; then
         printf 'safe audit: operator review required: safe audit check %s --ecosystem %s --json\n' \
@@ -8621,6 +8641,7 @@ check_command() {
           gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" "$aff_count" \
             "$socket_detail" "$guarddog_rules" "$guarddog_detail" "$guarddog_finding_versions" \
             "$release_security_fix_ids" "$([[ "$block_line" == PASS* ]] && printf 1 || printf 0)" \
+            "$behavioral_ack_lane_open" \
             "${warn_causes[@]}"
           gate_exit=10
         fi
@@ -8641,6 +8662,7 @@ check_command() {
           gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" "$aff_count" \
             "" "$guarddog_rules" "$guarddog_detail" "$guarddog_finding_versions" \
             "" "$([[ "$block_line" == PASS* ]] && printf 1 || printf 0)" \
+            "$behavioral_ack_lane_open" \
             "${guarddog_block_causes[@]}"
         fi
         printf 'safe audit: operator review required: safe audit check %s --ecosystem %s --json\n' \
@@ -8686,7 +8708,12 @@ gate_emit_refusal_hints() {
   local guarddog_finding_versions="$9"
   local cooldown_remediates="${10}"
   local blocklist_pass="${11}"
-  shift 11
+  # "1" when the FP lane could engage for a fresh acknowledgement right
+  # now: no entry already present (an existing vetoed ack makes an add
+  # suggestion a dead end) and OSV verifiable (an outage vetoes any ack
+  # until it recovers) — PR#67 F5 delta residual.
+  local ack_lane_open="${12}"
+  shift 12
   local -a causes=("$@")
   local cause has_socket_infra=0 has_unresolved=0 has_affecting=0 has_osv_down=0 has_low_score=0 has_custom_source=0 has_malware=0
   local has_guarddog_findings=0 has_guarddog_high_risk=0 has_guarddog_error=0 has_too_new=0
@@ -8764,7 +8791,8 @@ gate_emit_refusal_hints() {
     # advisory, MAL-* record, blocklist hit — PR#67 F5: a dead-end hint
     # next to "do not pin around it" is worse than none).
     if [[ "$resolution_ok" == "1" && "$guarddog_finding_versions" != *,* ]] \
-      && (( aff_count == 0 )) && (( ! has_malware )) && [[ "$blocklist_pass" == "1" ]]; then
+      && (( aff_count == 0 )) && (( ! has_malware )) && [[ "$blocklist_pass" == "1" ]] \
+      && [[ "$ack_lane_open" == "1" ]]; then
       local guarddog_ack_cmd=""
       guarddog_ack_cmd=$(gate_host_allow_add_cmd "$name" "${guarddog_finding_versions:-$primary_version}" "$ecosystem" "--acknowledge-behavioral") || guarddog_ack_cmd=""
       [[ -n "$guarddog_ack_cmd" ]] \
