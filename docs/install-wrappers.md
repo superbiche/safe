@@ -322,7 +322,16 @@ exit 100, never a silent passthrough.
 
 ## Timeouts
 
-Package checks are wrapped with `timeout` when it is available. Override the default 30 second timeout:
+Package checks are wrapped with `timeout` when it is available. The leash is
+computed so it always exceeds the sum of the audit's own component budgets —
+Socket score (15s under the gate, `SAFE_AUDIT_SOCKET_TIMEOUT`), the GuardDog
+wall-clock budget (`install.guarddog.timeout_seconds`, default 120s), plus a
+60s allowance for the individually bounded OSV/registry fetches. With defaults
+that is 195s. A hanging component therefore degrades to its own legible infra
+WARN inside a completed audit; the leash only fires as a backstop against
+genuinely unbounded regressions.
+
+`SAFE_INSTALL_TIMEOUT_SECONDS` overrides the computed leash absolutely:
 
 ```bash
 SAFE_INSTALL_TIMEOUT_SECONDS=60 npm install express

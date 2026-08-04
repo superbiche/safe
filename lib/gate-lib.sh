@@ -16,7 +16,15 @@
 # Sourced by bin/safe. It defines functions only — sourcing must never exit or
 # mutate the caller's shell state. Entry point: safe_gate_main <tool> <args...>.
 
-SAFE_GATE_TIMEOUT_SECONDS="${SAFE_INSTALL_TIMEOUT_SECONDS:-30}"
+# Socket budget handed to the audit child (SAFE_AUDIT_SOCKET_TIMEOUT). The
+# audit's own default is 30s — tuned for direct operator runs; under the gate
+# a hanging Socket backend should cost less wall-clock, and the leash
+# arithmetic below has to be able to rely on the value it passed down.
+SAFE_GATE_SOCKET_BUDGET_DEFAULT=15
+# Fixed allowance for everything in a check that is NOT Socket or GuardDog:
+# OSV querybatch (10s), per-advisory detail fetches (8s each), packument
+# resolution (5s) — all individually curl --max-time bounded.
+SAFE_GATE_AUDIT_OVERHEAD_SECONDS=60
 SAFE_GATE_WARNED_MISSING=0
 SAFE_GATE_SUBCMD=""
 SAFE_GATE_SUBCMD_IDX=0
@@ -232,6 +240,38 @@ safe_gate_audit_available() {
   [[ -n "${SAFE_GATE_AUDIT_BIN}" ]]
 }
 
+safe_gate_socket_budget() {
+  local budget="${SAFE_AUDIT_SOCKET_TIMEOUT:-}"
+  [[ "${budget}" =~ ^[1-9][0-9]*$ ]] || budget="${SAFE_GATE_SOCKET_BUDGET_DEFAULT}"
+  printf '%s\n' "${budget}"
+}
+
+# The leash on the audit child must EXCEED the sum of the audit's own
+# component budgets: every network probe inside `safe-audit check` is
+# individually bounded (Socket score, GuardDog wall-clock, curl --max-time),
+# so a leash smaller than their sum guarantees the kill lands here first and
+# converts a legible per-component infra WARN into an illegible
+# TIMEOUT_FAILCLOSED — which host-allow cannot rescue, and which the
+# audit-infrastructure ruling forbids reading as a package signal. Live
+# failure shape (Socket outage 2026-08-04): Socket's internal 30s hang alone
+# consumed the whole 30s leash, so every uncached install died as a generic
+# timeout instead of completing with "socket unavailable — infra WARN".
+# The leash is therefore a BACKSTOP against unbounded regressions, not the
+# operative timeout; the component budgets are. SAFE_INSTALL_TIMEOUT_SECONDS
+# still overrides the computation absolutely (an invalid value is ignored,
+# not passed to timeout(1) where it would fail the audit as exit 125).
+safe_gate_audit_leash_seconds() {
+  if [[ "${SAFE_INSTALL_TIMEOUT_SECONDS:-}" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s\n' "${SAFE_INSTALL_TIMEOUT_SECONDS}"
+    return 0
+  fi
+  local guarddog_budget
+  guarddog_budget="$(jq -r '.install.guarddog.timeout_seconds // 120' \
+    "$(safe_gate_run_config_dir)/config.json" 2>/dev/null || true)"
+  [[ "${guarddog_budget}" =~ ^[1-9][0-9]*$ ]] || guarddog_budget=120
+  printf '%s\n' "$(( $(safe_gate_socket_budget) + guarddog_budget + SAFE_GATE_AUDIT_OVERHEAD_SECONDS ))"
+}
+
 safe_gate_run_audit() {
   local rc=0
   local -a extra=()
@@ -241,11 +281,16 @@ safe_gate_run_audit() {
   [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]] && extra+=(--project-dir "${SAFE_GATE_PROJECT_DIR}")
   [[ -n "${SAFE_GATE_NPM_USERCONFIG:-}" ]] && extra+=(--npm-userconfig "${SAFE_GATE_NPM_USERCONFIG}")
   [[ -n "${SAFE_GATE_NPM_GLOBALCONFIG:-}" ]] && extra+=(--npm-globalconfig "${SAFE_GATE_NPM_GLOBALCONFIG}")
+  local socket_budget
+  socket_budget="$(safe_gate_socket_budget)"
   if command -v timeout >/dev/null 2>&1; then
-    timeout "${SAFE_GATE_TIMEOUT_SECONDS}" "${SAFE_GATE_AUDIT_BIN}" check "$@" "${extra[@]}"
+    SAFE_AUDIT_SOCKET_TIMEOUT="${socket_budget}" \
+      timeout "$(safe_gate_audit_leash_seconds)" \
+      "${SAFE_GATE_AUDIT_BIN}" check "$@" "${extra[@]}"
     rc=$?
   else
-    "${SAFE_GATE_AUDIT_BIN}" check "$@" "${extra[@]}"
+    SAFE_AUDIT_SOCKET_TIMEOUT="${socket_budget}" \
+      "${SAFE_GATE_AUDIT_BIN}" check "$@" "${extra[@]}"
     rc=$?
   fi
   return "$rc"

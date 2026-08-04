@@ -71,7 +71,7 @@ fi
   # surface what this invocation actually saw so tests can assert it.
   for env_name in NPM_CONFIG_REGISTRY PIP_INDEX_URL PIP_CONFIG_FILE GOPROXY \
                   CARGO_REGISTRY_DEFAULT CARGO_REGISTRIES_PRIVATE_INDEX \
-                  BUN_CONFIG_REGISTRY COMPOSER_HOME; do
+                  BUN_CONFIG_REGISTRY COMPOSER_HOME SAFE_AUDIT_SOCKET_TIMEOUT; do
     if [[ -n "${!env_name:-}" ]]; then
       printf 'AUDITENV\t%s=%s\n' "${env_name}" "${!env_name}"
       # Byte-exact form: the plain line cannot show a trailing newline or
@@ -335,6 +335,8 @@ run_zsh() {
     SAFE_AUDIT_SCAN_ECOSYSTEM_AUDITS="${SAFE_AUDIT_SCAN_ECOSYSTEM_AUDITS:-}" \
     SAFE_AUDIT_SCAN_NO_RESULT="${SAFE_AUDIT_SCAN_NO_RESULT:-}" \
     SAFE_AUDIT_CHECK_STATUS="${SAFE_AUDIT_CHECK_STATUS:-}" \
+    SAFE_AUDIT_SOCKET_TIMEOUT="${SAFE_AUDIT_SOCKET_TIMEOUT:-}" \
+    SAFE_INSTALL_TIMEOUT_SECONDS="${SAFE_INSTALL_TIMEOUT_SECONDS:-}" \
     SAFE_INSTALL_REAL_STATUS="${SAFE_INSTALL_REAL_STATUS:-}" \
     MISE_LS_JSON="${MISE_LS_JSON:-}" \
     "${ZSH_BIN}" -fc 'eval "${SAFE_INSTALL_TEST_SCRIPT}"'
@@ -1641,6 +1643,75 @@ STUB
     fail "$FUNCNAME"
     return
   fi
+  pass "$FUNCNAME"
+}
+
+case_gate_audit_leash_fits_component_budgets() {
+  # The leash must exceed the sum of the audit's internal budgets (Socket +
+  # GuardDog + bounded-curl overhead), or a single hanging component turns a
+  # legible infra WARN into TIMEOUT_FAILCLOSED (Socket outage 2026-08-04:
+  # socket 30s hang vs 30s leash killed every uncached install).
+  prepare_case "gate-audit-leash-arithmetic"
+  local cfg="${WORK_DIR}/runcfg"
+  mkdir -p "${cfg}"
+
+  leash() {
+    SAFE_RUN_CONFIG_DIR="${cfg}" GATE_LIB="${ROOT_DIR}/lib/gate-lib.sh" \
+      "$@" bash -c 'source "${GATE_LIB}"; safe_gate_audit_leash_seconds'
+  }
+
+  local got
+  # No config: default socket (15) + default guarddog (120) + overhead (60).
+  got="$(leash env)"
+  [[ "${got}" == "195" ]] || { printf 'default leash %s, expected 195\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+
+  # An operator-raised GuardDog budget grows the leash with it: a constant
+  # leash goes silently stale the day the budget moves.
+  printf '{"install":{"guarddog":{"timeout_seconds":300}}}\n' > "${cfg}/config.json"
+  got="$(leash env)"
+  [[ "${got}" == "375" ]] || { printf 'guarddog-300 leash %s, expected 375\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+
+  # The explicit operator override wins absolutely.
+  got="$(leash env SAFE_INSTALL_TIMEOUT_SECONDS=42)"
+  [[ "${got}" == "42" ]] || { printf 'override leash %s, expected 42\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+
+  # An invalid override is ignored, never handed to timeout(1) where it
+  # would fail every audit as exit 125.
+  got="$(leash env SAFE_INSTALL_TIMEOUT_SECONDS=soon)"
+  [[ "${got}" == "375" ]] || { printf 'invalid-override leash %s, expected 375\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+
+  # A corrupt guarddog budget in config falls back to the default 120.
+  printf '{"install":{"guarddog":{"timeout_seconds":"soon"}}}\n' > "${cfg}/config.json"
+  got="$(leash env)"
+  [[ "${got}" == "195" ]] || { printf 'corrupt-config leash %s, expected 195\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+
+  # A caller-set socket budget participates in the arithmetic.
+  rm -f "${cfg}/config.json"
+  got="$(leash env SAFE_AUDIT_SOCKET_TIMEOUT=9)"
+  [[ "${got}" == "189" ]] || { printf 'socket-9 leash %s, expected 189\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
+case_gate_audit_receives_socket_budget() {
+  # The gate hands the audit child its Socket sub-budget so the component
+  # bound the leash arithmetic assumed is the one that actually applies.
+  prepare_case "gate-audit-socket-budget"
+  SAFE_INSTALL_TEST_SCRIPT='npm install left-pad@1.2.3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDITENV\tSAFE_AUDIT_SOCKET_TIMEOUT=15' "$FUNCNAME" || return
+
+  # A caller-set budget survives — the gate default never clobbers it.
+  prepare_case "gate-audit-socket-budget-caller"
+  SAFE_AUDIT_SOCKET_TIMEOUT=25 SAFE_INSTALL_TEST_SCRIPT='npm install left-pad@1.2.3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDITENV\tSAFE_AUDIT_SOCKET_TIMEOUT=25' "$FUNCNAME" || return
+
+  # A malformed caller value degrades to the gate default, not to garbage
+  # reaching the audit's arithmetic.
+  prepare_case "gate-audit-socket-budget-invalid"
+  SAFE_AUDIT_SOCKET_TIMEOUT=soon SAFE_INSTALL_TEST_SCRIPT='npm install left-pad@1.2.3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDITENV\tSAFE_AUDIT_SOCKET_TIMEOUT=15' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -3604,6 +3675,8 @@ main() {
     case_gate_resolves_a_displaced_original \
     case_gate_resolves_a_wrapped_mise_shim \
     case_gate_exec_delegates_through_a_wrapped_mise_shim \
+    case_gate_audit_leash_fits_component_budgets \
+    case_gate_audit_receives_socket_budget \
     case_selective_install_refreshes_gate_lib \
     case_loose_marker_is_not_ownership \
     case_status_probes_every_wrapper \
