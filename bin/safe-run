@@ -1307,20 +1307,29 @@ latest_behavioral_receipt_json() {
     npm|bun) canon="npm" ;;
     *) canon="$ecosystem" ;;
   esac
-  # Receipt filenames are slugified (no whitespace), so ls -t word-splitting
-  # is safe here.
-  for f in $(ls -t "$checks_dir"/*.json 2>/dev/null); do
+  # Newest-first without command-substitution word splitting: the configured
+  # data dir may contain whitespace even though receipt basenames are
+  # slugified (PR#67 F6). Receipt paths cannot contain newlines.
+  while IFS= read -r f; do
+    f="${f#* }"
+    # The acknowledged rules are the PER-VERSION set for exactly the pinned
+    # version — the receipt-level .rules is a union across every scanned
+    # version, and a sibling version's rules must never be recorded as
+    # reviewed for this one (PR#67 F3). Aggregate-only receipts are
+    # rejected, not approximated.
     jq -e --arg n "$name" --arg v "$version" --arg e "$canon" '
       ((.ecosystem // "") |
         if . == "py" or . == "python" or . == "uv" or . == "pipx" or . == "pypi" then "python"
         elif . == "npm" or . == "bun" then "npm" else . end) == $e
-      and ((.resolved_versions // []) | index($v) != null)
       and ((.spec // "") | (. == $n or startswith($n + "@")))
-      and ((.guarddog.rules // []) | length > 0)
+      and (((.guarddog.versions // []) | map(select((.version == $v)
+            and (((.rules // []) | length) > 0)))) | length) == 1
     ' "$f" >/dev/null 2>&1 || continue
-    jq -c --arg receipt "$f" '{receipt: $receipt, rules: (.guarddog.rules // [])}' "$f"
+    jq -c --arg receipt "$f" --arg v "$version" \
+      '{receipt: $receipt,
+        rules: ((.guarddog.versions[] | select(.version == $v) | .rules) // [])}' "$f"
     return 0
-  done
+  done < <(find "$checks_dir" -maxdepth 1 -name '*.json' -printf '%T@ %p\n' 2>/dev/null | sort -rn)
   return 1
 }
 

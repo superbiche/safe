@@ -127,7 +127,13 @@ if [[ "${MOCK_SOCKET_MODE:-ok}" == "high-alert" ]]; then
   printf '{"ok":true,"data":{"self":{"score":{"overall":20},"alerts":[{"name":"didYouMean","severity":"high","category":"supplyChainRisk"}]}}}\n'
   exit 0
 fi
-printf '{"score":95}\n'
+if [[ "${MOCK_SOCKET_MODE:-ok}" == "bare" ]]; then
+  # Schema-less exit-0 body: says nothing about the package and must never
+  # count as the clean second opinion (PR#67 F1).
+  printf '{"score":95}\n'
+  exit 0
+fi
+printf '{"ok":true,"data":{"self":{"score":{"overall":80},"alerts":[]}}}\n'
 MOCK
 chmod +x "$COMMONBIN/socket"
 
@@ -613,6 +619,31 @@ write_ack_entry 1.0.0 "$ack_full_rules"
 run_check 1 MOCK_GUARDDOG_MODE=block MOCK_OSV_AFFECTING=1 -- demo@1.0.0 --ecosystem npm --json
 expect_status 20 "an affecting OSV advisory voids the acknowledgement"
 expect_grep "$OUT_FILE" 'behavioral acknowledgement void' "the void names the OSV condition"
+expect_json '((.warn_causes | index("guarddog_high_risk_acknowledged")) == null) and ((.warn_causes | index("guarddog_high_risk")) != null)' \
+  "the voided receipt carries no acknowledged cause (PR#67 F4)"
+
+prepare_case ack-socket-bare-veto
+write_ack_entry 1.0.0 "$ack_full_rules"
+run_check 1 MOCK_GUARDDOG_MODE=block MOCK_SOCKET_MODE=bare -- demo@1.0.0 --ecosystem npm --json
+expect_status 20 "a schema-less Socket success is a vacuous second opinion, not a clean one"
+expect_grep "$OUT_FILE" 'unrecognized result' "the veto names the unrecognized Socket envelope (PR#67 F1)"
+
+prepare_case ack-partial-scan-veto
+write_ack_entry 1.0.0 "$ack_full_rules"
+run_check 1 MOCK_GUARDDOG_MODE=partial-block -- demo@1.0.0 --ecosystem npm --json
+expect_status 20 "an incomplete GuardDog scan is never ack-eligible (PR#67 F2)"
+expect_json '((.warn_causes | index("guarddog_high_risk_acknowledged")) == null) and ((.warn_causes | index("guarddog_high_risk")) != null)' \
+  "the partial scan keeps the plain BLOCK cause"
+
+prepare_case ack-hint-suppressed-beside-independent-block
+run_check 1 MOCK_GUARDDOG_MODE=block MOCK_OSV_AFFECTING=1 -- demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 20 "combined guarddog + affecting-advisory BLOCK still refuses"
+if grep -q 'acknowledge-behavioral' "$ERR_FILE"; then
+  printf 'stderr:\n%s\n' "$(cat "$ERR_FILE")" >&2
+  fail "no FP-lane hint beside a BLOCK the acknowledgement cannot clear (PR#67 F5)"
+else
+  pass "no FP-lane hint beside a BLOCK the acknowledgement cannot clear (PR#67 F5)"
+fi
 
 prepare_case ack-version-mismatch
 write_ack_entry 2.0.0 "$ack_full_rules"
