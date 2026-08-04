@@ -34,6 +34,7 @@ GUARDDOG_CACHE_PROFILE="safe-default-v1"
 GUARDDOG_CACHE_PROFILE_NOSANDBOX="safe-nosandbox-v1"
 GUARDDOG_SANDBOX_MODE="auto"
 GUARDDOG_SANDBOX_FELL_BACK=0
+GUARDDOG_CAPTURE=()
 # Bound each GuardDog output stream — live head -c caps at both invocation
 # sites, never RLIMIT_FSIZE (which bound guarddog's INTERNAL writes too and
 # killed every tarball download over the limit, PR#66). The raw JSON is
@@ -5057,15 +5058,60 @@ guarddog_artifact_identity_json() {
   esac
 }
 
+# Run a producer with LIVE per-stream byte caps (GUARDDOG_OUTPUT_LIMIT_KIB
+# each): stdout → $1, stderr → $2, both through their own `head -c`
+# (swap-pipe, no process substitution — a procsub reader is not awaited and
+# races its consumers). Three-status contract in GUARDDOG_CAPTURE:
+#   [0] producer status (timeout's 124/137 included)
+#   [1] stdout-capture head status
+#   [2] stderr-capture head status
+# An empty element means that stage never reported (fd-setup failure,
+# unwritable status file): callers fail closed on [0] and treat a non-"0"
+# [1]/[2] as a capture failure diagnosed via an IN-MEMORY note — never one
+# appended to the possibly-full filesystem it diagnoses (PR#66 F2/N1).
+# Always returns 0; the statuses are the result. The outer group discards
+# only the shell's job-death diagnostic on KILL escalation (PR#65 N3).
+guarddog_bounded_capture() {
+  local stdout_file="$1" stderr_file="$2" status_file="$3"
+  shift 3
+  local limit_bytes=$(( GUARDDOG_OUTPUT_LIMIT_KIB * 1024 ))
+  local -a outer=()
+  GUARDDOG_CAPTURE=()
+  rm -f -- "$status_file" 2>/dev/null || true
+  {
+    {
+      "$@" </dev/null 2>&1 1>&3 \
+        | head -c "$limit_bytes" > "$stderr_file"
+      # Pipeline-element subshell: PIPESTATUS is captured before anything
+      # can reset it; the stderr-head status escapes via the status file (a
+      # failed write leaves [2] unreported — diagnosed, not lost) and the
+      # producer status becomes the segment's own exit, so the outer
+      # pipeline's PIPESTATUS[0] is the producer's, never pipefail's
+      # rightmost-nonzero.
+      local -a inner=("${PIPESTATUS[@]}")
+      printf '%s\n' "${inner[1]:-}" > "$status_file" 2>/dev/null || true
+      exit "${inner[0]:-125}"
+    } 3>&1 \
+      | head -c "$limit_bytes" > "$stdout_file"
+    outer=("${PIPESTATUS[@]}")
+  } 2>/dev/null || true
+  local stderr_head=""
+  stderr_head="$(cat -- "$status_file" 2>/dev/null || true)"
+  [[ "$stderr_head" =~ ^[0-9]+$ ]] || stderr_head=""
+  GUARDDOG_CAPTURE=("${outer[0]:-}" "${outer[1]:-}" "$stderr_head")
+  return 0
+}
+
 # A sandbox-origin failure: GuardDog either refuses up front because the
 # kernel sandbox is unavailable, or its sandboxed child dies before running.
 guarddog_scan_sandbox_failed() {
   local raw="$1" stderr_file="$2" rc="$3"
   local haystack=""
-  # Bounded read, never a whole-file slurp: callers truncate stderr to the
-  # per-stream limit, but this helper must not depend on that ordering — an
-  # unbounded stderr copied into one shell variable is memory exhaustion in
-  # the middle of failure handling (PR#66 F1).
+  # Bounded read, never a whole-file slurp: callers capture stderr through
+  # a live per-stream cap (guarddog_bounded_capture), but this helper must
+  # not depend on that invariant holding elsewhere — an unbounded stderr
+  # copied into one shell variable is memory exhaustion in the middle of
+  # failure handling (PR#66 F1; defense in depth).
   haystack=$(head -c "$(( GUARDDOG_OUTPUT_LIMIT_KIB * 1024 ))" -- "$stderr_file" 2>/dev/null || true)
   if [[ -s "$raw" ]]; then
     haystack+=$(jq -r 'if (type == "object") and ((.errors? // null) | type == "object")
@@ -5255,52 +5301,26 @@ guarddog_scan_one_json() {
       printf 'guarddog scan budget exhausted before this attempt\n' > "$stderr_file"
       return 0
     fi
-    # Output bounding via LIVE pipe caps on BOTH streams, NOT RLIMIT_FSIZE:
-    # `ulimit -f` bound EVERY file the process tree writes — including the
-    # tarball GuardDog downloads before scanning — so any package artifact
-    # over the limit died mid-download as `download-package: [Errno 27]
-    # File too large` and behavioral coverage was silently zero for large
-    # packages (qwen-code 0.21.5 = 24.6 MB vs 16 MiB; GuardDog v3.1.0
-    # imposes no size limit of its own — source audit 2026-08-04).
-    #
-    # Structure (swap-pipe, no process substitution — a procsub reader is
-    # not awaited and races its consumers):
-    #   inner segment: producer 2>&1 1>&3 | head -c LIM > stderr_file
-    #     — stderr through its own live cap; stdout escapes via fd 3.
-    #     The segment is a pipeline element, hence a subshell, so
-    #     `exit ${PIPESTATUS[0]}` forwards the PRODUCER's status as the
-    #     segment's own (a stderr flood cannot fill the scratch filesystem:
-    #     head stops at the limit and the writer sees EPIPE/backpressure).
-    #   outer: { inner } 3>&1 | head -c LIM > raw
-    #     — stdout through its live cap; over-limit JSON truncates (shape
-    #     check fails, size probe names the per-stream limit) and the
-    #     writer dies on SIGPIPE — the old EFBIG-on-stdout semantics.
-    # rc = PIPESTATUS[0] of the outer pipeline = the producer's status,
-    # never pipefail's rightmost-nonzero (PR#66 F2). The capture-failure
-    # diagnosis is IN MEMORY (guarddog_capture_note), never appended to the
-    # possibly-full filesystem it diagnoses, and fires on any raw-capture
-    # failure regardless of whether the producer also died of the broken
-    # pipe (PR#66 F2 delta). The group discards only the shell's job-death
-    # diagnostic on KILL escalation (PR#65 N3 class); if the group's own fd
-    # setup fails its body never runs and the empty status array falls back
-    # to 125 — never a pass (PR#65 N4 class).
-    local -a scan_pipe=()
-    local output_limit_bytes=$(( GUARDDOG_OUTPUT_LIMIT_KIB * 1024 ))
-    {
-      {
-        timeout --kill-after=2s "$remaining" \
-          env "${GUARDDOG_ENV_UNSET[@]}" "$guarddog_cmd" "$cli_ecosystem" scan "$name" \
-          --version "$version" --output-format=json ${sandbox_flag[@]+"${sandbox_flag[@]}"} \
-          </dev/null 2>&1 1>&3 \
-          | head -c "$output_limit_bytes" > "$stderr_file"
-        exit "${PIPESTATUS[0]}"
-      } 3>&1 \
-        | head -c "$output_limit_bytes" > "$raw"
-      scan_pipe=("${PIPESTATUS[@]}")
-    } 2>/dev/null || true
-    rc="${scan_pipe[0]:-125}"
-    if [[ "${scan_pipe[1]:-0}" != "0" ]]; then
-      guarddog_capture_note="guarddog output capture failed (head exit ${scan_pipe[1]}) — check free space under ${scratch}"
+    # Live pipe caps on BOTH streams via guarddog_bounded_capture, NOT
+    # RLIMIT_FSIZE: `ulimit -f` bound EVERY file the process tree writes —
+    # including the tarball GuardDog downloads before scanning — so any
+    # package artifact over the limit died mid-download as
+    # `download-package: [Errno 27] File too large` and behavioral coverage
+    # was silently zero for large packages (qwen-code 0.21.5 = 24.6 MB vs
+    # 16 MiB; GuardDog v3.1.0 imposes no size limit of its own — source
+    # audit 2026-08-04). Over-limit JSON truncates ($raw shape check fails,
+    # size probe names the per-stream limit) and the writer dies on SIGPIPE
+    # — the old EFBIG-on-stdout semantics; a stderr flood stops at the
+    # limit instead of running its budget against the scratch filesystem.
+    guarddog_bounded_capture "$raw" "$stderr_file" \
+      "$scratch/guarddog-${slot}-capture.status" \
+      timeout --kill-after=2s "$remaining" \
+      env "${GUARDDOG_ENV_UNSET[@]}" "$guarddog_cmd" "$cli_ecosystem" scan "$name" \
+      --version "$version" --output-format=json ${sandbox_flag[@]+"${sandbox_flag[@]}"}
+    rc="${GUARDDOG_CAPTURE[0]:-125}"
+    [[ "$rc" =~ ^[0-9]+$ ]] || rc=125
+    if [[ "${GUARDDOG_CAPTURE[1]:-}" != "0" || "${GUARDDOG_CAPTURE[2]:-}" != "0" ]]; then
+      guarddog_capture_note="guarddog output capture failed (stdout head ${GUARDDOG_CAPTURE[1]:-unreported}, stderr head ${GUARDDOG_CAPTURE[2]:-unreported}) — check free space under ${scratch}"
       (( rc == 0 )) && rc=1
     fi
   }
@@ -5464,28 +5484,20 @@ guarddog_tier_json() {
   fi
 
   local version_out="$scratch/guarddog-version.stdout" version_err="$scratch/guarddog-version.stderr" version_rc=0
-  # Same swap-pipe shape as guarddog_run_scan (live caps on BOTH streams,
-  # no RLIMIT_FSIZE, producer status via the segment exit, in-memory
-  # capture-failure diagnosis — see the comment there); the probe has no
-  # downloads, but one bounding idiom keeps the failure-note size probes
-  # below truthful for both sites.
-  local -a version_pipe=()
+  # Same bounded capture as guarddog_run_scan (live caps on BOTH streams,
+  # no RLIMIT_FSIZE, three-status contract, in-memory capture-failure
+  # diagnosis — see guarddog_bounded_capture); the probe has no downloads,
+  # but one bounding idiom keeps the failure-note size probes below
+  # truthful for both sites.
   local version_capture_note=""
-  local probe_limit_bytes=$(( GUARDDOG_OUTPUT_LIMIT_KIB * 1024 ))
-  {
-    {
-      timeout --kill-after=2s "$budget" \
-        env "${GUARDDOG_ENV_UNSET[@]}" "$guarddog_cmd" --version \
-        </dev/null 2>&1 1>&3 \
-        | head -c "$probe_limit_bytes" > "$version_err"
-      exit "${PIPESTATUS[0]}"
-    } 3>&1 \
-      | head -c "$probe_limit_bytes" > "$version_out"
-    version_pipe=("${PIPESTATUS[@]}")
-  } 2>/dev/null || true
-  version_rc="${version_pipe[0]:-125}"
-  if [[ "${version_pipe[1]:-0}" != "0" ]]; then
-    version_capture_note="guarddog version output capture failed (head exit ${version_pipe[1]}) — check free space under ${scratch}"
+  guarddog_bounded_capture "$version_out" "$version_err" \
+    "$scratch/guarddog-version-capture.status" \
+    timeout --kill-after=2s "$budget" \
+    env "${GUARDDOG_ENV_UNSET[@]}" "$guarddog_cmd" --version
+  version_rc="${GUARDDOG_CAPTURE[0]:-125}"
+  [[ "$version_rc" =~ ^[0-9]+$ ]] || version_rc=125
+  if [[ "${GUARDDOG_CAPTURE[1]:-}" != "0" || "${GUARDDOG_CAPTURE[2]:-}" != "0" ]]; then
+    version_capture_note="guarddog version output capture failed (stdout head ${GUARDDOG_CAPTURE[1]:-unreported}, stderr head ${GUARDDOG_CAPTURE[2]:-unreported}) — check free space under ${scratch}"
     (( version_rc == 0 )) && version_rc=1
   fi
   if (( version_rc != 0 )); then

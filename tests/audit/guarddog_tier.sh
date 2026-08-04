@@ -536,7 +536,10 @@ SECONDS=0
 run_check 1 MOCK_GUARDDOG_MODE=flood -- demo@1.0.0 --ecosystem npm --json
 flood_elapsed=$SECONDS
 expect_status 10 "unbounded GuardDog stdout is refused"
-expect_json '.guarddog.infra_error == true and (.guarddog.note | contains("output exceeded the 16384 KiB per-stream limit")) and .guarddog.cache.misses == 0' \
+# Size-or-timeout: under parallel suite load the 1s budget can expire
+# before the flood crosses 16 MiB — which note wins is a race. The exact
+# live-cap byte count is pinned by the bounded-capture oracle below.
+expect_json '.guarddog.infra_error == true and ((.guarddog.note | contains("output exceeded the 16384 KiB per-stream limit")) or (.guarddog.note | contains("timed out"))) and .guarddog.cache.misses == 0' \
   "GuardDog output bound becomes uncached infrastructure evidence"
 (( flood_elapsed < 10 )) && pass "flood refusal stays wall-clock bounded" || fail "flood refusal stays wall-clock bounded"
 
@@ -549,6 +552,50 @@ expect_status 10 "unbounded GuardDog stderr is refused"
 expect_json '.guarddog.infra_error == true and ((.guarddog.note | contains("per-stream limit")) or (.guarddog.note | contains("timed out")))' \
   "stderr flood lands on a legible size or timeout note"
 (( stderr_flood_elapsed < 10 )) && pass "stderr flood refusal stays wall-clock bounded" || fail "stderr flood refusal stays wall-clock bounded"
+
+# Direct oracle for guarddog_bounded_capture (PR#66 N1): the downstream
+# receipt cannot distinguish a live cap from an unbounded write a later
+# consumer shrank, and an inner (stderr-head) capture failure must be
+# visible in the three-status contract, not silently discarded.
+prepare_case bounded-capture-oracle
+cap_out="$CASE_DIR/cap.out"
+cap_err="$CASE_DIR/cap.err"
+cap_st="$CASE_DIR/cap.status"
+probe_capture() {
+  SA="$SAFE_AUDIT" OUT="$cap_out" ERR="${2:-$cap_err}" ST="$cap_st" MODE="$1" bash -c '
+    set -euo pipefail
+    source "$SA" help >/dev/null 2>&1
+    case "$MODE" in
+      clean)
+        producer() { printf "hello\n" >&2; printf "{}"; }
+        ;;
+      stderr-flood)
+        producer() {
+          chunk=$(printf "x%.0s" {1..8192})
+          for ((i = 0; i < 3000; i++)); do
+            printf "%s" "$chunk" >&2 || exit 141
+          done
+          printf "{}"
+        }
+        ;;
+    esac
+    guarddog_bounded_capture "$OUT" "$ERR" "$ST" producer
+    printf "%s|%s|%s\n" "${GUARDDOG_CAPTURE[0]:-x}" "${GUARDDOG_CAPTURE[1]:-x}" "${GUARDDOG_CAPTURE[2]:-x}"
+  ' 2>/dev/null
+}
+
+got="$(probe_capture clean)"
+[[ "$got" == "0|0|0" ]] && pass "bounded capture reports a clean three-status contract" || { printf 'got %s\n' "$got" >&2; fail "bounded capture reports a clean three-status contract"; }
+grep -q hello "$cap_err" && grep -q '{}' "$cap_out" \
+  && pass "bounded capture keeps the streams separated" || fail "bounded capture keeps the streams separated"
+
+got="$(probe_capture stderr-flood)"
+[[ "$got" == "141|0|0" ]] && pass "a stderr flood dies on the closed cap, statuses intact" || { printf 'got %s\n' "$got" >&2; fail "a stderr flood dies on the closed cap, statuses intact"; }
+cap_err_size=$(stat -c %s "$cap_err")
+[[ "$cap_err_size" == "16777216" ]] && pass "stderr capture is live-capped at exactly the per-stream limit" || { printf 'stderr size %s\n' "$cap_err_size" >&2; fail "stderr capture is live-capped at exactly the per-stream limit"; }
+
+got="$(probe_capture clean /dev/full)"
+[[ "$got" == "0|0|1" ]] && pass "an inner stderr-head failure is visible in the contract" || { printf 'got %s\n' "$got" >&2; fail "an inner stderr-head failure is visible in the contract"; }
 
 # Direct safe-audit coverage of the version-probe pipeline's failure paths:
 # the doctor cases exercising these mock modes run bin/safe's SEPARATE
