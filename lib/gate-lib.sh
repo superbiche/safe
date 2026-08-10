@@ -959,6 +959,13 @@ safe_gate_npm_lockdiff_unsafe_argv() {
 # npm is the authority for config precedence, boolean parsing, quoting, and
 # project .npmrc semantics. Keep the ambient environment unchanged so this
 # query resolves exactly what the final delegate will see.
+#
+# The probe MIRRORS the projection's own argv (safe's invariant flags first,
+# user argv last, exactly as the projection runs them) rather than reading
+# the ambient config: the projection asserts these invariants itself, so only
+# a user override can defeat them. Probing the ambient value instead refused
+# every dedupe/prune on a stock machine, where npm's own default is
+# ignore-scripts=false — protection unchanged, false refusals gone.
 safe_gate_npm_lockdiff_effective_config() {
   local project_dir="$1" subcommand="$2"
   shift 2
@@ -971,7 +978,8 @@ safe_gate_npm_lockdiff_effective_config() {
   fi
   if config_json="$(
     cd -- "${project_dir}" || exit 125
-    "${real_npm}" config get package-lock ignore-scripts "$@" --json 2>/dev/null
+    "${real_npm}" config get package-lock ignore-scripts \
+      --package-lock-only --ignore-scripts --no-audit --no-fund "$@" --json 2>/dev/null
   )"; then
     :
   else

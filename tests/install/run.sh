@@ -1417,6 +1417,18 @@ case_npm_lockdiff_effective_config_oracle() {
   assert_status 100 "$FUNCNAME" || return
   assert_err_contains_fragment 'effective npm config probe failed' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'PROJECTION\tnpm' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  rm -f "${WORK_DIR}/.npmrc"
+  # The probe must MIRROR the projection argv — safe's invariant flags first,
+  # user argv last — not read the ambient config. Probing the ambient value
+  # refused every dedupe/prune on a stock machine, where npm's own default is
+  # ignore-scripts=false. Asserting the argv (the stub answers from env, so
+  # only this pins the form the real npm would resolve).
+  NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}' \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tconfig\tget\tpackage-lock\tignore-scripts\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund\tdedupe\t--json' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
