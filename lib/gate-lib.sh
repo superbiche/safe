@@ -978,8 +978,8 @@ safe_gate_npm_lockdiff_effective_config() {
   fi
   if config_json="$(
     cd -- "${project_dir}" || exit 125
-    "${real_npm}" config get package-lock ignore-scripts \
-      --package-lock-only --ignore-scripts --no-audit --no-fund "$@" --json 2>/dev/null
+    "${real_npm}" config list --json \
+      --package-lock-only --ignore-scripts --no-audit --no-fund "$@" 2>/dev/null
   )"; then
     :
   else
@@ -1019,19 +1019,27 @@ safe_gate_npm_lockdiff_registry_hosts() {
   fi
   if registry_json="$(
     cd -- "${project_dir}" || exit 125
-    "${real_npm}" config get registry '@scope:registry' "$@" --json 2>/dev/null
+    "${real_npm}" config list --json "$@" 2>/dev/null
   )"; then
     :
   else
     safe_gate_err "safe: BLOCKED npm ${subcommand} — effective npm registry probe failed (audit-infrastructure breakage, not a package finding); fix npm configuration and retry — safe doctor; details: safe explain"
     return 100
   fi
+  # Every scoped registry key is enumerated from the effective config: a
+  # literal "@scope:registry" query returns the placeholder, never the
+  # project's real @foo:registry, so scoped private artifacts were
+  # over-refused as remote (PR#70 delta-3 F4).
   if registry_urls="$(jq -er '
-    if type != "object"
-      or (.registry | type != "string")
-      or ((."@scope:registry"? != null) and (."@scope:registry" | type != "string"))
+    if type != "object" or (.registry | type != "string")
     then error("invalid registry result")
-    else [.registry, (."@scope:registry"? // empty)] | .[]
+    else [ .registry,
+           ( to_entries[]
+             | select((.key | endswith(":registry")) and (.key != "registry"))
+             | select(.value != null)
+             | .value ) ]
+      | map(if type == "string" then . else error("invalid registry result") end)
+      | .[]
     end
   ' <<<"${registry_json}" 2>/dev/null)"; then
     :

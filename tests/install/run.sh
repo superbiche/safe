@@ -66,26 +66,35 @@ tool="$(basename -- "$0")"
   done
 } >> "${SAFE_INSTALL_COMMAND_LOG}"
 
-if [[ "${tool}" == "npm" && "${1:-}" == "config" && "${2:-}" == "get" ]]; then
-  has_effective_config=0
-  has_registry_config=0
+# Emulate npm 12's REAL config output shapes, not a convenient fiction: only
+# `config list --json` emits JSON; `config get` always emits key=value text
+# (bare value for a single key). The previous stub answered `config get
+# --json` with a JSON object, which is a format npm never produces — the
+# suite stayed green while the live gate refused every command (PR#70
+# delta-3 F2/F4). A regression back to `config get` now fails the caller's
+# jq parse here too, exactly as it would live.
+if [[ "${tool}" == "npm" && "${1:-}" == "config" && "${2:-}" == "list" ]]; then
+  wants_json=0
   for arg in "$@"; do
-    case "${arg}" in
-      package-lock|ignore-scripts) has_effective_config=1 ;;
-      registry|@scope:registry) has_registry_config=1 ;;
-    esac
+    [[ "${arg}" == "--json" ]] && wants_json=1
   done
-  if (( has_effective_config )); then
-    config_json="${NPM_LOCKDIFF_EFFECTIVE_CONFIG_JSON:-}"
-    [[ -n "${config_json}" ]] || config_json='{"package-lock":true,"ignore-scripts":true}'
-    printf '%s\n' "${config_json}"
-  elif (( has_registry_config )); then
-    config_json="${NPM_LOCKDIFF_REGISTRY_CONFIG_JSON:-}"
-    [[ -n "${config_json}" ]] || config_json='{"registry":"https://registry.npmjs.org/","@scope:registry":null}'
-    printf '%s\n' "${config_json}"
+  if (( wants_json )); then
+    # One effective-config object, as npm returns: both probes read it.
+    effective_json="${NPM_LOCKDIFF_EFFECTIVE_CONFIG_JSON:-}"
+    [[ -n "${effective_json}" ]] || effective_json='{"package-lock":true,"ignore-scripts":true}'
+    registry_json="${NPM_LOCKDIFF_REGISTRY_CONFIG_JSON:-}"
+    [[ -n "${registry_json}" ]] || registry_json='{"registry":"https://registry.npmjs.org/"}'
+    jq -cn --argjson a "${effective_json}" --argjson b "${registry_json}" '$b * $a' 2>/dev/null \
+      || printf '%s\n' "${effective_json}"
   else
-    printf '{}\n'
+    printf 'package-lock=true\nignore-scripts=true\n'
   fi
+  exit "${NPM_LOCKDIFF_CONFIG_STATUS:-0}"
+fi
+
+if [[ "${tool}" == "npm" && "${1:-}" == "config" && "${2:-}" == "get" ]]; then
+  # npm's real `config get` format: key=value lines, never JSON.
+  printf 'package-lock=true\nignore-scripts=true\n'
   exit "${NPM_LOCKDIFF_CONFIG_STATUS:-0}"
 fi
 
@@ -1428,7 +1437,7 @@ case_npm_lockdiff_effective_config_oracle() {
   NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}' \
     SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'REAL\tnpm\tconfig\tget\tpackage-lock\tignore-scripts\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund\tdedupe\t--json' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tconfig\tlist\t--json\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund\tdedupe' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
