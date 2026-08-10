@@ -1,0 +1,17 @@
+{
+  "name": "alias-fixture",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "name": "alias-fixture",
+      "version": "0.0.0"
+    },
+    "node_modules/friendly-alias": {
+      "name": "real-registry-pkg",
+      "version": "1.2.3"
+    },
+    "node_modules/plain": {
+      "version": "4.0.0"
+    }
+  }
+}

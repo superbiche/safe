@@ -1,0 +1,10 @@
+{
+  "name": "fixture-v2",
+  "lockfileVersion": 2,
+  "packages": {
+    "": {"name": "fixture-v2", "version": "1.0.0"},
+    "node_modules/left-pad": {"version": "1.3.0"},
+    "node_modules/outer/node_modules/@scope/nested": {"version": "2.0.0"},
+    "apps/team": {"version": "1.0.0"}
+  }
+}

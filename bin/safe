@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.11.1"
+SAFE_VERSION="1.12.0"
 SAFE_SELF="$(readlink -f "$0")"
 SAFE_DIR="$(dirname "$SAFE_SELF")"
 SAFE_CONFIG_ROOT="${SAFE_CONFIG_DIR:-$HOME/.config/safe}"
@@ -810,13 +810,14 @@ doctor_payload_json() {
   local run_parity_json
   run_parity_json=$(dispatch_parity_json "safe_run_version" "safe_run_via_dispatcher" env SAFE_RUN_NO_INIT=1 "$SAFE_RUN_PATH" version)
 
-  local core_bash_json core_jq_json core_zsh_json
+  local core_bash_json core_jq_json core_zsh_json core_safe_core_json
   local audit_curl_json audit_tar_json audit_ssh_json
   local verify_cosign_json verify_sha256sum_json verify_shasum_json verify_python3_json verify_python_json
   local sandbox_podman_json sandbox_timeout_json
   core_bash_json=$(command_presence_json bash)
   core_jq_json=$(command_presence_json jq)
   core_zsh_json=$(command_presence_json zsh)
+  core_safe_core_json=$(command_presence_json safe-core --version)
   audit_curl_json=$(command_presence_json curl)
   audit_tar_json=$(command_presence_json tar)
   audit_ssh_json=$(command_presence_json ssh)
@@ -1013,6 +1014,17 @@ doctor_payload_json() {
   linked_uvx=$(safe_run_linked_runner uvx)
   linked_pipx=$(safe_run_linked_runner pipx)
 
+  local safe_core_version_matches=false safe_core_warning=""
+  if [[ "$(jq -r '.present' <<<"$core_safe_core_json")" == "true" ]]; then
+    if [[ "$(jq -r '.version // empty' <<<"$core_safe_core_json")" == "$SAFE_VERSION" ]]; then
+      safe_core_version_matches=true
+    else
+      safe_core_warning="installed safe-core version differs from safe ${SAFE_VERSION}; rerun install.sh"
+    fi
+  else
+    safe_core_warning="safe-core is missing from PATH; rerun install.sh"
+  fi
+
   jq -n \
     --arg version "$SAFE_VERSION" \
     --arg config_dir "$base_config" \
@@ -1025,6 +1037,9 @@ doctor_payload_json() {
     --argjson core_bash "$core_bash_json" \
     --argjson core_jq "$core_jq_json" \
     --argjson core_zsh "$core_zsh_json" \
+    --argjson core_safe_core "$core_safe_core_json" \
+    --argjson safe_core_version_matches "$safe_core_version_matches" \
+    --arg safe_core_warning "$safe_core_warning" \
     --argjson audit_curl "$audit_curl_json" \
     --argjson audit_tar "$audit_tar_json" \
     --argjson audit_ssh "$audit_ssh_json" \
@@ -1081,7 +1096,8 @@ doctor_payload_json() {
         core: {
           bash: $core_bash,
           jq: $core_jq,
-          zsh: $core_zsh
+          zsh: $core_zsh,
+          safe_core: $core_safe_core
         },
         audit: {
           curl: $audit_curl,
@@ -1109,6 +1125,10 @@ doctor_payload_json() {
         safe_run_sandbox: $safe_run_sandbox
       },
       environment: {
+        safe_core: {
+          version_matches: $safe_core_version_matches,
+          warning: (if $safe_core_warning == "" then null else $safe_core_warning end)
+        },
         safe_run: {
           config_present: $safe_run_config_present,
           host_allow_file: $safe_run_host_allow_file,
@@ -1158,6 +1178,13 @@ print_doctor_human() {
     "  safe: " + .paths.safe.resolved,
     "  safe run binary: " + .paths.safe_run.resolved,
     "  safe audit binary: " + .paths.safe_audit.resolved,
+    "  safe core: " + (if .dependencies.core.safe_core.present then
+      (if .environment.safe_core.version_matches then
+        "ready (" + (.dependencies.core.safe_core.version // "unknown") + ")"
+      else
+        "DRIFT — " + (.environment.safe_core.warning // "rerun install.sh")
+      end)
+    else "MISSING — rerun install.sh" end),
     "",
     "dispatch:",
     "  audit version parity: " + (if .dispatch.audit_version_parity.supported then (if .dispatch.audit_version_parity.ok then "ok" else "mismatch" end) else "unavailable" end),

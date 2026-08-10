@@ -78,6 +78,7 @@ rm -f \
   "$BIN_DIR/safe" \
   "$BIN_DIR/safe-run" \
   "$BIN_DIR/safe-audit" \
+  "$BIN_DIR/safe-core" \
   "$BIN_DIR/safe-install" \
   "$BIN_DIR/safe-npx" \
   "$BIN_DIR/safe-bunx" \

@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.12.0 - 2026-08-10
+
+- npm gate: `npm dedupe` (including `ddp`) and `npm prune` now project their
+  package-lock-only mutation into a scratch directory before delegation. An
+  empty lock diff delegates directly; added and changed-to registry package
+  versions receive the normal per-target install audit, while pre-existing
+  findings on untouched packages do not block the operation. The projected
+  dependency scan, npm projection, or lock-diff parse failure fails closed as
+  audit-infrastructure breakage rather than a package finding. This first
+  version covers npm only; pnpm, yarn, and bun equivalents remain outside the
+  lane.
+- bootstrap: added the stdlib-only Go `safe-core` binary and its initial
+  `lockdiff` subcommand for npm lockfileVersion 2/3 package-map diffs.
+  `install.sh` now requires Go, builds `safe-core` with the safe version, and
+  installs it alongside the bash binaries; `safe doctor` reports missing or
+  version-drifted safe-core as a repair warning.
+
 ## 1.11.1 - 2026-08-10
 
 - gate/mise: a bare tool name the registry cannot resolve but the mise

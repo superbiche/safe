@@ -6,6 +6,19 @@ ZSH_BIN="$(command -v zsh)"
 TEST_ROOT="$(mktemp -d)"
 PASS_COUNT=0
 FAIL_COUNT=0
+SAFE_CORE_TEST_BIN="${TEST_ROOT}/safe-core"
+SAFE_CORE_TEST_AVAILABLE=0
+
+if command -v go >/dev/null 2>&1; then
+  if ( cd "${ROOT_DIR}" && go build -trimpath -o "${SAFE_CORE_TEST_BIN}" ./cmd/safe-core ); then
+    SAFE_CORE_TEST_AVAILABLE=1
+  else
+    printf 'not ok - safe-core test binary build failed\n' >&2
+    exit 1
+  fi
+else
+  printf 'SKIP: Go is unavailable; safe-core lockdiff install cases are skipped\n' >&2
+fi
 
 cleanup() {
   rm -rf "${TEST_ROOT}"
@@ -30,7 +43,11 @@ write_tool_stub() {
 #!/usr/bin/env bash
 tool="$(basename -- "$0")"
 {
-  printf 'REAL\t%s' "${tool}"
+  if [[ "${SAFE_GATE_LOCKDIFF_PROJECTION:-0}" == "1" ]]; then
+    printf 'PROJECTION\t%s' "${tool}"
+  else
+    printf 'REAL\t%s' "${tool}"
+  fi
   for arg in "$@"; do
     printf '\t%s' "${arg}"
   done
@@ -45,6 +62,19 @@ tool="$(basename -- "$0")"
     fi
   done
 } >> "${SAFE_INSTALL_COMMAND_LOG}"
+
+if [[ "${tool}" == "npm" && -n "${NPM_LOCK_MUTATION_JSON:-}" ]]; then
+  package_lock_only=0
+  for arg in "$@"; do
+    [[ "${arg}" == "--package-lock-only" ]] && package_lock_only=1
+  done
+  if (( package_lock_only )); then
+    lockfile="package-lock.json"
+    [[ -f "npm-shrinkwrap.json" ]] && lockfile="npm-shrinkwrap.json"
+    printf '%s\n' "${NPM_LOCK_MUTATION_JSON}" > "${lockfile}"
+    printf 'NPM_LOCK_MUTATION\t%s\n' "${lockfile}" >> "${SAFE_INSTALL_COMMAND_LOG}"
+  fi
+fi
 exit "${SAFE_INSTALL_REAL_STATUS:-0}"
 STUB
   chmod +x "${bin_dir}/${tool}"
@@ -347,6 +377,9 @@ prepare_case() {
   if [[ "${with_safe_audit}" == "yes" ]]; then
     write_safe_audit_stub "${BIN_DIR}"
   fi
+  if [[ "${SAFE_CORE_TEST_AVAILABLE}" == "1" ]]; then
+    ln -s "${SAFE_CORE_TEST_BIN}" "${BIN_DIR}/safe-core"
+  fi
 }
 
 # Gate mode: the wrappers sit ahead of the tool stubs on PATH, so a command
@@ -375,6 +408,7 @@ run_zsh() {
     SAFE_AUDIT_SOCKET_TIMEOUT="${SAFE_AUDIT_SOCKET_TIMEOUT:-}" \
     SAFE_INSTALL_TIMEOUT_SECONDS="${SAFE_INSTALL_TIMEOUT_SECONDS:-}" \
     SAFE_INSTALL_REAL_STATUS="${SAFE_INSTALL_REAL_STATUS:-}" \
+    NPM_LOCK_MUTATION_JSON="${NPM_LOCK_MUTATION_JSON:-}" \
     MISE_LS_JSON="${MISE_LS_JSON:-}" \
     "${ZSH_BIN}" -fc 'eval "${SAFE_INSTALL_TEST_SCRIPT}"'
   ) >"${OUT_FILE}" 2>"${ERR_FILE}"
@@ -471,6 +505,16 @@ assert_err_not_contains_fragment() {
     return 1
   fi
   return 0
+}
+
+skip_lockdiff_case() {
+  local label="$1"
+  if [[ "${SAFE_CORE_TEST_AVAILABLE}" == "1" ]]; then
+    return 0
+  fi
+  printf 'ok - %s # SKIP: Go is unavailable; safe-core lockdiff is not built\n' "${label}"
+  PASS_COUNT=$((PASS_COUNT + 1))
+  return 1
 }
 
 # The degraded-mode cases that used to live here (STRIP_HELPERS: a shell
@@ -1137,6 +1181,63 @@ case_update_family_gates() {
   pass "$FUNCNAME"
 }
 
+case_npm_dedupe_lockdiff_empty_delegates_without_scan() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_case "npm-dedupe-lockdiff-empty"
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/kept":{"version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
+  NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/kept":{"version":"1.0.0"}}}' \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'PROJECTION\tnpm\tdedupe\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tdedupe' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'AUDIT\tscan' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'AUDIT\tcheck' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_dedupe_lockdiff_introduced_block_refuses_without_delegation() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_case "npm-dedupe-lockdiff-block"
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
+  NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/blockme":{"version":"2.0.0"}}}' \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_dedupe_lockdiff_parse_failure_fails_closed() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_case "npm-dedupe-lockdiff-parse-failure"
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
+  NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/broken":{}}}' \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'lock-diff analysis failed' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'AUDIT\tscan' "$FUNCNAME" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_prune_lockdiff_introduced_block_refuses_without_delegation() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_case "npm-prune-lockdiff-block"
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
+  NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/blockme":{"version":"2.0.0"}}}' \
+    SAFE_INSTALL_TEST_SCRIPT='npm prune' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_count 0 $'REAL\tnpm\tprune' "${LOG_FILE}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_exec_passthrough_by_design() {
   prepare_case "exec-passthrough-by-design"
   SAFE_INSTALL_TEST_SCRIPT='pnpm exec eslint && composer exec tool && volta run node -v' run_zsh
@@ -1427,6 +1528,19 @@ case_install_idempotent_no_wrappers() {
   assert_count 0 'source "$HOME/.config/safe/install-wrappers.zsh"' "${HOME_DIR}/.zshrc" "$FUNCNAME" || return
   assert_count 1 'fpath=("$HOME/.local/share/zsh/site-functions" $fpath)' "${HOME_DIR}/.zshrc" "$FUNCNAME" || return
   [[ -f "${HOME_DIR}/.local/share/zsh/site-functions/_safe" ]] || { fail "$FUNCNAME"; return; }
+  [[ -x "${HOME_DIR}/.local/bin/safe-core" ]] || { fail "$FUNCNAME"; return; }
+  [[ "$("${HOME_DIR}/.local/bin/safe-core" --version)" == "1.12.0" ]] || { fail "$FUNCNAME"; return; }
+  local doctor_json
+  doctor_json="$(HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" \
+    "${HOME_DIR}/.local/bin/safe" doctor --json)" || { fail "$FUNCNAME"; return; }
+  jq -e '.dependencies.core.safe_core.present == true
+    and .dependencies.core.safe_core.version == "1.12.0"
+    and .environment.safe_core.version_matches == true
+    and .environment.safe_core.warning == null' <<<"${doctor_json}" >/dev/null || { fail "$FUNCNAME"; return; }
+  doctor_json="$(HOME="${HOME_DIR}" PATH="${BIN_DIR}:${HOME_DIR}/.local/bin:/usr/bin:/bin" \
+    "${HOME_DIR}/.local/bin/safe" doctor --json)" || { fail "$FUNCNAME"; return; }
+  jq -e '.environment.safe_core.version_matches == false
+    and (.environment.safe_core.warning | contains("rerun install.sh"))' <<<"${doctor_json}" >/dev/null || { fail "$FUNCNAME"; return; }
   pass "$FUNCNAME"
 }
 
@@ -1580,6 +1694,7 @@ case_uninstall_restores_the_displaced_binary() {
   # install, removed by uninstall — a leftover with safe-audit gone makes
   # every scanner-configured host fail closed (PR#64 review F8).
   [[ ! -e "${HOME_DIR}/.config/safe/scanner.mjs" ]] || { fail "$FUNCNAME"; return; }
+  [[ ! -e "${HOME_DIR}/.local/bin/safe-core" ]] || { fail "$FUNCNAME"; return; }
   pass "$FUNCNAME"
 }
 
@@ -3886,6 +4001,10 @@ main() {
     case_go_run_module_gates \
     case_go_run_value_flag_does_not_hide_module \
     case_update_family_gates \
+    case_npm_dedupe_lockdiff_empty_delegates_without_scan \
+    case_npm_dedupe_lockdiff_introduced_block_refuses_without_delegation \
+    case_npm_dedupe_lockdiff_parse_failure_fails_closed \
+    case_npm_prune_lockdiff_introduced_block_refuses_without_delegation \
     case_exec_passthrough_by_design \
     case_global_package_check \
     case_local_project_scan \

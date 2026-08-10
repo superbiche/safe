@@ -1,0 +1,11 @@
+{
+  "name": "fixture-v3",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {"name": "fixture-v3", "version": "1.0.0"},
+    "node_modules/@scope/workspace": {"resolved": "packages/workspace", "link": true},
+    "packages/workspace": {"name": "@scope/workspace", "version": "1.0.0"},
+    "node_modules/plain": {"version": "4.0.0"},
+    "node_modules/x/node_modules/@scope/registry": {"version": "3.0.0"}
+  }
+}
