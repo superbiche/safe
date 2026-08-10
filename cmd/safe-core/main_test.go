@@ -55,7 +55,7 @@ func TestRunWritesOnlyOneJSONDocument(t *testing.T) {
 	if got := run([]string{"lockdiff", old, new}, &stdout, &stderr); got != 0 {
 		t.Fatalf("run() = %d, stderr=%q", got, stderr.String())
 	}
-	if stdout.String() != "{\"schema\":1,\"added\":[],\"removed\":[],\"changed\":[{\"name\":\"a\",\"from\":\"1.0.0\",\"to\":\"2.0.0\"}]}\n" {
+	if stdout.String() != "{\"schema\":1,\"added\":[],\"removed\":[],\"changed\":[{\"name\":\"a\",\"from\":\"1.0.0\",\"to\":\"2.0.0\",\"source\":\"unknown\"}]}\n" {
 		t.Fatalf("stdout=%q", stdout.String())
 	}
 }

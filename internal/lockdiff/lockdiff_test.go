@@ -18,16 +18,16 @@ func TestLoadFixtures(t *testing.T) {
 			name:    "v2 extracts nested and scoped registry packages",
 			fixture: "v2.json",
 			want: []Package{
-				{Name: "@scope/nested", Version: "2.0.0"},
-				{Name: "left-pad", Version: "1.3.0"},
+				{Name: "@scope/nested", Version: "2.0.0", Source: "unknown"},
+				{Name: "left-pad", Version: "1.3.0", Source: "unknown"},
 			},
 		},
 		{
 			name:    "v3 skips workspace locals and links",
 			fixture: "v3-workspaces.json",
 			want: []Package{
-				{Name: "@scope/registry", Version: "3.0.0"},
-				{Name: "plain", Version: "4.0.0"},
+				{Name: "@scope/registry", Version: "3.0.0", Source: "unknown"},
+				{Name: "plain", Version: "4.0.0", Source: "unknown"},
 			},
 		},
 		{
@@ -37,8 +37,26 @@ func TestLoadFixtures(t *testing.T) {
 			name:    "aliased entry reports the real registry identity",
 			fixture: "v3-alias.json",
 			want: []Package{
-				{Name: "plain", Version: "4.0.0"},
-				{Name: "real-registry-pkg", Version: "1.2.3"},
+				{Name: "plain", Version: "4.0.0", Source: "unknown"},
+				{Name: "real-registry-pkg", Version: "1.2.3", Source: "registry", Integrity: "sha512-alias"},
+			},
+		},
+		{
+			name:    "source classes retain only registry aliases",
+			fixture: "v3-sources.json",
+			want: []Package{
+				{Name: "file-alias", Version: "1.0.0", Source: "file", Integrity: "sha512-file"},
+				{Name: "git-alias", Version: "1.0.0", Source: "git", Integrity: "sha512-git"},
+				{Name: "real-registry", Version: "1.0.0", Source: "registry", Integrity: "sha512-registry"},
+				{Name: "remote-alias", Version: "1.0.0", Source: "remote", Integrity: "sha512-remote"},
+				{Name: "unknown", Version: "1.0.0", Source: "unknown"},
+			},
+		},
+		{
+			name:    "non-registry aliases keep their install-path name",
+			fixture: "v3-nonregistry-alias.json",
+			want: []Package{
+				{Name: "alias", Version: "1.3.0", Source: "git", Integrity: "sha512-git"},
 			},
 		},
 		{
@@ -85,13 +103,13 @@ func TestCompareFixtures(t *testing.T) {
 	want := Diff{
 		Schema: 1,
 		Added: []Package{
-			{Name: "added", Version: "1.0.0"},
+			{Name: "added", Version: "1.0.0", Source: "unknown"},
 		},
 		Removed: []Package{
-			{Name: "removed", Version: "1.0.0"},
+			{Name: "removed", Version: "1.0.0", Source: "unknown"},
 		},
 		Changed: []Change{
-			{Name: "changed", From: "1.0.0", To: "2.0.0"},
+			{Name: "changed", From: "1.0.0", To: "2.0.0", Source: "unknown"},
 		},
 	}
 	if got := Compare(oldPackages, newPackages); !reflect.DeepEqual(got, want) {
@@ -101,22 +119,43 @@ func TestCompareFixtures(t *testing.T) {
 
 func TestComparePreservesAmbiguousMultiplicityAsAddedAndRemoved(t *testing.T) {
 	got := Compare(
-		[]Package{{Name: "duplicate", Version: "1.0.0"}, {Name: "duplicate", Version: "1.0.0"}},
-		[]Package{{Name: "duplicate", Version: "2.0.0"}, {Name: "duplicate", Version: "2.0.0"}},
+		[]Package{{Name: "duplicate", Version: "1.0.0", Source: "unknown"}, {Name: "duplicate", Version: "1.0.0", Source: "unknown"}},
+		[]Package{{Name: "duplicate", Version: "2.0.0", Source: "unknown"}, {Name: "duplicate", Version: "2.0.0", Source: "unknown"}},
 	)
 	want := Diff{
 		Schema: 1,
 		Added: []Package{
-			{Name: "duplicate", Version: "2.0.0"},
-			{Name: "duplicate", Version: "2.0.0"},
+			{Name: "duplicate", Version: "2.0.0", Source: "unknown"},
+			{Name: "duplicate", Version: "2.0.0", Source: "unknown"},
 		},
 		Removed: []Package{
-			{Name: "duplicate", Version: "1.0.0"},
-			{Name: "duplicate", Version: "1.0.0"},
+			{Name: "duplicate", Version: "1.0.0", Source: "unknown"},
+			{Name: "duplicate", Version: "1.0.0", Source: "unknown"},
 		},
 		Changed: []Change{},
 	}
 	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Compare() = %#v, want %#v", got, want)
+	}
+}
+
+func TestCompareSourceAndIntegrityChangesAreVisible(t *testing.T) {
+	oldPackages, err := Load(filepath.Join("testdata", "source-change-old.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	newPackages, err := Load(filepath.Join("testdata", "source-change-new.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := Diff{
+		Schema:  1,
+		Added:   []Package{},
+		Removed: []Package{},
+		Changed: []Change{{Name: "left-pad", From: "1.3.0", To: "1.3.0", Source: "git", Integrity: "sha512-git"}},
+	}
+	if got := Compare(oldPackages, newPackages); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Compare() = %#v, want %#v", got, want)
 	}
 }

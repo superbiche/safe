@@ -14,15 +14,19 @@ import (
 
 // Package identifies one registry package occurrence in an npm lockfile.
 type Package struct {
-	Name    string `json:"name"`
-	Version string `json:"version"`
+	Name      string `json:"name"`
+	Version   string `json:"version"`
+	Source    string `json:"source"`
+	Integrity string `json:"integrity,omitempty"`
 }
 
 // Change records a package name whose sole old and new occurrences differ.
 type Change struct {
-	Name string `json:"name"`
-	From string `json:"from"`
-	To   string `json:"to"`
+	Name      string `json:"name"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Source    string `json:"source"`
+	Integrity string `json:"integrity,omitempty"`
 }
 
 // Diff is the versioned lockfile delta emitted by safe-core lockdiff.
@@ -88,9 +92,11 @@ func Load(path string) ([]Package, error) {
 		}
 
 		var entry struct {
-			Link    *bool  `json:"link"`
-			Name    string `json:"name"`
-			Version string `json:"version"`
+			Link      *bool           `json:"link"`
+			Name      string          `json:"name"`
+			Version   string          `json:"version"`
+			Resolved  json.RawMessage `json:"resolved"`
+			Integrity json.RawMessage `json:"integrity"`
 		}
 		if err := json.Unmarshal(raw, &entry); err != nil {
 			return nil, fmt.Errorf("parse %q: .packages[%q] must be an object", path, key)
@@ -101,20 +107,35 @@ func Load(path string) ([]Package, error) {
 		if entry.Version == "" {
 			return nil, fmt.Errorf("parse %q: .packages[%q] is missing a string version", path, key)
 		}
+		resolved, resolvedPresent, err := optionalString(entry.Resolved)
+		if err != nil {
+			return nil, fmt.Errorf("parse %q: .packages[%q] resolved must be a string", path, key)
+		}
+		integrity, integrityPresent, err := optionalString(entry.Integrity)
+		if err != nil || (integrityPresent && integrity == "") {
+			return nil, fmt.Errorf("parse %q: .packages[%q] integrity must be a non-empty string", path, key)
+		}
+		source := sourceClass(resolved, resolvedPresent)
 		// npm records the REAL registry identity in .name when the install
 		// path is an alias ("foo": "npm:real-pkg@1"). The audit must vouch
-		// for that identity, never the alias path — a clean verdict for the
-		// alias name would vouch for an artifact nobody checked.
-		if entry.Name != "" {
+		// for that identity only when the descriptor is a registry artifact.
+		// A non-registry descriptor can self-declare a registry name, but that
+		// must not make an audit of that namesake vouch for its real source.
+		if source == "registry" && entry.Name != "" {
 			name = entry.Name
 		}
-		if err := validateValue("package name", name); err != nil {
+		if err := validatePackageName(name); err != nil {
 			return nil, fmt.Errorf("parse %q: .packages[%q] %w", path, key, err)
 		}
-		if err := validateValue("package version", entry.Version); err != nil {
+		if err := validateText("package version", entry.Version); err != nil {
 			return nil, fmt.Errorf("parse %q: .packages[%q] %w", path, key, err)
 		}
-		packages = append(packages, Package{Name: name, Version: entry.Version})
+		if integrityPresent {
+			if err := validateText("package integrity", integrity); err != nil {
+				return nil, fmt.Errorf("parse %q: .packages[%q] %w", path, key, err)
+			}
+		}
+		packages = append(packages, Package{Name: name, Version: entry.Version, Source: source, Integrity: integrity})
 	}
 
 	sort.Slice(packages, func(i, j int) bool {
@@ -131,18 +152,56 @@ func packageName(key string) (string, bool) {
 	return name, name != ""
 }
 
-func validateValue(label, value string) error {
+func optionalString(raw json.RawMessage) (string, bool, error) {
+	if len(raw) == 0 {
+		return "", false, nil
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", false, err
+	}
+	return value, true, nil
+}
+
+func sourceClass(resolved string, present bool) string {
+	if !present {
+		return "unknown"
+	}
+	lower := strings.ToLower(resolved)
+	switch {
+	case strings.HasPrefix(lower, "git+"), strings.HasPrefix(lower, "ssh://"), strings.HasPrefix(lower, "git@"):
+		return "git"
+	case strings.HasPrefix(lower, "file:"):
+		return "file"
+	case strings.HasPrefix(lower, "http://"), strings.HasPrefix(lower, "https://"):
+		return "registry"
+	default:
+		// npm also permits hosted and other URL-like descriptors. Until a
+		// source-aware audit exists, every non-empty unrecognized descriptor
+		// is remote and therefore refused by the gate.
+		return "remote"
+	}
+}
+
+func validateText(label, value string) error {
 	if value == "" || strings.IndexFunc(value, func(r rune) bool {
 		return unicode.IsControl(r) || unicode.IsSpace(r)
 	}) >= 0 {
 		return fmt.Errorf("has an invalid %s", label)
 	}
+	return nil
+}
+
+func validatePackageName(value string) error {
+	if err := validateText("package name", value); err != nil {
+		return err
+	}
 	if strings.HasPrefix(value, "@") {
 		if strings.Count(value, "/") != 1 {
-			return fmt.Errorf("has an invalid %s", label)
+			return fmt.Errorf("has an invalid package name")
 		}
 	} else if strings.Contains(value, "/") {
-		return fmt.Errorf("has an invalid %s", label)
+		return fmt.Errorf("has an invalid package name")
 	}
 	return nil
 }
@@ -177,8 +236,11 @@ func Compare(oldPackages, newPackages []Package) Diff {
 	for name := range allNames {
 		oldResidual := oldByName[name]
 		newResidual := newByName[name]
-		if len(oldResidual) == 1 && len(newResidual) == 1 && oldResidual[0].Version != newResidual[0].Version {
-			diff.Changed = append(diff.Changed, Change{Name: name, From: oldResidual[0].Version, To: newResidual[0].Version})
+		if len(oldResidual) == 1 && len(newResidual) == 1 && oldResidual[0] != newResidual[0] {
+			diff.Changed = append(diff.Changed, Change{
+				Name: name, From: oldResidual[0].Version, To: newResidual[0].Version,
+				Source: newResidual[0].Source, Integrity: newResidual[0].Integrity,
+			})
 			continue
 		}
 		diff.Removed = append(diff.Removed, oldResidual...)
@@ -230,5 +292,11 @@ func packageLess(a, b Package) bool {
 	if a.Name != b.Name {
 		return a.Name < b.Name
 	}
-	return a.Version < b.Version
+	if a.Version != b.Version {
+		return a.Version < b.Version
+	}
+	if a.Source != b.Source {
+		return a.Source < b.Source
+	}
+	return a.Integrity < b.Integrity
 }

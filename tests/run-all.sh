@@ -11,6 +11,7 @@ set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
 SUITES=(
+  tests/go/run.sh
   tests/install/run.sh
   tests/audit/check_version_aware.sh
   tests/audit/guarddog_tier.sh

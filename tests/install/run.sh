@@ -10,7 +10,7 @@ SAFE_CORE_TEST_BIN="${TEST_ROOT}/safe-core"
 SAFE_CORE_TEST_AVAILABLE=0
 
 if command -v go >/dev/null 2>&1; then
-  if ( cd "${ROOT_DIR}" && go build -trimpath -o "${SAFE_CORE_TEST_BIN}" ./cmd/safe-core ); then
+  if ( cd "${ROOT_DIR}" && go build -trimpath -ldflags "-X main.version=$(tr -d '[:space:]' < VERSION)" -o "${SAFE_CORE_TEST_BIN}" ./cmd/safe-core ); then
     SAFE_CORE_TEST_AVAILABLE=1
   else
     printf 'not ok - safe-core test binary build failed\n' >&2
@@ -45,6 +45,9 @@ tool="$(basename -- "$0")"
 {
   if [[ "${SAFE_GATE_LOCKDIFF_PROJECTION:-0}" == "1" ]]; then
     printf 'PROJECTION\t%s' "${tool}"
+    # The projection must see the project's npm config (F3 ruling): surface
+    # whether the scratch cwd carries the copied .npmrc.
+    [[ -f .npmrc ]] && printf '\tPROJNPMRC'
   else
     printf 'REAL\t%s' "${tool}"
   fi
@@ -65,10 +68,26 @@ tool="$(basename -- "$0")"
 
 if [[ "${tool}" == "npm" && -n "${NPM_LOCK_MUTATION_JSON:-}" ]]; then
   package_lock_only=0
-  for arg in "$@"; do
-    [[ "${arg}" == "--package-lock-only" ]] && package_lock_only=1
+  package_lock=1
+  end_options=0
+  args=("$@")
+  for (( i=0; i<${#args[@]}; i++ )); do
+    arg="${args[$i]}"
+    (( end_options )) && continue
+    [[ "${arg}" == "--" ]] && { end_options=1; continue; }
+    case "${arg,,}" in
+      --package-lock-only|--package-lock-only=true) package_lock_only=1 ;;
+      --package-lock-only=false|--no-package-lock-only) package_lock_only=0 ;;
+      --package-lock)
+        [[ "${args[$((i+1))]:-}" == "false" ]] && package_lock=0
+        ;;
+      --package-lock=false|--no-package-lock|--no-package-lock=true) package_lock=0 ;;
+      --no-package-lock=false|--package-lock=true) package_lock=1 ;;
+    esac
   done
-  if (( package_lock_only )); then
+  if [[ "${npm_config_package_lock_only:-}" == "true" ]]; then package_lock_only=1; fi
+  if [[ "${npm_config_package_lock:-}" == "false" ]]; then package_lock=0; fi
+  if (( package_lock_only && package_lock )); then
     lockfile="package-lock.json"
     [[ -f "npm-shrinkwrap.json" ]] && lockfile="npm-shrinkwrap.json"
     printf '%s\n' "${NPM_LOCK_MUTATION_JSON}" > "${lockfile}"
@@ -382,6 +401,23 @@ prepare_case() {
   fi
 }
 
+# lockdiff trusts the helper installed beside the real dispatcher. Most gate
+# cases intentionally symlink `safe` to the checkout so they exercise its
+# development lib path; these cases instead model the installed layout with a
+# copied dispatcher, a sibling core, and the copied gate library's parent.
+prepare_lockdiff_case() {
+  prepare_case "$1"
+  rm -f "${BIN_DIR}/safe"
+  cp "${ROOT_DIR}/bin/safe" "${BIN_DIR}/safe"
+  chmod +x "${BIN_DIR}/safe"
+  ln -s "${ROOT_DIR}/lib" "${CASE_DIR}/lib"
+  ln -s "${ROOT_DIR}/bin/safe-run" "${BIN_DIR}/safe-run"
+  # The F3 guard refuses when node_modules is absent (the real command would
+  # materialize every lockfile artifact unaudited); lockdiff cases model a
+  # populated project unless they test the guard itself.
+  mkdir -p "${WORK_DIR}/node_modules"
+}
+
 # Gate mode: the wrappers sit ahead of the tool stubs on PATH, so a command
 # resolves to the wrapper executable, which execs `safe gate <tool>`. Nothing
 # is sourced into the shell — that is the point of the port, and running the
@@ -409,6 +445,10 @@ run_zsh() {
     SAFE_INSTALL_TIMEOUT_SECONDS="${SAFE_INSTALL_TIMEOUT_SECONDS:-}" \
     SAFE_INSTALL_REAL_STATUS="${SAFE_INSTALL_REAL_STATUS:-}" \
     NPM_LOCK_MUTATION_JSON="${NPM_LOCK_MUTATION_JSON:-}" \
+    NPM_CONFIG_PACKAGE_LOCK="${NPM_CONFIG_PACKAGE_LOCK:-}" \
+    npm_config_package_lock="${npm_config_package_lock:-}" \
+    NPM_CONFIG_IGNORE_SCRIPTS="${NPM_CONFIG_IGNORE_SCRIPTS:-}" \
+    npm_config_ignore_scripts="${npm_config_ignore_scripts:-}" \
     MISE_LS_JSON="${MISE_LS_JSON:-}" \
     "${ZSH_BIN}" -fc 'eval "${SAFE_INSTALL_TEST_SCRIPT}"'
   ) >"${OUT_FILE}" 2>"${ERR_FILE}"
@@ -1183,25 +1223,57 @@ case_update_family_gates() {
 
 case_npm_dedupe_lockdiff_empty_delegates_without_scan() {
   skip_lockdiff_case "$FUNCNAME" || return
-  prepare_case "npm-dedupe-lockdiff-empty"
+  prepare_lockdiff_case "npm-dedupe-lockdiff-empty"
   printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
   printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/kept":{"version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
   NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/kept":{"version":"1.0.0"}}}' \
     SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'PROJECTION\tnpm\tdedupe\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund' "$FUNCNAME" || return
+  assert_log_contains $'PROJECTION\tnpm\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund\tdedupe' "$FUNCNAME" || return
   assert_log_contains $'REAL\tnpm\tdedupe' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'AUDIT\tscan' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'AUDIT\tcheck' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
+case_npm_lockdiff_absent_node_modules_refuses() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-no-node-modules"
+  rmdir "${WORK_DIR}/node_modules"
+  # Empty lock diff + absent tree = the real command materializes every
+  # lockfile artifact unaudited (review F3; operator-ruled guard).
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/kept":{"version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
+  SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'node_modules is absent' "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'PROJECTION' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_projection_sees_project_npmrc() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-npmrc-copied"
+  # A project-level registry must govern the projection too, or the audit
+  # vouches for a different artifact than the delegate fetches (review F3).
+  printf 'registry=https://npm.example.test/\n' > "${WORK_DIR}/.npmrc"
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/kept":{"version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
+  NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/kept":{"version":"1.0.0"}}}' \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'PROJECTION\tnpm\tPROJNPMRC\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund\tdedupe' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tdedupe' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_npm_dedupe_lockdiff_introduced_block_refuses_without_delegation() {
   skip_lockdiff_case "$FUNCNAME" || return
-  prepare_case "npm-dedupe-lockdiff-block"
+  prepare_lockdiff_case "npm-dedupe-lockdiff-block"
   printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
   printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
-  NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/blockme":{"version":"2.0.0"}}}' \
+  NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/blockme":{"version":"2.0.0","resolved":"https://registry.npmjs.org/blockme/-/blockme-2.0.0.tgz","integrity":"sha512-blockme"}}}' \
     SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
   assert_status 104 "$FUNCNAME" || return
   assert_project_scan_logged "$FUNCNAME" || return
@@ -1212,13 +1284,14 @@ case_npm_dedupe_lockdiff_introduced_block_refuses_without_delegation() {
 
 case_npm_dedupe_lockdiff_parse_failure_fails_closed() {
   skip_lockdiff_case "$FUNCNAME" || return
-  prepare_case "npm-dedupe-lockdiff-parse-failure"
+  prepare_lockdiff_case "npm-dedupe-lockdiff-parse-failure"
   printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
   printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
   NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/broken":{}}}' \
     SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
   assert_status 100 "$FUNCNAME" || return
   assert_err_contains_fragment 'lock-diff analysis failed' "$FUNCNAME" || return
+  assert_err_contains_fragment 'exit 3' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'AUDIT\tscan' "$FUNCNAME" || return
   assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME" || return
   pass "$FUNCNAME"
@@ -1226,15 +1299,180 @@ case_npm_dedupe_lockdiff_parse_failure_fails_closed() {
 
 case_npm_prune_lockdiff_introduced_block_refuses_without_delegation() {
   skip_lockdiff_case "$FUNCNAME" || return
-  prepare_case "npm-prune-lockdiff-block"
+  prepare_lockdiff_case "npm-prune-lockdiff-block"
   printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
   printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
-  NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/blockme":{"version":"2.0.0"}}}' \
+  NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/blockme":{"version":"2.0.0","resolved":"https://registry.npmjs.org/blockme/-/blockme-2.0.0.tgz","integrity":"sha512-blockme"}}}' \
     SAFE_INSTALL_TEST_SCRIPT='npm prune' run_zsh
   assert_status 104 "$FUNCNAME" || return
   assert_project_scan_logged "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tcheck\tblockme@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_count 0 $'REAL\tnpm\tprune' "${LOG_FILE}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_prefixes_route_to_projection() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-prefixes"
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
+  local token
+  for token in ded dedu dedup pru prun ddp; do
+    : > "${LOG_FILE}"
+    NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/blockme":{"version":"2.0.0","resolved":"https://registry.npmjs.org/blockme/-/blockme-2.0.0.tgz","integrity":"sha512-blockme"}}}' \
+      SAFE_INSTALL_TEST_SCRIPT="npm ${token}" run_zsh
+    assert_status 104 "$FUNCNAME" || return
+    assert_log_contains $'PROJECTION\tnpm\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund\t'"${token}" "$FUNCNAME" || return
+    assert_count 0 $'REAL\tnpm\t'"${token}" "${LOG_FILE}" "$FUNCNAME" || return
+  done
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_rejects_unsafe_projection_argv() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-unsafe-argv"
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
+  local args
+  for args in '--' '--no-package-lock' '--package-lock=false' '--package-lock false' '--no-ignore-scripts' '--ignore-scripts=false' '--ignore-scripts false'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="npm dedupe ${args}" run_zsh
+    assert_status 100 "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'PROJECTION\tnpm' "$FUNCNAME" || return
+    assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return; }
+  done
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_rejects_unsafe_projection_config() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-unsafe-config"
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
+
+  NPM_CONFIG_PACKAGE_LOCK=false SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'NPM_CONFIG_PACKAGE_LOCK' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'PROJECTION\tnpm' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  npm_config_package_lock=false SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'npm_config_package_lock' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'PROJECTION\tnpm' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  NPM_CONFIG_IGNORE_SCRIPTS=false SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'NPM_CONFIG_IGNORE_SCRIPTS' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'PROJECTION\tnpm' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  printf 'package-lock=false\n' > "${WORK_DIR}/.npmrc"
+  SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'package-lock=false in .npmrc' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'PROJECTION\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_refuses_nonregistry_sources() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-nonregistry-source"
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
+  NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/alias":{"name":"left-pad","version":"1.3.0","resolved":"git+https://example.invalid/left-pad.git#deadbeef","integrity":"sha512-git"}}}' \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'alias@1.3.0 is a git artifact, not a registry artifact; not audit-gated' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'AUDIT\tscan' "$FUNCNAME" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_safe_core_is_pinned_and_strict() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-safe-core-pinned"
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
+
+  # A PATH shadow must not be consulted: the sibling core stays authoritative.
+  cat > "${WRAPPER_DIR}/safe-core" <<'STUB'
+#!/usr/bin/env bash
+exit 77
+STUB
+  chmod +x "${WRAPPER_DIR}/safe-core"
+  NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}' \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tdedupe' "$FUNCNAME" || return
+
+  rm -f "${BIN_DIR}/safe-core"
+  cat > "${BIN_DIR}/safe-core" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --version) printf '1.12.0\n' ;;
+  lockdiff) printf '{"schema":1}\n' ;;
+esac
+STUB
+  chmod +x "${BIN_DIR}/safe-core"
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'lock-diff analysis returned an unreadable result' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'AUDIT\tscan' "$FUNCNAME" || return
+
+  cat > "${BIN_DIR}/safe-core" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then printf '0.0.0\n'; fi
+STUB
+  chmod +x "${BIN_DIR}/safe-core"
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe-core version 0.0.0 does not match safe 1.12.0' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'PROJECTION\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_refuses_missing_scan_coverage() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-scan-coverage"
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
+  local mutation='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/okpkg":{"version":"1.0.0","resolved":"https://registry.npmjs.org/okpkg/-/okpkg-1.0.0.tgz","integrity":"sha512-okpkg"}}}'
+
+  SAFE_AUDIT_SCAN_TOOL_STATUS='{"npm":1}' NPM_LOCK_MUTATION_JSON="${mutation}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'projected dependency scan produced no readable verdict' "$FUNCNAME" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_SCAN_ECOSYSTEM_AUDITS='[{"scanner":"npm-audit","status":"skipped","note":"npm unavailable"}]' NPM_LOCK_MUTATION_JSON="${mutation}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'projected dependency scanner failure (npm-audit' "$FUNCNAME" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_warn_matches_install_lane() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-warn-parity-install"
+  SAFE_INSTALL_TEST_SCRIPT='npm install -g warnme@2.0.0' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  local install_refusal
+  install_refusal="$(<"${ERR_FILE}")"
+
+  prepare_lockdiff_case "npm-lockdiff-warn-parity-dedupe"
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
+  NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/warnme":{"version":"2.0.0","resolved":"https://registry.npmjs.org/warnme/-/warnme-2.0.0.tgz","integrity":"sha512-warnme"}}}' \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  [[ "$(<"${ERR_FILE}")" == "${install_refusal}" ]] || { printf 'dedupe refusal diverged from install:\n%s\n' "$(<"${ERR_FILE}")" >&2; fail "$FUNCNAME"; return; }
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return; }
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -1537,6 +1775,11 @@ case_install_idempotent_no_wrappers() {
     and .dependencies.core.safe_core.version == "1.12.0"
     and .environment.safe_core.version_matches == true
     and .environment.safe_core.warning == null' <<<"${doctor_json}" >/dev/null || { fail "$FUNCNAME"; return; }
+  # The suite core is release-versioned for gate-time parity. Replace the
+  # PATH shadow explicitly so doctor continues to exercise its drift branch.
+  rm -f "${BIN_DIR}/safe-core"
+  printf '#!/usr/bin/env bash\nprintf "dev\\n"\n' > "${BIN_DIR}/safe-core"
+  chmod +x "${BIN_DIR}/safe-core"
   doctor_json="$(HOME="${HOME_DIR}" PATH="${BIN_DIR}:${HOME_DIR}/.local/bin:/usr/bin:/bin" \
     "${HOME_DIR}/.local/bin/safe" doctor --json)" || { fail "$FUNCNAME"; return; }
   jq -e '.environment.safe_core.version_matches == false
@@ -4002,9 +4245,18 @@ main() {
     case_go_run_value_flag_does_not_hide_module \
     case_update_family_gates \
     case_npm_dedupe_lockdiff_empty_delegates_without_scan \
+    case_npm_lockdiff_absent_node_modules_refuses \
+    case_npm_lockdiff_projection_sees_project_npmrc \
     case_npm_dedupe_lockdiff_introduced_block_refuses_without_delegation \
     case_npm_dedupe_lockdiff_parse_failure_fails_closed \
     case_npm_prune_lockdiff_introduced_block_refuses_without_delegation \
+    case_npm_lockdiff_prefixes_route_to_projection \
+    case_npm_lockdiff_rejects_unsafe_projection_argv \
+    case_npm_lockdiff_rejects_unsafe_projection_config \
+    case_npm_lockdiff_refuses_nonregistry_sources \
+    case_npm_lockdiff_safe_core_is_pinned_and_strict \
+    case_npm_lockdiff_refuses_missing_scan_coverage \
+    case_npm_lockdiff_warn_matches_install_lane \
     case_exec_passthrough_by_design \
     case_global_package_check \
     case_local_project_scan \

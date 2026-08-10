@@ -394,6 +394,12 @@ cmd_gate() {
   # Fail closed: without the routing tables nothing can vouch for the command.
   lib="$(gate_lib_path)" || refuse 100 "BLOCKED ${tool} — safe gate library not found (looked beside safe and in $SAFE_CONFIG_ROOT); to allow: ask the operator to re-run safe's install.sh; details: safe explain"
 
+  # gate-lib uses the sibling safe-core built and installed with this exact
+  # dispatcher release. Export explicitly instead of trusting a PATH helper:
+  # a shadow/stale lockdiff binary must fail closed, never vouch for an empty
+  # projection.
+  export SAFE_DIR SAFE_VERSION
+
   # shellcheck source=/dev/null
   source "$lib"
 
