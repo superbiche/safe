@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# LIVE suite — runs the lock-diff npm oracles against the REAL npm binary.
+# LIVE suite — exercises the CHECKED-IN lock-diff npm oracles against the REAL
+# npm binary.
 #
-# Why this exists: the install suite is hermetic (stubbed npm), and a stub
-# that answered `config get --json` with a JSON object — a shape npm never
-# emits — kept the suite green while the live gate refused every dedupe and
-# prune (PR#70 delta-3 F2/F4). A probe that asks a real tool for a real
-# format must be verified against that tool. Offline: `npm config list`
-# reads configuration only, never the network.
+# Why this exists: the install suite is hermetic (stubbed npm), and a stub that
+# answered `config get --json` with a JSON object — a shape npm never emits —
+# kept the suite green while the live gate refused every dedupe and prune
+# (PR#70 delta-3). A probe that asks a real tool for a real format must be
+# verified against that tool, and it must call the shipped helper rather than a
+# convenient re-implementation of it (delta-4 N1): a duplicated raw npm call
+# passes while lib/gate-lib.sh regresses.
+#
+# Offline: `npm config list` reads configuration only, never the network.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -16,9 +20,8 @@ FAIL=0
 pass() { printf 'ok - %s\n' "$1"; PASS=$((PASS + 1)); }
 fail() { printf 'FAIL - %s\n' "$1"; FAIL=$((FAIL + 1)); }
 
-# The gate resolves the delegate by skipping safe's own wrappers; here we want
-# the genuine npm, so locate it the same way and refuse to run against a
-# wrapper.
+# The gate resolves its delegate by skipping safe's own wrappers; this suite
+# needs the genuine npm, so locate it the same way.
 real_npm=""
 while IFS= read -r candidate; do
   [[ -x "${candidate}" ]] || continue
@@ -34,70 +37,118 @@ fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/safe-live-npm.XXXXXX")" || exit 1
 trap 'rm -rf -- "${WORK}"' EXIT
-: > "${WORK}/isolated-npmrc"
 printf '{"name":"live-oracle","version":"1.0.0"}\n' > "${WORK}/package.json"
 
-# Isolate from the operator's own user config so the suite measures npm's
-# stock defaults, not this machine's hardening.
-npm_probe() {
-  (
-    cd "${WORK}" || exit 125
-    "${real_npm}" config list --json --userconfig "${WORK}/isolated-npmrc" \
-      --package-lock-only --ignore-scripts --no-audit --no-fund "$@" 2>/dev/null
-  )
+# shellcheck source=/dev/null
+source "${ROOT}/lib/gate-lib.sh" >/dev/null 2>&1 || {
+  printf 'FAIL - cannot source lib/gate-lib.sh\n'
+  exit 1
 }
 
-json="$(npm_probe dedupe)"
-if [[ -n "${json}" ]] && jq -e 'type == "object"' <<<"${json}" >/dev/null 2>&1; then
-  pass "npm config list --json emits a JSON object (the format the gate parses)"
+# Pin the delegate the helpers resolve to the real npm found above, so the
+# suite measures the shipped code paths and not PATH accidents. The variable
+# name must be one gate-lib never declares `local`: bash is dynamically
+# scoped, so an override reading `real_npm` would see the CALLER's empty local
+# and report npm as unresolvable.
+SAFE_LIVE_REAL_NPM="${real_npm}"
+safe_gate_resolve_real() { printf '%s\n' "${SAFE_LIVE_REAL_NPM}"; }
+
+npmrc() { printf '%s' "$1" > "${WORK}/.npmrc"; }
+
+config_rc() {
+  ( safe_gate_npm_lockdiff_effective_config "${WORK}" dedupe "$@" ) >/dev/null 2>&1
+  printf '%s' "$?"
+}
+
+hosts_out() {
+  ( safe_gate_npm_lockdiff_registry_hosts "${WORK}" dedupe "$@" ) 2>/dev/null
+}
+
+# --- effective-config oracle -------------------------------------------------
+
+npmrc ''
+[[ "$(config_rc dedupe)" == "0" ]] \
+  && pass "ordinary dedupe passes the shipped config oracle on a stock npm config" \
+  || fail "ordinary dedupe was refused by the shipped config oracle"
+
+# npm's own default is ignore-scripts=false; the projection asserts it via its
+# own flags, so reading the ambient value refused every command on a stock
+# machine. The probe must mirror the projection instead.
+[[ "$(config_rc prune)" == "0" ]] \
+  && pass "ordinary prune passes the shipped config oracle" \
+  || fail "ordinary prune was refused by the shipped config oracle"
+
+# The probe's own transport must not be overridable by an ordinary output flag.
+[[ "$(config_rc dedupe --json=false)" == "0" ]] \
+  && pass "--json=false does not disable the probe transport (no over-refusal)" \
+  || fail "--json=false over-refused an ordinary command"
+[[ "$(config_rc dedupe --no-json)" == "0" ]] \
+  && pass "--no-json does not disable the probe transport (no over-refusal)" \
+  || fail "--no-json over-refused an ordinary command"
+
+[[ "$(config_rc dedupe --no-ignore-scripts)" == "100" ]] \
+  && pass "--no-ignore-scripts is detected as weakening and refused" \
+  || fail "--no-ignore-scripts was not refused"
+[[ "$(config_rc dedupe --package-lock=false)" == "100" ]] \
+  && pass "--package-lock=false is detected as weakening and refused" \
+  || fail "--package-lock=false was not refused"
+
+npmrc 'package-lock = "false"'
+[[ "$(config_rc dedupe)" == "100" ]] \
+  && pass "quoted .npmrc package-lock=false is refused (npm parses the quotes)" \
+  || fail "quoted .npmrc package-lock=false was not refused"
+
+npmrc $'package-lock=false\npackage-lock=true\n'
+[[ "$(config_rc dedupe)" == "0" ]] \
+  && pass "last-key-wins .npmrc resolving to true is not over-refused" \
+  || fail "last-key-wins .npmrc resolving to true was over-refused"
+
+npmrc ''
+[[ "$(NPM_CONFIG_PACKAGE_LOCK=' false ' config_rc dedupe)" == "100" ]] \
+  && pass "whitespace-padded environment false is refused (npm trims it)" \
+  || fail "whitespace-padded environment false was not refused"
+
+# --- registry-provenance oracle ---------------------------------------------
+
+npmrc $'registry=https://registry.npmjs.org/\n@corp:registry=https://npm.corp.invalid/\n'
+out="$(hosts_out dedupe)"
+if grep -qx 'npm.corp.invalid' <<<"${out}" && grep -qx 'registry.npmjs.org' <<<"${out}"; then
+  pass "real scoped registry keys are enumerated as trusted hosts"
 else
-  fail "npm config list --json did not emit a JSON object: ${json:0:120}"
+  fail "scoped registry enumeration missing: ${out//$'\n'/,}"
 fi
 
-# Stock npm defaults ignore-scripts to false; the projection asserts it via
-# its own flags, so an ordinary dedupe must still resolve healthy. Reading
-# the ambient value instead refused every command on a stock machine.
-if jq -e '.["package-lock"] == true and .["ignore-scripts"] == true' <<<"${json}" >/dev/null 2>&1; then
-  pass "ordinary dedupe resolves healthy invariants on a stock npm config"
+# npm consumes ONLY its @scope:registry form. Accepting any key ending in
+# ":registry" let project metadata grant an arbitrary host registry
+# provenance, so a remote tarball looked registry-authoritative (delta-4 F4).
+npmrc $'registry=https://registry.npmjs.org/\nnot-a-scope:registry=https://attacker.invalid/\n'
+out="$(hosts_out dedupe)"
+if grep -qx 'attacker.invalid' <<<"${out}"; then
+  fail "a non-scoped ':registry' key granted registry provenance to attacker.invalid"
 else
-  fail "ordinary dedupe did not resolve healthy invariants: $(jq -c '{"package-lock","ignore-scripts"}' <<<"${json}" 2>/dev/null)"
+  pass "non-scoped ':registry' keys cannot grant registry provenance"
 fi
 
-json="$(npm_probe dedupe --no-ignore-scripts)"
-if jq -e '.["ignore-scripts"] == false' <<<"${json}" >/dev/null 2>&1; then
-  pass "user --no-ignore-scripts still resolves to a weakened invariant (gate refuses)"
+npmrc 'registry=https://:'
+if [[ -z "$(hosts_out dedupe)" ]]; then
+  pass "a malformed registry authority is refused, not passed as a host"
 else
-  fail "user --no-ignore-scripts was not detected as weakening"
+  fail "malformed registry authority produced a host: $(hosts_out dedupe)"
 fi
 
-printf 'package-lock=false\n' > "${WORK}/.npmrc"
-json="$(npm_probe dedupe)"
-if jq -e '.["package-lock"] == false' <<<"${json}" >/dev/null 2>&1; then
-  pass "project .npmrc package-lock=false resolves weakened (gate refuses)"
-else
-  fail "project .npmrc package-lock=false was not detected"
-fi
+# --- retired call shape ------------------------------------------------------
 
-# Real scoped registry keys must be enumerable: querying the literal
-# "@scope:registry" returned a placeholder and over-refused scoped private
-# artifacts as remote.
-printf 'registry=https://registry.npmjs.org/\n@corp:registry=https://npm.corp.invalid/\n' > "${WORK}/.npmrc"
-json="$(npm_probe dedupe)"
-if jq -e '(.registry | type == "string")
-  and ([to_entries[] | select((.key | endswith(":registry")) and (.key != "registry")) | .value]
-       | index("https://npm.corp.invalid/") != null)' <<<"${json}" >/dev/null 2>&1; then
-  pass "scoped registry keys are enumerable from the effective config"
+npmrc ''
+if get_out="$(cd "${WORK}" && "${real_npm}" config get package-lock ignore-scripts --json 2>/dev/null)" \
+   && [[ -n "${get_out}" ]]; then
+  if jq -e 'type == "object"' <<<"${get_out}" >/dev/null 2>&1; then
+    fail "npm config get --json now emits JSON; revisit the oracle choice"
+  else
+    pass "npm config get --json is NOT JSON (why the oracle uses config list)"
+  fi
 else
-  fail "scoped registry enumeration failed: $(jq -c 'with_entries(select(.key | endswith(":registry")))' <<<"${json}" 2>/dev/null)"
-fi
-
-# The retired call shape, pinned so nobody reintroduces it: `config get`
-# emits key=value text and is NOT parseable as JSON.
-get_out="$(cd "${WORK}" && "${real_npm}" config get package-lock ignore-scripts --json --userconfig "${WORK}/isolated-npmrc" 2>/dev/null)"
-if jq -e 'type == "object"' <<<"${get_out}" >/dev/null 2>&1; then
-  fail "npm config get --json now emits JSON; revisit the oracle choice"
-else
-  pass "npm config get --json is NOT JSON (why the oracle uses config list)"
+  # Not vacuous: a failed or empty command must not be scored as a pass.
+  fail "npm config get probe produced no output; cannot assert the retired shape"
 fi
 
 printf '%s passed, %s failed\n' "${PASS}" "${FAIL}"

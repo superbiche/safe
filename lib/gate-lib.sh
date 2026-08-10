@@ -978,8 +978,12 @@ safe_gate_npm_lockdiff_effective_config() {
   fi
   if config_json="$(
     cd -- "${project_dir}" || exit 125
-    "${real_npm}" config list --json \
-      --package-lock-only --ignore-scripts --no-audit --no-fund "$@" 2>/dev/null
+    # Invariant flags FIRST (user argv may legitimately override them — that
+    # is what this probe measures), but `--json` LAST: it is the probe's own
+    # transport, and a user's ordinary `--json=false`/`--no-json` disabled it
+    # and made every such command unreadable (PR#70 delta-4 F2).
+    "${real_npm}" config list \
+      --package-lock-only --ignore-scripts --no-audit --no-fund "$@" --json 2>/dev/null
   )"; then
     :
   else
@@ -1019,7 +1023,7 @@ safe_gate_npm_lockdiff_registry_hosts() {
   fi
   if registry_json="$(
     cd -- "${project_dir}" || exit 125
-    "${real_npm}" config list --json "$@" 2>/dev/null
+    "${real_npm}" config list "$@" --json 2>/dev/null
   )"; then
     :
   else
@@ -1030,12 +1034,18 @@ safe_gate_npm_lockdiff_registry_hosts() {
   # literal "@scope:registry" query returns the placeholder, never the
   # project's real @foo:registry, so scoped private artifacts were
   # over-refused as remote (PR#70 delta-3 F4).
+  #
+  # The key must match npm's OWN scoped-registry grammar (@scope:registry).
+  # Accepting any key ending in ":registry" let a project's `.npmrc` line
+  # `not-a-scope:registry=https://attacker.invalid/` — which npm never
+  # consumes as a registry — grant that host registry provenance, so an
+  # arbitrary remote tarball looked registry-authoritative (delta-4 F4).
   if registry_urls="$(jq -er '
     if type != "object" or (.registry | type != "string")
     then error("invalid registry result")
     else [ .registry,
            ( to_entries[]
-             | select((.key | endswith(":registry")) and (.key != "registry"))
+             | select(.key | test("^@[^@:/]+:registry$"))
              | select(.value != null)
              | .value ) ]
       | map(if type == "string" then . else error("invalid registry result") end)
@@ -1058,11 +1068,14 @@ safe_gate_npm_lockdiff_registry_hosts() {
     authority="${registry_url#*://}"
     authority="${authority%%[/?#]*}"
     host="${authority##*@}"
-    if [[ -z "${host}" ]]; then
+    host="${host,,}"
+    # A nonblank but malformed authority is not a host: `https://:` yielded
+    # ":" and reached the allow-set (delta-4 F4). Require an ASCII host with
+    # an optional numeric port; anything else is unreadable config, refused.
+    if [[ ! "${host}" =~ ^[a-z0-9]([a-z0-9._-]*[a-z0-9.])?(:[0-9]+)?$ ]]; then
       safe_gate_err "safe: BLOCKED npm ${subcommand} — effective npm registry probe returned an unreadable result (audit-infrastructure breakage, not a package finding); fix npm configuration and retry — safe doctor; details: safe explain"
       return 100
     fi
-    host="${host,,}"
     for known in "${hosts[@]}"; do
       [[ "${known}" == "${host}" ]] && continue 2
     done

@@ -1437,7 +1437,10 @@ case_npm_lockdiff_effective_config_oracle() {
   NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}' \
     SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'REAL\tnpm\tconfig\tlist\t--json\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund\tdedupe' "$FUNCNAME" || return
+  # Invariant flags first (user argv may override them — that is the point of
+  # the mirror), but `--json` LAST so an ordinary user `--json=false` cannot
+  # disable the probe's own transport (delta-4 F2).
+  assert_log_contains $'REAL\tnpm\tconfig\tlist\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund\tdedupe\t--json' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
