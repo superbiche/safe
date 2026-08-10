@@ -2639,6 +2639,42 @@ case_mise_bare_shorthand_resolves_backend() {
   pass "$FUNCNAME"
 }
 
+case_mise_bare_config_pinned_names_the_spec() {
+  prepare_case "mise-bare-config-pinned-hint"
+  # A bare name the registry cannot resolve but the config pins under one
+  # backend is a spelling problem with one exact fix: the refusal names the
+  # configured spec. mise itself will not act on the bare form (it reads it
+  # as a registry/plugin shorthand), so resolving-and-proceeding would audit
+  # an artifact the delegate never touches — the hint is the only sound fix
+  # (inbox 2026-08-06 mise notes; live: @agentclientprotocol/…).
+  MISE_LS_JSON='{"npm:@scope/agent-tool": [{"version": "0.59.0", "requested_version": "0.59.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise upgrade @scope/agent-tool' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+  assert_err_contains_fragment "rerun with the full spec 'npm:@scope/agent-tool'" "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+
+  # Same hint on the install/use path — and the leading-@ scope must not be
+  # read as a version separator (splitting on the first @ emptied the name
+  # and misread the spec as malformed).
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:@scope/agent-tool": [{"version": "0.59.0", "requested_version": "0.59.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise use @scope/agent-tool' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+  assert_err_contains_fragment "rerun with the full spec 'npm:@scope/agent-tool'" "$FUNCNAME" || return
+
+  # Two backends pinning the same tool name: ambiguous — never guess a
+  # hint; the infrastructure framing stays.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:sametool": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}], "cargo:sametool": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise use sametool' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_mise_spec_canonicalization() {
   prepare_case "mise-spec-canonicalization"
   # Tool options are mise syntax, not package identity (review finding 2):
@@ -3856,6 +3892,7 @@ main() {
     case_mise_exec_gates_inner_command \
     case_mise_leading_flag_fails_closed \
     case_mise_bare_shorthand_resolves_backend \
+    case_mise_bare_config_pinned_names_the_spec \
     case_mise_spec_canonicalization \
     case_mise_preflight_fails_closed \
     case_mise_install_flags_are_modeled \

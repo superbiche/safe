@@ -2368,6 +2368,40 @@ safe_gate_mise_resolve_bare() {
   printf '%s\n' "$first"
 }
 
+# The unique configured backend spec whose tool part equals a bare name, if
+# any. mise does NOT act on the bare form of a backend tool (it reads it as
+# a registry/plugin shorthand), so this is hint material for a refusal —
+# never a resolution to audit against: an audit of the config's artifact
+# would vouch for a delegate that acts on a different identity, or on
+# nothing (inbox 2026-08-06 mise-registry note).
+safe_gate_mise_config_spec_for() {
+  local name="$1" key match=""
+  safe_gate_mise_load_rows || return 1
+  while IFS=$'\t' read -r key _; do
+    [[ -n "$key" && "$key" == *:* ]] || continue
+    [[ "${key#*:}" == "$name" ]] || continue
+    if [[ -z "$match" ]]; then
+      match="$key"
+    elif [[ "$key" != "$match" ]]; then
+      return 1
+    fi
+  done <<<"$SAFE_GATE_MISE_ROWS"
+  [[ -n "$match" ]] || return 1
+  printf '%s\n' "$match"
+}
+
+# Refuse an unresolvable bare name. When the config pins the tool under a
+# backend this is a spelling problem with one exact fix — name it. Only
+# without that hint does the refusal keep the infrastructure framing.
+safe_gate_mise_bare_refuse() {
+  local name="$1" fallback="$2" hint
+  if hint="$(safe_gate_mise_config_spec_for "$name")"; then
+    safe_gate_err "safe: BLOCKED mise — '${name}' is pinned in the mise config as '${hint}', but mise resolves bare names against its registry, not the config — rerun with the full spec '${hint}'; details: safe explain"
+    return 100
+  fi
+  safe_gate_mise_infra_refuse "$fallback"
+}
+
 # Source-relevant vars from mise's computed environment (project [env] can
 # set NPM_CONFIG_REGISTRY, PIP_INDEX_URL, ...). The audit must see the same
 # sources mise will install under, or a clean default-registry verdict
@@ -2727,7 +2761,14 @@ safe_gate_mise_check_spec() {
   fi
   if [[ "$stripped" != *:* ]]; then
     local bare_name="$stripped" bare_ver=""
-    if [[ "$stripped" == *@* ]]; then
+    # Leading-@ names are npm scopes, not version separators: split on the
+    # LAST @ only when one follows the scope (same rule as
+    # safe_gate_mise_spec_name; splitting on the first @ emptied the name
+    # and misread '@scope/tool' as malformed).
+    if [[ "$stripped" == @*/*@* ]]; then
+      bare_name="${stripped%@*}"
+      bare_ver="${stripped##*@}"
+    elif [[ "$stripped" == *@* && "$stripped" != @* ]]; then
       bare_name="${stripped%%@*}"
       bare_ver="${stripped#*@}"
     fi
@@ -2737,7 +2778,7 @@ safe_gate_mise_check_spec() {
     fi
     local eff
     if ! eff="$(safe_gate_mise_resolve_bare "$bare_name")"; then
-      safe_gate_mise_infra_refuse "cannot resolve '${bare_name}' to its backend (mise registry unavailable or unknown tool); use an explicit backend spec (npm:${bare_name})"
+      safe_gate_mise_bare_refuse "$bare_name" "cannot resolve '${bare_name}' to its backend (mise registry unavailable or unknown tool); use an explicit backend spec (npm:${bare_name})"
       return 100
     fi
     stripped="$eff"
@@ -3276,7 +3317,7 @@ safe_gate_mise_pin_upgrade_targets() {
     canon="$name"
     if [[ "$canon" != *:* ]]; then
       canon="$(safe_gate_mise_resolve_bare "$canon")" || {
-        safe_gate_mise_infra_refuse "cannot resolve '${name}' to its backend (mise registry unavailable or unknown tool); use an explicit backend spec"
+        safe_gate_mise_bare_refuse "$name" "cannot resolve '${name}' to its backend (mise registry unavailable or unknown tool); use an explicit backend spec"
         return 100
       }
     fi
