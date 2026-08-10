@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.11.1 - 2026-08-10
+
+- gate/mise: a bare tool name the registry cannot resolve but the mise
+  config pins under exactly one backend now refuses with the configured
+  spec to rerun (`rerun with the full spec 'npm:@scope/tool'`, preserving
+  the version and options the operator typed) instead of
+  misframing the spelling as safe/mise infrastructure breakage. mise itself
+  does not act on the bare form of a backend tool, so safe never resolves
+  and proceeds — the audit would vouch for an artifact the delegate never
+  touches. Ambiguous (two backends, one name) and truly unknown names keep
+  the infrastructure refusal.
+- gate/mise: a leading-@ npm scope in a bare spec is no longer read as a
+  version separator — `mise use @scope/tool` was refused as a malformed
+  tool spec; it now takes the normal resolution (and hint) path.
+
 ## 1.11.0 - 2026-08-04
 
 - Behavioral acknowledgement (operator FP lane, ruled 2026-08-04 after
