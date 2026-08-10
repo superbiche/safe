@@ -2393,10 +2393,16 @@ safe_gate_mise_config_spec_for() {
 # Refuse an unresolvable bare name. When the config pins the tool under a
 # backend this is a spelling problem with one exact fix — name it. Only
 # without that hint does the refusal keep the infrastructure framing.
+# The rerun hint must be behavior-preserving: only the name is replaced;
+# the version and options the operator typed stay (PR#69 review F1 — a
+# hint that drops '@1.2' or a platform selector points at a different
+# artifact than the one requested).
 safe_gate_mise_bare_refuse() {
-  local name="$1" fallback="$2" hint
+  local name="$1" orig="$2" fallback="$3" hint rerun
   if hint="$(safe_gate_mise_config_spec_for "$name")"; then
-    safe_gate_err "safe: BLOCKED mise — '${name}' is pinned in the mise config as '${hint}', but mise resolves bare names against its registry, not the config — rerun with the full spec '${hint}'; details: safe explain"
+    rerun="$hint"
+    [[ -n "$orig" && "$orig" == "$name"* ]] && rerun="${hint}${orig#"$name"}"
+    safe_gate_err "safe: BLOCKED mise — '${name}' is pinned in the mise config as '${hint}', but mise resolves bare names against its registry, not the config — rerun with the full spec '${rerun}'; details: safe explain"
     return 100
   fi
   safe_gate_mise_infra_refuse "$fallback"
@@ -2778,7 +2784,7 @@ safe_gate_mise_check_spec() {
     fi
     local eff
     if ! eff="$(safe_gate_mise_resolve_bare "$bare_name")"; then
-      safe_gate_mise_bare_refuse "$bare_name" "cannot resolve '${bare_name}' to its backend (mise registry unavailable or unknown tool); use an explicit backend spec (npm:${bare_name})"
+      safe_gate_mise_bare_refuse "$bare_name" "$spec" "cannot resolve '${bare_name}' to its backend (mise registry unavailable or unknown tool); use an explicit backend spec (npm:${bare_name})"
       return 100
     fi
     stripped="$eff"
@@ -3317,7 +3323,7 @@ safe_gate_mise_pin_upgrade_targets() {
     canon="$name"
     if [[ "$canon" != *:* ]]; then
       canon="$(safe_gate_mise_resolve_bare "$canon")" || {
-        safe_gate_mise_bare_refuse "$name" "cannot resolve '${name}' to its backend (mise registry unavailable or unknown tool); use an explicit backend spec"
+        safe_gate_mise_bare_refuse "$name" "$spec" "cannot resolve '${name}' to its backend (mise registry unavailable or unknown tool); use an explicit backend spec"
         return 100
       }
     fi

@@ -2672,6 +2672,64 @@ case_mise_bare_config_pinned_names_the_spec() {
   assert_status 100 "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
   assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+
+  # The rerun hint is behavior-preserving: the version and neutral options
+  # the operator typed survive the name replacement — a hint that drops
+  # '@1.2' or a platform selector points at a different artifact (PR#69
+  # review F1). Exactly one refusal line either way.
+  : > "${LOG_FILE}"; : > "${ERR_FILE}"
+  MISE_LS_JSON='{"npm:@scope/agent-tool": [{"version": "0.59.0", "requested_version": "0.59.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise use @scope/agent-tool@1.2' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment "rerun with the full spec 'npm:@scope/agent-tool@1.2'" "$FUNCNAME" || return
+  local hint_lines
+  hint_lines="$(grep -c 'safe:' "${ERR_FILE}" 2>/dev/null || printf '0')"
+  if [[ "${hint_lines}" != "1" ]]; then
+    printf 'expected exactly one safe: line, got %s:\n' "${hint_lines}" >&2
+    cat "${ERR_FILE}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:@scope/agent-tool": [{"version": "0.59.0", "requested_version": "0.59.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise use "@scope/agent-tool[platform=linux]@1.2"' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment "rerun with the full spec 'npm:@scope/agent-tool[platform=linux]@1.2'" "$FUNCNAME" || return
+
+  # Duplicate rows of the SAME key (several configured requests) are one
+  # logical match, not an ambiguity.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:@scope/agent-tool": [{"version": "0.59.0", "requested_version": "0.59.0", "installed": true}, {"version": "0.60.0", "requested_version": "0.60.0", "installed": false}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise use @scope/agent-tool' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment "rerun with the full spec 'npm:@scope/agent-tool'" "$FUNCNAME" || return
+
+  # A colonless (core-style) row never becomes hint material and does not
+  # spoil the unique backend match beside it.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"sametool": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}], "npm:sametool": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise use sametool' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment "rerun with the full spec 'npm:sametool'" "$FUNCNAME" || return
+
+  # Config enumeration failure: no hint, infrastructure framing, refusal.
+  : > "${LOG_FILE}"
+  MISE_LS_STATUS=1 MISE_LS_JSON='{"npm:@scope/agent-tool": [{"version": "0.59.0", "requested_version": "0.59.0", "installed": true}]}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise use @scope/agent-tool' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not a package verdict' "$FUNCNAME" || return
+
+  # Degenerate leading-@ shapes that now reach resolution instead of the
+  # malformed refusal: still refused, never delegated.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use @' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use @scope/' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 

@@ -4,7 +4,8 @@
 
 - gate/mise: a bare tool name the registry cannot resolve but the mise
   config pins under exactly one backend now refuses with the configured
-  spec to rerun (`rerun with the full spec 'npm:@scope/tool'`) instead of
+  spec to rerun (`rerun with the full spec 'npm:@scope/tool'`, preserving
+  the version and options the operator typed) instead of
   misframing the spelling as safe/mise infrastructure breakage. mise itself
   does not act on the bare form of a backend tool, so safe never resolves
   and proceeds — the audit would vouch for an artifact the delegate never
