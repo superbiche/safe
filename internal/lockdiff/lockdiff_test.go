@@ -159,3 +159,42 @@ func TestCompareSourceAndIntegrityChangesAreVisible(t *testing.T) {
 		t.Fatalf("Compare() = %#v, want %#v", got, want)
 	}
 }
+
+func TestLoadRegistryHostProvenance(t *testing.T) {
+	path := filepath.Join("testdata", "v3-registry-hosts.json")
+	tests := []struct {
+		name  string
+		hosts []string
+		want  []Package
+	}{
+		{
+			name:  "configured private registry matches case-insensitively",
+			hosts: []string{"REGISTRY.EXAMPLE.TEST"},
+			want: []Package{
+				{Name: "evil-alias", Version: "1.3.0", Source: "remote", Integrity: "sha512-evil"},
+				{Name: "real-npmjs", Version: "2.0.0", Source: "registry", Integrity: "sha512-npmjs"},
+				{Name: "real-private", Version: "1.0.0", Source: "registry", Integrity: "sha512-private"},
+			},
+		},
+		{
+			name: "non-matching HTTP source remains remote while npmjs magic stays registry",
+			want: []Package{
+				{Name: "evil-alias", Version: "1.3.0", Source: "remote", Integrity: "sha512-evil"},
+				{Name: "private-alias", Version: "1.0.0", Source: "remote", Integrity: "sha512-private"},
+				{Name: "real-npmjs", Version: "2.0.0", Source: "registry", Integrity: "sha512-npmjs"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := LoadWithRegistryHosts(path, tt.hosts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("LoadWithRegistryHosts() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}

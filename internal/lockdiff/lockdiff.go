@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -37,9 +38,16 @@ type Diff struct {
 	Changed []Change  `json:"changed"`
 }
 
-// Load reads registry package occurrences from an npm lockfileVersion 2 or 3
-// .packages map.
+// Load reads package occurrences using npm's default registry host.
 func Load(path string) ([]Package, error) {
+	return LoadWithRegistryHosts(path, nil)
+}
+
+// LoadWithRegistryHosts reads package occurrences from an npm lockfileVersion
+// 2 or 3 .packages map. A HTTP(S) descriptor is a registry artifact only when
+// its host is npm's default registry or one of registryHosts.
+func LoadWithRegistryHosts(path string, registryHosts []string) ([]Package, error) {
+	allowedRegistryHosts := registryHostSet(registryHosts)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read %q: %w", path, err)
@@ -115,7 +123,7 @@ func Load(path string) ([]Package, error) {
 		if err != nil || (integrityPresent && integrity == "") {
 			return nil, fmt.Errorf("parse %q: .packages[%q] integrity must be a non-empty string", path, key)
 		}
-		source := sourceClass(resolved, resolvedPresent)
+		source := sourceClass(resolved, resolvedPresent, allowedRegistryHosts)
 		// npm records the REAL registry identity in .name when the install
 		// path is an alias ("foo": "npm:real-pkg@1"). The audit must vouch
 		// for that identity only when the descriptor is a registry artifact.
@@ -163,7 +171,18 @@ func optionalString(raw json.RawMessage) (string, bool, error) {
 	return value, true, nil
 }
 
-func sourceClass(resolved string, present bool) string {
+func registryHostSet(registryHosts []string) map[string]struct{} {
+	hosts := map[string]struct{}{"registry.npmjs.org": {}}
+	for _, host := range registryHosts {
+		host = strings.ToLower(strings.TrimSpace(host))
+		if host != "" {
+			hosts[host] = struct{}{}
+		}
+	}
+	return hosts
+}
+
+func sourceClass(resolved string, present bool, registryHosts map[string]struct{}) string {
 	if !present {
 		return "unknown"
 	}
@@ -173,8 +192,18 @@ func sourceClass(resolved string, present bool) string {
 		return "git"
 	case strings.HasPrefix(lower, "file:"):
 		return "file"
-	case strings.HasPrefix(lower, "http://"), strings.HasPrefix(lower, "https://"):
+	case strings.HasPrefix(lower, "registry.npmjs.org/"):
+		// npm's lockfile format accepts this magic host-only default-registry
+		// descriptor. It has no URL scheme but remains a registry artifact.
 		return "registry"
+	case strings.HasPrefix(lower, "http://"), strings.HasPrefix(lower, "https://"):
+		parsed, err := url.Parse(resolved)
+		if err == nil {
+			if _, ok := registryHosts[strings.ToLower(parsed.Host)]; ok {
+				return "registry"
+			}
+		}
+		return "remote"
 	default:
 		// npm also permits hosted and other URL-like descriptors. Until a
 		// source-aware audit exists, every non-empty unrecognized descriptor

@@ -562,10 +562,12 @@ if ! (
   rm -f -- "$safe_core_build"
   die "safe-core build failed"
 fi
-install -m 0755 "$REPO_DIR/bin/safe" "$BIN_DIR/safe"
 install -m 0755 "$REPO_DIR/bin/safe-run" "$BIN_DIR/safe-run"
 install -m 0755 "$REPO_DIR/bin/safe-audit" "$BIN_DIR/safe-audit"
 install -m 0755 "$safe_core_build" "$BIN_DIR/safe-core"
+# Install the dispatcher last: a completed safe binary then has the matching
+# safe-core/safe-run/safe-audit siblings already written by this install run.
+install -m 0755 "$REPO_DIR/bin/safe" "$BIN_DIR/safe"
 rm -f -- "$safe_core_build"
 cleanup_legacy_install_artifacts
 info "installed binaries to $BIN_DIR"

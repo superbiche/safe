@@ -1,0 +1,8 @@
+{
+  "lockfileVersion": 3,
+  "packages": {
+    "node_modules/private-alias": {"name": "real-private", "version": "1.0.0", "resolved": "https://registry.example.test/real-private/-/real-private-1.0.0.tgz", "integrity": "sha512-private"},
+    "node_modules/evil-alias": {"name": "left-pad", "version": "1.3.0", "resolved": "https://example.invalid/evil.tgz", "integrity": "sha512-evil"},
+    "node_modules/npmjs-alias": {"name": "real-npmjs", "version": "2.0.0", "resolved": "registry.npmjs.org/real-npmjs/-/real-npmjs-2.0.0.tgz", "integrity": "sha512-npmjs"}
+  }
+}

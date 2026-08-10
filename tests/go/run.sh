@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Go unit/analysis coverage belongs in the aggregate suite, not only in the
-# install harness that happens to compile safe-core for wrapper cases.
-set -u
+# install harness that happens to compile safe-core for wrapper cases. Keep
+# explicit failure propagation: the aggregate runner must never turn a failed
+# Go check into a false-green final printf. Self-test with an exported failing
+# go function: this script and tests/run-all.sh must both return non-zero.
+set -eu
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 

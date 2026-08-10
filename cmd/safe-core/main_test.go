@@ -59,3 +59,25 @@ func TestRunWritesOnlyOneJSONDocument(t *testing.T) {
 		t.Fatalf("stdout=%q", stdout.String())
 	}
 }
+
+func TestRunRegistryHostOption(t *testing.T) {
+	dir := t.TempDir()
+	old := filepath.Join(dir, "old.json")
+	new := filepath.Join(dir, "new.json")
+	for path, contents := range map[string]string{
+		old: `{"lockfileVersion":3,"packages":{}}`,
+		new: `{"lockfileVersion":3,"packages":{"node_modules/alias":{"name":"private-pkg","version":"1.0.0","resolved":"https://registry.example.test/private-pkg/-/private-pkg-1.0.0.tgz"}}}`,
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if got := run([]string{"lockdiff", "--registry-host", "registry.example.test", old, new}, &stdout, &stderr); got != 0 {
+		t.Fatalf("run() = %d, stderr=%q", got, stderr.String())
+	}
+	if stdout.String() != "{\"schema\":1,\"added\":[{\"name\":\"private-pkg\",\"version\":\"1.0.0\",\"source\":\"registry\"}],\"removed\":[],\"changed\":[]}\n" {
+		t.Fatalf("stdout=%q", stdout.String())
+	}
+}
