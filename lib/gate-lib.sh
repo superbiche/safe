@@ -1007,6 +1007,43 @@ safe_gate_npm_lockdiff_effective_config() {
   return 0
 }
 
+# True when a lowercased authority is a host safe-core can compare against
+# Go's url.Host: a registered name or a bracketed IPv6 literal, with an
+# optional port in 1..65535.
+#
+# LC_ALL is pinned for the match: bash character ranges are locale-collated,
+# so under en_US.UTF-8 `[a-z]` matched accented letters and a Unicode host
+# was emitted raw instead of refused, while npm resolves it to punycode
+# (delta-5 F4).
+safe_gate_valid_registry_host() {
+  local host="$1" name="" port=""
+  local LC_ALL=C LC_COLLATE=C
+
+  if [[ "${host}" == \[*\] ]]; then
+    name="${host}"
+  elif [[ "${host}" == \[*\]:* ]]; then
+    name="${host%%\]:*}]"
+    port="${host##*\]:}"
+  elif [[ "${host}" == *:* ]]; then
+    name="${host%:*}"
+    port="${host##*:}"
+  else
+    name="${host}"
+  fi
+
+  if [[ "${name}" == \[*\] ]]; then
+    [[ "${name:1:${#name}-2}" =~ ^[0-9a-f:.]+$ ]] || return 1
+  else
+    [[ "${name}" =~ ^[0-9a-z]([0-9a-z._-]*[0-9a-z.])?$ ]] || return 1
+  fi
+
+  if [[ -n "${port}" ]]; then
+    [[ "${port}" =~ ^[0-9]+$ ]] || return 1
+    (( port >= 1 && port <= 65535 )) || return 1
+  fi
+  return 0
+}
+
 # Prints one lowercased host[:port] per effective npm registry. Registry
 # provenance cannot safely fall back to a guessed default: private registries
 # need their configured host to be audit-gated rather than over-refused.
@@ -1035,17 +1072,22 @@ safe_gate_npm_lockdiff_registry_hosts() {
   # project's real @foo:registry, so scoped private artifacts were
   # over-refused as remote (PR#70 delta-3 F4).
   #
-  # The key must match npm's OWN scoped-registry grammar (@scope:registry).
-  # Accepting any key ending in ":registry" let a project's `.npmrc` line
-  # `not-a-scope:registry=https://attacker.invalid/` — which npm never
-  # consumes as a registry — grant that host registry provenance, so an
-  # arbitrary remote tarball looked registry-authoritative (delta-4 F4).
-  if registry_urls="$(jq -er '
+  # The key must match a scope npm can actually SELECT, not merely one it
+  # stores. npm keeps any `<something>:registry` line in the effective config,
+  # but only resolves `@scope:registry` for a scope its package-name validator
+  # accepts — which requires the scope to survive URL-encoding unchanged.
+  # Accepting `not-a-scope:registry` (delta-4 F4), and then anything shaped
+  # `@<junk>:registry` such as `@a b:registry` or `@a#b:registry` (delta-5 F4),
+  # let a project's own .npmrc grant an arbitrary host registry provenance —
+  # making a remote tarball look registry-authoritative. This class is npm's
+  # unreserved set, so a legal scope is never over-refused.
+  local scope_pat=$'^@[A-Za-z0-9!~*\'()._-]+:registry$'
+  if registry_urls="$(jq -er --arg scope_pat "${scope_pat}" '
     if type != "object" or (.registry | type != "string")
     then error("invalid registry result")
     else [ .registry,
            ( to_entries[]
-             | select(.key | test("^@[^@:/]+:registry$"))
+             | select(.key | test($scope_pat))
              | select(.value != null)
              | .value ) ]
       | map(if type == "string" then . else error("invalid registry result") end)
@@ -1070,9 +1112,11 @@ safe_gate_npm_lockdiff_registry_hosts() {
     host="${authority##*@}"
     host="${host,,}"
     # A nonblank but malformed authority is not a host: `https://:` yielded
-    # ":" and reached the allow-set (delta-4 F4). Require an ASCII host with
-    # an optional numeric port; anything else is unreadable config, refused.
-    if [[ ! "${host}" =~ ^[a-z0-9]([a-z0-9._-]*[a-z0-9.])?(:[0-9]+)?$ ]]; then
+    # ":" and reached the allow-set (delta-4 F4). The check must equal what
+    # Go's url.Host will hold on the safe-core side, so bracketed IPv6 is
+    # accepted verbatim and a port outside 1..65535 is not a port at all
+    # (delta-5 F4).
+    if ! safe_gate_valid_registry_host "${host}"; then
       safe_gate_err "safe: BLOCKED npm ${subcommand} — effective npm registry probe returned an unreadable result (audit-infrastructure breakage, not a package finding); fix npm configuration and retry — safe doctor; details: safe explain"
       return 100
     fi

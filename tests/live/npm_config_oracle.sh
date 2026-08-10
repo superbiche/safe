@@ -118,16 +118,44 @@ else
   fail "scoped registry enumeration missing: ${out//$'\n'/,}"
 fi
 
-# npm consumes ONLY its @scope:registry form. Accepting any key ending in
-# ":registry" let project metadata grant an arbitrary host registry
-# provenance, so a remote tarball looked registry-authoritative (delta-4 F4).
-npmrc $'registry=https://registry.npmjs.org/\nnot-a-scope:registry=https://attacker.invalid/\n'
-out="$(hosts_out dedupe)"
-if grep -qx 'attacker.invalid' <<<"${out}"; then
-  fail "a non-scoped ':registry' key granted registry provenance to attacker.invalid"
-else
-  pass "non-scoped ':registry' keys cannot grant registry provenance"
-fi
+# npm STORES any `<x>:registry` line but only SELECTS a scope its package-name
+# validator accepts. Trusting a stored-but-unselectable key let a project's own
+# .npmrc grant an arbitrary host registry provenance, so a remote tarball looked
+# registry-authoritative — first via `not-a-scope:` (delta-4 F4), then via
+# `@<junk>:` spellings npm keeps but can never resolve (delta-5 F4).
+for bad_key in 'not-a-scope' '@a b' '@a#b' '@a%20b' '@a/b' '@a:b' '@'; do
+  npmrc "registry=https://registry.npmjs.org/"$'\n'"${bad_key}:registry=https://attacker.invalid/"$'\n'
+  if grep -qx 'attacker.invalid' <<<"$(hosts_out dedupe)"; then
+    fail "unselectable key '${bad_key}:registry' granted registry provenance to attacker.invalid"
+  else
+    pass "unselectable key '${bad_key}:registry' cannot grant registry provenance"
+  fi
+done
+
+# ...while every scope npm CAN select keeps working, including uppercase.
+npmrc $'registry=https://registry.npmjs.org/\n@Corp:registry=https://npm.up.invalid/\n'
+grep -qx 'npm.up.invalid' <<<"$(hosts_out dedupe)" \
+  && pass "an uppercase scope npm selects is still trusted" \
+  || fail "an uppercase scope npm selects was over-refused"
+
+# The host must equal what Go's url.Host holds on the safe-core side.
+npmrc 'registry=http://[::1]:4873/'
+[[ "$(hosts_out dedupe)" == '[::1]:4873' ]] \
+  && pass "a bracketed IPv6 registry is preserved verbatim as a host" \
+  || fail "IPv6 registry host was mangled or refused: $(hosts_out dedupe)"
+
+npmrc 'registry=https://example.com:99999/'
+[[ -z "$(hosts_out dedupe)" ]] \
+  && pass "a port outside 1..65535 is refused, not passed as a host" \
+  || fail "invalid port accepted: $(hosts_out dedupe)"
+
+# Bash character ranges are locale-collated: under en_US.UTF-8 `[a-z]` matched
+# accented letters and a Unicode host was emitted raw, while npm resolves such
+# a registry to punycode (delta-5 F4).
+npmrc 'registry=https://bücher.example/'
+[[ -z "$(LC_ALL=en_US.UTF-8 hosts_out dedupe)" ]] \
+  && pass "a non-ASCII registry host is refused under a UTF-8 locale" \
+  || fail "non-ASCII host leaked under en_US.UTF-8: $(LC_ALL=en_US.UTF-8 hosts_out dedupe)"
 
 npmrc 'registry=https://:'
 if [[ -z "$(hosts_out dedupe)" ]]; then
