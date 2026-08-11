@@ -47,6 +47,7 @@ SAFE_GATE_SUBCMD_IDX=0
 SAFE_GATE_SUBCMD_BADFLAG=""
 SAFE_GATE_GVAL=""
 SAFE_GATE_GBOOL=""
+SAFE_GATE_TOOL=""
 SAFE_GATE_NPM_USERCONFIG=""
 SAFE_GATE_NPM_GLOBALCONFIG=""
 SAFE_GATE_ENV_SCRUB=()
@@ -470,9 +471,173 @@ safe_gate_scan_target_flags() {
   done
 }
 
+# npm 12's lib/utils/cmd-list.js command and alias map. The aliases are a
+# dispatch surface, not just documentation: npm's generic abbreviation table
+# includes their KEYS, then dereferences the winning alias. Keep this snapshot
+# complete so an exact non-gated alias (for example `c` -> config) wins before
+# any overlapping gated prefix (for example `ci`). The live oracle compares
+# both arrays with the npm that safe's real delegate runs.
+SAFE_GATE_NPM_COMMANDS=(
+  access approve-scripts audit bugs cache ci completion config dedupe
+  deny-scripts deprecate diff dist-tag docs doctor edit exec explain explore
+  find-dupes fund get help help-search init install install-ci-test
+  install-scripts install-test link ll login logout ls org outdated owner
+  pack patch ping pkg prefix profile prune publish query rebuild repo restart
+  root run sbom search set stage start stop team test token trust undeprecate
+  uninstall unpublish update version view whoami
+)
+SAFE_GATE_NPM_ALIASES=(
+  author=owner home=docs issues=bugs info=view show=view find=search
+  add=install unlink=uninstall remove=uninstall rm=uninstall r=uninstall
+  un=uninstall rb=rebuild list=ls ln=link create=init i=install
+  it=install-test cit=install-ci-test u=update up=update c=config s=search
+  se=search tst=test t=test ddp=dedupe v=view run-script=run
+  clean-install=ci clean-install-test=install-ci-test x=exec why=explain
+  la=ll verison=version ic=ci innit=init in=install ins=install inst=install
+  insta=install instal=install isnt=install isnta=install isntal=install
+  isntall=install install-clean=ci isntall-clean=ci hlep=help
+  dist-tags=dist-tag upgrade=update udpate=update rum=run sit=install-ci-test
+  urn=run ogr=org
+)
+
+# Emits the npm 12 dispatch snapshot as `command<TAB>name` and
+# `alias<TAB>key<TAB>target` records for the hermetic and live drift guards.
+safe_gate_npm_dispatch_snapshot() {
+  local command pair
+  for command in "${SAFE_GATE_NPM_COMMANDS[@]}"; do
+    printf 'command\t%s\n' "${command}"
+  done
+  for pair in "${SAFE_GATE_NPM_ALIASES[@]}"; do
+    printf 'alias\t%s\t%s\n' "${pair%%=*}" "${pair#*=}"
+  done
+}
+
+# Emits the target of an exact npm alias map lookup. A nonzero return means the
+# token is not an alias key; callers must preserve that distinction because an
+# exact non-gated alias takes priority over a possible prefix match.
+safe_gate_npm_alias_target() {
+  local token="$1" pair
+  for pair in "${SAFE_GATE_NPM_ALIASES[@]}"; do
+    [[ "${pair%%=*}" == "${token}" ]] || continue
+    printf '%s' "${pair#*=}"
+    return 0
+  done
+  return 1
+}
+
+# npm currently maps aliases directly to canonical commands, but retain a
+# bounded dereference loop so the snapshot remains correct if a future map
+# chains aliases. A cycle is a broken snapshot, not a passthrough grant.
+safe_gate_npm_deref_alias() {
+  local target="$1" next i
+  for (( i=0; i<${#SAFE_GATE_NPM_ALIASES[@]}; i++ )); do
+    if next="$(safe_gate_npm_alias_target "${target}")"; then
+      target="${next}"
+    else
+      printf '%s' "${target}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Emits a canonical gated lane for an npm command target. `ci` is deliberately
+# separate because it takes no package argv; lockdiff is stricter than the
+# ordinary install lane and retains its existing projection API.
+safe_gate_npm_target_class() {
+  case "$1" in
+    install|install-test) printf '%s' install ;;
+    ci|install-ci-test) printf '%s' ci ;;
+    update) printf '%s' update ;;
+    exec) printf '%s' exec ;;
+    dedupe|prune) printf '%s' lockdiff ;;
+    *) return 1 ;;
+  esac
+}
+
+# Classifies npm's first command token without rewriting it. Exact aliases are
+# resolved first over the FULL alias map, preserving npm's own priority (for
+# example `c` remains config rather than a ci prefix). For non-alias tokens,
+# npm accepts a two-character-or-longer unique prefix of canonical commands
+# and alias keys. We conservatively route any such gated candidate and delegate
+# the untouched token so npm remains the authority on genuine ambiguity.
+#
+# Multiple gated candidates use this precedence: ci (no package argv), then
+# lockdiff (projection), then install, update, and exec. Today collisions are
+# confined to equivalent or stricter lanes; the ordering keeps a new collision
+# from becoming a passthrough.
+safe_gate_npm_subcommand_class() {
+  local token="$1" target="" candidate="" pair="" class=""
+
+  if target="$(safe_gate_npm_alias_target "${token}")"; then
+    target="$(safe_gate_npm_deref_alias "${target}")" || return 1
+    safe_gate_npm_target_class "${target}"
+    return $?
+  fi
+
+  if safe_gate_npm_target_class "${token}"; then
+    return 0
+  fi
+
+  (( ${#token} >= 2 )) || return 1
+  for class in ci lockdiff install update exec; do
+    for candidate in "${SAFE_GATE_NPM_COMMANDS[@]}"; do
+      [[ "${candidate}" == "${token}"* ]] || continue
+      target="$(safe_gate_npm_deref_alias "${candidate}")" || return 1
+      [[ "$(safe_gate_npm_target_class "${target}")" == "${class}" ]] && {
+        printf '%s' "${class}"
+        return 0
+      }
+    done
+    for pair in "${SAFE_GATE_NPM_ALIASES[@]}"; do
+      candidate="${pair%%=*}"
+      [[ "${candidate}" == "${token}"* ]] || continue
+      target="$(safe_gate_npm_deref_alias "${candidate}")" || return 1
+      [[ "$(safe_gate_npm_target_class "${target}")" == "${class}" ]] && {
+        printf '%s' "${class}"
+        return 0
+      }
+    done
+  done
+  return 1
+}
+
+# Composer has explicit aliases in addition to Symfony Console's command
+# prefixes. The aliases must win first: `r` is require even though `re` is an
+# ambiguity with remove/reinstall. Prefixes intentionally over-match
+# ambiguity: the gate audits, delegates the original token, and Composer emits
+# its own command error. `rei*` and `rem*` do not prefix a gated family.
+safe_gate_composer_subcommand_class() {
+  local token="$1"
+  case "${token}" in
+    i|install) printf '%s' install; return 0 ;;
+    u|upgrade|update) printf '%s' update; return 0 ;;
+    r|require) printf '%s' require; return 0 ;;
+  esac
+  [[ -n "${token}" ]] || return 1
+  if [[ "install" == "${token}"* ]]; then
+    printf '%s' install
+  elif [[ "update" == "${token}"* ]]; then
+    printf '%s' update
+  elif [[ "require" == "${token}"* ]]; then
+    printf '%s' require
+  else
+    return 1
+  fi
+}
+
 # Update-family subcommands resolve in-range instead of to the dist-tag; the
-# audit needs to know which semantics apply to resolve the real target.
+# audit needs to know which semantics apply to resolve the real target. npm's
+# widened dispatch must use its single classifier; other tools retain their
+# existing literal routing semantics.
 safe_gate_audit_op() {
+  local npm_class=""
+  if [[ "${SAFE_GATE_TOOL:-}" == "npm" ]]; then
+    npm_class="$(safe_gate_npm_subcommand_class "${SAFE_GATE_SUBCMD:-}")" || npm_class=""
+    [[ "${npm_class}" == "update" ]] && { printf '%s' update; return 0; }
+    printf '%s' install
+    return 0
+  fi
   case "${SAFE_GATE_SUBCMD:-}" in
     update|u|up|upgrade|udpate) printf '%s' "update" ;;
     *) printf '%s' "install" ;;
@@ -953,15 +1118,13 @@ safe_gate_npm_lockfile_name() {
   return 1
 }
 
-# npm accepts unique command prefixes. Keep this narrow to the new lock-diff
-# lane: install/update aliases have their own pre-existing routing contract.
+# Lock-diff remains a separate API/caller surface, but classification is shared
+# with every npm route so aliases and two-character prefixes (for example dd)
+# cannot bypass the projection.
 safe_gate_npm_lockdiff_subcommand() {
-  local token="$1"
-  case "${token}" in
-    ddp|dedupe|prune) return 0 ;;
-  esac
-  (( ${#token} >= 3 )) || return 1
-  [[ "dedupe" == "${token}"* || "prune" == "${token}"* ]]
+  local class=""
+  class="$(safe_gate_npm_subcommand_class "$1")" || return 1
+  [[ "${class}" == "lockdiff" ]]
 }
 
 # A bare -- terminates npm's option parsing, so it neutralizes the projection
@@ -2111,6 +2274,7 @@ safe_gate_global_flags() {
 # fail-closed refusal and return 100 so the caller can `|| return $?`.
 safe_gate_route() {
   local tool="$1"; shift
+  SAFE_GATE_TOOL="${tool}"
   safe_gate_global_flags "${tool}"
   safe_gate_locate_subcommand "${SAFE_GATE_GVAL}" "${SAFE_GATE_GBOOL}" "$@"
   case $? in
@@ -2268,6 +2432,10 @@ safe_gate_npm_like() {
   # installer runs (delta-4 finding F4: selectors key off the installer).
   [[ "${tool}" == "bun" ]] && SAFE_GATE_INSTALLER="bun"
   local subcommand="${SAFE_GATE_SUBCMD}"
+  local npm_class=""
+  if [[ "${tool}" == "npm" ]]; then
+    npm_class="$(safe_gate_npm_subcommand_class "${subcommand}")" || npm_class=""
+  fi
   local npm_lockdiff_lane=1
   if [[ "${tool}" == "npm" ]] && safe_gate_npm_lockdiff_subcommand "${subcommand}"; then
     npm_lockdiff_lane=0
@@ -2298,18 +2466,19 @@ safe_gate_npm_like() {
   local raw_package
   local project_present=1
 
+  if [[ "${tool}" == "npm" && "${npm_class}" == "exec" ]]; then
+    # npm's config parser is greedy: --package is honored even after the
+    # command, so post_positional=1.
+    safe_gate_exec_gate "npm ${subcommand}" npm 1 1 \
+      '--package|-p' '' \
+      '-c|--call|-w|--workspace|--cache|--prefix|--registry|--userconfig|--globalconfig|--loglevel|--script-shell|--node-options|--omit|--include' \
+      '-y|--yes|--no|--offline|--prefer-offline|--prefer-online|--ignore-existing|--foreground-scripts|--silent|--quiet|--workspaces|--include-workspace-root' \
+      '' \
+      "${rest[@]}" || return $?
+    safe_gate_exec_real "${tool}" "$@"
+  fi
+
   case "${tool}:${subcommand}" in
-    npm:exec|npm:x)
-      # npm's config parser is greedy: --package is honored even after the
-      # command, so post_positional=1.
-      safe_gate_exec_gate "npm ${subcommand}" npm 1 1 \
-        '--package|-p' '' \
-        '-c|--call|-w|--workspace|--cache|--prefix|--registry|--userconfig|--globalconfig|--loglevel|--script-shell|--node-options|--omit|--include' \
-        '-y|--yes|--no|--offline|--prefer-offline|--prefer-online|--ignore-existing|--foreground-scripts|--silent|--quiet|--workspaces|--include-workspace-root' \
-        '' \
-        "${rest[@]}" || return $?
-      safe_gate_exec_real "${tool}" "$@"
-      ;;
     bun:x)
       safe_gate_exec_gate "bun x" npm 1 0 \
         '--package|-p' '' '' \
@@ -2329,10 +2498,17 @@ safe_gate_npm_like() {
       ;;
   esac
 
-  case "${subcommand}" in
-    install|i|it|install-test|add|ci|update|u|up|upgrade|udpate|dedupe|ddp|prune) ;;
-    *) (( npm_lockdiff_lane == 0 )) || safe_gate_exec_real "${tool}" "$@" ;;
-  esac
+  if [[ "${tool}" == "npm" ]]; then
+    case "${npm_class}" in
+      install|ci|update|lockdiff) ;;
+      *) (( npm_lockdiff_lane == 0 )) || safe_gate_exec_real "${tool}" "$@" ;;
+    esac
+  else
+    case "${subcommand}" in
+      install|i|it|install-test|add|ci|update|u|up|upgrade|udpate|dedupe|ddp|prune) ;;
+      *) (( npm_lockdiff_lane == 0 )) || safe_gate_exec_real "${tool}" "$@" ;;
+    esac
+  fi
 
   if [[ "${tool}" == "npm" ]]; then
     # Script-policy argv on a gated install could widen or replace the
@@ -2409,6 +2585,14 @@ safe_gate_npm_like() {
 
   if (( project_present == 0 )); then
     safe_gate_scan_project || return $?
+  fi
+
+  # npm's ci and install-ci-test families do not accept package argv. Their
+  # aliases/prefixes still receive the project scan above, while leaving the
+  # original command token for npm to validate and execute.
+  if [[ "${tool}" == "npm" && "${npm_class}" == "ci" ]]; then
+    safe_gate_exec_real "${tool}" "$@"
+    return $?
   fi
 
   safe_gate_collect raw "$("${parser}" "${rest[@]}")"
@@ -2764,15 +2948,18 @@ safe_gate_composer() {
   local first="${SAFE_GATE_SUBCMD}"
   local subidx=$SAFE_GATE_SUBCMD_IDX
   local second="${@:subidx+1:1}"
+  local first_class="" second_class=""
+  first_class="$(safe_gate_composer_subcommand_class "${first}")" || first_class=""
+  second_class="$(safe_gate_composer_subcommand_class "${second}")" || second_class=""
   local -a packages=()
 
-  if [[ "${first}" != "global" || "${second}" != "require" ]]; then
-    if [[ "${first}" == "install" || "${first}" == "update" || "${first}" == "require" ]]; then
+  if [[ "${first}" != "global" || "${second_class}" != "require" ]]; then
+    if [[ -n "${first_class}" ]]; then
       if safe_gate_composer_project_present; then
         safe_gate_scan_project || return $?
       fi
 
-      if [[ "${first}" == "require" ]]; then
+      if [[ "${first_class}" == "require" ]]; then
         safe_gate_collect packages "$(safe_gate_composer_packages "${@:subidx+1}")"
         if (( ${#packages[@]} > 0 )); then
           safe_gate_check_many composer "${packages[@]}" || return $?

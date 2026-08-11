@@ -242,6 +242,57 @@ case_gated_tool_lists_stay_in_sync() {
   fi
 }
 
+function_block() {
+  local name="$1"
+  awk -v start="${name}() {" '
+    $0 == start { in_block=1; print; next }
+    in_block && /^[A-Za-z_][A-Za-z0-9_]*\(\) \{$/ { exit }
+    in_block { print }
+  ' "$ROOT/lib/gate-lib.sh"
+}
+
+case_npm_classifier_snapshot_routes_every_alias() {
+  # shellcheck source=/dev/null
+  source "$ROOT/lib/gate-lib.sh"
+  local kind key target expected actual bad=""
+  while IFS=$'\t' read -r kind key target; do
+    if [[ "$kind" == "command" ]]; then
+      target="$key"
+    else
+      target="$(safe_gate_npm_deref_alias "$target")" || {
+        bad="${bad} ${key}(broken-alias)"
+        continue
+      }
+    fi
+    expected="$(safe_gate_npm_target_class "$target")" || expected=""
+    actual="$(safe_gate_npm_subcommand_class "$key")" || actual=""
+    [[ "$actual" == "$expected" ]] || bad="${bad} ${key}=${actual:-passthrough}/${expected:-passthrough}"
+  done < <(safe_gate_npm_dispatch_snapshot)
+
+  if [[ -z "$bad" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (classifier drift:${bad})"
+  fi
+}
+
+case_npm_literal_sites_consult_the_classifier() {
+  local audit_op lockdiff npm_like
+  audit_op="$(function_block safe_gate_audit_op)"
+  lockdiff="$(function_block safe_gate_npm_lockdiff_subcommand)"
+  npm_like="$(function_block safe_gate_npm_like)"
+
+  if [[ "$audit_op" == *safe_gate_npm_subcommand_class* &&
+        "$lockdiff" == *safe_gate_npm_subcommand_class* &&
+        "$npm_like" == *'npm_class="$(safe_gate_npm_subcommand_class'* &&
+        "$npm_like" == *'case "${npm_class}" in'* &&
+        "$npm_like" != *'npm:exec|npm:x'* ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (a former npm literal route bypasses the classifier)"
+  fi
+}
+
 case_contract_is_valid_json
 case_contract_has_every_required_key
 case_every_exit_code_tells_an_agent_what_to_do
@@ -256,6 +307,8 @@ case_contract_never_suggests_latest
 case_version_constant_matches_version_file
 case_gated_tools_match_the_installed_wrapper_set
 case_gated_tool_lists_stay_in_sync
+case_npm_classifier_snapshot_routes_every_alias
+case_npm_literal_sites_consult_the_classifier
 
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

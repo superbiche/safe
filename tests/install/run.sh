@@ -1258,6 +1258,160 @@ case_update_family_gates() {
   pass "$FUNCNAME"
 }
 
+case_npm_abbreviation_classifier_gates_and_preserves_argv() {
+  prepare_case "npm-abbreviation-classifier"
+
+  # `inst` is a hardcoded npm alias. The check and the real delegate must both
+  # see the operation, while the delegate retains the operator's spelling.
+  SAFE_INSTALL_TEST_SCRIPT='npm inst okpkg' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tinst\tokpkg' "$FUNCNAME" || return
+
+  # The block canary proves an abbreviated install cannot delegate unaudited.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm inst blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm\tinst\tblockme' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm updat okpkg' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg\t--ecosystem\tnpm\t--gate\tinstall\t--op\tupdate' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tupdat\tokpkg' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm exe blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm\texe\tblockme' "$FUNCNAME" || return
+
+  # `in` is a short explicit install alias, while `d` is not a length-one
+  # match and stays a passthrough for npm to reject or handle itself.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm in okpkg' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tin\tokpkg' "$FUNCNAME" || return
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm d blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\td\tblockme' "$FUNCNAME" || return
+
+  pass "$FUNCNAME"
+}
+
+case_npm_alias_prefixes_and_priority() {
+  prepare_case "npm-alias-prefixes-and-priority"
+  touch "${WORK_DIR}/package.json"
+
+  # Generic npm prefixes include alias keys: `ad` -> add -> install.
+  SAFE_INSTALL_TEST_SCRIPT='npm ad okpkg' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tad\tokpkg' "$FUNCNAME" || return
+
+  # install-clean is itself an alias. Its prefix must take the no-package ci
+  # lane, scan the project, and preserve the original token for npm.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm install-cl' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tinstall-cl' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'AUDIT\tcheck' "$FUNCNAME" || return
+
+  for token in cit clean-install isntall; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="npm ${token}" run_zsh
+    assert_status 0 "$FUNCNAME" || return
+    assert_project_scan_logged "$FUNCNAME" || return
+    assert_log_contains $'REAL\tnpm\t'"${token}" "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'AUDIT\tcheck' "$FUNCNAME" || return
+  done
+
+  # Exact aliases outrank a gated prefix: c -> config and un -> uninstall.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm c get registry' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tc\tget\tregistry' "$FUNCNAME" || return
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm un blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tun\tblockme' "$FUNCNAME" || return
+
+  # Ambiguous npm spellings may be conservatively routed, but safe must keep
+  # their original argv so the real npm command remains the error authority.
+  for token in is ex cl; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_REAL_STATUS=1 SAFE_INSTALL_TEST_SCRIPT="npm ${token}" run_zsh
+    assert_status 1 "$FUNCNAME" || return
+    assert_log_contains $'REAL\tnpm\t'"${token}" "$FUNCNAME" || return
+  done
+  unset SAFE_INSTALL_REAL_STATUS
+
+  pass "$FUNCNAME"
+}
+
+case_non_npm_abbreviations_stay_passthrough() {
+  prepare_case "non-npm-abbreviations-passthrough"
+  SAFE_INSTALL_TEST_SCRIPT='pnpm inst blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tpnpm\tinst\tblockme' "$FUNCNAME" || return
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='yarn ad blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tyarn\tad\tblockme' "$FUNCNAME" || return
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='bun inst blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tbun\tinst\tblockme' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_composer_abbreviation_classifier_routes() {
+  prepare_case "composer-abbreviation-classifier"
+  touch "${WORK_DIR}/composer.json"
+
+  for token in u up i ins; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer ${token}" run_zsh
+    assert_status 0 "$FUNCNAME" || return
+    assert_project_scan_logged "$FUNCNAME" || return
+    assert_log_contains $'REAL\tcomposer\t'"${token}" "$FUNCNAME" || return
+  done
+
+  for token in r req requ; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer ${token} vendor/okpkg:^1" run_zsh
+    assert_status 0 "$FUNCNAME" || return
+    assert_log_contains $'AUDIT\tcheck\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+    assert_log_contains $'REAL\tcomposer\t'"${token}"$'\tvendor/okpkg:^1' "$FUNCNAME" || return
+  done
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer global requ vendor/okpkg:^1' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\tglobal\trequ\tvendor/okpkg:^1' "$FUNCNAME" || return
+
+  for token in rei rem; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer ${token} vendor/blockme" run_zsh
+    assert_status 0 "$FUNCNAME" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+    assert_log_contains $'REAL\tcomposer\t'"${token}"$'\tvendor/blockme' "$FUNCNAME" || return
+  done
+
+  pass "$FUNCNAME"
+}
+
 case_npm_dedupe_lockdiff_empty_delegates_without_scan() {
   skip_lockdiff_case "$FUNCNAME" || return
   prepare_lockdiff_case "npm-dedupe-lockdiff-empty"
@@ -1354,7 +1508,7 @@ case_npm_lockdiff_prefixes_route_to_projection() {
   printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
   printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
   local token
-  for token in ded dedu dedup pru prun ddp; do
+  for token in dd ded dedu dedup pru prun ddp; do
     : > "${LOG_FILE}"
     NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/blockme":{"version":"2.0.0","resolved":"https://registry.npmjs.org/blockme/-/blockme-2.0.0.tgz","integrity":"sha512-blockme"}}}' \
       SAFE_INSTALL_TEST_SCRIPT="npm ${token}" run_zsh
@@ -1509,7 +1663,7 @@ STUB
   cat > "${BIN_DIR}/safe-core" <<'STUB'
 #!/usr/bin/env bash
 case "${1:-}" in
-  --version) printf '1.14.0\n' ;;
+  --version) printf '1.15.0\n' ;;
   lockdiff) printf '{"schema":1}\n' ;;
 esac
 STUB
@@ -1528,7 +1682,7 @@ STUB
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
   assert_status 100 "$FUNCNAME" || return
-  assert_err_contains_fragment 'safe-core version 0.0.0 does not match safe 1.14.0' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe-core version 0.0.0 does not match safe 1.15.0' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'PROJECTION\tnpm' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -1864,12 +2018,12 @@ case_install_idempotent_no_wrappers() {
   assert_count 1 'fpath=("$HOME/.local/share/zsh/site-functions" $fpath)' "${HOME_DIR}/.zshrc" "$FUNCNAME" || return
   [[ -f "${HOME_DIR}/.local/share/zsh/site-functions/_safe" ]] || { fail "$FUNCNAME"; return; }
   [[ -x "${HOME_DIR}/.local/bin/safe-core" ]] || { fail "$FUNCNAME"; return; }
-  [[ "$("${HOME_DIR}/.local/bin/safe-core" --version)" == "1.14.0" ]] || { fail "$FUNCNAME"; return; }
+  [[ "$("${HOME_DIR}/.local/bin/safe-core" --version)" == "1.15.0" ]] || { fail "$FUNCNAME"; return; }
   local doctor_json
   doctor_json="$(HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" \
     "${HOME_DIR}/.local/bin/safe" doctor --json)" || { fail "$FUNCNAME"; return; }
   jq -e '.dependencies.core.safe_core.present == true
-    and .dependencies.core.safe_core.version == "1.14.0"
+    and .dependencies.core.safe_core.version == "1.15.0"
     and .environment.safe_core.version_matches == true
     and .environment.safe_core.warning == null' <<<"${doctor_json}" >/dev/null || { fail "$FUNCNAME"; return; }
   # The suite core is release-versioned for gate-time parity. Replace the
@@ -4563,6 +4717,10 @@ main() {
     case_go_run_module_gates \
     case_go_run_value_flag_does_not_hide_module \
     case_update_family_gates \
+    case_npm_abbreviation_classifier_gates_and_preserves_argv \
+    case_npm_alias_prefixes_and_priority \
+    case_non_npm_abbreviations_stay_passthrough \
+    case_composer_abbreviation_classifier_routes \
     case_npm_dedupe_lockdiff_empty_delegates_without_scan \
     case_npm_lockdiff_absent_node_modules_refuses \
     case_npm_lockdiff_projection_sees_project_npmrc \

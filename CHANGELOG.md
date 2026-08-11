@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- npm and Composer gate routing now covers their install, update, ci/require,
+  exec, and npm lock-diff command aliases and abbreviations before delegation.
+  npm uses a checked-in full command/alias snapshot with exact alias priority,
+  so non-fetch aliases such as `c` and `un` stay passthrough while abbreviated
+  fetch routes (including alias prefixes such as `ad` and `dd`) are audited.
+  Composer keeps its original token for Symfony Console to settle ambiguity.
+
 - Fresh releases whose initial Socket score times out now receive one bounded
   patience retry (`install.socket.fresh_scan_budget_seconds`, default 90s).
   If Socket still has no score, receipts record `PENDING`; a clean GuardDog,
