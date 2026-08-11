@@ -38,3 +38,46 @@ genuinely ambiguous prefixes still fail inside npm itself (fail closed).
 Sweep the other gated tools for prefix/abbreviation dispatch semantics
 (pnpm, yarn, bun, pip, uv, cargo, composer, mise) before assuming npm is the
 only one.
+
+## Resolution (2026-08-12)
+
+Closed by PR #74 (safe 1.15.0). Live probes showed the hole was wider than
+the note: npm dispatches via its hardcoded alias map (in/inst/isntall typo
+aliases, clean-install/ic, the install-ci-test/cit family) PLUS generic
+prefixes over commands AND alias keys (updat, exe, ad, dd) AND camelCase
+normalization (installTest, cleanInstall); composer's symfony console
+abbreviates the same way including the g..globa proxy prefixes.
+
+npm: one classifier per tool consulted by every former literal site (gated
+membership, exec dispatch, update-op selection, lockdiff) — exact alias
+lookup first over the full npm map (alias priority: `c`→config, `un`→
+uninstall stay passthrough), then len>=2 prefixes over canonical names and
+gated alias keys, camelCase normalized to kebab before lookup; the delegate
+always keeps the original token. Drift-guarded hermetically and by a live
+oracle against the installed npm cmd-list.js (a 519-spelling mechanical
+sweep found zero misses).
+
+composer: operator-ruled FULL CANONICAL-OR-REFUSE (2026-08-11) after the
+symfony abbreviation-surface mirror produced repeated review findings —
+only exact install/update/require and exact global route; aliases (i/u/
+upgrade/r) and every gated/global prefix refuse (case-insensitively, per
+symfony's fallback) with a single line naming the canonical spelling and
+the `composer run-script` escape hatch; exact non-gated commands and
+rei*/rem* stay passthrough (a live oracle derives all installed command
+names to prevent false refusals). Package-less require (top+global)
+refuses — composer's interactive discovery selects the package after the
+audit boundary; RequireCommand value-taking options are never audited as
+packages; relative global --working-dir refuses; the global-home resolver
+is Unix-only and env-spoof-proof.
+
+Review: 4 rounds (initial + 3 deltas) + a targeted confirmation, all
+sol/xhigh; the D339 two-fix-regression tripwire fired on the composer
+surface and triggered the simplification that became the operator's
+canonical-or-refuse ruling; the final round exceeded the nominal 4-round
+cap under explicit operator authorization (the round-4 findings were
+pre-existing perimeter gaps, not fix-caused churn). Chain archived at
+~/.liaison/reviews/2026-08-11-safe-slice5-abbreviation/.
+
+Sibling captured, out of scope: composer reinstall/create-project are
+fetch-class and ungated (inbox/2026-08-11-safe-composer-ungated-fetch-commands.md).
+Host tests/run-all.sh: all 21 suites green.

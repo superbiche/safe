@@ -161,6 +161,11 @@ fi
       printf 'AUDITENV_B64\t%s=%s\n' "${env_name}" "$(printf '%s' "${!env_name}" | base64 -w0)"
     fi
   done
+  # Global-Composer routing must scan the global project rather than the
+  # caller's cwd. Only the focused regression sets this fixture assertion.
+  if [[ -n "${SAFE_AUDIT_EXPECT_PROJECT:-}" || -n "${SAFE_AUDIT_EXPECT_PROJECTS:-}" ]]; then
+    printf 'AUDITPROJECT\t%s\n' "$PWD"
+  fi
 } >> "${SAFE_INSTALL_COMMAND_LOG}"
 
 if [[ "${1:-}" == "scan" ]]; then
@@ -186,14 +191,22 @@ if [[ "${1:-}" == "scan" ]]; then
     [[ -n "${stub_tool_status}" ]] || stub_tool_status='{"osv-scanner":{"status":"ok","note":null}}'
     stub_eco_audits="${SAFE_AUDIT_SCAN_ECOSYSTEM_AUDITS:-}"
     [[ -n "${stub_eco_audits}" ]] || stub_eco_audits='[]'
+    scan_critical="${SAFE_AUDIT_SCAN_CRITICAL:-0}"
+    if [[ -n "${SAFE_AUDIT_SCAN_CRITICAL_PROJECT:-}" ]]; then
+      if [[ "$PWD" == "${SAFE_AUDIT_SCAN_CRITICAL_PROJECT}" ]]; then
+        scan_critical=1
+      else
+        scan_critical=0
+      fi
+    fi
     cat > "${result_out}" <<JSON
 {
   "verdict": "${SAFE_AUDIT_SCAN_VERDICT:-GO}",
   "summary": {"packages_total": 3},
-  "cve_scan": {"critical": ${SAFE_AUDIT_SCAN_CRITICAL:-0}, "high": 0, "medium": 0, "low": 0, "findings": []},
+  "cve_scan": {"critical": ${scan_critical}, "high": 0, "medium": 0, "low": 0, "findings": []},
   "audit_totals": {
-    "critical": ${SAFE_AUDIT_SCAN_CRITICAL:-0}, "high": 0, "medium": 0, "low": 0, "unknown": 0,
-    "cve_scan": {"critical": ${SAFE_AUDIT_SCAN_CRITICAL:-0}, "high": 0, "medium": 0, "low": 0},
+    "critical": ${scan_critical}, "high": 0, "medium": 0, "low": 0, "unknown": 0,
+    "cve_scan": {"critical": ${scan_critical}, "high": 0, "medium": 0, "low": 0},
     "ecosystem": [], "deduplicated": false
   },
   "tool_status": ${stub_tool_status},
@@ -459,7 +472,7 @@ run_zsh() {
   (
     cd "${WORK_DIR}" || exit 99
     ROOT_DIR="${ROOT_DIR}" \
-    HOME="${HOME_DIR}" \
+    HOME="${SAFE_INSTALL_HOME:-${HOME_DIR}}" \
     PATH="${WRAPPER_DIR}:${BIN_DIR}:/usr/bin:/bin" \
     SAFE_AUDIT_PATH="${BIN_DIR}/safe-audit" \
     SAFE_INSTALL_COMMAND_LOG="${LOG_FILE}" \
@@ -478,6 +491,13 @@ run_zsh() {
     SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT="${SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT:-}" \
     SAFE_INSTALL_TIMEOUT_SECONDS="${SAFE_INSTALL_TIMEOUT_SECONDS:-}" \
     SAFE_INSTALL_REAL_STATUS="${SAFE_INSTALL_REAL_STATUS:-}" \
+    COMPOSER_HOME="${COMPOSER_HOME:-}" \
+    APPDATA="${APPDATA:-}" \
+    OS="${OS:-}" \
+    SAFE_INSTALL_COMPOSER_HOME_UNSET="${SAFE_INSTALL_COMPOSER_HOME_UNSET:-}" \
+    SAFE_AUDIT_EXPECT_PROJECT="${SAFE_AUDIT_EXPECT_PROJECT:-}" \
+    SAFE_AUDIT_EXPECT_PROJECTS="${SAFE_AUDIT_EXPECT_PROJECTS:-}" \
+    SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${SAFE_AUDIT_SCAN_CRITICAL_PROJECT:-}" \
     NPM_LOCK_MUTATION_JSON="${NPM_LOCK_MUTATION_JSON:-}" \
     NPM_CONFIG_PACKAGE_LOCK="${NPM_CONFIG_PACKAGE_LOCK:-}" \
     npm_config_package_lock="${npm_config_package_lock:-}" \
@@ -487,7 +507,7 @@ run_zsh() {
     NPM_LOCKDIFF_REGISTRY_CONFIG_JSON="${NPM_LOCKDIFF_REGISTRY_CONFIG_JSON:-}" \
     NPM_LOCKDIFF_CONFIG_STATUS="${NPM_LOCKDIFF_CONFIG_STATUS:-}" \
     MISE_LS_JSON="${MISE_LS_JSON:-}" \
-    "${ZSH_BIN}" -fc 'eval "${SAFE_INSTALL_TEST_SCRIPT}"'
+    "${ZSH_BIN}" -fc '[[ "${SAFE_INSTALL_COMPOSER_HOME_UNSET:-0}" == 1 ]] && unset COMPOSER_HOME; eval "${SAFE_INSTALL_TEST_SCRIPT}"'
   ) >"${OUT_FILE}" 2>"${ERR_FILE}"
   STATUS=$?
 }
@@ -531,6 +551,14 @@ assert_project_scan_logged() {
     return 1
   fi
   return 0
+}
+
+assert_scan_targets_logged() {
+  local label="$1" target
+  shift
+  for target in "$@"; do
+    assert_log_contains $'AUDITPROJECT\t'"${target}" "${label}" || return
+  done
 }
 
 assert_log_not_contains_fragment() {
@@ -1258,6 +1286,478 @@ case_update_family_gates() {
   pass "$FUNCNAME"
 }
 
+case_npm_abbreviation_classifier_gates_and_preserves_argv() {
+  prepare_case "npm-abbreviation-classifier"
+
+  # `inst` is a hardcoded npm alias. The check and the real delegate must both
+  # see the operation, while the delegate retains the operator's spelling.
+  SAFE_INSTALL_TEST_SCRIPT='npm inst okpkg' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tinst\tokpkg' "$FUNCNAME" || return
+
+  # The block canary proves an abbreviated install cannot delegate unaudited.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm inst blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm\tinst\tblockme' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm updat okpkg' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg\t--ecosystem\tnpm\t--gate\tinstall\t--op\tupdate' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tupdat\tokpkg' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm exe blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm\texe\tblockme' "$FUNCNAME" || return
+
+  # `in` is a short explicit install alias, while `d` is not a length-one
+  # match and stays a passthrough for npm to reject or handle itself.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm in okpkg' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tin\tokpkg' "$FUNCNAME" || return
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm d blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\td\tblockme' "$FUNCNAME" || return
+
+  pass "$FUNCNAME"
+}
+
+case_npm_alias_prefixes_and_priority() {
+  prepare_case "npm-alias-prefixes-and-priority"
+  touch "${WORK_DIR}/package.json"
+
+  # Generic npm prefixes include alias keys: `ad` -> add -> install.
+  SAFE_INSTALL_TEST_SCRIPT='npm ad okpkg' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tokpkg\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tad\tokpkg' "$FUNCNAME" || return
+
+  # install-clean is itself an alias. Its prefix must take the no-package ci
+  # lane, scan the project, and preserve the original token for npm.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm install-cl' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tinstall-cl' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'AUDIT\tcheck' "$FUNCNAME" || return
+
+  for token in cit clean-install isntall; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="npm ${token}" run_zsh
+    assert_status 0 "$FUNCNAME" || return
+    assert_project_scan_logged "$FUNCNAME" || return
+    assert_log_contains $'REAL\tnpm\t'"${token}" "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'AUDIT\tcheck' "$FUNCNAME" || return
+  done
+
+  # Exact aliases outrank a gated prefix: c -> config and un -> uninstall.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm c get registry' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tc\tget\tregistry' "$FUNCNAME" || return
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm un blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tun\tblockme' "$FUNCNAME" || return
+
+  # Ambiguous npm spellings may be conservatively routed. A clean path keeps
+  # original argv for the real command; a gated-looking ambiguity may instead
+  # be refused before delegation.
+  for token in is ex cl; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_REAL_STATUS=1 SAFE_INSTALL_TEST_SCRIPT="npm ${token}" run_zsh
+    assert_status 1 "$FUNCNAME" || return
+    assert_log_contains $'REAL\tnpm\t'"${token}" "$FUNCNAME" || return
+  done
+  unset SAFE_INSTALL_REAL_STATUS
+
+  pass "$FUNCNAME"
+}
+
+case_npm_camelcase_dispatch_and_conservative_ambiguity() {
+  prepare_case "npm-camelcase-dispatch"
+  touch "${WORK_DIR}/package.json"
+
+  # npm normalizes installTest to install-test before dispatch. The canary
+  # proves the gate does the same before the real command can fetch it.
+  SAFE_INSTALL_TEST_SCRIPT='npm installTest blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm\tinstallTest\tblockme' "$FUNCNAME" || return
+
+  # Hyphenated ci commands also normalize before npm resolves aliases/prefixes;
+  # their no-package lane scans and still delegates the original spelling.
+  for token in cleanInstall installCiTest; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="npm ${token}" run_zsh
+    assert_status 0 "$FUNCNAME" || return
+    assert_project_scan_logged "$FUNCNAME" || return
+    assert_log_contains $'REAL\tnpm\t'"${token}" "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'AUDIT\tcheck' "$FUNCNAME" || return
+  done
+
+  # distTag normalizes to npm's non-gated dist-tag command and stays a
+  # passthrough despite sharing the same camel-case normalization.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm distTag latest' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tdistTag\tlatest' "$FUNCNAME" || return
+
+  # `ex` can look like npm exec but npm itself considers it ambiguous. Policy
+  # deliberately permits this fail-closed pre-delegation refusal.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm ex --bogus' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+  assert_log_not_contains_fragment $'REAL\tnpm\tex' "$FUNCNAME" || return
+
+  pass "$FUNCNAME"
+}
+
+case_non_npm_abbreviations_stay_passthrough() {
+  prepare_case "non-npm-abbreviations-passthrough"
+  SAFE_INSTALL_TEST_SCRIPT='pnpm inst blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tpnpm\tinst\tblockme' "$FUNCNAME" || return
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='yarn ad blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tyarn\tad\tblockme' "$FUNCNAME" || return
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='bun inst blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tbun\tinst\tblockme' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_composer_canonical_or_refuse() {
+  prepare_case "composer-canonical-or-refuse"
+  touch "${WORK_DIR}/composer.json"
+  local token command args
+
+  # Only the three canonical top-level gated spellings audit and delegate.
+  for token in install update Update; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer ${token}" run_zsh
+    assert_status 0 "$FUNCNAME" || return
+    assert_project_scan_logged "$FUNCNAME" || return
+    assert_log_contains $'REAL\tcomposer\t'"${token}" "$FUNCNAME" || return
+  done
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer require vendor/okpkg:^1' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\trequire\tvendor/okpkg:^1' "$FUNCNAME" || return
+
+  # Symfony retries command matches case-insensitively. Exact built-ins keep
+  # their priority, while canonical mixed-case gated names enter the same lane.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer Init' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\tInit' "$FUNCNAME" || return
+
+  # Exact command names always remain dispatchable. `require` gets an
+  # explicit package because its intentional interactive zero-package refusal
+  # is covered below.
+  for command in "${SAFE_GATE_COMPOSER_COMMANDS[@]}"; do
+    : > "${LOG_FILE}"
+    args="${command}"
+    [[ "${command}" == require ]] && args+=' vendor/okpkg:^1'
+    SAFE_INSTALL_TEST_SCRIPT="composer ${args}" run_zsh
+    assert_status 0 "$FUNCNAME" || return
+    assert_log_contains $'REAL\tcomposer\t'"${command}" "$FUNCNAME" || return
+  done
+
+  # Composer accepts these aliases and abbreviations itself. Safe refuses
+  # every gated-looking one before any scan, package audit, or delegation.
+  for token in i u upgrade r in ins up upg upgr upgra upgrad re req requ g gl glo glob globa; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer ${token} vendor/okpkg:^1" run_zsh
+    assert_status 100 "$FUNCNAME" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+    assert_err_contains_fragment 'spell it canonically (composer' "$FUNCNAME" || return
+    assert_err_contains_fragment "or, if '${token}' is a project script, run it via composer run-script ${token}" "$FUNCNAME" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+  done
+
+  # The same policy applies to the nested command after the exact global
+  # proxy. This is still a refusal before global-home resolution or scanning.
+  for token in i u upgrade r ins up req requ g globa; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer global ${token} vendor/okpkg:^1" run_zsh
+    assert_status 100 "$FUNCNAME" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+    assert_err_contains_fragment 'spell it canonically (composer global' "$FUNCNAME" || return
+    assert_err_contains_fragment "composer global run-script ${token}" "$FUNCNAME" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+  done
+
+  # A mixed-case alias and prefix resolve in Symfony but must still fail closed
+  # before any gate side effect. The original spelling stays in the script
+  # escape hatch so a deliberate project command remains reachable.
+  for token in U ReQu gLoBa; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer ${token} vendor/okpkg:^1" run_zsh
+    assert_status 100 "$FUNCNAME" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+    assert_err_contains_fragment "or, if '${token}' is a project script, run it via composer run-script ${token}" "$FUNCNAME" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+  done
+
+  # Non-gated command prefixes keep their pre-existing passthrough behavior.
+  for token in rei rem; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer ${token} vendor/blockme" run_zsh
+    assert_status 0 "$FUNCNAME" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+    assert_log_contains $'REAL\tcomposer\t'"${token}"$'\tvendor/blockme' "$FUNCNAME" || return
+  done
+
+  # Interactive package discovery starts after safe's package-audit boundary,
+  # so every zero-package require form refuses before project scans/delegation.
+  for args in require 'require --no-interaction' 'require --' \
+    'global require' 'global require --no-interaction' 'global require --'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer ${args}" run_zsh
+    assert_status 100 "$FUNCNAME" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+    assert_err_contains_fragment 'specify at least one package explicitly' "$FUNCNAME" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+  done
+
+  # RequireCommand's value-taking options are not package operands. They must
+  # reach the same zero-package refusal in both top-level and global lanes.
+  for command in require 'global require'; do
+    for option in --prefer-install --audit-format --ignore-platform-req --apcu-autoloader-prefix; do
+      : > "${LOG_FILE}"
+      SAFE_INSTALL_TEST_SCRIPT="composer ${command} ${option} vendor/okpkg:^1" run_zsh
+      assert_status 100 "$FUNCNAME" || return
+      [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+      assert_err_contains_fragment 'specify at least one package explicitly' "$FUNCNAME" || return
+      assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+      assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+    done
+  done
+
+  for command in require 'global require'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer ${command} --audit-format=vendor/okpkg:^1" run_zsh
+    assert_status 100 "$FUNCNAME" || return
+    assert_err_contains_fragment 'specify at least one package explicitly' "$FUNCNAME" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+  done
+
+  # The option terminator changes the boundary: a following token is a real
+  # explicit package.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer require -- vendor/okpkg:^1' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\trequire\t--\tvendor/okpkg:^1' "$FUNCNAME" || return
+
+  pass "$FUNCNAME"
+}
+
+case_composer_global_canonical_routing() {
+  prepare_case "composer-global-canonical-routing"
+  local global_home="${HOME_DIR}/global-home"
+  local default_home="${HOME_DIR}/.composer"
+  local ordinary_home="${HOME_DIR}/ordinary-home"
+  local before_project="${CASE_DIR}/before-project"
+  local between_project="${CASE_DIR}/between-project"
+  local after_project="${CASE_DIR}/after-project"
+  local first_project="${CASE_DIR}/first-project"
+  local second_project="${CASE_DIR}/second-project"
+  local equals_project="${CASE_DIR}/equals-project"
+  local ignored_project="${CASE_DIR}/ignored-project"
+  local unix_home="${CASE_DIR}/unix-home"
+  local backslash_home="${unix_home//\//\\}"
+  local target args
+  for target in "${global_home}" "${default_home}" "${ordinary_home}" \
+    "${before_project}" "${between_project}" "${after_project}" \
+    "${first_project}" "${second_project}" "${equals_project}" "${ignored_project}" \
+    "${unix_home}/.composer"; do
+    mkdir -p "${target}"
+    touch "${target}/composer.json"
+  done
+
+  # Exact global plus canonical nested commands retain the unified preflight,
+  # package boundary, and original argv delegation.
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${global_home}" \
+    SAFE_INSTALL_TEST_SCRIPT='composer global update' run_zsh
+  assert_status 102 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" || return
+  assert_log_not_contains_fragment $'REAL\tcomposer\tglobal\tupdate' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT='composer global install' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" || return
+  assert_log_contains $'REAL\tcomposer\tglobal\tinstall' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT='composer global require vendor/okpkg:^1' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" || return
+  assert_log_contains $'AUDIT\tcheck\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\tglobal\trequire\tvendor/okpkg:^1' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT='composer global Require vendor/okpkg:^1' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" || return
+  assert_log_contains $'AUDIT\tcheck\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\tglobal\tRequire\tvendor/okpkg:^1' "$FUNCNAME" || return
+
+  # Factory uses PHP truthiness: unset, empty, and literal "0" select the
+  # platform home, while an ordinary COMPOSER_HOME selects itself.
+  : > "${LOG_FILE}"
+  COMPOSER_HOME='0' SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${default_home}" \
+    SAFE_INSTALL_TEST_SCRIPT='composer global update' run_zsh
+  assert_status 102 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${default_home}" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME='' SAFE_INSTALL_COMPOSER_HOME_UNSET=1 SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT='composer global update' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${default_home}" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME='' SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT='composer global update' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${default_home}" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${ordinary_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT='composer global update' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${ordinary_home}" || return
+
+  # This Unix-only resolver ignores all Windows-shaped environment variables.
+  : > "${LOG_FILE}"
+  COMPOSER_HOME='' SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${default_home}" \
+    SAFE_INSTALL_TEST_SCRIPT="env OS=Windows_NT OSTYPE=msys APPDATA=${CASE_DIR}/absent-appdata composer global update" run_zsh
+  assert_status 102 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${default_home}" || return
+  assert_log_not_contains_fragment 'absent-appdata' "$FUNCNAME" || return
+
+  # Factory normalizes Unix HOME before appending .composer.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_HOME="${backslash_home}" COMPOSER_HOME='' SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${unix_home}/.composer" \
+    SAFE_INSTALL_TEST_SCRIPT='composer global update' run_zsh
+  assert_status 102 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${unix_home}/.composer" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_HOME="${unix_home}///" COMPOSER_HOME='' SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${unix_home}/.composer" \
+    SAFE_INSTALL_TEST_SCRIPT='composer global update' run_zsh
+  assert_status 102 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${unix_home}/.composer" || return
+
+  # Absolute first working-dir values are retained at every position and add
+  # both selected projects to the scan set. Delegation still receives argv.
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT="composer --working-dir ${before_project} global update" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" "${before_project}" || return
+  assert_log_contains $'REAL\tcomposer\t--working-dir\t'"${before_project}"$'\tglobal\tupdate' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${between_project}" \
+    SAFE_INSTALL_TEST_SCRIPT="composer global --working-dir ${between_project} update" run_zsh
+  assert_status 102 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" "${between_project}" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT="composer global update --working-dir ${after_project}" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" "${after_project}" || return
+  assert_log_contains $'REAL\tcomposer\tglobal\tupdate\t--working-dir\t'"${after_project}" "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT="composer --working-dir ${first_project} global update --working-dir ${second_project}" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" "${first_project}" || return
+  assert_log_not_contains_fragment $'AUDITPROJECT\t'"${second_project}" "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT="composer global --working-dir=${equals_project} update" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" "${equals_project}" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT="composer global update -- --working-dir ${ignored_project}" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" || return
+  assert_log_not_contains_fragment $'AUDITPROJECT\t'"${ignored_project}" "$FUNCNAME" || return
+
+  # Relative values undergo Composer's proxy cwd stages; refusing them is
+  # safer than selecting a different project from the nested application.
+  for args in \
+    ' --working-dir relative global update' \
+    ' global --working-dir relative update' \
+    ' global update --working-dir relative' \
+    ' global --working-dir=relative update' \
+    ' global -d relative update' \
+    ' global -drelative update' \
+    ' global -d C:/relative update'; do
+    : > "${LOG_FILE}"
+    COMPOSER_HOME="${global_home}" SAFE_INSTALL_TEST_SCRIPT="composer${args}" run_zsh
+    assert_status 100 "$FUNCNAME" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+    assert_err_contains_fragment 'must be an absolute path' "$FUNCNAME" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+  done
+
+  # An unknown bare option in the accepted global lane can hide its nested
+  # command, so it remains a one-line conservative refusal.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer global --not-a-real-global-option update' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+  assert_log_not_contains_fragment $'REAL\tcomposer\tglobal\t--not-a-real-global-option' "$FUNCNAME" || return
+
+  pass "$FUNCNAME"
+}
+
 case_npm_dedupe_lockdiff_empty_delegates_without_scan() {
   skip_lockdiff_case "$FUNCNAME" || return
   prepare_lockdiff_case "npm-dedupe-lockdiff-empty"
@@ -1354,7 +1854,7 @@ case_npm_lockdiff_prefixes_route_to_projection() {
   printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
   printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
   local token
-  for token in ded dedu dedup pru prun ddp; do
+  for token in dd ded dedu dedup pru prun ddp; do
     : > "${LOG_FILE}"
     NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/blockme":{"version":"2.0.0","resolved":"https://registry.npmjs.org/blockme/-/blockme-2.0.0.tgz","integrity":"sha512-blockme"}}}' \
       SAFE_INSTALL_TEST_SCRIPT="npm ${token}" run_zsh
@@ -1509,7 +2009,7 @@ STUB
   cat > "${BIN_DIR}/safe-core" <<'STUB'
 #!/usr/bin/env bash
 case "${1:-}" in
-  --version) printf '1.14.0\n' ;;
+  --version) printf '1.15.0\n' ;;
   lockdiff) printf '{"schema":1}\n' ;;
 esac
 STUB
@@ -1528,7 +2028,7 @@ STUB
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
   assert_status 100 "$FUNCNAME" || return
-  assert_err_contains_fragment 'safe-core version 0.0.0 does not match safe 1.14.0' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe-core version 0.0.0 does not match safe 1.15.0' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'PROJECTION\tnpm' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -1864,12 +2364,12 @@ case_install_idempotent_no_wrappers() {
   assert_count 1 'fpath=("$HOME/.local/share/zsh/site-functions" $fpath)' "${HOME_DIR}/.zshrc" "$FUNCNAME" || return
   [[ -f "${HOME_DIR}/.local/share/zsh/site-functions/_safe" ]] || { fail "$FUNCNAME"; return; }
   [[ -x "${HOME_DIR}/.local/bin/safe-core" ]] || { fail "$FUNCNAME"; return; }
-  [[ "$("${HOME_DIR}/.local/bin/safe-core" --version)" == "1.14.0" ]] || { fail "$FUNCNAME"; return; }
+  [[ "$("${HOME_DIR}/.local/bin/safe-core" --version)" == "1.15.0" ]] || { fail "$FUNCNAME"; return; }
   local doctor_json
   doctor_json="$(HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" \
     "${HOME_DIR}/.local/bin/safe" doctor --json)" || { fail "$FUNCNAME"; return; }
   jq -e '.dependencies.core.safe_core.present == true
-    and .dependencies.core.safe_core.version == "1.14.0"
+    and .dependencies.core.safe_core.version == "1.15.0"
     and .environment.safe_core.version_matches == true
     and .environment.safe_core.warning == null' <<<"${doctor_json}" >/dev/null || { fail "$FUNCNAME"; return; }
   # The suite core is release-versioned for gate-time parity. Replace the
@@ -4563,6 +5063,12 @@ main() {
     case_go_run_module_gates \
     case_go_run_value_flag_does_not_hide_module \
     case_update_family_gates \
+    case_npm_abbreviation_classifier_gates_and_preserves_argv \
+    case_npm_alias_prefixes_and_priority \
+    case_npm_camelcase_dispatch_and_conservative_ambiguity \
+    case_non_npm_abbreviations_stay_passthrough \
+    case_composer_canonical_or_refuse \
+    case_composer_global_canonical_routing \
     case_npm_dedupe_lockdiff_empty_delegates_without_scan \
     case_npm_lockdiff_absent_node_modules_refuses \
     case_npm_lockdiff_projection_sees_project_npmrc \

@@ -13,6 +13,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SUITES=(
   tests/go/run.sh
   tests/live/npm_config_oracle.sh
+  tests/live/npm_abbrev_oracle.sh
+  tests/live/composer_abbrev_oracle.sh
   tests/live/shim_delegation.sh
   tests/install/run.sh
   tests/audit/check_version_aware.sh

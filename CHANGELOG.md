@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- npm gate routing covers install, update, ci, exec, and lock-diff aliases and
+  abbreviations before delegation. It uses a checked-in full command/alias
+  snapshot with exact alias priority, so non-fetch aliases such as `c` and
+  `un` stay passthrough while abbreviated fetch routes (including alias
+  prefixes such as `ad` and `dd`) are audited; camel-case normalization is
+  covered too.
+- Composer accepts only canonical `install`, `update`, and `require`
+  spellings, plus exact `global`, on its gated surface, case-insensitively to
+  match Symfony. Aliases targeting those commands and gated-looking prefixes
+  refuse before delegation with a canonical spelling plus `composer run-script`
+  escape hatch. The Unix-only global-home resolver ignores Windows-shaped
+  environment variables. An accepted Composer-global route scans the resolved
+  global home plus the first absolute `--working-dir` project; relative working
+  directories and package-less `require` forms refuse before an interactive
+  selection can bypass audit. Require option values never become package
+  operands. Original tokens remain unchanged on every delegated path.
+
 - Fresh releases whose initial Socket score times out now receive one bounded
   patience retry (`install.socket.fresh_scan_budget_seconds`, default 90s).
   If Socket still has no score, receipts record `PENDING`; a clean GuardDog,

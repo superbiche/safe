@@ -47,6 +47,7 @@ SAFE_GATE_SUBCMD_IDX=0
 SAFE_GATE_SUBCMD_BADFLAG=""
 SAFE_GATE_GVAL=""
 SAFE_GATE_GBOOL=""
+SAFE_GATE_TOOL=""
 SAFE_GATE_NPM_USERCONFIG=""
 SAFE_GATE_NPM_GLOBALCONFIG=""
 SAFE_GATE_ENV_SCRUB=()
@@ -470,9 +471,501 @@ safe_gate_scan_target_flags() {
   done
 }
 
+# npm 12's lib/utils/cmd-list.js command and alias map. The aliases are a
+# dispatch surface, not just documentation: npm's generic abbreviation table
+# includes their KEYS, then dereferences the winning alias. Keep this snapshot
+# complete so an exact non-gated alias (for example `c` -> config) wins before
+# any overlapping gated prefix (for example `ci`). The live oracle compares
+# both arrays with the npm that safe's real delegate runs.
+SAFE_GATE_NPM_COMMANDS=(
+  access approve-scripts audit bugs cache ci completion config dedupe
+  deny-scripts deprecate diff dist-tag docs doctor edit exec explain explore
+  find-dupes fund get help help-search init install install-ci-test
+  install-scripts install-test link ll login logout ls org outdated owner
+  pack patch ping pkg prefix profile prune publish query rebuild repo restart
+  root run sbom search set stage start stop team test token trust undeprecate
+  uninstall unpublish update version view whoami
+)
+SAFE_GATE_NPM_ALIASES=(
+  author=owner home=docs issues=bugs info=view show=view find=search
+  add=install unlink=uninstall remove=uninstall rm=uninstall r=uninstall
+  un=uninstall rb=rebuild list=ls ln=link create=init i=install
+  it=install-test cit=install-ci-test u=update up=update c=config s=search
+  se=search tst=test t=test ddp=dedupe v=view run-script=run
+  clean-install=ci clean-install-test=install-ci-test x=exec why=explain
+  la=ll verison=version ic=ci innit=init in=install ins=install inst=install
+  insta=install instal=install isnt=install isnta=install isntal=install
+  isntall=install install-clean=ci isntall-clean=ci hlep=help
+  dist-tags=dist-tag upgrade=update udpate=update rum=run sit=install-ci-test
+  urn=run ogr=org
+)
+
+# Emits the npm 12 dispatch snapshot as `command<TAB>name` and
+# `alias<TAB>key<TAB>target` records for the hermetic and live drift guards.
+safe_gate_npm_dispatch_snapshot() {
+  local command pair
+  for command in "${SAFE_GATE_NPM_COMMANDS[@]}"; do
+    printf 'command\t%s\n' "${command}"
+  done
+  for pair in "${SAFE_GATE_NPM_ALIASES[@]}"; do
+    printf 'alias\t%s\t%s\n' "${pair%%=*}" "${pair#*=}"
+  done
+}
+
+# Emits the target of an exact npm alias map lookup. A nonzero return means the
+# token is not an alias key; callers must preserve that distinction because an
+# exact non-gated alias takes priority over a possible prefix match.
+safe_gate_npm_alias_target() {
+  local token="$1" pair
+  for pair in "${SAFE_GATE_NPM_ALIASES[@]}"; do
+    [[ "${pair%%=*}" == "${token}" ]] || continue
+    printf '%s' "${pair#*=}"
+    return 0
+  done
+  return 1
+}
+
+# npm currently maps aliases directly to canonical commands, but retain a
+# bounded dereference loop so the snapshot remains correct if a future map
+# chains aliases. A cycle is a broken snapshot, not a passthrough grant.
+safe_gate_npm_deref_alias() {
+  local target="$1" next i
+  for (( i=0; i<${#SAFE_GATE_NPM_ALIASES[@]}; i++ )); do
+    if next="$(safe_gate_npm_alias_target "${target}")"; then
+      target="${next}"
+    else
+      printf '%s' "${target}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Emits a canonical gated lane for an npm command target. `ci` is deliberately
+# separate because it takes no package argv; lockdiff is stricter than the
+# ordinary install lane and retains its existing projection API.
+safe_gate_npm_target_class() {
+  case "$1" in
+    install|install-test) printf '%s' install ;;
+    ci|install-ci-test) printf '%s' ci ;;
+    update) printf '%s' update ;;
+    exec) printf '%s' exec ;;
+    dedupe|prune) printf '%s' lockdiff ;;
+    *) return 1 ;;
+  esac
+}
+
+# npm's cmd-list normalizes every uppercase letter to `-` plus its lowercase
+# form before exact command, alias, and abbreviation dispatch. Classification
+# must mirror that normalization, but callers deliberately keep the original
+# argv token for every path that reaches the real npm delegate.
+safe_gate_npm_normalize_subcommand() {
+  local token="$1" normalized="" char i
+  local LC_ALL=C
+
+  for (( i=0; i<${#token}; i++ )); do
+    char="${token:i:1}"
+    case "${char}" in
+      [A-Z]) normalized+="-${char,,}" ;;
+      *) normalized+="${char}" ;;
+    esac
+  done
+  printf '%s' "${normalized}"
+}
+
+# Classifies npm's normalized first command token. Exact aliases are resolved
+# first over the FULL alias map, preserving npm's own priority (for example
+# `c` remains config rather than a ci prefix). For non-alias tokens, npm
+# accepts a two-character-or-longer unique prefix of canonical commands and
+# alias keys. We conservatively route any such gated candidate. The original
+# token is delegated unchanged on every path that reaches delegation, but safe
+# may refuse a gated-looking ambiguous invocation before npm can report it.
+#
+# Multiple gated candidates use this precedence: ci (no package argv), then
+# lockdiff (projection), then install, update, and exec. Today collisions are
+# confined to equivalent or stricter lanes; the ordering keeps a new collision
+# from becoming a passthrough.
+safe_gate_npm_subcommand_class() {
+  local token="" target="" candidate="" pair="" class=""
+  token="$(safe_gate_npm_normalize_subcommand "$1")"
+
+  if target="$(safe_gate_npm_alias_target "${token}")"; then
+    target="$(safe_gate_npm_deref_alias "${target}")" || return 1
+    safe_gate_npm_target_class "${target}"
+    return $?
+  fi
+
+  if safe_gate_npm_target_class "${token}"; then
+    return 0
+  fi
+
+  (( ${#token} >= 2 )) || return 1
+  for class in ci lockdiff install update exec; do
+    for candidate in "${SAFE_GATE_NPM_COMMANDS[@]}"; do
+      [[ "${candidate}" == "${token}"* ]] || continue
+      target="$(safe_gate_npm_deref_alias "${candidate}")" || return 1
+      [[ "$(safe_gate_npm_target_class "${target}")" == "${class}" ]] && {
+        printf '%s' "${class}"
+        return 0
+      }
+    done
+    for pair in "${SAFE_GATE_NPM_ALIASES[@]}"; do
+      candidate="${pair%%=*}"
+      [[ "${candidate}" == "${token}"* ]] || continue
+      target="$(safe_gate_npm_deref_alias "${candidate}")" || return 1
+      [[ "$(safe_gate_npm_target_class "${target}")" == "${class}" ]] && {
+        printf '%s' "${class}"
+        return 0
+      }
+    done
+  done
+  return 1
+}
+
+# Composer's command list snapshot. The gate does not run `composer list` on
+# an install path: it can load project/global config before safe has audited
+# it. The live oracle compares this refusal boundary against the real command
+# list so a Composer upgrade cannot silently make an exact command refuse.
+SAFE_GATE_COMPOSER_COMMANDS=(
+  about archive audit browse bump check-platform-reqs clear-cache completion
+  config create-project depends diagnose dump-autoload exec fund global help
+  init install licenses list outdated policy prohibits reinstall remove
+  repository require run-script search self-update show status suggests update
+  validate
+)
+
+safe_gate_composer_normalize_token() {
+  local LC_ALL=C
+  printf '%s' "${1,,}"
+}
+
+safe_gate_composer_is_exact_command() {
+  local token command
+  token="$(safe_gate_composer_normalize_token "$1")"
+  for command in "${SAFE_GATE_COMPOSER_COMMANDS[@]}"; do
+    [[ "${command}" == "${token}" ]] && return 0
+  done
+  return 1
+}
+
+# Composer is intentionally canonical-or-refuse for the gated surface. The
+# operator does not use aliases or Symfony abbreviations, and passing them
+# through would let an evolving command table bypass audit. Exact non-gated
+# Composer commands remain passthrough; the live oracle guards that boundary.
+safe_gate_composer_subcommand_class() {
+  local token
+  token="$(safe_gate_composer_normalize_token "$1")"
+  case "${token}" in
+    install) printf '%s' install; return 0 ;;
+    update) printf '%s' update; return 0 ;;
+    require) printf '%s' require; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Returns the canonical gated spelling that an alias or prefix must use. This
+# deliberately runs only after the exact command check: `init` must not refuse
+# merely because it starts with `in`.
+safe_gate_composer_noncanonical_target() {
+  local token candidate
+  token="$(safe_gate_composer_normalize_token "$1")"
+  [[ -n "${token}" ]] || return 1
+  safe_gate_composer_is_exact_command "${token}" && return 1
+
+  case "${token}" in
+    i) printf '%s' install; return 0 ;;
+    u|upgrade) printf '%s' update; return 0 ;;
+    r) printf '%s' require; return 0 ;;
+  esac
+
+  for candidate in install update require upgrade global; do
+    [[ "${candidate}" == "${token}"* ]] || continue
+    case "${candidate}" in
+      upgrade) printf '%s' update ;;
+      *) printf '%s' "${candidate}" ;;
+    esac
+    return 0
+  done
+  return 1
+}
+
+# The global proxy itself is canonical-only. Keep recognition beside the
+# option walk: the proxy, nested command, package boundary, first working
+# directory, and project scan set are one result rather than independently
+# re-parsed routing facts.
+safe_gate_composer_is_global_proxy() {
+  [[ "$(safe_gate_composer_normalize_token "$1")" == global ]]
+}
+
+# Composer/Symfony application switches from `composer global --help`. The
+# working-dir value option is handled separately because Symfony's
+# getParameterOption() selects its FIRST occurrence across the whole argv.
+safe_gate_composer_application_boolean() {
+  case "$1" in
+    -h|--help|-q|--quiet|-V|--version|--ansi|--no-ansi|-n|--no-interaction|--profile|--no-plugins|--no-scripts|--no-cache|-v|-vv|-vvv|--verbose)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# PHP treats only a non-empty string other than "0" as truthy. Composer's
+# Factory::getHomeDir uses PHP truthiness for home-related environment values.
+safe_gate_composer_php_truthy() {
+  [[ -n "$1" && "$1" != "0" ]]
+}
+
+# Mirrors the installed Composer Factory::getHomeDir without running a second
+# Composer process (a config query writes config/auth and cache files before
+# the audit). This fleet is Unix-only, and the installed source has its XDG
+# branch disabled, so its order is truthy COMPOSER_HOME then normalized
+# HOME/.composer. No platform-shaped environment variable selects this target.
+safe_gate_composer_global_home() {
+  local home="${COMPOSER_HOME:-}"
+  if safe_gate_composer_php_truthy "${home}"; then
+    printf '%s' "${home}"
+    return 0
+  fi
+
+  home="${HOME:-}"
+  safe_gate_composer_php_truthy "${home}" || return 1
+  home="${home//\\//}"
+  while [[ "${home}" == */ ]]; do home="${home%/}"; done
+  printf '%s/.composer' "${home%/}"
+}
+
+safe_gate_composer_path_is_absolute() {
+  case "$1" in
+    /*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+safe_gate_composer_resolve_path() {
+  local path="$1" base="$2"
+  [[ -n "${path}" ]] || return 1
+  case "${path}" in
+    /*) printf '%s' "${path}" ;;
+    *) printf '%s/%s' "${base%/}" "${path}" ;;
+  esac
+}
+
+safe_gate_composer_add_scan_target() {
+  local target="$1" seen
+  [[ -n "${target}" ]] || return 0
+  for seen in "${SAFE_GATE_COMPOSER_SCAN_TARGETS[@]}"; do
+    [[ "${seen}" == "${target}" ]] && return 0
+  done
+  SAFE_GATE_COMPOSER_SCAN_TARGETS+=("${target}")
+}
+
+safe_gate_composer_set_noncanonical_refusal() {
+  local token="$1" canonical nested_global="$3"
+  canonical="$(safe_gate_composer_normalize_token "$2")"
+  SAFE_GATE_COMPOSER_REFUSE_TOKEN="${token}"
+  case "${canonical}" in
+    global)
+      SAFE_GATE_COMPOSER_REFUSE_HINT='composer global <command>'
+      ;;
+    *)
+      if (( nested_global )); then
+        SAFE_GATE_COMPOSER_REFUSE_HINT="composer global ${canonical}"
+      else
+        SAFE_GATE_COMPOSER_REFUSE_HINT="composer ${canonical}"
+      fi
+      ;;
+  esac
+  if (( nested_global )); then
+    SAFE_GATE_COMPOSER_SCRIPT_HINT="composer global run-script ${token}"
+  else
+    SAFE_GATE_COMPOSER_SCRIPT_HINT="composer run-script ${token}"
+  fi
+}
+
+# One composer routing pass. For a recognized global proxy it records all
+# routing facts needed by install, update, and require: the nested class,
+# package boundary, first effective --working-dir, and every project to scan.
+# It deliberately leaves ordinary non-global routing to safe_gate_route so
+# behavior outside the global lane remains byte-for-byte compatible.
+safe_gate_composer_route() {
+  local -a args=("$@")
+  local arg next="" first="" nested="" canonical="" home="" base="" target=""
+  local i nested_idx=-1 options_ended=0 is_global=0
+
+  SAFE_GATE_TOOL="composer"
+  SAFE_GATE_COMPOSER_IS_GLOBAL=0
+  SAFE_GATE_COMPOSER_SUBCMD=""
+  SAFE_GATE_COMPOSER_CLASS=""
+  SAFE_GATE_COMPOSER_PACKAGE_ARGS=()
+  SAFE_GATE_COMPOSER_WORKING_DIR=""
+  SAFE_GATE_COMPOSER_HAS_WORKING_DIR=0
+  SAFE_GATE_COMPOSER_SCAN_TARGETS=()
+  SAFE_GATE_COMPOSER_BADFLAG=""
+  SAFE_GATE_COMPOSER_REFUSE_TOKEN=""
+  SAFE_GATE_COMPOSER_REFUSE_HINT=""
+  SAFE_GATE_COMPOSER_SCRIPT_HINT=""
+  safe_gate_scan_target_flags composer "$@"
+
+  for (( i=0; i<${#args[@]}; i++ )); do
+    arg="${args[$i]}"
+    if (( options_ended )); then
+      if [[ -z "${first}" ]]; then
+        first="${arg}"
+        safe_gate_composer_is_global_proxy "${first}" && is_global=1
+      elif (( is_global )) && [[ -z "${nested}" ]]; then
+        nested="${arg}"; nested_idx=${i}
+      fi
+      continue
+    fi
+
+    case "${arg}" in
+      --)
+        options_ended=1
+        continue
+        ;;
+      --working-dir|-d)
+        if (( i + 1 >= ${#args[@]} )); then
+          if (( is_global )) && [[ -z "${nested}" ]]; then
+            SAFE_GATE_COMPOSER_BADFLAG="${arg}"
+            return 2
+          fi
+          continue
+        fi
+        if (( SAFE_GATE_COMPOSER_HAS_WORKING_DIR == 0 )); then
+          SAFE_GATE_COMPOSER_WORKING_DIR="${args[$((i + 1))]}"
+          SAFE_GATE_COMPOSER_HAS_WORKING_DIR=1
+        fi
+        i=$((i + 1))
+        continue
+        ;;
+      --working-dir=*)
+        if (( SAFE_GATE_COMPOSER_HAS_WORKING_DIR == 0 )); then
+          SAFE_GATE_COMPOSER_WORKING_DIR="${arg#*=}"
+          SAFE_GATE_COMPOSER_HAS_WORKING_DIR=1
+        fi
+        continue
+        ;;
+      -d?*)
+        if (( SAFE_GATE_COMPOSER_HAS_WORKING_DIR == 0 )); then
+          SAFE_GATE_COMPOSER_WORKING_DIR="${arg#-d}"
+          SAFE_GATE_COMPOSER_HAS_WORKING_DIR=1
+        fi
+        continue
+        ;;
+      -*)
+        if [[ -z "${first}" ]] || { (( is_global )) && [[ -z "${nested}" ]]; }; then
+          if safe_gate_composer_application_boolean "${arg}"; then
+            next="${args[$((i + 1))]:-}"
+            case "${next,,}" in
+              true|false) i=$((i + 1)) ;;
+            esac
+          elif [[ "${arg}" == --*=* || "${arg}" == -*=* ]]; then
+            : # Equals form cannot consume the later nested command.
+          else
+            SAFE_GATE_COMPOSER_BADFLAG="${arg}"
+            return 2
+          fi
+        fi
+        continue
+        ;;
+      *)
+        if [[ -z "${first}" ]]; then
+          first="${arg}"
+          safe_gate_composer_is_global_proxy "${first}" && is_global=1
+        elif (( is_global )) && [[ -z "${nested}" ]]; then
+          nested="${arg}"; nested_idx=${i}
+        fi
+        ;;
+    esac
+  done
+
+  if (( is_global == 0 )); then
+    safe_gate_route composer "$@" || return $?
+    SAFE_GATE_COMPOSER_SUBCMD="${SAFE_GATE_SUBCMD}"
+    if canonical="$(safe_gate_composer_noncanonical_target "${SAFE_GATE_SUBCMD}")"; then
+      safe_gate_composer_set_noncanonical_refusal "${SAFE_GATE_SUBCMD}" "${canonical}" 0
+      return 4
+    fi
+    SAFE_GATE_COMPOSER_CLASS="$(safe_gate_composer_subcommand_class "${SAFE_GATE_SUBCMD}")" || SAFE_GATE_COMPOSER_CLASS=""
+    SAFE_GATE_COMPOSER_PACKAGE_ARGS=("${@:SAFE_GATE_SUBCMD_IDX+1}")
+    return 0
+  fi
+
+  SAFE_GATE_COMPOSER_IS_GLOBAL=1
+  SAFE_GATE_COMPOSER_SUBCMD="${nested}"
+  if canonical="$(safe_gate_composer_noncanonical_target "${nested}")"; then
+    safe_gate_composer_set_noncanonical_refusal "${nested}" "${canonical}" 1
+    return 4
+  fi
+  SAFE_GATE_COMPOSER_CLASS="$(safe_gate_composer_subcommand_class "${nested}")" || SAFE_GATE_COMPOSER_CLASS=""
+  SAFE_GATE_SUBCMD="${nested}"
+  SAFE_GATE_SUBCMD_IDX=$((nested_idx + 1))
+  (( nested_idx >= 0 )) && SAFE_GATE_COMPOSER_PACKAGE_ARGS=("${args[@]:nested_idx+1}")
+
+  case "${SAFE_GATE_COMPOSER_CLASS}" in
+    install|update|require)
+      if (( SAFE_GATE_COMPOSER_HAS_WORKING_DIR )) && \
+          ! safe_gate_composer_path_is_absolute "${SAFE_GATE_COMPOSER_WORKING_DIR}"; then
+        return 5
+      fi
+      home="$(safe_gate_composer_global_home)" || return 3
+      base="${PWD}"
+      target=""
+      if (( SAFE_GATE_COMPOSER_HAS_WORKING_DIR )); then
+        target="$(safe_gate_composer_resolve_path "${SAFE_GATE_COMPOSER_WORKING_DIR}" "${PWD}")" || target=""
+        [[ -n "${target}" ]] && base="${target}"
+        # The shared source accumulator is deliberately last-wins for ordinary
+        # composer routes. Global Symfony parsing is first-wins, so its single
+        # routing result overrides that value before package checks run.
+        SAFE_GATE_PROJECT_DIR="${SAFE_GATE_COMPOSER_WORKING_DIR}"
+      fi
+      safe_gate_composer_add_scan_target "$(safe_gate_composer_resolve_path "${home}" "${base}" || true)"
+      if (( SAFE_GATE_COMPOSER_HAS_WORKING_DIR )); then
+        safe_gate_composer_add_scan_target "${target}"
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# Over-scan global routing targets: every existing directory is preflighted,
+# even before it has composer metadata. A nonexistent target contributes
+# nothing while other selected targets remain protected.
+safe_gate_composer_scan_targets() {
+  local target scan_rc
+  for target in "${SAFE_GATE_COMPOSER_SCAN_TARGETS[@]}"; do
+    [[ -d "${target}" ]] || continue
+    (
+      cd "${target}" || exit 125
+      safe_gate_scan_project
+    )
+    scan_rc=$?
+    if (( scan_rc == 125 )); then
+      safe_gate_err "safe: BLOCKED composer global — cannot enter the selected project for audit; repair its directory permissions, then retry; details: safe explain"
+      return 100
+    fi
+    (( scan_rc == 0 )) || return "${scan_rc}"
+  done
+  return 0
+}
+
 # Update-family subcommands resolve in-range instead of to the dist-tag; the
-# audit needs to know which semantics apply to resolve the real target.
+# audit needs to know which semantics apply to resolve the real target. npm's
+# widened dispatch must use its single classifier; other tools retain their
+# existing literal routing semantics.
 safe_gate_audit_op() {
+  local npm_class="" composer_token=""
+  if [[ "${SAFE_GATE_TOOL:-}" == "npm" ]]; then
+    npm_class="$(safe_gate_npm_subcommand_class "${SAFE_GATE_SUBCMD:-}")" || npm_class=""
+    [[ "${npm_class}" == "update" ]] && { printf '%s' update; return 0; }
+    printf '%s' install
+    return 0
+  fi
+  if [[ "${SAFE_GATE_TOOL:-}" == "composer" ]]; then
+    composer_token="$(safe_gate_composer_normalize_token "${SAFE_GATE_SUBCMD:-}")"
+    [[ "${composer_token}" == update ]] && { printf '%s' update; return 0; }
+    printf '%s' install
+    return 0
+  fi
   case "${SAFE_GATE_SUBCMD:-}" in
     update|u|up|upgrade|udpate) printf '%s' "update" ;;
     *) printf '%s' "install" ;;
@@ -953,15 +1446,13 @@ safe_gate_npm_lockfile_name() {
   return 1
 }
 
-# npm accepts unique command prefixes. Keep this narrow to the new lock-diff
-# lane: install/update aliases have their own pre-existing routing contract.
+# Lock-diff remains a separate API/caller surface, but classification is shared
+# with every npm route so aliases and two-character prefixes (for example dd)
+# cannot bypass the projection.
 safe_gate_npm_lockdiff_subcommand() {
-  local token="$1"
-  case "${token}" in
-    ddp|dedupe|prune) return 0 ;;
-  esac
-  (( ${#token} >= 3 )) || return 1
-  [[ "dedupe" == "${token}"* || "prune" == "${token}"* ]]
+  local class=""
+  class="$(safe_gate_npm_subcommand_class "$1")" || return 1
+  [[ "${class}" == "lockdiff" ]]
 }
 
 # A bare -- terminates npm's option parsing, so it neutralizes the projection
@@ -1770,7 +2261,7 @@ safe_gate_go_packages() {
 safe_gate_composer_packages() {
   local -a packages=()
   local arg
-  local skip_next=0
+  local skip_next=0 options_ended=0
 
   for arg in "$@"; do
     if (( skip_next )); then
@@ -1778,15 +2269,27 @@ safe_gate_composer_packages() {
       continue
     fi
 
+    if (( options_ended )); then
+      packages+=("$(safe_gate_colon_spec "${arg}")")
+      continue
+    fi
+
     case "${arg}" in
-      --dev|--update-no-dev|--update-with-dependencies|--update-with-all-dependencies|--ignore-platform-reqs|--no-update|--no-scripts|--no-progress|--no-install|--prefer-source|--prefer-dist|--prefer-install|--sort-packages|--optimize-autoloader|--classmap-authoritative|--apcu-autoloader)
+      --)
+        options_ended=1
         continue
         ;;
-      --working-dir|--repository)
+      --dev|--dry-run|--prefer-source|--prefer-dist|--fixed|--no-suggest|--no-progress|--no-update|--no-install|--no-audit|--no-security-blocking|--no-blocking|--update-no-dev|--update-with-dependencies|--update-with-all-dependencies|--with-dependencies|--with-all-dependencies|--ignore-platform-reqs|--prefer-stable|--prefer-lowest|--minimal-changes|--sort-packages|--optimize-autoloader|--classmap-authoritative|--apcu-autoloader|--no-scripts|--no-cache)
+        continue
+        ;;
+      # RequireCommand declares these four values; the application definition
+      # contributes --working-dir/-d. Every space-form value must be skipped
+      # so an optional interactive package argument cannot be fabricated.
+      --working-dir|-d|--repository|--prefer-install|--audit-format|--ignore-platform-req|--apcu-autoloader-prefix)
         skip_next=1
         continue
         ;;
-      --working-dir=*|--repository=*|--prefer-install=*)
+      --working-dir=*|-d?*|--repository=*|--prefer-install=*|--audit-format=*|--ignore-platform-req=*|--apcu-autoloader-prefix=*)
         continue
         ;;
       -*)
@@ -2111,6 +2614,7 @@ safe_gate_global_flags() {
 # fail-closed refusal and return 100 so the caller can `|| return $?`.
 safe_gate_route() {
   local tool="$1"; shift
+  SAFE_GATE_TOOL="${tool}"
   safe_gate_global_flags "${tool}"
   safe_gate_locate_subcommand "${SAFE_GATE_GVAL}" "${SAFE_GATE_GBOOL}" "$@"
   case $? in
@@ -2268,6 +2772,10 @@ safe_gate_npm_like() {
   # installer runs (delta-4 finding F4: selectors key off the installer).
   [[ "${tool}" == "bun" ]] && SAFE_GATE_INSTALLER="bun"
   local subcommand="${SAFE_GATE_SUBCMD}"
+  local npm_class=""
+  if [[ "${tool}" == "npm" ]]; then
+    npm_class="$(safe_gate_npm_subcommand_class "${subcommand}")" || npm_class=""
+  fi
   local npm_lockdiff_lane=1
   if [[ "${tool}" == "npm" ]] && safe_gate_npm_lockdiff_subcommand "${subcommand}"; then
     npm_lockdiff_lane=0
@@ -2298,18 +2806,19 @@ safe_gate_npm_like() {
   local raw_package
   local project_present=1
 
+  if [[ "${tool}" == "npm" && "${npm_class}" == "exec" ]]; then
+    # npm's config parser is greedy: --package is honored even after the
+    # command, so post_positional=1.
+    safe_gate_exec_gate "npm ${subcommand}" npm 1 1 \
+      '--package|-p' '' \
+      '-c|--call|-w|--workspace|--cache|--prefix|--registry|--userconfig|--globalconfig|--loglevel|--script-shell|--node-options|--omit|--include' \
+      '-y|--yes|--no|--offline|--prefer-offline|--prefer-online|--ignore-existing|--foreground-scripts|--silent|--quiet|--workspaces|--include-workspace-root' \
+      '' \
+      "${rest[@]}" || return $?
+    safe_gate_exec_real "${tool}" "$@"
+  fi
+
   case "${tool}:${subcommand}" in
-    npm:exec|npm:x)
-      # npm's config parser is greedy: --package is honored even after the
-      # command, so post_positional=1.
-      safe_gate_exec_gate "npm ${subcommand}" npm 1 1 \
-        '--package|-p' '' \
-        '-c|--call|-w|--workspace|--cache|--prefix|--registry|--userconfig|--globalconfig|--loglevel|--script-shell|--node-options|--omit|--include' \
-        '-y|--yes|--no|--offline|--prefer-offline|--prefer-online|--ignore-existing|--foreground-scripts|--silent|--quiet|--workspaces|--include-workspace-root' \
-        '' \
-        "${rest[@]}" || return $?
-      safe_gate_exec_real "${tool}" "$@"
-      ;;
     bun:x)
       safe_gate_exec_gate "bun x" npm 1 0 \
         '--package|-p' '' '' \
@@ -2329,10 +2838,17 @@ safe_gate_npm_like() {
       ;;
   esac
 
-  case "${subcommand}" in
-    install|i|it|install-test|add|ci|update|u|up|upgrade|udpate|dedupe|ddp|prune) ;;
-    *) (( npm_lockdiff_lane == 0 )) || safe_gate_exec_real "${tool}" "$@" ;;
-  esac
+  if [[ "${tool}" == "npm" ]]; then
+    case "${npm_class}" in
+      install|ci|update|lockdiff) ;;
+      *) (( npm_lockdiff_lane == 0 )) || safe_gate_exec_real "${tool}" "$@" ;;
+    esac
+  else
+    case "${subcommand}" in
+      install|i|it|install-test|add|ci|update|u|up|upgrade|udpate|dedupe|ddp|prune) ;;
+      *) (( npm_lockdiff_lane == 0 )) || safe_gate_exec_real "${tool}" "$@" ;;
+    esac
+  fi
 
   if [[ "${tool}" == "npm" ]]; then
     # Script-policy argv on a gated install could widen or replace the
@@ -2409,6 +2925,14 @@ safe_gate_npm_like() {
 
   if (( project_present == 0 )); then
     safe_gate_scan_project || return $?
+  fi
+
+  # npm's ci and install-ci-test families do not accept package argv. Their
+  # aliases/prefixes still receive the project scan above, while leaving the
+  # original command token for npm to validate and execute.
+  if [[ "${tool}" == "npm" && "${npm_class}" == "ci" ]]; then
+    safe_gate_exec_real "${tool}" "$@"
+    return $?
   fi
 
   safe_gate_collect raw "$("${parser}" "${rest[@]}")"
@@ -2759,33 +3283,67 @@ safe_gate_go() {
 }
 
 safe_gate_composer() {
-  safe_gate_route composer "$@" || return $?
-  safe_gate_scan_target_flags composer "$@"
-  local first="${SAFE_GATE_SUBCMD}"
-  local subidx=$SAFE_GATE_SUBCMD_IDX
-  local second="${@:subidx+1:1}"
+  local route_rc
+  safe_gate_composer_route "$@"
+  route_rc=$?
+  case "${route_rc}" in
+    2)
+      safe_gate_err "safe: BLOCKED composer global — cannot find the nested command past unrecognized flag '${SAFE_GATE_COMPOSER_BADFLAG}'; to allow: rewrite it as '${SAFE_GATE_COMPOSER_BADFLAG}=<value>', then retry; details: safe explain"
+      return 100
+      ;;
+    3)
+      safe_gate_err "safe: BLOCKED composer global — cannot resolve the Composer global project for audit; set COMPOSER_HOME or repair the Composer environment; details: safe explain"
+      return 100
+      ;;
+    4)
+      safe_gate_err "safe: BLOCKED composer ${SAFE_GATE_COMPOSER_REFUSE_TOKEN} — spell it canonically (${SAFE_GATE_COMPOSER_REFUSE_HINT}) or, if '${SAFE_GATE_COMPOSER_REFUSE_TOKEN}' is a project script, run it via ${SAFE_GATE_COMPOSER_SCRIPT_HINT}; details: safe explain"
+      return 100
+      ;;
+    5)
+      safe_gate_err "safe: BLOCKED composer global ${SAFE_GATE_COMPOSER_SUBCMD} — --working-dir must be an absolute path for audit; to allow: pass an absolute path; details: safe explain"
+      return 100
+      ;;
+    *)
+      (( route_rc == 0 )) || return "${route_rc}"
+      ;;
+  esac
   local -a packages=()
 
-  if [[ "${first}" != "global" || "${second}" != "require" ]]; then
-    if [[ "${first}" == "install" || "${first}" == "update" || "${first}" == "require" ]]; then
-      if safe_gate_composer_project_present; then
-        safe_gate_scan_project || return $?
+  if [[ "${SAFE_GATE_COMPOSER_CLASS}" == "require" ]]; then
+    safe_gate_collect packages "$(safe_gate_composer_packages "${SAFE_GATE_COMPOSER_PACKAGE_ARGS[@]}")"
+    if (( ${#packages[@]} == 0 )); then
+      if (( SAFE_GATE_COMPOSER_IS_GLOBAL )); then
+        safe_gate_err "safe: BLOCKED composer global require — specify at least one package explicitly so safe can audit it before Composer's interactive selection; to allow: pass <vendor/package>:<version>; details: safe explain"
+      else
+        safe_gate_err "safe: BLOCKED composer require — specify at least one package explicitly so safe can audit it before Composer's interactive selection; to allow: pass <vendor/package>:<version>; details: safe explain"
       fi
+      return 100
+    fi
+  fi
 
-      if [[ "${first}" == "require" ]]; then
-        safe_gate_collect packages "$(safe_gate_composer_packages "${@:subidx+1}")"
-        if (( ${#packages[@]} > 0 )); then
-          safe_gate_check_many composer "${packages[@]}" || return $?
-        fi
-      fi
+  if (( SAFE_GATE_COMPOSER_IS_GLOBAL )); then
+    case "${SAFE_GATE_COMPOSER_CLASS}" in
+      install|update|require)
+        safe_gate_composer_scan_targets || return $?
+        ;;
+    esac
+
+    if [[ "${SAFE_GATE_COMPOSER_CLASS}" == "require" ]]; then
+      safe_gate_check_many composer "${packages[@]}" || return $?
     fi
 
     safe_gate_exec_real composer "$@"
+    return $?
   fi
 
-  safe_gate_collect packages "$(safe_gate_composer_packages "${@:subidx+2}")"
-  if (( ${#packages[@]} > 0 )); then
-    safe_gate_check_many composer "${packages[@]}" || return $?
+  if [[ -n "${SAFE_GATE_COMPOSER_CLASS}" ]]; then
+    if safe_gate_composer_project_present; then
+      safe_gate_scan_project || return $?
+    fi
+
+    if [[ "${SAFE_GATE_COMPOSER_CLASS}" == "require" ]]; then
+      safe_gate_check_many composer "${packages[@]}" || return $?
+    fi
   fi
 
   safe_gate_exec_real composer "$@"
