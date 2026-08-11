@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Live contract probe for Socket's package-score envelope. This deliberately
+# Explicit opt-in live contract probe for Socket's package-score envelope.
+# Run `bash tests/live/socket_envelope.sh` manually; it is excluded from
+# tests/run-all.sh because it makes a real network call. This deliberately
 # never prints Socket output: an error response can include account context.
 
 set -euo pipefail

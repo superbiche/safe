@@ -4938,7 +4938,7 @@ socket_score_json() {
   # KILL escalation fires (timeout signals its own group — PR#65 delta-2 N3).
   { "${socket_leash[@]}" "${socket_invocation[@]}" package score "$purl_type" "$spec" --json > "$output.raw" 2>"$output.stderr" </dev/null || { score_rc=$?; score_ok=false; }; } 2>/dev/null
   if [[ "$score_ok" == "false" && ( "$score_rc" == "124" || "$score_rc" == "137" ) ]]; then
-    printf '%s\n' "$(jq -n --arg note "socket score timed out after ${socket_budget}s" '{available:true,status:"error",note:$note}')" > "$output"
+    printf '%s\n' "$(jq -n --arg note "socket score timed out after ${socket_budget}s" '{available:true,status:"error",timeout:true,note:$note}')" > "$output"
     return 0
   fi
 
@@ -4959,7 +4959,7 @@ socket_score_json() {
       # generic path below would read the (empty) kill-time output and
       # report a bare "socket command failed" (PR7 review F1).
       if [[ "$retry_rc" == "124" || "$retry_rc" == "137" ]]; then
-        printf '%s\n' "$(jq -n --arg note "socket score timed out after ${socket_budget}s" '{available:true,status:"error",note:$note}')" > "$output"
+        printf '%s\n' "$(jq -n --arg note "socket score timed out after ${socket_budget}s" '{available:true,status:"error",timeout:true,note:$note}')" > "$output"
         return 0
       fi
     fi
@@ -5764,12 +5764,14 @@ osv_query_package_json() {
     # shape (false, numbers, objects) is malformed and must not read as
     # "complete". Tokens travel through shell command substitution, which is
     # lossy for whitespace/control characters (a "\n" token would strip to
-    # empty and read as end-of-pagination): only accept tokens that survive
-    # the trip intact.
+    # empty and read as end-of-pagination): only accept a bounded token that
+    # survives the trip intact. The byte cap is checked before shell capture,
+    # so a malformed response cannot inflate argv or shell state.
     if ! jq -e '
       (has("next_page_token") | not)
       or (.next_page_token
-          | (type == "string") and (length > 0) and (test("^[[:graph:]]+$")))
+          | (type == "string") and (length > 0) and (utf8bytelength <= 4096)
+            and (test("^[[:graph:]]+$")))
     ' "$output.raw" >/dev/null 2>&1; then
       osv_write_package_query_result "$output" error "OSV pagination token malformed" "$vulns_file"
       return 0
@@ -7909,11 +7911,12 @@ check_command() {
     primary_version="$PKG_VERSION"
   fi
 
-  # Release age drives both the normal cooldown and the bounded patience
-  # exception for a fresh Socket score. Compute it once, before Socket, so
-  # the two policies cannot drift or observe different package metadata.
+  # The aggregate youngest age drives the cooldown. Socket patience is about
+  # the scored primary version, so it uses that version's own age from the
+  # same release map — a young sibling must not create patience for an old
+  # primary score.
   local cooldown_days cooldown_security_fix release_line="" release_age="" release_version="" release_published=""
-  local release_security_fix_ids="" release_exempt=0 release_ages_json='{}' release_info="" release_rc=2
+  local release_security_fix_ids="" release_exempt=0 release_ages_json='{}' primary_release_age="" release_info="" release_rc=2
   cooldown_days=$(install_policy_json | jq -r '.cooldown_days // 3')
   [[ "$cooldown_days" =~ ^[0-9]+$ ]] || cooldown_days=3
   cooldown_security_fix=$(install_policy_json | jq -r '.cooldown_security_fix // "exempt"')
@@ -7924,6 +7927,9 @@ check_command() {
     if (( release_rc == 0 )); then
       IFS=$'\t' read -r release_age release_version release_published release_ages_json <<<"$release_info"
       [[ -n "$release_ages_json" ]] || release_ages_json='{}'
+      primary_release_age=$(jq -er --arg version "$primary_version" '
+        .[$version] | select(type == "number" and . >= 0 and . == floor)
+      ' <<<"$release_ages_json" 2>/dev/null) || primary_release_age=""
     fi
   fi
 
@@ -7999,15 +8005,14 @@ check_command() {
     # inside the existing cooldown window, give that first computation one
     # longer bounded chance before deciding whether the score is pending.
     # Do not retry a 404, auth, rate-limit, or arbitrary backend failure.
-    if (( release_rc == 0 )) && (( release_age < cooldown_days )) \
-      && [[ "$(jq -r '.status // empty' "$socket_json" 2>/dev/null)" == "error" ]] \
-      && [[ "$(jq -r '.note // empty' "$socket_json" 2>/dev/null)" == socket\ score\ timed\ out\ after* ]]; then
+    if (( release_rc == 0 )) && [[ "$primary_release_age" =~ ^[0-9]+$ ]] \
+      && (( primary_release_age < cooldown_days )) \
+      && jq -e '(.status == "error") and (.timeout == true)' "$socket_json" >/dev/null 2>&1; then
       local fresh_socket_budget
       fresh_socket_budget=$(socket_fresh_scan_budget_seconds)
       socket_score_json "$ecosystem" "$socket_spec" "$socket_json" "$fresh_socket_budget"
-      if [[ "$(jq -r '.status // empty' "$socket_json" 2>/dev/null)" == "error" ]] \
-        && [[ "$(jq -r '.note // empty' "$socket_json" 2>/dev/null)" == socket\ score\ timed\ out\ after* ]]; then
-        jq -n --arg version "$primary_version" --argjson age_days "$release_age" \
+      if jq -e '(.status == "error") and (.timeout == true)' "$socket_json" >/dev/null 2>&1; then
+        jq -n --arg version "$primary_version" --argjson age_days "$primary_release_age" \
           --argjson timeout_seconds "$fresh_socket_budget" \
           '{available:true,status:"pending",
             note:("Socket scan not yet complete for fresh release " + $version),
@@ -8031,7 +8036,7 @@ check_command() {
     verdict="WARN"
   elif [[ "$(jq -r '.status' "$socket_json")" == "pending" ]]; then
     socket_pending=1
-    socket_line="PENDING (fresh release ${primary_version}, ${release_age}d old — Socket scan not yet complete)"
+    socket_line="PENDING (fresh release ${primary_version}, ${primary_release_age}d old — Socket scan not yet complete)"
     socket_detail=$(jq -r '.note // "Socket scan not yet complete"' "$socket_json" 2>/dev/null || true)
   elif [[ "$(jq -r '.status' "$socket_json")" != "ok" ]]; then
     local socket_note

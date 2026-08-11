@@ -127,6 +127,10 @@ if [[ "${MOCK_SOCKET_MODE:-ok}" == "error" ]]; then
   printf 'socket backend failed\n' >&2
   exit 1
 fi
+if [[ "${MOCK_SOCKET_MODE:-ok}" == "error-timeout-prefix" ]]; then
+  printf '{"message":"socket score timed out after a backend delay","cause":"backend unavailable"}\n'
+  exit 1
+fi
 if [[ "${MOCK_SOCKET_MODE:-ok}" == "high-alert" ]]; then
   socket_envelope 20 '[{"name":"didYouMean","severity":"high","category":"supplyChainRisk"}]'
   exit 0
@@ -1322,6 +1326,53 @@ if [[ "$(wc -l < "$CASE_DIR/socket-args.log")" == "1" ]]; then
   pass "old score timeout does not use the fresh retry"
 else
   fail "old score timeout does not use the fresh retry"
+fi
+
+# Patience belongs to the primary version being scored, not the aggregate
+# youngest resolved version used by cooldown. An old primary beside a young
+# sibling keeps the ordinary Socket infrastructure WARN and makes one call.
+prepare_case socket-multiversion-old-primary-timeout
+printf '{"dependencies":{"multi":"^1.0.0"}}\n' > "$CASE_DIR/project/package.json"
+printf '{"packages":{"node_modules/consumer":{"dependencies":{"multi":"^2.0.0"}}}}\n' > "$CASE_DIR/project/package-lock.json"
+printf '{"install":{"socket":{"mode":"always","fresh_scan_budget_seconds":1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 \
+  MOCK_PACKUMENT_MODE=multi \
+  MOCK_NPM_TIME_MULTI="$(date -d '40 days ago' -Is)|$(date -d '1 day ago' -Is)" \
+  MOCK_SOCKET_MODE=fresh-timeout \
+  MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" \
+  SAFE_AUDIT_SOCKET_TIMEOUT=1 -- \
+  multi --ecosystem npm --op update --project-dir "$CASE_DIR/project" --json
+expect_status 10 "a young sibling does not grant patience to an old primary"
+expect_json '.socket.status == "error" and .socket.timeout == true
+  and (.warn_causes | index("socket_error") != null)
+  and ((.warn_causes | index("socket_score_pending")) == null)
+  and .socket.fresh_release == null' \
+  "old primary timeout remains socket_error, never pending"
+if [[ "$(wc -l < "$CASE_DIR/socket-args.log")" == "1" ]]; then
+  pass "old primary beside a young sibling makes no fresh retry"
+else
+  fail "old primary beside a young sibling makes no fresh retry"
+fi
+
+# Only socket_score_json's local timeout envelopes may request patience. A
+# backend can happen to use the same prose, but remains a one-call error.
+prepare_case socket-backend-timeout-prefix
+printf '{"install":{"socket":{"mode":"always","fresh_scan_budget_seconds":1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 \
+  MOCK_NPM_TIME="$(date -d '1 hour ago' -Is)" \
+  MOCK_OSV_REMEDIATED_AT=1.0.0 \
+  MOCK_SOCKET_MODE=error-timeout-prefix \
+  MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 10 "backend timeout-looking prose remains an infrastructure WARN"
+expect_json '.socket.status == "error" and (.socket.timeout != true)
+  and (.warn_causes | index("socket_error") != null)
+  and ((.warn_causes | index("socket_score_pending")) == null)' \
+  "only a local timeout envelope can become pending"
+if [[ "$(wc -l < "$CASE_DIR/socket-args.log")" == "1" ]]; then
+  pass "backend timeout-looking prose does not retry"
+else
+  fail "backend timeout-looking prose does not retry"
 fi
 
 prepare_case socket-fresh-404

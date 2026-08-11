@@ -882,6 +882,28 @@ if expect_status 10 "non-string pagination token fails closed"; then
   pass "non-string pagination token fails closed"
 fi
 
+prepare_case pagination-over-cap-token
+PAGES="$CASE_DIR/pages"
+mkdir -p "$PAGES"
+{
+  printf '{"next_page_token":"'
+  head -c 4097 /dev/zero | tr '\0' x
+  printf '"}'
+} > "$PAGES/page1.json"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_PAGES="$PAGES" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install --json
+if expect_status 10 "an over-cap pagination token fails closed"; then
+  pass "an over-cap pagination token fails closed"
+fi
+if jq -e '.osv.status == "error" and .osv.note == "OSV pagination token malformed"' "$OUT_FILE" >/dev/null 2>&1; then
+  pass "over-cap pagination token produces the structured error envelope"
+else
+  fail "over-cap pagination token produces the structured error envelope"
+fi
+
 # ---------------------------------------------------------------------------
 # 23. vparse orders SemVer prerelease identifiers per spec (unit-level)
 # ---------------------------------------------------------------------------

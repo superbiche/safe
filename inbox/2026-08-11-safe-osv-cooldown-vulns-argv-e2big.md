@@ -52,9 +52,10 @@ Fixed by PR #73 (safe 1.14.0), as the rider on the fresh-release verdict
 slice. `osv_query_package_json` now keeps the advisory accumulator in a
 scratch file and emits every status/error/final write via `jq --slurpfile`
 (`osv_write_package_query_result` helper) — no `$vulns` passes through argv
-anywhere in the function, closing the whole defect class (unbounded data
-through argv). The cooldown security-fix waiver therefore engages again for
+in the advisory accumulator path. That accumulator defect is closed; the
+remaining pagination-token path is now bounded to 4096 bytes before shell
+capture. The cooldown security-fix waiver therefore engages again for
 advisory-heavy packages, and the stray bash stderr line is gone. Regression
-evidence: tests/audit/check_version_aware.sh case with a package-level OSV
-corpus above MAX_ARG_STRLEN asserting waiver engagement and no stderr leak
-(267/267 on host).
+evidence: tests/audit/check_version_aware.sh covers both a package-level OSV
+corpus above MAX_ARG_STRLEN and an over-cap pagination token, asserting the
+structured error path with no stderr leak.

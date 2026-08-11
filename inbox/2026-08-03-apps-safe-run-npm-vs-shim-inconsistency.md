@@ -66,6 +66,6 @@ when GuardDog + OSV + blocklist are all clean, WARN `socket_score_pending`
 otherwise, always a veto for the behavioral-ack second opinion. Same-day
 security-fix releases additionally regain the cooldown waiver via the
 E2BIG fix (see inbox/2026-08-11-safe-osv-cooldown-vulns-argv-e2big.md).
-Evidence: tests/audit/guarddog_tier.sh patience/pending cases (266/266),
-tests/live/socket_envelope.sh envelope pin, host tests/run-all.sh green.
+Evidence: tests/audit/guarddog_tier.sh patience/pending regressions; Socket
+live-probe evidence stands separately; host tests/run-all.sh green.
 All three items of this note are now closed.

@@ -25,10 +25,10 @@ SAFE_GATE_SOCKET_FRESH_SCAN_BUDGET_DEFAULT=90
 # Sequential multiplicity inside one `safe-audit check`, mirrored from
 # bin/safe-audit (PR#65 review F1 — the leash must cover the real bounded
 # path, not a one-of-each sketch):
-# - socket_score_json can run TWICE with the full budget: the first attempt
-#   plus the vault-injected retry after a late auth failure (delta N1). A
-#   young release whose first bounded score times out can then make ONE
-#   extended fresh-scan attempt; its separate budget is added below.
+# - each socket_score_json call can run TWICE with its full budget: the first
+#   attempt plus the vault-injected retry after a late auth failure (delta N1).
+#   A young release whose first bounded score times out can then make ONE
+#   extended fresh-scan call with the same two-attempt shape.
 # - resolve_target_versions caps RESOLVED_VERSIONS at 4; GuardDog runs a
 #   --version probe plus one scan per resolved version, each with the full
 #   configured budget.
@@ -293,7 +293,7 @@ safe_gate_socket_fresh_scan_budget() {
 # timeout instead of completing with "socket unavailable — infra WARN".
 # The leash is therefore a BACKSTOP against unbounded regressions, not the
 # operative timeout; the component budgets are. With defaults it computes to
-# 15*2 + 90 + 120*(1+4) + 80*(4+1) + 120 = 1240s — deliberately generous:
+# 15*2 + 90*2 + 120*(1+4) + 80*(4+1) + 120 = 1330s — deliberately generous:
 # it only
 # fires when a component escapes its own bound, which previously meant an
 # indefinite hang. The one fresh-release score retry is sequential with the
@@ -307,13 +307,14 @@ safe_gate_audit_leash_seconds() {
     printf '%s\n' "${SAFE_INSTALL_TIMEOUT_SECONDS}"
     return 0
   fi
-  local guarddog_budget fresh_socket_budget
+  local guarddog_budget socket_budget="${1:-}" fresh_socket_budget="${2:-}"
   guarddog_budget="$(jq -r '.install.guarddog.timeout_seconds // 120' \
     "$(safe_gate_run_config_dir)/config.json" 2>/dev/null || true)"
   safe_gate_timeout_value_ok "${guarddog_budget}" || guarddog_budget=120
-  fresh_socket_budget="$(safe_gate_socket_fresh_scan_budget)"
-  printf '%s\n' "$(( $(safe_gate_socket_budget) * SAFE_GATE_SOCKET_ATTEMPTS \
-    + fresh_socket_budget \
+  safe_gate_timeout_value_ok "${socket_budget}" || socket_budget="$(safe_gate_socket_budget)"
+  safe_gate_timeout_value_ok "${fresh_socket_budget}" || fresh_socket_budget="$(safe_gate_socket_fresh_scan_budget)"
+  printf '%s\n' "$(( socket_budget * SAFE_GATE_SOCKET_ATTEMPTS \
+    + fresh_socket_budget * SAFE_GATE_SOCKET_ATTEMPTS \
     + guarddog_budget * (1 + SAFE_GATE_MAX_RESOLVED_VERSIONS) \
     + SAFE_GATE_OSV_QUERY_BUDGET * (SAFE_GATE_MAX_RESOLVED_VERSIONS + 1) \
     + SAFE_GATE_AUDIT_OVERHEAD_SECONDS ))"
@@ -332,7 +333,7 @@ safe_gate_run_audit() {
   [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]] && extra+=(--project-dir "${SAFE_GATE_PROJECT_DIR}")
   [[ -n "${SAFE_GATE_NPM_USERCONFIG:-}" ]] && extra+=(--npm-userconfig "${SAFE_GATE_NPM_USERCONFIG}")
   [[ -n "${SAFE_GATE_NPM_GLOBALCONFIG:-}" ]] && extra+=(--npm-globalconfig "${SAFE_GATE_NPM_GLOBALCONFIG}")
-  local socket_budget fresh_socket_budget
+  local socket_budget fresh_socket_budget audit_leash
   socket_budget="$(safe_gate_socket_budget)"
   fresh_socket_budget="$(safe_gate_socket_fresh_scan_budget)"
   # --kill-after: TERM-only timeout is not a backstop — a TERM-resistant
@@ -341,6 +342,7 @@ safe_gate_run_audit() {
   # timeout recorder, so the leash value handed here is pinned at the real
   # call site, not self-reported.
   if command -v timeout >/dev/null 2>&1; then
+    audit_leash="$(safe_gate_audit_leash_seconds "$socket_budget" "$fresh_socket_budget")"
     # fd shuffle: the audit child's stderr stays on the real stderr (via fd
     # 3) while the SHELL's own job-death diagnostic is discarded — GNU
     # timeout without --foreground signals its own process group, so a KILL
@@ -350,7 +352,7 @@ safe_gate_run_audit() {
     {
       SAFE_AUDIT_SOCKET_TIMEOUT="${socket_budget}" \
         SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT="${fresh_socket_budget}" \
-        timeout --kill-after=2s "$(safe_gate_audit_leash_seconds)" \
+        timeout --kill-after=2s "$audit_leash" \
         "${SAFE_GATE_AUDIT_BIN}" check "$@" "${extra[@]}" 2>&3
       rc=$?
     } 3>&2 2>/dev/null
