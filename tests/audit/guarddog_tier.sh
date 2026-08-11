@@ -119,28 +119,51 @@ chmod +x "$COMMONBIN/curl"
 cat > "$COMMONBIN/socket" <<'MOCK'
 #!/usr/bin/env bash
 [[ -n "${MOCK_SOCKET_ARGS_LOG:-}" ]] && printf '%s\n' "$*" >> "$MOCK_SOCKET_ARGS_LOG"
+socket_envelope() {
+  local score="$1" alerts="$2"
+  printf '{"ok":true,"data":{"purl":"pkg:npm/demo@1.0.0","self":{"alerts":%s,"capabilities":[],"purl":"pkg:npm/demo@1.0.0","score":{"overall":%s,"supplyChain":80,"quality":80,"maintenance":80,"vulnerability":80,"license":80}},"transitively":[]}}\n' "$alerts" "$score"
+}
 if [[ "${MOCK_SOCKET_MODE:-ok}" == "error" ]]; then
   printf 'socket backend failed\n' >&2
   exit 1
 fi
+if [[ "${MOCK_SOCKET_MODE:-ok}" == "error-timeout-prefix" ]]; then
+  printf '{"message":"socket score timed out after a backend delay","cause":"backend unavailable"}\n'
+  exit 1
+fi
 if [[ "${MOCK_SOCKET_MODE:-ok}" == "high-alert" ]]; then
-  printf '{"ok":true,"data":{"self":{"score":{"overall":20},"alerts":[{"name":"didYouMean","severity":"high","category":"supplyChainRisk"}]}}}\n'
+  socket_envelope 20 '[{"name":"didYouMean","severity":"high","category":"supplyChainRisk"}]'
   exit 0
 fi
 if [[ "${MOCK_SOCKET_MODE:-ok}" == "unknown-severity" ]]; then
   # ok:true envelope whose alert severity is outside Socket's enum: an
   # alert safe cannot classify must veto, never count as not-high
   # (PR#67 F1 delta residual — "HIGH", "urgent", Unicode lookalikes).
-  printf '{"ok":true,"data":{"self":{"score":{"overall":40},"alerts":[{"name":"didYouMean","severity":"HIGH","category":"supplyChainRisk"}]}}}\n'
+  socket_envelope 40 '[{"name":"didYouMean","severity":"HIGH","category":"supplyChainRisk"}]'
   exit 0
 fi
 if [[ "${MOCK_SOCKET_MODE:-ok}" == "bare" ]]; then
   # Schema-less exit-0 body: says nothing about the package and must never
   # count as the clean second opinion (PR#67 F1).
-  printf '{"score":95}\n'
+  printf '{}\n'
   exit 0
 fi
-printf '{"ok":true,"data":{"self":{"score":{"overall":80},"alerts":[]}}}\n'
+case "${MOCK_SOCKET_MODE:-ok}" in
+  fresh-timeout-then-ok)
+    if [[ -e "${MOCK_SOCKET_STATE:?}" ]]; then
+      socket_envelope 82 '[]'
+      exit 0
+    fi
+    : > "${MOCK_SOCKET_STATE}"
+    sleep 30
+    ;;
+  fresh-timeout|hang) sleep 30 ;;
+  not-found)
+    printf '{"ok":false,"message":"Socket API error","cause":"Not Found (404)","data":{"code":404}}\n'
+    exit 1
+    ;;
+esac
+socket_envelope 80 '[]'
 MOCK
 chmod +x "$COMMONBIN/socket"
 
@@ -614,6 +637,24 @@ write_ack_entry 1.0.0 "$ack_full_rules"
 run_check 1 MOCK_GUARDDOG_MODE=block MOCK_SOCKET_MODE=error -- demo@1.0.0 --ecosystem npm --json
 expect_status 20 "no Socket second opinion, no downgrade"
 expect_grep "$OUT_FILE" 'requires a Socket second opinion' "the veto names the missing second opinion"
+
+prepare_case ack-socket-pending-veto
+write_ack_entry 1.0.0 "$ack_full_rules"
+printf '{"install":{"socket":{"fresh_scan_budget_seconds":1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 \
+  MOCK_GUARDDOG_MODE=block \
+  MOCK_NPM_TIME="$(date -d '1 hour ago' -Is)" \
+  MOCK_OSV_REMEDIATED_AT=1.0.0 \
+  MOCK_SOCKET_MODE=fresh-timeout \
+  SAFE_AUDIT_SOCKET_TIMEOUT=1 -- \
+  demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 20 "pending Socket score vetoes a behavioral acknowledgement"
+expect_json '.verdict == "BLOCK" and .socket.status == "pending"
+  and (.warn_causes | index("socket_score_pending") != null)
+  and (.warn_causes | index("guarddog_high_risk") != null)' \
+  "pending receipt retains the missing second-opinion cause and BLOCK"
+expect_grep "$OUT_FILE" 'requires a Socket second opinion' \
+  "pending Socket state is not accepted as acknowledgement evidence"
 
 prepare_case ack-socket-high-alert-veto
 write_ack_entry 1.0.0 "$ack_full_rules"
@@ -1197,6 +1238,160 @@ if grep -q '^Release age:' "$OUT_FILE"; then
   fail "no release-age line when the cooldown is disabled"
 else
   pass "no release-age line when the cooldown is disabled"
+fi
+
+# A first Socket timeout for a young security-fix release gets one extended,
+# still-bounded score attempt. A real envelope from that retry is evidence,
+# not a pending waiver.
+prepare_case socket-fresh-retry-success
+printf '{"install":{"socket":{"mode":"always","fresh_scan_budget_seconds":1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 \
+  MOCK_NPM_TIME="$(date -d '1 hour ago' -Is)" \
+  MOCK_OSV_REMEDIATED_AT=1.0.0 \
+  MOCK_SOCKET_MODE=fresh-timeout-then-ok \
+  MOCK_SOCKET_STATE="$CASE_DIR/socket-state" \
+  MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" \
+  SAFE_AUDIT_SOCKET_TIMEOUT=1 -- \
+  demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 0 "young Socket timeout retries into a scored GO"
+expect_json '.verdict == "GO" and .socket.status == "ok"
+  and .socket.raw.data.self.score.overall == 82 and .warn_causes == []' \
+  "retry receipt preserves the real Socket score"
+if [[ "$(wc -l < "$CASE_DIR/socket-args.log")" == "2" ]]; then
+  pass "fresh score path makes exactly one retry"
+else
+  fail "fresh score path makes exactly one retry"
+fi
+
+# When that extended retry also times out, clean GuardDog, OSV, and blocklist
+# evidence permit a disclosed GO. Install-known must retain PENDING, never
+# misstate that a clean Socket score was obtained.
+prepare_case socket-fresh-pending-clean
+printf '{"install":{"socket":{"mode":"always","fresh_scan_budget_seconds":1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 \
+  MOCK_NPM_TIME="$(date -d '1 hour ago' -Is)" \
+  MOCK_OSV_REMEDIATED_AT=1.0.0 \
+  MOCK_SOCKET_MODE=fresh-timeout \
+  SAFE_AUDIT_SOCKET_TIMEOUT=1 -- \
+  demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 0 "clean fresh score pending still gates GO"
+expect_json '.verdict == "GO" and .socket.status == "pending"
+  and (.checks.socket | startswith("PENDING (fresh release 1.0.0"))
+  and .warn_causes == []' \
+  "pending score is disclosed without an infrastructure WARN"
+if jq -e '.packages["npm:demo"].reasons | index("socket_score_pending") != null' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "GO evidence records the pending Socket state honestly"
+else
+  fail "GO evidence records the pending Socket state honestly"
+fi
+# Pending-score evidence is not fully clean: the offline stale-evidence
+# fallback in gate-lib selects verdict == "GO" only, so the record must
+# carry the distinct verdict (same exclusion principle as WARN_TOLERATED).
+if jq -e '.packages["npm:demo"].verdict == "GO_PENDING_SOCKET"' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "pending GO records a distinct verdict excluded from the offline fallback"
+else
+  fail "pending GO records a distinct verdict excluded from the offline fallback"
+fi
+
+prepare_case socket-fresh-pending-guarddog-error
+printf '{"install":{"socket":{"fresh_scan_budget_seconds":1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 \
+  MOCK_NPM_TIME="$(date -d '1 hour ago' -Is)" \
+  MOCK_OSV_REMEDIATED_AT=1.0.0 \
+  MOCK_GUARDDOG_MODE=error \
+  MOCK_SOCKET_MODE=fresh-timeout \
+  SAFE_AUDIT_SOCKET_TIMEOUT=1 -- \
+  demo@1.0.0 --ecosystem npm --json
+expect_status 10 "pending score beside GuardDog failure remains WARN"
+expect_json '.verdict == "WARN" and .socket.status == "pending"
+  and (.warn_causes | index("guarddog_error") != null)
+  and (.warn_causes | index("socket_score_pending") != null)' \
+  "pending cause is explicit when companion evidence is incomplete"
+
+prepare_case socket-old-timeout
+printf '{"install":{"socket":{"mode":"always","fresh_scan_budget_seconds":1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 \
+  MOCK_NPM_TIME="$(date -d '30 days ago' -Is)" \
+  MOCK_SOCKET_MODE=fresh-timeout \
+  MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" \
+  SAFE_AUDIT_SOCKET_TIMEOUT=1 -- \
+  demo@1.0.0 --ecosystem npm --json
+expect_status 10 "old Socket timeout keeps the infrastructure WARN"
+expect_json '.socket.status == "error" and (.warn_causes | index("socket_error") != null)
+  and ((.warn_causes | index("socket_score_pending")) == null)' \
+  "old timeout remains socket_error, not pending"
+if [[ "$(wc -l < "$CASE_DIR/socket-args.log")" == "1" ]]; then
+  pass "old score timeout does not use the fresh retry"
+else
+  fail "old score timeout does not use the fresh retry"
+fi
+
+# Patience belongs to the primary version being scored, not the aggregate
+# youngest resolved version used by cooldown. An old primary beside a young
+# sibling keeps the ordinary Socket infrastructure WARN and makes one call.
+prepare_case socket-multiversion-old-primary-timeout
+printf '{"dependencies":{"multi":"^1.0.0"}}\n' > "$CASE_DIR/project/package.json"
+printf '{"packages":{"node_modules/consumer":{"dependencies":{"multi":"^2.0.0"}}}}\n' > "$CASE_DIR/project/package-lock.json"
+printf '{"install":{"socket":{"mode":"always","fresh_scan_budget_seconds":1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 \
+  MOCK_PACKUMENT_MODE=multi \
+  MOCK_NPM_TIME_MULTI="$(date -d '40 days ago' -Is)|$(date -d '1 day ago' -Is)" \
+  MOCK_SOCKET_MODE=fresh-timeout \
+  MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" \
+  SAFE_AUDIT_SOCKET_TIMEOUT=1 -- \
+  multi --ecosystem npm --op update --project-dir "$CASE_DIR/project" --json
+expect_status 10 "a young sibling does not grant patience to an old primary"
+expect_json '.socket.status == "error" and .socket.timeout == true
+  and (.warn_causes | index("socket_error") != null)
+  and ((.warn_causes | index("socket_score_pending")) == null)
+  and .socket.fresh_release == null' \
+  "old primary timeout remains socket_error, never pending"
+if [[ "$(wc -l < "$CASE_DIR/socket-args.log")" == "1" ]]; then
+  pass "old primary beside a young sibling makes no fresh retry"
+else
+  fail "old primary beside a young sibling makes no fresh retry"
+fi
+
+# Only socket_score_json's local timeout envelopes may request patience. A
+# backend can happen to use the same prose, but remains a one-call error.
+prepare_case socket-backend-timeout-prefix
+printf '{"install":{"socket":{"mode":"always","fresh_scan_budget_seconds":1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 \
+  MOCK_NPM_TIME="$(date -d '1 hour ago' -Is)" \
+  MOCK_OSV_REMEDIATED_AT=1.0.0 \
+  MOCK_SOCKET_MODE=error-timeout-prefix \
+  MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --gate install --json
+expect_status 10 "backend timeout-looking prose remains an infrastructure WARN"
+expect_json '.socket.status == "error" and (.socket.timeout != true)
+  and (.warn_causes | index("socket_error") != null)
+  and ((.warn_causes | index("socket_score_pending")) == null)' \
+  "only a local timeout envelope can become pending"
+if [[ "$(wc -l < "$CASE_DIR/socket-args.log")" == "1" ]]; then
+  pass "backend timeout-looking prose does not retry"
+else
+  fail "backend timeout-looking prose does not retry"
+fi
+
+prepare_case socket-fresh-404
+printf '{"install":{"socket":{"mode":"always","fresh_scan_budget_seconds":1}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check 1 \
+  MOCK_NPM_TIME="$(date -d '1 hour ago' -Is)" \
+  MOCK_OSV_REMEDIATED_AT=1.0.0 \
+  MOCK_SOCKET_MODE=not-found \
+  MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-args.log" -- \
+  demo@1.0.0 --ecosystem npm --json
+expect_status 10 "Socket 404 remains an infrastructure error"
+expect_json '.socket.status == "error" and (.socket.note | contains("404"))
+  and (.warn_causes | index("socket_error") != null)
+  and ((.warn_causes | index("socket_score_pending")) == null)' \
+  "404 never masquerades as a fresh-score pending state"
+if [[ "$(wc -l < "$CASE_DIR/socket-args.log")" == "1" ]]; then
+  pass "404 does not use the fresh retry"
+else
+  fail "404 does not use the fresh retry"
 fi
 
 # --- review closures (PR#60 round 1) ----------------------------------------
