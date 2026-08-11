@@ -6,7 +6,7 @@
   "gated_surfaces": [
     {
       "surface": "npx, bunx, uvx",
-      "mechanism": "Binaries are symlinked to `safe run`: packages run from a project node_modules/.bin (bare unversioned names, current or parent dir), an allowlist, a Podman sandbox, or not at all.",
+      "mechanism": "Binaries are symlinked to `safe run`: packages run from a project node_modules/.bin (bare unversioned names, current or parent dir), an allowlist, a Podman sandbox, or not at all. A bare name for a gate-bound package-manager tool silently delegates to that tool's PATH wrapper; a missing or non-gate-bound target refuses.",
       "refusal": "`safe run: BLOCKED ...` + exit 100-104"
     },
     {

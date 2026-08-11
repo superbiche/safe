@@ -1507,7 +1507,7 @@ STUB
   cat > "${BIN_DIR}/safe-core" <<'STUB'
 #!/usr/bin/env bash
 case "${1:-}" in
-  --version) printf '1.12.0\n' ;;
+  --version) printf '1.13.0\n' ;;
   lockdiff) printf '{"schema":1}\n' ;;
 esac
 STUB
@@ -1526,7 +1526,7 @@ STUB
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
   assert_status 100 "$FUNCNAME" || return
-  assert_err_contains_fragment 'safe-core version 0.0.0 does not match safe 1.12.0' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe-core version 0.0.0 does not match safe 1.13.0' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'PROJECTION\tnpm' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -1862,12 +1862,12 @@ case_install_idempotent_no_wrappers() {
   assert_count 1 'fpath=("$HOME/.local/share/zsh/site-functions" $fpath)' "${HOME_DIR}/.zshrc" "$FUNCNAME" || return
   [[ -f "${HOME_DIR}/.local/share/zsh/site-functions/_safe" ]] || { fail "$FUNCNAME"; return; }
   [[ -x "${HOME_DIR}/.local/bin/safe-core" ]] || { fail "$FUNCNAME"; return; }
-  [[ "$("${HOME_DIR}/.local/bin/safe-core" --version)" == "1.12.0" ]] || { fail "$FUNCNAME"; return; }
+  [[ "$("${HOME_DIR}/.local/bin/safe-core" --version)" == "1.13.0" ]] || { fail "$FUNCNAME"; return; }
   local doctor_json
   doctor_json="$(HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" \
     "${HOME_DIR}/.local/bin/safe" doctor --json)" || { fail "$FUNCNAME"; return; }
   jq -e '.dependencies.core.safe_core.present == true
-    and .dependencies.core.safe_core.version == "1.12.0"
+    and .dependencies.core.safe_core.version == "1.13.0"
     and .environment.safe_core.version_matches == true
     and .environment.safe_core.warning == null' <<<"${doctor_json}" >/dev/null || { fail "$FUNCNAME"; return; }
   # The suite core is release-versioned for gate-time parity. Replace the
@@ -4295,6 +4295,151 @@ EOF
   pass "$FUNCNAME"
 }
 
+case_safe_run_gated_tool_delegation() {
+  prepare_case "safe-run-gated-tool-delegation" no
+  local gate_bin="${CASE_DIR}/gate-bin"
+  local delegate_target="${CASE_DIR}/npm-gate-wrapper"
+  local runner
+  mkdir -p "${gate_bin}"
+
+  # Keep the marker target separate from its PATH name: the runtime classifier
+  # must follow a symlink, then exec it with the npm argv0 intact.
+  cat > "${delegate_target}" <<'EOF'
+#!/usr/bin/env bash
+# safe-gate-wrapper v1 tool=npm
+printf 'WRAPPER_ARGV0=%s\n' "${0##*/}" >> "${SAFE_RUN_DELEGATE_LOG}"
+exec safe gate npm -- "$@"
+EOF
+  chmod +x "${delegate_target}"
+  ln -s "${delegate_target}" "${gate_bin}/npm"
+
+  rm -f "${BIN_DIR}/safe"
+  cat > "${BIN_DIR}/safe" <<'EOF'
+#!/usr/bin/env bash
+{
+  printf 'SAFE'
+  for arg in "$@"; do
+    printf '\t%s' "$arg"
+  done
+  printf '\n'
+} >> "${SAFE_RUN_DELEGATE_LOG}"
+exit "${SAFE_RUN_DELEGATE_RC:-0}"
+EOF
+  chmod +x "${BIN_DIR}/safe"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "${BIN_DIR}/podman"
+  chmod +x "${BIN_DIR}/podman"
+
+  run_safe_runner() {
+    local executable="$1"
+    shift
+    SAFE_RUN_CONFIG_DIR="${CASE_DIR}/run-config" \
+      SAFE_RUN_DATA_DIR="${CASE_DIR}/run-data" \
+      SAFE_RUN_DELEGATE_LOG="${CASE_DIR}/delegate.log" \
+      SAFE_RUN_DELEGATE_RC="${SAFE_RUN_DELEGATE_RC:-0}" \
+      PATH="${gate_bin}:${BIN_DIR}:/usr/bin:/bin" \
+      "${executable}" "$@" >"${OUT_FILE}" 2>"${ERR_FILE}"
+    STATUS=$?
+  }
+
+  SAFE_RUN_DELEGATE_RC=37 run_safe_runner "${ROOT_DIR}/bin/safe-run" npm update tar
+  assert_status 37 "$FUNCNAME" || return
+  grep -Fxq 'WRAPPER_ARGV0=npm' "${CASE_DIR}/delegate.log" || { fail "$FUNCNAME"; return; }
+  grep -Fxq $'SAFE\tgate\tnpm\t--\tupdate\ttar' "${CASE_DIR}/delegate.log" || { fail "$FUNCNAME"; return; }
+  [[ ! -s "${ERR_FILE}" ]] || { fail "$FUNCNAME"; return; }
+  grep -Fq 'GATE_DELEGATION' "${CASE_DIR}/run-data/audit.log" || { fail "$FUNCNAME"; return; }
+
+  # An executable without an exact marker must not run.
+  rm -f "${gate_bin}/npm" "${CASE_DIR}/delegate.log"
+  cat > "${gate_bin}/npm" <<'EOF'
+#!/usr/bin/env bash
+touch "${SAFE_RUN_DELEGATE_LOG}.canary"
+EOF
+  chmod +x "${gate_bin}/npm"
+  SAFE_RUN_DELEGATE_RC=0 run_safe_runner "${ROOT_DIR}/bin/safe-run" npm update tar
+  assert_status 100 "$FUNCNAME" || return
+  grep -Fq 'npm is not gate-bound on PATH' "${ERR_FILE}" || { fail "$FUNCNAME"; return; }
+  [[ ! -e "${CASE_DIR}/delegate.log.canary" ]] || { fail "$FUNCNAME"; return; }
+  grep -Fq 'GATE_TARGET_NOT_BOUND' "${CASE_DIR}/run-data/audit.log" || { fail "$FUNCNAME"; return; }
+
+  # A versioned package spec remains on the package lane, not the PATH wrapper.
+  rm -f "${gate_bin}/npm" "${CASE_DIR}/delegate.log"
+  ln -s "${delegate_target}" "${gate_bin}/npm"
+  SAFE_RUN_DELEGATE_RC=0 run_safe_runner "${ROOT_DIR}/bin/safe-run" npm@1.2.3 update tar
+  assert_status 102 "$FUNCNAME" || return
+  [[ ! -e "${CASE_DIR}/delegate.log" ]] || { fail "$FUNCNAME"; return; }
+
+  # F1 (PR#72 review): plain relative paths, trailing slashes, and the bare
+  # path operands are command paths too — never the invalid-package 103 lane.
+  for runner in /tmp/safe-run-absolute ./safe-run-relative ../safe-run-parent tools/npm npm/ . ..; do
+    SAFE_RUN_DELEGATE_RC=0 run_safe_runner "${ROOT_DIR}/bin/safe-run" "${runner}" update tar
+    assert_status 100 "$FUNCNAME" || return
+    grep -Fq 'command paths are unsupported' "${ERR_FILE}" || { fail "$FUNCNAME"; return; }
+    [[ "$(grep -c . "${ERR_FILE}")" == "1" ]] || { fail "$FUNCNAME"; return; }
+  done
+  grep -Fq 'UNSUPPORTED_COMMAND_PATH' "${CASE_DIR}/run-data/audit.log" || { fail "$FUNCNAME"; return; }
+
+  # ...while a scoped npm spec's slash keeps the package lane (non-TTY
+  # unknown → 102, and never the command-path refusal).
+  SAFE_RUN_DELEGATE_RC=0 run_safe_runner "${ROOT_DIR}/bin/safe-run" @scope/pkg --help
+  assert_status 102 "$FUNCNAME" || return
+  grep -Fq 'command paths are unsupported' "${ERR_FILE}" && { fail "$FUNCNAME"; return; }
+
+  # F2 (PR#72 review): --no-install is a strict local-only contract; a
+  # gate-listed bare tool must NOT silently delegate past it. With no local
+  # node_modules/.bin/npm the package lane refuses (100) and nothing execs.
+  rm -f "${CASE_DIR}/delegate.log"
+  SAFE_RUN_DELEGATE_RC=0 run_safe_runner "${ROOT_DIR}/bin/safe-run" --no-install npm exec cowsay
+  assert_status 100 "$FUNCNAME" || return
+  grep -Fq -- '--no-install requested' "${ERR_FILE}" || { fail "$FUNCNAME"; return; }
+  [[ ! -e "${CASE_DIR}/delegate.log" ]] || { fail "$FUNCNAME"; return; }
+
+  # F3 (PR#72 review): a trailing empty PATH component means the current
+  # directory in shell lookup. Probe the SHIPPED walker under a fully
+  # synthetic PATH (set inside the child, after sourcing, so the fixture
+  # never depends on host /usr/bin contents).
+  local cwd_gate="${CASE_DIR}/cwd-gate" cwd_candidate
+  mkdir -p "${cwd_gate}"
+  cp "${delegate_target}" "${cwd_gate}/npm"
+  chmod +x "${cwd_gate}/npm"
+  cwd_candidate=$(SAFE_RUN_NO_INIT=1 SAFE_RUN_PATH="${ROOT_DIR}/bin/safe-run" CWD_GATE="${cwd_gate}" bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    cd "$CWD_GATE" || exit 1
+    PATH="/nonexistent-first:"
+    safe_run_first_path_candidate npm
+  ' safe-run)
+  [[ "$cwd_candidate" == "./npm" ]] || { fail "$FUNCNAME"; return; }
+
+  # A linked npx/bunx/uvx target must fail before it can recurse into safe-run.
+  rm -f "${gate_bin}/npm"
+  ln -s "${ROOT_DIR}/bin/safe-run" "${gate_bin}/npm"
+  SAFE_RUN_DELEGATE_RC=0 run_safe_runner "${ROOT_DIR}/bin/safe-run" npm update tar
+  assert_status 100 "$FUNCNAME" || return
+  grep -Fq 'resolves to safe run itself' "${ERR_FILE}" || { fail "$FUNCNAME"; return; }
+  grep -Fq 'GATE_TARGET_SELF' "${CASE_DIR}/run-data/audit.log" || { fail "$FUNCNAME"; return; }
+
+  # Delegation intercepts --proxy before its normal ignored-proxy warning, so
+  # an explicit sandbox flag produces only the prescribed advisory line.
+  rm -f "${gate_bin}/npm" "${CASE_DIR}/delegate.log"
+  ln -s "${delegate_target}" "${gate_bin}/npm"
+  SAFE_RUN_DELEGATE_RC=0 run_safe_runner "${ROOT_DIR}/bin/safe-run" --proxy npm update tar
+  assert_status 0 "$FUNCNAME" || return
+  grep -Fq 'sandbox flags do not apply when delegating to the gate' "${ERR_FILE}" || { fail "$FUNCNAME"; return; }
+  [[ "$(grep -c . "${ERR_FILE}")" == "1" ]] || { fail "$FUNCNAME"; return; }
+  grep -Fq 'WARNING: --proxy ignored' "${ERR_FILE}" && { fail "$FUNCNAME"; return; }
+
+  # argv0-linked runner entry points share the same classifier.
+  for runner in npx bunx uvx; do
+    ln -sf "${ROOT_DIR}/bin/safe-run" "${gate_bin}/${runner}"
+    rm -f "${CASE_DIR}/delegate.log"
+    SAFE_RUN_DELEGATE_RC=0 run_safe_runner "${gate_bin}/${runner}" npm update tar
+    assert_status 0 "$FUNCNAME" || return
+    grep -Fxq 'WRAPPER_ARGV0=npm' "${CASE_DIR}/delegate.log" || { fail "$FUNCNAME"; return; }
+  done
+
+  pass "$FUNCNAME"
+}
+
 main() {
   local case
   for case in \
@@ -4454,7 +4599,8 @@ main() {
     case_mise_wrapper_dispatches_foreign_argv0 \
     case_mise_wrapper_dispatch_without_real_mise_is_legible \
     case_mise_wrapper_helper_matches_installer_output \
-    case_uninstall_cleans_shell_and_legacy_binaries
+    case_uninstall_cleans_shell_and_legacy_binaries \
+    case_safe_run_gated_tool_delegation
   do
     "$case"
   done

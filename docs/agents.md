@@ -37,7 +37,7 @@ the operator verbatim, wait, then retry the original command unchanged.
 <!-- BEGIN GENERATED: gated-surfaces -->
 | Surface | Mechanism | Refusal source |
 | --- | --- | --- |
-| `npx, bunx, uvx` | Binaries are symlinked to `safe run`: packages run from a project node_modules/.bin (bare unversioned names, current or parent dir), an allowlist, a Podman sandbox, or not at all. | `safe run: BLOCKED ...` + exit 100-104 |
+| `npx, bunx, uvx` | Binaries are symlinked to `safe run`: packages run from a project node_modules/.bin (bare unversioned names, current or parent dir), an allowlist, a Podman sandbox, or not at all. A bare name for a gate-bound package-manager tool silently delegates to that tool's PATH wrapper; a missing or non-gate-bound target refuses. | `safe run: BLOCKED ...` + exit 100-104 |
 | `npm, pnpm, pnpx, yarn, bun, pip, pip3, uv, cargo, go, composer, mise` | PATH wrappers in ~/.local/bin exec `safe gate <tool>`, which audits install, update, and exec-style subcommands with `safe audit` before delegating to the real tool. This applies in every shell, not just interactive zsh. | `safe: BLOCKED ...` + exit 100/102/104 |
 | `safe install <pkg>` | Audited, confirmed install path (multi-manager). With no specs in a project directory it audits the project's dependencies instead. | `safe: BLOCKED ...` + exit 100/102/104 |
 

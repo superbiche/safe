@@ -226,6 +226,22 @@ case_gated_tools_match_the_installed_wrapper_set() {
   fi
 }
 
+case_gated_tool_lists_stay_in_sync() {
+  # The install list is the deployable wrapper set. The dispatcher and safe-run
+  # keep explicit copies so each executable can work without sourcing an
+  # installer; drift would otherwise turn `safe run <tool>` into a bypass or a
+  # surprising package fetch.
+  local installed dispatcher runner
+  installed="$(sed -n 's/^GATE_TOOLS=(\(.*\))$/\1/p' "$ROOT/install.sh")"
+  dispatcher="$(sed -n 's/^SAFE_GATE_TOOL_LIST=(\(.*\))$/\1/p' "$ROOT/bin/safe")"
+  runner="$(sed -n 's/^SAFE_RUN_GATED_TOOLS=(\(.*\))$/\1/p' "$ROOT/bin/safe-run")"
+  if [[ -n "$installed" && "$installed" == "$dispatcher" && "$installed" == "$runner" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (install='$installed' dispatcher='$dispatcher' safe-run='$runner')"
+  fi
+}
+
 case_contract_is_valid_json
 case_contract_has_every_required_key
 case_every_exit_code_tells_an_agent_what_to_do
@@ -239,6 +255,7 @@ case_exit_codes_match_the_dispatcher
 case_contract_never_suggests_latest
 case_version_constant_matches_version_file
 case_gated_tools_match_the_installed_wrapper_set
+case_gated_tool_lists_stay_in_sync
 
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

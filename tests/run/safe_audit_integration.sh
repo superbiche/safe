@@ -334,10 +334,20 @@ PATH="$mockbin:$PATH" \
   ' safe-run || fail "host-allow update carried a behavioral ack to an unreviewed version"
 pass "host-allow update drops the behavioral acknowledgement"
 
+command_path_err="$tmp/command-path.err"
+set +e
+SAFE_RUN_CONFIG_DIR="$tmp/config-command-path" SAFE_RUN_DATA_DIR="$tmp/data-command-path" \
+  "$SAFE_RUN" "../bad" >/dev/null 2>"$command_path_err" </dev/null
+command_path_rc=$?
+set -e
+[[ "$command_path_rc" -eq 100 ]] || fail "command path expected rc=100, got $command_path_rc"
+grep -q "BLOCKED: command paths are unsupported" "$command_path_err" || fail "command path refusal not the command-path contract"
+pass "leading command path refuses as command path with exit 100 (not invalid-package 103)"
+
 invalid_name_err="$tmp/invalid-name.err"
 set +e
 SAFE_RUN_CONFIG_DIR="$tmp/config-invalid-name" SAFE_RUN_DATA_DIR="$tmp/data-invalid-name" \
-  "$SAFE_RUN" "../bad" >/dev/null 2>"$invalid_name_err" </dev/null
+  "$SAFE_RUN" "bad%name" >/dev/null 2>"$invalid_name_err" </dev/null
 invalid_name_rc=$?
 set -e
 [[ "$invalid_name_rc" -eq 103 ]] || fail "invalid package name expected rc=103, got $invalid_name_rc"

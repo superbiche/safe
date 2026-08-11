@@ -57,6 +57,12 @@ FORCE_LINK=0
 BLOCKED_REASON=""
 HOST_ALLOW_PINNED_VERSION=""
 SANDBOX_AUDIT_EXTRA="sbom_vulns=skipped"
+SANDBOX_FLAGS_EXPLICIT=0
+
+# Keep in sync with GATE_TOOLS in install.sh and SAFE_GATE_TOOL_LIST in
+# bin/safe. tests/contract/drift.sh enforces all three copies: safe run must
+# only delegate a tool whose normal PATH invocation is a gate wrapper.
+SAFE_RUN_GATED_TOOLS=(npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise)
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -377,6 +383,105 @@ runner_label_for_kind() {
     pipx) printf pipx ;;
     *) printf safe-run ;;
   esac
+}
+
+safe_run_is_gated_tool() {
+  local requested="$1" tool
+  for tool in "${SAFE_RUN_GATED_TOOLS[@]}"; do
+    [[ "$requested" == "$tool" ]] && return 0
+  done
+  return 1
+}
+
+# Print the first executable named <tool> on PATH. This deliberately follows
+# the shell's PATH order without resolving aliases, functions, or hashes: only
+# an executable file can safely be exec'd as the delegation target.
+safe_run_first_path_candidate() {
+  local tool="$1" dir candidate rest
+  # Manual walk instead of `IFS=: read -a`: read drops a trailing empty
+  # field, and an empty PATH component (leading, interior, or trailing)
+  # means the current directory in shell lookup. Appending one delimiter
+  # makes every component — empties included — visible to the loop.
+  [[ -n "${PATH:-}" ]] || return 1
+  rest="${PATH}:"
+  while [[ -n "$rest" ]]; do
+    dir="${rest%%:*}"
+    rest="${rest#*:}"
+    [[ -n "$dir" ]] || dir="."
+    candidate="${dir%/}/${tool}"
+    [[ -f "$candidate" && -x "$candidate" ]] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+# Runtime delegation intentionally follows symlinks: mise shims and a normal
+# symlink to a generated wrapper must classify from the wrapper's contents.
+# This is different from install ownership, which must never follow a symlink
+# it could overwrite. The marker is exact and tool-specific: a mise argv0 shim
+# named npm is not an npm gate wrapper and would bypass safe gate.
+safe_run_target_is_gate_bound() {
+  local target="$1" tool="$2"
+  LC_ALL=C sed -n '2p' -- "$target" 2>/dev/null \
+    | LC_ALL=C grep -qxF -- "# safe-gate-wrapper v1 tool=${tool}"
+}
+
+safe_run_target_is_self() {
+  local target="$1" target_real self_real
+  target_real=$(readlink -f -- "$target" 2>/dev/null) || return 1
+  self_real=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null) || return 1
+  [[ "$target_real" == "$self_real" ]]
+}
+
+# Prints a verified gate-wrapper target. Return 2 means the first PATH target
+# resolves back to this safe-run executable; callers must refuse it distinctly
+# so a linked runner can never recurse.
+safe_run_find_gate_bound_target() {
+  local tool="$1" target
+  target=$(safe_run_first_path_candidate "$tool") || return 1
+  safe_run_target_is_self "$target" && return 2
+  safe_run_target_is_gate_bound "$target" "$tool" || return 1
+  printf '%s\n' "$target"
+}
+
+refuse_command_path() {
+  local command_path="$1" runner
+  runner=$(runner_label_for_kind)
+  audit_log "$runner" "command-path:${command_path}" "REJECTED" "$(context_label)" "UNSUPPORTED_COMMAND_PATH"
+  err "BLOCKED: command paths are unsupported; invoke the tool plainly (the shim carries the gate) or use safe run <name>"
+  exit 100
+}
+
+delegate_gated_tool_if_applicable() {
+  local requested="$1" target target_status runner
+  shift
+
+  safe_run_is_gated_tool "$requested" || return 0
+  # --no-install is a strict local-only contract (run node_modules/.bin or
+  # refuse): delegating would silently discard it and let the delegate fetch.
+  # The package lane's local-bin-or-refuse enforcement is the honest path.
+  [[ "$NPX_NO_INSTALL" == "1" ]] && return 0
+  runner=$(runner_label_for_kind)
+  target_status=0
+  target=$(safe_run_find_gate_bound_target "$requested") || target_status=$?
+  if [[ "$target_status" != "0" ]]; then
+    if [[ "$target_status" == "2" ]]; then
+      target=$(safe_run_first_path_candidate "$requested" || true)
+      audit_log "$runner" "${requested}@gate" "REJECTED" "$(context_label)" "GATE_TARGET_SELF" "target=$target"
+      err "BLOCKED: ${requested} resolves to safe run itself; rerun install.sh, then invoke ${requested} plainly"
+      exit 100
+    fi
+    audit_log "$runner" "${requested}@gate" "REJECTED" "$(context_label)" "GATE_TARGET_NOT_BOUND" "target=$target"
+    err "BLOCKED: ${requested} is not gate-bound on PATH; rerun install.sh, then invoke ${requested} plainly"
+    exit 100
+  fi
+
+  audit_log "$runner" "${requested}@gate" "DELEGATED" "$(context_label)" "GATE_DELEGATION" "target=$target"
+  if [[ "$SANDBOX_FLAGS_EXPLICIT" == "1" ]]; then
+    info "sandbox flags do not apply when delegating to the gate"
+  fi
+  exec "$target" "$@"
 }
 
 # Resolve a bare tool name against node_modules/.bin in the current directory
@@ -1155,16 +1260,16 @@ parse_runner_args() {
       positional+=("$1"); shift; continue
     fi
     case "$1" in
-      --strict) STRICT_MODE=1; ALLOW_WRITE=0; ALLOW_NETWORK=0; shift ;;
-      -w|--write) ALLOW_WRITE=1; STRICT_MODE=0; shift ;;
-      -n|--network) ALLOW_NETWORK=1; STRICT_MODE=0; shift ;;
-      -s|--allow-secrets) ALLOW_SECRETS=1; shift ;;
-      --node22) NODE_VERSION_FLAG=22; shift ;;
-      --node24) NODE_VERSION_FLAG=24; shift ;;
-      --py312)  PY_VERSION_FLAG=312;  shift ;;
-      --py314)  PY_VERSION_FLAG=314;  shift ;;
-      --proxy)  PROXY_PASSTHROUGH=1;  shift ;;
-      -y|--yes) SKIP_PROMPT=1; shift ;;
+      --strict) SANDBOX_FLAGS_EXPLICIT=1; STRICT_MODE=1; ALLOW_WRITE=0; ALLOW_NETWORK=0; shift ;;
+      -w|--write) SANDBOX_FLAGS_EXPLICIT=1; ALLOW_WRITE=1; STRICT_MODE=0; shift ;;
+      -n|--network) SANDBOX_FLAGS_EXPLICIT=1; ALLOW_NETWORK=1; STRICT_MODE=0; shift ;;
+      -s|--allow-secrets) SANDBOX_FLAGS_EXPLICIT=1; ALLOW_SECRETS=1; shift ;;
+      --node22) SANDBOX_FLAGS_EXPLICIT=1; NODE_VERSION_FLAG=22; shift ;;
+      --node24) SANDBOX_FLAGS_EXPLICIT=1; NODE_VERSION_FLAG=24; shift ;;
+      --py312)  SANDBOX_FLAGS_EXPLICIT=1; PY_VERSION_FLAG=312;  shift ;;
+      --py314)  SANDBOX_FLAGS_EXPLICIT=1; PY_VERSION_FLAG=314;  shift ;;
+      --proxy)  SANDBOX_FLAGS_EXPLICIT=1; PROXY_PASSTHROUGH=1;  shift ;;
+      -y|--yes) SANDBOX_FLAGS_EXPLICIT=1; SKIP_PROMPT=1; shift ;;
       --)       saw_dashdash=1; shift ;;
       -h|--help) show_usage; exit 0 ;;
       -v|--version) echo "safe run $SAFE_RUN_VERSION"; exit 0 ;;
@@ -1201,12 +1306,21 @@ parse_runner_args() {
     show_usage
     exit 1
   fi
+  RUN_ARGS=("${positional[@]:1}")
+  case "${positional[0]}" in
+    # Scoped npm specs (@scope/name) legitimately carry a slash and stay on
+    # the package lane; every other slash-bearing operand (absolute,
+    # dot-relative, plain relative like tools/npm, trailing npm/) and the
+    # bare path operands . / .. are command paths, not package names.
+    @*) ;;
+    .|..|*/*) refuse_command_path "${positional[0]}" ;;
+  esac
+  delegate_gated_tool_if_applicable "${positional[0]}" "${RUN_ARGS[@]+"${RUN_ARGS[@]}"}"
   if [[ "$ALLOW_NETWORK" != "1" && "$PROXY_PASSTHROUGH" == "1" ]]; then
     printf '%s\n' '[safe run] WARNING: --proxy ignored because network is disabled' >&2
     PROXY_PASSTHROUGH=0
   fi
   parse_package "${positional[0]}"
-  RUN_ARGS=("${positional[@]:1}")
 }
 
 handle_runner_invocation() {
