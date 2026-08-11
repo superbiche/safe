@@ -25,34 +25,10 @@ SCAN_CACHE_TTL_SECONDS="${SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS:-86400}"
 # they must miss rather than replay.
 SCAN_CACHE_SCHEMA=1
 CHECKS_DIR="$DATA_DIR/checks"
-GUARDDOG_CACHE_DIR="${SAFE_AUDIT_GUARDDOG_CACHE_DIR:-$HOME/.cache/safe/guarddog}"
-GUARDDOG_SUPPORTED_VERSION="3.1.0"
-GUARDDOG_CACHE_PROFILE="safe-default-v1"
-# Profile used when the kernel sandbox is unavailable and the operator allows
-# the documented fallback. It is a DIFFERENT cache identity on purpose:
-# results gathered with weaker isolation must never replay as sandboxed ones.
-GUARDDOG_CACHE_PROFILE_NOSANDBOX="safe-nosandbox-v1"
-GUARDDOG_SANDBOX_MODE="auto"
-GUARDDOG_SANDBOX_FELL_BACK=0
-GUARDDOG_CAPTURE=()
-# Bound each GuardDog output stream — live head -c caps at both invocation
-# sites, never RLIMIT_FSIZE (which bound guarddog's INTERNAL writes too and
-# killed every tarball download over the limit, PR#66). The raw JSON is
-# later copied into both the permanent cache and the receipt, so an
-# unbounded scanner stream would turn package-controlled match volume into
-# a disk-exhaustion path.
-GUARDDOG_OUTPUT_LIMIT_KIB=16384
-GUARDDOG_ENV_UNSET=(
-  -u GUARDDOG_PARALLELISM
-  -u GUARDDOG_VERIFY_EXHAUSTIVE_DEPENDENCIES
-  -u GUARDDOG_NEW_DEPENDENCY_RISK_THRESHOLD
-  -u GUARDDOG_TOP_PACKAGES_CACHE_LOCATION
-  -u GUARDDOG_YARA_EXT_EXCLUDE
-  -u GUARDDOG_MAX_UNCOMPRESSED_SIZE
-  -u GUARDDOG_MAX_COMPRESSION_RATIO
-  -u GUARDDOG_MAX_FILE_COUNT
-  -u GUARDDOG_SUBSCAN_SANDBOX
-)
+SOCKET_CACHE_DIR="${SAFE_AUDIT_SOCKET_CACHE_DIR:-$HOME/.cache/safe/socket}"
+SOCKET_CACHE_SCHEMA=1
+SOCKET_CACHE_STALE_SCORE=""
+SOCKET_CACHE_STALE_AGE_DAYS=""
 IOC_DIR="$DATA_DIR/ioc"
 IOC_CATALOG_DIR="$IOC_DIR/catalogs"
 TOOL_BUNDLE_DIR="$DATA_DIR/tool-bundles"
@@ -1157,7 +1133,7 @@ tool_cache_set() {
 }
 
 build_tool_entry_json() {
-  local osv="${1:-}" grype="${2:-}" syft="${3:-}" govulncheck="${4:-}" cargo_audit="${5:-}" pip_audit="${6:-}" socket="${7:-}" guarddog="${8:-}"
+  local osv="${1:-}" grype="${2:-}" syft="${3:-}" govulncheck="${4:-}" cargo_audit="${5:-}" pip_audit="${6:-}" socket="${7:-}"
   printf '{'
   printf '"osv-scanner":%s,' "$(json_string_or_null "$osv")"
   printf '"grype":%s,' "$(json_string_or_null "$grype")"
@@ -1165,8 +1141,7 @@ build_tool_entry_json() {
   printf '"govulncheck":%s,' "$(json_string_or_null "$govulncheck")"
   printf '"cargo-audit":%s,' "$(json_string_or_null "$cargo_audit")"
   printf '"pip-audit":%s,' "$(json_string_or_null "$pip_audit")"
-  printf '"socket":%s,' "$(json_string_or_null "$socket")"
-  printf '"guarddog":%s' "$(json_string_or_null "$guarddog")"
+  printf '"socket":%s' "$(json_string_or_null "$socket")"
   printf '}'
 }
 
@@ -1184,7 +1159,7 @@ detect_machine_tools() {
   local output
   output=$(run_machine_capture "$machine" '
 PATH="$PATH:$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/go/bin:$HOME/.cargo/bin:$HOME/.local/share/mise/shims"
-for t in osv-scanner grype syft govulncheck cargo-audit pip-audit socket guarddog; do
+for t in osv-scanner grype syft govulncheck cargo-audit pip-audit socket; do
   if command -v "$t" >/dev/null 2>&1; then
     printf "%s\t%s\n" "$t" "$(command -v "$t")"
   else
@@ -1193,7 +1168,7 @@ for t in osv-scanner grype syft govulncheck cargo-audit pip-audit socket guarddo
 done
 ')
 
-  local osv="" grype="" syft="" govulncheck="" cargo_audit="" pip_audit="" socket="" guarddog=""
+  local osv="" grype="" syft="" govulncheck="" cargo_audit="" pip_audit="" socket=""
   local line tool path
   while IFS=$'\t' read -r tool path; do
     case "$tool" in
@@ -1204,7 +1179,6 @@ done
       cargo-audit) cargo_audit="$path" ;;
       pip-audit) pip_audit="$path" ;;
       socket) socket="$path" ;;
-      guarddog) guarddog="$path" ;;
     esac
   done <<<"$output"
 
@@ -1216,7 +1190,7 @@ done
   # resolving is genuinely gone as far as this host can tell.
   if [[ "$(machine_type "$machine")" == "local" ]]; then
     local kept
-    for tool in osv-scanner grype syft govulncheck cargo-audit pip-audit socket guarddog; do
+    for tool in osv-scanner grype syft govulncheck cargo-audit pip-audit socket; do
       case "$tool" in
         osv-scanner) [[ -n "$osv" ]] && continue ;;
         grype) [[ -n "$grype" ]] && continue ;;
@@ -1225,7 +1199,6 @@ done
         cargo-audit) [[ -n "$cargo_audit" ]] && continue ;;
         pip-audit) [[ -n "$pip_audit" ]] && continue ;;
         socket) [[ -n "$socket" ]] && continue ;;
-        guarddog) [[ -n "$guarddog" ]] && continue ;;
       esac
       kept=$(tool_cache_path "$machine" "$tool")
       [[ -n "$kept" && -x "$kept" ]] || continue
@@ -1238,12 +1211,11 @@ done
         cargo-audit) cargo_audit="$kept" ;;
         pip-audit) pip_audit="$kept" ;;
         socket) socket="$kept" ;;
-        guarddog) guarddog="$kept" ;;
       esac
     done
   fi
 
-  tool_cache_set "$machine" "$(build_tool_entry_json "$osv" "$grype" "$syft" "$govulncheck" "$cargo_audit" "$pip_audit" "$socket" "$guarddog")"
+  tool_cache_set "$machine" "$(build_tool_entry_json "$osv" "$grype" "$syft" "$govulncheck" "$cargo_audit" "$pip_audit" "$socket")"
 }
 
 machine_missing_core_tools() {
@@ -4865,8 +4837,128 @@ socket_fresh_scan_budget_seconds() {
   printf '%s\n' "$budget"
 }
 
+socket_cache_ttl_seconds() {
+  local days
+  days=$(install_policy_json | jq -r '.socket.cache_ttl_days // 7' 2>/dev/null || true)
+  [[ "$days" =~ ^[0-9]{1,4}$ ]] || days=7
+  (( days > 0 )) || { printf '0\n'; return 0; }
+  printf '%s\n' "$(( days * 86400 ))"
+}
+
+# A RECOGNIZED success envelope: everything the verdict is derived from must
+# be present and well-typed, and every alert must be classifiable — an alert
+# whose severity is outside Socket's enum is an unknown class that must WARN,
+# never count as clean (the malice BLOCK below reads this same array).
+#
+# Deliberately silent about `.data.transitively`: the verdict never reads the
+# dependency tree (that is the project-scan lane's job), so asserting its shape
+# here would let a future Socket schema change turn every check into an
+# infra-WARN for no gain. Its shape is pinned in tests/live/socket_envelope.sh
+# instead, where a drift is a loud test failure rather than a live outage.
+socket_envelope_valid() {
+  jq -e '
+    (.ok == true)
+    and (.data | type == "object")
+    and (.data.self | type == "object")
+    and (.data.self.score | type == "object")
+    and (.data.self.score.overall | type == "number")
+    and (.data.self.alerts | type == "array")
+    and ([.data.self.alerts[]
+          | select((type == "object")
+            and ((.name | type) == "string" and (.name | length) > 0)
+            and ((.severity | type) == "string"
+                 and (.severity as $severity
+                      | ["critical", "high", "middle", "low"] | index($severity)))
+            and ((.category | type) == "string" and (.category | length) > 0))]
+         | length) == (.data.self.alerts | length)
+  ' "$1" >/dev/null 2>&1
+}
+
+socket_cache_identity_json() {
+  local ecosystem="$1" name="$2" version="$3"
+  jq -cn --arg ecosystem "$ecosystem" --arg name "$name" --arg version "$version" \
+    '{schema:1,source:{name:"socket",envelope:1},identity:{ecosystem:$ecosystem,name:$name,version:$version}}'
+}
+
+socket_cache_key() {
+  local identity_json="$1" material
+  material=$(jq -cnS --argjson identity "$identity_json" '$identity' 2>/dev/null) || return 1
+  printf '%s' "$material" | sha256sum 2>/dev/null | awk '{print $1}'
+}
+
+socket_cache_replay() {
+  local ecosystem="$1" name="$2" version="$3" output="$4"
+  SOCKET_CACHE_STALE_SCORE=""
+  SOCKET_CACHE_STALE_AGE_DAYS=""
+  local ttl identity key entry fetched age now
+  ttl=$(socket_cache_ttl_seconds)
+  (( ttl > 0 )) || return 1
+  identity=$(socket_cache_identity_json "$ecosystem" "$name" "$version") || return 1
+  key=$(socket_cache_key "$identity") || return 1
+  entry="$SOCKET_CACHE_DIR/$key.json"
+  [[ -f "$entry" ]] || return 1
+  fetched=$(jq -r --argjson identity "$identity" --argjson schema "$SOCKET_CACHE_SCHEMA" '
+    if .schema == $schema and .source == $identity.source and .identity == $identity.identity
+       and (.fetched_at | type == "number")
+       and (.fetched_at >= 0 and .fetched_at == (.fetched_at | floor))
+    then .fetched_at else empty end
+  ' "$entry" 2>/dev/null) || return 1
+  [[ "$fetched" =~ ^[0-9]+$ ]] || return 1
+  local cached_result
+  cached_result=$(mktemp "${TMPDIR:-/tmp}/safe-socket-cache.XXXXXX") || return 1
+  if ! jq '.result // {}' "$entry" > "$cached_result" \
+    || ! socket_envelope_valid "$cached_result"; then
+    rm -f "$cached_result"
+    return 1
+  fi
+  now=$(date +%s)
+  age=$(( now - fetched ))
+  (( age >= 0 )) || age=0
+  if (( age > ttl )); then
+    SOCKET_CACHE_STALE_SCORE=$(jq -r '.data.self.score.overall // empty' "$cached_result" 2>/dev/null || true)
+    [[ "$SOCKET_CACHE_STALE_SCORE" =~ ^[0-9]+([.][0-9]+)?$ ]] || SOCKET_CACHE_STALE_SCORE=""
+    SOCKET_CACHE_STALE_AGE_DAYS=$(( (age + 86399) / 86400 ))
+    rm -f "$cached_result"
+    return 1
+  fi
+  jq -n --slurpfile entry "$entry" --argjson age "$age" '
+    {available:true,status:"ok",note:null,cached:true,cache_age_seconds:$age,
+     raw:($entry[0].result // {})}
+  ' > "$output" || return 1
+  rm -f "$cached_result"
+  socket_envelope_valid <(jq '.raw' "$output") || return 1
+}
+
+socket_cache_store() {
+  local ecosystem="$1" name="$2" version="$3" raw="$4"
+  local ttl identity key tmp
+  ttl=$(socket_cache_ttl_seconds)
+  (( ttl > 0 )) || return 0
+  socket_envelope_valid "$raw" || return 0
+  identity=$(socket_cache_identity_json "$ecosystem" "$name" "$version") || return 0
+  key=$(socket_cache_key "$identity") || return 0
+  umask 077
+  mkdir -p "$SOCKET_CACHE_DIR" 2>/dev/null || return 0
+  chmod 700 "$SOCKET_CACHE_DIR" 2>/dev/null || return 0
+  tmp=$(mktemp "$SOCKET_CACHE_DIR/.${key}.XXXXXX") || return 0
+  if jq -n --argjson schema "$SOCKET_CACHE_SCHEMA" --argjson identity "$identity" \
+      --argjson fetched_at "$(date +%s)" --slurpfile result "$raw" '
+      {schema:$schema,source:$identity.source,identity:$identity.identity,
+       fetched_at:$fetched_at,result:($result[0] // {})}
+    ' > "$tmp"; then
+    chmod 600 "$tmp" && mv -f "$tmp" "$SOCKET_CACHE_DIR/$key.json"
+  else
+    rm -f "$tmp"
+  fi
+}
+
 socket_score_json() {
   local ecosystem="$1" spec="$2" output="$3" socket_budget="${4:-${SAFE_AUDIT_SOCKET_TIMEOUT:-30}}"
+  local cache_name="${5:-}" cache_version="${6:-}"
+  if [[ -n "$cache_name" && -n "$cache_version" ]] \
+    && socket_cache_replay "$ecosystem" "$cache_name" "$cache_version" "$output"; then
+    return 0
+  fi
   # The socket CLI takes a purl type, not safe's ecosystem name. Only npm
   # coincides: "python"/"rust"/"go"/"php" produced pkg:python/... etc., which
   # the API rejects with 400 Bad Request — every non-npm score has been
@@ -4886,7 +4978,7 @@ socket_score_json() {
   # that reads like a supply-chain signal rather than a missing binary.
   socket_cmd=$(resolve_local_tool socket)
   if [[ -z "$socket_cmd" ]]; then
-    printf '{"available":false,"status":"skipped","note":"socket CLI not available"}\n' > "$output"
+    printf '{"available":false,"status":"error","note":"socket CLI not available"}\n' > "$output"
     return 0
   fi
   # Socket needs SOCKET_SECURITY_API_TOKEN for authenticated package scores.
@@ -4977,637 +5069,24 @@ socket_score_json() {
     printf '%s\n' "$(jq -n --arg note "$note" '{available:true,status:"error",note:$note}')" > "$output"
     return 0
   fi
+  if ! socket_envelope_valid "$output.raw"; then
+    printf '{"available":true,"status":"error","note":"socket returned an unrecognized result shape"}\n' > "$output"
+    return 0
+  fi
   jq -n --slurpfile data "$output.raw" '
     ($data[0] // {}) as $r |
     {
       available: true,
       status: "ok",
       note: null,
+      cached: false,
+      cache_age_seconds: null,
       raw: $r
     }
   ' > "$output"
-}
-
-# GuardDog v3 behavioral tier -------------------------------------------------
-#
-# GuardDog performs the public-registry download itself. Safe's locked cache
-# policy treats a complete scan as permanent evidence for an exact package
-# artifact, supported scanner version, and safe-owned scanner profile.
-# Integrity lookup is cache plumbing only: if it is unavailable the scan still
-# runs, but no result is stored under a guessed key.
-guarddog_npm_sri_valid() {
-  local algorithm="$1" digest="$2" expected_length=0
-  case "$algorithm" in
-    sha256) expected_length=44 ;;
-    sha384) expected_length=64 ;;
-    sha512) expected_length=88 ;;
-    *) return 1 ;;
-  esac
-  (( ${#digest} == expected_length )) \
-    && [[ "$digest" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
-}
-
-guarddog_artifact_identity_json() {
-  local ecosystem="$1" name="$2" version="$3" scratch="$4" slot="$5"
-  local metadata="$scratch/guarddog-artifact-${slot}.json"
-  local encoded_name encoded_version
-  encoded_name=$(urlencode "$name")
-  encoded_version=$(urlencode "$version")
-
-  case "$ecosystem" in
-    npm)
-      curl -fsSL --max-time 5 \
-        "https://registry.npmjs.org/${encoded_name}/${encoded_version}" \
-        -o "$metadata" 2>/dev/null || return 1
-      local integrity shasum algorithm digest
-      integrity=$(jq -r '(.dist.integrity // empty) | strings' "$metadata" 2>/dev/null || true)
-      if [[ -n "$integrity" ]]; then
-        # npm SRI may technically carry multiple space-separated digests. The
-        # first is the manager's preferred identity and is sufficient to bind
-        # this immutable artifact without putting whitespace in the key.
-        integrity="${integrity%% *}"
-        algorithm="${integrity%%-*}"
-        digest="${integrity#*-}"
-        guarddog_npm_sri_valid "$algorithm" "$digest" || return 1
-      else
-        shasum=$(jq -r '(.dist.shasum // empty) | strings' "$metadata" 2>/dev/null || true)
-        [[ "$shasum" =~ ^[0-9A-Fa-f]{40}$ ]] || return 1
-        algorithm="sha1"
-        digest="${shasum,,}"
-      fi
-      jq -n \
-        --arg ecosystem "$ecosystem" --arg name "$name" --arg version "$version" \
-        --arg registry "https://registry.npmjs.org" --arg algorithm "$algorithm" \
-        --arg digest "$digest" \
-        '{ecosystem:$ecosystem,name:$name,version:$version,registry:$registry,
-          artifact:{algorithm:$algorithm,digest:$digest,filename:null}}'
-      ;;
-    python)
-      # GuardDog v3.1.0 reads the package-level JSON and chooses the first
-      # supported release archive. Reproduce that choice before reading its
-      # digest; choosing the first digest blindly can bind a different file.
-      curl -fsSL --max-time 5 \
-        "https://pypi.org/pypi/${encoded_name}/json" \
-        -o "$metadata" 2>/dev/null || return 1
-      local selected filename py_digest
-      selected=$(jq -c --arg v "$version" '
-        [(.releases[$v] // [])[]
-          | select((.filename // "")
-            | test("[.](bz2|bzip2|gz|gzip|tgz|xz|zip|whl|egg)$"))][0] // empty
-      ' "$metadata" 2>/dev/null || true)
-      [[ -n "$selected" ]] || return 1
-      filename=$(jq -r '(.filename // empty) | strings' <<<"$selected" 2>/dev/null || true)
-      py_digest=$(jq -r '(.digests.sha256 // empty) | strings' <<<"$selected" 2>/dev/null || true)
-      [[ -n "$filename" && "$py_digest" =~ ^[0-9A-Fa-f]{64}$ ]] || return 1
-      jq -n \
-        --arg ecosystem "$ecosystem" --arg name "$name" --arg version "$version" \
-        --arg registry "https://pypi.org" --arg filename "$filename" \
-        --arg digest "${py_digest,,}" \
-        '{ecosystem:$ecosystem,name:$name,version:$version,registry:$registry,
-          artifact:{algorithm:"sha256",digest:$digest,filename:$filename}}'
-      ;;
-    *) return 1 ;;
-  esac
-}
-
-# Run a producer with LIVE per-stream byte caps (GUARDDOG_OUTPUT_LIMIT_KIB
-# each): stdout → $1, stderr → $2, both through their own `head -c`
-# (swap-pipe, no process substitution — a procsub reader is not awaited and
-# races its consumers). Three-status contract in GUARDDOG_CAPTURE:
-#   [0] producer status (timeout's 124/137 included)
-#   [1] stdout-capture head status
-#   [2] stderr-capture head status
-# An empty element means that stage never reported (fd-setup failure,
-# unwritable status file): callers fail closed on [0] and treat a non-"0"
-# [1]/[2] as a capture failure diagnosed via an IN-MEMORY note — never one
-# appended to the possibly-full filesystem it diagnoses (PR#66 F2/N1).
-# Always returns 0; the statuses are the result. The outer group discards
-# only the shell's job-death diagnostic on KILL escalation (PR#65 N3).
-guarddog_bounded_capture() {
-  local stdout_file="$1" stderr_file="$2" status_file="$3"
-  shift 3
-  local limit_bytes=$(( GUARDDOG_OUTPUT_LIMIT_KIB * 1024 ))
-  local -a outer=()
-  GUARDDOG_CAPTURE=()
-  rm -f -- "$status_file" 2>/dev/null || true
-  {
-    {
-      "$@" </dev/null 2>&1 1>&3 \
-        | head -c "$limit_bytes" > "$stderr_file"
-      # Pipeline-element subshell: PIPESTATUS is captured before anything
-      # can reset it; the stderr-head status escapes via the status file (a
-      # failed write leaves [2] unreported — diagnosed, not lost) and the
-      # producer status becomes the segment's own exit, so the outer
-      # pipeline's PIPESTATUS[0] is the producer's, never pipefail's
-      # rightmost-nonzero.
-      local -a inner=("${PIPESTATUS[@]}")
-      printf '%s\n' "${inner[1]:-}" > "$status_file" 2>/dev/null || true
-      exit "${inner[0]:-125}"
-    } 3>&1 \
-      | head -c "$limit_bytes" > "$stdout_file"
-    outer=("${PIPESTATUS[@]}")
-  } 2>/dev/null || true
-  local stderr_head=""
-  stderr_head="$(cat -- "$status_file" 2>/dev/null || true)"
-  [[ "$stderr_head" =~ ^[0-9]+$ ]] || stderr_head=""
-  GUARDDOG_CAPTURE=("${outer[0]:-}" "${outer[1]:-}" "$stderr_head")
-  return 0
-}
-
-# A sandbox-origin failure: GuardDog either refuses up front because the
-# kernel sandbox is unavailable, or its sandboxed child dies before running.
-guarddog_scan_sandbox_failed() {
-  local raw="$1" stderr_file="$2" rc="$3"
-  local haystack=""
-  # Bounded read, never a whole-file slurp: callers capture stderr through
-  # a live per-stream cap (guarddog_bounded_capture), but this helper must
-  # not depend on that invariant holding elsewhere — an unbounded stderr
-  # copied into one shell variable is memory exhaustion in the middle of
-  # failure handling (PR#66 F1; defense in depth).
-  haystack=$(head -c "$(( GUARDDOG_OUTPUT_LIMIT_KIB * 1024 ))" -- "$stderr_file" 2>/dev/null || true)
-  if [[ -s "$raw" ]]; then
-    haystack+=$(jq -r 'if (type == "object") and ((.errors? // null) | type == "object")
-      then [.errors[] | tostring] | join(" ") else "" end' "$raw" 2>/dev/null || true)
+  if [[ -n "$cache_name" && -n "$cache_version" ]]; then
+    socket_cache_store "$ecosystem" "$cache_name" "$cache_version" "$output.raw"
   fi
-  [[ "$haystack" == *"Sandboxed extraction failed"* \
-    || "$haystack" == *"sandbox is unavailable"* \
-    || "$haystack" == *"sandbox unavailable"* \
-    || "$haystack" == *"--no-sandbox"* ]]
-}
-
-guarddog_result_shape_valid() {
-  local result="$1"
-  jq -e '
-    type == "object"
-    and ((.issues? // -1) | type == "number" and . >= 0 and . == floor)
-    and ((.errors? // null) | type == "object")
-    and ((.results? // null) | type == "object")
-    and ((.risk_score? // null) | type == "object")
-    and (.risk_score.score | type == "number" and . >= 0 and . <= 10)
-    and (.risk_score.label | IN("no_risks_detected", "low", "suspicious", "high_risk"))
-    and ((.risk_score.findings_count? // -1) | type == "number" and . >= 0 and . == floor)
-    and ((.risk_score.score_breakdown? // null) | type == "object")
-    and ((.risks? // null) | type == "array")
-    and all(.risks[];
-      (.threat_rule | type == "string" and length > 0)
-      and ((.capability_rule == null) or (.capability_rule | type == "string")))
-    and (if .risk_score.label == "no_risks_detected" then
-           .risk_score.score == 0 and (.risks | length) == 0
-         elif .risk_score.label == "low" then
-           .risk_score.score > 0 and .risk_score.score < 5 and (.risks | length) > 0
-         elif .risk_score.label == "suspicious" then
-           .risk_score.score >= 5 and .risk_score.score < 7 and (.risks | length) > 0
-         else
-           .risk_score.score >= 7 and (.risks | length) > 0
-         end)
-  ' "$result" >/dev/null 2>&1
-}
-
-guarddog_active_profile() {
-  if (( GUARDDOG_SANDBOX_FELL_BACK )) || [[ "$GUARDDOG_SANDBOX_MODE" == "off" ]]; then
-    printf '%s' "$GUARDDOG_CACHE_PROFILE_NOSANDBOX"
-  else
-    printf '%s' "$GUARDDOG_CACHE_PROFILE"
-  fi
-}
-
-guarddog_cache_key() {
-  local identity_json="$1" scanner_version="$2" key_material="$3"
-  jq -cS -n --argjson identity "$identity_json" --arg scanner_version "$scanner_version" \
-    --arg profile "$GUARDDOG_CACHE_PROFILE" '
-    {schema:1,scanner:{name:"guarddog",version:$scanner_version,profile:$profile},identity:$identity}
-  ' > "$key_material" || return 1
-  sha256_file "$key_material"
-}
-
-guarddog_record_from_raw() {
-  local raw="$1" version="$2" cached="$3" cache_eligible="$4"
-  local artifact_json="$5" scanner_version="$6" cache_note="$7" output="$8"
-  local rules_json risk_label risk_score risk_count error_count contribution status note infra_error=false
-  rules_json=$(jq -c '[.risks[]? | (.threat_rule?, .capability_rule?)
-    | strings | select(length > 0)] | unique' "$raw")
-  risk_label=$(jq -r '.risk_score.label' "$raw")
-  risk_score=$(jq -r '.risk_score.score' "$raw")
-  risk_count=$(jq -r '.risks | length' "$raw")
-  error_count=$(jq -r '.errors | length' "$raw")
-  contribution="GO"
-  if [[ "$risk_label" == "high_risk" && "$risk_count" -gt 0 ]]; then
-    contribution="BLOCK"
-  elif (( risk_count > 0 )); then
-    contribution="WARN"
-  fi
-  status="ok"
-  note=""
-  if (( error_count > 0 )); then
-    infra_error=true
-    status="partial"
-    [[ "$contribution" == "GO" ]] && contribution="WARN"
-    note=$(jq -r '"guarddog reported rule errors: " + (.errors | keys | join(", "))' "$raw")
-  fi
-  jq -n \
-    --arg version "$version" --arg status "$status" --arg contribution "$contribution" \
-    --arg note "$note" --arg scanner_version "$scanner_version" \
-    --arg risk_label "$risk_label" --argjson risk_score "$risk_score" \
-    --argjson infra_error "$infra_error" --argjson cached "$cached" \
-    --argjson cache_eligible "$cache_eligible" --arg cache_note "$cache_note" \
-    --argjson artifact "$artifact_json" --argjson rules "$rules_json" \
-    --slurpfile raw "$raw" '
-    {
-      version:$version,status:$status,contribution:$contribution,
-      note:(if $note == "" then null else $note end),
-      scanner_version:$scanner_version,infra_error:$infra_error,
-      risk_label:$risk_label,risk_score:$risk_score,rules:$rules,
-      cache:{eligible:$cache_eligible,cached:$cached,
-        note:(if $cache_note == "" then null else $cache_note end)},
-      artifact_identity:$artifact,raw:($raw[0] // {})
-    }' > "$output"
-}
-
-guarddog_error_record() {
-  local version="$1" scanner_version="$2" note="$3" artifact_json="$4" output="$5"
-  jq -n --arg version "$version" --arg scanner_version "$scanner_version" \
-    --arg note "$note" --argjson artifact "$artifact_json" '
-    {version:$version,status:"error",contribution:"WARN",note:$note,
-     scanner_version:(if $scanner_version == "" then null else $scanner_version end),
-     infra_error:true,risk_label:null,risk_score:null,rules:[],
-     cache:{eligible:false,cached:false,note:null},
-     artifact_identity:$artifact,raw:null}' > "$output"
-}
-
-# Per-attempt profile: the cache identity must describe the isolation the
-# result was ACTUALLY produced under, never the run's aggregate state
-# (delta-2 F8 — a global flag mislabelled a sandboxed sibling version).
-guarddog_profile_for_flag() {
-  if [[ "$1" == "nosandbox" ]]; then
-    printf '%s' "$GUARDDOG_CACHE_PROFILE_NOSANDBOX"
-  else
-    printf '%s' "$GUARDDOG_CACHE_PROFILE"
-  fi
-}
-
-guarddog_scan_one_json() {
-  local ecosystem="$1" name="$2" version="$3" guarddog_cmd="$4"
-  local scanner_version="$5" budget="$6" scratch="$7" slot="$8" output="$9"
-  # In-memory capture-failure diagnosis, set by guarddog_run_scan (dynamic
-  # scope) and consumed first by the failure-note ladder — never written to
-  # the possibly-full filesystem it diagnoses (PR#66 F2).
-  local guarddog_capture_note=""
-  local artifact_file="$scratch/guarddog-artifact-${slot}-identity.json"
-  local artifact_json='null'
-  local key_material="$scratch/guarddog-cache-key-${slot}.json"
-  if guarddog_artifact_identity_json "$ecosystem" "$name" "$version" "$scratch" "$slot" > "$artifact_file"; then
-    artifact_json=$(cat "$artifact_file")
-  fi
-
-  local raw="$scratch/guarddog-${slot}.raw.json"
-  local cli_ecosystem="$ecosystem" stderr_file="$scratch/guarddog-${slot}.stderr" rc=0
-  [[ "$ecosystem" == "python" ]] && cli_ecosystem="pypi"
-
-  # One deadline for the whole version scan: an auto retry must fit inside
-  # the configured wall-clock budget, not double it (delta-2 F7). It starts
-  # immediately before the FIRST launch, never before cache preparation —
-  # a slow hash/cache probe must not eat the first attempt's budget
-  # (delta-3 F11).
-  local scan_deadline=0
-  local cache_eligible=false cache_key="" cache_file="" attempt_profile=""
-  local attempt_kind="sandbox"
-  [[ "$GUARDDOG_SANDBOX_MODE" == "off" ]] && attempt_kind="nosandbox"
-
-  # Prepare one attempt: derive its profile, cache key and file, then try the
-  # cache. Returns 0 when a valid cached result was replayed into $raw.
-  guarddog_attempt_prepare() {
-    attempt_profile=$(guarddog_profile_for_flag "$attempt_kind")
-    cache_eligible=false
-    cache_key=""
-    cache_file=""
-    if [[ "$artifact_json" != "null" && -n "$scanner_version" ]] \
-      && cache_key=$(GUARDDOG_CACHE_PROFILE="$attempt_profile" \
-        guarddog_cache_key "$artifact_json" "$scanner_version" "$key_material" 2>/dev/null) \
-      && [[ -n "$cache_key" ]]; then
-      cache_eligible=true
-      cache_file="$GUARDDOG_CACHE_DIR/${cache_key}.json"
-    fi
-    [[ "$cache_eligible" == "true" && -r "$cache_file" ]] || return 1
-    jq -e --argjson identity "$artifact_json" --arg scanner_version "$scanner_version" \
-      --arg profile "$attempt_profile" '
-      .schema == 1 and .identity == $identity
-      and .scanner == {name:"guarddog",version:$scanner_version,profile:$profile}
-      and (.result | type == "object")
-    ' "$cache_file" >/dev/null 2>&1 \
-      && jq -c '.result' "$cache_file" > "$raw" \
-      && guarddog_result_shape_valid "$raw" \
-      && jq -e '(.errors | length) == 0' "$raw" >/dev/null 2>&1
-  }
-
-  guarddog_run_scan() {
-    local -a sandbox_flag=()
-    [[ "$attempt_kind" == "nosandbox" ]] && sandbox_flag=(--no-sandbox)
-    # The first launch defines the window; later attempts share what is left.
-    (( scan_deadline == 0 )) && scan_deadline=$(( $(date +%s) + budget ))
-    local remaining=$(( scan_deadline - $(date +%s) ))
-    rc=0
-    guarddog_capture_note=""
-    if (( remaining <= 0 )); then
-      rc=124
-      : > "$raw"
-      printf 'guarddog scan budget exhausted before this attempt\n' > "$stderr_file"
-      return 0
-    fi
-    # Live pipe caps on BOTH streams via guarddog_bounded_capture, NOT
-    # RLIMIT_FSIZE: `ulimit -f` bound EVERY file the process tree writes —
-    # including the tarball GuardDog downloads before scanning — so any
-    # package artifact over the limit died mid-download as
-    # `download-package: [Errno 27] File too large` and behavioral coverage
-    # was silently zero for large packages (qwen-code 0.21.5 = 24.6 MB vs
-    # 16 MiB; GuardDog v3.1.0 imposes no size limit of its own — source
-    # audit 2026-08-04). Over-limit JSON truncates ($raw shape check fails,
-    # size probe names the per-stream limit) and the writer dies on SIGPIPE
-    # — the old EFBIG-on-stdout semantics; a stderr flood stops at the
-    # limit instead of running its budget against the scratch filesystem.
-    guarddog_bounded_capture "$raw" "$stderr_file" \
-      "$scratch/guarddog-${slot}-capture.status" \
-      timeout --kill-after=2s "$remaining" \
-      env "${GUARDDOG_ENV_UNSET[@]}" "$guarddog_cmd" "$cli_ecosystem" scan "$name" \
-      --version "$version" --output-format=json ${sandbox_flag[@]+"${sandbox_flag[@]}"}
-    rc="${GUARDDOG_CAPTURE[0]:-125}"
-    [[ "$rc" =~ ^[0-9]+$ ]] || rc=125
-    if [[ "${GUARDDOG_CAPTURE[1]:-}" != "0" || "${GUARDDOG_CAPTURE[2]:-}" != "0" ]]; then
-      guarddog_capture_note="guarddog output capture failed (stdout head ${GUARDDOG_CAPTURE[1]:-unreported}, stderr head ${GUARDDOG_CAPTURE[2]:-unreported}) — check free space under ${scratch}"
-      (( rc == 0 )) && rc=1
-    fi
-  }
-
-  if guarddog_attempt_prepare; then
-    guarddog_record_from_raw "$raw" "$version" true true "$artifact_json" "$scanner_version" "" "$output"
-    return 0
-  fi
-  guarddog_run_scan
-
-  # Sandbox fallback (operator-configurable, default auto): GuardDog refuses
-  # to scan when the kernel sandbox is unavailable, and on some hosts its
-  # Landlock child cannot even start — which yields ZERO behavioral coverage
-  # rather than weaker coverage. The retry is bound to a DIFFERENT cache
-  # profile so it can never replay as a sandboxed result, and it NEVER runs
-  # over a shape-valid result: a partial scan that retained real findings
-  # (including a high-risk BLOCK) must not be discarded because its error
-  # text happened to mention the sandbox (delta-2 F6). mode=required keeps
-  # the hard failure; mode=off never sandboxes.
-  if [[ "$GUARDDOG_SANDBOX_MODE" == "auto" && "$attempt_kind" == "sandbox" ]] \
-    && ! { (( rc == 0 )) && guarddog_result_shape_valid "$raw"; } \
-    && guarddog_scan_sandbox_failed "$raw" "$stderr_file" "$rc"; then
-    attempt_kind="nosandbox"
-    GUARDDOG_SANDBOX_FELL_BACK=1
-    if guarddog_attempt_prepare; then
-      guarddog_record_from_raw "$raw" "$version" true true "$artifact_json" "$scanner_version" "" "$output"
-      return 0
-    fi
-    guarddog_run_scan
-  fi
-
-  if (( rc != 0 )); then
-    local failure_note
-    local raw_size stderr_size output_limit_bytes=$((GUARDDOG_OUTPUT_LIMIT_KIB * 1024))
-    raw_size=$(file_size_bytes "$raw")
-    stderr_size=$(file_size_bytes "$stderr_file")
-    if [[ -n "$guarddog_capture_note" ]]; then
-      failure_note="$guarddog_capture_note"
-    elif (( raw_size >= output_limit_bytes || stderr_size >= output_limit_bytes )); then
-      failure_note="guarddog output exceeded the ${GUARDDOG_OUTPUT_LIMIT_KIB} KiB per-stream limit"
-    elif [[ "$rc" == "124" || "$rc" == "137" ]]; then
-      failure_note="guarddog scan timed out after ${budget}s"
-    else
-      failure_note=$(tr '\r\n' '  ' < "$stderr_file" | cut -c1-500)
-      [[ -n "$failure_note" ]] || failure_note="guarddog command failed (exit $rc)"
-    fi
-    guarddog_error_record "$version" "$scanner_version" "$failure_note" "$artifact_json" "$output"
-    return 0
-  fi
-  if ! guarddog_result_shape_valid "$raw"; then
-    # GuardDog's own failure shape omits the risk fields entirely and carries
-    # the cause in .errors (verified live: a failed sandboxed extraction
-    # returns {package, issues, errors}). Reporting that as "malformed JSON"
-    # hid an actionable infrastructure cause behind a parser complaint —
-    # audit-infrastructure failure must always name the breakage to fix.
-    local declared_errors=""
-    declared_errors=$(jq -r '
-      if (type == "object") and ((.errors? // null) | type == "object")
-         and ((.errors | length) > 0)
-      then [.errors | to_entries[] | "\(.key): \(.value | tostring)"] | join("; ")
-      else empty end' "$raw" 2>/dev/null || true)
-    if [[ -n "$declared_errors" ]]; then
-      guarddog_error_record "$version" "$scanner_version" \
-        "guarddog scan failed — ${declared_errors:0:500}" "$artifact_json" "$output"
-    else
-      guarddog_error_record "$version" "$scanner_version" \
-        "guarddog returned malformed or inconsistent JSON" "$artifact_json" "$output"
-    fi
-    return 0
-  fi
-
-  local cache_note="" error_count
-  error_count=$(jq -r '.errors | length' "$raw")
-  if [[ "$cache_eligible" == "true" && "$error_count" -eq 0 ]]; then
-    if mkdir -p "$GUARDDOG_CACHE_DIR" 2>/dev/null; then
-      chmod 700 "$GUARDDOG_CACHE_DIR" 2>/dev/null || true
-      local cache_tmp=""
-      cache_tmp=$(mktemp "$GUARDDOG_CACHE_DIR/.guarddog.XXXXXX" 2>/dev/null || true)
-      if [[ -n "$cache_tmp" ]] \
-        && jq -n --argjson identity "$artifact_json" --arg scanner_version "$scanner_version" \
-          --arg profile "$attempt_profile" \
-          --slurpfile result "$raw" '
-          {schema:1,scanner:{name:"guarddog",version:$scanner_version,profile:$profile},
-           identity:$identity,result:($result[0] // {})}' > "$cache_tmp" \
-        && chmod 600 "$cache_tmp" 2>/dev/null \
-        && mv "$cache_tmp" "$cache_file" 2>/dev/null; then
-        :
-      else
-        [[ -n "$cache_tmp" ]] && rm -f "$cache_tmp"
-        cache_note="guarddog result could not be written to the permanent cache"
-      fi
-    else
-      cache_note="guarddog permanent cache directory is unavailable"
-    fi
-  fi
-  guarddog_record_from_raw "$raw" "$version" false "$cache_eligible" \
-    "$artifact_json" "$scanner_version" "$cache_note" "$output"
-}
-
-guarddog_tier_json() {
-  local ecosystem="$1" name="$2" scratch="$3" output="$4"
-  shift 4
-  local -a versions=("$@")
-  local policy enabled budget config_note=""
-  policy=$(install_policy_json)
-  enabled=$(jq -r 'if .guarddog.enabled == false then "false" else "true" end' <<<"$policy")
-  budget=$(jq -r '.guarddog.timeout_seconds // 120' <<<"$policy")
-  GUARDDOG_SANDBOX_MODE=$(jq -r '.guarddog.sandbox // "auto"' <<<"$policy")
-  case "$GUARDDOG_SANDBOX_MODE" in auto|required|off) ;; *) GUARDDOG_SANDBOX_MODE="auto" ;; esac
-  GUARDDOG_SANDBOX_FELL_BACK=0
-  if [[ ! "$budget" =~ ^[1-9][0-9]*$ ]]; then
-    config_note="invalid install.guarddog.timeout_seconds; using default 120"
-    budget=120
-  fi
-
-  if [[ "$enabled" != "true" ]]; then
-    jq -n --argjson enabled false --argjson applicable "$([[ "$ecosystem" == "npm" || "$ecosystem" == "python" ]] && printf true || printf false)" \
-      --argjson budget "$budget" \
-      '{enabled:$enabled,applicable:$applicable,available:null,status:"disabled",
-        contribution:"GO",infra_error:false,note:"disabled by install.guarddog.enabled",
-        timeout_seconds:$budget,scanner_version:null,rules:[],risk_label:null,risk_score:null,
-        cache:{hits:0,misses:0,uncacheable:0},versions:[]}' > "$output"
-    return 0
-  fi
-  if [[ "$ecosystem" != "npm" && "$ecosystem" != "python" ]]; then
-    jq -n --argjson budget "$budget" \
-      '{enabled:true,applicable:false,available:null,status:"not_applicable",
-        contribution:"GO",infra_error:false,note:"GuardDog supports npm and PyPI package checks only",
-        timeout_seconds:$budget,scanner_version:null,rules:[],risk_label:null,risk_score:null,
-        cache:{hits:0,misses:0,uncacheable:0},versions:[]}' > "$output"
-    return 0
-  fi
-  if (( ${#versions[@]} == 0 )); then
-    jq -n --argjson budget "$budget" \
-      '{enabled:true,applicable:true,available:null,status:"skipped",
-        contribution:"GO",infra_error:false,note:"exact resolved version unavailable — behavioral tier skipped",
-        timeout_seconds:$budget,scanner_version:null,rules:[],risk_label:null,risk_score:null,
-        cache:{hits:0,misses:0,uncacheable:0},versions:[]}' > "$output"
-    return 0
-  fi
-
-  local guarddog_cmd
-  guarddog_cmd=$(resolve_local_tool guarddog)
-  if [[ -z "$guarddog_cmd" ]]; then
-    jq -n --argjson budget "$budget" \
-      '{enabled:true,applicable:true,available:false,status:"skipped",
-        contribution:"GO",infra_error:false,
-        note:"guarddog not installed — behavioral tier skipped; install: uv tool install guarddog",
-        timeout_seconds:$budget,scanner_version:null,rules:[],risk_label:null,risk_score:null,
-        cache:{hits:0,misses:0,uncacheable:0},versions:[]}' > "$output"
-    return 0
-  fi
-  if ! command -v timeout >/dev/null 2>&1; then
-    jq -n --argjson budget "$budget" \
-      '{enabled:true,applicable:true,available:true,status:"error",
-        contribution:"WARN",infra_error:true,
-        note:"guarddog scan skipped: no timeout binary to bound the call (install coreutils)",
-        timeout_seconds:$budget,scanner_version:null,rules:[],risk_label:null,risk_score:null,
-        cache:{hits:0,misses:0,uncacheable:0},versions:[]}' > "$output"
-    return 0
-  fi
-
-  local version_out="$scratch/guarddog-version.stdout" version_err="$scratch/guarddog-version.stderr" version_rc=0
-  # Same bounded capture as guarddog_run_scan (live caps on BOTH streams,
-  # no RLIMIT_FSIZE, three-status contract, in-memory capture-failure
-  # diagnosis — see guarddog_bounded_capture); the probe has no downloads,
-  # but one bounding idiom keeps the failure-note size probes below
-  # truthful for both sites.
-  local version_capture_note=""
-  guarddog_bounded_capture "$version_out" "$version_err" \
-    "$scratch/guarddog-version-capture.status" \
-    timeout --kill-after=2s "$budget" \
-    env "${GUARDDOG_ENV_UNSET[@]}" "$guarddog_cmd" --version
-  version_rc="${GUARDDOG_CAPTURE[0]:-125}"
-  [[ "$version_rc" =~ ^[0-9]+$ ]] || version_rc=125
-  if [[ "${GUARDDOG_CAPTURE[1]:-}" != "0" || "${GUARDDOG_CAPTURE[2]:-}" != "0" ]]; then
-    version_capture_note="guarddog version output capture failed (stdout head ${GUARDDOG_CAPTURE[1]:-unreported}, stderr head ${GUARDDOG_CAPTURE[2]:-unreported}) — check free space under ${scratch}"
-    (( version_rc == 0 )) && version_rc=1
-  fi
-  if (( version_rc != 0 )); then
-    local version_note
-    local version_out_size version_err_size output_limit_bytes=$((GUARDDOG_OUTPUT_LIMIT_KIB * 1024))
-    version_out_size=$(file_size_bytes "$version_out")
-    version_err_size=$(file_size_bytes "$version_err")
-    if [[ -n "$version_capture_note" ]]; then
-      version_note="$version_capture_note"
-    elif (( version_out_size >= output_limit_bytes || version_err_size >= output_limit_bytes )); then
-      version_note="guarddog version output exceeded the ${GUARDDOG_OUTPUT_LIMIT_KIB} KiB per-stream limit"
-    elif [[ "$version_rc" == "124" || "$version_rc" == "137" ]]; then
-      version_note="guarddog version check timed out after ${budget}s"
-    else
-      version_note=$(tr '\r\n' '  ' < "$version_err" | cut -c1-500)
-      [[ -n "$version_note" ]] || version_note="guarddog version check failed (exit $version_rc)"
-    fi
-    jq -n --arg note "$version_note" --argjson budget "$budget" \
-      '{enabled:true,applicable:true,available:true,status:"error",
-        contribution:"WARN",infra_error:true,note:$note,timeout_seconds:$budget,
-        scanner_version:null,rules:[],risk_label:null,risk_score:null,
-        cache:{hits:0,misses:0,uncacheable:0},versions:[]}' > "$output"
-    return 0
-  fi
-  local version_line scanner_version
-  version_line=$(head -n 1 "$version_out" | tr -d '\r')
-  # Accept both spellings: the installed guarddog 3.1.0 prints a BARE
-  # version (verified live), while Click's default `--version` renders
-  # "<prog>, version <x>". Parsing only the Click form made a correct
-  # install read as an unsupported scanner, silently disabling the whole
-  # behavioral tier — and, under tier-3, silently restoring Socket as the
-  # only behavioral signal (live adoption 2026-08-03).
-  scanner_version=$(sed -n 's/^guarddog, version \([^[:space:]]\+\).*$/\1/p' <<<"$version_line")
-  if [[ -z "$scanner_version" ]]; then
-    scanner_version=$(sed -n 's/^\([0-9]\+\.[0-9]\+\.[0-9]\+[0-9A-Za-z.+-]*\)[[:space:]]*$/\1/p' <<<"$version_line")
-  fi
-  if [[ "$scanner_version" != "$GUARDDOG_SUPPORTED_VERSION" ]]; then
-    local unsupported_note
-    if [[ -n "$scanner_version" ]]; then
-      unsupported_note="unsupported guarddog version ${scanner_version}; safe supports ${GUARDDOG_SUPPORTED_VERSION}"
-    else
-      unsupported_note="guarddog version output was unrecognized; safe supports ${GUARDDOG_SUPPORTED_VERSION}"
-    fi
-    jq -n --arg note "$unsupported_note" --arg scanner_version "$scanner_version" \
-      --argjson budget "$budget" '
-      {enabled:true,applicable:true,available:true,status:"error",
-       contribution:"WARN",infra_error:true,note:$note,timeout_seconds:$budget,
-       scanner_version:(if $scanner_version == "" then null else $scanner_version end),
-       rules:[],risk_label:null,risk_score:null,
-       cache:{hits:0,misses:0,uncacheable:0},versions:[]}' > "$output"
-    return 0
-  fi
-
-  local -a version_files=()
-  local version_file version slot=0
-  for version in "${versions[@]}"; do
-    version_file="$scratch/guarddog-result-${slot}.json"
-    guarddog_scan_one_json "$ecosystem" "$name" "$version" "$guarddog_cmd" \
-      "$scanner_version" "$budget" "$scratch" "$slot" "$version_file"
-    version_files+=("$version_file")
-    slot=$((slot + 1))
-  done
-
-  if (( GUARDDOG_SANDBOX_FELL_BACK )); then
-    config_note="${config_note:+$config_note; }kernel sandbox unavailable — scanned with --no-sandbox (weaker isolation; cached separately). Set install.guarddog.sandbox=required to fail instead"
-  fi
-  jq -s --arg scanner_version "$scanner_version" --arg config_note "$config_note" \
-    --arg sandbox_mode "$GUARDDOG_SANDBOX_MODE" --argjson fell_back "$(( GUARDDOG_SANDBOX_FELL_BACK ? 1 : 0 ))" \
-    --argjson budget "$budget" '
-    . as $versions
-    | (if any($versions[]; .contribution == "BLOCK") then "BLOCK"
-       elif any($versions[]; .contribution == "WARN") then "WARN"
-       else "GO" end) as $contribution
-    | ([ $versions[].rules[]? ] | unique) as $rules
-    | ([ $versions[] | select(.risk_score != null) ] | sort_by(.risk_score) | last) as $top
-    | ([ $versions[].note | select(. != null and . != "") ]
-       + (if $config_note == "" then [] else [$config_note] end) | unique) as $notes
-    | {
-        enabled:true,applicable:true,available:true,
-        status:(if any($versions[]; .status == "error") then "error"
-                elif any($versions[]; .status == "partial") then "partial"
-                else "ok" end),
-        contribution:$contribution,
-        infra_error:any($versions[]; .infra_error),
-        note:(if ($notes | length) == 0 then null else ($notes | join("; ")) end),
-        timeout_seconds:$budget,
-        sandbox:{mode:$sandbox_mode,fell_back:($fell_back == 1)},
-        scanner_version:(if $scanner_version == "" then null else $scanner_version end),
-        rules:$rules,
-        risk_label:($top.risk_label // null),risk_score:($top.risk_score // null),
-        cache:{
-          hits:([$versions[] | select(.cache.cached)] | length),
-          misses:([$versions[] | select(.cache.eligible and (.cache.cached | not))] | length),
-          uncacheable:([$versions[] | select(.cache.eligible | not)] | length)
-        },
-        versions:$versions
-      }
-  ' "${version_files[@]}" > "$output"
 }
 
 # Release-age lookup for the cooldown check: the minimum age (days) across
@@ -6800,7 +6279,7 @@ resolve_target_versions() {
   RESOLUTION_SOURCE=""
   RESOLUTION_RANGE=""
   if [[ -n "$requested" && "$requested" != "latest" ]] && version_is_exact "$ecosystem" "$requested"; then
-    # node-semver accepts a leading v, but npm's packument keys and GuardDog's
+    # node-semver accepts a leading v, but npm's packument keys and Socket's
     # exact-version lookup use the canonical version without it.
     if [[ "$ecosystem" == "npm" ]]; then
       RESOLVED_VERSIONS=("${requested#v}")
@@ -7657,48 +7136,24 @@ host_allow_matches_resolved() {
   return 0
 }
 
-# Operator-recorded behavioral acknowledgement (the GuardDog popular-package
-# FP lane, ruled 2026-08-04: graphifyy, prettier, qwen-code). Returns the
-# acknowledged rule set (JSON array) for EXACTLY this (name, version,
-# ecosystem) — the ack never carries across versions, and only ecosystems
-# `host-allow add` can grant are matchable (mirrors
-# host_allow_matches_resolved).
-host_allow_behavioral_ack_rules() {
-  local ecosystem="$1" name="$2" version="$3"
-  [[ -f "$SAFE_RUN_HOST_ALLOW_FILE" ]] || return 1
-  local canon_eco entry
-  canon_eco=$(host_allow_canonical_eco "$ecosystem")
-  case "$canon_eco" in npm|python) ;; *) return 1 ;; esac
-  entry=$(jq -c --arg p "$name" '.packages[$p] // empty' "$SAFE_RUN_HOST_ALLOW_FILE" 2>/dev/null || true)
-  [[ -n "$entry" ]] || return 1
-  [[ "$(host_allow_canonical_eco "$(jq -r '.ecosystem // "npm"' <<<"$entry")")" == "$canon_eco" ]] || return 1
-  [[ "$(jq -r '.version // empty' <<<"$entry")" == "$version" ]] || return 1
-  jq -ce '.behavioral_ack.rules | select(type == "array" and length > 0)' <<<"$entry" 2>/dev/null
-}
-
-# Derive the exact artifact versions a host-allow would override. Signal scope
-# is explicit: GuardDog/OSV retain per-version evidence, Socket scores the
-# primary version, and tier-wide failures/custom sources cover every resolved
-# version. The caller then requires one exact pin to equal this complete set.
+# Derive the exact artifact versions a host-allow would override. OSV retains
+# per-version evidence, while Socket scores the primary version and service
+# failures/custom sources cover every resolved version. The caller then
+# requires one exact pin to equal this complete set.
 host_allow_required_versions_json() {
-  local guarddog_file="$1" classifications_json="$2" causes_json="$3"
-  local primary_version="$4" resolved_versions_json="$5"
-  jq -cn --slurpfile guarddog "$guarddog_file" \
-    --argjson osv "$classifications_json" --argjson causes "$causes_json" \
+  local classifications_json="$1" causes_json="$2"
+  local primary_version="$3" resolved_versions_json="$4"
+  jq -cn --argjson osv "$classifications_json" --argjson causes "$causes_json" \
     --arg primary "$primary_version" --argjson resolved "$resolved_versions_json" '
-    ($guarddog[0] // {}) as $guarddog_result
-    | ([$guarddog_result.versions[]?
-        | select(.contribution == "WARN") | .version] | unique) as $guarddog_versions
-    | ($osv | map(select((.classification.affecting | length) > 0) | .version)) as $osv_versions
-    | (["socket_unavailable","socket_auth_failed","socket_rate_limited","socket_error","socket_low_score","socket_score_pending"]
+    ($osv | map(select((.classification.affecting | length) > 0) | .version)) as $osv_versions
+    | (["socket_unavailable","socket_auth_failed","socket_rate_limited","socket_error",
+        "socket_low_score","socket_critical_cve","socket_high_alert","socket_score_pending"]
        | any(. as $c | $causes | index($c) != null)) as $socket_applies
-    | ((($causes | index("guarddog_error")) != null)
-       and (($guarddog_result.versions // []) | length) == 0) as $guarddog_applies_to_all
     | (["osv_unavailable","custom_source","release_too_new"]
        | any(. as $c | $causes | index($c) != null)) as $other_all_apply
-    | ($guarddog_versions + $osv_versions
+    | ($osv_versions
        + (if $socket_applies and $primary != "" then [$primary] else [] end)
-       + (if $guarddog_applies_to_all or $other_all_apply then $resolved else [] end)
+       + (if $other_all_apply then $resolved else [] end)
        | unique) as $required
     | if ($required | length) == 0 then $resolved else $required end'
 }
@@ -7881,10 +7336,9 @@ check_command() {
     CHECK_INSTALLER=$(default_installer_for "$ecosystem")
   fi
 
-  local scratch socket_json guarddog_json osv_json block_reason verdict socket_line guarddog_line osv_line block_line
+  local scratch socket_json osv_json block_reason verdict socket_line osv_line block_line
   new_scratch_dir scratch
   socket_json="$scratch/socket.json"
-  guarddog_json="$scratch/guarddog.json"
   osv_json="$scratch/osv.json"
 
   # The effective sources are derived BEFORE resolution: an env/rc-selected
@@ -7943,64 +7397,23 @@ check_command() {
       "$scratch/packument.json" 2>/dev/null) || has_install_script=""
   fi
 
-  if (( resolution_ok )); then
-    guarddog_tier_json "$ecosystem" "$PKG_NAME" "$scratch" "$guarddog_json" \
-      "${RESOLVED_VERSIONS[@]}"
-  else
-    guarddog_tier_json "$ecosystem" "$PKG_NAME" "$scratch" "$guarddog_json"
-  fi
-
-  # --- behavioral acknowledgement candidacy (operator FP lane) ---------------
-  # A GuardDog BLOCK may be downgraded to a host-allowable WARN only by an
-  # operator-recorded acknowledgement pinned to EXACTLY this single resolved
-  # version, and only with every other signal clean: the current rule set a
-  # subset of what the operator acknowledged, Socket force-consulted as the
-  # second opinion reporting nothing high/critical, and zero OSV advisories
-  # affecting the version (verified after classification below). Blocklist,
-  # MAL-* records and OSV-critical stay untouchable regardless.
-  local behavioral_ack_rules="" behavioral_ack_candidate=0 behavioral_ack_prereqs=0
-  # Entry-independent prerequisites first (also the hint lane's base
-  # predicate — PR#67 F5 delta-2): an acknowledgement can only ever engage
-  # for a COMPLETE scan (status ok, no infra error — a partial result's
-  # rule set cannot support the new-rules veto: the detector that failed is
-  # exactly the one that might have produced the rule the operator never
-  # reviewed, F2) of exactly one resolved version.
-  if [[ "$(jq -r '.contribution // empty' "$guarddog_json" 2>/dev/null)" == "BLOCK" ]] \
-    && [[ "$(jq -r '.status // empty' "$guarddog_json" 2>/dev/null)" == "ok" ]] \
-    && [[ "$(jq -r '.infra_error' "$guarddog_json" 2>/dev/null)" == "false" ]] \
-    && (( resolution_ok )) && (( ${#RESOLVED_VERSIONS[@]} == 1 )); then
-    behavioral_ack_prereqs=1
-    if behavioral_ack_rules=$(host_allow_behavioral_ack_rules "$ecosystem" "$PKG_NAME" "$primary_version"); then
-      behavioral_ack_candidate=1
-    fi
-  fi
-
-  # --- tier-3 socket decision (make Socket optional, not load-bearing)
-  # GuardDog is the behavioral tier. Socket is consulted only when the
-  # behavioral tier produced no complete verdict (not installed, disabled,
-  # unsupported ecosystem, unresolved version, error, partial) — or when the
-  # operator forces it. A Socket outage then degrades only those rare
-  # consultations instead of every check (two full days of 429-degraded
-  # verdicts were the trigger; inbox 2026-08-03 tiered-scoring note).
-  # A behavioral-ack candidate forces the consult: Socket is the second
-  # opinion exactly when GuardDog is being overruled.
+  # Socket is the primary behavioral tier. Existing auto and always spellings
+  # both consult it; only the explicit never mode skips it.
   local socket_mode socket_skip_reason=""
   socket_mode=$(install_policy_json | jq -r '.socket.mode // "auto"')
   case "$socket_mode" in always|auto|never) ;; *) socket_mode="auto" ;; esac
   if [[ "$socket_mode" == "never" ]]; then
     socket_skip_reason="disabled by install.socket.mode=never"
-  elif [[ "$socket_mode" == "auto" ]] \
-    && [[ "$(jq -r '.status' "$guarddog_json" 2>/dev/null)" == "ok" ]] \
-    && (( behavioral_ack_candidate == 0 )); then
-    socket_skip_reason="tier 3 — behavioral verdict from GuardDog; not consulted"
-  fi
-  if [[ -n "$socket_skip_reason" ]]; then
     jq -n --arg reason "$socket_skip_reason" \
-      '{available: null, status: "skipped_tier3", note: $reason}' > "$socket_json"
+      '{available:null,status:"skipped",note:$reason}' > "$socket_json"
   else
     local socket_spec="$spec"
     (( resolution_ok )) && socket_spec="${PKG_NAME}@${primary_version}"
-    socket_score_json "$ecosystem" "$socket_spec" "$socket_json"
+    if (( resolution_ok )); then
+      socket_score_json "$ecosystem" "$socket_spec" "$socket_json" "" "$PKG_NAME" "$primary_version"
+    else
+      socket_score_json "$ecosystem" "$socket_spec" "$socket_json"
+    fi
     # Socket computes an unseen release's score on demand. For a release still
     # inside the existing cooldown window, give that first computation one
     # longer bounded chance before deciding whether the score is pending.
@@ -8010,7 +7423,8 @@ check_command() {
       && jq -e '(.status == "error") and (.timeout == true)' "$socket_json" >/dev/null 2>&1; then
       local fresh_socket_budget
       fresh_socket_budget=$(socket_fresh_scan_budget_seconds)
-      socket_score_json "$ecosystem" "$socket_spec" "$socket_json" "$fresh_socket_budget"
+      socket_score_json "$ecosystem" "$socket_spec" "$socket_json" "$fresh_socket_budget" \
+        "$PKG_NAME" "$primary_version"
       if jq -e '(.status == "error") and (.timeout == true)' "$socket_json" >/dev/null 2>&1; then
         jq -n --arg version "$primary_version" --argjson age_days "$primary_release_age" \
           --argjson timeout_seconds "$fresh_socket_budget" \
@@ -8026,8 +7440,8 @@ check_command() {
   local socket_detail=""
   local socket_pending=0
   socket_line="PASS (no behavioral anomalies)"
-  if [[ "$(jq -r '.status // empty' "$socket_json" 2>/dev/null)" == "skipped_tier3" ]]; then
-    # A deliberate tier-3 skip is not an outage: no cause, no verdict bump.
+  if [[ "$(jq -r '.status // empty' "$socket_json" 2>/dev/null)" == "skipped" ]]; then
+    # A deliberate policy skip is not an outage: no cause, no verdict bump.
     socket_line="SKIP ($(jq -r '.note' "$socket_json"))"
   elif [[ "$(jq -r '.available // false' "$socket_json" 2>/dev/null)" != "true" ]]; then
     socket_line='SKIP (socket CLI not available)'
@@ -8042,8 +7456,6 @@ check_command() {
     local socket_note
     socket_note=$(jq -r '.note // "socket check failed"' "$socket_json" 2>/dev/null || printf 'socket check failed')
     case "$socket_note" in
-      # 429 first: its message never mentions auth, and a bare *API* match
-      # used to relabel any failure (even spinner text) as an auth problem
       *"Too Many Requests"*|*" 429"*|*"rate limit"*)
         socket_line='WARN (socket rate-limited, retry later)'
         warn_causes+=("socket_rate_limited")
@@ -8061,140 +7473,43 @@ check_command() {
         warn_causes+=("socket_error")
         ;;
       *)
-        socket_line='WARN (socket check failed)'
+        socket_line='WARN (socket returned an unrecognized result)'
         warn_causes+=("socket_error")
         ;;
     esac
+    if [[ -n "$SOCKET_CACHE_STALE_SCORE" && -n "$SOCKET_CACHE_STALE_AGE_DAYS" ]]; then
+      socket_line+="; last complete score was ${SOCKET_CACHE_STALE_SCORE}, ${SOCKET_CACHE_STALE_AGE_DAYS}d ago"
+    fi
     socket_detail="$socket_note"
     verdict="WARN"
   else
     local score_val
-    score_val=$(jq -r '.raw.data.self.score.overall // empty' "$socket_json" 2>/dev/null || true)
-    if jq -e '(.raw.data.self.score.overall | type) == "number"
-      and (.raw.data.self.score.overall < 70)' "$socket_json" >/dev/null 2>&1; then
+    score_val=$(jq -r '.raw.data.self.score.overall' "$socket_json")
+    if jq -e '[.raw.data.self.alerts[]
+      | select(.severity == "critical" and .category == "supplyChainRisk")] | length > 0' \
+      "$socket_json" >/dev/null 2>&1; then
+      socket_line='BLOCK (critical supply-chain-risk alert)'
+      warn_causes+=("socket_malware")
+      bump_verdict verdict "BLOCK"
+    elif jq -e '[.raw.data.self.alerts[]
+      | select(.severity == "critical" and .category == "vulnerability")] | length > 0' \
+      "$socket_json" >/dev/null 2>&1; then
+      socket_line='WARN (critical vulnerability alert)'
+      warn_causes+=("socket_critical_cve")
+      bump_verdict verdict "WARN"
+    elif jq -e '[.raw.data.self.alerts[] | select(.severity == "high")] | length > 0' \
+      "$socket_json" >/dev/null 2>&1; then
+      socket_line='WARN (high-severity alert)'
+      warn_causes+=("socket_high_alert")
+      bump_verdict verdict "WARN"
+    elif jq -e '.raw.data.self.score.overall < 70' "$socket_json" >/dev/null 2>&1; then
       socket_line="WARN (score=$score_val)"
       warn_causes+=("socket_low_score")
-      verdict="WARN"
-    fi
-  fi
-
-  local guarddog_status guarddog_contribution guarddog_detail guarddog_rules guarddog_issue_count guarddog_infra
-  local guarddog_finding_versions
-  guarddog_status=$(jq -r '.status' "$guarddog_json")
-  guarddog_contribution=$(jq -r '.contribution' "$guarddog_json")
-  guarddog_detail=$(jq -r '.note // empty' "$guarddog_json")
-  guarddog_rules=$(jq -r '.rules | join(", ")' "$guarddog_json")
-  guarddog_issue_count=$(jq -r '[.versions[].raw.issues // 0] | add // 0' "$guarddog_json")
-  guarddog_infra=$(jq -r '.infra_error' "$guarddog_json")
-  guarddog_finding_versions=$(jq -r \
-    '[.versions[] | select((.rules | length) > 0) | .version] | unique | join(",")' \
-    "$guarddog_json")
-  # Behavioral-ack engagement: all conditions evaluable now except the OSV
-  # one, which re-escalates below once classification has run.
-  # Independent facts, then derivation (delta-3 N2 simplification): a
-  # first-match veto ladder conflated display priority with actionability
-  # whenever multiple vetoes coexisted. Engagement and hint refreshability
-  # both derive from the same two booleans; the veto TEXT concatenates
-  # every standing reason.
-  local behavioral_ack_engaged=0 behavioral_ack_veto=""
-  local behavioral_rules_covered=0 behavioral_socket_ok=0 behavioral_socket_veto=""
-  if (( behavioral_ack_candidate )); then
-    local behavioral_new_rules
-    behavioral_new_rules=$(jq -cn --slurpfile g "$guarddog_json" --argjson ack "$behavioral_ack_rules" \
-      '[(($g[0].rules // [])[]) | select(. as $r | ($ack | index($r)) | not)]' 2>/dev/null || printf '[]')
-    [[ "$behavioral_new_rules" == "[]" ]] && behavioral_rules_covered=1
-    if [[ "$(jq -r '.status // empty' "$socket_json" 2>/dev/null)" != "ok" ]]; then
-      behavioral_socket_veto="the acknowledgement requires a Socket second opinion and Socket is unavailable"
-    elif ! jq -e '
-        (.raw.ok == true)
-        and ((.raw.data.self.alerts // null) | type == "array")
-        and ([.raw.data.self.alerts[]
-              | select((type == "object")
-                and (.severity == "critical" or .severity == "high"
-                     or .severity == "middle" or .severity == "low"))]
-             | length) == (.raw.data.self.alerts | length)
-      ' "$socket_json" >/dev/null 2>&1; then
-      # The second opinion must be a RECOGNIZED success envelope: a bare
-      # exit-0 with {}, a score-only body, or an ok:false error envelope
-      # says nothing about the package, and a vacuous second opinion must
-      # veto, not engage (PR#67 F1). Every severity must be exactly one of
-      # Socket's enum values — "HIGH", "urgent", an empty string, or a
-      # Unicode lookalike is an UNKNOWN alert class, and an alert we cannot
-      # classify must veto, never count as not-high (F1 delta residual).
-      behavioral_socket_veto="the Socket second opinion returned an unrecognized result — cannot vouch for this version"
-      socket_line='WARN (socket returned an unrecognized result — second opinion unusable)'
-      warn_causes+=("socket_error")
-      socket_detail="unrecognized socket result shape"
       bump_verdict verdict "WARN"
-    elif [[ "$(jq -r '[.raw.data.self.alerts[] | select(.severity == "high" or .severity == "critical")] | length' "$socket_json" 2>/dev/null)" != "0" ]]; then
-      behavioral_socket_veto="Socket reports high-severity alerts for this version"
     else
-      behavioral_socket_ok=1
-    fi
-    if (( behavioral_rules_covered && behavioral_socket_ok )); then
-      behavioral_ack_engaged=1
-    elif (( ! behavioral_rules_covered )); then
-      behavioral_ack_veto="rules not covered by the acknowledgement: $(jq -r 'join(", ")' <<<"$behavioral_new_rules")"
-      [[ -n "$behavioral_socket_veto" ]] && behavioral_ack_veto+="; ${behavioral_socket_veto}"
-    else
-      behavioral_ack_veto="$behavioral_socket_veto"
+      socket_line="PASS (score=$score_val)"
     fi
   fi
-  case "$guarddog_status:$guarddog_contribution" in
-    disabled:*) guarddog_line='SKIP (disabled by install.guarddog.enabled)' ;;
-    not_applicable:*) guarddog_line='SKIP (not applicable to this ecosystem)' ;;
-    skipped:*) guarddog_line='SKIP (behavioral tier not run)' ;;
-    *:BLOCK)
-      if (( behavioral_ack_engaged )); then
-        guarddog_line="WARN (high-risk behavioral findings acknowledged by operator as false positives: ${guarddog_rules:-unknown rules})"
-      else
-        guarddog_line="BLOCK (high-risk behavioral findings: ${guarddog_rules:-unknown rules})"
-        [[ -n "$behavioral_ack_veto" ]] && guarddog_line+="; behavioral acknowledgement NOT applied — ${behavioral_ack_veto}"
-      fi
-      [[ "$guarddog_infra" == "true" ]] && guarddog_line+='; scan incomplete (infrastructure failure)'
-      ;;
-    *:WARN)
-      if [[ -n "$guarddog_rules" ]]; then
-        guarddog_line="WARN (behavioral findings: ${guarddog_rules})"
-        [[ "$guarddog_infra" == "true" ]] && guarddog_line+='; scan incomplete (infrastructure failure)'
-      else
-        guarddog_line='WARN (scan failed — infrastructure failure, NOT a package finding)'
-      fi
-      ;;
-    error:*) guarddog_line='WARN (scan failed — infrastructure failure, NOT a package finding)' ;;
-    *)
-      if (( guarddog_issue_count > 0 )); then
-        guarddog_line="PASS (no correlated behavioral risks; ${guarddog_issue_count} raw rule matches retained in receipt)"
-      else
-        guarddog_line='PASS (no correlated behavioral risks)'
-      fi
-      ;;
-  esac
-  if [[ "$guarddog_infra" == "true" ]]; then
-    warn_causes+=("guarddog_error")
-    bump_verdict verdict "WARN"
-  fi
-  case "$guarddog_contribution" in
-    BLOCK)
-      if (( behavioral_ack_engaged )); then
-        # Downgrade, never erase: the finding stays a WARN cause the operator
-        # entry must still clear at the gate; OSV classification below can
-        # re-escalate this to BLOCK (behavioral_ack void on any affecting
-        # advisory).
-        warn_causes+=("guarddog_high_risk_acknowledged")
-        bump_verdict verdict "WARN"
-      else
-        warn_causes+=("guarddog_high_risk")
-        bump_verdict verdict "BLOCK"
-      fi
-      ;;
-    WARN)
-      if [[ -n "$guarddog_rules" ]]; then
-        warn_causes+=("guarddog_findings")
-        bump_verdict verdict "WARN"
-      fi
-      ;;
-  esac
 
   # --- version-aware OSV evaluation
   local osv_eco
@@ -8253,52 +7568,6 @@ check_command() {
     osv_query_package_json "$ecosystem" "$PKG_NAME" "" "$osv_json"
     [[ "$(jq -r '.status' "$osv_json" 2>/dev/null)" == "ok" ]] || osv_status="error"
     total_count=$(jq '[.vulns[]?] | length' "$osv_json" 2>/dev/null || echo 0)
-  fi
-
-  # Behavioral-ack OSV condition (fail closed both ways): ANY advisory
-  # affecting the version voids the acknowledgement — the FP lane covers
-  # behavioral heuristics only, never known vulnerabilities — and an OSV
-  # infrastructure failure means the condition cannot be verified, so the
-  # BLOCK stands.
-  if (( behavioral_ack_engaged )) && { (( aff_count > 0 )) || [[ "$osv_status" != "ok" ]]; }; then
-    behavioral_ack_engaged=0
-    if (( aff_count > 0 )); then
-      guarddog_line="BLOCK (high-risk behavioral findings: ${guarddog_rules:-unknown rules}); behavioral acknowledgement void — ${aff_count} advisories affect this version"
-    else
-      guarddog_line="BLOCK (high-risk behavioral findings: ${guarddog_rules:-unknown rules}); behavioral acknowledgement NOT applied — OSV could not verify the version (infrastructure failure)"
-    fi
-    # The provisional acknowledged cause must not survive the void: a
-    # receipt carrying both reads as "an acknowledgement was active" to
-    # structured consumers (PR#67 F4).
-    local -a behavioral_kept_causes=()
-    local behavioral_kept_cause
-    for behavioral_kept_cause in ${warn_causes[@]+"${warn_causes[@]}"}; do
-      [[ "$behavioral_kept_cause" == "guarddog_high_risk_acknowledged" ]] \
-        || behavioral_kept_causes+=("$behavioral_kept_cause")
-    done
-    warn_causes=(${behavioral_kept_causes[@]+"${behavioral_kept_causes[@]}"})
-    warn_causes+=("guarddog_high_risk")
-    bump_verdict verdict "BLOCK"
-  fi
-
-  # Whether the `host-allow add --acknowledge-behavioral` command is the
-  # ACTIONABLE recovery right now (hint gating, PR#67 F5 delta-2): the
-  # entry-independent prerequisites must hold (complete single-version
-  # GuardDog BLOCK — a partial scan or multi-version resolution can never
-  # engage, so suggesting an add there is a dead end) and OSV must be able
-  # to verify the version. An existing entry closes the lane UNLESS
-  # uncovered rules are its ONLY standing veto — re-adding with the
-  # refreshed receipt is exactly that veto's recovery (delta-2 N1) — and a
-  # simultaneous Socket veto closes it regardless: re-adding cannot repair
-  # the second opinion (delta-3 N2, derived from the independent facts,
-  # never from a first-rendered veto).
-  local behavioral_ack_lane_open=0
-  if (( behavioral_ack_prereqs )) && [[ "$osv_status" == "ok" ]]; then
-    behavioral_ack_lane_open=1
-    if (( behavioral_ack_candidate )) \
-      && ! (( ! behavioral_rules_covered && behavioral_socket_ok )); then
-      behavioral_ack_lane_open=0
-    fi
   fi
 
   local block_severities affecting_blocked=""
@@ -8498,20 +7767,11 @@ check_command() {
 
   # A fresh Socket score that is still pending is data availability, not an
   # infrastructure outage. It may leave a GO only when every independent
-  # signal that could vouch for this resolved artifact is clean. Any adverse
-  # or incomplete companion signal keeps its own verdict and adds an explicit
-  # pending cause, so an acknowledgement never treats missing Socket evidence
-  # as a clean second opinion.
+  # signal already evaluated cleanly; otherwise retain that signal's verdict
+  # and add an explicit pending cause.
   if (( socket_pending )); then
-    local socket_pending_safe=0
-    if [[ "$guarddog_status" == "ok" && "$guarddog_contribution" == "GO" \
-      && "$guarddog_infra" == "false" && -z "$guarddog_rules" \
-      && "$guarddog_issue_count" == "0" && "$osv_status" == "ok" ]] \
-      && (( aff_count == 0 )) && [[ "$block_line" == PASS* ]] \
-      && (( behavioral_ack_candidate == 0 )); then
-      socket_pending_safe=1
-    fi
-    if (( ! socket_pending_safe )); then
+    if [[ "$verdict" != "GO" || "$osv_status" != "ok" ]] \
+      || (( ! resolution_ok || aff_count > 0 )) || [[ "$block_line" != PASS* ]]; then
       warn_causes+=("socket_score_pending")
       bump_verdict verdict "WARN"
     fi
@@ -8536,7 +7796,6 @@ check_command() {
     --arg installer "$CHECK_INSTALLER" \
     --arg verdict "$verdict" \
     --arg socket_line "$socket_line" \
-    --arg guarddog_line "$guarddog_line" \
     --arg osv_line "$osv_line" \
     --arg block_line "$block_line" \
     --arg release_line "$release_line" \
@@ -8557,7 +7816,6 @@ check_command() {
     --argjson versions "$classifications" \
     --argjson warn_causes "$warn_causes_json" \
     --slurpfile socket "$socket_json" \
-    --slurpfile guarddog "$guarddog_json" \
     --slurpfile osv "$osv_json" '
     {
       timestamp: $timestamp,
@@ -8577,7 +7835,6 @@ check_command() {
       has_install_script: (if $has_install_script == "" then null else ($has_install_script == "true") end),
       checks: {
         socket: $socket_line,
-        guarddog: $guarddog_line,
         osv: $osv_line,
         blocklist: $block_line,
         release_age: (if $release_line == "" then null else $release_line end)
@@ -8592,7 +7849,6 @@ check_command() {
         published: (if $release_published == "" then null else $release_published end)
       } end),
       socket: ($socket[0] // {}),
-      guarddog: ($guarddog[0] // {}),
       osv: (($osv[0] // {}) + {classification: $classification, versions: $versions})
     }' > "$result_json"
 
@@ -8608,29 +7864,17 @@ check_command() {
       printf 'Resolved:    (unresolved — auditing at package level)\n'
     fi
     printf 'Socket:      %s\n' "$socket_line"
-    printf 'GuardDog:    %s\n' "$guarddog_line"
     printf 'OSV:         %s\n' "$osv_line"
     [[ -n "$release_line" ]] && printf 'Release age: %s\n' "$release_line"
     printf 'Blocklist:   %s\n' "$block_line"
     if (( custom_source )); then
       printf '\n[safe audit] custom source: %s — advisory evidence covers the public registry identity only\n' "$CHECK_EFFECTIVE_SOURCES"
     fi
-    # Branch on the discriminated status first: a deliberate tier-3/never
-    # skip carries available:null and must not render as an outage
-    # (PR#60 review F3).
+    # Branch on the discriminated status first: a deliberate Socket-disabled
+    # skip must not render as an outage.
     if [[ "$(jq -r '.available' "$socket_json" 2>/dev/null)" == "false" ]]; then
       printf '\n[safe audit] WARNING: socket CLI not available, skipping behavioral analysis\n'
       printf '[safe audit] Install: safe audit setup local\n'
-    fi
-    # Weaker isolation must never pass silently, even on a clean PASS.
-    if [[ "$(jq -r '.sandbox.fell_back // false' "$guarddog_json" 2>/dev/null)" == "true" ]]; then
-      printf '\n[safe audit] guarddog: %s\n' "$guarddog_detail"
-    fi
-    if [[ "$guarddog_status" == "skipped" && "$(jq -r '.available' "$guarddog_json")" == "false" ]]; then
-      printf '\n[safe audit] %s\n' "$guarddog_detail"
-    elif [[ "$guarddog_infra" == "true" ]]; then
-      printf '\n[safe audit] guarddog unavailable (%s) — infrastructure failure, NOT a package finding\n' \
-        "${guarddog_detail:-unknown cause}"
     fi
     printf '\nVERDICT: %s\n' "$verdict"
     if [[ -z "$gate" && "$verdict" != "GO" ]]; then
@@ -8639,9 +7883,7 @@ check_command() {
       # preflight and deserves the same next-step hints (contract-test
       # findings 5/7).
       gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" "$aff_count" \
-        "$socket_detail" "$guarddog_rules" "$guarddog_detail" "$guarddog_finding_versions" \
-        "$release_security_fix_ids" "$([[ "$block_line" == PASS* ]] && printf 1 || printf 0)" \
-        "$behavioral_ack_lane_open" \
+        "$socket_detail" "$release_security_fix_ids" "$([[ "$block_line" == PASS* ]] && printf 1 || printf 0)" \
         ${warn_causes[@]+"${warn_causes[@]}"}
       if [[ "$verdict" == "BLOCK" ]]; then
         printf 'safe audit: operator review required: safe audit check %s --ecosystem %s --json\n' \
@@ -8658,46 +7900,20 @@ check_command() {
     case "$verdict" in
       GO)
         if [[ "$auto_allow" == "true" ]] && (( resolution_ok )); then
-          local guarddog_reason
-          case "$guarddog_status" in
-            ok)
-              # Provenance must survive into recorded evidence: a clean
-              # verdict produced without the kernel sandbox is not the same
-              # evidence as a sandboxed one (delta-2 F9).
-              if [[ "$(jq -r '.sandbox.fell_back // false' "$guarddog_json" 2>/dev/null)" == "true" \
-                || "$(jq -r '.sandbox.mode // ""' "$guarddog_json" 2>/dev/null)" == "off" ]]; then
-                guarddog_reason="guarddog_clean_for_versions_nosandbox"
-              else
-                guarddog_reason="guarddog_clean_for_versions"
-              fi
-              ;;
-            disabled) guarddog_reason="guarddog_disabled" ;;
-            not_applicable) guarddog_reason="guarddog_not_applicable" ;;
-            skipped) guarddog_reason="guarddog_skipped_not_installed" ;;
-            *) guarddog_reason="guarddog_state_${guarddog_status}" ;;
-          esac
-          # The recorded evidence must say what Socket actually did: a
-          # tier-3 skip is not a green score and must never read as one.
+          # A pending-score GO is not fully clean evidence: record it under a
+          # distinct verdict so the offline stale-evidence fallback can never
+          # treat incomplete Socket data as a clean check during an outage.
           local socket_reason="socket_ok"
-          # A pending-score GO is not fully clean evidence: record it under
-          # a distinct verdict so the offline stale-evidence fallback
-          # (safe_gate_known_matches selects verdict == "GO" only) can never
-          # treat incomplete Socket data as a clean check during an audit
-          # outage — same exclusion principle as WARN_TOLERATED.
           local known_verdict="GO"
           if (( socket_pending )); then
             socket_reason="socket_score_pending"
             known_verdict="GO_PENDING_SOCKET"
           elif [[ -n "$socket_skip_reason" ]]; then
-            if [[ "$socket_mode" == "never" ]]; then
-              socket_reason="socket_disabled"
-            else
-              socket_reason="socket_skipped_tier3"
-            fi
+            socket_reason="socket_disabled"
           fi
           mark_install_known "$ecosystem" "$PKG_NAME" "$primary_version" "$known_verdict" \
-            "$(jq -cn --arg guarddog_reason "$guarddog_reason" --arg socket_reason "$socket_reason" \
-              '["osv_clean_for_version",$socket_reason,"blocklist_pass",$guarddog_reason]')" "$result_json"
+            "$(jq -cn --arg socket_reason "$socket_reason" \
+              '["osv_clean_for_version",$socket_reason,"blocklist_pass"]')" "$result_json"
           printf '[safe audit] recorded clean check: %s:%s@%s (install-known)\n' \
             "$ecosystem" "$PKG_NAME" "$primary_version" >&2
         fi
@@ -8724,9 +7940,8 @@ check_command() {
         [[ "$block_line" != PASS* ]] && adverse=1
         for adverse_cause in ${warn_causes[@]+"${warn_causes[@]}"}; do
           [[ "$adverse_cause" == "socket_low_score" \
-            || "$adverse_cause" == "guarddog_findings" \
-            || "$adverse_cause" == "guarddog_high_risk" \
-            || "$adverse_cause" == "guarddog_high_risk_acknowledged" \
+            || "$adverse_cause" == "socket_critical_cve" \
+            || "$adverse_cause" == "socket_high_alert" \
             || "$adverse_cause" == "release_too_new" ]] && adverse=1
         done
         if (( adverse )); then
@@ -8737,7 +7952,7 @@ check_command() {
         # single-entry schema cannot authorize the aggregate operation.
         local -a host_allow_required_versions=()
         local host_allow_versions_json
-        host_allow_versions_json=$(host_allow_required_versions_json "$guarddog_json" \
+        host_allow_versions_json=$(host_allow_required_versions_json \
           "$classifications" "$warn_causes_json" "$primary_version" "$resolved_versions_json")
         mapfile -t host_allow_required_versions < <(jq -r '.[]' <<<"$host_allow_versions_json")
         HOST_ALLOW_RESOLVED_VERSION=""
@@ -8756,9 +7971,7 @@ check_command() {
           gate_exit=0
         else
           gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" "$aff_count" \
-            "$socket_detail" "$guarddog_rules" "$guarddog_detail" "$guarddog_finding_versions" \
-            "$release_security_fix_ids" "$([[ "$block_line" == PASS* ]] && printf 1 || printf 0)" \
-            "$behavioral_ack_lane_open" \
+            "$socket_detail" "$release_security_fix_ids" "$([[ "$block_line" == PASS* ]] && printf 1 || printf 0)" \
             "${warn_causes[@]}"
           gate_exit=10
         fi
@@ -8771,17 +7984,9 @@ check_command() {
             break
           fi
         done
-        local -a guarddog_block_causes=()
-        for block_cause in ${warn_causes[@]+"${warn_causes[@]}"}; do
-          [[ "$block_cause" == guarddog_* ]] && guarddog_block_causes+=("$block_cause")
-        done
-        if (( ${#guarddog_block_causes[@]} > 0 )); then
-          gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" "$aff_count" \
-            "" "$guarddog_rules" "$guarddog_detail" "$guarddog_finding_versions" \
-            "" "$([[ "$block_line" == PASS* ]] && printf 1 || printf 0)" \
-            "$behavioral_ack_lane_open" \
-            "${guarddog_block_causes[@]}"
-        fi
+        gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" "$aff_count" \
+          "$socket_detail" "" "$([[ "$block_line" == PASS* ]] && printf 1 || printf 0)" \
+          "${warn_causes[@]}"
         printf 'safe audit: operator review required: safe audit check %s --ecosystem %s --json\n' \
           "$( (( resolution_ok )) && printf '%s@%s' "$PKG_NAME" "$primary_version" || printf '%s' "$spec")" "$ecosystem" >&2
         revoke_install_known "$ecosystem" "$PKG_NAME" "$primary_version" ${RESOLVED_VERSIONS[@]+"${RESOLVED_VERSIONS[@]}"}
@@ -8820,32 +8025,25 @@ gate_host_allow_add_cmd() {
 # priority order. Socket failures are infrastructure breakage — the wording
 # must never read as a package vulnerability finding.
 gate_emit_refusal_hints() {
-  local ecosystem="$1" name="$2" primary_version="$3" resolution_ok="$4" aff_count="$5" socket_detail="$6"
-  local guarddog_rules="$7" guarddog_detail="$8"
-  local guarddog_finding_versions="$9"
-  local cooldown_remediates="${10}"
-  local blocklist_pass="${11}"
-  # "1" when the FP lane could engage for a fresh acknowledgement right
-  # now: no entry already present (an existing vetoed ack makes an add
-  # suggestion a dead end) and OSV verifiable (an outage vetoes any ack
-  # until it recovers) — PR#67 F5 delta residual.
-  local ack_lane_open="${12}"
-  shift 12
-  local -a causes=("$@")
-  local cause has_socket_infra=0 has_unresolved=0 has_affecting=0 has_osv_down=0 has_low_score=0 has_custom_source=0 has_malware=0
-  local has_guarddog_findings=0 has_guarddog_high_risk=0 has_guarddog_error=0 has_too_new=0
+  local ecosystem="$1" name="$2" primary_version="$3" resolution_ok="$4" aff_count="$5"
+  local socket_detail="$6" cooldown_remediates="$7" blocklist_pass="$8"
+  shift 8
+  local -a causes=("${@}")
+  local cause has_socket_infra=0 has_unresolved=0 has_affecting=0 has_osv_down=0
+  local has_low_score=0 has_socket_high=0 has_socket_critical_cve=0 has_socket_malware=0
+  local has_custom_source=0 has_malware=0 has_too_new=0
   for cause in "${causes[@]}"; do
     case "$cause" in
       socket_unavailable|socket_auth_failed|socket_rate_limited|socket_error) has_socket_infra=1 ;;
+      socket_low_score) has_low_score=1 ;;
+      socket_high_alert) has_socket_high=1 ;;
+      socket_critical_cve) has_socket_critical_cve=1 ;;
+      socket_malware) has_socket_malware=1 ;;
       version_unresolved) has_unresolved=1 ;;
       osv_affecting) has_affecting=1 ;;
       osv_unavailable) has_osv_down=1 ;;
-      socket_low_score) has_low_score=1 ;;
       custom_source) has_custom_source=1 ;;
       osv_malware) has_malware=1 ;;
-      guarddog_findings) has_guarddog_findings=1 ;;
-      guarddog_high_risk) has_guarddog_high_risk=1 ;;
-      guarddog_error) has_guarddog_error=1 ;;
       release_too_new) has_too_new=1 ;;
     esac
   done
@@ -8869,6 +8067,9 @@ gate_emit_refusal_hints() {
   if (( has_malware )); then
     printf 'safe audit: known-malware record (OSV MAL-*) — do not install, do not pin around it; operator review only\n' >&2
   fi
+  if (( has_socket_malware )); then
+    printf 'safe audit: Socket reports a critical supply-chain-risk alert — do not install or pin around it; operator review only\n' >&2
+  fi
   if (( has_custom_source )); then
     printf 'safe audit: custom package source — public advisory evidence cannot vouch for a private artifact\n' >&2
     printf 'safe audit: to trust this source permanently: add it to install.trusted_registries in ~/.config/safe/run/config.json (operator)\n' >&2
@@ -8879,8 +8080,8 @@ gate_emit_refusal_hints() {
     if [[ -n "$affecting_allow_cmd" ]]; then
       printf 'safe audit: to allow this exact version: %s\n' "$affecting_allow_cmd" >&2
     else
-      printf 'safe audit: operator review: safe audit check %s@%s --ecosystem %s --json\n' \
-        "$name" "$primary_version" "$ecosystem" >&2
+      printf 'safe audit: operator review: safe audit check %s@<x.y.z> --ecosystem %s --json\n' \
+        "$name" "$ecosystem" >&2
     fi
   fi
   if (( has_socket_infra )); then
@@ -8895,47 +8096,8 @@ gate_emit_refusal_hints() {
   if (( has_osv_down )); then
     printf 'safe audit: OSV advisory service unreachable — retry; if persistent, operator review\n' >&2
   fi
-  if (( has_low_score )); then
-    printf 'safe audit: socket behavioral score is low — operator review required (not auto-allowable)\n' >&2
-  fi
-  if (( has_guarddog_high_risk )); then
-    printf 'safe audit: guarddog high-risk behavioral findings (%s) — do not install or pin around them; operator review only\n' \
-      "${guarddog_rules:-unknown rules}" >&2
-    # The behavioral-FP lane exists only for a single exact resolved version
-    # and only survives clean OSV plus a clean Socket second opinion — no
-    # command is suggested for multi-version findings, nor beside an
-    # independent BLOCK the acknowledgement can never clear (affecting
-    # advisory, MAL-* record, blocklist hit — PR#67 F5: a dead-end hint
-    # next to "do not pin around it" is worse than none).
-    if [[ "$resolution_ok" == "1" && "$guarddog_finding_versions" != *,* ]] \
-      && (( aff_count == 0 )) && (( ! has_malware )) && [[ "$blocklist_pass" == "1" ]] \
-      && [[ "$ack_lane_open" == "1" ]]; then
-      local guarddog_ack_cmd=""
-      guarddog_ack_cmd=$(gate_host_allow_add_cmd "$name" "${guarddog_finding_versions:-$primary_version}" "$ecosystem" "--acknowledge-behavioral") || guarddog_ack_cmd=""
-      [[ -n "$guarddog_ack_cmd" ]] \
-        && printf 'safe audit: if operator review concludes FALSE POSITIVE: %s (TTY; engages only with clean OSV and a clean Socket second opinion)\n' \
-          "$guarddog_ack_cmd" >&2
-    fi
-  elif (( has_guarddog_findings )); then
-    printf 'safe audit: guarddog behavioral findings (%s) — operator review required\n' \
-      "${guarddog_rules:-unknown rules}" >&2
-    if [[ "$resolution_ok" == "1" ]]; then
-      if [[ "$guarddog_finding_versions" == *,* ]]; then
-        printf 'safe audit: guarddog findings affect multiple resolved versions (%s) — one host-allow pin cannot authorize the aggregate operation\n' \
-          "$guarddog_finding_versions" >&2
-      else
-        local guarddog_allow_cmd=""
-        guarddog_allow_cmd=$(gate_host_allow_add_cmd "$name" "${guarddog_finding_versions:-$primary_version}" "$ecosystem") || guarddog_allow_cmd=""
-        [[ -n "$guarddog_allow_cmd" ]] \
-          && printf 'safe audit: to allow this exact version: %s\n' "$guarddog_allow_cmd" >&2
-      fi
-    fi
-    printf 'safe audit: alternate operator policy: add guarddog_findings to install.auto_allow_tolerate, then retry this exact version\n' >&2
-  fi
-  if (( has_guarddog_error )); then
-    printf 'safe audit: guarddog unavailable (%s) — infrastructure failure, NOT a package finding\n' \
-      "${guarddog_detail:-unknown cause}" >&2
-    printf 'safe audit: fix now: safe doctor (guarddog wiring/version), then retry; escalate to the operator if it persists\n' >&2
+  if (( has_low_score || has_socket_high || has_socket_critical_cve )); then
+    printf 'safe audit: Socket reports behavioral risk — operator review required (not auto-allowable)\n' >&2
   fi
 }
 
@@ -10298,7 +9460,7 @@ binary_exec_command() {
 # Bun-shaped advisory array leaves on stdout. The host SIGKILLs the scanner
 # at 30s, so audit depth is deliberately shallow — local blocklist plus
 # version-scoped OSV querybatch (with per-advisory severity fetch); the
-# GuardDog/Socket tiers stay in the per-spec gate lane. Every infrastructure
+# Socket stays in the per-spec gate lane. Every infrastructure
 # failure exits nonzero WITHOUT emitting advisories: the host's fail-closed
 # contract blocks the install, and the stderr cause reads as
 # breakage-to-fix, never as a package finding.

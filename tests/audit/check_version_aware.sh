@@ -297,6 +297,7 @@ run_check() {
       SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" \
       SAFE_AUDIT_CONFIG_DIR="$CASE_DIR/audit-config" \
       SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
+      SAFE_AUDIT_SOCKET_CACHE_DIR="$CASE_DIR/socket-cache" \
       "${envs[@]}" \
       "$SAFE_AUDIT" check "$@"
   ) > "$OUT_FILE" 2> "$ERR_FILE"

@@ -41,7 +41,7 @@ and the two drifted.
 
 ```bash
 safe run [flags] <package>[@<version>] [-- args...]
-safe run host-allow add <pkg>@<ver> [--acknowledge-behavioral] [--reason "..."]
+safe run host-allow add <pkg>@<ver> [--reason "..."]
 safe run host-allow update <pkg>@<new> [--reason "..."]
 safe run host-allow remove <pkg>
 safe run host-allow list

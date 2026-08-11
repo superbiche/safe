@@ -250,13 +250,9 @@ default_config_json() {
     "block_severities": ["critical"],
     "cooldown_days": 3,
     "cooldown_security_fix": "exempt",
-    "guarddog": {
-      "enabled": true,
-      "timeout_seconds": 120,
-      "sandbox": "auto"
-    },
     "socket": {
-      "mode": "auto"
+      "mode": "auto",
+      "cache_ttl_days": 7
     }
   }
 }
@@ -1386,65 +1382,19 @@ host_allow_preflight_audit() {
 }
 
 write_host_allow_entry() {
-  local pkg="$1" version="$2" sha="$3" reason="$4" ecosystem="$5" ack_json="${6:-}"
+  local pkg="$1" version="$2" sha="$3" reason="$4" ecosystem="$5"
   local tmp
   tmp=$(mktemp)
-  # behavioral_ack records the exact GuardDog rule set the operator reviewed
-  # (from a check receipt) — the audit engages it only when the live rule
-  # set is a subset. Deliberately dropped by `host-allow update`: an
-  # acknowledgement never carries to a version the operator did not review.
   jq --arg p "$pkg" --arg v "$version" --arg s "$sha" \
-     --arg r "$reason" --arg d "$(date -I)" --arg e "$ecosystem" \
-     --argjson ack "${ack_json:-null}" '
-    .packages[$p] = ({
+     --arg r "$reason" --arg d "$(date -I)" --arg e "$ecosystem" '
+    .packages[$p] = {
       version: $v,
       sha: $s,
       ecosystem: $e,
       added: $d,
       reason: $r
-    } + (if $ack == null then {} else
-      {behavioral_ack: {rules: $ack.rules, receipt: $ack.receipt, added: $d}}
-    end))' "$HOST_ALLOW_FILE" > "$tmp"
+    }' "$HOST_ALLOW_FILE" > "$tmp"
   mv "$tmp" "$HOST_ALLOW_FILE"
-}
-
-# Newest check receipt for exactly this (name, version, ecosystem family)
-# that carries GuardDog behavioral rules. Prints {receipt, rules}. The
-# acknowledgement must record what the operator actually reviewed, so the
-# receipt — not operator memory — is the source of the rule set.
-latest_behavioral_receipt_json() {
-  local name="$1" version="$2" ecosystem="$3"
-  local checks_dir="$SAFE_AUDIT_DATA_DIR/checks" f canon
-  [[ -d "$checks_dir" ]] || return 1
-  case "$ecosystem" in
-    py|python|uv|pipx|pypi) canon="python" ;;
-    npm|bun) canon="npm" ;;
-    *) canon="$ecosystem" ;;
-  esac
-  # Newest-first without command-substitution word splitting: the configured
-  # data dir may contain whitespace even though receipt basenames are
-  # slugified (PR#67 F6). Receipt paths cannot contain newlines.
-  while IFS= read -r f; do
-    f="${f#* }"
-    # The acknowledged rules are the PER-VERSION set for exactly the pinned
-    # version — the receipt-level .rules is a union across every scanned
-    # version, and a sibling version's rules must never be recorded as
-    # reviewed for this one (PR#67 F3). Aggregate-only receipts are
-    # rejected, not approximated.
-    jq -e --arg n "$name" --arg v "$version" --arg e "$canon" '
-      ((.ecosystem // "") |
-        if . == "py" or . == "python" or . == "uv" or . == "pipx" or . == "pypi" then "python"
-        elif . == "npm" or . == "bun" then "npm" else . end) == $e
-      and ((.spec // "") | (. == $n or startswith($n + "@")))
-      and (((.guarddog.versions // []) | map(select((.version == $v)
-            and (((.rules // []) | length) > 0)))) | length) == 1
-    ' "$f" >/dev/null 2>&1 || continue
-    jq -c --arg receipt "$f" --arg v "$version" \
-      '{receipt: $receipt,
-        rules: ((.guarddog.versions[] | select(.version == $v) | .rules) // [])}' "$f"
-    return 0
-  done < <(find "$checks_dir" -maxdepth 1 -name '*.json' -printf '%T@ %p\n' 2>/dev/null | sort -rn)
-  return 1
 }
 
 cmd_host_allow() {
@@ -1474,38 +1424,24 @@ require_operator_tty() {
 cmd_host_allow_add() {
   local spec="${1:-}"
   shift || true
-  [[ -z "$spec" ]] && die "usage: safe run host-allow add <pkg>@<version> [--acknowledge-behavioral] [--reason \"...\"]"
+  [[ -z "$spec" ]] && die "usage: safe run host-allow add <pkg>@<version> [--reason \"...\"]"
   require_operator_tty add "$spec"
-  local reason="" ecosystem="npm" ack_behavioral=0
+  local reason="" ecosystem="npm"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --reason) reason="$2"; shift 2 ;;
       --reason=*) reason="${1#--reason=}"; shift ;;
       --ecosystem) ecosystem="$2"; shift 2 ;;
       --ecosystem=*) ecosystem="${1#--ecosystem=}"; shift ;;
-      --acknowledge-behavioral) ack_behavioral=1; shift ;;
       *) die "unknown flag: $1" ;;
     esac
   done
   parse_package "$spec"
   [[ "$PKG_VERSION" == "latest" ]] && die "host-allow requires an explicit version, not 'latest'"
-  if (( ack_behavioral )) && [[ -z "$reason" ]]; then
-    die "--acknowledge-behavioral requires --reason: record why the findings are false positives"
-  fi
   local package_kind
   package_kind=$(ecosystem_to_runner_kind "$ecosystem") || die "unknown --ecosystem: $ecosystem"
   PKG_NAME=$(normalize_and_validate_package_or_die "$PKG_NAME" "$package_kind" "$spec")
   host_allow_preflight_audit "$PKG_NAME" "$PKG_VERSION" "$ecosystem" "$reason" "Add to"
-
-  local ack_json=""
-  if (( ack_behavioral )); then
-    # The acknowledged rule set comes from a check receipt, never from
-    # operator memory: the audit later engages the ack only while the live
-    # rule set stays a subset of what was reviewed here.
-    if ! ack_json=$(latest_behavioral_receipt_json "$PKG_NAME" "$PKG_VERSION" "$ecosystem"); then
-      die "no check receipt with GuardDog behavioral findings for ${PKG_NAME}@${PKG_VERSION} — run: safe audit check ${PKG_NAME}@${PKG_VERSION} --ecosystem ${ecosystem} first (the acknowledgement records exactly the rule set you reviewed)"
-    fi
-  fi
 
   local sha=""
   case "$ecosystem" in
@@ -1515,12 +1451,8 @@ cmd_host_allow_add() {
   esac
   [[ -z "$sha" ]] && warn "could not fetch integrity for ${PKG_NAME}@${PKG_VERSION} (added without SHA)"
 
-  write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem" "$ack_json"
-  if (( ack_behavioral )); then
-    info "added ${PKG_NAME}@${PKG_VERSION} to host-allow with a behavioral acknowledgement ($(jq -r '.rules | length' <<<"$ack_json") rules from $(jq -r '.receipt' <<<"$ack_json"))"
-  else
-    info "added ${PKG_NAME}@${PKG_VERSION} to host-allow"
-  fi
+  write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem"
+  info "added ${PKG_NAME}@${PKG_VERSION} to host-allow"
 }
 
 cmd_host_allow_remove() {
@@ -2595,7 +2527,7 @@ RUNNER-NATIVE FLAGS (when invoked as npx/bunx/uvx)
                         mistaken for the package name
 
 SUBCOMMANDS
-  host-allow add <pkg>@<ver> [--acknowledge-behavioral] [--reason "..."] Add package to host execution allowlist (the ack flag records reviewed GuardDog findings as false positives for that exact version)
+  host-allow add <pkg>@<ver> [--reason "..."] Add package to host execution allowlist
   host-allow update <pkg>@<new> [--reason "..."]
                                               Update pinned version (prompts)
   host-allow remove <pkg>                     Remove from allowlist

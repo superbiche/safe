@@ -29,9 +29,6 @@ SAFE_GATE_SOCKET_FRESH_SCAN_BUDGET_DEFAULT=90
 #   attempt plus the vault-injected retry after a late auth failure (delta N1).
 #   A young release whose first bounded score times out can then make ONE
 #   extended fresh-scan call with the same two-attempt shape.
-# - resolve_target_versions caps RESOLVED_VERSIONS at 4; GuardDog runs a
-#   --version probe plus one scan per resolved version, each with the full
-#   configured budget.
 # - osv_query_package_json is bounded at 10 pages x curl --max-time 8 = 80s
 #   per invocation; it runs once per resolved version plus once more for the
 #   cooldown security-fix exemption.
@@ -284,7 +281,7 @@ safe_gate_socket_fresh_scan_budget() {
 
 # The leash on the audit child must EXCEED the worst-case sum of the audit's
 # own component budgets: every network probe inside `safe-audit check` is
-# individually bounded (Socket score, GuardDog wall-clock, curl --max-time),
+# individually bounded (Socket score and curl --max-time),
 # so a leash smaller than their sequential worst case guarantees the kill
 # lands here first and converts a legible per-component infra WARN into an
 # illegible TIMEOUT_FAILCLOSED — which host-allow cannot rescue, and which
@@ -294,7 +291,7 @@ safe_gate_socket_fresh_scan_budget() {
 # timeout instead of completing with "socket unavailable — infra WARN".
 # The leash is therefore a BACKSTOP against unbounded regressions, not the
 # operative timeout; the component budgets are. With defaults it computes to
-# 15*2 + 90*2 + 120*(1+4) + 80*(4+1) + 120 = 1330s — deliberately generous:
+# 15*2 + 90*2 + 80*(4+1) + 120 = 730s — deliberately generous:
 # it only
 # fires when a component escapes its own bound, which previously meant an
 # indefinite hang. The one fresh-release score retry is sequential with the
@@ -308,15 +305,11 @@ safe_gate_audit_leash_seconds() {
     printf '%s\n' "${SAFE_INSTALL_TIMEOUT_SECONDS}"
     return 0
   fi
-  local guarddog_budget socket_budget="${1:-}" fresh_socket_budget="${2:-}"
-  guarddog_budget="$(jq -r '.install.guarddog.timeout_seconds // 120' \
-    "$(safe_gate_run_config_dir)/config.json" 2>/dev/null || true)"
-  safe_gate_timeout_value_ok "${guarddog_budget}" || guarddog_budget=120
+  local socket_budget="${1:-}" fresh_socket_budget="${2:-}"
   safe_gate_timeout_value_ok "${socket_budget}" || socket_budget="$(safe_gate_socket_budget)"
   safe_gate_timeout_value_ok "${fresh_socket_budget}" || fresh_socket_budget="$(safe_gate_socket_fresh_scan_budget)"
   printf '%s\n' "$(( socket_budget * SAFE_GATE_SOCKET_ATTEMPTS \
     + fresh_socket_budget * SAFE_GATE_SOCKET_ATTEMPTS \
-    + guarddog_budget * (1 + SAFE_GATE_MAX_RESOLVED_VERSIONS) \
     + SAFE_GATE_OSV_QUERY_BUDGET * (SAFE_GATE_MAX_RESOLVED_VERSIONS + 1) \
     + SAFE_GATE_AUDIT_OVERHEAD_SECONDS ))"
 }
@@ -1009,29 +1002,6 @@ safe_gate_split_spec() {
   fi
 
   printf '%s\t%s\n' "${name}" "${version}"
-}
-
-# Offline fallback: when the audit itself timed out, an exact-version request
-# matching a fresh install-known entry (a previously recorded clean check) may
-# proceed on that stale evidence. Unpinned requests never qualify.
-# Disclose weaker-isolation provenance at REUSE time (review F9).
-safe_gate_known_provenance() {
-  local package="$1" ecosystem="$2" known_file name version
-  case "${ecosystem}" in
-    cargo) ecosystem="rust" ;;
-    composer) ecosystem="php" ;;
-    pip|uv) ecosystem="python" ;;
-  esac
-  command -v jq >/dev/null 2>&1 || return 0
-  known_file="$(safe_gate_run_config_dir)/install-known.json"
-  [[ -r "${known_file}" ]] || return 0
-  IFS=$'\t' read -r name version <<< "$(safe_gate_split_spec "${package}")"
-  [[ -n "${name}" ]] || return 0
-  if jq -e --arg k "${ecosystem}:${name}" \
-    '(.packages[$k].reasons // []) | index("guarddog_clean_for_versions_nosandbox") != null' \
-    "${known_file}" >/dev/null 2>&1; then
-    printf '%s' " — behavioral evidence was gathered WITHOUT the kernel sandbox"
-  fi
 }
 
 safe_gate_known_matches() {
@@ -2054,7 +2024,7 @@ safe_gate_check() {
       ;;
     124|137)
       if safe_gate_known_matches "${package}" "${ecosystem}"; then
-        safe_gate_err "safe install: safe audit timed out; proceeding on recorded clean check for ${package} (stale evidence)$(safe_gate_known_provenance "${package}" "${ecosystem}")"
+        safe_gate_err "safe install: safe audit timed out; proceeding on recorded clean check for ${package} (stale evidence)"
         safe_gate_audit_log "${ecosystem}" "${package}" "STALE_EVIDENCE"
         return 0
       fi

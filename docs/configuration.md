@@ -42,15 +42,8 @@ SAFE_CONFIG_DIR=/tmp/safe-config SAFE_DATA_DIR=/tmp/safe-data safe status
 ## Run Config
 
 `host-allow.json` stores pinned package versions allowed to execute on the host.
-An entry may carry an operator-recorded `behavioral_ack` (written by
-`host-allow add --acknowledge-behavioral`, TTY-gated): the exact GuardDog
-rule set reviewed as false positives for that exact version, sourced from a
-check receipt. The audit downgrades a GuardDog high-risk BLOCK to a
-host-allowable WARN only while the live rule set stays a subset of the
-acknowledged one, OSV shows nothing affecting the version, and a forced
-Socket second opinion reports nothing high/critical — blocklist, MAL-*
-records and OSV-critical remain unoverridable. `host-allow update` drops the
-ack: it never carries to a version the operator did not review.
+Existing entries with retired metadata are ignored; newly written entries use
+only the current pinned-version schema.
 
 `blocked.json` stores package names or patterns that should never run.
 
@@ -76,13 +69,9 @@ unchanged.
     "block_severities": ["critical"],
     "cooldown_days": 3,
     "cooldown_security_fix": "exempt",
-    "guarddog": {
-      "enabled": true,
-      "timeout_seconds": 120,
-      "sandbox": "auto"
-    },
     "socket": {
-      "mode": "auto"
+      "mode": "auto",
+      "cache_ttl_days": 7
     }
   }
 }
@@ -122,37 +111,17 @@ unchanged.
   remediate and that this setting caused the refusal. The exemption only
   applies to advisories fixed AT a resolved version — it never waives the
   cooldown for an ordinary feature release.
-- `socket.mode`: when to consult Socket. `auto` (default) is tier 3 —
-  Socket runs only when the GuardDog behavioral tier produced no complete
-  verdict (not installed, disabled, unsupported ecosystem, unresolved
-  version, error/partial), so a Socket outage degrades only those rare
-  consultations. `always` restores the pre-1.8 always-on behavior;
-  `never` disables Socket entirely. A deliberate skip is recorded honestly
-  in receipts and install-known reasons (`socket_skipped_tier3`, never
-  `socket_ok`).
-- `guarddog.enabled`: run GuardDog for exact resolved npm/PyPI versions.
-  Default: `true`. A missing binary is reported as a non-adverse skip while
-  Socket remains enabled in the current tiered-scoring slice.
-- `guarddog.sandbox`: `auto` (default), `required`, or `off`. GuardDog
-  extracts archives inside a kernel sandbox and refuses to scan when that
-  sandbox is unavailable — on hosts where its sandboxed child cannot start,
-  that means ZERO behavioral coverage rather than weaker coverage. `auto`
-  retries once with `--no-sandbox`, discloses the weaker isolation on every
-  surface (human output, receipt, `sandbox.fell_back`), and binds the result
-  to a separate cache profile (`safe-nosandbox-v1`) so it can never replay
-  as a sandboxed result. `required` keeps the hard failure (the tier then
-  reports infrastructure breakage and Socket is consulted instead); `off`
-  never sandboxes.
-- `guarddog.timeout_seconds`: wall-clock limit for each GuardDog scan and its
-  version probe. Default: `120`. Successful complete results are cached
-  permanently under `~/.cache/safe/guarddog/`, keyed by the exact public
-  registry artifact integrity, GuardDog version, and safe-owned scanner
-  profile. Safe currently accepts GuardDog 3.1.0 and removes ambient
-  `GUARDDOG_*` configuration before invoking it, so a caller cannot weaken a
-  scan and seed reusable evidence. Override the cache root with
-  `SAFE_AUDIT_GUARDDOG_CACHE_DIR` (primarily for tests). Because replay is
-  permanent, GuardDog metadata-source updates alone do not invalidate an
-  existing artifact/scanner/profile entry.
+- `socket.mode`: Socket is the primary behavioral tier. `auto` (default) and
+  `always` both consult it for every check; `never` is the sole intentional
+  skip and is recorded as `socket_disabled` without pretending the service
+  failed.
+- `socket.cache_ttl_days`: cache a validated successful Socket envelope for
+  the exact ecosystem, package name, and resolved version. Default: `7`; `0`
+  disables caching. Entries live under `~/.cache/safe/socket/`, are private
+  (`0700` directory, `0600` files), and are atomically replaced. On expiry,
+  safe queries Socket again; if that query fails, the WARN line may disclose
+  the last complete score and its age, but stale data never supplies a verdict.
+  Override the cache root with `SAFE_AUDIT_SOCKET_CACHE_DIR` for tests.
 
 Common sandbox settings include:
 

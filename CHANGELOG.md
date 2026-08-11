@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- GuardDog has been removed from the install gate. Socket is now the primary
+  behavioral tier for every check unless `install.socket.mode=never` is set.
+  A critical `supplyChainRisk` alert BLOCKs; critical vulnerability, high
+  alerts, and scores below 70 WARN. The retired behavioral-ack override lane
+  and its configuration have been removed. Validated successful Socket results
+  now cache for seven days by exact resolved package identity; expired entries
+  are context only and never decide a verdict.
+
 - npm gate routing covers install, update, ci, exec, and lock-diff aliases and
   abbreviations before delegation. It uses a checked-in full command/alias
   snapshot with exact alias priority, so non-fetch aliases such as `c` and
@@ -21,10 +29,9 @@
 
 - Fresh releases whose initial Socket score times out now receive one bounded
   patience retry (`install.socket.fresh_scan_budget_seconds`, default 90s).
-  If Socket still has no score, receipts record `PENDING`; a clean GuardDog,
-  OSV, and blocklist verdict may proceed with that disclosed note, while any
-  incomplete or adverse companion evidence remains WARN/BLOCK. A pending
-  score never satisfies the behavioral-ack second opinion.
+  If Socket still has no score, receipts record `PENDING`; a clean OSV and
+  blocklist verdict may proceed with that disclosed note, while any incomplete
+  or adverse companion evidence remains WARN/BLOCK.
 - Socket low-score detection now reads the current Socket CLI score envelope
   (`data.self.score.overall`), so an overall score below 70 again produces the
   existing `socket_low_score` WARN.
