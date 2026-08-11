@@ -34,5 +34,17 @@ for token in u up; do
   fi
 done
 
+# `global` is a proxy command and Symfony accepts every unique prefix. Asking
+# for its own help proves dispatch without entering the global project or
+# touching a registry.
+for token in g globa; do
+  if "$real_composer" "$token" --help > "$WORK/global-$token" 2>&1 \
+    && grep -Fq 'Allows running commands in the global composer dir' "$WORK/global-$token"; then
+    pass "composer $token --help resolves to global"
+  else
+    fail "composer $token --help did not resolve to global"
+  fi
+done
+
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

@@ -7,8 +7,10 @@
   npm uses a checked-in full command/alias snapshot with exact alias priority,
   so non-fetch aliases such as `c` and `un` stay passthrough while abbreviated
   fetch routes (including alias prefixes such as `ad` and `dd`) are audited.
-  npm's camel-case command normalization and Composer's `global` install/update
-  routes (including post-`global` options) receive the same audit coverage.
+  npm's camel-case command normalization and Composer's abbreviated `global`
+  proxy routes receive the same audit coverage. Gated Composer-global lanes
+  scan both the resolved global home and the first effective `--working-dir`
+  project, wherever that option appears before `--`.
   Original tokens are preserved on delegated paths; safe may conservatively
   refuse a gated-looking ambiguity before npm or Composer reports its own
   ambiguity error.

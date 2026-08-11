@@ -163,7 +163,7 @@ fi
   done
   # Global-Composer routing must scan the global project rather than the
   # caller's cwd. Only the focused regression sets this fixture assertion.
-  if [[ -n "${SAFE_AUDIT_EXPECT_PROJECT:-}" ]]; then
+  if [[ -n "${SAFE_AUDIT_EXPECT_PROJECT:-}" || -n "${SAFE_AUDIT_EXPECT_PROJECTS:-}" ]]; then
     printf 'AUDITPROJECT\t%s\n' "$PWD"
   fi
 } >> "${SAFE_INSTALL_COMMAND_LOG}"
@@ -191,14 +191,22 @@ if [[ "${1:-}" == "scan" ]]; then
     [[ -n "${stub_tool_status}" ]] || stub_tool_status='{"osv-scanner":{"status":"ok","note":null}}'
     stub_eco_audits="${SAFE_AUDIT_SCAN_ECOSYSTEM_AUDITS:-}"
     [[ -n "${stub_eco_audits}" ]] || stub_eco_audits='[]'
+    scan_critical="${SAFE_AUDIT_SCAN_CRITICAL:-0}"
+    if [[ -n "${SAFE_AUDIT_SCAN_CRITICAL_PROJECT:-}" ]]; then
+      if [[ "$PWD" == "${SAFE_AUDIT_SCAN_CRITICAL_PROJECT}" ]]; then
+        scan_critical=1
+      else
+        scan_critical=0
+      fi
+    fi
     cat > "${result_out}" <<JSON
 {
   "verdict": "${SAFE_AUDIT_SCAN_VERDICT:-GO}",
   "summary": {"packages_total": 3},
-  "cve_scan": {"critical": ${SAFE_AUDIT_SCAN_CRITICAL:-0}, "high": 0, "medium": 0, "low": 0, "findings": []},
+  "cve_scan": {"critical": ${scan_critical}, "high": 0, "medium": 0, "low": 0, "findings": []},
   "audit_totals": {
-    "critical": ${SAFE_AUDIT_SCAN_CRITICAL:-0}, "high": 0, "medium": 0, "low": 0, "unknown": 0,
-    "cve_scan": {"critical": ${SAFE_AUDIT_SCAN_CRITICAL:-0}, "high": 0, "medium": 0, "low": 0},
+    "critical": ${scan_critical}, "high": 0, "medium": 0, "low": 0, "unknown": 0,
+    "cve_scan": {"critical": ${scan_critical}, "high": 0, "medium": 0, "low": 0},
     "ecosystem": [], "deduplicated": false
   },
   "tool_status": ${stub_tool_status},
@@ -484,7 +492,10 @@ run_zsh() {
     SAFE_INSTALL_TIMEOUT_SECONDS="${SAFE_INSTALL_TIMEOUT_SECONDS:-}" \
     SAFE_INSTALL_REAL_STATUS="${SAFE_INSTALL_REAL_STATUS:-}" \
     COMPOSER_HOME="${COMPOSER_HOME:-}" \
+    SAFE_INSTALL_COMPOSER_HOME_UNSET="${SAFE_INSTALL_COMPOSER_HOME_UNSET:-}" \
     SAFE_AUDIT_EXPECT_PROJECT="${SAFE_AUDIT_EXPECT_PROJECT:-}" \
+    SAFE_AUDIT_EXPECT_PROJECTS="${SAFE_AUDIT_EXPECT_PROJECTS:-}" \
+    SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${SAFE_AUDIT_SCAN_CRITICAL_PROJECT:-}" \
     NPM_LOCK_MUTATION_JSON="${NPM_LOCK_MUTATION_JSON:-}" \
     NPM_CONFIG_PACKAGE_LOCK="${NPM_CONFIG_PACKAGE_LOCK:-}" \
     npm_config_package_lock="${npm_config_package_lock:-}" \
@@ -494,7 +505,7 @@ run_zsh() {
     NPM_LOCKDIFF_REGISTRY_CONFIG_JSON="${NPM_LOCKDIFF_REGISTRY_CONFIG_JSON:-}" \
     NPM_LOCKDIFF_CONFIG_STATUS="${NPM_LOCKDIFF_CONFIG_STATUS:-}" \
     MISE_LS_JSON="${MISE_LS_JSON:-}" \
-    "${ZSH_BIN}" -fc 'eval "${SAFE_INSTALL_TEST_SCRIPT}"'
+    "${ZSH_BIN}" -fc '[[ "${SAFE_INSTALL_COMPOSER_HOME_UNSET:-0}" == 1 ]] && unset COMPOSER_HOME; eval "${SAFE_INSTALL_TEST_SCRIPT}"'
   ) >"${OUT_FILE}" 2>"${ERR_FILE}"
   STATUS=$?
 }
@@ -538,6 +549,14 @@ assert_project_scan_logged() {
     return 1
   fi
   return 0
+}
+
+assert_scan_targets_logged() {
+  local label="$1" target
+  shift
+  for target in "$@"; do
+    assert_log_contains $'AUDITPROJECT\t'"${target}" "${label}" || return
+  done
 }
 
 assert_log_not_contains_fragment() {
@@ -1517,6 +1536,147 @@ case_composer_abbreviation_classifier_routes() {
     assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
     assert_log_contains $'REAL\tcomposer\t'"${token}"$'\tvendor/blockme' "$FUNCNAME" || return
   done
+
+  pass "$FUNCNAME"
+}
+
+case_composer_global_unified_routing() {
+  prepare_case "composer-global-unified-routing"
+  local global_home="${HOME_DIR}/global-home"
+  local default_home="${HOME_DIR}/.composer"
+  local ordinary_home="${HOME_DIR}/ordinary-home"
+  local before_project="${CASE_DIR}/before-project"
+  local between_project="${CASE_DIR}/between-project"
+  local after_project="${CASE_DIR}/after-project"
+  local first_project="${CASE_DIR}/first-project"
+  local second_project="${CASE_DIR}/second-project"
+  local equals_project="${CASE_DIR}/equals-project"
+  local ignored_project="${CASE_DIR}/ignored-project"
+  local target
+  for target in "${global_home}" "${default_home}" "${ordinary_home}" \
+    "${before_project}" "${between_project}" "${after_project}" \
+    "${first_project}" "${second_project}" "${equals_project}" "${ignored_project}"; do
+    mkdir -p "${target}"
+    touch "${target}/composer.json"
+  done
+
+  # Symfony resolves every accepted `global` prefix to the proxy. `g u` must
+  # scan its global project before the nested update can delegate; `globa requ`
+  # must retain the global require package check.
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${global_home}" \
+    SAFE_INSTALL_TEST_SCRIPT='composer g u' run_zsh
+  assert_status 102 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" || return
+  assert_log_not_contains_fragment $'REAL\tcomposer\tg\tu' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT='composer globa requ vendor/blockme:^1' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" || return
+  assert_log_contains $'AUDIT\tcheck\tvendor/blockme@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tcomposer\tgloba\trequ' "$FUNCNAME" || return
+
+  # Factory uses PHP truthiness: unset, empty, and literal "0" all select the
+  # platform home, while an ordinary value selects its own home.
+  : > "${LOG_FILE}"
+  COMPOSER_HOME='0' SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${default_home}" \
+    SAFE_INSTALL_TEST_SCRIPT='composer global u' run_zsh
+  assert_status 102 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${default_home}" || return
+  assert_log_not_contains_fragment $'REAL\tcomposer\tglobal\tu' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME='' SAFE_INSTALL_COMPOSER_HOME_UNSET=1 SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT='composer global u' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${default_home}" || return
+  assert_log_contains $'REAL\tcomposer\tglobal\tu' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME='' SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT='composer global u' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${default_home}" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${ordinary_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT='composer global u' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${ordinary_home}" || return
+
+  # The first --working-dir applies before global and again to the nested
+  # command. Every placement adds BOTH selected projects; the canaries prove
+  # a critical finding in either project blocks the original delegate.
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT="composer --working-dir ${before_project} global u" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" "${before_project}" || return
+  assert_log_contains $'REAL\tcomposer\t--working-dir\t'"${before_project}"$'\tglobal\tu' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${before_project}" \
+    SAFE_INSTALL_TEST_SCRIPT="composer --working-dir ${before_project} global u" run_zsh
+  assert_status 102 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${before_project}" || return
+  assert_log_not_contains_fragment $'REAL\tcomposer\t--working-dir' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${between_project}" \
+    SAFE_INSTALL_TEST_SCRIPT="composer global --working-dir ${between_project} u" run_zsh
+  assert_status 102 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" "${between_project}" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT="composer global u --working-dir ${after_project}" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" "${after_project}" || return
+  assert_log_contains $'REAL\tcomposer\tglobal\tu\t--working-dir\t'"${after_project}" "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${global_home}" \
+    SAFE_INSTALL_TEST_SCRIPT="composer global u --working-dir ${after_project}" run_zsh
+  assert_status 102 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" || return
+
+  # Symfony takes the first matching option. An equals form is equivalent,
+  # while a working-dir after -- is an argument and must not join the scan set.
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT="composer --working-dir ${first_project} global u --working-dir ${second_project}" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" "${first_project}" || return
+  assert_log_not_contains_fragment $'AUDITPROJECT\t'"${second_project}" "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT="composer global --working-dir=${equals_project} u" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" "${equals_project}" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT="composer global u -- --working-dir ${ignored_project}" run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" || return
+  assert_log_not_contains_fragment $'AUDITPROJECT\t'"${ignored_project}" "$FUNCNAME" || return
+
+  # An unrecognized bare option before the nested command can hide it, so the
+  # recognized global lane fails closed with one policy line instead of
+  # delegation.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer g --not-a-real-global-option u' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+  assert_log_not_contains_fragment $'REAL\tcomposer\tg\t--not-a-real-global-option' "$FUNCNAME" || return
 
   pass "$FUNCNAME"
 }
@@ -4831,6 +4991,7 @@ main() {
     case_npm_camelcase_dispatch_and_conservative_ambiguity \
     case_non_npm_abbreviations_stay_passthrough \
     case_composer_abbreviation_classifier_routes \
+    case_composer_global_unified_routing \
     case_npm_dedupe_lockdiff_empty_delegates_without_scan \
     case_npm_lockdiff_absent_node_modules_refuses \
     case_npm_lockdiff_projection_sees_project_npmrc \

@@ -647,105 +647,227 @@ safe_gate_composer_subcommand_class() {
   fi
 }
 
-# Composer's `global` proxy accepts the application options below before the
-# nested command. This is the complete value/boolean split shown by
-# `composer global --help`; a missing entry over-refuses rather than letting an
-# option value hide a fetching nested command.
-safe_gate_composer_global_subcommand() {
-  local -a args=("$@")
-  local val_alt='-d|--working-dir'
-  local bool_alt='-h|--help|-q|--quiet|-V|--version|--ansi|--no-ansi|-n|--no-interaction|--profile|--no-plugins|--no-scripts|--no-cache|-v|-vv|-vvv|--verbose'
-  local arg next i
-  SAFE_GATE_COMPOSER_GLOBAL_SUBCMD=""
-  SAFE_GATE_COMPOSER_GLOBAL_SUBCMD_IDX=-1
-  SAFE_GATE_COMPOSER_GLOBAL_BADFLAG=""
-
-  for (( i=0; i<${#args[@]}; i++ )); do
-    arg="${args[$i]}"
-    case "${arg}" in
-      --)
-        if (( i + 1 < ${#args[@]} )); then
-          SAFE_GATE_COMPOSER_GLOBAL_SUBCMD="${args[$((i + 1))]}"
-          SAFE_GATE_COMPOSER_GLOBAL_SUBCMD_IDX=$((i + 1))
-        fi
-        return 0
-        ;;
-      --*=*|-*=*) continue ;;
-      -?*)
-        if safe_gate_alt_match "${arg}" "${val_alt}"; then
-          if (( i + 1 >= ${#args[@]} )); then
-            SAFE_GATE_COMPOSER_GLOBAL_BADFLAG="${arg}"
-            return 2
-          fi
-          i=$((i + 1))
-        elif safe_gate_alt_match "${arg}" "${bool_alt}"; then
-          next="${args[$((i + 1))]:-}"
-          case "${next,,}" in
-            true|false) i=$((i + 1)) ;;
-          esac
-        else
-          SAFE_GATE_COMPOSER_GLOBAL_BADFLAG="${arg}"
-          return 2
-        fi
-        ;;
-      *)
-        SAFE_GATE_COMPOSER_GLOBAL_SUBCMD="${arg}"
-        SAFE_GATE_COMPOSER_GLOBAL_SUBCMD_IDX=${i}
-        return 0
-        ;;
-    esac
-  done
-  return 0
+# Composer's proxy is abbreviated by Symfony exactly as g, gl, glo, glob, and
+# globa. Keep recognition beside the option walk: the proxy, nested command,
+# package boundary, first working directory, and project scan set are one
+# result rather than independently re-parsed routing facts.
+safe_gate_composer_is_global_proxy() {
+  case "$1" in
+    g|gl|glo|glob|globa|global) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
-# Mirrors Composer Factory::getHomeDir without executing a second Composer
-# process. The installed Composer source gives COMPOSER_HOME priority, then
-# APPDATA/Composer on Windows, then the Unix default ~/.composer. Querying
-# `composer config --global home` is unsuitable here: it creates config/auth
-# and cache files before the audit has run.
+# Composer/Symfony application switches from `composer global --help`. The
+# working-dir value option is handled separately because Symfony's
+# getParameterOption() selects its FIRST occurrence across the whole argv.
+safe_gate_composer_application_boolean() {
+  case "$1" in
+    -h|--help|-q|--quiet|-V|--version|--ansi|--no-ansi|-n|--no-interaction|--profile|--no-plugins|--no-scripts|--no-cache|-v|-vv|-vvv|--verbose)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# PHP treats only a non-empty string other than "0" as truthy. Composer's
+# Factory::getHomeDir uses that rule for COMPOSER_HOME, APPDATA, and HOME.
+safe_gate_composer_php_truthy() {
+  [[ -n "$1" && "$1" != "0" ]]
+}
+
+# Mirrors the installed Composer Factory::getHomeDir without running a second
+# Composer process (a config query writes config/auth and cache files before
+# the audit). The installed source has its XDG branch disabled, so its order is
+# truthy COMPOSER_HOME, Windows APPDATA/Composer, then HOME/.composer.
 safe_gate_composer_global_home() {
   local home="${COMPOSER_HOME:-}"
-  if [[ -n "${home}" ]]; then
+  if safe_gate_composer_php_truthy "${home}"; then
     printf '%s' "${home}"
     return 0
   fi
 
   if [[ "${OS:-}" == "Windows_NT" || "${OSTYPE:-}" == msys* || \
         "${OSTYPE:-}" == cygwin* ]]; then
-    [[ -n "${APPDATA:-}" ]] || return 1
-    home="${APPDATA//\\//}"
+    home="${APPDATA:-}"
+    safe_gate_composer_php_truthy "${home}" || return 1
+    home="${home//\\//}"
     printf '%s/Composer' "${home%/}"
     return 0
   fi
 
-  [[ -n "${HOME:-}" ]] || return 1
-  printf '%s/.composer' "${HOME%/}"
+  home="${HOME:-}"
+  safe_gate_composer_php_truthy "${home}" || return 1
+  printf '%s/.composer' "${home%/}"
 }
 
-# A global install/update operates from Composer's global project, not from
-# the caller's cwd. Match the top-level Composer lane: only scan when that
-# project has composer metadata; an absent project cannot supply dependencies
-# for Composer to install or update.
-safe_gate_scan_composer_global_project() {
-  local global_home="" scan_rc
-  global_home="$(safe_gate_composer_global_home)" || {
-    safe_gate_err "safe: BLOCKED composer global — cannot resolve the Composer global project for audit; set COMPOSER_HOME or repair the Composer environment; details: safe explain"
-    return 100
-  }
-  [[ -d "${global_home}" ]] || return 0
+safe_gate_composer_resolve_path() {
+  local path="$1" base="$2"
+  [[ -n "${path}" ]] || return 1
+  case "${path}" in
+    /*|[A-Za-z]:/*) printf '%s' "${path}" ;;
+    *) printf '%s/%s' "${base%/}" "${path}" ;;
+  esac
+}
 
-  (
-    cd "${global_home}" || exit 125
-    if safe_gate_composer_project_present; then
-      safe_gate_scan_project
+safe_gate_composer_add_scan_target() {
+  local target="$1" seen
+  [[ -n "${target}" ]] || return 0
+  for seen in "${SAFE_GATE_COMPOSER_SCAN_TARGETS[@]}"; do
+    [[ "${seen}" == "${target}" ]] && return 0
+  done
+  SAFE_GATE_COMPOSER_SCAN_TARGETS+=("${target}")
+}
+
+# One composer routing pass. For a recognized global proxy it records all
+# routing facts needed by install, update, and require: the nested class,
+# package boundary, first effective --working-dir, and every project to scan.
+# It deliberately leaves ordinary non-global routing to safe_gate_route so
+# behavior outside the global lane remains byte-for-byte compatible.
+safe_gate_composer_route() {
+  local -a args=("$@")
+  local arg next="" first="" nested="" class="" home="" base="" target=""
+  local i first_idx=-1 nested_idx=-1 options_ended=0 is_global=0
+
+  SAFE_GATE_TOOL="composer"
+  SAFE_GATE_COMPOSER_IS_GLOBAL=0
+  SAFE_GATE_COMPOSER_SUBCMD=""
+  SAFE_GATE_COMPOSER_CLASS=""
+  SAFE_GATE_COMPOSER_PACKAGE_ARGS=()
+  SAFE_GATE_COMPOSER_WORKING_DIR=""
+  SAFE_GATE_COMPOSER_HAS_WORKING_DIR=0
+  SAFE_GATE_COMPOSER_SCAN_TARGETS=()
+  SAFE_GATE_COMPOSER_BADFLAG=""
+  safe_gate_scan_target_flags composer "$@"
+
+  for (( i=0; i<${#args[@]}; i++ )); do
+    arg="${args[$i]}"
+    if (( options_ended )); then
+      if [[ -z "${first}" ]]; then
+        first="${arg}"; first_idx=${i}
+        safe_gate_composer_is_global_proxy "${first}" && is_global=1
+      elif (( is_global )) && [[ -z "${nested}" ]]; then
+        nested="${arg}"; nested_idx=${i}
+      fi
+      continue
     fi
-  )
-  scan_rc=$?
-  if (( scan_rc == 125 )); then
-    safe_gate_err "safe: BLOCKED composer global — cannot enter the Composer global project for audit; repair its directory permissions, then retry; details: safe explain"
-    return 100
+
+    case "${arg}" in
+      --)
+        options_ended=1
+        continue
+        ;;
+      --working-dir|-d)
+        if (( i + 1 >= ${#args[@]} )); then
+          if (( is_global )) && [[ -z "${nested}" ]]; then
+            SAFE_GATE_COMPOSER_BADFLAG="${arg}"
+            return 2
+          fi
+          continue
+        fi
+        if (( SAFE_GATE_COMPOSER_HAS_WORKING_DIR == 0 )); then
+          SAFE_GATE_COMPOSER_WORKING_DIR="${args[$((i + 1))]}"
+          SAFE_GATE_COMPOSER_HAS_WORKING_DIR=1
+        fi
+        i=$((i + 1))
+        continue
+        ;;
+      --working-dir=*)
+        if (( SAFE_GATE_COMPOSER_HAS_WORKING_DIR == 0 )); then
+          SAFE_GATE_COMPOSER_WORKING_DIR="${arg#*=}"
+          SAFE_GATE_COMPOSER_HAS_WORKING_DIR=1
+        fi
+        continue
+        ;;
+      -d?*)
+        if (( SAFE_GATE_COMPOSER_HAS_WORKING_DIR == 0 )); then
+          SAFE_GATE_COMPOSER_WORKING_DIR="${arg#-d}"
+          SAFE_GATE_COMPOSER_HAS_WORKING_DIR=1
+        fi
+        continue
+        ;;
+      -*)
+        if [[ -z "${first}" ]] || { (( is_global )) && [[ -z "${nested}" ]]; }; then
+          if safe_gate_composer_application_boolean "${arg}"; then
+            next="${args[$((i + 1))]:-}"
+            case "${next,,}" in
+              true|false) i=$((i + 1)) ;;
+            esac
+          elif [[ "${arg}" == --*=* || "${arg}" == -*=* ]]; then
+            : # Equals form cannot consume the later nested command.
+          else
+            SAFE_GATE_COMPOSER_BADFLAG="${arg}"
+            return 2
+          fi
+        fi
+        continue
+        ;;
+      *)
+        if [[ -z "${first}" ]]; then
+          first="${arg}"; first_idx=${i}
+          safe_gate_composer_is_global_proxy "${first}" && is_global=1
+        elif (( is_global )) && [[ -z "${nested}" ]]; then
+          nested="${arg}"; nested_idx=${i}
+        fi
+        ;;
+    esac
+  done
+
+  if (( is_global == 0 )); then
+    safe_gate_route composer "$@" || return $?
+    SAFE_GATE_COMPOSER_SUBCMD="${SAFE_GATE_SUBCMD}"
+    SAFE_GATE_COMPOSER_CLASS="$(safe_gate_composer_subcommand_class "${SAFE_GATE_SUBCMD}")" || SAFE_GATE_COMPOSER_CLASS=""
+    SAFE_GATE_COMPOSER_PACKAGE_ARGS=("${@:SAFE_GATE_SUBCMD_IDX+1}")
+    return 0
   fi
-  return "${scan_rc}"
+
+  SAFE_GATE_COMPOSER_IS_GLOBAL=1
+  SAFE_GATE_COMPOSER_SUBCMD="${nested}"
+  SAFE_GATE_COMPOSER_CLASS="$(safe_gate_composer_subcommand_class "${nested}")" || SAFE_GATE_COMPOSER_CLASS=""
+  SAFE_GATE_SUBCMD="${nested}"
+  SAFE_GATE_SUBCMD_IDX=$((nested_idx + 1))
+  (( nested_idx >= 0 )) && SAFE_GATE_COMPOSER_PACKAGE_ARGS=("${args[@]:nested_idx+1}")
+
+  case "${SAFE_GATE_COMPOSER_CLASS}" in
+    install|update|require)
+      home="$(safe_gate_composer_global_home)" || return 3
+      base="${PWD}"
+      target=""
+      if (( SAFE_GATE_COMPOSER_HAS_WORKING_DIR )); then
+        target="$(safe_gate_composer_resolve_path "${SAFE_GATE_COMPOSER_WORKING_DIR}" "${PWD}")" || target=""
+        [[ -n "${target}" ]] && base="${target}"
+        # The shared source accumulator is deliberately last-wins for ordinary
+        # composer routes. Global Symfony parsing is first-wins, so its single
+        # routing result overrides that value before package checks run.
+        SAFE_GATE_PROJECT_DIR="${SAFE_GATE_COMPOSER_WORKING_DIR}"
+      fi
+      safe_gate_composer_add_scan_target "$(safe_gate_composer_resolve_path "${home}" "${base}" || true)"
+      if (( SAFE_GATE_COMPOSER_HAS_WORKING_DIR )); then
+        safe_gate_composer_add_scan_target "${target}"
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# Over-scan global routing targets: every existing directory is preflighted,
+# even before it has composer metadata. A nonexistent target contributes
+# nothing while other selected targets remain protected.
+safe_gate_composer_scan_targets() {
+  local target scan_rc
+  for target in "${SAFE_GATE_COMPOSER_SCAN_TARGETS[@]}"; do
+    [[ -d "${target}" ]] || continue
+    (
+      cd "${target}" || exit 125
+      safe_gate_scan_project
+    )
+    scan_rc=$?
+    if (( scan_rc == 125 )); then
+      safe_gate_err "safe: BLOCKED composer global — cannot enter the selected project for audit; repair its directory permissions, then retry; details: safe explain"
+      return 100
+    fi
+    (( scan_rc == 0 )) || return "${scan_rc}"
+  done
+  return 0
 }
 
 # Update-family subcommands resolve in-range instead of to the dist-tag; the
@@ -2067,11 +2189,11 @@ safe_gate_composer_packages() {
       --dev|--update-no-dev|--update-with-dependencies|--update-with-all-dependencies|--ignore-platform-reqs|--no-update|--no-scripts|--no-progress|--no-install|--prefer-source|--prefer-dist|--prefer-install|--sort-packages|--optimize-autoloader|--classmap-authoritative|--apcu-autoloader)
         continue
         ;;
-      --working-dir|--repository)
+      --working-dir|-d|--repository)
         skip_next=1
         continue
         ;;
-      --working-dir=*|--repository=*|--prefer-install=*)
+      --working-dir=*|-d?*|--repository=*|--prefer-install=*)
         continue
         ;;
       -*)
@@ -3065,49 +3187,49 @@ safe_gate_go() {
 }
 
 safe_gate_composer() {
-  safe_gate_route composer "$@" || return $?
-  safe_gate_scan_target_flags composer "$@"
-  local first="${SAFE_GATE_SUBCMD}"
-  local subidx=$SAFE_GATE_SUBCMD_IDX
-  local first_class="" nested_class=""
-  local -a global_args=()
-  first_class="$(safe_gate_composer_subcommand_class "${first}")" || first_class=""
+  local route_rc
+  safe_gate_composer_route "$@"
+  route_rc=$?
+  case "${route_rc}" in
+    2)
+      safe_gate_err "safe: BLOCKED composer global — cannot find the nested command past unrecognized flag '${SAFE_GATE_COMPOSER_BADFLAG}'; to allow: rewrite it as '${SAFE_GATE_COMPOSER_BADFLAG}=<value>', then retry; details: safe explain"
+      return 100
+      ;;
+    3)
+      safe_gate_err "safe: BLOCKED composer global — cannot resolve the Composer global project for audit; set COMPOSER_HOME or repair the Composer environment; details: safe explain"
+      return 100
+      ;;
+    *)
+      (( route_rc == 0 )) || return "${route_rc}"
+      ;;
+  esac
   local -a packages=()
 
-  if [[ "${first}" == "global" ]]; then
-    global_args=("${@:subidx+1}")
-    safe_gate_composer_global_subcommand "${global_args[@]}"
-    case $? in
-      2)
-        safe_gate_err "safe: BLOCKED composer global — cannot find the nested command past unrecognized flag '${SAFE_GATE_COMPOSER_GLOBAL_BADFLAG}'; to allow: rewrite it as '${SAFE_GATE_COMPOSER_GLOBAL_BADFLAG}=<value>', then retry; details: safe explain"
-        return 100
+  if (( SAFE_GATE_COMPOSER_IS_GLOBAL )); then
+    case "${SAFE_GATE_COMPOSER_CLASS}" in
+      install|update|require)
+        safe_gate_composer_scan_targets || return $?
         ;;
     esac
-    nested_class="$(safe_gate_composer_subcommand_class "${SAFE_GATE_COMPOSER_GLOBAL_SUBCMD}")" || nested_class=""
 
-    case "${nested_class}" in
-      install|update)
-        safe_gate_scan_composer_global_project || return $?
-        ;;
-      require)
-        safe_gate_collect packages "$(safe_gate_composer_packages "${global_args[@]:SAFE_GATE_COMPOSER_GLOBAL_SUBCMD_IDX+1}")"
-        if (( ${#packages[@]} > 0 )); then
-          safe_gate_check_many composer "${packages[@]}" || return $?
-        fi
-        ;;
-    esac
+    if [[ "${SAFE_GATE_COMPOSER_CLASS}" == "require" ]]; then
+      safe_gate_collect packages "$(safe_gate_composer_packages "${SAFE_GATE_COMPOSER_PACKAGE_ARGS[@]}")"
+      if (( ${#packages[@]} > 0 )); then
+        safe_gate_check_many composer "${packages[@]}" || return $?
+      fi
+    fi
 
     safe_gate_exec_real composer "$@"
     return $?
   fi
 
-  if [[ -n "${first_class}" ]]; then
+  if [[ -n "${SAFE_GATE_COMPOSER_CLASS}" ]]; then
     if safe_gate_composer_project_present; then
       safe_gate_scan_project || return $?
     fi
 
-    if [[ "${first_class}" == "require" ]]; then
-      safe_gate_collect packages "$(safe_gate_composer_packages "${@:subidx+1}")"
+    if [[ "${SAFE_GATE_COMPOSER_CLASS}" == "require" ]]; then
+      safe_gate_collect packages "$(safe_gate_composer_packages "${SAFE_GATE_COMPOSER_PACKAGE_ARGS[@]}")"
       if (( ${#packages[@]} > 0 )); then
         safe_gate_check_many composer "${packages[@]}" || return $?
       fi
