@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- `safe run <tool> [args...]` now silently delegates a bare wrapped tool name
+  (for example `npm` or `go`) to its verified PATH gate wrapper, so the normal
+  audited package-manager lane handles the operation instead of treating the
+  tool itself as an npx-style package at `latest`. Versioned specs stay on the
+  package lane. Command paths and missing, unmarked, or self-referential
+  targets refuse with exit 100 rather than bypassing the gate.
+
 ## 1.12.0 - 2026-08-10
 
 - npm gate: `npm dedupe` (including `ddp`) and `npm prune` now project their
