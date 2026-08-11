@@ -1,0 +1,11 @@
+{
+  "lockfileVersion": 3,
+  "packages": {
+    "": {"name": "sources", "version": "1.0.0"},
+    "node_modules/registry-alias": {"name": "real-registry", "version": "1.0.0", "resolved": "https://registry.npmjs.org/real-registry/-/real-registry-1.0.0.tgz", "integrity": "sha512-registry"},
+    "node_modules/git-alias": {"name": "left-pad", "version": "1.0.0", "resolved": "git+https://example.invalid/left-pad.git#deadbeef", "integrity": "sha512-git"},
+    "node_modules/file-alias": {"name": "left-pad", "version": "1.0.0", "resolved": "file:../left-pad.tgz", "integrity": "sha512-file"},
+    "node_modules/remote-alias": {"name": "left-pad", "version": "1.0.0", "resolved": "github:example/left-pad#deadbeef", "integrity": "sha512-remote"},
+    "node_modules/unknown": {"version": "1.0.0"}
+  }
+}

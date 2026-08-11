@@ -49,6 +49,30 @@ info() { printf '\033[36minstall:\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[33minstall:\033[0m %s\n' "$*" >&2; }
 die()  { err "$@"; exit 1; }
 
+# A previous safe install may still own `go` on PATH while this invocation is
+# rebuilding its target HOME. Calling that wrapper before this installer has
+# copied gate-lib.sh into the target config fails bootstrap. Select the first
+# executable `go` that is not a safe wrapper; the normal PATH order still
+# chooses a version-manager or system toolchain behind the wrapper.
+resolve_real_go() {
+  local dir candidate
+  local -a dirs=()
+
+  IFS=':' read -r -a dirs <<< "${PATH}"
+  for dir in "${dirs[@]}"; do
+    [[ -n "$dir" ]] || dir="."
+    candidate="${dir}/go"
+    [[ -f "$candidate" && -x "$candidate" ]] || continue
+    if LC_ALL=C sed -n '2p' -- "$candidate" 2>/dev/null \
+      | LC_ALL=C grep -qxF -- '# safe-gate-wrapper v1 tool=go'; then
+      continue
+    fi
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+
 usage() {
   cat <<'EOF'
 usage: bash install.sh [--all] [--run] [--audit] [--wrappers] [--no-wrappers] [--review-timer] [--uninstall]
@@ -107,6 +131,7 @@ done
 
 command -v bash >/dev/null 2>&1 || die "missing dependency: bash"
 command -v jq >/dev/null 2>&1 || die "missing dependency: jq"
+GO_BIN="$(resolve_real_go)" || die "missing dependency: go"
 command -v podman >/dev/null 2>&1 || warn "podman not installed; sandbox execution will fail until it is installed"
 
 for script in "$REPO_DIR/bin/safe" "$REPO_DIR/bin/safe-run" "$REPO_DIR/bin/safe-audit"; do
@@ -528,9 +553,22 @@ install -m 0644 "$REPO_DIR/docs/contract/agent-contract.json" "$AGENT_CONTRACT_T
 # scanner contract (mise aube via AUBE_SECURITY_SCANNER, bun >= 1.3 via
 # bunfig). The gate injects the env var when this file is present.
 install -m 0644 "$REPO_DIR/share/scanner.mjs" "$CONFIG_BASE/scanner.mjs"
-install -m 0755 "$REPO_DIR/bin/safe" "$BIN_DIR/safe"
+safe_core_build="$(mktemp "${TMPDIR:-/tmp}/safe-core.XXXXXX" 2>/dev/null)" || die "cannot allocate safe-core build output"
+if ! (
+  cd "$REPO_DIR"
+  "$GO_BIN" build -trimpath -ldflags "-X main.version=$(tr -d '[:space:]' < VERSION)" \
+    -o "$safe_core_build" ./cmd/safe-core
+); then
+  rm -f -- "$safe_core_build"
+  die "safe-core build failed"
+fi
 install -m 0755 "$REPO_DIR/bin/safe-run" "$BIN_DIR/safe-run"
 install -m 0755 "$REPO_DIR/bin/safe-audit" "$BIN_DIR/safe-audit"
+install -m 0755 "$safe_core_build" "$BIN_DIR/safe-core"
+# Install the dispatcher last: a completed safe binary then has the matching
+# safe-core/safe-run/safe-audit siblings already written by this install run.
+install -m 0755 "$REPO_DIR/bin/safe" "$BIN_DIR/safe"
+rm -f -- "$safe_core_build"
 cleanup_legacy_install_artifacts
 info "installed binaries to $BIN_DIR"
 

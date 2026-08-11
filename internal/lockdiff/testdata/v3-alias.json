@@ -1,0 +1,19 @@
+{
+  "name": "alias-fixture",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "name": "alias-fixture",
+      "version": "0.0.0"
+    },
+    "node_modules/friendly-alias": {
+      "name": "real-registry-pkg",
+      "version": "1.2.3",
+      "resolved": "https://registry.npmjs.org/real-registry-pkg/-/real-registry-pkg-1.2.3.tgz",
+      "integrity": "sha512-alias"
+    },
+    "node_modules/plain": {
+      "version": "4.0.0"
+    }
+  }
+}

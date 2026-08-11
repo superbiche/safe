@@ -1,0 +1,8 @@
+{
+  "lockfileVersion": 3,
+  "packages": {
+    "": {"name": "fixture", "version": "1.0.0"},
+    "node_modules/added": {"version": "1.0.0"},
+    "node_modules/changed": {"version": "2.0.0"}
+  }
+}

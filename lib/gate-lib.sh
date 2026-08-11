@@ -914,6 +914,480 @@ safe_gate_scan_project() {
   return 0
 }
 
+# Prefer npm-shrinkwrap.json because npm treats it as the authoritative lock;
+# otherwise project lockfiles use package-lock.json. Prints the basename only.
+safe_gate_npm_lockfile_name() {
+  local project_dir="$1"
+
+  if [[ -f "${project_dir}/npm-shrinkwrap.json" ]]; then
+    printf '%s\n' "npm-shrinkwrap.json"
+    return 0
+  fi
+  if [[ -f "${project_dir}/package-lock.json" ]]; then
+    printf '%s\n' "package-lock.json"
+    return 0
+  fi
+  return 1
+}
+
+# npm accepts unique command prefixes. Keep this narrow to the new lock-diff
+# lane: install/update aliases have their own pre-existing routing contract.
+safe_gate_npm_lockdiff_subcommand() {
+  local token="$1"
+  case "${token}" in
+    ddp|dedupe|prune) return 0 ;;
+  esac
+  (( ${#token} >= 3 )) || return 1
+  [[ "dedupe" == "${token}"* || "prune" == "${token}"* ]]
+}
+
+# A bare -- terminates npm's option parsing, so it neutralizes the projection
+# invariants appended before the user's argv. Effective config itself comes
+# from npm below; do not try to reimplement its argv/environment/.npmrc parser.
+safe_gate_npm_lockdiff_unsafe_argv() {
+  local arg
+  SAFE_GATE_LOCKDIFF_OFFENDING_TOKEN=""
+  for arg in "$@"; do
+    if [[ "${arg}" == "--" ]]; then
+      SAFE_GATE_LOCKDIFF_OFFENDING_TOKEN="--"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# npm is the authority for config precedence, boolean parsing, quoting, and
+# project .npmrc semantics. Keep the ambient environment unchanged so this
+# query resolves exactly what the final delegate will see.
+#
+# The probe MIRRORS the projection's own argv (safe's invariant flags first,
+# user argv last, exactly as the projection runs them) rather than reading
+# the ambient config: the projection asserts these invariants itself, so only
+# a user override can defeat them. Probing the ambient value instead refused
+# every dedupe/prune on a stock machine, where npm's own default is
+# ignore-scripts=false — protection unchanged, false refusals gone.
+safe_gate_npm_lockdiff_effective_config() {
+  local project_dir="$1" subcommand="$2"
+  shift 2
+  local real_npm="" config_json=""
+
+  real_npm="$(safe_gate_resolve_real npm)" || real_npm=""
+  if [[ -z "${real_npm}" ]]; then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — effective npm config probe cannot resolve npm (audit-infrastructure breakage, not a package finding); rerun install.sh; details: safe explain"
+    return 100
+  fi
+  if config_json="$(
+    cd -- "${project_dir}" || exit 125
+    # Invariant flags FIRST (user argv may legitimately override them — that
+    # is what this probe measures), but `--json` LAST: it is the probe's own
+    # transport, and a user's ordinary `--json=false`/`--no-json` disabled it
+    # and made every such command unreadable (PR#70 delta-4 F2).
+    "${real_npm}" config list \
+      --package-lock-only --ignore-scripts --no-audit --no-fund "$@" --json 2>/dev/null
+  )"; then
+    :
+  else
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — effective npm config probe failed (audit-infrastructure breakage, not a package finding); fix npm configuration and retry — safe doctor; details: safe explain"
+    return 100
+  fi
+  if ! jq -e 'type == "object"
+    and (."package-lock" | type == "boolean")
+    and (."ignore-scripts" | type == "boolean")' <<<"${config_json}" >/dev/null 2>&1; then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — effective npm config probe returned an unreadable result (audit-infrastructure breakage, not a package finding); fix npm configuration and retry — safe doctor; details: safe explain"
+    return 100
+  fi
+  if ! jq -e '."package-lock" == true' <<<"${config_json}" >/dev/null 2>&1; then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — effective npm config disables the lock-diff projection: package-lock is off; retry after enabling it; details: safe explain"
+    return 100
+  fi
+  if ! jq -e '."ignore-scripts" == true' <<<"${config_json}" >/dev/null 2>&1; then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — effective npm config disables the lock-diff projection: ignore-scripts is off; retry after enabling it; details: safe explain"
+    return 100
+  fi
+  return 0
+}
+
+# True when a lowercased authority is a host safe-core can compare against
+# Go's url.Host: a registered name or a bracketed IPv6 literal, with an
+# optional port in 1..65535.
+#
+# LC_ALL is pinned for the match: bash character ranges are locale-collated,
+# so under en_US.UTF-8 `[a-z]` matched accented letters and a Unicode host
+# was emitted raw instead of refused, while npm resolves it to punycode
+# (delta-5 F4).
+safe_gate_valid_registry_host() {
+  local host="$1" name="" port=""
+  local LC_ALL=C LC_COLLATE=C
+
+  if [[ "${host}" == \[*\] ]]; then
+    name="${host}"
+  elif [[ "${host}" == \[*\]:* ]]; then
+    name="${host%%\]:*}]"
+    port="${host##*\]:}"
+  elif [[ "${host}" == *:* ]]; then
+    name="${host%:*}"
+    port="${host##*:}"
+  else
+    name="${host}"
+  fi
+
+  if [[ "${name}" == \[*\] ]]; then
+    [[ "${name:1:${#name}-2}" =~ ^[0-9a-f:.]+$ ]] || return 1
+  else
+    [[ "${name}" =~ ^[0-9a-z]([0-9a-z._-]*[0-9a-z.])?$ ]] || return 1
+  fi
+
+  if [[ -n "${port}" ]]; then
+    [[ "${port}" =~ ^[0-9]+$ ]] || return 1
+    (( port >= 1 && port <= 65535 )) || return 1
+  fi
+  return 0
+}
+
+# Prints one lowercased host[:port] per effective npm registry. Registry
+# provenance cannot safely fall back to a guessed default: private registries
+# need their configured host to be audit-gated rather than over-refused.
+safe_gate_npm_lockdiff_registry_hosts() {
+  local project_dir="$1" subcommand="$2"
+  shift 2
+  local real_npm="" registry_json="" registry_urls="" registry_url authority host known
+  local -a hosts=()
+
+  real_npm="$(safe_gate_resolve_real npm)" || real_npm=""
+  if [[ -z "${real_npm}" ]]; then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — effective npm registry probe cannot resolve npm (audit-infrastructure breakage, not a package finding); rerun install.sh; details: safe explain"
+    return 100
+  fi
+  if registry_json="$(
+    cd -- "${project_dir}" || exit 125
+    "${real_npm}" config list "$@" --json 2>/dev/null
+  )"; then
+    :
+  else
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — effective npm registry probe failed (audit-infrastructure breakage, not a package finding); fix npm configuration and retry — safe doctor; details: safe explain"
+    return 100
+  fi
+  # Every scoped registry key is enumerated from the effective config: a
+  # literal "@scope:registry" query returns the placeholder, never the
+  # project's real @foo:registry, so scoped private artifacts were
+  # over-refused as remote (PR#70 delta-3 F4).
+  #
+  # The key must match a scope npm can actually SELECT, not merely one it
+  # stores. npm keeps any `<something>:registry` line in the effective config,
+  # but only resolves `@scope:registry` for a scope its package-name validator
+  # accepts — which requires the scope to survive URL-encoding unchanged.
+  # Accepting `not-a-scope:registry` (delta-4 F4), and then anything shaped
+  # `@<junk>:registry` such as `@a b:registry` or `@a#b:registry` (delta-5 F4),
+  # let a project's own .npmrc grant an arbitrary host registry provenance —
+  # making a remote tarball look registry-authoritative. This class is npm's
+  # unreserved set, so a legal scope is never over-refused.
+  local scope_pat=$'^@[A-Za-z0-9!~*\'()._-]+:registry$'
+  if registry_urls="$(jq -er --arg scope_pat "${scope_pat}" '
+    if type != "object" or (.registry | type != "string")
+    then error("invalid registry result")
+    else [ .registry,
+           ( to_entries[]
+             | select(.key | test($scope_pat))
+             | select(.value != null)
+             | .value ) ]
+      | map(if type == "string" then . else error("invalid registry result") end)
+      | .[]
+    end
+  ' <<<"${registry_json}" 2>/dev/null)"; then
+    :
+  else
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — effective npm registry probe returned an unreadable result (audit-infrastructure breakage, not a package finding); fix npm configuration and retry — safe doctor; details: safe explain"
+    return 100
+  fi
+  while IFS= read -r registry_url; do
+    case "${registry_url,,}" in
+      http://*|https://*) ;;
+      *)
+        safe_gate_err "safe: BLOCKED npm ${subcommand} — effective npm registry probe returned an unreadable result (audit-infrastructure breakage, not a package finding); fix npm configuration and retry — safe doctor; details: safe explain"
+        return 100
+        ;;
+    esac
+    authority="${registry_url#*://}"
+    authority="${authority%%[/?#]*}"
+    host="${authority##*@}"
+    host="${host,,}"
+    # A nonblank but malformed authority is not a host: `https://:` yielded
+    # ":" and reached the allow-set (delta-4 F4). The check must equal what
+    # Go's url.Host will hold on the safe-core side, so bracketed IPv6 is
+    # accepted verbatim and a port outside 1..65535 is not a port at all
+    # (delta-5 F4).
+    if ! safe_gate_valid_registry_host "${host}"; then
+      safe_gate_err "safe: BLOCKED npm ${subcommand} — effective npm registry probe returned an unreadable result (audit-infrastructure breakage, not a package finding); fix npm configuration and retry — safe doctor; details: safe explain"
+      return 100
+    fi
+    for known in "${hosts[@]}"; do
+      [[ "${known}" == "${host}" ]] && continue 2
+    done
+    hosts+=("${host}")
+  done <<<"${registry_urls}"
+  if (( ${#hosts[@]} == 0 )); then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — effective npm registry probe returned an unreadable result (audit-infrastructure breakage, not a package finding); fix npm configuration and retry — safe doctor; details: safe explain"
+    return 100
+  fi
+  printf '%s\n' "${hosts[@]}"
+  return 0
+}
+
+# The ordinary project preflight is intentionally advisory for legacy install
+# lanes. A lock-diff projection must fail closed instead: without a readable
+# scratch verdict, the introduced set cannot be scoped safely.
+safe_gate_lockdiff_scan_project() {
+  local project_dir="$1" subcommand="$2"
+  local result_file scan_log scan_status=0 broken=""
+
+  if ! safe_gate_audit_available; then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — projected dependency scan is unavailable (audit-infrastructure breakage, not a package finding); rerun install.sh; details: safe explain"
+    return 100
+  fi
+
+  result_file="$(mktemp "${project_dir}/safe-lockdiff-result.XXXXXX" 2>/dev/null)" || {
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — cannot allocate a projected dependency scan result (audit-infrastructure breakage, not a package finding); retry after fixing temporary storage; details: safe explain"
+    return 100
+  }
+  scan_log="$(mktemp "${project_dir}/safe-lockdiff-scan.XXXXXX" 2>/dev/null)" || {
+    rm -f -- "${result_file}"
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — cannot allocate projected dependency scan output (audit-infrastructure breakage, not a package finding); retry after fixing temporary storage; details: safe explain"
+    return 100
+  }
+
+  (
+    cd -- "${project_dir}" || exit 125
+    "${SAFE_GATE_AUDIT_BIN}" scan --deps-only --allow-missing-tools \
+      --result-out "${result_file}" --project .
+  ) >"${scan_log}" 2>&1 || scan_status=$?
+
+  if (( scan_status != 0 )); then
+    rm -f -- "${result_file}" "${scan_log}"
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — projected dependency scan failed with exit ${scan_status} (audit-infrastructure breakage, not a package finding); fix the scanner and retry — safe doctor; details: safe explain"
+    return 100
+  fi
+
+  if ! jq -e 'def optional_note: (has("note") | not) or (.note == null) or (.note | type == "string");
+    def tool_entry: type == "object" and (.status | type == "string") and optional_note;
+    def ecosystem_entry: type == "object" and (.scanner | type == "string") and (.status | type == "string") and optional_note;
+    type == "object"
+    and ((.audit_totals.critical? // .cve_scan.critical? // null) | type == "number")
+    and (.tool_status | type == "object")
+    and (.ecosystem_audits | type == "array")
+    and ([.tool_status | to_entries[] | (.key | type == "string") and (.value | tool_entry)] | all)
+    and ([.ecosystem_audits[] | ecosystem_entry] | all)' \
+    "${result_file}" >/dev/null 2>&1; then
+    rm -f -- "${result_file}" "${scan_log}"
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — projected dependency scan produced no readable verdict (audit-infrastructure breakage, not a package finding); fix the scanner and retry — safe doctor; details: safe explain"
+    return 100
+  fi
+
+  if broken="$(jq -er '
+    [ (.tool_status | to_entries[] | select(.value.status != "ok") | .key),
+      (.ecosystem_audits[] | select(.status != "ok") | .scanner)
+    ] | unique | join(", ")
+  ' "${result_file}" 2>/dev/null)"; then
+    :
+  else
+    rm -f -- "${result_file}" "${scan_log}"
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — projected dependency scan status is unreadable (audit-infrastructure breakage, not a package finding); fix the scanner and retry — safe doctor; details: safe explain"
+    return 100
+  fi
+  rm -f -- "${result_file}" "${scan_log}"
+
+  if [[ -n "${broken}" ]]; then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — projected dependency scanner failure (${broken}; audit-infrastructure breakage, not a package finding); fix the scanner and retry — safe doctor; details: safe explain"
+    return 100
+  fi
+
+  return 0
+}
+
+# Project an npm dedupe/prune lockfile mutation into a scratch directory, then
+# audit only the package identities introduced by that projection. Existing
+# project findings are deliberately not decisions in this lane.
+safe_gate_npm_lockdiff_preflight() {
+  local subcommand="$1"
+  shift
+  local project_dir="${SAFE_GATE_PROJECT_DIR:-.}" lockfile_name=""
+  local real_npm="" safe_core="" safe_core_version="" scratch="" diff_json="" introduced_rows="" registry_hosts="" rc=0
+  local -a introduced=() registry_host_args=()
+
+  if [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]]; then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — --prefix/--cwd project selectors cannot be lock-diff projected safely; cd to that project and retry (audit-infrastructure breakage, not a package finding); details: safe explain"
+    return 100
+  fi
+  if ! project_dir="$(cd -- "${project_dir}" 2>/dev/null && pwd -P)"; then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — project directory cannot be read for lock-diff projection (audit-infrastructure breakage, not a package finding); retry from the project root; details: safe explain"
+    return 100
+  fi
+  if [[ ! -f "${project_dir}/package.json" ]] || ! lockfile_name="$(safe_gate_npm_lockfile_name "${project_dir}")"; then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — package.json and an npm-shrinkwrap.json or package-lock.json are required for lock-diff projection (audit-infrastructure breakage, not a package finding); add the missing evidence and retry; details: safe explain"
+    return 100
+  fi
+  # With no node_modules at all, the lock diff projects to empty while the
+  # real command materializes EVERY lockfile artifact — nothing would be
+  # audited (PR#70 review F3, operator-ruled conservative guard 2026-08-10;
+  # the partial-tree residual is inbox
+  # 2026-08-10-safe-lockdiff-partial-tree-residual.md).
+  if [[ ! -d "${project_dir}/node_modules" ]]; then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — node_modules is absent, so this command would materialize every lockfile artifact without an audit; install first through the audited lane (npm ci / npm install), then retry; details: safe explain"
+    return 100
+  fi
+
+  if safe_gate_npm_lockdiff_unsafe_argv "$@"; then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — ${SAFE_GATE_LOCKDIFF_OFFENDING_TOKEN} disables the lock-diff projection invariant; retry without that token; details: safe explain"
+    return 100
+  fi
+  if safe_gate_npm_lockdiff_effective_config "${project_dir}" "${subcommand}" "$@"; then
+    :
+  else
+    rc=$?
+    return "${rc}"
+  fi
+  if registry_hosts="$(safe_gate_npm_lockdiff_registry_hosts "${project_dir}" "${subcommand}" "$@")"; then
+    :
+  else
+    rc=$?
+    return "${rc}"
+  fi
+  local registry_host
+  while IFS= read -r registry_host; do
+    [[ -n "${registry_host}" ]] && registry_host_args+=(--registry-host "${registry_host}")
+  done <<<"${registry_hosts}"
+
+  safe_core="${SAFE_DIR:-}/safe-core"
+  if [[ -z "${SAFE_DIR:-}" || ! -x "${safe_core}" ]]; then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — safe-core is not installed, so the lock diff cannot be audited; rerun install.sh; details: safe explain"
+    return 100
+  fi
+  if safe_core_version="$("${safe_core}" --version 2>/dev/null)"; then
+    :
+  else
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — safe-core version cannot be read (audit-infrastructure breakage, not a package finding); rerun install.sh; details: safe explain"
+    return 100
+  fi
+  if [[ -z "${SAFE_VERSION:-}" || "${safe_core_version}" != "${SAFE_VERSION}" ]]; then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — safe-core version ${safe_core_version:-unknown} does not match safe ${SAFE_VERSION:-unknown} (audit-infrastructure breakage, not a package finding); rerun install.sh; details: safe explain"
+    return 100
+  fi
+  real_npm="$(safe_gate_resolve_real npm)" || real_npm=""
+  if [[ -z "${real_npm}" ]]; then
+    safe_gate_err "safe: gate: npm: command not found (no non-wrapper npm on PATH)"
+    return 127
+  fi
+
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/safe-gate-lockdiff.XXXXXX" 2>/dev/null)" || {
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — cannot allocate lock-diff projection storage (audit-infrastructure breakage, not a package finding); retry after fixing temporary storage; details: safe explain"
+    return 100
+  }
+  if ! cp -- "${project_dir}/package.json" "${scratch}/package.json" \
+      || ! cp -- "${project_dir}/${lockfile_name}" "${scratch}/${lockfile_name}"; then
+    rm -rf -- "${scratch}"
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — cannot copy lock-diff projection inputs (audit-infrastructure breakage, not a package finding); verify project files and retry; details: safe explain"
+    return 100
+  fi
+  # The projection must resolve under the project's own npm config (custom
+  # registries, scoped registries) or it can vouch for a different artifact
+  # than the delegate fetches (PR#70 review F3, same ruling). The
+  # package-lock=false shape inside it was already refused above.
+  if [[ -f "${project_dir}/.npmrc" ]] && ! cp -- "${project_dir}/.npmrc" "${scratch}/.npmrc"; then
+    rm -rf -- "${scratch}"
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — cannot copy the project .npmrc into the lock-diff projection (audit-infrastructure breakage, not a package finding); verify project files and retry; details: safe explain"
+    return 100
+  fi
+
+  (
+    cd -- "${scratch}" || exit 125
+    SAFE_GATE_LOCKDIFF_PROJECTION=1 \
+      npm_config_package_lock=true \
+      npm_config_package_lock_only=true \
+      npm_config_ignore_scripts=true \
+      npm_config_audit=false \
+      npm_config_fund=false \
+      "${real_npm}" --package-lock-only --ignore-scripts --no-audit --no-fund "$@"
+  ) >"${scratch}/npm-projection.log" 2>&1 || rc=$?
+  if (( rc != 0 )); then
+    rm -rf -- "${scratch}"
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — lock-diff projection failed with exit ${rc} (audit-infrastructure breakage, not a package finding); fix npm/project metadata and retry; details: safe explain"
+    return 100
+  fi
+
+  if diff_json="$("${safe_core}" lockdiff "${registry_host_args[@]}" "${project_dir}/${lockfile_name}" "${scratch}/${lockfile_name}" 2>"${scratch}/lockdiff.err")"; then
+    :
+  else
+    rc=$?
+    rm -rf -- "${scratch}"
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — lock-diff analysis failed with exit ${rc} (audit-infrastructure breakage, not a package finding); repair the lockfile and retry; details: safe explain"
+    return 100
+  fi
+  if ! jq -e '
+    def optional_integrity: (has("integrity") | not) or (.integrity | type == "string");
+    def package_entry: type == "object" and (.name | type == "string") and (.version | type == "string") and (.source | type == "string") and optional_integrity;
+    def change_entry: type == "object" and (.name | type == "string") and (.from | type == "string") and (.to | type == "string") and (.source | type == "string") and optional_integrity;
+    type == "object"
+    and (.schema == 1)
+    and (.added | type == "array")
+    and (.removed | type == "array")
+    and (.changed | type == "array")
+    and ([ (.added[] | package_entry), (.removed[] | package_entry) ] | all)
+    and ([.changed[] | change_entry] | all)
+  ' <<<"${diff_json}" >/dev/null 2>&1; then
+    rm -rf -- "${scratch}"
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — lock-diff analysis returned an unreadable result (audit-infrastructure breakage, not a package finding); rerun install.sh and retry; details: safe explain"
+    return 100
+  fi
+  if jq -e '(.added | length) == 0 and (.removed | length) == 0 and (.changed | length) == 0' \
+      <<<"${diff_json}" >/dev/null 2>&1; then
+    rm -rf -- "${scratch}"
+    return 0
+  fi
+
+  if introduced_rows="$(jq -er '
+    [ .added[], (.changed[] | {name, version: .to, source, integrity}) ]
+    | unique_by(.name, .version, .source, .integrity)
+    | sort_by(.name, .version, .source, .integrity)
+    | map([ .name, .version, .source ] | @tsv)
+    | join("\n")
+  ' <<<"${diff_json}")"; then
+    :
+  else
+    rm -rf -- "${scratch}"
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — lock-diff introduced-target list is unreadable (audit-infrastructure breakage, not a package finding); rerun install.sh and retry; details: safe explain"
+    return 100
+  fi
+
+  local package name version source
+  while IFS=$'\t' read -r name version source; do
+    [[ -n "${name}" ]] || continue
+    if [[ "${source}" != "registry" ]]; then
+      rm -rf -- "${scratch}"
+      safe_gate_err "safe: BLOCKED npm ${subcommand} — ${name}@${version} is a ${source} artifact, not a registry artifact; not audit-gated; details: safe explain"
+      return 100
+    fi
+    introduced+=("${name}@${version}")
+  done <<<"${introduced_rows}"
+
+  safe_gate_lockdiff_scan_project "${scratch}" "${subcommand}"
+  rc=$?
+  if (( rc != 0 )); then
+    rm -rf -- "${scratch}"
+    return "${rc}"
+  fi
+
+  for package in "${introduced[@]}"; do
+    safe_gate_check "${package}" npm
+    rc=$?
+    if (( rc != 0 )); then
+      rm -rf -- "${scratch}"
+      return "${rc}"
+    fi
+  done
+
+  rm -rf -- "${scratch}"
+  return 0
+}
+
 safe_gate_any_file() {
   local file
 
@@ -1771,6 +2245,10 @@ safe_gate_npm_like() {
   # installer runs (delta-4 finding F4: selectors key off the installer).
   [[ "${tool}" == "bun" ]] && SAFE_GATE_INSTALLER="bun"
   local subcommand="${SAFE_GATE_SUBCMD}"
+  local npm_lockdiff_lane=1
+  if [[ "${tool}" == "npm" ]] && safe_gate_npm_lockdiff_subcommand "${subcommand}"; then
+    npm_lockdiff_lane=0
+  fi
   # bun --config=<file> swaps in an arbitrary bunfig.toml — a TOML surface
   # the source derivation does not read, and install.registry there
   # redirects the fetch. Same class as cargo --config: per-invocation
@@ -1829,8 +2307,8 @@ safe_gate_npm_like() {
   esac
 
   case "${subcommand}" in
-    install|i|it|install-test|add|ci|update|u|up|upgrade|udpate) ;;
-    *) safe_gate_exec_real "${tool}" "$@" ;;
+    install|i|it|install-test|add|ci|update|u|up|upgrade|udpate|dedupe|ddp|prune) ;;
+    *) (( npm_lockdiff_lane == 0 )) || safe_gate_exec_real "${tool}" "$@" ;;
   esac
 
   if [[ "${tool}" == "npm" ]]; then
@@ -1862,6 +2340,17 @@ safe_gate_npm_like() {
     # Inherited script-policy env survives into the delegate with
     # env-over-rc precedence: scrub it. The gate's own injection re-exports
     # after this.
+    if (( npm_lockdiff_lane == 0 )); then
+      if safe_gate_npm_global_true "$@"; then
+        safe_gate_err "safe: BLOCKED npm ${subcommand} --global — global dependency mutations have no project lockfile to audit; retry without --global; details: safe explain"
+        return 100
+      fi
+      safe_gate_npm_lockdiff_preflight "${subcommand}" "$@" || return $?
+      # The preflight has inspected the inherited script-policy environment.
+      # Scrub it only after that check, before the real mutation delegates.
+      safe_gate_npm_scrub_script_env
+      safe_gate_exec_real "${tool}" "$@"
+    fi
     safe_gate_npm_scrub_script_env
   fi
 
