@@ -24,9 +24,22 @@ fi
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/safe-live-composer-abbrev.XXXXXX") || exit 1
 trap 'rm -rf -- "$WORK"' EXIT
+mkdir -p "$WORK/work" "$WORK/home"
 
-for token in u up; do
-  if "$real_composer" "$token" --help > "$WORK/$token" 2>&1 \
+# Every real Composer probe runs from an empty project with global plugins,
+# scripts, and cache disabled. The oracle observes dispatch only; it must not
+# activate a project/global plugin or reuse a real Composer cache.
+probe_composer() {
+  (
+    cd "$WORK/work" || exit 1
+    HOME="$WORK/home" \
+      COMPOSER_HOME="$WORK/composer-home" \
+      "$real_composer" --no-plugins --no-scripts --no-cache "$@"
+  )
+}
+
+for token in u up Update; do
+  if probe_composer "$token" --help > "$WORK/$token" 2>&1 \
     && grep -Eq '^[[:space:]]*update[[:space:]]' "$WORK/$token"; then
     pass "composer $token --help resolves to update"
   else
@@ -38,7 +51,7 @@ done
 # for its own help proves dispatch without entering the global project or
 # touching a registry.
 for token in g globa; do
-  if "$real_composer" "$token" --help > "$WORK/global-$token" 2>&1 \
+  if probe_composer "$token" --help > "$WORK/global-$token" 2>&1 \
     && grep -Fq 'Allows running commands in the global composer dir' "$WORK/global-$token"; then
     pass "composer $token --help resolves to global"
   else
@@ -50,19 +63,24 @@ done
 # abbreviations without asking Composer to load config on an install path. A
 # Composer upgrade that adds an exact command overlapping those prefixes must
 # fail loudly here rather than turn that exact command into a false refusal.
-if "$real_composer" list --raw > "$WORK/commands" 2> "$WORK/commands.err"; then
+if probe_composer list --raw > "$WORK/commands" 2> "$WORK/commands.err"; then
   command_count=0
   while read -r command _; do
     [[ -n "$command" ]] || continue
     command_count=$((command_count + 1))
-    if target="$(safe_gate_composer_noncanonical_target "$command")"; then
-      fail "composer exact command $command would refuse as $target"
-    fi
+    # Symfony's retry is case-insensitive. Check both the installed spelling
+    # and an upper-case variant, so an exact built-in always wins before the
+    # gated-prefix refusal regardless of how the user typed it.
+    for spelling in "$command" "${command^^}"; do
+      if target="$(safe_gate_composer_noncanonical_target "$spelling")"; then
+        fail "composer exact command $spelling would refuse as $target"
+      fi
+    done
   done < "$WORK/commands"
   if (( command_count == 0 )); then
     fail 'composer list --raw returned no exact command names'
   else
-    pass "composer list --raw exact commands do not false-refuse ($command_count checked)"
+    pass "composer list --raw exact commands do not false-refuse ($command_count built-ins; case variants checked)"
   fi
 else
   fail 'composer list --raw could not derive the exact-command refusal boundary'

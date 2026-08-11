@@ -634,8 +634,14 @@ SAFE_GATE_COMPOSER_COMMANDS=(
   validate
 )
 
+safe_gate_composer_normalize_token() {
+  local LC_ALL=C
+  printf '%s' "${1,,}"
+}
+
 safe_gate_composer_is_exact_command() {
-  local token="$1" command
+  local token command
+  token="$(safe_gate_composer_normalize_token "$1")"
   for command in "${SAFE_GATE_COMPOSER_COMMANDS[@]}"; do
     [[ "${command}" == "${token}" ]] && return 0
   done
@@ -647,7 +653,9 @@ safe_gate_composer_is_exact_command() {
 # through would let an evolving command table bypass audit. Exact non-gated
 # Composer commands remain passthrough; the live oracle guards that boundary.
 safe_gate_composer_subcommand_class() {
-  case "$1" in
+  local token
+  token="$(safe_gate_composer_normalize_token "$1")"
+  case "${token}" in
     install) printf '%s' install; return 0 ;;
     update) printf '%s' update; return 0 ;;
     require) printf '%s' require; return 0 ;;
@@ -659,7 +667,8 @@ safe_gate_composer_subcommand_class() {
 # deliberately runs only after the exact command check: `init` must not refuse
 # merely because it starts with `in`.
 safe_gate_composer_noncanonical_target() {
-  local token="$1" candidate
+  local token candidate
+  token="$(safe_gate_composer_normalize_token "$1")"
   [[ -n "${token}" ]] || return 1
   safe_gate_composer_is_exact_command "${token}" && return 1
 
@@ -685,7 +694,7 @@ safe_gate_composer_noncanonical_target() {
 # directory, and project scan set are one result rather than independently
 # re-parsed routing facts.
 safe_gate_composer_is_global_proxy() {
-  [[ "$1" == global ]]
+  [[ "$(safe_gate_composer_normalize_token "$1")" == global ]]
 }
 
 # Composer/Symfony application switches from `composer global --help`. The
@@ -700,40 +709,20 @@ safe_gate_composer_application_boolean() {
 }
 
 # PHP treats only a non-empty string other than "0" as truthy. Composer's
-# Factory::getHomeDir uses that rule for COMPOSER_HOME, APPDATA, and HOME.
+# Factory::getHomeDir uses PHP truthiness for home-related environment values.
 safe_gate_composer_php_truthy() {
   [[ -n "$1" && "$1" != "0" ]]
 }
 
-# Composer's PHP process decides Windows from its runtime platform, not from
-# mutable shell OS/OSTYPE values. `uname` supplies the corresponding kernel
-# fact to the bash wrapper without allowing an environment spoof to redirect
-# the scan away from the delegate's global project.
-safe_gate_composer_is_windows() {
-  case "$(command uname -s 2>/dev/null || true)" in
-    MINGW*|MSYS*|CYGWIN*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
 # Mirrors the installed Composer Factory::getHomeDir without running a second
 # Composer process (a config query writes config/auth and cache files before
-# the audit). The installed source has its XDG branch disabled, so its order is
-# truthy COMPOSER_HOME, runtime-Windows APPDATA/Composer, then normalized
-# HOME/.composer.
+# the audit). This fleet is Unix-only, and the installed source has its XDG
+# branch disabled, so its order is truthy COMPOSER_HOME then normalized
+# HOME/.composer. No platform-shaped environment variable selects this target.
 safe_gate_composer_global_home() {
   local home="${COMPOSER_HOME:-}"
   if safe_gate_composer_php_truthy "${home}"; then
     printf '%s' "${home}"
-    return 0
-  fi
-
-  if safe_gate_composer_is_windows; then
-    home="${APPDATA:-}"
-    safe_gate_composer_php_truthy "${home}" || return 1
-    home="${home//\\//}"
-    while [[ "${home}" == */ ]]; do home="${home%/}"; done
-    printf '%s/Composer' "${home%/}"
     return 0
   fi
 
@@ -746,7 +735,7 @@ safe_gate_composer_global_home() {
 
 safe_gate_composer_path_is_absolute() {
   case "$1" in
-    /*|[A-Za-z]:/*|[A-Za-z]:\\*) return 0 ;;
+    /*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -755,7 +744,7 @@ safe_gate_composer_resolve_path() {
   local path="$1" base="$2"
   [[ -n "${path}" ]] || return 1
   case "${path}" in
-    /*|[A-Za-z]:/*|[A-Za-z]:\\*) printf '%s' "${path}" ;;
+    /*) printf '%s' "${path}" ;;
     *) printf '%s/%s' "${base%/}" "${path}" ;;
   esac
 }
@@ -770,7 +759,8 @@ safe_gate_composer_add_scan_target() {
 }
 
 safe_gate_composer_set_noncanonical_refusal() {
-  local token="$1" canonical="$2" nested_global="$3"
+  local token="$1" canonical nested_global="$3"
+  canonical="$(safe_gate_composer_normalize_token "$2")"
   SAFE_GATE_COMPOSER_REFUSE_TOKEN="${token}"
   case "${canonical}" in
     global)
@@ -784,6 +774,11 @@ safe_gate_composer_set_noncanonical_refusal() {
       fi
       ;;
   esac
+  if (( nested_global )); then
+    SAFE_GATE_COMPOSER_SCRIPT_HINT="composer global run-script ${token}"
+  else
+    SAFE_GATE_COMPOSER_SCRIPT_HINT="composer run-script ${token}"
+  fi
 }
 
 # One composer routing pass. For a recognized global proxy it records all
@@ -807,6 +802,7 @@ safe_gate_composer_route() {
   SAFE_GATE_COMPOSER_BADFLAG=""
   SAFE_GATE_COMPOSER_REFUSE_TOKEN=""
   SAFE_GATE_COMPOSER_REFUSE_HINT=""
+  SAFE_GATE_COMPOSER_SCRIPT_HINT=""
   safe_gate_scan_target_flags composer "$@"
 
   for (( i=0; i<${#args[@]}; i++ )); do
@@ -957,10 +953,16 @@ safe_gate_composer_scan_targets() {
 # widened dispatch must use its single classifier; other tools retain their
 # existing literal routing semantics.
 safe_gate_audit_op() {
-  local npm_class=""
+  local npm_class="" composer_token=""
   if [[ "${SAFE_GATE_TOOL:-}" == "npm" ]]; then
     npm_class="$(safe_gate_npm_subcommand_class "${SAFE_GATE_SUBCMD:-}")" || npm_class=""
     [[ "${npm_class}" == "update" ]] && { printf '%s' update; return 0; }
+    printf '%s' install
+    return 0
+  fi
+  if [[ "${SAFE_GATE_TOOL:-}" == "composer" ]]; then
+    composer_token="$(safe_gate_composer_normalize_token "${SAFE_GATE_SUBCMD:-}")"
+    [[ "${composer_token}" == update ]] && { printf '%s' update; return 0; }
     printf '%s' install
     return 0
   fi
@@ -2277,14 +2279,17 @@ safe_gate_composer_packages() {
         options_ended=1
         continue
         ;;
-      --dev|--update-no-dev|--update-with-dependencies|--update-with-all-dependencies|--ignore-platform-reqs|--no-update|--no-scripts|--no-progress|--no-install|--prefer-source|--prefer-dist|--prefer-install|--sort-packages|--optimize-autoloader|--classmap-authoritative|--apcu-autoloader)
+      --dev|--dry-run|--prefer-source|--prefer-dist|--fixed|--no-suggest|--no-progress|--no-update|--no-install|--no-audit|--no-security-blocking|--no-blocking|--update-no-dev|--update-with-dependencies|--update-with-all-dependencies|--with-dependencies|--with-all-dependencies|--ignore-platform-reqs|--prefer-stable|--prefer-lowest|--minimal-changes|--sort-packages|--optimize-autoloader|--classmap-authoritative|--apcu-autoloader|--no-scripts|--no-cache)
         continue
         ;;
-      --working-dir|-d|--repository)
+      # RequireCommand declares these four values; the application definition
+      # contributes --working-dir/-d. Every space-form value must be skipped
+      # so an optional interactive package argument cannot be fabricated.
+      --working-dir|-d|--repository|--prefer-install|--audit-format|--ignore-platform-req|--apcu-autoloader-prefix)
         skip_next=1
         continue
         ;;
-      --working-dir=*|-d?*|--repository=*|--prefer-install=*)
+      --working-dir=*|-d?*|--repository=*|--prefer-install=*|--audit-format=*|--ignore-platform-req=*|--apcu-autoloader-prefix=*)
         continue
         ;;
       -*)
@@ -3291,7 +3296,7 @@ safe_gate_composer() {
       return 100
       ;;
     4)
-      safe_gate_err "safe: BLOCKED composer ${SAFE_GATE_COMPOSER_REFUSE_TOKEN} — spell it canonically: ${SAFE_GATE_COMPOSER_REFUSE_HINT}; details: safe explain"
+      safe_gate_err "safe: BLOCKED composer ${SAFE_GATE_COMPOSER_REFUSE_TOKEN} — spell it canonically (${SAFE_GATE_COMPOSER_REFUSE_HINT}) or, if '${SAFE_GATE_COMPOSER_REFUSE_TOKEN}' is a project script, run it via ${SAFE_GATE_COMPOSER_SCRIPT_HINT}; details: safe explain"
       return 100
       ;;
     5)

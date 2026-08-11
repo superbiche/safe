@@ -1451,7 +1451,7 @@ case_composer_canonical_or_refuse() {
   local token command args
 
   # Only the three canonical top-level gated spellings audit and delegate.
-  for token in install update; do
+  for token in install update Update; do
     : > "${LOG_FILE}"
     SAFE_INSTALL_TEST_SCRIPT="composer ${token}" run_zsh
     assert_status 0 "$FUNCNAME" || return
@@ -1463,6 +1463,14 @@ case_composer_canonical_or_refuse() {
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tcheck\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_contains $'REAL\tcomposer\trequire\tvendor/okpkg:^1' "$FUNCNAME" || return
+
+  # Symfony retries command matches case-insensitively. Exact built-ins keep
+  # their priority, while canonical mixed-case gated names enter the same lane.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer Init' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\tInit' "$FUNCNAME" || return
 
   # Exact command names always remain dispatchable. `require` gets an
   # explicit package because its intentional interactive zero-package refusal
@@ -1483,7 +1491,8 @@ case_composer_canonical_or_refuse() {
     SAFE_INSTALL_TEST_SCRIPT="composer ${token} vendor/okpkg:^1" run_zsh
     assert_status 100 "$FUNCNAME" || return
     [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
-    assert_err_contains_fragment 'spell it canonically:' "$FUNCNAME" || return
+    assert_err_contains_fragment 'spell it canonically (composer' "$FUNCNAME" || return
+    assert_err_contains_fragment "or, if '${token}' is a project script, run it via composer run-script ${token}" "$FUNCNAME" || return
     assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
     assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
   done
@@ -1495,7 +1504,21 @@ case_composer_canonical_or_refuse() {
     SAFE_INSTALL_TEST_SCRIPT="composer global ${token} vendor/okpkg:^1" run_zsh
     assert_status 100 "$FUNCNAME" || return
     [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
-    assert_err_contains_fragment 'spell it canonically: composer global' "$FUNCNAME" || return
+    assert_err_contains_fragment 'spell it canonically (composer global' "$FUNCNAME" || return
+    assert_err_contains_fragment "composer global run-script ${token}" "$FUNCNAME" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+  done
+
+  # A mixed-case alias and prefix resolve in Symfony but must still fail closed
+  # before any gate side effect. The original spelling stays in the script
+  # escape hatch so a deliberate project command remains reachable.
+  for token in U ReQu gLoBa; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer ${token} vendor/okpkg:^1" run_zsh
+    assert_status 100 "$FUNCNAME" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+    assert_err_contains_fragment "or, if '${token}' is a project script, run it via composer run-script ${token}" "$FUNCNAME" || return
     assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
     assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
   done
@@ -1521,6 +1544,37 @@ case_composer_canonical_or_refuse() {
     assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
     assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
   done
+
+  # RequireCommand's value-taking options are not package operands. They must
+  # reach the same zero-package refusal in both top-level and global lanes.
+  for command in require 'global require'; do
+    for option in --prefer-install --audit-format --ignore-platform-req --apcu-autoloader-prefix; do
+      : > "${LOG_FILE}"
+      SAFE_INSTALL_TEST_SCRIPT="composer ${command} ${option} vendor/okpkg:^1" run_zsh
+      assert_status 100 "$FUNCNAME" || return
+      [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+      assert_err_contains_fragment 'specify at least one package explicitly' "$FUNCNAME" || return
+      assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+      assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+    done
+  done
+
+  for command in require 'global require'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer ${command} --audit-format=vendor/okpkg:^1" run_zsh
+    assert_status 100 "$FUNCNAME" || return
+    assert_err_contains_fragment 'specify at least one package explicitly' "$FUNCNAME" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+  done
+
+  # The option terminator changes the boundary: a following token is a real
+  # explicit package.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer require -- vendor/okpkg:^1' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\trequire\t--\tvendor/okpkg:^1' "$FUNCNAME" || return
 
   pass "$FUNCNAME"
 }
@@ -1572,6 +1626,14 @@ case_composer_global_canonical_routing() {
   assert_log_contains $'AUDIT\tcheck\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_contains $'REAL\tcomposer\tglobal\trequire\tvendor/okpkg:^1' "$FUNCNAME" || return
 
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT='composer global Require vendor/okpkg:^1' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_scan_targets_logged "$FUNCNAME" "${global_home}" || return
+  assert_log_contains $'AUDIT\tcheck\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\tglobal\tRequire\tvendor/okpkg:^1' "$FUNCNAME" || return
+
   # Factory uses PHP truthiness: unset, empty, and literal "0" select the
   # platform home, while an ordinary COMPOSER_HOME selects itself.
   : > "${LOG_FILE}"
@@ -1599,15 +1661,14 @@ case_composer_global_canonical_routing() {
   assert_status 0 "$FUNCNAME" || return
   assert_scan_targets_logged "$FUNCNAME" "${ordinary_home}" || return
 
-  # Mutable OS/APPDATA must not redirect a Linux Composer scan to a Windows
-  # home. Factory uses PHP's runtime platform; the gate uses uname likewise.
+  # This Unix-only resolver ignores all Windows-shaped environment variables.
   : > "${LOG_FILE}"
-  OS=Windows_NT APPDATA="${CASE_DIR}/absent-appdata" COMPOSER_HOME='' \
-    SAFE_AUDIT_EXPECT_PROJECTS=1 SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${default_home}" \
-    SAFE_INSTALL_TEST_SCRIPT='composer global update' run_zsh
+  COMPOSER_HOME='' SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${default_home}" \
+    SAFE_INSTALL_TEST_SCRIPT="env OS=Windows_NT OSTYPE=msys APPDATA=${CASE_DIR}/absent-appdata composer global update" run_zsh
   assert_status 102 "$FUNCNAME" || return
   assert_scan_targets_logged "$FUNCNAME" "${default_home}" || return
-  assert_log_not_contains_fragment 'absent-appdata/Composer' "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'absent-appdata' "$FUNCNAME" || return
 
   # Factory normalizes Unix HOME before appending .composer.
   : > "${LOG_FILE}"
@@ -1675,7 +1736,8 @@ case_composer_global_canonical_routing() {
     ' global update --working-dir relative' \
     ' global --working-dir=relative update' \
     ' global -d relative update' \
-    ' global -drelative update'; do
+    ' global -drelative update' \
+    ' global -d C:/relative update'; do
     : > "${LOG_FILE}"
     COMPOSER_HOME="${global_home}" SAFE_INSTALL_TEST_SCRIPT="composer${args}" run_zsh
     assert_status 100 "$FUNCNAME" || return
