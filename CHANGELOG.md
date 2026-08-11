@@ -7,7 +7,11 @@
   npm uses a checked-in full command/alias snapshot with exact alias priority,
   so non-fetch aliases such as `c` and `un` stay passthrough while abbreviated
   fetch routes (including alias prefixes such as `ad` and `dd`) are audited.
-  Composer keeps its original token for Symfony Console to settle ambiguity.
+  npm's camel-case command normalization and Composer's `global` install/update
+  routes (including post-`global` options) receive the same audit coverage.
+  Original tokens are preserved on delegated paths; safe may conservatively
+  refuse a gated-looking ambiguity before npm or Composer reports its own
+  ambiguity error.
 
 - Fresh releases whose initial Socket score times out now receive one bounded
   patience retry (`install.socket.fresh_scan_budget_seconds`, default 90s).

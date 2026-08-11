@@ -161,6 +161,11 @@ fi
       printf 'AUDITENV_B64\t%s=%s\n' "${env_name}" "$(printf '%s' "${!env_name}" | base64 -w0)"
     fi
   done
+  # Global-Composer routing must scan the global project rather than the
+  # caller's cwd. Only the focused regression sets this fixture assertion.
+  if [[ -n "${SAFE_AUDIT_EXPECT_PROJECT:-}" ]]; then
+    printf 'AUDITPROJECT\t%s\n' "$PWD"
+  fi
 } >> "${SAFE_INSTALL_COMMAND_LOG}"
 
 if [[ "${1:-}" == "scan" ]]; then
@@ -478,6 +483,8 @@ run_zsh() {
     SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT="${SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT:-}" \
     SAFE_INSTALL_TIMEOUT_SECONDS="${SAFE_INSTALL_TIMEOUT_SECONDS:-}" \
     SAFE_INSTALL_REAL_STATUS="${SAFE_INSTALL_REAL_STATUS:-}" \
+    COMPOSER_HOME="${COMPOSER_HOME:-}" \
+    SAFE_AUDIT_EXPECT_PROJECT="${SAFE_AUDIT_EXPECT_PROJECT:-}" \
     NPM_LOCK_MUTATION_JSON="${NPM_LOCK_MUTATION_JSON:-}" \
     NPM_CONFIG_PACKAGE_LOCK="${NPM_CONFIG_PACKAGE_LOCK:-}" \
     npm_config_package_lock="${npm_config_package_lock:-}" \
@@ -1343,8 +1350,9 @@ case_npm_alias_prefixes_and_priority() {
   assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
   assert_log_contains $'REAL\tnpm\tun\tblockme' "$FUNCNAME" || return
 
-  # Ambiguous npm spellings may be conservatively routed, but safe must keep
-  # their original argv so the real npm command remains the error authority.
+  # Ambiguous npm spellings may be conservatively routed. A clean path keeps
+  # original argv for the real command; a gated-looking ambiguity may instead
+  # be refused before delegation.
   for token in is ex cl; do
     : > "${LOG_FILE}"
     SAFE_INSTALL_REAL_STATUS=1 SAFE_INSTALL_TEST_SCRIPT="npm ${token}" run_zsh
@@ -1352,6 +1360,47 @@ case_npm_alias_prefixes_and_priority() {
     assert_log_contains $'REAL\tnpm\t'"${token}" "$FUNCNAME" || return
   done
   unset SAFE_INSTALL_REAL_STATUS
+
+  pass "$FUNCNAME"
+}
+
+case_npm_camelcase_dispatch_and_conservative_ambiguity() {
+  prepare_case "npm-camelcase-dispatch"
+  touch "${WORK_DIR}/package.json"
+
+  # npm normalizes installTest to install-test before dispatch. The canary
+  # proves the gate does the same before the real command can fetch it.
+  SAFE_INSTALL_TEST_SCRIPT='npm installTest blockme' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm\tinstallTest\tblockme' "$FUNCNAME" || return
+
+  # Hyphenated ci commands also normalize before npm resolves aliases/prefixes;
+  # their no-package lane scans and still delegates the original spelling.
+  for token in cleanInstall installCiTest; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="npm ${token}" run_zsh
+    assert_status 0 "$FUNCNAME" || return
+    assert_project_scan_logged "$FUNCNAME" || return
+    assert_log_contains $'REAL\tnpm\t'"${token}" "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'AUDIT\tcheck' "$FUNCNAME" || return
+  done
+
+  # distTag normalizes to npm's non-gated dist-tag command and stays a
+  # passthrough despite sharing the same camel-case normalization.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm distTag latest' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tdistTag\tlatest' "$FUNCNAME" || return
+
+  # `ex` can look like npm exec but npm itself considers it ambiguous. Policy
+  # deliberately permits this fail-closed pre-delegation refusal.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm ex --bogus' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+  assert_log_not_contains_fragment $'REAL\tnpm\tex' "$FUNCNAME" || return
 
   pass "$FUNCNAME"
 }
@@ -1400,6 +1449,66 @@ case_composer_abbreviation_classifier_routes() {
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tcheck\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_contains $'REAL\tcomposer\tglobal\trequ\tvendor/okpkg:^1' "$FUNCNAME" || return
+
+  # Composer global runs nested install/update from COMPOSER_HOME. The
+  # install canary must be stopped by the global-project scan before it can
+  # delegate; update aliases prove the ordinary scan-and-delegate paths.
+  local global_home="${HOME_DIR}/composer-global"
+  mkdir -p "${global_home}"
+  touch "${global_home}/composer.json"
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECT="${global_home}" \
+    SAFE_AUDIT_SCAN_CRITICAL=1 SAFE_INSTALL_TEST_SCRIPT='composer global i' run_zsh
+  assert_status 102 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_log_contains $'AUDITPROJECT\t'"${global_home}" "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tcomposer\tglobal\ti' "$FUNCNAME" || return
+
+  for token in u up; do
+    : > "${LOG_FILE}"
+    COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECT="${global_home}" \
+      SAFE_INSTALL_TEST_SCRIPT="composer global ${token}" run_zsh
+    assert_status 0 "$FUNCNAME" || return
+    assert_project_scan_logged "$FUNCNAME" || return
+    assert_log_contains $'AUDITPROJECT\t'"${global_home}" "$FUNCNAME" || return
+    assert_log_contains $'REAL\tcomposer\tglobal\t'"${token}" "$FUNCNAME" || return
+  done
+
+  # Without COMPOSER_HOME, the installed Composer source uses HOME/.composer.
+  # Pin that platform default independently of the explicit-home route.
+  local default_global_home="${HOME_DIR}/.composer"
+  mkdir -p "${default_global_home}"
+  touch "${default_global_home}/composer.json"
+  : > "${LOG_FILE}"
+  COMPOSER_HOME='' SAFE_AUDIT_EXPECT_PROJECT="${default_global_home}" \
+    SAFE_INSTALL_TEST_SCRIPT='composer global up' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_log_contains $'AUDITPROJECT\t'"${default_global_home}" "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\tglobal\tup' "$FUNCNAME" || return
+
+  # Options after global precede the nested command. Boolean and value forms
+  # must not hide require/update or move their package boundary.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer global --no-interaction requ vendor/okpkg:^1' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\tglobal\t--no-interaction\trequ\tvendor/okpkg:^1' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_home}" SAFE_AUDIT_EXPECT_PROJECT="${global_home}" \
+    SAFE_INSTALL_TEST_SCRIPT='composer global --no-interaction u' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_log_contains $'AUDITPROJECT\t'"${global_home}" "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\tglobal\t--no-interaction\tu' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer global --working-dir /tmp requ vendor/okpkg:^1' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tcheck\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall\t--project-dir\t/tmp' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'\t/tmp@latest' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\tglobal\t--working-dir\t/tmp\trequ\tvendor/okpkg:^1' "$FUNCNAME" || return
 
   for token in rei rem; do
     : > "${LOG_FILE}"
@@ -4719,6 +4828,7 @@ main() {
     case_update_family_gates \
     case_npm_abbreviation_classifier_gates_and_preserves_argv \
     case_npm_alias_prefixes_and_priority \
+    case_npm_camelcase_dispatch_and_conservative_ambiguity \
     case_non_npm_abbreviations_stay_passthrough \
     case_composer_abbreviation_classifier_routes \
     case_npm_dedupe_lockdiff_empty_delegates_without_scan \

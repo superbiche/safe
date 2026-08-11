@@ -54,5 +54,36 @@ else
   fail "npm command or alias map drifted; update the snapshot and classifier deliberately"
 fi
 
+# npm first turns camelCase into kebab-case, then runs the same alias and
+# abbreviation dereference. Generate every hyphenated command/alias spelling
+# from the gated families and compare npm's live target with the shipped
+# classifier. This is read-only: Node imports cmd-list.js only.
+if ! node - "$cmd_list" > "$WORK/camel" <<'NODE'
+const { commands, aliases, deref } = require(process.argv[2])
+const gated = new Set(['install', 'install-test', 'ci', 'install-ci-test', 'update', 'exec', 'dedupe', 'prune'])
+const camelize = token => token.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())
+for (const token of [...commands, ...Object.keys(aliases)]) {
+  const variant = camelize(token)
+  if (variant === token) continue
+  const target = deref(variant)
+  if (gated.has(target)) process.stdout.write(`${variant}\t${target}\n`)
+}
+NODE
+then
+  fail "installed npm cmd-list.js could not generate camel-case dereferences"
+else
+  camel_bad=""
+  while IFS=$'\t' read -r token target; do
+    expected="$(safe_gate_npm_target_class "$target" 2>/dev/null || true)"
+    actual="$(safe_gate_npm_subcommand_class "$token" 2>/dev/null || true)"
+    [[ "$actual" == "$expected" ]] || camel_bad="${camel_bad} ${token}=${actual:-passthrough}/${expected:-passthrough}"
+  done < "$WORK/camel"
+  if [[ -z "$camel_bad" ]]; then
+    pass "camel-case gated dispatch matches the real npm dereference"
+  else
+    fail "npm camel-case classifier drift:${camel_bad}"
+  fi
+fi
+
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

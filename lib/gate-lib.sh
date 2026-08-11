@@ -555,19 +555,39 @@ safe_gate_npm_target_class() {
   esac
 }
 
-# Classifies npm's first command token without rewriting it. Exact aliases are
-# resolved first over the FULL alias map, preserving npm's own priority (for
-# example `c` remains config rather than a ci prefix). For non-alias tokens,
-# npm accepts a two-character-or-longer unique prefix of canonical commands
-# and alias keys. We conservatively route any such gated candidate and delegate
-# the untouched token so npm remains the authority on genuine ambiguity.
+# npm's cmd-list normalizes every uppercase letter to `-` plus its lowercase
+# form before exact command, alias, and abbreviation dispatch. Classification
+# must mirror that normalization, but callers deliberately keep the original
+# argv token for every path that reaches the real npm delegate.
+safe_gate_npm_normalize_subcommand() {
+  local token="$1" normalized="" char i
+  local LC_ALL=C
+
+  for (( i=0; i<${#token}; i++ )); do
+    char="${token:i:1}"
+    case "${char}" in
+      [A-Z]) normalized+="-${char,,}" ;;
+      *) normalized+="${char}" ;;
+    esac
+  done
+  printf '%s' "${normalized}"
+}
+
+# Classifies npm's normalized first command token. Exact aliases are resolved
+# first over the FULL alias map, preserving npm's own priority (for example
+# `c` remains config rather than a ci prefix). For non-alias tokens, npm
+# accepts a two-character-or-longer unique prefix of canonical commands and
+# alias keys. We conservatively route any such gated candidate. The original
+# token is delegated unchanged on every path that reaches delegation, but safe
+# may refuse a gated-looking ambiguous invocation before npm can report it.
 #
 # Multiple gated candidates use this precedence: ci (no package argv), then
 # lockdiff (projection), then install, update, and exec. Today collisions are
 # confined to equivalent or stricter lanes; the ordering keeps a new collision
 # from becoming a passthrough.
 safe_gate_npm_subcommand_class() {
-  local token="$1" target="" candidate="" pair="" class=""
+  local token="" target="" candidate="" pair="" class=""
+  token="$(safe_gate_npm_normalize_subcommand "$1")"
 
   if target="$(safe_gate_npm_alias_target "${token}")"; then
     target="$(safe_gate_npm_deref_alias "${target}")" || return 1
@@ -605,8 +625,9 @@ safe_gate_npm_subcommand_class() {
 # Composer has explicit aliases in addition to Symfony Console's command
 # prefixes. The aliases must win first: `r` is require even though `re` is an
 # ambiguity with remove/reinstall. Prefixes intentionally over-match
-# ambiguity: the gate audits, delegates the original token, and Composer emits
-# its own command error. `rei*` and `rem*` do not prefix a gated family.
+# ambiguity: every route that reaches delegation preserves the original token,
+# while safe may refuse first on a gated-looking ambiguous invocation. `rei*`
+# and `rem*` do not prefix a gated family.
 safe_gate_composer_subcommand_class() {
   local token="$1"
   case "${token}" in
@@ -624,6 +645,107 @@ safe_gate_composer_subcommand_class() {
   else
     return 1
   fi
+}
+
+# Composer's `global` proxy accepts the application options below before the
+# nested command. This is the complete value/boolean split shown by
+# `composer global --help`; a missing entry over-refuses rather than letting an
+# option value hide a fetching nested command.
+safe_gate_composer_global_subcommand() {
+  local -a args=("$@")
+  local val_alt='-d|--working-dir'
+  local bool_alt='-h|--help|-q|--quiet|-V|--version|--ansi|--no-ansi|-n|--no-interaction|--profile|--no-plugins|--no-scripts|--no-cache|-v|-vv|-vvv|--verbose'
+  local arg next i
+  SAFE_GATE_COMPOSER_GLOBAL_SUBCMD=""
+  SAFE_GATE_COMPOSER_GLOBAL_SUBCMD_IDX=-1
+  SAFE_GATE_COMPOSER_GLOBAL_BADFLAG=""
+
+  for (( i=0; i<${#args[@]}; i++ )); do
+    arg="${args[$i]}"
+    case "${arg}" in
+      --)
+        if (( i + 1 < ${#args[@]} )); then
+          SAFE_GATE_COMPOSER_GLOBAL_SUBCMD="${args[$((i + 1))]}"
+          SAFE_GATE_COMPOSER_GLOBAL_SUBCMD_IDX=$((i + 1))
+        fi
+        return 0
+        ;;
+      --*=*|-*=*) continue ;;
+      -?*)
+        if safe_gate_alt_match "${arg}" "${val_alt}"; then
+          if (( i + 1 >= ${#args[@]} )); then
+            SAFE_GATE_COMPOSER_GLOBAL_BADFLAG="${arg}"
+            return 2
+          fi
+          i=$((i + 1))
+        elif safe_gate_alt_match "${arg}" "${bool_alt}"; then
+          next="${args[$((i + 1))]:-}"
+          case "${next,,}" in
+            true|false) i=$((i + 1)) ;;
+          esac
+        else
+          SAFE_GATE_COMPOSER_GLOBAL_BADFLAG="${arg}"
+          return 2
+        fi
+        ;;
+      *)
+        SAFE_GATE_COMPOSER_GLOBAL_SUBCMD="${arg}"
+        SAFE_GATE_COMPOSER_GLOBAL_SUBCMD_IDX=${i}
+        return 0
+        ;;
+    esac
+  done
+  return 0
+}
+
+# Mirrors Composer Factory::getHomeDir without executing a second Composer
+# process. The installed Composer source gives COMPOSER_HOME priority, then
+# APPDATA/Composer on Windows, then the Unix default ~/.composer. Querying
+# `composer config --global home` is unsuitable here: it creates config/auth
+# and cache files before the audit has run.
+safe_gate_composer_global_home() {
+  local home="${COMPOSER_HOME:-}"
+  if [[ -n "${home}" ]]; then
+    printf '%s' "${home}"
+    return 0
+  fi
+
+  if [[ "${OS:-}" == "Windows_NT" || "${OSTYPE:-}" == msys* || \
+        "${OSTYPE:-}" == cygwin* ]]; then
+    [[ -n "${APPDATA:-}" ]] || return 1
+    home="${APPDATA//\\//}"
+    printf '%s/Composer' "${home%/}"
+    return 0
+  fi
+
+  [[ -n "${HOME:-}" ]] || return 1
+  printf '%s/.composer' "${HOME%/}"
+}
+
+# A global install/update operates from Composer's global project, not from
+# the caller's cwd. Match the top-level Composer lane: only scan when that
+# project has composer metadata; an absent project cannot supply dependencies
+# for Composer to install or update.
+safe_gate_scan_composer_global_project() {
+  local global_home="" scan_rc
+  global_home="$(safe_gate_composer_global_home)" || {
+    safe_gate_err "safe: BLOCKED composer global — cannot resolve the Composer global project for audit; set COMPOSER_HOME or repair the Composer environment; details: safe explain"
+    return 100
+  }
+  [[ -d "${global_home}" ]] || return 0
+
+  (
+    cd "${global_home}" || exit 125
+    if safe_gate_composer_project_present; then
+      safe_gate_scan_project
+    fi
+  )
+  scan_rc=$?
+  if (( scan_rc == 125 )); then
+    safe_gate_err "safe: BLOCKED composer global — cannot enter the Composer global project for audit; repair its directory permissions, then retry; details: safe explain"
+    return 100
+  fi
+  return "${scan_rc}"
 }
 
 # Update-family subcommands resolve in-range instead of to the dist-tag; the
@@ -2947,32 +3069,49 @@ safe_gate_composer() {
   safe_gate_scan_target_flags composer "$@"
   local first="${SAFE_GATE_SUBCMD}"
   local subidx=$SAFE_GATE_SUBCMD_IDX
-  local second="${@:subidx+1:1}"
-  local first_class="" second_class=""
+  local first_class="" nested_class=""
+  local -a global_args=()
   first_class="$(safe_gate_composer_subcommand_class "${first}")" || first_class=""
-  second_class="$(safe_gate_composer_subcommand_class "${second}")" || second_class=""
   local -a packages=()
 
-  if [[ "${first}" != "global" || "${second_class}" != "require" ]]; then
-    if [[ -n "${first_class}" ]]; then
-      if safe_gate_composer_project_present; then
-        safe_gate_scan_project || return $?
-      fi
+  if [[ "${first}" == "global" ]]; then
+    global_args=("${@:subidx+1}")
+    safe_gate_composer_global_subcommand "${global_args[@]}"
+    case $? in
+      2)
+        safe_gate_err "safe: BLOCKED composer global — cannot find the nested command past unrecognized flag '${SAFE_GATE_COMPOSER_GLOBAL_BADFLAG}'; to allow: rewrite it as '${SAFE_GATE_COMPOSER_GLOBAL_BADFLAG}=<value>', then retry; details: safe explain"
+        return 100
+        ;;
+    esac
+    nested_class="$(safe_gate_composer_subcommand_class "${SAFE_GATE_COMPOSER_GLOBAL_SUBCMD}")" || nested_class=""
 
-      if [[ "${first_class}" == "require" ]]; then
-        safe_gate_collect packages "$(safe_gate_composer_packages "${@:subidx+1}")"
+    case "${nested_class}" in
+      install|update)
+        safe_gate_scan_composer_global_project || return $?
+        ;;
+      require)
+        safe_gate_collect packages "$(safe_gate_composer_packages "${global_args[@]:SAFE_GATE_COMPOSER_GLOBAL_SUBCMD_IDX+1}")"
         if (( ${#packages[@]} > 0 )); then
           safe_gate_check_many composer "${packages[@]}" || return $?
         fi
-      fi
-    fi
+        ;;
+    esac
 
     safe_gate_exec_real composer "$@"
+    return $?
   fi
 
-  safe_gate_collect packages "$(safe_gate_composer_packages "${@:subidx+2}")"
-  if (( ${#packages[@]} > 0 )); then
-    safe_gate_check_many composer "${packages[@]}" || return $?
+  if [[ -n "${first_class}" ]]; then
+    if safe_gate_composer_project_present; then
+      safe_gate_scan_project || return $?
+    fi
+
+    if [[ "${first_class}" == "require" ]]; then
+      safe_gate_collect packages "$(safe_gate_composer_packages "${@:subidx+1}")"
+      if (( ${#packages[@]} > 0 )); then
+        safe_gate_check_many composer "${packages[@]}" || return $?
+      fi
+    fi
   fi
 
   safe_gate_exec_real composer "$@"
