@@ -4368,13 +4368,47 @@ EOF
   assert_status 102 "$FUNCNAME" || return
   [[ ! -e "${CASE_DIR}/delegate.log" ]] || { fail "$FUNCNAME"; return; }
 
-  for runner in /tmp/safe-run-absolute ./safe-run-relative; do
+  # F1 (PR#72 review): plain relative paths, trailing slashes, and the bare
+  # path operands are command paths too — never the invalid-package 103 lane.
+  for runner in /tmp/safe-run-absolute ./safe-run-relative ../safe-run-parent tools/npm npm/ . ..; do
     SAFE_RUN_DELEGATE_RC=0 run_safe_runner "${ROOT_DIR}/bin/safe-run" "${runner}" update tar
     assert_status 100 "$FUNCNAME" || return
     grep -Fq 'command paths are unsupported' "${ERR_FILE}" || { fail "$FUNCNAME"; return; }
     [[ "$(grep -c . "${ERR_FILE}")" == "1" ]] || { fail "$FUNCNAME"; return; }
   done
   grep -Fq 'UNSUPPORTED_COMMAND_PATH' "${CASE_DIR}/run-data/audit.log" || { fail "$FUNCNAME"; return; }
+
+  # ...while a scoped npm spec's slash keeps the package lane (non-TTY
+  # unknown → 102, and never the command-path refusal).
+  SAFE_RUN_DELEGATE_RC=0 run_safe_runner "${ROOT_DIR}/bin/safe-run" @scope/pkg --help
+  assert_status 102 "$FUNCNAME" || return
+  grep -Fq 'command paths are unsupported' "${ERR_FILE}" && { fail "$FUNCNAME"; return; }
+
+  # F2 (PR#72 review): --no-install is a strict local-only contract; a
+  # gate-listed bare tool must NOT silently delegate past it. With no local
+  # node_modules/.bin/npm the package lane refuses (100) and nothing execs.
+  rm -f "${CASE_DIR}/delegate.log"
+  SAFE_RUN_DELEGATE_RC=0 run_safe_runner "${ROOT_DIR}/bin/safe-run" --no-install npm exec cowsay
+  assert_status 100 "$FUNCNAME" || return
+  grep -Fq -- '--no-install requested' "${ERR_FILE}" || { fail "$FUNCNAME"; return; }
+  [[ ! -e "${CASE_DIR}/delegate.log" ]] || { fail "$FUNCNAME"; return; }
+
+  # F3 (PR#72 review): a trailing empty PATH component means the current
+  # directory in shell lookup. Probe the SHIPPED walker under a fully
+  # synthetic PATH (set inside the child, after sourcing, so the fixture
+  # never depends on host /usr/bin contents).
+  local cwd_gate="${CASE_DIR}/cwd-gate" cwd_candidate
+  mkdir -p "${cwd_gate}"
+  cp "${delegate_target}" "${cwd_gate}/npm"
+  chmod +x "${cwd_gate}/npm"
+  cwd_candidate=$(SAFE_RUN_NO_INIT=1 SAFE_RUN_PATH="${ROOT_DIR}/bin/safe-run" CWD_GATE="${cwd_gate}" bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    cd "$CWD_GATE" || exit 1
+    PATH="/nonexistent-first:"
+    safe_run_first_path_candidate npm
+  ' safe-run)
+  [[ "$cwd_candidate" == "./npm" ]] || { fail "$FUNCNAME"; return; }
 
   # A linked npx/bunx/uvx target must fail before it can recurse into safe-run.
   rm -f "${gate_bin}/npm"

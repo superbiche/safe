@@ -397,11 +397,16 @@ safe_run_is_gated_tool() {
 # the shell's PATH order without resolving aliases, functions, or hashes: only
 # an executable file can safely be exec'd as the delegation target.
 safe_run_first_path_candidate() {
-  local tool="$1" dir candidate
-  local -a path_dirs=()
-
-  IFS=':' read -r -a path_dirs <<< "${PATH:-}"
-  for dir in "${path_dirs[@]}"; do
+  local tool="$1" dir candidate rest
+  # Manual walk instead of `IFS=: read -a`: read drops a trailing empty
+  # field, and an empty PATH component (leading, interior, or trailing)
+  # means the current directory in shell lookup. Appending one delimiter
+  # makes every component — empties included — visible to the loop.
+  [[ -n "${PATH:-}" ]] || return 1
+  rest="${PATH}:"
+  while [[ -n "$rest" ]]; do
+    dir="${rest%%:*}"
+    rest="${rest#*:}"
     [[ -n "$dir" ]] || dir="."
     candidate="${dir%/}/${tool}"
     [[ -f "$candidate" && -x "$candidate" ]] || continue
@@ -453,6 +458,10 @@ delegate_gated_tool_if_applicable() {
   shift
 
   safe_run_is_gated_tool "$requested" || return 0
+  # --no-install is a strict local-only contract (run node_modules/.bin or
+  # refuse): delegating would silently discard it and let the delegate fetch.
+  # The package lane's local-bin-or-refuse enforcement is the honest path.
+  [[ "$NPX_NO_INSTALL" == "1" ]] && return 0
   runner=$(runner_label_for_kind)
   target_status=0
   target=$(safe_run_find_gate_bound_target "$requested") || target_status=$?
@@ -1299,7 +1308,12 @@ parse_runner_args() {
   fi
   RUN_ARGS=("${positional[@]:1}")
   case "${positional[0]}" in
-    /*|./*|../*) refuse_command_path "${positional[0]}" ;;
+    # Scoped npm specs (@scope/name) legitimately carry a slash and stay on
+    # the package lane; every other slash-bearing operand (absolute,
+    # dot-relative, plain relative like tools/npm, trailing npm/) and the
+    # bare path operands . / .. are command paths, not package names.
+    @*) ;;
+    .|..|*/*) refuse_command_path "${positional[0]}" ;;
   esac
   delegate_gated_tool_if_applicable "${positional[0]}" "${RUN_ARGS[@]+"${RUN_ARGS[@]}"}"
   if [[ "$ALLOW_NETWORK" != "1" && "$PROXY_PASSTHROUGH" == "1" ]]; then
