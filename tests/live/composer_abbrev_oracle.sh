@@ -46,5 +46,27 @@ for token in g globa; do
   fi
 done
 
+# The gate ships a command snapshot so it can refuse gated-looking aliases and
+# abbreviations without asking Composer to load config on an install path. A
+# Composer upgrade that adds an exact command overlapping those prefixes must
+# fail loudly here rather than turn that exact command into a false refusal.
+if "$real_composer" list --raw > "$WORK/commands" 2> "$WORK/commands.err"; then
+  command_count=0
+  while read -r command _; do
+    [[ -n "$command" ]] || continue
+    command_count=$((command_count + 1))
+    if target="$(safe_gate_composer_noncanonical_target "$command")"; then
+      fail "composer exact command $command would refuse as $target"
+    fi
+  done < "$WORK/commands"
+  if (( command_count == 0 )); then
+    fail 'composer list --raw returned no exact command names'
+  else
+    pass "composer list --raw exact commands do not false-refuse ($command_count checked)"
+  fi
+else
+  fail 'composer list --raw could not derive the exact-command refusal boundary'
+fi
+
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

@@ -2,18 +2,20 @@
 
 ## Unreleased
 
-- npm and Composer gate routing now covers their install, update, ci/require,
-  exec, and npm lock-diff command aliases and abbreviations before delegation.
-  npm uses a checked-in full command/alias snapshot with exact alias priority,
-  so non-fetch aliases such as `c` and `un` stay passthrough while abbreviated
-  fetch routes (including alias prefixes such as `ad` and `dd`) are audited.
-  npm's camel-case command normalization and Composer's abbreviated `global`
-  proxy routes receive the same audit coverage. Gated Composer-global lanes
-  scan both the resolved global home and the first effective `--working-dir`
-  project, wherever that option appears before `--`.
-  Original tokens are preserved on delegated paths; safe may conservatively
-  refuse a gated-looking ambiguity before npm or Composer reports its own
-  ambiguity error.
+- npm gate routing covers install, update, ci, exec, and lock-diff aliases and
+  abbreviations before delegation. It uses a checked-in full command/alias
+  snapshot with exact alias priority, so non-fetch aliases such as `c` and
+  `un` stay passthrough while abbreviated fetch routes (including alias
+  prefixes such as `ad` and `dd`) are audited; camel-case normalization is
+  covered too.
+- Composer now accepts only canonical `install`, `update`, and `require`
+  spellings, plus exact `global`, on its gated surface. Aliases targeting those
+  commands and gated-looking prefixes refuse before delegation with a
+  canonical hint. An accepted Composer-global route scans the resolved global
+  home plus the first absolute `--working-dir` project; relative working
+  directories and package-less `require` forms refuse before an interactive
+  selection can bypass audit. Original tokens remain unchanged on every
+  delegated path.
 
 - Fresh releases whose initial Socket score times out now receive one bounded
   patience retry (`install.socket.fresh_scan_budget_seconds`, default 90s).
