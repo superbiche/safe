@@ -54,3 +54,18 @@ slice: operator-ruled IN SCOPE 2026-08-10 as its own deferred slice (next in
 queue). Item 3 done: the agent contract now documents the delegation
 (docs/contract/agent-contract.json, rendered docs/agents.md); the fleet-side
 my-safe-gate skill update lands at deploy.
+
+## Resolution — item 2 (2026-08-11)
+
+Item 2 fixed by PR #73 (safe 1.14.0). Live probes showed "no Socket score
+yet" is a blocking on-demand scan, not a distinct API state: safe now gives
+a release younger than the cooldown window one bounded patience retry
+(default 90s) — usually returning a REAL scored verdict — and if the scan
+is still incomplete, an explicit PENDING state: GO with a disclosed note
+when GuardDog + OSV + blocklist are all clean, WARN `socket_score_pending`
+otherwise, always a veto for the behavioral-ack second opinion. Same-day
+security-fix releases additionally regain the cooldown waiver via the
+E2BIG fix (see inbox/2026-08-11-safe-osv-cooldown-vulns-argv-e2big.md).
+Evidence: tests/audit/guarddog_tier.sh patience/pending cases (266/266),
+tests/live/socket_envelope.sh envelope pin, host tests/run-all.sh green.
+All three items of this note are now closed.
