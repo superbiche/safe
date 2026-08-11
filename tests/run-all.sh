@@ -14,6 +14,7 @@ SUITES=(
   tests/go/run.sh
   tests/live/npm_config_oracle.sh
   tests/live/shim_delegation.sh
+  tests/live/socket_envelope.sh
   tests/install/run.sh
   tests/audit/check_version_aware.sh
   tests/audit/guarddog_tier.sh

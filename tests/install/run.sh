@@ -152,7 +152,8 @@ fi
   # surface what this invocation actually saw so tests can assert it.
   for env_name in NPM_CONFIG_REGISTRY PIP_INDEX_URL PIP_CONFIG_FILE GOPROXY \
                   CARGO_REGISTRY_DEFAULT CARGO_REGISTRIES_PRIVATE_INDEX \
-                  BUN_CONFIG_REGISTRY COMPOSER_HOME SAFE_AUDIT_SOCKET_TIMEOUT; do
+                  BUN_CONFIG_REGISTRY COMPOSER_HOME SAFE_AUDIT_SOCKET_TIMEOUT \
+                  SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT; do
     if [[ -n "${!env_name:-}" ]]; then
       printf 'AUDITENV\t%s=%s\n' "${env_name}" "${!env_name}"
       # Byte-exact form: the plain line cannot show a trailing newline or
@@ -474,6 +475,7 @@ run_zsh() {
     SAFE_AUDIT_CHECK_SLEEP="${SAFE_AUDIT_CHECK_SLEEP:-}" \
     SAFE_AUDIT_CHECK_TRAP_TERM="${SAFE_AUDIT_CHECK_TRAP_TERM:-}" \
     SAFE_AUDIT_SOCKET_TIMEOUT="${SAFE_AUDIT_SOCKET_TIMEOUT:-}" \
+    SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT="${SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT:-}" \
     SAFE_INSTALL_TIMEOUT_SECONDS="${SAFE_INSTALL_TIMEOUT_SECONDS:-}" \
     SAFE_INSTALL_REAL_STATUS="${SAFE_INSTALL_REAL_STATUS:-}" \
     NPM_LOCK_MUTATION_JSON="${NPM_LOCK_MUTATION_JSON:-}" \
@@ -1507,7 +1509,7 @@ STUB
   cat > "${BIN_DIR}/safe-core" <<'STUB'
 #!/usr/bin/env bash
 case "${1:-}" in
-  --version) printf '1.13.0\n' ;;
+  --version) printf '1.14.0\n' ;;
   lockdiff) printf '{"schema":1}\n' ;;
 esac
 STUB
@@ -1526,7 +1528,7 @@ STUB
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
   assert_status 100 "$FUNCNAME" || return
-  assert_err_contains_fragment 'safe-core version 0.0.0 does not match safe 1.13.0' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe-core version 0.0.0 does not match safe 1.14.0' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'PROJECTION\tnpm' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -1862,12 +1864,12 @@ case_install_idempotent_no_wrappers() {
   assert_count 1 'fpath=("$HOME/.local/share/zsh/site-functions" $fpath)' "${HOME_DIR}/.zshrc" "$FUNCNAME" || return
   [[ -f "${HOME_DIR}/.local/share/zsh/site-functions/_safe" ]] || { fail "$FUNCNAME"; return; }
   [[ -x "${HOME_DIR}/.local/bin/safe-core" ]] || { fail "$FUNCNAME"; return; }
-  [[ "$("${HOME_DIR}/.local/bin/safe-core" --version)" == "1.13.0" ]] || { fail "$FUNCNAME"; return; }
+  [[ "$("${HOME_DIR}/.local/bin/safe-core" --version)" == "1.14.0" ]] || { fail "$FUNCNAME"; return; }
   local doctor_json
   doctor_json="$(HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" \
     "${HOME_DIR}/.local/bin/safe" doctor --json)" || { fail "$FUNCNAME"; return; }
   jq -e '.dependencies.core.safe_core.present == true
-    and .dependencies.core.safe_core.version == "1.13.0"
+    and .dependencies.core.safe_core.version == "1.14.0"
     and .environment.safe_core.version_matches == true
     and .environment.safe_core.warning == null' <<<"${doctor_json}" >/dev/null || { fail "$FUNCNAME"; return; }
   # The suite core is release-versioned for gate-time parity. Replace the
@@ -2151,18 +2153,19 @@ case_gate_audit_leash_fits_component_budgets() {
   }
 
   local got
-  # No config: socket 15 x 2 attempts (auth-failure vault retry)
+  # No config: socket 15 x 2 attempts (auth-failure vault retry), then the
+  # one 90s fresh-score retry, plus
   # + guarddog 120*(1 probe + 4 versions)
   # + OSV 80*(4 versions + 1 cooldown re-query) + overhead 120.
   got="$(leash env)"
-  [[ "${got}" == "1150" ]] || { printf 'default leash %s, expected 1150\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+  [[ "${got}" == "1240" ]] || { printf 'default leash %s, expected 1240\n' "${got}" >&2; fail "$FUNCNAME"; return; }
 
   # An operator-raised GuardDog budget grows the leash with it — times the
   # probe+versions multiplicity: a constant leash goes silently stale the
   # day the budget moves.
   printf '{"install":{"guarddog":{"timeout_seconds":300}}}\n' > "${cfg}/config.json"
   got="$(leash env)"
-  [[ "${got}" == "2050" ]] || { printf 'guarddog-300 leash %s, expected 2050\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+  [[ "${got}" == "2140" ]] || { printf 'guarddog-300 leash %s, expected 2140\n' "${got}" >&2; fail "$FUNCNAME"; return; }
 
   # The explicit operator override wins absolutely.
   got="$(leash env SAFE_INSTALL_TIMEOUT_SECONDS=42)"
@@ -2171,34 +2174,44 @@ case_gate_audit_leash_fits_component_budgets() {
   # An invalid override is ignored, never handed to timeout(1) where it
   # would fail every audit as exit 125.
   got="$(leash env SAFE_INSTALL_TIMEOUT_SECONDS=soon)"
-  [[ "${got}" == "2050" ]] || { printf 'invalid-override leash %s, expected 2050\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+  [[ "${got}" == "2140" ]] || { printf 'invalid-override leash %s, expected 2140\n' "${got}" >&2; fail "$FUNCNAME"; return; }
 
   # An oversized override (>5 digits) is rejected the same way: unbounded
   # integers can wrap the arithmetic, and timeout(1) treats 0 as DISABLED.
   got="$(leash env SAFE_INSTALL_TIMEOUT_SECONDS=999999)"
-  [[ "${got}" == "2050" ]] || { printf 'oversized-override leash %s, expected 2050\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+  [[ "${got}" == "2140" ]] || { printf 'oversized-override leash %s, expected 2140\n' "${got}" >&2; fail "$FUNCNAME"; return; }
 
   # A corrupt guarddog budget in config falls back to the default 120.
   printf '{"install":{"guarddog":{"timeout_seconds":"soon"}}}\n' > "${cfg}/config.json"
   got="$(leash env)"
-  [[ "${got}" == "1150" ]] || { printf 'corrupt-config leash %s, expected 1150\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+  [[ "${got}" == "1240" ]] || { printf 'corrupt-config leash %s, expected 1240\n' "${got}" >&2; fail "$FUNCNAME"; return; }
 
   # An overflow-sized guarddog budget is clamped to the default, never
   # allowed to wrap the leash to zero.
   printf '{"install":{"guarddog":{"timeout_seconds":18446744073709551436}}}\n' > "${cfg}/config.json"
   got="$(leash env)"
-  [[ "${got}" == "1150" ]] || { printf 'overflow-config leash %s, expected 1150\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+  [[ "${got}" == "1240" ]] || { printf 'overflow-config leash %s, expected 1240\n' "${got}" >&2; fail "$FUNCNAME"; return; }
 
   # A caller-set socket budget participates in the arithmetic — counted
   # once per attempt.
   rm -f "${cfg}/config.json"
   got="$(leash env SAFE_AUDIT_SOCKET_TIMEOUT=9)"
-  [[ "${got}" == "1138" ]] || { printf 'socket-9 leash %s, expected 1138\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+  [[ "${got}" == "1228" ]] || { printf 'socket-9 leash %s, expected 1228\n' "${got}" >&2; fail "$FUNCNAME"; return; }
 
   # An overflow-sized socket budget falls back to 15, keeping the leash sane
   # (a raw 20-digit value wrapped the computed leash to exactly 0).
   got="$(leash env SAFE_AUDIT_SOCKET_TIMEOUT=18446744073709551436)"
-  [[ "${got}" == "1150" ]] || { printf 'overflow-socket leash %s, expected 1150\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+  [[ "${got}" == "1240" ]] || { printf 'overflow-socket leash %s, expected 1240\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+
+  # The fresh-release score budget comes from the same config source and has
+  # its own one-attempt term in the leash.
+  printf '{"install":{"socket":{"fresh_scan_budget_seconds":45}}}\n' > "${cfg}/config.json"
+  got="$(leash env)"
+  [[ "${got}" == "1195" ]] || { printf 'fresh-45 leash %s, expected 1195\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+  got="$(leash env SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT=9)"
+  [[ "${got}" == "1159" ]] || { printf 'fresh-env-9 leash %s, expected 1159\n' "${got}" >&2; fail "$FUNCNAME"; return; }
+  got="$(leash env SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT=999999)"
+  [[ "${got}" == "1240" ]] || { printf 'fresh-overflow leash %s, expected 1240\n' "${got}" >&2; fail "$FUNCNAME"; return; }
   pass "$FUNCNAME"
 }
 
@@ -2213,20 +2226,21 @@ case_gate_audit_receives_socket_budget() {
   SAFE_INSTALL_TEST_SCRIPT='npm install left-pad@1.2.3' run_zsh
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'AUDITENV\tSAFE_AUDIT_SOCKET_TIMEOUT=15' "$FUNCNAME" || return
-  if ! grep -Fq $'TIMEOUTARGV\t--kill-after=2s\t1150\t' "${LOG_FILE}"; then
+  assert_log_contains $'AUDITENV\tSAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT=90' "$FUNCNAME" || return
+  if ! grep -Fq $'TIMEOUTARGV\t--kill-after=2s\t1240\t' "${LOG_FILE}"; then
     printf 'no timeout argv with the computed default leash\nlog:\n%s\n' "$(cat "${LOG_FILE}")" >&2
     fail "$FUNCNAME"
     return
   fi
 
   # A caller-set budget survives — the gate default never clobbers it — and
-  # flows into the leash the call site actually applied (25*2 + 1120).
+  # flows into the leash the call site actually applied (25*2 + 90 + 1120).
   prepare_case "gate-audit-socket-budget-caller"
   write_timeout_recorder "${BIN_DIR}"
   SAFE_AUDIT_SOCKET_TIMEOUT=25 SAFE_INSTALL_TEST_SCRIPT='npm install left-pad@1.2.3' run_zsh
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'AUDITENV\tSAFE_AUDIT_SOCKET_TIMEOUT=25' "$FUNCNAME" || return
-  if ! grep -Fq $'TIMEOUTARGV\t--kill-after=2s\t1170\t' "${LOG_FILE}"; then
+  if ! grep -Fq $'TIMEOUTARGV\t--kill-after=2s\t1260\t' "${LOG_FILE}"; then
     printf 'no timeout argv with the caller-budget leash\nlog:\n%s\n' "$(cat "${LOG_FILE}")" >&2
     fail "$FUNCNAME"
     return
@@ -2238,6 +2252,19 @@ case_gate_audit_receives_socket_budget() {
   SAFE_AUDIT_SOCKET_TIMEOUT=soon SAFE_INSTALL_TEST_SCRIPT='npm install left-pad@1.2.3' run_zsh
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'AUDITENV\tSAFE_AUDIT_SOCKET_TIMEOUT=15' "$FUNCNAME" || return
+
+  # The fresh budget is propagated as its own bounded component and changes
+  # the real timeout argv, not merely a mirror calculation.
+  prepare_case "gate-audit-fresh-socket-budget-caller"
+  write_timeout_recorder "${BIN_DIR}"
+  SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT=31 SAFE_INSTALL_TEST_SCRIPT='npm install left-pad@1.2.3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDITENV\tSAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT=31' "$FUNCNAME" || return
+  if ! grep -Fq $'TIMEOUTARGV\t--kill-after=2s\t1181\t' "${LOG_FILE}"; then
+    printf 'no timeout argv with the caller fresh-score budget\nlog:\n%s\n' "$(cat "${LOG_FILE}")" >&2
+    fail "$FUNCNAME"
+    return
+  fi
   pass "$FUNCNAME"
 }
 

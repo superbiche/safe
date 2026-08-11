@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Fresh releases whose initial Socket score times out now receive one bounded
+  patience retry (`install.socket.fresh_scan_budget_seconds`, default 90s).
+  If Socket still has no score, receipts record `PENDING`; a clean GuardDog,
+  OSV, and blocklist verdict may proceed with that disclosed note, while any
+  incomplete or adverse companion evidence remains WARN/BLOCK. A pending
+  score never satisfies the behavioral-ack second opinion.
+- Socket low-score detection now reads the current Socket CLI score envelope
+  (`data.self.score.overall`), so an overall score below 70 again produces the
+  existing `socket_low_score` WARN.
+- Package-level OSV pagination keeps its accumulating advisory corpus in
+  scratch files instead of passing it through jq arguments, preventing
+  `E2BIG` from disabling the cooldown security-fix waiver for large advisory
+  histories.
+
 - `safe run <tool> [args...]` now silently delegates a bare wrapped tool name
   (for example `npm` or `go`) to its verified PATH gate wrapper, so the normal
   audited package-manager lane handles the operation instead of treating the

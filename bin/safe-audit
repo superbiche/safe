@@ -4852,8 +4852,21 @@ blocked_entry_reason() {
   return 1
 }
 
+socket_timeout_value_ok() {
+  [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]]
+}
+
+socket_fresh_scan_budget_seconds() {
+  local budget="${SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT:-}"
+  if [[ -z "$budget" ]]; then
+    budget=$(install_policy_json | jq -r '.socket.fresh_scan_budget_seconds // 90' 2>/dev/null || true)
+  fi
+  socket_timeout_value_ok "$budget" || budget=90
+  printf '%s\n' "$budget"
+}
+
 socket_score_json() {
-  local ecosystem="$1" spec="$2" output="$3"
+  local ecosystem="$1" spec="$2" output="$3" socket_budget="${4:-${SAFE_AUDIT_SOCKET_TIMEOUT:-30}}"
   # The socket CLI takes a purl type, not safe's ecosystem name. Only npm
   # coincides: "python"/"rust"/"go"/"php" produced pkg:python/... etc., which
   # the API rejects with 400 Bad Request — every non-npm score has been
@@ -4906,7 +4919,6 @@ socket_score_json() {
   # (contract-test finding 1). A timeout is an infrastructure failure like any
   # other socket failure: legible note, WARN, never a package finding.
   local -a socket_leash=()
-  local socket_budget="${SAFE_AUDIT_SOCKET_TIMEOUT:-30}"
   if command -v timeout >/dev/null 2>&1; then
     # --kill-after: a TERM-resistant socket child would otherwise outlive
     # its budget indefinitely (same class as the gate leash, PR#65 delta N2).
@@ -5666,10 +5678,18 @@ release_min_age_days() {
   printf '%s\t%s\t%s\t%s\n' "$min_age" "$min_version" "$min_published" "$ages_json"
 }
 
+osv_write_package_query_result() {
+  local output="$1" status="$2" note="$3" vulns_file="$4"
+  jq -cn --arg status "$status" --arg note "$note" --slurpfile v "$vulns_file" \
+    '{status:$status, note:(if $note == "" then null else $note end), vulns:($v[0] // [])}' > "$output"
+}
+
 osv_query_package_json() {
   local ecosystem="$1" name="$2" version="$3" output="$4"
+  local vulns_file="$output.vulns.json"
+  printf '[]\n' > "$vulns_file"
   if ! command -v curl >/dev/null 2>&1; then
-    printf '{"status":"error","note":"curl not available","vulns":[]}\n' > "$output"
+    osv_write_package_query_result "$output" error "curl not available" "$vulns_file"
     return 0
   fi
   local eco
@@ -5685,8 +5705,9 @@ osv_query_package_json() {
   # with the findings on a later page. Treating one page as the full answer
   # would let a token-only page read as "zero advisories" — follow the token
   # chain, merge, and fail closed on any anomaly (bad page, non-array vulns,
-  # repeated token, unbounded chain).
-  local base_body body page_token="" vulns='[]' pages=0 seen_tokens=""
+  # repeated token, unbounded chain). The accumulating data stays in a file:
+  # package-level OSV answers can exceed Linux's per-argument size limit.
+  local base_body body page_token="" pages=0 seen_tokens=""
   if [[ -n "$version" && "$version" != "latest" ]]; then
     base_body=$(jq -n --arg eco "$eco" --arg name "$name" --arg version "$version" '{package:{ecosystem:$eco,name:$name},version:$version}')
   else
@@ -5697,7 +5718,7 @@ osv_query_package_json() {
   while :; do
     pages=$((pages + 1))
     if (( pages > 10 )); then
-      jq -cn --argjson v "$vulns" '{status:"error",note:"OSV pagination exceeded 10 pages",vulns:$v}' > "$output"
+      osv_write_package_query_result "$output" error "OSV pagination exceeded 10 pages" "$vulns_file"
       return 0
     fi
     if [[ -n "$page_token" ]]; then
@@ -5709,7 +5730,7 @@ osv_query_package_json() {
       -H 'content-type: application/json' \
       -d "$body" \
       > "$output.raw"; then
-      jq -cn --argjson v "$vulns" '{status:"error",note:"OSV query failed",vulns:$v}' > "$output"
+      osv_write_package_query_result "$output" error "OSV query failed" "$vulns_file"
       return 0
     fi
     # A JSON stream is a malformed response: plain jq validates every
@@ -5718,7 +5739,7 @@ osv_query_package_json() {
     # into a clean answer (PR#64 delta-2 F13; same class as the
     # querybatch/detail guards).
     if ! jq -es 'length == 1' "$output.raw" >/dev/null 2>&1; then
-      jq -cn --argjson v "$vulns" '{status:"error",note:"OSV response is not a single JSON document",vulns:$v}' > "$output"
+      osv_write_package_query_result "$output" error "OSV response is not a single JSON document" "$vulns_file"
       return 0
     fi
     # Validation is two-stage with the merge in between (delta-2 F1): the
@@ -5730,13 +5751,15 @@ osv_query_package_json() {
       (type == "object")
       and ((has("vulns") | not) or (.vulns | type == "array"))
     ' "$output.raw" >/dev/null 2>&1; then
-      jq -cn --argjson v "$vulns" '{status:"error",note:"OSV response malformed",vulns:$v}' > "$output"
+      osv_write_package_query_result "$output" error "OSV response malformed" "$vulns_file"
       return 0
     fi
-    if ! vulns=$(jq -cn --argjson acc "$vulns" --slurpfile r "$output.raw" '$acc + (($r[0].vulns) // [])' 2>/dev/null); then
-      jq -cn --argjson v "$vulns" '{status:"error",note:"OSV response merge failed",vulns:$v}' > "$output"
+    if ! jq -cn --slurpfile acc "$vulns_file" --slurpfile r "$output.raw" \
+      '($acc[0] // []) + (($r[0].vulns) // [])' > "$vulns_file.next" 2>/dev/null; then
+      osv_write_package_query_result "$output" error "OSV response merge failed" "$vulns_file"
       return 0
     fi
+    mv "$vulns_file.next" "$vulns_file"
     # next_page_token (when present) must be a non-empty string — any other
     # shape (false, numbers, objects) is malformed and must not read as
     # "complete". Tokens travel through shell command substitution, which is
@@ -5748,7 +5771,7 @@ osv_query_package_json() {
       or (.next_page_token
           | (type == "string") and (length > 0) and (test("^[[:graph:]]+$")))
     ' "$output.raw" >/dev/null 2>&1; then
-      jq -cn --argjson v "$vulns" '{status:"error",note:"OSV pagination token malformed",vulns:$v}' > "$output"
+      osv_write_package_query_result "$output" error "OSV pagination token malformed" "$vulns_file"
       return 0
     fi
     local next_token
@@ -5756,14 +5779,14 @@ osv_query_package_json() {
     [[ -z "$next_token" ]] && break
     case " ${seen_tokens:-} " in
       *" $next_token "*)
-        jq -cn --argjson v "$vulns" '{status:"error",note:"OSV pagination token repeated",vulns:$v}' > "$output"
+        osv_write_package_query_result "$output" error "OSV pagination token repeated" "$vulns_file"
         return 0
         ;;
     esac
     seen_tokens="${seen_tokens:-} $next_token"
     page_token="$next_token"
   done
-  jq -cn --argjson v "$vulns" '{status: "ok", note: null, vulns: $v}' > "$output"
+  osv_write_package_query_result "$output" ok "" "$vulns_file"
 }
 
 # ---------------------------------------------------------------------------
@@ -7665,7 +7688,7 @@ host_allow_required_versions_json() {
     | ([$guarddog_result.versions[]?
         | select(.contribution == "WARN") | .version] | unique) as $guarddog_versions
     | ($osv | map(select((.classification.affecting | length) > 0) | .version)) as $osv_versions
-    | (["socket_unavailable","socket_auth_failed","socket_rate_limited","socket_error","socket_low_score"]
+    | (["socket_unavailable","socket_auth_failed","socket_rate_limited","socket_error","socket_low_score","socket_score_pending"]
        | any(. as $c | $causes | index($c) != null)) as $socket_applies
     | ((($causes | index("guarddog_error")) != null)
        and (($guarddog_result.versions // []) | length) == 0) as $guarddog_applies_to_all
@@ -7886,6 +7909,24 @@ check_command() {
     primary_version="$PKG_VERSION"
   fi
 
+  # Release age drives both the normal cooldown and the bounded patience
+  # exception for a fresh Socket score. Compute it once, before Socket, so
+  # the two policies cannot drift or observe different package metadata.
+  local cooldown_days cooldown_security_fix release_line="" release_age="" release_version="" release_published=""
+  local release_security_fix_ids="" release_exempt=0 release_ages_json='{}' release_info="" release_rc=2
+  cooldown_days=$(install_policy_json | jq -r '.cooldown_days // 3')
+  [[ "$cooldown_days" =~ ^[0-9]+$ ]] || cooldown_days=3
+  cooldown_security_fix=$(install_policy_json | jq -r '.cooldown_security_fix // "exempt"')
+  case "$cooldown_security_fix" in exempt|enforce) ;; *) cooldown_security_fix="exempt" ;; esac
+  if (( resolution_ok )) && (( cooldown_days > 0 )); then
+    release_rc=0
+    release_info=$(release_min_age_days "$ecosystem" "$PKG_NAME" "$scratch" "${RESOLVED_VERSIONS[@]}") || release_rc=$?
+    if (( release_rc == 0 )); then
+      IFS=$'\t' read -r release_age release_version release_published release_ages_json <<<"$release_info"
+      [[ -n "$release_ages_json" ]] || release_ages_json='{}'
+    fi
+  fi
+
   # Whether the resolved version declares install-time lifecycle scripts
   # (abbreviated-packument hasInstallScript). Known only when the packument
   # was fetched — exact-version specs skip that fetch, and "" means unknown.
@@ -7954,11 +7995,31 @@ check_command() {
     local socket_spec="$spec"
     (( resolution_ok )) && socket_spec="${PKG_NAME}@${primary_version}"
     socket_score_json "$ecosystem" "$socket_spec" "$socket_json"
+    # Socket computes an unseen release's score on demand. For a release still
+    # inside the existing cooldown window, give that first computation one
+    # longer bounded chance before deciding whether the score is pending.
+    # Do not retry a 404, auth, rate-limit, or arbitrary backend failure.
+    if (( release_rc == 0 )) && (( release_age < cooldown_days )) \
+      && [[ "$(jq -r '.status // empty' "$socket_json" 2>/dev/null)" == "error" ]] \
+      && [[ "$(jq -r '.note // empty' "$socket_json" 2>/dev/null)" == socket\ score\ timed\ out\ after* ]]; then
+      local fresh_socket_budget
+      fresh_socket_budget=$(socket_fresh_scan_budget_seconds)
+      socket_score_json "$ecosystem" "$socket_spec" "$socket_json" "$fresh_socket_budget"
+      if [[ "$(jq -r '.status // empty' "$socket_json" 2>/dev/null)" == "error" ]] \
+        && [[ "$(jq -r '.note // empty' "$socket_json" 2>/dev/null)" == socket\ score\ timed\ out\ after* ]]; then
+        jq -n --arg version "$primary_version" --argjson age_days "$release_age" \
+          --argjson timeout_seconds "$fresh_socket_budget" \
+          '{available:true,status:"pending",
+            note:("Socket scan not yet complete for fresh release " + $version),
+            fresh_release:{version:$version,age_days:$age_days,timeout_seconds:$timeout_seconds}}' > "$socket_json"
+      fi
+    fi
   fi
 
   verdict="GO"
   local -a warn_causes=()
   local socket_detail=""
+  local socket_pending=0
   socket_line="PASS (no behavioral anomalies)"
   if [[ "$(jq -r '.status // empty' "$socket_json" 2>/dev/null)" == "skipped_tier3" ]]; then
     # A deliberate tier-3 skip is not an outage: no cause, no verdict bump.
@@ -7968,6 +8029,10 @@ check_command() {
     warn_causes+=("socket_unavailable")
     socket_detail="socket CLI not available"
     verdict="WARN"
+  elif [[ "$(jq -r '.status' "$socket_json")" == "pending" ]]; then
+    socket_pending=1
+    socket_line="PENDING (fresh release ${primary_version}, ${release_age}d old — Socket scan not yet complete)"
+    socket_detail=$(jq -r '.note // "Socket scan not yet complete"' "$socket_json" 2>/dev/null || true)
   elif [[ "$(jq -r '.status' "$socket_json")" != "ok" ]]; then
     local socket_note
     socket_note=$(jq -r '.note // "socket check failed"' "$socket_json" 2>/dev/null || printf 'socket check failed')
@@ -7999,8 +8064,9 @@ check_command() {
     verdict="WARN"
   else
     local score_val
-    score_val=$(jq -r '.raw.score // .raw.riskScore // empty' "$socket_json" 2>/dev/null || true)
-    if [[ -n "$score_val" && "$score_val" =~ ^[0-9]+$ && "$score_val" -lt 70 ]]; then
+    score_val=$(jq -r '.raw.data.self.score.overall // empty' "$socket_json" 2>/dev/null || true)
+    if jq -e '(.raw.data.self.score.overall | type) == "number"
+      and (.raw.data.self.score.overall < 70)' "$socket_json" >/dev/null 2>&1; then
       socket_line="WARN (score=$score_val)"
       warn_causes+=("socket_low_score")
       verdict="WARN"
@@ -8317,10 +8383,6 @@ check_command() {
   # window (malicious versions are usually caught and yanked within days).
   # WARN-tier and overridable; a failed lookup is disclosed and skipped,
   # never a refusal — the cooldown is a heuristic, not advisory evidence.
-  local cooldown_days cooldown_security_fix release_line="" release_age="" release_version="" release_published=""
-  local release_security_fix_ids="" release_exempt=0
-  cooldown_days=$(install_policy_json | jq -r '.cooldown_days // 3')
-  [[ "$cooldown_days" =~ ^[0-9]+$ ]] || cooldown_days=3
   # A cooldown that blocks the release fixing a published CVE recreates the
   # exact catch-22 this gate was built to end: safe used to WARN-refuse the
   # very bump that remediated the advisory it was warning about. So when the
@@ -8328,15 +8390,8 @@ check_command() {
   # the cooldown is waived by default and says so. `enforce` keeps the wait
   # (compromised-maintainer releases can carry a real fix as cover); the
   # operator picks which risk they prefer.
-  cooldown_security_fix=$(install_policy_json | jq -r '.cooldown_security_fix // "exempt"')
-  case "$cooldown_security_fix" in exempt|enforce) ;; *) cooldown_security_fix="exempt" ;; esac
   if (( resolution_ok )) && (( cooldown_days > 0 )); then
-    local release_info release_rc=0
-    release_info=$(release_min_age_days "$ecosystem" "$PKG_NAME" "$scratch" "${RESOLVED_VERSIONS[@]}") || release_rc=$?
     if (( release_rc == 0 )); then
-      local release_ages_json
-      IFS=$'\t' read -r release_age release_version release_published release_ages_json <<<"$release_info"
-      [[ -n "$release_ages_json" ]] || release_ages_json='{}'
       if (( release_age < cooldown_days )); then
         # Is this young release the remediation itself? The version-scoped
         # OSV query only returns advisories AFFECTING the version, so a
@@ -8434,6 +8489,27 @@ check_command() {
   elif block_reason=$(blocked_entry_reason "$PKG_NAME"); then
     bump_verdict verdict "BLOCK"
     block_line="BLOCKED ($block_reason)"
+  fi
+
+  # A fresh Socket score that is still pending is data availability, not an
+  # infrastructure outage. It may leave a GO only when every independent
+  # signal that could vouch for this resolved artifact is clean. Any adverse
+  # or incomplete companion signal keeps its own verdict and adds an explicit
+  # pending cause, so an acknowledgement never treats missing Socket evidence
+  # as a clean second opinion.
+  if (( socket_pending )); then
+    local socket_pending_safe=0
+    if [[ "$guarddog_status" == "ok" && "$guarddog_contribution" == "GO" \
+      && "$guarddog_infra" == "false" && -z "$guarddog_rules" \
+      && "$guarddog_issue_count" == "0" && "$osv_status" == "ok" ]] \
+      && (( aff_count == 0 )) && [[ "$block_line" == PASS* ]] \
+      && (( behavioral_ack_candidate == 0 )); then
+      socket_pending_safe=1
+    fi
+    if (( ! socket_pending_safe )); then
+      warn_causes+=("socket_score_pending")
+      bump_verdict verdict "WARN"
+    fi
   fi
 
   local warn_causes_json='[]'
@@ -8598,14 +8674,23 @@ check_command() {
           # The recorded evidence must say what Socket actually did: a
           # tier-3 skip is not a green score and must never read as one.
           local socket_reason="socket_ok"
-          if [[ -n "$socket_skip_reason" ]]; then
+          # A pending-score GO is not fully clean evidence: record it under
+          # a distinct verdict so the offline stale-evidence fallback
+          # (safe_gate_known_matches selects verdict == "GO" only) can never
+          # treat incomplete Socket data as a clean check during an audit
+          # outage — same exclusion principle as WARN_TOLERATED.
+          local known_verdict="GO"
+          if (( socket_pending )); then
+            socket_reason="socket_score_pending"
+            known_verdict="GO_PENDING_SOCKET"
+          elif [[ -n "$socket_skip_reason" ]]; then
             if [[ "$socket_mode" == "never" ]]; then
               socket_reason="socket_disabled"
             else
               socket_reason="socket_skipped_tier3"
             fi
           fi
-          mark_install_known "$ecosystem" "$PKG_NAME" "$primary_version" "GO" \
+          mark_install_known "$ecosystem" "$PKG_NAME" "$primary_version" "$known_verdict" \
             "$(jq -cn --arg guarddog_reason "$guarddog_reason" --arg socket_reason "$socket_reason" \
               '["osv_clean_for_version",$socket_reason,"blocklist_pass",$guarddog_reason]')" "$result_json"
           printf '[safe audit] recorded clean check: %s:%s@%s (install-known)\n' \

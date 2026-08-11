@@ -21,11 +21,14 @@
 # a hanging Socket backend should cost less wall-clock, and the leash
 # arithmetic below has to be able to rely on the value it passed down.
 SAFE_GATE_SOCKET_BUDGET_DEFAULT=15
+SAFE_GATE_SOCKET_FRESH_SCAN_BUDGET_DEFAULT=90
 # Sequential multiplicity inside one `safe-audit check`, mirrored from
 # bin/safe-audit (PR#65 review F1 — the leash must cover the real bounded
 # path, not a one-of-each sketch):
 # - socket_score_json can run TWICE with the full budget: the first attempt
-#   plus the vault-injected retry after a late auth failure (delta N1).
+#   plus the vault-injected retry after a late auth failure (delta N1). A
+#   young release whose first bounded score times out can then make ONE
+#   extended fresh-scan attempt; its separate budget is added below.
 # - resolve_target_versions caps RESOLVED_VERSIONS at 4; GuardDog runs a
 #   --version probe plus one scan per resolved version, each with the full
 #   configured budget.
@@ -268,6 +271,16 @@ safe_gate_socket_budget() {
   printf '%s\n' "${budget}"
 }
 
+safe_gate_socket_fresh_scan_budget() {
+  local budget="${SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT:-}"
+  if [[ -z "${budget}" ]]; then
+    budget="$(jq -r '.install.socket.fresh_scan_budget_seconds // empty' \
+      "$(safe_gate_run_config_dir)/config.json" 2>/dev/null || true)"
+  fi
+  safe_gate_timeout_value_ok "${budget}" || budget="${SAFE_GATE_SOCKET_FRESH_SCAN_BUDGET_DEFAULT}"
+  printf '%s\n' "${budget}"
+}
+
 # The leash on the audit child must EXCEED the worst-case sum of the audit's
 # own component budgets: every network probe inside `safe-audit check` is
 # individually bounded (Socket score, GuardDog wall-clock, curl --max-time),
@@ -280,9 +293,12 @@ safe_gate_socket_budget() {
 # timeout instead of completing with "socket unavailable — infra WARN".
 # The leash is therefore a BACKSTOP against unbounded regressions, not the
 # operative timeout; the component budgets are. With defaults it computes to
-# 15*2 + 120*(1+4) + 80*(4+1) + 120 = 1150s — deliberately generous: it only
+# 15*2 + 90 + 120*(1+4) + 80*(4+1) + 120 = 1240s — deliberately generous:
+# it only
 # fires when a component escapes its own bound, which previously meant an
-# indefinite hang. SAFE_INSTALL_TIMEOUT_SECONDS still overrides the
+# indefinite hang. The one fresh-release score retry is sequential with the
+# ordinary Socket call and has its own bounded budget.
+# SAFE_INSTALL_TIMEOUT_SECONDS still overrides the
 # computation absolutely (an out-of-range value is ignored, not passed to
 # timeout(1) where garbage would fail the audit as exit 125 and 0 would
 # disable the timeout).
@@ -291,11 +307,13 @@ safe_gate_audit_leash_seconds() {
     printf '%s\n' "${SAFE_INSTALL_TIMEOUT_SECONDS}"
     return 0
   fi
-  local guarddog_budget
+  local guarddog_budget fresh_socket_budget
   guarddog_budget="$(jq -r '.install.guarddog.timeout_seconds // 120' \
     "$(safe_gate_run_config_dir)/config.json" 2>/dev/null || true)"
   safe_gate_timeout_value_ok "${guarddog_budget}" || guarddog_budget=120
+  fresh_socket_budget="$(safe_gate_socket_fresh_scan_budget)"
   printf '%s\n' "$(( $(safe_gate_socket_budget) * SAFE_GATE_SOCKET_ATTEMPTS \
+    + fresh_socket_budget \
     + guarddog_budget * (1 + SAFE_GATE_MAX_RESOLVED_VERSIONS) \
     + SAFE_GATE_OSV_QUERY_BUDGET * (SAFE_GATE_MAX_RESOLVED_VERSIONS + 1) \
     + SAFE_GATE_AUDIT_OVERHEAD_SECONDS ))"
@@ -314,8 +332,9 @@ safe_gate_run_audit() {
   [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]] && extra+=(--project-dir "${SAFE_GATE_PROJECT_DIR}")
   [[ -n "${SAFE_GATE_NPM_USERCONFIG:-}" ]] && extra+=(--npm-userconfig "${SAFE_GATE_NPM_USERCONFIG}")
   [[ -n "${SAFE_GATE_NPM_GLOBALCONFIG:-}" ]] && extra+=(--npm-globalconfig "${SAFE_GATE_NPM_GLOBALCONFIG}")
-  local socket_budget
+  local socket_budget fresh_socket_budget
   socket_budget="$(safe_gate_socket_budget)"
+  fresh_socket_budget="$(safe_gate_socket_fresh_scan_budget)"
   # --kill-after: TERM-only timeout is not a backstop — a TERM-resistant
   # child outlives it indefinitely (delta N2; reproduced with
   # `trap '' TERM`). Tests observe the exact argv through a PATH-injected
@@ -330,12 +349,14 @@ safe_gate_run_audit() {
     # (delta-2 N3).
     {
       SAFE_AUDIT_SOCKET_TIMEOUT="${socket_budget}" \
+        SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT="${fresh_socket_budget}" \
         timeout --kill-after=2s "$(safe_gate_audit_leash_seconds)" \
         "${SAFE_GATE_AUDIT_BIN}" check "$@" "${extra[@]}" 2>&3
       rc=$?
     } 3>&2 2>/dev/null
   else
     SAFE_AUDIT_SOCKET_TIMEOUT="${socket_budget}" \
+      SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT="${fresh_socket_budget}" \
       "${SAFE_GATE_AUDIT_BIN}" check "$@" "${extra[@]}"
     rc=$?
   fi

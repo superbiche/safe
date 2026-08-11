@@ -90,7 +90,7 @@
     {
       "situation": "Audit backend is down or unauthenticated",
       "signal": "The refusal names a Socket auth failure, a rate limit, or a network error — not an advisory.",
-      "action": "Escalate to the operator immediately. Do not park it, do not retry around it, do not treat it as a vulnerability finding. Recovery is usually `socket login` or a vault-injection fix; `safe doctor` checks the wiring."
+      "action": "Escalate to the operator immediately. Do not park it, do not retry around it, do not treat it as a vulnerability finding. Recovery is usually `socket login` or a vault-injection fix; `safe doctor` checks the wiring. Exception: `PENDING (fresh release ...)` means Socket has not completed its first score; with clean GuardDog, OSV, and blocklist evidence it is disclosed data availability, not backend breakage."
     },
     {
       "situation": "A critical advisory affects the resolved version",

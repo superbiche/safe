@@ -58,7 +58,7 @@ case "$url" in
       cat "${MOCK_OSV_PAGES}/page${count}.json" | emit
       exit 0
     fi
-    body_version=$(printf '%s' "$data" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+    body_version=$(printf '%s' "$data" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
     if [[ -z "$body_version" || "$body_version" == "${MOCK_OSV_MATCH_VERSION:-}" ]]; then
       cat "${MOCK_OSV_FIXTURE:?}" | emit
     else
@@ -79,20 +79,25 @@ chmod +x "$MOCKBIN/curl"
 cat > "$MOCKBIN/socket" <<'MOCK'
 #!/usr/bin/env bash
 [[ -n "${MOCK_SOCKET_ARGS_LOG:-}" ]] && printf '%s\n' "$*" >> "$MOCK_SOCKET_ARGS_LOG"
+success_envelope() {
+  local score="$1"
+  printf '{"ok":true,"data":{"purl":"pkg:npm/fixture@1.0.0","self":{"alerts":[],"capabilities":[],"purl":"pkg:npm/fixture@1.0.0","score":{"overall":%s,"supplyChain":95,"quality":95,"maintenance":95,"vulnerability":95,"license":95}},"transitively":[]}}\n' "$score"
+}
 case "${MOCK_SOCKET_MODE:-ok}" in
-  ok) printf '{"score": 95}\n'; exit 0 ;;
-  low) printf '{"score": 40}\n'; exit 0 ;;
+  ok) success_envelope 95; exit 0 ;;
+  low) success_envelope 40; exit 0 ;;
   auth) printf '{"message":"Unauthorized","cause":"401 Unauthorized"}\n'; exit 1 ;;
   # First call: auth failure (triggers the vault-injected retry); retry: ok.
   auth-then-ok)
     if [[ -e "${MOCK_SOCKET_STATE:?}" ]]; then
-      printf '{"score": 95}\n'
+      success_envelope 95
       exit 0
     fi
     : > "${MOCK_SOCKET_STATE}"
     printf '{"message":"Unauthorized","cause":"401 Unauthorized"}\n'
     exit 1 ;;
   rate) printf '{"message":"Too Many Requests","cause":"429"}\n'; exit 1 ;;
+  not-found) printf '{"ok":false,"message":"Socket API error","cause":"Not Found (404)","data":{"code":404}}\n'; exit 1 ;;
   hang) sleep 300; exit 0 ;;
   # First call: auth failure (triggers the vault-injected retry); the
   # retry then hangs. State lives in a per-case file.
@@ -1070,6 +1075,13 @@ run_check \
   -- brace-expansion@2.1.4 --ecosystem npm --gate install
 if expect_status 10 "low socket score refuses"; then
   pass "low socket score refuses"
+fi
+if jq -e '.socket.raw.data.self.score.overall == 40
+  and (.warn_causes | index("socket_low_score") != null)' \
+  "$(ls "$CASE_CHECKS_DIR"/*.json | head -1)" >/dev/null 2>&1; then
+  pass "real Socket score envelope drives the low-score WARN"
+else
+  fail "real Socket score envelope drives the low-score WARN"
 fi
 if jq -e '.packages["npm:brace-expansion"] == null' "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
   pass "low socket score revokes stale clean evidence"
@@ -3320,5 +3332,41 @@ if expect_grep "$OUT_FILE" "blocklist file unreadable" "non-object blocklist ent
 fi
 
 # ---------------------------------------------------------------------------
+# Package-level OSV records feed the cooldown security-fix waiver. Keep a
+# corpus well beyond Linux's ~128 KiB MAX_ARG_STRLEN: the accumulator must
+# never travel through jq --argjson, and the direct check must not leak an
+# E2BIG diagnostic on stderr.
+prepare_case osv-cooldown-large-corpus
+large_fixture="$FIXTURES/osv-cooldown-large.json"
+large_registry="$FIXTURES/packument-cooldown-large.json"
+printf '{"dist-tags":{},"versions":{"2.1.4":{}},"time":{"2.1.4":"%s"}}\n' \
+  "$(date -d '1 hour ago' -Is)" > "$large_registry"
+{
+  printf '{"vulns":['
+  for ((i = 1; i <= 1400; i++)); do
+    (( i > 1 )) && printf ','
+    printf '{"id":"GHSA-large-%04d","database_specific":{"severity":"HIGH"},"affected":[{"package":{"ecosystem":"npm","name":"brace-expansion"},"ranges":[{"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"2.1.4"}]}]}]}' "$i"
+  done
+  printf ']}\n'
+} > "$large_fixture"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$large_registry" \
+  MOCK_OSV_FIXTURE="$large_fixture" \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --json
+if expect_status 0 "large package-level OSV corpus still permits the cooldown fix waiver"; then
+  pass "large package-level OSV corpus still permits the cooldown fix waiver"
+fi
+if jq -e '.release.cooldown_waived == true' "$OUT_FILE" >/dev/null 2>&1; then
+  pass "large OSV corpus reaches the security-fix waiver"
+else
+  fail "large OSV corpus reaches the security-fix waiver"
+fi
+if [[ ! -s "$ERR_FILE" ]]; then
+  pass "large OSV corpus emits no E2BIG stderr leak"
+else
+  fail "large OSV corpus emits no E2BIG stderr leak"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
