@@ -2022,6 +2022,15 @@ safe_gate_check() {
       safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_BLOCK"
       return 104
       ;;
+    30)
+      # The audit could not compute a verdict at all — the verdict engine is
+      # missing, version-skewed, or failed. That is breakage to repair, not a
+      # finding about the package, so the refusal says so and never suggests
+      # an allow entry: there is no evidence to allow around.
+      safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — safe audit could not run (audit-infrastructure breakage, not a package finding); rerun install.sh or run safe doctor; details: safe explain"
+      safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_AUDIT_INFRA"
+      return 100
+      ;;
     124|137)
       if safe_gate_known_matches "${package}" "${ecosystem}"; then
         safe_gate_err "safe install: safe audit timed out; proceeding on recorded clean check for ${package} (stale evidence)"

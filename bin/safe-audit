@@ -7767,12 +7767,12 @@ check_command() {
   if [[ -z "$evidence_json" ]]; then
     printf 'safe audit: could not assemble audit evidence — audit-infrastructure breakage, not a package finding; run safe doctor\n' >&2
     rm -rf "$scratch"
-    return 20
+    return 30
   fi
   if [[ ! -x "$safe_core_bin" ]]; then
     printf 'safe audit: verdict engine missing (safe-core is not installed) — audit-infrastructure breakage, not a package finding; rerun install.sh\n' >&2
     rm -rf "$scratch"
-    return 20
+    return 30
   fi
   # The pin is enforced whenever the caller knows what version it is: bin/safe
   # exports SAFE_VERSION to every child, so every real invocation is checked.
@@ -7784,7 +7784,7 @@ check_command() {
       printf 'safe audit: verdict engine version %s does not match safe %s — audit-infrastructure breakage, not a package finding; rerun install.sh\n' \
         "${safe_core_reported:-unknown}" "${SAFE_VERSION}" >&2
       rm -rf "$scratch"
-      return 20
+      return 30
     fi
   fi
 
@@ -7793,7 +7793,7 @@ check_command() {
   if [[ -z "$verdict_json" ]]; then
     printf 'safe audit: verdict engine failed to decide — audit-infrastructure breakage, not a package finding; rerun install.sh or run safe doctor\n' >&2
     rm -rf "$scratch"
-    return 20
+    return 30
   fi
 
   local -a warn_causes=()
