@@ -148,7 +148,7 @@ run_check() {
     MOCK_SOCKET_LOG="$CASE_LOG" \
     MOCK_SOCKET_MODE="$mode" \
     "${extra_env[@]}" \
-    "$SAFE_AUDIT" check fixture@1.0.0 --ecosystem npm --json > "$CASE_OUT" 2> "$CASE_ERR"
+    "$SAFE_AUDIT" check fixture@1.0.0 --ecosystem npm --json "$@" > "$CASE_OUT" 2> "$CASE_ERR"
   CHECK_RC=$?
   set -e
 }
@@ -249,13 +249,26 @@ run_check clean
 [[ "$(socket_calls)" == "2" ]] && pass 'zero TTL calls Socket every time' || fail 'zero TTL calls Socket every time'
 [[ "$(cache_entries)" == "0" ]] && pass 'zero TTL writes no cache entry' || fail 'zero TTL writes no cache entry'
 
-# `never` is the sole policy skip; auto is always consulted.
+# `never` is the sole policy skip; auto is always consulted. Since Socket
+# became the only behavioral tier, a skip carries no evidence and so cannot
+# certify on its own — but it stays free (no API call, no timeout).
 prepare_case disabled
 printf '{"install":{"cooldown_days":0,"socket":{"mode":"never","cache_ttl_days":7}}}\n' > "$CASE_RUN_CONFIG/config.json"
-run_check clean
-expect_rc 0 'explicit never mode permits otherwise-clean GO'
+run_check clean --gate install
+expect_rc 10 'never mode discloses that no behavioral evidence was gathered'
+expect_json '.warn_causes | index("socket_disabled") != null' 'the policy skip has its own cause, distinct from an outage'
 expect_json '.socket.status == "skipped" and .socket.note == "disabled by install.socket.mode=never"' 'disabled mode is an honest policy skip'
 [[ "$(socket_calls)" == "0" ]] && pass 'never mode does not invoke Socket' || fail 'never mode does not invoke Socket'
+grep -q 'auto_allow_tolerate' "$CASE_ERR" && pass 'the skip names the way to run this posture routinely' || fail 'the skip names the way to run this posture routinely'
+
+# An operator who declares the posture gets a clean gate again — recorded as
+# WARN_TOLERATED, never GO, so a tolerated skip cannot later read as a real
+# clean check.
+prepare_case disabled-tolerated
+printf '{"install":{"cooldown_days":0,"auto_allow_tolerate":["socket_disabled"],"socket":{"mode":"never","cache_ttl_days":7}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check clean --gate install
+expect_rc 0 'a declared skip posture passes the install gate'
+[[ "$(socket_calls)" == "0" ]] && pass 'tolerated skip still makes no Socket request' || fail 'tolerated skip still makes no Socket request'
 
 # A fresh release whose bounded retries have no completed score remains a
 # disclosed PENDING GO only while OSV and the blocklist are clean.

@@ -2,6 +2,9 @@
 set -u
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+# The repo VERSION, read once. Fixtures that need the CURRENT version must
+# derive it here: hard-coding it makes every release bump a false failure.
+SAFE_REPO_VERSION="$(tr -d '[:space:]' < "${ROOT_DIR}/VERSION")"
 ZSH_BIN="$(command -v zsh)"
 TEST_ROOT="$(mktemp -d)"
 PASS_COUNT=0
@@ -2006,10 +2009,10 @@ STUB
   assert_log_contains $'REAL\tnpm\tdedupe' "$FUNCNAME" || return
 
   rm -f "${BIN_DIR}/safe-core"
-  cat > "${BIN_DIR}/safe-core" <<'STUB'
+  cat > "${BIN_DIR}/safe-core" <<STUB
 #!/usr/bin/env bash
-case "${1:-}" in
-  --version) printf '1.16.0\n' ;;
+case "\${1:-}" in
+  --version) printf '${SAFE_REPO_VERSION}\n' ;;
   lockdiff) printf '{"schema":1}\n' ;;
 esac
 STUB
@@ -2028,7 +2031,7 @@ STUB
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
   assert_status 100 "$FUNCNAME" || return
-  assert_err_contains_fragment 'safe-core version 0.0.0 does not match safe 1.16.0' "$FUNCNAME" || return
+  assert_err_contains_fragment "safe-core version 0.0.0 does not match safe ${SAFE_REPO_VERSION}" "$FUNCNAME" || return
   assert_log_not_contains_fragment $'PROJECTION\tnpm' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -2364,12 +2367,12 @@ case_install_idempotent_no_wrappers() {
   assert_count 1 'fpath=("$HOME/.local/share/zsh/site-functions" $fpath)' "${HOME_DIR}/.zshrc" "$FUNCNAME" || return
   [[ -f "${HOME_DIR}/.local/share/zsh/site-functions/_safe" ]] || { fail "$FUNCNAME"; return; }
   [[ -x "${HOME_DIR}/.local/bin/safe-core" ]] || { fail "$FUNCNAME"; return; }
-  [[ "$("${HOME_DIR}/.local/bin/safe-core" --version)" == "1.16.0" ]] || { fail "$FUNCNAME"; return; }
+  [[ "$("${HOME_DIR}/.local/bin/safe-core" --version)" == "${SAFE_REPO_VERSION}" ]] || { fail "$FUNCNAME"; return; }
   local doctor_json
   doctor_json="$(HOME="${HOME_DIR}" PATH="${HOME_DIR}/.local/bin:/usr/bin:/bin" \
     "${HOME_DIR}/.local/bin/safe" doctor --json)" || { fail "$FUNCNAME"; return; }
-  jq -e '.dependencies.core.safe_core.present == true
-    and .dependencies.core.safe_core.version == "1.16.0"
+  jq -e --arg ver "${SAFE_REPO_VERSION}" '.dependencies.core.safe_core.present == true
+    and .dependencies.core.safe_core.version == $ver
     and .environment.safe_core.version_matches == true
     and .environment.safe_core.warning == null' <<<"${doctor_json}" >/dev/null || { fail "$FUNCNAME"; return; }
   # The suite core is release-versioned for gate-time parity. Replace the
