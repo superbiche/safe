@@ -11,7 +11,7 @@ Full documentation is published at <https://superbiche.github.io/safe/>.
 ```bash
 git clone <repo-url> safe
 cd safe
-safe audit scan --project .
+safe audit repo-audit .
 bash install.sh
 safe audit setup
 safe run link
@@ -25,7 +25,7 @@ own zero-trust model: clone it, scan it, then install it.
 
 Project and machine scans default to dependency evidence plus first-party source
 files, while skipping installed dependency trees such as `node_modules/` and
-`vendor/`. Use `safe audit scan --verbose --project .` to see the resolved
+`vendor/`. Use `safe audit repo-audit . --verbose` to see the resolved
 target, scan mode, staged files, and scanner inputs.
 
 When a required scanner or detected project ecosystem audit tool is missing, the
@@ -38,10 +38,10 @@ The installer is idempotent. Reruns refresh binaries and wrappers while preservi
 
 ```bash
 safe run repomix@latest -- --help
-safe audit scan --project .
-safe audit scan --deps-only --project .
-safe audit scan --full --project .
-safe audit check left-pad@1.3.0 --ecosystem npm
+safe audit repo-audit .
+safe audit repo-audit . --deps-only
+safe audit repo-audit . --full
+safe audit package-audit left-pad@1.3.0 --ecosystem npm
 safe install -g cowsay@1.6.0
 safe install --sandbox --allow-scripts native-addon@1.0.0
 safe install --trust-host -g cowsay@1.6.0

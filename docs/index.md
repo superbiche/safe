@@ -17,7 +17,7 @@ Clone, inspect, scan, then install:
 ```bash
 git clone <repo-url> safe
 cd safe
-safe audit scan --project .
+safe audit repo-audit .
 bash install.sh
 ```
 
@@ -40,14 +40,14 @@ safe run repomix@latest -- --help
 Scan the current project:
 
 ```bash
-safe audit scan --project .
+safe audit repo-audit .
 ```
 
 Project and machine scans default to dependency evidence plus first-party source
 files, while skipping installed dependency trees such as `node_modules/` and
-`vendor/`. Use `safe audit scan --deps-only --project .` for lockfile and
-manifest evidence only, `safe audit scan --full --project .` for the complete
-tree, and `safe audit scan --verbose --project .` to inspect the resolved scan
+`vendor/`. Use `safe audit repo-audit . --deps-only` for lockfile and
+manifest evidence only, `safe audit repo-audit . --full` for the complete
+tree, and `safe audit repo-audit . --verbose` to inspect the resolved scan
 scope.
 
 Guard persistent package installs. `install.sh` writes PATH wrappers to

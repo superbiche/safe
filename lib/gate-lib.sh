@@ -22,7 +22,7 @@
 # arithmetic below has to be able to rely on the value it passed down.
 SAFE_GATE_SOCKET_BUDGET_DEFAULT=15
 SAFE_GATE_SOCKET_FRESH_SCAN_BUDGET_DEFAULT=90
-# Sequential multiplicity inside one `safe-audit check`, mirrored from
+# Sequential multiplicity inside one `safe-audit package-audit`, mirrored from
 # bin/safe-audit (PR#65 review F1 — the leash must cover the real bounded
 # path, not a one-of-each sketch):
 # - each socket_score_json call can run TWICE with its full budget: the first
@@ -280,7 +280,7 @@ safe_gate_socket_fresh_scan_budget() {
 }
 
 # The leash on the audit child must EXCEED the worst-case sum of the audit's
-# own component budgets: every network probe inside `safe-audit check` is
+# own component budgets: every network probe inside `safe-audit package-audit` is
 # individually bounded (Socket score and curl --max-time),
 # so a leash smaller than their sequential worst case guarantees the kill
 # lands here first and converts a legible per-component infra WARN into an
@@ -1292,7 +1292,7 @@ safe_gate_confirm_critical() {
     return $?
   fi
 
-  safe_gate_err "safe: BLOCKED install — safe audit scan found critical findings and this shell is non-interactive; to allow: ask the operator to re-run interactively and review; details: safe explain"
+  safe_gate_err "safe: BLOCKED install — safe audit repo-audit found critical findings and this shell is non-interactive; to allow: ask the operator to re-run interactively and review; details: safe explain"
   return 102
 }
 
@@ -1365,7 +1365,7 @@ safe_gate_scan_project() {
 
   if (( critical > 0 )); then
     if [[ -t 0 && -t 1 ]]; then
-      safe_gate_err "safe install: safe audit scan reported ${critical} critical finding(s) in this project's dependencies"
+      safe_gate_err "safe install: safe audit repo-audit reported ${critical} critical finding(s) in this project's dependencies"
     fi
     safe_gate_confirm_critical
     return $?
@@ -1373,7 +1373,7 @@ safe_gate_scan_project() {
 
   if (( scan_status == 0 )); then
     if (( have_verdict == 0 )); then
-      safe_gate_err "safe install: safe audit scan produced no readable result; the project was NOT audit-gated — safe doctor"
+      safe_gate_err "safe install: safe audit repo-audit produced no readable result; the project was NOT audit-gated — safe doctor"
       return 0
     fi
     # A scanner that broke does not stop an install — the documented policy is
@@ -1390,13 +1390,13 @@ safe_gate_scan_project() {
   # security tool must never do.
   if [[ "${scan_output,,}" == *critical* ]]; then
     if [[ -t 0 && -t 1 ]]; then
-      safe_gate_err "safe install: safe audit scan failed with exit ${scan_status} after reporting critical findings"
+      safe_gate_err "safe install: safe audit repo-audit failed with exit ${scan_status} after reporting critical findings"
     fi
     safe_gate_confirm_critical
     return $?
   fi
 
-  safe_gate_err "safe install: safe audit scan failed with exit ${scan_status}; the project was not fully audited — safe doctor; proceeding"
+  safe_gate_err "safe install: safe audit repo-audit failed with exit ${scan_status}; the project was not fully audited — safe doctor; proceeding"
   return 0
 }
 
@@ -1977,7 +1977,7 @@ safe_gate_allow_hint() {
       fi
       ;;
     *)
-      printf 'to allow: operator review — safe audit check %s --ecosystem %s' "${package}" "${ecosystem}"
+      printf 'to allow: operator review — safe audit package-audit %s --ecosystem %s' "${package}" "${ecosystem}"
       ;;
   esac
 }
@@ -2018,7 +2018,7 @@ safe_gate_check() {
       # can never clear a BLOCK verdict — and for a known-malware record the
       # hint would contradict the audit's own "do not pin around it"
       # (review PR#55 F2). Operator review is the only next step.
-      safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — safe audit verdict BLOCK; operator review required: safe audit check ${package} --ecosystem ${ecosystem} --json; details: safe explain"
+      safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — safe audit verdict BLOCK; operator review required: safe audit package-audit ${package} --ecosystem ${ecosystem} --json; details: safe explain"
       safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_BLOCK"
       return 104
       ;;
@@ -2645,7 +2645,7 @@ safe_gate_exec_gate() {
   local -a from_specs=() extra_specs=() audit_specs=() normalized=()
   local arg flag spec positional="" refuse_msg=""
   local expect_from=0 expect_extra=0 skip_next=0 after_dd=0 seen_pos=0
-  refuse_msg="safe: BLOCKED ${label} — cannot vet the packages named by a requirements file inline; to allow: ask the operator to review them (safe audit check <pkg> --ecosystem ${ecosystem}), then retry; details: safe explain"
+  refuse_msg="safe: BLOCKED ${label} — cannot vet the packages named by a requirements file inline; to allow: ask the operator to review them (safe audit package-audit <pkg> --ecosystem ${ecosystem}), then retry; details: safe explain"
 
   for arg in "$@"; do
     if (( expect_from )); then
@@ -3068,7 +3068,7 @@ safe_gate_uv() {
         break
       fi
       if [[ "${run_arg}" == "--with-requirements" || "${run_arg}" == --with-requirements=* ]]; then
-        safe_gate_err "safe: BLOCKED uv run — cannot vet the packages named by --with-requirements inline; to allow: ask the operator to review them (safe audit check <pkg> --ecosystem python), then retry; details: safe explain"
+        safe_gate_err "safe: BLOCKED uv run — cannot vet the packages named by --with-requirements inline; to allow: ask the operator to review them (safe audit package-audit <pkg> --ecosystem python), then retry; details: safe explain"
         return 100
       fi
       if [[ "${run_arg}" == --*=* ]]; then

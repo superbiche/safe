@@ -153,7 +153,7 @@ run_check() {
     MOCK_SOCKET_LOG="$CASE_LOG" \
     MOCK_SOCKET_MODE="$mode" \
     "${extra_env[@]}" \
-    "$SAFE_AUDIT" check fixture@1.0.0 --ecosystem npm --json "$@" > "$CASE_OUT" 2> "$CASE_ERR"
+    "$SAFE_AUDIT" package-audit fixture@1.0.0 --ecosystem npm --json "$@" > "$CASE_OUT" 2> "$CASE_ERR"
   CHECK_RC=$?
   set -e
 }
@@ -192,7 +192,7 @@ env -u SOCKET_SECURITY_API_TOKEN HOME="$CASE_HOME" PATH="$MOCKBIN:/usr/bin:/bin"
   SAFE_AUDIT_CONFIG_DIR="$CASE_AUDIT_CONFIG" SAFE_AUDIT_DATA_DIR="$CASE_DATA/audit" \
   SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" SAFE_AUDIT_SOCKET_CACHE_DIR="$CASE_CACHE" \
   MOCK_SOCKET_LOG="$CASE_LOG" MOCK_SOCKET_MODE=clean \
-  "$SAFE_AUDIT" check fixture@1.0.1 --ecosystem npm --json > "$CASE_OUT" 2> "$CASE_ERR"
+  "$SAFE_AUDIT" package-audit fixture@1.0.1 --ecosystem npm --json > "$CASE_OUT" 2> "$CASE_ERR"
 CHECK_RC=$?
 set -e
 expect_rc 0 'different exact version is independently scored'
@@ -311,7 +311,7 @@ run_multi() {
     SAFE_AUDIT_CONFIG_DIR="$CASE_AUDIT_CONFIG" SAFE_AUDIT_DATA_DIR="$CASE_DATA/audit" \
     SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" SAFE_AUDIT_SOCKET_CACHE_DIR="$CASE_CACHE" \
     MOCK_SOCKET_LOG="$CASE_LOG" MOCK_SOCKET_MODE="$mode" MOCK_MULTI_VERSION=1 \
-    "$SAFE_AUDIT" check fixture --ecosystem npm --op update --project-dir "$MULTI_DIR" \
+    "$SAFE_AUDIT" package-audit fixture --ecosystem npm --op update --project-dir "$MULTI_DIR" \
     --json > "$CASE_OUT" 2> "$CASE_ERR"
   CHECK_RC=$?
   set -e

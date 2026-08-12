@@ -247,7 +247,7 @@ STUB
   ( cd "$project" && TMPDIR="$tmpdir" PATH="$mockbin:$PATH" \
       SAFE_AUDIT_CONFIG_DIR="$TEST_ROOT/config-scan" \
       SAFE_AUDIT_DATA_DIR="$TEST_ROOT/data-scan" \
-      "$SAFE_AUDIT" scan --deps-only --allow-missing-tools --project . ) >/dev/null 2>&1 || true
+      "$SAFE_AUDIT" repo-audit . --deps-only --allow-missing-tools ) >/dev/null 2>&1 || true
 
   local left
   left="$(scratch_count "$tmpdir")"

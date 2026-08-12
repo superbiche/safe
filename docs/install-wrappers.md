@@ -171,20 +171,20 @@ jail.
 Package installs run:
 
 ```bash
-safe audit check <package>@<version> --ecosystem <ecosystem>
+safe audit package-audit <package>@<version> --ecosystem <ecosystem>
 ```
 
 Project-local installs run:
 
 ```bash
-safe audit scan --deps-only --project .
+safe audit repo-audit . --deps-only
 ```
 
 The preflight is deps-only on purpose: what an install is about to change is
 the dependency evidence, and that mode is the one the scan cache can replay, so
 a bare `npm ci` in an unchanged tree costs a cache hit rather than a full
 scanner run. The source-level risk scan a `--full` scan performs is not part of
-the preflight; run `safe audit scan --project .` for that.
+the preflight; run `safe audit repo-audit .` for that.
 
 If `safe audit` is missing, wrappers warn once and continue. If package checks are available, package install checks fail closed: `WARN`, `BLOCK`, timeouts, and audit failures stop before the real install command runs.
 
@@ -244,7 +244,7 @@ Non-install and non-exec commands pass through unchanged.
 ## Wrapped Exec and Update Commands
 
 Exec-style subcommands that fetch and run registry packages are audited the
-same way installs are — the named package goes through `safe audit check`
+same way installs are — the named package goes through `safe audit package-audit`
 before the real tool runs:
 
 ```bash

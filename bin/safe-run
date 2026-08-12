@@ -112,7 +112,7 @@ safe_audit_check_spec() {
   image="$SAFE_AUDIT_IMAGE"
   podman image exists "$image" 2>/dev/null || return 2
   audit_pkg="$SAFE_AUDIT_BIN"
-  audit_cmd=$(printf 'npx --yes --ignore-scripts %q check %q --ecosystem %q --json' \
+  audit_cmd=$(printf 'npx --yes --ignore-scripts %q package-audit %q --ecosystem %q --json' \
     "$audit_pkg" "$spec" "$ecosystem")
 
   [[ $- == *e* ]] && restore_errexit=1
@@ -1545,10 +1545,10 @@ host_allow_review_probe() {
   # every check stays (it is the probe's verifiable evidence, same as for
   # any other check consumer), but nothing else may be created.
   if command -v timeout >/dev/null 2>&1; then
-    out=$(SAFE_AUDIT_NO_INIT=1 timeout "$leash" "$SAFE_AUDIT_BIN" check "${pkg}@${version}" \
+    out=$(SAFE_AUDIT_NO_INIT=1 timeout "$leash" "$SAFE_AUDIT_BIN" package-audit "${pkg}@${version}" \
       --ecosystem "$ecosystem" --json </dev/null 2>/dev/null) || rc=$?
   else
-    out=$(SAFE_AUDIT_NO_INIT=1 "$SAFE_AUDIT_BIN" check "${pkg}@${version}" \
+    out=$(SAFE_AUDIT_NO_INIT=1 "$SAFE_AUDIT_BIN" package-audit "${pkg}@${version}" \
       --ecosystem "$ecosystem" --json </dev/null 2>/dev/null) || rc=$?
   fi
   REVIEW_AUDIT_EXIT=$rc

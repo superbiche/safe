@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.18.0"
+SAFE_VERSION="1.19.0"
 # Exported at the top level, not per-subcommand: safe-audit pins itself to
 # this version, and every route that reaches it — the gate, `safe audit ...`,
 # `safe install`, the safe-audit compatibility command — must carry it or the
@@ -231,7 +231,7 @@ cmd_report_fp() {
       "## What was checked",
       "",
       "```",
-      "safe audit check \($spec)" + (if .ecosystem then " --ecosystem \(.ecosystem)" else "" end),
+      "safe audit package-audit \($spec)" + (if .ecosystem then " --ecosystem \(.ecosystem)" else "" end),
       "```",
       "",
       "Exit code: `\($status)`  ·  Verdict: **\(.verdict // "unknown")**",
@@ -863,10 +863,10 @@ doctor_payload_json() {
     if jq -e . >/dev/null 2>&1 <<<"$capabilities_json"; then
       capabilities_available=true
       capabilities_version=$(jq -r '.version // empty' <<<"$capabilities_json")
-      capability_verify_release_asset=$(jq -r '.capabilities["verify.release-asset"] // false' <<<"$capabilities_json")
-      capability_verify_sigstore_bundle=$(jq -r '.capabilities["verify.sigstore-bundle"] // false' <<<"$capabilities_json")
-      capability_verify_tuf_bootstrap=$(jq -r '.capabilities["verify.tuf-bootstrap"] // false' <<<"$capabilities_json")
-      capability_binary_exec=$(jq -r '.capabilities["binary.exec"] // false' <<<"$capabilities_json")
+      capability_verify_release_asset=$(jq -r '.capabilities["binary-audit.verify.release-asset"] // false' <<<"$capabilities_json")
+      capability_verify_sigstore_bundle=$(jq -r '.capabilities["binary-audit.verify.sigstore-bundle"] // false' <<<"$capabilities_json")
+      capability_verify_tuf_bootstrap=$(jq -r '.capabilities["binary-audit.verify.tuf-bootstrap"] // false' <<<"$capabilities_json")
+      capability_binary_exec=$(jq -r '.capabilities["binary-audit.exec"] // false' <<<"$capabilities_json")
     fi
   fi
 
@@ -1231,7 +1231,7 @@ install flags. Critical findings refuse with exit 104 even under `--yes`; a
 WARN verdict needs `--yes` or an interactive accept (exit 102 in a
 non-interactive shell); a scanner that ran and failed refuses with exit 100.
 
-Host installs are audited with `safe audit check` before the package manager runs.
+Host installs are audited with `safe audit package-audit` before the package manager runs.
 `--yes` skips the final confirmation prompt after a successful audit.
 `--trust-host` adds exact npm versions to safe run host-allow after install.
 EOF
@@ -1687,7 +1687,7 @@ safe_install_audit_package() {
   [[ -n "${SAFE_INSTALL_NPM_GLOBALCONFIG:-}" ]] && extra+=(--npm-globalconfig "$SAFE_INSTALL_NPM_GLOBALCONFIG")
 
   set +e
-  "$SAFE_AUDIT_PATH" check "$package" --ecosystem "$ecosystem" --gate install --op install ${extra[@]+"${extra[@]}"}
+  "$SAFE_AUDIT_PATH" package-audit "$package" --ecosystem "$ecosystem" --gate install --op install ${extra[@]+"${extra[@]}"}
   audit_status=$?
   set -e
 
@@ -1710,7 +1710,7 @@ safe_install_audit_package() {
       # known-malware record the hint would contradict the audit's own
       # "do not pin around it" (review PR#55 F2).
       safe_install_gate_log "$ecosystem" "$package" "REFUSED_BLOCK"
-      refuse 104 "BLOCKED ${ecosystem} install of ${package} — safe audit verdict BLOCK; operator review required: safe audit check ${package} --ecosystem ${ecosystem} --json; details: safe explain"
+      refuse 104 "BLOCKED ${ecosystem} install of ${package} — safe audit verdict BLOCK; operator review required: safe audit package-audit ${package} --ecosystem ${ecosystem} --json; details: safe explain"
       ;;
     30)
       # The audit could not compute a verdict at all. That is breakage to
@@ -1760,7 +1760,7 @@ safe_install_allow_hint() {
       fi
       ;;
     *)
-      printf 'to allow: operator review — safe audit check %s --ecosystem %s' "$package" "$ecosystem"
+      printf 'to allow: operator review — safe audit package-audit %s --ecosystem %s' "$package" "$ecosystem"
       ;;
   esac
 }
@@ -1866,7 +1866,7 @@ cmd_install_project() {
   # --allow-missing-tools: an ecosystem auditor that is not installed comes
   # back as a "not run" record this mode reports, rather than aborting the
   # scan and leaving a Rust or Go project unauditable from any script.
-  "$SAFE_AUDIT_PATH" scan --deps-only --allow-missing-tools --project . \
+  "$SAFE_AUDIT_PATH" repo-audit . --deps-only --allow-missing-tools \
     --result-out "$result_path" > "$scan_log" 2>&1
   scan_rc=$?
   set -e
@@ -1883,11 +1883,11 @@ cmd_install_project() {
     # reads this refusal to the wrong place.
     local cause
     if [[ "$scan_rc" -ne 0 && -s "$result_path" ]]; then
-      cause="safe audit scan exited ${scan_rc} after writing its result"
+      cause="safe audit repo-audit exited ${scan_rc} after writing its result"
     elif [[ "$scan_rc" -ne 0 ]]; then
-      cause="safe audit scan failed (exit ${scan_rc}) and produced no result"
+      cause="safe audit repo-audit failed (exit ${scan_rc}) and produced no result"
     else
-      cause="safe audit scan reported success but produced no result document"
+      cause="safe audit repo-audit reported success but produced no result document"
     fi
     rm -f "$result_path"
     safe_install_gate_log "project" "$(pwd)" "REFUSED_SCAN_UNREADABLE" "exit=${scan_rc}"
@@ -2002,7 +2002,7 @@ cmd_install_project() {
     ' "$result_path" 2>/dev/null || printf '')"
     safe_install_gate_log "project" "$(pwd)" "REFUSED_BLOCK" "critical=${critical} verdict=${verdict}"
     rm -f "$result_path"
-    refuse 104 "BLOCKED project audit — critical advisories in this project's dependencies (${critical_sources:-verdict ${verdict}}); to allow: operator review — safe audit scan --deps-only --project .; details: safe explain"
+    refuse 104 "BLOCKED project audit — critical advisories in this project's dependencies (${critical_sources:-verdict ${verdict}}); to allow: operator review — safe audit repo-audit .; details: safe explain"
   fi
   rm -f "$result_path"
 

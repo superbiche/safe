@@ -2209,7 +2209,7 @@ case_critical_scan_non_tty_aborts() {
   assert_status 102 "$FUNCNAME" || return
   assert_project_scan_logged "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
-  assert_err_contains_fragment 'safe: BLOCKED install — safe audit scan found critical findings' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe: BLOCKED install — safe audit repo-audit found critical findings' "$FUNCNAME" || return
   # Non-TTY refusals are exactly one line: the interactive preamble (which
   # says the scan FAILED, never that it "found" something) stays out.
   assert_err_not_contains_fragment 'after reporting critical findings' "$FUNCNAME" || return
@@ -2227,7 +2227,7 @@ case_critical_in_result_blocks_despite_exit_zero() {
   assert_status 102 "$FUNCNAME" || return
   assert_project_scan_logged "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
-  assert_err_contains_fragment 'safe: BLOCKED install — safe audit scan found critical findings' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe: BLOCKED install — safe audit repo-audit found critical findings' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 

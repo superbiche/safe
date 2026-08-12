@@ -86,7 +86,7 @@ run_scan() {
       SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS="${SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS:-86400}" \
       SAFE_AUDIT_CONFIG_DIR="$CASE_DIR/audit-config" \
       SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
-      "$SAFE_AUDIT" scan --deps-only --project . "$@"
+      "$SAFE_AUDIT" repo-audit . --deps-only "$@"
   ) > "$OUT_FILE" 2>&1
   STATUS=$?
   set -e
@@ -105,7 +105,7 @@ run_scan_source_mode() {
       SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS="${SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS:-86400}" \
       SAFE_AUDIT_CONFIG_DIR="$CASE_DIR/audit-config" \
       SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
-      "$SAFE_AUDIT" scan --project .
+      "$SAFE_AUDIT" repo-audit .
   ) > "$OUT_FILE" 2>&1
   STATUS=$?
   set -e

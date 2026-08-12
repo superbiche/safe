@@ -67,7 +67,7 @@ run_fixture WARN '
   run_sandbox() { SANDBOX_AUDIT_EXTRA="sbom_vulns=0"; return 0; }
   dispatch_run
 '
-grep -q 'check warnpkg@1.0.0 --ecosystem npm --json' "$tmp/audit-calls-WARN.log" || fail "safe audit check did not run before sandbox"
+grep -q 'package-audit warnpkg@1.0.0 --ecosystem npm --json' "$tmp/audit-calls-WARN.log" || fail "safe audit package-audit did not run before sandbox"
 grep -q 'SANDBOX.*OK.*sbom_vulns=0' "$tmp/data-WARN/audit.log" || fail "sandbox audit omitted sbom_vulns"
 pass "WARN continues to sandbox with sbom audit"
 

@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **Breaking — `safe audit` subcommands renamed to four narrow surfaces.**
+  `check` → `package-audit`, `scan --project <path>` → `repo-audit [<path>]`,
+  `scan` → `machine-audit`, and `binary`/`verify`/`release`/`vuln` → subverbs
+  of `binary-audit`. The old spellings are gone; there are no aliases. Each
+  surface now has one role and one vocabulary, over the same shared internals
+  (`scan_machine` is unchanged).
+
+  The reason is a defect the shared entrypoint kept producing: `scan` served
+  both a project audit and a fleet audit from one body, iterating machine
+  targets unconditionally, so auditing a directory printed fleet vocabulary —
+  `scan: finished rainbow project '/home/…'`. `repo-audit` has no machine
+  dimension at all; it resolves the local machine only because `scan_machine`
+  needs an execution context, and never names it. Auditing a project on a
+  remote host stays available as
+  `safe audit machine-audit --project <path> --machine <name>`.
+
+  `repo-audit` also takes its target as a positional path defaulting to `.`
+  rather than `--project`, and rejects `--all`/`--machine` with a message
+  naming `machine-audit`.
+
 - The verdict decision now lives in Go (`internal/verdict`, exposed as
   `safe-core package-verdict`). `bin/safe-audit` still gathers all evidence —
   version resolution, Socket scoring, OSV classification, release age,

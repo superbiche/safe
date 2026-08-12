@@ -63,8 +63,8 @@ safe audit setup --machine remote-a --bundle ./scanners.tar.gz
 Default scans use `source` mode:
 
 ```bash
-safe audit scan --project .
-safe audit scan --machine remote-a
+safe audit repo-audit .
+safe audit machine-audit --machine remote-a
 ```
 
 This scans dependency evidence plus first-party source and skips installed
@@ -73,19 +73,19 @@ dependency trees and generated output.
 For a faster dependency-only pass:
 
 ```bash
-safe audit scan --deps-only --project .
+safe audit repo-audit . --deps-only
 ```
 
 For a deep scan that includes installed dependency trees:
 
 ```bash
-safe audit scan --full --project .
+safe audit repo-audit . --full
 ```
 
 When validating scan scope, use verbose mode:
 
 ```bash
-safe audit scan --verbose --project .
+safe audit repo-audit . --verbose
 ```
 
 ## Diff Recent Results
