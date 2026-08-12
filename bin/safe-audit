@@ -7475,8 +7475,22 @@ check_command() {
   local socket_pending=0
   socket_line="PASS (no behavioral anomalies)"
   if [[ "$(jq -r '.status // empty' "$socket_json" 2>/dev/null)" == "skipped" ]]; then
-    # A deliberate policy skip is not an outage: no cause, no verdict bump.
+    # A policy skip and an outage are different EVENTS — different cause,
+    # different advice — but they carry the same evidence: none. Socket is
+    # the only behavioral tier since GuardDog was removed, so declining to
+    # consult it cannot also certify the package as clean; intent does not
+    # make an artifact safer. The skip stays free (no API call, no timeout),
+    # it just stops producing a clean GO on its own.
+    #
+    # An operator who wants exactly this posture — offline host, exhausted
+    # quota, curated internal registry where OSV + blocklist + cooldown is
+    # the accepted policy — declares it by adding socket_disabled to
+    # install.auto_allow_tolerate, which records WARN_TOLERATED rather than
+    # GO so a tolerated skip can never later read as a real clean check.
     socket_line="SKIP ($(jq -r '.note' "$socket_json"))"
+    warn_causes+=("socket_disabled")
+    socket_detail=$(jq -r '.note // "socket disabled by policy"' "$socket_json" 2>/dev/null || true)
+    verdict="WARN"
   elif [[ "$(jq -r '.available // false' "$socket_json" 2>/dev/null)" != "true" ]]; then
     socket_line='SKIP (socket CLI not available)'
     warn_causes+=("socket_unavailable")
@@ -8137,6 +8151,7 @@ gate_emit_refusal_hints() {
   local -a causes=("${@}")
   local cause has_socket_infra=0 has_unresolved=0 has_affecting=0 has_osv_down=0
   local has_low_score=0 has_socket_high=0 has_socket_critical_cve=0 has_socket_malware=0
+  local has_socket_disabled=0
   local has_custom_source=0 has_malware=0 has_too_new=0
   for cause in "${causes[@]}"; do
     case "$cause" in
@@ -8145,6 +8160,7 @@ gate_emit_refusal_hints() {
       socket_high_alert) has_socket_high=1 ;;
       socket_critical_cve) has_socket_critical_cve=1 ;;
       socket_malware) has_socket_malware=1 ;;
+      socket_disabled) has_socket_disabled=1 ;;
       version_unresolved) has_unresolved=1 ;;
       osv_affecting) has_affecting=1 ;;
       osv_unavailable) has_osv_down=1 ;;
@@ -8175,6 +8191,10 @@ gate_emit_refusal_hints() {
   fi
   if (( has_socket_malware )); then
     printf 'safe audit: Socket reports a critical supply-chain-risk alert — do not install or pin around it; operator review only\n' >&2
+  fi
+  if (( has_socket_disabled )); then
+    printf 'safe audit: the behavioral tier is off (install.socket.mode=never), so this check has no behavioral evidence — advisories, blocklist and release age still applied\n' >&2
+    printf 'safe audit: to run this posture routinely: add socket_disabled to install.auto_allow_tolerate; to re-enable the tier: set install.socket.mode=auto\n' >&2
   fi
   if (( has_custom_source )); then
     printf 'safe audit: custom package source — public advisory evidence cannot vouch for a private artifact\n' >&2

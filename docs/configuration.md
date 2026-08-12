@@ -113,8 +113,17 @@ unchanged.
   cooldown for an ordinary feature release.
 - `socket.mode`: Socket is the primary behavioral tier. `auto` (default) and
   `always` both consult it for every check; `never` is the sole intentional
-  skip and is recorded as `socket_disabled` without pretending the service
-  failed.
+  skip. The skip is free — no request, no timeout — and is recorded as
+  `socket_disabled`, distinct from the causes that mean the service failed.
+  Because Socket is the only behavioral tier, a check that skipped it has no
+  behavioral evidence, so `never` warns rather than passing on its own:
+  advisories, blocklist, and release age still apply, and the result reflects
+  what was actually gathered.
+  If that posture is deliberate — an offline host, an exhausted quota, or a
+  curated internal registry where advisories plus blocklist plus cooldown is
+  the accepted policy — add `socket_disabled` to `auto_allow_tolerate`. The
+  gate then passes and records `WARN_TOLERATED` rather than `GO`, so a
+  tolerated skip is never later mistaken for a completed check.
 - `socket.cache_ttl_days`: cache a validated successful Socket envelope for
   the exact ecosystem, package name, and resolved version. Default: `7`; `0`
   disables caching. Entries live under `~/.cache/safe/socket/`, are private

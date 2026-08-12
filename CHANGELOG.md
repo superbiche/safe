@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `install.socket.mode=never` no longer produces a clean GO on its own. Since
+  Socket became the only behavioral tier, a check that skips it has gathered
+  no behavioral evidence, and declining to look does not make an artifact
+  safer — so the skip warns and is recorded as `socket_disabled`, distinct
+  from the causes that mean Socket failed. The skip stays free: no request, no
+  timeout. Operators who want that posture routinely can add `socket_disabled`
+  to `install.auto_allow_tolerate`, which passes the gate and records
+  `WARN_TOLERATED` rather than `GO`.
+
 - GuardDog has been removed from the install gate. Socket is now the primary
   behavioral tier for every check unless `install.socket.mode=never` is set.
   A critical `supplyChainRisk` alert BLOCKs; critical vulnerability, high
