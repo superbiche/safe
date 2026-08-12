@@ -5,7 +5,7 @@ Clone the repository, inspect it, scan it, then run the installer:
 ```bash
 git clone <repo-url> safe
 cd safe
-safe audit scan --project .
+safe audit repo-audit .
 bash install.sh
 ```
 

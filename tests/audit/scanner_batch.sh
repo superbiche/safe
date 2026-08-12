@@ -517,7 +517,7 @@ case_paginated_requery_enforces_id_schema() {
 
 case_severity_scoped_to_queried_package() {
   # PR#64 delta F12: another affected package's critical must not classify
-  # the queried package — check_command scopes to matching_affected, and
+  # the queried package — package_audit_command scopes to matching_affected, and
   # the scanner must agree.
   setup_case sevscope
   MOCK_BATCH_FIXTURE="$FIXDIR/batch-sevscope.json"

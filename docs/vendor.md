@@ -4,7 +4,7 @@
 it checks named packages against Socket / OSV / the blocklist. Native vendor
 binaries — installed by a vendor's own installer and updated over the vendor's
 own infrastructure — have no public registry manifest, so there is no
-`safe audit check` analog for them.
+`safe audit package-audit` analog for them.
 
 `safe vendor update` covers that gap. It is an **audit trail, not a gate**: it
 records the before/after binary hash, the observed version, the reason, and the

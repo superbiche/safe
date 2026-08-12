@@ -38,7 +38,7 @@ or `safe-audit`.
 - networkless binary execution;
 - IOC updates and scans.
 
-`safe install -g` runs `safe audit check` for explicit package specs, prompts,
+`safe install -g` runs `safe audit package-audit` for explicit package specs, prompts,
 then delegates to the selected package manager. npm is the default; `--pnpm`,
 `--yarn`, `--bun`, and `--composer` translate `-g` to each manager's native
 global command. After successful installs of exact npm versions, interactive
@@ -46,8 +46,8 @@ runs can add that exact version to host-allow; `--trust-host` makes that step
 explicit. `safe install --sandbox` keeps the isolated `safe run install` workflow.
 
 Install wrappers are executable shims on PATH that exec `safe gate <tool>`.
-The gate runs `safe audit check` (install-gate mode) for package installs or
-`safe audit scan --project .` for project-local installs, then delegates to
+The gate runs `safe audit package-audit` (install-gate mode) for package installs or
+`safe audit repo-audit .` for project-local installs, then delegates to
 the first non-wrapper executable of that name on PATH — so mise/asdf shims
 and per-project tool versions keep working, in every shell.
 
@@ -66,7 +66,7 @@ sandbox-known  known enough for sandbox execution
 unknown        prompt in TTY, block in non-TTY
 ```
 
-`blocked.json` is shared by `safe run` and `safe audit check`, so a package
+`blocked.json` is shared by `safe run` and `safe audit package-audit`, so a package
 blocked during audit is also refused by the runner.
 
 ## Data Flow

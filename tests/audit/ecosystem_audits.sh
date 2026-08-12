@@ -91,7 +91,7 @@ run_scan() {
       SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
       SAFE_AUDIT_SCAN_NO_CACHE=1 \
       "$@" \
-      "$SAFE_AUDIT" scan --deps-only --project . --result-out "$RESULT"
+      "$SAFE_AUDIT" repo-audit . --deps-only --result-out "$RESULT"
   ) > "$CASE_DIR/scan.out" 2>&1
   STATUS=$?
   set -e
@@ -451,7 +451,7 @@ case_pnpm_project_still_caches() {
     env HOME="$CASE_DIR/home" PATH="$MOCKBIN:/usr/bin:/bin" \
       SAFE_AUDIT_CONFIG_DIR="$CASE_DIR/audit-config" \
       SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
-      "$SAFE_AUDIT" scan --deps-only --project . --result-out "$RESULT"
+      "$SAFE_AUDIT" repo-audit . --deps-only --result-out "$RESULT"
   ) > "$CASE_DIR/scan-cached.out" 2>&1
   local rc=$?
   set -e
@@ -478,7 +478,7 @@ case_missing_tool_is_reported_not_fatal_when_allowed() {
       SAFE_AUDIT_CONFIG_DIR="$CASE_DIR/audit-config" \
       SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
       SAFE_AUDIT_SCAN_NO_CACHE=1 \
-      "$SAFE_AUDIT" scan --deps-only --project . --allow-missing-tools --result-out "$RESULT"
+      "$SAFE_AUDIT" repo-audit . --deps-only --allow-missing-tools --result-out "$RESULT"
   ) > "$CASE_DIR/scan-allowed.out" 2>&1
   local rc_with=$?
   set -e

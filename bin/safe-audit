@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.1.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.18.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.19.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -61,14 +61,15 @@ BINARY_AUDIT_STDIO_LIMIT="${SAFE_AUDIT_BINARY_STDIO_LIMIT:-4000}"
 BINARY_AUDIT_STDIO_LINES="${SAFE_AUDIT_BINARY_STDIO_LINES:-40}"
 
 declare -ar SAFE_AUDIT_CAPABILITY_NAMES=(
-  scan
-  check
-  release.github
-  vuln.github-release
-  verify.release-asset
-  verify.sigstore-bundle
-  verify.tuf-bootstrap
-  binary.exec
+  package-audit
+  repo-audit
+  machine-audit
+  binary-audit.exec
+  binary-audit.release.github
+  binary-audit.vuln.github-release
+  binary-audit.verify.release-asset
+  binary-audit.verify.sigstore-bundle
+  binary-audit.verify.tuf-bootstrap
   ioc.lookup
   ioc.list
   ioc.update
@@ -875,24 +876,19 @@ capabilities_payload_json() {
       capabilities: $capabilities,
       groups: {
         top_level: {
-          scan: $capabilities.scan,
-          check: $capabilities.check,
+          "package-audit": $capabilities["package-audit"],
+          "repo-audit": $capabilities["repo-audit"],
+          "machine-audit": $capabilities["machine-audit"],
           diff: $capabilities.diff,
           status: $capabilities.status
         },
-        release: {
-          github: $capabilities["release.github"]
-        },
-        vuln: {
-          "github-release": $capabilities["vuln.github-release"]
-        },
-        verify: {
-          "release-asset": $capabilities["verify.release-asset"],
-          "sigstore-bundle": $capabilities["verify.sigstore-bundle"],
-          "tuf-bootstrap": $capabilities["verify.tuf-bootstrap"]
-        },
-        binary: {
-          exec: $capabilities["binary.exec"]
+        "binary-audit": {
+          exec: $capabilities["binary-audit.exec"],
+          "release.github": $capabilities["binary-audit.release.github"],
+          "vuln.github-release": $capabilities["binary-audit.vuln.github-release"],
+          "verify.release-asset": $capabilities["binary-audit.verify.release-asset"],
+          "verify.sigstore-bundle": $capabilities["binary-audit.verify.sigstore-bundle"],
+          "verify.tuf-bootstrap": $capabilities["binary-audit.verify.tuf-bootstrap"]
         },
         ioc: {
           lookup: $capabilities["ioc.lookup"],
@@ -1291,7 +1287,7 @@ confirm_scan_with_missing_tools() {
 
   local setup_cmd scan_cmd
   setup_cmd="safe audit setup $(printf '%q' "$machine")"
-  scan_cmd="safe audit scan --machine $(printf '%q' "$machine")"
+  scan_cmd="safe audit machine-audit --machine $(printf '%q' "$machine")"
   if [[ -n "$project_target" ]]; then
     scan_cmd+=" --project $(printf '%q' "$project_target")"
   fi
@@ -1859,7 +1855,7 @@ confirm_scan_with_missing_project_audit_tools() {
   fi
 
   local scan_cmd
-  scan_cmd="safe audit scan --machine $(printf '%q' "$machine")"
+  scan_cmd="safe audit machine-audit --machine $(printf '%q' "$machine")"
   if [[ -n "$project_target" ]]; then
     scan_cmd+=" --project $(printf '%q' "$project_target")"
   fi
@@ -5035,7 +5031,7 @@ socket_score_json() {
   # 15s sub-budget via SAFE_AUDIT_SOCKET_TIMEOUT and leashes the whole check
   # with a computed backstop that exceeds the sum of all component budgets
   # (safe_gate_audit_leash_seconds in lib/gate-lib.sh) — this budget is the
-  # operative bound, never the gate leash. A direct `safe-audit check` had no
+  # operative bound, never the gate leash. A direct `safe-audit package-audit` had no
   # bound at all, and an
   # intermittently wedged socket CLI hung it for minutes with zero output —
   # which reads as breakage and teaches an agent to route around the gate
@@ -5314,7 +5310,7 @@ osv_query_package_json() {
 # ---------------------------------------------------------------------------
 # Target-version resolution and version-aware advisory matching.
 #
-# `safe audit check` used to post version:"latest" to OSV, which cannot parse
+# `safe audit package-audit` used to post version:"latest" to OSV, which cannot parse
 # it and returns every advisory ever filed for the package — so the verdict
 # was a version-blind count that WARN-blocked the very bumps remediating a
 # CVE. The resolver below determines the version the package manager would
@@ -7282,7 +7278,7 @@ effective_sources_command() {
   printf '\n'
 }
 
-check_command() {
+package_audit_command() {
   local ecosystem="" json_mode=0 spec="" op="install" gate=""
   # Target-context selectors from the audited command line (dynamically
   # scoped: the resolver helpers read them). CHECK_EFFECTIVE_SOURCES is the
@@ -7348,7 +7344,7 @@ check_command() {
         shift 2
         ;;
       -*)
-        die "unknown check flag: $1"
+        die "unknown package-audit flag: $1"
         ;;
       *)
         spec="$1"
@@ -7356,7 +7352,7 @@ check_command() {
         ;;
     esac
   done
-  [[ -z "$spec" ]] && die "usage: safe audit check <pkg>[@<version>] [--ecosystem <name>] [--installer <name>] [--op install|update] [--gate install] [--dist-tag <t>] [--registry <url>] [--project-dir <dir>] [--json]"
+  [[ -z "$spec" ]] && die "usage: safe audit package-audit <pkg>[@<version>] [--ecosystem <name>] [--installer <name>] [--op install|update] [--gate install] [--dist-tag <t>] [--registry <url>] [--project-dir <dir>] [--json]"
   [[ "$op" == "install" || "$op" == "update" ]] || die "--op must be install or update"
   [[ -z "$gate" || "$gate" == "install" ]] || die "--gate supports only: install"
 
@@ -7936,7 +7932,7 @@ check_command() {
         "$socket_detail" "$release_security_fix_ids" "$([[ "$block_line" == PASS* ]] && printf 1 || printf 0)" \
         ${warn_causes[@]+"${warn_causes[@]}"}
       if [[ "$verdict" == "BLOCK" ]]; then
-        printf 'safe audit: operator review required: safe audit check %s --ecosystem %s --json\n' \
+        printf 'safe audit: operator review required: safe audit package-audit %s --ecosystem %s --json\n' \
           "$( (( resolution_ok )) && printf '%s@%s' "$PKG_NAME" "$primary_version" || printf '%s' "$spec")" "$ecosystem" >&2
       fi
     fi
@@ -8037,7 +8033,7 @@ check_command() {
         gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" "$aff_count" \
           "$socket_detail" "" "$([[ "$block_line" == PASS* ]] && printf 1 || printf 0)" \
           "${warn_causes[@]}"
-        printf 'safe audit: operator review required: safe audit check %s --ecosystem %s --json\n' \
+        printf 'safe audit: operator review required: safe audit package-audit %s --ecosystem %s --json\n' \
           "$( (( resolution_ok )) && printf '%s@%s' "$PKG_NAME" "$primary_version" || printf '%s' "$spec")" "$ecosystem" >&2
         revoke_install_known "$ecosystem" "$PKG_NAME" "$primary_version" ${RESOLVED_VERSIONS[@]+"${RESOLVED_VERSIONS[@]}"}
         gate_exit=20
@@ -8136,7 +8132,7 @@ gate_emit_refusal_hints() {
     if [[ -n "$affecting_allow_cmd" ]]; then
       printf 'safe audit: to allow this exact version: %s\n' "$affecting_allow_cmd" >&2
     else
-      printf 'safe audit: operator review: safe audit check %s@<x.y.z> --ecosystem %s --json\n' \
+      printf 'safe audit: operator review: safe audit package-audit %s@<x.y.z> --ecosystem %s --json\n' \
         "$name" "$ecosystem" >&2
     fi
   fi
@@ -8147,7 +8143,7 @@ gate_emit_refusal_hints() {
   fi
   if (( has_unresolved )); then
     printf 'safe audit: could not resolve the target version for %s — pin an exact version and retry\n' "$name" >&2
-    printf 'safe audit: inspect: safe audit check %s@<x.y.z> --ecosystem %s\n' "$name" "$ecosystem" >&2
+    printf 'safe audit: inspect: safe audit package-audit %s@<x.y.z> --ecosystem %s\n' "$name" "$ecosystem" >&2
   fi
   if (( has_osv_down )); then
     printf 'safe audit: OSV advisory service unreachable — retry; if persistent, operator review\n' >&2
@@ -8188,7 +8184,7 @@ release_github_command() {
         ;;
     esac
   done
-  [[ -n "$repo" && -n "$version" && -n "$asset" ]] || die "usage: safe audit release github --repo OWNER/REPO --version TAG --asset NAME [--json]"
+  [[ -n "$repo" && -n "$version" && -n "$asset" ]] || die "usage: safe audit binary-audit release github --repo OWNER/REPO --version TAG --asset NAME [--json]"
 
   local subject="github:${repo}@${version}#${asset}"
   local scratch checks_file reasons_file data_file
@@ -8443,7 +8439,7 @@ vuln_github_release_command() {
         ;;
     esac
   done
-  [[ -n "$repo" && -n "$version" ]] || die "usage: safe audit vuln github-release --repo OWNER/REPO --version TAG [--json]"
+  [[ -n "$repo" && -n "$version" ]] || die "usage: safe audit binary-audit vuln github-release --repo OWNER/REPO --version TAG [--json]"
 
   local subject="github:${repo}@${version}"
   local scratch checks_file reasons_file data_file advisories_json findings_file
@@ -8642,7 +8638,7 @@ verify_release_asset_command() {
         ;;
     esac
   done
-  [[ -n "$artifact" && -n "$checksum" ]] || die "usage: safe audit verify release-asset --artifact PATH --checksum PATH [--certificate PATH --signature PATH --certificate-identity-regexp REGEX --certificate-oidc-issuer URL] [--require-signature] [--json]"
+  [[ -n "$artifact" && -n "$checksum" ]] || die "usage: safe audit binary-audit verify release-asset --artifact PATH --checksum PATH [--certificate PATH --signature PATH --certificate-identity-regexp REGEX --certificate-oidc-issuer URL] [--require-signature] [--json]"
 
   local artifact_abs checksum_abs certificate_abs="" signature_abs=""
   artifact_abs=$(absolute_path "$artifact")
@@ -8827,7 +8823,7 @@ verify_sigstore_bundle_command() {
         ;;
     esac
   done
-  [[ -n "$artifact" && -n "$bundle" && -n "$identity" && -n "$oidc_issuer" ]] || die "usage: safe audit verify sigstore-bundle --artifact PATH --bundle PATH --identity VALUE --oidc-issuer URL [--json]"
+  [[ -n "$artifact" && -n "$bundle" && -n "$identity" && -n "$oidc_issuer" ]] || die "usage: safe audit binary-audit verify sigstore-bundle --artifact PATH --bundle PATH --identity VALUE --oidc-issuer URL [--json]"
 
   local artifact_abs bundle_abs
   artifact_abs=$(absolute_path "$artifact")
@@ -8990,7 +8986,7 @@ verify_tuf_bootstrap_command() {
         ;;
     esac
   done
-  [[ -n "$mirror_input" && -n "$root" && -n "$root_checksum" && "${#target_specs[@]}" -gt 0 ]] || die "usage: safe audit verify tuf-bootstrap --mirror PATH --root PATH --root-checksum SHA256 --target NAME=PATH [--target NAME=PATH ...] [--json]"
+  [[ -n "$mirror_input" && -n "$root" && -n "$root_checksum" && "${#target_specs[@]}" -gt 0 ]] || die "usage: safe audit binary-audit verify tuf-bootstrap --mirror PATH --root PATH --root-checksum SHA256 --target NAME=PATH [--target NAME=PATH ...] [--json]"
 
   local normalized_root_checksum
   normalized_root_checksum=$(normalize_sha256_checksum "$root_checksum") || die "--root-checksum must be a sha256 digest"
@@ -9381,7 +9377,7 @@ binary_exec_command() {
         ;;
     esac
   done
-  [[ -n "$artifact" ]] || die "usage: safe audit binary exec PATH [--timeout SECONDS] [--json] -- [ARGS...]"
+  [[ -n "$artifact" ]] || die "usage: safe audit binary-audit exec PATH [--timeout SECONDS] [--json] -- [ARGS...]"
 
   local artifact_abs
   artifact_abs=$(absolute_path "$artifact")
@@ -9668,7 +9664,7 @@ scanner_batch_command() {
   # MAL-* ids are known-malware and need no fetch. Everything else is
   # fetched once per distinct id, the record validated as the advisory it
   # claims to be, and classified by the SAME most-severe-candidate-wins
-  # ladder check_command uses (qualitative labels + every CVSS v3/v4
+  # ladder package_audit_command uses (qualitative labels + every CVSS v3/v4
   # vector) — the legacy substring matcher read a raw "CVSS:3.1/..." vector
   # as "low" and downgraded criticals to warn (PR#64 review F1). A record
   # that cannot be parsed is infrastructure breakage, never an
@@ -9689,7 +9685,7 @@ scanner_batch_command() {
       printf 'safe audit: scanner-batch: OSV advisory record malformed (%s) — audit-infrastructure breakage, not a package finding\n' "$id" >&2
       return 4
     fi
-    # Severity is scoped per QUERIED package, exactly as check_command
+    # Severity is scoped per QUERIED package, exactly as package_audit_command
     # scopes vuln_sev to matching_affected: whole-record aggregation
     # imported another affected package's critical into this package's
     # verdict (PR#64 delta F12). Top-level severity and
@@ -9745,37 +9741,40 @@ scanner_batch_command() {
   printf '%s\n' "$advisories"
 }
 
-cmd_release() {
-  local sub="${1:-}"
-  case "$sub" in
-    github) shift; release_github_command "$@" ;;
-    *) die "unknown release subcommand: ${sub:-}" ;;
-  esac
-}
-
-cmd_vuln() {
-  local sub="${1:-}"
-  case "$sub" in
-    github-release) shift; vuln_github_release_command "$@" ;;
-    *) die "unknown vuln subcommand: ${sub:-}" ;;
-  esac
-}
-
-cmd_verify() {
-  local sub="${1:-}"
-  case "$sub" in
-    release-asset) shift; verify_release_asset_command "$@" ;;
-    sigstore-bundle) shift; verify_sigstore_bundle_command "$@" ;;
-    tuf-bootstrap) shift; verify_tuf_bootstrap_command "$@" ;;
-    *) die "unknown verify subcommand: ${sub:-}" ;;
-  esac
-}
-
-cmd_binary() {
+# binary-audit: everything that judges a distributed ARTIFACT rather than a
+# dependency graph — release assets, signatures, TUF roots, and executing an
+# unknown binary under observation.
+binary_audit_command() {
   local sub="${1:-}"
   case "$sub" in
     exec) shift; binary_exec_command "$@" ;;
-    *) die "unknown binary subcommand: ${sub:-}" ;;
+    release)
+      shift
+      local rsub="${1:-}"
+      case "$rsub" in
+        github) shift; release_github_command "$@" ;;
+        *) die "unknown binary-audit release subcommand: ${rsub:-}" ;;
+      esac
+      ;;
+    vuln)
+      shift
+      local vsub="${1:-}"
+      case "$vsub" in
+        github-release) shift; vuln_github_release_command "$@" ;;
+        *) die "unknown binary-audit vuln subcommand: ${vsub:-}" ;;
+      esac
+      ;;
+    verify)
+      shift
+      local wsub="${1:-}"
+      case "$wsub" in
+        release-asset) shift; verify_release_asset_command "$@" ;;
+        sigstore-bundle) shift; verify_sigstore_bundle_command "$@" ;;
+        tuf-bootstrap) shift; verify_tuf_bootstrap_command "$@" ;;
+        *) die "unknown binary-audit verify subcommand: ${wsub:-}" ;;
+      esac
+      ;;
+    *) die "unknown binary-audit subcommand: ${sub:-}" ;;
   esac
 }
 
@@ -10345,44 +10344,120 @@ diff_command() {
   done
 }
 
-scan_command() {
+# Shared by repo-audit and machine-audit: the flags that mean the same thing
+# on both surfaces. Sets SCAN_MODE_PARSED and consumes what it recognizes,
+# leaving anything else for the caller to reject in its own vocabulary.
+SCAN_MODE_PARSED=""
+SCAN_FLAG_SHIFT=0
+scan_parse_shared_flag() {
+  local flag="$1" next="${2-}" have_next="${3:-0}"
+  SCAN_FLAG_SHIFT=0
+  case "$flag" in
+    --verbose)
+      SAFE_AUDIT_VERBOSE=1
+      SCAN_FLAG_SHIFT=1
+      ;;
+    --deps-only)
+      [[ -z "$SCAN_MODE_PARSED" ]] || die "scan mode flags are mutually exclusive"
+      SCAN_MODE_PARSED="deps"
+      SCAN_FLAG_SHIFT=1
+      ;;
+    --full)
+      [[ -z "$SCAN_MODE_PARSED" ]] || die "scan mode flags are mutually exclusive"
+      SCAN_MODE_PARSED="full"
+      SCAN_FLAG_SHIFT=1
+      ;;
+    --no-cache)
+      SAFE_AUDIT_SCAN_NO_CACHE=1
+      SCAN_FLAG_SHIFT=1
+      ;;
+    --allow-missing-tools)
+      SAFE_AUDIT_ALLOW_MISSING_TOOLS=1
+      SCAN_FLAG_SHIFT=1
+      ;;
+    --result-out)
+      # Hand the caller its own copy of the result document. The published
+      # per-day file is shared and can be replaced by a concurrent scan
+      # before the caller reads it; this copy cannot.
+      [[ "$have_next" == "1" ]] || die "--result-out requires a path"
+      SCAN_RESULT_OUT="$next"
+      SCAN_FLAG_SHIFT=2
+      ;;
+  esac
+  return 0
+}
+
+# Validated before the scan runs: a caller that cannot receive the result must
+# not learn this after several minutes of scanning.
+scan_validate_result_out() {
+  [[ -n "$SCAN_RESULT_OUT" ]] || return 0
+  local result_out_dir
+  result_out_dir="$(dirname -- "$SCAN_RESULT_OUT")"
+  [[ -d "$result_out_dir" && -w "$result_out_dir" ]] || die "--result-out directory is not writable: $result_out_dir"
+  # A directory (or anything that is not a regular file) would silently
+  # become "a file created somewhere near where you asked".
+  [[ ! -e "$SCAN_RESULT_OUT" || -f "$SCAN_RESULT_OUT" ]] || die "--result-out must name a regular file: $SCAN_RESULT_OUT"
+  [[ ! -e "$SCAN_RESULT_OUT" || -w "$SCAN_RESULT_OUT" ]] || die "--result-out is not writable: $SCAN_RESULT_OUT"
+}
+
+# repo-audit: one project tree on this machine. The machine is resolved because
+# scan_machine needs an execution context, never because the caller chose it —
+# so no machine name appears in this surface's output. Auditing a project on a
+# remote host is machine-audit --project <path> --machine <name>.
+repo_audit_command() {
   local project_target=""
-  local scan_mode="${SAFE_AUDIT_SCAN_MODE:-source}" scan_mode_set=0
-  local args=()
+  SCAN_MODE_PARSED=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --verbose)
-        SAFE_AUDIT_VERBOSE=1
+      --all|--machine)
+        die "repo-audit audits one project on this machine; for a project on another host use: safe audit machine-audit --project <path> --machine <name>"
+        ;;
+      --project)
+        die "repo-audit takes the project path as its argument: safe audit repo-audit [<path>]"
+        ;;
+      --*)
+        local have_next=0
+        [[ $# -ge 2 ]] && have_next=1
+        scan_parse_shared_flag "$1" "${2-}" "$have_next"
+        (( SCAN_FLAG_SHIFT > 0 )) || die "unknown repo-audit flag: $1"
+        shift "$SCAN_FLAG_SHIFT"
+        ;;
+      *)
+        [[ -z "$project_target" ]] || die "repo-audit takes a single project path"
+        project_target="$1"
         shift
         ;;
-      --deps-only)
-        [[ "$scan_mode_set" == "0" ]] || die "scan mode flags are mutually exclusive"
-        scan_mode="deps"
-        scan_mode_set=1
-        shift
-        ;;
-      --full)
-        [[ "$scan_mode_set" == "0" ]] || die "scan mode flags are mutually exclusive"
-        scan_mode="full"
-        scan_mode_set=1
-        shift
-        ;;
-      --no-cache)
-        SAFE_AUDIT_SCAN_NO_CACHE=1
-        shift
-        ;;
-      --allow-missing-tools)
-        SAFE_AUDIT_ALLOW_MISSING_TOOLS=1
-        shift
-        ;;
-      --result-out)
-        # Hand the caller its own copy of the result document. The published
-        # per-day file is shared and can be replaced by a concurrent scan
-        # before the caller reads it; this copy cannot.
-        [[ $# -lt 2 ]] && die "--result-out requires a path"
-        SCAN_RESULT_OUT="$2"
-        shift 2
-        ;;
+    esac
+  done
+  [[ -n "$project_target" ]] || project_target="."
+  [[ -d "$project_target" ]] || die "repo-audit target is not a directory: $project_target"
+  SAFE_AUDIT_SCAN_MODE="${SCAN_MODE_PARSED:-${SAFE_AUDIT_SCAN_MODE:-source}}"
+  scan_validate_result_out
+
+  parse_machine_targets default
+  local machine="${MACHINE_TARGETS[0]}"
+  local target_label
+  target_label="project $(printf '%q' "$project_target")"
+  vinfo "repo-audit mode: $SAFE_AUDIT_SCAN_MODE"
+  info "repo-audit: starting $target_label"
+  local scan_rc=0
+  if scan_machine "$machine" "$project_target" "$SAFE_AUDIT_SCAN_MODE"; then
+    info "repo-audit: finished $target_label"
+  else
+    scan_rc=$?
+    warn "repo-audit: failed $target_label"
+    return "$scan_rc"
+  fi
+}
+
+# machine-audit: whole machine roots across the fleet. The machine dimension is
+# the point here, so it stays in the output.
+machine_audit_command() {
+  local project_target=""
+  local args=()
+  SCAN_MODE_PARSED=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
       --project)
         [[ $# -lt 2 ]] && die "--project requires a path"
         project_target="$2"
@@ -10398,28 +10473,23 @@ scan_command() {
         shift
         ;;
       *)
-        die "unknown scan flag: $1"
+        local have_next=0
+        [[ $# -ge 2 ]] && have_next=1
+        scan_parse_shared_flag "$1" "${2-}" "$have_next"
+        (( SCAN_FLAG_SHIFT > 0 )) || die "unknown machine-audit flag: $1"
+        shift "$SCAN_FLAG_SHIFT"
         ;;
     esac
   done
-  SAFE_AUDIT_SCAN_MODE="$scan_mode"
-  if [[ -n "$SCAN_RESULT_OUT" ]]; then
-    # Checked before the scan runs: a caller that cannot receive the result
-    # must not learn this after several minutes of scanning.
-    local result_out_dir
-    result_out_dir="$(dirname -- "$SCAN_RESULT_OUT")"
-    [[ -d "$result_out_dir" && -w "$result_out_dir" ]] || die "--result-out directory is not writable: $result_out_dir"
-    # A directory (or anything that is not a regular file) would silently
-    # become "a file created somewhere near where you asked".
-    [[ ! -e "$SCAN_RESULT_OUT" || -f "$SCAN_RESULT_OUT" ]] || die "--result-out must name a regular file: $SCAN_RESULT_OUT"
-    [[ ! -e "$SCAN_RESULT_OUT" || -w "$SCAN_RESULT_OUT" ]] || die "--result-out is not writable: $SCAN_RESULT_OUT"
-  fi
+  SAFE_AUDIT_SCAN_MODE="${SCAN_MODE_PARSED:-${SAFE_AUDIT_SCAN_MODE:-source}}"
+  scan_validate_result_out
+
   parse_machine_targets default "${args[@]}"
   if [[ -n "$SCAN_RESULT_OUT" && "${#MACHINE_TARGETS[@]}" -gt 1 ]]; then
     die "--result-out writes one result document; it cannot be combined with a multi-machine scan"
   fi
-  vinfo "scan targets: ${MACHINE_TARGETS[*]}"
-  vinfo "scan mode: $scan_mode"
+  vinfo "machine-audit targets: ${MACHINE_TARGETS[*]}"
+  vinfo "machine-audit mode: $SAFE_AUDIT_SCAN_MODE"
   local machine
   for machine in "${MACHINE_TARGETS[@]}"; do
     local target_label
@@ -10428,13 +10498,13 @@ scan_command() {
     else
       target_label="machine root $(printf '%q' "$(machine_scan_root "$machine")")"
     fi
-    info "scan: starting $machine $target_label"
+    info "machine-audit: starting $machine $target_label"
     local scan_rc=0
-    if scan_machine "$machine" "$project_target" "$scan_mode"; then
-      info "scan: finished $machine $target_label"
+    if scan_machine "$machine" "$project_target" "$SAFE_AUDIT_SCAN_MODE"; then
+      info "machine-audit: finished $machine $target_label"
     else
       scan_rc=$?
-      warn "scan: failed $machine $target_label"
+      warn "machine-audit: failed $machine $target_label"
       return "$scan_rc"
     fi
   done
@@ -10533,15 +10603,25 @@ safe audit: multi-machine audit tooling
 
 USAGE
   safe audit capabilities [--json]
-  safe audit scan [--verbose] [--deps-only | --full] [--no-cache] [--result-out <file>] [--allow-missing-tools] [--project <path>] [--all | --machine <csv>]
-  safe audit check <pkg>@<version> [--ecosystem <name>] [--json]
+
+  package-audit — one package, before it is installed
+  safe audit package-audit <pkg>@<version> [--ecosystem <name>] [--json]
+
+  repo-audit — one project tree on this machine
+  safe audit repo-audit [<path>] [--verbose] [--deps-only | --full] [--no-cache] [--result-out <file>] [--allow-missing-tools]
+
+  machine-audit — whole machine roots, local or across the fleet
+  safe audit machine-audit [--verbose] [--deps-only | --full] [--no-cache] [--result-out <file>] [--allow-missing-tools] [--project <path>] [--all | --machine <csv>]
+
+  binary-audit — distributed artifacts: assets, signatures, TUF roots, execution
+  safe audit binary-audit exec PATH [--timeout SECONDS] [--json] -- [ARGS...]
+  safe audit binary-audit release github --repo OWNER/REPO --version TAG --asset NAME [--json]
+  safe audit binary-audit vuln github-release --repo OWNER/REPO --version TAG [--json]
+  safe audit binary-audit verify release-asset --artifact PATH --checksum PATH [--certificate PATH --signature PATH --certificate-identity-regexp REGEX --certificate-oidc-issuer URL] [--require-signature] [--json]
+  safe audit binary-audit verify sigstore-bundle --artifact PATH --bundle PATH --identity VALUE --oidc-issuer URL [--json]
+  safe audit binary-audit verify tuf-bootstrap --mirror PATH --root PATH --root-checksum SHA256 --target NAME=PATH [--target NAME=PATH ...] [--json]
+
   safe audit scanner-batch   (stdin: {"packages":[{"name","version"},…]} — Bun scanner API backend)
-  safe audit release github --repo OWNER/REPO --version TAG --asset NAME [--json]
-  safe audit vuln github-release --repo OWNER/REPO --version TAG [--json]
-  safe audit verify release-asset --artifact PATH --checksum PATH [--certificate PATH --signature PATH --certificate-identity-regexp REGEX --certificate-oidc-issuer URL] [--require-signature] [--json]
-  safe audit verify sigstore-bundle --artifact PATH --bundle PATH --identity VALUE --oidc-issuer URL [--json]
-  safe audit verify tuf-bootstrap --mirror PATH --root PATH --root-checksum SHA256 --target NAME=PATH [--target NAME=PATH ...] [--json]
-  safe audit binary exec PATH [--timeout SECONDS] [--json] -- [ARGS...]
   safe audit ioc <identifier> [--all | --machine <csv>]
   safe audit ioc --list <ioc.json> [--all | --machine <csv>]
   safe audit ioc --update [--since <duration>] [--all | --machine <csv>]
@@ -10580,13 +10660,11 @@ main() {
     ensure_dirs
   fi
   case "$cmd" in
-    scan) shift; scan_command "$@" ;;
-    check) shift; check_command "$@" ;;
+    package-audit) shift; package_audit_command "$@" ;;
+    repo-audit) shift; repo_audit_command "$@" ;;
+    machine-audit) shift; machine_audit_command "$@" ;;
+    binary-audit) shift; binary_audit_command "$@" ;;
     scanner-batch) shift; scanner_batch_command "$@" ;;
-    release) shift; cmd_release "$@" ;;
-    vuln) shift; cmd_vuln "$@" ;;
-    verify) shift; cmd_verify "$@" ;;
-    binary) shift; cmd_binary "$@" ;;
     ioc) shift; ioc_command "$@" ;;
     setup) shift; setup_command "$@" ;;
     diff) shift; diff_command "$@" ;;

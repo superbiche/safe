@@ -49,7 +49,7 @@ only the current pinned-version schema.
 
 `sandbox-known.json` stores packages accepted for future sandbox execution.
 
-`install-known.json` is machine-written by `safe audit check --gate install`:
+`install-known.json` is machine-written by `safe audit package-audit --gate install`:
 one entry per `ecosystem:name` recording the pinned resolved version that
 passed a clean version-aware check, the reasons, and a pointer to the check
 receipt. It smooths the install gate only (offline/timeout fallback within

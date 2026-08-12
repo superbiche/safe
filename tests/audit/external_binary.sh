@@ -519,7 +519,7 @@ run_json() {
   SAFE_AUDIT_GITHUB_RELEASE_MIN_AGE_DAYS=3 \
   PATH="$mockbin:$PATH" \
   MOCK_FIXTURES="$fixtures" \
-    "$SAFE_AUDIT" "$@" >"$out" 2>"$err"
+    "$SAFE_AUDIT" binary-audit "$@" >"$out" 2>"$err"
   RUN_RC=$?
   set -e
   RUN_OUT="$out"
@@ -533,7 +533,7 @@ run_json_real() {
   set +e
   SAFE_AUDIT_CONFIG_DIR="$tmp/config-$name" \
   SAFE_AUDIT_DATA_DIR="$tmp/data-$name" \
-    "$SAFE_AUDIT" "$@" >"$out" 2>"$err"
+    "$SAFE_AUDIT" binary-audit "$@" >"$out" 2>"$err"
   RUN_RC=$?
   set -e
   RUN_OUT="$out"
@@ -618,7 +618,7 @@ pass "verify signed checksum success"
 PATH="$nocosignbin" \
   SAFE_AUDIT_CONFIG_DIR="$tmp/config-verify-missing-tool" \
   SAFE_AUDIT_DATA_DIR="$tmp/data-verify-missing-tool" \
-  "$SAFE_AUDIT" verify release-asset --artifact "$artifact" --checksum "$checksum" --certificate "$cert" --signature "$sig" --certificate-identity-regexp '^https://github\.com/example/tool/\.github/workflows/release\.yml@refs/tags/v1\.2\.3$' --certificate-oidc-issuer https://token.actions.githubusercontent.com --json >"$tmp/verify-missing-tool.json" 2>"$tmp/verify-missing-tool.err" || true
+  "$SAFE_AUDIT" binary-audit verify release-asset --artifact "$artifact" --checksum "$checksum" --certificate "$cert" --signature "$sig" --certificate-identity-regexp '^https://github\.com/example/tool/\.github/workflows/release\.yml@refs/tags/v1\.2\.3$' --certificate-oidc-issuer https://token.actions.githubusercontent.com --json >"$tmp/verify-missing-tool.json" 2>"$tmp/verify-missing-tool.err" || true
 jq -e '.verdict == "BLOCK" and any(.reasons[]; .code == "missing_tool")' "$tmp/verify-missing-tool.json" >/dev/null || fail "verify missing cosign tool"
 pass "verify missing tool block"
 
@@ -662,7 +662,7 @@ pass "verify sigstore bundle success"
 PATH="$nocosignbin" \
   SAFE_AUDIT_CONFIG_DIR="$tmp/config-verify-sigstore-missing-tool" \
   SAFE_AUDIT_DATA_DIR="$tmp/data-verify-sigstore-missing-tool" \
-  "$SAFE_AUDIT" verify sigstore-bundle --artifact "$artifact" --bundle "$bundle_json" --identity keyless@projectsigstore.iam.gserviceaccount.com --oidc-issuer https://accounts.google.com --json >"$tmp/verify-sigstore-missing-tool.json" 2>"$tmp/verify-sigstore-missing-tool.err" || true
+  "$SAFE_AUDIT" binary-audit verify sigstore-bundle --artifact "$artifact" --bundle "$bundle_json" --identity keyless@projectsigstore.iam.gserviceaccount.com --oidc-issuer https://accounts.google.com --json >"$tmp/verify-sigstore-missing-tool.json" 2>"$tmp/verify-sigstore-missing-tool.err" || true
 jq -e '.verdict == "BLOCK" and any(.reasons[]; .code == "missing_tool")' "$tmp/verify-sigstore-missing-tool.json" >/dev/null || fail "verify sigstore missing cosign tool"
 pass "verify sigstore missing tool block"
 
@@ -849,7 +849,7 @@ PATH="$nopythonbin" \
 MOCK_COSIGN_BRIDGE_ROOT="$tuf_mirror" \
 SAFE_AUDIT_CONFIG_DIR="$tmp/config-verify-tuf-missing-python" \
 SAFE_AUDIT_DATA_DIR="$tmp/data-verify-tuf-missing-python" \
-  "$SAFE_AUDIT" verify tuf-bootstrap --mirror "$tuf_mirror" --root "$tuf_root" --root-checksum "$root_sha" --target artifact.pub="$tuf_target" --json >"$tmp/verify-tuf-missing-python.json" 2>"$tmp/verify-tuf-missing-python.err" || true
+  "$SAFE_AUDIT" binary-audit verify tuf-bootstrap --mirror "$tuf_mirror" --root "$tuf_root" --root-checksum "$root_sha" --target artifact.pub="$tuf_target" --json >"$tmp/verify-tuf-missing-python.json" 2>"$tmp/verify-tuf-missing-python.err" || true
 jq -e '
   .verdict == "BLOCK"
   and (.checks[] | select(.id == "mirror_bridge") | .verdict) == "BLOCK"
@@ -863,7 +863,7 @@ MOCK_COSIGN_BRIDGE_ROOT="$tuf_mirror" \
 MOCK_BRIDGE_FAIL_PID_FILE="$bridge_fail_pid_file" \
 SAFE_AUDIT_CONFIG_DIR="$tmp/config-verify-tuf-bridge-fail" \
 SAFE_AUDIT_DATA_DIR="$tmp/data-verify-tuf-bridge-fail" \
-  "$SAFE_AUDIT" verify tuf-bootstrap --mirror "$tuf_mirror" --root "$tuf_root" --root-checksum "$root_sha" --target artifact.pub="$tuf_target" --json >"$tmp/verify-tuf-bridge-fail.json" 2>"$tmp/verify-tuf-bridge-fail.err" || true
+  "$SAFE_AUDIT" binary-audit verify tuf-bootstrap --mirror "$tuf_mirror" --root "$tuf_root" --root-checksum "$root_sha" --target artifact.pub="$tuf_target" --json >"$tmp/verify-tuf-bridge-fail.json" 2>"$tmp/verify-tuf-bridge-fail.err" || true
 jq -e '
   .verdict == "BLOCK"
   and (.checks[] | select(.id == "mirror_bridge") | .verdict) == "BLOCK"
@@ -924,7 +924,7 @@ fi
 binary="$artifact_dir/tool-exec"
 printf '#!/bin/sh\necho hello\n' > "$binary"
 chmod +x "$binary"
-MOCK_CURL_MODE=release_success MOCK_PODMAN_LOG="$tmp/podman.log" run_json binary_exec binary exec "$binary" --json -- --version
+MOCK_CURL_MODE=release_success MOCK_PODMAN_LOG="$tmp/podman.log" run_json binary_exec exec "$binary" --json -- --version
 [[ "$RUN_RC" == "0" ]] || fail "binary exec rc=$RUN_RC"
 jq -e '.verdict == "GO" and .data.runtime_status == "ok" and (.data.stdout_summary | contains("podman stdout summary")) and (.data.stderr_summary | contains("podman stderr summary"))' "$RUN_OUT" >/dev/null || fail "binary exec payload"
 grep -q -- '--network=none' "$tmp/podman.log" || fail "binary exec missing --network=none"
@@ -946,7 +946,7 @@ jq -e '
 ' "$RUN_OUT" >/dev/null || fail "binary exec writable env payload"
 pass "binary exec sandbox command and output capture"
 
-MOCK_CURL_MODE=release_success MOCK_PODMAN_LOG="$tmp/podman-xdg.log" MOCK_PODMAN_TOUCH_XDG=1 run_json binary_exec_xdg binary exec "$binary" --json -- --version
+MOCK_CURL_MODE=release_success MOCK_PODMAN_LOG="$tmp/podman-xdg.log" MOCK_PODMAN_TOUCH_XDG=1 run_json binary_exec_xdg exec "$binary" --json -- --version
 [[ "$RUN_RC" == "0" ]] || fail "binary exec xdg rc=$RUN_RC"
 jq -e '.verdict == "GO" and .data.runtime_status == "ok" and (.data.stdout_summary | contains("config/cache/state paths are writable"))' "$RUN_OUT" >/dev/null || fail "binary exec xdg payload"
 pass "binary exec writable HOME/XDG behavior"

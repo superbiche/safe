@@ -20,7 +20,7 @@ pass "dispatcher syntax"
 completion_file="$ROOT/lib/completions/_safe"
 grep -Fq 'safe doctor [--json]' < <("$SAFE" --help) || fail "safe help missing doctor"
 grep -Fq 'safe run host-allow' < <(SAFE_RUN_NO_INIT=1 "$SAFE" run help) || fail "safe run help missing dispatcher form"
-grep -Fq 'safe audit scan' < <(SAFE_AUDIT_NO_INIT=1 "$SAFE" audit help) || fail "safe audit help missing dispatcher form"
+grep -Fq 'safe audit machine-audit' < <(SAFE_AUDIT_NO_INIT=1 "$SAFE" audit help) || fail "safe audit help missing dispatcher form"
 grep -Fq "'doctor:show local readiness diagnostics'" "$completion_file" || fail "top-level completion missing doctor"
 grep -Fq "doctor option' '--json'" "$completion_file" || fail "doctor completion missing --json"
 pass "help and completion"
@@ -48,8 +48,8 @@ cat > "$shim/safe-audit" <<'SH'
 case "${1:-}" in
   --version|-v) echo "safe-audit mock" ;;
   status) echo "config: ${SAFE_CONFIG_DIR:-$HOME/.config/safe}/audit" ;;
-  check) printf 'safe-audit'; for arg in "$@"; do printf '\t%s' "$arg"; done; printf '\n'; exit "${SAFE_AUDIT_STUB_STATUS:-0}" ;;
-  scan)
+  package-audit) printf 'safe-audit'; for arg in "$@"; do printf '\t%s' "$arg"; done; printf '\n'; exit "${SAFE_AUDIT_STUB_STATUS:-0}" ;;
+  repo-audit)
     { printf 'safe-audit'; for arg in "$@"; do printf '\t%s' "$arg"; done; printf '\n'; } >> "${SAFE_AUDIT_STUB_SCAN_LOG:-/dev/null}"
     { printf 'safe-audit'; for arg in "$@"; do printf '\t%s' "$arg"; done; printf '\n'; }
     # The caller receives its own copy through --result-out; the published
@@ -128,7 +128,7 @@ ln -s npm "$shim/composer"
 [[ "$("$shim/safe" audit --version)" == "safe-audit mock" ]] || fail "safe audit did not route"
 [[ "$("$shim/safe" install --allow-scripts cowsay@1.6.0)" == $'safe-run\tinstall\t--allow-scripts\tcowsay@1.6.0' ]] || fail "safe install did not route to safe run install"
 host_install_output="$(PATH="$shim:$PATH" "$shim/safe" install --yes -g cowsay@1.6.0)"
-grep -Fq $'safe-audit\tcheck\tcowsay@1.6.0\t--ecosystem\tnpm' <<<"$host_install_output" || fail "safe install did not audit global npm package"
+grep -Fq $'safe-audit\tpackage-audit\tcowsay@1.6.0\t--ecosystem\tnpm' <<<"$host_install_output" || fail "safe install did not audit global npm package"
 grep -Fq $'npm\tinstall\t-g\tcowsay@1.6.0' <<<"$host_install_output" || fail "safe install did not forward global npm flags"
 trust_config="$tmp/trust-config"
 trust_install_output="$(PATH="$shim:$PATH" SAFE_CONFIG_DIR="$trust_config" "$shim/safe" install --yes --trust-host -g cowsay@1.6.0)"
@@ -185,7 +185,7 @@ printf '{"name":"demo"}\n' > "$project_dir/package.json"
 # Clean project, non-interactive: exit 0 quietly, scan run in deps-only mode.
 PROJECT_ARGS=()
 project_case clean 0 "$project_dir" env SAFE_AUDIT_STUB_SCAN_VERDICT=GO
-grep -Fq $'safe-audit\tscan\t--deps-only\t--allow-missing-tools\t--project\t.' "$PROJECT_SCAN_LOG" || fail "project mode did not run a deps-only scan"
+grep -Fq $'safe-audit\trepo-audit\t.\t--deps-only\t--allow-missing-tools' "$PROJECT_SCAN_LOG" || fail "project mode did not run a deps-only scan"
 # An ecosystem auditor that is not installed must not abort the scan: this
 # mode reports it as not run and lets its own policy decide.
 grep -Fq -- '--allow-missing-tools' "$PROJECT_SCAN_LOG" || fail "project scan can be aborted by a missing scanner"
@@ -196,7 +196,7 @@ grep -Fq 'verdict:   GO' "$PROJECT_OUT" || fail "project mode summary omits the 
 # The explicit flag forces the same mode.
 PROJECT_ARGS=(--project)
 project_case flag 0 "$project_dir" env SAFE_AUDIT_STUB_SCAN_VERDICT=GO
-grep -Fq $'safe-audit\tscan\t--deps-only\t--allow-missing-tools\t--project\t.' "$PROJECT_SCAN_LOG" || fail "safe install --project did not scan"
+grep -Fq $'safe-audit\trepo-audit\t.\t--deps-only\t--allow-missing-tools' "$PROJECT_SCAN_LOG" || fail "safe install --project did not scan"
 
 # WARN needs an operator: non-TTY refuses 102, --yes accepts.
 PROJECT_ARGS=()
@@ -292,7 +292,7 @@ grep -Fq 'found no manifest' "$PROJECT_ERR" || fail "--project without a manifes
 # A named package still takes the spec path, manifest or not.
 PROJECT_ARGS=(--yes -g cowsay@1.6.0)
 project_case spec-still-audits 0 "$project_dir" env
-grep -Fq $'safe-audit\tcheck\tcowsay@1.6.0\t--ecosystem\tnpm' "$PROJECT_OUT" || fail "spec install stopped auditing in a project dir"
+grep -Fq $'safe-audit\tpackage-audit\tcowsay@1.6.0\t--ecosystem\tnpm' "$PROJECT_OUT" || fail "spec install stopped auditing in a project dir"
 grep -Fq $'npm\tinstall\t-g\tcowsay@1.6.0' "$PROJECT_OUT" || fail "spec install stopped delegating in a project dir"
 [[ ! -s "$PROJECT_SCAN_LOG" ]] || fail "spec install ran a project scan"
 
@@ -341,16 +341,16 @@ set -e
 [[ "$latest_trust_rc" -ne 0 ]] || fail "safe install --trust-host allowed latest"
 ! grep -Fq $'npm\tinstall\t-g\tcowsay' <<<"$latest_trust_output" || fail "safe install --trust-host installed latest before refusing trust"
 yarn_install_output="$(PATH="$shim:$PATH" "$shim/safe" install --yes --yarn -g typescript@5.0.0)"
-grep -Fq $'safe-audit\tcheck\ttypescript@5.0.0\t--ecosystem\tnpm' <<<"$yarn_install_output" || fail "safe install did not audit global yarn package"
+grep -Fq $'safe-audit\tpackage-audit\ttypescript@5.0.0\t--ecosystem\tnpm' <<<"$yarn_install_output" || fail "safe install did not audit global yarn package"
 grep -Fq $'yarn\tglobal\tadd\ttypescript@5.0.0' <<<"$yarn_install_output" || fail "safe install did not translate global yarn install"
 pnpm_install_output="$(PATH="$shim:$PATH" "$shim/safe" install --yes --pnpm -g cowsay@1.6.0)"
-grep -Fq $'safe-audit\tcheck\tcowsay@1.6.0\t--ecosystem\tnpm' <<<"$pnpm_install_output" || fail "safe install did not audit global pnpm package"
+grep -Fq $'safe-audit\tpackage-audit\tcowsay@1.6.0\t--ecosystem\tnpm' <<<"$pnpm_install_output" || fail "safe install did not audit global pnpm package"
 grep -Fq $'pnpm\tadd\t-g\tcowsay@1.6.0' <<<"$pnpm_install_output" || fail "safe install did not translate global pnpm install"
 bun_install_output="$(PATH="$shim:$PATH" "$shim/safe" install --yes --bun -g cowsay@1.6.0)"
-grep -Fq $'safe-audit\tcheck\tcowsay@1.6.0\t--ecosystem\tnpm' <<<"$bun_install_output" || fail "safe install did not audit global bun package"
+grep -Fq $'safe-audit\tpackage-audit\tcowsay@1.6.0\t--ecosystem\tnpm' <<<"$bun_install_output" || fail "safe install did not audit global bun package"
 grep -Fq $'bun\tadd\t-g\tcowsay@1.6.0' <<<"$bun_install_output" || fail "safe install did not translate global bun install"
 composer_install_output="$(PATH="$shim:$PATH" "$shim/safe" install --yes --composer -g vendor/pkg:^1)"
-grep -Fq $'safe-audit\tcheck\tvendor/pkg@^1\t--ecosystem\tcomposer' <<<"$composer_install_output" || fail "safe install did not audit global composer package"
+grep -Fq $'safe-audit\tpackage-audit\tvendor/pkg@^1\t--ecosystem\tcomposer' <<<"$composer_install_output" || fail "safe install did not audit global composer package"
 grep -Fq $'composer\tglobal\trequire\tvendor/pkg:^1' <<<"$composer_install_output" || fail "safe install did not translate global composer install"
 expected_safe_version="$(awk -F'"' '/^SAFE_VERSION=/ {print $2; exit}' "$SAFE")"
 grep -q "^safe ${expected_safe_version}$" < <("$shim/safe" version) || fail "safe version missing top-level version"
@@ -402,7 +402,7 @@ routed_json="$(
     "$ROOT/bin/safe" audit capabilities --json
 )"
 [[ "$(jq -cS . <<<"$direct_json")" == "$(jq -cS . <<<"$routed_json")" ]] || fail "safe audit capabilities did not match direct compatibility binary output"
-jq -e '.command == "safe audit capabilities" and .groups.verify["sigstore-bundle"] == true and .groups.setup["create-bundle"] == true' <<<"$routed_json" >/dev/null || fail "safe audit capabilities returned an unexpected payload"
+jq -e '.command == "safe audit capabilities" and .groups["binary-audit"]["verify.sigstore-bundle"] == true and .groups.setup["create-bundle"] == true' <<<"$routed_json" >/dev/null || fail "safe audit capabilities returned an unexpected payload"
 [[ ! -e "$cap_tmp/data/checks" ]] || fail "safe audit capabilities wrote audit checks"
 pass "dispatcher capabilities"
 

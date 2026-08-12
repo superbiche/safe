@@ -23,7 +23,7 @@ Then review machine config:
 ```bash
 $EDITOR ~/.config/safe/audit/machines.json
 safe audit setup --all
-safe audit scan --all
+safe audit machine-audit --all
 ```
 
 Install protection is active as soon as `install.sh` has written the PATH
@@ -52,7 +52,7 @@ safe run create-vite@latest -- my-app
 Flow:
 
 1. `safe run` normalizes the package and checks `blocked.json`.
-2. If not host-allowed, it tries `safe audit check` in an isolated audit container.
+2. If not host-allowed, it tries `safe audit package-audit` in an isolated audit container.
 3. `BLOCK` refuses execution.
 4. `WARN` logs the warning and continues only in the sandbox path.
 5. Unknown TTY execution prompts; unknown non-TTY execution blocks.
@@ -83,8 +83,8 @@ npm install express
 Flow:
 
 1. The PATH wrapper execs `safe gate npm`, which detects a package install.
-2. If the current directory looks like an npm project, it runs `safe audit scan --project .`.
-3. It extracts package specs and runs `safe audit check <pkg> --ecosystem npm --gate install`.
+2. If the current directory looks like an npm project, it runs `safe audit repo-audit .`.
+3. It extracts package specs and runs `safe audit package-audit <pkg> --ecosystem npm --gate install`.
 4. Only a passing gate proceeds.
 5. The real command runs through the first non-wrapper `npm` on PATH.
 
@@ -99,22 +99,22 @@ Representative review sequence for a GitHub-backed binary:
 
 ```bash
 safe audit capabilities --json
-safe audit release github --repo go-task/task --version v3.50.0 --asset task_linux_amd64.tar.gz --json
-safe audit vuln github-release --repo go-task/task --version v3.50.0 --json
-safe audit verify release-asset --artifact ./task --checksum ./task_checksums.txt --json
-safe audit binary exec ./task --json -- --version
+safe audit binary-audit release github --repo go-task/task --version v3.50.0 --asset task_linux_amd64.tar.gz --json
+safe audit binary-audit vuln github-release --repo go-task/task --version v3.50.0 --json
+safe audit binary-audit verify release-asset --artifact ./task --checksum ./task_checksums.txt --json
+safe audit binary-audit exec ./task --json -- --version
 ```
 
 For Sigstore bootstrap-shaped binaries such as `cosign`, the flow can include:
 
 ```bash
-safe audit verify sigstore-bundle \
+safe audit binary-audit verify sigstore-bundle \
   --artifact ./cosign-linux-amd64 \
   --bundle ./cosign-linux-amd64.sigstore.json \
   --identity keyless@projectsigstore.iam.gserviceaccount.com \
   --oidc-issuer https://accounts.google.com
 
-safe audit verify tuf-bootstrap \
+safe audit binary-audit verify tuf-bootstrap \
   --mirror ./mirror \
   --root ./root.json \
   --root-checksum "$(sha256sum ./root.json | awk '{print $1}')" \
@@ -127,7 +127,7 @@ Use `safe audit capabilities --json` before relying on advanced checks:
 
 ```bash
 if safe audit capabilities --json | jq -e '.capabilities["verify.release-asset"]'; then
-  safe audit verify release-asset --artifact ./tool --checksum ./checksums.txt --json
+  safe audit binary-audit verify release-asset --artifact ./tool --checksum ./checksums.txt --json
 fi
 ```
 

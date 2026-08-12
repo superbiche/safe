@@ -165,7 +165,7 @@ policy) the gate states the manual fallback and installs script-less as
 before. An unpinned install of a granted package gets a hint naming the
 pinned grant.
 
-`safe audit check --gate install` prints a hint when a resolved version
+`safe audit package-audit --gate install` prints a hint when a resolved version
 declares install scripts and no grant exists (`has_install_script` is also
 recorded in the check receipt), so "installed but broken" has a visible
 cause and the exact operator command to fix it.
@@ -180,11 +180,11 @@ safe run block import ./blocked-packages.txt
 ```
 
 The blocklist supports JSON or newline-list imports and is shared with
-`safe audit check`.
+`safe audit package-audit`.
 
 ## Host and Sandboxed Installs
 
-`safe install -g` audits explicit npm package specs with `safe audit check`,
+`safe install -g` audits explicit npm package specs with `safe audit package-audit`,
 asks for confirmation, then delegates to `npm install -g` with the original npm
 flags preserved:
 

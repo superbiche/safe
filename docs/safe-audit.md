@@ -5,7 +5,7 @@
 Call it through the dispatcher:
 
 ```bash
-safe audit scan --project .
+safe audit repo-audit .
 ```
 
 The compatibility `safe-audit` binary remains installed for scripts, but
@@ -21,15 +21,12 @@ safe audit capabilities --json
 
 The current capability groups cover:
 
-- scan, check, diff, and status;
-- GitHub release review;
-- GitHub repository advisory checks;
-- release asset verification;
-- Sigstore bundle verification;
-- TUF bootstrap verification;
-- binary sandbox execution;
-- IOC lookup, list scanning, and updates;
-- machine setup and scanner bundle creation.
+- `top_level`: package-audit, repo-audit, machine-audit, diff, and status;
+- `binary-audit`: GitHub release review, GitHub repository advisory checks,
+  release asset verification, Sigstore bundle verification, TUF bootstrap
+  verification, and binary sandbox execution;
+- `ioc`: lookup, list scanning, and updates;
+- `setup`: machine setup and scanner bundle creation.
 
 ## Scanner Setup
 
@@ -82,13 +79,13 @@ failure.
 Local project scan:
 
 ```bash
-safe audit scan --project .
+safe audit repo-audit .
 ```
 
 Verbose project scan:
 
 ```bash
-safe audit scan --verbose --project .
+safe audit repo-audit . --verbose
 ```
 
 Default project and machine scans use `source` mode. This is the normal
@@ -119,7 +116,7 @@ a scan is constrained to the intended project or machine root.
 
 When required scanners (`osv-scanner`, `syft`, `grype`) or discovered project
 ecosystems require audit commands that are missing (`npm`, `composer`,
-`pip-audit`, `cargo-audit`, `govulncheck`), `safe audit scan` stops by default
+`pip-audit`, `cargo-audit`, `govulncheck`), `safe audit machine-audit` stops by default
 and prints install guidance plus the rerun command. If you explicitly continue
 with a partial audit, missing tools are reported as `skipped` and the scan
 verdict is `WARN`; they are not presented as zero CVEs.
@@ -127,7 +124,7 @@ verdict is `WARN`; they are not presented as zero CVEs.
 Dependency-only scan:
 
 ```bash
-safe audit scan --deps-only --project .
+safe audit repo-audit . --deps-only
 ```
 
 ### Scan cache (`--deps-only`)
@@ -246,7 +243,7 @@ hid every dev-only advisory.
 the stream, so a nonzero exit means the run itself failed, whatever prefix it
 managed to write.
 
-`safe audit scan --allow-missing-tools` turns a missing ecosystem auditor from
+`safe audit machine-audit --allow-missing-tools` turns a missing ecosystem auditor from
 an abort into a reported gap. Callers that gate on the result document
 (`safe install --project`, the PATH-wrapper preflight) pass it: without it, a
 Rust project on a machine without cargo-audit could not be audited at all from
@@ -271,19 +268,19 @@ its own copy instead. Single-target scans only.
 Full filesystem scan, including installed dependency trees:
 
 ```bash
-safe audit scan --full --project .
+safe audit repo-audit . --full
 ```
 
 Configured machine scan:
 
 ```bash
-safe audit scan --machine remote-a --project /path/to/project
+safe audit machine-audit --machine remote-a --project /path/to/project
 ```
 
 All configured machines:
 
 ```bash
-safe audit scan --all
+safe audit machine-audit --all
 ```
 
 Results are written under:
@@ -302,15 +299,15 @@ Remote scan strategies are selected from available tools and connectivity:
 Before trusting a remote Grype scan, `safe audit` checks `grype db status -o json -q`. The stale threshold defaults to 7 days and can be changed:
 
 ```bash
-SAFE_AUDIT_GRYPE_DB_MAX_AGE_DAYS=14 safe audit scan --machine remote-a --project /path/to/project
+SAFE_AUDIT_GRYPE_DB_MAX_AGE_DAYS=14 safe audit machine-audit --machine remote-a --project /path/to/project
 ```
 
 ## Package Checks
 
 ```bash
-safe audit check express@4.21.0 --ecosystem npm
-safe audit check express --ecosystem npm            # unpinned: resolves the target first
-safe audit check ruff@0.11.0 --ecosystem python --json
+safe audit package-audit express@4.21.0 --ecosystem npm
+safe audit package-audit express --ecosystem npm            # unpinned: resolves the target first
+safe audit package-audit ruff@0.11.0 --ecosystem python --json
 ```
 
 Checks are **version-aware**: the command first resolves the version the
@@ -364,7 +361,7 @@ BLOCK (exit 20)
 The shell install wrappers and `safe install` invoke the check as a gate:
 
 ```bash
-safe audit check <pkg> --ecosystem npm --gate install --op install|update
+safe audit package-audit <pkg> --ecosystem npm --gate install --op install|update
 ```
 
 Gate mode applies the allow policy itself and exits 0 when the install may
@@ -398,7 +395,7 @@ For predictable repeated use, use a Socket account token. The practical token sc
 Review a GitHub release before downloading assets:
 
 ```bash
-safe audit release github \
+safe audit binary-audit release github \
   --repo sigstore/cosign \
   --version v3.0.5 \
   --asset cosign-linux-amd64 \
@@ -410,7 +407,7 @@ Checks include release age, draft/prerelease status, asset presence, release chu
 For repositories with multiple release streams:
 
 ```bash
-safe audit release github \
+safe audit binary-audit release github \
   --repo scaleway/scaleway-cli \
   --version v2.55.0 \
   --asset scaleway-cli_2.55.0_linux_amd64 \
@@ -420,7 +417,7 @@ safe audit release github \
 ## Advisory Review
 
 ```bash
-safe audit vuln github-release --repo OWNER/REPO --version v1.2.3 --json
+safe audit binary-audit vuln github-release --repo OWNER/REPO --version v1.2.3 --json
 ```
 
 The command maps GitHub repository security advisory ranges to the supplied release version where possible. High or critical matches block. Ambiguous advisory mappings block instead of being ignored.
@@ -430,7 +427,7 @@ The command maps GitHub repository security advisory ranges to the supplied rele
 Checksum-only release asset verification:
 
 ```bash
-safe audit verify release-asset \
+safe audit binary-audit verify release-asset \
   --artifact ./tool-linux-amd64 \
   --checksum ./checksums.txt \
   --json
@@ -439,7 +436,7 @@ safe audit verify release-asset \
 Checksum-only success returns `WARN` because no signature was verified. Add Sigstore certificate and signature data when available:
 
 ```bash
-safe audit verify release-asset \
+safe audit binary-audit verify release-asset \
   --artifact ./tool-linux-amd64 \
   --checksum ./checksums.txt \
   --certificate ./checksums.txt.pem \
@@ -452,7 +449,7 @@ safe audit verify release-asset \
 Verify a Sigstore bundle:
 
 ```bash
-safe audit verify sigstore-bundle \
+safe audit binary-audit verify sigstore-bundle \
   --artifact ./cosign-linux-amd64 \
   --bundle ./cosign-linux-amd64.sigstore.json \
   --identity keyless@projectsigstore.iam.gserviceaccount.com \
@@ -462,7 +459,7 @@ safe audit verify sigstore-bundle \
 Verify a local TUF bootstrap:
 
 ```bash
-safe audit verify tuf-bootstrap \
+safe audit binary-audit verify tuf-bootstrap \
   --mirror ./mirror \
   --root ./root.json \
   --root-checksum "$(sha256sum ./root.json | awk '{print $1}')" \
@@ -477,7 +474,7 @@ safe audit verify tuf-bootstrap \
 Run an artifact in a networkless Podman sandbox:
 
 ```bash
-safe audit binary exec ./tool --json -- --version
+safe audit binary-audit exec ./tool --json -- --version
 ```
 
 The sandbox uses a read-only artifact bind mount, no network, dropped capabilities, no-new-privileges, and tmpfs scratch space. Startup-shaped failures are classified with reason codes such as `missing_interpreter`, `missing_shared_library`, `sandbox_runtime_mismatch`, and `runtime_failure`.

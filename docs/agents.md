@@ -67,22 +67,22 @@ contract: safe explain`.
 ## Preflight
 
 <!-- BEGIN GENERATED: preflight -->
-Before proposing an install, an agent can check a spec directly: `safe audit check <pkg>@<version> --ecosystem <eco>` (add `--json` for the receipt). It prints Socket, OSV, blocklist, and release-age lines, `VERDICT: GO|WARN|BLOCK`, next-step hints on WARN/BLOCK, and exits 0/10/20 — those are verdict codes, not refusals. Exit 30 is different in kind: the audit could not run, so there is no verdict and nothing was learned about the package. Socket is the primary behavioral tier: critical supply-chain-risk alerts BLOCK, while infrastructure failures WARN with a recovery path. The gate turns the same WARN into a refusal with exit 100 (unless an allow matches) and BLOCK into exit 104.
+Before proposing an install, an agent can check a spec directly: `safe audit package-audit <pkg>@<version> --ecosystem <eco>` (add `--json` for the receipt). It prints Socket, OSV, blocklist, and release-age lines, `VERDICT: GO|WARN|BLOCK`, next-step hints on WARN/BLOCK, and exits 0/10/20 — those are verdict codes, not refusals. Exit 30 is different in kind: the audit could not run, so there is no verdict and nothing was learned about the package. Socket is the primary behavioral tier: critical supply-chain-risk alerts BLOCK, while infrastructure failures WARN with a recovery path. The gate turns the same WARN into a refusal with exit 100 (unless an allow matches) and BLOCK into exit 104.
 <!-- END GENERATED: preflight -->
 
 ## Exit codes
 
-Verdict codes (0/10/20) come from `safe audit check`; policy refusals use
+Verdict codes (0/10/20) come from `safe audit package-audit`; policy refusals use
 a dedicated 100-range so scripts and agents can distinguish a block from
 a missing binary (127):
 
 <!-- BEGIN GENERATED: exit-codes -->
 | Code | Meaning | What an agent should do |
 | --- | --- | --- |
-| 0 | Clean verdict (GO) from `safe audit check`, or a gated command that passed and ran | Proceed. |
-| 10 | `safe audit check` verdict WARN (advisory affecting the resolved version, Socket behavioral risk short of a critical supply-chain-risk alert, custom source, unresolved version, or an audit-infrastructure failure — the per-scanner lines say which) | Read the `safe audit:` hint lines: an infrastructure cause is breakage to escalate, an advisory cause is the gate working. Via the gate this same state refuses with exit 100. |
-| 20 | `safe audit check` verdict BLOCK (critical advisory affecting the resolved version, a known-malware `MAL-*` record, a Socket critical supply-chain-risk alert, or blocklist) | Do not install. Via the gate this refuses with exit 104; the receipt carries the evidence. A BLOCK always rests on evidence about the package — when the audit could not run at all the code is 30, not 20. |
-| 30 | `safe audit check` could not produce a verdict at all — audit-infrastructure breakage (the verdict engine is missing, version-skewed, or failed; or the evidence could not be assembled). This is NOT a package finding and carries no evidence about the package. | Do not read this as a refusal about the package, and do not retry the install. Repair the tooling: rerun install.sh, then `safe doctor`. Escalate to the operator if it persists. Via the gate this refuses with exit 100. |
+| 0 | Clean verdict (GO) from `safe audit package-audit`, or a gated command that passed and ran | Proceed. |
+| 10 | `safe audit package-audit` verdict WARN (advisory affecting the resolved version, Socket behavioral risk short of a critical supply-chain-risk alert, custom source, unresolved version, or an audit-infrastructure failure — the per-scanner lines say which) | Read the `safe audit:` hint lines: an infrastructure cause is breakage to escalate, an advisory cause is the gate working. Via the gate this same state refuses with exit 100. |
+| 20 | `safe audit package-audit` verdict BLOCK (critical advisory affecting the resolved version, a known-malware `MAL-*` record, a Socket critical supply-chain-risk alert, or blocklist) | Do not install. Via the gate this refuses with exit 104; the receipt carries the evidence. A BLOCK always rests on evidence about the package — when the audit could not run at all the code is 30, not 20. |
+| 30 | `safe audit package-audit` could not produce a verdict at all — audit-infrastructure breakage (the verdict engine is missing, version-skewed, or failed; or the evidence could not be assembled). This is NOT a package finding and carries no evidence about the package. | Do not read this as a refusal about the package, and do not retry the install. Repair the tooling: rerun install.sh, then `safe doctor`. Escalate to the operator if it persists. Via the gate this refuses with exit 100. |
 | 100 | Blocked by policy: an audit WARN with no matching allow entry, blocklist, fail-closed audit, or unrecognized/unsupported runner-native flags — the refusal line names which | Relay the refusal line verbatim to the operator. Do not retry, do not reword the command. |
 | 101 | Host-allow version pin mismatch | The allowlist pins a different version than the one requested. Report both versions; re-pin is an operator decision. |
 | 102 | Interactive operator confirmation required (non-TTY refusal) | Nothing an agent can do in this shell. Ask the operator to run it in their terminal. |

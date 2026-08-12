@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Version-aware `safe audit check` suite: target-version resolution, OSV
+# Version-aware `safe audit package-audit` suite: target-version resolution, OSV
 # server-authoritative classification, pagination, install-gate mode,
 # install-known recording/revocation, and the pinned (never @latest) refusal
 # hints. Fully offline: curl and socket are mocked on PATH.
@@ -304,7 +304,7 @@ run_check() {
       SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
       SAFE_AUDIT_SOCKET_CACHE_DIR="$CASE_DIR/socket-cache" \
       "${envs[@]}" \
-      "$SAFE_AUDIT" check "$@"
+      "$SAFE_AUDIT" package-audit "$@"
   ) > "$OUT_FILE" 2> "$ERR_FILE"
   STATUS=$?
   set -e

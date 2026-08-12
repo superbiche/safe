@@ -35,23 +35,23 @@ pass "process cleanup stops child processes"
 
 help_output="$("$SAFE_AUDIT" --help)"
 grep -q 'safe audit capabilities \[--json\]' <<<"$help_output" || fail "help omits capabilities"
-grep -q 'safe audit scan \[--verbose\]' <<<"$help_output" || fail "help omits scan --verbose"
+grep -q 'safe audit machine-audit \[--verbose\]' <<<"$help_output" || fail "help omits machine-audit --verbose"
 grep -q '\[--deps-only | --full\]' <<<"$help_output" || fail "help omits scan mode options"
 grep -q '\[--no-cache\]' <<<"$help_output" || fail "help omits scan --no-cache"
 grep -q 'safe audit ioc --update' <<<"$help_output" || fail "help omits ioc --update"
 grep -q 'safe audit setup --create-bundle' <<<"$help_output" || fail "help omits setup --create-bundle"
-grep -q 'safe audit verify sigstore-bundle' <<<"$help_output" || fail "help omits verify sigstore-bundle"
-grep -q 'safe audit verify tuf-bootstrap' <<<"$help_output" || fail "help omits verify tuf-bootstrap"
+grep -q 'safe audit binary-audit verify sigstore-bundle' <<<"$help_output" || fail "help omits verify sigstore-bundle"
+grep -q 'safe audit binary-audit verify tuf-bootstrap' <<<"$help_output" || fail "help omits verify tuf-bootstrap"
 pass "help output"
 
 grep -q 'capabilities' "$ROOT/lib/completions/_safe" || fail "completion omits capabilities"
 grep -q 'capabilities_opts=(--json)' "$ROOT/lib/completions/_safe" || fail "completion omits capabilities --json"
-grep -q 'scan_opts=(--all --machine --project --verbose --deps-only --full --no-cache --result-out --allow-missing-tools)' "$ROOT/lib/completions/_safe" || fail "completion omits scan mode options"
-# Every option safe audit scan advertises in --help must be completable: the
+grep -q 'machine_audit_opts=(--all --machine --project --verbose --deps-only --full --no-cache --result-out --allow-missing-tools)' "$ROOT/lib/completions/_safe" || fail "completion omits machine-audit mode options"
+# Every option safe audit machine-audit advertises in --help must be completable: the
 # old assertion pinned an exact list, so it passed precisely BECAUSE new flags
 # were missing.
-for scan_flag in $(SAFE_AUDIT_NO_INIT=1 "$ROOT/bin/safe-audit" help 2>/dev/null | grep -oE '^\s+safe audit scan .*' | grep -oE '\-\-[a-z-]+' | sort -u); do
-  grep -q -- "$scan_flag" <<<"$(grep -E '^\s+scan_opts=' "$ROOT/lib/completions/_safe")" || fail "completion omits scan flag: $scan_flag"
+for scan_flag in $(SAFE_AUDIT_NO_INIT=1 "$ROOT/bin/safe-audit" help 2>/dev/null | grep -oE '^\s+safe audit machine-audit .*' | grep -oE '\-\-[a-z-]+' | sort -u); do
+  grep -q -- "$scan_flag" <<<"$(grep -E '^\s+machine_audit_opts=' "$ROOT/lib/completions/_safe")" || fail "completion omits scan flag: $scan_flag"
 done
 grep -q 'sigstore-bundle' "$ROOT/lib/completions/_safe" || fail "completion omits sigstore-bundle"
 grep -q 'tuf-bootstrap' "$ROOT/lib/completions/_safe" || fail "completion omits tuf-bootstrap"
@@ -70,14 +70,15 @@ jq -e --arg version "$audit_version" '
   .command == "safe audit capabilities"
   and .version == $version
   and .capabilities == {
-    "scan": true,
-    "check": true,
-    "release.github": true,
-    "vuln.github-release": true,
-    "verify.release-asset": true,
-    "verify.sigstore-bundle": true,
-    "verify.tuf-bootstrap": true,
-    "binary.exec": true,
+    "package-audit": true,
+    "repo-audit": true,
+    "machine-audit": true,
+    "binary-audit.exec": true,
+    "binary-audit.release.github": true,
+    "binary-audit.vuln.github-release": true,
+    "binary-audit.verify.release-asset": true,
+    "binary-audit.verify.sigstore-bundle": true,
+    "binary-audit.verify.tuf-bootstrap": true,
     "ioc.lookup": true,
     "ioc.list": true,
     "ioc.update": true,
@@ -88,24 +89,19 @@ jq -e --arg version "$audit_version" '
   }
   and .groups == {
     "top_level": {
-      "scan": true,
-      "check": true,
+      "package-audit": true,
+      "repo-audit": true,
+      "machine-audit": true,
       "diff": true,
       "status": true
     },
-    "release": {
-      "github": true
-    },
-    "vuln": {
-      "github-release": true
-    },
-    "verify": {
-      "release-asset": true,
-      "sigstore-bundle": true,
-      "tuf-bootstrap": true
-    },
-    "binary": {
-      "exec": true
+    "binary-audit": {
+      "exec": true,
+      "release.github": true,
+      "vuln.github-release": true,
+      "verify.release-asset": true,
+      "verify.sigstore-bundle": true,
+      "verify.tuf-bootstrap": true
     },
     "ioc": {
       "lookup": true,
@@ -692,7 +688,7 @@ missing_output="$(
 )"
 grep -q 'safe audit setup local' <<<"$missing_output" || fail "missing tools advice omitted setup command"
 grep -q -- '--bundle <scanners.tar.gz>' <<<"$missing_output" || fail "missing tools advice omitted bundle guidance"
-grep -q "safe audit scan --machine local --project /tmp/example\\\\ project" <<<"$missing_output" || fail "missing tools advice omitted scan rerun command"
+grep -q "safe audit machine-audit --machine local --project /tmp/example\\\\ project" <<<"$missing_output" || fail "missing tools advice omitted scan rerun command"
 pass "missing tools bundle then scan advice"
 
 missing_default_output="$(
@@ -776,7 +772,7 @@ scan_missing_core_output="$(
         tool_cache_set "$1" "{\"osv-scanner\":null,\"grype\":null,\"syft\":null,\"govulncheck\":null,\"cargo-audit\":null,\"pip-audit\":null,\"socket\":null}"
       }
       set +e
-      scan_command --project "$SCAN_MISSING_CORE"
+      repo_audit_command "$SCAN_MISSING_CORE"
       rc=$?
       set -e
       printf "RC=%s\n" "$rc"
@@ -784,7 +780,7 @@ scan_missing_core_output="$(
 )"
 grep -q 'RC=2' <<<"$scan_missing_core_output" || fail "scan with missing core tools did not fail closed"
 grep -q 'skipping scan because required scanners are missing in non-TTY mode' <<<"$scan_missing_core_output" || fail "scan missing core tools omitted skip reason"
-if grep -q 'scan: finished' <<<"$scan_missing_core_output"; then
+if grep -q 'repo-audit: finished' <<<"$scan_missing_core_output"; then
   fail "scan with missing core tools logged finished"
 fi
 pass "scan missing core tools exits nonzero"
@@ -805,7 +801,7 @@ scan_missing_project_tool_output="$(
       }
       project_audit_tool_available() { [[ "$1" != "cargo-audit" ]]; }
       set +e
-      scan_command --project "$SCAN_MISSING_PROJECT_TOOL"
+      repo_audit_command "$SCAN_MISSING_PROJECT_TOOL"
       rc=$?
       set -e
       printf "RC=%s\n" "$rc"
@@ -813,7 +809,7 @@ scan_missing_project_tool_output="$(
 )"
 grep -q 'RC=2' <<<"$scan_missing_project_tool_output" || fail "scan with missing project audit tool did not fail closed"
 grep -q 'missing project audit tools.*cargo-audit' <<<"$scan_missing_project_tool_output" || fail "scan missing project audit tool omitted tool"
-if grep -q 'scan: finished' <<<"$scan_missing_project_tool_output"; then
+if grep -q 'repo-audit: finished' <<<"$scan_missing_project_tool_output"; then
   fail "scan with missing project audit tool logged finished"
 fi
 pass "scan missing project audit tools exits nonzero"
@@ -872,14 +868,22 @@ scan_project_output="$(
       detect_machine_tools() { return 0; }
       confirm_scan_with_missing_tools() { return 0; }
       scan_source_into_result() { printf "SCAN\t%s\t%s\t%s\t%s\t%s\t%s\n" "$1" "$2" "$3" "$4" "$5" "$6"; }
-      scan_command --verbose --project "$PROJECT_PATH"
+      repo_audit_command --verbose "$PROJECT_PATH"
     ' 2>&1
 )"
 scan_project_quoted="$(printf '%q' "$scan_project")"
-grep -Fq "scan: starting rainbow project $scan_project_quoted" <<<"$scan_project_output" || fail "project scan start log omitted target path"
-grep -Fq "scan: finished rainbow project $scan_project_quoted" <<<"$scan_project_output" || fail "project scan finish log omitted target path"
-grep -Fq "verbose: scan targets: rainbow" <<<"$scan_project_output" || fail "verbose scan omitted target machine"
-grep -Fq "verbose: scan mode: source" <<<"$scan_project_output" || fail "verbose scan omitted default source mode"
+grep -Fq "repo-audit: starting project $scan_project_quoted" <<<"$scan_project_output" || fail "project scan start log omitted target path"
+grep -Fq "repo-audit: finished project $scan_project_quoted" <<<"$scan_project_output" || fail "project scan finish log omitted target path"
+# The vocabulary leak this surface split exists to kill: repo-audit has no
+# machine dimension, so no machine name may appear in its progress lines. The
+# machine still shows in `verbose:` lines below — that is scan_machine's own
+# internal logging, shared with machine-audit, and not this surface's voice.
+while IFS= read -r progress_line; do
+  case "$progress_line" in
+    *rainbow*|*remote*) fail "repo-audit progress line named a machine: $progress_line" ;;
+  esac
+done < <(grep -E 'repo-audit: (starting|finished|failed) ' <<<"$scan_project_output" || true)
+grep -Fq "verbose: repo-audit mode: source" <<<"$scan_project_output" || fail "verbose scan omitted default source mode"
 grep -Fq "verbose: rainbow: resolved target=$scan_project_quoted" <<<"$scan_project_output" || fail "verbose scan omitted resolved project target"
 grep -Fq "verbose: rainbow: using local direct scan source=$scan_project_quoted" <<<"$scan_project_output" || fail "verbose scan omitted local project source"
 grep -Fq $'SCAN\trainbow\t'"$scan_project"$'\t'"$scan_project"$'\tlocal-direct\tsource\t1' <<<"$scan_project_output" || fail "project scan did not pass target path, mode, and strategy"
@@ -897,7 +901,7 @@ scan_full_output="$(
       set -- --version
       source "$SAFE_AUDIT_PATH" >/dev/null
       scan_machine() { printf "SCAN\t%s\t%s\t%s\n" "$1" "${2:-}" "${3:-}"; }
-      scan_command --full --project "$PROJECT_PATH"
+      repo_audit_command --full "$PROJECT_PATH"
     ' 2>&1
 )"
 grep -Fq $'SCAN\tlocal\t'"$scan_project"$'\tfull' <<<"$scan_full_output" || fail "--full did not select full scan mode"
@@ -912,7 +916,7 @@ scan_deps_output="$(
       set -- --version
       source "$SAFE_AUDIT_PATH" >/dev/null
       scan_machine() { printf "SCAN\t%s\t%s\t%s\n" "$1" "${2:-}" "${3:-}"; }
-      scan_command --deps-only --project "$PROJECT_PATH"
+      repo_audit_command --deps-only "$PROJECT_PATH"
     ' 2>&1
 )"
 grep -Fq $'SCAN\tlocal\t'"$scan_project"$'\tdeps' <<<"$scan_deps_output" || fail "--deps-only did not select deps scan mode"
@@ -981,7 +985,7 @@ pass "unreachable machine warning"
 
 SAFE_AUDIT_CONFIG_DIR="$tmp/config-machine-arg" \
 SAFE_AUDIT_DATA_DIR="$tmp/data-machine-arg" \
-  "$SAFE_AUDIT" scan --machine >/dev/null 2>"$tmp/machine-arg.err" && fail "--machine without value succeeded"
+  "$SAFE_AUDIT" machine-audit --machine >/dev/null 2>"$tmp/machine-arg.err" && fail "--machine without value succeeded"
 grep -q -- '--machine requires a comma-separated list' "$tmp/machine-arg.err" || fail "--machine missing value did not report usage error"
 pass "--machine missing value handling"
 

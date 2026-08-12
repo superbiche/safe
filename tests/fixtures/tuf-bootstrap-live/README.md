@@ -1,4 +1,4 @@
-Minimal offline TUF mirror fixture for `safe audit verify tuf-bootstrap` live tests.
+Minimal offline TUF mirror fixture for `safe audit binary-audit verify tuf-bootstrap` live tests.
 
 - `root.json` is a long-lived test root generated for this repo.
 - `mirror/` contains only the versioned metadata and hashed target blobs that `cosign initialize` actually fetches.

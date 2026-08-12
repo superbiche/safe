@@ -16,7 +16,7 @@ The installed gate is a COPY: repo edits change nothing live until `install.sh` 
 
 - Never suggest, match, or allowlist `@latest`; allow entries are pinned to resolved versions.
 - Audit-infrastructure failure (Socket auth/429/network/timeout) must read as breakage-to-fix with a recovery path, never as a CVE signal.
-- Refusals: single final stderr line; exit 100 (policy) / 102 (operator TTY needed) / 104 (audit BLOCK); 0/10/20 are `safe audit check` verdict codes; 127 = genuinely missing command.
+- Refusals: single final stderr line; exit 100 (policy) / 102 (operator TTY needed) / 104 (audit BLOCK); 0/10/20 are `safe audit package-audit` verdict codes; 127 = genuinely missing command.
 - Fail-closed stays for malice signals (blocklist, critical advisory affecting the resolved version, Socket BLOCK). Resolution that cannot be predicted degrades honestly (package-level WARN + pin hint), never silently passes.
 
 ## Reviews (repo default, ruled 2026-08-03)

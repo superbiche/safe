@@ -79,14 +79,15 @@ Runner flags:
 
 ```bash
 safe audit capabilities [--json]
-safe audit scan [--verbose] [--deps-only | --full] [--project <path>] [--all | --machine <csv>]
-safe audit check <pkg>@<version> [--ecosystem <name>] [--installer <name>] [--json]
-safe audit release github --repo OWNER/REPO --version TAG --asset NAME [--tag-regex REGEX] [--json]
-safe audit vuln github-release --repo OWNER/REPO --version TAG [--json]
-safe audit verify release-asset --artifact PATH --checksum PATH [--certificate PATH --signature PATH --certificate-identity-regexp REGEX --certificate-oidc-issuer URL] [--require-signature] [--json]
-safe audit verify sigstore-bundle --artifact PATH --bundle PATH --identity VALUE --oidc-issuer URL [--json]
-safe audit verify tuf-bootstrap --mirror PATH --root PATH --root-checksum SHA256 --target NAME=PATH [--target NAME=PATH ...] [--json]
-safe audit binary exec PATH [--timeout SECONDS] [--json] -- [ARGS...]
+safe audit machine-audit [--verbose] [--deps-only | --full] [--project <path>] [--all | --machine <csv>]
+safe audit package-audit <pkg>@<version> [--ecosystem <name>] [--installer <name>] [--json]
+safe audit repo-audit [<path>] [--verbose] [--deps-only | --full] [--no-cache] [--result-out <file>] [--allow-missing-tools]
+safe audit binary-audit release github --repo OWNER/REPO --version TAG --asset NAME [--tag-regex REGEX] [--json]
+safe audit binary-audit vuln github-release --repo OWNER/REPO --version TAG [--json]
+safe audit binary-audit verify release-asset --artifact PATH --checksum PATH [--certificate PATH --signature PATH --certificate-identity-regexp REGEX --certificate-oidc-issuer URL] [--require-signature] [--json]
+safe audit binary-audit verify sigstore-bundle --artifact PATH --bundle PATH --identity VALUE --oidc-issuer URL [--json]
+safe audit binary-audit verify tuf-bootstrap --mirror PATH --root PATH --root-checksum SHA256 --target NAME=PATH [--target NAME=PATH ...] [--json]
+safe audit binary-audit exec PATH [--timeout SECONDS] [--json] -- [ARGS...]
 safe audit ioc <identifier> [--all | --machine <csv>]
 safe audit ioc --list <ioc.json> [--all | --machine <csv>]
 safe audit ioc --update [--since <duration>] [--all | --machine <csv>]
@@ -101,7 +102,7 @@ safe audit --version
 an explicit local bundle. It does not download upstream release assets, run
 `curl | sh`, or run language package installers.
 
-`safe audit scan` defaults to `source` mode: dependency manifests and lockfiles
+`safe audit machine-audit` defaults to `source` mode: dependency manifests and lockfiles
 plus first-party source, while skipping installed dependency trees and generated
 output. Use `--deps-only` for manifests and lockfiles only, `--full` to scan the
 complete target tree, and `--verbose` to print project discovery, staged files,
@@ -155,7 +156,7 @@ possible and run deliberate updates through `safe vendor update`.
 ## Install Wrapper Coverage
 
 `safe install -g <pkg>` is the low-friction npm host-install path. It runs
-`safe audit check` for each explicit package, prompts before installing, and
+`safe audit package-audit` for each explicit package, prompts before installing, and
 then forwards to `npm install -g`. Use `--yes` to skip the final prompt after a
 successful audit.
 
@@ -187,7 +188,7 @@ safe install            # in a project directory
 safe install --project
 ```
 
-It runs `safe audit scan --deps-only --project .` (so it benefits from the scan
+It runs `safe audit repo-audit . --deps-only` (so it benefits from the scan
 cache) and prints a one-screen summary: audited manifests, package count,
 finding counts by severity, verdict, and the top critical/high findings with
 package and advisory id.
