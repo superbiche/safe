@@ -63,3 +63,35 @@ else
   printf 'not ok - live Socket package-score envelope changed (response withheld)\n' >&2
   exit 1
 fi
+
+# The assertions above are VACUOUS on a package with no alerts, and
+# brace-expansion has none — so they witnessed nothing about alert shape while
+# reading as coverage (review F4). node-ipc@10.1.1 is an immutable published
+# version that carries the alert this gate's only BLOCK depends on: severity
+# `critical` in category `supplyChainRisk`. If Socket ever renames either, the
+# malice BLOCK stops firing, and this is the assertion that says so.
+alerts="$scratch/alerts.json"
+set +e
+timeout --kill-after=2s 30s socket package score npm node-ipc@10.1.1 --json >"$alerts" 2>"$error"
+rc=$?
+set -e
+if (( rc != 0 )); then
+  printf 'not ok - live Socket alert-witness query failed (exit %s; response withheld)\n' "$rc" >&2
+  exit 1
+fi
+
+if jq -e '
+  ((.data.self.alerts | length) > 0)
+  and ([.data.self.alerts[]
+        | select(.severity == "critical" and .category == "supplyChainRisk")]
+       | length > 0)
+  and ([.data.self.alerts[]
+        | select((.name | type) == "string" and (.name | length) > 0
+                 and (.example | type) == "string")]
+       | length) == (.data.self.alerts | length)
+' "$alerts" >/dev/null 2>&1; then
+  printf 'ok - live Socket alert objects carry the malice class the BLOCK reads\n'
+else
+  printf 'not ok - live Socket alert contract changed: no critical/supplyChainRisk alert on a known-flagged version, or alert members moved (response withheld)\n' >&2
+  exit 1
+fi

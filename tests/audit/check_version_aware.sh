@@ -81,7 +81,7 @@ cat > "$MOCKBIN/socket" <<'MOCK'
 [[ -n "${MOCK_SOCKET_ARGS_LOG:-}" ]] && printf '%s\n' "$*" >> "$MOCK_SOCKET_ARGS_LOG"
 success_envelope() {
   local score="$1"
-  printf '{"ok":true,"data":{"purl":"pkg:npm/fixture@1.0.0","self":{"alerts":[],"capabilities":[],"purl":"pkg:npm/fixture@1.0.0","score":{"overall":%s,"supplyChain":95,"quality":95,"maintenance":95,"vulnerability":95,"license":95}},"transitively":[]}}\n' "$score"
+  printf '{"ok":true,"data":{"purl":"pkg:npm/fixture@1.0.0","self":{"alerts":[],"capabilities":[],"purl":"pkg:npm/fixture@1.0.0","score":{"overall":%s,"supplyChain":95,"quality":95,"maintenance":95,"vulnerability":95,"license":95}},"transitively":{"dependencyCount":0,"alerts":[],"score":{"overall":100}}}}\n' "$score"
 }
 case "${MOCK_SOCKET_MODE:-ok}" in
   ok) success_envelope 95; exit 0 ;;

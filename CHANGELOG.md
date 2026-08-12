@@ -9,6 +9,14 @@
   and its configuration have been removed. Validated successful Socket results
   now cache for seven days by exact resolved package identity; expired entries
   are context only and never decide a verdict.
+  Every resolved version is scored, not only the primary one, so a clean
+  version can no longer carry a flagged sibling through a ranged update; a
+  version that cannot be scored is reported unproven rather than assumed
+  clean. Alert classification is exhaustive: a critical alert in a category
+  safe does not recognize is treated as unresolved, never as clean. Socket
+  error bodies are classified into fixed reason codes and their text is
+  discarded — provider responses can carry account context and never reach a
+  receipt, cache, or terminal.
 
 - npm gate routing covers install, update, ci, exec, and lock-diff aliases and
   abbreviations before delegation. It uses a checked-in full command/alias

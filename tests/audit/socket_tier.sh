@@ -42,6 +42,10 @@ case "$url" in
   *)
     if [[ "${MOCK_RELEASE_FRESH:-0}" == "1" ]]; then
       printf '{"versions":{"1.0.0":{}},"time":{"1.0.0":"%s"}}\n' "$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)" | emit
+    elif [[ "${MOCK_MULTI_VERSION:-0}" == "1" ]]; then
+      # Two majors so two distinct project constraints resolve to two
+      # distinct installable versions (RESOLVED_VERSIONS length 2).
+      printf '{"versions":{"1.0.0":{},"2.0.0":{}},"dist-tags":{"latest":"2.0.0"},"time":{"1.0.0":"2020-01-01T00:00:00Z","2.0.0":"2020-06-01T00:00:00Z"}}\n' | emit
     else
       printf '{"versions":{"1.0.0":{}},"time":{"1.0.0":"2020-01-01T00:00:00Z"}}\n' | emit
     fi
@@ -63,19 +67,46 @@ envelope() {
   local score="$1" alerts="$2"
   printf '{"ok":true,"data":{"self":{"score":{"overall":%s},"alerts":%s},"transitively":{"dependencyCount":0,"alerts":[],"score":{"overall":100}}}}\n' "$score" "$alerts"
 }
+# The scored purl is the last non-flag argument: `... score npm name@version --json`.
+scored_version=""
+for arg in "$@"; do
+  case "$arg" in *@*) scored_version="${arg##*@}" ;; esac
+done
 case "${MOCK_SOCKET_MODE:-clean}" in
   clean) envelope 95 '[]' ;;
-  malware) envelope 95 '[{"name":"malware","severity":"critical","category":"supplyChainRisk"}]' ;;
-  critical-cve) envelope 95 '[{"name":"cve","severity":"critical","category":"vulnerability"}]' ;;
-  high) envelope 95 '[{"name":"risky","severity":"high","category":"supplyChainRisk"}]' ;;
+  # Primary (1.0.0) is clean, the sibling major (2.0.0) is malicious: the exact
+  # shape of the coverage gap review F1 found after GuardDog's multi-version
+  # scan was removed.
+  sibling-malware)
+    if [[ "$scored_version" == "2.0.0" ]]; then
+      envelope 95 '[{"name":"malware","severity":"critical","category":"supplyChainRisk","example":"npm/fixture@2.0.0"}]'
+    else
+      envelope 95 '[]'
+    fi
+    ;;
+  sibling-error)
+    if [[ "$scored_version" == "2.0.0" ]]; then
+      printf '{"message":"mock failure"}\n'; exit 1
+    else
+      envelope 95 '[]'
+    fi
+    ;;
+  # A critical alert in a category safe does not map: must never reach PASS.
+  unknown-category) envelope 95 '[{"name":"future-risk","severity":"critical","category":"newCategory","example":"npm/fixture@1.0.0"}]' ;;
+  malware) envelope 95 '[{"name":"malware","severity":"critical","category":"supplyChainRisk","example":"npm/fixture@1.0.0"}]' ;;
+  critical-cve) envelope 95 '[{"name":"cve","severity":"critical","category":"vulnerability","example":"npm/fixture@1.0.0"}]' ;;
+  high) envelope 95 '[{"name":"risky","severity":"high","category":"supplyChainRisk","example":"npm/fixture@1.0.0"}]' ;;
   low) envelope 40 '[]' ;;
-  bad-severity) envelope 95 '[{"name":"odd","severity":"unknown","category":"supplyChainRisk"}]' ;;
+  bad-severity) envelope 95 '[{"name":"odd","severity":"unknown","category":"supplyChainRisk","example":"npm/fixture@1.0.0"}]' ;;
   missing-name) envelope 95 '[{"severity":"critical","category":"supplyChainRisk"}]' ;;
   missing-category) envelope 95 '[{"name":"incomplete","severity":"critical"}]' ;;
   bad-score) printf '{"ok":true,"data":{"self":{"score":{"overall":"95"},"alerts":[]}}}\n' ;;
   missing-self) printf '{"ok":true,"data":{"transitively":{"dependencyCount":0}}}\n' ;;
   non-object-alert) envelope 95 '[true]' ;;
   rate) printf '{"message":"Too Many Requests","cause":"429"}\n'; exit 1 ;;
+  # Carries account context the way a real provider error body can. The
+  # sentinel must reach no receipt, cache, stdout, or stderr (review F5).
+  auth-leaky) printf '{"message":"Unauthorized for operator@example.com","cause":"account SENTINELACCT9137"}\n'; exit 1 ;;
   pending) sleep 5 ;;
   *) printf '{"message":"mock failure"}\n'; exit 1 ;;
 esac
@@ -234,6 +265,77 @@ run_check pending MOCK_RELEASE_FRESH=1 MOCK_COOLDOWN_FIX=1 SAFE_AUDIT_SOCKET_TIM
 expect_rc 0 'clean fresh release with incomplete Socket score stays GO'
 expect_json '.socket.status == "pending" and .verdict == "GO"' 'pending Socket score is disclosed in the receipt'
 [[ "$(cache_entries)" == "0" ]] && pass 'pending Socket score is never cached' || fail 'pending Socket score is never cached'
+
+# A critical alert whose category safe cannot map must degrade to an
+# infrastructure WARN, never fall through to PASS (review F3). Socket can add
+# a category at any time; an unknown class is unresolved, not clean.
+prepare_case unknown-category
+run_check unknown-category
+expect_rc 10 'unclassifiable critical alert warns instead of passing'
+expect_json '.warn_causes | index("socket_error") != null' 'unclassifiable critical alert is an unresolved result'
+expect_json '.verdict == "WARN"' 'unclassifiable critical alert never reaches GO'
+
+# --- every resolved version is scored, not just the primary (review F1) -----
+# Two project constraints resolve to two installable versions. The primary is
+# clean and the sibling major carries the malice alert; the operation installs
+# both, so a primary-only scan would let the malicious one through at GO.
+multi_project() {
+  MULTI_DIR="$CASE/project"
+  mkdir -p "$MULTI_DIR"
+  printf '{"dependencies":{"fixture":"^1.0.0"},"devDependencies":{"fixture":"^2.0.0"}}\n' \
+    > "$MULTI_DIR/package.json"
+}
+
+run_multi() {
+  local mode="$1"
+  set +e
+  env -u SOCKET_SECURITY_API_TOKEN HOME="$CASE_HOME" PATH="$MOCKBIN:/usr/bin:/bin" \
+    SAFE_AUDIT_CONFIG_DIR="$CASE_AUDIT_CONFIG" SAFE_AUDIT_DATA_DIR="$CASE_DATA/audit" \
+    SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" SAFE_AUDIT_SOCKET_CACHE_DIR="$CASE_CACHE" \
+    MOCK_SOCKET_LOG="$CASE_LOG" MOCK_SOCKET_MODE="$mode" MOCK_MULTI_VERSION=1 \
+    "$SAFE_AUDIT" check fixture --ecosystem npm --op update --project-dir "$MULTI_DIR" \
+    --json > "$CASE_OUT" 2> "$CASE_ERR"
+  CHECK_RC=$?
+  set -e
+}
+
+prepare_case multi-version-sanity
+multi_project
+run_multi clean
+expect_rc 0 'multi-constraint resolve with all versions clean permits GO'
+expect_json '.resolution.method == "project-range" and (.resolved_versions | sort) == ["1.0.0","2.0.0"]' 'both project constraints resolve to distinct installable versions'
+[[ "$(socket_calls)" == "2" ]] && pass 'every resolved version is scored' || fail 'every resolved version is scored'
+
+prepare_case multi-version-sibling-malware
+multi_project
+run_multi sibling-malware
+expect_rc 20 'malicious non-primary resolved version blocks'
+expect_json '.warn_causes | index("socket_malware") != null' 'sibling malice raises the malware cause'
+expect_json '.verdict == "BLOCK"' 'a clean primary cannot carry a malicious sibling to GO'
+
+prepare_case multi-version-sibling-error
+multi_project
+run_multi sibling-error
+expect_rc 10 'unscored non-primary version warns rather than passing'
+expect_json '.warn_causes | index("socket_error") != null' 'an unproven sibling is never assumed clean'
+
+# Provider error bodies can name the operator or the org, and could in
+# principle reflect credential material. safe classifies the failure into a
+# fixed reason code and discards the text (review F5).
+prepare_case error-body-sentinel
+run_check auth-leaky
+expect_rc 10 'auth failure warns as infrastructure breakage'
+expect_json '.warn_causes | index("socket_auth_failed") != null' 'auth failure is classified from a fixed reason code'
+if grep -rq 'SENTINELACCT9137' "$CASE" 2>/dev/null; then
+  fail 'provider error-body text never reaches receipt, cache, stdout, or stderr'
+else
+  pass 'provider error-body text never reaches receipt, cache, stdout, or stderr'
+fi
+if grep -rq 'operator@example.com' "$CASE" 2>/dev/null; then
+  fail 'provider error-body identity never reaches receipt, cache, stdout, or stderr'
+else
+  pass 'provider error-body identity never reaches receipt, cache, stdout, or stderr'
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

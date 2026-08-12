@@ -4874,6 +4874,30 @@ socket_envelope_valid() {
   ' "$1" >/dev/null 2>&1
 }
 
+# Classify one validated Socket result into exactly one verdict-bearing class.
+# EXHAUSTIVE by construction: `unmapped` catches any alert severe enough to
+# matter whose category safe does not know. Socket can add a category at any
+# time, and an unknown class must never fall through to clean — that is the
+# same principle the severity enum enforces in socket_envelope_valid, applied
+# one field over (review F3: a critical alert in a new category reached PASS).
+#
+# Precedence, strongest first: malware, unmapped-critical, critical CVE,
+# high, low score, clean.
+socket_classify() {
+  jq -r '
+    [.raw.data.self.alerts[]?] as $alerts
+    | ($alerts | map(select(.severity == "critical"))) as $critical
+    | if ($critical | map(select(.category == "supplyChainRisk")) | length) > 0 then "malware"
+      elif ($critical | map(select(.category != "supplyChainRisk"
+                                   and .category != "vulnerability")) | length) > 0 then "unmapped"
+      elif ($critical | map(select(.category == "vulnerability")) | length) > 0 then "critical_cve"
+      elif ($alerts | map(select(.severity == "high")) | length) > 0 then "high"
+      elif (.raw.data.self.score.overall < 70) then "low_score"
+      else "clean"
+      end
+  ' "$1" 2>/dev/null || printf 'unmapped'
+}
+
 socket_cache_identity_json() {
   local ecosystem="$1" name="$2" version="$3"
   jq -cn --arg ecosystem "$ecosystem" --arg name "$name" --arg version "$version" \
@@ -5021,7 +5045,7 @@ socket_score_json() {
     # why — never a package finding (PR7 review F2). Every other network
     # primitive in a check is individually curl --max-time bounded, so
     # this was the last unboundable call.
-    printf '{"available":true,"status":"error","note":"socket score skipped: no timeout binary to bound the call (install coreutils)"}\n' > "$output"
+    printf '{"available":true,"status":"error","reason":"unbounded","note":"socket score skipped: no timeout binary to bound the call (install coreutils)"}\n' > "$output"
     return 0
   fi
   local score_ok=true score_rc=0
@@ -5030,7 +5054,7 @@ socket_score_json() {
   # KILL escalation fires (timeout signals its own group — PR#65 delta-2 N3).
   { "${socket_leash[@]}" "${socket_invocation[@]}" package score "$purl_type" "$spec" --json > "$output.raw" 2>"$output.stderr" </dev/null || { score_rc=$?; score_ok=false; }; } 2>/dev/null
   if [[ "$score_ok" == "false" && ( "$score_rc" == "124" || "$score_rc" == "137" ) ]]; then
-    printf '%s\n' "$(jq -n --arg note "socket score timed out after ${socket_budget}s" '{available:true,status:"error",timeout:true,note:$note}')" > "$output"
+    printf '%s\n' "$(jq -n --arg note "socket score timed out after ${socket_budget}s" '{available:true,status:"error",reason:"timeout",timeout:true,note:$note}')" > "$output"
     return 0
   fi
 
@@ -5051,26 +5075,36 @@ socket_score_json() {
       # generic path below would read the (empty) kill-time output and
       # report a bare "socket command failed" (PR7 review F1).
       if [[ "$retry_rc" == "124" || "$retry_rc" == "137" ]]; then
-        printf '%s\n' "$(jq -n --arg note "socket score timed out after ${socket_budget}s" '{available:true,status:"error",timeout:true,note:$note}')" > "$output"
+        printf '%s\n' "$(jq -n --arg note "socket score timed out after ${socket_budget}s" '{available:true,status:"error",reason:"timeout",timeout:true,note:$note}')" > "$output"
         return 0
       fi
     fi
   fi
 
   if [[ "$score_ok" == "false" ]]; then
-    local note
-    # .cause carries the real reason (401 Unauthorized, 429 Too Many Requests,
-    # ...); .data can be an object, which would crash join(" ") and lose the
-    # note to the spinner text on stderr.
-    note=$(jq -r '[.message?, .cause?] | map(select(type == "string" and . != "")) | join(" — ")' "$output.raw" 2>/dev/null | tr '\n' ' ' || true)
-    [[ -n "$note" ]] || note=$(jq -r '[.message?, .cause?] | map(select(type == "string" and . != "")) | join(" — ")' "$output.stderr" 2>/dev/null | tr '\n' ' ' || true)
-    [[ -n "$note" ]] || note=$(cat "$output.stderr" 2>/dev/null | tr '\n' ' ' || true)
-    [[ -n "$note" ]] || note="socket command failed"
-    printf '%s\n' "$(jq -n --arg note "$note" '{available:true,status:"error",note:$note}')" > "$output"
+    # Provider error bodies can carry account context (operator identity, org
+    # name) and, if the vendor ever reflects it, credential material. Classify
+    # the failure here into a FIXED reason code and discard the text: the
+    # response body must never reach stdout, stderr, a receipt, a cache, or a
+    # log (review F5). Callers switch on .reason, never on prose.
+    local probe reason note
+    probe=$( { jq -r '[.message?, .cause?] | map(select(type == "string")) | join(" ")' \
+                 "$output.raw" 2>/dev/null; cat "$output.stderr" 2>/dev/null; } | tr '\n' ' ' || true)
+    case "$probe" in
+      # 429 first: its body never mentions auth, and a bare "API" match used to
+      # relabel any failure (even spinner text) as an auth problem.
+      *"Too Many Requests"*|*" 429"*|*"rate limit"*) reason="rate_limited"; note="socket rate-limited" ;;
+      *Unauthorized*|*" 401"*|*token*|*Token*|*"api key"*|*"API key"*) reason="auth"; note="socket authentication required" ;;
+      *"Not Found"*|*" 404"*) reason="not_found"; note="socket has no record of this package version" ;;
+      *) reason="error"; note="socket command failed" ;;
+    esac
+    unset probe
+    printf '%s\n' "$(jq -n --arg reason "$reason" --arg note "$note" \
+      '{available:true,status:"error",reason:$reason,note:$note}')" > "$output"
     return 0
   fi
   if ! socket_envelope_valid "$output.raw"; then
-    printf '{"available":true,"status":"error","note":"socket returned an unrecognized result shape"}\n' > "$output"
+    printf '{"available":true,"status":"error","reason":"malformed","note":"socket returned an unrecognized result shape"}\n' > "$output"
     return 0
   fi
   jq -n --slurpfile data "$output.raw" '
@@ -7453,23 +7487,32 @@ check_command() {
     socket_line="PENDING (fresh release ${primary_version}, ${primary_release_age}d old — Socket scan not yet complete)"
     socket_detail=$(jq -r '.note // "Socket scan not yet complete"' "$socket_json" 2>/dev/null || true)
   elif [[ "$(jq -r '.status' "$socket_json")" != "ok" ]]; then
-    local socket_note
+    # Switch on the fixed reason code, never on prose: the note is now a
+    # safe-authored constant and provider text never reaches this point
+    # (review F5). An envelope with no reason is an old or unexpected shape
+    # and degrades to the generic error, never to clean.
+    local socket_note socket_reason_code
     socket_note=$(jq -r '.note // "socket check failed"' "$socket_json" 2>/dev/null || printf 'socket check failed')
-    case "$socket_note" in
-      *"Too Many Requests"*|*" 429"*|*"rate limit"*)
+    socket_reason_code=$(jq -r '.reason // "error"' "$socket_json" 2>/dev/null || printf 'error')
+    case "$socket_reason_code" in
+      rate_limited)
         socket_line='WARN (socket rate-limited, retry later)'
         warn_causes+=("socket_rate_limited")
         ;;
-      *Unauthorized*|*" 401"*|*token*|*Token*)
+      auth)
         socket_line='WARN (socket authentication required)'
         warn_causes+=("socket_auth_failed")
         ;;
-      *"timed out"*)
+      timeout)
         socket_line='WARN (socket score timed out)'
         warn_causes+=("socket_error")
         ;;
-      *"no timeout binary"*)
+      unbounded)
         socket_line='WARN (socket score skipped: cannot be bounded)'
+        warn_causes+=("socket_error")
+        ;;
+      not_found)
+        socket_line='WARN (socket has no record of this package version)'
         warn_causes+=("socket_error")
         ;;
       *)
@@ -7483,32 +7526,95 @@ check_command() {
     socket_detail="$socket_note"
     verdict="WARN"
   else
-    local score_val
+    local score_val socket_class
     score_val=$(jq -r '.raw.data.self.score.overall' "$socket_json")
-    if jq -e '[.raw.data.self.alerts[]
-      | select(.severity == "critical" and .category == "supplyChainRisk")] | length > 0' \
-      "$socket_json" >/dev/null 2>&1; then
-      socket_line='BLOCK (critical supply-chain-risk alert)'
-      warn_causes+=("socket_malware")
-      bump_verdict verdict "BLOCK"
-    elif jq -e '[.raw.data.self.alerts[]
-      | select(.severity == "critical" and .category == "vulnerability")] | length > 0' \
-      "$socket_json" >/dev/null 2>&1; then
-      socket_line='WARN (critical vulnerability alert)'
-      warn_causes+=("socket_critical_cve")
-      bump_verdict verdict "WARN"
-    elif jq -e '[.raw.data.self.alerts[] | select(.severity == "high")] | length > 0' \
-      "$socket_json" >/dev/null 2>&1; then
-      socket_line='WARN (high-severity alert)'
-      warn_causes+=("socket_high_alert")
-      bump_verdict verdict "WARN"
-    elif jq -e '.raw.data.self.score.overall < 70' "$socket_json" >/dev/null 2>&1; then
-      socket_line="WARN (score=$score_val)"
-      warn_causes+=("socket_low_score")
-      bump_verdict verdict "WARN"
-    else
-      socket_line="PASS (score=$score_val)"
-    fi
+    socket_class=$(socket_classify "$socket_json")
+    case "$socket_class" in
+      malware)
+        socket_line='BLOCK (critical supply-chain-risk alert)'
+        warn_causes+=("socket_malware")
+        bump_verdict verdict "BLOCK"
+        ;;
+      unmapped)
+        socket_line='WARN (critical alert in a category safe cannot classify — treated as unresolved, not clean)'
+        warn_causes+=("socket_error")
+        socket_detail="unclassifiable critical alert category"
+        bump_verdict verdict "WARN"
+        ;;
+      critical_cve)
+        socket_line='WARN (critical vulnerability alert)'
+        warn_causes+=("socket_critical_cve")
+        bump_verdict verdict "WARN"
+        ;;
+      high)
+        socket_line='WARN (high-severity alert)'
+        warn_causes+=("socket_high_alert")
+        bump_verdict verdict "WARN"
+        ;;
+      low_score)
+        socket_line="WARN (score=$score_val)"
+        warn_causes+=("socket_low_score")
+        bump_verdict verdict "WARN"
+        ;;
+      *)
+        socket_line="PASS (score=$score_val)"
+        ;;
+    esac
+  fi
+
+  # --- sibling resolved versions (review F1) -------------------------------
+  # The behavioral tier must cover every version the operation can install,
+  # not just the primary. GuardDog scanned all of RESOLVED_VERSIONS; when it
+  # was removed, Socket's primary-only score silently dropped that coverage,
+  # so a clean 1.5.0 could carry a malicious 2.5.0 in on a ranged update.
+  # OSV already loops the same set — this restores parity.
+  #
+  # Cheap by construction: each exact version reads its own cache entry, so a
+  # re-audit of an unchanged set costs no API calls.
+  if (( resolution_ok )) && (( ${#RESOLVED_VERSIONS[@]} > 1 )) \
+    && [[ "$socket_mode" != "never" ]]; then
+    local sib sib_json sib_idx=0 sib_class
+    for sib in "${RESOLVED_VERSIONS[@]}"; do
+      [[ "$sib" == "$primary_version" ]] && continue
+      sib_idx=$(( sib_idx + 1 ))
+      sib_json="$scratch/socket-sibling-${sib_idx}.json"
+      socket_score_json "$ecosystem" "${PKG_NAME}@${sib}" "$sib_json" "" "$PKG_NAME" "$sib"
+      if [[ "$(jq -r '.status // empty' "$sib_json" 2>/dev/null)" != "ok" ]]; then
+        # A sibling we could not score is unproven, never assumed clean.
+        socket_line+="; ${sib} not scored (infrastructure failure)"
+        warn_causes+=("socket_error")
+        bump_verdict verdict "WARN"
+        continue
+      fi
+      sib_class=$(socket_classify "$sib_json")
+      case "$sib_class" in
+        malware)
+          socket_line+="; BLOCK ${sib} (critical supply-chain-risk alert)"
+          warn_causes+=("socket_malware")
+          bump_verdict verdict "BLOCK"
+          ;;
+        unmapped)
+          socket_line+="; WARN ${sib} (unclassifiable critical alert)"
+          warn_causes+=("socket_error")
+          bump_verdict verdict "WARN"
+          ;;
+        critical_cve)
+          socket_line+="; WARN ${sib} (critical vulnerability alert)"
+          warn_causes+=("socket_critical_cve")
+          bump_verdict verdict "WARN"
+          ;;
+        high)
+          socket_line+="; WARN ${sib} (high-severity alert)"
+          warn_causes+=("socket_high_alert")
+          bump_verdict verdict "WARN"
+          ;;
+        low_score)
+          socket_line+="; WARN ${sib} (score=$(jq -r '.raw.data.self.score.overall' "$sib_json"))"
+          warn_causes+=("socket_low_score")
+          bump_verdict verdict "WARN"
+          ;;
+      esac
+    done
   fi
 
   # --- version-aware OSV evaluation
