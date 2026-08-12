@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- **Fixed — a Go repo lost its entire OSV tier, silently.** Discovery handed
+  osv-scanner `go.sum`, which its Go extractor has never read (it reads
+  `go.mod`). osv-scanner treats a file it cannot extract as fatal for the
+  *whole batch*: it exits nonzero, writes nothing, and discards the lockfiles
+  it had already read. So a Go repo got no OSV coverage at all, and in a mixed
+  repo the Go file took the npm results down with it — 54 advisories were
+  invisible in the repo that surfaced this — while the audit still printed
+  `repo-audit: finished`.
+
+  What safe hands the scanner is now translated first: `go.sum` resolves to its
+  sibling `go.mod`, `bun.lockb` to its sibling `bun.lock`, and a file with no
+  readable stand-in is dropped and reported rather than passed in to kill the
+  batch.
+
+- If the osv batch fails anyway, each lockfile is rescanned on its own and the
+  results merged. One unreadable file now costs its own coverage instead of the
+  whole tier; the tool status becomes `partial` and names the file.
+
+- Lost coverage is stated where the operator reads it. `repo-audit` and
+  `machine-audit` close with `finished ... with degraded coverage: <tiers>`
+  instead of a clean `finished`, and the install gate's `not run:` line now
+  includes core tiers, not just ecosystem audits. The result JSON already
+  carried this in `tool_status`; nothing surfaced it.
+
+- **`bun.lock` and `bun.lockb` are discovered.** Bun projects were invisible to
+  `repo-audit`: no lockfile found, so nothing was audited. `bun.lock` is read
+  by osv-scanner directly; `bun.lockb` is binary and has no extractor, so it
+  counts as dependency evidence but is never handed to the scanner.
+
+- **New: `safe audit lockfile-support [--json]`**, which probes the installed
+  osv-scanner against every lockfile format safe hands it and reports any it
+  can no longer read. `safe doctor` runs it and lists dropped extractors under
+  missing prerequisites, so a scanner upgrade that strips a tier is visible
+  before it costs a scan. This defect shipped in an osv-scanner release and was
+  caught by a user, not by a check.
+
 - **Breaking — `safe audit` subcommands renamed to four narrow surfaces.**
   `check` → `package-audit`, `scan --project <path>` → `repo-audit [<path>]`,
   `scan` → `machine-audit`, and `binary`/`verify`/`release`/`vuln` → subverbs

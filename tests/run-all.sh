@@ -24,6 +24,7 @@ SUITES=(
   tests/audit/external_binary.sh
   tests/audit/scan_cache.sh
   tests/audit/tool_resolution.sh
+  tests/audit/lockfile_coverage.sh
   tests/audit/cvss4_known_answers.sh
   tests/audit/scanner_batch.sh
   tests/contract/drift.sh

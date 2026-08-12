@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.1.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.19.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.20.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -60,6 +60,23 @@ BINARY_AUDIT_TIMEOUT_SECONDS="${SAFE_AUDIT_BINARY_TIMEOUT_SECONDS:-20}"
 BINARY_AUDIT_STDIO_LIMIT="${SAFE_AUDIT_BINARY_STDIO_LIMIT:-4000}"
 BINARY_AUDIT_STDIO_LINES="${SAFE_AUDIT_BINARY_STDIO_LINES:-40}"
 
+# Every lockfile name safe hands osv-scanner, after translation. A scanner
+# upgrade that drops an extractor silently strips the OSV tier for every repo
+# using that format, so this is probed rather than inferred from the version.
+declare -ar SAFE_AUDIT_OSV_LOCKFILE_FORMATS=(
+  package-lock.json
+  npm-shrinkwrap.json
+  pnpm-lock.yaml
+  yarn.lock
+  bun.lock
+  uv.lock
+  poetry.lock
+  Pipfile.lock
+  composer.lock
+  Cargo.lock
+  go.mod
+)
+
 declare -ar SAFE_AUDIT_CAPABILITY_NAMES=(
   package-audit
   repo-audit
@@ -90,6 +107,10 @@ LAST_SCAN_RESULT_PATH=""
 # reads the snapshot instead.
 LAST_SCAN_RESULT_SNAPSHOT=""
 SCAN_RESULT_OUT=""
+# Which evidence tiers came back degraded on the last scan. The result JSON has
+# carried this in tool_status all along, but the surface's closing line said
+# "finished" either way, so a lost tier read as a completed audit.
+SCAN_DEGRADED_TIERS=""
 declare -a CURRENT_LOCKFILES=()
 declare -a CURRENT_MANIFESTS=()
 declare -a CURRENT_PROJECT_ROOTS=()
@@ -1402,7 +1423,7 @@ lockfile_ecosystem() {
   local file
   file=$(basename "$1")
   case "$file" in
-    package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock) echo "npm" ;;
+    package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb) echo "npm" ;;
     uv.lock|poetry.lock|Pipfile.lock) echo "python" ;;
     composer.lock) echo "php" ;;
     Cargo.lock) echo "rust" ;;
@@ -1415,7 +1436,7 @@ manifest_matches() {
   local base
   base=$(basename "$1")
   case "$base" in
-    package.json|package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum|.safe-audit)
+    package.json|package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum|.safe-audit)
       return 0
       ;;
     *)
@@ -1428,7 +1449,7 @@ lockfile_matches() {
   local base
   base=$(basename "$1")
   case "$base" in
-    package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
+    package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
       return 0
       ;;
     *)
@@ -1441,7 +1462,7 @@ project_root_manifest_matches() {
   local base
   base=$(basename "$1")
   case "$base" in
-    .safe-audit|package.json|package-lock.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum)
+    .safe-audit|package.json|package-lock.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum)
       return 0
       ;;
     *)
@@ -1687,7 +1708,7 @@ gather_stage_remotely() {
   if [[ "$rc" -ne 0 ]]; then
     warn "$machine: bounded remote staging failed; falling back to manifest staging"
     set +e
-    ssh_batch "$host" "cd $(printf '%q' "$target") && find . -type f \( -name '.safe-audit' -o -name 'package.json' -o -name 'package-lock.json' -o -name 'pnpm-lock.yaml' -o -name 'yarn.lock' -o -name 'uv.lock' -o -name 'poetry.lock' -o -name 'Pipfile.lock' -o -name 'pyproject.toml' -o -name 'composer.json' -o -name 'composer.lock' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'go.mod' -o -name 'go.sum' -o -name 'requirements.txt' -o -name 'requirements-dev.txt' -o -name 'requirements.lock' \) -print0 | tar --null -T - -czf - 2>/dev/null" \
+    ssh_batch "$host" "cd $(printf '%q' "$target") && find . -type f \( -name '.safe-audit' -o -name 'package.json' -o -name 'package-lock.json' -o -name 'pnpm-lock.yaml' -o -name 'yarn.lock' -o -name 'bun.lock' -o -name 'bun.lockb' -o -name 'uv.lock' -o -name 'poetry.lock' -o -name 'Pipfile.lock' -o -name 'pyproject.toml' -o -name 'composer.json' -o -name 'composer.lock' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'go.mod' -o -name 'go.sum' -o -name 'requirements.txt' -o -name 'requirements-dev.txt' -o -name 'requirements.lock' \) -print0 | tar --null -T - -czf - 2>/dev/null" \
       | tar -xzf - -C "$stage" 2>/dev/null
     statuses=("${PIPESTATUS[@]}")
     set -e
@@ -1768,7 +1789,7 @@ project_ecosystem_detected() {
   local root="$1" ecosystem="$2"
   case "$ecosystem" in
     npm)
-      [[ -f "$root/package.json" || -f "$root/package-lock.json" || -f "$root/pnpm-lock.yaml" || -f "$root/yarn.lock" ]]
+      [[ -f "$root/package.json" || -f "$root/package-lock.json" || -f "$root/pnpm-lock.yaml" || -f "$root/yarn.lock" || -f "$root/bun.lock" || -f "$root/bun.lockb" ]]
       ;;
     python)
       [[ -f "$root/pyproject.toml" || -f "$root/requirements.txt" || -f "$root/requirements-dev.txt" || -f "$root/requirements.lock" || -f "$root/uv.lock" || -f "$root/poetry.lock" || -f "$root/Pipfile.lock" ]]
@@ -1897,6 +1918,96 @@ osv_scan_output_valid() {
   jq -e 'type == "object" and ((.results? // null) | type == "array")' "$output" >/dev/null 2>&1
 }
 
+# osv-scanner picks an extractor by filename, and a file it has no extractor
+# for is fatal for the WHOLE batch: exit 127, empty stdout, every sibling it
+# already extracted discarded with it. Two files discovery finds hit that —
+# `go.sum` (the Go extractor reads go.mod) and `bun.lockb` (binary, no
+# extractor) — so a single Go or bun repo silently cost the entire OSV tier,
+# npm results included. Discovery still tracks both as dependency evidence;
+# this translates that set into what the scanner can actually read.
+#
+# A file with no parseable stand-in is dropped, which is real coverage lost —
+# the caller reports it rather than letting it pass as a clean scan.
+osv_lockfile_stand_in() {
+  local lf="$1" base dir
+  base=$(basename "$lf")
+  dir=$(dirname "$lf")
+  case "$base" in
+    go.sum)
+      [[ -f "$dir/go.mod" ]] && printf '%s' "$dir/go.mod"
+      ;;
+    bun.lockb)
+      [[ -f "$dir/bun.lock" ]] && printf '%s' "$dir/bun.lock"
+      ;;
+    *)
+      printf '%s' "$lf"
+      ;;
+  esac
+  return 0
+}
+
+# Emits the translated set, NUL-separated and deduplicated: a repo carrying
+# both bun.lockb and bun.lock resolves to one path, not two.
+osv_scannable_lockfiles() {
+  local lf sub
+  local -A seen=()
+  for lf in "$@"; do
+    sub=$(osv_lockfile_stand_in "$lf")
+    [[ -n "$sub" ]] || continue
+    [[ -z "${seen[$sub]:-}" ]] || continue
+    seen["$sub"]=1
+    printf '%s\0' "$sub"
+  done
+}
+
+# Coverage that was lost but still reads as a completed scan is the failure
+# mode this whole path exists to prevent: `partial` keeps the results that
+# survived while marking the tier non-ok, which is what turns the verdict to
+# WARN and puts the tier in the degraded-coverage disclosure.
+osv_mark_partial() {
+  local output="$1" note="$2" tmp
+  tmp="$output.partial"
+  if jq --arg note "$note" '. + {partial: $note}' "$output" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$output"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+# A batch that dies on one file still holds good evidence for every other one,
+# so rescan file by file and merge what survives rather than losing the tier.
+# Returns 1 when nothing survived, leaving the caller's error path in charge.
+osv_scan_lockfiles_individually() {
+  local machine="$1" osv="$2" output="$3"
+  shift 3
+  local -a parts=() failed=()
+  local lf part rc index=0
+  for lf in "$@"; do
+    part="$output.part.$index"
+    index=$((index + 1))
+    rc=0
+    set +e
+    "$osv" scan source --format json "--lockfile=$lf" > "$part" 2>"$part.stderr"
+    rc=$?
+    set -e
+    if osv_scan_output_valid "$part"; then
+      parts+=("$part")
+    else
+      vinfo "$machine: osv-scanner rescan failed for $(printf '%q' "$lf") (exit $rc)"
+      failed+=("$lf")
+    fi
+  done
+  [[ "${#parts[@]}" -gt 0 ]] || return 1
+  local merged="$output.merged"
+  jq -s '{results: (map(.results // []) | add // [])}' "${parts[@]}" > "$merged" 2>/dev/null || { rm -f "$merged"; return 1; }
+  mv "$merged" "$output"
+  if [[ "${#failed[@]}" -gt 0 ]]; then
+    warn "osv-scanner could not read $(printf '%s, ' "${failed[@]}" | sed 's/, $//'); the remaining lockfiles were scanned individually"
+    osv_mark_partial "$output" "osv-scanner could not read: $(printf '%s, ' "${failed[@]}" | sed 's/, $//')"
+  fi
+  return 0
+}
+
 osv_scan_lockfiles() {
   local machine="$1" output="$2"
   shift 2
@@ -1914,12 +2025,30 @@ osv_scan_lockfiles() {
     return 0
   fi
 
-  local args=(scan source --format json)
+  local -a scannable=() dropped=()
+  mapfile -d '' -t scannable < <(osv_scannable_lockfiles "${lockfiles[@]}")
   local lf
   for lf in "${lockfiles[@]}"; do
+    [[ -n "$(osv_lockfile_stand_in "$lf")" ]] || dropped+=("$lf")
+  done
+  local dropped_list=""
+  if [[ "${#dropped[@]}" -gt 0 ]]; then
+    dropped_list=$(printf '%s, ' "${dropped[@]}" | sed 's/, $//')
+  fi
+
+  if [[ "${#scannable[@]}" -eq 0 ]]; then
+    vinfo "$machine: osv-scanner skipped: no discovered lockfile is in a format the scanner reads ($dropped_list)"
+    warn "osv-scanner has no reader for the discovered lockfiles ($dropped_list); dependency coverage for them is missing"
+    jq -n --arg note "no osv-parseable lockfile among those discovered: $dropped_list" \
+      '{results: [], skipped: $note, skip_reason: "no_parseable_lockfiles"}' > "$output"
+    return 0
+  fi
+
+  local args=(scan source --format json)
+  for lf in "${scannable[@]}"; do
     args+=("--lockfile=$lf")
   done
-  vinfo "$machine: osv-scanner=$(printf '%q' "$osv") lockfiles=${#lockfiles[@]} output=$(printf '%q' "$output")"
+  vinfo "$machine: osv-scanner=$(printf '%q' "$osv") lockfiles=${#scannable[@]} dropped=${#dropped[@]} output=$(printf '%q' "$output")"
 
   local rc=0
   set +e
@@ -1929,12 +2058,83 @@ osv_scan_lockfiles() {
   if [[ "$rc" -ne 0 ]]; then
     if osv_scan_output_valid "$output"; then
       vinfo "$machine: osv-scanner exited $rc after producing valid JSON; keeping result"
+    elif [[ "${#scannable[@]}" -gt 1 ]] && osv_scan_lockfiles_individually "$machine" "$osv" "$output" "${scannable[@]}"; then
+      vinfo "$machine: osv-scanner batch failed; recovered by scanning each lockfile on its own"
     else
       warn "osv-scanner failed; details: $output.stderr"
       warn "osv-scanner stderr: $(first_line_summary "$(cat "$output.stderr" 2>/dev/null || true)" 240)"
       printf '{"results":[],"error":"osv-scanner failed"}\n' > "$output"
+      return 0
     fi
   fi
+
+  if [[ "${#dropped[@]}" -gt 0 ]]; then
+    warn "osv-scanner has no reader for $dropped_list; those dependencies are not covered by this scan"
+    osv_mark_partial "$output" "osv-scanner has no reader for: $dropped_list"
+  fi
+}
+
+# osv-scanner picks its extractor from the filename before reading a byte, so
+# "does this scanner still read format X" is answerable offline against an
+# empty file. The "could not determine extractor" line is the exact signal —
+# a parse complaint about empty content means the extractor is there.
+osv_lockfile_support_json() {
+  local osv probe name out version
+  osv=$(local_scanner_path osv-scanner)
+  local formats_json
+  formats_json=$(printf '%s\n' "${SAFE_AUDIT_OSV_LOCKFILE_FORMATS[@]}" | jq -Rn '[inputs | select(length > 0)]')
+  if [[ -z "$osv" ]]; then
+    jq -n --argjson formats "$formats_json" \
+      '{scanner: null, version: null, ok: false, formats: $formats, unsupported: [], note: "osv-scanner unavailable"}'
+    return 0
+  fi
+  version=$("$osv" --version 2>/dev/null | head -n 1 || true)
+  probe=$(mktemp -d)
+  local -a unsupported=()
+  for name in "${SAFE_AUDIT_OSV_LOCKFILE_FORMATS[@]}"; do
+    : > "$probe/$name"
+    out=$("$osv" scan source --offline --format json --lockfile="$probe/$name" 2>&1 >/dev/null || true)
+    if grep -qF 'could not determine extractor' <<<"$out"; then
+      unsupported+=("$name")
+    fi
+    rm -f "$probe/$name"
+  done
+  rm -rf "$probe"
+  local unsupported_json='[]'
+  if [[ "${#unsupported[@]}" -gt 0 ]]; then
+    unsupported_json=$(printf '%s\n' "${unsupported[@]}" | jq -Rn '[inputs | select(length > 0)]')
+  fi
+  jq -n --arg scanner "$osv" --arg version "$version" \
+    --argjson formats "$formats_json" --argjson unsupported "$unsupported_json" \
+    '{scanner: $scanner,
+      version: (if $version == "" then null else $version end),
+      ok: ($unsupported | length) == 0,
+      formats: $formats,
+      unsupported: $unsupported,
+      note: null}'
+}
+
+lockfile_support_command() {
+  local json_mode=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) json_mode=1; shift ;;
+      *) die "unknown lockfile-support flag: $1" ;;
+    esac
+  done
+  local payload
+  payload=$(osv_lockfile_support_json)
+  if [[ "$json_mode" == "1" ]]; then
+    printf '%s\n' "$payload"
+    return 0
+  fi
+  jq -r '
+    "osv-scanner: " + (.scanner // "unavailable"),
+    "version: " + (.version // "unknown"),
+    (if .ok then "all " + ((.formats | length) | tostring) + " lockfile formats readable"
+     else "UNREADABLE: " + (.unsupported | join(", ")) end)
+  ' <<<"$payload"
+  jq -e '.ok' <<<"$payload" >/dev/null 2>&1
 }
 
 syft_generate_sbom() {
@@ -2675,6 +2875,8 @@ build_scan_result_from_artifacts() {
     def osv_status($doc):
       if (($doc.error // "") != "") then
         {status:"error", note:$doc.error}
+      elif (($doc.partial // "") != "") then
+        {status:"partial", note:$doc.partial}
       elif (($doc.skip_reason // "") == "scanner_unavailable") then
         {status:"skipped", note:($doc.skipped // "scanner unavailable")}
       elif (($doc.skip_reason // "") == "no_lockfiles") then
@@ -2718,6 +2920,14 @@ build_scan_result_from_artifacts() {
       grype: scan_status($grype[0] // {})
     }
   ')
+
+  SCAN_DEGRADED_TIERS=$(jq -r '
+    to_entries
+    | map(select((.value.status // "ok") != "ok")
+          | .key + " " + (.value.status // "ok")
+            + (if (.value.note // "") != "" then " (" + .value.note + ")" else "" end))
+    | join("; ")
+  ' <<<"$tool_status_json")
 
   local critical high medium low severity
   critical=$(count_grype_severity "$grype_json" critical)
@@ -2815,7 +3025,11 @@ build_scan_result_from_artifacts() {
   local npm_lockfiles=0 file
   for file in ${CURRENT_LOCKFILES[@]+"${CURRENT_LOCKFILES[@]}"}; do
     case "$(basename -- "$file")" in
-      package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock)
+      # bun.lock counts because osv-scanner reads it, so the dependencies ARE
+      # covered and `npm audit: unsupported` is the same non-event it is for a
+      # pnpm project. bun.lockb does not: nothing reads the binary format, so a
+      # project carrying only that one really is uncovered and must still WARN.
+      package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lock)
         npm_lockfiles=$((npm_lockfiles + 1)) ;;
     esac
   done
@@ -3025,7 +3239,7 @@ scan_cache_result_is_cacheable() {
 # asks (`.npmrc` selects the registry npm audit queries; `.safe-audit` decides
 # which ecosystems are audited at all). This enumerates both.
 SCAN_CACHE_EXTRA_EVIDENCE=(
-  package.json package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock .npmrc
+  package.json package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock bun.lock bun.lockb .npmrc
   requirements.txt requirements-dev.txt pyproject.toml uv.lock poetry.lock Pipfile.lock
   composer.json composer.lock Cargo.toml Cargo.lock go.mod go.sum .safe-audit
 )
@@ -3482,7 +3696,7 @@ project_ecosystem_detected() {
   local root="$1" ecosystem="$2"
   case "$ecosystem" in
     npm)
-      [[ -f "$root/package.json" || -f "$root/package-lock.json" || -f "$root/pnpm-lock.yaml" || -f "$root/yarn.lock" ]]
+      [[ -f "$root/package.json" || -f "$root/package-lock.json" || -f "$root/pnpm-lock.yaml" || -f "$root/yarn.lock" || -f "$root/bun.lock" || -f "$root/bun.lockb" ]]
       ;;
     python)
       [[ -f "$root/pyproject.toml" || -f "$root/requirements.txt" || -f "$root/requirements-dev.txt" || -f "$root/requirements.lock" || -f "$root/uv.lock" || -f "$root/poetry.lock" || -f "$root/Pipfile.lock" ]]
@@ -4339,7 +4553,7 @@ while IFS= read -r -d '' file; do
     root=$(dirname "$file")
   fi
   case "$(basename "$file")" in
-    package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
+    package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
       lockfiles+=("$file")
       if [[ -z "${seen_roots[$root]:-}" ]]; then
         seen_roots["$root"]=1
@@ -4347,24 +4561,79 @@ while IFS= read -r -d '' file; do
       fi
       ;;
   esac
-done < <(find "$target" -type f \( -name 'package-lock.json' -o -name 'pnpm-lock.yaml' -o -name 'yarn.lock' -o -name 'uv.lock' -o -name 'poetry.lock' -o -name 'Pipfile.lock' -o -name 'composer.lock' -o -name 'Cargo.lock' -o -name 'go.sum' \) -print0)
+done < <(find "$target" -type f \( -name 'package-lock.json' -o -name 'pnpm-lock.yaml' -o -name 'yarn.lock' -o -name 'bun.lock' -o -name 'bun.lockb' -o -name 'uv.lock' -o -name 'poetry.lock' -o -name 'Pipfile.lock' -o -name 'composer.lock' -o -name 'Cargo.lock' -o -name 'go.sum' \) -print0)
 
 if [[ "${#roots[@]}" -eq 0 ]]; then
   roots=("$target")
 fi
 
-if command -v osv-scanner >/dev/null 2>&1 && [[ "${#lockfiles[@]}" -gt 0 ]]; then
+# Mirrors osv_lockfile_stand_in on the orchestrator side: osv-scanner aborts
+# the whole batch on a file it has no extractor for, so go.sum resolves to its
+# sibling go.mod and bun.lockb to its sibling bun.lock, or it is dropped.
+declare -a scannable=() dropped=()
+declare -A seen_scannable=()
+for lf in ${lockfiles[@]+"${lockfiles[@]}"}; do
+  sub=""
+  case "$(basename "$lf")" in
+    go.sum) [[ -f "$(dirname "$lf")/go.mod" ]] && sub="$(dirname "$lf")/go.mod" ;;
+    bun.lockb) [[ -f "$(dirname "$lf")/bun.lock" ]] && sub="$(dirname "$lf")/bun.lock" ;;
+    *) sub="$lf" ;;
+  esac
+  if [[ -z "$sub" ]]; then
+    dropped+=("$lf")
+    continue
+  fi
+  if [[ -z "${seen_scannable[$sub]:-}" ]]; then
+    seen_scannable["$sub"]=1
+    scannable+=("$sub")
+  fi
+done
+
+if command -v osv-scanner >/dev/null 2>&1 && [[ "${#scannable[@]}" -gt 0 ]]; then
   args=(scan source --format json)
-  for lf in "${lockfiles[@]}"; do args+=("--lockfile=$lf"); done
+  for lf in "${scannable[@]}"; do args+=("--lockfile=$lf"); done
   set +e
   osv-scanner "${args[@]}" > "$scratch/osv.json" 2>"$scratch/osv.stderr"
   osv_rc=$?
   set -e
   if [[ "$osv_rc" -ne 0 ]] && ! jq -e 'type == "object" and ((.results? // null) | type == "array")' "$scratch/osv.json" >/dev/null 2>&1; then
-    printf '{"results":[],"error":"osv-scanner failed"}\n' > "$scratch/osv.json"
+    parts=()
+    failed=()
+    index=0
+    for lf in "${scannable[@]}"; do
+      part="$scratch/osv.part.$index"
+      index=$((index + 1))
+      set +e
+      osv-scanner scan source --format json "--lockfile=$lf" > "$part" 2>"$part.stderr"
+      set -e
+      if jq -e 'type == "object" and ((.results? // null) | type == "array")' "$part" >/dev/null 2>&1; then
+        parts+=("$part")
+      else
+        failed+=("$lf")
+      fi
+    done
+    if [[ "${#parts[@]}" -gt 0 ]] && jq -s '{results: (map(.results // []) | add // [])}' "${parts[@]}" > "$scratch/osv.merged" 2>/dev/null; then
+      mv "$scratch/osv.merged" "$scratch/osv.json"
+      dropped+=(${failed[@]+"${failed[@]}"})
+    else
+      rm -f "$scratch/osv.merged"
+      printf '{"results":[],"error":"osv-scanner failed"}\n' > "$scratch/osv.json"
+      dropped=()
+    fi
+  fi
+  if [[ "${#dropped[@]}" -gt 0 ]]; then
+    note="osv-scanner has no reader for: $(printf '%s, ' "${dropped[@]}" | sed 's/, $//')"
+    if jq --arg note "$note" '. + {partial: $note}' "$scratch/osv.json" > "$scratch/osv.annotated" 2>/dev/null; then
+      mv "$scratch/osv.annotated" "$scratch/osv.json"
+    else
+      rm -f "$scratch/osv.annotated"
+    fi
   fi
 elif ! command -v osv-scanner >/dev/null 2>&1; then
   printf '{"results":[],"skipped":"osv-scanner unavailable","skip_reason":"scanner_unavailable"}\n' > "$scratch/osv.json"
+elif [[ "${#dropped[@]}" -gt 0 ]]; then
+  jq -n --arg note "no osv-parseable lockfile among those discovered: $(printf '%s, ' "${dropped[@]}" | sed 's/, $//')" \
+    '{results: [], skipped: $note, skip_reason: "no_parseable_lockfiles"}' > "$scratch/osv.json"
 else
   printf '{"results":[],"skipped":"no lockfiles discovered","skip_reason":"no_lockfiles"}\n' > "$scratch/osv.json"
 fi
@@ -4514,7 +4783,7 @@ matches_ignore() {
 
 manifest_matches() {
   case "$(basename "$1")" in
-    package.json|package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum|.safe-audit)
+    package.json|package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum|.safe-audit)
       return 0
       ;;
     *)
@@ -4525,7 +4794,7 @@ manifest_matches() {
 
 lockfile_matches() {
   case "$(basename "$1")" in
-    package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
+    package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
       return 0
       ;;
     *)
@@ -4722,6 +4991,7 @@ scan_remote_direct_into_result() {
 
 scan_machine() {
   local machine="$1" project_target="${2:-}" scan_mode="${3:-$SAFE_AUDIT_SCAN_MODE}"
+  SCAN_DEGRADED_TIERS=""
   vinfo "$machine: configured type=$(machine_type "$machine") host=$(printf '%q' "$(machine_host "$machine")") project_target=$(printf '%q' "$project_target")"
   if ! machine_reachable "$machine"; then
     warn "$machine: host unreachable; skipping scan"
@@ -9921,7 +10191,7 @@ ioc_machine_scan() {
   while IFS= read -r item; do
     [[ -z "$item" ]] && continue
     output_chunk=$(run_machine_capture "$machine" "
-find ${search_root} -type f \\( -name 'package-lock.json' -o -name 'yarn.lock' -o -name 'pnpm-lock.yaml' -o -name 'uv.lock' -o -name 'poetry.lock' -o -name 'Pipfile.lock' -o -name 'composer.lock' -o -name 'Cargo.lock' -o -name 'go.sum' \\) -print0 2>/dev/null | xargs -0 grep -nH -- $(printf '%q' "$item") 2>/dev/null || true
+find ${search_root} -type f \\( -name 'package-lock.json' -o -name 'yarn.lock' -o -name 'pnpm-lock.yaml' -o -name 'bun.lock' -o -name 'uv.lock' -o -name 'poetry.lock' -o -name 'Pipfile.lock' -o -name 'composer.lock' -o -name 'Cargo.lock' -o -name 'go.sum' \\) -print0 2>/dev/null | xargs -0 grep -nH -- $(printf '%q' "$item") 2>/dev/null || true
 " || true)
     [[ -n "$output_chunk" ]] && package_hits+="${output_chunk}"$'\n'
   done < <(jq -r '.packages[]?.name' "$ioc_json")
@@ -10442,7 +10712,11 @@ repo_audit_command() {
   info "repo-audit: starting $target_label"
   local scan_rc=0
   if scan_machine "$machine" "$project_target" "$SAFE_AUDIT_SCAN_MODE"; then
-    info "repo-audit: finished $target_label"
+    if [[ -n "$SCAN_DEGRADED_TIERS" ]]; then
+      warn "repo-audit: finished $target_label with degraded coverage: $SCAN_DEGRADED_TIERS"
+    else
+      info "repo-audit: finished $target_label"
+    fi
   else
     scan_rc=$?
     warn "repo-audit: failed $target_label"
@@ -10501,7 +10775,11 @@ machine_audit_command() {
     info "machine-audit: starting $machine $target_label"
     local scan_rc=0
     if scan_machine "$machine" "$project_target" "$SAFE_AUDIT_SCAN_MODE"; then
-      info "machine-audit: finished $machine $target_label"
+      if [[ -n "$SCAN_DEGRADED_TIERS" ]]; then
+        warn "machine-audit: finished $machine $target_label with degraded coverage: $SCAN_DEGRADED_TIERS"
+      else
+        info "machine-audit: finished $machine $target_label"
+      fi
     else
       scan_rc=$?
       warn "machine-audit: failed $machine $target_label"
@@ -10622,6 +10900,7 @@ USAGE
   safe audit binary-audit verify tuf-bootstrap --mirror PATH --root PATH --root-checksum SHA256 --target NAME=PATH [--target NAME=PATH ...] [--json]
 
   safe audit scanner-batch   (stdin: {"packages":[{"name","version"},…]} — Bun scanner API backend)
+  safe audit lockfile-support [--json]   (which lockfile formats the installed osv-scanner still reads)
   safe audit ioc <identifier> [--all | --machine <csv>]
   safe audit ioc --list <ioc.json> [--all | --machine <csv>]
   safe audit ioc --update [--since <duration>] [--all | --machine <csv>]
@@ -10653,6 +10932,13 @@ main() {
     effective-sources)
       shift
       effective_sources_command "$@"
+      return 0
+      ;;
+    # Read-only probe: doctor calls it, and doctor must not create the
+    # config/data tree as a side effect of reporting on it.
+    lockfile-support)
+      shift
+      lockfile_support_command "$@"
       return 0
       ;;
   esac
