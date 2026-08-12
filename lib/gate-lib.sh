@@ -347,13 +347,13 @@ safe_gate_run_audit() {
       SAFE_AUDIT_SOCKET_TIMEOUT="${socket_budget}" \
         SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT="${fresh_socket_budget}" \
         timeout --kill-after=2s "$audit_leash" \
-        "${SAFE_GATE_AUDIT_BIN}" check "$@" "${extra[@]}" 2>&3
+        "${SAFE_GATE_AUDIT_BIN}" package-audit "$@" "${extra[@]}" 2>&3
       rc=$?
     } 3>&2 2>/dev/null
   else
     SAFE_AUDIT_SOCKET_TIMEOUT="${socket_budget}" \
       SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT="${fresh_socket_budget}" \
-      "${SAFE_GATE_AUDIT_BIN}" check "$@" "${extra[@]}"
+      "${SAFE_GATE_AUDIT_BIN}" package-audit "$@" "${extra[@]}"
     rc=$?
   fi
   return "$rc"
@@ -1323,7 +1323,7 @@ safe_gate_scan_project() {
     # that exits 0 says nothing about what it found. Say that plainly rather
     # than treating "no answer" as "clean".
     safe_gate_err "safe install: cannot allocate a scan result file (TMPDIR and ${fallback_dir} both unwritable); the project was NOT audit-gated — safe doctor"
-    "${SAFE_GATE_AUDIT_BIN}" scan --deps-only --allow-missing-tools --project . 2>&1 || true
+    "${SAFE_GATE_AUDIT_BIN}" repo-audit . --deps-only --allow-missing-tools 2>&1 || true
     return 0
   fi
 
@@ -1332,8 +1332,8 @@ safe_gate_scan_project() {
   # replay — a bare `npm ci` in an unchanged tree costs a cache hit, not a
   # full scanner run. --allow-missing-tools keeps an uninstalled ecosystem
   # auditor from aborting the scan: it comes back as reported-but-not-run.
-  scan_output="$("${SAFE_GATE_AUDIT_BIN}" scan --deps-only --allow-missing-tools \
-    --result-out "${result_file}" --project . 2>&1)"
+  scan_output="$("${SAFE_GATE_AUDIT_BIN}" repo-audit . --deps-only --allow-missing-tools \
+    --result-out "${result_file}" 2>&1)"
   scan_status=$?
 
   [[ -n "${scan_output}" ]] && printf '%s\n' "${scan_output}"
@@ -1641,8 +1641,8 @@ safe_gate_lockdiff_scan_project() {
 
   (
     cd -- "${project_dir}" || exit 125
-    "${SAFE_GATE_AUDIT_BIN}" scan --deps-only --allow-missing-tools \
-      --result-out "${result_file}" --project .
+    "${SAFE_GATE_AUDIT_BIN}" repo-audit . --deps-only --allow-missing-tools \
+      --result-out "${result_file}"
   ) >"${scan_log}" 2>&1 || scan_status=$?
 
   if (( scan_status != 0 )); then

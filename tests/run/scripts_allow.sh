@@ -149,7 +149,7 @@ case "$1" in
     fi
     exit 0
     ;;
-  check) exit 0 ;;
+  package-audit) exit 0 ;;
   *) exit 0 ;;
 esac
 SH

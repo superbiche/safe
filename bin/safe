@@ -117,7 +117,7 @@ cmd_explain() {
     (if .refusal_note then (.refusal_note | wrap(70; "  ")) else empty end),
     "",
     (if .preflight then "PREFLIGHT", (.preflight | wrap(70; "  ")), "" else empty end),
-    "EXIT CODES (0/10/20 are check verdicts; 100-104 policy refusals; 127 a genuinely missing command)",
+    "EXIT CODES (0/10/20 are package-audit verdicts; 100-104 policy refusals; 127 a genuinely missing command)",
     (.exit_codes[] | "  \(.code)  \(.meaning)"),
     "",
     "VERSION RESOLUTION",
@@ -170,7 +170,7 @@ cmd_report_fp() {
     return 1
   }
 
-  local -a args=(check "$spec" --json)
+  local -a args=(package-audit "$spec" --json)
   [[ -n "$ecosystem" ]] && args+=(--ecosystem "$ecosystem")
 
   local payload status=0

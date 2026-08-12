@@ -81,6 +81,7 @@ Runner flags:
 safe audit capabilities [--json]
 safe audit machine-audit [--verbose] [--deps-only | --full] [--project <path>] [--all | --machine <csv>]
 safe audit package-audit <pkg>@<version> [--ecosystem <name>] [--installer <name>] [--json]
+safe audit repo-audit [<path>] [--verbose] [--deps-only | --full] [--no-cache] [--result-out <file>] [--allow-missing-tools]
 safe audit binary-audit release github --repo OWNER/REPO --version TAG --asset NAME [--tag-regex REGEX] [--json]
 safe audit binary-audit vuln github-release --repo OWNER/REPO --version TAG [--json]
 safe audit binary-audit verify release-asset --artifact PATH --checksum PATH [--certificate PATH --signature PATH --certificate-identity-regexp REGEX --certificate-oidc-issuer URL] [--require-signature] [--json]

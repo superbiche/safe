@@ -7344,7 +7344,7 @@ package_audit_command() {
         shift 2
         ;;
       -*)
-        die "unknown check flag: $1"
+        die "unknown package-audit flag: $1"
         ;;
       *)
         spec="$1"

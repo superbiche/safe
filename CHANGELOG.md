@@ -30,7 +30,7 @@
   one implementation of the policy rather than a bash copy that drifts. No
   verdict changes: the existing 338 golden cases pass unmodified.
 
-- `safe audit check` exits **30** when it could not produce a verdict at all —
+- `safe audit package-audit` exits **30** when it could not produce a verdict at all —
   the verdict engine is missing, version-skewed, or failed, or the evidence
   could not be assembled. Previously this shared exit 20 with a genuine BLOCK,
   so broken tooling was indistinguishable from a real refusal about the
