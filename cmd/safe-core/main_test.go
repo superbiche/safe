@@ -11,7 +11,7 @@ import (
 func TestRunUsageAndParseFailuresDoNotWritePartialJSON(t *testing.T) {
 	t.Run("usage", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
-		if got := run(nil, &stdout, &stderr); got != 2 {
+		if got := run(nil, strings.NewReader(""), &stdout, &stderr); got != 2 {
 			t.Fatalf("run() = %d, want 2", got)
 		}
 		if stdout.Len() != 0 || !strings.Contains(stderr.String(), "usage") {
@@ -30,7 +30,7 @@ func TestRunUsageAndParseFailuresDoNotWritePartialJSON(t *testing.T) {
 			t.Fatal(err)
 		}
 		var stdout, stderr bytes.Buffer
-		if got := run([]string{"lockdiff", bad, good}, &stdout, &stderr); got != 3 {
+		if got := run([]string{"lockdiff", bad, good}, strings.NewReader(""), &stdout, &stderr); got != 3 {
 			t.Fatalf("run() = %d, want 3", got)
 		}
 		if stdout.Len() != 0 || !strings.Contains(stderr.String(), "lockfileVersion 1") {
@@ -52,7 +52,7 @@ func TestRunWritesOnlyOneJSONDocument(t *testing.T) {
 		}
 	}
 	var stdout, stderr bytes.Buffer
-	if got := run([]string{"lockdiff", old, new}, &stdout, &stderr); got != 0 {
+	if got := run([]string{"lockdiff", old, new}, strings.NewReader(""), &stdout, &stderr); got != 0 {
 		t.Fatalf("run() = %d, stderr=%q", got, stderr.String())
 	}
 	if stdout.String() != "{\"schema\":1,\"added\":[],\"removed\":[],\"changed\":[{\"name\":\"a\",\"from\":\"1.0.0\",\"to\":\"2.0.0\",\"source\":\"unknown\"}]}\n" {
@@ -74,7 +74,7 @@ func TestRunRegistryHostOption(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if got := run([]string{"lockdiff", "--registry-host", "registry.example.test", old, new}, &stdout, &stderr); got != 0 {
+	if got := run([]string{"lockdiff", "--registry-host", "registry.example.test", old, new}, strings.NewReader(""), &stdout, &stderr); got != 0 {
 		t.Fatalf("run() = %d, stderr=%q", got, stderr.String())
 	}
 	if stdout.String() != "{\"schema\":1,\"added\":[{\"name\":\"private-pkg\",\"version\":\"1.0.0\",\"source\":\"registry\"}],\"removed\":[],\"changed\":[]}\n" {

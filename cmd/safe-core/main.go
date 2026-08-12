@@ -8,22 +8,28 @@ import (
 	"os"
 
 	"github.com/superbiche/safe/internal/lockdiff"
+	"github.com/superbiche/safe/internal/verdict"
 )
 
 var version = "dev"
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
-func run(args []string, stdout, stderr io.Writer) int {
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 1 && args[0] == "--version" {
 		fmt.Fprintln(stdout, version)
 		return 0
 	}
+	if len(args) > 0 && args[0] == "package-verdict" {
+		return packageVerdict(args[1:], stdin, stdout, stderr)
+	}
+
 	registryHosts, oldLockfile, newLockfile, ok := lockdiffArgs(args)
 	if !ok {
 		fmt.Fprintln(stderr, "safe-core: usage: safe-core lockdiff [--registry-host <host>]... <old-lockfile> <new-lockfile>")
+		fmt.Fprintln(stderr, "safe-core: usage: safe-core package-verdict < evidence.json")
 		return 2
 	}
 
@@ -42,6 +48,34 @@ func run(args []string, stdout, stderr io.Writer) int {
 	encoder.SetEscapeHTML(false)
 	if err := encoder.Encode(lockdiff.Compare(oldPackages, newPackages)); err != nil {
 		fmt.Fprintf(stderr, "safe-core: lockdiff: write JSON: %v\n", err)
+		return 3
+	}
+	return 0
+}
+
+// packageVerdict decides a verdict from an evidence document on stdin.
+//
+// Malformed evidence is exit 3, never a verdict: a decision layer that cannot
+// read its input has no evidence, and emitting any verdict there — including a
+// warning one — would let a serialization bug masquerade as a real check.
+func packageVerdict(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) != 0 {
+		fmt.Fprintln(stderr, "safe-core: usage: safe-core package-verdict < evidence.json")
+		return 2
+	}
+
+	var evidence verdict.Evidence
+	decoder := json.NewDecoder(stdin)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&evidence); err != nil {
+		fmt.Fprintf(stderr, "safe-core: package-verdict: read evidence: %v\n", err)
+		return 3
+	}
+
+	encoder := json.NewEncoder(stdout)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(verdict.Decide(evidence)); err != nil {
+		fmt.Fprintf(stderr, "safe-core: package-verdict: write JSON: %v\n", err)
 		return 3
 	}
 	return 0
