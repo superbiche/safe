@@ -224,18 +224,18 @@ case_socket_failure_text_is_not_copied_into_the_note() {
 }
 
 case_deliberate_socket_skip_is_not_reported_as_a_failure() {
-  # A tier-3 policy skip carries available:null/status:skipped_tier3. Calling
-  # that "the check failed" would send the operator chasing a Socket outage
-  # that never happened (PR#60 review F3).
+  # The sole intentional Socket skip carries available:null/status:skipped.
+  # Calling that "the check failed" would send the operator chasing an outage
+  # that never happened.
   local repo; repo="$(new_repo repo-socket-skip)"
-  jq '.socket = {"available": null, "status": "skipped_tier3",
-        "note": "tier 3 — behavioral verdict from GuardDog; not consulted"}' \
+  jq '.socket = {"available": null, "status": "skipped",
+        "note": "disabled by install.socket.mode=never"}' \
     < "$TEST_ROOT/payload.json" > "$TEST_ROOT/socket-skip.json"
   STUB_PAYLOAD="$TEST_ROOT/socket-skip.json" run_report_fp "$repo" demo >/dev/null 2>&1 || true
   local note
   note="$(find "$repo/inbox" -name '*.md' -type f | head -1)"
   [[ -n "$note" ]] || { fail "$FUNCNAME (no note)"; return; }
-  grep -Fq 'deliberately not consulted' "$note" \
+  grep -Fq 'deliberately disabled by policy' "$note" \
     || { fail "$FUNCNAME (skip not described as deliberate)"; return; }
   if grep -Fq 'the check failed' "$note"; then
     fail "$FUNCNAME (policy skip described as a failure)"

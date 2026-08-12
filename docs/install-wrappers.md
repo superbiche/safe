@@ -325,12 +325,11 @@ exit 100, never a silent passthrough.
 Package checks are wrapped with `timeout` when it is available. The leash is
 computed so it always exceeds the audit's sequential worst case — Socket
 score (15s under the gate, `SAFE_AUDIT_SOCKET_TIMEOUT`) times two attempts
-(the auth-failure vault retry), the GuardDog wall-clock budget
-(`install.guarddog.timeout_seconds`, default 120s) times its version probe
-plus up to four resolved versions, the paginated OSV query budget (80s) per
-resolved version plus the cooldown re-query, and a 120s allowance for the
-remaining individually bounded registry fetches. With defaults that is
-1150s. The number is deliberately generous: the component
+(the auth-failure vault retry), one 90s fresh-release Socket retry with the
+same two-attempt budget, the paginated OSV query budget (80s) per resolved
+version plus the cooldown re-query, and a 120s allowance for the remaining
+individually bounded registry fetches. With defaults that is 730s. The number
+is deliberately generous: the component
 budgets are the operative bounds, so a hanging component degrades to its own
 legible infra WARN inside a completed audit, and the leash only fires as a
 backstop against a component escaping its own bound — which previously meant

@@ -67,7 +67,7 @@ contract: safe explain`.
 ## Preflight
 
 <!-- BEGIN GENERATED: preflight -->
-Before proposing an install, an agent can check a spec directly: `safe audit check <pkg>@<version> --ecosystem <eco>` (add `--json` for the receipt). It prints per-scanner lines, including GuardDog for exact npm/PyPI versions, `VERDICT: GO|WARN|BLOCK`, next-step hints on WARN/BLOCK, and exits 0/10/20 — those are verdict codes, not refusals. GuardDog hints name the risk-forming rules. The gate turns the same WARN into a refusal with exit 100 (unless an allow matches) and BLOCK into exit 104.
+Before proposing an install, an agent can check a spec directly: `safe audit check <pkg>@<version> --ecosystem <eco>` (add `--json` for the receipt). It prints Socket, OSV, blocklist, and release-age lines, `VERDICT: GO|WARN|BLOCK`, next-step hints on WARN/BLOCK, and exits 0/10/20 — those are verdict codes, not refusals. Socket is the primary behavioral tier: critical supply-chain-risk alerts BLOCK, while infrastructure failures WARN with a recovery path. The gate turns the same WARN into a refusal with exit 100 (unless an allow matches) and BLOCK into exit 104.
 <!-- END GENERATED: preflight -->
 
 ## Exit codes
@@ -80,13 +80,13 @@ a missing binary (127):
 | Code | Meaning | What an agent should do |
 | --- | --- | --- |
 | 0 | Clean verdict (GO) from `safe audit check`, or a gated command that passed and ran | Proceed. |
-| 10 | `safe audit check` verdict WARN (advisory affecting the resolved version, lower-confidence GuardDog behavioral findings, custom source, unresolved version, or an audit-infrastructure failure — the per-scanner lines say which) | Read the `safe audit:` hint lines: an infrastructure cause is breakage to escalate, an advisory cause is the gate working. Via the gate this same state refuses with exit 100. |
-| 20 | `safe audit check` verdict BLOCK (critical advisory affecting the resolved version, a known-malware `MAL-*` record, GuardDog `high_risk` behavior, or blocklist) | Do not install. Via the gate this refuses with exit 104; the receipt carries the evidence. |
+| 10 | `safe audit check` verdict WARN (advisory affecting the resolved version, Socket behavioral risk short of a critical supply-chain-risk alert, custom source, unresolved version, or an audit-infrastructure failure — the per-scanner lines say which) | Read the `safe audit:` hint lines: an infrastructure cause is breakage to escalate, an advisory cause is the gate working. Via the gate this same state refuses with exit 100. |
+| 20 | `safe audit check` verdict BLOCK (critical advisory affecting the resolved version, a known-malware `MAL-*` record, a Socket critical supply-chain-risk alert, or blocklist) | Do not install. Via the gate this refuses with exit 104; the receipt carries the evidence. |
 | 100 | Blocked by policy: an audit WARN with no matching allow entry, blocklist, fail-closed audit, or unrecognized/unsupported runner-native flags — the refusal line names which | Relay the refusal line verbatim to the operator. Do not retry, do not reword the command. |
 | 101 | Host-allow version pin mismatch | The allowlist pins a different version than the one requested. Report both versions; re-pin is an operator decision. |
 | 102 | Interactive operator confirmation required (non-TTY refusal) | Nothing an agent can do in this shell. Ask the operator to run it in their terminal. |
 | 103 | Invalid package name rejected | Check the spec for a typo before escalating — this one is usually the caller's error. |
-| 104 | Safe audit BLOCK verdict | The audit returned BLOCK. That can be a critical advisory affecting the resolved version, a known-malware or blocklist entry, GuardDog high-risk behavior, or a critical advisory safe could not tie to a resolved version — the reason is in the receipt. Inspect it, and use `safe report-fp <spec>` only when its resolved-version and advisory evidence are inconsistent with the refusal. |
+| 104 | Safe audit BLOCK verdict | The audit returned BLOCK. That can be a critical advisory affecting the resolved version, a known-malware or blocklist entry, a Socket critical supply-chain-risk alert, or a critical advisory safe could not tie to a resolved version — the reason is in the receipt. Inspect it, and use `safe report-fp <spec>` only when its resolved-version and advisory evidence are inconsistent with the refusal. |
 | 127 | Genuinely missing command (never a policy refusal) | The command is not installed, or `safe` is missing from PATH. Report it; never treat it as a reason to bypass. |
 <!-- END GENERATED: exit-codes -->
 
@@ -105,11 +105,11 @@ When resolution fails (a private registry, a git or workspace spec, a compound r
 <!-- BEGIN GENERATED: escalation -->
 | Situation | Signal | Action |
 | --- | --- | --- |
-| Audit backend is down or unauthenticated | The refusal names a Socket auth failure, a rate limit, or a network error — not an advisory. | Escalate to the operator immediately. Do not park it, do not retry around it, do not treat it as a vulnerability finding. Recovery is usually `socket login` or a vault-injection fix; `safe doctor` checks the wiring. Exception: `PENDING (fresh release ...)` means Socket has not completed its first score; with clean GuardDog, OSV, and blocklist evidence it is disclosed data availability, not backend breakage. |
+| Audit backend is down or unauthenticated | The refusal names a Socket auth failure, a rate limit, or a network error — not an advisory. | Escalate to the operator immediately. Do not park it, do not retry around it, do not treat it as a vulnerability finding. Recovery is usually `socket login` or a vault-injection fix; `safe doctor` checks the wiring. Exception: `PENDING (fresh release ...)` means Socket has not completed its first score; with clean OSV and blocklist evidence it is disclosed data availability, not backend breakage. |
 | A critical advisory affects the resolved version | Exit 104 with an advisory ID and the resolved version. | This is the gate working. Report the advisory to the operator and propose a fixed version if one exists. |
 | The advisory does not affect the resolved version | In the receipt (`--json`), an advisory listed as affecting carries a fixed bound at or below the resolved version — the advisory's own range data contradicts the verdict. | Suspected false positive. Run `safe report-fp <spec>` — it re-runs the check, saves the receipt, and writes a dated note in safe's inbox listing every advisory's fixed bound so the operator can apply the disqualifying test. Nothing auto-applies. |
 | A refusal carries BOTH an advisory hint and an infrastructure hint | One `safe audit:` line offers a pinned allow command while another names a Socket/OSV failure as infrastructure breakage. | Infrastructure first: get the broken check fixed (or escalate it), then re-run — the verdict may change once full evidence is available. Only pursue the allow lane on a verdict computed with all checks working. |
-| A scanner is missing or broke | The output names a broken scanner and the verdict degraded to WARN. The explicit `guarddog not installed — behavioral tier skipped` note is the temporary exception in the current slice: Socket is still always-on, so that missing binary alone is not a WARN. | Coverage is missing, not a finding. Run `safe doctor` and report a present scanner that failed. For the explicit missing-GuardDog skip, relay the install note if behavioral coverage is wanted; do not read the skip as a vulnerability. |
+| A scanner is missing or broke | The output names a missing or failed Socket check and the verdict degraded to WARN. | Coverage is missing, not a finding. Run `safe doctor` and report a present scanner that failed; do not read an infrastructure warning as a vulnerability. |
 <!-- END GENERATED: escalation -->
 
 ## Reporting a false positive
@@ -142,11 +142,10 @@ is worth reporting to the operator. It is never a reason to bypass.
 Trust escalations require the operator's interactive terminal. `safe run host-allow add` and `update` refuse in non-TTY shells with exit 102, so an agent can suggest the command but never execute it.
 
 ```bash
-safe run host-allow add <pkg>@<version> --reason "..."                            # trusted host exec (npm)
-safe run host-allow add <pkg>@<version> --acknowledge-behavioral --reason "..."   # operator-only behavioral-FP lane: downgrades a GuardDog high-risk BLOCK to a host-allowable WARN for one reviewed exact version; engages only while the live rule set stays within the acknowledged one, OSV shows nothing affecting, and a forced Socket second opinion is clean. Agents relay this command to the operator, never run it
-safe run -y <pkg>@<version> -- <args>                                             # one-off sandbox run
-safe install [-g] <pkg>@<version>                                                 # audited install
-safe run block list && safe run audit --blocked                                   # review refusals
+safe run host-allow add <pkg>@<version> --reason "..."   # trusted host exec (npm)
+safe run -y <pkg>@<version> -- <args>                    # one-off sandbox run
+safe install [-g] <pkg>@<version>                        # audited install
+safe run block list && safe run audit --blocked          # review refusals
 ```
 <!-- END GENERATED: allow-flows -->
 

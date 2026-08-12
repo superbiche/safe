@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.15.0"
+SAFE_VERSION="1.16.0"
 SAFE_SELF="$(readlink -f "$0")"
 SAFE_DIR="$(dirname "$SAFE_SELF")"
 SAFE_CONFIG_ROOT="${SAFE_CONFIG_DIR:-$HOME/.config/safe}"
@@ -181,7 +181,6 @@ cmd_report_fp() {
     and (((.osv? // {}).classification? // {}) | type == "object")
     and ((.resolution? // {}) | type == "object")
     and ((.socket? // {}) | type == "object")
-    and ((.guarddog? // {}) | type == "object")
     and ((.resolved_versions? // []) | type == "array")
     and ((.warn_causes? // []) | type == "array")
   ' >/dev/null 2>&1 <<<"$payload"; then
@@ -248,7 +247,7 @@ cmd_report_fp() {
        else
         "No advisory is classified as affecting the resolved version, yet the "
           + "command was refused — so the verdict did not come from the OSV "
-          + "classification. Check the GuardDog, Socket, and blocklist sections of the receipt."
+          + "classification. Check the Socket and blocklist sections of the receipt."
        end),
       "",
       (if ((.osv.classification.remediated // []) | length) > 0 then
@@ -261,19 +260,14 @@ cmd_report_fp() {
       "## Verdict inputs",
       "",
       "- Socket: `\(.socket.status // "n/a")`" +
-        (if (.socket.status // "") == "skipped_tier3"
-         then " — deliberately not consulted (tier 3 policy skip); not a failure"
+        (if (.socket.status // "") == "skipped"
+         then " — deliberately disabled by policy; not a failure"
          elif ((.socket.status // "ok") != "ok")
          then " — the check failed; its raw error text is in the receipt, not here"
-         else "" end),
-      "- GuardDog: `\(.guarddog.status // "n/a")`" +
-        (if ((.guarddog.sandbox.fell_back // false) == true)
-         then " (scanned WITHOUT the kernel sandbox — weaker isolation)"
-         else "" end) +
-        (if (.guarddog.rules // [] | length) > 0
-         then " — rules: " + ((.guarddog.rules // []) | join(", "))
-         elif ((.guarddog.infra_error // false) == true)
-         then " — infrastructure failure; raw details are in the receipt"
+         elif ((.socket.raw.data.self.alerts // []) | length) > 0
+         then " — alerts: " + ((.socket.raw.data.self.alerts
+           | map("\(.name // "unknown") [\(.severity // "unknown")/\(.category // "unknown")]")
+           | join(", ")))
          else "" end),
       "- OSV: `\(.osv.status // "n/a")`, \((.osv.vulns // []) | length) advisories fetched",
       ""
@@ -854,52 +848,6 @@ doctor_payload_json() {
   [[ -n "${SOCKET_SECURITY_API_TOKEN:-}" ]] && socket_token_env_set=true
   [[ -f "$socket_mapping" ]] && socket_vault_mapping_present=true
 
-  # Match safe-audit's local tool resolution: caller PATH, the detected local
-  # tools.json entry, then managed fallback directories. Probe the selected
-  # executable under the same safe-owned GuardDog environment as the audit.
-  local guarddog_presence_json guarddog_cmd="" guarddog_version=""
-  local guarddog_machine="${SAFE_AUDIT_LOCAL_MACHINE:-local}" guarddog_cached=""
-  guarddog_cmd=$(command -v guarddog 2>/dev/null || true)
-  if [[ -z "$guarddog_cmd" && -r "$audit_config_dir/machines.json" ]]; then
-    guarddog_machine=$(jq -r --arg fallback "$guarddog_machine" \
-      '[.machines | to_entries[] | select(.value.type == "local") | .key][0] // $fallback' \
-      "$audit_config_dir/machines.json" 2>/dev/null || printf '%s' "$guarddog_machine")
-  fi
-  if [[ -z "$guarddog_cmd" && -r "$audit_config_dir/tools.json" ]]; then
-    guarddog_cached=$(jq -r --arg m "$guarddog_machine" '.[$m].guarddog // empty' \
-      "$audit_config_dir/tools.json" 2>/dev/null || true)
-    [[ -n "$guarddog_cached" && -x "$guarddog_cached" ]] && guarddog_cmd="$guarddog_cached"
-  fi
-  if [[ -z "$guarddog_cmd" ]]; then
-    guarddog_cmd=$(PATH="$PATH:$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/go/bin:$HOME/.cargo/bin:$HOME/.local/share/mise/shims" \
-      command -v guarddog 2>/dev/null || true)
-  fi
-  if [[ -n "$guarddog_cmd" ]] && command -v timeout >/dev/null 2>&1; then
-    guarddog_cmd=$(readlink -f "$guarddog_cmd" 2>/dev/null || printf '%s' "$guarddog_cmd")
-    local guarddog_probe_ok=true
-    if ! guarddog_version=$(timeout --kill-after=1s 2s env \
-        -u GUARDDOG_PARALLELISM \
-        -u GUARDDOG_VERIFY_EXHAUSTIVE_DEPENDENCIES \
-        -u GUARDDOG_NEW_DEPENDENCY_RISK_THRESHOLD \
-        -u GUARDDOG_TOP_PACKAGES_CACHE_LOCATION \
-        -u GUARDDOG_YARA_EXT_EXCLUDE \
-        -u GUARDDOG_MAX_UNCOMPRESSED_SIZE \
-        -u GUARDDOG_MAX_COMPRESSION_RATIO \
-        -u GUARDDOG_MAX_FILE_COUNT \
-        -u GUARDDOG_SUBSCAN_SANDBOX \
-        "$guarddog_cmd" --version </dev/null 2>/dev/null \
-      | head -c 256 | head -n 1); then
-      guarddog_probe_ok=false
-    fi
-    [[ "$guarddog_probe_ok" == "true" && "$guarddog_version" == guarddog,\ version\ * ]] \
-      || guarddog_version=""
-  elif [[ -n "$guarddog_cmd" ]]; then
-    guarddog_cmd=$(readlink -f "$guarddog_cmd" 2>/dev/null || printf '%s' "$guarddog_cmd")
-  fi
-  guarddog_presence_json=$(jq -n --arg path "$guarddog_cmd" --arg version "$guarddog_version" '
-    {present:($path != ""),path:(if $path == "" then null else $path end)}
-    + (if $version == "" then {} else {version:$version} end)')
-
   local capabilities_json="" capabilities_available=false
   local capabilities_version=""
   local capability_verify_release_asset=false
@@ -1071,7 +1019,6 @@ doctor_payload_json() {
     --argjson socket_cli_present "$socket_cli_present" \
     --argjson socket_token_env_set "$socket_token_env_set" \
     --argjson socket_vault_mapping_present "$socket_vault_mapping_present" \
-    --argjson guarddog_presence "$guarddog_presence_json" \
     --argjson linked_npx "$linked_npx" \
     --argjson linked_bunx "$linked_bunx" \
     --argjson linked_uvx "$linked_uvx" \
@@ -1165,11 +1112,6 @@ doctor_payload_json() {
           cli_path: $socket_cli_path,
           token_env_set: $socket_token_env_set,
           vault_mapping_present: $socket_vault_mapping_present
-        },
-        guarddog: {
-          cli_present: $guarddog_presence.present,
-          cli_path: $guarddog_presence.path,
-          version: ($guarddog_presence.version // null)
         }
       }
     }'
@@ -1210,10 +1152,6 @@ print_doctor_human() {
     "socket wiring (install gate scoring):",
     "  cli: " + (if .environment.socket.cli_present then .environment.socket.cli_path else "MISSING — install socket CLI" end),
     "  token: " + (if .environment.socket.token_env_set then "env" elif .environment.socket.vault_mapping_present then "vault mapping" else "MISSING — socket login or add bw-env socket mapping" end),
-    "",
-    "guarddog wiring (npm/PyPI behavioral tier):",
-    "  cli: " + (if .environment.guarddog.cli_present then .environment.guarddog.cli_path else "MISSING — uv tool install guarddog" end),
-    "  version: " + (.environment.guarddog.version // "unavailable"),
     (if (.environment.install_wrappers.mise_shims_bound_to_wrapper // 0) > 0 then
       "\nmise shims: " + (.environment.install_wrappers.mise_shims_bound_to_wrapper | tostring)
       + " bound to the gate wrapper — dispatch still works (argv0 branch) but pays an extra exec per call; repoint the shims at the real mise binary"
@@ -1601,31 +1539,6 @@ safe_install_gate_log() {
   printf '%s\n' "${line//[$'\r\n']/ }" 2>/dev/null >> "$data_dir/audit.log" || true
 }
 
-# Offline fallback: an exact-version request matching a fresh install-known
-# entry (previously recorded clean check) may proceed when the audit itself
-# timed out. Unpinned requests never qualify.
-# Disclose weaker-isolation provenance when reusing recorded evidence: a
-# clean behavioral verdict produced without the kernel sandbox must say so
-# at the moment it is REUSED, not only in the receipt (review F9).
-safe_install_known_provenance() {
-  local package="$1" ecosystem="$2" known_file name version
-  case "$ecosystem" in
-    cargo) ecosystem="rust" ;;
-    composer) ecosystem="php" ;;
-    pip|uv) ecosystem="python" ;;
-  esac
-  known_file="${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}/install-known.json"
-  command -v jq >/dev/null 2>&1 || return 0
-  [[ -r "$known_file" ]] || return 0
-  IFS=$'\t' read -r name version <<< "$(safe_install_split_spec "$package")"
-  [[ -n "$name" ]] || return 0
-  if jq -e --arg k "${ecosystem}:${name}" \
-    '(.packages[$k].reasons // []) | index("guarddog_clean_for_versions_nosandbox") != null' \
-    "$known_file" >/dev/null 2>&1; then
-    printf '%s' " — behavioral evidence was gathered WITHOUT the kernel sandbox"
-  fi
-}
-
 safe_install_known_matches() {
   local package="$1" ecosystem="$2"
   local known_file name version first_allowed ttl_days entry_epoch now_epoch
@@ -1796,7 +1709,7 @@ safe_install_audit_package() {
       ;;
     124|137)
       if safe_install_known_matches "$package" "$ecosystem"; then
-        err "safe audit timed out; proceeding on recorded clean check for $package (stale evidence)$(safe_install_known_provenance "$package" "$ecosystem")"
+        err "safe audit timed out; proceeding on recorded clean check for $package (stale evidence)"
         safe_install_gate_log "$ecosystem" "$package" "STALE_EVIDENCE"
         return 0
       fi

@@ -18,7 +18,7 @@ SUITES=(
   tests/live/shim_delegation.sh
   tests/install/run.sh
   tests/audit/check_version_aware.sh
-  tests/audit/guarddog_tier.sh
+  tests/audit/socket_tier.sh
   tests/audit/smoke.sh
   tests/audit/ecosystem_audits.sh
   tests/audit/external_binary.sh

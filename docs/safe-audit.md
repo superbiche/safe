@@ -336,27 +336,20 @@ affecting advisory whose severity is listed in `install.block_severities`
 (default: `critical`) produces BLOCK; other affecting advisories produce
 WARN. An OSV outage produces WARN (fail closed), never a zero-CVE PASS.
 
-For exact resolved npm and PyPI versions, GuardDog supplies the local
-behavioral tier. GuardDog's correlated `low`/`suspicious` risks WARN with
-cause `guarddog_findings`; `high_risk` behavior BLOCKs with cause
-`guarddog_high_risk`. Receipts name the risk-forming rules. Capability-only
-raw matches that GuardDog did not form into a risk remain visible in the
-receipt but do not change the verdict. Complete scans are cached permanently
-per public-registry artifact integrity, GuardDog version, and safe-owned
-scanner profile. Safe currently supports GuardDog 3.1.0, removes ambient
-`GUARDDOG_*` overrides before its version probe and scan, force-terminates a
-scanner that outlives the configured leash, and limits each output stream to
-16 MiB. If integrity is unavailable or invalid, the scan still runs without
-caching. Permanent replay deliberately does not refresh GuardDog's mutable
-metadata inputs for an unchanged artifact/scanner/profile identity.
+Socket is the primary behavioral tier and is consulted on every check unless
+the operator explicitly sets `install.socket.mode` to `never`. A validated
+Socket result BLOCKs only for a `critical` `supplyChainRisk` alert. Critical
+vulnerability alerts, high-severity alerts, and scores below 70 WARN; the
+receipt retains the validated envelope for review. Missing CLI, auth,
+rate-limit, timeout, and malformed-result conditions are infrastructure WARNs,
+not package findings.
 
-A missing GuardDog binary is a non-adverse skip in this slice because Socket
-remains always-on. Install it with `uv tool install guarddog`. If an installed
-GuardDog fails, times out, or returns unusable output, the check WARNs with
-`guarddog_error` and explicitly identifies the condition as infrastructure
-breakage, not a package finding. Configure the tier under
-`install.guarddog.enabled` and `install.guarddog.timeout_seconds`; `safe
-doctor` reports the CLI path and version.
+Successful envelopes are cached for the exact ecosystem, package name, and
+resolved version under `~/.cache/safe/socket/` (default TTL: 7 days; configure
+`install.socket.cache_ttl_days`). Cache entries are private and atomically
+written. Expired entries never decide a verdict: if the refresh fails, safe
+returns the live infrastructure WARN and may disclose the last complete score
+and its age as context.
 
 Verdicts and exit codes are unchanged for consumers:
 
