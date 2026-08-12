@@ -15,6 +15,11 @@ fail() { printf 'not ok - %s\n' "$*" >&2; FAIL_COUNT=$((FAIL_COUNT + 1)); }
 
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
+
+# safe-audit decides via safe-core; running from the repo means there is no
+# installed sibling, so build one and point the gate at it.
+. "$ROOT/tests/lib/safe-core.sh"
+safe_core_test_prepare "$ROOT" "$TEST_ROOT/safe-core" || exit 1
 MOCKBIN="$TEST_ROOT/mockbin"
 mkdir -p "$MOCKBIN"
 
@@ -349,6 +354,42 @@ if grep -rq 'operator@example.com' "$CASE" 2>/dev/null; then
 else
   pass 'provider error-body identity never reaches receipt, cache, stdout, or stderr'
 fi
+
+# ---------------------------------------------------------------------------
+# The verdict engine is infrastructure, and its failures are NOT verdicts.
+# Before the exit codes were split, a missing or broken engine returned 20 —
+# the same code as a genuine malware BLOCK — so a broken install was
+# indistinguishable from a real refusal, and during development a failed
+# evidence decode did imitate one. 30 means "no verdict could be computed".
+# ---------------------------------------------------------------------------
+prepare_case engine-missing
+run_check clean SAFE_CORE_BIN="$TEST_ROOT/definitely-not-here/safe-core"
+expect_rc 30 'a missing verdict engine is infrastructure breakage, not a BLOCK'
+if grep -q 'audit-infrastructure breakage, not a package finding' "$CASE_ERR"; then
+  pass 'the missing-engine refusal names itself as breakage'
+else
+  fail 'the missing-engine refusal names itself as breakage'
+fi
+
+prepare_case engine-skewed
+mkdir -p "$CASE/stub"
+cat > "$CASE/stub/safe-core" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then printf '0.0.0\n'; fi
+STUB
+chmod +x "$CASE/stub/safe-core"
+run_check clean SAFE_CORE_BIN="$CASE/stub/safe-core" SAFE_VERSION=9.9.9
+expect_rc 30 'a version-skewed verdict engine is infrastructure breakage, not a BLOCK'
+if grep -q 'rerun install.sh' "$CASE_ERR"; then
+  pass 'the skewed-engine refusal carries a recovery path'
+else
+  fail 'the skewed-engine refusal carries a recovery path'
+fi
+
+# The distinction only means something if a real BLOCK still reports 20.
+prepare_case engine-vs-real-block
+run_check malware
+expect_rc 20 'a real malware BLOCK still exits 20, distinct from infrastructure failure'
 
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

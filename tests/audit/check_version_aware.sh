@@ -18,6 +18,11 @@ fail() { printf 'not ok - %s\n' "$*" >&2; FAIL_COUNT=$((FAIL_COUNT + 1)); }
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
+# safe-audit decides via safe-core; running from the repo means there is no
+# installed sibling, so build one and point the gate at it.
+. "$ROOT/tests/lib/safe-core.sh"
+safe_core_test_prepare "$ROOT" "$TEST_ROOT/safe-core" || exit 1
+
 MOCKBIN="$TEST_ROOT/mockbin"
 mkdir -p "$MOCKBIN"
 

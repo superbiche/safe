@@ -4,6 +4,13 @@
 set -euo pipefail
 
 SAFE_AUDIT_VERSION="0.1.0"
+# safe-audit is installed as its own executable and is a documented
+# compatibility entry point, so it cannot rely on inheriting SAFE_VERSION
+# from the dispatcher: invoked directly there is no parent to inherit from,
+# and a conditional pin silently does not apply (delta review F2). It knows
+# its own release and only defers to an inherited value when one exists.
+# Guarded against the VERSION file by tests/contract/drift.sh.
+SAFE_VERSION="${SAFE_VERSION:-1.18.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -7469,165 +7476,64 @@ check_command() {
     fi
   fi
 
-  verdict="GO"
-  local -a warn_causes=()
-  local socket_detail=""
-  local socket_pending=0
-  socket_line="PASS (no behavioral anomalies)"
-  if [[ "$(jq -r '.status // empty' "$socket_json" 2>/dev/null)" == "skipped" ]]; then
-    # A policy skip and an outage are different EVENTS — different cause,
-    # different advice — but they carry the same evidence: none. Socket is
-    # the only behavioral tier since GuardDog was removed, so declining to
-    # consult it cannot also certify the package as clean; intent does not
-    # make an artifact safer. The skip stays free (no API call, no timeout),
-    # it just stops producing a clean GO on its own.
-    #
-    # An operator who wants exactly this posture — offline host, exhausted
-    # quota, curated internal registry where OSV + blocklist + cooldown is
-    # the accepted policy — declares it by adding socket_disabled to
-    # install.auto_allow_tolerate, which records WARN_TOLERATED rather than
-    # GO so a tolerated skip can never later read as a real clean check.
-    socket_line="SKIP ($(jq -r '.note' "$socket_json"))"
-    warn_causes+=("socket_disabled")
-    socket_detail=$(jq -r '.note // "socket disabled by policy"' "$socket_json" 2>/dev/null || true)
-    verdict="WARN"
-  elif [[ "$(jq -r '.available // false' "$socket_json" 2>/dev/null)" != "true" ]]; then
-    socket_line='SKIP (socket CLI not available)'
-    warn_causes+=("socket_unavailable")
-    socket_detail="socket CLI not available"
-    verdict="WARN"
-  elif [[ "$(jq -r '.status' "$socket_json")" == "pending" ]]; then
-    socket_pending=1
-    socket_line="PENDING (fresh release ${primary_version}, ${primary_release_age}d old — Socket scan not yet complete)"
-    socket_detail=$(jq -r '.note // "Socket scan not yet complete"' "$socket_json" 2>/dev/null || true)
-  elif [[ "$(jq -r '.status' "$socket_json")" != "ok" ]]; then
-    # Switch on the fixed reason code, never on prose: the note is now a
-    # safe-authored constant and provider text never reaches this point
-    # (review F5). An envelope with no reason is an old or unexpected shape
-    # and degrades to the generic error, never to clean.
-    local socket_note socket_reason_code
-    socket_note=$(jq -r '.note // "socket check failed"' "$socket_json" 2>/dev/null || printf 'socket check failed')
-    socket_reason_code=$(jq -r '.reason // "error"' "$socket_json" 2>/dev/null || printf 'error')
-    case "$socket_reason_code" in
-      rate_limited)
-        socket_line='WARN (socket rate-limited, retry later)'
-        warn_causes+=("socket_rate_limited")
-        ;;
-      auth)
-        socket_line='WARN (socket authentication required)'
-        warn_causes+=("socket_auth_failed")
-        ;;
-      timeout)
-        socket_line='WARN (socket score timed out)'
-        warn_causes+=("socket_error")
-        ;;
-      unbounded)
-        socket_line='WARN (socket score skipped: cannot be bounded)'
-        warn_causes+=("socket_error")
-        ;;
-      not_found)
-        socket_line='WARN (socket has no record of this package version)'
-        warn_causes+=("socket_error")
-        ;;
-      *)
-        socket_line='WARN (socket returned an unrecognized result)'
-        warn_causes+=("socket_error")
-        ;;
-    esac
-    if [[ -n "$SOCKET_CACHE_STALE_SCORE" && -n "$SOCKET_CACHE_STALE_AGE_DAYS" ]]; then
-      socket_line+="; last complete score was ${SOCKET_CACHE_STALE_SCORE}, ${SOCKET_CACHE_STALE_AGE_DAYS}d ago"
-    fi
-    socket_detail="$socket_note"
-    verdict="WARN"
-  else
-    local score_val socket_class
-    score_val=$(jq -r '.raw.data.self.score.overall' "$socket_json")
+  # --- behavioral tier: gather, do not decide -------------------------------
+  # Socket is the only behavioral tier since GuardDog was removed. Its envelope
+  # is normalized into evidence here; every judgment it implies belongs to the
+  # decision layer — that a policy skip and an outage carry the same (absent)
+  # evidence under different causes, and that an unrecognized reason degrades
+  # to an error rather than to clean.
+  local socket_class="" socket_score_text=""
+  if [[ "$(jq -r '.status // empty' "$socket_json" 2>/dev/null)" == "ok" ]]; then
     socket_class=$(socket_classify "$socket_json")
-    case "$socket_class" in
-      malware)
-        socket_line='BLOCK (critical supply-chain-risk alert)'
-        warn_causes+=("socket_malware")
-        bump_verdict verdict "BLOCK"
-        ;;
-      unmapped)
-        socket_line='WARN (critical alert in a category safe cannot classify — treated as unresolved, not clean)'
-        warn_causes+=("socket_error")
-        socket_detail="unclassifiable critical alert category"
-        bump_verdict verdict "WARN"
-        ;;
-      critical_cve)
-        socket_line='WARN (critical vulnerability alert)'
-        warn_causes+=("socket_critical_cve")
-        bump_verdict verdict "WARN"
-        ;;
-      high)
-        socket_line='WARN (high-severity alert)'
-        warn_causes+=("socket_high_alert")
-        bump_verdict verdict "WARN"
-        ;;
-      low_score)
-        socket_line="WARN (score=$score_val)"
-        warn_causes+=("socket_low_score")
-        bump_verdict verdict "WARN"
-        ;;
-      *)
-        socket_line="PASS (score=$score_val)"
-        ;;
-    esac
+    socket_score_text=$(jq -r '.raw.data.self.score.overall // empty' "$socket_json" 2>/dev/null || true)
   fi
 
-  # --- sibling resolved versions (review F1) -------------------------------
+  # A malformed envelope yields {}, which the decision layer reads as an
+  # unavailable tier and warns on — never as clean.
+  local socket_evidence
+  socket_evidence=$(jq -c \
+    --arg class "$socket_class" --arg score "$socket_score_text" \
+    --arg stale_score "$SOCKET_CACHE_STALE_SCORE" \
+    --arg stale_age "$SOCKET_CACHE_STALE_AGE_DAYS" '
+    {status: (.status // ""), available: (.available // false),
+     note: (.note // ""), reason: (.reason // ""),
+     score: $score, class: $class,
+     cache_stale_score: $stale_score, cache_stale_age_days: $stale_age}' \
+    "$socket_json" 2>/dev/null) || socket_evidence=""
+  if [[ -z "$socket_evidence" ]]; then
+    # A malformed envelope still produces a SHAPE-COMPLETE document: the
+    # decision reads it as an unavailable tier and warns, which is the intended
+    # fail-closed behavior. An incomplete document would instead be refused as
+    # infrastructure breakage, which is a different (and wrong) answer here.
+    socket_evidence='{"status":"","available":false,"note":"","reason":"","score":"","class":"","cache_stale_score":"","cache_stale_age_days":""}'
+  fi
+
+  # --- sibling resolved versions -------------------------------------------
   # The behavioral tier must cover every version the operation can install,
-  # not just the primary. GuardDog scanned all of RESOLVED_VERSIONS; when it
-  # was removed, Socket's primary-only score silently dropped that coverage,
-  # so a clean 1.5.0 could carry a malicious 2.5.0 in on a ranged update.
-  # OSV already loops the same set — this restores parity.
-  #
-  # Cheap by construction: each exact version reads its own cache entry, so a
-  # re-audit of an unchanged set costs no API calls.
+  # not just the primary: a clean 1.5.0 could otherwise carry a malicious
+  # 2.5.0 in on a ranged update. Cheap by construction — each exact version
+  # reads its own cache entry, so re-auditing an unchanged set costs no API
+  # calls. Scoring happens here; what an unscorable sibling MEANS is decided
+  # by the decision layer, which never assumes it clean.
+  local siblings_json='[]'
   if (( resolution_ok )) && (( ${#RESOLVED_VERSIONS[@]} > 1 )) \
     && [[ "$socket_mode" != "never" ]]; then
-    local sib sib_json sib_idx=0 sib_class
+    local sib sib_json sib_idx=0 sib_status sib_class sib_score
     for sib in "${RESOLVED_VERSIONS[@]}"; do
       [[ "$sib" == "$primary_version" ]] && continue
       sib_idx=$(( sib_idx + 1 ))
       sib_json="$scratch/socket-sibling-${sib_idx}.json"
       socket_score_json "$ecosystem" "${PKG_NAME}@${sib}" "$sib_json" "" "$PKG_NAME" "$sib"
-      if [[ "$(jq -r '.status // empty' "$sib_json" 2>/dev/null)" != "ok" ]]; then
-        # A sibling we could not score is unproven, never assumed clean.
-        socket_line+="; ${sib} not scored (infrastructure failure)"
-        warn_causes+=("socket_error")
-        bump_verdict verdict "WARN"
-        continue
+      sib_status=$(jq -r '.status // empty' "$sib_json" 2>/dev/null || true)
+      sib_class=""
+      sib_score=""
+      if [[ "$sib_status" == "ok" ]]; then
+        sib_class=$(socket_classify "$sib_json")
+        sib_score=$(jq -r '.raw.data.self.score.overall // empty' "$sib_json" 2>/dev/null || true)
       fi
-      sib_class=$(socket_classify "$sib_json")
-      case "$sib_class" in
-        malware)
-          socket_line+="; BLOCK ${sib} (critical supply-chain-risk alert)"
-          warn_causes+=("socket_malware")
-          bump_verdict verdict "BLOCK"
-          ;;
-        unmapped)
-          socket_line+="; WARN ${sib} (unclassifiable critical alert)"
-          warn_causes+=("socket_error")
-          bump_verdict verdict "WARN"
-          ;;
-        critical_cve)
-          socket_line+="; WARN ${sib} (critical vulnerability alert)"
-          warn_causes+=("socket_critical_cve")
-          bump_verdict verdict "WARN"
-          ;;
-        high)
-          socket_line+="; WARN ${sib} (high-severity alert)"
-          warn_causes+=("socket_high_alert")
-          bump_verdict verdict "WARN"
-          ;;
-        low_score)
-          socket_line+="; WARN ${sib} (score=$(jq -r '.raw.data.self.score.overall' "$sib_json"))"
-          warn_causes+=("socket_low_score")
-          bump_verdict verdict "WARN"
-          ;;
-      esac
+      siblings_json=$(jq -cn --argjson acc "$siblings_json" \
+        --arg v "$sib" --arg s "$sib_status" --arg c "$sib_class" --arg sc "$sib_score" \
+        '$acc + [{version: $v, status: $s, class: $c, score: $sc}]')
     done
   fi
 
@@ -7690,88 +7596,36 @@ check_command() {
     total_count=$(jq '[.vulns[]?] | length' "$osv_json" 2>/dev/null || echo 0)
   fi
 
-  local block_severities affecting_blocked=""
+  local block_severities
   block_severities=$(install_policy_json | jq -c '.block_severities // ["critical"]')
-  if (( resolution_ok )); then
-    # Adverse evidence outranks infrastructure failure: a partial OSV outage
-    # (one failed sibling-version query, a failed later page) must never
-    # demote an already-retained affecting/malware hit to a plain
-    # OSV-unavailable WARN — that WARN is host-allowable, and a known MAL
-    # hit would ride through (review PR#55 F1). Classify what was received
-    # FIRST; the outage then only adds its own cause on top.
-    if (( aff_count > 0 )); then
-      local aff_summary
-      aff_summary=$(jq -r '[.affecting[] | "\(.id) (\(.severity))"] | .[0:3] | join(", ")' <<<"$combined")
-      # The text line shows at most three IDs; say so instead of truncating
-      # silently — the full set lives in --json and the receipt.
-      (( aff_count > 3 )) && aff_summary="${aff_summary}, +$((aff_count - 3)) more"
-      osv_line="WARN (${aff_count} of ${total_count} advisories affect ${resolved_label}: ${aff_summary})"
-      warn_causes+=("osv_affecting")
-      bump_verdict verdict "WARN"
-      affecting_blocked=$(jq -r --argjson block "$block_severities" '[.affecting[] | select(.severity as $s | $block | index($s))] | length' <<<"$combined")
-      if (( affecting_blocked > 0 )); then
-        osv_line="BLOCK (${aff_count} of ${total_count} advisories affect ${resolved_label}: ${aff_summary})"
-        bump_verdict verdict "BLOCK"
-      fi
-      # OSV MAL-* records (OpenSSF malicious-packages) are blocklist-class:
-      # known malware, not a scored vulnerability. They usually carry no CVSS
-      # at all, so the severity ladder ranks them "unknown" — which the
-      # install.block_severities knob would leave overridable. Malware is
-      # never severity-policy business: BLOCK unconditionally, no knob.
-      local malware_ids
-      malware_ids=$(jq -r '[.affecting[] | select(.malware) | .id] | join(", ")' <<<"$combined")
-      if [[ -n "$malware_ids" ]]; then
-        osv_line="BLOCK (known-malware record affects ${resolved_label}: ${malware_ids})"
-        warn_causes+=("osv_malware")
-        bump_verdict verdict "BLOCK"
-      fi
-      if [[ "$osv_status" != "ok" ]]; then
-        # Partial data: the retained evidence above stands; the failure is
-        # additionally disclosed and keeps the incomplete check un-allowable.
-        osv_line="${osv_line}; OSV data incomplete (query failure)"
-        warn_causes+=("osv_unavailable")
-      fi
-    elif [[ "$osv_status" != "ok" ]]; then
-      # Previously an OSV outage silently counted as zero CVEs; fail closed.
-      osv_line="WARN (OSV query failed; advisory data unavailable)"
-      warn_causes+=("osv_unavailable")
-      bump_verdict verdict "WARN"
-    elif (( total_count > 0 )); then
-      if (( rem_count > 0 )); then
-        osv_line="PASS (0 of ${total_count} advisories affect ${resolved_label}; ${rem_count} fixed at or below it)"
-      else
-        osv_line="PASS (0 of ${total_count} advisories affect ${resolved_label})"
-      fi
-    else
-      osv_line="PASS (no known advisories for ${resolved_label})"
-    fi
-  else
-    if [[ "$osv_status" != "ok" ]]; then
-      osv_line="WARN (version unresolved and OSV query failed)"
-      warn_causes+=("osv_unavailable")
-    else
-      osv_line="WARN (version unresolved; ${total_count} historical advisories for package)"
-    fi
-    warn_causes+=("version_unresolved")
-    bump_verdict verdict "WARN"
-    # Per-record guards (`?` + strings): one malformed sibling record must
-    # not cancel a valid critical/MAL escalation by failing the whole jq
-    # program (PR#55 delta-1 F1 — same defect class as classification).
+
+  # The unresolved-version path additionally needs package-history signals.
+  # Per-record guards (`?` + strings): one malformed sibling record must not
+  # cancel a valid critical/MAL escalation by failing the whole jq program.
+  local osv_hist_critical=false osv_hist_malware=""
+  if (( ! resolution_ok )); then
     if jq -e '[.vulns[]? | .database_specific?.severity? | strings
       | ascii_downcase | select(. == "critical")] | length > 0' "$osv_json" >/dev/null 2>&1; then
-      bump_verdict verdict "BLOCK"
+      osv_hist_critical=true
     fi
-    # Same fail-closed rule as historical criticals: a package whose history
-    # carries a MAL-* known-malware record never proceeds on an unresolved
-    # version. A clean pinned version still GOes via the resolved path.
-    local hist_malware_ids
-    hist_malware_ids=$(jq -r '[.vulns[]? | .id? | strings | select(test("^MAL-"))] | join(", ")' "$osv_json" 2>/dev/null || true)
-    if [[ -n "$hist_malware_ids" ]]; then
-      osv_line="BLOCK (version unresolved; known-malware record in package history: ${hist_malware_ids})"
-      warn_causes+=("osv_malware")
-      bump_verdict verdict "BLOCK"
-    fi
+    osv_hist_malware=$(jq -r '[.vulns[]? | .id? | strings | select(test("^MAL-"))] | join(", ")' \
+      "$osv_json" 2>/dev/null || true)
   fi
+
+  local osv_evidence
+  # No affecting count is sent: the decision derives it from the list, so the
+  # two cannot disagree (review F1).
+  osv_evidence=$(jq -cn --argjson combined "$combined" --arg status "$osv_status" \
+    --argjson rem "$rem_count" --argjson total "$total_count" \
+    --argjson hist_critical "$osv_hist_critical" --arg hist_malware "$osv_hist_malware" '
+    {status: $status,
+     affecting: [$combined.affecting[]?
+                 | {id: ((.id // "") | tostring),
+                    severity: ((.severity // "unknown") | tostring),
+                    malware: ((.malware // false) == true)}],
+     remediated_count: $rem, total_count: $total,
+     historical_critical: $hist_critical,
+     historical_malware_ids: $hist_malware}') || osv_evidence=""
 
   # --- release-age cooldown: a brand-new release is the compromised-publish
   # window (malicious versions are usually caught and yanked within days).
@@ -7824,78 +7678,154 @@ check_command() {
             release_security_fix_ids=$(jq -r '.ids // ""' <<<"$cooldown_fix_json" 2>/dev/null || true)
           fi
         fi
-        if [[ -n "$release_security_fix_ids" && "$cooldown_security_fix" == "exempt" ]]; then
-          release_exempt=1
-          release_line="PASS (${release_version} published ${release_age}d ago — inside the ${cooldown_days}d cooldown, waived: it remediates ${release_security_fix_ids})"
-        else
-          release_line="WARN (${release_version} published ${release_age}d ago — younger than the ${cooldown_days}d cooldown)"
-          [[ -n "$release_security_fix_ids" ]] \
-            && release_line="${release_line}; it remediates ${release_security_fix_ids} but install.cooldown_security_fix=enforce"
-          warn_causes+=("release_too_new")
-          bump_verdict verdict "WARN"
-        fi
-      else
-        release_line="PASS (published ${release_age}d ago)"
       fi
-    elif (( release_rc == 1 )); then
-      release_line="SKIP (publish date unavailable — cooldown not evaluated)"
     fi
   fi
 
-  # A custom source floors the verdict at WARN regardless of resolution or
-  # exactness: OSV/Socket evidence covers the public registry identity, not
-  # whatever a private index serves under that name@version (delta finding
-  # 3). CHECK_REGISTRY may carry MULTIPLE space-separated sources (pip/uv
-  # selectors are cumulative — a later trusted selector must never erase an
-  # earlier untrusted one, delta-2 finding 3): every source must be trusted.
-  # The EFFECTIVE source can also come from env/rc config with no argv
-  # selector at all (npm: NPM_CONFIG_REGISTRY/.npmrc incl. scoped keys;
-  # python: pip/uv env + pip.conf; go: GOPROXY), and exact pins skip
-  # resolution entirely — so it is derived here on every check (env + rc
-  # read only, no network; delta-3/4 finding 3.2). Operator escape hatches:
-  # install.trusted_registries, or a pinned host-allow.
-  # (CHECK_EFFECTIVE_SOURCES was derived before resolution, above.)
+  # A custom source is gathered as a fact here and floored to WARN by the
+  # decision layer: OSV/Socket evidence covers the public registry identity,
+  # not whatever a private index serves under that name@version.
+  # CHECK_REGISTRY may carry MULTIPLE space-separated sources (pip/uv selectors
+  # are cumulative — a later trusted selector must never erase an earlier
+  # untrusted one): every source must be trusted. The EFFECTIVE source can also
+  # come from env/rc config with no argv selector at all, and exact pins skip
+  # resolution entirely, so it was derived before resolution, above.
+  # Operator escape hatches: install.trusted_registries, or a pinned host-allow.
   local custom_source=0 check_src
   for check_src in ${CHECK_EFFECTIVE_SOURCES}; do
     # Trust applies to the endpoint; a scoped token carries its key inline.
     if ! registry_is_trusted "$(source_element_url "$check_src")" "$ecosystem"; then
       custom_source=1
-      warn_causes+=("custom_source")
-      bump_verdict verdict "WARN"
       break
     fi
   done
 
-  block_line="PASS (not blocked)"
-  # An unreadable blocklist must not read as "not blocked": the conditional
-  # call below swallows jq failures, so a corrupt file would silently erase
-  # operator blocklist evidence (PR#64 review F4, sibling of the
-  # scanner-batch preflight). Local state breakage is a WARN with its own
-  # cause — infrastructure to fix, never a clean pass.
+  # Blocklist state is gathered here; what an unreadable file MEANS — that it
+  # is not the same as "not blocked" — is decided by the decision layer.
+  local blocklist_readable=1 blocklist_reason=""
   if [[ -f "$SAFE_RUN_BLOCKED_FILE" ]] \
     && ! jq -e '
       (type == "object") and ((.packages // {}) | type == "object")
       and ((.packages // {}) | [to_entries[] | .value | type == "object"] | all)
     ' "$SAFE_RUN_BLOCKED_FILE" >/dev/null 2>&1; then
-    block_line="WARN (blocklist file unreadable — repair or remove ${SAFE_RUN_BLOCKED_FILE})"
-    warn_causes+=("blocklist_unreadable")
-    bump_verdict verdict "WARN"
+    blocklist_readable=0
   elif block_reason=$(blocked_entry_reason "$PKG_NAME"); then
-    bump_verdict verdict "BLOCK"
-    block_line="BLOCKED ($block_reason)"
+    blocklist_reason="$block_reason"
   fi
 
-  # A fresh Socket score that is still pending is data availability, not an
-  # infrastructure outage. It may leave a GO only when every independent
-  # signal already evaluated cleanly; otherwise retain that signal's verdict
-  # and add an explicit pending cause.
-  if (( socket_pending )); then
-    if [[ "$verdict" != "GO" || "$osv_status" != "ok" ]] \
-      || (( ! resolution_ok || aff_count > 0 )) || [[ "$block_line" != PASS* ]]; then
-      warn_causes+=("socket_score_pending")
-      bump_verdict verdict "WARN"
-    fi
+  # --- decide ---------------------------------------------------------------
+  # Everything above gathered evidence; nothing above decided. safe-core owns
+  # the verdict (internal/verdict), so the policy has exactly one
+  # implementation rather than a bash copy that drifts away from it.
+  #
+  # A missing or version-skewed safe-core is audit-infrastructure breakage, not
+  # a package finding: it refuses with a recovery path and never produces a
+  # verdict. install.sh rebuilds and reinstalls safe-core on every run and safe
+  # doctor reports skew, so the recovery is always "rerun install.sh".
+  local safe_core_bin safe_core_reported
+  safe_core_bin="${SAFE_CORE_BIN:-}"
+  if [[ -z "$safe_core_bin" ]]; then
+    safe_core_bin="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/safe-core"
   fi
+
+  local resolution_ok_json="false"
+  if (( resolution_ok )); then
+    resolution_ok_json="true"
+  fi
+
+  # jq needs JSON booleans; the shell flags above stay numeric because other
+  # call sites evaluate them arithmetically.
+  local custom_source_json="false" blocklist_readable_json="false"
+  if (( custom_source )); then
+    custom_source_json="true"
+  fi
+  if (( blocklist_readable )); then
+    blocklist_readable_json="true"
+  fi
+
+  local evidence_json verdict_json
+  evidence_json=$(jq -cn \
+    --argjson res_ok "$resolution_ok_json" \
+    --arg primary "$primary_version" \
+    --arg label "$resolved_label" \
+    --argjson socket "$socket_evidence" \
+    --argjson siblings "$siblings_json" \
+    --argjson osv "$osv_evidence" \
+    --argjson release_rc "$release_rc" \
+    --arg release_age "$release_age" \
+    --arg primary_age "$primary_release_age" \
+    --arg release_version "$release_version" \
+    --argjson cooldown_days "$cooldown_days" \
+    --arg fix_ids "$release_security_fix_ids" \
+    --arg cooldown_fix "$cooldown_security_fix" \
+    --argjson custom_source "$custom_source_json" \
+    --argjson blocklist_readable "$blocklist_readable_json" \
+    --arg blocklist_reason "$blocklist_reason" \
+    --arg blocklist_path "$SAFE_RUN_BLOCKED_FILE" \
+    --argjson block_severities "$block_severities" '
+    {resolution: {ok: $res_ok, primary_version: $primary, label: $label},
+     socket: $socket,
+     socket_siblings: $siblings,
+     osv: $osv,
+     release: {rc: $release_rc,
+               age: ($release_age | if . == "" then 0 else tonumber end),
+               primary_age: $primary_age,
+               version: $release_version,
+               cooldown_days: $cooldown_days,
+               security_fix_ids: $fix_ids,
+               cooldown_security_fix: $cooldown_fix},
+     custom_source: $custom_source,
+     blocklist: {readable: $blocklist_readable,
+                 reason: $blocklist_reason,
+                 path: $blocklist_path},
+     block_severities: $block_severities}') || evidence_json=""
+
+  if [[ -z "$evidence_json" ]]; then
+    printf 'safe audit: could not assemble audit evidence — audit-infrastructure breakage, not a package finding; run safe doctor\n' >&2
+    rm -rf "$scratch"
+    return 30
+  fi
+  if [[ ! -x "$safe_core_bin" ]]; then
+    printf 'safe audit: verdict engine missing (safe-core is not installed) — audit-infrastructure breakage, not a package finding; rerun install.sh\n' >&2
+    rm -rf "$scratch"
+    return 30
+  fi
+  # Unconditional: safe-audit carries its own expected version, so every route
+  # that reaches it is pinned — the dispatcher, the gate, and direct invocation
+  # of the installed safe-audit executable alike.
+  safe_core_reported=$("$safe_core_bin" --version 2>/dev/null) || safe_core_reported=""
+  if [[ "$safe_core_reported" != "${SAFE_VERSION}" ]]; then
+    printf 'safe audit: verdict engine version %s does not match safe %s — audit-infrastructure breakage, not a package finding; rerun install.sh\n' \
+      "${safe_core_reported:-unknown}" "${SAFE_VERSION}" >&2
+    rm -rf "$scratch"
+    return 30
+  fi
+
+  verdict_json=$(printf '%s' "$evidence_json" | "$safe_core_bin" package-verdict 2>/dev/null) \
+    || verdict_json=""
+  if [[ -z "$verdict_json" ]]; then
+    printf 'safe audit: verdict engine failed to decide — audit-infrastructure breakage, not a package finding; rerun install.sh or run safe doctor\n' >&2
+    rm -rf "$scratch"
+    return 30
+  fi
+
+  local -a warn_causes=()
+  local socket_detail="" socket_pending=0
+  verdict=$(jq -r '.verdict' <<<"$verdict_json")
+  socket_line=$(jq -r '.lines.socket' <<<"$verdict_json")
+  osv_line=$(jq -r '.lines.osv' <<<"$verdict_json")
+  release_line=$(jq -r '.lines.release' <<<"$verdict_json")
+  block_line=$(jq -r '.lines.block' <<<"$verdict_json")
+  socket_detail=$(jq -r '.socket_detail' <<<"$verdict_json")
+  if [[ "$(jq -r '.socket_pending' <<<"$verdict_json")" == "true" ]]; then
+    socket_pending=1
+  fi
+  if [[ "$(jq -r '.release_exempt' <<<"$verdict_json")" == "true" ]]; then
+    release_exempt=1
+  fi
+  while IFS= read -r cause_line; do
+    [[ -n "$cause_line" ]] && warn_causes+=("$cause_line")
+  done < <(jq -r '.causes[]?' <<<"$verdict_json")
 
   local warn_causes_json='[]'
   if (( ${#warn_causes[@]} > 0 )); then
