@@ -192,6 +192,20 @@ case_version_constant_matches_version_file() {
   fi
 }
 
+case_audit_version_constant_matches_version_file() {
+  # bin/safe-audit carries its own expected version because it is installed as
+  # a standalone executable and pins safe-core unconditionally. A third version
+  # source is a third drift surface, so it is guarded like the first two.
+  local file_v const_v
+  file_v="$(tr -d '[:space:]' < "$ROOT/VERSION")"
+  const_v="$(sed -n 's/^SAFE_VERSION="${SAFE_VERSION:-\(.*\)}"$/\1/p' "$ROOT/bin/safe-audit" | head -n 1)"
+  if [[ -n "$file_v" && "$file_v" == "$const_v" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (VERSION file '$file_v' vs bin/safe-audit SAFE_VERSION '$const_v')"
+  fi
+}
+
 case_contract_never_suggests_latest() {
   # The standing operator ruling: allow entries are pinned to resolved
   # versions, and nothing safe prints may model `@latest` as acceptable.
@@ -305,6 +319,7 @@ case_malformed_contract_is_refused
 case_exit_codes_match_the_dispatcher
 case_contract_never_suggests_latest
 case_version_constant_matches_version_file
+case_audit_version_constant_matches_version_file
 case_gated_tools_match_the_installed_wrapper_set
 case_gated_tool_lists_stay_in_sync
 case_npm_classifier_snapshot_routes_every_alias

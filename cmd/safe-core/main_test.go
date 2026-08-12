@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -82,72 +83,168 @@ func TestRunRegistryHostOption(t *testing.T) {
 	}
 }
 
-// The decision layer is only as trustworthy as its decode boundary. These go
-// through the real JSON path rather than constructing typed structs, because
-// the defects they guard against are ones the decoder silently accepts:
-// missing keys and explicit nulls both yield zero values (review F1).
+// completeEvidence is a minimal but SHAPE-COMPLETE document: every key the
+// decision reads, present and non-null. Tests mutate one field at a time, so a
+// rejection is attributable to that mutation rather than to an omission.
+const completeEvidence = `{
+  "resolution": {"ok": true, "primary_version": "1.0.0", "label": "1.0.0"},
+  "socket": {"status": "ok", "available": true, "note": "", "reason": "",
+             "score": "90", "class": "clean",
+             "cache_stale_score": "", "cache_stale_age_days": ""},
+  "socket_siblings": [],
+  "osv": {"status": "ok", "affecting": [], "remediated_count": 0,
+          "total_count": 0, "historical_critical": false,
+          "historical_malware_ids": ""},
+  "release": {"rc": 0, "age": 30, "primary_age": "30", "version": "1.0.0",
+              "cooldown_days": 3, "security_fix_ids": "",
+              "cooldown_security_fix": "exempt"},
+  "custom_source": false,
+  "blocklist": {"readable": true, "reason": "", "path": "/etc/safe/blocked.json"},
+  "block_severities": ["critical"]
+}`
+
+// setEvidenceKey rewrites one JSON path in the complete document. A nil value
+// becomes an explicit JSON null; use dropEvidenceKey for the absent case.
+func setEvidenceKey(t *testing.T, path string, value any) string {
+	t.Helper()
+	return editEvidence(t, path, value, true)
+}
+
+// dropEvidenceKey removes one JSON path entirely.
+func dropEvidenceKey(t *testing.T, path string) string {
+	t.Helper()
+	return editEvidence(t, path, nil, false)
+}
+
+func editEvidence(t *testing.T, path string, value any, keep bool) string {
+	t.Helper()
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(completeEvidence), &doc); err != nil {
+		t.Fatalf("base evidence is not valid JSON: %v", err)
+	}
+	parts := strings.Split(path, ".")
+	node := doc
+	for _, p := range parts[:len(parts)-1] {
+		next, ok := node[p].(map[string]any)
+		if !ok {
+			t.Fatalf("path %q: %q is not an object", path, p)
+		}
+		node = next
+	}
+	last := parts[len(parts)-1]
+	if keep {
+		node[last] = value
+	} else {
+		delete(node, last)
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("re-encode: %v", err)
+	}
+	return string(out)
+}
+
+func runVerdict(t *testing.T, evidence string) (int, string, string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"package-verdict"}, strings.NewReader(evidence), &stdout, &stderr)
+	return code, stdout.String(), stderr.String()
+}
+
+// The base document must decide cleanly, or every rejection test below would
+// pass for the wrong reason.
+func TestCompleteEvidenceDecidesGO(t *testing.T) {
+	code, stdout, stderr := runVerdict(t, completeEvidence)
+	if code != 0 {
+		t.Fatalf("run() = %d, stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stdout, `"verdict":"GO"`) {
+		t.Fatalf("want GO, got %s", stdout)
+	}
+}
+
+// encoding/json cannot tell an absent adverse fact from a benign zero: an
+// omitted `malware` flag demotes a MAL record to an ordinary advisory, a null
+// `socket_siblings` erases ranged-update coverage, an absent `cooldown_days`
+// disables the cooldown. None is detectable after decoding, so an incomplete
+// document must be refused before it (delta review F1).
+func TestPackageVerdictRefusesIncompleteEvidence(t *testing.T) {
+	for _, path := range []string{
+		"osv.affecting", "osv.status", "osv.historical_critical",
+		"osv.historical_malware_ids", "osv.total_count",
+		"socket_siblings", "socket.class", "socket.status", "socket.available",
+		"release.rc", "release.cooldown_days", "release.cooldown_security_fix",
+		"custom_source", "blocklist.readable", "blocklist.reason",
+		"block_severities", "resolution.ok",
+	} {
+		for _, mode := range []string{"absent", "null"} {
+			t.Run(path+"/"+mode, func(t *testing.T) {
+				doc := dropEvidenceKey(t, path)
+				if mode == "null" {
+					doc = setEvidenceKey(t, path, nil)
+				}
+				code, stdout, _ := runVerdict(t, doc)
+				if code != 3 {
+					t.Fatalf("run() = %d, want 3 (stdout=%q)", code, stdout)
+				}
+				if stdout != "" {
+					t.Fatalf("emitted a verdict on incomplete evidence: %q", stdout)
+				}
+			})
+		}
+	}
+}
+
+// A malware record inside the affecting list must BLOCK on the strength of the
+// list alone, with no count field anywhere in the document.
+func TestPackageVerdictBlocksMalwareFromListAlone(t *testing.T) {
+	doc := setEvidenceKey(t, "osv.affecting", []any{
+		map[string]any{"id": "MAL-2026-1", "severity": "unknown", "malware": true},
+	})
+	doc = strings.Replace(doc, `"total_count":0`, `"total_count":1`, 1)
+	code, stdout, stderr := runVerdict(t, doc)
+	if code != 0 {
+		t.Fatalf("run() = %d, stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stdout, `"verdict":"BLOCK"`) || !strings.Contains(stdout, "osv_malware") {
+		t.Fatalf("want a malware BLOCK, got %s", stdout)
+	}
+}
+
+// An advisory missing its malware flag is exactly the erasure delta F1 named.
+func TestPackageVerdictRefusesAdvisoryMissingMalwareFlag(t *testing.T) {
+	doc := setEvidenceKey(t, "osv.affecting", []any{
+		map[string]any{"id": "MAL-2026-1", "severity": "unknown"},
+	})
+	if code, stdout, _ := runVerdict(t, doc); code != 3 || stdout != "" {
+		t.Fatalf("run() = %d stdout=%q, want 3 with no verdict", code, stdout)
+	}
+}
+
+// Validation must not reject a document the real producer can emit.
 func TestPackageVerdictRejectsUnusableEvidence(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		evidence string
+		name  string
+		path  string
+		value any
 	}{
-		{
-			"socket ok with a null class",
-			`{"resolution":{"ok":true,"primary_version":"1.0.0","label":"1.0.0"},
-			  "socket":{"status":"ok","available":true,"score":"90","class":null},
-			  "osv":{"status":"ok"},"blocklist":{"readable":true}}`,
-		},
-		{
-			"socket ok with the class key absent",
-			`{"resolution":{"ok":true,"primary_version":"1.0.0","label":"1.0.0"},
-			  "socket":{"status":"ok","available":true,"score":"90"},
-			  "osv":{"status":"ok"},"blocklist":{"readable":true}}`,
-		},
-		{
-			"socket ok with an unrecognized class",
-			`{"resolution":{"ok":true,"primary_version":"1.0.0","label":"1.0.0"},
-			  "socket":{"status":"ok","available":true,"score":"90","class":"probably_fine"},
-			  "osv":{"status":"ok"},"blocklist":{"readable":true}}`,
-		},
-		{
-			"sibling ok with an unrecognized class",
-			`{"resolution":{"ok":true,"primary_version":"1.0.0","label":"1.0.0"},
-			  "socket":{"status":"ok","available":true,"score":"90","class":"clean"},
-			  "socket_siblings":[{"version":"2.0.0","status":"ok","class":""}],
-			  "osv":{"status":"ok"},"blocklist":{"readable":true}}`,
-		},
+		{"socket ok with a null class", "socket.class", nil},
+		{"socket ok with an unrecognized class", "socket.class", "probably_fine"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
-			got := run([]string{"package-verdict"}, strings.NewReader(tc.evidence), &stdout, &stderr)
-			if got != 3 {
-				t.Fatalf("run() = %d, want 3 (stdout=%q)", got, stdout.String())
-			}
-			if stdout.Len() != 0 {
-				t.Fatalf("emitted a verdict on unusable evidence: %q", stdout.String())
+			doc := setEvidenceKey(t, tc.path, tc.value)
+			if code, stdout, _ := runVerdict(t, doc); code != 3 || stdout != "" {
+				t.Fatalf("run() = %d stdout=%q, want 3 with no verdict", code, stdout)
 			}
 		})
 	}
 }
 
-// A malware record must decide the verdict on the strength of the list alone.
-// Before the count was derived, a zeroed or absent affecting_count made this
-// entire branch unreachable while the evidence still named the MAL record.
-func TestPackageVerdictBlocksMalwareWithoutAnyCountField(t *testing.T) {
-	evidence := `{"resolution":{"ok":true,"primary_version":"1.0.0","label":"1.0.0"},
-	  "socket":{"status":"ok","available":true,"score":"90","class":"clean"},
-	  "osv":{"status":"ok","total_count":1,
-	         "affecting":[{"id":"MAL-2026-1","severity":"unknown","malware":true}]},
-	  "blocklist":{"readable":true},"block_severities":[]}`
-
-	var stdout, stderr bytes.Buffer
-	if got := run([]string{"package-verdict"}, strings.NewReader(evidence), &stdout, &stderr); got != 0 {
-		t.Fatalf("run() = %d, stderr=%q", got, stderr.String())
-	}
-	if !strings.Contains(stdout.String(), `"verdict":"BLOCK"`) {
-		t.Fatalf("want BLOCK, got %s", stdout.String())
-	}
-	if !strings.Contains(stdout.String(), "osv_malware") {
-		t.Fatalf("want the malware cause, got %s", stdout.String())
+func TestPackageVerdictRejectsSiblingWithUnknownClass(t *testing.T) {
+	doc := setEvidenceKey(t, "socket_siblings", []any{
+		map[string]any{"version": "2.0.0", "status": "ok", "class": ""},
+	})
+	if code, stdout, _ := runVerdict(t, doc); code != 3 || stdout != "" {
+		t.Fatalf("run() = %d stdout=%q, want 3 with no verdict", code, stdout)
 	}
 }

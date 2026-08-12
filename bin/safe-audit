@@ -4,6 +4,13 @@
 set -euo pipefail
 
 SAFE_AUDIT_VERSION="0.1.0"
+# safe-audit is installed as its own executable and is a documented
+# compatibility entry point, so it cannot rely on inheriting SAFE_VERSION
+# from the dispatcher: invoked directly there is no parent to inherit from,
+# and a conditional pin silently does not apply (delta review F2). It knows
+# its own release and only defers to an inherited value when one exists.
+# Guarded against the VERSION file by tests/contract/drift.sh.
+SAFE_VERSION="${SAFE_VERSION:-1.18.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -7492,7 +7499,14 @@ check_command() {
      note: (.note // ""), reason: (.reason // ""),
      score: $score, class: $class,
      cache_stale_score: $stale_score, cache_stale_age_days: $stale_age}' \
-    "$socket_json" 2>/dev/null) || socket_evidence='{}'
+    "$socket_json" 2>/dev/null) || socket_evidence=""
+  if [[ -z "$socket_evidence" ]]; then
+    # A malformed envelope still produces a SHAPE-COMPLETE document: the
+    # decision reads it as an unavailable tier and warns, which is the intended
+    # fail-closed behavior. An incomplete document would instead be refused as
+    # infrastructure breakage, which is a different (and wrong) answer here.
+    socket_evidence='{"status":"","available":false,"note":"","reason":"","score":"","class":"","cache_stale_score":"","cache_stale_age_days":""}'
+  fi
 
   # --- sibling resolved versions -------------------------------------------
   # The behavioral tier must cover every version the operation can install,
@@ -7776,18 +7790,15 @@ check_command() {
     rm -rf "$scratch"
     return 30
   fi
-  # The pin is enforced whenever the caller knows what version it is: bin/safe
-  # exports SAFE_VERSION to every child, so every real invocation is checked.
-  # A bare bin/safe-audit run (tests, development) has nothing to compare
-  # against and cannot manufacture one.
-  if [[ -n "${SAFE_VERSION:-}" ]]; then
-    safe_core_reported=$("$safe_core_bin" --version 2>/dev/null) || safe_core_reported=""
-    if [[ "$safe_core_reported" != "${SAFE_VERSION}" ]]; then
-      printf 'safe audit: verdict engine version %s does not match safe %s — audit-infrastructure breakage, not a package finding; rerun install.sh\n' \
-        "${safe_core_reported:-unknown}" "${SAFE_VERSION}" >&2
-      rm -rf "$scratch"
-      return 30
-    fi
+  # Unconditional: safe-audit carries its own expected version, so every route
+  # that reaches it is pinned — the dispatcher, the gate, and direct invocation
+  # of the installed safe-audit executable alike.
+  safe_core_reported=$("$safe_core_bin" --version 2>/dev/null) || safe_core_reported=""
+  if [[ "$safe_core_reported" != "${SAFE_VERSION}" ]]; then
+    printf 'safe audit: verdict engine version %s does not match safe %s — audit-infrastructure breakage, not a package finding; rerun install.sh\n' \
+      "${safe_core_reported:-unknown}" "${SAFE_VERSION}" >&2
+    rm -rf "$scratch"
+    return 30
   fi
 
   verdict_json=$(printf '%s' "$evidence_json" | "$safe_core_bin" package-verdict 2>/dev/null) \

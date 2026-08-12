@@ -16,6 +16,7 @@
 package verdict
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -538,3 +539,77 @@ func (ev Evidence) Validate() error {
 
 // Affecting exposes the advisory list the decision reads.
 func (ev Evidence) Affecting() []Advisory { return ev.OSV.Affecting }
+
+// requiredEvidenceKeys is every key the evidence document must carry, with a
+// non-null value. `[]` marks an array whose every element is checked.
+//
+// This exists because encoding/json cannot distinguish "absent" from "zero".
+// DisallowUnknownFields rejects keys we do not expect; nothing rejects keys we
+// do expect and did not get. For a decision layer that reads adverse facts,
+// every such gap is the same bug: an omitted or null field decodes to the value
+// that means "nothing wrong here". A missing `malware` flag drops a MAL record
+// to an ordinary advisory; a null `socket_siblings` erases ranged-update
+// coverage; an absent `cooldown_days` disables the cooldown. None of those can
+// be caught after decoding, so the document is checked before it (delta F1).
+var requiredEvidenceKeys = []string{
+	"resolution.ok", "resolution.primary_version", "resolution.label",
+	"socket.status", "socket.available", "socket.class",
+	"socket_siblings",
+	"socket_siblings[].version", "socket_siblings[].status", "socket_siblings[].class",
+	"osv.status", "osv.affecting", "osv.total_count", "osv.remediated_count",
+	"osv.historical_critical", "osv.historical_malware_ids",
+	"osv.affecting[].id", "osv.affecting[].severity", "osv.affecting[].malware",
+	"release.rc", "release.age", "release.primary_age", "release.version",
+	"release.cooldown_days", "release.security_fix_ids", "release.cooldown_security_fix",
+	"custom_source",
+	"blocklist.readable", "blocklist.reason", "blocklist.path",
+	"block_severities",
+}
+
+// RequireShape rejects an evidence document with a missing or null field the
+// decision reads. Callers must treat a failure as infrastructure breakage: it
+// means the evidence could not be trusted, not that the package is suspect.
+func RequireShape(raw []byte) error {
+	var root any
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return fmt.Errorf("evidence is not JSON: %w", err)
+	}
+	for _, path := range requiredEvidenceKeys {
+		if err := requirePath(root, strings.Split(path, "."), path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func requirePath(node any, parts []string, full string) error {
+	if len(parts) == 0 {
+		return nil
+	}
+	key, isArray := strings.CutSuffix(parts[0], "[]")
+
+	obj, ok := node.(map[string]any)
+	if !ok {
+		return fmt.Errorf("evidence field %s: parent is not an object", full)
+	}
+	child, present := obj[key]
+	if !present {
+		return fmt.Errorf("evidence field %s is missing", full)
+	}
+	if child == nil {
+		return fmt.Errorf("evidence field %s is null", full)
+	}
+	if !isArray {
+		return requirePath(child, parts[1:], full)
+	}
+	items, ok := child.([]any)
+	if !ok {
+		return fmt.Errorf("evidence field %s is not an array", full)
+	}
+	for i, item := range items {
+		if err := requirePath(item, parts[1:], fmt.Sprintf("%s[%d]", full, i)); err != nil {
+			return err
+		}
+	}
+	return nil
+}

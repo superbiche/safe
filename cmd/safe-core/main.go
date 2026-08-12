@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -64,8 +65,21 @@ func packageVerdict(args []string, stdin io.Reader, stdout, stderr io.Writer) in
 		return 2
 	}
 
+	raw, err := io.ReadAll(stdin)
+	if err != nil {
+		fmt.Fprintf(stderr, "safe-core: package-verdict: read evidence: %v\n", err)
+		return 3
+	}
+	// Shape first, then decode: the decoder cannot tell an absent adverse fact
+	// from a benign zero, so the raw document is checked for every key the
+	// decision reads before any of it is turned into typed values.
+	if err := verdict.RequireShape(raw); err != nil {
+		fmt.Fprintf(stderr, "safe-core: package-verdict: incomplete evidence: %v\n", err)
+		return 3
+	}
+
 	var evidence verdict.Evidence
-	decoder := json.NewDecoder(stdin)
+	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&evidence); err != nil {
 		fmt.Fprintf(stderr, "safe-core: package-verdict: read evidence: %v\n", err)
