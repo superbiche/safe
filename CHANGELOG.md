@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- The verdict decision now lives in Go (`internal/verdict`, exposed as
+  `safe-core package-verdict`). `bin/safe-audit` still gathers all evidence —
+  version resolution, Socket scoring, OSV classification, release age,
+  registry trust, blocklist state — and advisory classification stays in bash
+  because it needs semver range matching. Only the decision moved, so there is
+  one implementation of the policy rather than a bash copy that drifts. No
+  verdict changes: the existing 338 golden cases pass unmodified.
+
+- `safe-core` is now required for every audit, not just `npm dedupe`/`prune`.
+  A missing or version-skewed `safe-core` refuses as audit-infrastructure
+  breakage with a "rerun install.sh" recovery path, never as a package
+  finding, and never as a verdict. `install.sh` already rebuilds and
+  reinstalls `safe-core` on every run, and `safe doctor` already reports skew.
+
 - `install.socket.mode=never` no longer produces a clean GO on its own. Since
   Socket became the only behavioral tier, a check that skips it has gathered
   no behavioral evidence, and declining to look does not make an artifact
