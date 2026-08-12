@@ -7599,15 +7599,17 @@ check_command() {
   fi
 
   local osv_evidence
+  # No affecting count is sent: the decision derives it from the list, so the
+  # two cannot disagree (review F1).
   osv_evidence=$(jq -cn --argjson combined "$combined" --arg status "$osv_status" \
-    --argjson aff "$aff_count" --argjson rem "$rem_count" --argjson total "$total_count" \
+    --argjson rem "$rem_count" --argjson total "$total_count" \
     --argjson hist_critical "$osv_hist_critical" --arg hist_malware "$osv_hist_malware" '
     {status: $status,
      affecting: [$combined.affecting[]?
                  | {id: ((.id // "") | tostring),
                     severity: ((.severity // "unknown") | tostring),
                     malware: ((.malware // false) == true)}],
-     affecting_count: $aff, remediated_count: $rem, total_count: $total,
+     remediated_count: $rem, total_count: $total,
      historical_critical: $hist_critical,
      historical_malware_ids: $hist_malware}') || osv_evidence=""
 

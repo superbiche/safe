@@ -126,10 +126,9 @@ func TestUnscorableSiblingIsNotAssumedClean(t *testing.T) {
 func TestMalwareSurvivesPartialOSVOutage(t *testing.T) {
 	ev := clean()
 	ev.OSV = OSV{
-		Status:         "error",
-		Affecting:      []Advisory{{ID: "MAL-2026-1", Severity: "unknown", Malware: true}},
-		AffectingCount: 1,
-		TotalCount:     1,
+		Status:     "error",
+		Affecting:  []Advisory{{ID: "MAL-2026-1", Severity: "unknown", Malware: true}},
+		TotalCount: 1,
 	}
 	got := Decide(ev)
 	if got.Verdict != BLOCK {
@@ -149,10 +148,9 @@ func TestMalwareIgnoresBlockSeverityPolicy(t *testing.T) {
 	ev := clean()
 	ev.BlockSeverities = []string{}
 	ev.OSV = OSV{
-		Status:         "ok",
-		Affecting:      []Advisory{{ID: "MAL-2026-1", Severity: "unknown", Malware: true}},
-		AffectingCount: 1,
-		TotalCount:     1,
+		Status:     "ok",
+		Affecting:  []Advisory{{ID: "MAL-2026-1", Severity: "unknown", Malware: true}},
+		TotalCount: 1,
 	}
 	if got := Decide(ev); got.Verdict != BLOCK {
 		t.Fatalf("verdict = %q, want BLOCK even with no block severities", got.Verdict)
@@ -167,8 +165,7 @@ func TestAffectingSummaryTruncatesLoudly(t *testing.T) {
 			{ID: "CVE-1", Severity: "high"}, {ID: "CVE-2", Severity: "high"},
 			{ID: "CVE-3", Severity: "high"}, {ID: "CVE-4", Severity: "high"},
 		},
-		AffectingCount: 4,
-		TotalCount:     9,
+		TotalCount: 9,
 	}
 	got := Decide(ev)
 	if !strings.Contains(got.Lines.OSV, "+1 more") {
@@ -262,7 +259,6 @@ func TestPendingScoreOnlySurvivesAnOtherwiseCleanCheck(t *testing.T) {
 		{"osv outage", func(e *Evidence) { e.OSV.Status = "error" }},
 		{"unresolved", func(e *Evidence) { e.Resolution.OK = false }},
 		{"affecting advisory", func(e *Evidence) {
-			e.OSV.AffectingCount = 1
 			e.OSV.Affecting = []Advisory{{ID: "CVE-1", Severity: "low"}}
 			e.OSV.TotalCount = 1
 		}},

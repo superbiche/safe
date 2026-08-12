@@ -76,10 +76,15 @@ type SocketSibling struct {
 }
 
 // OSV carries the already-classified advisory evidence.
+//
+// There is deliberately no affecting-count field: a count carried alongside the
+// list it counts can disagree with it, and a producer regression that zeroed it
+// would make the malware handling below unreachable while the list still held a
+// MAL record. The count is derived from the list instead, so the two cannot
+// drift apart (review F1).
 type OSV struct {
 	Status               string     `json:"status"`
 	Affecting            []Advisory `json:"affecting"`
-	AffectingCount       int        `json:"affecting_count"`
 	RemediatedCount      int        `json:"remediated_count"`
 	TotalCount           int        `json:"total_count"`
 	HistoricalCritical   bool       `json:"historical_critical"`
@@ -334,16 +339,17 @@ func osvStage(ev Evidence, d *decision, res *Result) {
 		return
 	}
 
+	affectingCount := len(o.Affecting)
 	switch {
-	case o.AffectingCount > 0:
-		summary := affectingSummary(o.Affecting, o.AffectingCount)
+	case affectingCount > 0:
+		summary := affectingSummary(o.Affecting, affectingCount)
 		res.Lines.OSV = fmt.Sprintf("WARN (%d of %d advisories affect %s: %s)",
-			o.AffectingCount, o.TotalCount, label, summary)
+			affectingCount, o.TotalCount, label, summary)
 		d.warn("osv_affecting")
 
 		if countBlocked(o.Affecting, ev.BlockSeverities) > 0 {
 			res.Lines.OSV = fmt.Sprintf("BLOCK (%d of %d advisories affect %s: %s)",
-				o.AffectingCount, o.TotalCount, label, summary)
+				affectingCount, o.TotalCount, label, summary)
 			d.bump(BLOCK)
 		}
 		// Malware records usually carry no CVSS, so the severity ladder ranks
@@ -445,7 +451,7 @@ func pendingStage(ev Evidence, d *decision, res *Result) {
 	clean := d.verdict == GO &&
 		ev.OSV.Status == "ok" &&
 		ev.Resolution.OK &&
-		ev.OSV.AffectingCount == 0 &&
+		len(ev.OSV.Affecting) == 0 &&
 		strings.HasPrefix(res.Lines.Block, "PASS")
 	if !clean {
 		d.warn("socket_score_pending")
@@ -496,3 +502,39 @@ func orDefault(v, fallback string) string {
 	}
 	return v
 }
+
+// Known Socket classifications. A status of "ok" means the tier reported, so
+// its class decides the verdict; anything outside this set is evidence we
+// cannot interpret.
+var socketClasses = []string{"malware", "unmapped", "critical_cve", "high", "low_score", "clean"}
+
+// Validate rejects evidence that cannot be interpreted, so the caller fails
+// closed instead of deciding on it.
+//
+// The decoder alone is not enough: encoding/json accepts a missing key and
+// accepts JSON null for a scalar, both of which yield the zero value. A null
+// or absent socket class would therefore read as the empty string and fall to
+// the clean branch — absence of evidence silently becoming a pass, which is the
+// one thing this package must never do (review F1).
+func (ev Evidence) Validate() error {
+	if ev.Socket.Status == "ok" && !slices.Contains(socketClasses, ev.Socket.Class) {
+		return fmt.Errorf("socket reported ok with unknown class %q", ev.Socket.Class)
+	}
+	for _, sib := range ev.SocketSiblings {
+		if sib.Version == "" {
+			return fmt.Errorf("socket sibling with no version")
+		}
+		if sib.Status == "ok" && !slices.Contains(socketClasses, sib.Class) {
+			return fmt.Errorf("socket sibling %s reported ok with unknown class %q", sib.Version, sib.Class)
+		}
+	}
+	for _, a := range ev.Affecting() {
+		if a.ID == "" {
+			return fmt.Errorf("affecting advisory with no id")
+		}
+	}
+	return nil
+}
+
+// Affecting exposes the advisory list the decision reads.
+func (ev Evidence) Affecting() []Advisory { return ev.OSV.Affecting }

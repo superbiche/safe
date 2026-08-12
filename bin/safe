@@ -2,6 +2,11 @@
 set -euo pipefail
 
 SAFE_VERSION="1.18.0"
+# Exported at the top level, not per-subcommand: safe-audit pins itself to
+# this version, and every route that reaches it — the gate, `safe audit ...`,
+# `safe install`, the safe-audit compatibility command — must carry it or the
+# pin silently does not apply (review F2).
+export SAFE_VERSION
 SAFE_SELF="$(readlink -f "$0")"
 SAFE_DIR="$(dirname "$SAFE_SELF")"
 SAFE_CONFIG_ROOT="${SAFE_CONFIG_DIR:-$HOME/.config/safe}"
@@ -1706,6 +1711,14 @@ safe_install_audit_package() {
       # "do not pin around it" (review PR#55 F2).
       safe_install_gate_log "$ecosystem" "$package" "REFUSED_BLOCK"
       refuse 104 "BLOCKED ${ecosystem} install of ${package} — safe audit verdict BLOCK; operator review required: safe audit check ${package} --ecosystem ${ecosystem} --json; details: safe explain"
+      ;;
+    30)
+      # The audit could not compute a verdict at all. That is breakage to
+      # repair, not a finding about the package, so the refusal names it and
+      # offers no allow hint: there is no evidence to allow around. Mirrors
+      # the wrapper gate's arm in lib/gate-lib.sh.
+      safe_install_gate_log "$ecosystem" "$package" "REFUSED_AUDIT_INFRA"
+      refuse 100 "BLOCKED ${ecosystem} install of ${package} — safe audit could not run (audit-infrastructure breakage, not a package finding); rerun install.sh or run safe doctor; details: safe explain"
       ;;
     124|137)
       if safe_install_known_matches "$package" "$ecosystem"; then

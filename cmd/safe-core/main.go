@@ -71,6 +71,10 @@ func packageVerdict(args []string, stdin io.Reader, stdout, stderr io.Writer) in
 		fmt.Fprintf(stderr, "safe-core: package-verdict: read evidence: %v\n", err)
 		return 3
 	}
+	if err := evidence.Validate(); err != nil {
+		fmt.Fprintf(stderr, "safe-core: package-verdict: unusable evidence: %v\n", err)
+		return 3
+	}
 
 	encoder := json.NewEncoder(stdout)
 	encoder.SetEscapeHTML(false)
