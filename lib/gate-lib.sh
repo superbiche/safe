@@ -888,6 +888,15 @@ safe_gate_composer_route() {
 
   if (( is_global == 0 )); then
     safe_gate_route composer "$@" || return $?
+    # safe_gate_route (via safe_gate_scan_target_flags) records --working-dir/-d
+    # for the space and =forms but not the glued -dvalue form; the routing loop
+    # above already captured every form in SAFE_GATE_COMPOSER_WORKING_DIR. Fill
+    # only that gap so the effective project dir — the scan target AND the
+    # --project-dir threaded to safe-audit — is complete, without disturbing the
+    # covered forms' recorded value.
+    if (( SAFE_GATE_COMPOSER_HAS_WORKING_DIR )) && [[ -z "${SAFE_GATE_PROJECT_DIR}" ]]; then
+      SAFE_GATE_PROJECT_DIR="${SAFE_GATE_COMPOSER_WORKING_DIR}"
+    fi
     SAFE_GATE_COMPOSER_SUBCMD="${SAFE_GATE_SUBCMD}"
     if canonical="$(safe_gate_composer_noncanonical_target "${SAFE_GATE_SUBCMD}")"; then
       safe_gate_composer_set_noncanonical_refusal "${SAFE_GATE_SUBCMD}" "${canonical}" 0
@@ -954,6 +963,54 @@ safe_gate_composer_scan_targets() {
     (( scan_rc == 0 )) || return "${scan_rc}"
   done
   return 0
+}
+
+# Non-global install-class scanning honors Composer's effective --working-dir/-d
+# the way the global lane honors its selected projects: routing recorded the
+# target in SAFE_GATE_PROJECT_DIR (every form — `-d value`, `-dvalue`,
+# `--working-dir[=]value`), so presence detection and the project scan run
+# THERE, not against the process cwd. With no working-dir the effective
+# directory is the cwd and every cd below is a no-op, keeping the ordinary
+# `composer install` path byte-for-byte unchanged.
+safe_gate_composer_effective_project_dir() {
+  local dir="${SAFE_GATE_PROJECT_DIR:-}"
+  if [[ -n "${dir}" ]]; then
+    safe_gate_composer_resolve_path "${dir}" "${PWD}"
+  else
+    printf '%s' "${PWD}"
+  fi
+}
+
+# Presence in the effective project dir. Exit 0 = a project to scan, OR an
+# existing-but-unenterable dir (so the scan step below fails closed instead of
+# silently skipping a target we could not read); exit 1 = nothing to scan (dir
+# absent, or readable with no composer.json/composer.lock).
+safe_gate_composer_project_present_effective() {
+  local dir present_rc
+  dir="$(safe_gate_composer_effective_project_dir)"
+  [[ -d "${dir}" ]] || return 1
+  ( cd "${dir}" 2>/dev/null || exit 2; safe_gate_composer_project_present )
+  present_rc=$?
+  (( present_rc == 2 )) && return 0
+  return "${present_rc}"
+}
+
+# Scan the effective project dir. A dir that exists but cannot be entered is
+# audit-infrastructure breakage, not a clean tree: refuse (exit 100) rather than
+# delegate unaudited, mirroring the global scan-targets guard.
+safe_gate_composer_scan_effective() {
+  local dir scan_rc
+  dir="$(safe_gate_composer_effective_project_dir)"
+  (
+    cd "${dir}" 2>/dev/null || exit 125
+    safe_gate_scan_project
+  )
+  scan_rc=$?
+  if (( scan_rc == 125 )); then
+    safe_gate_err "safe: BLOCKED composer — cannot enter the --working-dir project for audit; repair its directory permissions, then retry; details: safe explain"
+    return 100
+  fi
+  return "${scan_rc}"
 }
 
 # Update-family subcommands resolve in-range instead of to the dist-tag; the
@@ -3529,7 +3586,7 @@ safe_gate_composer() {
     if (( cp_rc != 0 )); then
       # No root positional: install-class if a project exists (scan it), else
       # fail closed. Global has no cwd project to install into.
-      if (( SAFE_GATE_COMPOSER_IS_GLOBAL == 0 )) && safe_gate_composer_project_present; then
+      if (( SAFE_GATE_COMPOSER_IS_GLOBAL == 0 )) && safe_gate_composer_project_present_effective; then
         composer_create_project_scan=1
       elif (( ${#packages[@]} )); then
         safe_gate_err "safe: BLOCKED composer create-project --require — no Composer project here to install into; to allow: run it inside a project, or name the <vendor/package> to create from; details: safe explain"
@@ -3563,14 +3620,14 @@ safe_gate_composer() {
     # install-class form scans the current project AND audits any --require
     # additions — both, not either.
     if (( composer_create_project_scan )); then
-      safe_gate_scan_project || return $?
+      safe_gate_composer_scan_effective || return $?
     fi
     if (( ${#packages[@]} )); then
       safe_gate_check_many composer "${packages[@]}" || return $?
     fi
   elif [[ -n "${SAFE_GATE_COMPOSER_CLASS}" ]]; then
-    if safe_gate_composer_project_present; then
-      safe_gate_scan_project || return $?
+    if safe_gate_composer_project_present_effective; then
+      safe_gate_composer_scan_effective || return $?
     fi
 
     if [[ "${SAFE_GATE_COMPOSER_CLASS}" == "require" ]]; then

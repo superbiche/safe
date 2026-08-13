@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **Non-global Composer installs honor `--working-dir`/`-d` when scanning.** A
+  non-global `composer install`/`update`/`require`/`reinstall` — and a
+  package-less `create-project` — run with an effective working directory
+  (`-d <dir>`, `-d<dir>`, `--working-dir <dir>`, `--working-dir=<dir>`, at either
+  argument position) now runs its project presence check and dependency scan in
+  THAT directory rather than the process cwd. Previously the scan targeted the
+  caller's cwd, so `composer install -d /path/project` from an unrelated
+  directory skipped the project scan (or audited the wrong tree) before
+  delegating. An existing working directory that cannot be entered now refuses
+  (exit 100) instead of delegating unaudited; a nonexistent one has nothing to
+  scan and delegates (Composer rejects it). The effective directory is also
+  threaded to safe-audit as `--project-dir`, closing the same gap for the glued
+  `-d<dir>` form. The leading glued form (`composer -d<dir> install`) stays
+  fail-closed as before.
+
 - **Composer `reinstall` and `create-project` are now gated.** Both fetch remote
   artifacts but were recognized-but-passthrough. `reinstall` re-fetches the
   locked tree, so it is audited as an install-class project scan (covering both
