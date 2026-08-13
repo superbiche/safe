@@ -14,6 +14,13 @@
   lockfile paths containing "fail"/"error". Only a scanner that returned
   nothing usable refuses.
 
+  As part of the same move, `syft_status` now distinguishes its own markers: a
+  `syft failed` (the executable ran and exited nonzero, leaving an empty SBOM
+  that grype then scans) statuses `error` and refuses, while `syft unavailable`
+  (absent) stays a disclosed skip. Collapsing both to `skipped` — harmless
+  while the note-regex still caught "failed" — would otherwise have let a real
+  syft execution failure pass under `--yes` once the regex was gone.
+
 - **Removed a latent typosquat vector: the sandboxed audit "preflight."**
   `safe run` built an audit command as `npx --yes safe-audit package-audit …`
   inside a Podman sandbox — an unpinned fetch of a public npm package named

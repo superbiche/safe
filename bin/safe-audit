@@ -2994,7 +2994,15 @@ build_scan_result_from_artifacts() {
         | select((.name // "") == "safe-audit")
         | (.note // empty)
       ][0] // "") as $note |
-      if ($note | test("unavailable|failed"; "i")) then
+      # A syft that RAN and failed left the "syft failed" marker: its SBOM is
+      # empty, so grype then scans nothing — that is breakage (status "error",
+      # refused), not a skipped tier. Only "syft unavailable" (absent) is a
+      # skip. Distinguishing them is load-bearing: the install gate refuses on
+      # "error" but discloses+WARNs a skip, so collapsing both to "skipped" let
+      # a real syft failure pass under --yes.
+      if ($note | test("failed"; "i")) then
+        {status:"error", note:$note}
+      elif ($note | test("unavailable"; "i")) then
         {status:"skipped", note:$note}
       else
         {status:"ok", note:(if $note == "" then null else $note end)}
