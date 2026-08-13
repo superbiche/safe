@@ -918,6 +918,31 @@ case_doctor_mise_shim_repair_is_actionable() {
     fail "$FUNCNAME (still emits the old unactionable advice)"
     return
   fi
+  # Shell-safety: SAFE_BIN_DIR is operator-settable, so the interpolated bin root
+  # must be shell-escaped (jq @sh). A hostile path must not inject into the
+  # operator-pasted repair command (review F1, MAJOR).
+  local evil="${HOME_DIR}/x\"; touch ${HOME_DIR}/PWNED; echo x"
+  local evilmise="${HOME_DIR}/evil-mise"
+  mkdir -p "${evil}" "${evilmise}/shims"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# safe-gate-wrapper v1 tool=mise\n'
+    printf 'exit 0\n'
+  } > "${evil}/mise"
+  chmod +x "${evil}/mise"
+  ln -sf "${evil}/mise" "${evilmise}/shims/node"
+  local evil_repair
+  evil_repair="$(env HOME="${HOME_DIR}" SAFE_BIN_DIR="${evil}" MISE_DATA_DIR="${evilmise}" \
+    PATH="${evil}:/usr/bin:/bin" bash "${ROOT_DIR}/bin/safe" doctor 2>/dev/null \
+    | sed -n 's/^  repair: //p')"
+  [[ -n "${evil_repair}" ]] || { fail "$FUNCNAME (no repair line for hostile bin root)"; return; }
+  rm -f "${HOME_DIR}/PWNED"
+  ( eval "${evil_repair}" ) >/dev/null 2>&1 || true
+  if [[ -e "${HOME_DIR}/PWNED" ]]; then
+    printf 'injectable repair: %s\n' "${evil_repair}" >&2
+    fail "$FUNCNAME (repair command is shell-injectable for a hostile bin root)"
+    return
+  fi
   pass "$FUNCNAME"
 }
 
