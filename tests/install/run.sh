@@ -1737,6 +1737,15 @@ case_composer_reinstall_create_project() {
   assert_log_not_contains_fragment $'\ttargetdir@' "$FUNCNAME" || return
   assert_log_contains $'REAL\tcomposer\tcreate-project\tvendor/okpkg:^1\ttargetdir\t1.2.3' "$FUNCNAME" || return
 
+  # Composer keeps the fused selector when the [version] positional is PHP-falsy
+  # ("" or "0"), so a literal 0 must NOT override the fused constraint — safe
+  # audits what Composer actually resolves.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer create-project vendor/okpkg:^1 dir 0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'\tvendor/okpkg@0\t' "$FUNCNAME" || return
+
   # --stability/-s selects a candidate safe-audit cannot model (no stability
   # input; a range resolves silently), so create-project fails closed with a
   # pin hint rather than auditing a default-stability guess. Space and =forms,
@@ -1794,6 +1803,20 @@ case_composer_reinstall_create_project() {
   assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tpackage-audit\textra/one@^2\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tpackage-audit\textra/two@^3\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # A --require BEFORE the subcommand (Composer's lazy binding accepts the
+  # leading equals form and fetches it) would slip past the extractor, so it
+  # fails closed; the canonical trailing form above still audits.
+  for args in '--require=evil/pkg:^2 create-project vendor/okpkg:^1' \
+    '--require=evil/pkg:^2 create-project'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer ${args}" run_zsh
+    assert_status 100 "$FUNCNAME" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+    assert_err_contains_fragment 'require before the subcommand' "$FUNCNAME" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+  done
 
   # create-project with NO root but a --require addition is install-class:
   # Composer installs the current project and adds the requirement, so safe

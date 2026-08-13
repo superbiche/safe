@@ -2313,7 +2313,12 @@ safe_gate_composer_create_project_spec() {
   else
     name="${spec}"; version="latest"
   fi
-  [[ -n "${positional_version}" ]] && version="${positional_version}"
+  # Composer overrides the fused selector with the [version] positional only
+  # when that positional is PHP-truthy: `if (!$packageVersion …)` in
+  # CreateProjectCommand treats "" and "0" as absent and keeps the fused
+  # selector. Mirror that single exception so the audited selector matches the
+  # one Composer resolves.
+  [[ -n "${positional_version}" && "${positional_version}" != "0" ]] && version="${positional_version}"
   safe_gate_print_spec "${name}" "${version}"
 }
 
@@ -2354,6 +2359,25 @@ safe_gate_composer_has_stability_flag() {
     case "${arg}" in
       --) return 1 ;;
       -s|-s?*|--stability|--stability=*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# --require has the same lazy-binding exposure as --stability: Composer accepts
+# a leading equals-form `composer --require=vendor/pkg create-project …` and
+# fetches that package, but the subcommand locator strips it before the
+# extractor, leaving the addition unaudited. --require belongs after the
+# subcommand (canonical), so a leading one refuses. Callers pass only the args
+# BEFORE the subcommand so a legitimate trailing --require (audited by the
+# extractor) is untouched. Space-form leading --require is not an application
+# option and already fails closed in the locator.
+safe_gate_composer_has_leading_require() {
+  local arg
+  for arg in "$@"; do
+    case "${arg}" in
+      --) return 1 ;;
+      --require|--require=*) return 0 ;;
     esac
   done
   return 1
@@ -3478,6 +3502,15 @@ safe_gate_composer() {
     # (the extractor only sees post-subcommand args). Both paths refuse.
     if safe_gate_composer_has_stability_flag "$@"; then
       safe_gate_err "safe: BLOCKED composer create-project — --stability/-s makes Composer's fetched candidate unpredictable, so safe cannot audit the exact package; to allow: pin the version (composer create-project <vendor/package>:<version> …) and drop --stability; details: safe explain"
+      return 100
+    fi
+    # A --require BEFORE the subcommand (leading equals form) is fetched by
+    # Composer but stripped before the extractor. Only the leading slice is
+    # checked, so a canonical trailing --require still audits normally.
+    local cp_lead_count=$(( SAFE_GATE_SUBCMD_IDX > 0 ? SAFE_GATE_SUBCMD_IDX - 1 : 0 ))
+    if (( SAFE_GATE_COMPOSER_IS_GLOBAL == 0 )) && (( cp_lead_count > 0 )) \
+        && safe_gate_composer_has_leading_require "${@:1:cp_lead_count}"; then
+      safe_gate_err "safe: BLOCKED composer create-project — a --require before the subcommand hides the added package from audit; to allow: put --require after create-project; details: safe explain"
       return 100
     fi
     cp_out="$(safe_gate_composer_create_project_packages "${SAFE_GATE_COMPOSER_PACKAGE_ARGS[@]}")"

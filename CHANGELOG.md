@@ -15,7 +15,10 @@
   candidate selector safe-audit cannot model) and ambiguous multi-character
   short-option bundles (e.g. `-nd`, which Symfony parses as `-n` plus a
   `-d<dir>` that shifts the package boundary) both refuse with a pin/unbundle
-  hint rather than audit a guess. Value-taking flags (`--repository`,
+  hint rather than audit a guess. Because Composer binds command options lazily,
+  a `--stability` or `--require` placed *before* the subcommand
+  (`composer --require=… create-project …`) is caught too — it refuses rather
+  than fetch unaudited. Value-taking flags (`--repository`,
   `--repository-url`, `--working-dir`, …) can no longer be mistaken for the
   package, and `--repository-url` reaches the audit as the custom source.
   Abbreviations of both commands (`composer creat`, `composer reins`) now refuse
