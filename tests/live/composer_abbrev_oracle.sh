@@ -47,6 +47,24 @@ for token in u up Update; do
   fi
 done
 
+# reinstall and create-project are gated, so their abbreviations must refuse in
+# the gate. These probes prove the real Composer resolves those prefixes to the
+# gated command — the empirical anchor for the noncanonical-refusal entries.
+if probe_composer creat --help > "$WORK/creat" 2>&1 \
+  && grep -Fq 'Creates new project from a package' "$WORK/creat"; then
+  pass 'composer creat --help resolves to create-project'
+else
+  fail 'composer creat --help did not resolve to create-project'
+fi
+for token in reins reinst; do
+  if probe_composer "$token" --help > "$WORK/$token" 2>&1 \
+    && grep -Eq '^[[:space:]]*reinstall[[:space:]]' "$WORK/$token"; then
+    pass "composer $token --help resolves to reinstall"
+  else
+    fail "composer $token --help did not resolve to reinstall"
+  fi
+done
+
 # `global` is a proxy command and Symfony accepts every unique prefix. Asking
 # for its own help proves dispatch without entering the global project or
 # touching a registry.

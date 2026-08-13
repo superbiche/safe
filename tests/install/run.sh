@@ -1609,7 +1609,8 @@ case_composer_canonical_or_refuse() {
 
   # Composer accepts these aliases and abbreviations itself. Safe refuses
   # every gated-looking one before any scan, package audit, or delegation.
-  for token in i u upgrade r in ins up upg upgr upgra upgrad re req requ g gl glo glob globa; do
+  for token in i u upgrade r in ins up upg upgr upgra upgrad re req requ g gl glo glob globa \
+    rei rein reins reinst reinsta reinstal creat crea create create-p create-projec; do
     : > "${LOG_FILE}"
     SAFE_INSTALL_TEST_SCRIPT="composer ${token} vendor/okpkg:^1" run_zsh
     assert_status 100 "$FUNCNAME" || return
@@ -1647,7 +1648,9 @@ case_composer_canonical_or_refuse() {
   done
 
   # Non-gated command prefixes keep their pre-existing passthrough behavior.
-  for token in rei rem; do
+  # `rem` (remove) fetches nothing; only prefixes that resolve to a gated
+  # command refuse.
+  for token in rem; do
     : > "${LOG_FILE}"
     SAFE_INSTALL_TEST_SCRIPT="composer ${token} vendor/blockme" run_zsh
     assert_status 0 "$FUNCNAME" || return
@@ -1698,6 +1701,168 @@ case_composer_canonical_or_refuse() {
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_contains $'REAL\tcomposer\trequire\t--\tvendor/okpkg:^1' "$FUNCNAME" || return
+
+  pass "$FUNCNAME"
+}
+
+case_composer_reinstall_create_project() {
+  prepare_case "composer-reinstall-create-project"
+
+  # reinstall re-fetches the locked tree, so it audits as an install-class
+  # project scan and never treats a targeted package as a new install.
+  touch "${WORK_DIR}/composer.json"
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer reinstall' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'package-audit' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\treinstall' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer reinstall vendor/blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'package-audit' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\treinstall\tvendor/blockme' "$FUNCNAME" || return
+
+  # create-project audits ONLY the first positional as a package, and Composer's
+  # explicit [version] positional OVERRIDES a version fused into the name
+  # (Composer gives the positional precedence). The directory positional is
+  # never audited.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer create-project vendor/okpkg:^1 targetdir 1.2.3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@1.2.3\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'\tvendor/okpkg@^1\t' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'\ttargetdir@' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\tcreate-project\tvendor/okpkg:^1\ttargetdir\t1.2.3' "$FUNCNAME" || return
+
+  # Composer keeps the fused selector when the [version] positional is PHP-falsy
+  # ("" or "0"), so a literal 0 must NOT override the fused constraint — safe
+  # audits what Composer actually resolves.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer create-project vendor/okpkg:^1 dir 0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'\tvendor/okpkg@0\t' "$FUNCNAME" || return
+
+  # --stability/-s selects a candidate safe-audit cannot model (no stability
+  # input; a range resolves silently), so create-project fails closed with a
+  # pin hint rather than auditing a default-stability guess. Space and =forms,
+  # and the LEADING form (Composer binds --stability before the subcommand too:
+  # `composer --stability=dev create-project …`), which the subcommand locator
+  # would otherwise strip before the extractor.
+  for args in 'create-project -s dev vendor/okpkg:^1 dir' \
+    'create-project --stability=dev vendor/okpkg' \
+    'create-project vendor/okpkg:1.2.3 -s stable' \
+    '--stability=dev create-project vendor/okpkg'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer ${args}" run_zsh
+    assert_status 100 "$FUNCNAME" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+    assert_err_contains_fragment 'stability/-s makes Composer' "$FUNCNAME" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+  done
+
+  # The space-form leading --stability is an unrecognized application option, so
+  # the subcommand locator fails closed before routing — still no fetch.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer --stability dev create-project vendor/okpkg' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+
+  # An ambiguous multi-character short bundle (Symfony parses -nd as -n plus
+  # -d<dir>, shifting the package boundary) fails closed rather than audit the
+  # wrong token as the package.
+  for args in 'create-project -nd vendor/allowed vendor/blockme' \
+    'create-project -ns dev vendor/blockme'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer ${args}" run_zsh
+    assert_status 100 "$FUNCNAME" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+    assert_err_contains_fragment 'bundled short option' "$FUNCNAME" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+  done
+
+  # A value flag in a form safe DOES model must not be mistaken for the package.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer create-project --prefer-install dist vendor/okpkg:^1 dir' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'\tdist@' "$FUNCNAME" || return
+
+  # --require names additional fetched packages, so they are audited on top of
+  # the root package. The equals and space forms both count. A named root
+  # creates a NEW project, so the cwd is not scanned.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer create-project vendor/okpkg:^1 --require extra/one:^2 --require=extra/two:^3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\textra/one@^2\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\textra/two@^3\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # A --require BEFORE the subcommand (Composer's lazy binding accepts the
+  # leading equals form and fetches it) would slip past the extractor, so it
+  # fails closed; the canonical trailing form above still audits.
+  for args in '--require=evil/pkg:^2 create-project vendor/okpkg:^1' \
+    '--require=evil/pkg:^2 create-project'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer ${args}" run_zsh
+    assert_status 100 "$FUNCNAME" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+    assert_err_contains_fragment 'require before the subcommand' "$FUNCNAME" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+  done
+
+  # create-project with NO root but a --require addition is install-class:
+  # Composer installs the current project and adds the requirement, so safe
+  # scans the project AND audits the added package (both).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer create-project --require vendor/okpkg:^2' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@^2\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # --repository-url is a live (deprecated) source selector Composer uses for
+  # root-package selection, so it must reach the audit as the custom source.
+  for form in '--repository-url https://alt.example' '--repository-url=https://alt.example'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer create-project ${form} vendor/okpkg:^1 dir" run_zsh
+    assert_status 0 "$FUNCNAME" || return
+    assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall\t--registry\thttps://alt.example' "$FUNCNAME" || return
+  done
+
+  # A create-project package resolving to a blocked advisory refuses before any
+  # delegation — the audit boundary really gates the fetch. A package-audit
+  # BLOCK verdict exits 104 (distinct from the 100 policy refusals above).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer create-project vendor/blockme dir' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+
+  # A bare create-project inside a project directory installs the current
+  # project (install-class): it scans and delegates without auditing a package.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer create-project' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'package-audit' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\tcreate-project' "$FUNCNAME" || return
+
+  # With no package AND no project there is nothing to audit before the
+  # interactive fetch — fail closed with a single stderr line.
+  rm -f "${WORK_DIR}/composer.json" "${WORK_DIR}/composer.lock"
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer create-project' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+  assert_err_contains_fragment 'name the <vendor/package> to create from' "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
 
   pass "$FUNCNAME"
 }
@@ -5171,6 +5336,7 @@ main() {
     case_npm_camelcase_dispatch_and_conservative_ambiguity \
     case_non_npm_abbreviations_stay_passthrough \
     case_composer_canonical_or_refuse \
+    case_composer_reinstall_create_project \
     case_composer_global_canonical_routing \
     case_npm_dedupe_lockdiff_empty_delegates_without_scan \
     case_npm_lockdiff_absent_node_modules_refuses \
