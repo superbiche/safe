@@ -18,6 +18,13 @@ require jq
 bash -n "$SAFE_RUN"
 pass "bash syntax"
 
+# Regression: the sandboxed audit preflight fetched an unpinned npm package
+# named `safe-audit` (npx --yes) that this repo never published — a latent
+# typosquat vector. It was removed; guard against its return.
+! grep -qE 'npx .*package-audit' "$SAFE_RUN" || fail "container npx safe-audit fetch reintroduced"
+! grep -q 'safe_audit_check_spec\|safe_audit_check_unknown' "$SAFE_RUN" || fail "container audit preflight function reintroduced"
+pass "no unpinned npx safe-audit preflight in bin/safe-run"
+
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -55,41 +62,24 @@ run_fixture() {
     bash -c "$script" safe-run
 }
 
-run_fixture WARN '
+# A sandbox-known package runs straight in the sandbox — no audit preflight
+# (the preflight never worked live and was removed). No podman is invoked for
+# a preflight; the sandbox's own sbom audit still lands.
+run_fixture SANDBOXKNOWN '
   set -- version
   source "$SAFE_RUN_PATH" >/dev/null
   ensure_dirs
   RUNNER_KIND=npm
-  PKG_NAME=warnpkg
+  PKG_NAME=knownpkg
   PKG_VERSION=1.0.0
   PKG_VERSION_USER_SPECIFIED=1
-  mark_sandbox_known warnpkg 1.0.0
+  mark_sandbox_known knownpkg 1.0.0
   run_sandbox() { SANDBOX_AUDIT_EXTRA="sbom_vulns=0"; return 0; }
   dispatch_run
 '
-grep -q 'package-audit warnpkg@1.0.0 --ecosystem npm --json' "$tmp/audit-calls-WARN.log" || fail "safe audit package-audit did not run before sandbox"
-grep -q 'SANDBOX.*OK.*sbom_vulns=0' "$tmp/data-WARN/audit.log" || fail "sandbox audit omitted sbom_vulns"
-pass "WARN continues to sandbox with sbom audit"
-
-set +e
-run_fixture BLOCK '
-  set -- version
-  source "$SAFE_RUN_PATH" >/dev/null
-  ensure_dirs
-  RUNNER_KIND=npm
-  PKG_NAME=blockpkg
-  PKG_VERSION=1.0.0
-  PKG_VERSION_USER_SPECIFIED=1
-  mark_sandbox_known blockpkg 1.0.0
-  run_sandbox() { printf called > "$SAFE_RUN_DATA_DIR/sandbox-called"; return 0; }
-  dispatch_run
-'
-rc=$?
-set -e
-[[ "$rc" -eq 104 ]] || fail "BLOCK did not exit 104"
-[[ ! -e "$tmp/data-BLOCK/sandbox-called" ]] || fail "BLOCK executed sandbox"
-grep -q 'SAFE_AUDIT_BLOCK' "$tmp/data-BLOCK/audit.log" || fail "BLOCK audit entry missing"
-pass "BLOCK exits before sandbox"
+[[ ! -s "$tmp/audit-calls-SANDBOXKNOWN.log" ]] || fail "a preflight invoked podman before the sandbox"
+grep -q 'SANDBOX.*OK.*sbom_vulns=0' "$tmp/data-SANDBOXKNOWN/audit.log" || fail "sandbox audit omitted sbom_vulns"
+pass "sandbox-known package runs in sandbox with sbom audit, no preflight"
 
 run_fixture GO '
   set -- version
@@ -132,23 +122,25 @@ SAFE_RUN_PATH="$SAFE_RUN" \
   ' safe-run || fail "host-allow update @latest mutated allowlist"
 pass "host-allow update rejects latest before mutation"
 
-SAFE_RUN_CONFIG_DIR="$tmp/config-add-go-no-reason" \
-SAFE_RUN_DATA_DIR="$tmp/data-add-go-no-reason" \
-SAFE_AUDIT_VERDICT=GO \
-SAFE_AUDIT_CALL_LOG="$tmp/audit-calls-add-go-no-reason.log" \
+SAFE_RUN_CONFIG_DIR="$tmp/config-add-no-reason" \
+SAFE_RUN_DATA_DIR="$tmp/data-add-no-reason" \
 SAFE_RUN_PATH="$SAFE_RUN" \
-PATH="$mockbin:$PATH" \
+ERR_FILE="$tmp/add-no-reason.err" \
   bash -c '
     set -- version
     source "$SAFE_RUN_PATH" >/dev/null
     ensure_dirs
     registry_integrity_npm() { printf "sha512-fixture"; }
     require_operator_tty() { :; }
-    cmd_host_allow_add hostpkg@2.0.0 >/dev/null 2>&1
-    [[ "$(jq -r ".packages.hostpkg.version" "$HOST_ALLOW_FILE")" == "2.0.0" ]]
-    [[ "$(jq -r ".packages.hostpkg.reason" "$HOST_ALLOW_FILE")" == "" ]]
-  ' safe-run || fail "host-allow add GO required a reason"
-pass "host-allow add accepts safe audit GO without reason"
+    set +e
+    ( cmd_host_allow_add hostpkg@2.0.0 ) >/dev/null 2>"$ERR_FILE"
+    rc=$?
+    set -e
+    [[ "$rc" -ne 0 ]]
+    grep -q "reason is required" "$ERR_FILE"
+    [[ "$(jq -r ".packages | length" "$HOST_ALLOW_FILE")" == "0" ]]
+  ' safe-run || fail "host-allow add without --reason was not refused"
+pass "host-allow add requires --reason (audit-gated skip removed)"
 
 SAFE_RUN_CONFIG_DIR="$tmp/config-add-reason-equals" \
 SAFE_RUN_DATA_DIR="$tmp/data-add-reason-equals" \
@@ -210,12 +202,9 @@ grep -q "BLOCKED: invalid package name" "$invalid_name_err" || fail "invalid pac
 grep -q "safe explain" "$invalid_name_err" || fail "invalid package name refusal missing safe explain pointer"
 pass "invalid package name refuses with BLOCKED contract and exit 103"
 
-SAFE_RUN_CONFIG_DIR="$tmp/config-update-go-no-reason" \
-SAFE_RUN_DATA_DIR="$tmp/data-update-go-no-reason" \
-SAFE_AUDIT_VERDICT=GO \
-SAFE_AUDIT_CALL_LOG="$tmp/audit-calls-update-go-no-reason.log" \
+SAFE_RUN_CONFIG_DIR="$tmp/config-update-no-reason" \
+SAFE_RUN_DATA_DIR="$tmp/data-update-no-reason" \
 SAFE_RUN_PATH="$SAFE_RUN" \
-PATH="$mockbin:$PATH" \
   bash -c '
     set -- version
     source "$SAFE_RUN_PATH" >/dev/null
@@ -225,34 +214,32 @@ PATH="$mockbin:$PATH" \
     jq --arg p hostpkg --arg v 2.0.0 ".packages[\$p] = {version:\$v, reason:\"old exception\", ecosystem:\"npm\"}" "$HOST_ALLOW_FILE" > "$tmpfile"
     mv "$tmpfile" "$HOST_ALLOW_FILE"
     require_operator_tty() { :; }
-    cmd_host_allow_update hostpkg@2.1.0 >/dev/null 2>&1
-    [[ "$(jq -r ".packages.hostpkg.version" "$HOST_ALLOW_FILE")" == "2.1.0" ]]
-    [[ "$(jq -r ".packages.hostpkg.reason" "$HOST_ALLOW_FILE")" == "" ]]
-  ' safe-run || fail "host-allow update GO required or preserved a reason"
-pass "host-allow update accepts safe audit GO without reason"
-
-SAFE_RUN_CONFIG_DIR="$tmp/config-update-block" \
-SAFE_RUN_DATA_DIR="$tmp/data-update-block" \
-SAFE_AUDIT_VERDICT=BLOCK \
-SAFE_AUDIT_CALL_LOG="$tmp/audit-calls-update-block.log" \
-SAFE_RUN_PATH="$SAFE_RUN" \
-PATH="$mockbin:$PATH" \
-  bash -c '
-    set -- version
-    source "$SAFE_RUN_PATH" >/dev/null
-    ensure_dirs
-    tmpfile=$(mktemp)
-    jq --arg p hostpkg --arg v 2.0.0 ".packages[\$p] = {version:\$v, reason:\"fixture\", ecosystem:\"npm\"}" "$HOST_ALLOW_FILE" > "$tmpfile"
-    mv "$tmpfile" "$HOST_ALLOW_FILE"
     set +e
-    require_operator_tty() { :; }
     ( cmd_host_allow_update hostpkg@2.1.0 ) >/dev/null 2>&1
     rc=$?
     set -e
     [[ "$rc" -ne 0 ]]
     [[ "$(jq -r ".packages.hostpkg.version" "$HOST_ALLOW_FILE")" == "2.0.0" ]]
-  ' safe-run || fail "host-allow update safe audit BLOCK mutated allowlist"
-pass "host-allow update audits before mutation"
+  ' safe-run || fail "host-allow update without --reason was not refused"
+pass "host-allow update requires --reason (audit-gated skip removed)"
+
+SAFE_RUN_CONFIG_DIR="$tmp/config-update-reason" \
+SAFE_RUN_DATA_DIR="$tmp/data-update-reason" \
+SAFE_RUN_PATH="$SAFE_RUN" \
+  bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    ensure_dirs
+    registry_integrity_npm() { printf "sha512-fixture"; }
+    tmpfile=$(mktemp)
+    jq --arg p hostpkg --arg v 2.0.0 ".packages[\$p] = {version:\$v, reason:\"old\", ecosystem:\"npm\"}" "$HOST_ALLOW_FILE" > "$tmpfile"
+    mv "$tmpfile" "$HOST_ALLOW_FILE"
+    require_operator_tty() { :; }
+    cmd_host_allow_update hostpkg@2.1.0 --reason "bump for fix" >/dev/null 2>&1
+    [[ "$(jq -r ".packages.hostpkg.version" "$HOST_ALLOW_FILE")" == "2.1.0" ]]
+    [[ "$(jq -r ".packages.hostpkg.reason" "$HOST_ALLOW_FILE")" == "bump for fix" ]]
+  ' safe-run || fail "host-allow update with --reason failed"
+pass "host-allow update with --reason bumps version"
 
 podman_log="$tmp/podman.log"
 cat > "$mockbin/podman" <<'SH'
@@ -348,8 +335,8 @@ set -e
 pass "secret-like files block non-tty sandbox unless allowed"
 
 help_output="$("$SAFE_RUN" --help)"
-grep -q 'safe audit' <<<"$help_output" || fail "help omits safe audit integration"
-pass "help documents safe audit integration"
+grep -q 'sandbox-known' <<<"$help_output" || fail "help omits the sandbox decision tiers"
+pass "help documents the decision tiers"
 
 # ---------------------------------------------------------------------------
 # npx-native flag handling and local-bin passthrough (hermes false positive)
@@ -430,7 +417,7 @@ set -e
 grep -q 'not supported through safe run' "$tmp/package-flag.err" || fail "--package refusal not legible"
 pass "npm exec selector flags (--package) refuse with exit 100"
 
-# A versioned spec never uses the local bin: it stays in the audit pipeline
+# A versioned spec never uses the local bin: it takes the package-policy path
 # (here: unknown + non-TTY => exit 102) and the local stub must not run.
 set +e
 (
@@ -444,7 +431,7 @@ rc=$?
 set -e
 [[ "$rc" -eq 102 ]] || fail "versioned spec with local bin expected rc=102, got $rc"
 [[ ! -e "$tmp/local-bin-versioned-call.log" ]] || fail "versioned spec executed the local bin"
-pass "versioned spec bypasses local bin and stays in the audit pipeline"
+pass "versioned spec bypasses local bin and takes the package-policy path"
 
 # Blocklist beats the local bin.
 mkdir -p "$tmp/config-blocked-local"

@@ -24,7 +24,7 @@ or `safe-audit`.
 
 - blocklist entries are refused;
 - host allowlist entries run on the host with script execution suppressed where supported;
-- unknown packages are checked through `safe audit` when possible;
+- unknown packages are sandboxed in Podman (after an interactive prompt);
 - sandbox-known packages run in Podman without another prompt;
 - unknown non-TTY execution blocks unless explicitly allowed by flags.
 

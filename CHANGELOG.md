@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Removed a latent typosquat vector: the sandboxed audit "preflight."**
+  `safe run` built an audit command as `npx --yes safe-audit package-audit …`
+  inside a Podman sandbox — an unpinned fetch of a public npm package named
+  `safe-audit` that this repo has never published (the name is 404 on the
+  registry). On every real machine the fetch failed, the preflight returned
+  "inconclusive," and execution continued — so the check never produced a
+  verdict. But had anyone registered that name, `safe` would have run their
+  code (inside the confinement) *and* let it author a gate verdict. The whole
+  preflight path is removed; the sandbox's own confinement is unchanged.
+
+- **`host-allow add`/`update` and `scripts-allow add` now always require
+  `--reason`.** That requirement previously lived only in the preflight's
+  always-taken "inconclusive" branch, so removing the preflight would have
+  silently dropped it. A trust escalation carrying an operator reason is the
+  audit trail for bypassing the sandbox default; it is now unconditional,
+  matching `block add`. (The audit-gated affordance where a clean verdict let
+  you skip the reason only ever worked against a mocked audit; restoring it
+  the honest way — auditing on the host — is tracked for a follow-up.)
+
 - **Fixed — a Go repo lost its entire OSV tier, silently.** Discovery handed
   osv-scanner `go.sum`, which its Go extractor has never read (it reads
   `go.mod`). osv-scanner treats a file it cannot extract as fatal for the
