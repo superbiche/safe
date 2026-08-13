@@ -1960,6 +1960,30 @@ osv_scannable_lockfiles() {
   done
 }
 
+# A consumer-facing note must never carry a path. `bin/safe`'s install gate
+# decides "scanner broken" — exit 100, which not even --yes may accept — from a
+# free-form regex over this note, so a project living under `error-pages/` or
+# `failover/` turned a coverage gap into a hard refusal. Labels come from the
+# fixed vocabulary of lockfile NAMES; the paths stay in the warn line and the
+# verbose log, where nothing decides policy from them.
+osv_uncovered_labels() {
+  local lf out=""
+  local -a labels=()
+  local -A seen=()
+  for lf in "$@"; do
+    [[ -n "$lf" ]] || continue
+    lf=$(basename "$lf")
+    [[ -z "${seen[$lf]:-}" ]] || continue
+    seen["$lf"]=1
+    labels+=("$lf")
+  done
+  for lf in ${labels[@]+"${labels[@]}"}; do
+    [[ -z "$out" ]] || out+=", "
+    out+="$lf"
+  done
+  printf '%s' "$out"
+}
+
 # Coverage that was lost but still reads as a completed scan is the failure
 # mode this whole path exists to prevent: `partial` keeps the results that
 # survived while marking the tier non-ok, which is what turns the verdict to
@@ -1974,13 +1998,20 @@ osv_mark_partial() {
   fi
 }
 
+# Which lockfiles the per-file rescan could not read. Reported through a
+# global rather than annotated in place: the caller also knows about files
+# dropped in translation, and two annotations meant the second silently
+# replaced the first, hiding one of two simultaneous coverage losses.
+declare -a OSV_RESCAN_FAILED=()
+
 # A batch that dies on one file still holds good evidence for every other one,
 # so rescan file by file and merge what survives rather than losing the tier.
 # Returns 1 when nothing survived, leaving the caller's error path in charge.
 osv_scan_lockfiles_individually() {
   local machine="$1" osv="$2" output="$3"
   shift 3
-  local -a parts=() failed=()
+  OSV_RESCAN_FAILED=()
+  local -a parts=()
   local lf part rc index=0
   for lf in "$@"; do
     part="$output.part.$index"
@@ -1994,17 +2025,13 @@ osv_scan_lockfiles_individually() {
       parts+=("$part")
     else
       vinfo "$machine: osv-scanner rescan failed for $(printf '%q' "$lf") (exit $rc)"
-      failed+=("$lf")
+      OSV_RESCAN_FAILED+=("$lf")
     fi
   done
   [[ "${#parts[@]}" -gt 0 ]] || return 1
   local merged="$output.merged"
   jq -s '{results: (map(.results // []) | add // [])}' "${parts[@]}" > "$merged" 2>/dev/null || { rm -f "$merged"; return 1; }
   mv "$merged" "$output"
-  if [[ "${#failed[@]}" -gt 0 ]]; then
-    warn "osv-scanner could not read $(printf '%s, ' "${failed[@]}" | sed 's/, $//'); the remaining lockfiles were scanned individually"
-    osv_mark_partial "$output" "osv-scanner could not read: $(printf '%s, ' "${failed[@]}" | sed 's/, $//')"
-  fi
   return 0
 }
 
@@ -2039,7 +2066,7 @@ osv_scan_lockfiles() {
   if [[ "${#scannable[@]}" -eq 0 ]]; then
     vinfo "$machine: osv-scanner skipped: no discovered lockfile is in a format the scanner reads ($dropped_list)"
     warn "osv-scanner has no reader for the discovered lockfiles ($dropped_list); dependency coverage for them is missing"
-    jq -n --arg note "no osv-parseable lockfile among those discovered: $dropped_list" \
+    jq -n --arg note "no osv-parseable lockfile among those discovered: $(osv_uncovered_labels "${dropped[@]}")" \
       '{results: [], skipped: $note, skip_reason: "no_parseable_lockfiles"}' > "$output"
     return 0
   fi
@@ -2051,67 +2078,120 @@ osv_scan_lockfiles() {
   vinfo "$machine: osv-scanner=$(printf '%q' "$osv") lockfiles=${#scannable[@]} dropped=${#dropped[@]} output=$(printf '%q' "$output")"
 
   local rc=0
+  OSV_RESCAN_FAILED=()
   set +e
   "$osv" "${args[@]}" > "$output" 2>"$output.stderr"
   rc=$?
   set -e
-  if [[ "$rc" -ne 0 ]]; then
-    if osv_scan_output_valid "$output"; then
-      vinfo "$machine: osv-scanner exited $rc after producing valid JSON; keeping result"
-    elif [[ "${#scannable[@]}" -gt 1 ]] && osv_scan_lockfiles_individually "$machine" "$osv" "$output" "${scannable[@]}"; then
-      vinfo "$machine: osv-scanner batch failed; recovered by scanning each lockfile on its own"
-    else
-      warn "osv-scanner failed; details: $output.stderr"
-      warn "osv-scanner stderr: $(first_line_summary "$(cat "$output.stderr" 2>/dev/null || true)" 240)"
-      printf '{"results":[],"error":"osv-scanner failed"}\n' > "$output"
-      return 0
-    fi
+  # Judge the OUTPUT, never the exit status. osv-scanner exits nonzero when it
+  # FINDS something, so status alone cannot mean failure — and a wrapper or a
+  # future release can exit ZERO having written nothing, which read as a clean
+  # empty scan when validity was only checked inside the nonzero branch.
+  if osv_scan_output_valid "$output"; then
+    [[ "$rc" -eq 0 ]] || vinfo "$machine: osv-scanner exited $rc after producing valid JSON; keeping result"
+  elif [[ "${#scannable[@]}" -gt 1 ]] && osv_scan_lockfiles_individually "$machine" "$osv" "$output" "${scannable[@]}"; then
+    vinfo "$machine: osv-scanner batch produced no usable JSON (exit $rc); recovered by scanning each lockfile on its own"
+  else
+    warn "osv-scanner failed; details: $output.stderr"
+    warn "osv-scanner stderr: $(first_line_summary "$(cat "$output.stderr" 2>/dev/null || true)" 240)"
+    printf '{"results":[],"error":"osv-scanner failed"}\n' > "$output"
+    return 0
   fi
 
-  if [[ "${#dropped[@]}" -gt 0 ]]; then
-    warn "osv-scanner has no reader for $dropped_list; those dependencies are not covered by this scan"
-    osv_mark_partial "$output" "osv-scanner has no reader for: $dropped_list"
+  # One annotation covering every kind of loss. A file dropped in translation
+  # and a file the rescan could not read are the same fact to the operator —
+  # dependencies nothing looked at — and annotating them separately meant the
+  # second write replaced the first.
+  local -a uncovered=()
+  uncovered+=(${dropped[@]+"${dropped[@]}"})
+  uncovered+=(${OSV_RESCAN_FAILED[@]+"${OSV_RESCAN_FAILED[@]}"})
+  if [[ "${#uncovered[@]}" -gt 0 ]]; then
+    warn "osv-scanner could not read $(printf '%s, ' "${uncovered[@]}" | sed 's/, $//'); those dependencies are not covered by this scan"
+    osv_mark_partial "$output" "osv-scanner could not read: $(osv_uncovered_labels "${uncovered[@]}")"
   fi
 }
 
 # osv-scanner picks its extractor from the filename before reading a byte, so
 # "does this scanner still read format X" is answerable offline against an
-# empty file. The "could not determine extractor" line is the exact signal —
-# a parse complaint about empty content means the extractor is there.
+# empty file. Against empty content a healthy scanner says one of two things —
+# it ran an extractor and disliked the content, or it extracted no packages;
+# a missing extractor says so outright.
+#
+# Support is asserted from that POSITIVE evidence, never from the absence of
+# the missing-extractor phrase. Classifying "no error I recognize" as support
+# would make a crashing scanner, a permission failure, or a future wording
+# change report every format healthy — the precise opposite of what this guard
+# exists to catch. Anything unrecognized is `unknown`, which fails the check
+# loudly instead of passing it silently.
+osv_probe_format_support() {
+  local osv="$1" path="$2" out rc=0
+  set +e
+  out=$("$osv" scan source --offline --format json "--lockfile=$path" 2>&1 >/dev/null)
+  rc=$?
+  set -e
+  if grep -qF 'could not determine extractor' <<<"$out"; then
+    printf 'unsupported'
+  elif grep -qE 'extraction failed on specified lockfile|No package sources found' <<<"$out"; then
+    printf 'supported'
+  else
+    printf 'unknown %s %s' "$rc" "$(first_line_summary "$out" 120)"
+  fi
+  return 0
+}
+
+# Usage: osv_lockfile_support_json <varname>. The payload comes back through a
+# named variable for the same reason new_scratch_dir does: called as
+# `x=$(osv_lockfile_support_json)` the probe's scratch registration would die
+# with the command-substitution subshell and the cleanup trap would never see
+# the directory — which is exactly how the first version leaked it.
 osv_lockfile_support_json() {
-  local osv probe name out version
+  local __support_out_var="$1"
+  local osv probe name version verdict
   osv=$(local_scanner_path osv-scanner)
   local formats_json
   formats_json=$(printf '%s\n' "${SAFE_AUDIT_OSV_LOCKFILE_FORMATS[@]}" | jq -Rn '[inputs | select(length > 0)]')
   if [[ -z "$osv" ]]; then
-    jq -n --argjson formats "$formats_json" \
-      '{scanner: null, version: null, ok: false, formats: $formats, unsupported: [], note: "osv-scanner unavailable"}'
+    printf -v "$__support_out_var" '%s' "$(jq -n --argjson formats "$formats_json" \
+      '{scanner: null, version: null, ok: false, formats: $formats, unsupported: [], unknown: [], note: "osv-scanner unavailable"}')"
     return 0
   fi
   version=$("$osv" --version 2>/dev/null | head -n 1 || true)
-  probe=$(mktemp -d)
-  local -a unsupported=()
+  # The shared registry, not a bare mktemp: an interrupt during any of the
+  # eleven probe invocations exits through the cleanup trap, which only knows
+  # about directories registered here.
+  new_scratch_dir probe
+  local -a unsupported=() unknown=()
+  local note=""
   for name in "${SAFE_AUDIT_OSV_LOCKFILE_FORMATS[@]}"; do
     : > "$probe/$name"
-    out=$("$osv" scan source --offline --format json --lockfile="$probe/$name" 2>&1 >/dev/null || true)
-    if grep -qF 'could not determine extractor' <<<"$out"; then
-      unsupported+=("$name")
-    fi
+    verdict=$(osv_probe_format_support "$osv" "$probe/$name")
+    case "$verdict" in
+      supported) ;;
+      unsupported) unsupported+=("$name") ;;
+      *)
+        unknown+=("$name")
+        [[ -n "$note" ]] || note="$name: probe returned ${verdict#unknown }"
+        ;;
+    esac
     rm -f "$probe/$name"
   done
-  rm -rf "$probe"
-  local unsupported_json='[]'
+  local unsupported_json='[]' unknown_json='[]'
   if [[ "${#unsupported[@]}" -gt 0 ]]; then
     unsupported_json=$(printf '%s\n' "${unsupported[@]}" | jq -Rn '[inputs | select(length > 0)]')
   fi
-  jq -n --arg scanner "$osv" --arg version "$version" \
+  if [[ "${#unknown[@]}" -gt 0 ]]; then
+    unknown_json=$(printf '%s\n' "${unknown[@]}" | jq -Rn '[inputs | select(length > 0)]')
+  fi
+  printf -v "$__support_out_var" '%s' "$(jq -n --arg scanner "$osv" --arg version "$version" --arg note "$note" \
     --argjson formats "$formats_json" --argjson unsupported "$unsupported_json" \
+    --argjson unknown "$unknown_json" \
     '{scanner: $scanner,
       version: (if $version == "" then null else $version end),
-      ok: ($unsupported | length) == 0,
+      ok: (($unsupported | length) == 0 and ($unknown | length) == 0),
       formats: $formats,
       unsupported: $unsupported,
-      note: null}'
+      unknown: $unknown,
+      note: (if $note == "" then null else $note end)}')"
 }
 
 lockfile_support_command() {
@@ -2122,8 +2202,8 @@ lockfile_support_command() {
       *) die "unknown lockfile-support flag: $1" ;;
     esac
   done
-  local payload
-  payload=$(osv_lockfile_support_json)
+  local payload=""
+  osv_lockfile_support_json payload
   if [[ "$json_mode" == "1" ]]; then
     printf '%s\n' "$payload"
     return 0
@@ -2132,7 +2212,12 @@ lockfile_support_command() {
     "osv-scanner: " + (.scanner // "unavailable"),
     "version: " + (.version // "unknown"),
     (if .ok then "all " + ((.formats | length) | tostring) + " lockfile formats readable"
-     else "UNREADABLE: " + (.unsupported | join(", ")) end)
+     else
+       ([(if ((.unsupported // []) | length) > 0 then "UNREADABLE: " + (.unsupported | join(", ")) else empty end),
+         (if ((.unknown // []) | length) > 0 then "INCONCLUSIVE: " + (.unknown | join(", ")) else empty end),
+         (if (.note // "") != "" then "note: " + .note else empty end)]
+        | join("\n"))
+     end)
   ' <<<"$payload"
   jq -e '.ok' <<<"$payload" >/dev/null 2>&1
 }
@@ -4567,6 +4652,23 @@ if [[ "${#roots[@]}" -eq 0 ]]; then
   roots=("$target")
 fi
 
+# Mirrors osv_uncovered_labels: the note a consumer reads carries lockfile
+# NAMES, never paths — the install gate infers "scanner broken" from a regex
+# over this string, so a project under error-pages/ must not read as one.
+uncovered_labels() {
+  local lf out=""
+  local -A seen=()
+  for lf in "$@"; do
+    [[ -n "$lf" ]] || continue
+    lf="$(basename "$lf")"
+    [[ -z "${seen[$lf]:-}" ]] || continue
+    seen["$lf"]=1
+    [[ -z "$out" ]] || out+=", "
+    out+="$lf"
+  done
+  printf '%s' "$out"
+}
+
 # Mirrors osv_lockfile_stand_in on the orchestrator side: osv-scanner aborts
 # the whole batch on a file it has no extractor for, so go.sum resolves to its
 # sibling go.mod and bun.lockb to its sibling bun.lock, or it is dropped.
@@ -4596,7 +4698,10 @@ if command -v osv-scanner >/dev/null 2>&1 && [[ "${#scannable[@]}" -gt 0 ]]; the
   osv-scanner "${args[@]}" > "$scratch/osv.json" 2>"$scratch/osv.stderr"
   osv_rc=$?
   set -e
-  if [[ "$osv_rc" -ne 0 ]] && ! jq -e 'type == "object" and ((.results? // null) | type == "array")' "$scratch/osv.json" >/dev/null 2>&1; then
+  # Validity is judged on the output alone, exactly as on the orchestrator
+  # side: a nonzero exit with good JSON means findings, and a zero exit with
+  # no JSON is still a lost tier.
+  if ! jq -e 'type == "object" and ((.results? // null) | type == "array")' "$scratch/osv.json" >/dev/null 2>&1; then
     parts=()
     failed=()
     index=0
@@ -4622,7 +4727,7 @@ if command -v osv-scanner >/dev/null 2>&1 && [[ "${#scannable[@]}" -gt 0 ]]; the
     fi
   fi
   if [[ "${#dropped[@]}" -gt 0 ]]; then
-    note="osv-scanner has no reader for: $(printf '%s, ' "${dropped[@]}" | sed 's/, $//')"
+    note="osv-scanner could not read: $(uncovered_labels "${dropped[@]}")"
     if jq --arg note "$note" '. + {partial: $note}' "$scratch/osv.json" > "$scratch/osv.annotated" 2>/dev/null; then
       mv "$scratch/osv.annotated" "$scratch/osv.json"
     else
@@ -4632,7 +4737,7 @@ if command -v osv-scanner >/dev/null 2>&1 && [[ "${#scannable[@]}" -gt 0 ]]; the
 elif ! command -v osv-scanner >/dev/null 2>&1; then
   printf '{"results":[],"skipped":"osv-scanner unavailable","skip_reason":"scanner_unavailable"}\n' > "$scratch/osv.json"
 elif [[ "${#dropped[@]}" -gt 0 ]]; then
-  jq -n --arg note "no osv-parseable lockfile among those discovered: $(printf '%s, ' "${dropped[@]}" | sed 's/, $//')" \
+  jq -n --arg note "no osv-parseable lockfile among those discovered: $(uncovered_labels "${dropped[@]}")" \
     '{results: [], skipped: $note, skip_reason: "no_parseable_lockfiles"}' > "$scratch/osv.json"
 else
   printf '{"results":[],"skipped":"no lockfiles discovered","skip_reason":"no_lockfiles"}\n' > "$scratch/osv.json"

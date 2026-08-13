@@ -1172,8 +1172,17 @@ print_doctor_human() {
       elif .features.osv_lockfile_support.ok then
         "all " + ((.features.osv_lockfile_support.formats | length) | tostring) + " readable"
       else
-        "UNREADABLE — " + (.features.osv_lockfile_support.unsupported | join(", "))
-        + " (the scanner dropped these extractors; those repos lose their OSV tier)"
+        ([(if ((.features.osv_lockfile_support.unsupported // []) | length) > 0 then
+            "UNREADABLE — " + (.features.osv_lockfile_support.unsupported | join(", "))
+            + " (the scanner dropped these extractors; those repos lose their OSV tier)"
+          else empty end),
+          (if ((.features.osv_lockfile_support.unknown // []) | length) > 0 then
+            "INCONCLUSIVE — " + (.features.osv_lockfile_support.unknown | join(", "))
+            + " (the probe could not tell; treat coverage as unverified"
+            + (if (.features.osv_lockfile_support.note // "") != "" then " — " + .features.osv_lockfile_support.note else "" end)
+            + ")"
+          else empty end)]
+         | join("; "))
       end),
     "",
     "socket wiring (install gate scoring):",
@@ -1193,7 +1202,9 @@ print_doctor_human() {
         .features.binary_exec.missing[],
         .features.safe_run_sandbox.missing[],
         (.features.osv_lockfile_support.unsupported[]?
-         | "osv-scanner extractor for " + . + " (repos using it lose their OSV tier)")
+         | "osv-scanner extractor for " + . + " (repos using it lose their OSV tier)"),
+        (.features.osv_lockfile_support.unknown[]?
+         | "osv-scanner probe for " + . + " was inconclusive (coverage unverified)")
       ]
       | unique
       | if length == 0 then ["  none"] else map("  " + .) end

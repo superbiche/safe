@@ -30,8 +30,12 @@ mkdir -p "$MOCKBIN"
 
 # The stub records every --lockfile it was handed, one call per line, so a
 # test can assert on the ARGUMENTS rather than on the scan's conclusions.
-# SAFE_TEST_OSV_UNREADABLE lists basenames it refuses the way the real
-# scanner refuses a format it cannot extract: nothing on stdout, exit 127.
+# Knobs:
+#   SAFE_TEST_OSV_UNREADABLE   basenames it refuses the way the real scanner
+#                              refuses a format it cannot extract
+#   SAFE_TEST_OSV_PROBE_GARBAGE  probe calls fail in an unrecognized way
+#   SAFE_TEST_OSV_EMPTY_BATCH  exit 0 writing nothing (the shape that used to
+#                              slip past validation because the status was 0)
 cat > "$MOCKBIN/osv-scanner" <<'STUB'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "--version" ]]; then
@@ -39,21 +43,51 @@ if [[ "${1:-}" == "--version" ]]; then
   exit 0
 fi
 declare -a lockfiles=()
+probe=0
 for arg in "$@"; do
   case "$arg" in
     --lockfile=*) lockfiles+=("${arg#--lockfile=}") ;;
+    --offline) probe=1 ;;
   esac
 done
-if [[ -n "${SAFE_TEST_OSV_CALLS:-}" ]]; then
-  printf '%s\n' "${lockfiles[*]}" >> "$SAFE_TEST_OSV_CALLS"
-fi
-for lf in ${lockfiles[@]+"${lockfiles[@]}"}; do
+is_unreadable() {
+  local base
+  base="$(basename "$1")"
   for bad in ${SAFE_TEST_OSV_UNREADABLE:-}; do
-    if [[ "$(basename "$lf")" == "$bad" ]]; then
+    [[ "$base" == "$bad" ]] && return 0
+  done
+  return 1
+}
+# Probe path: reproduce what the real scanner says against EMPTY content —
+# a missing extractor names itself, a present one complains about the content.
+if [[ "$probe" == "1" ]]; then
+  if [[ -n "${SAFE_TEST_OSV_PROBE_GARBAGE:-}" ]]; then
+    printf 'boom: unexpected failure\n' >&2
+    exit 23
+  fi
+  for lf in ${lockfiles[@]+"${lockfiles[@]}"}; do
+    if is_unreadable "$lf"; then
       printf 'could not determine extractor suitable to this file: "%s"\n' "$lf" >&2
       exit 127
     fi
   done
+  printf 'extraction failed on specified lockfile\n' >&2
+  exit 127
+fi
+if [[ -n "${SAFE_TEST_OSV_CALLS:-}" ]]; then
+  printf '%s\n' "${lockfiles[*]}" >> "$SAFE_TEST_OSV_CALLS"
+fi
+if [[ -n "${SAFE_TEST_OSV_EMPTY_BATCH:-}" && "${#lockfiles[@]}" -gt 1 ]]; then
+  exit 0
+fi
+if [[ -n "${SAFE_TEST_OSV_EMPTY_BATCH:-}" && "${#lockfiles[@]}" -eq 1 && -n "${SAFE_TEST_OSV_EMPTY_SINGLE:-}" ]]; then
+  exit 0
+fi
+for lf in ${lockfiles[@]+"${lockfiles[@]}"}; do
+  if is_unreadable "$lf"; then
+    printf 'could not determine extractor suitable to this file: "%s"\n' "$lf" >&2
+    exit 127
+  fi
 done
 # One synthetic HIGH advisory per readable lockfile, so the count of surviving
 # results is readable from the scan totals: a lost tier scores 0, and a
@@ -266,6 +300,85 @@ case_every_lockfile_unreadable_is_an_error_not_a_clean_scan() {
   fi
 }
 
+# --- a coverage gap is not a broken scanner ---------------------------------
+
+# bin/safe's install gate decides "scanner broken" — exit 100, unacceptable
+# even under --yes — from this predicate over the free-form note. It is copied
+# verbatim from bin/safe so the two cannot drift apart silently.
+GATE_BROKEN_PREDICATE='
+  def broken: (.status // "ok") as $s
+    | ($s == "error") or (($s != "ok") and (((.note // "") | test("fail|error"; "i"))));
+  [ (.tool_status // {} | to_entries[]? | select(.value | broken) | .key) ] | length > 0
+'
+
+case_a_coverage_gap_under_a_failure_named_path_is_not_scanner_breakage() {
+  local dir result
+  # The project's own directory name is the whole point: interpolating the
+  # lockfile PATH into the note made `failure-demo` match the gate's
+  # /fail|error/i predicate and turned missing coverage into a hard refusal.
+  dir="$(make_project failure-demo bun.lockb)"
+  result="$(audit_project "$dir")"
+  local note
+  note="$(jq -r '.tool_status["osv-scanner"].note // ""' "$result" 2>/dev/null || printf '')"
+  if jq -e "$GATE_BROKEN_PREDICATE" "$result" >/dev/null 2>&1; then
+    fail "$FUNCNAME (gate would refuse: note=$note)"
+    return
+  fi
+  if [[ "$note" == */* ]]; then
+    fail "$FUNCNAME (note carries a path: $note)"
+    return
+  fi
+  if [[ "$note" == *"bun.lockb"* ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (note does not name the format: $note)"
+  fi
+}
+
+case_both_kinds_of_lost_coverage_are_reported_together() {
+  local dir result note
+  # legacy/go.sum has no sibling go.mod, so translation drops it; web/yarn.lock
+  # is handed over and the scanner refuses it. Both are uncovered, and the
+  # annotation used to name only whichever was written last.
+  dir="$(make_project mixed-loss legacy/go.sum deploy/package-lock.json web/yarn.lock)"
+  result="$(audit_project "$dir" SAFE_TEST_OSV_UNREADABLE="yarn.lock")"
+  note="$(jq -r '.tool_status["osv-scanner"].note // ""' "$result" 2>/dev/null || printf '')"
+  if [[ "$note" == *"go.sum"* && "$note" == *"yarn.lock"* ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (note names only part of the loss: $note)"
+  fi
+}
+
+# --- validity is judged on output, not exit status --------------------------
+
+case_zero_exit_with_no_output_is_not_a_clean_scan() {
+  local dir result status
+  # A wrapper or a future release exiting 0 having written nothing read as an
+  # empty, successful scan because validity was only checked when the exit
+  # status was nonzero. One lockfile, so there is no fallback to rescue it.
+  dir="$(make_project zero-exit deploy/package-lock.json)"
+  result="$(audit_project "$dir" SAFE_TEST_OSV_EMPTY_BATCH=1 SAFE_TEST_OSV_EMPTY_SINGLE=1)"
+  status="$(jq -r '.tool_status["osv-scanner"].status // "absent"' "$result" 2>/dev/null || printf 'absent')"
+  if [[ "$status" == "error" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (status=$status)"
+  fi
+}
+
+case_zero_exit_empty_batch_still_recovers_per_lockfile() {
+  local dir result high
+  dir="$(make_project zero-exit-batch deploy/package-lock.json web/yarn.lock)"
+  result="$(audit_project "$dir" SAFE_TEST_OSV_EMPTY_BATCH=1)"
+  high="$(jq -r '.cve_scan.high // 0' "$result" 2>/dev/null || printf '0')"
+  if [[ "$high" == "2" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (advisories recovered: $high, expected 2)"
+  fi
+}
+
 # --- the guard against the next scanner upgrade -----------------------------
 
 case_lockfile_support_reports_a_dropped_extractor() {
@@ -282,6 +395,47 @@ case_lockfile_support_reports_a_dropped_extractor() {
     pass "$FUNCNAME"
   else
     fail "$FUNCNAME (unsupported=$unsupported ok=$ok)"
+  fi
+}
+
+case_lockfile_support_refuses_to_call_an_unrecognized_failure_support() {
+  local out
+  # A probe that classified "no error phrase I recognize" as support would
+  # report every format healthy against a scanner that crashes on all of them.
+  out="$(PATH="$MOCKBIN:$PATH" HOME="$TEST_ROOT/home" \
+    SAFE_AUDIT_CONFIG_DIR="$TEST_ROOT/config-support-garbage" \
+    SAFE_AUDIT_DATA_DIR="$TEST_ROOT/data-support-garbage" \
+    SAFE_TEST_OSV_PROBE_GARBAGE=1 \
+    "$SAFE_AUDIT" lockfile-support --json 2>/dev/null)" || true
+  local ok unknown
+  ok="$(jq -r '.ok' <<<"$out" 2>/dev/null || printf 'true')"
+  unknown="$(jq -r '.unknown | length' <<<"$out" 2>/dev/null || printf '0')"
+  if [[ "$ok" == "false" && "$unknown" -ge 11 ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (ok=$ok unknown=$unknown)"
+  fi
+}
+
+# The probe must take its scratch from the shared registry, not a bare mktemp:
+# only registered directories are removed by the interrupt/exit traps. This
+# asserts the registration (a command-substitution call would lose it — the
+# first version did exactly that); the traps themselves are covered by
+# tests/audit/tool_resolution.sh, which is where the registry is under test.
+case_lockfile_support_leaves_no_scratch_behind() {
+  local probe_tmp before after
+  probe_tmp="$TEST_ROOT/probe-tmp"
+  mkdir -p "$probe_tmp"
+  before="$(find "$probe_tmp" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+  PATH="$MOCKBIN:$PATH" HOME="$TEST_ROOT/home" TMPDIR="$probe_tmp" \
+    SAFE_AUDIT_CONFIG_DIR="$TEST_ROOT/config-support-tmp" \
+    SAFE_AUDIT_DATA_DIR="$TEST_ROOT/data-support-tmp" \
+    "$SAFE_AUDIT" lockfile-support --json >/dev/null 2>&1 || true
+  after="$(find "$probe_tmp" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+  if [[ "$before" == "$after" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (scratch dirs before=$before after=$after)"
   fi
 }
 
@@ -310,7 +464,13 @@ case_a_clean_project_does_not_claim_degradation
 case_batch_failure_falls_back_to_scanning_each_lockfile
 case_batch_failure_keeps_the_readable_results
 case_every_lockfile_unreadable_is_an_error_not_a_clean_scan
+case_a_coverage_gap_under_a_failure_named_path_is_not_scanner_breakage
+case_both_kinds_of_lost_coverage_are_reported_together
+case_zero_exit_with_no_output_is_not_a_clean_scan
+case_zero_exit_empty_batch_still_recovers_per_lockfile
 case_lockfile_support_reports_a_dropped_extractor
+case_lockfile_support_refuses_to_call_an_unrecognized_failure_support
+case_lockfile_support_leaves_no_scratch_behind
 case_lockfile_support_passes_on_a_complete_scanner
 
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
