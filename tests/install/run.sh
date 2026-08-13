@@ -916,6 +916,27 @@ case_doctor_ecosystem_auditors_are_advisory_not_prereq() {
     fail "$FUNCNAME (ecosystem auditor leaked into missing prerequisites)"
     return
   fi
+  # Absent state — govulncheck is a Go tool, never a system package, so with no
+  # stub it reads absent deterministically: it must report present==false, render
+  # an "absent" line, and STILL never reach the prereq list.
+  local emptybin="${HOME_DIR}/eco-empty-bin"
+  mkdir -p "${emptybin}"
+  local doctor_absent_json doctor_absent_human
+  doctor_absent_json="$(env HOME="${HOME_DIR}" PATH="${emptybin}:/usr/bin:/bin" \
+    bash "${ROOT_DIR}/bin/safe" doctor --json 2>/dev/null)"
+  jq -e '.features.ecosystem_auditors.govulncheck.present == false' \
+    <<<"${doctor_absent_json}" >/dev/null \
+    || { printf '%s\n' "${doctor_absent_json}" >&2; fail "$FUNCNAME (govulncheck should read absent)"; return; }
+  doctor_absent_human="$(env HOME="${HOME_DIR}" PATH="${emptybin}:/usr/bin:/bin" \
+    bash "${ROOT_DIR}/bin/safe" doctor 2>/dev/null)"
+  grep -Eq 'govulncheck \(Go\): +absent' <<<"${doctor_absent_human}" \
+    || { printf '%s\n' "${doctor_absent_human}" >&2; fail "$FUNCNAME (absent auditor not rendered as absent)"; return; }
+  if sed -n '/missing prerequisites:/,$p' <<<"${doctor_absent_human}" \
+      | grep -Eq 'govulncheck|pip-audit|cargo-audit|composer'; then
+    printf '%s\n' "${doctor_absent_human}" >&2
+    fail "$FUNCNAME (absent auditor leaked into missing prerequisites)"
+    return
+  fi
   pass "$FUNCNAME"
 }
 
