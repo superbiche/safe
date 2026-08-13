@@ -304,6 +304,36 @@ case_pnpm_project_is_unsupported_coverage_not_breakage() {
   pass "$FUNCNAME"
 }
 
+case_bun_lock_project_is_covered_not_a_false_warn() {
+  prepare_case "bun-text"
+  printf '{"name":"demo","version":"1.0.0"}\n' > "$CASE_PROJECT/package.json"
+  printf '{"lockfileVersion":1,"workspaces":{"":{"name":"demo"}},"packages":{}}\n' > "$CASE_PROJECT/bun.lock"
+  # osv-scanner reads bun.lock, so the dependencies ARE covered and `npm audit`
+  # being unable to read it is the same non-event as for a pnpm project.
+  # Before bun lockfiles were discovered at all, this WARNed as "no lockfile".
+  run_scan NPM_RC=1 NPM_OUT=''
+  assert_jq "$FUNCNAME" '
+    (.ecosystem_audits[] | select(.scanner == "npm-audit") | .status == "unsupported")
+    and .verdict == "GO"
+  ' || return
+  pass "$FUNCNAME"
+}
+
+case_bun_lockb_only_project_still_warns() {
+  prepare_case "bun-binary"
+  printf '{"name":"demo","version":"1.0.0"}\n' > "$CASE_PROJECT/package.json"
+  printf 'binary\n' > "$CASE_PROJECT/bun.lockb"
+  # Nothing reads the binary format: npm audit cannot, and osv-scanner has no
+  # extractor for it. Discovering the file must not be mistaken for covering
+  # its dependencies.
+  run_scan NPM_RC=1 NPM_OUT=''
+  assert_jq "$FUNCNAME" '
+    .verdict == "WARN"
+    and (.tool_status["osv-scanner"].status == "skipped")
+  ' || return
+  pass "$FUNCNAME"
+}
+
 case_pip_audit_covers_every_declared_target() {
   prepare_case "pip-multi"
   printf 'app==1.0.0\n' > "$CASE_PROJECT/requirements.txt"
@@ -547,6 +577,8 @@ main() {
     case_project_mode_refuses_a_broken_scanner_under_yes \
     case_project_mode_accepts_a_clean_python_project \
     case_pnpm_project_is_unsupported_coverage_not_breakage \
+    case_bun_lock_project_is_covered_not_a_false_warn \
+    case_bun_lockb_only_project_still_warns \
     case_pip_audit_covers_every_declared_target \
     case_pyproject_is_audited_by_path_not_by_environment \
     case_govulncheck_partial_stream_is_an_error \

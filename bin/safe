@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.19.0"
+SAFE_VERSION="1.20.0"
 # Exported at the top level, not per-subcommand: safe-audit pins itself to
 # this version, and every route that reaches it — the gate, `safe audit ...`,
 # `safe install`, the safe-audit compatibility command — must carry it or the
@@ -870,6 +870,18 @@ doctor_payload_json() {
     fi
   fi
 
+  # An installed scanner is not a working scanner: osv-scanner 2.3.x dropped
+  # the go.sum path safe was feeding it, and one file it cannot read aborts the
+  # whole batch, so the OSV tier vanished while every presence check stayed
+  # green. Probe what the INSTALLED scanner actually reads.
+  local lockfile_support_json='{"scanner":null,"version":null,"ok":false,"formats":[],"unsupported":[],"note":"probe unavailable"}'
+  local lockfile_support_raw=""
+  if capture_command lockfile_support_raw "$SAFE_SELF" audit lockfile-support --json; then
+    if jq -e . >/dev/null 2>&1 <<<"$lockfile_support_raw"; then
+      lockfile_support_json=$(jq -c '.' <<<"$lockfile_support_raw")
+    fi
+  fi
+
   local has_cosign has_sha256sum has_shasum has_checksum has_python3 has_python has_python_bridge has_podman has_timeout
   has_cosign=$(jq -r '.present' <<<"$verify_cosign_json")
   has_sha256sum=$(jq -r '.present' <<<"$verify_sha256sum_json")
@@ -1015,6 +1027,7 @@ doctor_payload_json() {
     --argjson verify_tuf_bootstrap "$verify_tuf_bootstrap_json" \
     --argjson binary_exec "$binary_exec_json" \
     --argjson safe_run_sandbox "$safe_run_sandbox_json" \
+    --argjson osv_lockfile_support "$lockfile_support_json" \
     --argjson safe_run_config_present "$( [[ -f "$run_config_dir/config.json" ]] && printf 'true' || printf 'false' )" \
     --argjson safe_run_host_allow_file "$( [[ -f "$run_config_dir/host-allow.json" ]] && printf 'true' || printf 'false' )" \
     --argjson safe_run_sandbox_known_file "$( [[ -f "$run_config_dir/sandbox-known.json" ]] && printf 'true' || printf 'false' )" \
@@ -1080,7 +1093,8 @@ doctor_payload_json() {
         verify_sigstore_bundle: $verify_sigstore_bundle,
         verify_tuf_bootstrap: $verify_tuf_bootstrap,
         binary_exec: $binary_exec,
-        safe_run_sandbox: $safe_run_sandbox
+        safe_run_sandbox: $safe_run_sandbox,
+        osv_lockfile_support: $osv_lockfile_support
       },
       environment: {
         safe_core: {
@@ -1153,6 +1167,23 @@ print_doctor_human() {
       else "" end) as $podman_caveat
     | "  binary exec: " + (if .features.binary_exec.ready then "ready" else "not ready" end) + $podman_caveat,
       "  safe run sandbox: " + (if .features.safe_run_sandbox.ready then "ready" else "not ready" end) + $podman_caveat),
+    "  osv lockfile formats: " + (
+      if .features.osv_lockfile_support.scanner == null then "osv-scanner unavailable"
+      elif .features.osv_lockfile_support.ok then
+        "all " + ((.features.osv_lockfile_support.formats | length) | tostring) + " readable"
+      else
+        ([(if ((.features.osv_lockfile_support.unsupported // []) | length) > 0 then
+            "UNREADABLE — " + (.features.osv_lockfile_support.unsupported | join(", "))
+            + " (the scanner dropped these extractors; those repos lose their OSV tier)"
+          else empty end),
+          (if ((.features.osv_lockfile_support.unknown // []) | length) > 0 then
+            "INCONCLUSIVE — " + (.features.osv_lockfile_support.unknown | join(", "))
+            + " (the probe could not tell; treat coverage as unverified"
+            + (if (.features.osv_lockfile_support.note // "") != "" then " — " + .features.osv_lockfile_support.note else "" end)
+            + ")"
+          else empty end)]
+         | join("; "))
+      end),
     "",
     "socket wiring (install gate scoring):",
     "  cli: " + (if .environment.socket.cli_present then .environment.socket.cli_path else "MISSING — install socket CLI" end),
@@ -1169,7 +1200,11 @@ print_doctor_human() {
         .features.verify_sigstore_bundle.missing[],
         .features.verify_tuf_bootstrap.missing[],
         .features.binary_exec.missing[],
-        .features.safe_run_sandbox.missing[]
+        .features.safe_run_sandbox.missing[],
+        (.features.osv_lockfile_support.unsupported[]?
+         | "osv-scanner extractor for " + . + " (repos using it lose their OSV tier)"),
+        (.features.osv_lockfile_support.unknown[]?
+         | "osv-scanner probe for " + . + " was inconclusive (coverage unverified)")
       ]
       | unique
       | if length == 0 then ["  none"] else map("  " + .) end
@@ -1933,12 +1968,20 @@ cmd_install_project() {
 
   # Scanners that are absent rather than broken. Not a refusal — the operator
   # is told what was NOT looked at, and the verdict is already WARN.
+  # Core tiers belong here too: a lockfile format the scanner cannot read is
+  # coverage the operator never asked to lose, and reporting it only inside the
+  # result JSON is how it stayed invisible.
   local unrun_tools
   unrun_tools="$(jq -r '
-    [ .ecosystem_audits[]?
-      | select((.status // "ok") != "ok")
-      | select((.status // "") != "error")
-      | (.scanner // "unknown") + " (" + ((.note // "not run")) + ")"
+    [ (.ecosystem_audits[]?
+       | select((.status // "ok") != "ok")
+       | select((.status // "") != "error")
+       | (.scanner // "unknown") + " (" + ((.note // "not run")) + ")"),
+      (.tool_status // {} | to_entries[]?
+       | select((.value.status // "ok") != "ok")
+       | select((.value.status // "") != "error")
+       | select(((.value.note // "") | test("fail|error"; "i")) | not)
+       | .key + " (" + ((.value.note // "not run")) + ")")
     ] | unique | join(", ")
   ' "$result_path" 2>/dev/null || printf '')"
 

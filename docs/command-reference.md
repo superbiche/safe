@@ -94,6 +94,7 @@ safe audit ioc --update [--since <duration>] [--all | --machine <csv>]
 safe audit setup [<machine> | --all | --machine <csv>] [--bundle <scanners.tar.gz|latest>]
 safe audit setup --create-bundle [<scanners.tar.gz>]
 safe audit diff [--all | --machine <csv>] [--since <duration>]
+safe audit lockfile-support [--json]
 safe audit status
 safe audit --version
 ```

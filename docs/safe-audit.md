@@ -127,6 +127,35 @@ Dependency-only scan:
 safe audit repo-audit . --deps-only
 ```
 
+### What osv-scanner is handed
+
+osv-scanner selects an extractor from the filename, and a file it has no
+extractor for is fatal for the **whole batch**: it exits nonzero, writes
+nothing, and discards the lockfiles it had already extracted. So discovery's
+set is translated before the scanner sees it:
+
+- `go.sum` is replaced by its sibling `go.mod` — the Go extractor reads the
+  module file, never the checksum file.
+- `bun.lockb` is replaced by its sibling `bun.lock`; the binary format has no
+  extractor. `bun.lock` on its own is read directly.
+- A file with no readable stand-in is dropped, and the drop is reported.
+
+Two safeguards sit behind the translation, because the failure it prevents is
+silent by nature — the tier goes missing while the scan still completes:
+
+- If the batch fails anyway, each lockfile is rescanned on its own and the
+  results are merged. One unreadable file costs its own coverage, never the
+  whole tier; the tool status becomes `partial` and names the file.
+- Coverage that was lost is stated on the surface's closing line
+  (`finished ... with degraded coverage: ...`), not only inside the result
+  JSON's `tool_status`. A degraded tier also WARNs the verdict and blocks
+  caching.
+
+`safe audit lockfile-support [--json]` probes the installed scanner against
+every format safe hands it and reports any it can no longer read. `safe doctor`
+runs it, so a scanner upgrade that drops an extractor is visible before it
+costs a scan rather than after.
+
 ### Scan cache (`--deps-only`)
 
 A dependency-only scan reads exactly one thing: the dependency evidence
