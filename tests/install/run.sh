@@ -1867,6 +1867,139 @@ case_composer_reinstall_create_project() {
   pass "$FUNCNAME"
 }
 
+case_composer_nonglobal_working_dir() {
+  prepare_case "composer-nonglobal-working-dir"
+  local wd="${CASE_DIR}/wd-project"
+  mkdir -p "${wd}"
+  touch "${wd}/composer.json"
+
+  # A non-global install-class composer run with an effective --working-dir/-d
+  # scans THAT project, not the process cwd (which here holds no composer
+  # project at all — before this fix the scan was skipped or aimed at cwd).
+  # Every surface form Composer accepts is covered, at both argument positions.
+  local form
+  for form in "install -d ${wd}" \
+    "install -d${wd}" \
+    "install --working-dir ${wd}" \
+    "install --working-dir=${wd}" \
+    "-d ${wd} install" \
+    "update -d ${wd}" \
+    "reinstall -d ${wd}"; do
+    : > "${LOG_FILE}"
+    SAFE_AUDIT_EXPECT_PROJECT=1 \
+      SAFE_INSTALL_TEST_SCRIPT="composer ${form}" run_zsh
+    assert_status 0 "$FUNCNAME (${form})" || return
+    assert_scan_targets_logged "$FUNCNAME (${form})" "${wd}" || return
+    assert_log_not_contains_fragment 'package-audit' "$FUNCNAME (${form})" || return
+  done
+
+  # Rootless create-project is install-class and scans the effective working-dir
+  # project the same way.
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_EXPECT_PROJECT=1 \
+    SAFE_INSTALL_TEST_SCRIPT="composer create-project -d ${wd}" run_zsh
+  assert_status 0 "$FUNCNAME (create-project)" || return
+  assert_scan_targets_logged "$FUNCNAME (create-project)" "${wd}" || return
+
+  # The verdict is driven by the working-dir scan: a critical finding there
+  # refuses (non-interactive -> 102) before any delegation.
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_EXPECT_PROJECT=1 SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${wd}" \
+    SAFE_INSTALL_TEST_SCRIPT="composer install -d ${wd}" run_zsh
+  assert_status 102 "$FUNCNAME (critical wd)" || return
+  assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME (critical wd)" || return
+
+  # Conversely the cwd is NOT scanned: a project in cwd flagged critical does
+  # not block a run whose --working-dir points at a clean project elsewhere.
+  # Proves the scan moved off cwd rather than covering both.
+  touch "${WORK_DIR}/composer.json"
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_EXPECT_PROJECT=1 SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${WORK_DIR}" \
+    SAFE_INSTALL_TEST_SCRIPT="composer install -d ${wd}" run_zsh
+  assert_status 0 "$FUNCNAME (cwd not scanned)" || return
+  assert_scan_targets_logged "$FUNCNAME (cwd not scanned)" "${wd}" || return
+  assert_log_contains $'REAL\tcomposer\tinstall\t-d\t'"${wd}" "$FUNCNAME (cwd not scanned)" || return
+  rm -f "${WORK_DIR}/composer.json"
+
+  # An existing working-dir that cannot be entered is audit-infrastructure
+  # breakage, not a clean tree: refuse (exit 100, single stderr line), never
+  # delegate unaudited.
+  local unreadable="${CASE_DIR}/unreadable"
+  mkdir -p "${unreadable}"
+  touch "${unreadable}/composer.json"
+  chmod 000 "${unreadable}"
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT="composer install -d ${unreadable}" run_zsh
+  chmod 755 "${unreadable}"
+  assert_status 100 "$FUNCNAME (unreadable)" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME (unreadable)"; return 1; }
+  assert_err_contains_fragment 'cannot enter the --working-dir project' "$FUNCNAME (unreadable)" || return
+  assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME (unreadable)" || return
+
+  # A nonexistent working-dir has no project to scan: nothing is audited and the
+  # run delegates (Composer itself rejects the missing directory).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT="composer install -d ${CASE_DIR}/absent" run_zsh
+  assert_status 0 "$FUNCNAME (absent)" || return
+  assert_log_not_contains_fragment $'AUDIT\trepo-audit\t' "$FUNCNAME (absent)" || return
+  assert_log_contains $'REAL\tcomposer\tinstall\t-d\t'"${CASE_DIR}/absent" "$FUNCNAME (absent)" || return
+
+  # A REPEATED working-dir option resolves first-wins, matching Composer
+  # (Symfony ArgvInput.getParameterOption first-match). The scan must target the
+  # FIRST directory; the second is flagged critical to prove it is NOT scanned
+  # (a last-wins bug would scan it and either block or log its AUDITPROJECT).
+  local wd2="${CASE_DIR}/wd-project-2"
+  mkdir -p "${wd2}"
+  touch "${wd2}/composer.json"
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_EXPECT_PROJECT=1 SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${wd2}" \
+    SAFE_INSTALL_TEST_SCRIPT="composer install --working-dir=${wd} --working-dir=${wd2}" run_zsh
+  assert_status 0 "$FUNCNAME (repeated first-wins)" || return
+  assert_scan_targets_logged "$FUNCNAME (repeated first-wins)" "${wd}" || return
+  assert_log_not_contains_fragment $'AUDITPROJECT\t'"${wd2}" "$FUNCNAME (repeated first-wins)" || return
+
+  # The working-dir is entered with physical path semantics, matching Composer's
+  # chdir(): a symlinked `..` resolves to the real project, where a lexical `cd`
+  # would collapse symlink/.. and scan the wrong (clean) directory. Expected is
+  # computed with the same physical resolution so a symlinked temp prefix cannot
+  # skew the assertion.
+  local realproj="${CASE_DIR}/realproj"
+  mkdir -p "${realproj}/sub"
+  touch "${realproj}/composer.json"
+  ln -s "${realproj}/sub" "${CASE_DIR}/lnk"
+  local realproj_phys
+  realproj_phys="$(cd -P -- "${realproj}" && pwd)"
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_EXPECT_PROJECT=1 \
+    SAFE_INSTALL_TEST_SCRIPT="composer install -d ${CASE_DIR}/lnk/.." run_zsh
+  assert_status 0 "$FUNCNAME (physical cd)" || return
+  assert_scan_targets_logged "$FUNCNAME (physical cd)" "${realproj_phys}" || return
+
+  # The leading glued -dvalue form is (pre-existing) fail-closed: safe_gate_route
+  # does not model it as a value flag, so it refuses before routing rather than
+  # fetch unaudited. Guard that it stays closed.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT="composer -d${wd} install" run_zsh
+  assert_status 100 "$FUNCNAME (leading glued)" || return
+  assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME (leading glued)" || return
+
+  pass "$FUNCNAME"
+}
+
+case_composer_working_dir_missing_audit_warns_once() {
+  prepare_case "composer-missing-audit-warns-once" no
+  touch "${WORK_DIR}/composer.json"
+  # With no scanner available, an install-class composer run warns exactly once
+  # per process. `require` runs both the project scan and a package audit; the
+  # scan runs in place (not a subshell) precisely so the once-per-process
+  # warning flag survives into the package-audit step.
+  SAFE_INSTALL_TEST_SCRIPT='composer require vendor/okpkg:^1' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_count 1 'safe audit not installed, skipping pre-install check' "${ERR_FILE}" "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\trequire\tvendor/okpkg:^1' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_composer_global_canonical_routing() {
   prepare_case "composer-global-canonical-routing"
   local global_home="${HOME_DIR}/global-home"
@@ -5337,6 +5470,8 @@ main() {
     case_non_npm_abbreviations_stay_passthrough \
     case_composer_canonical_or_refuse \
     case_composer_reinstall_create_project \
+    case_composer_nonglobal_working_dir \
+    case_composer_working_dir_missing_audit_warns_once \
     case_composer_global_canonical_routing \
     case_npm_dedupe_lockdiff_empty_delegates_without_scan \
     case_npm_lockdiff_absent_node_modules_refuses \
