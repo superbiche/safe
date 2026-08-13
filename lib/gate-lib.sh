@@ -889,12 +889,14 @@ safe_gate_composer_route() {
   if (( is_global == 0 )); then
     safe_gate_route composer "$@" || return $?
     # safe_gate_route (via safe_gate_scan_target_flags) records --working-dir/-d
-    # for the space and =forms but not the glued -dvalue form; the routing loop
-    # above already captured every form in SAFE_GATE_COMPOSER_WORKING_DIR. Fill
-    # only that gap so the effective project dir — the scan target AND the
-    # --project-dir threaded to safe-audit — is complete, without disturbing the
-    # covered forms' recorded value.
-    if (( SAFE_GATE_COMPOSER_HAS_WORKING_DIR )) && [[ -z "${SAFE_GATE_PROJECT_DIR}" ]]; then
+    # into SAFE_GATE_PROJECT_DIR LAST-wins and misses the glued -dvalue form
+    # entirely. Composer resolves working-dir FIRST-wins (Symfony ArgvInput's
+    # getParameterOption), which the routing loop above already captured in
+    # SAFE_GATE_COMPOSER_WORKING_DIR for every form. Make that authoritative so
+    # the effective project dir — the scan target AND the --project-dir threaded
+    # to safe-audit — matches the directory Composer actually enters, including
+    # when the command repeats the option (`--working-dir=A --working-dir=B`).
+    if (( SAFE_GATE_COMPOSER_HAS_WORKING_DIR )); then
       SAFE_GATE_PROJECT_DIR="${SAFE_GATE_COMPOSER_WORKING_DIR}"
     fi
     SAFE_GATE_COMPOSER_SUBCMD="${SAFE_GATE_SUBCMD}"
@@ -985,11 +987,17 @@ safe_gate_composer_effective_project_dir() {
 # existing-but-unenterable dir (so the scan step below fails closed instead of
 # silently skipping a target we could not read); exit 1 = nothing to scan (dir
 # absent, or readable with no composer.json/composer.lock).
+#
+# With no working-dir the check runs in place — no subshell, byte-for-byte the
+# old cwd behavior. With one it enters the target with PHYSICAL cd (`cd -P`) to
+# match Composer's chdir(): a bare `cd` collapses `symlink/..` lexically and
+# would inspect a different directory than the one Composer resolves.
 safe_gate_composer_project_present_effective() {
   local dir present_rc
+  [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]] || { safe_gate_composer_project_present; return $?; }
   dir="$(safe_gate_composer_effective_project_dir)"
   [[ -d "${dir}" ]] || return 1
-  ( cd "${dir}" 2>/dev/null || exit 2; safe_gate_composer_project_present )
+  ( cd -P -- "${dir}" 2>/dev/null || exit 2; safe_gate_composer_project_present )
   present_rc=$?
   (( present_rc == 2 )) && return 0
   return "${present_rc}"
@@ -998,11 +1006,21 @@ safe_gate_composer_project_present_effective() {
 # Scan the effective project dir. A dir that exists but cannot be entered is
 # audit-infrastructure breakage, not a clean tree: refuse (exit 100) rather than
 # delegate unaudited, mirroring the global scan-targets guard.
+#
+# The scan runs in place — no subshell — when there is no working-dir OR no
+# scanner: that keeps the ordinary cwd path byte-for-byte AND preserves
+# safe_gate_scan_project's once-per-process "missing audit" warning state
+# (SAFE_GATE_WARNED_MISSING), which a subshell would discard. Only a real scan
+# in a distinct working-dir enters it (PHYSICAL cd, matching Composer's chdir).
 safe_gate_composer_scan_effective() {
   local dir scan_rc
+  if [[ -z "${SAFE_GATE_PROJECT_DIR:-}" ]] || ! safe_gate_audit_available; then
+    safe_gate_scan_project
+    return $?
+  fi
   dir="$(safe_gate_composer_effective_project_dir)"
   (
-    cd "${dir}" 2>/dev/null || exit 125
+    cd -P -- "${dir}" 2>/dev/null || exit 125
     safe_gate_scan_project
   )
   scan_rc=$?

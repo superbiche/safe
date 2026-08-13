@@ -12,10 +12,13 @@
   directory skipped the project scan (or audited the wrong tree) before
   delegating. An existing working directory that cannot be entered now refuses
   (exit 100) instead of delegating unaudited; a nonexistent one has nothing to
-  scan and delegates (Composer rejects it). The effective directory is also
-  threaded to safe-audit as `--project-dir`, closing the same gap for the glued
-  `-d<dir>` form. The leading glued form (`composer -d<dir> install`) stays
-  fail-closed as before.
+  scan and delegates (Composer rejects it). A repeated working-dir option
+  resolves first-wins (`--working-dir=A --working-dir=B` audits A, matching
+  Composer), and the directory is entered with physical path semantics so a
+  symlinked `..` resolves to the same project Composer's `chdir` reaches. The
+  effective directory is also threaded to safe-audit as `--project-dir`, closing
+  the same gap for the glued `-d<dir>` form. The leading glued form
+  (`composer -d<dir> install`) stays fail-closed as before.
 
 - **Composer `reinstall` and `create-project` are now gated.** Both fetch remote
   artifacts but were recognized-but-passthrough. `reinstall` re-fetches the
