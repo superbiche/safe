@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.21.0"
+SAFE_VERSION="1.24.0"
 # Exported at the top level, not per-subcommand: safe-audit pins itself to
 # this version, and every route that reaches it — the gate, `safe audit ...`,
 # `safe install`, the safe-audit compatibility command — must carry it or the
@@ -1048,6 +1048,7 @@ doctor_payload_json() {
     --argjson gate_wrappers "$gate_wrappers_json" \
     --argjson gate_wrappers_healthy "$gate_wrappers_healthy" \
     --argjson mise_shims_bound "$mise_shims_bound" \
+    --arg gate_bin_root "$SAFE_BIN_ROOT" \
     --argjson completion_present "$( [[ -f "$completion_file" ]] && printf 'true' || printf 'false' )" \
     '{
       command: "safe doctor",
@@ -1123,6 +1124,7 @@ doctor_payload_json() {
           gate_wrappers: $gate_wrappers,
           gate_wrappers_healthy: $gate_wrappers_healthy,
           mise_shims_bound_to_wrapper: $mise_shims_bound,
+          bin_root: $gate_bin_root,
           script_present: $wrapper_present,
           completion_present: $completion_present
         },
@@ -1190,7 +1192,11 @@ print_doctor_human() {
     "  token: " + (if .environment.socket.token_env_set then "env" elif .environment.socket.vault_mapping_present then "vault mapping" else "MISSING — socket login or add bw-env socket mapping" end),
     (if (.environment.install_wrappers.mise_shims_bound_to_wrapper // 0) > 0 then
       "\nmise shims: " + (.environment.install_wrappers.mise_shims_bound_to_wrapper | tostring)
-      + " bound to the gate wrapper — dispatch still works (argv0 branch) but pays an extra exec per call; repoint the shims at the real mise binary"
+      + " bound to the gate wrapper — dispatch still works (argv0 branch) but pays an extra exec per call."
+      + "\n  repair: PATH=\"$(printf %s \"$PATH\" | tr : \"\\n\" | grep -vxF \""
+      + (.environment.install_wrappers.bin_root // "")
+      + "\" | paste -sd:)\" mise reshim"
+      + "\n  (drops the safe bin dir so mise relinks the shims to the real binary; a plain mise reshim would rebind them to the wrapper)"
     else empty end),
     "",
     "missing prerequisites:",
