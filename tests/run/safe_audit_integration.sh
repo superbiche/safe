@@ -417,7 +417,7 @@ set -e
 grep -q 'not supported through safe run' "$tmp/package-flag.err" || fail "--package refusal not legible"
 pass "npm exec selector flags (--package) refuse with exit 100"
 
-# A versioned spec never uses the local bin: it stays in the audit pipeline
+# A versioned spec never uses the local bin: it takes the package-policy path
 # (here: unknown + non-TTY => exit 102) and the local stub must not run.
 set +e
 (
@@ -431,7 +431,7 @@ rc=$?
 set -e
 [[ "$rc" -eq 102 ]] || fail "versioned spec with local bin expected rc=102, got $rc"
 [[ ! -e "$tmp/local-bin-versioned-call.log" ]] || fail "versioned spec executed the local bin"
-pass "versioned spec bypasses local bin and stays in the audit pipeline"
+pass "versioned spec bypasses local bin and takes the package-policy path"
 
 # Blocklist beats the local bin.
 mkdir -p "$tmp/config-blocked-local"

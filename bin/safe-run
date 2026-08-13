@@ -78,14 +78,6 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
 }
 
-runner_ecosystem() {
-  case "$1" in
-    npm|bun) echo "npm" ;;
-    uv|pipx) echo "python" ;;
-    *) echo "npm" ;;
-  esac
-}
-
 log_host_allow_execution() {
   local pkg="$1" version="$2" runner="$3"
   mkdir -p "$SAFE_AUDIT_DATA_DIR"
@@ -1057,8 +1049,9 @@ dispatch_run() {
   # in the current or a parent directory (npm's own bin resolution, which is
   # how hoisted monorepo workspaces find their tools) runs the
   # already-installed binary directly — nothing is fetched. Mirrors the
-  # install-wrapper local-bin rule; versioned or scoped specs stay in the
-  # audit pipeline, and the blocklist above still wins.
+  # install-wrapper local-bin rule; versioned or scoped specs take the
+  # package-policy path (sandbox-known/unknown), and the blocklist above
+  # still wins.
   local local_bin=""
   if [[ ( "$RUNNER_KIND" == "npm" || "$RUNNER_KIND" == "bun" ) \
         && "$PKG_VERSION_USER_SPECIFIED" == "0" \
@@ -1308,7 +1301,7 @@ require_operator_tty() {
 cmd_host_allow_add() {
   local spec="${1:-}"
   shift || true
-  [[ -z "$spec" ]] && die "usage: safe run host-allow add <pkg>@<version> [--reason \"...\"]"
+  [[ -z "$spec" ]] && die "usage: safe run host-allow add <pkg>@<version> --reason \"...\""
   require_operator_tty add "$spec"
   local reason="" ecosystem="npm"
   while [[ $# -gt 0 ]]; do
@@ -1353,7 +1346,7 @@ cmd_host_allow_remove() {
 cmd_host_allow_update() {
   local spec="${1:-}"
   shift || true
-  [[ -z "$spec" ]] && die "usage: safe run host-allow update <pkg>@<new-version> [--reason \"...\"]"
+  [[ -z "$spec" ]] && die "usage: safe run host-allow update <pkg>@<new-version> --reason \"...\""
   require_operator_tty update "$spec"
   local reason=""
   while [[ $# -gt 0 ]]; do
@@ -1744,7 +1737,7 @@ scripts_allow_fetch_scripts() {
 cmd_scripts_allow_add() {
   local spec="${1:-}"
   shift || true
-  [[ -z "$spec" ]] && die "usage: safe run scripts-allow add <pkg>@<x.y.z> [--reason \"...\"]"
+  [[ -z "$spec" ]] && die "usage: safe run scripts-allow add <pkg>@<x.y.z> --reason \"...\""
   is_tty || {
     err "BLOCKED: scripts-allow add requires an interactive operator terminal"
     err "  ask the operator to run: safe run scripts-allow add ${spec} --reason \"...\""
@@ -2411,8 +2404,8 @@ RUNNER-NATIVE FLAGS (when invoked as npx/bunx/uvx)
                         mistaken for the package name
 
 SUBCOMMANDS
-  host-allow add <pkg>@<ver> [--reason "..."] Add package to host execution allowlist
-  host-allow update <pkg>@<new> [--reason "..."]
+  host-allow add <pkg>@<ver> --reason "..."   Add package to host execution allowlist
+  host-allow update <pkg>@<new> --reason "..."
                                               Update pinned version (prompts)
   host-allow remove <pkg>                     Remove from allowlist
   host-allow list                             Show allowlist
@@ -2421,7 +2414,7 @@ SUBCOMMANDS
                                               whether each pin still needs its
                                               entry (re-audit); --digest writes
                                               an inbox note when actionable
-  scripts-allow add <pkg>@<x.y.z> [--reason "..."]
+  scripts-allow add <pkg>@<x.y.z> --reason "..."
                                               Operator grant (TTY): reviewed
                                               install scripts for one exact
                                               identity run on npm -g installs
