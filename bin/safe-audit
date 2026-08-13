@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.1.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.21.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.22.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -2994,7 +2994,15 @@ build_scan_result_from_artifacts() {
         | select((.name // "") == "safe-audit")
         | (.note // empty)
       ][0] // "") as $note |
-      if ($note | test("unavailable|failed"; "i")) then
+      # A syft that RAN and failed left the "syft failed" marker: its SBOM is
+      # empty, so grype then scans nothing — that is breakage (status "error",
+      # refused), not a skipped tier. Only "syft unavailable" (absent) is a
+      # skip. Distinguishing them is load-bearing: the install gate refuses on
+      # "error" but discloses+WARNs a skip, so collapsing both to "skipped" let
+      # a real syft failure pass under --yes.
+      if ($note | test("failed"; "i")) then
+        {status:"error", note:$note}
+      elif ($note | test("unavailable"; "i")) then
         {status:"skipped", note:$note}
       else
         {status:"ok", note:(if $note == "" then null else $note end)}
