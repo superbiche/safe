@@ -252,11 +252,15 @@ project_case unknown-verdict 100 "$project_dir" env SAFE_AUDIT_STUB_SCAN_VERDICT
 grep -Fq 'not readable as a verdict' "$PROJECT_ERR" || fail "unknown verdict was not refused as unreadable"
 
 # A scanner that ran and FAILED is broken infrastructure: --yes cannot accept
-# it, and it must not read as a vulnerability.
+# it, and it must not read as a vulnerability. "broken" is the structural
+# status "error" (what a real failed grype writes — safe-audit maps its
+# {"error":...} output to status:"error"), never a "skipped"/"partial" status
+# second-guessed by a note that happens to contain "fail": a skipped scanner is
+# unavailable coverage (WARN), not breakage.
 PROJECT_ARGS=(--yes)
 project_case scanner-broken 100 "$project_dir" env \
   SAFE_AUDIT_STUB_SCAN_VERDICT=WARN \
-  SAFE_AUDIT_STUB_TOOL_STATUS='{"osv-scanner":{"status":"ok","note":null},"syft":{"status":"ok","note":null},"grype":{"status":"skipped","note":"grype failed"}}'
+  SAFE_AUDIT_STUB_TOOL_STATUS='{"osv-scanner":{"status":"ok","note":null},"syft":{"status":"ok","note":null},"grype":{"status":"error","note":"grype failed"}}'
 grep -Fq 'scanner failure (grype)' "$PROJECT_ERR" || fail "broken scanner was not named as infrastructure breakage"
 grep -Fq 'safe doctor' "$PROJECT_ERR" || fail "scanner failure refusal offers no recovery path"
 ! grep -Fqi 'critical' "$PROJECT_ERR" || fail "infrastructure failure reads as a vulnerability finding"

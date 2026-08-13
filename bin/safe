@@ -1976,14 +1976,16 @@ cmd_install_project() {
     refuse 100 "BLOCKED project audit — the safe audit result is not readable as a verdict (got '${verdict}'), so nothing was checked; to allow: fix the scanner — safe doctor, output in ${scan_log}; details: safe explain"
   fi
 
-  # A scanner that RAN AND FAILED is broken infrastructure, not a finding:
-  # its silence is not evidence of a clean project, and --yes must not be
-  # able to accept it. A scanner that is merely absent is a different thing
-  # (reported below, and already WARNs the verdict).
+  # A scanner whose status is "error" produced nothing usable: its silence is
+  # not evidence of a clean project, and --yes must not accept it. "broken" is
+  # a STRUCTURAL signal (status == "error"), never the prose of a free-form
+  # note — matching /fail|error/ over a note misread a "partial" run (some
+  # coverage, one target failed) as total breakage and hard-refused a project
+  # that was in fact audited. "partial", "unsupported" and "absent" are
+  # disclosed below and already WARN the verdict; only "error" refuses.
   local broken_tools
   broken_tools="$(jq -r '
-    def broken: (.status // "ok") as $s
-      | ($s == "error") or (($s != "ok") and (((.note // "") | test("fail|error"; "i"))));
+    def broken: (.status // "ok") == "error";
     [ (.tool_status // {} | to_entries[]? | select(.value | broken) | .key),
       (.ecosystem_audits[]? | select(broken) | (.scanner // "unknown"))
     ] | unique | join(", ")
@@ -1994,8 +1996,11 @@ cmd_install_project() {
     refuse 100 "BLOCKED project audit — scanner failure (${broken_tools}); the project was not fully checked; to allow: fix the scanner — safe doctor, output in ${scan_log}; details: safe explain"
   fi
 
-  # Scanners that are absent rather than broken. Not a refusal — the operator
-  # is told what was NOT looked at, and the verdict is already WARN.
+  # Scanners that are absent, unsupported, or only partially completed — not
+  # broken. Not a refusal — the operator is told what was NOT fully looked at,
+  # and the verdict is already WARN. A "partial" run is disclosed here by its
+  # own note, whatever words that note contains; it is no longer second-guessed
+  # by a /fail|error/ match, which is what wrongly promoted it to a refusal.
   # Core tiers belong here too: a lockfile format the scanner cannot read is
   # coverage the operator never asked to lose, and reporting it only inside the
   # result JSON is how it stayed invisible.
@@ -2008,7 +2013,6 @@ cmd_install_project() {
       (.tool_status // {} | to_entries[]?
        | select((.value.status // "ok") != "ok")
        | select((.value.status // "") != "error")
-       | select(((.value.note // "") | test("fail|error"; "i")) | not)
        | .key + " (" + ((.value.note // "not run")) + ")")
     ] | unique | join(", ")
   ' "$result_path" 2>/dev/null || printf '')"
