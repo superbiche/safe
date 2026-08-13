@@ -2339,6 +2339,26 @@ safe_gate_composer_create_project_spec() {
 #      stdout is the offending token. Per the load-bearing-list doctrine
 #      (see safe_gate_locate_subcommand) gaps merely over-refuse; only
 #      MISCLASSIFICATION bypasses — so unknown short bundles fail closed.
+# Composer binds command options lazily, so create-project's --stability can
+# ALSO appear before the subcommand (`composer --stability=dev create-project
+# …`), where the subcommand locator strips it as an application option and the
+# extractor below never sees it. Scan the whole argv so that leading form
+# refuses too. Only the long `--stability[=]` form is accepted leading; the
+# short `-s` forms Composer rejects leading, but they still reach the extractor
+# post-subcommand, so match every spelling here. Stop at `--`: after it Composer
+# treats tokens as positionals, so a `--stability`-shaped positional is not a
+# selector.
+safe_gate_composer_has_stability_flag() {
+  local arg
+  for arg in "$@"; do
+    case "${arg}" in
+      --) return 1 ;;
+      -s|-s?*|--stability|--stability=*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 safe_gate_composer_create_project_packages() {
   local -a positionals=() require_specs=()
   local arg skip_next=0 options_ended=0 want_require=0 saw_stability=0
@@ -3454,6 +3474,12 @@ safe_gate_composer() {
   # bundles refuse (the extractor cannot model the fetched artifact).
   if [[ "${SAFE_GATE_COMPOSER_CLASS}" == "create-project" ]]; then
     local cp_out cp_rc
+    # --stability can sit before the subcommand too, so check the whole argv
+    # (the extractor only sees post-subcommand args). Both paths refuse.
+    if safe_gate_composer_has_stability_flag "$@"; then
+      safe_gate_err "safe: BLOCKED composer create-project — --stability/-s makes Composer's fetched candidate unpredictable, so safe cannot audit the exact package; to allow: pin the version (composer create-project <vendor/package>:<version> …) and drop --stability; details: safe explain"
+      return 100
+    fi
     cp_out="$(safe_gate_composer_create_project_packages "${SAFE_GATE_COMPOSER_PACKAGE_ARGS[@]}")"
     cp_rc=$?
     case "${cp_rc}" in

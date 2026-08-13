@@ -1739,10 +1739,14 @@ case_composer_reinstall_create_project() {
 
   # --stability/-s selects a candidate safe-audit cannot model (no stability
   # input; a range resolves silently), so create-project fails closed with a
-  # pin hint rather than auditing a default-stability guess. Space and =forms.
+  # pin hint rather than auditing a default-stability guess. Space and =forms,
+  # and the LEADING form (Composer binds --stability before the subcommand too:
+  # `composer --stability=dev create-project …`), which the subcommand locator
+  # would otherwise strip before the extractor.
   for args in 'create-project -s dev vendor/okpkg:^1 dir' \
     'create-project --stability=dev vendor/okpkg' \
-    'create-project vendor/okpkg:1.2.3 -s stable'; do
+    'create-project vendor/okpkg:1.2.3 -s stable' \
+    '--stability=dev create-project vendor/okpkg'; do
     : > "${LOG_FILE}"
     SAFE_INSTALL_TEST_SCRIPT="composer ${args}" run_zsh
     assert_status 100 "$FUNCNAME" || return
@@ -1751,6 +1755,14 @@ case_composer_reinstall_create_project() {
     assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
     assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
   done
+
+  # The space-form leading --stability is an unrecognized application option, so
+  # the subcommand locator fails closed before routing — still no fetch.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer --stability dev create-project vendor/okpkg' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
 
   # An ambiguous multi-character short bundle (Symfony parses -nd as -n plus
   # -d<dir>, shifting the package boundary) fails closed rather than audit the
