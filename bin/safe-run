@@ -22,7 +22,6 @@ SAFE_AUDIT_DATA_DIR="${SAFE_AUDIT_DATA_DIR:-${SAFE_DATA_DIR:-$HOME/.local/share/
 SAFE_AUDIT_HOST_ALLOW_LOG="$SAFE_AUDIT_DATA_DIR/host-allow-log.jsonl"
 
 NODE_IMAGE_DEFAULT="docker.io/library/node:24"
-SAFE_AUDIT_IMAGE="${SAFE_AUDIT_IMAGE:-$NODE_IMAGE_DEFAULT}"
 NODE_IMAGE_ALT="docker.io/library/node:22"
 BUN_IMAGE="docker.io/oven/bun:1.3.14"
 # uv official image has uv + python preinstalled; required for uvx execution.
@@ -87,11 +86,6 @@ runner_ecosystem() {
   esac
 }
 
-safe_audit_spec() {
-  local pkg="$1" version="$2"
-  printf '%s@%s' "$pkg" "$version"
-}
-
 log_host_allow_execution() {
   local pkg="$1" version="$2" runner="$3"
   mkdir -p "$SAFE_AUDIT_DATA_DIR"
@@ -101,66 +95,6 @@ log_host_allow_execution() {
     --arg version "$version" \
     --arg runner "$runner" \
     '{timestamp:$timestamp,package:$package,version:$version,runner:$runner}' >> "$SAFE_AUDIT_HOST_ALLOW_LOG"
-}
-
-safe_audit_check_spec() {
-  local pkg="$1" version="$2" ecosystem="$3"
-  local spec check_json rc verdict restore_errexit=0 image audit_pkg audit_cmd
-  spec=$(safe_audit_spec "$pkg" "$version")
-
-  podman_available || return 2
-  image="$SAFE_AUDIT_IMAGE"
-  podman image exists "$image" 2>/dev/null || return 2
-  audit_pkg="$SAFE_AUDIT_BIN"
-  audit_cmd=$(printf 'npx --yes --ignore-scripts %q package-audit %q --ecosystem %q --json' \
-    "$audit_pkg" "$spec" "$ecosystem")
-
-  [[ $- == *e* ]] && restore_errexit=1
-  set +e
-  check_json=$(podman run --rm \
-    --cap-drop=ALL \
-    --security-opt=no-new-privileges \
-    --read-only \
-    --tmpfs "/tmp:rw,size=256m" \
-    --tmpfs "/root:rw,size=256m" \
-    --pids-limit=128 \
-    --memory=512m \
-    --cpus=1 \
-    --ulimit "nofile=512:512" \
-    --http-proxy=false \
-    -e "HOME=/root" \
-    -e "npm_config_ignore_scripts=true" \
-    "$image" \
-    sh -c "$audit_cmd" 2>/dev/null)
-  rc=$?
-  if [[ "$restore_errexit" == "1" ]]; then
-    set -e
-  else
-    set +e
-  fi
-
-  [[ -n "$check_json" ]] || return 2
-  verdict=$(printf '%s' "$check_json" | jq -r '.verdict // empty' 2>/dev/null || true)
-  case "$verdict" in
-    GO)
-      return 0
-      ;;
-    WARN)
-      return 10
-      ;;
-    BLOCK)
-      return 20
-      ;;
-    *)
-      return 2
-      ;;
-  esac
-}
-
-safe_audit_check_unknown() {
-  local pkg="$1" version="$2" ecosystem
-  ecosystem=$(runner_ecosystem "$RUNNER_KIND")
-  safe_audit_check_spec "$pkg" "$version" "$ecosystem"
 }
 
 # ---------------------------------------------------------------------------
@@ -1192,26 +1126,6 @@ dispatch_run() {
     fi
   fi
 
-  local safe_audit_state=2
-  set +e
-  safe_audit_check_unknown "$pkg" "$version"
-  safe_audit_state=$?
-  set -e
-  case "$safe_audit_state" in
-    20)
-      err "BLOCKED: $pkgver — safe audit reported BLOCK"
-      err "  agent contract: safe explain"
-      audit_log "$runner_label" "$pkgver" "BLOCKED" "$(context_label)" "SAFE_AUDIT_BLOCK"
-      exit 104
-      ;;
-    10)
-      warn "safe audit flagged $pkgver for review before sandboxing"
-      ;;
-    2)
-      warn "safe audit preflight unavailable or inconclusive; continuing with sandbox policy"
-      ;;
-  esac
-
   if in_sandbox_known "$pkg"; then
     info "sandbox-known: running $pkgver in Podman"
     mark_sandbox_known "$pkg" "$version"
@@ -1344,41 +1258,11 @@ registry_integrity_pypi() {
     sed 's/^/sha256-/'
 }
 
-host_allow_preflight_audit() {
-  local pkg="$1" version="$2" ecosystem="$3" reason="$4" action="$5"
-  local pkgver="${pkg}@${version}" state ok
-  set +e
-  safe_audit_check_spec "$pkg" "$version" "$ecosystem"
-  state=$?
-  set -e
-  case "$state" in
-    0)
-      ;;
-    10)
-      warn "safe audit flagged $pkgver before host-allow"
-      [[ -n "$reason" ]] || die "--reason is required to override safe audit WARN"
-      if ! is_tty; then
-        die "host-allow requires interactive confirmation for safe audit WARN"
-      fi
-      printf '  %s host-allow anyway? [y/N] ' "$action" >&2
-      read -r ok </dev/tty
-      [[ "$ok" =~ ^[yY]$ ]] || die "aborted"
-      ;;
-    20)
-      warn "safe audit reported BLOCK for $pkgver before host-allow"
-      [[ -n "$reason" ]] || die "--reason is required to override safe audit BLOCK"
-      if ! is_tty; then
-        die "host-allow requires interactive confirmation for safe audit BLOCK"
-      fi
-      printf '  %s host-allow anyway? [y/N] ' "$action" >&2
-      read -r ok </dev/tty
-      [[ "$ok" =~ ^[yY]$ ]] || die "aborted"
-      ;;
-    2)
-      warn "safe audit preflight unavailable or inconclusive before host-allow"
-      [[ -n "$reason" ]] || die "--reason is required when safe audit is unavailable or inconclusive"
-      ;;
-  esac
+# A trust escalation (host-allow add/update, scripts-allow add) must carry an
+# operator reason: it is the audit trail for bypassing the sandbox default.
+host_allow_require_reason() {
+  local reason="$1"
+  [[ -n "$reason" ]] || die "--reason is required"
 }
 
 write_host_allow_entry() {
@@ -1441,7 +1325,7 @@ cmd_host_allow_add() {
   local package_kind
   package_kind=$(ecosystem_to_runner_kind "$ecosystem") || die "unknown --ecosystem: $ecosystem"
   PKG_NAME=$(normalize_and_validate_package_or_die "$PKG_NAME" "$package_kind" "$spec")
-  host_allow_preflight_audit "$PKG_NAME" "$PKG_VERSION" "$ecosystem" "$reason" "Add to"
+  host_allow_require_reason "$reason"
 
   local sha=""
   case "$ecosystem" in
@@ -1494,7 +1378,7 @@ cmd_host_allow_update() {
     local ok; read -r ok </dev/tty
     [[ "$ok" =~ ^[yY]$ ]] || die "aborted"
   fi
-  host_allow_preflight_audit "$PKG_NAME" "$PKG_VERSION" "$ecosystem" "$reason" "Update"
+  host_allow_require_reason "$reason"
   local sha=""
   case "$ecosystem" in
     npm|bun) sha=$(registry_integrity_npm "$PKG_NAME" "$PKG_VERSION") || true ;;
@@ -1885,7 +1769,7 @@ cmd_scripts_allow_add() {
     die "scripts-allow requires an exact version (got '${PKG_VERSION}'); never names, ranges, or tags"
   PKG_NAME=$(normalize_and_validate_package_or_die "$PKG_NAME" "npm" "$spec")
 
-  host_allow_preflight_audit "$PKG_NAME" "$PKG_VERSION" "$ecosystem" "$reason" "Grant scripts for"
+  host_allow_require_reason "$reason"
 
   # The review step: show the operator what would be authorized. A grant is
   # a statement that these scripts were seen.
@@ -2570,17 +2454,14 @@ DECISION TIERS (in order)
                     current or a parent directory (npx/bunx): run the local
                     binary directly, no fetch
   3. host-allow     Execute on host with --ignore-scripts
-  4. safe audit     Check unknown packages in an isolated audit sandbox;
-                    BLOCK refuses, WARN continues
-  5. sandbox-known  Podman sandbox, no prompt
-  6. unknown        TTY: prompt; non-TTY: BLOCK
+  4. sandbox-known  Podman sandbox, no prompt
+  5. unknown        TTY: prompt; non-TTY: BLOCK
 
 EXIT CODES (policy refusals; distinguish from 127 = command not found)
   100  blocked by policy (blocklist, missing gate library, fail-closed audit, unrecognized/unsupported runner-native flags)
   101  host-allow version pin mismatch
   102  interactive operator confirmation required (non-TTY refusal)
   103  invalid package name rejected
-  104  safe audit BLOCK verdict
   Full agent contract: safe explain
 EOF
 }

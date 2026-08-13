@@ -58,16 +58,8 @@ sys.exit(os.waitstatus_to_exitcode(status))
 }
 
 if command -v python3 >/dev/null 2>&1; then
-  # Stubs: podman (audit preflight GO) and curl (registry version doc +
-  # integrity fetch) — the add must show the scripts it authorizes.
-  cat > "$tmp/bin/podman" <<'SH'
-#!/usr/bin/env bash
-case "$1" in
-  image) exit 0 ;;
-  run) printf '{"verdict":"GO"}\n' ;;
-  *) exit 1 ;;
-esac
-SH
+  # Stub curl (registry version doc + integrity fetch) — the add must show
+  # the scripts it authorizes.
   cat > "$tmp/bin/curl" <<'SH'
 #!/usr/bin/env bash
 url="${!#}"
@@ -77,7 +69,7 @@ case "$url" in
   *) exit 22 ;;
 esac
 SH
-  chmod +x "$tmp/bin/podman" "$tmp/bin/curl"
+  chmod +x "$tmp/bin/curl"
 
   add_cmd="SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' scripts-allow add left-pad@1.3.0 --reason 'needs binary fetch'"
   out=$(pty_run "$add_cmd" 2>&1) || fail "TTY add failed: $out"
