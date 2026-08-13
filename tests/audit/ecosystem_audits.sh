@@ -454,6 +454,108 @@ STUB
   pass "$FUNCNAME"
 }
 
+case_pip_audit_partial_does_not_gate_as_broken() {
+  prepare_case "install-pip-partial"
+  printf 'app==1.0.0\n' > "$CASE_PROJECT/requirements.txt"
+  printf 'devtool==2.0.0\n' > "$CASE_PROJECT/requirements-dev.txt"
+  # requirements.txt audits clean; requirements-dev.txt breaks -> status
+  # "partial", note "pip-audit failed for: ...". A partial run DID cover part
+  # of the project, so the gate must disclose it and WARN, never hard-refuse
+  # it as a broken scanner. The old /fail|error/ note-regex turned "one target
+  # failed" into "nothing was checked" (exit 100), an unrescuable dead end.
+  cat > "$MOCKBIN/pip-audit" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *requirements-dev.txt*) printf 'resolution error
+' >&2; exit 2 ;;
+  *) printf '%s' '{"dependencies":[{"name":"app","version":"1.0.0","vulns":[]}]}'; exit 0 ;;
+esac
+STUB
+  chmod +x "$MOCKBIN/pip-audit"
+  local rc=0
+  set +e
+  (
+    cd "$CASE_PROJECT" || exit 99
+    env \
+      HOME="$CASE_DIR/home" \
+      PATH="$MOCKBIN:/usr/bin:/bin" \
+      SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+      SAFE_AUDIT_CONFIG_DIR="$CASE_DIR/audit-config" \
+      SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
+      SAFE_DATA_DIR="$CASE_DIR/safe-data" \
+      SAFE_AUDIT_SCAN_NO_CACHE=1 \
+      "$ROOT/bin/safe" install --project --yes
+  ) > "$CASE_DIR/install.out" 2> "$CASE_DIR/install.err"
+  rc=$?
+  set -e
+  # Restore the shared stub for later cases.
+  cat > "$MOCKBIN/pip-audit" <<'STUB'
+#!/usr/bin/env bash
+printf '%s' "${PIP_AUDIT_OUT:-}"
+exit "${PIP_AUDIT_RC:-0}"
+STUB
+  chmod +x "$MOCKBIN/pip-audit"
+
+  # A partial scanner is not broken infrastructure: --yes accepts the WARN.
+  [[ "$rc" -eq 0 ]] || { printf 'expected rc=0, got %s\n%s\n%s\n' "$rc" "$(cat "$CASE_DIR/install.out")" "$(cat "$CASE_DIR/install.err")" >&2; fail "$FUNCNAME"; return; }
+  if grep -Fq 'scanner failure' "$CASE_DIR/install.err"; then
+    printf 'partial pip-audit wrongly refused as broken:\n%s\n' "$(cat "$CASE_DIR/install.err")" >&2; fail "$FUNCNAME"; return
+  fi
+  grep -Eq 'not run:.*pip-audit' "$CASE_DIR/install.out" || { printf 'partial pip-audit not disclosed:\n%s\n' "$(cat "$CASE_DIR/install.out")" >&2; fail "$FUNCNAME"; return; }
+  grep -Fq 'verdict:   WARN' "$CASE_DIR/install.out" || { cat "$CASE_DIR/install.out" >&2; fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
+case_syft_execution_failure_is_error_not_skipped() {
+  prepare_case "syft-failed"
+  printf '{"name":"demo","dependencies":{"left-pad":"^1.0.0"}}\n' > "$CASE_PROJECT/package.json"
+  printf '{"lockfileVersion":3,"packages":{"":{"name":"demo"}}}\n' > "$CASE_PROJECT/package-lock.json"
+  # syft present but exits nonzero -> safe-audit writes the "syft failed" marker
+  # SBOM, and grype then scans an EMPTY SBOM. That is a real execution failure,
+  # so tool_status.syft must be "error" and the install gate must refuse. The
+  # old mapping collapsed "failed" into "skipped", which --yes silently
+  # accepted (an unaudited project passing as a WARN). A syft that is merely
+  # "unavailable" stays skipped — this asserts only the failure path.
+  cat > "$MOCKBIN/syft" <<'STUB'
+#!/usr/bin/env bash
+printf 'syft: boom\n' >&2
+exit 1
+STUB
+  chmod +x "$MOCKBIN/syft"
+  run_scan
+  cp "$RESULT" "$CASE_DIR/result-copy.json" 2>/dev/null || true
+  local rc=0
+  set +e
+  (
+    cd "$CASE_PROJECT" || exit 99
+    env \
+      HOME="$CASE_DIR/home" \
+      PATH="$MOCKBIN:/usr/bin:/bin" \
+      SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+      SAFE_AUDIT_CONFIG_DIR="$CASE_DIR/audit-config" \
+      SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
+      SAFE_DATA_DIR="$CASE_DIR/safe-data" \
+      SAFE_AUDIT_SCAN_NO_CACHE=1 \
+      "$ROOT/bin/safe" install --project --yes
+  ) > "$CASE_DIR/install.out" 2> "$CASE_DIR/install.err"
+  rc=$?
+  set -e
+  # Restore the shared clean stub before any assertion can return.
+  cat > "$MOCKBIN/syft" <<'STUB'
+#!/usr/bin/env bash
+printf '{"components":[],"metadata":{"tools":[{"name":"syft"}]}}\n'
+exit 0
+STUB
+  chmod +x "$MOCKBIN/syft"
+  # Normalizer: a failed syft is an error, never a skip.
+  jq -e '.tool_status.syft.status == "error"' "$CASE_DIR/result-copy.json" >/dev/null 2>&1 \
+    || { jq -c '.tool_status.syft' "$CASE_DIR/result-copy.json" >&2; fail "$FUNCNAME"; return; }
+  # Gate: --yes must not accept an unaudited project (exit 100).
+  [[ "$rc" -eq 100 ]] || { printf 'expected rc=100, got %s\n%s\n%s\n' "$rc" "$(cat "$CASE_DIR/install.out")" "$(cat "$CASE_DIR/install.err")" >&2; fail "$FUNCNAME"; return; }
+  grep -Fq 'scanner failure' "$CASE_DIR/install.err" || { cat "$CASE_DIR/install.err" >&2; fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
 case_lockless_npm_project_is_not_clean() {
   prepare_case "no-lock"
   # package.json only: osv-scanner has no lockfile to read and npm audit has
@@ -584,6 +686,8 @@ main() {
     case_govulncheck_partial_stream_is_an_error \
     case_govulncheck_nonzero_exit_is_an_error \
     case_pip_audit_partial_failure_keeps_what_was_found \
+    case_pip_audit_partial_does_not_gate_as_broken \
+    case_syft_execution_failure_is_error_not_skipped \
     case_lockless_npm_project_is_not_clean \
     case_pnpm_project_still_caches \
     case_missing_tool_is_reported_not_fatal_when_allowed \

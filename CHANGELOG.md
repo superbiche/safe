@@ -10,6 +10,33 @@
   dir from `PATH` for the reshim, so mise relinks the shims to the real binary.
   The gate bin dir is exposed in `safe doctor --json` under
   `environment.install_wrappers.bin_root`.
+- **`safe doctor` now reports the ecosystem auditors it was blind to.**
+  `govulncheck`, `pip-audit`, `cargo-audit`, and `composer` are needed only
+  when a project of that ecosystem is audited, so doctor never listed them —
+  and answered "no missing prerequisites" on a box that had none of them. They
+  now appear as a distinct advisory ("ecosystem auditors — present only matters
+  when auditing that ecosystem") reporting each present/absent, and surface in
+  `--json` under `features.ecosystem_auditors`. They are deliberately NOT
+  missing prerequisites: a machine that never touches Go does not owe
+  `govulncheck`, and a `repo-audit` that needs one already WARNs and names it.
+- **A partly-failed ecosystem audit no longer hard-refuses the install.** The
+  project gate classed a scanner as broken infrastructure by matching
+  `/fail|error/` against its free-form note, so a `pip-audit` that covered
+  `requirements.txt` and only broke on `requirements-dev.txt` — status
+  `partial`, note `pip-audit failed for: …` — was refused with exit 100 as if
+  nothing had been checked, a dead end no allow could rescue. "broken" is now
+  the structural `status == "error"` alone; a `partial` run (real, if
+  incomplete, coverage) is disclosed on the `not run:` line and WARNs the
+  verdict like any other degraded tier. The same note-regex also misfired on
+  lockfile paths containing "fail"/"error". Only a scanner that returned
+  nothing usable refuses.
+
+  As part of the same move, `syft_status` now distinguishes its own markers: a
+  `syft failed` (the executable ran and exited nonzero, leaving an empty SBOM
+  that grype then scans) statuses `error` and refuses, while `syft unavailable`
+  (absent) stays a disclosed skip. Collapsing both to `skipped` — harmless
+  while the note-regex still caught "failed" — would otherwise have let a real
+  syft execution failure pass under `--yes` once the regex was gone.
 
 - **Removed a latent typosquat vector: the sandboxed audit "preflight."**
   `safe run` built an audit command as `npx --yes safe-audit package-audit …`
