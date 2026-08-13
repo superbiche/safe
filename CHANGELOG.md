@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **`safe doctor` now reports the ecosystem auditors it was blind to.**
+  `govulncheck`, `pip-audit`, `cargo-audit`, and `composer` are needed only
+  when a project of that ecosystem is audited, so doctor never listed them —
+  and answered "no missing prerequisites" on a box that had none of them. They
+  now appear as a distinct advisory ("ecosystem auditors — present only matters
+  when auditing that ecosystem") reporting each present/absent, and surface in
+  `--json` under `features.ecosystem_auditors`. They are deliberately NOT
+  missing prerequisites: a machine that never touches Go does not owe
+  `govulncheck`, and a `repo-audit` that needs one already WARNs and names it.
 - **A partly-failed ecosystem audit no longer hard-refuses the install.** The
   project gate classed a scanner as broken infrastructure by matching
   `/fail|error/` against its free-form note, so a `pip-audit` that covered
