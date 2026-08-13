@@ -652,6 +652,12 @@ safe_gate_composer_subcommand_class() {
     install) printf '%s' install; return 0 ;;
     update) printf '%s' update; return 0 ;;
     require) printf '%s' require; return 0 ;;
+    # reinstall re-fetches the locked tree, so it audits as an install-class
+    # project scan. create-project fetches a named root package and gets its
+    # own class (its positional grammar differs from require — only the first
+    # positional is a package).
+    reinstall) printf '%s' install; return 0 ;;
+    create-project) printf '%s' create-project; return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -671,7 +677,13 @@ safe_gate_composer_noncanonical_target() {
     r) printf '%s' require; return 0 ;;
   esac
 
-  for candidate in install update require upgrade global; do
+  # reinstall and create-project are gated too, so their abbreviations must
+  # refuse rather than pass through — `composer creat vendor/pkg` expands in
+  # Symfony and would otherwise fetch unaudited. Exact commands short-circuit
+  # above, so adding them here cannot false-refuse a built-in (live oracle
+  # guards this). require precedes reinstall so the ambiguous `re` keeps its
+  # existing canonical hint.
+  for candidate in install update require upgrade global reinstall create-project; do
     [[ "${candidate}" == "${token}"* ]] || continue
     case "${candidate}" in
       upgrade) printf '%s' update ;;
@@ -2283,6 +2295,95 @@ safe_gate_composer_packages() {
   safe_gate_print_list "${packages[@]}"
 }
 
+# create-project accepts the version fused to the package name with `:` or `=`
+# (`vendor/pkg:1.2`, `vendor/pkg=1.2`), per its --help; a bare name defaults to
+# latest. `:` wins when both could match so a constraint like `^1.2` stays
+# intact after the separator.
+safe_gate_composer_create_project_spec() {
+  local spec="$1" name version
+  if [[ "${spec}" == *:* ]]; then
+    name="${spec%%:*}"; version="${spec#*:}"
+  elif [[ "${spec}" == *=* ]]; then
+    name="${spec%%=*}"; version="${spec#*=}"
+  else
+    name="${spec}"; version="latest"
+  fi
+  safe_gate_print_spec "${name}" "${version}"
+}
+
+# create-project's positional grammar differs from require: only the FIRST
+# non-flag positional is a package; the 2nd positional is the target directory
+# and the 3rd a version — neither is ever a package. `--require` names
+# ADDITIONAL packages composer fetches (it deletes the lock and runs an update),
+# so those are audited too. Value-taking flags are enumerated from
+# `composer create-project --help` so a space-form value (e.g. `-s dev`) can
+# never be mistaken for the package positional — a mis-parse would let the real
+# fetched package skip audit. Prints one spec per line (root package first, then
+# each --require); empty output means the bare form (no package, no --require),
+# and the caller decides scan-or-refuse.
+safe_gate_composer_create_project_packages() {
+  local -a specs=()
+  local arg skip_next=0 options_ended=0 want_require=0 have_root=0
+
+  for arg in "$@"; do
+    if (( skip_next )); then
+      skip_next=0
+      continue
+    fi
+    if (( want_require )); then
+      want_require=0
+      specs+=("$(safe_gate_colon_spec "${arg}")")
+      continue
+    fi
+
+    if (( options_ended )); then
+      if (( have_root == 0 )); then
+        have_root=1
+        specs+=("$(safe_gate_composer_create_project_spec "${arg}")")
+      fi
+      continue
+    fi
+
+    case "${arg}" in
+      --)
+        options_ended=1
+        continue
+        ;;
+      --require)
+        want_require=1
+        continue
+        ;;
+      --require=*)
+        specs+=("$(safe_gate_colon_spec "${arg#*=}")")
+        continue
+        ;;
+      # create-project value-taking options (from `composer create-project
+      # --help`). Their space-form value must be skipped so it cannot be read
+      # as the package positional. --ignore-platform-reqs (plural, boolean) is
+      # intentionally absent: it falls through to the bare-flag arm below.
+      -s|--stability|--prefer-install|--repository|--repository-url|--audit-format|--ignore-platform-req|--working-dir|-d)
+        skip_next=1
+        continue
+        ;;
+      -s?*|--stability=*|--prefer-install=*|--repository=*|--repository-url=*|--audit-format=*|--ignore-platform-req=*|--working-dir=*|-d?*)
+        continue
+        ;;
+      -*)
+        continue
+        ;;
+      *)
+        if (( have_root == 0 )); then
+          have_root=1
+          specs+=("$(safe_gate_composer_create_project_spec "${arg}")")
+        fi
+        continue
+        ;;
+    esac
+  done
+
+  safe_gate_print_list "${specs[@]}"
+}
+
 safe_gate_python_packages() {
   local -a packages=()
   local arg
@@ -3287,6 +3388,7 @@ safe_gate_composer() {
       ;;
   esac
   local -a packages=()
+  local composer_create_project_scan=0
 
   if [[ "${SAFE_GATE_COMPOSER_CLASS}" == "require" ]]; then
     safe_gate_collect packages "$(safe_gate_composer_packages "${SAFE_GATE_COMPOSER_PACKAGE_ARGS[@]}")"
@@ -3300,6 +3402,23 @@ safe_gate_composer() {
     fi
   fi
 
+  # create-project audits its first positional package (plus any --require
+  # additions). A bare create-project inside a project directory is install-
+  # class (composer installs the current project), so it scans instead. With no
+  # package and no project there is nothing to audit before Composer's
+  # interactive fetch — fail closed.
+  if [[ "${SAFE_GATE_COMPOSER_CLASS}" == "create-project" ]]; then
+    safe_gate_collect packages "$(safe_gate_composer_create_project_packages "${SAFE_GATE_COMPOSER_PACKAGE_ARGS[@]}")"
+    if (( ${#packages[@]} == 0 )); then
+      if (( SAFE_GATE_COMPOSER_IS_GLOBAL == 0 )) && safe_gate_composer_project_present; then
+        composer_create_project_scan=1
+      else
+        safe_gate_err "safe: BLOCKED composer create-project — name the <vendor/package> to create from so safe can audit it before Composer fetches it; to allow: pass <vendor/package>[:<version>]; details: safe explain"
+        return 100
+      fi
+    fi
+  fi
+
   if (( SAFE_GATE_COMPOSER_IS_GLOBAL )); then
     case "${SAFE_GATE_COMPOSER_CLASS}" in
       install|update|require)
@@ -3307,7 +3426,8 @@ safe_gate_composer() {
         ;;
     esac
 
-    if [[ "${SAFE_GATE_COMPOSER_CLASS}" == "require" ]]; then
+    if [[ "${SAFE_GATE_COMPOSER_CLASS}" == "require" || "${SAFE_GATE_COMPOSER_CLASS}" == "create-project" ]] \
+        && (( ${#packages[@]} )); then
       safe_gate_check_many composer "${packages[@]}" || return $?
     fi
 
@@ -3315,7 +3435,16 @@ safe_gate_composer() {
     return $?
   fi
 
-  if [[ -n "${SAFE_GATE_COMPOSER_CLASS}" ]]; then
+  if [[ "${SAFE_GATE_COMPOSER_CLASS}" == "create-project" ]]; then
+    # create-project with a package creates a NEW project and ignores the
+    # current directory, so it never scans the cwd — it audits the named
+    # package(s) instead. The bare install-class form scans and does not audit.
+    if (( composer_create_project_scan )); then
+      safe_gate_scan_project || return $?
+    elif (( ${#packages[@]} )); then
+      safe_gate_check_many composer "${packages[@]}" || return $?
+    fi
+  elif [[ -n "${SAFE_GATE_COMPOSER_CLASS}" ]]; then
     if safe_gate_composer_project_present; then
       safe_gate_scan_project || return $?
     fi

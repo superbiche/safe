@@ -1609,7 +1609,8 @@ case_composer_canonical_or_refuse() {
 
   # Composer accepts these aliases and abbreviations itself. Safe refuses
   # every gated-looking one before any scan, package audit, or delegation.
-  for token in i u upgrade r in ins up upg upgr upgra upgrad re req requ g gl glo glob globa; do
+  for token in i u upgrade r in ins up upg upgr upgra upgrad re req requ g gl glo glob globa \
+    rei rein reins reinst reinsta reinstal creat crea create create-p create-projec; do
     : > "${LOG_FILE}"
     SAFE_INSTALL_TEST_SCRIPT="composer ${token} vendor/okpkg:^1" run_zsh
     assert_status 100 "$FUNCNAME" || return
@@ -1647,7 +1648,9 @@ case_composer_canonical_or_refuse() {
   done
 
   # Non-gated command prefixes keep their pre-existing passthrough behavior.
-  for token in rei rem; do
+  # `rem` (remove) fetches nothing; only prefixes that resolve to a gated
+  # command refuse.
+  for token in rem; do
     : > "${LOG_FILE}"
     SAFE_INSTALL_TEST_SCRIPT="composer ${token} vendor/blockme" run_zsh
     assert_status 0 "$FUNCNAME" || return
@@ -1698,6 +1701,84 @@ case_composer_canonical_or_refuse() {
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_contains $'REAL\tcomposer\trequire\t--\tvendor/okpkg:^1' "$FUNCNAME" || return
+
+  pass "$FUNCNAME"
+}
+
+case_composer_reinstall_create_project() {
+  prepare_case "composer-reinstall-create-project"
+
+  # reinstall re-fetches the locked tree, so it audits as an install-class
+  # project scan and never treats a targeted package as a new install.
+  touch "${WORK_DIR}/composer.json"
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer reinstall' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'package-audit' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\treinstall' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer reinstall vendor/blockme' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'package-audit' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\treinstall\tvendor/blockme' "$FUNCNAME" || return
+
+  # create-project with a package audits ONLY the first positional; the
+  # directory and version positionals that follow must never be audited.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer create-project vendor/okpkg:^1 targetdir 1.2.3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'\ttargetdir@' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'\t1.2.3@' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\tcreate-project\tvendor/okpkg:^1\ttargetdir\t1.2.3' "$FUNCNAME" || return
+
+  # A space-form value flag before the package must not be mistaken for the
+  # package positional (a mis-parse would let the real package skip audit).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer create-project -s dev vendor/okpkg:^1 dir' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'\tdev@' "$FUNCNAME" || return
+
+  # --require names additional fetched packages, so they are audited on top of
+  # the root package. The equals and space forms both count.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer create-project vendor/okpkg:^1 --require extra/one:^2 --require=extra/two:^3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\textra/one@^2\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\textra/two@^3\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # A create-project package resolving to a blocked advisory refuses before any
+  # delegation — the audit boundary really gates the fetch. A package-audit
+  # BLOCK verdict exits 104 (distinct from the 100 policy refusals above).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer create-project vendor/blockme dir' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+
+  # A bare create-project inside a project directory installs the current
+  # project (install-class): it scans and delegates without auditing a package.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer create-project' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'package-audit' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tcomposer\tcreate-project' "$FUNCNAME" || return
+
+  # With no package AND no project there is nothing to audit before the
+  # interactive fetch — fail closed with a single stderr line.
+  rm -f "${WORK_DIR}/composer.json" "${WORK_DIR}/composer.lock"
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer create-project' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+  assert_err_contains_fragment 'name the <vendor/package> to create from' "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
 
   pass "$FUNCNAME"
 }
@@ -5171,6 +5252,7 @@ main() {
     case_npm_camelcase_dispatch_and_conservative_ambiguity \
     case_non_npm_abbreviations_stay_passthrough \
     case_composer_canonical_or_refuse \
+    case_composer_reinstall_create_project \
     case_composer_global_canonical_routing \
     case_npm_dedupe_lockdiff_empty_delegates_without_scan \
     case_npm_lockdiff_absent_node_modules_refuses \

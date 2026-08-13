@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Composer `reinstall` and `create-project` are now gated.** Both fetch remote
+  artifacts but were recognized-but-passthrough. `reinstall` re-fetches the
+  locked tree, so it is audited as an install-class project scan (covering both
+  `reinstall` and `reinstall vendor/pkg`). `create-project` audits only its
+  first positional package — the trailing `[directory]` and `[version]`
+  positionals are never treated as packages, and value-taking flags (`-s`,
+  `--repository`, `--working-dir`, …) can no longer be mistaken for the package.
+  A bare `create-project` inside an existing project is install-class (it scans
+  and delegates); with no package and no project it fails closed. Any `--require`
+  additions are audited on top of the root package. Abbreviations of both
+  commands (`composer creat`, `composer reins`) now refuse with a canonical
+  spelling instead of passing through unaudited — closing a bypass where Symfony
+  would expand the prefix and fetch before the gate saw it.
+
 - **`safe doctor`'s mise-shim warning is now actionable.** When mise shims are
   bound to the gate wrapper, doctor printed "repoint the shims at the real mise
   binary" — whose obvious execution, a bare `mise reshim`, rebinds them to the
