@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **A partly-failed ecosystem audit no longer hard-refuses the install.** The
+  project gate classed a scanner as broken infrastructure by matching
+  `/fail|error/` against its free-form note, so a `pip-audit` that covered
+  `requirements.txt` and only broke on `requirements-dev.txt` — status
+  `partial`, note `pip-audit failed for: …` — was refused with exit 100 as if
+  nothing had been checked, a dead end no allow could rescue. "broken" is now
+  the structural `status == "error"` alone; a `partial` run (real, if
+  incomplete, coverage) is disclosed on the `not run:` line and WARNs the
+  verdict like any other degraded tier. The same note-regex also misfired on
+  lockfile paths containing "fail"/"error". Only a scanner that returned
+  nothing usable refuses.
+
 - **Removed a latent typosquat vector: the sandboxed audit "preflight."**
   `safe run` built an audit command as `npx --yes safe-audit package-audit …`
   inside a Podman sandbox — an unpinned fetch of a public npm package named
