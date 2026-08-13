@@ -12,6 +12,8 @@ Canonical shared rule source for this repo; vendor bridge files (`CLAUDE.md`, �
 
 The installed gate is a COPY: repo edits change nothing live until `install.sh` re-runs, and gated shells hold zsh function snapshots from their start. Two false "shipped bug" reports came from stale snapshots — before reporting a live-behavior bug, verify which version actually ran (`safe --version`, wrapper realpath).
 
+Running `install.sh` is pre-authorized whenever it makes the live gate better — after landing a fix, to close repo-vs-live skew, or to verify shipped behavior. Do it without asking; report what changed. It stays an ask only when the intent is anything other than improving the installed gate.
+
 ## Operator rulings (standing)
 
 - Never suggest, match, or allowlist `@latest`; allow entries are pinned to resolved versions.
