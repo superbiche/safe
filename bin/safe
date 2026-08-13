@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.21.0"
+SAFE_VERSION="1.23.0"
 # Exported at the top level, not per-subcommand: safe-audit pins itself to
 # this version, and every route that reaches it — the gate, `safe audit ...`,
 # `safe install`, the safe-audit compatibility command — must carry it or the
@@ -844,6 +844,18 @@ doctor_payload_json() {
   fi
   sandbox_timeout_json=$(command_presence_json timeout)
 
+  # Ecosystem auditors are conditional prerequisites: each is needed only when
+  # a project of that ecosystem is audited, so a machine that never touches Go
+  # cannot owe govulncheck. Listing them under "missing prerequisites" would
+  # cry wolf on every box; a repo-audit already WARNs and names the tool it
+  # could not run. Doctor still reports their presence as an advisory so the
+  # gap is visible before a scan needs them — reported, never a health failure.
+  local eco_govulncheck_json eco_pip_audit_json eco_cargo_audit_json eco_composer_json
+  eco_govulncheck_json=$(command_presence_json govulncheck)
+  eco_pip_audit_json=$(command_presence_json pip-audit)
+  eco_cargo_audit_json=$(command_presence_json cargo-audit)
+  eco_composer_json=$(command_presence_json composer)
+
   # Socket wiring: a failing socket score WARN-refuses installs, so the
   # doctor must make the auth/injection chain verifiable in one command.
   local socket_cmd socket_mapping="$HOME/.config/setup-new-machines/bw-env.d/socket.env"
@@ -1028,6 +1040,10 @@ doctor_payload_json() {
     --argjson binary_exec "$binary_exec_json" \
     --argjson safe_run_sandbox "$safe_run_sandbox_json" \
     --argjson osv_lockfile_support "$lockfile_support_json" \
+    --argjson eco_govulncheck "$eco_govulncheck_json" \
+    --argjson eco_pip_audit "$eco_pip_audit_json" \
+    --argjson eco_cargo_audit "$eco_cargo_audit_json" \
+    --argjson eco_composer "$eco_composer_json" \
     --argjson safe_run_config_present "$( [[ -f "$run_config_dir/config.json" ]] && printf 'true' || printf 'false' )" \
     --argjson safe_run_host_allow_file "$( [[ -f "$run_config_dir/host-allow.json" ]] && printf 'true' || printf 'false' )" \
     --argjson safe_run_sandbox_known_file "$( [[ -f "$run_config_dir/sandbox-known.json" ]] && printf 'true' || printf 'false' )" \
@@ -1094,7 +1110,13 @@ doctor_payload_json() {
         verify_tuf_bootstrap: $verify_tuf_bootstrap,
         binary_exec: $binary_exec,
         safe_run_sandbox: $safe_run_sandbox,
-        osv_lockfile_support: $osv_lockfile_support
+        osv_lockfile_support: $osv_lockfile_support,
+        ecosystem_auditors: {
+          govulncheck: $eco_govulncheck,
+          pip_audit: $eco_pip_audit,
+          cargo_audit: $eco_cargo_audit,
+          composer: $eco_composer
+        }
       },
       environment: {
         safe_core: {
@@ -1184,6 +1206,12 @@ print_doctor_human() {
           else empty end)]
          | join("; "))
       end),
+    "",
+    "ecosystem auditors (present only matters when auditing that ecosystem):",
+    "  govulncheck (Go):   " + (if .features.ecosystem_auditors.govulncheck.present then "present" else "absent — Go repos lose their govulncheck tier (repo-audit still WARNs and says so)" end),
+    "  pip-audit (Python): " + (if .features.ecosystem_auditors.pip_audit.present then "present" else "absent — Python repos lose their pip-audit tier (repo-audit still WARNs and says so)" end),
+    "  cargo-audit (Rust): " + (if .features.ecosystem_auditors.cargo_audit.present then "present" else "absent — Rust repos lose their cargo-audit tier (repo-audit still WARNs and says so)" end),
+    "  composer (PHP):     " + (if .features.ecosystem_auditors.composer.present then "present" else "absent — PHP repos lose their composer-audit tier (repo-audit still WARNs and says so)" end),
     "",
     "socket wiring (install gate scoring):",
     "  cli: " + (if .environment.socket.cli_present then .environment.socket.cli_path else "MISSING — install socket CLI" end),

@@ -883,6 +883,42 @@ case_doctor_podman_probe_skips_exec_under_no_new_privs() {
   pass "$FUNCNAME"
 }
 
+case_doctor_ecosystem_auditors_are_advisory_not_prereq() {
+  prepare_case "doctor-ecosystem-auditors"
+  # Ecosystem auditors (govulncheck/pip-audit/cargo-audit/composer) are needed
+  # only when auditing that ecosystem, so doctor reports their presence as an
+  # advisory and NEVER as a missing prerequisite — otherwise a box that never
+  # touches Go fails its health check for lacking govulncheck. A stubbed
+  # govulncheck is "present"; whatever is absent must not reach the prereq list.
+  local bindir="${HOME_DIR}/eco-stub-bin"
+  mkdir -p "${bindir}"
+  printf '#!/usr/bin/env bash\nprintf "govulncheck v1.0.0\\n"\n' > "${bindir}/govulncheck"
+  chmod +x "${bindir}/govulncheck"
+  local doctor_out
+  doctor_out="$(env HOME="${HOME_DIR}" PATH="${bindir}:/usr/bin:/bin" \
+    bash "${ROOT_DIR}/bin/safe" doctor --json 2>/dev/null)"
+  jq -e '.features.ecosystem_auditors.govulncheck.present == true
+    and (.features.ecosystem_auditors | has("pip_audit"))
+    and (.features.ecosystem_auditors | has("cargo_audit"))
+    and (.features.ecosystem_auditors | has("composer"))' \
+    <<<"${doctor_out}" >/dev/null || { printf '%s\n' "${doctor_out}" >&2; fail "$FUNCNAME"; return; }
+  local doctor_human
+  doctor_human="$(env HOME="${HOME_DIR}" PATH="${bindir}:/usr/bin:/bin" \
+    bash "${ROOT_DIR}/bin/safe" doctor 2>/dev/null)"
+  grep -Fq 'ecosystem auditors' <<<"${doctor_human}" \
+    || { printf '%s\n' "${doctor_human}" >&2; fail "$FUNCNAME"; return; }
+  grep -Eq 'govulncheck \(Go\): +present' <<<"${doctor_human}" \
+    || { printf '%s\n' "${doctor_human}" >&2; fail "$FUNCNAME"; return; }
+  # The core invariant: no ecosystem auditor is ever a missing prerequisite.
+  if sed -n '/missing prerequisites:/,$p' <<<"${doctor_human}" \
+      | grep -Eq 'govulncheck|pip-audit|cargo-audit|composer'; then
+    printf '%s\n' "${doctor_human}" >&2
+    fail "$FUNCNAME (ecosystem auditor leaked into missing prerequisites)"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
 case_uv_python_selector_not_a_package() {
   prepare_case "uv-python-selector-not-a-package"
   # --python/-p selects an interpreter; its value ("3.12") must never be
@@ -5118,6 +5154,7 @@ main() {
     case_wrappers_not_on_path_are_unhealthy \
     case_dash_bin_root_never_reports_healthy \
     case_doctor_podman_probe_skips_exec_under_no_new_privs \
+    case_doctor_ecosystem_auditors_are_advisory_not_prereq \
     case_uv_index_selectors_reach_audit \
     case_uninstall_removes_gate_wrappers \
     case_install_cleans_legacy_safe_install_artifacts \
