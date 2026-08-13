@@ -1725,32 +1725,81 @@ case_composer_reinstall_create_project() {
   assert_log_not_contains_fragment 'package-audit' "$FUNCNAME" || return
   assert_log_contains $'REAL\tcomposer\treinstall\tvendor/blockme' "$FUNCNAME" || return
 
-  # create-project with a package audits ONLY the first positional; the
-  # directory and version positionals that follow must never be audited.
+  # create-project audits ONLY the first positional as a package, and Composer's
+  # explicit [version] positional OVERRIDES a version fused into the name
+  # (Composer gives the positional precedence). The directory positional is
+  # never audited.
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='composer create-project vendor/okpkg:^1 targetdir 1.2.3' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@1.2.3\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'\tvendor/okpkg@^1\t' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\ttargetdir@' "$FUNCNAME" || return
-  assert_log_not_contains_fragment $'\t1.2.3@' "$FUNCNAME" || return
   assert_log_contains $'REAL\tcomposer\tcreate-project\tvendor/okpkg:^1\ttargetdir\t1.2.3' "$FUNCNAME" || return
 
-  # A space-form value flag before the package must not be mistaken for the
-  # package positional (a mis-parse would let the real package skip audit).
+  # --stability/-s selects a candidate safe-audit cannot model (no stability
+  # input; a range resolves silently), so create-project fails closed with a
+  # pin hint rather than auditing a default-stability guess. Space and =forms.
+  for args in 'create-project -s dev vendor/okpkg:^1 dir' \
+    'create-project --stability=dev vendor/okpkg' \
+    'create-project vendor/okpkg:1.2.3 -s stable'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer ${args}" run_zsh
+    assert_status 100 "$FUNCNAME" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+    assert_err_contains_fragment 'stability/-s makes Composer' "$FUNCNAME" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+  done
+
+  # An ambiguous multi-character short bundle (Symfony parses -nd as -n plus
+  # -d<dir>, shifting the package boundary) fails closed rather than audit the
+  # wrong token as the package.
+  for args in 'create-project -nd vendor/allowed vendor/blockme' \
+    'create-project -ns dev vendor/blockme'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer ${args}" run_zsh
+    assert_status 100 "$FUNCNAME" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+    assert_err_contains_fragment 'bundled short option' "$FUNCNAME" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME" || return
+  done
+
+  # A value flag in a form safe DOES model must not be mistaken for the package.
   : > "${LOG_FILE}"
-  SAFE_INSTALL_TEST_SCRIPT='composer create-project -s dev vendor/okpkg:^1 dir' run_zsh
+  SAFE_INSTALL_TEST_SCRIPT='composer create-project --prefer-install dist vendor/okpkg:^1 dir' run_zsh
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
-  assert_log_not_contains_fragment $'\tdev@' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'\tdist@' "$FUNCNAME" || return
 
   # --require names additional fetched packages, so they are audited on top of
-  # the root package. The equals and space forms both count.
+  # the root package. The equals and space forms both count. A named root
+  # creates a NEW project, so the cwd is not scanned.
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='composer create-project vendor/okpkg:^1 --require extra/one:^2 --require=extra/two:^3' run_zsh
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tpackage-audit\textra/one@^2\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tpackage-audit\textra/two@^3\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # create-project with NO root but a --require addition is install-class:
+  # Composer installs the current project and adds the requirement, so safe
+  # scans the project AND audits the added package (both).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='composer create-project --require vendor/okpkg:^2' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@^2\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # --repository-url is a live (deprecated) source selector Composer uses for
+  # root-package selection, so it must reach the audit as the custom source.
+  for form in '--repository-url https://alt.example' '--repository-url=https://alt.example'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="composer create-project ${form} vendor/okpkg:^1 dir" run_zsh
+    assert_status 0 "$FUNCNAME" || return
+    assert_log_contains $'AUDIT\tpackage-audit\tvendor/okpkg@^1\t--ecosystem\tcomposer\t--gate\tinstall\t--op\tinstall\t--registry\thttps://alt.example' "$FUNCNAME" || return
+  done
 
   # A create-project package resolving to a blocked advisory refuses before any
   # delegation — the audit boundary really gates the fetch. A package-audit

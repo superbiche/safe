@@ -6,15 +6,21 @@
   artifacts but were recognized-but-passthrough. `reinstall` re-fetches the
   locked tree, so it is audited as an install-class project scan (covering both
   `reinstall` and `reinstall vendor/pkg`). `create-project` audits only its
-  first positional package — the trailing `[directory]` and `[version]`
-  positionals are never treated as packages, and value-taking flags (`-s`,
-  `--repository`, `--working-dir`, …) can no longer be mistaken for the package.
-  A bare `create-project` inside an existing project is install-class (it scans
-  and delegates); with no package and no project it fails closed. Any `--require`
-  additions are audited on top of the root package. Abbreviations of both
-  commands (`composer creat`, `composer reins`) now refuse with a canonical
-  spelling instead of passing through unaudited — closing a bypass where Symfony
-  would expand the prefix and fetch before the gate saw it.
+  first positional package as the root package; Composer's explicit `[version]`
+  positional overrides a version fused into the name, and the `[directory]`
+  positional is never a package. Any `--require` additions are audited on top of
+  the root. A `create-project` with no root but a `--require` addition, or a
+  bare one, is install-class: safe scans the current project (and audits the
+  additions), or fails closed when there is no project. `--stability`/`-s` (a
+  candidate selector safe-audit cannot model) and ambiguous multi-character
+  short-option bundles (e.g. `-nd`, which Symfony parses as `-n` plus a
+  `-d<dir>` that shifts the package boundary) both refuse with a pin/unbundle
+  hint rather than audit a guess. Value-taking flags (`--repository`,
+  `--repository-url`, `--working-dir`, …) can no longer be mistaken for the
+  package, and `--repository-url` reaches the audit as the custom source.
+  Abbreviations of both commands (`composer creat`, `composer reins`) now refuse
+  with a canonical spelling instead of passing through unaudited — closing a
+  bypass where Symfony would expand the prefix and fetch before the gate saw it.
 
 - **`safe doctor`'s mise-shim warning is now actionable.** When mise shims are
   bound to the gate wrapper, doctor printed "repoint the shims at the real mise

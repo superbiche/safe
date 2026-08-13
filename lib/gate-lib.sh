@@ -450,12 +450,15 @@ safe_gate_scan_target_flags() {
         esac
         ;;
       composer)
+        # --repository-url is create-project's deprecated-but-live source
+        # selector; Composer still uses it for root-package selection, so it
+        # must reach the source scan exactly like --repository.
         case "${prev}" in
-          --repository) safe_gate_add_source "${arg}" ;;
+          --repository|--repository-url) safe_gate_add_source "${arg}" ;;
           --working-dir|-d) SAFE_GATE_PROJECT_DIR="${arg}" ;;
         esac
         case "${arg}" in
-          --repository=*) safe_gate_add_source "${arg#*=}" ;;
+          --repository=*|--repository-url=*) safe_gate_add_source "${arg#*=}" ;;
           --working-dir=*) SAFE_GATE_PROJECT_DIR="${arg#*=}" ;;
         esac
         ;;
@@ -2298,9 +2301,11 @@ safe_gate_composer_packages() {
 # create-project accepts the version fused to the package name with `:` or `=`
 # (`vendor/pkg:1.2`, `vendor/pkg=1.2`), per its --help; a bare name defaults to
 # latest. `:` wins when both could match so a constraint like `^1.2` stays
-# intact after the separator.
+# intact after the separator. When Composer's explicit [version] positional is
+# present it OVERRIDES any fused version (Composer gives the positional
+# precedence), so callers pass it as $2.
 safe_gate_composer_create_project_spec() {
-  local spec="$1" name version
+  local spec="$1" positional_version="${2:-}" name version
   if [[ "${spec}" == *:* ]]; then
     name="${spec%%:*}"; version="${spec#*:}"
   elif [[ "${spec}" == *=* ]]; then
@@ -2308,22 +2313,35 @@ safe_gate_composer_create_project_spec() {
   else
     name="${spec}"; version="latest"
   fi
+  [[ -n "${positional_version}" ]] && version="${positional_version}"
   safe_gate_print_spec "${name}" "${version}"
 }
 
 # create-project's positional grammar differs from require: only the FIRST
 # non-flag positional is a package; the 2nd positional is the target directory
-# and the 3rd a version — neither is ever a package. `--require` names
-# ADDITIONAL packages composer fetches (it deletes the lock and runs an update),
-# so those are audited too. Value-taking flags are enumerated from
-# `composer create-project --help` so a space-form value (e.g. `-s dev`) can
-# never be mistaken for the package positional — a mis-parse would let the real
-# fetched package skip audit. Prints one spec per line (root package first, then
-# each --require); empty output means the bare form (no package, no --require),
-# and the caller decides scan-or-refuse.
+# and the 3rd is the version (which OVERRIDES a fused version). Neither the
+# directory nor the version is ever a package. `--require` names ADDITIONAL
+# packages composer fetches (it deletes the lock and runs an update), so those
+# are audited too. Value-taking flags are enumerated from `composer
+# create-project --help` so a space-form value (e.g. `-s dev`) can never be
+# mistaken for the package positional — a mis-parse would let the real fetched
+# package skip audit.
+#
+# Prints one spec per line (root package first, then each --require). Return
+# codes carry the routing facts a command substitution would otherwise lose:
+#   0  a root package positional is present (stdout: root + any --require)
+#   1  no root positional (stdout: any --require specs, possibly empty)
+#   2  REFUSE: --stability/-s selects an unpredictable candidate safe cannot
+#      audit (no stability input to safe-audit; range+stability resolves
+#      silently). Fail closed with a pin hint rather than audit a guess.
+#   3  REFUSE: an ambiguous multi-character short-option bundle (e.g. `-nd`
+#      = -n plus -d<value>) whose value/package boundary safe cannot prove.
+#      stdout is the offending token. Per the load-bearing-list doctrine
+#      (see safe_gate_locate_subcommand) gaps merely over-refuse; only
+#      MISCLASSIFICATION bypasses — so unknown short bundles fail closed.
 safe_gate_composer_create_project_packages() {
-  local -a specs=()
-  local arg skip_next=0 options_ended=0 want_require=0 have_root=0
+  local -a positionals=() require_specs=()
+  local arg skip_next=0 options_ended=0 want_require=0 saw_stability=0
 
   for arg in "$@"; do
     if (( skip_next )); then
@@ -2332,15 +2350,11 @@ safe_gate_composer_create_project_packages() {
     fi
     if (( want_require )); then
       want_require=0
-      specs+=("$(safe_gate_colon_spec "${arg}")")
+      require_specs+=("$(safe_gate_colon_spec "${arg}")")
       continue
     fi
-
     if (( options_ended )); then
-      if (( have_root == 0 )); then
-        have_root=1
-        specs+=("$(safe_gate_composer_create_project_spec "${arg}")")
-      fi
+      positionals+=("${arg}")
       continue
     fi
 
@@ -2349,39 +2363,69 @@ safe_gate_composer_create_project_packages() {
         options_ended=1
         continue
         ;;
+      -s|--stability)
+        saw_stability=1
+        skip_next=1
+        continue
+        ;;
+      -s?*|--stability=*)
+        saw_stability=1
+        continue
+        ;;
       --require)
         want_require=1
         continue
         ;;
       --require=*)
-        specs+=("$(safe_gate_colon_spec "${arg#*=}")")
+        require_specs+=("$(safe_gate_colon_spec "${arg#*=}")")
         continue
         ;;
-      # create-project value-taking options (from `composer create-project
-      # --help`). Their space-form value must be skipped so it cannot be read
-      # as the package positional. --ignore-platform-reqs (plural, boolean) is
-      # intentionally absent: it falls through to the bare-flag arm below.
-      -s|--stability|--prefer-install|--repository|--repository-url|--audit-format|--ignore-platform-req|--working-dir|-d)
+      # Remaining create-project value-taking options (from `composer
+      # create-project --help`). Their space-form value is skipped so it cannot
+      # be read as the package positional; the attached/=form is ignored below.
+      --prefer-install|--repository|--repository-url|--audit-format|--ignore-platform-req|--working-dir|-d)
         skip_next=1
         continue
         ;;
-      -s?*|--stability=*|--prefer-install=*|--repository=*|--repository-url=*|--audit-format=*|--ignore-platform-req=*|--working-dir=*|-d?*)
+      --prefer-install=*|--repository=*|--repository-url=*|--audit-format=*|--ignore-platform-req=*|--working-dir=*|-d?*)
+        continue
+        ;;
+      -vv|-vvv)
+        continue
+        ;;
+      --*)
+        continue
+        ;;
+      -?)
         continue
         ;;
       -*)
-        continue
+        # Ambiguous multi-character short bundle: Symfony can parse a trailing
+        # value-taking short (`-nd <dir>`) that consumes the next token, which
+        # would shift the package boundary. Fail closed.
+        printf '%s' "${arg}"
+        return 3
         ;;
       *)
-        if (( have_root == 0 )); then
-          have_root=1
-          specs+=("$(safe_gate_composer_create_project_spec "${arg}")")
-        fi
-        continue
+        positionals+=("${arg}")
         ;;
     esac
   done
 
+  (( saw_stability )) && return 2
+
+  local -a specs=()
+  if (( ${#positionals[@]} > 0 )); then
+    if (( ${#positionals[@]} >= 3 )); then
+      specs+=("$(safe_gate_composer_create_project_spec "${positionals[0]}" "${positionals[2]}")")
+    else
+      specs+=("$(safe_gate_composer_create_project_spec "${positionals[0]}")")
+    fi
+  fi
+  specs+=("${require_specs[@]}")
   safe_gate_print_list "${specs[@]}"
+
+  (( ${#positionals[@]} > 0 ))
 }
 
 safe_gate_python_packages() {
@@ -3403,15 +3447,34 @@ safe_gate_composer() {
   fi
 
   # create-project audits its first positional package (plus any --require
-  # additions). A bare create-project inside a project directory is install-
-  # class (composer installs the current project), so it scans instead. With no
-  # package and no project there is nothing to audit before Composer's
-  # interactive fetch — fail closed.
+  # additions). When no root positional is given, Composer installs the current
+  # project (install-class) — so it scans the project, and additionally audits
+  # any --require additions. With no root and no project there is nothing to
+  # gate before Composer fetches — fail closed. --stability and ambiguous short
+  # bundles refuse (the extractor cannot model the fetched artifact).
   if [[ "${SAFE_GATE_COMPOSER_CLASS}" == "create-project" ]]; then
-    safe_gate_collect packages "$(safe_gate_composer_create_project_packages "${SAFE_GATE_COMPOSER_PACKAGE_ARGS[@]}")"
-    if (( ${#packages[@]} == 0 )); then
+    local cp_out cp_rc
+    cp_out="$(safe_gate_composer_create_project_packages "${SAFE_GATE_COMPOSER_PACKAGE_ARGS[@]}")"
+    cp_rc=$?
+    case "${cp_rc}" in
+      2)
+        safe_gate_err "safe: BLOCKED composer create-project — --stability/-s makes Composer's fetched candidate unpredictable, so safe cannot audit the exact package; to allow: pin the version (composer create-project <vendor/package>:<version> …) and drop --stability; details: safe explain"
+        return 100
+        ;;
+      3)
+        safe_gate_err "safe: BLOCKED composer create-project — cannot separate the package from the bundled short option '${cp_out}'; to allow: unbundle it (e.g. -n -d <dir>) or use the =form; details: safe explain"
+        return 100
+        ;;
+    esac
+    safe_gate_collect packages "${cp_out}"
+    if (( cp_rc != 0 )); then
+      # No root positional: install-class if a project exists (scan it), else
+      # fail closed. Global has no cwd project to install into.
       if (( SAFE_GATE_COMPOSER_IS_GLOBAL == 0 )) && safe_gate_composer_project_present; then
         composer_create_project_scan=1
+      elif (( ${#packages[@]} )); then
+        safe_gate_err "safe: BLOCKED composer create-project --require — no Composer project here to install into; to allow: run it inside a project, or name the <vendor/package> to create from; details: safe explain"
+        return 100
       else
         safe_gate_err "safe: BLOCKED composer create-project — name the <vendor/package> to create from so safe can audit it before Composer fetches it; to allow: pass <vendor/package>[:<version>]; details: safe explain"
         return 100
@@ -3436,12 +3499,14 @@ safe_gate_composer() {
   fi
 
   if [[ "${SAFE_GATE_COMPOSER_CLASS}" == "create-project" ]]; then
-    # create-project with a package creates a NEW project and ignores the
-    # current directory, so it never scans the cwd — it audits the named
-    # package(s) instead. The bare install-class form scans and does not audit.
+    # A named-root create-project builds a NEW project and ignores the cwd, so
+    # it only audits the named package(s) (scan flag stays 0). The rootless
+    # install-class form scans the current project AND audits any --require
+    # additions — both, not either.
     if (( composer_create_project_scan )); then
       safe_gate_scan_project || return $?
-    elif (( ${#packages[@]} )); then
+    fi
+    if (( ${#packages[@]} )); then
       safe_gate_check_many composer "${packages[@]}" || return $?
     fi
   elif [[ -n "${SAFE_GATE_COMPOSER_CLASS}" ]]; then
