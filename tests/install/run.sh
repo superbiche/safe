@@ -883,6 +883,69 @@ case_doctor_podman_probe_skips_exec_under_no_new_privs() {
   pass "$FUNCNAME"
 }
 
+case_doctor_mise_shim_repair_is_actionable() {
+  prepare_case "doctor-mise-shim"
+  # When mise shims are bound to the gate wrapper, doctor must print a runnable
+  # repair — not the old "repoint the shims at the real mise binary" prose, whose
+  # only obvious execution (`mise reshim` with the wrapper still on PATH) just
+  # recreates the drift. The repair strips the gate bin dir from PATH so mise
+  # relinks the shims to the real binary.
+  local bindir="${HOME_DIR}/mise-wrap-bin"
+  local misedir="${HOME_DIR}/mise-data"
+  mkdir -p "${bindir}" "${misedir}/shims"
+  # A marked mise gate wrapper, first on PATH -> gate_wrapper_state == installed.
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# safe-gate-wrapper v1 tool=mise\n'
+    printf 'exit 0\n'
+  } > "${bindir}/mise"
+  chmod +x "${bindir}/mise"
+  # A shim symlinked to the wrapper is the bound-drift state doctor reports.
+  ln -sf "${bindir}/mise" "${misedir}/shims/node"
+  local out
+  out="$(env HOME="${HOME_DIR}" SAFE_BIN_DIR="${bindir}" MISE_DATA_DIR="${misedir}" \
+    PATH="${bindir}:/usr/bin:/bin" bash "${ROOT_DIR}/bin/safe" doctor 2>/dev/null)"
+  grep -Fq 'bound to the gate wrapper' <<<"${out}" \
+    || { printf '%s\n' "${out}" >&2; fail "$FUNCNAME (bound shims not detected)"; return; }
+  grep -Fq 'repair: PATH=' <<<"${out}" \
+    || { printf '%s\n' "${out}" >&2; fail "$FUNCNAME (no repair command)"; return; }
+  grep -Fq 'mise reshim' <<<"${out}" \
+    || { printf '%s\n' "${out}" >&2; fail "$FUNCNAME (repair does not run reshim)"; return; }
+  grep -Fq "${bindir}" <<<"${out}" \
+    || { printf '%s\n' "${out}" >&2; fail "$FUNCNAME (repair does not name the bin dir to strip)"; return; }
+  if grep -Fq 'repoint the shims at the real mise binary' <<<"${out}"; then
+    printf '%s\n' "${out}" >&2
+    fail "$FUNCNAME (still emits the old unactionable advice)"
+    return
+  fi
+  # Shell-safety: SAFE_BIN_DIR is operator-settable, so the interpolated bin root
+  # must be shell-escaped (jq @sh). A hostile path must not inject into the
+  # operator-pasted repair command (review F1, MAJOR).
+  local evil="${HOME_DIR}/x\"; touch ${HOME_DIR}/PWNED; echo x"
+  local evilmise="${HOME_DIR}/evil-mise"
+  mkdir -p "${evil}" "${evilmise}/shims"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# safe-gate-wrapper v1 tool=mise\n'
+    printf 'exit 0\n'
+  } > "${evil}/mise"
+  chmod +x "${evil}/mise"
+  ln -sf "${evil}/mise" "${evilmise}/shims/node"
+  local evil_repair
+  evil_repair="$(env HOME="${HOME_DIR}" SAFE_BIN_DIR="${evil}" MISE_DATA_DIR="${evilmise}" \
+    PATH="${evil}:/usr/bin:/bin" bash "${ROOT_DIR}/bin/safe" doctor 2>/dev/null \
+    | sed -n 's/^  repair: //p')"
+  [[ -n "${evil_repair}" ]] || { fail "$FUNCNAME (no repair line for hostile bin root)"; return; }
+  rm -f "${HOME_DIR}/PWNED"
+  ( eval "${evil_repair}" ) >/dev/null 2>&1 || true
+  if [[ -e "${HOME_DIR}/PWNED" ]]; then
+    printf 'injectable repair: %s\n' "${evil_repair}" >&2
+    fail "$FUNCNAME (repair command is shell-injectable for a hostile bin root)"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
 case_doctor_ecosystem_auditors_are_advisory_not_prereq() {
   prepare_case "doctor-ecosystem-auditors"
   # Ecosystem auditors (govulncheck/pip-audit/cargo-audit/composer) are needed
@@ -5175,6 +5238,7 @@ main() {
     case_wrappers_not_on_path_are_unhealthy \
     case_dash_bin_root_never_reports_healthy \
     case_doctor_podman_probe_skips_exec_under_no_new_privs \
+    case_doctor_mise_shim_repair_is_actionable \
     case_doctor_ecosystem_auditors_are_advisory_not_prereq \
     case_uv_index_selectors_reach_audit \
     case_uninstall_removes_gate_wrappers \

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **`safe doctor`'s mise-shim warning is now actionable.** When mise shims are
+  bound to the gate wrapper, doctor printed "repoint the shims at the real mise
+  binary" — whose obvious execution, a bare `mise reshim`, rebinds them to the
+  wrapper again (the wrapper shadows the real mise on PATH), recreating the very
+  drift it warned about. It now prints a runnable repair that strips safe's bin
+  dir from `PATH` for the reshim, so mise relinks the shims to the real binary.
+  The gate bin dir is exposed in `safe doctor --json` under
+  `environment.install_wrappers.bin_root`.
 - **`safe doctor` now reports the ecosystem auditors it was blind to.**
   `govulncheck`, `pip-audit`, `cargo-audit`, and `composer` are needed only
   when a project of that ecosystem is audited, so doctor never listed them —
