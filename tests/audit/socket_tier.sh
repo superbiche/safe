@@ -109,6 +109,16 @@ case "${MOCK_SOCKET_MODE:-clean}" in
   missing-self) printf '{"ok":true,"data":{"transitively":{"dependencyCount":0}}}\n' ;;
   non-object-alert) envelope 95 '[true]' ;;
   rate) printf '{"message":"Too Many Requests","cause":"429"}\n'; exit 1 ;;
+  # Socket answered and simply has no record of this package version (404) —
+  # an absence of behavioral data, distinct from an outage.
+  not-found) printf '{"message":"Not Found","cause":"404"}\n'; exit 1 ;;
+  sibling-not-found)
+    if [[ "$scored_version" == "2.0.0" ]]; then
+      printf '{"message":"Not Found","cause":"404"}\n'; exit 1
+    else
+      envelope 95 '[]'
+    fi
+    ;;
   # Carries account context the way a real provider error body can. The
   # sentinel must reach no receipt, cache, stdout, or stderr (review F5).
   auth-leaky) printf '{"message":"Unauthorized for operator@example.com","cause":"account SENTINELACCT9137"}\n'; exit 1 ;;
@@ -354,6 +364,50 @@ if grep -rq 'operator@example.com' "$CASE" 2>/dev/null; then
 else
   pass 'provider error-body identity never reaches receipt, cache, stdout, or stderr'
 fi
+
+# --- not_found: absence of data, distinct from an outage --------------------
+# Socket answered 404 — it simply has no record of this package. That is not a
+# service failure, so it carries its own cause (socket_not_found), separately
+# tolerable from a real outage and the only override lane for ecosystems Socket
+# cannot host-allow (go, cargo).
+prepare_case not-found-distinct-cause
+run_check not-found
+expect_rc 10 'a not_found socket result warns'
+expect_json '.warn_causes | index("socket_not_found") != null' 'not_found carries its own socket_not_found cause'
+expect_json '.warn_causes | index("socket_error") == null' 'not_found is never conflated with a socket outage'
+expect_json '.checks.socket | test("no record")' 'the socket line discloses the missing record'
+
+# Gate mode: not_found refuses by default (opt-in) and names the tolerate lane.
+prepare_case not-found-gate-refuses
+run_check not-found --gate install --op install
+expect_rc 10 'not_found refuses at the install gate by default'
+if grep -q 'add socket_not_found to install.auto_allow_tolerate' "$CASE_ERR"; then
+  pass 'the refusal names the socket_not_found tolerate override'
+else
+  fail 'the refusal names the socket_not_found tolerate override'
+fi
+
+# Gate mode: with socket_not_found tolerated, the install proceeds.
+prepare_case not-found-gate-tolerated
+printf '{"install":{"cooldown_days":0,"socket":{"mode":"auto","cache_ttl_days":7},"auto_allow_tolerate":["socket_not_found"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check not-found --gate install --op install
+expect_rc 0 'a tolerated socket_not_found proceeds at the gate'
+
+# A tolerated socket outage must NOT drag not_found through, and vice versa:
+# tolerating socket_error alone still refuses a not_found.
+prepare_case not-found-not-tolerated-by-socket-error
+printf '{"install":{"cooldown_days":0,"socket":{"mode":"auto","cache_ttl_days":7},"auto_allow_tolerate":["socket_error"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check not-found --gate install --op install
+expect_rc 10 'tolerating socket_error does not tolerate a not_found'
+
+# Sibling not_found on a ranged update is the same absence of data: it raises
+# socket_not_found, never socket_error.
+prepare_case multi-version-sibling-not-found
+multi_project
+run_multi sibling-not-found
+expect_rc 10 'an unindexed sibling warns rather than passing'
+expect_json '.warn_causes | index("socket_not_found") != null' 'a not_found sibling raises socket_not_found'
+expect_json '.warn_causes | index("socket_error") == null' 'a not_found sibling is not conflated with an outage'
 
 # ---------------------------------------------------------------------------
 # The verdict engine is infrastructure, and its failures are NOT verdicts.
