@@ -74,6 +74,10 @@ type SocketSibling struct {
 	Status  string `json:"status"`
 	Class   string `json:"class"`
 	Score   string `json:"score"`
+	// Reason mirrors the primary socket reason code for a non-ok sibling so a
+	// ranged install distinguishes "no record" from an outage the same way the
+	// primary does. Optional (absent on older evidence) — defaults to "".
+	Reason string `json:"reason"`
 }
 
 // OSV carries the already-classified advisory evidence.
@@ -241,8 +245,14 @@ func socketStage(ev Evidence, d *decision, res *Result) {
 			res.Lines.Socket = "WARN (socket score skipped: cannot be bounded)"
 			cause = "socket_error"
 		case "not_found":
+			// Distinct from the socket_error outages above: Socket answered and
+			// simply has no record of this package version. That is an absence of
+			// behavioral data, not a service failure, so it carries its own cause
+			// — the operator can tolerate socket_not_found (per machine, opt-in)
+			// without also tolerating real Socket outages, and for ecosystems that
+			// have no host-allow lane (go, cargo) it is the only override.
 			res.Lines.Socket = "WARN (socket has no record of this package version)"
-			cause = "socket_error"
+			cause = "socket_not_found"
 		default:
 			res.Lines.Socket = "WARN (socket returned an unrecognized result)"
 			cause = "socket_error"
@@ -286,8 +296,13 @@ func socketStage(ev Evidence, d *decision, res *Result) {
 func socketSiblingStage(ev Evidence, d *decision, res *Result) {
 	for _, sib := range ev.SocketSiblings {
 		if sib.Status != "ok" {
-			res.Lines.Socket += fmt.Sprintf("; %s not scored (infrastructure failure)", sib.Version)
-			d.warn("socket_error")
+			if sib.Reason == "not_found" {
+				res.Lines.Socket += fmt.Sprintf("; %s not scored (socket has no record)", sib.Version)
+				d.warn("socket_not_found")
+			} else {
+				res.Lines.Socket += fmt.Sprintf("; %s not scored (infrastructure failure)", sib.Version)
+				d.warn("socket_error")
+			}
 			continue
 		}
 		switch sib.Class {

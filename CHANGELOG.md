@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Socket "no record of this package" is no longer conflated with a Socket
+  outage.** A package Socket has never scored (a 404/`not_found`) produced the
+  `socket_error` cause — the same one a real timeout, auth failure, or 429
+  outage produces — so it could not be tolerated without also tolerating genuine
+  outages, and ecosystems with no host-allow lane (go, cargo) had no override at
+  all. `not_found` now carries its own `socket_not_found` cause. It stays a WARN
+  by default (a package Socket has never seen can be a fresh typosquat in an
+  ecosystem Socket fully indexes, like npm/PyPI), but it is independently
+  tolerable via `install.auto_allow_tolerate` — opt-in, per machine — which is
+  the only override lane for go/cargo, where host-allow does not apply. Sibling
+  versions on a ranged update are classified the same way. This is what lets a
+  vetted `go install golang.org/x/vuln/cmd/govulncheck@<pinned>` (OSV and
+  blocklist PASS; Socket simply has no record) be allowed on a Go box without a
+  blanket bypass. Socket does index Go and Rust — this is per-package absence of
+  data, not a structural ecosystem gap, so an indexed module still gets its real
+  behavioral score.
+
 - **Non-global Composer installs honor `--working-dir`/`-d` when scanning.** A
   non-global `composer install`/`update`/`require`/`reinstall` — and a
   package-less `create-project` — run with an effective working directory

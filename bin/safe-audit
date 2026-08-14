@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.1.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.26.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.27.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -7567,7 +7567,7 @@ host_allow_required_versions_json() {
     --arg primary "$primary_version" --argjson resolved "$resolved_versions_json" '
     ($osv | map(select((.classification.affecting | length) > 0) | .version)) as $osv_versions
     | (["socket_unavailable","socket_auth_failed","socket_rate_limited","socket_error",
-        "socket_low_score","socket_critical_cve","socket_high_alert","socket_score_pending"]
+        "socket_not_found","socket_low_score","socket_critical_cve","socket_high_alert","socket_score_pending"]
        | any(. as $c | $causes | index($c) != null)) as $socket_applies
     | (["osv_unavailable","custom_source","release_too_new"]
        | any(. as $c | $causes | index($c) != null)) as $other_all_apply
@@ -7897,13 +7897,14 @@ package_audit_command() {
   local siblings_json='[]'
   if (( resolution_ok )) && (( ${#RESOLVED_VERSIONS[@]} > 1 )) \
     && [[ "$socket_mode" != "never" ]]; then
-    local sib sib_json sib_idx=0 sib_status sib_class sib_score
+    local sib sib_json sib_idx=0 sib_status sib_reason sib_class sib_score
     for sib in "${RESOLVED_VERSIONS[@]}"; do
       [[ "$sib" == "$primary_version" ]] && continue
       sib_idx=$(( sib_idx + 1 ))
       sib_json="$scratch/socket-sibling-${sib_idx}.json"
       socket_score_json "$ecosystem" "${PKG_NAME}@${sib}" "$sib_json" "" "$PKG_NAME" "$sib"
       sib_status=$(jq -r '.status // empty' "$sib_json" 2>/dev/null || true)
+      sib_reason=$(jq -r '.reason // empty' "$sib_json" 2>/dev/null || true)
       sib_class=""
       sib_score=""
       if [[ "$sib_status" == "ok" ]]; then
@@ -7911,8 +7912,8 @@ package_audit_command() {
         sib_score=$(jq -r '.raw.data.self.score.overall // empty' "$sib_json" 2>/dev/null || true)
       fi
       siblings_json=$(jq -cn --argjson acc "$siblings_json" \
-        --arg v "$sib" --arg s "$sib_status" --arg c "$sib_class" --arg sc "$sib_score" \
-        '$acc + [{version: $v, status: $s, class: $c, score: $sc}]')
+        --arg v "$sib" --arg s "$sib_status" --arg c "$sib_class" --arg sc "$sib_score" --arg r "$sib_reason" \
+        '$acc + [{version: $v, status: $s, class: $c, score: $sc, reason: $r}]')
     done
   fi
 
@@ -8460,11 +8461,12 @@ gate_emit_refusal_hints() {
   local -a causes=("${@}")
   local cause has_socket_infra=0 has_unresolved=0 has_affecting=0 has_osv_down=0
   local has_low_score=0 has_socket_high=0 has_socket_critical_cve=0 has_socket_malware=0
-  local has_socket_disabled=0
+  local has_socket_disabled=0 has_socket_not_found=0
   local has_custom_source=0 has_malware=0 has_too_new=0
   for cause in "${causes[@]}"; do
     case "$cause" in
       socket_unavailable|socket_auth_failed|socket_rate_limited|socket_error) has_socket_infra=1 ;;
+      socket_not_found) has_socket_not_found=1 ;;
       socket_low_score) has_low_score=1 ;;
       socket_high_alert) has_socket_high=1 ;;
       socket_critical_cve) has_socket_critical_cve=1 ;;
@@ -8504,6 +8506,19 @@ gate_emit_refusal_hints() {
   if (( has_socket_disabled )); then
     printf 'safe audit: the behavioral tier is off (install.socket.mode=never), so this check has no behavioral evidence — advisories, blocklist and release age still applied\n' >&2
     printf 'safe audit: to run this posture routinely: add socket_disabled to install.auto_allow_tolerate; to re-enable the tier: set install.socket.mode=auto\n' >&2
+  fi
+  if (( has_socket_not_found )); then
+    printf 'safe audit: Socket has no record of this package — an absence of behavioral data, NOT an outage; advisories, blocklist and release age still applied\n' >&2
+    local not_found_allow_cmd=""
+    if [[ "$resolution_ok" == "1" && -n "$primary_version" ]]; then
+      not_found_allow_cmd=$(gate_host_allow_add_cmd "$name" "$primary_version" "$ecosystem") || not_found_allow_cmd=""
+    fi
+    if [[ -n "$not_found_allow_cmd" ]]; then
+      printf 'safe audit: operator overrides: %s / add socket_not_found to install.auto_allow_tolerate\n' \
+        "$not_found_allow_cmd" >&2
+    else
+      printf 'safe audit: operator override: add socket_not_found to install.auto_allow_tolerate (the only lane for ecosystems Socket cannot host-allow, e.g. go, cargo)\n' >&2
+    fi
   fi
   if (( has_custom_source )); then
     printf 'safe audit: custom package source — public advisory evidence cannot vouch for a private artifact\n' >&2

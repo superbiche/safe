@@ -51,7 +51,7 @@ func TestSocketAbsenceNeverPasses(t *testing.T) {
 		{"auth", func(e *Evidence) { e.Socket.Status = "error"; e.Socket.Reason = "auth" }, "socket_auth_failed"},
 		{"timeout", func(e *Evidence) { e.Socket.Status = "error"; e.Socket.Reason = "timeout" }, "socket_error"},
 		{"unbounded", func(e *Evidence) { e.Socket.Status = "error"; e.Socket.Reason = "unbounded" }, "socket_error"},
-		{"not found", func(e *Evidence) { e.Socket.Status = "error"; e.Socket.Reason = "not_found" }, "socket_error"},
+		{"not found", func(e *Evidence) { e.Socket.Status = "error"; e.Socket.Reason = "not_found" }, "socket_not_found"},
 		{"unknown reason", func(e *Evidence) { e.Socket.Status = "error"; e.Socket.Reason = "wat" }, "socket_error"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -118,6 +118,37 @@ func TestUnscorableSiblingIsNotAssumedClean(t *testing.T) {
 	}
 	if !hasCause(got.Causes, "socket_error") {
 		t.Fatalf("causes = %v, want socket_error", got.Causes)
+	}
+}
+
+// A not_found sibling is an absence of behavioral data, not an outage: it warns
+// under socket_not_found (independently tolerable), never socket_error, so a
+// ranged install in an ecosystem Socket has not indexed can be overridden the
+// same way its primary can.
+func TestNotFoundSiblingIsDistinctFromOutage(t *testing.T) {
+	ev := clean()
+	ev.SocketSiblings = []SocketSibling{{Version: "2.5.0", Status: "error", Reason: "not_found"}}
+	got := Decide(ev)
+	if got.Verdict != WARN {
+		t.Fatalf("verdict = %q, want WARN", got.Verdict)
+	}
+	if !hasCause(got.Causes, "socket_not_found") {
+		t.Fatalf("causes = %v, want socket_not_found", got.Causes)
+	}
+	if hasCause(got.Causes, "socket_error") {
+		t.Fatalf("causes = %v, must not conflate not_found with an outage", got.Causes)
+	}
+}
+
+// not_found must be separable from real outages so an operator can tolerate the
+// coverage gap without also tolerating a Socket outage.
+func TestNotFoundIsNotSocketError(t *testing.T) {
+	ev := clean()
+	ev.Socket.Status = "error"
+	ev.Socket.Reason = "not_found"
+	got := Decide(ev)
+	if hasCause(got.Causes, "socket_error") {
+		t.Fatalf("causes = %v, not_found must not map to socket_error", got.Causes)
 	}
 }
 
