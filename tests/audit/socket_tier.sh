@@ -208,6 +208,42 @@ set -e
 expect_rc 0 'different exact version is independently scored'
 [[ "$(socket_calls)" == "2" ]] && pass 'cache never crosses exact versions' || fail 'cache never crosses exact versions'
 
+# install.socket.cache_dir relocates the cache when the env override is absent.
+# A leading ~/ expands to $HOME, and the env var still wins over the config.
+prepare_case cache-dir-config
+CONFIG_CACHE="$CASE/config-cache"
+printf '{"install":{"cooldown_days":0,"socket":{"mode":"auto","cache_ttl_days":7,"cache_dir":"~/cfg-socket-cache"}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_config_check() {
+  set +e
+  env -u SOCKET_SECURITY_API_TOKEN -u SAFE_AUDIT_SOCKET_CACHE_DIR \
+    HOME="$CASE_HOME" PATH="$MOCKBIN:/usr/bin:/bin" \
+    SAFE_AUDIT_CONFIG_DIR="$CASE_AUDIT_CONFIG" SAFE_AUDIT_DATA_DIR="$CASE_DATA/audit" \
+    SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" \
+    MOCK_SOCKET_LOG="$CASE_LOG" MOCK_SOCKET_MODE=clean \
+    "$SAFE_AUDIT" package-audit fixture@1.0.0 --ecosystem npm --json > "$CASE_OUT" 2> "$CASE_ERR"
+  CHECK_RC=$?
+  set -e
+}
+run_config_check
+expect_rc 0 'config cache_dir scan permits GO'
+[[ "$(find "$CASE_HOME/cfg-socket-cache" -type f -name '*.json' 2>/dev/null | wc -l | tr -d '[:space:]')" == "1" ]] \
+  && pass 'install.socket.cache_dir honored with ~/ expansion' || fail 'install.socket.cache_dir honored with ~/ expansion'
+run_config_check
+[[ "$(socket_calls)" == "1" ]] && pass 'config cache_dir replays on the second exact request' || fail 'config cache_dir replays on the second exact request'
+# Env override wins over the config value.
+mkdir -p "$CONFIG_CACHE"
+set +e
+env -u SOCKET_SECURITY_API_TOKEN HOME="$CASE_HOME" PATH="$MOCKBIN:/usr/bin:/bin" \
+  SAFE_AUDIT_CONFIG_DIR="$CASE_AUDIT_CONFIG" SAFE_AUDIT_DATA_DIR="$CASE_DATA/audit" \
+  SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" SAFE_AUDIT_SOCKET_CACHE_DIR="$CONFIG_CACHE" \
+  MOCK_SOCKET_LOG="$CASE_LOG" MOCK_SOCKET_MODE=clean \
+  "$SAFE_AUDIT" package-audit fixture@2.0.0 --ecosystem npm --json > "$CASE_OUT" 2> "$CASE_ERR"
+CHECK_RC=$?
+set -e
+expect_rc 0 'env override cache_dir scan permits GO'
+[[ "$(find "$CONFIG_CACHE" -type f -name '*.json' 2>/dev/null | wc -l | tr -d '[:space:]')" == "1" ]] \
+  && pass 'SAFE_AUDIT_SOCKET_CACHE_DIR wins over install.socket.cache_dir' || fail 'SAFE_AUDIT_SOCKET_CACHE_DIR wins over install.socket.cache_dir'
+
 # Cache success never changes the narrow verdict mapping.
 prepare_case verdict-malware
 run_check malware

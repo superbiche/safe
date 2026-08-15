@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **The Socket cache location is now a first-class config knob.** The cache root
+  was resolvable only via `SAFE_AUDIT_SOCKET_CACHE_DIR`, an env var the docs
+  framed as test-only, even though relocating the cache to a shared/synced path
+  is a legitimate recurring need (pay Socket's ~per-package scoring once
+  fleet-wide instead of on every machine). `install.socket.cache_dir` now sits
+  beside `install.socket.cache_ttl_days` as a supported, documented setting; a
+  leading `~/` expands to `$HOME`. Precedence is env override →
+  `install.socket.cache_dir` → the `~/.cache/safe/socket` default, so existing
+  setups and the test suite are unchanged. No verdict behavior changes: cache
+  entries are per-package JSON keyed by purl (no secrets), atomically written,
+  and TTL-bounded, which is what makes a synced cache dir safe to share across
+  trusted machines.
+
 - **Socket "no record of this package" is no longer conflated with a Socket
   outage.** A package Socket has never scored (a 404/`not_found`) produced the
   `socket_error` cause — the same one a real timeout, auth failure, or 429
