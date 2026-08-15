@@ -71,7 +71,8 @@ unchanged.
     "cooldown_security_fix": "exempt",
     "socket": {
       "mode": "auto",
-      "cache_ttl_days": 7
+      "cache_ttl_days": 7,
+      "cache_dir": "~/.cache/safe/socket"
     }
   }
 }
@@ -126,11 +127,19 @@ unchanged.
   tolerated skip is never later mistaken for a completed check.
 - `socket.cache_ttl_days`: cache a validated successful Socket envelope for
   the exact ecosystem, package name, and resolved version. Default: `7`; `0`
-  disables caching. Entries live under `~/.cache/safe/socket/`, are private
-  (`0700` directory, `0600` files), and are atomically replaced. On expiry,
-  safe queries Socket again; if that query fails, the WARN line may disclose
-  the last complete score and its age, but stale data never supplies a verdict.
-  Override the cache root with `SAFE_AUDIT_SOCKET_CACHE_DIR` for tests.
+  disables caching. Entries live under the cache dir (see `socket.cache_dir`),
+  are private (`0700` directory, `0600` files), and are atomically replaced. On
+  expiry, safe queries Socket again; if that query fails, the WARN line may
+  disclose the last complete score and its age, but stale data never supplies a
+  verdict.
+- `socket.cache_dir`: the Socket cache root. Default: `~/.cache/safe/socket`; a
+  leading `~/` expands to `$HOME`. Point it at a shared/synced location (e.g.
+  `~/Sync/config/safe/socket-cache/`) to pay Socket's per-package scoring once
+  across trusted machines instead of on every host. The cache is safe to share:
+  entries are per-package JSON keyed by purl (no secrets — Socket scores are
+  public), atomically written, and TTL-bounded, so concurrent writers and stale
+  entries are already handled. The `SAFE_AUDIT_SOCKET_CACHE_DIR` env var
+  overrides this (used by the test suite) and takes precedence over the config.
 
 Common sandbox settings include:
 

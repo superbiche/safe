@@ -372,7 +372,11 @@ not package findings.
 
 Successful envelopes are cached for the exact ecosystem, package name, and
 resolved version under `~/.cache/safe/socket/` (default TTL: 7 days; configure
-`install.socket.cache_ttl_days`). Cache entries are private and atomically
+`install.socket.cache_ttl_days`). The cache root is configurable via
+`install.socket.cache_dir` (env override: `SAFE_AUDIT_SOCKET_CACHE_DIR`):
+point it at a synced path to share Socket's per-package scoring across trusted
+machines, since entries are per-package JSON keyed by purl (no secrets),
+atomically written, and TTL-bounded. Cache entries are private and atomically
 written. Expired entries never decide a verdict: if the refresh fails, safe
 returns the live infrastructure WARN and may disclose the last complete score
 and its age as context.

@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.1.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.27.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.28.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -32,7 +32,6 @@ SCAN_CACHE_TTL_SECONDS="${SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS:-86400}"
 # they must miss rather than replay.
 SCAN_CACHE_SCHEMA=1
 CHECKS_DIR="$DATA_DIR/checks"
-SOCKET_CACHE_DIR="${SAFE_AUDIT_SOCKET_CACHE_DIR:-$HOME/.cache/safe/socket}"
 SOCKET_CACHE_SCHEMA=1
 SOCKET_CACHE_STALE_SCORE=""
 SOCKET_CACHE_STALE_AGE_DAYS=""
@@ -5231,6 +5230,24 @@ socket_cache_ttl_seconds() {
   printf '%s\n' "$(( days * 86400 ))"
 }
 
+# Resolve the Socket cache root. Env override wins (tests, ad-hoc), then the
+# first-class install.socket.cache_dir, then the per-user default. A leading
+# ~ / ~/ in the config value expands to $HOME so a synced path reads naturally.
+socket_cache_dir() {
+  if [[ -n "${SAFE_AUDIT_SOCKET_CACHE_DIR:-}" ]]; then
+    printf '%s\n' "$SAFE_AUDIT_SOCKET_CACHE_DIR"
+    return 0
+  fi
+  local dir
+  dir=$(install_policy_json | jq -r '.socket.cache_dir // empty' 2>/dev/null || true)
+  case "$dir" in
+    "~") dir="$HOME" ;;
+    "~/"*) dir="$HOME/${dir#\~/}" ;;
+  esac
+  [[ -n "$dir" ]] || dir="$HOME/.cache/safe/socket"
+  printf '%s\n' "$dir"
+}
+
 # A RECOGNIZED success envelope: everything the verdict is derived from must
 # be present and well-typed, and every alert must be classifiable — an alert
 # whose severity is outside Socket's enum is an unknown class that must WARN,
@@ -5300,12 +5317,13 @@ socket_cache_replay() {
   local ecosystem="$1" name="$2" version="$3" output="$4"
   SOCKET_CACHE_STALE_SCORE=""
   SOCKET_CACHE_STALE_AGE_DAYS=""
-  local ttl identity key entry fetched age now
+  local ttl identity key entry fetched age now cache_dir
   ttl=$(socket_cache_ttl_seconds)
   (( ttl > 0 )) || return 1
   identity=$(socket_cache_identity_json "$ecosystem" "$name" "$version") || return 1
   key=$(socket_cache_key "$identity") || return 1
-  entry="$SOCKET_CACHE_DIR/$key.json"
+  cache_dir=$(socket_cache_dir)
+  entry="$cache_dir/$key.json"
   [[ -f "$entry" ]] || return 1
   fetched=$(jq -r --argjson identity "$identity" --argjson schema "$SOCKET_CACHE_SCHEMA" '
     if .schema == $schema and .source == $identity.source and .identity == $identity.identity
@@ -5341,22 +5359,23 @@ socket_cache_replay() {
 
 socket_cache_store() {
   local ecosystem="$1" name="$2" version="$3" raw="$4"
-  local ttl identity key tmp
+  local ttl identity key tmp cache_dir
   ttl=$(socket_cache_ttl_seconds)
   (( ttl > 0 )) || return 0
   socket_envelope_valid "$raw" || return 0
   identity=$(socket_cache_identity_json "$ecosystem" "$name" "$version") || return 0
   key=$(socket_cache_key "$identity") || return 0
+  cache_dir=$(socket_cache_dir)
   umask 077
-  mkdir -p "$SOCKET_CACHE_DIR" 2>/dev/null || return 0
-  chmod 700 "$SOCKET_CACHE_DIR" 2>/dev/null || return 0
-  tmp=$(mktemp "$SOCKET_CACHE_DIR/.${key}.XXXXXX") || return 0
+  mkdir -p "$cache_dir" 2>/dev/null || return 0
+  chmod 700 "$cache_dir" 2>/dev/null || return 0
+  tmp=$(mktemp "$cache_dir/.${key}.XXXXXX") || return 0
   if jq -n --argjson schema "$SOCKET_CACHE_SCHEMA" --argjson identity "$identity" \
       --argjson fetched_at "$(date +%s)" --slurpfile result "$raw" '
       {schema:$schema,source:$identity.source,identity:$identity.identity,
        fetched_at:$fetched_at,result:($result[0] // {})}
     ' > "$tmp"; then
-    chmod 600 "$tmp" && mv -f "$tmp" "$SOCKET_CACHE_DIR/$key.json"
+    chmod 600 "$tmp" && mv -f "$tmp" "$cache_dir/$key.json"
   else
     rm -f "$tmp"
   fi
