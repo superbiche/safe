@@ -85,7 +85,7 @@ safe audit repo-audit [<path>] [--verbose] [--deps-only | --full] [--no-cache] [
 safe audit binary-audit release github --repo OWNER/REPO --version TAG --asset NAME [--tag-regex REGEX] [--json]
 safe audit binary-audit vuln github-release --repo OWNER/REPO --version TAG [--json]
 safe audit binary-audit verify release-asset --artifact PATH --checksum PATH [--certificate PATH --signature PATH --certificate-identity-regexp REGEX --certificate-oidc-issuer URL] [--require-signature] [--json]
-safe audit binary-audit verify sigstore-bundle --artifact PATH --bundle PATH --identity VALUE --oidc-issuer URL [--json]
+safe audit binary-audit verify sigstore-bundle --artifact PATH --bundle PATH (--identity VALUE | --identity-regexp REGEX) --oidc-issuer URL [--json]
 safe audit binary-audit verify tuf-bootstrap --mirror PATH --root PATH --root-checksum SHA256 --target NAME=PATH [--target NAME=PATH ...] [--json]
 safe audit binary-audit exec PATH [--timeout SECONDS] [--json] -- [ARGS...]
 safe audit ioc <identifier> [--all | --machine <csv>]

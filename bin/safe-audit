@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.1.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.28.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.29.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -9204,7 +9204,7 @@ verify_release_asset_command() {
 }
 
 verify_sigstore_bundle_command() {
-  local artifact="" bundle="" identity="" oidc_issuer=""
+  local artifact="" bundle="" identity="" identity_regexp="" oidc_issuer=""
   local json_mode=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -9221,6 +9221,11 @@ verify_sigstore_bundle_command() {
       --identity)
         [[ $# -lt 2 ]] && die "--identity requires a value"
         identity="$2"
+        shift 2
+        ;;
+      --identity-regexp)
+        [[ $# -lt 2 ]] && die "--identity-regexp requires a value"
+        identity_regexp="$2"
         shift 2
         ;;
       --oidc-issuer)
@@ -9240,11 +9245,22 @@ verify_sigstore_bundle_command() {
         ;;
     esac
   done
-  [[ -n "$artifact" && -n "$bundle" && -n "$identity" && -n "$oidc_issuer" ]] || die "usage: safe audit binary-audit verify sigstore-bundle --artifact PATH --bundle PATH --identity VALUE --oidc-issuer URL [--json]"
+  [[ -n "$identity" && -n "$identity_regexp" ]] && die "--identity and --identity-regexp are mutually exclusive"
+  [[ -n "$artifact" && -n "$bundle" && -n "$oidc_issuer" && ( -n "$identity" || -n "$identity_regexp" ) ]] || die "usage: safe audit binary-audit verify sigstore-bundle --artifact PATH --bundle PATH (--identity VALUE | --identity-regexp REGEX) --oidc-issuer URL [--json]"
 
   local artifact_abs bundle_abs
   artifact_abs=$(absolute_path "$artifact")
   bundle_abs=$(absolute_path "$bundle")
+
+  local -a identity_policy_args=()
+  local -a identity_reason_data_args=()
+  if [[ -n "$identity" ]]; then
+    identity_policy_args=(--certificate-identity "$identity")
+    identity_reason_data_args=(--arg expected_identity "$identity" '{expected_identity:$expected_identity}')
+  else
+    identity_policy_args=(--certificate-identity-regexp "$identity_regexp")
+    identity_reason_data_args=(--arg expected_identity_regexp "$identity_regexp" '{expected_identity_regexp:$expected_identity_regexp}')
+  fi
 
   local subject="sigstore-bundle:${artifact_abs}"
   local scratch checks_file reasons_file data_file bundle_meta_file
@@ -9295,7 +9311,7 @@ verify_sigstore_bundle_command() {
 
   if [[ "$verdict" == "GO" ]]; then
     if run_cosign_verify_blob_bundle "$artifact_abs" "$bundle_abs" "$cosign_main_output" \
-      --certificate-identity "$identity" \
+      "${identity_policy_args[@]}" \
       --certificate-oidc-issuer "$oidc_issuer"; then
       audit_add_check "$checks_file" "bundle_verification" "GO" "cosign verified the artifact against the bundle and signer policy"
     elif run_cosign_verify_blob_bundle "$artifact_abs" "$bundle_abs" "$cosign_any_output" \
@@ -9303,7 +9319,7 @@ verify_sigstore_bundle_command() {
       --certificate-oidc-issuer-regexp '.*'; then
       local identity_matches=0 issuer_matches=0
       if run_cosign_verify_blob_bundle "$artifact_abs" "$bundle_abs" "$cosign_identity_output" \
-        --certificate-identity "$identity" \
+        "${identity_policy_args[@]}" \
         --certificate-oidc-issuer-regexp '.*'; then
         identity_matches=1
       fi
@@ -9318,7 +9334,7 @@ verify_sigstore_bundle_command() {
       if (( identity_matches == 0 && issuer_matches == 1 )); then
         policy_status="identity_mismatch"
         audit_add_reason "$reasons_file" "identity_mismatch" "BLOCK" "bundle signer identity did not match the expected identity" \
-          "$(jq -cn --arg expected_identity "$identity" '{expected_identity:$expected_identity}')"
+          "$(jq -cn "${identity_reason_data_args[@]}")"
       elif (( identity_matches == 1 && issuer_matches == 0 )); then
         policy_status="issuer_mismatch"
         audit_add_reason "$reasons_file" "issuer_mismatch" "BLOCK" "bundle signer OIDC issuer did not match the expected issuer" \
@@ -9326,7 +9342,7 @@ verify_sigstore_bundle_command() {
       else
         policy_status="identity_and_issuer_mismatch"
         audit_add_reason "$reasons_file" "identity_mismatch" "BLOCK" "bundle signer identity did not match the expected identity" \
-          "$(jq -cn --arg expected_identity "$identity" '{expected_identity:$expected_identity}')"
+          "$(jq -cn "${identity_reason_data_args[@]}")"
         audit_add_reason "$reasons_file" "issuer_mismatch" "BLOCK" "bundle signer OIDC issuer did not match the expected issuer" \
           "$(jq -cn --arg expected_oidc_issuer "$oidc_issuer" '{expected_oidc_issuer:$expected_oidc_issuer}')"
       fi
@@ -9342,6 +9358,7 @@ verify_sigstore_bundle_command() {
     --arg artifact "$artifact_abs" \
     --arg bundle "$bundle_abs" \
     --arg expected_identity "$identity" \
+    --arg expected_identity_regexp "$identity_regexp" \
     --arg expected_oidc_issuer "$oidc_issuer" \
     --arg verification_tool "cosign verify-blob" \
     --arg policy_status "$policy_status" \
@@ -9349,7 +9366,8 @@ verify_sigstore_bundle_command() {
     '{
       artifact:$artifact,
       bundle:$bundle,
-      expected_identity:$expected_identity,
+      expected_identity:(if $expected_identity == "" then null else $expected_identity end),
+      expected_identity_regexp:(if $expected_identity_regexp == "" then null else $expected_identity_regexp end),
       expected_oidc_issuer:$expected_oidc_issuer,
       verification_tool:$verification_tool,
       policy_status:$policy_status,
@@ -11043,7 +11061,7 @@ USAGE
   safe audit binary-audit release github --repo OWNER/REPO --version TAG --asset NAME [--json]
   safe audit binary-audit vuln github-release --repo OWNER/REPO --version TAG [--json]
   safe audit binary-audit verify release-asset --artifact PATH --checksum PATH [--certificate PATH --signature PATH --certificate-identity-regexp REGEX --certificate-oidc-issuer URL] [--require-signature] [--json]
-  safe audit binary-audit verify sigstore-bundle --artifact PATH --bundle PATH --identity VALUE --oidc-issuer URL [--json]
+  safe audit binary-audit verify sigstore-bundle --artifact PATH --bundle PATH (--identity VALUE | --identity-regexp REGEX) --oidc-issuer URL [--json]
   safe audit binary-audit verify tuf-bootstrap --mirror PATH --root PATH --root-checksum SHA256 --target NAME=PATH [--target NAME=PATH ...] [--json]
 
   safe audit scanner-batch   (stdin: {"packages":[{"name","version"},…]} — Bun scanner API backend)

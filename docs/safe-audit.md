@@ -489,6 +489,21 @@ safe audit binary-audit verify sigstore-bundle \
   --oidc-issuer https://accounts.google.com
 ```
 
+Verify a GitHub attestation-style per-asset bundle with `--identity-regexp`:
+
+```bash
+safe audit binary-audit verify sigstore-bundle \
+  --artifact ./codex-x86_64-unknown-linux-musl \
+  --bundle ./codex-x86_64-unknown-linux-musl.sigstore.json \
+  --identity-regexp '^https://github\.com/openai/codex/\.github/workflows/.+@refs/tags/.+$' \
+  --oidc-issuer https://token.actions.githubusercontent.com
+```
+
+`--identity-regexp` is mutually exclusive with `--identity`, and one of the two
+is required. Use it when the signer identity is tag-bound — a GitHub Actions
+workflow identity ends in `@refs/tags/<tag>`, so it changes on every release and
+cannot be expressed as an exact identity.
+
 Verify a local TUF bootstrap:
 
 ```bash
