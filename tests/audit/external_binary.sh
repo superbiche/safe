@@ -686,6 +686,27 @@ run_json verify_sigstore_issuer_mismatch verify sigstore-bundle --artifact "$art
 jq -e '.verdict == "BLOCK" and .data.policy_status == "issuer_mismatch" and any(.reasons[]; .code == "issuer_mismatch")' "$RUN_OUT" >/dev/null || fail "verify sigstore issuer mismatch verdict"
 pass "verify sigstore issuer mismatch block"
 
+run_json verify_sigstore_identity_regexp verify sigstore-bundle --artifact "$artifact" --bundle "$bundle_json" --identity-regexp '^keyless@projectsigstore\.iam\.gserviceaccount\.com$' --oidc-issuer https://accounts.google.com --json
+[[ "$RUN_RC" == "0" ]] || fail "verify sigstore identity regexp rc=$RUN_RC"
+jq -e '.verdict == "GO" and .data.policy_status == "matched" and .data.expected_identity == null and .data.expected_identity_regexp == "^keyless@projectsigstore\\.iam\\.gserviceaccount\\.com$"' "$RUN_OUT" >/dev/null || fail "verify sigstore identity regexp payload"
+pass "verify sigstore identity regexp success"
+
+run_json verify_sigstore_identity_regexp_mismatch verify sigstore-bundle --artifact "$artifact" --bundle "$bundle_json" --identity-regexp '^wrong@example\.com$' --oidc-issuer https://accounts.google.com --json
+[[ "$RUN_RC" == "20" ]] || fail "verify sigstore identity regexp mismatch rc=$RUN_RC"
+jq -e '.verdict == "BLOCK" and .data.policy_status == "identity_mismatch" and .data.expected_identity == null and any(.reasons[]; .code == "identity_mismatch" and .data.expected_identity_regexp == "^wrong@example\\.com$")' "$RUN_OUT" >/dev/null || fail "verify sigstore identity regexp mismatch verdict"
+pass "verify sigstore identity regexp mismatch block"
+
+run_json verify_sigstore_identity_both verify sigstore-bundle --artifact "$artifact" --bundle "$bundle_json" --identity keyless@projectsigstore.iam.gserviceaccount.com --identity-regexp '^keyless@' --oidc-issuer https://accounts.google.com --json
+[[ "$RUN_RC" == "1" ]] || fail "verify sigstore both identity flags rc=$RUN_RC"
+grep -q 'mutually exclusive' "$RUN_ERR" || fail "verify sigstore both identity flags stderr"
+[[ "$(wc -l < "$RUN_ERR")" -eq 1 ]] || fail "verify sigstore both identity flags stderr is not a single line"
+pass "verify sigstore both identity flags refused"
+
+run_json verify_sigstore_identity_missing verify sigstore-bundle --artifact "$artifact" --bundle "$bundle_json" --oidc-issuer https://accounts.google.com --json
+[[ "$RUN_RC" == "1" ]] || fail "verify sigstore no identity flag rc=$RUN_RC"
+grep -q 'usage:' "$RUN_ERR" || fail "verify sigstore no identity flag stderr"
+pass "verify sigstore no identity flag refused"
+
 tuf_mirror="$tmp/tuf-mirror"
 tuf_mirror_missing_blob="$tmp/tuf-mirror-missing-blob"
 mkdir -p "$tuf_mirror/targets"

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **`verify sigstore-bundle` accepts `--identity-regexp` as an alternative to
+  the exact `--identity`.** GitHub attestation-style per-asset bundles — the
+  shape openai/codex publishes — are signed by a tag-bound workflow identity
+  (`https://github.com/openai/codex/.github/workflows/...@refs/tags/<tag>`),
+  which changes on every release and therefore cannot be pinned as an exact
+  identity. The flag maps to cosign's `--certificate-identity-regexp` and is
+  used for the main verification pass and the identity probe alike, so a
+  regexp-mode policy failure still classifies as `identity_mismatch` rather
+  than a blanket signature failure. It is mutually exclusive with `--identity`
+  and one of the two is required. `verify release-asset` already exposed
+  `--certificate-identity-regexp`, so this closes an inconsistency inside the
+  binary-audit lane rather than adding a new capability: whichever flag was
+  given is what the JSON payload reports (`expected_identity` and
+  `expected_identity_regexp`, each null when unset).
+
 - **The Socket cache location is now a first-class config knob.** The cache root
   was resolvable only via `SAFE_AUDIT_SOCKET_CACHE_DIR`, an env var the docs
   framed as test-only, even though relocating the cache to a shared/synced path

@@ -52,7 +52,7 @@ _safe_audit() {
   release_github_opts=(--repo --version --asset --json)
   vuln_github_release_opts=(--repo --version --json)
   verify_release_asset_opts=(--artifact --checksum --certificate --signature --certificate-identity-regexp --certificate-oidc-issuer --require-signature --json)
-  verify_sigstore_bundle_opts=(--artifact --bundle --identity --oidc-issuer --json)
+  verify_sigstore_bundle_opts=(--artifact --bundle --identity --identity-regexp --oidc-issuer --json)
   verify_tuf_bootstrap_opts=(--mirror --root --root-checksum --target --json)
   binary_exec_opts=(--timeout --json)
 
