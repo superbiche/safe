@@ -29,7 +29,7 @@ trivial PATH shims and completions.
 
 ## Tickets (index at export time, 2026-08-21)
 
-- [Binary-audit lane: native Go vs subprocess survey](https://superbiche.fibery.io/Superbiche/Tasks/120) — research, open; delegation fired at charting.
+- [Binary-audit lane: native Go vs subprocess survey](https://superbiche.fibery.io/Superbiche/Tasks/120) — research, CLOSED at charting.
 - [Composite release-review: spec, report schema, deps posture](https://superbiche.fibery.io/Superbiche/Tasks/121) — grilling, open; blocked by the survey.
 - [Parity belt: wire the bash-suite-against-Go rule into the repo](https://superbiche.fibery.io/Superbiche/Tasks/122) — task, open.
 - [Mixed-era binary shape: safe-core sidecar vs Go dispatcher](https://superbiche.fibery.io/Superbiche/Tasks/123) — grilling, open.
@@ -37,7 +37,7 @@ trivial PATH shims and completions.
 
 ## Decisions so far
 
-(none yet)
+- [Binary-audit lane: native Go vs subprocess survey](https://superbiche.fibery.io/Superbiche/Tasks/120) — subprocess-everywhere for the composite's v1, except GitHub REST which goes native stdlib (a straight port of the existing pinned-version curl contract); sigstore-go flagged as the future native candidate behind a fixture-corpus parity gate.
 
 ## Not yet specified
 
