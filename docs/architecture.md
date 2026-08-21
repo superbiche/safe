@@ -55,6 +55,20 @@ and per-project tool versions keep working, in every shell.
 intercept in-process auto-updaters automatically, but it records a durable audit
 trail for intentional updates that bypass package-manager safeguards.
 
+## Direction: Go
+
+`safe-core` (`cmd/safe-core`, with `internal/lockdiff` and `internal/verdict`)
+is the start of a gradual migration of `safe`'s logic out of bash and into Go.
+New capability grows in Go, not bash, wherever the choice exists.
+
+Standing design constraint (operator ruling 2026-08-21): when `binary-audit`
+moves to Go, build it composite-first — a single `release-review` command
+taking a release spec and emitting one report, advertised under one
+capability key — rather than porting the six sub-commands as-is. The
+composite was evaluated and dropped as a bash slice: downloads and
+package-specific lanes stay consumer-side either way, so the payoff only
+materializes as part of the Go migration.
+
 ## Trust Tiers
 
 Packages move through four persistent tiers:
