@@ -21,16 +21,20 @@ trivial PATH shims and completions.
 - Test law (charting ruling 2026-08-21): each migrated lane ports its tests
   to Go in the same slice, AND the surface's existing bash suite must stay
   green run against the Go binary until that surface's bash implementation
-  is deleted (the parity belt).
+  is deleted (the parity belt). Binary-audit variant (ruled at the composite
+  ticket, 2026-08-23): the composite is a new surface the bash suites cannot
+  exercise — parity evidence there is a fixture corpus (same releases through
+  the bash sub-lanes and `release-review`, verdicts diffed) until the bash
+  sub-lanes are deleted.
 - Dependency policy is ruled per lane in that lane's ticket; until a lane
   rules otherwise, the posture is subprocess (status quo).
 - First bite (charting ruling 2026-08-21): the binary-audit lane.
 - Repo review law applies (`AGENTS.md` § Reviews).
 
-## Tickets (index at export time, 2026-08-21)
+## Tickets (index at export time, 2026-08-23)
 
 - [Binary-audit lane: native Go vs subprocess survey](https://superbiche.fibery.io/Superbiche/Tasks/120) — research, CLOSED at charting.
-- [Composite release-review: spec, report schema, deps posture](https://superbiche.fibery.io/Superbiche/Tasks/121) — grilling, open; blocked by the survey.
+- [Composite release-review: spec, report schema, deps posture](https://superbiche.fibery.io/Superbiche/Tasks/121) — grilling, CLOSED 2026-08-23.
 - [Parity belt: wire the bash-suite-against-Go rule into the repo](https://superbiche.fibery.io/Superbiche/Tasks/122) — task, open.
 - [Mixed-era binary shape: safe-core sidecar vs Go dispatcher](https://superbiche.fibery.io/Superbiche/Tasks/123) — grilling, open.
 - [End-state gate: what replaces gate-lib and the PATH wrappers](https://superbiche.fibery.io/Superbiche/Tasks/124) — grilling, open.
@@ -38,6 +42,7 @@ trivial PATH shims and completions.
 ## Decisions so far
 
 - [Binary-audit lane: native Go vs subprocess survey](https://superbiche.fibery.io/Superbiche/Tasks/120) — subprocess-everywhere for the composite's v1, except GitHub REST which goes native stdlib (a straight port of the existing pinned-version curl contract); sigstore-go flagged as the future native candidate behind a fixture-corpus parity gate.
+- [Composite release-review: spec, report schema, deps posture](https://superbiche.fibery.io/Superbiche/Tasks/121) — JSON spec file in (`--spec PATH|-`); one report `{schema_version, subject, verdict, checks[]}` with a redesigned reason taxonomy (old bash codes die with the bash sub-lanes); worst-of aggregation with spec-declared advisory checks and first-class ERROR for could-not-run; single capability key `binary-audit.release-review` + advertised schema_version, strict spec decoding as backstop; composite-only (no Go shims for the six sub-lanes, deleted after consumer swap; fixture-corpus parity variant); survey deps posture ratified as-is.
 
 ## Not yet specified
 
