@@ -35,6 +35,30 @@ SUITES=(
   tests/integration/dispatcher.sh
 )
 
+# Parity-belt guard (AGENTS.md § Tests): every depth-2 test script must be
+# registered in SUITES or excluded here — a migration slice cannot add or
+# strand a belt suite silently.
+EXCLUDED=(
+  tests/audit/cvss4_exhaustive.sh   # dev cross-check needing a bootstrapped oracle
+  tests/audit/fetch_cvss4_ref.sh    # dev bootstrap helper for that oracle
+  tests/live/socket_envelope.sh     # opt-in live network probe, excluded per its own header
+  tests/lib/safe-core.sh            # shared helper, not a suite
+)
+for f in "$ROOT"/tests/*/*.sh; do
+  rel=${f#"$ROOT"/}
+  found=0
+  for s in "${SUITES[@]}" "${EXCLUDED[@]}"; do
+    [[ $rel == "$s" ]] && { found=1; break; }
+  done
+  if (( ! found )); then
+    printf 'run-all: %s is not in SUITES or EXCLUDED — register it (parity belt, AGENTS.md § Tests)\n' "$rel" >&2
+    exit 2
+  fi
+done
+
+# The aggregate runner never lets the Go belt skip itself into a false green.
+export SAFE_TEST_STRICT=1
+
 JOBS="${SAFE_TEST_JOBS:-$(nproc 2>/dev/null || echo 4)}"
 if ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
   printf 'run-all: SAFE_TEST_JOBS must be a positive integer (got %s)\n' "$JOBS" >&2
