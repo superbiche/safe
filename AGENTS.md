@@ -43,6 +43,24 @@ use, not review rounds.
 
 Bash suites, no framework: `tests/install/run.sh`, `tests/audit/*.sh`, `tests/contract/drift.sh`. Run the suites touching your change before any PR; new behavior gets a case in the matching suite. `tests/run-all.sh` runs every hermetic suite in parallel (~2 min wall-clock) — use it when a change touches more than one surface.
 
+Parity belt (Go migration law): a slice migrating a surface to Go ports that
+surface's tests to Go in the same slice, AND the surface's existing bash suite
+stays registered in `tests/run-all.sh` (`SUITES`) and stays green run against
+the Go implementation until the commit that deletes the surface's bash
+implementation — only that commit may remove the suite. Live instance today:
+suites build the working-tree Go binary via `tests/lib/safe-core.sh` and point
+`SAFE_CORE_BIN` at it. Binary-audit variant: the `release-review` composite is
+a new surface the bash suites cannot exercise — its parity evidence is a
+fixture corpus (same releases through the bash sub-lanes and `release-review`,
+verdicts diffed) until the six bash sub-lanes are deleted; the corpus lands
+with the composite slice. Belt-not-run is red: `tests/run-all.sh` exports
+`SAFE_TEST_STRICT=1`, under which a missing Go toolchain fails
+`tests/go/run.sh` instead of skipping. `tests/run-all.sh` refuses unregistered
+suites: every `tests/*/*.sh` file must appear in `SUITES` or its explicit
+exclusion list. The suite-to-surface mapping (which commit may drop which
+suite) is deliberately law, not tooling, until the mixed-era binary shape is
+ruled.
+
 ## Git
 
 `main` is push-protected; land via squash-merge PRs. Non-default branches are fine to push.
