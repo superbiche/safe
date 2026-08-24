@@ -29,10 +29,15 @@ var (
 // artifact's own readability and its checksum file's readability are separate
 // facts about a release, and a report that stops at whichever failed first
 // hides the other — including when the one it hid was the worse of the two.
-func checksum(spec Spec) CheckResult {
+//
+// verified holds the artifact indices an enabled signature check verified. It
+// is keyed by index rather than by name or path because a spec may legitimately
+// repeat either. A nil map means no signature check ran, in which case a matched
+// digest is checksum-only verification and warns unconditionally.
+func checksum(spec Spec, verified map[int]bool) CheckResult {
 	result := CheckResult{Reasons: []Reason{}}
 
-	for _, artifact := range spec.Artifacts {
+	for index, artifact := range spec.Artifacts {
 		name := artifact.AssetName
 
 		actual, hashErr := sha256File(artifact.Path)
@@ -97,13 +102,17 @@ func checksum(spec Spec) CheckResult {
 			continue
 		}
 
-		// Unconditional while no build verifies a signature. Spec-level
-		// signature metadata is a claim nothing here checks — treating its
-		// presence as verification would let an unreadable bundle path lift a
-		// release to GO. The slice that implements the signature check earns
-		// the right to suppress this.
+		// Suppressed only by a signature check that actually verified this
+		// artifact. Spec-level signature metadata is a claim, not verification:
+		// were presence of the block enough, a bundle path that does not exist
+		// would lift a release to GO. An advisory signature check that verified
+		// still suppresses — verification happened, and advisory caps what a
+		// check contributes to the top level, not what it observed.
+		if verified[index] {
+			continue
+		}
 		result.add(WARN, "checksum_only_verification",
-			fmt.Sprintf("%s matched its checksum, but no implemented check verifies that checksum", name),
+			fmt.Sprintf("%s matched its checksum, but no enabled signature check vouched for it", name),
 			map[string]string{"artifact": name})
 	}
 

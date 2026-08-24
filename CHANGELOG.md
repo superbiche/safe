@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- **`release-review` implements `signature`, `tuf` and `exec`, and can now
+  return a top-level `GO`.** Four of the six checks are live; `release` and
+  `vuln` remain schema-only and refused if enabled, and the composite stays
+  unadvertised in `safe audit capabilities` until they land. `signature`
+  verifies each artifact's Sigstore bundle with `cosign verify-blob` against the
+  spec's identity policy, and re-probes a failure with wildcard identity and
+  issuer so the report distinguishes a bundle that does not verify at all
+  (`signature_failure`) from one signed by the wrong identity or the wrong
+  issuer — both, when both are wrong. `tuf` bootstraps `cosign initialize`
+  against a pinned root over the spec's local mirror and compares each named
+  trust target against the trusted metadata. `exec` runs the release binary
+  under the same podman sandbox the bash lane used — no network, read-only
+  artifact bind, every capability dropped, tmpfs scratch — and reports how it
+  behaved. **`checksum_only_verification` earns its retirement**: a matched
+  digest no longer warns when an enabled `signature` check verified that same
+  artifact (matched by position, since a spec may repeat an asset name), so a
+  verified release exits 0 for the first time. Signature *metadata* alone still
+  does not suppress it — presence of a bundle path is not verification.
+  Three severities deliberately diverge from the bash sub-lanes: a missing
+  `cosign` or `podman` is `ERROR` (exit 30, audit-infrastructure breakage with
+  an install as its recovery) rather than `BLOCK`/`WARN`, and a missing `exec`
+  artifact is `BLOCK` rather than `WARN`, because the same observation must not
+  be classified two ways inside one composite. Three external dependencies
+  disappear in the port: the python HTTP bridge (the mirror is served by a
+  loopback listener from Go's own stdlib), the `sha256sum`/`shasum` preflight
+  (hashing is native), and coreutils `timeout` (the deadline is a Go context
+  with SIGTERM and a 5s kill delay). `docs/release-review.md` carries the new
+  reason taxonomy per check and a full divergence ledger.
+
 - **`safe audit binary-audit release-review --spec PATH` reviews a whole
   release from one spec and emits one report.** Judging a release meant running
   the six `binary-audit` sub-commands in sequence and stitching their JSON

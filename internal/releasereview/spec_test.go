@@ -5,6 +5,10 @@ import (
 	"testing"
 )
 
+// A syntactically valid sha256, so that a TUF case fails on the field under
+// test rather than on the checksum.
+const sixtyFourHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
 func TestDecodeRejects(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -78,18 +82,53 @@ func TestDecodeRejects(t *testing.T) {
 		},
 		{
 			name:    "unimplemented check enabled",
-			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],"checks":{"checksum":{"enabled":true},"signature":{"enabled":true}}}`,
-			wantSub: `check "signature" is not implemented by this build (implements: checksum)`,
+			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],"checks":{"checksum":{"enabled":true},"release":{"enabled":true}}}`,
+			wantSub: `check "release" is not implemented by this build (implements: checksum, signature, tuf, exec)`,
 		},
 		{
-			name:    "unimplemented exec check enabled",
-			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"exec":{"enabled":true,"artifact":"a","timeout_seconds":5}}}`,
-			wantSub: `check "exec" is not implemented by this build`,
+			name:    "unimplemented vuln check enabled",
+			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"vuln":{"enabled":true}}}`,
+			wantSub: `check "vuln" is not implemented by this build`,
 		},
 		{
-			name:    "unimplemented tuf check enabled",
-			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"m","root":"r","root_checksum":"s","targets":{"n":"p"}}}}`,
-			wantSub: `check "tuf" is not implemented by this build`,
+			name:    "signature enabled with no signature evidence anywhere",
+			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"},{"path":"b"}],"checks":{"signature":{"enabled":true}}}`,
+			wantSub: `check "signature" is enabled but no artifact carries evidence.signature`,
+		},
+		{
+			name:    "tuf mirror is a remote URL",
+			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"https://tuf.example/root","root":"r","root_checksum":"` + sixtyFourHex + `","targets":{"n":"p"}}}}`,
+			wantSub: "only supports local mirror paths or file:// URLs",
+		},
+		{
+			name:    "tuf mirror is missing",
+			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"root":"r","root_checksum":"` + sixtyFourHex + `","targets":{"n":"p"}}}}`,
+			wantSub: "checks.tuf.mirror is required",
+		},
+		{
+			name:    "tuf root checksum is not a sha256",
+			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"m","root":"r","root_checksum":"deadbeef","targets":{"n":"p"}}}}`,
+			wantSub: "checks.tuf.root_checksum must be a sha256 digest",
+		},
+		{
+			name:    "tuf names no targets",
+			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"m","root":"r","root_checksum":"` + sixtyFourHex + `","targets":{}}}}`,
+			wantSub: "must name at least one trust target",
+		},
+		{
+			name:    "tuf target has no path",
+			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"m","root":"r","root_checksum":"` + sixtyFourHex + `","targets":{"n":""}}}}`,
+			wantSub: `checks.tuf.targets["n"] is empty`,
+		},
+		{
+			name:    "exec names no artifact",
+			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"exec":{"enabled":true}}}`,
+			wantSub: "checks.exec.artifact is required",
+		},
+		{
+			name:    "exec timeout is negative",
+			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"exec":{"enabled":true,"artifact":"a","timeout_seconds":-1}}}`,
+			wantSub: "checks.exec.timeout_seconds must not be negative",
 		},
 		{
 			name:    "no checks enabled",
@@ -219,13 +258,47 @@ func TestDecodeAcceptsNestedDuplicateFreeSpec(t *testing.T) {
 // so the stderr line does not depend on JSON key order.
 func TestUnimplementedRefusalIsDeterministic(t *testing.T) {
 	spec := `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],
-	          "checks":{"exec":{"enabled":true},"vuln":{"enabled":true},"signature":{"enabled":true}}}`
+	          "checks":{"vuln":{"enabled":true},"release":{"enabled":true}}}`
 	_, err := Decode(strings.NewReader(spec))
 	if err == nil {
 		t.Fatal("expected a refusal, got none")
 	}
-	if !strings.Contains(err.Error(), `check "signature"`) {
-		t.Fatalf("expected the refusal to name signature, got %q", err.Error())
+	if !strings.Contains(err.Error(), `check "release"`) {
+		t.Fatalf("expected the refusal to name release, got %q", err.Error())
+	}
+}
+
+// Config validation is gated on enabled, so a disabled block may carry
+// whatever placeholder a generator left in it. The documented schema example
+// relies on this.
+func TestDisabledCheckBlocksAreNotValidated(t *testing.T) {
+	spec := `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},
+	          "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],
+	          "checks":{"checksum":{"enabled":true},
+	                    "tuf":{"enabled":false,"mirror":"https://not-a-local-mirror","root":"",
+	                           "root_checksum":"not-a-digest","targets":{}},
+	                    "exec":{"enabled":false,"artifact":"","timeout_seconds":-99}}}`
+	if _, err := Decode(strings.NewReader(spec)); err != nil {
+		t.Fatalf("a disabled block was validated: %v", err)
+	}
+}
+
+// The two fields the TUF check consumes are stored canonical, so the check
+// never re-derives them: a file:// mirror keeps only its path, and a prefixed
+// uppercase checksum lands lowercased and bare.
+func TestTUFConfigIsNormalized(t *testing.T) {
+	spec, err := Decode(strings.NewReader(
+		`{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],
+		  "checks":{"tuf":{"enabled":true,"mirror":"file:///srv/mirror","root":"root.json",
+		            "root_checksum":"sha256:` + strings.ToUpper(sixtyFourHex) + `","targets":{"n":"p"}}}}`))
+	if err != nil {
+		t.Fatalf("unexpected refusal: %v", err)
+	}
+	if got := spec.Checks.TUF.Mirror; got != "/srv/mirror" {
+		t.Fatalf("mirror normalized to %q, want /srv/mirror", got)
+	}
+	if got := spec.Checks.TUF.RootChecksum; got != sixtyFourHex {
+		t.Fatalf("root_checksum normalized to %q, want %q", got, sixtyFourHex)
 	}
 }
 
