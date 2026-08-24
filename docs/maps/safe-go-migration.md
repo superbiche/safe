@@ -34,12 +34,12 @@ trivial PATH shims and completions.
 - First bite (charting ruling 2026-08-21): the binary-audit lane.
 - Repo review law applies (`AGENTS.md` § Reviews).
 
-## Tickets (index at export time, 2026-08-23)
+## Tickets (index at export time, 2026-08-24)
 
 - [Binary-audit lane: native Go vs subprocess survey](https://superbiche.fibery.io/Superbiche/Tasks/120) — research, CLOSED at charting.
 - [Composite release-review: spec, report schema, deps posture](https://superbiche.fibery.io/Superbiche/Tasks/121) — grilling, CLOSED 2026-08-23.
 - [Parity belt: wire the bash-suite-against-Go rule into the repo](https://superbiche.fibery.io/Superbiche/Tasks/122) — task, CLOSED 2026-08-23.
-- [Mixed-era binary shape: safe-core sidecar vs Go dispatcher](https://superbiche.fibery.io/Superbiche/Tasks/123) — grilling, open.
+- [Mixed-era binary shape: safe-core sidecar vs Go dispatcher](https://superbiche.fibery.io/Superbiche/Tasks/123) — grilling, CLOSED 2026-08-24.
 - [End-state gate: what replaces gate-lib and the PATH wrappers](https://superbiche.fibery.io/Superbiche/Tasks/124) — grilling, open.
 
 ## Decisions so far
@@ -47,6 +47,7 @@ trivial PATH shims and completions.
 - [Binary-audit lane: native Go vs subprocess survey](https://superbiche.fibery.io/Superbiche/Tasks/120) — subprocess-everywhere for the composite's v1, except GitHub REST which goes native stdlib (a straight port of the existing pinned-version curl contract); sigstore-go flagged as the future native candidate behind a fixture-corpus parity gate.
 - [Composite release-review: spec, report schema, deps posture](https://superbiche.fibery.io/Superbiche/Tasks/121) — JSON spec file in (`--spec PATH|-`); one report `{schema_version, subject, verdict, checks[]}` with a redesigned reason taxonomy (old bash codes die with the bash sub-lanes); worst-of aggregation with spec-declared advisory checks and first-class ERROR for could-not-run; single capability key `binary-audit.release-review` + advertised schema_version, strict spec decoding as backstop; composite-only (no Go shims for the six sub-lanes, deleted after consumer swap; fixture-corpus parity variant); survey deps posture ratified as-is.
 - [Parity belt: wire the bash-suite-against-Go rule into the repo](https://superbiche.fibery.io/Superbiche/Tasks/122) — landed (PR #97, `be4b240`): law text in `AGENTS.md` § Tests (SUITES-departure rule + fixture-corpus variant), `tests/run-all.sh` enumeration guard refusing unregistered suites, `SAFE_TEST_STRICT=1` making belt-not-run red; suite-to-surface mapping deliberately law-not-tooling until the mixed-era binary shape is ruled.
+- [Mixed-era binary shape: safe-core sidecar vs Go dispatcher](https://superbiche.fibery.io/Superbiche/Tasks/123) — sidecar continues: one `safe-core` binary, lanes accrete as subcommands, bash dispatcher forwards via exec-passthrough (zero bash logic); exact `SAFE_VERSION` lockstep stays and extends to every migrated surface; capabilities stay statically advertised (lockstep makes them truthful); composite CLI path `safe audit binary-audit release-review`; a lane's migration slice replaces its bash implementation with the forward, so the parity belt holds through the unchanged CLI; Go dispatcher takeover deliberately left as fog.
 
 ## Not yet specified
 
