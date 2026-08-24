@@ -2,6 +2,84 @@
 
 ## Unreleased
 
+- **`release-review`'s version comparison now cuts file suffixes with gnulib's
+  actual forward-scan `file_prefixlen`.** The earlier port used a backward scan
+  that could cut a version string's prefix to empty and cut trailing runs the
+  real `filevercmp` leaves whole, so on degenerate-but-parseable shapes it
+  decided a `vuln` advisory range opposite to the `sort -V` bash oracle — e.g.
+  `1.2.V.` compared as `1.2`, dropping an advisory the oracle matched
+  (fail-open). The comparison of every well-formed version is unchanged; the
+  captured regression pairs in `version_test.go` pin the corrected edge cases to
+  the bash oracle's verdicts.
+
+- **`release-review` is now advertised as `binary-audit.release-review` in
+  `safe audit capabilities`.** A capability key is a promise that the surface
+  behind it is whole, and with all six checks live it is. The advertisement
+  carries the contract as well as the key: a new `versions` object states the
+  `spec_version` the composite accepts and the `report_schema_version` it emits,
+  so a consumer preflights both instead of discovering them from a refusal.
+  Those numbers are what `safe-core release-review --versions` prints, and
+  `tests/audit/release_review_forward.sh` fails if the advertisement and the
+  engine ever disagree — a capability promising a schema its engine does not
+  accept would be worse than no capability at all. The capabilities payload
+  gaining a key and an object is a change to that surface, so
+  `SAFE_AUDIT_VERSION` moves to `0.2.0`; it versions the capabilities command
+  and is independent of `SAFE_VERSION`. The six `binary-audit` sub-lanes stay
+  advertised beside the composite: they are still callable, and a key is
+  withdrawn when its command is deleted, not when a successor lands.
+
+- **The `exec` sandbox no longer runs the release binary through a shell.** The
+  bash lane wrapped it in `sh -c 'exec /artifact/<name> "$@"' sh` to forward its
+  arguments, which spliced a spec-supplied file name into shell program text: an
+  artifact named `x|touch PWNED` executed the second half of its own name inside
+  the container. It was contained — the injected code ran under the same
+  `--network=none --read-only --cap-drop=ALL` sandbox as the untrusted binary
+  the check runs by design — but the name becomes attacker-chosen the day a
+  consumer smokes a binary under the name an archive gave it. Go passes argv as
+  argv, so the wrapper bought nothing; podman is now handed the artifact path as
+  one argv entry followed by its arguments.
+
+- **A fixture-parity corpus (`tests/corpus/`) runs the same releases through
+  both the bash sub-lanes and the composite and diffs their verdicts.** The
+  composite is a surface the bash suites cannot exercise through their own CLIs,
+  so this is its parity belt, and it stays until those sub-lanes are deleted.
+  Both lanes are driven over real HTTP from one local fixture server — bash
+  through curl, the composite through `net/http` — because mocking each side
+  separately would compare two different fixtures and call the result parity.
+  Twelve cases assert the lanes agree; eight assert they differ in exactly the
+  way the divergence ledger records, so a ledgered divergence that quietly stops
+  happening fails the suite as loudly as one that appears. That covers every
+  verdict-affecting ledger entry, including the ones inherited from earlier
+  slices — a missing `cosign` or `podman`, and a missing `exec` artifact, were
+  claims about how the composite differs from bash that nothing checked until
+  now.
+
+- **`release-review` implements `release` and `vuln`, completing all six
+  checks.** Both are native Go against the GitHub REST API — no `curl`, no `jq`,
+  no subprocess. `release` reads the release's channel, its age, whether it
+  carries the asset the spec names, whether other releases were published the
+  same day, what changed against its predecessor, and whether GitHub reports the
+  tagged commit as signed; every adverse answer is `BLOCK`, because every one of
+  them is a fact about the release. `vuln` matches the version against the
+  repository's published advisories: high or critical is `BLOCK`, lower is
+  `WARN`, and an advisory whose affected range cannot be read is `BLOCK` — a
+  mapping that might cover the version fails closed. Version comparison is a
+  port of GNU version sort, the semantics `sort -V` gave the bash lanes, so a
+  release candidate still sorts above its release exactly as it did there; the
+  port's tables were captured by running the bash functions rather than written
+  from memory. `checks.release.asset` is required when the check is enabled.
+  **Three deliberate divergences from the bash sub-lanes, all ledgered in
+  `docs/release-review.md`:** a GitHub that cannot be read is now `ERROR` (exit
+  30) rather than `BLOCK` — only a `404` is evidence about the release, and its
+  message names the private-repository-without-`GITHUB_TOKEN` case, because
+  GitHub answers 404 rather than 403 for a read it will not authorize; paginated
+  listings follow the `Link` header instead of silently deciding on the first
+  page of 100, with a 10-page bound that is always reported; and an advisory
+  naming no readable version range is ambiguous rather than absent, closing a
+  fail-open where the bash lane read it as "does not affect this version".
+  `GITHUB_TOKEN`, when set, is sent as an `Authorization` header and reaches
+  nothing else — no URL, no report, no reason, no error message.
+
 - **`release-review` implements `signature`, `tuf` and `exec`, and can now
   return a top-level `GO`.** Four of the six checks are live; `release` and
   `vuln` remain schema-only and refused if enabled, and the composite stays

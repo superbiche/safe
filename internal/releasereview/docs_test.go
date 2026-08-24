@@ -18,10 +18,14 @@ func TestDocumentedSpecExamplesValidate(t *testing.T) {
 		t.Fatalf("read %s: %v", docPath, err)
 	}
 
+	// A spec example is a block naming both a spec_version and a subject. The
+	// doc also shows JSON that is not a spec — the capability advertisement
+	// quotes the spec_version it promises — and holding that to the spec
+	// validator would refuse a correct document.
 	blocks := jsonBlocks(string(content))
 	specs := make([]string, 0, len(blocks))
 	for _, block := range blocks {
-		if strings.Contains(block, `"spec_version"`) {
+		if strings.Contains(block, `"spec_version"`) && strings.Contains(block, `"subject"`) {
 			specs = append(specs, block)
 		}
 	}

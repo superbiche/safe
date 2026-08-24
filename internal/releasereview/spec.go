@@ -7,9 +7,13 @@
 // fails fast at the spec instead of returning a report whose missing checks a
 // consumer would have to notice on its own.
 //
-// Nothing here fetches anything. Every artifact and every piece of evidence is
-// a path the caller already placed on disk, which is what keeps this package
-// stdlib-only and its review reproducible.
+// Artifacts and their evidence are never fetched: every file a check reads is
+// a path the caller already placed on disk. The release and vuln checks do
+// reach the network, but only to read GitHub's own metadata about the release —
+// its channel, its age, the commit its tag names, the advisories published
+// against the repository. Nothing under review is downloaded here, which is
+// what keeps this package stdlib-only and its verdicts reproducible from the
+// caller's files.
 package releasereview
 
 import (
@@ -37,7 +41,18 @@ var checkOrder = []string{CheckChecksum, CheckSignature, CheckRelease, CheckVuln
 
 // implementedChecks lists the checks this build can actually run, in
 // checkOrder. Everything else is schema-only.
-var implementedChecks = []string{CheckChecksum, CheckSignature, CheckTUF, CheckExec}
+var implementedChecks = []string{CheckChecksum, CheckSignature, CheckRelease, CheckVuln, CheckTUF, CheckExec}
+
+// The two versions this build speaks. They are constants rather than literals
+// at their use sites because they are also advertised — `safe-core
+// release-review --versions` prints them, and safe-audit's capability payload
+// repeats them so a consumer can preflight a spec before writing one.
+const (
+	// SpecVersion is the only spec_version Decode accepts.
+	SpecVersion = 1
+	// ReportSchemaVersion is the schema_version every report carries.
+	ReportSchemaVersion = 1
+)
 
 // Spec is a release review request, schema spec_version 1.
 type Spec struct {
@@ -72,9 +87,9 @@ type Evidence struct {
 }
 
 // SignatureEvidence is a Sigstore bundle plus the identity policy it must
-// satisfy. Validated even though no build verifies bundles yet — the schema is
-// contract from day one, so a spec written today stays valid when the check
-// lands.
+// satisfy. It is validated whether or not the signature check is enabled: the
+// schema is contract, and evidence a disabled check would have read still has
+// to mean one thing.
 type SignatureEvidence struct {
 	Bundle         string `json:"bundle"`
 	Identity       string `json:"identity"`
@@ -85,12 +100,12 @@ type SignatureEvidence struct {
 // Checks selects which checks run. An omitted block is a disabled check; an
 // omitted Checks object is the default spec: checksum only.
 type Checks struct {
-	Checksum  *CheckConfig `json:"checksum"`
-	Signature *CheckConfig `json:"signature"`
-	Release   *CheckConfig `json:"release"`
-	Vuln      *CheckConfig `json:"vuln"`
-	TUF       *TUFCheck    `json:"tuf"`
-	Exec      *ExecCheck   `json:"exec"`
+	Checksum  *CheckConfig  `json:"checksum"`
+	Signature *CheckConfig  `json:"signature"`
+	Release   *ReleaseCheck `json:"release"`
+	Vuln      *CheckConfig  `json:"vuln"`
+	TUF       *TUFCheck     `json:"tuf"`
+	Exec      *ExecCheck    `json:"exec"`
 }
 
 // CheckConfig is the shape every check block shares. Advisory does not change
@@ -98,6 +113,15 @@ type Checks struct {
 type CheckConfig struct {
 	Enabled  bool `json:"enabled"`
 	Advisory bool `json:"advisory"`
+}
+
+// ReleaseCheck configures the GitHub release-metadata check. Asset is the name
+// the release must carry: the check answers whether GitHub's own record of the
+// release contains the file the consumer is about to install, so which file
+// that is has to be said, not guessed from the artifacts on disk.
+type ReleaseCheck struct {
+	CheckConfig
+	Asset string `json:"asset"`
 }
 
 // TUFCheck configures the TUF bootstrap check.
@@ -227,8 +251,8 @@ func walkForRepeats(decoder *json.Decoder, token json.Token, path string) error 
 
 // normalize validates the spec and fills the defaults the schema documents.
 func (s *Spec) normalize() error {
-	if s.SpecVersion != 1 {
-		return fmt.Errorf("spec_version must be 1 (got %d)", s.SpecVersion)
+	if s.SpecVersion != SpecVersion {
+		return fmt.Errorf("spec_version must be %d (got %d)", SpecVersion, s.SpecVersion)
 	}
 	if s.Subject.Repo == "" {
 		return fmt.Errorf("subject.repo is required")
@@ -304,6 +328,10 @@ func (s *Spec) validateChecks() error {
 		case CheckSignature:
 			if !s.anySignatureEvidence() {
 				return fmt.Errorf("check %q is enabled but no artifact carries evidence.signature", CheckSignature)
+			}
+		case CheckRelease:
+			if err := s.Checks.Release.validate(); err != nil {
+				return err
 			}
 		case CheckTUF:
 			if err := s.Checks.TUF.normalize(); err != nil {
@@ -381,6 +409,16 @@ func (t *TUFCheck) normalize() error {
 	return nil
 }
 
+// validate checks the release block. The asset name has no default: falling
+// back to the first artifact's name would let a spec that names the wrong file
+// pass as if it had named the right one.
+func (r *ReleaseCheck) validate() error {
+	if r.Asset == "" {
+		return fmt.Errorf("checks.release.asset is required — name the asset the GitHub release must carry")
+	}
+	return nil
+}
+
 // validate checks the exec block. Artifact is a free path: it is the executable
 // to smoke, typically something extracted from a distributed artifact, and it
 // need not name an artifacts[] entry.
@@ -438,8 +476,10 @@ func (s *Spec) checkConfigs() map[string]*CheckConfig {
 	configs := map[string]*CheckConfig{
 		CheckChecksum:  s.Checks.Checksum,
 		CheckSignature: s.Checks.Signature,
-		CheckRelease:   s.Checks.Release,
 		CheckVuln:      s.Checks.Vuln,
+	}
+	if s.Checks.Release != nil {
+		configs[CheckRelease] = &s.Checks.Release.CheckConfig
 	}
 	if s.Checks.TUF != nil {
 		configs[CheckTUF] = &s.Checks.TUF.CheckConfig

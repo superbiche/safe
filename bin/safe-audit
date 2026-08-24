@@ -3,14 +3,14 @@
 
 set -euo pipefail
 
-SAFE_AUDIT_VERSION="0.1.0"
+SAFE_AUDIT_VERSION="0.2.0"
 # safe-audit is installed as its own executable and is a documented
 # compatibility entry point, so it cannot rely on inheriting SAFE_VERSION
 # from the dispatcher: invoked directly there is no parent to inherit from,
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.31.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.32.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -76,10 +76,23 @@ declare -ar SAFE_AUDIT_OSV_LOCKFILE_FORMATS=(
   go.mod
 )
 
+# The release-review composite's advertised contract: the spec_version
+# safe-core accepts and the report schema_version it emits. A consumer
+# preflights both before writing a spec, so they are advertised alongside the
+# capability key rather than left to be discovered from a refusal. Guarded
+# against safe-core's own `release-review --versions` by
+# tests/audit/release_review_forward.sh.
+RELEASE_REVIEW_SPEC_VERSION=1
+RELEASE_REVIEW_REPORT_SCHEMA_VERSION=1
+
+# The six binary-audit sub-lanes stay advertised beside the composite that
+# replaces them: they are still callable, and a capability key is withdrawn
+# when its command is deleted, not when a successor lands.
 declare -ar SAFE_AUDIT_CAPABILITY_NAMES=(
   package-audit
   repo-audit
   machine-audit
+  binary-audit.release-review
   binary-audit.exec
   binary-audit.release.github
   binary-audit.vuln.github-release
@@ -892,8 +905,16 @@ capabilities_payload_json() {
 
   jq -n \
     --argjson capabilities "$capabilities_json" \
+    --argjson release_review_spec_version "$RELEASE_REVIEW_SPEC_VERSION" \
+    --argjson release_review_report_schema_version "$RELEASE_REVIEW_REPORT_SCHEMA_VERSION" \
     '{
       capabilities: $capabilities,
+      versions: {
+        "binary-audit.release-review": {
+          spec_version: $release_review_spec_version,
+          report_schema_version: $release_review_report_schema_version
+        }
+      },
       groups: {
         top_level: {
           "package-audit": $capabilities["package-audit"],
@@ -903,6 +924,7 @@ capabilities_payload_json() {
           status: $capabilities.status
         },
         "binary-audit": {
+          "release-review": $capabilities["binary-audit.release-review"],
           exec: $capabilities["binary-audit.exec"],
           "release.github": $capabilities["binary-audit.release.github"],
           "vuln.github-release": $capabilities["binary-audit.vuln.github-release"],
@@ -935,6 +957,7 @@ capabilities_command_json() {
       command: $command,
       version: $version,
       capabilities: $payload.capabilities,
+      versions: $payload.versions,
       groups: $payload.groups
     }'
 }
@@ -11089,7 +11112,7 @@ USAGE
   safe audit machine-audit [--verbose] [--deps-only | --full] [--no-cache] [--result-out <file>] [--allow-missing-tools] [--project <path>] [--all | --machine <csv>]
 
   binary-audit — distributed artifacts: assets, signatures, TUF roots, execution
-  safe audit binary-audit release-review --spec PATH   (whole release from one spec; composite, not yet capability-advertised)
+  safe audit binary-audit release-review --spec PATH   (whole release from one spec; composite)
   safe audit binary-audit exec PATH [--timeout SECONDS] [--json] -- [ARGS...]
   safe audit binary-audit release github --repo OWNER/REPO --version TAG --asset NAME [--json]
   safe audit binary-audit vuln github-release --repo OWNER/REPO --version TAG [--json]

@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/superbiche/safe/internal/releasereview"
 )
 
 func writeReviewFile(t *testing.T, dir, name, content string) string {
@@ -163,6 +165,42 @@ func TestReleaseReviewERROR(t *testing.T) {
 	}
 }
 
+// safe-audit advertises these two numbers in its capability payload, so what
+// this build actually accepts and emits has to be printable rather than
+// inferred from a refusal.
+func TestReleaseReviewVersions(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"release-review", "--versions"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("run() = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+
+	var versions map[string]int
+	if err := json.Unmarshal(stdout.Bytes(), &versions); err != nil {
+		t.Fatalf("output %q is not JSON: %v", stdout.String(), err)
+	}
+	if versions["spec_version"] != releasereview.SpecVersion ||
+		versions["report_schema_version"] != releasereview.ReportSchemaVersion {
+		t.Fatalf("printed %v, want the package's own constants", versions)
+	}
+
+	// The report the engine emits must actually carry the schema_version it
+	// advertises; two constants that agree with each other but not with the
+	// output would be a promise nothing keeps.
+	dir := t.TempDir()
+	artifact := writeReviewFile(t, dir, "tool.tar.gz", "payload")
+	checksums := writeReviewFile(t, dir, "checksums.txt", digestOf("payload")+"  tool.tar.gz\n")
+	_, report, _ := runReview(t, reviewSpec(t, artifact, checksums))
+	var emitted struct {
+		SchemaVersion int `json:"schema_version"`
+	}
+	if err := json.Unmarshal([]byte(report), &emitted); err != nil {
+		t.Fatalf("report %q is not JSON: %v", report, err)
+	}
+	if emitted.SchemaVersion != versions["report_schema_version"] {
+		t.Fatalf("report carries schema_version %d, advertised %d", emitted.SchemaVersion, versions["report_schema_version"])
+	}
+}
+
 func TestReleaseReviewUsage(t *testing.T) {
 	cases := [][]string{
 		{"release-review"},
@@ -170,6 +208,7 @@ func TestReleaseReviewUsage(t *testing.T) {
 		{"release-review", "--spec", ""},
 		{"release-review", "--specification", "s.json"},
 		{"release-review", "--spec", "s.json", "--json"},
+		{"release-review", "--versions", "extra"},
 	}
 	for _, args := range cases {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
@@ -192,7 +231,7 @@ func TestReleaseReviewUnusableSpec(t *testing.T) {
 	}{
 		{"not JSON", `not json`, "read spec"},
 		{"unknown field", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"x":1}`, `unknown field "x"`},
-		{"unimplemented check", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"vuln":{"enabled":true}}}`, "not implemented by this build"},
+		{"release enabled without an asset", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"release":{"enabled":true}}}`, "checks.release.asset is required"},
 		{"no checks enabled", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{}}`, "no checks are enabled"},
 		{
 			name:    "object appended after the spec",

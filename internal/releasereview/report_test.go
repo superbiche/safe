@@ -2,6 +2,7 @@ package releasereview
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -171,21 +172,29 @@ func TestEmptyReasonsEncodeAsArray(t *testing.T) {
 	}
 }
 
-// Review is total over enabled checks: a check with no implementation arm is
+// Dispatch is total over check ids: an id with no implementation arm is
 // reported as a broken review, never as a check that found nothing.
-func TestReviewBackstopsAnUnimplementedCheck(t *testing.T) {
+//
+// Every check the schema names now has an arm, so no spec reaches this — which
+// is exactly why it is driven directly. The backstop exists for a disagreement
+// between validation and the dispatcher, and a disagreement that fails closed
+// is the whole point of keeping it.
+func TestDispatchBackstopsAnUnimplementedCheck(t *testing.T) {
 	spec := Spec{
 		SpecVersion: 1,
 		Subject:     Subject{Repo: "o/r", Version: "v1"},
 		Artifacts:   []Artifact{{Path: "a", AssetName: "a"}},
-		Checks:      &Checks{Vuln: &CheckConfig{Enabled: true}},
+		Checks:      &Checks{},
 	}
 
-	report := Review(spec)
-	if report.Verdict != ERROR {
-		t.Fatalf("verdict %s, want ERROR", report.Verdict)
+	result := runCheck("provenance", spec, nil, CheckResult{})
+	if result.Verdict != ERROR {
+		t.Fatalf("verdict %s, want ERROR", result.Verdict)
 	}
-	if len(report.Checks) != 1 || report.Checks[0].Reasons[0].Code != "check_not_implemented" {
-		t.Fatalf("unexpected report: %+v", report.Checks)
+	if len(result.Reasons) != 1 || result.Reasons[0].Code != "check_not_implemented" {
+		t.Fatalf("unexpected reasons: %+v", result.Reasons)
+	}
+	if !strings.Contains(result.Reasons[0].Message, `"provenance"`) {
+		t.Fatalf("message %q does not name the check", result.Reasons[0].Message)
 	}
 }

@@ -81,14 +81,9 @@ func TestDecodeRejects(t *testing.T) {
 			wantSub: "signature.bundle is required",
 		},
 		{
-			name:    "unimplemented check enabled",
-			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],"checks":{"checksum":{"enabled":true},"release":{"enabled":true}}}`,
-			wantSub: `check "release" is not implemented by this build (implements: checksum, signature, tuf, exec)`,
-		},
-		{
-			name:    "unimplemented vuln check enabled",
-			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"vuln":{"enabled":true}}}`,
-			wantSub: `check "vuln" is not implemented by this build`,
+			name:    "release enabled without an asset",
+			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"release":{"enabled":true}}}`,
+			wantSub: "checks.release.asset is required",
 		},
 		{
 			name:    "signature enabled with no signature evidence anywhere",
@@ -254,11 +249,47 @@ func TestDecodeAcceptsNestedDuplicateFreeSpec(t *testing.T) {
 	}
 }
 
+// withImplementedChecks narrows what this build claims to implement for one
+// test.
+//
+// This build implements all six checks, so no spec reaches the
+// not-implemented refusal any more. That refusal is what keeps a stale safe
+// from returning a report whose missing checks a consumer would have to notice
+// on its own, and it stays covered by manufacturing the condition rather than
+// being deleted along with the last unimplemented check — the next
+// schema_version that names a seventh check needs it working on day one.
+func withImplementedChecks(t *testing.T, checks ...string) {
+	t.Helper()
+	original := implementedChecks
+	t.Cleanup(func() { implementedChecks = original })
+	implementedChecks = checks
+}
+
+func TestEnablingACheckThisBuildCannotRunIsRefused(t *testing.T) {
+	withImplementedChecks(t, CheckChecksum)
+
+	spec := `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},
+	          "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],
+	          "checks":{"checksum":{"enabled":true},"vuln":{"enabled":true}}}`
+	_, err := Decode(strings.NewReader(spec))
+	if err == nil {
+		t.Fatal("expected a refusal, got none")
+	}
+	if !strings.Contains(err.Error(), `check "vuln" is not implemented by this build (implements: checksum)`) {
+		t.Fatalf("refusal %q does not name the check and what the build does implement", err.Error())
+	}
+	if !strings.Contains(err.Error(), "upgrade safe or disable the check") {
+		t.Fatalf("refusal %q carries no recovery", err.Error())
+	}
+}
+
 // The unimplemented-check refusal names the first such check in report order,
 // so the stderr line does not depend on JSON key order.
 func TestUnimplementedRefusalIsDeterministic(t *testing.T) {
+	withImplementedChecks(t, CheckChecksum)
+
 	spec := `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],
-	          "checks":{"vuln":{"enabled":true},"release":{"enabled":true}}}`
+	          "checks":{"vuln":{"enabled":true},"release":{"enabled":true,"asset":"tool.tar.gz"}}}`
 	_, err := Decode(strings.NewReader(spec))
 	if err == nil {
 		t.Fatal("expected a refusal, got none")

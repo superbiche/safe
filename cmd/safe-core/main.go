@@ -35,7 +35,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if !ok {
 		fmt.Fprintln(stderr, "safe-core: usage: safe-core lockdiff [--registry-host <host>]... <old-lockfile> <new-lockfile>")
 		fmt.Fprintln(stderr, "safe-core: usage: safe-core package-verdict < evidence.json")
-		fmt.Fprintln(stderr, "safe-core: usage: safe-core release-review --spec <spec.json|->")
+		fmt.Fprintln(stderr, "safe-core: usage: safe-core release-review --spec <spec.json|-> | --versions")
 		return 2
 	}
 
@@ -112,8 +112,25 @@ func packageVerdict(args []string, stdin io.Reader, stdout, stderr io.Writer) in
 // through the exit code — 0/10/20 as elsewhere in safe, plus 30 for a review
 // that broke, which is audit infrastructure failing and not a release finding.
 func releaseReview(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	// The versions this build speaks, printed rather than inferred. safe-audit
+	// advertises them in its capability payload, and a capability that promised
+	// a schema the engine behind it does not accept would be worse than no
+	// capability key at all — so the advertisement is checked against this.
+	if len(args) == 1 && args[0] == "--versions" {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetEscapeHTML(false)
+		if err := encoder.Encode(map[string]int{
+			"spec_version":          releasereview.SpecVersion,
+			"report_schema_version": releasereview.ReportSchemaVersion,
+		}); err != nil {
+			fmt.Fprintf(stderr, "safe-core: release-review: write JSON: %v\n", err)
+			return 30
+		}
+		return 0
+	}
+
 	if len(args) != 2 || args[0] != "--spec" || args[1] == "" {
-		fmt.Fprintln(stderr, "safe-core: usage: safe-core release-review --spec <spec.json|->")
+		fmt.Fprintln(stderr, "safe-core: usage: safe-core release-review --spec <spec.json|-> | --versions")
 		return 2
 	}
 
