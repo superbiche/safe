@@ -138,8 +138,11 @@ func releaseReview(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 	encoder := json.NewEncoder(stdout)
 	encoder.SetEscapeHTML(false)
 	if err := encoder.Encode(report); err != nil {
-		fmt.Fprintf(stderr, "safe-core: release-review: write JSON: %v\n", err)
-		return 3
+		// A report that cannot be written is a broken review, not a refused
+		// spec: the review ran, and the failure is a full disk or a closed
+		// pipe on the consumer's side.
+		fmt.Fprintf(stderr, "safe-core: release-review: write JSON: %v — audit-infrastructure breakage, not a release finding\n", err)
+		return 30
 	}
 	return report.Verdict.ExitCode()
 }

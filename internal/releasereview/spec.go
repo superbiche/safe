@@ -13,6 +13,7 @@
 package releasereview
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -121,21 +122,106 @@ type setting struct {
 	Advisory bool
 }
 
-// Decode reads a spec and validates it. Unknown fields anywhere in the
-// document are a refusal: the spec is the one place a consumer and a safe
-// build can disagree about vocabulary, and disagreeing there is cheaper than
-// disagreeing about a report.
+// Decode reads a spec and validates it.
+//
+// Three shapes are refused before the spec is even looked at, because each one
+// means the document does not say one unambiguous thing:
+//
+//   - unknown fields anywhere — the spec is the one place a consumer and a
+//     safe build can disagree about vocabulary, and disagreeing there is
+//     cheaper than disagreeing about a report;
+//   - anything after the first JSON document — a second object appended to a
+//     spec would otherwise be silently ignored;
+//   - a repeated member at any depth — JSON decoders keep the last occurrence,
+//     so a spec saying both spec_version 2 and spec_version 1 would quietly
+//     become whichever the writer put last.
 func Decode(r io.Reader) (Spec, error) {
+	raw, err := io.ReadAll(r)
+	if err != nil {
+		return Spec{}, fmt.Errorf("read spec: %w", err)
+	}
+
 	var spec Spec
-	decoder := json.NewDecoder(r)
+	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&spec); err != nil {
 		return Spec{}, fmt.Errorf("read spec: %w", err)
 	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return Spec{}, fmt.Errorf("read spec: the spec must be exactly one JSON document")
+	}
+	if err := rejectRepeatedMembers(raw); err != nil {
+		return Spec{}, err
+	}
+
 	if err := spec.normalize(); err != nil {
 		return Spec{}, err
 	}
 	return spec, nil
+}
+
+// rejectRepeatedMembers walks the document's tokens and refuses any object
+// that names the same member twice, at any depth.
+func rejectRepeatedMembers(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil {
+		// Unreachable: the strict decode above already accepted these bytes.
+		return nil
+	}
+	return walkForRepeats(decoder, token, "")
+}
+
+func walkForRepeats(decoder *json.Decoder, token json.Token, path string) error {
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+
+	switch delim {
+	case '{':
+		seen := make(map[string]bool)
+		for {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return nil
+			}
+			if end, ok := keyToken.(json.Delim); ok && end == '}' {
+				return nil
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return nil
+			}
+			if seen[key] {
+				return fmt.Errorf("read spec: %q is given more than once", path+key)
+			}
+			seen[key] = true
+
+			valueToken, err := decoder.Token()
+			if err != nil {
+				return nil
+			}
+			if err := walkForRepeats(decoder, valueToken, path+key+"."); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for {
+			elementToken, err := decoder.Token()
+			if err != nil {
+				return nil
+			}
+			if end, ok := elementToken.(json.Delim); ok && end == ']' {
+				return nil
+			}
+			if err := walkForRepeats(decoder, elementToken, path); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // normalize validates the spec and fills the defaults the schema documents.

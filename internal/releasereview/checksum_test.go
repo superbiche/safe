@@ -73,11 +73,54 @@ func TestChecksumEntryFormats(t *testing.T) {
 			checksums := writeFile(t, dir, "checksums.txt", testCase.lines)
 
 			result := checksum(checksumSpec(artifact, "tool.tar.gz", checksums, true))
-			if result.Verdict != GO {
-				t.Fatalf("verdict %s with reasons %v, want GO", result.Verdict, codes(result))
-			}
+			assertVerified(t, result)
 		})
 	}
+}
+
+// assertVerified pins what a matched digest looks like in this build: WARN
+// carrying only checksum_only_verification. No implemented check verifies a
+// checksum, so a verified artifact cannot reach GO.
+func assertVerified(t *testing.T, result CheckResult) {
+	t.Helper()
+	if result.Verdict != WARN {
+		t.Fatalf("verdict %s with reasons %v, want WARN", result.Verdict, codes(result))
+	}
+	got := codes(result)
+	if len(got) != 1 || got[0] != "checksum_only_verification" {
+		t.Fatalf("reasons %v, want [checksum_only_verification]", got)
+	}
+}
+
+// F1: signature metadata is a claim, not a verification. Present or absent, it
+// must not change what the checksum check decides in this build.
+func TestSignatureMetadataDoesNotSuppressTheWarning(t *testing.T) {
+	dir := t.TempDir()
+	artifact := writeFile(t, dir, "tool.tar.gz", "payload")
+	checksums := writeFile(t, dir, "checksums.txt", sha256Of("payload")+"  tool.tar.gz\n")
+
+	signed := checksum(checksumSpec(artifact, "tool.tar.gz", checksums, true))
+	unsigned := checksum(checksumSpec(artifact, "tool.tar.gz", checksums, false))
+
+	assertVerified(t, signed)
+	assertVerified(t, unsigned)
+}
+
+// A signature block naming a bundle that does not exist must not lift the
+// verdict either — nothing in this build ever opens it.
+func TestUnverifiableBundlePathDoesNotLiftTheVerdict(t *testing.T) {
+	dir := t.TempDir()
+	artifact := writeFile(t, dir, "tool.tar.gz", "payload")
+	checksums := writeFile(t, dir, "checksums.txt", sha256Of("payload")+"  tool.tar.gz\n")
+
+	spec := checksumSpec(artifact, "tool.tar.gz", checksums, false)
+	spec.Artifacts[0].Evidence.Signature = &SignatureEvidence{
+		Bundle:     filepath.Join(dir, "definitely-missing.sigstore"),
+		Identity:   "unverified",
+		OIDCIssuer: "https://invalid.example",
+	}
+
+	assertVerified(t, checksum(spec))
 }
 
 func TestChecksumNameMatchingIsCaseSensitive(t *testing.T) {
@@ -101,10 +144,7 @@ func TestChecksumSingleEntryFallback(t *testing.T) {
 		artifact := writeFile(t, dir, "tool.tar.gz", payload)
 		checksums := writeFile(t, dir, "checksums.txt", sha256Of(payload)+"\n")
 
-		result := checksum(checksumSpec(artifact, "tool.tar.gz", checksums, true))
-		if result.Verdict != GO {
-			t.Fatalf("verdict %s reasons %v, want GO", result.Verdict, codes(result))
-		}
+		assertVerified(t, checksum(checksumSpec(artifact, "tool.tar.gz", checksums, true)))
 	})
 
 	t.Run("one entry naming a different asset still answers", func(t *testing.T) {
@@ -112,10 +152,7 @@ func TestChecksumSingleEntryFallback(t *testing.T) {
 		artifact := writeFile(t, dir, "tool.tar.gz", payload)
 		checksums := writeFile(t, dir, "checksums.txt", sha256Of(payload)+"  release.tar.gz\n")
 
-		result := checksum(checksumSpec(artifact, "tool.tar.gz", checksums, true))
-		if result.Verdict != GO {
-			t.Fatalf("verdict %s reasons %v, want GO", result.Verdict, codes(result))
-		}
+		assertVerified(t, checksum(checksumSpec(artifact, "tool.tar.gz", checksums, true)))
 	})
 
 	t.Run("two entries and no name match is no entry, not a mismatch", func(t *testing.T) {
@@ -241,39 +278,70 @@ func TestChecksumNoEvidenceWarns(t *testing.T) {
 	dir := t.TempDir()
 	verified := writeFile(t, dir, "tool.tar.gz", "payload")
 	checksums := writeFile(t, dir, "checksums.txt", sha256Of("payload")+"  tool.tar.gz\n")
+	present := writeFile(t, dir, "extra.tar.gz", "extra payload")
 
 	spec := checksumSpec(verified, "tool.tar.gz", checksums, true)
-	spec.Artifacts = append(spec.Artifacts, Artifact{
-		Path:      filepath.Join(dir, "extra.tar.gz"),
-		AssetName: "extra.tar.gz",
-	})
+	spec.Artifacts = append(spec.Artifacts, Artifact{Path: present, AssetName: "extra.tar.gz"})
 
 	result := checksum(spec)
 	if result.Verdict != WARN {
 		t.Fatalf("verdict %s, want WARN", result.Verdict)
 	}
-	got := codes(result)
-	if len(got) != 1 || got[0] != "no_checksum_evidence" {
-		t.Fatalf("reasons %v, want [no_checksum_evidence]", got)
-	}
-	if result.Reasons[0].Data["artifact"] != "extra.tar.gz" {
-		t.Fatalf("reason data %v", result.Reasons[0].Data)
+	if !hasReason(result, "no_checksum_evidence", "extra.tar.gz") {
+		t.Fatalf("reasons %v, want no_checksum_evidence for extra.tar.gz", codes(result))
 	}
 }
 
-func TestChecksumOnlyVerificationWarnsWhenUnsigned(t *testing.T) {
+// F2: an artifact carrying no checksum evidence is still probed for presence.
+// The old short-circuit reported only the missing evidence and lost the BLOCK.
+func TestChecksumMissingArtifactWithoutEvidenceKeepsBothReasons(t *testing.T) {
 	dir := t.TempDir()
-	artifact := writeFile(t, dir, "tool.tar.gz", "payload")
+	verified := writeFile(t, dir, "tool.tar.gz", "payload")
 	checksums := writeFile(t, dir, "checksums.txt", sha256Of("payload")+"  tool.tar.gz\n")
 
-	result := checksum(checksumSpec(artifact, "tool.tar.gz", checksums, false))
-	if result.Verdict != WARN {
-		t.Fatalf("verdict %s, want WARN", result.Verdict)
+	spec := checksumSpec(verified, "tool.tar.gz", checksums, true)
+	spec.Artifacts = append(spec.Artifacts, Artifact{
+		Path:      filepath.Join(dir, "absent.tar.gz"),
+		AssetName: "absent.tar.gz",
+	})
+
+	result := checksum(spec)
+	if result.Verdict != BLOCK {
+		t.Fatalf("verdict %s with reasons %v, want BLOCK", result.Verdict, codes(result))
 	}
-	got := codes(result)
-	if len(got) != 1 || got[0] != "checksum_only_verification" {
-		t.Fatalf("reasons %v, want [checksum_only_verification]", got)
+	if !hasReason(result, "artifact_missing", "absent.tar.gz") ||
+		!hasReason(result, "no_checksum_evidence", "absent.tar.gz") ||
+		!hasReason(result, "checksum_only_verification", "tool.tar.gz") {
+		t.Fatalf("reasons %v, want all three observations", codes(result))
 	}
+}
+
+// F2: an unreadable artifact and a missing checksum file are independent
+// observations, and BLOCK must win the worst-of over the ERROR.
+func TestChecksumUnreadableArtifactAndMissingChecksumFile(t *testing.T) {
+	dir := t.TempDir()
+	artifactDir := filepath.Join(dir, "tool.tar.gz")
+	if err := os.Mkdir(artifactDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	result := checksum(checksumSpec(artifactDir, "tool.tar.gz", filepath.Join(dir, "absent.txt"), true))
+	if result.Verdict != BLOCK {
+		t.Fatalf("verdict %s with reasons %v, want BLOCK", result.Verdict, codes(result))
+	}
+	if !hasReason(result, "artifact_unreadable", "tool.tar.gz") ||
+		!hasReason(result, "checksum_file_missing", "tool.tar.gz") {
+		t.Fatalf("reasons %v, want both observations", codes(result))
+	}
+}
+
+func hasReason(result CheckResult, code, artifact string) bool {
+	for _, reason := range result.Reasons {
+		if reason.Code == code && reason.Data["artifact"] == artifact {
+			return true
+		}
+	}
+	return false
 }
 
 func TestChecksumMultipleArtifacts(t *testing.T) {
@@ -297,11 +365,8 @@ func TestChecksumMultipleArtifacts(t *testing.T) {
 	if result.Verdict != BLOCK {
 		t.Fatalf("verdict %s, want BLOCK", result.Verdict)
 	}
-	got := codes(result)
-	if len(got) != 1 || got[0] != "digest_mismatch" {
-		t.Fatalf("reasons %v, want [digest_mismatch]", got)
-	}
-	if result.Reasons[0].Data["artifact"] != "bad.tar.gz" {
-		t.Fatalf("reason names %q", result.Reasons[0].Data["artifact"])
+	if !hasReason(result, "digest_mismatch", "bad.tar.gz") ||
+		!hasReason(result, "checksum_only_verification", "good.tar.gz") {
+		t.Fatalf("reasons %v, want each artifact's own observation", codes(result))
 	}
 }

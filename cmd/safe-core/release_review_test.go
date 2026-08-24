@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -58,7 +59,9 @@ func TestReleaseReviewWarnsOnChecksumOnlyVerification(t *testing.T) {
 	}
 }
 
-func TestReleaseReviewCleanGO(t *testing.T) {
+// Signature metadata does not lift a checksum-only review: this build verifies
+// no bundle, so the report is WARN and the envelope is checked there.
+func TestReleaseReviewSignedSpecStillWarns(t *testing.T) {
 	dir := t.TempDir()
 	artifact := writeReviewFile(t, dir, "tool.tar.gz", "payload")
 	checksums := writeReviewFile(t, dir, "checksums.txt", digestOf("payload")+"  tool.tar.gz\n")
@@ -67,8 +70,8 @@ func TestReleaseReviewCleanGO(t *testing.T) {
 	    "signature":{"bundle":"b","identity":"i","oidc_issuer":"https://example.test"}}}]}`, artifact, checksums)
 
 	code, stdout, stderr := runReview(t, spec)
-	if code != 0 {
-		t.Fatalf("run() = %d, want 0 (stderr=%q)", code, stderr)
+	if code != 10 {
+		t.Fatalf("run() = %d, want 10 (stderr=%q)", code, stderr)
 	}
 
 	var report struct {
@@ -90,15 +93,39 @@ func TestReleaseReviewCleanGO(t *testing.T) {
 	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
 		t.Fatalf("report is not JSON: %v (%q)", err, stdout)
 	}
-	if report.SchemaVersion != 1 || report.Verdict != "GO" {
+	if report.SchemaVersion != 1 || report.Verdict != "WARN" {
 		t.Fatalf("unexpected envelope %+v", report)
 	}
 	if report.Subject.Repo != "o/r" || report.Subject.Version != "v1" {
 		t.Fatalf("subject not echoed: %+v", report.Subject)
 	}
 	if len(report.Checks) != 1 || report.Checks[0].ID != "checksum" ||
-		report.Checks[0].Verdict != "GO" || len(report.Checks[0].Reasons) != 0 {
+		report.Checks[0].Verdict != "WARN" || len(report.Checks[0].Reasons) != 1 ||
+		report.Checks[0].Reasons[0].Code != "checksum_only_verification" {
 		t.Fatalf("unexpected checks %+v", report.Checks)
+	}
+}
+
+// failWriter is a stdout that cannot be written to, standing in for a full
+// disk or a consumer that closed the pipe.
+type failWriter struct{}
+
+func (failWriter) Write([]byte) (int, error) { return 0, errors.New("no space left on device") }
+
+// A report that cannot be written is infrastructure breakage (30), not a
+// refused spec (3): the review ran and decided.
+func TestReleaseReviewWriteFailureIsInfrastructure(t *testing.T) {
+	dir := t.TempDir()
+	checksums := writeReviewFile(t, dir, "checksums.txt", digestOf("payload")+"  tool.tar.gz\n")
+	spec := reviewSpec(t, filepath.Join(dir, "absent.tar.gz"), checksums)
+
+	var stderr bytes.Buffer
+	code := run([]string{"release-review", "--spec", "-"}, strings.NewReader(spec), failWriter{}, &stderr)
+	if code != 30 {
+		t.Fatalf("run() = %d, want 30", code)
+	}
+	if !strings.Contains(stderr.String(), "audit-infrastructure breakage") {
+		t.Fatalf("stderr does not classify the failure: %q", stderr.String())
 	}
 }
 
@@ -166,6 +193,16 @@ func TestReleaseReviewUnusableSpec(t *testing.T) {
 		{"unknown field", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"x":1}`, `unknown field "x"`},
 		{"unimplemented check", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true}}}`, "not implemented by this build"},
 		{"no checks enabled", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{}}`, "no checks are enabled"},
+		{
+			name:    "object appended after the spec",
+			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}]}{"unknown":true}`,
+			wantSub: "exactly one JSON document",
+		},
+		{
+			name:    "spec_version given twice",
+			spec:    `{"spec_version":2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],"spec_version":1}`,
+			wantSub: `"spec_version" is given more than once`,
+		},
 	}
 
 	for _, testCase := range cases {

@@ -106,16 +106,18 @@ printf 'not a spec\n' > "$TEST_ROOT/malformed.json"
 
 # --- passthrough ------------------------------------------------------------
 
-case_clean_release_exits_zero() {
+# Signature metadata is a claim this build verifies nothing about, so it must
+# not lift a verified artifact out of checksum-only WARN.
+case_signature_metadata_does_not_lift_to_go() {
   local rc
   rc=$(run_forward --spec "$TEST_ROOT/signed.json")
-  if [[ "$rc" != "0" ]]; then
-    fail "$FUNCNAME (exit $rc, want 0; stderr: $(cat "$TEST_ROOT/stderr"))"
+  if [[ "$rc" != "10" ]]; then
+    fail "$FUNCNAME (exit $rc, want 10; stderr: $(cat "$TEST_ROOT/stderr"))"
     return
   fi
-  if ! jq -e '.schema_version == 1 and .verdict == "GO"
+  if ! jq -e '.schema_version == 1 and .verdict == "WARN"
               and (.checks | length == 1) and .checks[0].id == "checksum"
-              and (.checks[0].reasons | length == 0)' \
+              and (.checks[0].reasons | map(.code)) == ["checksum_only_verification"]' \
       "$TEST_ROOT/stdout" >/dev/null 2>&1; then
     fail "$FUNCNAME (report not forwarded intact: $(cat "$TEST_ROOT/stdout"))"
     return
@@ -180,6 +182,25 @@ case_malformed_spec_is_not_a_verdict() {
   fi
   if [[ -s "$TEST_ROOT/stdout" ]]; then
     fail "$FUNCNAME (a refused spec still produced a report)"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
+# A spec with something appended says two things; exit-code fidelity for that
+# refusal has to survive the forward too.
+case_ambiguous_spec_is_not_a_verdict() {
+  local rc
+  cat "$TEST_ROOT/good.json" > "$TEST_ROOT/ambiguous.json"
+  printf '{"unknown": true}\n' >> "$TEST_ROOT/ambiguous.json"
+
+  rc=$(run_forward --spec "$TEST_ROOT/ambiguous.json")
+  if [[ "$rc" != "3" ]]; then
+    fail "$FUNCNAME (exit $rc, want 3)"
+    return
+  fi
+  if [[ -s "$TEST_ROOT/stdout" ]]; then
+    fail "$FUNCNAME (an ambiguous spec still produced a report)"
     return
   fi
   pass "$FUNCNAME"
@@ -250,21 +271,90 @@ case_missing_engine_refuses_as_infrastructure() {
 }
 
 case_help_advertises_the_composite() {
-  if ! "$SAFE_AUDIT" help 2>&1 | grep -q 'binary-audit release-review --spec PATH'; then
+  # help reaches ensure_dirs, so it runs under the same temp environment as
+  # every other case: no suite case may touch the operator's audit state.
+  if ! HOME="$TEST_ROOT/home" \
+    SAFE_AUDIT_CONFIG_DIR="$TEST_ROOT/config" \
+    SAFE_AUDIT_DATA_DIR="$TEST_ROOT/data" \
+    "$SAFE_AUDIT" help 2>&1 | grep -q 'binary-audit release-review --spec PATH'; then
     fail "$FUNCNAME"
     return
   fi
   pass "$FUNCNAME"
 }
 
-case_clean_release_exits_zero
+# The forward's dependency surface is safe-core's alone. jq is what safe-audit
+# demands globally, so a PATH without it proves the composite is routed before
+# that demand — the reviewer's repro for the init-before-forward defect.
+case_forward_runs_without_jq() {
+  local farm="$TEST_ROOT/nojq-path" rc=0 tool
+  mkdir -p "$farm"
+  for tool in bash cat dirname readlink mktemp rm sed tr uname; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      ln -sf "$(command -v "$tool")" "$farm/$tool"
+    fi
+  done
+  if PATH="$farm" command -v jq >/dev/null 2>&1; then
+    fail "$FUNCNAME (the trimmed PATH still resolves jq)"
+    return
+  fi
+
+  HOME="$TEST_ROOT/home" \
+  PATH="$farm" \
+  SAFE_CORE_BIN="$ENGINE" \
+  SAFE_AUDIT_CONFIG_DIR="$TEST_ROOT/config" \
+  SAFE_AUDIT_DATA_DIR="$TEST_ROOT/data" \
+    "$SAFE_AUDIT" binary-audit release-review --spec "$TEST_ROOT/mismatch.json" \
+    > "$TEST_ROOT/stdout" 2> "$TEST_ROOT/stderr" || rc=$?
+
+  if [[ "$rc" != "20" ]]; then
+    fail "$FUNCNAME (exit $rc, want 20; stderr: $(cat "$TEST_ROOT/stderr"))"
+    return
+  fi
+  if grep -q 'missing dependency' "$TEST_ROOT/stderr"; then
+    fail "$FUNCNAME (a bash-side dependency refused the review: $(cat "$TEST_ROOT/stderr"))"
+    return
+  fi
+  if ! jq -e '.verdict == "BLOCK"' "$TEST_ROOT/stdout" >/dev/null 2>&1; then
+    fail "$FUNCNAME (report: $(cat "$TEST_ROOT/stdout"))"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
+# The composite reads no audit state, so it must not create any either.
+case_forward_does_not_create_audit_state() {
+  local probe="$TEST_ROOT/state-probe" rc=0
+  rm -rf "$probe"
+  HOME="$probe/home" \
+  SAFE_CORE_BIN="$ENGINE" \
+  SAFE_AUDIT_CONFIG_DIR="$probe/config" \
+  SAFE_AUDIT_DATA_DIR="$probe/data" \
+    "$SAFE_AUDIT" binary-audit release-review --spec "$TEST_ROOT/good.json" \
+    > "$TEST_ROOT/stdout" 2> "$TEST_ROOT/stderr" || rc=$?
+
+  if [[ "$rc" != "10" ]]; then
+    fail "$FUNCNAME (exit $rc, want 10; stderr: $(cat "$TEST_ROOT/stderr"))"
+    return
+  fi
+  if [[ -e "$probe" ]]; then
+    fail "$FUNCNAME (the forward created audit state at $probe)"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
+case_signature_metadata_does_not_lift_to_go
 case_verified_release_passes_through
 case_report_reaches_stdout_only
 case_digest_mismatch_blocks
 case_malformed_spec_is_not_a_verdict
+case_ambiguous_spec_is_not_a_verdict
 case_usage_error_passes_through
 case_version_skew_refuses_as_infrastructure
 case_missing_engine_refuses_as_infrastructure
+case_forward_runs_without_jq
+case_forward_does_not_create_audit_state
 case_help_advertises_the_composite
 
 if (( FAIL_COUNT > 0 )); then

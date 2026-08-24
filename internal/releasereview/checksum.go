@@ -24,11 +24,29 @@ var (
 // differs is evidence about the release (BLOCK), while a file that exists and
 // cannot be read is a broken review (ERROR). Collapsing the second into the
 // first would report a permission problem as a tampered artifact.
+//
+// Every independent condition is reported, not just the first one found. The
+// artifact's own readability and its checksum file's readability are separate
+// facts about a release, and a report that stops at whichever failed first
+// hides the other — including when the one it hid was the worse of the two.
 func checksum(spec Spec) CheckResult {
 	result := CheckResult{Reasons: []Reason{}}
 
 	for _, artifact := range spec.Artifacts {
 		name := artifact.AssetName
+
+		actual, hashErr := sha256File(artifact.Path)
+		switch {
+		case hashErr == nil:
+		case errors.Is(hashErr, fs.ErrNotExist):
+			result.add(BLOCK, "artifact_missing",
+				fmt.Sprintf("artifact %s is not at %s", name, artifact.Path),
+				map[string]string{"artifact": name})
+		default:
+			result.add(ERROR, "artifact_unreadable",
+				fmt.Sprintf("could not hash artifact %s", name),
+				map[string]string{"artifact": name, "error": hashErr.Error()})
+		}
 
 		if artifact.Evidence.ChecksumFile == "" {
 			result.add(WARN, "no_checksum_evidence",
@@ -37,35 +55,25 @@ func checksum(spec Spec) CheckResult {
 			continue
 		}
 
-		actual, err := sha256File(artifact.Path)
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				result.add(BLOCK, "artifact_missing",
-					fmt.Sprintf("artifact %s is not at %s", name, artifact.Path),
-					map[string]string{"artifact": name})
-				continue
-			}
-			result.add(ERROR, "artifact_unreadable",
-				fmt.Sprintf("could not hash artifact %s", name),
-				map[string]string{"artifact": name, "error": err.Error()})
-			continue
-		}
-
-		content, err := os.ReadFile(artifact.Evidence.ChecksumFile)
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
+		content, readErr := os.ReadFile(artifact.Evidence.ChecksumFile)
+		if readErr != nil {
+			if errors.Is(readErr, fs.ErrNotExist) {
 				result.add(BLOCK, "checksum_file_missing",
 					fmt.Sprintf("checksum file for %s is not at %s", name, artifact.Evidence.ChecksumFile),
 					map[string]string{"artifact": name, "checksum_file": artifact.Evidence.ChecksumFile})
-				continue
+			} else {
+				result.add(ERROR, "artifact_unreadable",
+					fmt.Sprintf("could not read the checksum file for %s", name),
+					map[string]string{
+						"artifact":      name,
+						"checksum_file": artifact.Evidence.ChecksumFile,
+						"error":         readErr.Error(),
+					})
 			}
-			result.add(ERROR, "artifact_unreadable",
-				fmt.Sprintf("could not read the checksum file for %s", name),
-				map[string]string{
-					"artifact":      name,
-					"checksum_file": artifact.Evidence.ChecksumFile,
-					"error":         err.Error(),
-				})
+			continue
+		}
+		if hashErr != nil {
+			// Both sides are already reported; there is nothing left to compare.
 			continue
 		}
 
@@ -88,11 +96,14 @@ func checksum(spec Spec) CheckResult {
 			continue
 		}
 
-		if artifact.Evidence.Signature == nil {
-			result.add(WARN, "checksum_only_verification",
-				fmt.Sprintf("%s matched its checksum, but nothing signs that checksum", name),
-				map[string]string{"artifact": name})
-		}
+		// Unconditional while no build verifies a signature. Spec-level
+		// signature metadata is a claim nothing here checks — treating its
+		// presence as verification would let an unreadable bundle path lift a
+		// release to GO. The slice that implements the signature check earns
+		// the right to suppress this.
+		result.add(WARN, "checksum_only_verification",
+			fmt.Sprintf("%s matched its checksum, but no implemented check verifies that checksum", name),
+			map[string]string{"artifact": name})
 	}
 
 	return result

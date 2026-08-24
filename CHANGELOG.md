@@ -14,12 +14,19 @@
   (audit-infrastructure breakage, never a release finding) and 3 for a spec
   that cannot be read or validated, which is never a verdict. Advisory checks
   may warn but never decide the run, and their own uncapped verdict still
-  appears in the report. The spec is decoded strictly: unknown fields anywhere
-  are refused, so a stale `safe` fails at the spec rather than halfway through
-  a review. This build implements the `checksum` check only — `signature`,
-  `release`, `vuln`, `tuf`, and `exec` are named in the schema and refused if
-  enabled, and the composite is deliberately not advertised in
-  `safe audit capabilities` until they land. `docs/release-review.md` carries
+  appears in the report. The spec is decoded strictly: unknown fields anywhere,
+  anything appended after the first JSON document, and a member repeated inside
+  one object are all refused, so a stale or ambiguous spec fails immediately
+  rather than halfway through a review — or, worse, silently resolving to
+  whichever of two contradictory values came last. This build implements the
+  `checksum` check only — `signature`, `release`, `vuln`, `tuf`, and `exec` are
+  named in the schema and refused if enabled, and the composite is deliberately
+  not advertised in `safe audit capabilities` until they land. One consequence
+  is deliberate: since nothing here verifies a checksum file, a verified
+  artifact still warns with `checksum_only_verification` and this build cannot
+  return a top-level `GO`. Signature metadata in the spec does not change that
+  — presence of an unverified bundle path is not verification.
+  `docs/release-review.md` carries
   the spec, the report schema, the reason taxonomy, and the one deliberate
   divergence from the bash checksum lane (a single-entry checksum file answers
   for an unnamed asset; a multi-entry one reports "no entry" instead of

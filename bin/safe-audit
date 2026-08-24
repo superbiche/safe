@@ -10210,6 +10210,9 @@ release_review_forward() {
 binary_audit_command() {
   local sub="${1:-}"
   case "$sub" in
+    # main() routes this before global init, so this arm is what a sourced
+    # caller reaches; it keeps the subcommand table complete rather than
+    # dying on a subcommand safe-audit plainly supports.
     release-review) shift; release_review_forward "$@" ;;
     exec) shift; binary_exec_command "$@" ;;
     release)
@@ -11116,6 +11119,17 @@ EOF
 }
 
 main() {
+  # release-review is routed before ensure_dependencies and ensure_dirs
+  # because its entire dependency surface is safe-core's: it needs no jq, no
+  # config/data tree, and no TTY. Routing it with the others would let a
+  # bash-side dependency refuse a review the engine could have run, and would
+  # create audit state the composite never reads.
+  if [[ "${1:-}" == "binary-audit" && "${2:-}" == "release-review" ]]; then
+    shift 2
+    release_review_forward "$@"
+    return
+  fi
+
   ensure_dependencies
   local cmd="${1:-}"
   case "$cmd" in

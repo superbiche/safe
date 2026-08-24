@@ -25,6 +25,12 @@ the remaining checks land in slices 2 and 3, and the capability key is
 advertised in slice 3. Enabling an unimplemented check is refused at validation
 rather than silently skipped.
 
+One consequence is worth stating plainly: **this build cannot return a
+top-level `GO`.** A verified artifact still warns with
+`checksum_only_verification`, because no implemented check verifies the
+checksum file itself. Top-level `GO` becomes reachable when the `signature`
+check lands and can actually verify a bundle.
+
 | Check | Implemented | What it will decide |
 | --- | --- | --- |
 | `checksum` | yes | artifact sha256 against the release's checksum file |
@@ -55,7 +61,7 @@ no spec directory to resolve against.
 | 0 | verdict `GO` |
 | 10 | verdict `WARN` |
 | 20 | verdict `BLOCK` |
-| 30 | verdict `ERROR` — the review broke, this is audit-infrastructure breakage and not a finding about the release |
+| 30 | verdict `ERROR`, or the report could not be written — the review broke, this is audit-infrastructure breakage and not a finding about the release |
 | 2 | usage error |
 | 3 | the spec is unreadable, fails strict decode, or fails validation — never a verdict |
 
@@ -82,7 +88,6 @@ The bash forward adds one more: a missing or version-skewed `safe-core` returns
         "signature": {
           "bundle": "dist/foo.tar.gz.sigstore",
           "identity": "exact-identity",
-          "identity_regexp": "regexp",
           "oidc_issuer": "https://token.actions.githubusercontent.com"
         }
       }
@@ -118,19 +123,32 @@ build implements yet, so a spec written today stays valid when they land.
     may carry no evidence at all; what a check makes of that absence is the
     check's decision, not the schema's.
 - `evidence.signature` — when present, requires `bundle`, `oidc_issuer`, and
-  exactly one of `identity` or `identity_regexp`. The two are mutually
-  exclusive. This is validated now even though no build verifies bundles.
+  exactly one of `identity` (an exact match, as in the example above) or
+  `identity_regexp` (a pattern, for tag-bound workflow identities that change
+  every release). The two are mutually exclusive. This is validated now even
+  though no build verifies bundles.
 - `checks` — optional. Each check block is optional; an omitted block is a
   disabled check. **Omitting `checks` entirely enables `checksum` and nothing
   else** — the one check that needs no network and no external tool.
 
 ### Strict decoding
 
-The spec is decoded with unknown fields rejected, anywhere in the document. A
-typo, a field from a newer schema, a check option a stale build does not know:
-all are refusals at exit 3. The spec is the one place where a consumer and a
-`safe` build can disagree about vocabulary, and disagreeing there is much
-cheaper than disagreeing halfway through a review.
+Three shapes are refused at exit 3 before the spec's contents are looked at,
+because each one means the document does not say one unambiguous thing:
+
+- **Unknown fields, anywhere in the document.** A typo, a field from a newer
+  schema, a check option a stale build does not know. The spec is the one place
+  where a consumer and a `safe` build can disagree about vocabulary, and
+  disagreeing there is much cheaper than disagreeing halfway through a review.
+- **Anything after the first JSON document.** A second object appended to a
+  spec — by a broken generator, or a careless `cat` of two files — would
+  otherwise be read past and ignored.
+- **A member repeated inside one object, at any depth.** JSON decoders keep the
+  last occurrence, so a spec stating both `"spec_version": 2` and
+  `"spec_version": 1` would quietly become whichever the writer put last.
+
+Surrounding whitespace and the trailing newline every spec file ends with are
+not documents, and do not trip the second rule.
 
 ### Refusals
 
@@ -185,8 +203,11 @@ distinct signals with distinct recovery paths: `ERROR` says the review could
 not run and must never read as a finding about the release, and a real malice
 signal must never be downgraded to "our tooling broke".
 
-- A check's verdict is the worst-of its occurrences' classes. A clean verified
-  artifact contributes `GO`.
+- A check's verdict is the worst-of its occurrences' classes; a check that
+  found no occurrence at all contributes `GO`. Every condition a check observes
+  is reported, not only the first or the worst — an artifact that is unreadable
+  *and* whose checksum file is missing carries both reasons, and the worst-of
+  decides the verdict.
 - The top-level verdict is the worst-of the enabled checks' **effective**
   verdicts.
 - An **advisory** check's effective verdict is `min(own verdict, WARN)` — an
@@ -218,8 +239,15 @@ signal must never be downgraded to "our tooling broke".
 | `no_entry_for_artifact` | BLOCK | `artifact`, `checksum_file` | the checksum file is readable but has no usable entry for the asset |
 | `digest_mismatch` | BLOCK | `artifact`, `expected_sha256`, `actual_sha256` | the artifact's sha256 differs from its entry |
 | `no_checksum_evidence` | WARN | `artifact` | the check is enabled but this artifact carries no `checksum_file` |
-| `checksum_only_verification` | WARN | `artifact` | the digest matched, but the spec carries no signature evidence for the artifact, so verification remained checksum-only |
+| `checksum_only_verification` | WARN | `artifact` | the digest matched, but no implemented check verifies the checksum file itself, so verification remained checksum-only |
 | `artifact_unreadable` | ERROR | `artifact`, `error`, and `checksum_file` when the failure was on the checksum file | an I/O failure while reading a file that exists — a broken review, not evidence |
+
+`checksum_only_verification` is unconditional on a matched digest in this
+build. Signature evidence in the spec does **not** suppress it: no check here
+opens a bundle, so a `signature` block naming a file that does not even exist
+would otherwise be enough to lift a release to `GO`. Presence of metadata is
+not verification, and the slice that implements the signature check earns the
+right to suppress this warning.
 
 `artifact_unreadable` covers both the artifact and its checksum file on
 purpose. The distinction that matters is not *which* file failed but *why*: a
@@ -227,6 +255,11 @@ file that is absent or whose digest differs is evidence about the release
 (BLOCK), while a file that exists and cannot be read is a broken review
 (ERROR). Reporting a permission problem as a tampered artifact would be a
 false malice signal.
+
+Reasons accumulate per artifact. An artifact carrying no `checksum_file` is
+still probed for presence, so a missing one reports both `artifact_missing`
+and `no_checksum_evidence`; an unreadable artifact whose checksum file is also
+missing reports both, and BLOCK wins the worst-of over the ERROR.
 
 ### Backstop
 

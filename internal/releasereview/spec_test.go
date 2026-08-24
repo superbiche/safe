@@ -126,6 +126,95 @@ func TestDecodeRejects(t *testing.T) {
 	}
 }
 
+// F3: a decoder that reads one document and stops would accept anything
+// appended to a spec, and would silently keep the last of two contradictory
+// members. Both shapes mean the document does not say one thing.
+func TestDecodeRejectsAmbiguousDocuments(t *testing.T) {
+	const valid = `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},
+	                "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}]}`
+
+	cases := []struct {
+		name    string
+		spec    string
+		wantSub string
+	}{
+		{"trailing object", valid + `{"unknown":true}`, "exactly one JSON document"},
+		{"trailing scalar", valid + ` 7`, "exactly one JSON document"},
+		{"trailing garbage", valid + " not json", "exactly one JSON document"},
+		{"two whole specs", valid + valid, "exactly one JSON document"},
+		{
+			name: "contradictory spec_version",
+			spec: `{"spec_version":2,"subject":{"repo":"o/r","version":"v1"},
+			        "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],"spec_version":1}`,
+			wantSub: `"spec_version" is given more than once`,
+		},
+		{
+			name: "repeated member inside subject",
+			spec: `{"spec_version":1,"subject":{"repo":"o/r","repo":"other/r","version":"v1"},
+			        "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}]}`,
+			wantSub: `"subject.repo" is given more than once`,
+		},
+		{
+			name: "repeated member inside an array element",
+			spec: `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},
+			        "artifacts":[{"path":"a","path":"b","evidence":{"checksum_file":"c"}}]}`,
+			wantSub: `"artifacts.path" is given more than once`,
+		},
+		{
+			name: "repeated member inside a check block",
+			spec: `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},
+			        "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],
+			        "checks":{"checksum":{"enabled":true,"enabled":false}}}`,
+			wantSub: `"checks.checksum.enabled" is given more than once`,
+		},
+		{
+			name: "repeated check block",
+			spec: `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},
+			        "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],
+			        "checks":{"checksum":{"enabled":true},"checksum":{"enabled":false}}}`,
+			wantSub: `"checks.checksum" is given more than once`,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := Decode(strings.NewReader(testCase.spec))
+			if err == nil {
+				t.Fatalf("expected a refusal, got none")
+			}
+			if !strings.Contains(err.Error(), testCase.wantSub) {
+				t.Fatalf("error %q does not contain %q", err.Error(), testCase.wantSub)
+			}
+		})
+	}
+}
+
+// The single-document gate must not trip on the trailing newline every spec
+// file on disk ends with, nor on surrounding whitespace.
+func TestDecodeAcceptsSurroundingWhitespace(t *testing.T) {
+	const valid = `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},
+	                "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}]}`
+
+	for _, spec := range []string{valid + "\n", valid + "\n\n", "\n\t" + valid + "  \n", valid} {
+		if _, err := Decode(strings.NewReader(spec)); err != nil {
+			t.Fatalf("unexpected refusal for %q: %v", spec, err)
+		}
+	}
+}
+
+// Deeply nested but duplicate-free documents pass the walk unharmed.
+func TestDecodeAcceptsNestedDuplicateFreeSpec(t *testing.T) {
+	spec := `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},
+	          "artifacts":[
+	            {"path":"a","asset_name":"a","evidence":{"checksum_file":"c",
+	              "signature":{"bundle":"b","identity":"i","oidc_issuer":"u"}}},
+	            {"path":"b","evidence":{"checksum_file":"c"}}],
+	          "checks":{"checksum":{"enabled":true,"advisory":false}}}`
+	if _, err := Decode(strings.NewReader(spec)); err != nil {
+		t.Fatalf("unexpected refusal: %v", err)
+	}
+}
+
 // The unimplemented-check refusal names the first such check in report order,
 // so the stderr line does not depend on JSON key order.
 func TestUnimplementedRefusalIsDeterministic(t *testing.T) {
