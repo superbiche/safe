@@ -27,6 +27,7 @@ SUITES=(
   tests/audit/lockfile_coverage.sh
   tests/audit/cvss4_known_answers.sh
   tests/audit/scanner_batch.sh
+  tests/audit/release_review_forward.sh
   tests/contract/drift.sh
   tests/contract/report_fp.sh
   tests/run/host_allow_review.sh

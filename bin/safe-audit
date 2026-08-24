@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.1.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.29.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.30.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -10176,12 +10176,44 @@ scanner_batch_command() {
   printf '%s\n' "$advisories"
 }
 
+# release-review: the Go composite that reviews a whole release from one spec.
+#
+# Exec-passthrough by design. Every decision the composite makes — including
+# which checks a build implements and how a spec is refused — belongs to
+# safe-core, so bash carries only the lockstep pin that keeps a stale engine
+# from deciding. Nothing on this path registers a scratch dir, so replacing the
+# shell with exec strands no cleanup.
+release_review_forward() {
+  local safe_core_bin safe_core_reported
+  safe_core_bin="${SAFE_CORE_BIN:-}"
+  if [[ -z "$safe_core_bin" ]]; then
+    safe_core_bin="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/safe-core"
+  fi
+
+  if [[ ! -x "$safe_core_bin" ]]; then
+    printf 'safe audit: verdict engine missing (safe-core is not installed) — audit-infrastructure breakage, not a release finding; rerun install.sh\n' >&2
+    return 30
+  fi
+  safe_core_reported=$("$safe_core_bin" --version 2>/dev/null) || safe_core_reported=""
+  if [[ "$safe_core_reported" != "${SAFE_VERSION}" ]]; then
+    printf 'safe audit: verdict engine version %s does not match safe %s — audit-infrastructure breakage, not a release finding; rerun install.sh\n' \
+      "${safe_core_reported:-unknown}" "${SAFE_VERSION}" >&2
+    return 30
+  fi
+
+  exec "$safe_core_bin" release-review "$@"
+}
+
 # binary-audit: everything that judges a distributed ARTIFACT rather than a
 # dependency graph — release assets, signatures, TUF roots, and executing an
 # unknown binary under observation.
 binary_audit_command() {
   local sub="${1:-}"
   case "$sub" in
+    # main() routes this before global init, so this arm is what a sourced
+    # caller reaches; it keeps the subcommand table complete rather than
+    # dying on a subcommand safe-audit plainly supports.
+    release-review) shift; release_review_forward "$@" ;;
     exec) shift; binary_exec_command "$@" ;;
     release)
       shift
@@ -11057,6 +11089,7 @@ USAGE
   safe audit machine-audit [--verbose] [--deps-only | --full] [--no-cache] [--result-out <file>] [--allow-missing-tools] [--project <path>] [--all | --machine <csv>]
 
   binary-audit — distributed artifacts: assets, signatures, TUF roots, execution
+  safe audit binary-audit release-review --spec PATH   (whole release from one spec; composite, not yet capability-advertised)
   safe audit binary-audit exec PATH [--timeout SECONDS] [--json] -- [ARGS...]
   safe audit binary-audit release github --repo OWNER/REPO --version TAG --asset NAME [--json]
   safe audit binary-audit vuln github-release --repo OWNER/REPO --version TAG [--json]
@@ -11086,6 +11119,17 @@ EOF
 }
 
 main() {
+  # release-review is routed before ensure_dependencies and ensure_dirs
+  # because its entire dependency surface is safe-core's: it needs no jq, no
+  # config/data tree, and no TTY. Routing it with the others would let a
+  # bash-side dependency refuse a review the engine could have run, and would
+  # create audit state the composite never reads.
+  if [[ "${1:-}" == "binary-audit" && "${2:-}" == "release-review" ]]; then
+    shift 2
+    release_review_forward "$@"
+    return
+  fi
+
   ensure_dependencies
   local cmd="${1:-}"
   case "$cmd" in
