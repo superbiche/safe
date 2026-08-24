@@ -626,7 +626,7 @@ own trust cache.
 
 ## GitHub access
 
-`release` and `vuln` read the GitHub REST API over HTTPS. Six endpoints, all
+`release` and `vuln` read the GitHub REST API over HTTPS. Seven endpoints, all
 read-only:
 
 | Endpoint | Read by | For |
@@ -635,6 +635,7 @@ read-only:
 | `/repos/{repo}/releases` | `release` | same-day churn, the previous tag |
 | `/repos/{repo}/compare/{previous}...{version}` | `release` | what changed since the previous release |
 | `/repos/{repo}/git/ref/tags/{version}` | `release` | the commit the tag names |
+| `/repos/{repo}/git/tags/{sha}` | `release` | dereferencing an annotated tag to its commit |
 | `/repos/{repo}/commits/{sha}` | `release` | whether that commit is signed |
 | `/repos/{repo}/security-advisories` | `vuln` | advisories published against the repository |
 

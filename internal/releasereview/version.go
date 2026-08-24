@@ -206,34 +206,30 @@ func filevercmp(a, b string) int {
 	return verrevcmp(a, b)
 }
 
-// filePrefixLen returns the length of s with a trailing file suffix — the
-// regex `(\.[A-Za-z~][A-Za-z0-9~]*)*` — removed. This is what makes
-// `1.2.beta` compare below `1.2.1`: the suffix is cut before the numbers are
-// compared, so the comparison is `1.2` against `1.2.1`.
+// filePrefixLen returns the length of the prefix of s that survives cutting a
+// trailing file suffix — the longest tail matching the regex
+// `(\.[A-Za-z~][A-Za-z0-9~]*)*$`, with gnulib's rule that all of a nonempty s is
+// never taken as the suffix. This is a faithful port of gnulib's file_prefixlen
+// (lib/filevercmp.c): a FORWARD scan, so a trailing `.` that cannot open a valid
+// suffix group (e.g. `1.2.V.`) leaves nothing to cut and the string compares
+// whole, and a string that is entirely a would-be suffix (`.tar`) keeps its full
+// length rather than cutting to empty. Cutting the suffix before the numbers are
+// compared is what makes `1.2.beta` compare below `1.2.1`: the comparison becomes
+// `1.2` against `1.2.1`.
 func filePrefixLen(s string) int {
-	match := -1
-	readAlpha := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case readAlpha:
-			readAlpha = false
-			if !isASCIIAlpha(c) && c != '~' {
-				match = -1
+	n := len(s)
+	prefixLen := 0
+	for i := 0; ; {
+		if i == n {
+			return prefixLen
+		}
+		i++
+		prefixLen = i
+		for i+1 < n && s[i] == '.' && (isASCIIAlpha(s[i+1]) || s[i+1] == '~') {
+			for i += 2; i < n && (isASCIIAlnum(s[i]) || s[i] == '~'); i++ {
 			}
-		case c == '.':
-			readAlpha = true
-			if match < 0 {
-				match = i
-			}
-		case !isASCIIAlnum(c) && c != '~':
-			match = -1
 		}
 	}
-	if match < 0 {
-		return len(s)
-	}
-	return match
 }
 
 // verrevcmp is the Debian-style version comparison at the heart of version

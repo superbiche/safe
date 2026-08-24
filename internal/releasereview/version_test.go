@@ -38,6 +38,17 @@ func TestVersionCmpMatchesTheBashLane(t *testing.T) {
 		{"3.0.0", "3.0.0-1", -1},
 		{"", "1.0.0", -1},
 		{"1.0.0", "", 1},
+		// gnulib file_prefixlen is a forward scan: a trailing `.` that cannot
+		// open a valid suffix group cuts nothing, and an all-suffix string is
+		// never cut to empty. The old backward scan diverged from the bash
+		// oracle on these degenerate-but-parseable shapes (round-1 F1).
+		{"1.2.3", "1.2.V.", -1}, // `1.2.V.` compares whole; not cut to `1.2`
+		{"Xa", "X.V.", -1},
+		{".a+0", ".V* z[-_", 1}, // both keep leading `.`; not cut to empty
+		{".~9 ", ".b++_.Xa-", -1},
+		{"1.2.3", ".a", 1},
+		{"1.2.3", ".tar", 1},
+		{"X.V.", "X", 1},
 	} {
 		if got := versionCmp(testCase.left, testCase.right); got != testCase.want {
 			t.Errorf("versionCmp(%q, %q) = %d, want %d (captured from bash version_cmp)",
@@ -77,6 +88,14 @@ func TestVersionMatchesRangeMatchesTheBashLane(t *testing.T) {
 		{"2.0.0", "<2.0.0", rangeExcludes},
 		{"1.2.3", "<=1.2.3", rangeMatches},
 		{"1.2.3", "> 1.2.3", rangeExcludes},
+		// Round-1 F1: the constraint `1.2.V.` passes the bare-version regex, so
+		// the fixed forward-scan comparison must reach the bash verdict rather
+		// than silently drop the advisory (fail-open). Captured from the oracle.
+		{"1.2.3", "<=1.2.V.", rangeMatches},
+		{"1.2.3", ">=1.2.V.", rangeExcludes},
+		{"1.2.3", "<1.2.V.", rangeMatches},
+		{"1.2.3", ">1.2.V.", rangeExcludes},
+		{"1.2.3", "=1.2.V.", rangeExcludes},
 	} {
 		if got := versionMatchesRange(testCase.version, testCase.versionRange); got != testCase.want {
 			t.Errorf("versionMatchesRange(%q, %q) = %v, want %v (captured from bash version_matches_range)",

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **`release-review`'s version comparison now cuts file suffixes with gnulib's
+  actual forward-scan `file_prefixlen`.** The earlier port used a backward scan
+  that could cut a version string's prefix to empty and cut trailing runs the
+  real `filevercmp` leaves whole, so on degenerate-but-parseable shapes it
+  decided a `vuln` advisory range opposite to the `sort -V` bash oracle — e.g.
+  `1.2.V.` compared as `1.2`, dropping an advisory the oracle matched
+  (fail-open). The comparison of every well-formed version is unchanged; the
+  captured regression pairs in `version_test.go` pin the corrected edge cases to
+  the bash oracle's verdicts.
+
 - **`release-review` is now advertised as `binary-audit.release-review` in
   `safe audit capabilities`.** A capability key is a promise that the surface
   behind it is whole, and with all six checks live it is. The advertisement
