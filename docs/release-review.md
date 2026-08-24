@@ -45,6 +45,30 @@ Two checks read GitHub over HTTPS. Nothing under review is ever downloaded:
 artifact and every piece of evidence a check compares is a file the caller
 already placed on disk. See [GitHub access](#github-access).
 
+**The composite is advertised** as `binary-audit.release-review` in `safe audit
+capabilities` — a capability key is a promise that the surface behind it is
+whole, and with all six checks live it is. The advertisement carries the
+contract as well as the key:
+
+```json
+{
+  "capabilities": {"binary-audit.release-review": true},
+  "versions": {
+    "binary-audit.release-review": {"spec_version": 1, "report_schema_version": 1}
+  },
+  "groups": {"binary-audit": {"release-review": true}}
+}
+```
+
+A consumer preflights both numbers before writing a spec rather than
+discovering them from a refusal. They are what `safe-core release-review
+--versions` prints, and `tests/audit/release_review_forward.sh` fails if the
+two ever disagree.
+
+The six `binary-audit` sub-lanes stay advertised beside the composite. They are
+still callable, and a capability key is withdrawn when its command is deleted,
+not when a successor lands.
+
 ## Invocation
 
 `safe-core release-review --spec PATH`, where `PATH` may be `-` for stdin. No
@@ -717,3 +741,13 @@ behavior deliberately differs from the `binary-audit` sub-lane it replaces.
     entries at all, and it fails closed. The bash lane's own quirks in the
     *range grammar* are ported exactly, including that `||` makes a range
     unreadable and that a range of only separators matches everything.
+13. **The `exec` sandbox runs the binary directly, with no shell.** The bash
+    lane wrapped it in `sh -c 'exec /artifact/<name> "$@"' sh` to forward its
+    arguments, which spliced a spec-supplied file name into shell program text:
+    an artifact named `x|touch PWNED` ran the second half of its own name inside
+    the container. Contained — the injected code ran under the same
+    `--network=none --read-only --cap-drop=ALL` sandbox as the untrusted binary
+    the check executes by design, so no boundary was crossed — but the name
+    becomes attacker-chosen the day a consumer smokes a binary under the name an
+    archive gave it. Go passes argv as argv, so the wrapper bought nothing; it
+    is gone, and the binary is one argv entry followed by its arguments.

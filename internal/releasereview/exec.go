@@ -173,6 +173,13 @@ func effectiveExecTimeout(configured int) int {
 // every capability dropped, no privilege escalation, tmpfs scratch, and HOME
 // and the XDG paths pointed at that scratch so a binary that insists on writing
 // config still runs.
+//
+// The binary is named as its own argv entry, with no shell in between. The bash
+// lane had to wrap it in `sh -c 'exec /artifact/<name> "$@"' sh` to forward its
+// arguments, which spliced a spec-supplied file name into shell program text: an
+// artifact named `x|touch PWNED` executed the second half of that name. Go
+// passes argv as argv, so the wrapper buys nothing and the injection class goes
+// away with it. This is divergence 13 in docs/release-review.md.
 func sandboxArgs(artifact, image string, args []string) []string {
 	command := []string{
 		"run", "--rm",
@@ -189,7 +196,7 @@ func sandboxArgs(artifact, image string, args []string) []string {
 		"--workdir", "/work",
 		"-v", filepath.Dir(artifact) + ":/artifact:ro,z",
 		image,
-		"sh", "-c", `exec /artifact/` + filepath.Base(artifact) + ` "$@"`, "sh",
+		"/artifact/" + filepath.Base(artifact),
 	}
 	return append(command, args...)
 }

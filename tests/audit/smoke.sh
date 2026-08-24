@@ -73,6 +73,7 @@ jq -e --arg version "$audit_version" '
     "package-audit": true,
     "repo-audit": true,
     "machine-audit": true,
+    "binary-audit.release-review": true,
     "binary-audit.exec": true,
     "binary-audit.release.github": true,
     "binary-audit.vuln.github-release": true,
@@ -87,6 +88,12 @@ jq -e --arg version "$audit_version" '
     "diff": true,
     "status": true
   }
+  and .versions == {
+    "binary-audit.release-review": {
+      "spec_version": 1,
+      "report_schema_version": 1
+    }
+  }
   and .groups == {
     "top_level": {
       "package-audit": true,
@@ -96,6 +103,7 @@ jq -e --arg version "$audit_version" '
       "status": true
     },
     "binary-audit": {
+      "release-review": true,
       "exec": true,
       "release.github": true,
       "vuln.github-release": true,

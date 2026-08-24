@@ -271,6 +271,49 @@ case_missing_engine_refuses_as_infrastructure() {
   pass "$FUNCNAME"
 }
 
+# safe audit capabilities advertises the composite's accepted spec_version and
+# emitted report schema_version so a consumer can preflight a spec. Those
+# numbers live in bash, and the engine that has to honor them is safe-core: a
+# schema bump on one side and not the other would leave the capability
+# promising a contract nothing keeps. This is the only place both sides are
+# present at once, so it is where the coupling is guarded.
+case_advertised_versions_match_the_engine() {
+  local advertised engine
+  advertised="$(
+    HOME="$TEST_ROOT/home" \
+    SAFE_AUDIT_CONFIG_DIR="$TEST_ROOT/config" \
+    SAFE_AUDIT_DATA_DIR="$TEST_ROOT/data" \
+      "$SAFE_AUDIT" capabilities --json |
+      jq -c '.versions["binary-audit.release-review"]'
+  )"
+  engine="$("$SAFE_CORE_BIN" release-review --versions | jq -c '{spec_version, report_schema_version}')"
+
+  if [[ "$advertised" != "$engine" ]]; then
+    fail "$FUNCNAME (safe audit advertises $advertised, safe-core speaks $engine)"
+    return
+  fi
+  if [[ "$advertised" == "null" || -z "$advertised" ]]; then
+    fail "$FUNCNAME (the capability advertises no versions at all)"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
+# A capability key is a promise that the surface behind it is whole, so the key
+# and a working composite are asserted together.
+case_capability_key_is_advertised() {
+  if ! HOME="$TEST_ROOT/home" \
+    SAFE_AUDIT_CONFIG_DIR="$TEST_ROOT/config" \
+    SAFE_AUDIT_DATA_DIR="$TEST_ROOT/data" \
+      "$SAFE_AUDIT" capabilities --json |
+      jq -e '.capabilities["binary-audit.release-review"] == true
+             and .groups["binary-audit"]["release-review"] == true' >/dev/null; then
+    fail "$FUNCNAME"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
 case_help_advertises_the_composite() {
   # help reaches ensure_dirs, so it runs under the same temp environment as
   # every other case: no suite case may touch the operator's audit state.
@@ -357,6 +400,8 @@ case_missing_engine_refuses_as_infrastructure
 case_forward_runs_without_jq
 case_forward_does_not_create_audit_state
 case_help_advertises_the_composite
+case_capability_key_is_advertised
+case_advertised_versions_match_the_engine
 
 if (( FAIL_COUNT > 0 )); then
   printf 'release-review forward: %d passed, %d FAILED\n' "$PASS_COUNT" "$FAIL_COUNT" >&2

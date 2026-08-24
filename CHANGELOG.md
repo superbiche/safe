@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+- **`release-review` is now advertised as `binary-audit.release-review` in
+  `safe audit capabilities`.** A capability key is a promise that the surface
+  behind it is whole, and with all six checks live it is. The advertisement
+  carries the contract as well as the key: a new `versions` object states the
+  `spec_version` the composite accepts and the `report_schema_version` it emits,
+  so a consumer preflights both instead of discovering them from a refusal.
+  Those numbers are what `safe-core release-review --versions` prints, and
+  `tests/audit/release_review_forward.sh` fails if the advertisement and the
+  engine ever disagree — a capability promising a schema its engine does not
+  accept would be worse than no capability at all. The capabilities payload
+  gaining a key and an object is a change to that surface, so
+  `SAFE_AUDIT_VERSION` moves to `0.2.0`; it versions the capabilities command
+  and is independent of `SAFE_VERSION`. The six `binary-audit` sub-lanes stay
+  advertised beside the composite: they are still callable, and a key is
+  withdrawn when its command is deleted, not when a successor lands.
+
+- **The `exec` sandbox no longer runs the release binary through a shell.** The
+  bash lane wrapped it in `sh -c 'exec /artifact/<name> "$@"' sh` to forward its
+  arguments, which spliced a spec-supplied file name into shell program text: an
+  artifact named `x|touch PWNED` executed the second half of its own name inside
+  the container. It was contained — the injected code ran under the same
+  `--network=none --read-only --cap-drop=ALL` sandbox as the untrusted binary
+  the check runs by design — but the name becomes attacker-chosen the day a
+  consumer smokes a binary under the name an archive gave it. Go passes argv as
+  argv, so the wrapper bought nothing; podman is now handed the artifact path as
+  one argv entry followed by its arguments.
+
+- **A fixture-parity corpus (`tests/corpus/`) runs the same releases through
+  both the bash sub-lanes and the composite and diffs their verdicts.** The
+  composite is a surface the bash suites cannot exercise through their own CLIs,
+  so this is its parity belt, and it stays until those sub-lanes are deleted.
+  Both lanes are driven over real HTTP from one local fixture server — bash
+  through curl, the composite through `net/http` — because mocking each side
+  separately would compare two different fixtures and call the result parity.
+  Twelve cases assert the lanes agree; eight assert they differ in exactly the
+  way the divergence ledger records, so a ledgered divergence that quietly stops
+  happening fails the suite as loudly as one that appears. That covers every
+  verdict-affecting ledger entry, including the ones inherited from earlier
+  slices — a missing `cosign` or `podman`, and a missing `exec` artifact, were
+  claims about how the composite differs from bash that nothing checked until
+  now.
+
 - **`release-review` implements `release` and `vuln`, completing all six
   checks.** Both are native Go against the GitHub REST API — no `curl`, no `jq`,
   no subprocess. `release` reads the release's channel, its age, whether it

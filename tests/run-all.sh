@@ -28,6 +28,7 @@ SUITES=(
   tests/audit/cvss4_known_answers.sh
   tests/audit/scanner_batch.sh
   tests/audit/release_review_forward.sh
+  tests/corpus/run.sh
   tests/contract/drift.sh
   tests/contract/report_fp.sh
   tests/run/host_allow_review.sh

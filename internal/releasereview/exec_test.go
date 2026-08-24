@@ -66,12 +66,26 @@ func TestExecCleanRunPinsTheSandboxPolicy(t *testing.T) {
 		"--workdir", "/work",
 		filepath.Dir(artifact) + ":/artifact:ro,z",
 		defaultExecImage,
-		`exec /artifact/tool "$@"`,
+		"/artifact/tool",
 		"--version",
 	} {
 		if !contains(args, want) {
 			t.Fatalf("podman was not given %q; got %v", want, args)
 		}
+	}
+	// No shell stands between podman and the binary. Go passes argv as argv,
+	// and a wrapper that exists only to forward arguments is a wrapper a
+	// spec-supplied file name can be spliced into.
+	for _, forbidden := range []string{"sh", "-c"} {
+		if contains(args, forbidden) {
+			t.Fatalf("podman was given %q; the sandbox must run the binary directly: %v", forbidden, args)
+		}
+	}
+	// The binary and its arguments are consecutive entries after the image, so
+	// nothing between them can be reinterpreted.
+	image := indexOf(args, defaultExecImage)
+	if image < 0 || image+2 >= len(args) || args[image+1] != "/artifact/tool" || args[image+2] != "--version" {
+		t.Fatalf("the binary and its argument are not consecutive argv entries after the image: %v", args)
 	}
 	// Only the artifact's own directory is bound, and nothing else is: a
 	// project mount would let the binary read the repository it is being
@@ -294,11 +308,49 @@ func TestExecBoundsFloodedOutput(t *testing.T) {
 	}
 }
 
-func contains(haystack []string, needle string) bool {
-	for _, entry := range haystack {
-		if entry == needle {
-			return true
+// A file name is chosen by whoever produced the release, and one day it will be
+// the name inside an archive rather than one a spec author typed. A name
+// carrying shell metacharacters must therefore be a name, not a program: it
+// reaches podman as one argv entry, and no part of it is separated out.
+func TestExecArtifactNameIsNeverShellProgramText(t *testing.T) {
+	withFakeTools(t, "podman")
+	dir := t.TempDir()
+	const hostile = `x|touch PWNED`
+	artifact := writeFile(t, dir, hostile, "#!/bin/sh\nexit 0\n")
+	argLog := filepath.Join(dir, "podman-args.log")
+	t.Setenv("MOCK_PODMAN_LOG", argLog)
+
+	if result := sandboxExec(execSpec(artifact, nil, 5)); result.Verdict != GO {
+		t.Fatalf("verdict %s with reasons %v, want GO", result.Verdict, codes(result))
+	}
+
+	logged, err := os.ReadFile(argLog)
+	if err != nil {
+		t.Fatalf("read the arg log: %v", err)
+	}
+	args := strings.Split(strings.TrimRight(string(logged), "\n"), "\n")
+	if !contains(args, "/artifact/"+hostile) {
+		t.Fatalf("the name did not reach podman whole: %v", args)
+	}
+	for _, forbidden := range []string{"sh", "-c", "touch"} {
+		if contains(args, forbidden) {
+			t.Fatalf("%q became its own argument: %v", forbidden, args)
 		}
 	}
-	return false
+	if _, err := os.Stat(filepath.Join(dir, "PWNED")); err == nil {
+		t.Fatal("the name executed as a command")
+	}
+}
+
+func contains(haystack []string, needle string) bool {
+	return indexOf(haystack, needle) >= 0
+}
+
+func indexOf(haystack []string, needle string) int {
+	for index, entry := range haystack {
+		if entry == needle {
+			return index
+		}
+	}
+	return -1
 }
