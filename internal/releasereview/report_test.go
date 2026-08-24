@@ -151,16 +151,15 @@ func TestReviewEnvelope(t *testing.T) {
 	want := `{"schema_version":1,"subject":{"repo":"o/r","version":"v9"},"verdict":"WARN",` +
 		`"checks":[{"id":"checksum","advisory":false,"verdict":"WARN","reasons":[` +
 		`{"code":"checksum_only_verification",` +
-		`"message":"tool.tar.gz matched its checksum, but no implemented check verifies that checksum",` +
+		`"message":"tool.tar.gz matched its checksum, but no enabled signature check vouched for it",` +
 		`"data":{"artifact":"tool.tar.gz"}}]}]}`
 	if string(encoded) != want {
 		t.Fatalf("report encoded as\n%s\nwant\n%s", encoded, want)
 	}
 }
 
-// No slice-1 report can carry an empty reasons list, so the encoding of one is
-// pinned directly: a nil slice would serialize as null and change the schema
-// for the first check that can return clean.
+// A clean check carries an empty reasons list, and the encoding of one is
+// pinned directly: a nil slice would serialize as null and change the schema.
 func TestEmptyReasonsEncodeAsArray(t *testing.T) {
 	encoded, err := json.Marshal(CheckResult{ID: CheckChecksum, Reasons: []Reason{}})
 	if err != nil {

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -59,8 +60,8 @@ func TestReleaseReviewWarnsOnChecksumOnlyVerification(t *testing.T) {
 	}
 }
 
-// Signature metadata does not lift a checksum-only review: this build verifies
-// no bundle, so the report is WARN and the envelope is checked there.
+// Signature metadata does not lift a checksum-only review: the spec leaves the
+// signature check off, so no bundle is opened, and the report is WARN.
 func TestReleaseReviewSignedSpecStillWarns(t *testing.T) {
 	dir := t.TempDir()
 	artifact := writeReviewFile(t, dir, "tool.tar.gz", "payload")
@@ -191,7 +192,7 @@ func TestReleaseReviewUnusableSpec(t *testing.T) {
 	}{
 		{"not JSON", `not json`, "read spec"},
 		{"unknown field", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"x":1}`, `unknown field "x"`},
-		{"unimplemented check", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true}}}`, "not implemented by this build"},
+		{"unimplemented check", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"vuln":{"enabled":true}}}`, "not implemented by this build"},
 		{"no checks enabled", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{}}`, "no checks are enabled"},
 		{
 			name:    "object appended after the spec",
@@ -236,6 +237,109 @@ func TestReleaseReviewSpecFromFile(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), `"schema_version":1`) {
 		t.Fatalf("unexpected report %q", stdout.String())
+	}
+}
+
+// fakeCosignOnPath writes a cosign that verifies one fixed signer and
+// materializes a TUF cache from a mirror named by MOCK_COSIGN_BRIDGE_ROOT,
+// then points PATH at it alone. Replacing PATH rather than prepending is what
+// keeps a real cosign on the developer's machine out of these runs.
+func fakeCosignOnPath(t *testing.T) {
+	t.Helper()
+	bin := t.TempDir()
+	for _, helper := range []string{"bash", "cp", "dirname", "jq", "mkdir"} {
+		resolved, err := exec.LookPath(helper)
+		if err != nil {
+			t.Skipf("the fake cosign needs %s on PATH: %v", helper, err)
+		}
+		if err := os.Symlink(resolved, filepath.Join(bin, helper)); err != nil {
+			t.Fatalf("link %s: %v", helper, err)
+		}
+	}
+	script := `#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  verify-blob) printf 'Verified OK\n'; exit 0 ;;
+  initialize)
+    mirror_path="${MOCK_COSIGN_BRIDGE_ROOT:-}"
+    repo_dir="$HOME/.sigstore/root/mock-tuf"
+    mkdir -p "$repo_dir/targets"
+    cp "$mirror_path/targets.json" "$repo_dir/targets.json"
+    while IFS=$'\t' read -r name sha; do
+      [[ -n "$name" && -n "$sha" ]] || continue
+      cp "$mirror_path/targets/$sha.$name" "$repo_dir/targets/$name"
+    done < <(jq -r '.signed.targets | to_entries[] | [.key, .value.hashes.sha256] | @tsv' "$repo_dir/targets.json")
+    printf 'Initialized\n'
+    ;;
+  *) exit 1 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(bin, "cosign"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake cosign: %v", err)
+	}
+	t.Setenv("PATH", bin)
+}
+
+// The first report this CLI can return with exit 0: a digest that matched and a
+// signature that verified leaves nothing to warn about.
+func TestReleaseReviewVerifiedReleaseExitsZero(t *testing.T) {
+	fakeCosignOnPath(t)
+
+	dir := t.TempDir()
+	artifact := writeReviewFile(t, dir, "tool.tar.gz", "payload")
+	checksums := writeReviewFile(t, dir, "checksums.txt", digestOf("payload")+"  tool.tar.gz\n")
+	bundle := writeReviewFile(t, dir, "tool.tar.gz.sigstore", `{"mediaType":"application/vnd.dev.sigstore.bundle+json"}`)
+
+	spec := fmt.Sprintf(`{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},
+	  "artifacts":[{"path":%q,"asset_name":"tool.tar.gz","evidence":{"checksum_file":%q,
+	    "signature":{"bundle":%q,"identity":"https://example.test/workflow",
+	                 "oidc_issuer":"https://token.actions.githubusercontent.com"}}}],
+	  "checks":{"checksum":{"enabled":true},"signature":{"enabled":true}}}`, artifact, checksums, bundle)
+
+	code, stdout, stderr := runReview(t, spec)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0 (stderr=%q, report=%s)", code, stderr, stdout)
+	}
+	if !strings.Contains(stdout, `"verdict":"GO"`) {
+		t.Fatalf("report is not GO: %s", stdout)
+	}
+	if strings.Contains(stdout, "checksum_only_verification") {
+		t.Fatalf("a verified signature did not retire the checksum warning: %s", stdout)
+	}
+}
+
+// A TUF-enabled spec travels the CLI intact, including the two fields
+// validation rewrites on the way in (a file:// mirror and a prefixed checksum).
+func TestReleaseReviewTUFSpecThroughTheCLI(t *testing.T) {
+	fakeCosignOnPath(t)
+
+	mirror := t.TempDir()
+	if err := os.Mkdir(filepath.Join(mirror, "targets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const target = "trusted material"
+	digest := digestOf(target)
+	writeReviewFile(t, filepath.Join(mirror, "targets"), digest+".trusted_root.json", target)
+	writeReviewFile(t, mirror, "targets.json",
+		fmt.Sprintf(`{"signed":{"targets":{"trusted_root.json":{"hashes":{"sha256":%q},"length":%d}}}}`, digest, len(target)))
+
+	const rootContent = `{"signed":{"_type":"root"}}`
+	root := writeReviewFile(t, mirror, "root.json", rootContent)
+	local := writeReviewFile(t, t.TempDir(), "trusted_root.json", target)
+	t.Setenv("MOCK_COSIGN_BRIDGE_ROOT", mirror)
+
+	spec := fmt.Sprintf(`{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},
+	  "artifacts":[{"path":%q,"asset_name":"root.json"}],
+	  "checks":{"tuf":{"enabled":true,"mirror":%q,"root":%q,"root_checksum":%q,
+	                   "targets":{"trusted_root.json":%q}}}}`,
+		root, "file://"+mirror, root, "sha256:"+strings.ToUpper(digestOf(rootContent)), local)
+
+	code, stdout, stderr := runReview(t, spec)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0 (stderr=%q, report=%s)", code, stderr, stdout)
+	}
+	if !strings.Contains(stdout, `"id":"tuf"`) || !strings.Contains(stdout, `"verdict":"GO"`) {
+		t.Fatalf("unexpected report: %s", stdout)
 	}
 }
 

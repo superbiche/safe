@@ -114,6 +114,12 @@ func (r *CheckResult) add(severity Severity, code, message string, data map[stri
 // below total: an enabled check with no arm cannot occur unless validation and
 // the check registry disagree, and that disagreement is reported as ERROR
 // rather than passing as a check that found nothing.
+//
+// One computation is hoisted out of the loop: whether cosign vouched for an
+// artifact is what tells the checksum check apart a digest that was verified
+// from a digest that was merely matched, so the signature check runs before the
+// report is assembled. Assembly itself stays strictly in checkOrder — only the
+// order in which results are computed moves.
 func Review(spec Spec) Report {
 	report := Report{
 		SchemaVersion: 1,
@@ -121,12 +127,28 @@ func Review(spec Spec) Report {
 		Checks:        []CheckResult{},
 	}
 
+	enabled := spec.enabledChecks()
+
+	var signatureResult CheckResult
+	var verified map[int]bool
+	for _, check := range enabled {
+		if check.ID == CheckSignature {
+			signatureResult, verified = signature(spec)
+		}
+	}
+
 	verdict := GO
-	for _, check := range spec.enabledChecks() {
+	for _, check := range enabled {
 		var result CheckResult
 		switch check.ID {
 		case CheckChecksum:
-			result = checksum(spec)
+			result = checksum(spec, verified)
+		case CheckSignature:
+			result = signatureResult
+		case CheckTUF:
+			result = tuf(spec)
+		case CheckExec:
+			result = sandboxExec(spec)
 		default:
 			result = CheckResult{Reasons: []Reason{}}
 			result.add(ERROR, "check_not_implemented",
