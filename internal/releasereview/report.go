@@ -122,7 +122,7 @@ func (r *CheckResult) add(severity Severity, code, message string, data map[stri
 // order in which results are computed moves.
 func Review(spec Spec) Report {
 	report := Report{
-		SchemaVersion: 1,
+		SchemaVersion: ReportSchemaVersion,
 		Subject:       spec.Subject,
 		Checks:        []CheckResult{},
 	}
@@ -139,21 +139,7 @@ func Review(spec Spec) Report {
 
 	verdict := GO
 	for _, check := range enabled {
-		var result CheckResult
-		switch check.ID {
-		case CheckChecksum:
-			result = checksum(spec, verified)
-		case CheckSignature:
-			result = signatureResult
-		case CheckTUF:
-			result = tuf(spec)
-		case CheckExec:
-			result = sandboxExec(spec)
-		default:
-			result = CheckResult{Reasons: []Reason{}}
-			result.add(ERROR, "check_not_implemented",
-				fmt.Sprintf("check %q is enabled but this build has no implementation for it", check.ID), nil)
-		}
+		result := runCheck(check.ID, spec, verified, signatureResult)
 		result.ID = check.ID
 		result.Advisory = check.Advisory
 
@@ -166,4 +152,32 @@ func Review(spec Spec) Report {
 	}
 	report.Verdict = verdict
 	return report
+}
+
+// runCheck dispatches one enabled check.
+//
+// The default arm is the backstop the doc comment above describes: an id with
+// no implementation is reported as a broken review rather than as a check that
+// found nothing. Validation makes it unreachable through a spec — every check
+// the schema names has an arm here — so it is exercised directly by its test.
+func runCheck(id string, spec Spec, verified map[int]bool, signatureResult CheckResult) CheckResult {
+	switch id {
+	case CheckChecksum:
+		return checksum(spec, verified)
+	case CheckSignature:
+		return signatureResult
+	case CheckRelease:
+		return release(spec)
+	case CheckVuln:
+		return vuln(spec)
+	case CheckTUF:
+		return tuf(spec)
+	case CheckExec:
+		return sandboxExec(spec)
+	}
+
+	result := CheckResult{Reasons: []Reason{}}
+	result.add(ERROR, "check_not_implemented",
+		fmt.Sprintf("check %q is enabled but this build has no implementation for it", id), nil)
+	return result
 }

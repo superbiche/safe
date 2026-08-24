@@ -20,10 +20,10 @@ and both read the report.
 
 ## Status
 
-**Slice 2 of 3: `checksum`, `signature`, `tuf`, `exec`.** This build implements
-four of the six checks; `release` and `vuln` land in slice 3, which also
-advertises the capability key. Enabling an unimplemented check is refused at
-validation rather than silently skipped.
+**All six checks are implemented.** Enabling a check a build does not implement
+is still refused at validation rather than silently skipped — that refusal is
+what protects a consumer running an older `safe` against a spec written for a
+newer one.
 
 **Top-level `GO` is now reachable.** A digest that matched and a signature that
 verified leaves nothing to warn about. A checksum-only spec still warns:
@@ -31,17 +31,19 @@ verified leaves nothing to warn about. A checksum-only spec still warns:
 check that actually verified *that* artifact — advisory or not, since advisory
 caps what a check contributes to the top-level verdict, not what it observed.
 
-| Check | Implemented | What it decides |
+| Check | What it decides | Reaches the network |
 | --- | --- | --- |
-| `checksum` | yes | artifact sha256 against the release's checksum file |
-| `signature` | yes | Sigstore bundle against an identity policy, via cosign |
-| `release` | no | GitHub release metadata and age |
-| `vuln` | no | advisories affecting the release |
-| `tuf` | yes | TUF bootstrap material against a pinned root, via cosign |
-| `exec` | yes | networkless execution under observation, via podman |
+| `checksum` | artifact sha256 against the release's checksum file | no |
+| `signature` | Sigstore bundle against an identity policy, via cosign | no |
+| `release` | GitHub release metadata, age, history and tag signature | yes |
+| `vuln` | advisories published against the repository | yes |
+| `tuf` | TUF bootstrap material against a pinned root, via cosign | no |
+| `exec` | networkless execution under observation, via podman | no |
 
-The composite is not advertised in `safe audit capabilities` while checks are
-missing: a capability key is a promise that the surface behind it is whole.
+Two checks read GitHub over HTTPS. Nothing under review is ever downloaded:
+`release` and `vuln` read GitHub's own record *about* the release, while every
+artifact and every piece of evidence a check compares is a file the caller
+already placed on disk. See [GitHub access](#github-access).
 
 ## Invocation
 
@@ -96,7 +98,7 @@ The bash forward adds one more: a missing or version-skewed `safe-core` returns
   "checks": {
     "checksum":  {"enabled": true,  "advisory": false},
     "signature": {"enabled": false, "advisory": false},
-    "release":   {"enabled": false, "advisory": false},
+    "release":   {"enabled": false, "advisory": false, "asset": "foo.tar.gz"},
     "vuln":      {"enabled": false, "advisory": false},
     "tuf":       {"enabled": false, "advisory": false,
                   "mirror": "PATH-or-URL", "root": "PATH", "root_checksum": "SHA256",
@@ -107,8 +109,9 @@ The bash forward adds one more: a missing or version-skewed `safe-core` returns
 }
 ```
 
-All six checks are named in the schema from day one, including the ones no
-build implements yet, so a spec written today stays valid when they land.
+All six checks were named in the schema from day one, including the ones no
+build implemented yet, so specs written against the first release stayed valid
+as the checks landed.
 
 Turning `signature` on is what makes a clean `GO` reachable — the evidence in
 the example above already supports it:
@@ -133,6 +136,22 @@ the example above already supports it:
   "checks": {
     "checksum":  {"enabled": true},
     "signature": {"enabled": true}
+  }
+}
+```
+
+The two GitHub checks need no local evidence at all — they are answered from
+`subject` — except that `release` must be told which asset the release has to
+carry:
+
+```json
+{
+  "spec_version": 1,
+  "subject": {"repo": "OWNER/REPO", "version": "v1.2.3"},
+  "artifacts": [{"path": "dist/foo.tar.gz"}],
+  "checks": {
+    "release": {"enabled": true, "asset": "foo.tar.gz"},
+    "vuln":    {"enabled": true}
   }
 }
 ```
@@ -195,6 +214,11 @@ A check block's own configuration is validated **only when that check is
 enabled**. A disabled block may carry whatever placeholder a generator left in
 it, which is what keeps the schema example above valid.
 
+- `checks.release` — when enabled:
+  - `asset` — required. The name the GitHub release must carry. It has no
+    default: falling back to the first artifact's name would let a spec that
+    names the wrong file pass as if it had named the right one.
+- `checks.vuln` — when enabled, needs nothing beyond `subject`.
 - `checks.tuf` — when enabled:
   - `mirror` — required. A local directory path, or a `file://` URL, whose
     prefix is stripped. Any other `://` scheme is refused: the check serves the
@@ -237,12 +261,13 @@ not documents, and do not trip the second rule.
 
 Beyond decode and field validation, these spec conditions are refused:
 
-- **An enabled check this build does not implement.** The refusal names the
-  check and what the build does implement:
-  `check "release" is not implemented by this build (implements: checksum, signature, tuf, exec) — upgrade safe or disable the check`.
-  When several unimplemented checks are enabled, the refusal names the first in
-  report order, so the line does not depend on JSON key order. A report whose
-  checks were silently skipped would be worse than no report.
+- **An enabled check this build does not implement.** This build implements all
+  six, so only an older `safe` reading a spec written for a newer schema can
+  reach it. The refusal names the check and what the build does implement —
+  `check "…" is not implemented by this build (implements: …) — upgrade safe or
+  disable the check` — and when several are enabled it names the first in report
+  order, so the line does not depend on JSON key order. A report whose checks
+  were silently skipped would be worse than no report.
 - **No enabled checks at all** (`"checks": {}`, or every block disabled). A
   review that runs no check decides nothing, and a `GO` carrying no evidence is
   exactly the silent pass this gate exists to prevent.
@@ -255,6 +280,7 @@ Beyond decode and field validation, these spec conditions are refused:
   an absent `root`, or a `targets` map that is empty or holds an empty name or
   path. A multi-target spec's refusal names targets in sorted order, so the line
   does not depend on JSON key order either.
+- **A `release` block naming no `asset`.**
 - **An `exec` block naming no `artifact`, or a negative `timeout_seconds`.**
 
 ## Report schema (`schema_version` 1)
@@ -375,6 +401,76 @@ things happened: the bundle does not verify at all (`signature_failure`), or it
 verifies under a signer the policy does not allow. When both halves of the
 policy are wrong, **both** `identity_mismatch` and `issuer_mismatch` are
 emitted — a consumer who fixed only one would still be refused.
+
+### `release`
+
+Everything this check observes is a fact about the release, so every adverse
+answer is `BLOCK`. The only thing it can report that is *not* about the release
+is a GitHub it could not read, which is `ERROR` — see
+[the 404 split](#github-access).
+
+| Code | Class | Data | Meaning |
+| --- | --- | --- | --- |
+| `release_missing` | BLOCK | `repo`, `version` | GitHub has no such release; the message names the private-repository case |
+| `release_channel` | BLOCK | `draft`, `prerelease` | the release is a draft or a prerelease |
+| `release_age_unknown` | BLOCK | — | GitHub's metadata carries no publication timestamp this check can read |
+| `release_too_new` | BLOCK | `age_days`, `minimum_days`, `published_at` | the release is younger than the minimum age |
+| `asset_missing` | BLOCK | `asset` | the release does not carry the asset `checks.release.asset` names |
+| `release_history_missing` | BLOCK | `repo` | GitHub publishes no release listing for the repository |
+| `same_day_churn` | BLOCK | `count`, `published_day` | more than one non-draft release was published that day |
+| `previous_release_unresolved` | BLOCK | `version` | no earlier release could be resolved, so there is nothing to compare against |
+| `comparison_missing` | BLOCK | `previous_tag`, `version` | GitHub cannot compare the two tags |
+| `high_risk_paths` | BLOCK | `previous_tag`, `paths`, `changed_files` | release machinery changed since the previous release |
+| `tag_unresolved` | BLOCK | `version` | the git tag is absent, or does not resolve to one commit |
+| `commit_missing` | BLOCK | `commit` | a tag names a commit GitHub does not serve |
+| `commit_unverified` | BLOCK | `commit`, `reason` | GitHub does not report the tagged commit as signed |
+| `release_history_capped` | GO | `pages`, `releases_read` | the listing was longer than the page cap, but the predecessor was resolved before it — recorded so a capped walk is never silent |
+| `release_history_truncated` | ERROR | `pages`, `releases_read` | the page cap was reached before the release was found, so its predecessor could not be resolved |
+| `high_risk_pattern_invalid` | ERROR | `error` | `SAFE_AUDIT_GITHUB_HIGH_RISK_PATH_REGEX` does not compile, so no path was classified |
+| `metadata_unavailable` | ERROR | `endpoint` | GitHub could not be read — a transport failure, a timeout, a 5xx, a rate limit, or a body that is not the JSON this check expects |
+
+The five endpoints are consulted independently and every answer is reported: a
+release whose asset is missing *and* whose commit is unsigned says both, because
+a consumer who fixed only the first one reported would still be refused. Two
+lookups are conditional, because they have no question to ask otherwise: nothing
+is compared when no predecessor was resolved, and no commit is asked about when
+the tag resolved to none.
+
+`release_history_capped` and `release_history_truncated` are the same event told
+apart by whether it mattered. A cap that stopped a walk after everything needed
+was already resolved changed no verdict and says so at `GO`; a cap that stopped
+it first is this review failing to run, and reporting *that* as
+`previous_release_unresolved` would blame the repository for the reviewer's own
+bound — so the BLOCK is suppressed when the ERROR fires.
+
+### `vuln`
+
+| Code | Class | Data | Meaning |
+| --- | --- | --- | --- |
+| `known_advisory_high_severity` | BLOCK | `advisory`, `severity`, `cve` | a high or critical advisory affects this version |
+| `version_mapping_ambiguous` | BLOCK | `advisory`, `version` | an advisory names no affected range this check can read, so whether it covers the version is unknown |
+| `advisory_feed_missing` | BLOCK | `repo` | GitHub publishes no advisory feed for the repository; the message names the private-repository case |
+| `known_advisory` | WARN | `advisory`, `severity`, `cve` | an advisory below high severity affects this version |
+| `advisory_feed_unavailable` | ERROR | `repo` | the feed could not be read, so no advisory was checked |
+| `advisory_feed_truncated` | ERROR | `repo`, `pages`, `advisories_read` | the feed was longer than the page cap, so an advisory affecting this version may not have been seen |
+
+This is the one check with a genuine `WARN` tier. A low or moderate advisory
+affecting the version is a real observation a consumer should see, but it does
+not by itself refuse a release; a high or critical one does.
+
+A repository that has published no advisories answers `200` with an empty array,
+which is a clean `GO`. That is what makes `404` mean something else here — the
+repository itself is not visible — and why it is `BLOCK` rather than `ERROR`,
+the same reading `release` gives a 404.
+
+An advisory whose ranges are read in order stops at the first match, so an
+unreadable range listed *after* a matching one does not turn a decided advisory
+into an undecided one. One listed before it is reported as well: it was read, it
+decided nothing, and both facts are true.
+
+Unlike the release history, a capped advisory walk has no early answer. An
+advisory this check never read is an advisory it cannot rule out, so the cap is
+always `ERROR` here.
 
 ### `tuf`
 
@@ -504,6 +600,63 @@ directory for the few seconds `cosign initialize` runs. cosign is given a fresh
 scratch `HOME` so the review never reads — or overwrites — the invoking user's
 own trust cache.
 
+## GitHub access
+
+`release` and `vuln` read the GitHub REST API over HTTPS. Six endpoints, all
+read-only:
+
+| Endpoint | Read by | For |
+| --- | --- | --- |
+| `/repos/{repo}/releases/tags/{version}` | `release` | channel, age, assets |
+| `/repos/{repo}/releases` | `release` | same-day churn, the previous tag |
+| `/repos/{repo}/compare/{previous}...{version}` | `release` | what changed since the previous release |
+| `/repos/{repo}/git/ref/tags/{version}` | `release` | the commit the tag names |
+| `/repos/{repo}/commits/{sha}` | `release` | whether that commit is signed |
+| `/repos/{repo}/security-advisories` | `vuln` | advisories published against the repository |
+
+Every request carries `Accept: application/vnd.github+json`,
+`X-GitHub-Api-Version: 2022-11-28` and `User-Agent: safe-audit`, and nothing
+else — except that when `GITHUB_TOKEN` is set it is sent as
+`Authorization: Bearer …`. **That header is the token's only destination.** It
+never enters a URL, a query string, a report, a reason's data, or an error
+message, and the reason a failure names is built from the request URL alone.
+A token is not required; it is what makes a private repository readable, and
+what raises the rate limit.
+
+Three environment variables tune this:
+
+- `SAFE_AUDIT_GITHUB_API_BASE_URL` — the API root, default
+  `https://api.github.com`. This is what points the checks at a proxy or, in the
+  suites, at a local server.
+- `SAFE_AUDIT_GITHUB_RELEASE_MIN_AGE_DAYS` — the minimum age a release must
+  have, default `3`. An override that is not a number is ignored: the knob tunes
+  a threshold, and a typo in it must not decide a release.
+- `SAFE_AUDIT_GITHUB_HIGH_RISK_PATH_REGEX` — which changed paths count as
+  release machinery. An override that does not compile is `ERROR`, not an empty
+  match: a pattern that classified nothing would read as a release that changed
+  nothing risky.
+
+Every request carries a 30-second deadline, every response body is bounded at
+8 MiB, and a paginated listing follows at most 10 `Link: rel="next"` hops. A
+review must not be held open, grown, or walked forever by an endpoint it does
+not control.
+
+### The 404 split
+
+A `404` is GitHub *answering*: it looked, and what the spec named is not there.
+That is evidence about the release, and it is `BLOCK` — under a code naming
+what was absent, and with a message that names the other thing a 404 can mean,
+because **GitHub answers 404 rather than 403 for a read it will not
+authorize**. Without that sentence, a consumer with no token would read "this
+release does not exist" about a private repository and believe it.
+
+Every other failure — no route to the host, a timeout, a `5xx`, a `403` rate
+limit, a `429`, a body that is not the JSON the check expects, a response past
+the size bound — means the review could not run. Those are `ERROR` (exit 30),
+never `BLOCK`. This is the composite's standing severity law, the same one that
+makes a missing `cosign` an `ERROR`: "we could not check" must never land in the
+same bucket as "we checked, and it failed".
+
 ## Divergences from the bash sub-lanes
 
 The composite is a redesign, not a transcription. These are every place its
@@ -542,3 +695,25 @@ behavior deliberately differs from the `binary-audit` sub-lane it replaces.
    arrives. Both bound the same report to the same 40-line / 4000-char summary;
    the divergence is only in what the flood costs while it happens — bounded
    disk there, bounded memory here.
+10. **A GitHub that cannot be read is `ERROR`, not `BLOCK`** (`release` and
+    `vuln`). The bash lanes collapsed every failed request into `BLOCK`
+    (`metadata_unavailable`, `feed_unavailable`), so a rate limit, an expired
+    token or a GitHub outage read as a finding about the release. Here only a
+    `404` is evidence; everything else is the review failing to run. See
+    [the 404 split](#the-404-split).
+11. **Paginated listings are followed, and the cap is reported.** The bash lanes
+    read only the first page of `per_page=100`, so on a repository with a long
+    history the previous tag and the same-day count were computed from a
+    truncated view — silently. Here the `Link: rel="next"` chain is followed up
+    to 10 pages, and hitting that bound is always reported: at `GO` for a
+    release history whose answer was already resolved, at `ERROR` when it was
+    not, and at `ERROR` for an advisory feed, which has no early answer.
+12. **An advisory naming no readable version range is ambiguous, not absent**
+    (`vuln`). The bash lane dropped null and empty `vulnerable_version_range`
+    entries before matching, so an advisory whose every entry carried one
+    contributed nothing at all — it read as "does not affect this version",
+    which is a fail-open in a check whose whole job is not to miss one. Here it
+    is `version_mapping_ambiguous`, the same class as an advisory with no
+    entries at all, and it fails closed. The bash lane's own quirks in the
+    *range grammar* are ported exactly, including that `||` makes a range
+    unreadable and that a range of only separators matches everything.

@@ -192,7 +192,7 @@ func TestReleaseReviewUnusableSpec(t *testing.T) {
 	}{
 		{"not JSON", `not json`, "read spec"},
 		{"unknown field", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"x":1}`, `unknown field "x"`},
-		{"unimplemented check", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"vuln":{"enabled":true}}}`, "not implemented by this build"},
+		{"release enabled without an asset", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"release":{"enabled":true}}}`, "checks.release.asset is required"},
 		{"no checks enabled", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{}}`, "no checks are enabled"},
 		{
 			name:    "object appended after the spec",

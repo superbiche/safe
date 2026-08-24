@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- **`release-review` implements `release` and `vuln`, completing all six
+  checks.** Both are native Go against the GitHub REST API — no `curl`, no `jq`,
+  no subprocess. `release` reads the release's channel, its age, whether it
+  carries the asset the spec names, whether other releases were published the
+  same day, what changed against its predecessor, and whether GitHub reports the
+  tagged commit as signed; every adverse answer is `BLOCK`, because every one of
+  them is a fact about the release. `vuln` matches the version against the
+  repository's published advisories: high or critical is `BLOCK`, lower is
+  `WARN`, and an advisory whose affected range cannot be read is `BLOCK` — a
+  mapping that might cover the version fails closed. Version comparison is a
+  port of GNU version sort, the semantics `sort -V` gave the bash lanes, so a
+  release candidate still sorts above its release exactly as it did there; the
+  port's tables were captured by running the bash functions rather than written
+  from memory. `checks.release.asset` is required when the check is enabled.
+  **Three deliberate divergences from the bash sub-lanes, all ledgered in
+  `docs/release-review.md`:** a GitHub that cannot be read is now `ERROR` (exit
+  30) rather than `BLOCK` — only a `404` is evidence about the release, and its
+  message names the private-repository-without-`GITHUB_TOKEN` case, because
+  GitHub answers 404 rather than 403 for a read it will not authorize; paginated
+  listings follow the `Link` header instead of silently deciding on the first
+  page of 100, with a 10-page bound that is always reported; and an advisory
+  naming no readable version range is ambiguous rather than absent, closing a
+  fail-open where the bash lane read it as "does not affect this version".
+  `GITHUB_TOKEN`, when set, is sent as an `Authorization` header and reaches
+  nothing else — no URL, no report, no reason, no error message.
+
 - **`release-review` implements `signature`, `tuf` and `exec`, and can now
   return a top-level `GO`.** Four of the six checks are live; `release` and
   `vuln` remain schema-only and refused if enabled, and the composite stays
