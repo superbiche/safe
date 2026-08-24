@@ -12,6 +12,7 @@ nav:
   - External Dependencies: dependencies.md
   - safe-run: safe-run.md
   - safe-audit: safe-audit.md
+  - Release Review: release-review.md
   - Install Wrappers: install-wrappers.md
   - Vendor Updates: vendor.md
   - Agent Contract: agents.md

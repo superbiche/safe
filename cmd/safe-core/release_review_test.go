@@ -1,0 +1,215 @@
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func writeReviewFile(t *testing.T, dir, name, content string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func digestOf(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
+
+// reviewSpec builds a one-artifact checksum spec around real files on disk.
+func reviewSpec(t *testing.T, artifact, checksums string) string {
+	t.Helper()
+	spec := fmt.Sprintf(`{"spec_version":1,"subject":{"repo":"o/r","version":"v1.2.3"},
+	  "artifacts":[{"path":%q,"asset_name":"tool.tar.gz","evidence":{"checksum_file":%q}}],
+	  "checks":{"checksum":{"enabled":true}}}`, artifact, checksums)
+	return spec
+}
+
+func runReview(t *testing.T, spec string) (int, string, string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"release-review", "--spec", "-"}, strings.NewReader(spec), &stdout, &stderr)
+	return code, stdout.String(), stderr.String()
+}
+
+// An unsigned artifact whose digest matches still warns: checksum-only
+// verification is weaker than the spec's own vocabulary can express as GO.
+func TestReleaseReviewWarnsOnChecksumOnlyVerification(t *testing.T) {
+	dir := t.TempDir()
+	artifact := writeReviewFile(t, dir, "tool.tar.gz", "payload")
+	checksums := writeReviewFile(t, dir, "checksums.txt", digestOf("payload")+"  tool.tar.gz\n")
+
+	code, stdout, _ := runReview(t, reviewSpec(t, artifact, checksums))
+	if code != 10 {
+		t.Fatalf("run() = %d, want 10", code)
+	}
+	if !strings.Contains(stdout, "checksum_only_verification") {
+		t.Fatalf("report does not carry the reason: %s", stdout)
+	}
+}
+
+func TestReleaseReviewCleanGO(t *testing.T) {
+	dir := t.TempDir()
+	artifact := writeReviewFile(t, dir, "tool.tar.gz", "payload")
+	checksums := writeReviewFile(t, dir, "checksums.txt", digestOf("payload")+"  tool.tar.gz\n")
+	spec := fmt.Sprintf(`{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},
+	  "artifacts":[{"path":%q,"asset_name":"tool.tar.gz","evidence":{"checksum_file":%q,
+	    "signature":{"bundle":"b","identity":"i","oidc_issuer":"https://example.test"}}}]}`, artifact, checksums)
+
+	code, stdout, stderr := runReview(t, spec)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0 (stderr=%q)", code, stderr)
+	}
+
+	var report struct {
+		SchemaVersion int    `json:"schema_version"`
+		Verdict       string `json:"verdict"`
+		Subject       struct {
+			Repo    string `json:"repo"`
+			Version string `json:"version"`
+		} `json:"subject"`
+		Checks []struct {
+			ID       string `json:"id"`
+			Advisory bool   `json:"advisory"`
+			Verdict  string `json:"verdict"`
+			Reasons  []struct {
+				Code string `json:"code"`
+			} `json:"reasons"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("report is not JSON: %v (%q)", err, stdout)
+	}
+	if report.SchemaVersion != 1 || report.Verdict != "GO" {
+		t.Fatalf("unexpected envelope %+v", report)
+	}
+	if report.Subject.Repo != "o/r" || report.Subject.Version != "v1" {
+		t.Fatalf("subject not echoed: %+v", report.Subject)
+	}
+	if len(report.Checks) != 1 || report.Checks[0].ID != "checksum" ||
+		report.Checks[0].Verdict != "GO" || len(report.Checks[0].Reasons) != 0 {
+		t.Fatalf("unexpected checks %+v", report.Checks)
+	}
+}
+
+func TestReleaseReviewBLOCK(t *testing.T) {
+	dir := t.TempDir()
+	artifact := writeReviewFile(t, dir, "tool.tar.gz", "tampered")
+	checksums := writeReviewFile(t, dir, "checksums.txt", digestOf("payload")+"  tool.tar.gz\n")
+
+	code, stdout, _ := runReview(t, reviewSpec(t, artifact, checksums))
+	if code != 20 {
+		t.Fatalf("run() = %d, want 20", code)
+	}
+	if !strings.Contains(stdout, "digest_mismatch") {
+		t.Fatalf("report does not carry the reason: %s", stdout)
+	}
+}
+
+// A directory where the artifact should be hashes as an I/O failure, which is
+// a broken review (exit 30) and not a release finding.
+func TestReleaseReviewERROR(t *testing.T) {
+	dir := t.TempDir()
+	artifact := filepath.Join(dir, "tool.tar.gz")
+	if err := os.Mkdir(artifact, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	checksums := writeReviewFile(t, dir, "checksums.txt", digestOf("payload")+"  tool.tar.gz\n")
+
+	code, stdout, _ := runReview(t, reviewSpec(t, artifact, checksums))
+	if code != 30 {
+		t.Fatalf("run() = %d, want 30", code)
+	}
+	if !strings.Contains(stdout, `"verdict":"ERROR"`) {
+		t.Fatalf("report is not ERROR: %s", stdout)
+	}
+}
+
+func TestReleaseReviewUsage(t *testing.T) {
+	cases := [][]string{
+		{"release-review"},
+		{"release-review", "--spec"},
+		{"release-review", "--spec", ""},
+		{"release-review", "--specification", "s.json"},
+		{"release-review", "--spec", "s.json", "--json"},
+	}
+	for _, args := range cases {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if got := run(args, strings.NewReader(""), &stdout, &stderr); got != 2 {
+				t.Fatalf("run() = %d, want 2", got)
+			}
+			if stdout.Len() != 0 || !strings.Contains(stderr.String(), "usage") {
+				t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
+func TestReleaseReviewUnusableSpec(t *testing.T) {
+	cases := []struct {
+		name    string
+		spec    string
+		wantSub string
+	}{
+		{"not JSON", `not json`, "read spec"},
+		{"unknown field", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"x":1}`, `unknown field "x"`},
+		{"unimplemented check", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true}}}`, "not implemented by this build"},
+		{"no checks enabled", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{}}`, "no checks are enabled"},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			code, stdout, stderr := runReview(t, testCase.spec)
+			if code != 3 {
+				t.Fatalf("run() = %d, want 3", code)
+			}
+			if stdout != "" {
+				t.Fatalf("a refused spec still wrote a report: %q", stdout)
+			}
+			if !strings.Contains(stderr, testCase.wantSub) {
+				t.Fatalf("stderr %q does not contain %q", stderr, testCase.wantSub)
+			}
+			if lines := strings.Count(strings.TrimSpace(stderr), "\n"); lines != 0 {
+				t.Fatalf("refusal is %d lines, want one: %q", lines+1, stderr)
+			}
+		})
+	}
+}
+
+func TestReleaseReviewSpecFromFile(t *testing.T) {
+	dir := t.TempDir()
+	artifact := writeReviewFile(t, dir, "tool.tar.gz", "payload")
+	checksums := writeReviewFile(t, dir, "checksums.txt", digestOf("payload")+"  tool.tar.gz\n")
+	specPath := writeReviewFile(t, dir, "spec.json", reviewSpec(t, artifact, checksums))
+
+	var stdout, stderr bytes.Buffer
+	if got := run([]string{"release-review", "--spec", specPath}, strings.NewReader(""), &stdout, &stderr); got != 10 {
+		t.Fatalf("run() = %d, want 10 (stderr=%q)", got, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"schema_version":1`) {
+		t.Fatalf("unexpected report %q", stdout.String())
+	}
+}
+
+func TestReleaseReviewMissingSpecFile(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	got := run([]string{"release-review", "--spec", filepath.Join(t.TempDir(), "absent.json")},
+		strings.NewReader(""), &stdout, &stderr)
+	if got != 3 {
+		t.Fatalf("run() = %d, want 3", got)
+	}
+	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "read spec") {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}

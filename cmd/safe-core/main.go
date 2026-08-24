@@ -9,6 +9,7 @@ import (
 	"os"
 
 	"github.com/superbiche/safe/internal/lockdiff"
+	"github.com/superbiche/safe/internal/releasereview"
 	"github.com/superbiche/safe/internal/verdict"
 )
 
@@ -26,11 +27,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "package-verdict" {
 		return packageVerdict(args[1:], stdin, stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "release-review" {
+		return releaseReview(args[1:], stdin, stdout, stderr)
+	}
 
 	registryHosts, oldLockfile, newLockfile, ok := lockdiffArgs(args)
 	if !ok {
 		fmt.Fprintln(stderr, "safe-core: usage: safe-core lockdiff [--registry-host <host>]... <old-lockfile> <new-lockfile>")
 		fmt.Fprintln(stderr, "safe-core: usage: safe-core package-verdict < evidence.json")
+		fmt.Fprintln(stderr, "safe-core: usage: safe-core release-review --spec <spec.json|->")
 		return 2
 	}
 
@@ -97,6 +102,46 @@ func packageVerdict(args []string, stdin io.Reader, stdout, stderr io.Writer) in
 		return 3
 	}
 	return 0
+}
+
+// releaseReview reviews one release against a spec and prints its report.
+//
+// An unusable spec is exit 3, never a verdict, for the same reason
+// package-verdict refuses malformed evidence: a review that cannot read what
+// it was asked to check has decided nothing about the release. Verdicts leave
+// through the exit code — 0/10/20 as elsewhere in safe, plus 30 for a review
+// that broke, which is audit infrastructure failing and not a release finding.
+func releaseReview(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) != 2 || args[0] != "--spec" || args[1] == "" {
+		fmt.Fprintln(stderr, "safe-core: usage: safe-core release-review --spec <spec.json|->")
+		return 2
+	}
+
+	source := stdin
+	if args[1] != "-" {
+		file, err := os.Open(args[1])
+		if err != nil {
+			fmt.Fprintf(stderr, "safe-core: release-review: read spec: %v\n", err)
+			return 3
+		}
+		defer file.Close()
+		source = file
+	}
+
+	spec, err := releasereview.Decode(source)
+	if err != nil {
+		fmt.Fprintf(stderr, "safe-core: release-review: %v\n", err)
+		return 3
+	}
+
+	report := releasereview.Review(spec)
+	encoder := json.NewEncoder(stdout)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(report); err != nil {
+		fmt.Fprintf(stderr, "safe-core: release-review: write JSON: %v\n", err)
+		return 3
+	}
+	return report.Verdict.ExitCode()
 }
 
 func lockdiffArgs(args []string) (registryHosts []string, oldLockfile, newLockfile string, ok bool) {

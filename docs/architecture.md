@@ -69,6 +69,9 @@ composite was evaluated and dropped as a bash slice: downloads and
 package-specific lanes stay consumer-side either way, so the payoff only
 materializes as part of the Go migration.
 
+`safe audit binary-audit release-review` is that composite; its spec, report,
+taxonomy, and check status live in [Release Review](release-review.md).
+
 ## Trust Tiers
 
 Packages move through four persistent tiers:
