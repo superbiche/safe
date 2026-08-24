@@ -40,7 +40,7 @@ trivial PATH shims and completions.
 - [Composite release-review: spec, report schema, deps posture](https://superbiche.fibery.io/Superbiche/Tasks/121) — grilling, CLOSED 2026-08-23.
 - [Parity belt: wire the bash-suite-against-Go rule into the repo](https://superbiche.fibery.io/Superbiche/Tasks/122) — task, CLOSED 2026-08-23.
 - [Mixed-era binary shape: safe-core sidecar vs Go dispatcher](https://superbiche.fibery.io/Superbiche/Tasks/123) — grilling, CLOSED 2026-08-24.
-- [End-state gate: what replaces gate-lib and the PATH wrappers](https://superbiche.fibery.io/Superbiche/Tasks/124) — grilling, open.
+- [End-state gate: what replaces gate-lib and the PATH wrappers](https://superbiche.fibery.io/Superbiche/Tasks/124) — grilling, CLOSED 2026-08-24.
 
 ## Decisions so far
 
@@ -48,6 +48,7 @@ trivial PATH shims and completions.
 - [Composite release-review: spec, report schema, deps posture](https://superbiche.fibery.io/Superbiche/Tasks/121) — JSON spec file in (`--spec PATH|-`); one report `{schema_version, subject, verdict, checks[]}` with a redesigned reason taxonomy (old bash codes die with the bash sub-lanes); worst-of aggregation with spec-declared advisory checks and first-class ERROR for could-not-run; single capability key `binary-audit.release-review` + advertised schema_version, strict spec decoding as backstop; composite-only (no Go shims for the six sub-lanes, deleted after consumer swap; fixture-corpus parity variant); survey deps posture ratified as-is.
 - [Parity belt: wire the bash-suite-against-Go rule into the repo](https://superbiche.fibery.io/Superbiche/Tasks/122) — landed (PR #97, `be4b240`): law text in `AGENTS.md` § Tests (SUITES-departure rule + fixture-corpus variant), `tests/run-all.sh` enumeration guard refusing unregistered suites, `SAFE_TEST_STRICT=1` making belt-not-run red; suite-to-surface mapping deliberately law-not-tooling until the mixed-era binary shape is ruled.
 - [Mixed-era binary shape: safe-core sidecar vs Go dispatcher](https://superbiche.fibery.io/Superbiche/Tasks/123) — sidecar continues: one `safe-core` binary, lanes accrete as subcommands, bash dispatcher forwards via exec-passthrough (zero bash logic); exact `SAFE_VERSION` lockstep stays and extends to every migrated surface; capabilities stay statically advertised (lockstep makes them truthful); composite CLI path `safe audit binary-audit release-review`; a lane's migration slice replaces its bash implementation with the forward, so the parity belt holds through the unchanged CLI; Go dispatcher takeover deliberately left as fog.
+- [End-state gate: what replaces gate-lib and the PATH wrappers](https://superbiche.fibery.io/Superbiche/Tasks/124) — the gate becomes a native `safe gate` subcommand (gate-lib migrates as its own lane under the sidecar rules, then dies); the executable PATH shim scripts and their `safe-gate-wrapper v1` marker convention stay into the end state; the refusal exit-code/stderr contract carries verbatim (100/102/104, 0/10/20, 127, single stderr line); `safe setup` owns wrapper install/repair with `install.sh` shrunk to bootstrap, and the zsh sourcing stub survives as the interactive absent-gating warner.
 
 ## Not yet specified
 
@@ -56,9 +57,9 @@ trivial PATH shims and completions.
   interactive host-allow adds) — ports with the first lane that hits prompts.
 - Go package layout conventions as lanes multiply — expected to settle in
   early slices.
-- End-state install/distribution story: `install.sh`'s future, completions,
-  fleet rollout via machine-setup, and whether safe's own releases flow
-  through the binary-audit review lane (self-hosting).
+- End-state install/distribution story, minus the settled shell-hook part:
+  completions, fleet rollout via machine-setup, and whether safe's own
+  releases flow through the binary-audit review lane (self-hosting).
 - Contract/docs regeneration (`docs/contract/agent-contract.json` render
   pipeline) in the Go world.
 
