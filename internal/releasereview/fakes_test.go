@@ -26,7 +26,7 @@ const (
 // linked in because PATH is replaced rather than prepended: a real cosign on
 // the developer's machine must not be reachable from a test that asked for
 // none, and "tool missing" is otherwise not something a test can state.
-var fakeHelpers = []string{"bash", "cat", "cp", "dirname", "jq", "mkdir", "sleep"}
+var fakeHelpers = []string{"bash", "cat", "cp", "dirname", "mkdir", "sleep"}
 
 // withFakeTools builds a bin dir holding the named fakes, points PATH at it
 // alone, and returns the dir. Naming no tool is how a test says "this tool is
@@ -66,6 +66,11 @@ var fakeScripts = map[string]string{"cosign": fakeCosign, "podman": fakePodman}
 // reads, exactly as the bash mock does — the loopback URL it is handed is not
 // fetched, so the bridge gets its own unit test rather than being exercised
 // only indirectly here.
+//
+// initialize derives each target's name and digest from the mirror blob's own
+// `<sha>.<name>` filename (the convention buildTUFMirror lays down) rather than
+// parsing targets.json, so the fake needs no jq — a helper whose absence would
+// otherwise let every test in this package skip to a vacuous green.
 const fakeCosign = `#!/usr/bin/env bash
 set -euo pipefail
 
@@ -136,17 +141,20 @@ case "$command_name" in
     if [[ -f "$mirror_path/targets.json" ]]; then
       cp "$mirror_path/targets.json" "$repo_dir/targets.json"
     fi
-    if [[ -f "$repo_dir/targets.json" && -d "$mirror_path/targets" ]]; then
-      while IFS=$'\t' read -r target_name target_sha; do
-        [[ -n "$target_name" && -n "$target_sha" ]] || continue
+    if [[ -d "$mirror_path/targets" ]]; then
+      for blob in "$mirror_path"/targets/*; do
+        [[ -f "$blob" ]] || continue
+        base="${blob##*/}"
+        # Blobs are named <sha>.<name>; the sha is dot-free, so the first dot
+        # splits the digest from the (possibly dotted) target name.
+        target_name="${base#*.}"
+        [[ -n "$target_name" ]] || continue
         case ",${MOCK_COSIGN_TUF_SKIP_TARGETS:-}," in
           *,"$target_name",*) continue ;;
         esac
-        source_path="$mirror_path/targets/$target_sha.$target_name"
-        [[ -f "$source_path" ]] || continue
         mkdir -p "$(dirname "$targets_dir/$target_name")"
-        cp "$source_path" "$targets_dir/$target_name"
-      done < <(jq -r '.signed.targets | to_entries[] | [.key, (.value.hashes.sha256 // "")] | @tsv' "$repo_dir/targets.json")
+        cp "$blob" "$targets_dir/$target_name"
+      done
     fi
     printf 'Initialized\n'
     ;;
@@ -167,6 +175,16 @@ if [[ -n "${MOCK_PODMAN_LOG:-}" ]]; then
 fi
 if [[ -n "${MOCK_PODMAN_SLEEP:-}" ]]; then
   sleep "$MOCK_PODMAN_SLEEP"
+fi
+# MOCK_PODMAN_SPEW_LINES makes the fake emit that many ~1 KiB lines to BOTH
+# streams (pure bash builtins, no extra helper on PATH), standing in for a
+# binary that floods its output past the reviewer's in-memory capture cap.
+if [[ -n "${MOCK_PODMAN_SPEW_LINES:-}" ]]; then
+  line="$(printf 'x%.0s' {1..1000})"
+  for (( i = 0; i < MOCK_PODMAN_SPEW_LINES; i++ )); do
+    printf '%s\n' "$line"
+    printf '%s\n' "$line" >&2
+  done
 fi
 printf 'podman stdout summary\n'
 printf 'podman stderr summary\n' >&2

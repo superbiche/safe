@@ -226,6 +226,74 @@ func TestStdioSummaryIsBounded(t *testing.T) {
 	}
 }
 
+// A binary can emit unbounded output; the reviewer must not grow with it. The
+// bounded writer caps what it retains at execCaptureCap while still reporting
+// full consumption on every Write, so os/exec's drain goroutine never stalls
+// and the sandboxed process never blocks on a full pipe.
+func TestBoundedBufferCapsRetainedBytes(t *testing.T) {
+	var b boundedBuffer
+	chunk := make([]byte, 32<<10)
+	total := 0
+	for range 8 { // 256 KiB written, four times the 64 KiB cap
+		n, err := b.Write(chunk)
+		if n != len(chunk) || err != nil {
+			t.Fatalf("Write reported %d, %v; want %d, nil (a short write would stall the pipe drain)", n, err, len(chunk))
+		}
+		total += n
+	}
+	if total <= execCaptureCap {
+		t.Fatalf("test wrote %d bytes, want well past the %d cap", total, execCaptureCap)
+	}
+	if got := len(b.String()); got > execCaptureCap {
+		t.Fatalf("retained %d bytes, want at most the %d cap", got, execCaptureCap)
+	}
+	if !b.truncated {
+		t.Fatalf("writing past the cap did not record truncation")
+	}
+}
+
+func TestBoundedBufferKeepsSmallOutputWhole(t *testing.T) {
+	var b boundedBuffer
+	payload := []byte("podman stderr summary\n")
+	if n, err := b.Write(payload); n != len(payload) || err != nil {
+		t.Fatalf("Write reported %d, %v; want %d, nil", n, err, len(payload))
+	}
+	if b.String() != string(payload) {
+		t.Fatalf("retained %q, want it whole", b.String())
+	}
+	if b.truncated {
+		t.Fatalf("a sub-cap write must not report truncation")
+	}
+}
+
+// A binary that floods both streams past the capture cap must still produce a
+// bounded report and, crucially, complete: the run is read as runtime_failure
+// (the fake's own exit code), never a timeout — a short-writing drain would
+// fill the pipe, block the process, and let the deadline fire instead.
+func TestExecBoundsFloodedOutput(t *testing.T) {
+	artifact, _ := execFixture(t)
+	t.Setenv("MOCK_PODMAN_SPEW_LINES", "4000") // ~4 MB per stream, ~64x the cap
+	t.Setenv("MOCK_PODMAN_RC", "5")
+
+	result := sandboxExec(execSpec(artifact, nil, 10))
+	if result.Verdict != WARN {
+		t.Fatalf("verdict %s, want WARN", result.Verdict)
+	}
+	reason := result.Reasons[0]
+	if reason.Code != "runtime_failure" || reason.Data["exit_code"] != "5" {
+		t.Fatalf("unexpected reason %+v (a timeout here would mean the pipe drain stalled)", reason)
+	}
+	for _, stream := range []string{"stdout_summary", "stderr_summary"} {
+		summary := reason.Data[stream]
+		if runes := len([]rune(summary)); runes > execSummaryMaxChars {
+			t.Fatalf("%s carries %d runes, want at most %d", stream, runes, execSummaryMaxChars)
+		}
+		if lines := strings.Count(summary, "\n") + 1; lines > execSummaryMaxLines {
+			t.Fatalf("%s carries %d lines, want at most %d", stream, lines, execSummaryMaxLines)
+		}
+	}
+}
+
 func contains(haystack []string, needle string) bool {
 	for _, entry := range haystack {
 		if entry == needle {

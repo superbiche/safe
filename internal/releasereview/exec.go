@@ -18,10 +18,41 @@ const (
 	defaultExecImage          = "docker.io/library/alpine:3.22"
 	execSummaryMaxLines       = 40
 	execSummaryMaxChars       = 4000
+	// execCaptureCap bounds how much of each output stream is held in memory.
+	// The summary needs at most 40 lines / 4000 chars, so 64 KiB is ample
+	// headroom while keeping a binary that spews unbounded output from growing
+	// safe-core's RSS until the OOM killer takes it mid-review.
+	execCaptureCap = 64 << 10
 	// Mirrors the bash lane's `timeout --kill-after=5s`: a process that ignores
 	// SIGTERM still gets killed rather than holding the review open.
 	execKillDelay = 5 * time.Second
 )
+
+// boundedBuffer retains only the first execCaptureCap bytes written to it and
+// discards the rest. Write always reports full consumption (len(p), nil) so
+// os/exec's output-drain goroutine keeps reading and the sandboxed process
+// never blocks on a full pipe — the point is to cap the reviewer's memory, not
+// to backpressure the audited binary.
+type boundedBuffer struct {
+	buf       bytes.Buffer
+	truncated bool
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	if remaining := execCaptureCap - b.buf.Len(); remaining > 0 {
+		if len(p) <= remaining {
+			b.buf.Write(p)
+		} else {
+			b.buf.Write(p[:remaining])
+			b.truncated = true
+		}
+	} else if len(p) > 0 {
+		b.truncated = true
+	}
+	return len(p), nil
+}
+
+func (b *boundedBuffer) String() string { return b.buf.String() }
 
 // sandboxExec runs the release's executable under a networkless container and
 // reports how it behaved.
@@ -84,7 +115,7 @@ func sandboxExec(spec Spec) CheckResult {
 	command.Cancel = func() error { return command.Process.Signal(syscall.SIGTERM) }
 	command.WaitDelay = execKillDelay
 
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr boundedBuffer
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 	runErr := command.Run()

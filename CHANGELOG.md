@@ -15,7 +15,9 @@
   trust target against the trusted metadata. `exec` runs the release binary
   under the same podman sandbox the bash lane used — no network, read-only
   artifact bind, every capability dropped, tmpfs scratch — and reports how it
-  behaved. **`checksum_only_verification` earns its retirement**: a matched
+  behaved, capturing at most 64 KiB of each output stream so a binary that
+  floods its output cannot grow the reviewer's memory until it is OOM-killed
+  mid-review (the bash lane bounded the same flood on disk instead). **`checksum_only_verification` earns its retirement**: a matched
   digest no longer warns when an enabled `signature` check verified that same
   artifact (matched by position, since a spec may repeat an asset name), so a
   verified release exits 0 for the first time. Signature *metadata* alone still

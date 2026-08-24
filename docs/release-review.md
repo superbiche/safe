@@ -436,7 +436,11 @@ killed by a signal reports `-1`, and a container that exits 137 on its own is a
 runtime failure this review did not cause.
 
 Output summaries are bounded to 40 lines and 4000 characters. A report carries a
-summary, never a binary's unbounded output.
+summary, never a binary's unbounded output — and the capture itself is bounded
+too: at most 64 KiB of each stream is held in memory, the rest discarded as it
+arrives, so a binary that floods its output cannot grow the reviewer's memory
+until the OOM killer takes it mid-review. This is divergence 9 in the ledger
+below.
 
 ### Backstop
 
@@ -531,3 +535,10 @@ behavior deliberately differs from the `binary-audit` sub-lane it replaces.
    openssl to put the signer's certificate subject, issuer and SANs in its data
    payload. That is diagnostics, not a decision, and it is not worth an openssl
    dependency the composite otherwise does not need.
+9. **The `exec` capture is memory-bounded, not disk-bounded.** The bash lane
+   redirected both sandbox streams to scratch files and truncated afterwards, so
+   an unbounded binary filled disk, not RAM. The Go composite keeps the capture
+   in memory but caps it at 64 KiB per stream, discarding the rest as it
+   arrives. Both bound the same report to the same 40-line / 4000-char summary;
+   the divergence is only in what the flood costs while it happens — bounded
+   disk there, bounded memory here.
