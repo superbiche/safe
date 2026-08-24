@@ -72,16 +72,17 @@ func checksum(spec Spec) CheckResult {
 			}
 			continue
 		}
-		if hashErr != nil {
-			// Both sides are already reported; there is nothing left to compare.
-			continue
-		}
-
+		// Whether the checksum file holds an entry for this asset is a fact
+		// about the release on its own; only the comparison below needs the
+		// artifact's digest.
 		expected, ok := expectedDigest(string(content), name)
 		if !ok {
 			result.add(BLOCK, "no_entry_for_artifact",
 				fmt.Sprintf("checksum file contains no usable entry for %s", name),
 				map[string]string{"artifact": name, "checksum_file": artifact.Evidence.ChecksumFile})
+			continue
+		}
+		if hashErr != nil {
 			continue
 		}
 

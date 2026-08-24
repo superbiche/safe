@@ -335,6 +335,24 @@ func TestChecksumUnreadableArtifactAndMissingChecksumFile(t *testing.T) {
 	}
 }
 
+func TestChecksumUnreadableArtifactStillJudgesTheChecksumContent(t *testing.T) {
+	dir := t.TempDir()
+	artifactDir := filepath.Join(dir, "tool.tar.gz")
+	if err := os.Mkdir(artifactDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	noEntry := writeFile(t, dir, "checksums.txt", "not a checksum\n")
+
+	result := checksum(checksumSpec(artifactDir, "tool.tar.gz", noEntry, true))
+	if result.Verdict != BLOCK {
+		t.Fatalf("verdict %s with reasons %v, want BLOCK", result.Verdict, codes(result))
+	}
+	if !hasReason(result, "artifact_unreadable", "tool.tar.gz") ||
+		!hasReason(result, "no_entry_for_artifact", "tool.tar.gz") {
+		t.Fatalf("reasons %v, want both observations", codes(result))
+	}
+}
+
 func hasReason(result CheckResult, code, artifact string) bool {
 	for _, reason := range result.Reasons {
 		if reason.Code == code && reason.Data["artifact"] == artifact {

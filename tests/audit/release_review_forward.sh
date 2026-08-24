@@ -83,8 +83,9 @@ printf '%s  tool.tar.gz\n' "$(printf 'a different payload\n' | sha256sum | cut -
   > "$FIXTURES/wrong-checksums.txt"
 write_spec "$TEST_ROOT/mismatch.json" "$FIXTURES/wrong-checksums.txt"
 
-# Signature evidence is what lifts a verified artifact from WARN to GO. This
-# build verifies no bundle, so the file only has to satisfy the schema.
+# Deliberately unverifiable signature metadata: no build verifies bundles yet,
+# so this evidence must NOT lift the result past WARN — the case below proves
+# the forward keeps checksum_only_verification despite it.
 printf 'bundle\n' > "$FIXTURES/tool.tar.gz.sigstore"
 cat > "$TEST_ROOT/signed.json" <<EOF
 {
