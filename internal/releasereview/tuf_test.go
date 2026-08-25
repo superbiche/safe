@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const tufRootContent = `{"signed":{"_type":"root","version":1}}`
@@ -112,6 +113,40 @@ func TestTUFBootstrapFailureCarriesTheToolsFirstLine(t *testing.T) {
 	}
 	if result.Reasons[0].Message != "tuf initialize failed" {
 		t.Fatalf("message %q does not summarize the tool's output", result.Reasons[0].Message)
+	}
+}
+
+// A cosign initialize that runs past its deadline is audit-infrastructure
+// breakage, not a verdict about the trust material: ERROR (bootstrap_timeout),
+// never the BLOCK a genuine initialize rejection produces.
+func TestTUFBootstrapTimeoutIsErrorNotBlock(t *testing.T) {
+	spec, _, _ := tufFixture(t)
+	lowerCosignTimeout(t, 200*time.Millisecond)
+	t.Setenv("MOCK_COSIGN_SLEEP", "5")
+
+	result := tuf(spec)
+	if result.Verdict != ERROR {
+		t.Fatalf("verdict %s, want ERROR: %v", result.Verdict, codes(result))
+	}
+	if got := codes(result); len(got) != 1 || got[0] != "bootstrap_timeout" {
+		t.Fatalf("reasons %v, want [bootstrap_timeout]", got)
+	}
+}
+
+// A cosign initialize that exits but leaves a child holding its output pipe is
+// os/exec stalling on I/O (exec.ErrWaitDelay), not a bootstrap that failed. Like
+// the context-deadline timeout, it is ERROR (bootstrap_timeout), never a BLOCK.
+func TestTUFBootstrapPipeStallIsErrorNotBlock(t *testing.T) {
+	spec, _, _ := tufFixture(t)
+	lowerCosignKillDelay(t, 200*time.Millisecond)
+	t.Setenv("MOCK_COSIGN_ORPHAN", "2")
+
+	result := tuf(spec)
+	if result.Verdict != ERROR {
+		t.Fatalf("verdict %s, want ERROR: %v", result.Verdict, codes(result))
+	}
+	if got := codes(result); len(got) != 1 || got[0] != "bootstrap_timeout" {
+		t.Fatalf("reasons %v, want [bootstrap_timeout]", got)
 	}
 }
 

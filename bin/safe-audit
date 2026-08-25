@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.2.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.32.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.33.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"

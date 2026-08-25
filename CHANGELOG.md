@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **`release-review` now pins `GITHUB_TOKEN` to the base URL's origin and puts a
+  deadline on its `cosign` subprocesses.** The `release` and `vuln` checks make
+  two of their requests to absolute URLs GitHub itself returns — a `Link`
+  rel="next" target and an annotated tag object's address — and the bearer token
+  is now attached only when such a URL shares the base URL's origin (scheme, host,
+  and effective port), so a compromised or proxied response cannot steer the
+  credential elsewhere. The pin covers redirects too: the client installs its own
+  redirect policy, because Go's default forwards the header to any
+  same-host-or-subdomain target by hostname alone — dropping scheme and port. The
+  `signature` and `tuf` checks run their `cosign` invocations under the same
+  Go-context deadline the `exec` check uses; a cosign that runs past it — or that
+  exits while a descendant holds its output pipe open — is `ERROR`
+  (`verification_timeout` / `bootstrap_timeout`), never the `BLOCK` a real
+  verification or bootstrap failure produces: a tool that never answered is the
+  review failing to run, not a finding about the release. Both are deliberate
+  divergences from the bash sub-lanes (ledger entries 14 and 15) and carry Go
+  regression tests. No verdict on any well-formed release changes.
+
 - **`release-review`'s version comparison now cuts file suffixes with gnulib's
   actual forward-scan `file_prefixlen`.** The earlier port used a backward scan
   that could cut a version string's prefix to empty and cut trailing runs the

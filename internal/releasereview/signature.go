@@ -117,16 +117,34 @@ func verifyArtifact(result *CheckResult, artifact Artifact, evidence *SignatureE
 		identityData = map[string]string{"artifact": name, "expected_identity_regexp": evidence.IdentityRegexp}
 	}
 
-	mainOutput, mainErr := cosignVerifyBlob(artifact.Path, evidence.Bundle,
+	// A cosign that runs past its deadline is audit-infrastructure breakage, not
+	// a verdict about the signature: it is reported ERROR and the cascade stops,
+	// because a tool that never answers cannot be re-probed into one.
+	reportTimeout := func() {
+		result.add(ERROR, "verification_timeout",
+			fmt.Sprintf("cosign did not finish verifying %s within %s", name, cosignSubprocessTimeout),
+			map[string]string{"artifact": name})
+	}
+
+	mainOutput, mainTimedOut, mainErr := cosignVerifyBlob(artifact.Path, evidence.Bundle,
 		append(identityPolicy, "--certificate-oidc-issuer", evidence.OIDCIssuer))
+	if mainTimedOut {
+		reportTimeout()
+		return false
+	}
 	if mainErr == nil {
 		return true
 	}
 
-	if _, anyErr := cosignVerifyBlob(artifact.Path, evidence.Bundle, []string{
+	_, anyTimedOut, anyErr := cosignVerifyBlob(artifact.Path, evidence.Bundle, []string{
 		"--certificate-identity-regexp", ".*",
 		"--certificate-oidc-issuer-regexp", ".*",
-	}); anyErr != nil {
+	})
+	if anyTimedOut {
+		reportTimeout()
+		return false
+	}
+	if anyErr != nil {
 		// Nothing about the bundle verifies, so the identity probes below would
 		// only restate that.
 		result.add(BLOCK, "signature_failure",
@@ -135,12 +153,23 @@ func verifyArtifact(result *CheckResult, artifact Artifact, evidence *SignatureE
 		return false
 	}
 
-	_, identityErr := cosignVerifyBlob(artifact.Path, evidence.Bundle,
+	_, identityTimedOut, identityErr := cosignVerifyBlob(artifact.Path, evidence.Bundle,
 		append(identityPolicy, "--certificate-oidc-issuer-regexp", ".*"))
-	_, issuerErr := cosignVerifyBlob(artifact.Path, evidence.Bundle, []string{
+	if identityTimedOut {
+		// The issuer probe is not launched: a tool that just failed to answer
+		// within its deadline cannot be re-probed into one, and starting it would
+		// only hold the review for another deadline without changing the ERROR.
+		reportTimeout()
+		return false
+	}
+	_, issuerTimedOut, issuerErr := cosignVerifyBlob(artifact.Path, evidence.Bundle, []string{
 		"--certificate-identity-regexp", ".*",
 		"--certificate-oidc-issuer", evidence.OIDCIssuer,
 	})
+	if issuerTimedOut {
+		reportTimeout()
+		return false
+	}
 
 	identityMismatch := func() {
 		result.add(BLOCK, "identity_mismatch",
@@ -170,11 +199,10 @@ func verifyArtifact(result *CheckResult, artifact Artifact, evidence *SignatureE
 	return false
 }
 
-func cosignVerifyBlob(artifact, bundle string, policy []string) (string, error) {
+func cosignVerifyBlob(artifact, bundle string, policy []string) (output string, timedOut bool, err error) {
 	args := append([]string{"verify-blob", "--bundle", bundle, "--new-bundle-format=true"}, policy...)
 	args = append(args, artifact)
-	output, err := exec.Command("cosign", args...).CombinedOutput()
-	return string(output), err
+	return cosignRun(nil, args...)
 }
 
 // fileProbe classifies one input path.
