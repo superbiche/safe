@@ -13,7 +13,7 @@ _safe_run() {
   local -a run_cmds host_allow_cmds block_cmds opts
   local subcmd="${words[3]:-}"
   run_cmds=(host-allow block link unlink audit status install version help)
-  host_allow_cmds=(add list remove update)
+  host_allow_cmds=(add list remove update review export import)
   block_cmds=(add list remove import)
   opts=(--strict --node22 --py312 --proxy --allow-write --allow-network --allow-secrets --yes -h --help --version)
 

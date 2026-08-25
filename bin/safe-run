@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SAFE_RUN_VERSION="0.1.0"
+SAFE_RUN_VERSION="0.2.0"
 SAFE_RUN_NO_INIT="${SAFE_RUN_NO_INIT:-0}"
 
 CONFIG_DIR="${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}"
@@ -1260,10 +1260,14 @@ host_allow_require_reason() {
 
 write_host_allow_entry() {
   local pkg="$1" version="$2" sha="$3" reason="$4" ecosystem="$5"
+  # Callers that carry an original grant date (import, replicating another
+  # machine's set) pass it as $6 so a round trip does not reset the age the
+  # staleness review computes from; add/update omit it and stamp today.
+  local added="${6:-$(date -I)}"
   local tmp
   tmp=$(mktemp)
   jq --arg p "$pkg" --arg v "$version" --arg s "$sha" \
-     --arg r "$reason" --arg d "$(date -I)" --arg e "$ecosystem" '
+     --arg r "$reason" --arg d "$added" --arg e "$ecosystem" '
     .packages[$p] = {
       version: $v,
       sha: $s,
@@ -1282,9 +1286,230 @@ cmd_host_allow() {
     remove|rm) cmd_host_allow_remove "$@" ;;
     update) cmd_host_allow_update "$@" ;;
     review) cmd_host_allow_review "$@" ;;
+    export) cmd_host_allow_export "$@" ;;
+    import) cmd_host_allow_import "$@" ;;
     list|ls|"") cmd_host_allow_list ;;
     *)      die "unknown host-allow subcommand: $sub" ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands: host-allow export / import (fleet machine replication)
+#
+# The allow set is per-machine by design — a security boundary we keep. But
+# reconciling a fresh machine otherwise means rediscovering machine 1's whole
+# WARN-verdict allow set one failed install at a time. export dumps this
+# machine's set as a portable, reviewable document (no secrets — the sha is a
+# public registry integrity hash); import applies a reviewed set in ONE
+# explicit operator-run action. Import is "review this set and apply", never
+# "trust another machine": it re-validates every entry as `add` does,
+# re-fetches integrity from the registry (never trusting the file's sha over a
+# divergent one), refuses to silently overwrite a differing local pin, and is
+# TTY-gated exactly like add/update. Deliberately NOT sync-propagated.
+# ---------------------------------------------------------------------------
+
+HOST_ALLOW_EXPORT_SCHEMA="safe-host-allow-export/1"
+
+# An exact, registry-resolvable version pin — never a range (^1, 1.x, >=1), a
+# dist-tag (latest, next), or an npm source spec (file:/…, git+…, a URL or
+# path). Import ingests untrusted external specs, so a value that is not an
+# exact pin must never be written as a host-execution grant. Exact npm and
+# PEP440 versions begin with a digit and use only version characters; the
+# charset alone rejects every source-spec and range operator (: / # ^ ~ > < =
+# | whitespace *).
+is_exact_version() {
+  # Permissive on purpose: begins with a digit and carries only version
+  # characters (npm semver plus PEP440's epoch `!` and local `+`), which
+  # excludes every source-spec and range operator (: / # ^ ~ > < = | space *)
+  # for a cheap pre-fetch rejection. It is NOT the authority on exactness —
+  # registry_verified_integrity's echo-back is; this only avoids false
+  # rejection of legal pins (e.g. the Python epoch `1!2.0`).
+  local v="$1"
+  [[ "$v" =~ ^[0-9][A-Za-z0-9.+_!-]*$ ]]
+}
+
+# Fetch integrity for a version import intends to grant, verifying the registry
+# echoes back that EXACT version. A range or dist-tag that slipped the format
+# check resolves to a different version and is rejected here; a version the
+# registry cannot resolve returns nothing. Prints the integrity on an exact
+# match, nothing otherwise. Import writes only what this confirms.
+registry_verified_integrity() {
+  local pkg="$1" version="$2" ecosystem="$3" body resolved digest
+  case "$ecosystem" in
+    npm|bun)
+      body=$(curl -fsSL "https://registry.npmjs.org/${pkg}/${version}" 2>/dev/null) || return 1
+      resolved=$(printf '%s' "$body" | jq -r '.version // empty' 2>/dev/null) || return 1
+      [[ "$resolved" == "$version" ]] || return 1
+      digest=$(printf '%s' "$body" | jq -r '.dist.integrity // .dist.shasum // empty' 2>/dev/null) || return 1
+      [[ -n "$digest" ]] || return 1
+      printf '%s' "$digest"
+      ;;
+    py|python|uv|pipx)
+      body=$(curl -fsSL "https://pypi.org/pypi/${pkg}/${version}/json" 2>/dev/null) || return 1
+      resolved=$(printf '%s' "$body" | jq -r '.info.version // empty' 2>/dev/null) || return 1
+      [[ "$resolved" == "$version" ]] || return 1
+      digest=$(printf '%s' "$body" | jq -r '.urls[0].digests.sha256 // empty' 2>/dev/null) || return 1
+      [[ -n "$digest" ]] || return 1
+      printf 'sha256-%s' "$digest"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd_host_allow_export() {
+  # Accept the documented --json spelling; a JSON document is the only form,
+  # since its purpose is to be re-read by `import`. `list` is the human view.
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) shift ;;
+      *) die "unknown flag: $1 (usage: safe run host-allow export [--json])" ;;
+    esac
+  done
+  local packages='{}'
+  if [[ -r "$HOST_ALLOW_FILE" ]]; then
+    # A malformed local trust file is a legible error, never a silent empty
+    # export. Project ONLY the declared portable fields so no legacy or
+    # manually added key (e.g. behavioral_ack) leaks into the shared document.
+    # No `// {}`: jq's alternative treats false as absent, so `(.packages // {})`
+    # would let a boolean `.packages` masquerade as an empty set. Test the value
+    # directly, and only iterate once it is known to be an object.
+    jq -e '.packages | if type == "object" then all(.[]; type == "object") else false end' \
+      "$HOST_ALLOW_FILE" >/dev/null 2>&1 \
+      || die "host-allow file is malformed: $HOST_ALLOW_FILE"
+    packages=$(jq -c '(.packages // {})
+      | map_values({version, sha, ecosystem, added, reason})' "$HOST_ALLOW_FILE")
+  fi
+  jq -n --arg schema "$HOST_ALLOW_EXPORT_SCHEMA" --arg exported "$(date -I)" \
+     --argjson packages "$packages" \
+     '{schema: $schema, exported: $exported, packages: $packages}'
+}
+
+cmd_host_allow_import() {
+  local file="" dry_run=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=1; shift ;;
+      -*) die "unknown flag: $1 (usage: safe run host-allow import <file> [--dry-run])" ;;
+      *) [[ -n "$file" ]] && die "usage: safe run host-allow import <file> [--dry-run]"
+         file="$1"; shift ;;
+    esac
+  done
+  [[ -z "$file" ]] && die "usage: safe run host-allow import <file> [--dry-run]"
+  [[ -r "$file" ]] || die "cannot read import file: $file"
+  jq -e . "$file" >/dev/null 2>&1 || die "import file is not valid JSON: $file"
+  local schema
+  schema=$(jq -r '.schema // empty' "$file")
+  [[ "$schema" == "$HOST_ALLOW_EXPORT_SCHEMA" ]] || \
+    die "not a safe host-allow export (expected schema $HOST_ALLOW_EXPORT_SCHEMA); create one with: safe run host-allow export"
+  # The whole envelope is validated before any entry is applied: a scalar,
+  # array, or boolean `.packages` must fail loudly, never masquerade as an empty
+  # import. No `// {}` — jq's alternative treats false as absent.
+  jq -e '.packages | type == "object"' "$file" >/dev/null 2>&1 \
+    || die "import file is malformed: .packages must be a JSON object"
+
+  # A real apply writes trust entries: operator-TTY only, gated BEFORE any
+  # write AND before any state initialization, so neither a flag-parse slip
+  # nor directory scaffolding can happen from a non-TTY shell. --dry-run is
+  # read-only (an agent may run it to show the operator the delta) — it must
+  # touch nothing, so it never initializes state either. The refusal names an
+  # import-specific, shell-replayable command (import takes no --reason).
+  if (( dry_run == 0 )); then
+    if ! is_tty; then
+      err "BLOCKED: host-allow import requires an interactive operator terminal"
+      err "  ask the operator to run: safe run host-allow import $(printf '%q' "$file")"
+      err "  agent contract: safe explain"
+      exit 102
+    fi
+    [[ "$SAFE_RUN_NO_INIT" == "1" ]] || ensure_dirs
+  fi
+
+  local names
+  mapfile -t names < <(jq -r '.packages // {} | keys[]' "$file" 2>/dev/null)
+  if (( ${#names[@]} == 0 )); then
+    info "import: no packages in $file"
+    return 0
+  fi
+
+  local added=0 skipped=0
+  local name version ecosystem file_sha reason added_date kind normalized local_entry local_version fetched_sha
+  for name in "${names[@]}"; do
+    # Each entry must itself be an object: a scalar entry would crash the
+    # field extractions under `set -e` and could abort AFTER an earlier valid
+    # entry was already written. Skip it instead, applying nothing partial.
+    if [[ "$(jq -r --arg p "$name" '.packages[$p] | type' "$file" 2>/dev/null)" != "object" ]]; then
+      warn "skip ${name}: entry is not an object"; skipped=$((skipped + 1)); continue
+    fi
+    version=$(jq -r --arg p "$name" '.packages[$p].version // empty' "$file")
+    ecosystem=$(jq -r --arg p "$name" '.packages[$p].ecosystem // "npm"' "$file")
+    file_sha=$(jq -r --arg p "$name" '.packages[$p].sha // empty' "$file")
+    reason=$(jq -r --arg p "$name" '.packages[$p].reason // empty' "$file")
+    added_date=$(jq -r --arg p "$name" '.packages[$p].added // empty' "$file")
+
+    # The file is untrusted external input — validate exactly as `add` does,
+    # and reject any version that is not an exact registry pin (§ is_exact_version).
+    kind=$(ecosystem_to_runner_kind "$ecosystem") || {
+      warn "skip ${name}: unknown ecosystem '${ecosystem}'"; skipped=$((skipped + 1)); continue; }
+    if [[ -z "$version" ]] || ! is_exact_version "$version"; then
+      warn "skip ${name}: '${version}' is not an exact pinned version (no ranges, tags, or source specs)"
+      skipped=$((skipped + 1)); continue
+    fi
+    if [[ -z "$reason" ]]; then
+      warn "skip ${name}: entry carries no reason (audit trail required)"; skipped=$((skipped + 1)); continue
+    fi
+    # Preserve the original grant date only when it is a REAL calendar date
+    # (shape plus `date -d` round-trip, so 2026-02-30 is rejected); otherwise
+    # let the writer stamp today rather than trust an arbitrary string.
+    if [[ ! "$added_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+       || [[ "$(date -d "$added_date" +%Y-%m-%d 2>/dev/null)" != "$added_date" ]]; then
+      added_date=""
+    fi
+    normalized=$(normalize_and_validate_package_or_warn "$name" "$kind" "$name") || {
+      skipped=$((skipped + 1)); continue; }
+
+    # Never silently overwrite a divergent local pin.
+    local_entry=$(jq -c --arg p "$normalized" '.packages[$p] // empty' "$HOST_ALLOW_FILE" 2>/dev/null || true)
+    if [[ -n "$local_entry" ]]; then
+      local_version=$(printf '%s' "$local_entry" | jq -r '.version // empty')
+      if [[ "$local_version" == "$version" ]]; then
+        printf '  present  %s@%s (already allowed)\n' "$normalized" "$version" >&2
+        skipped=$((skipped + 1)); continue
+      fi
+      printf '  CONFLICT %s: local pins @%s, import has @%s — resolve with: safe run host-allow update %s@%s --reason "..."\n' \
+        "$normalized" "$local_version" "$version" "$normalized" "$version" >&2
+      skipped=$((skipped + 1)); continue
+    fi
+
+    # Import trusts the registry, not the file: an entry is written only if the
+    # registry resolves this EXACT version and returns an integrity for it. A
+    # version the registry cannot confirm — unknown, yanked, private, or a range
+    # or tag that slipped the format check and resolves to something else — is
+    # skipped, never written on faith. A divergent sha (mutated export or
+    # registry change) is skipped loudly.
+    fetched_sha=$(registry_verified_integrity "$normalized" "$version" "$ecosystem") || true
+    if [[ -z "$fetched_sha" ]]; then
+      warn "skip ${normalized}@${version}: could not verify this version against the registry (unknown version or registry unreachable) — add it by hand if intended"
+      skipped=$((skipped + 1)); continue
+    fi
+    if [[ -n "$file_sha" && "$fetched_sha" != "$file_sha" ]]; then
+      warn "skip ${normalized}@${version}: integrity mismatch (file ${file_sha}, registry ${fetched_sha}) — investigate before importing"
+      skipped=$((skipped + 1)); continue
+    fi
+
+    if (( dry_run )); then
+      printf '  would-add %s@%s [%s]\n' "$normalized" "$version" "$ecosystem" >&2
+      added=$((added + 1)); continue
+    fi
+
+    write_host_allow_entry "$normalized" "$version" "$fetched_sha" "$reason" "$ecosystem" "$added_date"
+    info "imported ${normalized}@${version}"
+    added=$((added + 1))
+  done
+
+  if (( dry_run )); then
+    info "dry-run: ${added} to add, ${skipped} skipped (no changes written)"
+  else
+    info "import complete: ${added} added, ${skipped} skipped"
+  fi
 }
 
 require_operator_tty() {
@@ -2414,6 +2639,12 @@ SUBCOMMANDS
                                               whether each pin still needs its
                                               entry (re-audit); --digest writes
                                               an inbox note when actionable
+  host-allow export [--json]                  Dump this machine's allow set as a
+                                              portable JSON document (for import)
+  host-allow import <file> [--dry-run]        Apply a reviewed allow set (TTY);
+                                              re-validates + re-fetches integrity,
+                                              never overwrites a divergent pin;
+                                              --dry-run previews the delta
   scripts-allow add <pkg>@<x.y.z> --reason "..."
                                               Operator grant (TTY): reviewed
                                               install scripts for one exact
@@ -2469,10 +2700,14 @@ main() {
   argv0=$(basename "$0")
   detect_runner "$argv0"
   if [[ "$SAFE_RUN_NO_INIT" != "1" ]]; then
-    # host-allow review is a read-only report over the trust surface: on a
-    # machine with no run state it must not seed trust files as a side
-    # effect of being asked what that state is.
-    if [[ "$argv0" == "safe-run" && "${1:-}" == "host-allow" && "${2:-}" == "review" ]]; then
+    # host-allow review and export are read-only reports over the trust
+    # surface: on a machine with no run state they must not seed trust files
+    # as a side effect of being asked what that state is. import is exempt too,
+    # but for a different reason — it defers initialization until AFTER its own
+    # operator-TTY gate, so a --dry-run preview and a refused non-TTY apply both
+    # touch nothing.
+    if [[ "$argv0" == "safe-run" && "${1:-}" == "host-allow" \
+          && ( "${2:-}" == "review" || "${2:-}" == "export" || "${2:-}" == "import" ) ]]; then
       :
     else
       ensure_dirs

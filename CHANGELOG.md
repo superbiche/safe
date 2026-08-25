@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **`safe run host-allow export` / `import` replicate a reviewed allow set to a
+  fresh machine.** The host-allow set is per-machine by design, so bringing up a
+  second machine used to mean rediscovering the first's whole WARN-verdict allow
+  set one failed install at a time. `export [--json]` dumps the set as a portable
+  JSON document (`schema: safe-host-allow-export/1`) — `name@version`, ecosystem,
+  the public registry integrity hash, reason, and date; no secrets. `import
+  <file> [--dry-run]` applies a reviewed set in one explicit operator-run action:
+  it is TTY-gated exactly like `add`/`update` (a real apply refuses non-TTY with
+  exit 102 and initializes no state before that gate; `--dry-run` is the
+  read-only preview an agent may run). It accepts only exact version pins — never
+  a range, dist-tag, or npm source spec (`file:`/`git+…`) — writes an entry only
+  when that exact version verifies against the registry (re-fetching integrity
+  rather than trusting the file's hash), never overwrites a divergent local pin,
+  and preserves each grant's original date. The allow set is deliberately not
+  auto-synced between machines — import keeps the human review in the loop.
+
 - **JVM/Maven dependencies are now OSV-covered, without command-gating.** `safe
   audit repo-audit` sweeps `pom.xml` and `gradle.lockfile` through OSV like any
   other lockfile, and `safe audit package-audit --ecosystem Maven <group:artifact>@<version>`
