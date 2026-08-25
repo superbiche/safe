@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Scanner discovery and OSV coverage stop misreporting two benign states as
+  breakage** (1.39.0). (1) A `tools.json` scanner cache that is empty (a
+  truncated write) or otherwise not a JSON object no longer poisons every audit
+  into "all scanners missing": `ensure_tools_file` normalizes it to `{}` before
+  any read or write, so a broken cache self-heals on the next run, and
+  `tool_cache_set` now validates its jq output before replacing the file —
+  previously jq read zero documents from a 0-byte cache, ran no filter, and
+  wrote an empty file while exiting 0, clobbering the cache for good.
+  `install.sh` guards the same clobber in its legacy-migration merge and
+  normalizes an imported empty/truncated `tools.json`. The cache is
+  re-derivable (detection re-probes), so overwriting a broken file loses
+  nothing. (2) A project whose lockfiles hold zero packages no longer reads as
+  `osv-scanner failed` (a degraded WARN indistinguishable from a finding):
+  osv-scanner exits nonzero with empty stdout and `No package sources found` on
+  stderr for a dependency-free scan, which safe now classifies as a clean empty
+  result, in both the machine-audit and repo-audit osv paths. The signal is the
+  same positive stderr phrase `osv_probe_format_support` already trusts; a real
+  crash prints a different error, so a future osv reword degrades safely to the
+  conservative "failed" and never suppresses a real error.
 - **`release-review` hardens three input paths against traversal, mis-mounting,
   and byte-order-decided verdicts** (defense-in-depth, no change to a verdict on
   any legitimate input). (1) A TUF trust target name that is absolute or carries

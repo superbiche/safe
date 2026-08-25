@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.3.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.38.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.39.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -339,10 +339,35 @@ seed_file_if_missing() {
   printf '%s\n' "$content" > "$path"
 }
 
+# A file holding exactly one top-level JSON object. `jq -e 'type=="object"'`
+# will NOT do: jq reads a STREAM of documents and bases -e on the last one, so
+# it accepts `[]\n{}` and other multi-object streams. A two-object tools.json
+# then makes `.[$m] = $entry` apply to every document and `tool_cache_path`
+# emit two newline-joined paths, which fail the executable check — the exact
+# scanner-missing symptom the cache guard exists to prevent. Slurp and assert a
+# single object instead.
+json_is_single_object() {
+  jq -e -s 'length == 1 and (.[0] | type == "object")' "$1" >/dev/null 2>&1
+}
+
+# tools.json is a re-derivable cache of per-machine scanner paths; detection
+# re-probes whatever it does not find, so overwriting a broken cache loses
+# nothing. A file that is absent, empty (a truncated write), or not a single
+# JSON object breaks every jq cache op — and `seed_file_if_missing` guarded only
+# absence, so a 0-byte file (an interrupted `mv`) silently poisoned every audit
+# into "all scanners missing" with no recovery but a hand-edit. Normalize the
+# cache here, before any read or write, so a poisoned file self-heals on the
+# next run. `json_is_single_object` rejects empty, garbage, non-object (`[]`)
+# and multi-document streams alike, so one predicate covers every broken shape.
+ensure_tools_file() {
+  json_is_single_object "$TOOLS_FILE" && return 0
+  printf '%s\n' '{}' > "$TOOLS_FILE"
+}
+
 ensure_dirs() {
   mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$RESULTS_DIR" "$SBOM_DIR" "$CHECKS_DIR" "$IOC_DIR" "$IOC_CATALOG_DIR" "$TOOL_BUNDLE_DIR"
   seed_file_if_missing "$MACHINES_FILE" "$(default_machines_json)"
-  seed_file_if_missing "$TOOLS_FILE" '{}'
+  ensure_tools_file
   touch "$HOST_ALLOW_LOG"
 }
 
@@ -617,9 +642,21 @@ tool_cache_set() {
   local machine="$1"
   local entry_json="$2"
   local tmp
+  # Normalize first: on a 0-byte cache jq reads zero documents, never runs the
+  # filter, and writes an EMPTY file while exiting 0 — so a check on jq's exit
+  # status passes on the exact input that poisons the cache, and the empty
+  # output then clobbers tools.json for good. Validate the OUTPUT is an object
+  # instead, and only then replace; a failure here is a real anomaly (a full
+  # disk, a broken jq), so surface it rather than leave a half-written cache.
+  ensure_tools_file
   tmp=$(mktemp)
-  jq --arg m "$machine" --argjson entry "$entry_json" '.[$m] = $entry' "$TOOLS_FILE" > "$tmp"
-  mv "$tmp" "$TOOLS_FILE"
+  if jq --arg m "$machine" --argjson entry "$entry_json" '.[$m] = $entry' "$TOOLS_FILE" > "$tmp" \
+     && json_is_single_object "$tmp"; then
+    mv "$tmp" "$TOOLS_FILE"
+  else
+    rm -f "$tmp"
+    die "failed to update the scanner cache ($TOOLS_FILE)"
+  fi
 }
 
 build_tool_entry_json() {
@@ -1385,6 +1422,20 @@ osv_scan_output_valid() {
   jq -e 'type == "object" and ((.results? // null) | type == "array")' "$output" >/dev/null 2>&1
 }
 
+# osv-scanner exits nonzero with empty stdout when every lockfile it read held
+# zero packages — a dependency-free project, which is clean, not a failure. It
+# says so on stderr ("No package sources found"), the same positive signal
+# osv_probe_format_support reads as a healthy extractor; a real crash (an
+# unreadable format, a missing path) prints a different error and never this
+# phrase. Keying on the phrase means a future osv reword degrades SAFELY to
+# today's conservative "osv-scanner failed" — it can never suppress a real
+# error, only miss this clean case. Without it a project with no dependencies
+# reads as a degraded scan (WARN), indistinguishable from a real finding.
+osv_stderr_zero_packages() {
+  local stderr_file="$1"
+  [[ -f "$stderr_file" ]] && grep -qF 'No package sources found' "$stderr_file"
+}
+
 # osv-scanner picks an extractor by filename, and a file it has no extractor
 # for is fatal for the WHOLE batch: exit 127, empty stdout, every sibling it
 # already extracted discarded with it. Two files discovery finds hit that —
@@ -1490,6 +1541,12 @@ osv_scan_lockfiles_individually() {
     set -e
     if osv_scan_output_valid "$part"; then
       parts+=("$part")
+    elif osv_stderr_zero_packages "$part.stderr"; then
+      # A 0-package lockfile among the batch: it contributes no results but is
+      # not a coverage loss, so it merges as an empty valid part rather than
+      # being reported as a file the rescan could not read.
+      printf '{"results":[]}\n' > "$part"
+      parts+=("$part")
     else
       vinfo "$machine: osv-scanner rescan failed for $(printf '%q' "$lf") (exit $rc)"
       OSV_RESCAN_FAILED+=("$lf")
@@ -1556,6 +1613,13 @@ osv_scan_lockfiles() {
   # empty scan when validity was only checked inside the nonzero branch.
   if osv_scan_output_valid "$output"; then
     [[ "$rc" -eq 0 ]] || vinfo "$machine: osv-scanner exited $rc after producing valid JSON; keeping result"
+  elif osv_stderr_zero_packages "$output.stderr"; then
+    # Checked before the rescan: an all-zero-package batch fails the per-file
+    # rescan too (each part is the same empty non-JSON), which would land it in
+    # the failure branch below. A clean empty result, no error, no partial —
+    # translation-dropped files are still annotated further down.
+    vinfo "$machine: osv-scanner found 0 packages in the scanned lockfiles; clean empty result"
+    printf '{"results":[]}\n' > "$output"
   elif [[ "${#scannable[@]}" -gt 1 ]] && osv_scan_lockfiles_individually "$machine" "$osv" "$output" "${scannable[@]}"; then
     vinfo "$machine: osv-scanner batch produced no usable JSON (exit $rc); recovered by scanning each lockfile on its own"
   else
@@ -4178,28 +4242,43 @@ if command -v osv-scanner >/dev/null 2>&1 && [[ "${#scannable[@]}" -gt 0 ]]; the
   # side: a nonzero exit with good JSON means findings, and a zero exit with
   # no JSON is still a lost tier.
   if ! jq -e 'type == "object" and ((.results? // null) | type == "array")' "$scratch/osv.json" >/dev/null 2>&1; then
-    parts=()
-    failed=()
-    index=0
-    for lf in "${scannable[@]}"; do
-      part="$scratch/osv.part.$index"
-      index=$((index + 1))
-      set +e
-      osv-scanner scan source --format json "--lockfile=$lf" > "$part" 2>"$part.stderr"
-      set -e
-      if jq -e 'type == "object" and ((.results? // null) | type == "array")' "$part" >/dev/null 2>&1; then
-        parts+=("$part")
-      else
-        failed+=("$lf")
-      fi
-    done
-    if [[ "${#parts[@]}" -gt 0 ]] && jq -s '{results: (map(.results // []) | add // [])}' "${parts[@]}" > "$scratch/osv.merged" 2>/dev/null; then
-      mv "$scratch/osv.merged" "$scratch/osv.json"
-      dropped+=(${failed[@]+"${failed[@]}"})
+    # This is a generated, single-quoted heredoc shipped to run standalone on a
+    # remote host, so it CANNOT call osv_stderr_zero_packages (defined only in
+    # the parent dispatcher). The benign-zero-packages test is inlined here as
+    # the same literal grep the parent's helper uses; the two must stay in sync
+    # (a regression over this generated helper guards against divergence).
+    if grep -qF 'No package sources found' "$scratch/osv.stderr" 2>/dev/null; then
+      # Every scanned lockfile held zero packages: a clean, dependency-free
+      # project, not a lost tier. Mirrors the orchestrator-side handling so the
+      # two osv paths cannot disagree about what an empty scan means.
+      printf '{"results":[]}\n' > "$scratch/osv.json"
     else
-      rm -f "$scratch/osv.merged"
-      printf '{"results":[],"error":"osv-scanner failed"}\n' > "$scratch/osv.json"
-      dropped=()
+      parts=()
+      failed=()
+      index=0
+      for lf in "${scannable[@]}"; do
+        part="$scratch/osv.part.$index"
+        index=$((index + 1))
+        set +e
+        osv-scanner scan source --format json "--lockfile=$lf" > "$part" 2>"$part.stderr"
+        set -e
+        if jq -e 'type == "object" and ((.results? // null) | type == "array")' "$part" >/dev/null 2>&1; then
+          parts+=("$part")
+        elif grep -qF 'No package sources found' "$part.stderr" 2>/dev/null; then
+          printf '{"results":[]}\n' > "$part"
+          parts+=("$part")
+        else
+          failed+=("$lf")
+        fi
+      done
+      if [[ "${#parts[@]}" -gt 0 ]] && jq -s '{results: (map(.results // []) | add // [])}' "${parts[@]}" > "$scratch/osv.merged" 2>/dev/null; then
+        mv "$scratch/osv.merged" "$scratch/osv.json"
+        dropped+=(${failed[@]+"${failed[@]}"})
+      else
+        rm -f "$scratch/osv.merged"
+        printf '{"results":[],"error":"osv-scanner failed"}\n' > "$scratch/osv.json"
+        dropped=()
+      fi
     fi
   fi
   if [[ "${#dropped[@]}" -gt 0 ]]; then

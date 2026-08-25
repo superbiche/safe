@@ -77,6 +77,18 @@ fi
 if [[ -n "${SAFE_TEST_OSV_CALLS:-}" ]]; then
   printf '%s\n' "${lockfiles[*]}" >> "$SAFE_TEST_OSV_CALLS"
 fi
+# A dependency-free scan: the real scanner exits nonzero with empty stdout and
+# says so on stderr. safe must read this as clean, not as a failed tier.
+if [[ -n "${SAFE_TEST_OSV_ZERO_PACKAGES:-}" ]]; then
+  printf 'Scanned lockfiles and found 0 packages\nNo package sources found, --help for usage information.\n' >&2
+  exit 128
+fi
+# A genuine crash that happens to share the 0-package exit code but NOT the
+# benign phrase: the fail-safe must still read this as a failure.
+if [[ -n "${SAFE_TEST_OSV_CRASH:-}" ]]; then
+  printf 'panic: unexpected internal error\n' >&2
+  exit 128
+fi
 if [[ -n "${SAFE_TEST_OSV_EMPTY_BATCH:-}" && "${#lockfiles[@]}" -gt 1 ]]; then
   exit 0
 fi
@@ -300,6 +312,93 @@ case_every_lockfile_unreadable_is_an_error_not_a_clean_scan() {
   fi
 }
 
+# --- a dependency-free scan is clean, not a failed tier ---------------------
+
+case_zero_package_project_reads_clean_not_degraded() {
+  # A project whose lockfiles hold no packages: osv-scanner exits nonzero with
+  # empty stdout and "No package sources found". safe used to fail the whole
+  # tier on it (status "error" -> a WARN indistinguishable from a real finding);
+  # it must read as a clean, covered scan. Exercises the repo-audit osv path.
+  local dir result status note
+  dir="$(make_project zero-pkg deploy/package-lock.json)"
+  result="$(audit_project "$dir" SAFE_TEST_OSV_ZERO_PACKAGES=1)"
+  status="$(jq -r '.tool_status["osv-scanner"].status // "absent"' "$result" 2>/dev/null || printf 'absent')"
+  note="$(jq -r '.tool_status["osv-scanner"].note // ""' "$result" 2>/dev/null || printf '')"
+  if [[ "$status" == "ok" ]] && ! grep -q 'degraded coverage' "$dir/audit.log"; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (status=$status note=$note)"
+  fi
+}
+
+case_zero_package_exit_without_the_benign_phrase_still_fails() {
+  # The fail-safe: the clean classification keys on the stderr phrase, never on
+  # the exit code. A crash that shares the 0-package exit code but not the
+  # phrase must still read as a failure, so a future osv reword degrades to
+  # conservative-failed rather than silently passing a broken scan as clean.
+  local dir result status
+  dir="$(make_project osv-crash deploy/package-lock.json)"
+  result="$(audit_project "$dir" SAFE_TEST_OSV_CRASH=1)"
+  status="$(jq -r '.tool_status["osv-scanner"].status // "absent"' "$result" 2>/dev/null || printf 'absent')"
+  if [[ "$status" == "error" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (status=$status)"
+  fi
+}
+
+case_remote_direct_helper_reads_zero_packages_clean() {
+  # The generated SSH helper (remote_scan_helper_script) is a self-contained
+  # single-quoted heredoc that runs standalone on a remote host, so it CANNOT
+  # call osv_stderr_zero_packages (defined only in the parent dispatcher). The
+  # benign-zero-packages check must be inlined there, or a dependency-free
+  # remote machine-audit reads "osv-scanner failed". This runs the actual
+  # generated helper end-to-end and also guards against the two copies diverging.
+  local dir helper out
+  dir="$(make_project remote-zero package-lock.json)"
+  helper="$TEST_ROOT/remote-helper.sh"
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+    bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; remote_scan_helper_script' > "$helper"
+  # A CALL to the parent-only predicate, not a comment mentioning it: strip
+  # full-line comments before checking so the heredoc's own explanatory comment
+  # does not trip the guard.
+  if grep -vE '^[[:space:]]*#' "$helper" | grep -q 'osv_stderr_zero_packages'; then
+    fail "$FUNCNAME (helper calls parent-only osv_stderr_zero_packages — the two copies diverged)"
+    return
+  fi
+  out="$TEST_ROOT/remote-out"; rm -rf "$out"; mkdir -p "$out"
+  SAFE_AUDIT_SCANNER_DIR="$MOCKBIN" SAFE_TEST_OSV_ZERO_PACKAGES=1 \
+    bash "$helper" "$dir" 2>/dev/null | tar -C "$out" -xz 2>/dev/null || true
+  if jq -e '.results == [] and (has("error") | not)' "$out/osv.json" >/dev/null 2>&1; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (osv.json=$(cat "$out/osv.json" 2>/dev/null || printf '<none>'))"
+  fi
+}
+
+case_orchestrator_single_zero_package_lockfile_is_clean() {
+  # The machine-audit path (osv_scan_lockfiles): a single 0-package lockfile
+  # never reaches the per-file rescan (which runs only for >1 file), so the
+  # batch benign check is all that stands between it and "osv-scanner failed".
+  local work="$TEST_ROOT/osv-direct"
+  mkdir -p "$work"
+  printf '{}\n' > "$work/package-lock.json"
+  local out="$work/osv.json"
+  PATH="$MOCKBIN:$PATH" \
+  HOME="$TEST_ROOT/home" \
+  SAFE_AUDIT_CONFIG_DIR="$TEST_ROOT/config-osv-direct" \
+  SAFE_AUDIT_DATA_DIR="$TEST_ROOT/data-osv-direct" \
+  SAFE_TEST_OSV_ZERO_PACKAGES=1 \
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+  OSV_OUT="$out" LF="$work/package-lock.json" \
+    bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; osv_scan_lockfiles local "$OSV_OUT" "$LF"' >/dev/null 2>&1 || true
+  if jq -e 'type == "object" and .results == [] and (has("error") | not) and (has("partial") | not)' "$out" >/dev/null 2>&1; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (osv.json=$(cat "$out" 2>/dev/null || printf '<none>'))"
+  fi
+}
+
 # --- a coverage gap is not a broken scanner ---------------------------------
 
 # bin/safe's install gate decides "scanner broken" — exit 100, unacceptable
@@ -514,6 +613,10 @@ case_a_clean_project_does_not_claim_degradation
 case_batch_failure_falls_back_to_scanning_each_lockfile
 case_batch_failure_keeps_the_readable_results
 case_every_lockfile_unreadable_is_an_error_not_a_clean_scan
+case_zero_package_project_reads_clean_not_degraded
+case_zero_package_exit_without_the_benign_phrase_still_fails
+case_orchestrator_single_zero_package_lockfile_is_clean
+case_remote_direct_helper_reads_zero_packages_clean
 case_a_coverage_gap_under_a_failure_named_path_is_not_scanner_breakage
 case_both_kinds_of_lost_coverage_are_reported_together
 case_zero_exit_with_no_output_is_not_a_clean_scan
