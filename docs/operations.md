@@ -132,7 +132,6 @@ zsh -n lib/install-wrappers.zsh lib/completions/_safe
 bash tests/integration/dispatcher.sh
 bash tests/install/run.sh
 bash tests/audit/smoke.sh
-bash tests/audit/external_binary.sh
 bash tests/run/safe_audit_integration.sh
 git diff --check
 ```

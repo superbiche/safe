@@ -922,7 +922,16 @@ doctor_payload_json() {
   elif [[ "$capability_release_review" != "true" ]]; then
     release_review_json=$(doctor_feature_json false false)
   else
+    # release-review runs entirely inside safe-core, which refuses every review
+    # without a matching engine, so a missing or version-mismatched safe-core
+    # gates readiness before the per-check tools do. cosign (signature + tuf)
+    # and podman (exec) are the tools its checks shell out to.
     local rr_missing=()
+    if [[ "$(jq -r '.present' <<<"$core_safe_core_json")" != "true" ]]; then
+      rr_missing+=("safe-core")
+    elif [[ "$(jq -r '.version // empty' <<<"$core_safe_core_json")" != "$SAFE_VERSION" ]]; then
+      rr_missing+=("safe-core@${SAFE_VERSION}")
+    fi
     [[ "$has_cosign" == "true" ]] || rr_missing+=("cosign")
     [[ "$has_podman" == "true" ]] || rr_missing+=("podman")
     if [[ ${#rr_missing[@]} -eq 0 ]]; then

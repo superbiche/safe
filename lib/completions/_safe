@@ -44,7 +44,7 @@ _safe_audit() {
   capabilities_opts=(--json)
   ioc_opts=(--all --machine --list --update --since)
   binary_audit_subcmds=(release-review)
-  release_review_opts=(--spec --versions --json)
+  release_review_opts=(--spec --versions)
 
   case "$subcmd" in
     machine-audit) _describe -t options 'machine-audit option' machine_audit_opts ;;

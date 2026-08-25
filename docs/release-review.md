@@ -65,9 +65,11 @@ discovering them from a refusal. They are what `safe-core release-review
 --versions` prints, and `tests/audit/release_review_forward.sh` fails if the
 two ever disagree.
 
-The six `binary-audit` sub-lanes stay advertised beside the composite. They are
-still callable, and a capability key is withdrawn when its command is deleted,
-not when a successor lands.
+The six `binary-audit` sub-lanes the composite replaced (`release github`,
+`vuln github-release`, the three `verify` lanes and `exec`) are deleted, and
+their capability keys are withdrawn with them — a key is a promise the command
+behind it exists. `binary-audit.release-review` is the one remaining
+binary-audit capability.
 
 ## Invocation
 
