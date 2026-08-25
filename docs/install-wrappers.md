@@ -196,9 +196,14 @@ non-interactive shell. Non-critical scan failures warn and continue, and a
 scanner that ran and failed is named in that warning rather than passing
 silently: the install proceeds, but what was not checked is said out loud. The
 same holds when no verdict can be read at all — an unwritable result
-destination, or a scan that failed outright: the preflight says the project was
-not audit-gated instead of treating silence as a clean result, and it never
-describes infrastructure breakage as a vulnerability finding.
+destination, or a scan that produced no readable document: the preflight says
+the project was not audit-gated instead of treating silence as a clean result,
+and it never describes infrastructure breakage as a vulnerability finding. A
+scan that fails **outright** (a non-zero exit — required scanners missing is the
+common case) is audit-infrastructure breakage: an interactive shell says so and
+proceeds, but a non-interactive shell has no operator to weigh that and refuses
+with exit 100, mirroring the projected-dependency scan guard rather than letting
+an unaudited install through.
 
 ## Wrapped Package Installs
 

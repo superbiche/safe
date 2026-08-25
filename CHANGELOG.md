@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **A non-interactive install gate now fails closed when the project audit
+  cannot run.** The install preflight (`safe_gate_scan_project`) already refused
+  critical findings in a non-TTY shell (exit 102); a scan that failed *outright*
+  — most commonly required scanners missing, which returns a non-zero exit — was
+  the one no-verdict path that still warned and proceeded. In a non-interactive
+  shell there is no operator to weigh that warning, so it now refuses with exit
+  100 ("audit-infrastructure breakage, not a package finding; fix the scanner and
+  retry"), mirroring the projected-dependency scan guard. Interactive shells are
+  unchanged: the operator still sees the warning and proceeds. Scope note: this
+  is the missing-scanner / outright-failure path only; the sibling no-verdict
+  sites (an unwritable result destination, or a scan that exits 0 with an
+  unreadable document) still warn-and-proceed and are parked to the audit lane.
+
 - **`safe run host-allow export` / `import` replicate a reviewed allow set to a
   fresh machine.** The host-allow set is per-machine by design, so bringing up a
   second machine used to mean rediscovering the first's whole WARN-verdict allow
