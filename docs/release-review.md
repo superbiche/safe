@@ -458,12 +458,13 @@ is a GitHub it could not read, which is `ERROR` — see
 | `high_risk_pattern_invalid` | ERROR | `error` | `SAFE_AUDIT_GITHUB_HIGH_RISK_PATH_REGEX` does not compile, so no path was classified |
 | `metadata_unavailable` | ERROR | `endpoint` | GitHub could not be read — a transport failure, a timeout, a 5xx, a rate limit, or a body that is not the JSON this check expects |
 
-The five endpoints are consulted independently and every answer is reported: a
+The six endpoints are consulted independently and every answer is reported: a
 release whose asset is missing *and* whose commit is unsigned says both, because
-a consumer who fixed only the first one reported would still be refused. Two
+a consumer who fixed only the first one reported would still be refused. Three
 lookups are conditional, because they have no question to ask otherwise: nothing
-is compared when no predecessor was resolved, and no commit is asked about when
-the tag resolved to none.
+is compared when no predecessor was resolved, an annotated tag is dereferenced
+only when the tag object is annotated rather than lightweight, and no commit is
+asked about when the tag resolved to none.
 
 `release_history_capped` and `release_history_truncated` are the same event told
 apart by whether it mattered. A cap that stopped a walk after everything needed
