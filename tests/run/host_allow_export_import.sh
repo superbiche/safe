@@ -52,6 +52,7 @@ case "$url" in
   *registry.npmjs.org/drift-pkg/9.9.9)    printf '{"version":"9.9.9","dist":{"integrity":"sha512-REGISTRY"}}\n' ;;
   *registry.npmjs.org/conflict-pkg/2.0.0) printf '{"version":"2.0.0","dist":{"integrity":"sha512-TWO"}}\n' ;;
   *registry.npmjs.org/range-pkg/1.x)      printf '{"version":"1.9.9","dist":{"integrity":"sha512-RANGE"}}\n' ;;
+  *pypi.org/pypi/epoch-pkg/1!2.0/json)    printf '{"info":{"version":"1!2.0"},"urls":[{"digests":{"sha256":"DEADBEEF"}}]}\n' ;;
   *) exit 22 ;;
 esac
 SH
@@ -127,7 +128,15 @@ rc=$?
 set -e
 [[ "$rc" != "0" ]] || fail "malformed host-allow file must fail export, not export empty"
 grep -q "malformed" <<<"$out" || fail "malformed-source error not legible: $out"
-pass "export refuses a malformed local trust file instead of emitting empty"
+# Boolean .packages must not slip through a `// {}` fallback as an empty export.
+printf '{"packages":false}\n' > "$tmp/config/host-allow.json"
+set +e
+out=$(run_safe_run host-allow export 2>&1)
+rc=$?
+set -e
+[[ "$rc" != "0" ]] || fail "boolean .packages must fail export, not export empty"
+grep -q "malformed" <<<"$out" || fail "boolean-source error not legible: $out"
+pass "export refuses a malformed local trust file (scalar and boolean) instead of emitting empty"
 
 # --- import --dry-run: read-only, runs non-TTY, seeds nothing (F5) ---------
 rm -rf "$tmp/bare"
@@ -180,6 +189,35 @@ if command -v python3 >/dev/null 2>&1; then
   [[ "$(jq -r '.packages["keep-pkg"].version' "$tmp/config/host-allow.json")" == "4.5.6" ]] || fail "import dropped keep-pkg"
   pass "TTY import stores the registry sha, preserves the reason, and preserves the original add date"
 
+  # --- import: a legal PEP440 epoch version is not falsely rejected (N1) ----
+  fresh_config
+  printf '{"packages":{}}\n' > "$tmp/config/host-allow.json"
+  cat > "$tmp/epoch.json" <<'JSON'
+{"schema":"safe-host-allow-export/1","exported":"2026-08-25","packages":{
+  "epoch-pkg":{"version":"1!2.0","sha":"sha256-DEADBEEF","ecosystem":"python","added":"2026-07-01","reason":"epoch pin"}
+}}
+JSON
+  cmd="SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' host-allow import '$tmp/epoch.json'"
+  out=$(pty_run "$cmd" 2>&1) || fail "TTY epoch import failed: $out"
+  [[ "$(jq -r '.packages["epoch-pkg"].version' "$tmp/config/host-allow.json")" == "1!2.0" ]] || fail "a legal PEP440 epoch pin must import: $out"
+  [[ "$(jq -r '.packages["epoch-pkg"].sha' "$tmp/config/host-allow.json")" == "sha256-DEADBEEF" ]] || fail "epoch import must store the pypi-verified sha"
+  pass "import accepts a legal PEP440 epoch version and verifies it against pypi"
+
+  # --- import: a calendar-invalid date falls back to today (N2) -------------
+  fresh_config
+  printf '{"packages":{}}\n' > "$tmp/config/host-allow.json"
+  cat > "$tmp/baddate.json" <<'JSON'
+{"schema":"safe-host-allow-export/1","exported":"2026-08-25","packages":{
+  "fresh-pkg":{"version":"1.2.3","sha":"sha512-FRESH","ecosystem":"npm","added":"2026-02-30","reason":"impossible date"}
+}}
+JSON
+  cmd="SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' host-allow import '$tmp/baddate.json'"
+  out=$(pty_run "$cmd" 2>&1) || fail "TTY bad-date import failed: $out"
+  stored_date=$(jq -r '.packages["fresh-pkg"].added' "$tmp/config/host-allow.json")
+  [[ "$stored_date" != "2026-02-30" ]] || fail "a calendar-invalid date must not be persisted"
+  [[ "$stored_date" == "$(date -I)" ]] || fail "invalid date must fall back to today (got $stored_date)"
+  pass "import rejects a calendar-invalid add date and stamps today instead"
+
   # --- import: a non-registry / non-exact spec never becomes a grant (F1) --
   fresh_config
   printf '{"packages":{}}\n' > "$tmp/config/host-allow.json"
@@ -212,6 +250,15 @@ JSON
   set -e
   [[ "$rc" != "0" ]] || fail "a scalar .packages must fail, not succeed empty"
   grep -q "malformed" <<<"$out" || fail "scalar .packages error not legible: $out"
+
+  # A boolean .packages must not pass a `// {}` fallback as an empty import.
+  printf '{"schema":"safe-host-allow-export/1","exported":"2026-08-25","packages":false}\n' > "$tmp/bool.json"
+  set +e
+  out=$(run_safe_run host-allow import "$tmp/bool.json" --dry-run </dev/null 2>&1)
+  rc=$?
+  set -e
+  [[ "$rc" != "0" ]] || fail "a boolean .packages must fail, not succeed empty"
+  grep -q "malformed" <<<"$out" || fail "boolean .packages error not legible: $out"
 
   cat > "$tmp/mixed-shape.json" <<'JSON'
 {"schema":"safe-host-allow-export/1","exported":"2026-08-25","packages":{

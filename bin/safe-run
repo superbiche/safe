@@ -1318,8 +1318,14 @@ HOST_ALLOW_EXPORT_SCHEMA="safe-host-allow-export/1"
 # charset alone rejects every source-spec and range operator (: / # ^ ~ > < =
 # | whitespace *).
 is_exact_version() {
+  # Permissive on purpose: begins with a digit and carries only version
+  # characters (npm semver plus PEP440's epoch `!` and local `+`), which
+  # excludes every source-spec and range operator (: / # ^ ~ > < = | space *)
+  # for a cheap pre-fetch rejection. It is NOT the authority on exactness —
+  # registry_verified_integrity's echo-back is; this only avoids false
+  # rejection of legal pins (e.g. the Python epoch `1!2.0`).
   local v="$1"
-  [[ "$v" =~ ^[0-9][A-Za-z0-9.+_-]*$ ]]
+  [[ "$v" =~ ^[0-9][A-Za-z0-9.+_!-]*$ ]]
 }
 
 # Fetch integrity for a version import intends to grant, verifying the registry
@@ -1364,7 +1370,10 @@ cmd_host_allow_export() {
     # A malformed local trust file is a legible error, never a silent empty
     # export. Project ONLY the declared portable fields so no legacy or
     # manually added key (e.g. behavioral_ack) leaks into the shared document.
-    jq -e '(.packages // {}) | type == "object" and all(.[]; type == "object")' \
+    # No `// {}`: jq's alternative treats false as absent, so `(.packages // {})`
+    # would let a boolean `.packages` masquerade as an empty set. Test the value
+    # directly, and only iterate once it is known to be an object.
+    jq -e '.packages | if type == "object" then all(.[]; type == "object") else false end' \
       "$HOST_ALLOW_FILE" >/dev/null 2>&1 \
       || die "host-allow file is malformed: $HOST_ALLOW_FILE"
     packages=$(jq -c '(.packages // {})
@@ -1392,9 +1401,10 @@ cmd_host_allow_import() {
   schema=$(jq -r '.schema // empty' "$file")
   [[ "$schema" == "$HOST_ALLOW_EXPORT_SCHEMA" ]] || \
     die "not a safe host-allow export (expected schema $HOST_ALLOW_EXPORT_SCHEMA); create one with: safe run host-allow export"
-  # The whole envelope is validated before any entry is applied: a scalar or
-  # array `.packages` must fail loudly, never masquerade as an empty import.
-  jq -e '(.packages // {}) | type == "object"' "$file" >/dev/null 2>&1 \
+  # The whole envelope is validated before any entry is applied: a scalar,
+  # array, or boolean `.packages` must fail loudly, never masquerade as an empty
+  # import. No `// {}` — jq's alternative treats false as absent.
+  jq -e '.packages | type == "object"' "$file" >/dev/null 2>&1 \
     || die "import file is malformed: .packages must be a JSON object"
 
   # A real apply writes trust entries: operator-TTY only, gated BEFORE any
@@ -1446,9 +1456,13 @@ cmd_host_allow_import() {
     if [[ -z "$reason" ]]; then
       warn "skip ${name}: entry carries no reason (audit trail required)"; skipped=$((skipped + 1)); continue
     fi
-    # Preserve the original grant date when it is a real date; otherwise let
-    # the writer stamp today rather than trust an arbitrary string.
-    [[ "$added_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || added_date=""
+    # Preserve the original grant date only when it is a REAL calendar date
+    # (shape plus `date -d` round-trip, so 2026-02-30 is rejected); otherwise
+    # let the writer stamp today rather than trust an arbitrary string.
+    if [[ ! "$added_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+       || [[ "$(date -d "$added_date" +%Y-%m-%d 2>/dev/null)" != "$added_date" ]]; then
+      added_date=""
+    fi
     normalized=$(normalize_and_validate_package_or_warn "$name" "$kind" "$name") || {
       skipped=$((skipped + 1)); continue; }
 
