@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- **`release-review` learns detached signature verification** (`spec_version`
+  → 2, 1.40.0). The `signature` check now accepts a detached
+  `certificate`+`signature` pair (the `<checksums>.pem` + `<checksums>.sig`
+  shape a release publishes beside its checksum file) alongside the existing
+  Sigstore `bundle`. The pair signs the **checksum file**, not the artifact, so
+  a verified detached signature vouches for an artifact through the digest the
+  `checksum` check matches against that same file: detached evidence therefore
+  requires the artifact to carry `evidence.checksum_file` and the `checksum`
+  check to be enabled, enforced at spec validation. This unblocks releases like
+  trufflehog that ship detached sigstore material and no bundle. `spec_version`
+  rose to 2, so a consumer preflighting the advertised
+  `binary-audit.release-review` capability must move in lockstep — a build
+  advertising `spec_version` 2 will refuse a `spec_version` 1 spec, and a
+  consumer pinned to 1 must bump before installing this release. Report
+  `schema_version` is unchanged (1): detached mode adds reason codes
+  (`certificate_missing`, `certificate_unreadable`, `signature_missing`,
+  `signature_unreadable`, `verification_infrastructure_unavailable`), not report
+  shape.
+- **A cosign trust-root outage no longer reads as a signature verdict**
+  (`release-review` signature check, 1.40.0). Detached verification needs a live
+  Sigstore-TUF and Rekor lookup that a bundle bakes in, so a review run while
+  those are unreachable would fail cosign with a network error. That is
+  audit-infrastructure breakage, not a signer the policy disallows: the cascade
+  now classifies cosign's own trust-bootstrap failure phrasing as
+  `verification_infrastructure_unavailable` (ERROR) and stops, at every probe,
+  rather than emitting a `signature_failure` BLOCK. The same classifier guards
+  the bundle path, where a cold trust-root cache with no network is the same
+  outage — closing a latent false-malice case there too. The classifier reads
+  only cosign's fatal error line and excludes its evidence-load and
+  identity-mismatch lines, so neither the non-fatal trusted-root warning nor the
+  caller-supplied evidence path or cert SAN that cosign echoes can steer a
+  genuine signature failure into it; an unrecognized fatal line falls through to
+  BLOCK (fail-closed). Detached mode uses
+  cosign's deprecated `--certificate`/`--signature` flags (a known risk, parked
+  with the feature; no bundle synthesis, and `--insecure-ignore-tlog` stays
+  rejected).
+
 - **Scanner discovery and OSV coverage stop misreporting two benign states as
   breakage** (1.39.0). (1) A `tools.json` scanner cache that is empty (a
   truncated write) or otherwise not a JSON object no longer poisons every audit

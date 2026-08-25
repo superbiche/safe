@@ -97,7 +97,8 @@ call `safe audit` for review signals before install.
 
 The review is one composite command: the installer writes a spec naming the
 release, its advisories, the downloaded artifact and its evidence (checksum,
-Sigstore bundle, TUF trust material), and calls the composite once:
+Sigstore bundle or detached certificate+signature, TUF trust material), and
+calls the composite once:
 
 ```bash
 safe audit capabilities --json

@@ -4,9 +4,105 @@ import (
 	"context"
 	"errors"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
 )
+
+// cosignOutcome is what one cosign probe amounts to. Three answers, not two: a
+// probe that verified, a probe that ran and rejected, and a probe that could
+// not run at all — the audit-infrastructure-breakage answer that must never be
+// read as a verdict about the release.
+type cosignOutcome int
+
+const (
+	cosignVerified cosignOutcome = iota
+	cosignRejected
+	cosignInfra
+)
+
+// probeOutcome carries one probe's classification alongside the raw output a
+// caller needs for its reason message and the timeout flag that tells a
+// deadline apart from an unreachable trust root.
+type probeOutcome struct {
+	output   string
+	timedOut bool
+	outcome  cosignOutcome
+}
+
+// classifyCosign turns a cosign run into one of the three outcomes. A clean
+// exit verified. A deadline, or output that names a trust-bootstrap network
+// failure, is infrastructure breakage. Everything else — a nonzero exit whose
+// output is about the certificate or signature — is a genuine rejection.
+func classifyCosign(timedOut bool, err error, output string) cosignOutcome {
+	switch {
+	case err == nil:
+		return cosignVerified
+	case timedOut || cosignInfraFailure(output):
+		return cosignInfra
+	default:
+		return cosignRejected
+	}
+}
+
+// cosignInfraFailure reports whether a failed cosign run failed because its own
+// trust bootstrap could not reach the network — the Sigstore TUF repository or
+// the Rekor transparency log — rather than because the evidence did not verify.
+//
+// Detached verification (certificate + signature, no bundle) needs a live Rekor
+// lookup and a fetched trusted root; a bundle embeds its inclusion proof and
+// only needs the trusted root, which cosign caches. Either way a cold cache
+// with no network fails here, and that is audit-infrastructure breakage with a
+// retry as its recovery — never a verdict about the release, which a BLOCK
+// would wrongly say.
+//
+// Only cosign's FATAL error line decides this. cosign prints the network
+// failure on its `Error:` / `error during command execution:` line; the
+// "Could not fetch trusted_root … Continuing with individual targets" line is a
+// non-fatal WARNING cosign emits even on runs that go on to verify or reject, so
+// matching a bare substring anywhere in combined output would convert a genuine
+// rejection that merely printed that warning into an ERROR. Scanning only fatal
+// lines also defuses the echo problem: cosign echoes the caller-supplied
+// certificate path and the certificate's SAN into its output, so a bare
+// substring match could be steered by an evidence path or SAN containing
+// `dial tcp`. Fatal lines about the evidence itself — a certificate that would
+// not load, or an identity that did not match — are excluded, so what remains is
+// the trust-bootstrap network chain and nothing an attacker controls. An
+// unrecognized fatal line falls through to the caller's rejection (BLOCK) — the
+// fail-closed direction — so a future cosign that rewords the bootstrap strings
+// degrades to over-blocking, never to a silent pass. The markers were captured
+// from a real offline cosign verify-blob run.
+func cosignInfraFailure(output string) bool {
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.ToLower(strings.TrimSpace(raw))
+		if !strings.HasPrefix(line, "error:") && !strings.HasPrefix(line, "error during command execution:") {
+			continue
+		}
+		// A fatal error about the evidence — a certificate or signature that
+		// would not load, or an identity that did not match — is a rejection,
+		// not infrastructure, even when the evidence path or SAN it echoes
+		// contains a network-shaped substring.
+		if strings.Contains(line, "loading cert") ||
+			strings.Contains(line, "loading signature") ||
+			strings.Contains(line, "none of the expected identities matched") {
+			continue
+		}
+		for _, marker := range []string{
+			"tuf refresh failed",
+			"getting rekor public keys",
+			"tuf remote mirror",
+			"network is unreachable",
+			"dial tcp",
+			"no such host",
+			"i/o timeout",
+		} {
+			if strings.Contains(line, marker) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // cosignSubprocessTimeout bounds every cosign invocation the composite makes.
 // A hung cosign — a wedged fetch to a signing-log backend, a process that never

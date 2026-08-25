@@ -33,7 +33,7 @@ func digestOf(content string) string {
 // reviewSpec builds a one-artifact checksum spec around real files on disk.
 func reviewSpec(t *testing.T, artifact, checksums string) string {
 	t.Helper()
-	spec := fmt.Sprintf(`{"spec_version":1,"subject":{"repo":"o/r","version":"v1.2.3"},
+	spec := fmt.Sprintf(`{"spec_version": 2,"subject":{"repo":"o/r","version":"v1.2.3"},
 	  "artifacts":[{"path":%q,"asset_name":"tool.tar.gz","evidence":{"checksum_file":%q}}],
 	  "checks":{"checksum":{"enabled":true}}}`, artifact, checksums)
 	return spec
@@ -68,7 +68,7 @@ func TestReleaseReviewSignedSpecStillWarns(t *testing.T) {
 	dir := t.TempDir()
 	artifact := writeReviewFile(t, dir, "tool.tar.gz", "payload")
 	checksums := writeReviewFile(t, dir, "checksums.txt", digestOf("payload")+"  tool.tar.gz\n")
-	spec := fmt.Sprintf(`{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},
+	spec := fmt.Sprintf(`{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},
 	  "artifacts":[{"path":%q,"asset_name":"tool.tar.gz","evidence":{"checksum_file":%q,
 	    "signature":{"bundle":"b","identity":"i","oidc_issuer":"https://example.test"}}}]}`, artifact, checksums)
 
@@ -230,17 +230,17 @@ func TestReleaseReviewUnusableSpec(t *testing.T) {
 		wantSub string
 	}{
 		{"not JSON", `not json`, "read spec"},
-		{"unknown field", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"x":1}`, `unknown field "x"`},
-		{"release enabled without an asset", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"release":{"enabled":true}}}`, "checks.release.asset is required"},
-		{"no checks enabled", `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{}}`, "no checks are enabled"},
+		{"unknown field", `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"x":1}`, `unknown field "x"`},
+		{"release enabled without an asset", `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"release":{"enabled":true}}}`, "checks.release.asset is required"},
+		{"no checks enabled", `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{}}`, "no checks are enabled"},
 		{
 			name:    "object appended after the spec",
-			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}]}{"unknown":true}`,
+			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}]}{"unknown":true}`,
 			wantSub: "exactly one JSON document",
 		},
 		{
 			name:    "spec_version given twice",
-			spec:    `{"spec_version":2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],"spec_version":1}`,
+			spec:    `{"spec_version":2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],"spec_version": 2}`,
 			wantSub: `"spec_version" is given more than once`,
 		},
 	}
@@ -329,7 +329,7 @@ func TestReleaseReviewVerifiedReleaseExitsZero(t *testing.T) {
 	checksums := writeReviewFile(t, dir, "checksums.txt", digestOf("payload")+"  tool.tar.gz\n")
 	bundle := writeReviewFile(t, dir, "tool.tar.gz.sigstore", `{"mediaType":"application/vnd.dev.sigstore.bundle+json"}`)
 
-	spec := fmt.Sprintf(`{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},
+	spec := fmt.Sprintf(`{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},
 	  "artifacts":[{"path":%q,"asset_name":"tool.tar.gz","evidence":{"checksum_file":%q,
 	    "signature":{"bundle":%q,"identity":"https://example.test/workflow",
 	                 "oidc_issuer":"https://token.actions.githubusercontent.com"}}}],
@@ -367,7 +367,7 @@ func TestReleaseReviewTUFSpecThroughTheCLI(t *testing.T) {
 	local := writeReviewFile(t, t.TempDir(), "trusted_root.json", target)
 	t.Setenv("MOCK_COSIGN_BRIDGE_ROOT", mirror)
 
-	spec := fmt.Sprintf(`{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},
+	spec := fmt.Sprintf(`{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},
 	  "artifacts":[{"path":%q,"asset_name":"root.json"}],
 	  "checks":{"tuf":{"enabled":true,"mirror":%q,"root":%q,"root_checksum":%q,
 	                   "targets":{"trusted_root.json":%q}}}}`,

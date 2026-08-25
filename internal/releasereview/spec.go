@@ -50,13 +50,20 @@ var implementedChecks = []string{CheckChecksum, CheckSignature, CheckRelease, Ch
 // release-review --versions` prints them, and safe-audit's capability payload
 // repeats them so a consumer can preflight a spec before writing one.
 const (
-	// SpecVersion is the only spec_version Decode accepts.
-	SpecVersion = 1
-	// ReportSchemaVersion is the schema_version every report carries.
+	// SpecVersion is the only spec_version Decode accepts. It rose to 2 when the
+	// signature check learned detached cert+signature evidence: the schema gained
+	// optional fields, so a consumer must be able to tell a build that understands
+	// them from one that would refuse them as unknown, and the advertised
+	// spec_version is that signal.
+	SpecVersion = 2
+	// ReportSchemaVersion is the schema_version every report carries. Detached
+	// evidence added reason codes, not report shape, so it stays 1: a consumer
+	// parses reasons by their (check, code) pair and a new code is data, not a
+	// schema change.
 	ReportSchemaVersion = 1
 )
 
-// Spec is a release review request, schema spec_version 1.
+// Spec is a release review request, schema spec_version 2.
 type Spec struct {
 	SpecVersion int        `json:"spec_version"`
 	Subject     Subject    `json:"subject"`
@@ -88,15 +95,34 @@ type Evidence struct {
 	Signature    *SignatureEvidence `json:"signature"`
 }
 
-// SignatureEvidence is a Sigstore bundle plus the identity policy it must
-// satisfy. It is validated whether or not the signature check is enabled: the
-// schema is contract, and evidence a disabled check would have read still has
-// to mean one thing.
+// SignatureEvidence is either a Sigstore bundle or a detached cert+signature
+// pair, plus the identity policy it must satisfy. It is validated whether or
+// not the signature check is enabled: the schema is contract, and evidence a
+// disabled check would have read still has to mean one thing.
+//
+// The two modes are mutually exclusive. Bundle names a Sigstore bundle that
+// signs the artifact itself and carries its own transparency-log proof.
+// Certificate and Signature are a detached pair — the shape a release that
+// publishes `<checksums>.pem` and `<checksums>.sig` beside its checksum file
+// ships — and they sign the artifact's checksum file, not the artifact: the
+// digest match the checksum check already performs is what carries the trust
+// the rest of the way to the artifact. Detached verification therefore vouches
+// for an artifact only in concert with an enabled checksum check, which
+// validateChecks enforces.
 type SignatureEvidence struct {
 	Bundle         string `json:"bundle"`
+	Certificate    string `json:"certificate"`
+	Signature      string `json:"signature"`
 	Identity       string `json:"identity"`
 	IdentityRegexp string `json:"identity_regexp"`
 	OIDCIssuer     string `json:"oidc_issuer"`
+}
+
+// isDetached reports whether this evidence is a detached cert+signature pair
+// rather than a Sigstore bundle. A validated spec guarantees the two are never
+// both set, so the absence of a bundle is what names the mode.
+func (s *SignatureEvidence) isDetached() bool {
+	return s.Bundle == ""
 }
 
 // Checks selects which checks run. An omitted block is a disabled check; an
@@ -221,8 +247,16 @@ func validateSignature(index int, signature *SignatureEvidence) error {
 	if signature == nil {
 		return nil
 	}
-	if signature.Bundle == "" {
-		return fmt.Errorf("artifacts[%d].evidence.signature.bundle is required", index)
+	hasBundle := signature.Bundle != ""
+	hasCert := signature.Certificate != ""
+	hasSig := signature.Signature != ""
+	switch {
+	case hasBundle && (hasCert || hasSig):
+		return fmt.Errorf("artifacts[%d].evidence.signature: a bundle and a detached certificate/signature are mutually exclusive", index)
+	case !hasBundle && !hasCert && !hasSig:
+		return fmt.Errorf("artifacts[%d].evidence.signature: a bundle, or a detached certificate and signature, is required", index)
+	case !hasBundle && !(hasCert && hasSig):
+		return fmt.Errorf("artifacts[%d].evidence.signature: detached verification requires both certificate and signature", index)
 	}
 	if signature.OIDCIssuer == "" {
 		return fmt.Errorf("artifacts[%d].evidence.signature.oidc_issuer is required", index)
@@ -268,6 +302,9 @@ func (s *Spec) validateChecks() error {
 			if !s.anySignatureEvidence() {
 				return fmt.Errorf("check %q is enabled but no artifact carries evidence.signature", CheckSignature)
 			}
+			if err := s.validateDetachedVouching(enabled); err != nil {
+				return err
+			}
 		case CheckRelease:
 			if err := s.Checks.Release.validate(); err != nil {
 				return err
@@ -301,6 +338,39 @@ func (s *Spec) anySignatureEvidence() bool {
 		}
 	}
 	return false
+}
+
+// validateDetachedVouching enforces what detached evidence needs to mean
+// anything. A Sigstore bundle signs the artifact, so a bundle that verifies
+// vouches for the artifact on its own. A detached certificate and signature
+// sign the artifact's checksum file, so their verifying vouches for the
+// artifact only by way of the digest the checksum check matches against that
+// same file: without an enabled checksum check the artifact's link to the
+// signed material is never exercised, and a top-level GO would rest on nothing.
+// So a detached artifact must carry a checksum file, and the checksum check
+// must be enabled to consume it. Bundle evidence is untouched by this.
+func (s *Spec) validateDetachedVouching(enabled []setting) error {
+	checksumEnabled := false
+	for _, check := range enabled {
+		if check.ID == CheckChecksum {
+			checksumEnabled = true
+			break
+		}
+	}
+	for i := range s.Artifacts {
+		artifact := &s.Artifacts[i]
+		signature := artifact.Evidence.Signature
+		if signature == nil || !signature.isDetached() {
+			continue
+		}
+		if !checksumEnabled {
+			return fmt.Errorf("artifacts[%d].evidence.signature is detached (certificate+signature), which signs the checksum file — enable the checksum check so the digest match ties it to the artifact", i)
+		}
+		if artifact.Evidence.ChecksumFile == "" {
+			return fmt.Errorf("artifacts[%d].evidence.signature is detached, which signs the checksum file, but the artifact carries no evidence.checksum_file", i)
+		}
+	}
+	return nil
 }
 
 // normalize validates the TUF block and rewrites the two fields the check

@@ -10,8 +10,10 @@ import (
 	"strings"
 )
 
-// signature verifies each artifact's Sigstore bundle with cosign and reports
-// which artifacts a signer policy actually vouched for.
+// signature verifies each artifact's signing evidence with cosign — a Sigstore
+// bundle over the artifact, or a detached certificate+signature over its
+// checksum file — and reports which artifacts a signer policy actually vouched
+// for.
 //
 // The returned map holds the indices cosign verified, keyed by index because a
 // spec may repeat an asset name or a path. It is what lets the checksum check
@@ -33,7 +35,7 @@ func signature(spec Spec) (CheckResult, map[int]bool) {
 	// per-artifact findings that are still collected below.
 	if !cosignAvailable && spec.anySignatureEvidence() {
 		result.add(ERROR, "tool_missing",
-			"cosign is required to verify Sigstore bundles — install cosign", nil)
+			"cosign is required to verify signatures — install cosign", nil)
 	}
 
 	for index, artifact := range spec.Artifacts {
@@ -56,43 +58,16 @@ func signature(spec Spec) (CheckResult, map[int]bool) {
 		evidence := artifact.Evidence.Signature
 		if evidence == nil {
 			result.add(WARN, "no_signature_evidence",
-				fmt.Sprintf("no signature bundle was provided for %s", name), data)
+				fmt.Sprintf("no signature evidence was provided for %s", name), data)
 			continue
 		}
 
-		bundleData := map[string]string{"artifact": name, "bundle": evidence.Bundle}
-		bundleUsable := false
-		bundleProbe, bundleErr := probeRegularFile(evidence.Bundle)
-		switch bundleProbe {
-		case fileAbsent:
-			result.add(BLOCK, "bundle_missing",
-				fmt.Sprintf("signature bundle for %s is not at %s", name, evidence.Bundle), bundleData)
-		case fileUnusable:
-			result.add(ERROR, "bundle_unreadable",
-				fmt.Sprintf("could not read the signature bundle for %s", name),
-				map[string]string{"artifact": name, "bundle": evidence.Bundle, "error": bundleErr})
-		default:
-			// Parsed natively rather than by shelling out to jq the way the bash
-			// lane does: a bundle that is not JSON cannot be a bundle, and the
-			// finding is the same without the dependency.
-			content, readErr := os.ReadFile(evidence.Bundle)
-			switch {
-			case readErr != nil:
-				result.add(ERROR, "bundle_unreadable",
-					fmt.Sprintf("could not read the signature bundle for %s", name),
-					map[string]string{"artifact": name, "bundle": evidence.Bundle, "error": readErr.Error()})
-			case !json.Valid(content):
-				result.add(BLOCK, "bundle_invalid",
-					fmt.Sprintf("signature bundle for %s is not valid JSON", name), bundleData)
-			default:
-				bundleUsable = true
-			}
-		}
+		blobPath, evidenceArgs, evidenceUsable := signatureInputs(&result, artifact, evidence)
 
-		if artifactProbe != fileOK || !bundleUsable || !cosignAvailable {
+		if artifactProbe != fileOK || !evidenceUsable || !cosignAvailable {
 			continue
 		}
-		if verifyArtifact(&result, artifact, evidence) {
+		if verifyArtifact(&result, name, blobPath, evidenceArgs, evidence) {
 			verified[index] = true
 		}
 	}
@@ -100,16 +75,128 @@ func signature(spec Spec) (CheckResult, map[int]bool) {
 	return result, verified
 }
 
+// signatureInputs probes one artifact's signature evidence and returns what
+// cosign will verify: the blob to check and the cosign flags that carry the
+// evidence. usable is false when a reason was added and verification must not
+// run.
+//
+// The two modes probe different files. A Sigstore bundle is a JSON document
+// that signs the artifact, so it is read and its JSON validity is a fact about
+// the evidence, and the blob cosign checks is the artifact. A detached
+// certificate and signature are opaque text — cosign, not this package, parses
+// them — that sign the artifact's checksum file, so only their presence and
+// readability are checked here and the blob is that checksum file. A detached
+// blob that is missing is left to the checksum check, which owns that finding;
+// verification is skipped rather than reported a second time.
+func signatureInputs(result *CheckResult, artifact Artifact, evidence *SignatureEvidence) (blobPath string, evidenceArgs []string, usable bool) {
+	name := artifact.AssetName
+
+	if evidence.isDetached() {
+		certOK := probeEvidenceFile(result, name, "certificate", evidence.Certificate)
+		sigOK := probeEvidenceFile(result, name, "signature", evidence.Signature)
+		if !certOK || !sigOK {
+			return "", nil, false
+		}
+		// The detached pair signs the checksum file, so cosign reads it as the
+		// blob. It is read here for the same reason the cert and signature are:
+		// a stat-only check would let an unreadable blob reach cosign and fail as
+		// a BLOCK. A missing or unreadable blob is the checksum check's finding,
+		// so no reason is added here — verification is simply skipped.
+		if _, readErr := os.ReadFile(artifact.Evidence.ChecksumFile); readErr != nil {
+			return "", nil, false
+		}
+		return artifact.Evidence.ChecksumFile,
+			[]string{"--certificate", evidence.Certificate, "--signature", evidence.Signature},
+			true
+	}
+
+	bundleData := map[string]string{"artifact": name, "bundle": evidence.Bundle}
+	bundleProbe, bundleErr := probeRegularFile(evidence.Bundle)
+	switch bundleProbe {
+	case fileAbsent:
+		result.add(BLOCK, "bundle_missing",
+			fmt.Sprintf("signature bundle for %s is not at %s", name, evidence.Bundle), bundleData)
+		return "", nil, false
+	case fileUnusable:
+		result.add(ERROR, "bundle_unreadable",
+			fmt.Sprintf("could not read the signature bundle for %s", name),
+			map[string]string{"artifact": name, "bundle": evidence.Bundle, "error": bundleErr})
+		return "", nil, false
+	}
+	// Parsed natively rather than by shelling out to jq the way the bash lane
+	// does: a bundle that is not JSON cannot be a bundle, and the finding is the
+	// same without the dependency.
+	content, readErr := os.ReadFile(evidence.Bundle)
+	switch {
+	case readErr != nil:
+		result.add(ERROR, "bundle_unreadable",
+			fmt.Sprintf("could not read the signature bundle for %s", name),
+			map[string]string{"artifact": name, "bundle": evidence.Bundle, "error": readErr.Error()})
+		return "", nil, false
+	case !json.Valid(content):
+		result.add(BLOCK, "bundle_invalid",
+			fmt.Sprintf("signature bundle for %s is not valid JSON", name), bundleData)
+		return "", nil, false
+	}
+	return artifact.Path,
+		[]string{"--bundle", evidence.Bundle, "--new-bundle-format=true"},
+		true
+}
+
+// probeEvidenceFile checks that one detached evidence file exists and is
+// readable, adding a mode-appropriate reason when it is not. The codes mirror
+// the bundle path's split: an absent file is evidence about the release
+// (BLOCK), a present file that cannot be read is a broken review (ERROR).
+//
+// The read is not skippable. os.Stat succeeding does not mean os.ReadFile will:
+// a file that stats but cannot be read (permissions, a mid-review I/O error)
+// would otherwise reach cosign, whose local-I/O failure the cascade would
+// misclassify as a signature_failure BLOCK — reporting review breakage as
+// release malice. Reading the file here keeps that an ERROR. The bytes are
+// discarded; cosign, not this package, parses the certificate and signature.
+func probeEvidenceFile(result *CheckResult, name, kind, path string) bool {
+	probe, err := probeRegularFile(path)
+	switch probe {
+	case fileAbsent:
+		result.add(BLOCK, kind+"_missing",
+			fmt.Sprintf("signature %s for %s is not at %s", kind, name, path),
+			map[string]string{"artifact": name, kind: path})
+		return false
+	case fileUnusable:
+		result.add(ERROR, kind+"_unreadable",
+			fmt.Sprintf("could not read the signature %s for %s", kind, name),
+			map[string]string{"artifact": name, kind: path, "error": err})
+		return false
+	}
+	if _, readErr := os.ReadFile(path); readErr != nil {
+		result.add(ERROR, kind+"_unreadable",
+			fmt.Sprintf("could not read the signature %s for %s", kind, name),
+			map[string]string{"artifact": name, kind: path, "error": readErr.Error()})
+		return false
+	}
+	return true
+}
+
 // verifyArtifact runs the cosign cascade for one artifact and reports whether
-// the signer policy was satisfied.
+// the signer policy was satisfied. blobPath and evidenceArgs come from
+// signatureInputs and already encode which mode — bundle or detached — this
+// artifact carries; the cascade below is identical for both.
 //
 // The cascade is a direct port of the bash lane. A failed verification is only
-// half an answer: whether the bundle is unverifiable at all, or verifiable but
-// signed by the wrong identity or the wrong issuer, are three different
+// half an answer: whether the signature is unverifiable at all, or verifiable
+// but signed by the wrong identity or the wrong issuer, are three different
 // findings with three different follow-ups, so a failure is re-probed with
 // wildcards until the report can say which one it was.
-func verifyArtifact(result *CheckResult, artifact Artifact, evidence *SignatureEvidence) bool {
-	name := artifact.AssetName
+//
+// Three outcomes, not two, at every probe. cosign that answers "yes" is a
+// verification; cosign that answers "no" is a finding to narrow; cosign that
+// could not answer — a deadline, or a trust bootstrap that could not reach the
+// Sigstore TUF repository or Rekor — is audit-infrastructure breakage that
+// stops the cascade with an ERROR, never a BLOCK. The distinction matters most
+// on the detached path, whose verification needs a live Rekor lookup a bundle
+// carries with it: a Rekor outage there must read as breakage-to-retry, not as
+// a release signed by the wrong key.
+func verifyArtifact(result *CheckResult, name, blobPath string, evidenceArgs []string, evidence *SignatureEvidence) bool {
 	identityPolicy := []string{"--certificate-identity", evidence.Identity}
 	identityData := map[string]string{"artifact": name, "expected_identity": evidence.Identity}
 	if evidence.Identity == "" {
@@ -117,75 +204,74 @@ func verifyArtifact(result *CheckResult, artifact Artifact, evidence *SignatureE
 		identityData = map[string]string{"artifact": name, "expected_identity_regexp": evidence.IdentityRegexp}
 	}
 
-	// A cosign that runs past its deadline is audit-infrastructure breakage, not
-	// a verdict about the signature: it is reported ERROR and the cascade stops,
-	// because a tool that never answers cannot be re-probed into one.
-	reportTimeout := func() {
-		result.add(ERROR, "verification_timeout",
-			fmt.Sprintf("cosign did not finish verifying %s within %s", name, cosignSubprocessTimeout),
-			map[string]string{"artifact": name})
+	reportInfra := func(pr probeOutcome) {
+		if pr.timedOut {
+			result.add(ERROR, "verification_timeout",
+				fmt.Sprintf("cosign did not finish verifying %s within %s", name, cosignSubprocessTimeout),
+				map[string]string{"artifact": name})
+			return
+		}
+		result.add(ERROR, "verification_infrastructure_unavailable",
+			fmt.Sprintf("cosign could not verify %s because its trust bootstrap (Sigstore TUF or the Rekor transparency log) was unreachable — audit-infrastructure breakage, not a finding about the release; retry once connectivity returns", name),
+			map[string]string{"artifact": name, "detail": cosignSummary(pr.output, "cosign trust bootstrap unreachable")})
+	}
+	run := func(policy []string) probeOutcome {
+		output, timedOut, err := cosignVerifyBlob(blobPath, evidenceArgs, policy)
+		return probeOutcome{output: output, timedOut: timedOut, outcome: classifyCosign(timedOut, err, output)}
 	}
 
-	mainOutput, mainTimedOut, mainErr := cosignVerifyBlob(artifact.Path, evidence.Bundle,
-		append(identityPolicy, "--certificate-oidc-issuer", evidence.OIDCIssuer))
-	if mainTimedOut {
-		reportTimeout()
-		return false
-	}
-	if mainErr == nil {
+	main := run(append(identityPolicy, "--certificate-oidc-issuer", evidence.OIDCIssuer))
+	switch main.outcome {
+	case cosignVerified:
 		return true
-	}
-
-	_, anyTimedOut, anyErr := cosignVerifyBlob(artifact.Path, evidence.Bundle, []string{
-		"--certificate-identity-regexp", ".*",
-		"--certificate-oidc-issuer-regexp", ".*",
-	})
-	if anyTimedOut {
-		reportTimeout()
+	case cosignInfra:
+		reportInfra(main)
 		return false
 	}
-	if anyErr != nil {
-		// Nothing about the bundle verifies, so the identity probes below would
-		// only restate that.
+
+	any := run([]string{"--certificate-identity-regexp", ".*", "--certificate-oidc-issuer-regexp", ".*"})
+	switch any.outcome {
+	case cosignInfra:
+		reportInfra(any)
+		return false
+	case cosignRejected:
+		// Nothing about the signature verifies, so the identity probes below
+		// would only restate that.
 		result.add(BLOCK, "signature_failure",
-			summaryOr(mainOutput, fmt.Sprintf("cosign could not verify %s against its bundle", name)),
+			cosignSummary(main.output, fmt.Sprintf("cosign could not verify %s", name)),
 			map[string]string{"artifact": name})
 		return false
 	}
 
-	_, identityTimedOut, identityErr := cosignVerifyBlob(artifact.Path, evidence.Bundle,
-		append(identityPolicy, "--certificate-oidc-issuer-regexp", ".*"))
-	if identityTimedOut {
+	identity := run(append(identityPolicy, "--certificate-oidc-issuer-regexp", ".*"))
+	if identity.outcome == cosignInfra {
 		// The issuer probe is not launched: a tool that just failed to answer
-		// within its deadline cannot be re-probed into one, and starting it would
-		// only hold the review for another deadline without changing the ERROR.
-		reportTimeout()
+		// cannot be re-probed into one, and starting it would only hold the
+		// review for another deadline without changing the ERROR.
+		reportInfra(identity)
 		return false
 	}
-	_, issuerTimedOut, issuerErr := cosignVerifyBlob(artifact.Path, evidence.Bundle, []string{
-		"--certificate-identity-regexp", ".*",
-		"--certificate-oidc-issuer", evidence.OIDCIssuer,
-	})
-	if issuerTimedOut {
-		reportTimeout()
+	issuer := run([]string{"--certificate-identity-regexp", ".*", "--certificate-oidc-issuer", evidence.OIDCIssuer})
+	if issuer.outcome == cosignInfra {
+		reportInfra(issuer)
 		return false
 	}
 
 	identityMismatch := func() {
 		result.add(BLOCK, "identity_mismatch",
-			fmt.Sprintf("the bundle for %s is signed by an identity the policy does not allow", name),
+			fmt.Sprintf("the signature for %s is signed by an identity the policy does not allow", name),
 			identityData)
 	}
 	issuerMismatch := func() {
 		result.add(BLOCK, "issuer_mismatch",
-			fmt.Sprintf("the bundle for %s is signed under an OIDC issuer the policy does not allow", name),
+			fmt.Sprintf("the signature for %s is signed under an OIDC issuer the policy does not allow", name),
 			map[string]string{"artifact": name, "expected_oidc_issuer": evidence.OIDCIssuer})
 	}
 
 	switch {
-	case identityErr != nil && issuerErr == nil:
+	case identity.outcome == cosignRejected && issuer.outcome != cosignRejected:
 		identityMismatch()
-	case identityErr == nil && issuerErr != nil:
+	case identity.outcome != cosignRejected && issuer.outcome == cosignRejected:
 		issuerMismatch()
 	default:
 		// Both probes failed, or — a shape a multi-signature bundle can produce
@@ -199,9 +285,13 @@ func verifyArtifact(result *CheckResult, artifact Artifact, evidence *SignatureE
 	return false
 }
 
-func cosignVerifyBlob(artifact, bundle string, policy []string) (output string, timedOut bool, err error) {
-	args := append([]string{"verify-blob", "--bundle", bundle, "--new-bundle-format=true"}, policy...)
-	args = append(args, artifact)
+// cosignVerifyBlob runs one cosign verify-blob probe. evidenceArgs carries the
+// mode — `--bundle …` or `--certificate … --signature …` — and blobPath is the
+// file that evidence signs.
+func cosignVerifyBlob(blobPath string, evidenceArgs, policy []string) (output string, timedOut bool, err error) {
+	args := append([]string{"verify-blob"}, evidenceArgs...)
+	args = append(args, policy...)
+	args = append(args, blobPath)
 	return cosignRun(nil, args...)
 }
 
@@ -256,4 +346,28 @@ func summaryOr(text, fallback string) string {
 		return summary
 	}
 	return fallback
+}
+
+// cosignSummary reduces cosign's combined output to the line worth reporting.
+// Current cosign prints a deprecation notice for the detached
+// `--certificate`/`--signature` flags BEFORE the real result, so the naive
+// first line of a detached failure is "Flag --certificate has been
+// deprecated…", not the failure — misleading text on a verdict-bearing reason.
+// The deprecation lines are dropped, an `Error:`-prefixed line is preferred
+// when present, and the fallback covers a run that said nothing usable.
+func cosignSummary(output, fallback string) string {
+	firstUsable := ""
+	for _, line := range strings.Split(output, "\n") {
+		trimmed := strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+		if trimmed == "" || strings.HasPrefix(trimmed, "Flag --") || strings.Contains(trimmed, "has been deprecated") {
+			continue
+		}
+		if rest := strings.TrimPrefix(trimmed, "Error: "); rest != trimmed {
+			return summaryOr(rest, fallback)
+		}
+		if firstUsable == "" {
+			firstUsable = trimmed
+		}
+	}
+	return summaryOr(firstUsable, fallback)
 }
