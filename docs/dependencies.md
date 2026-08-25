@@ -28,6 +28,11 @@ ecosystems discovered in that project. Missing scanner coverage stops the scan b
 default; if you explicitly continue, the affected tool is shown as `skipped` and
 the result verdict is `WARN`.
 
+JVM projects (`pom.xml`, `gradle.lockfile`) are covered by **OSV-Scanner
+alone**: there is no dedicated JVM audit tool in the table above, and Socket has
+no Maven tier, so a JVM audit is OSV-only and deliberately not command-gated.
+See the JVM / Maven and Gradle section of [`safe audit`](safe-audit.md).
+
 After installing tools, ask `safe` to detect them:
 
 ```bash

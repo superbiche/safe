@@ -286,6 +286,28 @@ so one advisory seen by three scanners counts three times. The aggregate
 answers "is there a critical anywhere", which double counting cannot change;
 anything showing a number to a human shows the per-scanner breakdown instead.
 
+### JVM / Maven and Gradle
+
+JVM dependencies get **coverage without command-gating**. Gradle and Maven are
+declarative — dependencies resolve transitively at build time, with no discrete
+install verb to wrap the way `npm install <pkg>` is wrapped — so there is no
+PATH shim for `mvn` or `gradle`, and a JVM dependency add is not intercepted at
+install time. Coverage comes from the audit engine instead:
+
+- **`safe audit repo-audit`** sweeps `pom.xml` and `gradle.lockfile` through
+  OSV like any other lockfile, so a project scan covers JVM dependencies and
+  reports a verdict rather than silently skipping them.
+- **`safe audit package-audit --ecosystem Maven <group:artifact>@<version>`** is
+  the single-coordinate preflight; `Maven`, `maven`, and `gradle` all map to the
+  OSV `Maven` ecosystem.
+
+There is **no per-ecosystem JVM auditor** (no equivalent of `npm audit`), and
+**Socket has no Maven tier**, so a JVM audit is OSV-only: the behavioral tier
+degrades honestly to a disclosed skip (`Socket has no Maven tier`) — never a
+false `GO`, and never an infrastructure-outage signal. A qualified Maven version
+OSV cannot range-match (`1.0.0.RELEASE`, `2.5-RC1`) resolves to a WARN with a
+pin-an-exact-version hint rather than a silent pass.
+
 ### `--result-out <file>`
 
 Writes the result document to a caller-owned path. The published result lives
@@ -337,6 +359,7 @@ SAFE_AUDIT_GRYPE_DB_MAX_AGE_DAYS=14 safe audit machine-audit --machine remote-a 
 safe audit package-audit express@4.21.0 --ecosystem npm
 safe audit package-audit express --ecosystem npm            # unpinned: resolves the target first
 safe audit package-audit ruff@0.11.0 --ecosystem python --json
+safe audit package-audit org.apache.logging.log4j:log4j-core@2.17.1 --ecosystem Maven
 ```
 
 Checks are **version-aware**: the command first resolves the version the
