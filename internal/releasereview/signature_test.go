@@ -1,7 +1,9 @@
 package releasereview
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -10,7 +12,7 @@ import (
 // the shape the suppression cases need.
 func signatureSpec(artifact, bundle, checksums, identity, issuer string) Spec {
 	return Spec{
-		SpecVersion: 1,
+		SpecVersion: SpecVersion,
 		Subject:     Subject{Repo: "o/r", Version: "v1.2.3"},
 		Artifacts: []Artifact{{
 			Path:      artifact,
@@ -290,7 +292,7 @@ func TestSignatureToolMissingIsReportedOnce(t *testing.T) {
 	bundle := writeFile(t, dir, "b.sigstore", `{}`)
 
 	spec := Spec{
-		SpecVersion: 1,
+		SpecVersion: SpecVersion,
 		Subject:     Subject{Repo: "o/r", Version: "v1"},
 		Artifacts: []Artifact{
 			{Path: first, AssetName: "a.tar.gz", Evidence: Evidence{Signature: &SignatureEvidence{Bundle: bundle, Identity: "i", OIDCIssuer: "u"}}},
@@ -418,5 +420,235 @@ func TestFirstLineSummaryIsBounded(t *testing.T) {
 	}
 	if got := firstLineSummary("   \n\n", 240); got != "" {
 		t.Fatalf("summary %q, want empty", got)
+	}
+}
+
+// --- detached signature (spec_version 2) ------------------------------------
+
+// detachedSpec builds a one-artifact spec whose signature evidence is a detached
+// cert+signature pair, with the checksum check enabled — the shape detached
+// evidence requires to vouch for anything.
+func detachedSpec(artifact, checksums, cert, sig, identity, issuer string) Spec {
+	return Spec{
+		SpecVersion: SpecVersion,
+		Subject:     Subject{Repo: "o/r", Version: "v1.2.3"},
+		Artifacts: []Artifact{{
+			Path:      artifact,
+			AssetName: "tool.tar.gz",
+			Evidence: Evidence{
+				ChecksumFile: checksums,
+				Signature:    &SignatureEvidence{Certificate: cert, Signature: sig, Identity: identity, OIDCIssuer: issuer},
+			},
+		}},
+		Checks: &Checks{
+			Checksum:  &CheckConfig{Enabled: true},
+			Signature: &CheckConfig{Enabled: true},
+		},
+	}
+}
+
+// detachedFixture writes an artifact, its matching checksum file, and a
+// certificate and signature beside it, then puts the fake cosign on PATH. The
+// evidence files' contents are opaque to the composite — cosign parses them —
+// so a placeholder byte suffices; what matters is that they exist.
+func detachedFixture(t *testing.T) (artifact, checksums, cert, sig string) {
+	t.Helper()
+	withFakeTools(t, "cosign")
+	t.Setenv("MOCK_COSIGN_IDENTITY", mockIdentity)
+	t.Setenv("MOCK_COSIGN_ISSUER", mockIssuer)
+
+	dir := t.TempDir()
+	artifact = writeFile(t, dir, "tool.tar.gz", "payload")
+	checksums = writeFile(t, dir, "checksums.txt", sha256Of("payload")+"  tool.tar.gz\n")
+	cert = writeFile(t, dir, "checksums.txt.pem", "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t")
+	sig = writeFile(t, dir, "checksums.txt.sig", "MEQCIExample")
+	return artifact, checksums, cert, sig
+}
+
+// The detached flagship: a signature over the checksum file, accepted by the
+// policy, vouches for the artifact through the digest match and reaches GO —
+// exactly as a bundle over the artifact does.
+func TestDetachedSignatureVerifiesAndSuppressesChecksumWarning(t *testing.T) {
+	artifact, checksums, cert, sig := detachedFixture(t)
+
+	report := Review(detachedSpec(artifact, checksums, cert, sig, mockIdentity, mockIssuer))
+	if report.Verdict != GO {
+		t.Fatalf("top-level verdict %s, want GO: %+v", report.Verdict, report.Checks)
+	}
+	for _, check := range report.Checks {
+		if len(check.Reasons) != 0 {
+			t.Fatalf("check %s is not clean: %v", check.ID, codes(check))
+		}
+	}
+}
+
+// The standing ruling: an audit-infrastructure outage must never read as a
+// finding about the release. A detached verification whose trust bootstrap
+// cannot reach Sigstore/Rekor is ERROR, not the signature_failure BLOCK a
+// wrong-signer produces, and it vouches for nothing.
+func TestDetachedSignatureInfraFailureIsErrorNotBlock(t *testing.T) {
+	artifact, checksums, cert, sig := detachedFixture(t)
+	t.Setenv("MOCK_COSIGN_INFRA", "1")
+
+	result, verified := signature(detachedSpec(artifact, checksums, cert, sig, mockIdentity, mockIssuer))
+	if result.Verdict != ERROR {
+		t.Fatalf("verdict %s, want ERROR (infra breakage, not a verdict): %v", result.Verdict, codes(result))
+	}
+	if got := codes(result); len(got) != 1 || got[0] != "verification_infrastructure_unavailable" {
+		t.Fatalf("reasons %v, want [verification_infrastructure_unavailable]", got)
+	}
+	if verified[0] {
+		t.Fatalf("an infrastructure failure vouched for the artifact")
+	}
+}
+
+// Sibling sweep: the same trust-root outage on the bundle path is the same
+// breakage. Before the detached slice the bundle cascade read any nonzero
+// cosign exit as signature_failure, so a cold-cache offline bundle verify would
+// have BLOCKed. The shared classifier makes it ERROR here too.
+func TestBundleSignatureInfraFailureIsErrorNotBlock(t *testing.T) {
+	artifact, bundle, checksums := signatureFixture(t)
+	t.Setenv("MOCK_COSIGN_INFRA", "1")
+
+	result, _ := signature(signatureSpec(artifact, bundle, checksums, mockIdentity, mockIssuer))
+	if result.Verdict != ERROR {
+		t.Fatalf("verdict %s, want ERROR: %v", result.Verdict, codes(result))
+	}
+	if got := codes(result); len(got) != 1 || got[0] != "verification_infrastructure_unavailable" {
+		t.Fatalf("reasons %v, want [verification_infrastructure_unavailable]", got)
+	}
+}
+
+// An infra failure stops the cascade at the first probe rather than running the
+// wildcard re-probes into the same outage.
+func TestDetachedInfraFailureStopsAtFirstProbe(t *testing.T) {
+	artifact, checksums, cert, sig := detachedFixture(t)
+	t.Setenv("MOCK_COSIGN_INFRA", "1")
+	callLog := writeFile(t, t.TempDir(), "calls", "")
+	t.Setenv("MOCK_COSIGN_CALL_LOG", callLog)
+
+	signature(detachedSpec(artifact, checksums, cert, sig, mockIdentity, mockIssuer))
+	if got := countLines(t, callLog); got != 1 {
+		t.Fatalf("cosign was called %d times, want 1 (the cascade must stop on infra breakage)", got)
+	}
+}
+
+// A wrong signer on the detached path is still a BLOCK — the infra classifier
+// must not swallow a genuine rejection.
+func TestDetachedIdentityMismatchStillBlocks(t *testing.T) {
+	artifact, checksums, cert, sig := detachedFixture(t)
+
+	result, _ := signature(detachedSpec(artifact, checksums, cert, sig, "https://example.test/not-the-signer", mockIssuer))
+	if result.Verdict != BLOCK {
+		t.Fatalf("verdict %s, want BLOCK: %v", result.Verdict, codes(result))
+	}
+	if got := codes(result); len(got) != 1 || got[0] != "identity_mismatch" {
+		t.Fatalf("reasons %v, want [identity_mismatch]", got)
+	}
+}
+
+// A missing certificate is evidence about the release (BLOCK), keyed to the
+// detached-mode code.
+func TestDetachedCertificateMissing(t *testing.T) {
+	artifact, checksums, _, sig := detachedFixture(t)
+	absent := filepath.Join(t.TempDir(), "absent.pem")
+
+	result, _ := signature(detachedSpec(artifact, checksums, absent, sig, mockIdentity, mockIssuer))
+	if result.Verdict != BLOCK {
+		t.Fatalf("verdict %s, want BLOCK", result.Verdict)
+	}
+	if !hasReason(result, "certificate_missing", "tool.tar.gz") {
+		t.Fatalf("reasons %v, want certificate_missing", codes(result))
+	}
+}
+
+// A missing signature is the same, under its own code.
+func TestDetachedSignatureFileMissing(t *testing.T) {
+	artifact, checksums, cert, _ := detachedFixture(t)
+	absent := filepath.Join(t.TempDir(), "absent.sig")
+
+	result, _ := signature(detachedSpec(artifact, checksums, cert, absent, mockIdentity, mockIssuer))
+	if result.Verdict != BLOCK {
+		t.Fatalf("verdict %s, want BLOCK", result.Verdict)
+	}
+	if !hasReason(result, "signature_missing", "tool.tar.gz") {
+		t.Fatalf("reasons %v, want signature_missing", codes(result))
+	}
+}
+
+// cosignInfraFailure classifies the strings cosign's own client bootstrap
+// emits, and nothing else — a signer-policy rejection must fall through to the
+// caller's BLOCK. The offline markers are the ones captured from a real run.
+func TestCosignInfraFailureClassification(t *testing.T) {
+	infra := []string{
+		"Error: getting rekor public keys: updating local metadata and targets",
+		"WARNING: Could not fetch trusted_root.json from the TUF repository",
+		"tuf: failed to download 13.root.json: dial tcp: network is unreachable",
+		"error updating to TUF remote mirror",
+	}
+	for _, output := range infra {
+		if !cosignInfraFailure(output) {
+			t.Errorf("cosignInfraFailure(%q) = false, want true", output)
+		}
+	}
+	rejections := []string{
+		"none of the expected identities matched what was in the certificate",
+		"error verifying blob: invalid signature when validating ASN.1 encoded signature",
+		"bundle signer policy mismatch",
+		"",
+		// Steering guard: cosign echoes the cert's SAN into the mismatch
+		// message, so a cert planting an infra marker there must not flip a
+		// genuine rejection into an ERROR. The mismatch signature wins.
+		"none of the expected identities matched, got subjects [https://evil.example/dial tcp] with issuer x",
+	}
+	for _, output := range rejections {
+		if cosignInfraFailure(output) {
+			t.Errorf("cosignInfraFailure(%q) = true, want false", output)
+		}
+	}
+}
+
+// The load-bearing composition: a detached signature vouches for the artifact
+// only through the digest match, so a signed checksum file must NOT rubber-stamp
+// a tampered artifact. The signature check verifies (the checksum file is
+// unchanged and signed), but the checksum check sees the mismatch and BLOCKs,
+// so the release is refused.
+func TestDetachedSignatureDoesNotVouchForATamperedArtifact(t *testing.T) {
+	artifact, checksums, cert, sig := detachedFixture(t)
+	// The checksum file still names the original payload's digest; the artifact
+	// on disk now holds something else.
+	if err := os.WriteFile(artifact, []byte("tampered"), 0o644); err != nil {
+		t.Fatalf("rewrite artifact: %v", err)
+	}
+
+	report := Review(detachedSpec(artifact, checksums, cert, sig, mockIdentity, mockIssuer))
+	if report.Verdict != BLOCK {
+		t.Fatalf("top-level verdict %s, want BLOCK for a tampered artifact: %+v", report.Verdict, report.Checks)
+	}
+	if !hasReason(report.Checks[0], "digest_mismatch", "tool.tar.gz") {
+		t.Fatalf("checksum reasons %v, want digest_mismatch", codes(report.Checks[0]))
+	}
+	if report.Checks[1].ID != CheckSignature || report.Checks[1].Verdict != GO {
+		t.Fatalf("signature check %+v, want a clean GO (the checksum file it signed is untouched)", report.Checks[1])
+	}
+}
+
+// A detached signature_failure carries the real cosign error, not the
+// deprecation notice cosign prints first for the --certificate/--signature
+// flags.
+func TestDetachedSignatureFailureMessageSkipsTheDeprecationNotice(t *testing.T) {
+	artifact, checksums, cert, sig := detachedFixture(t)
+	t.Setenv("MOCK_COSIGN_BUNDLE_MODE", "fail")
+
+	result, _ := signature(detachedSpec(artifact, checksums, cert, sig, mockIdentity, mockIssuer))
+	if len(result.Reasons) != 1 || result.Reasons[0].Code != "signature_failure" {
+		t.Fatalf("reasons %v, want [signature_failure]", codes(result))
+	}
+	message := result.Reasons[0].Message
+	if strings.Contains(message, "deprecated") || strings.HasPrefix(message, "Flag --") {
+		t.Fatalf("signature_failure message is the deprecation notice, not the failure: %q", message)
+	}
+	if message != "bundle verification failed" {
+		t.Fatalf("signature_failure message %q, want the cosign error line", message)
 	}
 }

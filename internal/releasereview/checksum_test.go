@@ -38,7 +38,7 @@ func checksumSpec(artifactPath, assetName, checksumFile string, signed bool) Spe
 		evidence.Signature = &SignatureEvidence{Bundle: "bundle", Identity: "i", OIDCIssuer: "u"}
 	}
 	return Spec{
-		SpecVersion: 1,
+		SpecVersion: SpecVersion,
 		Subject:     Subject{Repo: "o/r", Version: "v1"},
 		Artifacts:   []Artifact{{Path: artifactPath, AssetName: assetName, Evidence: evidence}},
 	}
@@ -406,7 +406,7 @@ func TestChecksumMultipleArtifacts(t *testing.T) {
 
 	signature := &SignatureEvidence{Bundle: "b", Identity: "i", OIDCIssuer: "u"}
 	spec := Spec{
-		SpecVersion: 1,
+		SpecVersion: SpecVersion,
 		Subject:     Subject{Repo: "o/r", Version: "v1"},
 		Artifacts: []Artifact{
 			{Path: good, AssetName: "good.tar.gz", Evidence: Evidence{ChecksumFile: checksums, Signature: signature}},

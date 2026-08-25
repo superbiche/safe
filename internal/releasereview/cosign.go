@@ -4,9 +4,92 @@ import (
 	"context"
 	"errors"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
 )
+
+// cosignOutcome is what one cosign probe amounts to. Three answers, not two: a
+// probe that verified, a probe that ran and rejected, and a probe that could
+// not run at all — the audit-infrastructure-breakage answer that must never be
+// read as a verdict about the release.
+type cosignOutcome int
+
+const (
+	cosignVerified cosignOutcome = iota
+	cosignRejected
+	cosignInfra
+)
+
+// probeOutcome carries one probe's classification alongside the raw output a
+// caller needs for its reason message and the timeout flag that tells a
+// deadline apart from an unreachable trust root.
+type probeOutcome struct {
+	output   string
+	timedOut bool
+	outcome  cosignOutcome
+}
+
+// classifyCosign turns a cosign run into one of the three outcomes. A clean
+// exit verified. A deadline, or output that names a trust-bootstrap network
+// failure, is infrastructure breakage. Everything else — a nonzero exit whose
+// output is about the certificate or signature — is a genuine rejection.
+func classifyCosign(timedOut bool, err error, output string) cosignOutcome {
+	switch {
+	case err == nil:
+		return cosignVerified
+	case timedOut || cosignInfraFailure(output):
+		return cosignInfra
+	default:
+		return cosignRejected
+	}
+}
+
+// cosignInfraFailure reports whether a failed cosign run failed because its own
+// trust bootstrap could not reach the network — the Sigstore TUF repository or
+// the Rekor transparency log — rather than because the evidence did not verify.
+//
+// Detached verification (certificate + signature, no bundle) needs a live Rekor
+// lookup and a fetched trusted root; a bundle embeds its inclusion proof and
+// only needs the trusted root, which cosign caches. Either way a cold cache
+// with no network fails here, and that is audit-infrastructure breakage with a
+// retry as its recovery — never a verdict about the release, which a BLOCK
+// would wrongly say.
+//
+// The match set is cosign's own client-bootstrap phrasing, which runs before
+// and independent of the evidence files. cosign does echo attacker-controlled
+// certificate contents — the SAN and issuer — into its identity-mismatch
+// message ("got subjects [...] with issuer ..."), so that message is preempted
+// first: a rejection that names the mismatch is a rejection whatever else the
+// echoed SAN contains, and returning false on it keeps an attacker from
+// steering a genuine BLOCK into an ERROR by planting a marker in the cert. Even
+// without that guard the fail-closed property holds (both outcomes refuse the
+// release); the guard just keeps the classification honest. Unrecognized output
+// falls through to the caller's rejection — the fail-closed direction — so a
+// future cosign that rewords the bootstrap strings degrades to over-blocking,
+// never to a silent pass. The markers were captured from a real offline cosign
+// verify-blob run.
+func cosignInfraFailure(output string) bool {
+	lower := strings.ToLower(output)
+	if strings.Contains(lower, "none of the expected identities matched") {
+		return false
+	}
+	for _, marker := range []string{
+		"could not fetch trusted_root",
+		"tuf refresh failed",
+		"getting rekor public keys",
+		"tuf remote mirror",
+		"network is unreachable",
+		"dial tcp",
+		"no such host",
+		"i/o timeout",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
 
 // cosignSubprocessTimeout bounds every cosign invocation the composite makes.
 // A hung cosign — a wedged fetch to a signing-log backend, a process that never

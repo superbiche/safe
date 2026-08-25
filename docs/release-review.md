@@ -34,7 +34,7 @@ caps what a check contributes to the top-level verdict, not what it observed.
 | Check | What it decides | Reaches the network |
 | --- | --- | --- |
 | `checksum` | artifact sha256 against the release's checksum file | no |
-| `signature` | Sigstore bundle against an identity policy, via cosign | no |
+| `signature` | Sigstore bundle or detached cert+signature against an identity policy, via cosign | bundle no, detached yes |
 | `release` | GitHub release metadata, age, history and tag signature | yes |
 | `vuln` | advisories published against the repository | yes |
 | `tuf` | TUF bootstrap material against a pinned root, via cosign | no |
@@ -54,7 +54,7 @@ contract as well as the key:
 {
   "capabilities": {"binary-audit.release-review": true},
   "versions": {
-    "binary-audit.release-review": {"spec_version": 1, "report_schema_version": 1}
+    "binary-audit.release-review": {"spec_version": 2, "report_schema_version": 1}
   },
   "groups": {"binary-audit": {"release-review": true}}
 }
@@ -103,11 +103,11 @@ that ran.
 The bash forward adds one more: a missing or version-skewed `safe-core` returns
 30 with a single stderr line naming `rerun install.sh` as the recovery.
 
-## Spec schema (`spec_version` 1)
+## Spec schema (`spec_version` 2)
 
 ```json
 {
-  "spec_version": 1,
+  "spec_version": 2,
   "subject": {"repo": "OWNER/REPO", "version": "TAG"},
   "artifacts": [
     {
@@ -146,7 +146,7 @@ the example above already supports it:
 
 ```json
 {
-  "spec_version": 1,
+  "spec_version": 2,
   "subject": {"repo": "OWNER/REPO", "version": "TAG"},
   "artifacts": [
     {
@@ -168,13 +168,44 @@ the example above already supports it:
 }
 ```
 
+A release that signs its **checksum file** rather than shipping a per-artifact
+bundle — the `<checksums>.pem` + `<checksums>.sig` shape — is expressed in
+detached mode. The signature vouches for the artifact only through the digest
+match, so the `checksum` check is enabled and the artifact carries its
+`checksum_file`:
+
+```json
+{
+  "spec_version": 2,
+  "subject": {"repo": "OWNER/REPO", "version": "TAG"},
+  "artifacts": [
+    {
+      "path": "dist/tool_1.0.0_linux_amd64.tar.gz",
+      "evidence": {
+        "checksum_file": "dist/tool_1.0.0_checksums.txt",
+        "signature": {
+          "certificate": "dist/tool_1.0.0_checksums.txt.pem",
+          "signature": "dist/tool_1.0.0_checksums.txt.sig",
+          "identity_regexp": "^https://github\\.com/OWNER/REPO/\\.github/workflows/release\\.yml@refs/tags/.*$",
+          "oidc_issuer": "https://token.actions.githubusercontent.com"
+        }
+      }
+    }
+  ],
+  "checks": {
+    "checksum":  {"enabled": true},
+    "signature": {"enabled": true}
+  }
+}
+```
+
 The two GitHub checks need no local evidence at all — they are answered from
 `subject` — except that `release` must be told which asset the release has to
 carry:
 
 ```json
 {
-  "spec_version": 1,
+  "spec_version": 2,
   "subject": {"repo": "OWNER/REPO", "version": "v1.2.3"},
   "artifacts": [{"path": "dist/foo.tar.gz"}],
   "checks": {
@@ -189,7 +220,7 @@ trust material to compare:
 
 ```json
 {
-  "spec_version": 1,
+  "spec_version": 2,
   "subject": {"repo": "sigstore/root-signing", "version": "v9"},
   "artifacts": [{"path": "trust/root.json"}],
   "checks": {
@@ -209,7 +240,7 @@ An enabled `exec` block names the executable to smoke — a free path, not an
 
 ```json
 {
-  "spec_version": 1,
+  "spec_version": 2,
   "subject": {"repo": "OWNER/REPO", "version": "TAG"},
   "artifacts": [{"path": "dist/foo.tar.gz"}],
   "checks": {
@@ -220,7 +251,7 @@ An enabled `exec` block names the executable to smoke — a free path, not an
 
 ### Fields
 
-- `spec_version` — must be exactly `1`.
+- `spec_version` — must be exactly `2`.
 - `subject.repo`, `subject.version` — required, non-empty. Echoed into the
   report so a stored report identifies itself without its spec.
 - `artifacts` — required, at least one entry.
@@ -230,10 +261,23 @@ An enabled `exec` block names the executable to smoke — a free path, not an
   - `evidence` — optional, and every field inside it is optional. An artifact
     may carry no evidence at all; what a check makes of that absence is the
     check's decision, not the schema's.
-- `evidence.signature` — when present, requires `bundle`, `oidc_issuer`, and
-  exactly one of `identity` (an exact match, as in the example above) or
-  `identity_regexp` (a pattern, for tag-bound workflow identities that change
-  every release). The two are mutually exclusive.
+- `evidence.signature` — when present, carries the signing evidence in one of
+  two mutually exclusive modes, plus the identity policy both share:
+  - **Bundle mode** — `bundle` names a Sigstore bundle that signs the artifact
+    itself and carries its own transparency-log proof, so it verifies offline.
+  - **Detached mode** — `certificate` and `signature` (both required together,
+    and neither may appear with `bundle`) are the `<checksums>.pem` and
+    `<checksums>.sig` a release publishes beside its checksum file. They sign
+    the **checksum file**, not the artifact: the digest the `checksum` check
+    matches against that same file is what carries the trust the rest of the way
+    to the artifact. So detached evidence requires the artifact to also carry
+    `evidence.checksum_file` **and** the `checksum` check to be enabled — without
+    the digest match the signature vouches for nothing about the artifact.
+    Detached verification needs a live Sigstore/Rekor lookup (a bundle bakes
+    that in), so unlike bundle mode it reaches the network.
+  - Both modes require `oidc_issuer` and exactly one of `identity` (an exact
+    match) or `identity_regexp` (a pattern, for tag-bound workflow identities
+    that change every release). The two identity forms are mutually exclusive.
 - `checks` — optional. Each check block is optional; an omitted block is a
   disabled check. **Omitting `checks` entirely enables `checksum` and nothing
   else** — the one check that needs no network and no external tool.
@@ -418,23 +462,33 @@ missing reports both, and BLOCK wins the worst-of over the ERROR.
 | Code | Class | Data | Meaning |
 | --- | --- | --- | --- |
 | `artifact_missing` | BLOCK | `artifact` | the artifact file is not at its path |
-| `bundle_missing` | BLOCK | `artifact`, `bundle` | the referenced Sigstore bundle is not at its path |
-| `bundle_invalid` | BLOCK | `artifact`, `bundle` | the bundle is readable but is not valid JSON |
-| `signature_failure` | BLOCK | `artifact` | cosign could not verify the artifact against the bundle at all; the message is the first line of cosign's output |
-| `identity_mismatch` | BLOCK | `artifact`, and `expected_identity` or `expected_identity_regexp` | the bundle verifies, but its signer identity is not the one the policy names |
-| `issuer_mismatch` | BLOCK | `artifact`, `expected_oidc_issuer` | the bundle verifies, but its OIDC issuer is not the one the policy names |
+| `bundle_missing` | BLOCK | `artifact`, `bundle` | the referenced Sigstore bundle is not at its path (bundle mode) |
+| `bundle_invalid` | BLOCK | `artifact`, `bundle` | the bundle is readable but is not valid JSON (bundle mode) |
+| `certificate_missing` | BLOCK | `artifact`, `certificate` | the detached certificate is not at its path (detached mode) |
+| `signature_missing` | BLOCK | `artifact`, `signature` | the detached signature is not at its path (detached mode) |
+| `signature_failure` | BLOCK | `artifact` | cosign could not verify the signed blob at all; the message is the first line of cosign's output |
+| `identity_mismatch` | BLOCK | `artifact`, and `expected_identity` or `expected_identity_regexp` | the signature verifies, but its signer identity is not the one the policy names |
+| `issuer_mismatch` | BLOCK | `artifact`, `expected_oidc_issuer` | the signature verifies, but its OIDC issuer is not the one the policy names |
 | `no_signature_evidence` | WARN | `artifact` | the check is enabled but this artifact carries no `signature` block |
 | `artifact_unreadable` | ERROR | `artifact`, `error` | the artifact exists and cannot be read |
-| `bundle_unreadable` | ERROR | `artifact`, `bundle`, `error` | the bundle exists and cannot be read |
+| `bundle_unreadable` | ERROR | `artifact`, `bundle`, `error` | the bundle exists and cannot be read (bundle mode) |
+| `certificate_unreadable` | ERROR | `artifact`, `certificate`, `error` | the detached certificate exists and cannot be read (detached mode) |
+| `signature_unreadable` | ERROR | `artifact`, `signature`, `error` | the detached signature exists and cannot be read (detached mode) |
 | `verification_timeout` | ERROR | `artifact` | cosign did not finish verifying the artifact within the subprocess deadline — the tool is present but never answered, which is breakage, not a signature failure |
+| `verification_infrastructure_unavailable` | ERROR | `artifact`, `detail` | cosign's trust bootstrap (Sigstore TUF or Rekor) was unreachable, so verification could not run — breakage to retry, never a verdict about the release; reachable most often in detached mode, whose verification needs a live Rekor lookup a bundle carries with it |
 | `tool_missing` | ERROR | — | cosign is not installed; emitted **once** for the check, not per artifact |
 
 A failed verification is only half an answer, so a failure is re-probed with
 wildcard identity and issuer policies until the report can say which of three
-things happened: the bundle does not verify at all (`signature_failure`), or it
-verifies under a signer the policy does not allow. When both halves of the
+things happened: the signature does not verify at all (`signature_failure`), or
+it verifies under a signer the policy does not allow. When both halves of the
 policy are wrong, **both** `identity_mismatch` and `issuer_mismatch` are
-emitted — a consumer who fixed only one would still be refused.
+emitted — a consumer who fixed only one would still be refused. A cosign that
+cannot reach its own trust root at any step stops the cascade with
+`verification_infrastructure_unavailable` rather than a `BLOCK`: an audit
+outage is not a signer the policy disallows. A detached blob that is missing is
+left to the `checksum` check, which owns that finding — the signature check does
+not report it twice.
 
 ### `release`
 
@@ -836,3 +890,48 @@ still cannot claim a behavior nothing checks.
     into the `-v` argument unchecked. No corpus pair: it changes behavior only on
     a pathological path, not a verdict on a legitimate fixture; `exec_test.go`
     carries the coverage.
+18. **Detached signatures sign the checksum file, and vouch only with the
+    checksum check** (`signature`, `spec_version` 2). The deleted bash `verify
+    release-asset --require-signature --certificate --signature` lane verified a
+    detached `<checksums>.pem` + `<checksums>.sig` pair directly. The composite
+    keeps that shape but ties its meaning to the rest of the review: the pair
+    signs the checksum file, so a verified detached signature vouches for an
+    artifact only through the digest the `checksum` check matches against that
+    same file. Spec validation therefore refuses detached evidence unless the
+    artifact carries `evidence.checksum_file` and the `checksum` check is
+    enabled — a signature-only `GO` in bundle mode means *the artifact* verified,
+    and detached mode must not let it mean less. `spec_test.go` and
+    `signature_test.go` carry the coverage.
+19. **A cosign trust-root outage is `ERROR`, not `BLOCK`** (`signature`). Bundle
+    verification bakes its transparency-log proof in and verifies offline;
+    detached verification needs a live Sigstore-TUF and Rekor lookup, so a review
+    that runs while those are unreachable would fail cosign with a network error.
+    That is audit-infrastructure breakage, never a signer the policy disallows,
+    so the cascade classifies cosign's own client-bootstrap phrasing (TUF refresh
+    / trusted-root fetch / Rekor public-key / dial failures) as
+    `verification_infrastructure_unavailable` (ERROR) and stops, at every step —
+    the wildcard re-probes hit the same outage. The match is a tight allowlist of
+    cosign's client-bootstrap strings, which arise before and independent of the
+    evidence files. cosign does echo the certificate's SAN and issuer into its
+    identity-mismatch message, so that message is preempted first: an output that
+    names an identity mismatch classifies as a rejection whatever the echoed SAN
+    contains, which keeps a cert planting an infra marker from downgrading a
+    genuine `BLOCK` to an `ERROR`. Even without that guard the fail-closed
+    property holds — both outcomes refuse the release — so the residual is a
+    downgrade in *kind*, never a silent pass; and an unrecognized message falls
+    through to `BLOCK`, so a future cosign that rewords the bootstrap strings
+    degrades to over-blocking. The same classifier guards the bundle path, where
+    a cold trust-root cache with no network is the same outage.
+    `signature_test.go` drives it with a fake cosign emitting the captured
+    offline output.
+20. **Detached mode uses cosign's deprecated `--certificate`/`--signature`
+    flags** (`signature`). Current cosign still verifies a detached pair through
+    these flags but prints a deprecation notice steering toward
+    `--bundle`/`--trusted-root`; the composite does not synthesize a bundle from
+    the pair (that machinery is not worth its weight for one evidence shape) and
+    does not pass `--insecure-ignore-tlog` (dropping the transparency-log check
+    would weaken verification against a leaked short-lived key). If a future
+    cosign removes the flags, detached verification fails closed as
+    `verification_infrastructure_unavailable` or `signature_failure` rather than
+    passing — a known risk parked with this feature, to revisit when a
+    non-deprecated detached path exists.

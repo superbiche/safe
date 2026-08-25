@@ -9,7 +9,7 @@ import (
 
 func execSpec(artifact string, args []string, timeout int) Spec {
 	return Spec{
-		SpecVersion: 1,
+		SpecVersion: SpecVersion,
 		Subject:     Subject{Repo: "o/r", Version: "v1"},
 		Artifacts:   []Artifact{{Path: artifact, AssetName: filepath.Base(artifact)}},
 		Checks: &Checks{Exec: &ExecCheck{

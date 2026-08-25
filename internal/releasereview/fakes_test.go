@@ -148,16 +148,38 @@ fi
 
 case "$command_name" in
   verify-blob)
-    identity=""; identity_regexp=""; issuer=""; issuer_regexp=""
+    identity=""; identity_regexp=""; issuer=""; issuer_regexp=""; detached=0
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --certificate-identity) identity="$2"; shift 2 ;;
         --certificate-identity-regexp) identity_regexp="$2"; shift 2 ;;
         --certificate-oidc-issuer) issuer="$2"; shift 2 ;;
         --certificate-oidc-issuer-regexp) issuer_regexp="$2"; shift 2 ;;
+        --certificate) detached=1; shift 2 ;;
+        --signature) detached=1; shift 2 ;;
         *) shift ;;
       esac
     done
+
+    # Real cosign prints these deprecation notices to stderr BEFORE its result
+    # whenever the detached --certificate/--signature flags are used. The fake
+    # reproduces them so the summary filter is exercised on the shape it must
+    # skip, not a paraphrase.
+    if [[ "$detached" == "1" ]]; then
+      printf 'Flag --certificate has been deprecated, please use --bundle with --trusted-root to provide the public certificate\n' >&2
+      printf 'Flag --signature has been deprecated, please use --bundle to provide a signature\n' >&2
+    fi
+
+    # MOCK_COSIGN_INFRA: cosign runs but its trust bootstrap cannot reach the
+    # Sigstore TUF repository or Rekor. Verbatim shape of a real offline
+    # verify-blob so the infra classifier is exercised on the strings it must
+    # match, not a paraphrase. Detached verification reaches this every time it
+    # runs offline; a cold-cache bundle verify reaches it too.
+    if [[ -n "${MOCK_COSIGN_INFRA:-}" ]]; then
+      printf 'WARNING: Could not fetch trusted_root.json from the TUF repository. Continuing with individual targets.\n' >&2
+      printf 'error during command execution: getting rekor public keys: updating local metadata and targets: error updating to TUF remote mirror: tuf: failed to download 13.root.json: dial tcp: lookup tuf-repo-cdn.sigstore.dev: network is unreachable\n' >&2
+      exit 1
+    fi
 
     if [[ "${MOCK_COSIGN_BUNDLE_MODE:-ok}" == "fail" ]]; then
       printf 'bundle verification failed\n' >&2

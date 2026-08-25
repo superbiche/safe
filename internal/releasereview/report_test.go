@@ -102,7 +102,7 @@ func TestReviewAppliesAdvisoryCapOnlyAtTopLevel(t *testing.T) {
 	checksums := writeFile(t, dir, "checksums.txt", "0000000000000000000000000000000000000000000000000000000000000000  tool.tar.gz\n")
 
 	spec := Spec{
-		SpecVersion: 1,
+		SpecVersion: SpecVersion,
 		Subject:     Subject{Repo: "o/r", Version: "v1"},
 		Artifacts: []Artifact{{
 			Path:      artifact,
@@ -133,7 +133,7 @@ func TestReviewEnvelope(t *testing.T) {
 	checksums := writeFile(t, dir, "checksums.txt", sha256Of("payload")+"  tool.tar.gz\n")
 
 	spec := Spec{
-		SpecVersion: 1,
+		SpecVersion: SpecVersion,
 		Subject:     Subject{Repo: "o/r", Version: "v9"},
 		Artifacts: []Artifact{{
 			Path:      artifact,
@@ -181,7 +181,7 @@ func TestEmptyReasonsEncodeAsArray(t *testing.T) {
 // is the whole point of keeping it.
 func TestDispatchBackstopsAnUnimplementedCheck(t *testing.T) {
 	spec := Spec{
-		SpecVersion: 1,
+		SpecVersion: SpecVersion,
 		Subject:     Subject{Repo: "o/r", Version: "v1"},
 		Artifacts:   []Artifact{{Path: "a", AssetName: "a"}},
 		Checks:      &Checks{},

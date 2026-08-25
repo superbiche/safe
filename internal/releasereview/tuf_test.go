@@ -47,7 +47,7 @@ func buildTUFMirror(t *testing.T, targets ...mirrorTarget) (mirror, root, rootCh
 
 func tufSpec(mirror, root, rootChecksum string, targets map[string]string) Spec {
 	return Spec{
-		SpecVersion: 1,
+		SpecVersion: SpecVersion,
 		Subject:     Subject{Repo: "o/r", Version: "v1"},
 		Artifacts:   []Artifact{{Path: root, AssetName: "root.json"}},
 		Checks: &Checks{TUF: &TUFCheck{

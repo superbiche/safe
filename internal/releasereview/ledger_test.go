@@ -60,7 +60,7 @@ func TestLedger01ChecksumNoEntryForArtifactIsBlock(t *testing.T) {
 		sha256Of("other a")+"  other-a.tar.gz\n"+sha256Of("other b")+"  other-b.tar.gz\n")
 
 	spec := Spec{
-		SpecVersion: 1,
+		SpecVersion: SpecVersion,
 		Subject:     ledgerSubject(),
 		Artifacts: []Artifact{{
 			Path: artifact, AssetName: "tool.bin",

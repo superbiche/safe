@@ -82,7 +82,7 @@ jq -e --arg version "$audit_version" '
   }
   and .versions == {
     "binary-audit.release-review": {
-      "spec_version": 1,
+      "spec_version": 2,
       "report_schema_version": 1
     }
   }
