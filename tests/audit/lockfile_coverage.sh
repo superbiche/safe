@@ -455,7 +455,57 @@ case_lockfile_support_passes_on_a_complete_scanner() {
   fi
 }
 
+# JVM/Maven coverage (ticket #145): a Maven manifest is OSV-readable by name, so
+# a pom.xml-only project must reach the scanner rather than skip silently.
+case_pom_xml_is_handed_to_the_scanner() {
+  local dir calls args
+  dir="$(make_project maven-pom pom.xml)"
+  calls="$dir/calls"
+  audit_project "$dir" SAFE_TEST_OSV_CALLS="$calls" >/dev/null
+  args="$(cat "$calls" 2>/dev/null || true)"
+  if [[ "$args" == *"pom.xml"* ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (scanner was handed: ${args:-<nothing>})"
+  fi
+}
+
+case_gradle_lockfile_is_handed_to_the_scanner() {
+  local dir calls args
+  dir="$(make_project gradle-project gradle.lockfile)"
+  calls="$dir/calls"
+  audit_project "$dir" SAFE_TEST_OSV_CALLS="$calls" >/dev/null
+  args="$(cat "$calls" 2>/dev/null || true)"
+  if [[ "$args" == *"gradle.lockfile"* ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (scanner was handed: ${args:-<nothing>})"
+  fi
+}
+
+# JVM/Maven is OSV-covered but deliberately NOT command-gated (ticket #145,
+# rule B): declarative builds have no wrappable install verb, so safe must never
+# demand a mvn/gradle CLI the way it demands npm/pip/cargo — and the OSV sweep
+# must still cover the manifest.
+case_jvm_project_demands_no_build_tool_cli() {
+  local dir calls log
+  dir="$(make_project jvmproj pom.xml)"
+  calls="$dir/calls"
+  audit_project "$dir" SAFE_TEST_OSV_CALLS="$calls" >/dev/null
+  log="$dir/audit.log"
+  if grep -qiE 'mvn|gradle|maven' "$log"; then
+    fail "$FUNCNAME (named a JVM build tool: $(grep -iE 'mvn|gradle|maven' "$log" | head -1))"
+  elif [[ "$(cat "$calls" 2>/dev/null)" == *"pom.xml"* ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (pom.xml did not reach the OSV sweep)"
+  fi
+}
+
 case_go_sum_is_translated_to_go_mod
+case_pom_xml_is_handed_to_the_scanner
+case_gradle_lockfile_is_handed_to_the_scanner
+case_jvm_project_demands_no_build_tool_cli
 case_bun_lock_is_handed_to_the_scanner
 case_bun_lockb_never_reaches_the_scanner
 case_unreadable_only_project_reports_missing_coverage

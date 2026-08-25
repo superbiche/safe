@@ -38,6 +38,9 @@ done
 emit() { if [[ -n "$outfile" ]]; then cat > "$outfile"; else cat; fi; }
 case "$url" in
   *api.osv.dev*)
+    if [[ -n "${MOCK_OSV_ECO_LOG:-}" ]]; then
+      grep -oE '"ecosystem": *"[^"]*"' <<<"$data" >> "$MOCK_OSV_ECO_LOG" 2>/dev/null || true
+    fi
     if [[ "${MOCK_COOLDOWN_FIX:-0}" == "1" && "$data" != *'"version"'* ]]; then
       printf '%s\n' '{"vulns":[{"id":"GHSA-FIXED","database_specific":{"severity":"HIGH"},"affected":[{"package":{"ecosystem":"npm","name":"fixture"},"ranges":[{"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"1.0.0"}]}]}]}]}' | emit
     else
@@ -164,6 +167,32 @@ run_check() {
     MOCK_SOCKET_MODE="$mode" \
     "${extra_env[@]}" \
     "$SAFE_AUDIT" package-audit fixture@1.0.0 --ecosystem npm --json "$@" > "$CASE_OUT" 2> "$CASE_ERR"
+  CHECK_RC=$?
+  set -e
+}
+
+# Same harness as run_check, but audits a Maven coordinate. Maven has no Socket
+# tier, so this exercises the honest-skip path (ticket #145) rather than npm's.
+run_check_maven() {
+  local mode="$1"
+  shift
+  local -a extra_env=()
+  while (( $# > 0 )) && [[ "$1" == *=* ]]; do
+    extra_env+=("$1")
+    shift
+  done
+  set +e
+  env -u SOCKET_SECURITY_API_TOKEN \
+    HOME="$CASE_HOME" \
+    PATH="$MOCKBIN:/usr/bin:/bin" \
+    SAFE_AUDIT_CONFIG_DIR="$CASE_AUDIT_CONFIG" \
+    SAFE_AUDIT_DATA_DIR="$CASE_DATA/audit" \
+    SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" \
+    SAFE_AUDIT_SOCKET_CACHE_DIR="$CASE_CACHE" \
+    MOCK_SOCKET_LOG="$CASE_LOG" \
+    MOCK_SOCKET_MODE="$mode" \
+    "${extra_env[@]}" \
+    "$SAFE_AUDIT" package-audit 'org.example:fixture@1.0.0' --ecosystem Maven --json "$@" > "$CASE_OUT" 2> "$CASE_ERR"
   CHECK_RC=$?
   set -e
 }
@@ -320,6 +349,19 @@ printf '{"install":{"cooldown_days":0,"auto_allow_tolerate":["socket_disabled"],
 run_check clean --gate install
 expect_rc 0 'a declared skip posture passes the install gate'
 [[ "$(socket_calls)" == "0" ]] && pass 'tolerated skip still makes no Socket request' || fail 'tolerated skip still makes no Socket request'
+
+# Maven has no Socket tier (ticket #145): package-audit degrades to an honest
+# policy-style skip rather than a pkg:java/... 400 read as an outage, and OSV is
+# queried under the correct "Maven" ecosystem — never a false-clean "java" miss.
+prepare_case maven-no-socket-tier
+run_check_maven clean MOCK_OSV_ECO_LOG="$CASE/osv-eco.log" --gate install
+expect_rc 10 'a clean Maven audit degrades to WARN (no behavioral tier), never GO'
+expect_json '.socket.status == "skipped" and .socket.note == "Socket has no Maven tier"' 'the Maven Socket skip names the missing tier, not a policy toggle'
+expect_json '.warn_causes | index("socket_disabled") != null' 'the Maven Socket skip carries the skip cause'
+[[ "$(socket_calls)" == "0" ]] && pass 'a Maven audit never invokes Socket' || fail 'a Maven audit never invokes Socket'
+grep -q 'Socket has no Maven tier' "$CASE_ERR" && pass 'the Maven hint names the missing tier' || fail 'the Maven hint names the missing tier'
+grep -q 'not auto-gated' "$CASE_ERR" && pass 'the Maven hint states the not-auto-gated posture' || fail 'the Maven hint states the not-auto-gated posture'
+grep -qE '"ecosystem": *"Maven"' "$CASE/osv-eco.log" 2>/dev/null && pass 'OSV is queried under the Maven ecosystem, not literal java' || fail 'OSV ecosystem for a Maven audit was not "Maven" (false-clean hazard)'
 
 # A fresh release whose bounded retries have no completed score remains a
 # disclosed PENDING GO only while OSV and the blocklist are clean.

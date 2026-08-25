@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **JVM/Maven dependencies are now OSV-covered, without command-gating.** `safe
+  audit repo-audit` sweeps `pom.xml` and `gradle.lockfile` through OSV like any
+  other lockfile, and `safe audit package-audit --ecosystem Maven <group:artifact>@<version>`
+  is a documented single-coordinate preflight (`Maven`, `maven` and `gradle`
+  all map to the OSV `Maven` ecosystem). Gradle and Maven are declarative —
+  dependencies resolve at build time with no discrete install verb to PATH-wrap
+  the way `npm install <pkg>` is — so there is no `mvn`/`gradle` shim and no
+  per-ecosystem JVM auditor: coverage without auto-gating is the honest end
+  state, not a stepping stone. Socket has no Maven tier, so a JVM audit is
+  OSV-only and its behavioral tier degrades to a disclosed `Socket has no Maven
+  tier` skip — never a false GO, and never an infrastructure-outage signal. A
+  qualified Maven version OSV cannot range-match (`1.0.0.RELEASE`) resolves to a
+  WARN with a pin-hint rather than a silent pass.
+
 - **The six `binary-audit` bash sub-lanes are deleted; `release-review` is the
   one binary-audit command.** `safe audit binary-audit release github`,
   `vuln github-release`, the three `verify` lanes (`release-asset`,

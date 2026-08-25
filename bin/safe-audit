@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.3.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.34.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.35.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -68,6 +68,8 @@ declare -ar SAFE_AUDIT_OSV_LOCKFILE_FORMATS=(
   composer.lock
   Cargo.lock
   go.mod
+  pom.xml
+  gradle.lockfile
 )
 
 # The release-review composite's advertised contract: the spec_version
@@ -892,6 +894,7 @@ lockfile_ecosystem() {
     composer.lock) echo "php" ;;
     Cargo.lock) echo "rust" ;;
     go.sum) echo "go" ;;
+    pom.xml|gradle.lockfile) echo "java" ;;
     *) echo "unknown" ;;
   esac
 }
@@ -900,7 +903,7 @@ manifest_matches() {
   local base
   base=$(basename "$1")
   case "$base" in
-    package.json|package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum|.safe-audit)
+    package.json|package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum|pom.xml|gradle.lockfile|build.gradle|build.gradle.kts|.safe-audit)
       return 0
       ;;
     *)
@@ -913,7 +916,7 @@ lockfile_matches() {
   local base
   base=$(basename "$1")
   case "$base" in
-    package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
+    package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum|pom.xml|gradle.lockfile)
       return 0
       ;;
     *)
@@ -926,7 +929,7 @@ project_root_manifest_matches() {
   local base
   base=$(basename "$1")
   case "$base" in
-    .safe-audit|package.json|package-lock.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum)
+    .safe-audit|package.json|package-lock.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum|pom.xml|gradle.lockfile|build.gradle|build.gradle.kts)
       return 0
       ;;
     *)
@@ -1172,7 +1175,7 @@ gather_stage_remotely() {
   if [[ "$rc" -ne 0 ]]; then
     warn "$machine: bounded remote staging failed; falling back to manifest staging"
     set +e
-    ssh_batch "$host" "cd $(printf '%q' "$target") && find . -type f \( -name '.safe-audit' -o -name 'package.json' -o -name 'package-lock.json' -o -name 'pnpm-lock.yaml' -o -name 'yarn.lock' -o -name 'bun.lock' -o -name 'bun.lockb' -o -name 'uv.lock' -o -name 'poetry.lock' -o -name 'Pipfile.lock' -o -name 'pyproject.toml' -o -name 'composer.json' -o -name 'composer.lock' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'go.mod' -o -name 'go.sum' -o -name 'requirements.txt' -o -name 'requirements-dev.txt' -o -name 'requirements.lock' \) -print0 | tar --null -T - -czf - 2>/dev/null" \
+    ssh_batch "$host" "cd $(printf '%q' "$target") && find . -type f \( -name '.safe-audit' -o -name 'package.json' -o -name 'package-lock.json' -o -name 'pnpm-lock.yaml' -o -name 'yarn.lock' -o -name 'bun.lock' -o -name 'bun.lockb' -o -name 'uv.lock' -o -name 'poetry.lock' -o -name 'Pipfile.lock' -o -name 'pyproject.toml' -o -name 'composer.json' -o -name 'composer.lock' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'go.mod' -o -name 'go.sum' -o -name 'pom.xml' -o -name 'gradle.lockfile' -o -name 'build.gradle' -o -name 'build.gradle.kts' -o -name 'requirements.txt' -o -name 'requirements-dev.txt' -o -name 'requirements.lock' \) -print0 | tar --null -T - -czf - 2>/dev/null" \
       | tar -xzf - -C "$stage" 2>/dev/null
     statuses=("${PIPESTATUS[@]}")
     set -e
@@ -2798,7 +2801,8 @@ scan_cache_result_is_cacheable() {
 SCAN_CACHE_EXTRA_EVIDENCE=(
   package.json package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock bun.lock bun.lockb .npmrc
   requirements.txt requirements-dev.txt pyproject.toml uv.lock poetry.lock Pipfile.lock
-  composer.json composer.lock Cargo.toml Cargo.lock go.mod go.sum .safe-audit
+  composer.json composer.lock Cargo.toml Cargo.lock go.mod go.sum
+  pom.xml gradle.lockfile build.gradle build.gradle.kts .safe-audit
 )
 
 # The scanner set is an input too. Install pip-audit and a project that was
@@ -4110,7 +4114,7 @@ while IFS= read -r -d '' file; do
     root=$(dirname "$file")
   fi
   case "$(basename "$file")" in
-    package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
+    package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum|pom.xml|gradle.lockfile)
       lockfiles+=("$file")
       if [[ -z "${seen_roots[$root]:-}" ]]; then
         seen_roots["$root"]=1
@@ -4118,7 +4122,7 @@ while IFS= read -r -d '' file; do
       fi
       ;;
   esac
-done < <(find "$target" -type f \( -name 'package-lock.json' -o -name 'pnpm-lock.yaml' -o -name 'yarn.lock' -o -name 'bun.lock' -o -name 'bun.lockb' -o -name 'uv.lock' -o -name 'poetry.lock' -o -name 'Pipfile.lock' -o -name 'composer.lock' -o -name 'Cargo.lock' -o -name 'go.sum' \) -print0)
+done < <(find "$target" -type f \( -name 'package-lock.json' -o -name 'pnpm-lock.yaml' -o -name 'yarn.lock' -o -name 'bun.lock' -o -name 'bun.lockb' -o -name 'uv.lock' -o -name 'poetry.lock' -o -name 'Pipfile.lock' -o -name 'composer.lock' -o -name 'Cargo.lock' -o -name 'go.sum' -o -name 'pom.xml' -o -name 'gradle.lockfile' \) -print0)
 
 if [[ "${#roots[@]}" -eq 0 ]]; then
   roots=("$target")
@@ -4360,7 +4364,7 @@ matches_ignore() {
 
 manifest_matches() {
   case "$(basename "$1")" in
-    package.json|package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum|.safe-audit)
+    package.json|package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|pyproject.toml|requirements*.txt|composer.json|composer.lock|Cargo.toml|Cargo.lock|go.mod|go.sum|pom.xml|gradle.lockfile|build.gradle|build.gradle.kts|.safe-audit)
       return 0
       ;;
     *)
@@ -4371,7 +4375,7 @@ manifest_matches() {
 
 lockfile_matches() {
   case "$(basename "$1")" in
-    package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum)
+    package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|composer.lock|Cargo.lock|go.sum|pom.xml|gradle.lockfile)
       return 0
       ;;
     *)
@@ -4853,6 +4857,14 @@ socket_score_json() {
     && socket_cache_replay "$ecosystem" "$cache_name" "$cache_version" "$output"; then
     return 0
   fi
+  # Socket has no Maven/JVM tier: a java score would purl as pkg:java/... and
+  # 400. Skip honestly with the same envelope install.socket.mode=never uses, so
+  # the verdict layer keeps advisories/blocklist/release-age and WARNs — never a
+  # false GO, and never the infra-outage wording a 400 would otherwise produce.
+  if [[ "$ecosystem" == "java" ]]; then
+    jq -n '{available:null,status:"skipped",note:"Socket has no Maven tier"}' > "$output"
+    return 0
+  fi
   # The socket CLI takes a purl type, not safe's ecosystem name. Only npm
   # coincides: "python"/"rust"/"go"/"php" produced pkg:python/... etc., which
   # the API rejects with 400 Bad Request — every non-npm score has been
@@ -5082,6 +5094,7 @@ osv_query_package_json() {
     php) eco="Packagist" ;;
     rust) eco="crates.io" ;;
     go) eco="Go" ;;
+    java) eco="Maven" ;;
     *) eco="$ecosystem" ;;
   esac
   # /v1/query is paginated: a successful page may carry only next_page_token
@@ -7134,6 +7147,7 @@ effective_sources_command() {
     cargo) ecosystem="rust" ;;
     composer) ecosystem="php" ;;
     pip|pypi|uv) ecosystem="python" ;;
+    maven|Maven|gradle|java) ecosystem="java" ;;
   esac
   if [[ -n "$CHECK_INSTALLER" ]]; then
     validate_installer "$CHECK_INSTALLER" || die "unknown --installer: $CHECK_INSTALLER"
@@ -7233,6 +7247,7 @@ package_audit_command() {
     cargo) ecosystem="rust" ;;
     composer) ecosystem="php" ;;
     pip|pypi|uv) ecosystem="python" ;;
+    maven|Maven|gradle|java) ecosystem="java" ;;
   esac
   if [[ -n "$CHECK_INSTALLER" ]]; then
     validate_installer "$CHECK_INSTALLER" || die "unknown --installer: $CHECK_INSTALLER"
@@ -7409,6 +7424,7 @@ package_audit_command() {
     php) osv_eco="Packagist" ;;
     rust) osv_eco="crates.io" ;;
     go) osv_eco="Go" ;;
+    java) osv_eco="Maven" ;;
     *) osv_eco="$ecosystem" ;;
   esac
 
@@ -7988,8 +8004,13 @@ gate_emit_refusal_hints() {
     printf 'safe audit: Socket reports a critical supply-chain-risk alert — do not install or pin around it; operator review only\n' >&2
   fi
   if (( has_socket_disabled )); then
-    printf 'safe audit: the behavioral tier is off (install.socket.mode=never), so this check has no behavioral evidence — advisories, blocklist and release age still applied\n' >&2
-    printf 'safe audit: to run this posture routinely: add socket_disabled to install.auto_allow_tolerate; to re-enable the tier: set install.socket.mode=auto\n' >&2
+    if [[ "$ecosystem" == "java" ]]; then
+      printf 'safe audit: Socket has no Maven tier, so this check has no behavioral evidence — advisories, blocklist and release age still applied\n' >&2
+      printf 'safe audit: JVM/Maven is OSV-covered but not auto-gated (declarative builds have no wrappable install verb); to run this posture routinely: add socket_disabled to install.auto_allow_tolerate\n' >&2
+    else
+      printf 'safe audit: the behavioral tier is off (install.socket.mode=never), so this check has no behavioral evidence — advisories, blocklist and release age still applied\n' >&2
+      printf 'safe audit: to run this posture routinely: add socket_disabled to install.auto_allow_tolerate; to re-enable the tier: set install.socket.mode=auto\n' >&2
+    fi
   fi
   if (( has_socket_not_found )); then
     printf 'safe audit: Socket has no record of this package — an absence of behavioral data, NOT an outage; advisories, blocklist and release age still applied\n' >&2
@@ -8456,7 +8477,7 @@ ioc_machine_scan() {
   while IFS= read -r item; do
     [[ -z "$item" ]] && continue
     output_chunk=$(run_machine_capture "$machine" "
-find ${search_root} -type f \\( -name 'package-lock.json' -o -name 'yarn.lock' -o -name 'pnpm-lock.yaml' -o -name 'bun.lock' -o -name 'uv.lock' -o -name 'poetry.lock' -o -name 'Pipfile.lock' -o -name 'composer.lock' -o -name 'Cargo.lock' -o -name 'go.sum' \\) -print0 2>/dev/null | xargs -0 grep -nH -- $(printf '%q' "$item") 2>/dev/null || true
+find ${search_root} -type f \\( -name 'package-lock.json' -o -name 'yarn.lock' -o -name 'pnpm-lock.yaml' -o -name 'bun.lock' -o -name 'uv.lock' -o -name 'poetry.lock' -o -name 'Pipfile.lock' -o -name 'composer.lock' -o -name 'Cargo.lock' -o -name 'go.sum' -o -name 'pom.xml' -o -name 'gradle.lockfile' \\) -print0 2>/dev/null | xargs -0 grep -nH -- $(printf '%q' "$item") 2>/dev/null || true
 " || true)
     [[ -n "$output_chunk" ]] && package_hits+="${output_chunk}"$'\n'
   done < <(jq -r '.packages[]?.name' "$ioc_json")
