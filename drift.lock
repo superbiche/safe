@@ -8,7 +8,7 @@ sig = "8dab3216df20261a"
 [[bindings]]
 doc = "docs/command-reference.md"
 target = "lib/completions/_safe"
-sig = "5249b39543e6dfde"
+sig = "d5ebd850ae7d3c4e"
 
 [[bindings]]
 doc = "docs/installation.md"

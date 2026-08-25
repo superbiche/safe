@@ -58,6 +58,24 @@ safe audit setup --create-bundle ./scanners.tar.gz
 safe audit setup --machine remote-a --bundle ./scanners.tar.gz
 ```
 
+## Host Allowlist Replication
+
+Bringing up a new machine also means reconciling its host-allow set — the pinned,
+reviewed tools that run outside the sandbox. That set is per-machine by design;
+rather than rediscovering the first machine's set one failed install at a time,
+export it and apply it once, under review:
+
+```bash
+safe run host-allow export > allow.json        # machine 1: portable, no secrets
+safe run host-allow import allow.json --dry-run # machine 2: preview the delta
+safe run host-allow import allow.json           # machine 2: reviewed apply (TTY)
+```
+
+`import` re-validates and re-fetches integrity for every entry, never overwrites
+a divergent local pin, and refuses in non-TTY shells (exit 102) unless
+`--dry-run`. The allow set is deliberately not auto-synced between machines — see
+[Host Allowlist › Fleet replication](safe-run.md#fleet-replication-export--import).
+
 ## Scan Modes
 
 Default scans use `source` mode:

@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SAFE_RUN_VERSION="0.1.0"
+SAFE_RUN_VERSION="0.2.0"
 SAFE_RUN_NO_INIT="${SAFE_RUN_NO_INIT:-0}"
 
 CONFIG_DIR="${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}"
@@ -1282,9 +1282,139 @@ cmd_host_allow() {
     remove|rm) cmd_host_allow_remove "$@" ;;
     update) cmd_host_allow_update "$@" ;;
     review) cmd_host_allow_review "$@" ;;
+    export) cmd_host_allow_export "$@" ;;
+    import) cmd_host_allow_import "$@" ;;
     list|ls|"") cmd_host_allow_list ;;
     *)      die "unknown host-allow subcommand: $sub" ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands: host-allow export / import (fleet machine replication)
+#
+# The allow set is per-machine by design — a security boundary we keep. But
+# reconciling a fresh machine otherwise means rediscovering machine 1's whole
+# WARN-verdict allow set one failed install at a time. export dumps this
+# machine's set as a portable, reviewable document (no secrets — the sha is a
+# public registry integrity hash); import applies a reviewed set in ONE
+# explicit operator-run action. Import is "review this set and apply", never
+# "trust another machine": it re-validates every entry as `add` does,
+# re-fetches integrity from the registry (never trusting the file's sha over a
+# divergent one), refuses to silently overwrite a differing local pin, and is
+# TTY-gated exactly like add/update. Deliberately NOT sync-propagated.
+# ---------------------------------------------------------------------------
+
+HOST_ALLOW_EXPORT_SCHEMA="safe-host-allow-export/1"
+
+cmd_host_allow_export() {
+  # Accept the documented --json spelling; a JSON document is the only form,
+  # since its purpose is to be re-read by `import`. `list` is the human view.
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) shift ;;
+      *) die "unknown flag: $1 (usage: safe run host-allow export [--json])" ;;
+    esac
+  done
+  local packages='{}'
+  [[ -r "$HOST_ALLOW_FILE" ]] && \
+    packages=$(jq -c '.packages // {}' "$HOST_ALLOW_FILE" 2>/dev/null || printf '{}')
+  jq -n --arg schema "$HOST_ALLOW_EXPORT_SCHEMA" --arg exported "$(date -I)" \
+     --argjson packages "$packages" \
+     '{schema: $schema, exported: $exported, packages: $packages}'
+}
+
+cmd_host_allow_import() {
+  local file="" dry_run=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=1; shift ;;
+      -*) die "unknown flag: $1 (usage: safe run host-allow import <file> [--dry-run])" ;;
+      *) [[ -n "$file" ]] && die "usage: safe run host-allow import <file> [--dry-run]"
+         file="$1"; shift ;;
+    esac
+  done
+  [[ -z "$file" ]] && die "usage: safe run host-allow import <file> [--dry-run]"
+  [[ -r "$file" ]] || die "cannot read import file: $file"
+  jq -e . "$file" >/dev/null 2>&1 || die "import file is not valid JSON: $file"
+  local schema
+  schema=$(jq -r '.schema // empty' "$file")
+  [[ "$schema" == "$HOST_ALLOW_EXPORT_SCHEMA" ]] || \
+    die "not a safe host-allow export (expected schema $HOST_ALLOW_EXPORT_SCHEMA); create one with: safe run host-allow export"
+
+  # A real apply writes trust entries: operator-TTY only, gated BEFORE any
+  # evaluation so no flag-parse slip can reach a write from a non-TTY shell.
+  # --dry-run is read-only (an agent may run it to show the operator the delta).
+  (( dry_run == 0 )) && require_operator_tty import "$file"
+
+  local names
+  mapfile -t names < <(jq -r '.packages // {} | keys[]' "$file" 2>/dev/null)
+  if (( ${#names[@]} == 0 )); then
+    info "import: no packages in $file"
+    return 0
+  fi
+
+  local added=0 skipped=0
+  local name version ecosystem file_sha reason kind normalized local_entry local_version fetched_sha
+  for name in "${names[@]}"; do
+    version=$(jq -r --arg p "$name" '.packages[$p].version // empty' "$file")
+    ecosystem=$(jq -r --arg p "$name" '.packages[$p].ecosystem // "npm"' "$file")
+    file_sha=$(jq -r --arg p "$name" '.packages[$p].sha // empty' "$file")
+    reason=$(jq -r --arg p "$name" '.packages[$p].reason // empty' "$file")
+
+    # The file is untrusted external input — validate exactly as `add` does.
+    kind=$(ecosystem_to_runner_kind "$ecosystem") || {
+      warn "skip ${name}: unknown ecosystem '${ecosystem}'"; skipped=$((skipped + 1)); continue; }
+    if [[ -z "$version" || "$version" == "latest" ]]; then
+      warn "skip ${name}: missing or non-pinned version"; skipped=$((skipped + 1)); continue
+    fi
+    if [[ -z "$reason" ]]; then
+      warn "skip ${name}: entry carries no reason (audit trail required)"; skipped=$((skipped + 1)); continue
+    fi
+    normalized=$(normalize_and_validate_package_or_warn "$name" "$kind" "$name") || {
+      skipped=$((skipped + 1)); continue; }
+
+    # Never silently overwrite a divergent local pin.
+    local_entry=$(jq -c --arg p "$normalized" '.packages[$p] // empty' "$HOST_ALLOW_FILE" 2>/dev/null || true)
+    if [[ -n "$local_entry" ]]; then
+      local_version=$(printf '%s' "$local_entry" | jq -r '.version // empty')
+      if [[ "$local_version" == "$version" ]]; then
+        printf '  present  %s@%s (already allowed)\n' "$normalized" "$version" >&2
+        skipped=$((skipped + 1)); continue
+      fi
+      printf '  CONFLICT %s: local pins @%s, import has @%s — resolve with: safe run host-allow update %s@%s --reason "..."\n' \
+        "$normalized" "$local_version" "$version" "$normalized" "$version" >&2
+      skipped=$((skipped + 1)); continue
+    fi
+
+    # Import trusts the registry, not the file: re-fetch integrity. A
+    # present-but-divergent sha means a mutated export or a registry change —
+    # never write it silently.
+    fetched_sha=""
+    case "$ecosystem" in
+      npm|bun) fetched_sha=$(registry_integrity_npm "$normalized" "$version") || true ;;
+      py|python|uv|pipx) fetched_sha=$(registry_integrity_pypi "$normalized" "$version") || true ;;
+    esac
+    if [[ -n "$fetched_sha" && -n "$file_sha" && "$fetched_sha" != "$file_sha" ]]; then
+      warn "skip ${normalized}@${version}: integrity mismatch (file ${file_sha}, registry ${fetched_sha}) — investigate before importing"
+      skipped=$((skipped + 1)); continue
+    fi
+
+    if (( dry_run )); then
+      printf '  would-add %s@%s [%s]\n' "$normalized" "$version" "$ecosystem" >&2
+      added=$((added + 1)); continue
+    fi
+
+    [[ -z "$fetched_sha" ]] && warn "could not fetch integrity for ${normalized}@${version} (imported without SHA)"
+    write_host_allow_entry "$normalized" "$version" "$fetched_sha" "$reason" "$ecosystem"
+    info "imported ${normalized}@${version}"
+    added=$((added + 1))
+  done
+
+  if (( dry_run )); then
+    info "dry-run: ${added} to add, ${skipped} skipped (no changes written)"
+  else
+    info "import complete: ${added} added, ${skipped} skipped"
+  fi
 }
 
 require_operator_tty() {
@@ -2414,6 +2544,12 @@ SUBCOMMANDS
                                               whether each pin still needs its
                                               entry (re-audit); --digest writes
                                               an inbox note when actionable
+  host-allow export [--json]                  Dump this machine's allow set as a
+                                              portable JSON document (for import)
+  host-allow import <file> [--dry-run]        Apply a reviewed allow set (TTY);
+                                              re-validates + re-fetches integrity,
+                                              never overwrites a divergent pin;
+                                              --dry-run previews the delta
   scripts-allow add <pkg>@<x.y.z> --reason "..."
                                               Operator grant (TTY): reviewed
                                               install scripts for one exact
@@ -2469,10 +2605,11 @@ main() {
   argv0=$(basename "$0")
   detect_runner "$argv0"
   if [[ "$SAFE_RUN_NO_INIT" != "1" ]]; then
-    # host-allow review is a read-only report over the trust surface: on a
-    # machine with no run state it must not seed trust files as a side
-    # effect of being asked what that state is.
-    if [[ "$argv0" == "safe-run" && "${1:-}" == "host-allow" && "${2:-}" == "review" ]]; then
+    # host-allow review and export are read-only reports over the trust
+    # surface: on a machine with no run state they must not seed trust files
+    # as a side effect of being asked what that state is.
+    if [[ "$argv0" == "safe-run" && "${1:-}" == "host-allow" \
+          && ( "${2:-}" == "review" || "${2:-}" == "export" ) ]]; then
       :
     else
       ensure_dirs

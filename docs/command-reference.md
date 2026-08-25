@@ -46,6 +46,8 @@ safe run host-allow update <pkg>@<new> --reason "..."
 safe run host-allow remove <pkg>
 safe run host-allow list
 safe run host-allow review [--json] [--digest] [--no-audit]
+safe run host-allow export [--json]
+safe run host-allow import <file> [--dry-run]
 safe run scripts-allow add <pkg>@<x.y.z> --reason "..."
 safe run scripts-allow remove <pkg>
 safe run scripts-allow list

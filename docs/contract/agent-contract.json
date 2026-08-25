@@ -141,7 +141,7 @@
       "purpose": "review refusals"
     }
   ],
-  "allow_flows_note": "Trust escalations require the operator's interactive terminal. `safe run host-allow add` and `update` refuse in non-TTY shells with exit 102, so an agent can suggest the command but never execute it.",
+  "allow_flows_note": "Trust escalations require the operator's interactive terminal. `safe run host-allow add`, `update`, and `import` (without `--dry-run`) refuse in non-TTY shells with exit 102, so an agent can suggest the command but never execute it.",
   "no_partial_load": "Gating is executable-based: a wrapper either runs the full gate or is not on PATH at all. If `safe gate` cannot load its routing tables it refuses with the usual `safe: BLOCKED` line and exit 100 rather than delegating. A bare silent 127 therefore means the command genuinely is not installed — or that `safe` itself is missing from PATH, which is worth reporting.",
   "harness_snippet": "## Package manager gates\n\nThis machine gates package execution/installation through `safe`. If a\ncommand fails with a `safe: BLOCKED` / `safe run: BLOCKED` line or exit code\n100–104, that is policy, not breakage: run `safe explain`, relay the refusal\nand its `to allow:` command to the operator verbatim, and never bypass\n(no direct node_modules/.bin calls, alternate installers, or curl|sh).\nSuspected false positive: `safe report-fp <spec>`."
 }

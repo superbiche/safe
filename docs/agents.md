@@ -140,7 +140,7 @@ is worth reporting to the operator. It is never a reason to bypass.
 ## Allow flows (operator only)
 
 <!-- BEGIN GENERATED: allow-flows -->
-Trust escalations require the operator's interactive terminal. `safe run host-allow add` and `update` refuse in non-TTY shells with exit 102, so an agent can suggest the command but never execute it.
+Trust escalations require the operator's interactive terminal. `safe run host-allow add`, `update`, and `import` (without `--dry-run`) refuse in non-TTY shells with exit 102, so an agent can suggest the command but never execute it.
 
 ```bash
 safe run host-allow add <pkg>@<version> --reason "..."   # trusted host exec (npm)

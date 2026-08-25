@@ -125,6 +125,47 @@ entries; an existing note for the day is never overwritten. `install.sh
 --review-timer` installs a weekly systemd user timer
 (`safe-host-allow-review.timer`) that runs `review --digest`.
 
+### Fleet replication (export / import)
+
+The allow set is per-machine by design — that boundary is a feature, not a gap.
+But bringing up a second machine otherwise means rediscovering the first
+machine's whole WARN-verdict allow set one failed install at a time. `export`
+and `import` replace that discover-by-failure loop with one reviewed apply,
+without weakening the boundary:
+
+```bash
+# On machine 1: dump the allow set as a portable, reviewable document.
+safe run host-allow export > allow.json
+
+# On machine 2: preview what a reviewed apply would change (read-only, no TTY).
+safe run host-allow import allow.json --dry-run
+
+# Then apply it in one explicit operator-run action (interactive terminal).
+safe run host-allow import allow.json
+```
+
+The exported document (`schema: safe-host-allow-export/1`) carries only
+`name@version`, ecosystem, the public registry integrity hash, the original
+`--reason`, and the add date. There are no secrets in it.
+
+`import` is *"review this set and apply"*, never *"trust another machine"*:
+
+- It is an operator-only trust escalation, TTY-gated exactly like `add`/`update`
+  — a real apply refuses in non-TTY shells with exit 102. `--dry-run` is the one
+  read-only exception, so a cooperative agent can show the operator the delta.
+- Every entry is re-validated (name, ecosystem, pinned version, non-empty
+  reason) as if it were typed into `add`; the file is treated as untrusted input.
+- Integrity is **re-fetched from the registry**, not trusted from the file. A
+  present-but-divergent hash (a mutated export, or a registry change) is skipped
+  loudly rather than written.
+- A package already pinned locally to a *different* version is never silently
+  overwritten — the conflict is reported and left for an explicit
+  `host-allow update`.
+
+Deliberately, the allow set is **not** Syncthing- or otherwise auto-synced
+between machines: silent fleet propagation is exactly what the per-machine
+boundary exists to prevent. `export`/`import` keep the human review in the loop.
+
 ## Scripts Allowlist
 
 `~/.npmrc` keeps `ignore-scripts=true` globally, so a package whose
