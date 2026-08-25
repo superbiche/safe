@@ -220,6 +220,16 @@ func TestDecodeRejectsAmbiguousDocuments(t *testing.T) {
 			        "checks":{"checksum":{"enabled":true},"checksum":{"enabled":false}}}`,
 			wantSub: `"checks.checksum" is given more than once`,
 		},
+		{
+			// DisallowUnknownFields does not save us: encoding/json matches
+			// `Spec_Version` to the spec_version field case-insensitively, so it is
+			// a duplicate that decodes to one field with byte order deciding the
+			// value. The shared repeat walker folds the key and refuses it.
+			name: "case-folded duplicate member",
+			spec: `{"spec_version":1,"Spec_Version":2,"subject":{"repo":"o/r","version":"v1"},
+			        "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}]}`,
+			wantSub: `"Spec_Version" is given more than once`,
+		},
 	}
 
 	for _, testCase := range cases {

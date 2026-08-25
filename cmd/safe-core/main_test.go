@@ -211,6 +211,32 @@ func TestPackageVerdictRefusesRepeatedMember(t *testing.T) {
 	}
 }
 
+// encoding/json binds object members to struct fields case-insensitively, so a
+// case-folded alias of a required key (`Blocklist` vs `blocklist`) decodes to the
+// same field, and which one wins is decided by byte order — the exact bug the
+// repeat check exists to refuse. RequireShape does not close it (it only requires
+// the canonical lowercase member to be present), so the alias must be caught as a
+// repeat. Both byte orders must refuse; without the fold one would BLOCK and the
+// other GO.
+func TestPackageVerdictRefusesCaseFoldedRepeatedMember(t *testing.T) {
+	adverseAlias := `"Blocklist":{"readable":true,"reason":"blocked by alias","path":"/tmp/blocklist"}`
+	orders := map[string]string{
+		"alias last":  completeEvidence[:len(completeEvidence)-1] + `,` + adverseAlias + `}`,
+		"alias first": `{` + adverseAlias + `,` + completeEvidence[1:],
+	}
+	for name, doc := range orders {
+		t.Run(name, func(t *testing.T) {
+			code, stdout, stderr := runVerdict(t, doc)
+			if code != 3 || stdout != "" {
+				t.Fatalf("run() = %d stdout=%q, want 3 with no verdict", code, stdout)
+			}
+			if !strings.Contains(stderr, "given more than once") {
+				t.Fatalf("stderr %q, want it to name the repeated member", stderr)
+			}
+		})
+	}
+}
+
 // A malware record inside the affecting list must BLOCK on the strength of the
 // list alone, with no count field anywhere in the document.
 func TestPackageVerdictBlocksMalwareFromListAlone(t *testing.T) {

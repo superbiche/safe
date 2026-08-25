@@ -257,6 +257,9 @@ it, which is what keeps the schema example above valid.
     lowercased).
   - `targets` — required, at least one entry, mapping a TUF target name to the
     local file that must match it. Every name and every path must be non-empty.
+    A name may contain `/` (TUF target names are path-like) but must be relative
+    and carry no `..` segment: the name is joined onto the mirror's targets tree,
+    where an absolute or climbing name would resolve out of it (divergence 16).
 - `checks.exec` — when enabled:
   - `artifact` — required. A **free path**: the executable to smoke, typically
     something extracted from a distributed artifact. It need **not** name an
@@ -306,8 +309,10 @@ Beyond decode and field validation, these spec conditions are refused:
 - **A `tuf` block that cannot describe a bootstrap**: a mirror that is absent or
   names a scheme other than `file://`, an absent or non-sha256 `root_checksum`,
   an absent `root`, or a `targets` map that is empty or holds an empty name or
-  path. A multi-target spec's refusal names targets in sorted order, so the line
-  does not depend on JSON key order either.
+  path — or a target name that is absolute or contains a `..` segment, which
+  would escape the mirror's targets tree (divergence 16). A multi-target spec's
+  refusal names targets in sorted order, so the line does not depend on JSON key
+  order either.
 - **A `release` block naming no `asset`.**
 - **An `exec` block naming no `artifact`, or a negative `timeout_seconds`.**
 
@@ -510,7 +515,7 @@ always `ERROR` here.
 | `trust_root_mismatch` | BLOCK | `root`, `expected_root_checksum`, `actual_root_checksum` | the root.json on disk is not the pinned root |
 | `bootstrap_failure` | BLOCK | — | `cosign initialize` failed, or succeeded without caching trusted targets metadata, or cached metadata that cannot be read as TUF targets JSON |
 | `policy_mismatch` | BLOCK | `target` | the trusted metadata does not name this target at all |
-| `trusted_mirror_target_invalid` | BLOCK | `target`, `mirror_blob_path`, and `trusted_metadata_sha256`/`actual_mirror_blob_sha256` on a content mismatch | the mirror is missing the blob its own trusted metadata names, or serves one that does not hash to it |
+| `trusted_mirror_target_invalid` | BLOCK | `target`, `mirror_blob_path`, and `trusted_metadata_sha256`/`actual_mirror_blob_sha256` on a content mismatch; only `target` and `trusted_metadata_sha256` when the trusted digest itself is not a sha256 | the mirror is missing the blob its own trusted metadata names, serves one that does not hash to it, or the trusted metadata's digest is not a sha256 (refused before it is joined into the blob path — divergence 16) |
 | `trust_material_mismatch` | BLOCK | `target`, `local_sha256`, `trusted_sha256`, `trusted_length` | the caller's local copy is not the trusted target |
 | `trust_root_unreadable` | ERROR | `root`, `error` | the root exists and cannot be hashed |
 | `trust_target_unreadable` | ERROR | `target`, `error` | a local target exists and cannot be hashed |
@@ -551,6 +556,7 @@ is reproducible byte-for-byte across runs.
 | `timeout` | WARN | `timeout_seconds` | the binary did not exit within the effective timeout |
 | `runtime_failure` | WARN | `exit_code`, and `stdout_summary`/`stderr_summary` when non-empty | the binary exited nonzero inside the sandbox |
 | `artifact_unreadable` | ERROR | `artifact_path`, `error` | the artifact path could not be resolved against the working directory |
+| `artifact_path_unmappable` | ERROR | `artifact_path` | the artifact's directory path contains a `:`, which podman would mis-split in the `-v` mount, so the sandbox cannot be built (divergence 17) |
 | `tool_missing` | ERROR | — | podman is not installed |
 
 Runtime observations are `WARN` because of what this check can and cannot say:

@@ -380,8 +380,6 @@ func (e *ExecCheck) validate() error {
 	return nil
 }
 
-// normalizeSHA256 accepts a digest with an optional sha256: prefix in any case
-// and returns it lowercased, or false when it is not 64 hex characters.
 // rejectUnsafeTargetName refuses a trust target name that would escape the
 // directory it is joined into. TUF names may contain `/`, so a name is refused
 // only when it is absolute or carries a `..` segment — the shapes that
@@ -398,6 +396,8 @@ func rejectUnsafeTargetName(name string) error {
 	return nil
 }
 
+// normalizeSHA256 accepts a digest with an optional sha256: prefix in any case
+// and returns it lowercased, or false when it is not 64 hex characters.
 func normalizeSHA256(raw string) (string, bool) {
 	digest := strings.ToLower(strings.TrimPrefix(raw, "sha256:"))
 	if !sha256Hex.MatchString(digest) {

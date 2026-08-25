@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // RejectRepeatedMembers walks the document's tokens and refuses any object that
@@ -57,10 +58,19 @@ func walkForRepeats(decoder *json.Decoder, token json.Token, path string) error 
 			if !ok {
 				return nil
 			}
-			if seen[key] {
+			// Fold to the consuming decoder's matching rule before comparing.
+			// encoding/json binds an object member to a struct field
+			// case-insensitively, so `Blocklist` and `blocklist` decode to the
+			// SAME field and the later occurrence silently wins — the exact
+			// byte-order-decides-the-value bug an exact-string compare would miss.
+			// Members here are ASCII identifiers, for which ToLower is that fold;
+			// being no looser than the decoder, it never rejects two members the
+			// decoder would keep distinct.
+			folded := strings.ToLower(key)
+			if seen[folded] {
 				return fmt.Errorf("%q is given more than once", path+key)
 			}
-			seen[key] = true
+			seen[folded] = true
 
 			valueToken, err := decoder.Token()
 			if err != nil {

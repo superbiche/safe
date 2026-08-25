@@ -28,6 +28,18 @@ func TestRejectRepeatedMembers(t *testing.T) {
 			wantSub: `"list.k" is given more than once`,
 		},
 		{
+			// encoding/json binds both to the same field case-insensitively, so
+			// they are a repeat the exact-string compare would have missed.
+			name:    "case-folded duplicate (matches the decoder's field folding)",
+			raw:     `{"blocklist":1,"Blocklist":2}`,
+			wantSub: `"Blocklist" is given more than once`,
+		},
+		{
+			name:    "case-folded duplicate, alias first",
+			raw:     `{"Blocklist":1,"blocklist":2}`,
+			wantSub: `"blocklist" is given more than once`,
+		},
+		{
 			name: "same key in sibling array elements is not a repeat",
 			raw:  `{"list":[{"k":1},{"k":2}]}`,
 		},
