@@ -133,6 +133,23 @@ func TestTUFBootstrapTimeoutIsErrorNotBlock(t *testing.T) {
 	}
 }
 
+// A cosign initialize that exits but leaves a child holding its output pipe is
+// os/exec stalling on I/O (exec.ErrWaitDelay), not a bootstrap that failed. Like
+// the context-deadline timeout, it is ERROR (bootstrap_timeout), never a BLOCK.
+func TestTUFBootstrapPipeStallIsErrorNotBlock(t *testing.T) {
+	spec, _, _ := tufFixture(t)
+	lowerCosignKillDelay(t, 200*time.Millisecond)
+	t.Setenv("MOCK_COSIGN_ORPHAN", "2")
+
+	result := tuf(spec)
+	if result.Verdict != ERROR {
+		t.Fatalf("verdict %s, want ERROR: %v", result.Verdict, codes(result))
+	}
+	if got := codes(result); len(got) != 1 || got[0] != "bootstrap_timeout" {
+		t.Fatalf("reasons %v, want [bootstrap_timeout]", got)
+	}
+}
+
 // cosign exiting 0 without caching trusted metadata is not a success: there is
 // nothing to compare the local material against, and treating that as a pass
 // would be the silent GO this gate exists to prevent.

@@ -25,6 +25,10 @@ const (
 	// How many Link rel="next" hops a paginated listing may follow. Hitting it
 	// is reported, never silently truncated.
 	githubMaxPages = 10
+	// How many HTTP redirects a single request may follow. A custom
+	// CheckRedirect replaces Go's default policy, and the default 10-hop cap goes
+	// with it, so the same bound is re-imposed here.
+	githubMaxRedirects = 10
 )
 
 // githubError is a failed GitHub request, classified into the only two things a
@@ -60,11 +64,41 @@ func newGitHubClient() *githubClient {
 	if base == "" {
 		base = defaultGitHubAPIBaseURL
 	}
-	return &githubClient{
+	client := &githubClient{
 		baseURL: base,
 		token:   os.Getenv("GITHUB_TOKEN"),
-		http:    &http.Client{Timeout: githubRequestTimeout},
 	}
+	// A custom CheckRedirect replaces Go's default redirect policy, which copies
+	// the Authorization header onto a same-host-or-subdomain target by hostname
+	// alone — dropping scheme and port, so it is looser than the origin the token
+	// is pinned to. The default 10-hop cap goes with the default policy, so it is
+	// re-imposed in the callback.
+	client.http = &http.Client{
+		Timeout:       githubRequestTimeout,
+		CheckRedirect: client.stripTokenOnForeignRedirect,
+	}
+	return client
+}
+
+// stripTokenOnForeignRedirect keeps GITHUB_TOKEN pinned to the base origin across
+// redirects, not just on the first request.
+//
+// Go copies the Authorization header onto a redirect whose host equals or is a
+// subdomain of the original — and it decides that by hostname alone, so a
+// same-host port change, an https→http downgrade, or a subdomain all keep the
+// header. The composite pins the token to the whole origin, so the header is
+// removed on any hop the direct-URL check would reject. This callback runs after
+// Go's own header copy, so deleting the header here is authoritative; nothing
+// re-adds it on a later hop.
+func (c *githubClient) stripTokenOnForeignRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= githubMaxRedirects {
+		return fmt.Errorf("stopped after %d redirects", githubMaxRedirects)
+	}
+	base, err := neturl.Parse(c.baseURL)
+	if err != nil || !sameGitHubOrigin(base, req.URL) {
+		req.Header.Del("Authorization")
+	}
+	return nil
 }
 
 // get fetches one API path and decodes the JSON body into out. It returns the
@@ -132,10 +166,8 @@ func (c *githubClient) get(pathOrURL string, out any) (string, *githubError) {
 //
 // On a base URL or a target that will not parse, the token is withheld: a
 // destination that cannot be shown to match is not one to trust with a
-// credential. Comparing scheme as well as host also refuses an https→http
-// downgrade of the same host, and the whole-URL parse rejects the
-// userinfo trick (https://api.github.com@evil.example), where the host is
-// evil.example.
+// credential. The whole-URL parse rejects the userinfo trick
+// (https://api.github.com@evil.example), where the host is evil.example.
 func (c *githubClient) tokenTargetTrusted(target string) bool {
 	base, err := neturl.Parse(c.baseURL)
 	if err != nil {
@@ -145,7 +177,39 @@ func (c *githubClient) tokenTargetTrusted(target string) bool {
 	if err != nil {
 		return false
 	}
-	return destination.Scheme == base.Scheme && strings.EqualFold(destination.Host, base.Host)
+	return sameGitHubOrigin(base, destination)
+}
+
+// sameGitHubOrigin reports whether target shares the base URL's origin — scheme,
+// host and effective port — the only origin GITHUB_TOKEN is attached to.
+//
+// The effective port folds a scheme's default (443 for https, 80 for http) into
+// the comparison, so an explicit `:443` under https equals its omitted form and
+// a same-origin request does not silently lose its token over a port the URL
+// merely spelled out; a genuinely different port stays foreign. Host is compared
+// case-insensitively. Scheme is matched exactly, so an https→http downgrade of
+// the same host is foreign.
+func sameGitHubOrigin(base, target *neturl.URL) bool {
+	return target.Scheme == base.Scheme &&
+		strings.EqualFold(target.Hostname(), base.Hostname()) &&
+		effectivePort(target) == effectivePort(base)
+}
+
+// effectivePort is the URL's port, or the scheme's default when none is spelled
+// out. An unknown scheme has no default, which keeps two unknown-scheme URLs
+// comparable only when they carry the same explicit port.
+func effectivePort(u *neturl.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	switch u.Scheme {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	default:
+		return ""
+	}
 }
 
 // getPaged walks a listing, appending each page through collect, and reports

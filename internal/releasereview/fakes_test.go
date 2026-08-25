@@ -4,9 +4,26 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+// countLines reports how many lines a file holds, used to count how many times
+// the fake cosign was invoked (it appends one line per verify-blob to
+// MOCK_COSIGN_CALL_LOG).
+func countLines(t *testing.T, path string) int {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	trimmed := strings.TrimRight(string(content), "\n")
+	if trimmed == "" {
+		return 0
+	}
+	return strings.Count(trimmed, "\n") + 1
+}
 
 // lowerCosignTimeout shortens the cosign subprocess deadline for one test and
 // restores it afterward, so a test can drive a real timeout against a fake
@@ -18,6 +35,16 @@ func lowerCosignTimeout(t *testing.T, d time.Duration) {
 	previous := cosignSubprocessTimeout
 	cosignSubprocessTimeout = d
 	t.Cleanup(func() { cosignSubprocessTimeout = previous })
+}
+
+// lowerCosignKillDelay shortens the WaitDelay grace for one test, so the
+// pipe-drain stall an orphaned child produces (MOCK_COSIGN_ORPHAN) is reached in
+// milliseconds instead of the production five seconds. Same non-parallel caveat.
+func lowerCosignKillDelay(t *testing.T, d time.Duration) {
+	t.Helper()
+	previous := cosignKillDelay
+	cosignKillDelay = d
+	t.Cleanup(func() { cosignKillDelay = previous })
 }
 
 // The checks in this package shell out to cosign and podman, so the tests put
@@ -39,7 +66,7 @@ const (
 // linked in because PATH is replaced rather than prepended: a real cosign on
 // the developer's machine must not be reachable from a test that asked for
 // none, and "tool missing" is otherwise not something a test can state.
-var fakeHelpers = []string{"bash", "cat", "cp", "dirname", "mkdir", "sleep"}
+var fakeHelpers = []string{"bash", "cat", "cp", "dirname", "mkdir", "sleep", "wc"}
 
 // withFakeTools builds a bin dir holding the named fakes, points PATH at it
 // alone, and returns the dir. Naming no tool is how a test says "this tool is
@@ -90,11 +117,32 @@ set -euo pipefail
 command_name="${1:-}"
 shift || true
 
-# MOCK_COSIGN_SLEEP makes an invocation outlive its deadline, the way
-# MOCK_PODMAN_SLEEP does for the exec check. exec replaces this shell so the
-# deadline's SIGTERM lands on sleep directly rather than orphaning it behind
-# bash — nothing after the sleep is meant to run when a test asks cosign to hang.
-if [[ -n "${MOCK_COSIGN_SLEEP:-}" ]]; then
+# MOCK_COSIGN_ORPHAN: cosign exits cleanly but leaves a child holding its stdout
+# pipe past the parent's exit. os/exec then waits WaitDelay and gives up with
+# exec.ErrWaitDelay — the pipe-drain stall, which is not the context deadline. A
+# backgrounded sleep inherits stdout; the parent exits 0 at once.
+if [[ -n "${MOCK_COSIGN_ORPHAN:-}" ]]; then
+  sleep "$MOCK_COSIGN_ORPHAN" &
+  exit 0
+fi
+
+# Per-invocation counter (verify-blob only): a test can both assert which calls
+# were made (line count) and hang a chosen one.
+call_index=0
+if [[ "$command_name" == "verify-blob" && -n "${MOCK_COSIGN_CALL_LOG:-}" ]]; then
+  printf 'x\n' >> "$MOCK_COSIGN_CALL_LOG"
+  call_index=$(( $(wc -l < "$MOCK_COSIGN_CALL_LOG") ))
+fi
+
+# MOCK_COSIGN_SLEEP hangs every invocation; MOCK_COSIGN_SLEEP_ON_CALL hangs only
+# the Nth verify-blob. exec replaces this shell so the deadline's SIGTERM lands
+# on sleep directly rather than orphaning it behind bash — nothing after the
+# sleep is meant to run when a test asks cosign to hang.
+if [[ -n "${MOCK_COSIGN_SLEEP_ON_CALL:-}" ]]; then
+  if [[ "$call_index" == "$MOCK_COSIGN_SLEEP_ON_CALL" ]]; then
+    exec sleep "${MOCK_COSIGN_SLEEP:-5}"
+  fi
+elif [[ -n "${MOCK_COSIGN_SLEEP:-}" ]]; then
   exec sleep "$MOCK_COSIGN_SLEEP"
 fi
 

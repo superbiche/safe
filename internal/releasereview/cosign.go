@@ -2,6 +2,7 @@ package releasereview
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"syscall"
 	"time"
@@ -17,8 +18,10 @@ var cosignSubprocessTimeout = 2 * time.Minute
 
 // cosignKillDelay mirrors the exec check's kill delay: a cosign that ignores the
 // SIGTERM the deadline sends still gets killed rather than wedging the Wait that
-// bounds the review.
-const cosignKillDelay = 5 * time.Second
+// bounds the review. It is also the grace Wait gives a descendant that outlives
+// cosign while still holding an output pipe. A var, not a const, so a test can
+// lower it to drive that pipe-drain path without a real five-second wait.
+var cosignKillDelay = 5 * time.Second
 
 // cosignRun runs cosign under a deadline and reports a timeout distinctly from a
 // nonzero exit.
@@ -45,8 +48,15 @@ func cosignRun(env []string, args ...string) (output string, timedOut bool, err 
 	command.WaitDelay = cosignKillDelay
 
 	out, runErr := command.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
-		return string(out), true, ctx.Err()
+	// Two shapes are the same "cosign did not answer in bounded time" event. The
+	// context deadline firing is the plain timeout. exec.ErrWaitDelay is the
+	// subtler one: cosign itself exited, but a descendant it left behind kept an
+	// output pipe open past the WaitDelay, so os/exec gave up waiting and closed
+	// the pipes. Both are the review stalling on its own tooling, never a verdict
+	// about the release — reported the same, as a timeout, so a caller never
+	// classifies either as a BLOCK.
+	if ctx.Err() == context.DeadlineExceeded || errors.Is(runErr, exec.ErrWaitDelay) {
+		return string(out), true, runErr
 	}
 	return string(out), false, runErr
 }

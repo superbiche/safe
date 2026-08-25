@@ -358,6 +358,53 @@ func TestSignatureVerificationTimeoutIsErrorNotBlock(t *testing.T) {
 	}
 }
 
+// A cosign that exits but leaves a child holding its output pipe is os/exec
+// stalling on I/O (exec.ErrWaitDelay), not a signature that failed to verify. It
+// must read ERROR (verification_timeout), never a BLOCK — the same infrastructure
+// classification a context-deadline timeout gets.
+func TestSignaturePipeStallIsErrorNotBlock(t *testing.T) {
+	artifact, bundle, checksums := signatureFixture(t)
+	lowerCosignKillDelay(t, 200*time.Millisecond)
+	t.Setenv("MOCK_COSIGN_ORPHAN", "2")
+
+	result, verified := signature(signatureSpec(artifact, bundle, checksums, mockIdentity, mockIssuer))
+	if result.Verdict != ERROR {
+		t.Fatalf("verdict %s, want ERROR: %v", result.Verdict, codes(result))
+	}
+	if got := codes(result); len(got) != 1 || got[0] != "verification_timeout" {
+		t.Fatalf("reasons %v, want [verification_timeout]", got)
+	}
+	if len(verified) != 0 {
+		t.Fatalf("a stalled verification still marked %v verified", verified)
+	}
+}
+
+// When the identity probe times out, the issuer probe is not launched: a tool
+// that just failed to answer cannot be re-probed, and the report is already
+// ERROR. The split-policy fake makes the main verification fail and the
+// permissive re-probe pass, so the cascade reaches the identity probe — the third
+// verify-blob — and hanging exactly that one must leave the fourth call unmade.
+func TestSignatureIdentityTimeoutDoesNotLaunchIssuerProbe(t *testing.T) {
+	artifact, bundle, checksums := signatureFixture(t)
+	t.Setenv("MOCK_COSIGN_SPLIT_POLICY", "1")
+	callLog := writeFile(t, t.TempDir(), "calls", "")
+	t.Setenv("MOCK_COSIGN_CALL_LOG", callLog)
+	t.Setenv("MOCK_COSIGN_SLEEP_ON_CALL", "3")
+	t.Setenv("MOCK_COSIGN_SLEEP", "5")
+	lowerCosignTimeout(t, 200*time.Millisecond)
+
+	result, _ := signature(signatureSpec(artifact, bundle, checksums, mockIdentity, mockIssuer))
+	if result.Verdict != ERROR {
+		t.Fatalf("verdict %s, want ERROR: %v", result.Verdict, codes(result))
+	}
+	if got := codes(result); len(got) != 1 || got[0] != "verification_timeout" {
+		t.Fatalf("reasons %v, want [verification_timeout]", got)
+	}
+	if calls := countLines(t, callLog); calls != 3 {
+		t.Fatalf("cosign verify-blob was invoked %d times, want 3 — the issuer probe must not launch", calls)
+	}
+}
+
 func TestFirstLineSummaryIsBounded(t *testing.T) {
 	long := ""
 	for range 400 {

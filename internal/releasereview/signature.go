@@ -155,11 +155,18 @@ func verifyArtifact(result *CheckResult, artifact Artifact, evidence *SignatureE
 
 	_, identityTimedOut, identityErr := cosignVerifyBlob(artifact.Path, evidence.Bundle,
 		append(identityPolicy, "--certificate-oidc-issuer-regexp", ".*"))
+	if identityTimedOut {
+		// The issuer probe is not launched: a tool that just failed to answer
+		// within its deadline cannot be re-probed into one, and starting it would
+		// only hold the review for another deadline without changing the ERROR.
+		reportTimeout()
+		return false
+	}
 	_, issuerTimedOut, issuerErr := cosignVerifyBlob(artifact.Path, evidence.Bundle, []string{
 		"--certificate-identity-regexp", ".*",
 		"--certificate-oidc-issuer", evidence.OIDCIssuer,
 	})
-	if identityTimedOut || issuerTimedOut {
+	if issuerTimedOut {
 		reportTimeout()
 		return false
 	}
