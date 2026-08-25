@@ -807,3 +807,26 @@ still cannot claim a behavior nothing checks.
     release. No corpus pair accompanies this either — a timeout is not reproducible
     through the fixture corpus without a deliberately hanging cosign; the Go unit
     tests drive it by lowering the deadline against a fake asked to sleep.
+16. **A trust target name that escapes its directory is refused** (`tuf`). The
+    target name is joined onto `<mirror>/targets` and onto the materialized
+    targets directory to build the paths this check hashes, and `filepath.Join`
+    runs `Clean`, which *resolves* a `..` rather than neutralizing it — so a name
+    like `../../etc/passwd` (or an absolute one) would steer those reads out of
+    the mirror. TUF names are path-like and legitimately contain `/`, so only the
+    traversal shapes are refused: an absolute name or one carrying a `..` segment
+    is rejected at spec validation (exit 3), before any check runs. The
+    metadata-supplied digest is spliced into the same blob path, so a non-hex
+    digest is refused at the check as `trusted_mirror_target_invalid` for the same
+    reason. The bash lane joined both unchecked. No corpus pair: this refuses a
+    hostile spec rather than changing a verdict on a legitimate one; `spec_test.go`
+    and `tuf_test.go` carry the coverage.
+17. **An artifact directory path containing `:` is refused** (`exec`). The
+    artifact's directory is bind-mounted as `<dir>:/artifact:ro,z`, and podman
+    splits a `-v` spec on `:`; a directory path with a colon would mis-split into
+    a bogus source, destination and options. The sandbox this check depends on
+    cannot then be built safely, so it is `ERROR` (`artifact_path_unmappable`) —
+    the review failing to run — never a finding about the release, the same
+    posture as a missing `podman` (divergence 3). The bash lane spliced the path
+    into the `-v` argument unchecked. No corpus pair: it changes behavior only on
+    a pathological path, not a verdict on a legitimate fixture; `exec_test.go`
+    carries the coverage.

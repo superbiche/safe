@@ -195,6 +195,22 @@ func TestPackageVerdictRefusesIncompleteEvidence(t *testing.T) {
 	}
 }
 
+// A repeated member resolves by byte order in encoding/json — the writer's last
+// occurrence silently wins — so two conflicting values for one fact would decide
+// the verdict by serialization. The decision layer refuses a duplicated member
+// before it reads anything, even on otherwise-complete evidence. The evidence is
+// machine-assembled by jq inside safe-audit, so this is defense in depth.
+func TestPackageVerdictRefusesRepeatedMember(t *testing.T) {
+	doc := `{"resolution": {"ok": false},` + completeEvidence[1:]
+	code, stdout, stderr := runVerdict(t, doc)
+	if code != 3 || stdout != "" {
+		t.Fatalf("run() = %d stdout=%q, want 3 with no verdict", code, stdout)
+	}
+	if !strings.Contains(stderr, "given more than once") {
+		t.Fatalf("stderr %q, want it to name the repeated member", stderr)
+	}
+}
+
 // A malware record inside the affecting list must BLOCK on the strength of the
 // list alone, with no count field anywhere in the document.
 func TestPackageVerdictBlocksMalwareFromListAlone(t *testing.T) {

@@ -25,10 +25,12 @@ import (
 // corpus pinned and no per-check test covers.
 //
 // Ledger entries 5–9 remove a bash dependency or bound a resource without
-// changing a verdict on identical inputs, and entries 14–15 change a request
-// property or need a hanging subprocess; none had a corpus pair (the ledger
-// says so per entry), so none has a golden here. Their unit coverage lives in
-// github_test.go, signature_test.go and exec_test.go.
+// changing a verdict on identical inputs, entries 14–15 change a request
+// property or need a hanging subprocess, and entries 16–17 refuse a hostile or
+// pathological input rather than changing a verdict on a legitimate one; none
+// had a corpus pair (the ledger says so per entry), so none has a golden here.
+// Their unit coverage lives in github_test.go, signature_test.go, exec_test.go,
+// spec_test.go and tuf_test.go.
 
 // reportHasCode reports whether any check in the composite report raised the
 // given reason code.

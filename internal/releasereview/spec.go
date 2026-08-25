@@ -24,6 +24,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/superbiche/safe/internal/strictjson"
 )
 
 // Check identifiers, in the fixed order they appear in a report.
@@ -176,77 +178,14 @@ func Decode(r io.Reader) (Spec, error) {
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		return Spec{}, fmt.Errorf("read spec: the spec must be exactly one JSON document")
 	}
-	if err := rejectRepeatedMembers(raw); err != nil {
-		return Spec{}, err
+	if err := strictjson.RejectRepeatedMembers(raw); err != nil {
+		return Spec{}, fmt.Errorf("read spec: %w", err)
 	}
 
 	if err := spec.normalize(); err != nil {
 		return Spec{}, err
 	}
 	return spec, nil
-}
-
-// rejectRepeatedMembers walks the document's tokens and refuses any object
-// that names the same member twice, at any depth.
-func rejectRepeatedMembers(raw []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	token, err := decoder.Token()
-	if err != nil {
-		// Unreachable: the strict decode above already accepted these bytes.
-		return nil
-	}
-	return walkForRepeats(decoder, token, "")
-}
-
-func walkForRepeats(decoder *json.Decoder, token json.Token, path string) error {
-	delim, ok := token.(json.Delim)
-	if !ok {
-		return nil
-	}
-
-	switch delim {
-	case '{':
-		seen := make(map[string]bool)
-		for {
-			keyToken, err := decoder.Token()
-			if err != nil {
-				return nil
-			}
-			if end, ok := keyToken.(json.Delim); ok && end == '}' {
-				return nil
-			}
-			key, ok := keyToken.(string)
-			if !ok {
-				return nil
-			}
-			if seen[key] {
-				return fmt.Errorf("read spec: %q is given more than once", path+key)
-			}
-			seen[key] = true
-
-			valueToken, err := decoder.Token()
-			if err != nil {
-				return nil
-			}
-			if err := walkForRepeats(decoder, valueToken, path+key+"."); err != nil {
-				return err
-			}
-		}
-	case '[':
-		for {
-			elementToken, err := decoder.Token()
-			if err != nil {
-				return nil
-			}
-			if end, ok := elementToken.(json.Delim); ok && end == ']' {
-				return nil
-			}
-			if err := walkForRepeats(decoder, elementToken, path); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 // normalize validates the spec and fills the defaults the schema documents.
@@ -402,6 +341,15 @@ func (t *TUFCheck) normalize() error {
 		if name == "" {
 			return fmt.Errorf("checks.tuf.targets has an empty target name")
 		}
+		// The name is joined onto <mirror>/targets and onto the materialized
+		// targets dir to build the paths this check hashes. filepath.Join runs
+		// Clean, which *resolves* a `..` rather than neutralizing it, so a name
+		// escaping its directory could steer those reads at an arbitrary file.
+		// TUF names are path-like and legitimately contain `/`, so only the
+		// traversal shapes are refused, not every separator.
+		if err := rejectUnsafeTargetName(name); err != nil {
+			return fmt.Errorf("checks.tuf.targets[%q]: %w", name, err)
+		}
 		if t.Targets[name] == "" {
 			return fmt.Errorf("checks.tuf.targets[%q] is empty — every trust target needs a local path", name)
 		}
@@ -434,6 +382,22 @@ func (e *ExecCheck) validate() error {
 
 // normalizeSHA256 accepts a digest with an optional sha256: prefix in any case
 // and returns it lowercased, or false when it is not 64 hex characters.
+// rejectUnsafeTargetName refuses a trust target name that would escape the
+// directory it is joined into. TUF names may contain `/`, so a name is refused
+// only when it is absolute or carries a `..` segment — the shapes that
+// filepath.Join's Clean would resolve out of the targets tree.
+func rejectUnsafeTargetName(name string) error {
+	if filepath.IsAbs(name) {
+		return fmt.Errorf("a trust target name must be relative")
+	}
+	for _, segment := range strings.Split(filepath.ToSlash(name), "/") {
+		if segment == ".." {
+			return fmt.Errorf("a trust target name must not contain a %q path segment", "..")
+		}
+	}
+	return nil
+}
+
 func normalizeSHA256(raw string) (string, bool) {
 	digest := strings.ToLower(strings.TrimPrefix(raw, "sha256:"))
 	if !sha256Hex.MatchString(digest) {

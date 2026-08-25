@@ -182,6 +182,31 @@ func TestTUFTargetNotNamedByTrustedMetadata(t *testing.T) {
 	}
 }
 
+// The digest comes from the trusted metadata and is spliced into the blob path
+// <mirror>/targets/<sha>.<name>, where filepath.Join's Clean would resolve a
+// `..` out of the targets tree. checkTarget refuses a non-hex digest before it
+// builds that path, so a hostile digest cannot steer the read — nor could the
+// mismatch branch report the sha256 of an out-of-tree file it hashed.
+func TestTUFTrustedMetadataDigestMustBeSHA256(t *testing.T) {
+	var metadata tufTargetsMetadata
+	if err := json.Unmarshal(
+		[]byte(`{"signed":{"targets":{"n":{"hashes":{"sha256":"../../../etc/passwd"},"length":1}}}}`),
+		&metadata); err != nil {
+		t.Fatalf("fixture metadata did not parse: %v", err)
+	}
+	config := &TUFCheck{Mirror: t.TempDir(), Targets: map[string]string{"n": "p"}}
+	result := CheckResult{Reasons: []Reason{}}
+
+	checkTarget(&result, config, metadata, t.TempDir(), "n", false)
+
+	if got := codes(result); len(got) != 1 || got[0] != "trusted_mirror_target_invalid" {
+		t.Fatalf("reasons %v, want [trusted_mirror_target_invalid]", got)
+	}
+	if !strings.Contains(result.Reasons[0].Message, "is not a sha256") {
+		t.Fatalf("message %q, want it to name the non-sha256 digest", result.Reasons[0].Message)
+	}
+}
+
 func TestTUFMirrorBlobProblems(t *testing.T) {
 	t.Run("the blob the metadata names is not in the mirror", func(t *testing.T) {
 		spec, mirror, _ := tufFixture(t)

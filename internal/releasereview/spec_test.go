@@ -116,6 +116,18 @@ func TestDecodeRejects(t *testing.T) {
 			wantSub: `checks.tuf.targets["n"] is empty`,
 		},
 		{
+			// A `..` segment would resolve out of <mirror>/targets when the
+			// name is joined into the blob path, so it is refused at the spec.
+			name:    "tuf target name climbs out of its directory",
+			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"m","root":"r","root_checksum":"` + sixtyFourHex + `","targets":{"../../etc/passwd":"p"}}}}`,
+			wantSub: `must not contain a ".." path segment`,
+		},
+		{
+			name:    "tuf target name is absolute",
+			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"m","root":"r","root_checksum":"` + sixtyFourHex + `","targets":{"/etc/passwd":"p"}}}}`,
+			wantSub: "must be relative",
+		},
+		{
 			name:    "exec names no artifact",
 			spec:    `{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"exec":{"enabled":true}}}`,
 			wantSub: "checks.exec.artifact is required",
@@ -330,6 +342,18 @@ func TestTUFConfigIsNormalized(t *testing.T) {
 	}
 	if got := spec.Checks.TUF.RootChecksum; got != sixtyFourHex {
 		t.Fatalf("root_checksum normalized to %q, want %q", got, sixtyFourHex)
+	}
+}
+
+// TUF target names are path-like and legitimately carry `/`; only the traversal
+// shapes are refused, so a slashed namespace name must still validate.
+func TestTUFSlashedTargetNameIsAccepted(t *testing.T) {
+	_, err := Decode(strings.NewReader(
+		`{"spec_version":1,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],
+		  "checks":{"tuf":{"enabled":true,"mirror":"m","root":"r","root_checksum":"` + sixtyFourHex + `",
+		            "targets":{"registry.npmjs.org/keys.json":"p"}}}}`))
+	if err != nil {
+		t.Fatalf("a slashed target name was refused: %v", err)
 	}
 }
 

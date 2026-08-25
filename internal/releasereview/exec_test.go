@@ -34,6 +34,28 @@ func execFixture(t *testing.T) (artifact, argLog string) {
 	return artifact, argLog
 }
 
+// The artifact's directory is bind-mounted as `<dir>:/artifact:ro,z`, which
+// podman splits on ':'. A colon in the directory path would mis-split the -v
+// spec, so the sandbox cannot be built and the review reports breakage (ERROR),
+// never a finding about the release.
+func TestExecColonInArtifactDirIsError(t *testing.T) {
+	withFakeTools(t, "podman")
+	dir := filepath.Join(t.TempDir(), "a:b")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("could not create the colon-bearing dir: %v", err)
+	}
+	artifact := writeFile(t, dir, "tool", "#!/bin/sh\nexit 0\n")
+
+	result := sandboxExec(execSpec(artifact, nil, 5))
+
+	if result.Verdict != ERROR {
+		t.Fatalf("verdict %v, want ERROR", result.Verdict)
+	}
+	if got := codes(result); len(got) != 1 || got[0] != "artifact_path_unmappable" {
+		t.Fatalf("reasons %v, want [artifact_path_unmappable]", got)
+	}
+}
+
 func TestExecCleanRunPinsTheSandboxPolicy(t *testing.T) {
 	artifact, argLog := execFixture(t)
 
