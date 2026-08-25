@@ -581,10 +581,12 @@ func TestDetachedSignatureFileMissing(t *testing.T) {
 // caller's BLOCK. The offline markers are the ones captured from a real run.
 func TestCosignInfraFailureClassification(t *testing.T) {
 	infra := []string{
-		"Error: getting rekor public keys: updating local metadata and targets",
-		"WARNING: Could not fetch trusted_root.json from the TUF repository",
-		"tuf: failed to download 13.root.json: dial tcp: network is unreachable",
-		"error updating to TUF remote mirror",
+		"error during command execution: setting up clients and keys: getting rekor public keys: updating local metadata and targets",
+		"Error: tuf: failed to download 13.root.json: dial tcp: lookup tuf-repo-cdn.sigstore.dev: network is unreachable",
+		"error during command execution: error updating to TUF remote mirror",
+		// The real offline shape: a non-fatal warning line followed by the fatal
+		// error line. The fatal line is what classifies.
+		"WARNING: Could not fetch trusted_root.json from the TUF repository. Continuing with individual targets.\nerror during command execution: getting rekor public keys: dial tcp: network is unreachable",
 	}
 	for _, output := range infra {
 		if !cosignInfraFailure(output) {
@@ -592,14 +594,20 @@ func TestCosignInfraFailureClassification(t *testing.T) {
 		}
 	}
 	rejections := []string{
-		"none of the expected identities matched what was in the certificate",
-		"error verifying blob: invalid signature when validating ASN.1 encoded signature",
+		"Error: none of the expected identities matched what was in the certificate",
+		"Error: verifying blob: invalid signature when validating ASN.1 encoded signature",
 		"bundle signer policy mismatch",
 		"",
-		// Steering guard: cosign echoes the cert's SAN into the mismatch
-		// message, so a cert planting an infra marker there must not flip a
-		// genuine rejection into an ERROR. The mismatch signature wins.
-		"none of the expected identities matched, got subjects [https://evil.example/dial tcp] with issuer x",
+		// A non-fatal trusted-root warning ALONE is not infrastructure: cosign
+		// prints it and then goes on to verify or reject. Only the fatal error
+		// line decides.
+		"WARNING: Could not fetch trusted_root.json from the TUF repository. Continuing with individual targets.",
+		// Steering guard: cosign echoes the cert's SAN and the caller's evidence
+		// path into its output, so a fatal line about the evidence must not flip
+		// a genuine rejection into an ERROR even when it contains a network
+		// substring. The identity-mismatch and cert-load signatures win.
+		"Error: none of the expected identities matched, got subjects [https://evil.example/dial tcp] with issuer x",
+		"Error: loading cert: open /home/x/dial tcp/no such host/cert.pem: no such file or directory",
 	}
 	for _, output := range rejections {
 		if cosignInfraFailure(output) {
@@ -650,5 +658,51 @@ func TestDetachedSignatureFailureMessageSkipsTheDeprecationNotice(t *testing.T) 
 	}
 	if message != "bundle verification failed" {
 		t.Fatalf("signature_failure message %q, want the cosign error line", message)
+	}
+}
+
+// F2 regression: an evidence file that stats but cannot be read is
+// review-infrastructure breakage (ERROR), not release malice. Before the fix
+// the detached path only stat'd, so an unreadable certificate reached cosign
+// and its local-I/O failure became a signature_failure BLOCK.
+func TestDetachedUnreadableCertificateIsErrorNotBlock(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permissions, so an unreadable file cannot be staged")
+	}
+	artifact, checksums, cert, sig := detachedFixture(t)
+	if err := os.Chmod(cert, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(cert, 0o644) })
+
+	result, verified := signature(detachedSpec(artifact, checksums, cert, sig, mockIdentity, mockIssuer))
+	if result.Verdict != ERROR {
+		t.Fatalf("verdict %s, want ERROR for an unreadable certificate: %v", result.Verdict, codes(result))
+	}
+	if !hasReason(result, "certificate_unreadable", "tool.tar.gz") {
+		t.Fatalf("reasons %v, want certificate_unreadable (never signature_failure)", codes(result))
+	}
+	if verified[0] {
+		t.Fatalf("an unreadable certificate vouched for the artifact")
+	}
+}
+
+// The same for an unreadable signature file.
+func TestDetachedUnreadableSignatureIsErrorNotBlock(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permissions")
+	}
+	artifact, checksums, cert, sig := detachedFixture(t)
+	if err := os.Chmod(sig, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sig, 0o644) })
+
+	result, _ := signature(detachedSpec(artifact, checksums, cert, sig, mockIdentity, mockIssuer))
+	if result.Verdict != ERROR {
+		t.Fatalf("verdict %s, want ERROR: %v", result.Verdict, codes(result))
+	}
+	if !hasReason(result, "signature_unreadable", "tool.tar.gz") {
+		t.Fatalf("reasons %v, want signature_unreadable", codes(result))
 	}
 }

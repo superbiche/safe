@@ -466,7 +466,7 @@ missing reports both, and BLOCK wins the worst-of over the ERROR.
 | `bundle_invalid` | BLOCK | `artifact`, `bundle` | the bundle is readable but is not valid JSON (bundle mode) |
 | `certificate_missing` | BLOCK | `artifact`, `certificate` | the detached certificate is not at its path (detached mode) |
 | `signature_missing` | BLOCK | `artifact`, `signature` | the detached signature is not at its path (detached mode) |
-| `signature_failure` | BLOCK | `artifact` | cosign could not verify the signed blob at all; the message is the first line of cosign's output |
+| `signature_failure` | BLOCK | `artifact` | cosign could not verify the signed blob at all; the message is cosign's error line, with the flag-deprecation notices it prints in detached mode filtered out |
 | `identity_mismatch` | BLOCK | `artifact`, and `expected_identity` or `expected_identity_regexp` | the signature verifies, but its signer identity is not the one the policy names |
 | `issuer_mismatch` | BLOCK | `artifact`, `expected_oidc_issuer` | the signature verifies, but its OIDC issuer is not the one the policy names |
 | `no_signature_evidence` | WARN | `artifact` | the check is enabled but this artifact carries no `signature` block |

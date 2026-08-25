@@ -56,36 +56,49 @@ func classifyCosign(timedOut bool, err error, output string) cosignOutcome {
 // retry as its recovery — never a verdict about the release, which a BLOCK
 // would wrongly say.
 //
-// The match set is cosign's own client-bootstrap phrasing, which runs before
-// and independent of the evidence files. cosign does echo attacker-controlled
-// certificate contents — the SAN and issuer — into its identity-mismatch
-// message ("got subjects [...] with issuer ..."), so that message is preempted
-// first: a rejection that names the mismatch is a rejection whatever else the
-// echoed SAN contains, and returning false on it keeps an attacker from
-// steering a genuine BLOCK into an ERROR by planting a marker in the cert. Even
-// without that guard the fail-closed property holds (both outcomes refuse the
-// release); the guard just keeps the classification honest. Unrecognized output
-// falls through to the caller's rejection — the fail-closed direction — so a
-// future cosign that rewords the bootstrap strings degrades to over-blocking,
-// never to a silent pass. The markers were captured from a real offline cosign
-// verify-blob run.
+// Only cosign's FATAL error line decides this. cosign prints the network
+// failure on its `Error:` / `error during command execution:` line; the
+// "Could not fetch trusted_root … Continuing with individual targets" line is a
+// non-fatal WARNING cosign emits even on runs that go on to verify or reject, so
+// matching a bare substring anywhere in combined output would convert a genuine
+// rejection that merely printed that warning into an ERROR. Scanning only fatal
+// lines also defuses the echo problem: cosign echoes the caller-supplied
+// certificate path and the certificate's SAN into its output, so a bare
+// substring match could be steered by an evidence path or SAN containing
+// `dial tcp`. Fatal lines about the evidence itself — a certificate that would
+// not load, or an identity that did not match — are excluded, so what remains is
+// the trust-bootstrap network chain and nothing an attacker controls. An
+// unrecognized fatal line falls through to the caller's rejection (BLOCK) — the
+// fail-closed direction — so a future cosign that rewords the bootstrap strings
+// degrades to over-blocking, never to a silent pass. The markers were captured
+// from a real offline cosign verify-blob run.
 func cosignInfraFailure(output string) bool {
-	lower := strings.ToLower(output)
-	if strings.Contains(lower, "none of the expected identities matched") {
-		return false
-	}
-	for _, marker := range []string{
-		"could not fetch trusted_root",
-		"tuf refresh failed",
-		"getting rekor public keys",
-		"tuf remote mirror",
-		"network is unreachable",
-		"dial tcp",
-		"no such host",
-		"i/o timeout",
-	} {
-		if strings.Contains(lower, marker) {
-			return true
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.ToLower(strings.TrimSpace(raw))
+		if !strings.HasPrefix(line, "error:") && !strings.HasPrefix(line, "error during command execution:") {
+			continue
+		}
+		// A fatal error about the evidence — a certificate or signature that
+		// would not load, or an identity that did not match — is a rejection,
+		// not infrastructure, even when the evidence path or SAN it echoes
+		// contains a network-shaped substring.
+		if strings.Contains(line, "loading cert") ||
+			strings.Contains(line, "loading signature") ||
+			strings.Contains(line, "none of the expected identities matched") {
+			continue
+		}
+		for _, marker := range []string{
+			"tuf refresh failed",
+			"getting rekor public keys",
+			"tuf remote mirror",
+			"network is unreachable",
+			"dial tcp",
+			"no such host",
+			"i/o timeout",
+		} {
+			if strings.Contains(line, marker) {
+				return true
+			}
 		}
 	}
 	return false

@@ -33,7 +33,7 @@ func signature(spec Spec) (CheckResult, map[int]bool) {
 	// per-artifact findings that are still collected below.
 	if !cosignAvailable && spec.anySignatureEvidence() {
 		result.add(ERROR, "tool_missing",
-			"cosign is required to verify Sigstore bundles — install cosign", nil)
+			"cosign is required to verify signatures — install cosign", nil)
 	}
 
 	for index, artifact := range spec.Artifacts {
@@ -95,7 +95,12 @@ func signatureInputs(result *CheckResult, artifact Artifact, evidence *Signature
 		if !certOK || !sigOK {
 			return "", nil, false
 		}
-		if probe, _ := probeRegularFile(artifact.Evidence.ChecksumFile); probe != fileOK {
+		// The detached pair signs the checksum file, so cosign reads it as the
+		// blob. It is read here for the same reason the cert and signature are:
+		// a stat-only check would let an unreadable blob reach cosign and fail as
+		// a BLOCK. A missing or unreadable blob is the checksum check's finding,
+		// so no reason is added here — verification is simply skipped.
+		if _, readErr := os.ReadFile(artifact.Evidence.ChecksumFile); readErr != nil {
 			return "", nil, false
 		}
 		return artifact.Evidence.ChecksumFile,
@@ -140,6 +145,13 @@ func signatureInputs(result *CheckResult, artifact Artifact, evidence *Signature
 // readable, adding a mode-appropriate reason when it is not. The codes mirror
 // the bundle path's split: an absent file is evidence about the release
 // (BLOCK), a present file that cannot be read is a broken review (ERROR).
+//
+// The read is not skippable. os.Stat succeeding does not mean os.ReadFile will:
+// a file that stats but cannot be read (permissions, a mid-review I/O error)
+// would otherwise reach cosign, whose local-I/O failure the cascade would
+// misclassify as a signature_failure BLOCK — reporting review breakage as
+// release malice. Reading the file here keeps that an ERROR. The bytes are
+// discarded; cosign, not this package, parses the certificate and signature.
 func probeEvidenceFile(result *CheckResult, name, kind, path string) bool {
 	probe, err := probeRegularFile(path)
 	switch probe {
@@ -152,6 +164,12 @@ func probeEvidenceFile(result *CheckResult, name, kind, path string) bool {
 		result.add(ERROR, kind+"_unreadable",
 			fmt.Sprintf("could not read the signature %s for %s", kind, name),
 			map[string]string{"artifact": name, kind: path, "error": err})
+		return false
+	}
+	if _, readErr := os.ReadFile(path); readErr != nil {
+		result.add(ERROR, kind+"_unreadable",
+			fmt.Sprintf("could not read the signature %s for %s", kind, name),
+			map[string]string{"artifact": name, kind: path, "error": readErr.Error()})
 		return false
 	}
 	return true

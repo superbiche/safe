@@ -63,7 +63,7 @@ const (
 	ReportSchemaVersion = 1
 )
 
-// Spec is a release review request, schema spec_version 1.
+// Spec is a release review request, schema spec_version 2.
 type Spec struct {
 	SpecVersion int        `json:"spec_version"`
 	Subject     Subject    `json:"subject"`
