@@ -163,17 +163,21 @@ func bootstrap(result *CheckResult, config *TUFCheck) (metadataPath, targetsDir 
 	}
 	remove := func() { _ = os.RemoveAll(cosignHome) }
 
-	command := exec.Command("cosign", "initialize",
+	// The environment is the real one with HOME replaced: a bare slice would drop
+	// PATH, and cosign resolves helpers through it. The deadline is cosignRun's,
+	// so a hung initialize cannot hold the review open.
+	output, timedOut, runErr := cosignRun(envWithHome(cosignHome), "initialize",
 		"--mirror", mirrorURL,
 		"--root", config.Root,
 		"--root-checksum", "sha256:"+config.RootChecksum)
-	// Built from the real environment with HOME replaced: a bare slice would
-	// drop PATH, and cosign resolves helpers through it.
-	command.Env = envWithHome(cosignHome)
-	output, runErr := command.CombinedOutput()
+	if timedOut {
+		result.add(ERROR, "bootstrap_timeout",
+			fmt.Sprintf("cosign did not initialize against the local TUF mirror within %s", cosignSubprocessTimeout), nil)
+		return "", "", remove, false
+	}
 	if runErr != nil {
 		result.add(BLOCK, "bootstrap_failure",
-			summaryOr(string(output), "cosign failed to initialize against the local TUF mirror"), nil)
+			summaryOr(output, "cosign failed to initialize against the local TUF mirror"), nil)
 		return "", "", remove, false
 	}
 

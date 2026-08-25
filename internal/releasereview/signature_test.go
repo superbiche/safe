@@ -3,6 +3,7 @@ package releasereview
 import (
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // signatureSpec builds a one-artifact spec with both checks enabled, which is
@@ -333,6 +334,27 @@ func TestSignatureIdentityRegexpPolicy(t *testing.T) {
 	}
 	if mismatch.Reasons[0].Data["expected_identity_regexp"] == "" {
 		t.Fatalf("reason data %v carries no expected identity regexp", mismatch.Reasons[0].Data)
+	}
+}
+
+// A cosign that runs past its deadline is the review's own tooling failing to
+// answer, not the signature failing to verify: it must read ERROR
+// (verification_timeout), never a BLOCK that would call a hung network fetch a
+// finding about the release.
+func TestSignatureVerificationTimeoutIsErrorNotBlock(t *testing.T) {
+	artifact, bundle, checksums := signatureFixture(t)
+	lowerCosignTimeout(t, 200*time.Millisecond)
+	t.Setenv("MOCK_COSIGN_SLEEP", "5")
+
+	result, verified := signature(signatureSpec(artifact, bundle, checksums, mockIdentity, mockIssuer))
+	if result.Verdict != ERROR {
+		t.Fatalf("verdict %s, want ERROR: %v", result.Verdict, codes(result))
+	}
+	if got := codes(result); len(got) != 1 || got[0] != "verification_timeout" {
+		t.Fatalf("reasons %v, want [verification_timeout]", got)
+	}
+	if len(verified) != 0 {
+		t.Fatalf("a timed-out verification still marked %v verified", verified)
 	}
 }
 

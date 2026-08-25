@@ -119,6 +119,54 @@ func TestNextPageURL(t *testing.T) {
 	}
 }
 
+// GITHUB_TOKEN goes to the base host and nowhere else. get is handed absolute
+// URLs taken from response bodies (a Link rel="next" target, an annotated tag
+// object's address); a compromised or proxied response naming a foreign host
+// must not carry the bearer token there. Two servers on two ports stand in for
+// the base and a foreign host — the pin is on scheme+host, and different ports
+// are different hosts, so the second server must see no Authorization at all.
+//
+// Only the auth scheme and a boolean are captured, never the credential: a
+// failing test's output goes to a log, and the token must not ride there.
+func TestTokenIsPinnedToTheBaseHost(t *testing.T) {
+	var baseScheme string
+	base := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if authorization := request.Header.Get("Authorization"); authorization != "" {
+			baseScheme, _, _ = strings.Cut(authorization, " ")
+		}
+		fmt.Fprint(writer, `{}`)
+	}))
+	defer base.Close()
+
+	foreignSawAuth := false
+	foreign := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "" {
+			foreignSawAuth = true
+		}
+		fmt.Fprint(writer, `{}`)
+	}))
+	defer foreign.Close()
+
+	t.Setenv("SAFE_AUDIT_GITHUB_API_BASE_URL", base.URL)
+	t.Setenv("GITHUB_TOKEN", "sentinel-not-a-real-token")
+	client := newGitHubClient()
+
+	var out any
+	if _, err := client.get(base.URL+"/repos/example/tool/releases", &out); err != nil {
+		t.Fatalf("the same-host request failed: %s", err.message)
+	}
+	if _, err := client.get(foreign.URL+"/repos/example/tool/releases", &out); err != nil {
+		t.Fatalf("the foreign-host request failed: %s", err.message)
+	}
+
+	if baseScheme != "Bearer" {
+		t.Fatalf("the base host received auth scheme %q, want Bearer", baseScheme)
+	}
+	if foreignSawAuth {
+		t.Fatal("GITHUB_TOKEN was sent to a host other than the base URL's")
+	}
+}
+
 // A response body is read into memory, so an endpoint that streams without end
 // must fail the review rather than grow it — the same bound the exec check's
 // output capture has, applied to the other place this package reads bytes it

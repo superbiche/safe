@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"strings"
 	"time"
@@ -41,9 +42,10 @@ type githubError struct {
 // githubClient talks to the GitHub REST API.
 //
 // GITHUB_TOKEN enters exactly one place: the Authorization header built in
-// get. It is never put in a URL, an argument, a reason's data, a report, or an
-// error message — including the ones built from a transport error, which carry
-// the request URL and nothing else.
+// get, and only when the request targets the base URL's own host (see
+// tokenTargetTrusted). It is never put in a URL, an argument, a reason's data, a
+// report, or an error message — including the ones built from a transport error,
+// which carry the request URL and nothing else.
 type githubClient struct {
 	baseURL string
 	token   string
@@ -88,7 +90,7 @@ func (c *githubClient) get(pathOrURL string, out any) (string, *githubError) {
 	request.Header.Set("Accept", "application/vnd.github+json")
 	request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	request.Header.Set("User-Agent", "safe-audit")
-	if c.token != "" {
+	if c.token != "" && c.tokenTargetTrusted(url) {
 		request.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
@@ -117,6 +119,33 @@ func (c *githubClient) get(pathOrURL string, out any) (string, *githubError) {
 		return "", &githubError{message: fmt.Sprintf("GitHub's response from %s is not the JSON this check expects: %v", url, err)}
 	}
 	return nextPageURL(response.Header.Get("Link")), nil
+}
+
+// tokenTargetTrusted reports whether target addresses the same scheme and host
+// as the configured base URL — the only place GITHUB_TOKEN may go.
+//
+// get is handed absolute URLs taken from response bodies: a Link rel="next"
+// target, and the annotated tag object's address. A compromised or proxied API
+// response must not be able to steer the bearer token at a host of its choosing.
+// Go already strips Authorization across a cross-host *redirect*; this closes the
+// direct-absolute-URL path, which is not a redirect and which Go does not guard.
+//
+// On a base URL or a target that will not parse, the token is withheld: a
+// destination that cannot be shown to match is not one to trust with a
+// credential. Comparing scheme as well as host also refuses an https→http
+// downgrade of the same host, and the whole-URL parse rejects the
+// userinfo trick (https://api.github.com@evil.example), where the host is
+// evil.example.
+func (c *githubClient) tokenTargetTrusted(target string) bool {
+	base, err := neturl.Parse(c.baseURL)
+	if err != nil {
+		return false
+	}
+	destination, err := neturl.Parse(target)
+	if err != nil {
+		return false
+	}
+	return destination.Scheme == base.Scheme && strings.EqualFold(destination.Host, base.Host)
 }
 
 // getPaged walks a listing, appending each page through collect, and reports

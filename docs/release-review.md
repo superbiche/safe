@@ -417,6 +417,7 @@ missing reports both, and BLOCK wins the worst-of over the ERROR.
 | `no_signature_evidence` | WARN | `artifact` | the check is enabled but this artifact carries no `signature` block |
 | `artifact_unreadable` | ERROR | `artifact`, `error` | the artifact exists and cannot be read |
 | `bundle_unreadable` | ERROR | `artifact`, `bundle`, `error` | the bundle exists and cannot be read |
+| `verification_timeout` | ERROR | `artifact` | cosign did not finish verifying the artifact within the subprocess deadline — the tool is present but never answered, which is breakage, not a signature failure |
 | `tool_missing` | ERROR | — | cosign is not installed; emitted **once** for the check, not per artifact |
 
 A failed verification is only half an answer, so a failure is re-probed with
@@ -510,6 +511,7 @@ always `ERROR` here.
 | `trust_target_unreadable` | ERROR | `target`, `error` | a local target exists and cannot be hashed |
 | `mirror_unserveable` | ERROR | `mirror`, `error` | the loopback bridge could not be started |
 | `scratch_unavailable` | ERROR | `error` | no scratch directory could be created for cosign's trust cache |
+| `bootstrap_timeout` | ERROR | — | `cosign initialize` did not finish within the subprocess deadline |
 | `tool_missing` | ERROR | — | cosign is not installed |
 
 What is answered when depends on what each answer genuinely needs. The root's
@@ -648,6 +650,14 @@ message, and the reason a failure names is built from the request URL alone.
 A token is not required; it is what makes a private repository readable, and
 what raises the rate limit.
 
+The header is also **pinned to the base URL's host**. Two of the requests above
+are made to absolute URLs the API itself hands back — a `Link: rel="next"`
+target and the annotated tag object's address — and the token is attached only
+when such a URL's scheme and host match the base URL's. A compromised or proxied
+response that named another host would receive the request without the token,
+not with it. (Go already strips the header across a cross-host redirect; this
+covers the direct-absolute-URL case, which is not a redirect.)
+
 Three environment variables tune this:
 
 - `SAFE_AUDIT_GITHUB_API_BASE_URL` — the API root, default
@@ -752,3 +762,27 @@ behavior deliberately differs from the `binary-audit` sub-lane it replaces.
     becomes attacker-chosen the day a consumer smokes a binary under the name an
     archive gave it. Go passes argv as argv, so the wrapper bought nothing; it
     is gone, and the binary is one argv entry followed by its arguments.
+14. **`GITHUB_TOKEN` is pinned to the base URL's host** (`release`, `vuln`). The
+    bash lane's `github_api_get` sent the same `Authorization: Bearer` header to
+    whatever URL it was handed, including the absolute URLs GitHub returns in a
+    `Link` header and in an annotated tag object's `url`. Here the token is
+    attached only when the target's scheme and host match the base URL's, so a
+    compromised or proxied response cannot steer the credential at a host of its
+    choosing. One behaviour-visible edge: a proxy configured through
+    `SAFE_AUDIT_GITHUB_API_BASE_URL` whose upstream `Link`/tag-object URLs escape
+    the proxy's host loses auth on those hops, and an unauthenticated read of a
+    private resource then answers `404` — which this composite treats as evidence
+    (see [the 404 split](#the-404-split)). No corpus pair accompanies this: the
+    pin changes a request property, not a verdict on identical fixture inputs the
+    way divergences 10–13 do; the `github_test.go` two-host regression carries it.
+15. **The `cosign` subprocesses carry a deadline** (`signature`, `tuf`). The bash
+    lanes ran `cosign verify-blob` and `cosign initialize` with no timeout, so a
+    cosign wedged on a network fetch held the whole review open indefinitely.
+    Here each cosign invocation runs under the same Go-context deadline the
+    `exec` check uses (SIGTERM on expiry, a 5s kill delay), and a run that
+    exceeds it is `ERROR` — `verification_timeout` / `bootstrap_timeout` — not
+    the `BLOCK` a genuine verification or bootstrap failure produces: a tool that
+    never answered is the review failing to run, never a finding about the
+    release. No corpus pair accompanies this either — a timeout is not reproducible
+    through the fixture corpus without a deliberately hanging cosign; the Go unit
+    tests drive it by lowering the deadline against a fake asked to sleep.

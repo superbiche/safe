@@ -5,7 +5,20 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+// lowerCosignTimeout shortens the cosign subprocess deadline for one test and
+// restores it afterward, so a test can drive a real timeout against a fake
+// cosign asked to hang (MOCK_COSIGN_SLEEP) instead of waiting out the production
+// two minutes. Tests using it must not run in parallel: the timeout is a
+// process-global var, like PATH.
+func lowerCosignTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	previous := cosignSubprocessTimeout
+	cosignSubprocessTimeout = d
+	t.Cleanup(func() { cosignSubprocessTimeout = previous })
+}
 
 // The checks in this package shell out to cosign and podman, so the tests put
 // fakes on PATH instead. The fakes are shell scripts driven by environment
@@ -76,6 +89,14 @@ set -euo pipefail
 
 command_name="${1:-}"
 shift || true
+
+# MOCK_COSIGN_SLEEP makes an invocation outlive its deadline, the way
+# MOCK_PODMAN_SLEEP does for the exec check. exec replaces this shell so the
+# deadline's SIGTERM lands on sleep directly rather than orphaning it behind
+# bash — nothing after the sleep is meant to run when a test asks cosign to hang.
+if [[ -n "${MOCK_COSIGN_SLEEP:-}" ]]; then
+  exec sleep "$MOCK_COSIGN_SLEEP"
+fi
 
 case "$command_name" in
   verify-blob)
