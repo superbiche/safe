@@ -16,3 +16,24 @@ This project is not exempt from its own zero-trust model. Clone it, inspect it,
 scan it, and only then install or run it.
 
 There is no CLA.
+
+## Docs drift
+
+Free-prose docs are bound to the code they describe with
+[Fiberplane Drift](https://github.com/fiberplane/drift). Bindings live in
+`drift.lock`; a fail-open pre-commit hook in `.githooks/` runs `drift check` and
+blocks a commit whose bound code changed without the doc being reviewed. (This
+is separate from `tests/contract/drift.sh`, which guards the structured
+agent-contract pipeline.)
+
+Enable the hook once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The hook is fail-open: with `drift` not installed it does nothing. When a bound
+target changes, update the doc prose, then refresh provenance with
+`drift link <doc> <target>` (or `drift link <doc> --doc-is-still-accurate` if the
+prose already covers the change). Bypass once, if you must, with
+`git commit --no-verify`.
