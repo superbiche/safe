@@ -22,9 +22,9 @@ safe audit capabilities --json
 The current capability groups cover:
 
 - `top_level`: package-audit, repo-audit, machine-audit, diff, and status;
-- `binary-audit`: GitHub release review, GitHub repository advisory checks,
-  release asset verification, Sigstore bundle verification, TUF bootstrap
-  verification, and binary sandbox execution;
+- `binary-audit`: `release-review`, one composite command whose checks cover a
+  release's checksums, signature, GitHub release metadata, repository
+  advisories, TUF bootstrap material, and networkless sandbox execution;
 - `ioc`: lookup, list scanning, and updates;
 - `setup`: machine setup and scanner bundle creation.
 

@@ -73,8 +73,10 @@ binary-audit capability.
 
 ## Invocation
 
-`safe-core release-review --spec PATH`, where `PATH` may be `-` for stdin. No
-other flags exist; anything else is a usage error.
+`safe-core release-review --spec PATH`, where `PATH` may be `-` for stdin. The
+only other accepted form is `--versions` (above), which prints the contract
+numbers and takes no spec; the two are mutually exclusive, and anything else is
+a usage error.
 
 Relative paths inside the spec resolve against the **process working
 directory**, not the spec's directory. The spec is a consumer-side artifact —

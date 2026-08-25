@@ -33,9 +33,9 @@ or `safe-audit`.
 - project and multi-machine scans;
 - SBOM generation and vulnerability scans;
 - package behavior checks;
-- GitHub release and advisory review;
-- release asset, Sigstore bundle, and TUF bootstrap verification;
-- networkless binary execution;
+- `release-review`, a composite that checks a downloaded release's checksums,
+  signature, GitHub release and advisory metadata, TUF bootstrap material, and
+  networkless execution;
 - IOC updates and scans.
 
 `safe install -g` runs `safe audit package-audit` for explicit package specs, prompts,
@@ -57,17 +57,18 @@ trail for intentional updates that bypass package-manager safeguards.
 
 ## Direction: Go
 
-`safe-core` (`cmd/safe-core`, with `internal/lockdiff` and `internal/verdict`)
-is the start of a gradual migration of `safe`'s logic out of bash and into Go.
-New capability grows in Go, not bash, wherever the choice exists.
+`safe-core` (`cmd/safe-core`, with `internal/lockdiff`, `internal/verdict`, and
+`internal/releasereview`) is the start of a gradual migration of `safe`'s logic
+out of bash and into Go. New capability grows in Go, not bash, wherever the
+choice exists.
 
-Standing design constraint (operator ruling 2026-08-21): when `binary-audit`
-moves to Go, build it composite-first — a single `release-review` command
-taking a release spec and emitting one report, advertised under one
-capability key — rather than porting the six sub-commands as-is. The
-composite was evaluated and dropped as a bash slice: downloads and
-package-specific lanes stay consumer-side either way, so the payoff only
-materializes as part of the Go migration.
+Standing design constraint (operator ruling 2026-08-21): `binary-audit` moved
+to Go composite-first — a single `release-review` command taking a release spec
+and emitting one report, advertised under one capability key — rather than
+porting the six sub-commands as-is. The composite was evaluated and dropped as a
+bash slice: downloads and package-specific lanes stay consumer-side either way,
+so the payoff only materialized as part of the Go migration. It shipped at
+1.34.0, and the six bash sub-lanes it replaced are deleted.
 
 `safe audit binary-audit release-review` is that composite; its spec, report,
 taxonomy, and check status live in [Release Review](release-review.md).
