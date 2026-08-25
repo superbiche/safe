@@ -479,9 +479,24 @@ merge_audit_config_state() {
         )
     ' > "$normalized_tools"
     tmp=$(mktemp)
-    jq -s '((.[0] // {}) + (.[1] // {}))' "$AUDIT_CONFIG_DIR/tools.json" "$normalized_tools" > "$tmp"
-    mv "$tmp" "$AUDIT_CONFIG_DIR/tools.json"
+    if jq -s '((.[0] // {}) + (.[1] // {}))' "$AUDIT_CONFIG_DIR/tools.json" "$normalized_tools" > "$tmp" \
+       && jq -e -s 'length == 1 and (.[0] | type == "object")' "$tmp" >/dev/null 2>&1; then
+      mv "$tmp" "$AUDIT_CONFIG_DIR/tools.json"
+    else
+      rm -f "$tmp"
+    fi
     rm -f "$normalized_tools"
+  fi
+
+  # A legacy tools.json that was empty, truncated, or a multi-document stream
+  # imports verbatim through the `cp` above and would poison every audit's jq
+  # cache ops (safe-audit self-heals on its next run, but leaving a broken file
+  # installed is a needless footgun). The cache is re-derivable — detection
+  # re-probes — so normalizing anything but a single JSON object to `{}` loses
+  # nothing. Slurp-and-count so a `[]\n{}` stream is rejected, not accepted on
+  # its last document.
+  if ! jq -e -s 'length == 1 and (.[0] | type == "object")' "$AUDIT_CONFIG_DIR/tools.json" >/dev/null 2>&1; then
+    printf '%s\n' '{}' > "$AUDIT_CONFIG_DIR/tools.json"
   fi
 }
 

@@ -13,7 +13,7 @@ sig = "d5ebd850ae7d3c4e"
 [[bindings]]
 doc = "docs/installation.md"
 target = "install.sh"
-sig = "d692d663a95125e1"
+sig = "8e893f958fdf5205"
 
 [[bindings]]
 doc = "docs/release-review.md"

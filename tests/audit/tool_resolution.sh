@@ -173,6 +173,114 @@ case_detection_drops_a_cached_path_that_is_gone() {
   fi
 }
 
+# --- a broken tools.json self-heals instead of poisoning every audit --------
+
+source_and_run() {
+  # Source the dispatcher against a given config dir and run one statement.
+  local config_dir="$1" stmt="$2"
+  HOME="$FAKE_HOME" \
+  SAFE_AUDIT_CONFIG_DIR="$config_dir" \
+  SAFE_AUDIT_DATA_DIR="$TEST_ROOT/data" \
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+  STMT="$stmt" \
+    bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; eval "$STMT"' >/dev/null 2>&1 || true
+}
+
+case_tool_cache_set_persists_from_an_empty_cache() {
+  # The live footgun: a 0-byte tools.json is not "missing", so the old seed
+  # skipped it; tool_cache_set's jq then read zero documents, wrote an empty
+  # file while exiting 0, and clobbered the cache back to empty — so detection
+  # could never persist a scanner and every audit reported all scanners missing.
+  local config_dir="$TEST_ROOT/config-empty-set"
+  mkdir -p "$config_dir"
+  : > "$config_dir/tools.json"   # 0 bytes: the poison
+  source_and_run "$config_dir" \
+    'tool_cache_set local "$(build_tool_entry_json /opt/osv "" "" "" "" "" "")"'
+  if jq -e 'type == "object"' "$config_dir/tools.json" >/dev/null 2>&1 \
+     && [[ "$(jq -r '.local["osv-scanner"] // ""' "$config_dir/tools.json")" == "/opt/osv" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (tools.json='$(cat "$config_dir/tools.json")')"
+  fi
+}
+
+case_empty_tools_file_normalizes_to_an_object() {
+  local config_dir="$TEST_ROOT/config-empty-norm"
+  mkdir -p "$config_dir"
+  : > "$config_dir/tools.json"
+  source_and_run "$config_dir" 'ensure_tools_file'
+  if [[ "$(cat "$config_dir/tools.json")" == "{}" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (tools.json='$(cat "$config_dir/tools.json")')"
+  fi
+}
+
+case_garbage_and_array_tools_files_normalize_to_an_object() {
+  # Garbage does not parse; `[]` parses but still breaks `.[$m] = $entry`.
+  # `jq -e type=="object"` rejects both, so both self-heal.
+  local ok=1 shape
+  for shape in 'not json at all' '[]' '42' 'null'; do
+    local config_dir="$TEST_ROOT/config-shape-$RANDOM"
+    mkdir -p "$config_dir"
+    printf '%s' "$shape" > "$config_dir/tools.json"
+    source_and_run "$config_dir" 'ensure_tools_file'
+    [[ "$(cat "$config_dir/tools.json")" == "{}" ]] || { ok=0; break; }
+  done
+  if [[ "$ok" == "1" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (shape '$shape' left '$(cat "$config_dir/tools.json")')"
+  fi
+}
+
+case_multi_document_tools_file_normalizes_to_a_single_object() {
+  # A multi-document stream passes a naive `type=="object"` because jq bases -e
+  # on the LAST document, so `[]\n{}` reads as an object. It must still
+  # normalize: a two-object cache makes `.[$m]=$entry` apply to every document
+  # and tool_cache_path emit two newline-joined paths, which fail the executable
+  # check — the very scanner-missing symptom the guard exists to prevent.
+  local config_dir="$TEST_ROOT/config-multidoc"
+  mkdir -p "$config_dir"
+  printf '[]\n{}\n' > "$config_dir/tools.json"
+  source_and_run "$config_dir" 'ensure_tools_file'
+  if [[ "$(cat "$config_dir/tools.json")" == "{}" ]] \
+     && [[ "$(jq -s 'length' "$config_dir/tools.json" 2>/dev/null)" == "1" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (tools.json='$(cat "$config_dir/tools.json")')"
+  fi
+}
+
+case_tool_cache_set_over_a_multi_document_cache_stays_single() {
+  # The write path must not perpetuate a stream: a `{}\n{}` cache would make jq
+  # emit two objects and the output validator must reject that, not install it.
+  local config_dir="$TEST_ROOT/config-multidoc-set"
+  mkdir -p "$config_dir"
+  printf '{}\n{}\n' > "$config_dir/tools.json"
+  source_and_run "$config_dir" \
+    'tool_cache_set local "$(build_tool_entry_json /opt/osv "" "" "" "" "" "")"'
+  if [[ "$(jq -s 'length' "$config_dir/tools.json" 2>/dev/null)" == "1" ]] \
+     && [[ "$(jq -r '.local["osv-scanner"] // ""' "$config_dir/tools.json" 2>/dev/null)" == "/opt/osv" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (tools.json='$(cat "$config_dir/tools.json")')"
+  fi
+}
+
+case_a_valid_tools_file_is_left_untouched() {
+  # ensure_tools_file must never stomp a good cache.
+  local config_dir="$TEST_ROOT/config-valid"
+  mkdir -p "$config_dir"
+  printf '{"local":{"osv-scanner":"/keep/me"}}\n' > "$config_dir/tools.json"
+  source_and_run "$config_dir" 'ensure_tools_file'
+  if [[ "$(jq -r '.local["osv-scanner"] // ""' "$config_dir/tools.json")" == "/keep/me" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (tools.json='$(cat "$config_dir/tools.json")')"
+  fi
+}
+
 # --- scratch lifecycle ------------------------------------------------------
 
 # Counts scratch directories created inside an isolated TMPDIR, so the assertion
@@ -264,6 +372,12 @@ case_stale_cache_entry_is_not_returned
 case_unknown_tool_resolves_to_nothing
 case_detection_keeps_a_still_valid_cached_path
 case_detection_drops_a_cached_path_that_is_gone
+case_tool_cache_set_persists_from_an_empty_cache
+case_empty_tools_file_normalizes_to_an_object
+case_garbage_and_array_tools_files_normalize_to_an_object
+case_multi_document_tools_file_normalizes_to_a_single_object
+case_tool_cache_set_over_a_multi_document_cache_stays_single
+case_a_valid_tools_file_is_left_untouched
 case_scratch_dirs_are_removed_on_success
 case_scratch_dirs_are_removed_on_failure
 case_a_real_scan_leaves_no_scratch_behind
