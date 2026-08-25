@@ -40,8 +40,7 @@ grep -q '\[--deps-only | --full\]' <<<"$help_output" || fail "help omits scan mo
 grep -q '\[--no-cache\]' <<<"$help_output" || fail "help omits scan --no-cache"
 grep -q 'safe audit ioc --update' <<<"$help_output" || fail "help omits ioc --update"
 grep -q 'safe audit setup --create-bundle' <<<"$help_output" || fail "help omits setup --create-bundle"
-grep -q 'safe audit binary-audit verify sigstore-bundle' <<<"$help_output" || fail "help omits verify sigstore-bundle"
-grep -q 'safe audit binary-audit verify tuf-bootstrap' <<<"$help_output" || fail "help omits verify tuf-bootstrap"
+grep -q 'safe audit binary-audit release-review --spec' <<<"$help_output" || fail "help omits binary-audit release-review"
 pass "help output"
 
 grep -q 'capabilities' "$ROOT/lib/completions/_safe" || fail "completion omits capabilities"
@@ -53,8 +52,7 @@ grep -q 'machine_audit_opts=(--all --machine --project --verbose --deps-only --f
 for scan_flag in $(SAFE_AUDIT_NO_INIT=1 "$ROOT/bin/safe-audit" help 2>/dev/null | grep -oE '^\s+safe audit machine-audit .*' | grep -oE '\-\-[a-z-]+' | sort -u); do
   grep -q -- "$scan_flag" <<<"$(grep -E '^\s+machine_audit_opts=' "$ROOT/lib/completions/_safe")" || fail "completion omits scan flag: $scan_flag"
 done
-grep -q 'sigstore-bundle' "$ROOT/lib/completions/_safe" || fail "completion omits sigstore-bundle"
-grep -q 'tuf-bootstrap' "$ROOT/lib/completions/_safe" || fail "completion omits tuf-bootstrap"
+grep -q 'binary_audit_subcmds=(release-review)' "$ROOT/lib/completions/_safe" || fail "completion omits binary-audit release-review"
 pass "completion output"
 
 tmp="$(mktemp -d)"
@@ -74,12 +72,6 @@ jq -e --arg version "$audit_version" '
     "repo-audit": true,
     "machine-audit": true,
     "binary-audit.release-review": true,
-    "binary-audit.exec": true,
-    "binary-audit.release.github": true,
-    "binary-audit.vuln.github-release": true,
-    "binary-audit.verify.release-asset": true,
-    "binary-audit.verify.sigstore-bundle": true,
-    "binary-audit.verify.tuf-bootstrap": true,
     "ioc.lookup": true,
     "ioc.list": true,
     "ioc.update": true,
@@ -103,13 +95,7 @@ jq -e --arg version "$audit_version" '
       "status": true
     },
     "binary-audit": {
-      "release-review": true,
-      "exec": true,
-      "release.github": true,
-      "vuln.github-release": true,
-      "verify.release-asset": true,
-      "verify.sigstore-bundle": true,
-      "verify.tuf-bootstrap": true
+      "release-review": true
     },
     "ioc": {
       "lookup": true,
@@ -1046,5 +1032,3 @@ if command -v osv-scanner >/dev/null 2>&1 && command -v syft >/dev/null 2>&1 && 
 else
   pass "scanner bundle skipped because scanners are not all installed"
 fi
-
-bash "$ROOT/tests/audit/external_binary.sh"

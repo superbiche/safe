@@ -95,39 +95,29 @@ Equivalent gate routing exists for pnpm, pnpx, yarn, bun, uv, pip, pip3, cargo, 
 External binary installers should treat a reviewed manifest as desired state and
 call `safe audit` for review signals before install.
 
-Representative review sequence for a GitHub-backed binary:
+The review is one composite command: the installer writes a spec naming the
+release, its advisories, the downloaded artifact and its evidence (checksum,
+Sigstore bundle, TUF trust material), and calls the composite once:
 
 ```bash
 safe audit capabilities --json
-safe audit binary-audit release github --repo go-task/task --version v3.50.0 --asset task_linux_amd64.tar.gz --json
-safe audit binary-audit vuln github-release --repo go-task/task --version v3.50.0 --json
-safe audit binary-audit verify release-asset --artifact ./task --checksum ./task_checksums.txt --json
-safe audit binary-audit exec ./task --json -- --version
+safe audit binary-audit release-review --spec ./review.json
 ```
 
-For Sigstore bootstrap-shaped binaries such as `cosign`, the flow can include:
-
-```bash
-safe audit binary-audit verify sigstore-bundle \
-  --artifact ./cosign-linux-amd64 \
-  --bundle ./cosign-linux-amd64.sigstore.json \
-  --identity keyless@projectsigstore.iam.gserviceaccount.com \
-  --oidc-issuer https://accounts.google.com
-
-safe audit binary-audit verify tuf-bootstrap \
-  --mirror ./mirror \
-  --root ./root.json \
-  --root-checksum "$(sha256sum ./root.json | awk '{print $1}')" \
-  --target artifact.pub=./trust/artifact.pub
-```
+The composite runs the release, vuln, checksum, signature, TUF and sandboxed
+exec checks and aggregates them into one verdict. The spec schema and the
+per-check evidence it accepts are documented in
+[release-review.md](release-review.md). Sigstore- and TUF-shaped binaries such
+as `cosign` supply their bundle and trust material through the artifact's
+`evidence` block in the same spec — there is no separate command per check.
 
 ## CI Or Script Integration
 
-Use `safe audit capabilities --json` before relying on advanced checks:
+Use `safe audit capabilities --json` before relying on the composite:
 
 ```bash
-if safe audit capabilities --json | jq -e '.capabilities["verify.release-asset"]'; then
-  safe audit binary-audit verify release-asset --artifact ./tool --checksum ./checksums.txt --json
+if safe audit capabilities --json | jq -e '.capabilities["binary-audit.release-review"]'; then
+  safe audit binary-audit release-review --spec ./review.json
 fi
 ```
 

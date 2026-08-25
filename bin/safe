@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.33.0"
+SAFE_VERSION="1.34.0"
 # Exported at the top level, not per-subcommand: safe-audit pins itself to
 # this version, and every route that reaches it — the gate, `safe audit ...`,
 # `safe install`, the safe-audit compatibility command — must carry it or the
@@ -867,18 +867,12 @@ doctor_payload_json() {
 
   local capabilities_json="" capabilities_available=false
   local capabilities_version=""
-  local capability_verify_release_asset=false
-  local capability_verify_sigstore_bundle=false
-  local capability_verify_tuf_bootstrap=false
-  local capability_binary_exec=false
+  local capability_release_review=false
   if capture_command capabilities_json "$SAFE_SELF" audit capabilities --json; then
     if jq -e . >/dev/null 2>&1 <<<"$capabilities_json"; then
       capabilities_available=true
       capabilities_version=$(jq -r '.version // empty' <<<"$capabilities_json")
-      capability_verify_release_asset=$(jq -r '.capabilities["binary-audit.verify.release-asset"] // false' <<<"$capabilities_json")
-      capability_verify_sigstore_bundle=$(jq -r '.capabilities["binary-audit.verify.sigstore-bundle"] // false' <<<"$capabilities_json")
-      capability_verify_tuf_bootstrap=$(jq -r '.capabilities["binary-audit.verify.tuf-bootstrap"] // false' <<<"$capabilities_json")
-      capability_binary_exec=$(jq -r '.capabilities["binary-audit.exec"] // false' <<<"$capabilities_json")
+      capability_release_review=$(jq -r '.capabilities["binary-audit.release-review"] // false' <<<"$capabilities_json")
     fi
   fi
 
@@ -894,24 +888,13 @@ doctor_payload_json() {
     fi
   fi
 
-  local has_cosign has_sha256sum has_shasum has_checksum has_python3 has_python has_python_bridge has_podman has_timeout
+  # The composite's only external tools are cosign (signature + tuf checks) and
+  # podman (exec check); checksum, tuf mirror, release and vuln are pure Go, and
+  # the timeout/python dependencies the bash sub-lanes needed are gone. The
+  # remaining verify/sandbox probes are still reported under `dependencies`.
+  local has_cosign has_podman
   has_cosign=$(jq -r '.present' <<<"$verify_cosign_json")
-  has_sha256sum=$(jq -r '.present' <<<"$verify_sha256sum_json")
-  has_shasum=$(jq -r '.present' <<<"$verify_shasum_json")
-  has_python3=$(jq -r '.present' <<<"$verify_python3_json")
-  has_python=$(jq -r '.present' <<<"$verify_python_json")
   has_podman=$(jq -r '.present' <<<"$sandbox_podman_json")
-  has_timeout=$(jq -r '.present' <<<"$sandbox_timeout_json")
-  if [[ "$has_sha256sum" == "true" || "$has_shasum" == "true" ]]; then
-    has_checksum=true
-  else
-    has_checksum=false
-  fi
-  if [[ "$has_python3" == "true" || "$has_python" == "true" ]]; then
-    has_python_bridge=true
-  else
-    has_python_bridge=false
-  fi
 
   local feature_capabilities_json
   if [[ "$capabilities_available" == "true" ]]; then
@@ -930,56 +913,22 @@ doctor_payload_json() {
     feature_capabilities_json='{"available":false,"command":"safe audit capabilities","version":null,"capabilities":{}}'
   fi
 
-  local verify_release_asset_json verify_sigstore_bundle_json verify_tuf_bootstrap_json
-  local binary_exec_json safe_run_sandbox_json
+  # release-review is one composite capability now, not six granular lanes. It
+  # is ready when safe-core advertises it AND both external tools its checks
+  # shell out to are present: cosign (signature + tuf) and podman (exec).
+  local release_review_json safe_run_sandbox_json
   if [[ "$capabilities_available" != "true" ]]; then
-    verify_release_asset_json=$(doctor_feature_json false false "safe audit capabilities")
-  elif [[ "$capability_verify_release_asset" != "true" ]]; then
-    verify_release_asset_json=$(doctor_feature_json false false)
-  elif [[ "$has_checksum" != "true" ]]; then
-    verify_release_asset_json=$(doctor_feature_json true false "sha256sum|shasum")
+    release_review_json=$(doctor_feature_json false false "safe audit capabilities")
+  elif [[ "$capability_release_review" != "true" ]]; then
+    release_review_json=$(doctor_feature_json false false)
   else
-    verify_release_asset_json=$(doctor_feature_json true true)
-  fi
-
-  if [[ "$capabilities_available" != "true" ]]; then
-    verify_sigstore_bundle_json=$(doctor_feature_json false false "safe audit capabilities")
-  elif [[ "$capability_verify_sigstore_bundle" != "true" ]]; then
-    verify_sigstore_bundle_json=$(doctor_feature_json false false)
-  elif [[ "$has_cosign" != "true" ]]; then
-    verify_sigstore_bundle_json=$(doctor_feature_json true false "cosign")
-  else
-    verify_sigstore_bundle_json=$(doctor_feature_json true true)
-  fi
-
-  if [[ "$capabilities_available" != "true" ]]; then
-    verify_tuf_bootstrap_json=$(doctor_feature_json false false "safe audit capabilities")
-  elif [[ "$capability_verify_tuf_bootstrap" != "true" ]]; then
-    verify_tuf_bootstrap_json=$(doctor_feature_json false false)
-  else
-    local tuf_missing=()
-    [[ "$has_checksum" == "true" ]] || tuf_missing+=("sha256sum|shasum")
-    [[ "$has_cosign" == "true" ]] || tuf_missing+=("cosign")
-    [[ "$has_python_bridge" == "true" ]] || tuf_missing+=("python3|python")
-    if [[ ${#tuf_missing[@]} -eq 0 ]]; then
-      verify_tuf_bootstrap_json=$(doctor_feature_json true true)
+    local rr_missing=()
+    [[ "$has_cosign" == "true" ]] || rr_missing+=("cosign")
+    [[ "$has_podman" == "true" ]] || rr_missing+=("podman")
+    if [[ ${#rr_missing[@]} -eq 0 ]]; then
+      release_review_json=$(doctor_feature_json true true)
     else
-      verify_tuf_bootstrap_json=$(doctor_feature_json true false "${tuf_missing[@]}")
-    fi
-  fi
-
-  if [[ "$capabilities_available" != "true" ]]; then
-    binary_exec_json=$(doctor_feature_json false false "safe audit capabilities")
-  elif [[ "$capability_binary_exec" != "true" ]]; then
-    binary_exec_json=$(doctor_feature_json false false)
-  else
-    local binary_missing=()
-    [[ "$has_podman" == "true" ]] || binary_missing+=("podman")
-    [[ "$has_timeout" == "true" ]] || binary_missing+=("timeout")
-    if [[ ${#binary_missing[@]} -eq 0 ]]; then
-      binary_exec_json=$(doctor_feature_json true true)
-    else
-      binary_exec_json=$(doctor_feature_json true false "${binary_missing[@]}")
+      release_review_json=$(doctor_feature_json true false "${rr_missing[@]}")
     fi
   fi
 
@@ -1034,10 +983,7 @@ doctor_payload_json() {
     --argjson sandbox_podman "$sandbox_podman_json" \
     --argjson sandbox_timeout "$sandbox_timeout_json" \
     --argjson feature_capabilities "$feature_capabilities_json" \
-    --argjson verify_release_asset "$verify_release_asset_json" \
-    --argjson verify_sigstore_bundle "$verify_sigstore_bundle_json" \
-    --argjson verify_tuf_bootstrap "$verify_tuf_bootstrap_json" \
-    --argjson binary_exec "$binary_exec_json" \
+    --argjson release_review "$release_review_json" \
     --argjson safe_run_sandbox "$safe_run_sandbox_json" \
     --argjson osv_lockfile_support "$lockfile_support_json" \
     --argjson eco_govulncheck "$eco_govulncheck_json" \
@@ -1106,10 +1052,7 @@ doctor_payload_json() {
       },
       features: {
         safe_audit_capabilities: $feature_capabilities,
-        verify_release_asset: $verify_release_asset,
-        verify_sigstore_bundle: $verify_sigstore_bundle,
-        verify_tuf_bootstrap: $verify_tuf_bootstrap,
-        binary_exec: $binary_exec,
+        release_review: $release_review,
         safe_run_sandbox: $safe_run_sandbox,
         osv_lockfile_support: $osv_lockfile_support,
         ecosystem_auditors: {
@@ -1183,13 +1126,10 @@ print_doctor_human() {
     "",
     "feature readiness:",
     "  safe audit capabilities: " + (if .features.safe_audit_capabilities.available then "available" else "unavailable" end),
-    "  verify release-asset: " + (if .features.verify_release_asset.ready then "ready" else "not ready" end),
-    "  verify sigstore-bundle: " + (if .features.verify_sigstore_bundle.ready then "ready" else "not ready" end),
-    "  verify tuf-bootstrap: " + (if .features.verify_tuf_bootstrap.ready then "ready" else "not ready" end),
     ((if .dependencies.sandbox.podman.probed == false
       then " (podman present but unprobed: this doctor runs no-new-privs — sandboxed execs fail from THIS process, unaffected outside it)"
       else "" end) as $podman_caveat
-    | "  binary exec: " + (if .features.binary_exec.ready then "ready" else "not ready" end) + $podman_caveat,
+    | "  release-review: " + (if .features.release_review.ready then "ready" else "not ready" end) + $podman_caveat,
       "  safe run sandbox: " + (if .features.safe_run_sandbox.ready then "ready" else "not ready" end) + $podman_caveat),
     "  osv lockfile formats: " + (
       if .features.osv_lockfile_support.scanner == null then "osv-scanner unavailable"
@@ -1230,10 +1170,7 @@ print_doctor_human() {
     "missing prerequisites:",
     (
       [
-        .features.verify_release_asset.missing[],
-        .features.verify_sigstore_bundle.missing[],
-        .features.verify_tuf_bootstrap.missing[],
-        .features.binary_exec.missing[],
+        .features.release_review.missing[],
         .features.safe_run_sandbox.missing[],
         (.features.osv_lockfile_support.unsupported[]?
          | "osv-scanner extractor for " + . + " (repos using it lose their OSV tier)"),

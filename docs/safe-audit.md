@@ -425,107 +425,21 @@ For predictable repeated use, use a Socket account token. The practical token sc
 
 ## Release Review
 
-Review a GitHub release before downloading assets:
+Review a whole GitHub release from a single spec — release metadata,
+advisories, checksum, signature, TUF trust material and a sandboxed smoke
+run, aggregated into one verdict:
 
 ```bash
-safe audit binary-audit release github \
-  --repo sigstore/cosign \
-  --version v3.0.5 \
-  --asset cosign-linux-amd64 \
-  --json
+safe audit binary-audit release-review --spec ./review.json
 ```
 
-Checks include release age, draft/prerelease status, asset presence, release churn, previous release comparison, high-risk path changes, tag-to-commit resolution, and GitHub commit verification status.
-
-For repositories with multiple release streams:
-
-```bash
-safe audit binary-audit release github \
-  --repo scaleway/scaleway-cli \
-  --version v2.55.0 \
-  --asset scaleway-cli_2.55.0_linux_amd64 \
-  --tag-regex '^v2\.'
-```
-
-## Advisory Review
-
-```bash
-safe audit binary-audit vuln github-release --repo OWNER/REPO --version v1.2.3 --json
-```
-
-The command maps GitHub repository security advisory ranges to the supplied release version where possible. High or critical matches block. Ambiguous advisory mappings block instead of being ignored.
-
-## Verification
-
-Checksum-only release asset verification:
-
-```bash
-safe audit binary-audit verify release-asset \
-  --artifact ./tool-linux-amd64 \
-  --checksum ./checksums.txt \
-  --json
-```
-
-Checksum-only success returns `WARN` because no signature was verified. Add Sigstore certificate and signature data when available:
-
-```bash
-safe audit binary-audit verify release-asset \
-  --artifact ./tool-linux-amd64 \
-  --checksum ./checksums.txt \
-  --certificate ./checksums.txt.pem \
-  --signature ./checksums.txt.sig \
-  --certificate-identity-regexp '^https://github.com/OWNER/REPO/' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --require-signature
-```
-
-Verify a Sigstore bundle:
-
-```bash
-safe audit binary-audit verify sigstore-bundle \
-  --artifact ./cosign-linux-amd64 \
-  --bundle ./cosign-linux-amd64.sigstore.json \
-  --identity keyless@projectsigstore.iam.gserviceaccount.com \
-  --oidc-issuer https://accounts.google.com
-```
-
-Verify a GitHub attestation-style per-asset bundle with `--identity-regexp`:
-
-```bash
-safe audit binary-audit verify sigstore-bundle \
-  --artifact ./codex-x86_64-unknown-linux-musl \
-  --bundle ./codex-x86_64-unknown-linux-musl.sigstore.json \
-  --identity-regexp '^https://github\.com/openai/codex/\.github/workflows/.+@refs/tags/.+$' \
-  --oidc-issuer https://token.actions.githubusercontent.com
-```
-
-`--identity-regexp` is mutually exclusive with `--identity`, and one of the two
-is required. Use it when the signer identity is tag-bound — a GitHub Actions
-workflow identity ends in `@refs/tags/<tag>`, so it changes on every release and
-cannot be expressed as an exact identity.
-
-Verify a local TUF bootstrap:
-
-```bash
-safe audit binary-audit verify tuf-bootstrap \
-  --mirror ./mirror \
-  --root ./root.json \
-  --root-checksum "$(sha256sum ./root.json | awk '{print $1}')" \
-  --target artifact.pub=./trust/artifact.pub \
-  --json
-```
-
-`verify tuf-bootstrap` requires `cosign`, a checksum tool, and `python3` or `python`. Local mirror inputs can be paths or `file://...` URLs. The verifier serves local mirror content through a temporary loopback `http://127.0.0.1:<port>` bridge before calling `cosign initialize`, because Cosign does not bootstrap correctly from `file://` mirrors.
-
-## Binary Execution
-
-Run an artifact in a networkless Podman sandbox:
-
-```bash
-safe audit binary-audit exec ./tool --json -- --version
-```
-
-The sandbox uses a read-only artifact bind mount, no network, dropped capabilities, no-new-privileges, and tmpfs scratch space. Startup-shaped failures are classified with reason codes such as `missing_interpreter`, `missing_shared_library`, `sandbox_runtime_mismatch`, and `runtime_failure`.
+This is the `release-review` composite (implemented in `safe-core`, forwarded
+here). It replaced the earlier six granular sub-lanes — `release github`,
+`vuln github-release`, `verify release-asset`, `verify sigstore-bundle`,
+`verify tuf-bootstrap` and `exec` — which no longer exist as commands. The
+spec schema, the six checks it runs, the report shape, and the ledger of
+places it deliberately diverges from those sub-lanes are documented in
+[release-review.md](release-review.md).
 
 ## IOC Workflows
 

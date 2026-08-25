@@ -34,27 +34,17 @@ _safe_run() {
 }
 
 _safe_audit() {
-  local -a audit_cmds machine_audit_opts repo_audit_opts package_audit_opts capabilities_opts ioc_opts release_subcmds vuln_subcmds verify_subcmds binary_audit_subcmds
-  local -a release_github_opts vuln_github_release_opts verify_release_asset_opts verify_sigstore_bundle_opts verify_tuf_bootstrap_opts binary_exec_opts
+  local -a audit_cmds machine_audit_opts repo_audit_opts package_audit_opts capabilities_opts ioc_opts binary_audit_subcmds release_review_opts
   local subcmd="${words[3]:-}"
   local nested="${words[4]:-}"
-  local nested2="${words[5]:-}"
   audit_cmds=(package-audit repo-audit machine-audit binary-audit ioc setup diff status capabilities)
   machine_audit_opts=(--all --machine --project --verbose --deps-only --full --no-cache --result-out --allow-missing-tools)
   repo_audit_opts=(--verbose --deps-only --full --no-cache --result-out --allow-missing-tools)
   package_audit_opts=(--ecosystem --json)
   capabilities_opts=(--json)
   ioc_opts=(--all --machine --list --update --since)
-  release_subcmds=(github)
-  vuln_subcmds=(github-release)
-  verify_subcmds=(release-asset sigstore-bundle tuf-bootstrap)
-  binary_audit_subcmds=(exec release vuln verify)
-  release_github_opts=(--repo --version --asset --json)
-  vuln_github_release_opts=(--repo --version --json)
-  verify_release_asset_opts=(--artifact --checksum --certificate --signature --certificate-identity-regexp --certificate-oidc-issuer --require-signature --json)
-  verify_sigstore_bundle_opts=(--artifact --bundle --identity --identity-regexp --oidc-issuer --json)
-  verify_tuf_bootstrap_opts=(--mirror --root --root-checksum --target --json)
-  binary_exec_opts=(--timeout --json)
+  binary_audit_subcmds=(release-review)
+  release_review_opts=(--spec --versions --json)
 
   case "$subcmd" in
     machine-audit) _describe -t options 'machine-audit option' machine_audit_opts ;;
@@ -63,27 +53,7 @@ _safe_audit() {
     capabilities) _describe -t options 'capabilities option' capabilities_opts ;;
     binary-audit)
       case "$nested" in
-        exec) _alternative 'options:option:_describe -t options "binary-audit exec option" binary_exec_opts' 'files:file:_files' ;;
-        release)
-          case "$nested2" in
-            github) _alternative 'options:option:_describe -t options "binary-audit release github option" release_github_opts' 'values:value:_message value' ;;
-            *) _describe -t commands 'binary-audit release command' release_subcmds ;;
-          esac
-          ;;
-        vuln)
-          case "$nested2" in
-            github-release) _alternative 'options:option:_describe -t options "binary-audit vuln github-release option" vuln_github_release_opts' 'values:value:_message value' ;;
-            *) _describe -t commands 'binary-audit vuln command' vuln_subcmds ;;
-          esac
-          ;;
-        verify)
-          case "$nested2" in
-            release-asset) _alternative 'options:option:_describe -t options "binary-audit verify release-asset option" verify_release_asset_opts' 'values:value:_message value' ;;
-            sigstore-bundle) _alternative 'options:option:_describe -t options "binary-audit verify sigstore-bundle option" verify_sigstore_bundle_opts' 'values:value:_message value' ;;
-            tuf-bootstrap) _alternative 'options:option:_describe -t options "binary-audit verify tuf-bootstrap option" verify_tuf_bootstrap_opts' 'values:value:_message value' ;;
-            *) _describe -t commands 'binary-audit verify command' verify_subcmds ;;
-          esac
-          ;;
+        release-review) _alternative 'options:option:_describe -t options "binary-audit release-review option" release_review_opts' 'files:file:_files' ;;
         *) _describe -t commands 'binary-audit command' binary_audit_subcmds ;;
       esac
       ;;

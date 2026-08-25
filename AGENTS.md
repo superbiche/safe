@@ -49,11 +49,13 @@ stays registered in `tests/run-all.sh` (`SUITES`) and stays green run against
 the Go implementation until the commit that deletes the surface's bash
 implementation — only that commit may remove the suite. Live instance today:
 suites build the working-tree Go binary via `tests/lib/safe-core.sh` and point
-`SAFE_CORE_BIN` at it. Binary-audit variant: the `release-review` composite is
-a new surface the bash suites cannot exercise — its parity evidence is a
-fixture corpus (same releases through the bash sub-lanes and `release-review`,
-verdicts diffed) until the six bash sub-lanes are deleted; the corpus lands
-with the composite slice. Belt-not-run is red: `tests/run-all.sh` exports
+`SAFE_CORE_BIN` at it. Binary-audit variant (resolved 1.34.0): the
+`release-review` composite's parity evidence was a fixture corpus (same
+releases through the bash sub-lanes and `release-review`, verdicts diffed)
+while both lanes existed. The six bash sub-lanes are now deleted, so the corpus
+is retired with them, and the verdict-affecting divergences are frozen as
+in-process Go goldens (`internal/releasereview/ledger_test.go`), one case per
+ledger entry. Belt-not-run is red: `tests/run-all.sh` exports
 `SAFE_TEST_STRICT=1`, under which a missing Go toolchain fails
 `tests/go/run.sh` instead of skipping. `tests/run-all.sh` refuses unregistered
 suites: every `tests/*/*.sh` file must appear in `SUITES` or its explicit
