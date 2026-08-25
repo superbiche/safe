@@ -10,11 +10,13 @@
   the public registry integrity hash, reason, and date; no secrets. `import
   <file> [--dry-run]` applies a reviewed set in one explicit operator-run action:
   it is TTY-gated exactly like `add`/`update` (a real apply refuses non-TTY with
-  exit 102; `--dry-run` is the read-only preview an agent may run), re-validates
-  every entry, re-fetches integrity from the registry rather than trusting the
-  file's hash, and never silently overwrites a divergent local pin. The allow set
-  is deliberately not auto-synced between machines — import keeps the human review
-  in the loop.
+  exit 102 and initializes no state before that gate; `--dry-run` is the
+  read-only preview an agent may run). It accepts only exact version pins — never
+  a range, dist-tag, or npm source spec (`file:`/`git+…`) — writes an entry only
+  when that exact version verifies against the registry (re-fetching integrity
+  rather than trusting the file's hash), never overwrites a divergent local pin,
+  and preserves each grant's original date. The allow set is deliberately not
+  auto-synced between machines — import keeps the human review in the loop.
 
 - **JVM/Maven dependencies are now OSV-covered, without command-gating.** `safe
   audit repo-audit` sweeps `pom.xml` and `gradle.lockfile` through OSV like any

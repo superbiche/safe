@@ -151,16 +151,26 @@ The exported document (`schema: safe-host-allow-export/1`) carries only
 `import` is *"review this set and apply"*, never *"trust another machine"*:
 
 - It is an operator-only trust escalation, TTY-gated exactly like `add`/`update`
-  — a real apply refuses in non-TTY shells with exit 102. `--dry-run` is the one
-  read-only exception, so a cooperative agent can show the operator the delta.
-- Every entry is re-validated (name, ecosystem, pinned version, non-empty
-  reason) as if it were typed into `add`; the file is treated as untrusted input.
-- Integrity is **re-fetched from the registry**, not trusted from the file. A
-  present-but-divergent hash (a mutated export, or a registry change) is skipped
-  loudly rather than written.
+  — a real apply refuses in non-TTY shells with exit 102, and it initializes no
+  state before that gate. `--dry-run` is the one read-only exception (it touches
+  nothing on a bare machine), so a cooperative agent can show the operator the
+  delta.
+- Every entry is re-validated (name, ecosystem, non-empty reason) as if it were
+  typed into `add`; the file is treated as untrusted input, and a malformed
+  document or a non-object entry is refused or skipped, never partially applied.
+- Only an **exact** version pin is accepted — never a range (`^1`, `1.x`), a
+  dist-tag (`latest`, `next`), or an npm source spec (`file:`, `git+…`, a URL or
+  path). This is what stops a tampered export from turning `victim@file:/…` into
+  a host-execution grant.
+- Integrity is **re-fetched from the registry**, not trusted from the file. An
+  entry is written only if its exact version resolves in the registry (returns
+  an integrity); an unverifiable version is skipped, and a present-but-divergent
+  hash (a mutated export, or a registry change) is skipped loudly.
 - A package already pinned locally to a *different* version is never silently
   overwritten — the conflict is reported and left for an explicit
   `host-allow update`.
+- The original grant date rides along, so a replicated pin keeps its true age in
+  the staleness review rather than looking freshly added.
 
 Deliberately, the allow set is **not** Syncthing- or otherwise auto-synced
 between machines: silent fleet propagation is exactly what the per-machine

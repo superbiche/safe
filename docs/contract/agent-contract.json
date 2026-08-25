@@ -79,7 +79,7 @@
   ],
   "agent_rules": [
     "Treat any BLOCKED line as policy, not breakage; do not retry blind.",
-    "Relay the refusal line and its `to allow:` command to the operator verbatim. Trust escalations (safe run host-allow add/update) only work in the operator's interactive terminal — never attempt them yourself.",
+    "Relay the refusal line and its `to allow:` command to the operator verbatim. Trust escalations (safe run host-allow add/update/import) only work in the operator's interactive terminal — never attempt them yourself.",
     "After the operator allows, retry the original command unchanged.",
     "Exit 127 from a wrapped tool means a genuinely missing command (or a `safe` missing from PATH), never a policy block — the gate always refuses legibly with exit 100. Report a silent 127, don't bypass.",
     "Never construct or request `<pkg>@latest`; use the pinned version the refusal names.",
