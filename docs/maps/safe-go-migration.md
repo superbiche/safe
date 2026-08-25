@@ -13,10 +13,10 @@ trivial PATH shims and completions.
 
 ## Notes
 
-- Strangler start exists: `cmd/safe-core` (lockdiff, package-verdict),
-  version-locked to `safe` by the gate.
+- Strangler start exists: `cmd/safe-core` (lockdiff, package-verdict,
+  release-review), version-locked to `safe` by the gate.
 - Standing constraint (`docs/architecture.md` § Direction: Go): binary-audit
-  is built composite-first in Go — one `release-review` command, one report,
+  was built composite-first in Go — one `release-review` command, one report,
   one capability key.
 - Test law (charting ruling 2026-08-21): each migrated lane ports its tests
   to Go in the same slice, AND the surface's existing bash suite must stay
@@ -31,16 +31,23 @@ trivial PATH shims and completions.
   (missing Go toolchain is red under the aggregate runner).
 - Dependency policy is ruled per lane in that lane's ticket; until a lane
   rules otherwise, the posture is subprocess (status quo).
-- First bite (charting ruling 2026-08-21): the binary-audit lane.
+- First bite (charting ruling 2026-08-21): the binary-audit lane —
+  **SHIPPED at 1.34.0** (ticket #144, PR #105 → `5ad74f1`). The six bash
+  sub-lanes are deleted; `release-review` is the one binary-audit command,
+  forwarding to `internal/releasereview`. With the bash sub-lanes gone, the
+  fixture-corpus parity gate is retired and verdict-affecting divergences are
+  frozen as in-process Go goldens (`internal/releasereview/ledger_test.go`,
+  `version_test.go`).
 - Repo review law applies (`AGENTS.md` § Reviews).
 
-## Tickets (index at export time, 2026-08-24)
+## Tickets (index at export time, 2026-08-25)
 
 - [Binary-audit lane: native Go vs subprocess survey](https://superbiche.fibery.io/Superbiche/Tasks/120) — research, CLOSED at charting.
 - [Composite release-review: spec, report schema, deps posture](https://superbiche.fibery.io/Superbiche/Tasks/121) — grilling, CLOSED 2026-08-23.
 - [Parity belt: wire the bash-suite-against-Go rule into the repo](https://superbiche.fibery.io/Superbiche/Tasks/122) — task, CLOSED 2026-08-23.
 - [Mixed-era binary shape: safe-core sidecar vs Go dispatcher](https://superbiche.fibery.io/Superbiche/Tasks/123) — grilling, CLOSED 2026-08-24.
 - [End-state gate: what replaces gate-lib and the PATH wrappers](https://superbiche.fibery.io/Superbiche/Tasks/124) — grilling, CLOSED 2026-08-24.
+- [Cutover: delete the six bash binary-audit sub-lanes (parity-belt final slice)](https://superbiche.fibery.io/Superbiche/Tasks/144) — build slice, DONE 2026-08-25 (shipped 1.34.0, PR #105).
 
 ## Decisions so far
 
@@ -52,7 +59,9 @@ trivial PATH shims and completions.
 
 ## Not yet specified
 
-- Ordering of lanes after binary-audit — reshuffles as slices land.
+- The next Go lane after binary-audit (now shipped) — unstarted; ordering
+  reshuffles as slices land. (The open standalone safe tickets #145/#146/#147
+  are feature work, not migration lanes.)
 - Interactive/TTY surfaces in Go (safe-run prompts, exit-102 semantics,
   interactive host-allow adds) — ports with the first lane that hits prompts.
 - Go package layout conventions as lanes multiply — expected to settle in
