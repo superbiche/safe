@@ -65,9 +65,11 @@ discovering them from a refusal. They are what `safe-core release-review
 --versions` prints, and `tests/audit/release_review_forward.sh` fails if the
 two ever disagree.
 
-The six `binary-audit` sub-lanes stay advertised beside the composite. They are
-still callable, and a capability key is withdrawn when its command is deleted,
-not when a successor lands.
+The six `binary-audit` sub-lanes the composite replaced (`release github`,
+`vuln github-release`, the three `verify` lanes and `exec`) are deleted, and
+their capability keys are withdrawn with them — a key is a promise the command
+behind it exists. `binary-audit.release-review` is the one remaining
+binary-audit capability.
 
 ## Invocation
 
@@ -698,8 +700,16 @@ same bucket as "we checked, and it failed".
 
 ## Divergences from the bash sub-lanes
 
-The composite is a redesign, not a transcription. These are every place its
-behavior deliberately differs from the `binary-audit` sub-lane it replaces.
+The composite is a redesign, not a transcription. The six `binary-audit`
+sub-lanes it replaced (`release github`, `vuln github-release`, the three
+`verify` lanes and `exec`) have since been deleted, so this is no longer a live
+parity contract against a running lane — it is the normative record of how the
+composite behaves and why, at every point it deliberately differs from the bash
+approach it grew out of. While both lanes existed, a parity corpus drove the
+same fixtures through each and diffed the verdicts; with bash gone, the
+verdict-affecting entries below (1–4, 10–13) are frozen as in-process goldens in
+`internal/releasereview/ledger_test.go`, one case per entry, so a ledger entry
+still cannot claim a behavior nothing checks.
 
 1. **Checksum single-entry fallback.** The bash lane falls back to the *first*
    digest of a file with any number of entries, which mislabels a no-entry case

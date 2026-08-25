@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **The six `binary-audit` bash sub-lanes are deleted; `release-review` is the
+  one binary-audit command.** `safe audit binary-audit release github`,
+  `vuln github-release`, the three `verify` lanes (`release-asset`,
+  `sigstore-bundle`, `tuf-bootstrap`) and `exec` no longer exist — the Go
+  `release-review` composite has done their whole job since 1.32.0, and keeping
+  them was dual maintenance. Their capability keys are withdrawn: `safe audit
+  capabilities` now advertises only `binary-audit.release-review` under the
+  `binary-audit` group (`SAFE_AUDIT_VERSION` → 0.3.0), and `safe doctor` reports
+  one `release-review` feature (ready when `cosign` and `podman` are present —
+  the composite's only external tools; checksum, TUF mirror, release and vuln are
+  pure Go, and the sub-lanes' `timeout` and `python` dependencies are gone). The
+  parity corpus that diffed the two lanes retires with them; the verdict-affecting
+  divergences it checked are now in-process Go goldens
+  (`internal/releasereview/ledger_test.go`), and a systematic differential golden
+  froze the bash version comparator before its deletion
+  (`version_test.go`). No release verdict changes.
+
 - **`release-review` now pins `GITHUB_TOKEN` to the base URL's origin and puts a
   deadline on its `cosign` subprocesses.** The `release` and `vuln` checks make
   two of their requests to absolute URLs GitHub itself returns — a `Link`
