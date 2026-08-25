@@ -1,0 +1,36 @@
+version = 1
+
+[[bindings]]
+doc = "docs/architecture.md"
+target = "docs/release-review.md"
+sig = "8dab3216df20261a"
+
+[[bindings]]
+doc = "docs/command-reference.md"
+target = "lib/completions/_safe"
+sig = "5249b39543e6dfde"
+
+[[bindings]]
+doc = "docs/installation.md"
+target = "install.sh"
+sig = "d692d663a95125e1"
+
+[[bindings]]
+doc = "docs/release-review.md"
+target = "internal/releasereview/report.go#Review"
+sig = "2fea910992963b18"
+
+[[bindings]]
+doc = "docs/release-review.md"
+target = "internal/releasereview/report.go#Severity"
+sig = "9f1f871c63f6f3f1"
+
+[[bindings]]
+doc = "docs/release-review.md"
+target = "internal/releasereview/spec.go#Spec"
+sig = "084d3a2364a61dca"
+
+[[bindings]]
+doc = "docs/safe-audit.md"
+target = "internal/verdict/verdict.go#Decide"
+sig = "9d7937815cb8379c"

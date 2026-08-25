@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# DRIFT_HOOK_START — docs-drift dogfood (2026-08-25); fail-open if drift absent.
+# One-time local bootstrap: git config core.hooksPath .githooks (see CONTRIBUTING.md).
+if [ -f drift.lock ] && command -v drift >/dev/null 2>&1; then
+  if ! drift check; then
+    echo "drift: docs stale or links broken — update the doc prose then 'drift link <doc> <target>', or bypass once with 'git commit --no-verify'" >&2
+    exit 1
+  fi
+fi
+# DRIFT_HOOK_END
