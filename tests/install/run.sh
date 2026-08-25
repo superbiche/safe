@@ -2635,6 +2635,31 @@ case_critical_scan_non_tty_aborts() {
   pass "$FUNCNAME"
 }
 
+# #147: a scan that FAILS OUTRIGHT (a non-zero exit — required scanners missing
+# in non-TTY is the common case, safe-audit exit 2) yields no verdict and never
+# says "critical". An interactive shell warns and lets the operator proceed; a
+# non-interactive shell has no one to weigh that warning, so it fails closed
+# with exit 100 rather than delegating an unaudited install — mirroring the
+# projected-dependency scan guard and the critical-findings non-TTY refusal
+# above. The sibling no-verdict sites (unwritable destination; exit-0 unreadable
+# document) still warn-and-proceed by policy — see the malformed-result case.
+case_scan_failed_outright_non_tty_blocks() {
+  prepare_case "scan-failed-outright-non-tty-blocks"
+  touch "${WORK_DIR}/package.json"
+  SAFE_AUDIT_SCAN_OUTPUT='local: skipping scan because required scanners are missing in non-TTY mode' \
+    SAFE_AUDIT_SCAN_STATUS=2 SAFE_AUDIT_SCAN_NO_RESULT=1 \
+    SAFE_INSTALL_TEST_SCRIPT='npm ci' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe: BLOCKED install — safe audit repo-audit failed with exit 2' "$FUNCNAME" || return
+  assert_err_contains_fragment 'audit-infrastructure breakage, not a package finding' "$FUNCNAME" || return
+  # Non-TTY refusals are exactly one line: no interactive "proceeding" tail.
+  assert_err_not_contains_fragment 'proceeding' "$FUNCNAME" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+  pass "$FUNCNAME"
+}
+
 # The scan EXITS 0 when it finds a critical advisory — the verdict lives in
 # the result document. Gating on the exit code let every finding through.
 case_critical_in_result_blocks_despite_exit_zero() {
@@ -5500,6 +5525,7 @@ main() {
     case_npm_alias_audits_target_package \
     case_audit_failure_blocks \
     case_critical_scan_non_tty_aborts \
+    case_scan_failed_outright_non_tty_blocks \
     case_critical_in_result_blocks_despite_exit_zero \
     case_broken_scanner_warns_and_proceeds \
     case_malformed_result_document_is_not_read_as_clean \

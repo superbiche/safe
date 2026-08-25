@@ -1486,8 +1486,19 @@ safe_gate_scan_project() {
     return $?
   fi
 
-  safe_gate_err "safe install: safe audit repo-audit failed with exit ${scan_status}; the project was not fully audited — safe doctor; proceeding"
-  return 0
+  # The scan failed outright (a non-zero exit — required scanners missing is
+  # the common case) and said nothing about criticals, so there is no verdict.
+  # An interactive operator can see the warning and choose to proceed; a
+  # non-interactive shell has no one to weigh that, and a gate that cannot
+  # audit must never silently pass the install. In non-TTY this is
+  # audit-infrastructure breakage to fix, not a clean tree — fail closed with a
+  # recovery path, mirroring the projected-dependency scan guard.
+  if [[ -t 0 && -t 1 ]]; then
+    safe_gate_err "safe install: safe audit repo-audit failed with exit ${scan_status}; the project was not fully audited — safe doctor; proceeding"
+    return 0
+  fi
+  safe_gate_err "safe: BLOCKED install — safe audit repo-audit failed with exit ${scan_status} (audit-infrastructure breakage, not a package finding); fix the scanner and retry — safe doctor; details: safe explain"
+  return 100
 }
 
 # Prefer npm-shrinkwrap.json because npm treats it as the authoritative lock;
