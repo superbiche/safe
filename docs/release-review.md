@@ -669,7 +669,7 @@ this command.
 
 | Tool | Used by | Purpose |
 | --- | --- | --- |
-| `cosign` | `signature`, `tuf` | `verify-blob` against a Sigstore bundle; `initialize` against a pinned TUF root |
+| `cosign` | `signature`, `tuf` | `verify-blob` against a Sigstore bundle or a detached certificate+signature; `initialize` against a pinned TUF root |
 | `podman` | `exec` | the sandbox the release binary runs in |
 
 **A missing tool is always `ERROR` (exit 30), never a verdict about the
@@ -908,19 +908,21 @@ still cannot claim a behavior nothing checks.
     that runs while those are unreachable would fail cosign with a network error.
     That is audit-infrastructure breakage, never a signer the policy disallows,
     so the cascade classifies cosign's own client-bootstrap phrasing (TUF refresh
-    / trusted-root fetch / Rekor public-key / dial failures) as
+    / Rekor public-key / dial failures) as
     `verification_infrastructure_unavailable` (ERROR) and stops, at every step —
-    the wildcard re-probes hit the same outage. The match is a tight allowlist of
-    cosign's client-bootstrap strings, which arise before and independent of the
-    evidence files. cosign does echo the certificate's SAN and issuer into its
-    identity-mismatch message, so that message is preempted first: an output that
-    names an identity mismatch classifies as a rejection whatever the echoed SAN
-    contains, which keeps a cert planting an infra marker from downgrading a
-    genuine `BLOCK` to an `ERROR`. Even without that guard the fail-closed
-    property holds — both outcomes refuse the release — so the residual is a
-    downgrade in *kind*, never a silent pass; and an unrecognized message falls
-    through to `BLOCK`, so a future cosign that rewords the bootstrap strings
-    degrades to over-blocking. The same classifier guards the bundle path, where
+    the wildcard re-probes hit the same outage. The classifier reads only
+    cosign's **fatal** line (`Error:` / `error during command execution:`), not
+    the whole combined output: the "Could not fetch trusted_root … Continuing"
+    line is a non-fatal warning cosign prints even on runs that go on to verify
+    or reject, and cosign echoes the caller-supplied evidence path and the
+    certificate's SAN into its output, so a whole-output substring match could be
+    steered by an evidence path or SAN containing a network string. Fatal lines
+    about the evidence itself — a certificate that would not load, or an identity
+    that did not match — are excluded, leaving only the trust-bootstrap network
+    chain, which nothing under an attacker's control reaches. An unrecognized
+    fatal line falls through to `BLOCK` — the fail-closed direction, so a future
+    cosign that rewords the bootstrap strings degrades to over-blocking, never a
+    silent pass. The same classifier guards the bundle path, where
     a cold trust-root cache with no network is the same outage.
     `signature_test.go` drives it with a fake cosign emitting the captured
     offline output.

@@ -10,8 +10,10 @@ import (
 	"strings"
 )
 
-// signature verifies each artifact's Sigstore bundle with cosign and reports
-// which artifacts a signer policy actually vouched for.
+// signature verifies each artifact's signing evidence with cosign — a Sigstore
+// bundle over the artifact, or a detached certificate+signature over its
+// checksum file — and reports which artifacts a signer policy actually vouched
+// for.
 //
 // The returned map holds the indices cosign verified, keyed by index because a
 // spec may repeat an asset name or a path. It is what lets the checksum check

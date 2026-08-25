@@ -29,10 +29,12 @@
   `verification_infrastructure_unavailable` (ERROR) and stops, at every probe,
   rather than emitting a `signature_failure` BLOCK. The same classifier guards
   the bundle path, where a cold trust-root cache with no network is the same
-  outage — closing a latent false-malice case there too. The match is a tight
-  allowlist of client-bootstrap strings that arise independent of the evidence
-  files, so a genuine signature failure cannot steer into it, and an
-  unrecognized message falls through to BLOCK (fail-closed). Detached mode uses
+  outage — closing a latent false-malice case there too. The classifier reads
+  only cosign's fatal error line and excludes its evidence-load and
+  identity-mismatch lines, so neither the non-fatal trusted-root warning nor the
+  caller-supplied evidence path or cert SAN that cosign echoes can steer a
+  genuine signature failure into it; an unrecognized fatal line falls through to
+  BLOCK (fail-closed). Detached mode uses
   cosign's deprecated `--certificate`/`--signature` flags (a known risk, parked
   with the feature; no bundle synthesis, and `--insecure-ignore-tlog` stays
   rejected).
