@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **`safe audit` subprocess scratch is reclaimed, not left in `$TMPDIR`**
+  (1.41.0). Several audit-path helpers created working files with a bare
+  `mktemp`, which lands the file directly in `$TMPDIR` where the process-exit
+  cleanup trap — which only reclaims directories registered through
+  `new_scratch_dir` — never sees it, so the scratch survived every exit path
+  including a clean rc 0. The grype db-health check (`raw` status capture, its
+  stderr sibling, and the health JSON), the scan-result snapshot, and the three
+  `safe audit ioc` helpers now route their scratch through the registry, so a
+  clean run leaves nothing behind. Observed live by the setup-new-machines
+  release-review verification (scratch accumulating per candidate across a
+  post-update sweep). Behavior-neutral to every verdict; hygiene only.
 - **`release-review` learns detached signature verification** (`spec_version`
   → 2, 1.40.0). The `signature` check now accepts a detached
   `certificate`+`signature` pair (the `<checksums>.pem` + `<checksums>.sig`
