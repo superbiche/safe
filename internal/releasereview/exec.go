@@ -105,6 +105,18 @@ func sandboxExec(spec Spec) CheckResult {
 		return result
 	}
 
+	// The artifact's directory is bind-mounted as `<dir>:/artifact:ro,z`, and
+	// podman splits a -v spec on `:`. A directory path containing a colon would
+	// mis-split into a bogus source, destination and options, so the sandbox
+	// this check depends on cannot be built safely — that is the review failing
+	// to run (ERROR), not a finding about the release.
+	if strings.Contains(filepath.Dir(absolute), ":") {
+		result.add(ERROR, "artifact_path_unmappable",
+			"the artifact's directory path contains a ':', which cannot be bind-mounted into the sandbox",
+			map[string]string{"artifact_path": absolute})
+		return result
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
 	defer cancel()
 

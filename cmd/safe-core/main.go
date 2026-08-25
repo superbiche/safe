@@ -10,6 +10,7 @@ import (
 
 	"github.com/superbiche/safe/internal/lockdiff"
 	"github.com/superbiche/safe/internal/releasereview"
+	"github.com/superbiche/safe/internal/strictjson"
 	"github.com/superbiche/safe/internal/verdict"
 )
 
@@ -72,6 +73,14 @@ func packageVerdict(args []string, stdin io.Reader, stdout, stderr io.Writer) in
 
 	raw, err := io.ReadAll(stdin)
 	if err != nil {
+		fmt.Fprintf(stderr, "safe-core: package-verdict: read evidence: %v\n", err)
+		return 3
+	}
+	// A repeated member is refused before anything reads the document: json keeps
+	// the last occurrence silently, so two conflicting values for one fact would
+	// resolve by byte order — a verdict decided by serialization, which this
+	// decision layer must not admit even though its evidence is machine-assembled.
+	if err := strictjson.RejectRepeatedMembers(raw); err != nil {
 		fmt.Fprintf(stderr, "safe-core: package-verdict: read evidence: %v\n", err)
 		return 3
 	}

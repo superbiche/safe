@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **`release-review` hardens three input paths against traversal, mis-mounting,
+  and byte-order-decided verdicts** (defense-in-depth, no change to a verdict on
+  any legitimate input). (1) A TUF trust target name that is absolute or carries
+  a `..` segment is refused at spec validation, and a non-hex trusted-metadata
+  digest is refused at the check — both are joined into the paths the `tuf` check
+  hashes, where `filepath.Join`'s `Clean` would resolve `..` out of the mirror
+  tree. (2) An `exec` artifact whose directory path contains a `:` is `ERROR`
+  (`artifact_path_unmappable`): podman splits a `-v` spec on `:`, so such a path
+  would mis-split the bind mount and the sandbox cannot be built safely. (3)
+  `safe-core package-verdict` now refuses an evidence document that names the same
+  member twice: `encoding/json` keeps the last occurrence silently, so two
+  conflicting values for one fact would resolve by byte order. These are
+  divergences 16–17 in the release-review ledger plus a shared
+  `internal/strictjson` check; the evidence document is machine-assembled, so (3)
+  is belt-and-suspenders.
+
 - **A non-interactive install gate now fails closed when the project audit
   cannot run.** The install preflight (`safe_gate_scan_project`) already refused
   critical findings in a non-TTY shell (exit 102); a scan that failed *outright*

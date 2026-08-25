@@ -257,6 +257,9 @@ it, which is what keeps the schema example above valid.
     lowercased).
   - `targets` — required, at least one entry, mapping a TUF target name to the
     local file that must match it. Every name and every path must be non-empty.
+    A name may contain `/` (TUF target names are path-like) but must be relative
+    and carry no `..` segment: the name is joined onto the mirror's targets tree,
+    where an absolute or climbing name would resolve out of it (divergence 16).
 - `checks.exec` — when enabled:
   - `artifact` — required. A **free path**: the executable to smoke, typically
     something extracted from a distributed artifact. It need **not** name an
@@ -306,8 +309,10 @@ Beyond decode and field validation, these spec conditions are refused:
 - **A `tuf` block that cannot describe a bootstrap**: a mirror that is absent or
   names a scheme other than `file://`, an absent or non-sha256 `root_checksum`,
   an absent `root`, or a `targets` map that is empty or holds an empty name or
-  path. A multi-target spec's refusal names targets in sorted order, so the line
-  does not depend on JSON key order either.
+  path — or a target name that is absolute or contains a `..` segment, which
+  would escape the mirror's targets tree (divergence 16). A multi-target spec's
+  refusal names targets in sorted order, so the line does not depend on JSON key
+  order either.
 - **A `release` block naming no `asset`.**
 - **An `exec` block naming no `artifact`, or a negative `timeout_seconds`.**
 
@@ -510,7 +515,7 @@ always `ERROR` here.
 | `trust_root_mismatch` | BLOCK | `root`, `expected_root_checksum`, `actual_root_checksum` | the root.json on disk is not the pinned root |
 | `bootstrap_failure` | BLOCK | — | `cosign initialize` failed, or succeeded without caching trusted targets metadata, or cached metadata that cannot be read as TUF targets JSON |
 | `policy_mismatch` | BLOCK | `target` | the trusted metadata does not name this target at all |
-| `trusted_mirror_target_invalid` | BLOCK | `target`, `mirror_blob_path`, and `trusted_metadata_sha256`/`actual_mirror_blob_sha256` on a content mismatch | the mirror is missing the blob its own trusted metadata names, or serves one that does not hash to it |
+| `trusted_mirror_target_invalid` | BLOCK | `target`, `mirror_blob_path`, and `trusted_metadata_sha256`/`actual_mirror_blob_sha256` on a content mismatch; only `target` and `trusted_metadata_sha256` when the trusted digest itself is not a sha256 | the mirror is missing the blob its own trusted metadata names, serves one that does not hash to it, or the trusted metadata's digest is not a sha256 (refused before it is joined into the blob path — divergence 16) |
 | `trust_material_mismatch` | BLOCK | `target`, `local_sha256`, `trusted_sha256`, `trusted_length` | the caller's local copy is not the trusted target |
 | `trust_root_unreadable` | ERROR | `root`, `error` | the root exists and cannot be hashed |
 | `trust_target_unreadable` | ERROR | `target`, `error` | a local target exists and cannot be hashed |
@@ -551,6 +556,7 @@ is reproducible byte-for-byte across runs.
 | `timeout` | WARN | `timeout_seconds` | the binary did not exit within the effective timeout |
 | `runtime_failure` | WARN | `exit_code`, and `stdout_summary`/`stderr_summary` when non-empty | the binary exited nonzero inside the sandbox |
 | `artifact_unreadable` | ERROR | `artifact_path`, `error` | the artifact path could not be resolved against the working directory |
+| `artifact_path_unmappable` | ERROR | `artifact_path` | the artifact's directory path contains a `:`, which podman would mis-split in the `-v` mount, so the sandbox cannot be built (divergence 17) |
 | `tool_missing` | ERROR | — | podman is not installed |
 
 Runtime observations are `WARN` because of what this check can and cannot say:
@@ -807,3 +813,26 @@ still cannot claim a behavior nothing checks.
     release. No corpus pair accompanies this either — a timeout is not reproducible
     through the fixture corpus without a deliberately hanging cosign; the Go unit
     tests drive it by lowering the deadline against a fake asked to sleep.
+16. **A trust target name that escapes its directory is refused** (`tuf`). The
+    target name is joined onto `<mirror>/targets` and onto the materialized
+    targets directory to build the paths this check hashes, and `filepath.Join`
+    runs `Clean`, which *resolves* a `..` rather than neutralizing it — so a name
+    like `../../etc/passwd` (or an absolute one) would steer those reads out of
+    the mirror. TUF names are path-like and legitimately contain `/`, so only the
+    traversal shapes are refused: an absolute name or one carrying a `..` segment
+    is rejected at spec validation (exit 3), before any check runs. The
+    metadata-supplied digest is spliced into the same blob path, so a non-hex
+    digest is refused at the check as `trusted_mirror_target_invalid` for the same
+    reason. The bash lane joined both unchecked. No corpus pair: this refuses a
+    hostile spec rather than changing a verdict on a legitimate one; `spec_test.go`
+    and `tuf_test.go` carry the coverage.
+17. **An artifact directory path containing `:` is refused** (`exec`). The
+    artifact's directory is bind-mounted as `<dir>:/artifact:ro,z`, and podman
+    splits a `-v` spec on `:`; a directory path with a colon would mis-split into
+    a bogus source, destination and options. The sandbox this check depends on
+    cannot then be built safely, so it is `ERROR` (`artifact_path_unmappable`) —
+    the review failing to run — never a finding about the release, the same
+    posture as a missing `podman` (divergence 3). The bash lane spliced the path
+    into the `-v` argument unchecked. No corpus pair: it changes behavior only on
+    a pathological path, not a verdict on a legitimate fixture; `exec_test.go`
+    carries the coverage.

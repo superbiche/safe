@@ -266,6 +266,18 @@ func checkTarget(result *CheckResult, config *TUFCheck, metadata tufTargetsMetad
 		return
 	}
 
+	// The digest is metadata-supplied and is spliced into the blob path below,
+	// where filepath.Join's Clean would resolve a `..` out of the targets tree —
+	// so a non-hex "digest" is refused before it can steer that read (and the
+	// mismatch branch could otherwise report the sha256 of an out-of-tree file).
+	// The name itself is already refused at spec validation.
+	if _, ok := normalizeSHA256(entry.Hashes.SHA256); !ok {
+		result.add(BLOCK, "trusted_mirror_target_invalid",
+			fmt.Sprintf("trusted metadata's digest for %s is not a sha256", name),
+			map[string]string{"target": name, "trusted_metadata_sha256": entry.Hashes.SHA256})
+		return
+	}
+
 	blobPath := filepath.Join(config.Mirror, "targets", entry.Hashes.SHA256+"."+name)
 	blobData := map[string]string{"target": name, "mirror_blob_path": blobPath}
 	blobInfo, err := os.Stat(blobPath)
