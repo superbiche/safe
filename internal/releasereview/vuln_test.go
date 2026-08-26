@@ -256,9 +256,12 @@ func TestVulnUnplaceableVersionAlwaysFailsClosed(t *testing.T) {
 		{"digitless, equality range", "nightly", advisoryEntry{"=1.0.0", ""}},
 		{"digitless, upper-bound range", "nightly", advisoryEntry{"<2.0.0", ""}},
 		{"digitless, unreadable range + patched", "nightly", advisoryEntry{"~>1.2.0", "2.0.0"}},
-		{"two versions fused by a dotted prefix", "tool-2.0-v0.5.0", advisoryEntry{"~>1.2.0", "1.0.0"}},
-		{"two versions, trailing platform", "tool-v0.5.0_linux-6.8", advisoryEntry{"~>1.2.0", "1.0.0"}},
-		{"two versions, readable upper-bound", "tool-v0.5.0_linux-6.8", advisoryEntry{"<1.0.0", ""}},
+		// F1 round-3 case: the real release `v0` has no dotted version, so the
+		// dotted `6.8` in the prefix must not be placed as the version.
+		{"version-bearing prefix, undotted release", "platform-6.8-v0", advisoryEntry{"<1.0.0", ""}},
+		// Trailing platform version breaks the structural anchor.
+		{"trailing platform version, unreadable + patched", "tool-v0.5.0_linux-6.8", advisoryEntry{"~>1.2.0", "1.0.0"}},
+		{"trailing platform version, readable upper-bound", "tool-v0.5.0_linux-6.8", advisoryEntry{"<1.0.0", ""}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			body := advisoryBodyEntries("GHSA-unplaceable", "high", testCase.entry)
@@ -270,6 +273,21 @@ func TestVulnUnplaceableVersionAlwaysFailsClosed(t *testing.T) {
 					result.Verdict, codes(result))
 			}
 		})
+	}
+}
+
+// The `-v` separator places the real release even when the prefix carries its
+// own dotted version: `tool-2.0-v0.5.0` is the release `0.5.0` of a tool named
+// `tool-2.0`, not `2.0`. Against an unreadable range with patched `1.0.0`, the
+// pre-patch `0.5.0` is affected (BLOCK) — the prefix `2.0` must not be placed
+// (which, being ≥ 1.0.0, would have excluded it and failed open).
+func TestVulnDashVSeparatorPlacesTheReleaseNotThePrefixVersion(t *testing.T) {
+	body := advisoryBodyEntries("GHSA-dashv", "high", advisoryEntry{"0.2.0 <= 0.9.0", "1.0.0"})
+	newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+	result := vuln(vulnSpecVersion("tool-2.0-v0.5.0"))
+	if result.Verdict != BLOCK || !hasCode(result, "known_advisory_high_severity") {
+		t.Fatalf("verdict %s with reasons %v, want a high-severity BLOCK for the pre-patch 0.5.0 release", result.Verdict, codes(result))
 	}
 }
 

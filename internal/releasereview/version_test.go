@@ -400,22 +400,28 @@ func TestComparableVersion(t *testing.T) {
 		want      string
 		placeable bool
 	}{
-		{"rust-v0.149.1", "0.149.1", true},
-		{"v1.2.3", "1.2.3", true},
+		// Whole-tag version, optionally v-prefixed.
 		{"1.2.3", "1.2.3", true},
+		{"v1.2.3", "1.2.3", true},
 		{"0.1.0", "0.1.0", true},
-		{"release-2.0.0-rc1", "2.0.0-rc1", true},
-		// A digit inside the project name is not a dotted version, so it does not
-		// count: the single version is the trailing one.
+		{"v1.2.3-alpha.1.2", "1.2.3-alpha.1.2", true},
+		{"v1.2.3+linux.6.8", "1.2.3+linux.6.8", true},
+		// Prefix, the `-v` separator, then the version — the structural position.
+		// A dotted run inside the prefix does not steal the placement: the `-v`
+		// version wins.
+		{"rust-v0.149.1", "0.149.1", true},
 		{"tool2-v0.5.0", "0.5.0", true},
-		{"tool2-0.5.0", "0.5.0", true},
-		{"v2-v0.5.0", "0.5.0", true},
-		{"go1.21.0", "1.21.0", true},
-		// Two dotted versions — which is the release version cannot be told, so
-		// the tag is unplaceable and fails closed rather than guessing.
-		{"tool-2.0-v0.5.0", "", false},
+		{"release-v2.0.0-rc1", "2.0.0-rc1", true},
+		{"tool-2.0-v0.5.0", "0.5.0", true},
+		{"platform-6.8-v0.1", "0.1", true},
+		// Unplaceable — the version is not at a structural position, so it is not
+		// guessed. `platform-6.8-v0`: the real release `v0` has no dotted version.
+		// `tool-v0.5.0_linux-6.8`: the `_linux` tail breaks the end anchor.
+		// `tool2-0.5.0` / `go1.21.0`: a name glued to a version with no `-v`.
+		{"platform-6.8-v0", "", false},
 		{"tool-v0.5.0_linux-6.8", "", false},
-		// No dotted version at all is unplaceable too.
+		{"tool2-0.5.0", "", false},
+		{"go1.21.0", "", false},
 		{"5abc", "", false},
 		{"nightly", "", false},
 		{"", "", false},

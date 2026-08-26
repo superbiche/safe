@@ -66,42 +66,41 @@ func versionMatchesRange(version, versionRange string) rangeMatch {
 	return rangeMatches
 }
 
-// dottedVersionCore matches a bare dotted numeric version (major.minor with any
-// further segments). It is used only to COUNT the version-shaped substrings a
-// tag contains, so ambiguity can be detected.
-var dottedVersionCore = regexp.MustCompile(`[0-9]+(?:\.[0-9]+)+`)
-
-// versionWithSuffix matches a dotted numeric version plus an optional
-// semver-style prerelease and build suffix. It has no leading `v` and no
-// boundary term: it is applied only once a tag is known to contain exactly one
-// version, so there is nothing else for it to collide with.
-var versionWithSuffix = regexp.MustCompile(`[0-9]+(?:\.[0-9]+)+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?`)
+// placeableTag matches a release tag whose version sits at a STRUCTURAL
+// position, capturing that version. The tag as a whole must be one of exactly
+// two shapes:
+//
+//	v?VERSION        the tag is the version, optionally `v`-prefixed (`1.2.3`, `v1.2.3`)
+//	<prefix>-vVERSION  a name, then the `-v` separator, then the version (`rust-v0.149.1`, `tool2-v0.5.0`)
+//
+// VERSION is a dotted numeric version with an optional semver prerelease/build
+// suffix. The whole-tag anchoring is what makes this a placement proof rather
+// than a guess: a version living in the prefix cannot be mistaken for the
+// release, because only the position after a leading `v?` or a `-v` separator is
+// read. `platform-6.8-v0` fits neither shape (its release `v0` has no dotted
+// version) and is unplaceable; `tool-v0.5.0_linux-6.8` fits neither (the `_linux`
+// platform tail breaks the end anchor). A `-v` separated version wins over any
+// dotted run in the prefix, so `tool-2.0-v0.5.0` correctly yields `0.5.0`.
+var placeableTag = regexp.MustCompile(`^(?:v?|.+-v)([0-9]+(?:\.[0-9]+)+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$`)
 
 // comparableVersion isolates the version core of a release tag so the vuln check
-// can compare it against advisory versions, reporting whether the tag names one
-// unambiguous version at all.
+// can compare it against advisory versions, reporting whether the tag names a
+// version at a position this build can trust.
 //
 // subject.version is the GitHub *tag* — the release check looks it up as one
 // (`/releases/tags/{version}`), so the producer cannot normalize it there, and a
 // tag may carry a project-specific prefix before the semver (openai/codex ships
 // the Rust binary as `rust-v0.149.1`). The contract is deliberately strict and
-// fail-closed: a tag is PLACEABLE only when it contains exactly one dotted
-// version. `tool2-v0.5.0` → `0.5.0` (the `2` of the name is not a dotted
-// version); but `tool-2.0-v0.5.0` and `tool-v0.5.0_linux-6.8` carry two dotted
-// versions and are NOT placeable — which one is the release version cannot be
-// told, so it is not guessed. An unplaceable tag returns ok=false; the caller
-// never compares it against a range or a patch, it is simply ambiguous. This
-// keeps extraction failure from ever reaching versionCmp, where an empty or
-// fabricated core could collate the wrong way and fail open.
+// fail-closed: only the two structural shapes in placeableTag are placed; any
+// other tag returns ok=false and is never compared against a range or a patch,
+// it is simply ambiguous. This keeps a fabricated or mis-located core from ever
+// reaching versionCmp, where it could collate the wrong way and fail open.
 func comparableVersion(tag string) (string, bool) {
-	if len(dottedVersionCore.FindAllString(tag, -1)) != 1 {
+	match := placeableTag.FindStringSubmatch(tag)
+	if match == nil {
 		return "", false
 	}
-	core := versionWithSuffix.FindString(tag)
-	if core == "" {
-		return "", false
-	}
-	return core, true
+	return match[1], true
 }
 
 // versionSatisfiesConstraint evaluates one comparison such as `<2.0.0` or
