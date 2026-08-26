@@ -396,29 +396,34 @@ func TestVersionMatchesRangeDifferentialGolden(t *testing.T) {
 
 func TestComparableVersion(t *testing.T) {
 	for _, testCase := range []struct {
-		tag  string
-		want string
+		tag       string
+		want      string
+		placeable bool
 	}{
-		{"rust-v0.149.1", "0.149.1"},
-		{"v1.2.3", "1.2.3"},
-		{"1.2.3", "1.2.3"},
-		{"0.1.0", "0.1.0"},
-		{"release-2.0.0-rc1", "2.0.0-rc1"},
-		// A digit inside the project name must not open the version: the core is
-		// the trailing version, not the `2` of the name.
-		{"tool2-v0.5.0", "0.5.0"},
-		{"tool2-0.5.0", "0.5.0"},
-		{"v2-v0.5.0", "0.5.0"},
-		// Unplaceable — fail closed rather than guess: a bare integer with no
-		// dotted version, a name glued to a version with no separator, and a
-		// non-version tag all yield "".
-		{"5abc", ""},
-		{"go1.21.0", ""},
-		{"nightly", ""},
-		{"", ""},
+		{"rust-v0.149.1", "0.149.1", true},
+		{"v1.2.3", "1.2.3", true},
+		{"1.2.3", "1.2.3", true},
+		{"0.1.0", "0.1.0", true},
+		{"release-2.0.0-rc1", "2.0.0-rc1", true},
+		// A digit inside the project name is not a dotted version, so it does not
+		// count: the single version is the trailing one.
+		{"tool2-v0.5.0", "0.5.0", true},
+		{"tool2-0.5.0", "0.5.0", true},
+		{"v2-v0.5.0", "0.5.0", true},
+		{"go1.21.0", "1.21.0", true},
+		// Two dotted versions — which is the release version cannot be told, so
+		// the tag is unplaceable and fails closed rather than guessing.
+		{"tool-2.0-v0.5.0", "", false},
+		{"tool-v0.5.0_linux-6.8", "", false},
+		// No dotted version at all is unplaceable too.
+		{"5abc", "", false},
+		{"nightly", "", false},
+		{"", "", false},
 	} {
-		if got := comparableVersion(testCase.tag); got != testCase.want {
-			t.Errorf("comparableVersion(%q) = %q, want %q", testCase.tag, got, testCase.want)
+		got, ok := comparableVersion(testCase.tag)
+		if got != testCase.want || ok != testCase.placeable {
+			t.Errorf("comparableVersion(%q) = (%q, %t), want (%q, %t)",
+				testCase.tag, got, ok, testCase.want, testCase.placeable)
 		}
 	}
 }

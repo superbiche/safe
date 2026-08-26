@@ -238,17 +238,38 @@ func TestVulnTagWithDigitInPrefixDoesNotFailOpen(t *testing.T) {
 	}
 }
 
-// The digitless fail-open guard on the READABLE-range path too: a subject
-// version with no placeable core must not string-collate above a range bound and
-// read as excluded. `nightly` against a high `<v2.0.0` advisory is a BLOCK, not a
-// GO.
-func TestVulnDigitlessVersionDoesNotEscapeAReadableRange(t *testing.T) {
-	body := advisoryBodyEntries("GHSA-digitless-range", "high", advisoryEntry{"<v2.0.0", ""})
-	newFakeGitHub(t, routes(advisoriesFeed(body)))
+// An unplaceable subject version (no single dotted version this build can
+// isolate) is NEVER compared against a range or a patch: it is ambiguous for
+// every entry and the advisory fails closed. This covers every range direction,
+// including the lower-bound and equality constraints where an empty-string
+// sentinel would have collated the wrong way and failed open (the round-2 N1
+// regression). It also covers a tag carrying TWO dotted versions, where guessing
+// which is the release version would fail open (the round-2 N2 / F1-fused
+// regressions).
+func TestVulnUnplaceableVersionAlwaysFailsClosed(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		version string
+		entry   advisoryEntry
+	}{
+		{"digitless, lower-bound range", "nightly", advisoryEntry{">=1.0.0", ""}},
+		{"digitless, equality range", "nightly", advisoryEntry{"=1.0.0", ""}},
+		{"digitless, upper-bound range", "nightly", advisoryEntry{"<2.0.0", ""}},
+		{"digitless, unreadable range + patched", "nightly", advisoryEntry{"~>1.2.0", "2.0.0"}},
+		{"two versions fused by a dotted prefix", "tool-2.0-v0.5.0", advisoryEntry{"~>1.2.0", "1.0.0"}},
+		{"two versions, trailing platform", "tool-v0.5.0_linux-6.8", advisoryEntry{"~>1.2.0", "1.0.0"}},
+		{"two versions, readable upper-bound", "tool-v0.5.0_linux-6.8", advisoryEntry{"<1.0.0", ""}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			body := advisoryBodyEntries("GHSA-unplaceable", "high", testCase.entry)
+			newFakeGitHub(t, routes(advisoriesFeed(body)))
 
-	result := vuln(vulnSpecVersion("nightly"))
-	if result.Verdict != BLOCK {
-		t.Fatalf("verdict %s with reasons %v, want BLOCK — an unplaceable version must fail closed", result.Verdict, codes(result))
+			result := vuln(vulnSpecVersion(testCase.version))
+			if result.Verdict != BLOCK || !hasCode(result, "version_mapping_ambiguous") {
+				t.Fatalf("verdict %s with reasons %v, want a version_mapping_ambiguous BLOCK — an unplaceable version must never be compared",
+					result.Verdict, codes(result))
+			}
+		})
 	}
 }
 

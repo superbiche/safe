@@ -32,10 +32,11 @@ func vuln(spec Spec) CheckResult {
 	repo := spec.Subject.Repo
 	// version is the subject's GitHub tag, echoed verbatim into every reason so
 	// the report names what the caller passed. comparable is that tag reduced to
-	// the version core the advisory ranges are compared against — the tag may
-	// carry a `rust-v`-style prefix the semver comparison cannot read.
+	// the one version core the advisory ranges are compared against; placeable is
+	// false when the tag names no single version — an unplaceable subject is
+	// never compared, only reported ambiguous.
 	version := spec.Subject.Version
-	comparable := comparableVersion(version)
+	comparable, placeable := comparableVersion(version)
 
 	var advisories []githubAdvisory
 	capped, err := client.getPaged(fmt.Sprintf("/repos/%s/security-advisories?per_page=100", repo), func(page json.RawMessage) *githubError {
@@ -71,7 +72,7 @@ func vuln(spec Spec) CheckResult {
 	}
 
 	for _, advisory := range advisories {
-		matched, ambiguous := matchAdvisory(advisory, comparable)
+		matched, ambiguous := matchAdvisory(advisory, comparable, placeable)
 		identifier := advisory.GHSAID
 		if identifier == "" {
 			identifier = "an advisory with no GHSA id"
@@ -113,10 +114,10 @@ func vuln(spec Spec) CheckResult {
 // entries at all, or entries none of which the range OR its patched-version
 // fallback could decide — is ambiguous: it is a published advisory against this
 // repository that this check cannot place.
-func matchAdvisory(advisory githubAdvisory, version string) (matched, ambiguous bool) {
+func matchAdvisory(advisory githubAdvisory, version string, placeable bool) (matched, ambiguous bool) {
 	decided := 0
 	for _, vulnerability := range advisory.Vulnerabilities {
-		switch entryVerdict(version, vulnerability.VulnerableVersionRange, vulnerability.PatchedVersions) {
+		switch entryVerdict(version, placeable, vulnerability.VulnerableVersionRange, vulnerability.PatchedVersions) {
 		case rangeMatches:
 			return true, ambiguous
 		case rangeExcludes:
@@ -136,13 +137,19 @@ func matchAdvisory(advisory githubAdvisory, version string) (matched, ambiguous 
 
 // entryVerdict decides one vulnerability entry.
 //
-// The vulnerable_version_range is authoritative whenever this build can read
-// it. Only when the range is unreadable — empty, a disjunction, or a syntax the
-// grammar rejects — is the entry's patched_versions consulted: the version a
-// fix first shipped in is a second, independent signal that an unreadable range
-// should not by itself sink a release. This ordering is deliberate and ruled:
+// A subject version this build could not place (the tag names no single
+// version) is never compared: it is ambiguous for every entry, so the advisory
+// fails closed rather than a fabricated core deciding it. Otherwise the
+// vulnerable_version_range is authoritative whenever this build can read it; only
+// when the range is unreadable — empty, a disjunction, or a syntax the grammar
+// rejects — is the entry's patched_versions consulted: the version a fix first
+// shipped in is a second, independent signal that an unreadable range should not
+// by itself sink a release. This ordering is deliberate and ruled:
 // patched_versions never overrides a range this check already decided.
-func entryVerdict(version, versionRange, patched string) rangeMatch {
+func entryVerdict(version string, placeable bool, versionRange, patched string) rangeMatch {
+	if !placeable {
+		return rangeAmbiguous
+	}
 	if verdict := versionMatchesRange(version, versionRange); verdict != rangeAmbiguous {
 		return verdict
 	}

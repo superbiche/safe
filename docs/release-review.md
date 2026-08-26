@@ -833,12 +833,15 @@ still cannot claim a behavior nothing checks.
 
     Two refinements the bash lane never had (both `vuln`): the subject version
     is the GitHub *tag* — the `release` check looks it up as one — so before
-    comparing it against advisory versions it is reduced to the last
-    version-shaped substring at a boundary (`rust-v0.149.1` → `0.149.1`), which
-    keeps a digit inside the project name (the `2` of `tool2-v0.5.0`) from being
-    read as the version; a tag with no placeable version yields an empty core
-    that fails closed everywhere rather than string-collating past a bound. And
-    when a range is
+    comparing it against advisory versions it is reduced to the single dotted
+    version the tag contains (`rust-v0.149.1` → `0.149.1`; the `2` of a
+    `tool2-v0.5.0` name is not a dotted version and does not count). A tag that
+    names NO dotted version, or MORE than one — a version fused into a prefix
+    (`tool-2.0-v0.5.0`), a trailing platform version (`tool-v0.5.0_linux-6.8`) —
+    is unplaceable: which is the release version cannot be told, so the advisory
+    is left ambiguous rather than comparing a guessed core. An unplaceable
+    version is never fed to the version comparison at all, so it can never
+    collate the wrong way and fail open. And when a range is
     unreadable, the entry's `patched_versions` is consulted as a second signal:
     a single, parseable fix version decides — a candidate at or above it is not
     affected, below it is — so an advisory whose *only* defect is an unparseable
