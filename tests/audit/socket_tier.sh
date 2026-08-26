@@ -394,13 +394,14 @@ multi_project() {
 
 run_multi() {
   local mode="$1"
+  shift
   set +e
   env -u SOCKET_SECURITY_API_TOKEN HOME="$CASE_HOME" PATH="$MOCKBIN:/usr/bin:/bin" \
     SAFE_AUDIT_CONFIG_DIR="$CASE_AUDIT_CONFIG" SAFE_AUDIT_DATA_DIR="$CASE_DATA/audit" \
     SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" SAFE_AUDIT_SOCKET_CACHE_DIR="$CASE_CACHE" \
     MOCK_SOCKET_LOG="$CASE_LOG" MOCK_SOCKET_MODE="$mode" MOCK_MULTI_VERSION=1 \
     "$SAFE_AUDIT" package-audit fixture --ecosystem npm --op update --project-dir "$MULTI_DIR" \
-    --json > "$CASE_OUT" 2> "$CASE_ERR"
+    --json "$@" > "$CASE_OUT" 2> "$CASE_ERR"
   CHECK_RC=$?
   set -e
 }
@@ -486,6 +487,94 @@ run_multi sibling-not-found
 expect_rc 10 'an unindexed sibling warns rather than passing'
 expect_json '.warn_causes | index("socket_not_found") != null' 'a not_found sibling raises socket_not_found'
 expect_json '.warn_causes | index("socket_error") == null' 'a not_found sibling is not conflated with an outage'
+
+# --- ranged host-allow: a primary-only pin must not cover a warned sibling ---
+# (Fibery #106) A ranged/multi-version op flattens its Socket causes into one
+# aggregate list with no per-version attribution. A host-allow pinning only the
+# PRIMARY version must therefore NOT be read as covering a SIBLING that actually
+# produced the Socket WARN. The single-entry host-allow schema cannot express a
+# two-version range, so the ranged op is deliberately non-host-allowable —
+# install.auto_allow_tolerate is its aggregate override.
+prepare_case ranged-host-allow-primary-pin-no-cover-sibling
+multi_project
+printf '{"packages":{"fixture":{"version":"1.0.0","sha":"x","ecosystem":"npm","added":"2026-08-01","reason":"primary pinned, sibling unproven"}}}\n' \
+  > "$CASE_RUN_CONFIG/host-allow.json"
+run_multi sibling-not-found --gate install
+expect_rc 10 'a primary-only host-allow pin does not carry a warned sibling to GO'
+if grep -q 'matches every warned resolved version' "$CASE_ERR"; then
+  fail 'the primary-only pin must not claim to cover the ranged set'
+else
+  pass 'the primary-only pin does not claim to cover the ranged set'
+fi
+# The ranged recovery lane is auto_allow_tolerate, not the pin: the refusal
+# names it and must NOT dangle a single-pin host-allow add that can never match.
+if grep -q 'add socket_not_found to install.auto_allow_tolerate' "$CASE_ERR"; then
+  pass 'the ranged refusal names the tolerate lane'
+else
+  fail 'the ranged refusal names the tolerate lane'
+fi
+if grep -q 'host-allow add' "$CASE_ERR"; then
+  fail 'the ranged refusal must not suggest a single-pin host-allow add (dead end)'
+else
+  pass 'the ranged refusal does not suggest a dead-end single-pin host-allow add'
+fi
+
+# The ranged escape the fix preserves: with the sibling cause tolerated, the
+# aggregate operation proceeds.
+prepare_case ranged-host-allow-tolerate-proceeds
+multi_project
+printf '{"install":{"cooldown_days":0,"socket":{"mode":"auto","cache_ttl_days":7},"auto_allow_tolerate":["socket_not_found"]}}\n' \
+  > "$CASE_RUN_CONFIG/config.json"
+run_multi sibling-not-found --gate install
+expect_rc 0 'a ranged sibling warn tolerated by auto_allow_tolerate proceeds'
+
+# Regression: a SINGLE-version install whose primary itself warned is still
+# host-allowable by an exact pin — the fix must not close the legitimate lane
+# (single-version resolved set == [primary], so the pin still covers it).
+prepare_case single-host-allow-primary-pin-covers
+printf '{"packages":{"fixture":{"version":"1.0.0","sha":"x","ecosystem":"npm","added":"2026-08-01","reason":"exact pin"}}}\n' \
+  > "$CASE_RUN_CONFIG/host-allow.json"
+run_check not-found --gate install --op install
+expect_rc 0 'an exact single-version pin still covers a primary Socket warn'
+if grep -q 'matches every warned resolved version' "$CASE_ERR"; then
+  pass 'the single-version pin is honored'
+else
+  fail 'the single-version pin is honored'
+fi
+
+# --- required-version derivation is deny-by-default (Fibery #106, review F1) --
+# The host-allow required set must treat EVERY non per-version cause as
+# aggregate — requiring the whole resolved set — so a primary-only pin can never
+# clear a ranged op. Only osv_affecting is per-version. An aggregate cause that
+# coexists with a version-specific osv_affecting must NOT let $osv_versions
+# narrow the set back to the affected version alone. Driven directly against the
+# derivation helper (the review's reproduction), sourcing is guarded so no main
+# runs.
+derive_required() {
+  local causes="$1"
+  (
+    set -- --version
+    source "$SAFE_AUDIT" >/dev/null 2>&1
+    host_allow_required_versions_json \
+      '[{"version":"1.0.0","classification":{"affecting":[{"id":"CVE-x"}]}},{"version":"2.0.0","classification":{"affecting":[]}}]' \
+      "$causes" "1.0.0" '["1.0.0","2.0.0"]' | jq -c 'sort'
+  )
+}
+derive_check() {
+  local label="$1" causes="$2" expect="$3" got
+  got=$(derive_required "$causes")
+  if [[ "$got" == "$expect" ]]; then pass "$label"; else fail "$label (got $got, want $expect)"; fi
+}
+derive_check 'aggregate socket_disabled + osv_affecting requires the whole ranged set' \
+  '["socket_disabled","osv_affecting"]' '["1.0.0","2.0.0"]'
+derive_check 'aggregate blocklist_unreadable + osv_affecting requires the whole ranged set' \
+  '["blocklist_unreadable","osv_affecting"]' '["1.0.0","2.0.0"]'
+derive_check 'an unknown/future cause is treated as aggregate (fail-closed)' \
+  '["socket_some_future_cause","osv_affecting"]' '["1.0.0","2.0.0"]'
+derive_check 'a plain socket WARN alone requires the whole ranged set' \
+  '["socket_not_found"]' '["1.0.0","2.0.0"]'
+derive_check 'pure per-version osv_affecting keeps its exact-version precision' \
+  '["osv_affecting"]' '["1.0.0"]'
 
 # ---------------------------------------------------------------------------
 # The verdict engine is infrastructure, and its failures are NOT verdicts.

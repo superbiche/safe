@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Ranged install-gate: a primary-only host-allow pin no longer covers a
+  warned sibling** (1.42.0). On a ranged/multi-version operation (e.g. `--op
+  update` resolving two majors), the warn-cause list is a single aggregate with
+  no per-version attribution. A host-allow entry pinning only the PRIMARY
+  version was read as "matches every warned resolved version" and allowed the
+  whole range — even when the version that actually produced the Socket WARN
+  was a resolved SIBLING, not the pinned one. Socket-derived (and other
+  unattributed) WARN classes now require the host-allow to cover the WHOLE
+  resolved set; the single-entry schema cannot express a multi-version range,
+  so a ranged op is deliberately non-host-allowable and routes to
+  `install.auto_allow_tolerate` as its aggregate override. A single-version
+  install is unchanged (its resolved set is just the primary). The matching
+  refusal no longer dangles a `host-allow add` hint that could never match a
+  ranged set — it names the tolerate lane instead. Fail-closed tightening of a
+  gate override; surfaced as proposal P1 during the 2026-08-14
+  socket_not_found review (pre-existing on main, not introduced there). Adds a
+  ranged gate/host-allow regression to `tests/audit/socket_tier.sh`.
 - **`safe audit` subprocess scratch is reclaimed, not left in `$TMPDIR`**
   (1.41.0). Several audit-path helpers created working files with a bare
   `mktemp`, which lands the file directly in `$TMPDIR` where the process-exit
