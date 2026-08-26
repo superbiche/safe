@@ -29,8 +29,34 @@ func advisoryBody(id, severity string, ranges ...string) string {
 		id, severity, strings.Join(entries, ","))
 }
 
+// advisoryEntry is one (range, patched_versions) pair inside an advisory —
+// either field may be empty to say the advisory omitted it.
+type advisoryEntry struct {
+	versionRange string
+	patched      string
+}
+
+// advisoryBodyEntries builds a GHSA record from explicit entries, so a test can
+// pair an unreadable range with a patched_versions fallback.
+func advisoryBodyEntries(id, severity string, entries ...advisoryEntry) string {
+	encoded := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		encoded = append(encoded, fmt.Sprintf(
+			`{"package":{"ecosystem":"go","name":"github.com/example/tool"},"vulnerable_version_range":%q,"patched_versions":%q}`,
+			entry.versionRange, entry.patched))
+	}
+	return fmt.Sprintf(`{"ghsa_id":%q,"cve_id":"CVE-2026-0001","severity":%q,"summary":"test advisory","vulnerabilities":[%s]}`,
+		id, severity, strings.Join(encoded, ","))
+}
+
 func advisoriesFeed(advisories ...string) map[string]string {
 	return map[string]string{advisoriesPath: "[" + strings.Join(advisories, ",") + "]"}
+}
+
+func vulnSpecVersion(version string) Spec {
+	spec := vulnSpec()
+	spec.Subject.Version = version
+	return spec
 }
 
 // A repository with no advisories answers with an empty array, and an empty
@@ -110,6 +136,204 @@ func TestVulnAmbiguousMappingBlocks(t *testing.T) {
 				t.Fatalf("reasons %v, want version_mapping_ambiguous", codes(result))
 			}
 		})
+	}
+}
+
+// When a range is unreadable, the entry's patched_versions is a second signal:
+// a candidate at or above the fix version is not affected (GO), one below it is
+// (BLOCK). This is what stops an advisory whose only defect is an unparseable
+// range from blocking every version forever.
+func TestVulnPatchedVersionResolvesAnUnreadableRange(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		patched  string
+		want     Severity
+		wantCode string
+	}{
+		{"candidate at or above the fix is not affected", "1.0.0", GO, ""},
+		{"candidate below the fix is affected", "2.0.0", BLOCK, "known_advisory_high_severity"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			body := advisoryBodyEntries("GHSA-patched", "high", advisoryEntry{"~>1.2.0", testCase.patched})
+			newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+			result := vuln(vulnSpec())
+			if result.Verdict != testCase.want {
+				t.Fatalf("verdict %s with reasons %v, want %s", result.Verdict, codes(result), testCase.want)
+			}
+			if hasCode(result, "version_mapping_ambiguous") {
+				t.Fatalf("reasons %v: a patched-resolved entry was still reported unmappable", codes(result))
+			}
+			if testCase.wantCode != "" && !hasCode(result, testCase.wantCode) {
+				t.Fatalf("reasons %v are missing %s", codes(result), testCase.wantCode)
+			}
+		})
+	}
+}
+
+// The real GHSA-w5fx-fh39-j5rw shape: openai/codex publishes it against its npm
+// package (`0.2.0 <= 0.38.0`, an unreadable space-separated compound bound) and
+// its VS Code extension (`<= 0.4.11`), each with a patched_versions. Reviewing
+// the Rust binary tag rust-v0.149.1, the readable range excludes it and the
+// unreadable one is resolved by its fix version — a clean GO, where before the
+// unparseable range was a permanent BLOCK.
+func TestVulnCodexRustTagIsNotBlockedByItsNpmAdvisory(t *testing.T) {
+	body := advisoryBodyEntries("GHSA-w5fx", "high",
+		advisoryEntry{"0.2.0 <= 0.38.0", "0.39.0"},
+		advisoryEntry{"<= 0.4.11", "0.4.12"},
+	)
+	newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+	result := vuln(vulnSpecVersion("rust-v0.149.1"))
+	if result.Verdict != GO || len(result.Reasons) != 0 {
+		t.Fatalf("verdict %s with reasons %v, want a clean GO", result.Verdict, codes(result))
+	}
+}
+
+// The ruled ordering: a range this build CAN read is authoritative, and
+// patched_versions is never consulted for it. Here the range matches (a BLOCK)
+// while the patched version, were it consulted, would exclude — the range must
+// win. Guards against a drift that lets patched_versions override a decided
+// range.
+func TestVulnReadableRangeIsNotOverriddenByPatchedVersion(t *testing.T) {
+	body := advisoryBodyEntries("GHSA-precedence", "high", advisoryEntry{"<v2.0.0", "1.0.0"})
+	newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+	result := vuln(vulnSpec())
+	if result.Verdict != BLOCK || !hasCode(result, "known_advisory_high_severity") {
+		t.Fatalf("verdict %s with reasons %v, want a BLOCK from the readable range", result.Verdict, codes(result))
+	}
+}
+
+// The fail-open guard: a subject version whose numeric core cannot be isolated
+// (no digit at all) must NOT be resolved by patched_versions — a string
+// comparison of a non-version collates letters above digits and would read as
+// "at or above the fix", passing a release the check cannot actually place. It
+// stays ambiguous and BLOCKs.
+func TestVulnDigitlessVersionIsNotResolvedByPatched(t *testing.T) {
+	body := advisoryBodyEntries("GHSA-digitless", "high", advisoryEntry{"~>1.2.0", "2.0.0"})
+	newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+	result := vuln(vulnSpecVersion("nightly"))
+	if result.Verdict != BLOCK || !hasCode(result, "version_mapping_ambiguous") {
+		t.Fatalf("verdict %s with reasons %v, want a version_mapping_ambiguous BLOCK", result.Verdict, codes(result))
+	}
+}
+
+// F1 regression: a digit inside the tag's project name must not be read as the
+// version boundary. `tool2-v0.5.0` reduces to `0.5.0`, not `2-v0.5.0`; against an
+// unreadable range with patched `1.0.0`, the genuinely pre-patch 0.5.0 is
+// affected (BLOCK) — it must not slip to GO because a mis-extracted `2-v0.5.0`
+// string-collates above the fix.
+func TestVulnTagWithDigitInPrefixDoesNotFailOpen(t *testing.T) {
+	body := advisoryBodyEntries("GHSA-prefixdigit", "high", advisoryEntry{"0.2.0 <= 0.9.0", "1.0.0"})
+	newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+	result := vuln(vulnSpecVersion("tool2-v0.5.0"))
+	if result.Verdict != BLOCK {
+		t.Fatalf("verdict %s with reasons %v, want BLOCK for the pre-patch 0.5.0 release", result.Verdict, codes(result))
+	}
+	if hasCode(result, "known_advisory") && !hasCode(result, "known_advisory_high_severity") {
+		t.Fatalf("reasons %v: expected the high-severity advisory to fire", codes(result))
+	}
+}
+
+// An unplaceable subject version (no single dotted version this build can
+// isolate) is NEVER compared against a range or a patch: it is ambiguous for
+// every entry and the advisory fails closed. This covers every range direction,
+// including the lower-bound and equality constraints where an empty-string
+// sentinel would have collated the wrong way and failed open (the round-2 N1
+// regression). It also covers a tag carrying TWO dotted versions, where guessing
+// which is the release version would fail open (the round-2 N2 / F1-fused
+// regressions).
+func TestVulnUnplaceableVersionAlwaysFailsClosed(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		version string
+		entry   advisoryEntry
+	}{
+		{"digitless, lower-bound range", "nightly", advisoryEntry{">=1.0.0", ""}},
+		{"digitless, equality range", "nightly", advisoryEntry{"=1.0.0", ""}},
+		{"digitless, upper-bound range", "nightly", advisoryEntry{"<2.0.0", ""}},
+		{"digitless, unreadable range + patched", "nightly", advisoryEntry{"~>1.2.0", "2.0.0"}},
+		// F1 round-3 case: the real release `v0` has no dotted version, so the
+		// dotted `6.8` in the prefix must not be placed as the version.
+		{"version-bearing prefix, undotted release", "platform-6.8-v0", advisoryEntry{"<1.0.0", ""}},
+		// Trailing platform version breaks the structural anchor.
+		{"trailing platform version, unreadable + patched", "tool-v0.5.0_linux-6.8", advisoryEntry{"~>1.2.0", "1.0.0"}},
+		{"trailing platform version, readable upper-bound", "tool-v0.5.0_linux-6.8", advisoryEntry{"<1.0.0", ""}},
+		// Round-4 residual class: a second dotted version in the prefix or a
+		// suffix must not be placed past the anchor. `9.9.9-v0.1.0` — the real
+		// pre-1.0.0 release `0.1.0` must not read as the prefix `9.9.9`;
+		// `0.1.0+build-v9.9.9` — build metadata `-v9.9.9` must not read as 9.9.9.
+		{"numeric prefix then -v release", "9.9.9-v0.1.0", advisoryEntry{"<1.0.0", ""}},
+		{"build metadata containing -v", "0.1.0+build-v9.9.9", advisoryEntry{"<1.0.0", ""}},
+		{"version-shaped prefix name", "2.0.0-v0.5.0", advisoryEntry{"<1.0.0", ""}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			body := advisoryBodyEntries("GHSA-unplaceable", "high", testCase.entry)
+			newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+			result := vuln(vulnSpecVersion(testCase.version))
+			if result.Verdict != BLOCK || !hasCode(result, "version_mapping_ambiguous") {
+				t.Fatalf("verdict %s with reasons %v, want a version_mapping_ambiguous BLOCK — an unplaceable version must never be compared",
+					result.Verdict, codes(result))
+			}
+		})
+	}
+}
+
+// The `-v` separator places the release even when the name carries a non-dotted
+// digit: `tool2-v0.5.0` is the release `0.5.0` of a tool named `tool2`. Against
+// an unreadable range with patched `1.0.0`, the pre-patch `0.5.0` is affected
+// (BLOCK) — the `2` of the name must not be placed, and the version must be read
+// (not left ambiguous).
+func TestVulnDashVSeparatorPlacesTheRelease(t *testing.T) {
+	body := advisoryBodyEntries("GHSA-dashv", "high", advisoryEntry{"0.2.0 <= 0.9.0", "1.0.0"})
+	newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+	result := vuln(vulnSpecVersion("tool2-v0.5.0"))
+	if result.Verdict != BLOCK || !hasCode(result, "known_advisory_high_severity") {
+		t.Fatalf("verdict %s with reasons %v, want a high-severity BLOCK for the pre-patch 0.5.0 release", result.Verdict, codes(result))
+	}
+}
+
+// A comma-separated patched_versions names several fixed branches; which one a
+// candidate belongs to is the package-identity question this build does not yet
+// answer, so it is left ambiguous rather than guessed.
+func TestVulnMultiBranchPatchedStaysAmbiguous(t *testing.T) {
+	body := advisoryBodyEntries("GHSA-multi", "high", advisoryEntry{"~>1.2.0", "1.5.0, 2.0.0"})
+	newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+	result := vuln(vulnSpec())
+	if result.Verdict != BLOCK || !hasCode(result, "version_mapping_ambiguous") {
+		t.Fatalf("verdict %s with reasons %v, want a version_mapping_ambiguous BLOCK", result.Verdict, codes(result))
+	}
+}
+
+// Behavior change from divergence 12: an entry with an empty range used to be
+// skipped and, if it was the only one, read as ambiguous. With a patched
+// version present it now resolves — an empty range plus a fix version at or
+// below the candidate is not affected.
+func TestVulnEmptyRangeWithPatchedResolves(t *testing.T) {
+	body := advisoryBodyEntries("GHSA-emptypatched", "high", advisoryEntry{"", "1.0.0"})
+	newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+	result := vuln(vulnSpec())
+	if result.Verdict != GO || len(result.Reasons) != 0 {
+		t.Fatalf("verdict %s with reasons %v, want a clean GO", result.Verdict, codes(result))
+	}
+}
+
+// An unreadable range with no usable patched_versions still fails closed — the
+// fallback is a resolver, not a loosening.
+func TestVulnUnreadableRangeWithoutPatchedStillBlocks(t *testing.T) {
+	body := advisoryBodyEntries("GHSA-nopatched", "low", advisoryEntry{"~>1.2.0", ""})
+	newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+	result := vuln(vulnSpec())
+	if result.Verdict != BLOCK || !hasCode(result, "version_mapping_ambiguous") {
+		t.Fatalf("verdict %s with reasons %v, want a version_mapping_ambiguous BLOCK", result.Verdict, codes(result))
 	}
 }
 

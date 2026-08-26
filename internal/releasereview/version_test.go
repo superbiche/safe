@@ -393,3 +393,49 @@ func TestVersionMatchesRangeDifferentialGolden(t *testing.T) {
 		}
 	}
 }
+
+func TestComparableVersion(t *testing.T) {
+	for _, testCase := range []struct {
+		tag       string
+		want      string
+		placeable bool
+	}{
+		// Placeable: exactly one dotted version, at a structural position — the
+		// whole tag as `v?VERSION`, or the version after a `-v` separator (a name
+		// containing a non-dotted digit is fine, `tool2-v0.5.0`).
+		{"1.2.3", "1.2.3", true},
+		{"v1.2.3", "1.2.3", true},
+		{"0.1.0", "0.1.0", true},
+		{"rust-v0.149.1", "0.149.1", true},
+		{"tool2-v0.5.0", "0.5.0", true},
+		{"release-v2.0.0-rc1", "2.0.0-rc1", true},
+		// Unplaceable: a SECOND dotted version anywhere makes the placement
+		// ambiguous, so the tag fails closed rather than guessing which is the
+		// release — whether the second version is in the prefix
+		// (`tool-2.0-v0.5.0`, `platform-6.8-v0.1`, `9.9.9-v0.1.0`) or a suffix
+		// (`0.1.0+build-v9.9.9`, `v1.2.3-alpha.1.2`, `v1.2.3+linux.6.8`).
+		{"tool-2.0-v0.5.0", "", false},
+		{"platform-6.8-v0.1", "", false},
+		{"9.9.9-v0.1.0", "", false},
+		{"0.1.0+build-v9.9.9", "", false},
+		{"v1.2.3-alpha.1.2", "", false},
+		{"v1.2.3+linux.6.8", "", false},
+		// Unplaceable: no version at a structural position at all.
+		// `platform-6.8-v0` — the release `v0` has no dotted version.
+		// `tool-v0.5.0_linux-6.8` — the `_linux` tail breaks the end anchor.
+		// `tool2-0.5.0` / `go1.21.0` — a name glued to a version with no `-v`.
+		{"platform-6.8-v0", "", false},
+		{"tool-v0.5.0_linux-6.8", "", false},
+		{"tool2-0.5.0", "", false},
+		{"go1.21.0", "", false},
+		{"5abc", "", false},
+		{"nightly", "", false},
+		{"", "", false},
+	} {
+		got, ok := comparableVersion(testCase.tag)
+		if got != testCase.want || ok != testCase.placeable {
+			t.Errorf("comparableVersion(%q) = (%q, %t), want (%q, %t)",
+				testCase.tag, got, ok, testCase.want, testCase.placeable)
+		}
+	}
+}

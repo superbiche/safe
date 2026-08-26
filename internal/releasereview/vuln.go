@@ -13,6 +13,7 @@ type githubAdvisory struct {
 	Severity        string `json:"severity"`
 	Vulnerabilities []struct {
 		VulnerableVersionRange string `json:"vulnerable_version_range"`
+		PatchedVersions        string `json:"patched_versions"`
 	} `json:"vulnerabilities"`
 }
 
@@ -29,7 +30,13 @@ func vuln(spec Spec) CheckResult {
 	result := CheckResult{Reasons: []Reason{}}
 	client := newGitHubClient()
 	repo := spec.Subject.Repo
+	// version is the subject's GitHub tag, echoed verbatim into every reason so
+	// the report names what the caller passed. comparable is that tag reduced to
+	// the one version core the advisory ranges are compared against; placeable is
+	// false when the tag names no single version — an unplaceable subject is
+	// never compared, only reported ambiguous.
 	version := spec.Subject.Version
+	comparable, placeable := comparableVersion(version)
 
 	var advisories []githubAdvisory
 	capped, err := client.getPaged(fmt.Sprintf("/repos/%s/security-advisories?per_page=100", repo), func(page json.RawMessage) *githubError {
@@ -65,7 +72,7 @@ func vuln(spec Spec) CheckResult {
 	}
 
 	for _, advisory := range advisories {
-		matched, ambiguous := matchAdvisory(advisory, version)
+		matched, ambiguous := matchAdvisory(advisory, comparable, placeable)
 		identifier := advisory.GHSAID
 		if identifier == "" {
 			identifier = "an advisory with no GHSA id"
@@ -101,30 +108,82 @@ func vuln(spec Spec) CheckResult {
 
 // matchAdvisory decides whether one advisory covers the version.
 //
-// Ranges are read in order and the first match wins, so an unreadable range
+// Entries are read in order and the first match wins, so an unreadable entry
 // listed after a matching one does not make a decided advisory ambiguous. An
-// advisory that names no usable range at all — no vulnerabilities entries, or
-// entries that all carry an empty range — is ambiguous: it is a published
-// advisory against this repository that this check cannot rule out.
-func matchAdvisory(advisory githubAdvisory, version string) (matched, ambiguous bool) {
-	usable := 0
+// advisory that names nothing this check can rule out — no vulnerabilities
+// entries at all, or entries none of which the range OR its patched-version
+// fallback could decide — is ambiguous: it is a published advisory against this
+// repository that this check cannot place.
+func matchAdvisory(advisory githubAdvisory, version string, placeable bool) (matched, ambiguous bool) {
+	decided := 0
 	for _, vulnerability := range advisory.Vulnerabilities {
-		versionRange := vulnerability.VulnerableVersionRange
-		if versionRange == "" {
-			continue
-		}
-		usable++
-		switch versionMatchesRange(version, versionRange) {
+		switch entryVerdict(version, placeable, vulnerability.VulnerableVersionRange, vulnerability.PatchedVersions) {
 		case rangeMatches:
 			return true, ambiguous
+		case rangeExcludes:
+			decided++
 		case rangeAmbiguous:
 			ambiguous = true
 		}
 	}
-	if usable == 0 {
+	// No entry decided either way and none was ambiguous means the advisory
+	// carried no vulnerabilities entries at all — still nothing this check can
+	// rule out.
+	if decided == 0 && !ambiguous {
 		ambiguous = true
 	}
 	return false, ambiguous
+}
+
+// entryVerdict decides one vulnerability entry.
+//
+// A subject version this build could not place (the tag names no single
+// version) is never compared: it is ambiguous for every entry, so the advisory
+// fails closed rather than a fabricated core deciding it. Otherwise the
+// vulnerable_version_range is authoritative whenever this build can read it; only
+// when the range is unreadable — empty, a disjunction, or a syntax the grammar
+// rejects — is the entry's patched_versions consulted: the version a fix first
+// shipped in is a second, independent signal that an unreadable range should not
+// by itself sink a release. This ordering is deliberate and ruled:
+// patched_versions never overrides a range this check already decided.
+func entryVerdict(version string, placeable bool, versionRange, patched string) rangeMatch {
+	if !placeable {
+		return rangeAmbiguous
+	}
+	if verdict := versionMatchesRange(version, versionRange); verdict != rangeAmbiguous {
+		return verdict
+	}
+	if verdict, ok := patchedVerdict(version, patched); ok {
+		return verdict
+	}
+	return rangeAmbiguous
+}
+
+// patchedVerdict reads patched_versions as the single version a fix first
+// shipped in: a candidate at or above it is not affected, below it is.
+//
+// It resolves only when both sides are real versions. A comma-separated
+// patched list names several fixed branches, and which branch a candidate
+// belongs to is the package-identity question this build does not yet answer —
+// left ambiguous, not guessed. A candidate that does not begin with a digit is
+// not a version this check placed (comparableVersion could not isolate one), so
+// it is refused rather than let filevercmp's letters-above-digits ordering read
+// every such candidate as "at or above the fix" and fail open.
+func patchedVerdict(version, patched string) (rangeMatch, bool) {
+	patched = strings.Trim(patched, asciiSpace)
+	if patched == "" || strings.ContainsRune(patched, ',') {
+		return rangeAmbiguous, false
+	}
+	if version == "" || !isASCIIDigit(version[0]) {
+		return rangeAmbiguous, false
+	}
+	if !constraintBare.MatchString(patched) {
+		return rangeAmbiguous, false
+	}
+	if versionCmp(version, patched) < 0 {
+		return rangeMatches, true
+	}
+	return rangeExcludes, true
 }
 
 func isHighOrCritical(severity string) bool {
