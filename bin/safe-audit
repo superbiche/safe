@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.3.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.41.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.42.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -7142,24 +7142,30 @@ host_allow_matches_resolved() {
   return 0
 }
 
-# Derive the exact artifact versions a host-allow would override. OSV retains
-# per-version evidence, while Socket scores the primary version and service
-# failures/custom sources cover every resolved version. The caller then
-# requires one exact pin to equal this complete set.
+# Derive the exact artifact versions a host-allow would override, deny-by-
+# default. OSV retains per-version evidence, so the ONLY per-version WARN cause
+# is `osv_affecting` — it requires just the affected versions ($osv_versions).
+# EVERY other cause — Socket results/outages, blocklist-unreadable, OSV/custom-
+# source outages, release age — carries NO per-version attribution (`warn_causes`
+# is a flat aggregate list with no record of WHICH resolved version raised it),
+# so any one of them requires the WHOLE resolved set. Enumerating a per-version
+# allowlist (osv_affecting) rather than an aggregate denylist is deliberate: an
+# unknown or future cause is treated as aggregate, failing closed rather than
+# silently narrowing the pin (review F1 — socket_disabled and blocklist_unreadable
+# were exactly such omissions). A single-version install collapses $resolved to
+# [primary] (no-op); a ranged op carrying any aggregate cause becomes
+# non-matchable under the one-pin schema and routes to
+# install.auto_allow_tolerate as its aggregate override (Fibery #106). The caller
+# then requires one exact pin to equal this complete set.
 host_allow_required_versions_json() {
   local classifications_json="$1" causes_json="$2"
   local primary_version="$3" resolved_versions_json="$4"
   jq -cn --argjson osv "$classifications_json" --argjson causes "$causes_json" \
     --arg primary "$primary_version" --argjson resolved "$resolved_versions_json" '
     ($osv | map(select((.classification.affecting | length) > 0) | .version)) as $osv_versions
-    | (["socket_unavailable","socket_auth_failed","socket_rate_limited","socket_error",
-        "socket_not_found","socket_low_score","socket_critical_cve","socket_high_alert","socket_score_pending"]
-       | any(. as $c | $causes | index($c) != null)) as $socket_applies
-    | (["osv_unavailable","custom_source","release_too_new"]
-       | any(. as $c | $causes | index($c) != null)) as $other_all_apply
+    | ([$causes[] | select(. != "osv_affecting")] | length > 0) as $aggregate_applies
     | ($osv_versions
-       + (if $socket_applies and $primary != "" then [$primary] else [] end)
-       + (if $other_all_apply then $resolved else [] end)
+       + (if $aggregate_applies then $resolved else [] end)
        | unique) as $required
     | if ($required | length) == 0 then $resolved else $required end'
 }
@@ -7903,6 +7909,7 @@ package_audit_command() {
       # findings 5/7).
       gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" "$aff_count" \
         "$socket_detail" "$release_security_fix_ids" "$([[ "$block_line" == PASS* ]] && printf 1 || printf 0)" \
+        "$primary_version" \
         ${warn_causes[@]+"${warn_causes[@]}"}
       if [[ "$verdict" == "BLOCK" ]]; then
         printf 'safe audit: operator review required: safe audit package-audit %s --ecosystem %s --json\n' \
@@ -7989,8 +7996,15 @@ package_audit_command() {
             "$(printf '%s,' "${warn_causes[@]}" | sed 's/,$//')" "$PKG_NAME" "$primary_version" >&2
           gate_exit=0
         else
+          # A single host-allow entry can only authorize a one-version required
+          # set; a ranged op (length > 1) is non-pinnable, so suppress the
+          # dead-end `host-allow add` hint and let the tolerate/review lanes
+          # carry the recovery (Fibery #106).
+          local pin_hint=""
+          (( ${#host_allow_required_versions[@]} == 1 )) && pin_hint="${host_allow_required_versions[0]}"
           gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" "$aff_count" \
             "$socket_detail" "$release_security_fix_ids" "$([[ "$block_line" == PASS* ]] && printf 1 || printf 0)" \
+            "$pin_hint" \
             "${warn_causes[@]}"
           gate_exit=10
         fi
@@ -8005,6 +8019,7 @@ package_audit_command() {
         done
         gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" "$aff_count" \
           "$socket_detail" "" "$([[ "$block_line" == PASS* ]] && printf 1 || printf 0)" \
+          "$primary_version" \
           "${warn_causes[@]}"
         printf 'safe audit: operator review required: safe audit package-audit %s --ecosystem %s --json\n' \
           "$( (( resolution_ok )) && printf '%s@%s' "$PKG_NAME" "$primary_version" || printf '%s' "$spec")" "$ecosystem" >&2
@@ -8045,9 +8060,14 @@ gate_host_allow_add_cmd() {
 # must never read as a package vulnerability finding.
 gate_emit_refusal_hints() {
   local ecosystem="$1" name="$2" primary_version="$3" resolution_ok="$4" aff_count="$5"
-  local socket_detail="$6" cooldown_remediates="$7" blocklist_pass="$8"
-  shift 8
+  local socket_detail="$6" cooldown_remediates="$7" blocklist_pass="$8" pin_version="$9"
+  shift 9
   local -a causes=("${@}")
+  # pin_version is the exact version a single host-allow entry would authorize
+  # (the sole element of the required-versions set), or "" when no single pin
+  # can cover the operation — a ranged op whose required set has >1 version.
+  # Empty suppresses every `host-allow add` hint so the refusal never dangles a
+  # pin that can never match (Fibery #106); the tolerate/review lanes remain.
   local cause has_socket_infra=0 has_unresolved=0 has_affecting=0 has_osv_down=0
   local has_low_score=0 has_socket_high=0 has_socket_critical_cve=0 has_socket_malware=0
   local has_socket_disabled=0 has_socket_not_found=0
@@ -8076,8 +8096,8 @@ gate_emit_refusal_hints() {
         "$cooldown_remediates" >&2
     fi
     local too_new_allow_cmd=""
-    if [[ "$resolution_ok" == "1" && -n "$primary_version" ]]; then
-      too_new_allow_cmd=$(gate_host_allow_add_cmd "$name" "$primary_version" "$ecosystem") || too_new_allow_cmd=""
+    if [[ "$resolution_ok" == "1" && -n "$pin_version" ]]; then
+      too_new_allow_cmd=$(gate_host_allow_add_cmd "$name" "$pin_version" "$ecosystem") || too_new_allow_cmd=""
     fi
     if [[ -n "$too_new_allow_cmd" ]]; then
       printf 'safe audit: operator overrides: %s / add release_too_new to install.auto_allow_tolerate\n' \
@@ -8104,8 +8124,8 @@ gate_emit_refusal_hints() {
   if (( has_socket_not_found )); then
     printf 'safe audit: Socket has no record of this package — an absence of behavioral data, NOT an outage; advisories, blocklist and release age still applied\n' >&2
     local not_found_allow_cmd=""
-    if [[ "$resolution_ok" == "1" && -n "$primary_version" ]]; then
-      not_found_allow_cmd=$(gate_host_allow_add_cmd "$name" "$primary_version" "$ecosystem") || not_found_allow_cmd=""
+    if [[ "$resolution_ok" == "1" && -n "$pin_version" ]]; then
+      not_found_allow_cmd=$(gate_host_allow_add_cmd "$name" "$pin_version" "$ecosystem") || not_found_allow_cmd=""
     fi
     if [[ -n "$not_found_allow_cmd" ]]; then
       printf 'safe audit: operator overrides: %s / add socket_not_found to install.auto_allow_tolerate\n' \
@@ -8120,7 +8140,9 @@ gate_emit_refusal_hints() {
   fi
   if (( has_affecting )) && (( ! has_malware )); then
     local affecting_allow_cmd=""
-    affecting_allow_cmd=$(gate_host_allow_add_cmd "$name" "$primary_version" "$ecosystem") || affecting_allow_cmd=""
+    if [[ -n "$pin_version" ]]; then
+      affecting_allow_cmd=$(gate_host_allow_add_cmd "$name" "$pin_version" "$ecosystem") || affecting_allow_cmd=""
+    fi
     if [[ -n "$affecting_allow_cmd" ]]; then
       printf 'safe audit: to allow this exact version: %s\n' "$affecting_allow_cmd" >&2
     else
