@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **release-review `tuf`: physical containment of mirror reads against
+  symlinked entries** (1.43.0). The `tuf` check already refused a `..`-bearing
+  or absolute TUF target name and a non-hex trusted-metadata digest, but those
+  rules are lexical and `os.Stat`/`os.Open` follow symlinks — so a mirror entry
+  that was itself a symlink out of the targets tree could still steer the
+  hash-read at an out-of-tree file. The mirror blob and the materialized
+  candidate are now read through an `os.Root` cage rooted at the targets tree,
+  which refuses any resolution — at the blob, at a `targets` directory that is
+  itself a symlink out of the mirror, or at any parent component of a path-like
+  name — that leaves it. An escaping entry is a new BLOCK,
+  `trusted_mirror_target_escapes_tree`; other resolution failures (missing blob,
+  symlink loop, non-directory component) keep the existing missing-blob reason;
+  an in-tree symlink (mirrors legitimately dedup content-addressed blobs) still
+  resolves normally, within the platform's symlink-resolution depth limit.
+  Defense-in-depth on an operator-supplied mirror; no legitimate mirror changes
+  verdict.
 - **Ranged install-gate: a primary-only host-allow pin no longer covers a
   warned sibling** (1.42.0). On a ranged/multi-version operation (e.g. `--op
   update` resolving two majors), the warn-cause list is a single aggregate with

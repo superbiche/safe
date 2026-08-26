@@ -570,6 +570,7 @@ always `ERROR` here.
 | `bootstrap_failure` | BLOCK | — | `cosign initialize` failed, or succeeded without caching trusted targets metadata, or cached metadata that cannot be read as TUF targets JSON |
 | `policy_mismatch` | BLOCK | `target` | the trusted metadata does not name this target at all |
 | `trusted_mirror_target_invalid` | BLOCK | `target`, `mirror_blob_path`, and `trusted_metadata_sha256`/`actual_mirror_blob_sha256` on a content mismatch; only `target` and `trusted_metadata_sha256` when the trusted digest itself is not a sha256 | the mirror is missing the blob its own trusted metadata names, serves one that does not hash to it, or the trusted metadata's digest is not a sha256 (refused before it is joined into the blob path — divergence 16) |
+| `trusted_mirror_target_escapes_tree` | BLOCK | `target`, `mirror_blob_path` | the mirror's entry for the target is a symlink whose resolution leaves the targets tree — physical containment beyond the lexical name/digest rules (divergence 16) |
 | `trust_material_mismatch` | BLOCK | `target`, `local_sha256`, `trusted_sha256`, `trusted_length` | the caller's local copy is not the trusted target |
 | `trust_root_unreadable` | ERROR | `root`, `error` | the root exists and cannot be hashed |
 | `trust_target_unreadable` | ERROR | `target`, `error` | a local target exists and cannot be hashed |
@@ -877,9 +878,20 @@ still cannot claim a behavior nothing checks.
     is rejected at spec validation (exit 3), before any check runs. The
     metadata-supplied digest is spliced into the same blob path, so a non-hex
     digest is refused at the check as `trusted_mirror_target_invalid` for the same
-    reason. The bash lane joined both unchecked. No corpus pair: this refuses a
-    hostile spec rather than changing a verdict on a legitimate one; `spec_test.go`
-    and `tuf_test.go` carry the coverage.
+    reason. The bash lane joined both unchecked. Those rules are *lexical*, and
+    `os.Stat`/`os.Open` follow symlinks, so they do not see through a mirror entry
+    that is itself a symlink out of the tree; the mirror blob and the materialized
+    candidate are therefore also read through an `os.Root` cage rooted at the
+    targets tree, which refuses any resolution — at the blob, at a `targets`
+    directory that is itself a symlink out of the mirror, or at any parent
+    component of a path-like name — that leaves it. An escaping blob is
+    `trusted_mirror_target_escapes_tree`; a resolution that fails for another
+    reason (a missing blob, a symlink loop, a non-directory component) keeps the
+    `trusted_mirror_target_invalid` missing-blob reason; an in-tree symlink
+    (mirrors dedup content-addressed blobs) resolves normally, within the
+    platform's symlink-resolution depth limit. No corpus pair: this refuses a
+    hostile spec or mirror rather than changing a verdict on a legitimate one;
+    `spec_test.go` and `tuf_test.go` carry the coverage.
 17. **An artifact directory path containing `:` is refused** (`exec`). The
     artifact's directory is bind-mounted as `<dir>:/artifact:ro,z`, and podman
     splits a `-v` spec on `:`; a directory path with a colon would mis-split into
