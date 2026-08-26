@@ -244,6 +244,278 @@ func TestTUFMirrorBlobProblems(t *testing.T) {
 	})
 }
 
+// Physical containment. The lexical name/digest rules refuse a `..` or absolute
+// *spelling*, but a mirror entry can be a symlink, and os.Stat/os.Open follow
+// one. A blob symlinked to an out-of-tree file whose content still hashes to the
+// trusted digest passes every content check — so only reading the blob through a
+// beneath-root cage turns it into a BLOCK. The out-of-tree file carries the
+// matching content precisely so a mismatch cannot be what fails the case.
+func TestTUFMirrorBlobEscapingTheTargetsTreeIsBlocked(t *testing.T) {
+	withFakeTools(t, "cosign")
+	const content = "trust me"
+	mirror, root, rootChecksum := buildTUFMirror(t, mirrorTarget{name: "trusted_root.json", content: content})
+	t.Setenv("MOCK_COSIGN_BRIDGE_ROOT", mirror)
+
+	blob := filepath.Join(mirror, "targets", sha256Of(content)+".trusted_root.json")
+	outside := writeFile(t, t.TempDir(), "smuggled", content)
+	if err := os.Remove(blob); err != nil {
+		t.Fatalf("remove blob: %v", err)
+	}
+	if err := os.Symlink(outside, blob); err != nil {
+		t.Fatalf("symlink blob: %v", err)
+	}
+
+	local := writeFile(t, t.TempDir(), "trusted_root.json", content)
+	result := tuf(tufSpec(mirror, root, rootChecksum, map[string]string{"trusted_root.json": local}))
+
+	if result.Verdict != BLOCK {
+		t.Fatalf("verdict %s, want BLOCK: %v", result.Verdict, codes(result))
+	}
+	if got := codes(result); len(got) != 1 || got[0] != "trusted_mirror_target_escapes_tree" {
+		t.Fatalf("reasons %v, want [trusted_mirror_target_escapes_tree]", got)
+	}
+	if result.Reasons[0].Data["mirror_blob_path"] == "" {
+		t.Fatalf("reason data %v does not name the blob path", result.Reasons[0].Data)
+	}
+}
+
+// A TUF target name is path-like and may contain `/`, so the blob lives under a
+// directory named from the digest and the name's leading segments. An escape can
+// therefore hide at a *parent* component, which a final-component O_NOFOLLOW
+// would not catch — only whole-path resolution (os.Root) does. Here the
+// intermediate directory is the symlink, pointing at an out-of-tree dir that
+// holds a matching file.
+func TestTUFNestedTargetNameEscapingViaAParentSymlinkIsBlocked(t *testing.T) {
+	withFakeTools(t, "cosign")
+	const (
+		name    = "keys/root.json"
+		content = "trust me"
+	)
+	digest := sha256Of(content)
+
+	mirror := t.TempDir()
+	targets := mkdir(t, filepath.Join(mirror, "targets"))
+	metadata, err := json.Marshal(map[string]any{"signed": map[string]any{"targets": map[string]any{
+		name: map[string]any{"hashes": map[string]string{"sha256": digest}, "length": len(content)},
+	}}})
+	if err != nil {
+		t.Fatalf("encode metadata: %v", err)
+	}
+	writeFile(t, mirror, "targets.json", string(metadata))
+	root := writeFile(t, mirror, "root.json", tufRootContent)
+	t.Setenv("MOCK_COSIGN_BRIDGE_ROOT", mirror)
+
+	// The blob for keys/root.json is targets/<digest>.keys/root.json; make the
+	// intermediate <digest>.keys a symlink out of the tree.
+	outsideDir := t.TempDir()
+	writeFile(t, outsideDir, "root.json", content)
+	if err := os.Symlink(outsideDir, filepath.Join(targets, digest+".keys")); err != nil {
+		t.Fatalf("symlink parent: %v", err)
+	}
+
+	local := writeFile(t, t.TempDir(), "root.json", content)
+	result := tuf(tufSpec(mirror, root, sha256Of(tufRootContent), map[string]string{name: local}))
+
+	if got := codes(result); len(got) != 1 || got[0] != "trusted_mirror_target_escapes_tree" {
+		t.Fatalf("reasons %v (verdict %s), want [trusted_mirror_target_escapes_tree]", got, result.Verdict)
+	}
+}
+
+// A symlink that stays inside the targets tree is legitimate — mirrors dedup
+// content-addressed blobs — so physical containment must resolve it, not reject
+// it. Rejecting an in-tree link would be a false positive on a normal mirror.
+func TestTUFMirrorBlobInTreeSymlinkStillVerifies(t *testing.T) {
+	withFakeTools(t, "cosign")
+	const content = "trust me"
+	mirror, root, rootChecksum := buildTUFMirror(t, mirrorTarget{name: "trusted_root.json", content: content})
+	t.Setenv("MOCK_COSIGN_BRIDGE_ROOT", mirror)
+
+	targets := filepath.Join(mirror, "targets")
+	real := writeFile(t, targets, "dedup.blob", content)
+	blob := filepath.Join(targets, sha256Of(content)+".trusted_root.json")
+	if err := os.Remove(blob); err != nil {
+		t.Fatalf("remove blob: %v", err)
+	}
+	if err := os.Symlink(filepath.Base(real), blob); err != nil {
+		t.Fatalf("symlink blob: %v", err)
+	}
+
+	local := writeFile(t, t.TempDir(), "trusted_root.json", content)
+	result := tuf(tufSpec(mirror, root, rootChecksum, map[string]string{"trusted_root.json": local}))
+	if result.Verdict != GO || len(result.Reasons) != 0 {
+		t.Fatalf("verdict %s with reasons %v, want a clean GO", result.Verdict, codes(result))
+	}
+}
+
+// A blob that is a dangling symlink to a name that is not there is absence, not
+// an escape: os.Root follows the in-tree link and finds nothing, so it reads as
+// the same missing-blob BLOCK a deleted blob produces — never the escape code.
+func TestTUFMirrorBlobDanglingSymlinkReadsAsMissing(t *testing.T) {
+	withFakeTools(t, "cosign")
+	const content = "trust me"
+	mirror, root, rootChecksum := buildTUFMirror(t, mirrorTarget{name: "trusted_root.json", content: content})
+	t.Setenv("MOCK_COSIGN_BRIDGE_ROOT", mirror)
+
+	blob := filepath.Join(mirror, "targets", sha256Of(content)+".trusted_root.json")
+	if err := os.Remove(blob); err != nil {
+		t.Fatalf("remove blob: %v", err)
+	}
+	if err := os.Symlink("absent-sibling", blob); err != nil {
+		t.Fatalf("symlink blob: %v", err)
+	}
+
+	local := writeFile(t, t.TempDir(), "trusted_root.json", content)
+	result := tuf(tufSpec(mirror, root, rootChecksum, map[string]string{"trusted_root.json": local}))
+	if got := codes(result); len(got) != 1 || got[0] != "trusted_mirror_target_invalid" {
+		t.Fatalf("reasons %v, want [trusted_mirror_target_invalid]", got)
+	}
+	if !strings.Contains(result.Reasons[0].Message, "missing from the local TUF mirror") {
+		t.Fatalf("message %q, want the missing-blob message", result.Reasons[0].Message)
+	}
+}
+
+// The targets directory itself can be the symlink. os.OpenRoot follows symlinks
+// in its own argument, so a `<mirror>/targets` that points out of the mirror
+// must be caught by deriving the targets Root from the mirror Root, not by
+// opening the joined path — otherwise the cage anchors at the escape destination
+// and everything under it reads as contained.
+func TestTUFTargetsDirectoryEscapingTheMirrorIsBlocked(t *testing.T) {
+	withFakeTools(t, "cosign")
+	const content = "trust me"
+	mirror, root, rootChecksum := buildTUFMirror(t, mirrorTarget{name: "trusted_root.json", content: content})
+	t.Setenv("MOCK_COSIGN_BRIDGE_ROOT", mirror)
+
+	relocated := filepath.Join(t.TempDir(), "smuggled-targets")
+	if err := os.Rename(filepath.Join(mirror, "targets"), relocated); err != nil {
+		t.Fatalf("relocate targets: %v", err)
+	}
+	if err := os.Symlink(relocated, filepath.Join(mirror, "targets")); err != nil {
+		t.Fatalf("symlink targets: %v", err)
+	}
+
+	local := writeFile(t, t.TempDir(), "trusted_root.json", content)
+	result := tuf(tufSpec(mirror, root, rootChecksum, map[string]string{"trusted_root.json": local}))
+	if got := codes(result); len(got) != 1 || got[0] != "trusted_mirror_target_escapes_tree" {
+		t.Fatalf("reasons %v (verdict %s), want [trusted_mirror_target_escapes_tree]", got, result.Verdict)
+	}
+}
+
+// The escape can be spelled with a relative `..` link, not only an absolute one;
+// both leave the targets tree and both must be refused.
+func TestTUFMirrorBlobEscapingViaRelativeLinkIsBlocked(t *testing.T) {
+	withFakeTools(t, "cosign")
+	const content = "trust me"
+	mirror, root, rootChecksum := buildTUFMirror(t, mirrorTarget{name: "trusted_root.json", content: content})
+	t.Setenv("MOCK_COSIGN_BRIDGE_ROOT", mirror)
+
+	// ../smuggled from the targets tree is <mirror>/smuggled — inside the mirror
+	// but outside the targets tree; content matches the digest so only
+	// containment can fail the case.
+	writeFile(t, mirror, "smuggled", content)
+	blob := filepath.Join(mirror, "targets", sha256Of(content)+".trusted_root.json")
+	if err := os.Remove(blob); err != nil {
+		t.Fatalf("remove blob: %v", err)
+	}
+	if err := os.Symlink(filepath.Join("..", "smuggled"), blob); err != nil {
+		t.Fatalf("symlink blob: %v", err)
+	}
+
+	local := writeFile(t, t.TempDir(), "trusted_root.json", content)
+	result := tuf(tufSpec(mirror, root, rootChecksum, map[string]string{"trusted_root.json": local}))
+	if got := codes(result); len(got) != 1 || got[0] != "trusted_mirror_target_escapes_tree" {
+		t.Fatalf("reasons %v (verdict %s), want [trusted_mirror_target_escapes_tree]", got, result.Verdict)
+	}
+}
+
+// Containment must hold at the READ, not only at the preceding stat: a change
+// that kept the stat cage but read the blob (or the trimmed-newline fallback) by
+// a path-following opener would escape. These pin both trusted-side reads
+// directly, for absolute and relative escapes.
+func TestTrustedReadsAreConfinedToTheirRoot(t *testing.T) {
+	dir := t.TempDir()
+	targets := mkdir(t, filepath.Join(dir, "targets"))
+	writeFile(t, dir, "secret", "smuggled")
+	if err := os.Symlink(filepath.Join(dir, "secret"), filepath.Join(targets, "abs.link")); err != nil {
+		t.Fatalf("abs link: %v", err)
+	}
+	if err := os.Symlink(filepath.Join("..", "secret"), filepath.Join(targets, "rel.link")); err != nil {
+		t.Fatalf("rel link: %v", err)
+	}
+
+	root, err := os.OpenRoot(targets)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+
+	for _, name := range []string{"abs.link", "rel.link"} {
+		if _, err := sha256WithinRoot(root, name); err == nil {
+			t.Fatalf("sha256WithinRoot(%q) read outside the root", name)
+		}
+	}
+
+	local := writeFile(t, t.TempDir(), "local", "smuggled\n")
+	for _, name := range []string{"abs.link", "rel.link"} {
+		if filesMatchAfterTrimmingNewlines(local, trustedCandidate{root: root, name: name}) {
+			t.Fatalf("trimmed match read outside the root via %q", name)
+		}
+	}
+}
+
+// A resolution failure that is not a beneath-root violation — here a symlink loop
+// (ELOOP) — is a broken mirror, not an escape, and must keep the pre-containment
+// missing-blob reason rather than being mislabeled as an escape. This pins the
+// positive escape match in isRootEscape against os.Root's other error classes.
+func TestTUFNonEscapeMirrorFailureIsNotReportedAsEscape(t *testing.T) {
+	withFakeTools(t, "cosign")
+	const content = "trust me"
+	mirror, root, rootChecksum := buildTUFMirror(t, mirrorTarget{name: "trusted_root.json", content: content})
+	t.Setenv("MOCK_COSIGN_BRIDGE_ROOT", mirror)
+
+	blob := filepath.Join(mirror, "targets", sha256Of(content)+".trusted_root.json")
+	if err := os.Remove(blob); err != nil {
+		t.Fatalf("remove blob: %v", err)
+	}
+	if err := os.Symlink(filepath.Base(blob), blob); err != nil {
+		t.Fatalf("loop link: %v", err)
+	}
+
+	local := writeFile(t, t.TempDir(), "trusted_root.json", content)
+	result := tuf(tufSpec(mirror, root, rootChecksum, map[string]string{"trusted_root.json": local}))
+	if got := codes(result); len(got) != 1 || got[0] != "trusted_mirror_target_invalid" {
+		t.Fatalf("reasons %v, want [trusted_mirror_target_invalid] (a symlink loop is not an escape)", got)
+	}
+}
+
+// A target whose name literally contains the escape sentinel text must not turn
+// a plain missing blob into a false escape. os.Root wraps the error in a
+// *PathError whose rendered text includes the caller-supplied blob name, so
+// isRootEscape compares the unwrapped node, not the rendered path — otherwise a
+// missing blob for a target named "path escapes from parent" would be reported
+// as an escape that never happened.
+func TestTUFTargetNameContainingEscapeTextIsNotAFalseEscape(t *testing.T) {
+	withFakeTools(t, "cosign")
+	const (
+		name    = "path escapes from parent.json"
+		content = "trust me"
+	)
+	mirror, root, rootChecksum := buildTUFMirror(t, mirrorTarget{name: name, content: content})
+	t.Setenv("MOCK_COSIGN_BRIDGE_ROOT", mirror)
+
+	if err := os.Remove(filepath.Join(mirror, "targets", sha256Of(content)+"."+name)); err != nil {
+		t.Fatalf("remove blob: %v", err)
+	}
+
+	local := writeFile(t, t.TempDir(), "local.json", content)
+	result := tuf(tufSpec(mirror, root, rootChecksum, map[string]string{name: local}))
+	if got := codes(result); len(got) != 1 || got[0] != "trusted_mirror_target_invalid" {
+		t.Fatalf("reasons %v, want [trusted_mirror_target_invalid] (missing, not a false escape)", got)
+	}
+	if !strings.Contains(result.Reasons[0].Message, "missing from the local TUF mirror") {
+		t.Fatalf("message %q, want the missing-blob message", result.Reasons[0].Message)
+	}
+}
+
 func TestTUFLocalTargetMismatch(t *testing.T) {
 	spec, _, local := tufFixture(t)
 	if err := os.WriteFile(local, []byte("a different key"), 0o644); err != nil {

@@ -3,7 +3,9 @@ package releasereview
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -243,11 +245,78 @@ func envWithHome(home string) []string {
 }
 
 // trustedCandidate is one copy of a target the local file may legitimately
-// match, carried with the digest and size it was accepted on.
+// match. It carries the *os.Root the copy lives under and its root-relative
+// name so every read of it — the digest above and the trimmed-newline fallback
+// below — passes through the same beneath-root enforcement, alongside the digest
+// and size it was accepted on.
 type trustedCandidate struct {
-	path string
+	root *os.Root
+	name string
 	sha  string
 	size int64
+}
+
+// containment is the outcome of resolving a mirror-relative name inside its
+// tree: present and contained, absent, or resolving outside the tree.
+type containment int
+
+const (
+	contained containment = iota
+	pathMissing
+	pathEscapes
+)
+
+// isRootEscape reports whether err is os.Root's beneath-root violation — a name
+// whose resolution (a symlink at any component) leaves the root. The stdlib does
+// not export the sentinel (os/file.go `errPathEscapes`), so it is matched by its
+// message; but only the *unwrapped* node is compared, never the rendered
+// *PathError, whose text also carries the caller-supplied path — a target
+// legitimately named "path escapes from parent" would otherwise make a plain
+// ENOENT look like an escape. The message is stable observable behavior of
+// os.Root; the statWithinRoot tests pin it, so a message change surfaces as a
+// test failure rather than a silent misclassification. Matching escape
+// POSITIVELY, rather than by elimination, also keeps genuine non-escape failures
+// — a non-directory component (ENOTDIR), a symlink loop or an over-deep chain
+// (ELOOP) — off the escape path, where they would otherwise be reported as an
+// escape that never happened.
+func isRootEscape(err error) bool {
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) && pathErr.Err != nil {
+		return pathErr.Err.Error() == "path escapes from parent"
+	}
+	return false
+}
+
+// statWithinRoot stats name inside root and classifies the three outcomes the
+// caller reports differently. os.Root refuses any name whose resolution —
+// symlinks at the final component or at any parent of a path-like target name
+// included — leaves the tree, which is the physical containment the lexical
+// name/digest rules cannot provide. Only a beneath-root violation is pathEscapes;
+// absence, a dangling in-tree link, a permission error, or any other resolution
+// failure is pathMissing, keeping the same missing-blob BLOCK the pre-containment
+// code gave an unstattable blob.
+func statWithinRoot(root *os.Root, name string) (os.FileInfo, containment) {
+	info, err := root.Stat(name)
+	switch {
+	case err == nil:
+		return info, contained
+	case isRootEscape(err):
+		return nil, pathEscapes
+	default:
+		return nil, pathMissing
+	}
+}
+
+// sha256WithinRoot hashes name inside root. os.Root re-enforces containment on
+// the Open, so the file hashed is the same contained file statWithinRoot saw —
+// the check and the read cannot be split by a symlink swapped in between.
+func sha256WithinRoot(root *os.Root, name string) (string, error) {
+	file, err := root.Open(name)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	return hashReader(file)
 }
 
 // checkTarget compares one local trust target against the trusted material.
@@ -266,7 +335,7 @@ func checkTarget(result *CheckResult, config *TUFCheck, metadata tufTargetsMetad
 		return
 	}
 
-	// The digest is metadata-supplied and is spliced into the blob path below,
+	// The digest is metadata-supplied and is spliced into the blob's name below,
 	// where filepath.Join's Clean would resolve a `..` out of the targets tree —
 	// so a non-hex "digest" is refused before it can steer that read (and the
 	// mismatch branch could otherwise report the sha256 of an out-of-tree file).
@@ -278,15 +347,60 @@ func checkTarget(result *CheckResult, config *TUFCheck, metadata tufTargetsMetad
 		return
 	}
 
-	blobPath := filepath.Join(config.Mirror, "targets", entry.Hashes.SHA256+"."+name)
+	// Physical containment. The lexical rules above refuse a `..` or absolute
+	// *spelling*, but os.Stat/os.Open follow symlinks, so a mirror entry that is
+	// a symlink could still steer the hash-read at a file outside the tree. The
+	// blob is read through an *os.Root rooted at the mirror's targets directory,
+	// which refuses any resolution that leaves it. blobName is a validated digest
+	// joined to a spec-validated relative target name.
+	blobName := entry.Hashes.SHA256 + "." + name
+	blobPath := filepath.Join(config.Mirror, "targets", blobName)
 	blobData := map[string]string{"target": name, "mirror_blob_path": blobPath}
-	blobInfo, err := os.Stat(blobPath)
-	if err != nil || !blobInfo.Mode().IsRegular() {
+
+	// The mirror is opened as the containment boundary and the targets tree is
+	// derived from it, rather than opening <mirror>/targets directly: os.OpenRoot
+	// follows symlinks in its own argument, so opening the joined path would
+	// follow a `targets` that is itself a symlink out of the mirror and anchor the
+	// cage at the escape destination. Deriving the targets Root via Root.OpenRoot
+	// refuses a `targets` link that leaves the mirror, while still allowing the
+	// operator's declared mirror path to be a symlink (that path is their
+	// declaration, not mirror-supplied content).
+	mirrorRoot, err := os.OpenRoot(config.Mirror)
+	if err != nil {
 		result.add(BLOCK, "trusted_mirror_target_invalid",
 			fmt.Sprintf("trusted target %s is missing from the local TUF mirror", name), blobData)
 		return
 	}
-	blobSHA, err := sha256File(blobPath)
+	defer mirrorRoot.Close()
+
+	targetsRoot, err := mirrorRoot.OpenRoot("targets")
+	if err != nil {
+		if isRootEscape(err) {
+			result.add(BLOCK, "trusted_mirror_target_escapes_tree",
+				fmt.Sprintf("the local TUF mirror's targets directory for %s resolves outside the mirror via a symlink", name),
+				blobData)
+			return
+		}
+		// No targets tree to open means the blob it should hold is not there.
+		result.add(BLOCK, "trusted_mirror_target_invalid",
+			fmt.Sprintf("trusted target %s is missing from the local TUF mirror", name), blobData)
+		return
+	}
+	defer targetsRoot.Close()
+
+	blobInfo, blobContainment := statWithinRoot(targetsRoot, blobName)
+	switch {
+	case blobContainment == pathEscapes:
+		result.add(BLOCK, "trusted_mirror_target_escapes_tree",
+			fmt.Sprintf("the local TUF mirror's entry for %s resolves outside the targets tree via a symlink", name),
+			blobData)
+		return
+	case blobContainment == pathMissing, !blobInfo.Mode().IsRegular():
+		result.add(BLOCK, "trusted_mirror_target_invalid",
+			fmt.Sprintf("trusted target %s is missing from the local TUF mirror", name), blobData)
+		return
+	}
+	blobSHA, err := sha256WithinRoot(targetsRoot, blobName)
 	if err != nil || blobSHA != entry.Hashes.SHA256 || blobInfo.Size() != entry.Length {
 		result.add(BLOCK, "trusted_mirror_target_invalid",
 			fmt.Sprintf("the local TUF mirror's copy of %s does not match trusted metadata", name),
@@ -321,22 +435,29 @@ func checkTarget(result *CheckResult, config *TUFCheck, metadata tufTargetsMetad
 	// The materialized copy is preferred when cosign produced one that matches
 	// the mirror blob, because that is the file a cosign-driven workflow would
 	// actually consume; the mirror blob is the fallback. A materialized copy
-	// that does not match the blob is not trusted material and is not offered.
+	// that does not match the blob is not trusted material and is not offered —
+	// and, like the blob, it is read through an *os.Root, so an escaping
+	// materialized entry is simply not offered rather than hashed out of tree.
+	// (That hardening is verdict-invisible: a materialized copy is only ever a
+	// candidate when it is byte-identical to the already-contained blob, so it
+	// can never change a match outcome — it is defense-in-depth on the read.)
 	candidates := make([]trustedCandidate, 0, 2)
-	materialized := filepath.Join(targetsDir, name)
-	if info, err := os.Stat(materialized); err == nil && info.Mode().IsRegular() && info.Size() == blobInfo.Size() {
-		if sum, err := sha256File(materialized); err == nil && sum == blobSHA {
-			candidates = append(candidates, trustedCandidate{materialized, sum, info.Size()})
+	if materializedRoot, err := os.OpenRoot(targetsDir); err == nil {
+		defer materializedRoot.Close()
+		if info, c := statWithinRoot(materializedRoot, name); c == contained && info.Mode().IsRegular() && info.Size() == blobInfo.Size() {
+			if sum, err := sha256WithinRoot(materializedRoot, name); err == nil && sum == blobSHA {
+				candidates = append(candidates, trustedCandidate{materializedRoot, name, sum, info.Size()})
+			}
 		}
 	}
-	candidates = append(candidates, trustedCandidate{blobPath, blobSHA, blobInfo.Size()})
+	candidates = append(candidates, trustedCandidate{targetsRoot, blobName, blobSHA, blobInfo.Size()})
 
 	trimmedAllowed := trimmedNewlineMatchAllowed(name, localPath)
 	for _, candidate := range candidates {
 		if localSHA == candidate.sha && localInfo.Size() == candidate.size {
 			return
 		}
-		if trimmedAllowed && filesMatchAfterTrimmingNewlines(localPath, candidate.path) {
+		if trimmedAllowed && filesMatchAfterTrimmingNewlines(localPath, candidate) {
 			return
 		}
 	}
@@ -366,14 +487,19 @@ func trimmedNewlineMatchAllowed(name, path string) bool {
 	return false
 }
 
-func filesMatchAfterTrimmingNewlines(left, right string) bool {
-	leftContent, err := os.ReadFile(left)
+// filesMatchAfterTrimmingNewlines compares the caller's local target against a
+// trusted candidate, ignoring trailing newlines. The trusted side is read
+// through its *os.Root, keeping this fallback read under the same beneath-root
+// enforcement as the digest read; the local side is the operator's own declared
+// file and is read by path.
+func filesMatchAfterTrimmingNewlines(localPath string, trusted trustedCandidate) bool {
+	localContent, err := os.ReadFile(localPath)
 	if err != nil {
 		return false
 	}
-	rightContent, err := os.ReadFile(right)
+	trustedContent, err := trusted.root.ReadFile(trusted.name)
 	if err != nil {
 		return false
 	}
-	return bytes.Equal(bytes.TrimRight(leftContent, "\r\n"), bytes.TrimRight(rightContent, "\r\n"))
+	return bytes.Equal(bytes.TrimRight(localContent, "\r\n"), bytes.TrimRight(trustedContent, "\r\n"))
 }

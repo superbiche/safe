@@ -125,9 +125,15 @@ func sha256File(path string) (string, error) {
 		return "", err
 	}
 	defer file.Close()
+	return hashReader(file)
+}
 
+// hashReader streams a reader through sha256 and returns the hex digest. The tuf
+// check reads its mirror blobs through an *os.Root rather than by path, so the
+// hashing is factored out of sha256File to serve both openers.
+func hashReader(reader io.Reader) (string, error) {
 	digest := sha256.New()
-	if _, err := io.Copy(digest, file); err != nil {
+	if _, err := io.Copy(digest, reader); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(digest.Sum(nil)), nil
