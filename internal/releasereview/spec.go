@@ -150,6 +150,13 @@ type CheckConfig struct {
 type ReleaseCheck struct {
 	CheckConfig
 	Asset string `json:"asset"`
+	// AllowUnsignedCommit accepts a release whose tagged commit GitHub reports as
+	// "unsigned" without a BLOCK, recording a visible GO note instead. It is set
+	// for a subject whose upstream never signs its tags and whose manifest waives
+	// commit_unverified because a stronger control covers the same risk. It
+	// narrows to the plain "unsigned" reason only; any other unverified state
+	// still BLOCKs.
+	AllowUnsignedCommit bool `json:"allow_unsigned_commit"`
 }
 
 // TUFCheck configures the TUF bootstrap check.

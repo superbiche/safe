@@ -290,6 +290,13 @@ it, which is what keeps the schema example above valid.
   - `asset` — required. The name the GitHub release must carry. It has no
     default: falling back to the first artifact's name would let a spec that
     names the wrong file pass as if it had named the right one.
+  - `allow_unsigned_commit` — optional, default `false`. When `true`, a tagged
+    commit GitHub reports as `unsigned` is recorded as a `commit_unsigned_allowed`
+    GO note instead of a `commit_unverified` BLOCK. It is for a subject whose
+    upstream never signs its release tags and whose stronger control — the
+    sigstore workflow attestation that binds the artifact to the tag — covers the
+    same risk. It narrows to the plain `unsigned` reason only: any other
+    unverified state (`invalid`, a bad author email, an unknown key) still BLOCKs.
 - `checks.vuln` — when enabled, needs nothing beyond `subject`.
 - `checks.tuf` — when enabled:
   - `mirror` — required. A local directory path, or a `file://` URL, whose
@@ -512,6 +519,7 @@ is a GitHub it could not read, which is `ERROR` — see
 | `tag_unresolved` | BLOCK | `version` | the git tag is absent, or does not resolve to one commit |
 | `commit_missing` | BLOCK | `commit` | a tag names a commit GitHub does not serve |
 | `commit_unverified` | BLOCK | `commit`, `reason` | GitHub does not report the tagged commit as signed |
+| `commit_unsigned_allowed` | GO | `commit`, `reason` | the tagged commit is unsigned and `checks.release.allow_unsigned_commit` accepts that for this subject; recorded so the unsigned state stays visible in the report |
 | `release_history_capped` | GO | `pages`, `releases_read` | the listing was longer than the page cap, but the predecessor was resolved before it — recorded so a capped walk is never silent |
 | `release_history_truncated` | ERROR | `pages`, `releases_read` | the page cap was reached before the release was found, so its predecessor could not be resolved |
 | `high_risk_pattern_invalid` | ERROR | `error` | `SAFE_AUDIT_GITHUB_HIGH_RISK_PATH_REGEX` does not compile, so no path was classified |
@@ -525,12 +533,41 @@ is compared when no predecessor was resolved, an annotated tag is dereferenced
 only when the tag object is annotated rather than lightweight, and no commit is
 asked about when the tag resolved to none.
 
+The release listing is read in small pages and the walk stops as soon as it has
+what it needs. GitHub returns each release's full body in this listing, so a
+repository with a long history of note-heavy releases — openai/codex ships over a
+thousand releases whose bodies run to hundreds of KB — produces pages that at
+`per_page=100` are tens of MB, past the in-memory body cap, and a history far
+longer than a page budget can walk. The walk therefore requests a small page,
+against a page budget of its own so a smaller page did not shrink how far back it
+can reach, and stops once the predecessor is resolved *and* it has read past the
+release's publication day.
+
+That early stop is sound for the predecessor, which is a fixed fact once found.
+It is **not** a completeness proof for `same_day_churn`. GitHub orders this
+listing by `created_at` — the date of the *tagged commit*, not when the release
+was published — so a release published on the review day but built from an older
+commit sorts deep in the listing and can fall outside both the read window and
+the page budget. `same_day_churn` is therefore a best-effort **positive**
+detector: it BLOCKs on the same-day siblings it sees, and a sibling it did not
+read is a known limitation, not a clean bill of health. That residual is
+attacker-reachable — a swapped artifact re-cut from an older commit is exactly
+the deep-sorting shape — and is carried as a known risk rather than closed here;
+closing it would require reading the whole listing, which repositories like codex
+make unaffordable. A capped walk reports `release_history_capped` for the same
+reason, so a truncated count stays visible rather than reading as a pass.
+
 `release_history_capped` and `release_history_truncated` are the same event told
-apart by whether it mattered. A cap that stopped a walk after everything needed
-was already resolved changed no verdict and says so at `GO`; a cap that stopped
-it first is this review failing to run, and reporting *that* as
+apart by whether the *predecessor* was resolved before the cap. A cap that
+stopped a walk after the predecessor was resolved changed no verdict about the
+comparison and says so at `GO` — though the same-day count over the truncated
+tail stays best-effort, which is why the capped note is surfaced rather than
+passed silently; a cap that stopped the walk before the predecessor was resolved
+is this review failing to run, and reporting *that* as
 `previous_release_unresolved` would blame the repository for the reviewer's own
-bound — so the BLOCK is suppressed when the ERROR fires.
+bound — so the BLOCK is suppressed when the ERROR fires. An early stop is neither:
+the predecessor was resolved and the walk read past the publication day, so it is
+a caller decision rather than a page-budget truncation, and no cap is reported.
 
 ### `vuln`
 
@@ -817,10 +854,12 @@ still cannot claim a behavior nothing checks.
 11. **Paginated listings are followed, and the cap is reported.** The bash lanes
     read only the first page of `per_page=100`, so on a repository with a long
     history the previous tag and the same-day count were computed from a
-    truncated view — silently. Here the `Link: rel="next"` chain is followed up
-    to 10 pages, and hitting that bound is always reported: at `GO` for a
-    release history whose answer was already resolved, at `ERROR` when it was
-    not, and at `ERROR` for an advisory feed, which has no early answer.
+    truncated view — silently. Here the `Link: rel="next"` chain is followed on a
+    per-caller page budget — the release history reads small pages (to fit the
+    body cap) up to a larger budget of its own, the advisory feed up to 10 pages —
+    and hitting that bound is always reported: at `GO` for a release history whose
+    predecessor was already resolved, at `ERROR` when it was not, and at `ERROR`
+    for an advisory feed, which has no early answer.
 12. **An advisory naming no readable version range is ambiguous, not absent**
     (`vuln`). The bash lane dropped null and empty `vulnerable_version_range`
     entries before matching, so an advisory whose every entry carried one

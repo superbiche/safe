@@ -13,6 +13,35 @@ import (
 
 const (
 	defaultReleaseMinAgeDays = 3
+	// releaseHistoryPageSize keeps a single page of the release listing under the
+	// body cap. GitHub returns each release's full body in this listing, and a
+	// repository like openai/codex ships hundreds of KB of notes per release — at
+	// per_page=100 one page is ~27 MB, far past githubMaxBodyBytes, so the read
+	// failed before any pagination logic ran. A small page reads only the newest
+	// releases, which is all reviewReleaseHistory needs, and the early stop in
+	// getPaged means a recent release is usually resolved from the first page.
+	releaseHistoryPageSize = 10
+	// releaseHistoryMaxPages bounds the history walk on its own budget rather than
+	// the shared githubMaxPages, so shrinking the page size did not also shrink the
+	// number of releases a walk can reach. At releaseHistoryPageSize this reads up
+	// to ~250 releases — the reach a review of a not-newest release needs — while
+	// staying well inside GitHub's 60/hour anonymous request budget (a recent
+	// release early-stops in one or two requests; only an old-release review pays
+	// the full budget). A review that runs past it reports release_history_*, never
+	// deciding on a silently truncated view.
+	releaseHistoryMaxPages = 25
+	// sameDayLookbehindDays is how far before the release's publication day the
+	// same-day-churn walk keeps reading. It bounds the COMMON case, not a proof:
+	// GitHub orders this listing by created_at, which is the tagged commit's date,
+	// so a release published on the review day but tagging an older commit sorts
+	// deep and can be missed. same_day_churn is therefore a best-effort positive
+	// detector — it BLOCKs on the same-day siblings it sees, and a sibling that
+	// sorts past this lookbehind (or past the page budget) is a known limitation,
+	// not a clean bill of health. The residual is attacker-reachable (a re-cut from
+	// an old commit) and is carried as a known risk, not closed here; closing it
+	// would require reading the whole listing, which repositories like codex make
+	// unaffordable.
+	sameDayLookbehindDays = 1
 	// The bash lane's default, copied verbatim: workflow files, the scripts a
 	// release is built and signed by, and the container and build entry points.
 	// A change to any of them between two releases is what a supply-chain
@@ -82,7 +111,7 @@ func release(spec Spec) CheckResult {
 		reviewReleaseComparison(&result, client, repo, version, previousTag)
 	}
 	if commit := reviewTagCommit(&result, client, repo, version); commit != "" {
-		reviewCommitVerification(&result, client, repo, commit)
+		reviewCommitVerification(&result, client, repo, commit, config.AllowUnsignedCommit)
 	}
 	return result
 }
@@ -142,13 +171,13 @@ func carriesAsset(release githubRelease, asset string) bool {
 // before this one, which is what the comparison below is taken against.
 func reviewReleaseHistory(result *CheckResult, client *githubClient, repo, version, publishedAt string) string {
 	var history []githubRelease
-	capped, err := client.getPaged(fmt.Sprintf("/repos/%s/releases?per_page=100", repo), func(page json.RawMessage) *githubError {
+	capped, err := client.getPaged(fmt.Sprintf("/repos/%s/releases?per_page=%d", repo, releaseHistoryPageSize), releaseHistoryMaxPages, func(page json.RawMessage) (bool, *githubError) {
 		var releases []githubRelease
 		if decodeErr := json.Unmarshal(page, &releases); decodeErr != nil {
-			return &githubError{message: fmt.Sprintf("GitHub's release listing is not an array of releases: %v", decodeErr)}
+			return false, &githubError{message: fmt.Sprintf("GitHub's release listing is not an array of releases: %v", decodeErr)}
 		}
 		history = append(history, releases...)
-		return nil
+		return historyWalkSatisfied(history, version, publishedAt), nil
 	})
 	if err != nil {
 		recordGitHubFailure(result, err, "the release history", "release_history_missing",
@@ -169,19 +198,21 @@ func reviewReleaseHistory(result *CheckResult, client *githubClient, repo, versi
 	switch {
 	case previousTag != "":
 		if capped {
-			// Everything this check reads the history for was resolved before
-			// the cap; the run is recorded so a capped listing is never silent,
-			// but it decides nothing.
+			// The predecessor — the one fact this branch needs complete — was
+			// resolved before the cap. The same-day count over the truncated tail
+			// is necessarily incomplete, which is exactly why the capped run is
+			// recorded rather than passed silently (the producer keeps this at
+			// WARN); same_day_churn stays a best-effort positive detector.
 			result.add(GO, "release_history_capped",
-				fmt.Sprintf("the release history was longer than the %d pages this check reads; the previous release was resolved before the cap, so nothing was decided on the truncated part", githubMaxPages),
-				map[string]string{"pages": strconv.Itoa(githubMaxPages), "releases_read": strconv.Itoa(len(history))})
+				fmt.Sprintf("the release history was longer than the %d pages this check reads; the previous release was resolved before the cap, so nothing was decided on the truncated part", releaseHistoryMaxPages),
+				map[string]string{"pages": strconv.Itoa(releaseHistoryMaxPages), "releases_read": strconv.Itoa(len(history))})
 		}
 	case capped:
 		// The cap, not the repository, is why there is no answer. That is this
 		// review failing to run, not evidence about the release.
 		result.add(ERROR, "release_history_truncated",
-			fmt.Sprintf("the release history was longer than the %d pages this check reads and %s was not reached, so its predecessor could not be resolved", githubMaxPages, version),
-			map[string]string{"pages": strconv.Itoa(githubMaxPages), "releases_read": strconv.Itoa(len(history))})
+			fmt.Sprintf("the release history was longer than the %d pages this check reads and %s was not reached, so its predecessor could not be resolved", releaseHistoryMaxPages, version),
+			map[string]string{"pages": strconv.Itoa(releaseHistoryMaxPages), "releases_read": strconv.Itoa(len(history))})
 	default:
 		result.add(BLOCK, "previous_release_unresolved",
 			fmt.Sprintf("no release published before %s could be resolved, so there is nothing to compare it against", version),
@@ -221,6 +252,50 @@ func previousReleaseTag(history []githubRelease, version string) string {
 		}
 	}
 	return ""
+}
+
+// historyWalkSatisfied reports whether the release listing has been read far
+// enough to stop the walk: the predecessor is resolved, and the walk has read
+// past the release's publication day. It is the getPaged early stop.
+//
+// This is sound for the predecessor, a fixed fact once found. It is NOT a
+// completeness proof for same_day_churn: the listing is ordered by created_at
+// (the tagged commit's date), so a same-day-published release built from an older
+// commit can sort past the window and go unread — see sameDayLookbehindDays.
+// The oldest entry read so far is the last one appended; once its created
+// timestamp is a full lookbehind day before the publication day AND its own
+// publication timestamp is before that day, the walk stops. Until a publication
+// day can be read from the release under review, or until the predecessor is
+// resolved, the walk does not stop early and falls through to the page budget —
+// the conservative default.
+func historyWalkSatisfied(history []githubRelease, version, publishedAt string) bool {
+	if len(history) == 0 || previousReleaseTag(history, version) == "" {
+		return false
+	}
+	publishedDay := publicationDay(publishedAt)
+	if publishedDay == "" {
+		return false
+	}
+	day, err := time.Parse("2006-01-02", publishedDay)
+	if err != nil {
+		return false
+	}
+	oldest := history[len(history)-1]
+	createdCutoff := day.AddDate(0, 0, -sameDayLookbehindDays)
+	return timestampBefore(oldest.CreatedAt, createdCutoff) &&
+		timestampBefore(oldest.PublishedAt, day)
+}
+
+// timestampBefore reports whether an RFC 3339 timestamp is strictly before a
+// cutoff. An empty or unreadable timestamp returns false: a timestamp that
+// cannot be placed is never treated as old enough to stop the walk, so an
+// unreadable date keeps the walk reading rather than ending it early.
+func timestampBefore(timestamp string, cutoff time.Time) bool {
+	parsed, err := time.Parse(time.RFC3339, timestamp)
+	if err != nil {
+		return false
+	}
+	return parsed.Before(cutoff)
 }
 
 func reviewReleaseComparison(result *CheckResult, client *githubClient, repo, version, previousTag string) {
@@ -307,7 +382,7 @@ func reviewTagCommit(result *CheckResult, client *githubClient, repo, version st
 	}
 }
 
-func reviewCommitVerification(result *CheckResult, client *githubClient, repo, commit string) {
+func reviewCommitVerification(result *CheckResult, client *githubClient, repo, commit string, allowUnsigned bool) {
 	var details githubCommit
 	_, err := client.get(fmt.Sprintf("/repos/%s/commits/%s", repo, url.PathEscape(commit)), &details)
 	if err != nil {
@@ -322,6 +397,21 @@ func reviewCommitVerification(result *CheckResult, client *githubClient, repo, c
 	reason := details.Commit.Verification.Reason
 	if reason == "" {
 		reason = "unverified"
+	}
+	// A subject whose upstream does not sign its release tags declares so with
+	// allow_unsigned_commit, which the producer sets when the manifest waives
+	// commit_unverified because a stronger control — the sigstore workflow
+	// attestation that binds the artifact to the tag — covers the same risk. An
+	// unsigned commit is then the expected state, not a finding, and is recorded
+	// as a GO note that stays in the report rather than a BLOCK the consumer must
+	// waive on every review. Only a plain "unsigned" passes: a commit GitHub
+	// reports as invalid, bad_email, or signed by an unknown key is anomalous even
+	// for a project that never signs, so it still BLOCKs.
+	if allowUnsigned && reason == "unsigned" {
+		result.add(GO, "commit_unsigned_allowed",
+			fmt.Sprintf("the tagged commit %s is unsigned, which the spec accepts for this subject (allow_unsigned_commit)", commit),
+			map[string]string{"commit": commit, "reason": reason})
+		return
 	}
 	result.add(BLOCK, "commit_unverified",
 		fmt.Sprintf("GitHub does not report the tagged commit %s as signed: %s", commit, reason),

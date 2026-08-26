@@ -59,6 +59,15 @@ func releaseEntry(tag, publishedAt string, draft, prerelease bool) string {
 		tag, draft, prerelease, publishedAt)
 }
 
+// releaseEntryC is releaseEntry with a created_at, which the history walk's early
+// stop reads: GitHub orders this listing by created_at, so the stop condition
+// needs both timestamps. An entry built without one (releaseEntry) leaves
+// created_at empty, which never satisfies the stop — the walk reads to the end.
+func releaseEntryC(tag, publishedAt, createdAt string, draft, prerelease bool) string {
+	return fmt.Sprintf(`{"tag_name":%q,"draft":%t,"prerelease":%t,"published_at":%q,"created_at":%q}`,
+		tag, draft, prerelease, publishedAt, createdAt)
+}
+
 // cleanRelease is a release nothing is wrong with: published a month ago on a
 // day of its own, carrying its asset, following a predecessor it changed no
 // release machinery against, tagged at a signed commit.
@@ -569,8 +578,199 @@ func TestReleaseHistoryPageCapIsReported(t *testing.T) {
 					pages++
 				}
 			}
-			if pages != githubMaxPages {
-				t.Fatalf("the listing was fetched %d times, want the %d-page cap", pages, githubMaxPages)
+			if pages != releaseHistoryMaxPages {
+				t.Fatalf("the listing was fetched %d times, want the %d-page cap", pages, releaseHistoryMaxPages)
+			}
+		})
+	}
+}
+
+// The history listing on a repository like openai/codex is over a thousand
+// releases whose bodies are hundreds of KB each — it can neither fit a page under
+// the body cap nor be walked to its end inside the page budget. Once the
+// predecessor is resolved and the walk has read past the release's publication
+// day, it stops, even though the server keeps offering more pages. A stopped walk
+// is a caller decision, not a page-cap truncation, so no cap is reported (the
+// same-day count stays best-effort; only the predecessor is a complete fact).
+func TestReleaseHistoryStopsEarlyOnceResolved(t *testing.T) {
+	bodies := cleanRelease()
+	bodies[releasePath] = releaseBody("2026-06-01T20:00:00Z", false, false, testAsset)
+	// The first page carries the release and its predecessor, both created and
+	// published well before the publication day, so the walk reads past the
+	// same-day window and the predecessor is known.
+	firstPage := releasesBody(
+		releaseEntryC(testVersion, "2026-06-01T20:00:00Z", "2026-06-01T20:00:00Z", false, false),
+		releaseEntryC("v1.2.2", "2026-05-01T10:00:00Z", "2026-05-01T10:00:00Z", false, false),
+	)
+
+	var serverURL string
+	fake := newFakeGitHub(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == releasesPath {
+			// Always offer another page; a working early stop declines it.
+			writer.Header().Set("Link", fmt.Sprintf(`<%s%s?per_page=%d&page=2>; rel="next"`,
+				serverURL, releasesPath, releaseHistoryPageSize))
+			fmt.Fprint(writer, firstPage)
+			return
+		}
+		routes(bodies)(writer, request)
+	})
+	serverURL = fake.server.URL
+
+	result := release(releaseSpec())
+	if result.Verdict != GO || len(result.Reasons) != 0 {
+		t.Fatalf("verdict %s with reasons %v, want a clean GO", result.Verdict, codes(result))
+	}
+	if hasCode(result, "release_history_capped") || hasCode(result, "release_history_truncated") {
+		t.Fatalf("an early stop was reported as a cap: %v", codes(result))
+	}
+
+	var listingRequests []recordedRequest
+	for _, request := range fake.requests {
+		if request.path == releasesPath {
+			listingRequests = append(listingRequests, request)
+		}
+	}
+	if len(listingRequests) != 1 {
+		t.Fatalf("the listing was fetched %d times, want 1 — the walk did not stop early", len(listingRequests))
+	}
+	if query := listingRequests[0].rawQuery; !strings.Contains(query, fmt.Sprintf("per_page=%d", releaseHistoryPageSize)) {
+		t.Fatalf("listing query %q, want per_page=%d so one page stays under the body cap", query, releaseHistoryPageSize)
+	}
+}
+
+// The listing is ordered by created_at, but same-day churn is a published_at
+// fact, so a same-day sibling can sit a page deeper than the release under
+// review. The walk keeps reading until it is past the publication day, so a
+// stable sibling published the same day on a later page is still counted.
+func TestReleaseHistoryCountsSameDaySiblingOnALaterPage(t *testing.T) {
+	bodies := cleanRelease()
+	bodies[releasePath] = releaseBody("2026-06-01T20:00:00Z", false, false, testAsset)
+	firstPage := releasesBody(
+		releaseEntryC(testVersion, "2026-06-01T20:00:00Z", "2026-06-01T20:00:00Z", false, false),
+	)
+	// The predecessor and a second stable release published the same day, created
+	// the day before — within the lookbehind window, so it sorts below the newest
+	// entries but is still a same-day sibling.
+	secondPage := releasesBody(
+		releaseEntryC("v1.2.2", "2026-05-20T10:00:00Z", "2026-05-20T10:00:00Z", false, false),
+		releaseEntryC("v1.2.3-rebuild", "2026-06-01T08:00:00Z", "2026-05-31T23:00:00Z", false, false),
+	)
+
+	var serverURL string
+	fake := newFakeGitHub(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == releasesPath {
+			if request.URL.Query().Get("page") == "2" {
+				fmt.Fprint(writer, secondPage)
+				return
+			}
+			writer.Header().Set("Link", fmt.Sprintf(`<%s%s?per_page=%d&page=2>; rel="next"`,
+				serverURL, releasesPath, releaseHistoryPageSize))
+			fmt.Fprint(writer, firstPage)
+			return
+		}
+		routes(bodies)(writer, request)
+	})
+	serverURL = fake.server.URL
+
+	result := release(releaseSpec())
+	if reason := reasonWithCode(t, result, "same_day_churn"); reason.Data["count"] != "2" {
+		t.Fatalf("same_day_churn count %q, want 2 — the later-page sibling was not counted", reason.Data["count"])
+	}
+	pages := 0
+	for _, request := range fake.requests {
+		if request.path == releasesPath {
+			pages++
+		}
+	}
+	if pages != 2 {
+		t.Fatalf("the listing was fetched %d times, want 2 — the walk stopped before the same-day window closed", pages)
+	}
+}
+
+// The release-history page budget is decoupled from the shared page cap, so
+// shrinking the page size to fit the body cap did not shrink how far back a
+// review can reach. A not-newest release whose predecessor sits past the shared
+// ten-page cap still resolves, where a coupled cap would have truncated.
+func TestReleaseHistoryReachIsDecoupledFromPageSize(t *testing.T) {
+	if releaseHistoryMaxPages <= githubMaxPages {
+		t.Fatalf("release-history budget %d must exceed the shared cap %d to restore reach", releaseHistoryMaxPages, githubMaxPages)
+	}
+	bodies := cleanRelease()
+	// The release under review sits on page 15 — past the shared 10-page cap,
+	// inside the release-history budget. Earlier pages are newer releases.
+	targetPage := githubMaxPages + 5
+	var serverURL string
+	page := 0
+	fake := newFakeGitHub(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == releasesPath {
+			page++
+			if page < targetPage {
+				writer.Header().Set("Link", fmt.Sprintf(`<%s%s?per_page=%d&page=%d>; rel="next"`,
+					serverURL, releasesPath, releaseHistoryPageSize, page+1))
+				fmt.Fprint(writer, releasesBody(
+					releaseEntry(fmt.Sprintf("v9.%d.0", page), daysAgo(page), false, false),
+				))
+				return
+			}
+			fmt.Fprint(writer, releasesBody(
+				releaseEntry(testVersion, daysAgo(30), false, false),
+				releaseEntry("v1.2.2", daysAgo(60), false, false),
+			))
+			return
+		}
+		routes(bodies)(writer, request)
+	})
+	serverURL = fake.server.URL
+
+	result := release(releaseSpec())
+	if hasCode(result, "release_history_truncated") || hasCode(result, "previous_release_unresolved") {
+		t.Fatalf("a predecessor within the budget was not resolved: %v", codes(result))
+	}
+	if result.Verdict != GO || len(result.Reasons) != 0 {
+		t.Fatalf("verdict %s with reasons %v, want a clean GO", result.Verdict, codes(result))
+	}
+}
+
+// A subject whose upstream never signs its release tags declares
+// allow_unsigned_commit, and an unsigned commit becomes a visible GO note rather
+// than a BLOCK the consumer waives on every review.
+func TestReleaseUnsignedCommitAllowedByPolicy(t *testing.T) {
+	bodies := cleanRelease()
+	bodies[commitPath] = `{"commit":{"verification":{"verified":false,"reason":"unsigned"}}}`
+	newFakeGitHub(t, routes(bodies))
+
+	spec := releaseSpec()
+	spec.Checks.Release.AllowUnsignedCommit = true
+	result := release(spec)
+	if result.Verdict != GO {
+		t.Fatalf("verdict %s with reasons %v, want GO", result.Verdict, codes(result))
+	}
+	if hasCode(result, "commit_unverified") {
+		t.Fatal("an allowed unsigned commit still BLOCKed")
+	}
+	if reason := reasonWithCode(t, result, "commit_unsigned_allowed"); reason.Data["reason"] != "unsigned" {
+		t.Fatalf("commit_unsigned_allowed data %v, want reason unsigned", reason.Data)
+	}
+}
+
+// The allowance is only for a plain "unsigned" commit. A commit GitHub reports as
+// invalid, wrongly attributed, or signed by an unknown key is anomalous even for
+// a project that never signs, so it still BLOCKs despite the flag.
+func TestReleaseUnsignedAllowanceNarrowsToPlainUnsigned(t *testing.T) {
+	for _, reason := range []string{"invalid", "bad_email", "unknown_key", "unverified"} {
+		t.Run(reason, func(t *testing.T) {
+			bodies := cleanRelease()
+			bodies[commitPath] = fmt.Sprintf(`{"commit":{"verification":{"verified":false,"reason":%q}}}`, reason)
+			newFakeGitHub(t, routes(bodies))
+
+			spec := releaseSpec()
+			spec.Checks.Release.AllowUnsignedCommit = true
+			result := release(spec)
+			if result.Verdict != BLOCK || !hasCode(result, "commit_unverified") {
+				t.Fatalf("reason %q: verdict %s with reasons %v, want a commit_unverified BLOCK", reason, result.Verdict, codes(result))
+			}
+			if hasCode(result, "commit_unsigned_allowed") {
+				t.Fatalf("reason %q was let through as an allowed unsigned commit", reason)
 			}
 		})
 	}
