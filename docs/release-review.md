@@ -537,7 +537,7 @@ bound — so the BLOCK is suppressed when the ERROR fires.
 | Code | Class | Data | Meaning |
 | --- | --- | --- | --- |
 | `known_advisory_high_severity` | BLOCK | `advisory`, `severity`, `cve` | a high or critical advisory affects this version |
-| `version_mapping_ambiguous` | BLOCK | `advisory`, `version` | an advisory names no affected range this check can read, so whether it covers the version is unknown |
+| `version_mapping_ambiguous` | BLOCK | `advisory`, `version` | an advisory names no affected range this check can read AND no usable `patched_versions` fallback, so whether it covers the version is unknown |
 | `advisory_feed_missing` | BLOCK | `repo` | GitHub publishes no advisory feed for the repository; the message names the private-repository case |
 | `known_advisory` | WARN | `advisory`, `severity`, `cve` | an advisory below high severity affects this version |
 | `advisory_feed_unavailable` | ERROR | `repo` | the feed could not be read, so no advisory was checked |
@@ -830,6 +830,22 @@ still cannot claim a behavior nothing checks.
     entries at all, and it fails closed. The bash lane's own quirks in the
     *range grammar* are ported exactly, including that `||` makes a range
     unreadable and that a range of only separators matches everything.
+
+    Two refinements the bash lane never had (both `vuln`): the subject version
+    is the GitHub *tag* — the `release` check looks it up as one — so before
+    comparing it against advisory versions it is reduced to its numeric core
+    (`rust-v0.149.1` → `0.149.1`), everything up to the first digit dropped; a
+    tag with no digit stays whole and cannot be placed. And when a range is
+    unreadable, the entry's `patched_versions` is consulted as a second signal:
+    a single, parseable fix version decides — a candidate at or above it is not
+    affected, below it is — so an advisory whose *only* defect is an unparseable
+    range no longer blocks every version forever. The fallback is a resolver,
+    not a loosening: a readable range is always authoritative and is never
+    overridden by `patched_versions`; a comma-separated patched list (several
+    fixed branches, a branch-identity question this build does not answer) does
+    not resolve; and a candidate with no numeric core does not resolve. When
+    neither the range nor a usable patched version can place the advisory, it is
+    still `version_mapping_ambiguous` and still fails closed.
 13. **The `exec` sandbox runs the binary directly, with no shell.** The bash
     lane wrapped it in `sh -c 'exec /artifact/<name> "$@"' sh` to forward its
     arguments, which spliced a spec-supplied file name into shell program text:

@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **release-review `vuln`: resolve an unreadable advisory range by its
+  `patched_versions`, and compare the subject tag by its version core**
+  (1.45.0). An advisory whose `vulnerable_version_range` this check cannot parse
+  used to BLOCK every version forever (`version_mapping_ambiguous`) — which is
+  what a repository publishing an advisory for an *adjacent* package (its npm
+  library, its editor extension) with a nonstandard range did to an unrelated
+  binary release. Two changes: (1) the subject version, which is the GitHub tag
+  the `release` check looks up, is reduced to its numeric core before advisory
+  comparison (`rust-v0.149.1` → `0.149.1`; a tag with no digit stays whole and
+  cannot be placed), so comparisons are numeric rather than string-collated; (2)
+  when a range is unreadable, the entry's `patched_versions` is consulted as a
+  second signal — a single parseable fix version decides (at or above it, not
+  affected; below it, affected). Strictly a resolver, not a loosening: a
+  readable range stays authoritative and is never overridden; a comma-separated
+  patched list does not resolve; a digitless candidate does not resolve; and
+  when neither range nor patched version can place the advisory it is still
+  `version_mapping_ambiguous` and still fails closed.
+
 - **composer global scan enters selected projects with physical `cd`**
   (1.44.0). The global composer scan lane
   (`safe_gate_composer_scan_targets`) entered each selected project with a

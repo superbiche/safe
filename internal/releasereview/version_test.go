@@ -393,3 +393,22 @@ func TestVersionMatchesRangeDifferentialGolden(t *testing.T) {
 		}
 	}
 }
+
+func TestComparableVersion(t *testing.T) {
+	for _, testCase := range []struct {
+		tag  string
+		want string
+	}{
+		{"rust-v0.149.1", "0.149.1"},
+		{"v1.2.3", "1.2.3"},
+		{"1.2.3", "1.2.3"},
+		{"0.1.0", "0.1.0"},
+		{"release-2.0.0-rc1", "2.0.0-rc1"},
+		{"nightly", "nightly"},
+		{"", ""},
+	} {
+		if got := comparableVersion(testCase.tag); got != testCase.want {
+			t.Errorf("comparableVersion(%q) = %q, want %q", testCase.tag, got, testCase.want)
+		}
+	}
+}

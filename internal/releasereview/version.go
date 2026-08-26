@@ -66,6 +66,26 @@ func versionMatchesRange(version, versionRange string) rangeMatch {
 	return rangeMatches
 }
 
+// comparableVersion isolates the numeric version core of a release tag so the
+// vuln check can compare it against advisory version data.
+//
+// subject.version is the GitHub *tag* — the release check looks it up as one
+// (`/releases/tags/{version}`), so the producer cannot normalize it there. A tag
+// may carry a project-specific prefix before the semver (openai/codex ships the
+// Rust binary as `rust-v0.149.1`), and semverNormalize strips only a leading
+// `v`. Everything up to the first ASCII digit is dropped, which also covers the
+// plain `v` and bare-numeric cases. A value with no digit at all is returned
+// unchanged: it is not a version this check can place, and patchedVerdict
+// refuses it rather than let a string comparison of non-versions fail open.
+func comparableVersion(tag string) string {
+	for index := 0; index < len(tag); index++ {
+		if isASCIIDigit(tag[index]) {
+			return tag[index:]
+		}
+	}
+	return tag
+}
+
 // versionSatisfiesConstraint evaluates one comparison such as `<2.0.0` or
 // `>= 1.0.0`. A bare version is an equality constraint.
 func versionSatisfiesConstraint(version, constraint string) rangeMatch {
