@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.3.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.40.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.41.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -1800,13 +1800,18 @@ grype_db_health_json() {
     return 0
   fi
 
-  local raw
-  raw=$(mktemp)
+  # Registered scratch, not a bare mktemp: the raw status and its captured
+  # stderr are this function's own working files. Hanging the stderr off the
+  # caller's $output also left a `.stderr` sibling beside the caller's file on
+  # every call; inside a registered dir the process-exit trap reclaims both.
+  local __scratch
+  new_scratch_dir __scratch
+  local raw="$__scratch/raw" stderr="$__scratch/stderr"
   local rc=0
-  run_machine_capture "$machine" "$(printf '%q' "$grype") db status -o json -q" > "$raw" 2>"$output.stderr" || rc=$?
+  run_machine_capture "$machine" "$(printf '%q' "$grype") db status -o json -q" > "$raw" 2>"$stderr" || rc=$?
 
   if ! jq -e 'type == "object"' "$raw" >/dev/null 2>&1; then
-    jq -n --arg note "grype db status failed" --arg stderr "$(cat "$output.stderr" 2>/dev/null || true)" --argjson rc "$rc" '
+    jq -n --arg note "grype db status failed" --arg stderr "$(cat "$stderr" 2>/dev/null || true)" --argjson rc "$rc" '
       {healthy:false,status:"error",note:$note,exit_code:$rc,stderr:$stderr}
     ' > "$output"
     return 0
@@ -1841,8 +1846,9 @@ grype_db_health_json() {
 
 machine_grype_db_healthy() {
   local machine="$1"
-  local health status detail
-  health=$(mktemp)
+  local health status detail __scratch
+  new_scratch_dir __scratch
+  health="$__scratch/health"
   grype_db_health_json "$machine" "$health"
   if jq -e '.healthy == true' "$health" >/dev/null 2>&1; then
     return 0
@@ -2760,9 +2766,13 @@ build_scan_result_from_artifacts() {
   # shared per-day path: `<date>-scan.json` is one file per machine per day, so
   # a concurrent scan of another project can replace it between any two reads.
   # Nothing that decides anything may re-read the shared path.
-  local delta_json snapshot
+  local delta_json snapshot __scratch
   delta_json=$(build_delta_json "$machine" "$result_path" "$sbom_path" "$build_tmp" "$sbom_src")
-  snapshot=$(mktemp)
+  # Registered scratch: the snapshot outlives this function — it is cached and
+  # rendered later in the run through LAST_SCAN_RESULT_SNAPSHOT — so a
+  # function-local rm cannot reclaim it, but the process-exit trap can.
+  new_scratch_dir __scratch
+  snapshot="$__scratch/snapshot"
   jq --argjson delta "$delta_json" '. + {delta: $delta}' "$build_tmp" > "$snapshot"
   rm -f "$build_tmp"
   cp "$snapshot" "$result_path"
@@ -8506,9 +8516,10 @@ build_ioc_from_cisa_kev() {
 
 ioc_update_command() {
   local since="${1:-}" scan_targets="${2:-0}"
-  local catalog_tmp ioc_tmp catalog_path ioc_path update_meta_path
-  catalog_tmp=$(mktemp)
-  ioc_tmp=$(mktemp)
+  local catalog_tmp ioc_tmp catalog_path ioc_path update_meta_path __scratch
+  new_scratch_dir __scratch
+  catalog_tmp="$__scratch/catalog"
+  ioc_tmp="$__scratch/ioc"
   catalog_path="$IOC_CATALOG_DIR/cisa-kev.json"
   ioc_path="$IOC_DIR/cisa-kev-ioc.json"
   update_meta_path="$IOC_CATALOG_DIR/cisa-kev-update.json"
@@ -8604,11 +8615,15 @@ ps aux | grep -F -- $(printf '%q' "$item") | grep -v grep || true
 
 ioc_run_scan() {
   local ident="$1" ioc_json="$2"
-  local result_path machine tmpfiles=()
+  local result_path machine tmpfiles=() __scratch
   result_path="$IOC_DIR/$(today_date)-$(slugify "$ident").json"
+  # One registered scratch dir for every per-machine scan file; the process-exit
+  # trap reclaims the tree rather than leaving one temp per target behind.
+  new_scratch_dir __scratch
+  local __i=0
   for machine in "${MACHINE_TARGETS[@]}"; do
-    local out
-    out=$(mktemp)
+    local out="$__scratch/scan.$__i"
+    __i=$((__i + 1))
     ioc_machine_scan "$machine" "$ioc_json" "$out"
     tmpfiles+=("$out")
   done
@@ -8680,9 +8695,10 @@ ioc_command() {
   fi
 
   parse_machine_targets default "${args[@]}"
-  local ioc_json advisory_json
-  advisory_json=$(mktemp)
-  ioc_json=$(mktemp)
+  local ioc_json advisory_json __scratch
+  new_scratch_dir __scratch
+  advisory_json="$__scratch/advisory.json"
+  ioc_json="$__scratch/ioc.json"
   if [[ -n "$list_file" ]]; then
     cp "$list_file" "$ioc_json"
     ident=$(jq -r '.id // "custom-ioc"' "$ioc_json")
