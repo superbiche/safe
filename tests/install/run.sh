@@ -2176,6 +2176,47 @@ case_composer_global_canonical_routing() {
   [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
   assert_log_not_contains_fragment $'REAL\tcomposer\tglobal\t--not-a-real-global-option' "$FUNCNAME" || return
 
+  # A global scan target is entered with physical path semantics, matching
+  # Composer's chdir(): when COMPOSER_HOME reaches through a symlinked `..`, the
+  # scan must land on the real physical directory, not the lexically-collapsed
+  # one. The wrong (lexical) directory is flagged critical, so under a bare `cd`
+  # the run would BLOCK; under `cd -P` it is never a scan target and the run
+  # passes. Expected is computed with the same physical resolution so a
+  # symlinked temp prefix cannot skew the assertion.
+  local phys_real="${CASE_DIR}/phys-realproj"
+  local phys_wrong="${CASE_DIR}/phys-wrongdir"
+  mkdir -p "${phys_real}/sub" "${phys_wrong}"
+  touch "${phys_real}/composer.json" "${phys_wrong}/composer.json"
+  ln -s "${phys_real}/sub" "${phys_wrong}/lnk"
+  local phys_real_canon
+  phys_real_canon="$(cd -P -- "${phys_real}" && pwd)"
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${phys_wrong}/lnk/.." SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${phys_wrong}" \
+    SAFE_INSTALL_TEST_SCRIPT='composer global install' run_zsh
+  assert_status 0 "$FUNCNAME (global physical cd)" || return
+  assert_scan_targets_logged "$FUNCNAME (global physical cd)" "${phys_real_canon}" || return
+  assert_log_not_contains_fragment $'AUDITPROJECT\t'"${phys_wrong}" "$FUNCNAME (global physical cd)" || return
+
+  # A selected global target that exists but cannot be entered is audit
+  # infrastructure breakage, not a clean tree: refuse (exit 100, single stderr
+  # line), never delegate unaudited. This locks the `cd -P -- ... 2>/dev/null`
+  # + 125->100 mapping so a regression that drops the suppression (two stderr
+  # lines) or the exit mapping cannot pass green.
+  local global_unreadable="${CASE_DIR}/global-unreadable"
+  mkdir -p "${global_unreadable}"
+  touch "${global_unreadable}/composer.json"
+  chmod 000 "${global_unreadable}"
+  : > "${LOG_FILE}"
+  COMPOSER_HOME="${global_unreadable}" SAFE_AUDIT_EXPECT_PROJECTS=1 \
+    SAFE_INSTALL_TEST_SCRIPT='composer global install' run_zsh
+  chmod 755 "${global_unreadable}"
+  assert_status 100 "$FUNCNAME (global unreadable)" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME (global unreadable)"; return 1; }
+  assert_err_contains_fragment 'cannot enter the selected project' "$FUNCNAME (global unreadable)" || return
+  assert_log_not_contains_fragment $'AUDITPROJECT\t' "$FUNCNAME (global unreadable)" || return
+  assert_log_not_contains_fragment $'REAL\tcomposer' "$FUNCNAME (global unreadable)" || return
+
   pass "$FUNCNAME"
 }
 

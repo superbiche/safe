@@ -949,12 +949,18 @@ safe_gate_composer_route() {
 # Over-scan global routing targets: every existing directory is preflighted,
 # even before it has composer metadata. A nonexistent target contributes
 # nothing while other selected targets remain protected.
+#
+# Each target is entered with PHYSICAL cd (`cd -P`) to match Composer's
+# chdir(), exactly as the non-global helpers do: a bare `cd` collapses
+# `symlink/..` lexically and would scan a different physical directory than the
+# one Composer resolves. `2>/dev/null` keeps an unenterable target's refusal to
+# the single BLOCKED stderr line below (no bare `cd:` diagnostic ahead of it).
 safe_gate_composer_scan_targets() {
   local target scan_rc
   for target in "${SAFE_GATE_COMPOSER_SCAN_TARGETS[@]}"; do
     [[ -d "${target}" ]] || continue
     (
-      cd "${target}" || exit 125
+      cd -P -- "${target}" 2>/dev/null || exit 125
       safe_gate_scan_project
     )
     scan_rc=$?
