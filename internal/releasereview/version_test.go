@@ -400,24 +400,30 @@ func TestComparableVersion(t *testing.T) {
 		want      string
 		placeable bool
 	}{
-		// Whole-tag version, optionally v-prefixed.
+		// Placeable: exactly one dotted version, at a structural position — the
+		// whole tag as `v?VERSION`, or the version after a `-v` separator (a name
+		// containing a non-dotted digit is fine, `tool2-v0.5.0`).
 		{"1.2.3", "1.2.3", true},
 		{"v1.2.3", "1.2.3", true},
 		{"0.1.0", "0.1.0", true},
-		{"v1.2.3-alpha.1.2", "1.2.3-alpha.1.2", true},
-		{"v1.2.3+linux.6.8", "1.2.3+linux.6.8", true},
-		// Prefix, the `-v` separator, then the version — the structural position.
-		// A dotted run inside the prefix does not steal the placement: the `-v`
-		// version wins.
 		{"rust-v0.149.1", "0.149.1", true},
 		{"tool2-v0.5.0", "0.5.0", true},
 		{"release-v2.0.0-rc1", "2.0.0-rc1", true},
-		{"tool-2.0-v0.5.0", "0.5.0", true},
-		{"platform-6.8-v0.1", "0.1", true},
-		// Unplaceable — the version is not at a structural position, so it is not
-		// guessed. `platform-6.8-v0`: the real release `v0` has no dotted version.
-		// `tool-v0.5.0_linux-6.8`: the `_linux` tail breaks the end anchor.
-		// `tool2-0.5.0` / `go1.21.0`: a name glued to a version with no `-v`.
+		// Unplaceable: a SECOND dotted version anywhere makes the placement
+		// ambiguous, so the tag fails closed rather than guessing which is the
+		// release — whether the second version is in the prefix
+		// (`tool-2.0-v0.5.0`, `platform-6.8-v0.1`, `9.9.9-v0.1.0`) or a suffix
+		// (`0.1.0+build-v9.9.9`, `v1.2.3-alpha.1.2`, `v1.2.3+linux.6.8`).
+		{"tool-2.0-v0.5.0", "", false},
+		{"platform-6.8-v0.1", "", false},
+		{"9.9.9-v0.1.0", "", false},
+		{"0.1.0+build-v9.9.9", "", false},
+		{"v1.2.3-alpha.1.2", "", false},
+		{"v1.2.3+linux.6.8", "", false},
+		// Unplaceable: no version at a structural position at all.
+		// `platform-6.8-v0` — the release `v0` has no dotted version.
+		// `tool-v0.5.0_linux-6.8` — the `_linux` tail breaks the end anchor.
+		// `tool2-0.5.0` / `go1.21.0` — a name glued to a version with no `-v`.
 		{"platform-6.8-v0", "", false},
 		{"tool-v0.5.0_linux-6.8", "", false},
 		{"tool2-0.5.0", "", false},

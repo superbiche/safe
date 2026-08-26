@@ -83,6 +83,14 @@ func versionMatchesRange(version, versionRange string) rangeMatch {
 // dotted run in the prefix, so `tool-2.0-v0.5.0` correctly yields `0.5.0`.
 var placeableTag = regexp.MustCompile(`^(?:v?|.+-v)([0-9]+(?:\.[0-9]+)+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$`)
 
+// dottedVersionCore matches a bare dotted numeric version, used only to COUNT
+// how many appear in a tag. The structural anchor decides WHERE the version is;
+// this count rejects a tag that carries a SECOND dotted version anywhere — in
+// the prefix, or inside a prerelease/build suffix — because which one is the
+// release then cannot be told (`9.9.9-v0.1.0`, `0.1.0+build-v9.9.9`,
+// `tool-2.0-v0.5.0`). Together they place only an unambiguous single version.
+var dottedVersionCore = regexp.MustCompile(`[0-9]+(?:\.[0-9]+)+`)
+
 // comparableVersion isolates the version core of a release tag so the vuln check
 // can compare it against advisory versions, reporting whether the tag names a
 // version at a position this build can trust.
@@ -98,6 +106,12 @@ var placeableTag = regexp.MustCompile(`^(?:v?|.+-v)([0-9]+(?:\.[0-9]+)+(?:-[0-9A
 func comparableVersion(tag string) (string, bool) {
 	match := placeableTag.FindStringSubmatch(tag)
 	if match == nil {
+		return "", false
+	}
+	// The anchor placed one version; refuse if a second dotted version lives
+	// anywhere else in the tag, so an ambiguous `9.9.9-v0.1.0` or
+	// `0.1.0+build-v9.9.9` cannot slip a prefix/suffix version past the anchor.
+	if len(dottedVersionCore.FindAllString(tag, -1)) != 1 {
 		return "", false
 	}
 	return match[1], true

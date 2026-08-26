@@ -262,6 +262,13 @@ func TestVulnUnplaceableVersionAlwaysFailsClosed(t *testing.T) {
 		// Trailing platform version breaks the structural anchor.
 		{"trailing platform version, unreadable + patched", "tool-v0.5.0_linux-6.8", advisoryEntry{"~>1.2.0", "1.0.0"}},
 		{"trailing platform version, readable upper-bound", "tool-v0.5.0_linux-6.8", advisoryEntry{"<1.0.0", ""}},
+		// Round-4 residual class: a second dotted version in the prefix or a
+		// suffix must not be placed past the anchor. `9.9.9-v0.1.0` — the real
+		// pre-1.0.0 release `0.1.0` must not read as the prefix `9.9.9`;
+		// `0.1.0+build-v9.9.9` — build metadata `-v9.9.9` must not read as 9.9.9.
+		{"numeric prefix then -v release", "9.9.9-v0.1.0", advisoryEntry{"<1.0.0", ""}},
+		{"build metadata containing -v", "0.1.0+build-v9.9.9", advisoryEntry{"<1.0.0", ""}},
+		{"version-shaped prefix name", "2.0.0-v0.5.0", advisoryEntry{"<1.0.0", ""}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			body := advisoryBodyEntries("GHSA-unplaceable", "high", testCase.entry)
@@ -276,16 +283,16 @@ func TestVulnUnplaceableVersionAlwaysFailsClosed(t *testing.T) {
 	}
 }
 
-// The `-v` separator places the real release even when the prefix carries its
-// own dotted version: `tool-2.0-v0.5.0` is the release `0.5.0` of a tool named
-// `tool-2.0`, not `2.0`. Against an unreadable range with patched `1.0.0`, the
-// pre-patch `0.5.0` is affected (BLOCK) — the prefix `2.0` must not be placed
-// (which, being ≥ 1.0.0, would have excluded it and failed open).
-func TestVulnDashVSeparatorPlacesTheReleaseNotThePrefixVersion(t *testing.T) {
+// The `-v` separator places the release even when the name carries a non-dotted
+// digit: `tool2-v0.5.0` is the release `0.5.0` of a tool named `tool2`. Against
+// an unreadable range with patched `1.0.0`, the pre-patch `0.5.0` is affected
+// (BLOCK) — the `2` of the name must not be placed, and the version must be read
+// (not left ambiguous).
+func TestVulnDashVSeparatorPlacesTheRelease(t *testing.T) {
 	body := advisoryBodyEntries("GHSA-dashv", "high", advisoryEntry{"0.2.0 <= 0.9.0", "1.0.0"})
 	newFakeGitHub(t, routes(advisoriesFeed(body)))
 
-	result := vuln(vulnSpecVersion("tool-2.0-v0.5.0"))
+	result := vuln(vulnSpecVersion("tool2-v0.5.0"))
 	if result.Verdict != BLOCK || !hasCode(result, "known_advisory_high_severity") {
 		t.Fatalf("verdict %s with reasons %v, want a high-severity BLOCK for the pre-patch 0.5.0 release", result.Verdict, codes(result))
 	}

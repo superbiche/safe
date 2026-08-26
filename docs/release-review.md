@@ -833,16 +833,18 @@ still cannot claim a behavior nothing checks.
 
     Two refinements the bash lane never had (both `vuln`): the subject version
     is the GitHub *tag* — the `release` check looks it up as one — so before
-    comparing it against advisory versions it is reduced to the version at a
-    STRUCTURAL position, the whole tag as `v?VERSION` or the version after a `-v`
-    separator (`rust-v0.149.1` → `0.149.1`, `tool2-v0.5.0` → `0.5.0`,
-    `tool-2.0-v0.5.0` → `0.5.0`). A tag whose version is not at such a position —
-    a release with no dotted version (`platform-6.8-v0`), a trailing platform tag
-    (`tool-v0.5.0_linux-6.8`), a name glued to a version with no `-v`
-    (`go1.21.0`) — is unplaceable and left ambiguous rather than placing a
-    version lifted from the prefix. An unplaceable version is never fed to the
-    version comparison at all, so it can never collate the wrong way and fail
-    open. And when a range is
+    comparing it against advisory versions it is reduced to a version only when
+    the tag names ONE unambiguously. Two conditions both hold: the version sits
+    at a STRUCTURAL position (the whole tag as `v?VERSION`, or the version after a
+    `-v` separator — `rust-v0.149.1` → `0.149.1`, `tool2-v0.5.0` → `0.5.0`), AND
+    the tag contains exactly one dotted version. Anything else is unplaceable and
+    left ambiguous rather than guessing: a release with no dotted version
+    (`platform-6.8-v0`), a name glued to a version with no `-v` (`go1.21.0`), or a
+    SECOND dotted version anywhere that makes placement ambiguous — in the prefix
+    (`tool-2.0-v0.5.0`, `9.9.9-v0.1.0`) or a suffix (`0.1.0+build-v9.9.9`,
+    `tool-v0.5.0_linux-6.8`). An unplaceable version is never fed to the version
+    comparison at all, so it can never collate the wrong way and fail open. And
+    when a range is
     unreadable, the entry's `patched_versions` is consulted as a second signal:
     a single, parseable fix version decides — a candidate at or above it is not
     affected, below it is — so an advisory whose *only* defect is an unparseable
