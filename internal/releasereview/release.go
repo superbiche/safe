@@ -198,9 +198,11 @@ func reviewReleaseHistory(result *CheckResult, client *githubClient, repo, versi
 	switch {
 	case previousTag != "":
 		if capped {
-			// Everything this check reads the history for was resolved before
-			// the cap; the run is recorded so a capped listing is never silent,
-			// but it decides nothing.
+			// The predecessor — the one fact this branch needs complete — was
+			// resolved before the cap. The same-day count over the truncated tail
+			// is necessarily incomplete, which is exactly why the capped run is
+			// recorded rather than passed silently (the producer keeps this at
+			// WARN); same_day_churn stays a best-effort positive detector.
 			result.add(GO, "release_history_capped",
 				fmt.Sprintf("the release history was longer than the %d pages this check reads; the previous release was resolved before the cap, so nothing was decided on the truncated part", releaseHistoryMaxPages),
 				map[string]string{"pages": strconv.Itoa(releaseHistoryMaxPages), "releases_read": strconv.Itoa(len(history))})

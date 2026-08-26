@@ -587,16 +587,17 @@ func TestReleaseHistoryPageCapIsReported(t *testing.T) {
 
 // The history listing on a repository like openai/codex is over a thousand
 // releases whose bodies are hundreds of KB each — it can neither fit a page under
-// the body cap nor be walked to its end inside the page cap. Once the predecessor
-// is resolved and the walk has read past the release's publication day, it stops,
-// even though the server keeps offering more pages. A stopped walk is a satisfied
-// read, not a truncated one, so no cap is reported.
+// the body cap nor be walked to its end inside the page budget. Once the
+// predecessor is resolved and the walk has read past the release's publication
+// day, it stops, even though the server keeps offering more pages. A stopped walk
+// is a caller decision, not a page-cap truncation, so no cap is reported (the
+// same-day count stays best-effort; only the predecessor is a complete fact).
 func TestReleaseHistoryStopsEarlyOnceResolved(t *testing.T) {
 	bodies := cleanRelease()
 	bodies[releasePath] = releaseBody("2026-06-01T20:00:00Z", false, false, testAsset)
 	// The first page carries the release and its predecessor, both created and
-	// published well before the publication day, so the same-day window is
-	// covered and the predecessor is known.
+	// published well before the publication day, so the walk reads past the
+	// same-day window and the predecessor is known.
 	firstPage := releasesBody(
 		releaseEntryC(testVersion, "2026-06-01T20:00:00Z", "2026-06-01T20:00:00Z", false, false),
 		releaseEntryC("v1.2.2", "2026-05-01T10:00:00Z", "2026-05-01T10:00:00Z", false, false),

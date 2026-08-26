@@ -558,12 +558,16 @@ make unaffordable. A capped walk reports `release_history_capped` for the same
 reason, so a truncated count stays visible rather than reading as a pass.
 
 `release_history_capped` and `release_history_truncated` are the same event told
-apart by whether it mattered. A cap that stopped a walk after everything needed
-was already resolved changed no verdict and says so at `GO`; a cap that stopped
-it first is this review failing to run, and reporting *that* as
+apart by whether the *predecessor* was resolved before the cap. A cap that
+stopped a walk after the predecessor was resolved changed no verdict about the
+comparison and says so at `GO` — though the same-day count over the truncated
+tail stays best-effort, which is why the capped note is surfaced rather than
+passed silently; a cap that stopped the walk before the predecessor was resolved
+is this review failing to run, and reporting *that* as
 `previous_release_unresolved` would blame the repository for the reviewer's own
 bound — so the BLOCK is suppressed when the ERROR fires. An early stop is neither:
-the walk read everything it needed, so no cap is reported at all.
+the predecessor was resolved and the walk read past the publication day, so it is
+a caller decision rather than a page-budget truncation, and no cap is reported.
 
 ### `vuln`
 
@@ -850,10 +854,12 @@ still cannot claim a behavior nothing checks.
 11. **Paginated listings are followed, and the cap is reported.** The bash lanes
     read only the first page of `per_page=100`, so on a repository with a long
     history the previous tag and the same-day count were computed from a
-    truncated view — silently. Here the `Link: rel="next"` chain is followed up
-    to 10 pages, and hitting that bound is always reported: at `GO` for a
-    release history whose answer was already resolved, at `ERROR` when it was
-    not, and at `ERROR` for an advisory feed, which has no early answer.
+    truncated view — silently. Here the `Link: rel="next"` chain is followed on a
+    per-caller page budget — the release history reads small pages (to fit the
+    body cap) up to a larger budget of its own, the advisory feed up to 10 pages —
+    and hitting that bound is always reported: at `GO` for a release history whose
+    predecessor was already resolved, at `ERROR` when it was not, and at `ERROR`
+    for an advisory feed, which has no early answer.
 12. **An advisory naming no readable version range is ambiguous, not absent**
     (`vuln`). The bash lane dropped null and empty `vulnerable_version_range`
     entries before matching, so an advisory whose every entry carried one

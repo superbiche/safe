@@ -221,13 +221,16 @@ func effectivePort(u *neturl.URL) string {
 // a review of a very long history bounded, and capped is returned so the caller
 // can say so rather than quietly deciding on partial data.
 //
-// collect returns stop=true when it has already read everything it needs, which
-// ends the walk without reading the rest of the listing. That is a satisfied
-// read, not a truncated one — capped stays false. A repository like openai/codex
-// publishes over a thousand releases whose bodies are hundreds of KB each; a
-// listing that had to be read to its end could neither fit a page under the body
-// cap nor finish inside the page cap, so a caller that can decide from the newest
-// entries alone says so here instead of walking the whole history.
+// collect returns stop=true when it has read as far back as it needs, which ends
+// the walk without reading the rest of the listing. That is a caller decision,
+// not a page-cap truncation, so capped stays false — but it is not a claim that
+// the whole listing was seen: what a stop actually guarantees is the caller's to
+// define (for the release history, the predecessor is resolved; the same-day
+// count over the unread tail stays best-effort — see historyWalkSatisfied). A
+// repository like openai/codex publishes over a thousand releases whose bodies
+// are hundreds of KB each; a listing read to its end could neither fit a page
+// under the body cap nor finish inside the page budget, so a caller that can act
+// on the newest entries stops here instead of walking the whole history.
 func (c *githubClient) getPaged(path string, maxPages int, collect func(page json.RawMessage) (stop bool, err *githubError)) (capped bool, err *githubError) {
 	next := path
 	for page := 0; page < maxPages; page++ {
