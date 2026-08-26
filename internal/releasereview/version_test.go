@@ -404,7 +404,17 @@ func TestComparableVersion(t *testing.T) {
 		{"1.2.3", "1.2.3"},
 		{"0.1.0", "0.1.0"},
 		{"release-2.0.0-rc1", "2.0.0-rc1"},
-		{"nightly", "nightly"},
+		// A digit inside the project name must not open the version: the core is
+		// the trailing version, not the `2` of the name.
+		{"tool2-v0.5.0", "0.5.0"},
+		{"tool2-0.5.0", "0.5.0"},
+		{"v2-v0.5.0", "0.5.0"},
+		// Unplaceable — fail closed rather than guess: a bare integer with no
+		// dotted version, a name glued to a version with no separator, and a
+		// non-version tag all yield "".
+		{"5abc", ""},
+		{"go1.21.0", ""},
+		{"nightly", ""},
 		{"", ""},
 	} {
 		if got := comparableVersion(testCase.tag); got != testCase.want {

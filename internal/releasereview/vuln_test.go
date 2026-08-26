@@ -220,6 +220,38 @@ func TestVulnDigitlessVersionIsNotResolvedByPatched(t *testing.T) {
 	}
 }
 
+// F1 regression: a digit inside the tag's project name must not be read as the
+// version boundary. `tool2-v0.5.0` reduces to `0.5.0`, not `2-v0.5.0`; against an
+// unreadable range with patched `1.0.0`, the genuinely pre-patch 0.5.0 is
+// affected (BLOCK) — it must not slip to GO because a mis-extracted `2-v0.5.0`
+// string-collates above the fix.
+func TestVulnTagWithDigitInPrefixDoesNotFailOpen(t *testing.T) {
+	body := advisoryBodyEntries("GHSA-prefixdigit", "high", advisoryEntry{"0.2.0 <= 0.9.0", "1.0.0"})
+	newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+	result := vuln(vulnSpecVersion("tool2-v0.5.0"))
+	if result.Verdict != BLOCK {
+		t.Fatalf("verdict %s with reasons %v, want BLOCK for the pre-patch 0.5.0 release", result.Verdict, codes(result))
+	}
+	if hasCode(result, "known_advisory") && !hasCode(result, "known_advisory_high_severity") {
+		t.Fatalf("reasons %v: expected the high-severity advisory to fire", codes(result))
+	}
+}
+
+// The digitless fail-open guard on the READABLE-range path too: a subject
+// version with no placeable core must not string-collate above a range bound and
+// read as excluded. `nightly` against a high `<v2.0.0` advisory is a BLOCK, not a
+// GO.
+func TestVulnDigitlessVersionDoesNotEscapeAReadableRange(t *testing.T) {
+	body := advisoryBodyEntries("GHSA-digitless-range", "high", advisoryEntry{"<v2.0.0", ""})
+	newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+	result := vuln(vulnSpecVersion("nightly"))
+	if result.Verdict != BLOCK {
+		t.Fatalf("verdict %s with reasons %v, want BLOCK — an unplaceable version must fail closed", result.Verdict, codes(result))
+	}
+}
+
 // A comma-separated patched_versions names several fixed branches; which one a
 // candidate belongs to is the package-identity question this build does not yet
 // answer, so it is left ambiguous rather than guessed.
