@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **release-review `release`: read the release history in small early-stopping
+  pages, and accept an unsigned commit when the spec allows it** (1.46.0). Two
+  live-usage fixes surfaced reviewing openai/codex. (1) The release-history
+  listing was read at `per_page=100` and walked to the page cap regardless of
+  need. codex publishes over a thousand releases whose bodies run to hundreds of
+  KB, so one page was ~27 MB — past the in-memory body cap — and the review
+  failed to run (`metadata_unavailable`). It now reads small pages and stops as
+  soon as the predecessor is resolved and it has read past the release's
+  publication day (a one-day margin covers the `created_at`-vs-`published_at`
+  ordering); an early stop reports no cap. A recent release resolves from the
+  first page. (2) A new `checks.release.allow_unsigned_commit` accepts a tagged
+  commit GitHub reports as `unsigned` as a visible `commit_unsigned_allowed` GO
+  note instead of a `commit_unverified` BLOCK — for a subject whose upstream
+  never signs its tags and whose sigstore workflow attestation covers the same
+  risk. It narrows to the plain `unsigned` reason; any other unverified state
+  (`invalid`, a bad author email, an unknown key) still BLOCKs.
+
 - **release-review `vuln`: resolve an unreadable advisory range by its
   `patched_versions`, and compare the subject tag by its version core**
   (1.45.0). An advisory whose `vulnerable_version_range` this check cannot parse

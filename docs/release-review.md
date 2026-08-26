@@ -290,6 +290,13 @@ it, which is what keeps the schema example above valid.
   - `asset` — required. The name the GitHub release must carry. It has no
     default: falling back to the first artifact's name would let a spec that
     names the wrong file pass as if it had named the right one.
+  - `allow_unsigned_commit` — optional, default `false`. When `true`, a tagged
+    commit GitHub reports as `unsigned` is recorded as a `commit_unsigned_allowed`
+    GO note instead of a `commit_unverified` BLOCK. It is for a subject whose
+    upstream never signs its release tags and whose stronger control — the
+    sigstore workflow attestation that binds the artifact to the tag — covers the
+    same risk. It narrows to the plain `unsigned` reason only: any other
+    unverified state (`invalid`, a bad author email, an unknown key) still BLOCKs.
 - `checks.vuln` — when enabled, needs nothing beyond `subject`.
 - `checks.tuf` — when enabled:
   - `mirror` — required. A local directory path, or a `file://` URL, whose
@@ -512,6 +519,7 @@ is a GitHub it could not read, which is `ERROR` — see
 | `tag_unresolved` | BLOCK | `version` | the git tag is absent, or does not resolve to one commit |
 | `commit_missing` | BLOCK | `commit` | a tag names a commit GitHub does not serve |
 | `commit_unverified` | BLOCK | `commit`, `reason` | GitHub does not report the tagged commit as signed |
+| `commit_unsigned_allowed` | GO | `commit`, `reason` | the tagged commit is unsigned and `checks.release.allow_unsigned_commit` accepts that for this subject; recorded so the unsigned state stays visible in the report |
 | `release_history_capped` | GO | `pages`, `releases_read` | the listing was longer than the page cap, but the predecessor was resolved before it — recorded so a capped walk is never silent |
 | `release_history_truncated` | ERROR | `pages`, `releases_read` | the page cap was reached before the release was found, so its predecessor could not be resolved |
 | `high_risk_pattern_invalid` | ERROR | `error` | `SAFE_AUDIT_GITHUB_HIGH_RISK_PATH_REGEX` does not compile, so no path was classified |
@@ -525,12 +533,27 @@ is compared when no predecessor was resolved, an annotated tag is dereferenced
 only when the tag object is annotated rather than lightweight, and no commit is
 asked about when the tag resolved to none.
 
+The release listing is read in small pages and the walk stops as soon as it has
+what it needs. GitHub returns each release's full body in this listing, so a
+repository with a long history of note-heavy releases — openai/codex ships over a
+thousand releases whose bodies run to hundreds of KB — produces pages that at
+`per_page=100` are tens of MB, past the in-memory body cap, and a history far
+longer than the page cap could walk. The walk therefore requests a small page and
+stops once the predecessor is resolved *and* it has read past the release's
+publication day (by a one-day margin, because the listing is ordered by
+`created_at` while same-day churn is a `published_at` fact, so a same-day sibling
+can sort a little deeper). A release created more than that margin before it was
+published *and* published on the review day is the one same-day sibling this can
+miss — a delayed manual publish, not the same-day re-cut the check defends
+against, which is created and published together at the top of the listing.
+
 `release_history_capped` and `release_history_truncated` are the same event told
 apart by whether it mattered. A cap that stopped a walk after everything needed
 was already resolved changed no verdict and says so at `GO`; a cap that stopped
 it first is this review failing to run, and reporting *that* as
 `previous_release_unresolved` would blame the repository for the reviewer's own
-bound — so the BLOCK is suppressed when the ERROR fires.
+bound — so the BLOCK is suppressed when the ERROR fires. An early stop is neither:
+the walk read everything it needed, so no cap is reported at all.
 
 ### `vuln`
 

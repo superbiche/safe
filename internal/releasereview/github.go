@@ -220,7 +220,15 @@ func effectivePort(u *neturl.URL) string {
 // a truncated view. Following the Link header fixes that; the cap is what keeps
 // a review of a very long history bounded, and capped is returned so the caller
 // can say so rather than quietly deciding on partial data.
-func (c *githubClient) getPaged(path string, collect func(page json.RawMessage) *githubError) (capped bool, err *githubError) {
+//
+// collect returns stop=true when it has already read everything it needs, which
+// ends the walk without reading the rest of the listing. That is a satisfied
+// read, not a truncated one — capped stays false. A repository like openai/codex
+// publishes over a thousand releases whose bodies are hundreds of KB each; a
+// listing that had to be read to its end could neither fit a page under the body
+// cap nor finish inside the page cap, so a caller that can decide from the newest
+// entries alone says so here instead of walking the whole history.
+func (c *githubClient) getPaged(path string, collect func(page json.RawMessage) (stop bool, err *githubError)) (capped bool, err *githubError) {
 	next := path
 	for page := 0; page < githubMaxPages; page++ {
 		var raw json.RawMessage
@@ -228,8 +236,12 @@ func (c *githubClient) getPaged(path string, collect func(page json.RawMessage) 
 		if requestErr != nil {
 			return false, requestErr
 		}
-		if collectErr := collect(raw); collectErr != nil {
+		stop, collectErr := collect(raw)
+		if collectErr != nil {
 			return false, collectErr
+		}
+		if stop {
+			return false, nil
 		}
 		if following == "" {
 			return false, nil
