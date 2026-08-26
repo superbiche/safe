@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **composer global scan enters selected projects with physical `cd`**
+  (1.44.0). The global composer scan lane
+  (`safe_gate_composer_scan_targets`) entered each selected project with a
+  bare `cd`, which processes `..` lexically: a target reaching through a
+  symlinked `..` collapsed to a different directory than Composer's PHP
+  `chdir()` resolves, so the audit could scan a clean directory while
+  Composer installs into the real one. It now enters with physical `cd -P --`
+  (`2>/dev/null`, so an unenterable target keeps its single BLOCKED stderr
+  line), matching Composer's `chdir()` exactly as the non-global helpers
+  already do (1.25.0). Same defect class as the #94 non-global fix; this was
+  the parked global sibling. An ordinary route (whose logical and physical
+  resolution are identical) is unaffected; only a route reaching through a
+  symlinked `..` changes which directory is audited — now the one Composer
+  actually enters.
+
 - **release-review `tuf`: physical containment of mirror reads against
   symlinked entries** (1.43.0). The `tuf` check already refused a `..`-bearing
   or absolute TUF target name and a non-hex trusted-metadata digest, but those
