@@ -21,15 +21,26 @@ const (
 	// releases, which is all reviewReleaseHistory needs, and the early stop in
 	// getPaged means a recent release is usually resolved from the first page.
 	releaseHistoryPageSize = 10
+	// releaseHistoryMaxPages bounds the history walk on its own budget rather than
+	// the shared githubMaxPages, so shrinking the page size did not also shrink the
+	// number of releases a walk can reach. At releaseHistoryPageSize this reads up
+	// to ~250 releases — the reach a review of a not-newest release needs — while
+	// staying well inside GitHub's 60/hour anonymous request budget (a recent
+	// release early-stops in one or two requests; only an old-release review pays
+	// the full budget). A review that runs past it reports release_history_*, never
+	// deciding on a silently truncated view.
+	releaseHistoryMaxPages = 25
 	// sameDayLookbehindDays is how far before the release's publication day the
-	// history walk keeps reading before it concludes it has seen every same-day
-	// sibling. The listing is ordered by created_at, not published_at, so a
-	// release published on the review day but created a little earlier sorts below
-	// the newest entries; the walk reads one day past to catch it. A stable
-	// release created more than this many days before it was published AND
-	// published on the review day is the residual this does not cover — a delayed
-	// manual publish, not the same-day re-cut the check defends against (a re-cut
-	// is created and published together, at the top of the listing).
+	// same-day-churn walk keeps reading. It bounds the COMMON case, not a proof:
+	// GitHub orders this listing by created_at, which is the tagged commit's date,
+	// so a release published on the review day but tagging an older commit sorts
+	// deep and can be missed. same_day_churn is therefore a best-effort positive
+	// detector — it BLOCKs on the same-day siblings it sees, and a sibling that
+	// sorts past this lookbehind (or past the page budget) is a known limitation,
+	// not a clean bill of health. The residual is attacker-reachable (a re-cut from
+	// an old commit) and is carried as a known risk, not closed here; closing it
+	// would require reading the whole listing, which repositories like codex make
+	// unaffordable.
 	sameDayLookbehindDays = 1
 	// The bash lane's default, copied verbatim: workflow files, the scripts a
 	// release is built and signed by, and the container and build entry points.
@@ -160,7 +171,7 @@ func carriesAsset(release githubRelease, asset string) bool {
 // before this one, which is what the comparison below is taken against.
 func reviewReleaseHistory(result *CheckResult, client *githubClient, repo, version, publishedAt string) string {
 	var history []githubRelease
-	capped, err := client.getPaged(fmt.Sprintf("/repos/%s/releases?per_page=%d", repo, releaseHistoryPageSize), func(page json.RawMessage) (bool, *githubError) {
+	capped, err := client.getPaged(fmt.Sprintf("/repos/%s/releases?per_page=%d", repo, releaseHistoryPageSize), releaseHistoryMaxPages, func(page json.RawMessage) (bool, *githubError) {
 		var releases []githubRelease
 		if decodeErr := json.Unmarshal(page, &releases); decodeErr != nil {
 			return false, &githubError{message: fmt.Sprintf("GitHub's release listing is not an array of releases: %v", decodeErr)}
@@ -191,15 +202,15 @@ func reviewReleaseHistory(result *CheckResult, client *githubClient, repo, versi
 			// the cap; the run is recorded so a capped listing is never silent,
 			// but it decides nothing.
 			result.add(GO, "release_history_capped",
-				fmt.Sprintf("the release history was longer than the %d pages this check reads; the previous release was resolved before the cap, so nothing was decided on the truncated part", githubMaxPages),
-				map[string]string{"pages": strconv.Itoa(githubMaxPages), "releases_read": strconv.Itoa(len(history))})
+				fmt.Sprintf("the release history was longer than the %d pages this check reads; the previous release was resolved before the cap, so nothing was decided on the truncated part", releaseHistoryMaxPages),
+				map[string]string{"pages": strconv.Itoa(releaseHistoryMaxPages), "releases_read": strconv.Itoa(len(history))})
 		}
 	case capped:
 		// The cap, not the repository, is why there is no answer. That is this
 		// review failing to run, not evidence about the release.
 		result.add(ERROR, "release_history_truncated",
-			fmt.Sprintf("the release history was longer than the %d pages this check reads and %s was not reached, so its predecessor could not be resolved", githubMaxPages, version),
-			map[string]string{"pages": strconv.Itoa(githubMaxPages), "releases_read": strconv.Itoa(len(history))})
+			fmt.Sprintf("the release history was longer than the %d pages this check reads and %s was not reached, so its predecessor could not be resolved", releaseHistoryMaxPages, version),
+			map[string]string{"pages": strconv.Itoa(releaseHistoryMaxPages), "releases_read": strconv.Itoa(len(history))})
 	default:
 		result.add(BLOCK, "previous_release_unresolved",
 			fmt.Sprintf("no release published before %s could be resolved, so there is nothing to compare it against", version),
@@ -242,17 +253,19 @@ func previousReleaseTag(history []githubRelease, version string) string {
 }
 
 // historyWalkSatisfied reports whether the release listing has been read far
-// enough to decide both of the things reviewReleaseHistory reads it for: the
-// predecessor tag and the same-day sibling count. It is the getPaged early stop.
+// enough to stop the walk: the predecessor is resolved, and the walk has read
+// past the release's publication day. It is the getPaged early stop.
 //
-// The predecessor must be resolved, and the walk must have reached entries old
-// enough that no unread entry can still be a same-day sibling. The listing is
-// created_at desc, so the oldest entry read so far is the last one appended:
-// once its created timestamp is a full lookbehind day before the publication day
-// AND its own publication timestamp is before that day, the walk stops. Until a
-// publication day can be read from the release under review, or until the
-// predecessor is resolved, the walk does not stop early and falls through to the
-// page cap — the honest, conservative default.
+// This is sound for the predecessor, a fixed fact once found. It is NOT a
+// completeness proof for same_day_churn: the listing is ordered by created_at
+// (the tagged commit's date), so a same-day-published release built from an older
+// commit can sort past the window and go unread — see sameDayLookbehindDays.
+// The oldest entry read so far is the last one appended; once its created
+// timestamp is a full lookbehind day before the publication day AND its own
+// publication timestamp is before that day, the walk stops. Until a publication
+// day can be read from the release under review, or until the predecessor is
+// resolved, the walk does not stop early and falls through to the page budget —
+// the conservative default.
 func historyWalkSatisfied(history []githubRelease, version, publishedAt string) bool {
 	if len(history) == 0 || previousReleaseTag(history, version) == "" {
 		return false

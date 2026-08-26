@@ -8,16 +8,20 @@
   listing was read at `per_page=100` and walked to the page cap regardless of
   need. codex publishes over a thousand releases whose bodies run to hundreds of
   KB, so one page was ~27 MB — past the in-memory body cap — and the review
-  failed to run (`metadata_unavailable`). It now reads small pages and stops as
-  soon as the predecessor is resolved and it has read past the release's
-  publication day (a one-day margin covers the `created_at`-vs-`published_at`
-  ordering); an early stop reports no cap. A recent release resolves from the
-  first page. (2) A new `checks.release.allow_unsigned_commit` accepts a tagged
-  commit GitHub reports as `unsigned` as a visible `commit_unsigned_allowed` GO
-  note instead of a `commit_unverified` BLOCK — for a subject whose upstream
-  never signs its tags and whose sigstore workflow attestation covers the same
-  risk. It narrows to the plain `unsigned` reason; any other unverified state
-  (`invalid`, a bad author email, an unknown key) still BLOCKs.
+  failed to run (`metadata_unavailable`). It now reads small pages, against a
+  page budget of its own (~250 releases, so a smaller page did not shrink how far
+  back a review can reach) and stops once the predecessor is resolved and it has
+  read past the release's publication day. A recent release resolves from the
+  first page. `same_day_churn` stays a best-effort positive detector: GitHub
+  orders the listing by the tagged commit's date, so a same-day release built
+  from an older commit can sort deep and go unread — a known limitation, carried
+  as a known risk, not a completeness proof. (2) A new
+  `checks.release.allow_unsigned_commit` accepts a tagged commit GitHub reports as
+  `unsigned` as a visible `commit_unsigned_allowed` GO note instead of a
+  `commit_unverified` BLOCK — for a subject whose upstream never signs its tags
+  and whose sigstore workflow attestation covers the same risk. It narrows to the
+  plain `unsigned` reason; any other unverified state (`invalid`, a bad author
+  email, an unknown key) still BLOCKs.
 
 - **release-review `vuln`: resolve an unreadable advisory range by its
   `patched_versions`, and compare the subject tag by its version core**

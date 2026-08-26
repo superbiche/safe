@@ -228,9 +228,9 @@ func effectivePort(u *neturl.URL) string {
 // listing that had to be read to its end could neither fit a page under the body
 // cap nor finish inside the page cap, so a caller that can decide from the newest
 // entries alone says so here instead of walking the whole history.
-func (c *githubClient) getPaged(path string, collect func(page json.RawMessage) (stop bool, err *githubError)) (capped bool, err *githubError) {
+func (c *githubClient) getPaged(path string, maxPages int, collect func(page json.RawMessage) (stop bool, err *githubError)) (capped bool, err *githubError) {
 	next := path
-	for page := 0; page < githubMaxPages; page++ {
+	for page := 0; page < maxPages; page++ {
 		var raw json.RawMessage
 		following, requestErr := c.get(next, &raw)
 		if requestErr != nil {

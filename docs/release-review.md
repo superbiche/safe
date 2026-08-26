@@ -538,14 +538,24 @@ what it needs. GitHub returns each release's full body in this listing, so a
 repository with a long history of note-heavy releases — openai/codex ships over a
 thousand releases whose bodies run to hundreds of KB — produces pages that at
 `per_page=100` are tens of MB, past the in-memory body cap, and a history far
-longer than the page cap could walk. The walk therefore requests a small page and
-stops once the predecessor is resolved *and* it has read past the release's
-publication day (by a one-day margin, because the listing is ordered by
-`created_at` while same-day churn is a `published_at` fact, so a same-day sibling
-can sort a little deeper). A release created more than that margin before it was
-published *and* published on the review day is the one same-day sibling this can
-miss — a delayed manual publish, not the same-day re-cut the check defends
-against, which is created and published together at the top of the listing.
+longer than a page budget can walk. The walk therefore requests a small page,
+against a page budget of its own so a smaller page did not shrink how far back it
+can reach, and stops once the predecessor is resolved *and* it has read past the
+release's publication day.
+
+That early stop is sound for the predecessor, which is a fixed fact once found.
+It is **not** a completeness proof for `same_day_churn`. GitHub orders this
+listing by `created_at` — the date of the *tagged commit*, not when the release
+was published — so a release published on the review day but built from an older
+commit sorts deep in the listing and can fall outside both the read window and
+the page budget. `same_day_churn` is therefore a best-effort **positive**
+detector: it BLOCKs on the same-day siblings it sees, and a sibling it did not
+read is a known limitation, not a clean bill of health. That residual is
+attacker-reachable — a swapped artifact re-cut from an older commit is exactly
+the deep-sorting shape — and is carried as a known risk rather than closed here;
+closing it would require reading the whole listing, which repositories like codex
+make unaffordable. A capped walk reports `release_history_capped` for the same
+reason, so a truncated count stays visible rather than reading as a pass.
 
 `release_history_capped` and `release_history_truncated` are the same event told
 apart by whether it mattered. A cap that stopped a walk after everything needed

@@ -39,7 +39,7 @@ func vuln(spec Spec) CheckResult {
 	comparable, placeable := comparableVersion(version)
 
 	var advisories []githubAdvisory
-	capped, err := client.getPaged(fmt.Sprintf("/repos/%s/security-advisories?per_page=100", repo), func(page json.RawMessage) (bool, *githubError) {
+	capped, err := client.getPaged(fmt.Sprintf("/repos/%s/security-advisories?per_page=100", repo), githubMaxPages, func(page json.RawMessage) (bool, *githubError) {
 		var batch []githubAdvisory
 		if decodeErr := json.Unmarshal(page, &batch); decodeErr != nil {
 			return false, &githubError{message: fmt.Sprintf("GitHub's advisory listing is not an array of advisories: %v", decodeErr)}

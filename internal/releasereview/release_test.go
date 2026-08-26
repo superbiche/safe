@@ -578,8 +578,8 @@ func TestReleaseHistoryPageCapIsReported(t *testing.T) {
 					pages++
 				}
 			}
-			if pages != githubMaxPages {
-				t.Fatalf("the listing was fetched %d times, want the %d-page cap", pages, githubMaxPages)
+			if pages != releaseHistoryMaxPages {
+				t.Fatalf("the listing was fetched %d times, want the %d-page cap", pages, releaseHistoryMaxPages)
 			}
 		})
 	}
@@ -683,6 +683,50 @@ func TestReleaseHistoryCountsSameDaySiblingOnALaterPage(t *testing.T) {
 	}
 	if pages != 2 {
 		t.Fatalf("the listing was fetched %d times, want 2 — the walk stopped before the same-day window closed", pages)
+	}
+}
+
+// The release-history page budget is decoupled from the shared page cap, so
+// shrinking the page size to fit the body cap did not shrink how far back a
+// review can reach. A not-newest release whose predecessor sits past the shared
+// ten-page cap still resolves, where a coupled cap would have truncated.
+func TestReleaseHistoryReachIsDecoupledFromPageSize(t *testing.T) {
+	if releaseHistoryMaxPages <= githubMaxPages {
+		t.Fatalf("release-history budget %d must exceed the shared cap %d to restore reach", releaseHistoryMaxPages, githubMaxPages)
+	}
+	bodies := cleanRelease()
+	// The release under review sits on page 15 — past the shared 10-page cap,
+	// inside the release-history budget. Earlier pages are newer releases.
+	targetPage := githubMaxPages + 5
+	var serverURL string
+	page := 0
+	fake := newFakeGitHub(t, func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == releasesPath {
+			page++
+			if page < targetPage {
+				writer.Header().Set("Link", fmt.Sprintf(`<%s%s?per_page=%d&page=%d>; rel="next"`,
+					serverURL, releasesPath, releaseHistoryPageSize, page+1))
+				fmt.Fprint(writer, releasesBody(
+					releaseEntry(fmt.Sprintf("v9.%d.0", page), daysAgo(page), false, false),
+				))
+				return
+			}
+			fmt.Fprint(writer, releasesBody(
+				releaseEntry(testVersion, daysAgo(30), false, false),
+				releaseEntry("v1.2.2", daysAgo(60), false, false),
+			))
+			return
+		}
+		routes(bodies)(writer, request)
+	})
+	serverURL = fake.server.URL
+
+	result := release(releaseSpec())
+	if hasCode(result, "release_history_truncated") || hasCode(result, "previous_release_unresolved") {
+		t.Fatalf("a predecessor within the budget was not resolved: %v", codes(result))
+	}
+	if result.Verdict != GO || len(result.Reasons) != 0 {
+		t.Fatalf("verdict %s with reasons %v, want a clean GO", result.Verdict, codes(result))
 	}
 }
 
