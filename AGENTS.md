@@ -31,6 +31,17 @@ Rationale (24h data, 2026-08-03): multi-round chains produced ~21%
 fix-caused findings while every operator-blocking defect arrived from live
 use, not review rounds.
 
+Chain mechanics (added 2026-08-27, liaison D0428; the open verb is law since
+2026-08-21): every review chain is OPENED through the engine BEFORE the
+review turn — `liaison review open <slug> --stance coordinator-hands
+--coordinator-actor cc --coordinator-model <id> --coordinator-effort <tier>
+--lane routine|deep --criteria "<verbatim>"` — and completed at close with
+`liaison review record <chain-dir> --verify-ref <evidence> --review-input
+assembled`. A chain closed without its engine-minted record fails liaison's
+`review.hygiene` gate permanently (a record cannot be engine-minted after
+the fact). The 2026-08-21→27 unopened safe chains were amnestied ONCE by
+name (D0428); no grace after.
+
 ## Contract and docs single-source
 
 `docs/contract/agent-contract.json` is the only source for the agent contract. Rendered surfaces (`docs/agents.md` generated blocks, `safe explain`) regenerate via `scripts/render-contract.sh`; never hand-edit generated blocks. `tests/contract/drift.sh` enforces this.
