@@ -305,6 +305,68 @@ func TestDecodeAcceptsNestedDuplicateFreeSpec(t *testing.T) {
 	}
 }
 
+// The vuln check's package scope has three shapes, and the nil-vs-empty
+// distinction is load-bearing: absent leaves the check package-blind, while an
+// empty array turns scoping on with zero declared identities (the honest "no
+// advisory package here tracks this artifact"). A non-empty array is scoping
+// with identities.
+func TestDecodeVulnPackageScopeShapes(t *testing.T) {
+	const head = `{"spec_version":2,"subject":{"repo":"o/r","version":"v1"},` +
+		`"artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],"checks":{"vuln":`
+
+	for _, testCase := range []struct {
+		name       string
+		vuln       string
+		wantScoped bool
+		wantLen    int
+	}{
+		{"absent packages key is blind", `{"enabled":true}`, false, 0},
+		{"empty packages array is an active empty scope", `{"enabled":true,"packages":[]}`, true, 0},
+		{"populated packages array is an active scope", `{"enabled":true,"packages":[{"ecosystem":"npm","name":"@openai/codex"}]}`, true, 1},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			spec, err := Decode(strings.NewReader(head + testCase.vuln + `}}`))
+			if err != nil {
+				t.Fatalf("unexpected refusal: %v", err)
+			}
+			if got := spec.Checks.Vuln.scoped(); got != testCase.wantScoped {
+				t.Fatalf("scoped() = %v, want %v", got, testCase.wantScoped)
+			}
+			if got := len(spec.Checks.Vuln.Packages); got != testCase.wantLen {
+				t.Fatalf("len(Packages) = %d, want %d", got, testCase.wantLen)
+			}
+		})
+	}
+}
+
+// A declared identity that names nothing is a misconfiguration, refused when the
+// check is enabled — distinct from an empty array, which is a valid empty scope.
+func TestDecodeRejectsIncompletePackageIdentity(t *testing.T) {
+	const head = `{"spec_version":2,"subject":{"repo":"o/r","version":"v1"},` +
+		`"artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],"checks":{"vuln":`
+
+	for _, vuln := range []string{
+		`{"enabled":true,"packages":[{"ecosystem":"npm","name":""}]}`,
+		`{"enabled":true,"packages":[{"ecosystem":"","name":"@openai/codex"}]}`,
+		`{"enabled":true,"packages":[{"ecosystem":"  ","name":"x"}]}`,
+	} {
+		if _, err := Decode(strings.NewReader(head + vuln + `}}`)); err == nil {
+			t.Fatalf("accepted an incomplete package identity: %s", vuln)
+		}
+	}
+}
+
+// A disabled vuln check is inert: its packages block is not validated, matching
+// the schema's "a disabled block is a placeholder" rule.
+func TestDecodeDoesNotValidateDisabledVulnPackages(t *testing.T) {
+	spec := `{"spec_version":2,"subject":{"repo":"o/r","version":"v1"},` +
+		`"artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],` +
+		`"checks":{"checksum":{"enabled":true},"vuln":{"enabled":false,"packages":[{"ecosystem":"","name":""}]}}}`
+	if _, err := Decode(strings.NewReader(spec)); err != nil {
+		t.Fatalf("a disabled vuln check's packages were validated: %v", err)
+	}
+}
+
 // withImplementedChecks narrows what this build claims to implement for one
 // test.
 //
@@ -433,7 +495,7 @@ func TestExplicitAssetNameWins(t *testing.T) {
 
 func TestEnabledChecksKeepReportOrder(t *testing.T) {
 	spec := Spec{Checks: &Checks{
-		Vuln:      &CheckConfig{Enabled: true, Advisory: true},
+		Vuln:      &VulnCheck{CheckConfig: CheckConfig{Enabled: true, Advisory: true}},
 		Checksum:  &CheckConfig{Enabled: true},
 		Signature: &CheckConfig{Enabled: true},
 		Exec:      &ExecCheck{CheckConfig: CheckConfig{Enabled: true}},

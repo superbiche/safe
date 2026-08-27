@@ -131,7 +131,7 @@ type Checks struct {
 	Checksum  *CheckConfig  `json:"checksum"`
 	Signature *CheckConfig  `json:"signature"`
 	Release   *ReleaseCheck `json:"release"`
-	Vuln      *CheckConfig  `json:"vuln"`
+	Vuln      *VulnCheck    `json:"vuln"`
 	TUF       *TUFCheck     `json:"tuf"`
 	Exec      *ExecCheck    `json:"exec"`
 }
@@ -157,6 +157,45 @@ type ReleaseCheck struct {
 	// narrows to the plain "unsigned" reason only; any other unverified state
 	// still BLOCKs.
 	AllowUnsignedCommit bool `json:"allow_unsigned_commit"`
+}
+
+// VulnCheck configures the advisory check. Packages declares which
+// advisory-package identities describe the subject artifact, so an advisory
+// GitHub publishes against an adjacent package in the same repository (the npm
+// wrapper or a VS Code extension beside a Rust binary) is ruled not-applicable
+// instead of matched cross-artifact. GitHub's ecosystem field is free text
+// ("vs code"), not an enum, so the identity is declared, never inferred.
+type VulnCheck struct {
+	CheckConfig
+	Packages []AdvisoryPackage `json:"packages"`
+}
+
+// AdvisoryPackage is one advisory-package identity: an ecosystem and a package
+// name, both as GitHub reports them in an advisory's `vulnerabilities[].package`.
+type AdvisoryPackage struct {
+	Ecosystem string `json:"ecosystem"`
+	Name      string `json:"name"`
+}
+
+// scoped reports whether the vuln check restricts advisories to declared
+// package identities. Presence of the packages key — even as an empty array —
+// turns scoping on: an empty scope is the honest assertion "no advisory package
+// in this repository tracks the subject artifact" (a Rust binary in a repo that
+// publishes only npm/extension advisories). Its ABSENCE is package-blind, the
+// pre-scoping default that matches every advisory. This is the ONE place the
+// nil-vs-empty distinction is read; never re-derive it from len().
+func (v *VulnCheck) scoped() bool { return v.Packages != nil }
+
+// validate rejects a declared identity that names nothing. An empty packages
+// array is a valid empty scope; an entry inside it that omits either half is a
+// misconfiguration, not an empty scope.
+func (v *VulnCheck) validate() error {
+	for i, pkg := range v.Packages {
+		if strings.Trim(pkg.Ecosystem, asciiSpace) == "" || strings.Trim(pkg.Name, asciiSpace) == "" {
+			return fmt.Errorf("checks.vuln.packages[%d]: both ecosystem and name are required", i)
+		}
+	}
+	return nil
 }
 
 // TUFCheck configures the TUF bootstrap check.
@@ -314,6 +353,10 @@ func (s *Spec) validateChecks() error {
 			}
 		case CheckRelease:
 			if err := s.Checks.Release.validate(); err != nil {
+				return err
+			}
+		case CheckVuln:
+			if err := s.Checks.Vuln.validate(); err != nil {
 				return err
 			}
 		case CheckTUF:
@@ -517,7 +560,9 @@ func (s *Spec) checkConfigs() map[string]*CheckConfig {
 	configs := map[string]*CheckConfig{
 		CheckChecksum:  s.Checks.Checksum,
 		CheckSignature: s.Checks.Signature,
-		CheckVuln:      s.Checks.Vuln,
+	}
+	if s.Checks.Vuln != nil {
+		configs[CheckVuln] = &s.Checks.Vuln.CheckConfig
 	}
 	if s.Checks.Release != nil {
 		configs[CheckRelease] = &s.Checks.Release.CheckConfig

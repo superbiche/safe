@@ -12,9 +12,53 @@ type githubAdvisory struct {
 	CVEID           string `json:"cve_id"`
 	Severity        string `json:"severity"`
 	Vulnerabilities []struct {
-		VulnerableVersionRange string `json:"vulnerable_version_range"`
-		PatchedVersions        string `json:"patched_versions"`
+		Package                advisoryPackage `json:"package"`
+		VulnerableVersionRange string          `json:"vulnerable_version_range"`
+		PatchedVersions        string          `json:"patched_versions"`
 	} `json:"vulnerabilities"`
+}
+
+// advisoryPackage is the identity GitHub attaches to one vulnerability entry:
+// which package, in which ecosystem, the range describes. A repository publishes
+// one advisory covering several packages at once (openai/codex's GHSA-w5fx names
+// its npm wrapper AND a VS Code extension), so this is what tells an entry about
+// the Rust binary apart from an entry about the extension beside it.
+type advisoryPackage struct {
+	Ecosystem string `json:"ecosystem"`
+	Name      string `json:"name"`
+}
+
+// advisoryScope decides which advisory entries describe the subject artifact.
+//
+// When inactive (the spec declared no packages) it is package-blind: every entry
+// is in scope, the pre-scoping behaviour that matches an advisory against any
+// artifact in the repository. When active, only entries whose package matches a
+// declared identity are in scope — with one fail-closed exception: an entry that
+// names no package (empty ecosystem or name) cannot be ruled out by identity, so
+// it stays in scope rather than silently dropping. Matching is case-insensitive
+// because the ecosystem is free text ("vs code", "npm") and over-matching fails
+// closed while under-matching fails open.
+type advisoryScope struct {
+	active   bool
+	packages []AdvisoryPackage
+}
+
+func (s advisoryScope) includes(pkg advisoryPackage) bool {
+	if !s.active {
+		return true
+	}
+	ecosystem := strings.Trim(pkg.Ecosystem, asciiSpace)
+	name := strings.Trim(pkg.Name, asciiSpace)
+	if ecosystem == "" || name == "" {
+		return true
+	}
+	for _, want := range s.packages {
+		if strings.EqualFold(ecosystem, strings.Trim(want.Ecosystem, asciiSpace)) &&
+			strings.EqualFold(name, strings.Trim(want.Name, asciiSpace)) {
+			return true
+		}
+	}
+	return false
 }
 
 // vuln matches the release's version against the repository's own published
@@ -37,6 +81,14 @@ func vuln(spec Spec) CheckResult {
 	// never compared, only reported ambiguous.
 	version := spec.Subject.Version
 	comparable, placeable := comparableVersion(version)
+	// The subject's declared package identities, if any. Scoping is active
+	// whenever the spec carried a packages key — an empty scope included, which
+	// is the honest "no advisory package here tracks this artifact" assertion.
+	scope := advisoryScope{}
+	if spec.Checks != nil && spec.Checks.Vuln != nil {
+		scope.active = spec.Checks.Vuln.scoped()
+		scope.packages = spec.Checks.Vuln.Packages
+	}
 
 	var advisories []githubAdvisory
 	capped, err := client.getPaged(fmt.Sprintf("/repos/%s/security-advisories?per_page=100", repo), githubMaxPages, func(page json.RawMessage) (bool, *githubError) {
@@ -74,11 +126,20 @@ func vuln(spec Spec) CheckResult {
 		return result
 	}
 
+	var outOfScope []string
 	for _, advisory := range advisories {
-		matched, ambiguous := matchAdvisory(advisory, comparable, placeable)
+		matched, ambiguous, notApplicable := matchAdvisory(advisory, comparable, placeable, scope)
 		identifier := advisory.GHSAID
 		if identifier == "" {
 			identifier = "an advisory with no GHSA id"
+		}
+
+		if notApplicable {
+			// Every entry named a package outside the subject's declared scope,
+			// so the advisory is about a different artifact in the same repo —
+			// recorded once below, never a per-advisory reason.
+			outOfScope = append(outOfScope, identifier)
+			continue
 		}
 
 		if ambiguous {
@@ -106,36 +167,63 @@ func vuln(spec Spec) CheckResult {
 				fmt.Sprintf("%s affects %s with severity %s", identifier, version, severity), data)
 		}
 	}
+
+	// One visible GO note for the advisories ruled not-applicable by scope: an
+	// empty note here is what makes an empty scope auditable, because the day a
+	// repository publishes an advisory that DOES name the subject's package, this
+	// count changes and the advisory leaves this list.
+	if len(outOfScope) > 0 {
+		result.add(GO, "advisory_out_of_scope",
+			fmt.Sprintf("%d advisory/advisories for %s name only packages outside the subject's declared scope, so they do not describe this artifact: %s",
+				len(outOfScope), repo, strings.Join(outOfScope, ", ")),
+			map[string]string{"repo": repo, "advisories": strings.Join(outOfScope, ","), "count": strconv.Itoa(len(outOfScope))})
+	}
 	return result
 }
 
 // matchAdvisory decides whether one advisory covers the version.
 //
-// Entries are read in order and the first match wins, so an unreadable entry
-// listed after a matching one does not make a decided advisory ambiguous. An
-// advisory that names nothing this check can rule out — no vulnerabilities
-// entries at all, or entries none of which the range OR its patched-version
-// fallback could decide — is ambiguous: it is a published advisory against this
-// repository that this check cannot place.
-func matchAdvisory(advisory githubAdvisory, version string, placeable bool) (matched, ambiguous bool) {
+// Only entries the scope includes are read; an entry naming a package outside
+// the subject's declared scope is skipped, because it describes a different
+// artifact. Included entries are read in order and the first match wins, so an
+// unreadable entry listed after a matching one does not make a decided advisory
+// ambiguous. An advisory that names nothing this check can rule out — no
+// vulnerabilities entries at all, or included entries none of which the range OR
+// its patched-version fallback could decide — is ambiguous: it is a published
+// advisory against this repository that this check cannot place.
+//
+// notApplicable is a fourth answer, distinct from ambiguous: an advisory that
+// HAD entries but none of them were in scope is about another package in the
+// same repository, not something unreadable. An advisory with no entries at all
+// stays ambiguous (fail-closed), never not-applicable — it names no package to
+// rule out.
+func matchAdvisory(advisory githubAdvisory, version string, placeable bool, scope advisoryScope) (matched, ambiguous, notApplicable bool) {
 	decided := 0
+	inScope := 0
 	for _, vulnerability := range advisory.Vulnerabilities {
+		if !scope.includes(vulnerability.Package) {
+			continue
+		}
+		inScope++
 		switch entryVerdict(version, placeable, vulnerability.VulnerableVersionRange, vulnerability.PatchedVersions) {
 		case rangeMatches:
-			return true, ambiguous
+			return true, ambiguous, false
 		case rangeExcludes:
 			decided++
 		case rangeAmbiguous:
 			ambiguous = true
 		}
 	}
-	// No entry decided either way and none was ambiguous means the advisory
-	// carried no vulnerabilities entries at all — still nothing this check can
-	// rule out.
+	if scope.active && len(advisory.Vulnerabilities) > 0 && inScope == 0 {
+		return false, false, true
+	}
+	// No in-scope entry decided either way and none was ambiguous means the
+	// advisory carried no vulnerabilities entries at all — still nothing this
+	// check can rule out.
 	if decided == 0 && !ambiguous {
 		ambiguous = true
 	}
-	return false, ambiguous
+	return false, ambiguous, false
 }
 
 // entryVerdict decides one vulnerability entry.

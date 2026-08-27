@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **release-review `vuln`: package/ecosystem scoping and compound-range
+  parsing** (1.47.0). Two hardening fixes on the advisory check, grounded in
+  openai/codex's GHSA-w5fx. (1) The check was package-blind: it matched an
+  advisory's version ranges against the subject whatever package the advisory
+  named, so an advisory published against a repo's npm wrapper or VS Code
+  extension could match the Rust binary beside them. A vuln spec may now declare
+  `checks.vuln.packages` — the advisory-package identities that describe the
+  subject; an advisory whose entries all name a different package is ruled
+  not-applicable and recorded in one aggregated `advisory_out_of_scope` GO note.
+  Absent, the check stays package-blind exactly as before; an empty `packages`
+  array is the honest "no advisory package here tracks this artifact". Two edges
+  fail closed: an entry naming no package is read anyway, and an advisory with no
+  entries stays ambiguous. Matching is case-insensitive (the ecosystem is free
+  text, e.g. `"vs code"`). (2) `versionMatchesRange` now reads GitHub's
+  space-separated two-sided bound `A <= B` as `>= A, <= B` (both inclusive) — the
+  spelling of codex's npm range `0.2.0 <= 0.38.0`, previously ambiguous and
+  resolved only by its `patched_versions`. Additive only: no range that already
+  decided changes meaning.
 - **release-review `release`: read the release history in small early-stopping
   pages, and accept an unsigned commit when the spec allows it** (1.46.0). Two
   live-usage fixes surfaced reviewing openai/codex. (1) The release-history

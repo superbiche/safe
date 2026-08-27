@@ -22,6 +22,19 @@ var (
 	// contain whitespace or a comma, because a comma separates constraints.
 	constraintWithOperator = regexp.MustCompile(`^(<=|>=|<|>|==|=)[[:space:]]*(v?[0-9][^[:space:],]*)$`)
 	constraintBare         = regexp.MustCompile(`^(v?[0-9][^[:space:],]*)$`)
+
+	// compoundBound matches GitHub's space-separated two-sided bound `A <= B`,
+	// which means `>= A, <= B`: A the inclusive floor, B the inclusive ceiling.
+	// GitHub's canonical form for an interval is the comma-separated `>= A, <= B`,
+	// but some advisories store it as this single two-version part — openai/codex's
+	// npm range `0.2.0 <= 0.38.0`, whose patched_versions `0.39.0` confirms 0.38.0
+	// is the last affected version, so the ceiling is inclusive. Only `<=` is
+	// admitted, the sole interior operator seen in real advisory data; any other
+	// two-token shape stays ambiguous rather than have a grammar guessed into a
+	// gate. Both sides must be versions, so a single-operator constraint (`<= B`,
+	// operator first) and a bare version never match this — the addition is purely
+	// additive, turning a previously-ambiguous string into a decided one.
+	compoundBound = regexp.MustCompile(`^(v?[0-9][^[:space:],]*)[[:space:]]+<=[[:space:]]+(v?[0-9][^[:space:],]*)$`)
 )
 
 // rangeMatch is what a version-range comparison concluded. Ambiguous is a third
@@ -59,11 +72,24 @@ func versionMatchesRange(version, versionRange string) rangeMatch {
 		if part == "" {
 			continue
 		}
-		if got := versionSatisfiesConstraint(version, part); got != rangeMatches {
+		if got := partSatisfied(version, part); got != rangeMatches {
 			return got
 		}
 	}
 	return rangeMatches
+}
+
+// partSatisfied evaluates one comma-separated part of a range. Most parts are a
+// single constraint; a two-sided `A <= B` bound is expanded into its floor and
+// ceiling and both must hold (AND), the same conjunction a comma expresses.
+func partSatisfied(version, part string) rangeMatch {
+	if match := compoundBound.FindStringSubmatch(part); match != nil {
+		if got := versionSatisfiesConstraint(version, ">="+match[1]); got != rangeMatches {
+			return got
+		}
+		return versionSatisfiesConstraint(version, "<="+match[2])
+	}
+	return versionSatisfiesConstraint(version, part)
 }
 
 // placeableTag matches a release tag whose version sits at a STRUCTURAL

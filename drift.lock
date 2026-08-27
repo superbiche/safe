@@ -3,7 +3,7 @@ version = 1
 [[bindings]]
 doc = "docs/architecture.md"
 target = "docs/release-review.md"
-sig = "07a8e64265886297"
+sig = "41af3913257a78ce"
 
 [[bindings]]
 doc = "docs/command-reference.md"
