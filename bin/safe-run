@@ -17,6 +17,20 @@ BLOCKED_FILE="$CONFIG_DIR/blocked.json"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 AUDIT_LOG="$DATA_DIR/audit.log"
 SEED_DIR="${SAFE_RUN_SEED_DIR:-}"
+# Bind to the safe-audit installed BESIDE this script, not whatever PATH
+# resolves — a PATH-shadowed safe-audit must not be able to author a preflight
+# verdict (round-1 F2). Only when executed as a program (production: the `safe`
+# dispatcher, or the npx/bunx/uvx symlinks) and the sibling is present; every
+# other case (explicit override, sourced under test, odd BASH_SOURCE, missing
+# sibling) falls back to today's bare-PATH `safe-audit`. The dispatcher pins the
+# same sibling via SAFE_AUDIT_PATH and now passes it in as a belt.
+if [[ -z "${SAFE_AUDIT_BIN:-}" && -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]:-}" == "${0:-}" ]]; then
+  _safe_run_self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)" || _safe_run_self_dir=""
+  if [[ -n "$_safe_run_self_dir" && -x "$_safe_run_self_dir/safe-audit" ]]; then
+    SAFE_AUDIT_BIN="$_safe_run_self_dir/safe-audit"
+  fi
+  unset _safe_run_self_dir
+fi
 SAFE_AUDIT_BIN="${SAFE_AUDIT_BIN:-safe-audit}"
 SAFE_AUDIT_DATA_DIR="${SAFE_AUDIT_DATA_DIR:-${SAFE_DATA_DIR:-$HOME/.local/share/safe}/audit}"
 SAFE_AUDIT_HOST_ALLOW_LOG="$SAFE_AUDIT_DATA_DIR/host-allow-log.jsonl"
@@ -57,6 +71,11 @@ FORCE_LINK=0
 # preflight BLOCK (into the sandbox, never host exec). It does not bypass the
 # blocklist, host-allow pin mismatch, or any other refusal.
 FORCE_AUDIT_OVERRIDE=0
+# Set when this invocation actually overrode a preflight BLOCK via --force. A
+# forced-BLOCK run executes ONCE in the sandbox but must never be persisted as
+# sandbox-known — otherwise a later non-TTY/no-force run would sandbox the
+# blocked package with no fresh audit (round-1 F1).
+AUDIT_BLOCK_FORCED=0
 BLOCKED_REASON=""
 HOST_ALLOW_PINNED_VERSION=""
 SANDBOX_AUDIT_EXTRA="sbom_vulns=skipped"
@@ -1022,14 +1041,21 @@ run_sandbox_with_audit_log() {
 # verdict codes (0=GO, 10=WARN, 20=BLOCK); anything else means the audit
 # could not run. Both the run-lane preflight and host_allow_review_probe call
 # this so the exec incantation cannot drift between them.
+# $4 (installer, optional): the runner that will actually fetch/execute the
+# package (npm|bun|uv|pipx). safe-audit keys bun-vs-npm source/resolution
+# semantics off the installer, so the run lane passes it; the grant lane and the
+# review probe omit it and let safe-audit default from the ecosystem (round-1
+# F4).
 _safe_audit_run_json() {
-  local spec="$1" ecosystem="$2" leash="$3"
+  local spec="$1" ecosystem="$2" leash="$3" installer="${4:-}"
+  local extra=()
+  [[ -n "$installer" ]] && extra=(--installer "$installer")
   if [[ -n "$leash" ]] && command -v timeout >/dev/null 2>&1; then
     SAFE_AUDIT_NO_INIT=1 timeout "$leash" "$SAFE_AUDIT_BIN" package-audit "$spec" \
-      --ecosystem "$ecosystem" --json </dev/null 2>/dev/null
+      --ecosystem "$ecosystem" ${extra[@]+"${extra[@]}"} --json </dev/null 2>/dev/null
   else
     SAFE_AUDIT_NO_INIT=1 "$SAFE_AUDIT_BIN" package-audit "$spec" \
-      --ecosystem "$ecosystem" --json </dev/null 2>/dev/null
+      --ecosystem "$ecosystem" ${extra[@]+"${extra[@]}"} --json </dev/null 2>/dev/null
   fi
 }
 
@@ -1082,7 +1108,9 @@ unknown_preflight_audit() {
   fi
 
   info "auditing $pkgver before sandboxing…"
-  out=$(_safe_audit_run_json "$pkgver" "$ecosystem" "$leash") || rc=$?
+  # RUNNER_KIND (npm|bun|uv|pipx) is a valid safe-audit --installer; pass it so
+  # a bunx preflight models bun's resolution, not npm's (round-1 F4).
+  out=$(_safe_audit_run_json "$pkgver" "$ecosystem" "$leash" "$RUNNER_KIND") || rc=$?
   verdict=""
   causes="[]"
   if [[ -n "$out" ]]; then
@@ -1102,6 +1130,9 @@ unknown_preflight_audit() {
         fi
         warn "safe audit reported BLOCK for $pkgver — overridden by --force; running in the sandbox only (never on host)"
         audit_log "$runner_label" "$pkgver" "PREFLIGHT" "$(context_label)" "BLOCK_FORCED" "verdict=${verdict:-none}"
+        # This one run is allowed into the sandbox, but the forced BLOCK must
+        # not become a persistent sandbox-known grant (round-1 F1).
+        AUDIT_BLOCK_FORCED=1
         return 0
       fi
       err "BLOCKED: $pkgver — safe audit reported BLOCK"
@@ -1185,7 +1216,14 @@ host_allow_preflight_audit() {
       fi
       ;;
     0)
-      : # clean GO (or a clean-but-unreadable rc 0): proceed; --reason still required
+      # A trustworthy clean result is verdict==GO with no warn causes; any other
+      # rc-0 shape (empty, malformed, contradictory) is an audit that did not
+      # actually clear the package. Never block a grant on it — but say so, so
+      # the operator knows the grant-time audit was inconclusive, not clean.
+      if [[ "$verdict" != "GO" \
+        || "$(printf '%s' "$causes" | jq -r 'length' 2>/dev/null)" != "0" ]]; then
+        warn "audit preflight inconclusive before ${action} ${pkgver} (no corroborating GO); continuing"
+      fi
       ;;
     *)
       warn "audit preflight inconclusive before ${action} ${pkgver} (exit $rc); continuing"
@@ -1202,8 +1240,12 @@ prompt_unknown() {
   case "$choice" in
     y|Y|yes) return 0 ;;
     a|A|always)
-      mark_sandbox_known "$pkg" "$version"
-      info "added $pkg to sandbox-known"
+      if [[ "$AUDIT_BLOCK_FORCED" == "1" ]]; then
+        info "not persisting sandbox-known: this run overrode an audit BLOCK (--force)"
+      else
+        mark_sandbox_known "$pkg" "$version"
+        info "added $pkg to sandbox-known"
+      fi
       return 0
       ;;
     *) return 1 ;;
@@ -1335,7 +1377,13 @@ dispatch_run() {
 
   if [[ "$SKIP_PROMPT" == "1" ]] || prompt_unknown "$pkg" "$version"; then
     info "sandboxing $pkgver"
-    [[ "$SKIP_PROMPT" == "1" ]] && mark_sandbox_known "$pkg" "$version"
+    if [[ "$SKIP_PROMPT" == "1" ]]; then
+      if [[ "$AUDIT_BLOCK_FORCED" == "1" ]]; then
+        info "not persisting sandbox-known: this run overrode an audit BLOCK (--force)"
+      else
+        mark_sandbox_known "$pkg" "$version"
+      fi
+    fi
     run_sandbox_with_audit_log "$runner_label" "$pkgver" "$pkg" "$version" "$@"
   else
     audit_log "$runner_label" "$pkgver" "UNKNOWN" "$(context_label)" "USER_DECLINED"

@@ -28,7 +28,14 @@
   it). The shared exec core (`_safe_audit_run_json`) backs both the run-lane
   and review probes so their incantation cannot drift. This is a genuine gate
   activation, not a cleanup: the old preflight never fired live, so the gate
-  now audits uniformly on every machine (host-side needs no podman). Fibery #86.
+  now audits uniformly on every machine (host-side needs no podman). A forced
+  BLOCK runs once in the sandbox but is NEVER persisted as sandbox-known (so a
+  later non-TTY run cannot silently re-run the blocked package unaudited); the
+  preflight binds to the `safe-audit` installed beside `safe run` (dispatcher
+  pins the same sibling), so a PATH-shadowed `safe-audit` cannot author a
+  verdict; the probe passes `--installer` so a bunx preflight models bun's
+  resolution, not npm's; and a grant-time rc-0 result without a corroborating
+  GO warns as inconclusive rather than passing silently. Fibery #86.
 
 - **mise `-C`/`--cd` lane enters the target with physical `cd`** (1.48.0). The
   mise routing surface entered the caller's `-C`/`--cd` directory with a bare

@@ -877,3 +877,132 @@ SAFE_AUDIT_PROBE_RC=10 SAFE_AUDIT_PROBE_JSON='{"verdict":"WARN","warn_causes":["
     [[ "$(jq -r ".packages.infrapkg.version" "$HOST_ALLOW_FILE")" == "2.0.0" ]]
   ' safe-run || fail "host-allow add blocked on an infra-only WARN (should degrade)"
 pass "host-allow add: infra-only WARN degrades, grant proceeds"
+
+# --- Round-1 fix regressions (F1–F4) ---
+
+# F1: a forced BLOCK runs ONCE in the sandbox but is NEVER persisted as
+# sandbox-known — else a later non-TTY/no-force run would sandbox the blocked
+# package with no fresh audit. Uses the REAL mark_sandbox_known (the no-op stub
+# is exactly what masked this).
+CFG_FP="$tmp/config-force-persist"; DATA_FP="$tmp/data-force-persist"
+set +e
+SAFE_RUN_CONFIG_DIR="$CFG_FP" SAFE_RUN_DATA_DIR="$DATA_FP" SAFE_RUN_PATH="$SAFE_RUN" \
+SAFE_AUDIT_BIN=safe-audit FORCE=1 \
+SAFE_AUDIT_PROBE_RC=20 SAFE_AUDIT_PROBE_JSON='{"verdict":"BLOCK","warn_causes":[]}' \
+PREFLIGHT_RAN_LOG="$tmp/fp1-ran.log" \
+  bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    ensure_dirs
+    is_tty() { return 0; }
+    RUNNER_KIND=npm; PKG_NAME=freshpkg; PKG_VERSION=9.9.9; PKG_VERSION_USER_SPECIFIED=1
+    SKIP_PROMPT=1; FORCE_AUDIT_OVERRIDE=1
+    run_sandbox_with_audit_log() { printf ran >> "$PREFLIGHT_RAN_LOG"; return 0; }
+    dispatch_run
+  ' safe-run >/dev/null 2>&1
+rc1=$?
+set -e
+[[ "$rc1" -eq 0 ]] || fail "forced-BLOCK run expected exit 0, got $rc1"
+[[ -s "$tmp/fp1-ran.log" ]] || fail "forced-BLOCK did not run once in the sandbox"
+[[ "$(jq -r '.packages.freshpkg // "absent"' "$CFG_FP/sandbox-known.json")" == "absent" ]] \
+  || fail "forced BLOCK persisted the blocked package as sandbox-known (F1)"
+# Second dispatch: non-TTY, no force -> the package is still unknown -> refuse 102.
+set +e
+SAFE_RUN_CONFIG_DIR="$CFG_FP" SAFE_RUN_DATA_DIR="$DATA_FP" SAFE_RUN_PATH="$SAFE_RUN" \
+SAFE_AUDIT_BIN=safe-audit \
+PREFLIGHT_RAN_LOG="$tmp/fp2-ran.log" \
+  bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    ensure_dirs
+    RUNNER_KIND=npm; PKG_NAME=freshpkg; PKG_VERSION=9.9.9; PKG_VERSION_USER_SPECIFIED=1
+    run_sandbox_with_audit_log() { printf ran >> "$PREFLIGHT_RAN_LOG"; return 0; }
+    dispatch_run
+  ' safe-run >/dev/null 2>&1
+rc2=$?
+set -e
+[[ "$rc2" -eq 102 ]] || fail "post-force non-TTY dispatch expected 102, got $rc2 (blocked pkg was persisted?)"
+[[ ! -e "$tmp/fp2-ran.log" ]] || fail "post-force run reached the sandbox — the blocked pkg persisted (F1)"
+pass "forced BLOCK runs once but is never persisted as sandbox-known (F1)"
+
+# F2: an EXECUTED safe-run binds its preflight to the safe-audit installed
+# beside it, never a PATH-shadowed decoy. Driven via `host-allow review` (a
+# read-only, non-TTY-OK path that runs the same host-side probe), so no pty is
+# needed. safe-run is copied next to a recording sibling; a decoy is first on
+# PATH; SAFE_AUDIT_BIN is left unset so the executed-mode resolution runs.
+fake="$tmp/fake-install"; decoy="$tmp/decoy-bin"
+mkdir -p "$fake" "$decoy"
+command cp "$SAFE_RUN" "$fake/safe-run"
+cat > "$fake/safe-audit" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SIBLING_LOG"
+printf '{"verdict":"GO","warn_causes":[]}'
+exit 0
+SH
+cat > "$decoy/safe-audit" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$DECOY_LOG"
+printf '{"verdict":"GO","warn_causes":[]}'
+exit 0
+SH
+chmod +x "$fake/safe-audit" "$decoy/safe-audit"
+CFG_F2="$tmp/config-f2"; mkdir -p "$CFG_F2"
+cat > "$CFG_F2/host-allow.json" <<'JSON'
+{"packages":{"probepkg":{"version":"1.0.0","ecosystem":"npm","added":"2026-01-01","reason":"x","sha":"sha512-x"}}}
+JSON
+set +e
+env -u SAFE_AUDIT_BIN \
+SAFE_RUN_CONFIG_DIR="$CFG_F2" SAFE_RUN_DATA_DIR="$tmp/data-f2" SAFE_AUDIT_DATA_DIR="$tmp/adata-f2" \
+SIBLING_LOG="$tmp/f2-sibling.log" DECOY_LOG="$tmp/f2-decoy.log" \
+PATH="$decoy:/usr/bin:/bin" \
+  "$fake/safe-run" host-allow review >/dev/null 2>&1
+set -e
+[[ -s "$tmp/f2-sibling.log" ]] || fail "executed safe-run did not bind to its sibling safe-audit (F2)"
+[[ ! -s "$tmp/f2-decoy.log" ]] || fail "executed safe-run used a PATH-shadowed decoy safe-audit (F2)"
+pass "executed safe-run binds its preflight probe to the sibling safe-audit, not a PATH decoy (F2)"
+
+# F3: grant-time rc 0 without a corroborating GO (e.g. empty {} output) must
+# degrade honestly — proceed, but WARN so the operator knows the grant-time
+# audit did not actually clear the package.
+CFG_F3="$tmp/config-f3"
+set +e
+SAFE_RUN_CONFIG_DIR="$CFG_F3" SAFE_RUN_DATA_DIR="$tmp/data-f3" SAFE_RUN_PATH="$SAFE_RUN" \
+SAFE_AUDIT_BIN=safe-audit \
+SAFE_AUDIT_PROBE_RC=0 SAFE_AUDIT_PROBE_JSON='{}' \
+ERR_FILE="$tmp/f3.err" \
+  bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    ensure_dirs
+    registry_integrity_npm() { printf "sha512-fixture"; }
+    require_operator_tty() { :; }
+    cmd_host_allow_add incpkg@3.0.0 --reason "x" 2>"$ERR_FILE"
+    [[ "$(jq -r ".packages.incpkg.version" "$HOST_ALLOW_FILE")" == "3.0.0" ]]
+  ' safe-run
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] || fail "grant on rc-0 empty output did not proceed (should degrade, not block)"
+grep -q "inconclusive" "$tmp/f3.err" || fail "grant on rc-0 empty output did not warn inconclusive (F3)"
+pass "grant-time rc-0 without a corroborating GO degrades honestly (warns, proceeds) (F3)"
+
+# F4: a bun (bunx) preflight passes --installer bun so safe-audit models bun's
+# resolution, not npm's. Bun still maps to the npm ECOSYSTEM.
+set +e
+SAFE_RUN_CONFIG_DIR="$tmp/config-f4" SAFE_RUN_DATA_DIR="$tmp/data-f4" SAFE_RUN_PATH="$SAFE_RUN" \
+SAFE_AUDIT_BIN=safe-audit \
+SAFE_AUDIT_PROBE_LOG="$tmp/f4-probe.log" \
+  bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    ensure_dirs
+    is_tty() { return 0; }
+    RUNNER_KIND=bun; PKG_NAME=bunpkg; PKG_VERSION=1.0.0; PKG_VERSION_USER_SPECIFIED=1
+    SKIP_PROMPT=1
+    mark_sandbox_known() { :; }
+    run_sandbox_with_audit_log() { return 0; }
+    dispatch_run
+  ' safe-run >/dev/null 2>&1
+set -e
+grep -q -- '--installer bun' "$tmp/f4-probe.log" || fail "bun preflight did not pass --installer bun (F4)"
+grep -q -- '--ecosystem npm' "$tmp/f4-probe.log" || fail "bun preflight did not use the npm ecosystem (F4)"
+pass "bunx preflight passes --installer bun on the npm ecosystem (F4)"
