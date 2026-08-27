@@ -53,6 +53,10 @@ SKIP_PROMPT=0
 PROXY_PASSTHROUGH=0
 NPX_NO_INSTALL=0
 FORCE_LINK=0
+# --force on a runner invocation ONLY overrides an unknown-package audit
+# preflight BLOCK (into the sandbox, never host exec). It does not bypass the
+# blocklist, host-allow pin mismatch, or any other refusal.
+FORCE_AUDIT_OVERRIDE=0
 BLOCKED_REASON=""
 HOST_ALLOW_PINNED_VERSION=""
 SANDBOX_AUDIT_EXTRA="sbom_vulns=skipped"
@@ -1001,6 +1005,194 @@ run_sandbox_with_audit_log() {
 # ---------------------------------------------------------------------------
 # Top-level dispatch for a runtime invocation
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Host-side audit preflight (Fibery #86)
+#
+# Reuses the INSTALLED safe-audit on the host — no container, no npm fetch —
+# exactly like host_allow_review_probe. This replaces the removed sandboxed
+# preflight (PR #82) that fetched an unpinned `safe-audit` npm name inside
+# Podman and never produced a verdict live.
+# ---------------------------------------------------------------------------
+
+# Shared exec core: run the installed safe-audit as a package probe with a
+# timeout leash, closed stdin (a hidden prompt must fail, not wait), and
+# SAFE_AUDIT_NO_INIT (a probe must not seed audit state on a fresh machine).
+# Echoes the JSON receipt on stdout; the caller reads the exit code via
+# `out=$(_safe_audit_run_json ...) || rc=$?`. Exit codes are safe-audit's
+# verdict codes (0=GO, 10=WARN, 20=BLOCK); anything else means the audit
+# could not run. Both the run-lane preflight and host_allow_review_probe call
+# this so the exec incantation cannot drift between them.
+_safe_audit_run_json() {
+  local spec="$1" ecosystem="$2" leash="$3"
+  if [[ -n "$leash" ]] && command -v timeout >/dev/null 2>&1; then
+    SAFE_AUDIT_NO_INIT=1 timeout "$leash" "$SAFE_AUDIT_BIN" package-audit "$spec" \
+      --ecosystem "$ecosystem" --json </dev/null 2>/dev/null
+  else
+    SAFE_AUDIT_NO_INIT=1 "$SAFE_AUDIT_BIN" package-audit "$spec" \
+      --ecosystem "$ecosystem" --json </dev/null 2>/dev/null
+  fi
+}
+
+# safe run's RUNNER_KIND -> safe-audit's --ecosystem name.
+runner_kind_to_ecosystem() {
+  case "$1" in
+    npm|bun) printf 'npm' ;;
+    uv|pipx) printf 'python' ;;
+    *)       printf 'npm' ;;
+  esac
+}
+
+# Ask an interactive operator to confirm a trust escalation that the audit
+# flagged; abort otherwise. Non-TTY callers (already TTY-gated upstream) die.
+audit_confirm_or_die() {
+  local action="$1" ok
+  is_tty || die "safe audit flagged this package; ${action} requires an interactive operator terminal"
+  printf '\033[33msafe run:\033[0m %s anyway? [y/N] ' "$action" >&2
+  read -r ok </dev/tty
+  [[ "$ok" =~ ^[yY]$ ]] || die "aborted"
+}
+
+# Run-lane preflight for an UNKNOWN package about to be sandboxed. Doctrine:
+#   BLOCK (rc 20) -> malice signal (Socket BLOCK / critical advisory on the
+#                    resolved version): refuse before sandboxing, exit 104.
+#                    rc 20 is safe-audit's authoritative BLOCK contract, so it
+#                    refuses even if the JSON is unparseable. --force (operator
+#                    TTY) downgrades it to a warn-and-continue INTO THE SANDBOX
+#                    (never host exec); the sandbox is still the containment.
+#   WARN  (rc 10) -> a non-infra finding: warn, continue into the sandbox.
+#                    infra-only causes are audit-infrastructure breakage, never
+#                    a package finding -> warn "degraded", continue.
+#   GO    (rc 0)  -> clean only when verdict==GO with no warn causes; any other
+#                    rc-0 shape is contradictory probe output -> inconclusive.
+#   other/empty   -> the audit could not run: warn, continue (honest degrade,
+#                    never a refusal — audit-infra failure is not a CVE signal).
+# Exits 104 (BLOCK), 102 (--force requested without a TTY), or returns 0.
+unknown_preflight_audit() {
+  local pkg="$1" version="$2" runner_label="$3"
+  local pkgver="${pkg}@${version}"
+  local ecosystem out rc=0 verdict causes non_infra
+  local leash="${SAFE_RUN_PREFLIGHT_TIMEOUT:-90}"
+  ecosystem=$(runner_kind_to_ecosystem "$RUNNER_KIND")
+
+  # No installed safe-audit -> no verdict to be had. Degrade honestly.
+  if ! command -v "$SAFE_AUDIT_BIN" >/dev/null 2>&1; then
+    warn "audit preflight unavailable (safe-audit not found); continuing with sandbox policy"
+    audit_log "$runner_label" "$pkgver" "PREFLIGHT" "$(context_label)" "UNAVAILABLE" "reason=no_safe_audit"
+    return 0
+  fi
+
+  info "auditing $pkgver before sandboxing…"
+  out=$(_safe_audit_run_json "$pkgver" "$ecosystem" "$leash") || rc=$?
+  verdict=""
+  causes="[]"
+  if [[ -n "$out" ]]; then
+    verdict=$(printf '%s' "$out" | jq -r '.verdict // empty' 2>/dev/null || true)
+    causes=$(printf '%s' "$out" | jq -c '.warn_causes // []' 2>/dev/null) || causes="[]"
+  fi
+
+  case "$rc" in
+    20)
+      if [[ "$FORCE_AUDIT_OVERRIDE" == "1" ]]; then
+        if ! is_tty; then
+          err "BLOCKED: $pkgver — safe audit reported BLOCK; --force override requires an interactive operator terminal"
+          err "  ask the operator to run it in their terminal, or resolve the advisory"
+          err "  agent contract: safe explain"
+          audit_log "$runner_label" "$pkgver" "PREFLIGHT" "$(context_label)" "BLOCK_FORCE_REFUSED_NOTTY" "verdict=${verdict:-none}"
+          exit 102
+        fi
+        warn "safe audit reported BLOCK for $pkgver — overridden by --force; running in the sandbox only (never on host)"
+        audit_log "$runner_label" "$pkgver" "PREFLIGHT" "$(context_label)" "BLOCK_FORCED" "verdict=${verdict:-none}"
+        return 0
+      fi
+      err "BLOCKED: $pkgver — safe audit reported BLOCK"
+      err "  to inspect: safe audit package-audit $pkgver --ecosystem $ecosystem"
+      err "  to override (operator TTY, runs in sandbox only): safe run --force $pkgver"
+      err "  agent contract: safe explain"
+      audit_log "$runner_label" "$pkgver" "PREFLIGHT" "$(context_label)" "BLOCK" "verdict=${verdict:-none}"
+      exit 104
+      ;;
+    10)
+      non_infra=$(printf '%s' "$causes" | jq -r --argjson infra "$HOST_ALLOW_REVIEW_INFRA_CAUSES" \
+        '[.[] | select(. as $c | $infra | index($c) | not)] | length' 2>/dev/null) || non_infra=""
+      if [[ "$verdict" == "WARN" && "$non_infra" =~ ^[0-9]+$ ]] && (( non_infra > 0 )); then
+        warn "safe audit flagged $pkgver for review; continuing into the sandbox"
+        audit_log "$runner_label" "$pkgver" "PREFLIGHT" "$(context_label)" "WARN"
+      else
+        warn "audit infrastructure degraded for $pkgver; continuing with sandbox policy"
+        audit_log "$runner_label" "$pkgver" "PREFLIGHT" "$(context_label)" "INCONCLUSIVE" "cause=infra_or_unreadable"
+      fi
+      return 0
+      ;;
+    0)
+      if [[ "$verdict" == "GO" \
+        && "$(printf '%s' "$causes" | jq -r 'length' 2>/dev/null)" == "0" ]]; then
+        audit_log "$runner_label" "$pkgver" "PREFLIGHT" "$(context_label)" "GO"
+      else
+        warn "audit preflight inconclusive for $pkgver; continuing with sandbox policy"
+        audit_log "$runner_label" "$pkgver" "PREFLIGHT" "$(context_label)" "INCONCLUSIVE" "rc=0"
+      fi
+      return 0
+      ;;
+    *)
+      warn "audit preflight unavailable or inconclusive ($pkgver, exit $rc); continuing with sandbox policy"
+      audit_log "$runner_label" "$pkgver" "PREFLIGHT" "$(context_label)" "INCONCLUSIVE" "rc=$rc"
+      return 0
+      ;;
+  esac
+}
+
+# Grant-lane preflight (host-allow add/update, scripts-allow add). A grant
+# escalates a package to a host-execution / scripts-execution trust tier, so
+# re-audit it host-side first. WARN or BLOCK requires an explicit interactive
+# confirmation to proceed; --reason is required unconditionally elsewhere and
+# does NOT depend on the verdict. Audit-infrastructure breakage never blocks a
+# grant — it degrades to a warning (an operator adding a pin is a deliberate
+# act; a wedged Socket call must not stop them).
+host_allow_preflight_audit() {
+  local pkg="$1" version="$2" ecosystem="$3" action="$4"
+  local pkgver="${pkg}@${version}" out rc=0 verdict causes non_infra
+  local leash="${SAFE_RUN_PREFLIGHT_TIMEOUT:-90}"
+  local audit_eco="$ecosystem"
+  case "$ecosystem" in
+    py|python|uv|pipx) audit_eco="python" ;;
+    npm|bun)           audit_eco="npm" ;;
+  esac
+  command -v "$SAFE_AUDIT_BIN" >/dev/null 2>&1 || {
+    warn "audit preflight unavailable (safe-audit not found) before ${action} ${pkgver}"
+    return 0
+  }
+  out=$(_safe_audit_run_json "$pkgver" "$audit_eco" "$leash") || rc=$?
+  verdict=""
+  causes="[]"
+  if [[ -n "$out" ]]; then
+    verdict=$(printf '%s' "$out" | jq -r '.verdict // empty' 2>/dev/null || true)
+    causes=$(printf '%s' "$out" | jq -c '.warn_causes // []' 2>/dev/null) || causes="[]"
+  fi
+  case "$rc" in
+    20)
+      warn "safe audit reported BLOCK for $pkgver before ${action}"
+      warn "  inspect: safe audit package-audit $pkgver --ecosystem $audit_eco"
+      audit_confirm_or_die "$action"
+      ;;
+    10)
+      non_infra=$(printf '%s' "$causes" | jq -r --argjson infra "$HOST_ALLOW_REVIEW_INFRA_CAUSES" \
+        '[.[] | select(. as $c | $infra | index($c) | not)] | length' 2>/dev/null) || non_infra=""
+      if [[ "$verdict" == "WARN" && "$non_infra" =~ ^[0-9]+$ ]] && (( non_infra > 0 )); then
+        warn "safe audit flagged $pkgver for review before ${action}"
+        audit_confirm_or_die "$action"
+      else
+        warn "audit infrastructure degraded before ${action} ${pkgver}; continuing"
+      fi
+      ;;
+    0)
+      : # clean GO (or a clean-but-unreadable rc 0): proceed; --reason still required
+      ;;
+    *)
+      warn "audit preflight inconclusive before ${action} ${pkgver} (exit $rc); continuing"
+      ;;
+  esac
+}
+
 prompt_unknown() {
   local pkg="$1" version="$2"
   local choice
@@ -1134,6 +1326,13 @@ dispatch_run() {
     exit 102
   fi
 
+  # Unknown package on a proceed path (about to be sandboxed): re-audit it
+  # host-side first. A BLOCK verdict refuses here (exit 104) before the
+  # operator is prompted; --force overrides into the sandbox. Non-TTY unknowns
+  # already refused above (exit 102), so this never runs on the hottest
+  # refusal lane. (Fibery #86.)
+  unknown_preflight_audit "$pkg" "$version" "$runner_label"
+
   if [[ "$SKIP_PROMPT" == "1" ]] || prompt_unknown "$pkg" "$version"; then
     info "sandboxing $pkgver"
     [[ "$SKIP_PROMPT" == "1" ]] && mark_sandbox_known "$pkg" "$version"
@@ -1173,6 +1372,10 @@ parse_runner_args() {
       --py314)  SANDBOX_FLAGS_EXPLICIT=1; PY_VERSION_FLAG=314;  shift ;;
       --proxy)  SANDBOX_FLAGS_EXPLICIT=1; PROXY_PASSTHROUGH=1;  shift ;;
       -y|--yes) SANDBOX_FLAGS_EXPLICIT=1; SKIP_PROMPT=1; shift ;;
+      # Overrides ONLY an unknown-package audit-preflight BLOCK, into the
+      # sandbox (never host exec); every other refusal stays fail-closed. A
+      # package's own --force is unaffected — it goes after the package name.
+      --force)  SANDBOX_FLAGS_EXPLICIT=1; FORCE_AUDIT_OVERRIDE=1; shift ;;
       --)       saw_dashdash=1; shift ;;
       -h|--help) show_usage; exit 0 ;;
       -v|--version) echo "safe run $SAFE_RUN_VERSION"; exit 0 ;;
@@ -1544,6 +1747,7 @@ cmd_host_allow_add() {
   package_kind=$(ecosystem_to_runner_kind "$ecosystem") || die "unknown --ecosystem: $ecosystem"
   PKG_NAME=$(normalize_and_validate_package_or_die "$PKG_NAME" "$package_kind" "$spec")
   host_allow_require_reason "$reason"
+  host_allow_preflight_audit "$PKG_NAME" "$PKG_VERSION" "$ecosystem" "add to host-allow"
 
   local sha=""
   case "$ecosystem" in
@@ -1597,6 +1801,7 @@ cmd_host_allow_update() {
     [[ "$ok" =~ ^[yY]$ ]] || die "aborted"
   fi
   host_allow_require_reason "$reason"
+  host_allow_preflight_audit "$PKG_NAME" "$PKG_VERSION" "$ecosystem" "update host-allow"
   local sha=""
   case "$ecosystem" in
     npm|bun) sha=$(registry_integrity_npm "$PKG_NAME" "$PKG_VERSION") || true ;;
@@ -1646,13 +1851,7 @@ host_allow_review_probe() {
   # machine that has none — the dated check receipt safe-audit writes for
   # every check stays (it is the probe's verifiable evidence, same as for
   # any other check consumer), but nothing else may be created.
-  if command -v timeout >/dev/null 2>&1; then
-    out=$(SAFE_AUDIT_NO_INIT=1 timeout "$leash" "$SAFE_AUDIT_BIN" package-audit "${pkg}@${version}" \
-      --ecosystem "$ecosystem" --json </dev/null 2>/dev/null) || rc=$?
-  else
-    out=$(SAFE_AUDIT_NO_INIT=1 "$SAFE_AUDIT_BIN" package-audit "${pkg}@${version}" \
-      --ecosystem "$ecosystem" --json </dev/null 2>/dev/null) || rc=$?
-  fi
+  out=$(_safe_audit_run_json "${pkg}@${version}" "$ecosystem" "$leash") || rc=$?
   REVIEW_AUDIT_EXIT=$rc
   if [[ -n "$out" ]]; then
     REVIEW_AUDIT_VERDICT=$(printf '%s' "$out" | jq -r '.verdict // empty' 2>/dev/null || true)
@@ -1988,6 +2187,7 @@ cmd_scripts_allow_add() {
   PKG_NAME=$(normalize_and_validate_package_or_die "$PKG_NAME" "npm" "$spec")
 
   host_allow_require_reason "$reason"
+  host_allow_preflight_audit "$PKG_NAME" "$PKG_VERSION" "$ecosystem" "grant scripts for"
 
   # The review step: show the operator what would be authorized. A grant is
   # a statement that these scripts were seen.
@@ -2617,6 +2817,10 @@ FLAGS
   --proxy           Pass host HTTP(S)_PROXY env vars into network-enabled sandbox
                     (default: blocked)
   -y, --yes         Skip interactive prompt for unknown packages
+  --force           Override an unknown-package audit-preflight BLOCK, running
+                    the package in the sandbox anyway (operator TTY, logged;
+                    never host exec). Overrides ONLY the audit verdict — the
+                    blocklist and every other refusal stay fail-closed.
   -h, --help        This message
   -v, --version     Print version
 
@@ -2679,13 +2883,16 @@ DECISION TIERS (in order)
                     binary directly, no fetch
   3. host-allow     Execute on host with --ignore-scripts
   4. sandbox-known  Podman sandbox, no prompt
-  5. unknown        TTY: prompt; non-TTY: BLOCK
+  5. unknown        TTY: audit host-side (BLOCK refuses with exit 104, --force
+                    overrides into the sandbox; WARN / audit-infra breakage
+                    continue), then prompt; non-TTY: BLOCK
 
 EXIT CODES (policy refusals; distinguish from 127 = command not found)
   100  blocked by policy (blocklist, missing gate library, fail-closed audit, unrecognized/unsupported runner-native flags)
   101  host-allow version pin mismatch
   102  interactive operator confirmation required (non-TTY refusal)
   103  invalid package name rejected
+  104  unknown-package audit preflight BLOCK verdict (override: --force)
   Full agent contract: safe explain
 EOF
 }

@@ -48,6 +48,27 @@ printf '%s\n' "$*" >> "$HOST_RUNNER_CALL_LOG"
 SH
 chmod +x "$mockbin/npx-real"
 
+# Stub safe-audit for the host-side preflight (Fibery #86). Logs each
+# package-audit invocation (so a case can assert zero invocations) and emits a
+# verdict JSON + exit code from env; defaults to a clean GO so the
+# host-allow/scripts-allow success-path cases proceed unchanged. Exported onto
+# PATH below so it shadows any real safe-audit and the suite stays hermetic.
+cat > "$mockbin/safe-audit" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "package-audit" ]]; then
+  printf 'package-audit %s\n' "$*" >> "${SAFE_AUDIT_PROBE_LOG:-/dev/null}"
+  json="${SAFE_AUDIT_PROBE_JSON:-}"
+  [[ -n "$json" ]] || json='{"verdict":"GO","warn_causes":[]}'
+  printf '%s' "$json"
+  exit "${SAFE_AUDIT_PROBE_RC:-0}"
+fi
+exit 0
+SH
+chmod +x "$mockbin/safe-audit"
+# Shadow any real safe-audit on PATH for every fixture in this file, including
+# the bare `bash -c` cases that do not set PATH themselves.
+export PATH="$mockbin:$PATH"
+
 run_fixture() {
   local verdict="$1" script="$2"
   SAFE_RUN_CONFIG_DIR="$tmp/config-$verdict" \
@@ -62,9 +83,11 @@ run_fixture() {
     bash -c "$script" safe-run
 }
 
-# A sandbox-known package runs straight in the sandbox — no audit preflight
-# (the preflight never worked live and was removed). No podman is invoked for
-# a preflight; the sandbox's own sbom audit still lands.
+# A sandbox-known package runs straight in the sandbox. The host-side unknown
+# preflight (Fibery #86) fires ONLY on the unknown path, after the
+# sandbox-known early-return, so a sandbox-known package is never re-audited.
+# The sandbox's own sbom audit still lands.
+SAFE_AUDIT_PROBE_LOG="$tmp/probe-SANDBOXKNOWN.log" \
 run_fixture SANDBOXKNOWN '
   set -- version
   source "$SAFE_RUN_PATH" >/dev/null
@@ -78,6 +101,7 @@ run_fixture SANDBOXKNOWN '
   dispatch_run
 '
 [[ ! -s "$tmp/audit-calls-SANDBOXKNOWN.log" ]] || fail "a preflight invoked podman before the sandbox"
+[[ ! -s "$tmp/probe-SANDBOXKNOWN.log" ]] || fail "sandbox-known package was re-audited by the host-side preflight"
 grep -q 'SANDBOX.*OK.*sbom_vulns=0' "$tmp/data-SANDBOXKNOWN/audit.log" || fail "sandbox audit omitted sbom_vulns"
 pass "sandbox-known package runs in sandbox with sbom audit, no preflight"
 
@@ -652,3 +676,204 @@ set -e
 [[ "$rc" -eq 100 ]] || fail "steered --no-install expected rc=100, got $rc"
 [[ ! -e "$tmp/steer-ni-call.log" ]] || fail "shadowing steered the --no-install local-bin path"
 pass "steering cannot reach the strict --no-install path either"
+
+# ---------------------------------------------------------------------------
+# Host-side unknown-package audit preflight (Fibery #86)
+#
+# The preflight re-audits an unknown package host-side (installed safe-audit,
+# no container) on the proceed path, before it is sandboxed. safe-audit is
+# mocked (see $mockbin/safe-audit) so the suite stays hermetic. The BLOCK->104
+# case is the falsifier: without the preflight an unknown package sandboxes
+# (rc 0), never 104.
+# ---------------------------------------------------------------------------
+
+# Fresh (unknown) npm package on the interactive proceed path; run_sandbox is
+# stubbed to record that execution was reached. FORCE=1 sets --force.
+preflight_fixture='
+  set -- version
+  source "$SAFE_RUN_PATH" >/dev/null
+  ensure_dirs
+  is_tty() { return 0; }
+  RUNNER_KIND=npm
+  PKG_NAME=freshpkg
+  PKG_VERSION=9.9.9
+  PKG_VERSION_USER_SPECIFIED=1
+  SKIP_PROMPT=1
+  [[ "${FORCE:-0}" == "1" ]] && FORCE_AUDIT_OVERRIDE=1
+  mark_sandbox_known() { :; }
+  run_sandbox_with_audit_log() { printf ran >> "$PREFLIGHT_RAN_LOG"; return 0; }
+  dispatch_run
+'
+
+# A: BLOCK verdict refuses with exit 104 before the sandbox (the falsifier).
+set +e
+SAFE_RUN_CONFIG_DIR="$tmp/config-pf-block" SAFE_RUN_DATA_DIR="$tmp/data-pf-block" \
+SAFE_RUN_PATH="$SAFE_RUN" \
+SAFE_AUDIT_PROBE_RC=20 SAFE_AUDIT_PROBE_JSON='{"verdict":"BLOCK","warn_causes":[]}' \
+SAFE_AUDIT_PROBE_LOG="$tmp/pf-block-probe.log" \
+PREFLIGHT_RAN_LOG="$tmp/pf-block-ran.log" \
+  bash -c "$preflight_fixture" safe-run >"$tmp/pf-block.err" 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 104 ]] || fail "unknown BLOCK preflight expected exit 104, got $rc"
+[[ ! -e "$tmp/pf-block-ran.log" ]] || fail "BLOCK preflight reached the sandbox"
+[[ -s "$tmp/pf-block-probe.log" ]] || fail "BLOCK preflight did not invoke safe-audit"
+grep -q 'to override' "$tmp/pf-block.err" || fail "BLOCK refusal omits the --force override hint"
+pass "unknown-package BLOCK verdict refuses with exit 104 before sandboxing"
+
+# B: --force (operator TTY) overrides the BLOCK into the sandbox, logged.
+set +e
+SAFE_RUN_CONFIG_DIR="$tmp/config-pf-force" SAFE_RUN_DATA_DIR="$tmp/data-pf-force" \
+SAFE_RUN_PATH="$SAFE_RUN" FORCE=1 \
+SAFE_AUDIT_PROBE_RC=20 SAFE_AUDIT_PROBE_JSON='{"verdict":"BLOCK","warn_causes":[]}' \
+SAFE_AUDIT_PROBE_LOG="$tmp/pf-force-probe.log" \
+PREFLIGHT_RAN_LOG="$tmp/pf-force-ran.log" \
+  bash -c "$preflight_fixture" safe-run >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] || fail "--force override expected exit 0, got $rc"
+[[ -s "$tmp/pf-force-ran.log" ]] || fail "--force did not reach the sandbox"
+grep -q 'PREFLIGHT | interactive | BLOCK_FORCED' "$tmp/data-pf-force/audit.log" || fail "--force override not logged as BLOCK_FORCED"
+pass "--force overrides a BLOCK verdict into the sandbox (TTY, logged)"
+
+# C: WARN with a real package finding warns and continues into the sandbox.
+set +e
+SAFE_RUN_CONFIG_DIR="$tmp/config-pf-warn" SAFE_RUN_DATA_DIR="$tmp/data-pf-warn" \
+SAFE_RUN_PATH="$SAFE_RUN" \
+SAFE_AUDIT_PROBE_RC=10 SAFE_AUDIT_PROBE_JSON='{"verdict":"WARN","warn_causes":["malware"]}' \
+PREFLIGHT_RAN_LOG="$tmp/pf-warn-ran.log" \
+  bash -c "$preflight_fixture" safe-run >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] || fail "WARN preflight expected exit 0, got $rc"
+[[ -s "$tmp/pf-warn-ran.log" ]] || fail "WARN preflight did not continue into the sandbox"
+grep -q 'PREFLIGHT | interactive | WARN' "$tmp/data-pf-warn/audit.log" || fail "WARN preflight not logged"
+pass "unknown-package WARN warns and continues into the sandbox"
+
+# D: infra-only WARN is audit breakage, not a package finding -> inconclusive.
+set +e
+SAFE_RUN_CONFIG_DIR="$tmp/config-pf-infra" SAFE_RUN_DATA_DIR="$tmp/data-pf-infra" \
+SAFE_RUN_PATH="$SAFE_RUN" \
+SAFE_AUDIT_PROBE_RC=10 SAFE_AUDIT_PROBE_JSON='{"verdict":"WARN","warn_causes":["socket_unavailable"]}' \
+PREFLIGHT_RAN_LOG="$tmp/pf-infra-ran.log" \
+  bash -c "$preflight_fixture" safe-run >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] || fail "infra-only WARN expected exit 0, got $rc"
+[[ -s "$tmp/pf-infra-ran.log" ]] || fail "infra-only WARN did not continue into the sandbox"
+grep -q 'PREFLIGHT | interactive | INCONCLUSIVE' "$tmp/data-pf-infra/audit.log" || fail "infra-only WARN not logged as INCONCLUSIVE"
+pass "unknown-package infra-only WARN degrades to inconclusive, never blocks"
+
+# E: clean GO continues and is logged as GO.
+set +e
+SAFE_RUN_CONFIG_DIR="$tmp/config-pf-go" SAFE_RUN_DATA_DIR="$tmp/data-pf-go" \
+SAFE_RUN_PATH="$SAFE_RUN" \
+PREFLIGHT_RAN_LOG="$tmp/pf-go-ran.log" \
+  bash -c "$preflight_fixture" safe-run >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] || fail "GO preflight expected exit 0, got $rc"
+[[ -s "$tmp/pf-go-ran.log" ]] || fail "GO preflight did not continue into the sandbox"
+grep -q 'PREFLIGHT | interactive | GO' "$tmp/data-pf-go/audit.log" || fail "GO preflight not logged"
+pass "unknown-package clean GO continues into the sandbox"
+
+# F: no installed safe-audit -> degrade honestly (warn + continue), no verdict.
+set +e
+SAFE_RUN_CONFIG_DIR="$tmp/config-pf-missing" SAFE_RUN_DATA_DIR="$tmp/data-pf-missing" \
+SAFE_RUN_PATH="$SAFE_RUN" \
+SAFE_AUDIT_BIN="/nonexistent/safe-audit-absent" \
+SAFE_AUDIT_PROBE_LOG="$tmp/pf-missing-probe.log" \
+PREFLIGHT_RAN_LOG="$tmp/pf-missing-ran.log" \
+  bash -c "$preflight_fixture" safe-run >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] || fail "missing safe-audit expected exit 0, got $rc"
+[[ -s "$tmp/pf-missing-ran.log" ]] || fail "missing safe-audit did not continue into the sandbox"
+[[ ! -e "$tmp/pf-missing-probe.log" ]] || fail "missing safe-audit somehow probed"
+grep -q 'PREFLIGHT | interactive | UNAVAILABLE' "$tmp/data-pf-missing/audit.log" || fail "missing safe-audit not logged as UNAVAILABLE"
+pass "no installed safe-audit degrades honestly (no verdict, continue)"
+
+# G (placement discriminator): a NON-TTY unknown still refuses early with exit
+# 102 and runs NO audit — the hottest refusal lane pays no preflight cost.
+set +e
+SAFE_RUN_CONFIG_DIR="$tmp/config-pf-nontty" SAFE_RUN_DATA_DIR="$tmp/data-pf-nontty" \
+SAFE_RUN_PATH="$SAFE_RUN" \
+SAFE_AUDIT_PROBE_LOG="$tmp/pf-nontty-probe.log" \
+PREFLIGHT_RAN_LOG="$tmp/pf-nontty-ran.log" \
+  bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    ensure_dirs
+    RUNNER_KIND=npm
+    PKG_NAME=freshpkg
+    PKG_VERSION=9.9.9
+    PKG_VERSION_USER_SPECIFIED=1
+    run_sandbox_with_audit_log() { printf ran >> "$PREFLIGHT_RAN_LOG"; return 0; }
+    dispatch_run
+  ' safe-run >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 102 ]] || fail "non-TTY unknown expected exit 102, got $rc"
+[[ ! -e "$tmp/pf-nontty-probe.log" ]] || fail "non-TTY unknown invoked the preflight (should not)"
+[[ ! -e "$tmp/pf-nontty-ran.log" ]] || fail "non-TTY unknown reached the sandbox"
+pass "non-TTY unknown refuses with exit 102 and runs no audit preflight"
+
+# --- Grant-lane preflight (host-allow add): re-audit before trust escalation ---
+
+# I: BLOCK verdict aborts the grant on a non-TTY confirmation; nothing written.
+set +e
+SAFE_RUN_CONFIG_DIR="$tmp/config-grant-block" SAFE_RUN_DATA_DIR="$tmp/data-grant-block" \
+SAFE_RUN_PATH="$SAFE_RUN" \
+SAFE_AUDIT_PROBE_RC=20 SAFE_AUDIT_PROBE_JSON='{"verdict":"BLOCK","warn_causes":[]}' \
+SAFE_AUDIT_PROBE_LOG="$tmp/grant-block-probe.log" \
+ERR_FILE="$tmp/grant-block.err" \
+  bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    ensure_dirs
+    registry_integrity_npm() { printf "sha512-fixture"; }
+    require_operator_tty() { :; }
+    set +e
+    ( cmd_host_allow_add newpkg@1.0.0 --reason "wants it" ) >/dev/null 2>"$ERR_FILE"
+    grc=$?
+    set -e
+    [[ "$grc" -ne 0 ]] || exit 1
+    [[ "$(jq -r ".packages | length" "$HOST_ALLOW_FILE")" == "0" ]] || exit 1
+    grep -q "interactive operator terminal" "$ERR_FILE" || exit 1
+  ' safe-run
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] || fail "host-allow add did not abort on a non-TTY BLOCK confirmation"
+[[ -s "$tmp/grant-block-probe.log" ]] || fail "grant preflight did not audit before host-allow add"
+pass "host-allow add re-audits; a BLOCK verdict aborts the grant (non-TTY)"
+
+# J: a clean GO proceeds and the grant lane did audit (probe invoked).
+SAFE_RUN_CONFIG_DIR="$tmp/config-grant-go" SAFE_RUN_DATA_DIR="$tmp/data-grant-go" \
+SAFE_RUN_PATH="$SAFE_RUN" \
+SAFE_AUDIT_PROBE_LOG="$tmp/grant-go-probe.log" \
+  bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    ensure_dirs
+    registry_integrity_npm() { printf "sha512-fixture"; }
+    require_operator_tty() { :; }
+    cmd_host_allow_add okpkg@1.2.3 --reason "clean" >/dev/null 2>&1
+    [[ "$(jq -r ".packages.okpkg.version" "$HOST_ALLOW_FILE")" == "1.2.3" ]]
+  ' safe-run || fail "host-allow add with a clean GO preflight failed"
+[[ -s "$tmp/grant-go-probe.log" ]] || fail "grant preflight did not audit on a clean add"
+pass "host-allow add audits host-side and a clean GO proceeds"
+
+# L: infra-only WARN never blocks a grant (audit breakage != package finding).
+SAFE_RUN_CONFIG_DIR="$tmp/config-grant-infra" SAFE_RUN_DATA_DIR="$tmp/data-grant-infra" \
+SAFE_RUN_PATH="$SAFE_RUN" \
+SAFE_AUDIT_PROBE_RC=10 SAFE_AUDIT_PROBE_JSON='{"verdict":"WARN","warn_causes":["osv_unavailable"]}' \
+  bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    ensure_dirs
+    registry_integrity_npm() { printf "sha512-fixture"; }
+    require_operator_tty() { :; }
+    cmd_host_allow_add infrapkg@2.0.0 --reason "infra" >/dev/null 2>&1
+    [[ "$(jq -r ".packages.infrapkg.version" "$HOST_ALLOW_FILE")" == "2.0.0" ]]
+  ' safe-run || fail "host-allow add blocked on an infra-only WARN (should degrade)"
+pass "host-allow add: infra-only WARN degrades, grant proceeds"
