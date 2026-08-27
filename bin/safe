@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.48.0"
+SAFE_VERSION="1.49.0"
 # Exported at the top level, not per-subcommand: safe-audit pins itself to
 # this version, and every route that reaches it — the gate, `safe audit ...`,
 # `safe install`, the safe-audit compatibility command — must carry it or the
@@ -15,6 +15,11 @@ SAFE_RUN_PATH="$SAFE_DIR/safe-run"
 # Env override so a test harness (or a side-by-side build) can point the
 # dispatcher and the install gate at a specific safe-audit.
 SAFE_AUDIT_PATH="${SAFE_AUDIT_PATH:-$SAFE_DIR/safe-audit}"
+# Belt for safe-run's own preflight (round-1 F2): pass the pinned sibling in so
+# safe run's host-side audit binds to the trusted safe-audit, not a PATH-shadowed
+# one. An explicit SAFE_AUDIT_BIN still wins; safe-run resolves its own sibling
+# when reached outside the dispatcher (the npx/bunx symlinks).
+export SAFE_AUDIT_BIN="${SAFE_AUDIT_BIN:-$SAFE_AUDIT_PATH}"
 SAFE_BIN_ROOT="${SAFE_BIN_DIR:-$HOME/.local/bin}"
 SAFE_ZSH_COMPLETION_DIR="${SAFE_ZSH_COMPLETION_DIR:-$HOME/.local/share/zsh/site-functions}"
 

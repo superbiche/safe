@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- **`safe run` regains a real host-side unknown-package audit preflight**
+  (1.49.0). PR #82 removed a sandboxed preflight that fetched an unpinned
+  `safe-audit` npm name inside Podman and never once produced a verdict on a
+  real machine (404, "inconclusive", continue). This restores a *working*
+  preflight that reuses the **installed** `safe-audit` on the host — no
+  container, no npm fetch — the same probe shape as `host_allow_review_probe`
+  (`SAFE_AUDIT_NO_INIT`, closed stdin, timeout leash via
+  `SAFE_RUN_PREFLIGHT_TIMEOUT`, default 90s). Before an **unknown** package is
+  sandboxed, safe re-audits it: a **BLOCK** verdict (Socket BLOCK or a critical
+  advisory on the resolved version) now refuses with **exit 104** before the
+  package runs — it can refuse installs that succeed today. A **WARN** with a
+  real package finding warns and continues into the sandbox; audit-infrastructure
+  breakage (Socket/OSV unavailable/auth/rate-limit) and any inconclusive or
+  unparseable result degrade honestly (warn + continue, never a CVE signal).
+  The non-TTY unknown path still refuses early with exit 102 and runs **no**
+  audit — the hottest refusal lane in agent shells adds no latency or quota
+  burn. A new **`--force`** flag (operator TTY, logged) overrides a preflight
+  BLOCK into the **sandbox only** — never host exec — and overrides nothing
+  else: the blocklist, host-allow pin mismatch, and every other refusal stay
+  fail-closed. The trust-escalation grants (`host-allow add`/`update`,
+  `scripts-allow add`) also regain a grant-time preflight: a WARN/BLOCK
+  requires an explicit interactive confirmation, while `--reason` stays
+  unconditionally required regardless of verdict (a clean GO does **not** skip
+  it). The shared exec core (`_safe_audit_run_json`) backs both the run-lane
+  and review probes so their incantation cannot drift. This is a genuine gate
+  activation, not a cleanup: the old preflight never fired live, so the gate
+  now audits uniformly on every machine (host-side needs no podman). A forced
+  BLOCK runs once in the sandbox but is NEVER persisted as sandbox-known (so a
+  later non-TTY run cannot silently re-run the blocked package unaudited); the
+  preflight binds to the `safe-audit` installed beside `safe run` (dispatcher
+  pins the same sibling), so a PATH-shadowed `safe-audit` cannot author a
+  verdict; the probe passes `--installer` so a bunx preflight models bun's
+  resolution, not npm's; and a grant-time rc-0 result without a corroborating
+  GO warns as inconclusive rather than passing silently. Fibery #86.
+
 - **mise `-C`/`--cd` lane enters the target with physical `cd`** (1.48.0). The
   mise routing surface entered the caller's `-C`/`--cd` directory with a bare
   `cd` at both the audit lane (`safe_gate_mise_check_with_env`) and the
