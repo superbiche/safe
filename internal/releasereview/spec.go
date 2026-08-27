@@ -51,11 +51,15 @@ var implementedChecks = []string{CheckChecksum, CheckSignature, CheckRelease, Ch
 // repeats them so a consumer can preflight a spec before writing one.
 const (
 	// SpecVersion is the only spec_version Decode accepts. It rose to 2 when the
-	// signature check learned detached cert+signature evidence: the schema gained
-	// optional fields, so a consumer must be able to tell a build that understands
-	// them from one that would refuse them as unknown, and the advertised
-	// spec_version is that signal.
-	SpecVersion = 2
+	// signature check learned detached cert+signature evidence, and to 3 when the
+	// release check learned `allow_unsigned_commit` and the vuln check learned
+	// `packages`: each gained an optional field, and under strict decode a build
+	// that does not know the field refuses a spec carrying it as unknown. The
+	// advertised spec_version is the signal that lets a consumer tell the two
+	// apart and preflight before writing the field — so it must rise in lockstep
+	// with every such addition. (`allow_unsigned_commit` shipped in 1.46.0 without
+	// its bump; 3 covers both fields.)
+	SpecVersion = 3
 	// ReportSchemaVersion is the schema_version every report carries. Detached
 	// evidence added reason codes, not report shape, so it stays 1: a consumer
 	// parses reasons by their (check, code) pair and a new code is data, not a
@@ -182,8 +186,10 @@ type AdvisoryPackage struct {
 // turns scoping on: an empty scope is the honest assertion "no advisory package
 // in this repository tracks the subject artifact" (a Rust binary in a repo that
 // publishes only npm/extension advisories). Its ABSENCE is package-blind, the
-// pre-scoping default that matches every advisory. This is the ONE place the
-// nil-vs-empty distinction is read; never re-derive it from len().
+// pre-scoping default that matches every advisory; a JSON `null` decodes to the
+// same nil slice as an omitted key, so it too reads as blind — the fail-closed,
+// wider-matching direction. This is the ONE place the nil-vs-empty distinction is
+// read; never re-derive it from len().
 func (v *VulnCheck) scoped() bool { return v.Packages != nil }
 
 // validate rejects a declared identity that names nothing. An empty packages

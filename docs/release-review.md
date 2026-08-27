@@ -54,7 +54,7 @@ contract as well as the key:
 {
   "capabilities": {"binary-audit.release-review": true},
   "versions": {
-    "binary-audit.release-review": {"spec_version": 2, "report_schema_version": 1}
+    "binary-audit.release-review": {"spec_version": 3, "report_schema_version": 1}
   },
   "groups": {"binary-audit": {"release-review": true}}
 }
@@ -103,11 +103,11 @@ that ran.
 The bash forward adds one more: a missing or version-skewed `safe-core` returns
 30 with a single stderr line naming `rerun install.sh` as the recovery.
 
-## Spec schema (`spec_version` 2)
+## Spec schema (`spec_version` 3)
 
 ```json
 {
-  "spec_version": 2,
+  "spec_version": 3,
   "subject": {"repo": "OWNER/REPO", "version": "TAG"},
   "artifacts": [
     {
@@ -146,7 +146,7 @@ the example above already supports it:
 
 ```json
 {
-  "spec_version": 2,
+  "spec_version": 3,
   "subject": {"repo": "OWNER/REPO", "version": "TAG"},
   "artifacts": [
     {
@@ -176,7 +176,7 @@ match, so the `checksum` check is enabled and the artifact carries its
 
 ```json
 {
-  "spec_version": 2,
+  "spec_version": 3,
   "subject": {"repo": "OWNER/REPO", "version": "TAG"},
   "artifacts": [
     {
@@ -205,7 +205,7 @@ carry:
 
 ```json
 {
-  "spec_version": 2,
+  "spec_version": 3,
   "subject": {"repo": "OWNER/REPO", "version": "v1.2.3"},
   "artifacts": [{"path": "dist/foo.tar.gz"}],
   "checks": {
@@ -220,7 +220,7 @@ trust material to compare:
 
 ```json
 {
-  "spec_version": 2,
+  "spec_version": 3,
   "subject": {"repo": "sigstore/root-signing", "version": "v9"},
   "artifacts": [{"path": "trust/root.json"}],
   "checks": {
@@ -240,7 +240,7 @@ An enabled `exec` block names the executable to smoke — a free path, not an
 
 ```json
 {
-  "spec_version": 2,
+  "spec_version": 3,
   "subject": {"repo": "OWNER/REPO", "version": "TAG"},
   "artifacts": [{"path": "dist/foo.tar.gz"}],
   "checks": {
@@ -251,7 +251,7 @@ An enabled `exec` block names the executable to smoke — a free path, not an
 
 ### Fields
 
-- `spec_version` — must be exactly `2`.
+- `spec_version` — must be exactly `3`.
 - `subject.repo`, `subject.version` — required, non-empty. Echoed into the
   report so a stored report identifies itself without its spec.
 - `artifacts` — required, at least one entry.
@@ -301,9 +301,11 @@ it, which is what keeps the schema example above valid.
   optional `packages` array declaring which advisory-package identities describe
   the subject artifact, each `{"ecosystem": ..., "name": ...}` as GitHub reports
   them in an advisory's `vulnerabilities[].package`:
-  - **Absent** — the check is package-blind: every advisory in the repository is
-    matched against the subject, the pre-scoping default.
-  - **Present, even as `[]`** — scoping is active: only entries whose package
+  - **Absent, or `null`** — the check is package-blind: every advisory in the
+    repository is matched against the subject, the pre-scoping default. A JSON
+    `null` reads the same as an omitted key (the fail-closed, wider-matching
+    direction).
+  - **Present as an array, even `[]`** — scoping is active: only entries whose package
     matches a declared identity are read; the rest are ruled not-applicable. An
     empty array is the honest "no advisory package in this repository tracks this
     artifact" — the shape a Rust binary uses in a repo that publishes only npm
@@ -345,7 +347,7 @@ because each one means the document does not say one unambiguous thing:
   spec — by a broken generator, or a careless `cat` of two files — would
   otherwise be read past and ignored.
 - **A member repeated inside one object, at any depth.** JSON decoders keep the
-  last occurrence, so a spec stating both `"spec_version": 2` and
+  last occurrence, so a spec stating both `"spec_version": 3` and
   `"spec_version": 1` would quietly become whichever the writer put last.
 
 Surrounding whitespace and the trailing newline every spec file ends with are

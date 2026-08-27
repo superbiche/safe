@@ -19,7 +19,13 @@
   space-separated two-sided bound `A <= B` as `>= A, <= B` (both inclusive) — the
   spelling of codex's npm range `0.2.0 <= 0.38.0`, previously ambiguous and
   resolved only by its `patched_versions`. Additive only: no range that already
-  decided changes meaning.
+  decided changes meaning. **The release-review `spec_version` rises 2 → 3**: both
+  this `packages` field and 1.46.0's `checks.release.allow_unsigned_commit` are
+  optional fields a strict-decoding older build refuses as unknown, so the
+  advertised spec_version must rise for a consumer to preflight them (1.46.0
+  shipped its field without the bump — 3 covers both). safe-core and the
+  `safe audit capabilities` payload now advertise `spec_version: 3`; a consumer
+  pinned to 2 is told to bump in lockstep rather than silently rejected mid-spec.
 - **release-review `release`: read the release history in small early-stopping
   pages, and accept an unsigned commit when the spec allows it** (1.46.0). Two
   live-usage fixes surfaced reviewing openai/codex. (1) The release-history

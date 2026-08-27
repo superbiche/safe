@@ -78,7 +78,7 @@ declare -ar SAFE_AUDIT_OSV_LOCKFILE_FORMATS=(
 # capability key rather than left to be discovered from a refusal. Guarded
 # against safe-core's own `release-review --versions` by
 # tests/audit/release_review_forward.sh.
-RELEASE_REVIEW_SPEC_VERSION=2
+RELEASE_REVIEW_SPEC_VERSION=3
 RELEASE_REVIEW_REPORT_SCHEMA_VERSION=1
 
 # binary-audit is the release-review composite: one spec-driven command that
