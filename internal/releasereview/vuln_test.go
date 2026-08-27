@@ -14,7 +14,7 @@ func vulnSpec() Spec {
 		SpecVersion: SpecVersion,
 		Subject:     Subject{Repo: testRepo, Version: testVersion},
 		Artifacts:   []Artifact{{Path: "dist/" + testAsset, AssetName: testAsset}},
-		Checks:      &Checks{Vuln: &CheckConfig{Enabled: true}},
+		Checks:      &Checks{Vuln: &VulnCheck{CheckConfig: CheckConfig{Enabled: true}}},
 	}
 }
 
@@ -57,6 +57,34 @@ func vulnSpecVersion(version string) Spec {
 	spec := vulnSpec()
 	spec.Subject.Version = version
 	return spec
+}
+
+// vulnSpecScoped is vulnSpecVersion with a declared package scope. A nil slice
+// leaves the check package-blind; a non-nil slice — an empty one included —
+// turns scoping on.
+func vulnSpecScoped(version string, packages []AdvisoryPackage) Spec {
+	spec := vulnSpecVersion(version)
+	spec.Checks.Vuln.Packages = packages
+	return spec
+}
+
+// packagedEntry is one advisory entry that names its own package identity, so a
+// test can mix in-scope and out-of-scope entries in one advisory.
+type packagedEntry struct {
+	ecosystem, name, versionRange, patched string
+}
+
+// advisoryBodyPackaged builds a GHSA record from entries that each carry an
+// explicit package identity.
+func advisoryBodyPackaged(id, severity string, entries ...packagedEntry) string {
+	encoded := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		encoded = append(encoded, fmt.Sprintf(
+			`{"package":{"ecosystem":%q,"name":%q},"vulnerable_version_range":%q,"patched_versions":%q}`,
+			entry.ecosystem, entry.name, entry.versionRange, entry.patched))
+	}
+	return fmt.Sprintf(`{"ghsa_id":%q,"cve_id":"CVE-2026-0001","severity":%q,"summary":"test advisory","vulnerabilities":[%s]}`,
+		id, severity, strings.Join(encoded, ","))
 }
 
 // A repository with no advisories answers with an empty array, and an empty
@@ -171,12 +199,14 @@ func TestVulnPatchedVersionResolvesAnUnreadableRange(t *testing.T) {
 	}
 }
 
-// The real GHSA-w5fx-fh39-j5rw shape: openai/codex publishes it against its npm
-// package (`0.2.0 <= 0.38.0`, an unreadable space-separated compound bound) and
-// its VS Code extension (`<= 0.4.11`), each with a patched_versions. Reviewing
-// the Rust binary tag rust-v0.149.1, the readable range excludes it and the
-// unreadable one is resolved by its fix version — a clean GO, where before the
-// unparseable range was a permanent BLOCK.
+// The real GHSA-w5fx-fh39-j5rw shape, package-blind: openai/codex publishes it
+// against its npm package (`0.2.0 <= 0.38.0`) and its VS Code extension
+// (`<= 0.4.11`), each with a patched_versions. Reviewing the Rust binary tag
+// rust-v0.149.1, both ranges exclude it — the compound npm bound now parses (Item
+// B) and 0.149.1 sits above its 0.38.0 ceiling, where before the unparseable
+// range was a permanent BLOCK. A clean GO even without scoping. Item A's scoping
+// makes the same GO not depend on the version numbers happening not to overlap
+// (see TestVulnEmptyScopeRulesForeignAdvisoryNotApplicable).
 func TestVulnCodexRustTagIsNotBlockedByItsNpmAdvisory(t *testing.T) {
 	body := advisoryBodyEntries("GHSA-w5fx", "high",
 		advisoryEntry{"0.2.0 <= 0.38.0", "0.39.0"},
@@ -473,5 +503,110 @@ func TestVulnSendsTheTokenOnlyInTheAuthorizationHeader(t *testing.T) {
 		if strings.Contains(request.path, token) || strings.Contains(request.rawQuery, token) {
 			t.Fatalf("the token reached the request line of %s", request.path)
 		}
+	}
+}
+
+// --- Item A: package/ecosystem scoping ---------------------------------------
+
+// The codex reality that motivated scoping: openai/codex's GHSA-w5fx names its
+// npm package and a VS Code extension, neither of which is the Rust binary under
+// review. With an empty declared scope — the honest "no advisory package in this
+// repository tracks this artifact" — the advisory is not-applicable: a clean GO
+// carrying one auditable note, never a version comparison against a foreign
+// package's range. Version 0.30.0 is chosen so it falls INSIDE the npm range: it
+// is scoping, not the numbers, that rules the advisory out (see the blind
+// counterpart below, which BLOCKs on the same inputs).
+func TestVulnEmptyScopeRulesForeignAdvisoryNotApplicable(t *testing.T) {
+	body := advisoryBodyPackaged("GHSA-w5fx", "critical",
+		packagedEntry{"npm", "@openai/codex", "0.2.0 <= 0.38.0", "0.39.0"},
+		packagedEntry{"vs code", "Codex IDE Extension", "<= 0.4.11", "0.4.12"},
+	)
+	newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+	result := vuln(vulnSpecScoped("rust-v0.30.0", []AdvisoryPackage{}))
+	if result.Verdict != GO {
+		t.Fatalf("verdict %s with reasons %v, want GO", result.Verdict, codes(result))
+	}
+	reason := reasonWithCode(t, result, "advisory_out_of_scope")
+	if reason.Data["count"] != "1" || reason.Data["advisories"] != "GHSA-w5fx" {
+		t.Fatalf("out-of-scope note data %v, want count 1 and GHSA-w5fx", reason.Data)
+	}
+}
+
+// Blind is the default and still matches a foreign package: the same advisory
+// and version with NO declared scope is a BLOCK. Scoping is the only thing that
+// changes the verdict, and only when the spec asks for it.
+func TestVulnBlindDefaultStillMatchesForeignPackage(t *testing.T) {
+	body := advisoryBodyPackaged("GHSA-w5fx", "critical",
+		packagedEntry{"npm", "@openai/codex", "0.2.0 <= 0.38.0", "0.39.0"},
+	)
+	newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+	result := vuln(vulnSpecVersion("rust-v0.30.0"))
+	if result.Verdict != BLOCK || !hasCode(result, "known_advisory_high_severity") {
+		t.Fatalf("verdict %s with reasons %v, want a package-blind BLOCK", result.Verdict, codes(result))
+	}
+}
+
+// Only the in-scope entry drives the verdict: one advisory carries a matching
+// range on a FOREIGN package and an excluding range on the DECLARED one. The
+// declared package's exclusion decides it; the foreign match is never read.
+func TestVulnScopeReadsOnlyDeclaredPackage(t *testing.T) {
+	body := advisoryBodyPackaged("GHSA-mixed", "critical",
+		packagedEntry{"npm", "@openai/codex", "<= 9.9.9", ""}, // would match, but foreign
+		packagedEntry{"githubactions", "openai/codex", "<0.1.0", ""},
+	)
+	newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+	scope := []AdvisoryPackage{{Ecosystem: "githubactions", Name: "openai/codex"}}
+	result := vuln(vulnSpecScoped("rust-v0.30.0", scope))
+	if result.Verdict != GO || len(result.Reasons) != 0 {
+		t.Fatalf("verdict %s with reasons %v, want a clean GO from the declared package's exclusion", result.Verdict, codes(result))
+	}
+}
+
+// Fail-closed on an identity-less entry: with scoping active, an advisory entry
+// naming no package cannot be ruled out by identity, so it is read anyway — a
+// matching range on it still BLOCKs rather than silently dropping out of scope.
+func TestVulnScopeKeepsIdentitylessEntryInScope(t *testing.T) {
+	body := advisoryBodyPackaged("GHSA-noident", "critical",
+		packagedEntry{"", "", "<= 9.9.9", ""},
+	)
+	newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+	scope := []AdvisoryPackage{{Ecosystem: "npm", Name: "@openai/codex"}}
+	result := vuln(vulnSpecScoped("rust-v0.30.0", scope))
+	if result.Verdict != BLOCK || !hasCode(result, "known_advisory_high_severity") {
+		t.Fatalf("verdict %s with reasons %v, want BLOCK (identity-less entry stays in scope)", result.Verdict, codes(result))
+	}
+}
+
+// Ecosystem and name match case-insensitively, because GitHub's ecosystem is
+// free text ("vs code"): a scope declared in one casing includes an advisory
+// entry written in another. Over-matching this way fails closed.
+func TestVulnScopeMatchesCaseInsensitively(t *testing.T) {
+	body := advisoryBodyPackaged("GHSA-case", "critical",
+		packagedEntry{"VS Code", "Codex IDE Extension", "<= 9.9.9", ""},
+	)
+	newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+	scope := []AdvisoryPackage{{Ecosystem: "vs code", Name: "codex ide extension"}}
+	result := vuln(vulnSpecScoped("rust-v0.30.0", scope))
+	if result.Verdict != BLOCK {
+		t.Fatalf("verdict %s with reasons %v, want BLOCK (case-insensitive scope match)", result.Verdict, codes(result))
+	}
+}
+
+// A scoped advisory that carries no entries at all names no package to rule out,
+// so it stays ambiguous (fail-closed) rather than being read as not-applicable.
+// not-applicable is only for an advisory whose entries were ALL out of scope.
+func TestVulnScopeEmptyAdvisoryStaysAmbiguous(t *testing.T) {
+	body := advisoryBodyPackaged("GHSA-noentries", "low")
+	newFakeGitHub(t, routes(advisoriesFeed(body)))
+
+	scope := []AdvisoryPackage{{Ecosystem: "npm", Name: "@openai/codex"}}
+	result := vuln(vulnSpecScoped("rust-v0.30.0", scope))
+	if result.Verdict != BLOCK || !hasCode(result, "version_mapping_ambiguous") {
+		t.Fatalf("verdict %s with reasons %v, want an ambiguous BLOCK", result.Verdict, codes(result))
 	}
 }

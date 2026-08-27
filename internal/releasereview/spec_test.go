@@ -17,164 +17,164 @@ func TestDecodeRejects(t *testing.T) {
 	}{
 		{
 			name:    "unknown top-level field",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"extra":1}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"extra":1}`,
 			wantSub: `unknown field "extra"`,
 		},
 		{
 			name:    "unknown nested field",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","sha":"x"}]}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","sha":"x"}]}`,
 			wantSub: `unknown field "sha"`,
 		},
 		{
 			name:    "unknown field inside a check block",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"checksum":{"enabled":true,"strict":true}}}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"checksum":{"enabled":true,"strict":true}}}`,
 			wantSub: `unknown field "strict"`,
 		},
 		{
 			name:    "wrong spec_version",
-			spec:    `{"spec_version":3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}]}`,
-			wantSub: "spec_version must be 2 (got 3)",
+			spec:    `{"spec_version":4,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}]}`,
+			wantSub: "spec_version must be 3 (got 4)",
 		},
 		{
 			name:    "missing spec_version",
 			spec:    `{"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}]}`,
-			wantSub: "spec_version must be 2 (got 0)",
+			wantSub: "spec_version must be 3 (got 0)",
 		},
 		{
 			name:    "missing repo",
-			spec:    `{"spec_version": 2,"subject":{"version":"v1"},"artifacts":[{"path":"a"}]}`,
+			spec:    `{"spec_version": 3,"subject":{"version":"v1"},"artifacts":[{"path":"a"}]}`,
 			wantSub: "subject.repo is required",
 		},
 		{
 			name:    "missing version",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r"},"artifacts":[{"path":"a"}]}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r"},"artifacts":[{"path":"a"}]}`,
 			wantSub: "subject.version is required",
 		},
 		{
 			name:    "no artifacts",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[]}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[]}`,
 			wantSub: "artifacts must contain at least one entry",
 		},
 		{
 			name:    "artifact without a path",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"asset_name":"a"}]}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"asset_name":"a"}]}`,
 			wantSub: "artifacts[0].path is required",
 		},
 		{
 			name:    "signature with both identity forms",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"signature":{"bundle":"b","identity":"i","identity_regexp":"r","oidc_issuer":"u"}}}]}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"signature":{"bundle":"b","identity":"i","identity_regexp":"r","oidc_issuer":"u"}}}]}`,
 			wantSub: "identity and identity_regexp are mutually exclusive",
 		},
 		{
 			name:    "signature with neither identity form",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"signature":{"bundle":"b","oidc_issuer":"u"}}}]}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"signature":{"bundle":"b","oidc_issuer":"u"}}}]}`,
 			wantSub: "one of identity or identity_regexp is required",
 		},
 		{
 			name:    "signature without an issuer",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"signature":{"bundle":"b","identity":"i"}}}]}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"signature":{"bundle":"b","identity":"i"}}}]}`,
 			wantSub: "signature.oidc_issuer is required",
 		},
 		{
 			name:    "signature with no evidence at all",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"signature":{"identity":"i","oidc_issuer":"u"}}}]}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"signature":{"identity":"i","oidc_issuer":"u"}}}]}`,
 			wantSub: "a bundle, or a detached certificate and signature, is required",
 		},
 		{
 			name:    "release enabled without an asset",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"release":{"enabled":true}}}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"release":{"enabled":true}}}`,
 			wantSub: "checks.release.asset is required",
 		},
 		{
 			name:    "signature enabled with no signature evidence anywhere",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"},{"path":"b"}],"checks":{"signature":{"enabled":true}}}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"},{"path":"b"}],"checks":{"signature":{"enabled":true}}}`,
 			wantSub: `check "signature" is enabled but no artifact carries evidence.signature`,
 		},
 		{
 			name:    "tuf mirror is a remote URL",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"https://tuf.example/root","root":"r","root_checksum":"` + sixtyFourHex + `","targets":{"n":"p"}}}}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"https://tuf.example/root","root":"r","root_checksum":"` + sixtyFourHex + `","targets":{"n":"p"}}}}`,
 			wantSub: "only supports local mirror paths or file:// URLs",
 		},
 		{
 			name:    "tuf mirror is missing",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"root":"r","root_checksum":"` + sixtyFourHex + `","targets":{"n":"p"}}}}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"root":"r","root_checksum":"` + sixtyFourHex + `","targets":{"n":"p"}}}}`,
 			wantSub: "checks.tuf.mirror is required",
 		},
 		{
 			name:    "tuf root checksum is not a sha256",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"m","root":"r","root_checksum":"deadbeef","targets":{"n":"p"}}}}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"m","root":"r","root_checksum":"deadbeef","targets":{"n":"p"}}}}`,
 			wantSub: "checks.tuf.root_checksum must be a sha256 digest",
 		},
 		{
 			name:    "tuf names no targets",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"m","root":"r","root_checksum":"` + sixtyFourHex + `","targets":{}}}}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"m","root":"r","root_checksum":"` + sixtyFourHex + `","targets":{}}}}`,
 			wantSub: "must name at least one trust target",
 		},
 		{
 			name:    "tuf target has no path",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"m","root":"r","root_checksum":"` + sixtyFourHex + `","targets":{"n":""}}}}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"m","root":"r","root_checksum":"` + sixtyFourHex + `","targets":{"n":""}}}}`,
 			wantSub: `checks.tuf.targets["n"] is empty`,
 		},
 		{
 			// A `..` segment would resolve out of <mirror>/targets when the
 			// name is joined into the blob path, so it is refused at the spec.
 			name:    "tuf target name climbs out of its directory",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"m","root":"r","root_checksum":"` + sixtyFourHex + `","targets":{"../../etc/passwd":"p"}}}}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"m","root":"r","root_checksum":"` + sixtyFourHex + `","targets":{"../../etc/passwd":"p"}}}}`,
 			wantSub: `must not contain a ".." path segment`,
 		},
 		{
 			name:    "tuf target name is absolute",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"m","root":"r","root_checksum":"` + sixtyFourHex + `","targets":{"/etc/passwd":"p"}}}}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"tuf":{"enabled":true,"mirror":"m","root":"r","root_checksum":"` + sixtyFourHex + `","targets":{"/etc/passwd":"p"}}}}`,
 			wantSub: "must be relative",
 		},
 		{
 			name:    "exec names no artifact",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"exec":{"enabled":true}}}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"exec":{"enabled":true}}}`,
 			wantSub: "checks.exec.artifact is required",
 		},
 		{
 			name:    "exec timeout is negative",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"exec":{"enabled":true,"artifact":"a","timeout_seconds":-1}}}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"exec":{"enabled":true,"artifact":"a","timeout_seconds":-1}}}`,
 			wantSub: "checks.exec.timeout_seconds must not be negative",
 		},
 		{
 			name:    "no checks enabled",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{}}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{}}`,
 			wantSub: "no checks are enabled",
 		},
 		{
 			name:    "every check explicitly disabled",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"checksum":{"enabled":false},"vuln":{"enabled":false}}}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],"checks":{"checksum":{"enabled":false},"vuln":{"enabled":false}}}`,
 			wantSub: "no checks are enabled",
 		},
 		{
 			name:    "checksum enabled with no checksum evidence anywhere",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"},{"path":"b"}],"checks":{"checksum":{"enabled":true}}}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"},{"path":"b"}],"checks":{"checksum":{"enabled":true}}}`,
 			wantSub: `check "checksum" is enabled but no artifact carries evidence.checksum_file`,
 		},
 		{
 			name:    "default checks with no checksum evidence anywhere",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}]}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}]}`,
 			wantSub: `check "checksum" is enabled but no artifact carries evidence.checksum_file`,
 		},
 		{
 			name:    "bundle and detached evidence are mutually exclusive",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"signature":{"bundle":"b","certificate":"c","signature":"s","identity":"i","oidc_issuer":"u"}}}]}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"signature":{"bundle":"b","certificate":"c","signature":"s","identity":"i","oidc_issuer":"u"}}}]}`,
 			wantSub: "a bundle and a detached certificate/signature are mutually exclusive",
 		},
 		{
 			name:    "detached certificate without signature",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"signature":{"certificate":"c","identity":"i","oidc_issuer":"u"}}}]}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"signature":{"certificate":"c","identity":"i","oidc_issuer":"u"}}}]}`,
 			wantSub: "detached verification requires both certificate and signature",
 		},
 		{
 			name:    "detached evidence with the checksum check disabled",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"checksum_file":"c","signature":{"certificate":"cert","signature":"sig","identity":"i","oidc_issuer":"u"}}}],"checks":{"signature":{"enabled":true}}}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"checksum_file":"c","signature":{"certificate":"cert","signature":"sig","identity":"i","oidc_issuer":"u"}}}],"checks":{"signature":{"enabled":true}}}`,
 			wantSub: "enable the checksum check so the digest match ties it to the artifact",
 		},
 		{
 			name:    "detached artifact carrying no checksum_file",
-			spec:    `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"checksum_file":"ca"}},{"path":"b","evidence":{"signature":{"certificate":"cert","signature":"sig","identity":"i","oidc_issuer":"u"}}}],"checks":{"checksum":{"enabled":true},"signature":{"enabled":true}}}`,
+			spec:    `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"checksum_file":"ca"}},{"path":"b","evidence":{"signature":{"certificate":"cert","signature":"sig","identity":"i","oidc_issuer":"u"}}}],"checks":{"checksum":{"enabled":true},"signature":{"enabled":true}}}`,
 			wantSub: "the artifact carries no evidence.checksum_file",
 		},
 	}
@@ -195,7 +195,7 @@ func TestDecodeRejects(t *testing.T) {
 // A detached cert+signature pair, with a checksum file and the checksum check
 // enabled, is the trufflehog shape spec_version 2 exists for. It must decode.
 func TestDecodeAcceptsDetachedSignature(t *testing.T) {
-	spec := `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"checksum_file":"c","signature":{"certificate":"cert.pem","signature":"sig","identity_regexp":".*","oidc_issuer":"u"}}}],"checks":{"checksum":{"enabled":true},"signature":{"enabled":true}}}`
+	spec := `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a","evidence":{"checksum_file":"c","signature":{"certificate":"cert.pem","signature":"sig","identity_regexp":".*","oidc_issuer":"u"}}}],"checks":{"checksum":{"enabled":true},"signature":{"enabled":true}}}`
 	decoded, err := Decode(strings.NewReader(spec))
 	if err != nil {
 		t.Fatalf("a valid detached spec was refused: %v", err)
@@ -210,7 +210,7 @@ func TestDecodeAcceptsDetachedSignature(t *testing.T) {
 // appended to a spec, and would silently keep the last of two contradictory
 // members. Both shapes mean the document does not say one thing.
 func TestDecodeRejectsAmbiguousDocuments(t *testing.T) {
-	const valid = `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},
+	const valid = `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},
 	                "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}]}`
 
 	cases := []struct {
@@ -224,32 +224,32 @@ func TestDecodeRejectsAmbiguousDocuments(t *testing.T) {
 		{"two whole specs", valid + valid, "exactly one JSON document"},
 		{
 			name: "contradictory spec_version",
-			spec: `{"spec_version":2,"subject":{"repo":"o/r","version":"v1"},
-			        "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],"spec_version": 2}`,
+			spec: `{"spec_version":3,"subject":{"repo":"o/r","version":"v1"},
+			        "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],"spec_version": 3}`,
 			wantSub: `"spec_version" is given more than once`,
 		},
 		{
 			name: "repeated member inside subject",
-			spec: `{"spec_version": 2,"subject":{"repo":"o/r","repo":"other/r","version":"v1"},
+			spec: `{"spec_version": 3,"subject":{"repo":"o/r","repo":"other/r","version":"v1"},
 			        "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}]}`,
 			wantSub: `"subject.repo" is given more than once`,
 		},
 		{
 			name: "repeated member inside an array element",
-			spec: `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},
+			spec: `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},
 			        "artifacts":[{"path":"a","path":"b","evidence":{"checksum_file":"c"}}]}`,
 			wantSub: `"artifacts.path" is given more than once`,
 		},
 		{
 			name: "repeated member inside a check block",
-			spec: `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},
+			spec: `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},
 			        "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],
 			        "checks":{"checksum":{"enabled":true,"enabled":false}}}`,
 			wantSub: `"checks.checksum.enabled" is given more than once`,
 		},
 		{
 			name: "repeated check block",
-			spec: `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},
+			spec: `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},
 			        "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],
 			        "checks":{"checksum":{"enabled":true},"checksum":{"enabled":false}}}`,
 			wantSub: `"checks.checksum" is given more than once`,
@@ -260,7 +260,7 @@ func TestDecodeRejectsAmbiguousDocuments(t *testing.T) {
 			// a duplicate that decodes to one field with byte order deciding the
 			// value. The shared repeat walker folds the key and refuses it.
 			name: "case-folded duplicate member",
-			spec: `{"spec_version": 2,"Spec_Version":2,"subject":{"repo":"o/r","version":"v1"},
+			spec: `{"spec_version": 3,"Spec_Version":2,"subject":{"repo":"o/r","version":"v1"},
 			        "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}]}`,
 			wantSub: `"Spec_Version" is given more than once`,
 		},
@@ -282,7 +282,7 @@ func TestDecodeRejectsAmbiguousDocuments(t *testing.T) {
 // The single-document gate must not trip on the trailing newline every spec
 // file on disk ends with, nor on surrounding whitespace.
 func TestDecodeAcceptsSurroundingWhitespace(t *testing.T) {
-	const valid = `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},
+	const valid = `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},
 	                "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}]}`
 
 	for _, spec := range []string{valid + "\n", valid + "\n\n", "\n\t" + valid + "  \n", valid} {
@@ -294,7 +294,7 @@ func TestDecodeAcceptsSurroundingWhitespace(t *testing.T) {
 
 // Deeply nested but duplicate-free documents pass the walk unharmed.
 func TestDecodeAcceptsNestedDuplicateFreeSpec(t *testing.T) {
-	spec := `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},
+	spec := `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},
 	          "artifacts":[
 	            {"path":"a","asset_name":"a","evidence":{"checksum_file":"c",
 	              "signature":{"bundle":"b","identity":"i","oidc_issuer":"u"}}},
@@ -302,6 +302,69 @@ func TestDecodeAcceptsNestedDuplicateFreeSpec(t *testing.T) {
 	          "checks":{"checksum":{"enabled":true,"advisory":false}}}`
 	if _, err := Decode(strings.NewReader(spec)); err != nil {
 		t.Fatalf("unexpected refusal: %v", err)
+	}
+}
+
+// The vuln check's package scope has three shapes, and the nil-vs-empty
+// distinction is load-bearing: absent leaves the check package-blind, while an
+// empty array turns scoping on with zero declared identities (the honest "no
+// advisory package here tracks this artifact"). A non-empty array is scoping
+// with identities.
+func TestDecodeVulnPackageScopeShapes(t *testing.T) {
+	const head = `{"spec_version":3,"subject":{"repo":"o/r","version":"v1"},` +
+		`"artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],"checks":{"vuln":`
+
+	for _, testCase := range []struct {
+		name       string
+		vuln       string
+		wantScoped bool
+		wantLen    int
+	}{
+		{"absent packages key is blind", `{"enabled":true}`, false, 0},
+		{"null packages reads the same as absent — blind", `{"enabled":true,"packages":null}`, false, 0},
+		{"empty packages array is an active empty scope", `{"enabled":true,"packages":[]}`, true, 0},
+		{"populated packages array is an active scope", `{"enabled":true,"packages":[{"ecosystem":"npm","name":"@openai/codex"}]}`, true, 1},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			spec, err := Decode(strings.NewReader(head + testCase.vuln + `}}`))
+			if err != nil {
+				t.Fatalf("unexpected refusal: %v", err)
+			}
+			if got := spec.Checks.Vuln.scoped(); got != testCase.wantScoped {
+				t.Fatalf("scoped() = %v, want %v", got, testCase.wantScoped)
+			}
+			if got := len(spec.Checks.Vuln.Packages); got != testCase.wantLen {
+				t.Fatalf("len(Packages) = %d, want %d", got, testCase.wantLen)
+			}
+		})
+	}
+}
+
+// A declared identity that names nothing is a misconfiguration, refused when the
+// check is enabled — distinct from an empty array, which is a valid empty scope.
+func TestDecodeRejectsIncompletePackageIdentity(t *testing.T) {
+	const head = `{"spec_version":3,"subject":{"repo":"o/r","version":"v1"},` +
+		`"artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],"checks":{"vuln":`
+
+	for _, vuln := range []string{
+		`{"enabled":true,"packages":[{"ecosystem":"npm","name":""}]}`,
+		`{"enabled":true,"packages":[{"ecosystem":"","name":"@openai/codex"}]}`,
+		`{"enabled":true,"packages":[{"ecosystem":"  ","name":"x"}]}`,
+	} {
+		if _, err := Decode(strings.NewReader(head + vuln + `}}`)); err == nil {
+			t.Fatalf("accepted an incomplete package identity: %s", vuln)
+		}
+	}
+}
+
+// A disabled vuln check is inert: its packages block is not validated, matching
+// the schema's "a disabled block is a placeholder" rule.
+func TestDecodeDoesNotValidateDisabledVulnPackages(t *testing.T) {
+	spec := `{"spec_version":3,"subject":{"repo":"o/r","version":"v1"},` +
+		`"artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],` +
+		`"checks":{"checksum":{"enabled":true},"vuln":{"enabled":false,"packages":[{"ecosystem":"","name":""}]}}}`
+	if _, err := Decode(strings.NewReader(spec)); err != nil {
+		t.Fatalf("a disabled vuln check's packages were validated: %v", err)
 	}
 }
 
@@ -324,7 +387,7 @@ func withImplementedChecks(t *testing.T, checks ...string) {
 func TestEnablingACheckThisBuildCannotRunIsRefused(t *testing.T) {
 	withImplementedChecks(t, CheckChecksum)
 
-	spec := `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},
+	spec := `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},
 	          "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],
 	          "checks":{"checksum":{"enabled":true},"vuln":{"enabled":true}}}`
 	_, err := Decode(strings.NewReader(spec))
@@ -344,7 +407,7 @@ func TestEnablingACheckThisBuildCannotRunIsRefused(t *testing.T) {
 func TestUnimplementedRefusalIsDeterministic(t *testing.T) {
 	withImplementedChecks(t, CheckChecksum)
 
-	spec := `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],
+	spec := `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],
 	          "checks":{"vuln":{"enabled":true},"release":{"enabled":true,"asset":"tool.tar.gz"}}}`
 	_, err := Decode(strings.NewReader(spec))
 	if err == nil {
@@ -359,7 +422,7 @@ func TestUnimplementedRefusalIsDeterministic(t *testing.T) {
 // whatever placeholder a generator left in it. The documented schema example
 // relies on this.
 func TestDisabledCheckBlocksAreNotValidated(t *testing.T) {
-	spec := `{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},
+	spec := `{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},
 	          "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],
 	          "checks":{"checksum":{"enabled":true},
 	                    "tuf":{"enabled":false,"mirror":"https://not-a-local-mirror","root":"",
@@ -375,7 +438,7 @@ func TestDisabledCheckBlocksAreNotValidated(t *testing.T) {
 // uppercase checksum lands lowercased and bare.
 func TestTUFConfigIsNormalized(t *testing.T) {
 	spec, err := Decode(strings.NewReader(
-		`{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],
+		`{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],
 		  "checks":{"tuf":{"enabled":true,"mirror":"file:///srv/mirror","root":"root.json",
 		            "root_checksum":"sha256:` + strings.ToUpper(sixtyFourHex) + `","targets":{"n":"p"}}}}`))
 	if err != nil {
@@ -393,7 +456,7 @@ func TestTUFConfigIsNormalized(t *testing.T) {
 // shapes are refused, so a slashed namespace name must still validate.
 func TestTUFSlashedTargetNameIsAccepted(t *testing.T) {
 	_, err := Decode(strings.NewReader(
-		`{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],
+		`{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},"artifacts":[{"path":"a"}],
 		  "checks":{"tuf":{"enabled":true,"mirror":"m","root":"r","root_checksum":"` + sixtyFourHex + `",
 		            "targets":{"registry.npmjs.org/keys.json":"p"}}}}`))
 	if err != nil {
@@ -403,7 +466,7 @@ func TestTUFSlashedTargetNameIsAccepted(t *testing.T) {
 
 func TestDecodeDefaults(t *testing.T) {
 	spec, err := Decode(strings.NewReader(
-		`{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},
+		`{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},
 		  "artifacts":[{"path":"dist/foo.tar.gz","evidence":{"checksum_file":"dist/checksums.txt"}}]}`))
 	if err != nil {
 		t.Fatalf("unexpected refusal: %v", err)
@@ -421,7 +484,7 @@ func TestDecodeDefaults(t *testing.T) {
 
 func TestExplicitAssetNameWins(t *testing.T) {
 	spec, err := Decode(strings.NewReader(
-		`{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},
+		`{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},
 		  "artifacts":[{"path":"dist/foo.tar.gz","asset_name":"foo-linux.tar.gz","evidence":{"checksum_file":"c"}}]}`))
 	if err != nil {
 		t.Fatalf("unexpected refusal: %v", err)
@@ -433,7 +496,7 @@ func TestExplicitAssetNameWins(t *testing.T) {
 
 func TestEnabledChecksKeepReportOrder(t *testing.T) {
 	spec := Spec{Checks: &Checks{
-		Vuln:      &CheckConfig{Enabled: true, Advisory: true},
+		Vuln:      &VulnCheck{CheckConfig: CheckConfig{Enabled: true, Advisory: true}},
 		Checksum:  &CheckConfig{Enabled: true},
 		Signature: &CheckConfig{Enabled: true},
 		Exec:      &ExecCheck{CheckConfig: CheckConfig{Enabled: true}},
@@ -451,7 +514,7 @@ func TestEnabledChecksKeepReportOrder(t *testing.T) {
 
 func TestAdvisoryMarkingSurvivesDecode(t *testing.T) {
 	spec, err := Decode(strings.NewReader(
-		`{"spec_version": 2,"subject":{"repo":"o/r","version":"v1"},
+		`{"spec_version": 3,"subject":{"repo":"o/r","version":"v1"},
 		  "artifacts":[{"path":"a","evidence":{"checksum_file":"c"}}],
 		  "checks":{"checksum":{"enabled":true,"advisory":true}}}`))
 	if err != nil {

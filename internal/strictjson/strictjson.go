@@ -4,7 +4,7 @@
 //
 // It checks ONE thing: that no object names the same member twice, at any
 // depth. Encoding/json keeps the last occurrence of a repeated key silently, so
-// a document saying both spec_version 2 and spec_version 1 — or two conflicting
+// a document saying both spec_version 3 and spec_version 1 — or two conflicting
 // verdict facts — would quietly become whichever the writer put last. That is a
 // decision changed by byte order, which no gate may allow.
 //

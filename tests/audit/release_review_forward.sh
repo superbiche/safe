@@ -65,7 +65,7 @@ write_spec() {
   local out="$1" checksum_file="$2"
   cat > "$out" <<EOF
 {
-  "spec_version": 2,
+  "spec_version": 3,
   "subject": {"repo": "superbiche/safe", "version": "v1.0.0"},
   "artifacts": [
     {"path": "$FIXTURES/tool.tar.gz",
@@ -89,7 +89,7 @@ write_spec "$TEST_ROOT/mismatch.json" "$FIXTURES/wrong-checksums.txt"
 printf 'bundle\n' > "$FIXTURES/tool.tar.gz.sigstore"
 cat > "$TEST_ROOT/signed.json" <<EOF
 {
-  "spec_version": 2,
+  "spec_version": 3,
   "subject": {"repo": "superbiche/safe", "version": "v1.0.0"},
   "artifacts": [
     {"path": "$FIXTURES/tool.tar.gz",

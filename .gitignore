@@ -12,3 +12,8 @@ inbox/tmp/
 config/run/*.json
 config/audit/*.json
 !config/seed/**/*.json
+
+# harness-local MCP wiring projections (registry ~/.agents/mcp.json is the intent; per-machine, Fibery Task #219)
+.codex/
+.qwen/
+opencode.json

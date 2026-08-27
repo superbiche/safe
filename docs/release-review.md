@@ -54,7 +54,7 @@ contract as well as the key:
 {
   "capabilities": {"binary-audit.release-review": true},
   "versions": {
-    "binary-audit.release-review": {"spec_version": 2, "report_schema_version": 1}
+    "binary-audit.release-review": {"spec_version": 3, "report_schema_version": 1}
   },
   "groups": {"binary-audit": {"release-review": true}}
 }
@@ -103,11 +103,11 @@ that ran.
 The bash forward adds one more: a missing or version-skewed `safe-core` returns
 30 with a single stderr line naming `rerun install.sh` as the recovery.
 
-## Spec schema (`spec_version` 2)
+## Spec schema (`spec_version` 3)
 
 ```json
 {
-  "spec_version": 2,
+  "spec_version": 3,
   "subject": {"repo": "OWNER/REPO", "version": "TAG"},
   "artifacts": [
     {
@@ -146,7 +146,7 @@ the example above already supports it:
 
 ```json
 {
-  "spec_version": 2,
+  "spec_version": 3,
   "subject": {"repo": "OWNER/REPO", "version": "TAG"},
   "artifacts": [
     {
@@ -176,7 +176,7 @@ match, so the `checksum` check is enabled and the artifact carries its
 
 ```json
 {
-  "spec_version": 2,
+  "spec_version": 3,
   "subject": {"repo": "OWNER/REPO", "version": "TAG"},
   "artifacts": [
     {
@@ -205,7 +205,7 @@ carry:
 
 ```json
 {
-  "spec_version": 2,
+  "spec_version": 3,
   "subject": {"repo": "OWNER/REPO", "version": "v1.2.3"},
   "artifacts": [{"path": "dist/foo.tar.gz"}],
   "checks": {
@@ -220,7 +220,7 @@ trust material to compare:
 
 ```json
 {
-  "spec_version": 2,
+  "spec_version": 3,
   "subject": {"repo": "sigstore/root-signing", "version": "v9"},
   "artifacts": [{"path": "trust/root.json"}],
   "checks": {
@@ -240,7 +240,7 @@ An enabled `exec` block names the executable to smoke — a free path, not an
 
 ```json
 {
-  "spec_version": 2,
+  "spec_version": 3,
   "subject": {"repo": "OWNER/REPO", "version": "TAG"},
   "artifacts": [{"path": "dist/foo.tar.gz"}],
   "checks": {
@@ -251,7 +251,7 @@ An enabled `exec` block names the executable to smoke — a free path, not an
 
 ### Fields
 
-- `spec_version` — must be exactly `2`.
+- `spec_version` — must be exactly `3`.
 - `subject.repo`, `subject.version` — required, non-empty. Echoed into the
   report so a stored report identifies itself without its spec.
 - `artifacts` — required, at least one entry.
@@ -297,7 +297,21 @@ it, which is what keeps the schema example above valid.
     sigstore workflow attestation that binds the artifact to the tag — covers the
     same risk. It narrows to the plain `unsigned` reason only: any other
     unverified state (`invalid`, a bad author email, an unknown key) still BLOCKs.
-- `checks.vuln` — when enabled, needs nothing beyond `subject`.
+- `checks.vuln` — when enabled, needs nothing beyond `subject`. It may carry an
+  optional `packages` array declaring which advisory-package identities describe
+  the subject artifact, each `{"ecosystem": ..., "name": ...}` as GitHub reports
+  them in an advisory's `vulnerabilities[].package`:
+  - **Absent, or `null`** — the check is package-blind: every advisory in the
+    repository is matched against the subject, the pre-scoping default. A JSON
+    `null` reads the same as an omitted key (the fail-closed, wider-matching
+    direction).
+  - **Present as an array, even `[]`** — scoping is active: only entries whose package
+    matches a declared identity are read; the rest are ruled not-applicable. An
+    empty array is the honest "no advisory package in this repository tracks this
+    artifact" — the shape a Rust binary uses in a repo that publishes only npm
+    and extension advisories. Matching is case-insensitive (the ecosystem is free
+    text, e.g. `"vs code"`). A declared identity must name both an ecosystem and
+    a name; either half empty is refused.
 - `checks.tuf` — when enabled:
   - `mirror` — required. A local directory path, or a `file://` URL, whose
     prefix is stripped. Any other `://` scheme is refused: the check serves the
@@ -333,7 +347,7 @@ because each one means the document does not say one unambiguous thing:
   spec — by a broken generator, or a careless `cat` of two files — would
   otherwise be read past and ignored.
 - **A member repeated inside one object, at any depth.** JSON decoders keep the
-  last occurrence, so a spec stating both `"spec_version": 2` and
+  last occurrence, so a spec stating both `"spec_version": 3` and
   `"spec_version": 1` would quietly become whichever the writer put last.
 
 Surrounding whitespace and the trailing newline every spec file ends with are
@@ -577,6 +591,7 @@ a caller decision rather than a page-budget truncation, and no cap is reported.
 | `version_mapping_ambiguous` | BLOCK | `advisory`, `version` | an advisory names no affected range this check can read AND no usable `patched_versions` fallback, so whether it covers the version is unknown |
 | `advisory_feed_missing` | BLOCK | `repo` | GitHub publishes no advisory feed for the repository; the message names the private-repository case |
 | `known_advisory` | WARN | `advisory`, `severity`, `cve` | an advisory below high severity affects this version |
+| `advisory_out_of_scope` | GO | `repo`, `advisories` (comma-joined GHSA ids), `count` | one aggregated note: advisories whose every entry named a package outside the subject's declared scope, ruled not-applicable |
 | `advisory_feed_unavailable` | ERROR | `repo` | the feed could not be read, so no advisory was checked |
 | `advisory_feed_truncated` | ERROR | `repo`, `pages`, `advisories_read` | the feed was longer than the page cap, so an advisory affecting this version may not have been seen |
 
@@ -597,6 +612,25 @@ decided nothing, and both facts are true.
 Unlike the release history, a capped advisory walk has no early answer. An
 advisory this check never read is an advisory it cannot rule out, so the cap is
 always `ERROR` here.
+
+When the spec declares a package scope, an advisory whose entries all name a
+different package is about another artifact in the same repository — a Rust
+binary is not covered by an advisory published against the repo's npm wrapper or
+its VS Code extension. Those advisories are ruled **not-applicable** and recorded
+once in a single `advisory_out_of_scope` `GO` note, so an empty scope stays
+auditable: the day the repository publishes an advisory that *does* name the
+subject's package, that advisory leaves the not-applicable list and is matched.
+Two edges fail closed rather than open: an advisory entry that names *no* package
+cannot be ruled out by identity, so it is read anyway; and an advisory carrying
+no entries at all names no package to rule out, so it stays ambiguous, never
+not-applicable. A package-blind spec (no `packages` key) matches every advisory,
+exactly as before scoping existed.
+
+A range GitHub stores as the space-separated two-sided bound `A <= B` — its
+non-canonical spelling of `>= A, <= B`, both bounds inclusive — is read as such;
+the canonical comma-separated form is read as it always was. Only `<=` is
+admitted between the two versions, the sole interior operator seen in real
+advisory data.
 
 ### `tuf`
 

@@ -104,6 +104,39 @@ func TestVersionMatchesRangeMatchesTheBashLane(t *testing.T) {
 	}
 }
 
+// Item B: GitHub's space-separated two-sided bound `A <= B` means `>= A, <= B`.
+// The bash lane never parsed this shape — it flagged it ambiguous — so these are
+// a Go-only addition, kept out of the bash-captured table above. The cases are
+// grounded in openai/codex's real npm range `0.2.0 <= 0.38.0`, whose
+// patched_versions `0.39.0` fixes the inclusive ceiling at 0.38.0. The addition
+// is additive-only: it turns a previously-ambiguous string into a decided one
+// and never changes what a single-operator or bare constraint already meant.
+func TestVersionMatchesRangeCompoundBound(t *testing.T) {
+	for _, testCase := range []struct {
+		version, versionRange string
+		want                  rangeMatch
+	}{
+		{"0.38.0", "0.2.0 <= 0.38.0", rangeMatches},  // the inclusive ceiling
+		{"0.39.0", "0.2.0 <= 0.38.0", rangeExcludes}, // the patched version, above it
+		{"0.2.0", "0.2.0 <= 0.38.0", rangeMatches},   // the inclusive floor
+		{"0.1.0", "0.2.0 <= 0.38.0", rangeExcludes},  // below the floor
+		{"0.30.0", "0.2.0 <= 0.38.0", rangeMatches},
+		{"v0.30.0", "0.2.0 <= 0.38.0", rangeMatches},   // v-prefix on the subject
+		{"0.30.0", "v0.2.0 <= v0.38.0", rangeMatches},  // v-prefix on both bounds
+		{"0.30.0", " 0.2.0 <= 0.38.0 ", rangeMatches},  // surrounding whitespace trims
+		{"0.30.0", "0.2.0 < 0.38.0", rangeAmbiguous},   // only `<=` is admitted
+		{"0.30.0", "0.2.0 >= 0.38.0", rangeAmbiguous},  // ditto — not guessed
+		{"0.30.0", "0.2.0 <= ", rangeAmbiguous},        // missing ceiling
+		{"0.30.0", "<= 0.38.0", rangeMatches},          // single constraint, unchanged
+		{"0.30.0", "0.2.0", rangeExcludes},             // bare version equality, unchanged
+	} {
+		if got := versionMatchesRange(testCase.version, testCase.versionRange); got != testCase.want {
+			t.Errorf("versionMatchesRange(%q, %q) = %v, want %v",
+				testCase.version, testCase.versionRange, got, testCase.want)
+		}
+	}
+}
+
 // --- P2 differential golden (slice #144) ------------------------------------
 //
 // The two tables below were captured by a systematic differential sweep against
