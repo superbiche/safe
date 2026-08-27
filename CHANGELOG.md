@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **mise `-C`/`--cd` lane enters the target with physical `cd`** (1.48.0). The
+  mise routing surface entered the caller's `-C`/`--cd` directory with a bare
+  `cd` at both the audit lane (`safe_gate_mise_check_with_env`) and the
+  inner-exec scan lane, which processes `..` lexically: a `-C` value reaching
+  through a symlinked `..` collapsed to a different directory than mise's own
+  `chdir()` (Rust `set_current_dir` → `chdir(2)`, verified physical against
+  real mise 2026.8.7), so safe could audit or scan a clean directory while mise
+  installs into the real one. Both sites now enter with physical, CDPATH-free
+  `CDPATH= cd -P --` (`2>/dev/null`, so an unenterable target keeps its single
+  refusal line), matching mise's `chdir()` exactly as the composer helpers
+  already do (1.25.0/1.44.0). The `CDPATH=` closes the same divergence for a
+  RELATIVE `-C` value: Bash's `cd` searches an exported `CDPATH` (and echoes
+  the hit to stdout) while mise's `chdir(2)` never does, so `mise -C project`
+  could otherwise send safe to a same-named directory elsewhere. Same defect
+  class as the #94/#95 composer fixes; this was
+  the third instance — the mise routing surface — parked out of the #95 slice
+  and now closed. An ordinary route (whose logical and physical resolution are
+  identical) is unaffected; only a route reaching through a symlinked `..`
+  changes which directory is audited — now the one mise actually enters.
+
 - **release-review `vuln`: package/ecosystem scoping and compound-range
   parsing** (1.47.0). Two hardening fixes on the advisory check, grounded in
   openai/codex's GHSA-w5fx. (1) The check was package-blind: it matched an

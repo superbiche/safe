@@ -4735,6 +4735,73 @@ case_mise_infra_refusals_are_one_line() {
   pass "$FUNCNAME"
 }
 
+case_mise_c_physical_cd() {
+  prepare_case "mise-c-physical-cd"
+  # The -C directory is entered with PHYSICAL path semantics, matching mise's
+  # own chdir (Rust set_current_dir -> chdir(2), verified physical against real
+  # mise 2026.8.7): when -C reaches through a symlinked `..`, both the audit
+  # lane (safe_gate_mise_check_with_env) and the inner-exec scan lane must land
+  # on the real physical directory, not the lexical `..` collapse a bare `cd`
+  # would produce — else safe audits/scans a different directory than the one
+  # mise installs into. Expected is computed with the same physical resolution
+  # so a symlinked temp prefix cannot skew the assertion. (Fibery #209; same
+  # defect class as the composer #94/#95 fixes.)
+  local phys_real="${CASE_DIR}/phys-realproj"
+  local phys_wrong="${CASE_DIR}/phys-wrongdir"
+  mkdir -p "${phys_real}/sub" "${phys_wrong}"
+  ln -s "${phys_real}/sub" "${phys_wrong}/lnk"
+  local phys_real_canon
+  phys_real_canon="$(cd -P -- "${phys_real}" && pwd)"
+
+  # Audit lane: `mise -C <symlinked-..> install npm:okpkg` audits the package
+  # from the -C directory. Under a bare `cd` the audit runs in phys_wrong (the
+  # lexical collapse); under `cd -P` it runs in phys_real.
+  SAFE_AUDIT_EXPECT_PROJECT=1 \
+    SAFE_INSTALL_TEST_SCRIPT="mise -C ${phys_wrong}/lnk/.. install npm:okpkg@1.0.0" run_zsh
+  assert_status 0 "$FUNCNAME (audit lane)" || return
+  assert_log_contains $'AUDITPROJECT\t'"${phys_real_canon}" "$FUNCNAME (audit lane)" || return
+  assert_log_not_contains_fragment $'AUDITPROJECT\t'"${phys_wrong}" "$FUNCNAME (audit lane)" || return
+
+  # Inner-exec scan lane: `mise -C <symlinked-..> exec -- npm install okpkg`
+  # scans from the same -C directory under NO_EXEC. Same physical/lexical
+  # discriminator on the twin `cd -P` site.
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_EXPECT_PROJECT=1 \
+    SAFE_INSTALL_TEST_SCRIPT="mise -C ${phys_wrong}/lnk/.. exec -- npm install okpkg@1.0.0" run_zsh
+  assert_status 0 "$FUNCNAME (scan lane)" || return
+  assert_log_contains $'AUDITPROJECT\t'"${phys_real_canon}" "$FUNCNAME (scan lane)" || return
+  assert_log_not_contains_fragment $'AUDITPROJECT\t'"${phys_wrong}" "$FUNCNAME (scan lane)" || return
+
+  # A RELATIVE -C value must resolve against the process cwd exactly as mise's
+  # chdir(2) does, which never consults CDPATH. Bash's `cd` DOES search an
+  # exported CDPATH, so a bare `cd -P -- project` could enter a same-named
+  # directory elsewhere (and echo it to stdout) while mise installs in
+  # ./project — the `cd -P` symlink fix above does not close this. `CDPATH=`
+  # on both cd sites neutralizes it. Discriminator: a decoy `project-rel`
+  # under CDPATH; the run must audit/scan the cwd-local one. (Fibery #209 F1,
+  # DEEP round-1.) Expected computed with the same physical resolution.
+  local rel_local="${WORK_DIR}/project-rel"
+  local cdpath_dir="${CASE_DIR}/cdpath-decoy"
+  mkdir -p "${rel_local}" "${cdpath_dir}/project-rel"
+  local rel_local_canon
+  rel_local_canon="$(cd -P -- "${rel_local}" && pwd)"
+
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_EXPECT_PROJECT=1 \
+    SAFE_INSTALL_TEST_SCRIPT="export CDPATH=${cdpath_dir}; mise -C project-rel install npm:okpkg@1.0.0" run_zsh
+  assert_status 0 "$FUNCNAME (audit lane CDPATH)" || return
+  assert_log_contains $'AUDITPROJECT\t'"${rel_local_canon}" "$FUNCNAME (audit lane CDPATH)" || return
+  assert_log_not_contains_fragment $'AUDITPROJECT\t'"${cdpath_dir}" "$FUNCNAME (audit lane CDPATH)" || return
+
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_EXPECT_PROJECT=1 \
+    SAFE_INSTALL_TEST_SCRIPT="export CDPATH=${cdpath_dir}; mise -C project-rel exec -- npm install okpkg@1.0.0" run_zsh
+  assert_status 0 "$FUNCNAME (scan lane CDPATH)" || return
+  assert_log_contains $'AUDITPROJECT\t'"${rel_local_canon}" "$FUNCNAME (scan lane CDPATH)" || return
+  assert_log_not_contains_fragment $'AUDITPROJECT\t'"${cdpath_dir}" "$FUNCNAME (scan lane CDPATH)" || return
+  pass "$FUNCNAME"
+}
+
 case_mise_leading_global_help_passes() {
   prepare_case "mise-leading-help"
   # `mise --help install npm:x` prints global help and installs nothing:
@@ -5638,6 +5705,7 @@ main() {
     case_mise_unmodeled_sources_are_not_vouched \
     case_mise_scoped_exclusion_and_interactive \
     case_mise_infra_refusals_are_one_line \
+    case_mise_c_physical_cd \
     case_mise_leading_global_help_passes \
     case_mise_env_values_round_trip_exactly \
     case_mise_entry_requires_requested_version \
