@@ -67,7 +67,7 @@ const (
 	ReportSchemaVersion = 1
 )
 
-// Spec is a release review request, schema spec_version 2.
+// Spec is a release review request, schema spec_version 3.
 type Spec struct {
 	SpecVersion int        `json:"spec_version"`
 	Subject     Subject    `json:"subject"`
@@ -238,7 +238,7 @@ type setting struct {
 //   - anything after the first JSON document — a second object appended to a
 //     spec would otherwise be silently ignored;
 //   - a repeated member at any depth — JSON decoders keep the last occurrence,
-//     so a spec saying both spec_version 2 and spec_version 1 would quietly
+//     so a spec saying both spec_version 3 and spec_version 1 would quietly
 //     become whichever the writer put last.
 func Decode(r io.Reader) (Spec, error) {
 	raw, err := io.ReadAll(r)
