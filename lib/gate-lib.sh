@@ -4111,7 +4111,17 @@ safe_gate_mise_check_with_env() {
   fi
   (
     if [[ -n "${SAFE_GATE_MISE_CD:-}" ]]; then
-      cd -- "${SAFE_GATE_MISE_CD}" 2>/dev/null || {
+      # PHYSICAL cd (`cd -P`) to match mise's own chdir: mise -C runs Rust
+      # std::env::set_current_dir -> chdir(2), which resolves `symlink/..`
+      # physically. SAFE_GATE_MISE_CD is the raw -C value, so a bare `cd`
+      # would collapse `..` lexically and audit a different physical directory
+      # than the one mise installs into. `CDPATH=` neutralizes Bash's CDPATH
+      # search, which chdir(2) never consults: without it an exported CDPATH
+      # could send a RELATIVE -C value to a same-named directory elsewhere
+      # (and print it to stdout). `2>/dev/null` keeps an unenterable directory
+      # to the single refusal line below. (Fibery #209; same defect class as
+      # the composer #94/#95 fixes.)
+      CDPATH= cd -P -- "${SAFE_GATE_MISE_CD}" 2>/dev/null || {
         safe_gate_mise_infra_refuse "cannot enter the -C directory '${SAFE_GATE_MISE_CD}' to audit from the same place mise installs"
         exit 100
       }
@@ -4898,7 +4908,12 @@ safe_gate_mise_gate_exec() {
     esac
     (
       if [[ -n "${SAFE_GATE_MISE_CD:-}" ]]; then
-        cd -- "${SAFE_GATE_MISE_CD}" 2>/dev/null || {
+        # PHYSICAL cd + CDPATH neutralized — see the twin site in
+        # safe_gate_mise_check_with_env: mise's -C chdirs physically (chdir(2),
+        # no CDPATH), so the inner-command scan must stand in the same physical
+        # directory, not the lexical `..` collapse a bare `cd` would produce nor
+        # a CDPATH-selected same-named directory elsewhere. (Fibery #209.)
+        CDPATH= cd -P -- "${SAFE_GATE_MISE_CD}" 2>/dev/null || {
           safe_gate_mise_infra_refuse "cannot enter the -C directory '${SAFE_GATE_MISE_CD}' to scan from the same place mise runs"
           exit 100
         }
