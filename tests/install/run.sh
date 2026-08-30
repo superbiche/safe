@@ -2364,6 +2364,23 @@ case_npm_lockdiff_target_platform_follows_npm_argv() {
   pass "$FUNCNAME"
 }
 
+case_npm_lockdiff_dash_led_target_platform_travels_verbatim() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-dash-led-target-platform"
+  # npm treats a target platform as an opaque string, dash-led spellings
+  # included — an optional entry constrained to the same string installs. The
+  # gate must forward the value verbatim rather than discard it, or the
+  # exemption silently re-aims at the host (r2 review, F2 residual).
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  local lock='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/blockme":{"version":"2.0.0","optional":true,"os":["-weird"],"resolved":"https://registry.npmjs.org/blockme/-/blockme-2.0.0.tgz","integrity":"sha512-blockme"}}}'
+  printf '%s\n' "${lock}" > "${WORK_DIR}/package-lock.json"
+  NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe --os=-weird' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm\tdedupe' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_npm_lockdiff_refuses_nonregistry_reify_candidate() {
   skip_lockdiff_case "$FUNCNAME" || return
   prepare_lockdiff_case "npm-lockdiff-nonregistry-reify-candidate"
@@ -5744,6 +5761,7 @@ main() {
     case_npm_lockdiff_exempts_never_installed_optional_entries \
     case_npm_lockdiff_symlinked_entry_is_audited \
     case_npm_lockdiff_target_platform_follows_npm_argv \
+    case_npm_lockdiff_dash_led_target_platform_travels_verbatim \
     case_npm_lockdiff_refuses_nonregistry_reify_candidate \
     case_npm_lockdiff_projection_sees_project_npmrc \
     case_npm_dedupe_lockdiff_introduced_block_refuses_without_delegation \

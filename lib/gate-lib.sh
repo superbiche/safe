@@ -1598,8 +1598,16 @@ safe_gate_npm_lockdiff_subcommand() {
 # projection runs first, so a spelling npm rejects never reaches this point.
 # libc constraints are not modeled at all: an optional libc mismatch is
 # over-audited, which is the safe direction.
+# Sets the SAFE_GATE_LOCKDIFF_PLATFORM_ARGS global array rather than
+# printing: argv tokens are handed to safe-core byte-for-byte, with no line
+# transport for a value to fall apart on. Values travel VERBATIM: npm treats a target as an opaque string, so
+# even a dash-led or whitespace-carrying spelling is a platform npm will
+# resolve os/cpu constraints against — discarding it would silently re-aim
+# the exemption at the host (r2 review, F2 residual). The `=` form keeps a
+# dash-led value from reading as a flag on the safe-core side.
 safe_gate_npm_lockdiff_platform_args() {
   local token previous="" os_target="" cpu_target=""
+  SAFE_GATE_LOCKDIFF_PLATFORM_ARGS=()
 
   for token in "$@"; do
     case "${previous}" in
@@ -1613,13 +1621,8 @@ safe_gate_npm_lockdiff_platform_args() {
     previous="${token}"
   done
 
-  # A dash-led or whitespace-carrying value is not a platform name; forwarding
-  # one would state a target as fact that npm never resolved that way.
-  [[ "${os_target}" == -* || "${os_target}" == *[[:space:]]* ]] && os_target=""
-  [[ "${cpu_target}" == -* || "${cpu_target}" == *[[:space:]]* ]] && cpu_target=""
-
-  [[ -n "${os_target}" ]] && printf '%s\n%s\n' --os "${os_target}"
-  [[ -n "${cpu_target}" ]] && printf '%s\n%s\n' --cpu "${cpu_target}"
+  [[ -n "${os_target}" ]] && SAFE_GATE_LOCKDIFF_PLATFORM_ARGS+=("--os=${os_target}")
+  [[ -n "${cpu_target}" ]] && SAFE_GATE_LOCKDIFF_PLATFORM_ARGS+=("--cpu=${cpu_target}")
   return 0
 }
 
@@ -2030,11 +2033,8 @@ safe_gate_npm_lockdiff_preflight() {
   # aix-only optional that this machine's platform would have excluded (r1
   # review F2). The candidate set has to be computed against the same target,
   # so the override travels with it.
-  local platform_lines platform_arg
-  platform_lines="$(safe_gate_npm_lockdiff_platform_args "$@")"
-  while IFS= read -r platform_arg; do
-    [[ -n "${platform_arg}" ]] && platform_args+=("${platform_arg}")
-  done <<<"${platform_lines}"
+  safe_gate_npm_lockdiff_platform_args "$@"
+  platform_args=("${SAFE_GATE_LOCKDIFF_PLATFORM_ARGS[@]}")
   if reify_json="$("${safe_core}" reify-candidates "${registry_host_args[@]}" "${platform_args[@]}" "${scratch}/${lockfile_name}" "${project_dir}" 2>"${scratch}/reify.err")"; then
     :
   else
