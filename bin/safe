@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.49.0"
+SAFE_VERSION="1.50.0"
 # Exported at the top level, not per-subcommand: safe-audit pins itself to
 # this version, and every route that reaches it — the gate, `safe audit ...`,
 # `safe install`, the safe-audit compatibility command — must carry it or the
@@ -10,6 +10,42 @@ export SAFE_VERSION
 SAFE_SELF="$(readlink -f "$0")"
 SAFE_DIR="$(dirname "$SAFE_SELF")"
 SAFE_CONFIG_ROOT="${SAFE_CONFIG_DIR:-$HOME/.config/safe}"
+# Trust anchor (#87): host-allow authority lives only in the canonical run
+# store; a redirected SAFE_CONFIG_DIR carries it only under the explicit
+# SAFE_RUN_TRUST_OVERRIDE token. Reads decline / use the literal canonical path
+# (F1, F3); writes hard-refuse (F4). Mirror of bin/safe-run.
+SAFE_RUN_CANONICAL_CONFIG_DIR="$HOME/.config/safe/run"
+_trust_norm_path() { realpath -m -- "$1" 2>/dev/null || printf '%s' "$1"; }
+_safe_effective_run_config_dir() { printf '%s' "${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}"; }
+trust_store_is_canonical() {
+  [[ "$(_trust_norm_path "$(_safe_effective_run_config_dir)")" \
+     == "$(_trust_norm_path "$SAFE_RUN_CANONICAL_CONFIG_DIR")" ]]
+}
+trust_store_file() {
+  local base="$1"
+  if [[ "${SAFE_RUN_TRUST_OVERRIDE:-0}" == "1" ]] && ! trust_store_is_canonical; then
+    printf '%s/%s' "$(_safe_effective_run_config_dir)" "$base"
+  else
+    printf '%s/%s' "$SAFE_RUN_CANONICAL_CONFIG_DIR" "$base"
+  fi
+}
+trust_grant_ok() {
+  local ctx="$1"
+  trust_store_is_canonical && return 0
+  if [[ "${SAFE_RUN_TRUST_OVERRIDE:-0}" == "1" ]]; then
+    err "trust store at non-canonical root honored via SAFE_RUN_TRUST_OVERRIDE ($ctx)"
+    return 0
+  fi
+  err "trust store at non-canonical root ignored for $ctx grant (set SAFE_RUN_TRUST_OVERRIDE=1 to honor)"
+  return 1
+}
+trust_write_or_die() {
+  local ctx="$1"
+  trust_store_is_canonical && return 0
+  [[ "${SAFE_RUN_TRUST_OVERRIDE:-0}" == "1" ]] && return 0
+  err "BLOCKED: trust store redirected via SAFE_CONFIG_DIR (canonical: $HOME/.config/safe/run); set SAFE_RUN_TRUST_OVERRIDE=1 to override"
+  exit 100
+}
 SAFE_DATA_ROOT="${SAFE_DATA_DIR:-$HOME/.local/share/safe}"
 SAFE_RUN_PATH="$SAFE_DIR/safe-run"
 # Env override so a test harness (or a side-by-side build) can point the
@@ -1481,7 +1517,9 @@ safe_install_trustable_package() {
 }
 
 safe_install_host_allow_file() {
-  printf '%s/run/host-allow.json\n' "${SAFE_CONFIG_DIR:-$HOME/.config/safe}"
+  # #87: writes land only on the canonical store (or a token-blessed redirect);
+  # the caller hard-refuses an unblessed redirect via trust_write_or_die.
+  trust_store_file host-allow.json
 }
 
 safe_install_ensure_host_allow_file() {
@@ -1497,6 +1535,9 @@ safe_install_ensure_host_allow_file() {
 safe_install_write_host_allow() {
   local package="$1" reason="$2"
   local name version host_allow_file tmp
+  # #87: refuse a trust write against a redirected root before creating or
+  # mutating any file (F4 — must precede ensure).
+  trust_write_or_die "host-allow-add"
 
   IFS=$'\t' read -r name version <<< "$(safe_install_split_spec "$package")"
   safe_install_ensure_host_allow_file
@@ -1527,10 +1568,13 @@ safe_install_canonical_eco() {
 safe_install_host_allow_matches() {
   local package="$1"
   local ecosystem="${2:-npm}"
-  local host_allow_file="${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run/host-allow.json"
-  local name version entry_version entry_ecosystem
+  local name version entry_version entry_ecosystem host_allow_file
 
   command -v jq >/dev/null 2>&1 || return 1
+  # #87: a redirected store cannot grant a host install override; read the
+  # literal canonical path (or a token-blessed redirect).
+  trust_grant_ok "host-allow" || return 1
+  host_allow_file="$(trust_store_file host-allow.json)"
   [[ -r "$host_allow_file" ]] || return 1
 
   IFS=$'\t' read -r name version <<< "$(safe_install_split_spec "$package")"

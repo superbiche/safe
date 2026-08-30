@@ -8,6 +8,12 @@ SAFE_RUN_VERSION="0.2.0"
 SAFE_RUN_NO_INIT="${SAFE_RUN_NO_INIT:-0}"
 
 CONFIG_DIR="${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}"
+# Canonical trust anchor: the run config root derived with NO env overrides.
+# Trust escalations are honored only from here (or from a redirected root the
+# operator explicitly blesses with SAFE_RUN_TRUST_OVERRIDE) — see
+# trust_redirected_guard (#87). HOME redirection is the residual bash floor.
+CANONICAL_RUN_CONFIG_DIR="$HOME/.config/safe/run"
+TRUST_OVERRIDE="${SAFE_RUN_TRUST_OVERRIDE:-0}"
 DATA_DIR="${SAFE_RUN_DATA_DIR:-${SAFE_DATA_DIR:-$HOME/.local/share/safe}/run}"
 HOST_ALLOW_FILE="$CONFIG_DIR/host-allow.json"
 SCRIPTS_ALLOW_FILE="$CONFIG_DIR/scripts-allow.json"
@@ -145,8 +151,15 @@ caller_info() {
 # ---------------------------------------------------------------------------
 ensure_dirs() {
   mkdir -p "$CONFIG_DIR" "$DATA_DIR"
-  [[ -f "$HOST_ALLOW_FILE" ]]    || seed_file "$HOST_ALLOW_FILE"    '{"packages":{}}'
-  [[ -f "$SCRIPTS_ALLOW_FILE" ]] || seed_file "$SCRIPTS_ALLOW_FILE" '{"packages":{}}'
+  # #87 (F4): never create the trust stores under an unblessed redirected root.
+  # They carry no authority there (trust reads resolve to the canonical store),
+  # so a refused trust write must leave nothing behind. Operational config
+  # (blocked/config/sandbox-known) still seeds so a legitimately relocated
+  # config keeps working.
+  if trust_store_is_canonical || [[ "$TRUST_OVERRIDE" == "1" ]]; then
+    [[ -f "$HOST_ALLOW_FILE" ]]    || seed_file "$HOST_ALLOW_FILE"    '{"packages":{}}'
+    [[ -f "$SCRIPTS_ALLOW_FILE" ]] || seed_file "$SCRIPTS_ALLOW_FILE" '{"packages":{}}'
+  fi
   [[ -f "$SANDBOX_KNOWN_FILE" ]] || seed_file "$SANDBOX_KNOWN_FILE" '{"packages":{}}'
   [[ -f "$INSTALL_KNOWN_FILE" ]] || seed_file "$INSTALL_KNOWN_FILE" '{"packages":{}}'
   [[ -f "$BLOCKED_FILE" ]]       || seed_file "$BLOCKED_FILE"       "$(default_blocked_json)"
@@ -672,13 +685,103 @@ resolve_package_key_in_file() {
 }
 
 # ---------------------------------------------------------------------------
+# Trust-store redirection guard (#87)
+# ---------------------------------------------------------------------------
+# Normalize a path without requiring it to exist, so `..`/symlink games in an
+# env-supplied config root cannot dodge the canonical comparison. realpath -m is
+# coreutils (Linux target); fall back to the raw string if it is unavailable.
+_norm_path() { realpath -m -- "$1" 2>/dev/null || printf '%s' "$1"; }
+
+# True when the effective run config root is the canonical $HOME-anchored one.
+trust_store_is_canonical() {
+  [[ "$(_norm_path "$CONFIG_DIR")" == "$(_norm_path "$CANONICAL_RUN_CONFIG_DIR")" ]]
+}
+
+# Guard a trust decision made against a possibly env-redirected config root.
+# A trust escalation (host-allow host-exec, scripts-allow lifecycle scripts, or
+# a trust-store write) must be anchored to the canonical store; a root
+# redirected via SAFE_RUN_CONFIG_DIR / SAFE_CONFIG_DIR carries trust only when
+# the operator sets the explicit SAFE_RUN_TRUST_OVERRIDE token. That token is
+# env-forgeable — the accepted bash floor (#87). Its value is a bright,
+# greppable tripwire in the agent transcript (the surface the operator
+# monitors); the hard wall is #1 (polkit) / #2 (root-owned store) on the Go map.
+# The audit log follows the same redirectable DATA_DIR, so the stderr warn — not
+# the log line — is the load-bearing signal.
+#   mode=read  -> return 1 (caller declines the grant; falls back to sandbox)
+#   mode=write -> exit 100 (policy refusal, single stderr line)
+trust_redirected_guard() {
+  local mode="$1" ctx="$2"
+  trust_store_is_canonical && return 0
+  if [[ "$TRUST_OVERRIDE" == "1" ]]; then
+    warn "trust store at non-canonical root honored via SAFE_RUN_TRUST_OVERRIDE ($ctx)"
+    audit_log "trust" "$ctx" "TRUST_STORE_OVERRIDE_HONORED" "$(context_label)" "path=$CONFIG_DIR" || true
+    return 0
+  fi
+  if [[ "$mode" == "write" ]]; then
+    err "BLOCKED: trust store redirected via SAFE_RUN_CONFIG_DIR (canonical: $HOME/.config/safe/run); set SAFE_RUN_TRUST_OVERRIDE=1 to override"
+    # Best-effort, stderr-silent log: the policy refusal (single stderr line +
+    # exit 100) must remain the FINAL stderr line. audit_log runs an
+    # unredirected mkdir -p + append; if the redirected data root is unwritable
+    # its filesystem diagnostic would otherwise trail the BLOCKED line (F5).
+    audit_log "trust" "$ctx" "TRUST_STORE_REDIRECTED_REFUSED" "$(context_label)" "path=$CONFIG_DIR" 2>/dev/null || true
+    exit 100
+  fi
+  warn "trust store at non-canonical root ignored for $ctx grant (set SAFE_RUN_TRUST_OVERRIDE=1 to honor)"
+  audit_log "trust" "$ctx" "TRUST_STORE_REDIRECTED_IGNORED" "$(context_label)" "path=$CONFIG_DIR" || true
+  return 1
+}
+
+# Echoes the authoritative path for a trust file: the LITERAL canonical path
+# (immune to a symlink flip on CONFIG_DIR between check and use, F3) unless a
+# redirected root is blessed by the token, in which case the raw redirected
+# path. Callers gate with trust_redirected_guard first; this only decides WHICH
+# store a permitted operation touches.
+trust_store_file() {
+  local base="$1"
+  if [[ "$TRUST_OVERRIDE" == "1" ]] && ! trust_store_is_canonical; then
+    printf '%s/%s' "$CONFIG_DIR" "$base"
+  else
+    printf '%s/%s' "$CANONICAL_RUN_CONFIG_DIR" "$base"
+  fi
+}
+
+# Echo a trust store's JSON, defaulting to an empty package set when the file is
+# absent. An unblessed redirect seeds no host/scripts trust files (F4), so the
+# non-guarded management readers (list/remove) must treat "absent" as "empty"
+# instead of aborting on jq's missing-file status under set -e / pipefail (N1
+# sibling class). A malformed present file still surfaces jq's error, unchanged.
+load_trust_store_json() {
+  local f="$1"
+  if [[ -f "$f" ]]; then cat -- "$f"; else printf '%s' '{"packages":{}}'; fi
+}
+
+# Count entries in a store for the status display. Absent -> 0 (legitimate);
+# present+valid -> the count; present+malformed/unreadable -> a visible marker,
+# never a silent 0 that would read as "empty" when the file is actually corrupt
+# (#87 N3). Emitted with %s (the marker is non-numeric).
+store_count() {
+  local f="$1"
+  [[ -e "$f" ]] || { printf '0'; return 0; }
+  # A parseable document is not necessarily a valid store: `.packages` must be an
+  # object (the readers index it by package name). `{"packages":[]}` parses but
+  # is schema-malformed — show the marker, not a misleading 0 (#87 N3).
+  if jq -e '.packages | type == "object"' "$f" >/dev/null 2>&1; then
+    jq '.packages | length' "$f" 2>/dev/null || printf '?(unreadable/malformed)'
+  else
+    printf '?(unreadable/malformed)'
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Tier lookups
 # ---------------------------------------------------------------------------
 in_host_allow() {
   local pkg="$1" version="$2"
   HOST_ALLOW_PINNED_VERSION=""
-  local entry
-  entry=$(jq -r --arg p "$pkg" '.packages[$p] // empty' "$HOST_ALLOW_FILE")
+  trust_redirected_guard read "host-allow" || return 1
+  local entry ha_file
+  ha_file="$(trust_store_file host-allow.json)"
+  entry=$(jq -r --arg p "$pkg" '.packages[$p] // empty' "$ha_file")
   [[ -z "$entry" ]] && return 1
   local allowed_version
   allowed_version=$(printf '%s' "$entry" | jq -r '.version')
@@ -693,19 +796,47 @@ in_host_allow() {
 in_blocked() {
   local pkg="$1"
   local entry
-  entry=$(jq -r --arg p "$pkg" '.packages[$p] // empty' "$BLOCKED_FILE")
-  if [[ -n "$entry" ]]; then
-    BLOCKED_REASON=$(printf '%s' "$entry" | jq -r '.reason')
-    return 0
-  fi
-  if [[ "$pkg" == @*/* ]]; then
-    local scope_wildcard="${pkg%%/*}/*"
-    entry=$(jq -r --arg p "$scope_wildcard" '.packages[$p] // empty' "$BLOCKED_FILE")
+  # Fail-closed doctrine + standing operator ruling ("fail-closed stays for
+  # malice signals — blocklist ..."): the blocklist is a malice signal, so a
+  # redirected config root — blessed OR not — may ADD blocks but must never HIDE
+  # a canonical one. The SAFE_RUN_TRUST_OVERRIDE token blesses trust GRANTS
+  # (host-exec, lifecycle scripts), never the suppression of a block; a
+  # forgeable env var must not be able to empty the blocklist. So any
+  # non-canonical root ALWAYS unions the canonical store in (F2). The canonical
+  # path is the literal $HOME-anchored one (symlink-flip immune, F3).
+  local -a blocked_files=("$CANONICAL_RUN_CONFIG_DIR/blocked.json")
+  trust_store_is_canonical || blocked_files+=("$BLOCKED_FILE")
+  local f
+  for f in "${blocked_files[@]}"; do
+    [[ -e "$f" ]] || continue    # absent authority member: legitimate (relocation)
+    # #87 N2: a present-but-unreadable or malformed authority member is breakage,
+    # NOT "not blocked". Silently skipping it (the old `[[ -r ]] || continue`)
+    # would hide a canonical block behind an unreadable file; letting jq fail
+    # would crash mid-run under set -e. Refuse instead — framed as
+    # breakage-to-fix with a recovery path, a single final stderr line, never a
+    # malice verdict.
+    if ! jq -e '
+      (type == "object") and ((.packages // {}) | type == "object")
+      and ((.packages // {}) | [to_entries[] | .value | type == "object"] | all)
+    ' "$f" >/dev/null 2>&1; then
+      err "BLOCKED: cannot read the blocklist at $f (unreadable or malformed) — repair it or reinstall safe; this is audit-infrastructure breakage, not a package verdict"
+      audit_log "blocklist" "$pkg" "BLOCKED" "$(context_label)" "BLOCKLIST_UNREADABLE" "path=$f" 2>/dev/null || true
+      exit 100
+    fi
+    entry=$(jq -r --arg p "$pkg" '.packages[$p] // empty' "$f")
     if [[ -n "$entry" ]]; then
       BLOCKED_REASON=$(printf '%s' "$entry" | jq -r '.reason')
       return 0
     fi
-  fi
+    if [[ "$pkg" == @*/* ]]; then
+      local scope_wildcard="${pkg%%/*}/*"
+      entry=$(jq -r --arg p "$scope_wildcard" '.packages[$p] // empty' "$f")
+      if [[ -n "$entry" ]]; then
+        BLOCKED_REASON=$(printf '%s' "$entry" | jq -r '.reason')
+        return 0
+      fi
+    fi
+  done
   return 1
 }
 
@@ -1343,9 +1474,15 @@ dispatch_run() {
     fi
   else
     # Note in audit if a host-allow entry was bypassed because runner lacks
-    # ignore-scripts support. (Only relevant info; not an error.)
-    local ha_entry
-    ha_entry=$(jq -r --arg p "$pkg" '.packages[$p] // empty' "$HOST_ALLOW_FILE")
+    # ignore-scripts support. (Only relevant info; not an error.) Read the
+    # honored store (canonical unless a blessed redirect) and tolerate its
+    # absence: a fresh unblessed redirect seeds no host-allow file (F4), so
+    # this purely-informational read must never abort the run under set -e (N1).
+    local ha_file ha_entry=""
+    ha_file="$(trust_store_file host-allow.json)"
+    if [[ -f "$ha_file" ]]; then
+      ha_entry=$(jq -r --arg p "$pkg" '.packages[$p] // empty' "$ha_file" 2>/dev/null || true)
+    fi
     if [[ -n "$ha_entry" ]]; then
       audit_log "$runner_label" "$pkgver" "INFO" "$(context_label)" \
         "HOST_ALLOW_SKIPPED_NO_IGNORE_SCRIPTS" "runner=$runner_label"
@@ -1515,7 +1652,10 @@ write_host_allow_entry() {
   # machine's set) pass it as $6 so a round trip does not reset the age the
   # staleness review computes from; add/update omit it and stamp today.
   local added="${6:-$(date -I)}"
-  local tmp
+  local tmp ha_file
+  # #87: write the sanctioned store (literal canonical, or a blessed redirect);
+  # callers are already write-guarded against an unblessed redirect.
+  ha_file="$(trust_store_file host-allow.json)"
   tmp=$(mktemp)
   jq --arg p "$pkg" --arg v "$version" --arg s "$sha" \
      --arg r "$reason" --arg d "$added" --arg e "$ecosystem" '
@@ -1525,8 +1665,8 @@ write_host_allow_entry() {
       ecosystem: $e,
       added: $d,
       reason: $r
-    }' "$HOST_ALLOW_FILE" > "$tmp"
-  mv "$tmp" "$HOST_ALLOW_FILE"
+    }' "$ha_file" > "$tmp"
+  mv "$tmp" "$ha_file"
 }
 
 cmd_host_allow() {
@@ -1636,6 +1776,7 @@ cmd_host_allow_export() {
 }
 
 cmd_host_allow_import() {
+  trust_redirected_guard write "host-allow-import"
   local file="" dry_run=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1775,6 +1916,7 @@ require_operator_tty() {
 }
 
 cmd_host_allow_add() {
+  trust_redirected_guard write "host-allow-add"
   local spec="${1:-}"
   shift || true
   [[ -z "$spec" ]] && die "usage: safe run host-allow add <pkg>@<version> --reason \"...\""
@@ -1812,6 +1954,9 @@ cmd_host_allow_add() {
 cmd_host_allow_remove() {
   local pkg="${1:-}"
   [[ -z "$pkg" ]] && die "usage: safe run host-allow remove <pkg>"
+  # An unblessed redirect seeds no host-allow file (F4): nothing to remove,
+  # rather than aborting on jq's missing-file status (N1 sibling class).
+  [[ -f "$HOST_ALLOW_FILE" ]] || { info "host-allow is empty; nothing to remove"; return 0; }
   pkg=$(resolve_package_key_in_file "$HOST_ALLOW_FILE" "$pkg")
   local tmp
   tmp=$(mktemp)
@@ -1821,6 +1966,7 @@ cmd_host_allow_remove() {
 }
 
 cmd_host_allow_update() {
+  trust_redirected_guard write "host-allow-update"
   local spec="${1:-}"
   shift || true
   [[ -z "$spec" ]] && die "usage: safe run host-allow update <pkg>@<new-version> --reason \"...\""
@@ -1862,9 +2008,9 @@ cmd_host_allow_update() {
 }
 
 cmd_host_allow_list() {
-  jq -r '.packages | to_entries[] |
-    "\(.key)@\(.value.version)\t\(.value.ecosystem // "npm")\t\(.value.added)\t\(.value.reason)"' \
-    "$HOST_ALLOW_FILE" | \
+  load_trust_store_json "$HOST_ALLOW_FILE" | \
+    jq -r '.packages | to_entries[] |
+    "\(.key)@\(.value.version)\t\(.value.ecosystem // "npm")\t\(.value.added)\t\(.value.reason)"' | \
     awk -F'\t' 'BEGIN{printf "%-40s %-8s %-12s %s\n","PACKAGE","ECO","ADDED","REASON"}
                 {printf "%-40s %-8s %-12s %s\n",$1,$2,$3,$4}'
   printf '\nnote: host-allow tier ONLY applies to npm/npx (uses --ignore-scripts).\n'
@@ -2207,6 +2353,7 @@ scripts_allow_fetch_scripts() {
 }
 
 cmd_scripts_allow_add() {
+  trust_redirected_guard write "scripts-allow-add"
   local spec="${1:-}"
   shift || true
   [[ -z "$spec" ]] && die "usage: safe run scripts-allow add <pkg>@<x.y.z> --reason \"...\""
@@ -2263,7 +2410,10 @@ cmd_scripts_allow_add() {
   sha=$(registry_integrity_npm "$PKG_NAME" "$PKG_VERSION") || true
   [[ -z "$sha" ]] && die "could not fetch registry integrity for ${PKG_NAME}@${PKG_VERSION} — refusing a grant not bound to the reviewed artifact"
 
-  local tmp
+  local tmp sa_file
+  # #87: write the sanctioned store (literal canonical, or a blessed redirect);
+  # cmd_scripts_allow_add is already write-guarded against an unblessed redirect.
+  sa_file="$(trust_store_file scripts-allow.json)"
   tmp=$(mktemp)
   jq --arg p "$PKG_NAME" --arg v "$PKG_VERSION" --arg s "$sha" \
      --arg r "$reason" --arg d "$(date -I)" --argjson scripts "$scripts_json" '
@@ -2274,8 +2424,8 @@ cmd_scripts_allow_add() {
       added: $d,
       reason: $r,
       scripts: $scripts
-    }' "$SCRIPTS_ALLOW_FILE" > "$tmp"
-  mv "$tmp" "$SCRIPTS_ALLOW_FILE"
+    }' "$sa_file" > "$tmp"
+  mv "$tmp" "$sa_file"
   info "granted install scripts for ${PKG_NAME}@${PKG_VERSION}"
   info "runs via: npm i -g ${PKG_NAME}@${PKG_VERSION} in a gated shell (npm >= 12; strict allow-scripts)"
 }
@@ -2283,6 +2433,9 @@ cmd_scripts_allow_add() {
 cmd_scripts_allow_remove() {
   local pkg="${1:-}"
   [[ -z "$pkg" ]] && die "usage: safe run scripts-allow remove <pkg>"
+  # An unblessed redirect seeds no scripts-allow file (F4): nothing to remove,
+  # rather than aborting on jq's missing-file status (N1 sibling class).
+  [[ -f "$SCRIPTS_ALLOW_FILE" ]] || { info "scripts-allow is empty; nothing to remove"; return 0; }
   pkg=$(resolve_package_key_in_file "$SCRIPTS_ALLOW_FILE" "$pkg")
   local tmp
   tmp=$(mktemp)
@@ -2292,9 +2445,9 @@ cmd_scripts_allow_remove() {
 }
 
 cmd_scripts_allow_list() {
-  jq -r '.packages | to_entries[] |
-    "\(.key)@\(.value.version)\t\(.value.added)\t\(if .value.scripts == null then "unreviewed(fetch failed)" else ((.value.scripts | keys | join(",")) // "none") end)\t\(.value.reason)"' \
-    "$SCRIPTS_ALLOW_FILE" | \
+  load_trust_store_json "$SCRIPTS_ALLOW_FILE" | \
+    jq -r '.packages | to_entries[] |
+    "\(.key)@\(.value.version)\t\(.value.added)\t\(if .value.scripts == null then "unreviewed(fetch failed)" else ((.value.scripts | keys | join(",")) // "none") end)\t\(.value.reason)"' | \
     awk -F'\t' 'BEGIN{printf "%-40s %-12s %-28s %s\n","PACKAGE","ADDED","SCRIPTS","REASON"}
                 {printf "%-40s %-12s %-28s %s\n",$1,$2,($3==""?"none":$3),$4}'
   printf '\nnote: grants apply to npm global installs in gated shells (npm >= 12 allow-scripts, strict).\n'
@@ -2445,19 +2598,22 @@ cmd_audit() {
 
 cmd_status() {
   local host_count sandbox_count install_count blocked_count
-  host_count=$(jq '.packages | length' "$HOST_ALLOW_FILE")
-  sandbox_count=$(jq '.packages | length' "$SANDBOX_KNOWN_FILE")
-  install_count=$(jq '.packages | length' "$INSTALL_KNOWN_FILE" 2>/dev/null || echo 0)
-  blocked_count=$(jq '.packages | length' "$BLOCKED_FILE")
+  # Absent store -> 0 (a fresh unblessed redirect seeds no host-allow file, F4;
+  # a status read must never abort under set -e, N1 sibling). A present-but-
+  # malformed store shows a visible marker rather than a silent 0 (N3).
+  host_count=$(store_count "$HOST_ALLOW_FILE")
+  sandbox_count=$(store_count "$SANDBOX_KNOWN_FILE")
+  install_count=$(store_count "$INSTALL_KNOWN_FILE")
+  blocked_count=$(store_count "$BLOCKED_FILE")
 
   echo "safe run $SAFE_RUN_VERSION"
   echo "config: $CONFIG_DIR"
   echo "log:    $AUDIT_LOG"
   echo
-  printf "host-allow:     %d (npm-only; bunx/uvx/pipx ignore these)\n" "$host_count"
-  printf "sandbox-known:  %d\n" "$sandbox_count"
-  printf "install-known:  %d (recorded clean install checks)\n" "$install_count"
-  printf "blocked:        %d\n" "$blocked_count"
+  printf "host-allow:     %s (npm-only; bunx/uvx/pipx ignore these)\n" "$host_count"
+  printf "sandbox-known:  %s\n" "$sandbox_count"
+  printf "install-known:  %s (recorded clean install checks)\n" "$install_count"
+  printf "blocked:        %s\n" "$blocked_count"
   echo
   if podman_available; then
     echo "podman: $(podman --version)"

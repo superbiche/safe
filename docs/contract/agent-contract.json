@@ -48,7 +48,7 @@
     },
     {
       "code": 100,
-      "meaning": "blocked by policy: an audit WARN with no matching allow entry, blocklist, fail-closed audit, or unrecognized/unsupported runner-native flags — the refusal line names which",
+      "meaning": "blocked by policy: an audit WARN with no matching allow entry, blocklist, fail-closed audit, unrecognized/unsupported runner-native flags, or a trust-store change requested against a non-canonical (environment-redirected) config root — the refusal line names which",
       "agent_action": "Relay the refusal line verbatim to the operator. Do not retry, do not reword the command."
     },
     {

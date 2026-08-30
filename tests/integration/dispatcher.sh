@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# #87: this suite exercises trust reads/writes (incl. `safe install --trust-host`)
+# through a relocated SAFE_CONFIG_DIR for hermeticity; bless it as authoritative
+# so the trust-redirect guard is a no-op here. The guard itself is covered by
+# tests/run/trust_store_redirect.sh.
+export SAFE_RUN_TRUST_OVERRIDE=1
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SAFE="$ROOT/bin/safe"
 
@@ -134,6 +140,36 @@ trust_config="$tmp/trust-config"
 trust_install_output="$(PATH="$shim:$PATH" SAFE_CONFIG_DIR="$trust_config" "$shim/safe" install --yes --trust-host -g cowsay@1.6.0)"
 grep -Fq $'npm\tinstall\t-g\tcowsay@1.6.0' <<<"$trust_install_output" || fail "safe install --trust-host did not install package"
 jq -e '.packages.cowsay.version == "1.6.0" and .packages.cowsay.ecosystem == "npm"' "$trust_config/run/host-allow.json" >/dev/null || fail "safe install --trust-host did not add exact host-allow entry"
+
+# #87 F4: the same --trust-host write, but with the trust store redirected AND
+# the override token OFF, must hard-refuse (exit 100) before writing anything —
+# a gated agent cannot forge a host-allow entry through a relocated config root.
+notoken_config="$tmp/notoken-trust-config"
+set +e
+notoken_out="$(PATH="$shim:$PATH" SAFE_CONFIG_DIR="$notoken_config" SAFE_RUN_TRUST_OVERRIDE=0 \
+  "$shim/safe" install --yes --trust-host -g cowsay@1.6.0 2>&1)"
+notoken_rc=$?
+set -e
+[[ "$notoken_rc" -eq 100 ]] || fail "safe install --trust-host on an unblessed redirected store must exit 100 (got $notoken_rc)"
+grep -Fq 'trust store redirected' <<<"$notoken_out" || fail "--trust-host refusal must be the trust-redirect message, not an incidental exit 100"
+[[ ! -f "$notoken_config/run/host-allow.json" ]] || fail "refused --trust-host must not write the redirected host-allow store"
+pass "safe install --trust-host refuses an unblessed redirected write (exit 100, nothing written)"
+
+# #87 F1: the redirect twin — SAFE_RUN_CONFIG_DIR is the other documented run
+# root, and the dispatcher must honor the same SAFE_RUN_CONFIG_DIR > SAFE_CONFIG_DIR
+# precedence as safe-run/safe-audit/gate-lib. Before the F1 fix bin/safe ignored
+# this variable, so an unblessed SAFE_RUN_CONFIG_DIR redirect wrote the canonical
+# store instead of refusing.
+runredir_config="$tmp/notoken-run-config"
+set +e
+runredir_out="$(PATH="$shim:$PATH" SAFE_RUN_CONFIG_DIR="$runredir_config" SAFE_RUN_TRUST_OVERRIDE=0 \
+  "$shim/safe" install --yes --trust-host -g cowsay@1.6.0 2>&1)"
+runredir_rc=$?
+set -e
+[[ "$runredir_rc" -eq 100 ]] || fail "safe install --trust-host on an unblessed SAFE_RUN_CONFIG_DIR redirect must exit 100 (got $runredir_rc)"
+grep -Fq 'trust store redirected' <<<"$runredir_out" || fail "SAFE_RUN_CONFIG_DIR redirect refusal must be the trust-redirect message"
+[[ ! -f "$runredir_config/host-allow.json" ]] || fail "refused --trust-host must not write the SAFE_RUN_CONFIG_DIR store"
+pass "safe install --trust-host honors the SAFE_RUN_CONFIG_DIR redirect too (F1 precedence)"
 
 refusal_case() {
   local label="$1" expected_rc="$2" stub_status="$3" fragment="$4"
