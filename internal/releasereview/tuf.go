@@ -200,14 +200,48 @@ func bootstrap(result *CheckResult, config *TUFCheck) (metadataPath, targetsDir 
 // A local directory is what the spec names, but cosign speaks HTTP to a mirror.
 // Loopback with an ephemeral port keeps the bridge unreachable from anywhere but
 // this process's own host for the few seconds it exists.
+//
+// The tree is served through an *os.Root rather than http.Dir, which follows
+// symlinks: a mirror entry pointing out of the tree would otherwise hand cosign
+// out-of-mirror bytes as trusted TUF material, the same substitution the blob
+// reads below are caged against. Named failure modes, all observed:
+//   - a resolution that leaves the mirror — an escaping symlink at the final
+//     component or at any directory component of the request path — fails the
+//     open with os.Root's beneath-root violation, which the file server maps to
+//     500 rather than 404. cosign's fetch then fails and bootstrap reports
+//     bootstrap_failure BLOCK: fail-closed, and distinguishable from a blob that
+//     is merely absent.
+//   - a dangling in-tree link is absence, not an escape, and reads as 404.
+//   - an in-tree symlink is followed and served. Containment is the property,
+//     not link-refusal — mirrors legitimately dedup content-addressed blobs
+//     through links, the same latitude the hash-read cage grants.
+//
+// The mirror root itself being a symlink is fine: os.OpenRoot resolves its own
+// argument once, and that path is the operator's declaration rather than
+// mirror-supplied content. The listener's own error path stays swallowed — a
+// failed Serve surfaces as cosign failing to fetch, which is already fail-closed.
 func serveMirror(dir string) (string, func(), error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return "", nil, err
 	}
-	server := &http.Server{Handler: http.FileServer(http.Dir(dir))}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		_ = listener.Close()
+		return "", nil, err
+	}
+	server := &http.Server{Handler: http.FileServer(http.FS(root.FS()))}
 	go func() { _ = server.Serve(listener) }()
-	return "http://" + listener.Addr().String(), func() { _ = server.Close() }, nil
+	// Both halves are closed or the root's descriptor leaks for the life of the
+	// review. The server goes first only for tidiness — Close does not drain
+	// in-flight handlers, so the ordering guarantees nothing on its own; what
+	// makes it safe is that stop runs after cosign has exited, with no request
+	// left to serve.
+	stop := func() {
+		_ = server.Close()
+		_ = root.Close()
+	}
+	return "http://" + listener.Addr().String(), stop, nil
 }
 
 // findTrustedTargetsMetadata locates targets.json exactly two levels under the
