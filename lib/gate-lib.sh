@@ -1082,6 +1082,50 @@ safe_gate_run_config_dir() {
   printf '%s' "${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}"
 }
 
+# Trust anchor for the install wrapper (#87). The read-side twin of
+# bin/safe-run's trust_redirected_guard: a trust GRANT (host-allow host-exec
+# override, scripts-allow lifecycle scripts) is honored only from the canonical
+# $HOME-anchored store, or from a redirected root the operator blessed with
+# SAFE_RUN_TRUST_OVERRIDE. Fail-safe: an unblessed redirect declines the grant
+# (install proceeds sandboxed / script-less) with a stderr tripwire — the audit
+# log follows the same redirectable root, so stderr is the load-bearing signal.
+# Deliberately duplicated: safe-run and the gate share no sourced root.
+safe_gate_canonical_run_config_dir() {
+  printf '%s' "$HOME/.config/safe/run"
+}
+
+# Normalize without requiring existence (defeats ../ + symlink evasion).
+safe_gate_norm_path() { realpath -m -- "$1" 2>/dev/null || printf '%s' "$1"; }
+
+safe_gate_trust_store_canonical() {
+  [[ "$(safe_gate_norm_path "$(safe_gate_run_config_dir)")" \
+     == "$(safe_gate_norm_path "$(safe_gate_canonical_run_config_dir)")" ]]
+}
+
+# Authoritative path for a trust file: the LITERAL canonical path (immune to a
+# symlink flip on the config root between check and use, F3) unless a redirected
+# root is token-blessed (then the raw redirected path).
+safe_gate_trust_store_file() {
+  local base="$1"
+  if [[ "${SAFE_RUN_TRUST_OVERRIDE:-0}" == "1" ]] && ! safe_gate_trust_store_canonical; then
+    printf '%s/%s' "$(safe_gate_run_config_dir)" "$base"
+  else
+    printf '%s/%s' "$(safe_gate_canonical_run_config_dir)" "$base"
+  fi
+}
+
+# 0 = honor the grant (canonical, or redirected+blessed); 1 = decline it.
+safe_gate_trust_redirected_ok() {
+  local ctx="$1"
+  safe_gate_trust_store_canonical && return 0
+  if [[ "${SAFE_RUN_TRUST_OVERRIDE:-0}" == "1" ]]; then
+    safe_gate_err "safe: trust store at non-canonical root honored via SAFE_RUN_TRUST_OVERRIDE (${ctx})"
+    return 0
+  fi
+  safe_gate_err "safe: trust store at non-canonical root ignored for ${ctx} grant (set SAFE_RUN_TRUST_OVERRIDE=1 to honor)"
+  return 1
+}
+
 safe_gate_split_spec() {
   local spec="$1"
   local name version
@@ -1178,8 +1222,9 @@ safe_gate_host_allow_matches() {
   local host_allow_file name version entry_version entry_ecosystem
 
   command -v jq >/dev/null 2>&1 || return 1
+  safe_gate_trust_redirected_ok "host-allow" || return 1
 
-  host_allow_file="$(safe_gate_run_config_dir)/host-allow.json"
+  host_allow_file="$(safe_gate_trust_store_file host-allow.json)"
   [[ -r "${host_allow_file}" ]] || return 1
 
   IFS=$'\t' read -r name version <<< "$(safe_gate_split_spec "${package}")"
@@ -1202,7 +1247,7 @@ safe_gate_host_allow_matches() {
 # ---------------------------------------------------------------------------
 
 safe_gate_scripts_allow_file() {
-  printf '%s/scripts-allow.json' "$(safe_gate_run_config_dir)"
+  printf '%s' "$(safe_gate_trust_store_file scripts-allow.json)"
 }
 
 # Prints the granted version for a package name; fails when none.
@@ -1300,6 +1345,9 @@ safe_gate_npm_global_true() {
 # policy: state the manual fallback instead of silently skipping scripts.
 safe_gate_npm_scripts_env() {
   local package matched="" name version granted
+  # #87: a redirected config root cannot authorize lifecycle scripts unless the
+  # operator blessed it; otherwise scripts stay skipped (fail-safe), one warn.
+  safe_gate_trust_redirected_ok "scripts-allow" || return 0
   for package in "$@"; do
     IFS=$'\t' read -r name version <<< "$(safe_gate_split_spec "${package}")"
     granted="$(safe_gate_scripts_allow_version "${name}")" || continue

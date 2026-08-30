@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.3.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.49.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.50.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -44,6 +44,46 @@ LAST_IOC_UPDATE="$DATA_DIR/last-ioc-update"
 
 SAFE_RUN_CONFIG_DIR="${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/run}"
 SAFE_RUN_BLOCKED_FILE="$SAFE_RUN_CONFIG_DIR/blocked.json"
+# Trust anchor (#87). This audit child is the shared install-gate boundary
+# (every `safe`/gate-lib install lane calls `safe-audit … --gate install`), so
+# the canonical-store rule that bin/safe-run enforces for the run lane must hold
+# here too, or a forged host-allow / emptied blocklist under a redirected
+# SAFE_RUN_CONFIG_DIR / SAFE_CONFIG_DIR would authorize a host install (F1) or
+# hide a canonical block (F2). A redirected root carries GRANT authority only
+# under SAFE_RUN_TRUST_OVERRIDE; without it host-allow grants are declined. The
+# blocklist is different: it is a malice signal, so the canonical store is
+# ALWAYS unioned in (blessed or not) — the token blesses grants, never the
+# suppression of a block (F2). Reads use the LITERAL canonical path (not the
+# env-derived one) so a symlink flip on the config root cannot swap the store
+# between check and use (F3). Mirror of bin/safe-run; the two share no sourced
+# root.
+SAFE_RUN_CANONICAL_CONFIG_DIR="$HOME/.config/safe/run"
+_trust_norm_path() { realpath -m -- "$1" 2>/dev/null || printf '%s' "$1"; }
+trust_store_is_canonical() {
+  [[ "$(_trust_norm_path "$SAFE_RUN_CONFIG_DIR")" \
+     == "$(_trust_norm_path "$SAFE_RUN_CANONICAL_CONFIG_DIR")" ]]
+}
+# Echoes the authoritative path for a trust/policy file: the literal canonical
+# path unless a redirected root is blessed by the token (then the raw path).
+trust_store_file() {
+  local base="$1"
+  if [[ "${SAFE_RUN_TRUST_OVERRIDE:-0}" == "1" ]] && ! trust_store_is_canonical; then
+    printf '%s/%s' "$SAFE_RUN_CONFIG_DIR" "$base"
+  else
+    printf '%s/%s' "$SAFE_RUN_CANONICAL_CONFIG_DIR" "$base"
+  fi
+}
+# 0 = honor a trust GRANT (canonical or blessed); 1 = decline (fail-safe).
+trust_grant_ok() {
+  local ctx="$1"
+  trust_store_is_canonical && return 0
+  if [[ "${SAFE_RUN_TRUST_OVERRIDE:-0}" == "1" ]]; then
+    warn "trust store at non-canonical root honored via SAFE_RUN_TRUST_OVERRIDE ($ctx)"
+    return 0
+  fi
+  warn "trust store at non-canonical root ignored for $ctx grant (set SAFE_RUN_TRUST_OVERRIDE=1 to honor)"
+  return 1
+}
 
 DEFAULT_SCAN_ROOT="${SAFE_AUDIT_DEFAULT_SCAN_ROOT:-$HOME}"
 DEFAULT_LOCAL_MACHINE="${SAFE_AUDIT_LOCAL_MACHINE:-local}"
@@ -4747,23 +4787,67 @@ parse_pkg_spec() {
   fi
 }
 
+# The blocklist files that carry authority for the current root, in search
+# order (populates BLOCKLIST_AUTHORITY_FILES). Canonical is ALWAYS included
+# (fail-closed doctrine + standing operator ruling "fail-closed stays for malice
+# signals — blocklist ...": a redirected root — blessed OR not — may ADD blocks
+# but must never HIDE a canonical one; the SAFE_RUN_TRUST_OVERRIDE token blesses
+# trust GRANTS, never the suppression of a block, #87 F2). A non-canonical root
+# also searches its redirected store; canonical is the literal $HOME-anchored
+# path (symlink-flip immune, F3). The reader (blocked_entry_reason) and the
+# fail-closed validity gate (blocklist_authority_readable) MUST consume this
+# SAME list — a member validated-but-not-searched, or searched-but-not-validated,
+# reopens the N2 hole.
+blocklist_authority_files() {
+  BLOCKLIST_AUTHORITY_FILES=("$SAFE_RUN_CANONICAL_CONFIG_DIR/blocked.json")
+  trust_store_is_canonical || BLOCKLIST_AUTHORITY_FILES+=("$SAFE_RUN_BLOCKED_FILE")
+}
+
+# Fail-closed validity across EVERY authority member actually searched. Absent
+# is legitimate (relocation / not-yet-seeded), but a present member that cannot
+# be read or does not validate is breakage — return 1 (names it in
+# BLOCKLIST_UNREADABLE_FILE) so the decision layer demotes to WARN rather than
+# treating a hidden or garbled block as "not blocked" (#87 N2).
+blocklist_authority_readable() {
+  local f
+  blocklist_authority_files
+  for f in "${BLOCKLIST_AUTHORITY_FILES[@]}"; do
+    # Present (`-e`), not "regular file" (`-f`): a non-regular node at the path
+    # (e.g. a directory at canonical blocked.json) must fail closed like any
+    # unreadable member, matching the run lane's in_blocked. Only a genuinely
+    # ABSENT member is skipped as legitimate relocation (#87 N2 lane parity).
+    [[ -e "$f" ]] || continue
+    if ! jq -e '
+      (type == "object") and ((.packages // {}) | type == "object")
+      and ((.packages // {}) | [to_entries[] | .value | type == "object"] | all)
+    ' "$f" >/dev/null 2>&1; then
+      BLOCKLIST_UNREADABLE_FILE="$f"
+      return 1
+    fi
+  done
+  return 0
+}
+
 blocked_entry_reason() {
   local pkg="$1"
-  [[ -f "$SAFE_RUN_BLOCKED_FILE" ]] || return 1
-  local entry
-  entry=$(jq -r --arg p "$pkg" '.packages[$p] // empty' "$SAFE_RUN_BLOCKED_FILE")
-  if [[ -n "$entry" ]]; then
-    printf '%s' "$(printf '%s' "$entry" | jq -r '.reason // "blocked"')"
-    return 0
-  fi
-  if [[ "$pkg" == @*/* ]]; then
-    local wildcard="${pkg%%/*}/*"
-    entry=$(jq -r --arg p "$wildcard" '.packages[$p] // empty' "$SAFE_RUN_BLOCKED_FILE")
+  blocklist_authority_files
+  local f entry
+  for f in "${BLOCKLIST_AUTHORITY_FILES[@]}"; do
+    [[ -f "$f" ]] || continue
+    entry=$(jq -r --arg p "$pkg" '.packages[$p] // empty' "$f")
     if [[ -n "$entry" ]]; then
       printf '%s' "$(printf '%s' "$entry" | jq -r '.reason // "blocked"')"
       return 0
     fi
-  fi
+    if [[ "$pkg" == @*/* ]]; then
+      local wildcard="${pkg%%/*}/*"
+      entry=$(jq -r --arg p "$wildcard" '.packages[$p] // empty' "$f")
+      if [[ -n "$entry" ]]; then
+        printf '%s' "$(printf '%s' "$entry" | jq -r '.reason // "blocked"')"
+        return 0
+      fi
+    fi
+  done
   return 1
 }
 
@@ -7121,10 +7205,16 @@ host_allow_canonical_eco() {
 host_allow_matches_resolved() {
   local ecosystem="$1" name="$2"
   shift 2
-  [[ -f "$SAFE_RUN_HOST_ALLOW_FILE" ]] || return 1
+  # #87: a host-allow grant is authority only from the canonical store (or a
+  # token-blessed redirect); a redirected root is declined so a forged pin
+  # cannot turn a WARN into GO on the install lane.
+  trust_grant_ok "host-allow" || return 1
+  local ha_file
+  ha_file="$(trust_store_file host-allow.json)"
+  [[ -f "$ha_file" ]] || return 1
   local entry_version entry_ecosystem
-  entry_version=$(jq -r --arg p "$name" '.packages[$p].version // empty' "$SAFE_RUN_HOST_ALLOW_FILE" 2>/dev/null || true)
-  entry_ecosystem=$(jq -r --arg p "$name" '.packages[$p].ecosystem // "npm"' "$SAFE_RUN_HOST_ALLOW_FILE" 2>/dev/null || true)
+  entry_version=$(jq -r --arg p "$name" '.packages[$p].version // empty' "$ha_file" 2>/dev/null || true)
+  entry_ecosystem=$(jq -r --arg p "$name" '.packages[$p].ecosystem // "npm"' "$ha_file" 2>/dev/null || true)
   [[ -n "$entry_version" ]] || return 1
   # Only ecosystems `host-allow add` can actually grant are matchable
   # (review PR#61 F3): a hand-edited entry for an unsupported ecosystem must
@@ -7677,13 +7767,16 @@ package_audit_command() {
 
   # Blocklist state is gathered here; what an unreadable file MEANS — that it
   # is not the same as "not blocked" — is decided by the decision layer.
-  local blocklist_readable=1 blocklist_reason=""
-  if [[ -f "$SAFE_RUN_BLOCKED_FILE" ]] \
-    && ! jq -e '
-      (type == "object") and ((.packages // {}) | type == "object")
-      and ((.packages // {}) | [to_entries[] | .value | type == "object"] | all)
-    ' "$SAFE_RUN_BLOCKED_FILE" >/dev/null 2>&1; then
+  # #87 N2: validate EVERY authority member actually searched (canonical always,
+  # plus the redirected store on a non-canonical root), not just the single
+  # trust_store_file selection. Otherwise, under a blessed redirect, a malformed
+  # or unreadable CANONICAL file would pass a redirected-only validity check and
+  # let blocked_entry_reason treat a hidden canonical block as "not blocked".
+  local blocklist_readable=1 blocklist_reason="" \
+    blocklist_file="$SAFE_RUN_CANONICAL_CONFIG_DIR/blocked.json"
+  if ! blocklist_authority_readable; then
     blocklist_readable=0
+    blocklist_file="$BLOCKLIST_UNREADABLE_FILE"
   elif block_reason=$(blocked_entry_reason "$PKG_NAME"); then
     blocklist_reason="$block_reason"
   fi
@@ -7736,7 +7829,7 @@ package_audit_command() {
     --argjson custom_source "$custom_source_json" \
     --argjson blocklist_readable "$blocklist_readable_json" \
     --arg blocklist_reason "$blocklist_reason" \
-    --arg blocklist_path "$SAFE_RUN_BLOCKED_FILE" \
+    --arg blocklist_path "$blocklist_file" \
     --argjson block_severities "$block_severities" '
     {resolution: {ok: $res_ok, primary_version: $primary, label: $label},
      socket: $socket,
@@ -8213,12 +8306,11 @@ scanner_batch_command() {
   # breakage, not "not blocked": blocked_entry_reason runs as a conditional,
   # where a jq failure is indistinguishable from a miss, and operator
   # blocklist evidence would vanish silently (PR#64 review F4).
-  if [[ -f "$SAFE_RUN_BLOCKED_FILE" ]] \
-    && ! jq -e '
-      (type == "object") and ((.packages // {}) | type == "object")
-      and ((.packages // {}) | [to_entries[] | .value | type == "object"] | all)
-    ' "$SAFE_RUN_BLOCKED_FILE" >/dev/null 2>&1; then
-    printf 'safe audit: scanner-batch: blocklist file unreadable (%s) — local audit-infrastructure breakage, not a package finding; repair or remove the file\n' "$SAFE_RUN_BLOCKED_FILE" >&2
+  # #87 N2: validate every authority member searched (canonical + any redirected
+  # store), not just the trust_store_file selection, so a malformed canonical
+  # under a blessed redirect cannot pass as readable and hide a canonical block.
+  if ! blocklist_authority_readable; then
+    printf 'safe audit: scanner-batch: blocklist file unreadable (%s) — local audit-infrastructure breakage, not a package finding; repair or remove the file\n' "$BLOCKLIST_UNREADABLE_FILE" >&2
     return 4
   fi
 

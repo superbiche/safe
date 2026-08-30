@@ -39,6 +39,32 @@ Move all config or data:
 SAFE_CONFIG_DIR=/tmp/safe-config SAFE_DATA_DIR=/tmp/safe-data safe status
 ```
 
+### Trust is anchored to the canonical root
+
+`SAFE_RUN_CONFIG_DIR` / `SAFE_CONFIG_DIR` relocate the config root, but the
+**trust** decisions — host-allow host execution, `scripts-allow` lifecycle
+scripts, and the trust-store writes (`host-allow add`/`update`/`import`,
+`scripts-allow add`) — are honored only from the canonical
+`~/.config/safe/run` store. This closes an escalation path: a process that can
+run package managers only through `safe` cannot point it at a store it wrote
+itself and thereby escape the sandbox. Against a redirected root safe **fails
+safe** on reads (the grant is declined; the package still runs sandboxed) and
+**refuses writes with exit 100**; the canonical blocklist is always consulted,
+so a redirect can never hide a block.
+
+If you genuinely relocate config and want trust to apply at the new location,
+set `SAFE_RUN_TRUST_OVERRIDE=1` — it blesses the redirected store's **grants**
+(host-allow host execution and `scripts-allow` lifecycle scripts) and lifts the
+write refusal. It does **not** extend to the blocklist: that is a malice signal,
+so the canonical blocklist is always unioned in regardless of the token — a
+redirect, blessed or not, can only add blocks, never hide a canonical one. The
+override is deliberately loud (it prints a warning on every honored grant) so
+its use stands out. Note the bash-level limits: this guard
+does not defend against a `HOME` redirection, and it is not a substitute for a
+non-forgeable operator check or a root-owned store (both tracked for the Go
+rewrite). It raises the bar and leaves a bright, greppable trail; it is not a
+hard privilege boundary.
+
 ## Run Config
 
 `host-allow.json` stores pinned package versions allowed to execute on the host.

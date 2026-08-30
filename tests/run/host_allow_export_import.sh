@@ -18,6 +18,11 @@
 
 set -euo pipefail
 
+# #87: this suite drives trust writes/grants through a redirected config root
+# for hermeticity; bless it as authoritative so the trust-redirect guard is a
+# no-op here. The guard's own behavior lives in tests/run/trust_store_redirect.sh.
+export SAFE_RUN_TRUST_OVERRIDE=1
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SAFE_RUN="$ROOT/bin/safe-run"
 

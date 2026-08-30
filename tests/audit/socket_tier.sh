@@ -5,6 +5,11 @@
 
 set -euo pipefail
 
+# #87: seeds host-allow pins in a relocated SAFE_RUN_CONFIG_DIR for hermeticity;
+# bless it as authoritative so the trust-redirect guard is a no-op here (the
+# guard itself is covered by tests/run/trust_store_redirect.sh).
+export SAFE_RUN_TRUST_OVERRIDE=1
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SAFE_AUDIT="$ROOT/bin/safe-audit"
 PASS_COUNT=0

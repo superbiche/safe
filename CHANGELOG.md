@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **Trust stores are anchored to the canonical config root; an
+  environment-redirected store can no longer grant escalation** (1.50.0).
+  `SAFE_RUN_CONFIG_DIR` / `SAFE_CONFIG_DIR` relocate the config root — a
+  documented convenience, but also the one lever a gated agent (allowed to
+  invoke runners only *through* safe) could pull to point safe at a store it
+  controls and thereby escape the sandbox. safe now honors a **trust
+  escalation** (host-allow host execution, `scripts-allow` lifecycle scripts)
+  and a **trust write** (`host-allow add`/`update`/`import`, `scripts-allow
+  add`) only from the canonical `~/.config/safe/run` store. A redirected root
+  **fails safe on reads** (the grant is declined; the package still runs
+  sandboxed) and **hard-refuses writes with exit 100**. The anchor spans every
+  trust-authority surface — `safe run` (`bin/safe-run`) and the whole install
+  gate (`bin/safe-audit`, which every `npm`/`pnpm`/`yarn`/`bun`/`pip` lane
+  calls, plus its `bin/safe` and `lib/gate-lib.sh` callers) — so a forged
+  host-allow cannot authorize a host install, and the canonical blocklist is
+  unioned in on the install path too, so a redirect can never *hide* a malice
+  signal. Trust reads and writes go to the literal canonical path, immune to a
+  symlink flip on the config root between check and use. An
+  operator who genuinely relocates config sets `SAFE_RUN_TRUST_OVERRIDE=1` to
+  bless the redirected store; that override is deliberately loud and logged (a
+  bright tripwire on the surface operators watch). This is a bash-level
+  hardening, not a hard boundary — `HOME` redirection remains a floor, and the
+  non-forgeable operator check plus a root-owned store are tracked for the Go
+  migration.
+
 - **`safe run` regains a real host-side unknown-package audit preflight**
   (1.49.0). PR #82 removed a sandboxed preflight that fetched an unpinned
   `safe-audit` npm name inside Podman and never once produced a verdict on a

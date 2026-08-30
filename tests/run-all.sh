@@ -34,6 +34,7 @@ SUITES=(
   tests/run/host_allow_export_import.sh
   tests/run/safe_audit_integration.sh
   tests/run/scripts_allow.sh
+  tests/run/trust_store_redirect.sh
   tests/integration/dispatcher.sh
 )
 
