@@ -14,8 +14,11 @@
   request path. An escaping request fails the fetch (HTTP 500), so cosign fails
   to initialize and the check reports the existing `bootstrap_failure` BLOCK:
   fail-closed, and distinguishable from a merely absent blob (404). Semantics
-  match the 1.43.0 cage: containment, not link-refusal — an in-tree symlink is
-  still followed and served, and a mirror root that is itself a symlink still
+  match the 1.43.0 cage: containment, not link-refusal — a relative in-tree
+  symlink is still followed and served (an absolute link target is refused
+  outright, even one pointing back beneath the mirror — `os.Root` rejects
+  absolute targets rather than resolving where they land, erring fail-closed),
+  and a mirror root that is itself a symlink still
   resolves, since that path is the operator's declaration rather than
   mirror-supplied content. Defense-in-depth on an operator-supplied mirror; no
   legitimate mirror changes verdict.

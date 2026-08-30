@@ -779,6 +779,35 @@ func TestServeMirrorServesAnInTreeSymlink(t *testing.T) {
 	}
 }
 
+// The dedup latitude is for RELATIVE links only: os.Root rejects an absolute
+// link target outright rather than resolving where it lands, so even an
+// absolute link pointing back beneath the mirror refuses like an escape. Pinned
+// so the serveMirror comment's claim stays honest — the refusal is fail-closed,
+// not a hole (r1 finding F1).
+func TestServeMirrorRefusesAnAbsoluteInTreeSymlink(t *testing.T) {
+	const content = "in-tree blob behind an absolute link"
+	dir := t.TempDir()
+	targets := mkdir(t, filepath.Join(dir, "targets"))
+	real := writeFile(t, targets, "real.blob", content)
+	if err := os.Symlink(real, filepath.Join(targets, "absolute.blob")); err != nil {
+		t.Fatalf("symlink blob: %v", err)
+	}
+
+	base, stop, err := serveMirror(dir)
+	if err != nil {
+		t.Fatalf("serve mirror: %v", err)
+	}
+	defer stop()
+
+	status, body := getMirror(t, base, "/targets/absolute.blob")
+	if status != http.StatusInternalServerError {
+		t.Fatalf("status %d, want 500", status)
+	}
+	if body == content {
+		t.Fatalf("absolute-target link was served; want refusal")
+	}
+}
+
 // A link that stays in the tree but names nothing is absence, not an escape: it
 // reads as the ordinary 404 a deleted file gives, never the 500 the cage uses.
 func TestServeMirrorDanglingInTreeSymlinkIsNotFound(t *testing.T) {

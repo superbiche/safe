@@ -212,9 +212,12 @@ func bootstrap(result *CheckResult, config *TUFCheck) (metadataPath, targetsDir 
 //     bootstrap_failure BLOCK: fail-closed, and distinguishable from a blob that
 //     is merely absent.
 //   - a dangling in-tree link is absence, not an escape, and reads as 404.
-//   - an in-tree symlink is followed and served. Containment is the property,
-//     not link-refusal — mirrors legitimately dedup content-addressed blobs
-//     through links, the same latitude the hash-read cage grants.
+//   - a relative in-tree symlink is followed and served. Containment is the
+//     property, not link-refusal — mirrors legitimately dedup content-addressed
+//     blobs through relative links, the same latitude the hash-read cage
+//     grants. An absolute link target is refused outright, even one pointing
+//     back beneath the mirror: os.Root rejects absolute targets rather than
+//     resolving where they land, which errs on the fail-closed side.
 //
 // The mirror root itself being a symlink is fine: os.OpenRoot resolves its own
 // argument once, and that path is the operator's declaration rather than
