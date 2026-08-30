@@ -30,6 +30,11 @@ func TestReifyCandidatesUsageFailuresWriteNoJSON(t *testing.T) {
 		{name: "three positionals", args: []string{"reify-candidates", lockfile, dir, dir}},
 		{name: "registry host without a value", args: []string{"reify-candidates", "--registry-host", lockfile, dir}},
 		{name: "unknown option", args: []string{"reify-candidates", "--tree", lockfile, dir}},
+		{name: "os without a value", args: []string{"reify-candidates", lockfile, dir, "--os"}},
+		{name: "os with an empty value", args: []string{"reify-candidates", "--os", "", lockfile, dir}},
+		{name: "os with an empty glued value", args: []string{"reify-candidates", "--os=", lockfile, dir}},
+		{name: "cpu without a value", args: []string{"reify-candidates", lockfile, dir, "--cpu"}},
+		{name: "cpu with an empty glued value", args: []string{"reify-candidates", "--cpu=", lockfile, dir}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
@@ -101,6 +106,43 @@ func TestReifyCandidatesWritesOnlyOneJSONDocument(t *testing.T) {
 	want := "{\"schema\":1,\"candidates\":[{\"path\":\"node_modules/gone\",\"name\":\"gone\",\"version\":\"2.0.0\",\"source\":\"registry\",\"integrity\":\"sha512-gone\",\"reason\":\"missing\"}]}\n"
 	if stdout.String() != want {
 		t.Fatalf("stdout=%q, want %q", stdout.String(), want)
+	}
+}
+
+// The gate forwards npm's own --os/--cpu, so both argv forms must land and
+// the last occurrence must win, as npm's config parsing does.
+func TestReifyCandidatesTargetPlatformFlags(t *testing.T) {
+	dir, lockfile := writeReifyProject(t, `{"lockfileVersion":3,"packages":{
+	  "":{"name":"reify-test","version":"1.0.0"},
+	  "node_modules/aix-only":{"version":"1.0.0","optional":true,"os":["aix"],"cpu":["ppc64"],"resolved":"https://registry.npmjs.org/aix-only/-/aix-only-1.0.0.tgz","integrity":"sha512-aix"}
+	}}`)
+
+	for _, tc := range []struct {
+		name  string
+		args  []string
+		want  string
+		empty bool
+	}{
+		{name: "no override exempts the entry", args: nil, empty: true},
+		{name: "glued form", args: []string{"--os=aix", "--cpu=ppc64"}},
+		{name: "separate form", args: []string{"--os", "aix", "--cpu", "ppc64"}},
+		{name: "last occurrence wins", args: []string{"--os=linux", "--cpu=ppc64", "--os", "aix"}},
+		{name: "os alone leaves the cpu constraint unmet", args: []string{"--os=aix"}, empty: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			args := append(append([]string{"reify-candidates"}, tc.args...), lockfile, dir)
+			if got := run(args, strings.NewReader(""), &stdout, &stderr); got != 0 {
+				t.Fatalf("run() = %d, stderr=%q", got, stderr.String())
+			}
+			want := "{\"schema\":1,\"candidates\":[]}\n"
+			if !tc.empty {
+				want = "{\"schema\":1,\"candidates\":[{\"path\":\"node_modules/aix-only\",\"name\":\"aix-only\",\"version\":\"1.0.0\",\"source\":\"registry\",\"integrity\":\"sha512-aix\",\"reason\":\"missing\"}]}\n"
+			}
+			if stdout.String() != want {
+				t.Fatalf("stdout=%q, want %q", stdout.String(), want)
+			}
+		})
 	}
 }
 

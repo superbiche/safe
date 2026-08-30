@@ -2320,6 +2320,50 @@ case_npm_lockdiff_exempts_never_installed_optional_entries() {
   pass "$FUNCNAME"
 }
 
+case_npm_lockdiff_symlinked_entry_is_audited() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-symlinked-entry"
+  # npm replaces a symlinked actual node with the projected ordinary package
+  # during reify, so a link carrying the locked version is a materialization,
+  # not evidence of presence (r1 review F1: npm prune turned the symlink into
+  # a directory). Reading the manifest through the link read the tree as
+  # complete and delegated unaudited.
+  mkdir -p "${WORK_DIR}/linked-source"
+  printf '{"name":"blockme","version":"2.0.0"}\n' > "${WORK_DIR}/linked-source/package.json"
+  ln -s "${WORK_DIR}/linked-source" "${WORK_DIR}/node_modules/blockme"
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '%s\n' "${LOCKDIFF_PARTIAL_TREE_LOCK}" > "${WORK_DIR}/package-lock.json"
+  NPM_LOCK_MUTATION_JSON="${LOCKDIFF_PARTIAL_TREE_LOCK}" \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_target_platform_follows_npm_argv() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-target-platform-argv"
+  # --os moves the platform npm resolves optional os/cpu against, so the
+  # exemption has to move with it: with --os=aix npm installs the aix-only
+  # optional that case_npm_lockdiff_exempts_never_installed_optional_entries
+  # proves it skips without the flag (r1 review F2).
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  local lock='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/blockme":{"version":"2.0.0","optional":true,"os":["aix"],"resolved":"https://registry.npmjs.org/blockme/-/blockme-2.0.0.tgz","integrity":"sha512-blockme"}}}'
+  printf '%s\n' "${lock}" > "${WORK_DIR}/package-lock.json"
+
+  local invocation
+  for invocation in 'npm dedupe --os=aix' 'npm prune --os aix'; do
+    : > "${LOG_FILE}"
+    NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT="${invocation}" run_zsh
+    assert_status 104 "$FUNCNAME (${invocation})" || return
+    assert_log_contains $'AUDIT\tpackage-audit\tblockme@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME (${invocation})" || return
+    assert_log_not_contains_fragment $'REAL\tnpm\tdedupe' "$FUNCNAME (${invocation})" || return
+    assert_log_not_contains_fragment $'REAL\tnpm\tprune' "$FUNCNAME (${invocation})" || return
+  done
+  pass "$FUNCNAME"
+}
+
 case_npm_lockdiff_refuses_nonregistry_reify_candidate() {
   skip_lockdiff_case "$FUNCNAME" || return
   prepare_lockdiff_case "npm-lockdiff-nonregistry-reify-candidate"
@@ -5698,6 +5742,8 @@ main() {
     case_npm_lockdiff_partial_tree_audits_reify_candidates \
     case_npm_lockdiff_version_mismatched_tree_is_a_reify_candidate \
     case_npm_lockdiff_exempts_never_installed_optional_entries \
+    case_npm_lockdiff_symlinked_entry_is_audited \
+    case_npm_lockdiff_target_platform_follows_npm_argv \
     case_npm_lockdiff_refuses_nonregistry_reify_candidate \
     case_npm_lockdiff_projection_sees_project_npmrc \
     case_npm_dedupe_lockdiff_introduced_block_refuses_without_delegation \

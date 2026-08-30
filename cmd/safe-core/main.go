@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/superbiche/safe/internal/lockdiff"
 	"github.com/superbiche/safe/internal/releasereview"
@@ -38,7 +39,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	registryHosts, oldLockfile, newLockfile, ok := lockdiffArgs(args)
 	if !ok {
 		fmt.Fprintln(stderr, "safe-core: usage: safe-core lockdiff [--registry-host <host>]... <old-lockfile> <new-lockfile>")
-		fmt.Fprintln(stderr, "safe-core: usage: safe-core reify-candidates [--registry-host <host>]... <lockfile> <project-dir>")
+		fmt.Fprintln(stderr, reifyCandidatesUsage)
 		fmt.Fprintln(stderr, "safe-core: usage: safe-core package-verdict < evidence.json")
 		fmt.Fprintln(stderr, "safe-core: usage: safe-core release-review --spec <spec.json|-> | --versions")
 		return 2
@@ -186,9 +187,9 @@ func releaseReview(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 // checked. An unreadable single entry inside a readable tree is different —
 // that is a candidate, decided in ReifyCandidates.
 func reifyCandidates(args []string, stdout, stderr io.Writer) int {
-	registryHosts, lockfile, projectDir, ok := reifyCandidatesArgs(args)
+	registryHosts, platform, lockfile, projectDir, ok := reifyCandidatesArgs(args)
 	if !ok {
-		fmt.Fprintln(stderr, "safe-core: usage: safe-core reify-candidates [--registry-host <host>]... <lockfile> <project-dir>")
+		fmt.Fprintln(stderr, reifyCandidatesUsage)
 		return 2
 	}
 
@@ -210,7 +211,7 @@ func reifyCandidates(args []string, stdout, stderr io.Writer) int {
 
 	encoder := json.NewEncoder(stdout)
 	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(lockdiff.ReifyCandidates(entries, projectDir)); err != nil {
+	if err := encoder.Encode(lockdiff.ReifyCandidates(entries, projectDir, platform)); err != nil {
 		fmt.Fprintf(stderr, "safe-core: reify-candidates: write JSON: %v\n", err)
 		return 3
 	}
@@ -244,28 +245,65 @@ func lockdiffArgs(args []string) (registryHosts []string, oldLockfile, newLockfi
 	return registryHosts, lockfiles[0], lockfiles[1], true
 }
 
+const reifyCandidatesUsage = "safe-core: usage: safe-core reify-candidates [--registry-host <host>]... [--os <platform>] [--cpu <arch>] <lockfile> <project-dir>"
+
 // reifyCandidatesArgs parses the subcommand's argv exactly as lockdiffArgs
 // parses its own: the same registry-host flag, the same refusal of an unknown
 // option, and the same two-positional shape.
-func reifyCandidatesArgs(args []string) (registryHosts []string, lockfile, projectDir string, ok bool) {
+//
+// --os/--cpu name the platform npm was told to resolve optional os/cpu
+// constraints against, in npm's own spelling. Both accept npm's two argv
+// forms and are last-wins, as npm's own config parsing is; an empty value is
+// a usage error rather than a silent fall back to this machine, because a
+// caller that means "this machine" passes no flag at all.
+func reifyCandidatesArgs(args []string) (registryHosts []string, platform lockdiff.Platform, lockfile, projectDir string, ok bool) {
+	fail := func() ([]string, lockdiff.Platform, string, string, bool) {
+		return nil, lockdiff.Platform{}, "", "", false
+	}
+
 	positionals := make([]string, 0, 2)
 	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--registry-host":
+		switch {
+		case args[i] == "--registry-host":
 			if i+1 >= len(args) || args[i+1] == "" {
-				return nil, "", "", false
+				return fail()
 			}
 			registryHosts = append(registryHosts, args[i+1])
 			i++
+		case args[i] == "--os", strings.HasPrefix(args[i], "--os="):
+			value, valued := flagValue(args, &i, "--os=")
+			if !valued {
+				return fail()
+			}
+			platform.OS = value
+		case args[i] == "--cpu", strings.HasPrefix(args[i], "--cpu="):
+			value, valued := flagValue(args, &i, "--cpu=")
+			if !valued {
+				return fail()
+			}
+			platform.CPU = value
 		default:
 			if len(positionals) == 2 || len(args[i]) > 1 && args[i][0] == '-' {
-				return nil, "", "", false
+				return fail()
 			}
 			positionals = append(positionals, args[i])
 		}
 	}
 	if len(positionals) != 2 || positionals[0] == "" || positionals[1] == "" {
-		return nil, "", "", false
+		return fail()
 	}
-	return registryHosts, positionals[0], positionals[1], true
+	return registryHosts, platform, positionals[0], positionals[1], true
+}
+
+// flagValue reads either argv form of a value-taking option — `--flag value`
+// or `--flag=value` — advancing the cursor past a separate value.
+func flagValue(args []string, i *int, prefix string) (string, bool) {
+	if value, valued := strings.CutPrefix(args[*i], prefix); valued {
+		return value, value != ""
+	}
+	if *i+1 >= len(args) || args[*i+1] == "" {
+		return "", false
+	}
+	*i++
+	return args[*i], true
 }

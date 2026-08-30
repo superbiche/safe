@@ -1583,6 +1583,46 @@ safe_gate_npm_lockdiff_subcommand() {
 # A bare -- terminates npm's option parsing, so it neutralizes the projection
 # invariants appended before the user's argv. Effective config itself comes
 # from npm below; do not try to reimplement its argv/environment/.npmrc parser.
+# npm's --os/--cpu move the target platform an optional package's os/cpu
+# constraints resolve against, and both dedupe and prune pass that target into
+# Arborist. The reify-candidate set must be computed against the SAME target or
+# its exemption speaks for a machine npm is not installing for: with --os=aix,
+# npm installs an aix-only optional the host platform excludes (r1 review F2).
+# Both argv spellings are read and the last occurrence wins, as npm's own
+# config parsing resolves them.
+#
+# Scope is deliberately the ARGV path only: npm_config_os/npm_config_cpu and
+# userconfig/workspace-rc mirroring are ticket #244 and are not read here.
+# A malformed or valueless flag emits nothing and the host platform stands —
+# npm's own parse of that same argv is what decides its install, and the
+# projection runs first, so a spelling npm rejects never reaches this point.
+# libc constraints are not modeled at all: an optional libc mismatch is
+# over-audited, which is the safe direction.
+safe_gate_npm_lockdiff_platform_args() {
+  local token previous="" os_target="" cpu_target=""
+
+  for token in "$@"; do
+    case "${previous}" in
+      --os) os_target="${token}" ;;
+      --cpu) cpu_target="${token}" ;;
+    esac
+    case "${token}" in
+      --os=*) os_target="${token#--os=}" ;;
+      --cpu=*) cpu_target="${token#--cpu=}" ;;
+    esac
+    previous="${token}"
+  done
+
+  # A dash-led or whitespace-carrying value is not a platform name; forwarding
+  # one would state a target as fact that npm never resolved that way.
+  [[ "${os_target}" == -* || "${os_target}" == *[[:space:]]* ]] && os_target=""
+  [[ "${cpu_target}" == -* || "${cpu_target}" == *[[:space:]]* ]] && cpu_target=""
+
+  [[ -n "${os_target}" ]] && printf '%s\n%s\n' --os "${os_target}"
+  [[ -n "${cpu_target}" ]] && printf '%s\n%s\n' --cpu "${cpu_target}"
+  return 0
+}
+
 safe_gate_npm_lockdiff_unsafe_argv() {
   local arg
   SAFE_GATE_LOCKDIFF_OFFENDING_TOKEN=""
@@ -1851,7 +1891,7 @@ safe_gate_npm_lockdiff_preflight() {
   local project_dir="${SAFE_GATE_PROJECT_DIR:-.}" lockfile_name=""
   local real_npm="" safe_core="" safe_core_version="" scratch="" diff_json="" introduced_rows="" registry_hosts="" rc=0
   local reify_json="" candidate_rows=""
-  local -a introduced=() registry_host_args=()
+  local -a introduced=() registry_host_args=() platform_args=()
 
   if [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]]; then
     safe_gate_err "safe: BLOCKED npm ${subcommand} — --prefix/--cwd project selectors cannot be lock-diff projected safely; cd to that project and retry (audit-infrastructure breakage, not a package finding); details: safe explain"
@@ -1984,7 +2024,18 @@ safe_gate_npm_lockdiff_preflight() {
   # residual). The reify-candidate set is those entries: what the delegated run
   # may still fetch, read from the projected lockfile against the actual tree,
   # because that lockfile is what the real command installs to.
-  if reify_json="$("${safe_core}" reify-candidates "${registry_host_args[@]}" "${scratch}/${lockfile_name}" "${project_dir}" 2>"${scratch}/reify.err")"; then
+  #
+  # npm resolves an optional package's os/cpu constraints against its EFFECTIVE
+  # target platform, and --os/--cpu move it: with --os=aix, npm installs an
+  # aix-only optional that this machine's platform would have excluded (r1
+  # review F2). The candidate set has to be computed against the same target,
+  # so the override travels with it.
+  local platform_lines platform_arg
+  platform_lines="$(safe_gate_npm_lockdiff_platform_args "$@")"
+  while IFS= read -r platform_arg; do
+    [[ -n "${platform_arg}" ]] && platform_args+=("${platform_arg}")
+  done <<<"${platform_lines}"
+  if reify_json="$("${safe_core}" reify-candidates "${registry_host_args[@]}" "${platform_args[@]}" "${scratch}/${lockfile_name}" "${project_dir}" 2>"${scratch}/reify.err")"; then
     :
   else
     rc=$?
@@ -1994,7 +2045,7 @@ safe_gate_npm_lockdiff_preflight() {
   fi
   if ! jq -e '
     def optional_integrity: (has("integrity") | not) or (.integrity | type == "string");
-    def candidate_entry: type == "object" and (.path | type == "string") and (.name | type == "string") and (.version | type == "string") and (.source | type == "string") and (.reason == "missing" or .reason == "version-mismatch") and optional_integrity;
+    def candidate_entry: type == "object" and (.path | type == "string") and (.name | type == "string") and (.version | type == "string") and (.source | type == "string") and (.reason == "missing" or .reason == "version-mismatch" or .reason == "symlinked") and optional_integrity;
     type == "object"
     and (.schema == 1)
     and (.candidates | type == "array")

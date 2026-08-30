@@ -94,7 +94,7 @@ func TestReifyCandidatesReadsTheTreeNotTheLockDelta(t *testing.T) {
 		{Path: "node_modules/required-elsewhere", Name: "required-elsewhere", Version: "1.0.0", Source: "registry", Integrity: "sha512-required-elsewhere", Reason: ReasonMissing},
 		{Path: "node_modules/stale", Name: "stale", Version: "1.0.0", Source: "registry", Integrity: "sha512-stale", Reason: ReasonVersionMismatch},
 	}
-	got := ReifyCandidates(loadEntriesForTest(t, lockfile), root)
+	got := ReifyCandidates(loadEntriesForTest(t, lockfile), root, Platform{})
 	if got.Schema != 1 {
 		t.Fatalf("ReifyCandidates() schema = %d, want 1", got.Schema)
 	}
@@ -110,12 +110,102 @@ func TestReifyCandidatesEmptySetSerializesAsAnArray(t *testing.T) {
 	root := t.TempDir()
 	lockfile := writeLockfile(t, root, `{"lockfileVersion":3,"packages":{"":{"name":"reify-test","version":"1.0.0"}}}`)
 
-	encoded, err := json.Marshal(ReifyCandidates(loadEntriesForTest(t, lockfile), root))
+	encoded, err := json.Marshal(ReifyCandidates(loadEntriesForTest(t, lockfile), root, Platform{}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := `{"schema":1,"candidates":[]}`; string(encoded) != want {
 		t.Fatalf("ReifyCandidates() encoded = %s, want %s", encoded, want)
+	}
+}
+
+// npm replaces a symlinked actual node with the projected ordinary package
+// during reify, so a symlink carrying the locked version is a materialization
+// the tree cannot vouch for (r1 review F1: the tree read as complete, and
+// npm prune turned the symlink into a directory).
+func TestReifyCandidatesTreatsSymlinkedEntriesAsCandidates(t *testing.T) {
+	root := t.TempDir()
+	// The link target sits outside node_modules the way `npm link` leaves it.
+	writeManifest(t, root, "local/artifact", `{"name":"artifact","version":"1.0.0"}`)
+	writeManifest(t, root, "local/node_modules/nested", `{"name":"nested","version":"1.0.0"}`)
+	if err := os.MkdirAll(filepath.Join(root, "node_modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "local", "artifact"), filepath.Join(root, "node_modules", "artifact")); err != nil {
+		t.Fatal(err)
+	}
+	// A symlinked PARENT component hides the same substitution one level down.
+	if err := os.Symlink(filepath.Join(root, "local"), filepath.Join(root, "node_modules", "parent")); err != nil {
+		t.Fatal(err)
+	}
+	lockfile := writeLockfile(t, root, `{
+	  "lockfileVersion": 3,
+	  "packages": {
+	    "": {"name": "reify-test", "version": "1.0.0"},
+	    "node_modules/artifact": {"version": "1.0.0", "resolved": "file:../artifact/artifact-1.0.0.tgz", "integrity": "sha512-file"},
+	    "node_modules/parent/node_modules/nested": {"version": "1.0.0"}
+	  }
+	}`)
+
+	want := []Candidate{
+		{Path: "node_modules/artifact", Name: "artifact", Version: "1.0.0", Source: "file", Integrity: "sha512-file", Reason: ReasonSymlinked},
+		{Path: "node_modules/parent/node_modules/nested", Name: "nested", Version: "1.0.0", Source: "unknown", Reason: ReasonSymlinked},
+	}
+	got := ReifyCandidates(loadEntriesForTest(t, lockfile), root, Platform{})
+	if !reflect.DeepEqual(got.Candidates, want) {
+		t.Fatalf("ReifyCandidates() = %#v, want %#v", got.Candidates, want)
+	}
+}
+
+// A workspace member is a symlink on disk by construction. It stays skipped:
+// npm creates that link rather than fetching anything, so the symlink rule
+// must sit behind the link:true skip, not in front of it.
+func TestReifyCandidatesStillSkipsLinkEntriesThatAreSymlinks(t *testing.T) {
+	root := t.TempDir()
+	writeManifest(t, root, "packages/member", `{"name":"member","version":"1.0.0"}`)
+	if err := os.MkdirAll(filepath.Join(root, "node_modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "packages", "member"), filepath.Join(root, "node_modules", "member")); err != nil {
+		t.Fatal(err)
+	}
+	lockfile := writeLockfile(t, root, `{
+	  "lockfileVersion": 3,
+	  "packages": {
+	    "": {"name": "reify-test", "version": "1.0.0"},
+	    "packages/member": {"name": "member", "version": "1.0.0"},
+	    "node_modules/member": {"resolved": "packages/member", "link": true}
+	  }
+	}`)
+
+	if got := ReifyCandidates(loadEntriesForTest(t, lockfile), root, Platform{}); len(got.Candidates) != 0 {
+		t.Fatalf("ReifyCandidates() = %#v, want no candidates", got.Candidates)
+	}
+}
+
+// One lstat per path prefix, not per entry: a real tree carries thousands of
+// entries under a handful of shared components.
+func TestTreeProbeMemoizesEachPathComponentOnce(t *testing.T) {
+	root := t.TempDir()
+	writeManifest(t, root, "local/first", `{"name":"first","version":"1.0.0"}`)
+	writeManifest(t, root, "local/second", `{"name":"second","version":"1.0.0"}`)
+	if err := os.MkdirAll(filepath.Join(root, "node_modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "local"), filepath.Join(root, "node_modules", "shared")); err != nil {
+		t.Fatal(err)
+	}
+
+	probe := newTreeProbe(root)
+	for _, path := range []string{"node_modules/shared/first", "node_modules/shared/second"} {
+		reason, ok := probe.reason(Entry{Path: path, Package: Package{Name: filepath.Base(path), Version: "1.0.0"}})
+		if !ok || reason != ReasonSymlinked {
+			t.Fatalf("reason(%q) = %q, %v, want %q, true", path, reason, ok, ReasonSymlinked)
+		}
+	}
+	want := map[string]bool{"node_modules": false, "node_modules/shared": true}
+	if !reflect.DeepEqual(probe.symlinks, want) {
+		t.Fatalf("probe.symlinks = %#v, want %#v", probe.symlinks, want)
 	}
 }
 
@@ -132,7 +222,7 @@ func TestReifyCandidatesTreatsAnUnreadableManifestAsMissing(t *testing.T) {
 	writeManifest(t, root, "node_modules/truncated", `{"name":"truncated","ver`)
 	writeManifest(t, root, "node_modules/versionless", `{"name":"versionless"}`)
 
-	got := ReifyCandidates(loadEntriesForTest(t, lockfile), root)
+	got := ReifyCandidates(loadEntriesForTest(t, lockfile), root, Platform{})
 	want := []Candidate{
 		{Path: "node_modules/truncated", Name: "truncated", Version: "1.0.0", Source: "unknown", Reason: ReasonMissing},
 		{Path: "node_modules/versionless", Name: "versionless", Version: "1.0.0", Source: "unknown", Reason: ReasonMissing},
@@ -161,9 +251,87 @@ func TestReifyCandidatesNeverReadsOutsideTheProject(t *testing.T) {
 	  }
 	}`)
 
-	got := ReifyCandidates(loadEntriesForTest(t, lockfile), root)
+	got := ReifyCandidates(loadEntriesForTest(t, lockfile), root, Platform{})
 	if len(got.Candidates) != 1 || got.Candidates[0].Reason != ReasonMissing {
 		t.Fatalf("ReifyCandidates() = %#v, want one missing candidate", got.Candidates)
+	}
+}
+
+func otherCPU(current string) string {
+	if current == "x64" {
+		return "arm64"
+	}
+	return "x64"
+}
+
+// npm resolves optional os/cpu against its EFFECTIVE target, and --os/--cpu
+// move it (r1 review F2: npm prune --os=aix installed an aix-only optional
+// that the host-platform exemption had skipped).
+func TestReifyCandidatesFollowsTheTargetPlatform(t *testing.T) {
+	root := t.TempDir()
+	elsewhereOS, elsewhereCPU := otherPlatform(currentOS), otherCPU(currentCPU)
+	lockfile := writeLockfile(t, root, fmt.Sprintf(`{
+	  "lockfileVersion": 3,
+	  "packages": {
+	    "": {"name": "reify-test", "version": "1.0.0"},
+	    "node_modules/os-bound": {"version": "1.0.0", "optional": true, "os": [%q]},
+	    "node_modules/cpu-bound": {"version": "1.0.0", "optional": true, "cpu": [%q]}
+	  }
+	}`, elsewhereOS, elsewhereCPU))
+	entries := loadEntriesForTest(t, lockfile)
+
+	paths := func(candidates []Candidate) []string {
+		found := make([]string, 0, len(candidates))
+		for _, candidate := range candidates {
+			found = append(found, candidate.Path)
+		}
+		return found
+	}
+
+	tests := []struct {
+		name     string
+		platform Platform
+		want     []string
+	}{
+		{name: "host platform exempts both", platform: Platform{}, want: []string{}},
+		{name: "os override makes the os-bound entry reachable", platform: Platform{OS: elsewhereOS}, want: []string{"node_modules/os-bound"}},
+		{name: "cpu override makes the cpu-bound entry reachable", platform: Platform{CPU: elsewhereCPU}, want: []string{"node_modules/cpu-bound"}},
+		{
+			name:     "both overrides reach both entries",
+			platform: Platform{OS: elsewhereOS, CPU: elsewhereCPU},
+			want:     []string{"node_modules/cpu-bound", "node_modules/os-bound"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := paths(ReifyCandidates(entries, root, tt.platform).Candidates); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("ReifyCandidates(%+v) = %v, want %v", tt.platform, got, tt.want)
+			}
+		})
+	}
+}
+
+// An override arrives from npm's own argv, so it is already in npm's
+// namespace: translating it would turn the operator's exact target into a
+// different one.
+func TestReifyCandidatesUsesOverridesVerbatim(t *testing.T) {
+	root := t.TempDir()
+	lockfile := writeLockfile(t, root, `{
+	  "lockfileVersion": 3,
+	  "packages": {
+	    "": {"name": "reify-test", "version": "1.0.0"},
+	    "node_modules/win-only": {"version": "1.0.0", "optional": true, "os": ["win32"]}
+	  }
+	}`)
+	entries := loadEntriesForTest(t, lockfile)
+
+	if got := ReifyCandidates(entries, root, Platform{OS: "win32"}).Candidates; len(got) != 1 {
+		t.Fatalf("ReifyCandidates(win32) = %#v, want one candidate", got)
+	}
+	// Go's spelling of that platform is not npm's, and nothing translates it.
+	if got := ReifyCandidates(entries, root, Platform{OS: "windows"}).Candidates; len(got) != 0 {
+		t.Fatalf("ReifyCandidates(windows) = %#v, want no candidates", got)
 	}
 }
 
