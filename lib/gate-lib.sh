@@ -1581,51 +1581,7 @@ safe_gate_npm_lockdiff_subcommand() {
 }
 
 # A bare -- terminates npm's option parsing, so it neutralizes the projection
-# invariants appended before the user's argv. Effective config itself comes
-# from npm below; do not try to reimplement its argv/environment/.npmrc parser.
-# npm's --os/--cpu move the target platform an optional package's os/cpu
-# constraints resolve against, and both dedupe and prune pass that target into
-# Arborist. The reify-candidate set must be computed against the SAME target or
-# its exemption speaks for a machine npm is not installing for: with --os=aix,
-# npm installs an aix-only optional the host platform excludes (r1 review F2).
-# Both argv spellings are read and the last occurrence wins, as npm's own
-# config parsing resolves them.
-#
-# Scope is deliberately the ARGV path only: npm_config_os/npm_config_cpu and
-# userconfig/workspace-rc mirroring are ticket #244 and are not read here.
-# A malformed or valueless flag emits nothing and the host platform stands —
-# npm's own parse of that same argv is what decides its install, and the
-# projection runs first, so a spelling npm rejects never reaches this point.
-# libc constraints are not modeled at all: an optional libc mismatch is
-# over-audited, which is the safe direction.
-# Sets the SAFE_GATE_LOCKDIFF_PLATFORM_ARGS global array rather than
-# printing: argv tokens are handed to safe-core byte-for-byte, with no line
-# transport for a value to fall apart on. Values travel VERBATIM: npm treats a target as an opaque string, so
-# even a dash-led or whitespace-carrying spelling is a platform npm will
-# resolve os/cpu constraints against — discarding it would silently re-aim
-# the exemption at the host (r2 review, F2 residual). The `=` form keeps a
-# dash-led value from reading as a flag on the safe-core side.
-safe_gate_npm_lockdiff_platform_args() {
-  local token previous="" os_target="" cpu_target=""
-  SAFE_GATE_LOCKDIFF_PLATFORM_ARGS=()
-
-  for token in "$@"; do
-    case "${previous}" in
-      --os) os_target="${token}" ;;
-      --cpu) cpu_target="${token}" ;;
-    esac
-    case "${token}" in
-      --os=*) os_target="${token#--os=}" ;;
-      --cpu=*) cpu_target="${token#--cpu=}" ;;
-    esac
-    previous="${token}"
-  done
-
-  [[ -n "${os_target}" ]] && SAFE_GATE_LOCKDIFF_PLATFORM_ARGS+=("--os=${os_target}")
-  [[ -n "${cpu_target}" ]] && SAFE_GATE_LOCKDIFF_PLATFORM_ARGS+=("--cpu=${cpu_target}")
-  return 0
-}
-
+# invariants appended before the user's argv.
 safe_gate_npm_lockdiff_unsafe_argv() {
   local arg
   SAFE_GATE_LOCKDIFF_OFFENDING_TOKEN=""
@@ -1648,10 +1604,23 @@ safe_gate_npm_lockdiff_unsafe_argv() {
 # a user override can defeat them. Probing the ambient value instead refused
 # every dedupe/prune on a stock machine, where npm's own default is
 # ignore-scripts=false — protection unchanged, false refusals gone.
+#
+# The same probe carries the target platform. npm's os/cpu move the platform
+# an optional package's os/cpu constraints resolve against, and both dedupe
+# and prune pass that target into Arborist. The reify-candidate set must be
+# computed against the SAME target or its exemption speaks for a machine npm
+# is not installing for: with os=aix npm installs an aix-only optional the
+# host platform excludes (r1 review F2). Reading it off the effective config
+# rather than off argv is what makes npm_config_os/npm_config_cpu and .npmrc
+# lines count too — the argv scanner this replaced saw neither (#244).
+# libc constraints are not modeled at all: an optional libc mismatch is
+# over-audited, which is the safe direction.
 safe_gate_npm_lockdiff_effective_config() {
   local project_dir="$1" subcommand="$2"
   shift 2
-  local real_npm="" config_json=""
+  local real_npm="" config_json="" raw_target=""
+  SAFE_GATE_LOCKDIFF_TARGET_OS=""
+  SAFE_GATE_LOCKDIFF_TARGET_CPU=""
 
   real_npm="$(safe_gate_resolve_real npm)" || real_npm=""
   if [[ -z "${real_npm}" ]]; then
@@ -1674,7 +1643,9 @@ safe_gate_npm_lockdiff_effective_config() {
   fi
   if ! jq -e 'type == "object"
     and (."package-lock" | type == "boolean")
-    and (."ignore-scripts" | type == "boolean")' <<<"${config_json}" >/dev/null 2>&1; then
+    and (."ignore-scripts" | type == "boolean")
+    and (.os == null or (.os | type == "string"))
+    and (.cpu == null or (.cpu | type == "string"))' <<<"${config_json}" >/dev/null 2>&1; then
     safe_gate_err "safe: BLOCKED npm ${subcommand} — effective npm config probe returned an unreadable result (audit-infrastructure breakage, not a package finding); fix npm configuration and retry — safe doctor; details: safe explain"
     return 100
   fi
@@ -1684,6 +1655,178 @@ safe_gate_npm_lockdiff_effective_config() {
   fi
   if ! jq -e '."ignore-scripts" == true' <<<"${config_json}" >/dev/null 2>&1; then
     safe_gate_err "safe: BLOCKED npm ${subcommand} — effective npm config disables the lock-diff projection: ignore-scripts is off; retry after enabling it; details: safe explain"
+    return 100
+  fi
+  # A target travels VERBATIM: npm treats it as an opaque string, so even a
+  # dash-led or whitespace-carrying spelling is a platform npm resolves os/cpu
+  # constraints against, and discarding it would silently re-aim the exemption
+  # at the host (r2 review, F2 residual). The trailing sentinel survives
+  # command substitution's newline stripping, so a value ending in a newline
+  # reaches safe-core whole.
+  #
+  # An empty target (npm's own reading of `--os=`) leaves the global empty and
+  # the host platform stands in safe-core. That can only over-audit: npm with
+  # an empty os excludes every platform-constrained optional, so the host view
+  # audits a superset of what the delegate fetches.
+  raw_target="$(jq -r '(if .os == null then "" else .os end) + "."' <<<"${config_json}" 2>/dev/null)" || raw_target="."
+  SAFE_GATE_LOCKDIFF_TARGET_OS="${raw_target%.}"
+  raw_target="$(jq -r '(if .cpu == null then "" else .cpu end) + "."' <<<"${config_json}" 2>/dev/null)" || raw_target="."
+  SAFE_GATE_LOCKDIFF_TARGET_CPU="${raw_target%.}"
+  return 0
+}
+
+# npm resolves a RELATIVE userconfig/globalconfig against the cwd, and the
+# projection's cwd is the scratch directory while the delegate's is the
+# project: the same spelling would name two different config files, so the
+# projection could vouch for an artifact fetched under other settings. Any
+# relative occurrence refuses rather than being rewritten — the precedence
+# among argv and case-variant environment spellings is npm's to resolve, not
+# something this gate reimplements. Absolute and ~-led values pass through:
+# npm expands ~ against $HOME in both argv and environment forms, so they
+# resolve identically from either cwd.
+safe_gate_npm_lockdiff_config_path_guard() {
+  local subcommand="$1"
+  shift
+  local token previous="" key value kind
+
+  for token in "$@"; do
+    kind=""
+    value=""
+    case "${previous}" in
+      --userconfig) kind="userconfig"; value="${token}" ;;
+      --globalconfig) kind="globalconfig"; value="${token}" ;;
+    esac
+    case "${token}" in
+      --userconfig=*) kind="userconfig"; value="${token#--userconfig=}" ;;
+      --globalconfig=*) kind="globalconfig"; value="${token#--globalconfig=}" ;;
+    esac
+    previous="${token}"
+    # An EMPTY argv value refuses with the relative ones: nothing pins what npm
+    # resolves it to, and a resolution that cannot be predicted is not one this
+    # projection can mirror. The environment loop below skips empty instead —
+    # there npm's own reading is unset.
+    [[ -n "${kind}" ]] || continue
+    if [[ "${value}" != /* && "${value}" != '~'* ]]; then
+      safe_gate_err "safe: BLOCKED npm ${subcommand} — --${kind} names a relative path, which cannot be mirrored into the lock-diff projection; retry with an absolute path; details: safe explain"
+      return 100
+    fi
+  done
+
+  # npm reads its environment keys case-insensitively and treats an empty
+  # value as unset.
+  for key in $(compgen -e); do
+    case "${key,,}" in
+      npm_config_userconfig) kind="userconfig" ;;
+      npm_config_globalconfig) kind="globalconfig" ;;
+      *) continue ;;
+    esac
+    value="${!key}"
+    [[ -n "${value}" ]] || continue
+    if [[ "${value}" != /* && "${value}" != '~'* ]]; then
+      safe_gate_err "safe: BLOCKED npm ${subcommand} — ${key} names a relative path, which cannot be mirrored into the lock-diff projection; retry with an absolute path; details: safe explain"
+      return 100
+    fi
+  done
+  return 0
+}
+
+# Every in-project package.json is mirrored into the projection. At a
+# workspace root the scratch otherwise carries no member manifests, and npm
+# SILENTLY drops every workspace entry from the projected lockfile: the diff
+# then shows removals only, nothing is audited, and the projection vouches for
+# an artifact the delegate never produces (#244). The sweep is a superset
+# rather than an enumeration because npm's own member discovery needs tree
+# state — `npm query .workspace` answers [] without it — and reimplementing
+# mapWorkspaces here would be the same guess by another name. It runs for
+# every project, not only workspace roots: an in-project `file:` dependency
+# needs its manifest for the same reason, and without it the projection failed
+# outright.
+#
+# Workspace-member .npmrc files are deliberately not mirrored: npm's config
+# chain is root-only, so a member rc file governs nothing in either lane.
+safe_gate_npm_lockdiff_mirror_manifests() {
+  local project_dir="$1" scratch="$2" subcommand="$3"
+  local patterns="" pattern manifest relative parent
+
+  if patterns="$(jq -er '
+    (.workspaces // [])
+    | (if type == "object" then (.packages // []) else . end)
+    | if type == "array" and ([.[] | type == "string"] | all) then .[] else error("malformed") end
+  ' "${project_dir}/package.json" 2>/dev/null)"; then
+    :
+  elif jq -e '(.workspaces // []) | (if type == "object" then (.packages // []) else . end) | (type == "array") and (length == 0)' \
+      "${project_dir}/package.json" >/dev/null 2>&1; then
+    patterns=""
+  else
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — the workspaces field in package.json cannot be read as a list of patterns (audit-infrastructure breakage, not a package finding); fix package.json and retry; details: safe explain"
+    return 100
+  fi
+
+  # A pattern reaching outside the project root names members the sweep below
+  # cannot mirror, and npm accepts such a pattern rather than rejecting it.
+  while IFS= read -r pattern; do
+    [[ -n "${pattern}" ]] || continue
+    if [[ "${pattern}" == /* || "${pattern}" == '~'* \
+      || "${pattern}" == ".." || "${pattern}" == "../"* \
+      || "${pattern}" == *"/.." || "${pattern}" == *"/../"* ]]; then
+      safe_gate_err "safe: BLOCKED npm ${subcommand} — workspace pattern ${pattern} reaches outside the project root, so its members cannot be mirrored into the lock-diff projection; scope workspaces inside the project and retry; details: safe explain"
+      return 100
+    fi
+  done <<<"${patterns}"
+
+  # -L follows a symlinked member directory on purpose: the copy lands as an
+  # ordinary file, so npm's glob in the scratch matches the same directories
+  # it matches in the project. node_modules is pruned — its manifests belong
+  # to installed artifacts, not to this project's own member set.
+  if ! find -L "${project_dir}" -name node_modules -prune -o -name package.json -print0 \
+      > "${scratch}/safe-manifest-sweep.list" 2>/dev/null; then
+    rm -f -- "${scratch}/safe-manifest-sweep.list"
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — cannot enumerate in-project package.json manifests for the lock-diff projection (audit-infrastructure breakage, not a package finding); verify project files and retry; details: safe explain"
+    return 100
+  fi
+  while IFS= read -r -d '' manifest; do
+    relative="${manifest#"${project_dir}/"}"
+    [[ "${relative}" != "${manifest}" ]] || continue
+    parent="$(dirname -- "${relative}")"
+    if [[ "${parent}" != "." ]] && ! mkdir -p -- "${scratch}/${parent}"; then
+      rm -f -- "${scratch}/safe-manifest-sweep.list"
+      safe_gate_err "safe: BLOCKED npm ${subcommand} — cannot mirror in-project package.json manifests into the lock-diff projection (audit-infrastructure breakage, not a package finding); verify project files and retry; details: safe explain"
+      return 100
+    fi
+    if ! cp -- "${manifest}" "${scratch}/${relative}"; then
+      rm -f -- "${scratch}/safe-manifest-sweep.list"
+      safe_gate_err "safe: BLOCKED npm ${subcommand} — cannot mirror in-project package.json manifests into the lock-diff projection (audit-infrastructure breakage, not a package finding); verify project files and retry; details: safe explain"
+      return 100
+    fi
+  done < "${scratch}/safe-manifest-sweep.list"
+  rm -f -- "${scratch}/safe-manifest-sweep.list"
+  return 0
+}
+
+# Every workspace member the project's own lockfile names must survive into
+# the projected one. A member key that vanished means npm discovered a
+# different member set in the scratch than it will in the project, and the
+# diff would report the member's whole subtree as removals — which are never
+# audited. A member the user legitimately deleted refuses here too: a faithful
+# drop and a discovery failure are indistinguishable without reimplementing
+# npm's member discovery, and this gate fails closed on that ambiguity.
+# v1 lockfiles carry no .packages and pass vacuously.
+safe_gate_npm_lockdiff_member_set_belt() {
+  local project_lock="$1" projected_lock="$2" subcommand="$3"
+  local missing=""
+
+  if missing="$(jq -er --slurpfile projected "${projected_lock}" '
+    ((.packages // {}) | keys | map(select(. != "" and (contains("node_modules/") | not))))
+    - (($projected[0].packages // {}) | keys)
+    | join(", ")
+  ' "${project_lock}" 2>/dev/null)"; then
+    :
+  else
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — workspace member sets cannot be read from the lockfiles (audit-infrastructure breakage, not a package finding); repair the lockfile and retry; details: safe explain"
+    return 100
+  fi
+  if [[ -n "${missing}" ]]; then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — the lock-diff projection resolved a different workspace member set than the project (${missing} absent from the projection), so what it vouches for is not what this command installs; run the install through the audited lane (npm ci / npm install) first, then retry; details: safe explain"
     return 100
   fi
   return 0
@@ -1922,6 +2065,12 @@ safe_gate_npm_lockdiff_preflight() {
     safe_gate_err "safe: BLOCKED npm ${subcommand} — ${SAFE_GATE_LOCKDIFF_OFFENDING_TOKEN} disables the lock-diff projection invariant; retry without that token; details: safe explain"
     return 100
   fi
+  if safe_gate_npm_lockdiff_config_path_guard "${subcommand}" "$@"; then
+    :
+  else
+    rc=$?
+    return "${rc}"
+  fi
   if safe_gate_npm_lockdiff_effective_config "${project_dir}" "${subcommand}" "$@"; then
     :
   else
@@ -1979,6 +2128,13 @@ safe_gate_npm_lockdiff_preflight() {
     safe_gate_err "safe: BLOCKED npm ${subcommand} — cannot copy the project .npmrc into the lock-diff projection (audit-infrastructure breakage, not a package finding); verify project files and retry; details: safe explain"
     return 100
   fi
+  if safe_gate_npm_lockdiff_mirror_manifests "${project_dir}" "${scratch}" "${subcommand}"; then
+    :
+  else
+    rc=$?
+    rm -rf -- "${scratch}"
+    return "${rc}"
+  fi
 
   (
     cd -- "${scratch}" || exit 125
@@ -1994,6 +2150,13 @@ safe_gate_npm_lockdiff_preflight() {
     rm -rf -- "${scratch}"
     safe_gate_err "safe: BLOCKED npm ${subcommand} — lock-diff projection failed with exit ${rc} (audit-infrastructure breakage, not a package finding); fix npm/project metadata and retry; details: safe explain"
     return 100
+  fi
+  if safe_gate_npm_lockdiff_member_set_belt "${project_dir}/${lockfile_name}" "${scratch}/${lockfile_name}" "${subcommand}"; then
+    :
+  else
+    rc=$?
+    rm -rf -- "${scratch}"
+    return "${rc}"
   fi
 
   if diff_json="$("${safe_core}" lockdiff "${registry_host_args[@]}" "${project_dir}/${lockfile_name}" "${scratch}/${lockfile_name}" 2>"${scratch}/lockdiff.err")"; then
@@ -2029,12 +2192,12 @@ safe_gate_npm_lockdiff_preflight() {
   # because that lockfile is what the real command installs to.
   #
   # npm resolves an optional package's os/cpu constraints against its EFFECTIVE
-  # target platform, and --os/--cpu move it: with --os=aix, npm installs an
-  # aix-only optional that this machine's platform would have excluded (r1
-  # review F2). The candidate set has to be computed against the same target,
-  # so the override travels with it.
-  safe_gate_npm_lockdiff_platform_args "$@"
-  platform_args=("${SAFE_GATE_LOCKDIFF_PLATFORM_ARGS[@]}")
+  # target platform, so the candidate set is computed against the target the
+  # config probe read, whatever source set it. The `=` form keeps a dash-led
+  # value from reading as a flag on the safe-core side; an empty target is
+  # omitted so safe-core's host mapping stands.
+  [[ -n "${SAFE_GATE_LOCKDIFF_TARGET_OS:-}" ]] && platform_args+=("--os=${SAFE_GATE_LOCKDIFF_TARGET_OS}")
+  [[ -n "${SAFE_GATE_LOCKDIFF_TARGET_CPU:-}" ]] && platform_args+=("--cpu=${SAFE_GATE_LOCKDIFF_TARGET_CPU}")
   if reify_json="$("${safe_core}" reify-candidates "${registry_host_args[@]}" "${platform_args[@]}" "${scratch}/${lockfile_name}" "${project_dir}" 2>"${scratch}/reify.err")"; then
     :
   else

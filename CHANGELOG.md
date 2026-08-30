@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+- **npm dedupe/prune: the lock-diff projection now mirrors the project's
+  config and workspace state** (1.53.0). The projection resolved in a scratch
+  directory carrying only the root `package.json`, the lockfile, and the
+  project `.npmrc`, so three kinds of state diverged between what the gate
+  vouched for and what the delegated command installs (#244).
+  - **The target platform is npm's, not the argv's.** The reify-candidate set
+    exempts an optional package whose `os`/`cpu` exclude the platform npm is
+    installing for, and that platform used to be read by scanning the command
+    line for `--os`/`--cpu`. npm resolves it from every config source, so
+    `npm_config_os=aix` (any case) or an `os=aix` line in `.npmrc` moved the
+    real install while the gate still audited against the host and exempted
+    the very optional the command was about to fetch. The gate now reads the
+    effective `os`/`cpu` off the same `npm config list --json` probe that
+    already decides `package-lock`/`ignore-scripts`, and the argv scanner is
+    deleted. An unreadable `os`/`cpu` is audit-infrastructure breakage (exit
+    100); a target npm reports as empty leaves the host platform standing,
+    which can only over-audit.
+  - **A relative `--userconfig`/`--globalconfig` refuses** (exit 100). npm
+    resolves those paths against the cwd, which is the project for the
+    delegate and the scratch for the projection, so one spelling names two
+    different config files and the projection could vouch for an artifact
+    fetched under settings it never read. Both argv spellings and the
+    environment forms (read case-insensitively, as npm reads them) are
+    checked; absolute and `~`-led values pass through untouched.
+  - **Workspace members are mirrored, and a lost member refuses.** At a
+    workspace root the scratch had no member manifests, so `npm dedupe
+    --package-lock-only` silently succeeded and dropped every workspace entry
+    from the projected lockfile: the diff then showed removals only — which
+    are never audited — and a member's own dependencies were materialized
+    unaudited. Every in-project `package.json` outside `node_modules` is now
+    copied into the projection at its project-relative path, which mirrors
+    member discovery by superset rather than by reimplementing npm's
+    `mapWorkspaces`. A `workspaces` pattern reaching outside the project root
+    (`../outside`, which npm accepts) refuses with exit 100, as does a
+    `workspaces` field that is not a list of patterns. After the projection, a
+    belt requires every non-`node_modules` key of the project's lockfile to
+    survive into the projected one; a member that vanished refuses with exit
+    100 rather than being read as an empty delta — a member legitimately
+    deleted refuses too, because a faithful drop and a discovery failure are
+    indistinguishable without reimplementing that discovery. Member-level
+    `.npmrc` files are deliberately not mirrored: npm's config chain is
+    root-only.
+  - **In-project `file:` dependencies stop failing the projection.** The same
+    manifest sweep carries their `package.json` into the scratch, so a project
+    depending on `file:./local-pkg` no longer refuses with a false "lock-diff
+    projection failed".
+
 - **npm dedupe/prune: a partial node_modules no longer reifies packages the
   lock diff never saw** (1.52.0). The lock-diff gate audited the delta between
   the project's lockfile and the projected one, which is the whole story only

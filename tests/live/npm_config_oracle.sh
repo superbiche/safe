@@ -64,6 +64,14 @@ hosts_out() {
   ( safe_gate_npm_lockdiff_registry_hosts "${WORK}" dedupe "$@" ) 2>/dev/null
 }
 
+# The target platform the shipped oracle extracted, read from the global the
+# preflight hands safe-core.
+target_os() {
+  SAFE_GATE_LOCKDIFF_TARGET_OS=""
+  safe_gate_npm_lockdiff_effective_config "${WORK}" dedupe "$@" >/dev/null 2>&1
+  printf '%s' "${SAFE_GATE_LOCKDIFF_TARGET_OS}"
+}
+
 # --- effective-config oracle -------------------------------------------------
 
 npmrc ''
@@ -107,6 +115,69 @@ npmrc ''
 [[ "$(NPM_CONFIG_PACKAGE_LOCK=' false ' config_rc dedupe)" == "100" ]] \
   && pass "whitespace-padded environment false is refused (npm trims it)" \
   || fail "whitespace-padded environment false was not refused"
+
+# --- target-platform oracle --------------------------------------------------
+
+# The reify-candidate exemption speaks for the platform npm installs FOR, and
+# npm resolves that from every config source. The argv scanner this replaced
+# saw only the command line, so an environment or .npmrc target moved the real
+# install while the audit stayed on the host platform (#244).
+
+npmrc ''
+[[ -z "$(target_os dedupe)" ]] \
+  && pass "no configured target platform leaves the host platform standing" \
+  || fail "an unset os produced a target: $(target_os dedupe)"
+
+[[ "$(target_os dedupe --os=aix)" == "aix" ]] \
+  && pass "an argv target platform is read from the effective config" \
+  || fail "argv --os=aix did not reach the target: $(target_os dedupe --os=aix)"
+
+[[ "$(target_os dedupe --os aix)" == "aix" ]] \
+  && pass "the space-separated argv spelling reaches the target too" \
+  || fail "argv --os aix did not reach the target"
+
+# npm treats a target as an opaque string: a dash-led value is a platform it
+# will resolve os constraints against, so it must survive verbatim.
+[[ "$(target_os dedupe --os=-weird)" == "-weird" ]] \
+  && pass "a dash-led target platform survives the probe verbatim" \
+  || fail "dash-led target was mangled: $(target_os dedupe --os=-weird)"
+
+[[ "$(npm_config_os=aix target_os dedupe)" == "aix" ]] \
+  && pass "an environment target platform is read from the effective config" \
+  || fail "npm_config_os=aix did not reach the target"
+
+[[ "$(NPM_CONFIG_OS=aix target_os dedupe)" == "aix" ]] \
+  && pass "npm reads its environment target case-insensitively" \
+  || fail "NPM_CONFIG_OS=aix did not reach the target"
+
+npmrc 'os=aix'
+[[ "$(target_os dedupe)" == "aix" ]] \
+  && pass "a project .npmrc target platform is read from the effective config" \
+  || fail "an .npmrc os=aix did not reach the target"
+
+# npm reports an empty argv target as "", which leaves the host platform
+# standing in safe-core — the over-auditing direction, since npm with an empty
+# os excludes every platform-constrained optional.
+npmrc ''
+[[ -z "$(target_os dedupe --os=)" ]] \
+  && pass "an empty argv target leaves the host platform standing" \
+  || fail "an empty --os= produced a target: $(target_os dedupe --os=)"
+
+# --- relative userconfig resolution -----------------------------------------
+
+# The refusal for a relative userconfig/globalconfig rests on this: npm
+# resolves such a path against the CWD, which is the project for the delegate
+# and the scratch directory for the projection, so one spelling names two
+# different config files.
+printf 'os=fromrelative\n' > "${WORK}/relative-npmrc"
+mkdir -p "${WORK}/elsewhere"
+from_project="$(cd "${WORK}" && "${real_npm}" config list --json --userconfig ./relative-npmrc 2>/dev/null | jq -r '.os // "unset"')"
+from_elsewhere="$(cd "${WORK}/elsewhere" && "${real_npm}" config list --json --userconfig ./relative-npmrc 2>/dev/null | jq -r '.os // "unset"')"
+if [[ "${from_project}" == "fromrelative" && "${from_elsewhere}" == "unset" ]]; then
+  pass "a relative --userconfig resolves against the cwd (why the projection refuses it)"
+else
+  fail "relative --userconfig resolution changed: project=${from_project} elsewhere=${from_elsewhere}"
+fi
 
 # --- registry-provenance oracle ---------------------------------------------
 
