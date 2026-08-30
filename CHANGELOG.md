@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- **npm dedupe/prune: a partial node_modules no longer reifies packages the
+  lock diff never saw** (1.52.0). The lock-diff gate audited the delta between
+  the project's lockfile and the projected one, which is the whole story only
+  when the tree already carries every entry both lockfiles agree on. It often
+  does not: a node_modules subdirectory deleted by hand, an install interrupted
+  mid-write, a tree carrying a different version than the lockfile names. On
+  such a tree `npm dedupe`/`npm prune` fetches those entries while the delta
+  stays EMPTY — and an empty delta returned 0 and delegated, so the fetch was
+  never audited (the partial-tree half of the PR #70 review F3 residual; its
+  absent-node_modules half already refuses outright). The gate now
+  also computes the **reify-candidate set** — every artifact the projected
+  lockfile names that the tree does not already carry at that version, or
+  carries only behind a symlink — through
+  the new `safe-core reify-candidates`, and unions it into the audited set. An
+  empty delta delegates only when the candidate set is empty too; a
+  non-registry candidate refuses with exit 100 the way a non-registry delta
+  target does; an analysis that cannot run is audit-infrastructure breakage
+  (exit 100), never a silent pass. Deliberately never installed artifacts stay
+  exempt so the gate does not refuse over a package that was never going to
+  arrive: an entry is skipped when it is a `link` lockfile entry (local
+  content, not a fetch) or when it is `optional` **and** its `os`/`cpu`
+  constraints exclude the platform npm is installing for, matched with npm's
+  own `checkPlatform` semantics including negations and `any`. That platform
+  is npm's effective target, not this machine: `--os`/`--cpu` on the command
+  line move it, and the gate reads them off npm's own argv (both spellings,
+  last one wins) so an `--os=aix` run audits the aix-only optional it will
+  actually install. A path the tree carries only through a **symlink** — an
+  `npm link` checkout, a hand-linked package, a symlinked `node_modules` root —
+  is a candidate rather than evidence of presence: npm replaces a linked
+  actual node with the ordinary package during reify, so its manifest
+  describes the link target and not what npm will put there. Everything else
+  is audited, `dev` entries included — a tree installed with `--omit=dev` is
+  over-audited rather than under-audited. Cost: on a partial tree these
+  commands now run a projected project scan and a package audit per candidate
+  where they previously delegated straight through.
 - **release-review `tuf`: the bootstrap mirror is served through a containment
   cage** (1.51.0). The `tuf` check serves the operator-supplied mirror to cosign
   over a loopback HTTP bridge, and that bridge used `http.Dir`, which follows
