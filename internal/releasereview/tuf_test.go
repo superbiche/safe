@@ -665,11 +665,165 @@ func TestServeMirrorServesTheDirectoryOverLoopback(t *testing.T) {
 		t.Fatalf("GET: %v", err)
 	}
 	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200", response.StatusCode)
+	}
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
 		t.Fatalf("read body: %v", err)
 	}
 	if string(body) != `{"signed":{"targets":{}}}` {
 		t.Fatalf("served %q", body)
+	}
+}
+
+// getMirror fetches one path from a served mirror and returns its status and
+// body, so the bridge cases below assert on both without repeating the plumbing.
+func getMirror(t *testing.T, base, path string) (int, string) {
+	t.Helper()
+	response, err := http.Get(base + path)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read body of %s: %v", path, err)
+	}
+	return response.StatusCode, string(body)
+}
+
+// The bridge is a second sink for the substitution the blob reads are caged
+// against: http.Dir follows symlinks, so a mirror entry pointing out of the tree
+// would serve out-of-mirror bytes to cosign during bootstrap — content cosign
+// then caches as trusted TUF material. Serving through an *os.Root refuses the
+// escaping resolution, which the file server reports as 500 rather than 404, so
+// the failure is fail-closed (cosign's fetch fails → bootstrap_failure BLOCK)
+// and stays distinguishable from a blob that is merely absent.
+func TestServeMirrorRefusesAnEscapingSymlink(t *testing.T) {
+	const secret = "out-of-mirror-secret"
+	dir := t.TempDir()
+	outside := writeFile(t, t.TempDir(), "secret.txt", secret)
+	targets := mkdir(t, filepath.Join(dir, "targets"))
+	if err := os.Symlink(outside, filepath.Join(targets, "evil")); err != nil {
+		t.Fatalf("symlink blob: %v", err)
+	}
+
+	base, stop, err := serveMirror(dir)
+	if err != nil {
+		t.Fatalf("serve mirror: %v", err)
+	}
+	defer stop()
+
+	status, body := getMirror(t, base, "/targets/evil")
+	if status != http.StatusInternalServerError {
+		t.Fatalf("status %d, want 500", status)
+	}
+	if strings.Contains(body, secret) {
+		t.Fatalf("body %q carries the out-of-mirror content", body)
+	}
+}
+
+// The escape can hide at a *directory* component of the request path rather than
+// at the file it names — the case a check on the final component alone cannot
+// catch, since every component up to it looks like an ordinary directory. Only
+// whole-path resolution (os.Root) refuses it.
+func TestServeMirrorRefusesAnEscapeThroughASymlinkedDirectory(t *testing.T) {
+	const secret = "out-of-mirror-secret"
+	dir := t.TempDir()
+	outsideDir := t.TempDir()
+	writeFile(t, outsideDir, "secret.txt", secret)
+	if err := os.Symlink(outsideDir, filepath.Join(dir, "link")); err != nil {
+		t.Fatalf("symlink directory: %v", err)
+	}
+
+	base, stop, err := serveMirror(dir)
+	if err != nil {
+		t.Fatalf("serve mirror: %v", err)
+	}
+	defer stop()
+
+	status, body := getMirror(t, base, "/link/secret.txt")
+	if status != http.StatusInternalServerError {
+		t.Fatalf("status %d, want 500", status)
+	}
+	if strings.Contains(body, secret) {
+		t.Fatalf("body %q carries the out-of-mirror content", body)
+	}
+}
+
+// Containment, not link-refusal: a mirror that dedups content-addressed blobs
+// through in-tree symlinks is a normal mirror, and refusing it would be a false
+// positive on the bootstrap path — the same latitude the blob-read cage grants.
+func TestServeMirrorServesAnInTreeSymlink(t *testing.T) {
+	const content = "deduped blob"
+	dir := t.TempDir()
+	targets := mkdir(t, filepath.Join(dir, "targets"))
+	real := writeFile(t, targets, "real.blob", content)
+	if err := os.Symlink(filepath.Base(real), filepath.Join(targets, "dedup.blob")); err != nil {
+		t.Fatalf("symlink blob: %v", err)
+	}
+
+	base, stop, err := serveMirror(dir)
+	if err != nil {
+		t.Fatalf("serve mirror: %v", err)
+	}
+	defer stop()
+
+	status, body := getMirror(t, base, "/targets/dedup.blob")
+	if status != http.StatusOK {
+		t.Fatalf("status %d, want 200", status)
+	}
+	if body != content {
+		t.Fatalf("served %q, want the linked file's content", body)
+	}
+}
+
+// The dedup latitude is for RELATIVE links only: os.Root rejects an absolute
+// link target outright rather than resolving where it lands, so even an
+// absolute link pointing back beneath the mirror refuses like an escape. Pinned
+// so the serveMirror comment's claim stays honest — the refusal is fail-closed,
+// not a hole (r1 finding F1).
+func TestServeMirrorRefusesAnAbsoluteInTreeSymlink(t *testing.T) {
+	const content = "in-tree blob behind an absolute link"
+	dir := t.TempDir()
+	targets := mkdir(t, filepath.Join(dir, "targets"))
+	real := writeFile(t, targets, "real.blob", content)
+	if err := os.Symlink(real, filepath.Join(targets, "absolute.blob")); err != nil {
+		t.Fatalf("symlink blob: %v", err)
+	}
+
+	base, stop, err := serveMirror(dir)
+	if err != nil {
+		t.Fatalf("serve mirror: %v", err)
+	}
+	defer stop()
+
+	status, body := getMirror(t, base, "/targets/absolute.blob")
+	if status != http.StatusInternalServerError {
+		t.Fatalf("status %d, want 500", status)
+	}
+	if body == content {
+		t.Fatalf("absolute-target link was served; want refusal")
+	}
+}
+
+// A link that stays in the tree but names nothing is absence, not an escape: it
+// reads as the ordinary 404 a deleted file gives, never the 500 the cage uses.
+func TestServeMirrorDanglingInTreeSymlinkIsNotFound(t *testing.T) {
+	dir := t.TempDir()
+	targets := mkdir(t, filepath.Join(dir, "targets"))
+	if err := os.Symlink("absent-sibling", filepath.Join(targets, "dangling.blob")); err != nil {
+		t.Fatalf("symlink blob: %v", err)
+	}
+
+	base, stop, err := serveMirror(dir)
+	if err != nil {
+		t.Fatalf("serve mirror: %v", err)
+	}
+	defer stop()
+
+	if status, _ := getMirror(t, base, "/targets/dangling.blob"); status != http.StatusNotFound {
+		t.Fatalf("status %d, want 404", status)
 	}
 }

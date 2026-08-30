@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **release-review `tuf`: the bootstrap mirror is served through a containment
+  cage** (1.51.0). The `tuf` check serves the operator-supplied mirror to cosign
+  over a loopback HTTP bridge, and that bridge used `http.Dir`, which follows
+  symlinks — the same defect class 1.43.0 closed at the hash-read sink, at a
+  second sink. A mirror entry symlinked out of the tree could hand cosign
+  out-of-mirror bytes during `cosign initialize`, content cosign then caches as
+  trusted TUF material, before any of the caged blob reads run. The bridge now
+  serves through an `os.Root` rooted at the mirror, which refuses any resolution
+  that leaves it — at the requested file or at any directory component of the
+  request path. An escaping request fails the fetch (HTTP 500), so cosign fails
+  to initialize and the check reports the existing `bootstrap_failure` BLOCK:
+  fail-closed, and distinguishable from a merely absent blob (404). Semantics
+  match the 1.43.0 cage: containment, not link-refusal — a relative in-tree
+  symlink is still followed and served (an absolute link target is refused
+  outright, even one pointing back beneath the mirror — `os.Root` rejects
+  absolute targets rather than resolving where they land, erring fail-closed),
+  and a mirror root that is itself a symlink still
+  resolves, since that path is the operator's declaration rather than
+  mirror-supplied content. Defense-in-depth on an operator-supplied mirror; no
+  legitimate mirror changes verdict.
 - **Trust stores are anchored to the canonical config root; an
   environment-redirected store can no longer grant escalation** (1.50.0).
   `SAFE_RUN_CONFIG_DIR` / `SAFE_CONFIG_DIR` relocate the config root — a
