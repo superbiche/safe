@@ -31,10 +31,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "release-review" {
 		return releaseReview(args[1:], stdin, stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "reify-candidates" {
+		return reifyCandidates(args[1:], stdout, stderr)
+	}
 
 	registryHosts, oldLockfile, newLockfile, ok := lockdiffArgs(args)
 	if !ok {
 		fmt.Fprintln(stderr, "safe-core: usage: safe-core lockdiff [--registry-host <host>]... <old-lockfile> <new-lockfile>")
+		fmt.Fprintln(stderr, "safe-core: usage: safe-core reify-candidates [--registry-host <host>]... <lockfile> <project-dir>")
 		fmt.Fprintln(stderr, "safe-core: usage: safe-core package-verdict < evidence.json")
 		fmt.Fprintln(stderr, "safe-core: usage: safe-core release-review --spec <spec.json|-> | --versions")
 		return 2
@@ -173,6 +177,46 @@ func releaseReview(args []string, stdin io.Reader, stdout, stderr io.Writer) int
 	return report.Verdict.ExitCode()
 }
 
+// reifyCandidates prints the lockfile artifacts a real install would still
+// materialize into a project tree.
+//
+// A project directory that cannot be read is exit 3, never an empty candidate
+// set: an unreadable tree is evidence about the tooling, not about the tree,
+// and reporting "nothing to fetch" there would vouch for a projection nobody
+// checked. An unreadable single entry inside a readable tree is different —
+// that is a candidate, decided in ReifyCandidates.
+func reifyCandidates(args []string, stdout, stderr io.Writer) int {
+	registryHosts, lockfile, projectDir, ok := reifyCandidatesArgs(args)
+	if !ok {
+		fmt.Fprintln(stderr, "safe-core: usage: safe-core reify-candidates [--registry-host <host>]... <lockfile> <project-dir>")
+		return 2
+	}
+
+	info, err := os.Stat(projectDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "safe-core: reify-candidates: read project directory: %v\n", err)
+		return 3
+	}
+	if !info.IsDir() {
+		fmt.Fprintf(stderr, "safe-core: reify-candidates: %q is not a directory\n", projectDir)
+		return 3
+	}
+
+	entries, err := lockdiff.LoadEntries(lockfile, registryHosts)
+	if err != nil {
+		fmt.Fprintf(stderr, "safe-core: reify-candidates: %v\n", err)
+		return 3
+	}
+
+	encoder := json.NewEncoder(stdout)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(lockdiff.ReifyCandidates(entries, projectDir)); err != nil {
+		fmt.Fprintf(stderr, "safe-core: reify-candidates: write JSON: %v\n", err)
+		return 3
+	}
+	return 0
+}
+
 func lockdiffArgs(args []string) (registryHosts []string, oldLockfile, newLockfile string, ok bool) {
 	if len(args) == 0 || args[0] != "lockdiff" {
 		return nil, "", "", false
@@ -198,4 +242,30 @@ func lockdiffArgs(args []string) (registryHosts []string, oldLockfile, newLockfi
 		return nil, "", "", false
 	}
 	return registryHosts, lockfiles[0], lockfiles[1], true
+}
+
+// reifyCandidatesArgs parses the subcommand's argv exactly as lockdiffArgs
+// parses its own: the same registry-host flag, the same refusal of an unknown
+// option, and the same two-positional shape.
+func reifyCandidatesArgs(args []string) (registryHosts []string, lockfile, projectDir string, ok bool) {
+	positionals := make([]string, 0, 2)
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--registry-host":
+			if i+1 >= len(args) || args[i+1] == "" {
+				return nil, "", "", false
+			}
+			registryHosts = append(registryHosts, args[i+1])
+			i++
+		default:
+			if len(positionals) == 2 || len(args[i]) > 1 && args[i][0] == '-' {
+				return nil, "", "", false
+			}
+			positionals = append(positionals, args[i])
+		}
+	}
+	if len(positionals) != 2 || positionals[0] == "" || positionals[1] == "" {
+		return nil, "", "", false
+	}
+	return registryHosts, positionals[0], positionals[1], true
 }

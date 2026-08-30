@@ -1850,6 +1850,7 @@ safe_gate_npm_lockdiff_preflight() {
   shift
   local project_dir="${SAFE_GATE_PROJECT_DIR:-.}" lockfile_name=""
   local real_npm="" safe_core="" safe_core_version="" scratch="" diff_json="" introduced_rows="" registry_hosts="" rc=0
+  local reify_json="" candidate_rows=""
   local -a introduced=() registry_host_args=()
 
   if [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]]; then
@@ -1866,9 +1867,9 @@ safe_gate_npm_lockdiff_preflight() {
   fi
   # With no node_modules at all, the lock diff projects to empty while the
   # real command materializes EVERY lockfile artifact — nothing would be
-  # audited (PR#70 review F3, operator-ruled conservative guard 2026-08-10;
-  # the partial-tree residual is inbox
-  # 2026-08-10-safe-lockdiff-partial-tree-residual.md).
+  # audited (PR#70 review F3, operator-ruled conservative guard 2026-08-10).
+  # The partial-tree half of that residual is closed further down by the
+  # reify-candidate set.
   if [[ ! -d "${project_dir}/node_modules" ]]; then
     safe_gate_err "safe: BLOCKED npm ${subcommand} — node_modules is absent, so this command would materialize every lockfile artifact without an audit; install first through the audited lane (npm ci / npm install), then retry; details: safe explain"
     return 100
@@ -1976,8 +1977,40 @@ safe_gate_npm_lockdiff_preflight() {
     safe_gate_err "safe: BLOCKED npm ${subcommand} — lock-diff analysis returned an unreadable result (audit-infrastructure breakage, not a package finding); rerun install.sh and retry; details: safe explain"
     return 100
   fi
+  # The lock delta is only half the story. A PARTIAL tree — a node_modules
+  # subdirectory deleted by hand, an install interrupted mid-write — makes the
+  # real command reify lockfile entries BOTH lockfiles already agreed on, so
+  # they never appear in the delta and nothing audits them (PR#70 review F3
+  # residual). The reify-candidate set is those entries: what the delegated run
+  # may still fetch, read from the projected lockfile against the actual tree,
+  # because that lockfile is what the real command installs to.
+  if reify_json="$("${safe_core}" reify-candidates "${registry_host_args[@]}" "${scratch}/${lockfile_name}" "${project_dir}" 2>"${scratch}/reify.err")"; then
+    :
+  else
+    rc=$?
+    rm -rf -- "${scratch}"
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — reify-candidate analysis failed with exit ${rc} (audit-infrastructure breakage, not a package finding); repair the lockfile and retry; details: safe explain"
+    return 100
+  fi
+  if ! jq -e '
+    def optional_integrity: (has("integrity") | not) or (.integrity | type == "string");
+    def candidate_entry: type == "object" and (.path | type == "string") and (.name | type == "string") and (.version | type == "string") and (.source | type == "string") and (.reason == "missing" or .reason == "version-mismatch") and optional_integrity;
+    type == "object"
+    and (.schema == 1)
+    and (.candidates | type == "array")
+    and ([.candidates[] | candidate_entry] | all)
+  ' <<<"${reify_json}" >/dev/null 2>&1; then
+    rm -rf -- "${scratch}"
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — reify-candidate analysis returned an unreadable result (audit-infrastructure breakage, not a package finding); rerun install.sh and retry; details: safe explain"
+    return 100
+  fi
+
+  # An empty delta is a clean bill of health only when the tree already carries
+  # every entry the projected lockfile names; otherwise the command still
+  # fetches, and the audit below is what vouches for it.
   if jq -e '(.added | length) == 0 and (.removed | length) == 0 and (.changed | length) == 0' \
-      <<<"${diff_json}" >/dev/null 2>&1; then
+      <<<"${diff_json}" >/dev/null 2>&1 \
+      && jq -e '(.candidates | length) == 0' <<<"${reify_json}" >/dev/null 2>&1; then
     rm -rf -- "${scratch}"
     return 0
   fi
@@ -2006,6 +2039,38 @@ safe_gate_npm_lockdiff_preflight() {
     fi
     introduced+=("${name}@${version}")
   done <<<"${introduced_rows}"
+
+  if candidate_rows="$(jq -er '
+    .candidates
+    | unique_by(.name, .version, .source)
+    | sort_by(.name, .version, .source)
+    | map([ .name, .version, .source ] | @tsv)
+    | join("\n")
+  ' <<<"${reify_json}")"; then
+    :
+  else
+    rm -rf -- "${scratch}"
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — reify-candidate target list is unreadable (audit-infrastructure breakage, not a package finding); rerun install.sh and retry; details: safe explain"
+    return 100
+  fi
+
+  # The delta's own targets were refused above with the message that names
+  # them, so a target in both sets keeps that wording; only a reify-only
+  # target reaches this one.
+  local seen known
+  while IFS=$'\t' read -r name version source; do
+    [[ -n "${name}" ]] || continue
+    if [[ "${source}" != "registry" ]]; then
+      rm -rf -- "${scratch}"
+      safe_gate_err "safe: BLOCKED npm ${subcommand} — this command would materialize ${name}@${version}, a ${source} artifact, not a registry artifact; not audit-gated; details: safe explain"
+      return 100
+    fi
+    known=0
+    for seen in "${introduced[@]}"; do
+      [[ "${seen}" == "${name}@${version}" ]] && { known=1; break; }
+    done
+    (( known )) || introduced+=("${name}@${version}")
+  done <<<"${candidate_rows}"
 
   safe_gate_lockdiff_scan_project "${scratch}" "${subcommand}"
   rc=$?

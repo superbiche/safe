@@ -38,6 +38,20 @@ type Diff struct {
 	Changed []Change  `json:"changed"`
 }
 
+// Entry is one .packages occurrence with the install path npm materializes it
+// at, plus the fields that decide whether a real install materializes it at
+// all. Load drops all of it; the reify lane needs every field to tell an
+// artifact the delegated command would fetch from one it never will.
+type Entry struct {
+	Path     string
+	Package  Package
+	Link     bool
+	Optional bool
+	Dev      bool
+	OS       []string
+	CPU      []string
+}
+
 // Load reads package occurrences using npm's default registry host.
 func Load(path string) ([]Package, error) {
 	return LoadWithRegistryHosts(path, nil)
@@ -47,6 +61,29 @@ func Load(path string) ([]Package, error) {
 // 2 or 3 .packages map. A HTTP(S) descriptor is a registry artifact only when
 // its host is npm's default registry or one of registryHosts.
 func LoadWithRegistryHosts(path string, registryHosts []string) ([]Package, error) {
+	entries, err := LoadEntries(path, registryHosts)
+	if err != nil {
+		return nil, err
+	}
+
+	packages := make([]Package, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Link {
+			continue
+		}
+		packages = append(packages, entry.Package)
+	}
+	sort.Slice(packages, func(i, j int) bool {
+		return packageLess(packages[i], packages[j])
+	})
+	return packages, nil
+}
+
+// LoadEntries reads the same .packages map as LoadWithRegistryHosts while
+// keeping each entry's install path and install-decision fields. Link entries
+// are returned carrying nothing but their path: npm never fetches them, so
+// they are neither validated nor classified here.
+func LoadEntries(path string, registryHosts []string) ([]Entry, error) {
 	allowedRegistryHosts := registryHostSet(registryHosts)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -92,7 +129,7 @@ func LoadWithRegistryHosts(path string, registryHosts []string) ([]Package, erro
 		return nil, fmt.Errorf("parse %q: .packages must be a JSON object", path)
 	}
 
-	packages := make([]Package, 0, len(entries))
+	loaded := make([]Entry, 0, len(entries))
 	for key, raw := range entries {
 		name, include := packageName(key)
 		if !include {
@@ -101,15 +138,20 @@ func LoadWithRegistryHosts(path string, registryHosts []string) ([]Package, erro
 
 		var entry struct {
 			Link      *bool           `json:"link"`
+			Optional  *bool           `json:"optional"`
+			Dev       *bool           `json:"dev"`
 			Name      string          `json:"name"`
 			Version   string          `json:"version"`
 			Resolved  json.RawMessage `json:"resolved"`
 			Integrity json.RawMessage `json:"integrity"`
+			OS        json.RawMessage `json:"os"`
+			CPU       json.RawMessage `json:"cpu"`
 		}
 		if err := json.Unmarshal(raw, &entry); err != nil {
 			return nil, fmt.Errorf("parse %q: .packages[%q] must be an object", path, key)
 		}
 		if entry.Link != nil && *entry.Link {
+			loaded = append(loaded, Entry{Path: key, Link: true})
 			continue
 		}
 		if entry.Version == "" {
@@ -143,13 +185,39 @@ func LoadWithRegistryHosts(path string, registryHosts []string) ([]Package, erro
 				return nil, fmt.Errorf("parse %q: .packages[%q] %w", path, key, err)
 			}
 		}
-		packages = append(packages, Package{Name: name, Version: entry.Version, Source: source, Integrity: integrity})
+		loaded = append(loaded, Entry{
+			Path:     key,
+			Package:  Package{Name: name, Version: entry.Version, Source: source, Integrity: integrity},
+			Optional: entry.Optional != nil && *entry.Optional,
+			Dev:      entry.Dev != nil && *entry.Dev,
+			OS:       stringList(entry.OS),
+			CPU:      stringList(entry.CPU),
+		})
 	}
 
-	sort.Slice(packages, func(i, j int) bool {
-		return packageLess(packages[i], packages[j])
+	sort.Slice(loaded, func(i, j int) bool {
+		return loaded[i].Path < loaded[j].Path
 	})
-	return packages, nil
+	return loaded, nil
+}
+
+// stringList reads npm's one-or-many spelling for os/cpu. An unreadable value
+// reads as absent, which matches every platform: over-auditing an entry the
+// real command may skip is the safe direction, and a lockfile shape this
+// parser does not recognize must not silently exempt an artifact from audit.
+func stringList(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(raw, &many); err == nil {
+		return many
+	}
+	var one string
+	if err := json.Unmarshal(raw, &one); err == nil {
+		return []string{one}
+	}
+	return nil
 }
 
 func packageName(key string) (string, bool) {

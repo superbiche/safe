@@ -467,6 +467,17 @@ prepare_lockdiff_case() {
   mkdir -p "${WORK_DIR}/node_modules"
 }
 
+# One materialized tree entry. The reify-candidate set reads
+# node_modules/<name>/package.json to tell an artifact the delegated command
+# would still fetch from one already on disk, so a case that wants an empty
+# candidate set has to carry the entries its lockfile names.
+install_lockdiff_package() {
+  local name="$1" version="$2"
+  mkdir -p "${WORK_DIR}/node_modules/${name}"
+  printf '{"name":"%s","version":"%s"}\n' "${name}" "${version}" \
+    > "${WORK_DIR}/node_modules/${name}/package.json"
+}
+
 # Gate mode: the wrappers sit ahead of the tool stubs on PATH, so a command
 # resolves to the wrapper executable, which execs `safe gate <tool>`. Nothing
 # is sourced into the shell — that is the point of the port, and running the
@@ -2223,6 +2234,8 @@ case_composer_global_canonical_routing() {
 case_npm_dedupe_lockdiff_empty_delegates_without_scan() {
   skip_lockdiff_case "$FUNCNAME" || return
   prepare_lockdiff_case "npm-dedupe-lockdiff-empty"
+  # Empty delta AND a complete tree: nothing is fetched, so nothing is audited.
+  install_lockdiff_package kept 1.0.0
   printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
   printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/kept":{"version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
   NPM_LOCK_MUTATION_JSON='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/kept":{"version":"1.0.0"}}}' \
@@ -2251,11 +2264,85 @@ case_npm_lockdiff_absent_node_modules_refuses() {
   pass "$FUNCNAME"
 }
 
+# The lockfile both sides of the projection agree on, so the delta is empty and
+# only the tree decides whether anything is still fetched.
+LOCKDIFF_PARTIAL_TREE_LOCK='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/blockme":{"version":"2.0.0","resolved":"https://registry.npmjs.org/blockme/-/blockme-2.0.0.tgz","integrity":"sha512-blockme"}}}'
+
+case_npm_lockdiff_partial_tree_audits_reify_candidates() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-partial-tree-missing"
+  # A node_modules that lost a subdirectory: the delta is empty, yet the real
+  # dedupe still fetches the entry both lockfiles name. The reify-candidate set
+  # is what puts it through the audit (PR#70 review F3 residual).
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '%s\n' "${LOCKDIFF_PARTIAL_TREE_LOCK}" > "${WORK_DIR}/package-lock.json"
+  NPM_LOCK_MUTATION_JSON="${LOCKDIFF_PARTIAL_TREE_LOCK}" \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_version_mismatched_tree_is_a_reify_candidate() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-partial-tree-version-mismatch"
+  # Present on disk is not the same as present at the locked version: the real
+  # command replaces this one, which is a fetch like any other.
+  install_lockdiff_package blockme 1.0.0
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '%s\n' "${LOCKDIFF_PARTIAL_TREE_LOCK}" > "${WORK_DIR}/package-lock.json"
+  NPM_LOCK_MUTATION_JSON="${LOCKDIFF_PARTIAL_TREE_LOCK}" \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_exempts_never_installed_optional_entries() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-optional-platform-exempt"
+  # An optional entry npm skips on this platform is never fetched, so auditing
+  # it would refuse the command over a package that was never going to arrive
+  # (fsevents on Linux). `aix` mismatches every machine this suite runs on; the
+  # entry would BLOCK if it reached the audit, so delegation proves the
+  # exemption.
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  local lock='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/blockme":{"version":"2.0.0","optional":true,"os":["aix"],"resolved":"https://registry.npmjs.org/blockme/-/blockme-2.0.0.tgz","integrity":"sha512-blockme"}}}'
+  printf '%s\n' "${lock}" > "${WORK_DIR}/package-lock.json"
+  NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tdedupe' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'AUDIT\tpackage-audit' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'AUDIT\trepo-audit' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_refuses_nonregistry_reify_candidate() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-nonregistry-reify-candidate"
+  # Same rule as a non-registry delta target, reached without a delta: nothing
+  # audit-gates a git artifact, so materializing one refuses.
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  local lock='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/gitpkg":{"version":"1.0.0","resolved":"git+https://example.invalid/gitpkg.git#deadbeef","integrity":"sha512-git"}}}'
+  printf '%s\n' "${lock}" > "${WORK_DIR}/package-lock.json"
+  NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'this command would materialize gitpkg@1.0.0, a git artifact, not a registry artifact; not audit-gated' "$FUNCNAME" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+  assert_log_not_contains_fragment $'AUDIT\trepo-audit' "$FUNCNAME" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_npm_lockdiff_projection_sees_project_npmrc() {
   skip_lockdiff_case "$FUNCNAME" || return
   prepare_lockdiff_case "npm-lockdiff-npmrc-copied"
   # A project-level registry must govern the projection too, or the audit
   # vouches for a different artifact than the delegate fetches (review F3).
+  install_lockdiff_package kept 1.0.0
   printf 'registry=https://npm.example.test/\n' > "${WORK_DIR}/.npmrc"
   printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
   printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/kept":{"version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
@@ -5608,6 +5695,10 @@ main() {
     case_composer_global_canonical_routing \
     case_npm_dedupe_lockdiff_empty_delegates_without_scan \
     case_npm_lockdiff_absent_node_modules_refuses \
+    case_npm_lockdiff_partial_tree_audits_reify_candidates \
+    case_npm_lockdiff_version_mismatched_tree_is_a_reify_candidate \
+    case_npm_lockdiff_exempts_never_installed_optional_entries \
+    case_npm_lockdiff_refuses_nonregistry_reify_candidate \
     case_npm_lockdiff_projection_sees_project_npmrc \
     case_npm_dedupe_lockdiff_introduced_block_refuses_without_delegation \
     case_npm_dedupe_lockdiff_parse_failure_fails_closed \
