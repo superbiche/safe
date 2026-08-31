@@ -22,8 +22,13 @@ pass "bash syntax"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+# The repo tree is kept deliberately: the digest used to land in its inbox, and
+# every digest case below asserts that nothing is written here any more.
 mkdir -p "$tmp/config" "$tmp/data" "$tmp/audit-data" "$tmp/bin" \
-  "$tmp/repo/.git" "$tmp/repo/bin" "$tmp/repo/inbox"
+  "$tmp/safe-config" "$tmp/repo/.git" "$tmp/repo/bin" "$tmp/repo/inbox"
+
+digest_json="$tmp/safe-config/audit/host-allow-digest.json"
+digest_md="$tmp/safe-config/audit/host-allow-digest.md"
 
 cat > "$tmp/config/host-allow.json" <<'JSON'
 {"packages":{
@@ -63,16 +68,23 @@ esac
 SH
 chmod +x "$tmp/bin/safe-audit-stub"
 
-run_review() {
+# SAFE_CONFIG_DIR, not SAFE_AUDIT_CONFIG_DIR: the digest path is derived, and
+# the derivation is what these cases have to exercise. SAFE_REPO_DIR is gone —
+# the digest no longer knows what a repo is.
+run_safe_run() {
   SAFE_RUN_CONFIG_DIR="$tmp/config" \
   SAFE_RUN_DATA_DIR="$tmp/data" \
   SAFE_AUDIT_DATA_DIR="$tmp/audit-data" \
+  SAFE_CONFIG_DIR="$tmp/safe-config" \
   SAFE_AUDIT_BIN="$tmp/bin/safe-audit-stub" \
   SAFE_HOST_ALLOW_REVIEW_TIMEOUT=1 \
-  SAFE_REPO_DIR="$tmp/repo" \
   SAFE_RUN_NO_INIT=1 \
   STUB_CALL_LOG="$tmp/stub-calls.log" \
-    "$SAFE_RUN" host-allow review "$@"
+    "$SAFE_RUN" "$@"
+}
+
+run_review() {
+  run_safe_run host-allow review "$@"
 }
 
 # --- classification -------------------------------------------------------
@@ -133,20 +145,32 @@ noaudit=$(run_review --json --no-audit)
 pass "--no-audit skips probes"
 
 # --- digest ---------------------------------------------------------------
-note="$tmp/repo/inbox/$(date -I)-safe-host-allow-digest.md"
+# The digest is machine-local state under the safe config root, never a note in
+# the repo's inbox: that lane is for asks, and a report that regenerates every
+# week is not one.
 run_review --digest >/dev/null 2>&1
-[[ -f "$note" ]] || fail "digest note not written"
-grep -q "safe run host-allow remove clean-pkg" "$note" || fail "digest missing remove suggestion"
-grep -q "URGENT" "$note" || fail "digest missing urgent flag"
-pass "digest note written when actionable"
+[[ -f "$digest_json" ]] || fail "digest JSON not written to $digest_json"
+[[ -f "$digest_md" ]] || fail "digest markdown not written to $digest_md"
+jq -e '.summary.removable == 1 and .summary."review-urgent" == 1' "$digest_json" >/dev/null \
+  || fail "digest JSON summary wrong: $(jq -c '.summary' "$digest_json")"
+jq -e '.generated | type == "string" and (. != "")' "$digest_json" >/dev/null \
+  || fail "digest JSON missing its generated timestamp"
+grep -q "safe run host-allow remove clean-pkg" "$digest_md" || fail "digest missing remove suggestion"
+grep -q "URGENT" "$digest_md" || fail "digest missing urgent flag"
+pass "digest writes report JSON and rendered markdown to the config path"
 
-printf 'sentinel\n' >> "$note"
+[[ -z "$(find "$tmp/repo" -type f -print -quit)" ]] || fail "digest wrote into the repo tree: $(find "$tmp/repo" -type f)"
+pass "digest writes nothing into the safe repo"
+
+# Overwritten per run, not preserved: the old inbox note was dated and kept,
+# this file is the latest review or it is lying.
+printf 'sentinel\n' >> "$digest_md"
 run_review --digest >/dev/null 2>&1
-grep -q "sentinel" "$note" || fail "existing digest note was overwritten"
-pass "existing digest note preserved"
+if grep -q "sentinel" "$digest_md"; then fail "digest markdown was not overwritten"; fi
+pass "each run replaces the digest"
 
-# Nothing actionable: only the infra and warn entries -> no note.
-rm -f "$note"
+# Nothing actionable still writes: a review that found nothing has to clear
+# yesterday's findings, or status keeps reporting decisions that are gone.
 cat > "$tmp/config/host-allow.json" <<'JSON'
 {"packages":{
   "warn-pkg":{"version":"1.3.0","sha":"b","ecosystem":"npm","added":"2026-05-01","reason":"real warn"},
@@ -154,8 +178,72 @@ cat > "$tmp/config/host-allow.json" <<'JSON'
 }}
 JSON
 run_review --digest >/dev/null 2>&1
-[[ ! -f "$note" ]] || fail "digest note written with nothing actionable"
-pass "no digest note when nothing actionable"
+[[ -f "$digest_json" ]] || fail "digest not written when nothing is actionable"
+jq -e '.summary.removable == 0 and .summary."review-urgent" == 0 and .summary.total == 2' \
+  "$digest_json" >/dev/null || fail "nothing-actionable digest has wrong counts: $(jq -c '.summary' "$digest_json")"
+pass "a review with nothing actionable still writes the digest, with zero counts"
+
+# --- status renders the digest --------------------------------------------
+printf '{"runners":{}}\n' > "$tmp/config/config.json"
+out=$(run_safe_run status 2>/dev/null)
+grep -q "review digest:  nothing actionable (reviewed " <<<"$out" \
+  || fail "status missing the quiet digest line: $out"
+pass "status reports a digest with nothing actionable"
+
+# Back to the actionable set, so status has counts to report.
+cat > "$tmp/config/host-allow.json" <<'JSON'
+{"packages":{
+  "clean-pkg":{"version":"2.1.4","sha":"a","ecosystem":"npm","added":"2026-07-01","reason":"was catch-22"},
+  "block-pkg":{"version":"0.0.1","sha":"c","ecosystem":"npm","added":"2026-06-01","reason":"went bad"}
+}}
+JSON
+run_review --digest >/dev/null 2>&1
+out=$(run_safe_run status 2>/dev/null)
+grep -q "review digest:  1 removable, 1 review-urgent (reviewed " <<<"$out" \
+  || fail "status missing the actionable digest counts: $out"
+grep -q "safe run host-allow remove <name>" <<<"$out" || fail "status missing the remove hint: $out"
+pass "status reports removable and review-urgent counts with the review date"
+
+# --- remove drops the handled entry ---------------------------------------
+run_safe_run host-allow remove clean-pkg >/dev/null 2>&1
+jq -e '[.entries[] | select(.name == "clean-pkg")] | length == 0' "$digest_json" >/dev/null \
+  || fail "removed entry still in the digest"
+jq -e '.summary.total == 1 and .summary.removable == 0 and .summary."review-urgent" == 1' \
+  "$digest_json" >/dev/null || fail "digest counts not recomputed after removal: $(jq -c '.summary' "$digest_json")"
+if grep -q "clean-pkg" "$digest_md"; then fail "removed entry still rendered in the digest markdown"; fi
+pass "host-allow remove drops the entry from the digest and recomputes the counts"
+
+out=$(run_safe_run status 2>/dev/null)
+grep -q "review digest:  0 removable, 1 review-urgent (reviewed " <<<"$out" \
+  || fail "status did not follow the recomputed digest: $out"
+pass "status stops reporting a removed entry"
+
+# Removing something the digest never carried is a no-op, never a failure:
+# the digest is a convenience surface and must not be able to fail a removal.
+run_safe_run host-allow remove block-pkg >/dev/null 2>&1 || fail "removal failed"
+mv "$tmp/config/host-allow.json" "$tmp/config/host-allow.json.bak"
+printf '{"packages":{"never-reviewed":{"version":"1.0.0","sha":"z","ecosystem":"npm","added":"2026-07-01","reason":"x"}}}\n' \
+  > "$tmp/config/host-allow.json"
+run_safe_run host-allow remove never-reviewed >/dev/null 2>&1 || fail "removal of an unreviewed entry failed"
+pass "removing an entry the digest never carried is a no-op"
+
+# An unreadable digest shows a marker rather than reading as "no findings".
+printf 'not json at all\n' > "$digest_json"
+out=$(run_safe_run status 2>/dev/null)
+grep -q "review digest:  UNREADABLE at " <<<"$out" || fail "status hid a malformed digest: $out"
+pass "status marks an unreadable digest instead of reporting zero findings"
+
+# Absent digest: no review has run yet.
+rm -f "$digest_json" "$digest_md"
+out=$(run_safe_run status 2>/dev/null)
+grep -q "review digest:  no review has run yet" <<<"$out" || fail "status missing the never-reviewed line: $out"
+pass "status says so when no review has run"
+
+# A review WITHOUT --digest writes nothing.
+mv "$tmp/config/host-allow.json.bak" "$tmp/config/host-allow.json"
+run_review --json >/dev/null 2>&1
+[[ ! -e "$digest_json" ]] || fail "review without --digest wrote a digest"
+pass "review without --digest writes no digest"
 
 # --- probe payload corroboration (F2) -------------------------------------
 cat > "$tmp/config/host-allow.json" <<'JSON'
@@ -188,12 +276,13 @@ fresh="$tmp/fresh"
 SAFE_RUN_CONFIG_DIR="$fresh/config" \
 SAFE_RUN_DATA_DIR="$fresh/data" \
 SAFE_AUDIT_DATA_DIR="$fresh/audit-data" \
+SAFE_CONFIG_DIR="$fresh/safe-config" \
 SAFE_AUDIT_BIN="$tmp/bin/safe-audit-stub" \
-SAFE_REPO_DIR="$tmp/repo" \
   "$SAFE_RUN" host-allow review --no-audit >/dev/null 2>&1 || true
 [[ ! -e "$fresh/config/host-allow.json" ]] || fail "review seeded host-allow.json on a fresh machine"
 [[ ! -e "$fresh/data/audit.log" ]] || fail "review seeded audit.log on a fresh machine"
-pass "review does not seed trust or audit state (no SAFE_RUN_NO_INIT)"
+[[ ! -e "$fresh/safe-config/audit" ]] || fail "review seeded the digest directory on a fresh machine"
+pass "review does not seed trust, audit, or digest state (no SAFE_RUN_NO_INIT)"
 
 # --- chronological last_used across offsets (F3) --------------------------
 # Append order is chronological; the second line is the later instant

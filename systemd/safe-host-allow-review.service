@@ -1,5 +1,5 @@
 [Unit]
-Description=safe host-allow staleness review (digest to safe repo inbox when actionable)
+Description=safe host-allow staleness review (digest under ~/.config/safe/audit, surfaced by safe status)
 
 [Service]
 Type=oneshot

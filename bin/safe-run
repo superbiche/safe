@@ -40,6 +40,15 @@ fi
 SAFE_AUDIT_BIN="${SAFE_AUDIT_BIN:-safe-audit}"
 SAFE_AUDIT_DATA_DIR="${SAFE_AUDIT_DATA_DIR:-${SAFE_DATA_DIR:-$HOME/.local/share/safe}/audit}"
 SAFE_AUDIT_HOST_ALLOW_LOG="$SAFE_AUDIT_DATA_DIR/host-allow-log.jsonl"
+# The host-allow review digest. Config root rather than data because it is an
+# operator-facing status surface, and safe-audit's config dir (same override
+# name) because one SAFE_CONFIG_DIR redirect must move a whole installation
+# coherently. Machine-local by design: this replaced a note written into the
+# safe repo's inbox, which is a capture lane for asks, not a channel for a
+# report that regenerates every week.
+HOST_ALLOW_DIGEST_DIR="${SAFE_AUDIT_CONFIG_DIR:-${SAFE_CONFIG_DIR:-$HOME/.config/safe}/audit}"
+HOST_ALLOW_DIGEST_JSON="$HOST_ALLOW_DIGEST_DIR/host-allow-digest.json"
+HOST_ALLOW_DIGEST_MD="$HOST_ALLOW_DIGEST_DIR/host-allow-digest.md"
 
 NODE_IMAGE_DEFAULT="docker.io/library/node:24"
 NODE_IMAGE_ALT="docker.io/library/node:22"
@@ -1978,6 +1987,9 @@ cmd_host_allow_remove() {
   jq --arg p "$pkg" 'del(.packages[$p])' "$HOST_ALLOW_FILE" > "$tmp"
   mv "$tmp" "$HOST_ALLOW_FILE"
   info "removed $pkg from host-allow"
+  # Only after the removal succeeded, and with the key the store actually
+  # used: status must stop reporting a decision the operator has just made.
+  host_allow_digest_drop_entry "$pkg"
 }
 
 cmd_host_allow_update() {
@@ -2154,52 +2166,28 @@ host_allow_review_usage() {
   fi
 }
 
-host_allow_review_repo_dir() {
-  # Where the digest note lands: the safe repo's inbox. Mirrors bin/safe's
-  # report_fp_repo_dir contract — an explicitly configured SAFE_REPO_DIR is
-  # authoritative (if it is wrong, that is an error, not a licence to fall
-  # back to a checkout nobody is watching).
-  if [[ -n "${SAFE_REPO_DIR:-}" ]]; then
-    [[ -d "$SAFE_REPO_DIR/.git" && -d "$SAFE_REPO_DIR/bin" ]] || return 1
-    (cd "$SAFE_REPO_DIR" && pwd)
-    return 0
-  fi
-  local script_dir candidate
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  for candidate in "$script_dir/.." "$HOME/dev/personal/safe"; do
-    [[ -d "$candidate/.git" && -d "$candidate/bin" ]] || continue
-    (cd "$candidate" && pwd)
-    return 0
-  done
-  return 1
-}
+# The report's summary shape, defined once. The review computes it after
+# probing and `host-allow remove` recomputes it after dropping an entry from
+# the digest; a second copy would drift the day a status is added. Applied to
+# an ARRAY of entries.
+HOST_ALLOW_SUMMARY_JQ='{
+       total: length,
+       removable: [.[] | select(.status == "removable")] | length,
+       keep: [.[] | select(.status == "keep")] | length,
+       "review-urgent": [.[] | select(.status == "review-urgent")] | length,
+       unknown: [.[] | select(.status == "unknown")] | length,
+       unaudited: [.[] | select(.status == "unaudited")] | length,
+       never_used: [.[] | select(.never_used)] | length}'
 
-host_allow_review_write_digest() {
-  # Writes the digest inbox note when the review found decisions to queue.
-  # The note is the nudge; nothing is removed automatically.
+host_allow_digest_render_md() {
+  # The rendered half of the digest, from the same report JSON status reads.
+  # Shared by --digest and by the removal hook, so the two never diverge.
   local report_json="$1"
-  local actionable
-  actionable=$(jq -r '(.summary.removable + .summary."review-urgent")' <<<"$report_json")
-  if (( actionable == 0 )); then
-    info "digest: nothing actionable (no removable or review-urgent entries); no note written"
-    return 0
-  fi
-  local repo_dir
-  if ! repo_dir=$(host_allow_review_repo_dir); then
-    err "digest: safe's repo is not on this machine (set SAFE_REPO_DIR); no note written"
-    return 1
-  fi
-  local note="$repo_dir/inbox/$(date -I)-safe-host-allow-digest.md"
-  if [[ -f "$note" ]]; then
-    info "digest: $note already exists; not overwriting"
-    return 0
-  fi
-  mkdir -p "$repo_dir/inbox"
   jq -r '
     def row: "| \(.name)@\(.version) | \(.ecosystem) | \(.age_days)d | \(.times_used) | \(.last_used // "never") | \(.status) |";
     "# Host-allow review digest — " + (.generated | split("T")[0]),
     "",
-    "**Source:** `safe run host-allow review --digest` (automated)",
+    "**Source:** `safe run host-allow review --digest` (automated; regenerated every run)",
     "",
     "## Summary",
     "",
@@ -2219,10 +2207,113 @@ host_allow_review_write_digest() {
         | "- `\(.name)@\(.version)` audits GO on its own — removable: `safe run host-allow remove \(.name)`"]
       | .[] ),
     "",
-    "Removal is operator-only (TTY-gated); this digest only queues the decisions.",
+    "Removal is operator-only (TTY-gated); this digest only reports the decisions.",
     "Statuses marked `unknown` reflect audit-infrastructure failure — retry later, never treat as stale."
-  ' <<<"$report_json" > "$note"
-  info "digest written: $note"
+  ' <<<"$report_json"
+}
+
+host_allow_digest_publish() {
+  # Both halves of the digest, each replaced atomically: staged BESIDE the
+  # target so the rename is a rename(2) and never a cross-filesystem
+  # copy-then-unlink a concurrent reader could catch mid-write (the scanner
+  # cache lesson, 1.54.0). The pair is deliberately not atomic together —
+  # nothing joins them, status reads only the JSON.
+  local report_json="$1"
+  local tmp_json tmp_md
+
+  if ! mkdir -p "$HOST_ALLOW_DIGEST_DIR"; then
+    err "digest: cannot create $HOST_ALLOW_DIGEST_DIR; nothing was written"
+    return 1
+  fi
+
+  tmp_json=$(stage_beside "$HOST_ALLOW_DIGEST_JSON")
+  if ! jq . <<<"$report_json" > "$tmp_json" || ! mv "$tmp_json" "$HOST_ALLOW_DIGEST_JSON"; then
+    rm -f "$tmp_json"
+    err "digest: cannot write $HOST_ALLOW_DIGEST_JSON"
+    return 1
+  fi
+
+  tmp_md=$(stage_beside "$HOST_ALLOW_DIGEST_MD")
+  if ! host_allow_digest_render_md "$report_json" > "$tmp_md" || ! mv "$tmp_md" "$HOST_ALLOW_DIGEST_MD"; then
+    rm -f "$tmp_md"
+    err "digest: cannot write $HOST_ALLOW_DIGEST_MD"
+    return 1
+  fi
+  return 0
+}
+
+host_allow_review_write_digest() {
+  # ALWAYS writes, including when nothing is actionable: the digest is a status
+  # surface reflecting the latest review, not a nudge queue. A run that found
+  # nothing must overwrite yesterday's findings, or `safe status` keeps
+  # reporting decisions that no longer exist.
+  local report_json="$1"
+  local actionable
+
+  host_allow_digest_publish "$report_json" || return 1
+
+  actionable=$(jq -r '(.summary.removable + .summary."review-urgent")' <<<"$report_json")
+  if (( actionable == 0 )); then
+    info "digest: nothing actionable; wrote $HOST_ALLOW_DIGEST_JSON and $HOST_ALLOW_DIGEST_MD"
+  else
+    info "digest: $actionable actionable; wrote $HOST_ALLOW_DIGEST_JSON and $HOST_ALLOW_DIGEST_MD"
+  fi
+}
+
+host_allow_digest_drop_entry() {
+  # A handled decision stops being reported. Mechanical only — the entry is
+  # dropped and the counts recomputed, with no re-audit and no network, so a
+  # removal never depends on audit infrastructure being up. The digest is a
+  # convenience surface: an absent, unreadable, or unrelated digest is a no-op
+  # here, never a failed removal (the N1 sibling class).
+  local pkg="$1"
+  local present updated
+
+  [[ -f "$HOST_ALLOW_DIGEST_JSON" ]] || return 0
+  present=$(jq -r --arg p "$pkg" '[.entries[]? | select(.name == $p)] | length' \
+    "$HOST_ALLOW_DIGEST_JSON" 2>/dev/null) || return 0
+  [[ "$present" =~ ^[0-9]+$ ]] || return 0
+  (( present > 0 )) || return 0
+
+  updated=$(jq -c --arg p "$pkg" '
+    .entries |= map(select(.name != $p))
+    | .summary = (.entries | '"$HOST_ALLOW_SUMMARY_JQ"')' \
+    "$HOST_ALLOW_DIGEST_JSON" 2>/dev/null) || return 0
+  [[ -n "$updated" ]] || return 0
+
+  host_allow_digest_publish "$updated" || return 0
+  info "digest: dropped $pkg and recomputed counts"
+}
+
+host_allow_digest_status_lines() {
+  # The digest as `safe run status` (and, through it, `safe status`) reports
+  # it. Three states, all of them legible: actionable, quiet, never run. A
+  # present-but-unreadable digest shows a marker rather than reading as "no
+  # findings" — the store_count precedent (N3).
+  local fields removable urgent generated
+
+  if [[ ! -f "$HOST_ALLOW_DIGEST_JSON" ]]; then
+    printf "review digest:  no review has run yet (safe run host-allow review --digest)\n"
+    return 0
+  fi
+  fields=$(jq -r '
+    [(.summary.removable // "?"), (.summary."review-urgent" // "?"),
+     ((.generated // "") | split("T")[0])] | @tsv' \
+    "$HOST_ALLOW_DIGEST_JSON" 2>/dev/null) || fields=""
+  IFS=$'\t' read -r removable urgent generated <<<"$fields"
+  if [[ ! "$removable" =~ ^[0-9]+$ || ! "$urgent" =~ ^[0-9]+$ ]]; then
+    printf "review digest:  UNREADABLE at %s — rerun: safe run host-allow review --digest\n" \
+      "$HOST_ALLOW_DIGEST_JSON"
+    return 0
+  fi
+  [[ -n "$generated" ]] || generated="unknown date"
+  if (( removable + urgent == 0 )); then
+    printf "review digest:  nothing actionable (reviewed %s)\n" "$generated"
+    return 0
+  fi
+  printf "review digest:  %s removable, %s review-urgent (reviewed %s)\n" \
+    "$removable" "$urgent" "$generated"
+  printf "                details: safe run host-allow review — then: safe run host-allow remove <name>\n"
 }
 
 cmd_host_allow_review() {
@@ -2298,14 +2389,7 @@ cmd_host_allow_review() {
 
   report_json=$(jq -sc --arg generated "$(now_iso)" '
     {generated:$generated, entries:.,
-     summary:{
-       total: length,
-       removable: [.[] | select(.status == "removable")] | length,
-       keep: [.[] | select(.status == "keep")] | length,
-       "review-urgent": [.[] | select(.status == "review-urgent")] | length,
-       unknown: [.[] | select(.status == "unknown")] | length,
-       unaudited: [.[] | select(.status == "unaudited")] | length,
-       never_used: [.[] | select(.never_used)] | length}}' "$entries_tmp")
+     summary:'"$HOST_ALLOW_SUMMARY_JQ"'}' "$entries_tmp")
   rm -f "$entries_tmp"
 
   if (( json_mode )); then
@@ -2629,6 +2713,7 @@ cmd_status() {
   printf "sandbox-known:  %s\n" "$sandbox_count"
   printf "install-known:  %s (recorded clean install checks)\n" "$install_count"
   printf "blocked:        %s\n" "$blocked_count"
+  host_allow_digest_status_lines
   echo
   if podman_available; then
     echo "podman: $(podman --version)"
