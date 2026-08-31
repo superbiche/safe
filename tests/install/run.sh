@@ -2790,11 +2790,26 @@ case_npm_lockdiff_refuses_hidden_config_expansion() {
   assert_err_contains_fragment 'the command line sets //registry.example/:_authToken, which npm does not report as a setting' "$FUNCNAME (argv)" || return
   assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (argv)" || return
 
-  # An environment-carried hidden setting, same rule.
+  # An environment-carried VISIBLE setting is parity's jurisdiction like any
+  # other: npm reports globalconfig, so the reference is verified by comparing
+  # resolved values rather than refused here.
   : > "${LOG_FILE}"
   npm_config_globalconfig='/abs/${PWD}/npmrc' NPM_LOCK_MUTATION_JSON="${lock}" \
     SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
   assert_status 0 "$FUNCNAME (visible env key delegates)" || return
+  assert_err_not_contains_fragment 'hides from its own config report' "$FUNCNAME (visible env key delegates)" || return
+
+  # An environment-carried HIDDEN credential is the env surface's real case:
+  # npm reports no such key, so nothing can verify it resolves identically.
+  : > "${LOG_FILE}"
+  npm_config__authToken='${PWD}' NPM_LOCK_MUTATION_JSON="${lock}" \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME (hidden env credential)" || return
+  assert_err_contains_fragment 'npm_config__authToken sets' "$FUNCNAME (hidden env credential)" || return
+  assert_err_contains_fragment 'a setting npm hides from its own config report' "$FUNCNAME (hidden env credential)" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME (hidden env credential)"; return 1; }
+  assert_log_not_contains_fragment $'PROJECTION\tnpm\t' "$FUNCNAME (hidden env credential)" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (hidden env credential)" || return
 
   # A VISIBLE key is parity's jurisdiction, not this guard's: it passes here
   # and the comparison of npm-resolved values is what refuses it.
