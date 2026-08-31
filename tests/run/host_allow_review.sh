@@ -183,6 +183,23 @@ jq -e '.summary.removable == 0 and .summary."review-urgent" == 0 and .summary.to
   "$digest_json" >/dev/null || fail "nothing-actionable digest has wrong counts: $(jq -c '.summary' "$digest_json")"
 pass "a review with nothing actionable still writes the digest, with zero counts"
 
+# The shape the weekly timer hits on a brand-new machine: no host-allow store
+# at all. It must produce a valid zero digest — that machine is exactly where
+# the old repo-inbox destination produced nothing.
+mv "$tmp/config/host-allow.json" "$tmp/host-allow.json.keep"
+run_review --digest >/dev/null 2>&1 || fail "--digest failed with no host-allow store"
+jq -e '.summary.total == 0 and (.entries | length) == 0' "$digest_json" >/dev/null \
+  || fail "empty-store digest is not a zero report: $(jq -c '.summary' "$digest_json")"
+grep -q '^0 entries' "$digest_md" || fail "empty-store digest markdown missing its zero summary"
+mv "$tmp/host-allow.json.keep" "$tmp/config/host-allow.json"
+pass "a machine with no host-allow store still gets a valid zero digest"
+
+# Each half is staged beside its target and renamed — a reader never sees a
+# partial digest, and a completed run leaves no staging file behind.
+residue=$(find "$tmp/safe-config/audit" -name 'host-allow-digest.*.??????' -print -quit)
+[[ -z "$residue" ]] || fail "digest left a staging file behind: $residue"
+pass "digest writes leave no staging residue"
+
 # --- status renders the digest --------------------------------------------
 printf '{"runners":{}}\n' > "$tmp/config/config.json"
 out=$(run_safe_run status 2>/dev/null)
