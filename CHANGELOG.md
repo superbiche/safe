@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **govulncheck coverage was structurally broken on every real Go project, and
+  now works** (1.55.0). The lane validated `govulncheck -json` as NDJSON —
+  split on newlines, every non-blank line must parse — but govulncheck emits a
+  stream of concatenated PRETTY-PRINTED documents, one object spread across
+  many lines, and always has. A clean scan of this repo (172 documents, exit 0)
+  had 14,105 of its 14,492 lines rejected, so the lane reported
+  `govulncheck: error (govulncheck failed (exit 0))` and the gate warned that
+  govulncheck coverage was missing. Every live Go scan hit this; the hermetic
+  stubs emitted single-line records, which is why the suite stayed green. The
+  stream is now slurped as the concatenated documents it is (`jq -s`, compact
+  documents included), which keeps the property that mattered: a run that died
+  mid-document is still a parse failure and still an error, never a confident
+  "zero findings".
+  - **A scanner that exited 0 no longer reports as having failed.** The
+    ecosystem-audit error note read `<scanner> failed (exit 0)` whenever the
+    output — not the scanner — was what could not be validated, which reads as
+    the tool having broken when it had not. That path now says
+    `<scanner> output validation failed (scanner exit 0)`; the status stays
+    `error` and the nonzero-exit wording is unchanged. It applies to every
+    ecosystem lane, since they share the renderer.
+
 - **The scanner cache is replaced atomically, so a concurrent scan can no
   longer refuse on scanners that are installed** (1.54.0). `safe audit`
   intermittently failed the gate closed with `missing required scanners:

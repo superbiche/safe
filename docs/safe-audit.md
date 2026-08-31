@@ -285,7 +285,15 @@ hid every dev-only advisory.
 
 `govulncheck` is required to exit 0: in `-json` mode it reports findings in
 the stream, so a nonzero exit means the run itself failed, whatever prefix it
-managed to write.
+managed to write. That stream is a sequence of **concatenated JSON documents**,
+each pretty-printed across many lines — not NDJSON — and safe slurps it as
+such. A stream that stops mid-document still fails to parse and is still an
+`error`; a run whose findings were truncated is never reported as clean.
+
+A scanner that exited 0 but whose output could not be validated says exactly
+that (`output validation failed (scanner exit 0)`) rather than
+`failed (exit 0)`: the status is still `error`, but the note names the output
+as what broke instead of implying the tool did.
 
 `safe audit machine-audit --allow-missing-tools` turns a missing ecosystem auditor from
 an abort into a reported gap. Callers that gate on the result document

@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.3.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.54.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.55.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -2072,7 +2072,9 @@ def audit_doc($scanner; $sevs):
 
 # ecosystem_audit_error <scanner> <exit-code> <stderr-file> <output>
 # The note always contains "failed": consumers key their infrastructure
-# refusal off the status, older readers off the note.
+# refusal off the status, older readers off the note. A scanner that exited 0
+# and whose OUTPUT is what we could not read says so — "failed (exit 0)"
+# contradicts itself and reads as the scanner having broken when it had not.
 ecosystem_audit_error() {
   local scanner="$1" rc="$2" stderr_file="$3" output="$4"
   local detail=""
@@ -2080,8 +2082,12 @@ ecosystem_audit_error() {
     detail="$(tr -d '\r' < "$stderr_file" | grep -v '^[[:space:]]*$' | tail -n 1)"
     detail="${detail:0:160}"
   fi
+  local reason="${scanner} failed (exit ${rc})"
+  if (( rc == 0 )); then
+    reason="${scanner} output validation failed (scanner exit 0)"
+  fi
   printf '%s\n' "$(render_ecosystem_audit_json "$scanner" "error" 0 0 0 0 0 \
-    "${scanner} failed (exit ${rc})${detail:+: ${detail}}" 0)" > "$output"
+    "${reason}${detail:+: ${detail}}" 0)" > "$output"
 }
 
 run_npm_audit_dir() {
@@ -2187,24 +2193,23 @@ run_govulncheck_dir() {
     ecosystem_audit_error "govulncheck" "$rc" "$output.stderr" "$output"
     return 0
   fi
-  # NDJSON, and every non-blank line must parse. Tolerating unparsable lines
-  # would turn a stream that died halfway — config record written, findings
-  # truncated — into a confident "zero findings". The stream must also look
-  # like govulncheck: at least one record it actually emits.
-  jq -Rs "$ECO_AUDIT_JQ_DEFS"'
-    ( split("\n") | map(select(test("[^[:space:]]"))) ) as $lines
-    | ( $lines | map(fromjson? // null) ) as $parsed
-    | if ($parsed | length) == 0 then error("empty govulncheck stream") else . end
-    | if ($parsed | map(select(. == null)) | length) > 0
-      then error("unparsable govulncheck records") else . end
-    | if ([ $parsed[] | select(type == "object")
+  # The stream is CONCATENATED JSON DOCUMENTS, pretty-printed across many lines
+  # each — not NDJSON. `jq -s` slurps that shape natively (compact documents
+  # too), and jq refusing the stream is the property to keep: a run that died
+  # halfway leaves a truncated document, so "config record written, findings
+  # lost" can never be read as a confident "zero findings". The stream must
+  # also look like govulncheck: at least one record it actually emits.
+  jq -s "$ECO_AUDIT_JQ_DEFS"'
+    . as $docs
+    | if ($docs | length) == 0 then error("empty govulncheck stream") else . end
+    | if ([ $docs[] | select(type == "object")
             | select(has("config") or has("progress") or has("osv") or has("finding")) ] | length) == 0
       then error("stream is not govulncheck output") else . end
-    | ( [ $parsed[] | select(type == "object") | select(has("finding"))
+    | ( [ $docs[] | select(type == "object") | select(has("finding"))
           | (.finding.osv // "unknown") ] | unique ) as $ids
     | [ $ids[] | "unknown" ] as $sevs
     | audit_doc("govulncheck"; $sevs)
-  ' < "$output.raw" > "$output" 2>/dev/null || ecosystem_audit_error "govulncheck" "$rc" "$output.stderr" "$output"
+  ' "$output.raw" > "$output" 2>/dev/null || ecosystem_audit_error "govulncheck" "$rc" "$output.stderr" "$output"
 }
 
 run_pip_audit_dir() {
@@ -4066,7 +4071,9 @@ def audit_doc($scanner; $sevs):
 
 # ecosystem_audit_error <scanner> <exit-code> <stderr-file> <output>
 # The note always contains "failed": consumers key their infrastructure
-# refusal off the status, older readers off the note.
+# refusal off the status, older readers off the note. A scanner that exited 0
+# and whose OUTPUT is what we could not read says so — "failed (exit 0)"
+# contradicts itself and reads as the scanner having broken when it had not.
 ecosystem_audit_error() {
   local scanner="$1" rc="$2" stderr_file="$3" output="$4"
   local detail=""
@@ -4074,8 +4081,12 @@ ecosystem_audit_error() {
     detail="$(tr -d '\r' < "$stderr_file" | grep -v '^[[:space:]]*$' | tail -n 1)"
     detail="${detail:0:160}"
   fi
+  local reason="${scanner} failed (exit ${rc})"
+  if (( rc == 0 )); then
+    reason="${scanner} output validation failed (scanner exit 0)"
+  fi
   printf '%s\n' "$(render_ecosystem_audit_json "$scanner" "error" 0 0 0 0 0 \
-    "${scanner} failed (exit ${rc})${detail:+: ${detail}}" 0)" > "$output"
+    "${reason}${detail:+: ${detail}}" 0)" > "$output"
 }
 
 run_npm_audit_dir() {
@@ -4181,24 +4192,23 @@ run_govulncheck_dir() {
     ecosystem_audit_error "govulncheck" "$rc" "$output.stderr" "$output"
     return 0
   fi
-  # NDJSON, and every non-blank line must parse. Tolerating unparsable lines
-  # would turn a stream that died halfway — config record written, findings
-  # truncated — into a confident "zero findings". The stream must also look
-  # like govulncheck: at least one record it actually emits.
-  jq -Rs "$ECO_AUDIT_JQ_DEFS"'
-    ( split("\n") | map(select(test("[^[:space:]]"))) ) as $lines
-    | ( $lines | map(fromjson? // null) ) as $parsed
-    | if ($parsed | length) == 0 then error("empty govulncheck stream") else . end
-    | if ($parsed | map(select(. == null)) | length) > 0
-      then error("unparsable govulncheck records") else . end
-    | if ([ $parsed[] | select(type == "object")
+  # The stream is CONCATENATED JSON DOCUMENTS, pretty-printed across many lines
+  # each — not NDJSON. `jq -s` slurps that shape natively (compact documents
+  # too), and jq refusing the stream is the property to keep: a run that died
+  # halfway leaves a truncated document, so "config record written, findings
+  # lost" can never be read as a confident "zero findings". The stream must
+  # also look like govulncheck: at least one record it actually emits.
+  jq -s "$ECO_AUDIT_JQ_DEFS"'
+    . as $docs
+    | if ($docs | length) == 0 then error("empty govulncheck stream") else . end
+    | if ([ $docs[] | select(type == "object")
             | select(has("config") or has("progress") or has("osv") or has("finding")) ] | length) == 0
       then error("stream is not govulncheck output") else . end
-    | ( [ $parsed[] | select(type == "object") | select(has("finding"))
+    | ( [ $docs[] | select(type == "object") | select(has("finding"))
           | (.finding.osv // "unknown") ] | unique ) as $ids
     | [ $ids[] | "unknown" ] as $sevs
     | audit_doc("govulncheck"; $sevs)
-  ' < "$output.raw" > "$output" 2>/dev/null || ecosystem_audit_error "govulncheck" "$rc" "$output.stderr" "$output"
+  ' "$output.raw" > "$output" 2>/dev/null || ecosystem_audit_error "govulncheck" "$rc" "$output.stderr" "$output"
 }
 
 run_pip_audit_dir() {
