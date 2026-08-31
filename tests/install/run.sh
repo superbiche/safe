@@ -465,12 +465,19 @@ EOF
     chmod +x "${wrapper_dir}/${tool}"
   done
   # The mise wrapper carries the argv0-dispatch branch: mise shims are
-  # symlinks to whatever `mise` resolves to, and a shim dispatch must reach
-  # the real binary with argv[0] intact, never the gate.
+  # symlinks to whatever `mise` resolves to, so a shim named after a gated
+  # tool enters the gate under that name, and every other shim reaches the
+  # real binary with argv[0] intact, never the gate.
   cat > "${wrapper_dir}/mise" <<'EOF'
 #!/usr/bin/env bash
 # safe-gate-wrapper v1 tool=mise
-if [[ "${0##*/}" != "mise" ]]; then
+__safe_gated_argv0s=(npm pnpm pnpx yarn bun pip pip3 uv cargo go composer)
+__safe_argv0="${0##*/}"
+if [[ "$__safe_argv0" != "mise" ]]; then
+  for __t in "${__safe_gated_argv0s[@]}"; do
+    [[ "$__safe_argv0" == "$__t" ]] || continue
+    exec safe gate "$__safe_argv0" -- "$@"
+  done
   IFS=: read -ra __dirs <<< "$PATH"
   for __d in "${__dirs[@]}"; do
     [[ -n "$__d" ]] || continue
@@ -480,7 +487,7 @@ if [[ "${0##*/}" != "mise" ]]; then
     LC_ALL=C head -n 2 -- "$__c" 2>/dev/null | grep -q '^# safe-gate-wrapper' && continue
     exec -a "$0" "$__c" "$@"
   done
-  printf 'safe gate: real mise not found on PATH (argv0 dispatch for %s)\n' "${0##*/}" >&2
+  printf 'safe gate: real mise not found on PATH (argv0 dispatch for %s)\n' "$__safe_argv0" >&2
   exit 127
 fi
 exec safe gate mise -- "$@"
@@ -3729,15 +3736,39 @@ case_gate_exec_delegates_through_a_wrapped_mise_shim() {
 printf 'REALMISE args=%s\n' "$*"
 STUB
   chmod +x "${realbin}/mise"
+  # Loop-freedom evidence (1.56.0): pnpm is a GATED argv[0], so a delegate exec
+  # of the shim itself would bounce straight back into `safe gate pnpm` —
+  # wrapper -> gate -> shim -> wrapper, forever. exec_real must reach the real
+  # mise directly instead, so this recorder must stay empty.
+  local gatelog="${WORK_DIR}/reentry.log"
+  : > "${gatelog}"
+  cat > "${wrap}/safe" <<STUB
+#!/usr/bin/env bash
+printf 'REENTRY\t%s\n' "\$*" >> "${gatelog}"
+STUB
+  chmod +x "${wrap}/safe"
 
   local out
   out="$(PATH="${wrap}:${shimdir}:${realbin}:/usr/bin:/bin" GATE_LIB="${ROOT_DIR}/lib/gate-lib.sh" \
     bash -c 'source "${GATE_LIB}"; safe_gate_exec_real pnpm --version' 2>&1)"
-  # The shim dispatches argv0=pnpm through the wrapper's preamble to the real
-  # mise, which receives the delegate's args. Any gate re-entry or dispatch
-  # failure surfaces as different output (or the preamble's 127 message).
+  # The delegate is the real mise, which receives the tool's args. Any gate
+  # re-entry or dispatch failure surfaces as different output (or the
+  # preamble's 127 message).
   if [[ "$out" != "REALMISE args=--version" ]]; then
     printf 'got: %s\n' "$out" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  if [[ -s "${gatelog}" ]]; then
+    printf 're-entered the gate: %s\n' "$(cat "${gatelog}")" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  # A shebang-script stub cannot OBSERVE the preserved argv[0] — the kernel
+  # rebuilds argv for the interpreter of a script, so only a native binary
+  # (like the real mise) receives it, and argv[0] is what mise multiplexes on.
+  # Pin the argv0-preserving exec form itself, as the wrapper case does.
+  if ! grep -Fq 'exec -a "$exec_argv0" "$real" "$@"' "${ROOT_DIR}/lib/gate-lib.sh"; then
     fail "$FUNCNAME"
     return
   fi
@@ -5984,6 +6015,138 @@ case_mise_wrapper_helper_matches_installer_output() {
   pass "$FUNCNAME"
 }
 
+case_mise_wrapper_gates_a_gated_argv0() {
+  # The hole closed in 1.56.0 (2026-08-31): a mise shim whose name is itself a
+  # GATED tool forwarded to the real installer with zero audit, so on any PATH
+  # carrying the shims dir `npm install` and `yarn install` ran unaudited while
+  # the same command through $BIN_DIR audited. That argv[0] must enter the gate
+  # under its own tool name. Driven against the INSTALLER's wrapper, not the
+  # suite's copy of it.
+  local dir="${TEST_ROOT}/${FUNCNAME}"
+  mkdir -p "${dir}/home" "${dir}/stub" "${dir}/real"
+  HOME="${dir}/home" SAFE_ZSHRC="${dir}/zshrc" bash "${ROOT_DIR}/install.sh" --wrappers >/dev/null 2>&1
+  local wrapper="${dir}/home/.local/bin/mise"
+  [[ -x "${wrapper}" ]] || { fail "$FUNCNAME"; return; }
+
+  cat > "${dir}/stub/safe" <<STUB
+#!/usr/bin/env bash
+printf 'SAFEARGV\t%s\n' "\$*" >> "${dir}/argv.log"
+STUB
+  chmod +x "${dir}/stub/safe"
+  # A real mise the forward-to-mise branch would reach: if the gated name took
+  # that branch instead, REALMISE lands on stdout and the log stays empty.
+  cat > "${dir}/real/mise" <<'STUB'
+#!/usr/bin/env bash
+printf 'REALMISE args=%s\n' "$*"
+STUB
+  chmod +x "${dir}/real/mise"
+  ln -s "${wrapper}" "${dir}/stub/npm"
+  : > "${dir}/argv.log"
+
+  local out
+  out=$(PATH="${dir}/stub:${dir}/real:/usr/bin:/bin" "${dir}/stub/npm" install cowsay@1.5.0 2>&1)
+  if [[ -n "$out" ]]; then
+    printf 'gated argv0 did not enter the gate: %s\n' "$out" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  if ! grep -Fqx "$(printf 'SAFEARGV\tgate npm -- install cowsay@1.5.0')" "${dir}/argv.log"; then
+    printf 'argv log: %s\n' "$(cat "${dir}/argv.log")" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
+case_mise_shims_ahead_of_the_gate_still_audit() {
+  # The reported production shape: `mise activate` in a non-interactive shell
+  # and agent harness PATHs put the shims dir AHEAD of $BIN_DIR, so a bare
+  # `npm install` resolves to the shim rather than to the npm wrapper. It must
+  # still reach `safe gate npm`.
+  local dir="${TEST_ROOT}/${FUNCNAME}"
+  mkdir -p "${dir}/home" "${dir}/shims" "${dir}/stub" "${dir}/real"
+  HOME="${dir}/home" SAFE_ZSHRC="${dir}/zshrc" bash "${ROOT_DIR}/install.sh" --wrappers >/dev/null 2>&1
+  ln -s "${dir}/home/.local/bin/mise" "${dir}/shims/npm"
+
+  cat > "${dir}/stub/safe" <<STUB
+#!/usr/bin/env bash
+printf 'SAFEARGV\t%s\n' "\$*" >> "${dir}/argv.log"
+STUB
+  chmod +x "${dir}/stub/safe"
+  cat > "${dir}/real/mise" <<'STUB'
+#!/usr/bin/env bash
+printf 'REALMISE args=%s\n' "$*"
+STUB
+  chmod +x "${dir}/real/mise"
+  : > "${dir}/argv.log"
+
+  local out
+  out=$(PATH="${dir}/stub:${dir}/shims:${dir}/home/.local/bin:${dir}/real:/usr/bin:/bin" \
+    bash -c 'npm install cowsay@1.5.0' 2>&1)
+  if [[ -n "$out" ]]; then
+    printf 'shims-first npm did not enter the gate: %s\n' "$out" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  if ! grep -Fqx "$(printf 'SAFEARGV\tgate npm -- install cowsay@1.5.0')" "${dir}/argv.log"; then
+    printf 'argv log: %s\n' "$(cat "${dir}/argv.log")" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  pass "$FUNCNAME"
+}
+
+case_install_normalizes_mise_shims() {
+  # Coverage depends on the shims pointing at the wrapper: a shims dir bound to
+  # the real mise never runs it, and the gated-argv0 dispatch above never fires.
+  local dir="${TEST_ROOT}/${FUNCNAME}"
+  local home="${dir}/home" shims="${dir}/home/.local/share/mise/shims"
+  mkdir -p "${shims}" "${dir}/real"
+  printf '#!/usr/bin/env bash\necho real-mise\n' > "${dir}/real/mise"
+  chmod +x "${dir}/real/mise"
+  ln -s "${dir}/real/mise" "${shims}/npm"
+  ln -s "${dir}/real/mise" "${shims}/node"
+  printf '#!/usr/bin/env bash\n# somebody else\n' > "${shims}/keepme"
+  chmod +x "${shims}/keepme"
+
+  HOME="${home}" SAFE_ZSHRC="${dir}/zshrc" bash "${ROOT_DIR}/install.sh" --wrappers \
+    >"${dir}/out" 2>"${dir}/err"
+  local install_status=$?
+  if [[ "${install_status}" -ne 0 ]]; then
+    printf 'install exited %s\n' "${install_status}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  local wrapper="${home}/.local/bin/mise"
+  [[ "${shims}/npm" -ef "${wrapper}" ]] || { fail "$FUNCNAME"; return; }
+  [[ "${shims}/node" -ef "${wrapper}" ]] || { fail "$FUNCNAME"; return; }
+  # A regular file in that directory is not something mise generated: it is
+  # never rewritten, and the count says so.
+  [[ ! -L "${shims}/keepme" ]] || { fail "$FUNCNAME"; return; }
+  grep -Fqx '# somebody else' "${shims}/keepme" || { fail "$FUNCNAME"; return; }
+  grep -Fq '2 re-pointed at the gate wrapper' "${dir}/err" || { fail "$FUNCNAME"; return; }
+  grep -Fq '1 non-symlink left alone' "${dir}/err" || { fail "$FUNCNAME"; return; }
+
+  # Second install: the shims are already bound, so nothing is rewritten.
+  HOME="${home}" SAFE_ZSHRC="${dir}/zshrc" bash "${ROOT_DIR}/install.sh" --wrappers \
+    >"${dir}/out2" 2>"${dir}/err2"
+  grep -Fq '0 re-pointed at the gate wrapper, 2 already bound' "${dir}/err2" || { fail "$FUNCNAME"; return; }
+
+  # A $BIN_DIR/mise that is NOT our wrapper is never a re-point target:
+  # binding 36 shims to a foreign file is the 2026-08-02 breakage itself.
+  local foreign="${dir}/foreign"
+  local foreign_shims="${foreign}/.local/share/mise/shims"
+  mkdir -p "${foreign}/.local/bin" "${foreign_shims}"
+  printf '#!/usr/bin/env bash\n# not ours\n' > "${foreign}/.local/bin/mise"
+  chmod +x "${foreign}/.local/bin/mise"
+  ln -s "${dir}/real/mise" "${foreign_shims}/npm"
+  HOME="${foreign}" SAFE_ZSHRC="${dir}/zshrc2" bash "${ROOT_DIR}/install.sh" --wrappers \
+    >"${dir}/out3" 2>"${dir}/err3"
+  [[ "${foreign_shims}/npm" -ef "${dir}/real/mise" ]] || { fail "$FUNCNAME"; return; }
+  grep -Fq 'is not a safe gate wrapper' "${dir}/err3" || { fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
 case_uninstall_cleans_shell_and_legacy_binaries() {
   prepare_case "uninstall-cleans-shell-and-legacy-binaries"
   mkdir -p "${HOME_DIR}/.local/bin" "${HOME_DIR}/.local/share/zsh/site-functions" "${HOME_DIR}/.config/safe-run/completions" "${HOME_DIR}/.config/safe" "${HOME_DIR}/.local/share/safe"
@@ -6362,6 +6525,9 @@ main() {
     case_mise_wrapper_dispatches_foreign_argv0 \
     case_mise_wrapper_dispatch_without_real_mise_is_legible \
     case_mise_wrapper_helper_matches_installer_output \
+    case_mise_wrapper_gates_a_gated_argv0 \
+    case_mise_shims_ahead_of_the_gate_still_audit \
+    case_install_normalizes_mise_shims \
     case_uninstall_cleans_shell_and_legacy_binaries \
     case_safe_run_gated_tool_delegation
   do

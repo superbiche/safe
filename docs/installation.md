@@ -17,6 +17,7 @@ Default install mode is `--all`, which installs:
 - `safe`, plus compatibility component binaries, to `~/.local/bin`;
 - seed config under `~/.config/safe/run` and `~/.config/safe/audit`;
 - `~/.config/safe/install-wrappers.zsh`;
+- PATH gate wrappers in `~/.local/bin` for the gated tools;
 - zsh completion `~/.local/share/zsh/site-functions/_safe`;
 - `.zshrc` source and completion `fpath` lines when missing.
 
@@ -38,6 +39,20 @@ PATH gate wrappers. On an existing installation the gate library
 binary — the dispatcher and its routing library are one upgrade unit, so
 already-installed wrappers always load the library matching the installed
 `safe`.
+
+## mise Shims
+
+Wrapper installation also normalizes the mise shims directory
+(`${MISE_DATA_DIR:-~/.local/share/mise}/shims`) when it exists. mise's shims
+are symlinks to whatever `mise` resolved to at reshim time, and gate coverage
+under mise depends on them resolving to safe's mise wrapper: a shims directory
+still bound to the real mise lets a tool reached through it install unaudited.
+The installer re-points those symlinks at the wrapper and reports the counts.
+
+Regular files in that directory are left alone — they are not something mise
+generated — and nothing is re-pointed unless `~/.local/bin/mise` is safe's own
+wrapper, so a skipped or foreign `mise` never becomes the target of the whole
+shim fleet.
 
 ## First Run
 
