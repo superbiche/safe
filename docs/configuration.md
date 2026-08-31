@@ -196,7 +196,7 @@ Default machine config:
 
 Unknown machine names are treated as SSH host names.
 
-`tools.json` records scanner paths per machine. `safe audit setup` updates it after installing or detecting scanners.
+`tools.json` records scanner paths per machine. `safe audit setup` updates it after installing or detecting scanners, and every scan refreshes detection — but a refresh that finds what the cache already records does not rewrite the file. Replacements are atomic, so a concurrent reader never sees a partial cache. See [safe audit](safe-audit.md) for how the cache is read and what an unreadable one means.
 
 ## Important Environment Variables
 

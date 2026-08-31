@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.53.0"
+SAFE_VERSION="1.54.0"
 # Exported at the top level, not per-subcommand: safe-audit pins itself to
 # this version, and every route that reaches it — the gate, `safe audit ...`,
 # `safe install`, the safe-audit compatibility command — must carry it or the
@@ -1542,7 +1542,12 @@ safe_install_write_host_allow() {
   IFS=$'\t' read -r name version <<< "$(safe_install_split_spec "$package")"
   safe_install_ensure_host_allow_file
   host_allow_file="$(safe_install_host_allow_file)"
-  tmp="$(mktemp)"
+  # Staged beside the trust store, never in $TMPDIR: `mv` is an atomic rename
+  # only within one filesystem, and $TMPDIR is routinely a tmpfs. Across
+  # filesystems it degrades to copy-then-unlink, which leaves a concurrent
+  # reader — any gated install checking this grant — looking at a truncated
+  # trust store.
+  tmp="$(mktemp "$host_allow_file.XXXXXX")" || die "cannot stage a host-allow write next to $host_allow_file"
   jq --arg p "$name" --arg v "$version" --arg r "$reason" --arg d "$(date -I)" '
     .packages[$p] = {
       version: $v,

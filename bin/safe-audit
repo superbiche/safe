@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.3.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.53.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.54.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -399,9 +399,27 @@ json_is_single_object() {
 # cache here, before any read or write, so a poisoned file self-heals on the
 # next run. `json_is_single_object` rejects empty, garbage, non-object (`[]`)
 # and multi-document streams alike, so one predicate covers every broken shape.
+#
+# The reset is a self-heal, not a repair-anything: a path that cannot be
+# written at all — a directory sitting where the cache belongs, an unwritable
+# config dir — is local audit-infrastructure breakage, and an unguarded
+# redirect would fail it with a raw shell error under `set -e`. Say what broke
+# and how to fix it, in the same wording class every other infrastructure
+# failure uses, so it can never read as a scanner or package finding.
 ensure_tools_file() {
   json_is_single_object "$TOOLS_FILE" && return 0
-  printf '%s\n' '{}' > "$TOOLS_FILE"
+  # stderr is silenced BEFORE stdout is opened, and the order is the whole
+  # point: bash applies redirections left to right, so `> "$FILE" 2>/dev/null`
+  # lets the failed open write its own diagnostic to a still-live stderr, and
+  # the refusal arrives as two lines. The contract is one final line.
+  printf '%s\n' '{}' 2>/dev/null > "$TOOLS_FILE" || die_tool_cache_unusable
+}
+
+# One wording for both halves of "the scanner cache is not usable": a read that
+# jq cannot answer, and a reset that cannot be written. Neither is a missing
+# scanner, and neither may be reported as one.
+die_tool_cache_unusable() {
+  die "scanner cache unusable ($TOOLS_FILE) — audit-infrastructure breakage, not a package finding; repair or remove the file, then rerun"
 }
 
 ensure_dirs() {
@@ -624,8 +642,23 @@ tool_cache_entry() {
   jq -r --arg m "$1" '.[$m] // empty' "$TOOLS_FILE"
 }
 
+# Lenient read, for callers that have a fallback: `resolve_local_tool` probes
+# PATH and the standard install directories either way, so an unreadable cache
+# costs it nothing but a slower answer.
 tool_cache_path() {
   jq -r --arg m "$1" --arg t "$2" '.[$m][$t] // empty' "$TOOLS_FILE" 2>/dev/null || true
+}
+
+# Strict read, for the callers that DECIDE from the answer. jq exiting nonzero
+# ("the cache could not be read") and jq exiting zero with no output ("the tool
+# is not in the cache") are opposite facts, and the lenient read above flattens
+# both to the empty string. Downstream that made an unreadable cache — a
+# truncated file mid-replace, a directory in its place — report as "missing
+# required scanners", which is a policy refusal wearing the costume of a
+# scanner finding. Propagate jq's status instead and let the caller separate
+# breakage from absence.
+tool_cache_path_checked() {
+  jq -r --arg m "$1" --arg t "$2" '.[$m][$t] // empty' "$TOOLS_FILE" 2>/dev/null
 }
 
 # The directories a scanner is expected to live in on a machine safe manages.
@@ -688,8 +721,19 @@ tool_cache_set() {
   # output then clobbers tools.json for good. Validate the OUTPUT is an object
   # instead, and only then replace; a failure here is a real anomaly (a full
   # disk, a broken jq), so surface it rather than leave a half-written cache.
+  #
+  # The temp file is allocated BESIDE the cache, never in $TMPDIR. tools.json
+  # lives on the config filesystem while $TMPDIR is routinely a tmpfs, and a
+  # cross-device `mv` is not a rename: it is copy-then-unlink, so a concurrent
+  # reader observes the destination truncated. Every gated build's repo-audit
+  # preflight writes this file, so "concurrent" is the normal case, and the
+  # torn read then travelled the whole way to a fail-closed gate refusal —
+  # ensure_tools_file resetting the half-written file to `{}`, the cache read
+  # coming back empty, and the scan refusing with "missing required scanners"
+  # while both scanners sat installed. Same filesystem makes the `mv` a
+  # rename(2): readers see the old file or the new one, never half of either.
   ensure_tools_file
-  tmp=$(mktemp)
+  tmp=$(mktemp "$CONFIG_DIR/.tools.json.XXXXXX") || die_tool_cache_unusable
   if jq --arg m "$machine" --argjson entry "$entry_json" '.[$m] = $entry' "$TOOLS_FILE" > "$tmp" \
      && json_is_single_object "$tmp"; then
     mv "$tmp" "$TOOLS_FILE"
@@ -782,28 +826,51 @@ done
     done
   fi
 
-  tool_cache_set "$machine" "$(build_tool_entry_json "$osv" "$grype" "$syft" "$govulncheck" "$cargo_audit" "$pip_audit" "$socket")"
+  local entry_json cached_json
+  entry_json=$(build_tool_entry_json "$osv" "$grype" "$syft" "$govulncheck" "$cargo_audit" "$pip_audit" "$socket")
+
+  # Detection refreshes unconditionally on every scan, so in the steady state
+  # this rewrote a file it had just reproduced byte for byte. The replace is
+  # atomic now, so a write is no longer a correctness problem — but a write
+  # that changes nothing is still churn on a file the whole fleet reads, and
+  # skipping it makes the steady state genuinely quiet. This does NOT mean
+  # writes stop: a machine whose PATH resolves a scanner to a different path
+  # than the cache holds differs on every scan, and writes on every scan.
+  #
+  # jq equality, not string equality: the cached entry is pretty-printed by
+  # the jq that wrote it while build_tool_entry_json emits compact JSON, so
+  # every comparison would differ on whitespace alone and the skip would never
+  # fire. Compare the VALUES — key order and formatting immaterial.
+  if cached_json=$(tool_cache_entry "$machine" 2>/dev/null) && [[ -n "$cached_json" ]] \
+     && jq -n -e --argjson cached "$cached_json" --argjson fresh "$entry_json" \
+          '$cached == $fresh' >/dev/null 2>&1; then
+    vinfo "$machine: scanner cache already current; not rewriting $TOOLS_FILE"
+    return 0
+  fi
+
+  tool_cache_set "$machine" "$entry_json"
 }
 
 machine_missing_core_tools() {
-  local machine="$1"
-  local missing=()
-  local tool
-  for tool in osv-scanner grype syft; do
-    if [[ -z "$(tool_cache_path "$machine" "$tool")" ]]; then
-      missing+=("$tool")
-    fi
-  done
-  printf '%s\n' "${missing[*]:-}"
+  machine_missing_tools_from_list "$1" osv-scanner grype syft
 }
+
+# Prints the tools this machine's cache does not name. Returns
+# TOOL_CACHE_UNREADABLE_RC instead when the cache could not be READ at all —
+# there is no missing-tool list to print in that case, only breakage to fix,
+# and every caller must say so rather than name scanners. Callers guard the
+# command substitution (`x=$(...) || rc=$?`) so `set -e` cannot turn the
+# breakage into a silent exit.
+TOOL_CACHE_UNREADABLE_RC=3
 
 machine_missing_tools_from_list() {
   local machine="$1"
   shift
   local missing=()
-  local tool
+  local tool path
   for tool in "$@"; do
-    if [[ -z "$(tool_cache_path "$machine" "$tool")" ]]; then
+    path=$(tool_cache_path_checked "$machine" "$tool") || return "$TOOL_CACHE_UNREADABLE_RC"
+    if [[ -z "$path" ]]; then
       missing+=("$tool")
     fi
   done
@@ -834,8 +901,9 @@ warn_install_hints_for_tools() {
 
 warn_missing_scan_tools() {
   local machine="$1"
-  local missing
-  missing=$(machine_missing_core_tools "$machine")
+  local missing rc=0
+  missing=$(machine_missing_core_tools "$machine") || rc=$?
+  (( rc == 0 )) || die_tool_cache_unusable
   [[ -z "$missing" ]] && return 0
   warn "$machine missing required scanners: $missing"
   warn "$machine: install scanners manually after verification, or use a local bundle with: safe audit setup $(printf '%q' "$machine") --bundle <scanners.tar.gz>"
@@ -845,8 +913,13 @@ warn_missing_scan_tools() {
 confirm_scan_with_missing_tools() {
   local machine="$1"
   local project_target="${2:-}"
-  local missing
-  missing=$(machine_missing_core_tools "$machine")
+  local missing rc=0
+  # An unreadable cache is not an empty cache: reporting it as missing
+  # scanners would refuse the scan on a policy signal for what is really
+  # local breakage, and would send the operator installing scanners that are
+  # already there. Refuse on the breakage, with the repair.
+  missing=$(machine_missing_core_tools "$machine") || rc=$?
+  (( rc == 0 )) || die_tool_cache_unusable
   [[ -z "$missing" ]] && return 0
 
   local setup_cmd scan_cmd
@@ -2516,7 +2589,12 @@ build_scan_result_from_artifacts() {
   result_path=$(scan_result_path_for "$machine" "$stamp")
   build_tmp=$(mktemp)
   sbom_path=$(scan_sbom_path_for "$machine" "$stamp")
-  cp "$sbom_src" "$sbom_path"
+  # The SBOM is shared per machine per day exactly like the result document
+  # beside it, so it is published the same way. A bare `cp` fills the live
+  # path in place, and `safe audit diff` or any external reader landing in
+  # that window parses a partial document.
+  publish_json_atomically "$sbom_src" "$sbom_path" \
+    || die "cannot publish the SBOM to $sbom_path"
 
   local ecosystem_audits_json
   if [[ -f "$ecosystem_audits_file" ]]; then
@@ -2815,7 +2893,12 @@ build_scan_result_from_artifacts() {
   snapshot="$__scratch/snapshot"
   jq --argjson delta "$delta_json" '. + {delta: $delta}' "$build_tmp" > "$snapshot"
   rm -f "$build_tmp"
-  cp "$snapshot" "$result_path"
+  # Publishing is a replace of a SHARED path, so it gets the same treatment as
+  # every other one: stage beside the destination, then rename. A bare `cp`
+  # onto the live path leaves it truncated for as long as the copy takes, and
+  # `safe audit status` and the next scan's delta both read it.
+  publish_json_atomically "$snapshot" "$result_path" \
+    || die "cannot publish the scan result to $result_path"
 
   LAST_SCAN_RESULT_PATH="$result_path"
   LAST_SCAN_RESULT_SNAPSHOT="$snapshot"
@@ -2850,18 +2933,34 @@ build_scan_result_from_artifacts() {
 #     never cached at all.
 # --------------------------------------------------------------------------
 
+# Replace a shared path with a document, atomically. The staging file is
+# allocated in the DESTINATION's directory, never $TMPDIR: `mv` is a rename
+# only within one filesystem, and $TMPDIR is routinely a tmpfs while the paths
+# published here are not. Across filesystems `mv` degrades to copy-then-unlink
+# and a concurrent reader sees the destination truncated.
+#
+# It validates nothing: the caller owns the document's format. That is what
+# lets the result document and the CycloneDX SBOM share one publisher without
+# either of them being checked against the other's schema.
+publish_json_atomically() {
+  local source_doc="$1" dest="$2"
+  local dir tmp
+  dir="$(dirname -- "$dest")"
+  tmp="$(mktemp "$dir/.safe-publish.XXXXXX")" || return 1
+  if ! cp "$source_doc" "$tmp" || ! mv "$tmp" "$dest"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  return 0
+}
+
 # Deliver the caller's copy atomically: a reader watching the path sees either
 # no file or a complete document, never half of one.
 write_scan_result_out() {
   local source_doc="$1"
   [[ -n "$SCAN_RESULT_OUT" ]] || return 0
-  local dir tmp
-  dir="$(dirname -- "$SCAN_RESULT_OUT")"
-  tmp="$(mktemp "$dir/.safe-result.XXXXXX")" || die "cannot write scan result to $SCAN_RESULT_OUT"
-  if ! cp "$source_doc" "$tmp" || ! mv "$tmp" "$SCAN_RESULT_OUT"; then
-    rm -f "$tmp"
-    die "cannot write scan result to $SCAN_RESULT_OUT"
-  fi
+  publish_json_atomically "$source_doc" "$SCAN_RESULT_OUT" \
+    || die "cannot write scan result to $SCAN_RESULT_OUT"
   return 0
 }
 
@@ -7147,7 +7246,13 @@ revoke_install_known() {
   [[ -n "$entry_version" ]] || return 0
   for v in "$@"; do
     if [[ "$v" == "$entry_version" ]]; then
-      tmp=$(mktemp)
+      # Staged beside the receipts file, not in $TMPDIR: this is a shared path
+      # every gated install reads, and a cross-device `mv` would leave it
+      # truncated mid-replace. A staging failure is fatal, never a skip:
+      # silently not revoking would leave clean evidence standing against the
+      # adverse knowledge that just superseded it (PR#29 finding 5).
+      tmp=$(mktemp "$INSTALL_KNOWN_FILE.XXXXXX") \
+        || die "cannot stage a write next to $INSTALL_KNOWN_FILE — audit-infrastructure breakage, not a package finding; check the config directory and rerun"
       jq --arg k "$key" 'del(.packages[$k])' "$INSTALL_KNOWN_FILE" > "$tmp" && mv "$tmp" "$INSTALL_KNOWN_FILE"
       return 0
     fi
@@ -7170,7 +7275,9 @@ mark_install_known() {
   source_id=$(source_identity)
   mkdir -p "$SAFE_RUN_CONFIG_DIR"
   [[ -f "$INSTALL_KNOWN_FILE" ]] || printf '{"packages":{}}\n' > "$INSTALL_KNOWN_FILE"
-  tmp=$(mktemp)
+  # Staged beside the receipts file, fatal on failure — see revoke_install_known.
+  tmp=$(mktemp "$INSTALL_KNOWN_FILE.XXXXXX") \
+    || die "cannot stage a write next to $INSTALL_KNOWN_FILE — audit-infrastructure breakage, not a package finding; check the config directory and rerun"
   jq --arg k "$key" --arg v "$version" --arg verdict "$verdict" \
     --argjson reasons "$reasons_json" --arg ev "$evidence" \
     --arg src "$source_id" \
@@ -8983,8 +9090,9 @@ setup_machine() {
   fi
 
   detect_machine_tools "$machine" 1
-  local still_missing
-  still_missing=$(machine_missing_tools_from_list "$machine" "${desired[@]}")
+  local still_missing rc=0
+  still_missing=$(machine_missing_tools_from_list "$machine" "${desired[@]}") || rc=$?
+  (( rc == 0 )) || die_tool_cache_unusable
   if [[ -n "$still_missing" ]]; then
     warn "$machine: setup failed; still missing: $still_missing"
     return 1
