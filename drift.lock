@@ -16,6 +16,11 @@ target = "install.sh"
 sig = "56e44b0440c81eb3"
 
 [[bindings]]
+doc = "docs/installation.md"
+target = "uninstall.sh"
+sig = "5671727a27b08249"
+
+[[bindings]]
 doc = "docs/release-review.md"
 target = "internal/releasereview/report.go#Review"
 sig = "2fea910992963b18"
@@ -34,3 +39,8 @@ sig = "084d3a2364a61dca"
 doc = "docs/safe-audit.md"
 target = "internal/verdict/verdict.go#Decide"
 sig = "9d7937815cb8379c"
+
+[[bindings]]
+doc = "docs/safe-run.md"
+target = "bin/safe-run"
+sig = "7c1e3dc0e04af096"
