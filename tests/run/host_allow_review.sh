@@ -262,6 +262,85 @@ run_review --json >/dev/null 2>&1
 [[ ! -e "$digest_json" ]] || fail "review without --digest wrote a digest"
 pass "review without --digest writes no digest"
 
+# --- digest path resolution and failure cleanup ---------------------------
+# Audit-root precedence: SAFE_AUDIT_CONFIG_DIR wins over the SAFE_CONFIG_DIR
+# derivation, exactly as safe-audit resolves its own config root. One redirect
+# has to move a whole installation, and the digest must not be the piece left
+# behind in the default location.
+cat > "$tmp/config/host-allow.json" <<'JSON'
+{"packages":{
+  "clean-pkg":{"version":"2.1.4","sha":"a","ecosystem":"npm","added":"2026-07-01","reason":"was catch-22"},
+  "block-pkg":{"version":"0.0.1","sha":"c","ecosystem":"npm","added":"2026-06-01","reason":"went bad"}
+}}
+JSON
+override="$tmp/override-audit"
+mkdir -p "$override"
+rm -f "$digest_json" "$digest_md"
+SAFE_AUDIT_CONFIG_DIR="$override" run_review --digest >/dev/null 2>&1
+[[ -f "$override/host-allow-digest.json" ]] || fail "SAFE_AUDIT_CONFIG_DIR did not move the digest JSON"
+[[ -f "$override/host-allow-digest.md" ]] || fail "SAFE_AUDIT_CONFIG_DIR did not move the digest markdown"
+[[ ! -e "$digest_json" ]] || fail "digest also written to the derived default path"
+pass "SAFE_AUDIT_CONFIG_DIR overrides the derived digest path"
+
+# A FAILED publish has to clean up after itself too: each half is staged beside
+# its target, so neither a rejected report nor a failing renderer may leave a
+# staging file next to the real one. Driven in-process because the halves
+# cannot be failed independently from outside — a permissions game fails the
+# first one and never reaches the second.
+run_review --digest >/dev/null 2>&1
+publish_probe() {
+  local mode="$1"
+  SAFE_RUN_CONFIG_DIR="$tmp/config" \
+  SAFE_RUN_DATA_DIR="$tmp/data" \
+  SAFE_AUDIT_DATA_DIR="$tmp/audit-data" \
+  SAFE_CONFIG_DIR="$tmp/safe-config" \
+  SAFE_RUN_NO_INIT=1 \
+  SAFE_RUN_PATH="$SAFE_RUN" \
+  bash -c '
+    # Capture the mode BEFORE `set --`: sourcing safe-run needs a harmless
+    # argv (the suite convention), and that replaces the positional it came in
+    # on.
+    probe_mode="$1"
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    set +e
+    case "$probe_mode" in
+      json) host_allow_digest_publish "not json at all" ;;
+      md)   host_allow_digest_publish "{\"generated\":\"2026-01-01T00:00:00Z\",\"entries\":\"nope\",\"summary\":{}}" ;;
+    esac
+    printf "PUBLISH_RC=%s\n" "$?"
+  ' safe-run "$mode" 2>/dev/null
+}
+
+for mode in json md; do
+  probe_out=$(publish_probe "$mode")
+  grep -q 'PUBLISH_RC=1' <<<"$probe_out" || fail "failed $mode publish did not report failure: $probe_out"
+  residue=$(find "$tmp/safe-config/audit" -name 'host-allow-digest.*.??????' -print -quit)
+  [[ -z "$residue" ]] || fail "failed $mode publish left a staging file behind: $residue"
+done
+pass "a failed publish reports failure and leaves no staging file beside either target"
+
+# The digest can never fail a removal: with an unwritable digest directory the
+# entry still leaves host-allow, the command still exits 0, and the operator is
+# told the digest is behind instead of being left to guess. stage_beside dies
+# inside a command substitution, which kills only that subshell — the empty
+# path it hands back must not be written through.
+run_review --digest >/dev/null 2>&1
+chmod 0555 "$tmp/safe-config/audit"
+remove_err="$tmp/remove-unwritable-err"
+run_safe_run host-allow remove clean-pkg >/dev/null 2>"$remove_err" \
+  || { chmod 0755 "$tmp/safe-config/audit"; fail "removal failed because the digest was unwritable"; }
+chmod 0755 "$tmp/safe-config/audit"
+jq -e '.packages | has("clean-pkg") | not' "$tmp/config/host-allow.json" >/dev/null \
+  || fail "entry survived a removal whose digest update failed"
+grep -q "the digest is stale until" "$remove_err" || fail "removal did not disclose the stale digest: $(cat "$remove_err")"
+if grep -q 'No such file or directory' "$remove_err"; then
+  fail "removal leaked a raw redirection error from an empty staging path: $(cat "$remove_err")"
+fi
+residue=$(find "$tmp/safe-config/audit" -name 'host-allow-digest.*.??????' -print -quit)
+[[ -z "$residue" ]] || fail "unwritable-dir removal left a staging file behind: $residue"
+pass "an unwritable digest cannot fail a removal, and says the digest is stale"
+
 # --- probe payload corroboration (F2) -------------------------------------
 cat > "$tmp/config/host-allow.json" <<'JSON'
 {"packages":{

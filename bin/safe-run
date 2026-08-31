@@ -2226,14 +2226,26 @@ host_allow_digest_publish() {
     return 1
   fi
 
-  tmp_json=$(stage_beside "$HOST_ALLOW_DIGEST_JSON")
+  # stage_beside dies, but it dies inside a command substitution — that kills
+  # the subshell and hands back an EMPTY path, so an unwritable digest
+  # directory used to continue into `> ""` and print a raw bash redirection
+  # error on top of the legible one. Check the path before using it.
+  tmp_json=$(stage_beside "$HOST_ALLOW_DIGEST_JSON") || tmp_json=""
+  if [[ -z "$tmp_json" ]]; then
+    err "digest: cannot stage a write beside $HOST_ALLOW_DIGEST_JSON; nothing was written"
+    return 1
+  fi
   if ! jq . <<<"$report_json" > "$tmp_json" || ! mv "$tmp_json" "$HOST_ALLOW_DIGEST_JSON"; then
     rm -f "$tmp_json"
     err "digest: cannot write $HOST_ALLOW_DIGEST_JSON"
     return 1
   fi
 
-  tmp_md=$(stage_beside "$HOST_ALLOW_DIGEST_MD")
+  tmp_md=$(stage_beside "$HOST_ALLOW_DIGEST_MD") || tmp_md=""
+  if [[ -z "$tmp_md" ]]; then
+    err "digest: cannot stage a write beside $HOST_ALLOW_DIGEST_MD; the rendered digest is stale"
+    return 1
+  fi
   if ! host_allow_digest_render_md "$report_json" > "$tmp_md" || ! mv "$tmp_md" "$HOST_ALLOW_DIGEST_MD"; then
     rm -f "$tmp_md"
     err "digest: cannot write $HOST_ALLOW_DIGEST_MD"
@@ -2281,7 +2293,12 @@ host_allow_digest_drop_entry() {
     "$HOST_ALLOW_DIGEST_JSON" 2>/dev/null) || return 0
   [[ -n "$updated" ]] || return 0
 
-  host_allow_digest_publish "$updated" || return 0
+  if ! host_allow_digest_publish "$updated"; then
+    # The removal already succeeded and stands. Say the digest is now behind
+    # rather than failing the command over a convenience surface.
+    info "digest: could not drop $pkg; the digest is stale until: safe run host-allow review --digest"
+    return 0
+  fi
   info "digest: dropped $pkg and recomputed counts"
 }
 
@@ -3146,7 +3163,10 @@ SUBCOMMANDS
                                               Staleness report: age, usage, and
                                               whether each pin still needs its
                                               entry (re-audit); --digest writes
-                                              an inbox note when actionable
+                                              the report and a rendered copy to
+                                              the audit config dir on every run,
+                                              actionable or not, and safe status
+                                              reports what it found
   host-allow export [--json]                  Dump this machine's allow set as a
                                               portable JSON document (for import)
   host-allow import <file> [--dry-run]        Apply a reviewed allow set (TTY);
