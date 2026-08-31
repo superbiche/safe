@@ -254,14 +254,57 @@ fi
 # variable differs between the projection lane and the delegate lane. These
 # assertions pin the boundary that guard is drawn on.
 
-# Only the exact braced spelling expands: the unbraced and default-value forms
-# stay literal, so scanning for ${PWD} alone is not under-reaching.
-npmrc $'os=${PWD}\ncpu=$PWD\nsearchlimit=${PWD:-fallback}\n'
-expansion_shapes="$(parity_probe "${WORK}" | jq -c '{os, cpu, searchlimit}')"
-if [[ "${expansion_shapes}" == "{\"os\":\"${WORK}\",\"cpu\":\"\$PWD\",\"searchlimit\":\"\${PWD:-fallback}\"}" ]]; then
-  pass "npm expands only the exact braced \${VAR} form (\$PWD and \${PWD:-x} stay literal)"
+# npm's expansion grammar is deliberately NOT modeled by the gate, and these
+# assertions are why: it is wider than any enumeration written against it.
+# ${VAR?} is honored (r3 N3 bypassed a guard that knew only ${VAR}), while a
+# backslash escapes the reference (r3 N4 falsely refused that spelling).
+npmrc $'os=${PWD?}\ncpu=\\${PWD}\nsearchlimit=${PWD:-fallback}\n'
+expansion_shapes="$(parity_probe "${WORK}" | jq -c '{cpu, searchlimit}')"
+question_form="$(parity_probe "${WORK}" | jq -r '.os')"
+if [[ "${expansion_shapes}" != "{\"cpu\":\"\${PWD}\",\"searchlimit\":\"\${PWD:-fallback}\"}" ]]; then
+  fail "escaped and default-value forms no longer stay literal: ${expansion_shapes}"
+elif [[ "${question_form}" == "${WORK}" ]]; then
+  pass "\${VAR?} is honored here while an escaped \\\${VAR} stays literal (npm 12 grammar)"
+elif [[ "${question_form}" == '${PWD?}' ]]; then
+  pass "\${VAR?} stays literal here while npm 12 expands it — the grammar is version-dependent, which is why no spelling is modeled"
 else
-  fail "braced-only expansion changed: ${expansion_shapes}"
+  fail "\${PWD?} resolved to neither the cwd nor its literal: ${question_form}"
+fi
+
+# Config carried on the COMMAND LINE is expanded the same way (r3 N2), which
+# is why argv is one of the guard's surfaces.
+npmrc ''
+argv_expanded="$(parity_probe "${WORK}" '--os=${PWD}' | jq -r '.os')"
+if [[ "${argv_expanded}" == "${WORK}" ]]; then
+  pass "an argv-carried config value is expanded per-cwd too"
+else
+  fail "argv --os=\${PWD} did not expand per-cwd: ${argv_expanded}"
+fi
+
+# A secret-bearing key npm omits from its report is expanded before it is
+# omitted, so the parity comparison cannot see its divergence — the reason a
+# hidden setting carrying ${ refuses instead.
+secret_visible="$(parity_probe "${WORK}" '--//registry.example/:_authToken=${PWD}' \
+  | jq -r 'has("//registry.example/:_authToken")')"
+if [[ "${secret_visible}" == "false" ]]; then
+  pass "a secret-bearing setting stays absent from the report even when set explicitly"
+else
+  fail "the secret key became visible in config list --json: ${secret_visible}"
+fi
+
+# ${OLDPWD} resolves from the environment, which is what makes re-asserting
+# the ambient value inside each cd'd subshell enough to keep it lane-invariant.
+npmrc 'os=${OLDPWD}'
+cp -- "${WORK}/.npmrc" "${PARITY_SCRATCH}/.npmrc"
+oldpwd_from_env="$( cd -- "${PARITY_SCRATCH}" && export OLDPWD="${WORK}" && "${real_npm}" config list \
+  --package-lock-only --ignore-scripts --no-audit --no-fund dedupe --json 2>/dev/null | jq -r '.os' )"
+oldpwd_other_lane="$( cd -- "${WORK}" && export OLDPWD="${WORK}" && "${real_npm}" config list \
+  --package-lock-only --ignore-scripts --no-audit --no-fund dedupe --json 2>/dev/null | jq -r '.os' )"
+rm -f -- "${PARITY_SCRATCH}/.npmrc"
+if [[ "${oldpwd_from_env}" == "${WORK}" && "${oldpwd_other_lane}" == "${WORK}" ]]; then
+  pass "\${OLDPWD} resolves from the environment, so re-asserting it makes both lanes agree"
+else
+  fail "\${OLDPWD} did not follow the environment: scratch=${oldpwd_from_env} project=${oldpwd_other_lane}"
 fi
 
 # Whether a pinned PWD steers the expansion is npm-version-dependent, and this

@@ -31,20 +31,33 @@
     `$HOME`. Every other non-empty value refuses — npm expands ONLY the `~/`
     prefix, so `~root/.npmrc`, `~foo` and a bare `~` are ordinary
     cwd-relative names to it.
-  - **Config values that expand differently in the two lanes refuse** (exit
-    100). npm substitutes `${VAR}` references into config values from the
-    environment of whichever process reads them, and it does so for every
-    value — including the secret-bearing keys it then omits from `npm config
-    list --json`, where the parity comparison below cannot see them. An
-    `_authToken` built from `${PWD}` therefore hands the projection and the
-    delegate different credentials. The variables that can differ between the
-    two lanes are enumerable — `${PWD}`, `${OLDPWD}`, and the projection's own
-    invariants — so a reference to one of them in the project `.npmrc`, in the
-    effective userconfig or globalconfig, or in any `npm_config_*`
-    environment value now refuses, naming the file or key and the reference.
-    Every other `${VAR}` resolves from an environment both lanes share, so
-    `_authToken=${NPM_TOKEN}` workflows are unaffected, and only the exact
-    braced spelling counts, because that is the only one npm expands.
+  - **Config npm hides from its own report refuses when it carries a
+    `${...}` reference** (exit 100), and the lock-diff lanes were made
+    environment-identical so fewer references can diverge at all. npm
+    substitutes `${VAR}` into config values from the environment of whichever
+    process reads them, including the secret-bearing keys it omits from `npm
+    config list --json`. The contract is now: visible config is verified
+    semantically by npm itself, because the parity check below compares
+    npm-RESOLVED values and therefore covers any expansion syntax, present or
+    future, for every key npm reports; config npm HIDES from that report
+    refuses on any `${` occurrence, because no lane-safe verification exists
+    for a value that cannot be observed. No expansion spelling is modeled
+    anywhere — earlier attempts to enumerate them were defeated in turn by an
+    argv surface, by npm's `${VAR?}` form, and by falsely refusing an escaped
+    `\${VAR}`. Secrecy is decided by observation: a setting is hidden exactly
+    when npm's own report omits its key. Surfaces are the project `.npmrc`,
+    the effective userconfig and globalconfig, every `npm_config_*`
+    environment value, and the command line. **Behavior change:** an
+    `_authToken=${NPM_TOKEN}` line now refuses on `dedupe`/`prune`; the
+    previous design permitted it by classifying that reference as
+    lane-shared, and maintaining such a classification is what kept failing.
+    Use a literal value in the config file for these two commands.
+    Lane hygiene landed with it: each probe and the projection re-assert the
+    ambient `OLDPWD` after their `cd`, so an `${OLDPWD}` reference is
+    lane-invariant and mirrors faithfully instead of needing a rule, and the
+    projection no longer exports the five `npm_config_*` copies of its own
+    invariant flags — argv already asserts those settings at higher
+    precedence, and the environment copies existed only in that lane.
   - **Workspace members are mirrored, and a lost member refuses.** At a
     workspace root the scratch had no member manifests, so `npm dedupe
     --package-lock-only` silently succeeded and dropped every workspace entry
@@ -75,8 +88,9 @@
     nothing else in the gate models; it starts with no exemptions, because a
     stock project resolves identically from either directory. Secret-bearing
     keys are the one blind spot — npm omits them from that output — and the
-    two transports that could make them diverge, a cwd-relative `--userconfig`
-    and a lane-divergent `${VAR}` reference, are both refused above. Cost: one additional `npm config list` per
+    transports that could make them diverge are refused above: a cwd-relative
+    `--userconfig`, and any `${...}` reference in a setting npm does not
+    report. Cost: one additional `npm config list` per
     `dedupe`/`prune`.
   - **In-project `file:` dependencies stop failing the projection.** The same
     manifest sweep carries their `package.json` into the scratch, so a project

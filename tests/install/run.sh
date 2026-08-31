@@ -129,7 +129,11 @@ stub_cwd_dependent_rc_json() {
       value="${line#*=}"
       key="${key// /}"
       value="${value#"${value%%[![:space:]]*}"}"
-      if [[ "${value}" == *'${PWD}'* ]]; then
+      # A backslash escapes the reference: npm reports the literal text, so
+      # both lanes receive the same value and nothing diverges.
+      if [[ "${value}" == *'\${'* ]]; then
+        continue
+      elif [[ "${value}" == *'${PWD}'* ]]; then
         value="${value//'${PWD}'/$PWD}"
       elif [[ "${value}" == ./* ]]; then
         value="${PWD}/${value#./}"
@@ -142,20 +146,18 @@ stub_cwd_dependent_rc_json() {
   printf '%s' "${out}"
 }
 
-# npm reports the config FILE paths it resolved, and the expansion guard reads
-# those keys to know which files to scan.
+# npm always reports the config FILE paths it resolved, and the hidden-config
+# guard reads those keys both to know which files to scan and to know that
+# userconfig/globalconfig are settings npm does report.
 stub_config_file_json() {
-  local token previous="" userconfig=""
+  local token previous="" userconfig="${HOME}/.npmrc"
   for token in "$@"; do
     [[ "${previous}" == "--userconfig" ]] && userconfig="${token}"
     [[ "${token}" == --userconfig=* ]] && userconfig="${token#--userconfig=}"
     previous="${token}"
   done
-  if [[ -n "${userconfig}" ]]; then
-    jq -cn --arg v "${userconfig}" '{userconfig: $v}'
-  else
-    printf '{}'
-  fi
+  jq -cn --arg u "${userconfig}" --arg g "${HOME}/etc/npmrc" \
+    '{userconfig: $u, globalconfig: $g}'
 }
 
 if [[ "${tool}" == "npm" && "${1:-}" == "config" && "${2:-}" == "list" ]]; then
@@ -175,8 +177,12 @@ if [[ "${tool}" == "npm" && "${1:-}" == "config" && "${2:-}" == "list" ]]; then
       '{os: (if $os == "" then null else $os end), cpu: (if $cpu == "" then null else $cpu end)}')"
     cwd_json="$(stub_cwd_dependent_rc_json)"
     files_json="$(stub_config_file_json "$@")"
+    # Order is npm's resolution order, not convenience: a value npm expands or
+    # resolves against the cwd is what it REPORTS, so it wins over the raw
+    # platform reading of the same key, and an explicit fixture override wins
+    # over everything.
     jq -cn --argjson a "${effective_json}" --argjson b "${registry_json}" --argjson c "${platform_json}" \
-      --argjson d "${cwd_json}" --argjson e "${files_json}" '$b * $d * $e * $c * $a' 2>/dev/null \
+      --argjson d "${cwd_json}" --argjson e "${files_json}" '$b * $e * $c * $d * $a' 2>/dev/null \
       || printf '%s\n' "${effective_json}"
   else
     printf 'package-lock=true\nignore-scripts=true\n'
@@ -2735,69 +2741,82 @@ case_npm_lockdiff_refuses_cwd_dependent_config() {
   pass "$FUNCNAME"
 }
 
-case_npm_lockdiff_refuses_lane_divergent_expansion() {
+case_npm_lockdiff_refuses_hidden_config_expansion() {
   skip_lockdiff_case "$FUNCNAME" || return
-  prepare_lockdiff_case "npm-lockdiff-lane-divergent-expansion"
-  # npm expands ${VAR} in every config VALUE — including the secret-bearing
-  # keys it then omits from `config list --json`, so an auth token built from
-  # ${PWD} hands the two lanes different credentials while both parity objects
-  # look identical (r2 review F3). The variables that can differ between the
-  # lanes are enumerable, so they are refused at the config source instead.
+  prepare_lockdiff_case "npm-lockdiff-hidden-config-expansion"
+  # npm substitutes ${...} references into every config value, including the
+  # secret-bearing keys it omits from its own report — where the parity check
+  # cannot see them (r2 F3, r3 N2/N3). Secrecy is decided by observation: a
+  # setting whose key npm does not report cannot be verified, so any ${ in it
+  # refuses, with no expansion spelling modeled anywhere.
   install_lockdiff_package kept 1.0.0
   printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
   local lock='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/kept":{"version":"1.0.0"}}}'
   printf '%s\n' "${lock}" > "${WORK_DIR}/package-lock.json"
 
-  # The r2 reproduction: a credential the parity comparison can never see.
-  printf '//registry.example/:_authToken=${PWD}\n' > "${WORK_DIR}/.npmrc"
+  # r3 N3: npm's ${VAR?} form. The guard needs no knowledge of it.
+  printf '//registry.example/:_authToken=${PWD?}\n' > "${WORK_DIR}/.npmrc"
   NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
   assert_status 100 "$FUNCNAME (project rc)" || return
-  assert_err_contains_fragment "${WORK_DIR}/.npmrc references \${PWD}" "$FUNCNAME (project rc)" || return
-  assert_err_contains_fragment 'expands against each process' "$FUNCNAME (project rc)" || return
+  assert_err_contains_fragment 'sets //registry.example/:_authToken, a setting npm hides from its own config report' "$FUNCNAME (project rc)" || return
   [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME (project rc)"; return 1; }
   assert_log_not_contains_fragment $'PROJECTION\tnpm\t' "$FUNCNAME (project rc)" || return
   assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (project rc)" || return
 
-  # An invariant that exists only inside the projection's environment.
+  # The boundary change, operator-ruled: a reference the old design classified
+  # as lane-shared refuses too. Classifying references is the mechanism three
+  # review rounds broke.
   : > "${LOG_FILE}"
-  printf 'registry=https://npm.example.test/${npm_config_ignore_scripts}/\n' > "${WORK_DIR}/.npmrc"
+  printf '//registry.example/:_authToken=${NPM_TOKEN}\n' > "${WORK_DIR}/.npmrc"
   NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
-  assert_status 100 "$FUNCNAME (projection invariant)" || return
-  assert_err_contains_fragment 'references ${npm_config_ignore_scripts}' "$FUNCNAME (projection invariant)" || return
-  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (projection invariant)" || return
+  assert_status 100 "$FUNCNAME (shared-env reference)" || return
+  assert_err_contains_fragment 'a setting npm hides from its own config report' "$FUNCNAME (shared-env reference)" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (shared-env reference)" || return
 
-  # The effective userconfig is scanned too, at the path npm reports.
+  # An escaped reference in a HIDDEN key refuses as well: the accepted
+  # over-refusal direction, since verifying it would mean modeling the escape.
+  : > "${LOG_FILE}"
+  printf '//registry.example/:_authToken=\\${PWD}\n' > "${WORK_DIR}/.npmrc"
+  NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME (escaped in hidden key)" || return
+  assert_err_contains_fragment 'a setting npm hides from its own config report' "$FUNCNAME (escaped in hidden key)" || return
+
+  # r3 N2: the same secret carried on the command line.
   : > "${LOG_FILE}"
   rm -f "${WORK_DIR}/.npmrc"
-  printf 'registry=https://npm.example.test/${PWD}/\n' > "${CASE_DIR}/user-pwd.npmrc"
   NPM_LOCK_MUTATION_JSON="${lock}" \
-    SAFE_INSTALL_TEST_SCRIPT="npm dedupe --userconfig ${CASE_DIR}/user-pwd.npmrc" run_zsh
-  assert_status 100 "$FUNCNAME (userconfig)" || return
-  assert_err_contains_fragment "${CASE_DIR}/user-pwd.npmrc references \${PWD}" "$FUNCNAME (userconfig)" || return
-  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (userconfig)" || return
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe '"'"'--//registry.example/:_authToken=${PWD}'"'" run_zsh
+  assert_status 100 "$FUNCNAME (argv)" || return
+  assert_err_contains_fragment 'the command line sets //registry.example/:_authToken, which npm does not report as a setting' "$FUNCNAME (argv)" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (argv)" || return
 
-  # An npm_config_* environment value carries the same expansion.
+  # An environment-carried hidden setting, same rule.
   : > "${LOG_FILE}"
-  npm_config_os='${PWD}' NPM_LOCK_MUTATION_JSON="${lock}" \
+  npm_config_globalconfig='/abs/${PWD}/npmrc' NPM_LOCK_MUTATION_JSON="${lock}" \
     SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
-  assert_status 100 "$FUNCNAME (env)" || return
-  assert_err_contains_fragment 'npm_config_os references ${PWD}' "$FUNCNAME (env)" || return
-  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (env)" || return
+  assert_status 0 "$FUNCNAME (visible env key delegates)" || return
 
-  # The boundary: a reference both lanes resolve identically keeps working —
-  # the delegate is exec'd from this same environment — and npm expands ONLY
-  # the exact braced spelling, so $PWD and ${PWD:-x} are literal strings to it.
-  # A commented-out reference is not a reference at all.
+  # A VISIBLE key is parity's jurisdiction, not this guard's: it passes here
+  # and the comparison of npm-resolved values is what refuses it.
   : > "${LOG_FILE}"
-  printf '//registry.example/:_authToken=${NPM_TOKEN}\ncpu=$PWD\nsearchlimit=${PWD:-fallback}\n; cache=${PWD}/cache\n#registry=https://old.example/${PWD}/\n' \
-    > "${WORK_DIR}/.npmrc"
+  printf 'os=${PWD}\n' > "${WORK_DIR}/.npmrc"
   NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
-  assert_status 0 "$FUNCNAME (shared and literal references)" || return
-  assert_err_not_contains_fragment 'expands against each process' "$FUNCNAME (shared and literal references)" || return
-  assert_log_contains $'REAL\tnpm\tdedupe' "$FUNCNAME (shared and literal references)" || return
+  assert_status 100 "$FUNCNAME (visible key reaches parity)" || return
+  assert_err_contains_fragment 'effective npm config resolves differently inside the lock-diff projection (os)' "$FUNCNAME (visible key reaches parity)" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (visible key reaches parity)" || return
+
+  # r3 N4: an escaped reference in a VISIBLE key is a literal to npm, so both
+  # lanes receive the same value, parity agrees, and the command delegates.
+  # The old token guard refused this outright.
+  : > "${LOG_FILE}"
+  printf 'os=\\${PWD}\n' > "${WORK_DIR}/.npmrc"
+  NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 0 "$FUNCNAME (escaped in visible key)" || return
+  assert_err_not_contains_fragment 'hides from its own config report' "$FUNCNAME (escaped in visible key)" || return
+  assert_err_not_contains_fragment 'resolves differently inside' "$FUNCNAME (escaped in visible key)" || return
+  assert_log_contains $'REAL\tnpm\tdedupe' "$FUNCNAME (escaped in visible key)" || return
   pass "$FUNCNAME"
 }
-
 case_npm_lockdiff_manifest_copy_failure_is_one_line() {
   skip_lockdiff_case "$FUNCNAME" || return
   prepare_lockdiff_case "npm-lockdiff-manifest-copy-failure"
@@ -6208,7 +6227,7 @@ main() {
     case_npm_lockdiff_mirrors_file_dependency_manifest \
     case_npm_lockdiff_manifest_copy_failure_is_one_line \
     case_npm_lockdiff_refuses_cwd_dependent_config \
-    case_npm_lockdiff_refuses_lane_divergent_expansion \
+    case_npm_lockdiff_refuses_hidden_config_expansion \
     case_npm_lockdiff_refuses_nonregistry_reify_candidate \
     case_npm_lockdiff_projection_sees_project_npmrc \
     case_npm_dedupe_lockdiff_introduced_block_refuses_without_delegation \
