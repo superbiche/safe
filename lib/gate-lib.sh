@@ -1680,6 +1680,84 @@ safe_gate_npm_lockdiff_effective_config() {
   return 0
 }
 
+# npm expands `${VAR}` references inside config VALUES against the environment
+# of the process reading them, and it does so for every string value —
+# including the secret-bearing keys it then omits from `config list --json`
+# (r2 review F3). A reference to a variable whose value differs between the
+# projection lane and the delegate lane therefore hands the two lanes
+# different settings, and for an omitted key the parity comparison cannot see
+# it. Those variables are enumerable, so they are refused at the source:
+#
+#   ${PWD}     — the projection reads it in the scratch and the delegate in
+#                the project, so it differs by construction. Rewriting it to
+#                agree is not available: npm 12.0.2 resolves it from the
+#                process's real cwd and ignores a pinned PWD entirely (npm 10
+#                honors the pin, which is exactly why this guard refuses the
+#                reference rather than trying to normalize it).
+#   ${OLDPWD}  — rewritten by the `cd` the probe and projection subshells do.
+#   the five npm_config_* invariants and SAFE_GATE_LOCKDIFF_PROJECTION —
+#                these exist ONLY in the projection lane's environment.
+#
+# Every OTHER ${VAR} resolves from an environment both lanes share, because
+# the delegate is exec'd from this same process environment: a
+# `_authToken=${NPM_TOKEN}` workflow keeps working, and that boundary is the
+# design, not an oversight. Only the exact braced spelling is scanned, which
+# is the only one npm expands — `$PWD` and `${PWD:-fallback}` stay literal
+# strings to it (probed, npm 12.0.2).
+#
+# Scanned surfaces are the config FILES npm will read — the project .npmrc and
+# the effective userconfig/globalconfig, whose paths npm reports in the object
+# retained above — plus every npm_config_* environment value. npm's builtin
+# npmrc is deliberately out of scope: it ships with the install and is npm's
+# own state, not project or operator state.
+safe_gate_npm_lockdiff_config_expansion_guard() {
+  local project_dir="$1" subcommand="$2"
+  local file="" line="" token="" key="" value=""
+  local -a files=() tokens=(
+    '${PWD}' '${OLDPWD}' '${SAFE_GATE_LOCKDIFF_PROJECTION}'
+    '${npm_config_package_lock}' '${npm_config_package_lock_only}'
+    '${npm_config_ignore_scripts}' '${npm_config_audit}' '${npm_config_fund}'
+  )
+
+  files+=("${project_dir}/.npmrc")
+  while IFS= read -r file; do
+    [[ -n "${file}" ]] && files+=("${file}")
+  done < <(jq -r '(.userconfig // empty), (.globalconfig // empty)' \
+    <<<"${SAFE_GATE_LOCKDIFF_CONFIG_JSON:-null}" 2>/dev/null)
+
+  for file in "${files[@]}"; do
+    [[ -e "${file}" ]] || continue
+    # npm will read what this guard cannot: an unreadable config file is
+    # audit-infrastructure breakage, never a silent skip.
+    if [[ ! -f "${file}" || ! -r "${file}" ]]; then
+      safe_gate_err "safe: BLOCKED npm ${subcommand} — npm config file ${file} cannot be read for the lock-diff projection (audit-infrastructure breakage, not a package finding); fix its permissions and retry — safe doctor; details: safe explain"
+      return 100
+    fi
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+      [[ "${line}" =~ ^[[:space:]]*[\;\#] ]] && continue
+      for token in "${tokens[@]}"; do
+        if [[ "${line}" == *"${token}"* ]]; then
+          safe_gate_err "safe: BLOCKED npm ${subcommand} — ${file} references ${token}, which npm expands against each process's own environment, so the lock-diff projection would resolve different settings than this command; remove the reference and retry; details: safe explain"
+          return 100
+        fi
+      done
+    done < "${file}"
+  done
+
+  for key in $(compgen -e); do
+    [[ "${key,,}" == npm_config_* ]] || continue
+    value="${!key}"
+    [[ -n "${value}" ]] || continue
+    for token in "${tokens[@]}"; do
+      if [[ "${value}" == *"${token}"* ]]; then
+        safe_gate_err "safe: BLOCKED npm ${subcommand} — ${key} references ${token}, which npm expands against each process's own environment, so the lock-diff projection would resolve different settings than this command; remove the reference and retry; details: safe explain"
+        return 100
+      fi
+    done
+  done
+  return 0
+}
+
 # Copying config files into the scratch does not copy what they RESOLVE to.
 # npm expands ${PWD} in every config source and resolves path-typed values
 # against process.cwd(), so the identical file read from the project and from
@@ -1690,12 +1768,16 @@ safe_gate_npm_lockdiff_effective_config() {
 # are compared whole: whatever npm reports differently is caught, including
 # spellings nothing else in this gate models.
 #
-# One probed limit is structural: npm omits secret-bearing keys (`_auth`, a
+# One limit is structural: npm omits secret-bearing keys (`_auth`, a
 # `//host/:_authToken` line) from `config list --json` entirely, so a
-# divergence confined to those is invisible here. It is tolerated because
-# those values are not cwd-derived — both lanes read the same files — and the
-# one transport that could make them differ, a cwd-relative userconfig, is
-# already refused by the config-path guard above.
+# divergence confined to those is invisible to this comparison. npm applies
+# its ${VAR} expansion to every string value BEFORE that omission, so such a
+# key can genuinely differ between the lanes (r2 review F3): that class is
+# refused upfront by the expansion guard above, which reads the config FILES
+# rather than npm's reported object. No residual is known — a secret value
+# reaching the two lanes differently would need a lane-distinct environment
+# variable or a lane-distinct config file, and both are refused before the
+# scratch is even allocated.
 #
 # What npm DOES report, it reports resolved, which is why this check is worth
 # its probe: on npm 12.0.2 under this exact layout a cwd-dependent `cache`
@@ -2161,6 +2243,14 @@ safe_gate_npm_lockdiff_preflight() {
     return "${rc}"
   fi
   if safe_gate_npm_lockdiff_effective_config "${project_dir}" "${subcommand}" "$@"; then
+    :
+  else
+    rc=$?
+    return "${rc}"
+  fi
+  # Reads the config file paths the probe above reported, and runs before the
+  # scratch exists: a lane-divergent expansion must never reach a projection.
+  if safe_gate_npm_lockdiff_config_expansion_guard "${project_dir}" "${subcommand}"; then
     :
   else
     rc=$?

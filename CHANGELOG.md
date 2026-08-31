@@ -26,7 +26,25 @@
     different config files and the projection could vouch for an artifact
     fetched under settings it never read. Both argv spellings and the
     environment forms (read case-insensitively, as npm reads them) are
-    checked; absolute and `~`-led values pass through untouched.
+    checked. Only two spellings resolve identically from either directory and
+    pass: an absolute path, and a `~/`-led one, which npm expands against
+    `$HOME`. Every other non-empty value refuses — npm expands ONLY the `~/`
+    prefix, so `~root/.npmrc`, `~foo` and a bare `~` are ordinary
+    cwd-relative names to it.
+  - **Config values that expand differently in the two lanes refuse** (exit
+    100). npm substitutes `${VAR}` references into config values from the
+    environment of whichever process reads them, and it does so for every
+    value — including the secret-bearing keys it then omits from `npm config
+    list --json`, where the parity comparison below cannot see them. An
+    `_authToken` built from `${PWD}` therefore hands the projection and the
+    delegate different credentials. The variables that can differ between the
+    two lanes are enumerable — `${PWD}`, `${OLDPWD}`, and the projection's own
+    invariants — so a reference to one of them in the project `.npmrc`, in the
+    effective userconfig or globalconfig, or in any `npm_config_*`
+    environment value now refuses, naming the file or key and the reference.
+    Every other `${VAR}` resolves from an environment both lanes share, so
+    `_authToken=${NPM_TOKEN}` workflows are unaffected, and only the exact
+    braced spelling counts, because that is the only one npm expands.
   - **Workspace members are mirrored, and a lost member refuses.** At a
     workspace root the scratch had no member manifests, so `npm dedupe
     --package-lock-only` silently succeeded and dropped every workspace entry
@@ -57,8 +75,8 @@
     nothing else in the gate models; it starts with no exemptions, because a
     stock project resolves identically from either directory. Secret-bearing
     keys are the one blind spot — npm omits them from that output — and the
-    transport that could make them diverge is the relative `--userconfig`
-    already refused above. Cost: one additional `npm config list` per
+    two transports that could make them diverge, a cwd-relative `--userconfig`
+    and a lane-divergent `${VAR}` reference, are both refused above. Cost: one additional `npm config list` per
     `dedupe`/`prune`.
   - **In-project `file:` dependencies stop failing the projection.** The same
     manifest sweep carries their `package.json` into the scratch, so a project

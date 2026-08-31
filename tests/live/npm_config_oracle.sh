@@ -35,6 +35,11 @@ if [[ -z "${real_npm}" ]]; then
   exit 0
 fi
 
+# Which npm answered matters when a result is version-dependent: this suite
+# takes whatever the gate's own resolution takes, which is not necessarily the
+# npm a probe was originally measured on.
+printf '# npm oracle target: %s (%s)\n' "${real_npm}" "$("${real_npm}" --version 2>/dev/null || printf 'version unknown')"
+
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/safe-live-npm.XXXXXX")" || exit 1
 trap 'rm -rf -- "${WORK}"' EXIT
 printf '{"name":"live-oracle","version":"1.0.0"}\n' > "${WORK}/package.json"
@@ -242,9 +247,62 @@ else
   fail "relative cache was not reported per-cwd: project=${from_project} scratch=${from_scratch}"
 fi
 
-# The one class npm keeps OUT of this output: secret-bearing keys. A
-# divergence confined to them is invisible here, which is why the config-path
-# guard refuses the cwd-relative userconfig that could create one.
+# --- lane-divergent ${VAR} expansion -----------------------------------------
+
+# npm expands ${VAR} in config VALUES against the reading process's own
+# environment, which is why the expansion guard refuses the references whose
+# variable differs between the projection lane and the delegate lane. These
+# assertions pin the boundary that guard is drawn on.
+
+# Only the exact braced spelling expands: the unbraced and default-value forms
+# stay literal, so scanning for ${PWD} alone is not under-reaching.
+npmrc $'os=${PWD}\ncpu=$PWD\nsearchlimit=${PWD:-fallback}\n'
+expansion_shapes="$(parity_probe "${WORK}" | jq -c '{os, cpu, searchlimit}')"
+if [[ "${expansion_shapes}" == "{\"os\":\"${WORK}\",\"cpu\":\"\$PWD\",\"searchlimit\":\"\${PWD:-fallback}\"}" ]]; then
+  pass "npm expands only the exact braced \${VAR} form (\$PWD and \${PWD:-x} stay literal)"
+else
+  fail "braced-only expansion changed: ${expansion_shapes}"
+fi
+
+# Whether a pinned PWD steers the expansion is npm-version-dependent, and this
+# suite runs against whichever npm the GATE would resolve: npm 12.0.2 ignores
+# the pin and uses the process's real cwd, while the older npm bundled with
+# Node 22 honors it. Both shapes are recorded rather than asserted away — the
+# guard refuses such a reference instead of rewriting it, so neither shape
+# changes the outcome, and only a third, unknown shape is a failure.
+npmrc 'os=${PWD}'
+pinned_os="$( cd -- "${WORK}" && env PWD=/pinned/elsewhere "${real_npm}" config list \
+  --package-lock-only --ignore-scripts --no-audit --no-fund dedupe --json 2>/dev/null | jq -r '.os' )"
+if [[ "${pinned_os}" == "${WORK}" ]]; then
+  pass "a pinned PWD does not steer \${PWD} here (npm uses the real cwd; matching the lanes' expansion is unavailable)"
+elif [[ "${pinned_os}" == "/pinned/elsewhere" ]]; then
+  pass "a pinned PWD steers \${PWD} here (older npm shape; the guard refuses rather than rewrites either way)"
+else
+  fail "\${PWD} resolved to neither the cwd nor the pinned value: ${pinned_os}"
+fi
+
+# Environment-sourced npm_config_* values are expanded the same way, which is
+# why the guard scans them as well as the config files.
+npmrc ''
+env_expanded="$(npm_config_os='${PWD}' parity_probe "${WORK}" | jq -r '.os')"
+if [[ "${env_expanded}" == "${WORK}" ]]; then
+  pass "an npm_config_* environment value is expanded per-cwd too"
+else
+  fail "npm_config_os=\${PWD} did not expand per-cwd: ${env_expanded}"
+fi
+
+# The guard learns which files npm will read from the probe's own report.
+config_files="$(parity_probe "${WORK}" | jq -r '[(.userconfig | type), (.globalconfig | type)] | join(",")')"
+if [[ "${config_files}" == "string,string" ]]; then
+  pass "the probe reports the effective userconfig and globalconfig paths (the guard's file list)"
+else
+  fail "config file paths are not both reported as strings: ${config_files}"
+fi
+
+# The one class npm keeps OUT of this output: secret-bearing keys. npm applies
+# the expansion above to them BEFORE omitting them, so a ${PWD}-built token
+# diverges invisibly to parity (r2 review F3) — the expansion guard is what
+# refuses that class, upstream of this comparison.
 printf '//registry.npmjs.org/:_authToken=live-oracle-not-a-real-token\n_auth=bGl2ZS1vcmFjbGU=\n' > "${WORK}/auth.npmrc"
 auth_keys="$(parity_probe "${WORK}" --userconfig "${WORK}/auth.npmrc" | jq -r '[keys[] | select(startswith("_") or startswith("//"))] | join(", ")')"
 if [[ -z "${auth_keys}" ]]; then

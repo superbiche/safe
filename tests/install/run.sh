@@ -112,25 +112,50 @@ stub_effective_platform() {
   return 0
 }
 
-# npm expands ${PWD} in an rc value against the CWD of the process reading it,
-# so one rc file reports different settings from the project and from the
-# scratch — the divergence the parity check exists to catch (r1 review F3).
-# Only ${PWD}-carrying lines are modeled here: they are precisely the ones
-# whose reported value depends on where npm ran.
+# Two npm behaviors make one rc file report different settings from the
+# project and from the scratch, which is the divergence the parity check
+# exists to catch (r1 review F3): ${PWD} is expanded against the CWD of the
+# process reading it, and a relative path value is resolved against that same
+# CWD. Only those two shapes are modeled — they are precisely the ones whose
+# reported value depends on where npm ran, so nothing else in the suite moves.
 stub_cwd_dependent_rc_json() {
   local line key value out='{}'
   if [[ -f .npmrc ]]; then
     while IFS= read -r line || [[ -n "${line}" ]]; do
-      [[ "${line}" == *'${PWD}'* && "${line}" == *=* ]] || continue
+      # ini comments are not settings; npm reports nothing for them.
+      [[ "${line}" =~ ^[[:space:]]*[\;\#] ]] && continue
+      [[ "${line}" == *=* ]] || continue
       key="${line%%=*}"
       value="${line#*=}"
       key="${key// /}"
       value="${value#"${value%%[![:space:]]*}"}"
-      value="${value//'${PWD}'/$PWD}"
+      if [[ "${value}" == *'${PWD}'* ]]; then
+        value="${value//'${PWD}'/$PWD}"
+      elif [[ "${value}" == ./* ]]; then
+        value="${PWD}/${value#./}"
+      else
+        continue
+      fi
       out="$(jq -cn --argjson base "${out}" --arg k "${key}" --arg v "${value}" '$base + {($k): $v}')"
     done < .npmrc
   fi
   printf '%s' "${out}"
+}
+
+# npm reports the config FILE paths it resolved, and the expansion guard reads
+# those keys to know which files to scan.
+stub_config_file_json() {
+  local token previous="" userconfig=""
+  for token in "$@"; do
+    [[ "${previous}" == "--userconfig" ]] && userconfig="${token}"
+    [[ "${token}" == --userconfig=* ]] && userconfig="${token#--userconfig=}"
+    previous="${token}"
+  done
+  if [[ -n "${userconfig}" ]]; then
+    jq -cn --arg v "${userconfig}" '{userconfig: $v}'
+  else
+    printf '{}'
+  fi
 }
 
 if [[ "${tool}" == "npm" && "${1:-}" == "config" && "${2:-}" == "list" ]]; then
@@ -149,8 +174,9 @@ if [[ "${tool}" == "npm" && "${1:-}" == "config" && "${2:-}" == "list" ]]; then
       --arg cpu "$(stub_effective_platform cpu "$@")" \
       '{os: (if $os == "" then null else $os end), cpu: (if $cpu == "" then null else $cpu end)}')"
     cwd_json="$(stub_cwd_dependent_rc_json)"
+    files_json="$(stub_config_file_json "$@")"
     jq -cn --argjson a "${effective_json}" --argjson b "${registry_json}" --argjson c "${platform_json}" \
-      --argjson d "${cwd_json}" '$b * $d * $c * $a' 2>/dev/null \
+      --argjson d "${cwd_json}" --argjson e "${files_json}" '$b * $d * $e * $c * $a' 2>/dev/null \
       || printf '%s\n' "${effective_json}"
   else
     printf 'package-lock=true\nignore-scripts=true\n'
@@ -2685,25 +2711,90 @@ case_npm_lockdiff_mirrors_file_dependency_manifest() {
 case_npm_lockdiff_refuses_cwd_dependent_config() {
   skip_lockdiff_case "$FUNCNAME" || return
   prepare_lockdiff_case "npm-lockdiff-cwd-dependent-config"
-  # Copying the config files does not copy what they RESOLVE to: npm expands
-  # ${PWD} against the cwd of the process reading it, so the same .npmrc gives
-  # the projection a different setting than the delegate gets and the audit
-  # would vouch for an artifact resolved elsewhere (r1 review F3). The two
-  # probes are compared whole, so this is caught generically rather than by
-  # enumerating the spellings that can do it.
+  # Copying the config files does not copy what they RESOLVE to: npm resolves
+  # a relative path value against the cwd of the process reading it, so the
+  # same .npmrc gives the projection a different setting than the delegate
+  # gets and the audit would vouch for an artifact resolved elsewhere (r1
+  # review F3). The two probes are compared whole, so this is caught
+  # generically. The divergence here carries no ${} reference on purpose —
+  # that class refuses earlier, at the expansion guard, and this case has to
+  # keep exercising the comparison itself.
   install_lockdiff_package kept 1.0.0
-  printf 'registry=https://npm.example.test/${PWD}/\n' > "${WORK_DIR}/.npmrc"
+  printf 'cache=./cache\n' > "${WORK_DIR}/.npmrc"
   printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
   local lock='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/kept":{"version":"1.0.0"}}}'
   printf '%s\n' "${lock}" > "${WORK_DIR}/package-lock.json"
   NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
   assert_status 100 "$FUNCNAME" || return
-  assert_err_contains_fragment 'effective npm config resolves differently inside the lock-diff projection (registry)' "$FUNCNAME" || return
+  assert_err_contains_fragment 'effective npm config resolves differently inside the lock-diff projection (cache)' "$FUNCNAME" || return
   assert_err_contains_fragment 'cannot be mirrored; make those values absolute and retry' "$FUNCNAME" || return
   [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
   # The projection must not run on a config the audit cannot vouch for.
   assert_log_not_contains_fragment $'PROJECTION\tnpm\t' "$FUNCNAME" || return
   assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_refuses_lane_divergent_expansion() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-lane-divergent-expansion"
+  # npm expands ${VAR} in every config VALUE — including the secret-bearing
+  # keys it then omits from `config list --json`, so an auth token built from
+  # ${PWD} hands the two lanes different credentials while both parity objects
+  # look identical (r2 review F3). The variables that can differ between the
+  # lanes are enumerable, so they are refused at the config source instead.
+  install_lockdiff_package kept 1.0.0
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  local lock='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/kept":{"version":"1.0.0"}}}'
+  printf '%s\n' "${lock}" > "${WORK_DIR}/package-lock.json"
+
+  # The r2 reproduction: a credential the parity comparison can never see.
+  printf '//registry.example/:_authToken=${PWD}\n' > "${WORK_DIR}/.npmrc"
+  NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME (project rc)" || return
+  assert_err_contains_fragment "${WORK_DIR}/.npmrc references \${PWD}" "$FUNCNAME (project rc)" || return
+  assert_err_contains_fragment 'expands against each process' "$FUNCNAME (project rc)" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME (project rc)"; return 1; }
+  assert_log_not_contains_fragment $'PROJECTION\tnpm\t' "$FUNCNAME (project rc)" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (project rc)" || return
+
+  # An invariant that exists only inside the projection's environment.
+  : > "${LOG_FILE}"
+  printf 'registry=https://npm.example.test/${npm_config_ignore_scripts}/\n' > "${WORK_DIR}/.npmrc"
+  NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME (projection invariant)" || return
+  assert_err_contains_fragment 'references ${npm_config_ignore_scripts}' "$FUNCNAME (projection invariant)" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (projection invariant)" || return
+
+  # The effective userconfig is scanned too, at the path npm reports.
+  : > "${LOG_FILE}"
+  rm -f "${WORK_DIR}/.npmrc"
+  printf 'registry=https://npm.example.test/${PWD}/\n' > "${CASE_DIR}/user-pwd.npmrc"
+  NPM_LOCK_MUTATION_JSON="${lock}" \
+    SAFE_INSTALL_TEST_SCRIPT="npm dedupe --userconfig ${CASE_DIR}/user-pwd.npmrc" run_zsh
+  assert_status 100 "$FUNCNAME (userconfig)" || return
+  assert_err_contains_fragment "${CASE_DIR}/user-pwd.npmrc references \${PWD}" "$FUNCNAME (userconfig)" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (userconfig)" || return
+
+  # An npm_config_* environment value carries the same expansion.
+  : > "${LOG_FILE}"
+  npm_config_os='${PWD}' NPM_LOCK_MUTATION_JSON="${lock}" \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME (env)" || return
+  assert_err_contains_fragment 'npm_config_os references ${PWD}' "$FUNCNAME (env)" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (env)" || return
+
+  # The boundary: a reference both lanes resolve identically keeps working —
+  # the delegate is exec'd from this same environment — and npm expands ONLY
+  # the exact braced spelling, so $PWD and ${PWD:-x} are literal strings to it.
+  # A commented-out reference is not a reference at all.
+  : > "${LOG_FILE}"
+  printf '//registry.example/:_authToken=${NPM_TOKEN}\ncpu=$PWD\nsearchlimit=${PWD:-fallback}\n; cache=${PWD}/cache\n#registry=https://old.example/${PWD}/\n' \
+    > "${WORK_DIR}/.npmrc"
+  NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 0 "$FUNCNAME (shared and literal references)" || return
+  assert_err_not_contains_fragment 'expands against each process' "$FUNCNAME (shared and literal references)" || return
+  assert_log_contains $'REAL\tnpm\tdedupe' "$FUNCNAME (shared and literal references)" || return
   pass "$FUNCNAME"
 }
 
@@ -6117,6 +6208,7 @@ main() {
     case_npm_lockdiff_mirrors_file_dependency_manifest \
     case_npm_lockdiff_manifest_copy_failure_is_one_line \
     case_npm_lockdiff_refuses_cwd_dependent_config \
+    case_npm_lockdiff_refuses_lane_divergent_expansion \
     case_npm_lockdiff_refuses_nonregistry_reify_candidate \
     case_npm_lockdiff_projection_sees_project_npmrc \
     case_npm_dedupe_lockdiff_introduced_block_refuses_without_delegation \
