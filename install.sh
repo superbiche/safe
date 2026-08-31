@@ -49,6 +49,21 @@ info() { printf '\033[36minstall:\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[33minstall:\033[0m %s\n' "$*" >&2; }
 die()  { err "$@"; exit 1; }
 
+# Stage a replacement BESIDE the file it will replace, and print its path.
+#
+# `mv` is an atomic rename only within one filesystem, and $TMPDIR is routinely
+# a tmpfs while safe's config tree is not. Across the two, `mv` degrades to
+# copy-then-unlink: for the length of the copy every concurrent reader of the
+# destination sees a truncated file. install.sh replaces live state — trust
+# stores and the scanner cache — that a gated build running at the same moment
+# reads, and a torn read of the scanner cache is exactly what once failed the
+# gate closed on scanners that were installed all along. Same directory, same
+# filesystem, so the `mv` is a rename(2).
+stage_beside() {
+  local dest="$1"
+  mktemp "$dest.XXXXXX" || die "cannot stage a write next to $dest"
+}
+
 # A previous safe install may still own `go` on PATH while this invocation is
 # rebuilding its target HOME. Calling that wrapper before this installer has
 # copied gate-lib.sh into the target config fails bootstrap. Select the first
@@ -365,7 +380,7 @@ merge_unique_lines() {
   mkdir -p "$(dirname "$dst")"
   touch "$dst"
   local tmp
-  tmp=$(mktemp)
+  tmp=$(stage_beside "$dst")
   awk '!seen[$0]++' "$dst" "$src" > "$tmp"
   mv "$tmp" "$dst"
 }
@@ -416,7 +431,7 @@ merge_json_prefer_legacy() {
     return 0
   fi
   local tmp
-  tmp=$(mktemp)
+  tmp=$(stage_beside "$current")
   jq -s "$query" "$current" "$legacy" > "$tmp"
   mv "$tmp" "$current"
 }
@@ -478,7 +493,7 @@ merge_audit_config_state() {
           end
         )
     ' > "$normalized_tools"
-    tmp=$(mktemp)
+    tmp=$(stage_beside "$AUDIT_CONFIG_DIR/tools.json")
     if jq -s '((.[0] // {}) + (.[1] // {}))' "$AUDIT_CONFIG_DIR/tools.json" "$normalized_tools" > "$tmp" \
        && jq -e -s 'length == 1 and (.[0] | type == "object")' "$tmp" >/dev/null 2>&1; then
       mv "$tmp" "$AUDIT_CONFIG_DIR/tools.json"

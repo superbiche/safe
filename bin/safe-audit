@@ -7235,8 +7235,11 @@ revoke_install_known() {
     if [[ "$v" == "$entry_version" ]]; then
       # Staged beside the receipts file, not in $TMPDIR: this is a shared path
       # every gated install reads, and a cross-device `mv` would leave it
-      # truncated mid-replace.
-      tmp=$(mktemp "$INSTALL_KNOWN_FILE.XXXXXX") || return 0
+      # truncated mid-replace. A staging failure is fatal, never a skip:
+      # silently not revoking would leave clean evidence standing against the
+      # adverse knowledge that just superseded it (PR#29 finding 5).
+      tmp=$(mktemp "$INSTALL_KNOWN_FILE.XXXXXX") \
+        || die "cannot stage a write next to $INSTALL_KNOWN_FILE — audit-infrastructure breakage, not a package finding; check the config directory and rerun"
       jq --arg k "$key" 'del(.packages[$k])' "$INSTALL_KNOWN_FILE" > "$tmp" && mv "$tmp" "$INSTALL_KNOWN_FILE"
       return 0
     fi
@@ -7259,8 +7262,9 @@ mark_install_known() {
   source_id=$(source_identity)
   mkdir -p "$SAFE_RUN_CONFIG_DIR"
   [[ -f "$INSTALL_KNOWN_FILE" ]] || printf '{"packages":{}}\n' > "$INSTALL_KNOWN_FILE"
-  # Staged beside the receipts file — see revoke_install_known.
-  tmp=$(mktemp "$INSTALL_KNOWN_FILE.XXXXXX") || return 0
+  # Staged beside the receipts file, fatal on failure — see revoke_install_known.
+  tmp=$(mktemp "$INSTALL_KNOWN_FILE.XXXXXX") \
+    || die "cannot stage a write next to $INSTALL_KNOWN_FILE — audit-infrastructure breakage, not a package finding; check the config directory and rerun"
   jq --arg k "$key" --arg v "$version" --arg verdict "$verdict" \
     --argjson reasons "$reasons_json" --arg ev "$evidence" \
     --arg src "$source_id" \
