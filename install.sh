@@ -217,14 +217,42 @@ write_gate_wrapper() {
     # mise multiplexes on argv[0]: its shims are symlinks to whatever `mise`
     # resolves to on PATH, and a reshim run while this wrapper shadows the
     # real binary binds every shim here (2026-08-02: all 36 shims broke and
-    # every node-family tool executed mise bare). A shim dispatch must reach
-    # the real mise with argv[0] intact and must never enter the gate. The
-    # branch is self-contained (no `safe gate` involvement) so a gate bug
-    # can never take the whole shim fleet down with it.
-    cat > "$target" <<'EOF' || return 1
-#!/usr/bin/env bash
-# safe-gate-wrapper v1 tool=mise
-if [[ "${0##*/}" != "mise" ]]; then
+    # every node-family tool executed mise bare). So an argv[0] that is not
+    # `mise` is a shim dispatch, and it splits two ways.
+    #
+    # A shim named after a GATED tool was a silent bypass: on any PATH that
+    # puts the shims dir ahead of this one — `mise activate` in a
+    # non-interactive shell, an agent harness environment — `npm install` and
+    # `yarn install` resolved to the shim, forwarded to the real installer
+    # with argv[0] intact, and installed with zero audit while the same
+    # command through $BIN_DIR/npm audited (2026-08-31: two full 500+-package
+    # yarn installs went through ungated). Gated argv[0]s therefore enter the
+    # gate, and fail closed if safe is broken — exactly what the plain npm
+    # wrapper beside this one already does.
+    #
+    # Every other shim name (node, java, gemini, …) keeps the self-contained
+    # forward to the real mise with argv[0] intact and never enters the gate,
+    # so the 2026-08-02 property still holds where it matters: a gate bug can
+    # never take the whole shim fleet down with it.
+    #
+    # The gated list is spliced from GATE_TOOLS at install time — a
+    # hand-maintained second copy would drift the day a tool is added.
+    local gated="" candidate
+    for candidate in "${GATE_TOOLS[@]}"; do
+      [[ "$candidate" == "mise" ]] && continue
+      gated+="${gated:+ }$(printf '%q' "$candidate")"
+    done
+    {
+      printf '%s\n' '#!/usr/bin/env bash'
+      printf '%s\n' '# safe-gate-wrapper v1 tool=mise'
+      printf '__safe_gated_argv0s=(%s)\n' "$gated"
+      cat <<'EOF'
+__safe_argv0="${0##*/}"
+if [[ "$__safe_argv0" != "mise" ]]; then
+  for __t in "${__safe_gated_argv0s[@]}"; do
+    [[ "$__safe_argv0" == "$__t" ]] || continue
+    exec safe gate "$__safe_argv0" -- "$@"
+  done
   IFS=: read -ra __dirs <<< "$PATH"
   for __d in "${__dirs[@]}"; do
     [[ -n "$__d" ]] || continue
@@ -234,11 +262,12 @@ if [[ "${0##*/}" != "mise" ]]; then
     LC_ALL=C head -n 2 -- "$__c" 2>/dev/null | grep -q '^# safe-gate-wrapper' && continue
     exec -a "$0" "$__c" "$@"
   done
-  printf 'safe gate: real mise not found on PATH (argv0 dispatch for %s)\n' "${0##*/}" >&2
+  printf 'safe gate: real mise not found on PATH (argv0 dispatch for %s)\n' "$__safe_argv0" >&2
   exit 127
 fi
 exec safe gate mise -- "$@"
 EOF
+    } > "$target" || return 1
     chmod 0755 "$target" || return 1
     return 0
   fi
@@ -326,6 +355,43 @@ install_gate_wrappers() {
   if [[ "${#skipped[@]}" -gt 0 ]]; then
     warn "kept existing non-safe files, gating NOT active for: ${skipped[*]} (remove them and re-run to gate these tools)"
   fi
+}
+
+# Gate coverage under mise depends on the shims pointing HERE: a shims dir
+# whose symlinks resolve to the real mise never runs the wrapper, so a gated
+# tool name arriving through it is ungated no matter what the wrapper does.
+# Re-point them. Only symlinks — a regular file in that directory is not
+# something mise generated, and a wrapper that is not ours is never a target
+# (re-pointing 36 shims at a foreign file is precisely the 2026-08-02 breakage
+# the argv0 dispatch exists to prevent).
+normalize_mise_shims() {
+  local wrapper="$BIN_DIR/mise"
+  local shims_dir="${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims"
+  local shim repointed=0 kept=0 foreign=0
+
+  [[ -d "$shims_dir" ]] || return 0
+  if ! gate_wrapper_marked "$wrapper" mise; then
+    info "left the mise shims in $shims_dir alone: $wrapper is not a safe gate wrapper"
+    return 0
+  fi
+
+  while IFS= read -r -d '' shim; do
+    if [[ ! -L "$shim" ]]; then
+      foreign=$((foreign + 1))
+      continue
+    fi
+    if [[ "$shim" -ef "$wrapper" ]]; then
+      kept=$((kept + 1))
+      continue
+    fi
+    if ln -sfn -- "$wrapper" "$shim"; then
+      repointed=$((repointed + 1))
+    else
+      warn "could not re-point mise shim $shim at $wrapper — tools reached through it stay ungated"
+    fi
+  done < <(find "$shims_dir" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+
+  info "mise shims in $shims_dir: $repointed re-pointed at the gate wrapper, $kept already bound, $foreign non-symlink left alone"
 }
 
 migrate_dir() {
@@ -646,6 +712,7 @@ if (( DO_WRAPPERS )); then
   install -m 0644 "$REPO_DIR/lib/install-wrappers.zsh" "$WRAPPER_TARGET"
   install -m 0644 "$REPO_DIR/lib/gate-lib.sh" "$GATE_LIB_TARGET"
   install_gate_wrappers
+  normalize_mise_shims
   touch "$ZSHRC"
   if grep -Fqx "$SOURCE_LINE" "$ZSHRC" || grep -Fqx 'source ~/.config/safe/install-wrappers.zsh' "$ZSHRC"; then
     info "wrapper source line already present in $ZSHRC"

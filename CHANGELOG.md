@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+- **Package installs reached through a mise shim were completely ungated, and
+  now enter the gate** (1.56.0). mise's shims are symlinks to whatever `mise`
+  resolved to at reshim time, which on a gated machine is safe's own mise
+  wrapper — and that wrapper's argv[0] dispatch, written to keep the shim fleet
+  alive through a gate bug (2026-08-02), forwarded EVERY non-`mise` argv[0]
+  straight to the real binary without auditing. When the shim's name was itself
+  a gated tool, that was a silent bypass:
+  `~/.local/share/mise/shims/npm install <pkg>` ran the real npm with zero
+  audit while `npm install <pkg>` through `~/.local/bin` audited normally. Any
+  PATH that puts the shims dir ahead of `~/.local/bin` — `mise activate` in a
+  non-interactive shell, an agent harness environment, `mise exec -- yarn …` —
+  therefore installed unaudited by default, and two full 500+-package
+  `yarn install` runs went through that way before it was noticed. The gate's
+  coverage claim was false on exactly the spelling mise users reach for first.
+  A gated argv[0] now enters the gate under its own tool name and fails closed
+  if safe is broken, the same as the plain `npm` wrapper beside it; every other
+  shim name (node, java, …) keeps the self-contained forward to the real mise,
+  so a gate bug still cannot take the whole shim fleet down. The gated list is
+  spliced from the installer's tool table, never hand-maintained twice.
+  - **Install re-points mise shims at the gate wrapper.** Coverage depends on
+    the shims resolving to the wrapper at all: a shims directory left bound to
+    the real mise never runs it. `install.sh` now re-points those symlinks and
+    reports the counts. Regular files in that directory are left alone, and
+    nothing is re-pointed unless `~/.local/bin/mise` is safe's own wrapper.
+  - **Uninstall puts the shims back.** Because that binding is now the default
+    on every install, removing the wrapper without restoring them would leave
+    every mise-managed tool — node and java included, not just the gated ones —
+    a dangling symlink until someone thought to run `mise reshim`. Removing the
+    gate must not uninstall the tools it was gating, so `uninstall.sh`
+    re-points the shims bound to the wrapper it is removing at the first
+    non-wrapper `mise` on PATH. When none resolves it leaves them in place and
+    says to reshim; it never deletes a shim.
+  - **The gate's mise-shim delegate no longer goes through the shim.** When the
+    real tool safe resolves to is a mise shim, the gate now execs the real mise
+    under the tool's argv[0] directly — doing what the shim's dispatch did,
+    without the round trip that would otherwise loop back into the gate
+    forever. The loop is broken structurally; there is still no re-entry
+    env-var, which would be a forgeable bypass.
+
 - **govulncheck coverage was structurally broken on every real Go project, and
   now works** (1.55.0). The lane validated `govulncheck -json` as NDJSON —
   split on newlines, every non-blank line must parse — but govulncheck emits a

@@ -180,6 +180,7 @@ safe_gate_exec_real() {
   local tool="$1"
   shift
   local real
+  local exec_argv0=""
 
   if [[ "${SAFE_GATE_NO_EXEC:-}" == "1" ]]; then
     return 0
@@ -191,6 +192,26 @@ safe_gate_exec_real() {
     # a policy refusal is never 127.
     safe_gate_err "safe: gate: ${tool}: command not found (no non-wrapper ${tool} on PATH)"
     exit 127
+  fi
+
+  # The delegate resolve_real hands back for a node tool is often the mise
+  # shim itself — a file named <tool> whose marker says tool=mise (see the
+  # acceptance there). Since 1.56.0 that shim's argv0 dispatch routes gated
+  # names back into the gate, so exec'ing it here would loop: wrapper -> gate
+  # -> shim -> wrapper. Do directly what the dispatch did instead — exec the
+  # real mise under the tool's argv[0], which is what mise multiplexes on —
+  # and the recursion is broken structurally rather than by a skip switch a
+  # caller could forge.
+  if [[ "$tool" != "mise" ]] \
+    && [[ "$(safe_gate_wrapper_marker_tool "$real")" == "mise" ]]; then
+    local real_mise
+    real_mise="$(safe_gate_resolve_real mise)"
+    if [[ -z "$real_mise" ]]; then
+      safe_gate_err "safe: gate: ${tool}: command not found (its delegate is a mise shim and no non-wrapper mise is on PATH)"
+      exit 127
+    fi
+    exec_argv0="$tool"
+    real="$real_mise"
   fi
 
   # Install-time security scanner (Bun Security Scanner API): when the safe
@@ -222,9 +243,18 @@ safe_gate_exec_real() {
     for scrub_name in "${SAFE_GATE_ENV_SCRUB[@]}"; do
       env_u+=(-u "${scrub_name}")
     done
+    if [[ -n "$exec_argv0" ]]; then
+      # env(1) cannot set argv[0], and for a mise delegate argv[0] is what
+      # selects the tool — hop through one bash to combine the scrub with it.
+      exec env "${env_u[@]}" "${BASH:-bash}" -c \
+        'exec -a "$1" "$2" "${@:3}"' safe-gate "$exec_argv0" "$real" "$@"
+    fi
     exec env "${env_u[@]}" "$real" "$@"
   fi
 
+  if [[ -n "$exec_argv0" ]]; then
+    exec -a "$exec_argv0" "$real" "$@"
+  fi
   exec "$real" "$@"
 }
 
@@ -5670,9 +5700,11 @@ safe_gate_main() {
   }
 
   # No re-entry guard by design: recursion cannot loop (safe_gate_exec_real
-  # only ever execs a resolved non-wrapper path), and child processes that
-  # invoke a wrapped tool SHOULD be gated — an env-var skip switch would be
-  # both a forgeable bypass and a coverage hole for lifecycle scripts.
+  # only ever execs a real binary — a resolved non-wrapper path, or the real
+  # mise behind an accepted mise shim, never the shim itself), and child
+  # processes that invoke a wrapped tool SHOULD be gated — an env-var skip
+  # switch would be both a forgeable bypass and a coverage hole for lifecycle
+  # scripts.
   case "${tool}" in
     npm|pnpm|bun) safe_gate_npm_like "${tool}" "$@" ;;
     pnpx) safe_gate_pnpx "$@" ;;
