@@ -1665,25 +1665,104 @@ safe_gate_npm_lockdiff_effective_config() {
   # reaches safe-core whole.
   #
   # An empty target (npm's own reading of `--os=`) leaves the global empty and
-  # the host platform stands in safe-core. That can only over-audit: npm with
-  # an empty os excludes every platform-constrained optional, so the host view
-  # audits a superset of what the delegate fetches.
+  # the host platform stands in safe-core. That MIRRORS npm rather than
+  # approximating it: npm-install-checks resolves the constraint against
+  # `environment.os || currentEnv.os()`, so an empty target falls back to the
+  # host on npm's side too (r1 review F5).
   raw_target="$(jq -r '(if .os == null then "" else .os end) + "."' <<<"${config_json}" 2>/dev/null)" || raw_target="."
   SAFE_GATE_LOCKDIFF_TARGET_OS="${raw_target%.}"
   raw_target="$(jq -r '(if .cpu == null then "" else .cpu end) + "."' <<<"${config_json}" 2>/dev/null)" || raw_target="."
   SAFE_GATE_LOCKDIFF_TARGET_CPU="${raw_target%.}"
+  # Retained for the parity check below, which compares this object against the
+  # one the same probe returns from inside the scratch. Re-probing the project
+  # instead would measure a config that may have changed between the two calls.
+  SAFE_GATE_LOCKDIFF_CONFIG_JSON="${config_json}"
   return 0
 }
 
-# npm resolves a RELATIVE userconfig/globalconfig against the cwd, and the
-# projection's cwd is the scratch directory while the delegate's is the
-# project: the same spelling would name two different config files, so the
-# projection could vouch for an artifact fetched under other settings. Any
-# relative occurrence refuses rather than being rewritten — the precedence
-# among argv and case-variant environment spellings is npm's to resolve, not
-# something this gate reimplements. Absolute and ~-led values pass through:
-# npm expands ~ against $HOME in both argv and environment forms, so they
-# resolve identically from either cwd.
+# Copying config files into the scratch does not copy what they RESOLVE to.
+# npm expands ${PWD} in every config source and resolves path-typed values
+# against process.cwd(), so the identical file read from the project and from
+# the scratch can yield different settings — and the projection then vouches
+# for an artifact resolved under settings the delegate never uses (r1 review
+# F3). Rather than enumerate the spellings that can do this, the same probe is
+# run from inside the prepared scratch and the two effective-config objects
+# are compared whole: whatever npm reports differently is caught, including
+# spellings nothing else in this gate models.
+#
+# One probed limit is structural: npm omits secret-bearing keys (`_auth`, a
+# `//host/:_authToken` line) from `config list --json` entirely, so a
+# divergence confined to those is invisible here. It is tolerated because
+# those values are not cwd-derived — both lanes read the same files — and the
+# one transport that could make them differ, a cwd-relative userconfig, is
+# already refused by the config-path guard above.
+#
+# What npm DOES report, it reports resolved, which is why this check is worth
+# its probe: on npm 12.0.2 under this exact layout a cwd-dependent `cache`
+# (`cache=./cache`) and even a project-rc `os=${PWD}` come back expanded
+# against each probe's own cwd, so both diverge and both are caught here
+# rather than reaching the projection.
+#
+# The differing-key list is not an allowlist: it starts empty because a stock
+# project yields an identical object across two cwds under this probe layout.
+# A key that legitimately differs gets an explicit jq del() naming why it is
+# benign, never a pre-emptive exemption.
+safe_gate_npm_lockdiff_config_parity() {
+  local scratch="$1" subcommand="$2"
+  shift 2
+  local real_npm="" scratch_json="" differing=""
+
+  real_npm="$(safe_gate_resolve_real npm)" || real_npm=""
+  if [[ -z "${real_npm}" ]]; then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — projected npm config probe cannot resolve npm (audit-infrastructure breakage, not a package finding); rerun install.sh; details: safe explain"
+    return 100
+  fi
+  if scratch_json="$(
+    cd -- "${scratch}" || exit 125
+    "${real_npm}" config list \
+      --package-lock-only --ignore-scripts --no-audit --no-fund "$@" --json 2>/dev/null
+  )"; then
+    :
+  else
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — projected npm config probe failed (audit-infrastructure breakage, not a package finding); fix npm configuration and retry — safe doctor; details: safe explain"
+    return 100
+  fi
+  if ! jq -e 'type == "object"' <<<"${scratch_json}" >/dev/null 2>&1; then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — projected npm config probe returned an unreadable result (audit-infrastructure breakage, not a package finding); fix npm configuration and retry — safe doctor; details: safe explain"
+    return 100
+  fi
+  if differing="$(jq -rn \
+    --argjson project "${SAFE_GATE_LOCKDIFF_CONFIG_JSON:-null}" \
+    --argjson projected "${scratch_json}" '
+    [ (($project | keys) + ($projected | keys)) | unique | .[]
+      | select($project[.] != $projected[.]) ]
+    | join(", ")
+  ' 2>/dev/null)"; then
+    :
+  else
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — npm config cannot be compared between the project and the lock-diff projection (audit-infrastructure breakage, not a package finding); rerun install.sh and retry; details: safe explain"
+    return 100
+  fi
+  # A real project-config finding, not broken infrastructure: the settings are
+  # readable, they simply cannot survive the move into the projection.
+  if [[ -n "${differing}" ]]; then
+    safe_gate_err "safe: BLOCKED npm ${subcommand} — effective npm config resolves differently inside the lock-diff projection (${differing}); working-directory-dependent config (\${PWD}, relative paths) cannot be mirrored; make those values absolute and retry; details: safe explain"
+    return 100
+  fi
+  return 0
+}
+
+# npm resolves a userconfig/globalconfig path against the cwd unless it is
+# already absolute, and the projection's cwd is the scratch directory while
+# the delegate's is the project: such a spelling names two different config
+# files, so the projection could vouch for an artifact fetched under other
+# settings. Only two forms resolve identically from either cwd and pass here:
+# a `/`-led path, and a `~/`-led one, which npm expands against $HOME in both
+# its argv and environment forms. Every other non-empty value refuses rather
+# than being rewritten — npm expands ONLY the `~/` prefix, so `~root/.npmrc`,
+# `~foo` and a bare `~` are ordinary cwd-relative names to it (r1 review F2),
+# and the precedence among argv and case-variant environment spellings is
+# npm's to resolve, not something this gate reimplements.
 safe_gate_npm_lockdiff_config_path_guard() {
   local subcommand="$1"
   shift
@@ -1706,8 +1785,8 @@ safe_gate_npm_lockdiff_config_path_guard() {
     # projection can mirror. The environment loop below skips empty instead —
     # there npm's own reading is unset.
     [[ -n "${kind}" ]] || continue
-    if [[ "${value}" != /* && "${value}" != '~'* ]]; then
-      safe_gate_err "safe: BLOCKED npm ${subcommand} — --${kind} names a relative path, which cannot be mirrored into the lock-diff projection; retry with an absolute path; details: safe explain"
+    if [[ "${value}" != /* && "${value}" != '~/'* ]]; then
+      safe_gate_err "safe: BLOCKED npm ${subcommand} — --${kind} names a path npm resolves against the current directory, which cannot be mirrored into the lock-diff projection; retry with an absolute or ~/ path; details: safe explain"
       return 100
     fi
   done
@@ -1722,8 +1801,8 @@ safe_gate_npm_lockdiff_config_path_guard() {
     esac
     value="${!key}"
     [[ -n "${value}" ]] || continue
-    if [[ "${value}" != /* && "${value}" != '~'* ]]; then
-      safe_gate_err "safe: BLOCKED npm ${subcommand} — ${key} names a relative path, which cannot be mirrored into the lock-diff projection; retry with an absolute path; details: safe explain"
+    if [[ "${value}" != /* && "${value}" != '~/'* ]]; then
+      safe_gate_err "safe: BLOCKED npm ${subcommand} — ${key} names a path npm resolves against the current directory, which cannot be mirrored into the lock-diff projection; retry with an absolute or ~/ path; details: safe explain"
       return 100
     fi
   done
@@ -1746,7 +1825,7 @@ safe_gate_npm_lockdiff_config_path_guard() {
 # chain is root-only, so a member rc file governs nothing in either lane.
 safe_gate_npm_lockdiff_mirror_manifests() {
   local project_dir="$1" scratch="$2" subcommand="$3"
-  local patterns="" pattern manifest relative parent
+  local patterns="" pattern normalized manifest relative parent
 
   if patterns="$(jq -er '
     (.workspaces // [])
@@ -1764,11 +1843,21 @@ safe_gate_npm_lockdiff_mirror_manifests() {
 
   # A pattern reaching outside the project root names members the sweep below
   # cannot mirror, and npm accepts such a pattern rather than rejecting it.
+  # The residue judged here is normalized the way npm READS a pattern, not the
+  # way it enumerates members: leading negations are stripped (parity is
+  # irrelevant to whether the residue escapes), backslashes become `/` (npm 12
+  # converts them, so `..\outside` escaped a raw-text guard — r1 review F1),
+  # and a leading `/` is dropped (npm treats it as root-relative, so refusing
+  # `/packages/*` was a false refusal). A `~`-led residue stays: npm expands no
+  # tilde in a workspace pattern, it is an in-root directory name.
   while IFS= read -r pattern; do
     [[ -n "${pattern}" ]] || continue
-    if [[ "${pattern}" == /* || "${pattern}" == '~'* \
-      || "${pattern}" == ".." || "${pattern}" == "../"* \
-      || "${pattern}" == *"/.." || "${pattern}" == *"/../"* ]]; then
+    normalized="${pattern}"
+    while [[ "${normalized}" == '!'* ]]; do normalized="${normalized#!}"; done
+    normalized="${normalized//\\//}"
+    while [[ "${normalized}" == /* ]]; do normalized="${normalized#/}"; done
+    if [[ "${normalized}" == ".." || "${normalized}" == "../"* \
+      || "${normalized}" == *"/.." || "${normalized}" == *"/../"* ]]; then
       safe_gate_err "safe: BLOCKED npm ${subcommand} — workspace pattern ${pattern} reaches outside the project root, so its members cannot be mirrored into the lock-diff projection; scope workspaces inside the project and retry; details: safe explain"
       return 100
     fi
@@ -1788,12 +1877,12 @@ safe_gate_npm_lockdiff_mirror_manifests() {
     relative="${manifest#"${project_dir}/"}"
     [[ "${relative}" != "${manifest}" ]] || continue
     parent="$(dirname -- "${relative}")"
-    if [[ "${parent}" != "." ]] && ! mkdir -p -- "${scratch}/${parent}"; then
+    if [[ "${parent}" != "." ]] && ! mkdir -p -- "${scratch}/${parent}" 2>/dev/null; then
       rm -f -- "${scratch}/safe-manifest-sweep.list"
       safe_gate_err "safe: BLOCKED npm ${subcommand} — cannot mirror in-project package.json manifests into the lock-diff projection (audit-infrastructure breakage, not a package finding); verify project files and retry; details: safe explain"
       return 100
     fi
-    if ! cp -- "${manifest}" "${scratch}/${relative}"; then
+    if ! cp -- "${manifest}" "${scratch}/${relative}" 2>/dev/null; then
       rm -f -- "${scratch}/safe-manifest-sweep.list"
       safe_gate_err "safe: BLOCKED npm ${subcommand} — cannot mirror in-project package.json manifests into the lock-diff projection (audit-infrastructure breakage, not a package finding); verify project files and retry; details: safe explain"
       return 100
@@ -2113,8 +2202,8 @@ safe_gate_npm_lockdiff_preflight() {
     safe_gate_err "safe: BLOCKED npm ${subcommand} — cannot allocate lock-diff projection storage (audit-infrastructure breakage, not a package finding); retry after fixing temporary storage; details: safe explain"
     return 100
   }
-  if ! cp -- "${project_dir}/package.json" "${scratch}/package.json" \
-      || ! cp -- "${project_dir}/${lockfile_name}" "${scratch}/${lockfile_name}"; then
+  if ! cp -- "${project_dir}/package.json" "${scratch}/package.json" 2>/dev/null \
+      || ! cp -- "${project_dir}/${lockfile_name}" "${scratch}/${lockfile_name}" 2>/dev/null; then
     rm -rf -- "${scratch}"
     safe_gate_err "safe: BLOCKED npm ${subcommand} — cannot copy lock-diff projection inputs (audit-infrastructure breakage, not a package finding); verify project files and retry; details: safe explain"
     return 100
@@ -2123,12 +2212,21 @@ safe_gate_npm_lockdiff_preflight() {
   # registries, scoped registries) or it can vouch for a different artifact
   # than the delegate fetches (PR#70 review F3, same ruling). The
   # package-lock=false shape inside it was already refused above.
-  if [[ -f "${project_dir}/.npmrc" ]] && ! cp -- "${project_dir}/.npmrc" "${scratch}/.npmrc"; then
+  if [[ -f "${project_dir}/.npmrc" ]] && ! cp -- "${project_dir}/.npmrc" "${scratch}/.npmrc" 2>/dev/null; then
     rm -rf -- "${scratch}"
     safe_gate_err "safe: BLOCKED npm ${subcommand} — cannot copy the project .npmrc into the lock-diff projection (audit-infrastructure breakage, not a package finding); verify project files and retry; details: safe explain"
     return 100
   fi
   if safe_gate_npm_lockdiff_mirror_manifests "${project_dir}" "${scratch}" "${subcommand}"; then
+    :
+  else
+    rc=$?
+    rm -rf -- "${scratch}"
+    return "${rc}"
+  fi
+  # Last preparation step before the projection runs: the scratch is complete,
+  # so what npm resolves inside it is what the projection will resolve.
+  if safe_gate_npm_lockdiff_config_parity "${scratch}" "${subcommand}" "$@"; then
     :
   else
     rc=$?

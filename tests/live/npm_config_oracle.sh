@@ -156,8 +156,8 @@ npmrc 'os=aix'
   || fail "an .npmrc os=aix did not reach the target"
 
 # npm reports an empty argv target as "", which leaves the host platform
-# standing in safe-core — the over-auditing direction, since npm with an empty
-# os excludes every platform-constrained optional.
+# standing in safe-core — the same fallback npm-install-checks makes with
+# `environment.os || currentEnv.os()` (r1 review F5).
 npmrc ''
 [[ -z "$(target_os dedupe --os=)" ]] \
   && pass "an empty argv target leaves the host platform standing" \
@@ -178,6 +178,81 @@ if [[ "${from_project}" == "fromrelative" && "${from_elsewhere}" == "unset" ]]; 
 else
   fail "relative --userconfig resolution changed: project=${from_project} elsewhere=${from_elsewhere}"
 fi
+
+# --- effective-config parity across cwds -------------------------------------
+
+# Copying config files into the projection does not copy what they RESOLVE to:
+# npm expands values against the cwd of the process reading them, so the same
+# files can hand the projection different settings than the delegate gets (r1
+# review F3). The parity check compares the same probe run from the project
+# and from the prepared scratch; these assertions pin the npm behaviors that
+# check depends on.
+
+PARITY_SCRATCH="${WORK}/parity-scratch"
+mkdir -p "${PARITY_SCRATCH}"
+printf '{"name":"live-oracle","version":"1.0.0"}\n' > "${PARITY_SCRATCH}/package.json"
+
+# The probe layout the gate uses, verbatim, from an arbitrary cwd.
+parity_probe() {
+  ( cd -- "$1" && "${real_npm}" config list \
+      --package-lock-only --ignore-scripts --no-audit --no-fund dedupe "${@:2}" --json 2>/dev/null )
+}
+
+npmrc ''
+: > "${PARITY_SCRATCH}/.npmrc"
+project_config="$(parity_probe "${WORK}")"
+scratch_config="$(parity_probe "${PARITY_SCRATCH}")"
+if [[ -n "${project_config}" ]] \
+  && jq -en --argjson a "${project_config}" --argjson b "${scratch_config}" '$a == $b' >/dev/null 2>&1; then
+  pass "a stock project's effective config is identical from either cwd (empty allowlist is earned)"
+else
+  fail "stock config differs across cwds: $(jq -rn --argjson a "${project_config:-null}" --argjson b "${scratch_config:-null}" '[((($a|keys)+($b|keys))|unique)[]|select($a[.] != $b[.])] | join(", ")' 2>/dev/null)"
+fi
+
+# The F3 reproduction shape: one absolute userconfig, two cwds, two values.
+printf 'registry=https://npm.example.test/${PWD}/\n' > "${WORK}/pwd-user.npmrc"
+from_project="$(parity_probe "${WORK}" --userconfig "${WORK}/pwd-user.npmrc" | jq -r '.registry')"
+from_scratch="$(parity_probe "${PARITY_SCRATCH}" --userconfig "${WORK}/pwd-user.npmrc" | jq -r '.registry')"
+if [[ -n "${from_project}" && "${from_project}" != "${from_scratch}" ]]; then
+  pass "a userconfig \${PWD} value resolves per-cwd (the divergence parity catches)"
+else
+  fail "userconfig \${PWD} did not diverge: project=${from_project} scratch=${from_scratch}"
+fi
+
+# Reported values come back RESOLVED, so cwd-dependent settings are visible to
+# the comparison rather than hidden from it — including the target platform
+# itself, whose divergence would re-aim the reify exemption.
+npmrc 'os=${PWD}'
+cp -- "${WORK}/.npmrc" "${PARITY_SCRATCH}/.npmrc"
+from_project="$(parity_probe "${WORK}" | jq -r '.os')"
+from_scratch="$(parity_probe "${PARITY_SCRATCH}" | jq -r '.os')"
+if [[ "${from_project}" == "${WORK}" && "${from_scratch}" == "${PARITY_SCRATCH}" ]]; then
+  pass "a project-rc os=\${PWD} expands per-cwd and is visible to the parity check"
+else
+  fail "project-rc os=\${PWD} did not expand per-cwd: project=${from_project} scratch=${from_scratch}"
+fi
+
+npmrc 'cache=./cache'
+cp -- "${WORK}/.npmrc" "${PARITY_SCRATCH}/.npmrc"
+from_project="$(parity_probe "${WORK}" | jq -r '.cache')"
+from_scratch="$(parity_probe "${PARITY_SCRATCH}" | jq -r '.cache')"
+if [[ "${from_project}" == "${WORK}/cache" && "${from_scratch}" == "${PARITY_SCRATCH}/cache" ]]; then
+  pass "a relative cache is reported resolved per-cwd, so parity catches it too"
+else
+  fail "relative cache was not reported per-cwd: project=${from_project} scratch=${from_scratch}"
+fi
+
+# The one class npm keeps OUT of this output: secret-bearing keys. A
+# divergence confined to them is invisible here, which is why the config-path
+# guard refuses the cwd-relative userconfig that could create one.
+printf '//registry.npmjs.org/:_authToken=live-oracle-not-a-real-token\n_auth=bGl2ZS1vcmFjbGU=\n' > "${WORK}/auth.npmrc"
+auth_keys="$(parity_probe "${WORK}" --userconfig "${WORK}/auth.npmrc" | jq -r '[keys[] | select(startswith("_") or startswith("//"))] | join(", ")')"
+if [[ -z "${auth_keys}" ]]; then
+  pass "secret-bearing config keys are omitted from config list --json (documented parity blind spot)"
+else
+  fail "secret-bearing keys appear in config list --json: ${auth_keys}"
+fi
+rm -f -- "${PARITY_SCRATCH}/.npmrc"
 
 # --- registry-provenance oracle ---------------------------------------------
 

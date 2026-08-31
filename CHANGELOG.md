@@ -18,7 +18,8 @@
     already decides `package-lock`/`ignore-scripts`, and the argv scanner is
     deleted. An unreadable `os`/`cpu` is audit-infrastructure breakage (exit
     100); a target npm reports as empty leaves the host platform standing,
-    which can only over-audit.
+    which is what npm itself does — `npm-install-checks` resolves an entry's
+    constraint against `environment.os || currentEnv.os()`.
   - **A relative `--userconfig`/`--globalconfig` refuses** (exit 100). npm
     resolves those paths against the cwd, which is the project for the
     delegate and the scratch for the projection, so one spelling names two
@@ -44,6 +45,21 @@
     indistinguishable without reimplementing that discovery. Member-level
     `.npmrc` files are deliberately not mirrored: npm's config chain is
     root-only.
+  - **Config that resolves differently inside the projection refuses** (exit
+    100). Copying the config files does not copy what they resolve to: npm
+    expands `${PWD}` and resolves relative paths against the cwd of the
+    process reading them, so the same `.npmrc` or the same absolute
+    `--userconfig` hands the projection different settings than the delegate
+    gets — a different registry, cache, CA file, or even a different target
+    platform. The gate now runs its effective-config probe a second time from
+    inside the prepared scratch and compares the two objects whole, naming the
+    keys that differ. The comparison is generic, so it catches spellings
+    nothing else in the gate models; it starts with no exemptions, because a
+    stock project resolves identically from either directory. Secret-bearing
+    keys are the one blind spot — npm omits them from that output — and the
+    transport that could make them diverge is the relative `--userconfig`
+    already refused above. Cost: one additional `npm config list` per
+    `dedupe`/`prune`.
   - **In-project `file:` dependencies stop failing the projection.** The same
     manifest sweep carries their `package.json` into the scratch, so a project
     depending on `file:./local-pkg` no longer refuses with a false "lock-diff
