@@ -429,23 +429,78 @@ case_an_unreadable_cache_refuses_the_whole_scan() {
   # End to end: the startup normalizer cannot write `{}` over a directory
   # either, and an unguarded redirect would fail that with a raw shell error.
   # The refusal must be safe's own single line, in the infrastructure wording.
+  #
+  # The line COUNT is the assertion, not a substring. A substring check passes
+  # just as happily on two lines as on one, and two lines is exactly the bug
+  # this guards: `> "$FILE" 2>/dev/null` silences stderr only AFTER bash has
+  # already tried to open the file and printed its own diagnostic, so the
+  # refusal arrives as bash's "Is a directory" followed by safe's line. stderr
+  # is captured on its own so the count means what it says.
   local config_dir="$TEST_ROOT/config-unreadable-e2e"
   local project="$TEST_ROOT/unreadable-project"
+  local errfile="$TEST_ROOT/unreadable-e2e.err"
   make_unreadable_tools_file "$config_dir"
   make_scan_project "$project"
 
-  local out rc=0
-  out="$( cd "$project" && HOME="$FAKE_HOME" PATH="$SCAN_MOCKBIN:$PATH" \
+  local rc=0
+  ( cd "$project" && HOME="$FAKE_HOME" PATH="$SCAN_MOCKBIN:$PATH" \
       SAFE_AUDIT_CONFIG_DIR="$config_dir" \
       SAFE_AUDIT_DATA_DIR="$TEST_ROOT/data-unreadable" \
-      "$SAFE_AUDIT" repo-audit . --deps-only --allow-missing-tools 2>&1 )" || rc=$?
+      "$SAFE_AUDIT" repo-audit . --deps-only --allow-missing-tools ) \
+    >/dev/null 2>"$errfile" || rc=$?
+
+  local err lines
+  err="$(cat "$errfile")"
+  lines="$(wc -l < "$errfile" | tr -d ' ')"
 
   if (( rc != 0 )) \
-     && [[ "$out" == *"audit-infrastructure breakage"* ]] \
-     && [[ "$out" != *"missing required scanners"* ]]; then
+     && [[ "$lines" == "1" ]] \
+     && [[ "$err" == *"audit-infrastructure breakage"* ]] \
+     && [[ "$err" != *"missing required scanners"* ]]; then
     pass "$FUNCNAME"
   else
-    fail "$FUNCNAME (rc=$rc, out='$out')"
+    fail "$FUNCNAME (rc=$rc, stderr lines=$lines, err='$err')"
+  fi
+}
+
+case_the_shared_sbom_is_replaced_not_rewritten_in_place() {
+  # The SBOM is shared per machine per day exactly like the result document,
+  # and `safe audit diff` reads it. The inode is the oracle, same as for the
+  # scanner cache: a `cp` onto the live path keeps the inode and fills the file
+  # in place — which IS the window a reader can land in — while an atomic
+  # publish renames a fully written file over it and always installs a new one.
+  #
+  # The scan cache is disabled: a replayed second scan never rebuilds the
+  # result, so it would never republish the SBOM and the oracle would read a
+  # skipped write as a preserved inode.
+  local config_dir="$TEST_ROOT/config-sbom"
+  local data_dir="$TEST_ROOT/data-sbom"
+  local project="$TEST_ROOT/sbom-project"
+  mkdir -p "$config_dir"
+  make_scan_project "$project"
+
+  local scan
+  scan() {
+    ( cd "$project" && HOME="$FAKE_HOME" PATH="$SCAN_MOCKBIN:$PATH" \
+        SAFE_AUDIT_SCAN_NO_CACHE=1 \
+        SAFE_AUDIT_CONFIG_DIR="$config_dir" \
+        SAFE_AUDIT_DATA_DIR="$data_dir" \
+        "$SAFE_AUDIT" repo-audit . --deps-only --allow-missing-tools ) >/dev/null 2>&1 || true
+  }
+
+  scan
+  local sbom first_inode second_inode
+  sbom="$(find "$data_dir/sbom" -maxdepth 2 -name '*-sbom.cdx.json' 2>/dev/null | head -n 1)"
+  first_inode="$(stat -c '%i' "$sbom" 2>/dev/null || printf '')"
+
+  scan
+  second_inode="$(stat -c '%i' "$sbom" 2>/dev/null || printf '')"
+
+  if [[ -n "$first_inode" && -n "$second_inode" && "$first_inode" != "$second_inode" ]] \
+     && jq -e 'type == "object"' "$sbom" >/dev/null 2>&1; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (sbom='${sbom:-<none>}', inode ${first_inode:-<none>} -> ${second_inode:-<none>})"
   fi
 }
 
@@ -576,6 +631,7 @@ case_an_unchanged_detection_does_not_rewrite_the_cache
 case_cache_write_stages_beside_the_cache_not_in_tmpdir
 case_an_unreadable_cache_refuses_as_breakage_not_missing_scanners
 case_an_unreadable_cache_refuses_the_whole_scan
+case_the_shared_sbom_is_replaced_not_rewritten_in_place
 case_an_absent_tool_still_reports_as_missing
 case_scratch_dirs_are_removed_on_success
 case_scratch_dirs_are_removed_on_failure

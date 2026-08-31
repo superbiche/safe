@@ -408,7 +408,11 @@ json_is_single_object() {
 # failure uses, so it can never read as a scanner or package finding.
 ensure_tools_file() {
   json_is_single_object "$TOOLS_FILE" && return 0
-  printf '%s\n' '{}' > "$TOOLS_FILE" 2>/dev/null || die_tool_cache_unusable
+  # stderr is silenced BEFORE stdout is opened, and the order is the whole
+  # point: bash applies redirections left to right, so `> "$FILE" 2>/dev/null`
+  # lets the failed open write its own diagnostic to a still-live stderr, and
+  # the refusal arrives as two lines. The contract is one final line.
+  printf '%s\n' '{}' 2>/dev/null > "$TOOLS_FILE" || die_tool_cache_unusable
 }
 
 # One wording for both halves of "the scanner cache is not usable": a read that
@@ -2585,7 +2589,12 @@ build_scan_result_from_artifacts() {
   result_path=$(scan_result_path_for "$machine" "$stamp")
   build_tmp=$(mktemp)
   sbom_path=$(scan_sbom_path_for "$machine" "$stamp")
-  cp "$sbom_src" "$sbom_path"
+  # The SBOM is shared per machine per day exactly like the result document
+  # beside it, so it is published the same way. A bare `cp` fills the live
+  # path in place, and `safe audit diff` or any external reader landing in
+  # that window parses a partial document.
+  publish_json_atomically "$sbom_src" "$sbom_path" \
+    || die "cannot publish the SBOM to $sbom_path"
 
   local ecosystem_audits_json
   if [[ -f "$ecosystem_audits_file" ]]; then
@@ -2929,6 +2938,10 @@ build_scan_result_from_artifacts() {
 # only within one filesystem, and $TMPDIR is routinely a tmpfs while the paths
 # published here are not. Across filesystems `mv` degrades to copy-then-unlink
 # and a concurrent reader sees the destination truncated.
+#
+# It validates nothing: the caller owns the document's format. That is what
+# lets the result document and the CycloneDX SBOM share one publisher without
+# either of them being checked against the other's schema.
 publish_json_atomically() {
   local source_doc="$1" dest="$2"
   local dir tmp

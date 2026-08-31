@@ -64,6 +64,21 @@ stage_beside() {
   mktemp "$dest.XXXXXX" || die "cannot stage a write next to $dest"
 }
 
+# Create or replace a shared file from a source file, atomically. Seeding a
+# destination that does not exist yet needs this just as much as replacing one
+# that does: a plain `cp` creates the path first and fills it afterwards, so a
+# gated build reading that store in between finds it present and truncated —
+# which for a trust store reads as "no grants" and for the scanner cache as
+# "no scanners".
+publish_beside() {
+  local src="$1" dest="$2" tmp
+  tmp=$(stage_beside "$dest")
+  if ! cp "$src" "$tmp" || ! mv "$tmp" "$dest"; then
+    rm -f "$tmp"
+    die "cannot publish $dest from $src"
+  fi
+}
+
 # A previous safe install may still own `go` on PATH while this invocation is
 # rebuilding its target HOME. Calling that wrapper before this installer has
 # copied gate-lib.sh into the target config fails bootstrap. Select the first
@@ -427,7 +442,7 @@ merge_json_prefer_legacy() {
   [[ -f "$legacy" ]] || return 0
   mkdir -p "$(dirname "$current")"
   if [[ ! -f "$current" ]]; then
-    cp "$legacy" "$current"
+    publish_beside "$legacy" "$current"
     return 0
   fi
   local tmp
@@ -477,7 +492,7 @@ merge_audit_config_state() {
   [[ -f "$LEGACY_SAFE_AUDIT_CONFIG_DIR/tools.json" ]] || return 0
   mkdir -p "$(dirname "$AUDIT_CONFIG_DIR/tools.json")"
   if [[ ! -f "$AUDIT_CONFIG_DIR/tools.json" ]]; then
-    cp "$LEGACY_SAFE_AUDIT_CONFIG_DIR/tools.json" "$AUDIT_CONFIG_DIR/tools.json"
+    publish_beside "$LEGACY_SAFE_AUDIT_CONFIG_DIR/tools.json" "$AUDIT_CONFIG_DIR/tools.json"
   else
     local normalized_tools tmp
     normalized_tools=$(mktemp)

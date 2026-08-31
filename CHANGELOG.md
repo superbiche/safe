@@ -33,14 +33,24 @@
     flow unchanged.
   - **The same non-atomic replace is fixed everywhere it touched shared
     state**: the published scan result (`results/<machine>/<date>-scan.json`),
-    the install-evidence receipts, `safe run`'s host-allow, scripts-allow,
-    blocklist, sandbox-known and config files, and `install.sh`'s legacy-state
-    merges — including the one that merges `tools.json` itself, which replaced
-    the scanner cache the same unsafe way while gated builds could be reading
-    it. All stage beside their destination now. Per-process temporary files are
-    unaffected. A staging failure on the install receipts is now fatal rather
-    than a silent skip: skipping a revoke would leave clean evidence standing
-    against the adverse knowledge that had just superseded it.
+    the published SBOM (`sbom/<machine>/<date>-sbom.cdx.json`, which `safe
+    audit diff` and external readers consume), the install-evidence receipts,
+    `safe run`'s host-allow, scripts-allow, blocklist, sandbox-known and config
+    files, and `install.sh`'s legacy-state migrations — both the merges and the
+    first-time seeds, including the ones that create and merge `tools.json`
+    itself while gated builds could be reading it. Creating a shared file
+    needed this as much as replacing one: a plain `cp` publishes the path
+    first and fills it afterwards, so a reader in between finds it present and
+    empty, which for a trust store reads as "no grants". All stage beside their
+    destination and rename now. Per-process temporary files are unaffected. A
+    staging failure on the install receipts is now fatal rather than a silent
+    skip: skipping a revoke would leave clean evidence standing against the
+    adverse knowledge that had just superseded it.
+  - **The unreadable-cache refusal is one line, not two.** The startup
+    normalizer wrote its reset as `> "$FILE" 2>/dev/null`, and bash applies
+    redirections left to right — so the failed open printed its own diagnostic
+    to a still-live stderr before safe's refusal followed it. Silencing stderr
+    first restores the single-final-line refusal contract.
 
 - **npm dedupe/prune: the lock-diff projection now mirrors the project's
   config and workspace state** (1.53.0). The projection resolved in a scratch
