@@ -51,6 +51,14 @@ tool="$(basename -- "$0")"
     # The projection must see the project's npm config (F3 ruling): surface
     # whether the scratch cwd carries the copied .npmrc.
     [[ -f .npmrc ]] && printf '\tPROJNPMRC'
+    # #244: without the project's other package.json manifests the scratch is
+    # a different workspace/file:-dep project than the delegate's, and npm
+    # drops those entries from the projected lockfile silently. Surface every
+    # non-root manifest the scratch received, root-relative and sorted.
+    while IFS= read -r mirrored_manifest; do
+      [[ -n "${mirrored_manifest}" ]] && printf '\tPROJMANIFEST:%s' "${mirrored_manifest}"
+    done < <(find . -name node_modules -prune -o -mindepth 2 -name package.json -print 2>/dev/null \
+      | sed 's|^\./||' | LC_ALL=C sort)
   else
     printf 'REAL\t%s' "${tool}"
   fi
@@ -76,6 +84,82 @@ tool="$(basename -- "$0")"
 # suite stayed green while the live gate refused every command (PR#70
 # delta-3 F2/F4). A regression back to `config get` now fails the caller's
 # jq parse here too, exactly as it would live.
+# npm reports the EFFECTIVE os/cpu here — resolved from every config source,
+# as a string, or null when nothing sets it. The gate reads that key instead
+# of scanning the argv it was handed (#244), so this stub has to resolve it
+# the way npm does: project .npmrc, then the environment (any case), then
+# argv, last occurrence winning. An empty value is unset, matching npm's own
+# reading of an empty environment variable; the `--os=` argv spelling, which
+# npm reports as "", is not modeled.
+stub_effective_platform() {
+  local key="$1"
+  shift
+  local found="" token previous="" env_key rc_line
+  if [[ -f .npmrc ]]; then
+    while IFS= read -r rc_line || [[ -n "${rc_line}" ]]; do
+      [[ "${rc_line}" == "${key}="* ]] && found="${rc_line#${key}=}"
+    done < .npmrc
+  fi
+  for env_key in $(compgen -e); do
+    [[ "${env_key,,}" == "npm_config_${key}" && -n "${!env_key}" ]] && found="${!env_key}"
+  done
+  for token in "$@"; do
+    [[ "${previous}" == "--${key}" ]] && found="${token}"
+    [[ "${token}" == "--${key}="* ]] && found="${token#--${key}=}"
+    previous="${token}"
+  done
+  [[ -n "${found}" ]] && printf '%s' "${found}"
+  return 0
+}
+
+# Two npm behaviors make one rc file report different settings from the
+# project and from the scratch, which is the divergence the parity check
+# exists to catch (r1 review F3): ${PWD} is expanded against the CWD of the
+# process reading it, and a relative path value is resolved against that same
+# CWD. Only those two shapes are modeled — they are precisely the ones whose
+# reported value depends on where npm ran, so nothing else in the suite moves.
+stub_cwd_dependent_rc_json() {
+  local line key value out='{}'
+  if [[ -f .npmrc ]]; then
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+      # ini comments are not settings; npm reports nothing for them.
+      [[ "${line}" =~ ^[[:space:]]*[\;\#] ]] && continue
+      [[ "${line}" == *=* ]] || continue
+      key="${line%%=*}"
+      value="${line#*=}"
+      key="${key// /}"
+      value="${value#"${value%%[![:space:]]*}"}"
+      # A backslash escapes the reference: npm reports the literal text, so
+      # both lanes receive the same value and nothing diverges.
+      if [[ "${value}" == *'\${'* ]]; then
+        continue
+      elif [[ "${value}" == *'${PWD}'* ]]; then
+        value="${value//'${PWD}'/$PWD}"
+      elif [[ "${value}" == ./* ]]; then
+        value="${PWD}/${value#./}"
+      else
+        continue
+      fi
+      out="$(jq -cn --argjson base "${out}" --arg k "${key}" --arg v "${value}" '$base + {($k): $v}')"
+    done < .npmrc
+  fi
+  printf '%s' "${out}"
+}
+
+# npm always reports the config FILE paths it resolved, and the hidden-config
+# guard reads those keys both to know which files to scan and to know that
+# userconfig/globalconfig are settings npm does report.
+stub_config_file_json() {
+  local token previous="" userconfig="${HOME}/.npmrc"
+  for token in "$@"; do
+    [[ "${previous}" == "--userconfig" ]] && userconfig="${token}"
+    [[ "${token}" == --userconfig=* ]] && userconfig="${token#--userconfig=}"
+    previous="${token}"
+  done
+  jq -cn --arg u "${userconfig}" --arg g "${HOME}/etc/npmrc" \
+    '{userconfig: $u, globalconfig: $g}'
+}
+
 if [[ "${tool}" == "npm" && "${1:-}" == "config" && "${2:-}" == "list" ]]; then
   wants_json=0
   for arg in "$@"; do
@@ -87,7 +171,18 @@ if [[ "${tool}" == "npm" && "${1:-}" == "config" && "${2:-}" == "list" ]]; then
     [[ -n "${effective_json}" ]] || effective_json='{"package-lock":true,"ignore-scripts":true}'
     registry_json="${NPM_LOCKDIFF_REGISTRY_CONFIG_JSON:-}"
     [[ -n "${registry_json}" ]] || registry_json='{"registry":"https://registry.npmjs.org/"}'
-    jq -cn --argjson a "${effective_json}" --argjson b "${registry_json}" '$b * $a' 2>/dev/null \
+    platform_json="$(jq -cn \
+      --arg os "$(stub_effective_platform os "$@")" \
+      --arg cpu "$(stub_effective_platform cpu "$@")" \
+      '{os: (if $os == "" then null else $os end), cpu: (if $cpu == "" then null else $cpu end)}')"
+    cwd_json="$(stub_cwd_dependent_rc_json)"
+    files_json="$(stub_config_file_json "$@")"
+    # Order is npm's resolution order, not convenience: a value npm expands or
+    # resolves against the cwd is what it REPORTS, so it wins over the raw
+    # platform reading of the same key, and an explicit fixture override wins
+    # over everything.
+    jq -cn --argjson a "${effective_json}" --argjson b "${registry_json}" --argjson c "${platform_json}" \
+      --argjson d "${cwd_json}" --argjson e "${files_json}" '$b * $e * $c * $d * $a' 2>/dev/null \
       || printf '%s\n' "${effective_json}"
   else
     printf 'package-lock=true\nignore-scripts=true\n'
@@ -425,6 +520,11 @@ prepare_case() {
   OUT_FILE="${CASE_DIR}/stdout.log"
   ERR_FILE="${CASE_DIR}/stderr.log"
 
+  # run_zsh forwards these npm config keys into the gated shell, so a value
+  # inherited from the environment the suite was launched in would reach the
+  # npm stub and move a hermetic case's effective config.
+  unset npm_config_os NPM_CONFIG_OS npm_config_userconfig npm_config_globalconfig
+
   mkdir -p "${BIN_DIR}" "${WRAPPER_DIR}" "${WORK_DIR}" "${HOME_DIR}"
   : > "${LOG_FILE}"
   : > "${OUT_FILE}"
@@ -518,6 +618,10 @@ run_zsh() {
     NPM_CONFIG_IGNORE_SCRIPTS="${NPM_CONFIG_IGNORE_SCRIPTS:-}" \
     npm_config_ignore_scripts="${npm_config_ignore_scripts:-}" \
     NPM_LOCKDIFF_EFFECTIVE_CONFIG_JSON="${NPM_LOCKDIFF_EFFECTIVE_CONFIG_JSON:-}" \
+    npm_config_os="${npm_config_os:-}" \
+    NPM_CONFIG_OS="${NPM_CONFIG_OS:-}" \
+    npm_config_userconfig="${npm_config_userconfig:-}" \
+    npm_config_globalconfig="${npm_config_globalconfig:-}" \
     NPM_LOCKDIFF_REGISTRY_CONFIG_JSON="${NPM_LOCKDIFF_REGISTRY_CONFIG_JSON:-}" \
     NPM_LOCKDIFF_CONFIG_STATUS="${NPM_LOCKDIFF_CONFIG_STATUS:-}" \
     MISE_LS_JSON="${MISE_LS_JSON:-}" \
@@ -2378,6 +2482,373 @@ case_npm_lockdiff_dash_led_target_platform_travels_verbatim() {
   assert_status 104 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tpackage-audit\tblockme@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm\tdedupe' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# One aix-only optional entry: exempt on this machine, installed — and so
+# audited — as soon as the effective target platform is aix, whichever config
+# source says so.
+LOCKDIFF_AIX_OPTIONAL_LOCK='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/blockme":{"version":"2.0.0","optional":true,"os":["aix"],"resolved":"https://registry.npmjs.org/blockme/-/blockme-2.0.0.tgz","integrity":"sha512-blockme"}}}'
+
+case_npm_lockdiff_target_platform_follows_npm_environment() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-target-platform-env"
+  # npm resolves os/cpu from its environment as well as its argv, and reads
+  # those keys case-insensitively. The argv scanner this replaced saw neither
+  # spelling, so an npm_config_os=aix run audited against the host platform
+  # and exempted the very optional it was about to install (#244).
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '%s\n' "${LOCKDIFF_AIX_OPTIONAL_LOCK}" > "${WORK_DIR}/package-lock.json"
+
+  : > "${LOG_FILE}"
+  npm_config_os=aix NPM_LOCK_MUTATION_JSON="${LOCKDIFF_AIX_OPTIONAL_LOCK}" \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 104 "$FUNCNAME (npm_config_os)" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME (npm_config_os)" || return
+  assert_log_not_contains_fragment $'REAL\tnpm\tdedupe' "$FUNCNAME (npm_config_os)" || return
+
+  : > "${LOG_FILE}"
+  NPM_CONFIG_OS=aix NPM_LOCK_MUTATION_JSON="${LOCKDIFF_AIX_OPTIONAL_LOCK}" \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 104 "$FUNCNAME (NPM_CONFIG_OS)" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME (NPM_CONFIG_OS)" || return
+  assert_log_not_contains_fragment $'REAL\tnpm\tdedupe' "$FUNCNAME (NPM_CONFIG_OS)" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_target_platform_follows_project_npmrc() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-target-platform-npmrc"
+  # A project .npmrc sets the target as legitimately as the command line, and
+  # this is the source no argv scan could ever have reached (#244).
+  printf 'os=aix\n' > "${WORK_DIR}/.npmrc"
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '%s\n' "${LOCKDIFF_AIX_OPTIONAL_LOCK}" > "${WORK_DIR}/package-lock.json"
+  NPM_LOCK_MUTATION_JSON="${LOCKDIFF_AIX_OPTIONAL_LOCK}" \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm\tdedupe' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_refuses_relative_config_paths() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-relative-config-path"
+  # npm resolves a relative userconfig/globalconfig against the cwd, which is
+  # the scratch for the projection and the project for the delegate: the same
+  # spelling names two different config files, so the projection would vouch
+  # for an artifact fetched under settings it never read.
+  install_lockdiff_package kept 1.0.0
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  local lock='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/kept":{"version":"1.0.0"}}}'
+  printf '%s\n' "${lock}" > "${WORK_DIR}/package-lock.json"
+
+  local invocation
+  # The empty spelling refuses with the relative ones: nothing pins what npm
+  # resolves it to, and the projection cannot mirror what it cannot predict.
+  # A literal ~user path refuses too — npm expands ONLY the ~/ prefix, so
+  # ~root/.npmrc is an ordinary cwd-relative name to it (r1 review F2); it is
+  # quoted here so the test shell does not expand it before the gate sees it.
+  for invocation in \
+    'npm dedupe --userconfig ./x' \
+    'npm dedupe --userconfig=./x' \
+    'npm dedupe --userconfig=' \
+    'npm dedupe --userconfig='"'"'~root/.npmrc'"'" \
+    'npm dedupe --userconfig='"'"'~'"'" \
+    'npm dedupe --globalconfig relative/npmrc'; do
+    : > "${LOG_FILE}"
+    NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT="${invocation}" run_zsh
+    assert_status 100 "$FUNCNAME (${invocation})" || return
+    assert_err_contains_fragment 'names a path npm resolves against the current directory' "$FUNCNAME (${invocation})" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME (${invocation})"; return 1; }
+    assert_log_not_contains_fragment $'PROJECTION\tnpm' "$FUNCNAME (${invocation})" || return
+    assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (${invocation})" || return
+  done
+
+  : > "${LOG_FILE}"
+  npm_config_userconfig='./x' NPM_LOCK_MUTATION_JSON="${lock}" \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME (env)" || return
+  assert_err_contains_fragment 'npm_config_userconfig names a path npm resolves against the current directory' "$FUNCNAME (env)" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (env)" || return
+
+  : > "${LOG_FILE}"
+  npm_config_userconfig='~root/.npmrc' NPM_LOCK_MUTATION_JSON="${lock}" \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME (env ~user)" || return
+  assert_err_contains_fragment 'npm_config_userconfig names a path npm resolves against the current directory' "$FUNCNAME (env ~user)" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (env ~user)" || return
+
+  # An absolute value resolves to the same file from either cwd, so it is not
+  # this guard's business and the command runs its ordinary course.
+  : > "${LOG_FILE}"
+  printf 'registry=https://registry.npmjs.org/\n' > "${CASE_DIR}/absolute.npmrc"
+  NPM_LOCK_MUTATION_JSON="${lock}" \
+    SAFE_INSTALL_TEST_SCRIPT="npm dedupe --userconfig ${CASE_DIR}/absolute.npmrc" run_zsh
+  assert_status 0 "$FUNCNAME (absolute)" || return
+  assert_err_not_contains_fragment 'names a path npm resolves' "$FUNCNAME (absolute)" || return
+  assert_log_contains $'REAL\tnpm\tdedupe\t--userconfig\t'"${CASE_DIR}/absolute.npmrc" "$FUNCNAME (absolute)" || return
+
+  # ~/ is the one prefix npm expands against $HOME, in argv and environment
+  # alike, so it names the same file from either cwd and passes untouched.
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="${lock}" \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe --userconfig='"'"'~/home.npmrc'"'" run_zsh
+  assert_status 0 "$FUNCNAME (~/)" || return
+  assert_err_not_contains_fragment 'names a path npm resolves' "$FUNCNAME (~/)" || return
+  assert_log_contains $'REAL\tnpm\tdedupe\t--userconfig=~/home.npmrc' "$FUNCNAME (~/)" || return
+  pass "$FUNCNAME"
+}
+
+# A workspace root: the member manifest lives outside the root package.json,
+# and the lockfile names both the member itself and the registry dependency it
+# hoists to the root tree.
+LOCKDIFF_WORKSPACE_LOCK='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0","workspaces":["packages/*"]},"packages/a":{"name":"a","version":"1.0.0","dependencies":{"blockme":"^2.0.0"}},"node_modules/a":{"resolved":"packages/a","link":true},"node_modules/blockme":{"version":"2.0.0","resolved":"https://registry.npmjs.org/blockme/-/blockme-2.0.0.tgz","integrity":"sha512-blockme"}}}'
+
+prepare_lockdiff_workspace_fixture() {
+  printf '{"name":"lockdiff-test","version":"1.0.0","workspaces":["packages/*"]}\n' > "${WORK_DIR}/package.json"
+  mkdir -p "${WORK_DIR}/packages/a"
+  printf '{"name":"a","version":"1.0.0","dependencies":{"blockme":"^2.0.0"}}\n' > "${WORK_DIR}/packages/a/package.json"
+  printf '%s\n' "${LOCKDIFF_WORKSPACE_LOCK}" > "${WORK_DIR}/package-lock.json"
+  ln -s "${WORK_DIR}/packages/a" "${WORK_DIR}/node_modules/a"
+}
+
+case_npm_lockdiff_mirrors_workspace_member_manifests() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-workspace-member-manifests"
+  # Without the member manifests the scratch is a different project: npm
+  # silently drops every workspace entry from the projected lockfile, the diff
+  # reports removals only — which are never audited — and the member's own
+  # dependency is materialized unaudited (#244 silent under-audit).
+  prepare_lockdiff_workspace_fixture
+  NPM_LOCK_MUTATION_JSON="${LOCKDIFF_WORKSPACE_LOCK}" \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'PROJECTION\tnpm\tPROJMANIFEST:packages/a/package.json\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund\tdedupe' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_refuses_escaping_workspace_pattern() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-workspace-escape"
+  # npm accepts a pattern that reaches outside the project root — it produces
+  # a ../outside lockfile key — but nothing outside the root is mirrored into
+  # the projection, so the two lanes would resolve different member sets.
+  #
+  # The escape has to be judged on the pattern npm READS, not the raw text:
+  # npm 12 converts backslashes to /, so ..\outside walked past a raw-text
+  # guard while npm resolved the member outside the root, and a stale lockfile
+  # with no such member left the member-set belt nothing to require (r1 review
+  # F1). Leading negations are equally irrelevant to where the residue points.
+  printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
+  local pattern
+  for pattern in '../outside' '..\\outside' '!!../outside' 'packages/../../outside'; do
+    : > "${LOG_FILE}"
+    printf '{"name":"lockdiff-test","version":"1.0.0","workspaces":["%s"]}\n' "${pattern}" > "${WORK_DIR}/package.json"
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+    assert_status 100 "$FUNCNAME (${pattern})" || return
+    assert_err_contains_fragment 'reaches outside the project root' "$FUNCNAME (${pattern})" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME (${pattern})"; return 1; }
+    assert_log_not_contains_fragment $'PROJECTION\tnpm\t--package-lock-only' "$FUNCNAME (${pattern})" || return
+    assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (${pattern})" || return
+  done
+  # The backslash spelling is named verbatim in its refusal, as the user wrote
+  # it rather than as the guard normalized it.
+  assert_err_contains_fragment 'workspace pattern packages/../../outside reaches outside' "$FUNCNAME" || return
+
+  # A leading slash is root-relative to npm, not an escape: refusing it was a
+  # false refusal, and the member behind it mirrors like any other.
+  : > "${LOG_FILE}"
+  prepare_lockdiff_workspace_fixture
+  printf '{"name":"lockdiff-test","version":"1.0.0","workspaces":["/packages/*"]}\n' > "${WORK_DIR}/package.json"
+  NPM_LOCK_MUTATION_JSON="${LOCKDIFF_WORKSPACE_LOCK}" \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 104 "$FUNCNAME (root-relative)" || return
+  assert_err_not_contains_fragment 'reaches outside the project root' "$FUNCNAME (root-relative)" || return
+  assert_log_contains $'PROJECTION\tnpm\tPROJMANIFEST:packages/a/package.json\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund\tdedupe' "$FUNCNAME (root-relative)" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme@2.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME (root-relative)" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_member_set_belt_refuses_dropped_member() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-member-set-belt"
+  # The member the project's lockfile names is gone from the projected one, so
+  # npm resolved a different member set in the scratch than it will in the
+  # project and the member's subtree would leave the diff as removals nothing
+  # audits. A member deliberately deleted refuses here too: the two are
+  # indistinguishable without reimplementing npm's member discovery.
+  prepare_lockdiff_workspace_fixture
+  rm -rf "${WORK_DIR}/packages/a"
+  local projected='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0","workspaces":["packages/*"]}}}'
+  NPM_LOCK_MUTATION_JSON="${projected}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'resolved a different workspace member set than the project (packages/a absent from the projection)' "$FUNCNAME" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+  assert_log_not_contains_fragment $'AUDIT\trepo-audit' "$FUNCNAME" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_mirrors_file_dependency_manifest() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-file-dependency-manifest"
+  # An in-project file: dependency needs its manifest in the scratch for the
+  # same reason a workspace member does. Live, the missing manifest failed the
+  # projection outright and the command was refused as broken infrastructure;
+  # here the sweep evidence and a clean delegation are what the stub can show.
+  mkdir -p "${WORK_DIR}/local-pkg"
+  printf '{"name":"local-pkg","version":"1.0.0"}\n' > "${WORK_DIR}/local-pkg/package.json"
+  printf '{"name":"lockdiff-test","version":"1.0.0","dependencies":{"local-pkg":"file:./local-pkg"}}\n' > "${WORK_DIR}/package.json"
+  ln -s "${WORK_DIR}/local-pkg" "${WORK_DIR}/node_modules/local-pkg"
+  local lock='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0","dependencies":{"local-pkg":"file:./local-pkg"}},"local-pkg":{"name":"local-pkg","version":"1.0.0"},"node_modules/local-pkg":{"resolved":"local-pkg","link":true}}}'
+  printf '%s\n' "${lock}" > "${WORK_DIR}/package-lock.json"
+  NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'PROJECTION\tnpm\tPROJMANIFEST:local-pkg/package.json\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund\tdedupe' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tdedupe' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'AUDIT\tpackage-audit' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_refuses_cwd_dependent_config() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-cwd-dependent-config"
+  # Copying the config files does not copy what they RESOLVE to: npm resolves
+  # a relative path value against the cwd of the process reading it, so the
+  # same .npmrc gives the projection a different setting than the delegate
+  # gets and the audit would vouch for an artifact resolved elsewhere (r1
+  # review F3). The two probes are compared whole, so this is caught
+  # generically. The divergence here carries no ${} reference on purpose —
+  # that class refuses earlier, at the expansion guard, and this case has to
+  # keep exercising the comparison itself.
+  install_lockdiff_package kept 1.0.0
+  printf 'cache=./cache\n' > "${WORK_DIR}/.npmrc"
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  local lock='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/kept":{"version":"1.0.0"}}}'
+  printf '%s\n' "${lock}" > "${WORK_DIR}/package-lock.json"
+  NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'effective npm config resolves differently inside the lock-diff projection (cache)' "$FUNCNAME" || return
+  assert_err_contains_fragment 'cannot be mirrored; make those values absolute and retry' "$FUNCNAME" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+  # The projection must not run on a config the audit cannot vouch for.
+  assert_log_not_contains_fragment $'PROJECTION\tnpm\t' "$FUNCNAME" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_lockdiff_refuses_hidden_config_expansion() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-hidden-config-expansion"
+  # npm substitutes ${...} references into every config value, including the
+  # secret-bearing keys it omits from its own report — where the parity check
+  # cannot see them (r2 F3, r3 N2/N3). Secrecy is decided by observation: a
+  # setting whose key npm does not report cannot be verified, so any ${ in it
+  # refuses, with no expansion spelling modeled anywhere.
+  install_lockdiff_package kept 1.0.0
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  local lock='{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"},"node_modules/kept":{"version":"1.0.0"}}}'
+  printf '%s\n' "${lock}" > "${WORK_DIR}/package-lock.json"
+
+  # r3 N3: npm's ${VAR?} form. The guard needs no knowledge of it.
+  printf '//registry.example/:_authToken=${PWD?}\n' > "${WORK_DIR}/.npmrc"
+  NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME (project rc)" || return
+  assert_err_contains_fragment 'sets //registry.example/:_authToken, a setting npm hides from its own config report' "$FUNCNAME (project rc)" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME (project rc)"; return 1; }
+  assert_log_not_contains_fragment $'PROJECTION\tnpm\t' "$FUNCNAME (project rc)" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (project rc)" || return
+
+  # The boundary change, operator-ruled: a reference the old design classified
+  # as lane-shared refuses too. Classifying references is the mechanism three
+  # review rounds broke.
+  : > "${LOG_FILE}"
+  printf '//registry.example/:_authToken=${NPM_TOKEN}\n' > "${WORK_DIR}/.npmrc"
+  NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME (shared-env reference)" || return
+  assert_err_contains_fragment 'a setting npm hides from its own config report' "$FUNCNAME (shared-env reference)" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (shared-env reference)" || return
+
+  # An escaped reference in a HIDDEN key refuses as well: the accepted
+  # over-refusal direction, since verifying it would mean modeling the escape.
+  : > "${LOG_FILE}"
+  printf '//registry.example/:_authToken=\\${PWD}\n' > "${WORK_DIR}/.npmrc"
+  NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME (escaped in hidden key)" || return
+  assert_err_contains_fragment 'a setting npm hides from its own config report' "$FUNCNAME (escaped in hidden key)" || return
+
+  # r3 N2: the same secret carried on the command line.
+  : > "${LOG_FILE}"
+  rm -f "${WORK_DIR}/.npmrc"
+  NPM_LOCK_MUTATION_JSON="${lock}" \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe '"'"'--//registry.example/:_authToken=${PWD}'"'" run_zsh
+  assert_status 100 "$FUNCNAME (argv)" || return
+  assert_err_contains_fragment 'the command line sets //registry.example/:_authToken, which npm does not report as a setting' "$FUNCNAME (argv)" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (argv)" || return
+
+  # An environment-carried VISIBLE setting is parity's jurisdiction like any
+  # other: npm reports globalconfig, so the reference is verified by comparing
+  # resolved values rather than refused here.
+  : > "${LOG_FILE}"
+  npm_config_globalconfig='/abs/${PWD}/npmrc' NPM_LOCK_MUTATION_JSON="${lock}" \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 0 "$FUNCNAME (visible env key delegates)" || return
+  assert_err_not_contains_fragment 'hides from its own config report' "$FUNCNAME (visible env key delegates)" || return
+
+  # An environment-carried HIDDEN credential is the env surface's real case:
+  # npm reports no such key, so nothing can verify it resolves identically.
+  : > "${LOG_FILE}"
+  npm_config__authToken='${PWD}' NPM_LOCK_MUTATION_JSON="${lock}" \
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME (hidden env credential)" || return
+  assert_err_contains_fragment 'npm_config__authToken sets' "$FUNCNAME (hidden env credential)" || return
+  assert_err_contains_fragment 'a setting npm hides from its own config report' "$FUNCNAME (hidden env credential)" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME (hidden env credential)"; return 1; }
+  assert_log_not_contains_fragment $'PROJECTION\tnpm\t' "$FUNCNAME (hidden env credential)" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (hidden env credential)" || return
+
+  # A VISIBLE key is parity's jurisdiction, not this guard's: it passes here
+  # and the comparison of npm-resolved values is what refuses it.
+  : > "${LOG_FILE}"
+  printf 'os=${PWD}\n' > "${WORK_DIR}/.npmrc"
+  NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 100 "$FUNCNAME (visible key reaches parity)" || return
+  assert_err_contains_fragment 'effective npm config resolves differently inside the lock-diff projection (os)' "$FUNCNAME (visible key reaches parity)" || return
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME (visible key reaches parity)" || return
+
+  # r3 N4: an escaped reference in a VISIBLE key is a literal to npm, so both
+  # lanes receive the same value, parity agrees, and the command delegates.
+  # The old token guard refused this outright.
+  : > "${LOG_FILE}"
+  printf 'os=\\${PWD}\n' > "${WORK_DIR}/.npmrc"
+  NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  assert_status 0 "$FUNCNAME (escaped in visible key)" || return
+  assert_err_not_contains_fragment 'hides from its own config report' "$FUNCNAME (escaped in visible key)" || return
+  assert_err_not_contains_fragment 'resolves differently inside' "$FUNCNAME (escaped in visible key)" || return
+  assert_log_contains $'REAL\tnpm\tdedupe' "$FUNCNAME (escaped in visible key)" || return
+  pass "$FUNCNAME"
+}
+case_npm_lockdiff_manifest_copy_failure_is_one_line() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_lockdiff_case "npm-lockdiff-manifest-copy-failure"
+  # A manifest the sweep cannot read is audit-infrastructure breakage, and the
+  # refusal contract is one final stderr line: cp's own diagnostic ahead of it
+  # made two (r1 review F4).
+  printf '{"name":"lockdiff-test","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  printf '{"lockfileVersion":3,"packages":{"":{"name":"lockdiff-test","version":"1.0.0"}}}\n' > "${WORK_DIR}/package-lock.json"
+  mkdir -p "${WORK_DIR}/nested"
+  printf '{"name":"nested","version":"1.0.0"}\n' > "${WORK_DIR}/nested/package.json"
+  chmod 000 "${WORK_DIR}/nested/package.json"
+  SAFE_INSTALL_TEST_SCRIPT='npm dedupe' run_zsh
+  chmod 644 "${WORK_DIR}/nested/package.json"
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'cannot mirror in-project package.json manifests' "$FUNCNAME" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+  assert_count 0 $'REAL\tnpm\tdedupe' "${LOG_FILE}" "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -5762,6 +6233,16 @@ main() {
     case_npm_lockdiff_symlinked_entry_is_audited \
     case_npm_lockdiff_target_platform_follows_npm_argv \
     case_npm_lockdiff_dash_led_target_platform_travels_verbatim \
+    case_npm_lockdiff_target_platform_follows_npm_environment \
+    case_npm_lockdiff_target_platform_follows_project_npmrc \
+    case_npm_lockdiff_refuses_relative_config_paths \
+    case_npm_lockdiff_mirrors_workspace_member_manifests \
+    case_npm_lockdiff_refuses_escaping_workspace_pattern \
+    case_npm_lockdiff_member_set_belt_refuses_dropped_member \
+    case_npm_lockdiff_mirrors_file_dependency_manifest \
+    case_npm_lockdiff_manifest_copy_failure_is_one_line \
+    case_npm_lockdiff_refuses_cwd_dependent_config \
+    case_npm_lockdiff_refuses_hidden_config_expansion \
     case_npm_lockdiff_refuses_nonregistry_reify_candidate \
     case_npm_lockdiff_projection_sees_project_npmrc \
     case_npm_dedupe_lockdiff_introduced_block_refuses_without_delegation \

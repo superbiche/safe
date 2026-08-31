@@ -35,6 +35,11 @@ if [[ -z "${real_npm}" ]]; then
   exit 0
 fi
 
+# Which npm answered matters when a result is version-dependent: this suite
+# takes whatever the gate's own resolution takes, which is not necessarily the
+# npm a probe was originally measured on.
+printf '# npm oracle target: %s (%s)\n' "${real_npm}" "$("${real_npm}" --version 2>/dev/null || printf 'version unknown')"
+
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/safe-live-npm.XXXXXX")" || exit 1
 trap 'rm -rf -- "${WORK}"' EXIT
 printf '{"name":"live-oracle","version":"1.0.0"}\n' > "${WORK}/package.json"
@@ -62,6 +67,14 @@ config_rc() {
 
 hosts_out() {
   ( safe_gate_npm_lockdiff_registry_hosts "${WORK}" dedupe "$@" ) 2>/dev/null
+}
+
+# The target platform the shipped oracle extracted, read from the global the
+# preflight hands safe-core.
+target_os() {
+  SAFE_GATE_LOCKDIFF_TARGET_OS=""
+  safe_gate_npm_lockdiff_effective_config "${WORK}" dedupe "$@" >/dev/null 2>&1
+  printf '%s' "${SAFE_GATE_LOCKDIFF_TARGET_OS}"
 }
 
 # --- effective-config oracle -------------------------------------------------
@@ -107,6 +120,240 @@ npmrc ''
 [[ "$(NPM_CONFIG_PACKAGE_LOCK=' false ' config_rc dedupe)" == "100" ]] \
   && pass "whitespace-padded environment false is refused (npm trims it)" \
   || fail "whitespace-padded environment false was not refused"
+
+# --- target-platform oracle --------------------------------------------------
+
+# The reify-candidate exemption speaks for the platform npm installs FOR, and
+# npm resolves that from every config source. The argv scanner this replaced
+# saw only the command line, so an environment or .npmrc target moved the real
+# install while the audit stayed on the host platform (#244).
+
+npmrc ''
+[[ -z "$(target_os dedupe)" ]] \
+  && pass "no configured target platform leaves the host platform standing" \
+  || fail "an unset os produced a target: $(target_os dedupe)"
+
+[[ "$(target_os dedupe --os=aix)" == "aix" ]] \
+  && pass "an argv target platform is read from the effective config" \
+  || fail "argv --os=aix did not reach the target: $(target_os dedupe --os=aix)"
+
+[[ "$(target_os dedupe --os aix)" == "aix" ]] \
+  && pass "the space-separated argv spelling reaches the target too" \
+  || fail "argv --os aix did not reach the target"
+
+# npm treats a target as an opaque string: a dash-led value is a platform it
+# will resolve os constraints against, so it must survive verbatim.
+[[ "$(target_os dedupe --os=-weird)" == "-weird" ]] \
+  && pass "a dash-led target platform survives the probe verbatim" \
+  || fail "dash-led target was mangled: $(target_os dedupe --os=-weird)"
+
+[[ "$(npm_config_os=aix target_os dedupe)" == "aix" ]] \
+  && pass "an environment target platform is read from the effective config" \
+  || fail "npm_config_os=aix did not reach the target"
+
+[[ "$(NPM_CONFIG_OS=aix target_os dedupe)" == "aix" ]] \
+  && pass "npm reads its environment target case-insensitively" \
+  || fail "NPM_CONFIG_OS=aix did not reach the target"
+
+npmrc 'os=aix'
+[[ "$(target_os dedupe)" == "aix" ]] \
+  && pass "a project .npmrc target platform is read from the effective config" \
+  || fail "an .npmrc os=aix did not reach the target"
+
+# npm reports an empty argv target as "", which leaves the host platform
+# standing in safe-core — the same fallback npm-install-checks makes with
+# `environment.os || currentEnv.os()` (r1 review F5).
+npmrc ''
+[[ -z "$(target_os dedupe --os=)" ]] \
+  && pass "an empty argv target leaves the host platform standing" \
+  || fail "an empty --os= produced a target: $(target_os dedupe --os=)"
+
+# --- relative userconfig resolution -----------------------------------------
+
+# The refusal for a relative userconfig/globalconfig rests on this: npm
+# resolves such a path against the CWD, which is the project for the delegate
+# and the scratch directory for the projection, so one spelling names two
+# different config files.
+printf 'os=fromrelative\n' > "${WORK}/relative-npmrc"
+mkdir -p "${WORK}/elsewhere"
+from_project="$(cd "${WORK}" && "${real_npm}" config list --json --userconfig ./relative-npmrc 2>/dev/null | jq -r '.os // "unset"')"
+from_elsewhere="$(cd "${WORK}/elsewhere" && "${real_npm}" config list --json --userconfig ./relative-npmrc 2>/dev/null | jq -r '.os // "unset"')"
+if [[ "${from_project}" == "fromrelative" && "${from_elsewhere}" == "unset" ]]; then
+  pass "a relative --userconfig resolves against the cwd (why the projection refuses it)"
+else
+  fail "relative --userconfig resolution changed: project=${from_project} elsewhere=${from_elsewhere}"
+fi
+
+# --- effective-config parity across cwds -------------------------------------
+
+# Copying config files into the projection does not copy what they RESOLVE to:
+# npm expands values against the cwd of the process reading them, so the same
+# files can hand the projection different settings than the delegate gets (r1
+# review F3). The parity check compares the same probe run from the project
+# and from the prepared scratch; these assertions pin the npm behaviors that
+# check depends on.
+
+PARITY_SCRATCH="${WORK}/parity-scratch"
+mkdir -p "${PARITY_SCRATCH}"
+printf '{"name":"live-oracle","version":"1.0.0"}\n' > "${PARITY_SCRATCH}/package.json"
+
+# The probe layout the gate uses, verbatim, from an arbitrary cwd.
+parity_probe() {
+  ( cd -- "$1" && "${real_npm}" config list \
+      --package-lock-only --ignore-scripts --no-audit --no-fund dedupe "${@:2}" --json 2>/dev/null )
+}
+
+npmrc ''
+: > "${PARITY_SCRATCH}/.npmrc"
+project_config="$(parity_probe "${WORK}")"
+scratch_config="$(parity_probe "${PARITY_SCRATCH}")"
+if [[ -n "${project_config}" ]] \
+  && jq -en --argjson a "${project_config}" --argjson b "${scratch_config}" '$a == $b' >/dev/null 2>&1; then
+  pass "a stock project's effective config is identical from either cwd (empty allowlist is earned)"
+else
+  fail "stock config differs across cwds: $(jq -rn --argjson a "${project_config:-null}" --argjson b "${scratch_config:-null}" '[((($a|keys)+($b|keys))|unique)[]|select($a[.] != $b[.])] | join(", ")' 2>/dev/null)"
+fi
+
+# The F3 reproduction shape: one absolute userconfig, two cwds, two values.
+printf 'registry=https://npm.example.test/${PWD}/\n' > "${WORK}/pwd-user.npmrc"
+from_project="$(parity_probe "${WORK}" --userconfig "${WORK}/pwd-user.npmrc" | jq -r '.registry')"
+from_scratch="$(parity_probe "${PARITY_SCRATCH}" --userconfig "${WORK}/pwd-user.npmrc" | jq -r '.registry')"
+if [[ -n "${from_project}" && "${from_project}" != "${from_scratch}" ]]; then
+  pass "a userconfig \${PWD} value resolves per-cwd (the divergence parity catches)"
+else
+  fail "userconfig \${PWD} did not diverge: project=${from_project} scratch=${from_scratch}"
+fi
+
+# Reported values come back RESOLVED, so cwd-dependent settings are visible to
+# the comparison rather than hidden from it — including the target platform
+# itself, whose divergence would re-aim the reify exemption.
+npmrc 'os=${PWD}'
+cp -- "${WORK}/.npmrc" "${PARITY_SCRATCH}/.npmrc"
+from_project="$(parity_probe "${WORK}" | jq -r '.os')"
+from_scratch="$(parity_probe "${PARITY_SCRATCH}" | jq -r '.os')"
+if [[ "${from_project}" == "${WORK}" && "${from_scratch}" == "${PARITY_SCRATCH}" ]]; then
+  pass "a project-rc os=\${PWD} expands per-cwd and is visible to the parity check"
+else
+  fail "project-rc os=\${PWD} did not expand per-cwd: project=${from_project} scratch=${from_scratch}"
+fi
+
+npmrc 'cache=./cache'
+cp -- "${WORK}/.npmrc" "${PARITY_SCRATCH}/.npmrc"
+from_project="$(parity_probe "${WORK}" | jq -r '.cache')"
+from_scratch="$(parity_probe "${PARITY_SCRATCH}" | jq -r '.cache')"
+if [[ "${from_project}" == "${WORK}/cache" && "${from_scratch}" == "${PARITY_SCRATCH}/cache" ]]; then
+  pass "a relative cache is reported resolved per-cwd, so parity catches it too"
+else
+  fail "relative cache was not reported per-cwd: project=${from_project} scratch=${from_scratch}"
+fi
+
+# --- lane-divergent ${VAR} expansion -----------------------------------------
+
+# npm expands ${VAR} in config VALUES against the reading process's own
+# environment, which is why the expansion guard refuses the references whose
+# variable differs between the projection lane and the delegate lane. These
+# assertions pin the boundary that guard is drawn on.
+
+# npm's expansion grammar is deliberately NOT modeled by the gate, and these
+# assertions are why: it is wider than any enumeration written against it.
+# ${VAR?} is honored (r3 N3 bypassed a guard that knew only ${VAR}), while a
+# backslash escapes the reference (r3 N4 falsely refused that spelling).
+npmrc $'os=${PWD?}\ncpu=\\${PWD}\nsearchlimit=${PWD:-fallback}\n'
+expansion_shapes="$(parity_probe "${WORK}" | jq -c '{cpu, searchlimit}')"
+question_form="$(parity_probe "${WORK}" | jq -r '.os')"
+if [[ "${expansion_shapes}" != "{\"cpu\":\"\${PWD}\",\"searchlimit\":\"\${PWD:-fallback}\"}" ]]; then
+  fail "escaped and default-value forms no longer stay literal: ${expansion_shapes}"
+elif [[ "${question_form}" == "${WORK}" ]]; then
+  pass "\${VAR?} is honored here while an escaped \\\${VAR} stays literal (npm 12 grammar)"
+elif [[ "${question_form}" == '${PWD?}' ]]; then
+  pass "\${VAR?} stays literal here while npm 12 expands it — the grammar is version-dependent, which is why no spelling is modeled"
+else
+  fail "\${PWD?} resolved to neither the cwd nor its literal: ${question_form}"
+fi
+
+# Config carried on the COMMAND LINE is expanded the same way (r3 N2), which
+# is why argv is one of the guard's surfaces.
+npmrc ''
+argv_expanded="$(parity_probe "${WORK}" '--os=${PWD}' | jq -r '.os')"
+if [[ "${argv_expanded}" == "${WORK}" ]]; then
+  pass "an argv-carried config value is expanded per-cwd too"
+else
+  fail "argv --os=\${PWD} did not expand per-cwd: ${argv_expanded}"
+fi
+
+# A secret-bearing key npm omits from its report is expanded before it is
+# omitted, so the parity comparison cannot see its divergence — the reason a
+# hidden setting carrying ${ refuses instead.
+secret_visible="$(parity_probe "${WORK}" '--//registry.example/:_authToken=${PWD}' \
+  | jq -r 'has("//registry.example/:_authToken")')"
+if [[ "${secret_visible}" == "false" ]]; then
+  pass "a secret-bearing setting stays absent from the report even when set explicitly"
+else
+  fail "the secret key became visible in config list --json: ${secret_visible}"
+fi
+
+# ${OLDPWD} resolves from the environment, which is what makes re-asserting
+# the ambient value inside each cd'd subshell enough to keep it lane-invariant.
+npmrc 'os=${OLDPWD}'
+cp -- "${WORK}/.npmrc" "${PARITY_SCRATCH}/.npmrc"
+oldpwd_from_env="$( cd -- "${PARITY_SCRATCH}" && export OLDPWD="${WORK}" && "${real_npm}" config list \
+  --package-lock-only --ignore-scripts --no-audit --no-fund dedupe --json 2>/dev/null | jq -r '.os' )"
+oldpwd_other_lane="$( cd -- "${WORK}" && export OLDPWD="${WORK}" && "${real_npm}" config list \
+  --package-lock-only --ignore-scripts --no-audit --no-fund dedupe --json 2>/dev/null | jq -r '.os' )"
+rm -f -- "${PARITY_SCRATCH}/.npmrc"
+if [[ "${oldpwd_from_env}" == "${WORK}" && "${oldpwd_other_lane}" == "${WORK}" ]]; then
+  pass "\${OLDPWD} resolves from the environment, so re-asserting it makes both lanes agree"
+else
+  fail "\${OLDPWD} did not follow the environment: scratch=${oldpwd_from_env} project=${oldpwd_other_lane}"
+fi
+
+# Whether a pinned PWD steers the expansion is npm-version-dependent, and this
+# suite runs against whichever npm the GATE would resolve: npm 12.0.2 ignores
+# the pin and uses the process's real cwd, while the older npm bundled with
+# Node 22 honors it. Both shapes are recorded rather than asserted away — the
+# guard refuses such a reference instead of rewriting it, so neither shape
+# changes the outcome, and only a third, unknown shape is a failure.
+npmrc 'os=${PWD}'
+pinned_os="$( cd -- "${WORK}" && env PWD=/pinned/elsewhere "${real_npm}" config list \
+  --package-lock-only --ignore-scripts --no-audit --no-fund dedupe --json 2>/dev/null | jq -r '.os' )"
+if [[ "${pinned_os}" == "${WORK}" ]]; then
+  pass "a pinned PWD does not steer \${PWD} here (npm uses the real cwd; matching the lanes' expansion is unavailable)"
+elif [[ "${pinned_os}" == "/pinned/elsewhere" ]]; then
+  pass "a pinned PWD steers \${PWD} here (older npm shape; the guard refuses rather than rewrites either way)"
+else
+  fail "\${PWD} resolved to neither the cwd nor the pinned value: ${pinned_os}"
+fi
+
+# Environment-sourced npm_config_* values are expanded the same way, which is
+# why the guard scans them as well as the config files.
+npmrc ''
+env_expanded="$(npm_config_os='${PWD}' parity_probe "${WORK}" | jq -r '.os')"
+if [[ "${env_expanded}" == "${WORK}" ]]; then
+  pass "an npm_config_* environment value is expanded per-cwd too"
+else
+  fail "npm_config_os=\${PWD} did not expand per-cwd: ${env_expanded}"
+fi
+
+# The guard learns which files npm will read from the probe's own report.
+config_files="$(parity_probe "${WORK}" | jq -r '[(.userconfig | type), (.globalconfig | type)] | join(",")')"
+if [[ "${config_files}" == "string,string" ]]; then
+  pass "the probe reports the effective userconfig and globalconfig paths (the guard's file list)"
+else
+  fail "config file paths are not both reported as strings: ${config_files}"
+fi
+
+# The one class npm keeps OUT of this output: secret-bearing keys. npm applies
+# the expansion above to them BEFORE omitting them, so a ${PWD}-built token
+# diverges invisibly to parity (r2 review F3) — the expansion guard is what
+# refuses that class, upstream of this comparison.
+printf '//registry.npmjs.org/:_authToken=live-oracle-not-a-real-token\n_auth=bGl2ZS1vcmFjbGU=\n' > "${WORK}/auth.npmrc"
+auth_keys="$(parity_probe "${WORK}" --userconfig "${WORK}/auth.npmrc" | jq -r '[keys[] | select(startswith("_") or startswith("//"))] | join(", ")')"
+if [[ -z "${auth_keys}" ]]; then
+  pass "secret-bearing config keys are omitted from config list --json (documented parity blind spot)"
+else
+  fail "secret-bearing keys appear in config list --json: ${auth_keys}"
+fi
+rm -f -- "${PARITY_SCRATCH}/.npmrc"
 
 # --- registry-provenance oracle ---------------------------------------------
 
