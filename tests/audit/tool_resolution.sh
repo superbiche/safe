@@ -281,6 +281,200 @@ case_a_valid_tools_file_is_left_untouched() {
   fi
 }
 
+# --- tools.json is SHARED state: replace it atomically, and rarely ----------
+#
+# Every gated build's repo-audit preflight refreshes detection, so tools.json
+# has many concurrent writers and many concurrent readers. Two properties keep
+# that survivable, and both are asserted below:
+#
+#   1. A replace is a rename WITHIN the config filesystem. Staging in $TMPDIR
+#      (routinely a tmpfs) made `mv` a cross-device copy-then-unlink, and a
+#      reader landing inside that window saw a truncated cache — which
+#      ensure_tools_file then reset to `{}`, which read as "missing required
+#      scanners", which failed the gate closed on scanners that were installed
+#      the whole time.
+#   2. The steady state does not write at all. Detection that reproduces the
+#      cached entry skips the write, so the contended window is not even
+#      entered on the runs that had nothing to say. This is rarity, not
+#      absence: a machine whose PATH resolves a scanner elsewhere than the
+#      cache holds differs on every scan, and writes on every scan.
+
+SCAN_MOCKBIN="$TEST_ROOT/cache-scan-mockbin"
+mkdir -p "$SCAN_MOCKBIN"
+for tool in osv-scanner grype syft; do
+  cat > "$SCAN_MOCKBIN/$tool" <<'STUB'
+#!/usr/bin/env bash
+case "$(basename -- "$0")" in
+  osv-scanner) printf '{"results":[]}\n' ;;
+  grype)       printf '{"matches":[]}\n' ;;
+  syft)        printf '{"components":[],"metadata":{"tools":[{"name":"syft"}]}}\n' ;;
+esac
+exit 0
+STUB
+  chmod +x "$SCAN_MOCKBIN/$tool"
+done
+
+# A minimal npm project: enough evidence for a --deps-only scan to have work.
+make_scan_project() {
+  local project="$1"
+  mkdir -p "$project"
+  printf '{"name":"p","version":"1.0.0","dependencies":{}}\n' > "$project/package.json"
+  printf '{"name":"p","version":"1.0.0","lockfileVersion":3,"packages":{}}\n' > "$project/package-lock.json"
+}
+
+run_hermetic_scan() {
+  local config_dir="$1" project="$2"
+  ( cd "$project" && HOME="$FAKE_HOME" PATH="$SCAN_MOCKBIN:$PATH" \
+      SAFE_AUDIT_CONFIG_DIR="$config_dir" \
+      SAFE_AUDIT_DATA_DIR="$TEST_ROOT/data-cache-scan" \
+      "$SAFE_AUDIT" repo-audit . --deps-only --allow-missing-tools ) >/dev/null 2>&1 || true
+}
+
+case_an_unchanged_detection_does_not_rewrite_the_cache() {
+  # The inode is the oracle: an atomic replace is a rename, which always
+  # installs a NEW inode at the path. An unchanged inode after a second scan
+  # is proof no replace happened — string-comparing the contents could not
+  # tell a skipped write from a rewrite of identical bytes.
+  local config_dir="$TEST_ROOT/config-idempotent"
+  local project="$TEST_ROOT/idempotent-project"
+  mkdir -p "$config_dir"
+  make_scan_project "$project"
+
+  run_hermetic_scan "$config_dir" "$project"
+  local first_inode
+  first_inode="$(stat -c '%i' "$config_dir/tools.json" 2>/dev/null || printf '')"
+
+  run_hermetic_scan "$config_dir" "$project"
+  local second_inode
+  second_inode="$(stat -c '%i' "$config_dir/tools.json" 2>/dev/null || printf '')"
+
+  if [[ -n "$first_inode" && "$first_inode" == "$second_inode" ]] \
+     && jq -e -s 'length == 1 and (.[0] | type == "object")' "$config_dir/tools.json" >/dev/null 2>&1 \
+     && [[ "$(jq -r '.local["osv-scanner"] // ""' "$config_dir/tools.json")" == "$SCAN_MOCKBIN/osv-scanner" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (inode ${first_inode:-<none>} -> ${second_inode:-<none>}, cache='$(cat "$config_dir/tools.json" 2>/dev/null)')"
+  fi
+}
+
+case_cache_write_stages_beside_the_cache_not_in_tmpdir() {
+  # Where the staging file lands IS the fix, and a survivable oracle for it is
+  # not "$TMPDIR ends up empty" — a bare `mktemp` + `mv` empties $TMPDIR too,
+  # by moving the staged file out of it. Point $TMPDIR at a path that does not
+  # exist instead: `mktemp` with no template cannot allocate there and the
+  # write fails, while `mktemp "$CONFIG_DIR/..."` carries its own directory and
+  # never consults $TMPDIR at all. A write that still lands is proof the
+  # staging file was allocated beside the destination.
+  local config_dir="$TEST_ROOT/config-stage-beside"
+  mkdir -p "$config_dir"
+  printf '{}\n' > "$config_dir/tools.json"
+
+  TMPDIR="$TEST_ROOT/tmpdir-that-does-not-exist" \
+  HOME="$FAKE_HOME" \
+  SAFE_AUDIT_CONFIG_DIR="$config_dir" \
+  SAFE_AUDIT_DATA_DIR="$TEST_ROOT/data" \
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+    bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null
+      tool_cache_set local "$(build_tool_entry_json /opt/osv "" "" "" "" "" "")"' \
+    >/dev/null 2>&1 || true
+
+  # And the staging file is consumed by the rename, never left beside the cache.
+  local leftovers
+  leftovers="$(find "$config_dir" -maxdepth 1 -name '.tools.json.*' 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "$(jq -r '.local["osv-scanner"] // ""' "$config_dir/tools.json" 2>/dev/null)" == "/opt/osv" ]] \
+     && [[ "$leftovers" == "0" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME ($leftovers staging leftovers, cache='$(cat "$config_dir/tools.json" 2>/dev/null)')"
+  fi
+}
+
+# --- an unreadable cache is breakage, never a missing scanner ---------------
+
+# A directory where tools.json belongs defeats both recovery paths at once:
+# jq cannot read it, and ensure_tools_file's `printf > file` reset cannot heal
+# it. What is left is a cache that cannot be read — infrastructure to repair,
+# and the one thing it must never be called is a missing scanner.
+make_unreadable_tools_file() {
+  local config_dir="$1"
+  mkdir -p "$config_dir/tools.json"
+}
+
+case_an_unreadable_cache_refuses_as_breakage_not_missing_scanners() {
+  # SAFE_AUDIT_NO_INIT keeps the startup ensure_dirs from refusing before the
+  # decision seam is reached: this case is about what the seam DECIDES, not
+  # about the startup guard (that is the e2e case below).
+  local config_dir="$TEST_ROOT/config-unreadable-seam"
+  make_unreadable_tools_file "$config_dir"
+
+  local out rc=0
+  out="$(HOME="$FAKE_HOME" \
+    SAFE_AUDIT_NO_INIT=1 \
+    SAFE_AUDIT_CONFIG_DIR="$config_dir" \
+    SAFE_AUDIT_DATA_DIR="$TEST_ROOT/data" \
+    SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+      bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null
+        confirm_scan_with_missing_tools local' 2>&1)" || rc=$?
+
+  if (( rc != 0 )) \
+     && [[ "$out" == *"audit-infrastructure breakage"* ]] \
+     && [[ "$out" != *"missing required scanners"* ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (rc=$rc, out='$out')"
+  fi
+}
+
+case_an_unreadable_cache_refuses_the_whole_scan() {
+  # End to end: the startup normalizer cannot write `{}` over a directory
+  # either, and an unguarded redirect would fail that with a raw shell error.
+  # The refusal must be safe's own single line, in the infrastructure wording.
+  local config_dir="$TEST_ROOT/config-unreadable-e2e"
+  local project="$TEST_ROOT/unreadable-project"
+  make_unreadable_tools_file "$config_dir"
+  make_scan_project "$project"
+
+  local out rc=0
+  out="$( cd "$project" && HOME="$FAKE_HOME" PATH="$SCAN_MOCKBIN:$PATH" \
+      SAFE_AUDIT_CONFIG_DIR="$config_dir" \
+      SAFE_AUDIT_DATA_DIR="$TEST_ROOT/data-unreadable" \
+      "$SAFE_AUDIT" repo-audit . --deps-only --allow-missing-tools 2>&1 )" || rc=$?
+
+  if (( rc != 0 )) \
+     && [[ "$out" == *"audit-infrastructure breakage"* ]] \
+     && [[ "$out" != *"missing required scanners"* ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (rc=$rc, out='$out')"
+  fi
+}
+
+case_an_absent_tool_still_reports_as_missing() {
+  # The other half of the distinction: a cache that READS fine and simply does
+  # not name the scanner is a genuinely missing scanner, and must keep taking
+  # the missing-tools path rather than being upgraded to breakage.
+  local config_dir="$TEST_ROOT/config-genuinely-missing"
+  mkdir -p "$config_dir"
+  printf '{"local":{}}\n' > "$config_dir/tools.json"
+
+  local out rc=0
+  out="$(HOME="$FAKE_HOME" \
+    SAFE_AUDIT_NO_INIT=1 \
+    SAFE_AUDIT_CONFIG_DIR="$config_dir" \
+    SAFE_AUDIT_DATA_DIR="$TEST_ROOT/data" \
+    SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+      bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null
+        confirm_scan_with_missing_tools local' 2>&1)" || rc=$?
+
+  if (( rc == 2 )) \
+     && [[ "$out" == *"missing required scanners"* ]] \
+     && [[ "$out" != *"audit-infrastructure breakage"* ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (rc=$rc, out='$out')"
+  fi
+}
+
 # --- scratch lifecycle ------------------------------------------------------
 
 # Counts scratch directories created inside an isolated TMPDIR, so the assertion
@@ -378,6 +572,11 @@ case_garbage_and_array_tools_files_normalize_to_an_object
 case_multi_document_tools_file_normalizes_to_a_single_object
 case_tool_cache_set_over_a_multi_document_cache_stays_single
 case_a_valid_tools_file_is_left_untouched
+case_an_unchanged_detection_does_not_rewrite_the_cache
+case_cache_write_stages_beside_the_cache_not_in_tmpdir
+case_an_unreadable_cache_refuses_as_breakage_not_missing_scanners
+case_an_unreadable_cache_refuses_the_whole_scan
+case_an_absent_tool_still_reports_as_missing
 case_scratch_dirs_are_removed_on_success
 case_scratch_dirs_are_removed_on_failure
 case_a_real_scan_leaves_no_scratch_behind

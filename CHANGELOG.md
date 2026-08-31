@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- **The scanner cache is replaced atomically, so a concurrent scan can no
+  longer refuse on scanners that are installed** (1.54.0). `safe audit`
+  intermittently failed the gate closed with `missing required scanners:
+  syft|osv-scanner` on hosts where both were installed and working — reliably
+  reproducible under parallel test runs, where many gated builds audit at
+  once. The cache (`~/.config/safe/audit/tools.json`) was staged in `$TMPDIR`
+  and moved into the config directory. Those are different filesystems on a
+  normal setup ($TMPDIR a tmpfs), and a cross-device `mv` is not a rename: it
+  is copy-then-unlink, so a reader landing inside the copy saw a truncated
+  cache. From there the failure was fully deterministic — the truncated file
+  looked invalid, the cache normalizer reset it to `{}`, every scanner lookup
+  came back empty, and the scan refused for missing scanners. The staging file
+  is now allocated beside the cache, which makes the replace a `rename(2)`:
+  a reader sees the whole old file or the whole new one.
+  - **A refresh that changes nothing no longer writes.** Detection runs on
+    every scan, and in the steady state it reproduced the cached entry and
+    rewrote it anyway. It now compares the fresh entry against the cached one
+    and skips the write when they are equal. This is rarity, not silence:
+    a machine whose PATH resolves a scanner somewhere other than the cache
+    records differs on every scan and writes on every scan.
+  - **A cache that cannot be read is breakage, not a missing scanner.** The
+    read feeding the missing-scanner decision mapped every failure to "empty",
+    so an unreadable cache — a directory in its place, a config directory safe
+    cannot write — refused the scan by naming scanners, sending the operator
+    to reinstall tools that were never gone. Those refusals now say
+    `audit-infrastructure breakage, not a package finding` and name the
+    repair, matching every other infrastructure failure in safe. A cache that
+    reads fine and genuinely does not name a scanner keeps the missing-tools
+    flow unchanged.
+  - **The same non-atomic replace is fixed everywhere it touched shared
+    state**: the published scan result (`results/<machine>/<date>-scan.json`),
+    the install-evidence receipts, and `safe run`'s host-allow, scripts-allow,
+    blocklist, sandbox-known and config files. All stage beside their
+    destination now. Per-process temporary files are unaffected.
+
 - **npm dedupe/prune: the lock-diff projection now mirrors the project's
   config and workspace state** (1.53.0). The projection resolved in a scratch
   directory carrying only the root `package.json`, the lockfile, and the

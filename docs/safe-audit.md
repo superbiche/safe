@@ -74,6 +74,21 @@ scanners missing until someone refreshed by hand. A tool that genuinely
 disappeared is still dropped: claiming coverage safe does not have is the worse
 failure.
 
+The cache is shared state with many concurrent writers — every gated build's
+repo-audit preflight refreshes detection — so two properties keep it
+survivable. A replace is atomic: the new cache is staged in the config
+directory and renamed into place, so a concurrent reader sees the old file or
+the new one, never half of either. And a refresh that reproduces the cached
+entry does not write at all, which makes the steady state quiet; a machine
+whose PATH resolves a scanner somewhere other than the cache records still
+writes on every scan.
+
+A cache that cannot be *read* — a directory in its place, a file the config
+directory will not let safe rewrite — is audit-infrastructure breakage, and
+scans refuse on it with a repair hint. It is never reported as a missing
+scanner: those are opposite facts, and conflating them sends an operator
+reinstalling scanners that were installed the whole time.
+
 ## Project And Machine Scans
 
 Local project scan:
@@ -312,9 +327,11 @@ pin-an-exact-version hint rather than a silent pass.
 
 Writes the result document to a caller-owned path. The published result lives
 at `~/.local/share/safe/audit/results/<machine>/<date>-scan.json`, one file per
-machine per day: a concurrent scan of another project replaces it. Any caller
-that *decides* something from a scan (`safe install --project` does) must read
-its own copy instead. Single-target scans only.
+machine per day: a concurrent scan of another project replaces it. The replace
+is atomic — a reader gets one complete document, never a truncated one — but
+which scan's document it gets is whichever wrote last. Any caller that
+*decides* something from a scan (`safe install --project` does) must read its
+own copy instead. Single-target scans only.
 
 Full filesystem scan, including installed dependency trees:
 

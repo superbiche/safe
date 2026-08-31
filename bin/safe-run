@@ -103,6 +103,21 @@ die()  { err "$@"; exit 1; }
 is_tty() { [[ -t 0 && -t 1 ]]; }
 now_iso() { date -Iseconds; }
 
+# Stage a replacement BESIDE the file it will replace, and print its path.
+#
+# `mv` is an atomic rename only within one filesystem. $TMPDIR is routinely a
+# tmpfs while safe's trust stores and config are not, so `mktemp` + `mv` across
+# the two degrades to copy-then-unlink: for the duration of the copy, every
+# concurrent reader of the destination sees a truncated file. Trust stores and
+# config are read by every gated command on the host, so that window is not
+# hypothetical — the same shape produced a fail-closed gate refusal against a
+# scanner cache that was never actually missing. Every replace of a shared
+# state file allocates its staging file here instead.
+stage_beside() {
+  local dest="$1"
+  mktemp "$dest.XXXXXX" || die "cannot stage a write next to $dest"
+}
+
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
 }
@@ -848,7 +863,7 @@ in_sandbox_known() {
 mark_sandbox_known() {
   local pkg="$1" version="$2"
   local tmp
-  tmp=$(mktemp)
+  tmp=$(stage_beside "$SANDBOX_KNOWN_FILE")
   jq --arg p "$pkg" --arg v "$version" --arg d "$(date -I)" '
     .packages[$p] = {
       last_version: $v,
@@ -1656,7 +1671,7 @@ write_host_allow_entry() {
   # #87: write the sanctioned store (literal canonical, or a blessed redirect);
   # callers are already write-guarded against an unblessed redirect.
   ha_file="$(trust_store_file host-allow.json)"
-  tmp=$(mktemp)
+  tmp=$(stage_beside "$ha_file")
   jq --arg p "$pkg" --arg v "$version" --arg s "$sha" \
      --arg r "$reason" --arg d "$added" --arg e "$ecosystem" '
     .packages[$p] = {
@@ -1959,7 +1974,7 @@ cmd_host_allow_remove() {
   [[ -f "$HOST_ALLOW_FILE" ]] || { info "host-allow is empty; nothing to remove"; return 0; }
   pkg=$(resolve_package_key_in_file "$HOST_ALLOW_FILE" "$pkg")
   local tmp
-  tmp=$(mktemp)
+  tmp=$(stage_beside "$HOST_ALLOW_FILE")
   jq --arg p "$pkg" 'del(.packages[$p])' "$HOST_ALLOW_FILE" > "$tmp"
   mv "$tmp" "$HOST_ALLOW_FILE"
   info "removed $pkg from host-allow"
@@ -2414,7 +2429,7 @@ cmd_scripts_allow_add() {
   # #87: write the sanctioned store (literal canonical, or a blessed redirect);
   # cmd_scripts_allow_add is already write-guarded against an unblessed redirect.
   sa_file="$(trust_store_file scripts-allow.json)"
-  tmp=$(mktemp)
+  tmp=$(stage_beside "$sa_file")
   jq --arg p "$PKG_NAME" --arg v "$PKG_VERSION" --arg s "$sha" \
      --arg r "$reason" --arg d "$(date -I)" --argjson scripts "$scripts_json" '
     .packages[$p] = {
@@ -2438,7 +2453,7 @@ cmd_scripts_allow_remove() {
   [[ -f "$SCRIPTS_ALLOW_FILE" ]] || { info "scripts-allow is empty; nothing to remove"; return 0; }
   pkg=$(resolve_package_key_in_file "$SCRIPTS_ALLOW_FILE" "$pkg")
   local tmp
-  tmp=$(mktemp)
+  tmp=$(stage_beside "$SCRIPTS_ALLOW_FILE")
   jq --arg p "$pkg" 'del(.packages[$p])' "$SCRIPTS_ALLOW_FILE" > "$tmp"
   mv "$tmp" "$SCRIPTS_ALLOW_FILE"
   info "removed scripts grant for $pkg"
@@ -2482,7 +2497,7 @@ cmd_block_add() {
   done
   [[ -z "$reason" ]] && die "--reason is required"
   pkg=$(normalize_block_package_name_or_die "$pkg")
-  local tmp; tmp=$(mktemp)
+  local tmp; tmp=$(stage_beside "$BLOCKED_FILE")
   jq --arg p "$pkg" --arg r "$reason" --arg d "$(date -I)" '
     .packages[$p] = { reason: $r, added: $d }' "$BLOCKED_FILE" > "$tmp"
   mv "$tmp" "$BLOCKED_FILE"
@@ -2493,7 +2508,7 @@ cmd_block_remove() {
   local pkg="${1:-}"
   [[ -z "$pkg" ]] && die "usage: safe run block remove <pkg>"
   pkg=$(resolve_package_key_in_file "$BLOCKED_FILE" "$pkg")
-  local tmp; tmp=$(mktemp)
+  local tmp; tmp=$(stage_beside "$BLOCKED_FILE")
   jq --arg p "$pkg" 'del(.packages[$p])' "$BLOCKED_FILE" > "$tmp"
   mv "$tmp" "$BLOCKED_FILE"
   info "unblocked $pkg"
@@ -2515,7 +2530,7 @@ cmd_block_import() {
     body=$(curl -fsSL "$source") || die "fetch failed: $source"
   fi
   local tmp imported_tmp today
-  tmp=$(mktemp)
+  tmp=$(stage_beside "$BLOCKED_FILE")
   imported_tmp=$(mktemp)
   today=$(date -I)
 
@@ -2724,7 +2739,7 @@ _link_rollback_run() {
         fi
         ;;
       CONFIG_SET)
-        local tmp; tmp=$(mktemp)
+        local tmp; tmp=$(stage_beside "$CONFIG_FILE")
         jq --arg k "$a1" '.runners[$k] = null' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
         ;;
     esac
@@ -2814,7 +2829,7 @@ _link_one() {
     _link_rollback_record BACKUP "$path" "$backup"
   fi
 
-  local tmp; tmp=$(mktemp)
+  local tmp; tmp=$(stage_beside "$CONFIG_FILE")
   jq --arg k "${k}_real" --arg v "$backup" '.runners[$k] = $v' "$CONFIG_FILE" > "$tmp"
   mv "$tmp" "$CONFIG_FILE"
   _link_rollback_record CONFIG_SET "${k}_real"
@@ -2832,13 +2847,13 @@ _link_repair_stale_runners() {
   for k in npx bunx uvx pipx; do
     saved=$(jq -r --arg k "${k}_real" '.runners[$k] // empty' "$CONFIG_FILE")
     if [[ -n "$saved" ]] && is_stale_volta_path "$saved"; then
-      tmp=$(mktemp)
+      tmp=$(stage_beside "$CONFIG_FILE")
       jq --arg k "${k}_real" '.runners[$k] = null' "$CONFIG_FILE" > "$tmp"
       mv "$tmp" "$CONFIG_FILE"
       info "$k: cleared stale Volta runner path ($saved)"
     fi
   done
-  tmp=$(mktemp)
+  tmp=$(stage_beside "$CONFIG_FILE")
   jq 'del(.runners["npx-volta_real"])' "$CONFIG_FILE" > "$tmp"
   mv "$tmp" "$CONFIG_FILE"
 }
@@ -2898,13 +2913,13 @@ cmd_unlink() {
       warn "$k: $path is not a symlink; not touching"
       continue
     fi
-    local tmp; tmp=$(mktemp)
+    local tmp; tmp=$(stage_beside "$CONFIG_FILE")
     jq --arg k "${k}_real" '.runners[$k] = null' "$CONFIG_FILE" > "$tmp"
     mv "$tmp" "$CONFIG_FILE"
   done
 
   # Drop the retired Volta bookkeeping key if it survived an old install.
-  local tmp; tmp=$(mktemp)
+  local tmp; tmp=$(stage_beside "$CONFIG_FILE")
   jq 'del(.runners["npx-volta_real"])' "$CONFIG_FILE" > "$tmp"
   mv "$tmp" "$CONFIG_FILE"
 
