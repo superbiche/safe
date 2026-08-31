@@ -225,8 +225,127 @@ case_govulncheck_counts_unique_findings() {
 case_govulncheck_empty_stream_is_an_error() {
   prepare_case "go-broken"
   printf 'module demo\n\ngo 1.22\n' > "$CASE_PROJECT/go.mod"
-  # A working govulncheck always emits at least its config record.
-  run_scan GOVULNCHECK_RC=1 GOVULNCHECK_OUT=''
+  # A working govulncheck always emits at least its config record. Exit 0 here:
+  # the empty stream must be caught by the parser, not by the exit-code path.
+  run_scan GOVULNCHECK_RC=0 GOVULNCHECK_OUT=''
+  assert_jq "$FUNCNAME" '
+    .ecosystem_audits[] | select(.scanner == "govulncheck") | .status == "error"
+  ' || return
+  # A scanner that exited 0 did not "fail (exit 0)" — its OUTPUT failed to
+  # validate, and the note has to say which one broke.
+  assert_jq "$FUNCNAME" '
+    .ecosystem_audits[] | select(.scanner == "govulncheck")
+      | ((.note // "") | test("validation"))
+        and (((.note // "") | test("failed \\(exit 0\\)")) | not)
+  ' || return
+  pass "$FUNCNAME"
+}
+
+case_govulncheck_pretty_stream_is_read() {
+  prepare_case "go-pretty"
+  printf 'module demo\n\ngo 1.22\n' > "$CASE_PROJECT/go.mod"
+  printf 'package main\nfunc main() {}\n' > "$CASE_PROJECT/main.go"
+  # THE shape govulncheck actually emits: concatenated PRETTY-PRINTED documents,
+  # one object spread over many lines, not NDJSON. Read line by line, a clean
+  # 172-document scan of a real repo was rejected as unparsable and every Go
+  # project reported "govulncheck failed" with its coverage missing.
+  run_scan GOVULNCHECK_RC=0 GOVULNCHECK_OUT='{
+  "config": {
+    "protocol_version": "v1.0.0",
+    "scanner_name": "govulncheck",
+    "scanner_version": "v1.7.0",
+    "db": "https://vuln.go.dev",
+    "scan_level": "symbol",
+    "scan_mode": "source"
+  }
+}
+{
+  "SBOM": {
+    "go_version": "go1.26.5",
+    "modules": [
+      {
+        "path": "demo"
+      },
+      {
+        "path": "stdlib"
+      }
+    ]
+  }
+}
+{
+  "progress": {
+    "message": "Fetching vulnerabilities from the database..."
+  }
+}
+{
+  "osv": {
+    "id": "GO-2021-0067",
+    "modules": [
+      {
+        "path": "stdlib"
+      }
+    ]
+  }
+}
+{
+  "progress": {
+    "message": "Checking the code against the vulnerabilities..."
+  }
+}'
+  assert_jq "$FUNCNAME" '
+    .ecosystem_audits[] | select(.scanner == "govulncheck")
+      | .status == "ok" and .total == 0 and .unknown == 0
+  ' || return
+  # An `osv` record is a database entry the scan considered, never a finding.
+  assert_jq "$FUNCNAME" '.audit_totals.critical == 0 and .verdict == "GO"' || return
+  pass "$FUNCNAME"
+}
+
+case_govulncheck_pretty_stream_counts_findings() {
+  prepare_case "go-pretty-finding"
+  printf 'module demo\n\ngo 1.22\n' > "$CASE_PROJECT/go.mod"
+  printf 'package main\nfunc main() {}\n' > "$CASE_PROJECT/main.go"
+  run_scan GOVULNCHECK_RC=0 GOVULNCHECK_OUT='{
+  "config": {
+    "protocol_version": "v1.0.0",
+    "scanner_name": "govulncheck"
+  }
+}
+{
+  "osv": {
+    "id": "GO-2026-0001"
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-0001",
+    "fixed_version": "v1.2.3",
+    "trace": [
+      {
+        "module": "example.com/x",
+        "function": "Vulnerable"
+      }
+    ]
+  }
+}'
+  assert_jq "$FUNCNAME" '
+    .ecosystem_audits[] | select(.scanner == "govulncheck")
+      | .status == "ok" and .total == 1 and .unknown == 1
+  ' || return
+  pass "$FUNCNAME"
+}
+
+case_govulncheck_foreign_json_is_an_error() {
+  prepare_case "go-foreign"
+  printf 'module demo\n\ngo 1.22\n' > "$CASE_PROJECT/go.mod"
+  printf 'package main\nfunc main() {}\n' > "$CASE_PROJECT/main.go"
+  # Valid JSON, exit 0, and none of the records govulncheck emits: a different
+  # tool answered (or a wrapper swallowed the real one). Reporting zero findings
+  # here would claim coverage nothing produced.
+  run_scan GOVULNCHECK_RC=0 GOVULNCHECK_OUT='{
+  "results": [],
+  "experimentalAnalysisConfig": {}
+}'
   assert_jq "$FUNCNAME" '
     .ecosystem_audits[] | select(.scanner == "govulncheck") | .status == "error"
   ' || return
@@ -398,10 +517,17 @@ case_govulncheck_partial_stream_is_an_error() {
   prepare_case "go-partial"
   printf 'module demo\n\ngo 1.22\n' > "$CASE_PROJECT/go.mod"
   printf 'package main\nfunc main() {}\n' > "$CASE_PROJECT/main.go"
-  # Valid config record, then the process dies mid-write. Tolerating the
-  # unparsable tail would report a confident zero findings.
-  run_scan GOVULNCHECK_RC=1 GOVULNCHECK_OUT='{"config":{"protocol_version":"v1.0.0"}}
-{"finding":{"osv":"GO-2026-000'
+  # Complete config document, then the process dies mid-document. Exit 0, so
+  # only the parser can catch it: tolerating the truncated tail would report a
+  # confident zero findings from a scan that never finished.
+  run_scan GOVULNCHECK_RC=0 GOVULNCHECK_OUT='{
+  "config": {
+    "protocol_version": "v1.0.0"
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-000'
   assert_jq "$FUNCNAME" '
     .ecosystem_audits[] | select(.scanner == "govulncheck") | .status == "error"
   ' || return
@@ -675,6 +801,9 @@ main() {
     case_composer_advisories_are_keyed_by_package \
     case_cargo_audit_derives_severity_from_cvss \
     case_govulncheck_counts_unique_findings \
+    case_govulncheck_pretty_stream_is_read \
+    case_govulncheck_pretty_stream_counts_findings \
+    case_govulncheck_foreign_json_is_an_error \
     case_govulncheck_empty_stream_is_an_error \
     case_project_mode_refuses_a_broken_scanner_under_yes \
     case_project_mode_accepts_a_clean_python_project \
