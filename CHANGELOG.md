@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- **The weekly host-allow review digest is machine-local state now, not a note
+  in the safe repo's inbox** (1.57.0). `--digest` wrote
+  `inbox/<date>-safe-host-allow-digest.md` into the safe checkout, which was
+  wrong twice over: the inbox is a capture lane for asks that get consumed and
+  deleted, not a channel for a report that regenerates every week, and the
+  timer only produced anything at all on a machine that happened to have the
+  repo cloned. The digest now lands at
+  `~/.config/safe/audit/host-allow-digest.json` with a rendered
+  `host-allow-digest.md` beside it, so the weekly timer produces the same
+  surface on every machine and nothing is written into a git tree.
+  - **It is a status surface, so it is always current.** Both files are
+    rewritten on every run, including a run that finds nothing actionable —
+    the old note skipped writing when there was nothing to report and refused
+    to overwrite an existing note for the day, which meant yesterday's
+    findings could outlive the review that cleared them. Each file is staged
+    beside its target and renamed, so a concurrent reader never sees a
+    half-written digest.
+  - **`safe status` reports it.** The status output now carries the removable
+    and review-urgent counts with the review date when there is something to
+    act on, a one-liner when there is not, and says plainly when no review has
+    ever run. A digest that cannot be read shows as unreadable rather than
+    passing for "no findings".
+  - **A handled decision stops nagging.** `safe run host-allow remove <pkg>`
+    drops that entry from the digest and recomputes the counts, mechanically —
+    no re-audit, no network — so status follows the operator's action instead
+    of waiting a week for the next review. A digest that is absent, unreadable,
+    or never carried the entry is a no-op there; the digest is a convenience
+    surface and can never fail a removal.
+
 - **Package installs reached through a mise shim were completely ungated, and
   now enter the gate** (1.56.0). mise's shims are symlinks to whatever `mise`
   resolved to at reshim time, which on a gated machine is safe's own mise

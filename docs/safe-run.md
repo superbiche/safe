@@ -102,7 +102,7 @@ execution long after the pinned version audits clean on its own.
 ```bash
 safe run host-allow review            # human table
 safe run host-allow review --json     # machine-readable report
-safe run host-allow review --digest   # + inbox note in the safe repo when actionable
+safe run host-allow review --digest   # + machine-local digest read by safe status
 safe run host-allow review --no-audit # age/usage only, no re-audit probes
 ```
 
@@ -119,10 +119,22 @@ re-auditing the pinned version:
 
 The review is read-only — removal stays operator-only and TTY-gated. Each
 re-audit probe is bounded (`SAFE_HOST_ALLOW_REVIEW_TIMEOUT`, default 90s).
-`--digest` writes `inbox/<date>-safe-host-allow-digest.md` into the safe repo
-(`SAFE_REPO_DIR` overrides discovery) when it finds removable or review-urgent
-entries; an existing note for the day is never overwritten. `install.sh
---review-timer` installs a weekly systemd user timer
+`--digest` writes the report to `~/.config/safe/audit/host-allow-digest.json`
+and renders it beside as `host-allow-digest.md`. Both are replaced on every
+run, including a run that finds nothing actionable: the digest is a status
+surface reflecting the latest review, not a queue of notes — a review that
+found nothing has to clear yesterday's findings. Each file is staged beside its
+target and renamed, so a concurrent reader never sees a half-written digest.
+
+`safe run status` (and `safe status`, which includes it) reports the digest:
+the removable and review-urgent counts with the review date when there is
+something to act on, a one-liner with the date when there is not, and a line
+saying no review has run yet when the file is absent. `safe run host-allow
+remove <pkg>` drops that entry from the digest and recomputes the counts, so a
+handled decision stops being reported without waiting for the next review — a
+mechanical edit, with no re-audit and no network.
+
+`install.sh --review-timer` installs a weekly systemd user timer
 (`safe-host-allow-review.timer`) that runs `review --digest`.
 
 ### Fleet replication (export / import)

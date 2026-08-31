@@ -6043,8 +6043,15 @@ STUB
   ln -s "${wrapper}" "${dir}/stub/npm"
   : > "${dir}/argv.log"
 
+  # Run from a scratch directory, never the caller's. The PATH below ends in
+  # /usr/bin so the wrapper can find head/grep, which means a setup that
+  # silently failed could reach the REAL npm — and a real `npm install` writes
+  # package.json and node_modules into the CWD (it did once, into the repo
+  # root). The assertions catch the fall-through; the cd keeps a fall-through
+  # from touching anything that matters.
   local out
-  out=$(PATH="${dir}/stub:${dir}/real:/usr/bin:/bin" "${dir}/stub/npm" install cowsay@1.5.0 2>&1)
+  out=$(cd "${dir}" && PATH="${dir}/stub:${dir}/real:/usr/bin:/bin" \
+    "${dir}/stub/npm" install cowsay@1.5.0 2>&1)
   if [[ -n "$out" ]]; then
     printf 'gated argv0 did not enter the gate: %s\n' "$out" >&2
     fail "$FUNCNAME"
@@ -6066,6 +6073,10 @@ case_mise_shims_ahead_of_the_gate_still_audit() {
   local dir="${TEST_ROOT}/${FUNCNAME}"
   mkdir -p "${dir}/home" "${dir}/shims" "${dir}/stub" "${dir}/real"
   HOME="${dir}/home" SAFE_ZSHRC="${dir}/zshrc" bash "${ROOT_DIR}/install.sh" --wrappers >/dev/null 2>&1
+  # Without the wrapper the shim below is a dangling symlink, PATH resolution
+  # walks past it, and the command reaches the real npm instead of proving
+  # anything. Fail on the setup rather than on a confusing assertion.
+  [[ -x "${dir}/home/.local/bin/mise" ]] || { fail "$FUNCNAME"; return; }
   ln -s "${dir}/home/.local/bin/mise" "${dir}/shims/npm"
 
   cat > "${dir}/stub/safe" <<STUB
@@ -6080,8 +6091,10 @@ STUB
   chmod +x "${dir}/real/mise"
   : > "${dir}/argv.log"
 
+  # Scratch CWD for the same reason as the case above: a fall-through past the
+  # shim reaches the real npm, and a real install writes into the CWD.
   local out
-  out=$(PATH="${dir}/stub:${dir}/shims:${dir}/home/.local/bin:${dir}/real:/usr/bin:/bin" \
+  out=$(cd "${dir}" && PATH="${dir}/stub:${dir}/shims:${dir}/home/.local/bin:${dir}/real:/usr/bin:/bin" \
     bash -c 'npm install cowsay@1.5.0' 2>&1)
   if [[ -n "$out" ]]; then
     printf 'shims-first npm did not enter the gate: %s\n' "$out" >&2
