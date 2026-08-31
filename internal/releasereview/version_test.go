@@ -121,14 +121,14 @@ func TestVersionMatchesRangeCompoundBound(t *testing.T) {
 		{"0.2.0", "0.2.0 <= 0.38.0", rangeMatches},   // the inclusive floor
 		{"0.1.0", "0.2.0 <= 0.38.0", rangeExcludes},  // below the floor
 		{"0.30.0", "0.2.0 <= 0.38.0", rangeMatches},
-		{"v0.30.0", "0.2.0 <= 0.38.0", rangeMatches},   // v-prefix on the subject
-		{"0.30.0", "v0.2.0 <= v0.38.0", rangeMatches},  // v-prefix on both bounds
-		{"0.30.0", " 0.2.0 <= 0.38.0 ", rangeMatches},  // surrounding whitespace trims
-		{"0.30.0", "0.2.0 < 0.38.0", rangeAmbiguous},   // only `<=` is admitted
-		{"0.30.0", "0.2.0 >= 0.38.0", rangeAmbiguous},  // ditto — not guessed
-		{"0.30.0", "0.2.0 <= ", rangeAmbiguous},        // missing ceiling
-		{"0.30.0", "<= 0.38.0", rangeMatches},          // single constraint, unchanged
-		{"0.30.0", "0.2.0", rangeExcludes},             // bare version equality, unchanged
+		{"v0.30.0", "0.2.0 <= 0.38.0", rangeMatches},  // v-prefix on the subject
+		{"0.30.0", "v0.2.0 <= v0.38.0", rangeMatches}, // v-prefix on both bounds
+		{"0.30.0", " 0.2.0 <= 0.38.0 ", rangeMatches}, // surrounding whitespace trims
+		{"0.30.0", "0.2.0 < 0.38.0", rangeAmbiguous},  // only `<=` is admitted
+		{"0.30.0", "0.2.0 >= 0.38.0", rangeAmbiguous}, // ditto — not guessed
+		{"0.30.0", "0.2.0 <= ", rangeAmbiguous},       // missing ceiling
+		{"0.30.0", "<= 0.38.0", rangeMatches},         // single constraint, unchanged
+		{"0.30.0", "0.2.0", rangeExcludes},            // bare version equality, unchanged
 	} {
 		if got := versionMatchesRange(testCase.version, testCase.versionRange); got != testCase.want {
 			t.Errorf("versionMatchesRange(%q, %q) = %v, want %v",
