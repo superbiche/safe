@@ -11,6 +11,15 @@
 # passes while lib/gate-lib.sh regresses.
 #
 # Offline: `npm config list` reads configuration only, never the network.
+#
+# Target skew is accepted by ruling (operator, 2026-08-31): under the test
+# harness's PATH this suite may resolve a DIFFERENT npm build than the one the
+# operator's live gate delegates to (observed: /usr/bin/npm 10.9.8 here, mise
+# shim 12.0.2 live). Attesting the harness-PATH npm is acceptable BECAUSE the
+# resolved target is printed as the suite's first line — the skew can never be
+# invisible — and behaviors that differ between builds (env-PWD pinning,
+# `${VAR?}` substitution) are recorded shape-per-version, never asserted
+# single-shape. Do not "fix" this suite to chase the live gate's npm.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
