@@ -20,6 +20,16 @@ if ! command -v go >/dev/null 2>&1; then
 fi
 
 cd "${ROOT}" || exit 1
+
+# Formatting is part of the belt: unformatted Go landed once (1.47.0) because
+# nothing checked, and stayed on main for two weeks. gofmt -l prints offenders
+# and says nothing when clean; the tracked-dir list keeps it off fixtures.
+unformatted=$(gofmt -l cmd internal)
+if [[ -n "${unformatted}" ]]; then
+  printf 'FAIL: gofmt drift in:\n%s\n' "${unformatted}" >&2
+  exit 1
+fi
+
 go vet ./...
 go test ./...
-printf 'go: vet and tests passed\n'
+printf 'go: gofmt, vet and tests passed\n'
