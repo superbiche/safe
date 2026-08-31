@@ -26,6 +26,14 @@
     the real mise never runs it. `install.sh` now re-points those symlinks and
     reports the counts. Regular files in that directory are left alone, and
     nothing is re-pointed unless `~/.local/bin/mise` is safe's own wrapper.
+  - **Uninstall puts the shims back.** Because that binding is now the default
+    on every install, removing the wrapper without restoring them would leave
+    every mise-managed tool — node and java included, not just the gated ones —
+    a dangling symlink until someone thought to run `mise reshim`. Removing the
+    gate must not uninstall the tools it was gating, so `uninstall.sh`
+    re-points the shims bound to the wrapper it is removing at the first
+    non-wrapper `mise` on PATH. When none resolves it leaves them in place and
+    says to reshim; it never deletes a shim.
   - **The gate's mise-shim delegate no longer goes through the shim.** When the
     real tool safe resolves to is a mise shim, the gate now execs the real mise
     under the tool's argv[0] directly — doing what the shim's dispatch did,

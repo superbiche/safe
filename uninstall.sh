@@ -103,6 +103,76 @@ gate_wrapper_marked() {
     | LC_ALL=C grep -qxF -- "# safe-gate-wrapper v1 tool=${tool}"
 }
 
+# First executable mise on PATH that is not one of our wrappers — the same
+# marker-skipping walk the wrapper's own argv0 dispatch performs.
+resolve_real_mise() {
+  local dir candidate
+  local -a dirs=()
+
+  IFS=':' read -r -a dirs <<< "${PATH}"
+  for dir in "${dirs[@]}"; do
+    [[ -n "$dir" ]] || dir="."
+    candidate="${dir}/mise"
+    [[ -f "$candidate" && -x "$candidate" ]] || continue
+    if LC_ALL=C sed -n '2p' -- "$candidate" 2>/dev/null \
+      | LC_ALL=C grep -qxF -- '# safe-gate-wrapper v1 tool=mise'; then
+      continue
+    fi
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+# Install binds mise's shims to our mise wrapper (install.sh
+# normalize_mise_shims), so deleting that wrapper without putting them back
+# leaves EVERY mise-managed tool — node and java included, not just the gated
+# ones — a dangling symlink until the operator thinks to run `mise reshim`.
+# Removing the gate must never uninstall the tools it was gating: this is the
+# shim-fleet twin of the <tool>.original restore below. Runs BEFORE the wrapper
+# is removed, because identifying the shims bound to it needs it on disk.
+restore_mise_shims() {
+  local wrapper="$BIN_DIR/mise"
+  local shims_dir="${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims"
+  local shim real_mise="" repointed=0 foreign=0
+  local -a bound=()
+
+  [[ -d "$shims_dir" ]] || return 0
+  # Not our wrapper: the removal loop will not touch it either, so its shims
+  # are nobody's business here.
+  gate_wrapper_marked "$wrapper" mise || return 0
+
+  while IFS= read -r -d '' shim; do
+    if [[ ! -L "$shim" ]]; then
+      foreign=$((foreign + 1))
+      continue
+    fi
+    [[ "$shim" -ef "$wrapper" ]] || continue
+    bound+=("$shim")
+  done < <(find "$shims_dir" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+
+  [[ "${#bound[@]}" -gt 0 ]] || return 0
+
+  real_mise="$(resolve_real_mise)" || real_mise=""
+  if [[ -z "$real_mise" ]]; then
+    # Leave them and say so. A dangling shim is one `mise reshim` from
+    # repaired; a deleted one is gone with no signal it ever existed.
+    warn "no non-wrapper mise on PATH: ${#bound[@]} mise shims in $shims_dir still point at the wrapper being removed — run 'mise reshim' to rebuild them"
+    return 0
+  fi
+
+  for shim in "${bound[@]}"; do
+    if ln -sfn -- "$real_mise" "$shim"; then
+      repointed=$((repointed + 1))
+    else
+      warn "could not re-point mise shim $shim at $real_mise — run 'mise reshim' to rebuild it"
+    fi
+  done
+  info "mise shims in $shims_dir: $repointed re-pointed at $real_mise, $foreign non-symlink left alone"
+}
+
+restore_mise_shims
+
 removed_wrappers=()
 restored_originals=()
 for tool in npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise; do

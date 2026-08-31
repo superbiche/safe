@@ -6147,6 +6147,64 @@ case_install_normalizes_mise_shims() {
   pass "$FUNCNAME"
 }
 
+case_uninstall_restores_mise_shims() {
+  # The twin of case_install_normalizes_mise_shims: install binds the shims to
+  # our wrapper, so removing the gate must put them back. Otherwise uninstall
+  # leaves EVERY mise-managed tool — node and java included, not just the gated
+  # ones — a dangling symlink until someone runs `mise reshim`.
+  local dir="${TEST_ROOT}/${FUNCNAME}"
+  local home="${dir}/home" shims="${dir}/home/.local/share/mise/shims"
+  mkdir -p "${shims}" "${dir}/real"
+  printf '#!/usr/bin/env bash\necho real-mise\n' > "${dir}/real/mise"
+  chmod +x "${dir}/real/mise"
+  ln -s "${dir}/real/mise" "${shims}/npm"
+  ln -s "${dir}/real/mise" "${shims}/node"
+  printf '#!/usr/bin/env bash\n# somebody else\n' > "${shims}/keepme"
+  chmod +x "${shims}/keepme"
+
+  HOME="${home}" SAFE_ZSHRC="${dir}/zshrc" bash "${ROOT_DIR}/install.sh" --wrappers >/dev/null 2>&1
+  [[ "${shims}/npm" -ef "${home}/.local/bin/mise" ]] || { fail "$FUNCNAME"; return; }
+
+  PATH="${dir}/real:${PATH}" HOME="${home}" SAFE_ZSHRC="${dir}/zshrc" \
+    bash "${ROOT_DIR}/uninstall.sh" >"${dir}/out" 2>"${dir}/err"
+  local uninstall_status=$?
+  if [[ "${uninstall_status}" -ne 0 ]]; then
+    printf 'uninstall exited %s\n' "${uninstall_status}" >&2
+    fail "$FUNCNAME"
+    return
+  fi
+  [[ ! -e "${home}/.local/bin/mise" ]] || { fail "$FUNCNAME"; return; }
+  # Every shim runs the real mise again, and none of them dangles.
+  [[ "${shims}/npm" -ef "${dir}/real/mise" ]] || { fail "$FUNCNAME"; return; }
+  [[ "${shims}/node" -ef "${dir}/real/mise" ]] || { fail "$FUNCNAME"; return; }
+  [[ ! -L "${shims}/keepme" ]] || { fail "$FUNCNAME"; return; }
+  grep -Fqx '# somebody else' "${shims}/keepme" || { fail "$FUNCNAME"; return; }
+  grep -Fq '2 re-pointed at' "${dir}/err" || { fail "$FUNCNAME"; return; }
+  grep -Fq '1 non-symlink left alone' "${dir}/err" || { fail "$FUNCNAME"; return; }
+
+  # No non-wrapper mise anywhere: the shims are LEFT alone with a legible
+  # reshim hint. Deleting them would be worse — a dangling shim is one command
+  # from repaired, a deleted one is gone with no signal it existed.
+  local bare="${dir}/bare" bare_shims="${dir}/bare/.local/share/mise/shims"
+  local sysbin="${dir}/sysbin" cmd cmd_path
+  mkdir -p "${bare_shims}" "${sysbin}"
+  for cmd in bash sed grep find ln mv rm mktemp cat; do
+    cmd_path="$(command -v "${cmd}")" || { fail "$FUNCNAME"; return; }
+    ln -sf "${cmd_path}" "${sysbin}/${cmd}"
+  done
+  HOME="${bare}" SAFE_ZSHRC="${dir}/zshrc2" bash "${ROOT_DIR}/install.sh" --wrappers >/dev/null 2>&1
+  ln -sfn "${bare}/.local/bin/mise" "${bare_shims}/npm"
+  PATH="${sysbin}" HOME="${bare}" SAFE_ZSHRC="${dir}/zshrc2" \
+    bash "${ROOT_DIR}/uninstall.sh" >"${dir}/out2" 2>"${dir}/err2"
+  [[ -L "${bare_shims}/npm" ]] || { fail "$FUNCNAME"; return; }
+  grep -Fq "run 'mise reshim' to rebuild them" "${dir}/err2" || {
+    printf 'stderr: %s\n' "$(cat "${dir}/err2")" >&2
+    fail "$FUNCNAME"
+    return
+  }
+  pass "$FUNCNAME"
+}
+
 case_uninstall_cleans_shell_and_legacy_binaries() {
   prepare_case "uninstall-cleans-shell-and-legacy-binaries"
   mkdir -p "${HOME_DIR}/.local/bin" "${HOME_DIR}/.local/share/zsh/site-functions" "${HOME_DIR}/.config/safe-run/completions" "${HOME_DIR}/.config/safe" "${HOME_DIR}/.local/share/safe"
@@ -6528,6 +6586,7 @@ main() {
     case_mise_wrapper_gates_a_gated_argv0 \
     case_mise_shims_ahead_of_the_gate_still_audit \
     case_install_normalizes_mise_shims \
+    case_uninstall_restores_mise_shims \
     case_uninstall_cleans_shell_and_legacy_binaries \
     case_safe_run_gated_tool_delegation
   do

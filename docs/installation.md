@@ -54,6 +54,12 @@ generated — and nothing is re-pointed unless `~/.local/bin/mise` is safe's own
 wrapper, so a skipped or foreign `mise` never becomes the target of the whole
 shim fleet.
 
+`uninstall.sh` puts them back: shims bound to the wrapper it is removing are
+re-pointed at the first non-wrapper `mise` on PATH, so removing the gate does
+not uninstall the tools it was gating. If no such `mise` resolves, the symlinks
+are left in place and the uninstaller says to run `mise reshim` — it never
+deletes a shim.
+
 ## First Run
 
 After installation:
