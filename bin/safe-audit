@@ -3217,8 +3217,32 @@ scan_cache_scanner_fingerprint() {
   done
 }
 
+# `composer audit` reads the INSTALLED tree by default, not the lock (see
+# run_composer_audit_dir), so vendor/composer/installed.json is dependency
+# evidence no manifest or lockfile covers: a checkout whose vendor/ was rebuilt
+# from another branch keeps the same composer.lock, hashes to the same key, and
+# would replay the previous installed tree's verdict — demonstrated at one
+# suppressed critical. This names the file composer will actually read:
+# COMPOSER_VENDOR_DIR when exported (composer's own precedence), else
+# composer.json's config.vendor-dir, else vendor/. A relative directory is
+# resolved against the root. A vendor-dir carrying an unexpanded placeholder
+# resolves to nothing, the file is absent, and the root stays keyed on its lock
+# alone — the pre-1.58 behavior, never a wrong hash.
+composer_installed_metadata_path() {
+  local root="$1" vendor=""
+  [[ -f "$root/composer.json" ]] || return 0
+  if [[ -n "${COMPOSER_VENDOR_DIR:-}" ]]; then
+    vendor="$COMPOSER_VENDOR_DIR"
+  elif command -v jq >/dev/null 2>&1; then
+    vendor="$(jq -r '.config["vendor-dir"] // empty' "$root/composer.json" 2>/dev/null || true)"
+  fi
+  [[ -n "$vendor" ]] || vendor="vendor"
+  [[ "$vendor" == /* ]] || vendor="$root/$vendor"
+  printf '%s\n' "${vendor%/}/composer/installed.json"
+}
+
 scan_cache_evidence_paths() {
-  local root name path
+  local root name path installed
   for path in ${CURRENT_LOCKFILES[@]+"${CURRENT_LOCKFILES[@]}"} \
               ${CURRENT_MANIFESTS[@]+"${CURRENT_MANIFESTS[@]}"}; do
     [[ -n "$path" ]] && printf '%s\n' "$path"
@@ -3230,6 +3254,8 @@ scan_cache_evidence_paths() {
       # is what gets hashed.
       [[ -e "$path" ]] && printf '%s\n' "$path"
     done
+    installed="$(composer_installed_metadata_path "$root")"
+    [[ -n "$installed" && -e "$installed" ]] && printf '%s\n' "$installed"
   done
 }
 

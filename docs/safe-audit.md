@@ -203,10 +203,11 @@ costs a scan rather than after.
 
 ### Scan cache (`--deps-only`)
 
-A dependency-only scan reads exactly one thing: the dependency evidence
-(lockfiles and manifests). When that evidence hashes to a set already scanned
-within 24 hours, re-running the scanners cannot produce a different verdict, so
-the recorded result is replayed instead:
+A dependency-only scan reads only dependency evidence: the lockfiles and
+manifests discovery finds, plus the few per-root files a scanner reads to
+decide its answer (enumerated below). When that evidence hashes to a set
+already scanned within 24 hours, re-running the scanners cannot produce a
+different verdict, so the recorded result is replayed instead:
 
 ```text
 [safe audit] scan cache hit (17m) — dependency evidence unchanged; --no-cache forces a fresh scan
@@ -250,6 +251,17 @@ per-root inputs that decide what a scanner *asks*: `.npmrc` (which registry
 `npm audit` queries), `.safe-audit` (which ecosystems are audited at all), and
 every known evidence name that exists as a **symlink** — discovery walks
 regular files, but `npm audit` reads the link happily.
+
+Composer's **installed tree** is in the key for the same reason. `composer
+audit` audits what is in `vendor/`, not what is in the lock, so a checkout
+whose `vendor/` was rebuilt from another branch can hold an advisory its
+unchanged `composer.lock` never mentions — and without this the unchanged lock
+would replay the previous tree's verdict. The file hashed per root is the one
+composer will read: `$COMPOSER_VENDOR_DIR/composer/installed.json` when that
+variable is exported, else the directory named by `config.vendor-dir` in
+`composer.json`, else `vendor/`. A root with no installed tree — every path
+package in a monorepo, every checkout audited before its build — is audited
+from its lock and keyed on that lock alone, which is exactly what it read.
 
 The **scanner set** is part of the key too: each tool's presence and, when
 present, its path, size and mtime. Installing pip-audit gains a project Python

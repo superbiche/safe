@@ -38,6 +38,15 @@
     the default run reported six advisories including one critical while
     `--locked` reported none. The lock is read only when there is no installed
     tree, never in preference to one.
+  - **The installed tree is part of the scan-cache key**, because reading it
+    made it dependency evidence. `vendor/composer/installed.json` survives an
+    ordinary branch change, so a checkout returning to an older lock kept the
+    older cache key and replayed a clean verdict over an installed critical —
+    demonstrated at one suppressed critical on a `--deps-only` scan, the mode
+    the install gate uses. The file hashed is the one composer reads:
+    `$COMPOSER_VENDOR_DIR` when exported, else `config.vendor-dir`, else
+    `vendor/`. Post-scan revalidation covers it too, so a `vendor/` rewritten
+    while the scanners ran is not cached.
 - **A composer project with no dependencies is a clean result, not an error**
   (1.58.0). `composer audit` exits 0 with empty stdout and `No packages -
   skipping audit.` on stderr, which safe reported as `output validation
