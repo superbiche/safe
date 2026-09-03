@@ -24,14 +24,20 @@
     helper's lockfile walk had no prunes at all and also read every lockfile
     under `vendor/`. A scan that skipped anything says how many; `--verbose`
     lists them.
-- **`composer audit` reads the lock file when there is one** (1.58.0). It
-  audits *installed* packages by default and refuses a project whose
-  dependencies were never installed (`No installed packages found ... pass
-  --locked`) — every path package in a monorepo, every checkout audited before
-  its build — which safe reported as a broken scanner. `--locked` is passed
-  whenever a `composer.lock` is present, so the audit reads what the project
-  pins. Verified against Composer 2.10: `--locked` succeeds on a lock that is
-  out of date with `composer.json`, so there is no fallback to keep.
+- **A composer project with no installed tree falls back to its lock file**
+  (1.58.0). `composer audit` refuses a project whose dependencies were never
+  installed (`No installed packages found ... pass --locked`) — every path
+  package in a monorepo, every checkout audited before its build — and safe
+  reported that refusal as a broken scanner. It now reruns with `--locked` and
+  notes `audited composer.lock (no installed packages)`, because a lock-file
+  audit and an installed-tree audit are not the same coverage. With no lock
+  either, the refusal stays an error: nothing was audited.
+  - **The installed tree stays the primary evidence.** `--locked` reads a
+    different package set, and a deployed checkout whose lock has drifted can
+    carry an installed advisory the lock does not mention: on such a fixture
+    the default run reported six advisories including one critical while
+    `--locked` reported none. The lock is read only when there is no installed
+    tree, never in preference to one.
 - **A composer project with no dependencies is a clean result, not an error**
   (1.58.0). `composer audit` exits 0 with empty stdout and `No packages -
   skipping audit.` on stderr, which safe reported as `output validation
@@ -46,6 +52,25 @@
   (relative to the target; `.` is the target itself), the CVE-block one-liner
   names each scanner once with counts summed and `across N roots` when it ran
   in more than one, and the detail block prefixes each line with its root.
+- **Cached scan results from before 1.58.0 are retired** (1.58.0). The scan
+  cache key records the machine, target, mode and evidence hashes but no safe
+  version, so the schema is what retires stale semantics — and this release
+  changes them twice over: ecosystem records gained `root`, discovery began
+  pruning nested repositories, and the composer lane changed which package set
+  it audits. The schema moves 1 -> 2, so every earlier entry misses and
+  rescans. Without it a pre-1.58 result would replay under 1.58 rules: the
+  live cache held 90 such entries, 7 still inside the 24h TTL.
+- **Nested-repository detection deliberately stops at derived directories**
+  (1.58.0). A repository under `vendor/` or `build/_deps/` is a
+  source-installed dependency (`composer install --prefer-source`, a CMake
+  fetch), not a second copy of the project, so it is not reported as nested and
+  `--full` catalogs it as the dependency it is. Documented and locked with a
+  test rather than changed.
+- **A trailing slash on a remote target no longer disables the prune**
+  (1.58.0). The remote helper compared paths against its raw target, so
+  `--project /srv/app/` built a `//` prefix that matched nothing and reported
+  zero nested repositories where `/srv/app` reported three. The helper
+  normalizes its target once, up front.
 - **The gate stopped warning about null bytes on every `go`, `cargo` and `bun`
   invocation** (1.58.0). Since 1.56.0 the wrapper-marker probe ran `sed` over
   the resolved delegate unconditionally, and for a real tool that delegate is

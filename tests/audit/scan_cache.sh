@@ -393,6 +393,24 @@ case_schema_drift_falls_through() {
   pass "$FUNCNAME"
 }
 
+case_previous_schema_entry_misses() {
+  # The rollout property, not just the drift property: an entry minted by the
+  # PREVIOUS release under an otherwise valid key must miss. 1.58.0 changed
+  # what a result means — ecosystem records gained `root`, discovery started
+  # pruning nested repositories, and the composer lane changed which package
+  # set it audits — while the key carries no safe version, so without the
+  # schema bump a 1.57 result replays under 1.58 semantics. The live cache
+  # held 90 such entries, 7 inside the TTL.
+  prepare_case "previous-schema"
+  run_scan
+  run_scan
+  # A freshly written entry is at the current schema and hits.
+  assert_hit "$FUNCNAME" || return
+  # The same entry, minted by the previous schema, must not.
+  assert_miss_after_edit "$FUNCNAME" '._cache.schema = 1' || return
+  pass "$FUNCNAME"
+}
+
 case_malformed_timestamp_falls_through() {
   prepare_case "bad-timestamp"
   run_scan
@@ -669,6 +687,7 @@ main() {
     case_no_evidence_is_not_cacheable \
     case_foreign_envelope_falls_through \
     case_schema_drift_falls_through \
+    case_previous_schema_entry_misses \
     case_malformed_timestamp_falls_through \
     case_invalid_verdict_falls_through \
     case_invalid_ttl_disables_cache \

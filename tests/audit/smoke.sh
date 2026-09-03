@@ -348,6 +348,60 @@ grep -qx 'exclude nested-clone' "$nested_report" || fail "syft excludes missed t
 grep -qx 'exclude nested-clone/**' "$nested_report" || fail "syft excludes missed the nested clone subtree"
 pass "nested repositories are pruned, submodules kept"
 
+# Derived directories are a deliberate boundary. A source-installed dependency
+# (composer --prefer-source, a CMake build/_deps fetch) is a repository under
+# vendor/ or build/, but it is one of the project's DEPENDENCIES, not a second
+# copy of the project. Detection must not report it, so `--full` — which exists
+# to catalog installed trees — still catalogs it.
+mkdir -p "$nested_fixture/vendor/source-copy/.git"
+printf '{"name":"source-copy"}\n' > "$nested_fixture/vendor/source-copy/package.json"
+printf '{"lockfileVersion":3}\n' > "$nested_fixture/vendor/source-copy/package-lock.json"
+derived_report="$tmp/nested-derived-discovery.txt"
+SAFE_AUDIT_CONFIG_DIR="$tmp/config-nested-derived" \
+SAFE_AUDIT_DATA_DIR="$tmp/data-nested-derived" \
+SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+NESTED_FIXTURE="$nested_fixture" \
+  bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null
+    while IFS= read -r -d "" n; do printf "nested %s\n" "${n#$NESTED_FIXTURE/}"; done < <(nested_repo_roots "$NESTED_FIXTURE")
+    gather_projects_from_source "$NESTED_FIXTURE" 1 2>/dev/null
+    for x in "${CURRENT_SYFT_EXCLUDES[@]}"; do printf "exclude %s\n" "$x"; done' > "$derived_report"
+grep -q 'nested vendor/' "$derived_report" && fail "a source-installed dependency under vendor/ was reported as a nested repository"
+grep -q 'exclude vendor/source-copy' "$derived_report" && fail "a dependency under vendor/ became a syft exclude"
+grep -qx 'nested .task/wt' "$derived_report" || fail "derived-directory boundary lost the linked worktree"
+pass "repositories under derived directories are dependencies, not nested repos"
+
+# A trailing slash is an ordinary operator spelling (`machine-audit --project
+# /srv/app/`). Every ancestry test matches on the target or target/*, so an
+# unnormalized `//` prefix silently reported zero nested repositories.
+slash_a="$tmp/nested-slash-a.txt"
+slash_b="$tmp/nested-slash-b.txt"
+for spelling_var in NESTED_SLASH_PLAIN NESTED_SLASH_TRAILING; do
+  case "$spelling_var" in
+    NESTED_SLASH_PLAIN)    spelling="$nested_fixture";  slash_out="$slash_a" ;;
+    NESTED_SLASH_TRAILING) spelling="$nested_fixture/"; slash_out="$slash_b" ;;
+  esac
+  SAFE_AUDIT_CONFIG_DIR="$tmp/config-nested-slash" \
+  SAFE_AUDIT_DATA_DIR="$tmp/data-nested-slash" \
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+  NESTED_FIXTURE="$nested_fixture" \
+  SPELLING="$spelling" \
+    bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null
+      while IFS= read -r -d "" n; do printf "local %s\n" "${n#$NESTED_FIXTURE/}"; done < <(nested_repo_roots "$SPELLING")
+      { remote_scan_helper_script | sed -n "1,/^done < <(find_pruned_lockfiles)/p"
+        printf "%s\n" "for n in \"\${nested_repos[@]}\"; do printf \"remote %s\n\" \"\${n#\$target/}\"; done"
+        printf "%s\n" "for r in \"\${roots[@]}\"; do if [[ \"\$r\" == \"\$target\" ]]; then printf \"label .\n\"; else printf \"label %s\n\" \"\$(relative_to \"\$target\" \"\$r\")\"; fi; done"
+      } | bash -s -- "$SPELLING"' > "$slash_out" 2>/dev/null
+done
+[[ -s "$slash_a" ]] || fail "nested-repo detection produced nothing for a plain target"
+if ! command diff -q "$slash_a" "$slash_b" >/dev/null; then
+  printf 'trailing slash changed the result:\n%s\n' "$(command diff "$slash_a" "$slash_b")" >&2
+  fail "a trailing slash changed nested-repo detection"
+fi
+grep -qx 'remote .task/wt' "$slash_a" || fail "remote detection missed the linked worktree"
+grep -qx 'label .' "$slash_a" || fail "remote label for the target itself is not '.'"
+grep -qx 'label packages/lib' "$slash_a" || fail "remote relative label for a package root is wrong"
+pass "a trailing slash on the target changes nothing"
+
 # The same rule must NOT empty a machine-audit scan: a scan root is a plain
 # directory holding independent repositories side by side, and none of them has
 # a .git-carrying ancestor under the root.

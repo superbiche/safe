@@ -161,9 +161,15 @@ also carries a `.git` entry. A `machine-audit` scan root is a plain directory
 holding independent repositories side by side, so none of them has such an
 ancestor and all of them stay discovered.
 
+Detection does not descend derived directories (`vendor/`, `node_modules/`,
+`build/`, and the rest of the skip list). A repository found there is a
+source-installed **dependency** — `composer install --prefer-source`, a CMake
+`build/_deps/` fetch — not a second copy of the project, and `--full` exists to
+catalog installed trees, so it catalogs those as it always has.
+
 Skipped roots are excluded from manifest and lockfile discovery, from the
-staged source scan, from the `.safe-audit` config walk, and from the SBOM
-(including `--full`). A scan that skipped any prints one line saying how many;
+staged source scan, from the `.safe-audit` config walk, and from the SBOM,
+`--full` included. A scan that skipped any prints one line saying how many;
 `--verbose` lists them.
 
 ### What osv-scanner is handed
@@ -221,7 +227,9 @@ does not capture.
 An entry is replayed only for the request that produced it. The stored envelope
 records the schema, key, machine, target, and mode, and every field is checked
 before replay; an entry belonging to another project, or written by a safe that
-scored verdicts differently, is a miss. A malformed entry never aborts the scan
+scored verdicts differently, is a miss. The key carries no version, so the
+schema is what retires stale semantics: 1.58.0 moved it to 2, and every entry
+written before it misses. A malformed entry never aborts the scan
 it was meant to accelerate — the failure mode of a cache must be slowness, not
 an error a caller reads as "the scan failed".
 
@@ -325,14 +333,20 @@ that (`output validation failed (scanner exit 0)`) rather than
 `failed (exit 0)`: the status is still `error`, but the note names the output
 as what broke instead of implying the tool did.
 
-`composer audit` reads **installed** packages by default and refuses a project
-whose dependencies were never installed (`No installed packages found ... pass
---locked`) — which is every path package in a monorepo and every checkout
-audited before its build. safe passes `--locked` whenever a `composer.lock` is
-present, so the audit reads what the project pins rather than what happens to
-be in `vendor/`. Verified against Composer 2.10: `--locked` also succeeds on a
-lock that is out of date with `composer.json`, so there is no fallback to the
-unlocked run.
+`composer audit` reads the **installed** tree by default, and `--locked` reads
+the lock file instead — a different package set. safe audits the installed tree
+first, because a deployed checkout whose lock has drifted can carry an
+installed advisory the lock does not mention: against such a fixture the
+default run reported six advisories including one critical while `--locked`
+reported none.
+
+The lock file is used only when there is no installed tree to read. composer
+refuses that case outright (`No installed packages found ... pass --locked`) —
+every path package in a monorepo, every checkout audited before its build — and
+safe then reruns with `--locked` rather than reporting a broken scanner. The
+record's note says `audited composer.lock (no installed packages)`, because a
+lock-file audit and an installed-tree audit are not the same coverage. With no
+lock either, the refusal stays an `error`: nothing was audited.
 
 Every audit record carries the **root it ran in** (`.root`, relative to the
 scan target; `.` is the target itself), on `.ecosystem_audits[]` and on

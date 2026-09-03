@@ -30,7 +30,12 @@ SCAN_CACHE_TTL_SECONDS="${SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS:-86400}"
 # Bump whenever the shape or the semantics of a scan result change: entries
 # written by an older safe compute their verdict under different rules, so
 # they must miss rather than replay.
-SCAN_CACHE_SCHEMA=1
+#   2 (1.58.0): ecosystem records carry `root`, nested repositories are pruned
+#     from discovery, and the composer lane audits the installed tree with a
+#     lock-file fallback. A schema-1 entry was computed under none of those
+#     rules — replaying one would report a pre-prune package count, or suppress
+#     the composer lane this version intended to recompute.
+SCAN_CACHE_SCHEMA=2
 CHECKS_DIR="$DATA_DIR/checks"
 SOCKET_CACHE_SCHEMA=1
 SOCKET_CACHE_STALE_SCORE=""
@@ -1174,8 +1179,20 @@ syft_exclude_args_for_current_scan() {
 # Git SUBMODULES are KEPT. Their `.git` file points into `/.git/modules/`, they
 # are part of the parent's build, their lockfiles are the parent's dependencies,
 # and they were audited before this prune existed.
+#
+# The search does NOT descend derived directories (vendor/, node_modules/,
+# build/, ...). A repository found there is not a second copy of the project —
+# it is one of the project's dependencies, fetched as a source checkout
+# (`composer install --prefer-source`, a CMake `build/_deps/` fetch). `source`
+# and `deps` scans already skip those trees by the ordinary derived-directory
+# rule, and `--full` exists precisely to catalog installed trees, so excluding
+# them from the SBOM would hide real dependencies. Deliberate boundary.
 nested_repo_roots() {
   local source_abs="$1"
+  # Callers reach here through path_abs, which normalizes; a direct caller may
+  # not, and every comparison below is against "$source_abs" or "$source_abs"/*.
+  source_abs="${source_abs%/}"
+  [[ -n "$source_abs" ]] || source_abs="/"
   local -a find_args=("$source_abs" "-mindepth" "1")
   local pattern first=1
 
@@ -2240,19 +2257,14 @@ run_composer_audit_dir() {
     printf '%s\n' "$(render_ecosystem_audit_json "composer-audit" "skipped" 0 0 0 0 0 "composer unavailable" 0)" > "$output"
     return 0
   fi
-  local rc=0
-  # `composer audit` reads INSTALLED packages by default and refuses a project
-  # whose dependencies were never installed ("No installed packages found ...
-  # pass --locked"), which is every path package in a monorepo and every
-  # checkout audited before its build. The lock file is the evidence we want
-  # anyway: it is what the project pins, installed or not. Verified against
-  # Composer 2.10: `--locked` also succeeds on a lock that is out of date with
-  # composer.json, so there is no unlocked fallback to keep.
-  if [[ -f "$dir/composer.lock" ]]; then
-    (cd "$dir" && composer audit --locked --format=json) > "$output.raw" 2>"$output.stderr" || rc=$?
-  else
-    (cd "$dir" && composer audit --format=json) > "$output.raw" 2>"$output.stderr" || rc=$?
-  fi
+  local rc=0 fallback_note=""
+  # The INSTALLED tree is the primary evidence: composer's default audits what
+  # is in vendor/, and the lock file is a different package set. A deployed
+  # checkout whose lock has drifted can carry an installed critical the lock
+  # does not mention — reproduced at 6 advisories including one critical
+  # against a lock reporting zero — so reading the lock instead of the
+  # installed tree silently drops that coverage.
+  (cd "$dir" && composer audit --format=json) > "$output.raw" 2>"$output.stderr" || rc=$?
   # A project that declares no dependencies prints nothing on stdout and says
   # so on stderr, exit 0. That is a real, complete answer — zero advisories
   # because there is nothing to audit — and reading it as "output validation
@@ -2263,17 +2275,32 @@ run_composer_audit_dir() {
     printf '%s\n' "$(render_ecosystem_audit_json "composer-audit" "ok" 0 0 0 0 0 "composer reported no packages to audit" 0)" > "$output"
     return 0
   fi
+  # Only when there is no installed tree to read does the lock become the best
+  # evidence available: composer refuses outright ("No installed packages
+  # found ... pass --locked"), which is every path package in a monorepo and
+  # every checkout audited before its build. That refusal used to be reported
+  # as a broken scanner. The note names what was actually audited, because a
+  # lock-file audit and an installed-tree audit are not the same coverage.
+  if (( rc != 0 )) \
+    && ! jq -e 'has("advisories")' "$output.raw" >/dev/null 2>&1 \
+    && grep -qF 'No installed packages found' "$output.stderr" 2>/dev/null \
+    && [[ -f "$dir/composer.lock" ]]; then
+    rc=0
+    (cd "$dir" && composer audit --locked --format=json) > "$output.raw" 2>"$output.stderr" || rc=$?
+    fallback_note="audited composer.lock (no installed packages)"
+  fi
   # composer keys advisories BY PACKAGE: {"advisories":{"vendor/pkg":[...]}}.
   # Read as a flat array it finds nothing at all.
   if ! jq -e 'has("advisories")' "$output.raw" >/dev/null 2>&1; then
     ecosystem_audit_error "composer-audit" "$rc" "$output.stderr" "$output"
     return 0
   fi
-  jq "$ECO_AUDIT_JQ_DEFS"'
+  jq --arg note "$fallback_note" "$ECO_AUDIT_JQ_DEFS"'
     ( .advisories // {} ) as $a
     | [ if ($a | type) == "object" then ($a[] | .[]?) else ($a[]?) end ] as $adv
     | [ $adv[] | ((.severity // "unknown") | sev_norm) ] as $sevs
     | audit_doc("composer-audit"; $sevs)
+    | .note = (if $note == "" then null else $note end)
   ' "$output.raw" > "$output" 2>/dev/null || ecosystem_audit_error "composer-audit" "$rc" "$output.stderr" "$output"
 }
 
@@ -3491,6 +3518,13 @@ remote_scan_helper_script() {
   cat <<'EOF'
 set -euo pipefail
 target="$1"
+# Normalize once, before anything compares paths against it. Ancestry testing
+# and every relative label below match on `$target` or `$target/*`, and a
+# caller-supplied trailing slash builds a `//` prefix that matches no `find`
+# output — a `machine-audit --project /srv/app/` reported zero nested
+# repositories where `/srv/app` reported three.
+target="${target%/}"
+[[ -n "$target" ]] || target="/"
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 
@@ -3511,6 +3545,14 @@ trim() {
 # directory carrying `.git` is skipped only when an ancestor at or below the
 # target also carries one (so a scan root full of independent repos survives),
 # and submodules (`gitdir:` into `/.git/modules/`) are kept.
+#
+# The search does NOT descend derived directories (vendor/, node_modules/,
+# build/, ...). A repository found there is not a second copy of the project —
+# it is one of the project's dependencies, fetched as a source checkout
+# (`composer install --prefer-source`, a CMake `build/_deps/` fetch). `source`
+# and `deps` scans already skip those trees by the ordinary derived-directory
+# rule, and `--full` exists precisely to catalog installed trees, so excluding
+# them from the SBOM would hide real dependencies. Deliberate boundary.
 declare -a derived_prunes=(
   .hg .svn node_modules vendor .venv venv env .tox .nox __pycache__
   .pytest_cache .mypy_cache .ruff_cache .cache .parcel-cache .turbo
@@ -4364,19 +4406,14 @@ run_composer_audit_dir() {
     printf '%s\n' "$(render_ecosystem_audit_json "composer-audit" "skipped" 0 0 0 0 0 "composer unavailable" 0)" > "$output"
     return 0
   fi
-  local rc=0
-  # `composer audit` reads INSTALLED packages by default and refuses a project
-  # whose dependencies were never installed ("No installed packages found ...
-  # pass --locked"), which is every path package in a monorepo and every
-  # checkout audited before its build. The lock file is the evidence we want
-  # anyway: it is what the project pins, installed or not. Verified against
-  # Composer 2.10: `--locked` also succeeds on a lock that is out of date with
-  # composer.json, so there is no unlocked fallback to keep.
-  if [[ -f "$dir/composer.lock" ]]; then
-    (cd "$dir" && composer audit --locked --format=json) > "$output.raw" 2>"$output.stderr" || rc=$?
-  else
-    (cd "$dir" && composer audit --format=json) > "$output.raw" 2>"$output.stderr" || rc=$?
-  fi
+  local rc=0 fallback_note=""
+  # The INSTALLED tree is the primary evidence: composer's default audits what
+  # is in vendor/, and the lock file is a different package set. A deployed
+  # checkout whose lock has drifted can carry an installed critical the lock
+  # does not mention — reproduced at 6 advisories including one critical
+  # against a lock reporting zero — so reading the lock instead of the
+  # installed tree silently drops that coverage.
+  (cd "$dir" && composer audit --format=json) > "$output.raw" 2>"$output.stderr" || rc=$?
   # A project that declares no dependencies prints nothing on stdout and says
   # so on stderr, exit 0. That is a real, complete answer — zero advisories
   # because there is nothing to audit — and reading it as "output validation
@@ -4387,17 +4424,32 @@ run_composer_audit_dir() {
     printf '%s\n' "$(render_ecosystem_audit_json "composer-audit" "ok" 0 0 0 0 0 "composer reported no packages to audit" 0)" > "$output"
     return 0
   fi
+  # Only when there is no installed tree to read does the lock become the best
+  # evidence available: composer refuses outright ("No installed packages
+  # found ... pass --locked"), which is every path package in a monorepo and
+  # every checkout audited before its build. That refusal used to be reported
+  # as a broken scanner. The note names what was actually audited, because a
+  # lock-file audit and an installed-tree audit are not the same coverage.
+  if (( rc != 0 )) \
+    && ! jq -e 'has("advisories")' "$output.raw" >/dev/null 2>&1 \
+    && grep -qF 'No installed packages found' "$output.stderr" 2>/dev/null \
+    && [[ -f "$dir/composer.lock" ]]; then
+    rc=0
+    (cd "$dir" && composer audit --locked --format=json) > "$output.raw" 2>"$output.stderr" || rc=$?
+    fallback_note="audited composer.lock (no installed packages)"
+  fi
   # composer keys advisories BY PACKAGE: {"advisories":{"vendor/pkg":[...]}}.
   # Read as a flat array it finds nothing at all.
   if ! jq -e 'has("advisories")' "$output.raw" >/dev/null 2>&1; then
     ecosystem_audit_error "composer-audit" "$rc" "$output.stderr" "$output"
     return 0
   fi
-  jq "$ECO_AUDIT_JQ_DEFS"'
+  jq --arg note "$fallback_note" "$ECO_AUDIT_JQ_DEFS"'
     ( .advisories // {} ) as $a
     | [ if ($a | type) == "object" then ($a[] | .[]?) else ($a[]?) end ] as $adv
     | [ $adv[] | ((.severity // "unknown") | sev_norm) ] as $sevs
     | audit_doc("composer-audit"; $sevs)
+    | .note = (if $note == "" then null else $note end)
   ' "$output.raw" > "$output" 2>/dev/null || ecosystem_audit_error "composer-audit" "$rc" "$output.stderr" "$output"
 }
 
@@ -4856,6 +4908,14 @@ find_all_files() {
 # on the project that motivated this, twelve times). Skipped only when an
 # ancestor at or below the target also carries `.git`, so a scan root holding
 # independent repos side by side keeps all of them; submodules are kept.
+#
+# The search does NOT descend derived directories (vendor/, node_modules/,
+# build/, ...). A repository found there is not a second copy of the project —
+# it is one of the project's dependencies, fetched as a source checkout
+# (`composer install --prefer-source`, a CMake `build/_deps/` fetch). `source`
+# and `deps` scans already skip those trees by the ordinary derived-directory
+# rule, and `--full` exists precisely to catalog installed trees, so excluding
+# them from the SBOM would hide real dependencies. Deliberate boundary.
 stage_nested_repo_roots() {
   local entry dir head_line
   local -A carriers=()

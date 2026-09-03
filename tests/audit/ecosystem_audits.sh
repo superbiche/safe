@@ -67,6 +67,13 @@ done
 cat > "$MOCKBIN/composer" <<'STUB'
 #!/usr/bin/env bash
 [[ -n "${COMPOSER_ARGV_LOG:-}" ]] && printf '%s\n' "$*" >> "$COMPOSER_ARGV_LOG"
+# The lock-file rerun is a DIFFERENT package set, so it answers separately:
+# COMPOSER_LOCKED_* when --locked is passed, COMPOSER_* otherwise.
+if [[ " $* " == *" --locked "* && -n "${COMPOSER_LOCKED_OUT+x}" ]]; then
+  [[ -n "${COMPOSER_LOCKED_ERR:-}" ]] && printf '%s' "$COMPOSER_LOCKED_ERR" >&2
+  printf '%s' "${COMPOSER_LOCKED_OUT:-}"
+  exit "${COMPOSER_LOCKED_RC:-0}"
+fi
 [[ -n "${COMPOSER_ERR:-}" ]] && printf '%s' "$COMPOSER_ERR" >&2
 printf '%s' "${COMPOSER_OUT:-}"
 exit "${COMPOSER_RC:-0}"
@@ -776,42 +783,107 @@ STUB
   pass "$FUNCNAME"
 }
 
-case_composer_audits_the_lock_when_one_exists() {
-  # `composer audit` reads INSTALLED packages by default and refuses a project
-  # whose dependencies were never installed ("No installed packages found ...
-  # pass --locked"). Every path package in a monorepo and every checkout
-  # audited before its build is that project, and the refusal was reported as
-  # a broken scanner.
-  prepare_case "composer-locked"
+case_composer_audits_the_installed_tree_when_there_is_one() {
+  # composer audit's DEFAULT reads the installed tree, and --locked reads a
+  # different package set. Against a deployed checkout whose lock had drifted,
+  # the unlocked run reported 6 advisories including one critical while
+  # --locked reported none: preferring the lock silently drops installed
+  # coverage. With an installed tree present there is exactly one call, and it
+  # is the unlocked one.
+  prepare_case "composer-installed-primary"
   printf '{"name":"demo/app","require":{"vendor/pkg":"^1.0"}}\n' > "$CASE_PROJECT/composer.json"
   printf '{"packages":[]}\n' > "$CASE_PROJECT/composer.lock"
   local argv_log="$CASE_DIR/composer.argv"
-  run_scan COMPOSER_ARGV_LOG="$argv_log" COMPOSER_OUT='{"advisories":{}}'
+  run_scan COMPOSER_ARGV_LOG="$argv_log" COMPOSER_RC=1 \
+    COMPOSER_OUT='{"advisories":{"vendor/pkg":[{"advisoryId":"PKSA-1","severity":"critical"}]}}' \
+    COMPOSER_LOCKED_OUT='{"advisories":{}}'
   assert_jq "$FUNCNAME" '
-    .ecosystem_audits[] | select(.scanner == "composer-audit")
-      | .status == "ok" and .total == 0
+    (.ecosystem_audits[] | select(.scanner == "composer-audit")
+      | .status == "ok" and .total == 1 and .critical == 1 and (.note == null))
+    and .audit_totals.critical == 1
   ' || return
-  grep -q -- '--locked' "$argv_log" || {
-    printf 'composer argv did not carry --locked:\n%s\n' "$(cat "$argv_log" 2>/dev/null)" >&2
+  [[ "$(wc -l < "$argv_log")" -eq 1 ]] || {
+    printf 'expected one composer call, got:\n%s\n' "$(cat "$argv_log")" >&2
+    fail "$FUNCNAME"; return
+  }
+  if grep -q -- '--locked' "$argv_log"; then
+    printf 'composer read the lock while an installed tree was present:\n%s\n' "$(cat "$argv_log")" >&2
+    fail "$FUNCNAME"; return
+  fi
+  pass "$FUNCNAME"
+}
+
+case_composer_installed_advisories_win_over_the_lock() {
+  # The shape the review blocked on, literally: the installed tree carries a
+  # critical the lock does not mention. The lock's answer must not be the one
+  # reported.
+  prepare_case "composer-installed-wins"
+  printf '{"name":"demo/app"}\n' > "$CASE_PROJECT/composer.json"
+  printf '{"packages":[]}\n' > "$CASE_PROJECT/composer.lock"
+  run_scan COMPOSER_RC=1 \
+    COMPOSER_OUT='{"advisories":{"symfony/http-foundation":[{"advisoryId":"PKSA-INSTALLED","severity":"critical"}]}}' \
+    COMPOSER_LOCKED_OUT='{"advisories":{}}'
+  assert_jq "$FUNCNAME" '
+    (.ecosystem_audits[] | select(.scanner == "composer-audit")
+      | .status == "ok" and .critical == 1)
+    and .audit_totals.critical == 1
+    and .verdict == "WARN"
+  ' || return
+  pass "$FUNCNAME"
+}
+
+case_composer_falls_back_to_the_lock_with_no_installed_tree() {
+  # No vendor/ to read: composer refuses ("No installed packages found ...
+  # pass --locked"), which is every path package in a monorepo and every
+  # checkout audited before its build. The lock is then the best evidence
+  # available, and the note says that is what was audited.
+  prepare_case "composer-lock-fallback"
+  printf '{"name":"demo/app","require":{"vendor/pkg":"^1.0"}}\n' > "$CASE_PROJECT/composer.json"
+  printf '{"packages":[]}\n' > "$CASE_PROJECT/composer.lock"
+  local argv_log="$CASE_DIR/composer.argv"
+  run_scan COMPOSER_ARGV_LOG="$argv_log" COMPOSER_RC=1 COMPOSER_OUT='' \
+    COMPOSER_ERR='No installed packages found. Please run "composer install" before running "audit" or pass "--locked" to audit the lock file.
+' \
+    COMPOSER_LOCKED_OUT='{"advisories":{"vendor/pkg":[{"advisoryId":"PKSA-LOCK","severity":"high"}]}}' \
+    COMPOSER_LOCKED_RC=1
+  assert_jq "$FUNCNAME" '
+    (.ecosystem_audits[] | select(.scanner == "composer-audit")
+      | .status == "ok" and .total == 1 and .high == 1
+        and ((.note // "") | test("composer.lock")))
+    and .audit_totals.high == 1
+  ' || return
+  [[ "$(wc -l < "$argv_log")" -eq 2 ]] || {
+    printf 'expected two composer calls, got:\n%s\n' "$(cat "$argv_log")" >&2
+    fail "$FUNCNAME"; return
+  }
+  head -n 1 "$argv_log" | grep -q -- '--locked' && {
+    printf 'first composer call carried --locked:\n%s\n' "$(cat "$argv_log")" >&2
+    fail "$FUNCNAME"; return
+  }
+  tail -n 1 "$argv_log" | grep -q -- '--locked' || {
+    printf 'fallback call did not carry --locked:\n%s\n' "$(cat "$argv_log")" >&2
     fail "$FUNCNAME"; return
   }
   pass "$FUNCNAME"
 }
 
-case_composer_without_a_lock_audits_the_installed_tree() {
-  # No lock file, nothing to read from one: the flag must not be passed, or
-  # composer refuses the run outright.
-  prepare_case "composer-unlocked"
-  printf '{"name":"demo/app"}\n' > "$CASE_PROJECT/composer.json"
+case_composer_refusal_without_a_lock_stays_an_error() {
+  # No installed tree AND no lock: there is nothing to audit from, and that is
+  # missing coverage, not a clean project.
+  prepare_case "composer-no-lock-refusal"
+  printf '{"name":"demo/app","require":{"vendor/pkg":"^1.0"}}\n' > "$CASE_PROJECT/composer.json"
   local argv_log="$CASE_DIR/composer.argv"
-  run_scan COMPOSER_ARGV_LOG="$argv_log" COMPOSER_OUT='{"advisories":{}}'
+  run_scan COMPOSER_ARGV_LOG="$argv_log" COMPOSER_RC=1 COMPOSER_OUT='' \
+    COMPOSER_ERR='No installed packages found. Please run "composer install" before running "audit" or pass "--locked" to audit the lock file.
+'
   assert_jq "$FUNCNAME" '
-    .ecosystem_audits[] | select(.scanner == "composer-audit") | .status == "ok"
+    .ecosystem_audits[] | select(.scanner == "composer-audit")
+      | .status == "error" and ((.note // "") | test("failed"))
   ' || return
-  if grep -q -- '--locked' "$argv_log"; then
-    printf 'composer argv carried --locked with no composer.lock:\n%s\n' "$(cat "$argv_log")" >&2
+  [[ "$(wc -l < "$argv_log")" -eq 1 ]] || {
+    printf 'expected one composer call with no lock, got:\n%s\n' "$(cat "$argv_log")" >&2
     fail "$FUNCNAME"; return
-  fi
+  }
   pass "$FUNCNAME"
 }
 
@@ -949,8 +1021,10 @@ main() {
     case_lockless_npm_project_is_not_clean \
     case_pnpm_project_still_caches \
     case_missing_tool_is_reported_not_fatal_when_allowed \
-    case_composer_audits_the_lock_when_one_exists \
-    case_composer_without_a_lock_audits_the_installed_tree \
+    case_composer_audits_the_installed_tree_when_there_is_one \
+    case_composer_installed_advisories_win_over_the_lock \
+    case_composer_falls_back_to_the_lock_with_no_installed_tree \
+    case_composer_refusal_without_a_lock_stays_an_error \
     case_composer_no_packages_is_a_clean_result_not_an_error \
     case_ecosystem_audits_carry_the_root_they_ran_in \
     case_local_and_remote_normalizers_stay_identical
