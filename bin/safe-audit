@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.3.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.57.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.58.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -1155,6 +1155,79 @@ syft_exclude_args_for_current_scan() {
   done
 }
 
+# Repository roots nested INSIDE the scan target, NUL-separated, absolute.
+#
+# A linked git worktree (`.task/wt/.git` is a file reading
+# `gitdir: <repo>/.git/worktrees/wt`) or a nested independent clone is a second
+# full copy of a codebase living under the target. Auditing it as part of the
+# target multiplies every finding by the number of copies: on a Laravel + pnpm
+# project with 11 worktrees under `.task/`, discovery found 4356 packages and
+# 72 CVE criticals where 6 were real, and the install gate refused on "92
+# critical finding(s)" that were 12 renderings of the same 6 (1.58.0).
+#
+# The rule is ANCESTRY, not "carries a .git": `machine-audit` runs this same
+# discovery over a scan root holding many independent repos side by side, and a
+# flat "has .git" test would empty that scan. A directory is pruned only when
+# some ancestor of it, at or below the target (the target itself included),
+# also carries a `.git` entry — i.e. it is a repository inside a repository.
+#
+# Git SUBMODULES are KEPT. Their `.git` file points into `/.git/modules/`, they
+# are part of the parent's build, their lockfiles are the parent's dependencies,
+# and they were audited before this prune existed.
+nested_repo_roots() {
+  local source_abs="$1"
+  local -a find_args=("$source_abs" "-mindepth" "1")
+  local pattern first=1
+
+  # The derived-directory prune set MINUS `.git`: `.git` is exactly what this
+  # walk is looking for, so pruning it by name would find nothing at all.
+  find_args+=("(")
+  for pattern in "${DEFAULT_DERIVED_EXCLUDES[@]}"; do
+    [[ -z "$pattern" || "$pattern" == ".git" ]] && continue
+    [[ "$first" == "1" ]] || find_args+=("-o")
+    find_args+=("-name" "$pattern")
+    first=0
+  done
+  if [[ "$first" == "0" ]]; then
+    find_args+=(")" "-prune" "-o")
+  else
+    find_args=("$source_abs" "-mindepth" "1")
+  fi
+  find_args+=("-name" ".git" "-print0" "-prune")
+
+  local git_entry dir gitdir_line
+  local -A carriers=()
+  local -a candidates=()
+  while IFS= read -r -d '' git_entry; do
+    dir=$(dirname "$git_entry")
+    carriers["$dir"]=1
+    # A submodule is not a nested repository for this purpose.
+    if [[ -f "$git_entry" ]]; then
+      gitdir_line=$(LC_ALL=C sed -n '1p' -- "$git_entry" 2>/dev/null || true)
+      if [[ "$gitdir_line" == *"/.git/modules/"* ]]; then
+        continue
+      fi
+    fi
+    candidates+=("$dir")
+  done < <(find "${find_args[@]}" 2>/dev/null)
+
+  [[ "${#candidates[@]}" -gt 0 ]] || return 0
+  [[ -e "$source_abs/.git" ]] && carriers["$source_abs"]=1
+
+  local candidate probe
+  for candidate in "${candidates[@]}"; do
+    probe=$(dirname "$candidate")
+    while [[ "$probe" == "$source_abs" || "$probe" == "$source_abs"/* ]]; do
+      if [[ -n "${carriers[$probe]:-}" ]]; then
+        printf '%s\0' "$candidate"
+        break
+      fi
+      [[ "$probe" == "$source_abs" ]] && break
+      probe=$(dirname "$probe")
+    done
+  done
+}
+
 find_source_files_pruned() {
   local source_abs="$1"
   local root_config="$source_abs/.safe-audit"
@@ -1165,27 +1238,34 @@ find_source_files_pruned() {
     root_ignores+=("${PROJECT_IGNORES[@]}")
   fi
 
+  local -a nested=()
+  mapfile -d '' -t nested < <(nested_repo_roots "$source_abs")
+
   local find_args=("$source_abs")
   local pattern clean_pattern first=1
-  if [[ "${#root_ignores[@]}" -gt 0 ]]; then
-    find_args+=("(")
-    for pattern in "${root_ignores[@]}"; do
-      [[ -z "$pattern" ]] && continue
-      clean_pattern="${pattern#./}"
-      clean_pattern="${clean_pattern%/}"
-      [[ "$first" == "1" ]] || find_args+=("-o")
-      if [[ "$clean_pattern" == */* ]]; then
-        find_args+=("-path" "$source_abs/$clean_pattern" "-o" "-path" "$source_abs/$clean_pattern/*")
-      else
-        find_args+=("-name" "$clean_pattern" "-o" "-path" "$source_abs/$clean_pattern" "-o" "-path" "$source_abs/$clean_pattern/*")
-      fi
-      first=0
-    done
-    if [[ "$first" == "0" ]]; then
-      find_args+=(")" "-prune" "-o")
+  find_args+=("(")
+  for pattern in "${root_ignores[@]}"; do
+    [[ -z "$pattern" ]] && continue
+    clean_pattern="${pattern#./}"
+    clean_pattern="${clean_pattern%/}"
+    [[ "$first" == "1" ]] || find_args+=("-o")
+    if [[ "$clean_pattern" == */* ]]; then
+      find_args+=("-path" "$source_abs/$clean_pattern" "-o" "-path" "$source_abs/$clean_pattern/*")
     else
-      find_args=("$source_abs")
+      find_args+=("-name" "$clean_pattern" "-o" "-path" "$source_abs/$clean_pattern" "-o" "-path" "$source_abs/$clean_pattern/*")
     fi
+    first=0
+  done
+  for pattern in "${nested[@]}"; do
+    [[ -n "$pattern" ]] || continue
+    [[ "$first" == "1" ]] || find_args+=("-o")
+    find_args+=("-path" "$pattern" "-o" "-path" "$pattern/*")
+    first=0
+  done
+  if [[ "$first" == "0" ]]; then
+    find_args+=(")" "-prune" "-o")
+  else
+    find_args=("$source_abs")
   fi
 
   find "${find_args[@]}" -type f -print0 2>/dev/null
@@ -1356,6 +1436,21 @@ gather_projects_from_source() {
     fi
   }
 
+  # Nested repositories are pruned from every walk below by
+  # find_source_files_pruned; syft walks the tree itself, so `--full` SBOMs
+  # need the same roots handed to it as excludes or the SBOM re-imports the
+  # packages discovery just refused.
+  local -a nested_roots=()
+  mapfile -d '' -t nested_roots < <(nested_repo_roots "$source_abs")
+  local nested_root nested_rel
+  for nested_root in "${nested_roots[@]}"; do
+    [[ -n "$nested_root" ]] || continue
+    nested_rel=$(relative_to "$source_abs" "$nested_root")
+    [[ -n "$nested_rel" && "$nested_rel" != "." ]] || continue
+    CURRENT_SYFT_EXCLUDES+=("$nested_rel")
+    CURRENT_SYFT_EXCLUDES+=("$nested_rel/**")
+  done
+
   local cfg
   while IFS= read -r -d '' cfg; do
     append_syft_excludes_for_config "$source_abs" "$cfg"
@@ -1389,7 +1484,15 @@ gather_projects_from_source() {
     CURRENT_PROJECT_ROOTS=("$source_abs")
   fi
 
-  vinfo "project discovery: manifests=${#CURRENT_MANIFESTS[@]} lockfiles=${#CURRENT_LOCKFILES[@]} project_roots=${#CURRENT_PROJECT_ROOTS[@]} syft_excludes=${#CURRENT_SYFT_EXCLUDES[@]}"
+  # A silent prune reads as a scanner that lost packages. Say it once at normal
+  # verbosity so the DELTA it produces (-3990 packages, on the project that
+  # motivated this) is legible without --verbose.
+  if [[ "${#nested_roots[@]}" -gt 0 ]]; then
+    info "discovery: skipped ${#nested_roots[@]} nested repositories (worktrees or clones); --verbose lists them"
+  fi
+
+  vinfo "project discovery: manifests=${#CURRENT_MANIFESTS[@]} lockfiles=${#CURRENT_LOCKFILES[@]} project_roots=${#CURRENT_PROJECT_ROOTS[@]} syft_excludes=${#CURRENT_SYFT_EXCLUDES[@]} nested_repos=${#nested_roots[@]}"
+  verbose_paths "nested repo (skipped)" "${nested_roots[@]}"
   verbose_paths "project root" "${CURRENT_PROJECT_ROOTS[@]}"
   verbose_paths "lockfile" "${CURRENT_LOCKFILES[@]}"
   verbose_paths "manifest" "${CURRENT_MANIFESTS[@]}"
@@ -2138,7 +2241,28 @@ run_composer_audit_dir() {
     return 0
   fi
   local rc=0
-  (cd "$dir" && composer audit --format=json) > "$output.raw" 2>"$output.stderr" || rc=$?
+  # `composer audit` reads INSTALLED packages by default and refuses a project
+  # whose dependencies were never installed ("No installed packages found ...
+  # pass --locked"), which is every path package in a monorepo and every
+  # checkout audited before its build. The lock file is the evidence we want
+  # anyway: it is what the project pins, installed or not. Verified against
+  # Composer 2.10: `--locked` also succeeds on a lock that is out of date with
+  # composer.json, so there is no unlocked fallback to keep.
+  if [[ -f "$dir/composer.lock" ]]; then
+    (cd "$dir" && composer audit --locked --format=json) > "$output.raw" 2>"$output.stderr" || rc=$?
+  else
+    (cd "$dir" && composer audit --format=json) > "$output.raw" 2>"$output.stderr" || rc=$?
+  fi
+  # A project that declares no dependencies prints nothing on stdout and says
+  # so on stderr, exit 0. That is a real, complete answer — zero advisories
+  # because there is nothing to audit — and reading it as "output validation
+  # failed" turned dependency-free projects into lost coverage. Mirrors the
+  # osv-scanner "No package sources found" benign zero.
+  if (( rc == 0 )) && [[ ! -s "$output.raw" ]] \
+    && grep -qF 'No packages - skipping audit.' "$output.stderr" 2>/dev/null; then
+    printf '%s\n' "$(render_ecosystem_audit_json "composer-audit" "ok" 0 0 0 0 0 "composer reported no packages to audit" 0)" > "$output"
+    return 0
+  fi
   # composer keys advisories BY PACKAGE: {"advisories":{"vendor/pkg":[...]}}.
   # Read as a flat array it finds nothing at all.
   if ! jq -e 'has("advisories")' "$output.raw" >/dev/null 2>&1; then
@@ -2534,17 +2658,35 @@ render_scan_summary() {
   # Ecosystem audits report their own advisories; without this line a
   # govulncheck or cargo-audit finding appears in the totals and the verdict
   # while every printed bucket reads zero.
+  #
+  # One line PER SCANNER, not per root. A monorepo runs composer audit once per
+  # package, so the per-record rendering printed the same scanner ten times
+  # over — identical strings joined by semicolons, unreadable and wrong about
+  # how much was found. Counts are summed across the roots a scanner ran in and
+  # the root count is named, which is the number a reader actually needs here;
+  # the per-root breakdown is the detail block below.
   local eco_summary
   eco_summary="$(jq -r '
-    [ .audit_totals.ecosystem[]?
-      | select((.total // 0) > 0)
-      | .scanner + " " + (.total | tostring)
-        + " (critical " + ((.critical // 0) | tostring)
-        + ", high " + ((.high // 0) | tostring)
-        + ", medium " + ((.medium // 0) | tostring)
-        + ", low " + ((.low // 0) | tostring)
-        + ", unknown " + ((.unknown // 0) | tostring) + ")"
-    ] | join("; ")
+    [ .audit_totals.ecosystem[]? | select((.total // 0) > 0) ]
+    | group_by(.scanner)
+    | [ .[]
+        | { scanner: .[0].scanner,
+            roots: ([.[] | (.root // ".")] | unique | length),
+            total: ([.[] | (.total // 0)] | add),
+            critical: ([.[] | (.critical // 0)] | add),
+            high: ([.[] | (.high // 0)] | add),
+            medium: ([.[] | (.medium // 0)] | add),
+            low: ([.[] | (.low // 0)] | add),
+            unknown: ([.[] | (.unknown // 0)] | add) }
+        | .scanner + " " + (.total | tostring)
+          + " (critical " + (.critical | tostring)
+          + ", high " + (.high | tostring)
+          + ", medium " + (.medium | tostring)
+          + ", low " + (.low | tostring)
+          + ", unknown " + (.unknown | tostring) + ")"
+          + (if .roots > 1 then " across " + (.roots | tostring) + " roots" else "" end)
+      ]
+    | join("; ")
   ' "$result_path" 2>/dev/null || printf '')"
   [[ -n "$eco_summary" ]] && printf '  ECOSYSTEM AUDITS: %s\n' "$eco_summary"
   printf '\n'
@@ -2557,13 +2699,17 @@ render_scan_summary() {
   if jq -e '(.tool_status // {} | to_entries | map(select((.value.status // "ok") != "ok")) | length) > 0' "$result_path" >/dev/null; then
     printf '\n'
   fi
+  # The detail block names the root each record came from. `.` is the target
+  # itself and stays unlabeled, so a single-project scan reads exactly as it
+  # did before roots were recorded.
   printf 'ECOSYSTEM AUDITS:\n'
   jq -r '
     .ecosystem_audits[]? |
+    ((.root // ".") | if . == "." then "" else " [" + . + "]" end) as $root |
     if (.status // "ok") == "ok" then
-      "  \(.scanner): \(.total) advisories (\(.critical) critical, \(.high) high, \(.medium) medium, \(.low) low)"
+      "  \(.scanner)\($root): \(.total) advisories (\(.critical) critical, \(.high) high, \(.medium) medium, \(.low) low)"
     else
-      "  \(.scanner): \(.status // "skipped")" + (if (.note // "") != "" then " (" + .note + ")" else "" end)
+      "  \(.scanner)\($root): \(.status // "skipped")" + (if (.note // "") != "" then " (" + .note + ")" else "" end)
     end
   ' "$result_path"
   printf '\nSOURCE SCAN:\n'
@@ -2821,7 +2967,8 @@ build_scan_result_from_artifacts() {
       unknown: sum(.unknown),
       cve_scan: {critical: $critical, high: $high, medium: $medium, low: $low},
       ecosystem: [$audits[]? | select(counted)
-                  | {scanner, status, total, critical, high, medium, low, unknown: (.unknown // 0)}],
+                  | {scanner, status, total, critical, high, medium, low, unknown: (.unknown // 0),
+                     root: (.root // ".")}],
       deduplicated: false
     }' 2>/dev/null || printf '{"critical":%s,"high":%s,"medium":%s,"low":%s,"unknown":0,"deduplicated":false}' \
       "$critical" "$high" "$medium" "$low")
@@ -3229,11 +3376,19 @@ scan_source_into_result() {
   syft_generate_sbom "$machine" "$syft_source" "$sbom_tmp"
   grype_scan_sbom "$machine" "$sbom_tmp" "$grype_json"
 
-  local root project_audits_files=()
+  # Every audit record carries the root it came from. A monorepo runs the same
+  # scanner once per package, and without the label the report reads as one
+  # scanner reported N times: on the project that motivated this the summary
+  # printed "composer-audit 23" ten times over, joined by semicolons, with no
+  # way to tell which package any of them described.
+  local root roots_base root_label project_audits_files=()
+  roots_base=$(path_abs "$source")
   for root in "${CURRENT_PROJECT_ROOTS[@]}"; do
     parse_project_config "$root/.safe-audit"
     vinfo "$machine: ecosystem audits root=$(printf '%q' "$root")"
-    run_project_ecosystem_audits "$root" "$scratch/$(slugify "$root")" > "$scratch/$(slugify "$root").audits.json"
+    root_label=$(relative_to "$roots_base" "$root")
+    run_project_ecosystem_audits "$root" "$scratch/$(slugify "$root")" \
+      | jq --arg root "$root_label" 'map(.root = $root)' > "$scratch/$(slugify "$root").audits.json"
     project_audits_files+=("$scratch/$(slugify "$root").audits.json")
   done
 
@@ -3298,11 +3453,19 @@ scan_source_with_external_sbom_into_result() {
   run_source_risk_scan "$source" "$source_scan_tmp" "$scan_mode"
   grype_scan_sbom "$local_machine" "$sbom_src" "$grype_json"
 
-  local root project_audits_files=()
+  # Every audit record carries the root it came from. A monorepo runs the same
+  # scanner once per package, and without the label the report reads as one
+  # scanner reported N times: on the project that motivated this the summary
+  # printed "composer-audit 23" ten times over, joined by semicolons, with no
+  # way to tell which package any of them described.
+  local root roots_base root_label project_audits_files=()
+  roots_base=$(path_abs "$source")
   for root in "${CURRENT_PROJECT_ROOTS[@]}"; do
     parse_project_config "$root/.safe-audit"
     vinfo "$machine: ecosystem audits root=$(printf '%q' "$root")"
-    run_project_ecosystem_audits "$root" "$scratch/$(slugify "$root")" > "$scratch/$(slugify "$root").audits.json"
+    root_label=$(relative_to "$roots_base" "$root")
+    run_project_ecosystem_audits "$root" "$scratch/$(slugify "$root")" \
+      | jq --arg root "$root_label" 'map(.root = $root)' > "$scratch/$(slugify "$root").audits.json"
     project_audits_files+=("$scratch/$(slugify "$root").audits.json")
   done
 
@@ -3343,6 +3506,61 @@ trim() {
   printf '%s' "$s"
 }
 
+# Nested-repository pruning, standalone: a helper script cannot call the
+# functions in bin/safe-audit. Same rule as nested_repo_roots there — a
+# directory carrying `.git` is skipped only when an ancestor at or below the
+# target also carries one (so a scan root full of independent repos survives),
+# and submodules (`gitdir:` into `/.git/modules/`) are kept.
+declare -a derived_prunes=(
+  .hg .svn node_modules vendor .venv venv env .tox .nox __pycache__
+  .pytest_cache .mypy_cache .ruff_cache .cache .parcel-cache .turbo
+  .next .nuxt .vite dist build out coverage target
+)
+
+remote_nested_repo_roots() {
+  local base="$1"
+  local -a args=("$base" -mindepth 1 "(")
+  local p first=1
+  for p in "${derived_prunes[@]}"; do
+    [[ "$first" == "1" ]] || args+=(-o)
+    args+=(-name "$p")
+    first=0
+  done
+  args+=(")" -prune -o -name .git -print0 -prune)
+
+  local entry dir head_line
+  local -A carriers=()
+  local -a candidates=()
+  while IFS= read -r -d '' entry; do
+    dir=$(dirname "$entry")
+    carriers["$dir"]=1
+    if [[ -f "$entry" ]]; then
+      head_line=$(LC_ALL=C sed -n '1p' -- "$entry" 2>/dev/null || true)
+      [[ "$head_line" == *"/.git/modules/"* ]] && continue
+    fi
+    candidates+=("$dir")
+  done < <(find "${args[@]}" 2>/dev/null)
+
+  [[ "${#candidates[@]}" -gt 0 ]] || return 0
+  [[ -e "$base/.git" ]] && carriers["$base"]=1
+
+  local candidate probe
+  for candidate in "${candidates[@]}"; do
+    probe=$(dirname "$candidate")
+    while [[ "$probe" == "$base" || "$probe" == "$base"/* ]]; do
+      if [[ -n "${carriers[$probe]:-}" ]]; then
+        printf '%s\0' "$candidate"
+        break
+      fi
+      [[ "$probe" == "$base" ]] && break
+      probe=$(dirname "$probe")
+    done
+  done
+}
+
+declare -a nested_repos=()
+mapfile -d '' -t nested_repos < <(remote_nested_repo_roots "$target")
+
 collect_syft_exclude_args() {
   local cfg root rel_prefix raw line section="" pattern
   while IFS= read -r -d '' cfg; do
@@ -3366,6 +3584,16 @@ collect_syft_exclude_args() {
       fi
     done <"$cfg"
   done < <(find "$target" -type f -name '.safe-audit' -print0 2>/dev/null)
+  # syft walks the tree itself, so the roots discovery pruned must be handed
+  # to it explicitly or the SBOM re-imports every package they hold.
+  local nested nested_rel
+  for nested in "${nested_repos[@]}"; do
+    [[ -n "$nested" ]] || continue
+    nested_rel="${nested#"$target"/}"
+    [[ -n "$nested_rel" && "$nested_rel" != "$nested" ]] || continue
+    printf '%s\0%s\0' '--exclude' "$nested_rel"
+    printf '%s\0%s\0' '--exclude' "$nested_rel/**"
+  done
 }
 
 if [[ "${SAFE_AUDIT_REMOTE_SBOM_ONLY:-0}" == "1" ]]; then
@@ -4137,7 +4365,28 @@ run_composer_audit_dir() {
     return 0
   fi
   local rc=0
-  (cd "$dir" && composer audit --format=json) > "$output.raw" 2>"$output.stderr" || rc=$?
+  # `composer audit` reads INSTALLED packages by default and refuses a project
+  # whose dependencies were never installed ("No installed packages found ...
+  # pass --locked"), which is every path package in a monorepo and every
+  # checkout audited before its build. The lock file is the evidence we want
+  # anyway: it is what the project pins, installed or not. Verified against
+  # Composer 2.10: `--locked` also succeeds on a lock that is out of date with
+  # composer.json, so there is no unlocked fallback to keep.
+  if [[ -f "$dir/composer.lock" ]]; then
+    (cd "$dir" && composer audit --locked --format=json) > "$output.raw" 2>"$output.stderr" || rc=$?
+  else
+    (cd "$dir" && composer audit --format=json) > "$output.raw" 2>"$output.stderr" || rc=$?
+  fi
+  # A project that declares no dependencies prints nothing on stdout and says
+  # so on stderr, exit 0. That is a real, complete answer — zero advisories
+  # because there is nothing to audit — and reading it as "output validation
+  # failed" turned dependency-free projects into lost coverage. Mirrors the
+  # osv-scanner "No package sources found" benign zero.
+  if (( rc == 0 )) && [[ ! -s "$output.raw" ]] \
+    && grep -qF 'No packages - skipping audit.' "$output.stderr" 2>/dev/null; then
+    printf '%s\n' "$(render_ecosystem_audit_json "composer-audit" "ok" 0 0 0 0 0 "composer reported no packages to audit" 0)" > "$output"
+    return 0
+  fi
   # composer keys advisories BY PACKAGE: {"advisories":{"vendor/pkg":[...]}}.
   # Read as a flat array it finds nothing at all.
   if ! jq -e 'has("advisories")' "$output.raw" >/dev/null 2>&1; then
@@ -4321,6 +4570,31 @@ run_project_ecosystem_audits() {
   fi
 }
 
+# The unpruned walk this replaces descended into vendor/, node_modules/ and
+# every linked worktree under the target: on a Laravel project with 11
+# worktrees it found the same lockfiles twelve times over and audited twelve
+# copies of one project.
+find_pruned_lockfiles() {
+  local -a args=("$target" "(")
+  local p first=1 nested
+  for p in .git "${derived_prunes[@]}"; do
+    [[ "$first" == "1" ]] || args+=(-o)
+    args+=(-name "$p")
+    first=0
+  done
+  for nested in "${nested_repos[@]}"; do
+    [[ -n "$nested" ]] || continue
+    args+=(-o -path "$nested" -o -path "$nested/*")
+  done
+  args+=(")" -prune -o -type f "(" \
+    -name 'package-lock.json' -o -name 'pnpm-lock.yaml' -o -name 'yarn.lock' \
+    -o -name 'bun.lock' -o -name 'bun.lockb' -o -name 'uv.lock' \
+    -o -name 'poetry.lock' -o -name 'Pipfile.lock' -o -name 'composer.lock' \
+    -o -name 'Cargo.lock' -o -name 'go.sum' -o -name 'pom.xml' \
+    -o -name 'gradle.lockfile' ")" -print0)
+  find "${args[@]}" 2>/dev/null
+}
+
 declare -a lockfiles=() roots=() audit_files=()
 declare -A seen_roots=()
 
@@ -4345,7 +4619,7 @@ while IFS= read -r -d '' file; do
       fi
       ;;
   esac
-done < <(find "$target" -type f \( -name 'package-lock.json' -o -name 'pnpm-lock.yaml' -o -name 'yarn.lock' -o -name 'bun.lock' -o -name 'bun.lockb' -o -name 'uv.lock' -o -name 'poetry.lock' -o -name 'Pipfile.lock' -o -name 'composer.lock' -o -name 'Cargo.lock' -o -name 'go.sum' -o -name 'pom.xml' -o -name 'gradle.lockfile' \) -print0)
+done < <(find_pruned_lockfiles)
 
 if [[ "${#roots[@]}" -eq 0 ]]; then
   roots=("$target")
@@ -4477,7 +4751,16 @@ fi
 
 for root in "${roots[@]}"; do
   parse_project_config "$root/.safe-audit"
-  run_project_ecosystem_audits "$root" "$scratch/$(slugify "$root")" > "$scratch/$(slugify "$root").audits.json"
+  # The label the local scan attaches (see scan_source_into_result). This
+  # helper's relative_to does not collapse a path equal to its base, so the
+  # target itself is named explicitly.
+  if [[ "$root" == "$target" ]]; then
+    root_label="."
+  else
+    root_label="$(relative_to "$target" "$root")"
+  fi
+  run_project_ecosystem_audits "$root" "$scratch/$(slugify "$root")" \
+    | jq --arg root "$root_label" 'map(.root = $root)' > "$scratch/$(slugify "$root").audits.json"
   audit_files+=("$scratch/$(slugify "$root").audits.json")
 done
 
@@ -4567,6 +4850,76 @@ find_pruned_files() {
 find_all_files() {
   find . -type f -print0 2>/dev/null
 }
+
+# A linked worktree or a nested clone under the target is a second copy of a
+# codebase; staging it makes the local scan audit the same project twice (or,
+# on the project that motivated this, twelve times). Skipped only when an
+# ancestor at or below the target also carries `.git`, so a scan root holding
+# independent repos side by side keeps all of them; submodules are kept.
+stage_nested_repo_roots() {
+  local entry dir head_line
+  local -A carriers=()
+  local -a candidates=()
+  while IFS= read -r -d '' entry; do
+    dir="${entry%/.git}"
+    dir="${dir#./}"
+    [[ -n "$dir" && "$dir" != "$entry" ]] || dir="."
+    carriers["$dir"]=1
+    if [[ -f "$entry" ]]; then
+      head_line=$(LC_ALL=C sed -n '1p' -- "$entry" 2>/dev/null || true)
+      [[ "$head_line" == *"/.git/modules/"* ]] && continue
+    fi
+    [[ "$dir" == "." ]] && continue
+    candidates+=("$dir")
+  done < <(find_git_entries)
+
+  local candidate probe
+  for candidate in "${candidates[@]}"; do
+    probe="$candidate"
+    while [[ "$probe" == */* ]]; do
+      probe="${probe%/*}"
+      if [[ -n "${carriers[$probe]:-}" ]]; then
+        printf '%s\n' "$candidate"
+        continue 2
+      fi
+    done
+    [[ -n "${carriers[.]:-}" ]] && printf '%s\n' "$candidate"
+  done
+}
+
+find_git_entries() {
+  find . \( \
+    -name '.hg' -o \
+    -name '.svn' -o \
+    -name 'node_modules' -o \
+    -name 'vendor' -o \
+    -name '.venv' -o \
+    -name 'venv' -o \
+    -name 'env' -o \
+    -name '.tox' -o \
+    -name '.nox' -o \
+    -name '__pycache__' -o \
+    -name '.pytest_cache' -o \
+    -name '.mypy_cache' -o \
+    -name '.ruff_cache' -o \
+    -name '.cache' -o \
+    -name '.parcel-cache' -o \
+    -name '.turbo' -o \
+    -name '.next' -o \
+    -name '.nuxt' -o \
+    -name '.vite' -o \
+    -name 'dist' -o \
+    -name 'build' -o \
+    -name 'out' -o \
+    -name 'coverage' -o \
+    -name 'target' \
+  \) -prune -o -name '.git' -print0 -prune 2>/dev/null
+}
+
+while IFS= read -r nested_rel; do
+  [[ -n "$nested_rel" ]] || continue
+  ignores+=("$nested_rel")
+done < <(stage_nested_repo_roots)
 
 if [[ "$scan_mode" != "full" ]]; then
   while IFS= read -r -d '' cfg; do

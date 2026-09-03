@@ -126,8 +126,9 @@ Scan modes:
 | `full` | `--full` | Full target tree, including installed deps such as `node_modules/` and `vendor/`. | Deep investigation when speed is secondary. |
 
 `--verbose` prints the resolved target, scan mode, project roots, lockfiles,
-manifests, staged source files, and scanner inputs. Use it when confirming that
-a scan is constrained to the intended project or machine root.
+manifests, staged source files, skipped nested repositories, and scanner inputs.
+Use it when confirming that a scan is constrained to the intended project or
+machine root.
 
 When required scanners (`osv-scanner`, `syft`, `grype`) or discovered project
 ecosystems require audit commands that are missing (`npm`, `composer`,
@@ -141,6 +142,29 @@ Dependency-only scan:
 ```bash
 safe audit repo-audit . --deps-only
 ```
+
+### Nested repositories
+
+A repository nested inside the target is skipped: linked git worktrees (a `.git`
+file pointing into `<repo>/.git/worktrees/`) and independent clones (a `.git`
+directory) are second copies of a codebase, and auditing them as part of the
+target reports the same findings once per copy. A project with 11 worktrees
+under `.task/` produced 4356 packages and 72 CVE criticals where 6 were real.
+
+Git **submodules are kept**. Their `.git` file points into
+`<repo>/.git/modules/`, their lockfiles are the parent project's dependencies,
+and they are part of what the parent builds.
+
+The rule is ancestry, not "carries a `.git`": a directory is skipped only when
+another directory at or below the scan target — the target itself included —
+also carries a `.git` entry. A `machine-audit` scan root is a plain directory
+holding independent repositories side by side, so none of them has such an
+ancestor and all of them stay discovered.
+
+Skipped roots are excluded from manifest and lockfile discovery, from the
+staged source scan, from the `.safe-audit` config walk, and from the SBOM
+(including `--full`). A scan that skipped any prints one line saying how many;
+`--verbose` lists them.
 
 ### What osv-scanner is handed
 
@@ -275,6 +299,12 @@ record with per-severity counts. Four rules govern that normalization:
   requirements files and one fails, the advisories the other one found are
   still counted. A failure in one target must not erase a critical found in
   another.
+- A scanner reporting **nothing to audit** is a clean result, not a breakage:
+  a `composer.json` with no dependencies makes `composer audit` exit 0 with an
+  empty stdout and `No packages - skipping audit.` on stderr. That is a
+  complete answer — zero advisories because there is nothing to look at — and
+  it is recorded as `ok` with the note `composer reported no packages to
+  audit`. Mirrors the osv-scanner `No package sources found` benign zero.
 
 A scanner that is **absent** does warn (its coverage is genuinely missing), and
 a scanner that **failed** warns and blocks caching. `pip-audit` audits every
@@ -294,6 +324,24 @@ A scanner that exited 0 but whose output could not be validated says exactly
 that (`output validation failed (scanner exit 0)`) rather than
 `failed (exit 0)`: the status is still `error`, but the note names the output
 as what broke instead of implying the tool did.
+
+`composer audit` reads **installed** packages by default and refuses a project
+whose dependencies were never installed (`No installed packages found ... pass
+--locked`) — which is every path package in a monorepo and every checkout
+audited before its build. safe passes `--locked` whenever a `composer.lock` is
+present, so the audit reads what the project pins rather than what happens to
+be in `vendor/`. Verified against Composer 2.10: `--locked` also succeeds on a
+lock that is out of date with `composer.json`, so there is no fallback to the
+unlocked run.
+
+Every audit record carries the **root it ran in** (`.root`, relative to the
+scan target; `.` is the target itself), on `.ecosystem_audits[]` and on
+`.audit_totals.ecosystem[]` alike. A monorepo runs the same scanner once per
+package, and without the root the report read as one scanner reported N times.
+The scan summary follows: the `ECOSYSTEM AUDITS:` line in the CVE block names
+each scanner once with its counts summed across the roots it ran in (and
+`across N roots` when that is more than one), while the detail block below
+prints one line per record, prefixed with its root.
 
 `safe audit machine-audit --allow-missing-tools` turns a missing ecosystem auditor from
 an abort into a reported gap. Callers that gate on the result document

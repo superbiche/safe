@@ -60,6 +60,19 @@ exit "${!rc_var:-0}"
 STUB
   chmod +x "$MOCKBIN/$tool"
 done
+# `composer` needs more than the shared stub: the audit lane decides its flags
+# from what is on disk (`--locked` only when a composer.lock exists), and the
+# "no packages" answer arrives on stderr with an empty stdout, so both argv and
+# stderr have to be under the test's control.
+cat > "$MOCKBIN/composer" <<'STUB'
+#!/usr/bin/env bash
+[[ -n "${COMPOSER_ARGV_LOG:-}" ]] && printf '%s\n' "$*" >> "$COMPOSER_ARGV_LOG"
+[[ -n "${COMPOSER_ERR:-}" ]] && printf '%s' "$COMPOSER_ERR" >&2
+printf '%s' "${COMPOSER_OUT:-}"
+exit "${COMPOSER_RC:-0}"
+STUB
+chmod +x "$MOCKBIN/composer"
+
 # `cargo audit` is invoked as `cargo audit`, with cargo-audit only probed for
 # availability.
 cat > "$MOCKBIN/cargo" <<'STUB'
@@ -763,6 +776,122 @@ STUB
   pass "$FUNCNAME"
 }
 
+case_composer_audits_the_lock_when_one_exists() {
+  # `composer audit` reads INSTALLED packages by default and refuses a project
+  # whose dependencies were never installed ("No installed packages found ...
+  # pass --locked"). Every path package in a monorepo and every checkout
+  # audited before its build is that project, and the refusal was reported as
+  # a broken scanner.
+  prepare_case "composer-locked"
+  printf '{"name":"demo/app","require":{"vendor/pkg":"^1.0"}}\n' > "$CASE_PROJECT/composer.json"
+  printf '{"packages":[]}\n' > "$CASE_PROJECT/composer.lock"
+  local argv_log="$CASE_DIR/composer.argv"
+  run_scan COMPOSER_ARGV_LOG="$argv_log" COMPOSER_OUT='{"advisories":{}}'
+  assert_jq "$FUNCNAME" '
+    .ecosystem_audits[] | select(.scanner == "composer-audit")
+      | .status == "ok" and .total == 0
+  ' || return
+  grep -q -- '--locked' "$argv_log" || {
+    printf 'composer argv did not carry --locked:\n%s\n' "$(cat "$argv_log" 2>/dev/null)" >&2
+    fail "$FUNCNAME"; return
+  }
+  pass "$FUNCNAME"
+}
+
+case_composer_without_a_lock_audits_the_installed_tree() {
+  # No lock file, nothing to read from one: the flag must not be passed, or
+  # composer refuses the run outright.
+  prepare_case "composer-unlocked"
+  printf '{"name":"demo/app"}\n' > "$CASE_PROJECT/composer.json"
+  local argv_log="$CASE_DIR/composer.argv"
+  run_scan COMPOSER_ARGV_LOG="$argv_log" COMPOSER_OUT='{"advisories":{}}'
+  assert_jq "$FUNCNAME" '
+    .ecosystem_audits[] | select(.scanner == "composer-audit") | .status == "ok"
+  ' || return
+  if grep -q -- '--locked' "$argv_log"; then
+    printf 'composer argv carried --locked with no composer.lock:\n%s\n' "$(cat "$argv_log")" >&2
+    fail "$FUNCNAME"; return
+  fi
+  pass "$FUNCNAME"
+}
+
+case_composer_no_packages_is_a_clean_result_not_an_error() {
+  # A composer.json declaring no dependencies: exit 0, empty stdout, the reason
+  # on stderr. That is a complete answer — zero advisories because there is
+  # nothing to audit — and reading it as "output validation failed" turned
+  # dependency-free projects into lost coverage. Mirrors the osv-scanner
+  # "No package sources found" benign zero.
+  prepare_case "composer-no-packages"
+  printf '{"name":"demo/app"}\n' > "$CASE_PROJECT/composer.json"
+  run_scan COMPOSER_OUT='' COMPOSER_ERR='No packages - skipping audit.
+'
+  assert_jq "$FUNCNAME" '
+    (.ecosystem_audits[] | select(.scanner == "composer-audit")
+      | .status == "ok" and .total == 0 and .critical == 0
+        and ((.note // "") | test("no packages")))
+    and .audit_totals.critical == 0
+    and .verdict == "GO"
+  ' || return
+  pass "$FUNCNAME"
+}
+
+case_ecosystem_audits_carry_the_root_they_ran_in() {
+  # A monorepo runs the same scanner once per package. Without the root the
+  # report reads as one scanner reported N times: on the project that motivated
+  # this, "composer-audit 23 (...)" printed ten times over, joined by
+  # semicolons, with no way to tell which package any of them described.
+  prepare_case "eco-roots"
+  mkdir -p "$CASE_PROJECT/packages/one" "$CASE_PROJECT/packages/two"
+  printf '{"name":"demo/root"}\n' > "$CASE_PROJECT/composer.json"
+  printf '{"packages":[]}\n' > "$CASE_PROJECT/composer.lock"
+  printf '{"name":"demo/one"}\n' > "$CASE_PROJECT/packages/one/composer.json"
+  printf '{"packages":[]}\n' > "$CASE_PROJECT/packages/one/composer.lock"
+  printf '{"name":"demo/two"}\n' > "$CASE_PROJECT/packages/two/composer.json"
+  printf '{"packages":[]}\n' > "$CASE_PROJECT/packages/two/composer.lock"
+  run_scan COMPOSER_RC=2 COMPOSER_OUT='{"advisories":{"vendor/pkg":[{"advisoryId":"PKSA-1","severity":"high"}]}}'
+  assert_jq "$FUNCNAME" '
+    ([.ecosystem_audits[] | select(.scanner == "composer-audit") | .root] | sort)
+      == [".", "packages/one", "packages/two"]
+  ' || return
+  assert_jq "$FUNCNAME" '
+    ([.audit_totals.ecosystem[] | select(.scanner == "composer-audit") | .root] | sort)
+      == [".", "packages/one", "packages/two"]
+  ' || return
+
+  # The CVE-block one-liner names the scanner ONCE with the counts summed, and
+  # says how many roots it ran in.
+  local summary="$CASE_DIR/summary.txt"
+  SAFE_AUDIT_CONFIG_DIR="$CASE_DIR/audit-config" \
+  SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
+  SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+  RESULT_PATH="$RESULT" \
+    bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; render_scan_summary "$RESULT_PATH"' > "$summary" 2>/dev/null || true
+  local one_liner
+  one_liner="$(grep 'ECOSYSTEM AUDITS: ' "$summary" || true)"
+  [[ "$(grep -c 'composer-audit' <<<"$one_liner")" -eq 1 ]] || {
+    printf 'one-liner repeated the scanner: %s\n' "$one_liner" >&2
+    fail "$FUNCNAME"; return
+  }
+  grep -qF 'composer-audit 3 (critical 0, high 3,' <<<"$one_liner" || {
+    printf 'one-liner did not sum counts across roots: %s\n' "$one_liner" >&2
+    fail "$FUNCNAME"; return
+  }
+  grep -qF 'across 3 roots' <<<"$one_liner" || {
+    printf 'one-liner did not name the root count: %s\n' "$one_liner" >&2
+    fail "$FUNCNAME"; return
+  }
+  # The detail block prefixes the root, and the target itself stays unlabeled.
+  grep -qF '  composer-audit [packages/one]: 1 advisories' "$summary" || {
+    printf 'detail block missed the root prefix:\n%s\n' "$(cat "$summary")" >&2
+    fail "$FUNCNAME"; return
+  }
+  grep -qE '^  composer-audit: 1 advisories' "$summary" || {
+    printf 'detail block labeled the target itself:\n%s\n' "$(cat "$summary")" >&2
+    fail "$FUNCNAME"; return
+  }
+  pass "$FUNCNAME"
+}
+
 case_local_and_remote_normalizers_stay_identical() {
   # The remote scan helper ships its own copy of these functions. A fix applied
   # to one copy and not the other is a silent divergence in what a remote scan
@@ -820,6 +949,10 @@ main() {
     case_lockless_npm_project_is_not_clean \
     case_pnpm_project_still_caches \
     case_missing_tool_is_reported_not_fatal_when_allowed \
+    case_composer_audits_the_lock_when_one_exists \
+    case_composer_without_a_lock_audits_the_installed_tree \
+    case_composer_no_packages_is_a_clean_result_not_an_error \
+    case_ecosystem_audits_carry_the_root_they_ran_in \
     case_local_and_remote_normalizers_stay_identical
   do
     "$case"
