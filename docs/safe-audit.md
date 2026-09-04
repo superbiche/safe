@@ -240,6 +240,20 @@ represented by the key. Nothing is cached when:
 - **govulncheck is involved at all.** It analyses `./...` — Go source, which no
   evidence hash covers. That holds even when it was merely absent, so
   installing it later is never masked by a replay of the run that lacked it.
+- **a composer audit answered from the installed tree.** `composer audit`
+  reads `vendor/composer/installed.json`, then drops every recorded package
+  whose install directory is absent. Two things therefore decide its answer
+  that no file hash can represent: the metadata bytes (a `vendor/` rebuilt
+  from another branch changes the verdict under an unchanged lock) and the
+  mere existence of each package directory (creating one empty directory
+  turned a clean result into one critical while every hashable byte stayed
+  identical). Keying that would mean reproducing every installer's
+  package-presence rules, so the lane is not replayable at all. Each
+  composer record carries the state that decided it — `installed`, `lock`, or
+  `none` — and only the last two are cacheable. **The cost is real**: a PHP
+  project with a vendor tree re-runs the dependency scan at every install
+  preflight. A project audited from its lock — a path package, a checkout
+  before its build — still replays.
 - **an ecosystem audit failed, was absent, or returned partial coverage**, or
   any of osv-scanner, syft and grype is in a non-ok state. Missing coverage is
   not a cacheable answer. (A deterministic `unsupported` record — npm audit
@@ -251,17 +265,6 @@ per-root inputs that decide what a scanner *asks*: `.npmrc` (which registry
 `npm audit` queries), `.safe-audit` (which ecosystems are audited at all), and
 every known evidence name that exists as a **symlink** — discovery walks
 regular files, but `npm audit` reads the link happily.
-
-Composer's **installed tree** is in the key for the same reason. `composer
-audit` audits what is in `vendor/`, not what is in the lock, so a checkout
-whose `vendor/` was rebuilt from another branch can hold an advisory its
-unchanged `composer.lock` never mentions — and without this the unchanged lock
-would replay the previous tree's verdict. The file hashed per root is the one
-composer will read: `$COMPOSER_VENDOR_DIR/composer/installed.json` when that
-variable is exported, else the directory named by `config.vendor-dir` in
-`composer.json`, else `vendor/`. A root with no installed tree — every path
-package in a monorepo, every checkout audited before its build — is audited
-from its lock and keyed on that lock alone, which is exactly what it read.
 
 The **scanner set** is part of the key too: each tool's presence and, when
 present, its path, size and mtime. Installing pip-audit gains a project Python
@@ -359,6 +362,14 @@ safe then reruns with `--locked` rather than reporting a broken scanner. The
 record's note says `audited composer.lock (no installed packages)`, because a
 lock-file audit and an installed-tree audit are not the same coverage. With no
 lock either, the refusal stays an `error`: nothing was audited.
+
+Each composer record also carries `evidence` — the state that decided its
+package set: `installed` when the installed tree answered, `lock` when the
+lock did, `none` when the project declares no dependencies. The
+[scan cache](#scan-cache---deps-only) reads it, and reads it strictly: a
+refusal raised while `vendor/composer/installed.json` exists was decided by
+which install directories are present, so that record is `installed` even
+though the lock produced the counts.
 
 Every audit record carries the **root it ran in** (`.root`, relative to the
 scan target; `.` is the target itself), on `.ecosystem_audits[]` and on

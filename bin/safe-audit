@@ -2257,7 +2257,11 @@ run_composer_audit_dir() {
     printf '%s\n' "$(render_ecosystem_audit_json "composer-audit" "skipped" 0 0 0 0 0 "composer unavailable" 0)" > "$output"
     return 0
   fi
-  local rc=0 fallback_note=""
+  # `evidence` names the state that DECIDED the audited package set, because
+  # the scan cache has to know whether this lane read anything it cannot hash:
+  # "installed" = the installed tree decided it, "lock" = composer.lock alone,
+  # "none" = nothing was declared. Only the last two are hashable evidence.
+  local rc=0 fallback_note="" evidence="installed"
   # The INSTALLED tree is the primary evidence: composer's default audits what
   # is in vendor/, and the lock file is a different package set. A deployed
   # checkout whose lock has drifted can carry an installed critical the lock
@@ -2272,7 +2276,8 @@ run_composer_audit_dir() {
   # osv-scanner "No package sources found" benign zero.
   if (( rc == 0 )) && [[ ! -s "$output.raw" ]] \
     && grep -qF 'No packages - skipping audit.' "$output.stderr" 2>/dev/null; then
-    printf '%s\n' "$(render_ecosystem_audit_json "composer-audit" "ok" 0 0 0 0 0 "composer reported no packages to audit" 0)" > "$output"
+    render_ecosystem_audit_json "composer-audit" "ok" 0 0 0 0 0 "composer reported no packages to audit" 0 \
+      | jq -c '.evidence = "none"' > "$output"
     return 0
   fi
   # Only when there is no installed tree to read does the lock become the best
@@ -2288,6 +2293,18 @@ run_composer_audit_dir() {
     rc=0
     (cd "$dir" && composer audit --locked --format=json) > "$output.raw" 2>"$output.stderr" || rc=$?
     fallback_note="audited composer.lock (no installed packages)"
+    # The refusal has two causes and they are not the same evidence. With no
+    # installed metadata at all, nothing was ever built and composer.lock is
+    # the whole input. With metadata present, composer READ it and emptied the
+    # repository because the recorded install paths are absent — Factory
+    # purges a package whose directory is missing — so a directory appearing
+    # later changes the verdict while every hashable byte stays put. That is
+    # the installed tree deciding the lane, and nothing can hash it.
+    local vendor_dir="${COMPOSER_VENDOR_DIR:-}"
+    [[ -n "$vendor_dir" ]] || vendor_dir="$(jq -r '.config["vendor-dir"] // "vendor"' "$dir/composer.json" 2>/dev/null || printf 'vendor')"
+    [[ -n "$vendor_dir" ]] || vendor_dir="vendor"
+    [[ "$vendor_dir" == /* ]] || vendor_dir="$dir/$vendor_dir"
+    [[ -f "${vendor_dir%/}/composer/installed.json" ]] || evidence="lock"
   fi
   # composer keys advisories BY PACKAGE: {"advisories":{"vendor/pkg":[...]}}.
   # Read as a flat array it finds nothing at all.
@@ -2295,12 +2312,13 @@ run_composer_audit_dir() {
     ecosystem_audit_error "composer-audit" "$rc" "$output.stderr" "$output"
     return 0
   fi
-  jq --arg note "$fallback_note" "$ECO_AUDIT_JQ_DEFS"'
+  jq --arg note "$fallback_note" --arg evidence "$evidence" "$ECO_AUDIT_JQ_DEFS"'
     ( .advisories // {} ) as $a
     | [ if ($a | type) == "object" then ($a[] | .[]?) else ($a[]?) end ] as $adv
     | [ $adv[] | ((.severity // "unknown") | sev_norm) ] as $sevs
     | audit_doc("composer-audit"; $sevs)
     | .note = (if $note == "" then null else $note end)
+    | .evidence = $evidence
   ' "$output.raw" > "$output" 2>/dev/null || ecosystem_audit_error "composer-audit" "$rc" "$output.stderr" "$output"
 }
 
@@ -3164,10 +3182,22 @@ scan_cache_enabled() {
 
 # A result is replayable only if every scanner that contributed to it read
 # nothing outside the hashed evidence, and only if the scanner set itself was
-# complete. Three exclusions:
+# complete. Four exclusions:
 #   - govulncheck at all (any status): it analyses Go SOURCE, which the key
 #     does not cover, and if it was merely absent, installing it later must
 #     not be masked by a replay of the run that lacked it.
+#   - any composer audit whose answer came from the INSTALLED TREE. Two review
+#     rounds went looking for the file that would key that tree and there is
+#     none: `composer audit` reads vendor/composer/installed.json (N1: a
+#     vendor/ rebuilt from another branch changed the verdict under an
+#     unchanged lock) and then DROPS every recorded package whose install
+#     directory is absent (N2: creating one empty directory changed a clean
+#     result into one critical while every hashable byte stayed identical).
+#     Keying that would mean reproducing each installer's presence semantics,
+#     so the lane is simply not replayable. A composer record decided by the
+#     lock ("lock") or by a project with nothing declared ("none") is, because
+#     both read files that are in the key. The cost is stated in
+#     docs/safe-audit.md: a PHP project with a vendor tree re-scans every time.
 #   - any ecosystem audit that did not return "ok": a tool that was missing
 #     or broken is coverage the key cannot represent, so the next scan runs
 #     for real rather than replaying a partial answer.
@@ -3177,6 +3207,8 @@ scan_cache_result_is_cacheable() {
   local result="$1"
   jq -e '
     ([.ecosystem_audits[]? | select((.scanner // "") == "govulncheck")] | length == 0)
+    and ([.ecosystem_audits[]?
+          | select((.scanner // "") == "composer-audit" and (.evidence // "") == "installed")] | length == 0)
     and ([.ecosystem_audits[]?
           | select((.status // "ok") != "ok")
           | select((.status // "") != "unsupported")] | length == 0)
@@ -3217,32 +3249,8 @@ scan_cache_scanner_fingerprint() {
   done
 }
 
-# `composer audit` reads the INSTALLED tree by default, not the lock (see
-# run_composer_audit_dir), so vendor/composer/installed.json is dependency
-# evidence no manifest or lockfile covers: a checkout whose vendor/ was rebuilt
-# from another branch keeps the same composer.lock, hashes to the same key, and
-# would replay the previous installed tree's verdict — demonstrated at one
-# suppressed critical. This names the file composer will actually read:
-# COMPOSER_VENDOR_DIR when exported (composer's own precedence), else
-# composer.json's config.vendor-dir, else vendor/. A relative directory is
-# resolved against the root. A vendor-dir carrying an unexpanded placeholder
-# resolves to nothing, the file is absent, and the root stays keyed on its lock
-# alone — the pre-1.58 behavior, never a wrong hash.
-composer_installed_metadata_path() {
-  local root="$1" vendor=""
-  [[ -f "$root/composer.json" ]] || return 0
-  if [[ -n "${COMPOSER_VENDOR_DIR:-}" ]]; then
-    vendor="$COMPOSER_VENDOR_DIR"
-  elif command -v jq >/dev/null 2>&1; then
-    vendor="$(jq -r '.config["vendor-dir"] // empty' "$root/composer.json" 2>/dev/null || true)"
-  fi
-  [[ -n "$vendor" ]] || vendor="vendor"
-  [[ "$vendor" == /* ]] || vendor="$root/$vendor"
-  printf '%s\n' "${vendor%/}/composer/installed.json"
-}
-
 scan_cache_evidence_paths() {
-  local root name path installed
+  local root name path
   for path in ${CURRENT_LOCKFILES[@]+"${CURRENT_LOCKFILES[@]}"} \
               ${CURRENT_MANIFESTS[@]+"${CURRENT_MANIFESTS[@]}"}; do
     [[ -n "$path" ]] && printf '%s\n' "$path"
@@ -3254,8 +3262,6 @@ scan_cache_evidence_paths() {
       # is what gets hashed.
       [[ -e "$path" ]] && printf '%s\n' "$path"
     done
-    installed="$(composer_installed_metadata_path "$root")"
-    [[ -n "$installed" && -e "$installed" ]] && printf '%s\n' "$installed"
   done
 }
 
@@ -4432,7 +4438,11 @@ run_composer_audit_dir() {
     printf '%s\n' "$(render_ecosystem_audit_json "composer-audit" "skipped" 0 0 0 0 0 "composer unavailable" 0)" > "$output"
     return 0
   fi
-  local rc=0 fallback_note=""
+  # `evidence` names the state that DECIDED the audited package set, because
+  # the scan cache has to know whether this lane read anything it cannot hash:
+  # "installed" = the installed tree decided it, "lock" = composer.lock alone,
+  # "none" = nothing was declared. Only the last two are hashable evidence.
+  local rc=0 fallback_note="" evidence="installed"
   # The INSTALLED tree is the primary evidence: composer's default audits what
   # is in vendor/, and the lock file is a different package set. A deployed
   # checkout whose lock has drifted can carry an installed critical the lock
@@ -4447,7 +4457,8 @@ run_composer_audit_dir() {
   # osv-scanner "No package sources found" benign zero.
   if (( rc == 0 )) && [[ ! -s "$output.raw" ]] \
     && grep -qF 'No packages - skipping audit.' "$output.stderr" 2>/dev/null; then
-    printf '%s\n' "$(render_ecosystem_audit_json "composer-audit" "ok" 0 0 0 0 0 "composer reported no packages to audit" 0)" > "$output"
+    render_ecosystem_audit_json "composer-audit" "ok" 0 0 0 0 0 "composer reported no packages to audit" 0 \
+      | jq -c '.evidence = "none"' > "$output"
     return 0
   fi
   # Only when there is no installed tree to read does the lock become the best
@@ -4463,6 +4474,18 @@ run_composer_audit_dir() {
     rc=0
     (cd "$dir" && composer audit --locked --format=json) > "$output.raw" 2>"$output.stderr" || rc=$?
     fallback_note="audited composer.lock (no installed packages)"
+    # The refusal has two causes and they are not the same evidence. With no
+    # installed metadata at all, nothing was ever built and composer.lock is
+    # the whole input. With metadata present, composer READ it and emptied the
+    # repository because the recorded install paths are absent — Factory
+    # purges a package whose directory is missing — so a directory appearing
+    # later changes the verdict while every hashable byte stays put. That is
+    # the installed tree deciding the lane, and nothing can hash it.
+    local vendor_dir="${COMPOSER_VENDOR_DIR:-}"
+    [[ -n "$vendor_dir" ]] || vendor_dir="$(jq -r '.config["vendor-dir"] // "vendor"' "$dir/composer.json" 2>/dev/null || printf 'vendor')"
+    [[ -n "$vendor_dir" ]] || vendor_dir="vendor"
+    [[ "$vendor_dir" == /* ]] || vendor_dir="$dir/$vendor_dir"
+    [[ -f "${vendor_dir%/}/composer/installed.json" ]] || evidence="lock"
   fi
   # composer keys advisories BY PACKAGE: {"advisories":{"vendor/pkg":[...]}}.
   # Read as a flat array it finds nothing at all.
@@ -4470,12 +4493,13 @@ run_composer_audit_dir() {
     ecosystem_audit_error "composer-audit" "$rc" "$output.stderr" "$output"
     return 0
   fi
-  jq --arg note "$fallback_note" "$ECO_AUDIT_JQ_DEFS"'
+  jq --arg note "$fallback_note" --arg evidence "$evidence" "$ECO_AUDIT_JQ_DEFS"'
     ( .advisories // {} ) as $a
     | [ if ($a | type) == "object" then ($a[] | .[]?) else ($a[]?) end ] as $adv
     | [ $adv[] | ((.severity // "unknown") | sev_norm) ] as $sevs
     | audit_doc("composer-audit"; $sevs)
     | .note = (if $note == "" then null else $note end)
+    | .evidence = $evidence
   ' "$output.raw" > "$output" 2>/dev/null || ecosystem_audit_error "composer-audit" "$rc" "$output.stderr" "$output"
 }
 

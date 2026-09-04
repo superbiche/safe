@@ -799,7 +799,8 @@ case_composer_audits_the_installed_tree_when_there_is_one() {
     COMPOSER_LOCKED_OUT='{"advisories":{}}'
   assert_jq "$FUNCNAME" '
     (.ecosystem_audits[] | select(.scanner == "composer-audit")
-      | .status == "ok" and .total == 1 and .critical == 1 and (.note == null))
+      | .status == "ok" and .total == 1 and .critical == 1 and (.note == null)
+        and .evidence == "installed")
     and .audit_totals.critical == 1
   ' || return
   [[ "$(wc -l < "$argv_log")" -eq 1 ]] || {
@@ -825,7 +826,7 @@ case_composer_installed_advisories_win_over_the_lock() {
     COMPOSER_LOCKED_OUT='{"advisories":{}}'
   assert_jq "$FUNCNAME" '
     (.ecosystem_audits[] | select(.scanner == "composer-audit")
-      | .status == "ok" and .critical == 1)
+      | .status == "ok" and .critical == 1 and .evidence == "installed")
     and .audit_totals.critical == 1
     and .verdict == "WARN"
   ' || return
@@ -849,7 +850,8 @@ case_composer_falls_back_to_the_lock_with_no_installed_tree() {
   assert_jq "$FUNCNAME" '
     (.ecosystem_audits[] | select(.scanner == "composer-audit")
       | .status == "ok" and .total == 1 and .high == 1
-        and ((.note // "") | test("composer.lock")))
+        and ((.note // "") | test("composer.lock"))
+        and .evidence == "lock")
     and .audit_totals.high == 1
   ' || return
   [[ "$(wc -l < "$argv_log")" -eq 2 ]] || {
@@ -864,6 +866,55 @@ case_composer_falls_back_to_the_lock_with_no_installed_tree() {
     printf 'fallback call did not carry --locked:\n%s\n' "$(cat "$argv_log")" >&2
     fail "$FUNCNAME"; return
   }
+  pass "$FUNCNAME"
+}
+
+case_composer_fallback_with_an_installed_tree_reads_as_installed_evidence() {
+  # The same "No installed packages found" refusal, but vendor/ IS there:
+  # composer read installed.json and emptied its repository because the
+  # recorded install directories are absent. The lock answered, yet what
+  # DECIDED that is filesystem state no hash covers — one empty directory
+  # appearing turns a clean result into a critical — so the record says
+  # `installed` and the scan cache refuses it. The note still names the lock,
+  # because the lock is what was read.
+  prepare_case "composer-fallback-installed-evidence"
+  printf '{"name":"demo/app","require":{"vendor/pkg":"^1.0"}}\n' > "$CASE_PROJECT/composer.json"
+  printf '{"packages":[]}\n' > "$CASE_PROJECT/composer.lock"
+  mkdir -p "$CASE_PROJECT/vendor/composer"
+  printf '{"packages":[{"name":"vendor/pkg","version":"1.0.0"}]}\n' \
+    > "$CASE_PROJECT/vendor/composer/installed.json"
+  run_scan COMPOSER_RC=1 COMPOSER_OUT='' \
+    COMPOSER_ERR='No installed packages found. Please run "composer install" before running "audit" or pass "--locked" to audit the lock file.
+' \
+    COMPOSER_LOCKED_OUT='{"advisories":{}}'
+  assert_jq "$FUNCNAME" '
+    .ecosystem_audits[] | select(.scanner == "composer-audit")
+      | .status == "ok" and .total == 0
+        and ((.note // "") | test("composer.lock"))
+        and .evidence == "installed"
+  ' || return
+  pass "$FUNCNAME"
+}
+
+case_composer_vendor_dir_config_decides_the_installed_probe() {
+  # config.vendor-dir moves the tree composer reads, so it moves the file the
+  # evidence probe looks for: a stray default-location vendor/ must not make a
+  # genuine pre-build fallback look installed-decided.
+  prepare_case "composer-fallback-vendor-dir"
+  printf '{"name":"demo/app","config":{"vendor-dir":"lib/deps"},"require":{"vendor/pkg":"^1.0"}}\n' \
+    > "$CASE_PROJECT/composer.json"
+  printf '{"packages":[]}\n' > "$CASE_PROJECT/composer.lock"
+  mkdir -p "$CASE_PROJECT/vendor/composer"
+  printf '{"packages":[{"name":"stray/unread","version":"9.9.9"}]}\n' \
+    > "$CASE_PROJECT/vendor/composer/installed.json"
+  run_scan COMPOSER_RC=1 COMPOSER_OUT='' \
+    COMPOSER_ERR='No installed packages found. Please run "composer install" before running "audit" or pass "--locked" to audit the lock file.
+' \
+    COMPOSER_LOCKED_OUT='{"advisories":{}}'
+  assert_jq "$FUNCNAME" '
+    .ecosystem_audits[] | select(.scanner == "composer-audit")
+      | .status == "ok" and .evidence == "lock"
+  ' || return
   pass "$FUNCNAME"
 }
 
@@ -900,7 +951,8 @@ case_composer_no_packages_is_a_clean_result_not_an_error() {
   assert_jq "$FUNCNAME" '
     (.ecosystem_audits[] | select(.scanner == "composer-audit")
       | .status == "ok" and .total == 0 and .critical == 0
-        and ((.note // "") | test("no packages")))
+        and ((.note // "") | test("no packages"))
+        and .evidence == "none")
     and .audit_totals.critical == 0
     and .verdict == "GO"
   ' || return
@@ -1024,6 +1076,8 @@ main() {
     case_composer_audits_the_installed_tree_when_there_is_one \
     case_composer_installed_advisories_win_over_the_lock \
     case_composer_falls_back_to_the_lock_with_no_installed_tree \
+    case_composer_fallback_with_an_installed_tree_reads_as_installed_evidence \
+    case_composer_vendor_dir_config_decides_the_installed_probe \
     case_composer_refusal_without_a_lock_stays_an_error \
     case_composer_no_packages_is_a_clean_result_not_an_error \
     case_ecosystem_audits_carry_the_root_they_ran_in \
