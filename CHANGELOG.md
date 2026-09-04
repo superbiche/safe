@@ -2,6 +2,98 @@
 
 ## Unreleased
 
+- **A repository nested inside the scan target is no longer audited as part of
+  it** (1.58.0). `repo-audit` walked into linked git worktrees and nested
+  clones, so a project with 11 worktrees under `.task/` was audited twelve
+  times over: 4356 packages, 72 CVE criticals where 6 were real, and an
+  install gate refusing on "92 critical finding(s)" that were the same handful
+  of advisories counted once per copy. Discovery now skips a directory
+  carrying `.git` when another directory at or below the target — the target
+  itself included — carries one too.
+  - **Submodules are kept.** Their `.git` file points into `.git/modules/`,
+    their lockfiles are the parent's dependencies, and they were always meant
+    to be audited with it. Only worktrees (`.git/worktrees/`) and nested
+    independent clones are skipped.
+  - **A `machine-audit` scan root still finds everything.** The rule is
+    ancestry, not "carries a `.git`": a scan root holding independent
+    repositories side by side gives none of them a `.git`-carrying ancestor,
+    so all of them stay discovered. A flat rule would have emptied that scan.
+  - **The prune reaches every walk**, including the SBOM (skipped roots become
+    syft excludes, so `--full` skips them too), the staged source scan, the
+    `.safe-audit` config walk, and both remote helpers — the remote scan
+    helper's lockfile walk had no prunes at all and also read every lockfile
+    under `vendor/`. A scan that skipped anything says how many; `--verbose`
+    lists them.
+- **A composer project with no installed tree falls back to its lock file**
+  (1.58.0). `composer audit` refuses a project whose dependencies were never
+  installed (`No installed packages found ... pass --locked`) — every path
+  package in a monorepo, every checkout audited before its build — and safe
+  reported that refusal as a broken scanner. It now reruns with `--locked` and
+  notes `audited composer.lock (no installed packages)`, because a lock-file
+  audit and an installed-tree audit are not the same coverage. With no lock
+  either, the refusal stays an error: nothing was audited.
+  - **The installed tree stays the primary evidence.** `--locked` reads a
+    different package set, and a deployed checkout whose lock has drifted can
+    carry an installed advisory the lock does not mention: on such a fixture
+    the default run reported six advisories including one critical while
+    `--locked` reported none. The lock is read only when there is no installed
+    tree, never in preference to one.
+  - **An installed-tree composer result is never cached**, because nothing can
+    key it. `composer audit` reads `vendor/composer/installed.json` and then
+    drops every recorded package whose install directory is absent, so two
+    unhashable things decide its answer: a `vendor/` rebuilt from another
+    branch changed the verdict under an unchanged lock, and creating one empty
+    package directory turned a clean result into one critical while every
+    hashable byte stayed identical. Both were demonstrated as suppressed
+    criticals on `--deps-only`, the mode the install gate runs. Each composer
+    record now carries `evidence` — `installed`, `lock`, or `none` — and the
+    scan cache stores only the last two. A refusal raised while installed
+    metadata exists counts as `installed`: the install paths decided it, not
+    the lock. **The cost**: a PHP project with a vendor tree re-runs the
+    dependency scan at every install preflight. Lock-audited projects — path
+    packages, checkouts before their build — still replay.
+- **A composer project with no dependencies is a clean result, not an error**
+  (1.58.0). `composer audit` exits 0 with empty stdout and `No packages -
+  skipping audit.` on stderr, which safe reported as `output validation
+  failed`. It is now `ok` with zero advisories and a note saying so, the same
+  way osv-scanner's `No package sources found` is handled. A dependency-free
+  project is not lost coverage.
+- **Every ecosystem-audit record carries the root it ran in** (1.58.0). A
+  monorepo runs the same scanner once per package, and the summary printed one
+  identical line per run — `composer-audit 23 (...)` ten times over, joined by
+  semicolons, with no way to tell which package any of them described. Records
+  on `.ecosystem_audits[]` and `.audit_totals.ecosystem[]` now carry `.root`
+  (relative to the target; `.` is the target itself), the CVE-block one-liner
+  names each scanner once with counts summed and `across N roots` when it ran
+  in more than one, and the detail block prefixes each line with its root.
+- **Cached scan results from before 1.58.0 are retired** (1.58.0). The scan
+  cache key records the machine, target, mode and evidence hashes but no safe
+  version, so the schema is what retires stale semantics — and this release
+  changes them twice over: ecosystem records gained `root`, discovery began
+  pruning nested repositories, and the composer lane changed which package set
+  it audits. The schema moves 1 -> 2, so every earlier entry misses and
+  rescans. Without it a pre-1.58 result would replay under 1.58 rules: the
+  live cache held 90 such entries, 7 still inside the 24h TTL.
+- **Nested-repository detection deliberately stops at derived directories**
+  (1.58.0). A repository under `vendor/` or `build/_deps/` is a
+  source-installed dependency (`composer install --prefer-source`, a CMake
+  fetch), not a second copy of the project, so it is not reported as nested and
+  `--full` catalogs it as the dependency it is. Documented and locked with a
+  test rather than changed.
+- **A trailing slash on a remote target no longer disables the prune**
+  (1.58.0). The remote helper compared paths against its raw target, so
+  `--project /srv/app/` built a `//` prefix that matched nothing and reported
+  zero nested repositories where `/srv/app` reported three. The helper
+  normalizes its target once, up front.
+- **The gate stopped warning about null bytes on every `go`, `cargo` and `bun`
+  invocation** (1.58.0). Since 1.56.0 the wrapper-marker probe ran `sed` over
+  the resolved delegate unconditionally, and for a real tool that delegate is
+  an ELF binary: bash printed `warning: command substitution: ignored null
+  byte in input` to stderr on every gated run. The probe now refuses
+  non-wrappers up front, and both marker probes read a bounded prefix with NUL
+  bytes stripped — so a binary can neither produce a warning nor pull megabytes
+  of its first "line" into a shell variable.
+
 - **The weekly host-allow review digest is machine-local state now, not a note
   in the safe repo's inbox** (1.57.0). `--digest` wrote
   `inbox/<date>-safe-host-allow-digest.md` into the safe checkout, which was

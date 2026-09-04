@@ -107,6 +107,19 @@ safe_gate_warn_missing() {
 # Real-tool resolution
 # ---------------------------------------------------------------------------
 
+# Both probes below run against WHATEVER sits on PATH under a gated name, and
+# most of the time that is an ELF binary (go, cargo, bun, uv.original), not a
+# script. Two properties follow, and both are load-bearing:
+#   - the read is BOUNDED (head -c): a binary's first "line" can be megabytes,
+#     and an unbounded `read` pulled all of it into a variable to find a marker
+#     that lives in the first 80 bytes or nowhere;
+#   - NUL bytes are stripped before the bytes reach a shell variable. bash
+#     cannot hold a NUL, and a command substitution that meets one prints
+#     `warning: command substitution: ignored null byte in input` — on stderr,
+#     on every gated invocation (regression 1.56.0-1.57.0, #134). Stripping is
+#     safe here because the marker is ASCII: no NUL can be part of a match.
+SAFE_GATE_MARKER_PROBE_BYTES=4096
+
 # A generated wrapper carries `# safe-gate-wrapper` in its first two lines.
 safe_gate_is_wrapper() {
   local path="$1" line i=0
@@ -115,7 +128,7 @@ safe_gate_is_wrapper() {
     case "$line" in
       *'# safe-gate-wrapper'*) return 0 ;;
     esac
-  done < "$path" 2>/dev/null
+  done < <(LC_ALL=C head -c "$SAFE_GATE_MARKER_PROBE_BYTES" -- "$path" 2>/dev/null | tr -d '\0')
   return 1
 }
 
@@ -123,7 +136,11 @@ safe_gate_is_wrapper() {
 # gate_wrapper_marked). Empty output when the line is not a marker.
 safe_gate_wrapper_marker_tool() {
   local path="$1" line
-  line="$(LC_ALL=C sed -n '2p' -- "$path" 2>/dev/null)"
+  # Only a wrapper can carry the marker, and the callers hand this function
+  # arbitrary delegates. Refusing non-wrappers up front keeps the binary case
+  # off the read path entirely.
+  safe_gate_is_wrapper "$path" || return 0
+  line="$(LC_ALL=C head -c "$SAFE_GATE_MARKER_PROBE_BYTES" -- "$path" 2>/dev/null | tr -d '\0' | LC_ALL=C sed -n '2p')" || line=""
   case "$line" in
     '# safe-gate-wrapper '*' tool='*) printf '%s\n' "${line##* tool=}" ;;
   esac

@@ -126,8 +126,9 @@ Scan modes:
 | `full` | `--full` | Full target tree, including installed deps such as `node_modules/` and `vendor/`. | Deep investigation when speed is secondary. |
 
 `--verbose` prints the resolved target, scan mode, project roots, lockfiles,
-manifests, staged source files, and scanner inputs. Use it when confirming that
-a scan is constrained to the intended project or machine root.
+manifests, staged source files, skipped nested repositories, and scanner inputs.
+Use it when confirming that a scan is constrained to the intended project or
+machine root.
 
 When required scanners (`osv-scanner`, `syft`, `grype`) or discovered project
 ecosystems require audit commands that are missing (`npm`, `composer`,
@@ -141,6 +142,35 @@ Dependency-only scan:
 ```bash
 safe audit repo-audit . --deps-only
 ```
+
+### Nested repositories
+
+A repository nested inside the target is skipped: linked git worktrees (a `.git`
+file pointing into `<repo>/.git/worktrees/`) and independent clones (a `.git`
+directory) are second copies of a codebase, and auditing them as part of the
+target reports the same findings once per copy. A project with 11 worktrees
+under `.task/` produced 4356 packages and 72 CVE criticals where 6 were real.
+
+Git **submodules are kept**. Their `.git` file points into
+`<repo>/.git/modules/`, their lockfiles are the parent project's dependencies,
+and they are part of what the parent builds.
+
+The rule is ancestry, not "carries a `.git`": a directory is skipped only when
+another directory at or below the scan target — the target itself included —
+also carries a `.git` entry. A `machine-audit` scan root is a plain directory
+holding independent repositories side by side, so none of them has such an
+ancestor and all of them stay discovered.
+
+Detection does not descend derived directories (`vendor/`, `node_modules/`,
+`build/`, and the rest of the skip list). A repository found there is a
+source-installed **dependency** — `composer install --prefer-source`, a CMake
+`build/_deps/` fetch — not a second copy of the project, and `--full` exists to
+catalog installed trees, so it catalogs those as it always has.
+
+Skipped roots are excluded from manifest and lockfile discovery, from the
+staged source scan, from the `.safe-audit` config walk, and from the SBOM,
+`--full` included. A scan that skipped any prints one line saying how many;
+`--verbose` lists them.
 
 ### What osv-scanner is handed
 
@@ -173,10 +203,11 @@ costs a scan rather than after.
 
 ### Scan cache (`--deps-only`)
 
-A dependency-only scan reads exactly one thing: the dependency evidence
-(lockfiles and manifests). When that evidence hashes to a set already scanned
-within 24 hours, re-running the scanners cannot produce a different verdict, so
-the recorded result is replayed instead:
+A dependency-only scan reads only dependency evidence: the lockfiles and
+manifests discovery finds, plus the few per-root files a scanner reads to
+decide its answer (enumerated below). When that evidence hashes to a set
+already scanned within 24 hours, re-running the scanners cannot produce a
+different verdict, so the recorded result is replayed instead:
 
 ```text
 [safe audit] scan cache hit (17m) — dependency evidence unchanged; --no-cache forces a fresh scan
@@ -197,7 +228,9 @@ does not capture.
 An entry is replayed only for the request that produced it. The stored envelope
 records the schema, key, machine, target, and mode, and every field is checked
 before replay; an entry belonging to another project, or written by a safe that
-scored verdicts differently, is a miss. A malformed entry never aborts the scan
+scored verdicts differently, is a miss. The key carries no version, so the
+schema is what retires stale semantics: 1.58.0 moved it to 2, and every entry
+written before it misses. A malformed entry never aborts the scan
 it was meant to accelerate — the failure mode of a cache must be slowness, not
 an error a caller reads as "the scan failed".
 
@@ -207,6 +240,20 @@ represented by the key. Nothing is cached when:
 - **govulncheck is involved at all.** It analyses `./...` — Go source, which no
   evidence hash covers. That holds even when it was merely absent, so
   installing it later is never masked by a replay of the run that lacked it.
+- **a composer audit answered from the installed tree.** `composer audit`
+  reads `vendor/composer/installed.json`, then drops every recorded package
+  whose install directory is absent. Two things therefore decide its answer
+  that no file hash can represent: the metadata bytes (a `vendor/` rebuilt
+  from another branch changes the verdict under an unchanged lock) and the
+  mere existence of each package directory (creating one empty directory
+  turned a clean result into one critical while every hashable byte stayed
+  identical). Keying that would mean reproducing every installer's
+  package-presence rules, so the lane is not replayable at all. Each
+  composer record carries the state that decided it — `installed`, `lock`, or
+  `none` — and only the last two are cacheable. **The cost is real**: a PHP
+  project with a vendor tree re-runs the dependency scan at every install
+  preflight. A project audited from its lock — a path package, a checkout
+  before its build — still replays.
 - **an ecosystem audit failed, was absent, or returned partial coverage**, or
   any of osv-scanner, syft and grype is in a non-ok state. Missing coverage is
   not a cacheable answer. (A deterministic `unsupported` record — npm audit
@@ -275,6 +322,12 @@ record with per-severity counts. Four rules govern that normalization:
   requirements files and one fails, the advisories the other one found are
   still counted. A failure in one target must not erase a critical found in
   another.
+- A scanner reporting **nothing to audit** is a clean result, not a breakage:
+  a `composer.json` with no dependencies makes `composer audit` exit 0 with an
+  empty stdout and `No packages - skipping audit.` on stderr. That is a
+  complete answer — zero advisories because there is nothing to look at — and
+  it is recorded as `ok` with the note `composer reported no packages to
+  audit`. Mirrors the osv-scanner `No package sources found` benign zero.
 
 A scanner that is **absent** does warn (its coverage is genuinely missing), and
 a scanner that **failed** warns and blocks caching. `pip-audit` audits every
@@ -294,6 +347,38 @@ A scanner that exited 0 but whose output could not be validated says exactly
 that (`output validation failed (scanner exit 0)`) rather than
 `failed (exit 0)`: the status is still `error`, but the note names the output
 as what broke instead of implying the tool did.
+
+`composer audit` reads the **installed** tree by default, and `--locked` reads
+the lock file instead — a different package set. safe audits the installed tree
+first, because a deployed checkout whose lock has drifted can carry an
+installed advisory the lock does not mention: against such a fixture the
+default run reported six advisories including one critical while `--locked`
+reported none.
+
+The lock file is used only when there is no installed tree to read. composer
+refuses that case outright (`No installed packages found ... pass --locked`) —
+every path package in a monorepo, every checkout audited before its build — and
+safe then reruns with `--locked` rather than reporting a broken scanner. The
+record's note says `audited composer.lock (no installed packages)`, because a
+lock-file audit and an installed-tree audit are not the same coverage. With no
+lock either, the refusal stays an `error`: nothing was audited.
+
+Each composer record also carries `evidence` — the state that decided its
+package set: `installed` when the installed tree answered, `lock` when the
+lock did, `none` when the project declares no dependencies. The
+[scan cache](#scan-cache---deps-only) reads it, and reads it strictly: a
+refusal raised while `vendor/composer/installed.json` exists was decided by
+which install directories are present, so that record is `installed` even
+though the lock produced the counts.
+
+Every audit record carries the **root it ran in** (`.root`, relative to the
+scan target; `.` is the target itself), on `.ecosystem_audits[]` and on
+`.audit_totals.ecosystem[]` alike. A monorepo runs the same scanner once per
+package, and without the root the report read as one scanner reported N times.
+The scan summary follows: the `ECOSYSTEM AUDITS:` line in the CVE block names
+each scanner once with its counts summed across the roots it ran in (and
+`across N roots` when that is more than one), while the detail block below
+prints one line per record, prefixed with its root.
 
 `safe audit machine-audit --allow-missing-tools` turns a missing ecosystem auditor from
 an abort into a reported gap. Callers that gate on the result document

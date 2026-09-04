@@ -3683,6 +3683,45 @@ case_gate_resolves_a_displaced_original() {
   pass "$FUNCNAME"
 }
 
+case_gate_marker_probe_is_nul_safe() {
+  # Every gated go/cargo/bun invocation ran the marker probe over an ELF
+  # binary, and bash printed `warning: command substitution: ignored null byte
+  # in input` to stderr each time (regression 1.56.0, #134). The probe must
+  # report "not a wrapper" for a binary AND say nothing at all while doing it.
+  prepare_case "gate-marker-probe-nul-safe"
+  local dir="${WORK_DIR}/nulbin"
+  mkdir -p "${dir}"
+  printf '#!/x\n\0\0ELF\0\n' > "${dir}/go"
+  chmod +x "${dir}/go"
+
+  local out="${WORK_DIR}/marker.out" err="${WORK_DIR}/marker.err"
+  PATH="${dir}:/usr/bin:/bin" GATE_LIB="${ROOT_DIR}/lib/gate-lib.sh" TOOLPATH="${dir}/go" \
+    bash -c 'set -euo pipefail; source "${GATE_LIB}"; safe_gate_wrapper_marker_tool "${TOOLPATH}"' \
+    > "${out}" 2> "${err}"
+  [[ ! -s "${out}" ]] || {
+    printf 'marker probe printed %s for a binary\n' "$(cat "${out}")" >&2
+    fail "$FUNCNAME"; return
+  }
+  [[ ! -s "${err}" ]] || {
+    printf 'marker probe wrote to stderr: %s\n' "$(cat "${err}")" >&2
+    fail "$FUNCNAME"; return
+  }
+
+  # The binary is still a resolvable delegate: the probe must not disqualify it.
+  local got
+  got="$(PATH="${dir}:/usr/bin:/bin" GATE_LIB="${ROOT_DIR}/lib/gate-lib.sh" \
+    bash -c 'source "${GATE_LIB}"; safe_gate_resolve_real go' 2>"${err}")"
+  [[ "${got}" == "${dir}/go" ]] || {
+    printf 'resolved to %s, expected %s\n' "${got:-<empty>}" "${dir}/go" >&2
+    fail "$FUNCNAME"; return
+  }
+  [[ ! -s "${err}" ]] || {
+    printf 'resolve_real wrote to stderr: %s\n' "$(cat "${err}")" >&2
+    fail "$FUNCNAME"; return
+  }
+  pass "$FUNCNAME"
+}
+
 case_gate_resolves_a_wrapped_mise_shim() {
   prepare_case "gate-resolves-wrapped-mise-shim"
   local bindir="${WORK_DIR}/gatebin" shimdir="${WORK_DIR}/miseshims"
@@ -6530,6 +6569,7 @@ main() {
     case_failed_wrapper_write_restores_the_displaced_binary \
     case_uninstall_restores_the_displaced_binary \
     case_gate_resolves_a_displaced_original \
+    case_gate_marker_probe_is_nul_safe \
     case_gate_resolves_a_wrapped_mise_shim \
     case_gate_exec_delegates_through_a_wrapped_mise_shim \
     case_gate_audit_leash_fits_component_budgets \

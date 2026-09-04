@@ -53,9 +53,50 @@ STUB
   chmod +x "$MOCKBIN/$tool"
 done
 
+# `composer` needs more than the shared stub: the cache policy branches on
+# WHICH state answered the audit, and composer decides that from the working
+# directory. This models the three real lanes — nothing declared, no readable
+# installed tree (refuse, and safe reruns with --locked), an installed tree
+# that answers — including composer's rule that a recorded package whose
+# install directory is absent is dropped from the repository.
+cat > "$MOCKBIN/composer" <<'STUB'
+#!/usr/bin/env bash
+printf 'composer
+' >> "${SCANNER_LOG:-/dev/null}"
+[[ -n "${MUTATE_TARGET:-}" && -f "${MUTATE_TARGET:-}" ]] && printf '
+' >> "$MUTATE_TARGET"
+if [[ " $* " == *" --locked "* ]]; then
+  printf '{"advisories":{}}
+'
+  exit 0
+fi
+if ! jq -e '((.require // {}) | length) > 0' composer.json >/dev/null 2>&1; then
+  printf 'No packages - skipping audit.
+' >&2
+  exit 0
+fi
+vendor="$(jq -r '.config["vendor-dir"] // "vendor"' composer.json 2>/dev/null || printf 'vendor')"
+[[ -n "$vendor" ]] || vendor="vendor"
+installed=0
+while IFS= read -r name; do
+  [[ -n "$name" ]] || continue
+  [[ -d "$vendor/$name" ]] && installed=1
+done < <(jq -r '.packages[]?.name // empty' "$vendor/composer/installed.json" 2>/dev/null)
+if (( installed == 0 )); then
+  printf 'No installed packages found. Please run "composer install" before running "audit" or pass "--locked" to audit the lock file.
+' >&2
+  exit 1
+fi
+printf '{"advisories":{}}
+'
+exit 0
+STUB
+chmod +x "$MOCKBIN/composer"
+
 CASE_DIR=""
 CASE_HOME=""
 CASE_PROJECT=""
+CASE_RESULT=""
 SCANNER_LOG=""
 OUT_FILE=""
 
@@ -393,6 +434,24 @@ case_schema_drift_falls_through() {
   pass "$FUNCNAME"
 }
 
+case_previous_schema_entry_misses() {
+  # The rollout property, not just the drift property: an entry minted by the
+  # PREVIOUS release under an otherwise valid key must miss. 1.58.0 changed
+  # what a result means — ecosystem records gained `root`, discovery started
+  # pruning nested repositories, and the composer lane changed which package
+  # set it audits — while the key carries no safe version, so without the
+  # schema bump a 1.57 result replays under 1.58 semantics. The live cache
+  # held 90 such entries, 7 inside the TTL.
+  prepare_case "previous-schema"
+  run_scan
+  run_scan
+  # A freshly written entry is at the current schema and hits.
+  assert_hit "$FUNCNAME" || return
+  # The same entry, minted by the previous schema, must not.
+  assert_miss_after_edit "$FUNCNAME" '._cache.schema = 1' || return
+  pass "$FUNCNAME"
+}
+
 case_malformed_timestamp_falls_through() {
   prepare_case "bad-timestamp"
   run_scan
@@ -638,6 +697,101 @@ STUB
   pass "$FUNCNAME"
 }
 
+# A composer fixture lives in these cases only: the shared prepare_case is
+# npm-shaped and other cases assert exact cache-entry counts against it.
+# composer_evidence reads the field the cache policy branches on.
+prepare_composer_case() {
+  local name="$1"
+  prepare_case "$name"
+  CASE_RESULT="$CASE_DIR/result.json"
+}
+
+composer_evidence() {
+  jq -r '.ecosystem_audits[] | select(.scanner == "composer-audit") | .evidence // "<absent>"' \
+    "$CASE_RESULT" 2>/dev/null
+}
+
+case_installed_tree_composer_result_is_never_cached() {
+  prepare_composer_case "composer-installed-uncacheable"
+  # An installed tree that answers: `composer audit` read vendor/, which no
+  # hash represents, so this result must never be filed.
+  printf '{"name":"demo/app","require":{"vendor/pkg":"^1.0"}}\n' > "$CASE_PROJECT/composer.json"
+  printf '{"content-hash":"c0ffee","packages":[]}\n' > "$CASE_PROJECT/composer.lock"
+  mkdir -p "$CASE_PROJECT/vendor/composer" "$CASE_PROJECT/vendor/vendor/pkg"
+  printf '{"packages":[{"name":"vendor/pkg","version":"1.0.0"}]}\n' \
+    > "$CASE_PROJECT/vendor/composer/installed.json"
+  run_scan --result-out "$CASE_RESULT"
+  [[ "$STATUS" -eq 0 ]] || { printf 'scan exited %s\n%s\n' "$STATUS" "$(cat "$OUT_FILE")" >&2; fail "$FUNCNAME"; return; }
+  [[ "$(composer_evidence)" == "installed" ]] || { printf 'evidence=%s\n' "$(composer_evidence)" >&2; fail "$FUNCNAME"; return; }
+  [[ "$(cache_entries)" -eq 0 ]] || { printf 'cached an installed-tree composer result\n' >&2; fail "$FUNCNAME"; return; }
+
+  # And the next scan is a real one, every time.
+  run_scan --result-out "$CASE_RESULT"
+  assert_no_hit "$FUNCNAME" || return
+  assert_scanners_ran "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_lock_fallback_composer_result_is_cached() {
+  prepare_composer_case "composer-lock-cacheable"
+  # No installed tree at all — a path package, or a checkout audited before
+  # its build. composer.lock answered and composer.lock is in the key.
+  printf '{"name":"demo/app","require":{"vendor/pkg":"^1.0"}}\n' > "$CASE_PROJECT/composer.json"
+  printf '{"content-hash":"c0ffee","packages":[]}\n' > "$CASE_PROJECT/composer.lock"
+  run_scan --result-out "$CASE_RESULT"
+  [[ "$(composer_evidence)" == "lock" ]] || { printf 'evidence=%s\n' "$(composer_evidence)" >&2; fail "$FUNCNAME"; return; }
+  [[ "$(cache_entries)" -eq 1 ]] || { printf 'expected 1 cache entry, got %s\n' "$(cache_entries)" >&2; fail "$FUNCNAME"; return; }
+
+  run_scan --result-out "$CASE_RESULT"
+  assert_hit "$FUNCNAME" || return
+  assert_no_scanners "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_dependency_free_composer_result_is_cached() {
+  prepare_composer_case "composer-none-cacheable"
+  # Nothing declared: composer audits nothing and says so. There is no unkeyed
+  # state behind that answer, so it replays like any other.
+  printf '{"name":"demo/app"}\n' > "$CASE_PROJECT/composer.json"
+  run_scan --result-out "$CASE_RESULT"
+  [[ "$(composer_evidence)" == "none" ]] || { printf 'evidence=%s\n' "$(composer_evidence)" >&2; fail "$FUNCNAME"; return; }
+  [[ "$(cache_entries)" -eq 1 ]] || { printf 'expected 1 cache entry, got %s\n' "$(cache_entries)" >&2; fail "$FUNCNAME"; return; }
+
+  run_scan --result-out "$CASE_RESULT"
+  assert_hit "$FUNCNAME" || return
+  assert_no_scanners "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_install_path_appearing_cannot_replay_a_stale_result() {
+  prepare_composer_case "composer-install-path"
+  # The shape review r3 blocked on. installed.json records a package whose
+  # install directory is absent, so composer empties its repository and the
+  # lock answers. Creating ONLY that directory changes the audited package set
+  # while installed.json, composer.lock and every other hashed byte stay
+  # identical — no key can see it. The record says `installed` because the
+  # installed tree decided the lane, so nothing was cached to replay.
+  printf '{"name":"demo/app","require":{"vendor/pkg":"^1.0"}}\n' > "$CASE_PROJECT/composer.json"
+  printf '{"content-hash":"c0ffee","packages":[]}\n' > "$CASE_PROJECT/composer.lock"
+  mkdir -p "$CASE_PROJECT/vendor/composer"
+  printf '{"packages":[{"name":"vendor/pkg","version":"1.0.0"}]}\n' \
+    > "$CASE_PROJECT/vendor/composer/installed.json"
+  local installed_sha
+  installed_sha="$(sha256sum < "$CASE_PROJECT/vendor/composer/installed.json")"
+  run_scan --result-out "$CASE_RESULT"
+  [[ "$(composer_evidence)" == "installed" ]] || { printf 'evidence=%s\n' "$(composer_evidence)" >&2; fail "$FUNCNAME"; return; }
+  [[ "$(cache_entries)" -eq 0 ]] || { printf 'cached a result the install paths decided\n' >&2; fail "$FUNCNAME"; return; }
+
+  mkdir -p "$CASE_PROJECT/vendor/vendor/pkg"
+  run_scan --result-out "$CASE_RESULT"
+  assert_no_hit "$FUNCNAME" || return
+  assert_scanners_ran "$FUNCNAME" || return
+  [[ "$(sha256sum < "$CASE_PROJECT/vendor/composer/installed.json")" == "$installed_sha" ]] \
+    || { printf 'installed.json moved; this case no longer isolates install-path state\n' >&2; fail "$FUNCNAME"; return; }
+  [[ "$(cache_entries)" -eq 0 ]] || { printf 'cached an installed-tree result after the path appeared\n' >&2; fail "$FUNCNAME"; return; }
+  pass "$FUNCNAME"
+}
+
 case_ecosystem_audit_counts_reach_the_totals() {
   prepare_case "audit-totals"
   run_scan
@@ -669,6 +823,7 @@ main() {
     case_no_evidence_is_not_cacheable \
     case_foreign_envelope_falls_through \
     case_schema_drift_falls_through \
+    case_previous_schema_entry_misses \
     case_malformed_timestamp_falls_through \
     case_invalid_verdict_falls_through \
     case_invalid_ttl_disables_cache \
@@ -680,6 +835,10 @@ main() {
     case_registry_config_is_part_of_the_key \
     case_scanner_set_change_invalidates \
     case_config_created_during_the_scan_is_not_cached \
+    case_installed_tree_composer_result_is_never_cached \
+    case_lock_fallback_composer_result_is_cached \
+    case_dependency_free_composer_result_is_cached \
+    case_install_path_appearing_cannot_replay_a_stale_result \
     case_ecosystem_audit_counts_reach_the_totals
   do
     "$case"
