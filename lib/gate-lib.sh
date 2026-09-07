@@ -2730,19 +2730,46 @@ safe_gate_install_is_interactive() {
   [[ -t 0 && -t 1 ]]
 }
 
+# host-allow records standing grants ONLY for npm and python (bin/safe-run).
+# For any other gated source ecosystem (cargo, go, composer) a grant is
+# impossible: safe-run would default the missing ecosystem to npm and mint a
+# phantom npm entry the operator never authorized (review F1). So [a] is offered
+# and accepted only for a grant-capable ecosystem, and the grant helper refuses
+# to record for anything else.
+safe_gate_ecosystem_grant_capable() {
+  case "$(safe_gate_canonical_eco "$1")" in
+    npm|python) return 0 ;;
+    *)          return 1 ;;
+  esac
+}
+
 safe_gate_confirm_warn() {
   local package="$1"
+  local ecosystem="$2"
   local reply
 
   safe_gate_err "safe: ${package} — safe audit returned WARN: a finding about the package (see the report above), not an audit-infrastructure outage."
-  printf 'safe: override deliberately? [y] install once  [a] install and allow future reinstalls  [N] cancel: ' >&2
+  if safe_gate_ecosystem_grant_capable "${ecosystem}"; then
+    printf 'safe: override deliberately? [y] install once  [a] install and allow future reinstalls  [N] cancel: ' >&2
+  else
+    printf 'safe: override deliberately? [y] install once  [N] cancel: ' >&2
+  fi
   if ! IFS= read -r reply </dev/tty; then
     return 1
   fi
   case "${reply}" in
-    y|Y|yes|YES)     printf 'once' ;;
-    a|A|allow|ALLOW) printf 'allow' ;;
-    *)               return 1 ;;
+    y|Y|yes|YES) printf 'once' ;;
+    a|A|allow|ALLOW)
+      # Only a real standing grant is possible for a grant-capable ecosystem;
+      # otherwise [a] was never offered, so treat a typed 'a' as a decline
+      # rather than silently installing without the grant the operator asked for.
+      if safe_gate_ecosystem_grant_capable "${ecosystem}"; then
+        printf 'allow'
+      else
+        return 1
+      fi
+      ;;
+    *) return 1 ;;
   esac
 }
 
@@ -2773,6 +2800,13 @@ safe_gate_warn_grant_host_allow() {
   local ecosystem="$2"
   local run_bin reason
 
+  # Belt-and-suspenders for F1: never mint a defaulted-npm grant for an
+  # ecosystem host-allow does not support. The confirm no longer offers [a]
+  # there, but a stray 'allow' must still never record cross-ecosystem trust.
+  if ! safe_gate_ecosystem_grant_capable "${ecosystem}"; then
+    safe_gate_err "safe: install proceeded; host-allow records standing grants only for npm and python, so none was recorded for ${package} (${ecosystem})."
+    return 0
+  fi
   if ! run_bin="$(safe_gate_resolve_run_bin)"; then
     safe_gate_err "safe: install proceeded, but safe-run was not found to record the host-allow grant; add it later: safe run host-allow add ${package} --reason \"...\""
     return 0
@@ -2854,7 +2888,7 @@ safe_gate_check() {
       fi
       if safe_gate_install_is_interactive; then
         local warn_choice=""
-        warn_choice="$(safe_gate_confirm_warn "${package}")" || warn_choice=""
+        warn_choice="$(safe_gate_confirm_warn "${package}" "${ecosystem}")" || warn_choice=""
         case "${warn_choice}" in
           once)
             safe_gate_audit_log "${ecosystem}" "${package}" "WARN_TTY_OVERRIDE"

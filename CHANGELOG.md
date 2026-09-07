@@ -12,8 +12,10 @@
   (`bin/safe`, `gate-lib`) now print the finding and offer the operator a
   deliberate choice: `[y]` install once, `[a]` install and also record a
   standing host-allow grant (so agents can reinstall it unattended — host-allow's
-  actual purpose), or `[N]` cancel. The `[a]` reason is canned (an acknowledgment,
-  not a justification — the operator never types one). Implements safe/AGENTS.md
+  actual purpose), or `[N]` cancel. `[a]` is offered only for npm/python — the
+  ecosystems host-allow supports; a cargo/go/composer grant would silently mint
+  a phantom npm entry, so those get `[y]`/`[N]` only. The `[a]` reason is canned
+  (an acknowledgment, not a justification — the operator never types one). Implements safe/AGENTS.md
   "Operator override is mandatory at every terminus" for the adverse-WARN gate.
   - **The agent path is unchanged.** A non-interactive shell (an agent, CI, or
     `mise upgrade` without `--raw`) still refuses with exit `100` and the
