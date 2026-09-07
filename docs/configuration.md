@@ -13,6 +13,8 @@ Unified config lives under:
   audit/
     machines.json
     tools.json
+    host-allow-digest.json
+    host-allow-digest.md
   install-wrappers.zsh
 ```
 

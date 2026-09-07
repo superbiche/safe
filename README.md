@@ -52,7 +52,7 @@ safe explain
 
 Refusals are agent-legible: they start with `safe: BLOCKED` or `safe run: BLOCKED`, name the reason plus the operator command that allows, and exit with dedicated policy codes (100–104). `safe explain` prints the full agent contract so coding agents surface blocks to the operator instead of bypassing them; see [`docs/agents.md`](docs/agents.md).
 
-`safe run` protects ad hoc package execution. `safe audit` scans projects, machines, releases, binaries, and IOCs. `safe install -g` audits npm packages, asks for confirmation, then delegates to `npm install -g` with flags preserved. Exact npm versions can be added to `safe run` host-allow after install with the trust prompt or `--trust-host`; `latest`, omitted versions, and ranges are never trusted. Use `--manager` or shortcuts such as `--yarn` and `--composer` to translate `-g` for other supported package managers. The install wrappers shadow package-manager install commands in zsh and call `safe audit` before delegation.
+`safe run` protects ad hoc package execution. `safe audit` scans projects, machines, releases, binaries, and IOCs. `safe install -g` audits npm packages, asks for confirmation, then delegates to `npm install -g` with flags preserved. Exact npm versions can be added to `safe run` host-allow after install with the trust prompt or `--trust-host`; `latest`, omitted versions, and ranges are never trusted. Use `--manager` or shortcuts such as `--yarn` and `--composer` to translate `-g` for other supported package managers. The install wrappers are PATH executables in `~/.local/bin` that shadow the real package managers in every shell and call `safe audit` before delegation.
 
 ## Requirements
 

@@ -514,13 +514,19 @@ written. Expired entries never decide a verdict: if the refresh fails, safe
 returns the live infrastructure WARN and may disclose the last complete score
 and its age as context.
 
-Verdicts and exit codes are unchanged for consumers:
+Verdicts and their exit codes:
 
 ```text
 GO    (exit 0)
 WARN  (exit 10)
 BLOCK (exit 20)
 ```
+
+A fourth code, **exit 30**, means the audit could not produce a verdict at all —
+audit-infrastructure breakage (the verdict engine is missing, version-skewed, or
+failed; or the evidence could not be assembled). It is not a package finding and
+carries no evidence about the package, so a consumer treats it as breakage-to-fix,
+never as a risk signal.
 
 ### Install gate mode
 
@@ -539,8 +545,14 @@ proceed:
 - **WARN** proceeds only when a pinned `host-allow` entry matches the
   **resolved** version, or when every WARN cause is listed in the opt-in
   `install.auto_allow_tolerate` config and no advisory affects the resolved
-  version. Otherwise it refuses (exit 10) with an actionable, always-pinned
-  hint — suggestions never use `@latest`.
+  version. Otherwise it refuses with an actionable, always-pinned hint —
+  suggestions never use `@latest`. The refusal code distinguishes the cause: a
+  WARN whose causes are **entirely** audit-infrastructure outages (Socket/OSV
+  unreachable) with no adverse package evidence exits **11** — a missing signal,
+  not a package finding — while any WARN carrying real package evidence exits
+  **10**. Plain `safe audit package-audit` exits 10 for both; only gate mode
+  distinguishes them, so the install gate can offer the operator a deliberate
+  per-instance override for exit 11 rather than a misleading host-allow vouch.
 - **BLOCK** refuses (exit 20) and points at operator review.
 
 A Socket scoring failure (missing CLI, auth, rate limit) is reported as an

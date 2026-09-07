@@ -35,7 +35,7 @@ directory holding the real package managers (a version-manager shim dir, for
 instance). Verify with:
 
 ```bash
-safe status   # wrappers: ok (11/11 installed in ~/.local/bin)
+safe status   # wrappers: ok (12/12 installed in ~/.local/bin)
 ```
 
 `~/.config/safe/install-wrappers.zsh` is a compatibility stub for existing
@@ -88,7 +88,7 @@ Flow:
 4. Only a passing gate proceeds.
 5. The real command runs through the first non-wrapper `npm` on PATH.
 
-Equivalent gate routing exists for pnpm, pnpx, yarn, bun, uv, pip, pip3, cargo, go, and composer (Volta is retired).
+Equivalent gate routing exists for pnpm, pnpx, yarn, bun, uv, pip, pip3, cargo, go, composer, and mise (Volta is retired).
 
 ## External Binary Review
 

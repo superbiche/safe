@@ -232,6 +232,7 @@ uv, pip, pip3
 cargo
 go
 composer
+mise
 ```
 
 They run package checks for explicit package installs and project scans for lockfile or manifest based project operations.

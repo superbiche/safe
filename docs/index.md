@@ -56,7 +56,7 @@ through the gate once that directory precedes the real tools on PATH:
 
 ```bash
 safe install -g cowsay@1.6.0
-safe status          # confirm: wrappers: ok (11/11 installed)
+safe status          # confirm: wrappers: ok (12/12 installed)
 npm install express  # gated by ~/.local/bin/npm -> safe gate npm
 ```
 
