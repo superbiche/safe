@@ -1,14 +1,59 @@
 version = 1
 
 [[bindings]]
+doc = "docs/agents.md"
+target = "docs/contract/agent-contract.json"
+sig = "3577e55b25b609de"
+
+[[bindings]]
+doc = "docs/agents.md"
+target = "scripts/render-contract.sh"
+sig = "bb00aa18e9045036"
+
+[[bindings]]
 doc = "docs/architecture.md"
 target = "docs/release-review.md"
 sig = "762a1fb5687c76ab"
 
 [[bindings]]
 doc = "docs/command-reference.md"
+target = "install.sh"
+sig = "56e44b0440c81eb3"
+
+[[bindings]]
+doc = "docs/command-reference.md"
 target = "lib/completions/_safe"
 sig = "d5ebd850ae7d3c4e"
+
+[[bindings]]
+doc = "docs/configuration.md"
+target = "bin/safe-audit"
+sig = "2b1a2a6deb2ffaef"
+
+[[bindings]]
+doc = "docs/configuration.md"
+target = "bin/safe-run"
+sig = "601590a99c675238"
+
+[[bindings]]
+doc = "docs/dependencies.md"
+target = "bin/safe-audit"
+sig = "2b1a2a6deb2ffaef"
+
+[[bindings]]
+doc = "docs/index.md"
+target = "install.sh"
+sig = "56e44b0440c81eb3"
+
+[[bindings]]
+doc = "docs/install-wrappers.md"
+target = "install.sh"
+sig = "56e44b0440c81eb3"
+
+[[bindings]]
+doc = "docs/install-wrappers.md"
+target = "lib/gate-lib.sh"
+sig = "e1966859b6fa0e3c"
 
 [[bindings]]
 doc = "docs/installation.md"
@@ -19,6 +64,16 @@ sig = "56e44b0440c81eb3"
 doc = "docs/installation.md"
 target = "uninstall.sh"
 sig = "5671727a27b08249"
+
+[[bindings]]
+doc = "docs/integration-flows.md"
+target = "install.sh"
+sig = "56e44b0440c81eb3"
+
+[[bindings]]
+doc = "docs/integration-flows.md"
+target = "lib/gate-lib.sh"
+sig = "e1966859b6fa0e3c"
 
 [[bindings]]
 doc = "docs/release-review.md"
@@ -34,6 +89,11 @@ sig = "9f1f871c63f6f3f1"
 doc = "docs/release-review.md"
 target = "internal/releasereview/spec.go#Spec"
 sig = "084d3a2364a61dca"
+
+[[bindings]]
+doc = "docs/safe-audit.md"
+target = "bin/safe-audit"
+sig = "2b1a2a6deb2ffaef"
 
 [[bindings]]
 doc = "docs/safe-audit.md"

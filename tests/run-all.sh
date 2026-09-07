@@ -30,6 +30,7 @@ SUITES=(
   tests/audit/release_review_forward.sh
   tests/audit/tempfile_hygiene.sh
   tests/contract/drift.sh
+  tests/contract/docs_drift.sh
   tests/contract/report_fp.sh
   tests/run/host_allow_review.sh
   tests/run/host_allow_export_import.sh

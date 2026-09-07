@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **The changelog is cut into dated per-version sections.** Releases
+  1.13.0–1.60.0 had accumulated un-sectioned under one `## Unreleased` block;
+  each now carries its own dated `## x.y.z - date` header. A pure
+  re-sectioning — no release note was reworded or dropped.
+- **Free-prose docs are now drift-gated.** Twelve new `drift.lock` bindings tie
+  the load-bearing docs (install-wrappers, configuration, integration-flows,
+  index, command-reference, safe-audit, dependencies, agents) to the code they
+  describe, and a new hard gate — `tests/contract/docs_drift.sh`, registered in
+  `tests/run-all.sh` — fails the aggregate suite when a bound doc goes stale or
+  a markdown link breaks. It is the enforceable twin of the fail-open
+  `.githooks/pre-commit` drift hook, and refuses to skip itself when `drift` is
+  absent under `SAFE_TEST_STRICT=1`.
+- **Docs refreshed to the shipped gate.** `mise` (the 12th gate tool, gated
+  since 1.56.0) is now listed across the wrapper and tool-family lists and the
+  `12/12` wrapper count; the exit-code enumerations gained `11` (infra-only gate
+  WARN), `30` (audit could not run), `101` (pin mismatch), `103` (invalid
+  package name) and the interactive adverse-/infra-WARN operator overrides; the
+  README wrapper model is corrected to PATH executables; the config tree lists
+  the machine-local host-allow review digest.
+
+## 1.60.0 - 2026-09-07
+
 - **An interactive operator install blocked on an adverse WARN now offers a
   direct at-the-terminal override instead of only the host-allow copy-paste**
   (1.60.0). Previously a WARN with a real finding about the package (low Socket
@@ -33,6 +55,8 @@
     child's stdio by default, so the gate sees no TTY and refuses (102/100).
     Run `mise upgrade --raw <spec>` for the interactive override to appear.
 
+## 1.59.0 - 2026-09-07
+
 - **An install blocked only because the audit infrastructure is down now offers
   a deliberate operator override instead of a misleading host-allow** (1.59.0).
   When Socket (or OSV) is unreachable, the package audits WARN with no finding
@@ -55,6 +79,8 @@
     `GATE_INFRA_WARN_CAUSES` and safe-run's `HOST_ALLOW_REVIEW_INFRA_CAUSES`
     must stay byte-identical (`tests/contract/drift.sh`), so both gates agree on
     what counts as an outage.
+
+## 1.58.0 - 2026-09-04
 
 - **A repository nested inside the scan target is no longer audited as part of
   it** (1.58.0). `repo-audit` walked into linked git worktrees and nested
@@ -148,6 +174,8 @@
   bytes stripped — so a binary can neither produce a warning nor pull megabytes
   of its first "line" into a shell variable.
 
+## 1.57.0 - 2026-09-01
+
 - **The weekly host-allow review digest is machine-local state now, not a note
   in the safe repo's inbox** (1.57.0). `--digest` wrote
   `inbox/<date>-safe-host-allow-digest.md` into the safe checkout, which was
@@ -176,6 +204,8 @@
     of waiting a week for the next review. A digest that is absent, unreadable,
     or never carried the entry is a no-op there; the digest is a convenience
     surface and can never fail a removal.
+
+## 1.56.0 - 2026-09-01
 
 - **Package installs reached through a mise shim were completely ungated, and
   now enter the gate** (1.56.0). mise's shims are symlinks to whatever `mise`
@@ -216,6 +246,8 @@
     forever. The loop is broken structurally; there is still no re-entry
     env-var, which would be a forgeable bypass.
 
+## 1.55.0 - 2026-08-31
+
 - **govulncheck coverage was structurally broken on every real Go project, and
   now works** (1.55.0). The lane validated `govulncheck -json` as NDJSON —
   split on newlines, every non-blank line must parse — but govulncheck emits a
@@ -236,6 +268,8 @@
     `<scanner> output validation failed (scanner exit 0)`; the status stays
     `error` and the nonzero-exit wording is unchanged. It applies to every
     ecosystem lane, since they share the renderer.
+
+## 1.54.0 - 2026-08-31
 
 - **The scanner cache is replaced atomically, so a concurrent scan can no
   longer refuse on scanners that are installed** (1.54.0). `safe audit`
@@ -286,6 +320,8 @@
     redirections left to right — so the failed open printed its own diagnostic
     to a still-live stderr before safe's refusal followed it. Silencing stderr
     first restores the single-final-line refusal contract.
+
+## 1.53.0 - 2026-08-31
 
 - **npm dedupe/prune: the lock-diff projection now mirrors the project's
   config and workspace state** (1.53.0). The projection resolved in a scratch
@@ -382,6 +418,8 @@
     depending on `file:./local-pkg` no longer refuses with a false "lock-diff
     projection failed".
 
+## 1.52.0 - 2026-08-30
+
 - **npm dedupe/prune: a partial node_modules no longer reifies packages the
   lock diff never saw** (1.52.0). The lock-diff gate audited the delta between
   the project's lockfile and the projected one, which is the whole story only
@@ -417,6 +455,9 @@
   over-audited rather than under-audited. Cost: on a partial tree these
   commands now run a projected project scan and a package audit per candidate
   where they previously delegated straight through.
+
+## 1.51.0 - 2026-08-30
+
 - **release-review `tuf`: the bootstrap mirror is served through a containment
   cage** (1.51.0). The `tuf` check serves the operator-supplied mirror to cosign
   over a loopback HTTP bridge, and that bridge used `http.Dir`, which follows
@@ -437,6 +478,9 @@
   resolves, since that path is the operator's declaration rather than
   mirror-supplied content. Defense-in-depth on an operator-supplied mirror; no
   legitimate mirror changes verdict.
+
+## 1.50.0 - 2026-08-30
+
 - **Trust stores are anchored to the canonical config root; an
   environment-redirected store can no longer grant escalation** (1.50.0).
   `SAFE_RUN_CONFIG_DIR` / `SAFE_CONFIG_DIR` relocate the config root — a
@@ -461,6 +505,8 @@
   hardening, not a hard boundary — `HOME` redirection remains a floor, and the
   non-forgeable operator check plus a root-owned store are tracked for the Go
   migration.
+
+## 1.49.0 - 2026-08-27
 
 - **`safe run` regains a real host-side unknown-package audit preflight**
   (1.49.0). PR #82 removed a sandboxed preflight that fetched an unpinned
@@ -497,6 +543,8 @@
   resolution, not npm's; and a grant-time rc-0 result without a corroborating
   GO warns as inconclusive rather than passing silently. Fibery #86.
 
+## 1.48.0 - 2026-08-27
+
 - **mise `-C`/`--cd` lane enters the target with physical `cd`** (1.48.0). The
   mise routing surface entered the caller's `-C`/`--cd` directory with a bare
   `cd` at both the audit lane (`safe_gate_mise_check_with_env`) and the
@@ -516,6 +564,8 @@
   and now closed. An ordinary route (whose logical and physical resolution are
   identical) is unaffected; only a route reaching through a symlinked `..`
   changes which directory is audited — now the one mise actually enters.
+
+## 1.47.0 - 2026-08-27
 
 - **release-review `vuln`: package/ecosystem scoping and compound-range
   parsing** (1.47.0). Two hardening fixes on the advisory check, grounded in
@@ -541,6 +591,9 @@
   shipped its field without the bump — 3 covers both). safe-core and the
   `safe audit capabilities` payload now advertise `spec_version: 3`; a consumer
   pinned to 2 is told to bump in lockstep rather than silently rejected mid-spec.
+
+## 1.46.0 - 2026-08-27
+
 - **release-review `release`: read the release history in small early-stopping
   pages, and accept an unsigned commit when the spec allows it** (1.46.0). Two
   live-usage fixes surfaced reviewing openai/codex. (1) The release-history
@@ -562,6 +615,8 @@
   plain `unsigned` reason; any other unverified state (`invalid`, a bad author
   email, an unknown key) still BLOCKs.
 
+## 1.45.0 - 2026-08-26
+
 - **release-review `vuln`: resolve an unreadable advisory range by its
   `patched_versions`, and compare the subject tag by its version core**
   (1.45.0). An advisory whose `vulnerable_version_range` this check cannot parse
@@ -580,6 +635,8 @@
   when neither range nor patched version can place the advisory it is still
   `version_mapping_ambiguous` and still fails closed.
 
+## 1.44.0 - 2026-08-26
+
 - **composer global scan enters selected projects with physical `cd`**
   (1.44.0). The global composer scan lane
   (`safe_gate_composer_scan_targets`) entered each selected project with a
@@ -594,6 +651,8 @@
   resolution are identical) is unaffected; only a route reaching through a
   symlinked `..` changes which directory is audited — now the one Composer
   actually enters.
+
+## 1.43.0 - 2026-08-26
 
 - **release-review `tuf`: physical containment of mirror reads against
   symlinked entries** (1.43.0). The `tuf` check already refused a `..`-bearing
@@ -611,6 +670,9 @@
   resolves normally, within the platform's symlink-resolution depth limit.
   Defense-in-depth on an operator-supplied mirror; no legitimate mirror changes
   verdict.
+
+## 1.42.0 - 2026-08-26
+
 - **Ranged install-gate: a primary-only host-allow pin no longer covers a
   warned sibling** (1.42.0). On a ranged/multi-version operation (e.g. `--op
   update` resolving two majors), the warn-cause list is a single aggregate with
@@ -628,6 +690,9 @@
   gate override; surfaced as proposal P1 during the 2026-08-14
   socket_not_found review (pre-existing on main, not introduced there). Adds a
   ranged gate/host-allow regression to `tests/audit/socket_tier.sh`.
+
+## 1.41.0 - 2026-08-26
+
 - **`safe audit` subprocess scratch is reclaimed, not left in `$TMPDIR`**
   (1.41.0). Several audit-path helpers created working files with a bare
   `mktemp`, which lands the file directly in `$TMPDIR` where the process-exit
@@ -639,6 +704,9 @@
   clean run leaves nothing behind. Observed live by the setup-new-machines
   release-review verification (scratch accumulating per candidate across a
   post-update sweep). Behavior-neutral to every verdict; hygiene only.
+
+## 1.40.0 - 2026-08-26
+
 - **`release-review` learns detached signature verification** (`spec_version`
   → 2, 1.40.0). The `signature` check now accepts a detached
   `certificate`+`signature` pair (the `<checksums>.pem` + `<checksums>.sig`
@@ -676,6 +744,8 @@
   with the feature; no bundle synthesis, and `--insecure-ignore-tlog` stays
   rejected).
 
+## 1.39.0 - 2026-08-25
+
 - **Scanner discovery and OSV coverage stop misreporting two benign states as
   breakage** (1.39.0). (1) A `tools.json` scanner cache that is empty (a
   truncated write) or otherwise not a JSON object no longer poisons every audit
@@ -695,6 +765,9 @@
   same positive stderr phrase `osv_probe_format_support` already trusts; a real
   crash prints a different error, so a future osv reword degrades safely to the
   conservative "failed" and never suppresses a real error.
+
+## 1.38.0 - 2026-08-25
+
 - **`release-review` hardens three input paths against traversal, mis-mounting,
   and byte-order-decided verdicts** (defense-in-depth, no change to a verdict on
   any legitimate input). (1) A TUF trust target name that is absolute or carries
@@ -711,6 +784,8 @@
   `internal/strictjson` check; the evidence document is machine-assembled, so (3)
   is belt-and-suspenders.
 
+## 1.37.0 - 2026-08-25
+
 - **A non-interactive install gate now fails closed when the project audit
   cannot run.** The install preflight (`safe_gate_scan_project`) already refused
   critical findings in a non-TTY shell (exit 102); a scan that failed *outright*
@@ -723,6 +798,8 @@
   is the missing-scanner / outright-failure path only; the sibling no-verdict
   sites (an unwritable result destination, or a scan that exits 0 with an
   unreadable document) still warn-and-proceed and are parked to the audit lane.
+
+## 1.36.0 - 2026-08-25
 
 - **`safe run host-allow export` / `import` replicate a reviewed allow set to a
   fresh machine.** The host-allow set is per-machine by design, so bringing up a
@@ -740,6 +817,8 @@
   and preserves each grant's original date. The allow set is deliberately not
   auto-synced between machines — import keeps the human review in the loop.
 
+## 1.35.0 - 2026-08-25
+
 - **JVM/Maven dependencies are now OSV-covered, without command-gating.** `safe
   audit repo-audit` sweeps `pom.xml` and `gradle.lockfile` through OSV like any
   other lockfile, and `safe audit package-audit --ecosystem Maven <group:artifact>@<version>`
@@ -753,6 +832,8 @@
   tier` skip — never a false GO, and never an infrastructure-outage signal. A
   qualified Maven version OSV cannot range-match (`1.0.0.RELEASE`) resolves to a
   WARN with a pin-hint rather than a silent pass.
+
+## 1.34.0 - 2026-08-25
 
 - **The six `binary-audit` bash sub-lanes are deleted; `release-review` is the
   one binary-audit command.** `safe audit binary-audit release github`,
@@ -771,6 +852,8 @@
   froze the bash version comparator before its deletion
   (`version_test.go`). No release verdict changes.
 
+## 1.33.0 - 2026-08-25
+
 - **`release-review` now pins `GITHUB_TOKEN` to the base URL's origin and puts a
   deadline on its `cosign` subprocesses.** The `release` and `vuln` checks make
   two of their requests to absolute URLs GitHub itself returns — a `Link`
@@ -788,6 +871,8 @@
   review failing to run, not a finding about the release. Both are deliberate
   divergences from the bash sub-lanes (ledger entries 14 and 15) and carry Go
   regression tests. No verdict on any well-formed release changes.
+
+## 1.32.0 - 2026-08-24
 
 - **`release-review`'s version comparison now cuts file suffixes with gnulib's
   actual forward-scan `file_prefixlen`.** The earlier port used a backward scan
@@ -867,6 +952,8 @@
   `GITHUB_TOKEN`, when set, is sent as an `Authorization` header and reaches
   nothing else — no URL, no report, no reason, no error message.
 
+## 1.31.0 - 2026-08-24
+
 - **`release-review` implements `signature`, `tuf` and `exec`, and can now
   return a top-level `GO`.** Four of the six checks are live; `release` and
   `vuln` remain schema-only and refused if enabled, and the composite stays
@@ -898,6 +985,8 @@
   with SIGTERM and a 5s kill delay). `docs/release-review.md` carries the new
   reason taxonomy per check and a full divergence ledger.
 
+## 1.30.0 - 2026-08-24
+
 - **`safe audit binary-audit release-review --spec PATH` reviews a whole
   release from one spec and emits one report.** Judging a release meant running
   the six `binary-audit` sub-commands in sequence and stitching their JSON
@@ -928,6 +1017,8 @@
   for an unnamed asset; a multi-entry one reports "no entry" instead of
   mislabeling it as a mismatch).
 
+## 1.29.0 - 2026-08-21
+
 - **`verify sigstore-bundle` accepts `--identity-regexp` as an alternative to
   the exact `--identity`.** GitHub attestation-style per-asset bundles — the
   shape openai/codex publishes — are signed by a tag-bound workflow identity
@@ -943,6 +1034,8 @@
   given is what the JSON payload reports (`expected_identity` and
   `expected_identity_regexp`, each null when unset).
 
+## 1.28.0 - 2026-08-15
+
 - **The Socket cache location is now a first-class config knob.** The cache root
   was resolvable only via `SAFE_AUDIT_SOCKET_CACHE_DIR`, an env var the docs
   framed as test-only, even though relocating the cache to a shared/synced path
@@ -955,6 +1048,8 @@
   entries are per-package JSON keyed by purl (no secrets), atomically written,
   and TTL-bounded, which is what makes a synced cache dir safe to share across
   trusted machines.
+
+## 1.27.0 - 2026-08-14
 
 - **Socket "no record of this package" is no longer conflated with a Socket
   outage.** A package Socket has never scored (a 404/`not_found`) produced the
@@ -973,6 +1068,8 @@
   data, not a structural ecosystem gap, so an indexed module still gets its real
   behavioral score.
 
+## 1.26.0 - 2026-08-14
+
 - **Non-global Composer installs honor `--working-dir`/`-d` when scanning.** A
   non-global `composer install`/`update`/`require`/`reinstall` — and a
   package-less `create-project` — run with an effective working directory
@@ -990,6 +1087,8 @@
   effective directory is also threaded to safe-audit as `--project-dir`, closing
   the same gap for the glued `-d<dir>` form. The leading glued form
   (`composer -d<dir> install`) stays fail-closed as before.
+
+## 1.25.0 - 2026-08-13
 
 - **Composer `reinstall` and `create-project` are now gated.** Both fetch remote
   artifacts but were recognized-but-passthrough. `reinstall` re-fetches the
@@ -1014,6 +1113,8 @@
   with a canonical spelling instead of passing through unaudited — closing a
   bypass where Symfony would expand the prefix and fetch before the gate saw it.
 
+## 1.24.0 - 2026-08-13
+
 - **`safe doctor`'s mise-shim warning is now actionable.** When mise shims are
   bound to the gate wrapper, doctor printed "repoint the shims at the real mise
   binary" — whose obvious execution, a bare `mise reshim`, rebinds them to the
@@ -1022,6 +1123,9 @@
   dir from `PATH` for the reshim, so mise relinks the shims to the real binary.
   The gate bin dir is exposed in `safe doctor --json` under
   `environment.install_wrappers.bin_root`.
+
+## 1.23.0 - 2026-08-13
+
 - **`safe doctor` now reports the ecosystem auditors it was blind to.**
   `govulncheck`, `pip-audit`, `cargo-audit`, and `composer` are needed only
   when a project of that ecosystem is audited, so doctor never listed them —
@@ -1031,6 +1135,9 @@
   `--json` under `features.ecosystem_auditors`. They are deliberately NOT
   missing prerequisites: a machine that never touches Go does not owe
   `govulncheck`, and a `repo-audit` that needs one already WARNs and names it.
+
+## 1.22.0 - 2026-08-13
+
 - **A partly-failed ecosystem audit no longer hard-refuses the install.** The
   project gate classed a scanner as broken infrastructure by matching
   `/fail|error/` against its free-form note, so a `pip-audit` that covered
@@ -1050,6 +1157,8 @@
   while the note-regex still caught "failed" — would otherwise have let a real
   syft execution failure pass under `--yes` once the regex was gone.
 
+## 1.21.0 - 2026-08-13
+
 - **Removed a latent typosquat vector: the sandboxed audit "preflight."**
   `safe run` built an audit command as `npx --yes safe-audit package-audit …`
   inside a Podman sandbox — an unpinned fetch of a public npm package named
@@ -1068,6 +1177,8 @@
   matching `block add`. (The audit-gated affordance where a clean verdict let
   you skip the reason only ever worked against a mocked audit; restoring it
   the honest way — auditing on the host — is tracked for a follow-up.)
+
+## 1.20.0 - 2026-08-13
 
 - **Fixed — a Go repo lost its entire OSV tier, silently.** Discovery handed
   osv-scanner `go.sum`, which its Go extractor has never read (it reads
@@ -1105,6 +1216,8 @@
   before it costs a scan. This defect shipped in an osv-scanner release and was
   caught by a user, not by a check.
 
+## 1.19.0 - 2026-08-12
+
 - **Breaking — `safe audit` subcommands renamed to four narrow surfaces.**
   `check` → `package-audit`, `scan --project <path>` → `repo-audit [<path>]`,
   `scan` → `machine-audit`, and `binary`/`verify`/`release`/`vuln` → subverbs
@@ -1125,14 +1238,6 @@
   rather than `--project`, and rejects `--all`/`--machine` with a message
   naming `machine-audit`.
 
-- The verdict decision now lives in Go (`internal/verdict`, exposed as
-  `safe-core package-verdict`). `bin/safe-audit` still gathers all evidence —
-  version resolution, Socket scoring, OSV classification, release age,
-  registry trust, blocklist state — and advisory classification stays in bash
-  because it needs semver range matching. Only the decision moved, so there is
-  one implementation of the policy rather than a bash copy that drifts. No
-  verdict changes: the existing 338 golden cases pass unmodified.
-
 - `safe audit package-audit` exits **30** when it could not produce a verdict at all —
   the verdict engine is missing, version-skewed, or failed, or the evidence
   could not be assembled. Previously this shared exit 20 with a genuine BLOCK,
@@ -1142,11 +1247,23 @@
   breakage rather than offering an allow entry. `docs/contract/agent-contract.json`
   documents the new code.
 
+## 1.18.0 - 2026-08-12
+
+- The verdict decision now lives in Go (`internal/verdict`, exposed as
+  `safe-core package-verdict`). `bin/safe-audit` still gathers all evidence —
+  version resolution, Socket scoring, OSV classification, release age,
+  registry trust, blocklist state — and advisory classification stays in bash
+  because it needs semver range matching. Only the decision moved, so there is
+  one implementation of the policy rather than a bash copy that drifts. No
+  verdict changes: the existing 338 golden cases pass unmodified.
+
 - `safe-core` is now required for every audit, not just `npm dedupe`/`prune`.
   A missing or version-skewed `safe-core` refuses as audit-infrastructure
   breakage with a "rerun install.sh" recovery path, never as a package
   finding, and never as a verdict. `install.sh` already rebuilds and
   reinstalls `safe-core` on every run, and `safe doctor` already reports skew.
+
+## 1.17.0 - 2026-08-12
 
 - `install.socket.mode=never` no longer produces a clean GO on its own. Since
   Socket became the only behavioral tier, a check that skips it has gathered
@@ -1156,6 +1273,8 @@
   timeout. Operators who want that posture routinely can add `socket_disabled`
   to `install.auto_allow_tolerate`, which passes the gate and records
   `WARN_TOLERATED` rather than `GO`.
+
+## 1.16.0 - 2026-08-12
 
 - GuardDog has been removed from the install gate. Socket is now the primary
   behavioral tier for every check unless `install.socket.mode=never` is set.
@@ -1172,6 +1291,8 @@
   error bodies are classified into fixed reason codes and their text is
   discarded — provider responses can carry account context and never reach a
   receipt, cache, or terminal.
+
+## 1.15.0 - 2026-08-12
 
 - npm gate routing covers install, update, ci, exec, and lock-diff aliases and
   abbreviations before delegation. It uses a checked-in full command/alias
@@ -1190,6 +1311,8 @@
   selection can bypass audit. Require option values never become package
   operands. Original tokens remain unchanged on every delegated path.
 
+## 1.14.0 - 2026-08-11
+
 - Fresh releases whose initial Socket score times out now receive one bounded
   patience retry (`install.socket.fresh_scan_budget_seconds`, default 90s).
   If Socket still has no score, receipts record `PENDING`; a clean OSV and
@@ -1202,6 +1325,8 @@
   scratch files instead of passing it through jq arguments, preventing
   `E2BIG` from disabling the cooldown security-fix waiver for large advisory
   histories.
+
+## 1.13.0 - 2026-08-11
 
 - `safe run <tool> [args...]` now silently delegates a bare wrapped tool name
   (for example `npm` or `go`) to its verified PATH gate wrapper, so the normal

@@ -5,7 +5,7 @@ interactive zsh, `bash -c`, Makefile recipes, CI steps, and agent harnesses
 alike. They are executables on PATH, installed by `install.sh` at:
 
 ```text
-~/.local/bin/{npm,pnpm,pnpx,yarn,bun,pip,pip3,uv,cargo,go,composer}
+~/.local/bin/{npm,pnpm,pnpx,yarn,bun,pip,pip3,uv,cargo,go,composer,mise}
 ```
 
 Each one is a three-line shim:
@@ -309,9 +309,20 @@ safe: BLOCKED <tool> <action> — <reason>; to allow: <operator command>; detail
 ```
 
 Refusals exit with dedicated codes so callers can distinguish a policy block
-from a missing binary (127): `100` policy block, `102` interactive operator
-confirmation required, `104` `safe audit` BLOCK verdict. See the
+from a missing binary (127): `100` policy block, `101` host-allow version pin
+mismatch, `102` interactive operator confirmation required (non-TTY refusal),
+`103` invalid package name, `104` `safe audit` BLOCK verdict. See the
 [Agent Contract](agents.md) page and `safe explain`.
+
+At an interactive terminal a gate WARN is not a dead end: the gate offers the
+operator a deliberate override rather than only the host-allow copy-paste. An
+infra-only WARN (every cause an audit-infrastructure outage — gate exit `11`)
+prompts a one-shot confirmation; an adverse WARN (a real package finding)
+prints it and offers `[y]` install once / `[a]` install and record a standing
+host-allow grant (npm/python only) / `[N]` cancel. The override reads
+`/dev/tty`, never stdin, so a non-interactive caller (agent, CI, `mise upgrade`
+without `--raw`) always refuses with the hint instead — `--yes` cannot reach
+it. See the [Agent Contract](agents.md).
 
 ## Snapshot-stripped shells are no longer a special case
 
