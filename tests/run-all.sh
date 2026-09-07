@@ -17,6 +17,7 @@ SUITES=(
   tests/live/composer_abbrev_oracle.sh
   tests/live/shim_delegation.sh
   tests/install/run.sh
+  tests/install/gate_adverse_warn_override.sh
   tests/audit/check_version_aware.sh
   tests/audit/socket_tier.sh
   tests/audit/smoke.sh

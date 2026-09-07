@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- **An interactive operator install blocked on an adverse WARN now offers a
+  direct at-the-terminal override instead of only the host-allow copy-paste**
+  (1.60.0). Previously a WARN with a real finding about the package (low Socket
+  score, a critical/high alert, an unclassifiable alert, an affecting advisory)
+  dead-ended at "to allow: ask the operator to run: safe run host-allow add …" —
+  a copy-paste-a-command-with-a-placeholder-reason-and-retry hoop, with no
+  override lane at the terminal. At an interactive terminal the install gates
+  (`bin/safe`, `gate-lib`) now print the finding and offer the operator a
+  deliberate choice: `[y]` install once, `[a]` install and also record a
+  standing host-allow grant (so agents can reinstall it unattended — host-allow's
+  actual purpose), or `[N]` cancel. `[a]` is offered only for npm/python — the
+  ecosystems host-allow supports; a cargo/go/composer grant would silently mint
+  a phantom npm entry, so those get `[y]`/`[N]` only. The `[a]` reason is canned
+  (an acknowledgment, not a justification — the operator never types one). Implements safe/AGENTS.md
+  "Operator override is mandatory at every terminus" for the adverse-WARN gate.
+  - **The agent path is unchanged.** A non-interactive shell (an agent, CI, or
+    `mise upgrade` without `--raw`) still refuses with exit `100` and the
+    host-allow hint — an agent asking the operator to pre-authorize a package is
+    exactly what host-allow is for. `--yes` never reaches the override (it reads
+    `/dev/tty`, never stdin), so an agent cannot turn a WARN into an install on
+    its own — no silent auto-pass.
+  - **`[a]` on an adverse WARN re-confirms once.** `safe run host-allow add`
+    re-audits host-side and, because the finding is real, asks a second `[y/N]`:
+    granting *host-execution* trust to a flagged package is a bigger step than a
+    one-time install and earns its own deliberate confirm. The infra override
+    (exit 11) is unchanged and never offers `[a]` (a host-allow entry must not
+    vouch for a non-event).
+  - **`mise upgrade` needs `--raw` to reach the prompt.** mise captures the
+    child's stdio by default, so the gate sees no TTY and refuses (102/100).
+    Run `mise upgrade --raw <spec>` for the interactive override to appear.
+
 - **An install blocked only because the audit infrastructure is down now offers
   a deliberate operator override instead of a misleading host-allow** (1.59.0).
   When Socket (or OSV) is unreachable, the package audits WARN with no finding
