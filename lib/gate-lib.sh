@@ -2714,6 +2714,81 @@ safe_gate_confirm_infra() {
   [[ "${reply}" == "y" || "${reply}" == "Y" || "${reply}" == "yes" || "${reply}" == "YES" ]]
 }
 
+# Deliberate per-instance override for an ADVERSE WARN (a finding ABOUT the
+# package, exit 10) on the wrapper path. The per-scanner report is already on
+# stderr; this asks the operator to override it consciously. Echoes the chosen
+# token (once|allow) to stdout; a decline or an unreadable tty echoes nothing and
+# returns non-zero. Reads /dev/tty, never stdin (the wrapped tool owns stdin) and
+# is reached only after the caller confirmed a TTY — so --yes can never satisfy
+# it (no silent auto-pass, terminus ruling). Unlike the infra override (exit 11),
+# an adverse WARN offers [a]: recording a host-allow grant here is a genuine
+# operator vouch for a real finding, not a vouch for a non-event.
+# The gate is interactive when both stdin and stdout are a terminal. Factored
+# out so the exit-10 override routing is unit-testable by stubbing it (the
+# confirm helpers read /dev/tty, which no non-pty test can drive).
+safe_gate_install_is_interactive() {
+  [[ -t 0 && -t 1 ]]
+}
+
+safe_gate_confirm_warn() {
+  local package="$1"
+  local reply
+
+  safe_gate_err "safe: ${package} — safe audit returned WARN: a finding about the package (see the report above), not an audit-infrastructure outage."
+  printf 'safe: override deliberately? [y] install once  [a] install and allow future reinstalls  [N] cancel: ' >&2
+  if ! IFS= read -r reply </dev/tty; then
+    return 1
+  fi
+  case "${reply}" in
+    y|Y|yes|YES)     printf 'once' ;;
+    a|A|allow|ALLOW) printf 'allow' ;;
+    *)               return 1 ;;
+  esac
+}
+
+# Resolve safe-run for the [a] grant sub-call, mirroring safe_gate_resolve_audit_bin.
+safe_gate_resolve_run_bin() {
+  if [[ -n "${SAFE_RUN_BIN:-}" && -x "${SAFE_RUN_BIN}" ]]; then
+    printf '%s\n' "${SAFE_RUN_BIN}"
+    return 0
+  fi
+  if [[ -n "${SAFE_RUN_PATH:-}" && -x "${SAFE_RUN_PATH}" ]]; then
+    printf '%s\n' "${SAFE_RUN_PATH}"
+    return 0
+  fi
+  local found
+  found="$(command -v safe-run 2>/dev/null || true)"
+  [[ -n "$found" ]] || return 1
+  printf '%s\n' "$found"
+}
+
+# The operator chose [a]: also record a standing host-allow grant so agents can
+# reinstall unattended. The reason is an acknowledgment, not a justification
+# (operator ruling 2026-09-07) — canned, never typed. safe-run host-allow add
+# re-audits host-side (a host-execution trust escalation earns its own confirm on
+# an adverse finding); the grant is best-effort — if it does not land, the install
+# still proceeded, so this surfaces the miss, never aborts.
+safe_gate_warn_grant_host_allow() {
+  local package="$1"
+  local ecosystem="$2"
+  local run_bin reason
+
+  if ! run_bin="$(safe_gate_resolve_run_bin)"; then
+    safe_gate_err "safe: install proceeded, but safe-run was not found to record the host-allow grant; add it later: safe run host-allow add ${package} --reason \"...\""
+    return 0
+  fi
+  reason="operator override at the install gate ($(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u))"
+  local -a cmd=("${run_bin}" host-allow add "${package}" --reason "${reason}")
+  case "$(safe_gate_canonical_eco "${ecosystem}")" in
+    python) cmd+=(--ecosystem python) ;;
+  esac
+  if "${cmd[@]}"; then
+    safe_gate_err "safe: recorded a host-allow grant for ${package} (future reinstalls permitted)"
+  else
+    safe_gate_err "safe: install proceeded, but the host-allow grant was not recorded; add it later: safe run host-allow add ${package} --reason \"...\""
+  fi
+}
+
 safe_gate_allow_hint() {
   local package="$1"
   local ecosystem="$2"
@@ -2763,10 +2838,39 @@ safe_gate_check() {
       return 0
       ;;
     1|10)
+      # Adverse WARN: a finding ABOUT the package (the per-scanner report was
+      # printed above), not an audit-infra outage. Operator override is mandatory
+      # at every terminus (safe/AGENTS.md, 2026-09-07): at an interactive terminal
+      # the operator overrides deliberately — [y] once, or [a] also record a
+      # standing host-allow grant (agents reinstall unattended). Non-interactively
+      # this stays a refusal with the host-allow hint — the agent asks the operator
+      # to pre-authorize, exactly host-allow's purpose (operator ruling: leave the
+      # agent path as-is). A pre-existing exact host-allow entry is honored first
+      # (a prior deliberate grant, not a suggestion made here).
       if safe_gate_host_allow_matches "${package}" "${ecosystem}"; then
         safe_gate_err "safe install: safe audit warned for ${package}; exact host-allow entry permits install"
         safe_gate_audit_log "${ecosystem}" "${package}" "HOST_ALLOW_OVERRIDE"
         return 0
+      fi
+      if safe_gate_install_is_interactive; then
+        local warn_choice=""
+        warn_choice="$(safe_gate_confirm_warn "${package}")" || warn_choice=""
+        case "${warn_choice}" in
+          once)
+            safe_gate_audit_log "${ecosystem}" "${package}" "WARN_TTY_OVERRIDE"
+            return 0
+            ;;
+          allow)
+            safe_gate_audit_log "${ecosystem}" "${package}" "WARN_TTY_OVERRIDE_ALLOW"
+            safe_gate_warn_grant_host_allow "${package}" "${ecosystem}"
+            return 0
+            ;;
+          *)
+            safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — safe audit verdict WARN and you declined the override; details: safe explain"
+            safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_WARN_DECLINED"
+            return 100
+            ;;
+        esac
       fi
       safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — safe audit verdict WARN; $(safe_gate_allow_hint "${package}" "${ecosystem}"); details: safe explain"
       safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_WARN"
