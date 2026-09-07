@@ -272,7 +272,14 @@ func socketStage(ev Evidence, d *decision, res *Result) {
 		case "unmapped":
 			res.Lines.Socket = "WARN (critical alert in a category safe cannot classify — treated as unresolved, not clean)"
 			res.SocketDetail = "unclassifiable critical alert category"
-			d.warn("socket_error")
+			// An unclassifiable CRITICAL alert is adverse evidence about the
+			// package, not an infrastructure outage — it must carry its own
+			// cause, never socket_error. The install gate's infra-only override
+			// (gate exit 11) keys on the audit-infra cause set; folding an
+			// adverse alert into socket_error let a critical Socket signal reach
+			// that operator-overridable path and print "infrastructure failure,
+			// NOT a package finding" (review F1, 2026-09-07).
+			d.warn("socket_unmapped")
 		case "critical_cve":
 			res.Lines.Socket = "WARN (critical vulnerability alert)"
 			d.warn("socket_critical_cve")
@@ -311,7 +318,8 @@ func socketSiblingStage(ev Evidence, d *decision, res *Result) {
 			d.block("socket_malware")
 		case "unmapped":
 			res.Lines.Socket += fmt.Sprintf("; WARN %s (unclassifiable critical alert)", sib.Version)
-			d.warn("socket_error")
+			// Adverse, not an outage — its own cause, never socket_error (F1).
+			d.warn("socket_unmapped")
 		case "critical_cve":
 			res.Lines.Socket += fmt.Sprintf("; WARN %s (critical vulnerability alert)", sib.Version)
 			d.warn("socket_critical_cve")

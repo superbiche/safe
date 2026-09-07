@@ -8770,11 +8770,12 @@ gate_emit_refusal_hints() {
   # pin that can never match (Fibery #106); the tolerate/review lanes remain.
   local cause has_socket_infra=0 has_unresolved=0 has_affecting=0 has_osv_down=0
   local has_low_score=0 has_socket_high=0 has_socket_critical_cve=0 has_socket_malware=0
-  local has_socket_disabled=0 has_socket_not_found=0
+  local has_socket_disabled=0 has_socket_not_found=0 has_socket_unmapped=0
   local has_custom_source=0 has_malware=0 has_too_new=0
   for cause in "${causes[@]}"; do
     case "$cause" in
       socket_unavailable|socket_auth_failed|socket_rate_limited|socket_error) has_socket_infra=1 ;;
+      socket_unmapped) has_socket_unmapped=1 ;;
       socket_not_found) has_socket_not_found=1 ;;
       socket_low_score) has_low_score=1 ;;
       socket_high_alert) has_socket_high=1 ;;
@@ -8811,6 +8812,9 @@ gate_emit_refusal_hints() {
   fi
   if (( has_socket_malware )); then
     printf 'safe audit: Socket reports a critical supply-chain-risk alert — do not install or pin around it; operator review only\n' >&2
+  fi
+  if (( has_socket_unmapped )); then
+    printf 'safe audit: Socket reports a CRITICAL alert in a category safe cannot classify — treated as unresolved (adverse), NOT an infrastructure outage; operator review, or pin the exact version with host-allow if you accept it\n' >&2
   fi
   if (( has_socket_disabled )); then
     if [[ "$ecosystem" == "java" ]]; then

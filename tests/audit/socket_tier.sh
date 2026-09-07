@@ -383,8 +383,24 @@ expect_json '.socket.status == "pending" and .verdict == "GO"' 'pending Socket s
 prepare_case unknown-category
 run_check unknown-category
 expect_rc 10 'unclassifiable critical alert warns instead of passing'
-expect_json '.warn_causes | index("socket_error") != null' 'unclassifiable critical alert is an unresolved result'
+expect_json '.warn_causes | index("socket_unmapped") != null' 'unclassifiable critical alert is an unresolved result'
+expect_json '.warn_causes | index("socket_error") == null' 'an unclassifiable critical alert is never conflated with an infra outage'
 expect_json '.verdict == "WARN"' 'unclassifiable critical alert never reaches GO'
+
+# F1 (review 2026-09-07): an unclassifiable CRITICAL Socket alert is ADVERSE
+# evidence, not an infra outage — at the install gate it must stay exit 10 (its
+# host-allow/review path), NEVER the infra-only TTY override (exit 11), and must
+# NOT print "infrastructure failure". socket_unmapped keeps it out of the infra
+# cause set that routes to 11.
+prepare_case unknown-category-gate
+run_check unknown-category --gate install --op install
+expect_rc 10 'an unclassifiable critical alert is NOT the infra-only override (10, not 11)'
+expect_json '.warn_causes | index("socket_unmapped") != null' 'the gated unmapped alert carries socket_unmapped'
+if grep -q 'infrastructure failure' "$CASE_ERR"; then
+  fail 'an unmapped critical alert must not read as infrastructure failure'
+else
+  pass 'an unmapped critical alert must not read as infrastructure failure'
+fi
 
 # --- every resolved version is scored, not just the primary (review F1) -----
 # Two project constraints resolve to two installable versions. The primary is

@@ -75,7 +75,7 @@ func TestSocketClassMapping(t *testing.T) {
 		cause   string
 	}{
 		{"malware", BLOCK, "socket_malware"},
-		{"unmapped", WARN, "socket_error"},
+		{"unmapped", WARN, "socket_unmapped"},
 		{"critical_cve", WARN, "socket_critical_cve"},
 		{"high", WARN, "socket_high_alert"},
 		{"low_score", WARN, "socket_low_score"},
@@ -118,6 +118,25 @@ func TestUnscorableSiblingIsNotAssumedClean(t *testing.T) {
 	}
 	if !hasCause(got.Causes, "socket_error") {
 		t.Fatalf("causes = %v, want socket_error", got.Causes)
+	}
+}
+
+// An unmapped sibling is a critical alert safe cannot classify — adverse
+// evidence, not an outage. It must carry socket_unmapped, never socket_error,
+// so the install gate's infra-only override cannot treat a critical Socket
+// signal on a ranged sibling as an audit-infrastructure outage (F1).
+func TestUnmappedSiblingIsNotAnOutage(t *testing.T) {
+	ev := clean()
+	ev.SocketSiblings = []SocketSibling{{Version: "2.5.0", Status: "ok", Class: "unmapped"}}
+	got := Decide(ev)
+	if got.Verdict != WARN {
+		t.Fatalf("verdict = %q, want WARN", got.Verdict)
+	}
+	if !hasCause(got.Causes, "socket_unmapped") {
+		t.Fatalf("causes = %v, want socket_unmapped", got.Causes)
+	}
+	if hasCause(got.Causes, "socket_error") {
+		t.Fatalf("causes = %v, an unmapped critical alert must not read as an outage", got.Causes)
 	}
 }
 
