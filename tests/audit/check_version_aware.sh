@@ -564,8 +564,11 @@ run_check \
   MOCK_OSV_FIXTURE="$fixture" \
   -- brace-expansion@2.1.4 --ecosystem npm --gate install
 mv "$MOCKBIN/socket.hidden" "$MOCKBIN/socket"
-if expect_status 10 "socket outage still refuses (never tolerated silently)"; then
-  pass "socket outage still refuses (never tolerated silently)"
+# Infra-only WARN at the gate is exit 11 (operator-TTY-overridable), never a
+# silent tolerate: the install gates turn 11 into a deliberate confirm or a 102
+# refusal, so this still fails closed (safe/AGENTS.md terminus ruling, 2026-09-07).
+if expect_status 11 "socket outage is the operator-overridable infra exit (11), never a silent tolerate"; then
+  pass "socket outage is the operator-overridable infra exit (11), never a silent tolerate"
 fi
 if expect_grep "$ERR_FILE" 'infrastructure failure, NOT a package finding' "socket refusal reads as breakage, not a CVE"; then
   pass "socket refusal reads as breakage, not a CVE"
@@ -785,7 +788,7 @@ run_check \
   MOCK_OSV_PAGES="$PAGES" \
   MOCK_SOCKET_MODE=ok \
   -- brace-expansion@2.1.4 --ecosystem npm --gate install
-if expect_status 10 "a repeated pagination token fails closed"; then
+if expect_status 11 "a repeated pagination token fails closed"; then
   pass "a repeated pagination token fails closed"
 fi
 if expect_grep "$OUT_FILE" 'OSV query failed|OSV pagination|OSV response' "pagination anomaly is explicit"; then
@@ -818,7 +821,7 @@ run_check \
   MOCK_OSV_STATUS=22 \
   MOCK_SOCKET_MODE=ok \
   -- brace-expansion@2.1.4 --ecosystem npm --gate install
-if expect_status 10 "OSV outage fails closed instead of counting zero CVEs"; then
+if expect_status 11 "OSV outage fails closed instead of counting zero CVEs"; then
   pass "OSV outage fails closed instead of counting zero CVEs"
 fi
 if expect_grep "$OUT_FILE" 'OSV query failed' "OSV outage is explicit in the check output"; then
@@ -889,7 +892,7 @@ run_check \
   MOCK_OSV_PAGES="$PAGES" \
   MOCK_SOCKET_MODE=ok \
   -- brace-expansion@2.1.4 --ecosystem npm --gate install
-if expect_status 10 "non-string pagination token fails closed"; then
+if expect_status 11 "non-string pagination token fails closed"; then
   pass "non-string pagination token fails closed"
 fi
 
@@ -906,7 +909,7 @@ run_check \
   MOCK_OSV_PAGES="$PAGES" \
   MOCK_SOCKET_MODE=ok \
   -- brace-expansion@2.1.4 --ecosystem npm --gate install --json
-if expect_status 10 "an over-cap pagination token fails closed"; then
+if expect_status 11 "an over-cap pagination token fails closed"; then
   pass "an over-cap pagination token fails closed"
 fi
 if jq -e '.osv.status == "error" and .osv.note == "OSV pagination token malformed"' "$OUT_FILE" >/dev/null 2>&1; then
@@ -1026,7 +1029,7 @@ run_check \
   MOCK_OSV_PAGES="$PAGES" \
   MOCK_SOCKET_MODE=ok \
   -- brace-expansion@2.1.4 --ecosystem npm --gate install
-if expect_status 10 "whitespace pagination token fails closed"; then
+if expect_status 11 "whitespace pagination token fails closed"; then
   pass "whitespace pagination token fails closed"
 fi
 

@@ -319,6 +319,7 @@ for arg in "$@"; do
   case "${arg}" in
     *blockme*) exit 20 ;;
     *warnme*) exit 10 ;;
+    *infrafail*) exit 11 ;;
   esac
 done
 
@@ -802,6 +803,21 @@ case_refusal_message_contract() {
   assert_status 100 "$FUNCNAME" || return
   assert_err_contains_fragment 'safe: BLOCKED npm install of warnme@1.0.0' "$FUNCNAME" || return
   assert_err_contains_fragment 'safe run host-allow add warnme@1.0.0 --reason' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe explain' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_infra_only_warn_no_host_allow_and_needs_a_tty() {
+  # An infra-only WARN (audit tier unreachable, gate exit 11) is a missing
+  # signal, NOT a package finding: the wrapper must not dangle a host-allow
+  # package-vouch, and non-interactively it refuses with exit 102 (operator TTY
+  # needed) rather than 100 with a host-allow hint. safe/AGENTS.md "Operator
+  # override is mandatory at every terminus" (2026-09-07).
+  prepare_case "infra-only-warn-no-host-allow"
+  SAFE_INSTALL_TEST_SCRIPT='npm install -g infrafail@1.0.0' run_zsh
+  assert_status 102 "$FUNCNAME" || return
+  assert_err_contains_fragment 'audit infrastructure is unavailable' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'host-allow add' "$FUNCNAME" || return
   assert_err_contains_fragment 'safe explain' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -6451,6 +6467,7 @@ main() {
     case_gate_lib_missing_fails_closed \
     case_wrapper_passthrough_is_cheap \
     case_refusal_message_contract \
+    case_infra_only_warn_no_host_allow_and_needs_a_tty \
     case_npm_exec_fetch_audits \
     case_npm_exec_local_bin_passthrough \
     case_npm_exec_versioned_spec_audits_despite_local_bin \

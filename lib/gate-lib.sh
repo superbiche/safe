@@ -2697,6 +2697,23 @@ safe_gate_pip_project_install() {
 # Fallback hint when the audit could not supply a pinned suggestion (the gate
 # prints resolved-version hints itself). Must never render an @latest shape:
 # allow entries are always pinned to an exact resolved version.
+# Deliberate per-instance override for an infra-only WARN on the wrapper path.
+# Reads /dev/tty, never stdin (the wrapped tool owns stdin); reached only after
+# the caller confirmed a TTY. Declining or an unreadable tty returns non-zero.
+safe_gate_confirm_infra() {
+  local package="$1"
+  local reply
+
+  safe_gate_err "safe: audit infrastructure is unavailable for ${package} — infrastructure breakage, NOT a package finding."
+  safe_gate_err "safe: proceeding installs ${package} WITHOUT the behavioral (Socket) signal; the recommended fix is to restore it (socket login / wait and retry / safe doctor)."
+  printf 'safe: proceed without the behavioral signal? [y/N] ' >&2
+  if ! IFS= read -r reply </dev/tty; then
+    return 1
+  fi
+
+  [[ "${reply}" == "y" || "${reply}" == "Y" || "${reply}" == "yes" || "${reply}" == "YES" ]]
+}
+
 safe_gate_allow_hint() {
   local package="$1"
   local ecosystem="$2"
@@ -2754,6 +2771,32 @@ safe_gate_check() {
       safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — safe audit verdict WARN; $(safe_gate_allow_hint "${package}" "${ecosystem}"); details: safe explain"
       safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_WARN"
       return 100
+      ;;
+    11)
+      # Infra-only WARN: every cause is an audit-tier outage, NOT a package
+      # finding. Operator override is a DELIBERATE, per-instance TTY confirmation
+      # (safe/AGENTS.md "Operator override is mandatory at every terminus",
+      # 2026-09-07) — never a host-allow package-vouch, never a standing
+      # tolerate. Non-interactive refuses with exit 102 (operator TTY needed),
+      # not the misleading host-allow hint. A pre-existing host-allow entry is
+      # still honored (a prior deliberate grant, not a suggestion made here).
+      if safe_gate_host_allow_matches "${package}" "${ecosystem}"; then
+        safe_gate_err "safe install: safe audit warned for ${package} (audit infrastructure unavailable); exact host-allow entry permits install"
+        safe_gate_audit_log "${ecosystem}" "${package}" "HOST_ALLOW_OVERRIDE"
+        return 0
+      fi
+      if [[ -t 0 && -t 1 ]]; then
+        if safe_gate_confirm_infra "${package}"; then
+          safe_gate_audit_log "${ecosystem}" "${package}" "INFRA_TTY_OVERRIDE"
+          return 0
+        fi
+        safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — audit infrastructure is unavailable (not a package finding) and you declined to proceed without it; fix it (socket login / wait / safe doctor) and retry; details: safe explain"
+        safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_INFRA_DECLINED"
+        return 100
+      fi
+      safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — audit infrastructure is unavailable (not a package finding); proceeding is a deliberate operator decision that needs an interactive terminal — re-run in a TTY to accept it, or fix the infra (socket login / wait / safe doctor); details: safe explain"
+      safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_INFRA_NONTTY"
+      return 102
       ;;
     2|20)
       # No allow hint on BLOCK: host-allow is a WARN-tier escape hatch and

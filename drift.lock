@@ -43,4 +43,4 @@ sig = "9d7937815cb8379c"
 [[bindings]]
 doc = "docs/safe-run.md"
 target = "bin/safe-run"
-sig = "7c1e3dc0e04af096"
+sig = "601590a99c675238"
