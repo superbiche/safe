@@ -402,6 +402,23 @@ else
   pass 'an unmapped critical alert must not read as infrastructure failure'
 fi
 
+# F1 residual (review r2): an unmapped critical alert is ADVERSE, so it must
+# REVOKE a stale clean install-known record — otherwise a later whole-audit
+# timeout replays the stale GO. socket_unmapped is now in the gate's
+# adverse-revocation set; adverse=1 revokes every RESOLVED version, so this
+# primary case exercises the same revoke path a ranged unmapped sibling takes.
+prepare_case unknown-category-revoke
+printf '{"packages":{"npm:fixture":{"version":"1.0.0","verdict":"GO","reasons":[],"evidence":"x","source":"implicit-default","first_allowed":"2026-09-07T10:00:00+02:00","last_used":"2026-09-07","times_used":1}}}\n' \
+  > "$CASE_RUN_CONFIG/install-known.json"
+run_check unknown-category --gate install --op install
+expect_rc 10 'an unmapped critical alert still refuses at the gate'
+if jq -e '.packages["npm:fixture"] == null' "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass 'an unmapped critical alert revokes the stale clean install-known record'
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2
+  fail 'an unmapped critical alert revokes the stale clean install-known record'
+fi
+
 # --- every resolved version is scored, not just the primary (review F1) -----
 # Two project constraints resolve to two installable versions. The primary is
 # clean and the sibling major carries the malice alert; the operation installs
