@@ -48,6 +48,7 @@ EXCLUDED=(
   tests/audit/fetch_cvss4_ref.sh    # dev bootstrap helper for that oracle
   tests/live/socket_envelope.sh     # opt-in live network probe, excluded per its own header
   tests/lib/safe-core.sh            # shared helper, not a suite
+  tests/lib/real-tool.sh            # shared helper (real-toolchain resolver), not a suite
 )
 for f in "$ROOT"/tests/*/*.sh; do
   rel=${f#"$ROOT"/}

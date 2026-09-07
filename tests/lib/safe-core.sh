@@ -11,18 +11,27 @@
 # suite always exercises the decision layer it ships with rather than whatever
 # happens to be installed on the host.
 
+# shellcheck source=tests/lib/real-tool.sh
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/real-tool.sh"
+
 # safe_core_test_prepare <repo-root> <output-path>
 # Exports SAFE_CORE_BIN on success. Returns non-zero if Go is unavailable or
 # the build fails; callers decide whether that is a skip or a hard failure.
+# The build calls the real go toolchain directly, never safe's own gate
+# wrapper — the belt is harness, not a package install to audit (real-tool.sh).
 safe_core_test_prepare() {
-  local root="$1" out="$2"
+  local root="$1" out="$2" go
 
-  if ! command -v go >/dev/null 2>&1; then
-    printf 'SKIP: Go is unavailable; safe-core cannot be built\n' >&2
+  if ! go="$(real_tool go)"; then
+    if command -v go >/dev/null 2>&1; then
+      printf "SKIP: go on PATH is only safe's gate wrapper, no real toolchain behind it; safe-core cannot be built\n" >&2
+    else
+      printf 'SKIP: Go is unavailable; safe-core cannot be built\n' >&2
+    fi
     return 1
   fi
 
-  if ! ( cd "$root" && go build -trimpath \
+  if ! ( cd "$root" && "$go" build -trimpath \
       -ldflags "-X main.version=$(tr -d '[:space:]' < VERSION)" \
       -o "$out" ./cmd/safe-core ); then
     printf 'not ok - safe-core test binary build failed\n' >&2

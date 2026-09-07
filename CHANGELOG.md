@@ -21,6 +21,15 @@
   package name) and the interactive adverse-/infra-WARN operator overrides; the
   README wrapper model is corrected to PATH executables; the config tree lists
   the machine-local host-allow review digest.
+- **The Go parity belt calls the toolchain directly, not through the gate.**
+  `tests/lib/safe-core.sh`, `tests/go/run.sh` and `tests/install/run.sh` built
+  and ran Go with an unqualified `go`, which on a safe-gated machine is the
+  `~/.local/bin/go` gate wrapper — routing the belt's own build through the live
+  gate (audit + host-allow-log side effects, and a hard failure under a
+  read-only `$HOME`). A new shared helper `tests/lib/real-tool.sh` resolves the
+  first non-wrapper `go` on PATH (detection mirrors gate-lib's
+  `safe_gate_is_wrapper`), and the belt uses it. Closes the PR #141 review's
+  audit-lane finding.
 
 ## 1.60.0 - 2026-09-07
 
