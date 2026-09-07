@@ -8658,6 +8658,7 @@ package_audit_command() {
           [[ "$adverse_cause" == "socket_low_score" \
             || "$adverse_cause" == "socket_critical_cve" \
             || "$adverse_cause" == "socket_high_alert" \
+            || "$adverse_cause" == "socket_unmapped" \
             || "$adverse_cause" == "release_too_new" ]] && adverse=1
         done
         if (( adverse )); then
@@ -8814,7 +8815,20 @@ gate_emit_refusal_hints() {
     printf 'safe audit: Socket reports a critical supply-chain-risk alert — do not install or pin around it; operator review only\n' >&2
   fi
   if (( has_socket_unmapped )); then
-    printf 'safe audit: Socket reports a CRITICAL alert in a category safe cannot classify — treated as unresolved (adverse), NOT an infrastructure outage; operator review, or pin the exact version with host-allow if you accept it\n' >&2
+    printf 'safe audit: Socket reports a CRITICAL alert in a category safe cannot classify — treated as unresolved (adverse), NOT an infrastructure outage\n' >&2
+    # Advertise host-allow only when the store can actually pin this operation:
+    # gate_host_allow_add_cmd is the capability oracle (npm/python + a single
+    # resolvable version), so a ranged op or a go/cargo audit gets the
+    # operator-review lane instead of a dead-end pin (review N1).
+    local unmapped_allow_cmd=""
+    if [[ "$resolution_ok" == "1" && -n "$pin_version" ]]; then
+      unmapped_allow_cmd=$(gate_host_allow_add_cmd "$name" "$pin_version" "$ecosystem") || unmapped_allow_cmd=""
+    fi
+    if [[ -n "$unmapped_allow_cmd" ]]; then
+      printf 'safe audit: operator review, or pin the exact version if you accept it: %s\n' "$unmapped_allow_cmd" >&2
+    else
+      printf 'safe audit: operator review only: safe audit package-audit %s --ecosystem %s --json\n' "$name" "$ecosystem" >&2
+    fi
   fi
   if (( has_socket_disabled )); then
     if [[ "$ecosystem" == "java" ]]; then
