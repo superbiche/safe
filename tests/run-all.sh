@@ -31,6 +31,7 @@ SUITES=(
   tests/audit/tempfile_hygiene.sh
   tests/contract/drift.sh
   tests/contract/docs_drift.sh
+  tests/contract/wrapper_detect_parity.sh
   tests/contract/report_fp.sh
   tests/run/host_allow_review.sh
   tests/run/host_allow_export_import.sh
@@ -48,6 +49,7 @@ EXCLUDED=(
   tests/audit/fetch_cvss4_ref.sh    # dev bootstrap helper for that oracle
   tests/live/socket_envelope.sh     # opt-in live network probe, excluded per its own header
   tests/lib/safe-core.sh            # shared helper, not a suite
+  tests/lib/real-tool.sh            # shared helper (real-toolchain resolver), not a suite
 )
 for f in "$ROOT"/tests/*/*.sh; do
   rel=${f#"$ROOT"/}

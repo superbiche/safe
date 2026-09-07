@@ -10,12 +10,21 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 
-if ! command -v go >/dev/null 2>&1; then
+# Resolve the real go toolchain, never safe's own gate wrapper — the belt must
+# not route `go vet`/`go test` through the live gate (real-tool.sh).
+# shellcheck source=tests/lib/real-tool.sh
+source "${ROOT}/tests/lib/real-tool.sh"
+if ! GO="$(real_tool go)"; then
+  if command -v go >/dev/null 2>&1; then
+    reason="go on PATH is only safe's gate wrapper, no real toolchain behind it"
+  else
+    reason="Go is unavailable"
+  fi
   if [[ "${SAFE_TEST_STRICT:-}" == "1" ]]; then
-    printf 'FAIL: Go is unavailable and SAFE_TEST_STRICT=1; the Go parity belt must run\n' >&2
+    printf 'FAIL: %s and SAFE_TEST_STRICT=1; the Go parity belt must run\n' "$reason" >&2
     exit 1
   fi
-  printf 'SKIP: Go is unavailable; go vet ./... and go test ./... are skipped\n'
+  printf 'SKIP: %s; go vet ./... and go test ./... are skipped\n' "$reason"
   exit 0
 fi
 
@@ -30,6 +39,6 @@ if [[ -n "${unformatted}" ]]; then
   exit 1
 fi
 
-go vet ./...
-go test ./...
+"$GO" vet ./...
+"$GO" test ./...
 printf 'go: gofmt, vet and tests passed\n'

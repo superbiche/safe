@@ -12,13 +12,19 @@ FAIL_COUNT=0
 SAFE_CORE_TEST_BIN="${TEST_ROOT}/safe-core"
 SAFE_CORE_TEST_AVAILABLE=0
 
-if command -v go >/dev/null 2>&1; then
-  if ( cd "${ROOT_DIR}" && go build -trimpath -ldflags "-X main.version=$(tr -d '[:space:]' < VERSION)" -o "${SAFE_CORE_TEST_BIN}" ./cmd/safe-core ); then
+# Build safe-core with the real go toolchain, never safe's own gate wrapper
+# (real-tool.sh): the belt is harness, not a package install to audit.
+# shellcheck source=tests/lib/real-tool.sh
+source "${ROOT_DIR}/tests/lib/real-tool.sh"
+if GO_BIN="$(real_tool go)"; then
+  if ( cd "${ROOT_DIR}" && "${GO_BIN}" build -trimpath -ldflags "-X main.version=$(tr -d '[:space:]' < VERSION)" -o "${SAFE_CORE_TEST_BIN}" ./cmd/safe-core ); then
     SAFE_CORE_TEST_AVAILABLE=1
   else
     printf 'not ok - safe-core test binary build failed\n' >&2
     exit 1
   fi
+elif command -v go >/dev/null 2>&1; then
+  printf "SKIP: go on PATH is only safe's gate wrapper, no real toolchain behind it; safe-core lockdiff install cases are skipped\n" >&2
 else
   printf 'SKIP: Go is unavailable; safe-core lockdiff install cases are skipped\n' >&2
 fi
