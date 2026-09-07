@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **An install blocked only because the audit infrastructure is down now offers
+  a deliberate operator override instead of a misleading host-allow** (1.59.0).
+  When Socket (or OSV) is unreachable, the package audits WARN with no finding
+  about the package — but the install gate refused with "to allow: host-allow
+  add <pkg>", which records a permanent *package vouch* for a version that was
+  never the problem. safe-audit now signals a WARN whose causes are ENTIRELY
+  audit-infrastructure outages as a distinct gate exit code (`11`), and the
+  install gates (`bin/safe`, `gate-lib`) turn it into a deliberate per-instance
+  TTY confirmation — "proceed without the behavioral signal? [y/N]". Declining,
+  or a non-interactive shell, refuses with exit `102` (operator TTY needed);
+  the misleading host-allow hint is gone from this path.
+  - **Never a silent pass on this path.** The override is TTY-only and
+    per-instance: `--yes` does not accept it, and a pre-existing operator
+    host-allow entry is still honored (a prior deliberate grant) but never
+    *suggested* here. Implements safe/AGENTS.md "Operator override is mandatory
+    at every terminus". (Known open item, unchanged here: a standing
+    `install.auto_allow_tolerate` listing an infra cause still auto-passes it
+    before this path — a separate operator decision, disfavored by the ruling.)
+  - **The infra-cause set is shared and drift-guarded.** safe-audit's
+    `GATE_INFRA_WARN_CAUSES` and safe-run's `HOST_ALLOW_REVIEW_INFRA_CAUSES`
+    must stay byte-identical (`tests/contract/drift.sh`), so both gates agree on
+    what counts as an outage.
+
 - **A repository nested inside the scan target is no longer audited as part of
   it** (1.58.0). `repo-audit` walked into linked git worktrees and nested
   clones, so a project with 11 worktrees under `.task/` was audited twelve

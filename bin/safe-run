@@ -2056,6 +2056,10 @@ cmd_host_allow_list() {
 # WARN causes that are audit-infrastructure breakage, not package findings
 # (operator ruling): an infra-only WARN means the entry's true state is
 # UNKNOWN — it is never evidence of staleness, and never "still needed".
+# This is the same set the install gate uses to route an infra-only WARN to the
+# TTY-override path (safe-audit's GATE_INFRA_WARN_CAUSES, gate exit 11); the two
+# MUST stay byte-identical and tests/contract/drift.sh asserts it, so both gates
+# agree on what counts as an audit-infrastructure outage.
 HOST_ALLOW_REVIEW_INFRA_CAUSES='["socket_unavailable","socket_auth_failed","socket_rate_limited","socket_error","osv_unavailable"]'
 
 host_allow_review_probe() {

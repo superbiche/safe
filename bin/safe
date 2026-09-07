@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.58.0"
+SAFE_VERSION="1.59.0"
 # Exported at the top level, not per-subcommand: safe-audit pins itself to
 # this version, and every route that reaches it — the gate, `safe audit ...`,
 # `safe install`, the safe-audit compatibility command — must carry it or the
@@ -1774,6 +1774,32 @@ safe_install_audit_package() {
       safe_install_gate_log "$ecosystem" "$package" "REFUSED_WARN"
       refuse 100 "BLOCKED ${ecosystem} install of ${package} — safe audit verdict WARN; $(safe_install_allow_hint "$package" "$ecosystem"); details: safe explain"
       ;;
+    11)
+      # Infra-only WARN: every cause is an audit-tier outage (Socket/OSV
+      # unreachable), NOT a finding about the package. The operator override is a
+      # DELIBERATE, per-instance TTY confirmation (safe/AGENTS.md "Operator
+      # override is mandatory at every terminus", 2026-09-07): never --yes (that
+      # is the silent auto-pass the ruling forbids), never a host-allow hint
+      # (that records a package vouch for a non-event), never a standing
+      # auto_allow_tolerate (that would silently pass every future outage). A
+      # pre-existing operator host-allow entry is still honored — it is a prior
+      # deliberate grant, not a suggestion made here.
+      if safe_install_host_allow_matches "$package" "$ecosystem"; then
+        err "safe audit warned for $package (audit infrastructure unavailable); exact host-allow entry permits install"
+        safe_install_gate_log "$ecosystem" "$package" "HOST_ALLOW_OVERRIDE"
+        return 0
+      fi
+      if [[ -t 0 && -t 1 ]]; then
+        if safe_install_confirm_infra "$package"; then
+          safe_install_gate_log "$ecosystem" "$package" "INFRA_TTY_OVERRIDE"
+          return 0
+        fi
+        safe_install_gate_log "$ecosystem" "$package" "REFUSED_INFRA_DECLINED"
+        refuse 100 "BLOCKED ${ecosystem} install of ${package} — audit infrastructure is unavailable (not a package finding) and you declined to proceed without it; fix it (socket login / wait / safe doctor) and retry; details: safe explain"
+      fi
+      safe_install_gate_log "$ecosystem" "$package" "REFUSED_INFRA_NONTTY"
+      refuse 102 "BLOCKED ${ecosystem} install of ${package} — audit infrastructure is unavailable (not a package finding); proceeding is a deliberate operator decision that needs an interactive terminal — re-run in a TTY to accept it, or fix the infra (socket login / wait / safe doctor); details: safe explain"
+      ;;
     2|20)
       # No allow hint on BLOCK: host-allow only clears WARN, and for a
       # known-malware record the hint would contradict the audit's own
@@ -1843,6 +1869,24 @@ safe_install_confirm() {
   fi
 
   printf 'safe: install with `%s`? [y/N] ' "$(quote_command "${install_cmd[@]}")" >&2
+  if ! IFS= read -r reply </dev/tty; then
+    return 1
+  fi
+
+  [[ "$reply" == "y" || "$reply" == "Y" || "$reply" == "yes" || "$reply" == "YES" ]]
+}
+
+# Deliberate per-instance override for an infra-only WARN. Reads /dev/tty, never
+# stdin (a wrapped tool owns stdin), and is reached only after the caller has
+# already confirmed a TTY — so --yes, which never touches this path, can never
+# satisfy it. Declining or an unreadable tty returns non-zero (the gate refuses).
+safe_install_confirm_infra() {
+  local package="$1"
+  local reply
+
+  printf 'safe: audit infrastructure is unavailable for %s — infrastructure breakage, NOT a package finding.\n' "$package" >&2
+  printf 'safe: proceeding installs %s WITHOUT the behavioral (Socket) signal; the recommended fix is to restore it (socket login / wait and retry / safe doctor).\n' "$package" >&2
+  printf 'safe: proceed without the behavioral signal? [y/N] ' >&2
   if ! IFS= read -r reply </dev/tty; then
     return 1
   fi

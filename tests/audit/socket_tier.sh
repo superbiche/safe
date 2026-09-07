@@ -383,8 +383,24 @@ expect_json '.socket.status == "pending" and .verdict == "GO"' 'pending Socket s
 prepare_case unknown-category
 run_check unknown-category
 expect_rc 10 'unclassifiable critical alert warns instead of passing'
-expect_json '.warn_causes | index("socket_error") != null' 'unclassifiable critical alert is an unresolved result'
+expect_json '.warn_causes | index("socket_unmapped") != null' 'unclassifiable critical alert is an unresolved result'
+expect_json '.warn_causes | index("socket_error") == null' 'an unclassifiable critical alert is never conflated with an infra outage'
 expect_json '.verdict == "WARN"' 'unclassifiable critical alert never reaches GO'
+
+# F1 (review 2026-09-07): an unclassifiable CRITICAL Socket alert is ADVERSE
+# evidence, not an infra outage — at the install gate it must stay exit 10 (its
+# host-allow/review path), NEVER the infra-only TTY override (exit 11), and must
+# NOT print "infrastructure failure". socket_unmapped keeps it out of the infra
+# cause set that routes to 11.
+prepare_case unknown-category-gate
+run_check unknown-category --gate install --op install
+expect_rc 10 'an unclassifiable critical alert is NOT the infra-only override (10, not 11)'
+expect_json '.warn_causes | index("socket_unmapped") != null' 'the gated unmapped alert carries socket_unmapped'
+if grep -q 'infrastructure failure' "$CASE_ERR"; then
+  fail 'an unmapped critical alert must not read as infrastructure failure'
+else
+  pass 'an unmapped critical alert must not read as infrastructure failure'
+fi
 
 # --- every resolved version is scored, not just the primary (review F1) -----
 # Two project constraints resolve to two installable versions. The primary is
@@ -616,6 +632,27 @@ fi
 prepare_case engine-vs-real-block
 run_check malware
 expect_rc 20 'a real malware BLOCK still exits 20, distinct from infrastructure failure'
+
+# Infra-only WARN at the INSTALL GATE is exit 11 — a missing signal the operator
+# may deliberately override at the TTY, distinct from a plain WARN (10) that
+# routes to host-allow. safe/AGENTS.md "Operator override is mandatory at every
+# terminus" (2026-09-07). The override itself lives in bin/safe / gate-lib; here
+# we only prove the audit CLASSIFIES and SIGNALS it.
+prepare_case infra-only-gate-fail
+run_check fail --gate install --op install
+expect_rc 11 'an infra-only WARN (Socket outage) is gate exit 11, not 10'
+expect_json '.verdict == "WARN" and (.warn_causes | index("socket_error") != null)' \
+  'the exit-11 case is still a WARN carrying socket_error'
+
+prepare_case infra-only-gate-rate
+run_check rate --gate install --op install
+expect_rc 11 'a rate-limited Socket outage is gate exit 11'
+
+# The split is gate-only: plain preflight of the same outage stays exit 10, so
+# `safe audit package-audit` keeps its documented verdict-code contract.
+prepare_case infra-only-preflight
+run_check fail
+expect_rc 10 'the same infra outage in plain preflight stays exit 10'
 
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

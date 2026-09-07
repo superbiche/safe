@@ -307,6 +307,23 @@ case_npm_literal_sites_consult_the_classifier() {
   fi
 }
 
+case_infra_cause_sets_match_between_gates() {
+  # safe-audit routes an infra-only WARN to the TTY-override exit (11) using
+  # GATE_INFRA_WARN_CAUSES; safe-run classifies the same causes for host-allow
+  # review with HOST_ALLOW_REVIEW_INFRA_CAUSES. If the two sets drift, the two
+  # gates disagree on what counts as an audit-infrastructure outage — one would
+  # offer the honest override where the other treats the WARN as a finding.
+  # They must be byte-identical.
+  local audit_set run_set
+  audit_set="$(sed -n "s/^GATE_INFRA_WARN_CAUSES='\(.*\)'$/\1/p" "$ROOT/bin/safe-audit" | head -n1)"
+  run_set="$(sed -n "s/^HOST_ALLOW_REVIEW_INFRA_CAUSES='\(.*\)'$/\1/p" "$ROOT/bin/safe-run" | head -n1)"
+  if [[ -n "$audit_set" && "$audit_set" == "$run_set" ]] && jq -e . >/dev/null 2>&1 <<<"$audit_set"; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (safe-audit '$audit_set' vs safe-run '$run_set')"
+  fi
+}
+
 case_contract_is_valid_json
 case_contract_has_every_required_key
 case_every_exit_code_tells_an_agent_what_to_do
@@ -324,6 +341,7 @@ case_gated_tools_match_the_installed_wrapper_set
 case_gated_tool_lists_stay_in_sync
 case_npm_classifier_snapshot_routes_every_alias
 case_npm_literal_sites_consult_the_classifier
+case_infra_cause_sets_match_between_gates
 
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

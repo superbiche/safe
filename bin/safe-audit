@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.3.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.58.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.59.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -7924,6 +7924,23 @@ effective_sources_command() {
   printf '\n'
 }
 
+# Audit-infrastructure WARN causes (operator ruling): each is an outage in a
+# scanner tier, NOT a finding about the package. A gated WARN whose cause set is
+# non-empty and drawn ENTIRELY from this set is operator-overridable at the TTY
+# (gate exit 11) — a deliberate, per-instance decision, never --yes, never a
+# host-allow package-vouch, never a standing tolerate. MUST stay byte-identical
+# to safe-run's HOST_ALLOW_REVIEW_INFRA_CAUSES; tests/contract/drift.sh asserts
+# the parity so the two gates can never disagree on what counts as infra.
+GATE_INFRA_WARN_CAUSES='["socket_unavailable","socket_auth_failed","socket_rate_limited","socket_error","osv_unavailable"]'
+
+# Exit 0 (true) when the WARN cause list is non-empty and every cause is an
+# audit-infrastructure outage — the infra-only override condition.
+gate_warn_is_infra_only() {
+  jq -e --argjson infra "$GATE_INFRA_WARN_CAUSES" \
+    'length > 0 and all(.[]; . as $c | ($infra | index($c)) != null)' \
+    <<<"$1" >/dev/null 2>&1
+}
+
 package_audit_command() {
   local ecosystem="" json_mode=0 spec="" op="install" gate=""
   # Target-context selectors from the audited command line (dynamically
@@ -8679,7 +8696,17 @@ package_audit_command() {
             "$socket_detail" "$release_security_fix_ids" "$([[ "$block_line" == PASS* ]] && printf 1 || printf 0)" \
             "$pin_hint" \
             "${warn_causes[@]}"
-          gate_exit=10
+          # An infra-only WARN (every cause an audit-tier outage, no adverse
+          # package evidence) is not a finding to pin around — it is a missing
+          # signal the operator may deliberately accept at the TTY. Exit 11 tells
+          # the gate to offer that override instead of the misleading host-allow
+          # hint (safe/AGENTS.md "Operator override is mandatory at every
+          # terminus", 2026-09-07). Any adverse cause keeps the plain WARN (10).
+          if (( aff_count == 0 )) && [[ "$block_line" == PASS* ]] && gate_warn_is_infra_only "$warn_causes_json"; then
+            gate_exit=11
+          else
+            gate_exit=10
+          fi
         fi
         ;;
       BLOCK)
@@ -8743,11 +8770,12 @@ gate_emit_refusal_hints() {
   # pin that can never match (Fibery #106); the tolerate/review lanes remain.
   local cause has_socket_infra=0 has_unresolved=0 has_affecting=0 has_osv_down=0
   local has_low_score=0 has_socket_high=0 has_socket_critical_cve=0 has_socket_malware=0
-  local has_socket_disabled=0 has_socket_not_found=0
+  local has_socket_disabled=0 has_socket_not_found=0 has_socket_unmapped=0
   local has_custom_source=0 has_malware=0 has_too_new=0
   for cause in "${causes[@]}"; do
     case "$cause" in
       socket_unavailable|socket_auth_failed|socket_rate_limited|socket_error) has_socket_infra=1 ;;
+      socket_unmapped) has_socket_unmapped=1 ;;
       socket_not_found) has_socket_not_found=1 ;;
       socket_low_score) has_low_score=1 ;;
       socket_high_alert) has_socket_high=1 ;;
@@ -8784,6 +8812,9 @@ gate_emit_refusal_hints() {
   fi
   if (( has_socket_malware )); then
     printf 'safe audit: Socket reports a critical supply-chain-risk alert — do not install or pin around it; operator review only\n' >&2
+  fi
+  if (( has_socket_unmapped )); then
+    printf 'safe audit: Socket reports a CRITICAL alert in a category safe cannot classify — treated as unresolved (adverse), NOT an infrastructure outage; operator review, or pin the exact version with host-allow if you accept it\n' >&2
   fi
   if (( has_socket_disabled )); then
     if [[ "$ecosystem" == "java" ]]; then
