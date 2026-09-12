@@ -231,8 +231,14 @@ exclude_args="$(
   PROJECT_PATH="$project" \
     bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null; gather_projects_from_source "$PROJECT_PATH"; syft_exclude_args_for_current_scan' | tr '\0' '\n'
 )"
-grep -q '^vendor$' <<<"$exclude_args" || fail "syft excludes omitted vendor pattern"
-grep -q '^vendor/\*\*$' <<<"$exclude_args" || fail "syft excludes omitted vendor subtree pattern"
+grep -q '^\*\*/vendor$' <<<"$exclude_args" || fail "syft excludes omitted vendor pattern"
+grep -q '^\*\*/vendor/\*\*$' <<<"$exclude_args" || fail "syft excludes omitted vendor subtree pattern"
+# Syft rejects any pattern not beginning with './', '*/', or '**/' — and the
+# rejection kills the whole scan. Every emitted pattern must be grammar-valid,
+# whatever produced it.
+if grep -Ev '^(--exclude|\./|\*\*/|\*/)' <<<"$exclude_args" | grep -q .; then
+  fail "syft emitted a pattern syft's grammar rejects"
+fi
 pass "syft exclude args"
 
 discovery_verbose="$(
@@ -342,10 +348,10 @@ grep -q 'lockfile .task/wt/' "$nested_report" && fail "linked worktree was disco
 grep -q 'lockfile nested-clone/' "$nested_report" && fail "nested clone was discovered as part of its parent"
 grep -qx 'root sub' "$nested_report" || fail "submodule lost its project root"
 grep -q 'root .task/wt' "$nested_report" && fail "linked worktree kept a project root"
-grep -qx 'exclude .task/wt' "$nested_report" || fail "syft excludes missed the linked worktree"
-grep -qx 'exclude .task/wt/**' "$nested_report" || fail "syft excludes missed the linked worktree subtree"
-grep -qx 'exclude nested-clone' "$nested_report" || fail "syft excludes missed the nested clone"
-grep -qx 'exclude nested-clone/**' "$nested_report" || fail "syft excludes missed the nested clone subtree"
+grep -qx 'exclude ./.task/wt' "$nested_report" || fail "syft excludes missed the linked worktree"
+grep -qx 'exclude ./.task/wt/**' "$nested_report" || fail "syft excludes missed the linked worktree subtree"
+grep -qx 'exclude ./nested-clone' "$nested_report" || fail "syft excludes missed the nested clone"
+grep -qx 'exclude ./nested-clone/**' "$nested_report" || fail "syft excludes missed the nested clone subtree"
 pass "nested repositories are pruned, submodules kept"
 
 # Derived directories are a deliberate boundary. A source-installed dependency
@@ -366,9 +372,160 @@ NESTED_FIXTURE="$nested_fixture" \
     gather_projects_from_source "$NESTED_FIXTURE" 1 2>/dev/null
     for x in "${CURRENT_SYFT_EXCLUDES[@]}"; do printf "exclude %s\n" "$x"; done' > "$derived_report"
 grep -q 'nested vendor/' "$derived_report" && fail "a source-installed dependency under vendor/ was reported as a nested repository"
-grep -q 'exclude vendor/source-copy' "$derived_report" && fail "a dependency under vendor/ became a syft exclude"
+grep -Fqx 'exclude ./vendor/source-copy' "$derived_report" && fail "a dependency under vendor/ became a syft exclude"
 grep -qx 'nested .task/wt' "$derived_report" || fail "derived-directory boundary lost the linked worktree"
 pass "repositories under derived directories are dependencies, not nested repos"
+
+# Glob metacharacters in a nested repo's NAME are literal directory
+# characters, not patterns: unescaped, `clone[1]` is a character class
+# matching `clone1`, and `brace{a,b}` is alternation matching `bracea` — a
+# clone discovery pruned would re-enter the SBOM under a name syft never
+# excluded, and its lookalike sibling would vanish instead. Filesystem-derived
+# fragments are escaped; operator ignore patterns are globs and are not.
+mkdir -p "$nested_fixture/clone[1]/.git" "$nested_fixture/brace{a,b}/.git" \
+  "$nested_fixture/bracea" "$nested_fixture/apps/web/build"
+printf '{"name":"cl1"}\n' > "$nested_fixture/clone[1]/package.json"
+printf '{"lockfileVersion":3}\n' > "$nested_fixture/clone[1]/package-lock.json"
+printf '{"name":"cl2"}\n' > "$nested_fixture/brace{a,b}/package.json"
+printf '{"lockfileVersion":3}\n' > "$nested_fixture/brace{a,b}/package-lock.json"
+printf '{"name":"sibling"}\n' > "$nested_fixture/bracea/package.json"
+printf '{"lockfileVersion":3}\n' > "$nested_fixture/bracea/package-lock.json"
+cat > "$nested_fixture/apps/web/.safe-audit" <<'YAML'
+ignore:
+  - build
+YAML
+printf '{"name":"built"}\n' > "$nested_fixture/apps/web/build/package-lock.json"
+
+escape_report="$tmp/nested-escape.txt"
+SAFE_AUDIT_CONFIG_DIR="$tmp/config-nested-escape" \
+SAFE_AUDIT_DATA_DIR="$tmp/data-nested-escape" \
+SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+NESTED_FIXTURE="$nested_fixture" \
+  bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null
+    gather_projects_from_source "$NESTED_FIXTURE" 1 2>/dev/null
+    for x in "${CURRENT_SYFT_EXCLUDES[@]}"; do printf "exclude %s\n" "$x"; done' > "$escape_report"
+grep -Fqx 'exclude ./clone\[1\]' "$escape_report" || fail "a glob-metacharacter clone name was not escaped in the syft excludes"
+grep -Fqx 'exclude ./clone\[1\]/**' "$escape_report" || fail "the escaped clone subtree pattern is missing"
+grep -Fqx 'exclude ./brace\{a,b\}' "$escape_report" || fail "a brace clone name was not escaped in the syft excludes"
+grep -Fqx 'exclude ./brace\{a,b\}/**' "$escape_report" || fail "the brace-escaped clone subtree pattern is missing"
+if grep -q 'bracea' "$escape_report"; then
+  fail "a lookalike sibling of a brace-named clone was excluded by brace alternation"
+fi
+# A nested config's bare ignore is scoped INSIDE that config's directory:
+# any-depth below it, anchored to it — not any-depth before it.
+grep -Fqx 'exclude ./apps/web/**/build' "$escape_report" || fail "a nested config ignore lost its config-scoped any-depth shape"
+grep -Fqx 'exclude ./apps/web/**/build/**' "$escape_report" || fail "a nested config ignore lost its subtree pattern"
+if grep -Eq 'exclude \*\*/apps/web' "$escape_report"; then
+  fail "a nested config ignore was shifted under any same-named directory"
+fi
+if grep -Ev '^exclude (\./|\*\*/|\*/)' "$escape_report" | grep -q .; then
+  fail "syft excludes carried a pattern outside syft's grammar"
+fi
+pass "syft excludes escape glob chars and stay grammar-valid"
+
+# Authored prefixes keep their shape and their scope. `./x` and `*/x` were
+# patterns Syft accepted before this emission existed; composing them must not
+# broaden them (root-only becoming any-depth, one level becoming arbitrary
+# depth would hide packages from the SBOM). A nested config's patterns stay
+# inside that config's directory: `**/` before the prefix would exclude
+# lookalikes outside its scope and miss deeper names inside it.
+prefix_fixture="$tmp/prefix-fixture"
+mkdir -p "$prefix_fixture/.git" \
+  "$prefix_fixture/rootonly" \
+  "$prefix_fixture/deep/rootonly" \
+  "$prefix_fixture/onelevel" \
+  "$prefix_fixture/deep/onelevel" \
+  "$prefix_fixture/cfg/cfgonly" \
+  "$prefix_fixture/cfg/ignored" \
+  "$prefix_fixture/cfg/deep/ignored" \
+  "$prefix_fixture/cfg/keep" \
+  "$prefix_fixture/other/cfg/ignored"
+cat > "$prefix_fixture/.safe-audit" <<'YAML'
+ignore:
+  - ./rootonly
+  - */onelevel
+YAML
+cat > "$prefix_fixture/cfg/.safe-audit" <<'YAML'
+ignore:
+  - ignored
+  - ./cfgonly
+YAML
+
+prefix_report="$tmp/prefix-excludes.txt"
+SAFE_AUDIT_CONFIG_DIR="$tmp/config-prefix" \
+SAFE_AUDIT_DATA_DIR="$tmp/data-prefix" \
+SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+PREFIX_FIXTURE="$prefix_fixture" \
+  bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null
+    gather_projects_from_source "$PREFIX_FIXTURE" 1 2>/dev/null
+    for x in "${CURRENT_SYFT_EXCLUDES[@]}"; do printf "exclude %s\n" "$x"; done' > "$prefix_report"
+grep -Fqx 'exclude ./rootonly' "$prefix_report" || fail "a root config ./ pattern was not kept root-anchored"
+grep -Fqx 'exclude ./rootonly/**' "$prefix_report" || fail "the root-anchored ./ subtree pattern is missing"
+grep -Fqx 'exclude */onelevel' "$prefix_report" || fail "a root config */ pattern was not kept one-level"
+grep -Fqx 'exclude */onelevel/**' "$prefix_report" || fail "the one-level subtree pattern is missing"
+if grep -Eq 'exclude (\*\*/rootonly|\*\*/onelevel|\*\*/\*/onelevel)' "$prefix_report"; then
+  fail "an explicitly prefixed pattern was broadened beyond its authored shape"
+fi
+grep -Fqx 'exclude ./cfg/**/ignored' "$prefix_report" || fail "a nested config's bare ignore lost its config-scoped any-depth shape"
+grep -Fqx 'exclude ./cfg/**/ignored/**' "$prefix_report" || fail "the nested config's subtree pattern is missing"
+grep -Fqx 'exclude ./cfg/cfgonly' "$prefix_report" || fail "a nested config's ./ pattern lost its config-local anchoring"
+if grep -Eq 'exclude \*\*/cfg' "$prefix_report"; then
+  fail "a nested config's ignore was shifted under any same-named directory"
+fi
+if grep -Ev '^exclude (\./|\*\*/|\*/)' "$prefix_report" | grep -q .; then
+  fail "syft excludes carried a pattern outside syft's grammar"
+fi
+pass "authored ignore prefixes keep their shape and their config scope"
+
+# Local and generated-remote exclude production must AGREE. The remote helper
+# is a standalone heredoc that cannot call the orchestrator's functions, so it
+# carries its own copies of the emission logic — a syft shim captures what
+# each side would hand the scanner over the same tree.
+parity_shim="$tmp/parity-shim"
+mkdir -p "$parity_shim"
+cat > "$parity_shim/syft" <<'STUB'
+#!/usr/bin/env bash
+prev=""
+for a in "$@"; do
+  [[ "$prev" == "--exclude" ]] && printf '%s\0' "$a" >> "${SYFT_ARGS_LOG:?}"
+  prev="$a"
+done
+printf '{"components":[],"metadata":{"tools":[{"name":"syft"}]}}\n'
+STUB
+chmod +x "$parity_shim/syft"
+
+local_args="$tmp/parity-local.txt"
+remote_args="$tmp/parity-remote.txt"
+SAFE_AUDIT_CONFIG_DIR="$tmp/config-parity-local" \
+SAFE_AUDIT_DATA_DIR="$tmp/data-parity-local" \
+SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+NESTED_FIXTURE="$nested_fixture" \
+LOCAL_ARGS="$local_args" \
+  bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null
+    gather_projects_from_source "$NESTED_FIXTURE" 1 2>/dev/null
+    syft_exclude_args_for_current_scan | while IFS= read -r -d "" t; do
+      [[ "$t" == "--exclude" ]] && continue
+      printf "%s\0" "$t"
+    done > "$LOCAL_ARGS"'
+: > "$remote_args"
+# The SBOM_ONLY branch exits the helper mid-pipeline, so the heredoc writer
+# dies of SIGPIPE (141); the captured args and the comparison below are the
+# verdict, not the pipeline's status.
+SYFT_ARGS_LOG="$remote_args" \
+SAFE_AUDIT_PATH="$SAFE_AUDIT" \
+NESTED_FIXTURE="$nested_fixture" \
+PARITY_SHIM="$parity_shim" \
+  bash -c 'set -- --version; source "$SAFE_AUDIT_PATH" >/dev/null
+    remote_scan_helper_script | \
+      PATH="/usr/bin:/bin" SAFE_AUDIT_SCANNER_DIR="$PARITY_SHIM" SAFE_AUDIT_REMOTE_SBOM_ONLY=1 \
+        bash -s -- "$NESTED_FIXTURE" >/dev/null' || true
+[[ -s "$local_args" ]] || fail "local syft exclude capture is empty; parity check is vacuous"
+if ! cmp -s <(sort -z "$local_args") <(sort -z "$remote_args"); then
+  printf 'local and remote syft exclude args diverge:\nlocal:  %s\nremote: %s\n' \
+    "$(tr '\0' '\n' <"$local_args")" "$(tr '\0' '\n' <"$remote_args")" >&2
+  fail "local and remote syft exclude args disagree"
+fi
+pass "local and remote syft exclude args agree"
 
 # A trailing slash is an ordinary operator spelling (`machine-audit --project
 # /srv/app/`). Every ancestry test matches on the target or target/*, so an

@@ -172,6 +172,18 @@ staged source scan, from the `.safe-audit` config walk, and from the SBOM,
 `--full` included. A scan that skipped any prints one line saying how many;
 `--verbose` lists them.
 
+The SBOM exclusions mirror that scope. A skipped root is handed to Syft as an
+anchored, escaped `./path` — escaped, because a directory literally named
+`clone[1]` is a directory, not a character class, and `clone{a,b}` is not
+alternation. Each `.safe-audit` ignore composes with its config's own
+location: a bare name matches at any depth under that config's directory
+(`./cfg/**/name` for a config in `cfg/`), while an explicitly authored prefix
+keeps its shape — `./x` at the config's root, `*/x` one level below it,
+`**/x` any depth under the config's directory. A root config's `./x` stays root-only;
+Syft never receives a pattern with the any-depth wildcard in front of the
+config's directory, which would exclude same-named paths outside the
+config's scope and miss deeper ones inside it.
+
 ### What osv-scanner is handed
 
 osv-scanner selects an extractor from the filename, and a file it has no

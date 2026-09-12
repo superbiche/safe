@@ -49,6 +49,7 @@ EXCLUDED=(
   tests/audit/cvss4_exhaustive.sh   # dev cross-check needing a bootstrapped oracle
   tests/audit/fetch_cvss4_ref.sh    # dev bootstrap helper for that oracle
   tests/live/socket_envelope.sh     # opt-in live network probe, excluded per its own header
+  tests/live/syft_exclude_oracle.sh # opt-in live probe needing an installed syft, excluded per its own header
   tests/lib/safe-core.sh            # shared helper, not a suite
   tests/lib/real-tool.sh            # shared helper (real-toolchain resolver), not a suite
 )

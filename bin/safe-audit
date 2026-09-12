@@ -1138,20 +1138,96 @@ path_matches_default_exclude() {
   path_matches_patterns "$rel" "${DEFAULT_DERIVED_EXCLUDES[@]}"
 }
 
+# Syft rejects ANY exclusion pattern that does not begin with './', '*/', or
+# '**/' — and the rejection kills the whole scan, so one unprefixed pattern
+# cost the target its entire SBOM (grype then scanned an empty document).
+# Emission composes each authored pattern with the .safe-audit's own location,
+# which stays ANCHORED to the source root: a '**/' in front of a nested
+# config's directory would move the any-depth wildcard BEFORE that directory,
+# excluding lookalikes outside the config's scope (other/cfg/ignored) while
+# missing deeper names inside it (cfg/deep/ignored). Discovery already scopes
+# a nested config's ignores to its directory subtree, so the emission does too.
+#
+# The authored pattern's own shape survives, preserving valid Syft prefixes:
+# - bare `name` — discovery prunes it at any depth under the config
+#   (-name), so the descendant wildcard goes BETWEEN the escaped prefix and
+#   the name: `./cfg/**/name` for a nested config, `**/name` for the root
+#   config. Never narrowed to './', or the SBOM would re-import trees the
+#   rest of the audit refuses.
+# - `./name` — explicitly rooted: stays at the config directory's root
+#   (`./cfg/name`; for the root config `./name`, exactly the form Syft has
+#   always accepted — never broadened to any-depth).
+# - `*/name` — one level below the config's root, as authored (nested:
+#   `./cfg/*/name`).
+# - `**/name` — explicitly any-depth under the config's directory.
+#
+# A nested repository root is an exact discovered path, so it is anchored
+# with './' and its glob metacharacters are escaped: unescaped, a directory
+# literally named `clone[1]` is a character class matching `clone1`, and
+# `clone{a,b}` is brace alternation matching `clonea` — the nested repo
+# re-enters the SBOM discovery just pruned. The operator-authored pattern is
+# a glob and is passed through unescaped; only filesystem-derived fragments
+# are escaped.
+#
+# The generated remote helper ships its own copies of this escaping, the
+# composition and of the emission shapes (it runs standalone on a remote
+# host). They must stay in sync; the remote-parity case in
+# tests/audit/smoke.sh guards that.
+syft_glob_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\*/\\*}"
+  s="${s//\?/\\?}"
+  s="${s//\[/\\[}"
+  s="${s//\]/\\]}"
+  s="${s//\{/\\{}"
+  s="${s//\}/\\\}}"
+  printf '%s' "$s"
+}
+
+# Compose one Syft exclusion from an authored ignore pattern and the escaped
+# source-root-relative prefix of the .safe-audit that authored it. Prints the
+# composed pattern; fails (non-zero) on a pattern that is dead after
+# normalization.
+syft_compose_exclude() {
+  local rel_prefix="$1" pattern="$2" anchored
+  case "$pattern" in
+    ./*)    pattern="${pattern#./}"; anchored="./" ;;
+    '**/'*) anchored="" ;;
+    '*/'*)  anchored="" ;;
+    */*)    anchored="./" ;;
+    *)      anchored="**/" ;;
+  esac
+  [[ -n "$pattern" ]] || return 1
+  if [[ -n "$rel_prefix" ]]; then
+    # './' is already carried by the anchored prefix itself.
+    [[ "$anchored" == "./" ]] && anchored=""
+    printf './%s%s%s' "$rel_prefix" "$anchored" "$pattern"
+  else
+    printf '%s%s' "$anchored" "$pattern"
+  fi
+}
+
 append_syft_excludes_for_config() {
   local source_abs="$1" config="$2"
   [[ -f "$config" ]] || return 0
-  local root rel_prefix pattern
+  local root rel_prefix pattern exclude
   root=$(dirname "$config")
   rel_prefix=$(relative_to "$source_abs" "$root")
   [[ "$rel_prefix" == "." ]] && rel_prefix=""
   [[ -n "$rel_prefix" ]] && rel_prefix="${rel_prefix%/}/"
+  rel_prefix=$(syft_glob_escape "$rel_prefix")
 
   parse_project_config "$config"
   for pattern in "${PROJECT_IGNORES[@]}"; do
     [[ -z "$pattern" ]] && continue
-    CURRENT_SYFT_EXCLUDES+=("${rel_prefix}${pattern}")
-    CURRENT_SYFT_EXCLUDES+=("${rel_prefix}${pattern}/**")
+    # The same trailing-slash spelling the find-side prune normalizes
+    # (find_source_files_pruned); an empty result is a dead pattern there
+    # and is dead here too.
+    pattern="${pattern%/}"
+    exclude=$(syft_compose_exclude "$rel_prefix" "$pattern") || continue
+    CURRENT_SYFT_EXCLUDES+=("$exclude")
+    CURRENT_SYFT_EXCLUDES+=("$exclude/**")
   done
 }
 
@@ -1466,8 +1542,9 @@ gather_projects_from_source() {
     [[ -n "$nested_root" ]] || continue
     nested_rel=$(relative_to "$source_abs" "$nested_root")
     [[ -n "$nested_rel" && "$nested_rel" != "." ]] || continue
-    CURRENT_SYFT_EXCLUDES+=("$nested_rel")
-    CURRENT_SYFT_EXCLUDES+=("$nested_rel/**")
+    nested_rel=$(syft_glob_escape "$nested_rel")
+    CURRENT_SYFT_EXCLUDES+=("./$nested_rel")
+    CURRENT_SYFT_EXCLUDES+=("./$nested_rel/**")
   done
 
   local cfg
@@ -3685,13 +3762,58 @@ remote_nested_repo_roots() {
 declare -a nested_repos=()
 mapfile -d '' -t nested_repos < <(remote_nested_repo_roots "$target")
 
+# Copy of the orchestrator's syft_glob_escape and syft_compose_exclude: this
+# heredoc is generated, single-quoted, and shipped to run standalone on a
+# remote host, so it cannot call the orchestrator's helpers. Syft rejects any
+# exclusion pattern not beginning with './', '*/', or '**/' — and the
+# rejection kills the whole scan — so every pattern below carries a valid
+# prefix, and filesystem-derived fragments are escaped so a directory
+# literally named `clone[1]` is matched as itself, not as a character class,
+# and `clone{a,b}` is not brace alternation. Each authored pattern composes
+# with its .safe-audit's ANCHORED location (never '**/' before the prefix,
+# which would exclude lookalikes outside that config's scope): a bare name
+# gets the descendant wildcard between prefix and name, './name' stays at the
+# config's root, '*/name' one level below, '**/name' any depth from the
+# config's root — all as authored. The two copies must stay in sync; the
+# remote-parity case in tests/audit/smoke.sh guards that.
+syft_glob_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\*/\\*}"
+  s="${s//\?/\\?}"
+  s="${s//\[/\\[}"
+  s="${s//\]/\\]}"
+  s="${s//\{/\\{}"
+  s="${s//\}/\\\}}"
+  printf '%s' "$s"
+}
+
+syft_compose_exclude() {
+  local rel_prefix="$1" pattern="$2" anchored
+  case "$pattern" in
+    ./*)    pattern="${pattern#./}"; anchored="./" ;;
+    '**/'*) anchored="" ;;
+    '*/'*)  anchored="" ;;
+    */*)    anchored="./" ;;
+    *)      anchored="**/" ;;
+  esac
+  [[ -n "$pattern" ]] || return 1
+  if [[ -n "$rel_prefix" ]]; then
+    [[ "$anchored" == "./" ]] && anchored=""
+    printf './%s%s%s' "$rel_prefix" "$anchored" "$pattern"
+  else
+    printf '%s%s' "$anchored" "$pattern"
+  fi
+}
+
 collect_syft_exclude_args() {
-  local cfg root rel_prefix raw line section="" pattern
+  local cfg root rel_prefix raw line section="" pattern exclude
   while IFS= read -r -d '' cfg; do
     root=$(dirname "$cfg")
     rel_prefix="${root#"$target"/}"
     [[ "$rel_prefix" == "$root" || "$rel_prefix" == "." ]] && rel_prefix=""
     [[ -n "$rel_prefix" ]] && rel_prefix="${rel_prefix%/}/"
+    rel_prefix=$(syft_glob_escape "$rel_prefix")
     section=""
     while IFS= read -r raw || [[ -n "$raw" ]]; do
       line="${raw%%#*}"
@@ -3703,8 +3825,11 @@ collect_syft_exclude_args() {
       esac
       if [[ "$section" == "ignore" && "$line" =~ ^-[[:space:]]*(.+)$ ]]; then
         pattern="${BASH_REMATCH[1]}"
-        printf '%s\0%s\0' '--exclude' "${rel_prefix}${pattern}"
-        printf '%s\0%s\0' '--exclude' "${rel_prefix}${pattern}/**"
+        pattern="${pattern%/}"
+        [[ -z "$pattern" ]] && continue
+        exclude=$(syft_compose_exclude "$rel_prefix" "$pattern") || continue
+        printf '%s\0%s\0' '--exclude' "$exclude"
+        printf '%s\0%s\0' '--exclude' "$exclude/**"
       fi
     done <"$cfg"
   done < <(find "$target" -type f -name '.safe-audit' -print0 2>/dev/null)
@@ -3715,8 +3840,9 @@ collect_syft_exclude_args() {
     [[ -n "$nested" ]] || continue
     nested_rel="${nested#"$target"/}"
     [[ -n "$nested_rel" && "$nested_rel" != "$nested" ]] || continue
-    printf '%s\0%s\0' '--exclude' "$nested_rel"
-    printf '%s\0%s\0' '--exclude' "$nested_rel/**"
+    nested_rel=$(syft_glob_escape "$nested_rel")
+    printf '%s\0%s\0' '--exclude' "./$nested_rel"
+    printf '%s\0%s\0' '--exclude' "./$nested_rel/**"
   done
 }
 
