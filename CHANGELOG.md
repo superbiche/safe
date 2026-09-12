@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **Project audits keep their SBOM when nested repositories or `.safe-audit`
+  ignores are present.** Syft rejects any exclusion pattern not beginning with
+  `./`, `*/`, or `**/` — and one rejected pattern failed the whole SBOM scan,
+  leaving Grype to scan an empty document. Nested-repo roots and config ignores
+  are now composed in Syft's grammar: nested roots are anchored (`./path`) with
+  glob metacharacters in real directory names escaped (`clone[1]` is a
+  directory, not a character class; `clone{a,b}` is not alternation), and each
+  `.safe-audit` ignore is emitted inside that config's own directory subtree —
+  a bare name matches at any depth under the config (`./cfg/**/name`), an
+  explicitly authored prefix keeps its shape (`./x` at the config's root,
+  `*/x` one level below, `**/x` any depth under the config's directory), and a root
+  config's `./x` stays root-only. The generated remote helper composes the
+  same patterns; a new parity regression asserts local and remote arguments
+  agree, and an opt-in live probe (`tests/live/syft_exclude_oracle.sh`) checks
+  the composed set against a real Syft.
+
 - Project audits no longer recurse through `cargo update --workspace` when a
   Rust manifest has no local lockfile. Cargo-audit reads `Cargo.lock` explicitly;
   missing lockfiles produce a coverage warning without generating dependencies.
