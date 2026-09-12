@@ -435,20 +435,15 @@ case_schema_drift_falls_through() {
 }
 
 case_previous_schema_entry_misses() {
-  # The rollout property, not just the drift property: an entry minted by the
-  # PREVIOUS release under an otherwise valid key must miss. 1.58.0 changed
-  # what a result means — ecosystem records gained `root`, discovery started
-  # pruning nested repositories, and the composer lane changed which package
-  # set it audits — while the key carries no safe version, so without the
-  # schema bump a 1.57 result replays under 1.58 semantics. The live cache
-  # held 90 such entries, 7 inside the TTL.
+  # Entries from before read-only Cargo auditing must miss: they may reflect
+  # generated dependency evidence rather than the current missing-lock warning.
   prepare_case "previous-schema"
   run_scan
   run_scan
   # A freshly written entry is at the current schema and hits.
   assert_hit "$FUNCNAME" || return
   # The same entry, minted by the previous schema, must not.
-  assert_miss_after_edit "$FUNCNAME" '._cache.schema = 1' || return
+  assert_miss_after_edit "$FUNCNAME" '._cache.schema = 2' || return
   pass "$FUNCNAME"
 }
 

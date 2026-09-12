@@ -35,7 +35,9 @@ SCAN_CACHE_TTL_SECONDS="${SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS:-86400}"
 #     lock-file fallback. A schema-1 entry was computed under none of those
 #     rules — replaying one would report a pre-prune package count, or suppress
 #     the composer lane this version intended to recompute.
-SCAN_CACHE_SCHEMA=2
+#   3: cargo-audit only reads an explicit existing lockfile; missing locks
+#     report missing coverage rather than invoking Cargo to generate evidence.
+SCAN_CACHE_SCHEMA=3
 CHECKS_DIR="$DATA_DIR/checks"
 SOCKET_CACHE_SCHEMA=1
 SOCKET_CACHE_STALE_SCORE=""
@@ -2328,8 +2330,17 @@ run_cargo_audit_dir() {
     printf '%s\n' "$(render_ecosystem_audit_json "cargo-audit" "skipped" 0 0 0 0 0 "cargo-audit unavailable" 0)" > "$output"
     return 0
   fi
+  # cargo-audit generates a missing default lockfile via `cargo update
+  # --workspace`. That re-enters the install gate and recursively audits this
+  # same project. Audits consume existing evidence; they never create it.
+  if [[ ! -f "$dir/Cargo.lock" ]]; then
+    printf '%s\n' "$(render_ecosystem_audit_json "cargo-audit" "skipped" 0 0 0 0 0 "Cargo.lock missing: Rust dependencies at this root were not audited; provide the lockfile and retry" 0)" > "$output"
+    return 0
+  fi
   local rc=0
-  (cd "$dir" && cargo audit --json) > "$output.raw" 2>"$output.stderr" || rc=$?
+  # An explicit file also prevents generation if the lock disappears after
+  # the check above: cargo-audit then reports an error instead of updating.
+  (cd "$dir" && cargo audit --json --file Cargo.lock) > "$output.raw" 2>"$output.stderr" || rc=$?
   if ! jq -e '(.vulnerabilities.list | type) == "array"' "$output.raw" >/dev/null 2>&1; then
     ecosystem_audit_error "cargo-audit" "$rc" "$output.stderr" "$output"
     return 0
@@ -4548,8 +4559,17 @@ run_cargo_audit_dir() {
     printf '%s\n' "$(render_ecosystem_audit_json "cargo-audit" "skipped" 0 0 0 0 0 "cargo-audit unavailable" 0)" > "$output"
     return 0
   fi
+  # cargo-audit generates a missing default lockfile via `cargo update
+  # --workspace`. That re-enters the install gate and recursively audits this
+  # same project. Audits consume existing evidence; they never create it.
+  if [[ ! -f "$dir/Cargo.lock" ]]; then
+    printf '%s\n' "$(render_ecosystem_audit_json "cargo-audit" "skipped" 0 0 0 0 0 "Cargo.lock missing: Rust dependencies at this root were not audited; provide the lockfile and retry" 0)" > "$output"
+    return 0
+  fi
   local rc=0
-  (cd "$dir" && cargo audit --json) > "$output.raw" 2>"$output.stderr" || rc=$?
+  # An explicit file also prevents generation if the lock disappears after
+  # the check above: cargo-audit then reports an error instead of updating.
+  (cd "$dir" && cargo audit --json --file Cargo.lock) > "$output.raw" 2>"$output.stderr" || rc=$?
   if ! jq -e '(.vulnerabilities.list | type) == "array"' "$output.raw" >/dev/null 2>&1; then
     ecosystem_audit_error "cargo-audit" "$rc" "$output.stderr" "$output"
     return 0
