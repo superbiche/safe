@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.61.0 - 2026-09-12
+
 - **Project audit reports show critical/high advisories before the install
   decision.** Each entry names the advisory ID, affected package/version,
   scanner, and upstream summary when provided. OSV summaries/details and Grype
