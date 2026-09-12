@@ -1015,20 +1015,20 @@ case_doctor_podman_probe_skips_exec_under_no_new_privs() {
     || { printf '%s\n' "${doctor_human}" >&2; fail "$FUNCNAME"; return; }
   grep -A2 'missing prerequisites:' <<<"${doctor_human}" | grep -Fq 'podman' \
     && { printf '%s\n' "${doctor_human}" >&2; fail "$FUNCNAME"; return; }
-  [[ ! -e "${HOME_DIR}/podman-invocations.log" ]] || { fail "$FUNCNAME"; return; }
+  [[ ! -e "${HOME_DIR}/podman-invocations.log" ]] || { printf '%s\n' "$doctor_out" "$doctor_human" >&2; fail "$FUNCNAME"; return; }
   # NoNewPrivs is inherited and cannot be cleared by omitting setpriv.
   # Check the real caller state; both decisions also have fixture coverage below.
   doctor_out="$(env HOME="${HOME_DIR}" PATH="${bindir}:/usr/bin:/bin" \
     bash "${ROOT_DIR}/bin/safe" doctor --json 2>/dev/null)"
   if grep -q '^NoNewPrivs:[[:space:]]*1' /proc/self/status 2>/dev/null; then
     jq -e '.dependencies.sandbox.podman.probed == false' <<<"${doctor_out}" >/dev/null \
-      || { fail "$FUNCNAME"; return; }
-    [[ ! -e "${HOME_DIR}/podman-invocations.log" ]] || { fail "$FUNCNAME"; return; }
+      || { printf '%s\n' "$doctor_out" "$doctor_human" >&2; fail "$FUNCNAME"; return; }
+    [[ ! -e "${HOME_DIR}/podman-invocations.log" ]] || { printf '%s\n' "$doctor_out" "$doctor_human" >&2; fail "$FUNCNAME"; return; }
   else
     jq -e '.dependencies.sandbox.podman.version == "podman version 5.0.0"' \
-      <<<"${doctor_out}" >/dev/null || { fail "$FUNCNAME"; return; }
+      <<<"${doctor_out}" >/dev/null || { printf '%s\n' "$doctor_out" "$doctor_human" >&2; fail "$FUNCNAME"; return; }
     [[ "$(cat "${HOME_DIR}/podman-invocations.log")" == '--version' ]] \
-      || { fail "$FUNCNAME"; return; }
+      || { printf '%s\n' "$doctor_out" "$doctor_human" >&2; fail "$FUNCNAME"; return; }
   fi
   pass "$FUNCNAME"
 }
@@ -1062,24 +1062,25 @@ STUB
     doctor_human="$(env HOME="${HOME_DIR}" PATH="${bindir}:/usr/bin:/bin" SAFE_TEST_REAL_GREP="$real_grep" \
       bash "${ROOT_DIR}/bin/safe" doctor 2>/dev/null)"
     [[ "$(cat "${HOME_DIR}/nnp-queries.log")" == $'query\nquery' ]] \
-      || { fail "$FUNCNAME (fixture $nnp not consumed)"; return; }
+      || { printf '%s\n' "$doctor_out" "$doctor_human" >&2; fail "$FUNCNAME (fixture $nnp not consumed)"; return; }
     jq -e '.dependencies.sandbox.podman.present == true' <<<"$doctor_out" >/dev/null \
-      || { fail "$FUNCNAME ($nnp presence)"; return; }
+      || { printf '%s\n' "$doctor_out" "$doctor_human" >&2; fail "$FUNCNAME ($nnp presence)"; return; }
     if [[ "$nnp" == 1 ]]; then
       jq -e '.dependencies.sandbox.podman.probed == false
         and (.dependencies.sandbox.podman.note | test("no-new-privs"))' <<<"$doctor_out" >/dev/null \
-        || { fail "$FUNCNAME ($nnp JSON)"; return; }
+        || { printf '%s\n' "$doctor_out" "$doctor_human" >&2; fail "$FUNCNAME ($nnp JSON)"; return; }
       grep -Fq 'podman present but unprobed' <<<"$doctor_human" \
-        || { fail "$FUNCNAME ($nnp human)"; return; }
-      [[ ! -e "${HOME_DIR}/podman-invocations.log" ]] || { fail "$FUNCNAME ($nnp exec)"; return; }
+        || { printf '%s\n' "$doctor_out" "$doctor_human" >&2; fail "$FUNCNAME ($nnp human)"; return; }
+      [[ ! -e "${HOME_DIR}/podman-invocations.log" ]] || { printf '%s\n' "$doctor_out" "$doctor_human" >&2; fail "$FUNCNAME ($nnp exec)"; return; }
     else
       jq -e '.dependencies.sandbox.podman.version == "podman version 5.0.0"' <<<"$doctor_out" >/dev/null \
-        || { fail "$FUNCNAME ($nnp JSON)"; return; }
+        || { printf '%s\n' "$doctor_out" "$doctor_human" >&2; fail "$FUNCNAME ($nnp JSON)"; return; }
       if grep -Fq 'podman present but unprobed' <<<"$doctor_human"; then
+        printf '%s\n' "$doctor_human" >&2
         fail "$FUNCNAME ($nnp human)"; return
       fi
       [[ "$(cat "${HOME_DIR}/podman-invocations.log")" == $'--version\n--version' ]] \
-        || { fail "$FUNCNAME ($nnp exec)"; return; }
+        || { printf '%s\n' "$doctor_out" "$doctor_human" >&2; fail "$FUNCNAME ($nnp exec)"; return; }
     fi
   done
   pass "$FUNCNAME"
