@@ -2675,6 +2675,34 @@ build_delta_json() {
     }'
 }
 
+# Use the same OSV severity interpretation as the counts, including older
+# cached entries carrying a score rather than a severity name.
+render_scan_advisories() {
+  local result_path="$1" raw band severity_map='{}'
+  while IFS= read -r raw; do
+    band=$(severity_from_osv_entry "$raw")
+    severity_map=$(jq -c --arg raw "$raw" --arg band "$band" '. + {($raw): $band}' <<<"$severity_map")
+  done < <(jq -r '[.cve_scan.findings[]? | select(.source == "osv") | (.severity // "unknown" | tostring)] | unique[]' "$result_path")
+  jq -r --argjson bands "$severity_map" '
+    def line: tostring | gsub("[\\s\\p{Cc}]+"; " ") | sub("^ +"; "") | sub(" +$"; "");
+    [.cve_scan.findings[]?
+      | . + {band: (if .source == "osv" then $bands[(.severity // "unknown" | tostring)]
+                   else (.severity // "unknown" | ascii_downcase) end)}
+      | select(.band == "critical" or .band == "high")]
+    | sort_by((if .band == "critical" then 0 else 1 end), .id, .package, .version, .source)
+    | if length == 0 then empty else
+        "\nCRITICAL/HIGH ADVISORIES (osv-scanner + grype):",
+        (.[] | ((.summary // "") | line) as $summary
+          | "  - [" + (.band | ascii_upcase) + "] " + ((.id // "unknown") | line)
+            + " " + ((.package // "unknown") | line) + "@" + ((.version // "unknown") | line)
+            + " (" + ((.source // "unknown") | line) + ") — "
+            + (if $summary == "" then "summary unavailable from scanner"
+               elif ($summary | length) > 240 then $summary[:237] + "..."
+               else $summary end))
+      end
+  ' "$result_path"
+}
+
 render_scan_summary() {
   # $1 is read for the numbers; $2 (default $1) is the path shown to a human.
   # They differ while a scan renders its private snapshot but points the reader
@@ -2700,6 +2728,7 @@ render_scan_summary() {
   printf '  HIGH: %s\n' "$(jq -r '.cve_scan.high' "$result_path")"
   printf '  MEDIUM: %s\n' "$(jq -r '.cve_scan.medium' "$result_path")"
   printf '  LOW: %s\n' "$(jq -r '.cve_scan.low' "$result_path")"
+  render_scan_advisories "$result_path"
   # Ecosystem audits report their own advisories; without this line a
   # govulncheck or cargo-audit finding appears in the totals and the verdict
   # while every printed bucket reads zero.
@@ -2744,18 +2773,25 @@ render_scan_summary() {
   if jq -e '(.tool_status // {} | to_entries | map(select((.value.status // "ok") != "ok")) | length) > 0' "$result_path" >/dev/null; then
     printf '\n'
   fi
-  # The detail block names the root each record came from. `.` is the target
-  # itself and stays unlabeled, so a single-project scan reads exactly as it
-  # did before roots were recorded.
+  # Unsupported roots share one line per scanner/reason. Keep individual
+  # successful and broken audit records visible; the JSON retains every root.
   printf 'ECOSYSTEM AUDITS:\n'
   jq -r '
-    .ecosystem_audits[]? |
+    ([.ecosystem_audits[]? | select(.status == "unsupported")]
+      | group_by([.scanner, (.note // "")])[]
+      | .[0] as $audit
+      | ([.[] | (.root // ".")] | unique | length) as $roots
+      | "  \($audit.scanner): unsupported"
+        + (if ($audit.note // "") != "" then " (" + $audit.note + ")" else "" end)
+        + (if $roots > 1 then " across " + ($roots | tostring) + " roots" else "" end)),
+    (.ecosystem_audits[]? | select(.status != "unsupported") |
     ((.root // ".") | if . == "." then "" else " [" + . + "]" end) as $root |
     if (.status // "ok") == "ok" then
       "  \(.scanner)\($root): \(.total) advisories (\(.critical) critical, \(.high) high, \(.medium) medium, \(.low) low)"
     else
       "  \(.scanner)\($root): \(.status // "skipped")" + (if (.note // "") != "" then " (" + .note + ")" else "" end)
     end
+    )
   ' "$result_path"
   printf '\nSOURCE SCAN:\n'
   printf '  %s files scanned; %s suspicious patterns\n' \
@@ -2908,7 +2944,8 @@ build_scan_result_from_artifacts() {
             id: (.id // .aliases[0] // "unknown"),
             severity: osv_severity,
             package: $name,
-            version: $version
+            version: $version,
+            summary: ([.summary, .details] | map(select(type == "string" and test("\\S"))) | .[0] // null)
           }
       ] +
       [
@@ -2919,7 +2956,9 @@ build_scan_result_from_artifacts() {
             id: (.vulnerability.id // "unknown"),
             severity: (.vulnerability.severity // "unknown"),
             package: (.artifact.name // "unknown"),
-            version: (.artifact.version // "unknown")
+            version: (.artifact.version // "unknown"),
+            summary: ([.vulnerability.description, .relatedVulnerabilities[]?.description]
+                      | map(select(type == "string" and test("\\S"))) | .[0] // null)
           }
       ]
     ) | unique_by(.source + ":" + .id + ":" + .package + ":" + .version)

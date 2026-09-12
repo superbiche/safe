@@ -201,6 +201,20 @@ every format safe hands it and reports any it can no longer read. `safe doctor`
 runs it, so a scanner upgrade that drops an extractor is visible before it
 costs a scan rather than after.
 
+### Advisory details in scan reports
+
+Project and machine reports list every critical/high OSV and Grype finding,
+critical first, with its advisory ID, affected package/version, scanner, and
+upstream summary. Multiline summaries become one line, capped at 240 characters.
+The result JSON preserves the full upstream text. If the scanner or an older
+cache entry supplies no summary, the report says so and still shows the ID;
+`--no-cache` refreshes old results with any descriptions supplied by the scanners.
+
+Unsupported ecosystem audits are grouped by scanner and reason, with a count
+of affected roots. Individual roots remain in the result JSON. Successful and
+broken ecosystem audits keep their per-root detail. This presentation does not
+change verdicts, counts, or operator overrides.
+
 ### Scan cache (`--deps-only`)
 
 A dependency-only scan reads only dependency evidence: the lockfiles and
