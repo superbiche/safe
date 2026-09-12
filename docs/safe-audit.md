@@ -334,6 +334,14 @@ record with per-severity counts. Four rules govern that normalization:
   project behind an operator prompt for a tool that was never going to answer.
   A `package.json` with **no lockfile at all** is different: nothing covers
   those dependencies, so that WARNs rather than reporting a clean project.
+- `cargo audit` receives `--file Cargo.lock` and never generates a lockfile.
+  A Rust root without its own `Cargo.lock` is reported as skipped with a missing
+  coverage warning, including a workspace member whose lock lives at another
+  root. Existing lockfiles at other discovered roots are still audited. Provide
+  the missing lockfile and retry where independent dependency evidence is needed.
+  This avoids cargo-audit's default `cargo update --workspace` re-entering the
+  package gate during a project audit. If the file disappears after the check,
+  the explicit file argument makes the scanner fail instead of generating it.
 - Coverage that is partly missing is `partial`: when pip-audit audits two
   requirements files and one fails, the advisories the other one found are
   still counted. A failure in one target must not erase a critical found in

@@ -217,6 +217,7 @@ case_composer_advisories_are_keyed_by_package() {
 case_cargo_audit_derives_severity_from_cvss() {
   prepare_case "cargo"
   printf '[package]\nname = "demo"\n' > "$CASE_PROJECT/Cargo.toml"
+  printf 'version = 3\n' > "$CASE_PROJECT/Cargo.lock"
   # RustSec advisories usually carry a CVSS vector and no severity word.
   run_scan CARGO_AUDIT_RC=1 CARGO_AUDIT_OUT='{"vulnerabilities":{"list":[{"advisory":{"id":"RUSTSEC-2026-0001","cvss":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}},{"advisory":{"id":"RUSTSEC-2026-0002"}}]}}'
   assert_jq "$FUNCNAME" '
@@ -224,6 +225,65 @@ case_cargo_audit_derives_severity_from_cvss() {
       | .status == "ok" and .total == 2 and .critical == 1 and .unknown == 1
   ' || return
   assert_jq "$FUNCNAME" '.audit_totals.critical == 1' || return
+  pass "$FUNCNAME"
+}
+
+case_cargo_audit_never_generates_lockfiles() {
+  prepare_case "cargo-no-generation"
+  printf '[package]\nname = "lockless"\n' > "$CASE_PROJECT/Cargo.toml"
+  mkdir -p "$CASE_PROJECT/locked" "$CASE_DIR/cargobin"
+  printf '[package]\nname = "locked"\n' > "$CASE_PROJECT/locked/Cargo.toml"
+  printf 'version = 3\n' > "$CASE_PROJECT/locked/Cargo.lock"
+  local before
+  before=$(sha256sum "$CASE_PROJECT/locked/Cargo.lock")
+  # Model cargo-audit's default-file behavior. A request to generate evidence
+  # enters the REAL gate; its scanner stub bounds recursion at the first hop.
+  cat > "$CASE_DIR/cargobin/cargo" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\t%s\n' "$PWD" "$*" >> "$CARGO_CALLS"
+if [[ "$1" == update ]]; then
+  source "$GATE_LIB"
+  safe_gate_cargo "$@"
+  exit $?
+fi
+[[ "$1" == audit ]] || exit 90
+if [[ "$*" != 'audit --json --file Cargo.lock' ]]; then
+  cargo update --workspace
+  exit $?
+fi
+[[ -f Cargo.lock ]] || { printf 'missing lockfile\n' >&2; exit 1; }
+printf '{"vulnerabilities":{"list":[{"advisory":{"severity":"critical"}}]}}\n'
+exit 1
+STUB
+  cat > "$CASE_DIR/cargobin/safe-audit" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$REENTRY_LOG"
+exit 2
+STUB
+  chmod +x "$CASE_DIR/cargobin/"*
+  run_scan PATH="$CASE_DIR/cargobin:$MOCKBIN:/usr/bin:/bin" \
+    GATE_LIB="$ROOT/lib/gate-lib.sh" CARGO_CALLS="$CASE_DIR/cargo.calls" \
+    SAFE_AUDIT_BIN="$CASE_DIR/cargobin/safe-audit" REENTRY_LOG="$CASE_DIR/reentry"
+  [[ ! -e "$CASE_DIR/reentry" && ! -e "$CASE_PROJECT/Cargo.lock" ]] || {
+    printf 'cargo-audit re-entered the gate or created a lockfile\n' >&2
+    fail "$FUNCNAME"; return
+  }
+  [[ "$(cat "$CASE_DIR/cargo.calls")" == "$CASE_PROJECT/locked"$'\t''audit --json --file Cargo.lock' \
+    && "$(sha256sum "$CASE_PROJECT/locked/Cargo.lock")" == "$before" ]] || {
+    printf 'unexpected cargo calls or lockfile mutation: %s\n' "$(cat "$CASE_DIR/cargo.calls")" >&2
+    fail "$FUNCNAME"; return
+  }
+  assert_jq "$FUNCNAME" '
+    (.ecosystem_audits[] | select(.scanner == "cargo-audit" and .root == ".")
+      | .status == "skipped" and (.note | contains("Cargo.lock missing")))
+    and (.ecosystem_audits[] | select(.scanner == "cargo-audit" and .root == "locked")
+      | .status == "ok" and .critical == 1)
+    and .audit_totals.critical == 1 and .verdict == "WARN"
+  ' || return
+  # With no audited siblings, missing evidence alone must still prevent GO.
+  rm -rf "$CASE_PROJECT/locked"
+  run_scan CARGO_AUDIT_OUT='{"vulnerabilities":{"list":[]}}'
+  assert_jq "$FUNCNAME" '.verdict == "WARN" and .audit_totals.critical == 0' || return
   pass "$FUNCNAME"
 }
 
@@ -1053,6 +1113,7 @@ main() {
     case_garbage_output_is_an_error \
     case_composer_advisories_are_keyed_by_package \
     case_cargo_audit_derives_severity_from_cvss \
+    case_cargo_audit_never_generates_lockfiles \
     case_govulncheck_counts_unique_findings \
     case_govulncheck_pretty_stream_is_read \
     case_govulncheck_pretty_stream_counts_findings \

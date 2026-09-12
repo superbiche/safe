@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Project audits no longer recurse through `cargo update --workspace` when a
+  Rust manifest has no local lockfile. Cargo-audit reads `Cargo.lock` explicitly;
+  missing lockfiles produce a coverage warning without generating dependencies.
+  Local and remote scans use the same behavior; older scan caches are invalidated.
+
 - The install test suite now handles inherited `no-new-privs` correctly, with
   deterministic coverage of both podman probe decisions using a fake executable.
   Restricted agent sessions no longer need an operator to rerun this test.
