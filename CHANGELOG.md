@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- The install test suite now handles inherited `no-new-privs` correctly, with
+  deterministic coverage of both podman probe decisions using a fake executable.
+  Restricted agent sessions no longer need an operator to rerun this test.
+
 ## 1.61.0 - 2026-09-12
 
 - **Project audit reports show critical/high advisories before the install

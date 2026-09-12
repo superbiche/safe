@@ -1015,15 +1015,73 @@ case_doctor_podman_probe_skips_exec_under_no_new_privs() {
     || { printf '%s\n' "${doctor_human}" >&2; fail "$FUNCNAME"; return; }
   grep -A2 'missing prerequisites:' <<<"${doctor_human}" | grep -Fq 'podman' \
     && { printf '%s\n' "${doctor_human}" >&2; fail "$FUNCNAME"; return; }
-  # Outside a sandbox the version probe still runs and no caveat renders.
+  [[ ! -e "${HOME_DIR}/podman-invocations.log" ]] || { fail "$FUNCNAME"; return; }
+  # NoNewPrivs is inherited and cannot be cleared by omitting setpriv.
+  # Check the real caller state; both decisions also have fixture coverage below.
   doctor_out="$(env HOME="${HOME_DIR}" PATH="${bindir}:/usr/bin:/bin" \
     bash "${ROOT_DIR}/bin/safe" doctor --json 2>/dev/null)"
-  jq -e '.dependencies.sandbox.podman.version == "podman version 5.0.0"' \
-    <<<"${doctor_out}" >/dev/null || { printf '%s\n' "${doctor_out}" >&2; fail "$FUNCNAME"; return; }
-  doctor_human="$(env HOME="${HOME_DIR}" PATH="${bindir}:/usr/bin:/bin" \
-    bash "${ROOT_DIR}/bin/safe" doctor 2>/dev/null)"
-  grep -Fq 'podman present but unprobed' <<<"${doctor_human}" \
-    && { printf '%s\n' "${doctor_human}" >&2; fail "$FUNCNAME"; return; }
+  if grep -q '^NoNewPrivs:[[:space:]]*1' /proc/self/status 2>/dev/null; then
+    jq -e '.dependencies.sandbox.podman.probed == false' <<<"${doctor_out}" >/dev/null \
+      || { fail "$FUNCNAME"; return; }
+    [[ ! -e "${HOME_DIR}/podman-invocations.log" ]] || { fail "$FUNCNAME"; return; }
+  else
+    jq -e '.dependencies.sandbox.podman.version == "podman version 5.0.0"' \
+      <<<"${doctor_out}" >/dev/null || { fail "$FUNCNAME"; return; }
+    [[ "$(cat "${HOME_DIR}/podman-invocations.log")" == '--version' ]] \
+      || { fail "$FUNCNAME"; return; }
+  fi
+  pass "$FUNCNAME"
+}
+
+case_doctor_podman_probe_states() {
+  prepare_case "doctor-podman-states"
+  local bindir="${HOME_DIR}/stub-bin" real_grep nnp doctor_out doctor_human
+  real_grep="$(command -v grep)"
+  mkdir -p "${bindir}"
+  # Only substitute the kernel-status query. All other grep calls stay real,
+  # and podman is ALWAYS a stub, including the simulated unrestricted branch.
+  cat > "${bindir}/grep" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$#" == 3 && "$1" == '-q' && "$2" == '^NoNewPrivs:[[:space:]]*1' && "$3" == '/proc/self/status' ]]; then
+  printf 'query\n' >> "$HOME/nnp-queries.log"
+  exec "$SAFE_TEST_REAL_GREP" "$1" "$2" "$HOME/status-fixture"
+fi
+exec "$SAFE_TEST_REAL_GREP" "$@"
+STUB
+  cat > "${bindir}/podman" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$HOME/podman-invocations.log"
+printf 'podman version 5.0.0\n'
+STUB
+  chmod +x "${bindir}/grep" "${bindir}/podman"
+  for nnp in 0 1; do
+    printf 'NoNewPrivs:\t%s\n' "$nnp" > "${HOME_DIR}/status-fixture"
+    rm -f "${HOME_DIR}/nnp-queries.log" "${HOME_DIR}/podman-invocations.log"
+    doctor_out="$(env HOME="${HOME_DIR}" PATH="${bindir}:/usr/bin:/bin" SAFE_TEST_REAL_GREP="$real_grep" \
+      bash "${ROOT_DIR}/bin/safe" doctor --json 2>/dev/null)"
+    doctor_human="$(env HOME="${HOME_DIR}" PATH="${bindir}:/usr/bin:/bin" SAFE_TEST_REAL_GREP="$real_grep" \
+      bash "${ROOT_DIR}/bin/safe" doctor 2>/dev/null)"
+    [[ "$(cat "${HOME_DIR}/nnp-queries.log")" == $'query\nquery' ]] \
+      || { fail "$FUNCNAME (fixture $nnp not consumed)"; return; }
+    jq -e '.dependencies.sandbox.podman.present == true' <<<"$doctor_out" >/dev/null \
+      || { fail "$FUNCNAME ($nnp presence)"; return; }
+    if [[ "$nnp" == 1 ]]; then
+      jq -e '.dependencies.sandbox.podman.probed == false
+        and (.dependencies.sandbox.podman.note | test("no-new-privs"))' <<<"$doctor_out" >/dev/null \
+        || { fail "$FUNCNAME ($nnp JSON)"; return; }
+      grep -Fq 'podman present but unprobed' <<<"$doctor_human" \
+        || { fail "$FUNCNAME ($nnp human)"; return; }
+      [[ ! -e "${HOME_DIR}/podman-invocations.log" ]] || { fail "$FUNCNAME ($nnp exec)"; return; }
+    else
+      jq -e '.dependencies.sandbox.podman.version == "podman version 5.0.0"' <<<"$doctor_out" >/dev/null \
+        || { fail "$FUNCNAME ($nnp JSON)"; return; }
+      if grep -Fq 'podman present but unprobed' <<<"$doctor_human"; then
+        fail "$FUNCNAME ($nnp human)"; return
+      fi
+      [[ "$(cat "${HOME_DIR}/podman-invocations.log")" == $'--version\n--version' ]] \
+        || { fail "$FUNCNAME ($nnp exec)"; return; }
+    fi
+  done
   pass "$FUNCNAME"
 }
 
@@ -6606,6 +6664,7 @@ main() {
     case_wrappers_not_on_path_are_unhealthy \
     case_dash_bin_root_never_reports_healthy \
     case_doctor_podman_probe_skips_exec_under_no_new_privs \
+    case_doctor_podman_probe_states \
     case_doctor_mise_shim_repair_is_actionable \
     case_doctor_ecosystem_auditors_are_advisory_not_prereq \
     case_uv_index_selectors_reach_audit \
