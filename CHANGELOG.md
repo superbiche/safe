@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.61.1 - 2026-09-12
+
 - **Project audits keep their SBOM when nested repositories or `.safe-audit`
   ignores are present.** Syft rejects any exclusion pattern not beginning with
   `./`, `*/`, or `**/` — and one rejected pattern failed the whole SBOM scan,
