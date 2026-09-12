@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.61.0 - 2026-09-12
+
+- **Project audit reports show critical/high advisories before the install
+  decision.** Each entry names the advisory ID, affected package/version,
+  scanner, and upstream summary when provided. OSV summaries/details and Grype
+  descriptions survive normalization and caching; older cache entries still
+  show IDs with an explicit unavailable-summary fallback. Repeated unsupported
+  ecosystem audits collapse to one line per scanner/reason with a root count.
+
 - **The changelog is cut into dated per-version sections.** Releases
   1.13.0–1.60.0 had accumulated un-sectioned under one `## Unreleased` block;
   each now carries its own dated `## x.y.z - date` header. A pure
