@@ -214,7 +214,7 @@ case_contract_never_suggests_latest() {
     return
   fi
   # The two mentions that ARE allowed are the prohibitions themselves.
-  if jq -e '(.version_resolution.never_latest | test("Never suggest"))' >/dev/null 2>&1 < "$CONTRACT"; then
+  if jq -e '(.version_resolution.never_latest | test("ALWAYS install exact pinned versions.*NEVER execute or hand the operator"))' >/dev/null 2>&1 < "$CONTRACT"; then
     pass "$FUNCNAME"
   else
     fail "$FUNCNAME (the never-latest rule is missing)"

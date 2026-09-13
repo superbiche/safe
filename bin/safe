@@ -1801,6 +1801,23 @@ safe_install_audit_package() {
       safe_install_gate_log "$ecosystem" "$package" "REFUSED_WARN"
       refuse 100 "BLOCKED ${ecosystem} install of ${package} — safe audit verdict WARN; $(safe_install_allow_hint "$package" "$ecosystem"); details: safe explain"
       ;;
+    12)
+      if safe_install_host_allow_matches "$package" "$ecosystem"; then
+        err "Socket is rate-limited for ${package}; exact host-allow entry permits install"
+        safe_install_gate_log "$ecosystem" "$package" "HOST_ALLOW_OVERRIDE"
+        return 0
+      fi
+      if ! safe_gate_operator_terminal; then
+        refuse 102 "BLOCKED ${ecosystem} install of ${package} — Socket is rate-limited; accepting missing Socket scores requires the operator's interactive terminal; hand over the complete command with exact pinned versions; details: safe explain"
+      fi
+      if [[ "${SAFE_GATE_SOCKET_COMMAND_CONSENT:-0}" != 1 ]]; then
+        safe_gate_confirm_socket_command || refuse 100 "BLOCKED ${ecosystem} install of ${package} — Socket is rate-limited and you declined this command's override; wait and retry; details: safe explain"
+        SAFE_GATE_SOCKET_COMMAND_CONSENT=1
+      fi
+      err "${package} — missing Socket score accepted for this command (rate limit)."
+      safe_install_gate_log "$ecosystem" "$package" "SOCKET_RATE_LIMIT_COMMAND_OVERRIDE"
+      return 0
+      ;;
     11)
       # Infra-only WARN: every cause is an audit-tier outage (Socket/OSV
       # unreachable), NOT a finding about the package. The operator override is a
@@ -2268,6 +2285,9 @@ cmd_install_project() {
 }
 
 cmd_install() {
+  local SAFE_GATE_SOCKET_COMMAND_CONSENT=0
+  export -n SAFE_GATE_SOCKET_COMMAND_CONSENT
+  local policy_lib
   local host_mode=0 sandbox_mode=0 yes=0
   local project_mode=0
   local trust_host=0
@@ -2377,12 +2397,16 @@ cmd_install() {
     exec "$SAFE_RUN_PATH" install "${manager_args[@]}"
   fi
 
+  policy_lib="$(gate_lib_path)" || refuse 100 "BLOCKED install — safe gate library missing; rerun install.sh; details: safe explain"
+  source "$policy_lib"
+
   command -v "$manager" >/dev/null 2>&1 || die "safe install --host requires $manager"
 
   mapfile -t audit_packages < <(safe_install_audit_specs "$manager" "${manager_args[@]}")
 
   [[ "${#audit_packages[@]}" -gt 0 ]] || die "usage: safe install --host [package-manager flags...] <pkg> [...]"
 
+  safe_gate_batch_limit "${#audit_packages[@]}" || return $?
   ecosystem="$(safe_install_ecosystem "$manager")"
   case "$manager" in
     composer) safe_install_scan_target_flags composer "${manager_args[@]}" ;;
@@ -2408,7 +2432,10 @@ cmd_install() {
 
   local install_rc
   set +e
-  "${install_cmd[@]}"
+  # Continue through the same wrapper policy in-process, preserving only this
+  # command's local consent. The subshell contains exec and shell-option changes;
+  # a separately invoked wrapper or lifecycle child still starts without consent.
+  ( export SAFE_DIR SAFE_VERSION; safe_gate_dispatch "${install_cmd[@]}" )
   install_rc=$?
   set -e
   [[ "$install_rc" -eq 0 ]] || return "$install_rc"

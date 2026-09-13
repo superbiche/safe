@@ -8890,6 +8890,9 @@ package_audit_command() {
           # terminus", 2026-09-07). Any adverse cause keeps the plain WARN (10).
           if (( aff_count == 0 )) && [[ "$block_line" == PASS* ]] && gate_warn_is_infra_only "$warn_causes_json"; then
             gate_exit=11
+            if jq -e 'length > 0 and all(.[]; . == "socket_rate_limited")' <<<"$warn_causes_json" >/dev/null 2>&1; then
+              gate_exit=12
+            fi
           else
             gate_exit=10
           fi

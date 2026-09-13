@@ -577,6 +577,25 @@ if expect_grep "$ERR_FILE" 'fix now:' "socket refusal carries a recovery path"; 
   pass "socket refusal carries a recovery path"
 fi
 
+# Pure rate limits are distinct from mixed outage/finding WARNs.
+for rate_case in pure plain osv-down affecting; do
+  prepare_case "socket-rate-${rate_case}"
+  fixture="$(osv_fixture_empty)"
+  extra=(--gate install)
+  expected=12
+  osv_status=0
+  if [[ "$rate_case" == plain ]]; then extra=(); expected=10; fi
+  if [[ "$rate_case" == osv-down ]]; then osv_status=1; expected=11; fi
+  if [[ "$rate_case" == affecting ]]; then fixture="$(osv_fixture_affecting_moderate)"; expected=10; fi
+  run_check MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+    MOCK_SOCKET_MODE=rate MOCK_OSV_STATUS="$osv_status" \
+    MOCK_OSV_MATCH_VERSION=2.1.4 MOCK_OSV_FIXTURE="$fixture" \
+    -- brace-expansion@2.1.4 --ecosystem npm "${extra[@]}"
+  if expect_status "$expected" "Socket rate-limit classification: $rate_case"; then
+    pass "Socket rate-limit classification: $rate_case"
+  fi
+done
+
 # ---------------------------------------------------------------------------
 # 8b. Operator opt-in tolerate knob allows socket-outage WARN when OSV clean
 # ---------------------------------------------------------------------------

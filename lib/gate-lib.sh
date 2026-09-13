@@ -2700,6 +2700,31 @@ safe_gate_pip_project_install() {
 # Deliberate per-instance override for an infra-only WARN on the wrapper path.
 # Reads /dev/tty, never stdin (the wrapped tool owns stdin); reached only after
 # the caller confirmed a TTY. Declining or an unreadable tty returns non-zero.
+# Command-local consent is initialized by safe_gate_main, never imported from
+# the environment or persisted. A PTY is necessary, not proof of human identity:
+# recognized agent sessions are also refused; agent instructions prohibit PTYs
+# or marker removal to obtain operator privileges.
+safe_gate_operator_terminal() {
+  [[ -t 0 && -t 1 && -z "${CODEX_THREAD_ID:-}" && -z "${CODEX_CI:-}" &&
+     -z "${CLAUDECODE:-}" && -z "${OPENCODE:-}" ]]
+}
+
+safe_gate_batch_limit() {
+  (( $1 <= 3 )) && return 0
+  if ! safe_gate_operator_terminal; then
+    safe_gate_err "safe: BLOCKED install — $1 requested packages exceeds the unattended maximum of 3; hand the complete command with exact pinned versions to the operator for an interactive terminal; do not split the task into smaller commands; details: safe explain"
+    return 102
+  fi
+}
+
+safe_gate_confirm_socket_command() {
+  local reply
+  safe_gate_err "safe: Socket is rate-limited. Approval covers missing Socket scores for this install command only; other security checks remain active."
+  printf 'safe: continue this install without Socket scores? [y/N] ' >&2
+  IFS= read -r reply </dev/tty || return 1
+  case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
 safe_gate_confirm_infra() {
   local package="$1"
   local reply
@@ -2850,6 +2875,27 @@ safe_gate_allow_hint() {
   esac
 }
 
+safe_gate_accept_socket_rate_limit() {
+  local package="$1" ecosystem="$2"
+  # Only a pure Socket rate-limit WARN earns command-wide consent. Every
+  # package is still audited: another outage, advisory or BLOCK takes its
+  # own ordinary path, never this approval.
+  if ! safe_gate_operator_terminal; then
+    safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — Socket is rate-limited; accepting missing Socket scores requires the operator's interactive terminal; hand over the complete command with exact pinned versions; details: safe explain"
+    return 102
+  fi
+  if [[ "${SAFE_GATE_SOCKET_COMMAND_CONSENT:-0}" != 1 ]]; then
+    if ! safe_gate_confirm_socket_command; then
+      safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — Socket is rate-limited and you declined this command's override; wait and retry; details: safe explain"
+      return 100
+    fi
+    SAFE_GATE_SOCKET_COMMAND_CONSENT=1
+  fi
+  safe_gate_err "safe: ${package} — missing Socket score accepted for this command (rate limit)."
+  safe_gate_audit_log "${ecosystem}" "${package}" "SOCKET_RATE_LIMIT_COMMAND_OVERRIDE"
+  return 0
+}
+
 # Check one package via safe audit's install gate.
 # Returns: 0=GO/proceed, 100=policy refusal, 104=audit BLOCK verdict.
 safe_gate_check() {
@@ -2909,6 +2955,20 @@ safe_gate_check() {
       safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — safe audit verdict WARN; $(safe_gate_allow_hint "${package}" "${ecosystem}"); details: safe explain"
       safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_WARN"
       return 100
+      ;;
+    12)
+      # Preserve an existing exact grant in the audit's source context, before
+      # any mise deferral; never reinterpret that grant in the parent's env.
+      if safe_gate_host_allow_matches "$package" "$ecosystem"; then
+        safe_gate_err "safe install: Socket is rate-limited for ${package}; exact host-allow entry permits install"
+        safe_gate_audit_log "$ecosystem" "$package" "HOST_ALLOW_OVERRIDE"
+        return 0
+      fi
+      # A mise package audit runs under an isolated env/cwd. Defer only this
+      # decision to its parent so the consent lasts across sibling packages.
+      [[ "${3:-}" == defer-socket-consent ]] && return 12
+      safe_gate_accept_socket_rate_limit "$package" "$ecosystem"
+      return $?
       ;;
     11)
       # Infra-only WARN: every cause is an audit-tier outage, NOT a package
@@ -2977,6 +3037,7 @@ safe_gate_check_many() {
   shift
   local package
 
+  safe_gate_batch_limit "$#" || return $?
   for package in "$@"; do
     safe_gate_check "${package}" "${ecosystem}" || return $?
   done
@@ -3924,6 +3985,11 @@ safe_gate_npm_like() {
       install|i|it|install-test|add|ci|update|u|up|upgrade|udpate|dedupe|ddp|prune) ;;
       *) (( npm_lockdiff_lane == 0 )) || safe_gate_exec_real "${tool}" "$@" ;;
     esac
+  fi
+
+  if [[ "${npm_class}" != "ci" ]]; then
+    safe_gate_collect raw "$("${parser}" "${rest[@]}")"
+    safe_gate_batch_limit "${#raw[@]}" || return $?
   fi
 
   if [[ "${tool}" == "npm" ]]; then
@@ -4925,6 +4991,7 @@ safe_gate_mise_check_with_env() {
     safe_gate_err "safe: mise ${pkg}: ${unmodeled} selects a ${installer} source safe cannot resolve advisories against — not audit-gated; review manually, or install from the default source to get a checked verdict"
     return 0
   fi
+  local audit_rc=0
   (
     if [[ -n "${SAFE_GATE_MISE_CD:-}" ]]; then
       # PHYSICAL cd (`cd -P`) to match mise's own chdir: mise -C runs Rust
@@ -4963,8 +5030,13 @@ safe_gate_mise_check_with_env() {
         [[ -n "${MISE_PIPX_REGISTRY_URL:-}" ]] && SAFE_GATE_REGISTRY="$(safe_gate_pipx_index_url "${MISE_PIPX_REGISTRY_URL}")"
         ;;
     esac
-    safe_gate_check "$pkg" "$eco"
-  )
+    safe_gate_check "$pkg" "$eco" defer-socket-consent
+  ) || audit_rc=$?
+  if (( audit_rc == 12 )); then
+    safe_gate_accept_socket_rate_limit "$pkg" "$eco"
+  else
+    return "$audit_rc"
+  fi
 }
 
 # Audit one explicit tool spec (argv or config-derived). The audited identity
@@ -5593,6 +5665,7 @@ safe_gate_mise_gate_install() {
   local sub="$1"
   shift
   safe_gate_mise_parse_sub "$sub" "$@" || return $?
+  safe_gate_batch_limit "${#SAFE_GATE_MISE_SPECS[@]}" || return $?
 
   local -a specs=("${SAFE_GATE_MISE_SPECS[@]+"${SAFE_GATE_MISE_SPECS[@]}"}")
   if (( ${#specs[@]} == 0 )); then
@@ -5634,6 +5707,7 @@ safe_gate_mise_gate_use() {
   fi
   # `use` honors --minimum-release-age too: without the guard it audited an
   # unconstrained target while mise selected an older one (delta-2 F3).
+  safe_gate_batch_limit "${#SAFE_GATE_MISE_SPECS[@]}" || return $?
   safe_gate_mise_min_age_guard "${SAFE_GATE_MISE_SPECS[@]}" || return $?
   safe_gate_mise_overlay_or_refuse || return $?
   local spec
@@ -5656,6 +5730,7 @@ safe_gate_mise_exec_auto_install_enabled() {
 
 safe_gate_mise_gate_exec() {
   safe_gate_mise_parse_sub exec "$@" || return $?
+  safe_gate_batch_limit "${#SAFE_GATE_MISE_SPECS[@]}" || return $?
 
   local -a audit=("${SAFE_GATE_MISE_SPECS[@]+"${SAFE_GATE_MISE_SPECS[@]}"}")
   local -a cmd=("${SAFE_GATE_MISE_CMD[@]+"${SAFE_GATE_MISE_CMD[@]}"}")
@@ -5723,6 +5798,7 @@ safe_gate_mise_gate_exec() {
         ;;
     esac
     (
+      set -- "${SAFE_GATE_SOCKET_COMMAND_CONSENT:-0}" "${cmd[@]}"
       if [[ -n "${SAFE_GATE_MISE_CD:-}" ]]; then
         # PHYSICAL cd + CDPATH neutralized — see the twin site in
         # safe_gate_mise_check_with_env: mise's -C chdirs physically (chdir(2),
@@ -5739,7 +5815,10 @@ safe_gate_mise_gate_exec() {
         exit 100
       }
       SAFE_GATE_NO_EXEC=1
-      safe_gate_main "${cmd[0]}" "${cmd[@]:1}"
+      SAFE_GATE_SOCKET_COMMAND_CONSENT="$1"
+      export -n SAFE_GATE_SOCKET_COMMAND_CONSENT
+      shift
+      safe_gate_dispatch "$@"
     ) || return $?
   fi
   return 0
@@ -5884,6 +5963,15 @@ safe_gate_mise() {
 }
 
 safe_gate_main() {
+  local SAFE_GATE_SOCKET_COMMAND_CONSENT=0
+  export -n SAFE_GATE_SOCKET_COMMAND_CONSENT
+  safe_gate_dispatch "$@"
+}
+
+# Also used in a subshell by safe install after its own package audits: that
+# internal continuation shares this command's consent without exporting it to
+# wrappers or child install scripts. Every external entry calls main and resets.
+safe_gate_dispatch() {
   local tool="${1:-}"
   shift || true
 

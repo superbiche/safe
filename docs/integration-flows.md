@@ -83,9 +83,12 @@ npm install express
 Flow:
 
 1. The PATH wrapper execs `safe gate npm`, which detects a package install.
+   More than three explicit package targets requires an operator terminal before audits.
 2. If the current directory looks like an npm project, it runs `safe audit repo-audit .`.
 3. It extracts package specs and runs `safe audit package-audit <pkg> --ecosystem npm --gate install`.
-4. Only a passing gate proceeds.
+4. Only a passing gate or applicable deliberate operator override proceeds.
+   Pure Socket rate limits can be accepted once for this command; all package
+   audits continue, and other outages/findings retain their own decision paths.
 5. The real command runs through the first non-wrapper `npm` on PATH.
 
 Equivalent gate routing exists for pnpm, pnpx, yarn, bun, uv, pip, pip3, cargo, go, composer, and mise (Volta is retired).

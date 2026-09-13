@@ -37,6 +37,8 @@ trap 'rm -rf "$tmp"' EXIT
 shim="$tmp/bin"
 mkdir -p "$shim"
 cp "$SAFE" "$shim/safe"
+mkdir -p "$tmp/lib"
+cp "$ROOT/lib/gate-lib.sh" "$tmp/lib/gate-lib.sh"
 chmod +x "$shim/safe"
 
 cat > "$shim/safe-run" <<'SH'
@@ -133,6 +135,15 @@ ln -s npm "$shim/composer"
 [[ "$("$shim/safe" run --version)" == "safe-run mock" ]] || fail "safe run did not route"
 [[ "$("$shim/safe" audit --version)" == "safe-audit mock" ]] || fail "safe audit did not route"
 [[ "$("$shim/safe" install --allow-scripts cowsay@1.6.0)" == $'safe-run\tinstall\t--allow-scripts\tcowsay@1.6.0' ]] || fail "safe install did not route to safe run install"
+# Help and sandbox dispatch do not depend on the host gate library.
+nolib="$tmp/no-gate-lib"
+mkdir -p "$nolib/bin"
+cp "$SAFE" "$nolib/bin/safe"
+cp "$shim/safe-run" "$nolib/bin/safe-run"
+SAFE_CONFIG_DIR="$nolib/config" SAFE_GATE_LIB= "$nolib/bin/safe" install --help >/dev/null || fail "install help requires gate-lib"
+[[ "$(SAFE_CONFIG_DIR="$nolib/config" SAFE_GATE_LIB= "$nolib/bin/safe" install --sandbox cowsay@1.6.0)" == $'safe-run\tinstall\tcowsay@1.6.0' ]] || fail "sandbox dispatch requires gate-lib"
+pass "help and sandbox dispatch work without host gate library"
+
 host_install_output="$(PATH="$shim:$PATH" "$shim/safe" install --yes -g cowsay@1.6.0)"
 grep -Fq $'safe-audit\tpackage-audit\tcowsay@1.6.0\t--ecosystem\tnpm' <<<"$host_install_output" || fail "safe install did not audit global npm package"
 grep -Fq $'npm\tinstall\t-g\tcowsay@1.6.0' <<<"$host_install_output" || fail "safe install did not forward global npm flags"
