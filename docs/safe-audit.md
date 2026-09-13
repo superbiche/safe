@@ -584,11 +584,16 @@ proceed:
   version. Otherwise it refuses with an actionable, always-pinned hint —
   suggestions never use `@latest`. The refusal code distinguishes the cause: a
   WARN whose causes are **entirely** audit-infrastructure outages (Socket/OSV
-  unreachable) with no adverse package evidence exits **11** — a missing signal,
+  unreachable) with no adverse package evidence exits **11** (or **12** when
+  every cause is specifically `socket_rate_limited`) — a missing signal,
   not a package finding — while any WARN carrying real package evidence exits
   **10**. Plain `safe audit package-audit` exits 10 for both; only gate mode
   distinguishes them, so the install gate can offer the operator a deliberate
   per-instance override for exit 11 rather than a misleading host-allow vouch.
+  Exit 12 offers one deliberate operator-terminal approval for rate-limit-only
+  results across the current install command. Every package is still audited;
+  another outage or finding keeps its own decision path. This consent expires
+  at command exit and is unavailable to agents.
 - **BLOCK** refuses (exit 20) and points at operator review.
 
 A Socket scoring failure (missing CLI, auth, rate limit) is reported as an

@@ -663,7 +663,7 @@ expect_json '.verdict == "WARN" and (.warn_causes | index("socket_error") != nul
 
 prepare_case infra-only-gate-rate
 run_check rate --gate install --op install
-expect_rc 11 'a rate-limited Socket outage is gate exit 11'
+expect_rc 12 'a rate-limited Socket outage is gate exit 12'
 
 # The split is gate-only: plain preflight of the same outage stays exit 10, so
 # `safe audit package-audit` keeps its documented verdict-code contract.

@@ -209,19 +209,22 @@ an unaudited install through.
 
 Examples that trigger package checks:
 
+These are routing illustrations, not recommended package versions. Resolve and
+audit each real target before using it; `example-package` is illustrative.
+
 ```bash
 npm install -g cowsay@1.6.0
-npm install express
-pnpm add lodash
-yarn global add typescript
-bun add -g cowsay
-uv tool install ruff
+npm install example-package@1.2.3
+pnpm add example-package@1.2.3
+yarn global add example-package@1.2.3
+bun add -g cowsay@1.6.0
+uv tool install example-package==1.2.3
 uv pip install black==24.4.0
 pip install black==24.4.0
 pip3 install pytest==8.3.0
-cargo install cargo-edit
-go install golang.org/x/tools/cmd/stringer@latest
-composer require vendor/package
+cargo install example-package --version 1.2.3
+go install golang.org/x/tools/cmd/stringer@v0.24.0
+composer require vendor/package:1.2.3
 ```
 
 ## Wrapped Project Operations
@@ -253,15 +256,15 @@ same way installs are — the named package goes through `safe audit package-aud
 before the real tool runs:
 
 ```bash
-npm exec create-vite        # bare name: passthrough if node_modules/.bin/create-vite exists (cwd or parent)
-npm x cowsay
-npm exec --package=cowsay -- cowsay hi
+npm exec --no -- create-vite  # local-only: refuses if the binary is absent
+npm x cowsay@1.6.0
+npm exec --package=cowsay@1.6.0 -- cowsay hi
 pnpm dlx cowsay@1.6.0
-yarn dlx create-react-app
-bun x cowsay
-uv run --with rich script.py   # audits the --with / -w packages only
-uv tool run ruff
-go run example.com/cmd/tool@latest
+yarn dlx example-package@1.2.3
+bun x cowsay@1.6.0
+uv run --with example-package==1.2.3 script.py   # audits the --with / -w packages only
+uv tool run example-package==1.2.3
+go run example.com/cmd/tool@v1.2.3
 ```
 
 The package is identified as the value of `--package`/`--from` (or the first
@@ -297,7 +300,7 @@ and `composer exec` (project/vendor binaries only), `uv run` without
 `npm exec <tool>` / `bun x <tool>` pass through only for a **bare** command
 name backed by `node_modules/.bin/<tool>` in the physical cwd or a parent
 directory (npm's own bin resolution, covering hoisted monorepos); a versioned or aliased spec
-(`tool@1.2.3`, `tool@npm:other`) can still resolve to a remote fetch, so it
+(`tool@1.2.3`, `tool@npm:other@1.2.3`) can still resolve to a remote fetch, so it
 is always audited even when a same-named local bin exists.
 
 ## Refusal Contract
@@ -315,8 +318,9 @@ mismatch, `102` interactive operator confirmation required (non-TTY refusal),
 [Agent Contract](agents.md) page and `safe explain`.
 
 At an interactive terminal a gate WARN is not a dead end: the gate offers the
-operator a deliberate override rather than only the host-allow copy-paste. An
-infra-only WARN (every cause an audit-infrastructure outage — gate exit `11`)
+operator a deliberate override rather than only the host-allow copy-paste. Any
+other infra-only WARN (every cause an audit-infrastructure outage, with no package
+finding — gate exit `11`)
 prompts a one-shot confirmation; an adverse WARN (a real package finding)
 prints it and offers `[y]` install once / `[a]` install and record a standing
 host-allow grant (npm/python only) / `[N]` cancel. The override reads
@@ -354,5 +358,27 @@ an indefinite hang.
 `SAFE_INSTALL_TIMEOUT_SECONDS` overrides the computed leash absolutely:
 
 ```bash
-SAFE_INSTALL_TIMEOUT_SECONDS=60 npm install express
+SAFE_INSTALL_TIMEOUT_SECONDS=60 npm install example-package@1.2.3
 ```
+
+### Operator command consent and agent batch limits
+
+A WARN caused solely by Socket rate limiting has gate-only exit 12. The
+operator can accept missing Socket scores once for the current install command.
+The gate keeps auditing each package; only repeated rate-limit-only prompts are
+suppressed. Other outages, adverse findings and BLOCKs retain their normal paths.
+An existing exact host-allow grant remains effective; this feature creates none.
+Consent lives only in the gate process, expires at command exit and is never
+saved as host trust or exposed as an environment bypass switch.
+
+The new approval requires stdin and stdout to be terminals, reads `/dev/tty`,
+and rejects recognized agent sessions. A PTY is not human authentication: agents
+must never manufacture one, clear markers or answer these prompts.
+
+An unattended command naming more than three package targets refuses with exit
+102 before package audits. The limit counts requested targets, not transitive
+dependencies or an existing lockfile's size. Agents must hand larger tasks to the
+operator as a single exact-pinned command, not split them to evade the limit.
+ALWAYS pin exact versions in agent installs and operator handoffs; NEVER use
+`@latest`, moving tags, ranges or unversioned package targets. Lockfile installs
+retain their exact resolved versions without listing transitives on the CLI.
