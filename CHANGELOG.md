@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.62.0 - 2026-09-13
+
 - Accept Socket rate-limit-only warnings once per operator install command; keep all audits active and refuse agent/non-interactive consent.
 - Refuse unattended installs naming more than three packages before package audits. Require exact pinned versions in agent installs and operator handoffs; forbid splitting larger tasks to evade handoff.
 
