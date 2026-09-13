@@ -318,8 +318,9 @@ mismatch, `102` interactive operator confirmation required (non-TTY refusal),
 [Agent Contract](agents.md) page and `safe explain`.
 
 At an interactive terminal a gate WARN is not a dead end: the gate offers the
-operator a deliberate override rather than only the host-allow copy-paste. An
-other infra-only WARN (an audit-infrastructure outage — gate exit `11`)
+operator a deliberate override rather than only the host-allow copy-paste. Any
+other infra-only WARN (every cause an audit-infrastructure outage, with no package
+finding — gate exit `11`)
 prompts a one-shot confirmation; an adverse WARN (a real package finding)
 prints it and offers `[y]` install once / `[a]` install and record a standing
 host-allow grant (npm/python only) / `[N]` cancel. The override reads
