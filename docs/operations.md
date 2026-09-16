@@ -73,8 +73,50 @@ safe run host-allow import allow.json           # machine 2: reviewed apply (TTY
 
 `import` re-validates and re-fetches integrity for every entry, never overwrites
 a divergent local pin, and refuses in non-TTY shells (exit 102) unless
-`--dry-run`. The allow set is deliberately not auto-synced between machines — see
-[Host Allowlist › Fleet replication](safe-run.md#fleet-replication-export--import).
+`--dry-run`. For unattended fleet followers, opt in to signed UNION replication:
+
+```bash
+# Follower provisioning: import and independently verify the operator's public
+# GPG key, then pin its full primary fingerprint at an operator terminal.
+safe run host-allow follow-signer add <full-primary-fingerprint>
+
+# rainbow: operator terminal (GPG key/passphrase or hardware-token touch).
+safe run host-allow export --sign
+
+# agent-dev: unattended preview, then apply (no TTY required).
+safe run host-allow follow --dry-run
+safe run host-allow follow
+```
+
+Signed exports are `~/Sync/state/safe/host-allow.<short-hostname>.json` with
+`.json.asc` signatures. Synchronize these two files, not `host-allow.json` or
+`config.json`. Use `export --sign --out <dir>` and `follow --from <dir>` for a
+custom transport directory. Optional `follow.signing_key` selects the origin's
+GPG key; `follow.signers` is maintained by the TTY-only `follow-signer add|remove`
+commands. Provision public keys locally first; follow never retrieves keys.
+
+A user timer can invoke `safe run host-allow follow` daily. This change does not
+install a timer or automatically sign after add. Own-host files are ignored;
+verified statements add only absent grants after import validation, retaining
+the original `added` date and recording `followed_from`. Dry-run validates the
+whole plan without changing persistent state. Exit 0 means all eligible files
+were handled or nothing needed doing; non-zero surfaces skipped signatures,
+invalid entries or pin conflicts to the timer. Valid files can still apply
+alongside failures. A transport delivering mismatched JSON/signature generations
+causes a safe rejection; rerun after both files have arrived.
+
+For a skipped file, the operator can review it and run
+`safe run host-allow import <file>` at a TTY. Conflicting pins need the usual
+`safe run host-allow update <pkg>@<version> --reason "..."`. Signature failures
+and counts are emitted by follow; there is no persistent doctor status in this
+slice. Unpinning a signer revokes future acceptance, not existing grants. Old
+signed exports can re-add removed grants while the signer remains pinned; retire
+those exports or revoke the signer when withdrawing trust. Protect the signing
+key and provision signer configuration through a trusted operator session;
+TTY gating retains the existing cooperative-agent boundary.
+
+See [Host Allowlist › Fleet replication](safe-run.md#fleet-replication-export--import)
+for validation, signature-keyring and operator-override details.
 
 ## Scan Modes
 

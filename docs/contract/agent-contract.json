@@ -150,9 +150,21 @@
     {
       "command": "safe run block list && safe run audit --blocked",
       "purpose": "review refusals"
+    },
+    {
+      "command": "safe run host-allow export --sign",
+      "purpose": "operator-signed fleet export (TTY)"
+    },
+    {
+      "command": "safe run host-allow follow-signer add <fingerprint>",
+      "purpose": "pin a full GPG primary fingerprint (operator TTY)"
+    },
+    {
+      "command": "safe run host-allow follow [--dry-run] [--from <dir>]",
+      "purpose": "agent-permitted UNION of verified operator-signed grants"
     }
   ],
-  "allow_flows_note": "Trust escalations require the operator's interactive terminal. `safe run host-allow add`, `update`, and `import` (without `--dry-run`) refuse in non-TTY shells with exit 102, so an agent can suggest the command but never execute it.",
+  "allow_flows_note": "Trust escalations require the operator's interactive terminal. `safe run host-allow add`, `update`, `import` (without `--dry-run`), `export --sign`, and `follow-signer add|remove` refuse in non-TTY shells with exit 102. Agents may run `safe run host-allow follow [--dry-run] [--from <dir>]`: it applies statements signed by an operator whose full GPG primary fingerprint was pinned at a TTY in follow.signers, so it is not a new agent trust escalation. It verifies signatures with an isolated pinned-key keyring, re-validates exact pins and registry integrity as import does, adds only missing entries, and never removes grants or overwrites different local pins. Signature skips, invalid entries and conflicts return non-zero; already-present pins are successful no-ops. Dry-run changes no persistent state. Skipped files retain the operator's TTY import override; conflicting pins require an explicit update. --yes never grants trust, and the redirected-store write guard remains active.",
   "no_partial_load": "Gating is executable-based: a wrapper either runs the full gate or is not on PATH at all. If `safe gate` cannot load its routing tables it refuses with the usual `safe: BLOCKED` line and exit 100 rather than delegating. A bare silent 127 therefore means the command genuinely is not installed — or that `safe` itself is missing from PATH, which is worth reporting.",
   "harness_snippet": "## Package manager gates\n\nThis machine gates package execution/installation through `safe`. If a\ncommand fails with a `safe: BLOCKED` / `safe run: BLOCKED` line or exit code\n100–104, that is policy, not breakage: run `safe explain`, relay the refusal\nand its `to allow:` command to the operator verbatim, and never bypass\n(no direct node_modules/.bin calls, alternate installers, or curl|sh).\nSuspected false positive: `safe report-fp <spec>`.\nALWAYS use exact pinned package versions in installs and operator handoffs;\nNEVER use @latest, moving tags, ranges or unversioned targets. Maximum 3\nrequested packages per unattended task; hand larger tasks to the operator\nwithout splitting them or manufacturing a TTY to obtain consent."
 }

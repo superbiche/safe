@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Add operator-TTY `safe run host-allow export --sign [--out <dir>]`, writing
+  schema `/2` host/timestamp metadata and a detached armored GPG signature;
+  unsigned stdout exports retain schema `/1`, and import accepts both.
+- Add TTY-only `host-allow follow-signer add|remove <fingerprint>` and unattended
+  `host-allow follow [--dry-run] [--from <dir>]`. Follow verifies only pinned
+  primary keys and their signing subkeys in an isolated keyring, shares import's
+  entry validation and registry-integrity checks, and merges by UNION with
+  original dates and `followed_from` provenance. It never removes grants or
+  replaces a different local pin; grant writers lock and recheck before writing.
+  Signature skips, invalid entries and conflicts return non-zero with the
+  existing operator-TTY import/update recovery path. No `--yes` override.
+
 ## 1.62.0 - 2026-09-13
 
 - Accept Socket rate-limit-only warnings once per operator install command; keep all audits active and refuse agent/non-interactive consent.

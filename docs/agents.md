@@ -139,16 +139,19 @@ If an agent sees a bare, silent 127 from a wrapped tool, that means the command
 genuinely is not installed — or that `safe` itself is missing from PATH, which
 is worth reporting to the operator. It is never a reason to bypass.
 
-## Allow flows (operator only)
+## Allow flows and signed followers
 
 <!-- BEGIN GENERATED: allow-flows -->
-Trust escalations require the operator's interactive terminal. `safe run host-allow add`, `update`, and `import` (without `--dry-run`) refuse in non-TTY shells with exit 102, so an agent can suggest the command but never execute it.
+Trust escalations require the operator's interactive terminal. `safe run host-allow add`, `update`, `import` (without `--dry-run`), `export --sign`, and `follow-signer add|remove` refuse in non-TTY shells with exit 102. Agents may run `safe run host-allow follow [--dry-run] [--from <dir>]`: it applies statements signed by an operator whose full GPG primary fingerprint was pinned at a TTY in follow.signers, so it is not a new agent trust escalation. It verifies signatures with an isolated pinned-key keyring, re-validates exact pins and registry integrity as import does, adds only missing entries, and never removes grants or overwrites different local pins. Signature skips, invalid entries and conflicts return non-zero; already-present pins are successful no-ops. Dry-run changes no persistent state. Skipped files retain the operator's TTY import override; conflicting pins require an explicit update. --yes never grants trust, and the redirected-store write guard remains active.
 
 ```bash
 safe run host-allow add <pkg>@<version> --reason "..."   # trusted host exec (npm)
 safe run -y <pkg>@<version> -- <args>                    # one-off sandbox run
 safe install [-g] <pkg>@<version>                        # audited install
 safe run block list && safe run audit --blocked          # review refusals
+safe run host-allow export --sign                        # operator-signed fleet export (TTY)
+safe run host-allow follow-signer add <fingerprint>      # pin a full GPG primary fingerprint (operator TTY)
+safe run host-allow follow [--dry-run] [--from <dir>]    # agent-permitted UNION of verified operator-signed grants
 ```
 <!-- END GENERATED: allow-flows -->
 
