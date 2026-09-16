@@ -85,6 +85,23 @@ receipt. It smooths the install gate only (offline/timeout fallback within
 host-execution trust stays in `host-allow.json`, which is TTY-gated and
 unchanged.
 
+`follow.signing_key` in `run/config.json` optionally selects the GPG key for
+operator-only `safe run host-allow export --sign`; absent, GPG uses its default.
+`follow.signers` is a list of full GPG primary-key fingerprints. Manage it at an
+operator TTY using `safe run host-allow follow-signer add|remove <fingerprint>`;
+add requires that public key in the local GPG keyring. `follow` verifies signed
+exports in an isolated keyring containing only these authorities (including
+their certified signing subkeys), honouring key revocation/expiry and signature
+expiry. Update revocation information in the follower's local GPG keyring;
+verification never fetches keys. Unrelated expired/revoked subkeys do not
+invalidate a good signature. `follow-state.json`, beside the guard-selected
+host-allow store, records per-origin `{accepted, applied:["pkg@version"]}` and
+must remain local. Preserve it when removing grants: equal generations skip
+applied identities and retry pending ones; older generations are refused.
+An equal generation with nothing pending returns 0 with one info line. Legacy
+string-only records require operator review/migration, never silent reset.
+Both operations retain the redirected-store guard. See [signed follower import](safe-run.md#signed-follower-import).
+
 `config.json` stores runtime defaults, linked runner paths, sandbox limits, warning behavior, and the install-gate policy:
 
 ```json

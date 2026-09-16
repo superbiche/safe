@@ -73,8 +73,81 @@ safe run host-allow import allow.json           # machine 2: reviewed apply (TTY
 
 `import` re-validates and re-fetches integrity for every entry, never overwrites
 a divergent local pin, and refuses in non-TTY shells (exit 102) unless
-`--dry-run`. The allow set is deliberately not auto-synced between machines — see
-[Host Allowlist › Fleet replication](safe-run.md#fleet-replication-export--import).
+`--dry-run`. For unattended fleet followers, opt in to signed UNION replication:
+
+```bash
+# Follower provisioning: import and independently verify the operator's public
+# GPG key, then pin its full primary fingerprint at an operator terminal.
+safe run host-allow follow-signer add <full-primary-fingerprint>
+
+# rainbow: operator terminal (GPG key/passphrase or hardware-token touch).
+safe run host-allow export --sign
+
+# agent-dev: unattended preview, then apply (no TTY required).
+safe run host-allow follow --dry-run
+safe run host-allow follow
+```
+
+Signed exports are `~/Sync/state/safe/host-allow.<short-hostname>.json` with
+`.json.asc` signatures. Synchronize these two files, not `host-allow.json` or
+`config.json`. Use `export --sign --out <dir>` and `follow --from <dir>` for a
+custom transport directory. Optional `follow.signing_key` selects the origin's
+GPG key; `follow.signers` is maintained by the TTY-only `follow-signer add|remove`
+commands. Provision public keys locally first; follow never retrieves keys.
+Revocation and expiry are honoured, including revoked/expired signature statuses
+that GPG can report with exit 0. Key-level warnings about unrelated expired or
+revoked subkeys do not reject a good signature. A signature actually made by an
+expired/revoked key is still rejected. Revoked or expired primary keys cannot be pinned.
+Distribute revocation certificates and updated public keys to every follower's
+local keyring; there is no automatic keyserver refresh.
+
+A user timer can invoke `safe run host-allow follow` daily. This change does not
+install a timer or automatically sign after add. Own-host files are ignored;
+verified statements add only absent grants after import validation, retaining
+the original `added` date and recording `followed_from`. Dry-run validates the
+whole plan without changing persistent state. A machine-local `follow-state.json`
+beside the guard-selected trust store records each origin as
+`{"accepted":"<exported_at>","applied":["<pkg>@<version>"]}`. Older timestamps
+warn, increment the freshness-skip count and return non-zero. Equal timestamps
+retry only identities that never applied; successful entries stay skipped even
+after operator removal. A registry outage is therefore retryable with the same
+signed file. Once complete, unchanged daily runs return 0 with one quiet info
+line, no registry calls and no import prescription. Verification still runs.
+A newer signed generation starts a fresh applied set. Timestamp comparisons
+normalize timezone offsets.
+
+Add/update/import/follow and removal share the host-store writer lock. Follow
+fetches registry evidence outside it (10 seconds maximum per request), then
+rechecks the generation, applied identities and local pins during its locked
+commit. Lock waits are bounded to 10 seconds with a writer-busy recovery hint.
+Valid files and entries can still apply alongside failures. A mismatched
+JSON/signature pair during transport is safely rejected; retry after both arrive.
+
+For an actual skip/error, the operator can review the file and run
+`safe run host-allow import <file>` at a TTY. Conflicting pins need the usual
+`safe run host-allow update <pkg>@<version> --reason "..."`. Signature and older
+replay failures/counts are emitted by follow; there is no persistent doctor
+status in this slice. Dry-run never creates or changes freshness state or its
+lock file. Keep the ledger local and preserve it across restarts/removal.
+Malformed records (including the earlier experimental generation-only format)
+need operator review/migration; do not erase history to force a retry.
+
+Each applied identity is marked immediately before publishing its grant, and a
+reported write failure rolls back that mark. Interruption between the separate
+atomic ledger/store renames may conservatively consume that one identity without
+its grant; recover it with deliberate TTY import or a newer signed generation.
+Registry failures and other unapplied entries remain retryable unattended.
+
+Unpinning/revoking a signer stops future acceptance, not existing grants.
+Freshness prevents replay only for generations this machine already accepted:
+initial bootstrap, a newer signed statement, or another authorized origin can
+still authorize a previously removed grant. Retire those exports or revoke the
+signer when withdrawing fleet-wide trust. Protect the signing key and provision
+signer configuration through a trusted operator session;
+TTY gating retains the existing cooperative-agent boundary.
+
+See [Host Allowlist › Fleet replication](safe-run.md#fleet-replication-export--import)
+for validation, signature-keyring and operator-override details.
 
 ## Scan Modes
 

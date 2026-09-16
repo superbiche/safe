@@ -139,16 +139,19 @@ If an agent sees a bare, silent 127 from a wrapped tool, that means the command
 genuinely is not installed — or that `safe` itself is missing from PATH, which
 is worth reporting to the operator. It is never a reason to bypass.
 
-## Allow flows (operator only)
+## Allow flows and signed followers
 
 <!-- BEGIN GENERATED: allow-flows -->
-Trust escalations require the operator's interactive terminal. `safe run host-allow add`, `update`, and `import` (without `--dry-run`) refuse in non-TTY shells with exit 102, so an agent can suggest the command but never execute it.
+Trust escalations require the operator's interactive terminal. `safe run host-allow add`, `update`, `import` (without `--dry-run`), `export --sign`, and `follow-signer add|remove` refuse in non-TTY shells with exit 102. Agents may run `safe run host-allow follow [--dry-run] [--from <dir>]`: it applies statements signed by an operator whose full GPG primary fingerprint was pinned at a TTY in follow.signers, so it is not a new agent trust escalation. It verifies signatures with an isolated pinned-key keyring, rejects revoked/expired keys and signatures, re-validates exact pins and registry integrity as import does, adds only missing entries, and never removes grants or overwrites different local pins. A local follow-state.json stores each origin as {accepted, applied:["pkg@version"]}. Equal generations retry only unapplied identities, preserving operator removals of applied grants. Fully applied equal generations return 0 with one quiet info line and no import hint; only older generations are replay skips (WARN, counted, non-zero). Registry fetches run outside the writer lock with 10-second timeouts; lock waits are bounded to 10 seconds, and ledger/local pins are rechecked during commit. Each identity is marked before its grant and rolled back on a reported write failure; interruption between ledger/store renames may conservatively require operator recovery for that identity. Registry outages do not consume unapplied identities. Dry-run changes neither trust nor ledger/lock state. Key-level statuses for unrelated expired/revoked subkeys do not invalidate GOODSIG; adverse signature statuses still refuse. Skipped files retain the operator's TTY import override; conflicting pins require an explicit update. --yes never grants trust, and the redirected-store write guard remains active.
 
 ```bash
 safe run host-allow add <pkg>@<version> --reason "..."   # trusted host exec (npm)
 safe run -y <pkg>@<version> -- <args>                    # one-off sandbox run
 safe install [-g] <pkg>@<version>                        # audited install
 safe run block list && safe run audit --blocked          # review refusals
+safe run host-allow export --sign                        # operator-signed fleet export (TTY)
+safe run host-allow follow-signer add <fingerprint>      # pin a full GPG primary fingerprint (operator TTY)
+safe run host-allow follow [--dry-run] [--from <dir>]    # agent-permitted UNION of verified operator-signed grants
 ```
 <!-- END GENERATED: allow-flows -->
 

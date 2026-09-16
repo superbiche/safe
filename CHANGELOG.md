@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- Harden signed follow with `GOODSIG` and adverse per-signature status checks;
+  refuse revoked/expired primary admission while allowing a healthy signature
+  when an unrelated subkey expires or is revoked.
+- Serialize host-allow removal and grant writes, with 10-second lock waits and
+  clear contention errors. Validate/fetch registry evidence before taking the
+  commit lock (10-second HTTP timeout), then recheck the ledger and local pins.
+- Track per-origin `{accepted, applied:["pkg@version"]}` in local
+  `follow-state.json`. Equal generations retry unapplied entries after outages;
+  fully applied re-reads return 0 with one quiet info line. Applied identities
+  remain skipped after removal; older generations warn and return non-zero.
+  Dry-run never changes state. Individual marks precede grant publication and
+  roll back on reported write failure; interruption between the two atomic files
+  may require operator recovery for that identity. Legacy generation-only records
+  require operator review/migration.
+
+- Add operator-TTY `safe run host-allow export --sign [--out <dir>]`, writing
+  schema `/2` host/timestamp metadata and a detached armored GPG signature;
+  unsigned stdout exports retain schema `/1`, and import accepts both.
+- Add TTY-only `host-allow follow-signer add|remove <fingerprint>` and unattended
+  `host-allow follow [--dry-run] [--from <dir>]`. Follow verifies only pinned
+  primary keys and their signing subkeys in an isolated keyring, shares import's
+  entry validation and registry-integrity checks, and merges by UNION with
+  original dates and `followed_from` provenance. It never removes grants or
+  replaces a different local pin; grant writers lock and recheck before writing.
+  Signature skips, invalid entries and conflicts return non-zero with the
+  existing operator-TTY import/update recovery path. No `--yes` override.
+
 ## 1.62.0 - 2026-09-13
 
 - Accept Socket rate-limit-only warnings once per operator install command; keep all audits active and refuse agent/non-interactive consent.

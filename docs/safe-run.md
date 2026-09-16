@@ -160,6 +160,16 @@ The exported document (`schema: safe-host-allow-export/1`) carries only
 `name@version`, ecosystem, the public registry integrity hash, the original
 `--reason`, and the add date. There are no secrets in it.
 
+`export --sign [--out <dir>]` requires an operator TTY and GPG. It writes
+`host-allow.<hostname -s>.json` and its detached armored `.json.asc` signature
+under `~/Sync/state/safe/` by default. Signed documents use schema
+`safe-host-allow-export/2`, adding `host` and `exported_at`; unsigned stdout
+exports stay at `/1`. Import accepts both schemas. Each file is atomically
+renamed after signing succeeds; readers may briefly see mismatched generations
+and must reject them. `follow.signing_key` in the run config selects the GPG
+signing key; otherwise GPG selects its default key. Signing a redirected trust
+store requires the same explicit trust override as a grant.
+
 `import` is *"review this set and apply"*, never *"trust another machine"*:
 
 - It is an operator-only trust escalation, TTY-gated exactly like `add`/`update`
@@ -184,9 +194,124 @@ The exported document (`schema: safe-host-allow-export/1`) carries only
 - The original grant date rides along, so a replicated pin keeps its true age in
   the staleness review rather than looking freshly added.
 
-Deliberately, the allow set is **not** Syncthing- or otherwise auto-synced
-between machines: silent fleet propagation is exactly what the per-machine
-boundary exists to prevent. `export`/`import` keep the human review in the loop.
+#### Signed follower import
+
+For unattended followers, the operator can delegate acceptance to specific GPG
+**primary-key fingerprints**. Import the operator's public key into the follower's
+GPG keyring, verify its full fingerprint through a trusted channel, then at an
+operator terminal run:
+
+```bash
+safe run host-allow follow-signer add <full-primary-fingerprint>
+# Origin (operator TTY; optional --out selects another directory):
+safe run host-allow export --sign
+# Follower (no TTY required; optional --from selects another directory):
+safe run host-allow follow --dry-run
+safe run host-allow follow
+# Revoke future acceptance (operator TTY):
+safe run host-allow follow-signer remove <full-primary-fingerprint>
+```
+
+`follow-signer` is the TTY-gated setter for `follow.signers` in
+`~/.config/safe/run/config.json`; there is no generic config setter. It accepts
+full 40- or 64-hex primary fingerprints, requires the public key locally on add,
+and never fetches keys. Signing subkeys certified by that primary are accepted.
+Revoked or expired primary keys cannot be pinned. The two signer-management
+operations and signed export refuse non-TTY callers
+with exit 102. There is no `--yes` or `-y` override.
+
+`follow` reads `host-allow.*.json` in `~/Sync/state/safe/` (or `--from`), ignoring
+its own short-hostname file. It copies each document and `.json.asc` signature
+into private temporary storage, verifies with GPG using an isolated keyring
+built only from the pinned primary keys, and applies those same verified bytes.
+It never downloads a key. Revocation and expiry are honoured: revoked/expired
+primary keys are excluded from the verifier keyring, and verification requires
+`GOODSIG` alongside the pinned-primary `VALIDSIG`, rejecting revoked-key,
+expired-key and expired-signature status (`REVKEYSIG`, `EXPKEYSIG`, `EXPSIG`)
+even when GPG exits successfully. `KEYEXPIRED`/`KEYREVOKED` are key-level
+bookkeeping: they may concern unrelated subkeys and do not invalidate a good
+signature. A healthy primary can therefore sign while an unrelated subkey has
+expired; an expired signing subkey still cannot authorize a grant.
+Import revocation certificates and updated public keys into each follower's
+local GPG keyring; there is no automatic keyserver refresh.
+Unknown/unavailable signers, missing signatures, invalid signatures, and invalid
+signer configuration produce one WARN per file
+and increment the signature-skip count. Signed `/2` metadata must identify the
+host in the filename. The default directory being absent is a successful no-op.
+
+The merge is **UNION**: missing grants pass the same name, ecosystem, reason,
+exact-version and registry-integrity validator as `import`. Already-present
+pins are no-ops, different local pins produce `CONFLICT` with an explicit
+`host-allow update` hint, and no local grants are removed. Grant writes and
+`host-allow remove` share one lock. Follow collects validated entries and performs
+registry requests outside the lock, then rechecks its ledger and local pins under
+the lock before writing. Each registry request has a 10-second timeout; each
+lock acquisition waits at most 10 seconds and reports another writer is running
+on timeout. An entry the validation loop had already observed as present is not
+restored if the operator removes it during the run; an entry removed before its
+turn in that loop can be written back by the same run (the generation still
+authorizes it) — re-run `host-allow remove` in that case. New entries retain the origin's valid `added` date and record
+`followed_from: <host>`; invalid dates fall back to today, as in import.
+Neither import nor follow runs add's interactive audit preflight: the operator
+review/signature authorizes the statement, while import validation rechecks the
+exact registry identity. Missing local grants with invalid field types or
+unverifiable integrity are skipped. `--dry-run` verifies and validates everything,
+including conflicts between source files, without changing persistent state.
+
+A local `follow-state.json` beside the guard-selected trust store records each
+origin's highest accepted `exported_at` and the identities already applied:
+
+```json
+{"origins":{"rainbow":{"accepted":"2026-09-16T14:00:00Z","applied":["fresh-pkg@1.2.3"]}}}
+```
+
+Timestamps are real ISO-8601 whole-second instants with an explicit timezone;
+equivalent timezone spellings compare equal. **Older** documents warn, increment
+the freshness-skip count and return non-zero. An **equal** generation retries
+only identities not in `applied`; applied identities stay skipped even if an
+operator subsequently removed their local grants. Registry outages and invalid
+entries are not marked applied, so an unchanged signed export can be retried
+when the registry recovers or a conflict is resolved. Successful siblings remain
+recorded. A newer signed generation starts a new applied set and can authorize
+grants again.
+
+Once all entries of an equal generation are applied, repeated timer runs and
+previews return 0 with one quiet info line and no import hint or registry fetch.
+Signatures are still verified on every run. `--dry-run` never creates or changes
+the ledger or its lock file. Keep the ledger local and preserve it across
+restarts/removal. Malformed records, including earlier experimental string-only
+generation records, fail closed: an operator must review/migrate the applied
+identities, including previously applied grants now removed, or use manual import.
+
+The generation and individual identity marks are atomically published under the
+shared lock. Each mark is written immediately before its local grant; a reported
+grant-write failure rolls back that mark for retry. A process interruption between
+the two file renames may conservatively leave that one identity marked without
+its grant. Use operator-TTY import or a newer signed generation for that rare
+recovery; unrelated identities and registry failures remain retryable. Store and
+ledger are individually atomic, not a transactional two-file update.
+
+Exit 0 means eligible files were handled (including current-generation no-ops),
+or none existed. Exit 1 reports signature/older-generation skips, validation
+failures, conflicts or operational errors; valid siblings can still apply.
+The redirected-store write guard remains active (exit 100). An operator can
+review any skipped file and deliberately apply it with the existing
+`safe run host-allow import <file>` at a TTY; import still validates entries and
+never overwrites a different pin. Resolve those pins with `host-allow update`.
+
+Synchronize only signed exports and signatures, **not** the live trust store or
+signer configuration. A timer may run `follow` unattended; export remains a
+separate operator gesture. Removing a signer stops future imports but does not
+remove grants already accepted. The freshness ledger prevents replay of accepted
+generations, not cross-origin withdrawal: a newer statement or a statement from
+another authorized origin may still include a removed grant. Retire those
+exports or unpin their signer when withdrawing trust across the fleet. Existing
+installs have no historical ledger until their first accepted follow; protect
+and retain the local state file.
+Protect the signing key (for example with a hardware token requiring touch).
+TTY checks and user-writable configuration retain safe's existing cooperative
+agent boundary; they are not an OS-level defense against a hostile same-user
+process.
 
 ## Scripts Allowlist
 
