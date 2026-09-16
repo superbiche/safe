@@ -247,8 +247,10 @@ pins are no-ops, different local pins produce `CONFLICT` with an explicit
 registry requests outside the lock, then rechecks its ledger and local pins under
 the lock before writing. Each registry request has a 10-second timeout; each
 lock acquisition waits at most 10 seconds and reports another writer is running
-on timeout. Entries already present when validation started are never restored
-if the operator removes them while other entries are being fetched. New entries retain the origin's valid `added` date and record
+on timeout. An entry the validation loop had already observed as present is not
+restored if the operator removes it during the run; an entry removed before its
+turn in that loop can be written back by the same run (the generation still
+authorizes it) — re-run `host-allow remove` in that case. New entries retain the origin's valid `added` date and record
 `followed_from: <host>`; invalid dates fall back to today, as in import.
 Neither import nor follow runs add's interactive audit preflight: the operator
 review/signature authorizes the statement, while import validation rechecks the
