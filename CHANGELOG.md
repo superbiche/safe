@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.63.0 - 2026-09-16
+
 - Harden signed follow with `GOODSIG` and adverse per-signature status checks;
   refuse revoked/expired primary admission while allowing a healthy signature
   when an unrelated subkey expires or is revoked.
