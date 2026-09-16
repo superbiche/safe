@@ -93,9 +93,13 @@ add requires that public key in the local GPG keyring. `follow` verifies signed
 exports in an isolated keyring containing only these authorities (including
 their certified signing subkeys), honouring key revocation/expiry and signature
 expiry. Update revocation information in the follower's local GPG keyring;
-verification never fetches keys. `follow-state.json`, beside the guard-selected
-host-allow store, holds accepted per-origin timestamps and must remain local.
-Preserve it when removing grants; equal/older signed generations are refused.
+verification never fetches keys. Unrelated expired/revoked subkeys do not
+invalidate a good signature. `follow-state.json`, beside the guard-selected
+host-allow store, records per-origin `{accepted, applied:["pkg@version"]}` and
+must remain local. Preserve it when removing grants: equal generations skip
+applied identities and retry pending ones; older generations are refused.
+An equal generation with nothing pending returns 0 with one info line. Legacy
+string-only records require operator review/migration, never silent reset.
 Both operations retain the redirected-store guard. See [signed follower import](safe-run.md#signed-follower-import).
 
 `config.json` stores runtime defaults, linked runner paths, sandbox limits, warning behavior, and the install-gate policy:

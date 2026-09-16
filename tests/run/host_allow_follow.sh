@@ -5,12 +5,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SAFE_RUN="$ROOT/bin/safe-run"
 pass() { printf 'ok - %s\n' "$*"; }
 fail() { printf 'not ok - %s\n' "$*" >&2; exit 1; }
-for tool in gpg gpgconf python3 jq flock; do
+for tool in gpg gpgconf python3 jq flock timeout; do
   command -v "$tool" >/dev/null || fail "missing required command: $tool"
 done
 tmp=$(mktemp -d)
-locker_pid="" remove_pid=""
+locker_pid="" remove_pid="" follow_pid=""
 cleanup() {
+  [[ ! -d "$tmp/registry-control" ]] || touch "$tmp/registry-control/release"
+  [[ -z "$follow_pid" ]] || kill "$follow_pid" 2>/dev/null || true
   [[ -z "$locker_pid" ]] || kill "$locker_pid" 2>/dev/null || true
   [[ -z "$remove_pid" ]] || kill "$remove_pid" 2>/dev/null || true
   gpgconf --homedir "$tmp/gnupg" --kill gpg-agent >/dev/null 2>&1 || true
@@ -69,6 +71,12 @@ printf 'agent-dev\n'
 STUB
 cat > "$tmp/bin/curl" <<'STUB'
 #!/usr/bin/env bash
+[[ " $* " == *" --max-time 10 "* ]] || exit 99
+[[ "${TEST_REGISTRY_OUTAGE:-0}" != 1 ]] || exit 22
+if [[ -n "${TEST_REGISTRY_CONTROL:-}" ]]; then
+  touch "$TEST_REGISTRY_CONTROL/started"
+  while [[ ! -e "$TEST_REGISTRY_CONTROL/release" ]]; do sleep 0.02; done
+fi
 if [[ "${TEST_CONCURRENT_PIN:-0}" == "1" ]]; then
   jq '.packages["fresh-pkg"] = {version:"9.9.9", reason:"concurrent local grant", ecosystem:"npm"}' \
     "$SAFE_RUN_CONFIG_DIR/host-allow.json" > "$SAFE_RUN_CONFIG_DIR/concurrent.json"
@@ -97,10 +105,11 @@ grep -q 'would-add fresh-pkg@1.2.3' "$tmp/output" || fail 'missing dry-run plan'
 expect_rc 0 "$SAFE_RUN" host-allow follow
 jq -e '.packages["fresh-pkg"] | .version == "1.2.3" and .added == "2026-07-01" and .followed_from == "rainbow" and .sha == "sha512-FRESH"' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'follow grant differs'
 cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/local-before.json"
-expect_rc 1 "$SAFE_RUN" host-allow follow
-grep -q '1 freshness skips' "$tmp/output" || fail 'repeat generation not counted as stale'
+expect_rc 0 "$SAFE_RUN" host-allow follow
+grep -q 'already at the current generation' "$tmp/output" || fail 'repeat generation is not a quiet no-op'
+[[ $(wc -l < "$tmp/output") == 1 ]] || fail 'steady state should print one info line'
 cmp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'repeat follow changed store'
-pass 'non-TTY follow applies signed grant with original date and provenance; repeat generation is refused without mutation'
+pass 'non-TTY follow applies signed grant with original date and provenance; repeat generation is a quiet successful no-op'
 
 # Per-case directory keeps invalid siblings from contaminating other tests.
 mkdir "$tmp/incoming"
@@ -271,24 +280,25 @@ rm -f "$SAFE_RUN_CONFIG_DIR/host-allow.json.lock"
 expect_rc 0 "$SAFE_RUN" host-allow follow --dry-run --from "$tmp/incoming"
 [[ ! -e "$state_file" && ! -e "$SAFE_RUN_CONFIG_DIR/host-allow.json.lock" ]] || fail 'dry-run created generation or lock state'
 expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
-jq -e --arg stamp "$original_stamp" '.origins.rainbow == $stamp' "$state_file" >/dev/null || fail 'generation not recorded'
+jq -e --arg stamp "$original_stamp" '.origins.rainbow.accepted == $stamp' "$state_file" >/dev/null || fail 'generation not recorded'
 "$SAFE_RUN" host-allow remove fresh-pkg > "$tmp/output" 2>&1
 cp "$state_file" "$tmp/state-before.json"
 cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/local-before.json"
-expect_follow_failure
-grep -q '1 freshness skips' "$tmp/output" || fail 'equal replay not counted'
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+cmp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'equal generation re-added a removed grant'
+[[ $(wc -l < "$tmp/output") == 1 ]] || fail 'equal generation should print one info line'
 jq --arg stamp "$older_stamp" '.exported_at = $stamp' "$export_file" > "$tmp/incoming/host-allow.rainbow.json"
 sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
 expect_follow_failure
 cmp "$tmp/state-before.json" "$state_file" || fail 'older replay changed high-water mark'
 pass 'equal and older signed generations cannot re-add a removed grant via --from'
 
-# Different timestamp spellings for the same instant must also count as replay.
+# Equivalent timestamp spellings must share the applied-identity ledger.
 equivalent_stamp=$(date -u -d "@$original_epoch" +%Y-%m-%dT%H:%M:%SZ)
 jq --arg stamp "$equivalent_stamp" '.exported_at = $stamp' "$export_file" > "$tmp/incoming/host-allow.rainbow.json"
 sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
-expect_follow_failure
-grep -q '1 freshness skips' "$tmp/output" || fail 'timezone-equivalent replay accepted'
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+cmp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'timezone-equivalent generation re-added removed grant'
 pass 'freshness compares timestamp instants rather than timezone strings'
 
 jq --arg stamp "$newer_stamp" '.exported_at = $stamp' "$export_file" > "$tmp/incoming/host-allow.rainbow.json"
@@ -298,21 +308,21 @@ grep -q 'would-add fresh-pkg' "$tmp/output" || fail 'newer preview did not plan 
 cmp "$tmp/state-before.json" "$state_file" || fail 'dry-run advanced high-water mark'
 cmp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'newer dry-run changed trust store'
 expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
-jq -e --arg stamp "$newer_stamp" '.origins.rainbow == $stamp' "$state_file" >/dev/null || fail 'newer generation did not advance state'
+jq -e --arg stamp "$newer_stamp" '.origins.rainbow.accepted == $stamp' "$state_file" >/dev/null || fail 'newer generation did not advance state'
 jq -e '.packages | has("fresh-pkg")' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'newer signed statement did not apply'
 pass 'newer generation applies and advances state; dry-run leaves existing state byte-identical'
 
 # Keep another origin's mark when updating this one, and fail closed on bad state.
-jq '.origins.tuxedo = "2026-01-01T00:00:00Z"' "$state_file" > "$tmp/state-next.json"
+jq '.origins.tuxedo = {accepted:"2026-01-01T00:00:00Z",applied:[]}' "$state_file" > "$tmp/state-next.json"
 cp "$tmp/state-next.json" "$state_file"
 next_stamp=$(date -u -d "@$((original_epoch + 120))" +%Y-%m-%dT%H:%M:%SZ)
 jq --arg stamp "$next_stamp" '.exported_at = $stamp' "$export_file" > "$tmp/incoming/host-allow.rainbow.json"
 sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
 expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
-jq -e --arg stamp "$next_stamp" '.origins.rainbow == $stamp and .origins.tuxedo == "2026-01-01T00:00:00Z"' "$state_file" >/dev/null || fail 'state lost another origin'
+jq -e --arg stamp "$next_stamp" '.origins.rainbow.accepted == $stamp and .origins.tuxedo.accepted == "2026-01-01T00:00:00Z"' "$state_file" >/dev/null || fail 'state lost another origin'
 cp "$state_file" "$tmp/state-before.json"
 cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/local-before.json"
-printf '{"origins":{"rainbow":"tomorrow"}}\n' > "$state_file"
+printf '{"origins":{"rainbow":{"accepted":"tomorrow","applied":[]}}}\n' > "$state_file"
 expect_follow_failure
 grep -q 'malformed timestamp' "$tmp/output" || fail 'invalid state timestamp not surfaced'
 printf '{"origins":false}\n' > "$state_file"
@@ -325,8 +335,8 @@ expect_follow_failure
 cmp "$tmp/state-before.json" "$state_file" || fail 'invalid export timestamp changed state'
 pass 'per-origin state is preserved and malformed state/export timestamps fail closed'
 
-# Partial validation failures still consume an accepted generation. Otherwise a
-# later retry can replay its successful additions after the operator removes one.
+# Partial validation failures leave only the successful identities consumed;
+# later retries must not replay those additions after operator removal.
 reset_incoming
 jq --arg stamp "$next_stamp" '.exported_at=$stamp | .packages["bad-pkg"]={version:"latest",reason:"bad sibling"}' "$export_file" > "$tmp/incoming/host-allow.rainbow.json"
 sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
@@ -335,7 +345,8 @@ expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
 "$SAFE_RUN" host-allow remove fresh-pkg > "$tmp/output" 2>&1
 cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/local-before.json"
 expect_follow_failure
-grep -q '1 freshness skips' "$tmp/output" || fail 'partial generation replay not refused'
+grep -q 'not an exact pinned' "$tmp/output" || fail 'unapplied invalid entry was not retried'
+jq -e '.origins.rainbow.applied == ["fresh-pkg@1.2.3"]' "$state_file" >/dev/null || fail 'ledger did not isolate successful entry'
 pass 'partial entry failures cannot leave successful grants replayable after removal'
 
 # Removal must wait for the shared writer lock, not race its read/modify/write.
@@ -369,6 +380,111 @@ remove_pid=""
 [[ "$blocked" == 1 ]] || fail 'remove completed while the host-allow writer lock was held'
 jq -e '.packages | has("fresh-pkg") | not' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'remove failed after lock release'
 pass 'remove blocks under the shared writer lock and succeeds after release'
+
+# A registry outage must leave identities retryable in the same generation.
+reset_incoming
+cp "$export_file" "$tmp/incoming/host-allow.rainbow.json"
+sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
+expect_rc 1 env TEST_REGISTRY_OUTAGE=1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+jq -e '.origins.rainbow.applied == []' "$state_file" >/dev/null || fail 'outage consumed unapplied grants'
+cp "$state_file" "$tmp/outage-state.json"
+expect_rc 0 "$SAFE_RUN" host-allow follow --dry-run --from "$tmp/incoming"
+cmp "$tmp/outage-state.json" "$state_file" || fail 'retry preview mutated ledger'
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+jq -e '.packages["fresh-pkg"].version == "1.2.3"' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'outage retry did not apply grant'
+jq -e '.origins.rainbow.applied == ["fresh-pkg@1.2.3"]' "$state_file" >/dev/null || fail 'successful retry not recorded'
+pass 'outage then recovery applies the unchanged signed generation on retry'
+for ((repeat=0; repeat<3; repeat++)); do
+  expect_rc 0 env TEST_REGISTRY_OUTAGE=1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+  [[ $(wc -l < "$tmp/output") == 1 ]] || fail 'steady state prints more than one info line'
+  grep -q 'already at the current generation' "$tmp/output" || fail 'missing quiet steady-state info'
+  if grep -qE 'WARN|operator override|host-allow import' "$tmp/output"; then fail 'steady state suggests an override'; fi
+done
+pass 'three unchanged runs return zero with one quiet info line and no registry dependency'
+
+# A reported local publication failure must also leave that identity retryable.
+reset_incoming
+cp "$export_file" "$tmp/incoming/host-allow.rainbow.json"
+sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
+"$SAFE_RUN" host-allow remove fresh-pkg > "$tmp/output" 2>&1
+cat > "$tmp/bin/mv" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${TEST_FAIL_HOST_STORE:-0}" == 1 && "${!#}" == "$SAFE_RUN_CONFIG_DIR/host-allow.json" ]]; then exit 1; fi
+exec /usr/bin/mv "$@"
+STUB
+chmod +x "$tmp/bin/mv"
+expect_rc 1 env TEST_FAIL_HOST_STORE=1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+jq -e '.origins.rainbow.applied == []' "$state_file" >/dev/null || fail 'failed store publication consumed identity'
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+jq -e '.origins.rainbow.applied == ["fresh-pkg@1.2.3"]' "$state_file" >/dev/null || fail 'store-failure retry did not complete'
+pass 'explicit local publication failure rolls back only the failed identity for retry'
+
+# Registry validation must not hold the store lock. Explicit readiness markers
+# keep the proof independent of the registry stub's sleep duration.
+reset_incoming
+jq '.packages["a-kept"]={version:"5.0.0",reason:"local grant",ecosystem:"npm"}' "$export_file" > "$tmp/incoming/host-allow.rainbow.json"
+sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
+printf '{"packages":{"a-kept":{"version":"5.0.0","reason":"local grant","ecosystem":"npm"}}}\n' > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+mkdir "$tmp/registry-control"
+env TEST_REGISTRY_CONTROL="$tmp/registry-control" "$SAFE_RUN" host-allow follow --from "$tmp/incoming" > "$tmp/slow-follow.log" 2>&1 &
+follow_pid=$!
+for ((attempt=0; attempt<250; attempt++)); do
+  [[ -e "$tmp/registry-control/started" ]] && break
+  sleep 0.02
+done
+[[ -e "$tmp/registry-control/started" ]] || fail 'registry stub did not start'
+remove_rc=0
+timeout 2 "$SAFE_RUN" host-allow remove a-kept > "$tmp/remove-output" 2>&1 || remove_rc=$?
+[[ "$remove_rc" == 0 ]] || fail 'remove blocked behind registry I/O'
+[[ ! -e "$tmp/registry-control/release" ]] || fail 'registry released before remove proof'
+jq -e '.packages | has("a-kept") | not' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'remove failed during registry I/O'
+touch "$tmp/registry-control/release"
+wait "$follow_pid"
+follow_pid=""
+jq -e '.packages | has("fresh-pkg") and (has("a-kept") | not)' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'follow lost concurrent removal'
+pass 'remove completes while registry is stalled; follow preserves its removal on commit'
+
+# Bound actual contention too: use the production timeout, not a test bypass.
+exec {held_lock}>"$SAFE_RUN_CONFIG_DIR/host-allow.json.lock"
+flock -x "$held_lock"
+expect_rc 1 timeout 13 "$SAFE_RUN" host-allow remove fresh-pkg
+grep -q 'another writer is running (lock timeout after 10s)' "$tmp/output" || fail 'lock timeout lacks clear recovery message'
+flock -u "$held_lock"
+exec {held_lock}>&-
+pass 'store-lock contention times out with a writer-busy recovery hint'
+
+# Sign with the healthy primary, then let an unrelated subkey expire. GPG
+# emits KEYEXPIRED even though this signature remains GOODSIG/VALIDSIG.
+reset_incoming
+gpg --no-options --batch --pinentry-mode loopback --passphrase '' \
+  --quick-add-key "$fingerprint" ed25519 sign seconds=3 > "$tmp/keygen.log" 2>&1 || fail 'rotating subkey generation failed'
+rotating_subkey=$(gpg --no-options --batch --with-colons --list-keys "$fingerprint" 2>/dev/null | awk -F: '$1 == "sub" {want=1; next} want && $1 == "fpr" {last=$10; want=0} END {print last}')
+cp "$export_file" "$tmp/incoming/host-allow.rainbow.json"
+sign_document "$fingerprint!" "$tmp/incoming/host-allow.rainbow.json"
+cp "$export_file" "$tmp/expired-subkey.json"
+sign_document "$rotating_subkey!" "$tmp/expired-subkey.json"
+for ((attempt=0; attempt<100; attempt++)); do
+  validity=$(gpg --no-options --batch --with-colons --list-keys "$fingerprint" 2>/dev/null | awk -F: -v f="$rotating_subkey" '$1 == "sub" {v=$2} $1 == "fpr" && $10 == f {print v}')
+  [[ "$validity" == e ]] && break
+  sleep 0.1
+done
+[[ "$validity" == e ]] || fail 'unrelated subkey did not expire'
+gpg --no-options --batch --status-fd 1 --verify "$tmp/incoming/host-allow.rainbow.json.asc" "$tmp/incoming/host-allow.rainbow.json" > "$tmp/unrelated-status" 2>/dev/null || fail 'healthy primary signature no longer verifies'
+grep -q '^\[GNUPG:\] KEYEXPIRED ' "$tmp/unrelated-status" || fail 'fixture did not exercise KEYEXPIRED'
+grep -q '^\[GNUPG:\] GOODSIG ' "$tmp/unrelated-status" || fail 'fixture lacks GOODSIG'
+"$SAFE_RUN" host-allow remove fresh-pkg > "$tmp/output" 2>&1
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+jq -e '.packages | has("fresh-pkg")' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'unrelated expired subkey blocked primary signature'
+pass 'healthy primary signature applies despite an unrelated expired subkey'
+
+# The unrelated key-level warning is harmless; a signature actually made by
+# that expired subkey must still be refused with unchanged store and ledger.
+cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/local-before.json"
+cp "$state_file" "$tmp/subkey-state.json"
+cp "$tmp/expired-subkey.json.asc" "$tmp/incoming/host-allow.rainbow.json.asc"
+expect_follow_failure
+cmp "$tmp/subkey-state.json" "$state_file" || fail 'expired signing subkey changed ledger'
+pass 'expired signing subkey is still refused although its primary remains healthy'
 
 # Expire a real short-lived key after signing and pinning it while still live.
 reset_incoming
@@ -418,12 +534,14 @@ SAFE_RUN_PATH="$SAFE_RUN" STATUS_FIXTURE_DIR="$tmp" SAFE_RUN_NO_INIT=1 bash -c '
   source "$SAFE_RUN_PATH" >/dev/null
   printf "[GNUPG:] VALIDSIG fixture\n" > "$STATUS_FIXTURE_DIR/status-fixture"
   if follow_signature_current "$STATUS_FIXTURE_DIR/status-fixture"; then exit 1; fi
-  for adverse in REVKEYSIG EXPKEYSIG EXPSIG KEYREVOKED KEYEXPIRED; do
+  for adverse in REVKEYSIG EXPKEYSIG EXPSIG; do
     printf "[GNUPG:] GOODSIG fixture\n[GNUPG:] %s fixture\n[GNUPG:] VALIDSIG fixture\n" "$adverse" > "$STATUS_FIXTURE_DIR/status-fixture"
     if follow_signature_current "$STATUS_FIXTURE_DIR/status-fixture"; then exit 1; fi
   done
-  printf "[GNUPG:] GOODSIG fixture\n[GNUPG:] VALIDSIG fixture\n" > "$STATUS_FIXTURE_DIR/status-fixture"
-  follow_signature_current "$STATUS_FIXTURE_DIR/status-fixture"
+  for harmless in KEYEXPIRED KEYREVOKED; do
+    printf "[GNUPG:] GOODSIG fixture\n[GNUPG:] %s fixture\n[GNUPG:] VALIDSIG fixture\n" "$harmless" > "$STATUS_FIXTURE_DIR/status-fixture"
+    follow_signature_current "$STATUS_FIXTURE_DIR/status-fixture" || exit 1
+  done
 ' safe-run || fail 'verification-status belt accepted adverse status or rejected good-only status'
-pass 'verification status requires GOODSIG and rejects every revoked/expired status even alongside GOODSIG'
+pass 'verification status rejects adverse signature tokens but accepts key-level tokens with GOODSIG'
 printf 'all host-allow signed export/follow tests passed\n'

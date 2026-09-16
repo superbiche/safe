@@ -95,7 +95,9 @@ custom transport directory. Optional `follow.signing_key` selects the origin's
 GPG key; `follow.signers` is maintained by the TTY-only `follow-signer add|remove`
 commands. Provision public keys locally first; follow never retrieves keys.
 Revocation and expiry are honoured, including revoked/expired signature statuses
-that GPG can report with exit 0. Revoked or expired primary keys cannot be pinned.
+that GPG can report with exit 0. Key-level warnings about unrelated expired or
+revoked subkeys do not reject a good signature. A signature actually made by an
+expired/revoked key is still rejected. Revoked or expired primary keys cannot be pinned.
 Distribute revocation certificates and updated public keys to every follower's
 local keyring; there is no automatic keyserver refresh.
 
@@ -104,26 +106,37 @@ install a timer or automatically sign after add. Own-host files are ignored;
 verified statements add only absent grants after import validation, retaining
 the original `added` date and recording `followed_from`. Dry-run validates the
 whole plan without changing persistent state. A machine-local `follow-state.json`
-beside the guard-selected trust store records the highest accepted `exported_at`
-per origin. Only strictly newer ISO-8601 whole-second timestamps with a timezone
-are accepted; equal or older documents (even through another `--from`) emit a
-WARN, increment the freshness-skip count and return non-zero. Thus a timer
-re-reading an unchanged export reports a stale generation, rather than exit 0.
-Exit 0 means all eligible files were fresh and handled, or no eligible files
-existed; non-zero also surfaces skipped signatures, invalid entries or pin conflicts. Valid files can still apply
-alongside failures. A transport delivering mismatched JSON/signature generations
-causes a safe rejection; rerun after both files have arrived.
+beside the guard-selected trust store records each origin as
+`{"accepted":"<exported_at>","applied":["<pkg>@<version>"]}`. Older timestamps
+warn, increment the freshness-skip count and return non-zero. Equal timestamps
+retry only identities that never applied; successful entries stay skipped even
+after operator removal. A registry outage is therefore retryable with the same
+signed file. Once complete, unchanged daily runs return 0 with one quiet info
+line, no registry calls and no import prescription. Verification still runs.
+A newer signed generation starts a fresh applied set. Timestamp comparisons
+normalize timezone offsets.
 
-For a skipped file, the operator can review it and run
+Add/update/import/follow and removal share the host-store writer lock. Follow
+fetches registry evidence outside it (10 seconds maximum per request), then
+rechecks the generation, applied identities and local pins during its locked
+commit. Lock waits are bounded to 10 seconds with a writer-busy recovery hint.
+Valid files and entries can still apply alongside failures. A mismatched
+JSON/signature pair during transport is safely rejected; retry after both arrive.
+
+For an actual skip/error, the operator can review the file and run
 `safe run host-allow import <file>` at a TTY. Conflicting pins need the usual
-`safe run host-allow update <pkg>@<version> --reason "..."`. Signature failures
-and counts are emitted by follow; there is no persistent doctor status in this
-slice. Add/update/import/follow and removal share the host-store writer lock;
-follow checks and atomically records a generation before adding its grants under
-that lock. A validation failure or interruption consumes the generation, so
-retry requires a newer signed export or deliberate TTY import. Dry-run never
-creates or advances freshness state. Preserve this local file across restarts
-and grant removal; do not sync it. Malformed state requires operator repair.
+`safe run host-allow update <pkg>@<version> --reason "..."`. Signature and older
+replay failures/counts are emitted by follow; there is no persistent doctor
+status in this slice. Dry-run never creates or changes freshness state or its
+lock file. Keep the ledger local and preserve it across restarts/removal.
+Malformed records (including the earlier experimental generation-only format)
+need operator review/migration; do not erase history to force a retry.
+
+Each applied identity is marked immediately before publishing its grant, and a
+reported write failure rolls back that mark. Interruption between the separate
+atomic ledger/store renames may conservatively consume that one identity without
+its grant; recover it with deliberate TTY import or a newer signed generation.
+Registry failures and other unapplied entries remain retryable unattended.
 
 Unpinning/revoking a signer stops future acceptance, not existing grants.
 Freshness prevents replay only for generations this machine already accepted:

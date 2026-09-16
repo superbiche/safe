@@ -227,7 +227,11 @@ built only from the pinned primary keys, and applies those same verified bytes.
 It never downloads a key. Revocation and expiry are honoured: revoked/expired
 primary keys are excluded from the verifier keyring, and verification requires
 `GOODSIG` alongside the pinned-primary `VALIDSIG`, rejecting revoked-key,
-expired-key and expired-signature status even when GPG exits successfully.
+expired-key and expired-signature status (`REVKEYSIG`, `EXPKEYSIG`, `EXPSIG`)
+even when GPG exits successfully. `KEYEXPIRED`/`KEYREVOKED` are key-level
+bookkeeping: they may concern unrelated subkeys and do not invalidate a good
+signature. A healthy primary can therefore sign while an unrelated subkey has
+expired; an expired signing subkey still cannot authorize a grant.
 Import revocation certificates and updated public keys into each follower's
 local GPG keyring; there is no automatic keyserver refresh.
 Unknown/unavailable signers, missing signatures, invalid signatures, and invalid
@@ -239,9 +243,12 @@ The merge is **UNION**: missing grants pass the same name, ecosystem, reason,
 exact-version and registry-integrity validator as `import`. Already-present
 pins are no-ops, different local pins produce `CONFLICT` with an explicit
 `host-allow update` hint, and no local grants are removed. Grant writes and
-`host-allow remove` share one lock. Follow checks/records its generation and
-applies its additions under that lock; its writer also rechecks the local pin
-after registry validation. New entries retain the origin's valid `added` date and record
+`host-allow remove` share one lock. Follow collects validated entries and performs
+registry requests outside the lock, then rechecks its ledger and local pins under
+the lock before writing. Each registry request has a 10-second timeout; each
+lock acquisition waits at most 10 seconds and reports another writer is running
+on timeout. Entries already present when validation started are never restored
+if the operator removes them while other entries are being fetched. New entries retain the origin's valid `added` date and record
 `followed_from: <host>`; invalid dates fall back to today, as in import.
 Neither import nor follow runs add's interactive audit preflight: the operator
 review/signature authorizes the statement, while import validation rechecks the
@@ -249,27 +256,42 @@ exact registry identity. Missing local grants with invalid field types or
 unverifiable integrity are skipped. `--dry-run` verifies and validates everything,
 including conflicts between source files, without changing persistent state.
 
-A local `follow-state.json` beside the guard-selected trust store records the
-highest accepted `exported_at` for each origin (`{"origins":{"rainbow":"..."}}`).
-Timestamps must be real ISO-8601 whole-second instants with an explicit timezone,
-as emitted by signed export; equivalent timezone spellings compare equal.
-Any document **not strictly newer**, including an identical daily re-read or a
-replay from another `--from` directory, is skipped with a WARN, a freshness-skip
-count and a non-zero result. A newer signed statement may authorize grants again.
-This state is machine-local: preserve it across restarts and do not synchronize
-or reset it when removing a grant. Malformed state fails closed with a repair hint.
+A local `follow-state.json` beside the guard-selected trust store records each
+origin's highest accepted `exported_at` and the identities already applied:
 
-The accepted generation is atomically recorded under the shared lock **before**
-its additions. If entry validation or a later write fails, valid entries can
-still have applied and that generation remains consumed; an interrupted apply
-also cannot replay after a removal. Retry with a strictly newer signed export or
-the deliberate TTY `import` override. `--dry-run` reads state and validates the
-plan but never creates/advances the state or creates a lock file.
+```json
+{"origins":{"rainbow":{"accepted":"2026-09-16T14:00:00Z","applied":["fresh-pkg@1.2.3"]}}}
+```
 
-Exit 0 means all eligible files verified, were fresh and applied (including
-already-present pins in a fresh generation), or no eligible files existed.
-Exit 1 reports signature/freshness skips, validation failures, conflicts, or
-operational errors; valid siblings can still apply.
+Timestamps are real ISO-8601 whole-second instants with an explicit timezone;
+equivalent timezone spellings compare equal. **Older** documents warn, increment
+the freshness-skip count and return non-zero. An **equal** generation retries
+only identities not in `applied`; applied identities stay skipped even if an
+operator subsequently removed their local grants. Registry outages and invalid
+entries are not marked applied, so an unchanged signed export can be retried
+when the registry recovers or a conflict is resolved. Successful siblings remain
+recorded. A newer signed generation starts a new applied set and can authorize
+grants again.
+
+Once all entries of an equal generation are applied, repeated timer runs and
+previews return 0 with one quiet info line and no import hint or registry fetch.
+Signatures are still verified on every run. `--dry-run` never creates or changes
+the ledger or its lock file. Keep the ledger local and preserve it across
+restarts/removal. Malformed records, including earlier experimental string-only
+generation records, fail closed: an operator must review/migrate the applied
+identities, including previously applied grants now removed, or use manual import.
+
+The generation and individual identity marks are atomically published under the
+shared lock. Each mark is written immediately before its local grant; a reported
+grant-write failure rolls back that mark for retry. A process interruption between
+the two file renames may conservatively leave that one identity marked without
+its grant. Use operator-TTY import or a newer signed generation for that rare
+recovery; unrelated identities and registry failures remain retryable. Store and
+ledger are individually atomic, not a transactional two-file update.
+
+Exit 0 means eligible files were handled (including current-generation no-ops),
+or none existed. Exit 1 reports signature/older-generation skips, validation
+failures, conflicts or operational errors; valid siblings can still apply.
 The redirected-store write guard remains active (exit 100). An operator can
 review any skipped file and deliberately apply it with the existing
 `safe run host-allow import <file>` at a TTY; import still validates entries and

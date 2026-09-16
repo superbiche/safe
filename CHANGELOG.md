@@ -2,15 +2,20 @@
 
 ## Unreleased
 
-- Harden signed host-allow follow: require a good signature status and reject
-  revoked/expired keys or signatures even when GPG exits 0; signer admission
-  rejects revoked/expired primary keys. Local key revocation information is honoured.
-- Serialize `host-allow remove` with grant writers. Follow now atomically records
-  accepted per-origin `exported_at` in local `follow-state.json` under the same
-  lock as its additions. Equal/older generations warn and return non-zero;
-  dry-run never advances state. Generations are consumed before additions, so
-  partial failures/interruption require a newer export or operator-TTY import
-  for retry, preserving removal against replay of previously accepted exports.
+- Harden signed follow with `GOODSIG` and adverse per-signature status checks;
+  refuse revoked/expired primary admission while allowing a healthy signature
+  when an unrelated subkey expires or is revoked.
+- Serialize host-allow removal and grant writes, with 10-second lock waits and
+  clear contention errors. Validate/fetch registry evidence before taking the
+  commit lock (10-second HTTP timeout), then recheck the ledger and local pins.
+- Track per-origin `{accepted, applied:["pkg@version"]}` in local
+  `follow-state.json`. Equal generations retry unapplied entries after outages;
+  fully applied re-reads return 0 with one quiet info line. Applied identities
+  remain skipped after removal; older generations warn and return non-zero.
+  Dry-run never changes state. Individual marks precede grant publication and
+  roll back on reported write failure; interruption between the two atomic files
+  may require operator recovery for that identity. Legacy generation-only records
+  require operator review/migration.
 
 - Add operator-TTY `safe run host-allow export --sign [--out <dir>]`, writing
   schema `/2` host/timestamp metadata and a detached armored GPG signature;
