@@ -1701,7 +1701,7 @@ write_host_allow_entry_locked() (
   # callers are already write-guarded against an unblessed redirect.
   ha_file="$(trust_store_file host-allow.json)"
   # Recheck UNION under the caller's lock after registry validation.
-  local local_entry local_version
+  local local_entry local_version local_generation local_origin incoming_epoch existing_epoch
   if [[ -n "$followed_from" ]]; then
     if [[ -e "$ha_file" ]]; then
       local_entry=$(jq -ce --arg p "$pkg" 'if (.packages | type) == "object" then
@@ -1713,6 +1713,19 @@ write_host_allow_entry_locked() (
           warn "CONFLICT $pkg: local pins @$local_version, follow has @$version — resolve with: safe run host-allow update $pkg@$version --reason \"...\""
           return 1
         fi
+        local_generation=$(jq -r '.entry.followed_generation // empty' <<<"$local_entry") || return 1
+        local_origin=$(jq -r '.entry.followed_from // empty' <<<"$local_entry") || return 1
+        if [[ -n "$local_generation" ]]; then
+          incoming_epoch=$(follow_exported_epoch "$generation") || return 1
+          existing_epoch=$(follow_exported_epoch "$local_generation") || {
+            warn "WARN follow: local pin @$local_version has a malformed followed generation; repair the host-allow store at an operator terminal"
+            return 1
+          }
+          if (( incoming_epoch <= existing_epoch )); then
+            warn "WARN follow: refusing $pkg@$version from $followed_from: local pin @$local_version from ${local_origin:-local operator} has generation $local_generation, which is not older than $generation — resolve with: safe run host-allow update $pkg@$version --reason \"...\""
+            return 1
+          fi
+        fi
       fi
     else
       printf '{"packages":{}}\n' > "$ha_file" || return 1
@@ -1720,19 +1733,22 @@ write_host_allow_entry_locked() (
   fi
   tmp=$(stage_beside "$ha_file") || return 1
   jq --arg p "$pkg" --arg v "$version" --arg s "$sha" \
-     --arg r "$reason" --arg d "$added" --arg e "$ecosystem" --arg origin "$followed_from" '
+     --arg r "$reason" --arg d "$added" --arg e "$ecosystem" --arg origin "$followed_from" --arg generation "$generation" '
     .packages[$p] = {
       version: $v,
       sha: $s,
       ecosystem: $e,
       added: $d,
       reason: $r
-    } + (if $origin == "" then {} else {followed_from: $origin} end)' "$ha_file" > "$tmp" || { rm -f -- "$tmp"; return 1; }
-  mv "$tmp" "$ha_file"
+    } + (if $origin == "" then {} else
+      {followed_from: $origin} + (if $generation == "" then {} else {followed_generation: $generation} end)
+    end)' "$ha_file" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv "$tmp" "$ha_file" || return 1
   if [[ "$replace_local" == "1" && -n "$local_version" && "$local_version" != "$version" ]]; then
     audit_log "host-allow-follow" "$pkg@$version" "TRUST" "$(context_label)" "REPLACED" \
       "old_pin=@$local_version new_pin=@$version origin_host=$followed_from generation=$generation"
   fi
+  return 0
 )
 
 cmd_host_allow() {
@@ -1947,7 +1963,10 @@ host_allow_apply_export() {
   fi
 
   local added=0 skipped=0
-  local name version ecosystem file_sha reason added_date kind normalized local_entry local_version fetched_sha disposition planned_entry
+  local name version ecosystem file_sha reason added_date kind normalized local_entry local_version fetched_sha disposition planned_entry statement_generation
+  if [[ "$writer" == "follow_collect_entry" ]]; then
+    statement_generation=$(jq -er '.exported_at' "$file") || return 1
+  fi
   for name in "${names[@]}"; do
     name=$(printf '%s' "$name" | base64 --decode)
     # Each entry must itself be an object: a scalar entry would crash the
@@ -2007,7 +2026,7 @@ host_allow_apply_export() {
       local_version=$(printf '%s' "$local_entry" | jq -r '.version // empty')
       if [[ "$local_version" == "$version" ]]; then
         if [[ "$writer" == "follow_collect_entry" ]]; then
-          follow_collect_entry "$normalized" "$version" "$file_sha" "$reason" "$ecosystem" "$added_date" "$origin" present || return 1
+          follow_collect_entry "$normalized" "$version" "$file_sha" "$reason" "$ecosystem" "$added_date" "$origin" present "$statement_generation" || return 1
         else
           printf '  present  %s@%s (already allowed)\n' "$normalized" "$version" >&2
         fi
@@ -2016,7 +2035,7 @@ host_allow_apply_export() {
       if [[ "$writer" == "follow_collect_entry" ]]; then
         disposition="replace"
       else
-        printf '  CONFLICT %s: local pins @%s, import has @%s — resolve with: safe run host-allow update %s@%s --reason \"...\"\n' \
+        printf '  CONFLICT %s: local pins @%s, import has @%s — resolve with: safe run host-allow update %s@%s --reason "..."\n' \
           "$normalized" "$local_version" "$version" "$normalized" "$version" >&2
         skipped=$((skipped + 1)); failures=$((failures + 1)); continue
       fi
@@ -2040,7 +2059,7 @@ host_allow_apply_export() {
 
     if [[ "$writer" == "follow_collect_entry" ]]; then
       [[ -n "$disposition" ]] || disposition="verified"
-      follow_collect_entry "$normalized" "$version" "$fetched_sha" "$reason" "$ecosystem" "$added_date" "$origin" "$disposition" || return 1
+      follow_collect_entry "$normalized" "$version" "$fetched_sha" "$reason" "$ecosystem" "$added_date" "$origin" "$disposition" "$statement_generation" || return 1
       added=$((added + 1)); continue
     fi
 
@@ -2137,6 +2156,13 @@ follow_exported_epoch() {
   date -d "$stamp" +%s 2>/dev/null
 }
 
+follow_generation_is_newer() {
+  local incoming="$1" existing="$2" incoming_epoch existing_epoch
+  incoming_epoch=$(follow_exported_epoch "$incoming") || return 1
+  existing_epoch=$(follow_exported_epoch "$existing") || return 1
+  (( incoming_epoch > existing_epoch ))
+}
+
 # Preview reads atomic ledger snapshots; real runs read under the writer lock
 # so an in-progress identity mark cannot be mistaken for a committed entry.
 # Commit rereads the ledger after registry validation before any trust write.
@@ -2192,8 +2218,8 @@ follow_publish_state() {
 # entry observed before fetch must not be resurrected if removed during fetch.
 follow_collect_entry() {
   follow_candidates=$(jq -c --arg p "$1" --arg v "$2" --arg s "$3" \
-    --arg r "$4" --arg e "$5" --arg d "$6" --arg disposition "$8" \
-    '. + [{name:$p, version:$v, sha:$s, reason:$r, ecosystem:$e, added:$d, disposition:$disposition}]' \
+    --arg r "$4" --arg e "$5" --arg d "$6" --arg disposition "$8" --arg generation "$9" \
+    '. + [{name:$p, version:$v, sha:$s, reason:$r, ecosystem:$e, added:$d, disposition:$disposition, generation:$generation}]' \
     <<<"$follow_candidates")
 }
 
@@ -2201,7 +2227,7 @@ follow_collect_entry() {
 # writes; dry-run reads atomic snapshots without creating a lock or ledger.
 follow_commit_generation() {
   local dry_run="$1" origin="$2" ha_file="$3" stamp="$4" candidates="$5"
-  local state_file state selected next entry name version sha reason ecosystem added disposition id local_version planned_version replacement replace_local
+  local state_file state selected next entry name version sha reason ecosystem added disposition id local_entry local_generation local_origin statement_generation planned_entry replacement replace_local
   local changed=0 failures=0
   state_file="$(dirname "$ha_file")/follow-state.json"
   state=$(follow_load_state "$state_file") || return 1
@@ -2218,16 +2244,30 @@ follow_commit_generation() {
     if jq -e --arg host "$origin" --arg id "$id" '.origins[$host].applied | index($id) != null' <<<"$state" >/dev/null; then
       continue
     fi
-    local_version=$(load_trust_store_json "$ha_file" | jq -er --arg p "$name" '
+    local_entry=$(load_trust_store_json "$ha_file" | jq -ce --arg p "$name" '
       if (.packages | type) != "object" then error("malformed host-allow store")
-      elif (.packages | has($p)) then (.packages[$p].version // "invalid") else "" end') || return 1
+      elif (.packages | has($p)) then .packages[$p] else {} end') || return 1
+    local_version=$(jq -r '.version // empty' <<<"$local_entry")
+    local_generation=$(jq -r '.followed_generation // empty' <<<"$local_entry")
+    local_origin=$(jq -r '.followed_from // empty' <<<"$local_entry")
     if (( dry_run )); then
-      planned_version=$(jq -r --arg p "$name" '.[$p].version // empty' <<<"$follow_planned")
-      [[ -z "$planned_version" ]] || local_version="$planned_version"
+      planned_entry=$(jq -c --arg p "$name" '.[$p] // empty' <<<"$follow_planned")
+      if [[ -n "$planned_entry" ]]; then
+        local_entry="$planned_entry"
+        local_version=$(jq -r '.version // empty' <<<"$local_entry")
+        local_generation=$(jq -r '.followed_generation // empty' <<<"$local_entry")
+        local_origin=$(jq -r '.followed_from // empty' <<<"$local_entry")
+      fi
     fi
     disposition=$(jq -r '.disposition' <<<"$entry")
+    statement_generation=$(jq -r '.generation // empty' <<<"$entry")
     if [[ -n "$local_version" && "$local_version" != "$version" && "$disposition" != "replace" ]]; then
       warn "CONFLICT $name: local pins @$local_version, follow has @$version — resolve with: safe run host-allow update $name@$version --reason \"...\""
+      failures=$((failures + 1)); continue
+    fi
+    if [[ -n "$local_version" && "$local_version" != "$version" && "$disposition" == "replace" && -n "$local_generation" ]] &&
+       ! follow_generation_is_newer "$statement_generation" "$local_generation"; then
+      warn "WARN follow: refusing $id from $origin: local pin @$local_version from ${local_origin:-local operator} has generation $local_generation, which is not older than $statement_generation — resolve with: safe run host-allow update $name@$version --reason \"...\""
       failures=$((failures + 1)); continue
     fi
     replacement=""
@@ -2244,10 +2284,12 @@ follow_commit_generation() {
     if (( dry_run )); then
       if [[ -n "$replacement" ]]; then
         printf '  would-replace %s@%s -> @%s\n' "$name" "$local_version" "$version" >&2
-        follow_planned=$(jq -c --arg p "$name" --arg v "$version" '.[$p] = {version:$v}' <<<"$follow_planned")
+        follow_planned=$(jq -c --arg p "$name" --arg v "$version" --arg origin "$origin" --arg generation "$statement_generation" \
+          '.[$p] = {version:$v, followed_from:$origin, followed_generation:$generation}' <<<"$follow_planned")
       elif [[ -z "$local_version" && "$disposition" != present ]]; then
         printf '  would-add %s\n' "$id" >&2
-        follow_planned=$(jq -c --arg p "$name" --arg v "$version" '.[$p] = {version:$v}' <<<"$follow_planned")
+        follow_planned=$(jq -c --arg p "$name" --arg v "$version" --arg origin "$origin" --arg generation "$statement_generation" \
+          '.[$p] = {version:$v, followed_from:$origin, followed_generation:$generation}' <<<"$follow_planned")
       fi
     else
       # Publish the identity before its local grant, so an interrupted writer

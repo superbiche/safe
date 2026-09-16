@@ -4,7 +4,9 @@
 
 - Signed `host-allow follow` pins replace different local pins, recording the
   old and new pins, origin host, and generation in the audit trail and local
-  follow ledger. Dry-run previews replacements; unsigned `import` keeps its
+  follow ledger. Followed entries retain their accepted generation so the
+  newest signed statement wins across origins; stale statements warn and remain
+  retryable. Dry-run previews replacements; unsigned `import` keeps its
   conflict behavior.
 
 ## 1.63.0 - 2026-09-16

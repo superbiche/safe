@@ -3,7 +3,7 @@ version = 1
 [[bindings]]
 doc = "docs/agents.md"
 target = "docs/contract/agent-contract.json"
-sig = "75d460a6f9558e44"
+sig = "2428e9e0f1f90477"
 
 [[bindings]]
 doc = "docs/agents.md"
@@ -33,7 +33,7 @@ sig = "b12ab74e3e7b31e2"
 [[bindings]]
 doc = "docs/configuration.md"
 target = "bin/safe-run"
-sig = "e5349b3e99c816bf"
+sig = "f9260ff74f208270"
 
 [[bindings]]
 doc = "docs/dependencies.md"
@@ -103,4 +103,4 @@ sig = "9d7937815cb8379c"
 [[bindings]]
 doc = "docs/safe-run.md"
 target = "bin/safe-run"
-sig = "e5349b3e99c816bf"
+sig = "f9260ff74f208270"

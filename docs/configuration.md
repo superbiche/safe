@@ -96,7 +96,9 @@ expiry. Update revocation information in the follower's local GPG keyring;
 verification never fetches keys. Unrelated expired/revoked subkeys do not
 invalidate a good signature. `follow-state.json`, beside the guard-selected
 host-allow store, records per-origin `{accepted, applied:["pkg@version"],
-replaced:["pkg@old->new"]}` and must remain local. Preserve it when removing
+replaced:["pkg@old->new"]}` and must remain local. Followed store entries also
+carry `followed_from` and `followed_generation` so the newest signed statement
+wins across origins; a host-set pin yields to any signed statement. Preserve it
 grants: equal generations skip
 applied identities and retry pending ones; older generations are refused.
 An equal generation with nothing pending returns 0 with one info line. Legacy

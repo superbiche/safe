@@ -120,7 +120,7 @@ sign_document() {
   gpg --no-options --batch --yes --armor --local-user "$1" --detach-sign --output "$2.asc" -- "$2" > "$tmp/sign.log" 2>&1 || fail 'fixture signing failed'
 }
 expect_follow_failure() {
-  expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming" "$@"
+  expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
   grep -q 'operator override:.*host-allow import' "$tmp/output" || fail 'missing operator import hint'
   cmp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'failure altered local grant'
 }
@@ -140,6 +140,9 @@ sign_document "$other_fingerprint" "$tmp/incoming/host-allow.rainbow.json"
 expect_follow_failure
 pass 'untrusted signer rejected even when its public key exists in the ambient keyring'
 reset_incoming
+jq 'del(.packages["fresh-pkg"].followed_from, .packages["fresh-pkg"].followed_generation) | .packages["fresh-pkg"].reason = "local operator pin"' "$SAFE_RUN_CONFIG_DIR/host-allow.json" > "$tmp/local-repin.json"
+cp "$tmp/local-repin.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/local-before.json"
 jq '.packages["fresh-pkg"].version = "2.0.0"' "$export_file" > "$tmp/incoming/host-allow.rainbow.json"
 sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
 rm -f "$tmp/data/audit.log"
@@ -167,6 +170,42 @@ expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
 jq -e '.packages["fresh-pkg"].version == "1.2.3"' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'newer generation did not re-align local re-pin'
 grep -q 'followed fresh-pkg@1.2.3 from rainbow (replaced local pin @9.9.9)' "$tmp/output" || fail 'newer re-alignment info line missing'
 pass 'local re-pin survives an equal generation and is replaced by a newer signed generation'
+
+# A newer signed generation wins across origins regardless of glob order.
+cross_base=$(date -d "$(jq -r '.exported_at' "$export_file")" +%s)
+cross_newer=$(date -u -d "@$((cross_base + 7200))" +%Y-%m-%dT%H:%M:%SZ)
+cross_older=$(date -u -d "@$((cross_base + 3600))" +%Y-%m-%dT%H:%M:%SZ)
+reset_incoming
+printf '{"packages":{}}\n' > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+jq --arg stamp "$cross_newer" '.host = "rainbow" | .exported_at = $stamp | .packages["fresh-pkg"].version = "2.0.0"' "$export_file" > "$tmp/incoming/host-allow.rainbow.json"
+jq --arg stamp "$cross_older" '.host = "tuxedo" | .exported_at = $stamp | .packages["fresh-pkg"].version = "1.2.3"' "$export_file" > "$tmp/incoming/host-allow.tuxedo.json"
+sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
+sign_document "$fingerprint" "$tmp/incoming/host-allow.tuxedo.json"
+expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+jq -e '.packages["fresh-pkg"].version == "2.0.0" and .packages["fresh-pkg"].followed_from == "rainbow" and .packages["fresh-pkg"].followed_generation == $stamp' --arg stamp "$cross_newer" "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'older cross-origin statement downgraded the newer pin'
+jq -e '.origins.rainbow.applied == ["fresh-pkg@2.0.0"] and .origins.tuxedo.applied == []' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'older cross-origin identity was consumed'
+grep -q 'refusing fresh-pkg@1.2.3 from tuxedo: local pin @2.0.0 from rainbow' "$tmp/output" || fail 'cross-origin warning did not name both origins'
+expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+jq -e '.origins.tuxedo.applied == []' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'lagging origin stopped retrying after its first refusal'
+cp "$tmp/incoming/host-allow.tuxedo.json" "$tmp/tuxedo-cross.json"
+cp "$tmp/incoming/host-allow.tuxedo.json.asc" "$tmp/tuxedo-cross.json.asc"
+cp "$tmp/incoming/host-allow.rainbow.json" "$tmp/rainbow-cross.json"
+cp "$tmp/incoming/host-allow.rainbow.json.asc" "$tmp/rainbow-cross.json.asc"
+
+reset_incoming
+mkdir "$tmp/older-first" "$tmp/newer-second"
+cp "$tmp/tuxedo-cross.json" "$tmp/older-first/host-allow.tuxedo.json"
+cp "$tmp/tuxedo-cross.json.asc" "$tmp/older-first/host-allow.tuxedo.json.asc"
+cp "$tmp/rainbow-cross.json" "$tmp/newer-second/host-allow.rainbow.json"
+cp "$tmp/rainbow-cross.json.asc" "$tmp/newer-second/host-allow.rainbow.json.asc"
+printf '{"packages":{}}\n' > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/older-first"
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/newer-second"
+jq -e '.packages["fresh-pkg"].version == "2.0.0" and .packages["fresh-pkg"].followed_from == "rainbow" and .packages["fresh-pkg"].followed_generation == $stamp' --arg stamp "$cross_newer" "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'newer cross-origin statement did not re-align the older pin'
+jq -e '.origins.tuxedo.applied == ["fresh-pkg@1.2.3"] and .origins.rainbow.applied == ["fresh-pkg@2.0.0"]' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'reversed cross-origin order did not apply both generations'
+cp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+rm -rf -- "$tmp/older-first" "$tmp/newer-second"
+pass 'newest signed statement wins across origins; an older statement stays retryable'
 reset_incoming
 printf 'invalid unsigned own-host file\n' > "$tmp/incoming/host-allow.agent-dev.json"
 expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
@@ -212,7 +251,8 @@ pass 'same import validator rejects bad types, missing reasons, unknown ecosyste
 reset_incoming
 cp "$export_file" "$tmp/incoming/host-allow.rainbow.json"
 cp "$export_file.asc" "$tmp/incoming/host-allow.rainbow.json.asc"
-jq '.host="tuxedo" | .packages["fresh-pkg"].version="2.0.0"' "$export_file" > "$tmp/incoming/host-allow.tuxedo.json"
+preview_stamp=$(date -u -d "$(jq -r '.exported_at' "$export_file") + 60 seconds" +%Y-%m-%dT%H:%M:%SZ)
+jq --arg stamp "$preview_stamp" '.host="tuxedo" | .exported_at=$stamp | .packages["fresh-pkg"].version="2.0.0"' "$export_file" > "$tmp/incoming/host-allow.tuxedo.json"
 sign_document "$fingerprint" "$tmp/incoming/host-allow.tuxedo.json"
 expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming" --dry-run
 grep -q 'would-add fresh-pkg' "$tmp/output" || fail 'preview missing first addition'
@@ -425,30 +465,28 @@ for ((repeat=0; repeat<3; repeat++)); do
 done
 pass 'three unchanged runs return zero with one quiet info line and no registry dependency'
 
-# A reported local publication failure must also leave that identity retryable.
+# A reported trust-store publication failure must also leave that identity
+# retryable. The mv stub fails only when the final target is the trust store;
+# ledger renames continue normally so this reaches the store publication path.
 reset_incoming
-cp "$export_file" "$tmp/incoming/host-allow.rainbow.json"
+jq '.packages["fresh-pkg"].version = "2.0.0"' "$export_file" > "$tmp/incoming/host-allow.rainbow.json"
 sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
-"$SAFE_RUN" host-allow remove fresh-pkg > "$tmp/output" 2>&1
+printf '{"packages":{"fresh-pkg":{"version":"1.2.3","sha":"sha512-FRESH","ecosystem":"npm","added":"2026-06-01","reason":"local operator pin"}}}\n' > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/local-before.json"
+rm -f "$tmp/data/audit.log"
 cat > "$tmp/bin/mv" <<'STUB'
 #!/usr/bin/env bash
-# This follow run publishes the ledger first, then the trust store; fail the
-# second rename to exercise rollback of a reported store publication failure.
-if [[ "${TEST_FAIL_HOST_STORE:-0}" == 1 ]]; then
-  count_file="$SAFE_RUN_CONFIG_DIR/mv-fail-count"
-  count=0
-  [[ ! -e "$count_file" ]] || count=$(<"$count_file")
-  count=$((count + 1))
-  printf '%s\n' "$count" > "$count_file"
-  (( count == 2 )) && exit 1
-fi
+if [[ "${TEST_FAIL_HOST_STORE:-0}" == 1 && "${!#}" == "$SAFE_RUN_CONFIG_DIR/host-allow.json" ]]; then exit 1; fi
 exec /usr/bin/mv "$@"
 STUB
 chmod +x "$tmp/bin/mv"
 expect_rc 1 env TEST_FAIL_HOST_STORE=1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
 jq -e '.origins.rainbow.applied == []' "$state_file" >/dev/null || fail 'failed store publication consumed identity'
+cmp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'failed store publication changed local grant'
+if [[ -e "$tmp/data/audit.log" ]] && grep -q 'REPLACED' "$tmp/data/audit.log"; then fail 'failed store publication wrote replacement audit'; fi
 expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
-jq -e '.origins.rainbow.applied == ["fresh-pkg@1.2.3"]' "$state_file" >/dev/null || fail 'store-failure retry did not complete'
+jq -e '.packages["fresh-pkg"].version == "2.0.0"' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'store-failure retry did not replace local pin'
+jq -e '.origins.rainbow.applied == ["fresh-pkg@2.0.0"]' "$state_file" >/dev/null || fail 'store-failure retry did not complete'
 pass 'explicit local publication failure rolls back only the failed identity for retry'
 
 # Registry validation must not hold the store lock. Explicit readiness markers

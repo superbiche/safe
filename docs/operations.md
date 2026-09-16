@@ -104,10 +104,13 @@ local keyring; there is no automatic keyserver refresh.
 A user timer can invoke `safe run host-allow follow` daily. This change does not
 install a timer or automatically sign after add. Own-host files are ignored;
 verified statements add absent grants or replace a different local pin after
-import validation, retaining the signed entry's `added` date and recording
-`followed_from`. Replacements are recorded in the run audit log and the
-origin's `replaced` ledger array. Dry-run validates the whole plan without
-changing persistent state. A machine-local `follow-state.json` beside the
+import validation when their generation is newer than the generation recorded
+on that entry, retaining the signed entry's `added` date and recording
+`followed_from` and `followed_generation`. Entries without a recorded generation
+yield to a signed statement. The newest signed statement wins across origins; a
+host-set pin yields to any signed statement. Replacements are recorded in the
+run audit log and the origin's `replaced` ledger array. Dry-run validates the
+whole plan without changing persistent state. A machine-local `follow-state.json` beside the
 guard-selected trust store records each origin as
 `{"accepted":"<exported_at>","applied":["<pkg>@<version>"],"replaced":["<pkg>@<old>-><new>"]}`. Older timestamps
 warn, increment the freshness-skip count and return non-zero. Equal timestamps
@@ -130,7 +133,10 @@ JSON/signature pair during transport is safely rejected; retry after both arrive
 For an actual skip/error, the operator can review the file and run
 `safe run host-allow import <file>` at a TTY. Unsigned imports keep their
 conflict behavior and need the usual `safe run host-allow update
-<pkg>@<version> --reason "..."`; signed follow replaces a different local pin.
+<pkg>@<version> --reason "..."`; signed follow replaces a different local pin
+when its generation is newer. A stale signed statement is warned, counted as a
+failure, and remains retryable for that identity until its origin publishes a
+newer generation.
 Signature and older
 replay failures/counts are emitted by follow; there is no persistent doctor
 status in this slice. Dry-run never creates or changes freshness state or its
