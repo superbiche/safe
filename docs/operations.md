@@ -112,16 +112,22 @@ host-set pin yields to any signed statement. Replacements are recorded in the
 run audit log and the origin's `replaced` ledger array. Dry-run validates the
 whole plan without changing persistent state. A machine-local `follow-state.json` beside the
 guard-selected trust store records each origin as
-`{"accepted":"<exported_at>","applied":["<pkg>@<version>"],"replaced":["<pkg>@<old>-><new>"]}`. Older timestamps
+`{"accepted":"<exported_at>","applied":["<pkg>@<version>"],"replaced":["<pkg>@<old>-><new>"],"refused":["<pkg>@<version>"]}`. Older timestamps
 warn, increment the freshness-skip count and return non-zero. Equal timestamps
 retry only identities that never applied; successful entries stay skipped even
 after operator removal. A local re-pin survives an equal generation and a newer
-signed generation re-aligns it to the origin's pin. A registry outage is
-therefore retryable with the same signed file. Once complete, unchanged daily
+signed generation re-aligns it to the origin's pin. Older or equal replacement
+statements are WARNed once, recorded in `refused`, and remain non-zero; a
+same-generation retry is an INFO skip that cannot replace a later TTY re-pin. A
+hinted update to the refused version makes it present and clears the refusal. A
+registry outage is therefore retryable with the same signed file. Once complete, unchanged daily
 runs return 0 with one quiet info line, no registry calls and no import
 prescription. Verification still runs.
-A newer signed generation starts a fresh applied set. Timestamp comparisons
-normalize timezone offsets.
+A newer signed generation starts fresh applied and refused sets. After upgrading,
+the first follow derives a missing `followed_generation` when `followed_from`
+and the matching applied identity identify a prior followed entry; TTY entries
+without that provenance remain replaceable. Timestamp comparisons normalize
+timezone offsets.
 
 Add/update/import/follow and removal share the host-store writer lock. Follow
 fetches registry evidence outside it (10 seconds maximum per request), then

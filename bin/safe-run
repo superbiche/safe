@@ -2158,8 +2158,8 @@ follow_exported_epoch() {
 
 follow_generation_is_newer() {
   local incoming="$1" existing="$2" incoming_epoch existing_epoch
-  incoming_epoch=$(follow_exported_epoch "$incoming") || return 1
-  existing_epoch=$(follow_exported_epoch "$existing") || return 1
+  incoming_epoch=$(follow_exported_epoch "$incoming") || return 2
+  existing_epoch=$(follow_exported_epoch "$existing") || return 2
   (( incoming_epoch > existing_epoch ))
 }
 
@@ -2174,7 +2174,8 @@ follow_load_state() {
     type == "object" and
     (.accepted | type == "string" and (test("[[:space:][:cntrl:]]") | not)) and
     (.applied | type == "array" and all(.[]; type == "string" and length > 0)) and
-    ((.replaced == null) or (.replaced | type == "array" and all(.[]; type == "string" and length > 0)))))' \
+    ((.replaced == null) or (.replaced | type == "array" and all(.[]; type == "string" and length > 0))) and
+    ((.refused == null) or (.refused | type == "array" and all(.[]; type == "string" and length > 0)))))' \
     <<<"$state" >/dev/null 2>&1; then
     warn "WARN follow: malformed follow-state.json (including legacy generation-only records); repair it at an operator terminal before following"
     return 1
@@ -2204,7 +2205,7 @@ follow_select_generation() {
     fi
   fi
   jq -c --arg host "$origin" --arg stamp "$stamp" \
-    '.origins[$host] = {accepted: $stamp, applied: [], replaced: []}' <<<"$state"
+    '.origins[$host] = {accepted: $stamp, applied: [], replaced: [], refused: []}' <<<"$state"
 }
 
 follow_publish_state() {
@@ -2227,7 +2228,7 @@ follow_collect_entry() {
 # writes; dry-run reads atomic snapshots without creating a lock or ledger.
 follow_commit_generation() {
   local dry_run="$1" origin="$2" ha_file="$3" stamp="$4" candidates="$5"
-  local state_file state selected next entry name version sha reason ecosystem added disposition id local_entry local_generation local_origin statement_generation planned_entry replacement replace_local
+  local state_file state selected next entry name version sha reason ecosystem added disposition id local_entry local_generation local_origin statement_generation planned_entry replacement replace_local generation_rc already_refused
   local changed=0 failures=0
   state_file="$(dirname "$ha_file")/follow-state.json"
   state=$(follow_load_state "$state_file") || return 1
@@ -2246,7 +2247,12 @@ follow_commit_generation() {
     fi
     local_entry=$(load_trust_store_json "$ha_file" | jq -ce --arg p "$name" '
       if (.packages | type) != "object" then error("malformed host-allow store")
-      elif (.packages | has($p)) then .packages[$p] else {} end') || return 1
+      elif (.packages | has($p)) then
+        .packages[$p] |
+        if type == "object" then . + {version: (.version // "invalid")}
+        else {version: "invalid"}
+        end
+      else {} end') || return 1
     local_version=$(jq -r '.version // empty' <<<"$local_entry")
     local_generation=$(jq -r '.followed_generation // empty' <<<"$local_entry")
     local_origin=$(jq -r '.followed_from // empty' <<<"$local_entry")
@@ -2259,16 +2265,50 @@ follow_commit_generation() {
         local_origin=$(jq -r '.followed_from // empty' <<<"$local_entry")
       fi
     fi
+    if [[ -n "$local_origin" && -z "$local_generation" && "$local_version" != "invalid" ]]; then
+      local_generation=$(jq -r --arg host "$local_origin" --arg id "$name@$local_version" '
+        if ((.origins[$host].applied // []) | index($id)) != null
+        then .origins[$host].accepted // empty
+        else empty
+        end' <<<"$state") || return 1
+    fi
     disposition=$(jq -r '.disposition' <<<"$entry")
     statement_generation=$(jq -r '.generation // empty' <<<"$entry")
-    if [[ -n "$local_version" && "$local_version" != "$version" && "$disposition" != "replace" ]]; then
+    if [[ "$local_version" == "invalid" ]] ||
+       [[ -n "$local_version" && "$local_version" != "$version" && "$disposition" != "replace" ]]; then
       warn "CONFLICT $name: local pins @$local_version, follow has @$version — resolve with: safe run host-allow update $name@$version --reason \"...\""
       failures=$((failures + 1)); continue
     fi
-    if [[ -n "$local_version" && "$local_version" != "$version" && "$disposition" == "replace" && -n "$local_generation" ]] &&
-       ! follow_generation_is_newer "$statement_generation" "$local_generation"; then
-      warn "WARN follow: refusing $id from $origin: local pin @$local_version from ${local_origin:-local operator} has generation $local_generation, which is not older than $statement_generation — resolve with: safe run host-allow update $name@$version --reason \"...\""
+    already_refused=0
+    if jq -e --arg host "$origin" --arg id "$id" '.origins[$host].refused // [] | index($id) != null' <<<"$state" >/dev/null; then
+      already_refused=1
+    fi
+    if (( already_refused )) && [[ "$local_version" != "$version" ]]; then
+      info "follow: skipped $id from $origin (generation $statement_generation was refused; local pin @${local_version:-absent})"
       failures=$((failures + 1)); continue
+    fi
+    if [[ -n "$local_version" && "$local_version" != "$version" && "$disposition" == "replace" && -n "$local_generation" ]]; then
+      generation_rc=0
+      follow_generation_is_newer "$statement_generation" "$local_generation" || generation_rc=$?
+      if (( generation_rc != 0 )); then
+        if (( generation_rc == 2 )); then
+          warn "WARN follow: local pin @$local_version has a malformed followed generation; repair the host-allow store at an operator terminal"
+        else
+          warn "WARN follow: refusing $id from $origin: local pin @$local_version from ${local_origin:-local operator} has generation $local_generation, which is not older than $statement_generation — resolve with: safe run host-allow update $name@$version --reason \"...\""
+        fi
+        if (( !already_refused )); then
+          if (( dry_run )); then
+            info "follow: would refuse $id from $origin at generation $statement_generation"
+          else
+            next=$(jq -c --arg host "$origin" --arg id "$id" '
+              .origins[$host].refused = ((.origins[$host].refused // []) + [$id] | unique)' <<<"$state") || return 1
+            follow_publish_state "$state_file" "$next" || return 1
+            state="$next"
+            changed=1
+          fi
+        fi
+        failures=$((failures + 1)); continue
+      fi
     fi
     replacement=""
     replace_local=0
@@ -2278,6 +2318,7 @@ follow_commit_generation() {
     fi
     next=$(jq -c --arg host "$origin" --arg id "$id" --arg replacement "$replacement" '
       .origins[$host].applied += [$id] |
+      .origins[$host].refused = ((.origins[$host].refused // []) - [$id]) |
       if $replacement == "" then .
       else .origins[$host].replaced = ((.origins[$host].replaced // []) + [$replacement])
       end' <<<"$state") || return 1

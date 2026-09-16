@@ -271,7 +271,7 @@ A local `follow-state.json` beside the guard-selected trust store records each
 origin's highest accepted `exported_at` and the identities already applied:
 
 ```json
-{"origins":{"rainbow":{"accepted":"2026-09-16T14:00:00Z","applied":["fresh-pkg@1.2.3"],"replaced":["fresh-pkg@1.0.0->1.2.3"]}}}
+{"origins":{"rainbow":{"accepted":"2026-09-16T14:00:00Z","applied":["fresh-pkg@1.2.3"],"replaced":["fresh-pkg@1.0.0->1.2.3"],"refused":["other-pkg@2.0.0"]}}}
 ```
 
 Timestamps are real ISO-8601 whole-second instants with an explicit timezone;
@@ -284,8 +284,16 @@ when the registry recovers. Successful siblings remain recorded. A local re-pin
 survives an equal generation; a newer signed generation re-aligns it to the
 publishing host's signed pin. A stale cross-origin statement is refused per
 identity with a WARN, counted as a failure, and left retryable until that origin
-publishes a newer generation. A newer signed generation starts a new applied set
-and can authorize grants again.
+publishes a newer generation. The refusal is remembered in the origin's optional
+`refused` array, so a same-generation retry prints an INFO skip and remains
+non-zero without replacing a later operator TTY re-pin. A hinted
+`host-allow update` to the refused version makes the entry present and clears
+that refusal. A newer signed generation starts fresh applied and refused sets
+and can authorize grants again. After upgrading from a release that recorded
+followed entries without `followed_generation`, the first follow derives the
+generation from the entry's `followed_from` origin and matching `applied`
+identity before comparing it; entries without that provenance remain
+generation-less and yield to a signed statement.
 
 Once all entries of an equal generation are applied, repeated timer runs and
 previews return 0 with one quiet info line and no import hint or registry fetch.

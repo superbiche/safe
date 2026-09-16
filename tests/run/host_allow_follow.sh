@@ -191,6 +191,7 @@ cp "$tmp/incoming/host-allow.tuxedo.json" "$tmp/tuxedo-cross.json"
 cp "$tmp/incoming/host-allow.tuxedo.json.asc" "$tmp/tuxedo-cross.json.asc"
 cp "$tmp/incoming/host-allow.rainbow.json" "$tmp/rainbow-cross.json"
 cp "$tmp/incoming/host-allow.rainbow.json.asc" "$tmp/rainbow-cross.json.asc"
+cp "$SAFE_RUN_CONFIG_DIR/follow-state.json" "$tmp/state-with-refusal.json"
 
 reset_incoming
 mkdir "$tmp/older-first" "$tmp/newer-second"
@@ -206,6 +207,44 @@ jq -e '.origins.tuxedo.applied == ["fresh-pkg@1.2.3"] and .origins.rainbow.appli
 cp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json"
 rm -rf -- "$tmp/older-first" "$tmp/newer-second"
 pass 'newest signed statement wins across origins; an older statement stays retryable'
+
+# A refusal survives an operator TTY re-pin, including a dry-run. The
+# lagging origin remains red until it publishes a newer generation.
+cp "$tmp/tuxedo-cross.json" "$tmp/incoming/host-allow.tuxedo.json"
+cp "$tmp/tuxedo-cross.json.asc" "$tmp/incoming/host-allow.tuxedo.json.asc"
+cp "$tmp/rainbow-cross.json" "$tmp/incoming/host-allow.rainbow.json"
+cp "$tmp/rainbow-cross.json.asc" "$tmp/incoming/host-allow.rainbow.json.asc"
+cp "$tmp/state-with-refusal.json" "$SAFE_RUN_CONFIG_DIR/follow-state.json"
+cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/local-before-refused-repin.json"
+cp "$SAFE_RUN_CONFIG_DIR/follow-state.json" "$tmp/state-before-refused-repin.json"
+printf '{"packages":{"fresh-pkg":{"version":"3.0.0","reason":"local TTY re-pin","ecosystem":"npm"}}}\n' > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+jq -e '.packages["fresh-pkg"].version == "3.0.0" and (.packages["fresh-pkg"] | has("followed_from") | not)' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'refused origin replaced a TTY re-pin'
+grep -q 'follow: skipped fresh-pkg@1.2.3 from tuxedo' "$tmp/output" || fail 'repeated refusal did not print the quiet skip'
+cmp "$tmp/state-before-refused-repin.json" "$SAFE_RUN_CONFIG_DIR/follow-state.json" || fail 'repeated refusal changed the ledger'
+cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/local-after-refused-repin.json"
+expect_rc 1 "$SAFE_RUN" host-allow follow --dry-run --from "$tmp/incoming"
+grep -q 'follow: skipped fresh-pkg@1.2.3 from tuxedo' "$tmp/output" || fail 'dry-run did not print the refused skip'
+cmp "$tmp/local-after-refused-repin.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'refused dry-run changed the store'
+cmp "$tmp/state-before-refused-repin.json" "$SAFE_RUN_CONFIG_DIR/follow-state.json" || fail 'refused dry-run changed the ledger'
+pass 'same-generation refusals survive a TTY re-pin and dry-run'
+
+# A 1.63.0-shaped followed entry has no stamp, but its applied identity and
+# origin ledger still recover the accepted generation before comparison.
+reset_incoming
+mkdir "$tmp/legacy"
+printf '{"packages":{"fresh-pkg":{"version":"2.0.0","sha":"sha512-FRESH","ecosystem":"npm","added":"2026-07-01","reason":"legacy followed grant","followed_from":"rainbow"}}}\n' > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+printf '{"origins":{"rainbow":{"accepted":"%s","applied":["fresh-pkg@2.0.0"],"replaced":[]}}}\n' "$cross_newer" > "$SAFE_RUN_CONFIG_DIR/follow-state.json"
+cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/legacy-before.json"
+cp "$tmp/tuxedo-cross.json" "$tmp/legacy/host-allow.tuxedo.json"
+cp "$tmp/tuxedo-cross.json.asc" "$tmp/legacy/host-allow.tuxedo.json.asc"
+expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/legacy"
+cmp "$tmp/legacy-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'legacy followed entry was replaced by an older statement'
+grep -q 'refusing fresh-pkg@1.2.3 from tuxedo: local pin @2.0.0 from rainbow' "$tmp/output" || fail 'legacy generation backfill did not refuse the lagging origin'
+rm -rf -- "$tmp/legacy"
+cp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+pass 'legacy followed entries derive their accepted generation on first follow'
+
 reset_incoming
 printf 'invalid unsigned own-host file\n' > "$tmp/incoming/host-allow.agent-dev.json"
 expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
@@ -246,6 +285,33 @@ for cause in 'no reason' 'unknown ecosystem' 'not an exact pinned' 'invalid entr
   grep -q "$cause" "$tmp/output" || fail "missing rejection: $cause"
 done
 pass 'same import validator rejects bad types, missing reasons, unknown ecosystems, non-exact pins, unresolved versions and changed integrity'
+
+# A malformed local entry is a named conflict, while a valid sibling in the
+# same signed file still applies. Exercise both null and versionless shapes.
+reset_incoming
+jq '.host = "rainbow" | .packages = {
+ "fresh-pkg":{"version":"1.2.3","ecosystem":"npm","sha":"sha512-FRESH","reason":"fresh grant","added":"2026-07-01"},
+ "epoch-pkg":{"version":"1!2.0","ecosystem":"python","sha":"sha256-EPOCH","reason":"sibling grant","added":"2026-06-03"}
+}' "$export_file" > "$tmp/incoming/host-allow.rainbow.json"
+sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
+printf '{"packages":{"fresh-pkg":null}}\n' > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+grep -q 'CONFLICT fresh-pkg: local pins @invalid, follow has @1.2.3' "$tmp/output" || fail 'null local entry was not named as a conflict'
+jq -e '.packages["epoch-pkg"].version == "1!2.0"' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'null entry blocked the valid sibling'
+jq -e '.origins.rainbow.applied | index("epoch-pkg@1!2.0") != null' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'null entry sibling was not recorded'
+reset_incoming
+jq '.host = "rainbow" | .packages = {
+ "fresh-pkg":{"version":"1.2.3","ecosystem":"npm","sha":"sha512-FRESH","reason":"fresh grant","added":"2026-07-01"},
+ "epoch-pkg":{"version":"1!2.0","ecosystem":"python","sha":"sha256-EPOCH","reason":"sibling grant","added":"2026-06-03"}
+}' "$export_file" > "$tmp/incoming/host-allow.rainbow.json"
+sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
+printf '{"packages":{"fresh-pkg":{"reason":"missing version"}}}\n' > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+grep -q 'CONFLICT fresh-pkg: local pins @invalid, follow has @1.2.3' "$tmp/output" || fail 'versionless local entry was not named as a conflict'
+jq -e '.packages["epoch-pkg"].version == "1!2.0"' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'versionless entry blocked the valid sibling'
+jq -e '.origins.rainbow.applied | index("epoch-pkg@1!2.0") != null' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'versionless entry sibling was not recorded'
+cp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+pass 'null and versionless local entries report named conflicts while valid siblings apply'
 
 # Preview must model the whole UNION, including conflicts between source files.
 reset_incoming
