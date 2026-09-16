@@ -28,7 +28,7 @@ sig = "d5ebd850ae7d3c4e"
 [[bindings]]
 doc = "docs/configuration.md"
 target = "bin/safe-audit"
-sig = "b12ab74e3e7b31e2"
+sig = "c1a5b1775726c28f"
 
 [[bindings]]
 doc = "docs/configuration.md"
@@ -38,7 +38,7 @@ sig = "e955e0bd2281d5d3"
 [[bindings]]
 doc = "docs/dependencies.md"
 target = "bin/safe-audit"
-sig = "b12ab74e3e7b31e2"
+sig = "c1a5b1775726c28f"
 
 [[bindings]]
 doc = "docs/index.md"
@@ -93,7 +93,7 @@ sig = "084d3a2364a61dca"
 [[bindings]]
 doc = "docs/safe-audit.md"
 target = "bin/safe-audit"
-sig = "b12ab74e3e7b31e2"
+sig = "c1a5b1775726c28f"
 
 [[bindings]]
 doc = "docs/safe-audit.md"

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.64.0 - 2026-09-17
+
 - Signed `host-allow follow` pins replace different local pins, recording the
   old and new pins, origin host, and generation in the audit trail and local
   follow ledger. Followed entries retain their accepted generation so the
