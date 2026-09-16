@@ -160,6 +160,16 @@ The exported document (`schema: safe-host-allow-export/1`) carries only
 `name@version`, ecosystem, the public registry integrity hash, the original
 `--reason`, and the add date. There are no secrets in it.
 
+`export --sign [--out <dir>]` requires an operator TTY and GPG. It writes
+`host-allow.<hostname -s>.json` and its detached armored `.json.asc` signature
+under `~/Sync/state/safe/` by default. Signed documents use schema
+`safe-host-allow-export/2`, adding `host` and `exported_at`; unsigned stdout
+exports stay at `/1`. Import accepts both schemas. Each file is atomically
+renamed after signing succeeds; readers may briefly see mismatched generations
+and must reject them. `follow.signing_key` in the run config selects the GPG
+signing key; otherwise GPG selects its default key. Signing a redirected trust
+store requires the same explicit trust override as a grant.
+
 `import` is *"review this set and apply"*, never *"trust another machine"*:
 
 - It is an operator-only trust escalation, TTY-gated exactly like `add`/`update`

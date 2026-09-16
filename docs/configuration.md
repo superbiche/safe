@@ -85,6 +85,9 @@ receipt. It smooths the install gate only (offline/timeout fallback within
 host-execution trust stays in `host-allow.json`, which is TTY-gated and
 unchanged.
 
+`follow.signing_key` in `run/config.json` optionally selects the GPG key for
+operator-only `safe run host-allow export --sign`; absent, GPG uses its default.
+
 `config.json` stores runtime defaults, linked runner paths, sandbox limits, warning behavior, and the install-gate policy:
 
 ```json

@@ -1774,12 +1774,22 @@ registry_verified_integrity() {
 cmd_host_allow_export() {
   # Accept the documented --json spelling; a JSON document is the only form,
   # since its purpose is to be re-read by `import`. `list` is the human view.
+  local sign=0 out_dir="$HOME/Sync/state/safe" out_set=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --json) shift ;;
-      *) die "unknown flag: $1 (usage: safe run host-allow export [--json])" ;;
+      --sign) sign=1; shift ;;
+      --out) [[ $# -ge 2 && -n "$2" ]] || die "--out requires a directory"
+        out_dir="$2"; out_set=1; shift 2 ;;
+      *) die "unknown flag: $1 (usage: safe run host-allow export [--json] [--sign [--out <dir>]])" ;;
     esac
   done
+  (( sign || ! out_set )) || die "--out requires --sign"
+  if (( sign )); then
+    trust_redirected_guard write "host-allow-export-sign"
+    require_operator_tty "export --sign" ""
+    require_cmd gpg
+  fi
   local packages='{}'
   if [[ -r "$HOST_ALLOW_FILE" ]]; then
     # A malformed local trust file is a legible error, never a silent empty
@@ -1794,10 +1804,41 @@ cmd_host_allow_export() {
     packages=$(jq -c '(.packages // {})
       | map_values({version, sha, ecosystem, added, reason})' "$HOST_ALLOW_FILE")
   fi
-  jq -n --arg schema "$HOST_ALLOW_EXPORT_SCHEMA" --arg exported "$(date -I)" \
+  local document
+  document=$(jq -n --arg schema "$HOST_ALLOW_EXPORT_SCHEMA" --arg exported "$(date -I)" \
      --argjson packages "$packages" \
-     '{schema: $schema, exported: $exported, packages: $packages}'
+     '{schema: $schema, exported: $exported, packages: $packages}')
+  if (( sign )); then
+    host_allow_export_signed "$document" "$out_dir"
+  else
+    printf '%s\n' "$document"
+  fi
 }
+
+# Stage both files on the destination filesystem before publishing either.
+# The two renames are individually atomic; a reader seeing mixed generations
+# rejects the signature and can retry after synchronization completes.
+host_allow_export_signed() (
+  local document="$1" out_dir="$2" host dest staging signing_key
+  host=$(hostname -s)
+  [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid short hostname"
+  mkdir -p -- "$out_dir"
+  dest="$out_dir/host-allow.$host.json"
+  staging=$(mktemp -d "$out_dir/.host-allow-sign.XXXXXX")
+  trap 'rm -rf -- "$staging"' EXIT
+  jq --arg host "$host" --arg exported_at "$(now_iso)" \
+    '.schema = "safe-host-allow-export/2" | .host = $host | .exported_at = $exported_at' \
+    <<<"$document" > "$staging/export.json"
+  signing_key=$(config_get '.follow.signing_key' '')
+  local key_args=()
+  [[ -z "$signing_key" ]] || key_args=(--local-user "$signing_key")
+  gpg --no-options --armor --detach-sign "${key_args[@]}" \
+    --output "$staging/export.json.asc" -- "$staging/export.json" \
+    || die "could not sign export; check follow.signing_key or the default GPG key and retry at an operator terminal"
+  mv -f -- "$staging/export.json.asc" "$dest.asc"
+  mv -f -- "$staging/export.json" "$dest"
+  info "signed export: $dest (signature: $dest.asc)"
+)
 
 cmd_host_allow_import() {
   trust_redirected_guard write "host-allow-import"
@@ -1815,7 +1856,7 @@ cmd_host_allow_import() {
   jq -e . "$file" >/dev/null 2>&1 || die "import file is not valid JSON: $file"
   local schema
   schema=$(jq -r '.schema // empty' "$file")
-  [[ "$schema" == "$HOST_ALLOW_EXPORT_SCHEMA" ]] || \
+  [[ "$schema" == "$HOST_ALLOW_EXPORT_SCHEMA" || "$schema" == "safe-host-allow-export/2" ]] || \
     die "not a safe host-allow export (expected schema $HOST_ALLOW_EXPORT_SCHEMA); create one with: safe run host-allow export"
   # The whole envelope is validated before any entry is applied: a scalar,
   # array, or boolean `.packages` must fail loudly, never masquerade as an empty
@@ -1934,7 +1975,10 @@ require_operator_tty() {
   local action="$1" spec="$2"
   is_tty && return 0
   err "BLOCKED: host-allow $action requires an interactive operator terminal"
-  err "  ask the operator to run: safe run host-allow $action ${spec} --reason \"...\""
+  case "$action" in
+    add|update) err "  ask the operator to run: safe run host-allow $action ${spec} --reason \"...\"" ;;
+    *) err "  ask the operator to run: safe run host-allow $action $spec" ;;
+  esac
   err "  agent contract: safe explain"
   exit 102
 }
@@ -3173,6 +3217,7 @@ SUBCOMMANDS
                                               reports what it found
   host-allow export [--json]                  Dump this machine's allow set as a
                                               portable JSON document (for import)
+  host-allow export --sign [--out <dir>]      Sign a fleet export (operator TTY)
   host-allow import <file> [--dry-run]        Apply a reviewed allow set (TTY);
                                               re-validates + re-fetches integrity,
                                               never overwrites a divergent pin;

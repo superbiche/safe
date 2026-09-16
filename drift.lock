@@ -33,7 +33,7 @@ sig = "45d5f0e9e949d90e"
 [[bindings]]
 doc = "docs/configuration.md"
 target = "bin/safe-run"
-sig = "601590a99c675238"
+sig = "06e7c8fe5f0b9df9"
 
 [[bindings]]
 doc = "docs/dependencies.md"
@@ -103,4 +103,4 @@ sig = "9d7937815cb8379c"
 [[bindings]]
 doc = "docs/safe-run.md"
 target = "bin/safe-run"
-sig = "601590a99c675238"
+sig = "06e7c8fe5f0b9df9"
