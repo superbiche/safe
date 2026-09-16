@@ -84,6 +84,7 @@ if [[ "${TEST_CONCURRENT_PIN:-0}" == "1" ]]; then
 fi
 case "${!#}" in
   *registry.npmjs.org/fresh-pkg/1.2.3) printf '{"version":"1.2.3","dist":{"integrity":"sha512-FRESH"}}' ;;
+  *registry.npmjs.org/fresh-pkg/2.0.0) printf '{"version":"2.0.0","dist":{"integrity":"sha512-FRESH"}}' ;;
   *registry.npmjs.org/range-pkg/1.x) printf '{"version":"1.2.3","dist":{"integrity":"sha512-FRESH"}}' ;;
   *pypi.org/pypi/epoch-pkg/1!2.0/json) printf '{"info":{"version":"1!2.0"},"urls":[{"digests":{"sha256":"EPOCH"}}]}' ;;
   *) exit 22 ;;
@@ -141,10 +142,31 @@ pass 'untrusted signer rejected even when its public key exists in the ambient k
 reset_incoming
 jq '.packages["fresh-pkg"].version = "2.0.0"' "$export_file" > "$tmp/incoming/host-allow.rainbow.json"
 sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
-expect_follow_failure
-grep -q 'CONFLICT fresh-pkg.*host-allow update fresh-pkg@2.0.0' "$tmp/output" || fail 'missing conflict/update hint'
-expect_follow_failure --dry-run
-pass 'different local pin preserved in apply and preview'
+rm -f "$tmp/data/audit.log"
+expect_rc 0 "$SAFE_RUN" host-allow follow --dry-run --from "$tmp/incoming"
+grep -q 'would-replace fresh-pkg@1.2.3 -> @2.0.0' "$tmp/output" || fail 'dry-run missed signed replacement'
+cmp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'replacement preview altered local grant'
+[[ ! -e "$SAFE_RUN_CONFIG_DIR/follow-state.json" ]] || fail 'replacement preview advanced ledger'
+[[ ! -e "$tmp/data/audit.log" ]] || fail 'replacement preview wrote audit log'
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+jq -e '.packages["fresh-pkg"] | .version == "2.0.0" and .added == "2026-07-01" and .followed_from == "rainbow" and .sha == "sha512-FRESH"' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'signed replacement differs'
+jq -e '.origins.rainbow.applied == ["fresh-pkg@2.0.0"] and .origins.rainbow.replaced == ["fresh-pkg@1.2.3->2.0.0"]' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'replacement ledger record differs'
+grep -q 'host-allow-follow | fresh-pkg@2.0.0 | TRUST | non-tty | REPLACED | old_pin=@1.2.3 new_pin=@2.0.0 origin_host=rainbow generation=' "$tmp/data/audit.log" || fail 'replacement audit event missing'
+grep -q 'followed fresh-pkg@2.0.0 from rainbow (replaced local pin @1.2.3)' "$tmp/output" || fail 'replacement info line missing'
+pass 'signed follow replaces a different local pin, records the replacement, and previews without writes'
+
+# An operator re-pin survives an equal generation, then a newer signed
+# generation re-aligns it to the publishing host's pin.
+printf '{"packages":{"fresh-pkg":{"version":"9.9.9","reason":"local re-pin","ecosystem":"npm"}}}\n' > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+jq -e '.packages["fresh-pkg"].version == "9.9.9"' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'equal generation changed a local re-pin'
+repin_stamp=$(date -u -d "$(jq -r '.exported_at' "$export_file") + 60 seconds" +%Y-%m-%dT%H:%M:%SZ)
+jq --arg stamp "$repin_stamp" '.exported_at = $stamp' "$export_file" > "$tmp/incoming/host-allow.rainbow.json"
+sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+jq -e '.packages["fresh-pkg"].version == "1.2.3"' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'newer generation did not re-align local re-pin'
+grep -q 'followed fresh-pkg@1.2.3 from rainbow (replaced local pin @9.9.9)' "$tmp/output" || fail 'newer re-alignment info line missing'
+pass 'local re-pin survives an equal generation and is replaced by a newer signed generation'
 reset_incoming
 printf 'invalid unsigned own-host file\n' > "$tmp/incoming/host-allow.agent-dev.json"
 expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
@@ -192,10 +214,11 @@ cp "$export_file" "$tmp/incoming/host-allow.rainbow.json"
 cp "$export_file.asc" "$tmp/incoming/host-allow.rainbow.json.asc"
 jq '.host="tuxedo" | .packages["fresh-pkg"].version="2.0.0"' "$export_file" > "$tmp/incoming/host-allow.tuxedo.json"
 sign_document "$fingerprint" "$tmp/incoming/host-allow.tuxedo.json"
-expect_follow_failure --dry-run
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming" --dry-run
 grep -q 'would-add fresh-pkg' "$tmp/output" || fail 'preview missing first addition'
-grep -q 'CONFLICT fresh-pkg' "$tmp/output" || fail 'preview missed cross-file conflict'
-pass 'dry-run detects cross-source conflict without mutating the local store'
+grep -q 'would-replace fresh-pkg@1.2.3 -> @2.0.0' "$tmp/output" || fail 'preview missed cross-source replacement'
+cmp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'cross-source replacement preview altered local grant'
+pass 'dry-run models signed replacement across source files without mutating the local store'
 
 # An invalid signature in one file must not suppress another valid file.
 rm -f "$tmp/incoming/host-allow.tuxedo.json.asc"
@@ -409,7 +432,16 @@ sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
 "$SAFE_RUN" host-allow remove fresh-pkg > "$tmp/output" 2>&1
 cat > "$tmp/bin/mv" <<'STUB'
 #!/usr/bin/env bash
-if [[ "${TEST_FAIL_HOST_STORE:-0}" == 1 && "${!#}" == "$SAFE_RUN_CONFIG_DIR/host-allow.json" ]]; then exit 1; fi
+# This follow run publishes the ledger first, then the trust store; fail the
+# second rename to exercise rollback of a reported store publication failure.
+if [[ "${TEST_FAIL_HOST_STORE:-0}" == 1 ]]; then
+  count_file="$SAFE_RUN_CONFIG_DIR/mv-fail-count"
+  count=0
+  [[ ! -e "$count_file" ]] || count=$(<"$count_file")
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$count_file"
+  (( count == 2 )) && exit 1
+fi
 exec /usr/bin/mv "$@"
 STUB
 chmod +x "$tmp/bin/mv"

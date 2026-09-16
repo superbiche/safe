@@ -241,8 +241,11 @@ host in the filename. The default directory being absent is a successful no-op.
 
 The merge is **UNION**: missing grants pass the same name, ecosystem, reason,
 exact-version and registry-integrity validator as `import`. Already-present
-pins are no-ops, different local pins produce `CONFLICT` with an explicit
-`host-allow update` hint, and no local grants are removed. Grant writes and
+pins are no-ops, and a different local pin is replaced by the signed pin. The
+replacement is recorded in the append-only run audit log and in the origin's
+`replaced` ledger array; follow prints `followed <pkg>@<new> from <host> (replaced local pin @<old>)`.
+No local grants are removed. Unsigned `import` keeps its current `CONFLICT`
+behavior and requires an explicit update. Grant writes and
 `host-allow remove` share one lock. Follow collects validated entries and performs
 registry requests outside the lock, then rechecks its ledger and local pins under
 the lock before writing. Each registry request has a 10-second timeout; each
@@ -256,13 +259,13 @@ Neither import nor follow runs add's interactive audit preflight: the operator
 review/signature authorizes the statement, while import validation rechecks the
 exact registry identity. Missing local grants with invalid field types or
 unverifiable integrity are skipped. `--dry-run` verifies and validates everything,
-including conflicts between source files, without changing persistent state.
+including replacement plans across source files, without changing persistent state.
 
 A local `follow-state.json` beside the guard-selected trust store records each
 origin's highest accepted `exported_at` and the identities already applied:
 
 ```json
-{"origins":{"rainbow":{"accepted":"2026-09-16T14:00:00Z","applied":["fresh-pkg@1.2.3"]}}}
+{"origins":{"rainbow":{"accepted":"2026-09-16T14:00:00Z","applied":["fresh-pkg@1.2.3"],"replaced":["fresh-pkg@1.0.0->1.2.3"]}}}
 ```
 
 Timestamps are real ISO-8601 whole-second instants with an explicit timezone;
@@ -271,9 +274,10 @@ the freshness-skip count and return non-zero. An **equal** generation retries
 only identities not in `applied`; applied identities stay skipped even if an
 operator subsequently removed their local grants. Registry outages and invalid
 entries are not marked applied, so an unchanged signed export can be retried
-when the registry recovers or a conflict is resolved. Successful siblings remain
-recorded. A newer signed generation starts a new applied set and can authorize
-grants again.
+when the registry recovers. Successful siblings remain recorded. A local re-pin
+survives an equal generation; a newer signed generation re-aligns it to the
+publishing host's signed pin. A newer signed generation starts a new applied set
+and can authorize grants again.
 
 Once all entries of an equal generation are applied, repeated timer runs and
 previews return 0 with one quiet info line and no import hint or registry fetch.

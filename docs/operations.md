@@ -103,16 +103,20 @@ local keyring; there is no automatic keyserver refresh.
 
 A user timer can invoke `safe run host-allow follow` daily. This change does not
 install a timer or automatically sign after add. Own-host files are ignored;
-verified statements add only absent grants after import validation, retaining
-the original `added` date and recording `followed_from`. Dry-run validates the
-whole plan without changing persistent state. A machine-local `follow-state.json`
-beside the guard-selected trust store records each origin as
-`{"accepted":"<exported_at>","applied":["<pkg>@<version>"]}`. Older timestamps
+verified statements add absent grants or replace a different local pin after
+import validation, retaining the signed entry's `added` date and recording
+`followed_from`. Replacements are recorded in the run audit log and the
+origin's `replaced` ledger array. Dry-run validates the whole plan without
+changing persistent state. A machine-local `follow-state.json` beside the
+guard-selected trust store records each origin as
+`{"accepted":"<exported_at>","applied":["<pkg>@<version>"],"replaced":["<pkg>@<old>-><new>"]}`. Older timestamps
 warn, increment the freshness-skip count and return non-zero. Equal timestamps
 retry only identities that never applied; successful entries stay skipped even
-after operator removal. A registry outage is therefore retryable with the same
-signed file. Once complete, unchanged daily runs return 0 with one quiet info
-line, no registry calls and no import prescription. Verification still runs.
+after operator removal. A local re-pin survives an equal generation and a newer
+signed generation re-aligns it to the origin's pin. A registry outage is
+therefore retryable with the same signed file. Once complete, unchanged daily
+runs return 0 with one quiet info line, no registry calls and no import
+prescription. Verification still runs.
 A newer signed generation starts a fresh applied set. Timestamp comparisons
 normalize timezone offsets.
 
@@ -124,8 +128,10 @@ Valid files and entries can still apply alongside failures. A mismatched
 JSON/signature pair during transport is safely rejected; retry after both arrive.
 
 For an actual skip/error, the operator can review the file and run
-`safe run host-allow import <file>` at a TTY. Conflicting pins need the usual
-`safe run host-allow update <pkg>@<version> --reason "..."`. Signature and older
+`safe run host-allow import <file>` at a TTY. Unsigned imports keep their
+conflict behavior and need the usual `safe run host-allow update
+<pkg>@<version> --reason "..."`; signed follow replaces a different local pin.
+Signature and older
 replay failures/counts are emitted by follow; there is no persistent doctor
 status in this slice. Dry-run never creates or changes freshness state or its
 lock file. Keep the ledger local and preserve it across restarts/removal.

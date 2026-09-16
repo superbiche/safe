@@ -95,8 +95,9 @@ their certified signing subkeys), honouring key revocation/expiry and signature
 expiry. Update revocation information in the follower's local GPG keyring;
 verification never fetches keys. Unrelated expired/revoked subkeys do not
 invalidate a good signature. `follow-state.json`, beside the guard-selected
-host-allow store, records per-origin `{accepted, applied:["pkg@version"]}` and
-must remain local. Preserve it when removing grants: equal generations skip
+host-allow store, records per-origin `{accepted, applied:["pkg@version"],
+replaced:["pkg@old->new"]}` and must remain local. Preserve it when removing
+grants: equal generations skip
 applied identities and retry pending ones; older generations are refused.
 An equal generation with nothing pending returns 0 with one info line. Legacy
 string-only records require operator review/migration, never silent reset.
