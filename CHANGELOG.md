@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Signed `host-allow follow` pins replace different local pins, recording the
+  old and new pins, origin host, and generation in the audit trail and local
+  follow ledger. Followed entries retain their accepted generation so the
+  newest signed statement wins across origins; stale statements warn and remain
+  retryable. The first follow after upgrade derives generations for followed
+  entries from the local ledger, and refused older/equal identities remain
+  refused for that generation until a newer statement arrives. Dry-run previews
+  replacements; unsigned `import` keeps its conflict behavior.
+
 ## 1.63.0 - 2026-09-16
 
 - Harden signed follow with `GOODSIG` and adverse per-signature status checks;

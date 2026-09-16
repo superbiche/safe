@@ -103,18 +103,33 @@ local keyring; there is no automatic keyserver refresh.
 
 A user timer can invoke `safe run host-allow follow` daily. This change does not
 install a timer or automatically sign after add. Own-host files are ignored;
-verified statements add only absent grants after import validation, retaining
-the original `added` date and recording `followed_from`. Dry-run validates the
-whole plan without changing persistent state. A machine-local `follow-state.json`
-beside the guard-selected trust store records each origin as
-`{"accepted":"<exported_at>","applied":["<pkg>@<version>"]}`. Older timestamps
+verified statements add absent grants or replace a different local pin after
+import validation when their generation is newer than the generation recorded
+on that entry, retaining the signed entry's `added` date and recording
+`followed_from` and `followed_generation`. Entries without a recorded generation
+yield to a signed statement. The newest signed statement wins across origins; a
+host-set pin yields to any signed statement. Replacements are recorded in the
+run audit log and the origin's `replaced` ledger array. Dry-run validates the
+whole plan without changing persistent state. A machine-local `follow-state.json` beside the
+guard-selected trust store records each origin as
+`{"accepted":"<exported_at>","applied":["<pkg>@<version>"],"replaced":["<pkg>@<old>-><new>"],"refused":["<pkg>@<version>"]}`. Older timestamps
 warn, increment the freshness-skip count and return non-zero. Equal timestamps
 retry only identities that never applied; successful entries stay skipped even
-after operator removal. A registry outage is therefore retryable with the same
-signed file. Once complete, unchanged daily runs return 0 with one quiet info
-line, no registry calls and no import prescription. Verification still runs.
-A newer signed generation starts a fresh applied set. Timestamp comparisons
-normalize timezone offsets.
+after operator removal. A local re-pin survives an equal generation and a newer
+signed generation re-aligns it to the origin's pin. Older or equal replacement
+statements are WARNed once, recorded in `refused`, and remain non-zero; a
+same-generation retry is an INFO skip that cannot replace a later TTY re-pin. A
+hinted update to the refused version makes it present and clears the refusal. A
+registry outage is therefore retryable with the same signed file. Once complete, unchanged daily
+runs return 0 with one quiet info line, no registry calls and no import
+prescription. Verification still runs.
+A newer signed generation starts fresh applied and refused sets. After upgrading,
+the first follow derives a missing `followed_generation` when `followed_from`
+and the matching applied identity identify a prior followed entry. An entry
+without that evidence yields once to a signed statement, then carries its
+generation: TTY entries, and followed entries whose origin has since published
+a newer generation without that package (the ledger no longer lists them). Timestamp comparisons normalize
+timezone offsets.
 
 Add/update/import/follow and removal share the host-store writer lock. Follow
 fetches registry evidence outside it (10 seconds maximum per request), then
@@ -124,8 +139,13 @@ Valid files and entries can still apply alongside failures. A mismatched
 JSON/signature pair during transport is safely rejected; retry after both arrive.
 
 For an actual skip/error, the operator can review the file and run
-`safe run host-allow import <file>` at a TTY. Conflicting pins need the usual
-`safe run host-allow update <pkg>@<version> --reason "..."`. Signature and older
+`safe run host-allow import <file>` at a TTY. Unsigned imports keep their
+conflict behavior and need the usual `safe run host-allow update
+<pkg>@<version> --reason "..."`; signed follow replaces a different local pin
+when its generation is newer. A stale signed statement is warned, counted as a
+failure, and remains retryable for that identity until its origin publishes a
+newer generation.
+Signature and older
 replay failures/counts are emitted by follow; there is no persistent doctor
 status in this slice. Dry-run never creates or changes freshness state or its
 lock file. Keep the ledger local and preserve it across restarts/removal.
