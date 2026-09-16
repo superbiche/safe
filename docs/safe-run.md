@@ -292,8 +292,10 @@ that refusal. A newer signed generation starts fresh applied and refused sets
 and can authorize grants again. After upgrading from a release that recorded
 followed entries without `followed_generation`, the first follow derives the
 generation from the entry's `followed_from` origin and matching `applied`
-identity before comparing it; entries without that provenance remain
-generation-less and yield to a signed statement.
+identity before comparing it. Entries without that evidence — TTY entries,
+and followed entries whose origin has since published a newer generation
+without that package — are generation-less and yield once to a signed
+statement, after which they carry its generation.
 
 Once all entries of an equal generation are applied, repeated timer runs and
 previews return 0 with one quiet info line and no import hint or registry fetch.

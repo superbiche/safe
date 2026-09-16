@@ -125,8 +125,10 @@ runs return 0 with one quiet info line, no registry calls and no import
 prescription. Verification still runs.
 A newer signed generation starts fresh applied and refused sets. After upgrading,
 the first follow derives a missing `followed_generation` when `followed_from`
-and the matching applied identity identify a prior followed entry; TTY entries
-without that provenance remain replaceable. Timestamp comparisons normalize
+and the matching applied identity identify a prior followed entry. An entry
+without that evidence yields once to a signed statement, then carries its
+generation: TTY entries, and followed entries whose origin has since published
+a newer generation without that package (the ledger no longer lists them). Timestamp comparisons normalize
 timezone offsets.
 
 Add/update/import/follow and removal share the host-store writer lock. Follow
