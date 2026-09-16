@@ -87,6 +87,12 @@ unchanged.
 
 `follow.signing_key` in `run/config.json` optionally selects the GPG key for
 operator-only `safe run host-allow export --sign`; absent, GPG uses its default.
+`follow.signers` is a list of full GPG primary-key fingerprints. Manage it at an
+operator TTY using `safe run host-allow follow-signer add|remove <fingerprint>`;
+add requires that public key in the local GPG keyring. `follow` verifies signed
+exports in an isolated keyring containing only these authorities (including
+their certified signing subkeys). Both operations retain the redirected-store
+guard. See [signed follower import](safe-run.md#signed-follower-import).
 
 `config.json` stores runtime defaults, linked runner paths, sandbox limits, warning behavior, and the install-gate policy:
 

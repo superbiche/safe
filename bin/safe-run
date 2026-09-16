@@ -1670,28 +1670,49 @@ host_allow_require_reason() {
   [[ -n "$reason" ]] || die "--reason is required"
 }
 
-write_host_allow_entry() {
+write_host_allow_entry() (
   local pkg="$1" version="$2" sha="$3" reason="$4" ecosystem="$5"
   # Callers that carry an original grant date (import, replicating another
   # machine's set) pass it as $6 so a round trip does not reset the age the
   # staleness review computes from; add/update omit it and stamp today.
-  local added="${6:-$(date -I)}"
+  local added="${6:-$(date -I)}" followed_from="${7:-}"
   local tmp ha_file
   # #87: write the sanctioned store (literal canonical, or a blessed redirect);
   # callers are already write-guarded against an unblessed redirect.
   ha_file="$(trust_store_file host-allow.json)"
-  tmp=$(stage_beside "$ha_file")
+  # Serialize grant writers, then recheck UNION under the lock: an operator
+  # or another follower may have added a pin during the registry request.
+  require_cmd flock
+  mkdir -p -- "$(dirname "$ha_file")" || return 1
+  local lock_fd local_entry local_version
+  exec {lock_fd}>"$ha_file.lock" || return 1
+  flock -x "$lock_fd" || return 1
+  if [[ -n "$followed_from" ]]; then
+    if [[ -e "$ha_file" ]]; then
+      local_entry=$(jq -ce --arg p "$pkg" 'if (.packages | type) == "object" then
+        {entry: .packages[$p], present: (.packages | has($p))} else error("malformed store") end' "$ha_file") || return 1
+      if [[ "$(jq -r '.present' <<<"$local_entry")" == "true" ]]; then
+        local_version=$(jq -r '.entry.version // empty' <<<"$local_entry") || return 1
+        [[ "$local_version" == "$version" ]] && return 0
+        warn "CONFLICT $pkg: local pins @$local_version, follow has @$version — resolve with: safe run host-allow update $pkg@$version --reason \"...\""
+        return 1
+      fi
+    else
+      printf '{"packages":{}}\n' > "$ha_file" || return 1
+    fi
+  fi
+  tmp=$(stage_beside "$ha_file") || return 1
   jq --arg p "$pkg" --arg v "$version" --arg s "$sha" \
-     --arg r "$reason" --arg d "$added" --arg e "$ecosystem" '
+     --arg r "$reason" --arg d "$added" --arg e "$ecosystem" --arg origin "$followed_from" '
     .packages[$p] = {
       version: $v,
       sha: $s,
       ecosystem: $e,
       added: $d,
       reason: $r
-    }' "$ha_file" > "$tmp"
+    } + (if $origin == "" then {} else {followed_from: $origin} end)' "$ha_file" > "$tmp" || { rm -f -- "$tmp"; return 1; }
   mv "$tmp" "$ha_file"
-}
+)
 
 cmd_host_allow() {
   local sub="${1:-list}"
@@ -1703,6 +1724,8 @@ cmd_host_allow() {
     review) cmd_host_allow_review "$@" ;;
     export) cmd_host_allow_export "$@" ;;
     import) cmd_host_allow_import "$@" ;;
+    follow) cmd_host_allow_follow "$@" ;;
+    follow-signer) cmd_host_allow_follow_signer "$@" ;;
     list|ls|"") cmd_host_allow_list ;;
     *)      die "unknown host-allow subcommand: $sub" ;;
   esac
@@ -1720,7 +1743,8 @@ cmd_host_allow() {
 # "trust another machine": it re-validates every entry as `add` does,
 # re-fetches integrity from the registry (never trusting the file's sha over a
 # divergent one), refuses to silently overwrite a differing local pin, and is
-# TTY-gated exactly like add/update. Deliberately NOT sync-propagated.
+# TTY-gated exactly like add/update. Signed exports may additionally be followed
+# unattended, after the operator pins the signing authority at a TTY.
 # ---------------------------------------------------------------------------
 
 HOST_ALLOW_EXPORT_SCHEMA="safe-host-allow-export/1"
@@ -1832,7 +1856,7 @@ host_allow_export_signed() (
   signing_key=$(config_get '.follow.signing_key' '')
   local key_args=()
   [[ -z "$signing_key" ]] || key_args=(--local-user "$signing_key")
-  gpg --no-options --armor --detach-sign "${key_args[@]}" \
+  gpg --armor --detach-sign "${key_args[@]}" \
     --output "$staging/export.json.asc" -- "$staging/export.json" \
     || die "could not sign export; check follow.signing_key or the default GPG key and retry at an operator terminal"
   mv -f -- "$staging/export.json.asc" "$dest.asc"
@@ -1853,16 +1877,7 @@ cmd_host_allow_import() {
   done
   [[ -z "$file" ]] && die "usage: safe run host-allow import <file> [--dry-run]"
   [[ -r "$file" ]] || die "cannot read import file: $file"
-  jq -e . "$file" >/dev/null 2>&1 || die "import file is not valid JSON: $file"
-  local schema
-  schema=$(jq -r '.schema // empty' "$file")
-  [[ "$schema" == "$HOST_ALLOW_EXPORT_SCHEMA" || "$schema" == "safe-host-allow-export/2" ]] || \
-    die "not a safe host-allow export (expected schema $HOST_ALLOW_EXPORT_SCHEMA); create one with: safe run host-allow export"
-  # The whole envelope is validated before any entry is applied: a scalar,
-  # array, or boolean `.packages` must fail loudly, never masquerade as an empty
-  # import. No `// {}` — jq's alternative treats false as absent.
-  jq -e '.packages | type == "object"' "$file" >/dev/null 2>&1 \
-    || die "import file is malformed: .packages must be a JSON object"
+  host_allow_import_envelope "$file" || die "invalid host-allow export: $file"
 
   # A real apply writes trust entries: operator-TTY only, gated BEFORE any
   # write AND before any state initialization, so neither a flag-parse slip
@@ -1880,8 +1895,31 @@ cmd_host_allow_import() {
     [[ "$SAFE_RUN_NO_INIT" == "1" ]] || ensure_dirs
   fi
 
+  host_allow_apply_export "$file" "$dry_run"
+}
+
+# Shared import/follow validation. Return errors so a follower can report a bad
+# file and still inspect the rest; import converts them to its usual refusal.
+host_allow_import_envelope() {
+  local file="$1" schema
+  jq -se 'length == 1 and (.[0] | type == "object")' "$file" >/dev/null 2>&1 || {
+    warn "import file is not valid JSON: $file"; return 1;
+  }
+  schema=$(jq -r '.schema // empty' "$file")
+  [[ "$schema" == "$HOST_ALLOW_EXPORT_SCHEMA" || "$schema" == "safe-host-allow-export/2" ]] || {
+    warn "not a safe host-allow export (expected schema $HOST_ALLOW_EXPORT_SCHEMA or safe-host-allow-export/2); create one with: safe run host-allow export"
+    return 1
+  }
+  jq -e '.packages | type == "object"' "$file" >/dev/null 2>&1 || {
+    warn "import file is malformed: .packages must be a JSON object"; return 1;
+  }
+}
+
+host_allow_apply_export() {
+  local file="$1" dry_run="$2" origin="${3:-}" failures=0
+  local ha_file="${4:-$HOST_ALLOW_FILE}"
   local names
-  mapfile -t names < <(jq -r '.packages // {} | keys[]' "$file" 2>/dev/null)
+  mapfile -t names < <(jq -r '.packages // {} | keys[] | @base64' "$file" 2>/dev/null)
   if (( ${#names[@]} == 0 )); then
     info "import: no packages in $file"
     return 0
@@ -1890,11 +1928,20 @@ cmd_host_allow_import() {
   local added=0 skipped=0
   local name version ecosystem file_sha reason added_date kind normalized local_entry local_version fetched_sha
   for name in "${names[@]}"; do
+    name=$(printf '%s' "$name" | base64 --decode)
     # Each entry must itself be an object: a scalar entry would crash the
     # field extractions under `set -e` and could abort AFTER an earlier valid
     # entry was already written. Skip it instead, applying nothing partial.
     if [[ "$(jq -r --arg p "$name" '.packages[$p] | type' "$file" 2>/dev/null)" != "object" ]]; then
-      warn "skip ${name}: entry is not an object"; skipped=$((skipped + 1)); continue
+      warn "skip ${name}: entry is not an object"; skipped=$((skipped + 1)); failures=$((failures + 1)); continue
+    fi
+    if ! jq -e --arg p "$name" '.packages[$p] |
+      (.version | type == "string") and (.reason | type == "string") and
+      ((.ecosystem == null) or (.ecosystem | type == "string")) and
+      ((.sha == null) or (.sha | type == "string")) and
+      ((.added == null) or (.added | type == "string"))' "$file" >/dev/null; then
+      warn "skip ${name}: invalid entry field types"
+      skipped=$((skipped + 1)); failures=$((failures + 1)); continue
     fi
     version=$(jq -r --arg p "$name" '.packages[$p].version // empty' "$file")
     ecosystem=$(jq -r --arg p "$name" '.packages[$p].ecosystem // "npm"' "$file")
@@ -1905,13 +1952,13 @@ cmd_host_allow_import() {
     # The file is untrusted external input — validate exactly as `add` does,
     # and reject any version that is not an exact registry pin (§ is_exact_version).
     kind=$(ecosystem_to_runner_kind "$ecosystem") || {
-      warn "skip ${name}: unknown ecosystem '${ecosystem}'"; skipped=$((skipped + 1)); continue; }
+      warn "skip ${name}: unknown ecosystem '${ecosystem}'"; skipped=$((skipped + 1)); failures=$((failures + 1)); continue; }
     if [[ -z "$version" ]] || ! is_exact_version "$version"; then
       warn "skip ${name}: '${version}' is not an exact pinned version (no ranges, tags, or source specs)"
-      skipped=$((skipped + 1)); continue
+      skipped=$((skipped + 1)); failures=$((failures + 1)); continue
     fi
     if [[ -z "$reason" ]]; then
-      warn "skip ${name}: entry carries no reason (audit trail required)"; skipped=$((skipped + 1)); continue
+      warn "skip ${name}: entry carries no reason (audit trail required)"; skipped=$((skipped + 1)); failures=$((failures + 1)); continue
     fi
     # Preserve the original grant date only when it is a REAL calendar date
     # (shape plus `date -d` round-trip, so 2026-02-30 is rejected); otherwise
@@ -1921,10 +1968,13 @@ cmd_host_allow_import() {
       added_date=""
     fi
     normalized=$(normalize_and_validate_package_or_warn "$name" "$kind" "$name") || {
-      skipped=$((skipped + 1)); continue; }
+      skipped=$((skipped + 1)); failures=$((failures + 1)); continue; }
 
     # Never silently overwrite a divergent local pin.
-    local_entry=$(jq -c --arg p "$normalized" '.packages[$p] // empty' "$HOST_ALLOW_FILE" 2>/dev/null || true)
+    local_entry=$(jq -c --arg p "$normalized" '.packages[$p] // empty' "$ha_file" 2>/dev/null || true)
+    if [[ -n "$origin" && "$dry_run" == "1" && -z "$local_entry" ]]; then
+      local_entry=$(jq -c --arg p "$normalized" '.[$p] // empty' <<<"$follow_planned")
+    fi
     if [[ -n "$local_entry" ]]; then
       local_version=$(printf '%s' "$local_entry" | jq -r '.version // empty')
       if [[ "$local_version" == "$version" ]]; then
@@ -1933,7 +1983,7 @@ cmd_host_allow_import() {
       fi
       printf '  CONFLICT %s: local pins @%s, import has @%s — resolve with: safe run host-allow update %s@%s --reason "..."\n' \
         "$normalized" "$local_version" "$version" "$normalized" "$version" >&2
-      skipped=$((skipped + 1)); continue
+      skipped=$((skipped + 1)); failures=$((failures + 1)); continue
     fi
 
     # Import trusts the registry, not the file: an entry is written only if the
@@ -1945,19 +1995,22 @@ cmd_host_allow_import() {
     fetched_sha=$(registry_verified_integrity "$normalized" "$version" "$ecosystem") || true
     if [[ -z "$fetched_sha" ]]; then
       warn "skip ${normalized}@${version}: could not verify this version against the registry (unknown version or registry unreachable) — add it by hand if intended"
-      skipped=$((skipped + 1)); continue
+      skipped=$((skipped + 1)); failures=$((failures + 1)); continue
     fi
     if [[ -n "$file_sha" && "$fetched_sha" != "$file_sha" ]]; then
       warn "skip ${normalized}@${version}: integrity mismatch (file ${file_sha}, registry ${fetched_sha}) — investigate before importing"
-      skipped=$((skipped + 1)); continue
+      skipped=$((skipped + 1)); failures=$((failures + 1)); continue
     fi
 
     if (( dry_run )); then
       printf '  would-add %s@%s [%s]\n' "$normalized" "$version" "$ecosystem" >&2
+      if [[ -n "$origin" ]]; then
+        follow_planned=$(jq --arg p "$normalized" --arg v "$version" '.[$p] = {version: $v}' <<<"$follow_planned")
+      fi
       added=$((added + 1)); continue
     fi
 
-    write_host_allow_entry "$normalized" "$version" "$fetched_sha" "$reason" "$ecosystem" "$added_date"
+    write_host_allow_entry "$normalized" "$version" "$fetched_sha" "$reason" "$ecosystem" "$added_date" "$origin" || return 1
     info "imported ${normalized}@${version}"
     added=$((added + 1))
   done
@@ -1967,7 +2020,143 @@ cmd_host_allow_import() {
   else
     info "import complete: ${added} added, ${skipped} skipped"
   fi
+  [[ -z "$origin" || "$failures" == "0" ]]
 }
+
+# Only full primary-key fingerprints are signing authorities. GPG may also
+# match a subkey when exporting; inspect the export's primary fingerprint.
+follow_fingerprint_valid() { [[ "$1" =~ ^([A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})$ ]]; }
+
+follow_export_key() {
+  local fingerprint="$1" dest="$2" primary
+  gpg --no-options --batch --export "$fingerprint" > "$dest" 2>/dev/null || return 1
+  [[ -s "$dest" ]] || return 1
+  primary=$(gpg --no-options --batch --with-colons --show-keys "$dest" 2>/dev/null |
+    awk -F: '$1 == "pub" {want=1; next} want && $1 == "fpr" {print $10; want=0}') || return 1
+  [[ "$primary" == "$fingerprint" ]]
+}
+
+cmd_host_allow_follow_signer() (
+  trust_redirected_guard write "host-allow-follow-signer"
+  [[ $# == 2 && ( "$1" == "add" || "$1" == "remove" ) ]] ||
+    die "usage: safe run host-allow follow-signer add|remove <primary-key-fingerprint>"
+  local action="$1" fingerprint="${2^^}" config staging current
+  follow_fingerprint_valid "$fingerprint" || die "use the full primary-key fingerprint (40 or 64 hexadecimal characters)"
+  require_operator_tty "follow-signer $action" "$fingerprint"
+  config=$(trust_store_file config.json)
+  current='{}'
+  if [[ -e "$config" ]]; then
+    current=$(cat -- "$config")
+  fi
+  jq -e 'type == "object" and
+    ((.follow == null) or (.follow | type == "object")) and
+    ((.follow.signers == null) or
+      (.follow.signers | type == "array" and all(.[]; type == "string")))' \
+    <<<"$current" >/dev/null || die "malformed follow config; repair $config at an operator terminal"
+  staging=$(mktemp -d)
+  trap 'rm -rf -- "$staging"' EXIT
+  if [[ "$action" == "add" ]]; then
+    require_cmd gpg
+    follow_export_key "$fingerprint" "$staging/key.gpg" ||
+      die "primary public key unavailable; import the operator's public key into GPG, verify its full fingerprint, then retry follow-signer add"
+  fi
+  mkdir -p -- "$(dirname "$config")"
+  local next
+  next=$(stage_beside "$config")
+  trap 'rm -rf -- "$staging"; rm -f -- "$next"' EXIT
+  jq --arg fingerprint "$fingerprint" --arg action "$action" '
+    .follow.signers = ((.follow.signers // [] | map(ascii_upcase)) |
+      if $action == "add" then (. + [$fingerprint] | unique)
+      else map(select(. != $fingerprint)) end)' <<<"$current" > "$next"
+  mv -f -- "$next" "$config"
+  info "follow-signer $action: $fingerprint"
+)
+
+cmd_host_allow_follow() (
+  trust_redirected_guard write "host-allow-follow"
+  local from="$HOME/Sync/state/safe" dry_run=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=1; shift ;;
+      --from) [[ $# -ge 2 && -n "$2" ]] || die "--from requires a directory"
+        from="$2"; shift 2 ;;
+      *) die "unknown flag: $1 (usage: safe run host-allow follow [--dry-run] [--from <dir>])" ;;
+    esac
+  done
+  # No directory yet is normal on a newly provisioned host.
+  [[ -e "$from" ]] || { info "follow: nothing to do ($from absent)"; return 0; }
+  [[ -d "$from" && -r "$from" && -x "$from" ]] || die "cannot read follow directory: $from; inspect it or use host-allow import <file> at an operator terminal"
+  local host file origin
+  host=$(hostname -s)
+  local files=()
+  shopt -s nullglob
+  for file in "$from"/host-allow.*.json; do
+    [[ "${file##*/}" == "host-allow.$host.json" ]] || files+=("$file")
+  done
+  (( ${#files[@]} )) || { info "follow: nothing to do"; return 0; }
+  require_cmd gpg
+  local staging config signers='[]' fingerprint valid_config=1
+  staging=$(mktemp -d)
+  trap 'rm -rf -- "$staging"' EXIT
+  mkdir -m 700 "$staging/keyring"
+  config=$(trust_store_file config.json)
+  if [[ -e "$config" ]]; then
+    signers=$(jq -ce '
+      if .follow.signers == null then [] else .follow.signers end |
+      if type == "array" and all(.[]; type == "string" and test("^([A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})$"))
+      then map(ascii_upcase) | unique else error("invalid follow.signers") end' \
+      "$config" 2>/dev/null) || { signers='[]'; valid_config=0; }
+  fi
+  local verifier=(gpg --no-options --homedir "$staging/keyring" --batch --no-auto-key-retrieve --auto-key-locate clear)
+  while IFS= read -r fingerprint; do
+    if follow_export_key "$fingerprint" "$staging/key.gpg"; then
+      "${verifier[@]}" --import "$staging/key.gpg" >/dev/null 2>&1 || true
+    fi
+  done < <(jq -r '.[]' <<<"$signers")
+
+  # Bind all local reads and writes to the guard-selected store. A corrupt
+  # local store must never be silently replaced by a follower.
+  local ha_file
+  ha_file=$(trust_store_file host-allow.json)
+  if [[ -e "$ha_file" ]]; then
+    jq -e '.packages | type == "object"' "$ha_file" >/dev/null 2>&1 ||
+      die "malformed local host-allow store; repair it at an operator terminal before follow or import"
+  fi
+  local verified=0 signature_skips=0 failed_files=0 follow_planned='{}' verified_primary
+  for file in "${files[@]}"; do
+    origin="${file##*/}"; origin="${origin#host-allow.}"; origin="${origin%.json}"
+    # Work only on private snapshots after signature verification. The sync
+    # transport is untrusted and may replace the original at any moment.
+    if (( ! valid_config )) || [[ ! "$origin" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+       [[ ! -f "$file" || ! -f "$file.asc" ]] ||
+       ! cp -- "$file" "$staging/export.json" 2>/dev/null ||
+       ! cp -- "$file.asc" "$staging/export.json.asc" 2>/dev/null ||
+       ! "${verifier[@]}" --status-fd 1 --verify "$staging/export.json.asc" "$staging/export.json" > "$staging/status" 2>/dev/null; then
+      warn "WARN follow: skipped $(printf '%q' "$file") (unsigned, invalid signature, unavailable/unpinned key, or invalid signer config)"
+      signature_skips=$((signature_skips + 1)); continue
+    fi
+    # Check GPG's machine-readable primary fingerprint as well as its exit
+    # status. Trust belongs to a pinned primary and its certified subkeys.
+    verified_primary=$(awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" {print (NF >= 12 ? $12 : $3)}' "$staging/status")
+    if ! jq -e --arg f "$verified_primary" 'index($f) != null' <<<"$signers" >/dev/null; then
+      warn "WARN follow: skipped $(printf '%q' "$file") (signature is not from one pinned primary key)"
+      signature_skips=$((signature_skips + 1)); continue
+    fi
+    verified=$((verified + 1))
+    if ! host_allow_import_envelope "$staging/export.json" ||
+       ! jq -e --arg host "$origin" '.schema == "safe-host-allow-export/2" and .host == $host and (.exported_at | type == "string")' "$staging/export.json" >/dev/null; then
+      warn "WARN follow: skipped $(printf '%q' "$file") (invalid signed envelope or host metadata)"
+      failed_files=$((failed_files + 1)); continue
+    fi
+    info "follow: verified $(printf '%q' "$file")"
+    host_allow_apply_export "$staging/export.json" "$dry_run" "$origin" "$ha_file" || failed_files=$((failed_files + 1))
+  done
+  info "follow complete: $verified verified, $signature_skips signature skips, $failed_files files with validation errors or conflicts"
+  if (( signature_skips || failed_files )); then
+    warn 'operator override: review the original file, then run safe run host-allow import <file> at an operator terminal; conflicting pins require host-allow update <pkg>@<version> --reason "..."'
+    return 1
+  fi
+)
 
 require_operator_tty() {
   # Trust escalations are operator-only: agents may suggest the command
@@ -3218,6 +3407,9 @@ SUBCOMMANDS
   host-allow export [--json]                  Dump this machine's allow set as a
                                               portable JSON document (for import)
   host-allow export --sign [--out <dir>]      Sign a fleet export (operator TTY)
+  host-allow follow [--dry-run] [--from <dir>] Follow operator-signed grants (UNION)
+  host-allow follow-signer add|remove <fingerprint>
+                                            Pin/revoke a signing authority (TTY)
   host-allow import <file> [--dry-run]        Apply a reviewed allow set (TTY);
                                               re-validates + re-fetches integrity,
                                               never overwrites a divergent pin;
@@ -3287,7 +3479,8 @@ main() {
     # operator-TTY gate, so a --dry-run preview and a refused non-TTY apply both
     # touch nothing.
     if [[ "$argv0" == "safe-run" && "${1:-}" == "host-allow" \
-          && ( "${2:-}" == "review" || "${2:-}" == "export" || "${2:-}" == "import" ) ]]; then
+          && ( "${2:-}" == "review" || "${2:-}" == "export" || "${2:-}" == "import" \
+            || "${2:-}" == "follow" || "${2:-}" == "follow-signer" ) ]]; then
       :
     else
       ensure_dirs

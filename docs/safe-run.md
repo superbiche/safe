@@ -194,9 +194,71 @@ store requires the same explicit trust override as a grant.
 - The original grant date rides along, so a replicated pin keeps its true age in
   the staleness review rather than looking freshly added.
 
-Deliberately, the allow set is **not** Syncthing- or otherwise auto-synced
-between machines: silent fleet propagation is exactly what the per-machine
-boundary exists to prevent. `export`/`import` keep the human review in the loop.
+#### Signed follower import
+
+For unattended followers, the operator can delegate acceptance to specific GPG
+**primary-key fingerprints**. Import the operator's public key into the follower's
+GPG keyring, verify its full fingerprint through a trusted channel, then at an
+operator terminal run:
+
+```bash
+safe run host-allow follow-signer add <full-primary-fingerprint>
+# Origin (operator TTY; optional --out selects another directory):
+safe run host-allow export --sign
+# Follower (no TTY required; optional --from selects another directory):
+safe run host-allow follow --dry-run
+safe run host-allow follow
+# Revoke future acceptance (operator TTY):
+safe run host-allow follow-signer remove <full-primary-fingerprint>
+```
+
+`follow-signer` is the TTY-gated setter for `follow.signers` in
+`~/.config/safe/run/config.json`; there is no generic config setter. It accepts
+full 40- or 64-hex primary fingerprints, requires the public key locally on add,
+and never fetches keys. Signing subkeys certified by that primary are accepted.
+The two signer-management operations and signed export refuse non-TTY callers
+with exit 102. There is no `--yes` or `-y` override.
+
+`follow` reads `host-allow.*.json` in `~/Sync/state/safe/` (or `--from`), ignoring
+its own short-hostname file. It copies each document and `.json.asc` signature
+into private temporary storage, verifies with GPG using an isolated keyring
+built only from the pinned primary keys, and applies those same verified bytes.
+It never downloads a key. Unknown/unavailable signers, missing signatures,
+invalid signatures, and invalid signer configuration produce one WARN per file
+and increment the signature-skip count. Signed `/2` metadata must identify the
+host in the filename. The default directory being absent is a successful no-op.
+
+The merge is **UNION**: missing grants pass the same name, ecosystem, reason,
+exact-version and registry-integrity validator as `import`. Already-present
+pins are no-ops, different local pins produce `CONFLICT` with an explicit
+`host-allow update` hint, and no local grants are removed. Grant writers lock
+and recheck the local pin after registry validation to preserve concurrent
+operator grants. New entries retain the origin's valid `added` date and record
+`followed_from: <host>`; invalid dates fall back to today, as in import.
+Neither import nor follow runs add's interactive audit preflight: the operator
+review/signature authorizes the statement, while import validation rechecks the
+exact registry identity. Missing local grants with invalid field types or
+unverifiable integrity are skipped. `--dry-run` verifies and validates everything,
+including conflicts between source files, without changing persistent state.
+
+Exit 0 means all eligible files verified and applied (including already-present
+pins), or nothing needed doing. Exit 1 reports signature skips, validation
+failures, conflicts, or operational errors; valid siblings can still apply.
+The redirected-store write guard remains active (exit 100). An operator can
+review any skipped file and deliberately apply it with the existing
+`safe run host-allow import <file>` at a TTY; import still validates entries and
+never overwrites a different pin. Resolve those pins with `host-allow update`.
+
+Synchronize only signed exports and signatures, **not** the live trust store or
+signer configuration. A timer may run `follow` unattended; export remains a
+separate operator gesture. Removing a signer stops future imports but does not
+remove grants already accepted. Signed statements have no freshness/revocation
+ledger: an old valid export can re-add a locally removed grant while its signer
+remains pinned. Retire the export or unpin its signer when withdrawing trust.
+Protect the signing key (for example with a hardware token requiring touch).
+TTY checks and user-writable configuration retain safe's existing cooperative
+agent boundary; they are not an OS-level defense against a hostile same-user
+process.
 
 ## Scripts Allowlist
 
