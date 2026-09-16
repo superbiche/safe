@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Harden signed host-allow follow: require a good signature status and reject
+  revoked/expired keys or signatures even when GPG exits 0; signer admission
+  rejects revoked/expired primary keys. Local key revocation information is honoured.
+- Serialize `host-allow remove` with grant writers. Follow now atomically records
+  accepted per-origin `exported_at` in local `follow-state.json` under the same
+  lock as its additions. Equal/older generations warn and return non-zero;
+  dry-run never advances state. Generations are consumed before additions, so
+  partial failures/interruption require a newer export or operator-TTY import
+  for retry, preserving removal against replay of previously accepted exports.
+
 - Add operator-TTY `safe run host-allow export --sign [--out <dir>]`, writing
   schema `/2` host/timestamp metadata and a detached armored GPG signature;
   unsigned stdout exports retain schema `/1`, and import accepts both.

@@ -91,8 +91,12 @@ operator-only `safe run host-allow export --sign`; absent, GPG uses its default.
 operator TTY using `safe run host-allow follow-signer add|remove <fingerprint>`;
 add requires that public key in the local GPG keyring. `follow` verifies signed
 exports in an isolated keyring containing only these authorities (including
-their certified signing subkeys). Both operations retain the redirected-store
-guard. See [signed follower import](safe-run.md#signed-follower-import).
+their certified signing subkeys), honouring key revocation/expiry and signature
+expiry. Update revocation information in the follower's local GPG keyring;
+verification never fetches keys. `follow-state.json`, beside the guard-selected
+host-allow store, holds accepted per-origin timestamps and must remain local.
+Preserve it when removing grants; equal/older signed generations are refused.
+Both operations retain the redirected-store guard. See [signed follower import](safe-run.md#signed-follower-import).
 
 `config.json` stores runtime defaults, linked runner paths, sandbox limits, warning behavior, and the install-gate policy:
 

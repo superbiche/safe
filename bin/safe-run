@@ -1670,7 +1670,23 @@ host_allow_require_reason() {
   [[ -n "$reason" ]] || die "--reason is required"
 }
 
-write_host_allow_entry() (
+# All host-store read/modify/write operations share this lock. Callbacks that
+# already hold it use the internal locked writer directly (flock is not recursive).
+with_host_allow_lock() (
+  local ha_file="$1" lock_fd
+  shift
+  require_cmd flock
+  mkdir -p -- "$(dirname "$ha_file")" || return 1
+  exec {lock_fd}>"$ha_file.lock" || return 1
+  flock -x "$lock_fd" || return 1
+  "$@"
+)
+
+write_host_allow_entry() {
+  with_host_allow_lock "$(trust_store_file host-allow.json)" write_host_allow_entry_locked "$@"
+}
+
+write_host_allow_entry_locked() (
   local pkg="$1" version="$2" sha="$3" reason="$4" ecosystem="$5"
   # Callers that carry an original grant date (import, replicating another
   # machine's set) pass it as $6 so a round trip does not reset the age the
@@ -1680,13 +1696,8 @@ write_host_allow_entry() (
   # #87: write the sanctioned store (literal canonical, or a blessed redirect);
   # callers are already write-guarded against an unblessed redirect.
   ha_file="$(trust_store_file host-allow.json)"
-  # Serialize grant writers, then recheck UNION under the lock: an operator
-  # or another follower may have added a pin during the registry request.
-  require_cmd flock
-  mkdir -p -- "$(dirname "$ha_file")" || return 1
-  local lock_fd local_entry local_version
-  exec {lock_fd}>"$ha_file.lock" || return 1
-  flock -x "$lock_fd" || return 1
+  # Recheck UNION under the caller's lock after registry validation.
+  local local_entry local_version
   if [[ -n "$followed_from" ]]; then
     if [[ -e "$ha_file" ]]; then
       local_entry=$(jq -ce --arg p "$pkg" 'if (.packages | type) == "object" then
@@ -1917,7 +1928,7 @@ host_allow_import_envelope() {
 
 host_allow_apply_export() {
   local file="$1" dry_run="$2" origin="${3:-}" failures=0
-  local ha_file="${4:-$HOST_ALLOW_FILE}"
+  local ha_file="${4:-$HOST_ALLOW_FILE}" writer="${5:-write_host_allow_entry}"
   local names
   mapfile -t names < <(jq -r '.packages // {} | keys[] | @base64' "$file" 2>/dev/null)
   if (( ${#names[@]} == 0 )); then
@@ -2010,7 +2021,7 @@ host_allow_apply_export() {
       added=$((added + 1)); continue
     fi
 
-    write_host_allow_entry "$normalized" "$version" "$fetched_sha" "$reason" "$ecosystem" "$added_date" "$origin" || return 1
+    "$writer" "$normalized" "$version" "$fetched_sha" "$reason" "$ecosystem" "$added_date" "$origin" || return 1
     info "imported ${normalized}@${version}"
     added=$((added + 1))
   done
@@ -2032,7 +2043,8 @@ follow_export_key() {
   gpg --no-options --batch --export "$fingerprint" > "$dest" 2>/dev/null || return 1
   [[ -s "$dest" ]] || return 1
   primary=$(gpg --no-options --batch --with-colons --show-keys "$dest" 2>/dev/null |
-    awk -F: '$1 == "pub" {want=1; next} want && $1 == "fpr" {print $10; want=0}') || return 1
+    awk -F: '$1 == "pub" {if ($2 == "r" || $2 == "e") exit 1; want=1; next}
+      want && $1 == "fpr" {print $10; want=0}') || return 1
   [[ "$primary" == "$fingerprint" ]]
 }
 
@@ -2058,7 +2070,7 @@ cmd_host_allow_follow_signer() (
   if [[ "$action" == "add" ]]; then
     require_cmd gpg
     follow_export_key "$fingerprint" "$staging/key.gpg" ||
-      die "primary public key unavailable; import the operator's public key into GPG, verify its full fingerprint, then retry follow-signer add"
+      die "primary public key unavailable, revoked or expired; import the operator's public key into GPG, verify its full fingerprint, then retry follow-signer add"
   fi
   mkdir -p -- "$(dirname "$config")"
   local next
@@ -2071,6 +2083,69 @@ cmd_host_allow_follow_signer() (
   mv -f -- "$next" "$config"
   info "follow-signer $action: $fingerprint"
 )
+
+# GPG can return 0 and VALIDSIG for expired/revoked material. Require the
+# positive status and reject every adverse key/signature-lifetime status.
+follow_signature_current() {
+  awk '$1 == "[GNUPG:]" {
+    if ($2 == "GOODSIG") good=1
+    if ($2 ~ /^(REVKEYSIG|EXPKEYSIG|EXPSIG|KEYREVOKED|KEYEXPIRED)$/) bad=1
+  } END {exit (!good || bad)}' "$1"
+}
+
+# Signed exports use ISO-8601 whole seconds with an explicit timezone.
+# Compare instants, not text (equivalent offsets must not evade the high-water mark).
+follow_exported_epoch() {
+  local stamp="$1"
+  [[ "$stamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2})$ ]] || return 1
+  date -d "$stamp" +%s 2>/dev/null
+}
+
+# Real applies run entirely under the host-store lock. Dry-run calls this
+# directly: it reads an atomic state snapshot and never creates a lock/state file.
+follow_apply_generation() {
+  local file="$1" dry_run="$2" origin="$3" ha_file="$4"
+  local state_file state stamp epoch prior prior_epoch entry tmp
+  state_file="$(dirname "$ha_file")/follow-state.json"
+  if ! stamp=$(jq -er '.exported_at | select(type == "string" and (test("[[:space:][:cntrl:]]") | not))' "$file") ||
+     ! epoch=$(follow_exported_epoch "$stamp"); then
+    warn "WARN follow: skipped $origin (invalid exported_at; expected a real ISO-8601 timestamp with timezone)"
+    return 1
+  fi
+  state='{"origins":{}}'
+  if [[ -e "$state_file" ]]; then
+    state=$(cat -- "$state_file") || return 1
+    if ! jq -se 'length == 1 and (.[0].origins | type == "object" and all(.[]; type == "string" and (test("[[:space:][:cntrl:]]") | not)))' \
+      <<<"$state" >/dev/null 2>&1; then
+      warn "WARN follow: malformed follow-state.json; repair it at an operator terminal before following"
+      return 1
+    fi
+    while IFS= read -r entry; do
+      if ! follow_exported_epoch "$entry" >/dev/null; then
+        warn "WARN follow: malformed timestamp in follow-state.json; repair it at an operator terminal before following"
+        return 1
+      fi
+    done < <(jq -r '.origins[]' <<<"$state")
+  fi
+  prior=$(jq -r --arg host "$origin" '.origins[$host] // empty' <<<"$state") || return 1
+  if [[ -n "$prior" ]]; then
+    prior_epoch=$(follow_exported_epoch "$prior") || return 1
+    if (( epoch <= prior_epoch )); then
+      warn "WARN follow: skipped $origin (exported_at $stamp is not newer than accepted $prior)"
+      return 2
+    fi
+  fi
+  if (( ! dry_run )); then
+    # Consume the verified generation before its additions. If validation,
+    # publication or the process later fails, a partial apply cannot be replayed
+    # after a local removal. Retry requires a newer export or operator import.
+    tmp=$(stage_beside "$state_file") || return 1
+    jq --arg host "$origin" --arg stamp "$stamp" '.origins[$host] = $stamp' \
+      <<<"$state" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+    mv -f -- "$tmp" "$state_file" || { rm -f -- "$tmp"; return 1; }
+  fi
+  host_allow_apply_export "$file" "$dry_run" "$origin" "$ha_file" write_host_allow_entry_locked
+}
 
 cmd_host_allow_follow() (
   trust_redirected_guard write "host-allow-follow"
@@ -2122,7 +2197,7 @@ cmd_host_allow_follow() (
     jq -e '.packages | type == "object"' "$ha_file" >/dev/null 2>&1 ||
       die "malformed local host-allow store; repair it at an operator terminal before follow or import"
   fi
-  local verified=0 signature_skips=0 failed_files=0 follow_planned='{}' verified_primary
+  local verified=0 signature_skips=0 freshness_skips=0 failed_files=0 follow_planned='{}' verified_primary apply_rc
   for file in "${files[@]}"; do
     origin="${file##*/}"; origin="${origin#host-allow.}"; origin="${origin%.json}"
     # Work only on private snapshots after signature verification. The sync
@@ -2138,8 +2213,9 @@ cmd_host_allow_follow() (
     # Check GPG's machine-readable primary fingerprint as well as its exit
     # status. Trust belongs to a pinned primary and its certified subkeys.
     verified_primary=$(awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" {print (NF >= 12 ? $12 : $3)}' "$staging/status")
-    if ! jq -e --arg f "$verified_primary" 'index($f) != null' <<<"$signers" >/dev/null; then
-      warn "WARN follow: skipped $(printf '%q' "$file") (signature is not from one pinned primary key)"
+    if ! follow_signature_current "$staging/status" ||
+       ! jq -e --arg f "$verified_primary" 'index($f) != null' <<<"$signers" >/dev/null; then
+      warn "WARN follow: skipped $(printf '%q' "$file") (signature is revoked, expired, or not good from one pinned primary key)"
       signature_skips=$((signature_skips + 1)); continue
     fi
     verified=$((verified + 1))
@@ -2149,10 +2225,20 @@ cmd_host_allow_follow() (
       failed_files=$((failed_files + 1)); continue
     fi
     info "follow: verified $(printf '%q' "$file")"
-    host_allow_apply_export "$staging/export.json" "$dry_run" "$origin" "$ha_file" || failed_files=$((failed_files + 1))
+    apply_rc=0
+    if (( dry_run )); then
+      follow_apply_generation "$staging/export.json" "$dry_run" "$origin" "$ha_file" || apply_rc=$?
+    else
+      with_host_allow_lock "$ha_file" follow_apply_generation "$staging/export.json" "$dry_run" "$origin" "$ha_file" || apply_rc=$?
+    fi
+    case "$apply_rc" in
+      0) ;;
+      2) freshness_skips=$((freshness_skips + 1)) ;;
+      *) failed_files=$((failed_files + 1)) ;;
+    esac
   done
-  info "follow complete: $verified verified, $signature_skips signature skips, $failed_files files with validation errors or conflicts"
-  if (( signature_skips || failed_files )); then
+  info "follow complete: $verified verified, $signature_skips signature skips, $freshness_skips freshness skips, $failed_files files with validation errors or conflicts"
+  if (( signature_skips || freshness_skips || failed_files )); then
     warn 'operator override: review the original file, then run safe run host-allow import <file> at an operator terminal; conflicting pins require host-allow update <pkg>@<version> --reason "..."'
     return 1
   fi
@@ -2214,11 +2300,16 @@ cmd_host_allow_remove() {
   # An unblessed redirect seeds no host-allow file (F4): nothing to remove,
   # rather than aborting on jq's missing-file status (N1 sibling class).
   [[ -f "$HOST_ALLOW_FILE" ]] || { info "host-allow is empty; nothing to remove"; return 0; }
-  pkg=$(resolve_package_key_in_file "$HOST_ALLOW_FILE" "$pkg")
-  local tmp
-  tmp=$(stage_beside "$HOST_ALLOW_FILE")
-  jq --arg p "$pkg" 'del(.packages[$p])' "$HOST_ALLOW_FILE" > "$tmp"
-  mv "$tmp" "$HOST_ALLOW_FILE"
+  with_host_allow_lock "$HOST_ALLOW_FILE" host_allow_remove_locked "$pkg"
+}
+
+host_allow_remove_locked() {
+  local pkg="$1" tmp
+  [[ -f "$HOST_ALLOW_FILE" ]] || { info "host-allow is empty; nothing to remove"; return 0; }
+  pkg=$(resolve_package_key_in_file "$HOST_ALLOW_FILE" "$pkg") || return 1
+  tmp=$(stage_beside "$HOST_ALLOW_FILE") || return 1
+  jq --arg p "$pkg" 'del(.packages[$p])' "$HOST_ALLOW_FILE" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv "$tmp" "$HOST_ALLOW_FILE" || return 1
   info "removed $pkg from host-allow"
   # Only after the removal succeeded, and with the key the store actually
   # used: status must stop reporting a decision the operator has just made.

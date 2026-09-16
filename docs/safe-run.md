@@ -216,24 +216,32 @@ safe run host-allow follow-signer remove <full-primary-fingerprint>
 `~/.config/safe/run/config.json`; there is no generic config setter. It accepts
 full 40- or 64-hex primary fingerprints, requires the public key locally on add,
 and never fetches keys. Signing subkeys certified by that primary are accepted.
-The two signer-management operations and signed export refuse non-TTY callers
+Revoked or expired primary keys cannot be pinned. The two signer-management
+operations and signed export refuse non-TTY callers
 with exit 102. There is no `--yes` or `-y` override.
 
 `follow` reads `host-allow.*.json` in `~/Sync/state/safe/` (or `--from`), ignoring
 its own short-hostname file. It copies each document and `.json.asc` signature
 into private temporary storage, verifies with GPG using an isolated keyring
 built only from the pinned primary keys, and applies those same verified bytes.
-It never downloads a key. Unknown/unavailable signers, missing signatures,
-invalid signatures, and invalid signer configuration produce one WARN per file
+It never downloads a key. Revocation and expiry are honoured: revoked/expired
+primary keys are excluded from the verifier keyring, and verification requires
+`GOODSIG` alongside the pinned-primary `VALIDSIG`, rejecting revoked-key,
+expired-key and expired-signature status even when GPG exits successfully.
+Import revocation certificates and updated public keys into each follower's
+local GPG keyring; there is no automatic keyserver refresh.
+Unknown/unavailable signers, missing signatures, invalid signatures, and invalid
+signer configuration produce one WARN per file
 and increment the signature-skip count. Signed `/2` metadata must identify the
 host in the filename. The default directory being absent is a successful no-op.
 
 The merge is **UNION**: missing grants pass the same name, ecosystem, reason,
 exact-version and registry-integrity validator as `import`. Already-present
 pins are no-ops, different local pins produce `CONFLICT` with an explicit
-`host-allow update` hint, and no local grants are removed. Grant writers lock
-and recheck the local pin after registry validation to preserve concurrent
-operator grants. New entries retain the origin's valid `added` date and record
+`host-allow update` hint, and no local grants are removed. Grant writes and
+`host-allow remove` share one lock. Follow checks/records its generation and
+applies its additions under that lock; its writer also rechecks the local pin
+after registry validation. New entries retain the origin's valid `added` date and record
 `followed_from: <host>`; invalid dates fall back to today, as in import.
 Neither import nor follow runs add's interactive audit preflight: the operator
 review/signature authorizes the statement, while import validation rechecks the
@@ -241,9 +249,27 @@ exact registry identity. Missing local grants with invalid field types or
 unverifiable integrity are skipped. `--dry-run` verifies and validates everything,
 including conflicts between source files, without changing persistent state.
 
-Exit 0 means all eligible files verified and applied (including already-present
-pins), or nothing needed doing. Exit 1 reports signature skips, validation
-failures, conflicts, or operational errors; valid siblings can still apply.
+A local `follow-state.json` beside the guard-selected trust store records the
+highest accepted `exported_at` for each origin (`{"origins":{"rainbow":"..."}}`).
+Timestamps must be real ISO-8601 whole-second instants with an explicit timezone,
+as emitted by signed export; equivalent timezone spellings compare equal.
+Any document **not strictly newer**, including an identical daily re-read or a
+replay from another `--from` directory, is skipped with a WARN, a freshness-skip
+count and a non-zero result. A newer signed statement may authorize grants again.
+This state is machine-local: preserve it across restarts and do not synchronize
+or reset it when removing a grant. Malformed state fails closed with a repair hint.
+
+The accepted generation is atomically recorded under the shared lock **before**
+its additions. If entry validation or a later write fails, valid entries can
+still have applied and that generation remains consumed; an interrupted apply
+also cannot replay after a removal. Retry with a strictly newer signed export or
+the deliberate TTY `import` override. `--dry-run` reads state and validates the
+plan but never creates/advances the state or creates a lock file.
+
+Exit 0 means all eligible files verified, were fresh and applied (including
+already-present pins in a fresh generation), or no eligible files existed.
+Exit 1 reports signature/freshness skips, validation failures, conflicts, or
+operational errors; valid siblings can still apply.
 The redirected-store write guard remains active (exit 100). An operator can
 review any skipped file and deliberately apply it with the existing
 `safe run host-allow import <file>` at a TTY; import still validates entries and
@@ -252,9 +278,12 @@ never overwrites a different pin. Resolve those pins with `host-allow update`.
 Synchronize only signed exports and signatures, **not** the live trust store or
 signer configuration. A timer may run `follow` unattended; export remains a
 separate operator gesture. Removing a signer stops future imports but does not
-remove grants already accepted. Signed statements have no freshness/revocation
-ledger: an old valid export can re-add a locally removed grant while its signer
-remains pinned. Retire the export or unpin its signer when withdrawing trust.
+remove grants already accepted. The freshness ledger prevents replay of accepted
+generations, not cross-origin withdrawal: a newer statement or a statement from
+another authorized origin may still include a removed grant. Retire those
+exports or unpin their signer when withdrawing trust across the fleet. Existing
+installs have no historical ledger until their first accepted follow; protect
+and retain the local state file.
 Protect the signing key (for example with a hardware token requiring touch).
 TTY checks and user-writable configuration retain safe's existing cooperative
 agent boundary; they are not an OS-level defense against a hostile same-user

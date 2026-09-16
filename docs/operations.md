@@ -94,14 +94,23 @@ Signed exports are `~/Sync/state/safe/host-allow.<short-hostname>.json` with
 custom transport directory. Optional `follow.signing_key` selects the origin's
 GPG key; `follow.signers` is maintained by the TTY-only `follow-signer add|remove`
 commands. Provision public keys locally first; follow never retrieves keys.
+Revocation and expiry are honoured, including revoked/expired signature statuses
+that GPG can report with exit 0. Revoked or expired primary keys cannot be pinned.
+Distribute revocation certificates and updated public keys to every follower's
+local keyring; there is no automatic keyserver refresh.
 
 A user timer can invoke `safe run host-allow follow` daily. This change does not
 install a timer or automatically sign after add. Own-host files are ignored;
 verified statements add only absent grants after import validation, retaining
 the original `added` date and recording `followed_from`. Dry-run validates the
-whole plan without changing persistent state. Exit 0 means all eligible files
-were handled or nothing needed doing; non-zero surfaces skipped signatures,
-invalid entries or pin conflicts to the timer. Valid files can still apply
+whole plan without changing persistent state. A machine-local `follow-state.json`
+beside the guard-selected trust store records the highest accepted `exported_at`
+per origin. Only strictly newer ISO-8601 whole-second timestamps with a timezone
+are accepted; equal or older documents (even through another `--from`) emit a
+WARN, increment the freshness-skip count and return non-zero. Thus a timer
+re-reading an unchanged export reports a stale generation, rather than exit 0.
+Exit 0 means all eligible files were fresh and handled, or no eligible files
+existed; non-zero also surfaces skipped signatures, invalid entries or pin conflicts. Valid files can still apply
 alongside failures. A transport delivering mismatched JSON/signature generations
 causes a safe rejection; rerun after both files have arrived.
 
@@ -109,10 +118,19 @@ For a skipped file, the operator can review it and run
 `safe run host-allow import <file>` at a TTY. Conflicting pins need the usual
 `safe run host-allow update <pkg>@<version> --reason "..."`. Signature failures
 and counts are emitted by follow; there is no persistent doctor status in this
-slice. Unpinning a signer revokes future acceptance, not existing grants. Old
-signed exports can re-add removed grants while the signer remains pinned; retire
-those exports or revoke the signer when withdrawing trust. Protect the signing
-key and provision signer configuration through a trusted operator session;
+slice. Add/update/import/follow and removal share the host-store writer lock;
+follow checks and atomically records a generation before adding its grants under
+that lock. A validation failure or interruption consumes the generation, so
+retry requires a newer signed export or deliberate TTY import. Dry-run never
+creates or advances freshness state. Preserve this local file across restarts
+and grant removal; do not sync it. Malformed state requires operator repair.
+
+Unpinning/revoking a signer stops future acceptance, not existing grants.
+Freshness prevents replay only for generations this machine already accepted:
+initial bootstrap, a newer signed statement, or another authorized origin can
+still authorize a previously removed grant. Retire those exports or revoke the
+signer when withdrawing fleet-wide trust. Protect the signing key and provision
+signer configuration through a trusted operator session;
 TTY gating retains the existing cooperative-agent boundary.
 
 See [Host Allowlist › Fleet replication](safe-run.md#fleet-replication-export--import)
