@@ -5,6 +5,9 @@
 - Re-derive generation-bearing follow refusals before each comparison, while
   keeping equal and older generations refused; empty local versions now fail
   closed without blocking valid sibling entries.
+- Let a TTY update to the refused version clear generation-less refusal memory;
+  document repeated WARNs for generation-bearing refusals and add a registry
+  retry hint to failed host-allow add/update verification.
 - Explain the primary fingerprint when `follow-signer add` receives a signing
   subkey, while continuing to refuse the subkey.
 - Require `host-allow add` and `update` to verify the exact registry version

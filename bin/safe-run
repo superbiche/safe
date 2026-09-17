@@ -2294,7 +2294,7 @@ follow_commit_generation() {
     # to compare. Once a generation exists, re-derive the decision below so a
     # repaired local stamp can be compared without resurrecting equal/older
     # refused identities.
-    if (( already_refused )) && [[ -z "$local_generation" ]]; then
+    if (( already_refused )) && [[ -z "$local_generation" && "$local_version" != "$version" ]]; then
       info "follow: skipped $id from $origin (generation $statement_generation was refused; local pin @${local_version:-absent})"
       failures=$((failures + 1)); continue
     fi
@@ -2540,7 +2540,7 @@ cmd_host_allow_add() {
     py|python|uv|pipx) sha=$(registry_integrity_pypi "$PKG_NAME" "$PKG_VERSION") || true ;;
     *) die "unknown --ecosystem: $ecosystem" ;;
   esac
-  [[ -n "$sha" ]] || die "could not verify ${PKG_NAME}@${PKG_VERSION} against the registry (unknown version or registry unreachable)"
+  [[ -n "$sha" ]] || die "could not verify ${PKG_NAME}@${PKG_VERSION} against the registry (unknown version or registry unreachable) — retry when the registry is reachable"
 
   write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem"
   info "added ${PKG_NAME}@${PKG_VERSION} to host-allow"
@@ -2605,7 +2605,7 @@ cmd_host_allow_update() {
     py|python|uv|pipx) sha=$(registry_integrity_pypi "$PKG_NAME" "$PKG_VERSION") || true ;;
     *) die "unknown --ecosystem: $ecosystem" ;;
   esac
-  [[ -n "$sha" ]] || die "could not verify ${PKG_NAME}@${PKG_VERSION} against the registry (unknown version or registry unreachable)"
+  [[ -n "$sha" ]] || die "could not verify ${PKG_NAME}@${PKG_VERSION} against the registry (unknown version or registry unreachable) — retry when the registry is reachable"
   write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem"
   info "updated ${PKG_NAME}@${PKG_VERSION} in host-allow"
 }

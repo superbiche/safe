@@ -229,6 +229,20 @@ cmp "$tmp/local-after-refused-repin.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json"
 cmp "$tmp/state-before-refused-repin.json" "$SAFE_RUN_CONFIG_DIR/follow-state.json" || fail 'refused dry-run changed the ledger'
 pass 'same-generation refusals survive a TTY re-pin and dry-run'
 
+# The refusal's update hint can be followed exactly: updating to the refused
+# version creates a generation-less local entry, which must be re-derived and
+# clear the refusal without rewriting the already-matching store entry.
+printf '{"packages":{"fresh-pkg":{"version":"2.0.0","sha":"sha512-FRESH","ecosystem":"npm","added":"2026-07-01","reason":"followed origin grant","followed_from":"rainbow","followed_generation":"%s"}}}\n' "$cross_newer" > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+printf '{"origins":{"rainbow":{"accepted":"%s","applied":["fresh-pkg@2.0.0"],"replaced":[]},"tuxedo":{"accepted":"%s","applied":[],"replaced":[]}}}\n' "$cross_newer" "$cross_older" > "$SAFE_RUN_CONFIG_DIR/follow-state.json"
+expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+jq -e '.origins.tuxedo.refused == ["fresh-pkg@1.2.3"]' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'refusal was not recorded before the hinted update'
+printf 'y\n' | pty_run "$SAFE_RUN" host-allow update fresh-pkg@1.2.3 --reason "operator ruling" > "$tmp/output" 2>&1 || fail 'TTY update to refused version failed'
+cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/local-before-refused-version-follow.json"
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+cmp "$tmp/local-before-refused-version-follow.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'equal-version retry rewrote the host-allow store'
+jq -e '.origins.tuxedo.refused == [] and .origins.tuxedo.applied == ["fresh-pkg@1.2.3"]' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'equal-version retry did not clear refusal and apply identity'
+pass 'refusal followed by TTY update to the refused version clears memory without rewriting the store'
+
 # A repaired followed-generation must be compared again even when the
 # identity remains in refusal memory. The memory-only path is for entries with
 # no generation, where there is no safe comparison to make.

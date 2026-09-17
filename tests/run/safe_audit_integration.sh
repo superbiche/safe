@@ -885,6 +885,7 @@ ERR_FILE="$tmp/grant-unknown-add.err" \
     set -e
     [[ "$grc" -ne 0 ]] || exit 1
     grep -q "could not verify nonexistent-pkg@9.9.9" "$ERR_FILE" || exit 1
+    grep -q "retry when the registry is reachable" "$ERR_FILE" || exit 1
     [[ "$(jq -r ".packages | length" "$HOST_ALLOW_FILE")" == "0" ]] || exit 1
   ' safe-run || fail "host-allow add accepted an unverified registry version"
 pass "host-allow add refuses an unverified exact registry version"
@@ -905,6 +906,7 @@ ERR_FILE="$tmp/grant-unknown-update.err" \
     set -e
     [[ "$grc" -ne 0 ]] || exit 1
     grep -q "could not verify known-pkg@2.0.0" "$ERR_FILE" || exit 1
+    grep -q "retry when the registry is reachable" "$ERR_FILE" || exit 1
     [[ "$(jq -r ".packages[\"known-pkg\"].version" "$HOST_ALLOW_FILE")" == "1.0.0" ]] || exit 1
   ' safe-run || fail "host-allow update accepted an unverified registry version"
 pass "host-allow update refuses an unverified exact registry version"

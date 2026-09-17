@@ -117,10 +117,12 @@ guard-selected trust store records each origin as
 warn, increment the freshness-skip count and return non-zero. Equal timestamps
 retry only identities that never applied; successful entries stay skipped even
 after operator removal. A local re-pin survives an equal generation and a newer
-signed generation re-aligns it to the origin's pin. Older or equal replacement
-statements are WARNed once, recorded in `refused`, and remain non-zero; a
-same-generation retry is an INFO skip that cannot replace a later TTY re-pin. A
-hinted update to the refused version makes it present and clears the refusal. A
+signed generation re-aligns it to the origin's pin. Generation-less refusals
+are WARNed once, recorded in `refused`, and remain non-zero; same-generation
+retries are quiet INFO skips that cannot replace a later TTY re-pin. A
+generation-bearing refusal is re-derived against the incoming generation and
+WARNed on every run. A hinted update to the refused version makes it present
+and clears the refusal. A
 registry outage is therefore retryable with the same signed file. Once complete, unchanged daily
 runs return 0 with one quiet info line, no registry calls and no import
 prescription. Verification still runs.
