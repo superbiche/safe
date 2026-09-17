@@ -175,6 +175,35 @@ TTY gating retains the existing cooperative-agent boundary.
 See [Host Allowlist › Fleet replication](safe-run.md#fleet-replication-export--import)
 for validation, signature-keyring and operator-override details.
 
+## Safe release follow
+
+`safe release follow` owns L7 release verification and installation. A daily
+user timer may invoke it unattended; machine-setup only needs to add that timer
+later. The command fetches the existing origin, selects the highest strict
+`vX.Y.Z` descendant newer than the installed version, verifies its annotated
+OpenPGP tag against the TTY-pinned `follow.signers`, installs the verified
+archive with the recorded installer flags, and checks `safe --version` after
+installation. It never pulls from another host, adds a remote, uses sudo, or
+falls back to the ambient keyring.
+
+Signer rotation means adding the new primary fingerprint at a TTY before
+publishing tags signed by it, then removing the old fingerprint after every
+follower has received the new public key and has completed a successful follow.
+Removing the old signer prevents future acceptance; it does not undo the
+release already installed under that signer. Hosts with no pinned signer refuse
+and print the bootstrap command. The release-follow audit line records the
+verified tag object and primary fingerprint, and refusal lines remain visible
+to a failed systemd unit.
+
+The install source record is local at
+`$SAFE_CONFIG_DIR/release-follow.json`. It contains the absolute checkout path
+and normalized `install.sh` component flags. The release pass installs from a
+private archive of the verified commit, then warns if the recorded checkout is
+dirty or cannot fast-forward. The pass lock is bounded to 10 seconds. Because
+the current installer still direct-writes some binaries and wrappers, a killed
+install can expose mixed live files; this is an installer atomicity residual,
+not a reason to install from the unverified working tree.
+
 ## Scan Modes
 
 Default scans use `source` mode:

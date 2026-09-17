@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add unattended `safe release follow`, which fetches and verifies the highest
+  signed descendant release from the recorded checkout, installs its exact
+  archive bytes with the recorded installer flags, and logs the result.
+- Have `install.sh` record its local checkout path and normalized component
+  flags for release following.
+
 ## 1.64.1 - 2026-09-17
 
 - Re-derive generation-bearing follow refusals before each comparison, while

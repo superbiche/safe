@@ -43,6 +43,8 @@ DO_RUN=0
 DO_AUDIT=0
 DO_WRAPPERS=0
 DO_REVIEW_TIMER=0
+INSTALL_FLAGS_WERE_SUPPLIED=0
+WITH_COMPLETIONS=0
 
 err()  { printf '\033[31minstall:\033[0m %s\n' "$*" >&2; }
 info() { printf '\033[36minstall:\033[0m %s\n' "$*" >&2; }
@@ -121,28 +123,36 @@ fi
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --all)
+      INSTALL_FLAGS_WERE_SUPPLIED=1
       DO_RUN=1
       DO_AUDIT=1
       DO_WRAPPERS=1
       ;;
     --run)
+      INSTALL_FLAGS_WERE_SUPPLIED=1
       DO_RUN=1
       ;;
     --audit)
+      INSTALL_FLAGS_WERE_SUPPLIED=1
       DO_AUDIT=1
       ;;
     --wrappers)
+      INSTALL_FLAGS_WERE_SUPPLIED=1
       DO_WRAPPERS=1
       ;;
     --review-timer)
+      INSTALL_FLAGS_WERE_SUPPLIED=1
       DO_REVIEW_TIMER=1
       ;;
     --no-wrappers)
+      INSTALL_FLAGS_WERE_SUPPLIED=1
       DO_RUN=1
       DO_AUDIT=1
       DO_WRAPPERS=0
       ;;
     --with-completions)
+      INSTALL_FLAGS_WERE_SUPPLIED=1
+      WITH_COMPLETIONS=1
       ;;
     --uninstall)
       exec "$REPO_DIR/uninstall.sh"
@@ -158,6 +168,50 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+release_follow_install_flags_json() {
+  if (( ! INSTALL_FLAGS_WERE_SUPPLIED )); then
+    jq -cn '["--all"]'
+    return
+  fi
+  local -a flags=()
+  if (( DO_RUN && DO_AUDIT && DO_WRAPPERS )); then
+    flags+=(--all)
+  elif (( DO_RUN && DO_AUDIT && !DO_WRAPPERS )); then
+    flags+=(--no-wrappers)
+  else
+    (( DO_RUN )) && flags+=(--run)
+    (( DO_AUDIT )) && flags+=(--audit)
+    (( DO_WRAPPERS )) && flags+=(--wrappers)
+  fi
+  (( DO_REVIEW_TIMER )) && flags+=(--review-timer)
+  (( WITH_COMPLETIONS )) && flags+=(--with-completions)
+  printf '%s\n' "${flags[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))'
+}
+
+record_release_follow_source() {
+  local checkout flags_json record tmp
+  checkout="${SAFE_RELEASE_FOLLOW_CHECKOUT:-$REPO_DIR}"
+  [[ "$checkout" = /* ]] || die "release-follow checkout record must be an absolute path: $checkout"
+  checkout=$(cd -- "$checkout" 2>/dev/null && pwd -P) ||
+    die "release-follow checkout does not exist: $checkout"
+  flags_json="${SAFE_RELEASE_FOLLOW_FLAGS_JSON:-$(release_follow_install_flags_json)}"
+  jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' \
+    <<<"$flags_json" >/dev/null || die "release-follow installer flags are malformed"
+  record="$CONFIG_BASE/release-follow.json"
+  mkdir -p -- "$CONFIG_BASE"
+  tmp=$(stage_beside "$record") || die "cannot stage release-follow record"
+  jq -cn --arg checkout "$checkout" --argjson flags "$flags_json" \
+    '{schema:"safe-release-follow/1", checkout:$checkout, install_flags:$flags}' > "$tmp" || {
+    rm -f -- "$tmp"
+    die "cannot render release-follow record"
+  }
+  chmod 0600 -- "$tmp"
+  mv -f -- "$tmp" "$record" || {
+    rm -f -- "$tmp"
+    die "cannot publish release-follow record: $record"
+  }
+}
 
 command -v bash >/dev/null 2>&1 || die "missing dependency: bash"
 command -v jq >/dev/null 2>&1 || die "missing dependency: jq"
@@ -753,6 +807,8 @@ if (( DO_REVIEW_TIMER )); then
     warn "systemctl not found; timer units installed to $SYSTEMD_USER_DIR but not enabled"
   fi
 fi
+
+record_release_follow_source
 
 info ""
 info "installed safe $("$BIN_DIR/safe" version | head -n 1 | awk '{print $2}')"

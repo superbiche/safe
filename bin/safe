@@ -76,6 +76,7 @@ USAGE
   safe install --manager npm|pnpm|yarn|bun|composer -g [--yes] [--trust-host] <pkg> [...]
   safe install --sandbox [--allow-scripts] <pkg> [...]
   safe vendor update --name NAME --path PATH --reason TEXT -- COMMAND...
+  safe release follow [--dry-run] [--checkout <dir>]
   safe setup [<machine> | --all | --machine <csv>]
   safe status
   safe doctor [--json]
@@ -710,6 +711,372 @@ cmd_vendor_update() {
     printf 'safe: vendor update recorded %s -> %s\n' "$before_sha" "$after_sha" >&2
     printf 'safe: audit log: %s\n' "$log_file" >&2
   fi
+}
+
+# ---------------------------------------------------------------------------
+# Signed release follower
+# ---------------------------------------------------------------------------
+release_follow_system_tool() {
+  local name="$1" candidate resolved
+  case "$name" in
+    git|gpg|tar|timeout) ;;
+    *) return 1 ;;
+  esac
+  for candidate in "/usr/bin/$name" "/bin/$name" "/usr/local/bin/$name"; do
+    [[ -f "$candidate" && -x "$candidate" ]] || continue
+    resolved=$(readlink -f -- "$candidate" 2>/dev/null) || continue
+    [[ -x "$resolved" ]] || continue
+    printf '%s\n' "$resolved"
+    return 0
+  done
+  return 1
+}
+
+release_follow_clean_git_env() {
+  env -i \
+    HOME="$RELEASE_FOLLOW_HOME" \
+    PATH=/usr/bin:/bin \
+    LC_ALL=C \
+    GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_SYSTEM=/dev/null \
+    GIT_OPTIONAL_LOCKS=0 \
+    GIT_TERMINAL_PROMPT=0 \
+    "$@"
+}
+
+release_follow_clean_gpg_env() {
+  env -i \
+    HOME="$RELEASE_FOLLOW_HOME" \
+    PATH=/usr/bin:/bin \
+    LC_ALL=C \
+    GNUPGHOME="$RELEASE_FOLLOW_OPERATOR_GNUPGHOME" \
+    "$@"
+}
+
+release_follow_audit() {
+  local event="$1" safe_event
+  safe_event=$(printf '%s' "$event" | tr '\r\n|' '   ')
+  mkdir -p -- "$RELEASE_FOLLOW_AUDIT_DIR" || return 1
+  printf '%s | release-follow | %s\n' "$(date -Iseconds)" "$safe_event" >> "$RELEASE_FOLLOW_AUDIT_LOG"
+}
+
+release_follow_manual_path() {
+  local checkout="${1:-}"
+  if [[ -n "$checkout" ]]; then
+    printf 'operator override: (cd %q && git pull --ff-only && bash install.sh --all)\n' "$checkout" >&2
+  else
+    printf 'operator override: (cd <checkout> && git pull --ff-only && bash install.sh --all)\n' >&2
+  fi
+}
+
+release_follow_refuse() {
+  local reason="$1" checkout="${2:-${RELEASE_FOLLOW_CHECKOUT:-}}"
+  local safe_reason
+  safe_reason=$(printf '%s' "$reason" | tr '\r\n|' '   ')
+  if [[ "${RELEASE_FOLLOW_DRY_RUN:-0}" != 1 ]]; then
+    release_follow_audit "RELEASE_FOLLOW_REFUSED reason=$safe_reason" || true
+  fi
+  printf 'safe: release follow refused — %s\n' "$safe_reason" >&2
+  release_follow_manual_path "$checkout"
+  return 1
+}
+
+release_follow_operator_home() {
+  printf '%s' "${GNUPGHOME:-$HOME/.gnupg}"
+}
+
+release_follow_load_signers() {
+  local config="$1"
+  RELEASE_FOLLOW_SIGNERS='[]'
+  [[ -f "$config" && ! -L "$config" ]] || return 0
+  RELEASE_FOLLOW_SIGNERS=$(jq -ce '
+    if (.follow.signers // []) | type != "array" then error("invalid signers")
+    elif all((.follow.signers // [])[]; type == "string" and test("^([A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})$"))
+    then ((.follow.signers // []) | map(ascii_upcase) | unique)
+    else error("invalid signers") end' "$config" 2>/dev/null) || return 1
+}
+
+release_follow_export_signer() {
+  local fingerprint="$1" destination="$2" primary
+  release_follow_clean_gpg_env "$RELEASE_FOLLOW_GPG_PATH" --no-options --batch \
+    --export "$fingerprint" > "$destination" 2>/dev/null || return 1
+  [[ -s "$destination" ]] || return 1
+  primary=$(release_follow_clean_gpg_env "$RELEASE_FOLLOW_GPG_PATH" --no-options --batch \
+    --with-colons --show-keys "$destination" 2>/dev/null |
+    awk -F: '$1 == "pub" {if ($2 == "r" || $2 == "e") exit 1; want=1; next}
+      want && $1 == "fpr" {print $10; want=0}') || return 1
+  [[ "$primary" == "$fingerprint" ]]
+}
+
+release_follow_prepare_keyring() {
+  local fingerprint
+  mkdir -m 700 -- "$RELEASE_FOLLOW_KEYRING" || return 1
+  while IFS= read -r fingerprint; do
+    [[ -n "$fingerprint" ]] || continue
+    release_follow_export_signer "$fingerprint" "$RELEASE_FOLLOW_STAGING/key.gpg" || continue
+    release_follow_clean_gpg_env "$RELEASE_FOLLOW_GPG_PATH" --no-options --batch \
+      --homedir "$RELEASE_FOLLOW_KEYRING" --import "$RELEASE_FOLLOW_STAGING/key.gpg" \
+      >/dev/null 2>&1 || return 1
+  done < <(jq -r '.[]' <<<"$RELEASE_FOLLOW_SIGNERS")
+}
+
+release_follow_semver_gt() {
+  local left="$1" right="$2" l1 l2 l3 r1 r2 r3
+  IFS=. read -r l1 l2 l3 <<<"$left"
+  IFS=. read -r r1 r2 r3 <<<"$right"
+  (( 10#$l1 > 10#$r1 )) && return 0
+  (( 10#$l1 < 10#$r1 )) && return 1
+  (( 10#$l2 > 10#$r2 )) && return 0
+  (( 10#$l2 < 10#$r2 )) && return 1
+  (( 10#$l3 > 10#$r3 ))
+}
+
+release_follow_tag_metadata() {
+  local tag="$1" tag_object="$2" raw object_header type_header tag_header
+  local target target_type embedded sig_line
+  raw="$RELEASE_FOLLOW_STAGING/tag.raw"
+  release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
+    cat-file tag "$tag_object" > "$raw" 2>/dev/null || return 1
+  object_header=$(grep -c '^object [0-9a-fA-F]\{40,64\}$' "$raw")
+  type_header=$(grep -c '^type [A-Za-z0-9][A-Za-z0-9_-]*$' "$raw")
+  tag_header=$(grep -c '^tag .\+$' "$raw")
+  (( object_header == 1 && type_header == 1 && tag_header == 1 )) || return 1
+  target=$(sed -n 's/^object //p' "$raw")
+  target_type=$(sed -n 's/^type //p' "$raw")
+  embedded=$(sed -n 's/^tag //p' "$raw")
+  [[ "$target_type" == commit && "$embedded" == "$tag" ]] || return 1
+  [[ "$(release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" cat-file -t "$target" 2>/dev/null)" == commit ]] || return 1
+  sig_line=$(awk '/^-----BEGIN PGP SIGNATURE-----$/ {print NR; exit}' "$raw")
+  [[ "$sig_line" =~ ^[0-9]+$ && "$sig_line" -gt 1 ]] || return 1
+  head -n $((sig_line - 1)) "$raw" > "$RELEASE_FOLLOW_STAGING/tag.payload"
+  tail -n +"$sig_line" "$raw" > "$RELEASE_FOLLOW_STAGING/tag.signature"
+  grep -q '^-----END PGP SIGNATURE-----$' "$RELEASE_FOLLOW_STAGING/tag.signature" || return 1
+  RELEASE_FOLLOW_TAG_PAYLOAD="$RELEASE_FOLLOW_STAGING/tag.payload"
+  RELEASE_FOLLOW_TAG_SIGNATURE="$RELEASE_FOLLOW_STAGING/tag.signature"
+}
+
+release_follow_verify_signature() {
+  local status_file="$RELEASE_FOLLOW_STAGING/gpg.status" verified_primary
+  release_follow_clean_gpg_env "$RELEASE_FOLLOW_GPG_PATH" --no-options \
+    --homedir "$RELEASE_FOLLOW_KEYRING" --batch --no-auto-key-retrieve \
+    --auto-key-locate clear --status-fd 1 --verify "$RELEASE_FOLLOW_TAG_SIGNATURE" \
+    "$RELEASE_FOLLOW_TAG_PAYLOAD" > "$status_file" 2>/dev/null || return 1
+  verified_primary=$(awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" {print (NF >= 12 ? $12 : $3)}' "$status_file")
+  [[ -n "$verified_primary" ]] || return 1
+  awk '$1 == "[GNUPG:]" {
+    if ($2 == "GOODSIG") good=1
+    if ($2 == "VALIDSIG") valid=1
+    if ($2 ~ /^(REVKEYSIG|EXPKEYSIG|EXPSIG|BADSIG|ERRSIG|KEYREVOKED|KEYEXPIRED)$/) bad=1
+  } END {exit !(good && valid && !bad)}' "$status_file" || return 1
+  jq -e --arg fingerprint "$verified_primary" 'index($fingerprint) != null' \
+    <<<"$RELEASE_FOLLOW_SIGNERS" >/dev/null || return 1
+  RELEASE_FOLLOW_SIGNER="$verified_primary"
+}
+
+release_follow_fast_forward_checkout() {
+  local default_ref default_branch branch_ref old_ref
+  [[ -z "$(release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
+    status --porcelain --untracked-files=all 2>/dev/null)" ]] || {
+    printf 'safe: release follow: WARN checkout is dirty; default branch was not advanced\n' >&2
+    return 0
+  }
+  default_ref=$(release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
+    symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null) || {
+    printf 'safe: release follow: WARN origin/HEAD is unavailable; checkout was not advanced\n' >&2
+    return 0
+  }
+  default_branch="${default_ref#refs/remotes/origin/}"
+  [[ "$default_branch" != "$default_ref" && "$default_branch" != */* ]] || {
+    printf 'safe: release follow: WARN origin/HEAD is invalid; checkout was not advanced\n' >&2
+    return 0
+  }
+  branch_ref="refs/heads/$default_branch"
+  old_ref=$(release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
+    rev-parse --verify "$branch_ref" 2>/dev/null) || {
+    printf 'safe: release follow: WARN local default branch is missing; checkout was not advanced\n' >&2
+    return 0
+  }
+  release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
+    merge-base --is-ancestor "$old_ref" "$RELEASE_FOLLOW_CANDIDATE_COMMIT" || {
+    printf 'safe: release follow: WARN default branch is diverged; checkout was not advanced\n' >&2
+    return 0
+  }
+  release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
+    update-ref "$branch_ref" "$RELEASE_FOLLOW_CANDIDATE_COMMIT" "$old_ref" ||
+    printf 'safe: release follow: WARN default branch fast-forward failed; checkout was not advanced\n' >&2
+}
+
+cmd_release_follow() {
+  local dry_run=0 explicit_checkout="" record flags_json origin installed_commit
+  local tag tag_version best_version="" best_tag="" tag_oid candidate_commit
+  local archive_dir version_in_archive install_rc installed_after
+  local lock_fd config
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=1; shift ;;
+      --checkout) [[ $# -ge 2 && -n "$2" ]] || die "release follow: --checkout requires a directory"; explicit_checkout="$2"; shift 2 ;;
+      -h|--help)
+        printf 'usage: safe release follow [--dry-run] [--checkout <dir>]\n'
+        return 0
+        ;;
+      *) die "usage: safe release follow [--dry-run] [--checkout <dir>]" ;;
+    esac
+  done
+
+  # This command has no reason to consult a user PATH. Resolve every helper
+  # from the system tool directories so a timer's PATH cannot shadow the
+  # verifier or one of the parsers that decides whether verification passed.
+  PATH=/usr/bin:/bin
+  export PATH
+  RELEASE_FOLLOW_HOME="$HOME"
+  RELEASE_FOLLOW_DRY_RUN="$dry_run"
+  RELEASE_FOLLOW_AUDIT_DIR="$SAFE_DATA_ROOT/run"
+  RELEASE_FOLLOW_AUDIT_LOG="$RELEASE_FOLLOW_AUDIT_DIR/audit.log"
+  RELEASE_FOLLOW_INSTALL_SAFE_BIN_DIR="$SAFE_BIN_ROOT"
+  RELEASE_FOLLOW_INSTALL_SAFE_CONFIG_DIR="$SAFE_CONFIG_ROOT"
+  RELEASE_FOLLOW_INSTALL_SAFE_DATA_DIR="$SAFE_DATA_ROOT"
+  RELEASE_FOLLOW_INSTALL_SAFE_RUN_CONFIG_DIR="${SAFE_RUN_CONFIG_DIR:-$SAFE_CONFIG_ROOT/run}"
+  RELEASE_FOLLOW_INSTALL_SAFE_RUN_DATA_DIR="${SAFE_RUN_DATA_DIR:-$SAFE_DATA_ROOT/run}"
+  RELEASE_FOLLOW_INSTALL_SAFE_ZSH_COMPLETION_DIR="$SAFE_ZSH_COMPLETION_DIR"
+  RELEASE_FOLLOW_INSTALL_SAFE_ZSHRC="${SAFE_ZSHRC:-$HOME/.zshrc}"
+  RELEASE_FOLLOW_GIT_PATH=$(release_follow_system_tool git) || { release_follow_refuse "trusted git is unavailable"; return; }
+  RELEASE_FOLLOW_GPG_PATH=$(release_follow_system_tool gpg) || { release_follow_refuse "trusted gpg is unavailable"; return; }
+  RELEASE_FOLLOW_TAR_PATH=$(release_follow_system_tool tar) || { release_follow_refuse "trusted tar is unavailable"; return; }
+  RELEASE_FOLLOW_TIMEOUT_PATH=$(release_follow_system_tool timeout) || { release_follow_refuse "trusted timeout is unavailable"; return; }
+  RELEASE_FOLLOW_OPERATOR_GNUPGHOME=$(release_follow_operator_home)
+
+  record="$SAFE_CONFIG_ROOT/release-follow.json"
+  [[ ! -L "$record" ]] || { release_follow_refuse "release-follow record is a symlink; repair it with bash install.sh --all"; return; }
+  if [[ -n "$explicit_checkout" ]]; then
+    RELEASE_FOLLOW_CHECKOUT=$(cd -- "$explicit_checkout" 2>/dev/null && pwd -P) || {
+      release_follow_refuse "explicit checkout does not exist: $explicit_checkout"; return;
+    }
+  elif [[ -f "$record" ]]; then
+    RELEASE_FOLLOW_CHECKOUT=$(jq -er '.checkout | select(type == "string" and startswith("/"))' "$record" 2>/dev/null) || {
+      release_follow_refuse "release-follow record is malformed; repair it with bash install.sh --all"; return;
+    }
+  else
+    release_follow_refuse "release-follow checkout record is missing"; return
+  fi
+  [[ -d "$RELEASE_FOLLOW_CHECKOUT" ]] || { release_follow_refuse "checkout directory is missing: $RELEASE_FOLLOW_CHECKOUT"; return; }
+  if [[ -f "$record" ]]; then
+    flags_json=$(jq -ce '.install_flags | select(type == "array" and length > 0 and all(.[]; type == "string"))' "$record" 2>/dev/null) || {
+      release_follow_refuse "release-follow installer flags are missing or malformed"; return;
+    }
+  elif [[ -n "$explicit_checkout" ]]; then
+    flags_json='["--all"]'
+  else
+    release_follow_refuse "release-follow installer record is missing"; return
+  fi
+  jq -e 'all(.[]; . == "--all" or . == "--run" or . == "--audit" or . == "--wrappers" or . == "--no-wrappers" or . == "--review-timer" or . == "--with-completions")' \
+    <<<"$flags_json" >/dev/null || { release_follow_refuse "release-follow installer flags contain an unsupported option"; return; }
+  mapfile -t RELEASE_FOLLOW_INSTALL_FLAGS < <(jq -r '.[]' <<<"$flags_json")
+
+  release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
+    rev-parse --is-inside-work-tree 2>/dev/null | grep -qx true || {
+    release_follow_refuse "recorded checkout is not a git worktree"; return;
+  }
+  origin=$(release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
+    config --local --no-includes --get remote.origin.url 2>/dev/null) || {
+    release_follow_refuse "checkout has no existing origin remote"; return;
+  }
+  [[ -n "$origin" && "$origin" != *[$'\r\n']* ]] || { release_follow_refuse "origin URL is invalid"; return; }
+
+  if (( ! dry_run )); then
+    exec {lock_fd}>"$RELEASE_FOLLOW_AUDIT_DIR/release-follow.lock" || { release_follow_refuse "cannot create the release-follow lock"; return; }
+    flock -x -w 10 "$lock_fd" || {
+      release_follow_refuse "another pass is running (lock timeout after 10s)"; return;
+    }
+  fi
+
+  installed_commit=$(release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
+    rev-parse --verify "refs/tags/v$SAFE_VERSION^{commit}" 2>/dev/null) || {
+    release_follow_refuse "installed version tag v$SAFE_VERSION is missing or does not name a commit"; return;
+  }
+  "$RELEASE_FOLLOW_TIMEOUT_PATH" --foreground 30 env -i HOME="$RELEASE_FOLLOW_HOME" PATH=/usr/bin:/bin LC_ALL=C \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+    GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
+    fetch --tags --no-write-fetch-head "$origin" 'refs/tags/*:refs/tags/*' >/dev/null 2>&1 || {
+    release_follow_refuse "git fetch --tags from origin failed or exceeded the 30 second timeout"; return;
+  }
+
+  while IFS= read -r tag; do
+    [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
+    tag_version="${tag#v}"
+    release_follow_semver_gt "$tag_version" "${SAFE_VERSION#v}" || continue
+    if [[ -z "$best_version" ]] || release_follow_semver_gt "$tag_version" "$best_version"; then
+      best_version="$tag_version"
+      best_tag="$tag"
+    fi
+  done < <(release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
+    for-each-ref --format='%(refname:strip=2)' refs/tags 2>/dev/null)
+  if [[ -z "$best_tag" ]]; then
+    printf 'safe: release follow: nothing newer than %s\n' "$SAFE_VERSION"
+    return 0
+  fi
+  tag_oid=$(release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
+    rev-parse --verify "refs/tags/$best_tag" 2>/dev/null) || { release_follow_refuse "candidate tag $best_tag cannot be resolved"; return; }
+  candidate_commit=$(release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
+    rev-parse --verify "refs/tags/$best_tag^{commit}" 2>/dev/null) || { release_follow_refuse "candidate tag $best_tag does not resolve to a commit"; return; }
+  release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
+    merge-base --is-ancestor "$installed_commit" "$candidate_commit" || { release_follow_refuse "candidate $best_tag is not a descendant of installed v$SAFE_VERSION"; return; }
+  RELEASE_FOLLOW_CANDIDATE_COMMIT="$candidate_commit"
+  RELEASE_FOLLOW_TAG_OBJECT="$tag_oid"
+  RELEASE_FOLLOW_STAGING=$(mktemp -d "${TMPDIR:-/tmp}/safe-release-follow.XXXXXX") || { release_follow_refuse "cannot allocate private release staging"; return; }
+  chmod 700 "$RELEASE_FOLLOW_STAGING"
+  trap 'rm -rf -- "$RELEASE_FOLLOW_STAGING"' RETURN
+  RELEASE_FOLLOW_KEYRING="$RELEASE_FOLLOW_STAGING/keyring"
+  release_follow_tag_metadata "$best_tag" "$tag_oid" || { release_follow_refuse "candidate tag $best_tag is not a directly signed annotated commit tag"; return; }
+  # Release trust is stricter than ordinary redirected run state: an
+  # environment override must never replace the TTY-pinned signer list.
+  config="$SAFE_RUN_CANONICAL_CONFIG_DIR/config.json"
+  release_follow_load_signers "$config" || { release_follow_refuse "follow.signers is malformed; pin a primary fingerprint at a TTY"; return; }
+  [[ "$(jq 'length' <<<"$RELEASE_FOLLOW_SIGNERS")" -gt 0 ]] || {
+    release_follow_refuse "no follow.signers are pinned; operator bootstrap: safe run host-allow follow-signer add <primary-fingerprint> at a TTY"; return;
+  }
+  release_follow_prepare_keyring || { release_follow_refuse "none of the pinned signer keys is available in the local operator keyring"; return; }
+  release_follow_verify_signature || { release_follow_refuse "candidate tag signature is not a valid OpenPGP signature from a pinned, current primary"; return; }
+
+  if (( dry_run )); then
+    printf 'safe: release follow: candidate=%s signer=%s would-install\n' "$best_tag" "$RELEASE_FOLLOW_SIGNER"
+    return 0
+  fi
+  archive_dir=$(mktemp -d "${TMPDIR:-/tmp}/safe-release-archive.XXXXXX") || { release_follow_refuse "cannot allocate private archive staging"; return; }
+  chmod 700 "$archive_dir"
+  trap 'rm -rf -- "$RELEASE_FOLLOW_STAGING" "$archive_dir"' RETURN
+  release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
+    archive --format=tar "$RELEASE_FOLLOW_CANDIDATE_COMMIT" |
+    "$RELEASE_FOLLOW_TAR_PATH" -xf - -C "$archive_dir" || { release_follow_refuse "verified release archive could not be extracted"; return; }
+  version_in_archive=$(tr -d '[:space:]' < "$archive_dir/VERSION" 2>/dev/null) || { release_follow_refuse "verified archive has no readable VERSION"; return; }
+  [[ "$version_in_archive" == "$best_version" ]] || { release_follow_refuse "verified archive VERSION does not match $best_tag"; return; }
+  set +e
+  ( cd "$archive_dir" && env -i HOME="$RELEASE_FOLLOW_HOME" PATH=/usr/bin:/bin TMPDIR=/tmp \
+      GOFLAGS=-buildvcs=false \
+      SAFE_BIN_DIR="$RELEASE_FOLLOW_INSTALL_SAFE_BIN_DIR" \
+      SAFE_CONFIG_DIR="$RELEASE_FOLLOW_INSTALL_SAFE_CONFIG_DIR" \
+      SAFE_DATA_DIR="$RELEASE_FOLLOW_INSTALL_SAFE_DATA_DIR" \
+      SAFE_RUN_CONFIG_DIR="$RELEASE_FOLLOW_INSTALL_SAFE_RUN_CONFIG_DIR" \
+      SAFE_RUN_DATA_DIR="$RELEASE_FOLLOW_INSTALL_SAFE_RUN_DATA_DIR" \
+      SAFE_ZSH_COMPLETION_DIR="$RELEASE_FOLLOW_INSTALL_SAFE_ZSH_COMPLETION_DIR" \
+      SAFE_ZSHRC="$RELEASE_FOLLOW_INSTALL_SAFE_ZSHRC" \
+      SAFE_RELEASE_FOLLOW_CHECKOUT="$RELEASE_FOLLOW_CHECKOUT" \
+      SAFE_RELEASE_FOLLOW_FLAGS_JSON="$flags_json" \
+      bash install.sh "${RELEASE_FOLLOW_INSTALL_FLAGS[@]}" )
+  install_rc=$?
+  set -e
+  (( install_rc == 0 )) || { release_follow_refuse "verified release install.sh failed (exit $install_rc)"; return; }
+  installed_after=$(env -i HOME="$RELEASE_FOLLOW_HOME" PATH=/usr/bin:/bin \
+    SAFE_CONFIG_DIR="$SAFE_CONFIG_ROOT" SAFE_DATA_DIR="$SAFE_DATA_ROOT" \
+    SAFE_RUN_CONFIG_DIR="${SAFE_RUN_CONFIG_DIR:-$SAFE_CONFIG_ROOT/run}" \
+    SAFE_RUN_DATA_DIR="${SAFE_RUN_DATA_DIR:-$SAFE_DATA_ROOT/run}" \
+    "$SAFE_SELF" --version 2>/dev/null | sed -n '1s/^safe //p')
+  [[ "$installed_after" == "$best_version" ]] || { release_follow_refuse "post-install safe --version is $installed_after, expected $best_version"; return; }
+  release_follow_fast_forward_checkout
+  release_follow_audit "RELEASE_FOLLOWED from=$SAFE_VERSION to=$best_version signer=$RELEASE_FOLLOW_SIGNER tag_object=$RELEASE_FOLLOW_TAG_OBJECT" || {
+    release_follow_refuse "install succeeded but the release-follow audit event could not be written"; return;
+  }
+  printf 'safe: release follow: installed %s signer=%s\n' "$best_tag" "$RELEASE_FOLLOW_SIGNER"
 }
 
 capture_command() {
@@ -2466,6 +2833,12 @@ case "${1:-}" in
     ;;
   gate)     shift; cmd_gate "$@" ;;
   install)  shift; cmd_install "$@" ;;
+  release)
+    shift
+    [[ "${1:-}" == follow ]] || die "usage: safe release follow [--dry-run] [--checkout <dir>]"
+    shift
+    cmd_release_follow "$@"
+    ;;
   vendor)   shift; cmd_vendor "$@" ;;
   status)   shift; cmd_status "$@" ;;
   setup)    shift; exec "$SAFE_AUDIT_PATH" setup "$@" ;;

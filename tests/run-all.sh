@@ -48,6 +48,7 @@ SUITES=(
   tests/run/host_allow_review.sh
   tests/run/host_allow_export_import.sh
   tests/run/host_allow_follow.sh
+  tests/run/release_follow.sh
   tests/run/safe_audit_integration.sh
   tests/run/scripts_allow.sh
   tests/run/trust_store_redirect.sh

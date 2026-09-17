@@ -111,6 +111,19 @@ An equal generation with nothing pending returns 0 with one info line. Legacy
 string-only records require operator review/migration, never silent reset.
 Both operations retain the redirected-store guard. See [signed follower import](safe-run.md#signed-follower-import).
 
+`release-follow.json` is a machine-local regular file written by `install.sh`.
+It records the absolute source checkout and the normalized installer component
+flags used by `safe release follow`:
+
+```json
+{"schema":"safe-release-follow/1","checkout":"/absolute/path/to/safe","install_flags":["--run"]}
+```
+
+Do not synchronize this file or replace it with a symlink. `safe release follow`
+refuses a missing or malformed record unless an explicit `--checkout` repair
+path is supplied. The record does not pin trust; release trust remains solely
+in the TTY-managed `follow.signers` list.
+
 `config.json` stores runtime defaults, linked runner paths, sandbox limits, warning behavior, and the install-gate policy:
 
 ```json
