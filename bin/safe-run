@@ -2283,7 +2283,11 @@ follow_commit_generation() {
     if jq -e --arg host "$origin" --arg id "$id" '.origins[$host].refused // [] | index($id) != null' <<<"$state" >/dev/null; then
       already_refused=1
     fi
-    if (( already_refused )) && [[ "$local_version" != "$version" ]]; then
+    # A refusal is only authoritative when the local entry has no generation
+    # to compare. Once a generation exists, re-derive the decision below so a
+    # repaired local stamp can be compared without resurrecting equal/older
+    # refused identities.
+    if (( already_refused )) && [[ -z "$local_generation" ]]; then
       info "follow: skipped $id from $origin (generation $statement_generation was refused; local pin @${local_version:-absent})"
       failures=$((failures + 1)); continue
     fi

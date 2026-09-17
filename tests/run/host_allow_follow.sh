@@ -229,6 +229,19 @@ cmp "$tmp/local-after-refused-repin.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json"
 cmp "$tmp/state-before-refused-repin.json" "$SAFE_RUN_CONFIG_DIR/follow-state.json" || fail 'refused dry-run changed the ledger'
 pass 'same-generation refusals survive a TTY re-pin and dry-run'
 
+# A repaired followed-generation must be compared again even when the
+# identity remains in refusal memory. The memory-only path is for entries with
+# no generation, where there is no safe comparison to make.
+reset_incoming
+printf '{"packages":{"fresh-pkg":{"version":"1.2.3","sha":"sha512-FRESH","ecosystem":"npm","added":"2026-07-01","reason":"repaired followed grant","followed_from":"rainbow","followed_generation":"%s"}}}\n' "$cross_older" > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+printf '{"origins":{"rainbow":{"accepted":"%s","applied":[],"replaced":[],"refused":["fresh-pkg@2.0.0"]}}}\n' "$cross_newer" > "$SAFE_RUN_CONFIG_DIR/follow-state.json"
+jq --arg stamp "$cross_newer" '.host = "rainbow" | .exported_at = $stamp | .packages["fresh-pkg"].version = "2.0.0"' "$export_file" > "$tmp/incoming/host-allow.rainbow.json"
+sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+jq -e '.packages["fresh-pkg"].version == "2.0.0" and .packages["fresh-pkg"].followed_generation == $stamp' --arg stamp "$cross_newer" "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'repaired generation did not re-derive the refusal decision'
+jq -e '.origins.rainbow.refused == [] and .origins.rainbow.applied == ["fresh-pkg@2.0.0"]' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'repaired generation refusal was not cleared after apply'
+pass 'generation-bearing refused identities are re-derived before comparison'
+
 # A 1.63.0-shaped followed entry has no stamp, but its applied identity and
 # origin ledger still recover the accepted generation before comparison.
 reset_incoming

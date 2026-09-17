@@ -123,6 +123,9 @@ hinted update to the refused version makes it present and clears the refusal. A
 registry outage is therefore retryable with the same signed file. Once complete, unchanged daily
 runs return 0 with one quiet info line, no registry calls and no import
 prescription. Verification still runs.
+Generation-bearing refused identities are re-evaluated against the incoming
+generation on every run; refusal memory short-circuits only entries whose local
+generation is absent and cannot be compared.
 A newer signed generation starts fresh applied and refused sets. After upgrading,
 the first follow derives a missing `followed_generation` when `followed_from`
 and the matching applied identity identify a prior followed entry. An entry
