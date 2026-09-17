@@ -243,7 +243,7 @@ Scan results and SBOMs:
 
 ### Running Tests
 
-Run the hermetic contributor gate with:
+Run the contributor and release gate with:
 
 ```sh
 bash tests/run-all.sh
@@ -253,8 +253,12 @@ The runner creates and removes a temporary HOME, XDG config/data/state/cache
 roots, GnuPG home, and safe config/data/run/cache directories before starting
 any suite. Every standalone suite applies the same setup through
 `tests/lib/test-isolation.sh`; a contract check fails if a suite loses that
-helper or call. The `tests/live/` probes are excluded from this aggregate and
-remain opt-in because they require installed tools or network services.
+helper, marker, or call. The four live npm/Composer/shim probes stay in this
+aggregate and set `SAFE_TEST_ISOLATION_KEEP_TOOLS=1` themselves so they retain
+real installed tools and mise shims on PATH. That opt preserves tool discovery
+and mise roots only; HOME, XDG, and SAFE state remain scratch-isolated. The
+socket-envelope and syft probes remain opt-in because they require their own
+live services or installed tools.
 
 To run one suite, invoke it directly; it creates its own temporary environment
 before any fixture code runs:

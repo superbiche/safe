@@ -60,9 +60,15 @@ safe_test_assert_isolated_paths() {
 }
 
 safe_test_setup_isolation() {
-  local parent_tmp root
+  local parent_tmp root original_home original_path original_mise_config
+  local original_mise_data original_mise_cache
+  original_home="${HOME:-$(safe_test_real_home)}"
+  original_path="${PATH:-/usr/local/bin:/usr/bin:/bin}"
+  original_mise_config="${MISE_CONFIG_DIR:-}"
+  original_mise_data="${MISE_DATA_DIR:-}"
+  original_mise_cache="${MISE_CACHE_DIR:-}"
   # run-all exports its original HOME so child suites can guard against it.
-  SAFE_TEST_INVOKING_HOME="${SAFE_TEST_INVOKING_HOME:-$(safe_test_real_home)}"
+  SAFE_TEST_INVOKING_HOME="${SAFE_TEST_INVOKING_HOME:-$original_home}"
   export SAFE_TEST_INVOKING_HOME
 
   parent_tmp="${TMPDIR:-/tmp}"
@@ -99,11 +105,18 @@ safe_test_setup_isolation() {
   export SAFE_AUDIT_IOC_ROOT="$root/ioc-root"
   export SAFE_AUDIT_SETUP_VALIDATE_PATH="$root/validate"
 
-  # mise is consulted by several real-tool probes; keep its config and cache
-  # outside the invoking HOME even when the caller has a configured mise.
-  export MISE_CONFIG_DIR="$root/mise/config"
-  export MISE_DATA_DIR="$root/mise/data"
-  export MISE_CACHE_DIR="$root/mise/cache"
+  # Live npm/composer/shim probes opt into real tool discovery explicitly. That
+  # opt preserves PATH and mise roots, while every HOME/XDG/SAFE root remains
+  # scratch-isolated. All other suites get a clean tool lookup and mise state.
+  if [[ "${SAFE_TEST_ISOLATION_KEEP_TOOLS:-0}" == "1" ]]; then
+    export MISE_CONFIG_DIR="${original_mise_config:-$original_home/.config/mise}"
+    export MISE_DATA_DIR="${original_mise_data:-$original_home/.local/share/mise}"
+    export MISE_CACHE_DIR="${original_mise_cache:-$original_home/.cache/mise}"
+  else
+    export MISE_CONFIG_DIR="$root/mise/config"
+    export MISE_DATA_DIR="$root/mise/data"
+    export MISE_CACHE_DIR="$root/mise/cache"
+  fi
 
   mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" \
     "$XDG_CACHE_HOME" "$GNUPGHOME" "$SAFE_CONFIG_DIR" "$SAFE_DATA_DIR" \
@@ -118,9 +131,13 @@ safe_test_setup_isolation() {
 
   export TMPDIR="$root/tmp"
   mkdir -p "$TMPDIR"
-  # Do not inherit user-installed safe wrappers or version-manager shims. The
-  # suites add their own fixture bins explicitly, and system tools remain.
-  export PATH="$root/bin:/usr/local/bin:/usr/bin:/bin"
+  # Default mode does not inherit user-installed safe wrappers or version-manager
+  # shims. The keep-tools opt below is reserved for the four live tool probes.
+  if [[ "${SAFE_TEST_ISOLATION_KEEP_TOOLS:-0}" == "1" ]]; then
+    export PATH="$root/bin:$original_path"
+  else
+    export PATH="$root/bin:/usr/local/bin:/usr/bin:/bin"
+  fi
   export GOFLAGS="${GOFLAGS:+$GOFLAGS }-buildvcs=false"
   safe_test_assert_isolated_paths || return 1
   trap 'safe_test_cleanup' EXIT

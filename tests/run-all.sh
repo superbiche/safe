@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Parallel suite runner. Every suite is scratch-isolated (own mktemp dirs,
-# mocked PATH), so they run concurrently: wall-clock is the slowest suite,
-# not the sum. SAFE_TEST_JOBS caps concurrency (default: nproc).
+# Parallel suite runner. Every suite is scratch-isolated (own mktemp dirs);
+# default suites use a clean PATH and live tool probes opt into real tools, so
+# they run concurrently: wall-clock is the slowest suite, not the sum.
 #
-# Excluded by design: tests/live/* are opt-in probes against installed tools or
-# network services, and the CVSS development helpers need a bootstrapped oracle.
-# The hermetic suites remain the one-command contributor gate.
+# Excluded by design: audit/cvss4_exhaustive.sh and audit/fetch_cvss4_ref.sh
+# — development cross-checks that need the FIRST oracle bootstrapped into
+# tmp/cvss4-ref/; the committed known-answer suite covers the scorer.
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -16,6 +16,10 @@ safe_test_setup_isolation || exit 1
 
 SUITES=(
   tests/go/run.sh
+  tests/live/npm_config_oracle.sh
+  tests/live/npm_abbrev_oracle.sh
+  tests/live/composer_abbrev_oracle.sh
+  tests/live/shim_delegation.sh
   tests/install/run.sh
   tests/install/socket_command_consent.sh
   tests/install/gate_adverse_warn_override.sh
@@ -53,10 +57,6 @@ EXCLUDED=(
   tests/audit/fetch_cvss4_ref.sh    # dev bootstrap helper for that oracle
   tests/live/socket_envelope.sh     # opt-in live network probe, excluded per its own header
   tests/live/syft_exclude_oracle.sh # opt-in live probe needing an installed syft, excluded per its own header
-  tests/live/npm_config_oracle.sh   # opt-in live npm behavior probe
-  tests/live/npm_abbrev_oracle.sh   # opt-in live npm behavior probe
-  tests/live/composer_abbrev_oracle.sh # opt-in live Composer behavior probe
-  tests/live/shim_delegation.sh     # opt-in live installed-shim probe
   tests/lib/test-isolation.sh       # shared HOME/state isolation helper, not a suite
   tests/lib/safe-core.sh            # shared helper, not a suite
   tests/lib/real-tool.sh            # shared helper (real-toolchain resolver), not a suite
