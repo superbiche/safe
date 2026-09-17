@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.64.1 - 2026-09-17
+
 - Re-derive generation-bearing follow refusals before each comparison, while
   keeping equal and older generations refused; empty local versions now fail
   closed without blocking valid sibling entries.
