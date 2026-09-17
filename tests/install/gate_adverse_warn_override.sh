@@ -10,6 +10,11 @@
 
 set -uo pipefail
 
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 pass() { printf 'ok - %s\n' "$*"; }
@@ -25,7 +30,7 @@ source "$ROOT/lib/gate-lib.sh" || fail "could not source gate-lib.sh"
 pass "sourced gate-lib.sh"
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$tmp\""
 LOGF="$tmp/log.txt"
 
 # --- shared stubs: an adverse WARN (exit 10), no pre-existing host-allow -------

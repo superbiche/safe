@@ -15,6 +15,11 @@
 
 set -euo pipefail
 
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SAFE_RUN="$ROOT/bin/safe-run"
 SAFE_AUDIT="$ROOT/bin/safe-audit"
@@ -33,7 +38,7 @@ bash -n "$GATE_LIB"
 pass "bash syntax"
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$tmp\""
 
 # Canonical store lives under a fake HOME so the suite never touches the real
 # ~/.config/safe. REDIR is a non-canonical root an "attacker" would supply.

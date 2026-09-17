@@ -5,6 +5,12 @@
 # cannot represent.
 set -uo pipefail
 
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+export SAFE_TEST_ISOLATION_KEEP_TOOLS=1
+safe_test_setup_isolation || exit 1
+
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 SAFE_RUN="$ROOT/bin/safe-run"
 PASS=0
@@ -58,7 +64,7 @@ if (( found != 3 )); then
   fail "partial gate surface: missing ${missing[*]}"
 else
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/safe-live-shim-delegation.XXXXXX") || exit 1
-  trap 'rm -rf -- "$WORK"' EXIT
+  safe_test_compose_exit_trap "rm -rf -- \"\$WORK\""
 
   # A marked wrapper remains gate-bound through a symlink at the requested
   # tool name. This models a version-manager shim without duplicating the

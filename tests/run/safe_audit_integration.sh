@@ -2,6 +2,11 @@
 
 set -euo pipefail
 
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
+
 # #87: this suite drives trust writes/grants through a redirected config root
 # for hermeticity; bless it as authoritative so the trust-redirect guard is a
 # no-op here. The guard's own behavior lives in tests/run/trust_store_redirect.sh.
@@ -31,7 +36,7 @@ pass "bash syntax"
 pass "no unpinned npx safe-audit preflight in bin/safe-run"
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$tmp\""
 
 mockbin="$tmp/mockbin"
 mkdir -p "$mockbin"

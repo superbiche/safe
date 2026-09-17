@@ -241,6 +241,51 @@ Scan results and SBOMs:
 
 ## Maintenance Checks
 
+### Running Tests
+
+Run the contributor and release gate with:
+
+```sh
+bash tests/run-all.sh
+```
+
+The runner creates and removes a temporary HOME, XDG config/data/state/cache
+roots, GnuPG home, and safe config/data/run/cache directories before starting
+any suite. Every standalone suite applies the same setup through
+`tests/lib/test-isolation.sh`; a contract check fails if a suite loses that
+helper, marker, or call. The four live npm/Composer/shim probes stay in this
+aggregate and set `SAFE_TEST_ISOLATION_KEEP_TOOLS=1` themselves so they retain
+the real installed tools and mise shims on the original PATH. The npm probes
+need a real npm (and the abbreviation probe needs its matching Node and global
+npm command map), the Composer probe needs a real Composer, and the shim probe
+needs the operator's gate-bound npm, Go, and mise targets. They are read-only
+probes and may need network only where the real tool requires it. The opt
+preserves those tool paths and mise roots only; HOME, XDG, SAFE state,
+package-manager caches, and user/global config files remain scratch-isolated.
+An inherited npm prefix may remain so npm can identify its installed tree; it
+is not a cache or config write target. The socket-envelope and syft probes
+remain opt-in because they require their own live services or installed tools.
+On a machine whose only npm is a gate-bound target, both npm oracles skip under
+the isolated gate: the config oracle has no real non-wrapper npm, and the
+abbreviation oracle cannot obtain a usable global prefix. This is a known
+live-coverage gap.
+
+For a before/after sentinel run, hash the real `MISE_CONFIG_DIR`,
+`MISE_DATA_DIR`, and `MISE_CACHE_DIR` trees as well as the safe config/data
+files. The four live probes inspect those real tool roots for discovery, so a
+clean sentinel requires the mise hashes to remain identical.
+
+To run one suite, invoke it directly; it creates its own temporary environment
+before any fixture code runs:
+
+```sh
+bash tests/audit/smoke.sh
+```
+
+The runtime guard aborts with a `safe-test: FATAL` message if a safe config,
+data, state, or guarded SAFE path resolves below the HOME that invoked the
+suite.
+
 Before committing documentation or shell changes, run the smoke checks that match the touched area:
 
 ```bash

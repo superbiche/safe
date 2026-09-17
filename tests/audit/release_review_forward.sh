@@ -12,6 +12,11 @@
 
 set -euo pipefail
 
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SAFE_AUDIT="$ROOT/bin/safe-audit"
 
@@ -24,7 +29,7 @@ command -v jq >/dev/null 2>&1 || { printf 'not ok - missing required command: jq
 command -v sha256sum >/dev/null 2>&1 || { printf 'not ok - missing required command: sha256sum\n' >&2; exit 1; }
 
 TEST_ROOT="$(mktemp -d)"
-trap 'rm -rf "$TEST_ROOT"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$TEST_ROOT\""
 
 bash -n "$SAFE_AUDIT"
 pass "safe-audit syntax"

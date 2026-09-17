@@ -2,6 +2,11 @@
 
 set -euo pipefail
 
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SAFE_AUDIT="$ROOT/bin/safe-audit"
 INSTALL="$ROOT/install.sh"
@@ -56,7 +61,7 @@ grep -q 'binary_audit_subcmds=(release-review)' "$ROOT/lib/completions/_safe" ||
 pass "completion output"
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$tmp\""
 
 audit_version="$("$SAFE_AUDIT" --version | awk '{print $NF}')"
 capabilities_json="$(

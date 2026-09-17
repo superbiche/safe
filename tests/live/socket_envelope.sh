@@ -6,6 +6,11 @@
 
 set -euo pipefail
 
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
+
 if ! command -v socket >/dev/null 2>&1; then
   printf 'SKIP socket_envelope: socket CLI is unavailable\n'
   exit 0
@@ -22,7 +27,7 @@ if ! command -v timeout >/dev/null 2>&1; then
 fi
 
 scratch="$(mktemp -d)"
-trap 'rm -rf "$scratch"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$scratch\""
 result="$scratch/socket.json"
 error="$scratch/socket.stderr"
 

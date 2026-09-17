@@ -2,9 +2,14 @@
 # Report the evidence behind a decision, including a replay of cached data.
 # Hermetic: scanner artifacts are fixtures; no scanner or network is invoked.
 set -euo pipefail
+
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_ROOT=$(mktemp -d)
-trap 'rm -rf "$TEST_ROOT"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$TEST_ROOT\""
 export SAFE_AUDIT_CONFIG_DIR="$TEST_ROOT/config" SAFE_AUDIT_DATA_DIR="$TEST_ROOT/data"
 set -- --version
 source "$ROOT/bin/safe-audit" >/dev/null

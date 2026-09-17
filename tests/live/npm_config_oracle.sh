@@ -22,6 +22,12 @@
 # single-shape. Do not "fix" this suite to chase the live gate's npm.
 set -uo pipefail
 
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+export SAFE_TEST_ISOLATION_KEEP_TOOLS=1
+safe_test_setup_isolation || exit 1
+
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 PASS=0
 FAIL=0
@@ -50,7 +56,7 @@ fi
 printf '# npm oracle target: %s (%s)\n' "${real_npm}" "$("${real_npm}" --version 2>/dev/null || printf 'version unknown')"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/safe-live-npm.XXXXXX")" || exit 1
-trap 'rm -rf -- "${WORK}"' EXIT
+safe_test_compose_exit_trap "rm -rf -- \"\${WORK}\""
 printf '{"name":"live-oracle","version":"1.0.0"}\n' > "${WORK}/package.json"
 
 # shellcheck source=/dev/null

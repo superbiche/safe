@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 set -u
 
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
+# These cases assert install defaults relative to each case's HOME and set
+# explicit SAFE_* paths only where a case is testing an override.
+unset SAFE_CONFIG_DIR SAFE_DATA_DIR SAFE_RUN_CONFIG_DIR SAFE_RUN_DATA_DIR \
+  SAFE_AUDIT_CONFIG_DIR SAFE_AUDIT_DATA_DIR SAFE_AUDIT_BIN_DIR \
+  SAFE_AUDIT_SCANNER_DIR SAFE_AUDIT_SOCKET_CACHE_DIR SAFE_BIN_DIR \
+  SAFE_ZSH_COMPLETION_DIR SAFE_RUN_SEED_DIR
+unset MISE_CONFIG_DIR MISE_DATA_DIR MISE_CACHE_DIR
+
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 # The repo VERSION, read once. Fixtures that need the CURRENT version must
 # derive it here: hard-coding it makes every release bump a false failure.
@@ -32,7 +44,7 @@ fi
 cleanup() {
   rm -rf "${TEST_ROOT}"
 }
-trap cleanup EXIT
+safe_test_compose_exit_trap cleanup
 
 fail() {
   printf 'not ok - %s\n' "$1" >&2

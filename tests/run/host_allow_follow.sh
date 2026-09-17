@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Signed fleet replication. All state, keys and registry responses are fixtures.
 set -euo pipefail
+
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SAFE_RUN="$ROOT/bin/safe-run"
 pass() { printf 'ok - %s\n' "$*"; }
@@ -18,7 +23,7 @@ cleanup() {
   gpgconf --homedir "$tmp/gnupg" --kill gpg-agent >/dev/null 2>&1 || true
   rm -rf -- "$tmp"
 }
-trap cleanup EXIT
+safe_test_compose_exit_trap cleanup
 export HOME="$tmp/home" GNUPGHOME="$tmp/gnupg"
 export SAFE_RUN_CONFIG_DIR="$HOME/.config/safe/run" SAFE_RUN_DATA_DIR="$tmp/data"
 export SAFE_AUDIT_DATA_DIR="$tmp/audit" SAFE_RUN_TRUST_OVERRIDE=0 SAFE_RUN_NO_INIT=0

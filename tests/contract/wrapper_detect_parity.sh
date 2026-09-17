@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
 # Regression: the belt's `real_tool_is_wrapper` (tests/lib/real-tool.sh) must
 # agree with the gate's `safe_gate_is_wrapper` (lib/gate-lib.sh) on what a safe
 # gate wrapper is. They are deliberately SEPARATE copies — the parity belt must
@@ -32,7 +37,7 @@ check_parity() {
 }
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$tmp\""
 
 printf '# safe-gate-wrapper v1 tool=go\nexec safe gate go -- "$@"\n' > "$tmp/l1"
 check_parity "marker on line 1 is a wrapper" "$tmp/l1"

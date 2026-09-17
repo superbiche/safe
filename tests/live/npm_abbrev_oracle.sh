@@ -4,6 +4,12 @@
 # only reports its global prefix and Node only imports cmd-list.js.
 set -uo pipefail
 
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+export SAFE_TEST_ISOLATION_KEEP_TOOLS=1
+safe_test_setup_isolation || exit 1
+
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 PASS=0
 FAIL=0
@@ -27,7 +33,10 @@ if ! command -v node >/dev/null 2>&1; then
   exit 0
 fi
 
-prefix="$("$real_npm" prefix -g 2>/dev/null || true)"
+if ! prefix="$(safe_test_npm_global_prefix "$real_npm")"; then
+  printf '%s\n' "$prefix"
+  exit 0
+fi
 cmd_list="${prefix%/}/lib/node_modules/npm/lib/utils/cmd-list.js"
 if [[ ! -r "$cmd_list" ]]; then
   fail "npm command map is unavailable at the delegate's global prefix"
@@ -36,7 +45,7 @@ if [[ ! -r "$cmd_list" ]]; then
 fi
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/safe-live-npm-abbrev.XXXXXX") || exit 1
-trap 'rm -rf -- "$WORK"' EXIT
+safe_test_compose_exit_trap "rm -rf -- \"\$WORK\""
 
 safe_gate_npm_dispatch_snapshot | LC_ALL=C sort > "$WORK/shipped"
 if ! node - "$cmd_list" > "$WORK/installed" <<'NODE'

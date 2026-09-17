@@ -7,6 +7,11 @@
 # silently change the oracle.
 set -euo pipefail
 
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 REF="${CVSS4_REF_DIR:-$ROOT/tmp/cvss4-ref}"
 SHA="c5b0d409ae9f57c44264c6ce5f27d89298e1d32a"

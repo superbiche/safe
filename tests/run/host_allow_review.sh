@@ -3,6 +3,12 @@
 
 set -euo pipefail
 
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
+unset SAFE_AUDIT_CONFIG_DIR
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SAFE_RUN="$ROOT/bin/safe-run"
 
@@ -20,17 +26,17 @@ bash -n "$SAFE_RUN"
 pass "bash syntax"
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$tmp\""
 
 # The repo tree is kept deliberately: the digest used to land in its inbox, and
 # every digest case below asserts that nothing is written here any more.
-mkdir -p "$tmp/config" "$tmp/data" "$tmp/audit-data" "$tmp/bin" \
+mkdir -p "$tmp/config/run" "$tmp/data/run" "$tmp/audit-data" "$tmp/bin" \
   "$tmp/safe-config" "$tmp/repo/.git" "$tmp/repo/bin" "$tmp/repo/inbox"
 
 digest_json="$tmp/safe-config/audit/host-allow-digest.json"
 digest_md="$tmp/safe-config/audit/host-allow-digest.md"
 
-cat > "$tmp/config/host-allow.json" <<'JSON'
+cat > "$tmp/config/run/host-allow.json" <<'JSON'
 {"packages":{
   "clean-pkg":{"version":"2.1.4","sha":"a","ecosystem":"npm","added":"2026-07-01","reason":"was catch-22"},
   "warn-pkg":{"version":"1.3.0","sha":"b","ecosystem":"npm","added":"2026-05-01","reason":"real warn"},
@@ -46,7 +52,7 @@ cat > "$tmp/audit-data/host-allow-log.jsonl" <<'JSON'
 {"timestamp":"2026-07-30T10:00:00+02:00","package":"clean-pkg","version":"2.1.4","runner":"npx"}
 {"timestamp":"2026-08-01T11:00:00+02:00","package":"clean-pkg","version":"2.1.4","runner":"npx"}
 JSON
-cat > "$tmp/data/audit.log" <<'LOG'
+cat > "$tmp/data/run/audit.log" <<'LOG'
 2026-08-01T11:00:00+02:00 | npx | clean-pkg@2.1.4 | HOST_ALLOW | non-tty | OK
 2026-08-02T09:00:00+02:00 | install:npm | warn-pkg@1.3.0 | GATE | non-tty | HOST_ALLOW_OVERRIDE
 LOG
@@ -72,15 +78,15 @@ chmod +x "$tmp/bin/safe-audit-stub"
 # the derivation is what these cases have to exercise. SAFE_REPO_DIR is gone —
 # the digest no longer knows what a repo is.
 run_safe_run() {
-  SAFE_RUN_CONFIG_DIR="$tmp/config" \
-  SAFE_RUN_DATA_DIR="$tmp/data" \
+  SAFE_CONFIG_DIR="$tmp/config" \
+  SAFE_DATA_DIR="$tmp/data" \
+  SAFE_AUDIT_CONFIG_DIR="${SAFE_AUDIT_CONFIG_DIR:-$tmp/safe-config/audit}" \
   SAFE_AUDIT_DATA_DIR="$tmp/audit-data" \
-  SAFE_CONFIG_DIR="$tmp/safe-config" \
   SAFE_AUDIT_BIN="$tmp/bin/safe-audit-stub" \
   SAFE_HOST_ALLOW_REVIEW_TIMEOUT=1 \
   SAFE_RUN_NO_INIT=1 \
   STUB_CALL_LOG="$tmp/stub-calls.log" \
-    "$SAFE_RUN" "$@"
+    env -u SAFE_RUN_CONFIG_DIR -u SAFE_RUN_DATA_DIR "$SAFE_RUN" "$@"
 }
 
 run_review() {
@@ -171,7 +177,7 @@ pass "each run replaces the digest"
 
 # Nothing actionable still writes: a review that found nothing has to clear
 # yesterday's findings, or status keeps reporting decisions that are gone.
-cat > "$tmp/config/host-allow.json" <<'JSON'
+cat > "$tmp/config/run/host-allow.json" <<'JSON'
 {"packages":{
   "warn-pkg":{"version":"1.3.0","sha":"b","ecosystem":"npm","added":"2026-05-01","reason":"real warn"},
   "infra-pkg":{"version":"1.0.0","sha":"d","ecosystem":"npm","added":"2026-06-15","reason":"socket down"}
@@ -186,12 +192,12 @@ pass "a review with nothing actionable still writes the digest, with zero counts
 # The shape the weekly timer hits on a brand-new machine: no host-allow store
 # at all. It must produce a valid zero digest — that machine is exactly where
 # the old repo-inbox destination produced nothing.
-mv "$tmp/config/host-allow.json" "$tmp/host-allow.json.keep"
+mv "$tmp/config/run/host-allow.json" "$tmp/host-allow.json.keep"
 run_review --digest >/dev/null 2>&1 || fail "--digest failed with no host-allow store"
 jq -e '.summary.total == 0 and (.entries | length) == 0' "$digest_json" >/dev/null \
   || fail "empty-store digest is not a zero report: $(jq -c '.summary' "$digest_json")"
 grep -q '^0 entries' "$digest_md" || fail "empty-store digest markdown missing its zero summary"
-mv "$tmp/host-allow.json.keep" "$tmp/config/host-allow.json"
+mv "$tmp/host-allow.json.keep" "$tmp/config/run/host-allow.json"
 pass "a machine with no host-allow store still gets a valid zero digest"
 
 # Each half is staged beside its target and renamed — a reader never sees a
@@ -201,14 +207,14 @@ residue=$(find "$tmp/safe-config/audit" -name 'host-allow-digest.*.??????' -prin
 pass "digest writes leave no staging residue"
 
 # --- status renders the digest --------------------------------------------
-printf '{"runners":{}}\n' > "$tmp/config/config.json"
+printf '{"runners":{}}\n' > "$tmp/config/run/config.json"
 out=$(run_safe_run status 2>/dev/null)
 grep -q "review digest:  nothing actionable (reviewed " <<<"$out" \
   || fail "status missing the quiet digest line: $out"
 pass "status reports a digest with nothing actionable"
 
 # Back to the actionable set, so status has counts to report.
-cat > "$tmp/config/host-allow.json" <<'JSON'
+cat > "$tmp/config/run/host-allow.json" <<'JSON'
 {"packages":{
   "clean-pkg":{"version":"2.1.4","sha":"a","ecosystem":"npm","added":"2026-07-01","reason":"was catch-22"},
   "block-pkg":{"version":"0.0.1","sha":"c","ecosystem":"npm","added":"2026-06-01","reason":"went bad"}
@@ -238,9 +244,9 @@ pass "status stops reporting a removed entry"
 # Removing something the digest never carried is a no-op, never a failure:
 # the digest is a convenience surface and must not be able to fail a removal.
 run_safe_run host-allow remove block-pkg >/dev/null 2>&1 || fail "removal failed"
-mv "$tmp/config/host-allow.json" "$tmp/config/host-allow.json.bak"
+mv "$tmp/config/run/host-allow.json" "$tmp/config/run/host-allow.json.bak"
 printf '{"packages":{"never-reviewed":{"version":"1.0.0","sha":"z","ecosystem":"npm","added":"2026-07-01","reason":"x"}}}\n' \
-  > "$tmp/config/host-allow.json"
+  > "$tmp/config/run/host-allow.json"
 run_safe_run host-allow remove never-reviewed >/dev/null 2>&1 || fail "removal of an unreviewed entry failed"
 pass "removing an entry the digest never carried is a no-op"
 
@@ -257,7 +263,7 @@ grep -q "review digest:  no review has run yet" <<<"$out" || fail "status missin
 pass "status says so when no review has run"
 
 # A review WITHOUT --digest writes nothing.
-mv "$tmp/config/host-allow.json.bak" "$tmp/config/host-allow.json"
+mv "$tmp/config/run/host-allow.json.bak" "$tmp/config/run/host-allow.json"
 run_review --json >/dev/null 2>&1
 [[ ! -e "$digest_json" ]] || fail "review without --digest wrote a digest"
 pass "review without --digest writes no digest"
@@ -267,7 +273,7 @@ pass "review without --digest writes no digest"
 # derivation, exactly as safe-audit resolves its own config root. One redirect
 # has to move a whole installation, and the digest must not be the piece left
 # behind in the default location.
-cat > "$tmp/config/host-allow.json" <<'JSON'
+cat > "$tmp/config/run/host-allow.json" <<'JSON'
 {"packages":{
   "clean-pkg":{"version":"2.1.4","sha":"a","ecosystem":"npm","added":"2026-07-01","reason":"was catch-22"},
   "block-pkg":{"version":"0.0.1","sha":"c","ecosystem":"npm","added":"2026-06-01","reason":"went bad"}
@@ -331,7 +337,7 @@ remove_err="$tmp/remove-unwritable-err"
 run_safe_run host-allow remove clean-pkg >/dev/null 2>"$remove_err" \
   || { chmod 0755 "$tmp/safe-config/audit"; fail "removal failed because the digest was unwritable"; }
 chmod 0755 "$tmp/safe-config/audit"
-jq -e '.packages | has("clean-pkg") | not' "$tmp/config/host-allow.json" >/dev/null \
+jq -e '.packages | has("clean-pkg") | not' "$tmp/config/run/host-allow.json" >/dev/null \
   || fail "entry survived a removal whose digest update failed"
 grep -q "the digest is stale until" "$remove_err" || fail "removal did not disclose the stale digest: $(cat "$remove_err")"
 if grep -q 'No such file or directory' "$remove_err"; then
@@ -342,7 +348,7 @@ residue=$(find "$tmp/safe-config/audit" -name 'host-allow-digest.*.??????' -prin
 pass "an unwritable digest cannot fail a removal, and says the digest is stale"
 
 # --- probe payload corroboration (F2) -------------------------------------
-cat > "$tmp/config/host-allow.json" <<'JSON'
+cat > "$tmp/config/run/host-allow.json" <<'JSON'
 {"packages":{
   "empty-pkg":{"version":"1.0.0","sha":"f","ecosystem":"npm","added":"2026-07-01","reason":"probe lies"},
   "garbage-pkg":{"version":"2.0.0","sha":"g","ecosystem":"npm","added":"2026-07-01","reason":"probe garbage"}
@@ -354,7 +360,7 @@ pass "exit 0 without corroborating GO payload is unknown"
 [[ "$(status_of garbage-pkg)" == "unknown" ]] || fail "exit-20 probe with garbage stdout must be unknown"
 pass "exit 20 without corroborating BLOCK payload is unknown"
 
-cat > "$tmp/config/host-allow.json" <<'JSON'
+cat > "$tmp/config/run/host-allow.json" <<'JSON'
 {"packages":{
   "contradict-pkg":{"version":"1.0.0","sha":"h","ecosystem":"npm","added":"2026-07-01","reason":"go with causes"}
 }}
@@ -383,7 +389,7 @@ pass "review does not seed trust, audit, or digest state (no SAFE_RUN_NO_INIT)"
 # --- chronological last_used across offsets (F3) --------------------------
 # Append order is chronological; the second line is the later instant
 # (01:15Z) but the lexically smaller string. A lexical max would pick line 1.
-cat > "$tmp/config/host-allow.json" <<'JSON'
+cat > "$tmp/config/run/host-allow.json" <<'JSON'
 {"packages":{
   "clean-pkg":{"version":"2.1.4","sha":"a","ecosystem":"npm","added":"2026-07-01","reason":"dst pair"}
 }}
@@ -392,7 +398,7 @@ cat > "$tmp/audit-data/host-allow-log.jsonl" <<'JSON'
 {"timestamp":"2026-10-25T02:30:00+02:00","package":"clean-pkg","version":"2.1.4","runner":"npx"}
 {"timestamp":"2026-10-25T02:15:00+01:00","package":"clean-pkg","version":"2.1.4","runner":"npx"}
 JSON
-: >| "$tmp/data/audit.log"
+: >| "$tmp/data/run/audit.log"
 report=$(run_review --json)
 last=$(jq -r '.entries[0].last_used' <<<"$report")
 [[ "$last" == "2026-10-25T02:15:00+01:00" ]] || fail "last_used picked lexical, not chronological: $last"
@@ -410,7 +416,7 @@ last=$(jq -r '.entries[0].last_used' <<<"$report")
 pass "last_used survives out-of-order appends"
 
 # --- malformed entries degrade, not abort (F4) ----------------------------
-cat > "$tmp/config/host-allow.json" <<'JSON'
+cat > "$tmp/config/run/host-allow.json" <<'JSON'
 {"packages":{
   "broken-entry":"not an object",
   "block-pkg":{"version":"0.0.1","sha":"c","ecosystem":"npm","added":"2026-06-01","reason":"went bad"}
@@ -421,7 +427,7 @@ report=$(run_review --json)
 [[ "$(status_of block-pkg)" == "review-urgent" ]] || fail "entries after a malformed one must still be classified"
 pass "malformed entry degrades to unknown; the rest of the list survives"
 
-cat > "$tmp/config/host-allow.json" <<'JSON'
+cat > "$tmp/config/run/host-allow.json" <<'JSON'
 {"packages":"nope"}
 JSON
 if run_review --json >/dev/null 2>"$tmp/malformed-err"; then

@@ -8,14 +8,19 @@
 # toolchain is a failure, not a skip: an unrun belt must read red.
 set -eu
 
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
+
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 
 # Resolve the real go toolchain, never safe's own gate wrapper — the belt must
 # not route `go vet`/`go test` through the live gate (real-tool.sh).
 # shellcheck source=tests/lib/real-tool.sh
 source "${ROOT}/tests/lib/real-tool.sh"
-if ! GO="$(real_tool go)"; then
-  if command -v go >/dev/null 2>&1; then
+if ! GO="$(PATH="${SAFE_TEST_ORIGINAL_PATH:-$PATH}" real_tool go)"; then
+  if PATH="${SAFE_TEST_ORIGINAL_PATH:-$PATH}" command -v go >/dev/null 2>&1; then
     reason="go on PATH is only safe's gate wrapper, no real toolchain behind it"
   else
     reason="Go is unavailable"

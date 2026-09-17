@@ -8,6 +8,12 @@
 
 set -euo pipefail
 
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
+unset AUBE_SECURITY_SCANNER
+
 # #87: seeds blocklist fixtures (incl. malformed) in a relocated
 # SAFE_RUN_CONFIG_DIR; bless it as authoritative so the blocklist-readability
 # check judges the redirected fixture rather than the canonical store. The
@@ -24,7 +30,7 @@ pass() { printf 'ok - %s\n' "$*"; PASS_COUNT=$((PASS_COUNT + 1)); }
 fail() { printf 'not ok - %s\n' "$*" >&2; FAIL_COUNT=$((FAIL_COUNT + 1)); }
 
 TEST_ROOT="$(mktemp -d)"
-trap 'rm -rf "$TEST_ROOT"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$TEST_ROOT\""
 
 MOCKBIN="$TEST_ROOT/mockbin"
 FIXDIR="$TEST_ROOT/fixtures"
