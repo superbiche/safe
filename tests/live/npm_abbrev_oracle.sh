@@ -33,7 +33,10 @@ if ! command -v node >/dev/null 2>&1; then
   exit 0
 fi
 
-prefix="$("$real_npm" prefix -g 2>/dev/null || true)"
+if ! prefix="$(safe_test_npm_global_prefix "$real_npm")"; then
+  safe_test_npm_global_prefix_skip_message
+  exit 0
+fi
 cmd_list="${prefix%/}/lib/node_modules/npm/lib/utils/cmd-list.js"
 if [[ ! -r "$cmd_list" ]]; then
   fail "npm command map is unavailable at the delegate's global prefix"

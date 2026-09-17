@@ -66,6 +66,42 @@ else
   fail 'hostile npm config path was not neutralized or rejected'
 fi
 
+npm_prefix_stub="$SAFE_TEST_ROOT/npm-prefix-stub"
+valid_npm_prefix="$SAFE_TEST_ROOT/valid-npm-prefix"
+cat > "$npm_prefix_stub" <<'STUB'
+#!/usr/bin/env bash
+if [[ $# -ge 2 && "$1" == prefix && "$2" == -g ]]; then
+  if [[ "$PREFIX_MODE" == blocked ]]; then
+    printf 'safe: BLOCKED npm — safe gate library not found\n'
+    exit 100
+  fi
+  printf '%s\n' "$PREFIX_PATH"
+  exit 0
+fi
+exit 2
+STUB
+chmod +x "$npm_prefix_stub"
+mkdir -p "$valid_npm_prefix"
+
+if PREFIX_MODE=blocked PREFIX_PATH="$valid_npm_prefix" \
+  safe_test_npm_global_prefix "$npm_prefix_stub" >/dev/null; then
+  fail 'gate-bound npm refusal was treated as a usable prefix'
+elif [[ "$(safe_test_npm_global_prefix_skip_message)" == \
+  'SKIP: npm delegate is gate-bound and refuses under the scratch HOME; live abbreviation oracle skipped' ]]; then
+  pass 'gate-bound npm refusal selects the exact abbreviation-oracle SKIP'
+else
+  fail 'gate-bound npm refusal did not select the exact abbreviation-oracle SKIP'
+fi
+
+if prefix="$(PREFIX_MODE=valid PREFIX_PATH="$valid_npm_prefix" \
+  safe_test_npm_global_prefix "$npm_prefix_stub")" \
+  && [[ "$prefix" == "$valid_npm_prefix" ]] \
+  && [[ ! -r "$prefix/lib/node_modules/npm/lib/utils/cmd-list.js" ]]; then
+  pass 'a valid prefix with no npm command map remains a failure condition'
+else
+  fail 'a valid prefix without cmd-list.js did not remain a failure condition'
+fi
+
 keep_home="$SAFE_TEST_ROOT/keep-tools-home"
 keep_tool="$keep_home/tools"
 mkdir -p "$keep_tool"

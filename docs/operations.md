@@ -265,6 +265,10 @@ package-manager caches, and user/global config files remain scratch-isolated.
 An inherited npm prefix may remain so npm can identify its installed tree; it
 is not a cache or config write target. The socket-envelope and syft probes
 remain opt-in because they require their own live services or installed tools.
+On a machine whose only npm is a gate-bound target, both npm oracles skip under
+the isolated gate: the config oracle has no real non-wrapper npm, and the
+abbreviation oracle cannot obtain a usable global prefix. This is a known
+live-coverage gap.
 
 For a before/after sentinel run, hash the real `MISE_CONFIG_DIR`,
 `MISE_DATA_DIR`, and `MISE_CACHE_DIR` trees as well as the safe config/data

@@ -17,6 +17,18 @@ safe_test_compose_exit_trap() {
   trap "${command}; safe_test_cleanup" EXIT
 }
 
+safe_test_npm_global_prefix() {
+  local tool="$1" output
+  output="$("$tool" prefix -g 2>&1)" || return 1
+  [[ "$output" != *'safe: BLOCKED'* ]] || return 1
+  [[ -d "$output" ]] || return 1
+  printf '%s\n' "$output"
+}
+
+safe_test_npm_global_prefix_skip_message() {
+  printf '%s\n' 'SKIP: npm delegate is gate-bound and refuses under the scratch HOME; live abbreviation oracle skipped'
+}
+
 safe_test_normalize_path() {
   local path="${1:-}"
   while [[ "$path" != "/" && "$path" == */ ]]; do
