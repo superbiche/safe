@@ -34,7 +34,7 @@ bash -n "$GATE_LIB"
 pass "bash syntax"
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$tmp\""
 
 mkdir -p "$tmp/config" "$tmp/data" "$tmp/audit-data" "$tmp/bin"
 printf '{"packages":{}}\n' > "$tmp/config/scripts-allow.json"

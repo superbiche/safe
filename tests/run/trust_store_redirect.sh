@@ -38,7 +38,7 @@ bash -n "$GATE_LIB"
 pass "bash syntax"
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$tmp\""
 
 # Canonical store lives under a fake HOME so the suite never touches the real
 # ~/.config/safe. REDIR is a non-canonical root an "attacker" would supply.

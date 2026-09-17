@@ -9,7 +9,7 @@ set -euo pipefail
 safe_test_setup_isolation || exit 1
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEST_ROOT=$(mktemp -d)
-trap 'rm -rf "$TEST_ROOT"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$TEST_ROOT\""
 export SAFE_AUDIT_CONFIG_DIR="$TEST_ROOT/config" SAFE_AUDIT_DATA_DIR="$TEST_ROOT/data"
 set -- --version
 source "$ROOT/bin/safe-audit" >/dev/null

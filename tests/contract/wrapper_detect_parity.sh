@@ -37,7 +37,7 @@ check_parity() {
 }
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$tmp\""
 
 printf '# safe-gate-wrapper v1 tool=go\nexec safe gate go -- "$@"\n' > "$tmp/l1"
 check_parity "marker on line 1 is a wrapper" "$tmp/l1"

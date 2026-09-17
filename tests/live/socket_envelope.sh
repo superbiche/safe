@@ -27,7 +27,7 @@ if ! command -v timeout >/dev/null 2>&1; then
 fi
 
 scratch="$(mktemp -d)"
-trap 'rm -rf "$scratch"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$scratch\""
 result="$scratch/socket.json"
 error="$scratch/socket.stderr"
 

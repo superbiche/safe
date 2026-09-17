@@ -8,7 +8,7 @@ set -uo pipefail
 safe_test_setup_isolation || exit 1
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$tmp\""
 fail() { printf 'not ok - %s\n' "$*" >&2; exit 1; }
 pass() { printf 'ok - %s\n' "$*"; }
 source "$ROOT/lib/gate-lib.sh"

@@ -29,7 +29,7 @@ pass() { printf 'ok - %s\n' "$*"; PASS_COUNT=$((PASS_COUNT + 1)); }
 fail() { printf 'not ok - %s\n' "$*" >&2; FAIL_COUNT=$((FAIL_COUNT + 1)); }
 
 TEST_ROOT="$(mktemp -d)"
-trap 'rm -rf "$TEST_ROOT"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$TEST_ROOT\""
 
 # --- the source itself ------------------------------------------------------
 

@@ -36,7 +36,7 @@ pass "bash syntax"
 pass "no unpinned npx safe-audit preflight in bin/safe-run"
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$tmp\""
 
 mockbin="$tmp/mockbin"
 mkdir -p "$mockbin"

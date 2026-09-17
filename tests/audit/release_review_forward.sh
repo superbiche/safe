@@ -29,7 +29,7 @@ command -v jq >/dev/null 2>&1 || { printf 'not ok - missing required command: jq
 command -v sha256sum >/dev/null 2>&1 || { printf 'not ok - missing required command: sha256sum\n' >&2; exit 1; }
 
 TEST_ROOT="$(mktemp -d)"
-trap 'rm -rf "$TEST_ROOT"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$TEST_ROOT\""
 
 bash -n "$SAFE_AUDIT"
 pass "safe-audit syntax"

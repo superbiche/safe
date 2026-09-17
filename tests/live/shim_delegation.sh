@@ -64,7 +64,7 @@ if (( found != 3 )); then
   fail "partial gate surface: missing ${missing[*]}"
 else
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/safe-live-shim-delegation.XXXXXX") || exit 1
-  trap 'rm -rf -- "$WORK"' EXIT
+  safe_test_compose_exit_trap "rm -rf -- \"\$WORK\""
 
   # A marked wrapper remains gate-bound through a symlink at the requested
   # tool name. This models a version-manager shim without duplicating the

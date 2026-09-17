@@ -34,7 +34,7 @@ pass() { printf 'ok - %s\n' "$*"; PASS_COUNT=$((PASS_COUNT + 1)); }
 fail() { printf 'not ok - %s\n' "$*" >&2; FAIL_COUNT=$((FAIL_COUNT + 1)); }
 
 TEST_ROOT="$(mktemp -d)"
-trap 'rm -rf "$TEST_ROOT"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$TEST_ROOT\""
 
 # The resolver's last resort is a list of standard install directories under
 # $HOME. Pointing HOME at an empty tree is what keeps this suite hermetic:

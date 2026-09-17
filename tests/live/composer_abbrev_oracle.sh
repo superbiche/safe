@@ -29,7 +29,7 @@ if [[ -z "$real_composer" ]]; then
 fi
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/safe-live-composer-abbrev.XXXXXX") || exit 1
-trap 'rm -rf -- "$WORK"' EXIT
+safe_test_compose_exit_trap "rm -rf -- \"\$WORK\""
 mkdir -p "$WORK/work" "$WORK/home"
 
 # Every real Composer probe runs from an empty project with global plugins,

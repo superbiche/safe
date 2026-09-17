@@ -23,7 +23,7 @@ cleanup() {
   gpgconf --homedir "$tmp/gnupg" --kill gpg-agent >/dev/null 2>&1 || true
   rm -rf -- "$tmp"
 }
-trap cleanup EXIT
+safe_test_compose_exit_trap cleanup
 export HOME="$tmp/home" GNUPGHOME="$tmp/gnupg"
 export SAFE_RUN_CONFIG_DIR="$HOME/.config/safe/run" SAFE_RUN_DATA_DIR="$tmp/data"
 export SAFE_AUDIT_DATA_DIR="$tmp/audit" SAFE_RUN_TRUST_OVERRIDE=0 SAFE_RUN_NO_INIT=0

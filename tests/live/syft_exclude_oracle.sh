@@ -30,7 +30,7 @@ fi
 bash -n "$ROOT/bin/safe-audit"
 
 scratch="$(mktemp -d)"
-trap 'rm -rf "$scratch"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$scratch\""
 
 # The scan root is itself a repository (root .git), holding: the project's own
 # package, a workspace package, a submodule, a config-ignored vendor/ tree, a

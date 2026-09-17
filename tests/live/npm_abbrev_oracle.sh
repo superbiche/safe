@@ -42,7 +42,7 @@ if [[ ! -r "$cmd_list" ]]; then
 fi
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/safe-live-npm-abbrev.XXXXXX") || exit 1
-trap 'rm -rf -- "$WORK"' EXIT
+safe_test_compose_exit_trap "rm -rf -- \"\$WORK\""
 
 safe_gate_npm_dispatch_snapshot | LC_ALL=C sort > "$WORK/shipped"
 if ! node - "$cmd_list" > "$WORK/installed" <<'NODE'

@@ -61,7 +61,7 @@ grep -q 'binary_audit_subcmds=(release-review)' "$ROOT/lib/completions/_safe" ||
 pass "completion output"
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$tmp\""
 
 audit_version="$("$SAFE_AUDIT" --version | awk '{print $NF}')"
 capabilities_json="$(

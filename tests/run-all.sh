@@ -3,10 +3,15 @@
 # default suites use a clean PATH and live tool probes opt into real tools, so
 # they run concurrently: wall-clock is the slowest suite, not the sum.
 #
-# Excluded by design: audit/cvss4_exhaustive.sh and audit/fetch_cvss4_ref.sh
-# — development cross-checks that need the FIRST oracle bootstrapped into
-# tmp/cvss4-ref/; the committed known-answer suite covers the scorer.
+# Excluded by design: the two CVSS development cross-checks need the FIRST
+# oracle bootstrapped into tmp/cvss4-ref/; the committed known-answer suite
+# covers the scorer. The socket and syft probes remain excluded per their own
+# headers; the four tool probes below are release-gate members.
 set -u
+
+# The live probes opt into real tool discovery themselves. Do not let an
+# ambient opt leak into the aggregate's non-live children.
+unset SAFE_TEST_ISOLATION_KEEP_TOOLS
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # SAFE_TEST_ISOLATION_MARKER: the aggregate runner owns the outer scratch tree.
@@ -81,7 +86,7 @@ if ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
   printf 'run-all: SAFE_TEST_JOBS must be a positive integer (got %s)\n' "$JOBS" >&2
   exit 2
 fi
-logdir=$(mktemp -d "${TMPDIR:-/tmp}/safe-tests.XXXXXX")
+logdir=$(mktemp -d "${SAFE_TEST_PARENT_TMPDIR:-/tmp}/safe-tests.XXXXXX")
 
 slug() { printf '%s' "$1" | tr '/' '_'; }
 
@@ -89,7 +94,7 @@ run_suite() {
   local suite="$1" log rc start elapsed
   log="$logdir/$(slug "$suite").log"
   start=$SECONDS
-  bash "$ROOT/$suite" > "$log" 2>&1
+  env -u SAFE_TEST_ISOLATION_KEEP_TOOLS bash "$ROOT/$suite" > "$log" 2>&1
   rc=$?
   elapsed=$(( SECONDS - start ))
   printf '%s\n%s\n' "$rc" "$elapsed" > "$logdir/$(slug "$suite").rc"

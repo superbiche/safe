@@ -26,7 +26,7 @@ if ! bash "$ROOT/tests/audit/fetch_cvss4_ref.sh" >/dev/null 2>&1; then
 fi
 
 TEST_ROOT="$(mktemp -d)"
-trap 'rm -rf "$TEST_ROOT"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$TEST_ROOT\""
 
 awk '
   /^JQ_SEVERITY_DEFS=/ { block++; capture = (block == 2); next }

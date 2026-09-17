@@ -30,7 +30,7 @@ source "$ROOT/lib/gate-lib.sh" || fail "could not source gate-lib.sh"
 pass "sourced gate-lib.sh"
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+safe_test_compose_exit_trap "rm -rf \"\$tmp\""
 LOGF="$tmp/log.txt"
 
 # --- shared stubs: an adverse WARN (exit 10), no pre-existing host-allow -------

@@ -56,7 +56,7 @@ fi
 printf '# npm oracle target: %s (%s)\n' "${real_npm}" "$("${real_npm}" --version 2>/dev/null || printf 'version unknown')"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/safe-live-npm.XXXXXX")" || exit 1
-trap 'rm -rf -- "${WORK}"' EXIT
+safe_test_compose_exit_trap "rm -rf -- \"\${WORK}\""
 printf '{"name":"live-oracle","version":"1.0.0"}\n' > "${WORK}/package.json"
 
 # shellcheck source=/dev/null

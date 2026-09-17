@@ -19,8 +19,8 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 # not route `go vet`/`go test` through the live gate (real-tool.sh).
 # shellcheck source=tests/lib/real-tool.sh
 source "${ROOT}/tests/lib/real-tool.sh"
-if ! GO="$(real_tool go)"; then
-  if command -v go >/dev/null 2>&1; then
+if ! GO="$(PATH="${SAFE_TEST_ORIGINAL_PATH:-$PATH}" real_tool go)"; then
+  if PATH="${SAFE_TEST_ORIGINAL_PATH:-$PATH}" command -v go >/dev/null 2>&1; then
     reason="go on PATH is only safe's gate wrapper, no real toolchain behind it"
   else
     reason="Go is unavailable"

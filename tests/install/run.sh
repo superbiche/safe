@@ -44,7 +44,7 @@ fi
 cleanup() {
   rm -rf "${TEST_ROOT}"
 }
-trap cleanup EXIT
+safe_test_compose_exit_trap cleanup
 
 fail() {
   printf 'not ok - %s\n' "$1" >&2
