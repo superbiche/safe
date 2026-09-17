@@ -188,6 +188,9 @@ store requires the same explicit trust override as a grant.
   entry is written only if its exact version resolves in the registry (returns
   an integrity); an unverifiable version is skipped, and a present-but-divergent
   hash (a mutated export, or a registry change) is skipped loudly.
+- A local entry whose version is missing, null, empty, or otherwise not a
+  non-empty string is reported as `@invalid`; valid sibling entries continue
+  through the same follow operation.
 - A package already pinned locally to a *different* version is never silently
   overwritten — the conflict is reported and left for an explicit
   `host-allow update`.

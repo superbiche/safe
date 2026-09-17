@@ -2249,7 +2249,7 @@ follow_commit_generation() {
       if (.packages | type) != "object" then error("malformed host-allow store")
       elif (.packages | has($p)) then
         .packages[$p] |
-        if type == "object" then . + {version: (.version // "invalid")}
+        if type == "object" then . + {version: (if ((.version | type) == "string" and (.version | length) > 0) then .version else "invalid" end)}
         else {version: "invalid"}
         end
       else {} end') || return 1

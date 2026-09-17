@@ -324,7 +324,19 @@ grep -q 'CONFLICT fresh-pkg: local pins @invalid, follow has @1.2.3' "$tmp/outpu
 jq -e '.packages["epoch-pkg"].version == "1!2.0"' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'versionless entry blocked the valid sibling'
 jq -e '.origins.rainbow.applied | index("epoch-pkg@1!2.0") != null' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'versionless entry sibling was not recorded'
 cp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json"
-pass 'null and versionless local entries report named conflicts while valid siblings apply'
+reset_incoming
+jq '.host = "rainbow" | .packages = {
+ "fresh-pkg":{"version":"1.2.3","ecosystem":"npm","sha":"sha512-FRESH","reason":"fresh grant","added":"2026-07-01"},
+ "epoch-pkg":{"version":"1!2.0","ecosystem":"python","sha":"sha256-EPOCH","reason":"sibling grant","added":"2026-06-03"}
+}' "$export_file" > "$tmp/incoming/host-allow.rainbow.json"
+sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
+printf '{"packages":{"fresh-pkg":{"version":"","reason":"empty version"}}}\n' > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+grep -q 'CONFLICT fresh-pkg: local pins @invalid, follow has @1.2.3' "$tmp/output" || fail 'empty local version was not named as a conflict'
+jq -e '.packages["epoch-pkg"].version == "1!2.0"' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'empty version blocked the valid sibling'
+jq -e '.origins.rainbow.applied | index("epoch-pkg@1!2.0") != null' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'empty version sibling was not recorded'
+cp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+pass 'null, versionless, and empty-string local entries report named conflicts while valid siblings apply'
 
 # Preview must model the whole UNION, including conflicts between source files.
 reset_incoming
