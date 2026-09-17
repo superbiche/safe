@@ -12,6 +12,9 @@
   subkey, while continuing to refuse the subkey.
 - Require `host-allow add` and `update` to verify the exact registry version
   and integrity before writing the trust store.
+- Test runners and standalone suites now create scratch HOME, XDG, GnuPG, and
+  safe state roots, with a contract tripwire and runtime guard preventing test
+  state from reaching a contributor's real home. Live probes stay opt-in.
 
 ## 1.64.0 - 2026-09-17
 

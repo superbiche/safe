@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Command-local rate-limit consent, without weakening other verdicts.
 set -uo pipefail
+
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -14,6 +19,7 @@ safe_gate_audit_log() { :; }
 safe_gate_run_audit() { calls=$((calls+1)); return "$audit_rc"; }
 safe_gate_operator_terminal() { return "$terminal_rc"; }
 safe_gate_confirm_socket_command() { prompts=$((prompts+1)); return "$confirm_rc"; }
+safe_gate_dispatch() { safe_gate_npm_like "$@"; }
 run_check() { actual=0; safe_gate_check "$1" npm >"$tmp/out" 2>"$tmp/err" || actual=$?; }
 calls=0; prompts=0; audit_rc=12; terminal_rc=0; confirm_rc=0
 SAFE_GATE_SOCKET_COMMAND_CONSENT=0
@@ -53,6 +59,13 @@ safe_gate_check_many npm a@1 b@1 c@1 || fail 'three should fit'
 pass 'four refuses before audit, three audits normally'
 # bin/safe sibling path: function definitions only, with isolated shell options.
 export ROOT tmp
+mkdir -p "$tmp/bin"
+cat >"$tmp/bin/npm" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$tmp/bin/npm"
+export PATH="$tmp/bin:$PATH"
 bash <<'INNER' || exit 1
 source <(sed '/^argv0=/,$d' "$ROOT/bin/safe")
 source "$ROOT/lib/gate-lib.sh"

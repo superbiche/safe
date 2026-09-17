@@ -8,6 +8,11 @@
 # toolchain is a failure, not a skip: an unrun belt must read red.
 set -eu
 
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
+
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 
 # Resolve the real go toolchain, never safe's own gate wrapper — the belt must

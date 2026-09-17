@@ -3,6 +3,12 @@
 
 set -euo pipefail
 
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
+unset SAFE_AUDIT_CONFIG_DIR
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SAFE_RUN="$ROOT/bin/safe-run"
 
@@ -74,6 +80,7 @@ chmod +x "$tmp/bin/safe-audit-stub"
 run_safe_run() {
   SAFE_RUN_CONFIG_DIR="$tmp/config" \
   SAFE_RUN_DATA_DIR="$tmp/data" \
+  SAFE_AUDIT_CONFIG_DIR="${SAFE_AUDIT_CONFIG_DIR:-$tmp/safe-config/audit}" \
   SAFE_AUDIT_DATA_DIR="$tmp/audit-data" \
   SAFE_CONFIG_DIR="$tmp/safe-config" \
   SAFE_AUDIT_BIN="$tmp/bin/safe-audit-stub" \

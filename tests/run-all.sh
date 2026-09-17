@@ -3,19 +3,19 @@
 # mocked PATH), so they run concurrently: wall-clock is the slowest suite,
 # not the sum. SAFE_TEST_JOBS caps concurrency (default: nproc).
 #
-# Excluded by design: audit/cvss4_exhaustive.sh and audit/fetch_cvss4_ref.sh
-# — development cross-checks that need the FIRST oracle bootstrapped into
-# tmp/cvss4-ref/; the committed known-answer suite covers the scorer.
+# Excluded by design: tests/live/* are opt-in probes against installed tools or
+# network services, and the CVSS development helpers need a bootstrapped oracle.
+# The hermetic suites remain the one-command contributor gate.
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# SAFE_TEST_ISOLATION_MARKER: the aggregate runner owns the outer scratch tree.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$ROOT/tests/lib/test-isolation.sh"
+safe_test_setup_isolation || exit 1
 
 SUITES=(
   tests/go/run.sh
-  tests/live/npm_config_oracle.sh
-  tests/live/npm_abbrev_oracle.sh
-  tests/live/composer_abbrev_oracle.sh
-  tests/live/shim_delegation.sh
   tests/install/run.sh
   tests/install/socket_command_consent.sh
   tests/install/gate_adverse_warn_override.sh
@@ -33,6 +33,7 @@ SUITES=(
   tests/audit/tempfile_hygiene.sh
   tests/contract/drift.sh
   tests/contract/docs_drift.sh
+  tests/contract/home_isolation.sh
   tests/contract/wrapper_detect_parity.sh
   tests/contract/report_fp.sh
   tests/run/host_allow_review.sh
@@ -52,6 +53,11 @@ EXCLUDED=(
   tests/audit/fetch_cvss4_ref.sh    # dev bootstrap helper for that oracle
   tests/live/socket_envelope.sh     # opt-in live network probe, excluded per its own header
   tests/live/syft_exclude_oracle.sh # opt-in live probe needing an installed syft, excluded per its own header
+  tests/live/npm_config_oracle.sh   # opt-in live npm behavior probe
+  tests/live/npm_abbrev_oracle.sh   # opt-in live npm behavior probe
+  tests/live/composer_abbrev_oracle.sh # opt-in live Composer behavior probe
+  tests/live/shim_delegation.sh     # opt-in live installed-shim probe
+  tests/lib/test-isolation.sh       # shared HOME/state isolation helper, not a suite
   tests/lib/safe-core.sh            # shared helper, not a suite
   tests/lib/real-tool.sh            # shared helper (real-toolchain resolver), not a suite
 )

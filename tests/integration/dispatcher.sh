@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
+unset SAFE_CONFIG_DIR SAFE_DATA_DIR SAFE_RUN_CONFIG_DIR SAFE_RUN_DATA_DIR \
+  SAFE_AUDIT_CONFIG_DIR SAFE_AUDIT_DATA_DIR SAFE_AUDIT_BIN_DIR \
+  SAFE_AUDIT_SCANNER_DIR SAFE_AUDIT_SOCKET_CACHE_DIR SAFE_BIN_DIR \
+  SAFE_ZSH_COMPLETION_DIR SAFE_RUN_SEED_DIR
+
 # #87: this suite exercises trust reads/writes (incl. `safe install --trust-host`)
 # through a relocated SAFE_CONFIG_DIR for hermeticity; bless it as authoritative
 # so the trust-redirect guard is a no-op here. The guard itself is covered by
@@ -148,7 +157,9 @@ host_install_output="$(PATH="$shim:$PATH" "$shim/safe" install --yes -g cowsay@1
 grep -Fq $'safe-audit\tpackage-audit\tcowsay@1.6.0\t--ecosystem\tnpm' <<<"$host_install_output" || fail "safe install did not audit global npm package"
 grep -Fq $'npm\tinstall\t-g\tcowsay@1.6.0' <<<"$host_install_output" || fail "safe install did not forward global npm flags"
 trust_config="$tmp/trust-config"
-trust_install_output="$(PATH="$shim:$PATH" SAFE_CONFIG_DIR="$trust_config" "$shim/safe" install --yes --trust-host -g cowsay@1.6.0)"
+trust_install_output="$(PATH="$shim:$PATH" SAFE_CONFIG_DIR="$trust_config" \
+  SAFE_RUN_CONFIG_DIR="$trust_config/run" SAFE_RUN_DATA_DIR="$tmp/trust-data" \
+  "$shim/safe" install --yes --trust-host -g cowsay@1.6.0)"
 grep -Fq $'npm\tinstall\t-g\tcowsay@1.6.0' <<<"$trust_install_output" || fail "safe install --trust-host did not install package"
 jq -e '.packages.cowsay.version == "1.6.0" and .packages.cowsay.ecosystem == "npm"' "$trust_config/run/host-allow.json" >/dev/null || fail "safe install --trust-host did not add exact host-allow entry"
 
@@ -457,8 +468,12 @@ jq -e '.command == "safe audit capabilities" and .groups["binary-audit"]["releas
 [[ ! -e "$cap_tmp/data/checks" ]] || fail "safe audit capabilities wrote audit checks"
 pass "dispatcher capabilities"
 
-SAFE_CONFIG_DIR="$tmp/config" SAFE_DATA_DIR="$tmp/data" "$ROOT/bin/safe-run" status | grep -F "config: $tmp/config/run" >/dev/null || fail "safe-run config path"
-SAFE_CONFIG_DIR="$tmp/config" SAFE_DATA_DIR="$tmp/data" "$ROOT/bin/safe-audit" status | grep -F "config: $tmp/config/audit" >/dev/null || fail "safe-audit config path"
+  SAFE_CONFIG_DIR="$tmp/config" SAFE_DATA_DIR="$tmp/data" \
+  SAFE_RUN_CONFIG_DIR="$tmp/config/run" SAFE_RUN_DATA_DIR="$tmp/data/run" \
+    "$ROOT/bin/safe-run" status | grep -F "config: $tmp/config/run" >/dev/null || fail "safe-run config path"
+  SAFE_CONFIG_DIR="$tmp/config" SAFE_DATA_DIR="$tmp/data" \
+  SAFE_AUDIT_CONFIG_DIR="$tmp/config/audit" SAFE_AUDIT_DATA_DIR="$tmp/data/audit" \
+    "$ROOT/bin/safe-audit" status | grep -F "config: $tmp/config/audit" >/dev/null || fail "safe-audit config path"
 pass "config paths"
 
 doctor_tmp="$(mktemp -d)"

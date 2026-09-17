@@ -5,6 +5,11 @@
 # cannot represent.
 set -uo pipefail
 
+# SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
+# shellcheck source=tests/lib/test-isolation.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
+safe_test_setup_isolation || exit 1
+
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 SAFE_RUN="$ROOT/bin/safe-run"
 PASS=0

@@ -241,6 +241,32 @@ Scan results and SBOMs:
 
 ## Maintenance Checks
 
+### Running Tests
+
+Run the hermetic contributor gate with:
+
+```sh
+bash tests/run-all.sh
+```
+
+The runner creates and removes a temporary HOME, XDG config/data/state/cache
+roots, GnuPG home, and safe config/data/run/cache directories before starting
+any suite. Every standalone suite applies the same setup through
+`tests/lib/test-isolation.sh`; a contract check fails if a suite loses that
+helper or call. The `tests/live/` probes are excluded from this aggregate and
+remain opt-in because they require installed tools or network services.
+
+To run one suite, invoke it directly; it creates its own temporary environment
+before any fixture code runs:
+
+```sh
+bash tests/audit/smoke.sh
+```
+
+The runtime guard aborts with a `safe-test: FATAL` message if a safe config,
+data, state, or guarded SAFE path resolves below the HOME that invoked the
+suite.
+
 Before committing documentation or shell changes, run the smoke checks that match the touched area:
 
 ```bash
