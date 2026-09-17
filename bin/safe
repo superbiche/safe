@@ -741,6 +741,7 @@ release_follow_clean_git_env() {
     GIT_CONFIG_GLOBAL=/dev/null \
     GIT_CONFIG_SYSTEM=/dev/null \
     GIT_OPTIONAL_LOCKS=0 \
+    GIT_NO_REPLACE_OBJECTS=1 \
     GIT_TERMINAL_PROMPT=0 \
     "$@"
 }
@@ -768,6 +769,24 @@ release_follow_manual_path() {
   else
     printf 'operator override: (cd <checkout> && git pull --ff-only && bash install.sh --all)\n' >&2
   fi
+}
+
+release_follow_cleanup() {
+  local path
+  for path in "${RELEASE_FOLLOW_STAGING:-}" "${RELEASE_FOLLOW_ARCHIVE_DIR:-}"; do
+    [[ -n "$path" ]] || continue
+    rm -rf -- "$path"
+  done
+}
+
+release_follow_install_cleanup_trap() {
+  local existing
+  existing=$(trap -p EXIT)
+  RELEASE_FOLLOW_PREVIOUS_EXIT_ACTION=""
+  if [[ "$existing" =~ ^trap\ --\ \'(.*)\'\ EXIT$ ]]; then
+    RELEASE_FOLLOW_PREVIOUS_EXIT_ACTION="${BASH_REMATCH[1]}"
+  fi
+  trap 'release_follow_cleanup; if [[ -n "${RELEASE_FOLLOW_PREVIOUS_EXIT_ACTION:-}" ]]; then eval "$RELEASE_FOLLOW_PREVIOUS_EXIT_ACTION"; fi' EXIT
 }
 
 release_follow_refuse() {
@@ -911,7 +930,8 @@ cmd_release_follow() {
   local dry_run=0 explicit_checkout="" record flags_json origin installed_commit
   local tag tag_version best_version="" best_tag="" tag_oid candidate_commit
   local archive_dir version_in_archive install_rc installed_after
-  local lock_fd config
+  local lock_fd config git_dir fetch_output fetch_rc rejected_tag origin_display
+  local probe_rc
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dry-run) dry_run=1; shift ;;
@@ -977,6 +997,21 @@ cmd_release_follow() {
     rev-parse --is-inside-work-tree 2>/dev/null | grep -qx true || {
     release_follow_refuse "recorded checkout is not a git worktree"; return;
   }
+  git_dir=$(release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
+    rev-parse --git-dir 2>/dev/null) || {
+    release_follow_refuse "checkout Git directory cannot be resolved"; return;
+  }
+  [[ "$git_dir" = /* ]] || git_dir="$RELEASE_FOLLOW_CHECKOUT/$git_dir"
+  git_dir=$(readlink -f -- "$git_dir" 2>/dev/null) || {
+    release_follow_refuse "checkout Git directory cannot be resolved"; return;
+  }
+  [[ -d "$git_dir" ]] || { release_follow_refuse "checkout Git directory is missing"; return; }
+  [[ ! -e "$git_dir/info/grafts" ]] || {
+    release_follow_refuse "checkout uses grafts; repair it with a fresh full clone"; return;
+  }
+  [[ ! -e "$git_dir/shallow" ]] || {
+    release_follow_refuse "checkout is shallow and can change ancestry answers; repair it with a full clone"; return;
+  }
   origin=$(release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
     config --local --no-includes --get remote.origin.url 2>/dev/null) || {
     release_follow_refuse "checkout has no existing origin remote"; return;
@@ -994,12 +1029,22 @@ cmd_release_follow() {
     rev-parse --verify "refs/tags/v$SAFE_VERSION^{commit}" 2>/dev/null) || {
     release_follow_refuse "installed version tag v$SAFE_VERSION is missing or does not name a commit"; return;
   }
-  "$RELEASE_FOLLOW_TIMEOUT_PATH" --foreground 30 env -i HOME="$RELEASE_FOLLOW_HOME" PATH=/usr/bin:/bin LC_ALL=C \
+  set +e
+  fetch_output=$("$RELEASE_FOLLOW_TIMEOUT_PATH" --foreground 30 env -i HOME="$RELEASE_FOLLOW_HOME" PATH=/usr/bin:/bin LC_ALL=C \
     GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
-    GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
-    fetch --tags --no-write-fetch-head "$origin" 'refs/tags/*:refs/tags/*' >/dev/null 2>&1 || {
-    release_follow_refuse "git fetch --tags from origin failed or exceeded the 30 second timeout"; return;
-  }
+    GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0 "$RELEASE_FOLLOW_GIT_PATH" \
+    -C "$RELEASE_FOLLOW_CHECKOUT" fetch --tags --no-write-fetch-head "$origin" \
+    'refs/tags/*:refs/tags/*' 2>&1)
+  fetch_rc=$?
+  set -e
+  if (( fetch_rc != 0 )); then
+    rejected_tag=$(sed -n 's/.*\[rejected\][[:space:]]\+\([^[:space:]]\+\).*/\1/p' <<<"$fetch_output" | head -n 1)
+    if [[ -n "$rejected_tag" ]]; then
+      release_follow_refuse "origin tag update rejected for $rejected_tag; repair with git -C $RELEASE_FOLLOW_CHECKOUT tag -d $rejected_tag or git fetch --tags --force"; return;
+    fi
+    origin_display=$(printf '%s' "$origin" | sed -E 's#^([[:alpha:]][[:alnum:]+.-]*://)[^/@]*@#\1<credentials-redacted>@#')
+    release_follow_refuse "transport failure fetching origin $origin_display; origin must be fetchable with no agent and no credentials (anonymous HTTPS url, SSH pushurl is fine)"; return;
+  fi
 
   while IFS= read -r tag; do
     [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
@@ -1025,7 +1070,8 @@ cmd_release_follow() {
   RELEASE_FOLLOW_TAG_OBJECT="$tag_oid"
   RELEASE_FOLLOW_STAGING=$(mktemp -d "${TMPDIR:-/tmp}/safe-release-follow.XXXXXX") || { release_follow_refuse "cannot allocate private release staging"; return; }
   chmod 700 "$RELEASE_FOLLOW_STAGING"
-  trap 'rm -rf -- "$RELEASE_FOLLOW_STAGING"' RETURN
+  RELEASE_FOLLOW_ARCHIVE_DIR=""
+  release_follow_install_cleanup_trap
   RELEASE_FOLLOW_KEYRING="$RELEASE_FOLLOW_STAGING/keyring"
   release_follow_tag_metadata "$best_tag" "$tag_oid" || { release_follow_refuse "candidate tag $best_tag is not a directly signed annotated commit tag"; return; }
   # Release trust is stricter than ordinary redirected run state: an
@@ -1044,7 +1090,9 @@ cmd_release_follow() {
   fi
   archive_dir=$(mktemp -d "${TMPDIR:-/tmp}/safe-release-archive.XXXXXX") || { release_follow_refuse "cannot allocate private archive staging"; return; }
   chmod 700 "$archive_dir"
-  trap 'rm -rf -- "$RELEASE_FOLLOW_STAGING" "$archive_dir"' RETURN
+  RELEASE_FOLLOW_ARCHIVE_DIR="$archive_dir"
+  mkdir -p "$RELEASE_FOLLOW_STAGING/gocache" "$RELEASE_FOLLOW_STAGING/gomodcache" "$RELEASE_FOLLOW_STAGING/gopath"
+  chmod 700 "$RELEASE_FOLLOW_STAGING/gocache" "$RELEASE_FOLLOW_STAGING/gomodcache" "$RELEASE_FOLLOW_STAGING/gopath"
   release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
     archive --format=tar "$RELEASE_FOLLOW_CANDIDATE_COMMIT" |
     "$RELEASE_FOLLOW_TAR_PATH" -xf - -C "$archive_dir" || { release_follow_refuse "verified release archive could not be extracted"; return; }
@@ -1052,7 +1100,10 @@ cmd_release_follow() {
   [[ "$version_in_archive" == "$best_version" ]] || { release_follow_refuse "verified archive VERSION does not match $best_tag"; return; }
   set +e
   ( cd "$archive_dir" && env -i HOME="$RELEASE_FOLLOW_HOME" PATH=/usr/bin:/bin TMPDIR=/tmp \
-      GOFLAGS=-buildvcs=false \
+      GOENV=off GOTOOLCHAIN=local GOPROXY=off GOFLAGS='-buildvcs=false -mod=mod' \
+      GOCACHE="$RELEASE_FOLLOW_STAGING/gocache" \
+      GOMODCACHE="$RELEASE_FOLLOW_STAGING/gomodcache" \
+      GOPATH="$RELEASE_FOLLOW_STAGING/gopath" \
       SAFE_BIN_DIR="$RELEASE_FOLLOW_INSTALL_SAFE_BIN_DIR" \
       SAFE_CONFIG_DIR="$RELEASE_FOLLOW_INSTALL_SAFE_CONFIG_DIR" \
       SAFE_DATA_DIR="$RELEASE_FOLLOW_INSTALL_SAFE_DATA_DIR" \
@@ -1066,11 +1117,15 @@ cmd_release_follow() {
   install_rc=$?
   set -e
   (( install_rc == 0 )) || { release_follow_refuse "verified release install.sh failed (exit $install_rc)"; return; }
+  set +e
   installed_after=$(env -i HOME="$RELEASE_FOLLOW_HOME" PATH=/usr/bin:/bin \
     SAFE_CONFIG_DIR="$SAFE_CONFIG_ROOT" SAFE_DATA_DIR="$SAFE_DATA_ROOT" \
     SAFE_RUN_CONFIG_DIR="${SAFE_RUN_CONFIG_DIR:-$SAFE_CONFIG_ROOT/run}" \
     SAFE_RUN_DATA_DIR="${SAFE_RUN_DATA_DIR:-$SAFE_DATA_ROOT/run}" \
-    "$SAFE_SELF" --version 2>/dev/null | sed -n '1s/^safe //p')
+    "$SAFE_BIN_ROOT/safe" --version 2>/dev/null | sed -n '1s/^safe //p')
+  probe_rc=$?
+  set -e
+  (( probe_rc == 0 )) || { release_follow_refuse "post-install safe --version probe failed (exit $probe_rc)"; return; }
   [[ "$installed_after" == "$best_version" ]] || { release_follow_refuse "post-install safe --version is $installed_after, expected $best_version"; return; }
   release_follow_fast_forward_checkout
   release_follow_audit "RELEASE_FOLLOWED from=$SAFE_VERSION to=$best_version signer=$RELEASE_FOLLOW_SIGNER tag_object=$RELEASE_FOLLOW_TAG_OBJECT" || {

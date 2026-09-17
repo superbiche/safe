@@ -9,9 +9,9 @@ safe install [--project] [--yes]
 safe install [-g|--global] [--yes] <pkg> [...]
 safe install --manager npm|pnpm|yarn|bun|composer -g [--yes] [--trust-host] <pkg> [...]
 safe install --sandbox [--allow-scripts] <pkg> [...]
-  safe vendor update --name NAME --path PATH --reason TEXT -- COMMAND...
-  safe release follow [--dry-run] [--checkout <dir>]
-  safe setup [<machine> | --all | --machine <csv>]
+safe vendor update --name NAME --path PATH --reason TEXT -- COMMAND...
+safe release follow [--dry-run] [--checkout <dir>]
+safe setup [<machine> | --all | --machine <csv>]
 safe status
 safe doctor [--json]
 safe explain [--json]

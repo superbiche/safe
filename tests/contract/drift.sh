@@ -88,7 +88,11 @@ case_hand_editing_a_generated_block_is_caught() {
   # accident. Edit a copy and prove --check rejects it.
   local sandbox="$TEST_ROOT/sandbox"
   mkdir -p "$sandbox"
-  cp -r "$ROOT/docs" "$ROOT/scripts" "$sandbox/"
+  cp -rL "$ROOT/docs" "$ROOT/scripts" "$sandbox/"
+  [[ -f "$sandbox/docs/agents.md" && ! -L "$sandbox/docs/agents.md" ]] || {
+    fail "$FUNCNAME (generated surface copy is not a regular file)"
+    return
+  }
   # Inside a generated block — an edit OUTSIDE the markers is legitimate
   # hand-written prose and must keep passing.
   sed -i 's/^| 100 |/| 100 | HAND EDITED |/' "$sandbox/docs/agents.md"

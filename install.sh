@@ -189,16 +189,47 @@ release_follow_install_flags_json() {
   printf '%s\n' "${flags[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))'
 }
 
+release_follow_union_install_flags_json() {
+  local current="$1" existing="$2"
+  jq -cn --argjson current "$current" --argjson existing "$existing" '
+    def expanded:
+      reduce .[] as $flag ([ ];
+        if $flag == "--all" then . + ["--run", "--audit", "--wrappers"]
+        elif $flag == "--no-wrappers" then . + ["--run", "--audit"]
+        else . + [$flag] end) | unique;
+    ($existing + $current) as $flags
+    | ($flags | expanded) as $components
+    | (any($flags[]; . == "--all" or . == "--wrappers")) as $wrappers
+    | (any($components[]; . == "--run")) as $run
+    | (any($components[]; . == "--audit")) as $audit
+    | (if ($run and $audit and $wrappers) then ["--all"]
+       elif ($run and $audit) then ["--no-wrappers"]
+       else ([
+         (if $run then "--run" else empty end),
+         (if $audit then "--audit" else empty end),
+         (if $wrappers then "--wrappers" else empty end)
+       ]) end)
+    + (if any($components[]; . == "--review-timer") then ["--review-timer"] else [] end)
+    + (if any($components[]; . == "--with-completions") then ["--with-completions"] else [] end)'
+}
+
 record_release_follow_source() {
-  local checkout flags_json record tmp
+  local checkout flags_json record tmp current_flags existing_flags
   checkout="${SAFE_RELEASE_FOLLOW_CHECKOUT:-$REPO_DIR}"
   [[ "$checkout" = /* ]] || die "release-follow checkout record must be an absolute path: $checkout"
   checkout=$(cd -- "$checkout" 2>/dev/null && pwd -P) ||
     die "release-follow checkout does not exist: $checkout"
-  flags_json="${SAFE_RELEASE_FOLLOW_FLAGS_JSON:-$(release_follow_install_flags_json)}"
-  jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' \
-    <<<"$flags_json" >/dev/null || die "release-follow installer flags are malformed"
   record="$CONFIG_BASE/release-follow.json"
+  current_flags="${SAFE_RELEASE_FOLLOW_FLAGS_JSON:-$(release_follow_install_flags_json)}"
+  jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' \
+    <<<"$current_flags" >/dev/null || die "release-follow installer flags are malformed"
+  existing_flags='[]'
+  if [[ -f "$record" && ! -L "$record" ]]; then
+    existing_flags=$(jq -ce '.install_flags | select(type == "array" and length > 0 and all(.[]; type == "string"))' "$record" 2>/dev/null) ||
+      die "existing release-follow installer flags are malformed"
+  fi
+  flags_json=$(release_follow_union_install_flags_json "$current_flags" "$existing_flags") ||
+    die "cannot merge release-follow installer flags"
   mkdir -p -- "$CONFIG_BASE"
   tmp=$(stage_beside "$record") || die "cannot stage release-follow record"
   jq -cn --arg checkout "$checkout" --argjson flags "$flags_json" \

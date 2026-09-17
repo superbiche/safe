@@ -371,6 +371,7 @@ payload and signature from the tag object, uses an isolated keyring containing
 only the pinned public keys, and ignores ambient Git signing configuration and
 the user keyring. Lightweight tags, non-OpenPGP signatures, revoked or expired
 key/signature status, bad signatures, and unpinned signers refuse.
+The origin must be fetchable with no agent and no credentials (anonymous HTTPS url, SSH pushurl is fine).
 
 The verified commit is archived into a private temporary directory, its
 `VERSION` is checked against the tag, and that tree's `install.sh` is run with
@@ -381,6 +382,8 @@ after installation. `install.sh` currently replaces some live files with
 direct writes, so the lock serializes passes but cannot make a killed install
 an all-files transaction; the installed surface may be mixed until the normal
 manual repair path is run.
+Archive attribute filtering is fail-closed today: any attribute-driven omission
+that removes an installer input causes the verified archive install to refuse.
 
 Every non-dry refusal returns non-zero, prints the manual operator path, and
 records a refusal in `~/.local/share/safe/run/audit.log`. A confirmed update

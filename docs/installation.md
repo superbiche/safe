@@ -25,7 +25,8 @@ The installer is idempotent. It refreshes installed files, seeds only missing co
 
 After a successful install, it also writes the machine-local
 `$SAFE_CONFIG_DIR/release-follow.json` record with the absolute checkout path
-from which that installer ran and the normalized component flags. The record is
+from which that installer ran and the union of normalized component flags. A
+later component-only install extends the record instead of narrowing it. The record is
 used by `safe release follow`; it is not a synced artifact and contains no
 signer trust.
 

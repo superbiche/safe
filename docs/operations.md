@@ -185,6 +185,7 @@ OpenPGP tag against the TTY-pinned `follow.signers`, installs the verified
 archive with the recorded installer flags, and checks `safe --version` after
 installation. It never pulls from another host, adds a remote, uses sudo, or
 falls back to the ambient keyring.
+The origin must be fetchable with no agent and no credentials (anonymous HTTPS url, SSH pushurl is fine).
 
 Signer rotation means adding the new primary fingerprint at a TTY before
 publishing tags signed by it, then removing the old fingerprint after every
@@ -197,12 +198,17 @@ to a failed systemd unit.
 
 The install source record is local at
 `$SAFE_CONFIG_DIR/release-follow.json`. It contains the absolute checkout path
-and normalized `install.sh` component flags. The release pass installs from a
+and the union of normalized `install.sh` component flags from successive
+installs. The release pass installs from a
 private archive of the verified commit, then warns if the recorded checkout is
 dirty or cannot fast-forward. The pass lock is bounded to 10 seconds. Because
 the current installer still direct-writes some binaries and wrappers, a killed
 install can expose mixed live files; this is an installer atomicity residual,
 not a reason to install from the unverified working tree.
+`--no-wrappers` records the run and audit components when the union has no
+wrappers yet. It never removes wrappers already in the union; a later
+`--wrappers` invocation adds them when needed and re-enables them for future
+follows.
 
 ## Scan Modes
 

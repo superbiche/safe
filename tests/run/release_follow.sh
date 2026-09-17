@@ -57,6 +57,9 @@ PATH=/usr/bin:/bin SAFE_BIN_DIR="$SAFE_BIN_DIR" SAFE_CONFIG_DIR="$SAFE_CONFIG_DI
 driver="$SAFE_BIN_DIR/safe"
 [[ "$(SAFE_CONFIG_DIR="$SAFE_CONFIG_DIR" SAFE_DATA_DIR="$SAFE_DATA_DIR" "$driver" --version 2>/dev/null | sed -n '1s/^safe //p')" == 1.64.1 ]] || fail 'base safe version not installed'
 
+mkdir -p "$HOME/.config/go"
+printf 'GOTOOLCHAIN=go1.99.0\n' > "$HOME/.config/go/env"
+
 make_release() {
   local version="$1" mode="${2:-signed}" other_key="${3:-}"
   printf '%s\n' "$version" > "$checkout/VERSION"
@@ -88,6 +91,28 @@ make_release() {
   git -C "$checkout" remote set-head origin -a >/dev/null 2>&1 || true
 }
 
+plant_replace_commit() {
+  local repo="$1" candidate="$2" parent="$3" marker="$4" version="$5"
+  local version_oid install_oid evil_tree evil_commit
+  printf '%s\n' "$version" | git -C "$repo" hash-object -w --stdin > "$tmp/version-blob"
+  version_oid=$(cat "$tmp/version-blob")
+  cat > "$tmp/evil-install" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'evil replacement\\n' > '$marker'
+cat > "\$SAFE_BIN_DIR/safe" <<'SAFE'
+#!/usr/bin/env bash
+printf 'safe $version\\n'
+SAFE
+chmod +x "\$SAFE_BIN_DIR/safe"
+EOF
+  install_oid=$(git -C "$repo" hash-object -w "$tmp/evil-install")
+  evil_tree=$(printf '100644 blob %s\tVERSION\n100755 blob %s\tinstall.sh\n' "$version_oid" "$install_oid" |
+    git -C "$repo" mktree)
+  evil_commit=$(git -C "$repo" commit-tree "$evil_tree" -p "$parent" -m 'evil replacement')
+  git -C "$repo" update-ref "refs/replace/$candidate" "$evil_commit"
+}
+
 run_follow() {
   local output rc=0
   output=$(SAFE_CONFIG_DIR="$SAFE_CONFIG_DIR" SAFE_DATA_DIR="$SAFE_DATA_DIR" \
@@ -105,7 +130,7 @@ grep -q 'installed v1.64.2 signer=' <<<"$FOLLOW_OUTPUT" || fail "happy path did 
 grep -q "RELEASE_FOLLOWED from=1.64.1 to=1.64.2 signer=$fingerprint tag_object=" "$SAFE_RUN_DATA_DIR/audit.log" || fail 'follow event missing'
 [[ "$(SAFE_CONFIG_DIR="$SAFE_CONFIG_DIR" SAFE_DATA_DIR="$SAFE_DATA_DIR" "$SAFE_BIN_DIR/safe" --version 2>/dev/null | sed -n '1s/^safe //p')" == 1.64.2 ]] || fail 'happy path installed wrong version'
 driver="$SAFE_BIN_DIR/safe"
-pass 'signed descendant installs exact archive bytes and logs the primary fingerprint'
+pass 'signed descendant installs exact archive bytes, ignores hostile Go configuration and logs the primary fingerprint'
 
 run_follow
 [[ "$FOLLOW_RC" == 0 && "$FOLLOW_OUTPUT" == 'safe: release follow: nothing newer than 1.64.2' ]] || fail 'no-newer path was not a quiet success'
@@ -253,6 +278,160 @@ exec {lock_fd}>&-
 grep -q 'another pass is running' <<<"$FOLLOW_OUTPUT" || fail 'lock contention message missing'
 grep -q 'RELEASE_FOLLOW_REFUSED reason=another pass is running' "$SAFE_RUN_DATA_DIR/audit.log" || fail 'lock refusal was not audited'
 pass 'release-follow passes are bounded to one writer'
+
+replace_candidate=$(git -C "$checkout" rev-parse 'refs/tags/v1.65.5^{commit}')
+replace_parent=$(git -C "$checkout" rev-parse 'refs/tags/v1.65.3^{commit}')
+replace_marker="$tmp/current-replace-marker"
+plant_replace_commit "$checkout" "$replace_candidate" "$replace_parent" "$replace_marker" 1.65.5
+run_follow
+[[ "$FOLLOW_RC" == 0 ]] || fail "replace-ref candidate was not safely handled: $FOLLOW_OUTPUT"
+[[ ! -e "$replace_marker" ]] || fail 'replace-ref archive installed the evil marker'
+grep -q 'RELEASE_FOLLOWED from=1.65.3 to=1.65.5 signer=' "$SAFE_RUN_DATA_DIR/audit.log" || fail 'replace-ref safe follow event missing'
+git -C "$checkout" update-ref -d "refs/replace/$replace_candidate"
+pass 'replace-ref candidate installs genuine bytes and never attributes evil bytes'
+
+legacy_root="$tmp/legacy-2304ebb"
+mkdir -p "$legacy_root"
+git archive 2304ebb | tar -xf - -C "$legacy_root"
+legacy_repo="$tmp/legacy-repo"
+legacy_origin="$tmp/legacy-origin.git"
+git init --quiet "$legacy_repo"
+git init --bare --quiet "$legacy_origin"
+git -C "$legacy_repo" config user.name 'legacy fixture'
+git -C "$legacy_repo" config user.email legacy@example.invalid
+printf '1.64.1\n' > "$legacy_repo/VERSION"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$legacy_repo/install.sh"
+chmod +x "$legacy_repo/install.sh"
+git -C "$legacy_repo" add VERSION install.sh
+git -C "$legacy_repo" commit --quiet -m base
+legacy_parent=$(git -C "$legacy_repo" rev-parse HEAD)
+git -c gpg.format=openpgp -c gpg.program=/usr/bin/gpg -C "$legacy_repo" tag -s -u "$fingerprint" -m v1.64.1 v1.64.1
+git -C "$legacy_repo" remote add origin "$legacy_origin"
+git -C "$legacy_repo" push --quiet origin HEAD refs/tags/v1.64.1
+printf '1.64.2\n' > "$legacy_repo/VERSION"
+cat > "$legacy_repo/install.sh" <<'LEGACY_INSTALL'
+#!/usr/bin/env bash
+set -euo pipefail
+cat > "$SAFE_BIN_DIR/safe" <<'SAFE'
+#!/usr/bin/env bash
+printf 'safe 1.64.2\n'
+SAFE
+chmod +x "$SAFE_BIN_DIR/safe"
+LEGACY_INSTALL
+chmod +x "$legacy_repo/install.sh"
+git -C "$legacy_repo" add VERSION install.sh
+git -C "$legacy_repo" commit --quiet -m candidate
+git -c gpg.format=openpgp -c gpg.program=/usr/bin/gpg -C "$legacy_repo" tag -s -u "$fingerprint" -m v1.64.2 v1.64.2
+git -C "$legacy_repo" push --quiet origin HEAD refs/tags/v1.64.2
+legacy_candidate=$(git -C "$legacy_repo" rev-parse 'refs/tags/v1.64.2^{commit}')
+legacy_marker="$tmp/legacy-replace-marker"
+plant_replace_commit "$legacy_repo" "$legacy_candidate" "$legacy_parent" "$legacy_marker" 1.64.2
+legacy_home="$tmp/legacy-home"
+legacy_config="$tmp/legacy-config"
+legacy_data="$tmp/legacy-data"
+legacy_bin="$tmp/legacy-bin"
+mkdir -p "$legacy_home/.config/safe/run" "$legacy_config" "$legacy_data/run" "$legacy_bin"
+printf '{"follow":{"signers":["%s"]}}\n' "$fingerprint" > "$legacy_home/.config/safe/run/config.json"
+printf '{"schema":"safe-release-follow/1","checkout":"%s","install_flags":["--run"]}\n' "$legacy_repo" > "$legacy_config/release-follow.json"
+cp "$legacy_root/bin/safe" "$legacy_bin/safe"
+chmod +x "$legacy_bin/safe"
+set +e
+legacy_output=$(env -i HOME="$legacy_home" GNUPGHOME="$GNUPGHOME" PATH=/usr/bin:/bin \
+  SAFE_CONFIG_DIR="$legacy_config" SAFE_DATA_DIR="$legacy_data" SAFE_BIN_DIR="$legacy_bin" \
+  SAFE_RUN_CONFIG_DIR="$legacy_home/.config/safe/run" SAFE_RUN_DATA_DIR="$legacy_data/run" \
+  "$legacy_bin/safe" release follow 2>&1)
+legacy_rc=$?
+set -e
+printf '%s\n' "$legacy_output" > "$tmp/legacy-output"
+[[ "$legacy_rc" == 0 ]] || fail "archived 2304ebb did not reproduce the replace-ref vulnerability (rc=$legacy_rc)"
+[[ -e "$legacy_marker" ]] || fail 'archived 2304ebb did not install the evil replacement marker'
+grep -q 'RELEASE_FOLLOWED from=1.64.1 to=1.64.2 signer=' "$legacy_data/run/audit.log" ||
+  fail 'archived 2304ebb did not misattribute the evil replacement'
+pass 'replace-ref regression is non-vacuous: the git archive of 2304ebb fails it'
+
+make_release 1.65.6 signed
+touch "$checkout/.git/info/grafts"
+run_follow
+[[ "$FOLLOW_RC" == 1 ]] || fail 'graft checkout was not refused'
+grep -q 'checkout uses grafts' <<<"$FOLLOW_OUTPUT" || fail 'graft refusal message missing'
+rm -f "$checkout/.git/info/grafts"
+touch "$checkout/.git/shallow"
+run_follow
+[[ "$FOLLOW_RC" == 1 ]] || fail 'shallow checkout was not refused'
+grep -q 'checkout is shallow' <<<"$FOLLOW_OUTPUT" || fail 'shallow refusal message missing'
+rm -f "$checkout/.git/shallow"
+pass 'grafts and shallow ancestry metadata are refused'
+
+candidate_1656_tag=$(git -C "$checkout" rev-parse refs/tags/v1.65.6)
+candidate_1655_commit=$(git -C "$checkout" rev-parse 'refs/tags/v1.65.5^{commit}')
+git -C "$checkout" update-ref refs/tags/v1.65.6 "$candidate_1655_commit"
+run_follow
+[[ "$FOLLOW_RC" == 1 ]] || fail 'rejected local tag update was not refused'
+grep -q 'v1.65.6' <<<"$FOLLOW_OUTPUT" || fail 'rejected tag name missing'
+grep -q 'repair with' <<<"$FOLLOW_OUTPUT" || fail 'rejected tag repair missing'
+git -C "$checkout" update-ref refs/tags/v1.65.6 "$candidate_1656_tag"
+git -C "$checkout" remote set-url origin "$tmp/missing-origin.git"
+run_follow
+[[ "$FOLLOW_RC" == 1 ]] || fail 'transport failure was not refused'
+grep -q 'transport failure fetching origin' <<<"$FOLLOW_OUTPUT" || fail 'transport failure message missing'
+grep -q 'missing-origin.git' <<<"$FOLLOW_OUTPUT" || fail 'origin URL missing from transport failure'
+grep -q 'origin must be fetchable with no agent and no credentials' <<<"$FOLLOW_OUTPUT" || fail 'anonymous-origin requirement missing'
+git -C "$checkout" remote set-url origin "$origin"
+pass 'fetch rejection and transport failure have distinct operator repairs'
+
+union_checkout="$tmp/union-checkout"
+union_config="$tmp/union-config"
+union_data="$tmp/union-data"
+union_bin="$tmp/union-bin"
+union_home="$tmp/union-home"
+union_stub="$tmp/union-stub"
+git clone --quiet --no-hardlinks "$checkout" "$union_checkout"
+cp "$ROOT/install.sh" "$union_checkout/install.sh"
+mkdir -p "$union_config" "$union_data" "$union_bin" "$union_home" "$union_stub"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$union_stub/systemctl"
+chmod +x "$union_stub/systemctl"
+union_env=(HOME="$union_home" PATH="$union_stub:/usr/bin:/bin" SAFE_CONFIG_DIR="$union_config"
+  SAFE_DATA_DIR="$union_data" SAFE_BIN_DIR="$union_bin" SAFE_ZSHRC="$union_home/.zshrc")
+env -i "${union_env[@]}" bash "$union_checkout/install.sh" --run >/dev/null 2>&1 || fail 'union base install failed'
+env -i "${union_env[@]}" bash "$union_checkout/install.sh" --review-timer >/dev/null 2>&1 || fail 'review-timer-only install failed'
+if ! jq -e '.install_flags == ["--run", "--review-timer"]' "$union_config/release-follow.json" >/dev/null; then
+  jq -c . "$union_config/release-follow.json" >&2 || true
+  fail 'review-timer-only install narrowed the record'
+fi
+env -i "${union_env[@]}" bash "$union_checkout/install.sh" --no-wrappers >/dev/null 2>&1 || fail 'no-wrappers install failed'
+jq -e '.install_flags == ["--no-wrappers", "--review-timer"]' "$union_config/release-follow.json" >/dev/null ||
+  fail 'no-wrappers did not preserve the component union'
+env -i "${union_env[@]}" bash "$union_checkout/install.sh" --wrappers >/dev/null 2>&1 || fail 'wrappers install failed'
+jq -e '.install_flags == ["--all", "--review-timer"]' "$union_config/release-follow.json" >/dev/null ||
+  fail 'wrappers did not re-enable wrappers in the union'
+env -i "${union_env[@]}" bash "$union_checkout/install.sh" --no-wrappers >/dev/null 2>&1 || fail 'no-wrappers repeat install failed'
+jq -e '.install_flags == ["--all", "--review-timer"]' "$union_config/release-follow.json" >/dev/null ||
+  fail 'no-wrappers narrowed an existing wrapper union'
+pass 'installer records the component union and preserves no-wrappers semantics'
+
+probe_driver="$tmp/probe-driver"
+cp "$driver" "$probe_driver"
+printf '1.65.7\n' > "$checkout/VERSION"
+sed -i -E 's/^SAFE_VERSION="[0-9]+\.[0-9]+\.[0-9]+"/SAFE_VERSION="1.65.7"/' "$checkout/bin/safe"
+cat > "$checkout/install.sh" <<'PROBE_INSTALL'
+#!/usr/bin/env bash
+set -euo pipefail
+rm -f -- "$SAFE_BIN_DIR/safe"
+PROBE_INSTALL
+chmod +x "$checkout/install.sh"
+git -C "$checkout" add VERSION bin/safe install.sh
+git -C "$checkout" commit --quiet -m 'fixture probe failure'
+git -c gpg.format=openpgp -c gpg.program=/usr/bin/gpg -C "$checkout" tag -s -u "$fingerprint" -m v1.65.7 v1.65.7
+git -C "$checkout" push --quiet origin HEAD refs/tags/v1.65.7
+driver="$probe_driver"
+run_follow
+[[ "$FOLLOW_RC" != 127 ]] || fail 'post-install probe leaked exit 127'
+grep -q 'post-install safe --version probe failed' <<<"$FOLLOW_OUTPUT" || fail 'probe failure refusal missing'
+grep -q 'RELEASE_FOLLOW_REFUSED reason=post-install safe --version probe failed' "$SAFE_RUN_DATA_DIR/audit.log" ||
+  fail 'probe failure was not audited'
+cp "$probe_driver" "$SAFE_BIN_DIR/safe"
+driver="$SAFE_BIN_DIR/safe"
+pass 'post-install probe failures are audited and return the refusal status'
 
 rm -f "$SAFE_CONFIG_DIR/release-follow.json"
 run_follow
