@@ -71,7 +71,8 @@ safe run host-allow import allow.json --dry-run # machine 2: preview the delta
 safe run host-allow import allow.json           # machine 2: reviewed apply (TTY)
 ```
 
-`import` re-validates and re-fetches integrity for every entry, never overwrites
+`add` and `update` verify the exact requested version and fetch its integrity
+from the public registry before writing. `import` re-validates and re-fetches integrity for every entry, never overwrites
 a divergent local pin, and refuses in non-TTY shells (exit 102) unless
 `--dry-run`. For unattended fleet followers, opt in to signed UNION replication:
 
@@ -116,13 +117,18 @@ guard-selected trust store records each origin as
 warn, increment the freshness-skip count and return non-zero. Equal timestamps
 retry only identities that never applied; successful entries stay skipped even
 after operator removal. A local re-pin survives an equal generation and a newer
-signed generation re-aligns it to the origin's pin. Older or equal replacement
-statements are WARNed once, recorded in `refused`, and remain non-zero; a
-same-generation retry is an INFO skip that cannot replace a later TTY re-pin. A
-hinted update to the refused version makes it present and clears the refusal. A
+signed generation re-aligns it to the origin's pin. Generation-less refusals
+are WARNed once, recorded in `refused`, and remain non-zero; same-generation
+retries are quiet INFO skips that cannot replace a later TTY re-pin. A
+generation-bearing refusal is re-derived against the incoming generation and
+WARNed on every run. A hinted update to the refused version makes it present
+and clears the refusal. A
 registry outage is therefore retryable with the same signed file. Once complete, unchanged daily
 runs return 0 with one quiet info line, no registry calls and no import
 prescription. Verification still runs.
+Generation-bearing refused identities are re-evaluated against the incoming
+generation on every run; refusal memory short-circuits only entries whose local
+generation is absent and cannot be compared.
 A newer signed generation starts fresh applied and refused sets. After upgrading,
 the first follow derives a missing `followed_generation` when `followed_from`
 and the matching applied identity identify a prior followed entry. An entry

@@ -229,6 +229,33 @@ cmp "$tmp/local-after-refused-repin.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json"
 cmp "$tmp/state-before-refused-repin.json" "$SAFE_RUN_CONFIG_DIR/follow-state.json" || fail 'refused dry-run changed the ledger'
 pass 'same-generation refusals survive a TTY re-pin and dry-run'
 
+# The refusal's update hint can be followed exactly: updating to the refused
+# version creates a generation-less local entry, which must be re-derived and
+# clear the refusal without rewriting the already-matching store entry.
+printf '{"packages":{"fresh-pkg":{"version":"2.0.0","sha":"sha512-FRESH","ecosystem":"npm","added":"2026-07-01","reason":"followed origin grant","followed_from":"rainbow","followed_generation":"%s"}}}\n' "$cross_newer" > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+printf '{"origins":{"rainbow":{"accepted":"%s","applied":["fresh-pkg@2.0.0"],"replaced":[]},"tuxedo":{"accepted":"%s","applied":[],"replaced":[]}}}\n' "$cross_newer" "$cross_older" > "$SAFE_RUN_CONFIG_DIR/follow-state.json"
+expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+jq -e '.origins.tuxedo.refused == ["fresh-pkg@1.2.3"]' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'refusal was not recorded before the hinted update'
+printf 'y\n' | pty_run "$SAFE_RUN" host-allow update fresh-pkg@1.2.3 --reason "operator ruling" > "$tmp/output" 2>&1 || fail 'TTY update to refused version failed'
+cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/local-before-refused-version-follow.json"
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+cmp "$tmp/local-before-refused-version-follow.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'equal-version retry rewrote the host-allow store'
+jq -e '.origins.tuxedo.refused == [] and .origins.tuxedo.applied == ["fresh-pkg@1.2.3"]' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'equal-version retry did not clear refusal and apply identity'
+pass 'refusal followed by TTY update to the refused version clears memory without rewriting the store'
+
+# A repaired followed-generation must be compared again even when the
+# identity remains in refusal memory. The memory-only path is for entries with
+# no generation, where there is no safe comparison to make.
+reset_incoming
+printf '{"packages":{"fresh-pkg":{"version":"1.2.3","sha":"sha512-FRESH","ecosystem":"npm","added":"2026-07-01","reason":"repaired followed grant","followed_from":"rainbow","followed_generation":"%s"}}}\n' "$cross_older" > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+printf '{"origins":{"rainbow":{"accepted":"%s","applied":[],"replaced":[],"refused":["fresh-pkg@2.0.0"]}}}\n' "$cross_newer" > "$SAFE_RUN_CONFIG_DIR/follow-state.json"
+jq --arg stamp "$cross_newer" '.host = "rainbow" | .exported_at = $stamp | .packages["fresh-pkg"].version = "2.0.0"' "$export_file" > "$tmp/incoming/host-allow.rainbow.json"
+sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+jq -e '.packages["fresh-pkg"].version == "2.0.0" and .packages["fresh-pkg"].followed_generation == $stamp' --arg stamp "$cross_newer" "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'repaired generation did not re-derive the refusal decision'
+jq -e '.origins.rainbow.refused == [] and .origins.rainbow.applied == ["fresh-pkg@2.0.0"]' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'repaired generation refusal was not cleared after apply'
+pass 'generation-bearing refused identities are re-derived before comparison'
+
 # A 1.63.0-shaped followed entry has no stamp, but its applied identity and
 # origin ledger still recover the accepted generation before comparison.
 reset_incoming
@@ -311,7 +338,19 @@ grep -q 'CONFLICT fresh-pkg: local pins @invalid, follow has @1.2.3' "$tmp/outpu
 jq -e '.packages["epoch-pkg"].version == "1!2.0"' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'versionless entry blocked the valid sibling'
 jq -e '.origins.rainbow.applied | index("epoch-pkg@1!2.0") != null' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'versionless entry sibling was not recorded'
 cp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json"
-pass 'null and versionless local entries report named conflicts while valid siblings apply'
+reset_incoming
+jq '.host = "rainbow" | .packages = {
+ "fresh-pkg":{"version":"1.2.3","ecosystem":"npm","sha":"sha512-FRESH","reason":"fresh grant","added":"2026-07-01"},
+ "epoch-pkg":{"version":"1!2.0","ecosystem":"python","sha":"sha256-EPOCH","reason":"sibling grant","added":"2026-06-03"}
+}' "$export_file" > "$tmp/incoming/host-allow.rainbow.json"
+sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
+printf '{"packages":{"fresh-pkg":{"version":"","reason":"empty version"}}}\n' > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+grep -q 'CONFLICT fresh-pkg: local pins @invalid, follow has @1.2.3' "$tmp/output" || fail 'empty local version was not named as a conflict'
+jq -e '.packages["epoch-pkg"].version == "1!2.0"' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'empty version blocked the valid sibling'
+jq -e '.origins.rainbow.applied | index("epoch-pkg@1!2.0") != null' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'empty version sibling was not recorded'
+cp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+pass 'null, versionless, and empty-string local entries report named conflicts while valid siblings apply'
 
 # Preview must model the whole UNION, including conflicts between source files.
 reset_incoming
@@ -368,6 +407,14 @@ cp "$export_file" "$tmp/incoming/host-allow.rainbow.json"
 sign_document "$subkey!" "$tmp/incoming/host-allow.rainbow.json"
 expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
 pass 'signing subkey verifies through its pinned primary fingerprint'
+cp "$SAFE_RUN_CONFIG_DIR/config.json" "$tmp/config-before-subkey-add.json"
+if pty_run "$SAFE_RUN" host-allow follow-signer add "$subkey" > "$tmp/output" 2>&1; then
+  fail 'subkey fingerprint was accepted as a follow signer'
+fi
+grep -q 'subkey' "$tmp/output" || fail 'subkey refusal did not identify the supplied fingerprint as a subkey'
+grep -q "$fingerprint" "$tmp/output" || fail 'subkey refusal did not print the primary fingerprint'
+cmp "$tmp/config-before-subkey-add.json" "$SAFE_RUN_CONFIG_DIR/config.json" || fail 'subkey signer refusal changed config'
+pass 'follow-signer add identifies a subkey and names its primary fingerprint'
 
 # With no safe-specific selector, respect GPG's configured default key.
 jq 'del(.follow.signing_key)' "$SAFE_RUN_CONFIG_DIR/config.json" > "$tmp/config-next.json"

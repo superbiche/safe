@@ -1647,20 +1647,25 @@ handle_runner_invocation() {
 # Subcommands: host-allow
 # ---------------------------------------------------------------------------
 registry_integrity_npm() {
-  local pkg="$1" version="$2"
+  local pkg="$1" version="$2" body resolved digest
   local url="https://registry.npmjs.org/${pkg}/${version}"
-  local body
-  body=$(curl -fsSL "$url" 2>/dev/null) || return 1
-  printf '%s' "$body" | jq -r '.dist.integrity // .dist.shasum // empty'
+  body=$(curl -fsSL --max-time 10 "$url" 2>/dev/null) || return 1
+  resolved=$(printf '%s' "$body" | jq -r '.version // empty' 2>/dev/null) || return 1
+  [[ "$resolved" == "$version" ]] || return 1
+  digest=$(printf '%s' "$body" | jq -r '.dist.integrity // .dist.shasum // empty' 2>/dev/null) || return 1
+  [[ -n "$digest" ]] || return 1
+  printf '%s' "$digest"
 }
 
 registry_integrity_pypi() {
-  local pkg="$1" version="$2"
+  local pkg="$1" version="$2" body resolved digest
   local url="https://pypi.org/pypi/${pkg}/${version}/json"
-  local body
-  body=$(curl -fsSL "$url" 2>/dev/null) || return 1
-  printf '%s' "$body" | jq -r '.urls[0].digests.sha256 // empty' | \
-    sed 's/^/sha256-/'
+  body=$(curl -fsSL --max-time 10 "$url" 2>/dev/null) || return 1
+  resolved=$(printf '%s' "$body" | jq -r '.info.version // empty' 2>/dev/null) || return 1
+  [[ "$resolved" == "$version" ]] || return 1
+  digest=$(printf '%s' "$body" | jq -r '.urls[0].digests.sha256 // empty' 2>/dev/null) || return 1
+  [[ -n "$digest" ]] || return 1
+  printf 'sha256-%s' "$digest"
 }
 
 # A trust escalation (host-allow add/update, scripts-allow add) must carry an
@@ -1810,24 +1815,10 @@ is_exact_version() {
 # registry cannot resolve returns nothing. Prints the integrity on an exact
 # match, nothing otherwise. Import writes only what this confirms.
 registry_verified_integrity() {
-  local pkg="$1" version="$2" ecosystem="$3" body resolved digest
+  local pkg="$1" version="$2" ecosystem="$3"
   case "$ecosystem" in
-    npm|bun)
-      body=$(curl -fsSL --max-time 10 "https://registry.npmjs.org/${pkg}/${version}" 2>/dev/null) || return 1
-      resolved=$(printf '%s' "$body" | jq -r '.version // empty' 2>/dev/null) || return 1
-      [[ "$resolved" == "$version" ]] || return 1
-      digest=$(printf '%s' "$body" | jq -r '.dist.integrity // .dist.shasum // empty' 2>/dev/null) || return 1
-      [[ -n "$digest" ]] || return 1
-      printf '%s' "$digest"
-      ;;
-    py|python|uv|pipx)
-      body=$(curl -fsSL --max-time 10 "https://pypi.org/pypi/${pkg}/${version}/json" 2>/dev/null) || return 1
-      resolved=$(printf '%s' "$body" | jq -r '.info.version // empty' 2>/dev/null) || return 1
-      [[ "$resolved" == "$version" ]] || return 1
-      digest=$(printf '%s' "$body" | jq -r '.urls[0].digests.sha256 // empty' 2>/dev/null) || return 1
-      [[ -n "$digest" ]] || return 1
-      printf 'sha256-%s' "$digest"
-      ;;
+    npm|bun) registry_integrity_npm "$pkg" "$version" ;;
+    py|python|uv|pipx) registry_integrity_pypi "$pkg" "$version" ;;
     *) return 1 ;;
   esac
 }
@@ -2102,6 +2093,17 @@ follow_export_key() {
   [[ "$primary" == "$fingerprint" ]]
 }
 
+follow_subkey_primary() {
+  local fingerprint="$1"
+  gpg --no-options --batch --with-colons --list-keys "$fingerprint" 2>/dev/null |
+    awk -F: -v want="$fingerprint" '
+      $1 == "pub" {record="pub"; primary=""; next}
+      $1 == "sub" {record="sub"; next}
+      $1 == "fpr" && record == "pub" {primary=$10; record="pub-fpr"; next}
+      $1 == "fpr" && record == "sub" && $10 == want {print primary; exit}
+    '
+}
+
 cmd_host_allow_follow_signer() (
   trust_redirected_guard write "host-allow-follow-signer"
   [[ $# == 2 && ( "$1" == "add" || "$1" == "remove" ) ]] ||
@@ -2123,6 +2125,11 @@ cmd_host_allow_follow_signer() (
   trap 'rm -rf -- "$staging"' EXIT
   if [[ "$action" == "add" ]]; then
     require_cmd gpg
+    local subkey_primary=""
+    subkey_primary=$(follow_subkey_primary "$fingerprint") || true
+    if [[ -n "$subkey_primary" ]]; then
+      die "subkey fingerprint $fingerprint belongs to primary key $subkey_primary; use the primary fingerprint with follow-signer add (subkeys are refused)"
+    fi
     follow_export_key "$fingerprint" "$staging/key.gpg" ||
       die "primary public key unavailable, revoked or expired; import the operator's public key into GPG, verify its full fingerprint, then retry follow-signer add"
   fi
@@ -2249,7 +2256,7 @@ follow_commit_generation() {
       if (.packages | type) != "object" then error("malformed host-allow store")
       elif (.packages | has($p)) then
         .packages[$p] |
-        if type == "object" then . + {version: (.version // "invalid")}
+        if type == "object" then . + {version: (if ((.version | type) == "string" and (.version | length) > 0) then .version else "invalid" end)}
         else {version: "invalid"}
         end
       else {} end') || return 1
@@ -2283,7 +2290,11 @@ follow_commit_generation() {
     if jq -e --arg host "$origin" --arg id "$id" '.origins[$host].refused // [] | index($id) != null' <<<"$state" >/dev/null; then
       already_refused=1
     fi
-    if (( already_refused )) && [[ "$local_version" != "$version" ]]; then
+    # A refusal is only authoritative when the local entry has no generation
+    # to compare. Once a generation exists, re-derive the decision below so a
+    # repaired local stamp can be compared without resurrecting equal/older
+    # refused identities.
+    if (( already_refused )) && [[ -z "$local_generation" && "$local_version" != "$version" ]]; then
       info "follow: skipped $id from $origin (generation $statement_generation was refused; local pin @${local_version:-absent})"
       failures=$((failures + 1)); continue
     fi
@@ -2529,7 +2540,7 @@ cmd_host_allow_add() {
     py|python|uv|pipx) sha=$(registry_integrity_pypi "$PKG_NAME" "$PKG_VERSION") || true ;;
     *) die "unknown --ecosystem: $ecosystem" ;;
   esac
-  [[ -z "$sha" ]] && warn "could not fetch integrity for ${PKG_NAME}@${PKG_VERSION} (added without SHA)"
+  [[ -n "$sha" ]] || die "could not verify ${PKG_NAME}@${PKG_VERSION} against the registry (unknown version or registry unreachable) — retry when the registry is reachable"
 
   write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem"
   info "added ${PKG_NAME}@${PKG_VERSION} to host-allow"
@@ -2594,7 +2605,7 @@ cmd_host_allow_update() {
     py|python|uv|pipx) sha=$(registry_integrity_pypi "$PKG_NAME" "$PKG_VERSION") || true ;;
     *) die "unknown --ecosystem: $ecosystem" ;;
   esac
-  [[ -z "$sha" ]] && warn "could not fetch integrity for ${PKG_NAME}@${PKG_VERSION} (updated without SHA)"
+  [[ -n "$sha" ]] || die "could not verify ${PKG_NAME}@${PKG_VERSION} against the registry (unknown version or registry unreachable) — retry when the registry is reachable"
   write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem"
   info "updated ${PKG_NAME}@${PKG_VERSION} in host-allow"
 }

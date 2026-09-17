@@ -92,7 +92,7 @@ safe run host-allow list
 safe run host-allow remove pnpm
 ```
 
-`host-allow add` and `host-allow update` are operator-only trust escalations: they require an interactive terminal and refuse in non-TTY shells with exit 102, so a cooperative agent can suggest the command verbatim but not execute it. (The TTY check is a cooperative-agent boundary, not proof of operator presence — a process that allocates a pseudo-terminal can satisfy it; see the residual-risk note in `install-wrappers.md`.) Both require a `--reason` — the audit trail for bypassing the sandbox default — and refuse without one.
+`host-allow add` and `host-allow update` are operator-only trust escalations: they require an interactive terminal and refuse in non-TTY shells with exit 102, so a cooperative agent can suggest the command verbatim but not execute it. (The TTY check is a cooperative-agent boundary, not proof of operator presence — a process that allocates a pseudo-terminal can satisfy it; see the residual-risk note in `install-wrappers.md`.) Both require a `--reason` — the audit trail for bypassing the sandbox default — and refuse without one. Each exact version is verified against its public registry before the trust-store writer runs; unknown or unreachable versions fail closed.
 
 ### Staleness review
 
@@ -188,6 +188,9 @@ store requires the same explicit trust override as a grant.
   entry is written only if its exact version resolves in the registry (returns
   an integrity); an unverifiable version is skipped, and a present-but-divergent
   hash (a mutated export, or a registry change) is skipped loudly.
+- A local entry whose version is missing, null, empty, or otherwise not a
+  non-empty string is reported as `@invalid`; valid sibling entries continue
+  through the same follow operation.
 - A package already pinned locally to a *different* version is never silently
   overwritten — the conflict is reported and left for an explicit
   `host-allow update`.
@@ -216,6 +219,8 @@ safe run host-allow follow-signer remove <full-primary-fingerprint>
 `~/.config/safe/run/config.json`; there is no generic config setter. It accepts
 full 40- or 64-hex primary fingerprints, requires the public key locally on add,
 and never fetches keys. Signing subkeys certified by that primary are accepted.
+A signing-subkey fingerprint passed to `follow-signer add` is refused, but the
+command identifies the matching primary fingerprint to use instead.
 Revoked or expired primary keys cannot be pinned. The two signer-management
 operations and signed export refuse non-TTY callers
 with exit 102. There is no `--yes` or `-y` override.
@@ -285,8 +290,11 @@ survives an equal generation; a newer signed generation re-aligns it to the
 publishing host's signed pin. A stale cross-origin statement is refused per
 identity with a WARN, counted as a failure, and left retryable until that origin
 publishes a newer generation. The refusal is remembered in the origin's optional
-`refused` array, so a same-generation retry prints an INFO skip and remains
-non-zero without replacing a later operator TTY re-pin. A hinted
+`refused` array. When the local entry carries no generation (an operator TTY
+re-pin or a removed grant), a same-generation retry prints a quiet INFO skip and
+remains non-zero without replacing that re-pin. When the local entry carries a
+generation, the refusal is re-derived against the incoming generation and WARNed
+on every run. A hinted
 `host-allow update` to the refused version makes the entry present and clears
 that refusal. A newer signed generation starts fresh applied and refused sets
 and can authorize grants again. After upgrading from a release that recorded
