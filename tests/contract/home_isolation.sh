@@ -74,6 +74,11 @@ if [[ $# -ge 2 && "$1" == prefix && "$2" == -g ]]; then
   if [[ "$PREFIX_MODE" == blocked ]]; then
     printf 'safe: BLOCKED npm — safe gate library not found\n'
     exit 100
+  elif [[ "$PREFIX_MODE" == warning ]]; then
+    printf 'npm: warning: using the configured global prefix\n' >&2
+  elif [[ "$PREFIX_MODE" == error ]]; then
+    printf 'npm: unable to determine global prefix\n' >&2
+    exit 7
   fi
   printf '%s\n' "$PREFIX_PATH"
   exit 0
@@ -83,14 +88,34 @@ STUB
 chmod +x "$npm_prefix_stub"
 mkdir -p "$valid_npm_prefix"
 
-if PREFIX_MODE=blocked PREFIX_PATH="$valid_npm_prefix" \
-  safe_test_npm_global_prefix "$npm_prefix_stub" >/dev/null; then
-  fail 'gate-bound npm refusal was treated as a usable prefix'
-elif [[ "$(safe_test_npm_global_prefix_skip_message)" == \
+if warning_prefix="$(PREFIX_MODE=warning PREFIX_PATH="$valid_npm_prefix" \
+  safe_test_npm_global_prefix "$npm_prefix_stub")" \
+  && [[ "$warning_prefix" == "$valid_npm_prefix" ]]; then
+  pass 'npm warning on stderr does not invalidate a valid stdout prefix'
+else
+  fail 'npm warning on stderr invalidated a valid stdout prefix'
+fi
+
+blocked_message=""
+blocked_rc=0
+blocked_message="$(PREFIX_MODE=blocked PREFIX_PATH="$valid_npm_prefix" \
+  safe_test_npm_global_prefix "$npm_prefix_stub")" || blocked_rc=$?
+if [[ "$blocked_rc" -ne 0 && "$blocked_message" == \
   'SKIP: npm delegate is gate-bound and refuses under the scratch HOME; live abbreviation oracle skipped' ]]; then
   pass 'gate-bound npm refusal selects the exact abbreviation-oracle SKIP'
 else
   fail 'gate-bound npm refusal did not select the exact abbreviation-oracle SKIP'
+fi
+
+error_message=""
+error_rc=0
+error_message="$(PREFIX_MODE=error PREFIX_PATH="$valid_npm_prefix" \
+  safe_test_npm_global_prefix "$npm_prefix_stub")" || error_rc=$?
+if [[ "$error_rc" -ne 0 && "$error_message" == \
+  'SKIP: npm global prefix unavailable (rc=7); live abbreviation oracle skipped' ]]; then
+  pass 'non-gate npm prefix failure reports its return code'
+else
+  fail 'non-gate npm prefix failure was mislabeled'
 fi
 
 if prefix="$(PREFIX_MODE=valid PREFIX_PATH="$valid_npm_prefix" \

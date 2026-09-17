@@ -34,7 +34,7 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 if ! prefix="$(safe_test_npm_global_prefix "$real_npm")"; then
-  safe_test_npm_global_prefix_skip_message
+  printf '%s\n' "$prefix"
   exit 0
 fi
 cmd_list="${prefix%/}/lib/node_modules/npm/lib/utils/cmd-list.js"

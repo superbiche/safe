@@ -18,15 +18,28 @@ safe_test_compose_exit_trap() {
 }
 
 safe_test_npm_global_prefix() {
-  local tool="$1" output
-  output="$("$tool" prefix -g 2>&1)" || return 1
-  [[ "$output" != *'safe: BLOCKED'* ]] || return 1
-  [[ -d "$output" ]] || return 1
-  printf '%s\n' "$output"
-}
-
-safe_test_npm_global_prefix_skip_message() {
-  printf '%s\n' 'SKIP: npm delegate is gate-bound and refuses under the scratch HOME; live abbreviation oracle skipped'
+  local tool="$1" stdout stderr err_file rc prefix line
+  err_file="$(mktemp "$TMPDIR/safe-test-npm-prefix.XXXXXX")" || {
+    printf 'SKIP: npm global prefix unavailable (rc=1); live abbreviation oracle skipped\n'
+    return 1
+  }
+  stdout="$("$tool" prefix -g 2>"$err_file")"
+  rc=$?
+  stderr="$(cat "$err_file")"
+  rm -f -- "$err_file"
+  prefix=""
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && prefix="$line"
+  done <<< "$stdout"
+  if printf '%s\n%s\n' "$stdout" "$stderr" | grep -Fq 'safe: BLOCKED'; then
+    printf '%s\n' 'SKIP: npm delegate is gate-bound and refuses under the scratch HOME; live abbreviation oracle skipped'
+    return 1
+  fi
+  if [[ "$rc" -ne 0 || ! -d "$prefix" ]]; then
+    printf 'SKIP: npm global prefix unavailable (rc=%s); live abbreviation oracle skipped\n' "$rc"
+    return 1
+  fi
+  printf '%s\n' "$prefix"
 }
 
 safe_test_normalize_path() {
