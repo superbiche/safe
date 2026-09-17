@@ -290,8 +290,11 @@ survives an equal generation; a newer signed generation re-aligns it to the
 publishing host's signed pin. A stale cross-origin statement is refused per
 identity with a WARN, counted as a failure, and left retryable until that origin
 publishes a newer generation. The refusal is remembered in the origin's optional
-`refused` array, so a same-generation retry prints an INFO skip and remains
-non-zero without replacing a later operator TTY re-pin. A hinted
+`refused` array. When the local entry carries no generation (an operator TTY
+re-pin or a removed grant), a same-generation retry prints a quiet INFO skip and
+remains non-zero without replacing that re-pin. When the local entry carries a
+generation, the refusal is re-derived against the incoming generation and WARNed
+on every run. A hinted
 `host-allow update` to the refused version makes the entry present and clears
 that refusal. A newer signed generation starts fresh applied and refused sets
 and can authorize grants again. After upgrading from a release that recorded
