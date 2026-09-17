@@ -2102,6 +2102,17 @@ follow_export_key() {
   [[ "$primary" == "$fingerprint" ]]
 }
 
+follow_subkey_primary() {
+  local fingerprint="$1"
+  gpg --no-options --batch --with-colons --list-keys "$fingerprint" 2>/dev/null |
+    awk -F: -v want="$fingerprint" '
+      $1 == "pub" {record="pub"; primary=""; next}
+      $1 == "sub" {record="sub"; next}
+      $1 == "fpr" && record == "pub" {primary=$10; record="pub-fpr"; next}
+      $1 == "fpr" && record == "sub" && $10 == want {print primary; exit}
+    '
+}
+
 cmd_host_allow_follow_signer() (
   trust_redirected_guard write "host-allow-follow-signer"
   [[ $# == 2 && ( "$1" == "add" || "$1" == "remove" ) ]] ||
@@ -2123,6 +2134,11 @@ cmd_host_allow_follow_signer() (
   trap 'rm -rf -- "$staging"' EXIT
   if [[ "$action" == "add" ]]; then
     require_cmd gpg
+    local subkey_primary=""
+    subkey_primary=$(follow_subkey_primary "$fingerprint") || true
+    if [[ -n "$subkey_primary" ]]; then
+      die "subkey fingerprint $fingerprint belongs to primary key $subkey_primary; use the primary fingerprint with follow-signer add (subkeys are refused)"
+    fi
     follow_export_key "$fingerprint" "$staging/key.gpg" ||
       die "primary public key unavailable, revoked or expired; import the operator's public key into GPG, verify its full fingerprint, then retry follow-signer add"
   fi

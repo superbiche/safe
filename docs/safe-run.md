@@ -219,6 +219,8 @@ safe run host-allow follow-signer remove <full-primary-fingerprint>
 `~/.config/safe/run/config.json`; there is no generic config setter. It accepts
 full 40- or 64-hex primary fingerprints, requires the public key locally on add,
 and never fetches keys. Signing subkeys certified by that primary are accepted.
+A signing-subkey fingerprint passed to `follow-signer add` is refused, but the
+command identifies the matching primary fingerprint to use instead.
 Revoked or expired primary keys cannot be pinned. The two signer-management
 operations and signed export refuse non-TTY callers
 with exit 102. There is no `--yes` or `-y` override.

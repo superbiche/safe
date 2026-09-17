@@ -393,6 +393,14 @@ cp "$export_file" "$tmp/incoming/host-allow.rainbow.json"
 sign_document "$subkey!" "$tmp/incoming/host-allow.rainbow.json"
 expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
 pass 'signing subkey verifies through its pinned primary fingerprint'
+cp "$SAFE_RUN_CONFIG_DIR/config.json" "$tmp/config-before-subkey-add.json"
+if pty_run "$SAFE_RUN" host-allow follow-signer add "$subkey" > "$tmp/output" 2>&1; then
+  fail 'subkey fingerprint was accepted as a follow signer'
+fi
+grep -q 'subkey' "$tmp/output" || fail 'subkey refusal did not identify the supplied fingerprint as a subkey'
+grep -q "$fingerprint" "$tmp/output" || fail 'subkey refusal did not print the primary fingerprint'
+cmp "$tmp/config-before-subkey-add.json" "$SAFE_RUN_CONFIG_DIR/config.json" || fail 'subkey signer refusal changed config'
+pass 'follow-signer add identifies a subkey and names its primary fingerprint'
 
 # With no safe-specific selector, respect GPG's configured default key.
 jq 'del(.follow.signing_key)' "$SAFE_RUN_CONFIG_DIR/config.json" > "$tmp/config-next.json"

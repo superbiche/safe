@@ -94,7 +94,8 @@ exports in an isolated keyring containing only these authorities (including
 their certified signing subkeys), honouring key revocation/expiry and signature
 expiry. Update revocation information in the follower's local GPG keyring;
 verification never fetches keys. Unrelated expired/revoked subkeys do not
-invalidate a good signature. `follow-state.json`, beside the guard-selected
+invalidate a good signature. A subkey fingerprint passed to `follow-signer add`
+is refused with the matching primary fingerprint to use instead. `follow-state.json`, beside the guard-selected
 host-allow store, records per-origin `{accepted, applied:["pkg@version"],
 replaced:["pkg@old->new"], refused:["pkg@version"]}` and must remain local. Followed store entries also
 carry `followed_from` and `followed_generation` so the newest signed statement
