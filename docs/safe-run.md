@@ -92,7 +92,7 @@ safe run host-allow list
 safe run host-allow remove pnpm
 ```
 
-`host-allow add` and `host-allow update` are operator-only trust escalations: they require an interactive terminal and refuse in non-TTY shells with exit 102, so a cooperative agent can suggest the command verbatim but not execute it. (The TTY check is a cooperative-agent boundary, not proof of operator presence — a process that allocates a pseudo-terminal can satisfy it; see the residual-risk note in `install-wrappers.md`.) Both require a `--reason` — the audit trail for bypassing the sandbox default — and refuse without one.
+`host-allow add` and `host-allow update` are operator-only trust escalations: they require an interactive terminal and refuse in non-TTY shells with exit 102, so a cooperative agent can suggest the command verbatim but not execute it. (The TTY check is a cooperative-agent boundary, not proof of operator presence — a process that allocates a pseudo-terminal can satisfy it; see the residual-risk note in `install-wrappers.md`.) Both require a `--reason` — the audit trail for bypassing the sandbox default — and refuse without one. Each exact version is verified against its public registry before the trust-store writer runs; unknown or unreachable versions fail closed.
 
 ### Staleness review
 

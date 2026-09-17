@@ -1647,20 +1647,25 @@ handle_runner_invocation() {
 # Subcommands: host-allow
 # ---------------------------------------------------------------------------
 registry_integrity_npm() {
-  local pkg="$1" version="$2"
+  local pkg="$1" version="$2" body resolved digest
   local url="https://registry.npmjs.org/${pkg}/${version}"
-  local body
-  body=$(curl -fsSL "$url" 2>/dev/null) || return 1
-  printf '%s' "$body" | jq -r '.dist.integrity // .dist.shasum // empty'
+  body=$(curl -fsSL --max-time 10 "$url" 2>/dev/null) || return 1
+  resolved=$(printf '%s' "$body" | jq -r '.version // empty' 2>/dev/null) || return 1
+  [[ "$resolved" == "$version" ]] || return 1
+  digest=$(printf '%s' "$body" | jq -r '.dist.integrity // .dist.shasum // empty' 2>/dev/null) || return 1
+  [[ -n "$digest" ]] || return 1
+  printf '%s' "$digest"
 }
 
 registry_integrity_pypi() {
-  local pkg="$1" version="$2"
+  local pkg="$1" version="$2" body resolved digest
   local url="https://pypi.org/pypi/${pkg}/${version}/json"
-  local body
-  body=$(curl -fsSL "$url" 2>/dev/null) || return 1
-  printf '%s' "$body" | jq -r '.urls[0].digests.sha256 // empty' | \
-    sed 's/^/sha256-/'
+  body=$(curl -fsSL --max-time 10 "$url" 2>/dev/null) || return 1
+  resolved=$(printf '%s' "$body" | jq -r '.info.version // empty' 2>/dev/null) || return 1
+  [[ "$resolved" == "$version" ]] || return 1
+  digest=$(printf '%s' "$body" | jq -r '.urls[0].digests.sha256 // empty' 2>/dev/null) || return 1
+  [[ -n "$digest" ]] || return 1
+  printf 'sha256-%s' "$digest"
 }
 
 # A trust escalation (host-allow add/update, scripts-allow add) must carry an
@@ -1810,24 +1815,10 @@ is_exact_version() {
 # registry cannot resolve returns nothing. Prints the integrity on an exact
 # match, nothing otherwise. Import writes only what this confirms.
 registry_verified_integrity() {
-  local pkg="$1" version="$2" ecosystem="$3" body resolved digest
+  local pkg="$1" version="$2" ecosystem="$3"
   case "$ecosystem" in
-    npm|bun)
-      body=$(curl -fsSL --max-time 10 "https://registry.npmjs.org/${pkg}/${version}" 2>/dev/null) || return 1
-      resolved=$(printf '%s' "$body" | jq -r '.version // empty' 2>/dev/null) || return 1
-      [[ "$resolved" == "$version" ]] || return 1
-      digest=$(printf '%s' "$body" | jq -r '.dist.integrity // .dist.shasum // empty' 2>/dev/null) || return 1
-      [[ -n "$digest" ]] || return 1
-      printf '%s' "$digest"
-      ;;
-    py|python|uv|pipx)
-      body=$(curl -fsSL --max-time 10 "https://pypi.org/pypi/${pkg}/${version}/json" 2>/dev/null) || return 1
-      resolved=$(printf '%s' "$body" | jq -r '.info.version // empty' 2>/dev/null) || return 1
-      [[ "$resolved" == "$version" ]] || return 1
-      digest=$(printf '%s' "$body" | jq -r '.urls[0].digests.sha256 // empty' 2>/dev/null) || return 1
-      [[ -n "$digest" ]] || return 1
-      printf 'sha256-%s' "$digest"
-      ;;
+    npm|bun) registry_integrity_npm "$pkg" "$version" ;;
+    py|python|uv|pipx) registry_integrity_pypi "$pkg" "$version" ;;
     *) return 1 ;;
   esac
 }
@@ -2549,7 +2540,7 @@ cmd_host_allow_add() {
     py|python|uv|pipx) sha=$(registry_integrity_pypi "$PKG_NAME" "$PKG_VERSION") || true ;;
     *) die "unknown --ecosystem: $ecosystem" ;;
   esac
-  [[ -z "$sha" ]] && warn "could not fetch integrity for ${PKG_NAME}@${PKG_VERSION} (added without SHA)"
+  [[ -n "$sha" ]] || die "could not verify ${PKG_NAME}@${PKG_VERSION} against the registry (unknown version or registry unreachable)"
 
   write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem"
   info "added ${PKG_NAME}@${PKG_VERSION} to host-allow"
@@ -2614,7 +2605,7 @@ cmd_host_allow_update() {
     py|python|uv|pipx) sha=$(registry_integrity_pypi "$PKG_NAME" "$PKG_VERSION") || true ;;
     *) die "unknown --ecosystem: $ecosystem" ;;
   esac
-  [[ -z "$sha" ]] && warn "could not fetch integrity for ${PKG_NAME}@${PKG_VERSION} (updated without SHA)"
+  [[ -n "$sha" ]] || die "could not verify ${PKG_NAME}@${PKG_VERSION} against the registry (unknown version or registry unreachable)"
   write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem"
   info "updated ${PKG_NAME}@${PKG_VERSION} in host-allow"
 }

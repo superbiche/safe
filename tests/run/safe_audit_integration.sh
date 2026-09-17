@@ -868,6 +868,47 @@ SAFE_AUDIT_PROBE_LOG="$tmp/grant-go-probe.log" \
 [[ -s "$tmp/grant-go-probe.log" ]] || fail "grant preflight did not audit on a clean add"
 pass "host-allow add audits host-side and a clean GO proceeds"
 
+# A grant must not be recorded when the exact registry version cannot be
+# confirmed. This is the same fail-closed existence check import/follow use.
+SAFE_RUN_CONFIG_DIR="$tmp/config-grant-unknown-add" SAFE_RUN_DATA_DIR="$tmp/data-grant-unknown-add" \
+SAFE_RUN_PATH="$SAFE_RUN" \
+ERR_FILE="$tmp/grant-unknown-add.err" \
+  bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    ensure_dirs
+    registry_integrity_npm() { return 1; }
+    require_operator_tty() { :; }
+    set +e
+    ( cmd_host_allow_add nonexistent-pkg@9.9.9 --reason "unknown" ) >/dev/null 2>"$ERR_FILE"
+    grc=$?
+    set -e
+    [[ "$grc" -ne 0 ]] || exit 1
+    grep -q "could not verify nonexistent-pkg@9.9.9" "$ERR_FILE" || exit 1
+    [[ "$(jq -r ".packages | length" "$HOST_ALLOW_FILE")" == "0" ]] || exit 1
+  ' safe-run || fail "host-allow add accepted an unverified registry version"
+pass "host-allow add refuses an unverified exact registry version"
+
+SAFE_RUN_CONFIG_DIR="$tmp/config-grant-unknown-update" SAFE_RUN_DATA_DIR="$tmp/data-grant-unknown-update" \
+SAFE_RUN_PATH="$SAFE_RUN" \
+ERR_FILE="$tmp/grant-unknown-update.err" \
+  bash -c '
+    set -- version
+    source "$SAFE_RUN_PATH" >/dev/null
+    ensure_dirs
+    printf '"'"'{"packages":{"known-pkg":{"version":"1.0.0","reason":"old","ecosystem":"npm"}}}'"'"' > "$HOST_ALLOW_FILE"
+    registry_integrity_npm() { return 1; }
+    require_operator_tty() { :; }
+    set +e
+    ( cmd_host_allow_update known-pkg@2.0.0 --reason "unknown" ) >/dev/null 2>"$ERR_FILE"
+    grc=$?
+    set -e
+    [[ "$grc" -ne 0 ]] || exit 1
+    grep -q "could not verify known-pkg@2.0.0" "$ERR_FILE" || exit 1
+    [[ "$(jq -r ".packages[\"known-pkg\"].version" "$HOST_ALLOW_FILE")" == "1.0.0" ]] || exit 1
+  ' safe-run || fail "host-allow update accepted an unverified registry version"
+pass "host-allow update refuses an unverified exact registry version"
+
 # L: infra-only WARN never blocks a grant (audit breakage != package finding).
 SAFE_RUN_CONFIG_DIR="$tmp/config-grant-infra" SAFE_RUN_DATA_DIR="$tmp/data-grant-infra" \
 SAFE_RUN_PATH="$SAFE_RUN" \

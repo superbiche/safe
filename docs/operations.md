@@ -71,7 +71,8 @@ safe run host-allow import allow.json --dry-run # machine 2: preview the delta
 safe run host-allow import allow.json           # machine 2: reviewed apply (TTY)
 ```
 
-`import` re-validates and re-fetches integrity for every entry, never overwrites
+`add` and `update` verify the exact requested version and fetch its integrity
+from the public registry before writing. `import` re-validates and re-fetches integrity for every entry, never overwrites
 a divergent local pin, and refuses in non-TTY shells (exit 102) unless
 `--dry-run`. For unattended fleet followers, opt in to signed UNION replication:
 

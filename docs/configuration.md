@@ -71,7 +71,9 @@ hard privilege boundary.
 
 `host-allow.json` stores pinned package versions allowed to execute on the host.
 Existing entries with retired metadata are ignored; newly written entries use
-only the current pinned-version schema.
+only the current pinned-version schema. `host-allow add` and `update` verify the
+exact version against its registry and obtain fresh integrity before writing;
+an unknown or unreachable version is refused.
 
 `blocked.json` stores package names or patterns that should never run.
 

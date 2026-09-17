@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Re-derive generation-bearing follow refusals before each comparison, while
+  keeping equal and older generations refused; empty local versions now fail
+  closed without blocking valid sibling entries.
+- Explain the primary fingerprint when `follow-signer add` receives a signing
+  subkey, while continuing to refuse the subkey.
+- Require `host-allow add` and `update` to verify the exact registry version
+  and integrity before writing the trust store.
+
 ## 1.64.0 - 2026-09-17
 
 - Signed `host-allow follow` pins replace different local pins, recording the
