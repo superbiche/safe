@@ -12,13 +12,26 @@ safe_test_setup_isolation || exit 1
 pass() { printf 'ok - %s\n' "$*"; }
 fail() { printf 'not ok - %s\n' "$*" >&2; exit 1; }
 
+fixture_allowlist=(
+  "$ROOT/tests/fixtures/release_follow_pre_fix.sh"
+)
+
 while IFS= read -r -d '' suite; do
   [[ "$suite" == "$ROOT/tests/lib/"* ]] && continue
   if [[ "$suite" == "$ROOT/tests/fixtures/"* ]]; then
-    [[ ! -x "$suite" ]] || fail "fixture must not be executable: ${suite#"$ROOT"/}"
-    grep -Fq 'SAFE_RELEASE_FOLLOW_PRE_FIX_FIXTURE' "$suite" || \
-      fail "fixture lacks its explicit test-only invocation guard: ${suite#"$ROOT"/}"
-    continue
+    fixture_known=0
+    for fixture in "${fixture_allowlist[@]}"; do
+      if [[ "$suite" == "$fixture" ]]; then
+        fixture_known=1
+        break
+      fi
+    done
+    if (( fixture_known )); then
+      [[ ! -x "$suite" ]] || fail "fixture must not be executable: ${suite#"$ROOT"/}"
+      grep -Fq 'SAFE_RELEASE_FOLLOW_PRE_FIX_FIXTURE' "$suite" || \
+        fail "fixture lacks its explicit test-only invocation guard: ${suite#"$ROOT"/}"
+      continue
+    fi
   fi
   grep -Eq '^[[:space:]]*#[[:space:]]*SAFE_TEST_ISOLATION_MARKER([[:space:]:]|$)' "$suite" || fail "missing isolation marker: ${suite#"$ROOT"/}"
   grep -Eq '^[[:space:]]*(source|\.)[[:space:]].*test-isolation\.sh' "$suite" || fail "missing isolation helper source: ${suite#"$ROOT"/}"
@@ -26,6 +39,23 @@ while IFS= read -r -d '' suite; do
   grep -Eq '^[[:space:]]*trap .* EXIT' "$suite" && fail "suite replaces composed EXIT trap: ${suite#"$ROOT"/}"
 done < <(find "$ROOT/tests" -mindepth 2 -type f -name '*.sh' -print0)
 pass 'every suite carries the isolation helper and marker'
+
+case_fixture_allowlist_rejects_unknown_fixture() {
+  local sandbox="$SAFE_TEST_ROOT/fixture-allowlist" contract
+  mkdir -p "$sandbox"
+  cp -rL "$ROOT/tests" "$sandbox/"
+  contract="$sandbox/tests/contract/home_isolation.sh"
+  printf '%s\n' '#!/usr/bin/env bash' '# SAFE_RELEASE_FOLLOW_PRE_FIX_FIXTURE' > "$sandbox/tests/fixtures/rogue.sh"
+  chmod 644 "$sandbox/tests/fixtures/rogue.sh"
+  sed -i '/^case_fixture_allowlist_rejects_unknown_fixture$/d' "$contract"
+  if bash "$contract" >"$sandbox/output" 2>&1; then
+    fail 'unknown fixture bypassed the home-isolation tripwire'
+  else
+    pass 'unknown fixture is rejected by the home-isolation tripwire'
+  fi
+}
+
+case_fixture_allowlist_rejects_unknown_fixture
 
 grep -Eq '^[[:space:]]*unset SAFE_TEST_ISOLATION_KEEP_TOOLS$' "$ROOT/tests/run-all.sh" || fail 'aggregate does not clear ambient live-tool opt'
 grep -Eq '^[[:space:]]*env -u SAFE_TEST_ISOLATION_KEEP_TOOLS bash ' "$ROOT/tests/run-all.sh" || fail 'aggregate does not clear live-tool opt for child suites'

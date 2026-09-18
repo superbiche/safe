@@ -105,9 +105,14 @@ case_hand_editing_a_generated_block_is_caught() {
 }
 
 case_release_follow_tree_has_no_gitattributes() {
+  local tracked_files
   # The follower refuses a signed .gitattributes because reproducing Git's
   # archive attribute transformations inside the tree-hash check is unsafe.
-  if git -C "$ROOT" ls-files | grep -Eq '(^|/)\.gitattributes$'; then
+  tracked_files=$(git -C "$ROOT" ls-files) || {
+    fail 'release-follow tree could not be enumerated'
+    return
+  }
+  if grep -Eq '(^|/)\.gitattributes$' <<<"$tracked_files"; then
     fail 'release-follow refuses .gitattributes trees'
   else
     pass 'release-follow tree has no .gitattributes'

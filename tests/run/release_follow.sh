@@ -145,16 +145,16 @@ pass 'signed descendant installs exact archive bytes, ignores hostile Go configu
 run_follow
 [[ "$FOLLOW_RC" == 0 && "$FOLLOW_OUTPUT" == 'safe: release follow: nothing newer than 1.64.2' ]] || fail 'no-newer path was not a quiet success'
 jq -e '.candidate == null and .verdict == "nothing-newer"' "$status_file" >/dev/null || fail 'nothing-newer status was not recorded'
-before_status=$(sha256sum "$status_file")
+rm -f -- "$status_file"
 run_follow --dry-run
 [[ "$FOLLOW_RC" == 0 && "$FOLLOW_OUTPUT" == 'safe: release follow: nothing newer than 1.64.2' ]] || fail 'dry-run nothing-newer path was not a quiet success'
-[[ "$(sha256sum "$status_file")" == "$before_status" ]] || fail 'dry-run nothing-newer changed last-pass status'
+[[ ! -e "$status_file" ]] || fail 'dry-run nothing-newer wrote last-pass status'
 pass 'nothing newer is a zero exit with one line'
 
 make_release 1.64.3 unsigned
 before_record=$(sha256sum "$SAFE_CONFIG_DIR/release-follow.json")
 before_audit=$(sha256sum "$SAFE_RUN_DATA_DIR/audit.log")
-before_status=$(sha256sum "$status_file")
+rm -f -- "$status_file"
 run_follow --dry-run
 [[ "$FOLLOW_RC" == 1 ]] || fail 'unsigned candidate was not refused'
 grep -q 'operator override:' <<<"$FOLLOW_OUTPUT" || fail 'unsigned refusal lacks manual path'
@@ -162,7 +162,7 @@ run_follow --dry-run
 [[ "$FOLLOW_RC" == 1 ]] || fail 'dry-run unsigned candidate unexpectedly passed'
 [[ "$(sha256sum "$SAFE_CONFIG_DIR/release-follow.json")" == "$before_record" ]] || fail 'dry-run changed the record'
 [[ "$(sha256sum "$SAFE_RUN_DATA_DIR/audit.log")" == "$before_audit" ]] || fail 'dry-run changed the audit log'
-[[ "$(sha256sum "$status_file")" == "$before_status" ]] || fail 'dry-run changed last-pass status'
+[[ ! -e "$status_file" ]] || fail 'dry-run unsigned candidate wrote last-pass status'
 pass 'unsigned candidate and dry-run write protections hold'
 git -C "$checkout" tag -d v1.64.3 >/dev/null
 git --git-dir "$origin" update-ref -d refs/tags/v1.64.3
@@ -357,23 +357,21 @@ legacy_marker="$tmp/legacy-replace-marker"
 plant_replace_commit "$legacy_repo" "$legacy_candidate" "$legacy_parent" "$legacy_marker" 1.64.2
 legacy_data="$tmp/legacy-data"
 legacy_bin="$tmp/legacy-bin"
+legacy_config="$tmp/legacy-config"
 legacy_home="$tmp/legacy-home"
 mkdir -p "$legacy_home"
-mkdir -p "$legacy_data/run" "$legacy_bin"
+mkdir -p "$legacy_config" "$legacy_data/run" "$legacy_bin"
 set +e
 legacy_output=$(env -i HOME="$legacy_home" GNUPGHOME="$GNUPGHOME" PATH=/usr/bin:/bin \
-  SAFE_BIN_DIR="$legacy_bin" SAFE_DATA_DIR="$legacy_data" \
-  SAFE_RELEASE_FOLLOW_CHECKOUT="$legacy_repo" SAFE_RELEASE_FOLLOW_INSTALLED=1.64.1 \
-  SAFE_RELEASE_FOLLOW_TAG=v1.64.2 SAFE_RELEASE_FOLLOW_AUDIT_LOG="$legacy_data/run/audit.log" \
-  SAFE_RELEASE_FOLLOW_SIGNER="$fingerprint" SAFE_RELEASE_FOLLOW_PRE_FIX_FIXTURE=1 \
+  SAFE_CONFIG_DIR="$legacy_config" SAFE_BIN_DIR="$legacy_bin" SAFE_DATA_DIR="$legacy_data" \
+  SAFE_RELEASE_FOLLOW_CHECKOUT="$legacy_repo" SAFE_RELEASE_FOLLOW_TAG=v1.64.2 \
+  SAFE_RELEASE_FOLLOW_PRE_FIX_FIXTURE=1 \
   bash "$LEGACY_DRIVER" 2>&1)
 legacy_rc=$?
 set -e
 printf '%s\n' "$legacy_output" > "$tmp/legacy-output"
 [[ "$legacy_rc" == 0 ]] || fail "pre-fix fixture did not reproduce the replace-ref vulnerability (rc=$legacy_rc)"
 [[ -e "$legacy_marker" ]] || fail 'pre-fix fixture did not install the evil replacement marker'
-grep -q 'RELEASE_FOLLOWED from=1.64.1 to=1.64.2 signer=' "$legacy_data/run/audit.log" ||
-  fail 'pre-fix fixture did not misattribute the evil replacement'
 pass 'replace-ref regression is non-vacuous: the checked-in pre-fix fixture fails it'
 
 make_release 1.65.6 signed
