@@ -343,6 +343,68 @@ TTY checks and user-writable configuration retain safe's existing cooperative
 agent boundary; they are not an OS-level defense against a hostile same-user
 process.
 
+## Safe release follow
+
+Each follower can update `safe` from its own checkout without a TTY, prompt, or
+sudo:
+
+```bash
+safe release follow --dry-run
+safe release follow
+```
+
+`install.sh` records its absolute source checkout and the selected install
+components in the local `$SAFE_CONFIG_DIR/release-follow.json` file. The file
+must be a regular local file; it is not a synced trust artifact. A missing,
+malformed, or non-git checkout refuses with the manual `git pull --ff-only &&
+bash install.sh --all` recovery path. `--checkout <dir>` is an explicit source
+override and is useful when repairing a missing record; it does not change the
+record during a dry run.
+
+Follow fetches tags from the checkout's existing `origin` with a 30-second
+timeout. It considers only strict, non-pre-release `vX.Y.Z` tags newer than the
+installed version. The selected tag must be an annotated tag whose embedded
+name equals its ref, points directly to a commit descended from the installed
+version's tag commit, and carries a valid OpenPGP signature from a primary
+fingerprint already pinned in `follow.signers`. The verifier extracts the tag
+payload and signature from the tag object, uses an isolated keyring containing
+only the pinned public keys, and ignores ambient Git signing configuration and
+the user keyring. Lightweight tags, non-OpenPGP signatures, revoked or expired
+key/signature status, bad signatures, and unpinned signers refuse.
+The origin must be fetchable with no agent and no credentials (anonymous HTTPS url, SSH pushurl is fine).
+
+The verified commit is archived into a private temporary directory, its
+`VERSION` is checked against the tag, and that tree's `install.sh` is run with
+the recorded component flags. The working tree is never the install source.
+Before installation, the follower computes the extracted archive tree in a
+throwaway Git repository with checkout attributes and hooks disabled and
+requires it to equal the verified commit tree. Checkout-local attributes that
+filter the archive therefore refuse; a signed `.gitattributes` in the release
+also refuses because its archive transformations are not treated as a safe
+tree-hash input.
+After a successful version check, the checkout's default branch advances only
+when clean and fast-forwardable; a dirty or diverged checkout produces a WARN
+after installation. `install.sh` currently replaces some live files with
+direct writes, so the lock serializes passes but cannot make a killed install
+an all-files transaction; the installed surface may be mixed until the normal
+manual repair path is run.
+The ancestry check still uses the installed version tag in the writable
+checkout; a canonical run-store lineage anchor is outside this lane's scope.
+
+Each non-dry pass atomically records its UTC time, installed-before version,
+candidate, and verdict in the local
+`$SAFE_CONFIG_DIR/release-follow-status.json`. `safe status` adds one line such
+as `release follow: installed 2h ago`, or `release follow: never run`. A
+refusal or a state older than three days appears as
+`.environment.release_follow.warning` in `safe doctor --json`.
+
+Every non-dry refusal returns non-zero, prints the manual operator path, and
+records a refusal in `~/.local/share/safe/run/audit.log`. A confirmed update
+records `RELEASE_FOLLOWED from=<old> to=<new> signer=<primary-fingerprint>
+tag_object=<sha>`. No newer tag is a quiet exit-0 no-op. Removing a signer at a
+TTY stops future release acceptance; it does not roll back an already installed
+release.
+
 ## Scripts Allowlist
 
 `~/.npmrc` keeps `ignore-scripts=true` globally, so a package whose

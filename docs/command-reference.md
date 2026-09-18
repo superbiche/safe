@@ -10,6 +10,7 @@ safe install [-g|--global] [--yes] <pkg> [...]
 safe install --manager npm|pnpm|yarn|bun|composer -g [--yes] [--trust-host] <pkg> [...]
 safe install --sandbox [--allow-scripts] <pkg> [...]
 safe vendor update --name NAME --path PATH --reason TEXT -- COMMAND...
+safe release follow [--dry-run] [--checkout <dir>]
 safe setup [<machine> | --all | --machine <csv>]
 safe status
 safe doctor [--json]
@@ -29,6 +30,9 @@ operator-only allow flows. `--json` emits the same contract as data.
 check, captures the evidence while it is still true, and writes a dated note
 in safe's own `inbox/` for the operator to validate. It changes nothing —
 no allowlist entry, no verdict, no trust state.
+
+`safe status` includes one release-follow line: `release follow: <verdict>
+<age>`, or `release follow: never run` when no non-dry pass has recorded state.
 
 ### Policy exit codes
 

@@ -111,6 +111,35 @@ An equal generation with nothing pending returns 0 with one info line. Legacy
 string-only records require operator review/migration, never silent reset.
 Both operations retain the redirected-store guard. See [signed follower import](safe-run.md#signed-follower-import).
 
+`release-follow.json` is a machine-local regular file written by `install.sh`.
+It records the absolute source checkout and the union of normalized installer
+component flags from successful `install.sh` invocations:
+
+```json
+{"schema":"safe-release-follow/1","checkout":"/absolute/path/to/safe","install_flags":["--run"]}
+```
+
+Do not synchronize this file or replace it with a symlink. `safe release follow`
+refuses a missing or malformed record unless an explicit `--checkout` repair
+path is supplied. The record does not pin trust; release trust remains solely
+in the TTY-managed `follow.signers` list. `--no-wrappers` keeps wrappers out of
+the recorded union when none were previously installed; it does not remove
+wrappers already present in that union.
+
+`release-follow-status.json` is a machine-local regular file written after
+each non-dry release-follow pass. It is atomically replaced and has this
+shape:
+
+```json
+{"schema":"safe-release-follow/1","time":"2026-09-18T12:00:00Z","installed_before":"1.64.1","candidate":"v1.64.2","verdict":"installed"}
+```
+
+The candidate is `null` when there was no candidate or the pass refused before
+selecting one. Verdicts are `installed`, `nothing-newer`, or
+`refused`. Dry runs do not write this file. `safe status` reads
+it for the release-follow age line, and `safe doctor --json` exposes its last
+pass and warnings under `environment.release_follow`.
+
 `config.json` stores runtime defaults, linked runner paths, sandbox limits, warning behavior, and the install-gate policy:
 
 ```json

@@ -26,6 +26,7 @@ safe_test_setup_isolation || exit 1
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SAFE_AUDIT="$ROOT/bin/safe-audit"
+SAFE="$ROOT/bin/safe"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -107,6 +108,61 @@ run_case "machine_grype_db_healthy" 'machine_grype_db_healthy local >/dev/null 2
 # grype_db_health_json directly (raw + stderr), writing health JSON to a file
 # inside the case scratch dir so only its own working files are under test.
 run_case "grype_db_health_json" 'grype_db_health_json local "$CASE_OUT/health.out" >/dev/null 2>&1 || true'
+
+run_release_follow_refusal_case() {
+  local scratch outdir count
+  scratch="$(mktemp -d)"
+  outdir="$(mktemp -d)"
+  count="$(
+    SAFE="$SAFE" CASE_TMP="$scratch" CASE_OUT="$outdir" bash -c '
+      set -euo pipefail
+      export TMPDIR="$CASE_TMP" HOME="$CASE_OUT/home"
+      repo="$CASE_OUT/repo"
+      origin="$CASE_OUT/origin.git"
+      config="$CASE_OUT/config"
+      data="$CASE_OUT/data"
+      bin="$CASE_OUT/bin"
+      mkdir -p "$HOME" "$config" "$data" "$bin"
+      git init --quiet "$repo"
+      git init --bare --quiet "$origin"
+      git -C "$repo" config user.name "tempfile hygiene"
+      git -C "$repo" config user.email hygiene@example.invalid
+      printf "1.64.1\n" > "$repo/VERSION"
+      git -C "$repo" add VERSION
+      git -C "$repo" commit --quiet -m base
+      git -C "$repo" tag -a -m v1.64.1 v1.64.1
+      git -C "$repo" remote add origin "$origin"
+      git -C "$repo" push --quiet origin HEAD refs/tags/v1.64.1
+      printf "1.64.2\n" > "$repo/VERSION"
+      git -C "$repo" add VERSION
+      git -C "$repo" commit --quiet -m candidate
+      git -C "$repo" tag -a -m v1.64.2 v1.64.2
+      git -C "$repo" push --quiet origin HEAD refs/tags/v1.64.2
+      printf "{\"schema\":\"safe-release-follow/1\",\"checkout\":\"%s\",\"install_flags\":[\"--run\"]}\n" "$repo" > "$config/release-follow.json"
+      set +e
+      SAFE_CONFIG_DIR="$config" SAFE_DATA_DIR="$data" SAFE_BIN_DIR="$bin" \
+        SAFE_RUN_CONFIG_DIR="$HOME/.config/safe/run" SAFE_RUN_DATA_DIR="$data/run" \
+        PATH=/usr/bin:/bin "$SAFE" release follow > "$CASE_OUT/follow.out" 2>&1
+      rc=$?
+      set -e
+      [ "$rc" -ne 0 ]
+      left=0
+      for entry in "$TMPDIR"/safe-release-follow.* "$TMPDIR"/safe-release-archive.*; do
+        [ -e "$entry" ] || continue
+        left=$((left + 1))
+      done
+      printf "%s" "$left"
+    '
+  )"
+  rm -rf "$scratch" "$outdir"
+  if [[ "$count" == 0 ]]; then
+    pass "release follow refusal leaves no staging directories in \$TMPDIR"
+  else
+    fail "release follow refusal left $count staging directories in \$TMPDIR"
+  fi
+}
+
+run_release_follow_refusal_case
 
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
