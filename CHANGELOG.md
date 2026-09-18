@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.65.0 - 2026-09-18
+
 - Add unattended `safe release follow`, which fetches and verifies the highest
   signed descendant release from the recorded checkout, installs its exact
   archive bytes with the recorded installer flags, and logs the result.
