@@ -56,6 +56,7 @@ PATH=/usr/bin:/bin SAFE_BIN_DIR="$SAFE_BIN_DIR" SAFE_CONFIG_DIR="$SAFE_CONFIG_DI
   >/dev/null 2>&1 || fail 'base fixture install failed'
 driver="$SAFE_BIN_DIR/safe"
 [[ "$(SAFE_CONFIG_DIR="$SAFE_CONFIG_DIR" SAFE_DATA_DIR="$SAFE_DATA_DIR" "$driver" --version 2>/dev/null | sed -n '1s/^safe //p')" == 1.64.1 ]] || fail 'base safe version not installed'
+status_file="$SAFE_CONFIG_DIR/release-follow-status.json"
 
 mkdir -p "$HOME/.config/go"
 printf 'GOTOOLCHAIN=go1.99.0\n' > "$HOME/.config/go/env"
@@ -129,16 +130,23 @@ run_follow
 grep -q 'installed v1.64.2 signer=' <<<"$FOLLOW_OUTPUT" || fail "happy path did not report signer: $FOLLOW_OUTPUT"
 grep -q "RELEASE_FOLLOWED from=1.64.1 to=1.64.2 signer=$fingerprint tag_object=" "$SAFE_RUN_DATA_DIR/audit.log" || fail 'follow event missing'
 [[ "$(SAFE_CONFIG_DIR="$SAFE_CONFIG_DIR" SAFE_DATA_DIR="$SAFE_DATA_DIR" "$SAFE_BIN_DIR/safe" --version 2>/dev/null | sed -n '1s/^safe //p')" == 1.64.2 ]] || fail 'happy path installed wrong version'
+[[ -f "$status_file" && ! -L "$status_file" ]] || fail 'last-pass status file is not a regular file'
+jq -e '.installed_before == "1.64.1" and .candidate == "v1.64.2" and .verdict == "installed" and (.time | strings)' "$status_file" >/dev/null ||
+  fail 'installed last-pass status is malformed'
+status_output=$(SAFE_CONFIG_DIR="$SAFE_CONFIG_DIR" SAFE_DATA_DIR="$SAFE_DATA_DIR" "$driver" status 2>/dev/null)
+grep -q '^release follow: installed ' <<<"$status_output" || fail 'status did not print the installed release-follow line'
 driver="$SAFE_BIN_DIR/safe"
 pass 'signed descendant installs exact archive bytes, ignores hostile Go configuration and logs the primary fingerprint'
 
 run_follow
 [[ "$FOLLOW_RC" == 0 && "$FOLLOW_OUTPUT" == 'safe: release follow: nothing newer than 1.64.2' ]] || fail 'no-newer path was not a quiet success'
+jq -e '.candidate == null and .verdict == "nothing-newer"' "$status_file" >/dev/null || fail 'nothing-newer status was not recorded'
 pass 'nothing newer is a zero exit with one line'
 
 make_release 1.64.3 unsigned
 before_record=$(sha256sum "$SAFE_CONFIG_DIR/release-follow.json")
 before_audit=$(sha256sum "$SAFE_RUN_DATA_DIR/audit.log")
+before_status=$(sha256sum "$status_file")
 run_follow --dry-run
 [[ "$FOLLOW_RC" == 1 ]] || fail 'unsigned candidate was not refused'
 grep -q 'operator override:' <<<"$FOLLOW_OUTPUT" || fail 'unsigned refusal lacks manual path'
@@ -146,6 +154,7 @@ run_follow --dry-run
 [[ "$FOLLOW_RC" == 1 ]] || fail 'dry-run unsigned candidate unexpectedly passed'
 [[ "$(sha256sum "$SAFE_CONFIG_DIR/release-follow.json")" == "$before_record" ]] || fail 'dry-run changed the record'
 [[ "$(sha256sum "$SAFE_RUN_DATA_DIR/audit.log")" == "$before_audit" ]] || fail 'dry-run changed the audit log'
+[[ "$(sha256sum "$status_file")" == "$before_status" ]] || fail 'dry-run changed last-pass status'
 pass 'unsigned candidate and dry-run write protections hold'
 git -C "$checkout" tag -d v1.64.3 >/dev/null
 git --git-dir "$origin" update-ref -d refs/tags/v1.64.3
@@ -166,6 +175,20 @@ run_follow
 [[ "$FOLLOW_RC" == 1 ]] || fail 'BADSIG tag was not refused'
 git -C "$checkout" tag -d v1.64.6 >/dev/null
 git --git-dir "$origin" update-ref -d refs/tags/v1.64.6
+jq -e '.verdict == "refused:verification" and .candidate == "v1.64.6"' "$status_file" >/dev/null || fail 'refusal last-pass status was not recorded'
+doctor_json=$(SAFE_CONFIG_DIR="$SAFE_CONFIG_DIR" SAFE_DATA_DIR="$SAFE_DATA_DIR" \
+  SAFE_RUN_CONFIG_DIR="$SAFE_RUN_CONFIG_DIR" SAFE_RUN_DATA_DIR="$SAFE_RUN_DATA_DIR" "$driver" doctor --json 2>/dev/null) ||
+  fail 'doctor JSON failed while checking release-follow refusal'
+jq -e '.environment.release_follow.warning | strings | contains("refused")' <<<"$doctor_json" >/dev/null ||
+  fail 'doctor did not warn on a release-follow refusal'
+stale_time=$(date -u -d '4 days ago' +%Y-%m-%dT%H:%M:%SZ)
+jq --arg time "$stale_time" '.time = $time | .verdict = "nothing-newer"' "$status_file" > "$tmp/stale-status"
+mv -f "$tmp/stale-status" "$status_file"
+doctor_json=$(SAFE_CONFIG_DIR="$SAFE_CONFIG_DIR" SAFE_DATA_DIR="$SAFE_DATA_DIR" \
+  SAFE_RUN_CONFIG_DIR="$SAFE_RUN_CONFIG_DIR" SAFE_RUN_DATA_DIR="$SAFE_RUN_DATA_DIR" "$driver" doctor --json 2>/dev/null) ||
+  fail 'doctor JSON failed while checking release-follow staleness'
+jq -e '.environment.release_follow.warning | strings | contains("stale")' <<<"$doctor_json" >/dev/null ||
+  fail 'doctor did not warn on stale release-follow state'
 pass 'lightweight, mismatched-name and bad-signature tags are refused'
 
 gpg --no-options --batch --pinentry-mode loopback --passphrase '' \
@@ -379,6 +402,27 @@ grep -q 'origin must be fetchable with no agent and no credentials' <<<"$FOLLOW_
 git -C "$checkout" remote set-url origin "$origin"
 pass 'fetch rejection and transport failure have distinct operator repairs'
 
+make_release 1.65.8 signed
+printf 'install.sh export-ignore\n' > "$checkout/.git/info/attributes"
+run_follow
+[[ "$FOLLOW_RC" == 1 ]] || fail 'checkout info attributes were not refused'
+grep -q 'verified archive tree differs' <<<"$FOLLOW_OUTPUT" || fail 'checkout info attribute tree refusal missing'
+rm -f "$checkout/.git/info/attributes"
+run_follow
+[[ "$FOLLOW_RC" == 0 ]] || fail "genuine tree equality after info attributes failed: $FOLLOW_OUTPUT"
+
+make_release 1.65.9 signed
+attribute_file="$tmp/core-attributes"
+printf 'install.sh export-ignore\n' > "$attribute_file"
+git -C "$checkout" config core.attributesFile "$attribute_file"
+run_follow
+[[ "$FOLLOW_RC" == 1 ]] || fail 'core.attributesFile was not refused'
+grep -q 'verified archive tree differs' <<<"$FOLLOW_OUTPUT" || fail 'core.attributesFile tree refusal missing'
+git -C "$checkout" config --unset core.attributesFile
+run_follow
+[[ "$FOLLOW_RC" == 0 ]] || fail "genuine tree equality after core.attributesFile failed: $FOLLOW_OUTPUT"
+pass 'archive tree equality refuses checkout attributes and accepts genuine bytes'
+
 union_checkout="$tmp/union-checkout"
 union_config="$tmp/union-config"
 union_data="$tmp/union-data"
@@ -411,8 +455,8 @@ pass 'installer records the component union and preserves no-wrappers semantics'
 
 probe_driver="$tmp/probe-driver"
 cp "$driver" "$probe_driver"
-printf '1.65.7\n' > "$checkout/VERSION"
-sed -i -E 's/^SAFE_VERSION="[0-9]+\.[0-9]+\.[0-9]+"/SAFE_VERSION="1.65.7"/' "$checkout/bin/safe"
+printf '1.65.10\n' > "$checkout/VERSION"
+sed -i -E 's/^SAFE_VERSION="[0-9]+\.[0-9]+\.[0-9]+"/SAFE_VERSION="1.65.10"/' "$checkout/bin/safe"
 cat > "$checkout/install.sh" <<'PROBE_INSTALL'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -421,8 +465,8 @@ PROBE_INSTALL
 chmod +x "$checkout/install.sh"
 git -C "$checkout" add VERSION bin/safe install.sh
 git -C "$checkout" commit --quiet -m 'fixture probe failure'
-git -c gpg.format=openpgp -c gpg.program=/usr/bin/gpg -C "$checkout" tag -s -u "$fingerprint" -m v1.65.7 v1.65.7
-git -C "$checkout" push --quiet origin HEAD refs/tags/v1.65.7
+git -c gpg.format=openpgp -c gpg.program=/usr/bin/gpg -C "$checkout" tag -s -u "$fingerprint" -m v1.65.10 v1.65.10
+git -C "$checkout" push --quiet origin HEAD refs/tags/v1.65.10
 driver="$probe_driver"
 run_follow
 [[ "$FOLLOW_RC" != 127 ]] || fail 'post-install probe leaked exit 127'

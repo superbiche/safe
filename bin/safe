@@ -545,6 +545,7 @@ cmd_status() {
     echo "                foreign/shadowed/missing/not-on-path tools are NOT gated; fix and re-run install.sh"
     echo "                not-on-path means the wrapper exists but $SAFE_BIN_ROOT is not on PATH here"
   fi
+  release_follow_status_line
 }
 
 sha256_file_or_null() {
@@ -789,12 +790,117 @@ release_follow_install_cleanup_trap() {
   trap 'release_follow_cleanup; if [[ -n "${RELEASE_FOLLOW_PREVIOUS_EXIT_ACTION:-}" ]]; then eval "$RELEASE_FOLLOW_PREVIOUS_EXIT_ACTION"; fi' EXIT
 }
 
+release_follow_status_path() {
+  printf '%s/release-follow-status.json' "$SAFE_CONFIG_ROOT"
+}
+
+release_follow_status_reason_class() {
+  local reason="${1,,}"
+  case "$reason" in
+    *staging*|*archive*) printf 'staging' ;;
+    *signer*|*signature*|*gpg*|*tag*) printf 'verification' ;;
+    *graft*|*shallow*|*descendant*|*ancestor*) printf 'ancestry' ;;
+    *transport*|*origin*|*fetch*) printf 'transport' ;;
+    *lock*) printf 'lock' ;;
+    *probe*|*version*) printf 'post-install' ;;
+    *install*) printf 'install' ;;
+    *checkout*|*record*) printf 'checkout' ;;
+    *) printf 'internal' ;;
+  esac
+}
+
+release_follow_status_write() {
+  local verdict="$1" path tmp candidate_json
+  path=$(release_follow_status_path)
+  candidate_json='null'
+  if [[ -n "${RELEASE_FOLLOW_STATUS_CANDIDATE:-}" ]]; then
+    candidate_json=$(jq -cn --arg candidate "$RELEASE_FOLLOW_STATUS_CANDIDATE" '$candidate') || return 1
+  fi
+  mkdir -p -- "$SAFE_CONFIG_ROOT" || return 1
+  tmp=$(mktemp "$path.XXXXXX") || return 1
+  if ! jq -cn \
+    --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg installed_before "${RELEASE_FOLLOW_STATUS_INSTALLED_BEFORE:-$SAFE_VERSION}" \
+    --argjson candidate "$candidate_json" \
+    --arg verdict "$verdict" \
+    '{schema:"safe-release-follow/1", time:$timestamp, installed_before:$installed_before, candidate:$candidate, verdict:$verdict}' \
+    > "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  chmod 0600 -- "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$path" || { rm -f -- "$tmp"; return 1; }
+}
+
+release_follow_status_snapshot() {
+  local path
+  path=$(release_follow_status_path)
+  if [[ -f "$path" && ! -L "$path" ]] &&
+    jq -e '(.schema == "safe-release-follow/1" and (.time | type) == "string" and (.installed_before | type) == "string" and ((.candidate == null) or (.candidate | type) == "string") and (.verdict | type) == "string")' \
+      "$path" >/dev/null 2>&1; then
+    jq -c . "$path"
+  else
+    printf '{}'
+  fi
+}
+
+release_follow_status_age() {
+  local timestamp="$1" epoch now age
+  epoch=$(date -u -d "$timestamp" +%s 2>/dev/null) || return 1
+  now=$(date -u +%s)
+  age=$((now - epoch))
+  (( age < 0 )) && age=0
+  if (( age >= 86400 )); then
+    printf '%sd ago' "$((age / 86400))"
+  elif (( age >= 3600 )); then
+    printf '%sh ago' "$((age / 3600))"
+  elif (( age >= 60 )); then
+    printf '%sm ago' "$((age / 60))"
+  else
+    printf '%ss ago' "$age"
+  fi
+}
+
+release_follow_status_line() {
+  local snapshot verdict timestamp age
+  snapshot=$(release_follow_status_snapshot)
+  if [[ "$snapshot" == '{}' ]]; then
+    printf 'release follow: never run\n'
+    return 0
+  fi
+  verdict=$(jq -r '.verdict' <<<"$snapshot")
+  timestamp=$(jq -r '.time' <<<"$snapshot")
+  age=$(release_follow_status_age "$timestamp") || {
+    printf 'release follow: never run\n'
+    return 0
+  }
+  printf 'release follow: %s %s\n' "$verdict" "$age"
+}
+
+release_follow_status_warning() {
+  local snapshot="$1" verdict timestamp age epoch now
+  [[ "$snapshot" != '{}' ]] || return 0
+  verdict=$(jq -r '.verdict' <<<"$snapshot")
+  if [[ "$verdict" == refused:* ]]; then
+    printf 'release follow last pass refused (%s); run safe release follow' "${verdict#refused:}"
+    return 0
+  fi
+  timestamp=$(jq -r '.time' <<<"$snapshot")
+  epoch=$(date -u -d "$timestamp" +%s 2>/dev/null) || return 0
+  now=$(date -u +%s)
+  age=$((now - epoch))
+  if (( age > 259200 )); then
+    printf 'release follow last pass is stale (older than 3 days); run safe release follow'
+  fi
+}
+
 release_follow_refuse() {
   local reason="$1" checkout="${2:-${RELEASE_FOLLOW_CHECKOUT:-}}"
   local safe_reason
   safe_reason=$(printf '%s' "$reason" | tr '\r\n|' '   ')
   if [[ "${RELEASE_FOLLOW_DRY_RUN:-0}" != 1 ]]; then
     release_follow_audit "RELEASE_FOLLOW_REFUSED reason=$safe_reason" || true
+    release_follow_status_write "refused:$(release_follow_status_reason_class "$reason")" || true
   fi
   printf 'safe: release follow refused — %s\n' "$safe_reason" >&2
   release_follow_manual_path "$checkout"
@@ -944,6 +1050,9 @@ cmd_release_follow() {
     esac
   done
 
+  RELEASE_FOLLOW_STATUS_INSTALLED_BEFORE="$SAFE_VERSION"
+  RELEASE_FOLLOW_STATUS_CANDIDATE=""
+
   # This command has no reason to consult a user PATH. Resolve every helper
   # from the system tool directories so a timer's PATH cannot shadow the
   # verifier or one of the parsers that decides whether verification passed.
@@ -1058,8 +1167,10 @@ cmd_release_follow() {
     for-each-ref --format='%(refname:strip=2)' refs/tags 2>/dev/null)
   if [[ -z "$best_tag" ]]; then
     printf 'safe: release follow: nothing newer than %s\n' "$SAFE_VERSION"
+    release_follow_status_write 'nothing-newer' || true
     return 0
   fi
+  RELEASE_FOLLOW_STATUS_CANDIDATE="$best_tag"
   tag_oid=$(release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
     rev-parse --verify "refs/tags/$best_tag" 2>/dev/null) || { release_follow_refuse "candidate tag $best_tag cannot be resolved"; return; }
   candidate_commit=$(release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
@@ -1098,6 +1209,37 @@ cmd_release_follow() {
     "$RELEASE_FOLLOW_TAR_PATH" -xf - -C "$archive_dir" || { release_follow_refuse "verified release archive could not be extracted"; return; }
   version_in_archive=$(tr -d '[:space:]' < "$archive_dir/VERSION" 2>/dev/null) || { release_follow_refuse "verified archive has no readable VERSION"; return; }
   [[ "$version_in_archive" == "$best_version" ]] || { release_follow_refuse "verified archive VERSION does not match $best_tag"; return; }
+  if release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
+    ls-tree -r --name-only "$RELEASE_FOLLOW_CANDIDATE_COMMIT" 2>/dev/null |
+    grep -Eq '(^|/)\.gitattributes$'; then
+    release_follow_refuse "verified release contains .gitattributes; archive tree equality is fail-closed for signed attributes"; return;
+  fi
+  local verified_tree staging_tree
+  verified_tree=$(release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
+    rev-parse --verify "$RELEASE_FOLLOW_CANDIDATE_COMMIT^{tree}" 2>/dev/null) || {
+    release_follow_refuse "verified release tree cannot be resolved"; return;
+  }
+  release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$archive_dir" init --quiet || {
+    release_follow_refuse "verified archive could not initialize its tree check"; return;
+  }
+  release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$archive_dir" \
+    config --local core.attributesFile /dev/null || {
+    release_follow_refuse "verified archive tree check could not disable attributes"; return;
+  }
+  release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$archive_dir" \
+    config --local core.hooksPath /dev/null || {
+    release_follow_refuse "verified archive tree check could not disable hooks"; return;
+  }
+  release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$archive_dir" add -Af . || {
+    release_follow_refuse "verified archive tree check could not add extracted files"; return;
+  }
+  staging_tree=$(release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$archive_dir" \
+    write-tree 2>/dev/null) || {
+    release_follow_refuse "verified archive tree check could not write a tree"; return;
+  }
+  [[ "$staging_tree" == "$verified_tree" ]] || {
+    release_follow_refuse "verified archive tree differs from the signed commit tree"; return;
+  }
   set +e
   ( cd "$archive_dir" && env -i HOME="$RELEASE_FOLLOW_HOME" PATH=/usr/bin:/bin TMPDIR=/tmp \
       GOENV=off GOTOOLCHAIN=local GOPROXY=off GOFLAGS='-buildvcs=false -mod=mod' \
@@ -1131,6 +1273,8 @@ cmd_release_follow() {
   release_follow_audit "RELEASE_FOLLOWED from=$SAFE_VERSION to=$best_version signer=$RELEASE_FOLLOW_SIGNER tag_object=$RELEASE_FOLLOW_TAG_OBJECT" || {
     release_follow_refuse "install succeeded but the release-follow audit event could not be written"; return;
   }
+  release_follow_status_write installed ||
+    printf 'safe: release follow: WARN last-pass status could not be written\n' >&2
   printf 'safe: release follow: installed %s signer=%s\n' "$best_tag" "$RELEASE_FOLLOW_SIGNER"
 }
 
@@ -1429,6 +1573,10 @@ doctor_payload_json() {
     safe_core_warning="safe-core is missing from PATH; rerun install.sh"
   fi
 
+  local release_follow_last_status_json release_follow_warning=""
+  release_follow_last_status_json=$(release_follow_status_snapshot)
+  release_follow_warning=$(release_follow_status_warning "$release_follow_last_status_json")
+
   jq -n \
     --arg version "$SAFE_VERSION" \
     --arg config_dir "$base_config" \
@@ -1444,6 +1592,8 @@ doctor_payload_json() {
     --argjson core_safe_core "$core_safe_core_json" \
     --argjson safe_core_version_matches "$safe_core_version_matches" \
     --arg safe_core_warning "$safe_core_warning" \
+    --argjson release_follow_last_status "$release_follow_last_status_json" \
+    --arg release_follow_warning "$release_follow_warning" \
     --argjson audit_curl "$audit_curl_json" \
     --argjson audit_tar "$audit_tar_json" \
     --argjson audit_ssh "$audit_ssh_json" \
@@ -1538,6 +1688,10 @@ doctor_payload_json() {
         safe_core: {
           version_matches: $safe_core_version_matches,
           warning: (if $safe_core_warning == "" then null else $safe_core_warning end)
+        },
+        release_follow: {
+          last_pass: (if ($release_follow_last_status | has("verdict")) then $release_follow_last_status else null end),
+          warning: (if $release_follow_warning == "" then null else $release_follow_warning end)
         },
         safe_run: {
           config_present: $safe_run_config_present,

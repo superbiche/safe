@@ -31,6 +31,9 @@ check, captures the evidence while it is still true, and writes a dated note
 in safe's own `inbox/` for the operator to validate. It changes nothing —
 no allowlist entry, no verdict, no trust state.
 
+`safe status` includes one release-follow line: `release follow: <verdict>
+<age>`, or `release follow: never run` when no non-dry pass has recorded state.
+
 ### Policy exit codes
 
 The exit-code table is **generated** into [Agent Contract](agents.md) from

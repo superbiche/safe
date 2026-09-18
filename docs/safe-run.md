@@ -376,14 +376,27 @@ The origin must be fetchable with no agent and no credentials (anonymous HTTPS u
 The verified commit is archived into a private temporary directory, its
 `VERSION` is checked against the tag, and that tree's `install.sh` is run with
 the recorded component flags. The working tree is never the install source.
+Before installation, the follower computes the extracted archive tree in a
+throwaway Git repository with checkout attributes and hooks disabled and
+requires it to equal the verified commit tree. Checkout-local attributes that
+filter the archive therefore refuse; a signed `.gitattributes` in the release
+also refuses because its archive transformations are not treated as a safe
+tree-hash input.
 After a successful version check, the checkout's default branch advances only
 when clean and fast-forwardable; a dirty or diverged checkout produces a WARN
 after installation. `install.sh` currently replaces some live files with
 direct writes, so the lock serializes passes but cannot make a killed install
 an all-files transaction; the installed surface may be mixed until the normal
 manual repair path is run.
-Archive attribute filtering is fail-closed today: any attribute-driven omission
-that removes an installer input causes the verified archive install to refuse.
+The ancestry check still uses the installed version tag in the writable
+checkout; a canonical run-store lineage anchor is outside this lane's scope.
+
+Each non-dry pass atomically records its UTC time, installed-before version,
+candidate, and verdict in the local
+`$SAFE_CONFIG_DIR/release-follow-status.json`. `safe status` adds one line such
+as `release follow: installed 2h ago`, or `release follow: never run`. A
+refusal or a state older than three days appears as
+`.environment.release_follow.warning` in `safe doctor --json`.
 
 Every non-dry refusal returns non-zero, prints the manual operator path, and
 records a refusal in `~/.local/share/safe/run/audit.log`. A confirmed update

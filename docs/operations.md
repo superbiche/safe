@@ -209,6 +209,17 @@ not a reason to install from the unverified working tree.
 wrappers yet. It never removes wrappers already in the union; a later
 `--wrappers` invocation adds them when needed and re-enables them for future
 follows.
+Before `install.sh` runs, the extracted archive tree is compared with the
+verified commit tree in a throwaway Git repository with checkout attributes and
+hooks disabled. Checkout-local attribute filtering and signed `.gitattributes`
+are fail-closed refusals. The ancestry anchor remains the installed version tag
+in the writable checkout; a canonical lineage anchor is not part of this lane.
+
+The companion `$SAFE_CONFIG_DIR/release-follow-status.json` is a regular,
+atomically replaced local file containing the last non-dry pass time,
+installed-before version, candidate, and verdict. `safe status` prints its
+single release-follow line; `safe doctor --json` warns when the verdict is a
+refusal or the pass is more than three days old.
 
 ## Scan Modes
 

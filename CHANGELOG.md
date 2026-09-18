@@ -7,6 +7,8 @@
   archive bytes with the recorded installer flags, and logs the result.
 - Have `install.sh` record its local checkout path and normalized component
   flags for release following.
+- Verify the extracted release tree before installation and expose the last
+  release-follow outcome through `safe status` and `safe doctor --json`.
 
 ## 1.64.1 - 2026-09-17
 
