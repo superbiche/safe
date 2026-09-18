@@ -9,6 +9,8 @@
   flags for release following.
 - Verify the extracted release tree before installation and expose the last
   release-follow outcome through `safe status` and `safe doctor --json`.
+- Keep dry runs write-free on the no-newer path, isolate Go workspace
+  selection, anchor fetch rejection repairs, and record refusals uniformly.
 
 ## 1.64.1 - 2026-09-17
 

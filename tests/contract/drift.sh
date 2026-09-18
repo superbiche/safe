@@ -90,7 +90,7 @@ case_hand_editing_a_generated_block_is_caught() {
   mkdir -p "$sandbox"
   cp -rL "$ROOT/docs" "$ROOT/scripts" "$sandbox/"
   [[ -f "$sandbox/docs/agents.md" && ! -L "$sandbox/docs/agents.md" ]] || {
-    fail "$FUNCNAME (generated surface copy is not a regular file)"
+    fail 'generated surface copy is not a regular file'
     return
   }
   # Inside a generated block — an edit OUTSIDE the markers is legitimate
@@ -101,6 +101,16 @@ case_hand_editing_a_generated_block_is_caught() {
     fail "$FUNCNAME (a hand-edited doc passed --check)"
   else
     pass "$FUNCNAME"
+  fi
+}
+
+case_release_follow_tree_has_no_gitattributes() {
+  # The follower refuses a signed .gitattributes because reproducing Git's
+  # archive attribute transformations inside the tree-hash check is unsafe.
+  if git -C "$ROOT" ls-files | grep -Eq '(^|/)\.gitattributes$'; then
+    fail 'release-follow refuses .gitattributes trees'
+  else
+    pass 'release-follow tree has no .gitattributes'
   fi
 }
 
@@ -338,6 +348,7 @@ case_contract_has_every_required_key
 case_every_exit_code_tells_an_agent_what_to_do
 case_docs_are_not_stale
 case_hand_editing_a_generated_block_is_caught
+case_release_follow_tree_has_no_gitattributes
 case_explain_json_is_the_contract_verbatim
 case_explain_text_renders_from_the_contract
 case_explain_fails_loudly_without_a_contract

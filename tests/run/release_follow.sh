@@ -10,6 +10,7 @@ set -euo pipefail
 safe_test_setup_isolation || exit 1
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+LEGACY_DRIVER="$ROOT/tests/fixtures/release_follow_pre_fix.sh"
 pass() { printf 'ok - %s\n' "$*"; }
 fail() { printf 'not ok - %s\n' "$*" >&2; exit 1; }
 for tool in bash git gpg gpgconf jq flock timeout tar go; do
@@ -60,6 +61,9 @@ status_file="$SAFE_CONFIG_DIR/release-follow-status.json"
 
 mkdir -p "$HOME/.config/go"
 printf 'GOTOOLCHAIN=go1.99.0\n' > "$HOME/.config/go/env"
+mkdir -p "$TMPDIR/go-work-module"
+printf 'module example.invalid/release-follow-work\n\ngo 1.26.0\n' > "$TMPDIR/go-work-module/go.mod"
+printf 'go 1.26.0\n\nuse ./go-work-module\n' > "$TMPDIR/go.work"
 
 make_release() {
   local version="$1" mode="${2:-signed}" other_key="${3:-}"
@@ -136,11 +140,15 @@ jq -e '.installed_before == "1.64.1" and .candidate == "v1.64.2" and .verdict ==
 status_output=$(SAFE_CONFIG_DIR="$SAFE_CONFIG_DIR" SAFE_DATA_DIR="$SAFE_DATA_DIR" "$driver" status 2>/dev/null)
 grep -q '^release follow: installed ' <<<"$status_output" || fail 'status did not print the installed release-follow line'
 driver="$SAFE_BIN_DIR/safe"
-pass 'signed descendant installs exact archive bytes, ignores hostile Go configuration and logs the primary fingerprint'
+pass 'signed descendant installs exact archive bytes, ignores hostile Go configuration and parent go.work, and logs the primary fingerprint'
 
 run_follow
 [[ "$FOLLOW_RC" == 0 && "$FOLLOW_OUTPUT" == 'safe: release follow: nothing newer than 1.64.2' ]] || fail 'no-newer path was not a quiet success'
 jq -e '.candidate == null and .verdict == "nothing-newer"' "$status_file" >/dev/null || fail 'nothing-newer status was not recorded'
+before_status=$(sha256sum "$status_file")
+run_follow --dry-run
+[[ "$FOLLOW_RC" == 0 && "$FOLLOW_OUTPUT" == 'safe: release follow: nothing newer than 1.64.2' ]] || fail 'dry-run nothing-newer path was not a quiet success'
+[[ "$(sha256sum "$status_file")" == "$before_status" ]] || fail 'dry-run nothing-newer changed last-pass status'
 pass 'nothing newer is a zero exit with one line'
 
 make_release 1.64.3 unsigned
@@ -175,7 +183,7 @@ run_follow
 [[ "$FOLLOW_RC" == 1 ]] || fail 'BADSIG tag was not refused'
 git -C "$checkout" tag -d v1.64.6 >/dev/null
 git --git-dir "$origin" update-ref -d refs/tags/v1.64.6
-jq -e '.verdict == "refused:verification" and .candidate == "v1.64.6"' "$status_file" >/dev/null || fail 'refusal last-pass status was not recorded'
+jq -e '.verdict == "refused" and .candidate == "v1.64.6"' "$status_file" >/dev/null || fail 'refusal last-pass status was not recorded'
 doctor_json=$(SAFE_CONFIG_DIR="$SAFE_CONFIG_DIR" SAFE_DATA_DIR="$SAFE_DATA_DIR" \
   SAFE_RUN_CONFIG_DIR="$SAFE_RUN_CONFIG_DIR" SAFE_RUN_DATA_DIR="$SAFE_RUN_DATA_DIR" "$driver" doctor --json 2>/dev/null) ||
   fail 'doctor JSON failed while checking release-follow refusal'
@@ -313,9 +321,7 @@ grep -q 'RELEASE_FOLLOWED from=1.65.3 to=1.65.5 signer=' "$SAFE_RUN_DATA_DIR/aud
 git -C "$checkout" update-ref -d "refs/replace/$replace_candidate"
 pass 'replace-ref candidate installs genuine bytes and never attributes evil bytes'
 
-legacy_root="$tmp/legacy-2304ebb"
-mkdir -p "$legacy_root"
-git archive 2304ebb | tar -xf - -C "$legacy_root"
+[[ -x "$LEGACY_DRIVER" ]] || fail 'pre-fix replacement-ref fixture is missing or not executable'
 legacy_repo="$tmp/legacy-repo"
 legacy_origin="$tmp/legacy-origin.git"
 git init --quiet "$legacy_repo"
@@ -349,28 +355,25 @@ git -C "$legacy_repo" push --quiet origin HEAD refs/tags/v1.64.2
 legacy_candidate=$(git -C "$legacy_repo" rev-parse 'refs/tags/v1.64.2^{commit}')
 legacy_marker="$tmp/legacy-replace-marker"
 plant_replace_commit "$legacy_repo" "$legacy_candidate" "$legacy_parent" "$legacy_marker" 1.64.2
-legacy_home="$tmp/legacy-home"
-legacy_config="$tmp/legacy-config"
 legacy_data="$tmp/legacy-data"
 legacy_bin="$tmp/legacy-bin"
-mkdir -p "$legacy_home/.config/safe/run" "$legacy_config" "$legacy_data/run" "$legacy_bin"
-printf '{"follow":{"signers":["%s"]}}\n' "$fingerprint" > "$legacy_home/.config/safe/run/config.json"
-printf '{"schema":"safe-release-follow/1","checkout":"%s","install_flags":["--run"]}\n' "$legacy_repo" > "$legacy_config/release-follow.json"
-cp "$legacy_root/bin/safe" "$legacy_bin/safe"
-chmod +x "$legacy_bin/safe"
+legacy_home="$tmp/legacy-home"
+mkdir -p "$legacy_home"
+mkdir -p "$legacy_data/run" "$legacy_bin"
 set +e
 legacy_output=$(env -i HOME="$legacy_home" GNUPGHOME="$GNUPGHOME" PATH=/usr/bin:/bin \
-  SAFE_CONFIG_DIR="$legacy_config" SAFE_DATA_DIR="$legacy_data" SAFE_BIN_DIR="$legacy_bin" \
-  SAFE_RUN_CONFIG_DIR="$legacy_home/.config/safe/run" SAFE_RUN_DATA_DIR="$legacy_data/run" \
-  "$legacy_bin/safe" release follow 2>&1)
+  SAFE_BIN_DIR="$legacy_bin" SAFE_DATA_DIR="$legacy_data" \
+  SAFE_RELEASE_FOLLOW_CHECKOUT="$legacy_repo" SAFE_RELEASE_FOLLOW_INSTALLED=1.64.1 \
+  SAFE_RELEASE_FOLLOW_TAG=v1.64.2 SAFE_RELEASE_FOLLOW_AUDIT_LOG="$legacy_data/run/audit.log" \
+  SAFE_RELEASE_FOLLOW_SIGNER="$fingerprint" "$LEGACY_DRIVER" 2>&1)
 legacy_rc=$?
 set -e
 printf '%s\n' "$legacy_output" > "$tmp/legacy-output"
-[[ "$legacy_rc" == 0 ]] || fail "archived 2304ebb did not reproduce the replace-ref vulnerability (rc=$legacy_rc)"
-[[ -e "$legacy_marker" ]] || fail 'archived 2304ebb did not install the evil replacement marker'
+[[ "$legacy_rc" == 0 ]] || fail "pre-fix fixture did not reproduce the replace-ref vulnerability (rc=$legacy_rc)"
+[[ -e "$legacy_marker" ]] || fail 'pre-fix fixture did not install the evil replacement marker'
 grep -q 'RELEASE_FOLLOWED from=1.64.1 to=1.64.2 signer=' "$legacy_data/run/audit.log" ||
-  fail 'archived 2304ebb did not misattribute the evil replacement'
-pass 'replace-ref regression is non-vacuous: the git archive of 2304ebb fails it'
+  fail 'pre-fix fixture did not misattribute the evil replacement'
+pass 'replace-ref regression is non-vacuous: the checked-in pre-fix fixture fails it'
 
 make_release 1.65.6 signed
 touch "$checkout/.git/info/grafts"
@@ -393,6 +396,24 @@ run_follow
 grep -q 'v1.65.6' <<<"$FOLLOW_OUTPUT" || fail 'rejected tag name missing'
 grep -q 'repair with' <<<"$FOLLOW_OUTPUT" || fail 'rejected tag repair missing'
 git -C "$checkout" update-ref refs/tags/v1.65.6 "$candidate_1656_tag"
+hostile_ssh="$tmp/hostile-ssh"
+upload_pack_path="$(git --exec-path)/git-upload-pack"
+cat > "$hostile_ssh" <<EOF
+#!/usr/bin/env bash
+printf 'remote: [rejected] ;evil\$IFS\n' >&2
+exec $upload_pack_path '$origin'
+EOF
+chmod +x "$hostile_ssh"
+git -C "$checkout" config remote.origin.url ssh://git@local/tmp/origin.git
+git -C "$checkout" config core.sshCommand "$hostile_ssh"
+git -C "$checkout" update-ref refs/tags/v1.65.6 "$candidate_1655_commit"
+run_follow
+[[ "$FOLLOW_RC" == 1 ]] || fail 'hostile remote rejection was not refused'
+[[ "$FOLLOW_OUTPUT" != *evil* ]] || fail 'hostile remote text entered the repair command'
+grep -q 'origin tag update rejected for v1.65.6' <<<"$FOLLOW_OUTPUT" || fail 'anchored rejected-tag parse missed the ref-status tag'
+git -C "$checkout" update-ref refs/tags/v1.65.6 "$candidate_1656_tag"
+git -C "$checkout" config --unset core.sshCommand
+git -C "$checkout" remote set-url origin "$origin"
 git -C "$checkout" remote set-url origin "$tmp/missing-origin.git"
 run_follow
 [[ "$FOLLOW_RC" == 1 ]] || fail 'transport failure was not refused'
@@ -400,7 +421,7 @@ grep -q 'transport failure fetching origin' <<<"$FOLLOW_OUTPUT" || fail 'transpo
 grep -q 'missing-origin.git' <<<"$FOLLOW_OUTPUT" || fail 'origin URL missing from transport failure'
 grep -q 'origin must be fetchable with no agent and no credentials' <<<"$FOLLOW_OUTPUT" || fail 'anonymous-origin requirement missing'
 git -C "$checkout" remote set-url origin "$origin"
-pass 'fetch rejection and transport failure have distinct operator repairs'
+pass 'fetch rejection parsing ignores hostile remote text and keeps transport repairs distinct'
 
 make_release 1.65.8 signed
 printf 'install.sh export-ignore\n' > "$checkout/.git/info/attributes"

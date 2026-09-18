@@ -136,7 +136,7 @@ shape:
 
 The candidate is `null` when there was no candidate or the pass refused before
 selecting one. Verdicts are `installed`, `nothing-newer`, or
-`refused:<reason-class>`. Dry runs do not write this file. `safe status` reads
+`refused`. Dry runs do not write this file. `safe status` reads
 it for the release-follow age line, and `safe doctor --json` exposes its last
 pass and warnings under `environment.release_follow`.
 

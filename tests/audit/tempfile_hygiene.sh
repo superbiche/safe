@@ -156,7 +156,7 @@ run_release_follow_refusal_case() {
   )"
   rm -rf "$scratch" "$outdir"
   if [[ "$count" == 0 ]]; then
-    pass 'release follow refusal leaves no staging directories in $TMPDIR'
+    pass "release follow refusal leaves no staging directories in \$TMPDIR"
   else
     fail "release follow refusal left $count staging directories in \$TMPDIR"
   fi

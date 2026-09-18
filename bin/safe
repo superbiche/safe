@@ -780,33 +780,8 @@ release_follow_cleanup() {
   done
 }
 
-release_follow_install_cleanup_trap() {
-  local existing
-  existing=$(trap -p EXIT)
-  RELEASE_FOLLOW_PREVIOUS_EXIT_ACTION=""
-  if [[ "$existing" =~ ^trap\ --\ \'(.*)\'\ EXIT$ ]]; then
-    RELEASE_FOLLOW_PREVIOUS_EXIT_ACTION="${BASH_REMATCH[1]}"
-  fi
-  trap 'release_follow_cleanup; if [[ -n "${RELEASE_FOLLOW_PREVIOUS_EXIT_ACTION:-}" ]]; then eval "$RELEASE_FOLLOW_PREVIOUS_EXIT_ACTION"; fi' EXIT
-}
-
 release_follow_status_path() {
   printf '%s/release-follow-status.json' "$SAFE_CONFIG_ROOT"
-}
-
-release_follow_status_reason_class() {
-  local reason="${1,,}"
-  case "$reason" in
-    *staging*|*archive*) printf 'staging' ;;
-    *signer*|*signature*|*gpg*|*tag*) printf 'verification' ;;
-    *graft*|*shallow*|*descendant*|*ancestor*) printf 'ancestry' ;;
-    *transport*|*origin*|*fetch*) printf 'transport' ;;
-    *lock*) printf 'lock' ;;
-    *probe*|*version*) printf 'post-install' ;;
-    *install*) printf 'install' ;;
-    *checkout*|*record*) printf 'checkout' ;;
-    *) printf 'internal' ;;
-  esac
 }
 
 release_follow_status_write() {
@@ -881,8 +856,8 @@ release_follow_status_warning() {
   local snapshot="$1" verdict timestamp age epoch now
   [[ "$snapshot" != '{}' ]] || return 0
   verdict=$(jq -r '.verdict' <<<"$snapshot")
-  if [[ "$verdict" == refused:* ]]; then
-    printf 'release follow last pass refused (%s); run safe release follow' "${verdict#refused:}"
+  if [[ "$verdict" == refused ]]; then
+    printf 'release follow last pass refused; run safe release follow'
     return 0
   fi
   timestamp=$(jq -r '.time' <<<"$snapshot")
@@ -900,7 +875,7 @@ release_follow_refuse() {
   safe_reason=$(printf '%s' "$reason" | tr '\r\n|' '   ')
   if [[ "${RELEASE_FOLLOW_DRY_RUN:-0}" != 1 ]]; then
     release_follow_audit "RELEASE_FOLLOW_REFUSED reason=$safe_reason" || true
-    release_follow_status_write "refused:$(release_follow_status_reason_class "$reason")" || true
+    release_follow_status_write refused || true
   fi
   printf 'safe: release follow refused — %s\n' "$safe_reason" >&2
   release_follow_manual_path "$checkout"
@@ -1036,7 +1011,7 @@ cmd_release_follow() {
   local dry_run=0 explicit_checkout="" record flags_json origin installed_commit
   local tag tag_version best_version="" best_tag="" tag_oid candidate_commit
   local archive_dir version_in_archive install_rc installed_after
-  local lock_fd config git_dir fetch_output fetch_rc rejected_tag origin_display
+  local lock_fd config git_dir fetch_output fetch_rc rejected_tag origin_display checkout_q
   local probe_rc
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1147,9 +1122,13 @@ cmd_release_follow() {
   fetch_rc=$?
   set -e
   if (( fetch_rc != 0 )); then
-    rejected_tag=$(sed -n 's/.*\[rejected\][[:space:]]\+\([^[:space:]]\+\).*/\1/p' <<<"$fetch_output" | head -n 1)
+    rejected_tag=$(sed -n 's/^ ! \[rejected\][[:space:]]\+\([^[:space:]]\+\).*/\1/p' <<<"$fetch_output" | head -n 1)
+    checkout_q=$(printf '%q' "$RELEASE_FOLLOW_CHECKOUT")
     if [[ -n "$rejected_tag" ]]; then
-      release_follow_refuse "origin tag update rejected for $rejected_tag; repair with git -C $RELEASE_FOLLOW_CHECKOUT tag -d $rejected_tag or git fetch --tags --force"; return;
+      if [[ "$rejected_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        release_follow_refuse "origin tag update rejected for $rejected_tag; repair with git -C $checkout_q tag -d $rejected_tag or git fetch --tags --force"; return;
+      fi
+      release_follow_refuse "origin tag update was rejected; repair with git -C $checkout_q fetch --tags --force"; return;
     fi
     origin_display=$(printf '%s' "$origin" | sed -E 's#^([[:alpha:]][[:alnum:]+.-]*://)[^/@]*@#\1<credentials-redacted>@#')
     release_follow_refuse "transport failure fetching origin $origin_display; origin must be fetchable with no agent and no credentials (anonymous HTTPS url, SSH pushurl is fine)"; return;
@@ -1167,7 +1146,9 @@ cmd_release_follow() {
     for-each-ref --format='%(refname:strip=2)' refs/tags 2>/dev/null)
   if [[ -z "$best_tag" ]]; then
     printf 'safe: release follow: nothing newer than %s\n' "$SAFE_VERSION"
-    release_follow_status_write 'nothing-newer' || true
+    if [[ "${RELEASE_FOLLOW_DRY_RUN:-0}" != 1 ]]; then
+      release_follow_status_write 'nothing-newer' || true
+    fi
     return 0
   fi
   RELEASE_FOLLOW_STATUS_CANDIDATE="$best_tag"
@@ -1182,7 +1163,7 @@ cmd_release_follow() {
   RELEASE_FOLLOW_STAGING=$(mktemp -d "${TMPDIR:-/tmp}/safe-release-follow.XXXXXX") || { release_follow_refuse "cannot allocate private release staging"; return; }
   chmod 700 "$RELEASE_FOLLOW_STAGING"
   RELEASE_FOLLOW_ARCHIVE_DIR=""
-  release_follow_install_cleanup_trap
+  trap 'release_follow_cleanup' EXIT
   RELEASE_FOLLOW_KEYRING="$RELEASE_FOLLOW_STAGING/keyring"
   release_follow_tag_metadata "$best_tag" "$tag_oid" || { release_follow_refuse "candidate tag $best_tag is not a directly signed annotated commit tag"; return; }
   # Release trust is stricter than ordinary redirected run state: an
@@ -1242,7 +1223,7 @@ cmd_release_follow() {
   }
   set +e
   ( cd "$archive_dir" && env -i HOME="$RELEASE_FOLLOW_HOME" PATH=/usr/bin:/bin TMPDIR=/tmp \
-      GOENV=off GOTOOLCHAIN=local GOPROXY=off GOFLAGS='-buildvcs=false -mod=mod' \
+      GOENV=off GOTOOLCHAIN=local GOWORK=off GOPROXY=off GOFLAGS='-buildvcs=false' \
       GOCACHE="$RELEASE_FOLLOW_STAGING/gocache" \
       GOMODCACHE="$RELEASE_FOLLOW_STAGING/gomodcache" \
       GOPATH="$RELEASE_FOLLOW_STAGING/gopath" \
