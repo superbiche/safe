@@ -14,6 +14,12 @@ fail() { printf 'not ok - %s\n' "$*" >&2; exit 1; }
 
 while IFS= read -r -d '' suite; do
   [[ "$suite" == "$ROOT/tests/lib/"* ]] && continue
+  if [[ "$suite" == "$ROOT/tests/fixtures/"* ]]; then
+    [[ ! -x "$suite" ]] || fail "fixture must not be executable: ${suite#"$ROOT"/}"
+    grep -Fq 'SAFE_RELEASE_FOLLOW_PRE_FIX_FIXTURE' "$suite" || \
+      fail "fixture lacks its explicit test-only invocation guard: ${suite#"$ROOT"/}"
+    continue
+  fi
   grep -Eq '^[[:space:]]*#[[:space:]]*SAFE_TEST_ISOLATION_MARKER([[:space:]:]|$)' "$suite" || fail "missing isolation marker: ${suite#"$ROOT"/}"
   grep -Eq '^[[:space:]]*(source|\.)[[:space:]].*test-isolation\.sh' "$suite" || fail "missing isolation helper source: ${suite#"$ROOT"/}"
   grep -Eq '^[[:space:]]*safe_test_setup_isolation([[:space:]]|\||$)' "$suite" || fail "missing isolation call: ${suite#"$ROOT"/}"

@@ -66,6 +66,7 @@ EXCLUDED=(
   tests/lib/test-isolation.sh       # shared HOME/state isolation helper, not a suite
   tests/lib/safe-core.sh            # shared helper, not a suite
   tests/lib/real-tool.sh            # shared helper (real-toolchain resolver), not a suite
+  tests/fixtures/release_follow_pre_fix.sh # checked-in pre-fix driver for the release-follow non-vacuity case, not a suite
 )
 for f in "$ROOT"/tests/*/*.sh; do
   rel=${f#"$ROOT"/}

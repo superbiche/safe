@@ -321,7 +321,7 @@ grep -q 'RELEASE_FOLLOWED from=1.65.3 to=1.65.5 signer=' "$SAFE_RUN_DATA_DIR/aud
 git -C "$checkout" update-ref -d "refs/replace/$replace_candidate"
 pass 'replace-ref candidate installs genuine bytes and never attributes evil bytes'
 
-[[ -x "$LEGACY_DRIVER" ]] || fail 'pre-fix replacement-ref fixture is missing or not executable'
+[[ -f "$LEGACY_DRIVER" && ! -x "$LEGACY_DRIVER" ]] || fail 'pre-fix replacement-ref fixture is missing or executable'
 legacy_repo="$tmp/legacy-repo"
 legacy_origin="$tmp/legacy-origin.git"
 git init --quiet "$legacy_repo"
@@ -365,7 +365,8 @@ legacy_output=$(env -i HOME="$legacy_home" GNUPGHOME="$GNUPGHOME" PATH=/usr/bin:
   SAFE_BIN_DIR="$legacy_bin" SAFE_DATA_DIR="$legacy_data" \
   SAFE_RELEASE_FOLLOW_CHECKOUT="$legacy_repo" SAFE_RELEASE_FOLLOW_INSTALLED=1.64.1 \
   SAFE_RELEASE_FOLLOW_TAG=v1.64.2 SAFE_RELEASE_FOLLOW_AUDIT_LOG="$legacy_data/run/audit.log" \
-  SAFE_RELEASE_FOLLOW_SIGNER="$fingerprint" "$LEGACY_DRIVER" 2>&1)
+  SAFE_RELEASE_FOLLOW_SIGNER="$fingerprint" SAFE_RELEASE_FOLLOW_PRE_FIX_FIXTURE=1 \
+  bash "$LEGACY_DRIVER" 2>&1)
 legacy_rc=$?
 set -e
 printf '%s\n' "$legacy_output" > "$tmp/legacy-output"
