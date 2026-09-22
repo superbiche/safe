@@ -6035,7 +6035,13 @@ osv_query_package_json() {
   # package-level OSV answers can exceed Linux's per-argument size limit.
   local base_body body page_token="" pages=0 seen_tokens=""
   if [[ -n "$version" && "$version" != "latest" ]]; then
-    base_body=$(jq -n --arg eco "$eco" --arg name "$name" --arg version "$version" '{package:{ecosystem:$eco,name:$name},version:$version}')
+    # PEP 440 local segments (+rocm7.0) are build metadata: they do not
+    # participate in published-range comparisons, so the advisory query uses
+    # the base version — the conservative answer regardless of how OSV's PyPI
+    # matcher treats local segments. Receipts keep the full pinned identity.
+    local osv_version="$version"
+    [[ "$ecosystem" == "python" ]] && osv_version="${version%%+*}"
+    base_body=$(jq -n --arg eco "$eco" --arg name "$name" --arg version "$osv_version" '{package:{ecosystem:$eco,name:$name},version:$version}')
   else
     # Package-only query: returns every advisory ever filed for the package.
     # Only used on the degraded path when no target version could be resolved.
@@ -6239,7 +6245,11 @@ version_is_exact() {
       [[ "${version#v}" =~ $SEMVER_STRICT_RE ]]
       ;;
     python)
-      [[ "$version" =~ ^[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?$ ]]
+      # PEP 440 local version segments (+rocm7.0, +cu128) are part of the
+      # exact identity: a pin like torch==2.10.0+rocm7.0 resolves only from
+      # the index that ships that build, and rejecting it here would degrade
+      # an exact pin to the unresolved package-level audit (Fibery #467).
+      [[ "$version" =~ ^[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?(\+[0-9A-Za-z]+([._-][0-9A-Za-z]+)*)?$ ]]
       ;;
     go)
       [[ "$version" == v* && "${version#v}" =~ $SEMVER_STRICT_RE ]]
@@ -7139,7 +7149,12 @@ resolve_target_versions() {
   command -v curl >/dev/null 2>&1 || return 1
   case "$ecosystem" in
     npm) resolve_npm_versions "$name" "$requested" "$op" "$scratch" || return 1 ;;
-    python) resolve_registry_latest "$requested" "https://pypi.org/pypi/${name}/json" '.info.version // empty' pypi.org "$scratch" || return 1 ;;
+    python)
+      # Mirror the rust/php degrade: with a custom source, a pypi-latest
+      # lookup would audit an artifact from a different index than the one
+      # the manager installs from (Fibery #467).
+      [[ -z "${CHECK_EFFECTIVE_SOURCES:-}" ]] || return 1
+      resolve_registry_latest "$requested" "https://pypi.org/pypi/${name}/json" '.info.version // empty' pypi.org "$scratch" || return 1 ;;
     rust)
       # An effective custom source — argv, env-selected registry.default, or
       # a gate-threaded mise registry name — means this default-registry
@@ -10460,6 +10475,9 @@ main() {
   fi
   case "$cmd" in
     package-audit) shift; package_audit_command "$@" ;;
+    # The alias callers keep reaching for (my-safe-gate said `check` for
+    # years); identical surface, canonical name stays package-audit.
+    check) shift; package_audit_command "$@" ;;
     repo-audit) shift; repo_audit_command "$@" ;;
     machine-audit) shift; machine_audit_command "$@" ;;
     binary-audit) shift; binary_audit_command "$@" ;;

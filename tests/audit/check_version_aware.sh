@@ -3501,5 +3501,131 @@ else
   fail "unknown age lands in the consent branch (fail-closed)"
 fi
 
+# ---------------------------------------------------------------------------
+# 36. PEP 440 local version segments (Fibery #467): a python exact pin with a
+#     local segment (+rocm7.0) is an exact identity — no registry fetch, OSV
+#     queried on the base version (local segments are build metadata and do
+#     not participate in published-range comparisons), and a custom index
+#     stays a WARN (operator override / trusted_registries), never a BLOCK.
+# ---------------------------------------------------------------------------
+cat > "$FIXTURES/osv-torch.json" <<'JSON'
+{"vulns": [
+  {"id": "PYSEC-TORCH", "database_specific": {"severity": "HIGH"},
+   "affected": [{"package": {"ecosystem": "PyPI", "name": "torch"},
+     "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}]}]}]}
+]}
+JSON
+
+prepare_case pep440-local-exact
+fixture="$FIXTURES/osv-torch.json"
+: > "$CASE_DIR/reg-urls.log"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION="2.10.0" \
+  MOCK_SOCKET_MODE=ok \
+  MOCK_REGISTRY_URL_LOG="$CASE_DIR/reg-urls.log" \
+  -- torch@2.10.0+rocm7.0 --ecosystem python --registry 'https://download.pytorch.org/whl/rocm7.0' --json
+if expect_status 10 "a local-segment python pin with a custom index is a WARN, never a BLOCK"; then
+  pass "a local-segment python pin with a custom index is a WARN, never a BLOCK"
+fi
+if jq -e '.resolution.method == "exact" and .resolved_versions == ["2.10.0+rocm7.0"]' "$OUT_FILE" >/dev/null 2>&1; then
+  pass "the local-segment pin resolves as exact without a registry fetch"
+else
+  fail "the local-segment pin resolves as exact without a registry fetch"
+fi
+# Resolution is exact (no fetch by construction); the ONLY registry request
+# allowed is the pypi publish-age metadata lookup — any other registry,
+# including the custom index, must never be fetched for an exact pin.
+if [[ -s "$CASE_DIR/reg-urls.log" ]] \
+  && ! grep -qv '^https://pypi\.org/pypi/torch/' "$CASE_DIR/reg-urls.log"; then
+  pass "the only registry request is the pypi publish-age lookup"
+else
+  fail "the exact local-segment pin fetched something other than the pypi age lookup"
+fi
+if jq -e '(.warn_causes | index("custom_source") != null) and (.warn_causes | index("version_unresolved") == null)' "$OUT_FILE" >/dev/null 2>&1; then
+  pass "the only floor is the custom-source WARN (version resolved)"
+else
+  fail "the only floor is the custom-source WARN (version resolved)"
+fi
+if jq -e '.osv.classification.affecting | map(select(.id == "PYSEC-TORCH")) | length > 0' "$OUT_FILE" >/dev/null 2>&1; then
+  pass "OSV was queried on the base version (2.10.0) and matched the advisory"
+else
+  fail "OSV was queried on the base version (2.10.0) and matched the advisory"
+fi
+
+# The identical pin against a TRUSTED index: no WARN, clean GO — the exact
+# shape the 2026-09-20 operator incident should have had.
+prepare_case pep440-local-trusted
+printf '{"install": {"socket": {"mode": "always"}, "trusted_registries": ["https://download.pytorch.org/whl/rocm7.0"]}}\n' \
+  > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION="2.10.0" \
+  MOCK_SOCKET_MODE=ok \
+  -- torch@2.10.0+rocm7.0 --ecosystem python --registry 'https://download.pytorch.org/whl/rocm7.0' --gate install --json
+if expect_status 0 "a local-segment pin from a trusted index gates GO"; then
+  pass "a local-segment pin from a trusted index gates GO"
+fi
+if jq -e '.warn_causes == []' "$OUT_FILE" >/dev/null 2>&1; then
+  pass "a trusted index produces no custom-source WARN"
+else
+  fail "a trusted index produces no custom-source WARN"
+fi
+
+# A python non-exact request against a custom index degrades to unresolved
+# (mirrors rust/php): a pypi-latest lookup would audit an artifact from a
+# different index than the one the manager installs from.
+prepare_case python-custom-nondexact-degrades
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$(osv_fixture_empty)" \
+  MOCK_SOCKET_MODE=ok \
+  -- torch --ecosystem python --registry 'https://download.pytorch.org/whl/rocm7.0' --json
+if expect_status 10 "a python non-exact request on a custom index degrades to unresolved"; then
+  pass "a python non-exact request on a custom index degrades to unresolved"
+fi
+if jq -e '(.warn_causes | index("version_unresolved") != null) and (.warn_causes | index("custom_source") != null)' "$OUT_FILE" >/dev/null 2>&1; then
+  pass "the degraded python path keeps both the unresolved and custom-source causes"
+else
+  fail "the degraded python path keeps both the unresolved and custom-source causes"
+fi
+
+# `safe audit check` is an alias of package-audit (my-safe-gate pointed at
+# `check` for years; the alias keeps those invocations working).
+prepare_case check-alias
+fixture="$(osv_fixture_empty)"
+# Direct invocation (run_check prepends `package-audit`, which would make
+# this test vacuous — r1 review MAJOR): the alias must dispatch alone.
+OUT_FILE="$CASE_DIR/alias-out.log"
+ERR_FILE="$CASE_DIR/alias-err.log"
+set +e
+(
+  cd "$CASE_PROJECT" || exit 99
+  env \
+    HOME="$CASE_HOME" \
+    PATH="$MOCKBIN:/usr/bin:/bin" \
+    SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" \
+    SAFE_AUDIT_CONFIG_DIR="$CASE_DIR/audit-config" \
+    SAFE_AUDIT_DATA_DIR="$CASE_DIR/audit-data" \
+    SAFE_AUDIT_SOCKET_CACHE_DIR="$CASE_DIR/socket-cache" \
+    MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+    MOCK_OSV_FIXTURE="$fixture" \
+    MOCK_SOCKET_MODE=ok \
+    "$SAFE_AUDIT" check brace-expansion@2.1.4 --ecosystem npm --json
+) > "$OUT_FILE" 2> "$ERR_FILE"
+STATUS=$?
+set -e
+if expect_status 0 "the check alias runs the package audit"; then
+  pass "the check alias runs the package audit"
+fi
+if jq -e '.verdict == "GO" and .spec == "brace-expansion@2.1.4"' "$OUT_FILE" >/dev/null 2>&1; then
+  pass "the check alias audits the requested spec and emits the verdict"
+else
+  fail "the check alias audits the requested spec and emits the verdict"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
