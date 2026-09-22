@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.66.1 - 2026-09-22
 
 - Allow unattended all-green installs in the `safe install` lane (operator
   direction 2026-09-22): a GO with a final Socket answer or a ruled
