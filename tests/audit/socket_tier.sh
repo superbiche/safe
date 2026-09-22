@@ -599,7 +599,7 @@ fi
 
 # Gate mode: with socket_not_found tolerated, the install proceeds.
 prepare_case not-found-gate-tolerated
-printf '"{"install":{"cooldown_days":0,"socket":{"mode":"always","cache_ttl_days":7},"auto_allow_tolerate":["socket_not_found"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install":{"cooldown_days":0,"socket":{"mode":"always","cache_ttl_days":7},"auto_allow_tolerate":["socket_not_found"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 run_check not-found --gate install --op install
 expect_rc 0 'a tolerated socket_not_found proceeds at the gate'
 
@@ -654,7 +654,7 @@ fi
 # aggregate operation proceeds.
 prepare_case ranged-host-allow-tolerate-proceeds
 multi_project
-printf '"{"install":{"cooldown_days":0,"socket":{"mode":"always","cache_ttl_days":7},"auto_allow_tolerate":["socket_not_found"]}}\n' \
+printf '{"install":{"cooldown_days":0,"socket":{"mode":"always","cache_ttl_days":7},"auto_allow_tolerate":["socket_not_found"]}}\n' \
   > "$CASE_RUN_CONFIG/config.json"
 run_multi sibling-not-found --gate install
 expect_rc 0 'a ranged sibling warn tolerated by auto_allow_tolerate proceeds'

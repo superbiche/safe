@@ -19,7 +19,7 @@
   `mode: always` preserves the pre-scope unconditional-call behavior with no
   prompt.
 - Add the sandbox fallback at the Socket-failure terminus (2026-09-22): where
-  `safe run` can carry the install faithfully (npm/bun, project-local, via
+  `safe run` can carry the install faithfully (npm, project-local, via
   `safe install`), the prompt proposes the sandbox first (default Y); `n`
   installs directly as the operator's confirmation. Other lanes keep their
   existing deliberate confirms.

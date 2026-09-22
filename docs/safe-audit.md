@@ -614,7 +614,7 @@ proceed:
   results across the current install command. Every package is still audited;
   another outage or finding keeps its own decision path. This consent expires
   at command exit and is unavailable to agents. At an interactive terminal
-  where `safe run` can carry the install faithfully (npm/bun, project-local,
+  where `safe run` can carry the install faithfully (npm, project-local,
   via `safe install`), the socket-failure terminus proposes the **sandbox
   fallback first**: default **Y** re-runs the install under the `safe run`
   sandbox (behavioral containment for the missing behavioral evidence), `n`

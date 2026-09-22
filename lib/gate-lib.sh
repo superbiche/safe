@@ -2905,7 +2905,7 @@ safe_gate_accept_socket_rate_limit() {
 safe_gate_confirm_socket_consent() {
   local package="$1"
   local reply
-  safe_gate_err "safe: ${package} resolves to a fresh release inside the Socket window — no behavioral evidence yet."
+  safe_gate_err "safe: ${package} resolves to a fresh (or unknown-age) release inside the Socket window — no behavioral evidence yet."
   printf 'safe: run the Socket behavioral check now? [Y/n] ' >&2
   if ! IFS= read -r reply </dev/tty; then
     return 1
@@ -6038,6 +6038,12 @@ safe_gate_mise() {
 safe_gate_main() {
   local SAFE_GATE_SOCKET_COMMAND_CONSENT=0
   export -n SAFE_GATE_SOCKET_COMMAND_CONSENT
+  # The consent channel and its recursion guard are the gate's own per-command
+  # state; an inherited/exported value must never reach the audit (F1 review,
+  # 2026-09-22 — a forged grant would skip the operator ask). The transient
+  # env-prefix the consent re-run uses is applied at the call site, after this
+  # scrub, so the granted value still reaches exactly one re-audit.
+  unset SAFE_AUDIT_SOCKET_CONSENT SAFE_GATE_CONSENT_RECURSION
   safe_gate_dispatch "$@"
 }
 

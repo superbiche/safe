@@ -9001,10 +9001,11 @@ package_audit_command() {
         # Legibility, not policy: the install proceeds either way, but a
         # package that declares install scripts will land with them skipped
         # (global ignore-scripts). Name the operator command that authorizes
-        # them, so a later "installed but broken" has a visible cause. Skipped
-        # on the consent pass — the final GO re-renders it.
-        if (( ! socket_consent_required )) \
-          && [[ "$ecosystem" == "npm" && "$has_install_script" == "true" ]] && (( resolution_ok )) \
+        # them, so a later "installed but broken" has a visible cause.
+        # Printed on the consent pass too: on the declined path there is no
+        # final GO audit, and that is exactly the install that needs the
+        # visible cause (review F7).
+        if [[ "$ecosystem" == "npm" && "$has_install_script" == "true" ]] && (( resolution_ok )) \
           && ! scripts_allow_matches_resolved "$PKG_NAME" "$primary_version"; then
           printf '[safe audit] %s@%s declares install scripts — they will be SKIPPED (global ignore-scripts); if the tool needs them: safe run scripts-allow add %s@%s --reason "..." (operator, TTY)\n' \
             "$PKG_NAME" "$primary_version" "$PKG_NAME" "$primary_version" >&2

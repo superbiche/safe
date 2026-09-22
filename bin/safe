@@ -2421,6 +2421,13 @@ safe_install_audit_package() {
         safe_install_gate_log "$ecosystem" "$package" "HOST_ALLOW_OVERRIDE"
         return 0
       fi
+      # A sandbox decision already made for this command (an earlier package's
+      # fallback prompt) covers later infra WARNs too: re-prompting could flip
+      # the whole command from sandboxed to direct (review F8).
+      if [[ "${SAFE_INSTALL_SOCKET_FALLBACK:-}" == "sandbox" ]]; then
+        safe_install_gate_log "$ecosystem" "$package" "SOCKET_FAIL_SANDBOX_ROUTE_ACTIVE"
+        return 0
+      fi
       if [[ -t 0 && -t 1 ]]; then
         if safe_install_sandbox_capable \
           && [[ "${SAFE_INSTALL_SOCKET_FALLBACK:-}" != "host" ]]; then
@@ -2574,7 +2581,7 @@ safe_install_confirm_socket_consent() {
   local package="$1"
   local reply
 
-  printf 'safe: %s resolves to a fresh release inside the Socket window — no behavioral evidence yet.\n' "$package" >&2
+  printf 'safe: %s resolves to a fresh (or unknown-age) release inside the Socket window — no behavioral evidence yet.\n' "$package" >&2
   printf 'safe: run the Socket behavioral check now? [Y/n] ' >&2
   if ! IFS= read -r reply </dev/tty; then
     return 1
@@ -2588,15 +2595,13 @@ safe_install_confirm_socket_consent() {
 # behavioral CONTAINMENT for the missing behavioral EVIDENCE. "n" installs
 # directly; the n itself is that confirmation. Echoes the chosen token
 # (sandbox|direct); an unreadable tty returns non-zero (the caller refuses).
-# Only offered where safe run can carry the install faithfully — npm/bun,
-# project-local (safe_install_sandbox_capable); the prompt prints the exact
-# command Y will run, so dropped flags are visible before the choice.
+# Only offered where safe run carries the install faithfully — npm,
+# project-local (safe_install_sandbox_capable): safe run's sandbox always
+# installs with npm in a node image, so a bun project would get a lockfile
+# it does not use (review F4). The prompt prints the exact command Y will
+# run, so any leftover manager flags are visible before the choice.
 safe_install_sandbox_capable() {
-  case "${manager:-}" in
-    npm|bun) ;;
-    *) return 1 ;;
-  esac
-  [[ "${global_mode:-0}" == "0" ]]
+  [[ "${manager:-}" == "npm" ]]
 }
 
 safe_install_confirm_sandbox_fallback() {
@@ -2605,6 +2610,8 @@ safe_install_confirm_sandbox_fallback() {
   local reply
 
   printf 'safe: %s for %s — the install would proceed WITHOUT the behavioral (Socket) signal; infrastructure failure, NOT a package finding.\n' "$cause" "$package" >&2
+  printf 'safe: Y runs: safe run install -w -n %s\n' \
+    "$(quote_command ${manager_args[@]+"${manager_args[@]}"})" >&2
   printf 'safe: install under the safe run sandbox instead? [Y/n] ' >&2
   if ! IFS= read -r reply </dev/tty; then
     return 1
@@ -2964,6 +2971,13 @@ cmd_install_project() {
 cmd_install() {
   local SAFE_GATE_SOCKET_COMMAND_CONSENT=0
   export -n SAFE_GATE_SOCKET_COMMAND_CONSENT
+  # The consent channel and its recursion guard are the gate's own per-command
+  # state: an inherited/exported value must never reach the audit (F1 review,
+  # 2026-09-22 — a forged grant would skip the operator ask the ruling made
+  # mandatory). Mirror the SAFE_GATE_SOCKET_COMMAND_CONSENT scrub above.
+  # Not `local`: the audit loop sets the route/recursion variables as globals
+  # this function reads back, and a `local` here would shadow them to empty.
+  unset SAFE_AUDIT_SOCKET_CONSENT SAFE_INSTALL_CONSENT_RECURSION SAFE_INSTALL_SOCKET_FALLBACK
   local policy_lib
   local host_mode=0 sandbox_mode=0 yes=0
   local project_mode=0

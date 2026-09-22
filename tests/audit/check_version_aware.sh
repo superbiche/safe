@@ -3463,7 +3463,7 @@ with open(path, "w") as f:
 PY
 
 prepare_case scope-fresh-consent-gate
-printf '{"install": {"socket": {"mode": "always"}, "cooldown_days": 3, "socket": {"mode": "auto"}}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"cooldown_days": 3, "socket": {"mode": "auto"}}}\n' > "$CASE_RUN_CONFIG/config.json"
 fixture="$(osv_fixture_empty)"
 run_check \
   MOCK_REGISTRY_FIXTURE="$FIXTURES/packument-fresh.json" \
@@ -3486,7 +3486,7 @@ fi
 # Unknown age (no publish timestamps): fail-closed consent, never a silent
 # out-of-scope skip.
 prepare_case scope-unknown-age-consent
-printf '{"install": {"socket": {"mode": "always"}, "cooldown_days": 3, "socket": {"mode": "auto"}}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"cooldown_days": 3, "socket": {"mode": "auto"}}}\n' > "$CASE_RUN_CONFIG/config.json"
 fixture="$(osv_fixture_empty)"
 run_check \
   MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
