@@ -44,10 +44,22 @@ git -C "$checkout" remote set-url origin "$origin"
 git -C "$checkout" config user.name 'L7 test'
 git -C "$checkout" config user.email l7@example.invalid
 git -C "$checkout" config commit.gpgSign false
-git -C "$checkout" tag -d v1.64.0 v1.64.1 >/dev/null 2>&1 || true
-git -C "$checkout" tag -s -u "$fingerprint" -m v1.64.1 v1.64.1
+# The clone carries the repository's real tags; the fixture must not collide
+# with them, so strip every tag before building the ladder.
+git -C "$checkout" tag -l | xargs -r git -C "$checkout" tag -d
+# The fixture ladder derives from the checkout's own VERSION so landing a real
+# release never hard-breaks the suite: the base release is whatever the tree
+# ships, every candidate is a successive patch bump of it, and RV[0] is a
+# guaranteed-older downgrade probe.
+base_version="$(tr -d '[:space:]' < "$checkout/VERSION")"
+declare -a RV
+RV[0]="$(printf '%d.99.99' "$(( ${base_version%%.*} - 1 ))")"
+for __i in $(seq 1 18); do
+  RV[$__i]="$(printf '%s.%d' "${base_version%.*}" "$(( ${base_version##*.} + __i ))")"
+done
+git -C "$checkout" tag -s -u "$fingerprint" -m "$base_version" "v$base_version"
 git -C "$checkout" push --quiet --set-upstream origin HEAD
-git -C "$checkout" push --quiet origin refs/tags/v1.64.1
+git -C "$checkout" push --quiet origin "refs/tags/v$base_version"
 git --git-dir "$origin" symbolic-ref HEAD refs/heads/release-follow
 git -C "$checkout" remote set-head origin -a >/dev/null 2>&1 || true
 
@@ -56,7 +68,7 @@ PATH=/usr/bin:/bin SAFE_BIN_DIR="$SAFE_BIN_DIR" SAFE_CONFIG_DIR="$SAFE_CONFIG_DI
   SAFE_RUN_DATA_DIR="$SAFE_RUN_DATA_DIR" bash "$checkout/install.sh" --run \
   >/dev/null 2>&1 || fail 'base fixture install failed'
 driver="$SAFE_BIN_DIR/safe"
-[[ "$(SAFE_CONFIG_DIR="$SAFE_CONFIG_DIR" SAFE_DATA_DIR="$SAFE_DATA_DIR" "$driver" --version 2>/dev/null | sed -n '1s/^safe //p')" == 1.64.1 ]] || fail 'base safe version not installed'
+[[ "$(SAFE_CONFIG_DIR="$SAFE_CONFIG_DIR" SAFE_DATA_DIR="$SAFE_DATA_DIR" "$driver" --version 2>/dev/null | sed -n '1s/^safe //p')" == "$base_version" ]] || fail 'base safe version not installed'
 status_file="$SAFE_CONFIG_DIR/release-follow-status.json"
 
 mkdir -p "$HOME/.config/go"
@@ -128,14 +140,14 @@ run_follow() {
   FOLLOW_RC="$rc"
 }
 
-make_release 1.64.2
+make_release ${RV[1]}
 run_follow
 [[ "$FOLLOW_RC" == 0 ]] || fail "happy path failed: $FOLLOW_OUTPUT"
-grep -q 'installed v1.64.2 signer=' <<<"$FOLLOW_OUTPUT" || fail "happy path did not report signer: $FOLLOW_OUTPUT"
-grep -q "RELEASE_FOLLOWED from=1.64.1 to=1.64.2 signer=$fingerprint tag_object=" "$SAFE_RUN_DATA_DIR/audit.log" || fail 'follow event missing'
-[[ "$(SAFE_CONFIG_DIR="$SAFE_CONFIG_DIR" SAFE_DATA_DIR="$SAFE_DATA_DIR" "$SAFE_BIN_DIR/safe" --version 2>/dev/null | sed -n '1s/^safe //p')" == 1.64.2 ]] || fail 'happy path installed wrong version'
+grep -q "installed v${RV[1]} signer=" <<<"$FOLLOW_OUTPUT" || fail "happy path did not report signer: $FOLLOW_OUTPUT"
+grep -q "RELEASE_FOLLOWED from=$base_version to=${RV[1]} signer=$fingerprint tag_object=" "$SAFE_RUN_DATA_DIR/audit.log" || fail 'follow event missing'
+[[ "$(SAFE_CONFIG_DIR="$SAFE_CONFIG_DIR" SAFE_DATA_DIR="$SAFE_DATA_DIR" "$SAFE_BIN_DIR/safe" --version 2>/dev/null | sed -n '1s/^safe //p')" == ${RV[1]} ]] || fail 'happy path installed wrong version'
 [[ -f "$status_file" && ! -L "$status_file" ]] || fail 'last-pass status file is not a regular file'
-jq -e '.installed_before == "1.64.1" and .candidate == "v1.64.2" and .verdict == "installed" and (.time | strings)' "$status_file" >/dev/null ||
+jq -e ".installed_before == \"$base_version\" and .candidate == \"v${RV[1]}\" and .verdict == \"installed\" and (.time | strings)" "$status_file" >/dev/null ||
   fail 'installed last-pass status is malformed'
 status_output=$(SAFE_CONFIG_DIR="$SAFE_CONFIG_DIR" SAFE_DATA_DIR="$SAFE_DATA_DIR" "$driver" status 2>/dev/null)
 grep -q '^release follow: installed ' <<<"$status_output" || fail 'status did not print the installed release-follow line'
@@ -143,15 +155,15 @@ driver="$SAFE_BIN_DIR/safe"
 pass 'signed descendant installs exact archive bytes, ignores hostile Go configuration and parent go.work, and logs the primary fingerprint'
 
 run_follow
-[[ "$FOLLOW_RC" == 0 && "$FOLLOW_OUTPUT" == 'safe: release follow: nothing newer than 1.64.2' ]] || fail 'no-newer path was not a quiet success'
+[[ "$FOLLOW_RC" == 0 && "$FOLLOW_OUTPUT" == "safe: release follow: nothing newer than ${RV[1]}" ]] || fail 'no-newer path was not a quiet success'
 jq -e '.candidate == null and .verdict == "nothing-newer"' "$status_file" >/dev/null || fail 'nothing-newer status was not recorded'
 rm -f -- "$status_file"
 run_follow --dry-run
-[[ "$FOLLOW_RC" == 0 && "$FOLLOW_OUTPUT" == 'safe: release follow: nothing newer than 1.64.2' ]] || fail 'dry-run nothing-newer path was not a quiet success'
+[[ "$FOLLOW_RC" == 0 && "$FOLLOW_OUTPUT" == "safe: release follow: nothing newer than ${RV[1]}" ]] || fail 'dry-run nothing-newer path was not a quiet success'
 [[ ! -e "$status_file" ]] || fail 'dry-run nothing-newer wrote last-pass status'
 pass 'nothing newer is a zero exit with one line'
 
-make_release 1.64.3 unsigned
+make_release ${RV[2]} unsigned
 before_record=$(sha256sum "$SAFE_CONFIG_DIR/release-follow.json")
 before_audit=$(sha256sum "$SAFE_RUN_DATA_DIR/audit.log")
 rm -f -- "$status_file"
@@ -164,26 +176,26 @@ run_follow --dry-run
 [[ "$(sha256sum "$SAFE_RUN_DATA_DIR/audit.log")" == "$before_audit" ]] || fail 'dry-run changed the audit log'
 [[ ! -e "$status_file" ]] || fail 'dry-run unsigned candidate wrote last-pass status'
 pass 'unsigned candidate and dry-run write protections hold'
-git -C "$checkout" tag -d v1.64.3 >/dev/null
-git --git-dir "$origin" update-ref -d refs/tags/v1.64.3
+git -C "$checkout" tag -d v${RV[2]} >/dev/null
+git --git-dir "$origin" update-ref -d refs/tags/v${RV[2]}
 
-make_release 1.64.4 lightweight
+make_release ${RV[3]} lightweight
 run_follow
 [[ "$FOLLOW_RC" == 1 ]] || fail 'lightweight tag was not refused'
-git -C "$checkout" tag -d v1.64.4 >/dev/null
-git --git-dir "$origin" update-ref -d refs/tags/v1.64.4
-make_release 1.64.5 mismatch
+git -C "$checkout" tag -d v${RV[3]} >/dev/null
+git --git-dir "$origin" update-ref -d refs/tags/v${RV[3]}
+make_release ${RV[4]} mismatch
 run_follow
 [[ "$FOLLOW_RC" == 1 ]] || fail 'embedded tag-name mismatch was not refused'
-git -C "$checkout" tag -d v1.64.5 v1.64.5-real >/dev/null
-git --git-dir "$origin" update-ref -d refs/tags/v1.64.5
-git --git-dir "$origin" update-ref -d refs/tags/v1.64.5-real
-make_release 1.64.6 badsig
+git -C "$checkout" tag -d v${RV[4]} v${RV[4]}-real >/dev/null
+git --git-dir "$origin" update-ref -d refs/tags/v${RV[4]}
+git --git-dir "$origin" update-ref -d refs/tags/v${RV[4]}-real
+make_release ${RV[5]} badsig
 run_follow
 [[ "$FOLLOW_RC" == 1 ]] || fail 'BADSIG tag was not refused'
-git -C "$checkout" tag -d v1.64.6 >/dev/null
-git --git-dir "$origin" update-ref -d refs/tags/v1.64.6
-jq -e '.verdict == "refused" and .candidate == "v1.64.6"' "$status_file" >/dev/null || fail 'refusal last-pass status was not recorded'
+git -C "$checkout" tag -d v${RV[5]} >/dev/null
+git --git-dir "$origin" update-ref -d refs/tags/v${RV[5]}
+jq -e ".verdict == \"refused\" and .candidate == \"v${RV[5]}\"" "$status_file" >/dev/null || fail 'refusal last-pass status was not recorded'
 doctor_json=$(SAFE_CONFIG_DIR="$SAFE_CONFIG_DIR" SAFE_DATA_DIR="$SAFE_DATA_DIR" \
   SAFE_RUN_CONFIG_DIR="$SAFE_RUN_CONFIG_DIR" SAFE_RUN_DATA_DIR="$SAFE_RUN_DATA_DIR" "$driver" doctor --json 2>/dev/null) ||
   fail 'doctor JSON failed while checking release-follow refusal'
@@ -203,25 +215,25 @@ gpg --no-options --batch --pinentry-mode loopback --passphrase '' \
   --quick-generate-key 'wrong <wrong@example.invalid>' ed25519 sign 0 >/dev/null 2>&1
 wrong_fingerprint=$(gpg --no-options --batch --with-colons --list-keys 'wrong@example.invalid' 2>/dev/null |
   awk -F: '$1 == "pub" {seen=1} seen && $1 == "fpr" {print $10; exit}')
-make_release 1.64.7 signed "$wrong_fingerprint"
+make_release ${RV[6]} signed "$wrong_fingerprint"
 run_follow
 [[ "$FOLLOW_RC" == 1 ]] || fail 'wrong-key tag was not refused'
-git -C "$checkout" tag -d v1.64.7 >/dev/null
-git --git-dir "$origin" update-ref -d refs/tags/v1.64.7
+git -C "$checkout" tag -d v${RV[6]} >/dev/null
+git --git-dir "$origin" update-ref -d refs/tags/v${RV[6]}
 pass 'wrong-key tag is refused'
 
 gpg --no-options --batch --pinentry-mode loopback --passphrase '' \
   --quick-generate-key 'expired <expired@example.invalid>' ed25519 sign 0 >/dev/null 2>&1
 expired_fingerprint=$(gpg --no-options --batch --with-colons --list-keys 'expired@example.invalid' 2>/dev/null |
   awk -F: '$1 == "pub" {seen=1} seen && $1 == "fpr" {print $10; exit}')
-make_release 1.64.8 signed "$expired_fingerprint"
+make_release ${RV[7]} signed "$expired_fingerprint"
 gpg --no-options --batch --pinentry-mode loopback --passphrase '' \
   --quick-set-expire "$expired_fingerprint" seconds=1 >/dev/null 2>&1 || fail 'could not expire disposable test key'
 sleep 2
 run_follow
 [[ "$FOLLOW_RC" == 1 ]] || fail 'expired-key tag was not refused'
-git -C "$checkout" tag -d v1.64.8 >/dev/null
-git --git-dir "$origin" update-ref -d refs/tags/v1.64.8
+git -C "$checkout" tag -d v${RV[7]} >/dev/null
+git --git-dir "$origin" update-ref -d refs/tags/v${RV[7]}
 
 pass 'expired-key tags are refused'
 
@@ -229,20 +241,20 @@ gpg --no-options --batch --pinentry-mode loopback --passphrase '' \
   --quick-generate-key 'revoked <revoked@example.invalid>' ed25519 sign 0 >/dev/null 2>&1
 revoked_fingerprint=$(gpg --no-options --batch --with-colons --list-keys 'revoked@example.invalid' 2>/dev/null |
   awk -F: '$1 == "fpr" {print $10; exit}')
-make_release 1.64.9 signed "$revoked_fingerprint"
+make_release ${RV[8]} signed "$revoked_fingerprint"
 sed 's/^://' "$GNUPGHOME/openpgp-revocs.d/$revoked_fingerprint.rev" > "$tmp/revoke.asc"
 gpg --no-options --batch --import "$tmp/revoke.asc" >/dev/null 2>&1 || fail 'could not revoke disposable test key'
 run_follow
 [[ "$FOLLOW_RC" == 1 ]] || fail 'revoked-key tag was not refused'
-git -C "$checkout" tag -d v1.64.9 >/dev/null
-git --git-dir "$origin" update-ref -d refs/tags/v1.64.9
+git -C "$checkout" tag -d v${RV[8]} >/dev/null
+git --git-dir "$origin" update-ref -d refs/tags/v${RV[8]}
 pass 'revoked-key tags are refused'
 
-make_release 1.64.0 signed
+make_release ${RV[0]} signed
 run_follow
-[[ "$FOLLOW_RC" == 0 && "$FOLLOW_OUTPUT" == 'safe: release follow: nothing newer than 1.64.2' ]] || fail 'downgrade changed the installed release'
-git -C "$checkout" tag -d v1.64.0 >/dev/null
-git --git-dir "$origin" update-ref -d refs/tags/v1.64.0
+[[ "$FOLLOW_RC" == 0 && "$FOLLOW_OUTPUT" == "safe: release follow: nothing newer than ${RV[1]}" ]] || fail 'downgrade changed the installed release'
+git -C "$checkout" tag -d v${RV[0]} >/dev/null
+git --git-dir "$origin" update-ref -d refs/tags/v${RV[0]}
 pass 'older release tags cannot downgrade'
 
 bad_repo="$tmp/bad-repo"
@@ -250,26 +262,26 @@ git clone --quiet --no-hardlinks "$checkout" "$bad_repo"
 git -C "$bad_repo" remote set-url origin "$origin"
 git -C "$bad_repo" checkout --quiet --orphan unrelated
 git -C "$bad_repo" rm -rf --quiet .
-printf '1.65.0\n' > "$bad_repo/VERSION"
+printf "${RV[9]}\n" > "$bad_repo/VERSION"
 git -C "$bad_repo" add VERSION
 git -C "$bad_repo" commit --quiet -m unrelated
-git -C "$bad_repo" tag -s -u "$fingerprint" -m v1.65.0 v1.65.0
-git -C "$bad_repo" push --quiet origin refs/tags/v1.65.0
+git -C "$bad_repo" tag -s -u "$fingerprint" -m v${RV[9]} v${RV[9]}
+git -C "$bad_repo" push --quiet origin refs/tags/v${RV[9]}
 run_follow
 [[ "$FOLLOW_RC" == 1 ]] || fail 'non-descendant candidate was not refused'
 pass 'non-descendant candidate is refused'
 
-git --git-dir "$origin" update-ref -d refs/tags/v1.65.0
-git -C "$checkout" checkout --quiet -B release-follow v1.64.2
+git --git-dir "$origin" update-ref -d refs/tags/v${RV[9]}
+git -C "$checkout" checkout --quiet -B release-follow v${RV[1]}
 printf 'dirty\n' > "$checkout/DIRTY"
-make_release 1.65.1 signed
+make_release ${RV[10]} signed
 run_follow --checkout "$checkout"
 [[ "$FOLLOW_RC" == 0 ]] || fail "dirty checkout install failed: $FOLLOW_OUTPUT"
 grep -q 'WARN checkout is dirty' <<<"$FOLLOW_OUTPUT" || fail 'dirty checkout warning missing'
 [[ -f "$checkout/DIRTY" ]] || fail 'dirty checkout was modified'
 pass 'dirty checkout installs the verified archive and warns on branch advancement'
 
-make_release 1.65.2 signed
+make_release ${RV[11]} signed
 git -C "$checkout" config gpg.program "$tmp/hostile-gpg"
 git -C "$checkout" config gpg.format ssh
 git -C "$checkout" config tag.gpgSign true
@@ -284,13 +296,13 @@ mkdir -p "$shadow"
 printf '#!/usr/bin/env bash\nexit 99\n' > "$shadow/git"
 printf '#!/usr/bin/env bash\nexit 99\n' > "$shadow/gpg"
 chmod +x "$shadow/git" "$shadow/gpg"
-make_release 1.65.3 signed
+make_release ${RV[12]} signed
 FOLLOW_PATH="$shadow:/usr/bin:/bin" run_follow
 [[ "$FOLLOW_RC" == 0 ]] || fail "PATH-shadowed git/gpg affected follow: $FOLLOW_OUTPUT"
 unset FOLLOW_PATH
 pass 'PATH-shadowed git and gpg cannot affect follow'
 
-make_release 1.65.4 signed
+make_release ${RV[13]} signed
 rm -f "$SAFE_RUN_CONFIG_DIR/config.json"
 run_follow
 [[ "$FOLLOW_RC" == 1 ]] || fail 'missing pinned signers were not refused'
@@ -298,7 +310,7 @@ grep -q 'follow-signer add <primary-fingerprint> at a TTY' <<<"$FOLLOW_OUTPUT" |
 printf '{"follow":{"signers":["%s"]}}\n' "$fingerprint" > "$SAFE_RUN_CONFIG_DIR/config.json"
 pass 'no pinned signer refuses without ambient-key fallback'
 
-make_release 1.65.5 signed
+make_release ${RV[14]} signed
 lockfile="$SAFE_RUN_DATA_DIR/release-follow.lock"
 exec {lock_fd}>"$lockfile"
 flock -x "$lock_fd"
@@ -310,14 +322,14 @@ grep -q 'another pass is running' <<<"$FOLLOW_OUTPUT" || fail 'lock contention m
 grep -q 'RELEASE_FOLLOW_REFUSED reason=another pass is running' "$SAFE_RUN_DATA_DIR/audit.log" || fail 'lock refusal was not audited'
 pass 'release-follow passes are bounded to one writer'
 
-replace_candidate=$(git -C "$checkout" rev-parse 'refs/tags/v1.65.5^{commit}')
-replace_parent=$(git -C "$checkout" rev-parse 'refs/tags/v1.65.3^{commit}')
+replace_candidate=$(git -C "$checkout" rev-parse "refs/tags/v${RV[14]}^{commit}")
+replace_parent=$(git -C "$checkout" rev-parse "refs/tags/v${RV[12]}^{commit}")
 replace_marker="$tmp/current-replace-marker"
-plant_replace_commit "$checkout" "$replace_candidate" "$replace_parent" "$replace_marker" 1.65.5
+plant_replace_commit "$checkout" "$replace_candidate" "$replace_parent" "$replace_marker" ${RV[14]}
 run_follow
 [[ "$FOLLOW_RC" == 0 ]] || fail "replace-ref candidate was not safely handled: $FOLLOW_OUTPUT"
 [[ ! -e "$replace_marker" ]] || fail 'replace-ref archive installed the evil marker'
-grep -q 'RELEASE_FOLLOWED from=1.65.3 to=1.65.5 signer=' "$SAFE_RUN_DATA_DIR/audit.log" || fail 'replace-ref safe follow event missing'
+grep -q "RELEASE_FOLLOWED from=${RV[12]} to=${RV[14]} signer=" "$SAFE_RUN_DATA_DIR/audit.log" || fail 'replace-ref safe follow event missing'
 git -C "$checkout" update-ref -d "refs/replace/$replace_candidate"
 pass 'replace-ref candidate installs genuine bytes and never attributes evil bytes'
 
@@ -374,7 +386,7 @@ printf '%s\n' "$legacy_output" > "$tmp/legacy-output"
 [[ -e "$legacy_marker" ]] || fail 'pre-fix fixture did not install the evil replacement marker'
 pass 'replace-ref regression is non-vacuous: the checked-in pre-fix fixture fails it'
 
-make_release 1.65.6 signed
+make_release ${RV[15]} signed
 touch "$checkout/.git/info/grafts"
 run_follow
 [[ "$FOLLOW_RC" == 1 ]] || fail 'graft checkout was not refused'
@@ -387,14 +399,14 @@ grep -q 'checkout is shallow' <<<"$FOLLOW_OUTPUT" || fail 'shallow refusal messa
 rm -f "$checkout/.git/shallow"
 pass 'grafts and shallow ancestry metadata are refused'
 
-candidate_1656_tag=$(git -C "$checkout" rev-parse refs/tags/v1.65.6)
-candidate_1655_commit=$(git -C "$checkout" rev-parse 'refs/tags/v1.65.5^{commit}')
-git -C "$checkout" update-ref refs/tags/v1.65.6 "$candidate_1655_commit"
+candidate_1656_tag=$(git -C "$checkout" rev-parse refs/tags/v${RV[15]})
+candidate_1655_commit=$(git -C "$checkout" rev-parse "refs/tags/v${RV[14]}^{commit}")
+git -C "$checkout" update-ref refs/tags/v${RV[15]} "$candidate_1655_commit"
 run_follow
 [[ "$FOLLOW_RC" == 1 ]] || fail 'rejected local tag update was not refused'
-grep -q 'v1.65.6' <<<"$FOLLOW_OUTPUT" || fail 'rejected tag name missing'
+grep -q "v${RV[15]}" <<<"$FOLLOW_OUTPUT" || fail 'rejected tag name missing'
 grep -q 'repair with' <<<"$FOLLOW_OUTPUT" || fail 'rejected tag repair missing'
-git -C "$checkout" update-ref refs/tags/v1.65.6 "$candidate_1656_tag"
+git -C "$checkout" update-ref refs/tags/v${RV[15]} "$candidate_1656_tag"
 hostile_ssh="$tmp/hostile-ssh"
 upload_pack_path="$(git --exec-path)/git-upload-pack"
 cat > "$hostile_ssh" <<EOF
@@ -405,12 +417,12 @@ EOF
 chmod +x "$hostile_ssh"
 git -C "$checkout" config remote.origin.url ssh://git@local/tmp/origin.git
 git -C "$checkout" config core.sshCommand "$hostile_ssh"
-git -C "$checkout" update-ref refs/tags/v1.65.6 "$candidate_1655_commit"
+git -C "$checkout" update-ref refs/tags/v${RV[15]} "$candidate_1655_commit"
 run_follow
 [[ "$FOLLOW_RC" == 1 ]] || fail 'hostile remote rejection was not refused'
 [[ "$FOLLOW_OUTPUT" != *evil* ]] || fail 'hostile remote text entered the repair command'
-grep -q 'origin tag update rejected for v1.65.6' <<<"$FOLLOW_OUTPUT" || fail 'anchored rejected-tag parse missed the ref-status tag'
-git -C "$checkout" update-ref refs/tags/v1.65.6 "$candidate_1656_tag"
+grep -q "origin tag update rejected for v${RV[15]}" <<<"$FOLLOW_OUTPUT" || fail 'anchored rejected-tag parse missed the ref-status tag'
+git -C "$checkout" update-ref refs/tags/v${RV[15]} "$candidate_1656_tag"
 git -C "$checkout" config --unset core.sshCommand
 git -C "$checkout" remote set-url origin "$origin"
 git -C "$checkout" remote set-url origin "$tmp/missing-origin.git"
@@ -422,7 +434,7 @@ grep -q 'origin must be fetchable with no agent and no credentials' <<<"$FOLLOW_
 git -C "$checkout" remote set-url origin "$origin"
 pass 'fetch rejection parsing ignores hostile remote text and keeps transport repairs distinct'
 
-make_release 1.65.8 signed
+make_release ${RV[16]} signed
 printf 'install.sh export-ignore\n' > "$checkout/.git/info/attributes"
 run_follow
 [[ "$FOLLOW_RC" == 1 ]] || fail 'checkout info attributes were not refused'
@@ -431,7 +443,7 @@ rm -f "$checkout/.git/info/attributes"
 run_follow
 [[ "$FOLLOW_RC" == 0 ]] || fail "genuine tree equality after info attributes failed: $FOLLOW_OUTPUT"
 
-make_release 1.65.9 signed
+make_release ${RV[17]} signed
 attribute_file="$tmp/core-attributes"
 printf 'install.sh export-ignore\n' > "$attribute_file"
 git -C "$checkout" config core.attributesFile "$attribute_file"
@@ -475,8 +487,8 @@ pass 'installer records the component union and preserves no-wrappers semantics'
 
 probe_driver="$tmp/probe-driver"
 cp "$driver" "$probe_driver"
-printf '1.65.10\n' > "$checkout/VERSION"
-sed -i -E 's/^SAFE_VERSION="[0-9]+\.[0-9]+\.[0-9]+"/SAFE_VERSION="1.65.10"/' "$checkout/bin/safe"
+printf "${RV[18]}\n" > "$checkout/VERSION"
+sed -i -E "s/^SAFE_VERSION=\"[0-9]+\\.[0-9]+\\.[0-9]+\"/SAFE_VERSION=\"${RV[18]}\"/" "$checkout/bin/safe"
 cat > "$checkout/install.sh" <<'PROBE_INSTALL'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -485,8 +497,8 @@ PROBE_INSTALL
 chmod +x "$checkout/install.sh"
 git -C "$checkout" add VERSION bin/safe install.sh
 git -C "$checkout" commit --quiet -m 'fixture probe failure'
-git -c gpg.format=openpgp -c gpg.program=/usr/bin/gpg -C "$checkout" tag -s -u "$fingerprint" -m v1.65.10 v1.65.10
-git -C "$checkout" push --quiet origin HEAD refs/tags/v1.65.10
+git -c gpg.format=openpgp -c gpg.program=/usr/bin/gpg -C "$checkout" tag -s -u "$fingerprint" -m v${RV[18]} v${RV[18]}
+git -C "$checkout" push --quiet origin HEAD refs/tags/v${RV[18]}
 driver="$probe_driver"
 run_follow
 [[ "$FOLLOW_RC" != 127 ]] || fail 'post-install probe leaked exit 127'
