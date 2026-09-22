@@ -367,7 +367,7 @@ grep -q 'auto_allow_tolerate' "$CASE_ERR" && pass 'the skip names the way to run
 prepare_case disabled-tolerated
 printf '{"install":{"cooldown_days":0,"auto_allow_tolerate":["socket_disabled"],"socket":{"mode":"never","cache_ttl_days":7}}}\n' > "$CASE_RUN_CONFIG/config.json"
 run_check clean --gate install
-expect_rc 0 'a declared skip posture passes the install gate'
+expect_rc 15 'a declared skip posture is a tolerated WARN pass (terminal required, 2026-09-22)'
 [[ "$(socket_calls)" == "0" ]] && pass 'tolerated skip still makes no Socket request' || fail 'tolerated skip still makes no Socket request'
 
 # Maven has no Socket tier (ticket #145), and since the 2026-09-22 scope
@@ -401,6 +401,15 @@ run_check pending MOCK_RELEASE_FRESH=1 MOCK_COOLDOWN_FIX=1 SAFE_AUDIT_SOCKET_TIM
 expect_rc 0 'clean fresh release with incomplete Socket score stays GO'
 expect_json '.socket.status == "pending" and .verdict == "GO"' 'pending Socket score is disclosed in the receipt'
 [[ "$(cache_entries)" == "0" ]] && pass 'pending Socket score is never cached' || fail 'pending Socket score is never cached'
+# 2026-09-22 direction: a pending Socket score is NOT all-green — the gate
+# gets its own code so unattended installs never proceed on it.
+prepare_case pending-gate
+printf '{"install":{"cooldown_days":3,"socket":{"mode":"always","cache_ttl_days":7}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check pending MOCK_RELEASE_FRESH=1 MOCK_COOLDOWN_FIX=1 SAFE_AUDIT_SOCKET_TIMEOUT=1 SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT=1 --gate install
+expect_rc 14 'a pending Socket score hands gate exit 14 (not all-green)'
+jq -e '.packages["npm:fixture"].verdict == "GO_PENDING_SOCKET"' "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1 \
+  && pass 'the pending receipt keeps its distinct verdict' || fail 'the pending receipt keeps its distinct verdict'
+
 
 # ---------------------------------------------------------------------------
 # 2026-09-22 scope ruling: Socket is called only for fresh npm/python
@@ -601,7 +610,7 @@ fi
 prepare_case not-found-gate-tolerated
 printf '{"install":{"cooldown_days":0,"socket":{"mode":"always","cache_ttl_days":7},"auto_allow_tolerate":["socket_not_found"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 run_check not-found --gate install --op install
-expect_rc 0 'a tolerated socket_not_found proceeds at the gate'
+expect_rc 15 'a tolerated socket_not_found pass requires a terminal (2026-09-22)'
 
 # A tolerated socket outage must NOT drag not_found through, and vice versa:
 # tolerating socket_error alone still refuses a not_found.
@@ -657,7 +666,7 @@ multi_project
 printf '{"install":{"cooldown_days":0,"socket":{"mode":"always","cache_ttl_days":7},"auto_allow_tolerate":["socket_not_found"]}}\n' \
   > "$CASE_RUN_CONFIG/config.json"
 run_multi sibling-not-found --gate install
-expect_rc 0 'a ranged sibling warn tolerated by auto_allow_tolerate proceeds'
+expect_rc 15 'a ranged tolerated pass requires a terminal (2026-09-22)'
 
 # Regression: a SINGLE-version install whose primary itself warned is still
 # host-allowable by an exact pin — the fix must not close the legitimate lane
@@ -666,7 +675,7 @@ prepare_case single-host-allow-primary-pin-covers
 printf '{"packages":{"fixture":{"version":"1.0.0","sha":"x","ecosystem":"npm","added":"2026-08-01","reason":"exact pin"}}}\n' \
   > "$CASE_RUN_CONFIG/host-allow.json"
 run_check not-found --gate install --op install
-expect_rc 0 'an exact single-version pin still covers a primary Socket warn'
+expect_rc 15 'a host-allow covered primary warn requires a terminal (2026-09-22)'
 if grep -q 'matches every warned resolved version' "$CASE_ERR"; then
   pass 'the single-version pin is honored'
 else

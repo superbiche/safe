@@ -352,3 +352,51 @@ SAFE_AUDIT_SOCKET_CONSENT=granted safe_gate_main npm install || exit 1
 exit 0
 INNER
 pass 'gate-lib consent: Y re-runs with granted env, n proceeds, deferral passes 13 through, main scrubs'
+
+# gate-lib case 14 (pending Socket score, r1 review BLOCKER closure): the
+# wrapper lane mirrors bin/safe — non-terminal 102, confirm 0, decline 100 —
+# and the mise child defers 14 to its parent like a consent ask.
+: >"$tmp/gate-consent-env"; rm -f "$tmp/gate-second"
+safe_gate_operator_terminal() { return 0; }
+safe_gate_run_audit() { return 14; }
+safe_gate_confirm_pending() { printf 'y\n' >>"$tmp/pending-answers"; return 0; }
+safe_gate_check fresh@1.0.0 npm || exit 1
+[[ -s "$tmp/pending-answers" ]] || exit 1
+safe_gate_confirm_pending() { printf 'n\n' >>"$tmp/pending-answers"; return 1; }
+pending_rc=0
+safe_gate_check fresh@1.0.0 npm 2>/dev/null || pending_rc=$?
+[[ $pending_rc == 100 ]] || exit 1
+safe_gate_operator_terminal() { return 1; }
+pending_rc=0
+safe_gate_check fresh@1.0.0 npm 2>/dev/null || pending_rc=$?
+[[ $pending_rc == 102 ]] || exit 1
+safe_gate_operator_terminal() { return 0; }
+pending_rc=0
+safe_gate_check fresh@1.0.0 npm defer-socket-consent 2>/dev/null || pending_rc=$?
+[[ $pending_rc == 14 ]] || exit 1
+
+pass 'gate-lib pending-14: non-terminal 102, confirm 0, decline 100, mise deferral passes 14 through'
+
+# gate-lib case 15 (tolerated/host-allowed WARN pass): same terminal rule.
+: >"$tmp/pending-answers"
+safe_gate_run_audit() { return 15; }
+safe_gate_confirm_tolerated() { printf 'y\n' >>"$tmp/pending-answers"; return 0; }
+safe_gate_confirm_pending() { printf 'y\n' >>"$tmp/pending-answers"; return 0; }
+tolerated_rc=0
+safe_gate_check tol@1.0.0 npm 2>/dev/null || tolerated_rc=$?
+[[ $tolerated_rc == 0 ]] || { printf 'tol-Y got %s\n' "$tolerated_rc" >&2; exit 1; }
+safe_gate_confirm_pending() { printf 'n\n' >>"$tmp/pending-answers"; return 1; }
+safe_gate_confirm_tolerated() { return 1; }
+tolerated_rc=0
+safe_gate_check tol@1.0.0 npm 2>/dev/null || tolerated_rc=$?
+[[ $tolerated_rc == 100 ]] || { printf 'tol-decline got %s\n' "$tolerated_rc" >&2; exit 1; }
+safe_gate_operator_terminal() { return 1; }
+safe_gate_confirm_tolerated() { return 1; }
+tolerated_rc=0
+safe_gate_check tol@1.0.0 npm 2>/dev/null || tolerated_rc=$?
+[[ $tolerated_rc == 102 ]] || exit 1
+safe_gate_operator_terminal() { return 0; }
+tolerated_rc=0
+safe_gate_check tol@1.0.0 npm defer-socket-consent 2>/dev/null || tolerated_rc=$?
+[[ $tolerated_rc == 15 ]] || exit 1
+pass 'gate-lib tolerated-15: non-terminal 102, confirm 0, decline 100, mise deferral passes 15 through' 

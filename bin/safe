@@ -2302,6 +2302,12 @@ safe_install_audit_package() {
   local ecosystem="$2"
   local audit_status
 
+  # STRICT green for this package: set only by the clean-GO path below.
+  # Host-allow overrides, tolerated WARNs, stale-evidence timeouts and
+  # consent declines also return 0 but must never ride the unattended
+  # proceed (review r1 F-MAJOR-2, 2026-09-22).
+  SAFE_INSTALL_STRICT_GREEN=0
+
   [[ -x "$SAFE_AUDIT_PATH" ]] || die "safe install requires safe audit at $SAFE_AUDIT_PATH"
 
   local -a extra=()
@@ -2319,6 +2325,7 @@ safe_install_audit_package() {
 
   case "$audit_status" in
     0)
+      SAFE_INSTALL_STRICT_GREEN=1
       safe_install_gate_log "$ecosystem" "$package" "PROCEED"
       return 0
       ;;
@@ -2476,6 +2483,35 @@ safe_install_audit_package() {
       safe_install_gate_log "$ecosystem" "$package" "SOCKET_CONSENT_DECLINED"
       err "${package} — Socket check declined for this install; proceeding on advisories, blocklist and release age."
       return 0
+      ;;
+    14)
+      # GO with a still-incomplete Socket score (2026-09-22 direction): not
+      # all-green, so an unattended shell never proceeds on it. The receipt is
+      # GO_PENDING_SOCKET; an interactive terminal confirms as before;
+      # --yes cannot substitute for the terminal (no silent auto-pass).
+      if ! safe_gate_operator_terminal; then
+        refuse 102 "BLOCKED ${ecosystem} install of ${package} — the Socket score for the fresh release is still pending, so this install is not all-green; an operator confirms it at an interactive terminal; hand over the complete command with exact pinned versions; details: safe explain"
+      fi
+      if safe_install_confirm "${package} — the Socket score is still pending; install now"; then
+        safe_install_gate_log "$ecosystem" "$package" "PENDING_SOCKET_TTY_OVERRIDE"
+        return 0
+      fi
+      safe_install_gate_log "$ecosystem" "$package" "REFUSED_PENDING_DECLINED"
+      refuse 100 "BLOCKED ${ecosystem} install of ${package} — Socket score pending and you declined; retry once the scan completes; details: safe explain"
+      ;;
+    15)
+      # A WARN pass through a host-allow entry or auto_allow_tolerate
+      # (2026-09-22 direction): a deliberate grant, not all-green — the same
+      # terminal requirement as before applies, never the unattended proceed.
+      if ! safe_gate_operator_terminal; then
+        refuse 102 "BLOCKED ${ecosystem} install of ${package} — the WARN passes via host-allow/tolerate but that is not an all-green check; an operator confirms it at an interactive terminal; hand over the complete command with exact pinned versions; details: safe explain"
+      fi
+      if safe_install_confirm "${package} — WARN passes via host-allow/tolerate; install now"; then
+        safe_install_gate_log "$ecosystem" "$package" "TOLERATED_WARN_TTY_OVERRIDE"
+        return 0
+      fi
+      safe_install_gate_log "$ecosystem" "$package" "REFUSED_TOLERATED_DECLINED"
+      refuse 100 "BLOCKED ${ecosystem} install of ${package} — tolerated WARN and you declined; details: safe explain"
       ;;
     2|20)
       # No allow hint on BLOCK: host-allow only clears WARN, and for a
@@ -3107,8 +3143,10 @@ cmd_install() {
   # it only when told which installer runs.
   SAFE_INSTALL_INSTALLER=""
   [[ "$manager" == "bun" ]] && SAFE_INSTALL_INSTALLER="bun"
+  local green_all=1
   for audit_package in "${audit_packages[@]}"; do
     safe_install_audit_package "$audit_package" "$ecosystem"
+    [[ "${SAFE_INSTALL_STRICT_GREEN:-0}" == "1" ]] || green_all=0
     if safe_install_trustable_package "$audit_package" "$ecosystem"; then
       trust_packages+=("$audit_package")
     elif [[ "$trust_host" == "1" ]]; then
@@ -3127,7 +3165,16 @@ cmd_install() {
 
   safe_install_build_command install_cmd "$manager" "$global_mode" "${manager_args[@]}"
   if [[ "$yes" != "1" ]]; then
-    safe_install_confirm "${install_cmd[@]}" || die "install cancelled"
+    if [[ ! -t 0 || ! -t 1 ]] && [[ "$green_all" == "1" ]]; then
+      # Unattended all-green install (operator direction 2026-09-22): every
+      # package ended clean-GO (final Socket answer or a ruled out-of-scope
+      # skip) — any WARN, tolerate, host-allow override, stale-evidence
+      # timeout, pending score, consent ask or BLOCK keeps its own terminal
+      # requirement below. Logged as its own decision token.
+      safe_install_gate_log "$ecosystem" "${audit_packages[*]}" "INSTALL_UNATTENDED_GREEN"
+    else
+      safe_install_confirm "${install_cmd[@]}" || die "install cancelled"
+    fi
   fi
 
   local install_rc

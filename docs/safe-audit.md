@@ -582,7 +582,12 @@ never as a risk signal.
 In gate mode a fifth code, **exit 13**, means the verdict is GO but a
 fresh-release Socket check awaits the operator's consent — the gate resolves
 it to a normal verdict (Y) or a consented proceed (n); a non-interactive
-shell receives the operator-TTY refusal instead.
+shell receives the operator-TTY refusal instead. A sixth code, **exit 14**,
+means GO with a still-pending Socket score (`GO_PENDING_SOCKET` receipt): not
+all-green, so unattended shells refuse 102 and an interactive terminal
+confirms as before. A seventh code, **exit 15**, means a WARN passed via a
+host-allow entry or `auto_allow_tolerate` — a deliberate grant, not an
+all-green check: same terminal requirement, never the unattended proceed.
 
 ### Install gate mode
 

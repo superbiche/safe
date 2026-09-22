@@ -535,7 +535,7 @@ run_check \
   MOCK_OSV_MATCH_VERSION=2.1.4 \
   MOCK_SOCKET_MODE=ok \
   -- brace-expansion --ecosystem npm --op update --gate install
-if expect_status 0 "pinned host-allow entry matches the RESOLVED version of an unversioned spec"; then
+if expect_status 15 "pinned host-allow entry matches the RESOLVED version of an unversioned spec"; then
   pass "pinned host-allow entry matches the RESOLVED version of an unversioned spec"
 fi
 if expect_grep "$ERR_FILE" 'host-allow entry brace-expansion@2\.1\.4 matches' "override notice names the pin"; then
@@ -620,7 +620,7 @@ run_check \
   MOCK_OSV_FIXTURE="$fixture" \
   -- brace-expansion@2.1.4 --ecosystem npm --gate install
 mv "$MOCKBIN/socket.hidden" "$MOCKBIN/socket"
-if expect_status 0 "auto_allow_tolerate opt-in allows the tolerated cause"; then
+if expect_status 15 "auto_allow_tolerate opt-in yields the tolerated WARN pass (terminal required, 2026-09-22)"; then
   pass "auto_allow_tolerate opt-in allows the tolerated cause"
 fi
 if jq -e '.packages["npm:brace-expansion"].verdict == "WARN_TOLERATED"' \
@@ -1034,7 +1034,7 @@ run_check \
   MOCK_OSV_MATCH_VERSION=2.1.4 \
   MOCK_SOCKET_MODE=ok \
   -- brace-expansion@2.1.4 --ecosystem npm --gate install
-if expect_status 0 "pinned host-allow still permits this invocation"; then
+if expect_status 15 "pinned host-allow still permits this invocation (terminal required, 2026-09-22)"; then
   pass "pinned host-allow still permits this invocation"
 fi
 if jq -e '.packages["npm:brace-expansion"] == null' "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then

@@ -27,6 +27,7 @@ SUITES=(
   tests/live/shim_delegation.sh
   tests/install/run.sh
   tests/install/socket_command_consent.sh
+  tests/install/unattended_green.sh
   tests/install/gate_adverse_warn_override.sh
   tests/audit/check_version_aware.sh
   tests/audit/socket_tier.sh
