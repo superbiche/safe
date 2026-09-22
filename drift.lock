@@ -28,17 +28,17 @@ sig = "d5ebd850ae7d3c4e"
 [[bindings]]
 doc = "docs/configuration.md"
 target = "bin/safe-audit"
-sig = "68d0d9c9fc97a76e"
+sig = "08ad8fd42478707e"
 
 [[bindings]]
 doc = "docs/configuration.md"
 target = "bin/safe-run"
-sig = "6fa0036ffdf04ae7"
+sig = "21e5f31b5bfa3754"
 
 [[bindings]]
 doc = "docs/dependencies.md"
 target = "bin/safe-audit"
-sig = "68d0d9c9fc97a76e"
+sig = "08ad8fd42478707e"
 
 [[bindings]]
 doc = "docs/index.md"
@@ -78,7 +78,7 @@ sig = "7716170507ec2acd"
 [[bindings]]
 doc = "docs/operations.md"
 target = "bin/safe-run"
-sig = "6fa0036ffdf04ae7"
+sig = "21e5f31b5bfa3754"
 
 [[bindings]]
 doc = "docs/release-review.md"
@@ -98,7 +98,7 @@ sig = "084d3a2364a61dca"
 [[bindings]]
 doc = "docs/safe-audit.md"
 target = "bin/safe-audit"
-sig = "68d0d9c9fc97a76e"
+sig = "08ad8fd42478707e"
 
 [[bindings]]
 doc = "docs/safe-audit.md"
@@ -108,4 +108,4 @@ sig = "9d7937815cb8379c"
 [[bindings]]
 doc = "docs/safe-run.md"
 target = "bin/safe-run"
-sig = "6fa0036ffdf04ae7"
+sig = "21e5f31b5bfa3754"
