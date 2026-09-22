@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.66.0 - 2026-09-22
 
 - Scope the Socket behavioral tier to fresh npm/Python releases (operator
   ruling 2026-09-22): under `install.socket.mode: auto` (the default), a live
