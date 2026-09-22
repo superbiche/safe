@@ -90,7 +90,8 @@ const completeEvidence = `{
   "resolution": {"ok": true, "primary_version": "1.0.0", "label": "1.0.0"},
   "socket": {"status": "ok", "available": true, "note": "", "reason": "",
              "score": "90", "class": "clean",
-             "cache_stale_score": "", "cache_stale_age_days": ""},
+             "cache_stale_score": "", "cache_stale_age_days": "",
+             "window_days": 0},
   "socket_siblings": [],
   "osv": {"status": "ok", "affecting": [], "remediated_count": 0,
           "total_count": 0, "historical_critical": false,
@@ -173,6 +174,7 @@ func TestPackageVerdictRefusesIncompleteEvidence(t *testing.T) {
 		"osv.affecting", "osv.status", "osv.historical_critical",
 		"osv.historical_malware_ids", "osv.total_count",
 		"socket_siblings", "socket.class", "socket.status", "socket.available",
+		"socket.window_days",
 		"release.rc", "release.cooldown_days", "release.cooldown_security_fix",
 		"custom_source", "blocklist.readable", "blocklist.reason",
 		"block_severities", "resolution.ok",
@@ -284,7 +286,20 @@ func TestPackageVerdictRejectsUnusableEvidence(t *testing.T) {
 
 func TestPackageVerdictRejectsSiblingWithUnknownClass(t *testing.T) {
 	doc := setEvidenceKey(t, "socket_siblings", []any{
-		map[string]any{"version": "2.0.0", "status": "ok", "class": ""},
+		map[string]any{"version": "2.0.0", "status": "ok", "class": "",
+			"score": "", "reason": "", "age_days": -1},
+	})
+	if code, stdout, _ := runVerdict(t, doc); code != 3 || stdout != "" {
+		t.Fatalf("run() = %d stdout=%q, want 3 with no verdict", code, stdout)
+	}
+}
+
+func TestPackageVerdictRejectsSiblingWithoutAge(t *testing.T) {
+	// age_days is shape-required on every sibling: absent decodes to 0, and a
+	// silent 0 would read as "published today" — the consent-vs-scope fork.
+	doc := setEvidenceKey(t, "socket_siblings", []any{
+		map[string]any{"version": "2.0.0", "status": "out_of_scope", "class": "",
+			"score": "", "reason": ""},
 	})
 	if code, stdout, _ := runVerdict(t, doc); code != 3 || stdout != "" {
 		t.Fatalf("run() = %d stdout=%q, want 3 with no verdict", code, stdout)

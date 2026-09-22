@@ -59,7 +59,12 @@ case "$url" in
     ;;
   *)
     if [[ "${MOCK_RELEASE_FRESH:-0}" == "1" ]]; then
-      printf '{"versions":{"1.0.0":{}},"time":{"1.0.0":"%s"}}\n' "$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)" | emit
+      fresh_time="1 hour ago"
+      # MOCK_RELEASE_AGE moves the fresh release inside/outside specific
+      # windows (e.g. 4d: outside the 3d cooldown, inside the 7d Socket
+      # window) without a second fresh-packument knob.
+      [[ -n "${MOCK_RELEASE_AGE:-}" ]] && fresh_time="$MOCK_RELEASE_AGE"
+      printf '{"versions":{"1.0.0":{}},"time":{"1.0.0":"%s"}}\n' "$(date -u -d "$fresh_time" +%Y-%m-%dT%H:%M:%SZ)" | emit
     elif [[ "${MOCK_MULTI_VERSION:-0}" == "1" ]]; then
       # Two majors so two distinct project constraints resolve to two
       # distinct installable versions (RESOLVED_VERSIONS length 2).
@@ -152,7 +157,12 @@ prepare_case() {
   CASE_ERR="$CASE/err.txt"
   CASE_LOG="$CASE/socket.log"
   mkdir -p "$CASE_RUN_CONFIG" "$CASE_AUDIT_CONFIG" "$CASE_DATA" "$CASE_HOME"
-  printf '{"install":{"cooldown_days":0,"socket":{"mode":"auto","cache_ttl_days":7}}}\n' > "$CASE_RUN_CONFIG/config.json"
+  # The tier-mechanics default is mode "always": the 2026-09-22 scope ruling
+  # puts ordinary installs (mode auto) behind the fresh-window consent flow,
+  # which has its own dedicated cases below. `always` preserves today's
+  # unconditional-call semantics, so every cache/classification/outage case
+  # below exercises the tier itself, not the scope gate.
+  printf '{"install":{"cooldown_days":0,"socket":{"mode":"always","cache_ttl_days":7}}}\n' > "$CASE_RUN_CONFIG/config.json"
   printf '{"packages":{}}\n' > "$CASE_RUN_CONFIG/blocked.json"
   : > "$CASE_LOG"
 }
@@ -251,7 +261,7 @@ expect_rc 0 'different exact version is independently scored'
 # A leading ~/ expands to $HOME, and the env var still wins over the config.
 prepare_case cache-dir-config
 CONFIG_CACHE="$CASE/config-cache"
-printf '{"install":{"cooldown_days":0,"socket":{"mode":"auto","cache_ttl_days":7,"cache_dir":"~/cfg-socket-cache"}}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install":{"cooldown_days":0,"socket":{"mode":"always","cache_ttl_days":7,"cache_dir":"~/cfg-socket-cache"}}}\n' > "$CASE_RUN_CONFIG/config.json"
 run_config_check() {
   set +e
   env -u SOCKET_SECURITY_API_TOKEN -u SAFE_AUDIT_SOCKET_CACHE_DIR \
@@ -333,7 +343,7 @@ expect_rc 10 'rate limit warns as infrastructure breakage'
 
 # TTL zero disables both read and write caching.
 prepare_case ttl-zero
-printf '{"install":{"cooldown_days":0,"socket":{"mode":"auto","cache_ttl_days":0}}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install":{"cooldown_days":0,"socket":{"mode":"always","cache_ttl_days":0}}}\n' > "$CASE_RUN_CONFIG/config.json"
 run_check clean
 run_check clean
 [[ "$(socket_calls)" == "2" ]] && pass 'zero TTL calls Socket every time' || fail 'zero TTL calls Socket every time'
@@ -360,27 +370,105 @@ run_check clean --gate install
 expect_rc 0 'a declared skip posture passes the install gate'
 [[ "$(socket_calls)" == "0" ]] && pass 'tolerated skip still makes no Socket request' || fail 'tolerated skip still makes no Socket request'
 
-# Maven has no Socket tier (ticket #145): package-audit degrades to an honest
-# policy-style skip rather than a pkg:java/... 400 read as an outage, and OSV is
-# queried under the correct "Maven" ecosystem — never a false-clean "java" miss.
+# Maven has no Socket tier (ticket #145), and since the 2026-09-22 scope
+# ruling it is outside the default ecosystems besides: a Maven audit skips
+# silently (disclosed, no warn) — OSV is queried under the correct "Maven"
+# ecosystem, never a false-clean "java" miss.
 prepare_case maven-no-socket-tier
 run_check_maven clean MOCK_OSV_ECO_LOG="$CASE/osv-eco.log" --gate install
-expect_rc 10 'a clean Maven audit degrades to WARN (no behavioral tier), never GO'
-expect_json '.socket.status == "skipped" and .socket.note == "Socket has no Maven tier"' 'the Maven Socket skip names the missing tier, not a policy toggle'
-expect_json '.warn_causes | index("socket_disabled") != null' 'the Maven Socket skip carries the skip cause'
+expect_rc 0 'a clean Maven audit is GO on advisories and age alone'
+expect_json '.socket.status == "out_of_scope" and .socket.note == "Socket has no Maven tier"' 'the Maven skip names the missing tier as a scope state'
+expect_json '.warn_causes == []' 'a Maven audit carries no socket cause (scope ruling)'
 [[ "$(socket_calls)" == "0" ]] && pass 'a Maven audit never invokes Socket' || fail 'a Maven audit never invokes Socket'
-grep -q 'Socket has no Maven tier' "$CASE_ERR" && pass 'the Maven hint names the missing tier' || fail 'the Maven hint names the missing tier'
-grep -q 'not auto-gated' "$CASE_ERR" && pass 'the Maven hint states the not-auto-gated posture' || fail 'the Maven hint states the not-auto-gated posture'
+grep -q 'Socket has no Maven tier' "$CASE_OUT" && pass 'the Maven hint names the missing tier' || fail 'the Maven hint names the missing tier'
 grep -qE '"ecosystem": *"Maven"' "$CASE/osv-eco.log" 2>/dev/null && pass 'OSV is queried under the Maven ecosystem, not literal java' || fail 'OSV ecosystem for a Maven audit was not "Maven" (false-clean hazard)'
+
+# An operator who explicitly adds java to the ecosystems re-arms the tier —
+# and the capability fact (no Maven tier) is a WARN again, because they asked
+# for a check Socket cannot deliver.
+prepare_case maven-explicit-eco
+printf '{"install":{"cooldown_days":0,"socket":{"mode":"always","cache_ttl_days":7,"ecosystems":["npm","java"]}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check_maven clean --gate install
+expect_rc 10 'an explicitly-requested Maven tier still warns: Socket has no such tier'
+expect_json '.socket.status == "skipped" and .socket.note == "Socket has no Maven tier"' 'the explicit-config Maven skip keeps the policy-skip shape'
+expect_json '.warn_causes | index("socket_disabled") != null' 'the explicit-config Maven skip carries the skip cause'
 
 # A fresh release whose bounded retries have no completed score remains a
 # disclosed PENDING GO only while OSV and the blocklist are clean.
 prepare_case pending
-printf '{"install":{"cooldown_days":3,"socket":{"mode":"auto","cache_ttl_days":7}}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install":{"cooldown_days":3,"socket":{"mode":"always","cache_ttl_days":7}}}\n' > "$CASE_RUN_CONFIG/config.json"
 run_check pending MOCK_RELEASE_FRESH=1 MOCK_COOLDOWN_FIX=1 SAFE_AUDIT_SOCKET_TIMEOUT=1 SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT=1
 expect_rc 0 'clean fresh release with incomplete Socket score stays GO'
 expect_json '.socket.status == "pending" and .verdict == "GO"' 'pending Socket score is disclosed in the receipt'
 [[ "$(cache_entries)" == "0" ]] && pass 'pending Socket score is never cached' || fail 'pending Socket score is never cached'
+
+# ---------------------------------------------------------------------------
+# 2026-09-22 scope ruling: Socket is called only for fresh npm/python
+# releases, and even then only with the operator's consent at the gate.
+# Old releases and out-of-ecosystem audits skip silently — OSV, the
+# blocklist and the release-age rule decide.
+# ---------------------------------------------------------------------------
+
+# mode auto + an OLD release: no call, no prompt, no warn. GO stays GO and
+# the skip is disclosed in the check line and the verdict log.
+prepare_case scope-old-release
+printf '{"install":{"cooldown_days":7,"socket":{"mode":"auto","cache_ttl_days":7}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check clean --gate install
+expect_rc 0 'an old release under mode auto installs without Socket'
+expect_json '.socket.status == "out_of_scope"' 'the old-release skip is a scope state'
+expect_json '.warn_causes == []' 'an out-of-scope skip carries no cause'
+expect_json '.checks.socket | contains("SKIP")' 'the scope skip is disclosed in the check line'
+[[ "$(socket_calls)" == "0" ]] && pass 'an old release under mode auto never calls Socket' || fail 'an old release under mode auto never calls Socket'
+tail -n 1 "$CASE_DATA/audit/audit-log.jsonl" 2>/dev/null | jq -e '.event == "package_audit" and .socket.status == "out_of_scope" and .verdict == "GO"' >/dev/null 2>&1 \
+  && pass 'the verdict log records the scope skip' || fail 'the verdict log records the scope skip'
+
+# mode auto + a FRESH release: no call, no receipt — gate exit 13 hands the
+# consent ask to the install gate; the audit itself stays a decidable GO.
+# The mock age is 4d: outside the 3d cooldown (a younger release would WARN
+# release_too_new and take the override lane instead), inside the 7d window.
+prepare_case scope-fresh-consent
+printf '{"install":{"cooldown_days":3,"socket":{"mode":"auto","cache_ttl_days":7}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check clean MOCK_RELEASE_FRESH=1 MOCK_RELEASE_AGE="4 days ago" --gate install
+expect_rc 13 'a fresh release under mode auto hands the consent ask to the gate'
+expect_json '.socket.status == "consent_required" and .socket.window_days == 7' 'the consent envelope names the window'
+expect_json '.verdict == "GO"' 'the consent pass verdict is GO (decidable without the tier)'
+[[ "$(socket_calls)" == "0" ]] && pass 'no Socket call is spent before consent' || fail 'no Socket call is spent before consent'
+known_count="$(jq '.packages | length' "$CASE_RUN_CONFIG/install-known.json" 2>/dev/null || echo 0)"
+[[ "$known_count" == "0" ]] && pass 'no clean receipt is minted before the operator answers' || fail 'no clean receipt is minted before the operator answers'
+
+# A standalone (non-gate) audit never prompts: same consent state, disclosed.
+prepare_case scope-fresh-standalone
+printf '{"install":{"cooldown_days":3,"socket":{"mode":"auto","cache_ttl_days":7}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check clean MOCK_RELEASE_FRESH=1 MOCK_RELEASE_AGE="4 days ago"
+expect_rc 0 'a standalone audit of a fresh release stays decidable'
+expect_json '.socket.status == "consent_required"' 'the standalone audit discloses the consent state'
+grep -q 'fresh release' "$CASE_OUT" && pass 'the standalone output names the fresh-release disclosure' || fail 'the standalone output names the fresh-release disclosure'
+
+# Consent (the gate's Y) re-run: the live call happens, a clean score GOes,
+# and the clean receipt is only now minted.
+prepare_case scope-fresh-granted
+printf '{"install":{"cooldown_days":3,"socket":{"mode":"auto","cache_ttl_days":7}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check clean MOCK_RELEASE_FRESH=1 MOCK_RELEASE_AGE="4 days ago" SAFE_AUDIT_SOCKET_CONSENT=granted --gate install
+expect_rc 0 'granted consent spends the Socket call and GOes'
+expect_json '.socket.status == "ok"' 'the consented run carries the live score'
+[[ "$(socket_calls)" == "1" ]] && pass 'exactly one Socket call is spent on consent' || fail 'exactly one Socket call is spent on consent'
+jq -e '.packages["npm:fixture"].verdict == "GO"' "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1 \
+  && pass 'the consented clean run records its clean receipt' || fail 'the consented clean run records its clean receipt'
+
+# The failure rule is unchanged: a consented call that fails still warns as
+# infrastructure, never silently passes (2026-09-22 ruling, clause 3).
+prepare_case scope-fresh-granted-failure
+printf '{"install":{"cooldown_days":3,"socket":{"mode":"auto","cache_ttl_days":7}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check rate MOCK_RELEASE_FRESH=1 MOCK_RELEASE_AGE="4 days ago" SAFE_AUDIT_SOCKET_CONSENT=granted
+expect_rc 10 'a consented Socket failure still warns'
+expect_json '.warn_causes | index("socket_rate_limited") != null' 'the failure keeps its rate-limit cause'
+
+# The verdict log measures the consent state on the declined path too.
+prepare_case scope-fresh-consent-log
+printf '{"install":{"cooldown_days":7,"socket":{"mode":"auto","cache_ttl_days":7}}}\n' > "$CASE_RUN_CONFIG/config.json"
+run_check clean MOCK_RELEASE_FRESH=1
+tail -n 1 "$CASE_DATA/audit/audit-log.jsonl" 2>/dev/null | jq -e '.socket_consent.required == true and .socket_consent.window_days == 7' >/dev/null 2>&1 \
+  && pass 'the verdict log records the consent ask with its window' || fail 'the verdict log records the consent ask with its window'
 
 # A critical alert whose category safe cannot map must degrade to an
 # infrastructure WARN, never fall through to PASS (review F3). Socket can add
@@ -511,14 +599,14 @@ fi
 
 # Gate mode: with socket_not_found tolerated, the install proceeds.
 prepare_case not-found-gate-tolerated
-printf '{"install":{"cooldown_days":0,"socket":{"mode":"auto","cache_ttl_days":7},"auto_allow_tolerate":["socket_not_found"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '"{"install":{"cooldown_days":0,"socket":{"mode":"always","cache_ttl_days":7},"auto_allow_tolerate":["socket_not_found"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 run_check not-found --gate install --op install
 expect_rc 0 'a tolerated socket_not_found proceeds at the gate'
 
 # A tolerated socket outage must NOT drag not_found through, and vice versa:
 # tolerating socket_error alone still refuses a not_found.
 prepare_case not-found-not-tolerated-by-socket-error
-printf '{"install":{"cooldown_days":0,"socket":{"mode":"auto","cache_ttl_days":7},"auto_allow_tolerate":["socket_error"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install":{"cooldown_days":0,"socket":{"mode":"always","cache_ttl_days":7},"auto_allow_tolerate":["socket_error"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 run_check not-found --gate install --op install
 expect_rc 10 'tolerating socket_error does not tolerate a not_found'
 
@@ -566,7 +654,7 @@ fi
 # aggregate operation proceeds.
 prepare_case ranged-host-allow-tolerate-proceeds
 multi_project
-printf '{"install":{"cooldown_days":0,"socket":{"mode":"auto","cache_ttl_days":7},"auto_allow_tolerate":["socket_not_found"]}}\n' \
+printf '"{"install":{"cooldown_days":0,"socket":{"mode":"always","cache_ttl_days":7},"auto_allow_tolerate":["socket_not_found"]}}\n' \
   > "$CASE_RUN_CONFIG/config.json"
 run_multi sibling-not-found --gate install
 expect_rc 0 'a ranged sibling warn tolerated by auto_allow_tolerate proceeds'

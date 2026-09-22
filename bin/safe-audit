@@ -8251,6 +8251,20 @@ package_audit_command() {
     primary_version="$PKG_VERSION"
   fi
 
+  # Socket policy is read BEFORE the release lookup: the scope rule keys on
+  # the release age, so the release map must be fetched whenever Socket is in
+  # play — not only when the cooldown needs it. An operator with
+  # cooldown_days=0 still gets correct scope decisions (old releases silently
+  # out of scope) rather than a consent prompt per install.
+  local socket_mode scope_ecos window_days
+  socket_mode=$(install_policy_json | jq -r '.socket.mode // "auto"')
+  case "$socket_mode" in always|auto|never) ;; *) socket_mode="auto" ;; esac
+  scope_ecos=$(install_policy_json | jq -c '.socket.ecosystems // ["npm","python"]')
+  jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' >/dev/null 2>&1 <<<"$scope_ecos" \
+    || scope_ecos='["npm","python"]'
+  window_days=$(install_policy_json | jq -r '.socket.fresh_window_days // 7')
+  [[ "$window_days" =~ ^[0-9]+$ ]] || window_days=7
+
   # The aggregate youngest age drives the cooldown. Socket patience is about
   # the scored primary version, so it uses that version's own age from the
   # same release map — a young sibling must not create patience for an old
@@ -8261,7 +8275,14 @@ package_audit_command() {
   [[ "$cooldown_days" =~ ^[0-9]+$ ]] || cooldown_days=3
   cooldown_security_fix=$(install_policy_json | jq -r '.cooldown_security_fix // "exempt"')
   case "$cooldown_security_fix" in exempt|enforce) ;; *) cooldown_security_fix="exempt" ;; esac
-  if (( resolution_ok )) && (( cooldown_days > 0 )); then
+  local release_needed=0
+  if (( cooldown_days > 0 )); then
+    release_needed=1
+  elif [[ "$socket_mode" != "never" ]] \
+    && jq -e --arg eco "$ecosystem" 'index($eco)' >/dev/null 2>&1 <<<"$scope_ecos"; then
+    release_needed=1
+  fi
+  if (( resolution_ok )) && (( release_needed )); then
     release_rc=0
     release_info=$(release_min_age_days "$ecosystem" "$PKG_NAME" "$scratch" "${RESOLVED_VERSIONS[@]}") || release_rc=$?
     if (( release_rc == 0 )); then
@@ -8283,22 +8304,98 @@ package_audit_command() {
       "$scratch/packument.json" 2>/dev/null) || has_install_script=""
   fi
 
-  # Socket is the primary behavioral tier. Existing auto and always spellings
-  # both consult it; only the explicit never mode skips it.
-  local socket_mode socket_skip_reason=""
-  socket_mode=$(install_policy_json | jq -r '.socket.mode // "auto"')
-  case "$socket_mode" in always|auto|never) ;; *) socket_mode="auto" ;; esac
+  # Socket is the primary behavioral tier, scoped by the 2026-09-22 operator
+  # ruling: it is consulted only for npm/python releases younger than the
+  # fresh window, and even then only with the operator's consent (a TTY
+  # prompt at the install gate). mode=always keeps today's unconditional
+  # calls; mode=never keeps the tier off. Out-of-scope checks skip silently
+  # (disclosed, no warn) — OSV, the blocklist and the release-age rule decide.
+  # Policy itself was read before the release lookup, above.
+  # The gate sets this after its TTY consent prompt; nothing else may. A
+  # granted consent only ever WIDENS evidence (a live Socket call), so a
+  # forged value cannot weaken the audit — the skip direction has no env.
+  socket_consent_granted() { [[ "${SAFE_AUDIT_SOCKET_CONSENT:-}" == "granted" ]]; }
+
+  # Scope decision for one scored version: live | consent | out_of_scope.
+  # Age "" (unknown) fails closed into consent — an unknown state never
+  # widens the skip.
+  socket_scope_decision() {  # $1=mode-override-check-already-done $2=age
+    if socket_consent_granted; then printf 'live'; return; fi
+    if [[ "$socket_mode" == "always" ]]; then printf 'live'; return; fi
+    if [[ -z "$2" ]]; then printf 'consent'; return; fi
+    if (( $2 < window_days )); then printf 'consent'; return; fi
+    printf 'out_of_scope'
+  }
+
+  # A valid cached score is not a call: replay it silently even without
+  # consent. Writes the ok envelope into $2 on a hit; non-zero on a miss.
+  # (socket_score_json replays again on its live path — cheap, same key.)
+  socket_cached_or_defer() {  # $1=ecosystem $2=name $3=version $4=out $5=age $6=kind(primary|sibling)
+    if socket_cache_replay "$1" "$2" "$3" "$4"; then return 0; fi
+    case "$(socket_scope_decision no "$5")" in
+      out_of_scope)
+        if [[ "$6" == "primary" ]]; then
+          jq -n --arg note "outside Socket scope: release ${5}d old, beyond install.socket.fresh_window_days=${window_days}" \
+            '{available:false,status:"out_of_scope",note:$note}' > "$4"
+        else
+          jq -n '{available:false,status:"out_of_scope",note:"release age beyond the Socket fresh window"}' > "$4"
+        fi
+        return 2
+        ;;
+      consent)
+        if [[ -z "$5" ]]; then
+          jq -n --arg note "release age unknown — Socket behavioral check proposed (fail-closed)" \
+            --argjson window "$window_days" \
+            '{available:false,status:"consent_required",note:$note,window_days:$window}' > "$4"
+        else
+          jq -n --arg note "fresh release ${5}d old, inside the Socket fresh window — check proposed at the gate" \
+            --argjson window "$window_days" \
+            '{available:false,status:"consent_required",note:$note,window_days:$window}' > "$4"
+        fi
+        return 3
+        ;;
+      *)
+        # Live: neither a cache hit nor a scope state. A DISTINCT non-zero
+        # (1) — the caller's fallback branch spends the socket_score_json call.
+        return 1
+        ;;
+    esac
+  }
+
+  local socket_skip_reason=""
   if [[ "$socket_mode" == "never" ]]; then
     socket_skip_reason="disabled by install.socket.mode=never"
     jq -n --arg reason "$socket_skip_reason" \
       '{available:null,status:"skipped",note:$reason}' > "$socket_json"
+  elif ! jq -e --arg eco "$ecosystem" 'index($eco)' >/dev/null 2>&1 <<<"$scope_ecos"; then
+    local scope_note="outside Socket scope: ${ecosystem} not in install.socket.ecosystems"
+    [[ "$ecosystem" == "java" ]] && scope_note="Socket has no Maven tier"
+    jq -n --arg note "$scope_note" \
+      '{available:false,status:"out_of_scope",note:$note}' > "$socket_json"
   else
     local socket_spec="$spec"
     (( resolution_ok )) && socket_spec="${PKG_NAME}@${primary_version}"
     if (( resolution_ok )); then
-      socket_score_json "$ecosystem" "$socket_spec" "$socket_json" "" "$PKG_NAME" "$primary_version"
+      local primary_socket_rc=0
+      socket_cached_or_defer "$ecosystem" "$PKG_NAME" "$primary_version" \
+        "$socket_json" "$primary_release_age" primary || primary_socket_rc=$?
+      case "$primary_socket_rc" in
+        0) : ;; # cache hit — no call, no consent
+        2) : ;; # out of scope
+        3) : ;; # consent required — the gate prompts on exit 13
+        *) socket_score_json "$ecosystem" "$socket_spec" "$socket_json" "" "$PKG_NAME" "$primary_version" ;;
+      esac
     else
-      socket_score_json "$ecosystem" "$socket_spec" "$socket_json"
+      # Unresolved: age unknown → the scope decision fails closed into
+      # consent (or a live call under mode=always / granted consent); the
+      # version_unresolved WARN dominates the gate outcome either way.
+      local unresolved_socket_rc=0
+      socket_cached_or_defer "$ecosystem" "$spec" "" "$socket_json" "" primary \
+        || unresolved_socket_rc=$?
+      case "$unresolved_socket_rc" in
+        0|2|3) : ;;
+        *) socket_score_json "$ecosystem" "$socket_spec" "$socket_json" ;;
+      esac
     fi
     # Socket computes an unseen release's score on demand. For a release still
     # inside the existing cooldown window, give that first computation one
@@ -8339,18 +8436,20 @@ package_audit_command() {
   socket_evidence=$(jq -c \
     --arg class "$socket_class" --arg score "$socket_score_text" \
     --arg stale_score "$SOCKET_CACHE_STALE_SCORE" \
-    --arg stale_age "$SOCKET_CACHE_STALE_AGE_DAYS" '
+    --arg stale_age "$SOCKET_CACHE_STALE_AGE_DAYS" \
+    --argjson win "$window_days" '
     {status: (.status // ""), available: (.available // false),
      note: (.note // ""), reason: (.reason // ""),
      score: $score, class: $class,
-     cache_stale_score: $stale_score, cache_stale_age_days: $stale_age}' \
+     cache_stale_score: $stale_score, cache_stale_age_days: $stale_age,
+     window_days: $win}' \
     "$socket_json" 2>/dev/null) || socket_evidence=""
   if [[ -z "$socket_evidence" ]]; then
     # A malformed envelope still produces a SHAPE-COMPLETE document: the
     # decision reads it as an unavailable tier and warns, which is the intended
     # fail-closed behavior. An incomplete document would instead be refused as
     # infrastructure breakage, which is a different (and wrong) answer here.
-    socket_evidence='{"status":"","available":false,"note":"","reason":"","score":"","class":"","cache_stale_score":"","cache_stale_age_days":""}'
+    socket_evidence='{"status":"","available":false,"note":"","reason":"","score":"","class":"","cache_stale_score":"","cache_stale_age_days":"","window_days":0}'
   fi
 
   # --- sibling resolved versions -------------------------------------------
@@ -8362,24 +8461,37 @@ package_audit_command() {
   # by the decision layer, which never assumes it clean.
   local siblings_json='[]'
   if (( resolution_ok )) && (( ${#RESOLVED_VERSIONS[@]} > 1 )) \
-    && [[ "$socket_mode" != "never" ]]; then
-    local sib sib_json sib_idx=0 sib_status sib_reason sib_class sib_score
+    && [[ "$socket_mode" != "never" ]] \
+    && jq -e --arg eco "$ecosystem" 'index($eco)' >/dev/null 2>&1 <<<"$scope_ecos"; then
+    local sib sib_json sib_idx=0 sib_status sib_reason sib_class sib_score sib_age
     for sib in "${RESOLVED_VERSIONS[@]}"; do
       [[ "$sib" == "$primary_version" ]] && continue
       sib_idx=$(( sib_idx + 1 ))
       sib_json="$scratch/socket-sibling-${sib_idx}.json"
-      socket_score_json "$ecosystem" "${PKG_NAME}@${sib}" "$sib_json" "" "$PKG_NAME" "$sib"
-      sib_status=$(jq -r '.status // empty' "$sib_json" 2>/dev/null || true)
-      sib_reason=$(jq -r '.reason // empty' "$sib_json" 2>/dev/null || true)
-      sib_class=""
-      sib_score=""
+      sib_age=$(jq -er --arg v "$sib" '.[$v] | select(type == "number" and . >= 0)' \
+        <<<"$release_ages_json" 2>/dev/null) || sib_age=""
+      sib_status="" sib_reason="" sib_class="" sib_score=""
+      local cached_sib_rc=0
+      socket_cached_or_defer "$ecosystem" "$PKG_NAME" "$sib" "$sib_json" "$sib_age" sibling \
+        || cached_sib_rc=$?
+      case "$cached_sib_rc" in
+        0|2|3)
+          sib_status=$(jq -r '.status // empty' "$sib_json" 2>/dev/null || true)
+          ;;
+        *)
+          socket_score_json "$ecosystem" "${PKG_NAME}@${sib}" "$sib_json" "" "$PKG_NAME" "$sib"
+          sib_status=$(jq -r '.status // empty' "$sib_json" 2>/dev/null || true)
+          ;;
+      esac
       if [[ "$sib_status" == "ok" ]]; then
         sib_class=$(socket_classify "$sib_json")
         sib_score=$(jq -r '.raw.data.self.score.overall // empty' "$sib_json" 2>/dev/null || true)
       fi
+      [[ -n "$sib_reason" ]] || sib_reason=$(jq -r '.reason // empty' "$sib_json" 2>/dev/null || true)
       siblings_json=$(jq -cn --argjson acc "$siblings_json" \
-        --arg v "$sib" --arg s "$sib_status" --arg c "$sib_class" --arg sc "$sib_score" --arg r "$sib_reason" \
-        '$acc + [{version: $v, status: $s, class: $c, score: $sc, reason: $r}]')
+        --arg v "$sib" --arg s "$sib_status" --arg c "$sib_class" --arg sc "$sib_score" \
+        --arg r "$sib_reason" --argjson age "${sib_age:-$(( -1 ))}" \
+        '$acc + [{version: $v, status: $s, class: $c, score: $sc, reason: $r, age_days: $age}]')
     done
   fi
 
@@ -8670,6 +8782,10 @@ package_audit_command() {
   if [[ "$(jq -r '.socket_pending' <<<"$verdict_json")" == "true" ]]; then
     socket_pending=1
   fi
+  local socket_consent_required=0
+  if [[ "$(jq -r '.socket_consent.required // false' <<<"$verdict_json")" == "true" ]]; then
+    socket_consent_required=1
+  fi
   if [[ "$(jq -r '.release_exempt' <<<"$verdict_json")" == "true" ]]; then
     release_exempt=1
   fi
@@ -8752,6 +8868,54 @@ package_audit_command() {
       osv: (($osv[0] // {}) + {classification: $classification, versions: $versions})
     }' > "$result_json"
 
+  # Verdict log (operator direction 2026-09-22): one best-effort JSONL line per
+  # audit, measuring the real share of useful Socket calls across the scope
+  # change — status/reason by ecosystem and age bucket, plus the consent and
+  # scope states the new flow produces. Never blocks or alters the audit; the
+  # install gate appends its own decision tokens to run/audit.log separately.
+  # SAFE_AUDIT_AUDIT_LOG relocates the file (tests never write real state).
+  local audit_log_file="${SAFE_AUDIT_AUDIT_LOG:-$DATA_DIR/audit-log.jsonl}"
+  if mkdir -p "$(dirname "$audit_log_file")" 2>/dev/null \
+    && jq -cn \
+      --arg ts "$(now_iso)" \
+      --arg version "${SAFE_VERSION}" \
+      --arg spec "$spec" \
+      --arg op "$op" \
+      --arg eco "$ecosystem" \
+      --arg installer "$CHECK_INSTALLER" \
+      --arg verdict "$verdict" \
+      --arg res_status "$( (( resolution_ok )) && printf ok || printf unresolved )" \
+      --arg res_method "$RESOLUTION_METHOD" \
+      --arg primary "$primary_version" \
+      --argjson versions "$resolved_versions_json" \
+      --arg release_version "$release_version" \
+      --arg primary_age "$primary_release_age" \
+      --argjson cooldown_days "$cooldown_days" \
+      --argjson waived "$release_exempt" \
+      --slurpfile socket "$socket_json" \
+      --argjson socket_line "$socket_evidence" \
+      --argjson consent_required "$socket_consent_required" \
+      --argjson warn_causes "$warn_causes_json" \
+      --argjson gate "$([[ "$gate" == "install" ]] && printf true || printf false)" '
+      {ts: $ts, event: "package_audit", safe_version: $version,
+       spec: $spec, op: $op, ecosystem: $eco, installer: $installer,
+       gate: $gate, verdict: $verdict,
+       resolution: {status: $res_status, method: $res_method,
+                    primary: $primary, versions: $versions},
+       release: {version: (if $release_version == "" then null else $release_version end),
+                 primary_age_days: (if $primary_age == "" then null else ($primary_age | tonumber) end),
+                 cooldown_days: $cooldown_days, waived: $waived},
+       socket: {status: ($socket_line.status // ""),
+                reason: ($socket_line.reason // ""),
+                class: ($socket_line.class // ""),
+                cached: (($socket[0].cached // false) == true),
+                note: ($socket_line.note // "")},
+       socket_consent: {required: ($consent_required == 1),
+                        window_days: ($socket_line.window_days // 0)},
+       warn_causes: $warn_causes}' >> "$audit_log_file" 2>/dev/null; then
+    :
+  fi
+
   if [[ "$json_mode" == "1" ]]; then
     cat "$result_json"
   else
@@ -8771,8 +8935,13 @@ package_audit_command() {
       printf '\n[safe audit] custom source: %s — advisory evidence covers the public registry identity only\n' "$CHECK_EFFECTIVE_SOURCES"
     fi
     # Branch on the discriminated status first: a deliberate Socket-disabled
-    # skip must not render as an outage.
-    if [[ "$(jq -r '.available' "$socket_json" 2>/dev/null)" == "false" ]]; then
+    # skip must not render as an outage, and neither may a scope state — the
+    # scope skip is disclosed through its note, not as a WARNING.
+    local socket_env_status
+    socket_env_status=$(jq -r '.status // empty' "$socket_json" 2>/dev/null)
+    if [[ "$socket_env_status" == "out_of_scope" || "$socket_env_status" == "consent_required" ]]; then
+      printf '\n[safe audit] %s\n' "$(jq -r '.note // ""' "$socket_json" 2>/dev/null)"
+    elif [[ "$(jq -r '.available' "$socket_json" 2>/dev/null)" == "false" ]]; then
       printf '\n[safe audit] WARNING: socket CLI not available, skipping behavioral analysis\n'
       printf '[safe audit] Install: safe audit setup local\n'
     fi
@@ -8800,7 +8969,16 @@ package_audit_command() {
     auto_allow=$(jq -r 'if .auto_allow == false then "false" else "true" end' <<<"$policy")
     case "$verdict" in
       GO)
-        if [[ "$auto_allow" == "true" ]] && (( resolution_ok )); then
+        if (( socket_consent_required )); then
+          # The audit is otherwise GO, but a live Socket check awaits the
+          # operator's consent (2026-09-22 scope ruling). Exit 13 hands the
+          # ask to the gate — Y re-runs the audit with the consent channel
+          # set, n proceeds on this verdict, and a non-TTY refuses 102. NO
+          # receipt is minted here: the operation is not final, and a
+          # GO receipt without the behavioral answer would read as clean
+          # evidence in the offline stale fallback.
+          gate_exit=13
+        elif [[ "$auto_allow" == "true" ]] && (( resolution_ok )); then
           # A pending-score GO is not fully clean evidence: record it under a
           # distinct verdict so the offline stale-evidence fallback can never
           # treat incomplete Socket data as a clean check during an outage.
@@ -8811,6 +8989,8 @@ package_audit_command() {
             known_verdict="GO_PENDING_SOCKET"
           elif [[ -n "$socket_skip_reason" ]]; then
             socket_reason="socket_disabled"
+          elif [[ "$(jq -r '.status // empty' "$socket_json" 2>/dev/null)" == "out_of_scope" ]]; then
+            socket_reason="socket_out_of_scope"
           fi
           mark_install_known "$ecosystem" "$PKG_NAME" "$primary_version" "$known_verdict" \
             "$(jq -cn --arg socket_reason "$socket_reason" \
@@ -8821,13 +9001,15 @@ package_audit_command() {
         # Legibility, not policy: the install proceeds either way, but a
         # package that declares install scripts will land with them skipped
         # (global ignore-scripts). Name the operator command that authorizes
-        # them, so a later "installed but broken" has a visible cause.
-        if [[ "$ecosystem" == "npm" && "$has_install_script" == "true" ]] && (( resolution_ok )) \
+        # them, so a later "installed but broken" has a visible cause. Skipped
+        # on the consent pass — the final GO re-renders it.
+        if (( ! socket_consent_required )) \
+          && [[ "$ecosystem" == "npm" && "$has_install_script" == "true" ]] && (( resolution_ok )) \
           && ! scripts_allow_matches_resolved "$PKG_NAME" "$primary_version"; then
           printf '[safe audit] %s@%s declares install scripts — they will be SKIPPED (global ignore-scripts); if the tool needs them: safe run scripts-allow add %s@%s --reason "..." (operator, TTY)\n' \
             "$PKG_NAME" "$primary_version" "$PKG_NAME" "$primary_version" >&2
         fi
-        gate_exit=0
+        (( socket_consent_required )) || gate_exit=0
         ;;
       WARN)
         # Adverse SECURITY knowledge (affecting advisory, blocklist hit, low

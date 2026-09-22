@@ -291,6 +291,13 @@ prepare_case() {
   CASE_PROJECT="$CASE_DIR/project"
   CASE_CHECKS_DIR="$CASE_DIR/audit-data/checks"
   mkdir -p "$CASE_RUN_CONFIG" "$CASE_HOME" "$CASE_PROJECT" "$CASE_DIR/audit-config" "$CASE_DIR/audit-data"
+  # 2026-09-22 scope ruling: this suite exercises gate/verdict/receipt
+  # mechanics, not the fresh-window consent flow (which has its own cases at
+  # the bottom), so the behavioral tier runs in mode "always" by default —
+  # today's unconditional-call semantics. The fixtures carry no publish
+  # timestamps, so under mode auto every check would land in the fail-closed
+  # unknown-age consent branch instead of reaching the tier.
+  printf '{"install": {"socket": {"mode": "always"}}}\n' > "$CASE_RUN_CONFIG/config.json"
 }
 
 # run_check <mock env assignments...> -- <check args...>
@@ -605,7 +612,7 @@ done
 # 8b. Operator opt-in tolerate knob allows socket-outage WARN when OSV clean
 # ---------------------------------------------------------------------------
 prepare_case socket-tolerated
-printf '{"install": {"auto_allow_tolerate": ["socket_unavailable"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"socket": {"mode": "always"}, "auto_allow_tolerate": ["socket_unavailable"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 mv "$MOCKBIN/socket" "$MOCKBIN/socket.hidden"
 fixture="$(osv_fixture_empty)"
 run_check \
@@ -1000,7 +1007,7 @@ fi
 # 26. install.trusted_registries lifts the custom-source floor
 # ---------------------------------------------------------------------------
 prepare_case trusted-registry
-printf '{"install": {"trusted_registries": ["https://registry.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"socket": {"mode": "always"}, "trusted_registries": ["https://registry.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 fixture="$(osv_fixture_empty)"
 run_check \
   MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
@@ -1154,7 +1161,7 @@ fi
 # 33. Receipts are source-scoped on write
 # ---------------------------------------------------------------------------
 prepare_case receipt-source-scope
-printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"socket": {"mode": "always"}, "trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 fixture="$(osv_fixture_empty)"
 run_check \
   MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
@@ -1177,7 +1184,7 @@ fi
 #     (delta-3 finding 3.1) while the floor still sees every selector
 # ---------------------------------------------------------------------------
 prepare_case npm-registry-last-wins
-printf '{"install": {"trusted_registries": ["https://first.example", "https://second.example"]}}\n' \
+printf '{"install": {"socket": {"mode": "always"}, "trusted_registries": ["https://first.example", "https://second.example"]}}\n' \
   > "$CASE_RUN_CONFIG/config.json"
 fixture="$(osv_fixture_empty)"
 run_check \
@@ -1234,7 +1241,7 @@ fi
 #     scoped to it (UX-preserving mitigation for finding 3.2)
 # ---------------------------------------------------------------------------
 prepare_case env-registry-trusted
-printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"socket": {"mode": "always"}, "trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 fixture="$(osv_fixture_empty)"
 run_check \
   NPM_CONFIG_REGISTRY=https://mirror.example \
@@ -1504,7 +1511,7 @@ fi
 #     its slashless twin are the same source (delta-4 finding N1)
 # ---------------------------------------------------------------------------
 prepare_case receipt-canonical
-printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"socket": {"mode": "always"}, "trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 fixture="$(osv_fixture_empty)"
 run_check \
   MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
@@ -1550,7 +1557,7 @@ fi
 # 48. A trusted pip mirror stays frictionless (UX preservation for 3.2)
 # ---------------------------------------------------------------------------
 prepare_case pip-env-trusted
-printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"socket": {"mode": "always"}, "trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 fixture="$(osv_fixture_empty)"
 run_check \
   PIP_INDEX_URL=https://mirror.example/simple \
@@ -1566,7 +1573,7 @@ fi
 #     precedence (delta-5 finding 3.2)
 # ---------------------------------------------------------------------------
 prepare_case env-registry-case-precedence
-printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"socket": {"mode": "always"}, "trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 fixture="$(osv_fixture_empty)"
 run_check \
   NPM_CONFIG_REGISTRY=https://mirror.example \
@@ -1697,7 +1704,7 @@ if expect_no_grep "$ERR_FILE" 'sekret' "credentials never reach stderr"; then
   pass "credentials never reach stderr"
 fi
 prepare_case creds-redacted-receipt
-printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"socket": {"mode": "always"}, "trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 run_check \
   PIP_INDEX_URL=https://alice:sekret@mirror.example/simple \
   MOCK_OSV_FIXTURE="$fixture" \
@@ -1721,7 +1728,7 @@ fi
 #     (delta-6 finding 3.2b)
 # ---------------------------------------------------------------------------
 prepare_case scoped-key-resolution
-printf '{"install": {"trusted_registries": ["https://foo.example", "https://bar.example"]}}\n' \
+printf '{"install": {"socket": {"mode": "always"}, "trusted_registries": ["https://foo.example", "https://bar.example"]}}\n' \
   > "$CASE_RUN_CONFIG/config.json"
 fixture="$(osv_fixture_empty)"
 run_check \
@@ -1741,7 +1748,7 @@ else
   fail "npm-oracle: the MATCHING scope's registry resolves the package"
 fi
 prepare_case scoped-cli-over-env
-printf '{"install": {"trusted_registries": ["https://cli.example", "https://env.example"]}}\n' \
+printf '{"install": {"socket": {"mode": "always"}, "trusted_registries": ["https://cli.example", "https://env.example"]}}\n' \
   > "$CASE_RUN_CONFIG/config.json"
 run_check \
   'npm_config_@demo:registry=https://env.example' \
@@ -1795,7 +1802,7 @@ if expect_no_grep "$OUT_FILE" 'sekret2' "query tokens never reach stdout" \
   pass "query tokens never reach output"
 fi
 prepare_case authed-registry-operational
-printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"socket": {"mode": "always"}, "trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 run_check \
   MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
   MOCK_REGISTRY_URL_LOG="$CASE_DIR/registry-urls.log" \
@@ -1892,7 +1899,7 @@ fi
 # ---------------------------------------------------------------------------
 prepare_case userconfig-scoped-resolution
 printf '@foo:registry=https://foo.example\n@bar:registry=https://bar.example\n' > "$CASE_DIR/alt-npmrc"
-printf '{"install": {"trusted_registries": ["https://foo.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"socket": {"mode": "always"}, "trusted_registries": ["https://foo.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 fixture="$(osv_fixture_empty)"
 run_check \
   MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
@@ -2169,7 +2176,7 @@ fi
 # stamped, and re-derived by the reader — never conflated with the implicit
 # default source.
 prepare_case gate-reader-literal-default
-printf '{"install": {"trusted_registries": ["cargo-registry:default"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"socket": {"mode": "always"}, "trusted_registries": ["cargo-registry:default"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 fixture="$(osv_fixture_empty)"
 run_check \
   MOCK_OSV_FIXTURE="$fixture" \
@@ -2197,7 +2204,7 @@ fi
 # 64. A custom-source receipt is reusable only from that same custom source
 # ---------------------------------------------------------------------------
 prepare_case gate-reader-custom-source
-printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"socket": {"mode": "always"}, "trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 fixture="$(osv_fixture_empty)"
 run_check \
   MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
@@ -2221,7 +2228,7 @@ fi
 # and reader must canonicalize identically or a trailing slash silently splits
 # the identity — the exact boundary that broke before centralization.
 prepare_case gate-reader-canonicalized-source
-printf '{"install": {"trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"socket": {"mode": "always"}, "trusted_registries": ["https://mirror.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 fixture="$(osv_fixture_empty)"
 run_check \
   MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
@@ -2305,7 +2312,7 @@ else
   fail "cargo opaque identity is cargo-registry:<name>"
 fi
 prepare_case cargo-opaque-trusted
-printf '{"install": {"trusted_registries": ["cargo-registry:private"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"socket": {"mode": "always"}, "trusted_registries": ["cargo-registry:private"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 fixture="$(osv_fixture_empty)"
 run_check \
   MOCK_OSV_FIXTURE="$fixture" \
@@ -2605,7 +2612,7 @@ prepare_case composer-dist-and-source
 mkdir -p "$CASE_DIR/composer-home"
 printf '{"repositories":[{"type":"package","package":{"name":"vendor/pkg","version":"1.0.0","dist":{"url":"https://trusted.example/pkg.zip","type":"zip"},"source":{"url":"https://evil.example/repo.git","type":"git","reference":"main"}}}]}\n' \
   > "$CASE_DIR/composer-home/config.json"
-printf '{"install": {"trusted_registries": ["https://trusted.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"socket": {"mode": "always"}, "trusted_registries": ["https://trusted.example"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 fixture="$(osv_fixture_empty)"
 run_check \
   MOCK_OSV_FIXTURE="$fixture" \
@@ -3017,6 +3024,10 @@ for eco_pair in "rust:cargo:libc@0.2.150" "go:golang:golang.org/x/mod@0.14.0" "p
   purl="${rest%%:*}"
   spec="${rest#*:}"
   prepare_case "socket-purl-$eco"
+  # These ecosystems are outside the default Socket scope (2026-09-22
+  # ruling); the purl mapping only runs when the operator adds them.
+  printf '{"install": {"socket": {"mode": "always", "ecosystems": ["%s"]}}}\n' "$eco" \
+    > "$CASE_RUN_CONFIG/config.json"
   fixture="$(osv_fixture_empty)"
   run_check \
     MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
@@ -3102,7 +3113,7 @@ fi
 #     policy still blocks a MAL hit (the knob governs scored CVEs only).
 # ---------------------------------------------------------------------------
 prepare_case malware-knob-immune
-printf '{"install": {"block_severities": []}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"socket": {"mode": "always"}, "block_severities": []}}\n' > "$CASE_RUN_CONFIG/config.json"
 fixture="$(osv_fixture_malware)"
 run_check \
   MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
@@ -3227,7 +3238,7 @@ fi
 prepare_case malware-malformed-sibling
 printf '{"packages":{"brace-expansion":{"version":"2.1.4","ecosystem":"npm"}}}\n' \
   > "$CASE_RUN_CONFIG/host-allow.json"
-printf '{"install": {"auto_allow_tolerate": ["osv_unavailable"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"socket": {"mode": "always"}, "auto_allow_tolerate": ["osv_unavailable"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 cat > "$FIXTURES/osv-malware-malformed-sibling.json" <<'JSON'
 {"vulns": [
   {"id": "MAL-2026-99999",
@@ -3299,7 +3310,7 @@ fi
 prepare_case malware-bad-token-same-page
 printf '{"packages":{"brace-expansion":{"version":"2.1.4","ecosystem":"npm"}}}\n' \
   > "$CASE_RUN_CONFIG/host-allow.json"
-printf '{"install": {"auto_allow_tolerate": ["osv_unavailable"]}}\n' > "$CASE_RUN_CONFIG/config.json"
+printf '{"install": {"socket": {"mode": "always"}, "auto_allow_tolerate": ["osv_unavailable"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 PAGES_DIR="$CASE_DIR/osv-pages"
 mkdir -p "$PAGES_DIR"
 cat > "$PAGES_DIR/page1.json" <<'JSON'
@@ -3426,6 +3437,68 @@ if [[ ! -s "$ERR_FILE" ]]; then
   pass "large OSV corpus emits no E2BIG stderr leak"
 else
   fail "large OSV corpus emits no E2BIG stderr leak"
+fi
+
+# ---------------------------------------------------------------------------
+# 35. 2026-09-22 scope ruling: fresh releases under mode auto do not spend a
+#     Socket call without consent. The audit stays a decidable GO and the
+#     gate receives exit 13 with no clean receipt minted. An unknown release
+#     age fails closed into the same consent branch — it never widens a skip.
+# ---------------------------------------------------------------------------
+cat > "$FIXTURES/packument-fresh.json" <<'JSON'
+{
+  "dist-tags": {"latest": "2.1.4"},
+  "versions": {"2.1.4": {}},
+  "time": {"2.1.4": "__FRESH_TIME__"}
+}
+JSON
+python_bin="$(command -v python3 || command -v python)"
+"$python_bin" - "$FIXTURES/packument-fresh.json" <<'PY'
+import sys, datetime
+path = sys.argv[1]
+with open(path) as f:
+    body = f.read().replace("__FRESH_TIME__", (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=4)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+with open(path, "w") as f:
+    f.write(body)
+PY
+
+prepare_case scope-fresh-consent-gate
+printf '{"install": {"socket": {"mode": "always"}, "cooldown_days": 3, "socket": {"mode": "auto"}}}\n' > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument-fresh.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_SOCKET_ARGS_LOG="$CASE_DIR/socket-calls.log" \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install --json
+: > "$CASE_DIR/socket-calls.log"
+if expect_status 13 "fresh release under mode auto hands the consent ask to the gate"; then
+  pass "fresh release under mode auto hands the consent ask to the gate"
+fi
+if jq -e '.socket.status == "consent_required" and .socket.window_days == 7' "$OUT_FILE" >/dev/null 2>&1; then
+  pass "the consent envelope names the window"
+else
+  fail "the consent envelope names the window"
+fi
+[[ ! -e "$CASE_RUN_CONFIG/install-known.json" ]] \
+  && pass "no clean receipt before the operator answers" \
+  || fail "no clean receipt before the operator answers"
+
+# Unknown age (no publish timestamps): fail-closed consent, never a silent
+# out-of-scope skip.
+prepare_case scope-unknown-age-consent
+printf '{"install": {"socket": {"mode": "always"}, "cooldown_days": 3, "socket": {"mode": "auto"}}}\n' > "$CASE_RUN_CONFIG/config.json"
+fixture="$(osv_fixture_empty)"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  -- brace-expansion@2.1.4 --ecosystem npm --json
+if expect_status 0 "a standalone unknown-age audit stays decidable"; then
+  pass "a standalone unknown-age audit stays decidable"
+fi
+if jq -e '.socket.status == "consent_required"' "$OUT_FILE" >/dev/null 2>&1; then
+  pass "unknown age lands in the consent branch (fail-closed)"
+else
+  fail "unknown age lands in the consent branch (fail-closed)"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"

@@ -155,7 +155,9 @@ pass and warnings under `environment.release_follow`.
     "socket": {
       "mode": "auto",
       "cache_ttl_days": 7,
-      "cache_dir": "~/.cache/safe/socket"
+      "cache_dir": "~/.cache/safe/socket",
+      "ecosystems": ["npm", "python"],
+      "fresh_window_days": 7
     }
   }
 }
@@ -195,8 +197,10 @@ pass and warnings under `environment.release_follow`.
   remediate and that this setting caused the refusal. The exemption only
   applies to advisories fixed AT a resolved version — it never waives the
   cooldown for an ordinary feature release.
-- `socket.mode`: Socket is the primary behavioral tier. `auto` (default) and
-  `always` both consult it for every check; `never` is the sole intentional
+- `socket.mode`: Socket is the primary behavioral tier. `auto` (default)
+  scopes it per the fresh-window rule below and asks the operator before any
+  live call; `always` keeps the pre-scope behavior — an unconditional call on
+  every in-scope check, no consent prompt; `never` is the sole intentional
   skip. The skip is free — no request, no timeout — and is recorded as
   `socket_disabled`, distinct from the causes that mean the service failed.
   Because Socket is the only behavioral tier, a check that skipped it has no
@@ -208,6 +212,23 @@ pass and warnings under `environment.release_follow`.
   the accepted policy — add `socket_disabled` to `auto_allow_tolerate`. The
   gate then passes and records `WARN_TOLERATED` rather than `GO`, so a
   tolerated skip is never later mistaken for a completed check.
+- `socket.ecosystems`: the ecosystems Socket is consulted for. Default:
+  `["npm", "python"]` — the two where Socket's behavioral scoring has real
+  coverage; for go, cargo, php and others it almost always answers "no
+  record" while still consuming rate limit. Audits outside the list skip
+  silently (disclosed as an `out_of_scope` state, no warn) and decide on
+  advisories, blocklist and release age. `java` is additionally always
+  skipped by capability (Socket has no Maven tier).
+- `socket.fresh_window_days`: the fresh-release window for the scope rule
+  (operator ruling 2026-09-22). Under `mode: auto`, a release younger than
+  this many days is NOT scored automatically: the audit stays decidable on
+  advisories/blocklist/release-age, and the install gate asks the operator
+  whether to spend the live Socket call (TTY, default Y; `n` proceeds
+  without it). A release at or beyond the window never triggers a call or a
+  prompt. An unknown release age (failed publish-date lookup) fails closed
+  into the consent branch — an unknown state never widens the skip. A valid
+  cached score replays without prompting: a cache hit is not a call.
+  Default: `7`.
 - `socket.cache_ttl_days`: cache a validated successful Socket envelope for
   the exact ecosystem, package name, and resolved version. Default: `7`; `0`
   disables caching. Entries live under the cache dir (see `socket.cache_dir`),

@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -66,6 +67,10 @@ type Socket struct {
 	Class             string `json:"class"`
 	CacheStaleScore   string `json:"cache_stale_score"`
 	CacheStaleAgeDays string `json:"cache_stale_age_days"`
+	// WindowDays is the Socket fresh window (install.socket.fresh_window_days)
+	// in force for this audit; 0 outside any scope decision. It feeds the
+	// consent payload the install gate prompts on.
+	WindowDays int `json:"window_days"`
 }
 
 // SocketSibling is a non-primary resolved version that was scored separately.
@@ -78,6 +83,26 @@ type SocketSibling struct {
 	// ranged install distinguishes "no record" from an outage the same way the
 	// primary does. Optional (absent on older evidence) — defaults to "".
 	Reason string `json:"reason"`
+	// AgeDays is the sibling's release age; -1 unknown. A negative age never
+	// narrows the skip: unknown-age siblings land in the consent set, never
+	// in the out-of-scope one.
+	AgeDays int `json:"age_days"`
+}
+
+// SocketConsentVersion is one resolved version whose live Socket check awaits
+// the operator's consent at the install gate. AgeDays is nil when unknown.
+type SocketConsentVersion struct {
+	Version string `json:"version"`
+	AgeDays *int   `json:"age_days"`
+}
+
+// SocketConsent carries the fresh-release consent decision the install gate
+// must put to the operator. Required is true only when at least one version
+// is pending; the gate prompts once for the whole operation.
+type SocketConsent struct {
+	Required   bool                   `json:"required"`
+	Versions   []SocketConsentVersion `json:"versions"`
+	WindowDays int                    `json:"window_days"`
 }
 
 // OSV carries the already-classified advisory evidence.
@@ -139,12 +164,13 @@ type Lines struct {
 
 // Result is the decision.
 type Result struct {
-	Verdict       string   `json:"verdict"`
-	Causes        []string `json:"causes"`
-	Lines         Lines    `json:"lines"`
-	SocketDetail  string   `json:"socket_detail"`
-	SocketPending bool     `json:"socket_pending"`
-	ReleaseExempt bool     `json:"release_exempt"`
+	Verdict       string        `json:"verdict"`
+	Causes        []string      `json:"causes"`
+	Lines         Lines         `json:"lines"`
+	SocketDetail  string        `json:"socket_detail"`
+	SocketPending bool          `json:"socket_pending"`
+	ReleaseExempt bool          `json:"release_exempt"`
+	SocketConsent SocketConsent `json:"socket_consent"`
 }
 
 // decision accumulates verdict and causes while the stages run.
@@ -204,7 +230,10 @@ func Decide(ev Evidence) Result {
 //
 // The branch order matters: a policy skip and an outage are distinguishable
 // events carrying identical evidence (none), so each gets its own cause while
-// both warn. Only the final branch — a tier that actually reported — can pass.
+// both warn. The scope states (out_of_scope, consent_required) are the two
+// silent branches — deliberate scope decisions from the 2026-09-22 operator
+// ruling, never unknown states — and must be matched BEFORE the
+// unavailable/unset checks, since both carry Available=false.
 func socketStage(ev Evidence, d *decision, res *Result) {
 	s := ev.Socket
 	switch {
@@ -212,6 +241,28 @@ func socketStage(ev Evidence, d *decision, res *Result) {
 		res.Lines.Socket = fmt.Sprintf("SKIP (%s)", s.Note)
 		res.SocketDetail = orDefault(s.Note, "socket disabled by policy")
 		d.warn("socket_disabled")
+
+	case s.Status == "out_of_scope":
+		// A release beyond the fresh window, or an ecosystem outside
+		// install.socket.ecosystems: no call, no warn — OSV, the blocklist
+		// and the release-age rule decide. Disclosed in the line and the
+		// audit JSON; warning here would recreate per-install friction on
+		// every old package, the exact problem the scope ruling removes.
+		res.Lines.Socket = fmt.Sprintf("SKIP (%s)", s.Note)
+		res.SocketDetail = orDefault(s.Note, "outside Socket scope")
+
+	case s.Status == "consent_required":
+		// Fresh release (or unknown age) inside the window: safe does not
+		// spend a Socket call without the operator's say-so. The verdict
+		// stays decidable without the behavioral tier so the gate's consent
+		// prompt can print the would-be result; the gate prompts only when
+		// this verdict is otherwise GO.
+		res.SocketConsent.Required = true
+		res.SocketConsent.WindowDays = s.WindowDays
+		res.SocketConsent.Versions = append(res.SocketConsent.Versions,
+			primaryConsentVersion(ev))
+		res.Lines.Socket = fmt.Sprintf("CONSENT (%s)", s.Note)
+		res.SocketDetail = orDefault(s.Note, "Socket check proposed")
 
 	case !s.Available:
 		res.Lines.Socket = "SKIP (socket CLI not available)"
@@ -300,8 +351,29 @@ func socketStage(ev Evidence, d *decision, res *Result) {
 // This exists because removing the previous behavioral tier silently dropped
 // multi-version coverage: a clean primary could carry a malicious sibling in on
 // a ranged update. A sibling that could not be scored is unproven, never clean.
+// Scope states mirror the primary: an old sibling is silently out of scope, an
+// in-window one joins the consent set — an unknown-age sibling always joins
+// consent (a negative age must never widen the skip).
 func socketSiblingStage(ev Evidence, d *decision, res *Result) {
 	for _, sib := range ev.SocketSiblings {
+		if sib.Status == "out_of_scope" {
+			res.Lines.Socket += fmt.Sprintf("; %s outside Socket scope (release age)", sib.Version)
+			continue
+		}
+		if sib.Status == "consent_required" {
+			res.SocketConsent.Required = true
+			if res.SocketConsent.WindowDays == 0 {
+				res.SocketConsent.WindowDays = ev.Socket.WindowDays
+			}
+			cv := SocketConsentVersion{Version: sib.Version}
+			if sib.AgeDays >= 0 {
+				age := sib.AgeDays
+				cv.AgeDays = &age
+			}
+			res.SocketConsent.Versions = append(res.SocketConsent.Versions, cv)
+			res.Lines.Socket += fmt.Sprintf("; %s pending Socket consent", sib.Version)
+			continue
+		}
 		if sib.Status != "ok" {
 			if sib.Reason == "not_found" {
 				res.Lines.Socket += fmt.Sprintf("; %s not scored (socket has no record)", sib.Version)
@@ -527,6 +599,17 @@ func orDefault(v, fallback string) string {
 	return v
 }
 
+// primaryConsentVersion builds the consent entry for the scored primary. The
+// age is text upstream (it may be absent); anything non-numeric stays unknown
+// (nil) — an unreadable age must land in the consent set, never widen a skip.
+func primaryConsentVersion(ev Evidence) SocketConsentVersion {
+	v := SocketConsentVersion{Version: ev.Resolution.PrimaryVersion}
+	if age, err := strconv.Atoi(ev.Release.PrimaryAge); err == nil && age >= 0 {
+		v.AgeDays = &age
+	}
+	return v
+}
+
 // Known Socket classifications. A status of "ok" means the tier reported, so
 // its class decides the verdict; anything outside this set is evidence we
 // cannot interpret.
@@ -576,9 +659,10 @@ func (ev Evidence) Affecting() []Advisory { return ev.OSV.Affecting }
 // be caught after decoding, so the document is checked before it (delta F1).
 var requiredEvidenceKeys = []string{
 	"resolution.ok", "resolution.primary_version", "resolution.label",
-	"socket.status", "socket.available", "socket.class",
+	"socket.status", "socket.available", "socket.class", "socket.window_days",
 	"socket_siblings",
 	"socket_siblings[].version", "socket_siblings[].status", "socket_siblings[].class",
+	"socket_siblings[].age_days",
 	"osv.status", "osv.affecting", "osv.total_count", "osv.remediated_count",
 	"osv.historical_critical", "osv.historical_malware_ids",
 	"osv.affecting[].id", "osv.affecting[].severity", "osv.affecting[].malware",

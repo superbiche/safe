@@ -2367,6 +2367,34 @@ safe_install_audit_package() {
       if ! safe_gate_operator_terminal; then
         refuse 102 "BLOCKED ${ecosystem} install of ${package} — Socket is rate-limited; accepting missing Socket scores requires the operator's interactive terminal; hand over the complete command with exact pinned versions; details: safe explain"
       fi
+      # 2026-09-22 ruling: the failure terminus proposes the sandbox first
+      # (default Y). A decision already made in this command covers later
+      # rate-limited packages without re-prompting.
+      case "${SAFE_INSTALL_SOCKET_FALLBACK:-}" in
+        sandbox)
+          safe_install_gate_log "$ecosystem" "$package" "SOCKET_FAIL_SANDBOX_ROUTE_ACTIVE"
+          return 0
+          ;;
+        host)
+          safe_install_gate_log "$ecosystem" "$package" "SOCKET_RATE_LIMIT_COMMAND_OVERRIDE"
+          err "${package} — missing Socket score accepted for this command (rate limit)."
+          return 0
+          ;;
+      esac
+      local fb_choice_12=""
+      if safe_install_sandbox_capable; then
+        fb_choice_12="$(safe_install_confirm_sandbox_fallback "$package" "Socket is rate-limited")" || \
+          refuse 100 "BLOCKED ${ecosystem} install of ${package} — Socket is rate-limited and the terminal would not answer; wait and retry; details: safe explain"
+        if [[ "$fb_choice_12" == "sandbox" ]]; then
+          SAFE_INSTALL_SOCKET_FALLBACK=sandbox
+          safe_install_gate_log "$ecosystem" "$package" "SOCKET_FAIL_SANDBOX_FALLBACK"
+          return 0
+        fi
+        SAFE_INSTALL_SOCKET_FALLBACK=host
+        safe_install_gate_log "$ecosystem" "$package" "SOCKET_RATE_LIMIT_COMMAND_OVERRIDE"
+        err "${package} — missing Socket score accepted for this command (rate limit); installing on the host by your confirmation."
+        return 0
+      fi
       if [[ "${SAFE_GATE_SOCKET_COMMAND_CONSENT:-0}" != 1 ]]; then
         safe_gate_confirm_socket_command || refuse 100 "BLOCKED ${ecosystem} install of ${package} — Socket is rate-limited and you declined this command's override; wait and retry; details: safe explain"
         SAFE_GATE_SOCKET_COMMAND_CONSENT=1
@@ -2384,13 +2412,31 @@ safe_install_audit_package() {
       # (that records a package vouch for a non-event), never a standing
       # auto_allow_tolerate (that would silently pass every future outage). A
       # pre-existing operator host-allow entry is still honored — it is a prior
-      # deliberate grant, not a suggestion made here.
+      # deliberate grant, not a suggestion made here. Since 2026-09-22 the
+      # interactive terminus proposes the sandbox FIRST (default Y) wherever
+      # safe run can carry the install faithfully; "n" installs directly, the
+      # n itself being that confirmation.
       if safe_install_host_allow_matches "$package" "$ecosystem"; then
         err "safe audit warned for $package (audit infrastructure unavailable); exact host-allow entry permits install"
         safe_install_gate_log "$ecosystem" "$package" "HOST_ALLOW_OVERRIDE"
         return 0
       fi
       if [[ -t 0 && -t 1 ]]; then
+        if safe_install_sandbox_capable \
+          && [[ "${SAFE_INSTALL_SOCKET_FALLBACK:-}" != "host" ]]; then
+          local fb_choice_11=""
+          fb_choice_11="$(safe_install_confirm_sandbox_fallback "$package" "audit infrastructure is unavailable")" || \
+            refuse 100 "BLOCKED ${ecosystem} install of ${package} — audit infrastructure is unavailable and the terminal would not answer; fix it (socket login / wait / safe doctor) and retry; details: safe explain"
+          if [[ "$fb_choice_11" == "sandbox" ]]; then
+            SAFE_INSTALL_SOCKET_FALLBACK=sandbox
+            safe_install_gate_log "$ecosystem" "$package" "SOCKET_FAIL_SANDBOX_FALLBACK"
+            return 0
+          fi
+          SAFE_INSTALL_SOCKET_FALLBACK=host
+          safe_install_gate_log "$ecosystem" "$package" "INFRA_TTY_OVERRIDE"
+          err "${package} — proceeding without the unavailable audit signal by your confirmation."
+          return 0
+        fi
         if safe_install_confirm_infra "$package"; then
           safe_install_gate_log "$ecosystem" "$package" "INFRA_TTY_OVERRIDE"
           return 0
@@ -2400,6 +2446,29 @@ safe_install_audit_package() {
       fi
       safe_install_gate_log "$ecosystem" "$package" "REFUSED_INFRA_NONTTY"
       refuse 102 "BLOCKED ${ecosystem} install of ${package} — audit infrastructure is unavailable (not a package finding); proceeding is a deliberate operator decision that needs an interactive terminal — re-run in a TTY to accept it, or fix the infra (socket login / wait / safe doctor); details: safe explain"
+      ;;
+    13)
+      # Fresh-release Socket consent (2026-09-22 ruling): the audit is
+      # otherwise GO and safe does not spend a Socket call without the
+      # operator's say-so. Y re-runs the audit with the consent channel set
+      # (env, transient — it never reaches the next package); n proceeds on
+      # advisories, blocklist and release age, the n being that confirmation.
+      if ! safe_gate_operator_terminal; then
+        refuse 102 "BLOCKED ${ecosystem} install of ${package} — fresh release inside the Socket window: an operator decides at an interactive terminal whether the Socket behavioral check runs (Y, default) or the install proceeds without it (n); hand over the complete command with exact pinned versions; details: safe explain"
+      fi
+      if [[ "${SAFE_INSTALL_CONSENT_RECURSION:-0}" == "1" ]]; then
+        safe_install_gate_log "$ecosystem" "$package" "REFUSED_CONSENT_CHANNEL"
+        refuse 100 "BLOCKED ${ecosystem} install of ${package} — the consent re-check still asks for consent (consent channel broken); rerun install.sh or run safe doctor; details: safe explain"
+      fi
+      if safe_install_confirm_socket_consent "$package"; then
+        safe_install_gate_log "$ecosystem" "$package" "SOCKET_CONSENT_GRANTED"
+        SAFE_INSTALL_CONSENT_RECURSION=1 SAFE_AUDIT_SOCKET_CONSENT=granted \
+          safe_install_audit_package "$package" "$ecosystem"
+        return $?
+      fi
+      safe_install_gate_log "$ecosystem" "$package" "SOCKET_CONSENT_DECLINED"
+      err "${package} — Socket check declined for this install; proceeding on advisories, blocklist and release age."
+      return 0
       ;;
     2|20)
       # No allow hint on BLOCK: host-allow only clears WARN, and for a
@@ -2493,6 +2562,57 @@ safe_install_confirm_infra() {
   fi
 
   [[ "$reply" == "y" || "$reply" == "Y" || "$reply" == "yes" || "$reply" == "YES" ]]
+}
+
+# Fresh-release Socket consent (operator ruling 2026-09-22): safe does not
+# spend a Socket call on a fresh release without the operator's say-so. The
+# audit is otherwise GO; default Y — pressing Enter runs the check, "n"
+# proceeds on advisories/blocklist/release-age alone. Reads /dev/tty, never
+# stdin, reached only after the caller confirmed an operator terminal —
+# --yes can never satisfy it (no silent auto-pass).
+safe_install_confirm_socket_consent() {
+  local package="$1"
+  local reply
+
+  printf 'safe: %s resolves to a fresh release inside the Socket window — no behavioral evidence yet.\n' "$package" >&2
+  printf 'safe: run the Socket behavioral check now? [Y/n] ' >&2
+  if ! IFS= read -r reply </dev/tty; then
+    return 1
+  fi
+
+  [[ "$reply" != "n" && "$reply" != "N" && "$reply" != "no" && "$reply" != "NO" ]]
+}
+
+# Sandbox fallback after a Socket failure (operator ruling 2026-09-22):
+# default Y — the install re-runs under the safe run sandbox, restoring
+# behavioral CONTAINMENT for the missing behavioral EVIDENCE. "n" installs
+# directly; the n itself is that confirmation. Echoes the chosen token
+# (sandbox|direct); an unreadable tty returns non-zero (the caller refuses).
+# Only offered where safe run can carry the install faithfully — npm/bun,
+# project-local (safe_install_sandbox_capable); the prompt prints the exact
+# command Y will run, so dropped flags are visible before the choice.
+safe_install_sandbox_capable() {
+  case "${manager:-}" in
+    npm|bun) ;;
+    *) return 1 ;;
+  esac
+  [[ "${global_mode:-0}" == "0" ]]
+}
+
+safe_install_confirm_sandbox_fallback() {
+  local package="$1"
+  local cause="$2"
+  local reply
+
+  printf 'safe: %s for %s — the install would proceed WITHOUT the behavioral (Socket) signal; infrastructure failure, NOT a package finding.\n' "$cause" "$package" >&2
+  printf 'safe: install under the safe run sandbox instead? [Y/n] ' >&2
+  if ! IFS= read -r reply </dev/tty; then
+    return 1
+  fi
+  case "$reply" in
+    n|N|no|NO) printf 'direct' ;;
+    *) printf 'sandbox' ;;
+  esac
 }
 
 # Deliberate per-instance override for an ADVERSE WARN (a finding ABOUT the
@@ -2981,6 +3101,15 @@ cmd_install() {
       die "--trust-host requires exact npm versions; refusing to trust $audit_package"
     fi
   done
+
+  # 2026-09-22 sandbox fallback: the operator routed this command through the
+  # safe run sandbox after a Socket failure (default-Y prompt). safe run
+  # install is npm/bun, project-local, write+network enabled and
+  # ignore-scripts by default — exactly what the prompt showed. Exec replaces
+  # the host dispatch entirely: nothing of this command runs unsandboxed.
+  if [[ "${SAFE_INSTALL_SOCKET_FALLBACK:-}" == "sandbox" ]]; then
+    exec "$SAFE_RUN_PATH" install -w -n "${manager_args[@]}"
+  fi
 
   safe_install_build_command install_cmd "$manager" "$global_mode" "${manager_args[@]}"
   if [[ "$yes" != "1" ]]; then

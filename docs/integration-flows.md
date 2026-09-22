@@ -87,7 +87,10 @@ Flow:
 2. If the current directory looks like an npm project, it runs `safe audit repo-audit .`.
 3. It extracts package specs and runs `safe audit package-audit <pkg> --ecosystem npm --gate install`.
 4. Only a passing gate or applicable deliberate operator override proceeds.
-   Pure Socket rate limits can be accepted once for this command; all package
+   A fresh npm/Python release inside the Socket window asks the operator
+   first (gate-only exit 13: Y runs the behavioral check, n proceeds without
+   it; agents receive exit 102 and hand over the pinned command). Pure
+   Socket rate limits can be accepted once for this command; all package
    audits continue, and other outages/findings retain their own decision paths.
 5. The real command runs through the first non-wrapper `npm` on PATH.
 
