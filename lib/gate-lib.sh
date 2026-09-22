@@ -2913,6 +2913,34 @@ safe_gate_confirm_socket_consent() {
   [[ "$reply" != "n" && "$reply" != "N" && "$reply" != "no" && "$reply" != "NO" ]]
 }
 
+# Pending-Socket-score confirm (operator direction 2026-09-22): the install is
+# GO but not all-green; the operator confirms it knowingly. Reads /dev/tty,
+# never stdin, reached only after safe_gate_operator_terminal.
+safe_gate_confirm_pending() {
+  local package="$1"
+  local reply
+  safe_gate_err "safe: ${package} resolves to a fresh release whose Socket score is still pending — this install is not all-green."
+  printf 'safe: install now anyway? [y/N] ' >&2
+  if ! IFS= read -r reply </dev/tty; then
+    return 1
+  fi
+  [[ "$reply" == "y" || "$reply" == "Y" || "$reply" == "yes" || "$reply" == "YES" ]]
+}
+
+# Tolerated/host-allowed WARN confirm (operator direction 2026-09-22): the
+# pass is a deliberate grant, not an all-green check — the prompt must name
+# THAT risk, never a pending Socket score (r2 review MAJOR).
+safe_gate_confirm_tolerated() {
+  local package="$1"
+  local reply
+  safe_gate_err "safe: ${package}'s WARN passes via host-allow/tolerate — a deliberate grant, not an all-green check."
+  printf 'safe: install now anyway? [y/N] ' >&2
+  if ! IFS= read -r reply </dev/tty; then
+    return 1
+  fi
+  [[ "$reply" == "y" || "$reply" == "Y" || "$reply" == "yes" || "$reply" == "YES" ]]
+}
+
 # Check one package via safe audit's install gate.
 # Returns: 0=GO/proceed, 100=policy refusal, 104=audit BLOCK verdict.
 safe_gate_check() {
@@ -3044,6 +3072,45 @@ safe_gate_check() {
       safe_gate_err "safe: ${package} — Socket check declined for this install; proceeding on advisories, blocklist and release age."
       safe_gate_audit_log "${ecosystem}" "${package}" "SOCKET_CONSENT_DECLINED"
       return 0
+      ;;
+    14)
+      # GO with a still-incomplete Socket score (2026-09-22 direction): not
+      # all-green, so an unattended shell never proceeds on it. The receipt is
+      # GO_PENDING_SOCKET. Non-terminal refuses 102; the terminal confirms as
+      # before; decline refuses 100. The mise child defers to its parent like
+      # the consent ask does.
+      [[ "${3:-}" == defer-socket-consent ]] && return 14
+      if ! safe_gate_operator_terminal; then
+        safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — the Socket score for the fresh release is still pending, so this install is not all-green; an operator confirms it at an interactive terminal; hand over the complete command with exact pinned versions; details: safe explain"
+        safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_PENDING_NONTTY"
+        return 102
+      fi
+      if safe_gate_confirm_pending "${package}"; then
+        safe_gate_audit_log "${ecosystem}" "${package}" "PENDING_SOCKET_TTY_OVERRIDE"
+        return 0
+      fi
+      safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — Socket score pending and you declined; retry once the scan completes; details: safe explain"
+      safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_PENDING_DECLINED"
+      return 100
+      ;;
+    15)
+      # WARN pass through host-allow or auto_allow_tolerate (2026-09-22
+      # direction): a deliberate grant, not all-green — same terminal
+      # requirement as before, never the unattended proceed. The mise child
+      # defers to its parent.
+      [[ "${3:-}" == defer-socket-consent ]] && return 15
+      if ! safe_gate_operator_terminal; then
+        safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — the WARN passes via host-allow/tolerate but that is not an all-green check; an operator confirms it at an interactive terminal; hand over the complete command with exact pinned versions; details: safe explain"
+        safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_TOLERATED_NONTTY"
+        return 102
+      fi
+      if safe_gate_confirm_tolerated "${package}"; then
+        safe_gate_audit_log "${ecosystem}" "${package}" "TOLERATED_WARN_TTY_OVERRIDE"
+        return 0
+      fi
+      safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — tolerated WARN and you declined; details: safe explain"
+      safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_TOLERATED_DECLINED"
+      return 100
       ;;
     2|20)
       # No allow hint on BLOCK: host-allow is a WARN-tier escape hatch and
@@ -5083,6 +5150,36 @@ safe_gate_mise_check_with_env() {
   ) || audit_rc=$?
   if (( audit_rc == 12 )); then
     safe_gate_accept_socket_rate_limit "$pkg" "$eco"
+  elif (( audit_rc == 15 )); then
+    # Tolerated/host-allowed WARN deferred by the child: operator confirms at
+    # this terminal, no re-audit needed.
+    if ! safe_gate_operator_terminal; then
+      safe_gate_err "safe: BLOCKED mise install of ${pkg} — the WARN passes via host-allow/tolerate but that is not an all-green check; an operator confirms it at an interactive terminal; hand over the complete command with exact pinned versions; details: safe explain"
+      safe_gate_audit_log "${eco}" "${pkg}" "REFUSED_TOLERATED_NONTTY"
+      return 102
+    fi
+    if safe_gate_confirm_tolerated "${pkg}"; then
+      safe_gate_audit_log "${eco}" "${pkg}" "TOLERATED_WARN_TTY_OVERRIDE"
+      return 0
+    fi
+    safe_gate_err "safe: BLOCKED mise install of ${pkg} — tolerated WARN and you declined; details: safe explain"
+    safe_gate_audit_log "${eco}" "${pkg}" "REFUSED_TOLERATED_DECLINED"
+    return 100
+  elif (( audit_rc == 14 )); then
+    # Pending-score terminus deferred by the child: the operator confirms at
+    # this terminal, no re-audit needed (the verdict is already final).
+    if ! safe_gate_operator_terminal; then
+      safe_gate_err "safe: BLOCKED mise install of ${pkg} — the Socket score for the fresh release is still pending, so this install is not all-green; an operator confirms it at an interactive terminal; hand over the complete command with exact pinned versions; details: safe explain"
+      safe_gate_audit_log "${eco}" "${pkg}" "REFUSED_PENDING_NONTTY"
+      return 102
+    fi
+    if safe_gate_confirm_pending "${pkg}"; then
+      safe_gate_audit_log "${eco}" "${pkg}" "PENDING_SOCKET_TTY_OVERRIDE"
+      return 0
+    fi
+    safe_gate_err "safe: BLOCKED mise install of ${pkg} — Socket score pending and you declined; retry once the scan completes; details: safe explain"
+    safe_gate_audit_log "${eco}" "${pkg}" "REFUSED_PENDING_DECLINED"
+    return 100
   elif (( audit_rc == 13 )); then
     # 2026-09-22 consent: the child's isolated env/cwd cannot prompt; defer
     # to this (parent) terminal. Y re-runs the WHOLE env-scoped audit with

@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.3.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.65.0}"
+SAFE_VERSION="${SAFE_VERSION:-1.66.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -9010,7 +9010,19 @@ package_audit_command() {
           printf '[safe audit] %s@%s declares install scripts — they will be SKIPPED (global ignore-scripts); if the tool needs them: safe run scripts-allow add %s@%s --reason "..." (operator, TTY)\n' \
             "$PKG_NAME" "$primary_version" "$PKG_NAME" "$primary_version" >&2
         fi
-        (( socket_consent_required )) || gate_exit=0
+        if (( socket_consent_required )); then
+          : # gate_exit stays 13 (set above)
+        elif (( socket_pending )); then
+          # GO with a still-incomplete Socket score is NOT all-green evidence
+          # (operator direction 2026-09-22): unattended installs proceed only
+          # on fully green checks, so the pending state gets its own gate
+          # code. The receipt above stays GO_PENDING_SOCKET (the stale
+          # fallback requires a plain GO); an interactive terminal confirms
+          # as before; non-interactive refuses 102.
+          gate_exit=14
+        else
+          gate_exit=0
+        fi
         ;;
       WARN)
         # Adverse SECURITY knowledge (affecting advisory, blocklist hit, low
@@ -9045,7 +9057,10 @@ package_audit_command() {
           "${host_allow_required_versions[@]}"; then
           printf '[safe audit] host-allow entry %s@%s matches every warned resolved version; allowing\n' \
             "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION" >&2
-          gate_exit=0
+          # Gate exit 15 (2026-09-22 direction): a host-allowed WARN pass is a
+          # deliberate grant, not all-green evidence — unattended shells
+          # refuse 102 and the terminal confirms as before.
+          gate_exit=15
         elif [[ "$auto_allow" == "true" ]] && (( resolution_ok )) && (( aff_count == 0 )) \
           && [[ "$block_line" == PASS* ]] && (( ${#warn_causes[@]} > 0 )) \
           && [[ "$(jq -r --argjson causes "$warn_causes_json" '((.auto_allow_tolerate // []) | map(tostring)) as $tol | $causes | all(. as $c | $tol | index($c) != null)' <<<"$policy")" == "true" ]]; then
@@ -9053,7 +9068,7 @@ package_audit_command() {
             "$warn_causes_json" "$result_json"
           printf '[safe audit] WARN causes tolerated by install.auto_allow_tolerate (%s); allowing %s@%s\n' \
             "$(printf '%s,' "${warn_causes[@]}" | sed 's/,$//')" "$PKG_NAME" "$primary_version" >&2
-          gate_exit=0
+          gate_exit=15
         else
           # A single host-allow entry can only authorize a one-version required
           # set; a ranged op (length > 1) is non-pinnable, so suppress the

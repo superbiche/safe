@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- Allow unattended all-green installs in the `safe install` lane (operator
+  direction 2026-09-22): a GO with a final Socket answer or a ruled
+  out-of-scope skip installs without a terminal and logs
+  `INSTALL_UNATTENDED_GREEN`; interactive terminals keep the explicit
+  confirmation.
+- Give a pending fresh-release Socket score its own gate code (exit 14,
+  `GO_PENDING_SOCKET` receipt): not all-green, so unattended shells refuse
+  102 and interactive terminals confirm as before.
+- A WARN pass through a host-allow entry or `auto_allow_tolerate` gets its
+  own gate code (exit 15): a deliberate grant, not all-green — unattended
+  shells refuse 102 and interactive terminals confirm as before. A mixed
+  batch never goes green off its final package. Consequence:
+  `auto_allow_tolerate` no longer clears installs unattended; the operator
+  confirms at a terminal.
+- `scripts/release check` now validates the `bin/safe-audit` version
+  constant too — a release bump that misses it skewed every audit to exit 30.
+
 ## 1.66.0 - 2026-09-22
 
 - Scope the Socket behavioral tier to fresh npm/Python releases (operator

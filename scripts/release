@@ -40,6 +40,14 @@ check_version_sync() {
     printf 'VERSION does not match bin/safe SAFE_VERSION\n' >&2
     exit 1
   }
+  # safe-audit pins itself to the release too (its version-skew guard refuses
+  # every audit on a mismatch), so the release check must cover it as well.
+  local v_ere
+  v_ere="${v//./\\.}"
+  grep -qE "^SAFE_VERSION=\"\\\$\{SAFE_VERSION:-${v_ere}\}\"$" "$ROOT/bin/safe-audit" || {
+    printf 'VERSION does not match bin/safe-audit SAFE_VERSION\n' >&2
+    exit 1
+  }
 }
 
 require_clean_worktree() {
