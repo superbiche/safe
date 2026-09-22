@@ -531,13 +531,28 @@ affecting advisory whose severity is listed in `install.block_severities`
 (default: `critical`) produces BLOCK; other affecting advisories produce
 WARN. An OSV outage produces WARN (fail closed), never a zero-CVE PASS.
 
-Socket is the primary behavioral tier and is consulted on every check unless
-the operator explicitly sets `install.socket.mode` to `never`. A validated
-Socket result BLOCKs only for a `critical` `supplyChainRisk` alert. Critical
-vulnerability alerts, high-severity alerts, and scores below 70 WARN; the
-receipt retains the validated envelope for review. Missing CLI, auth,
-rate-limit, timeout, and malformed-result conditions are infrastructure WARNs,
-not package findings.
+Socket is the primary behavioral tier, scoped by the 2026-09-22 operator
+ruling: under `install.socket.mode: auto` (the default) it is consulted only
+for **npm and Python** releases younger than `install.socket.fresh_window_days`
+(default 7), and even then no live call is spent automatically — the install
+gate asks the operator first (TTY prompt, default **Y** = run the check; `n`
+proceeds on advisories, blocklist and release age alone, the `n` being that
+confirmation). A release at or beyond the window, and any ecosystem outside
+`install.socket.ecosystems`, skips the tier silently: the check line reads
+`SKIP (outside Socket scope: …)` with no WARN, and OSV, the blocklist and the
+release-age rule decide. An unknown release age fails closed into the consent
+branch. A valid cached score replays without prompting — a cache hit is not a
+call. `mode: always` restores unconditional calls for in-scope checks (no
+prompt); `mode: never` turns the tier off entirely (WARN `socket_disabled`,
+the pre-scope posture). A validated Socket result BLOCKs only for a
+`critical` `supplyChainRisk` alert. Critical vulnerability alerts,
+high-severity alerts, and scores below 70 WARN; the receipt retains the
+validated envelope for review. When Socket IS called, missing CLI, auth,
+rate-limit, timeout, and malformed-result conditions remain infrastructure
+WARNs, not package findings. Every audit appends one line to the verdict log
+(`~/.local/share/safe/audit/audit-log.jsonl`; `SAFE_AUDIT_AUDIT_LOG`
+overrides) recording the socket state, scope/consent outcome and verdict —
+the measurement behind the scope ruling.
 
 Successful envelopes are cached for the exact ecosystem, package name, and
 resolved version under `~/.cache/safe/socket/` (default TTL: 7 days; configure
@@ -563,6 +578,11 @@ audit-infrastructure breakage (the verdict engine is missing, version-skewed, or
 failed; or the evidence could not be assembled). It is not a package finding and
 carries no evidence about the package, so a consumer treats it as breakage-to-fix,
 never as a risk signal.
+
+In gate mode a fifth code, **exit 13**, means the verdict is GO but a
+fresh-release Socket check awaits the operator's consent — the gate resolves
+it to a normal verdict (Y) or a consented proceed (n); a non-interactive
+shell receives the operator-TTY refusal instead.
 
 ### Install gate mode
 
@@ -593,7 +613,19 @@ proceed:
   Exit 12 offers one deliberate operator-terminal approval for rate-limit-only
   results across the current install command. Every package is still audited;
   another outage or finding keeps its own decision path. This consent expires
-  at command exit and is unavailable to agents.
+  at command exit and is unavailable to agents. At an interactive terminal
+  where `safe run` can carry the install faithfully (npm, project-local,
+  via `safe install`), the socket-failure terminus proposes the **sandbox
+  fallback first**: default **Y** re-runs the install under the `safe run`
+  sandbox (behavioral containment for the missing behavioral evidence), `n`
+  installs directly, the `n` itself being that confirmation.
+- **Exit 13 (fresh-release consent)**: the verdict is GO but a live Socket
+  check on a fresh npm/python release awaits the operator's say-so (2026-09-22
+  ruling). At the TTY: default **Y** re-runs the audit with the check and
+  continues on its verdict; **n** proceeds without the behavioral check, the
+  `n` being that confirmation; no clean receipt is minted for a declined
+  check. Non-interactive shells refuse 102 — the operator hands over the
+  complete pinned command.
 - **BLOCK** refuses (exit 20) and points at operator review.
 
 A Socket scoring failure (missing CLI, auth, rate limit) is reported as an

@@ -368,3 +368,103 @@ func TestCauseOrderFollowsStageOrder(t *testing.T) {
 func hasCause(causes []string, want string) bool {
 	return slices.Contains(causes, want)
 }
+
+// Scope states are the only silent Socket branches: a deliberate scope decision
+// (operator ruling 2026-09-22) carries no cause and cannot raise the verdict.
+func TestSocketOutOfScopeIsSilentlyDisclosed(t *testing.T) {
+	ev := clean()
+	ev.Socket = Socket{Status: "out_of_scope", Available: false,
+		Note: "outside Socket scope: release 210d old", WindowDays: 7}
+	got := Decide(ev)
+	if got.Verdict != GO || len(got.Causes) != 0 {
+		t.Fatalf("verdict=%q causes=%v, want clean GO with no cause", got.Verdict, got.Causes)
+	}
+	if got.Lines.Socket != "SKIP (outside Socket scope: release 210d old)" {
+		t.Errorf("socket line = %q", got.Lines.Socket)
+	}
+}
+
+func TestConsentRequiredStaysDecidableAndCarriesTheSet(t *testing.T) {
+	ev := clean()
+	ev.Socket = Socket{Status: "consent_required", Available: false,
+		Note: "fresh release 1.2.3, 2d old", WindowDays: 7}
+	ev.Release.PrimaryAge = "2"
+	got := Decide(ev)
+	if got.Verdict != GO || len(got.Causes) != 0 {
+		t.Fatalf("verdict=%q causes=%v, want decidable GO with no cause", got.Verdict, got.Causes)
+	}
+	if !got.SocketConsent.Required || got.SocketConsent.WindowDays != 7 {
+		t.Fatalf("consent = %+v, want required with window 7", got.SocketConsent)
+	}
+	if len(got.SocketConsent.Versions) != 1 {
+		t.Fatalf("consent versions = %+v, want the primary only", got.SocketConsent.Versions)
+	}
+	cv := got.SocketConsent.Versions[0]
+	if cv.Version != "1.2.3" || cv.AgeDays == nil || *cv.AgeDays != 2 {
+		t.Fatalf("consent version = %+v, want 1.2.3 @ 2d", cv)
+	}
+}
+
+// An unknown age must land in the consent set, never widen a skip.
+func TestConsentWithUnknownAgeCarriesNilAge(t *testing.T) {
+	ev := clean()
+	ev.Socket = Socket{Status: "consent_required", Available: false,
+		Note: "release age unknown", WindowDays: 7}
+	ev.Release.PrimaryAge = ""
+	got := Decide(ev)
+	if !got.SocketConsent.Required {
+		t.Fatal("consent not required for unknown age")
+	}
+	if cv := got.SocketConsent.Versions[0]; cv.AgeDays != nil {
+		t.Fatalf("age = %v, want nil for unknown", *cv.AgeDays)
+	}
+}
+
+// The consent metadata is inert: adverse evidence elsewhere still decides.
+func TestConsentDoesNotMaskAdverseEvidence(t *testing.T) {
+	ev := clean()
+	ev.Socket = Socket{Status: "consent_required", Available: false,
+		Note: "fresh release", WindowDays: 7}
+	ev.OSV = OSV{Status: "ok", Affecting: []Advisory{
+		{ID: "GHSA-xxxx", Severity: "high", Malware: false}}, TotalCount: 1}
+	got := Decide(ev)
+	if got.Verdict != WARN || !hasCause(got.Causes, "osv_affecting") {
+		t.Fatalf("verdict=%q causes=%v, want WARN on osv_affecting", got.Verdict, got.Causes)
+	}
+	for _, c := range got.Causes {
+		if strings.HasPrefix(c, "socket_") {
+			t.Fatalf("cause %q: a scope state must never become a socket cause", c)
+		}
+	}
+}
+
+func TestSiblingScopeStatesMirrorPrimary(t *testing.T) {
+	ev := clean()
+	ev.Socket = Socket{Status: "ok", Available: true, Score: "90",
+		Class: "clean", WindowDays: 7}
+	ev.SocketSiblings = []SocketSibling{
+		{Version: "2.0.0", Status: "out_of_scope", Class: "", Score: "", AgeDays: 210},
+		{Version: "2.1.0", Status: "consent_required", Class: "", Score: "", AgeDays: 1},
+		{Version: "2.2.0", Status: "consent_required", Class: "", Score: "", AgeDays: -1},
+	}
+	got := Decide(ev)
+	if got.Verdict != GO || len(got.Causes) != 0 {
+		t.Fatalf("verdict=%q causes=%v, want GO with no cause", got.Verdict, got.Causes)
+	}
+	if !got.SocketConsent.Required || len(got.SocketConsent.Versions) != 2 {
+		t.Fatalf("consent = %+v, want the two consent siblings", got.SocketConsent)
+	}
+	if got.SocketConsent.WindowDays != 7 {
+		t.Fatalf("window = %d, want 7 (from the primary envelope)", got.SocketConsent.WindowDays)
+	}
+	if cv := got.SocketConsent.Versions[0]; cv.Version != "2.1.0" || cv.AgeDays == nil || *cv.AgeDays != 1 {
+		t.Fatalf("first consent version = %+v, want 2.1.0 @ 1d", cv)
+	}
+	if cv := got.SocketConsent.Versions[1]; cv.Version != "2.2.0" || cv.AgeDays != nil {
+		t.Fatalf("second consent version = %+v, want 2.2.0 with unknown age", cv)
+	}
+	if !strings.Contains(got.Lines.Socket, "2.0.0 outside Socket scope (release age)") ||
+		!strings.Contains(got.Lines.Socket, "2.1.0 pending Socket consent") {
+		t.Errorf("socket line = %q, want both sibling states disclosed", got.Lines.Socket)
+	}
+}

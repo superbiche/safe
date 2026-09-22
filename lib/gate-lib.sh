@@ -2896,6 +2896,23 @@ safe_gate_accept_socket_rate_limit() {
   return 0
 }
 
+# Fresh-release Socket consent (operator ruling 2026-09-22): safe does not
+# spend a Socket call on a fresh release without the operator's say-so. The
+# audit is otherwise GO; default Y — pressing Enter runs the check, "n"
+# proceeds on advisories/blocklist/release-age alone, the n being that
+# confirmation. Reads /dev/tty, never stdin, reached only after
+# safe_gate_operator_terminal — --yes can never satisfy it.
+safe_gate_confirm_socket_consent() {
+  local package="$1"
+  local reply
+  safe_gate_err "safe: ${package} resolves to a fresh (or unknown-age) release inside the Socket window — no behavioral evidence yet."
+  printf 'safe: run the Socket behavioral check now? [Y/n] ' >&2
+  if ! IFS= read -r reply </dev/tty; then
+    return 1
+  fi
+  [[ "$reply" != "n" && "$reply" != "N" && "$reply" != "no" && "$reply" != "NO" ]]
+}
+
 # Check one package via safe audit's install gate.
 # Returns: 0=GO/proceed, 100=policy refusal, 104=audit BLOCK verdict.
 safe_gate_check() {
@@ -2995,6 +3012,38 @@ safe_gate_check() {
       safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — audit infrastructure is unavailable (not a package finding); proceeding is a deliberate operator decision that needs an interactive terminal — re-run in a TTY to accept it, or fix the infra (socket login / wait / safe doctor); details: safe explain"
       safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_INFRA_NONTTY"
       return 102
+      ;;
+    13)
+      # Fresh-release Socket consent (2026-09-22 ruling): no Socket call is
+      # spent without the operator's say-so; the audit is otherwise GO. Y
+      # re-runs the audit with the consent channel set (env, transient — it
+      # never reaches the next package); n proceeds, the n being that
+      # confirmation. Non-interactive refuses 102 — the honest agent/operator
+      # boundary (the prompt reads /dev/tty, never stdin; --yes cannot reach
+      # it). The sandbox fallback prompt lives in the `safe install` lane
+      # only: safe run install can carry a bare spec set faithfully, while a
+      # wrapper's full manager argv (global flags, manager-specific options)
+      # cannot cross into it without silently dropping operator intent.
+      [[ "${3:-}" == defer-socket-consent ]] && return 13
+      if ! safe_gate_operator_terminal; then
+        safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — fresh release inside the Socket window: an operator decides at an interactive terminal whether the Socket behavioral check runs (Y, default) or the install proceeds without it (n); hand over the complete command with exact pinned versions; details: safe explain"
+        safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_CONSENT_NONTTY"
+        return 102
+      fi
+      if [[ "${SAFE_GATE_CONSENT_RECURSION:-0}" == "1" ]]; then
+        safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — the consent re-check still asks for consent (consent channel broken); rerun install.sh or run safe doctor; details: safe explain"
+        safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_CONSENT_CHANNEL"
+        return 100
+      fi
+      if safe_gate_confirm_socket_consent "${package}"; then
+        safe_gate_audit_log "${ecosystem}" "${package}" "SOCKET_CONSENT_GRANTED"
+        SAFE_GATE_CONSENT_RECURSION=1 SAFE_AUDIT_SOCKET_CONSENT=granted \
+          safe_gate_check "${package}" "${ecosystem}" "${3:-}"
+        return $?
+      fi
+      safe_gate_err "safe: ${package} — Socket check declined for this install; proceeding on advisories, blocklist and release age."
+      safe_gate_audit_log "${ecosystem}" "${package}" "SOCKET_CONSENT_DECLINED"
+      return 0
       ;;
     2|20)
       # No allow hint on BLOCK: host-allow is a WARN-tier escape hatch and
@@ -5034,6 +5083,30 @@ safe_gate_mise_check_with_env() {
   ) || audit_rc=$?
   if (( audit_rc == 12 )); then
     safe_gate_accept_socket_rate_limit "$pkg" "$eco"
+  elif (( audit_rc == 13 )); then
+    # 2026-09-22 consent: the child's isolated env/cwd cannot prompt; defer
+    # to this (parent) terminal. Y re-runs the WHOLE env-scoped audit with
+    # the consent channel set (env, transient); n proceeds on advisories,
+    # blocklist and release age, the n being that confirmation.
+    if [[ "${SAFE_GATE_CONSENT_RECURSION:-0}" == "1" ]]; then
+      safe_gate_err "safe: BLOCKED mise install of ${pkg} — the consent re-check still asks for consent (consent channel broken); rerun install.sh or run safe doctor; details: safe explain"
+      safe_gate_audit_log "${eco}" "${pkg}" "REFUSED_CONSENT_CHANNEL"
+      return 100
+    fi
+    if ! safe_gate_operator_terminal; then
+      safe_gate_err "safe: BLOCKED mise install of ${pkg} — fresh release inside the Socket window: an operator decides at an interactive terminal whether the Socket behavioral check runs (Y, default) or the install proceeds without it (n); hand over the complete command with exact pinned versions; details: safe explain"
+      safe_gate_audit_log "${eco}" "${pkg}" "REFUSED_CONSENT_NONTTY"
+      return 102
+    fi
+    if safe_gate_confirm_socket_consent "${pkg}"; then
+      safe_gate_audit_log "${eco}" "${pkg}" "SOCKET_CONSENT_GRANTED"
+      SAFE_GATE_CONSENT_RECURSION=1 SAFE_AUDIT_SOCKET_CONSENT=granted \
+        safe_gate_mise_check_with_env "$overlay" "$pkg" "$eco" "$installer"
+      return $?
+    fi
+    safe_gate_err "safe: ${pkg} — Socket check declined for this install; proceeding on advisories, blocklist and release age."
+    safe_gate_audit_log "${eco}" "${pkg}" "SOCKET_CONSENT_DECLINED"
+    return 0
   else
     return "$audit_rc"
   fi
@@ -5965,6 +6038,12 @@ safe_gate_mise() {
 safe_gate_main() {
   local SAFE_GATE_SOCKET_COMMAND_CONSENT=0
   export -n SAFE_GATE_SOCKET_COMMAND_CONSENT
+  # The consent channel and its recursion guard are the gate's own per-command
+  # state; an inherited/exported value must never reach the audit (F1 review,
+  # 2026-09-22 — a forged grant would skip the operator ask). The transient
+  # env-prefix the consent re-run uses is applied at the call site, after this
+  # scrub, so the granted value still reaches exactly one re-audit.
+  unset SAFE_AUDIT_SOCKET_CONSENT SAFE_GATE_CONSENT_RECURSION
   safe_gate_dispatch "$@"
 }
 

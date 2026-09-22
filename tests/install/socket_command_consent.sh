@@ -202,3 +202,153 @@ SAFE_GATE_SOCKET_COMMAND_CONSENT=0; actual=0
 safe_gate_mise_check_with_env '' a@1.0.0 npm >"$tmp/out" 2>"$tmp/err" || actual=$?
 [[ $actual == 102 ]] || fail 'parent grant must not clear different audit source'
 pass 'mise grant matching stays in audit source context before consent deferral'
+
+# ---------------------------------------------------------------------------
+# 2026-09-22 fresh-release consent (gate exit 13) and sandbox fallback.
+# ---------------------------------------------------------------------------
+
+# bin/safe lane: consent re-run, decline, non-TTY refusal, recursion guard.
+export ROOT tmp
+bash <<'INNER' || exit 1
+source <(sed '/^argv0=/,$d' "$ROOT/bin/safe")
+source "$ROOT/lib/gate-lib.sh"
+set +e
+SAFE_AUDIT_PATH="$tmp/audit"
+cat >"$SAFE_AUDIT_PATH" <<'STUB'
+#!/usr/bin/env bash
+n=$(cat "$CALLS" 2>/dev/null || echo 0); n=$((n+1)); printf '%s' "$n" >"$CALLS"
+printf '%s\n' "${SAFE_AUDIT_SOCKET_CONSENT-unset}" >>"$ENVLOG"
+[[ "$n" == 1 ]] && exit 13
+exit 0
+STUB
+chmod +x "$SAFE_AUDIT_PATH"
+: >"$tmp/consent-env"; export CALLS="$tmp/calls" ENVLOG="$tmp/consent-env"
+safe_gate_operator_terminal() { return 0; }
+safe_install_confirm_socket_consent() { printf 'y\n' >>"$tmp/consent-answers"; return 0; }
+safe_install_gate_log() { :; }
+rm -f "$tmp/calls"
+safe_install_audit_package fresh@1 npm || exit 1
+[[ "$(cat "$tmp/calls")" == 2 ]] || exit 1
+[[ "$(tail -n1 "$tmp/consent-env")" == granted ]] || exit 1
+[[ ! -e "$SAFE_RUN_CONFIG_DIR/install-known.json" ]] || true
+# Declined consent proceeds without a re-run.
+: >"$tmp/consent-answers"; rm -f "$tmp/calls"
+safe_install_confirm_socket_consent() { printf 'n\n' >>"$tmp/consent-answers"; return 1; }
+safe_install_audit_package fresh@1 npm || exit 1
+[[ "$(cat "$tmp/calls")" == 1 ]] || exit 1
+# Non-TTY refuses 102 (refuse exits, so run it in a subshell).
+safe_gate_operator_terminal() { return 1; }
+rm -f "$tmp/calls"
+rc=0; ( safe_install_audit_package fresh@1 npm ) 2>"$tmp/nontty.err" || rc=$?
+[[ $rc == 102 ]] || { printf 'non-tty got %s\n' "$rc" >&2; exit 1; }
+# The audit itself always runs before the gate dispatches on its exit; the
+# refusal is about the CONSENT, not about skipping the audit.
+# Broken consent channel refuses 100 (recursion guard).
+safe_gate_operator_terminal() { return 0; }
+rm -f "$tmp/calls"
+rc=0; ( SAFE_INSTALL_CONSENT_RECURSION=1 safe_install_audit_package fresh@1 npm ) 2>/dev/null || rc=$?
+[[ $rc == 100 ]] || { printf 'guard got %s\n' "$rc" >&2; exit 1; }
+exit 0
+INNER
+pass 'bin/safe consent: Y re-runs with granted env, n proceeds, non-TTY refuses 102, guard refuses 100'
+
+# An inherited/exported consent grant is scrubbed at cmd_install entry: the
+# forged grant must not reach the audit, so a fresh release still refuses 102
+# through the REAL safe_install_audit_package dispatch.
+bash <<'INNER' || exit 1
+source <(sed '/^argv0=/,$d' "$ROOT/bin/safe")
+source "$ROOT/lib/gate-lib.sh"
+set +e
+mkdir -p "$tmp/run-config"
+export SAFE_RUN_CONFIG_DIR="$tmp/run-config"
+printf '{"packages":{}}\n' >"$SAFE_RUN_CONFIG_DIR/blocked.json"
+SAFE_AUDIT_PATH="$tmp/audit2"
+cat >"$SAFE_AUDIT_PATH" <<'STUB'
+#!/usr/bin/env bash
+printf '%s' "${SAFE_AUDIT_SOCKET_CONSENT-unset}" > "$ENVLOG2"
+exit 13
+STUB
+chmod +x "$SAFE_AUDIT_PATH"
+export ENVLOG2="$tmp/consent-env2"; : >"$ENVLOG2"
+export SAFE_AUDIT_DATA_DIR="$tmp/audit-data"
+export SAFE_INSTALL_MANAGER=npm
+gate_lib_path() { printf '%s' "$ROOT/lib/gate-lib.sh"; }
+manager=npm; global_mode=0
+export SAFE_AUDIT_SOCKET_CONSENT=granted
+rc=0; ( cmd_install --host --yes fresh@1 ) 2>/dev/null || rc=$?
+[[ $rc == 102 ]] || { printf 'scrub got %s\n' "$rc" >&2; exit 1; }
+[[ "$(cat "$ENVLOG2")" == unset ]] || exit 1
+exit 0
+INNER
+pass 'cmd_install scrubs an inherited consent grant before the audit runs'
+
+# Sandbox fallback: Y routes the whole command through safe run; the route
+# suppresses later prompts; case 11 honors it too (review F8).
+bash <<'INNER' || exit 1
+source <(sed '/^argv0=/,$d' "$ROOT/bin/safe")
+source "$ROOT/lib/gate-lib.sh"
+set +e
+SAFE_AUDIT_PATH="$tmp/audit3"
+printf '#!/bin/sh\nexit 12\n' >"$SAFE_AUDIT_PATH"; chmod +x "$SAFE_AUDIT_PATH"
+printf '#!/bin/sh\necho sandboxed >>"$SANDBOXLOG"\nexit 0\n' >"$tmp/safe-run"; chmod +x "$tmp/safe-run"
+SAFE_RUN_PATH="$tmp/safe-run"
+export SANDBOXLOG="$tmp/sandbox-log"; : >"$SANDBOXLOG"
+safe_gate_operator_terminal() { return 0; }
+safe_install_gate_log() { :; }
+manager=npm; global_mode=0
+safe_install_sandbox_capable || exit 1
+manager=bun
+safe_install_sandbox_capable && exit 1
+manager=npm
+safe_install_confirm_sandbox_fallback() { printf 'sandbox'; }
+safe_install_audit_package ratey@1 npm || exit 1
+[[ "${SAFE_INSTALL_SOCKET_FALLBACK:-}" == sandbox ]] || exit 1
+safe_install_audit_package ratey2@1 npm || exit 1
+safe_install_host_allow_matches() { return 1; }
+printf '#!/bin/sh\nexit 11\n' >"$SAFE_AUDIT_PATH"
+# Route active: case 11 proceeds without re-prompting (review F8).
+safe_install_audit_package infry@1 npm || exit 1
+[[ "$(wc -l <"$SANDBOXLOG")" == 0 ]] || exit 1
+# Route unset: case 11 stays a non-interactive refusal.
+rc=0; ( SAFE_INSTALL_SOCKET_FALLBACK="" safe_install_audit_package infry@1 npm ) 2>/dev/null || rc=$?
+[[ $rc == 102 ]] || exit 1
+# The route execs safe run from cmd_install.
+gate_lib_path() { printf '%s' "$tmp/empty-lib"; }
+safe_install_audit_specs() { printf 'a@1\n'; }
+safe_install_audit_package() { SAFE_INSTALL_SOCKET_FALLBACK=sandbox; return 0; }
+safe_install_build_command() { install_cmd=(npm install a@1); }
+cmd_install --host --yes a@1 || exit 1
+[[ "$(tail -n1 "$SANDBOXLOG")" == sandboxed ]] || exit 1
+exit 0
+INNER
+pass 'sandbox fallback: npm-only capability, route covers later packages, cmd_install execs safe run'
+
+# gate-lib lane: exit 13 consent with the same protocol; deferred 13 passes
+# through to the mise parent; safe_gate_main scrubs an inherited grant.
+bash <<'INNER' || exit 1
+source "$ROOT/lib/gate-lib.sh"
+set +e
+safe_gate_audit_available() { return 0; }
+safe_gate_audit_op() { printf install; }
+safe_gate_audit_log() { :; }
+: >"$tmp/gate-consent-env"; export GENVLOG="$tmp/gate-consent-env"
+safe_gate_run_audit() { printf '%s\n' "${SAFE_AUDIT_SOCKET_CONSENT-unset}" >>"$GENVLOG"; if [[ ! -e "$tmp/gate-second" ]]; then : >"$tmp/gate-second"; return 13; fi; return 0; }
+safe_gate_operator_terminal() { return 0; }
+safe_gate_confirm_socket_consent() { printf 'y\n' >>"$tmp/consent-answers-g"; return 0; }
+safe_gate_check fresh@1.0.0 npm || exit 1
+[[ "$(tail -n1 "$tmp/gate-consent-env")" == granted ]] || exit 1
+# Declined consent proceeds.
+rm -f "$tmp/gate-second"
+safe_gate_confirm_socket_consent() { printf 'n\n' >>"$tmp/consent-answers-g"; return 1; }
+safe_gate_check fresh@1.0.0 npm || exit 1
+# Deferred 13 reaches the mise parent unresolved.
+rm -f "$tmp/gate-second"
+actual=0
+safe_gate_check fresh@1.0.0 npm defer-socket-consent 2>/dev/null || actual=$?
+[[ $actual == 13 ]] || exit 1
+# safe_gate_main scrubs an inherited grant before dispatch.
+safe_gate_dispatch() { [[ ${SAFE_AUDIT_SOCKET_CONSENT+set} != set ]]; }
+SAFE_AUDIT_SOCKET_CONSENT=granted safe_gate_main npm install || exit 1
+exit 0
+INNER
+pass 'gate-lib consent: Y re-runs with granted env, n proceeds, deferral passes 13 through, main scrubs'

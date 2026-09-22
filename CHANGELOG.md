@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- Scope the Socket behavioral tier to fresh npm/Python releases (operator
+  ruling 2026-09-22): under `install.socket.mode: auto` (the default), a live
+  Socket call is spent only for npm/Python releases younger than the new
+  `install.socket.fresh_window_days` (default 7), and only after the install
+  gate asks at the TTY (default Y; `n` proceeds without the check; a
+  non-interactive shell refuses 102). Releases at or beyond the window, and
+  ecosystems outside the new `install.socket.ecosystems` (default
+  `["npm","python"]`), skip the tier silently with a disclosed `out_of_scope`
+  state — advisories, blocklist and release age decide; go/cargo/php audits
+  no longer draw `socket_not_found` WARNs, and Maven audits no longer warn
+  `socket_disabled` by default. An unknown release age fails closed into the
+  consent branch; a cached score replays without prompting.
+- Add the fresh-release consent terminus (gate exit 13): the verdict stays a
+  decidable GO, no clean receipt is minted before the operator answers, and
+  `mode: always` preserves the pre-scope unconditional-call behavior with no
+  prompt.
+- Add the sandbox fallback at the Socket-failure terminus (2026-09-22): where
+  `safe run` can carry the install faithfully (npm, project-local, via
+  `safe install`), the prompt proposes the sandbox first (default Y); `n`
+  installs directly as the operator's confirmation. Other lanes keep their
+  existing deliberate confirms.
+- Add the verdict log (`~/.local/share/safe/audit/audit-log.jsonl`,
+  `SAFE_AUDIT_AUDIT_LOG` override): one JSONL line per audit recording the
+  socket state, scope/consent outcome and verdict, measuring the real share
+  of useful Socket calls across the scope change.
+- Document the Socket scope, consent and sandbox-fallback flow
+  (`docs/safe-audit.md`, `docs/configuration.md`).
+
 ## 1.65.0 - 2026-09-18
 
 - Add unattended `safe release follow`, which fetches and verifies the highest

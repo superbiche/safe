@@ -363,6 +363,14 @@ SAFE_INSTALL_TIMEOUT_SECONDS=60 npm install example-package@1.2.3
 
 ### Operator command consent and agent batch limits
 
+A fresh npm/Python release inside the Socket window (default 7 days) is not
+scored automatically (2026-09-22 scope ruling): in the wrapper lane the audit
+returns gate-only exit 13, the operator answers at the terminal (Y runs the
+Socket check, n proceeds without the behavioral evidence), and a
+non-interactive session refuses 102 so the agent hands over the pinned
+command. The consent channel (`SAFE_AUDIT_SOCKET_CONSENT`) is set only by the
+gate for that one re-audit; it is never an environment bypass.
+
 A WARN caused solely by Socket rate limiting has gate-only exit 12. The
 operator can accept missing Socket scores once for the current install command.
 The gate keeps auditing each package; only repeated rate-limit-only prompts are
