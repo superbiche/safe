@@ -573,6 +573,18 @@ WARN  (exit 10)
 BLOCK (exit 20)
 ```
 
+PEP 440 local version segments (`torch==2.10.0+rocm7.0`) are exact
+identities: the pin is audited without a registry fetch, and the advisory
+query uses the base version (`2.10.0`) — local segments are build metadata
+and do not participate in published-range comparisons, so an advisory
+affecting the base version decides exactly as it would for the final
+release. The custom index itself never escalates the verdict: on an exact
+local-segment pin it stays a WARN (operator override or
+`trusted_registries`). A python request that is NOT an exact version
+degrades to the unresolved path when a custom source is in play (mirroring
+rust/php): a pypi-latest lookup would audit an artifact from a different
+index than the one the manager installs from.
+
 A fourth code, **exit 30**, means the audit could not produce a verdict at all —
 audit-infrastructure breakage (the verdict engine is missing, version-skewed, or
 failed; or the evidence could not be assembled). It is not a package finding and
