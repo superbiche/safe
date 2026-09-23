@@ -175,6 +175,16 @@ TTY gating retains the existing cooperative-agent boundary.
 See [Host Allowlist › Fleet replication](safe-run.md#fleet-replication-export--import)
 for validation, signature-keyring and operator-override details.
 
+## Host-allow store audit trail
+
+Every confirmed host-allow store write — `add`, `update`, `import`,
+`remove`, and follow-applied entries — appends one event to the audit log
+(`~/.local/share/safe/run/audit.log`):
+`HOST_ALLOW_WRITE op=<op> pkg=<name@version> entries=<store size>`. The
+lines use the TRUST tier, which `host-allow review` deliberately does not
+count as pin usage (usage comes from executions and install-gate override
+lines only).
+
 ## Safe release follow
 
 `safe release follow` owns L7 release verification and installation. A daily

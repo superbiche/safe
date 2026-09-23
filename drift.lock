@@ -33,7 +33,7 @@ sig = "08ad8fd42478707e"
 [[bindings]]
 doc = "docs/configuration.md"
 target = "bin/safe-run"
-sig = "6fa0036ffdf04ae7"
+sig = "21e5f31b5bfa3754"
 
 [[bindings]]
 doc = "docs/dependencies.md"
@@ -78,7 +78,7 @@ sig = "7716170507ec2acd"
 [[bindings]]
 doc = "docs/operations.md"
 target = "bin/safe-run"
-sig = "6fa0036ffdf04ae7"
+sig = "21e5f31b5bfa3754"
 
 [[bindings]]
 doc = "docs/release-review.md"
@@ -108,4 +108,4 @@ sig = "9d7937815cb8379c"
 [[bindings]]
 doc = "docs/safe-run.md"
 target = "bin/safe-run"
-sig = "6fa0036ffdf04ae7"
+sig = "21e5f31b5bfa3754"

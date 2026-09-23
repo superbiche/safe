@@ -160,6 +160,8 @@ expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
 jq -e '.packages["fresh-pkg"] | .version == "2.0.0" and .added == "2026-07-01" and .followed_from == "rainbow" and .sha == "sha512-FRESH"' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'signed replacement differs'
 jq -e '.origins.rainbow.applied == ["fresh-pkg@2.0.0"] and .origins.rainbow.replaced == ["fresh-pkg@1.2.3->2.0.0"]' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'replacement ledger record differs'
 grep -q 'host-allow-follow | fresh-pkg@2.0.0 | TRUST | non-tty | REPLACED | old_pin=@1.2.3 new_pin=@2.0.0 origin_host=rainbow generation=' "$tmp/data/audit.log" || fail 'replacement audit event missing'
+# Fibery #469: the follow write itself also emits the store-write event.
+grep -q 'host-allow | fresh-pkg@2.0.0 | TRUST | non-tty | HOST_ALLOW_WRITE | op=follow entries=' "$tmp/data/audit.log" || fail 'follow store-write audit event missing'
 grep -q 'followed fresh-pkg@2.0.0 from rainbow (replaced local pin @1.2.3)' "$tmp/output" || fail 'replacement info line missing'
 pass 'signed follow replaces a different local pin, records the replacement, and previews without writes'
 
