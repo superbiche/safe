@@ -213,6 +213,44 @@ JSON
   [[ "$(jq -r '.packages["epoch-pkg"].sha' "$tmp/config/host-allow.json")" == "sha256-DEADBEEF" ]] || fail "epoch import must store the pypi-verified sha"
   pass "import accepts a legal PEP440 epoch version and verifies it against pypi"
 
+  # Fibery #469: every confirmed store write leaves one HOST_ALLOW_WRITE
+  # event in the audit log (op=<op>, entries=<store size>) — and those lines
+  # must not count as usage in host-allow review.
+  audit_log_file="$tmp/data/audit.log"
+  [[ -f "$audit_log_file" ]] || fail "no audit log after import writes"
+  grep -q 'HOST_ALLOW_WRITE.*op=import entries=1' "$audit_log_file" ||
+    fail "the import write did not log HOST_ALLOW_WRITE op=import entries=1"
+
+  # update (TTY, registry re-verified) -> op=update; the update prompts
+  # [y/N], so the pty needs the answer piped in.
+  cmd="SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' host-allow update epoch-pkg@1!2.0 --reason 'rotate integrity'"
+  out=$(printf 'y\n' | pty_run "$cmd" 2>&1) || fail "TTY update failed: $out"
+  grep -q 'HOST_ALLOW_WRITE.*op=update' "$audit_log_file" ||
+    fail "the update write did not log HOST_ALLOW_WRITE op=update"
+
+  # add (TTY, registry re-verified) -> op=add
+  cmd="SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' host-allow add epoch-pkg@1!2.0 --ecosystem python --reason 're-add for the audit-event case'"
+  out=$(printf 'y\n' | pty_run "$cmd" 2>&1) || fail "TTY add failed: $out"
+  grep -q 'HOST_ALLOW_WRITE.*op=add entries=1' "$audit_log_file" ||
+    fail "the add write did not log HOST_ALLOW_WRITE op=add entries=1"
+
+  # remove -> op=remove with the remaining store size
+  cmd="SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' host-allow remove epoch-pkg"
+  out=$(printf 'y\n' | pty_run "$cmd" 2>&1) || fail "remove failed: $out"
+  grep -q 'HOST_ALLOW_WRITE.*op=remove entries=0' "$audit_log_file" ||
+    fail "the remove write did not log HOST_ALLOW_WRITE op=remove entries=0"
+
+  # Re-add epoch-pkg (it stays in the store) so review proves the TRUST-tier
+  # write events do not count as usage: epoch-pkg has zero EXEC/override use.
+  cmd="SAFE_RUN_TRUST_OVERRIDE=1 SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' host-allow add epoch-pkg@1!2.0 --ecosystem python --reason 're-add for the review-count case'"
+  out=$(printf 'y\n' | pty_run "$cmd" 2>&1) || fail "TTY re-add failed: $out"
+  review_json=$(SAFE_RUN_TRUST_OVERRIDE=1 SAFE_RUN_CONFIG_DIR="$tmp/config" SAFE_RUN_DATA_DIR="$tmp/data" \
+    SAFE_AUDIT_DATA_DIR="$tmp/audit-data" PATH="$tmp/bin:$PATH" \
+    "$SAFE_RUN" host-allow review --json 2>/dev/null) || fail "review --json failed"
+  uses=$(jq -r '.entries[] | select(.name == "epoch-pkg") | .times_used' <<<"$review_json")
+  [[ "$uses" == "0" ]] || fail "review counted a TRUST write event as usage (times_used=$uses)"
+  pass "store writes leave HOST_ALLOW_WRITE audit events (import/update/add/remove) and review does not count them"
+
   # --- import: a calendar-invalid date falls back to today (N2) -------------
   fresh_config
   printf '{"packages":{}}\n' > "$tmp/config/host-allow.json"

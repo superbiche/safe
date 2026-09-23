@@ -1749,6 +1749,14 @@ write_host_allow_entry_locked() (
       {followed_from: $origin} + (if $generation == "" then {} else {followed_generation: $generation} end)
     end)' "$ha_file" > "$tmp" || { rm -f -- "$tmp"; return 1; }
   mv "$tmp" "$ha_file" || return 1
+  # One audit event per confirmed store write (Fibery #469): the append-only
+  # audit log is the attribution trail the file mtime could not provide. Tier
+  # TRUST + decision HOST_ALLOW_WRITE stay outside both shapes host-allow
+  # review counts as usage (the execution log and the GATE override lines).
+  local write_op="${10:-write}" store_entries
+  store_entries=$(jq -r '.packages | length' "$ha_file" 2>/dev/null || echo '?')
+  audit_log "host-allow" "$pkg@$version" "TRUST" "$(context_label)" "HOST_ALLOW_WRITE" \
+    "op=$write_op entries=$store_entries"
   if [[ "$replace_local" == "1" && -n "$local_version" && "$local_version" != "$version" ]]; then
     audit_log "host-allow-follow" "$pkg@$version" "TRUST" "$(context_label)" "REPLACED" \
       "old_pin=@$local_version new_pin=@$version origin_host=$followed_from generation=$generation"
@@ -2062,7 +2070,7 @@ host_allow_apply_export() {
       added=$((added + 1)); continue
     fi
 
-    "$writer" "$normalized" "$version" "$fetched_sha" "$reason" "$ecosystem" "$added_date" "$origin" || return 1
+    "$writer" "$normalized" "$version" "$fetched_sha" "$reason" "$ecosystem" "$added_date" "$origin" 0 "" "import" || return 1
     info "imported ${normalized}@${version}"
     added=$((added + 1))
   done
@@ -2354,7 +2362,7 @@ follow_commit_generation() {
         reason=$(jq -r '.reason' <<<"$entry")
         ecosystem=$(jq -r '.ecosystem' <<<"$entry")
         added=$(jq -r '.added' <<<"$entry")
-        if ! write_host_allow_entry_locked "$name" "$version" "$sha" "$reason" "$ecosystem" "$added" "$origin" "$replace_local" "$stamp"; then
+        if ! write_host_allow_entry_locked "$name" "$version" "$sha" "$reason" "$ecosystem" "$added" "$origin" "$replace_local" "$stamp" "follow"; then
           follow_publish_state "$state_file" "$state" || warn "follow: could not restore entry ledger after a failed write; operator repair/import required"
           return 1
         fi
@@ -2542,7 +2550,7 @@ cmd_host_allow_add() {
   esac
   [[ -n "$sha" ]] || die "could not verify ${PKG_NAME}@${PKG_VERSION} against the registry (unknown version or registry unreachable) — retry when the registry is reachable"
 
-  write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem"
+  write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem" "" "" 0 "" "add"
   info "added ${PKG_NAME}@${PKG_VERSION} to host-allow"
 }
 
@@ -2562,6 +2570,11 @@ host_allow_remove_locked() {
   tmp=$(stage_beside "$HOST_ALLOW_FILE") || return 1
   jq --arg p "$pkg" 'del(.packages[$p])' "$HOST_ALLOW_FILE" > "$tmp" || { rm -f -- "$tmp"; return 1; }
   mv "$tmp" "$HOST_ALLOW_FILE" || return 1
+  # Store-write audit event, same contract as write_host_allow_entry_locked.
+  local store_entries
+  store_entries=$(jq -r '.packages | length' "$HOST_ALLOW_FILE" 2>/dev/null || echo '?')
+  audit_log "host-allow" "$pkg" "TRUST" "$(context_label)" "HOST_ALLOW_WRITE" \
+    "op=remove entries=$store_entries"
   info "removed $pkg from host-allow"
   # Only after the removal succeeded, and with the key the store actually
   # used: status must stop reporting a decision the operator has just made.
@@ -2606,7 +2619,10 @@ cmd_host_allow_update() {
     *) die "unknown --ecosystem: $ecosystem" ;;
   esac
   [[ -n "$sha" ]] || die "could not verify ${PKG_NAME}@${PKG_VERSION} against the registry (unknown version or registry unreachable) — retry when the registry is reachable"
-  write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem"
+  # replace_local stays 0: the keyed jq assignment already replaces the
+  # entry, and the follow-only REPLACED/replace machinery reads follow-scoped
+  # state this caller does not have.
+  write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem" "" "" 0 "" "update"
   info "updated ${PKG_NAME}@${PKG_VERSION} in host-allow"
 }
 
