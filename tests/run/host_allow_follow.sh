@@ -117,6 +117,45 @@ grep -q 'already at the current generation' "$tmp/output" || fail 'repeat genera
 cmp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'repeat follow changed store'
 pass 'non-TTY follow applies signed grant with original date and provenance; repeat generation is a quiet successful no-op'
 
+# The accepted generation names its verified signer, and the install gate's
+# reader (bin/safe-audit) accepts exactly what this writer produced
+# (2026-09-29 direction: a followed grant installs unattended while its signer
+# stays pinned). The reader is sourced, not re-implemented.
+jq -e --arg f "$fingerprint" '.origins.rainbow.signer == $f and .origins.rainbow.applied == ["fresh-pkg@1.2.3"]' \
+  "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'ledger does not name the verified signer'
+gate_followed_grant() (
+  trust_store_file() { printf '%s/%s' "$SAFE_RUN_CONFIG_DIR" "$1"; }
+  # shellcheck disable=SC1090
+  source <(sed -n '/^followed_grant_ledger_file() {$/,/^# Receipt, verdict-log event/p' "$ROOT/bin/safe-audit")
+  followed_grant_lookup "$1" "$2" || exit 1
+  printf '%s %s %s\n' "$FOLLOWED_GRANT_ORIGIN" "$FOLLOWED_GRANT_SIGNER" "$FOLLOWED_GRANT_GENERATION"
+)
+followed_generation=$(jq -r '.exported_at' "$export_file")
+[[ "$(gate_followed_grant fresh-pkg 1.2.3)" == "rainbow $fingerprint $followed_generation" ]] ||
+  fail 'gate does not recognize the grant follow just wrote'
+! gate_followed_grant fresh-pkg 1.2.4 >/dev/null || fail 'gate recognized a followed grant for another version'
+pty_run "$SAFE_RUN" host-allow follow-signer remove "$fingerprint" > "$tmp/output" 2>&1 || fail 'signer remove failed'
+! gate_followed_grant fresh-pkg 1.2.3 >/dev/null || fail 'an unpinned signer still authorizes the unattended pass'
+pty_run "$SAFE_RUN" host-allow follow-signer add "$fingerprint" > "$tmp/output" 2>&1 || fail 'signer re-add failed'
+gate_followed_grant fresh-pkg 1.2.3 >/dev/null || fail 're-pinning the signer did not restore the followed grant'
+pass 'ledger names the verified signer; the gate reader accepts it and signer removal withdraws it'
+
+# A ledger written before signers were recorded gains one on the next verified
+# run of the same generation, without touching the grant.
+jq 'del(.origins.rainbow.signer)' "$SAFE_RUN_CONFIG_DIR/follow-state.json" > "$tmp/legacy-state.json"
+cp "$tmp/legacy-state.json" "$SAFE_RUN_CONFIG_DIR/follow-state.json"
+! gate_followed_grant fresh-pkg 1.2.3 >/dev/null || fail 'a ledger without a signer authorized the unattended pass'
+expect_rc 0 "$SAFE_RUN" host-allow follow --dry-run
+cmp "$tmp/legacy-state.json" "$SAFE_RUN_CONFIG_DIR/follow-state.json" || fail 'dry-run recorded a signer'
+expect_rc 0 "$SAFE_RUN" host-allow follow
+jq -e --arg f "$fingerprint" '.origins.rainbow.signer == $f and .origins.rainbow.applied == ["fresh-pkg@1.2.3"]' \
+  "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'legacy ledger did not gain the signer'
+cmp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'signer backfill changed the store'
+gate_followed_grant fresh-pkg 1.2.3 >/dev/null || fail 'backfilled ledger is not recognized by the gate'
+expect_rc 0 "$SAFE_RUN" host-allow follow
+grep -q 'already at the current generation' "$tmp/output" || fail 'steady state after backfill is not a quiet no-op'
+pass 'a pre-signer ledger gains the signer on the next verified run; dry-run writes nothing'
+
 # Per-case directory keeps invalid siblings from contaminating other tests.
 mkdir "$tmp/incoming"
 cp "$export_file" "$tmp/original.json"

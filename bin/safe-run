@@ -2242,12 +2242,20 @@ follow_collect_entry() {
 # No registry calls here. The caller holds the shared writer lock for real
 # writes; dry-run reads atomic snapshots without creating a lock or ledger.
 follow_commit_generation() {
-  local dry_run="$1" origin="$2" ha_file="$3" stamp="$4" candidates="$5"
+  local dry_run="$1" origin="$2" ha_file="$3" stamp="$4" candidates="$5" signer="${6:-}"
   local state_file state selected next entry name version sha reason ecosystem added disposition id local_entry local_generation local_origin statement_generation planned_entry replacement replace_local generation_rc already_refused
   local changed=0 failures=0
   state_file="$(dirname "$ha_file")/follow-state.json"
   state=$(follow_load_state "$state_file") || return 1
   selected=$(follow_select_generation "$state" "$origin" "$stamp") || return $?
+  # The verified primary fingerprint rides on the accepted generation: the
+  # install gate lets a followed grant pass unattended only while this signer
+  # is still pinned in follow.signers (2026-09-29 direction). A new generation
+  # starts without one, so it always names the key that signed THAT statement.
+  if [[ -n "$signer" ]]; then
+    selected=$(jq -c --arg host "$origin" --arg signer "$signer" \
+      '.origins[$host].signer = $signer' <<<"$selected") || return 1
+  fi
   if [[ "$selected" != "$state" ]]; then
     (( dry_run )) || follow_publish_state "$state_file" "$selected" || return 1
     changed=1
@@ -2381,7 +2389,7 @@ follow_commit_generation() {
 }
 
 follow_apply_generation() {
-  local file="$1" dry_run="$2" origin="$3" ha_file="$4"
+  local file="$1" dry_run="$2" origin="$3" ha_file="$4" signer="${5:-}"
   local state stamp applied collect_rc=0 commit_rc=0 follow_candidates='[]'
   if ! stamp=$(jq -er '.exported_at | select(type == "string" and (test("[[:space:][:cntrl:]]") | not))' "$file") ||
      ! follow_exported_epoch "$stamp" >/dev/null; then
@@ -2398,9 +2406,9 @@ follow_apply_generation() {
   # Validation and all bounded registry I/O happen before acquiring the lock.
   host_allow_apply_export "$file" "$dry_run" "$origin" "$ha_file" follow_collect_entry "$applied" || collect_rc=$?
   if (( dry_run )); then
-    follow_commit_generation "$dry_run" "$origin" "$ha_file" "$stamp" "$follow_candidates" || commit_rc=$?
+    follow_commit_generation "$dry_run" "$origin" "$ha_file" "$stamp" "$follow_candidates" "$signer" || commit_rc=$?
   else
-    with_host_allow_lock "$ha_file" follow_commit_generation "$dry_run" "$origin" "$ha_file" "$stamp" "$follow_candidates" || commit_rc=$?
+    with_host_allow_lock "$ha_file" follow_commit_generation "$dry_run" "$origin" "$ha_file" "$stamp" "$follow_candidates" "$signer" || commit_rc=$?
   fi
   (( commit_rc != 2 )) || return 2
   (( collect_rc == 0 )) || return 1
@@ -2485,7 +2493,7 @@ cmd_host_allow_follow() (
       failed_files=$((failed_files + 1)); continue
     fi
     apply_rc=0
-    follow_apply_generation "$staging/export.json" "$dry_run" "$origin" "$ha_file" || apply_rc=$?
+    follow_apply_generation "$staging/export.json" "$dry_run" "$origin" "$ha_file" "$verified_primary" || apply_rc=$?
     case "$apply_rc" in
       0) ;;
       2) freshness_skips=$((freshness_skips + 1)) ;;
@@ -2717,7 +2725,8 @@ host_allow_review_usage() {
   # Observed usage for one entry; sets REVIEW_TIMES_USED, REVIEW_LAST_USED.
   # Executions come from the host-allow execution log (canonical, one JSON
   # line per exec); install-gate WARN overrides come from the audit log
-  # (`GATE` tier, `HOST_ALLOW_OVERRIDE` decision). The audit log's own
+  # (`GATE` tier, `HOST_ALLOW_OVERRIDE` or `ALLOWED_VIA_FOLLOWED_GRANT`
+  # decision). The audit log's own
   # HOST_ALLOW tier lines duplicate the execution log — not counted twice.
   local pkg="$1"
   local exec_count=0 gate_count=0
@@ -2740,7 +2749,7 @@ host_allow_review_usage() {
   fi
   if [[ -f "$AUDIT_LOG" ]]; then
     gate_count=$(awk -F' \\| ' -v pkg="$pkg" '
-      $4 == "GATE" && $6 == "HOST_ALLOW_OVERRIDE" \
+      $4 == "GATE" && ($6 == "HOST_ALLOW_OVERRIDE" || $6 == "ALLOWED_VIA_FOLLOWED_GRANT") \
         && ($3 == pkg || index($3, pkg "@") == 1) { count++ }
       END { print count + 0 }' "$AUDIT_LOG" 2>/dev/null) || gate_count=0
     while IFS= read -r ts; do
@@ -2751,7 +2760,7 @@ host_allow_review_usage() {
         gate_last="$ts"
       fi
     done < <(awk -F' \\| ' -v pkg="$pkg" '
-      $4 == "GATE" && $6 == "HOST_ALLOW_OVERRIDE" \
+      $4 == "GATE" && ($6 == "HOST_ALLOW_OVERRIDE" || $6 == "ALLOWED_VIA_FOLLOWED_GRANT") \
         && ($3 == pkg || index($3, pkg "@") == 1) { print $1 }' "$AUDIT_LOG" 2>/dev/null)
   fi
   REVIEW_TIMES_USED=$(( exec_count + gate_count ))

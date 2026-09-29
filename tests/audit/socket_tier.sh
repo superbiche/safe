@@ -682,6 +682,153 @@ else
   fail 'the single-version pin is honored'
 fi
 
+# --- followed operator-signed grant (operator direction 2026-09-29) ----------
+# A pin this machine took from a verified signed export is the operator's own
+# decision: the exact version installs unattended (gate exit 16) whatever the
+# WARN cause, consent ask or pending score. The pin alone is never enough — the
+# follow ledger must list the identity and its recorded signer must still be
+# pinned. Fixture state mirrors what `safe run host-allow follow` writes
+# (tests/run/host_allow_follow.sh binds the real writer to this reader).
+FOLLOW_SIGNER="0123456789ABCDEF0123456789ABCDEF01234567"
+FOLLOW_GENERATION="2026-09-29T11:15:43+02:00"
+# seed_followed_grant <pinned-version> <ledger-json> <signers-json> <install-json>
+seed_followed_grant() {
+  local version="$1" ledger="$2" signers="$3" install="$4"
+  if [[ -n "$version" ]]; then
+    jq -n --arg v "$version" --arg g "$FOLLOW_GENERATION" \
+      '{packages: {fixture: {version: $v, sha: "x", ecosystem: "npm", added: "2026-09-28",
+        reason: "origin grant", followed_from: "rainbow", followed_generation: $g}}}' \
+      > "$CASE_RUN_CONFIG/host-allow.json"
+  else
+    printf '{"packages":{}}\n' > "$CASE_RUN_CONFIG/host-allow.json"
+  fi
+  [[ -z "$ledger" ]] || printf '%s\n' "$ledger" > "$CASE_RUN_CONFIG/follow-state.json"
+  jq -n --argjson signers "$signers" --argjson install "$install" \
+    '{install: $install, follow: {signers: $signers}}' > "$CASE_RUN_CONFIG/config.json"
+}
+follow_ledger() {
+  local applied="$1" signer="${2:-}"
+  jq -cn --arg g "$FOLLOW_GENERATION" --argjson applied "$applied" --arg signer "$signer" \
+    '{origins: {rainbow: ({accepted: $g, applied: $applied, replaced: [], refused: []}
+      + (if $signer == "" then {} else {signer: $signer} end))}}'
+}
+FRESH_AUTO='{"cooldown_days":3,"socket":{"mode":"auto","cache_ttl_days":7}}'
+
+# The Tuxedo case: a 0-day release (cooldown WARN, Socket consent pending in
+# the fresh window) with a followed grant installs non-interactively.
+prepare_case followed-grant-zero-day
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$FRESH_AUTO"
+run_check clean MOCK_RELEASE_FRESH=1 --gate install --op install
+expect_rc 16 'a followed grant installs a 0-day release without a terminal'
+expect_json '.verdict == "WARN" and (.warn_causes | index("release_too_new") != null)' \
+  'the followed pass leaves the WARN verdict and its cause disclosed'
+[[ "$(socket_calls)" == "0" ]] && pass 'a followed grant spends no Socket call' || fail 'a followed grant spends no Socket call'
+jq -e --arg s "$FOLLOW_SIGNER" '.packages["npm:fixture"]
+  | .version == "1.0.0" and .verdict == "ALLOWED_VIA_FOLLOWED_GRANT"
+    and (.reasons | index("followed_grant:rainbow") != null)
+    and (.reasons | index("followed_signer:" + $s) != null)
+    and (.reasons | index("release_too_new") != null)' "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1 \
+  && pass 'the receipt records origin, signer and the covered cause' || fail 'the receipt records origin, signer and the covered cause'
+tail -n 1 "$CASE_DATA/audit/audit-log.jsonl" 2>/dev/null | jq -e --arg s "$FOLLOW_SIGNER" --arg g "$FOLLOW_GENERATION" '
+  .event == "followed_grant" and .decision == "ALLOWED_VIA_FOLLOWED_GRANT" and .package == "fixture"
+  and .version == "1.0.0" and .origin == "rainbow" and .signer == $s and .generation == $g
+  and .covered == "warn"' >/dev/null 2>&1 \
+  && pass 'the verdict log records the followed grant' || fail 'the verdict log records the followed grant'
+grep -q "ALLOWED_VIA_FOLLOWED_GRANT (rainbow, $FOLLOW_SIGNER)" "$CASE_ERR" \
+  && pass 'the audit names origin and signer on stderr' || fail 'the audit names origin and signer on stderr'
+
+# Negative: the same package at another version is still gated.
+prepare_case followed-grant-other-version
+seed_followed_grant 2.0.0 "$(follow_ledger '["fixture@2.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$FRESH_AUTO"
+run_check clean MOCK_RELEASE_FRESH=1 --gate install --op install
+expect_rc 10 'a followed grant for another version does not cover this one'
+[[ ! -e "$CASE_RUN_CONFIG/install-known.json" ]] \
+  || ! jq -e '.packages["npm:fixture"].verdict == "ALLOWED_VIA_FOLLOWED_GRANT"' "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1 \
+  && pass 'no followed receipt is minted for the uncovered version' || fail 'no followed receipt is minted for the uncovered version'
+
+# A pin typed at this machine's terminal is not a followed grant.
+prepare_case followed-grant-local-pin
+seed_followed_grant 1.0.0 "" "[\"$FOLLOW_SIGNER\"]" "$FRESH_AUTO"
+jq 'del(.packages.fixture.followed_from, .packages.fixture.followed_generation)' \
+  "$CASE_RUN_CONFIG/host-allow.json" > "$CASE/ha.json" && mv "$CASE/ha.json" "$CASE_RUN_CONFIG/host-allow.json"
+run_check clean MOCK_RELEASE_FRESH=1 --gate install --op install
+expect_rc 15 'a local host-allow pin keeps the terminal requirement'
+
+# followed_from in the store is a label, not authority: without the ledger
+# identity the pass stays a terminal decision.
+prepare_case followed-grant-store-label-only
+seed_followed_grant 1.0.0 "" "[\"$FOLLOW_SIGNER\"]" "$FRESH_AUTO"
+run_check clean MOCK_RELEASE_FRESH=1 --gate install --op install
+expect_rc 15 'a followed_from label without a ledger identity is not a followed grant'
+prepare_case followed-grant-dropped-from-generation
+seed_followed_grant 1.0.0 "$(follow_ledger '[]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$FRESH_AUTO"
+run_check clean MOCK_RELEASE_FRESH=1 --gate install --op install
+expect_rc 15 'an identity absent from the accepted generation is not a followed grant'
+
+# Signer withdrawal reaches grants already taken: an unpinned or unrecorded
+# signer falls back to the terminal.
+prepare_case followed-grant-signer-unpinned
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" '[]' "$FRESH_AUTO"
+run_check clean MOCK_RELEASE_FRESH=1 --gate install --op install
+expect_rc 15 'a grant whose signer is no longer pinned keeps the terminal requirement'
+prepare_case followed-grant-signer-other
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" '["89ABCDEF0123456789ABCDEF0123456789ABCDEF"]' "$FRESH_AUTO"
+run_check clean MOCK_RELEASE_FRESH=1 --gate install --op install
+expect_rc 15 'a grant signed by a key other than the pinned one keeps the terminal requirement'
+prepare_case followed-grant-signer-unrecorded
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]')" "[\"$FOLLOW_SIGNER\"]" "$FRESH_AUTO"
+run_check clean MOCK_RELEASE_FRESH=1 --gate install --op install
+expect_rc 15 'a ledger with no recorded signer keeps the terminal requirement'
+prepare_case followed-grant-signers-malformed
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\",\"DEADBEEF\"]" "$FRESH_AUTO"
+run_check clean MOCK_RELEASE_FRESH=1 --gate install --op install
+expect_rc 15 'a malformed follow.signers list authorizes nothing'
+prepare_case followed-grant-signer-case
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"${FOLLOW_SIGNER,,}\"]" "$FRESH_AUTO"
+run_check clean MOCK_RELEASE_FRESH=1 --gate install --op install
+expect_rc 16 'fingerprint spelling case does not withdraw a followed grant'
+
+# Removing the local pin withdraws the grant even though the ledger keeps the
+# applied identity (the ledger is replay memory, the store is the grant).
+prepare_case followed-grant-local-pin-removed
+seed_followed_grant "" "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$FRESH_AUTO"
+run_check clean MOCK_RELEASE_FRESH=1 --gate install --op install
+expect_rc 10 'a removed local pin withdraws the followed grant (WARN)'
+run_check clean MOCK_RELEASE_FRESH=1 MOCK_RELEASE_AGE="4 days ago" --gate install
+expect_rc 13 'a removed local pin withdraws the followed grant (consent ask)'
+
+# The grant covers the GO termini too: the consent ask (past the cooldown,
+# inside the Socket window) and a still-pending score.
+prepare_case followed-grant-consent
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$FRESH_AUTO"
+run_check clean MOCK_RELEASE_FRESH=1 MOCK_RELEASE_AGE="4 days ago" --gate install
+expect_rc 16 'a followed grant answers the fresh-release consent ask'
+[[ "$(socket_calls)" == "0" ]] && pass 'the followed consent pass spends no Socket call' || fail 'the followed consent pass spends no Socket call'
+jq -e '.packages["npm:fixture"] | .verdict == "ALLOWED_VIA_FOLLOWED_GRANT" and (.reasons | index("covered:socket_consent") != null)' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1 \
+  && pass 'the consent pass receipt is never a clean GO' || fail 'the consent pass receipt is never a clean GO'
+prepare_case followed-grant-pending
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" \
+  '{"cooldown_days":3,"socket":{"mode":"always","cache_ttl_days":7}}'
+run_check pending MOCK_RELEASE_FRESH=1 MOCK_COOLDOWN_FIX=1 SAFE_AUDIT_SOCKET_TIMEOUT=1 SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT=1 --gate install
+expect_rc 16 'a followed grant covers a pending Socket score'
+jq -e '.packages["npm:fixture"] | .verdict == "ALLOWED_VIA_FOLLOWED_GRANT" and (.reasons | index("covered:socket_pending") != null)' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1 \
+  && pass 'the pending pass receipt is never a clean GO' || fail 'the pending pass receipt is never a clean GO'
+
+# A clean GO needs no grant and stays green; a BLOCK is never cleared by one.
+prepare_case followed-grant-clean-go-stays-green
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$FRESH_AUTO"
+run_check clean --gate install
+expect_rc 0 'a clean GO with a followed grant stays a green exit 0'
+jq -e '.packages["npm:fixture"].verdict == "GO"' "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1 \
+  && pass 'the clean GO keeps its clean receipt' || fail 'the clean GO keeps its clean receipt'
+prepare_case followed-grant-block
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" \
+  '{"cooldown_days":0,"socket":{"mode":"always","cache_ttl_days":7}}'
+run_check malware --gate install --op install
+expect_rc 20 'a followed grant never clears a BLOCK'
+
 # --- required-version derivation is deny-by-default (Fibery #106, review F1) --
 # The host-allow required set must treat EVERY non per-version cause as
 # aggregate — requiring the whole resolved set — so a primary-only pin can never

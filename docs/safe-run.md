@@ -273,10 +273,11 @@ unverifiable integrity are skipped. `--dry-run` verifies and validates everythin
 including replacement plans across source files, without changing persistent state.
 
 A local `follow-state.json` beside the guard-selected trust store records each
-origin's highest accepted `exported_at` and the identities already applied:
+origin's highest accepted `exported_at`, the verified primary fingerprint that
+signed it, and the identities already applied:
 
 ```json
-{"origins":{"rainbow":{"accepted":"2026-09-16T14:00:00Z","applied":["fresh-pkg@1.2.3"],"replaced":["fresh-pkg@1.0.0->1.2.3"],"refused":["other-pkg@2.0.0"]}}}
+{"origins":{"rainbow":{"accepted":"2026-09-16T14:00:00Z","applied":["fresh-pkg@1.2.3"],"replaced":["fresh-pkg@1.0.0->1.2.3"],"refused":["other-pkg@2.0.0"],"signer":"<40-or-64-hex primary fingerprint>"}}}
 ```
 
 Timestamps are real ISO-8601 whole-second instants with an explicit timezone;
@@ -332,7 +333,8 @@ never overwrites a different pin. Resolve those pins with `host-allow update`.
 Synchronize only signed exports and signatures, **not** the live trust store or
 signer configuration. A timer may run `follow` unattended; export remains a
 separate operator gesture. Removing a signer stops future imports but does not
-remove grants already accepted. The freshness ledger prevents replay of accepted
+remove grants already accepted; it does withdraw their unattended install pass
+(see below). The freshness ledger prevents replay of accepted
 generations, not cross-origin withdrawal: a newer statement or a statement from
 another authorized origin may still include a removed grant. Retire those
 exports or unpin their signer when withdrawing trust across the fleet. Existing
@@ -342,6 +344,45 @@ Protect the signing key (for example with a hardware token requiring touch).
 TTY checks and user-writable configuration retain safe's existing cooperative
 agent boundary; they are not an OS-level defense against a hostile same-user
 process.
+
+#### Followed grants at the install gate
+
+A package accepted on a machine that signs an export is accepted fleet-wide
+(operator direction 2026-09-29). Once `follow` has taken a grant, the install
+gate treats it as the operator's own confirmation for that exact
+`name@version`: the install proceeds unattended (gate exit 16) where a plain
+host-allow pass, a fresh-release consent ask or a pending Socket score would
+ask for a terminal (exits 15, 13, 14). Every WARN cause is covered — advisory
+findings, cooldown, 0-day release, Socket states, audit-tier outages. No
+Socket call is spent on the consent path.
+
+The pin alone is not the grant. The gate requires all of:
+
+- the local host-allow entry matches every resolved version (removing the
+  local pin withdraws the grant, even though the ledger keeps the identity);
+- `follow-state.json` lists `name@version` in an origin's `applied` array —
+  the identity is part of that origin's currently accepted signed statement;
+- the `signer` recorded for that origin (the verified primary fingerprint of
+  the accepted generation) is still pinned in `follow.signers`.
+
+Anything else keeps the terminal requirement: another version, a pin typed at
+this machine's terminal, a package the origin dropped from a newer generation,
+an unrecorded signer, or a signer removed with `follow-signer remove` — which
+therefore withdraws unattended passes for grants already taken, not only future
+imports. A BLOCK is never cleared (exit 104). The `followed_from` field in the
+store is a label for reports, not authority.
+
+Ledgers written before signers were recorded gain one on the next verified
+`follow` run of the same generation; until then their grants keep asking for a
+terminal. The pass is never green: the gate logs `ALLOWED_VIA_FOLLOWED_GRANT`
+(`INSTALL_UNATTENDED_FOLLOWED_GRANT` for the `safe install` command), the
+receipt carries that verdict with `followed_grant:<origin>` and
+`followed_signer:<fingerprint>`, and the verdict log gains a `followed_grant`
+event with origin, generation and signer. `host-allow review` counts these
+passes as usage of the entry.
+
+The exporting machine gains nothing from its own export: its pins were typed
+at its terminal and keep the terminal requirement there.
 
 ## Safe release follow
 

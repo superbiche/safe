@@ -218,4 +218,37 @@ grep -q "host-allow add cowsay==6.1 --reason .*--ecosystem python" "$ARGV_LOG" \
   || fail "F1(bin/safe python): expected --ecosystem python: $(cat "$ARGV_LOG")"
 pass "bin/safe grant(python): appends --ecosystem python"
 
+# --- followed operator-signed grant (gate exit 16, 2026-09-29 direction) ------
+# The wrapper lane and the mise lane both proceed with NO terminal and no
+# confirm; the same lanes still refuse 102 on a plain host-allow/tolerated pass
+# (exit 15) — the Tuxedo `mise install` refusal, and its fix, side by side.
+CONFIRM_LOG="$tmp/followed-confirms"
+safe_gate_operator_terminal()      { return 1; }
+safe_gate_install_is_interactive() { return 1; }
+safe_gate_confirm_tolerated()      { printf 'asked\n' >>"$CONFIRM_LOG"; return 0; }
+safe_gate_mise_apply_overlay()     { :; }
+
+: >"$LOGF"; : >"$CONFIRM_LOG"
+safe_gate_run_audit() { return 16; }
+rc="$(run_gate fresh@0.84.0 npm)"
+[[ "$rc" == "0" ]] || fail "followed grant: wrapper lane expected rc 0, got $rc"
+[[ "$(last_log)" == "ALLOWED_VIA_FOLLOWED_GRANT" ]] || fail "followed grant: wrapper lane logged $(last_log)"
+pass "followed grant: the wrapper lane proceeds unattended under its own token"
+
+: >"$LOGF"
+rc=0; safe_gate_mise_check_with_env '' fresh@0.84.0 npm >/dev/null 2>&1 || rc=$?
+[[ "$rc" == "0" ]] || fail "followed grant: mise lane expected rc 0, got $rc"
+[[ "$(last_log)" == "ALLOWED_VIA_FOLLOWED_GRANT" ]] || fail "followed grant: mise lane logged $(last_log)"
+[[ ! -s "$CONFIRM_LOG" ]] || fail "followed grant: a confirm was consulted"
+pass "followed grant: mise install proceeds without a terminal or a confirm"
+
+: >"$LOGF"
+safe_gate_run_audit() { return 15; }
+rc=0; safe_gate_mise_check_with_env '' fresh@0.84.1 npm >/dev/null 2>&1 || rc=$?
+[[ "$rc" == "102" ]] || fail "plain host-allow pass: mise lane expected rc 102, got $rc"
+[[ "$(last_log)" == "REFUSED_TOLERATED_NONTTY" ]] || fail "plain host-allow pass: mise lane logged $(last_log)"
+rc="$(run_gate fresh@0.84.1 npm)"
+[[ "$rc" == "102" ]] || fail "plain host-allow pass: wrapper lane expected rc 102, got $rc"
+pass "a host-allow pass that is not a followed grant still refuses 102 in both lanes"
+
 printf 'all gate adverse-warn override checks passed\n'

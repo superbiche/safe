@@ -8012,6 +8012,81 @@ host_allow_matches_resolved() {
   return 0
 }
 
+# Followed operator-signed grant (operator direction 2026-09-29): a host-allow
+# pin this machine took from a verified signed export is the operator's own
+# decision, made once on the exporting machine — the follower installs that
+# exact version unattended (gate exit 16) instead of asking again (13/14/15).
+# The pin alone is not enough; all of these must hold:
+#   - the local host-allow entry matches (the caller ran
+#     host_allow_matches_resolved; removing the local pin withdraws the grant);
+#   - the follow ledger lists name@version as applied for an origin, i.e. the
+#     identity is part of that origin's currently accepted signed statement;
+#   - the signer recorded for that origin is still pinned in follow.signers
+#     (`follow-signer remove` withdraws every unattended pass it authorized).
+# A local TTY pin, an unrecorded signer or an unpinned one keeps the terminal
+# requirement. Sets FOLLOWED_GRANT_{ORIGIN,GENERATION,SIGNER}.
+followed_grant_ledger_file() {
+  printf '%s/follow-state.json' "$(dirname "$(trust_store_file host-allow.json)")"
+}
+
+followed_grant_lookup() {
+  local name="$1" version="$2"
+  FOLLOWED_GRANT_ORIGIN="" FOLLOWED_GRANT_GENERATION="" FOLLOWED_GRANT_SIGNER=""
+  [[ -n "$name" && -n "$version" ]] || return 1
+  local ha_file state_file config_file grant
+  ha_file="$(trust_store_file host-allow.json)"
+  state_file="$(followed_grant_ledger_file)"
+  config_file="$(trust_store_file config.json)"
+  [[ -f "$ha_file" && -f "$state_file" && -f "$config_file" ]] || return 1
+  grant=$(jq -cn --arg p "$name" --arg id "$name@$version" \
+    --slurpfile store "$ha_file" --slurpfile state "$state_file" --slurpfile config "$config_file" '
+    ($config[0].follow.signers // []) as $raw
+    | (if ($raw | type) == "array"
+          and ($raw | all(.[]; type == "string" and test("^([A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})$")))
+       then ($raw | map(ascii_upcase)) else [] end) as $signers
+    | ($store[0].packages[$p].followed_from // "") as $preferred
+    | [ ($state[0].origins // {}) | to_entries[]
+        | select((.value | type) == "object")
+        | select((.value.applied | type) == "array" and (.value.applied | index($id)) != null)
+        | select((.value.accepted | type) == "string")
+        | select((.value.signer | type) == "string")
+        | select((.value.signer | ascii_upcase) as $f | $signers | index($f) != null)
+        | {origin: .key, generation: .value.accepted, signer: (.value.signer | ascii_upcase)} ]
+    | sort_by(.origin)
+    | (map(select(.origin == $preferred)) + .)[0] // empty' 2>/dev/null) || return 1
+  [[ -n "$grant" ]] || return 1
+  FOLLOWED_GRANT_ORIGIN=$(jq -r '.origin' <<<"$grant")
+  FOLLOWED_GRANT_GENERATION=$(jq -r '.generation' <<<"$grant")
+  FOLLOWED_GRANT_SIGNER=$(jq -r '.signer' <<<"$grant")
+  [[ -n "$FOLLOWED_GRANT_ORIGIN" && -n "$FOLLOWED_GRANT_SIGNER" ]]
+}
+
+# Receipt, verdict-log event and the stderr line for one followed-grant pass.
+# $5 names what the grant stood in for (warn|socket_consent|socket_pending).
+followed_grant_record() {
+  local ecosystem="$1" name="$2" version="$3" causes_json="$4" covered="$5" receipt_evidence="$6"
+  mark_install_known "$ecosystem" "$name" "$version" "ALLOWED_VIA_FOLLOWED_GRANT" \
+    "$(jq -cn --argjson causes "$causes_json" --arg covered "$covered" \
+      --arg origin "$FOLLOWED_GRANT_ORIGIN" --arg signer "$FOLLOWED_GRANT_SIGNER" \
+      '["followed_grant:" + $origin, "followed_signer:" + $signer, "covered:" + $covered] + $causes')" \
+    "$receipt_evidence"
+  local audit_log_file="${SAFE_AUDIT_AUDIT_LOG:-$DATA_DIR/audit-log.jsonl}"
+  if mkdir -p "$(dirname "$audit_log_file")" 2>/dev/null; then
+    jq -cn --arg ts "$(now_iso)" --arg safe_version "${SAFE_VERSION}" \
+      --arg eco "$ecosystem" --arg name "$name" --arg version "$version" \
+      --arg origin "$FOLLOWED_GRANT_ORIGIN" --arg generation "$FOLLOWED_GRANT_GENERATION" \
+      --arg signer "$FOLLOWED_GRANT_SIGNER" --arg covered "$covered" \
+      --argjson causes "$causes_json" '
+      {ts: $ts, event: "followed_grant", safe_version: $safe_version,
+       ecosystem: $eco, package: $name, version: $version,
+       decision: "ALLOWED_VIA_FOLLOWED_GRANT", covered: $covered,
+       origin: $origin, generation: $generation, signer: $signer,
+       warn_causes: $causes}' >> "$audit_log_file" 2>/dev/null || true
+  fi
+  printf '[safe audit] ALLOWED_VIA_FOLLOWED_GRANT (%s, %s): %s@%s is covered by the operator-signed grant of generation %s; installing without a second confirmation\n' \
+    "$FOLLOWED_GRANT_ORIGIN" "$FOLLOWED_GRANT_SIGNER" "$name" "$version" "$FOLLOWED_GRANT_GENERATION" >&2
+}
+
 # Derive the exact artifact versions a host-allow would override, deny-by-
 # default. OSV retains per-version evidence, so the ONLY per-version WARN cause
 # is `osv_affecting` — it requires just the affected versions ($osv_versions).
@@ -8984,7 +9059,27 @@ package_audit_command() {
     auto_allow=$(jq -r 'if .auto_allow == false then "false" else "true" end' <<<"$policy")
     case "$verdict" in
       GO)
-        if (( socket_consent_required )); then
+        # A followed operator-signed grant stands in for the two GO termini
+        # that otherwise need a terminal (consent ask, pending score): the
+        # operator decided on the exporting machine (2026-09-29 direction).
+        # The ledger probe comes first so a machine that follows nothing pays
+        # no store read and prints no trust-root notice on this path.
+        local followed_go=0
+        if (( socket_consent_required || socket_pending )) && (( resolution_ok )) \
+          && [[ -f "$(followed_grant_ledger_file)" ]]; then
+          local -a followed_go_versions=()
+          mapfile -t followed_go_versions < <(jq -r '.[]' <<<"$resolved_versions_json")
+          (( ${#followed_go_versions[@]} > 0 )) || followed_go_versions=("$primary_version")
+          HOST_ALLOW_RESOLVED_VERSION=""
+          if host_allow_matches_resolved "$ecosystem" "$PKG_NAME" "${followed_go_versions[@]}" \
+            && followed_grant_lookup "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION"; then
+            followed_go=1
+          fi
+        fi
+        if (( followed_go )); then
+          followed_grant_record "$ecosystem" "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION" "$warn_causes_json" \
+            "$( (( socket_consent_required )) && printf socket_consent || printf socket_pending )" "$result_json"
+        elif (( socket_consent_required )); then
           # The audit is otherwise GO, but a live Socket check awaits the
           # operator's consent (2026-09-22 scope ruling). Exit 13 hands the
           # ask to the gate — Y re-runs the audit with the consent channel
@@ -9025,7 +9120,9 @@ package_audit_command() {
           printf '[safe audit] %s@%s declares install scripts — they will be SKIPPED (global ignore-scripts); if the tool needs them: safe run scripts-allow add %s@%s --reason "..." (operator, TTY)\n' \
             "$PKG_NAME" "$primary_version" "$PKG_NAME" "$primary_version" >&2
         fi
-        if (( socket_consent_required )); then
+        if (( followed_go )); then
+          gate_exit=16
+        elif (( socket_consent_required )); then
           : # gate_exit stays 13 (set above)
         elif (( socket_pending )); then
           # GO with a still-incomplete Socket score is NOT all-green evidence
@@ -9072,10 +9169,19 @@ package_audit_command() {
           "${host_allow_required_versions[@]}"; then
           printf '[safe audit] host-allow entry %s@%s matches every warned resolved version; allowing\n' \
             "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION" >&2
-          # Gate exit 15 (2026-09-22 direction): a host-allowed WARN pass is a
-          # deliberate grant, not all-green evidence — unattended shells
-          # refuse 102 and the terminal confirms as before.
-          gate_exit=15
+          if followed_grant_lookup "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION"; then
+            # Gate exit 16 (2026-09-29 direction): the pin came from a verified
+            # operator-signed export, so the operator already confirmed this
+            # exact version — every WARN cause is covered, no terminal.
+            followed_grant_record "$ecosystem" "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION" \
+              "$warn_causes_json" warn "$result_json"
+            gate_exit=16
+          else
+            # Gate exit 15 (2026-09-22 direction): a host-allowed WARN pass is a
+            # deliberate grant, not all-green evidence — unattended shells
+            # refuse 102 and the terminal confirms as before.
+            gate_exit=15
+          fi
         elif [[ "$auto_allow" == "true" ]] && (( resolution_ok )) && (( aff_count == 0 )) \
           && [[ "$block_line" == PASS* ]] && (( ${#warn_causes[@]} > 0 )) \
           && [[ "$(jq -r --argjson causes "$warn_causes_json" '((.auto_allow_tolerate // []) | map(tostring)) as $tol | $causes | all(. as $c | $tol | index($c) != null)' <<<"$policy")" == "true" ]]; then
