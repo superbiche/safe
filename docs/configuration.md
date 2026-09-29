@@ -160,6 +160,7 @@ pass and warnings under `environment.release_follow`.
     "block_severities": ["critical"],
     "cooldown_days": 3,
     "cooldown_security_fix": "exempt",
+    "reuse": { "enabled": false },
     "socket": {
       "mode": "auto",
       "cache_ttl_days": 7,
@@ -186,6 +187,14 @@ pass and warnings under `environment.release_follow`.
   `cargo-registry:<name>`, and a disabled packagist is
   `local:packagist-disabled`.
 - `auto_allow_ttl_days`: freshness window for the offline/timeout fallback.
+- `reuse.enabled`: per-host rule for `safe install --reuse` (default `false`).
+  `true` lets the reuse of an installed `vendor/` from another checkout of the
+  same repository run unattended, agents included, whatever the lockfile audit
+  says; the outcome is recorded, never turned into a pass. `false` keeps each
+  reuse an operator decision at an interactive terminal (exit 102 otherwise).
+  Only the JSON boolean `true` enables it, and only from the canonical run
+  store: a redirected config root needs `SAFE_RUN_TRUST_OVERRIDE`. See
+  [reuse of installed dependencies](command-reference.md#reuse-of-installed-dependencies).
 - `block_severities`: affecting-advisory severities that hard-BLOCK instead
   of WARN.
 - `cooldown_days`: WARN when any resolved version was published fewer than

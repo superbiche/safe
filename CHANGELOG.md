@@ -20,6 +20,20 @@
   followed identity in another ecosystem than the local pin is a conflict,
   never "already present".
 - `host-allow review` counts followed-grant installs as usage of the entry.
+- Add `safe install --reuse [--reuse-from <checkout>] [--dry-run]` (operator
+  ruling 2026-09-30): fill a worktree's missing Composer `vendor/` from another
+  checkout of the same repository whose `composer.lock` is byte-identical.
+  Reuse of resident bytes is not new package ingress: it needs no network, no
+  package manager and no lifecycle script, and it is allowed whatever the
+  lockfile audit says. The audit is recorded with the copy and never becomes a
+  pass: an adverse one ends as `reused-existing-vendor-with-known-risks`, an
+  unavailable one as `reused-existing-vendor-unaudited`. Provenance, lockfile,
+  installed inventory, symlinks and platform are verified first; any mismatch
+  refuses with exit 100 and copies nothing. The normal install refusal is
+  unchanged.
+- Add the per-host rule `install.reuse.enabled` (default `false`): `true` lets
+  reuse run unattended; otherwise the operator confirms each reuse at a
+  terminal and other sessions refuse 102.
 
 ## 1.66.1 - 2026-09-22
 

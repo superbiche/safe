@@ -9,6 +9,7 @@ safe install [--project] [--yes]
 safe install [-g|--global] [--yes] <pkg> [...]
 safe install --manager npm|pnpm|yarn|bun|composer -g [--yes] [--trust-host] <pkg> [...]
 safe install --sandbox [--allow-scripts] <pkg> [...]
+safe install --reuse [--reuse-from <checkout>] [--dry-run]
 safe vendor update --name NAME --path PATH --reason TEXT -- COMMAND...
 safe release follow [--dry-run] [--checkout <dir>]
 safe setup [<machine> | --all | --machine <csv>]
@@ -225,6 +226,65 @@ arguments or with `-g`/`--host`/`--manager`/`--trust-host`/`--sandbox`; those
 combinations are a usage error rather than a silent audit-only success. For the
 same reason auto-detection only applies to a bare `safe install`: with any
 install flag present and no package named, the usage error stands.
+
+### Reuse of installed dependencies
+
+A fresh git worktree has no `vendor/`. A normal `composer install` there is new
+package ingress and is refused when the unchanged `composer.lock` carries
+critical advisories — even though the exact same tree already sits in the main
+checkout. `safe install --reuse` covers that case as its own operation: it
+copies the resident tree and never turns an adverse audit into a pass.
+
+```bash
+cd <worktree>/<project>
+safe install --reuse --dry-run     # verify and report, copy nothing
+safe install --reuse               # source: first other checkout with the same lockfile
+safe install --reuse --reuse-from /path/to/main/checkout
+```
+
+Verified before anything is copied; any failure refuses with exit 100 and
+leaves the target untouched:
+
+| Check | Refused when |
+| --- | --- |
+| Provenance | the source is not the same project path in a checkout of the same git repository, or its `vendor/` is a symlink or belongs to another user |
+| Lockfile | `composer.lock` is not byte-identical (SHA-256) in both checkouts |
+| Inventory | `vendor/composer/installed.json` does not list exactly the lockfile's packages (dev packages count when the source was installed with them), or is not in the Composer 2 format |
+| Tree | a listed package directory is missing or outside the project |
+| Links | a symlink is absolute or would leave the project once copied |
+| Platform | the `php` that runs in the target differs in version or extensions from the one in the source, or Composer's generated platform check fails under it |
+| Target | `vendor/` already exists and is not empty — reuse never overwrites |
+
+The copy uses `cp -a --reflink=auto`: no hardlinks, so a test run that rewrites
+a vendored file never reaches the source checkout. No network access, no
+package manager and no lifecycle script runs. A root `autoload` section that
+changed in the worktree is not regenerated; run
+`composer dump-autoload --no-scripts` when the branch changed it.
+
+What reuse does **not** establish is file integrity: the contents are taken as
+they are in the source checkout, and the receipt says so.
+
+The lockfile audit (`safe audit repo-audit . --deps-only`) runs for the record
+and decides nothing:
+
+| Inherited audit | Status line | Gate log decision |
+| --- | --- | --- |
+| verdict `GO`, no critical finding | `reused-existing-vendor` | `REUSED_EXISTING` |
+| verdict `WARN` or `BLOCK`, or any critical finding | `reused-existing-vendor-with-known-risks` | `REUSED_EXISTING_WITH_KNOWN_RISKS` |
+| the audit could not run | `reused-existing-vendor-unaudited` | `REUSED_EXISTING_UNAUDITED` |
+
+The exit code is 0 in all three cases; the status line and the receipt under
+`~/.local/share/safe/install/reuse/` carry the outcome, source checkout,
+lockfile hash, package count and inherited finding counts.
+
+Same-machine reuse is a per-host rule. With `install.reuse.enabled: true` in
+`~/.config/safe/run/config.json` it runs unattended, agents included. Without
+it (the default) the operator confirms each reuse at an interactive terminal,
+and a non-interactive or agent session refuses with exit 102. `--dry-run` works
+either way.
+
+Only Composer projects are covered. `--reuse` takes no package and cannot be
+combined with `--project`, `--sandbox` or the host install flags.
 
 `safe install --sandbox ...` preserves the isolated `safe run install` workflow.
 
