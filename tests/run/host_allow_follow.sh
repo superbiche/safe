@@ -126,8 +126,10 @@ jq -e --arg f "$fingerprint" '.origins.rainbow.signer == $f and .origins.rainbow
 gate_followed_grant() (
   trust_store_file() { printf '%s/%s' "$SAFE_RUN_CONFIG_DIR" "$1"; }
   # shellcheck disable=SC1090
+  source <(sed -n '/^host_allow_canonical_eco() {$/,/^}$/p' "$ROOT/bin/safe-audit")
+  # shellcheck disable=SC1090
   source <(sed -n '/^followed_grant_ledger_file() {$/,/^# Receipt, verdict-log event/p' "$ROOT/bin/safe-audit")
-  followed_grant_lookup "$1" "$2" || exit 1
+  followed_grant_lookup "${3:-npm}" "$1" "$2" || exit 1
   printf '%s %s %s\n' "$FOLLOWED_GRANT_ORIGIN" "$FOLLOWED_GRANT_SIGNER" "$FOLLOWED_GRANT_GENERATION"
 )
 followed_generation=$(jq -r '.exported_at' "$export_file")
@@ -155,6 +157,71 @@ gate_followed_grant fresh-pkg 1.2.3 >/dev/null || fail 'backfilled ledger is not
 expect_rc 0 "$SAFE_RUN" host-allow follow
 grep -q 'already at the current generation' "$tmp/output" || fail 'steady state after backfill is not a quiet no-op'
 pass 'a pre-signer ledger gains the signer on the next verified run; dry-run writes nothing'
+
+# Review r1 regressions: unattended authority is bound to the ecosystem the
+# signed statement named (F1) and to the key that signed the statement that
+# carries the identity (F2). Each case restores store, ledger and config.
+cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/r1-store.json"
+cp "$SAFE_RUN_CONFIG_DIR/follow-state.json" "$tmp/r1-state.json"
+cp "$SAFE_RUN_CONFIG_DIR/config.json" "$tmp/r1-config.json"
+r1_restore() {
+  cp "$tmp/r1-store.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+  cp "$tmp/r1-state.json" "$SAFE_RUN_CONFIG_DIR/follow-state.json"
+  cp "$tmp/r1-config.json" "$SAFE_RUN_CONFIG_DIR/config.json"
+  rm -rf "$tmp/r1-in"; mkdir "$tmp/r1-in"
+}
+r1_sign() { # <key> <jq filter over the original export>
+  jq "$2" "$export_file" > "$tmp/r1-in/host-allow.rainbow.json"
+  gpg --no-options --batch --yes --armor --local-user "$1" --detach-sign \
+    --output "$tmp/r1-in/host-allow.rainbow.json.asc" -- "$tmp/r1-in/host-allow.rainbow.json" > "$tmp/sign.log" 2>&1 || fail 'fixture signing failed'
+}
+r1_later=$(date -u -d "$(jq -r '.exported_at' "$export_file") + 30 seconds" +%Y-%m-%dT%H:%M:%SZ)
+jq -e '.origins.rainbow.granted == ["npm:fresh-pkg@1.2.3"]' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null ||
+  fail 'the ledger does not bind the grant to its ecosystem'
+
+# F1: a Python grant never vouches for the npm pin of the same name@version.
+r1_restore
+r1_sign "$fingerprint" ".exported_at = \"$r1_later\" | .packages[\"fresh-pkg\"].ecosystem = \"python\""
+expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/r1-in"
+grep -q 'CONFLICT fresh-pkg: local pin is npm' "$tmp/output" || fail 'cross-ecosystem present was not a conflict'
+! gate_followed_grant fresh-pkg 1.2.3 npm >/dev/null || fail 'a Python grant authorized the npm pin'
+! gate_followed_grant fresh-pkg 1.2.3 python >/dev/null || fail 'a conflicting Python grant was recorded as authority'
+# F1 variant: a pin re-added locally in another ecosystem borrows nothing.
+r1_restore
+jq '.packages["fresh-pkg"].ecosystem = "python"' "$tmp/r1-store.json" > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+! gate_followed_grant fresh-pkg 1.2.3 python >/dev/null || fail 'a local re-add in another ecosystem borrowed the npm grant'
+# Aliases canonicalize: a bun statement is an npm grant.
+r1_restore
+r1_sign "$fingerprint" ".exported_at = \"$r1_later\" | .packages[\"fresh-pkg\"].ecosystem = \"bun\""
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/r1-in"
+gate_followed_grant fresh-pkg 1.2.3 npm >/dev/null || fail 'a bun statement did not grant the npm identity'
+pass 'followed authority is bound to the canonical ecosystem of the signed statement'
+
+# F2: another pinned key signing an equal-generation statement WITHOUT the
+# identity does not inherit it.
+r1_restore
+gpg --no-options --batch --pinentry-mode loopback --passphrase '' \
+  --quick-generate-key 'Safe fixture rotation <rotation@example.invalid>' ed25519 sign 0 > "$tmp/keygen.log" 2>&1 || fail 'rotation key generation failed'
+rotation_fingerprint=$(gpg --no-options --batch --with-colons --list-keys 'rotation@example.invalid' 2>/dev/null | awk -F: '$1 == "fpr" {print $10; exit}')
+pty_run "$SAFE_RUN" host-allow follow-signer add "$rotation_fingerprint" > "$tmp/output" 2>&1 || fail 'rotation signer add failed'
+pty_run "$SAFE_RUN" host-allow follow-signer remove "$fingerprint" > "$tmp/output" 2>&1 || fail 'original signer remove failed'
+! gate_followed_grant fresh-pkg 1.2.3 >/dev/null || fail 'an unpinned signer still authorized the grant'
+r1_sign "$rotation_fingerprint" '.packages = {}'
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/r1-in"
+jq -e --arg f "$rotation_fingerprint" '.origins.rainbow | .signer == $f and .granted == [] and .applied == ["fresh-pkg@1.2.3"]' \
+  "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'the rotation ledger differs'
+! gate_followed_grant fresh-pkg 1.2.3 >/dev/null || fail 'an equal-generation statement without the identity inherited it'
+# Legacy backfill: a pre-signer ledger gains authority only for identities the
+# verified statement actually carries.
+r1_restore
+jq 'del(.origins.rainbow.signer, .origins.rainbow.granted)' "$tmp/r1-state.json" > "$SAFE_RUN_CONFIG_DIR/follow-state.json"
+r1_sign "$fingerprint" '.packages = {}'
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/r1-in"
+! gate_followed_grant fresh-pkg 1.2.3 >/dev/null || fail 'a legacy backfill from a statement without the identity granted it'
+r1_restore
+rm -rf "$tmp/r1-in"
+gate_followed_grant fresh-pkg 1.2.3 >/dev/null || fail 'restoring the ledger did not restore the grant'
+pass 'a signer or legacy backfill grants only identities its own verified statement carries'
 
 # Per-case directory keeps invalid siblings from contaminating other tests.
 mkdir "$tmp/incoming"

@@ -8019,8 +8019,10 @@ host_allow_matches_resolved() {
 # The pin alone is not enough; all of these must hold:
 #   - the local host-allow entry matches (the caller ran
 #     host_allow_matches_resolved; removing the local pin withdraws the grant);
-#   - the follow ledger lists name@version as applied for an origin, i.e. the
-#     identity is part of that origin's currently accepted signed statement;
+#   - the follow ledger lists name@version as applied for an origin, and its
+#     `granted` list holds ecosystem:name@version — written by the last
+#     verified run from that statement's own contents, so the grant is bound to
+#     the ecosystem the signed statement named and to the key that signed it;
 #   - the signer recorded for that origin is still pinned in follow.signers
 #     (`follow-signer remove` withdraws every unattended pass it authorized).
 # A local TTY pin, an unrecorded signer or an unpinned one keeps the terminal
@@ -8030,15 +8032,16 @@ followed_grant_ledger_file() {
 }
 
 followed_grant_lookup() {
-  local name="$1" version="$2"
+  local ecosystem="$1" name="$2" version="$3"
   FOLLOWED_GRANT_ORIGIN="" FOLLOWED_GRANT_GENERATION="" FOLLOWED_GRANT_SIGNER=""
-  [[ -n "$name" && -n "$version" ]] || return 1
+  [[ -n "$ecosystem" && -n "$name" && -n "$version" ]] || return 1
   local ha_file state_file config_file grant
   ha_file="$(trust_store_file host-allow.json)"
   state_file="$(followed_grant_ledger_file)"
   config_file="$(trust_store_file config.json)"
   [[ -f "$ha_file" && -f "$state_file" && -f "$config_file" ]] || return 1
   grant=$(jq -cn --arg p "$name" --arg id "$name@$version" \
+    --arg gid "$(host_allow_canonical_eco "$ecosystem"):$name@$version" \
     --slurpfile store "$ha_file" --slurpfile state "$state_file" --slurpfile config "$config_file" '
     ($config[0].follow.signers // []) as $raw
     | (if ($raw | type) == "array"
@@ -8048,6 +8051,7 @@ followed_grant_lookup() {
     | [ ($state[0].origins // {}) | to_entries[]
         | select((.value | type) == "object")
         | select((.value.applied | type) == "array" and (.value.applied | index($id)) != null)
+        | select((.value.granted | type) == "array" and (.value.granted | index($gid)) != null)
         | select((.value.accepted | type) == "string")
         | select((.value.signer | type) == "string")
         | select((.value.signer | ascii_upcase) as $f | $signers | index($f) != null)
@@ -9072,7 +9076,7 @@ package_audit_command() {
           (( ${#followed_go_versions[@]} > 0 )) || followed_go_versions=("$primary_version")
           HOST_ALLOW_RESOLVED_VERSION=""
           if host_allow_matches_resolved "$ecosystem" "$PKG_NAME" "${followed_go_versions[@]}" \
-            && followed_grant_lookup "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION"; then
+            && followed_grant_lookup "$ecosystem" "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION"; then
             followed_go=1
           fi
         fi
@@ -9169,7 +9173,7 @@ package_audit_command() {
           "${host_allow_required_versions[@]}"; then
           printf '[safe audit] host-allow entry %s@%s matches every warned resolved version; allowing\n' \
             "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION" >&2
-          if followed_grant_lookup "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION"; then
+          if followed_grant_lookup "$ecosystem" "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION"; then
             # Gate exit 16 (2026-09-29 direction): the pin came from a verified
             # operator-signed export, so the operator already confirmed this
             # exact version — every WARN cause is covered, no terminal.

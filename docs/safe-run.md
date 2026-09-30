@@ -277,7 +277,7 @@ origin's highest accepted `exported_at`, the verified primary fingerprint that
 signed it, and the identities already applied:
 
 ```json
-{"origins":{"rainbow":{"accepted":"2026-09-16T14:00:00Z","applied":["fresh-pkg@1.2.3"],"replaced":["fresh-pkg@1.0.0->1.2.3"],"refused":["other-pkg@2.0.0"],"signer":"<40-or-64-hex primary fingerprint>"}}}
+{"origins":{"rainbow":{"accepted":"2026-09-16T14:00:00Z","applied":["fresh-pkg@1.2.3"],"replaced":["fresh-pkg@1.0.0->1.2.3"],"refused":["other-pkg@2.0.0"],"signer":"<40-or-64-hex primary fingerprint>","granted":["npm:fresh-pkg@1.2.3"]}}}
 ```
 
 Timestamps are real ISO-8601 whole-second instants with an explicit timezone;
@@ -358,15 +358,24 @@ Socket call is spent on the consent path.
 
 The pin alone is not the grant. The gate requires all of:
 
-- the local host-allow entry matches every resolved version (removing the
+- the local host-allow entry matches every version the pass covers — each
+  warned version, or every resolved version for a consent ask or a pending
+  score (removing the
   local pin withdraws the grant, even though the ledger keeps the identity);
-- `follow-state.json` lists `name@version` in an origin's `applied` array —
-  the identity is part of that origin's currently accepted signed statement;
+- `follow-state.json` lists `name@version` in an origin's `applied` array and
+  `<ecosystem>:name@version` in its `granted` array. Each verified `follow`
+  run rewrites `granted` and `signer` from that run's own statement: only
+  identities the statement carries, in the ecosystem it names, under the key
+  that signed it. A Python grant never covers an npm pin of the same
+  name@version, and a statement from another pinned key does not inherit
+  identities it does not carry;
 - the `signer` recorded for that origin (the verified primary fingerprint of
-  the accepted generation) is still pinned in `follow.signers`.
+  the statement that granted the identity) is still pinned in
+  `follow.signers`.
 
 Anything else keeps the terminal requirement: another version, a pin typed at
-this machine's terminal, a package the origin dropped from a newer generation,
+this machine's terminal, a pin in another ecosystem, a package the origin
+dropped from a newer generation,
 an unrecorded signer, or a signer removed with `follow-signer remove` — which
 therefore withdraws unattended passes for grants already taken, not only future
 imports. A BLOCK is never cleared (exit 104). The `followed_from` field in the

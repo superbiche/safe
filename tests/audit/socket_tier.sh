@@ -710,7 +710,7 @@ follow_ledger() {
   local applied="$1" signer="${2:-}"
   jq -cn --arg g "$FOLLOW_GENERATION" --argjson applied "$applied" --arg signer "$signer" \
     '{origins: {rainbow: ({accepted: $g, applied: $applied, replaced: [], refused: []}
-      + (if $signer == "" then {} else {signer: $signer} end))}}'
+      + (if $signer == "" then {} else {signer: $signer, granted: ($applied | map("npm:" + .))} end))}}'
 }
 FRESH_AUTO='{"cooldown_days":3,"socket":{"mode":"auto","cache_ttl_days":7}}'
 
@@ -787,6 +787,16 @@ prepare_case followed-grant-signer-case
 seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"${FOLLOW_SIGNER,,}\"]" "$FRESH_AUTO"
 run_check clean MOCK_RELEASE_FRESH=1 --gate install --op install
 expect_rc 16 'fingerprint spelling case does not withdraw a followed grant'
+
+# The ledger binds the grant to the ecosystem the signed statement named.
+prepare_case followed-grant-other-ecosystem
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER" | jq -c '.origins.rainbow.granted = ["python:fixture@1.0.0"]')" "[\"$FOLLOW_SIGNER\"]" "$FRESH_AUTO"
+run_check clean MOCK_RELEASE_FRESH=1 --gate install --op install
+expect_rc 15 'a grant for another ecosystem is not a followed grant for this one'
+prepare_case followed-grant-applied-not-granted
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER" | jq -c '.origins.rainbow.granted = []')" "[\"$FOLLOW_SIGNER\"]" "$FRESH_AUTO"
+run_check clean MOCK_RELEASE_FRESH=1 --gate install --op install
+expect_rc 15 'an applied identity the signed statement does not carry is not a followed grant'
 
 # Removing the local pin withdraws the grant even though the ledger keeps the
 # applied identity (the ledger is replay memory, the store is the grant).

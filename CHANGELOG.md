@@ -13,9 +13,12 @@
   pin exists, the follow ledger lists the identity and its signer stays
   pinned, so `follow-signer remove` now also withdraws unattended passes for
   grants already taken. Never logged as green.
-- `host-allow follow` records the verified signer fingerprint of each
-  accepted generation in `follow-state.json`; an existing ledger gains it on
-  the next verified run. Until then its grants keep asking for a terminal.
+- `host-allow follow` records, per origin, the verified signer fingerprint and
+  the `granted` identities (`<ecosystem>:<pkg>@<version>`) of the statement it
+  just verified, in `follow-state.json`; an existing ledger gains them on the
+  next verified run. Until then its grants keep asking for a terminal. A
+  followed identity in another ecosystem than the local pin is a conflict,
+  never "already present".
 - `host-allow review` counts followed-grant installs as usage of the entry.
 
 ## 1.66.1 - 2026-09-22
