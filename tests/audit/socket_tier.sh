@@ -855,6 +855,10 @@ seed_block_override() {
   jq --argjson ids "$accepted" '.packages.fixture.block_override = {advisories: $ids, accepted: "2026-09-30"}' \
     "$CASE_RUN_CONFIG/host-allow.json" > "$CASE/ha.json" && mv "$CASE/ha.json" "$CASE_RUN_CONFIG/host-allow.json"
 }
+ledger_block_override() {
+  jq --argjson ids "$1" '.origins.rainbow.block_overrides = {"npm:fixture@1.0.0": $ids}' \
+    "$CASE_RUN_CONFIG/follow-state.json" > "$CASE/fs.json" && mv "$CASE/fs.json" "$CASE_RUN_CONFIG/follow-state.json"
+}
 drop_follow_label() {
   jq 'del(.packages.fixture.followed_from, .packages.fixture.followed_generation)' \
     "$CASE_RUN_CONFIG/host-allow.json" > "$CASE/ha.json" && mv "$CASE/ha.json" "$CASE_RUN_CONFIG/host-allow.json"
@@ -889,6 +893,7 @@ expect_rc 17 'a followed_from label without a ledger identity keeps the terminal
 prepare_case block-override-followed
 seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$BLOCK_INSTALL"
 seed_block_override '["GHSA-aaaa"]'
+ledger_block_override '["GHSA-aaaa"]'
 run_check clean MOCK_OSV_CRITICAL=GHSA-aaaa --gate install --op install
 expect_rc 16 'a followed override installs the accepted BLOCK unattended'
 jq -e '.packages["npm:fixture"] | .verdict == "ALLOWED_VIA_FOLLOWED_GRANT"
@@ -898,6 +903,20 @@ jq -e '.packages["npm:fixture"] | .verdict == "ALLOWED_VIA_FOLLOWED_GRANT"
 tail -n 1 "$CASE_DATA/audit/audit-log.jsonl" 2>/dev/null | jq -e '.event == "followed_grant" and .covered == "block_override"
   and .origin == "rainbow"' >/dev/null 2>&1 \
   && pass 'the verdict log records the followed BLOCK override' || fail 'the verdict log records the followed BLOCK override'
+
+# Review r1 F1: a WARN-era followed ledger plus an override in the store that
+# no verified statement bound is never unattended.
+prepare_case block-override-store-only
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$BLOCK_INSTALL"
+seed_block_override '["GHSA-aaaa"]'
+run_check clean MOCK_OSV_CRITICAL=GHSA-aaaa --gate install --op install
+expect_rc 17 'an override only in the store never rides a followed ledger unattended'
+prepare_case block-override-ledger-narrower
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$BLOCK_INSTALL"
+seed_block_override '["GHSA-aaaa","GHSA-cccc"]'
+ledger_block_override '["GHSA-aaaa"]'
+run_check clean MOCK_OSV_CRITICAL=GHSA-aaaa,GHSA-cccc --gate install --op install
+expect_rc 17 'the followed lane covers only what the verified statement accepted'
 
 prepare_case block-override-followed-signer-unpinned
 seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" '[]' "$BLOCK_INSTALL"

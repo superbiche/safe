@@ -45,7 +45,9 @@
   blocking advisory is one it accepted. Locally that is new gate exit 17
   (terminal confirm, 102 unattended); signed exports carry the override and
   followers install the accepted version unattended (exit 16,
-  `covered:block_override`). Malware and blocklist BLOCKs are never recorded.
+  `covered:block_override`) from the follow ledger's `block_overrides`,
+  rewritten from each verified statement; `follow --dry-run` previews
+  override changes. Malware and blocklist BLOCKs are never recorded.
 - `safe audit package-audit` results carry `package` and `block: {class,
   advisories}`; the install gates read the decided result through
   `SAFE_AUDIT_RESULT_OUT` instead of re-running the audit.

@@ -99,7 +99,7 @@ verification never fetches keys. Unrelated expired/revoked subkeys do not
 invalidate a good signature. A subkey fingerprint passed to `follow-signer add`
 is refused with the matching primary fingerprint to use instead. `follow-state.json`, beside the guard-selected
 host-allow store, records per-origin `{accepted, applied:["pkg@version"],
-replaced:["pkg@old->new"], refused:["pkg@version"], signer:"<fingerprint>", granted:["ecosystem:pkg@version"]}` and must remain local. `signer` is
+replaced:["pkg@old->new"], refused:["pkg@version"], signer:"<fingerprint>", granted:["ecosystem:pkg@version"], block_overrides:{"ecosystem:pkg@version":["advisory id"]}}` and must remain local. `signer` is
 the verified primary fingerprint of the accepted generation: while it stays in
 `follow.signers`, the install gate lets an applied identity with a matching
 local pin install unattended. `granted` binds that pass to the canonical

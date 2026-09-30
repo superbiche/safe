@@ -8097,11 +8097,10 @@ followed_grant_record() {
 # `safe run host-allow add --accept-block` at an operator terminal or taken from
 # a verified signed export. It covers this BLOCK only when the current blocking
 # advisories are non-empty and every one of them was accepted — a new advisory
-# asks again. Sets BLOCK_OVERRIDE_ORIGIN to the entry's followed_from ("" for a
-# local override); the caller decides terminal (local) vs unattended (followed).
+# asks again. The store copy only ever earns the terminal confirm (17); the
+# unattended followed lane reads the ledger (followed_block_override_covers).
 block_override_covers() {
   local name="$1" advisories_json="$2" ha_file
-  BLOCK_OVERRIDE_ORIGIN=""
   ha_file="$(trust_store_file host-allow.json)"
   [[ -f "$ha_file" ]] || return 1
   jq -e --arg p "$name" --argjson current "$advisories_json" '
@@ -8111,8 +8110,23 @@ block_override_covers() {
       and ($accepted | type) == "array"
       and ($accepted | all(.[]; type == "string"))
       and ($current | all(.[]; . as $id | $accepted | index($id) != null))' "$ha_file" >/dev/null 2>&1 || return 1
-  BLOCK_OVERRIDE_ORIGIN=$(jq -r --arg p "$name" '.packages[$p].followed_from // "" | strings' "$ha_file" 2>/dev/null) || BLOCK_OVERRIDE_ORIGIN=""
   return 0
+}
+
+# Followed BLOCK override (review r1 F1): true when the ledger entry of the
+# origin followed_grant_lookup selected binds this exact identity to accepted
+# advisories covering every current blocking one. The follow commit rewrites
+# that binding from each verified statement, like `granted`.
+followed_block_override_covers() {
+  local ecosystem="$1" name="$2" version="$3" advisories_json="$4" state_file
+  state_file="$(followed_grant_ledger_file)"
+  [[ -f "$state_file" && -n "$FOLLOWED_GRANT_ORIGIN" ]] || return 1
+  jq -e --arg host "$FOLLOWED_GRANT_ORIGIN" --arg gid "$(host_allow_canonical_eco "$ecosystem"):$name@$version" \
+    --argjson current "$advisories_json" '
+    (.origins[$host].block_overrides[$gid]) as $accepted
+    | ($current | type) == "array" and ($current | length) > 0
+      and ($accepted | type) == "array" and ($accepted | all(.[]; type == "string"))
+      and ($current | all(.[]; . as $id | $accepted | index($id) != null))' "$state_file" >/dev/null 2>&1
 }
 
 # Derive the exact artifact versions a host-allow would override, deny-by-
@@ -9267,16 +9281,22 @@ package_audit_command() {
         # version, so the gate refuses it with the pin hint.
         local -a block_versions=()
         mapfile -t block_versions < <(jq -r '.[]' <<<"$resolved_versions_json")
-        local block_covered=0
+        local block_pinned=0 block_followed=0 block_covered=0
         HOST_ALLOW_RESOLVED_VERSION=""
         if (( resolution_ok )) && (( ${#block_versions[@]} == 1 )) && [[ "$block_class" == "advisory" ]] \
-          && host_allow_matches_resolved "$ecosystem" "$PKG_NAME" "${block_versions[0]}" \
-          && block_override_covers "$PKG_NAME" "$block_advisories_json"; then
+          && host_allow_matches_resolved "$ecosystem" "$PKG_NAME" "${block_versions[0]}"; then
+          block_pinned=1
+        fi
+        # Followed lane: the accepted advisories come from the follow ledger,
+        # written from the verified statement that granted this exact
+        # identity — never from the store entry (review r1 F1).
+        if (( block_pinned )) && followed_grant_lookup "$ecosystem" "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION" \
+          && followed_block_override_covers "$ecosystem" "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION" "$block_advisories_json"; then
+          block_followed=1
+        elif (( block_pinned )) && block_override_covers "$PKG_NAME" "$block_advisories_json"; then
           block_covered=1
         fi
-        if (( block_covered )) && [[ -n "$BLOCK_OVERRIDE_ORIGIN" ]] \
-          && followed_grant_lookup "$ecosystem" "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION" \
-          && [[ "$FOLLOWED_GRANT_ORIGIN" == "$BLOCK_OVERRIDE_ORIGIN" ]]; then
+        if (( block_followed )); then
           followed_grant_record "$ecosystem" "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION" \
             "$(jq -cn --argjson causes "$warn_causes_json" --argjson ids "$block_advisories_json" \
               '$causes + ($ids | map("block_advisory:" + .))')" block_override "$result_json"

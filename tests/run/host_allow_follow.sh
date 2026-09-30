@@ -242,15 +242,40 @@ bo_export() { # <seconds-after-base> <override-json|null>
   sign_document "$fingerprint" "$tmp/bo-incoming/host-allow.rainbow.json"
 }
 bo_export 120 '{"advisories":["GHSA-aaaa"],"accepted":"2026-09-30"}'
+cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/bo-pre-store.json"
+cp "$SAFE_RUN_CONFIG_DIR/follow-state.json" "$tmp/bo-pre-state.json"
+expect_rc 0 "$SAFE_RUN" host-allow follow --dry-run --from "$tmp/bo-incoming"
+grep -q 'would-set-block-override npm:fresh-pkg@1.2.3 from rainbow: GHSA-aaaa' "$tmp/output" ||
+  fail "the preview does not show the override it would grant: $(cat "$tmp/output")"
+cmp "$tmp/bo-pre-store.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" && cmp "$tmp/bo-pre-state.json" "$SAFE_RUN_CONFIG_DIR/follow-state.json" ||
+  fail 'the override preview wrote trust state'
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/bo-incoming"
+grep -q 'BLOCK override updated' "$tmp/output" || fail 'the override refresh is not reported'
+jq -e '.origins.rainbow.block_overrides == {"npm:fresh-pkg@1.2.3": ["GHSA-aaaa"]}' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null ||
+  fail 'the ledger does not bind the accepted advisories to the verified statement'
+# Review r1 F1: an equal-timestamp statement from the same key without the
+# override withdraws it from the ledger, even though the identity is replayed.
+jq 'del(.packages["fresh-pkg"].block_override)' "$tmp/bo-incoming/host-allow.rainbow.json" > "$tmp/bo-same.json"
+mv "$tmp/bo-same.json" "$tmp/bo-incoming/host-allow.rainbow.json"
+sign_document "$fingerprint" "$tmp/bo-incoming/host-allow.rainbow.json"
+expect_rc 0 "$SAFE_RUN" host-allow follow --dry-run --from "$tmp/bo-incoming"
+grep -q 'would-drop-block-override npm:fresh-pkg@1.2.3 from rainbow' "$tmp/output" || fail 'the preview does not show the withdrawal'
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/bo-incoming"
+jq -e '.origins.rainbow.block_overrides == {}' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null ||
+  fail 'an equal-timestamp statement without the override left it in the ledger'
+bo_export 120 '{"advisories":["GHSA-aaaa"],"accepted":"2026-09-30"}'
 expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/bo-incoming"
 jq -e '.packages["fresh-pkg"] | .version == "1.2.3" and .followed_from == "rainbow" and .sha == "sha512-FRESH"
   and .block_override == {"advisories":["GHSA-aaaa"],"accepted":"2026-09-30"}' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null \
   || fail 'a same-version pin did not take the origin override'
-grep -q 'BLOCK override updated' "$tmp/output" || fail 'the override refresh is not reported'
+jq -e '.origins.rainbow.block_overrides == {"npm:fresh-pkg@1.2.3": ["GHSA-aaaa"]}' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null \
+  || fail 'the ledger did not take the override back from the newer statement'
 bo_export 180 '{"advisories":["GHSA-aaaa","GHSA-bbbb"],"accepted":"2026-09-30"}'
 expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/bo-incoming"
 jq -e '.packages["fresh-pkg"].block_override.advisories == ["GHSA-aaaa","GHSA-bbbb"]' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null \
   || fail 'a widened origin override did not reach the follower'
+jq -e '.origins.rainbow.block_overrides["npm:fresh-pkg@1.2.3"] == ["GHSA-aaaa","GHSA-bbbb"]' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null \
+  || fail 'the ledger binding did not widen'
 bo_export 240 null
 expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/bo-incoming"
 jq -e '.packages["fresh-pkg"] | has("block_override") | not' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null \

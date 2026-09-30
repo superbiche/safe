@@ -277,7 +277,7 @@ origin's highest accepted `exported_at`, the verified primary fingerprint that
 signed it, and the identities already applied:
 
 ```json
-{"origins":{"rainbow":{"accepted":"2026-09-16T14:00:00Z","applied":["fresh-pkg@1.2.3"],"replaced":["fresh-pkg@1.0.0->1.2.3"],"refused":["other-pkg@2.0.0"],"signer":"<40-or-64-hex primary fingerprint>","granted":["npm:fresh-pkg@1.2.3"]}}}
+{"origins":{"rainbow":{"accepted":"2026-09-16T14:00:00Z","applied":["fresh-pkg@1.2.3"],"replaced":["fresh-pkg@1.0.0->1.2.3"],"refused":["other-pkg@2.0.0"],"signer":"<40-or-64-hex primary fingerprint>","granted":["npm:fresh-pkg@1.2.3"],"block_overrides":{"npm:fresh-pkg@1.2.3":["GHSA-xxxx-xxxx-xxxx"]}}}}
 ```
 
 Timestamps are real ISO-8601 whole-second instants with an explicit timezone;
@@ -426,10 +426,15 @@ refuse 102. Signed exports carry the override as an optional per-entry field
 takes changes to it — added, widened or dropped — on the next `follow`. On a
 follower the covered BLOCK installs unattended as a followed grant (exit 16,
 receipt `covered:block_override` plus one `block_advisory:<id>` per accepted
-advisory), under the same ledger and signer conditions as above. The entry
-must itself come from that origin: a local operator pin is never rewritten by
-`follow` and its override stays a terminal decision. Followers on an older
-safe ignore the field and keep refusing.
+advisory), under the same ledger and signer conditions as above. The accepted
+advisories it trusts are the follow ledger's `block_overrides` for that
+origin and `<ecosystem>:name@version`, rewritten from every verified
+statement like `granted` — never the store entry's copy. A statement without
+the override, even one with the same timestamp, withdraws it, and
+`follow --dry-run` prints the `would-set-block-override` /
+`would-drop-block-override` changes. An override present only in the store (a
+local pin, or a stale copy) stays a terminal decision (exit 17). Followers on
+an older safe ignore the field and keep refusing.
 
 Malware and blocklist BLOCKs are overridable per install only. They are never
 recorded, so they never reach an export.
