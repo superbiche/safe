@@ -3,7 +3,7 @@ version = 1
 [[bindings]]
 doc = "docs/agents.md"
 target = "docs/contract/agent-contract.json"
-sig = "32b0c65fff16dd5e"
+sig = "c5f936f5bf91fe99"
 
 [[bindings]]
 doc = "docs/agents.md"
