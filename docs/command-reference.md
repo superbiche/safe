@@ -233,7 +233,9 @@ A fresh git worktree has no `vendor/`. A normal `composer install` there is new
 package ingress and is refused when the unchanged `composer.lock` carries
 critical advisories — even though the exact same tree already sits in the main
 checkout. `safe install --reuse` covers that case as its own operation: it
-copies the resident tree and never turns an adverse audit into a pass.
+copies dependencies that are already on this machine. It runs no audit, no
+`php`, no package manager and no network access, so its outcome is never an
+audit result (operator rulings 2026-09-30).
 
 ```bash
 cd <worktree>/<project>
@@ -242,40 +244,60 @@ safe install --reuse               # source: first other checkout with the same 
 safe install --reuse --reuse-from /path/to/main/checkout
 ```
 
-Verified before anything is copied; any failure refuses with exit 100 and
-leaves the target untouched:
+Identity is verified first; a mismatch is a different operation, not a reuse,
+and refuses with exit 100:
 
 | Check | Refused when |
 | --- | --- |
 | Provenance | the source is not the same project path in a checkout of the same git repository, or its `vendor/` is a symlink or belongs to another user |
 | Lockfile | `composer.lock` is not byte-identical (SHA-256) in both checkouts |
+| Autoload rules | the root `autoload`/`autoload-dev` sections of `composer.json` differ, so the copied autoloader would be wrong |
+| Target | `vendor/` already exists and is not empty — reuse never overwrites, even if it appears during the copy |
+
+The tree itself must be complete and self-contained. A gap here is an operator
+decision: unattended shells and dry runs refuse with exit 102; at the
+operator's terminal the gap is named and the operator may copy anyway, which
+the receipt records as `operator_override`:
+
+| Evidence | Gap when |
+| --- | --- |
 | Inventory | `vendor/composer/installed.json` does not list exactly the lockfile's packages (dev packages count when the source was installed with them), or is not in the Composer 2 format |
-| Tree | a listed package directory is missing or outside the project |
-| Links | a symlink is absolute or would leave the project once copied |
-| Platform | the `php` that runs in the target differs in version or extensions from the one in the source, or Composer's generated platform check fails under it |
-| Target | `vendor/` already exists and is not empty — reuse never overwrites |
+| Tree | a package has no install path, or its directory is missing or outside `vendor/` |
+| Autoloader | `vendor/autoload.php` or `vendor/composer/autoload_real.php` is missing |
+| Links | a symlink in the copied tree is absolute or leaves the project, or reaches a path repository that is absent in the target or whose package name or autoload rules differ there |
+| Integrity | the tree changed since its baseline (below) |
 
-The copy uses `cp -a --reflink=auto`: no hardlinks, so a test run that rewrites
-a vendored file never reaches the source checkout. No network access, no
-package manager and no lifecycle script runs. A root `autoload` section that
-changed in the worktree is not regenerated; run
-`composer dump-autoload --no-scripts` when the branch changed it.
+Only what the inventory describes is copied: `vendor/composer`, the
+autoloader and other top-level generated files, `vendor/bin`, and each
+package's install path. Any other directory or link in `vendor/` is left
+behind and listed as `skipped` in the output and the receipt. A path-repository
+link is copied as a link, so in the target it reaches the target's own copy of
+the package, as `composer install` would have made it.
 
-What reuse does **not** establish is file integrity: the contents are taken as
-they are in the source checkout, and the receipt says so.
+Integrity is trust on first use. The first reuse from a source checkout records
+a baseline: the SHA-256 of every file and the target of every link in its
+`vendor/`. Later reuses from that checkout must match it; a changed file is a
+gap, and an operator who accepts it re-records the baseline. A source
+reinstalled with a new lockfile starts a new baseline. The first use is not
+verified, and the receipt says which case applied (`baseline-recorded`,
+`baseline-matched`, `baseline-re-recorded-new-lockfile`,
+`baseline-re-recorded-by-operator`).
 
-The lockfile audit (`safe audit repo-audit . --deps-only`) runs for the record
-and decides nothing:
+The copy uses `cp -a --reflink=auto` into a staging directory inside the
+target: no hardlinks, so a test run that rewrites a vendored file never reaches
+the source checkout. The staged copy is checked again, the lockfiles are
+re-hashed, and the receipt and baseline are written before the copy is renamed
+into place. One reuse per target runs at a time; an interrupted or refused
+reuse removes its staging. If the receipt store under
+`~/.local/share/safe/install/reuse/` is not writable, nothing is copied.
 
-| Inherited audit | Status line | Gate log decision |
-| --- | --- | --- |
-| verdict `GO`, no critical finding | `reused-existing-vendor` | `REUSED_EXISTING` |
-| verdict `WARN` or `BLOCK`, or any critical finding | `reused-existing-vendor-with-known-risks` | `REUSED_EXISTING_WITH_KNOWN_RISKS` |
-| the audit could not run | `reused-existing-vendor-unaudited` | `REUSED_EXISTING_UNAUDITED` |
-
-The exit code is 0 in all three cases; the status line and the receipt under
-`~/.local/share/safe/install/reuse/` carry the outcome, source checkout,
-lockfile hash, package count and inherited finding counts.
+Every successful reuse ends as `reused-existing-vendor` with exit 0 (gate log
+`REUSED_EXISTING`, or `REUSED_EXISTING_OPERATOR_OVERRIDE` after an accepted
+gap). The receipt names the source checkout, the lockfile hash, the package
+count, the integrity state and `audit: not run`. The copied dependencies keep
+whatever advisories they had; audit them with `safe audit repo-audit .`.
+Platform compatibility is not checked: the project's runtime (for example its
+container image) decides it.
 
 Same-machine reuse is a per-host rule. With `install.reuse.enabled: true` in
 `~/.config/safe/run/config.json` it runs unattended, agents included. Without

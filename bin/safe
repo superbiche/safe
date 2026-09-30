@@ -1852,9 +1852,9 @@ Host installs are audited with `safe audit package-audit` before the package man
 `--reuse` fills this Composer project's missing `vendor/` from another checkout
 of the same git repository on this machine (the main checkout or a sibling
 worktree) whose `composer.lock` is byte-identical. It copies already-resident
-files only: no network, no package manager, no lifecycle scripts. The audit of
-the lockfile is recorded with the copy and never turned into a pass; an adverse
-verdict ends as `reused-existing-vendor-with-known-risks`. Unattended use needs
+files only: no audit, no php, no package manager, no network. A tree changed
+since its first reuse, or incomplete, is the operator's decision at a terminal.
+The status is `reused-existing-vendor`, never an audit result. Unattended use needs
 `install.reuse.enabled: true` in the run config of this host.
 EOF
 }
@@ -3051,12 +3051,6 @@ safe_install_reuse_refuse() {
   refuse "$code" "$@"
 }
 
-# Version and loaded extensions of the php that runs in <dir> (a version
-# manager may resolve it per directory). Empty when php cannot run there.
-safe_install_reuse_php_identity() {
-  ( cd -P -- "$1" 2>/dev/null && php -r 'echo PHP_VERSION, " ", implode(",", get_loaded_extensions());' 2>/dev/null ) || true
-}
-
 # First differences between the lockfile and the installed inventory; empty
 # when they describe the same package set. Dev packages count only when the
 # source tree was installed with them.
@@ -3080,36 +3074,102 @@ safe_install_reuse_inventory_diff() {
       end' 2>/dev/null || printf 'installed.json or composer.lock is not readable JSON'
 }
 
-# A package directory the inventory names but the tree lacks; empty when the
-# tree is complete. Paths that leave the source project are reported too.
-safe_install_reuse_missing_path() {
-  local source="$1" rel resolved
-  while IFS= read -r rel; do
-    [[ -n "$rel" ]] || continue
-    resolved="$(realpath -m -- "$source/vendor/composer/$rel")"
-    if [[ "$resolved" != "$source"/* || ! -d "$resolved" ]]; then
-      printf '%s' "$rel"
-      return 0
+# First reason <vendor> is not a complete, self-contained installed tree for
+# <lock>, once it sits at <target>/vendor; empty when it is. Checked on the
+# source before copying and again on the staged copy, so what lands is what
+# was checked:
+#   - the inventory in installed.json equals the lockfile;
+#   - every package has an install path, inside vendor/, that exists;
+#   - Composer's generated autoloader is present;
+#   - a symlink in what is copied stays inside vendor/, or reaches a path
+#     inside the project (a Composer path repository) that exists at <target>
+#     with the same package name and autoload rules as at <source> —
+#     otherwise it would dangle or the copied autoloader would be wrong.
+# Paths are resolved logically, as the tree will see them at <target>/vendor.
+safe_install_reuse_tree_problem() {
+  local vendor="$1" lock="$2" source="$3" target="$4" installed rel resolved dir link dest where
+  installed="$vendor/composer/installed.json"
+  [[ -f "$installed" ]] || { printf 'vendor/composer/installed.json is missing'; return 0; }
+  rel="$(safe_install_reuse_inventory_diff "$lock" "$installed")"
+  [[ -z "$rel" ]] || { printf 'the inventory does not match the lockfile (%s)' "$rel"; return 0; }
+  while IFS=$'\t' read -r dir rel; do
+    if [[ -z "$rel" ]]; then
+      printf 'package %s has no install path' "$dir"; return 0
     fi
-  done < <(jq -r '.packages[] | .["install-path"] // empty' "$source/vendor/composer/installed.json" 2>/dev/null)
-}
-
-# A symlink that would point back into the source checkout, or outside the
-# project, once copied; empty when every link is relative and stays inside.
-safe_install_reuse_unsafe_link() {
-  local source="$1" link dest resolved
+    resolved="$(realpath -m -s -- "$vendor/composer/$rel")"
+    if [[ "$resolved" != "$vendor"/* || ! ( -d "$resolved" || -L "$resolved" ) ]]; then
+      printf 'package directory %s is missing or outside vendor/' "$rel"; return 0
+    fi
+  done < <(jq -r '.packages[] | select(.type != "metapackage") | [.name, (.["install-path"] // "")] | @tsv' "$installed" 2>/dev/null)
+  for rel in autoload.php composer/autoload_real.php; do
+    [[ -f "$vendor/$rel" && ! -L "$vendor/$rel" ]] || { printf 'vendor/%s is missing (the tree cannot autoload)' "$rel"; return 0; }
+  done
+  local -a copied=()
+  while IFS= read -r rel; do
+    [[ -e "$vendor/$rel" || -L "$vendor/$rel" ]] && copied+=("$vendor/$rel")
+  done < <(safe_install_reuse_items "$vendor" | sort -u)
   while IFS= read -r -d '' link; do
     dest="$(readlink -- "$link")"
-    if [[ "$dest" == /* ]]; then
-      printf '%s -> %s' "${link#"$source"/}" "$dest"
-      return 0
+    where="${link#"$vendor"/}"
+    resolved="$(realpath -m -s -- "$target/vendor/$(dirname -- "$where")/$dest")"
+    [[ "$dest" != /* && "$resolved" == "$target/vendor"/* ]] && continue
+    rel="${resolved#"$target"/}"
+    if [[ "$dest" == /* || "$resolved" != "$target"/* ]]; then
+      printf 'symlink vendor/%s -> %s points outside the project' "$where" "$dest"; return 0
     fi
-    resolved="$(realpath -m -- "$(dirname -- "$link")/$dest")"
-    if [[ "$resolved" != "$source"/* ]]; then
-      printf '%s -> %s' "${link#"$source"/}" "$dest"
-      return 0
+    if [[ ! -e "$target/$rel" ]]; then
+      printf 'symlink vendor/%s -> %s would dangle here (%s is absent)' "$where" "$dest" "$rel"; return 0
     fi
-  done < <(find "$source/vendor" -type l -print0 2>/dev/null)
+    # A path repository links to the checkout's own copy of the package, as
+    # Composer itself would install it there; its sources may differ between
+    # branches. What the copied autoloader encodes is the package's name and
+    # autoload rules, so those must agree.
+    if [[ -f "$source/$rel/composer.json" || -f "$target/$rel/composer.json" ]] &&
+       [[ "$(jq -cS '[.name, .autoload, .["autoload-dev"]]' "$source/$rel/composer.json" 2>/dev/null)" != \
+          "$(jq -cS '[.name, .autoload, .["autoload-dev"]]' "$target/$rel/composer.json" 2>/dev/null)" ]]; then
+      printf 'symlink vendor/%s -> %s reaches %s, whose name or autoload rules differ here' "$where" "$dest" "$rel"; return 0
+    fi
+  done < <(find "${copied[@]}" -type l -print0 2>/dev/null)
+}
+
+# What the copy carries, relative to vendor/: Composer's own directory and
+# autoloader, vendor/bin, top-level generated files, and every inventoried
+# package path. Any other directory or link in vendor/ is not a dependency
+# Composer knows of and is left behind.
+safe_install_reuse_items() {
+  local vendor="$1" rel
+  printf '%s\n' composer autoload.php
+  [[ -e "$vendor/bin" || -L "$vendor/bin" ]] && printf 'bin\n'
+  # Top-level regular files are generated metadata (e.g. a plugin's manifest).
+  find "$vendor" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' 2>/dev/null
+  while IFS= read -r rel; do
+    rel="$(realpath -m -s --relative-to="$vendor" -- "$vendor/composer/$rel")"
+    printf '%s\n' "$rel"
+  done < <(jq -r '.packages[] | select(.type != "metapackage") | .["install-path"] // empty' "$vendor/composer/installed.json" 2>/dev/null)
+}
+
+# Entries of vendor/ (two levels deep) the copy leaves behind.
+safe_install_reuse_skipped() {
+  local vendor="$1" entry
+  local -A keep=()
+  while IFS= read -r entry; do keep["$entry"]=1; done < <(safe_install_reuse_items "$vendor")
+  while IFS= read -r -d '' entry; do
+    entry="${entry#"$vendor"/}"
+    case "$entry" in composer|composer/*|bin|bin/*|autoload.php) continue ;; esac
+    [[ -n "${keep[$entry]:-}" ]] && continue
+    [[ "$entry" == */* ]] || { [[ -d "$vendor/$entry" && ! -L "$vendor/$entry" ]] && continue; }
+    printf '%s\n' "$entry"
+  done < <(find "$vendor" -mindepth 1 -maxdepth 2 -print0 2>/dev/null | sort -z)
+}
+
+# Per-file manifest of an installed tree: sha256 of every regular file and the
+# target of every symlink, sorted by path. The trust-on-first-use baseline
+# (operator ruling 2026-09-30, A11) compares against it.
+safe_install_reuse_manifest() {
+  ( cd -P -- "$1" &&
+    { find . -type f -print0 | xargs -0 -r sha256sum --
+      find . -type l -printf 'link %l  %p\n'
+    } | LC_ALL=C sort -k2 )
 }
 
 safe_install_reuse_confirm() {
@@ -3119,10 +3179,29 @@ safe_install_reuse_confirm() {
   [[ "$reply" == "y" || "$reply" == "Y" || "$reply" == "yes" || "$reply" == "YES" ]]
 }
 
+# An evidence gap (incomplete tree, changed since its baseline) is an operator
+# decision, never a dead end (terminus ruling 2026-09-07): at the operator's
+# terminal the gap is named and the operator may copy anyway, recorded in the
+# receipt; unattended shells and dry runs refuse 102 with that lane named.
+# Echoes nothing; returns 0 when the operator accepted.
+safe_install_reuse_evidence_gap() {
+  local target="$1" problem="$2" dry_run="$3" reply
+  if [[ "$dry_run" == "0" ]] && safe_gate_operator_terminal; then
+    err "reuse evidence gap: ${problem}"
+    printf 'safe: copy it anyway, recorded as an operator override? [y/N] ' >&2
+    IFS= read -r reply </dev/tty || reply=""
+    case "$reply" in
+      y|Y|yes|YES) return 0 ;;
+    esac
+    safe_install_reuse_refuse 100 REFUSED_REUSE_DECLINED "$target" "BLOCKED reuse — ${problem}; declined at the terminal; nothing was copied; details: safe explain"
+  fi
+  safe_install_reuse_refuse 102 REFUSED_REUSE_EVIDENCE "$target" "BLOCKED reuse — ${problem}; to allow: reinstall in the source checkout, or the operator accepts it at an interactive terminal (safe install --reuse); details: safe explain"
+}
+
 cmd_install_reuse() {
   local source_arg="$1" dry_run="$2"
   local tool
-  for tool in jq git sha256sum realpath find cp; do
+  for tool in jq git sha256sum realpath find cp flock; do
     command -v "$tool" >/dev/null 2>&1 || refuse 100 "BLOCKED reuse — required command '${tool}' is missing; to allow: install it, then retry; details: safe explain"
   done
 
@@ -3198,95 +3277,45 @@ cmd_install_reuse() {
   [[ "$source_lock_sha" == "$lock_sha" ]] ||
     safe_install_reuse_refuse 100 REFUSED_REUSE_LOCK_MISMATCH "$target" "BLOCKED reuse — composer.lock differs between ${source} (sha256 ${source_lock_sha:0:12}) and this project (sha256 ${lock_sha:0:12}); a changed lockfile is a new install, not a reuse; details: safe explain"
 
-  local inventory_diff
-  inventory_diff="$(safe_install_reuse_inventory_diff "$target/composer.lock" "$source/vendor/composer/installed.json")"
-  [[ -z "$inventory_diff" ]] ||
-    safe_install_reuse_refuse 100 REFUSED_REUSE_STALE_TREE "$target" "BLOCKED reuse — the installed tree in ${source} does not match its lockfile (${inventory_diff}); to allow: reinstall in that checkout first; details: safe explain"
-
-  local missing_path
-  missing_path="$(safe_install_reuse_missing_path "$source")"
-  [[ -z "$missing_path" ]] ||
-    safe_install_reuse_refuse 100 REFUSED_REUSE_STALE_TREE "$target" "BLOCKED reuse — the installed tree in ${source} lists a package directory that is missing or outside the project (${missing_path}); to allow: reinstall in that checkout first; details: safe explain"
-
-  local unsafe_link
-  unsafe_link="$(safe_install_reuse_unsafe_link "$source")"
-  [[ -z "$unsafe_link" ]] ||
-    safe_install_reuse_refuse 100 REFUSED_REUSE_LINK "$target" "BLOCKED reuse — a symlink in the installed tree would leave the project once copied (${unsafe_link}); details: safe explain"
-
-  if [[ -e "$target/vendor" || -L "$target/vendor" ]]; then
-    if [[ -L "$target/vendor" || ! -d "$target/vendor" || -n "$(ls -A -- "$target/vendor" 2>/dev/null)" ]]; then
-      safe_install_reuse_refuse 100 REFUSED_REUSE_TARGET_EXISTS "$target" "BLOCKED reuse — ${target}/vendor already exists and reuse never overwrites; to allow: remove it yourself, then retry; details: safe explain"
-    fi
+  # The generated autoloader also encodes the ROOT package's autoload rules,
+  # which the lockfile does not cover.
+  if [[ "$(jq -cS '[.autoload, .["autoload-dev"]]' "$source/composer.json" 2>/dev/null)" != \
+        "$(jq -cS '[.autoload, .["autoload-dev"]]' "$target/composer.json" 2>/dev/null)" ]]; then
+    safe_install_reuse_refuse 100 REFUSED_REUSE_AUTOLOAD "$target" "BLOCKED reuse — composer.json autoload rules differ between ${source} and this project, so the copied autoloader would be wrong here; to allow: run the normal install; details: safe explain"
   fi
 
-  # Platform: the php that runs in the target must be the one the tree runs
-  # under in the source, and Composer's own generated check must pass on it.
-  local source_php target_php platform_check="absent"
-  command -v php >/dev/null 2>&1 ||
-    safe_install_reuse_refuse 100 REFUSED_REUSE_PLATFORM "$target" "BLOCKED reuse — php is not available, so platform compatibility cannot be established; details: safe explain"
-  source_php="$(safe_install_reuse_php_identity "$source")"
-  target_php="$(safe_install_reuse_php_identity "$target")"
-  if [[ -z "$source_php" || -z "$target_php" || "$source_php" != "$target_php" ]]; then
-    safe_install_reuse_refuse 100 REFUSED_REUSE_PLATFORM "$target" "BLOCKED reuse — php differs between the two checkouts (source: ${source_php%% *}, here: ${target_php%% *}, or a different extension set); the installed tree was resolved for another platform; details: safe explain"
-  fi
-  if [[ -f "$source/vendor/composer/platform_check.php" ]]; then
-    if ( cd -P -- "$target" && php "$source/vendor/composer/platform_check.php" ) >/dev/null 2>&1; then
-      platform_check="passed"
-    else
-      safe_install_reuse_refuse 100 REFUSED_REUSE_PLATFORM "$target" "BLOCKED reuse — Composer's platform check fails under the php that runs here (${target_php%% *}); details: safe explain"
-    fi
+  target_vendor_free() {
+    [[ ! -e "$target/vendor" && ! -L "$target/vendor" ]] ||
+      { [[ -d "$target/vendor" && ! -L "$target/vendor" && -z "$(ls -A -- "$target/vendor" 2>/dev/null)" ]]; }
+  }
+  target_vendor_free ||
+    safe_install_reuse_refuse 100 REFUSED_REUSE_TARGET_EXISTS "$target" "BLOCKED reuse — ${target}/vendor already exists and reuse never overwrites; to allow: remove it yourself, then retry; details: safe explain"
+
+  local -a overrides=()
+  local problem
+  problem="$(safe_install_reuse_tree_problem "$source/vendor" "$target/composer.lock" "$source" "$target")"
+  if [[ -n "$problem" ]]; then
+    safe_install_reuse_evidence_gap "$target" "the installed tree in ${source}: ${problem}" "$dry_run"
+    overrides+=("$problem")
   fi
 
   local packages dev
   packages="$(jq -r '.packages | length' "$source/vendor/composer/installed.json")"
   dev="$(jq -r 'if (.dev? // false) == true then "true" else "false" end' "$source/vendor/composer/installed.json")"
 
-  # The inherited verdict: the same dependency audit a project install runs,
-  # on the lockfile both checkouts share. It is recorded, never consulted —
-  # the rule allows the reuse whatever it says, and a scan that cannot run is
-  # written down as such rather than read as clean.
-  local verdict="UNKNOWN" critical="x" high="x" medium="x" low="x" result_path scan_log
-  result_path="$(mktemp "${TMPDIR:-/tmp}/safe-reuse-scan.XXXXXX")"
-  scan_log="$(safe_install_project_log_path)"
-  if [[ -x "$SAFE_AUDIT_PATH" ]] &&
-     "$SAFE_AUDIT_PATH" repo-audit . --deps-only --allow-missing-tools \
-       --result-out "$result_path" > "$scan_log" 2>&1 &&
-     [[ -s "$result_path" ]]; then
-    verdict="$(jq -r '.verdict // "UNKNOWN"' "$result_path" 2>/dev/null || printf 'UNKNOWN')"
-    critical="$(jq -r '.audit_totals.critical // .cve_scan.critical // "x"' "$result_path" 2>/dev/null || printf 'x')"
-    high="$(jq -r '.audit_totals.high // .cve_scan.high // "x"' "$result_path" 2>/dev/null || printf 'x')"
-    medium="$(jq -r '.audit_totals.medium // .cve_scan.medium // "x"' "$result_path" 2>/dev/null || printf 'x')"
-    low="$(jq -r '.audit_totals.low // .cve_scan.low // "x"' "$result_path" 2>/dev/null || printf 'x')"
-  fi
-  rm -f "$result_path"
-  [[ "$verdict" == "GO" || "$verdict" == "WARN" || "$verdict" == "BLOCK" ]] || verdict="UNKNOWN"
-  [[ "$critical" =~ ^[0-9]+$ && "$high" =~ ^[0-9]+$ ]] || verdict="UNKNOWN"
-  [[ "$verdict" == "GO" && "$critical" =~ ^[0-9]+$ && "$critical" -gt 0 ]] && verdict="BLOCK"
-
-  local outcome decision
-  case "$verdict" in
-    GO) outcome="reused-existing-vendor"; decision="REUSED_EXISTING" ;;
-    UNKNOWN) outcome="reused-existing-vendor-unaudited"; decision="REUSED_EXISTING_UNAUDITED" ;;
-    *) outcome="reused-existing-vendor-with-known-risks"; decision="REUSED_EXISTING_WITH_KNOWN_RISKS" ;;
-  esac
-
   printf 'safe install: reuse of installed dependencies — %s\n' "$target"
   printf '  source:    %s\n' "$source"
   printf '  lockfile:  composer.lock sha256 %s (identical)\n' "$lock_sha"
   printf '  packages:  %s installed, inventory matches the lockfile (dev packages: %s)\n' "$packages" \
     "$([[ "$dev" == "true" ]] && printf 'included' || printf 'NOT installed in the source')"
-  printf '  platform:  php %s, same extensions; composer platform check %s\n' "${target_php%% *}" "$platform_check"
-  if [[ "$verdict" == "UNKNOWN" ]]; then
-    printf '  audit:     NOT AVAILABLE — the lockfile audit could not run (%s); nothing is known about these packages\n' "$scan_log"
-  else
-    printf '  audit:     project verdict %s — critical %s, high %s, medium %s, low %s (every manifest of this project; inherited, unchanged by the copy)\n' \
-      "$verdict" "$critical" "$high" "$medium" "$low"
-  fi
-  printf '  integrity: file contents are taken as they are in the source; no offline oracle verifies them\n'
+  local skipped
+  skipped="$(safe_install_reuse_skipped "$source/vendor" | paste -sd, - || true)"
+  [[ -z "$skipped" ]] || printf '  skipped:   %s (in vendor/ but not in the inventory; not copied)\n' "$skipped"
+  printf '  audit:     not run — reuse copies what is already on this machine; audit it with: safe audit repo-audit .\n'
 
   if [[ "$dry_run" == "1" ]]; then
-    safe_install_gate_log "reuse:composer" "$target" "REUSE_DRY_RUN" "source=${source} verdict=${verdict}"
-    printf '  status:    dry run — nothing copied (would end as %s)\n' "$outcome"
+    safe_install_gate_log "reuse:composer" "$target" "REUSE_DRY_RUN" "source=${source}"
+    printf '  status:    dry run — nothing copied (would end as reused-existing-vendor)\n'
     return 0
   fi
 
@@ -3295,54 +3324,120 @@ cmd_install_reuse() {
       safe_install_reuse_refuse 100 REFUSED_REUSE_DECLINED "$target" "BLOCKED reuse — declined at the terminal; nothing was copied; details: safe explain"
   fi
 
+  # One reuse per target at a time; the receipt store is required up front.
+  local reuse_dir baseline_dir source_key
+  reuse_dir="${SAFE_DATA_DIR:-$HOME/.local/share/safe}/install/reuse"
+  baseline_dir="$reuse_dir/baselines"
+  mkdir -p -- "$reuse_dir/locks" "$baseline_dir" 2>/dev/null && [[ -w "$reuse_dir" && -w "$baseline_dir" ]] ||
+    safe_install_reuse_refuse 100 REFUSED_REUSE_RECEIPT "$target" "BLOCKED reuse — the receipt store ${reuse_dir} is not writable; nothing was copied; fix its permissions, then retry; details: safe explain"
+  exec {SAFE_REUSE_LOCK_FD}>"$reuse_dir/locks/$(printf '%s' "$target" | sha256sum | cut -c1-16).lock"
+  flock -n "$SAFE_REUSE_LOCK_FD" ||
+    safe_install_reuse_refuse 100 REFUSED_REUSE_BUSY "$target" "BLOCKED reuse — another reuse into ${target} is running; wait for it, then retry; details: safe explain"
+  source_key="$(printf '%s' "$source" | sha256sum | cut -c1-32)"
+
   # No hardlinks: a test run that rewrites a vendored file must never reach
-  # the source checkout. Staged beside the target, then renamed.
-  local staging="$target/vendor.safe-reuse.$$"
-  rm -rf -- "$staging"
-  if ! cp -a --reflink=auto -- "$source/vendor" "$staging" 2>/dev/null; then
-    rm -rf -- "$staging"
+  # the source checkout. Staged inside the target, removed on any exit,
+  # checked again as copied, then renamed into place.
+  SAFE_REUSE_STAGING="$(mktemp -d "$target/.safe-reuse.XXXXXX")" ||
+    safe_install_reuse_refuse 100 REFUSED_REUSE_COPY "$target" "BLOCKED reuse — cannot create a staging directory in ${target}; details: safe explain"
+  trap 'rm -rf -- "${SAFE_REUSE_STAGING:-}" "${SAFE_REUSE_TMP_RECEIPT:-}" "${SAFE_REUSE_TMP_BASELINE:-}"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  local -a items=()
+  mapfile -t items < <(safe_install_reuse_items "$source/vendor" | sort -u)
+  if ! { mkdir -p -- "$SAFE_REUSE_STAGING/vendor" &&
+         ( cd -P -- "$source/vendor" && cp -a --reflink=auto --parents -- "${items[@]}" "$SAFE_REUSE_STAGING/vendor/" ) 2>/dev/null; }; then
     safe_install_reuse_refuse 100 REFUSED_REUSE_COPY "$target" "BLOCKED reuse — copying ${source}/vendor failed; nothing was installed; check free space and permissions; details: safe explain"
   fi
-  [[ ! -d "$target/vendor" ]] || rmdir -- "$target/vendor"
-  if ! mv -- "$staging" "$target/vendor"; then
-    rm -rf -- "$staging"
-    safe_install_reuse_refuse 100 REFUSED_REUSE_COPY "$target" "BLOCKED reuse — could not move the copied tree into place; nothing was installed; details: safe explain"
+
+  # The copy is what lands: identity and structure are checked on it, not on
+  # a source that may have moved during the copy.
+  [[ "$(sha256sum -- "$source/composer.lock" | cut -d' ' -f1)" == "$lock_sha" &&
+     "$(sha256sum -- "$target/composer.lock" | cut -d' ' -f1)" == "$lock_sha" ]] ||
+    safe_install_reuse_refuse 100 REFUSED_REUSE_LOCK_MISMATCH "$target" "BLOCKED reuse — composer.lock changed while copying; nothing was installed; retry; details: safe explain"
+  local staged_problem
+  staged_problem="$(safe_install_reuse_tree_problem "$SAFE_REUSE_STAGING/vendor" "$target/composer.lock" "$source" "$target")"
+  if [[ -n "$staged_problem" && "$staged_problem" != "$problem" ]]; then
+    safe_install_reuse_refuse 100 REFUSED_REUSE_COPY "$target" "BLOCKED reuse — the source tree changed while copying (${staged_problem}); nothing was installed; retry; details: safe explain"
   fi
 
-  local receipt_dir receipt=""
-  receipt_dir="${SAFE_DATA_DIR:-$HOME/.local/share/safe}/install/reuse"
-  if mkdir -p "$receipt_dir" 2>/dev/null; then
-    receipt="$receipt_dir/$(date +%Y%m%dT%H%M%S)-$$.json"
-    jq -n --arg ts "$(date -Iseconds)" --arg safe_version "$SAFE_VERSION" \
-      --arg outcome "$outcome" --arg source "$source" --arg target "$target" \
-      --arg repository "$target_common" --arg lock_sha "$lock_sha" \
-      --argjson packages "$packages" --argjson dev "$dev" \
-      --arg php "$target_php" --arg platform_check "$platform_check" \
-      --arg verdict "$verdict" --arg critical "$critical" --arg high "$high" \
-      --arg medium "$medium" --arg low "$low" --arg scan_log "$scan_log" \
-      --arg rule "$([[ "$enabled" == "1" ]] && printf 'install.reuse.enabled' || printf 'operator-terminal')" '
-      def count: if test("^[0-9]+$") then tonumber else null end;
-      {ts: $ts, safe_version: $safe_version, operation: "reuse", ecosystem: "composer",
-       status: $outcome, authorized_by: $rule,
-       source: $source, target: $target, repository: $repository,
-       lockfile: {name: "composer.lock", sha256: $lock_sha},
-       inventory: {packages: $packages, dev: $dev},
-       platform: {php: ($php | split(" ")[0]), composer_platform_check: $platform_check},
-       inherited_audit: {verdict: $verdict, critical: ($critical | count), high: ($high | count),
-                         medium: ($medium | count), low: ($low | count), scan_log: $scan_log},
-       integrity: "unverified: copied as found in the source checkout",
-       network: false, lifecycle_scripts: false}' > "$receipt" 2>/dev/null || receipt=""
+  # Trust on first use (A11): the first reuse from a source records its
+  # per-file manifest; later reuses must match it, or the operator accepts the
+  # change at the terminal. A reinstalled source (new lockfile) re-records.
+  local manifest manifest_sha files baseline_file="$baseline_dir/$source_key.json" integrity recorded_at
+  manifest="$(safe_install_reuse_manifest "$SAFE_REUSE_STAGING/vendor")"
+  manifest_sha="$(printf '%s\n' "$manifest" | sha256sum | cut -d' ' -f1)"
+  files="$(printf '%s\n' "$manifest" | grep -c . || true)"
+  recorded_at="$(date -Iseconds)"
+  integrity="baseline-recorded"
+  if [[ -f "$baseline_file" ]] && jq -e --arg l "$lock_sha" '.lock_sha256 == $l' "$baseline_file" >/dev/null 2>&1; then
+    if jq -e --arg m "$manifest_sha" '.manifest_sha256 == $m' "$baseline_file" >/dev/null 2>&1; then
+      integrity="baseline-matched"
+      recorded_at="$(jq -r '.recorded_at' "$baseline_file")"
+    else
+      local changed
+      changed="$( { diff <(printf '%s\n' "$manifest") "$baseline_dir/$source_key.manifest" 2>/dev/null || true; } |
+        sed -n 's/^[<>] [^ ]*  \.\/\(.*\)$/\1/p' | sort -u | head -n 3 | paste -sd, -)" || changed=""
+      safe_install_reuse_evidence_gap "$target" "the installed tree in ${source} changed since its baseline of $(jq -r '.recorded_at' "$baseline_file") (${changed:-files differ})" 0
+      overrides+=("changed since baseline: ${changed:-files differ}")
+      integrity="baseline-re-recorded-by-operator"
+    fi
+  elif [[ -f "$baseline_file" ]]; then
+    integrity="baseline-re-recorded-new-lockfile"
   fi
+
+  local outcome="reused-existing-vendor" decision="REUSED_EXISTING"
+  (( ${#overrides[@]} == 0 )) || decision="REUSED_EXISTING_OPERATOR_OVERRIDE"
+  local receipt
+  receipt="$reuse_dir/$(date +%Y%m%dT%H%M%S)-$$.json"
+  if ! { SAFE_REUSE_TMP_RECEIPT="$(mktemp "$reuse_dir/.receipt.XXXXXX")" &&
+  jq -n --arg ts "$(date -Iseconds)" --arg safe_version "$SAFE_VERSION" \
+    --arg outcome "$outcome" --arg source "$source" --arg target "$target" \
+    --arg repository "$target_common" --arg lock_sha "$lock_sha" \
+    --argjson packages "$packages" --argjson dev "$dev" \
+    --arg integrity "$integrity" --arg recorded_at "$recorded_at" --arg manifest_sha "$manifest_sha" \
+    --argjson files "${files:-0}" --arg skipped "$skipped" \
+    --argjson overrides "$(printf '%s\n' ${overrides[@]+"${overrides[@]}"} | jq -R . | jq -cs 'map(select(length > 0))')" \
+    --arg rule "$([[ "$enabled" == "1" ]] && printf 'install.reuse.enabled' || printf 'operator-terminal')" '
+    {ts: $ts, safe_version: $safe_version, operation: "reuse", ecosystem: "composer",
+     status: $outcome, authorized_by: $rule, operator_override: $overrides,
+     source: $source, target: $target, repository: $repository,
+     lockfile: {name: "composer.lock", sha256: $lock_sha},
+     inventory: {packages: $packages, dev: $dev},
+     skipped: ($skipped | split(",") | map(select(length > 0))),
+     integrity: {state: $integrity, baseline_recorded_at: $recorded_at,
+                 manifest_sha256: $manifest_sha, files: $files},
+     audit: "not run: reuse copies dependencies already on this machine",
+     network: false, package_manager: false, scripts_executed: false}' > "$SAFE_REUSE_TMP_RECEIPT"; }; then
+    safe_install_reuse_refuse 100 REFUSED_REUSE_RECEIPT "$target" "BLOCKED reuse — the receipt could not be written in ${reuse_dir}; nothing was installed; details: safe explain"
+  fi
+  if [[ "$integrity" != "baseline-matched" ]]; then
+    if ! { SAFE_REUSE_TMP_BASELINE="$(mktemp "$baseline_dir/.baseline.XXXXXX")" &&
+      printf '%s\n' "$manifest" > "$SAFE_REUSE_TMP_BASELINE.manifest" &&
+      jq -n --arg s "$source" --arg l "$lock_sha" --arg m "$manifest_sha" --arg r "$recorded_at" --argjson f "${files:-0}" \
+        '{source: $s, lock_sha256: $l, manifest_sha256: $m, recorded_at: $r, files: $f}' > "$SAFE_REUSE_TMP_BASELINE"; }; then
+      safe_install_reuse_refuse 100 REFUSED_REUSE_RECEIPT "$target" "BLOCKED reuse — the integrity baseline could not be written in ${baseline_dir}; nothing was installed; details: safe explain"
+    fi
+  fi
+
+  # Publish: rename(2) replaces at most an empty vendor/, never a populated one.
+  if ! { target_vendor_free && mv -T -- "$SAFE_REUSE_STAGING/vendor" "$target/vendor" 2>/dev/null; }; then
+    safe_install_reuse_refuse 100 REFUSED_REUSE_TARGET_EXISTS "$target" "BLOCKED reuse — ${target}/vendor appeared while copying and reuse never overwrites; nothing was installed; details: safe explain"
+  fi
+  if ! mv -f -- "$SAFE_REUSE_TMP_RECEIPT" "$receipt" ||
+     { [[ -n "${SAFE_REUSE_TMP_BASELINE:-}" ]] &&
+       ! { mv -f -- "$SAFE_REUSE_TMP_BASELINE.manifest" "$baseline_dir/$source_key.manifest" &&
+           mv -f -- "$SAFE_REUSE_TMP_BASELINE" "$baseline_file"; }; }; then
+    refuse 100 "BLOCKED reuse — vendor/ is installed in ${target}, but its receipt or baseline could not be finalized in ${reuse_dir}; remove ${target}/vendor and retry after fixing the store; details: safe explain"
+  fi
+  SAFE_REUSE_TMP_RECEIPT="" SAFE_REUSE_TMP_BASELINE=""
 
   safe_install_gate_log "reuse:composer" "$target" "$decision" \
-    "source=${source} lock=${lock_sha:0:12} packages=${packages} verdict=${verdict} critical=${critical} high=${high}"
-  [[ -n "$receipt" ]] && printf '  receipt:   %s\n' "$receipt"
+    "source=${source} lock=${lock_sha:0:12} packages=${packages} integrity=${integrity}"
+  printf '  integrity: %s (%s files, baseline of %s)\n' "$integrity" "$files" "$recorded_at"
+  (( ${#overrides[@]} == 0 )) || printf '  override:  accepted at the terminal: %s\n' "$(IFS='; '; printf '%s' "${overrides[*]}")"
+  printf '  receipt:   %s\n' "$receipt"
   printf '  status:    %s\n' "$outcome"
-  if [[ "$verdict" == "BLOCK" || "$verdict" == "WARN" ]]; then
-    err "reused an installed tree that carries known advisories (verdict ${verdict}); it is fit for local tests, not evidence of a clean audit"
-  elif [[ "$verdict" == "UNKNOWN" ]]; then
-    err "reused an installed tree without an audit result; nothing is known about its advisories"
-  fi
   return 0
 }
 
