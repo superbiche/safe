@@ -3112,6 +3112,15 @@ safe_gate_check() {
       safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_TOLERATED_DECLINED"
       return 100
       ;;
+    16)
+      # Followed operator-signed grant (2026-09-29 direction): the exact
+      # version was accepted on the exporting machine and reached this one
+      # through a verified signed export, so it installs unattended whatever
+      # the WARN, consent or pending state was. Not a green check: it keeps
+      # its own decision token. The audit named origin and signer.
+      safe_gate_audit_log "${ecosystem}" "${package}" "ALLOWED_VIA_FOLLOWED_GRANT"
+      return 0
+      ;;
     2|20)
       # No allow hint on BLOCK: host-allow is a WARN-tier escape hatch and
       # can never clear a BLOCK verdict — and for a known-malware record the

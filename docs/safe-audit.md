@@ -600,6 +600,12 @@ all-green, so unattended shells refuse 102 and an interactive terminal
 confirms as before. A seventh code, **exit 15**, means a WARN passed via a
 host-allow entry or `auto_allow_tolerate` — a deliberate grant, not an
 all-green check: same terminal requirement, never the unattended proceed.
+An eighth code, **exit 16**, replaces 13, 14 and 15 when the exact resolved
+version is covered by a followed operator-signed grant: the operator accepted
+that version on the exporting machine, so the follower installs it unattended
+(`ALLOWED_VIA_FOLLOWED_GRANT` receipt and a `followed_grant` line in the verdict
+log, both naming origin and signer). See
+[Followed grants at the install gate](safe-run.md#followed-grants-at-the-install-gate).
 
 ### Install gate mode
 

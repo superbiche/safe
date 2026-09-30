@@ -113,7 +113,7 @@ host-set pin yields to any signed statement. Replacements are recorded in the
 run audit log and the origin's `replaced` ledger array. Dry-run validates the
 whole plan without changing persistent state. A machine-local `follow-state.json` beside the
 guard-selected trust store records each origin as
-`{"accepted":"<exported_at>","applied":["<pkg>@<version>"],"replaced":["<pkg>@<old>-><new>"],"refused":["<pkg>@<version>"]}`. Older timestamps
+`{"accepted":"<exported_at>","applied":["<pkg>@<version>"],"replaced":["<pkg>@<old>-><new>"],"refused":["<pkg>@<version>"],"signer":"<fingerprint>","granted":["<ecosystem>:<pkg>@<version>"]}`. Older timestamps
 warn, increment the freshness-skip count and return non-zero. Equal timestamps
 retry only identities that never applied; successful entries stay skipped even
 after operator removal. A local re-pin survives an equal generation and a newer
@@ -164,7 +164,13 @@ atomic ledger/store renames may conservatively consume that one identity without
 its grant; recover it with deliberate TTY import or a newer signed generation.
 Registry failures and other unapplied entries remain retryable unattended.
 
-Unpinning/revoking a signer stops future acceptance, not existing grants.
+Unpinning/revoking a signer stops future acceptance, not existing grants. It
+does end their unattended install pass: a followed grant installs without a
+terminal (gate exit 16) only while the signer recorded for its origin stays
+pinned, the identity is in that origin's accepted generation and the local pin
+exists. After upgrading a follower, run `safe run host-allow follow` once so the
+ledger records the signer; until then followed grants keep asking for a
+terminal.
 Freshness prevents replay only for generations this machine already accepted:
 initial bootstrap, a newer signed statement, or another authorized origin can
 still authorize a previously removed grant. Retire those exports or revoke the

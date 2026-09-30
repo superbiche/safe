@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- A followed operator-signed grant installs without a second confirmation
+  (operator direction 2026-09-29): when the exact resolved version is pinned
+  by a grant this machine took through `safe run host-allow follow`, the
+  install gate proceeds unattended (new gate exit 16,
+  `ALLOWED_VIA_FOLLOWED_GRANT`) in place of the terminal requirement of a
+  host-allow WARN pass (15), a fresh-release consent ask (13) or a pending
+  Socket score (14). Every WARN cause is covered; a BLOCK still refuses 104,
+  and another version is still gated. The grant holds only while the local
+  pin exists, the follow ledger lists the identity and its signer stays
+  pinned, so `follow-signer remove` now also withdraws unattended passes for
+  grants already taken. Never logged as green.
+- `host-allow follow` records, per origin, the verified signer fingerprint and
+  the `granted` identities (`<ecosystem>:<pkg>@<version>`) of the statement it
+  just verified, in `follow-state.json`; an existing ledger gains them on the
+  next verified run. Until then its grants keep asking for a terminal. A
+  followed identity in another ecosystem than the local pin is a conflict,
+  never "already present".
+- `host-allow review` counts followed-grant installs as usage of the entry.
+
 ## 1.66.1 - 2026-09-22
 
 - Allow unattended all-green installs in the `safe install` lane (operator

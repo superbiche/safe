@@ -97,6 +97,16 @@ printf '%s' "$n" > "$MIXED_CALLS"
 [[ "$n" == 1 ]] && exit 10
 exit 0
 MIXED
+elif [[ "$AUDIT_RC" == "seq" ]]; then
+  # One exit code per audited package, in order (AUDIT_SEQ="16 0").
+  cat > "$SAFE_AUDIT_PATH" <<'SEQ'
+#!/usr/bin/env bash
+n=$(cat "$MIXED_CALLS" 2>/dev/null || echo 0)
+n=$((n+1))
+printf '%s' "$n" > "$MIXED_CALLS"
+read -ra codes <<<"$AUDIT_SEQ"
+exit "${codes[$((n-1))]}"
+SEQ
 else
   printf '#!/bin/sh\nexit %s\n' "$AUDIT_RC" > "$SAFE_AUDIT_PATH"
 fi
@@ -203,5 +213,52 @@ rc="$(AUDIT_RC=13 WITH_YES=0 PACKAGES='green@1.0.0' run_cmd_install)"
 grep -q "INSTALL_UNATTENDED_GREEN" "$tmp/gate-log" &&
   fail "consent ask logged the green token"
 pass "fresh-release consent ask refuses 102 outside a terminal"
+
+# Non-TTY + followed operator-signed grant (gate exit 16, 2026-09-29
+# direction): installs without a terminal, under its own tokens — never green.
+: >"$tmp/gate-log"; : >"$tmp/confirm-log"
+rc="$(AUDIT_RC=16 WITH_YES=0 PACKAGES='followed@1.0.0' run_cmd_install)"
+[[ "$rc" == "0" ]] || { printf 'followed grant got %s; err:\n%s\n' "$rc" "$(cat "$tmp/err.txt" 2>/dev/null)" >&2; exit 1; }
+[[ ! -s "$tmp/confirm-log" ]] || fail "followed grant consulted the confirm (no TTY exists)"
+grep -q "followed@1.0.0 | ALLOWED_VIA_FOLLOWED_GRANT" "$tmp/gate-log" ||
+  fail "followed grant did not log its decision token"
+grep -q "followed@1.0.0 | INSTALL_UNATTENDED_FOLLOWED_GRANT" "$tmp/gate-log" ||
+  fail "followed grant did not log the unattended token"
+grep -q "INSTALL_UNATTENDED_GREEN" "$tmp/gate-log" &&
+  fail "followed grant logged the green token"
+pass "a followed operator-signed grant installs without a terminal, never as green"
+
+# Mixed batch: followed grant + clean package proceeds, still not green.
+: >"$tmp/gate-log"; : >"$tmp/confirm-log"; rm -f "$tmp/mixed-calls"
+export MIXED_CALLS="$tmp/mixed-calls"
+rc="$(AUDIT_RC=seq AUDIT_SEQ='16 0' WITH_YES=0 PACKAGES='followed@1.0.0 clean@2.0.0' run_cmd_install)"
+[[ "$rc" == "0" ]] || fail "followed+clean batch did not proceed (rc=$rc)"
+[[ ! -s "$tmp/confirm-log" ]] || fail "followed+clean batch consulted the confirm"
+grep -q "followed@1.0.0 clean@2.0.0 | INSTALL_UNATTENDED_FOLLOWED_GRANT" "$tmp/gate-log" ||
+  fail "followed+clean batch did not log the followed-grant token"
+grep -q "INSTALL_UNATTENDED_GREEN" "$tmp/gate-log" &&
+  fail "followed+clean batch logged the green token"
+pass "a followed grant beside a clean package proceeds unattended, never as green"
+
+# Mixed batch: a followed grant never carries a neighbour. A host-allow WARN
+# override (exit 10, returns 0) beside it keeps the terminal requirement, in
+# either order — the batch must not proceed off the followed package.
+for seq in '16 10' '10 16'; do
+  : >"$tmp/gate-log"; : >"$tmp/confirm-log"; rm -f "$tmp/mixed-calls"
+  rc="$(AUDIT_RC=seq AUDIT_SEQ="$seq" HOST_ALLOW_RC=0 WITH_YES=0 PACKAGES='one@1.0.0 two@2.0.0' run_cmd_install)"
+  [[ "$rc" == "102" ]] || fail "followed+override batch ($seq) did not refuse 102 (rc=$rc)"
+  [[ -s "$tmp/confirm-log" ]] || fail "followed+override batch ($seq) skipped the confirm lane"
+  grep -q "INSTALL_UNATTENDED" "$tmp/gate-log" &&
+    fail "followed+override batch ($seq) logged an unattended token"
+done
+pass "a followed grant never carries a non-green neighbour past the terminal"
+
+# A followed grant beside a tolerated WARN (exit 15) refuses before any route.
+: >"$tmp/gate-log"; : >"$tmp/confirm-log"; rm -f "$tmp/mixed-calls"
+rc="$(AUDIT_RC=seq AUDIT_SEQ='16 15' WITH_YES=0 PACKAGES='followed@1.0.0 tol@2.0.0' run_cmd_install)"
+[[ "$rc" == "102" ]] || fail "followed+tolerated batch did not refuse 102 (rc=$rc)"
+grep -q "INSTALL_UNATTENDED" "$tmp/gate-log" &&
+  fail "followed+tolerated batch logged an unattended token"
+pass "a followed grant beside a tolerated WARN still refuses 102"
 
 printf 'unattended-green: all cases passed\n'

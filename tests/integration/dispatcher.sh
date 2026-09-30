@@ -206,8 +206,27 @@ refusal_case() {
 refusal_case audit-warn 100 10 'safe: BLOCKED npm install of warnme@1.0.0' --yes -g warnme@1.0.0
 refusal_case audit-block 104 20 'safe: BLOCKED npm install of blockme@1.0.0' --yes -g blockme@1.0.0
 refusal_case audit-fail 100 42 'safe audit failed with exit 42 (fail closed)' --yes -g failme@1.0.0
-refusal_case non-tty-confirm 102 0 'BLOCKED install — interactive confirmation required' -g okpkg@1.0.0
+# A non-green pass keeps the terminal: a host-allow/tolerated WARN pass (gate
+# exit 15) refuses 102 without a TTY.
+refusal_case non-tty-tolerated 102 15 'safe: BLOCKED npm install of tolpkg@1.0.0' -g tolpkg@1.0.0
 pass "safe install policy refusals use BLOCKED contract and exit codes"
+
+# Since 1.66.1 a clean GO installs without a terminal; since the 2026-09-29
+# direction a followed operator-signed grant (gate exit 16) does too.
+unattended_case() {
+  local label="$1" stub_status="$2" token="$3" spec="$4"
+  local rc=0 data="$tmp/unattended-$label-data"
+  PATH="$shim:$PATH" SAFE_CONFIG_DIR="$tmp/unattended-$label-config" SAFE_RUN_DATA_DIR="$data" \
+    SAFE_AUDIT_STUB_STATUS="$stub_status" \
+    "$shim/safe" install -g "$spec" >/dev/null 2>"$tmp/unattended-$label.err" </dev/null || rc=$?
+  [[ "$rc" -eq 0 ]] || { cat "$tmp/unattended-$label.err" >&2; fail "safe install $label expected rc=0, got rc=$rc"; }
+  grep -Fq "| $token" "$data/audit.log" || { cat "$data/audit.log" >&2; fail "safe install $label did not log $token"; }
+}
+unattended_case green 0 INSTALL_UNATTENDED_GREEN okpkg@1.0.0
+unattended_case followed-grant 16 INSTALL_UNATTENDED_FOLLOWED_GRANT followed@1.0.0
+grep -Fq "INSTALL_UNATTENDED_GREEN" "$tmp/unattended-followed-grant-data/audit.log" &&
+  fail "a followed grant must never log the green token"
+pass "safe install proceeds without a terminal on a clean GO and on a followed operator-signed grant"
 
 # --- safe install project mode ---------------------------------------------
 # No package spec + a manifest in cwd = bulk audit of the project's dependency

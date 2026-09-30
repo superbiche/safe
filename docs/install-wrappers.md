@@ -371,6 +371,13 @@ non-interactive session refuses 102 so the agent hands over the pinned
 command. The consent channel (`SAFE_AUDIT_SOCKET_CONSENT`) is set only by the
 gate for that one re-audit; it is never an environment bypass.
 
+A followed operator-signed grant for the exact version (gate-only exit 16,
+2026-09-29 direction) installs unattended in every wrapper lane, `mise`
+included: it replaces the consent ask (13), the pending-score confirm (14) and
+the host-allow/tolerated WARN confirm (15), and logs
+`ALLOWED_VIA_FOLLOWED_GRANT`. See
+[followed grants at the install gate](safe-run.md#followed-grants-at-the-install-gate).
+
 A WARN caused solely by Socket rate limiting has gate-only exit 12. The
 operator can accept missing Socket scores once for the current install command.
 The gate keeps auditing each package; only repeated rate-limit-only prompts are

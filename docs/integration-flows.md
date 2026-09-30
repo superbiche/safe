@@ -92,6 +92,8 @@ Flow:
    it; agents receive exit 102 and hand over the pinned command). Pure
    Socket rate limits can be accepted once for this command; all package
    audits continue, and other outages/findings retain their own decision paths.
+   An exact version covered by a followed operator-signed grant proceeds
+   unattended (gate-only exit 16) in place of exits 13, 14 and 15.
 5. The real command runs through the first non-wrapper `npm` on PATH.
 
 Equivalent gate routing exists for pnpm, pnpx, yarn, bun, uv, pip, pip3, cargo, go, composer, and mise (Volta is retired).

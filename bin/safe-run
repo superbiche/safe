@@ -2010,9 +2010,13 @@ host_allow_apply_export() {
       skipped=$((skipped + 1)); failures=$((failures + 1)); continue; }
     disposition=""
 
-    if [[ "$writer" == "follow_collect_entry" ]] &&
-       jq -e --arg id "$normalized@$version" 'index($id) != null' <<<"$applied" >/dev/null; then
-      continue
+    if [[ "$writer" == "follow_collect_entry" ]]; then
+      # Every valid identity this verified statement carries, with its
+      # canonical ecosystem: the commit derives unattended authority from it.
+      follow_statement_ids=$(jq -c --arg id "$(follow_canonical_eco "$ecosystem"):$normalized@$version" '. + [$id]' <<<"$follow_statement_ids")
+      if jq -e --arg id "$normalized@$version" 'index($id) != null' <<<"$applied" >/dev/null; then
+        continue
+      fi
     fi
 
     # Never silently overwrite a divergent local pin.
@@ -2023,6 +2027,13 @@ host_allow_apply_export() {
     fi
     if [[ -n "$local_entry" ]]; then
       local_version=$(printf '%s' "$local_entry" | jq -r '.version // empty')
+      # Same name@version in another ecosystem is another package (review r1
+      # F1): never "present", never replaced silently.
+      if [[ "$(follow_canonical_eco "$(printf '%s' "$local_entry" | jq -r '.ecosystem // "npm"')")" != "$(follow_canonical_eco "$ecosystem")" ]]; then
+        printf '  CONFLICT %s: local pin is %s, %s has %s — resolve at an operator terminal: safe run host-allow remove %s, then host-allow import the reviewed file\n' \
+          "$normalized" "$(printf '%s' "$local_entry" | jq -r '.ecosystem // "npm"')" "${origin:-the import}" "$ecosystem" "$normalized" >&2
+        skipped=$((skipped + 1)); failures=$((failures + 1)); continue
+      fi
       if [[ "$local_version" == "$version" ]]; then
         if [[ "$writer" == "follow_collect_entry" ]]; then
           follow_collect_entry "$normalized" "$version" "$file_sha" "$reason" "$ecosystem" "$added_date" "$origin" present "$statement_generation" || return 1
@@ -2065,7 +2076,8 @@ host_allow_apply_export() {
     if (( dry_run )); then
       printf '  would-add %s@%s [%s]\n' "$normalized" "$version" "$ecosystem" >&2
       if [[ -n "$origin" ]]; then
-        follow_planned=$(jq --arg p "$normalized" --arg v "$version" '.[$p] = {version: $v}' <<<"$follow_planned")
+        # The plan carries the ecosystem: later sources compare against it.
+        follow_planned=$(jq --arg p "$normalized" --arg v "$version" --arg e "$ecosystem" '.[$p] = {version: $v, ecosystem: $e}' <<<"$follow_planned")
       fi
       added=$((added + 1)); continue
     fi
@@ -2239,10 +2251,20 @@ follow_collect_entry() {
     <<<"$follow_candidates")
 }
 
+# Package identity for followed authority: the ecosystem is part of it, so a
+# Python grant never vouches for an npm package of the same name@version.
+follow_canonical_eco() {
+  case "$1" in
+    py|python|uv|pipx|pypi) printf 'python' ;;
+    npm|bun) printf 'npm' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
 # No registry calls here. The caller holds the shared writer lock for real
 # writes; dry-run reads atomic snapshots without creating a lock or ledger.
 follow_commit_generation() {
-  local dry_run="$1" origin="$2" ha_file="$3" stamp="$4" candidates="$5"
+  local dry_run="$1" origin="$2" ha_file="$3" stamp="$4" candidates="$5" signer="${6:-}" statement_ids="${7:-[]}"
   local state_file state selected next entry name version sha reason ecosystem added disposition id local_entry local_generation local_origin statement_generation planned_entry replacement replace_local generation_rc already_refused
   local changed=0 failures=0
   state_file="$(dirname "$ha_file")/follow-state.json"
@@ -2289,6 +2311,13 @@ follow_commit_generation() {
     fi
     disposition=$(jq -r '.disposition' <<<"$entry")
     statement_generation=$(jq -r '.generation // empty' <<<"$entry")
+    # Re-check under the lock: the local pin may have changed ecosystem
+    # since collection (review r1 F1).
+    if [[ -n "$local_version" && "$local_version" != "invalid" ]] &&
+       [[ "$(follow_canonical_eco "$(jq -r '.ecosystem // "npm"' <<<"$local_entry")")" != "$(follow_canonical_eco "$(jq -r '.ecosystem' <<<"$entry")")" ]]; then
+      warn "CONFLICT $name: local pin is $(jq -r '.ecosystem // "npm"' <<<"$local_entry"), follow has $(jq -r '.ecosystem' <<<"$entry") — resolve at an operator terminal: safe run host-allow remove $name, then host-allow import the reviewed file"
+      failures=$((failures + 1)); continue
+    fi
     if [[ "$local_version" == "invalid" ]] ||
        [[ -n "$local_version" && "$local_version" != "$version" && "$disposition" != "replace" ]]; then
       warn "CONFLICT $name: local pins @$local_version, follow has @$version — resolve with: safe run host-allow update $name@$version --reason \"...\""
@@ -2345,11 +2374,13 @@ follow_commit_generation() {
       if [[ -n "$replacement" ]]; then
         printf '  would-replace %s@%s -> @%s\n' "$name" "$local_version" "$version" >&2
         follow_planned=$(jq -c --arg p "$name" --arg v "$version" --arg origin "$origin" --arg generation "$statement_generation" \
-          '.[$p] = {version:$v, followed_from:$origin, followed_generation:$generation}' <<<"$follow_planned")
+          --arg e "$(jq -r '.ecosystem' <<<"$entry")" \
+          '.[$p] = {version:$v, ecosystem:$e, followed_from:$origin, followed_generation:$generation}' <<<"$follow_planned")
       elif [[ -z "$local_version" && "$disposition" != present ]]; then
         printf '  would-add %s\n' "$id" >&2
         follow_planned=$(jq -c --arg p "$name" --arg v "$version" --arg origin "$origin" --arg generation "$statement_generation" \
-          '.[$p] = {version:$v, followed_from:$origin, followed_generation:$generation}' <<<"$follow_planned")
+          --arg e "$(jq -r '.ecosystem' <<<"$entry")" \
+          '.[$p] = {version:$v, ecosystem:$e, followed_from:$origin, followed_generation:$generation}' <<<"$follow_planned")
       fi
     else
       # Publish the identity before its local grant, so an interrupted writer
@@ -2376,13 +2407,32 @@ follow_commit_generation() {
     changed=1
     state="$next"
   done < <(jq -c '.[]' <<<"$candidates")
+  # Unattended authority (2026-09-29 direction, review r1 F1/F2): the signer
+  # that verified THIS statement, and `granted` — the canonical
+  # ecosystem:name@version identities that this statement itself carries and
+  # that are applied. Rewritten from every verified run, never carried over:
+  # a statement from another key, or one without the identity, cannot
+  # inherit an earlier signer's grants, and an identity is bound to the
+  # ecosystem the signed statement named. A new generation starts empty.
+  if [[ -n "$signer" ]]; then
+    next=$(jq -c --arg host "$origin" --arg signer "$signer" --argjson ids "$statement_ids" '
+      (.origins[$host].applied // []) as $applied
+      | .origins[$host].signer = $signer
+      | .origins[$host].granted = ([ $ids[] | select((split(":")[1:] | join(":")) as $id
+          | $applied | index($id) != null) ] | unique)' <<<"$state") || return 1
+    if [[ "$next" != "$state" ]]; then
+      (( dry_run )) || follow_publish_state "$state_file" "$next" || return 1
+      changed=1
+      state="$next"
+    fi
+  fi
   (( failures == 0 )) || return 1
   (( changed )) || return 3
 }
 
 follow_apply_generation() {
-  local file="$1" dry_run="$2" origin="$3" ha_file="$4"
-  local state stamp applied collect_rc=0 commit_rc=0 follow_candidates='[]'
+  local file="$1" dry_run="$2" origin="$3" ha_file="$4" signer="${5:-}"
+  local state stamp applied collect_rc=0 commit_rc=0 follow_candidates='[]' follow_statement_ids='[]'
   if ! stamp=$(jq -er '.exported_at | select(type == "string" and (test("[[:space:][:cntrl:]]") | not))' "$file") ||
      ! follow_exported_epoch "$stamp" >/dev/null; then
     warn "WARN follow: skipped $origin (invalid exported_at; expected a real ISO-8601 timestamp with timezone)"
@@ -2398,9 +2448,9 @@ follow_apply_generation() {
   # Validation and all bounded registry I/O happen before acquiring the lock.
   host_allow_apply_export "$file" "$dry_run" "$origin" "$ha_file" follow_collect_entry "$applied" || collect_rc=$?
   if (( dry_run )); then
-    follow_commit_generation "$dry_run" "$origin" "$ha_file" "$stamp" "$follow_candidates" || commit_rc=$?
+    follow_commit_generation "$dry_run" "$origin" "$ha_file" "$stamp" "$follow_candidates" "$signer" "$follow_statement_ids" || commit_rc=$?
   else
-    with_host_allow_lock "$ha_file" follow_commit_generation "$dry_run" "$origin" "$ha_file" "$stamp" "$follow_candidates" || commit_rc=$?
+    with_host_allow_lock "$ha_file" follow_commit_generation "$dry_run" "$origin" "$ha_file" "$stamp" "$follow_candidates" "$signer" "$follow_statement_ids" || commit_rc=$?
   fi
   (( commit_rc != 2 )) || return 2
   (( collect_rc == 0 )) || return 1
@@ -2485,7 +2535,7 @@ cmd_host_allow_follow() (
       failed_files=$((failed_files + 1)); continue
     fi
     apply_rc=0
-    follow_apply_generation "$staging/export.json" "$dry_run" "$origin" "$ha_file" || apply_rc=$?
+    follow_apply_generation "$staging/export.json" "$dry_run" "$origin" "$ha_file" "$verified_primary" || apply_rc=$?
     case "$apply_rc" in
       0) ;;
       2) freshness_skips=$((freshness_skips + 1)) ;;
@@ -2717,7 +2767,8 @@ host_allow_review_usage() {
   # Observed usage for one entry; sets REVIEW_TIMES_USED, REVIEW_LAST_USED.
   # Executions come from the host-allow execution log (canonical, one JSON
   # line per exec); install-gate WARN overrides come from the audit log
-  # (`GATE` tier, `HOST_ALLOW_OVERRIDE` decision). The audit log's own
+  # (`GATE` tier, `HOST_ALLOW_OVERRIDE` or `ALLOWED_VIA_FOLLOWED_GRANT`
+  # decision). The audit log's own
   # HOST_ALLOW tier lines duplicate the execution log — not counted twice.
   local pkg="$1"
   local exec_count=0 gate_count=0
@@ -2740,7 +2791,7 @@ host_allow_review_usage() {
   fi
   if [[ -f "$AUDIT_LOG" ]]; then
     gate_count=$(awk -F' \\| ' -v pkg="$pkg" '
-      $4 == "GATE" && $6 == "HOST_ALLOW_OVERRIDE" \
+      $4 == "GATE" && ($6 == "HOST_ALLOW_OVERRIDE" || $6 == "ALLOWED_VIA_FOLLOWED_GRANT") \
         && ($3 == pkg || index($3, pkg "@") == 1) { count++ }
       END { print count + 0 }' "$AUDIT_LOG" 2>/dev/null) || gate_count=0
     while IFS= read -r ts; do
@@ -2751,7 +2802,7 @@ host_allow_review_usage() {
         gate_last="$ts"
       fi
     done < <(awk -F' \\| ' -v pkg="$pkg" '
-      $4 == "GATE" && $6 == "HOST_ALLOW_OVERRIDE" \
+      $4 == "GATE" && ($6 == "HOST_ALLOW_OVERRIDE" || $6 == "ALLOWED_VIA_FOLLOWED_GRANT") \
         && ($3 == pkg || index($3, pkg "@") == 1) { print $1 }' "$AUDIT_LOG" 2>/dev/null)
   fi
   REVIEW_TIMES_USED=$(( exec_count + gate_count ))

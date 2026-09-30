@@ -2307,6 +2307,9 @@ safe_install_audit_package() {
   # consent declines also return 0 but must never ride the unattended
   # proceed (review r1 F-MAJOR-2, 2026-09-22).
   SAFE_INSTALL_STRICT_GREEN=0
+  # A followed operator-signed grant (gate exit 16) is not green, but the
+  # operator already confirmed it: it may ride the unattended proceed too.
+  SAFE_INSTALL_FOLLOWED_GRANT=0
 
   [[ -x "$SAFE_AUDIT_PATH" ]] || die "safe install requires safe audit at $SAFE_AUDIT_PATH"
 
@@ -2512,6 +2515,15 @@ safe_install_audit_package() {
       fi
       safe_install_gate_log "$ecosystem" "$package" "REFUSED_TOLERATED_DECLINED"
       refuse 100 "BLOCKED ${ecosystem} install of ${package} — tolerated WARN and you declined; details: safe explain"
+      ;;
+    16)
+      # Followed operator-signed grant (2026-09-29 direction): the operator
+      # accepted this exact version on the exporting machine, so it installs
+      # without a terminal. Not strict green — it rides the unattended
+      # proceed under its own flag and decision token.
+      SAFE_INSTALL_FOLLOWED_GRANT=1
+      safe_install_gate_log "$ecosystem" "$package" "ALLOWED_VIA_FOLLOWED_GRANT"
+      return 0
       ;;
     2|20)
       # No allow hint on BLOCK: host-allow only clears WARN, and for a
@@ -3143,10 +3155,11 @@ cmd_install() {
   # it only when told which installer runs.
   SAFE_INSTALL_INSTALLER=""
   [[ "$manager" == "bun" ]] && SAFE_INSTALL_INSTALLER="bun"
-  local green_all=1
+  local green_all=1 unattended_all=1
   for audit_package in "${audit_packages[@]}"; do
     safe_install_audit_package "$audit_package" "$ecosystem"
     [[ "${SAFE_INSTALL_STRICT_GREEN:-0}" == "1" ]] || green_all=0
+    [[ "${SAFE_INSTALL_STRICT_GREEN:-0}" == "1" || "${SAFE_INSTALL_FOLLOWED_GRANT:-0}" == "1" ]] || unattended_all=0
     if safe_install_trustable_package "$audit_package" "$ecosystem"; then
       trust_packages+=("$audit_package")
     elif [[ "$trust_host" == "1" ]]; then
@@ -3172,6 +3185,10 @@ cmd_install() {
       # timeout, pending score, consent ask or BLOCK keeps its own terminal
       # requirement below. Logged as its own decision token.
       safe_install_gate_log "$ecosystem" "${audit_packages[*]}" "INSTALL_UNATTENDED_GREEN"
+    elif [[ ! -t 0 || ! -t 1 ]] && [[ "$unattended_all" == "1" ]]; then
+      # Every package is clean-GO or covered by a followed operator-signed
+      # grant (2026-09-29 direction). Never logged as green.
+      safe_install_gate_log "$ecosystem" "${audit_packages[*]}" "INSTALL_UNATTENDED_FOLLOWED_GRANT"
     else
       safe_install_confirm "${install_cmd[@]}" || die "install cancelled"
     fi
