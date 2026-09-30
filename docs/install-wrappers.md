@@ -378,6 +378,18 @@ the host-allow/tolerated WARN confirm (15), and logs
 `ALLOWED_VIA_FOLLOWED_GRANT`. See
 [followed grants at the install gate](safe-run.md#followed-grants-at-the-install-gate).
 
+A BLOCK (104) has an operator override at an interactive terminal (2026-09-30
+rulings), in every wrapper lane and `safe install`: when the audit resolved one
+exact version, the gate names the evidence and asks the operator to type
+`<pkg>@<version>` (install once, `BLOCK_TTY_OVERRIDE`) or, for an
+advisory-only BLOCK on npm/python, `record <pkg>@<version>` (also runs
+`safe run host-allow add --accept-block`, `BLOCK_TTY_OVERRIDE_RECORD`).
+Anything else refuses 100. A BLOCK covered by an override recorded on this
+host is gate exit 17: a `[y/N]` confirm at the terminal, 102 without one.
+`mise` defers both to its parent's terminal. Agents and non-interactive shells
+keep the unchanged 104 refusal. See
+[BLOCK overrides](safe-run.md#block-overrides).
+
 A WARN caused solely by Socket rate limiting has gate-only exit 12. The
 operator can accept missing Socket scores once for the current install command.
 The gate keeps auditing each package; only repeated rate-limit-only prompts are

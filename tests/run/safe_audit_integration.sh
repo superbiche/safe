@@ -873,6 +873,43 @@ SAFE_AUDIT_PROBE_LOG="$tmp/grant-go-probe.log" \
 [[ -s "$tmp/grant-go-probe.log" ]] || fail "grant preflight did not audit on a clean add"
 pass "host-allow add audits host-side and a clean GO proceeds"
 
+# --- Recorded BLOCK override (host-allow add --accept-block, rulings 2026-09-30)
+# Only an advisory-only BLOCK on exactly the requested version is recordable;
+# the operator types name@version at the terminal (/dev/tty, driven here
+# through a pty) and the entry stores exactly the advisories the audit named.
+accept_block_run() { # <label> <probe-rc> <probe-json> <typed> <spec>
+  local label="$1"
+  mkdir -p "$tmp/config-ab-$label"
+  printf '%s\n' "$4" | SAFE_RUN_CONFIG_DIR="$tmp/config-ab-$label" SAFE_RUN_DATA_DIR="$tmp/data-ab-$label" \
+    SAFE_RUN_PATH="$SAFE_RUN" SAFE_AUDIT_PROBE_RC="$2" SAFE_AUDIT_PROBE_JSON="$3" \
+    AB_SPEC="$5" \
+    python3 -c 'import pty,sys,os; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' bash -c '
+      set -- version
+      source "$SAFE_RUN_PATH" >/dev/null
+      ensure_dirs
+      registry_integrity_npm() { printf "sha512-fixture"; }
+      cmd_host_allow_add "$AB_SPEC" --reason "accepted" --accept-block
+    ' safe-run > "$tmp/ab-$label.out" 2>&1
+}
+AB_JSON='{"verdict":"BLOCK","warn_causes":["osv_affecting"],"resolved_versions":["1.0.0"],"block":{"class":"advisory","advisories":["GHSA-aaaa","GHSA-bbbb"]}}'
+accept_block_run ok 20 "$AB_JSON" 'blkpkg@1.0.0' blkpkg@1.0.0 || fail "accept-block with the typed identity failed: $(cat "$tmp/ab-ok.out")"
+jq -e --arg d "$(date -I)" '.packages.blkpkg | .version == "1.0.0"
+  and .block_override == {advisories: ["GHSA-aaaa","GHSA-bbbb"], accepted: $d}' "$tmp/config-ab-ok/host-allow.json" >/dev/null \
+  || fail "accept-block did not record the named advisories"
+grep -q 'BLOCK_OVERRIDE_RECORDED' "$tmp/data-ab-ok/audit.log" || fail "accept-block left no audit event"
+if accept_block_run typo 20 "$AB_JSON" 'blkpkg@1.0.1' blkpkg@1.0.0; then fail "a mistyped identity recorded an override"; fi
+[[ "$(jq -r '.packages | length' "$tmp/config-ab-typo/host-allow.json" 2>/dev/null || echo 0)" == "0" ]] || fail "a mistyped identity wrote the store"
+for class in malware blocklist; do
+  if accept_block_run "$class" 20 "$(jq -c --arg c "$class" '.block.class = $c | .block.advisories = []' <<<"$AB_JSON")" 'blkpkg@1.0.0' blkpkg@1.0.0; then
+    fail "a $class BLOCK was recorded"
+  fi
+  grep -q "never recorded" "$tmp/ab-$class.out" || fail "the $class refusal is not legible"
+done
+if accept_block_run go 0 '{"verdict":"GO","warn_causes":[]}' 'blkpkg@1.0.0' blkpkg@1.0.0; then fail "accept-block recorded without a BLOCK"; fi
+grep -q 'nothing to accept' "$tmp/ab-go.out" || fail "the no-BLOCK refusal is not legible"
+if accept_block_run range 20 "$(jq -c '.resolved_versions = ["1.0.1"]' <<<"$AB_JSON")" 'blkpkg@1.0.0' blkpkg@1.0.0; then fail "accept-block recorded a different resolved version"; fi
+pass "host-allow add --accept-block records only a typed, advisory-only, exact-version BLOCK"
+
 # A grant must not be recorded when the exact registry version cannot be
 # confirmed. This is the same fail-closed existence check import/follow use.
 SAFE_RUN_CONFIG_DIR="$tmp/config-grant-unknown-add" SAFE_RUN_DATA_DIR="$tmp/data-grant-unknown-add" \

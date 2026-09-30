@@ -36,6 +36,25 @@
 - Add the per-host rule `install.reuse.enabled` (default `false`): `true` lets
   reuse run unattended; otherwise the operator confirms each reuse at a
   terminal and other sessions refuse 102.
+- A BLOCK now has an operator override (operator rulings 2026-09-30). At an
+  operator terminal, a BLOCK on one exact resolved version installs once when
+  the operator types `<pkg>@<version>`; agents and non-interactive shells
+  still get 104. An advisory-only BLOCK can be recorded — `record
+  <pkg>@<version>` at the prompt, or `safe run host-allow add <pkg>@<version>
+  --reason "..." --accept-block` — and covers later installs only while every
+  blocking advisory is one it accepted. Locally that is new gate exit 17
+  (terminal confirm, 102 unattended); signed exports carry the override and
+  followers install the accepted version unattended (exit 16,
+  `covered:block_override`) from the follow ledger's `block_overrides`,
+  rewritten from each verified statement and honored only for a pin taken
+  from that origin; `follow --dry-run` previews override changes.
+- `host-allow follow` records the SHA-256 of each accepted statement; a
+  different signed statement for an already-accepted `exported_at` instant is
+  a collision, refused without changing the ledger (ask the origin for a
+  newer export, or review it with `host-allow import`). Malware and blocklist BLOCKs are never recorded.
+- `safe audit package-audit` results carry `package` and `block: {class,
+  advisories}`; the install gates read the decided result through
+  `SAFE_AUDIT_RESULT_OUT` instead of re-running the audit.
 
 ## 1.66.1 - 2026-09-22
 

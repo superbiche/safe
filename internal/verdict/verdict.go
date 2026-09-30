@@ -171,6 +171,28 @@ type Result struct {
 	SocketPending bool          `json:"socket_pending"`
 	ReleaseExempt bool          `json:"release_exempt"`
 	SocketConsent SocketConsent `json:"socket_consent"`
+	// Block classifies a BLOCK verdict for the operator override lanes
+	// (operator rulings 2026-09-30): which override the install gate may offer,
+	// and which advisories an operator override would accept. Zero value
+	// (class "") on GO/WARN.
+	Block Block `json:"block"`
+}
+
+// Block names why a BLOCK verdict blocked. Class is one of:
+//   - "malware": a known-malware record (OSV MAL-*) or a Socket critical
+//     supply-chain alert on a resolved version;
+//   - "blocklist": the operator's local blocklist names the package;
+//   - "unresolved": the version could not be resolved, so no exact version
+//     exists to override;
+//   - "advisory": only affecting advisories at a blocking severity. Advisories
+//     lists their ids, sorted — the evidence an operator override accepts.
+//
+// The most severe source wins when several apply; Advisories is filled only for
+// the advisory class, so an override can never be recorded against malware or a
+// blocklist entry that shares the verdict.
+type Block struct {
+	Class      string   `json:"class"`
+	Advisories []string `json:"advisories"`
 }
 
 // decision accumulates verdict and causes while the stages run.
@@ -223,7 +245,34 @@ func Decide(ev Evidence) Result {
 	if res.Causes == nil {
 		res.Causes = []string{}
 	}
+	res.Block = classifyBlock(ev, res)
 	return res
+}
+
+// classifyBlock derives Result.Block from the evidence the stages already read.
+// It never changes the verdict.
+func classifyBlock(ev Evidence, res Result) Block {
+	b := Block{Advisories: []string{}}
+	if res.Verdict != BLOCK {
+		return b
+	}
+	switch {
+	case slices.Contains(res.Causes, "osv_malware") || slices.Contains(res.Causes, "socket_malware"):
+		b.Class = "malware"
+	case ev.Blocklist.Readable && ev.Blocklist.Reason != "":
+		b.Class = "blocklist"
+	case !ev.Resolution.OK:
+		b.Class = "unresolved"
+	default:
+		b.Class = "advisory"
+		for _, a := range ev.OSV.Affecting {
+			if slices.Contains(ev.BlockSeverities, a.Severity) && !slices.Contains(b.Advisories, a.ID) {
+				b.Advisories = append(b.Advisories, a.ID)
+			}
+		}
+		slices.Sort(b.Advisories)
+	}
+	return b
 }
 
 // socketStage evaluates the primary behavioral tier.

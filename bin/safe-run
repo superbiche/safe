@@ -1668,6 +1668,53 @@ registry_integrity_pypi() {
   printf 'sha256-%s' "$digest"
 }
 
+# Recorded BLOCK override (operator rulings 2026-09-30): `host-allow add
+# --accept-block` re-audits the exact version host-side and records the
+# blocking advisories the operator accepts on the entry. Only an advisory-only
+# BLOCK is recordable: a malware record, a Socket critical supply-chain alert
+# or a blocklist entry stays a per-install decision at the install gate and is
+# never written. The operator types name@version to accept (a deliberate
+# gesture that --yes and stdin cannot reach). Prints the override object.
+host_allow_accept_block() {
+  local pkg="$1" version="$2" ecosystem="$3"
+  local pkgver="${pkg}@${version}" out rc=0 audit_eco="$ecosystem" class typed
+  case "$ecosystem" in
+    py|python|uv|pipx) audit_eco="python" ;;
+    npm|bun)           audit_eco="npm" ;;
+  esac
+  command -v "$SAFE_AUDIT_BIN" >/dev/null 2>&1 \
+    || die "--accept-block needs safe audit to name the advisories it accepts (safe-audit not found)"
+  out=$(_safe_audit_run_json "$pkgver" "$audit_eco" "${SAFE_RUN_PREFLIGHT_TIMEOUT:-90}") || rc=$?
+  if [[ "$rc" != "20" ]] || ! jq -e '.verdict == "BLOCK"' <<<"$out" >/dev/null 2>&1; then
+    die "--accept-block: safe audit did not return BLOCK for $pkgver (exit $rc) — nothing to accept; without a BLOCK use host-allow add without --accept-block"
+  fi
+  class=$(jq -r '.block.class // ""' <<<"$out")
+  case "$class" in
+    advisory) ;;
+    malware|blocklist)
+      die "--accept-block: $pkgver is blocked by a ${class} signal — overridable only per install at the install gate, never recorded" ;;
+    *)
+      die "--accept-block: the BLOCK for $pkgver names no exact version to accept (${class:-unclassified}); pin one exact version" ;;
+  esac
+  jq -e --arg v "$version" '.resolved_versions == [$v]' <<<"$out" >/dev/null 2>&1 \
+    || die "--accept-block: safe audit resolved $pkgver to $(jq -c '.resolved_versions' <<<"$out"), not exactly $version"
+  jq -e '.block.advisories | type == "array" and length > 0 and all(.[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._:-]*$"))' <<<"$out" >/dev/null 2>&1 \
+    || die "--accept-block: safe audit named no valid blocking advisory ids for $pkgver"
+  warn "safe audit reported BLOCK for $pkgver: critical advisories $(jq -r '.block.advisories | join(", ")' <<<"$out")"
+  warn "  inspect: safe audit package-audit $pkgver --ecosystem $audit_eco"
+  warn "  recording accepts exactly these advisories for this exact version; the install gate asks again if another one appears, and signed exports carry the override to followed hosts"
+  printf '\033[33msafe run:\033[0m type %s to accept them: ' "$pkgver" >&2
+  IFS= read -r typed </dev/tty || typed=""
+  [[ "$typed" == "$pkgver" ]] || die "aborted (typed text did not match $pkgver)"
+  jq -c --arg d "$(date -I)" '{advisories: .block.advisories, accepted: $d}' <<<"$out"
+}
+
+# Shape of a block_override carried by a store entry or an export entry.
+HOST_ALLOW_BLOCK_OVERRIDE_VALID='(.block_override == null) or (.block_override | type == "object"
+  and (.advisories | type == "array" and length > 0
+       and all(.[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._:-]*$")))
+  and (.accepted | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")))'
+
 # A trust escalation (host-allow add/update, scripts-allow add) must carry an
 # operator reason: it is the audit trail for bypassing the sandbox default.
 host_allow_require_reason() {
@@ -1701,6 +1748,10 @@ write_host_allow_entry_locked() (
   # staleness review computes from; add/update omit it and stamp today.
   local added="${6:-$(date -I)}" followed_from="${7:-}"
   local replace_local="${8:-0}" generation="${9:-}"
+  # $11: the entry's block_override as compact JSON ("" = none). A followed
+  # entry already pinned at this version is rewritten only when the SAME
+  # origin changed its override; a local operator pin is never touched.
+  local block_override="${11:-}"
   local tmp ha_file
   # #87: write the sanctioned store (literal canonical, or a blessed redirect);
   # callers are already write-guarded against an unblessed redirect.
@@ -1713,22 +1764,27 @@ write_host_allow_entry_locked() (
         {entry: .packages[$p], present: (.packages | has($p))} else error("malformed store") end' "$ha_file") || return 1
       if [[ "$(jq -r '.present' <<<"$local_entry")" == "true" ]]; then
         local_version=$(jq -r '.entry.version // empty' <<<"$local_entry") || return 1
-        [[ "$local_version" == "$version" ]] && return 0
-        if [[ "$replace_local" != "1" ]]; then
+        if [[ "$local_version" == "$version" ]]; then
+          [[ "$(jq -r '.entry.followed_from // empty' <<<"$local_entry")" == "$followed_from" ]] || return 0
+          local incoming_override='null'
+          [[ -z "$block_override" ]] || incoming_override=$(jq -c . <<<"$block_override") || return 1
+          [[ "$(jq -c '.entry.block_override // null' <<<"$local_entry")" != "$incoming_override" ]] || return 0
+        elif [[ "$replace_local" != "1" ]]; then
           warn "CONFLICT $pkg: local pins @$local_version, follow has @$version — resolve with: safe run host-allow update $pkg@$version --reason \"...\""
           return 1
-        fi
-        local_generation=$(jq -r '.entry.followed_generation // empty' <<<"$local_entry") || return 1
-        local_origin=$(jq -r '.entry.followed_from // empty' <<<"$local_entry") || return 1
-        if [[ -n "$local_generation" ]]; then
-          incoming_epoch=$(follow_exported_epoch "$generation") || return 1
-          existing_epoch=$(follow_exported_epoch "$local_generation") || {
-            warn "WARN follow: local pin @$local_version has a malformed followed generation; repair the host-allow store at an operator terminal"
-            return 1
-          }
-          if (( incoming_epoch <= existing_epoch )); then
-            warn "WARN follow: refusing $pkg@$version from $followed_from: local pin @$local_version from ${local_origin:-local operator} has generation $local_generation, which is not older than $generation — resolve with: safe run host-allow update $pkg@$version --reason \"...\""
-            return 1
+        else
+          local_generation=$(jq -r '.entry.followed_generation // empty' <<<"$local_entry") || return 1
+          local_origin=$(jq -r '.entry.followed_from // empty' <<<"$local_entry") || return 1
+          if [[ -n "$local_generation" ]]; then
+            incoming_epoch=$(follow_exported_epoch "$generation") || return 1
+            existing_epoch=$(follow_exported_epoch "$local_generation") || {
+              warn "WARN follow: local pin @$local_version has a malformed followed generation; repair the host-allow store at an operator terminal"
+              return 1
+            }
+            if (( incoming_epoch <= existing_epoch )); then
+              warn "WARN follow: refusing $pkg@$version from $followed_from: local pin @$local_version from ${local_origin:-local operator} has generation $local_generation, which is not older than $generation — resolve with: safe run host-allow update $pkg@$version --reason \"...\""
+              return 1
+            fi
           fi
         fi
       fi
@@ -1738,7 +1794,8 @@ write_host_allow_entry_locked() (
   fi
   tmp=$(stage_beside "$ha_file") || return 1
   jq --arg p "$pkg" --arg v "$version" --arg s "$sha" \
-     --arg r "$reason" --arg d "$added" --arg e "$ecosystem" --arg origin "$followed_from" --arg generation "$generation" '
+     --arg r "$reason" --arg d "$added" --arg e "$ecosystem" --arg origin "$followed_from" --arg generation "$generation" \
+     --arg override "$block_override" '
     .packages[$p] = {
       version: $v,
       sha: $s,
@@ -1747,7 +1804,7 @@ write_host_allow_entry_locked() (
       reason: $r
     } + (if $origin == "" then {} else
       {followed_from: $origin} + (if $generation == "" then {} else {followed_generation: $generation} end)
-    end)' "$ha_file" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+    end) + (if $override == "" then {} else {block_override: ($override | fromjson)} end)' "$ha_file" > "$tmp" || { rm -f -- "$tmp"; return 1; }
   mv "$tmp" "$ha_file" || return 1
   # One audit event per confirmed store write (Fibery #469): the append-only
   # audit log is the attribution trail the file mtime could not provide. Tier
@@ -1861,8 +1918,12 @@ cmd_host_allow_export() {
     jq -e '.packages | if type == "object" then all(.[]; type == "object") else false end' \
       "$HOST_ALLOW_FILE" >/dev/null 2>&1 \
       || die "host-allow file is malformed: $HOST_ALLOW_FILE"
+    # block_override rides along when present (operator ruling 2026-09-30:
+    # an origin-side BLOCK override propagates to followers). Older
+    # followers read only the fields they know, so they keep refusing.
     packages=$(jq -c '(.packages // {})
-      | map_values({version, sha, ecosystem, added, reason})' "$HOST_ALLOW_FILE")
+      | map_values({version, sha, ecosystem, added, reason}
+          + (if .block_override == null then {} else {block_override} end))' "$HOST_ALLOW_FILE")
   fi
   local document
   document=$(jq -n --arg schema "$HOST_ALLOW_EXPORT_SCHEMA" --arg exported "$(date -I)" \
@@ -1962,7 +2023,7 @@ host_allow_apply_export() {
   fi
 
   local added=0 skipped=0
-  local name version ecosystem file_sha reason added_date kind normalized local_entry local_version fetched_sha disposition planned_entry statement_generation
+  local name version ecosystem file_sha reason added_date entry_override kind normalized local_entry local_version fetched_sha disposition planned_entry statement_generation
   if [[ "$writer" == "follow_collect_entry" ]]; then
     statement_generation=$(jq -er '.exported_at' "$file") || return 1
   fi
@@ -1978,7 +2039,8 @@ host_allow_apply_export() {
       (.version | type == "string") and (.reason | type == "string") and
       ((.ecosystem == null) or (.ecosystem | type == "string")) and
       ((.sha == null) or (.sha | type == "string")) and
-      ((.added == null) or (.added | type == "string"))' "$file" >/dev/null; then
+      ((.added == null) or (.added | type == "string")) and
+      ('"$HOST_ALLOW_BLOCK_OVERRIDE_VALID"')' "$file" >/dev/null; then
       warn "skip ${name}: invalid entry field types"
       skipped=$((skipped + 1)); failures=$((failures + 1)); continue
     fi
@@ -1987,6 +2049,7 @@ host_allow_apply_export() {
     file_sha=$(jq -r --arg p "$name" '.packages[$p].sha // empty' "$file")
     reason=$(jq -r --arg p "$name" '.packages[$p].reason // empty' "$file")
     added_date=$(jq -r --arg p "$name" '.packages[$p].added // empty' "$file")
+    entry_override=$(jq -c --arg p "$name" '.packages[$p].block_override // empty' "$file")
 
     # The file is untrusted external input — validate exactly as `add` does,
     # and reject any version that is not an exact registry pin (§ is_exact_version).
@@ -2014,6 +2077,12 @@ host_allow_apply_export() {
       # Every valid identity this verified statement carries, with its
       # canonical ecosystem: the commit derives unattended authority from it.
       follow_statement_ids=$(jq -c --arg id "$(follow_canonical_eco "$ecosystem"):$normalized@$version" '. + [$id]' <<<"$follow_statement_ids")
+      # The advisories this statement accepts for a BLOCK on that identity:
+      # the only source of the followed BLOCK override (review r1 F1).
+      if [[ -n "$entry_override" ]]; then
+        follow_statement_overrides=$(jq -c --arg id "$(follow_canonical_eco "$ecosystem"):$normalized@$version" \
+          --argjson o "$entry_override" '.[$id] = ($o.advisories | unique)' <<<"$follow_statement_overrides")
+      fi
       if jq -e --arg id "$normalized@$version" 'index($id) != null' <<<"$applied" >/dev/null; then
         continue
       fi
@@ -2036,13 +2105,20 @@ host_allow_apply_export() {
       fi
       if [[ "$local_version" == "$version" ]]; then
         if [[ "$writer" == "follow_collect_entry" ]]; then
-          follow_collect_entry "$normalized" "$version" "$file_sha" "$reason" "$ecosystem" "$added_date" "$origin" present "$statement_generation" || return 1
-        else
-          printf '  present  %s@%s (already allowed)\n' "$normalized" "$version" >&2
+          follow_collect_entry "$normalized" "$version" "$file_sha" "$reason" "$ecosystem" "$added_date" "$origin" present "$statement_generation" "$entry_override" || return 1
+          skipped=$((skipped + 1)); continue
         fi
-        skipped=$((skipped + 1)); continue
+        # A reviewed import may change only the recorded BLOCK override of a
+        # pin it already matches; anything else is already allowed.
+        if [[ -z "$entry_override" ]] \
+          || [[ "$(printf '%s' "$local_entry" | jq -c '.block_override // null')" == "$(jq -c . <<<"$entry_override")" ]]; then
+          printf '  present  %s@%s (already allowed)\n' "$normalized" "$version" >&2
+          skipped=$((skipped + 1)); continue
+        fi
       fi
-      if [[ "$writer" == "follow_collect_entry" ]]; then
+      if [[ "$local_version" == "$version" ]]; then
+        : # import: override change on a matching pin, written below
+      elif [[ "$writer" == "follow_collect_entry" ]]; then
         disposition="replace"
       else
         printf '  CONFLICT %s: local pins @%s, import has @%s — resolve with: safe run host-allow update %s@%s --reason "..."\n' \
@@ -2069,7 +2145,7 @@ host_allow_apply_export() {
 
     if [[ "$writer" == "follow_collect_entry" ]]; then
       [[ -n "$disposition" ]] || disposition="verified"
-      follow_collect_entry "$normalized" "$version" "$fetched_sha" "$reason" "$ecosystem" "$added_date" "$origin" "$disposition" "$statement_generation" || return 1
+      follow_collect_entry "$normalized" "$version" "$fetched_sha" "$reason" "$ecosystem" "$added_date" "$origin" "$disposition" "$statement_generation" "$entry_override" || return 1
       added=$((added + 1)); continue
     fi
 
@@ -2082,7 +2158,7 @@ host_allow_apply_export() {
       added=$((added + 1)); continue
     fi
 
-    "$writer" "$normalized" "$version" "$fetched_sha" "$reason" "$ecosystem" "$added_date" "$origin" 0 "" "import" || return 1
+    "$writer" "$normalized" "$version" "$fetched_sha" "$reason" "$ecosystem" "$added_date" "$origin" 0 "" "import" "$entry_override" || return 1
     info "imported ${normalized}@${version}"
     added=$((added + 1))
   done
@@ -2246,8 +2322,8 @@ follow_publish_state() {
 # entry observed before fetch must not be resurrected if removed during fetch.
 follow_collect_entry() {
   follow_candidates=$(jq -c --arg p "$1" --arg v "$2" --arg s "$3" \
-    --arg r "$4" --arg e "$5" --arg d "$6" --arg disposition "$8" --arg generation "$9" \
-    '. + [{name:$p, version:$v, sha:$s, reason:$r, ecosystem:$e, added:$d, disposition:$disposition, generation:$generation}]' \
+    --arg r "$4" --arg e "$5" --arg d "$6" --arg disposition "$8" --arg generation "$9" --arg override "${10:-}" \
+    '. + [{name:$p, version:$v, sha:$s, reason:$r, ecosystem:$e, added:$d, disposition:$disposition, generation:$generation, block_override:$override}]' \
     <<<"$follow_candidates")
 }
 
@@ -2264,11 +2340,24 @@ follow_canonical_eco() {
 # No registry calls here. The caller holds the shared writer lock for real
 # writes; dry-run reads atomic snapshots without creating a lock or ledger.
 follow_commit_generation() {
-  local dry_run="$1" origin="$2" ha_file="$3" stamp="$4" candidates="$5" signer="${6:-}" statement_ids="${7:-[]}"
-  local state_file state selected next entry name version sha reason ecosystem added disposition id local_entry local_generation local_origin statement_generation planned_entry replacement replace_local generation_rc already_refused
+  local dry_run="$1" origin="$2" ha_file="$3" stamp="$4" candidates="$5" signer="${6:-}" statement_ids="${7:-[]}" statement_overrides="${8:-\{\}}" statement_sha="${9:-}"
+  local state_file state selected next entry name version sha reason ecosystem added disposition id override_changed local_entry local_generation local_origin statement_generation planned_entry replacement replace_local generation_rc already_refused
   local changed=0 failures=0
   state_file="$(dirname "$ha_file")/follow-state.json"
   state=$(follow_load_state "$state_file") || return 1
+  local pre_state="$state" prior_stamp prior_sha
+  # One generation, one statement (review r2 F1): a different signed statement
+  # carrying an already-accepted exported_at is a collision, never a silent
+  # replacement — otherwise replaying an older statement of that second could
+  # restore authority a newer one withdrew. Authority stays as accepted; the
+  # operator resolves it with a newer export, or import/update at a terminal.
+  prior_stamp=$(jq -r --arg host "$origin" '.origins[$host].accepted // empty' <<<"$state")
+  prior_sha=$(jq -r --arg host "$origin" '.origins[$host].statement_sha256 // empty' <<<"$state")
+  if [[ -n "$statement_sha" && -n "$prior_sha" && -n "$prior_stamp" && "$prior_sha" != "$statement_sha" ]] &&
+     [[ "$(follow_exported_epoch "$prior_stamp" 2>/dev/null)" == "$(follow_exported_epoch "$stamp" 2>/dev/null)" ]]; then
+    warn "WARN follow: skipped $origin (a different signed statement for the already-accepted generation $stamp; ask the origin for a newer export, or review it with host-allow import at an operator terminal)"
+    return 1
+  fi
   selected=$(follow_select_generation "$state" "$origin" "$stamp") || return $?
   if [[ "$selected" != "$state" ]]; then
     (( dry_run )) || follow_publish_state "$state_file" "$selected" || return 1
@@ -2387,18 +2476,31 @@ follow_commit_generation() {
       # cannot allow replay after removal. Explicit publication failure rolls
       # back this mark; registry failures never reach this phase at all.
       follow_publish_state "$state_file" "$next" || return 1
-      if [[ "$disposition" == "replace" ]] ||
+      # A pin this origin already gave at this version is refreshed when the
+      # origin changed its recorded BLOCK override (added, widened, dropped);
+      # the locked writer re-checks origin and override before rewriting.
+      override_changed=0
+      if [[ "$disposition" == "present" && "$local_version" == "$version" && "$local_origin" == "$origin" ]] &&
+         [[ "$(jq -c '.block_override // null' <<<"$local_entry")" != "$(jq -c 'if .block_override == "" then null else (.block_override | fromjson) end' <<<"$entry")" ]]; then
+        override_changed=1
+      fi
+      if [[ "$disposition" == "replace" ]] || (( override_changed )) ||
          [[ -z "$local_version" && "$disposition" != "present" ]]; then
         sha=$(jq -r '.sha' <<<"$entry")
+        # A refreshed pin keeps the integrity already verified for it; the
+        # present path never re-fetched the registry.
+        (( ! override_changed )) || sha=$(jq -r '.sha // empty' <<<"$local_entry")
         reason=$(jq -r '.reason' <<<"$entry")
         ecosystem=$(jq -r '.ecosystem' <<<"$entry")
         added=$(jq -r '.added' <<<"$entry")
-        if ! write_host_allow_entry_locked "$name" "$version" "$sha" "$reason" "$ecosystem" "$added" "$origin" "$replace_local" "$stamp" "follow"; then
+        if ! write_host_allow_entry_locked "$name" "$version" "$sha" "$reason" "$ecosystem" "$added" "$origin" "$replace_local" "$stamp" "follow" "$(jq -r '.block_override' <<<"$entry")"; then
           follow_publish_state "$state_file" "$state" || warn "follow: could not restore entry ledger after a failed write; operator repair/import required"
           return 1
         fi
         if [[ -n "$replacement" ]]; then
           info "followed $id from $origin (replaced local pin @$local_version)"
+        elif (( override_changed )); then
+          info "followed $id from $origin (BLOCK override updated)"
         else
           info "followed $id from $origin"
         fi
@@ -2414,12 +2516,29 @@ follow_commit_generation() {
   # a statement from another key, or one without the identity, cannot
   # inherit an earlier signer's grants, and an identity is bound to the
   # ecosystem the signed statement named. A new generation starts empty.
+  # `block_overrides` binds each granted identity to the advisories THIS
+  # statement accepts for a BLOCK on it (2026-09-30 rulings, review r1 F1);
+  # the gate's followed BLOCK lane reads nothing else.
   if [[ -n "$signer" ]]; then
-    next=$(jq -c --arg host "$origin" --arg signer "$signer" --argjson ids "$statement_ids" '
+    next=$(jq -c --arg host "$origin" --arg signer "$signer" --argjson ids "$statement_ids" \
+      --argjson ovr "$statement_overrides" --arg digest "$statement_sha" '
       (.origins[$host].applied // []) as $applied
+      | ([ $ids[] | select((split(":")[1:] | join(":")) as $id | $applied | index($id) != null) ] | unique) as $granted
       | .origins[$host].signer = $signer
-      | .origins[$host].granted = ([ $ids[] | select((split(":")[1:] | join(":")) as $id
-          | $applied | index($id) != null) ] | unique)' <<<"$state") || return 1
+      | .origins[$host].granted = $granted
+      | .origins[$host].block_overrides = ($ovr | with_entries(select(.key as $k | $granted | index($k) != null)))
+      | if $digest == "" then . else .origins[$host].statement_sha256 = $digest end' <<<"$state") || return 1
+    if (( dry_run )); then
+      # Preview the trust change the real run would make (review r1 F2),
+      # against the ledger as committed, before a newer generation reset it.
+      jq -r --arg host "$origin" --argjson new "$next" '
+        (.origins[$host].block_overrides // {}) as $old
+        | ($new.origins[$host].block_overrides // {}) as $cur
+        | (($old + $cur) | keys[]) as $k
+        | if ($old[$k] // null) == ($cur[$k] // null) then empty
+          elif $cur[$k] == null then "  would-drop-block-override \($k) from \($host)"
+          else "  would-set-block-override \($k) from \($host): \($cur[$k] | join(","))" end' <<<"$pre_state" >&2 || true
+    fi
     if [[ "$next" != "$state" ]]; then
       (( dry_run )) || follow_publish_state "$state_file" "$next" || return 1
       changed=1
@@ -2432,7 +2551,7 @@ follow_commit_generation() {
 
 follow_apply_generation() {
   local file="$1" dry_run="$2" origin="$3" ha_file="$4" signer="${5:-}"
-  local state stamp applied collect_rc=0 commit_rc=0 follow_candidates='[]' follow_statement_ids='[]'
+  local state stamp applied collect_rc=0 commit_rc=0 follow_candidates='[]' follow_statement_ids='[]' follow_statement_overrides='{}'
   if ! stamp=$(jq -er '.exported_at | select(type == "string" and (test("[[:space:][:cntrl:]]") | not))' "$file") ||
      ! follow_exported_epoch "$stamp" >/dev/null; then
     warn "WARN follow: skipped $origin (invalid exported_at; expected a real ISO-8601 timestamp with timezone)"
@@ -2445,12 +2564,14 @@ follow_apply_generation() {
   fi
   state=$(follow_select_generation "$state" "$origin" "$stamp") || return $?
   applied=$(jq -c --arg host "$origin" '.origins[$host].applied' <<<"$state") || return 1
+  local statement_sha
+  statement_sha=$(sha256sum -- "$file" | cut -d' ' -f1) || return 1
   # Validation and all bounded registry I/O happen before acquiring the lock.
   host_allow_apply_export "$file" "$dry_run" "$origin" "$ha_file" follow_collect_entry "$applied" || collect_rc=$?
   if (( dry_run )); then
-    follow_commit_generation "$dry_run" "$origin" "$ha_file" "$stamp" "$follow_candidates" "$signer" "$follow_statement_ids" || commit_rc=$?
+    follow_commit_generation "$dry_run" "$origin" "$ha_file" "$stamp" "$follow_candidates" "$signer" "$follow_statement_ids" "$follow_statement_overrides" "$statement_sha" || commit_rc=$?
   else
-    with_host_allow_lock "$ha_file" follow_commit_generation "$dry_run" "$origin" "$ha_file" "$stamp" "$follow_candidates" "$signer" "$follow_statement_ids" || commit_rc=$?
+    with_host_allow_lock "$ha_file" follow_commit_generation "$dry_run" "$origin" "$ha_file" "$stamp" "$follow_candidates" "$signer" "$follow_statement_ids" "$follow_statement_overrides" "$statement_sha" || commit_rc=$?
   fi
   (( commit_rc != 2 )) || return 2
   (( collect_rc == 0 )) || return 1
@@ -2572,11 +2693,12 @@ cmd_host_allow_add() {
   trust_redirected_guard write "host-allow-add"
   local spec="${1:-}"
   shift || true
-  [[ -z "$spec" ]] && die "usage: safe run host-allow add <pkg>@<version> --reason \"...\""
+  [[ -z "$spec" ]] && die "usage: safe run host-allow add <pkg>@<version> --reason \"...\" [--ecosystem <eco>] [--accept-block]"
   require_operator_tty add "$spec"
-  local reason="" ecosystem="npm"
+  local reason="" ecosystem="npm" accept_block=0 block_override=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --accept-block) accept_block=1; shift ;;
       --reason) reason="$2"; shift 2 ;;
       --reason=*) reason="${1#--reason=}"; shift ;;
       --ecosystem) ecosystem="$2"; shift 2 ;;
@@ -2590,7 +2712,11 @@ cmd_host_allow_add() {
   package_kind=$(ecosystem_to_runner_kind "$ecosystem") || die "unknown --ecosystem: $ecosystem"
   PKG_NAME=$(normalize_and_validate_package_or_die "$PKG_NAME" "$package_kind" "$spec")
   host_allow_require_reason "$reason"
-  host_allow_preflight_audit "$PKG_NAME" "$PKG_VERSION" "$ecosystem" "add to host-allow"
+  if (( accept_block )); then
+    block_override=$(host_allow_accept_block "$PKG_NAME" "$PKG_VERSION" "$ecosystem")
+  else
+    host_allow_preflight_audit "$PKG_NAME" "$PKG_VERSION" "$ecosystem" "add to host-allow"
+  fi
 
   local sha=""
   case "$ecosystem" in
@@ -2600,8 +2726,14 @@ cmd_host_allow_add() {
   esac
   [[ -n "$sha" ]] || die "could not verify ${PKG_NAME}@${PKG_VERSION} against the registry (unknown version or registry unreachable) — retry when the registry is reachable"
 
-  write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem" "" "" 0 "" "add"
-  info "added ${PKG_NAME}@${PKG_VERSION} to host-allow"
+  write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem" "" "" 0 "" "add" "$block_override"
+  if [[ -n "$block_override" ]]; then
+    audit_log "host-allow" "${PKG_NAME}@${PKG_VERSION}" "TRUST" "$(context_label)" "BLOCK_OVERRIDE_RECORDED" \
+      "advisories=$(jq -r '.advisories | join(",")' <<<"$block_override")"
+    info "added ${PKG_NAME}@${PKG_VERSION} to host-allow with a recorded BLOCK override ($(jq -r '.advisories | join(", ")' <<<"$block_override"))"
+  else
+    info "added ${PKG_NAME}@${PKG_VERSION} to host-allow"
+  fi
 }
 
 cmd_host_allow_remove() {
@@ -2679,7 +2811,7 @@ cmd_host_allow_update() {
 cmd_host_allow_list() {
   load_trust_store_json "$HOST_ALLOW_FILE" | \
     jq -r '.packages | to_entries[] |
-    "\(.key)@\(.value.version)\t\(.value.ecosystem // "npm")\t\(.value.added)\t\(.value.reason)"' | \
+    "\(.key)@\(.value.version)\t\(.value.ecosystem // "npm")\t\(.value.added)\t\(.value.reason)\(if .value.block_override then " [BLOCK override: " + (.value.block_override.advisories | join(", ")) + "]" else "" end)"' | \
     awk -F'\t' 'BEGIN{printf "%-40s %-8s %-12s %s\n","PACKAGE","ECO","ADDED","REASON"}
                 {printf "%-40s %-8s %-12s %s\n",$1,$2,$3,$4}'
   printf '\nnote: host-allow tier ONLY applies to npm/npx (uses --ignore-scripts).\n'
@@ -2766,9 +2898,9 @@ host_allow_review_probe() {
 host_allow_review_usage() {
   # Observed usage for one entry; sets REVIEW_TIMES_USED, REVIEW_LAST_USED.
   # Executions come from the host-allow execution log (canonical, one JSON
-  # line per exec); install-gate WARN overrides come from the audit log
-  # (`GATE` tier, `HOST_ALLOW_OVERRIDE` or `ALLOWED_VIA_FOLLOWED_GRANT`
-  # decision). The audit log's own
+  # line per exec); install-gate overrides come from the audit log (`GATE`
+  # tier, `HOST_ALLOW_OVERRIDE`, `ALLOWED_VIA_FOLLOWED_GRANT` or
+  # `RECORDED_BLOCK_OVERRIDE_TTY` decision). The audit log's own
   # HOST_ALLOW tier lines duplicate the execution log — not counted twice.
   local pkg="$1"
   local exec_count=0 gate_count=0
@@ -2791,7 +2923,7 @@ host_allow_review_usage() {
   fi
   if [[ -f "$AUDIT_LOG" ]]; then
     gate_count=$(awk -F' \\| ' -v pkg="$pkg" '
-      $4 == "GATE" && ($6 == "HOST_ALLOW_OVERRIDE" || $6 == "ALLOWED_VIA_FOLLOWED_GRANT") \
+      $4 == "GATE" && ($6 == "HOST_ALLOW_OVERRIDE" || $6 == "ALLOWED_VIA_FOLLOWED_GRANT" || $6 == "RECORDED_BLOCK_OVERRIDE_TTY") \
         && ($3 == pkg || index($3, pkg "@") == 1) { count++ }
       END { print count + 0 }' "$AUDIT_LOG" 2>/dev/null) || gate_count=0
     while IFS= read -r ts; do
@@ -2802,7 +2934,7 @@ host_allow_review_usage() {
         gate_last="$ts"
       fi
     done < <(awk -F' \\| ' -v pkg="$pkg" '
-      $4 == "GATE" && ($6 == "HOST_ALLOW_OVERRIDE" || $6 == "ALLOWED_VIA_FOLLOWED_GRANT") \
+      $4 == "GATE" && ($6 == "HOST_ALLOW_OVERRIDE" || $6 == "ALLOWED_VIA_FOLLOWED_GRANT" || $6 == "RECORDED_BLOCK_OVERRIDE_TTY") \
         && ($3 == pkg || index($3, pkg "@") == 1) { print $1 }' "$AUDIT_LOG" 2>/dev/null)
   fi
   REVIEW_TIMES_USED=$(( exec_count + gate_count ))

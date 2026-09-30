@@ -113,7 +113,7 @@ host-set pin yields to any signed statement. Replacements are recorded in the
 run audit log and the origin's `replaced` ledger array. Dry-run validates the
 whole plan without changing persistent state. A machine-local `follow-state.json` beside the
 guard-selected trust store records each origin as
-`{"accepted":"<exported_at>","applied":["<pkg>@<version>"],"replaced":["<pkg>@<old>-><new>"],"refused":["<pkg>@<version>"],"signer":"<fingerprint>","granted":["<ecosystem>:<pkg>@<version>"]}`. Older timestamps
+`{"accepted":"<exported_at>","applied":["<pkg>@<version>"],"replaced":["<pkg>@<old>-><new>"],"refused":["<pkg>@<version>"],"signer":"<fingerprint>","granted":["<ecosystem>:<pkg>@<version>"],"block_overrides":{"<ecosystem>:<pkg>@<version>":["<advisory id>"]},"statement_sha256":"<sha256>"}`. Older timestamps
 warn, increment the freshness-skip count and return non-zero. Equal timestamps
 retry only identities that never applied; successful entries stay skipped even
 after operator removal. A local re-pin survives an equal generation and a newer
@@ -170,7 +170,11 @@ terminal (gate exit 16) only while the signer recorded for its origin stays
 pinned, the identity is in that origin's accepted generation and the local pin
 exists. After upgrading a follower, run `safe run host-allow follow` once so the
 ledger records the signer; until then followed grants keep asking for a
-terminal.
+terminal. The same conditions govern a BLOCK override the origin recorded
+(`host-allow add --accept-block`): the next `follow` carries it to pins taken
+from that origin, and the follower then installs the accepted version
+unattended while no new blocking advisory appears. Hosts still on an older
+safe ignore the override and keep refusing.
 Freshness prevents replay only for generations this machine already accepted:
 initial bootstrap, a newer signed statement, or another authorized origin can
 still authorize a previously removed grant. Retire those exports or revoke the

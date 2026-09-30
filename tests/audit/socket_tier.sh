@@ -51,7 +51,12 @@ case "$url" in
     if [[ -n "${MOCK_OSV_ECO_LOG:-}" ]]; then
       grep -oE '"ecosystem": *"[^"]*"' <<<"$data" >> "$MOCK_OSV_ECO_LOG" 2>/dev/null || true
     fi
-    if [[ "${MOCK_COOLDOWN_FIX:-0}" == "1" && "$data" != *'"version"'* ]]; then
+    if [[ -n "${MOCK_OSV_CRITICAL:-}" ]]; then
+      # Comma-separated ids, each a CRITICAL advisory affecting every version.
+      printf '%s' "$MOCK_OSV_CRITICAL" | tr ',' '\n' | jq -R '{id: ., database_specific: {severity: "CRITICAL"},
+        affected: [{package: {ecosystem: "npm", name: "fixture"}, ranges: [{type: "SEMVER", events: [{introduced: "0"}]}]}]}' \
+        | jq -s '{vulns: .}' | emit
+    elif [[ "${MOCK_COOLDOWN_FIX:-0}" == "1" && "$data" != *'"version"'* ]]; then
       printf '%s\n' '{"vulns":[{"id":"GHSA-FIXED","database_specific":{"severity":"HIGH"},"affected":[{"package":{"ecosystem":"npm","name":"fixture"},"ranges":[{"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"1.0.0"}]}]}]}]}' | emit
     else
       printf '{"vulns":[]}\n' | emit
@@ -838,6 +843,120 @@ seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")
   '{"cooldown_days":0,"socket":{"mode":"always","cache_ttl_days":7}}'
 run_check malware --gate install --op install
 expect_rc 20 'a followed grant never clears a BLOCK'
+
+# --- BLOCK override lanes (operator rulings 2026-09-30) ---------------------
+# An advisory-only BLOCK names its blocking advisories; a recorded override on
+# the host-allow entry covers the install only while every one of them was
+# accepted. Recorded locally -> terminal confirm (17); taken from a followed
+# signed export -> unattended (16). Anything else stays 20 (the gate then
+# offers the typed per-install override at an operator terminal).
+seed_block_override() {
+  local accepted="$1"
+  jq --argjson ids "$accepted" '.packages.fixture.block_override = {advisories: $ids, accepted: "2026-09-30"}' \
+    "$CASE_RUN_CONFIG/host-allow.json" > "$CASE/ha.json" && mv "$CASE/ha.json" "$CASE_RUN_CONFIG/host-allow.json"
+}
+ledger_block_override() {
+  jq --argjson ids "$1" '.origins.rainbow.block_overrides = {"npm:fixture@1.0.0": $ids}' \
+    "$CASE_RUN_CONFIG/follow-state.json" > "$CASE/fs.json" && mv "$CASE/fs.json" "$CASE_RUN_CONFIG/follow-state.json"
+}
+drop_follow_label() {
+  jq 'del(.packages.fixture.followed_from, .packages.fixture.followed_generation)' \
+    "$CASE_RUN_CONFIG/host-allow.json" > "$CASE/ha.json" && mv "$CASE/ha.json" "$CASE_RUN_CONFIG/host-allow.json"
+}
+BLOCK_INSTALL='{"cooldown_days":0,"socket":{"mode":"always","cache_ttl_days":7}}'
+
+prepare_case block-advisory-plain
+seed_followed_grant "" "" '[]' "$BLOCK_INSTALL"
+run_check clean MOCK_OSV_CRITICAL=GHSA-bbbb,GHSA-aaaa SAFE_AUDIT_RESULT_OUT="$CASE/result.json" --gate install --op install
+expect_rc 20 'an advisory BLOCK with no override stays 20'
+expect_json '.verdict == "BLOCK" and .package == "fixture" and .block.class == "advisory"
+  and .block.advisories == ["GHSA-aaaa","GHSA-bbbb"]' 'the result names the class and the sorted blocking advisories'
+jq -e '.gate_exit == 20 and .package == "fixture" and .resolved_versions == ["1.0.0"]
+  and .block.class == "advisory"' "$CASE/result.json" >/dev/null 2>&1 \
+  && pass 'SAFE_AUDIT_RESULT_OUT receives the decided result for the gate' || fail 'SAFE_AUDIT_RESULT_OUT receives the decided result for the gate'
+
+prepare_case block-override-local
+seed_followed_grant 1.0.0 "" '[]' "$BLOCK_INSTALL"
+drop_follow_label
+seed_block_override '["GHSA-aaaa","GHSA-bbbb"]'
+run_check clean MOCK_OSV_CRITICAL=GHSA-aaaa --gate install --op install
+expect_rc 17 'a local recorded override covers the BLOCK behind a terminal confirm'
+grep -q 'recorded on this host' "$CASE_ERR" \
+  && pass 'the audit names the recorded override' || fail 'the audit names the recorded override'
+
+prepare_case block-override-label-only
+seed_followed_grant 1.0.0 "" "[\"$FOLLOW_SIGNER\"]" "$BLOCK_INSTALL"
+seed_block_override '["GHSA-aaaa"]'
+run_check clean MOCK_OSV_CRITICAL=GHSA-aaaa --gate install --op install
+expect_rc 17 'a followed_from label without a ledger identity keeps the terminal confirm'
+
+prepare_case block-override-followed
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$BLOCK_INSTALL"
+seed_block_override '["GHSA-aaaa"]'
+ledger_block_override '["GHSA-aaaa"]'
+run_check clean MOCK_OSV_CRITICAL=GHSA-aaaa --gate install --op install
+expect_rc 16 'a followed override installs the accepted BLOCK unattended'
+jq -e '.packages["npm:fixture"] | .verdict == "ALLOWED_VIA_FOLLOWED_GRANT"
+    and (.reasons | index("covered:block_override") != null)
+    and (.reasons | index("block_advisory:GHSA-aaaa") != null)' "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1 \
+  && pass 'the followed BLOCK receipt names the accepted advisories' || fail 'the followed BLOCK receipt names the accepted advisories'
+tail -n 1 "$CASE_DATA/audit/audit-log.jsonl" 2>/dev/null | jq -e '.event == "followed_grant" and .covered == "block_override"
+  and .origin == "rainbow"' >/dev/null 2>&1 \
+  && pass 'the verdict log records the followed BLOCK override' || fail 'the verdict log records the followed BLOCK override'
+
+# Review r1 F1: a WARN-era followed ledger plus an override in the store that
+# no verified statement bound is never unattended.
+prepare_case block-override-store-only
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$BLOCK_INSTALL"
+seed_block_override '["GHSA-aaaa"]'
+run_check clean MOCK_OSV_CRITICAL=GHSA-aaaa --gate install --op install
+expect_rc 17 'an override only in the store never rides a followed ledger unattended'
+prepare_case block-override-ledger-narrower
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$BLOCK_INSTALL"
+seed_block_override '["GHSA-aaaa","GHSA-cccc"]'
+ledger_block_override '["GHSA-aaaa"]'
+run_check clean MOCK_OSV_CRITICAL=GHSA-aaaa,GHSA-cccc --gate install --op install
+expect_rc 17 'the followed lane covers only what the verified statement accepted'
+
+prepare_case block-override-followed-signer-unpinned
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" '[]' "$BLOCK_INSTALL"
+seed_block_override '["GHSA-aaaa"]'
+run_check clean MOCK_OSV_CRITICAL=GHSA-aaaa --gate install --op install
+expect_rc 17 'an unpinned signer turns a followed override into a terminal confirm'
+
+prepare_case block-override-followed-local-entry
+# Ledger lists the identity, but the entry itself is a local operator pin: the
+# unattended lane needs the override to come from that origin.
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$BLOCK_INSTALL"
+drop_follow_label
+seed_block_override '["GHSA-aaaa"]'
+ledger_block_override '["GHSA-aaaa"]'
+run_check clean MOCK_OSV_CRITICAL=GHSA-aaaa --gate install --op install
+expect_rc 17 'a local override never rides a WARN-era ledger identity unattended'
+
+prepare_case block-override-new-advisory
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$BLOCK_INSTALL"
+seed_block_override '["GHSA-aaaa"]'
+run_check clean MOCK_OSV_CRITICAL=GHSA-aaaa,GHSA-cccc --gate install --op install
+expect_rc 20 'a blocking advisory outside the accepted set asks again'
+
+prepare_case block-override-other-version
+seed_followed_grant 2.0.0 "$(follow_ledger '["fixture@2.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$BLOCK_INSTALL"
+seed_block_override '["GHSA-aaaa"]'
+run_check clean MOCK_OSV_CRITICAL=GHSA-aaaa --gate install --op install
+expect_rc 20 'an override recorded for another version does not cover this one'
+
+prepare_case block-override-malware
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$BLOCK_INSTALL"
+seed_block_override '["GHSA-aaaa"]'
+run_check malware MOCK_OSV_CRITICAL=GHSA-aaaa --gate install --op install
+expect_rc 20 'a recorded override never covers a malware BLOCK'
+expect_json '.block.class == "malware" and .block.advisories == []' 'a malware BLOCK names no overridable advisories'
+
+prepare_case block-grant-without-override
+seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$BLOCK_INSTALL"
+run_check clean MOCK_OSV_CRITICAL=GHSA-aaaa --gate install --op install
+expect_rc 20 'a followed grant without an override never clears an advisory BLOCK'
 
 # --- required-version derivation is deny-by-default (Fibery #106, review F1) --
 # The host-allow required set must treat EVERY non per-version cause as

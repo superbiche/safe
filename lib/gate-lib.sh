@@ -2848,6 +2848,128 @@ safe_gate_warn_grant_host_allow() {
   fi
 }
 
+# Operator override of an install-gate BLOCK (operator rulings 2026-09-30).
+# A BLOCK (gate exit 20) whose result document names one exact resolved
+# version is overridable at an operator terminal: the operator types
+# name@version to install once. For an
+# advisory-only BLOCK on a grant-capable ecosystem, typing
+# `record name@version` also records the override on the host-allow entry
+# (safe run host-allow add --accept-block, which re-audits and asks again);
+# signed exports carry it to followed hosts. Malware and blocklist BLOCKs are
+# never recorded. The result file is the audit's --result-out document.
+# Reads /dev/tty, never stdin, so --yes cannot reach it. Echoes
+# `once` or `record <name>@<version>`; returns non-zero otherwise.
+safe_gate_confirm_block() {
+  local ecosystem="$1" result="$2"
+  local target class ids reply recordable=0
+  target="$(jq -r 'if (.package | type) == "string" and (.resolved_versions | length) == 1
+    then "\(.package)@\(.resolved_versions[0])" else empty end' "${result}" 2>/dev/null)" || target=""
+  class="$(jq -r '.block.class // empty' "${result}" 2>/dev/null)" || class=""
+  ids="$(jq -r '.block.advisories // [] | join(", ")' "${result}" 2>/dev/null)" || ids=""
+  [[ -n "${target}" ]] || return 1
+  case "${class}" in
+    advisory)
+      safe_gate_err "safe: ${target} is BLOCKED: critical advisories affect this exact version (${ids})."
+      safe_gate_ecosystem_grant_capable "${ecosystem}" && recordable=1
+      ;;
+    malware)
+      safe_gate_err "safe: ${target} is BLOCKED: a known-malware record or a Socket critical supply-chain alert names it. Installing it runs code flagged as malicious; this override is never recorded." ;;
+    blocklist)
+      safe_gate_err "safe: ${target} is BLOCKED: this host's blocklist names it; this override is never recorded." ;;
+    *) return 1 ;;
+  esac
+  if (( recordable )); then
+    printf "safe: type %s to install once, or 'record %s' to install and record the override (signed exports carry it to followed hosts); anything else cancels: " "${target}" "${target}" >&2
+  else
+    printf 'safe: type %s to install once despite the BLOCK; anything else cancels: ' "${target}" >&2
+  fi
+  IFS= read -r reply </dev/tty || return 1
+  if [[ "${reply}" == "${target}" ]]; then
+    printf 'once'
+  elif (( recordable )) && [[ "${reply}" == "record ${target}" ]]; then
+    printf 'record %s' "${target}"
+  else
+    return 1
+  fi
+}
+
+# Best-effort record of an accepted advisory BLOCK: the install proceeds
+# either way, so a miss is surfaced, never fatal.
+safe_gate_block_record_override() {
+  local target="$1" ecosystem="$2" run_bin reason
+  if ! run_bin="$(safe_gate_resolve_run_bin)"; then
+    safe_gate_err "safe: install proceeded, but safe-run was not found to record the override; record it later: safe run host-allow add ${target} --reason \"...\" --accept-block"
+    return 0
+  fi
+  reason="operator BLOCK override at the install gate ($(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u))"
+  local -a cmd=("${run_bin}" host-allow add "${target}" --reason "${reason}" --accept-block)
+  case "$(safe_gate_canonical_eco "${ecosystem}")" in
+    python) cmd+=(--ecosystem python) ;;
+  esac
+  if "${cmd[@]}"; then
+    safe_gate_err "safe: recorded the BLOCK override for ${target}"
+  else
+    safe_gate_err "safe: install proceeded, but the BLOCK override was not recorded; record it later: safe run host-allow add ${target} --reason \"...\" --accept-block"
+  fi
+}
+
+# Gate exit 17: the BLOCK is covered by an override recorded on THIS host.
+# Like a host-allowed WARN (15) it is a deliberate grant, not a green check:
+# the operator confirms at the terminal; unattended shells refuse 102.
+safe_gate_confirm_recorded_block() {
+  local package="$1" reply
+  safe_gate_err "safe: ${package} is BLOCKED by critical advisories that the operator override recorded on this host accepts."
+  printf 'safe: install now? [y/N] ' >&2
+  IFS= read -r reply </dev/tty || return 1
+  [[ "$reply" == "y" || "$reply" == "Y" || "$reply" == "yes" || "$reply" == "YES" ]]
+}
+
+# One handler for 17/20 so the wrapper arm, bin/safe and the mise parent
+# agree. $4 names the operation in refusals ("npm install").
+# Returns 0 (proceed), 100 (declined), 102 (17 without a terminal) or 104.
+safe_gate_block_terminus() {
+  local code="$1" package="$2" ecosystem="$3" label="$4" result="$5" choice=""
+  if [[ "${code}" == 17 ]]; then
+    if ! safe_gate_operator_terminal; then
+      safe_gate_err "safe: BLOCKED ${label} of ${package} — the BLOCK is covered by an operator override recorded on this host, which an operator confirms at an interactive terminal; hand over the complete command with exact pinned versions; details: safe explain"
+      safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_RECORDED_BLOCK_OVERRIDE_NONTTY"
+      return 102
+    fi
+    if safe_gate_confirm_recorded_block "${package}"; then
+      safe_gate_audit_log "${ecosystem}" "${package}" "RECORDED_BLOCK_OVERRIDE_TTY"
+      return 0
+    fi
+    safe_gate_err "safe: BLOCKED ${label} of ${package} — recorded BLOCK override and you declined; details: safe explain"
+    safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_RECORDED_BLOCK_OVERRIDE_DECLINED"
+    return 100
+  fi
+  # Unchanged refusal off a terminal, and when the result names no exact
+  # version (unresolved, several versions, or no readable result).
+  if ! safe_gate_operator_terminal || [[ -z "${result}" || ! -s "${result}" ]] ||
+     ! jq -e '(.package | type) == "string" and (.resolved_versions | length) == 1
+       and (.block.class == "advisory" or .block.class == "malware" or .block.class == "blocklist")' "${result}" >/dev/null 2>&1; then
+    safe_gate_err "safe: BLOCKED ${label} of ${package} — safe audit verdict BLOCK; operator review required: safe audit package-audit ${package} --ecosystem ${ecosystem} --json; details: safe explain"
+    safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_BLOCK"
+    return 104
+  fi
+  choice="$(safe_gate_confirm_block "${ecosystem}" "${result}")" || choice=""
+  case "${choice}" in
+    once)
+      safe_gate_audit_log "${ecosystem}" "${package}" "BLOCK_TTY_OVERRIDE"
+      safe_gate_err "safe: installing ${package} despite the BLOCK by your override (this install only)."
+      return 0
+      ;;
+    record\ *)
+      safe_gate_audit_log "${ecosystem}" "${package}" "BLOCK_TTY_OVERRIDE_RECORD"
+      safe_gate_block_record_override "${choice#record }" "${ecosystem}"
+      return 0
+      ;;
+  esac
+  safe_gate_err "safe: BLOCKED ${label} of ${package} — safe audit verdict BLOCK and no override was typed; details: safe explain"
+  safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_BLOCK_DECLINED"
+  return 100
+}
+
 safe_gate_allow_hint() {
   local package="$1"
   local ecosystem="$2"
@@ -2953,9 +3075,20 @@ safe_gate_check() {
     return 0
   fi
 
-  safe_gate_run_audit "${package}" --ecosystem "${ecosystem}" \
+  # The BLOCK override reads the decided result (17/20). A deferring mise
+  # child writes it where its parent will read it (SAFE_GATE_RESULT_OUT).
+  local result_out="${SAFE_GATE_RESULT_OUT:-}" own_result=0
+  if [[ -z "${result_out}" ]]; then
+    result_out="$(mktemp "${TMPDIR:-/tmp}/safe-gate-result.XXXXXX")" || result_out=""
+    own_result=1
+  fi
+  SAFE_AUDIT_RESULT_OUT="${result_out}" safe_gate_run_audit "${package}" --ecosystem "${ecosystem}" \
     --gate install --op "$(safe_gate_audit_op)"
   audit_status=$?
+  if (( own_result )) && [[ -n "${result_out}" ]]; then
+    # Removed when this function returns, whichever arm returns.
+    trap 'rm -f -- "'"${result_out}"'"; trap - RETURN' RETURN
+  fi
 
   case "${audit_status}" in
     0)
@@ -3121,14 +3254,17 @@ safe_gate_check() {
       safe_gate_audit_log "${ecosystem}" "${package}" "ALLOWED_VIA_FOLLOWED_GRANT"
       return 0
       ;;
-    2|20)
-      # No allow hint on BLOCK: host-allow is a WARN-tier escape hatch and
-      # can never clear a BLOCK verdict — and for a known-malware record the
-      # hint would contradict the audit's own "do not pin around it"
-      # (review PR#55 F2). Operator review is the only next step.
-      safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — safe audit verdict BLOCK; operator review required: safe audit package-audit ${package} --ecosystem ${ecosystem} --json; details: safe explain"
-      safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_BLOCK"
-      return 104
+    17|2|20)
+      # BLOCK (rulings 2026-09-30). No allow hint: host-allow never clears a
+      # BLOCK, and for a known-malware record the hint would contradict the
+      # audit's own "do not pin around it" (review PR#55 F2). At an operator
+      # terminal a BLOCK on one exact version takes a typed override; 17 is
+      # a BLOCK covered by an override recorded on this host (terminal
+      # confirm, 102 without one). Everything else refuses 104 as before.
+      # The mise child defers both to its parent's terminal.
+      [[ "${3:-}" == defer-socket-consent ]] && return "${audit_status}"
+      safe_gate_block_terminus "${audit_status}" "${package}" "${ecosystem}" "${ecosystem} install" "${result_out}"
+      return $?
       ;;
     30)
       # The audit could not compute a verdict at all — the verdict engine is
@@ -5117,6 +5253,11 @@ safe_gate_mise_check_with_env() {
     return 0
   fi
   local audit_rc=0
+  # The child writes the decided result here so this parent can put a
+  # deferred BLOCK override (17/21) to the operator.
+  local SAFE_GATE_RESULT_OUT=""
+  SAFE_GATE_RESULT_OUT="$(mktemp "${TMPDIR:-/tmp}/safe-gate-result.XXXXXX")" || SAFE_GATE_RESULT_OUT=""
+  [[ -z "${SAFE_GATE_RESULT_OUT}" ]] || trap 'rm -f -- "'"${SAFE_GATE_RESULT_OUT}"'"; trap - RETURN' RETURN
   (
     if [[ -n "${SAFE_GATE_MISE_CD:-}" ]]; then
       # PHYSICAL cd (`cd -P`) to match mise's own chdir: mise -C runs Rust
@@ -5157,7 +5298,10 @@ safe_gate_mise_check_with_env() {
     esac
     safe_gate_check "$pkg" "$eco" defer-socket-consent
   ) || audit_rc=$?
-  if (( audit_rc == 12 )); then
+  if (( audit_rc == 17 || audit_rc == 20 || audit_rc == 2 )); then
+    safe_gate_block_terminus "${audit_rc}" "${pkg}" "${eco}" "${eco} install" "${SAFE_GATE_RESULT_OUT:-}"
+    return $?
+  elif (( audit_rc == 12 )); then
     safe_gate_accept_socket_rate_limit "$pkg" "$eco"
   elif (( audit_rc == 15 )); then
     # Tolerated/host-allowed WARN deferred by the child: operator confirms at
@@ -6150,6 +6294,8 @@ safe_gate_main() {
   # env-prefix the consent re-run uses is applied at the call site, after this
   # scrub, so the granted value still reaches exactly one re-audit.
   unset SAFE_AUDIT_SOCKET_CONSENT SAFE_GATE_CONSENT_RECURSION
+  # The BLOCK-override result channel is set per audit call, never inherited.
+  unset SAFE_GATE_RESULT_OUT SAFE_AUDIT_RESULT_OUT
   safe_gate_dispatch "$@"
 }
 

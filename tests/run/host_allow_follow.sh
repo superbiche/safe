@@ -207,14 +207,18 @@ pty_run "$SAFE_RUN" host-allow follow-signer add "$rotation_fingerprint" > "$tmp
 pty_run "$SAFE_RUN" host-allow follow-signer remove "$fingerprint" > "$tmp/output" 2>&1 || fail 'original signer remove failed'
 ! gate_followed_grant fresh-pkg 1.2.3 >/dev/null || fail 'an unpinned signer still authorized the grant'
 r1_sign "$rotation_fingerprint" '.packages = {}'
-expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/r1-in"
-jq -e --arg f "$rotation_fingerprint" '.origins.rainbow | .signer == $f and .granted == [] and .applied == ["fresh-pkg@1.2.3"]' \
-  "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'the rotation ledger differs'
+# A different statement for an already-accepted generation is a collision
+# (#173 review r2): refused, the ledger keeps the original signer, which is
+# no longer pinned — so nothing is inherited either way.
+expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/r1-in"
+grep -q 'different signed statement for the already-accepted generation' "$tmp/output" || fail 'the rotation collision was not reported'
+jq -e --arg f "$fingerprint" '.origins.rainbow | .signer == $f and .applied == ["fresh-pkg@1.2.3"]' \
+  "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'the rotation collision changed the ledger'
 ! gate_followed_grant fresh-pkg 1.2.3 >/dev/null || fail 'an equal-generation statement without the identity inherited it'
 # Legacy backfill: a pre-signer ledger gains authority only for identities the
 # verified statement actually carries.
 r1_restore
-jq 'del(.origins.rainbow.signer, .origins.rainbow.granted)' "$tmp/r1-state.json" > "$SAFE_RUN_CONFIG_DIR/follow-state.json"
+jq 'del(.origins.rainbow.signer, .origins.rainbow.granted, .origins.rainbow.statement_sha256)' "$tmp/r1-state.json" > "$SAFE_RUN_CONFIG_DIR/follow-state.json"
 r1_sign "$fingerprint" '.packages = {}'
 expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/r1-in"
 ! gate_followed_grant fresh-pkg 1.2.3 >/dev/null || fail 'a legacy backfill from a statement without the identity granted it'
@@ -222,13 +226,100 @@ r1_restore
 rm -rf "$tmp/r1-in"
 gate_followed_grant fresh-pkg 1.2.3 >/dev/null || fail 'restoring the ledger did not restore the grant'
 pass 'a signer or legacy backfill grants only identities its own verified statement carries'
+sign_document() {
+  gpg --no-options --batch --yes --armor --local-user "$1" --detach-sign --output "$2.asc" -- "$2" > "$tmp/sign.log" 2>&1 || fail 'fixture signing failed'
+}
+# BLOCK override carry-over (operator rulings 2026-09-30): an origin-side
+# override rides the signed export as an optional per-entry field; a follower
+# pinned at the same version from the same origin takes changes to it (added,
+# widened, dropped), a local operator pin is never touched, and a malformed
+# override fails the entry loudly.
+cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/bo-store-before.json"
+cp "$SAFE_RUN_CONFIG_DIR/follow-state.json" "$tmp/bo-state-before.json"
+mkdir "$tmp/bo-incoming"
+bo_stamp_base=$(date -d "$(jq -r '.exported_at' "$export_file")" +%s)
+bo_export() { # <seconds-after-base> <override-json|null>
+  jq --arg stamp "$(date -u -d "@$((bo_stamp_base + $1))" +%Y-%m-%dT%H:%M:%SZ)" --argjson o "$2" '
+    .exported_at = $stamp
+    | if $o == null then del(.packages["fresh-pkg"].block_override)
+      else .packages["fresh-pkg"].block_override = $o end' "$export_file" > "$tmp/bo-incoming/host-allow.rainbow.json"
+  sign_document "$fingerprint" "$tmp/bo-incoming/host-allow.rainbow.json"
+}
+bo_export 120 '{"advisories":["GHSA-aaaa"],"accepted":"2026-09-30"}'
+cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/bo-pre-store.json"
+cp "$SAFE_RUN_CONFIG_DIR/follow-state.json" "$tmp/bo-pre-state.json"
+expect_rc 0 "$SAFE_RUN" host-allow follow --dry-run --from "$tmp/bo-incoming"
+grep -q 'would-set-block-override npm:fresh-pkg@1.2.3 from rainbow: GHSA-aaaa' "$tmp/output" ||
+  fail "the preview does not show the override it would grant: $(cat "$tmp/output")"
+cmp "$tmp/bo-pre-store.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" && cmp "$tmp/bo-pre-state.json" "$SAFE_RUN_CONFIG_DIR/follow-state.json" ||
+  fail 'the override preview wrote trust state'
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/bo-incoming"
+grep -q 'BLOCK override updated' "$tmp/output" || fail 'the override refresh is not reported'
+jq -e '.origins.rainbow.block_overrides == {"npm:fresh-pkg@1.2.3": ["GHSA-aaaa"]}' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null ||
+  fail 'the ledger does not bind the accepted advisories to the verified statement'
+# Review r2 F1: one generation, one statement. A different signed statement
+# with the same exported_at is a collision: refused, authority unchanged; the
+# byte-identical original is an ordinary replay.
+cp "$tmp/bo-incoming/host-allow.rainbow.json" "$tmp/bo-orig.json"
+cp "$tmp/bo-incoming/host-allow.rainbow.json.asc" "$tmp/bo-orig.json.asc"
+cp "$SAFE_RUN_CONFIG_DIR/follow-state.json" "$tmp/bo-state-granted.json"
+jq 'del(.packages["fresh-pkg"].block_override)' "$tmp/bo-orig.json" > "$tmp/bo-incoming/host-allow.rainbow.json"
+sign_document "$fingerprint" "$tmp/bo-incoming/host-allow.rainbow.json"
+expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/bo-incoming"
+grep -q 'different signed statement for the already-accepted generation' "$tmp/output" || fail 'a same-generation collision was not reported'
+cmp "$tmp/bo-state-granted.json" "$SAFE_RUN_CONFIG_DIR/follow-state.json" || fail 'a same-generation collision changed the ledger'
+cp "$tmp/bo-orig.json" "$tmp/bo-incoming/host-allow.rainbow.json"
+cp "$tmp/bo-orig.json.asc" "$tmp/bo-incoming/host-allow.rainbow.json.asc"
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/bo-incoming"
+cmp "$tmp/bo-state-granted.json" "$SAFE_RUN_CONFIG_DIR/follow-state.json" || fail 'replaying the accepted statement changed the ledger'
+bo_export 120 '{"advisories":["GHSA-aaaa"],"accepted":"2026-09-30"}'
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/bo-incoming"
+jq -e '.packages["fresh-pkg"] | .version == "1.2.3" and .followed_from == "rainbow" and .sha == "sha512-FRESH"
+  and .block_override == {"advisories":["GHSA-aaaa"],"accepted":"2026-09-30"}' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null \
+  || fail 'a same-version pin did not take the origin override'
+jq -e '.origins.rainbow.block_overrides == {"npm:fresh-pkg@1.2.3": ["GHSA-aaaa"]}' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null \
+  || fail 'the ledger did not take the override back from the newer statement'
+bo_export 180 '{"advisories":["GHSA-aaaa","GHSA-bbbb"],"accepted":"2026-09-30"}'
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/bo-incoming"
+jq -e '.packages["fresh-pkg"].block_override.advisories == ["GHSA-aaaa","GHSA-bbbb"]' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null \
+  || fail 'a widened origin override did not reach the follower'
+jq -e '.origins.rainbow.block_overrides["npm:fresh-pkg@1.2.3"] == ["GHSA-aaaa","GHSA-bbbb"]' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null \
+  || fail 'the ledger binding did not widen'
+bo_export 240 null
+cp "$SAFE_RUN_CONFIG_DIR/follow-state.json" "$tmp/bo-pre-drop.json"
+expect_rc 0 "$SAFE_RUN" host-allow follow --dry-run --from "$tmp/bo-incoming"
+grep -q 'would-drop-block-override npm:fresh-pkg@1.2.3 from rainbow' "$tmp/output" || fail 'the preview hides a newer-generation withdrawal'
+cmp "$tmp/bo-pre-drop.json" "$SAFE_RUN_CONFIG_DIR/follow-state.json" || fail 'the withdrawal preview wrote the ledger'
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/bo-incoming"
+jq -e '.packages["fresh-pkg"] | has("block_override") | not' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null \
+  || fail 'an override the origin dropped survived on the follower'
+cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/bo-store-mid.json"
+bo_export 300 '{"advisories":[],"accepted":"2026-09-30"}'
+expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/bo-incoming"
+grep -q 'invalid entry field types' "$tmp/output" || fail 'a malformed override was not reported'
+cmp "$tmp/bo-store-mid.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'a malformed override changed the store'
+jq 'del(.packages["fresh-pkg"].followed_from, .packages["fresh-pkg"].followed_generation)' \
+  "$tmp/bo-store-mid.json" > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/bo-local.json"
+bo_export 360 '{"advisories":["GHSA-aaaa"],"accepted":"2026-09-30"}'
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/bo-incoming"
+cmp "$tmp/bo-local.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'an origin override rewrote a local operator pin'
+# Origin side: the export projection carries the override and nothing else new.
+jq '.packages["fresh-pkg"].block_override = {"advisories":["GHSA-aaaa"],"accepted":"2026-09-30"}' \
+  "$tmp/bo-local.json" > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+expect_rc 0 "$SAFE_RUN" host-allow export
+jq -e '.packages["fresh-pkg"] | keys == ["added","block_override","ecosystem","reason","sha","version"]
+  and .block_override.advisories == ["GHSA-aaaa"]' "$tmp/output" >/dev/null || fail 'export does not carry the override'
+cp "$tmp/bo-store-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+cp "$tmp/bo-state-before.json" "$SAFE_RUN_CONFIG_DIR/follow-state.json"
+pass 'a signed export carries the BLOCK override; same-origin pins take changes, local pins and malformed overrides do not'
 
 # Review r2 F3: the dry-run plan keeps each planned entry's ecosystem, so two
 # origins granting the same Python package preview exactly as they apply, and
 # a planned Python entry still conflicts with an npm statement.
 r1_restore
 r2_sign() { # <origin> <ecosystem>
-  jq --arg h "$1" --arg e "$2" '.host = $h | .packages = {"epoch-pkg":{"version":"1!2.0","ecosystem":$e,"sha":"sha256-EPOCH","reason":"union","added":"2026-06-03"}}' \
+  jq --arg h "$1" --arg e "$2" --arg s "$r1_later" '.host = $h | .exported_at = $s | .packages = {"epoch-pkg":{"version":"1!2.0","ecosystem":$e,"sha":"sha256-EPOCH","reason":"union","added":"2026-06-03"}}' \
     "$export_file" > "$tmp/r1-in/host-allow.$1.json"
   gpg --no-options --batch --yes --armor --local-user "$fingerprint" --detach-sign \
     --output "$tmp/r1-in/host-allow.$1.json.asc" -- "$tmp/r1-in/host-allow.$1.json" > "$tmp/sign.log" 2>&1 || fail 'fixture signing failed'
@@ -251,9 +342,6 @@ pass 'dry-run previews a cross-origin Python union as it applies; planned entrie
 mkdir "$tmp/incoming"
 cp "$export_file" "$tmp/original.json"
 reset_incoming() { rm -f "$tmp/incoming/"* "$SAFE_RUN_CONFIG_DIR/follow-state.json"; }
-sign_document() {
-  gpg --no-options --batch --yes --armor --local-user "$1" --detach-sign --output "$2.asc" -- "$2" > "$tmp/sign.log" 2>&1 || fail 'fixture signing failed'
-}
 expect_follow_failure() {
   expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
   grep -q 'operator override:.*host-allow import' "$tmp/output" || fail 'missing operator import hint'
@@ -606,9 +694,12 @@ pass 'equal and older signed generations cannot re-add a removed grant via --fro
 
 # Equivalent timestamp spellings must share the applied-identity ledger.
 equivalent_stamp=$(date -u -d "@$original_epoch" +%Y-%m-%dT%H:%M:%SZ)
+# The same instant spelled differently is the same generation; its bytes
+# differ from the accepted statement, so it is a collision (#173 review r2).
 jq --arg stamp "$equivalent_stamp" '.exported_at = $stamp' "$export_file" > "$tmp/incoming/host-allow.rainbow.json"
 sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
-expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
+grep -q 'different signed statement for the already-accepted generation' "$tmp/output" || fail 'the equivalent-instant statement was not treated as the same generation'
 cmp "$tmp/local-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'timezone-equivalent generation re-added removed grant'
 pass 'freshness compares timestamp instants rather than timezone strings'
 

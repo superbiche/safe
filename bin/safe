@@ -2330,10 +2330,19 @@ safe_install_audit_package() {
   [[ -n "${SAFE_INSTALL_NPM_USERCONFIG:-}" ]] && extra+=(--npm-userconfig "$SAFE_INSTALL_NPM_USERCONFIG")
   [[ -n "${SAFE_INSTALL_NPM_GLOBALCONFIG:-}" ]] && extra+=(--npm-globalconfig "$SAFE_INSTALL_NPM_GLOBALCONFIG")
 
+  # The BLOCK override (17/20) reads the decided result back.
+  local result_out=""
+  result_out="$(mktemp "${TMPDIR:-/tmp}/safe-install-result.XXXXXX")" || result_out=""
+
   set +e
-  "$SAFE_AUDIT_PATH" package-audit "$package" --ecosystem "$ecosystem" --gate install --op install ${extra[@]+"${extra[@]}"}
+  SAFE_AUDIT_RESULT_OUT="$result_out" \
+    "$SAFE_AUDIT_PATH" package-audit "$package" --ecosystem "$ecosystem" --gate install --op install ${extra[@]+"${extra[@]}"}
   audit_status=$?
   set -e
+  case "$audit_status" in
+    2|17|20) ;;
+    *) [[ -z "$result_out" ]] || rm -f -- "$result_out" ;;
+  esac
 
   case "$audit_status" in
     0)
@@ -2534,12 +2543,19 @@ safe_install_audit_package() {
       safe_install_gate_log "$ecosystem" "$package" "ALLOWED_VIA_FOLLOWED_GRANT"
       return 0
       ;;
-    2|20)
-      # No allow hint on BLOCK: host-allow only clears WARN, and for a
-      # known-malware record the hint would contradict the audit's own
-      # "do not pin around it" (review PR#55 F2).
-      safe_install_gate_log "$ecosystem" "$package" "REFUSED_BLOCK"
-      refuse 104 "BLOCKED ${ecosystem} install of ${package} — safe audit verdict BLOCK; operator review required: safe audit package-audit ${package} --ecosystem ${ecosystem} --json; details: safe explain"
+    17|2|20)
+      # BLOCK (rulings 2026-09-30). No allow hint: host-allow never clears a
+      # BLOCK, and for a known-malware record the hint would contradict the
+      # audit's own "do not pin around it" (review PR#55 F2). At an operator
+      # terminal a BLOCK on one exact version takes a typed override; 17 is
+      # a BLOCK covered by an override recorded on this host. The shared
+      # gate-lib handler keeps this lane and the wrappers identical; off a
+      # terminal it refuses 104 (17: 102) as before.
+      local block_rc=0
+      safe_gate_block_terminus "$audit_status" "$package" "$ecosystem" "${ecosystem} install" "$result_out" || block_rc=$?
+      [[ -z "$result_out" ]] || rm -f -- "$result_out"
+      (( block_rc == 0 )) && return 0
+      exit "$block_rc"
       ;;
     30)
       # The audit could not compute a verdict at all. That is breakage to
@@ -3513,6 +3529,8 @@ cmd_install() {
   # Not `local`: the audit loop sets the route/recursion variables as globals
   # this function reads back, and a `local` here would shadow them to empty.
   unset SAFE_AUDIT_SOCKET_CONSENT SAFE_INSTALL_CONSENT_RECURSION SAFE_INSTALL_SOCKET_FALLBACK
+  # The BLOCK-override result channel is set per audit call, never inherited.
+  unset SAFE_GATE_RESULT_OUT SAFE_AUDIT_RESULT_OUT
   local policy_lib
   local host_mode=0 sandbox_mode=0 yes=0
   local project_mode=0

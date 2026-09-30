@@ -8036,19 +8036,23 @@ followed_grant_lookup() {
   FOLLOWED_GRANT_ORIGIN="" FOLLOWED_GRANT_GENERATION="" FOLLOWED_GRANT_SIGNER=""
   [[ -n "$ecosystem" && -n "$name" && -n "$version" ]] || return 1
   local ha_file state_file config_file grant
+  FOLLOWED_GRANT_LEDGER=""
   ha_file="$(trust_store_file host-allow.json)"
   state_file="$(followed_grant_ledger_file)"
   config_file="$(trust_store_file config.json)"
   [[ -f "$ha_file" && -f "$state_file" && -f "$config_file" ]] || return 1
+  # One read of the ledger backs this lookup and the BLOCK-override check
+  # that may follow it (review r2 R4): a concurrent follow cannot mix them.
+  FOLLOWED_GRANT_LEDGER="$(jq -c . "$state_file" 2>/dev/null)" || return 1
   grant=$(jq -cn --arg p "$name" --arg id "$name@$version" \
     --arg gid "$(host_allow_canonical_eco "$ecosystem"):$name@$version" \
-    --slurpfile store "$ha_file" --slurpfile state "$state_file" --slurpfile config "$config_file" '
+    --slurpfile store "$ha_file" --argjson ledger "$FOLLOWED_GRANT_LEDGER" --slurpfile config "$config_file" '
     ($config[0].follow.signers // []) as $raw
     | (if ($raw | type) == "array"
           and ($raw | all(.[]; type == "string" and test("^([A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})$")))
        then ($raw | map(ascii_upcase)) else [] end) as $signers
     | ($store[0].packages[$p].followed_from // "") as $preferred
-    | [ ($state[0].origins // {}) | to_entries[]
+    | [ ($ledger.origins // {}) | to_entries[]
         | select((.value | type) == "object")
         | select((.value.applied | type) == "array" and (.value.applied | index($id)) != null)
         | select((.value.granted | type) == "array" and (.value.granted | index($gid)) != null)
@@ -8089,6 +8093,47 @@ followed_grant_record() {
   fi
   printf '[safe audit] ALLOWED_VIA_FOLLOWED_GRANT (%s, %s): %s@%s is covered by the operator-signed grant of generation %s; installing without a second confirmation\n' \
     "$FOLLOWED_GRANT_ORIGIN" "$FOLLOWED_GRANT_SIGNER" "$name" "$version" "$FOLLOWED_GRANT_GENERATION" >&2
+}
+
+# Recorded BLOCK override (operator rulings 2026-09-30). The host-allow entry
+# the caller already matched (host_allow_matches_resolved) may carry
+# `block_override: {advisories: [...], accepted: "YYYY-MM-DD"}`, written only by
+# `safe run host-allow add --accept-block` at an operator terminal or taken from
+# a verified signed export. It covers this BLOCK only when the current blocking
+# advisories are non-empty and every one of them was accepted — a new advisory
+# asks again. The store copy only ever earns the terminal confirm (17); the
+# unattended followed lane reads the ledger (followed_block_override_covers).
+block_override_covers() {
+  local name="$1" advisories_json="$2" ha_file
+  ha_file="$(trust_store_file host-allow.json)"
+  [[ -f "$ha_file" ]] || return 1
+  jq -e --arg p "$name" --argjson current "$advisories_json" '
+    .packages[$p] as $e
+    | ($e.block_override.advisories) as $accepted
+    | ($current | type) == "array" and ($current | length) > 0
+      and ($accepted | type) == "array"
+      and ($accepted | all(.[]; type == "string"))
+      and ($current | all(.[]; . as $id | $accepted | index($id) != null))' "$ha_file" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+# Followed BLOCK override (review r1 F1): true when the ledger entry of the
+# origin followed_grant_lookup selected binds this exact identity to accepted
+# advisories covering every current blocking one. The follow commit rewrites
+# that binding from each verified statement, like `granted`.
+followed_block_override_covers() {
+  local ecosystem="$1" name="$2" version="$3" advisories_json="$4"
+  [[ -n "${FOLLOWED_GRANT_LEDGER:-}" && -n "$FOLLOWED_GRANT_ORIGIN" ]] || return 1
+  # Only a pin this host took from that origin: a local re-pin keeps its own
+  # terminal confirmation (17) even when the ledger still grants the identity
+  # (review r2 F3).
+  [[ "$(jq -r --arg p "$name" '.packages[$p].followed_from // "" | strings' "$(trust_store_file host-allow.json)" 2>/dev/null)" == "$FOLLOWED_GRANT_ORIGIN" ]] || return 1
+  jq -e --arg host "$FOLLOWED_GRANT_ORIGIN" --arg gid "$(host_allow_canonical_eco "$ecosystem"):$name@$version" \
+    --argjson current "$advisories_json" '
+    (.origins[$host].block_overrides[$gid]) as $accepted
+    | ($current | type) == "array" and ($current | length) > 0
+      and ($accepted | type) == "array" and ($accepted | all(.[]; type == "string"))
+      and ($current | all(.[]; . as $id | $accepted | index($id) != null))' <<<"$FOLLOWED_GRANT_LEDGER" >/dev/null 2>&1
 }
 
 # Derive the exact artifact versions a host-allow would override, deny-by-
@@ -8883,6 +8928,9 @@ package_audit_command() {
   if [[ "$(jq -r '.release_exempt' <<<"$verdict_json")" == "true" ]]; then
     release_exempt=1
   fi
+  local block_class block_advisories_json
+  block_class=$(jq -r '.block.class // ""' <<<"$verdict_json")
+  block_advisories_json=$(jq -c '.block.advisories // []' <<<"$verdict_json")
   while IFS= read -r cause_line; do
     [[ -n "$cause_line" ]] && warn_causes+=("$cause_line")
   done < <(jq -r '.causes[]?' <<<"$verdict_json")
@@ -8925,11 +8973,15 @@ package_audit_command() {
     --argjson classification "$combined" \
     --argjson versions "$classifications" \
     --argjson warn_causes "$warn_causes_json" \
+    --arg block_class "$block_class" \
+    --argjson block_advisories "$block_advisories_json" \
+    --arg package "$PKG_NAME" \
     --slurpfile socket "$socket_json" \
     --slurpfile osv "$osv_json" '
     {
       timestamp: $timestamp,
       spec: $spec,
+      package: $package,
       op: $op,
       ecosystem: $ecosystem,
       installer: $installer,
@@ -8942,6 +8994,7 @@ package_audit_command() {
         range: $resolution_range
       },
       warn_causes: $warn_causes,
+      block: (if $block_class == "" then null else {class: $block_class, advisories: $block_advisories} end),
       has_install_script: (if $has_install_script == "" then null else ($has_install_script == "true") end),
       checks: {
         socket: $socket_line,
@@ -9222,24 +9275,73 @@ package_audit_command() {
         fi
         ;;
       BLOCK)
-        local block_cause
-        for block_cause in ${warn_causes[@]+"${warn_causes[@]}"}; do
-          if [[ "$block_cause" == "osv_malware" ]]; then
-            printf 'safe audit: known-malware record (OSV MAL-*) — do not install, do not pin around it; operator review only\n' >&2
-            break
-          fi
-        done
-        gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" "$aff_count" \
-          "$socket_detail" "" "$([[ "$block_line" == PASS* ]] && printf 1 || printf 0)" \
-          "$primary_version" \
-          "${warn_causes[@]}"
-        printf 'safe audit: operator review required: safe audit package-audit %s --ecosystem %s --json\n' \
-          "$( (( resolution_ok )) && printf '%s@%s' "$PKG_NAME" "$primary_version" || printf '%s' "$spec")" "$ecosystem" >&2
         revoke_install_known "$ecosystem" "$PKG_NAME" "$primary_version" ${RESOLVED_VERSIONS[@]+"${RESOLVED_VERSIONS[@]}"}
-        gate_exit=20
+        # Operator override lanes (rulings 2026-09-30): a BLOCK on one exact
+        # resolved version is overridable at an operator terminal (the gate
+        # reads the result document on exit 20). An advisory-only BLOCK may
+        # also carry a recorded override on the host-allow entry; it covers
+        # this install only while every blocking advisory is one the
+        # operator accepted. Recorded here → terminal confirm (17); taken
+        # from a followed operator-signed export → unattended (16). Malware
+        # and blocklist BLOCKs are overridable per install only and never
+        # recorded. An unresolved or multi-version BLOCK names no exact
+        # version, so the gate refuses it with the pin hint.
+        local -a block_versions=()
+        mapfile -t block_versions < <(jq -r '.[]' <<<"$resolved_versions_json")
+        local block_pinned=0 block_followed=0 block_covered=0
+        HOST_ALLOW_RESOLVED_VERSION=""
+        if (( resolution_ok )) && (( ${#block_versions[@]} == 1 )) && [[ "$block_class" == "advisory" ]] \
+          && host_allow_matches_resolved "$ecosystem" "$PKG_NAME" "${block_versions[0]}"; then
+          block_pinned=1
+        fi
+        # Followed lane: the accepted advisories come from the follow ledger,
+        # written from the verified statement that granted this exact
+        # identity — never from the store entry (review r1 F1).
+        if (( block_pinned )) && followed_grant_lookup "$ecosystem" "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION" \
+          && followed_block_override_covers "$ecosystem" "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION" "$block_advisories_json"; then
+          block_followed=1
+        elif (( block_pinned )) && block_override_covers "$PKG_NAME" "$block_advisories_json"; then
+          block_covered=1
+        fi
+        if (( block_followed )); then
+          followed_grant_record "$ecosystem" "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION" \
+            "$(jq -cn --argjson causes "$warn_causes_json" --argjson ids "$block_advisories_json" \
+              '$causes + ($ids | map("block_advisory:" + .))')" block_override "$result_json"
+          gate_exit=16
+        elif (( block_covered )); then
+          printf '[safe audit] BLOCK covered by the operator override recorded on this host for %s@%s (accepted: %s); an operator confirms the install at an interactive terminal\n' \
+            "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION" "$(jq -r 'join(", ")' <<<"$block_advisories_json")" >&2
+          gate_exit=17
+        else
+          local block_cause
+          for block_cause in ${warn_causes[@]+"${warn_causes[@]}"}; do
+            if [[ "$block_cause" == "osv_malware" ]]; then
+              printf 'safe audit: known-malware record (OSV MAL-*) — do not install, do not pin around it; operator review only\n' >&2
+              break
+            fi
+          done
+          gate_emit_refusal_hints "$ecosystem" "$PKG_NAME" "$primary_version" "$resolution_ok" "$aff_count" \
+            "$socket_detail" "" "$([[ "$block_line" == PASS* ]] && printf 1 || printf 0)" \
+            "$primary_version" \
+            "${warn_causes[@]}"
+          printf 'safe audit: operator review required: safe audit package-audit %s --ecosystem %s --json\n' \
+            "$( (( resolution_ok )) && printf '%s@%s' "$PKG_NAME" "$primary_version" || printf '%s' "$spec")" "$ecosystem" >&2
+          if ! (( resolution_ok )) || (( ${#block_versions[@]} != 1 )); then
+            printf 'safe audit: no exact version to override — pin one exact version to reach the operator override at an interactive terminal\n' >&2
+          fi
+          gate_exit=20
+        fi
         ;;
     esac
     if (( gate_exit >= 0 )); then
+      # The install gates read the decided result (resolved version, block
+      # class and advisories) from SAFE_AUDIT_RESULT_OUT to put the BLOCK
+      # override to the operator without re-running the audit. They set or
+      # clear it on every call, so an inherited value never reaches a gate.
+      if [[ -n "${SAFE_AUDIT_RESULT_OUT:-}" ]]; then
+        jq --argjson gate_exit "$gate_exit" '. + {gate_exit: $gate_exit}' "$result_json" > "$SAFE_AUDIT_RESULT_OUT" 2>/dev/null \
+          || rm -f -- "$SAFE_AUDIT_RESULT_OUT"
+      fi
       rm -rf "$scratch"
       return "$gate_exit"
     fi

@@ -277,7 +277,7 @@ origin's highest accepted `exported_at`, the verified primary fingerprint that
 signed it, and the identities already applied:
 
 ```json
-{"origins":{"rainbow":{"accepted":"2026-09-16T14:00:00Z","applied":["fresh-pkg@1.2.3"],"replaced":["fresh-pkg@1.0.0->1.2.3"],"refused":["other-pkg@2.0.0"],"signer":"<40-or-64-hex primary fingerprint>","granted":["npm:fresh-pkg@1.2.3"]}}}
+{"origins":{"rainbow":{"accepted":"2026-09-16T14:00:00Z","applied":["fresh-pkg@1.2.3"],"replaced":["fresh-pkg@1.0.0->1.2.3"],"refused":["other-pkg@2.0.0"],"signer":"<40-or-64-hex primary fingerprint>","granted":["npm:fresh-pkg@1.2.3"],"block_overrides":{"npm:fresh-pkg@1.2.3":["GHSA-xxxx-xxxx-xxxx"]},"statement_sha256":"<sha256 of the accepted statement>"}}}
 ```
 
 Timestamps are real ISO-8601 whole-second instants with an explicit timezone;
@@ -378,8 +378,8 @@ this machine's terminal, a pin in another ecosystem, a package the origin
 dropped from a newer generation,
 an unrecorded signer, or a signer removed with `follow-signer remove` — which
 therefore withdraws unattended passes for grants already taken, not only future
-imports. A BLOCK is never cleared (exit 104). The `followed_from` field in the
-store is a label for reports, not authority.
+imports. A BLOCK is cleared only by an override the origin recorded (below).
+The `followed_from` field in the store is a label for reports, not authority.
 
 Ledgers written before signers were recorded gain one on the next verified
 `follow` run of the same generation; until then their grants keep asking for a
@@ -392,6 +392,56 @@ passes as usage of the entry.
 
 The exporting machine gains nothing from its own export: its pins were typed
 at its terminal and keep the terminal requirement there.
+
+#### BLOCK overrides
+
+A BLOCK has an operator override too (operator rulings 2026-09-30). At an
+operator terminal, when the audit resolved one exact version, the install gate
+names the evidence and asks the operator to type `<pkg>@<version>`; that
+installs once and records nothing. A BLOCK without one exact version (an
+unresolved or ranged spec) still refuses 104 with a hint to pin one. Off a
+terminal, and for every agent, a BLOCK refuses 104 exactly as before.
+
+An advisory-only BLOCK — critical advisories on the resolved version, no
+malware record, no Socket critical supply-chain alert, no blocklist entry —
+can also be recorded. At the gate prompt, type `record <pkg>@<version>`, or
+run:
+
+```bash
+safe run host-allow add <pkg>@<version> --reason "..." --accept-block
+```
+
+`--accept-block` re-audits the exact version, refuses anything but an
+advisory-only BLOCK on that version, shows the blocking advisories, and asks
+the operator to type `<pkg>@<version>`. The entry then carries
+`block_override: {advisories: [...], accepted: "YYYY-MM-DD"}`. The override
+covers an install only while every blocking advisory is one it accepted: a new
+advisory, another version, or a malware or blocklist signal asks again.
+`host-allow update` drops it, and `host-allow list` shows it.
+
+On the host that recorded it, a covered BLOCK is gate exit 17: the operator
+confirms at the terminal (`RECORDED_BLOCK_OVERRIDE_TTY`), unattended shells
+refuse 102. Signed exports carry the override as an optional per-entry field
+(schema unchanged), and a follower pinned at that version from that origin
+takes changes to it — added, widened or dropped — on the next `follow`. On a
+follower the covered BLOCK installs unattended as a followed grant (exit 16,
+receipt `covered:block_override` plus one `block_advisory:<id>` per accepted
+advisory), under the same ledger and signer conditions as above. The accepted
+advisories it trusts are the follow ledger's `block_overrides` for that
+origin and `<ecosystem>:name@version`, rewritten from every verified
+statement like `granted` — never the store entry's copy — and only for a pin
+this host took from that origin (`followed_from`). A newer statement without
+the override withdraws it. The ledger records the SHA-256 of the accepted
+statement (`statement_sha256`); a different signed statement carrying the
+same `exported_at` instant is a collision, refused without changing the ledger,
+so an older statement of that second cannot be replayed to restore a withdrawn
+override. `follow --dry-run` prints the `would-set-block-override` /
+`would-drop-block-override` changes. An override present only in the store (a
+local pin, or a stale copy) stays a terminal decision (exit 17). Followers on
+an older safe ignore the field and keep refusing.
+
+Malware and blocklist BLOCKs are overridable per install only. They are never
+recorded, so they never reach an export.
 
 ## Safe release follow
 
