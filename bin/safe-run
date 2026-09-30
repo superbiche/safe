@@ -2076,7 +2076,8 @@ host_allow_apply_export() {
     if (( dry_run )); then
       printf '  would-add %s@%s [%s]\n' "$normalized" "$version" "$ecosystem" >&2
       if [[ -n "$origin" ]]; then
-        follow_planned=$(jq --arg p "$normalized" --arg v "$version" '.[$p] = {version: $v}' <<<"$follow_planned")
+        # The plan carries the ecosystem: later sources compare against it.
+        follow_planned=$(jq --arg p "$normalized" --arg v "$version" --arg e "$ecosystem" '.[$p] = {version: $v, ecosystem: $e}' <<<"$follow_planned")
       fi
       added=$((added + 1)); continue
     fi
@@ -2373,11 +2374,13 @@ follow_commit_generation() {
       if [[ -n "$replacement" ]]; then
         printf '  would-replace %s@%s -> @%s\n' "$name" "$local_version" "$version" >&2
         follow_planned=$(jq -c --arg p "$name" --arg v "$version" --arg origin "$origin" --arg generation "$statement_generation" \
-          '.[$p] = {version:$v, followed_from:$origin, followed_generation:$generation}' <<<"$follow_planned")
+          --arg e "$(jq -r '.ecosystem' <<<"$entry")" \
+          '.[$p] = {version:$v, ecosystem:$e, followed_from:$origin, followed_generation:$generation}' <<<"$follow_planned")
       elif [[ -z "$local_version" && "$disposition" != present ]]; then
         printf '  would-add %s\n' "$id" >&2
         follow_planned=$(jq -c --arg p "$name" --arg v "$version" --arg origin "$origin" --arg generation "$statement_generation" \
-          '.[$p] = {version:$v, followed_from:$origin, followed_generation:$generation}' <<<"$follow_planned")
+          --arg e "$(jq -r '.ecosystem' <<<"$entry")" \
+          '.[$p] = {version:$v, ecosystem:$e, followed_from:$origin, followed_generation:$generation}' <<<"$follow_planned")
       fi
     else
       # Publish the identity before its local grant, so an interrupted writer

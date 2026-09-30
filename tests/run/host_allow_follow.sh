@@ -223,6 +223,30 @@ rm -rf "$tmp/r1-in"
 gate_followed_grant fresh-pkg 1.2.3 >/dev/null || fail 'restoring the ledger did not restore the grant'
 pass 'a signer or legacy backfill grants only identities its own verified statement carries'
 
+# Review r2 F3: the dry-run plan keeps each planned entry's ecosystem, so two
+# origins granting the same Python package preview exactly as they apply, and
+# a planned Python entry still conflicts with an npm statement.
+r1_restore
+r2_sign() { # <origin> <ecosystem>
+  jq --arg h "$1" --arg e "$2" '.host = $h | .packages = {"epoch-pkg":{"version":"1!2.0","ecosystem":$e,"sha":"sha256-EPOCH","reason":"union","added":"2026-06-03"}}' \
+    "$export_file" > "$tmp/r1-in/host-allow.$1.json"
+  gpg --no-options --batch --yes --armor --local-user "$fingerprint" --detach-sign \
+    --output "$tmp/r1-in/host-allow.$1.json.asc" -- "$tmp/r1-in/host-allow.$1.json" > "$tmp/sign.log" 2>&1 || fail 'fixture signing failed'
+}
+r2_sign rainbow python; r2_sign tuxedo python
+expect_rc 0 "$SAFE_RUN" host-allow follow --dry-run --from "$tmp/r1-in"
+! grep -q CONFLICT "$tmp/output" || fail 'a duplicate Python grant previewed as a conflict'
+cmp "$tmp/r1-store.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'the preview changed the store'
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/r1-in"
+jq -e '.packages["epoch-pkg"].ecosystem == "python"' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'the duplicate Python grant did not apply'
+r1_restore
+r2_sign rainbow python; r2_sign tuxedo npm
+expect_rc 1 "$SAFE_RUN" host-allow follow --dry-run --from "$tmp/r1-in"
+grep -q 'CONFLICT epoch-pkg: local pin is python' "$tmp/output" || fail 'a planned Python entry did not conflict with an npm statement'
+r1_restore
+rm -rf "$tmp/r1-in"
+pass 'dry-run previews a cross-origin Python union as it applies; planned entries keep their ecosystem'
+
 # Per-case directory keeps invalid siblings from contaminating other tests.
 mkdir "$tmp/incoming"
 cp "$export_file" "$tmp/original.json"
