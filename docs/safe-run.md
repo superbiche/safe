@@ -378,8 +378,8 @@ this machine's terminal, a pin in another ecosystem, a package the origin
 dropped from a newer generation,
 an unrecorded signer, or a signer removed with `follow-signer remove` — which
 therefore withdraws unattended passes for grants already taken, not only future
-imports. A BLOCK is never cleared (exit 104). The `followed_from` field in the
-store is a label for reports, not authority.
+imports. A BLOCK is cleared only by an override the origin recorded (below).
+The `followed_from` field in the store is a label for reports, not authority.
 
 Ledgers written before signers were recorded gain one on the next verified
 `follow` run of the same generation; until then their grants keep asking for a
@@ -392,6 +392,47 @@ passes as usage of the entry.
 
 The exporting machine gains nothing from its own export: its pins were typed
 at its terminal and keep the terminal requirement there.
+
+#### BLOCK overrides
+
+A BLOCK has an operator override too (operator rulings 2026-09-30). At an
+operator terminal, when the audit resolved one exact version, the install gate
+names the evidence and asks the operator to type `<pkg>@<version>`; that
+installs once and records nothing. A BLOCK without one exact version (an
+unresolved or ranged spec) still refuses 104 with a hint to pin one. Off a
+terminal, and for every agent, a BLOCK refuses 104 exactly as before.
+
+An advisory-only BLOCK — critical advisories on the resolved version, no
+malware record, no Socket critical supply-chain alert, no blocklist entry —
+can also be recorded. At the gate prompt, type `record <pkg>@<version>`, or
+run:
+
+```bash
+safe run host-allow add <pkg>@<version> --reason "..." --accept-block
+```
+
+`--accept-block` re-audits the exact version, refuses anything but an
+advisory-only BLOCK on that version, shows the blocking advisories, and asks
+the operator to type `<pkg>@<version>`. The entry then carries
+`block_override: {advisories: [...], accepted: "YYYY-MM-DD"}`. The override
+covers an install only while every blocking advisory is one it accepted: a new
+advisory, another version, or a malware or blocklist signal asks again.
+`host-allow update` drops it, and `host-allow list` shows it.
+
+On the host that recorded it, a covered BLOCK is gate exit 17: the operator
+confirms at the terminal (`RECORDED_BLOCK_OVERRIDE_TTY`), unattended shells
+refuse 102. Signed exports carry the override as an optional per-entry field
+(schema unchanged), and a follower pinned at that version from that origin
+takes changes to it — added, widened or dropped — on the next `follow`. On a
+follower the covered BLOCK installs unattended as a followed grant (exit 16,
+receipt `covered:block_override` plus one `block_advisory:<id>` per accepted
+advisory), under the same ledger and signer conditions as above. The entry
+must itself come from that origin: a local operator pin is never rewritten by
+`follow` and its override stays a terminal decision. Followers on an older
+safe ignore the field and keep refusing.
+
+Malware and blocklist BLOCKs are overridable per install only. They are never
+recorded, so they never reach an export.
 
 ## Safe release follow
 

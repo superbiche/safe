@@ -170,7 +170,11 @@ terminal (gate exit 16) only while the signer recorded for its origin stays
 pinned, the identity is in that origin's accepted generation and the local pin
 exists. After upgrading a follower, run `safe run host-allow follow` once so the
 ledger records the signer; until then followed grants keep asking for a
-terminal.
+terminal. The same conditions govern a BLOCK override the origin recorded
+(`host-allow add --accept-block`): the next `follow` carries it to pins taken
+from that origin, and the follower then installs the accepted version
+unattended while no new blocking advisory appears. Hosts still on an older
+safe ignore the override and keep refusing.
 Freshness prevents replay only for generations this machine already accepted:
 initial bootstrap, a newer signed statement, or another authorized origin can
 still authorize a previously removed grant. Retire those exports or revoke the

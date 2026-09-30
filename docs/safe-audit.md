@@ -606,6 +606,19 @@ that version on the exporting machine, so the follower installs it unattended
 (`ALLOWED_VIA_FOLLOWED_GRANT` receipt and a `followed_grant` line in the verdict
 log, both naming origin and signer). See
 [Followed grants at the install gate](safe-run.md#followed-grants-at-the-install-gate).
+A ninth code, **exit 17**, means BLOCK covered by an operator override
+recorded on this host (`host-allow add --accept-block`): the operator
+confirms at the terminal, unattended shells refuse 102. A followed grant whose
+origin recorded such an override clears the BLOCK as exit 16. See
+[BLOCK overrides](safe-run.md#block-overrides).
+
+The result document (`--json`, and the receipt) carries `package` and, on a
+BLOCK, `block: {class, advisories}` — `class` is `advisory`, `malware`,
+`blocklist` or `unresolved`, and `advisories` lists the blocking advisory ids
+of an advisory-only BLOCK (the evidence an override accepts). In gate mode the
+decided result is also written, with `gate_exit`, to `SAFE_AUDIT_RESULT_OUT`
+when the caller sets it; the install gates use it to put the BLOCK override
+to the operator without re-running the audit.
 
 ### Install gate mode
 
@@ -649,7 +662,12 @@ proceed:
   `n` being that confirmation; no clean receipt is minted for a declined
   check. Non-interactive shells refuse 102 — the operator hands over the
   complete pinned command.
-- **BLOCK** refuses (exit 20) and points at operator review.
+- **BLOCK** refuses (exit 20) and points at operator review. At an operator
+  terminal, a BLOCK on one exact resolved version takes a typed override
+  (`<pkg>@<version>` installs once; `record <pkg>@<version>` also records an
+  advisory-only override); a BLOCK without one exact version prints the pin
+  hint. An override recorded on this host that covers every blocking advisory
+  is exit 17.
 
 A Socket scoring failure (missing CLI, auth, rate limit) is reported as an
 infrastructure failure with a recovery path (`socket login`, `safe doctor`),

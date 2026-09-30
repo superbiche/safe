@@ -468,3 +468,57 @@ func TestSiblingScopeStatesMirrorPrimary(t *testing.T) {
 		t.Errorf("socket line = %q, want both sibling states disclosed", got.Lines.Socket)
 	}
 }
+
+// The override lanes read Result.Block: only an advisory-only BLOCK names the
+// advisories an operator override may accept; malware, blocklist and an
+// unresolved version never carry any (operator rulings 2026-09-30).
+func TestBlockClassification(t *testing.T) {
+	advisory := func(ev *Evidence) {
+		ev.OSV = OSV{Status: "ok", TotalCount: 3, Affecting: []Advisory{
+			{ID: "GHSA-bbbb", Severity: "critical"},
+			{ID: "GHSA-aaaa", Severity: "critical"},
+			{ID: "GHSA-low", Severity: "low"},
+		}}
+	}
+	cases := []struct {
+		name       string
+		mutate     func(*Evidence)
+		class      string
+		advisories []string
+	}{
+		{"clean GO carries no class", func(ev *Evidence) {}, "", []string{}},
+		{"WARN carries no class", func(ev *Evidence) {
+			ev.OSV = OSV{Status: "ok", TotalCount: 1, Affecting: []Advisory{{ID: "GHSA-low", Severity: "low"}}}
+		}, "", []string{}},
+		{"advisory-only BLOCK lists the blocking ids, sorted", advisory, "advisory", []string{"GHSA-aaaa", "GHSA-bbbb"}},
+		{"OSV malware outranks advisories", func(ev *Evidence) {
+			advisory(ev)
+			ev.OSV.Affecting = append(ev.OSV.Affecting, Advisory{ID: "MAL-2026-1", Severity: "unknown", Malware: true})
+		}, "malware", []string{}},
+		{"Socket malware outranks advisories", func(ev *Evidence) {
+			advisory(ev)
+			ev.Socket.Class = "malware"
+		}, "malware", []string{}},
+		{"blocklist outranks advisories", func(ev *Evidence) {
+			advisory(ev)
+			ev.Blocklist.Reason = "operator blocked"
+		}, "blocklist", []string{}},
+		{"unresolved historical critical", func(ev *Evidence) {
+			ev.Resolution = Resolution{OK: false, Label: "foo"}
+			ev.OSV = OSV{Status: "ok", TotalCount: 1, HistoricalCritical: true}
+		}, "unresolved", []string{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := clean()
+			tc.mutate(&ev)
+			got := Decide(ev)
+			if got.Block.Class != tc.class {
+				t.Fatalf("block class = %q, want %q (verdict=%s causes=%v)", got.Block.Class, tc.class, got.Verdict, got.Causes)
+			}
+			if !slices.Equal(got.Block.Advisories, tc.advisories) {
+				t.Fatalf("block advisories = %v, want %v", got.Block.Advisories, tc.advisories)
+			}
+		})
+	}
+}

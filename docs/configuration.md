@@ -107,7 +107,10 @@ ecosystem the signed statement named; each verified run rewrites both fields
 from its own statement, so a key never inherits identities another key
 signed (gate exit 16; see
 [followed grants at the install gate](safe-run.md#followed-grants-at-the-install-gate)),
-so `follow-signer remove` also withdraws that pass. Followed store entries also
+so `follow-signer remove` also withdraws that pass. An entry may also carry
+`block_override: {advisories, accepted}`, written only by
+`host-allow add --accept-block` or taken from a signed export; see
+[BLOCK overrides](safe-run.md#block-overrides). Followed store entries also
 carry `followed_from` and `followed_generation` so the newest signed statement
 wins across origins; a host-set pin yields to any signed statement. Preserve it
 grants: equal generations skip

@@ -222,6 +222,59 @@ r1_restore
 rm -rf "$tmp/r1-in"
 gate_followed_grant fresh-pkg 1.2.3 >/dev/null || fail 'restoring the ledger did not restore the grant'
 pass 'a signer or legacy backfill grants only identities its own verified statement carries'
+sign_document() {
+  gpg --no-options --batch --yes --armor --local-user "$1" --detach-sign --output "$2.asc" -- "$2" > "$tmp/sign.log" 2>&1 || fail 'fixture signing failed'
+}
+# BLOCK override carry-over (operator rulings 2026-09-30): an origin-side
+# override rides the signed export as an optional per-entry field; a follower
+# pinned at the same version from the same origin takes changes to it (added,
+# widened, dropped), a local operator pin is never touched, and a malformed
+# override fails the entry loudly.
+cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/bo-store-before.json"
+cp "$SAFE_RUN_CONFIG_DIR/follow-state.json" "$tmp/bo-state-before.json"
+mkdir "$tmp/bo-incoming"
+bo_stamp_base=$(date -d "$(jq -r '.exported_at' "$export_file")" +%s)
+bo_export() { # <seconds-after-base> <override-json|null>
+  jq --arg stamp "$(date -u -d "@$((bo_stamp_base + $1))" +%Y-%m-%dT%H:%M:%SZ)" --argjson o "$2" '
+    .exported_at = $stamp
+    | if $o == null then del(.packages["fresh-pkg"].block_override)
+      else .packages["fresh-pkg"].block_override = $o end' "$export_file" > "$tmp/bo-incoming/host-allow.rainbow.json"
+  sign_document "$fingerprint" "$tmp/bo-incoming/host-allow.rainbow.json"
+}
+bo_export 120 '{"advisories":["GHSA-aaaa"],"accepted":"2026-09-30"}'
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/bo-incoming"
+jq -e '.packages["fresh-pkg"] | .version == "1.2.3" and .followed_from == "rainbow" and .sha == "sha512-FRESH"
+  and .block_override == {"advisories":["GHSA-aaaa"],"accepted":"2026-09-30"}' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null \
+  || fail 'a same-version pin did not take the origin override'
+grep -q 'BLOCK override updated' "$tmp/output" || fail 'the override refresh is not reported'
+bo_export 180 '{"advisories":["GHSA-aaaa","GHSA-bbbb"],"accepted":"2026-09-30"}'
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/bo-incoming"
+jq -e '.packages["fresh-pkg"].block_override.advisories == ["GHSA-aaaa","GHSA-bbbb"]' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null \
+  || fail 'a widened origin override did not reach the follower'
+bo_export 240 null
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/bo-incoming"
+jq -e '.packages["fresh-pkg"] | has("block_override") | not' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null \
+  || fail 'an override the origin dropped survived on the follower'
+cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/bo-store-mid.json"
+bo_export 300 '{"advisories":[],"accepted":"2026-09-30"}'
+expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/bo-incoming"
+grep -q 'invalid entry field types' "$tmp/output" || fail 'a malformed override was not reported'
+cmp "$tmp/bo-store-mid.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'a malformed override changed the store'
+jq 'del(.packages["fresh-pkg"].followed_from, .packages["fresh-pkg"].followed_generation)' \
+  "$tmp/bo-store-mid.json" > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/bo-local.json"
+bo_export 360 '{"advisories":["GHSA-aaaa"],"accepted":"2026-09-30"}'
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/bo-incoming"
+cmp "$tmp/bo-local.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'an origin override rewrote a local operator pin'
+# Origin side: the export projection carries the override and nothing else new.
+jq '.packages["fresh-pkg"].block_override = {"advisories":["GHSA-aaaa"],"accepted":"2026-09-30"}' \
+  "$tmp/bo-local.json" > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+expect_rc 0 "$SAFE_RUN" host-allow export
+jq -e '.packages["fresh-pkg"] | keys == ["added","block_override","ecosystem","reason","sha","version"]
+  and .block_override.advisories == ["GHSA-aaaa"]' "$tmp/output" >/dev/null || fail 'export does not carry the override'
+cp "$tmp/bo-store-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+cp "$tmp/bo-state-before.json" "$SAFE_RUN_CONFIG_DIR/follow-state.json"
+pass 'a signed export carries the BLOCK override; same-origin pins take changes, local pins and malformed overrides do not'
 
 # Review r2 F3: the dry-run plan keeps each planned entry's ecosystem, so two
 # origins granting the same Python package preview exactly as they apply, and
@@ -251,9 +304,6 @@ pass 'dry-run previews a cross-origin Python union as it applies; planned entrie
 mkdir "$tmp/incoming"
 cp "$export_file" "$tmp/original.json"
 reset_incoming() { rm -f "$tmp/incoming/"* "$SAFE_RUN_CONFIG_DIR/follow-state.json"; }
-sign_document() {
-  gpg --no-options --batch --yes --armor --local-user "$1" --detach-sign --output "$2.asc" -- "$2" > "$tmp/sign.log" 2>&1 || fail 'fixture signing failed'
-}
 expect_follow_failure() {
   expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
   grep -q 'operator override:.*host-allow import' "$tmp/output" || fail 'missing operator import hint'

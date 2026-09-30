@@ -3,7 +3,7 @@ version = 1
 [[bindings]]
 doc = "docs/agents.md"
 target = "docs/contract/agent-contract.json"
-sig = "16f8be0744bd3251"
+sig = "6e49888614bf705c"
 
 [[bindings]]
 doc = "docs/agents.md"
@@ -28,17 +28,17 @@ sig = "8d5eb953902ff2a2"
 [[bindings]]
 doc = "docs/configuration.md"
 target = "bin/safe-audit"
-sig = "747888a7c9dc7fd5"
+sig = "6c7b24f2fbca1c7b"
 
 [[bindings]]
 doc = "docs/configuration.md"
 target = "bin/safe-run"
-sig = "8a4b98a3c3bc3ab1"
+sig = "c0d9087571232143"
 
 [[bindings]]
 doc = "docs/dependencies.md"
 target = "bin/safe-audit"
-sig = "747888a7c9dc7fd5"
+sig = "6c7b24f2fbca1c7b"
 
 [[bindings]]
 doc = "docs/index.md"
@@ -53,7 +53,7 @@ sig = "fc4f25508fd0a22e"
 [[bindings]]
 doc = "docs/install-wrappers.md"
 target = "lib/gate-lib.sh"
-sig = "2cbbf79d138a2dda"
+sig = "ba6d4a9b7b7eeb06"
 
 [[bindings]]
 doc = "docs/installation.md"
@@ -73,12 +73,12 @@ sig = "fc4f25508fd0a22e"
 [[bindings]]
 doc = "docs/integration-flows.md"
 target = "lib/gate-lib.sh"
-sig = "2cbbf79d138a2dda"
+sig = "ba6d4a9b7b7eeb06"
 
 [[bindings]]
 doc = "docs/operations.md"
 target = "bin/safe-run"
-sig = "8a4b98a3c3bc3ab1"
+sig = "c0d9087571232143"
 
 [[bindings]]
 doc = "docs/release-review.md"
@@ -98,14 +98,14 @@ sig = "084d3a2364a61dca"
 [[bindings]]
 doc = "docs/safe-audit.md"
 target = "bin/safe-audit"
-sig = "747888a7c9dc7fd5"
+sig = "6c7b24f2fbca1c7b"
 
 [[bindings]]
 doc = "docs/safe-audit.md"
 target = "internal/verdict/verdict.go#Decide"
-sig = "9d7937815cb8379c"
+sig = "06592133c2df48cf"
 
 [[bindings]]
 doc = "docs/safe-run.md"
 target = "bin/safe-run"
-sig = "8a4b98a3c3bc3ab1"
+sig = "c0d9087571232143"

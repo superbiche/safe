@@ -30,6 +30,7 @@ SUITES=(
   tests/install/unattended_green.sh
   tests/install/gate_adverse_warn_override.sh
   tests/install/reuse.sh
+  tests/install/gate_block_override.sh
   tests/audit/check_version_aware.sh
   tests/audit/socket_tier.sh
   tests/audit/smoke.sh
