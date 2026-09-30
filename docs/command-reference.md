@@ -244,14 +244,14 @@ safe install --reuse               # source: first other checkout with the same 
 safe install --reuse --reuse-from /path/to/main/checkout
 ```
 
-Identity is verified first; a mismatch is a different operation, not a reuse,
-and refuses with exit 100:
+Identity is verified first. A mismatch means the tree is not this project's
+dependencies, so it refuses with exit 100; the deliberate way through is the
+normal install, with its own operator overrides at the terminal:
 
 | Check | Refused when |
 | --- | --- |
 | Provenance | the source is not the same project path in a checkout of the same git repository, or its `vendor/` is a symlink or belongs to another user |
 | Lockfile | `composer.lock` is not byte-identical (SHA-256) in both checkouts |
-| Autoload rules | the root `autoload`/`autoload-dev` sections of `composer.json` differ, so the copied autoloader would be wrong |
 | Target | `vendor/` already exists and is not empty — reuse never overwrites, even if it appears during the copy |
 
 The tree itself must be complete and self-contained. A gap here is an operator
@@ -264,8 +264,9 @@ the receipt records as `operator_override`:
 | Inventory | `vendor/composer/installed.json` does not list exactly the lockfile's packages (dev packages count when the source was installed with them), or is not in the Composer 2 format |
 | Tree | a package has no install path, or its directory is missing or outside `vendor/` |
 | Autoloader | `vendor/autoload.php` or `vendor/composer/autoload_real.php` is missing |
-| Links | a symlink in the copied tree is absolute or leaves the project, or reaches a path repository that is absent in the target or whose package name or autoload rules differ there |
-| Integrity | the tree changed since its baseline (below) |
+| Links | a symlink in the copied tree is absolute or leaves the project (also through another link in the target), or reaches a path repository that is absent in the target or whose package name or autoload rules differ there |
+| Autoload rules | the root `autoload`/`autoload-dev` sections of `composer.json` differ, so the copied autoloader is wrong until `composer dump-autoload` runs |
+| Integrity | the tree changed since its baseline (below), its baseline record is unreadable, or a file cannot be read and hashed |
 
 Only what the inventory describes is copied: `vendor/composer`, the
 autoloader and other top-level generated files, `vendor/bin`, and each
@@ -279,7 +280,8 @@ a baseline: the SHA-256 of every file and the target of every link in its
 `vendor/`. Later reuses from that checkout must match it; a changed file is a
 gap, and an operator who accepts it re-records the baseline. A source
 reinstalled with a new lockfile starts a new baseline. The first use is not
-verified, and the receipt says which case applied (`baseline-recorded`,
+verified, and the receipt says which case applied. `--dry-run` hashes the
+source and compares it with the baseline without recording anything (`baseline-recorded`,
 `baseline-matched`, `baseline-re-recorded-new-lockfile`,
 `baseline-re-recorded-by-operator`).
 

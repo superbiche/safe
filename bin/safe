@@ -3120,6 +3120,11 @@ safe_install_reuse_tree_problem() {
     if [[ ! -e "$target/$rel" ]]; then
       printf 'symlink vendor/%s -> %s would dangle here (%s is absent)' "$where" "$dest" "$rel"; return 0
     fi
+    # Physically too: an intermediate symlink in the target must not lead out.
+    resolved="$(realpath -e -- "$target/$rel" 2>/dev/null)" || resolved=""
+    if [[ -z "$resolved" || "$resolved" != "$(realpath -e -- "$target")"/* ]]; then
+      printf 'symlink vendor/%s -> %s leads outside the project through another link' "$where" "$dest"; return 0
+    fi
     # A path repository links to the checkout's own copy of the package, as
     # Composer itself would install it there; its sources may differ between
     # branches. What the copied autoloader encodes is the package's name and
@@ -3162,14 +3167,46 @@ safe_install_reuse_skipped() {
   done < <(find "$vendor" -mindepth 1 -maxdepth 2 -print0 2>/dev/null | sort -z)
 }
 
-# Per-file manifest of an installed tree: sha256 of every regular file and the
-# target of every symlink, sorted by path. The trust-on-first-use baseline
-# (operator ruling 2026-09-30, A11) compares against it.
+# Per-file manifest of what the copy carries from <vendor>: sha256 of every
+# regular file and the target of every symlink, sorted by path. The
+# trust-on-first-use baseline (operator ruling 2026-09-30, A11) compares
+# against it. Fails — prints nothing usable — when any file cannot be listed
+# or hashed: a partial manifest must never become or match a baseline.
 safe_install_reuse_manifest() {
-  ( cd -P -- "$1" &&
-    { find . -type f -print0 | xargs -0 -r sha256sum --
-      find . -type l -printf 'link %l  %p\n'
-    } | LC_ALL=C sort -k2 )
+  local vendor="$1" hashes links expected
+  local -a paths=()
+  mapfile -t paths < <(safe_install_reuse_items "$vendor" | sort -u | sed 's#^#./#')
+  (
+    set -o pipefail
+    cd -P -- "$vendor" || exit 1
+    for p in "${paths[@]}"; do [[ -e "$p" || -L "$p" ]] || exit 1; done
+    expected="$(find "${paths[@]}" -type f | wc -l)" || exit 1
+    hashes="$(find "${paths[@]}" -type f -print0 | xargs -0 -r sha256sum -- 2>/dev/null)" || exit 1
+    [[ "$(printf '%s' "$hashes" | grep -c '^[0-9a-f]\{64\}  ')" == "$expected" ]] || exit 1
+    links="$(find "${paths[@]}" -type l -printf 'link %l  %p\n')" || exit 1
+    printf '%s\n%s\n' "$hashes" "$links" | grep -v '^$' | LC_ALL=C sort -k2
+  )
+}
+
+# The baseline decision, shared by the copy and --dry-run (read-only here):
+# absent | matched | changed | new-lockfile | corrupt.
+safe_install_reuse_baseline_state() {
+  local baseline_file="$1" manifest_sha="$2" lock_sha="$3"
+  [[ -e "$baseline_file" ]] || { printf 'absent'; return 0; }
+  if ! jq -e 'type == "object"
+      and (.lock_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+      and (.manifest_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+      and (.recorded_at | type == "string")' "$baseline_file" >/dev/null 2>&1 ||
+     [[ ! -f "${baseline_file%.json}.manifest" ]]; then
+    printf 'corrupt'; return 0
+  fi
+  if ! jq -e --arg l "$lock_sha" '.lock_sha256 == $l' "$baseline_file" >/dev/null 2>&1; then
+    printf 'new-lockfile'
+  elif jq -e --arg m "$manifest_sha" '.manifest_sha256 == $m' "$baseline_file" >/dev/null 2>&1; then
+    printf 'matched'
+  else
+    printf 'changed'
+  fi
 }
 
 safe_install_reuse_confirm() {
@@ -3277,11 +3314,13 @@ cmd_install_reuse() {
   [[ "$source_lock_sha" == "$lock_sha" ]] ||
     safe_install_reuse_refuse 100 REFUSED_REUSE_LOCK_MISMATCH "$target" "BLOCKED reuse — composer.lock differs between ${source} (sha256 ${source_lock_sha:0:12}) and this project (sha256 ${lock_sha:0:12}); a changed lockfile is a new install, not a reuse; details: safe explain"
 
+  local autoload_override=""
   # The generated autoloader also encodes the ROOT package's autoload rules,
   # which the lockfile does not cover.
   if [[ "$(jq -cS '[.autoload, .["autoload-dev"]]' "$source/composer.json" 2>/dev/null)" != \
         "$(jq -cS '[.autoload, .["autoload-dev"]]' "$target/composer.json" 2>/dev/null)" ]]; then
-    safe_install_reuse_refuse 100 REFUSED_REUSE_AUTOLOAD "$target" "BLOCKED reuse — composer.json autoload rules differ between ${source} and this project, so the copied autoloader would be wrong here; to allow: run the normal install; details: safe explain"
+    safe_install_reuse_evidence_gap "$target" "composer.json autoload rules differ between ${source} and this project, so the copied autoloader would be wrong here until composer dump-autoload runs" "$dry_run"
+    autoload_override="root autoload rules differ"
   fi
 
   target_vendor_free() {
@@ -3292,6 +3331,7 @@ cmd_install_reuse() {
     safe_install_reuse_refuse 100 REFUSED_REUSE_TARGET_EXISTS "$target" "BLOCKED reuse — ${target}/vendor already exists and reuse never overwrites; to allow: remove it yourself, then retry; details: safe explain"
 
   local -a overrides=()
+  [[ -z "${autoload_override:-}" ]] || overrides+=("$autoload_override")
   local problem
   problem="$(safe_install_reuse_tree_problem "$source/vendor" "$target/composer.lock" "$source" "$target")"
   if [[ -n "$problem" ]]; then
@@ -3314,7 +3354,19 @@ cmd_install_reuse() {
   printf '  audit:     not run — reuse copies what is already on this machine; audit it with: safe audit repo-audit .\n'
 
   if [[ "$dry_run" == "1" ]]; then
-    safe_install_gate_log "reuse:composer" "$target" "REUSE_DRY_RUN" "source=${source}"
+    local dry_manifest dry_state dry_key
+    dry_key="$(printf '%s' "$source" | sha256sum | cut -c1-32)"
+    if ! dry_manifest="$(safe_install_reuse_manifest "$source/vendor")"; then
+      safe_install_reuse_evidence_gap "$target" "not every file in ${source}/vendor could be read and hashed" 1
+    fi
+    dry_state="$(safe_install_reuse_baseline_state "${SAFE_DATA_DIR:-$HOME/.local/share/safe}/install/reuse/baselines/${dry_key}.json" \
+      "$(printf '%s\n' "$dry_manifest" | sha256sum | cut -d' ' -f1)" "$lock_sha")"
+    case "$dry_state" in
+      changed) safe_install_reuse_evidence_gap "$target" "the installed tree in ${source} changed since its baseline" 1 ;;
+      corrupt) safe_install_reuse_evidence_gap "$target" "the integrity baseline recorded for ${source} is unreadable" 1 ;;
+    esac
+    safe_install_gate_log "reuse:composer" "$target" "REUSE_DRY_RUN" "source=${source} baseline=${dry_state}"
+    printf '  integrity: baseline %s\n' "$dry_state"
     printf '  status:    dry run — nothing copied (would end as reused-existing-vendor)\n'
     return 0
   fi
@@ -3340,7 +3392,7 @@ cmd_install_reuse() {
   # checked again as copied, then renamed into place.
   SAFE_REUSE_STAGING="$(mktemp -d "$target/.safe-reuse.XXXXXX")" ||
     safe_install_reuse_refuse 100 REFUSED_REUSE_COPY "$target" "BLOCKED reuse — cannot create a staging directory in ${target}; details: safe explain"
-  trap 'rm -rf -- "${SAFE_REUSE_STAGING:-}" "${SAFE_REUSE_TMP_RECEIPT:-}" "${SAFE_REUSE_TMP_BASELINE:-}"' EXIT
+  trap 'rm -rf -- "${SAFE_REUSE_STAGING:-}" "${SAFE_REUSE_TMP_RECEIPT:-}" "${SAFE_REUSE_TMP_BASELINE:-}" "${SAFE_REUSE_TMP_BASELINE:+${SAFE_REUSE_TMP_BASELINE}.manifest}"' EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
   local -a items=()
@@ -3365,24 +3417,34 @@ cmd_install_reuse() {
   # per-file manifest; later reuses must match it, or the operator accepts the
   # change at the terminal. A reinstalled source (new lockfile) re-records.
   local manifest manifest_sha files baseline_file="$baseline_dir/$source_key.json" integrity recorded_at
-  manifest="$(safe_install_reuse_manifest "$SAFE_REUSE_STAGING/vendor")"
+  if ! manifest="$(safe_install_reuse_manifest "$SAFE_REUSE_STAGING/vendor")"; then
+    safe_install_reuse_evidence_gap "$target" "not every copied file could be read and hashed, so no baseline can be recorded or matched" 0
+    manifest=""
+    overrides+=("files could not all be hashed")
+  fi
   manifest_sha="$(printf '%s\n' "$manifest" | sha256sum | cut -d' ' -f1)"
   files="$(printf '%s\n' "$manifest" | grep -c . || true)"
   recorded_at="$(date -Iseconds)"
   integrity="baseline-recorded"
-  if [[ -f "$baseline_file" ]] && jq -e --arg l "$lock_sha" '.lock_sha256 == $l' "$baseline_file" >/dev/null 2>&1; then
-    if jq -e --arg m "$manifest_sha" '.manifest_sha256 == $m' "$baseline_file" >/dev/null 2>&1; then
-      integrity="baseline-matched"
-      recorded_at="$(jq -r '.recorded_at' "$baseline_file")"
-    else
-      local changed
-      changed="$( { diff <(printf '%s\n' "$manifest") "$baseline_dir/$source_key.manifest" 2>/dev/null || true; } |
-        sed -n 's/^[<>] [^ ]*  \.\/\(.*\)$/\1/p' | sort -u | head -n 3 | paste -sd, -)" || changed=""
-      safe_install_reuse_evidence_gap "$target" "the installed tree in ${source} changed since its baseline of $(jq -r '.recorded_at' "$baseline_file") (${changed:-files differ})" 0
-      overrides+=("changed since baseline: ${changed:-files differ}")
-      integrity="baseline-re-recorded-by-operator"
-    fi
-  elif [[ -f "$baseline_file" ]]; then
+  local baseline_state
+  baseline_state="$(safe_install_reuse_baseline_state "$baseline_file" "$manifest_sha" "$lock_sha")"
+  if [[ -z "$manifest" ]]; then
+    integrity="unverified-by-operator"
+  elif [[ "$baseline_state" == "corrupt" ]]; then
+    safe_install_reuse_evidence_gap "$target" "the integrity baseline recorded for ${source} is unreadable" 0
+    overrides+=("baseline unreadable")
+    integrity="baseline-re-recorded-by-operator"
+  elif [[ "$baseline_state" == "matched" ]]; then
+    integrity="baseline-matched"
+    recorded_at="$(jq -r '.recorded_at' "$baseline_file")"
+  elif [[ "$baseline_state" == "changed" ]]; then
+    local changed
+    changed="$( { diff <(printf '%s\n' "$manifest") "$baseline_dir/$source_key.manifest" 2>/dev/null || true; } |
+      sed -n 's/^[<>] [^ ]*  \.\/\(.*\)$/\1/p' | sort -u | head -n 3 | paste -sd, -)" || changed=""
+    safe_install_reuse_evidence_gap "$target" "the installed tree in ${source} changed since its baseline of $(jq -r '.recorded_at' "$baseline_file") (${changed:-files differ})" 0
+    overrides+=("changed since baseline: ${changed:-files differ}")
+    integrity="baseline-re-recorded-by-operator"
+  elif [[ "$baseline_state" == "new-lockfile" ]]; then
     integrity="baseline-re-recorded-new-lockfile"
   fi
 
@@ -3411,7 +3473,7 @@ cmd_install_reuse() {
      network: false, package_manager: false, scripts_executed: false}' > "$SAFE_REUSE_TMP_RECEIPT"; }; then
     safe_install_reuse_refuse 100 REFUSED_REUSE_RECEIPT "$target" "BLOCKED reuse — the receipt could not be written in ${reuse_dir}; nothing was installed; details: safe explain"
   fi
-  if [[ "$integrity" != "baseline-matched" ]]; then
+  if [[ "$integrity" != "baseline-matched" && -n "$manifest" ]]; then
     if ! { SAFE_REUSE_TMP_BASELINE="$(mktemp "$baseline_dir/.baseline.XXXXXX")" &&
       printf '%s\n' "$manifest" > "$SAFE_REUSE_TMP_BASELINE.manifest" &&
       jq -n --arg s "$source" --arg l "$lock_sha" --arg m "$manifest_sha" --arg r "$recorded_at" --argjson f "${files:-0}" \

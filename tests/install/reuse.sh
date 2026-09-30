@@ -152,6 +152,9 @@ reuse "$WT"
 [[ "$RC" == "0" ]] || fail "baseline reuse failed (rc=$RC)"
 printf '<?php // injected\n' > "$MAIN/vendor/acme/spreadsheet/src/Main.php"
 WT="$WT2" reuse "$WT2"
+WT="$WT2" reuse "$WT2" --dry-run
+WT="$WT2" expect_refusal 102 'changed since its baseline' "--dry-run predicts the changed baseline"
+WT="$WT2" reuse "$WT2"
 WT="$WT2" expect_refusal 102 'changed since its baseline' "a source changed since its baseline is refused unattended"
 grep -Fq 'acme/spreadsheet/src/Main.php' "$tmp/err.txt" || fail "the refusal does not name the changed file"
 
@@ -252,7 +255,7 @@ expect_refusal 100 'holds an installed vendor/ for this composer.lock' "auto-det
 make_repo autoload-rules
 jq '.autoload["psr-4"]["Other\\"] = "lib/"' "$WT/composer.json" > "$tmp/c.json" && mv "$tmp/c.json" "$WT/composer.json"
 reuse "$WT"
-expect_refusal 100 'autoload rules differ' "different root autoload rules would make the copied autoloader wrong"
+expect_refusal 102 'autoload rules differ' "different root autoload rules are an evidence gap for the operator"
 
 make_repo unwritable-store
 printf 'not a directory\n' > "$tmp/store-file"
@@ -281,8 +284,48 @@ rm -rf "$WT/vendor"
 RACE_MODE=term PATH="$tmp/racebin:$PATH" reuse "$WT"
 [[ "$RC" == "143" && ! -e "$WT/vendor" ]] || fail "an interrupted copy did not stop cleanly (rc=$RC)"
 compgen -G "$WT/.safe-reuse.*" >/dev/null && fail "an interrupted copy left its staging behind"
-ls "$SAFE_DATA_DIR/install/reuse/" | grep -q '^\.receipt' && fail "an interrupted copy left a partial receipt"
+compgen -G "$SAFE_DATA_DIR/install/reuse/.receipt.*" >/dev/null && fail "an interrupted copy left a partial receipt"
+compgen -G "$SAFE_DATA_DIR/install/reuse/baselines/.baseline.*" >/dev/null && fail "a refused or interrupted copy left a temporary baseline"
 pass "a concurrent vendor/ is never overwritten and an interrupted copy leaves nothing behind"
+
+# --- review r2: damaged evidence never becomes an accepted baseline ---------------
+make_repo hash-failure
+REAL_SHA="$(command -v sha256sum)"
+mkdir -p "$tmp/hashbin"
+cat > "$tmp/hashbin/sha256sum" <<STUB
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  if [[ "\$arg" == *acme/runtime/src/Main.php ]]; then
+    echo "sha256sum: \$arg: Input/output error" >&2
+    args=(); for a in "\$@"; do [[ "\$a" == "\$arg" ]] || args+=("\$a"); done
+    "$REAL_SHA" "\${args[@]}"; exit 1
+  fi
+done
+exec "$REAL_SHA" "\$@"
+STUB
+chmod +x "$tmp/hashbin/sha256sum"
+PATH="$tmp/hashbin:$PATH" reuse "$WT"
+expect_refusal 102 'could be read and hashed' "a file that cannot be hashed is an evidence gap, never a baseline"
+[[ -z "$(find "$SAFE_DATA_DIR/install/reuse/baselines" -name '*.json' -newer "$tmp/hashbin/sha256sum" 2>/dev/null)" ]] ||
+  fail "a partial manifest was recorded as a baseline"
+
+make_repo corrupt-baseline
+reuse "$WT"
+[[ "$RC" == "0" ]] || fail "baseline reuse failed (rc=$RC)"
+baseline_json="$(find "$SAFE_DATA_DIR/install/reuse/baselines" -name '*.json' -newer "$MAIN/composer.lock" | head -n 1)"
+printf '{"lock_sha' > "$baseline_json"
+printf '<?php // changed\n' > "$MAIN/vendor/acme/runtime/src/Main.php"
+WT="$WT2" reuse "$WT2"
+WT="$WT2" expect_refusal 102 'integrity baseline recorded for' "an unreadable baseline is an evidence gap, never a new lockfile"
+
+make_repo chained-link
+mkdir -p "$tmp/chained-link/outside"
+printf 'outside\n' > "$tmp/chained-link/outside/x"
+ln -s "$tmp/chained-link/outside" "$MAIN/packages-redirect" 2>/dev/null || { mkdir -p "$MAIN"; ln -s "$tmp/chained-link/outside" "$MAIN/packages-redirect"; }
+ln -s "$tmp/chained-link/outside" "$WT/packages-redirect"
+ln -s ../../../packages-redirect "$MAIN/vendor/acme/runtime/link"
+reuse "$WT"
+expect_refusal 102 'leads outside the project through another link' "a link reaching outside the project through another link is refused"
 
 # --- dry run and explicit source -----------------------------------------------
 make_repo dry
