@@ -20,6 +20,22 @@
   followed identity in another ecosystem than the local pin is a conflict,
   never "already present".
 - `host-allow review` counts followed-grant installs as usage of the entry.
+- Add `safe install --reuse [--reuse-from <checkout>] [--dry-run]` (operator
+  rulings 2026-09-30): fill a worktree's missing Composer `vendor/` by copying
+  the installed tree of another checkout of the same repository with the same
+  `composer.lock`. It copies what is already on the machine and runs no audit,
+  no `php`, no package manager and no network access. Identity mismatches
+  (repository, lockfile, root autoload rules, existing target) refuse 100;
+  evidence gaps (inventory, missing package directories, missing autoloader,
+  links leaving the project or reaching an absent or different path
+  repository, a tree changed since its trust-on-first-use baseline) refuse
+  102 unattended and are the operator's
+  decision at the terminal. Only what the inventory describes is copied (the
+  rest is listed as skipped). The copy is staged, re-checked and published
+  atomically with a required receipt; the status is `reused-existing-vendor`.
+- Add the per-host rule `install.reuse.enabled` (default `false`): `true` lets
+  reuse run unattended; otherwise the operator confirms each reuse at a
+  terminal and other sessions refuse 102.
 
 ## 1.66.1 - 2026-09-22
 

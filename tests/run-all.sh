@@ -29,6 +29,7 @@ SUITES=(
   tests/install/socket_command_consent.sh
   tests/install/unattended_green.sh
   tests/install/gate_adverse_warn_override.sh
+  tests/install/reuse.sh
   tests/audit/check_version_aware.sh
   tests/audit/socket_tier.sh
   tests/audit/smoke.sh
