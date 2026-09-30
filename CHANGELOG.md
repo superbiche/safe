@@ -46,8 +46,12 @@
   (terminal confirm, 102 unattended); signed exports carry the override and
   followers install the accepted version unattended (exit 16,
   `covered:block_override`) from the follow ledger's `block_overrides`,
-  rewritten from each verified statement; `follow --dry-run` previews
-  override changes. Malware and blocklist BLOCKs are never recorded.
+  rewritten from each verified statement and honored only for a pin taken
+  from that origin; `follow --dry-run` previews override changes.
+- `host-allow follow` records the SHA-256 of each accepted statement; a
+  different signed statement for an already-accepted `exported_at` instant is
+  a collision, refused without changing the ledger (ask the origin for a
+  newer export, or review it with `host-allow import`). Malware and blocklist BLOCKs are never recorded.
 - `safe audit package-audit` results carry `package` and `block: {class,
   advisories}`; the install gates read the decided result through
   `SAFE_AUDIT_RESULT_OUT` instead of re-running the audit.

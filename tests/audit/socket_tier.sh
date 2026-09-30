@@ -930,6 +930,7 @@ prepare_case block-override-followed-local-entry
 seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$BLOCK_INSTALL"
 drop_follow_label
 seed_block_override '["GHSA-aaaa"]'
+ledger_block_override '["GHSA-aaaa"]'
 run_check clean MOCK_OSV_CRITICAL=GHSA-aaaa --gate install --op install
 expect_rc 17 'a local override never rides a WARN-era ledger identity unattended'
 

@@ -277,7 +277,7 @@ origin's highest accepted `exported_at`, the verified primary fingerprint that
 signed it, and the identities already applied:
 
 ```json
-{"origins":{"rainbow":{"accepted":"2026-09-16T14:00:00Z","applied":["fresh-pkg@1.2.3"],"replaced":["fresh-pkg@1.0.0->1.2.3"],"refused":["other-pkg@2.0.0"],"signer":"<40-or-64-hex primary fingerprint>","granted":["npm:fresh-pkg@1.2.3"],"block_overrides":{"npm:fresh-pkg@1.2.3":["GHSA-xxxx-xxxx-xxxx"]}}}}
+{"origins":{"rainbow":{"accepted":"2026-09-16T14:00:00Z","applied":["fresh-pkg@1.2.3"],"replaced":["fresh-pkg@1.0.0->1.2.3"],"refused":["other-pkg@2.0.0"],"signer":"<40-or-64-hex primary fingerprint>","granted":["npm:fresh-pkg@1.2.3"],"block_overrides":{"npm:fresh-pkg@1.2.3":["GHSA-xxxx-xxxx-xxxx"]},"statement_sha256":"<sha256 of the accepted statement>"}}}
 ```
 
 Timestamps are real ISO-8601 whole-second instants with an explicit timezone;
@@ -429,9 +429,13 @@ receipt `covered:block_override` plus one `block_advisory:<id>` per accepted
 advisory), under the same ledger and signer conditions as above. The accepted
 advisories it trusts are the follow ledger's `block_overrides` for that
 origin and `<ecosystem>:name@version`, rewritten from every verified
-statement like `granted` — never the store entry's copy. A statement without
-the override, even one with the same timestamp, withdraws it, and
-`follow --dry-run` prints the `would-set-block-override` /
+statement like `granted` — never the store entry's copy — and only for a pin
+this host took from that origin (`followed_from`). A newer statement without
+the override withdraws it. The ledger records the SHA-256 of the accepted
+statement (`statement_sha256`); a different signed statement carrying the
+same `exported_at` instant is a collision, refused without changing the ledger,
+so an older statement of that second cannot be replayed to restore a withdrawn
+override. `follow --dry-run` prints the `would-set-block-override` /
 `would-drop-block-override` changes. An override present only in the store (a
 local pin, or a stale copy) stays a terminal decision (exit 17). Followers on
 an older safe ignore the field and keep refusing.

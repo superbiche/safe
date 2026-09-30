@@ -113,7 +113,7 @@ host-set pin yields to any signed statement. Replacements are recorded in the
 run audit log and the origin's `replaced` ledger array. Dry-run validates the
 whole plan without changing persistent state. A machine-local `follow-state.json` beside the
 guard-selected trust store records each origin as
-`{"accepted":"<exported_at>","applied":["<pkg>@<version>"],"replaced":["<pkg>@<old>-><new>"],"refused":["<pkg>@<version>"],"signer":"<fingerprint>","granted":["<ecosystem>:<pkg>@<version>"],"block_overrides":{"<ecosystem>:<pkg>@<version>":["<advisory id>"]}}`. Older timestamps
+`{"accepted":"<exported_at>","applied":["<pkg>@<version>"],"replaced":["<pkg>@<old>-><new>"],"refused":["<pkg>@<version>"],"signer":"<fingerprint>","granted":["<ecosystem>:<pkg>@<version>"],"block_overrides":{"<ecosystem>:<pkg>@<version>":["<advisory id>"]},"statement_sha256":"<sha256>"}`. Older timestamps
 warn, increment the freshness-skip count and return non-zero. Equal timestamps
 retry only identities that never applied; successful entries stay skipped even
 after operator removal. A local re-pin survives an equal generation and a newer

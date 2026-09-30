@@ -8036,19 +8036,23 @@ followed_grant_lookup() {
   FOLLOWED_GRANT_ORIGIN="" FOLLOWED_GRANT_GENERATION="" FOLLOWED_GRANT_SIGNER=""
   [[ -n "$ecosystem" && -n "$name" && -n "$version" ]] || return 1
   local ha_file state_file config_file grant
+  FOLLOWED_GRANT_LEDGER=""
   ha_file="$(trust_store_file host-allow.json)"
   state_file="$(followed_grant_ledger_file)"
   config_file="$(trust_store_file config.json)"
   [[ -f "$ha_file" && -f "$state_file" && -f "$config_file" ]] || return 1
+  # One read of the ledger backs this lookup and the BLOCK-override check
+  # that may follow it (review r2 R4): a concurrent follow cannot mix them.
+  FOLLOWED_GRANT_LEDGER="$(jq -c . "$state_file" 2>/dev/null)" || return 1
   grant=$(jq -cn --arg p "$name" --arg id "$name@$version" \
     --arg gid "$(host_allow_canonical_eco "$ecosystem"):$name@$version" \
-    --slurpfile store "$ha_file" --slurpfile state "$state_file" --slurpfile config "$config_file" '
+    --slurpfile store "$ha_file" --argjson ledger "$FOLLOWED_GRANT_LEDGER" --slurpfile config "$config_file" '
     ($config[0].follow.signers // []) as $raw
     | (if ($raw | type) == "array"
           and ($raw | all(.[]; type == "string" and test("^([A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})$")))
        then ($raw | map(ascii_upcase)) else [] end) as $signers
     | ($store[0].packages[$p].followed_from // "") as $preferred
-    | [ ($state[0].origins // {}) | to_entries[]
+    | [ ($ledger.origins // {}) | to_entries[]
         | select((.value | type) == "object")
         | select((.value.applied | type) == "array" and (.value.applied | index($id)) != null)
         | select((.value.granted | type) == "array" and (.value.granted | index($gid)) != null)
@@ -8118,15 +8122,18 @@ block_override_covers() {
 # advisories covering every current blocking one. The follow commit rewrites
 # that binding from each verified statement, like `granted`.
 followed_block_override_covers() {
-  local ecosystem="$1" name="$2" version="$3" advisories_json="$4" state_file
-  state_file="$(followed_grant_ledger_file)"
-  [[ -f "$state_file" && -n "$FOLLOWED_GRANT_ORIGIN" ]] || return 1
+  local ecosystem="$1" name="$2" version="$3" advisories_json="$4"
+  [[ -n "${FOLLOWED_GRANT_LEDGER:-}" && -n "$FOLLOWED_GRANT_ORIGIN" ]] || return 1
+  # Only a pin this host took from that origin: a local re-pin keeps its own
+  # terminal confirmation (17) even when the ledger still grants the identity
+  # (review r2 F3).
+  [[ "$(jq -r --arg p "$name" '.packages[$p].followed_from // "" | strings' "$(trust_store_file host-allow.json)" 2>/dev/null)" == "$FOLLOWED_GRANT_ORIGIN" ]] || return 1
   jq -e --arg host "$FOLLOWED_GRANT_ORIGIN" --arg gid "$(host_allow_canonical_eco "$ecosystem"):$name@$version" \
     --argjson current "$advisories_json" '
     (.origins[$host].block_overrides[$gid]) as $accepted
     | ($current | type) == "array" and ($current | length) > 0
       and ($accepted | type) == "array" and ($accepted | all(.[]; type == "string"))
-      and ($current | all(.[]; . as $id | $accepted | index($id) != null))' "$state_file" >/dev/null 2>&1
+      and ($current | all(.[]; . as $id | $accepted | index($id) != null))' <<<"$FOLLOWED_GRANT_LEDGER" >/dev/null 2>&1
 }
 
 # Derive the exact artifact versions a host-allow would override, deny-by-

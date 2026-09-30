@@ -2340,11 +2340,24 @@ follow_canonical_eco() {
 # No registry calls here. The caller holds the shared writer lock for real
 # writes; dry-run reads atomic snapshots without creating a lock or ledger.
 follow_commit_generation() {
-  local dry_run="$1" origin="$2" ha_file="$3" stamp="$4" candidates="$5" signer="${6:-}" statement_ids="${7:-[]}" statement_overrides="${8:-\{\}}"
+  local dry_run="$1" origin="$2" ha_file="$3" stamp="$4" candidates="$5" signer="${6:-}" statement_ids="${7:-[]}" statement_overrides="${8:-\{\}}" statement_sha="${9:-}"
   local state_file state selected next entry name version sha reason ecosystem added disposition id override_changed local_entry local_generation local_origin statement_generation planned_entry replacement replace_local generation_rc already_refused
   local changed=0 failures=0
   state_file="$(dirname "$ha_file")/follow-state.json"
   state=$(follow_load_state "$state_file") || return 1
+  local pre_state="$state" prior_stamp prior_sha
+  # One generation, one statement (review r2 F1): a different signed statement
+  # carrying an already-accepted exported_at is a collision, never a silent
+  # replacement — otherwise replaying an older statement of that second could
+  # restore authority a newer one withdrew. Authority stays as accepted; the
+  # operator resolves it with a newer export, or import/update at a terminal.
+  prior_stamp=$(jq -r --arg host "$origin" '.origins[$host].accepted // empty' <<<"$state")
+  prior_sha=$(jq -r --arg host "$origin" '.origins[$host].statement_sha256 // empty' <<<"$state")
+  if [[ -n "$statement_sha" && -n "$prior_sha" && -n "$prior_stamp" && "$prior_sha" != "$statement_sha" ]] &&
+     [[ "$(follow_exported_epoch "$prior_stamp" 2>/dev/null)" == "$(follow_exported_epoch "$stamp" 2>/dev/null)" ]]; then
+    warn "WARN follow: skipped $origin (a different signed statement for the already-accepted generation $stamp; ask the origin for a newer export, or review it with host-allow import at an operator terminal)"
+    return 1
+  fi
   selected=$(follow_select_generation "$state" "$origin" "$stamp") || return $?
   if [[ "$selected" != "$state" ]]; then
     (( dry_run )) || follow_publish_state "$state_file" "$selected" || return 1
@@ -2508,21 +2521,23 @@ follow_commit_generation() {
   # the gate's followed BLOCK lane reads nothing else.
   if [[ -n "$signer" ]]; then
     next=$(jq -c --arg host "$origin" --arg signer "$signer" --argjson ids "$statement_ids" \
-      --argjson ovr "$statement_overrides" '
+      --argjson ovr "$statement_overrides" --arg digest "$statement_sha" '
       (.origins[$host].applied // []) as $applied
       | ([ $ids[] | select((split(":")[1:] | join(":")) as $id | $applied | index($id) != null) ] | unique) as $granted
       | .origins[$host].signer = $signer
       | .origins[$host].granted = $granted
-      | .origins[$host].block_overrides = ($ovr | with_entries(select(.key as $k | $granted | index($k) != null)))' <<<"$state") || return 1
+      | .origins[$host].block_overrides = ($ovr | with_entries(select(.key as $k | $granted | index($k) != null)))
+      | if $digest == "" then . else .origins[$host].statement_sha256 = $digest end' <<<"$state") || return 1
     if (( dry_run )); then
-      # Preview the trust change the real run would make (review r1 F2).
+      # Preview the trust change the real run would make (review r1 F2),
+      # against the ledger as committed, before a newer generation reset it.
       jq -r --arg host "$origin" --argjson new "$next" '
         (.origins[$host].block_overrides // {}) as $old
         | ($new.origins[$host].block_overrides // {}) as $cur
         | (($old + $cur) | keys[]) as $k
         | if ($old[$k] // null) == ($cur[$k] // null) then empty
           elif $cur[$k] == null then "  would-drop-block-override \($k) from \($host)"
-          else "  would-set-block-override \($k) from \($host): \($cur[$k] | join(","))" end' <<<"$state" >&2 || true
+          else "  would-set-block-override \($k) from \($host): \($cur[$k] | join(","))" end' <<<"$pre_state" >&2 || true
     fi
     if [[ "$next" != "$state" ]]; then
       (( dry_run )) || follow_publish_state "$state_file" "$next" || return 1
@@ -2549,12 +2564,14 @@ follow_apply_generation() {
   fi
   state=$(follow_select_generation "$state" "$origin" "$stamp") || return $?
   applied=$(jq -c --arg host "$origin" '.origins[$host].applied' <<<"$state") || return 1
+  local statement_sha
+  statement_sha=$(sha256sum -- "$file" | cut -d' ' -f1) || return 1
   # Validation and all bounded registry I/O happen before acquiring the lock.
   host_allow_apply_export "$file" "$dry_run" "$origin" "$ha_file" follow_collect_entry "$applied" || collect_rc=$?
   if (( dry_run )); then
-    follow_commit_generation "$dry_run" "$origin" "$ha_file" "$stamp" "$follow_candidates" "$signer" "$follow_statement_ids" "$follow_statement_overrides" || commit_rc=$?
+    follow_commit_generation "$dry_run" "$origin" "$ha_file" "$stamp" "$follow_candidates" "$signer" "$follow_statement_ids" "$follow_statement_overrides" "$statement_sha" || commit_rc=$?
   else
-    with_host_allow_lock "$ha_file" follow_commit_generation "$dry_run" "$origin" "$ha_file" "$stamp" "$follow_candidates" "$signer" "$follow_statement_ids" "$follow_statement_overrides" || commit_rc=$?
+    with_host_allow_lock "$ha_file" follow_commit_generation "$dry_run" "$origin" "$ha_file" "$stamp" "$follow_candidates" "$signer" "$follow_statement_ids" "$follow_statement_overrides" "$statement_sha" || commit_rc=$?
   fi
   (( commit_rc != 2 )) || return 2
   (( collect_rc == 0 )) || return 1
