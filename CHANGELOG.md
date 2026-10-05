@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- The mise gate summarizes release-binary tools in one line per command
+  instead of one notice per tool: specs on the `aqua`, `github`, `gitlab`,
+  `forgejo`, `http`, `s3` and `packslip` backends (which mise verifies itself
+  by checksum and, where published, cosign/minisign/SLSA/GitHub attestations)
+  print `safe: mise: N release binaries not advisory-audited (mise
+  checksum/signature checks only): …`. Verdicts are unchanged: these specs
+  still pass without an advisory audit. Plugin backends (`asdf`, `vfox`) and
+  `ubi` keep the per-tool "review manually" notice.
 - A followed operator-signed grant installs without a second confirmation
   (operator direction 2026-09-29): when the exact resolved version is pinned
   by a grant this machine took through `safe run host-allow follow`, the

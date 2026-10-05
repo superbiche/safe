@@ -4810,6 +4810,26 @@ case_mise_runtime_and_other_backends_pass() {
   pass "$FUNCNAME"
 }
 
+case_mise_release_backends_share_one_notice() {
+  prepare_case "mise-release-backends-one-notice"
+  # Release-binary backends (mise verifies the asset itself) pass without an
+  # audit and are summarized in ONE line, not one notice per tool.
+  SAFE_INSTALL_TEST_SCRIPT='mise install aqua:sigstore/cosign@3.1.3 github:anchore/grype@0.120.0 http:ntn@0.23.16' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe: mise: 3 release binaries not advisory-audited (mise checksum/signature checks only): sigstore/cosign@3.1.3, anchore/grype@0.120.0, ntn@0.23.16' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'no registry advisory source' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tinstall\taqua:sigstore/cosign@3.1.3\tgithub:anchore/grype@0.120.0\thttp:ntn@0.23.16' "$FUNCNAME" || return
+
+  # A plugin backend keeps its per-tool notice next to the summary.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise install aqua:minio/mc@1.0.0 vfox:owner/plugin@1.0.0' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe: mise: 1 release binary not advisory-audited (mise checksum/signature checks only): minio/mc@1.0.0' "$FUNCNAME" || return
+  assert_err_contains_fragment "'vfox' backend has no registry advisory source" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_mise_bare_install_preflights_config() {
   prepare_case "mise-bare-install-preflight"
   # One backend tool not installed yet -> audited; blockme blocks the run.
@@ -6703,6 +6723,7 @@ main() {
     case_uninstall_preserves_symlinked_zshrc \
     case_mise_use_backend_audits \
     case_mise_runtime_and_other_backends_pass \
+    case_mise_release_backends_share_one_notice \
     case_mise_bare_install_preflights_config \
     case_mise_bare_upgrade_audits_floating \
     case_mise_exec_gates_inner_command \

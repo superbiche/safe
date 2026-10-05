@@ -79,9 +79,14 @@ effective backend via `mise registry` before the runtime-vs-package call is
 made; audits run with mise's project `[env]` package-source variables
 applied, so the verdict covers the source mise will actually install from.
 Official runtime installs (`node@22`) pass through; non-registry backends
-(aqua/ubi/gem) and source-bearing specs (`pipx:owner/repo` GitHub
+(ubi/gem/asdf/vfox) and source-bearing specs (`pipx:owner/repo` GitHub
 shorthands, `git+`/URL forms) pass with an explicit notice that they are
 not audit-gated — a public-registry audit must never vouch for them.
+Release-binary backends (`aqua`, `github`, `gitlab`, `forgejo`, `http`,
+`s3`, `packslip`), whose assets mise verifies itself, pass the same way but
+share one summary line per command (`safe: mise: N release binaries not
+advisory-audited (mise checksum/signature checks only): …`) instead of a
+notice per tool.
 Every helper query safe makes (`registry`, `ls`, `env`, `settings`) runs
 under the same context as the delegated command — `-C`, `-E`, and the
 config/env-disabling switches (`--no-config`, `--no-env`, `--no-hooks`) —
