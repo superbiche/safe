@@ -1936,6 +1936,31 @@ cmd_host_allow_export() {
   fi
 }
 
+# A trust change on an origin republishes its signed export in the same
+# gesture (operator ruling 2026-10-05): grant, export and the followers'
+# follow are one flow, so the operator no longer runs `export --sign` by hand.
+# A host is an origin when its signed export already exists in the default
+# directory; `follow.auto_export: false` opts out. The trust-store write has
+# already succeeded: a failed or declined signature warns with the recovery
+# command and never fails the grant.
+host_allow_auto_export() {
+  local host dest
+  [[ "$(jq -r '.follow.auto_export | if . == false then "false" else "true" end' \
+    "$CONFIG_FILE" 2>/dev/null || echo true)" == "true" ]] || return 0
+  host=$(hostname -s 2>/dev/null) || return 0
+  dest="$HOME/Sync/state/safe/host-allow.$host.json"
+  [[ -f "$dest" ]] || return 0
+  if ! is_tty; then
+    warn "host-allow changed, but the signed export $dest was not refreshed (no operator terminal); followers keep the previous grants until you run: safe run host-allow export --sign"
+    return 0
+  fi
+  info "republishing the signed export for followers"
+  if ! ( cmd_host_allow_export --sign ); then
+    warn "host-allow changed, but the signed export was not refreshed; followers keep the previous grants until you run: safe run host-allow export --sign"
+  fi
+  return 0
+}
+
 # Stage both files on the destination filesystem before publishing either.
 # The two renames are individually atomic; a reader seeing mixed generations
 # rejects the signature and can retry after synchronization completes.
@@ -1943,21 +1968,27 @@ host_allow_export_signed() (
   local document="$1" out_dir="$2" host dest staging signing_key
   host=$(hostname -s)
   [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid short hostname"
-  mkdir -p -- "$out_dir"
+  # Every step fails explicitly: callers may run this under a negated
+  # conditional, where errexit is off, and must still see the failure.
+  mkdir -p -- "$out_dir" || die "could not create the export directory $out_dir"
   dest="$out_dir/host-allow.$host.json"
-  staging=$(mktemp -d "$out_dir/.host-allow-sign.XXXXXX")
+  staging=$(mktemp -d "$out_dir/.host-allow-sign.XXXXXX") \
+    || die "could not stage the signed export in $out_dir"
   trap 'rm -rf -- "$staging"' EXIT
   jq --arg host "$host" --arg exported_at "$(now_iso)" \
     '.schema = "safe-host-allow-export/2" | .host = $host | .exported_at = $exported_at' \
-    <<<"$document" > "$staging/export.json"
+    <<<"$document" > "$staging/export.json" \
+    || die "could not project the signed export document"
   signing_key=$(config_get '.follow.signing_key' '')
   local key_args=()
   [[ -z "$signing_key" ]] || key_args=(--local-user "$signing_key")
   gpg --armor --detach-sign "${key_args[@]}" \
     --output "$staging/export.json.asc" -- "$staging/export.json" \
     || die "could not sign export; check follow.signing_key or the default GPG key and retry at an operator terminal"
-  mv -f -- "$staging/export.json.asc" "$dest.asc"
-  mv -f -- "$staging/export.json" "$dest"
+  mv -f -- "$staging/export.json.asc" "$dest.asc" \
+    || die "could not publish $dest.asc; the previous export is unchanged — retry: safe run host-allow export --sign"
+  mv -f -- "$staging/export.json" "$dest" \
+    || die "could not publish $dest after its signature; followers reject the mismatched pair until you retry: safe run host-allow export --sign"
   info "signed export: $dest (signature: $dest.asc)"
 )
 
@@ -2734,6 +2765,7 @@ cmd_host_allow_add() {
   else
     info "added ${PKG_NAME}@${PKG_VERSION} to host-allow"
   fi
+  host_allow_auto_export
 }
 
 cmd_host_allow_remove() {
@@ -2742,7 +2774,8 @@ cmd_host_allow_remove() {
   # An unblessed redirect seeds no host-allow file (F4): nothing to remove,
   # rather than aborting on jq's missing-file status (N1 sibling class).
   [[ -f "$HOST_ALLOW_FILE" ]] || { info "host-allow is empty; nothing to remove"; return 0; }
-  with_host_allow_lock "$HOST_ALLOW_FILE" host_allow_remove_locked "$pkg"
+  with_host_allow_lock "$HOST_ALLOW_FILE" host_allow_remove_locked "$pkg" || return $?
+  host_allow_auto_export
 }
 
 host_allow_remove_locked() {
@@ -2806,6 +2839,7 @@ cmd_host_allow_update() {
   # state this caller does not have.
   write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem" "" "" 0 "" "update"
   info "updated ${PKG_NAME}@${PKG_VERSION} in host-allow"
+  host_allow_auto_export
 }
 
 cmd_host_allow_list() {

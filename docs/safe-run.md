@@ -170,6 +170,16 @@ and must reject them. `follow.signing_key` in the run config selects the GPG
 signing key; otherwise GPG selects its default key. Signing a redirected trust
 store requires the same explicit trust override as a grant.
 
+On an origin — a host whose own signed export already exists in
+`~/Sync/state/safe/` — `host-allow add`, `update` and `remove` (including the
+install gate's `[a]` grant and `--accept-block`) republish the signed export
+in the same gesture, so a grant, its export and the followers' `follow` form
+one flow. The trust change is written first: a declined or failed signature,
+or a change made without an operator terminal, keeps the change and warns that
+followers hold the previous grants until `safe run host-allow export --sign`
+runs. Set `follow.auto_export` to `false` to keep the export manual. A host
+without its own export never starts publishing one.
+
 `import` is *"review this set and apply"*, never *"trust another machine"*:
 
 - It is an operator-only trust escalation, TTY-gated exactly like `add`/`update`
@@ -331,8 +341,9 @@ review any skipped file and deliberately apply it with the existing
 never overwrites a different pin. Resolve those pins with `host-allow update`.
 
 Synchronize only signed exports and signatures, **not** the live trust store or
-signer configuration. A timer may run `follow` unattended; export remains a
-separate operator gesture. Removing a signer stops future imports but does not
+signer configuration. A timer may run `follow` unattended; export stays an
+operator gesture at a TTY — the first `export --sign` makes a host an origin,
+and its later `host-allow add|update|remove` republish it (see above). Removing a signer stops future imports but does not
 remove grants already accepted; it does withdraw their unattended install pass
 (see below). The freshness ledger prevents replay of accepted
 generations, not cross-origin withdrawal: a newer statement or a statement from

@@ -191,7 +191,7 @@
     },
     {
       "command": "safe run host-allow export --sign",
-      "purpose": "operator-signed fleet export (TTY)"
+      "purpose": "operator-signed fleet export (TTY); on an origin (its own signed export exists) host-allow add/update/remove republish it automatically unless follow.auto_export is false"
     },
     {
       "command": "safe run host-allow follow-signer add <fingerprint>",

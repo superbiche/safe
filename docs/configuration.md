@@ -89,6 +89,9 @@ unchanged.
 
 `follow.signing_key` in `run/config.json` optionally selects the GPG key for
 operator-only `safe run host-allow export --sign`; absent, GPG uses its default.
+`follow.auto_export` (default `true`) republishes that signed export after each
+`host-allow add|update|remove` on a host that already publishes one; `false`
+keeps the export manual.
 `follow.signers` is a list of full GPG primary-key fingerprints. Manage it at an
 operator TTY using `safe run host-allow follow-signer add|remove <fingerprint>`;
 add requires that public key in the local GPG keyring. `follow` verifies signed

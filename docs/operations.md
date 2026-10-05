@@ -82,6 +82,8 @@ a divergent local pin, and refuses in non-TTY shells (exit 102) unless
 safe run host-allow follow-signer add <full-primary-fingerprint>
 
 # rainbow: operator terminal (GPG key/passphrase or hardware-token touch).
+# Once this export exists, every later host-allow add/update/remove on
+# rainbow republishes it in the same gesture (follow.auto_export).
 safe run host-allow export --sign
 
 # agent-dev: unattended preview, then apply (no TTY required).
