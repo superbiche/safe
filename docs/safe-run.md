@@ -341,8 +341,9 @@ review any skipped file and deliberately apply it with the existing
 never overwrites a different pin. Resolve those pins with `host-allow update`.
 
 Synchronize only signed exports and signatures, **not** the live trust store or
-signer configuration. A timer may run `follow` unattended; export remains a
-separate operator gesture. Removing a signer stops future imports but does not
+signer configuration. A timer may run `follow` unattended; export stays an
+operator gesture at a TTY — the first `export --sign` makes a host an origin,
+and its later `host-allow add|update|remove` republish it (see above). Removing a signer stops future imports but does not
 remove grants already accepted; it does withdraw their unattended install pass
 (see below). The freshness ledger prevents replay of accepted
 generations, not cross-origin withdrawal: a newer statement or a statement from

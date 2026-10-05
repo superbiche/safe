@@ -1007,4 +1007,26 @@ rm -f -- "$export_file" "$export_file.asc"
 pty_run "$SAFE_RUN" host-allow remove gone-pkg > "$tmp/output" 2>&1 || fail 'non-origin remove failed'
 [[ ! -e "$export_file" ]] || fail 'a non-origin host started publishing an export'
 pass 'a host without its own signed export never starts publishing one'
+
+seed_auto_export "$signing_config"
+printf 'y\n' | pty_run "$SAFE_RUN" host-allow update fresh-pkg@1.2.3 --reason "auto-export update" > "$tmp/output" 2>&1 || { cat "$tmp/output" >&2; fail 'TTY update on origin failed'; }
+grep -q 'republishing the signed export' "$tmp/output" || fail 'update on an origin did not republish'
+jq -e '.packages["fresh-pkg"].reason == "auto-export update"' "$export_file" >/dev/null || fail 'update did not reach the republished export'
+gpg --no-options --batch --verify "$export_file.asc" "$export_file" > "$tmp/verify.log" 2>&1 || fail 'update re-export signature does not verify'
+pass 'host-allow update on an origin republishes the signed export'
+
+# A publication failure after signing must reach the wrapper's warning, never
+# a "signed export" success line (review R1, 2026-10-05).
+seed_auto_export "$signing_config"
+cat > "$tmp/bin/mv" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${TEST_FAIL_EXPORT_JSON:-0}" == 1 && "${!#}" == "$HOME/Sync/state/safe/host-allow.rainbow.json" ]]; then exit 1; fi
+exec /usr/bin/mv "$@"
+STUB
+chmod +x "$tmp/bin/mv"
+pty_run env TEST_FAIL_EXPORT_JSON=1 "$SAFE_RUN" host-allow remove gone-pkg > "$tmp/output" 2>&1 || fail 'a failed publication failed the trust change'
+grep -q 'signed export was not refreshed' "$tmp/output" || fail 'publication failure did not reach the recovery warning'
+if grep -q 'signed export: ' "$tmp/output"; then fail 'publication failure still reported a signed export'; fi
+jq -e '.packages | has("gone-pkg") | not' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'publication failure rolled back the trust change'
+pass 'a publication failure after signing warns instead of reporting success'
 printf 'all host-allow signed export/follow tests passed\n'

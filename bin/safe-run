@@ -1968,21 +1968,27 @@ host_allow_export_signed() (
   local document="$1" out_dir="$2" host dest staging signing_key
   host=$(hostname -s)
   [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid short hostname"
-  mkdir -p -- "$out_dir"
+  # Every step fails explicitly: callers may run this under a negated
+  # conditional, where errexit is off, and must still see the failure.
+  mkdir -p -- "$out_dir" || die "could not create the export directory $out_dir"
   dest="$out_dir/host-allow.$host.json"
-  staging=$(mktemp -d "$out_dir/.host-allow-sign.XXXXXX")
+  staging=$(mktemp -d "$out_dir/.host-allow-sign.XXXXXX") \
+    || die "could not stage the signed export in $out_dir"
   trap 'rm -rf -- "$staging"' EXIT
   jq --arg host "$host" --arg exported_at "$(now_iso)" \
     '.schema = "safe-host-allow-export/2" | .host = $host | .exported_at = $exported_at' \
-    <<<"$document" > "$staging/export.json"
+    <<<"$document" > "$staging/export.json" \
+    || die "could not project the signed export document"
   signing_key=$(config_get '.follow.signing_key' '')
   local key_args=()
   [[ -z "$signing_key" ]] || key_args=(--local-user "$signing_key")
   gpg --armor --detach-sign "${key_args[@]}" \
     --output "$staging/export.json.asc" -- "$staging/export.json" \
     || die "could not sign export; check follow.signing_key or the default GPG key and retry at an operator terminal"
-  mv -f -- "$staging/export.json.asc" "$dest.asc"
-  mv -f -- "$staging/export.json" "$dest"
+  mv -f -- "$staging/export.json.asc" "$dest.asc" \
+    || die "could not publish $dest.asc; the previous export is unchanged — retry: safe run host-allow export --sign"
+  mv -f -- "$staging/export.json" "$dest" \
+    || die "could not publish $dest after its signature; followers reject the mismatched pair until you retry: safe run host-allow export --sign"
   info "signed export: $dest (signature: $dest.asc)"
 )
 
