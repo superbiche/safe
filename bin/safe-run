@@ -1936,6 +1936,31 @@ cmd_host_allow_export() {
   fi
 }
 
+# A trust change on an origin republishes its signed export in the same
+# gesture (operator ruling 2026-10-05): grant, export and the followers'
+# follow are one flow, so the operator no longer runs `export --sign` by hand.
+# A host is an origin when its signed export already exists in the default
+# directory; `follow.auto_export: false` opts out. The trust-store write has
+# already succeeded: a failed or declined signature warns with the recovery
+# command and never fails the grant.
+host_allow_auto_export() {
+  local host dest
+  [[ "$(jq -r '.follow.auto_export | if . == false then "false" else "true" end' \
+    "$CONFIG_FILE" 2>/dev/null || echo true)" == "true" ]] || return 0
+  host=$(hostname -s 2>/dev/null) || return 0
+  dest="$HOME/Sync/state/safe/host-allow.$host.json"
+  [[ -f "$dest" ]] || return 0
+  if ! is_tty; then
+    warn "host-allow changed, but the signed export $dest was not refreshed (no operator terminal); followers keep the previous grants until you run: safe run host-allow export --sign"
+    return 0
+  fi
+  info "republishing the signed export for followers"
+  if ! ( cmd_host_allow_export --sign ); then
+    warn "host-allow changed, but the signed export was not refreshed; followers keep the previous grants until you run: safe run host-allow export --sign"
+  fi
+  return 0
+}
+
 # Stage both files on the destination filesystem before publishing either.
 # The two renames are individually atomic; a reader seeing mixed generations
 # rejects the signature and can retry after synchronization completes.
@@ -2734,6 +2759,7 @@ cmd_host_allow_add() {
   else
     info "added ${PKG_NAME}@${PKG_VERSION} to host-allow"
   fi
+  host_allow_auto_export
 }
 
 cmd_host_allow_remove() {
@@ -2742,7 +2768,8 @@ cmd_host_allow_remove() {
   # An unblessed redirect seeds no host-allow file (F4): nothing to remove,
   # rather than aborting on jq's missing-file status (N1 sibling class).
   [[ -f "$HOST_ALLOW_FILE" ]] || { info "host-allow is empty; nothing to remove"; return 0; }
-  with_host_allow_lock "$HOST_ALLOW_FILE" host_allow_remove_locked "$pkg"
+  with_host_allow_lock "$HOST_ALLOW_FILE" host_allow_remove_locked "$pkg" || return $?
+  host_allow_auto_export
 }
 
 host_allow_remove_locked() {
@@ -2806,6 +2833,7 @@ cmd_host_allow_update() {
   # state this caller does not have.
   write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem" "" "" 0 "" "update"
   info "updated ${PKG_NAME}@${PKG_VERSION} in host-allow"
+  host_allow_auto_export
 }
 
 cmd_host_allow_list() {

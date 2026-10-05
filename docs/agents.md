@@ -157,7 +157,7 @@ safe run -y <pkg>@<version> -- <args>                                   # one-of
 safe install [-g] <pkg>@<version>                                       # audited install
 safe install --reuse [--reuse-from <checkout>] [--dry-run]              # agent-permitted where the host enables it: fill a worktree's missing Composer vendor/ by copying the installed tree of another checkout of the same repository with an identical composer.lock (no audit, no php, no package manager, no network); the status is reused-existing-vendor, never an audit result
 safe run block list && safe run audit --blocked                         # review refusals
-safe run host-allow export --sign                                       # operator-signed fleet export (TTY)
+safe run host-allow export --sign                                       # operator-signed fleet export (TTY); on an origin (its own signed export exists) host-allow add/update/remove republish it automatically unless follow.auto_export is false
 safe run host-allow follow-signer add <fingerprint>                     # pin a full GPG primary fingerprint (operator TTY)
 safe run host-allow follow [--dry-run] [--from <dir>]                   # agent-permitted UNION of verified operator-signed grants; a followed exact version then installs unattended (gate exit 16)
 safe release follow [--dry-run] [--checkout <dir>]                      # agent-permitted install of a verified signed safe release

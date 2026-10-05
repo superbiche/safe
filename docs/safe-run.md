@@ -170,6 +170,16 @@ and must reject them. `follow.signing_key` in the run config selects the GPG
 signing key; otherwise GPG selects its default key. Signing a redirected trust
 store requires the same explicit trust override as a grant.
 
+On an origin — a host whose own signed export already exists in
+`~/Sync/state/safe/` — `host-allow add`, `update` and `remove` (including the
+install gate's `[a]` grant and `--accept-block`) republish the signed export
+in the same gesture, so a grant, its export and the followers' `follow` form
+one flow. The trust change is written first: a declined or failed signature,
+or a change made without an operator terminal, keeps the change and warns that
+followers hold the previous grants until `safe run host-allow export --sign`
+runs. Set `follow.auto_export` to `false` to keep the export manual. A host
+without its own export never starts publishing one.
+
 `import` is *"review this set and apply"*, never *"trust another machine"*:
 
 - It is an operator-only trust escalation, TTY-gated exactly like `add`/`update`

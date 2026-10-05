@@ -953,4 +953,58 @@ SAFE_RUN_PATH="$SAFE_RUN" STATUS_FIXTURE_DIR="$tmp" SAFE_RUN_NO_INIT=1 bash -c '
   done
 ' safe-run || fail 'verification-status belt accepted adverse status or rejected good-only status'
 pass 'verification status rejects adverse signature tokens but accepts key-level tokens with GOODSIG'
+
+# A trust change on an origin republishes its signed export in the same
+# gesture (operator ruling 2026-10-05). The host is an origin when its own
+# signed export already exists; follow.auto_export=false opts out.
+rm -f -- "$GNUPGHOME/gpg.conf"
+printf '#!/usr/bin/env bash\nprintf "rainbow\\n"\n' > "$tmp/bin/hostname"
+chmod +x "$tmp/bin/hostname"
+gpg --no-options --batch --pinentry-mode loopback --passphrase '' \
+  --quick-generate-key 'Safe auto-export origin <auto@example.invalid>' ed25519 sign 0 > "$tmp/keygen.log" 2>&1 || fail 'auto-export key generation failed'
+auto_fingerprint=$(gpg --no-options --batch --with-colons --list-keys 'auto@example.invalid' 2>/dev/null | awk -F: '$1 == "fpr" {print $10; exit}')
+seed_auto_export() {
+  printf '%s\n' "$1" > "$SAFE_RUN_CONFIG_DIR/config.json"
+  printf '{"packages":{"fresh-pkg":{"version":"1.2.3","sha":"sha512-FRESH","ecosystem":"npm","added":"2026-07-01","reason":"origin grant"},"gone-pkg":{"version":"9.9.9","sha":"sha512-GONE","ecosystem":"npm","added":"2026-07-01","reason":"to remove"}}}\n' > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
+  rm -f -- "$export_file" "$export_file.asc"
+  pty_run "$SAFE_RUN" host-allow export --sign > "$tmp/output" 2>&1 || { cat "$tmp/output" >&2; fail "auto-export seed export failed"; }
+  jq -e '.packages | has("gone-pkg")' "$export_file" >/dev/null || fail 'auto-export seed lacks gone-pkg'
+  cp "$export_file" "$tmp/export-before-auto.json"
+}
+signing_config=$(printf '{"follow":{"signing_key":"%s"}}' "$auto_fingerprint")
+
+seed_auto_export "$signing_config"
+pty_run "$SAFE_RUN" host-allow remove gone-pkg > "$tmp/output" 2>&1 || fail 'TTY remove on origin failed'
+grep -q 'republishing the signed export' "$tmp/output" || fail 'origin trust change did not announce the re-export'
+jq -e '(.packages | has("gone-pkg") | not) and .packages["fresh-pkg"].version == "1.2.3"' "$export_file" >/dev/null || fail 'origin export not refreshed after the trust change'
+gpg --no-options --batch --verify "$export_file.asc" "$export_file" > "$tmp/verify.log" 2>&1 || fail 'auto-export signature does not verify'
+pass 'a trust change on an origin republishes the signed export in the same gesture'
+
+seed_auto_export "$signing_config"
+expect_rc 0 "$SAFE_RUN" host-allow remove gone-pkg
+grep -q 'signed export .* was not refreshed (no operator terminal)' "$tmp/output" || fail 'non-TTY trust change did not warn about the stale export'
+grep -q 'safe run host-allow export --sign' "$tmp/output" || fail 'non-TTY warning lacks the recovery command'
+cmp "$tmp/export-before-auto.json" "$export_file" || fail 'non-TTY trust change rewrote the export'
+jq -e '.packages | has("gone-pkg") | not' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'non-TTY remove did not apply locally'
+pass 'without a terminal the trust change applies and warns that the export is stale'
+
+seed_auto_export "$(jq -c '.follow.auto_export = false' <<<"$signing_config")"
+pty_run "$SAFE_RUN" host-allow remove gone-pkg > "$tmp/output" 2>&1 || fail 'opt-out remove failed'
+cmp "$tmp/export-before-auto.json" "$export_file" || fail 'follow.auto_export=false still re-exported'
+if grep -q 'republishing the signed export' "$tmp/output"; then fail 'opt-out still announced a re-export'; fi
+pass 'follow.auto_export=false keeps the export manual'
+
+seed_auto_export "$signing_config"
+printf '%s\n' "$(jq -c '.follow.signing_key = "0000000000000000000000000000000000000000"' <<<"$signing_config")" > "$SAFE_RUN_CONFIG_DIR/config.json"
+pty_run "$SAFE_RUN" host-allow remove gone-pkg > "$tmp/output" 2>&1 || fail 'a failed re-export failed the trust change'
+grep -q 'signed export was not refreshed' "$tmp/output" || fail 'failed re-export did not warn'
+cmp "$tmp/export-before-auto.json" "$export_file" || fail 'failed re-export replaced the published export'
+jq -e '.packages | has("gone-pkg") | not' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null || fail 'failed re-export rolled back the trust change'
+pass 'a failed re-export warns and keeps both the trust change and the previous export'
+
+seed_auto_export "$signing_config"
+rm -f -- "$export_file" "$export_file.asc"
+pty_run "$SAFE_RUN" host-allow remove gone-pkg > "$tmp/output" 2>&1 || fail 'non-origin remove failed'
+[[ ! -e "$export_file" ]] || fail 'a non-origin host started publishing an export'
+pass 'a host without its own signed export never starts publishing one'
 printf 'all host-allow signed export/follow tests passed\n'

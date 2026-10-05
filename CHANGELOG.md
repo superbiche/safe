@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- A trust change on an origin republishes its signed export in the same
+  gesture (operator ruling 2026-10-05): on a host whose own signed export
+  already exists, `host-allow add`, `update` and `remove` (including the
+  install gate's `[a]` grant and `--accept-block`) run `export --sign` right
+  after writing the trust store. A declined or failed signature, or a change
+  without an operator terminal, keeps the change and warns with the recovery
+  command. `follow.auto_export: false` keeps the export manual; a host without
+  its own export never starts publishing one.
 - The mise gate summarizes release-binary tools in one line per command
   instead of one notice per tool: specs on the `aqua`, `github`, `gitlab`,
   `forgejo`, `http`, `s3` and `packslip` backends (mise checks the asset's
