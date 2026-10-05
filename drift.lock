@@ -53,7 +53,7 @@ sig = "fc4f25508fd0a22e"
 [[bindings]]
 doc = "docs/install-wrappers.md"
 target = "lib/gate-lib.sh"
-sig = "ba6d4a9b7b7eeb06"
+sig = "be52ed2829d6012b"
 
 [[bindings]]
 doc = "docs/installation.md"
@@ -73,7 +73,7 @@ sig = "fc4f25508fd0a22e"
 [[bindings]]
 doc = "docs/integration-flows.md"
 target = "lib/gate-lib.sh"
-sig = "ba6d4a9b7b7eeb06"
+sig = "be52ed2829d6012b"
 
 [[bindings]]
 doc = "docs/operations.md"

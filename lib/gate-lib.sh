@@ -4825,7 +4825,8 @@ safe_gate_composer() {
 # cargo:*, go:*) with lifecycle scripts — completely unaudited before this.
 # Runtime installs (node@22, python@3.12) pass through: official runtimes,
 # not registry packages. Non-registry backends (aqua/ubi/gem/asdf plugins)
-# have no advisory source to audit against; they pass with a notice.
+# have no advisory source to audit against; they pass with a notice (one
+# summary line for release-binary backends, see below).
 # ---------------------------------------------------------------------------
 
 safe_gate_mise_backend_ecosystem() {
@@ -4836,6 +4837,32 @@ safe_gate_mise_backend_ecosystem() {
     go) printf '%s' "go" ;;
     *) return 1 ;;
   esac
+}
+
+# Release-binary backends: no advisory source, but mise itself verifies the
+# fetched asset (checksum, and cosign/minisign/SLSA/GitHub attestations where
+# the publisher provides them). They share one summary notice per command
+# instead of a line each. Plugin backends (asdf, vfox) run arbitrary code and
+# keep the per-tool notice.
+safe_gate_mise_release_backend() {
+  case "$1" in
+    aqua|github|gitlab|forgejo|http|s3|packslip) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+SAFE_GATE_MISE_RELEASE_PASSED=()
+
+safe_gate_mise_release_notice_flush() {
+  local n=${#SAFE_GATE_MISE_RELEASE_PASSED[@]} item list=""
+  (( n == 0 )) && return 0
+  for item in "${SAFE_GATE_MISE_RELEASE_PASSED[@]}"; do
+    list="${list:+${list}, }${item}"
+  done
+  SAFE_GATE_MISE_RELEASE_PASSED=()
+  local noun="release binaries"
+  (( n == 1 )) && noun="release binary"
+  safe_gate_err "safe: mise: ${n} ${noun} not advisory-audited (mise checksum/signature checks only): ${list}"
 }
 
 safe_gate_mise_infra_refuse() {
@@ -5414,6 +5441,10 @@ safe_gate_mise_check_spec() {
   # Official runtimes (core:node) are not registry packages.
   [[ "$backend" == "core" ]] && return 0
   if ! eco="$(safe_gate_mise_backend_ecosystem "$backend")"; then
+    if safe_gate_mise_release_backend "$backend"; then
+      SAFE_GATE_MISE_RELEASE_PASSED+=("$rest")
+      return 0
+    fi
     safe_gate_err "safe: mise ${spec}: '${backend}' backend has no registry advisory source; not audit-gated — review manually if untrusted"
     return 0
   fi
@@ -6013,9 +6044,11 @@ safe_gate_mise_gate_install() {
   # check; argv specs still need theirs.
   local from_config=0
   (( ${#SAFE_GATE_MISE_SPECS[@]} == 0 )) && from_config=1
+  SAFE_GATE_MISE_RELEASE_PASSED=()
   for spec in "${specs[@]}"; do
     safe_gate_mise_check_spec "$spec" "$SAFE_GATE_MISE_OVERLAY" "$from_config" || return $?
   done
+  safe_gate_mise_release_notice_flush
   return 0
 }
 
@@ -6034,9 +6067,11 @@ safe_gate_mise_gate_use() {
   safe_gate_mise_min_age_guard "${SAFE_GATE_MISE_SPECS[@]}" || return $?
   safe_gate_mise_overlay_or_refuse || return $?
   local spec
+  SAFE_GATE_MISE_RELEASE_PASSED=()
   for spec in "${SAFE_GATE_MISE_SPECS[@]}"; do
     safe_gate_mise_check_spec "$spec" "$SAFE_GATE_MISE_OVERLAY" || return $?
   done
+  safe_gate_mise_release_notice_flush
   return 0
 }
 
@@ -6083,6 +6118,7 @@ safe_gate_mise_gate_exec() {
   fi
 
   local spec i_spec=0
+  SAFE_GATE_MISE_RELEASE_PASSED=()
   for spec in ${audit[@]+"${audit[@]}"}; do
     # The first entries are the argv tool specs; the rest came from
     # the collector, which already asked about their options.
@@ -6091,6 +6127,7 @@ safe_gate_mise_gate_exec() {
     i_spec=$((i_spec + 1))
     safe_gate_mise_check_spec "$spec" "$SAFE_GATE_MISE_OVERLAY" "$skip_opts" || return $?
   done
+  safe_gate_mise_release_notice_flush
 
   # A gated tool behind -- gets the full routing/audit pass with the exec
   # suppressed (the outer mise owns execution and its env). The inner scan
