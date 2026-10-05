@@ -83,7 +83,8 @@ Official runtime installs (`node@22`) pass through; non-registry backends
 shorthands, `git+`/URL forms) pass with an explicit notice that they are
 not audit-gated — a public-registry audit must never vouch for them.
 Release-binary backends (`aqua`, `github`, `gitlab`, `forgejo`, `http`,
-`s3`, `packslip`), whose assets mise verifies itself, pass the same way but
+`s3`, `packslip`), on which mise runs its own checksum (and, where the
+backend supports it, signature/attestation) checks, pass the same way but
 share one summary line per command (`safe: mise: N release binaries not
 advisory-audited (mise checksum/signature checks only): …`) instead of a
 notice per tool.

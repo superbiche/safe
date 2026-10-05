@@ -4825,7 +4825,8 @@ safe_gate_composer() {
 # cargo:*, go:*) with lifecycle scripts — completely unaudited before this.
 # Runtime installs (node@22, python@3.12) pass through: official runtimes,
 # not registry packages. Non-registry backends (aqua/ubi/gem/asdf plugins)
-# have no advisory source to audit against; they pass with a notice.
+# have no advisory source to audit against; they pass with a notice (one
+# summary line for release-binary backends, see below).
 # ---------------------------------------------------------------------------
 
 safe_gate_mise_backend_ecosystem() {

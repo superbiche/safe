@@ -4818,6 +4818,7 @@ case_mise_release_backends_share_one_notice() {
   assert_status 0 "$FUNCNAME" || return
   assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
   assert_err_contains_fragment 'safe: mise: 3 release binaries not advisory-audited (mise checksum/signature checks only): sigstore/cosign@3.1.3, anchore/grype@0.120.0, ntn@0.23.16' "$FUNCNAME" || return
+  assert_count 1 'safe: mise: 3 release binaries not advisory-audited (mise checksum/signature checks only): sigstore/cosign@3.1.3, anchore/grype@0.120.0, ntn@0.23.16' "${ERR_FILE}" "$FUNCNAME" || return
   assert_err_not_contains_fragment 'no registry advisory source' "$FUNCNAME" || return
   assert_log_contains $'REAL\tmise\tinstall\taqua:sigstore/cosign@3.1.3\tgithub:anchore/grype@0.120.0\thttp:ntn@0.23.16' "$FUNCNAME" || return
 

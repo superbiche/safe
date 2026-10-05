@@ -4,8 +4,9 @@
 
 - The mise gate summarizes release-binary tools in one line per command
   instead of one notice per tool: specs on the `aqua`, `github`, `gitlab`,
-  `forgejo`, `http`, `s3` and `packslip` backends (which mise verifies itself
-  by checksum and, where published, cosign/minisign/SLSA/GitHub attestations)
+  `forgejo`, `http`, `s3` and `packslip` backends (mise checks the asset's
+  checksum where one is available, and signatures/attestations only where the
+  backend supports them, natively on `aqua`)
   print `safe: mise: N release binaries not advisory-audited (mise
   checksum/signature checks only): …`. Verdicts are unchanged: these specs
   still pass without an advisory audit. Plugin backends (`asdf`, `vfox`) and
