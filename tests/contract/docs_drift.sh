@@ -19,6 +19,12 @@
 # not blocked from running this single suite by hand.
 set -eu
 
+# drift is a mise tool, and a shim cannot run under the scratch HOME (drift
+# itself needs none). Take the binary tests/run-all.sh resolved before its own
+# isolation, or resolve it here while the caller's PATH and mise still apply.
+drift_bin="${SAFE_TEST_DRIFT_BIN:-}"
+[[ -n "$drift_bin" ]] || drift_bin=$(mise which drift 2>/dev/null || command -v drift 2>/dev/null || true)
+
 # SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
 # shellcheck source=tests/lib/test-isolation.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
@@ -27,7 +33,7 @@ safe_test_setup_isolation || exit 1
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
 
-if ! command -v drift >/dev/null 2>&1; then
+if [[ -z "$drift_bin" || ! -x "$drift_bin" ]]; then
   if [[ "${SAFE_TEST_STRICT:-}" == "1" ]]; then
     printf 'FAIL: drift is unavailable and SAFE_TEST_STRICT=1; the docs-drift gate must run\n' >&2
     exit 1
@@ -43,7 +49,7 @@ fi
 
 # drift check exits non-zero if any bound target drifted from its doc's
 # provenance snapshot, or a discovered markdown link is broken.
-if ! out=$(drift check 2>&1); then
+if ! out=$("$drift_bin" check 2>&1); then
   printf '%s\n' "$out" >&2
   printf 'FAIL: docs stale or a markdown link is broken — update the doc prose, then refresh provenance with `drift link <doc> <target>` (or `drift link <doc> --doc-is-still-accurate` if the prose already covers the change). See CONTRIBUTING.md "Docs drift".\n' >&2
   exit 1
