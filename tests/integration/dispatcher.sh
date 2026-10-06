@@ -483,7 +483,7 @@ routed_json="$(
     "$ROOT/bin/safe" audit capabilities --json
 )"
 [[ "$(jq -cS . <<<"$direct_json")" == "$(jq -cS . <<<"$routed_json")" ]] || fail "safe audit capabilities did not match direct compatibility binary output"
-jq -e '.command == "safe audit capabilities" and .groups["binary-audit"]["release-review"] == true and .groups.setup["create-bundle"] == true' <<<"$routed_json" >/dev/null || fail "safe audit capabilities returned an unexpected payload"
+jq -e '.command == "safe audit capabilities" and .groups["binary-audit"] == null and .groups.setup["create-bundle"] == true' <<<"$routed_json" >/dev/null || fail "safe audit capabilities returned an unexpected payload"
 [[ ! -e "$cap_tmp/data/checks" ]] || fail "safe audit capabilities wrote audit checks"
 pass "dispatcher capabilities"
 
@@ -537,9 +537,7 @@ limited_json="$(
     "$ROOT/bin/safe" doctor --json
 )"
 jq -e '
-  .features.release_review.ready == false
-  and (.features.release_review.missing | index("cosign") != null)
-  and (.features.release_review.missing | index("podman") != null)
+  .features.release_review == null
   and .features.safe_run_sandbox.ready == false
   and (.features.safe_run_sandbox.missing | index("podman") != null)
 ' <<<"$limited_json" >/dev/null || fail "doctor did not downgrade missing dependency readiness"
@@ -569,8 +567,7 @@ chmod +x "$doctor_fail_dir/safe-audit"
 failed_capabilities_json="$("$doctor_fail_dir/safe" doctor --json)"
 jq -e '
   .features.safe_audit_capabilities.available == false
-  and .features.release_review.supported == false
-  and (.features.release_review.missing | index("safe audit capabilities") != null)
+  and .features.release_review == null
 ' <<<"$failed_capabilities_json" >/dev/null || fail "doctor did not handle capabilities lookup failure"
 pass "doctor capabilities downgrade"
 

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Remove `safe audit binary-audit` and its `release-review` composite
+  (`safe-core release-review`, `internal/releasereview`) with their only
+  consumer, machine-setup's external-binary reviewer: release binaries are
+  installed through mise backends, which check checksums and, where the
+  backend supports them, signatures and attestations. `safe audit
+  binary-audit` now exits 1 and says where release binaries went. The
+  capabilities payload drops `binary-audit.release-review` and its
+  `binary-audit` group, and `versions` is now `{}`; `safe doctor` drops the
+  `release_review` feature and the `cosign` probe.
 - A trust change on an origin republishes its signed export in the same
   gesture (operator ruling 2026-10-05): on a host whose own signed export
   already exists, `host-allow add`, `update` and `remove` (including the

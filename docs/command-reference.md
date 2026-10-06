@@ -89,7 +89,6 @@ safe audit capabilities [--json]
 safe audit machine-audit [--verbose] [--deps-only | --full] [--project <path>] [--all | --machine <csv>]
 safe audit package-audit <pkg>@<version> [--ecosystem <name>] [--installer <name>] [--json]
 safe audit repo-audit [<path>] [--verbose] [--deps-only | --full] [--no-cache] [--result-out <file>] [--allow-missing-tools]
-safe audit binary-audit release-review --spec PATH   # whole-release composite; see docs/release-review.md
 safe audit ioc <identifier> [--all | --machine <csv>]
 safe audit ioc --list <ioc.json> [--all | --machine <csv>]
 safe audit ioc --update [--since <duration>] [--all | --machine <csv>]

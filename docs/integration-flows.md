@@ -101,35 +101,22 @@ Flow:
 
 Equivalent gate routing exists for pnpm, pnpx, yarn, bun, uv, pip, pip3, cargo, go, composer, and mise (Volta is retired).
 
-## External Binary Review
+## Release Binaries
 
-External binary installers should treat a reviewed manifest as desired state and
-call `safe audit` for review signals before install.
-
-The review is one composite command: the installer writes a spec naming the
-release, its advisories, the downloaded artifact and its evidence (checksum,
-Sigstore bundle or detached certificate+signature, TUF trust material), and
-calls the composite once:
-
-```bash
-safe audit capabilities --json
-safe audit binary-audit release-review --spec ./review.json
-```
-
-The composite runs the release, vuln, checksum, signature, TUF and sandboxed
-exec checks and aggregates them into one verdict. The spec schema and the
-per-check evidence it accepts are documented in
-[release-review.md](release-review.md). Sigstore- and TUF-shaped binaries such
-as `cosign` supply their bundle and trust material through the artifact's
-`evidence` block in the same spec — there is no separate command per check.
+Release binaries (GitHub, GitLab and similar release assets) are installed
+through mise backends (`aqua`, `github`, `gitlab`, `packslip`, …), which check
+the asset checksum and, where the backend supports it, its signature or
+attestation. `safe` has no release-review lane: the mise gate passes these
+specs with one summary notice per command, `safe: mise: N release binaries not
+advisory-audited`.
 
 ## CI Or Script Integration
 
-Use `safe audit capabilities --json` before relying on the composite:
+Use `safe audit capabilities --json` before relying on a command:
 
 ```bash
-if safe audit capabilities --json | jq -e '.capabilities["binary-audit.release-review"]'; then
-  safe audit binary-audit release-review --spec ./review.json
+if safe audit capabilities --json | jq -e '.capabilities["package-audit"]'; then
+  safe audit package-audit left-pad@1.3.0 --json
 fi
 ```
 

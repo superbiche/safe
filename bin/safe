@@ -1405,7 +1405,7 @@ doctor_payload_json() {
 
   local core_bash_json core_jq_json core_zsh_json core_safe_core_json
   local audit_curl_json audit_tar_json audit_ssh_json
-  local verify_cosign_json verify_sha256sum_json verify_shasum_json verify_python3_json verify_python_json
+  local verify_sha256sum_json verify_shasum_json verify_python3_json verify_python_json
   local sandbox_podman_json sandbox_timeout_json
   core_bash_json=$(command_presence_json bash)
   core_jq_json=$(command_presence_json jq)
@@ -1414,7 +1414,6 @@ doctor_payload_json() {
   audit_curl_json=$(command_presence_json curl)
   audit_tar_json=$(command_presence_json tar)
   audit_ssh_json=$(command_presence_json ssh)
-  verify_cosign_json=$(command_presence_json cosign)
   verify_sha256sum_json=$(command_presence_json sha256sum)
   verify_shasum_json=$(command_presence_json shasum)
   verify_python3_json=$(command_presence_json python3 --version)
@@ -1455,12 +1454,10 @@ doctor_payload_json() {
 
   local capabilities_json="" capabilities_available=false
   local capabilities_version=""
-  local capability_release_review=false
   if capture_command capabilities_json "$SAFE_SELF" audit capabilities --json; then
     if jq -e . >/dev/null 2>&1 <<<"$capabilities_json"; then
       capabilities_available=true
       capabilities_version=$(jq -r '.version // empty' <<<"$capabilities_json")
-      capability_release_review=$(jq -r '.capabilities["binary-audit.release-review"] // false' <<<"$capabilities_json")
     fi
   fi
 
@@ -1476,12 +1473,7 @@ doctor_payload_json() {
     fi
   fi
 
-  # The composite's only external tools are cosign (signature + tuf checks) and
-  # podman (exec check); checksum, tuf mirror, release and vuln are pure Go, and
-  # the timeout/python dependencies the bash sub-lanes needed are gone. The
-  # remaining verify/sandbox probes are still reported under `dependencies`.
-  local has_cosign has_podman
-  has_cosign=$(jq -r '.present' <<<"$verify_cosign_json")
+  local has_podman
   has_podman=$(jq -r '.present' <<<"$sandbox_podman_json")
 
   local feature_capabilities_json
@@ -1501,34 +1493,7 @@ doctor_payload_json() {
     feature_capabilities_json='{"available":false,"command":"safe audit capabilities","version":null,"capabilities":{}}'
   fi
 
-  # release-review is one composite capability now, not six granular lanes. It
-  # is ready when safe-core advertises it AND both external tools its checks
-  # shell out to are present: cosign (signature + tuf) and podman (exec).
-  local release_review_json safe_run_sandbox_json
-  if [[ "$capabilities_available" != "true" ]]; then
-    release_review_json=$(doctor_feature_json false false "safe audit capabilities")
-  elif [[ "$capability_release_review" != "true" ]]; then
-    release_review_json=$(doctor_feature_json false false)
-  else
-    # release-review runs entirely inside safe-core, which refuses every review
-    # without a matching engine, so a missing or version-mismatched safe-core
-    # gates readiness before the per-check tools do. cosign (signature + tuf)
-    # and podman (exec) are the tools its checks shell out to.
-    local rr_missing=()
-    if [[ "$(jq -r '.present' <<<"$core_safe_core_json")" != "true" ]]; then
-      rr_missing+=("safe-core")
-    elif [[ "$(jq -r '.version // empty' <<<"$core_safe_core_json")" != "$SAFE_VERSION" ]]; then
-      rr_missing+=("safe-core@${SAFE_VERSION}")
-    fi
-    [[ "$has_cosign" == "true" ]] || rr_missing+=("cosign")
-    [[ "$has_podman" == "true" ]] || rr_missing+=("podman")
-    if [[ ${#rr_missing[@]} -eq 0 ]]; then
-      release_review_json=$(doctor_feature_json true true)
-    else
-      release_review_json=$(doctor_feature_json true false "${rr_missing[@]}")
-    fi
-  fi
-
+  local safe_run_sandbox_json
   local run_missing=()
   [[ "$has_podman" == "true" ]] || run_missing+=("podman")
   if [[ ${#run_missing[@]} -eq 0 ]]; then
@@ -1578,7 +1543,6 @@ doctor_payload_json() {
     --argjson audit_curl "$audit_curl_json" \
     --argjson audit_tar "$audit_tar_json" \
     --argjson audit_ssh "$audit_ssh_json" \
-    --argjson verify_cosign "$verify_cosign_json" \
     --argjson verify_sha256sum "$verify_sha256sum_json" \
     --argjson verify_shasum "$verify_shasum_json" \
     --argjson verify_python3 "$verify_python3_json" \
@@ -1586,7 +1550,6 @@ doctor_payload_json() {
     --argjson sandbox_podman "$sandbox_podman_json" \
     --argjson sandbox_timeout "$sandbox_timeout_json" \
     --argjson feature_capabilities "$feature_capabilities_json" \
-    --argjson release_review "$release_review_json" \
     --argjson safe_run_sandbox "$safe_run_sandbox_json" \
     --argjson osv_lockfile_support "$lockfile_support_json" \
     --argjson eco_govulncheck "$eco_govulncheck_json" \
@@ -1642,7 +1605,6 @@ doctor_payload_json() {
           ssh: $audit_ssh
         },
         verify: {
-          cosign: $verify_cosign,
           sha256sum: $verify_sha256sum,
           shasum: $verify_shasum,
           python3: $verify_python3,
@@ -1655,7 +1617,6 @@ doctor_payload_json() {
       },
       features: {
         safe_audit_capabilities: $feature_capabilities,
-        release_review: $release_review,
         safe_run_sandbox: $safe_run_sandbox,
         osv_lockfile_support: $osv_lockfile_support,
         ecosystem_auditors: {
@@ -1736,8 +1697,7 @@ print_doctor_human() {
     ((if .dependencies.sandbox.podman.probed == false
       then " (podman present but unprobed: this doctor runs no-new-privs — sandboxed execs fail from THIS process, unaffected outside it)"
       else "" end) as $podman_caveat
-    | "  release-review: " + (if .features.release_review.ready then "ready" else "not ready" end) + $podman_caveat,
-      "  safe run sandbox: " + (if .features.safe_run_sandbox.ready then "ready" else "not ready" end) + $podman_caveat),
+    | "  safe run sandbox: " + (if .features.safe_run_sandbox.ready then "ready" else "not ready" end) + $podman_caveat),
     "  osv lockfile formats: " + (
       if .features.osv_lockfile_support.scanner == null then "osv-scanner unavailable"
       elif .features.osv_lockfile_support.ok then
@@ -1777,7 +1737,6 @@ print_doctor_human() {
     "missing prerequisites:",
     (
       [
-        .features.release_review.missing[],
         .features.safe_run_sandbox.missing[],
         (.features.osv_lockfile_support.unsupported[]?
          | "osv-scanner extractor for " + . + " (repos using it lose their OSV tier)"),

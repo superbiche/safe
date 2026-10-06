@@ -45,7 +45,7 @@ grep -q '\[--deps-only | --full\]' <<<"$help_output" || fail "help omits scan mo
 grep -q '\[--no-cache\]' <<<"$help_output" || fail "help omits scan --no-cache"
 grep -q 'safe audit ioc --update' <<<"$help_output" || fail "help omits ioc --update"
 grep -q 'safe audit setup --create-bundle' <<<"$help_output" || fail "help omits setup --create-bundle"
-grep -q 'safe audit binary-audit release-review --spec' <<<"$help_output" || fail "help omits binary-audit release-review"
+! grep -q 'binary-audit' <<<"$help_output" || fail "help still advertises the removed binary-audit"
 pass "help output"
 
 grep -q 'capabilities' "$ROOT/lib/completions/_safe" || fail "completion omits capabilities"
@@ -57,7 +57,7 @@ grep -q 'machine_audit_opts=(--all --machine --project --verbose --deps-only --f
 for scan_flag in $(SAFE_AUDIT_NO_INIT=1 "$ROOT/bin/safe-audit" help 2>/dev/null | grep -oE '^\s+safe audit machine-audit .*' | grep -oE '\-\-[a-z-]+' | sort -u); do
   grep -q -- "$scan_flag" <<<"$(grep -E '^\s+machine_audit_opts=' "$ROOT/lib/completions/_safe")" || fail "completion omits scan flag: $scan_flag"
 done
-grep -q 'binary_audit_subcmds=(release-review)' "$ROOT/lib/completions/_safe" || fail "completion omits binary-audit release-review"
+! grep -q 'binary-audit\|release-review' "$ROOT/lib/completions/_safe" || fail "completion still offers the removed binary-audit"
 pass "completion output"
 
 tmp="$(mktemp -d)"
@@ -76,7 +76,6 @@ jq -e --arg version "$audit_version" '
     "package-audit": true,
     "repo-audit": true,
     "machine-audit": true,
-    "binary-audit.release-review": true,
     "ioc.lookup": true,
     "ioc.list": true,
     "ioc.update": true,
@@ -85,12 +84,7 @@ jq -e --arg version "$audit_version" '
     "diff": true,
     "status": true
   }
-  and .versions == {
-    "binary-audit.release-review": {
-      "spec_version": 3,
-      "report_schema_version": 1
-    }
-  }
+  and .versions == {}
   and .groups == {
     "top_level": {
       "package-audit": true,
@@ -98,9 +92,6 @@ jq -e --arg version "$audit_version" '
       "machine-audit": true,
       "diff": true,
       "status": true
-    },
-    "binary-audit": {
-      "release-review": true
     },
     "ioc": {
       "lookup": true,
@@ -115,6 +106,18 @@ jq -e --arg version "$audit_version" '
 ' <<<"$capabilities_json" >/dev/null || fail "capabilities json contract changed"
 [[ ! -e "$tmp/cap-data/checks" ]] || fail "capabilities wrote audit checks"
 pass "capabilities json contract"
+
+# binary-audit left with its only consumer; a stale caller gets the reason,
+# not "unknown command".
+set +e
+removed_err="$(SAFE_AUDIT_CONFIG_DIR="$tmp/cap-config" SAFE_AUDIT_DATA_DIR="$tmp/cap-data" \
+  "$SAFE_AUDIT" binary-audit release-review --versions 2>&1 >/dev/null)"
+removed_rc=$?
+set -e
+[[ "$removed_rc" -eq 1 ]] || fail "removed binary-audit exited $removed_rc, expected 1"
+grep -q 'binary-audit was removed after safe 1.66.1' <<<"$removed_err" || fail "removed binary-audit does not explain its removal: $removed_err"
+[[ ! -e "$tmp/cap-data/checks" ]] || fail "removed binary-audit created audit state"
+pass "removed binary-audit explains itself"
 
 fixture="$tmp/cisa-kev.json"
 fixture_url="file://$fixture"

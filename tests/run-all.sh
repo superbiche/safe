@@ -14,6 +14,10 @@ set -u
 unset SAFE_TEST_ISOLATION_KEEP_TOOLS
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# docs_drift needs the real drift binary (a mise tool); resolve it while the
+# caller's PATH, mise roots and safe gate still apply.
+SAFE_TEST_DRIFT_BIN="${SAFE_TEST_DRIFT_BIN:-$(cd "$ROOT" && mise which drift 2>/dev/null || command -v drift 2>/dev/null || true)}"
+export SAFE_TEST_DRIFT_BIN
 # SAFE_TEST_ISOLATION_MARKER: the aggregate runner owns the outer scratch tree.
 # shellcheck source=tests/lib/test-isolation.sh
 . "$ROOT/tests/lib/test-isolation.sh"
@@ -41,7 +45,6 @@ SUITES=(
   tests/audit/lockfile_coverage.sh
   tests/audit/cvss4_known_answers.sh
   tests/audit/scanner_batch.sh
-  tests/audit/release_review_forward.sh
   tests/audit/tempfile_hygiene.sh
   tests/contract/drift.sh
   tests/contract/docs_drift.sh

@@ -14,7 +14,11 @@ trivial PATH shims and completions.
 ## Notes
 
 - Strangler start exists: `cmd/safe-core` (lockdiff, package-verdict,
-  release-review), version-locked to `safe` by the gate.
+  reify-candidates), version-locked to `safe` by the gate.
+- Binary-audit lane RETIRED after 1.66.1: `release-review` and
+  `internal/releasereview` are deleted with their only consumer
+  (machine-setup's external-binary reviewer); release binaries moved to mise
+  backends. The notes and decisions below about the lane are history.
 - Standing constraint (`docs/architecture.md` § Direction: Go): binary-audit
   was built composite-first in Go — one `release-review` command, one report,
   one capability key.
@@ -66,8 +70,7 @@ trivial PATH shims and completions.
 - Go package layout conventions as lanes multiply — expected to settle in
   early slices.
 - End-state install/distribution story, minus the settled shell-hook part:
-  completions, fleet rollout via machine-setup, and whether safe's own
-  releases flow through the binary-audit review lane (self-hosting).
+  completions and fleet rollout via machine-setup.
 - Contract/docs regeneration (`docs/contract/agent-contract.json` render
   pipeline) in the Go world.
 
