@@ -31,12 +31,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "reify-candidates" {
 		return reifyCandidates(args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "tools-scan" {
+		return toolsScan(args[1:], stdout, stderr)
+	}
 
 	registryHosts, oldLockfile, newLockfile, ok := lockdiffArgs(args)
 	if !ok {
 		fmt.Fprintln(stderr, "safe-core: usage: safe-core lockdiff [--registry-host <host>]... <old-lockfile> <new-lockfile>")
 		fmt.Fprintln(stderr, reifyCandidatesUsage)
 		fmt.Fprintln(stderr, "safe-core: usage: safe-core package-verdict < evidence.json")
+		fmt.Fprintln(stderr, toolsScanUsage)
 		return 2
 	}
 

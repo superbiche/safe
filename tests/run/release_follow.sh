@@ -483,6 +483,14 @@ jq -e '.install_flags == ["--all", "--review-timer"]' "$union_config/release-fol
 env -i "${union_env[@]}" bash "$union_checkout/install.sh" --no-wrappers >/dev/null 2>&1 || fail 'no-wrappers repeat install failed'
 jq -e '.install_flags == ["--all", "--review-timer"]' "$union_config/release-follow.json" >/dev/null ||
   fail 'no-wrappers narrowed an existing wrapper union'
+env -i "${union_env[@]}" bash "$union_checkout/install.sh" --tools-scan-timer >/dev/null 2>&1 || fail 'tools-scan-timer install failed'
+jq -e '.install_flags == ["--all", "--review-timer", "--tools-scan-timer"]' "$union_config/release-follow.json" >/dev/null ||
+  fail 'tools-scan-timer was not added to the union'
+[[ -f "$union_home/.config/systemd/user/safe-tools-scan.timer" && -f "$union_home/.config/systemd/user/safe-tools-scan.service" ]] ||
+  fail 'tools-scan-timer did not install its units'
+env -i "${union_env[@]}" bash "$union_checkout/install.sh" --run >/dev/null 2>&1 || fail 'run repeat install failed'
+jq -e '.install_flags == ["--all", "--review-timer", "--tools-scan-timer"]' "$union_config/release-follow.json" >/dev/null ||
+  fail 'a later install dropped tools-scan-timer from the union'
 pass 'installer records the component union and preserves no-wrappers semantics'
 
 probe_driver="$tmp/probe-driver"

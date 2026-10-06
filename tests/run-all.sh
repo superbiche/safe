@@ -37,6 +37,7 @@ SUITES=(
   tests/install/gate_block_override.sh
   tests/audit/check_version_aware.sh
   tests/audit/socket_tier.sh
+  tests/audit/tools_scan.sh
   tests/audit/smoke.sh
   tests/audit/ecosystem_audits.sh
   tests/audit/scan_cache.sh

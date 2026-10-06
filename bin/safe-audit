@@ -122,6 +122,7 @@ declare -ar SAFE_AUDIT_CAPABILITY_NAMES=(
   package-audit
   repo-audit
   machine-audit
+  tools-scan
   ioc.lookup
   ioc.list
   ioc.update
@@ -435,6 +436,7 @@ capabilities_payload_json() {
           "package-audit": $capabilities["package-audit"],
           "repo-audit": $capabilities["repo-audit"],
           "machine-audit": $capabilities["machine-audit"],
+          "tools-scan": $capabilities["tools-scan"],
           diff: $capabilities.diff,
           status: $capabilities.status
         },
@@ -10388,6 +10390,25 @@ repo_audit_command() {
   fi
 }
 
+# tools-scan: High/Critical advisories affecting the mise tools installed on
+# this machine. safe-core does the work; with --publish the report goes to the
+# Sync/state bus and nothing is printed (docs/tools-scan.md).
+tools_scan_command() {
+  local safe_core_bin safe_core_reported
+  safe_core_bin="${SAFE_CORE_BIN:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/safe-core}"
+  if [[ ! -x "$safe_core_bin" ]]; then
+    die "tools-scan: safe-core is not installed; rerun install.sh"
+  fi
+  safe_core_reported=$("$safe_core_bin" --version 2>/dev/null) || safe_core_reported=""
+  if [[ "$safe_core_reported" != "${SAFE_VERSION}" ]]; then
+    die "tools-scan: safe-core ${safe_core_reported:-unknown} does not match safe ${SAFE_VERSION}; rerun install.sh"
+  fi
+  # Same directories the scanner probe adds: syft and grype are usually mise
+  # tools, and a timer or agent shell may not carry them on PATH.
+  PATH="$PATH:$HOME/.local/bin:$HOME/.local/share/mise/shims" \
+    "$safe_core_bin" tools-scan --cache-dir "$DATA_DIR/tools-scan/sbom" "$@"
+}
+
 # machine-audit: whole machine roots across the fleet. The machine dimension is
 # the point here, so it stays in the output.
 machine_audit_command() {
@@ -10555,6 +10576,9 @@ USAGE
   machine-audit — whole machine roots, local or across the fleet
   safe audit machine-audit [--verbose] [--deps-only | --full] [--no-cache] [--result-out <file>] [--allow-missing-tools] [--project <path>] [--all | --machine <csv>]
 
+  tools-scan — High/Critical advisories in the mise tools installed here
+  safe audit tools-scan [--publish [--out <file>]] [--host <name>]
+
   safe audit scanner-batch   (stdin: {"packages":[{"name","version"},…]} — Bun scanner API backend)
   safe audit lockfile-support [--json]   (which lockfile formats the installed osv-scanner still reads)
   safe audit ioc <identifier> [--all | --machine <csv>]
@@ -10573,6 +10597,8 @@ FILES
   ~/.local/share/safe/audit/checks/
   ~/.local/share/safe/audit/ioc/
   ~/.local/share/safe/audit/tool-bundles/scanners.tar.gz
+  ~/.local/share/safe/audit/tools-scan/sbom/
+  ~/Sync/state/tool-vulns/<host>.json   (tools-scan --publish)
 EOF
 }
 
@@ -10612,6 +10638,7 @@ main() {
     check) shift; package_audit_command "$@" ;;
     repo-audit) shift; repo_audit_command "$@" ;;
     machine-audit) shift; machine_audit_command "$@" ;;
+    tools-scan) shift; tools_scan_command "$@" ;;
     scanner-batch) shift; scanner_batch_command "$@" ;;
     ioc) shift; ioc_command "$@" ;;
     setup) shift; setup_command "$@" ;;

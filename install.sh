@@ -43,6 +43,7 @@ DO_RUN=0
 DO_AUDIT=0
 DO_WRAPPERS=0
 DO_REVIEW_TIMER=0
+DO_TOOLS_SCAN_TIMER=0
 INSTALL_FLAGS_WERE_SUPPLIED=0
 WITH_COMPLETIONS=0
 
@@ -107,10 +108,12 @@ resolve_real_go() {
 
 usage() {
   cat <<'EOF'
-usage: bash install.sh [--all] [--run] [--audit] [--wrappers] [--no-wrappers] [--review-timer] [--uninstall]
+usage: bash install.sh [--all] [--run] [--audit] [--wrappers] [--no-wrappers] [--review-timer] [--tools-scan-timer] [--uninstall]
 
 Default is --all. --review-timer additionally installs and enables the weekly
 host-allow staleness review as a systemd user timer (opt-in; machine state).
+--tools-scan-timer installs and enables the daily tools-scan, which publishes
+advisories in installed mise tools to ~/Sync/state/tool-vulns (opt-in).
 EOF
 }
 
@@ -143,6 +146,10 @@ while [[ $# -gt 0 ]]; do
     --review-timer)
       INSTALL_FLAGS_WERE_SUPPLIED=1
       DO_REVIEW_TIMER=1
+      ;;
+    --tools-scan-timer)
+      INSTALL_FLAGS_WERE_SUPPLIED=1
+      DO_TOOLS_SCAN_TIMER=1
       ;;
     --no-wrappers)
       INSTALL_FLAGS_WERE_SUPPLIED=1
@@ -185,6 +192,7 @@ release_follow_install_flags_json() {
     (( DO_WRAPPERS )) && flags+=(--wrappers)
   fi
   (( DO_REVIEW_TIMER )) && flags+=(--review-timer)
+  (( DO_TOOLS_SCAN_TIMER )) && flags+=(--tools-scan-timer)
   (( WITH_COMPLETIONS )) && flags+=(--with-completions)
   printf '%s\n' "${flags[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))'
 }
@@ -210,6 +218,7 @@ release_follow_union_install_flags_json() {
          (if $wrappers then "--wrappers" else empty end)
        ]) end)
     + (if any($components[]; . == "--review-timer") then ["--review-timer"] else [] end)
+    + (if any($components[]; . == "--tools-scan-timer") then ["--tools-scan-timer"] else [] end)
     + (if any($components[]; . == "--with-completions") then ["--with-completions"] else [] end)'
 }
 
@@ -834,6 +843,20 @@ if (( DO_REVIEW_TIMER )); then
     systemctl --user daemon-reload
     systemctl --user enable --now safe-host-allow-review.timer
     info "enabled weekly host-allow review timer (safe-host-allow-review.timer)"
+  else
+    warn "systemctl not found; timer units installed to $SYSTEMD_USER_DIR but not enabled"
+  fi
+fi
+
+if (( DO_TOOLS_SCAN_TIMER )); then
+  SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  mkdir -p "$SYSTEMD_USER_DIR"
+  install -m 0644 "$REPO_DIR/systemd/safe-tools-scan.service" "$SYSTEMD_USER_DIR/"
+  install -m 0644 "$REPO_DIR/systemd/safe-tools-scan.timer" "$SYSTEMD_USER_DIR/"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user daemon-reload
+    systemctl --user enable --now safe-tools-scan.timer
+    info "enabled daily tools-scan timer (safe-tools-scan.timer)"
   else
     warn "systemctl not found; timer units installed to $SYSTEMD_USER_DIR but not enabled"
   fi

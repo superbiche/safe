@@ -45,6 +45,7 @@ grep -q '\[--deps-only | --full\]' <<<"$help_output" || fail "help omits scan mo
 grep -q '\[--no-cache\]' <<<"$help_output" || fail "help omits scan --no-cache"
 grep -q 'safe audit ioc --update' <<<"$help_output" || fail "help omits ioc --update"
 grep -q 'safe audit setup --create-bundle' <<<"$help_output" || fail "help omits setup --create-bundle"
+grep -q 'safe audit tools-scan \[--publish' <<<"$help_output" || fail "help omits tools-scan"
 ! grep -q 'binary-audit' <<<"$help_output" || fail "help still advertises the removed binary-audit"
 pass "help output"
 
@@ -58,6 +59,9 @@ for scan_flag in $(SAFE_AUDIT_NO_INIT=1 "$ROOT/bin/safe-audit" help 2>/dev/null 
   grep -q -- "$scan_flag" <<<"$(grep -E '^\s+machine_audit_opts=' "$ROOT/lib/completions/_safe")" || fail "completion omits scan flag: $scan_flag"
 done
 ! grep -q 'binary-audit\|release-review' "$ROOT/lib/completions/_safe" || fail "completion still offers the removed binary-audit"
+for scan_flag in $(SAFE_AUDIT_NO_INIT=1 "$ROOT/bin/safe-audit" help 2>/dev/null | grep -oE '^\s+safe audit tools-scan .*' | grep -oE '\-\-[a-z-]+' | sort -u); do
+  grep -q -- "$scan_flag" <<<"$(grep -E '^\s+tools_scan_opts=' "$ROOT/lib/completions/_safe")" || fail "completion omits tools-scan flag: $scan_flag"
+done
 pass "completion output"
 
 tmp="$(mktemp -d)"
@@ -76,6 +80,7 @@ jq -e --arg version "$audit_version" '
     "package-audit": true,
     "repo-audit": true,
     "machine-audit": true,
+    "tools-scan": true,
     "ioc.lookup": true,
     "ioc.list": true,
     "ioc.update": true,
@@ -90,6 +95,7 @@ jq -e --arg version "$audit_version" '
       "package-audit": true,
       "repo-audit": true,
       "machine-audit": true,
+      "tools-scan": true,
       "diff": true,
       "status": true
     },

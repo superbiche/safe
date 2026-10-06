@@ -1,0 +1,12 @@
+[Unit]
+Description=safe tools-scan (High/Critical advisories in installed mise tools, published to ~/Sync/state/tool-vulns)
+
+[Service]
+Type=oneshot
+TimeoutStartSec=45min
+ExecStart=%h/.local/bin/safe audit tools-scan --publish
+WorkingDirectory=%h
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
+StandardInput=null
+Nice=10
+IOSchedulingClass=idle

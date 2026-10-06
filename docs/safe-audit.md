@@ -21,7 +21,7 @@ safe audit capabilities --json
 
 The current capability groups cover:
 
-- `top_level`: package-audit, repo-audit, machine-audit, diff, and status;
+- `top_level`: package-audit, repo-audit, machine-audit, tools-scan, diff, and status;
 - `ioc`: lookup, list scanning, and updates;
 - `setup`: machine setup and scanner bundle creation.
 

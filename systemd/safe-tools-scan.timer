@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily safe tools-scan
+
+[Timer]
+OnCalendar=*-*-* 10:23
+RandomizedDelaySec=20min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

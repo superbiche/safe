@@ -14,7 +14,8 @@ trivial PATH shims and completions.
 ## Notes
 
 - Strangler start exists: `cmd/safe-core` (lockdiff, package-verdict,
-  reify-candidates), version-locked to `safe` by the gate.
+  reify-candidates, tools-scan), version-locked to `safe` by the gate.
+  tools-scan was born in Go: no bash implementation, no parity belt.
 - Binary-audit lane RETIRED after 1.66.1: `release-review` and
   `internal/releasereview` are deleted with their only consumer
   (machine-setup's external-binary reviewer); release binaries moved to mise
