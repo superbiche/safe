@@ -106,8 +106,9 @@ safe run host-allow review --digest   # + machine-local digest read by safe stat
 safe run host-allow review --no-audit # age/usage only, no re-audit probes
 ```
 
-Per entry the review reports age, observed usage (host executions plus
-install-gate overrides, joined from the audit logs), and a status from
+Per entry the review reports age, observed usage (host executions,
+install-gate overrides and followed-grant installs, joined from the audit
+logs), and a status from
 re-auditing the pinned version:
 
 - `removable` — audits GO on its own; the entry is dead weight.

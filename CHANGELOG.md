@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.67.0 - 2026-10-06
 
 - Remove `safe audit binary-audit` and its `release-review` composite
   (`safe-core release-review`, `internal/releasereview`) with their only
