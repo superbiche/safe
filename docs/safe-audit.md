@@ -22,9 +22,6 @@ safe audit capabilities --json
 The current capability groups cover:
 
 - `top_level`: package-audit, repo-audit, machine-audit, diff, and status;
-- `binary-audit`: `release-review`, one composite command whose checks cover a
-  release's checksums, signature, GitHub release metadata, repository
-  advisories, TUF bootstrap material, and networkless sandbox execution;
 - `ioc`: lookup, list scanning, and updates;
 - `setup`: machine setup and scanner bundle creation.
 
@@ -681,24 +678,6 @@ socket login
 ```
 
 For predictable repeated use, use a Socket account token. The practical token scope for `socket package score` is `packages:list`. `safe doctor` reports the Socket CLI and token wiring.
-
-## Release Review
-
-Review a whole GitHub release from a single spec — release metadata,
-advisories, checksum, signature, TUF trust material and a sandboxed smoke
-run, aggregated into one verdict:
-
-```bash
-safe audit binary-audit release-review --spec ./review.json
-```
-
-This is the `release-review` composite (implemented in `safe-core`, forwarded
-here). It replaced the earlier six granular sub-lanes — `release github`,
-`vuln github-release`, `verify release-asset`, `verify sigstore-bundle`,
-`verify tuf-bootstrap` and `exec` — which no longer exist as commands. The
-spec schema, the six checks it runs, the report shape, and the ledger of
-places it deliberately diverges from those sub-lanes are documented in
-[release-review.md](release-review.md).
 
 ## IOC Workflows
 

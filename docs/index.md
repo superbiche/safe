@@ -64,7 +64,7 @@ npm install express  # gated by ~/.local/bin/npm -> safe gate npm
 
 Unknown package code should not get host access by default. `safe` prefers sandboxed execution, explicit pinned host allowlists, package checks before install, and auditable records of decisions.
 
-For release binaries, `safe audit` separates source/release review, checksum or Sigstore verification, and networkless binary smoke execution.
+Release binaries are installed through mise backends, which verify checksums and, where supported, signatures; the mise gate reports them as not advisory-audited.
 
 For vendor-native tools that update themselves outside package managers, use
 `safe vendor update` to record intent, command, rollback note, and binary hashes
