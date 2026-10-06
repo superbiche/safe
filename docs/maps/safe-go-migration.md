@@ -38,7 +38,6 @@ trivial PATH shims and completions.
   fixture-corpus parity gate is retired and verdict-affecting divergences are
   frozen as in-process Go goldens (`internal/releasereview/ledger_test.go`,
   `version_test.go`).
-- Repo review law applies (`AGENTS.md` § Reviews).
 
 ## Tickets (index at export time, 2026-08-25)
 

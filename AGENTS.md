@@ -31,27 +31,6 @@ Running `install.sh` is pre-authorized whenever it makes the live gate better �
 - Fail-closed stays for malice signals (blocklist, critical advisory affecting the resolved version, Socket BLOCK). Resolution that cannot be predicted degrades honestly (package-level WARN + pin hint), never silently passes.
 - Operator override is mandatory at every terminus (ruled 2026-09-07). Anything that can end in refusal/BLOCK/REJECT — a verdict, gate, review heuristic, feature, or proposal — MUST expose a conscious operator-override entry (a TTY override / documented escape hatch, e.g. exit 102 "operator TTY needed"). A terminus that leaves the operator no override lane is itself the defect and is rejected. Fail-closed means the operator must override deliberately, never that there is no override; the only thing an override cannot do is turn into a silent auto-pass.
 
-## Reviews (repo default, ruled 2026-08-03)
-
-ONE orthogonal review round per PR: sol/xhigh for verdict-affecting changes,
-terra/medium for routine. Corrective findings close in-slice; the closure
-evidence is the regression test + green suite, not a re-review. A delta
-round runs only when round 1 found a BLOCKER or a fix is non-mechanical.
-Rationale (24h data, 2026-08-03): multi-round chains produced ~21%
-fix-caused findings while every operator-blocking defect arrived from live
-use, not review rounds.
-
-Chain mechanics (added 2026-08-27, liaison D0428; the open verb is law since
-2026-08-21): every review chain is OPENED through the engine BEFORE the
-review turn — `liaison review open <slug> --stance coordinator-hands
---coordinator-actor cc --coordinator-model <id> --coordinator-effort <tier>
---lane routine|deep --criteria "<verbatim>"` — and completed at close with
-`liaison review record <chain-dir> --verify-ref <evidence> --review-input
-assembled`. A chain closed without its engine-minted record fails liaison's
-`review.hygiene` gate permanently (a record cannot be engine-minted after
-the fact). The 2026-08-21→27 unopened safe chains were amnestied ONCE by
-name (D0428); no grace after.
-
 ## Contract and docs single-source
 
 `docs/contract/agent-contract.json` is the only source for the agent contract. Rendered surfaces (`docs/agents.md` generated blocks, `safe explain`) regenerate via `scripts/render-contract.sh`; never hand-edit generated blocks. `tests/contract/drift.sh` enforces this.
