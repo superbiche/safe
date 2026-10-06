@@ -98,7 +98,6 @@ DEFAULT_REMOTE_ROOT="${SAFE_AUDIT_REMOTE_ROOT:-\$HOME}"
 DEFAULT_CISA_KEV_URL="${SAFE_AUDIT_CISA_KEV_URL:-https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json}"
 GRYPE_DB_MAX_AGE_DAYS="${SAFE_AUDIT_GRYPE_DB_MAX_AGE_DAYS:-7}"
 SSH_CONNECT_TIMEOUT="${SAFE_AUDIT_SSH_CONNECT_TIMEOUT:-10}"
-GITHUB_HIGH_RISK_PATH_REGEX="${SAFE_AUDIT_GITHUB_HIGH_RISK_PATH_REGEX:-(^|/)\\.github/workflows/|(^|/)(install|setup|bootstrap|release|publish|sign|cosign|checksum|goreleaser)([^/]*)(\\.[^/]+)?$|(^|/)(Dockerfile|Makefile|magefile\\.go)$}"
 
 # Every lockfile name safe hands osv-scanner, after translation. A scanner
 # upgrade that drops an extractor silently strips the OSV tier for every repo
@@ -346,10 +345,6 @@ urlencode() {
 first_line_summary() {
   local text="$1" limit="${2:-240}"
   printf '%s' "$text" | tr '\r\n' '  ' | tr -s ' ' | cut -c1-"$limit"
-}
-
-matches_high_risk_path() {
-  [[ "$1" =~ $GITHUB_HIGH_RISK_PATH_REGEX ]]
 }
 
 ensure_dependencies() {
