@@ -255,6 +255,46 @@ func TestScanRecordsPerToolFailuresWithoutHidingOthers(t *testing.T) {
 	}
 }
 
+func TestScanWhereEveryVersionFailsIsAnError(t *testing.T) {
+	for _, stage := range []string{"sbom", "match"} {
+		t.Run(stage, func(t *testing.T) {
+			f := newFakeTools(t)
+			a := f.install("a", 1, "[]")
+			b := f.install("b", 1, "[]")
+			if stage == "sbom" {
+				for _, dir := range []string{a, b} {
+					if err := os.WriteFile(filepath.Join(dir, ".fail-syft"), nil, 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+			} else {
+				f.write("matches-a.json", "not json")
+				f.write("matches-b.json", "not json")
+			}
+			f.write("installed.json", installedJSON(map[string][][2]string{"a": {{"1", a}}, "b": {{"1", b}}}))
+
+			r := Scan(context.Background(), f.options())
+			if r.Error == nil || !strings.Contains(*r.Error, "no tool version could be scanned (2 failed; first: "+stage) {
+				t.Fatalf("error = %v", r.Error)
+			}
+			if r.Tools != nil || r.Unscanned != nil || len(r.Errors) != 2 {
+				t.Fatalf("findings must be unknown and failures kept: %+v", r)
+			}
+		})
+	}
+}
+
+func TestScanWithOnlyUnscannedVersionsIsNotAnError(t *testing.T) {
+	f := newFakeTools(t)
+	bw := f.install("bw", 0, "[]")
+	f.write("installed.json", installedJSON(map[string][][2]string{"bw": {{"1", bw}}}))
+
+	r := Scan(context.Background(), f.options())
+	if r.Error != nil || len(r.Unscanned) != 1 {
+		t.Fatalf("report = %+v", r)
+	}
+}
+
 func TestScanFailedUpdateWithUsableDatabaseStillMatches(t *testing.T) {
 	f := newFakeTools(t)
 	a := f.install("a", 1, list(grypeMatch("GHSA-x", "High", "c", "1")))

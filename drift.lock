@@ -98,7 +98,7 @@ sig = "1d1a90d4ade3ee7f"
 [[bindings]]
 doc = "docs/tools-scan.md"
 target = "internal/toolscan/toolscan.go"
-sig = "2e31cf6dccd2bf16"
+sig = "3ea528689f19953f"
 
 [[bindings]]
 doc = "docs/tools-scan.md"

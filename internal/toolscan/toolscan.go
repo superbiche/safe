@@ -179,6 +179,10 @@ func Scan(ctx context.Context, o Options) Report {
 		r.Tools = append(r.Tools, t)
 	}
 	pruneCache(o.CacheDir, keep)
+	if len(scope) > 0 && len(r.Tools) == 0 && len(r.Unscanned) == 0 {
+		return r.fail("no tool version could be scanned (%d failed; first: %s %s@%s: %s)",
+			len(r.Errors), r.Errors[0].Stage, r.Errors[0].Tool, r.Errors[0].Version, r.Errors[0].Message)
+	}
 	return r
 }
 

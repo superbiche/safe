@@ -88,6 +88,29 @@ else
   fail "without --publish no report on stdout"
 fi
 
+# Every version failing is a failed run, not a clean one.
+cp "$MOCKBIN/grype" "$TEST_ROOT/grype.ok"
+cat > "$MOCKBIN/grype" <<'MOCK'
+#!/usr/bin/env bash
+[[ "$1" == version ]] && { echo '{"version":"0.120.0"}'; exit 0; }
+[[ "$1 $2" == "db update" ]] && exit 0
+[[ "$1 $2" == "db status" ]] && { echo '{"built":"2026-10-06T06:32:14Z","valid":true}'; exit 0; }
+echo "matcher crashed" >&2
+exit 1
+MOCK
+chmod +x "$MOCKBIN/grype"
+set +e
+PATH="$MOCKBIN:$PATH" "$SAFE_AUDIT" tools-scan --publish --out "$out" --host testhost >/dev/null 2>"$TEST_ROOT/err"
+rc=$?
+set -e
+if [[ $rc -eq 3 && $(wc -l < "$TEST_ROOT/err") -eq 1 ]] && grep -q 'no tool version could be scanned' "$TEST_ROOT/err" \
+  && jq -e '.error != null and .tools == null and (.errors | length) == 1 and .errors[0].stage == "match"' "$out" >/dev/null; then
+  pass "a run where every version fails publishes an error and exits 3"
+else
+  fail "all versions failing: rc=$rc stderr=[$(cat "$TEST_ROOT/err")] report=$(jq -c . "$out")"
+fi
+mv "$TEST_ROOT/grype.ok" "$MOCKBIN/grype"
+
 # A run that cannot scan still publishes, says why on stderr and exits 3.
 rm "$MOCKBIN/grype"
 set +e

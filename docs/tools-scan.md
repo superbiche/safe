@@ -65,7 +65,7 @@ present. `null` means unknown, never zero or clean.
 | `scope.in_scope`, `scope.prunable` | version counts; `scope` is `null` when mise could not be read |
 | `tools` | one entry per scanned version (below); `null` when the run failed |
 | `unscanned` | `tool@version` of versions with no component; `null` when the run failed |
-| `errors` | per-version failures, `{tool, version, stage: "sbom"\|"match", message}`; such a version is in neither `tools` nor `unscanned` |
+| `errors` | per-version failures, `{tool, version, stage: "sbom"\|"match", message}`; such a version is in neither `tools` nor `unscanned`. When every version in scope failed, the run fails (`error` set) and `errors` is kept |
 | `error` | why the run failed, or `null` |
 
 A `tools` entry: `tool` (mise tool id), `version`, `components` (SBOM artifact
@@ -79,6 +79,6 @@ counts and `[]`.
 
 - `0`: the report was produced; per-version failures are in `errors`.
 - `2`: usage error.
-- `3`: the run failed (missing scanner or mise, unusable database, publication
-  failure). With `--publish` the report carrying `error` is still written
+- `3`: the run failed (missing scanner or mise, unusable database, every
+  version in scope failed to scan, publication failure). With `--publish` the report carrying `error` is still written
   when possible, and the reason is the single stderr line.

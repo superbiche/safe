@@ -54,7 +54,7 @@ git -C "$checkout" tag -l | xargs -r git -C "$checkout" tag -d
 base_version="$(tr -d '[:space:]' < "$checkout/VERSION")"
 declare -a RV
 RV[0]="$(printf '%d.99.99' "$(( ${base_version%%.*} - 1 ))")"
-for __i in $(seq 1 18); do
+for __i in $(seq 1 19); do
   RV[$__i]="$(printf '%s.%d' "${base_version%.*}" "$(( ${base_version##*.} + __i ))")"
 done
 git -C "$checkout" tag -s -u "$fingerprint" -m "$base_version" "v$base_version"
@@ -493,10 +493,30 @@ jq -e '.install_flags == ["--all", "--review-timer", "--tools-scan-timer"]' "$un
   fail 'a later install dropped tools-scan-timer from the union'
 pass 'installer records the component union and preserves no-wrappers semantics'
 
+timer_stub="$tmp/timer-stub"
+mkdir -p "$timer_stub"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$timer_stub/systemctl"
+chmod +x "$timer_stub/systemctl"
+PATH="$timer_stub:/usr/bin:/bin" SAFE_BIN_DIR="$SAFE_BIN_DIR" SAFE_CONFIG_DIR="$SAFE_CONFIG_DIR" \
+  SAFE_DATA_DIR="$SAFE_DATA_DIR" SAFE_RUN_CONFIG_DIR="$SAFE_RUN_CONFIG_DIR" \
+  SAFE_RUN_DATA_DIR="$SAFE_RUN_DATA_DIR" bash "$checkout/install.sh" --run --tools-scan-timer \
+  >/dev/null 2>&1 || fail 'tools-scan-timer fixture install failed'
+jq -e '.install_flags | index("--tools-scan-timer")' "$SAFE_CONFIG_DIR/release-follow.json" >/dev/null ||
+  fail 'tools-scan-timer install did not record its flag'
+rm -f -- "$HOME/.config/systemd/user/safe-tools-scan.timer"
+make_release ${RV[18]} signed
+FOLLOW_PATH="$timer_stub:$PATH" run_follow
+[[ "$FOLLOW_RC" == 0 ]] || fail "follow with a recorded --tools-scan-timer failed: $FOLLOW_OUTPUT"
+grep -q "installed v${RV[18]} signer=" <<<"$FOLLOW_OUTPUT" || fail "tools-scan-timer follow did not install: $FOLLOW_OUTPUT"
+[[ -f "$HOME/.config/systemd/user/safe-tools-scan.timer" ]] || fail 'follow did not reinstall the tools-scan timer'
+jq -e '.install_flags | index("--tools-scan-timer")' "$SAFE_CONFIG_DIR/release-follow.json" >/dev/null ||
+  fail 'follow dropped --tools-scan-timer from the record'
+pass 'an installer-produced --tools-scan-timer record keeps following releases'
+
 probe_driver="$tmp/probe-driver"
 cp "$driver" "$probe_driver"
-printf "${RV[18]}\n" > "$checkout/VERSION"
-sed -i -E "s/^SAFE_VERSION=\"[0-9]+\\.[0-9]+\\.[0-9]+\"/SAFE_VERSION=\"${RV[18]}\"/" "$checkout/bin/safe"
+printf "${RV[19]}\n" > "$checkout/VERSION"
+sed -i -E "s/^SAFE_VERSION=\"[0-9]+\\.[0-9]+\\.[0-9]+\"/SAFE_VERSION=\"${RV[19]}\"/" "$checkout/bin/safe"
 cat > "$checkout/install.sh" <<'PROBE_INSTALL'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -505,8 +525,8 @@ PROBE_INSTALL
 chmod +x "$checkout/install.sh"
 git -C "$checkout" add VERSION bin/safe install.sh
 git -C "$checkout" commit --quiet -m 'fixture probe failure'
-git -c gpg.format=openpgp -c gpg.program=/usr/bin/gpg -C "$checkout" tag -s -u "$fingerprint" -m v${RV[18]} v${RV[18]}
-git -C "$checkout" push --quiet origin HEAD refs/tags/v${RV[18]}
+git -c gpg.format=openpgp -c gpg.program=/usr/bin/gpg -C "$checkout" tag -s -u "$fingerprint" -m v${RV[19]} v${RV[19]}
+git -C "$checkout" push --quiet origin HEAD refs/tags/v${RV[19]}
 driver="$probe_driver"
 run_follow
 [[ "$FOLLOW_RC" != 127 ]] || fail 'post-install probe leaked exit 127'
