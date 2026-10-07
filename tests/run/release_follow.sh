@@ -54,7 +54,7 @@ git -C "$checkout" tag -l | xargs -r git -C "$checkout" tag -d
 base_version="$(tr -d '[:space:]' < "$checkout/VERSION")"
 declare -a RV
 RV[0]="$(printf '%d.99.99' "$(( ${base_version%%.*} - 1 ))")"
-for __i in $(seq 1 19); do
+for __i in $(seq 1 23); do
   RV[$__i]="$(printf '%s.%d' "${base_version%.*}" "$(( ${base_version##*.} + __i ))")"
 done
 git -C "$checkout" tag -s -u "$fingerprint" -m "$base_version" "v$base_version"
@@ -513,10 +513,76 @@ jq -e '.install_flags | index("--tools-scan-timer")' "$SAFE_CONFIG_DIR/release-f
   fail 'follow dropped --tools-scan-timer from the record'
 pass 'an installer-produced --tools-scan-timer record keeps following releases'
 
+# A follower host's recorded checkout: a clone of origin with the default
+# branch checked out, behind the release.
+follower="$tmp/follower"
+git clone --quiet --no-hardlinks "$origin" "$follower"
+git -C "$follower" config user.name 'L7 follower'
+git -C "$follower" config user.email follower@example.invalid
+git -C "$follower" config commit.gpgSign false
+make_release ${RV[19]} signed
+run_follow --checkout "$follower"
+[[ "$FOLLOW_RC" == 0 ]] || fail "follower advance failed: $FOLLOW_OUTPUT"
+[[ "$(git -C "$follower" rev-parse HEAD)" == "$(git -C "$follower" rev-parse "v${RV[19]}^{commit}")" ]] ||
+  fail 'checked-out default branch was not advanced to the release'
+[[ -z "$(git -C "$follower" status --porcelain --untracked-files=all)" ]] ||
+  fail "advancing left the index or working tree behind: $(git -C "$follower" status --porcelain | head -3)"
+[[ "$(tr -d '[:space:]' < "$follower/VERSION")" == "${RV[19]}" ]] || fail 'working tree VERSION was not advanced'
+pass 'a checked-out default branch advances with its index and working tree'
+
+mkdir -p "$follower/inbox/bundle"
+printf 'capture\n' > "$follower/inbox/2026-10-07-l7-capture.md"
+printf 'raw\n' > "$follower/inbox/bundle/raw.txt"
+git -C "$follower" add inbox
+git -C "$follower" commit --quiet -m 'inbox: l7 capture' -m 'Body of capture'
+capture_message=$(git -C "$follower" cat-file commit HEAD | sed '1,/^$/d' | od -c)
+make_release ${RV[20]} signed
+run_follow --checkout "$follower"
+[[ "$FOLLOW_RC" == 0 ]] || fail "capture carry follow failed: $FOLLOW_OUTPUT"
+! grep -q 'WARN' <<<"$FOLLOW_OUTPUT" || fail "capture carry warned: $FOLLOW_OUTPUT"
+[[ "$(git -C "$follower" rev-parse HEAD^)" == "$(git -C "$follower" rev-parse "v${RV[20]}^{commit}")" ]] ||
+  fail 'the capture was not replayed on the release'
+[[ "$(git -C "$follower" log -1 --format='%an' HEAD)" == 'L7 follower' ]] || fail 'the replayed capture lost its author'
+[[ "$(git -C "$follower" cat-file commit HEAD | sed '1,/^$/d' | od -c)" == "$capture_message" ]] ||
+  fail 'the replayed capture message changed'
+[[ -f "$follower/inbox/2026-10-07-l7-capture.md" && -f "$follower/inbox/bundle/raw.txt" ]] || fail 'carried capture files are missing'
+[[ -z "$(git -C "$follower" status --porcelain --untracked-files=all)" ]] || fail 'capture carry left the checkout dirty'
+pass 'local inbox capture commits are carried onto the release'
+
+# The capture reached origin and was consumed there: it is not replayed.
+mkdir -p "$checkout/inbox"
+printf 'capture\n' > "$checkout/inbox/2026-10-07-l7-capture.md"
+git -C "$checkout" add inbox/2026-10-07-l7-capture.md
+git -C "$checkout" commit --quiet -m 'inbox: l7 capture'
+git -C "$checkout" rm --quiet inbox/2026-10-07-l7-capture.md
+git -C "$checkout" commit --quiet -m 'inbox: consume l7 capture'
+make_release ${RV[21]} signed
+run_follow --checkout "$follower"
+[[ "$FOLLOW_RC" == 0 ]] || fail "delivered-capture follow failed: $FOLLOW_OUTPUT"
+[[ "$(git -C "$follower" rev-parse HEAD^)" == "$(git -C "$follower" rev-parse "v${RV[21]}^{commit}")" ]] ||
+  fail 'the undelivered bundle was not replayed alone on the release'
+[[ ! -e "$follower/inbox/2026-10-07-l7-capture.md" && -f "$follower/inbox/bundle/raw.txt" ]] ||
+  fail 'a delivered capture was resurrected or the undelivered one was lost'
+[[ "$(git -C "$follower" cat-file commit HEAD | sed '1,/^$/d' | od -c)" == "$capture_message" ]] ||
+  fail 'a second replay changed the capture message'
+pass 'a capture already in the release history is not resurrected'
+
+printf 'local\n' > "$follower/local.txt"
+git -C "$follower" add local.txt
+git -C "$follower" commit --quiet -m 'local work'
+follower_head=$(git -C "$follower" rev-parse HEAD)
+make_release ${RV[22]} signed
+run_follow --checkout "$follower"
+[[ "$FOLLOW_RC" == 0 ]] || fail "local-commit follow install failed: $FOLLOW_OUTPUT"
+grep -q 'WARN default branch has local commits other than inbox captures' <<<"$FOLLOW_OUTPUT" ||
+  fail "local-commit warning missing: $FOLLOW_OUTPUT"
+[[ "$(git -C "$follower" rev-parse HEAD)" == "$follower_head" ]] || fail 'a branch with local work was moved'
+pass 'a default branch with other local commits is left in place'
+
 probe_driver="$tmp/probe-driver"
 cp "$driver" "$probe_driver"
-printf "${RV[19]}\n" > "$checkout/VERSION"
-sed -i -E "s/^SAFE_VERSION=\"[0-9]+\\.[0-9]+\\.[0-9]+\"/SAFE_VERSION=\"${RV[19]}\"/" "$checkout/bin/safe"
+printf "${RV[23]}\n" > "$checkout/VERSION"
+sed -i -E "s/^SAFE_VERSION=\"[0-9]+\\.[0-9]+\\.[0-9]+\"/SAFE_VERSION=\"${RV[23]}\"/" "$checkout/bin/safe"
 cat > "$checkout/install.sh" <<'PROBE_INSTALL'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -525,8 +591,8 @@ PROBE_INSTALL
 chmod +x "$checkout/install.sh"
 git -C "$checkout" add VERSION bin/safe install.sh
 git -C "$checkout" commit --quiet -m 'fixture probe failure'
-git -c gpg.format=openpgp -c gpg.program=/usr/bin/gpg -C "$checkout" tag -s -u "$fingerprint" -m v${RV[19]} v${RV[19]}
-git -C "$checkout" push --quiet origin HEAD refs/tags/v${RV[19]}
+git -c gpg.format=openpgp -c gpg.program=/usr/bin/gpg -C "$checkout" tag -s -u "$fingerprint" -m v${RV[23]} v${RV[23]}
+git -C "$checkout" push --quiet origin HEAD refs/tags/v${RV[23]}
 driver="$probe_driver"
 run_follow
 [[ "$FOLLOW_RC" != 127 ]] || fail 'post-install probe leaked exit 127'

@@ -494,9 +494,15 @@ requires it to equal the verified commit tree. Checkout-local attributes that
 filter the archive therefore refuse; a signed `.gitattributes` in the release
 also refuses because its archive transformations are not treated as a safe
 tree-hash input.
-After a successful version check, the checkout's default branch advances only
-when clean and fast-forwardable; a dirty or diverged checkout produces a WARN
-after installation. `install.sh` currently replaces some live files with
+After a successful version check, the checkout's default branch advances to
+the release when the checkout is clean; a dirty checkout produces a WARN after
+installation. A default branch checked out in the recorded checkout moves with
+its index and working tree (`git reset --keep`); one checked out in another
+worktree is left in place with a WARN. Local commits that only add files under
+`inbox/` (agent captures, which cannot be pushed to the protected default
+branch) are replayed on the release with their message and author; a captured
+path the release history already holds has reached origin and is dropped. Any
+other local commit leaves the branch in place with a WARN. `install.sh` currently replaces some live files with
 direct writes, so the lock serializes passes but cannot make a killed install
 an all-files transaction; the installed surface may be mixed until the normal
 manual repair path is run.

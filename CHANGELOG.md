@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- `safe release follow` advances a checked-out default branch with its index
+  and working tree. It used to move only the branch ref, which left the
+  checkout showing the reverse of the release as staged changes and made every
+  later pass warn that the checkout was dirty. Local commits that only add
+  files under `inbox/` are replayed on the release instead of blocking the
+  advance; a capture whose path the release history already holds is dropped.
+  A default branch already at or past the release is left alone without a
+  warning.
+
 ## 1.68.0 - 2026-10-07
 
 - Add `safe audit tools-scan` (`safe-core tools-scan`, `internal/toolscan`):
