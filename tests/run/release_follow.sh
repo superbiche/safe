@@ -534,15 +534,17 @@ mkdir -p "$follower/inbox/bundle"
 printf 'capture\n' > "$follower/inbox/2026-10-07-l7-capture.md"
 printf 'raw\n' > "$follower/inbox/bundle/raw.txt"
 git -C "$follower" add inbox
-git -C "$follower" commit --quiet -m 'inbox: l7 capture'
+git -C "$follower" commit --quiet -m 'inbox: l7 capture' -m 'Body of capture'
+capture_message=$(git -C "$follower" cat-file commit HEAD | sed '1,/^$/d' | od -c)
 make_release ${RV[20]} signed
 run_follow --checkout "$follower"
 [[ "$FOLLOW_RC" == 0 ]] || fail "capture carry follow failed: $FOLLOW_OUTPUT"
 ! grep -q 'WARN' <<<"$FOLLOW_OUTPUT" || fail "capture carry warned: $FOLLOW_OUTPUT"
 [[ "$(git -C "$follower" rev-parse HEAD^)" == "$(git -C "$follower" rev-parse "v${RV[20]}^{commit}")" ]] ||
   fail 'the capture was not replayed on the release'
-[[ "$(git -C "$follower" log -1 --format='%s|%an' HEAD)" == 'inbox: l7 capture|L7 follower' ]] ||
-  fail 'the replayed capture lost its message or author'
+[[ "$(git -C "$follower" log -1 --format='%an' HEAD)" == 'L7 follower' ]] || fail 'the replayed capture lost its author'
+[[ "$(git -C "$follower" cat-file commit HEAD | sed '1,/^$/d' | od -c)" == "$capture_message" ]] ||
+  fail 'the replayed capture message changed'
 [[ -f "$follower/inbox/2026-10-07-l7-capture.md" && -f "$follower/inbox/bundle/raw.txt" ]] || fail 'carried capture files are missing'
 [[ -z "$(git -C "$follower" status --porcelain --untracked-files=all)" ]] || fail 'capture carry left the checkout dirty'
 pass 'local inbox capture commits are carried onto the release'
@@ -561,6 +563,8 @@ run_follow --checkout "$follower"
   fail 'the undelivered bundle was not replayed alone on the release'
 [[ ! -e "$follower/inbox/2026-10-07-l7-capture.md" && -f "$follower/inbox/bundle/raw.txt" ]] ||
   fail 'a delivered capture was resurrected or the undelivered one was lost'
+[[ "$(git -C "$follower" cat-file commit HEAD | sed '1,/^$/d' | od -c)" == "$capture_message" ]] ||
+  fail 'a second replay changed the capture message'
 pass 'a capture already in the release history is not resurrected'
 
 printf 'local\n' > "$follower/local.txt"

@@ -1010,7 +1010,7 @@ release_follow_carry_captures() {
     tree=$(release_follow_git GIT_INDEX_FILE="$index_file" write-tree) || return 1
     mapfile -t ident < <(release_follow_git log -1 --format='%an%n%ae%n%aI%n%cn%n%ce%n%cI' "$commit")
     (( ${#ident[@]} == 6 )) || return 1
-    release_follow_git log -1 --format=%B "$commit" > "$message_file" || return 1
+    release_follow_git log -1 --format=format:%B "$commit" > "$message_file" || return 1
     tip=$(release_follow_git GIT_AUTHOR_NAME="${ident[0]}" GIT_AUTHOR_EMAIL="${ident[1]}" \
       GIT_AUTHOR_DATE="${ident[2]}" GIT_COMMITTER_NAME="${ident[3]}" GIT_COMMITTER_EMAIL="${ident[4]}" \
       GIT_COMMITTER_DATE="${ident[5]}" commit-tree --no-gpg-sign "$tree" -p "$tip" -F "$message_file") || return 1
