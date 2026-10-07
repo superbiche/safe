@@ -17,3 +17,5 @@ config/audit/*.json
 .codex/
 .qwen/
 opencode.json
+# per-machine harness settings; release follow reads only this file, not the global excludes
+.claude/settings.local.json
