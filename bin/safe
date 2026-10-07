@@ -974,15 +974,58 @@ release_follow_verify_signature() {
   RELEASE_FOLLOW_SIGNER="$verified_primary"
 }
 
+# Git in the recorded checkout; leading GIT_*=VALUE arguments are environment.
+release_follow_git() {
+  local -a vars=()
+  while [[ "${1:-}" == GIT_*=* ]]; do vars+=("$1"); shift; done
+  release_follow_clean_git_env "${vars[@]}" "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" "$@"
+}
+
+# Prints the commit the default branch moves to: the candidate with the local
+# commits that only add files under inbox/ replayed on top. Agents commit inbox
+# captures on the default branch and cannot push them (main is push-protected).
+# A captured path the candidate's history already holds has reached origin and
+# is not replayed. Fails on any other local commit.
+release_follow_carry_captures() {
+  local old_ref="$1" candidate="$2" tip="$2" commit parents meta path mode blob kind tree
+  local index_file="$RELEASE_FOLLOW_STAGING/carry.index" message_file="$RELEASE_FOLLOW_STAGING/carry.msg"
+  local -a commits entries ident
+  mapfile -t commits < <(release_follow_git rev-list --reverse --topo-order "$candidate..$old_ref")
+  for commit in "${commits[@]}"; do
+    [[ "$commit" =~ ^[0-9a-f]{40,64}$ ]] || return 1
+    parents=$(release_follow_git rev-list --parents -n 1 "$commit") || return 1
+    [[ "$parents" =~ ^[0-9a-f]+\ [0-9a-f]+$ ]] || return 1
+    entries=()
+    while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+      read -r _ mode _ blob kind <<<"${meta#:}"
+      [[ "$kind" == A && "$path" == inbox/?* ]] || return 1
+      [[ -n "$(release_follow_git rev-list -1 "$candidate" -- "$path")" ]] || entries+=("$mode,$blob,$path")
+    done < <(release_follow_git diff-tree -r --no-renames --no-commit-id -z --raw "$commit^" "$commit")
+    (( ${#entries[@]} )) || continue
+    rm -f -- "$index_file"
+    release_follow_git GIT_INDEX_FILE="$index_file" read-tree "$tip" || return 1
+    for meta in "${entries[@]}"; do
+      release_follow_git GIT_INDEX_FILE="$index_file" update-index --add --cacheinfo "$meta" || return 1
+    done
+    tree=$(release_follow_git GIT_INDEX_FILE="$index_file" write-tree) || return 1
+    mapfile -t ident < <(release_follow_git log -1 --format='%an%n%ae%n%aI%n%cn%n%ce%n%cI' "$commit")
+    (( ${#ident[@]} == 6 )) || return 1
+    release_follow_git log -1 --format=%B "$commit" > "$message_file" || return 1
+    tip=$(release_follow_git GIT_AUTHOR_NAME="${ident[0]}" GIT_AUTHOR_EMAIL="${ident[1]}" \
+      GIT_AUTHOR_DATE="${ident[2]}" GIT_COMMITTER_NAME="${ident[3]}" GIT_COMMITTER_EMAIL="${ident[4]}" \
+      GIT_COMMITTER_DATE="${ident[5]}" commit-tree --no-gpg-sign "$tree" -p "$tip" -F "$message_file") || return 1
+  done
+  rm -f -- "$index_file" "$message_file"
+  printf '%s\n' "$tip"
+}
+
 release_follow_fast_forward_checkout() {
-  local default_ref default_branch branch_ref old_ref
-  [[ -z "$(release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
-    status --porcelain --untracked-files=all 2>/dev/null)" ]] || {
+  local default_ref default_branch branch_ref old_ref new_ref head_ref
+  [[ -z "$(release_follow_git status --porcelain --untracked-files=all 2>/dev/null)" ]] || {
     printf 'safe: release follow: WARN checkout is dirty; default branch was not advanced\n' >&2
     return 0
   }
-  default_ref=$(release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
-    symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null) || {
+  default_ref=$(release_follow_git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null) || {
     printf 'safe: release follow: WARN origin/HEAD is unavailable; checkout was not advanced\n' >&2
     return 0
   }
@@ -992,19 +1035,28 @@ release_follow_fast_forward_checkout() {
     return 0
   }
   branch_ref="refs/heads/$default_branch"
-  old_ref=$(release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
-    rev-parse --verify "$branch_ref" 2>/dev/null) || {
+  old_ref=$(release_follow_git rev-parse --verify "$branch_ref" 2>/dev/null) || {
     printf 'safe: release follow: WARN local default branch is missing; checkout was not advanced\n' >&2
     return 0
   }
-  release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
-    merge-base --is-ancestor "$old_ref" "$RELEASE_FOLLOW_CANDIDATE_COMMIT" || {
-    printf 'safe: release follow: WARN default branch is diverged; checkout was not advanced\n' >&2
+  release_follow_git merge-base --is-ancestor "$RELEASE_FOLLOW_CANDIDATE_COMMIT" "$old_ref" && return 0
+  new_ref=$(release_follow_carry_captures "$old_ref" "$RELEASE_FOLLOW_CANDIDATE_COMMIT") || {
+    printf 'safe: release follow: WARN default branch has local commits other than inbox captures; checkout was not advanced\n' >&2
     return 0
   }
-  release_follow_clean_git_env "$RELEASE_FOLLOW_GIT_PATH" -C "$RELEASE_FOLLOW_CHECKOUT" \
-    update-ref "$branch_ref" "$RELEASE_FOLLOW_CANDIDATE_COMMIT" "$old_ref" ||
-    printf 'safe: release follow: WARN default branch fast-forward failed; checkout was not advanced\n' >&2
+  head_ref=$(release_follow_git symbolic-ref --quiet HEAD 2>/dev/null) || head_ref=""
+  if [[ "$head_ref" == "$branch_ref" ]]; then
+    # Checked out here: the index and working tree move with the branch.
+    release_follow_git GIT_REFLOG_ACTION="safe release follow" reset --quiet --keep "$new_ref" ||
+      printf 'safe: release follow: WARN default branch could not be advanced; checkout was not advanced\n' >&2
+    return 0
+  fi
+  if release_follow_git worktree list --porcelain 2>/dev/null | grep -qxF "branch $branch_ref"; then
+    printf 'safe: release follow: WARN default branch is checked out in another worktree; checkout was not advanced\n' >&2
+    return 0
+  fi
+  release_follow_git update-ref -m "safe release follow" "$branch_ref" "$new_ref" "$old_ref" ||
+    printf 'safe: release follow: WARN default branch could not be advanced; checkout was not advanced\n' >&2
 }
 
 cmd_release_follow() {

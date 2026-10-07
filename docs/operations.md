@@ -212,8 +212,9 @@ The install source record is local at
 `$SAFE_CONFIG_DIR/release-follow.json`. It contains the absolute checkout path
 and the union of normalized `install.sh` component flags from successive
 installs. The release pass installs from a
-private archive of the verified commit, then warns if the recorded checkout is
-dirty or cannot fast-forward. The pass lock is bounded to 10 seconds. Because
+private archive of the verified commit, then advances the recorded checkout's
+default branch, replaying local inbox-capture commits on the release; it warns
+instead when the checkout is dirty or the branch carries other local commits. The pass lock is bounded to 10 seconds. Because
 the current installer still direct-writes some binaries and wrappers, a killed
 install can expose mixed live files; this is an installer atomicity residual,
 not a reason to install from the unverified working tree.
