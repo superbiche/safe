@@ -89,6 +89,7 @@ safe audit capabilities [--json]
 safe audit machine-audit [--verbose] [--deps-only | --full] [--project <path>] [--all | --machine <csv>]
 safe audit package-audit <pkg>@<version> [--ecosystem <name>] [--installer <name>] [--json]
 safe audit repo-audit [<path>] [--verbose] [--deps-only | --full] [--no-cache] [--result-out <file>] [--allow-missing-tools]
+safe audit tools-scan [--publish [--out <file>]] [--host <name>]
 safe audit ioc <identifier> [--all | --machine <csv>]
 safe audit ioc --list <ioc.json> [--all | --machine <csv>]
 safe audit ioc --update [--since <duration>] [--all | --machine <csv>]
@@ -109,6 +110,11 @@ plus first-party source, while skipping installed dependency trees and generated
 output. Use `--deps-only` for manifests and lockfiles only, `--full` to scan the
 complete target tree, and `--verbose` to print project discovery, staged files,
 and scanner inputs.
+
+`safe audit tools-scan` matches the mise tools installed on this machine against
+High and Critical advisories; `--publish` writes the report to
+`~/Sync/state/tool-vulns/<host>.json` and prints nothing. See
+[tools-scan](tools-scan.md).
 
 Missing required scanners or audit tools for discovered project ecosystems stop
 the scan by default. If an interactive user explicitly continues, the missing

@@ -38,7 +38,16 @@ bash install.sh --run
 bash install.sh --audit
 bash install.sh --wrappers
 bash install.sh --no-wrappers
+bash install.sh --review-timer
+bash install.sh --tools-scan-timer
 ```
+
+`--review-timer` and `--tools-scan-timer` add opt-in systemd user timers: the
+weekly host-allow staleness review ([safe-run](safe-run.md)) and the daily
+[tools-scan](tools-scan.md) publication.
+When the user systemd manager cannot be reached (as under `safe release
+follow`), the units are still installed and the installer warns with the
+`systemctl --user enable --now` command instead of failing.
 
 `--no-wrappers` installs the run and audit tools without generating the
 PATH gate wrappers. On an existing installation the gate library

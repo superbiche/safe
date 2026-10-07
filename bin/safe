@@ -1073,7 +1073,7 @@ cmd_release_follow() {
   else
     release_follow_refuse "release-follow installer record is missing"; return
   fi
-  jq -e 'all(.[]; . == "--all" or . == "--run" or . == "--audit" or . == "--wrappers" or . == "--no-wrappers" or . == "--review-timer" or . == "--with-completions")' \
+  jq -e 'all(.[]; . == "--all" or . == "--run" or . == "--audit" or . == "--wrappers" or . == "--no-wrappers" or . == "--review-timer" or . == "--tools-scan-timer" or . == "--with-completions")' \
     <<<"$flags_json" >/dev/null || { release_follow_refuse "release-follow installer flags contain an unsupported option"; return; }
   mapfile -t RELEASE_FOLLOW_INSTALL_FLAGS < <(jq -r '.[]' <<<"$flags_json")
 

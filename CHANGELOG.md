@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Add `safe audit tools-scan` (`safe-core tools-scan`, `internal/toolscan`):
+  High and Critical advisories affecting the mise tools installed on this
+  machine, for versions a tracked config still references. One cached syft
+  SBOM per version directory, rematched by grype after a database update.
+  `--publish` writes `~/Sync/state/tool-vulns/<host>.json` (schema
+  `tool-vulns/1`, for Vigie) and prints nothing; a run that cannot scan still
+  publishes its error and exits 3. `install.sh --tools-scan-timer` installs
+  the daily `safe-tools-scan.timer`. The capabilities payload gains
+  `tools-scan`. See `docs/tools-scan.md`.
+
 ## 1.67.0 - 2026-10-06
 
 - Remove `safe audit binary-audit` and its `release-review` composite
