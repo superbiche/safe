@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.68.0 - 2026-10-07
 
 - Add `safe audit tools-scan` (`safe-core tools-scan`, `internal/toolscan`):
   High and Critical advisories affecting the mise tools installed on this
@@ -11,6 +11,11 @@
   publishes its error and exits 3. `install.sh --tools-scan-timer` installs
   the daily `safe-tools-scan.timer`. The capabilities payload gains
   `tools-scan`. See `docs/tools-scan.md`.
+- `safe release follow` accepts a recorded `--tools-scan-timer`. A timer step
+  in `install.sh` that cannot reload or enable the user systemd unit (as under
+  release follow's `env -i`) now installs the units and warns with the enable
+  command instead of failing the install; before, a recorded `--review-timer`
+  would have made every follow refuse.
 
 ## 1.67.0 - 2026-10-06
 
