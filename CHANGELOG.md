@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.68.1 - 2026-10-07
 
 - `safe release follow` advances a checked-out default branch with its index
   and working tree. It used to move only the branch ref, which left the
