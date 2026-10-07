@@ -834,32 +834,31 @@ else
   info "added completion fpath line to $ZSHRC"
 fi
 
-if (( DO_REVIEW_TIMER )); then
-  SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-  mkdir -p "$SYSTEMD_USER_DIR"
-  install -m 0644 "$REPO_DIR/systemd/safe-host-allow-review.service" "$SYSTEMD_USER_DIR/"
-  install -m 0644 "$REPO_DIR/systemd/safe-host-allow-review.timer" "$SYSTEMD_USER_DIR/"
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl --user daemon-reload
-    systemctl --user enable --now safe-host-allow-review.timer
-    info "enabled weekly host-allow review timer (safe-host-allow-review.timer)"
+# Installs a timer's units and enables it. `safe release follow` runs this
+# installer under env -i, where the user manager is unreachable: the units are
+# still refreshed and the timer enabled by an earlier install keeps running, so
+# that case warns instead of failing the whole install.
+install_user_timer() {
+  local name="$1" what="$2" dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  mkdir -p "$dir"
+  install -m 0644 "$REPO_DIR/systemd/$name.service" "$dir/"
+  install -m 0644 "$REPO_DIR/systemd/$name.timer" "$dir/"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "systemctl not found; timer units installed to $dir but not enabled"
+  elif systemctl --user daemon-reload >/dev/null 2>&1 \
+      && systemctl --user enable --now "$name.timer" >/dev/null 2>&1; then
+    info "enabled $what ($name.timer)"
   else
-    warn "systemctl not found; timer units installed to $SYSTEMD_USER_DIR but not enabled"
+    warn "user systemd manager unreachable; $name units installed to $dir; enable with: systemctl --user daemon-reload && systemctl --user enable --now $name.timer"
   fi
+}
+
+if (( DO_REVIEW_TIMER )); then
+  install_user_timer safe-host-allow-review "weekly host-allow review timer"
 fi
 
 if (( DO_TOOLS_SCAN_TIMER )); then
-  SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-  mkdir -p "$SYSTEMD_USER_DIR"
-  install -m 0644 "$REPO_DIR/systemd/safe-tools-scan.service" "$SYSTEMD_USER_DIR/"
-  install -m 0644 "$REPO_DIR/systemd/safe-tools-scan.timer" "$SYSTEMD_USER_DIR/"
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl --user daemon-reload
-    systemctl --user enable --now safe-tools-scan.timer
-    info "enabled daily tools-scan timer (safe-tools-scan.timer)"
-  else
-    warn "systemctl not found; timer units installed to $SYSTEMD_USER_DIR but not enabled"
-  fi
+  install_user_timer safe-tools-scan "daily tools-scan timer"
 fi
 
 record_release_follow_source
