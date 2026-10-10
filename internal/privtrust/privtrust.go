@@ -1,18 +1,17 @@
 // Package privtrust decides operator-managed trust for owner-controlled
-// private package registries: which registry a package name belongs to,
-// whether the artifact about to be installed matches the integrity pinned for
-// that exact version, and how local and fleet-followed statements combine.
+// private package registries (trusted origins, operator ruling a37): which
+// registry a package name belongs to, whether the package manager would fetch
+// it from that registry's origin, and how local and fleet-followed statements
+// combine. A name in a registered namespace fetched from its origin is trusted
+// like a local artifact; there is no per-version pin or integrity ledger.
 //
-// The package reads three stores, all owned by bin/safe-run's trust root:
+// The package reads two stores, both owned by bin/safe-run's trust root:
 //
 //   - private-registries.json: the local registry policy (operator TTY only);
-//   - private-pins.json: per-version artifact integrity, written by the
-//     operator or recorded on first use (TOFU) by the install gate;
 //   - private-follow-state.json: the last verified signed statement accepted
 //     from each fleet origin, honored only while its signer stays pinned.
 //
-// Nothing here fetches anything or reads a credential: integrity is gathered
-// by the ecosystem's own client in bash and handed in.
+// Nothing here fetches anything or reads a credential.
 package privtrust
 
 import (
@@ -25,6 +24,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -32,12 +32,8 @@ import (
 )
 
 const (
-	PolicySchema    = "safe-private-registries/1"
-	PinsSchema      = "safe-private-pins/1"
-	StatementSchema = "safe-private-registries-export/1"
-
-	PinModeTOFU     = "tofu"
-	PinModeOperator = "operator"
+	PolicySchema    = "safe-private-registries/2"
+	StatementSchema = "safe-private-registries-export/2"
 
 	KindLocal    = "local"
 	KindFollowed = "followed"
@@ -45,38 +41,12 @@ const (
 
 // Registry is one private registry definition.
 type Registry struct {
-	Ecosystem    string   `json:"ecosystem"`
-	Origin       string   `json:"origin"`
-	Owner        string   `json:"owner,omitempty"`
-	Namespace    []string `json:"namespace"`
-	PinMode      string   `json:"pin_mode"`
-	CooldownDays int      `json:"cooldown_days"`
-	Added        string   `json:"added,omitempty"`
-	Reason       string   `json:"reason,omitempty"`
-}
-
-// Integrity is the per-ecosystem artifact identity. npm uses the sha512 SRI;
-// Go the module zip and go.mod h1 hashes; Python the sha256 of every
-// distribution file of the version (pip picks one per platform, so the whole
-// set is bound).
-type Integrity struct {
-	SRI   string            `json:"sri,omitempty"`
-	H1    string            `json:"h1,omitempty"`
-	Mod   string            `json:"mod,omitempty"`
-	Files map[string]string `json:"files,omitempty"`
-}
-
-// Pin records the integrity of one exact version served by one origin.
-type Pin struct {
-	Ecosystem string    `json:"ecosystem"`
-	Origin    string    `json:"origin"`
-	Name      string    `json:"name"`
-	Version   string    `json:"version"`
-	Integrity Integrity `json:"integrity"`
-	Artifact  string    `json:"artifact,omitempty"`
-	PinnedBy  string    `json:"pinned_by"`
-	PinnedAt  string    `json:"pinned_at,omitempty"`
-	Revoked   bool      `json:"revoked,omitempty"`
+	Ecosystem string   `json:"ecosystem"`
+	Origin    string   `json:"origin"`
+	Owner     string   `json:"owner,omitempty"`
+	Namespace []string `json:"namespace"`
+	Added     string   `json:"added,omitempty"`
+	Reason    string   `json:"reason,omitempty"`
 }
 
 // Policy is private-registries.json.
@@ -85,19 +55,12 @@ type Policy struct {
 	Registries map[string]Registry `json:"registries"`
 }
 
-// Pins is private-pins.json.
-type Pins struct {
-	Schema string         `json:"schema"`
-	Pins   map[string]Pin `json:"pins"`
-}
-
 // FollowedOrigin is the last accepted signed statement of one fleet origin.
 type FollowedOrigin struct {
 	Accepted        string              `json:"accepted"`
 	StatementSHA256 string              `json:"statement_sha256"`
 	Signer          string              `json:"signer"`
 	Registries      map[string]Registry `json:"registries"`
-	Pins            map[string]Pin      `json:"pins"`
 }
 
 // FollowState is private-follow-state.json.
@@ -111,7 +74,6 @@ type Statement struct {
 	Host       string              `json:"host"`
 	ExportedAt string              `json:"exported_at"`
 	Registries map[string]Registry `json:"registries"`
-	Pins       map[string]Pin      `json:"pins"`
 }
 
 var (
@@ -120,11 +82,7 @@ var (
 	pyNameRe     = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$`)
 	pyNormRe     = regexp.MustCompile(`[-_.]+`)
 	goElemRe     = regexp.MustCompile(`^[A-Za-z0-9._~+-]+$`)
-	sha256HexRe  = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	h1Re         = regexp.MustCompile(`^h1:[A-Za-z0-9+/]{43}=$`)
-	sriSHA512Re  = regexp.MustCompile(`^sha512-[A-Za-z0-9+/]{86}==$`)
 	hostRe       = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
-	fileNameRe   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]*$`)
 )
 
 // ValidEcosystem reports whether eco is one this package supports.
@@ -351,163 +309,7 @@ func ValidateRegistry(id string, r Registry) (Registry, error) {
 	}
 	sort.Strings(ns)
 	r.Namespace = ns
-	switch r.PinMode {
-	case "":
-		r.PinMode = PinModeTOFU
-	case PinModeTOFU, PinModeOperator:
-	default:
-		return r, fmt.Errorf("registry %s: pin_mode must be tofu or operator", id)
-	}
-	if r.CooldownDays < 0 || r.CooldownDays > 365 {
-		return r, fmt.Errorf("registry %s: cooldown_days must be 0..365", id)
-	}
 	return r, nil
-}
-
-// ValidateIntegrity checks the integrity shape for an ecosystem.
-func ValidateIntegrity(eco string, in Integrity) (Integrity, error) {
-	switch eco {
-	case "npm":
-		sri, err := NormalizeSRI(in.SRI)
-		if err != nil {
-			return in, err
-		}
-		return Integrity{SRI: sri}, nil
-	case "go":
-		// The go.mod hash is always required. The zip hash may be absent only
-		// in an observation: go.sum carries just the /go.mod line for a
-		// module that is in the build graph but never downloaded. Pins always
-		// carry both (ValidatePin).
-		if !h1Re.MatchString(in.Mod) || (in.H1 != "" && !h1Re.MatchString(in.H1)) {
-			return in, fmt.Errorf("go integrity needs h1: hashes for the module zip and its go.mod")
-		}
-		return Integrity{H1: in.H1, Mod: in.Mod}, nil
-	case "python":
-		if len(in.Files) == 0 {
-			return in, fmt.Errorf("python integrity needs at least one distribution file sha256")
-		}
-		files := map[string]string{}
-		for f, h := range in.Files {
-			h = strings.TrimPrefix(strings.ToLower(h), "sha256:")
-			if !fileNameRe.MatchString(f) || !sha256HexRe.MatchString(h) {
-				return in, fmt.Errorf("python integrity entry %q is not filename -> sha256", f)
-			}
-			files[f] = h
-		}
-		return Integrity{Files: files}, nil
-	}
-	return in, fmt.Errorf("unsupported ecosystem %q", eco)
-}
-
-// NormalizeSRI returns the one sha512 member of an SRI string. npm accepts
-// bytes matching ANY digest of the strongest algorithm present, so an SRI
-// carrying two distinct sha512 digests admits two artifacts: it is refused,
-// never narrowed to one of them. A weaker-only SRI (sha1 shasum) or a token
-// of a stronger-than-sha512 or unknown algorithm npm might prefer is not an
-// identity this package can bind either.
-func NormalizeSRI(sri string) (string, error) {
-	found := ""
-	for _, tok := range strings.Fields(sri) {
-		if i := strings.IndexByte(tok, '?'); i >= 0 {
-			tok = tok[:i]
-		}
-		algo, _, _ := strings.Cut(tok, "-")
-		switch algo {
-		case "sha512":
-			if !sriSHA512Re.MatchString(tok) {
-				return "", fmt.Errorf("npm integrity carries a malformed sha512 digest")
-			}
-			if found != "" && found != tok {
-				return "", fmt.Errorf("npm integrity carries two different sha512 digests; it would admit either artifact")
-			}
-			found = tok
-		case "sha1", "sha256", "sha384":
-			// Weaker than sha512: npm checks the strongest algorithm only.
-		default:
-			return "", fmt.Errorf("npm integrity carries an unsupported algorithm %q", algo)
-		}
-	}
-	if found == "" {
-		return "", fmt.Errorf("npm integrity needs a sha512 SRI")
-	}
-	return found, nil
-}
-
-// IntegrityEqual compares two validated integrities of one ecosystem.
-func IntegrityEqual(eco string, a, b Integrity) bool {
-	switch eco {
-	case "npm":
-		return a.SRI != "" && a.SRI == b.SRI
-	case "go":
-		// A zip hash missing on one side (a go.sum /go.mod-only line) is
-		// compared on the go.mod hash alone; present on both, both must match.
-		if a.Mod == "" || a.Mod != b.Mod {
-			return false
-		}
-		return a.H1 == "" || b.H1 == "" || a.H1 == b.H1
-	case "python":
-		if len(a.Files) == 0 || len(a.Files) != len(b.Files) {
-			return false
-		}
-		for f, h := range a.Files {
-			if b.Files[f] != h {
-				return false
-			}
-		}
-		return true
-	}
-	return false
-}
-
-// PinKey is the ledger key of one identity. It keys on the origin, not the
-// registry id, so hosts may name the same registry differently.
-func PinKey(eco, origin, name, version string) string {
-	return eco + "|" + origin + "|" + NormalizeName(eco, name) + "|" + version
-}
-
-// ValidatePin checks a pin and returns it canonicalized together with its key.
-func ValidatePin(p Pin) (Pin, string, error) {
-	if !ValidEcosystem(p.Ecosystem) {
-		return p, "", fmt.Errorf("pin: unsupported ecosystem %q", p.Ecosystem)
-	}
-	origin, err := CanonicalOrigin(p.Origin)
-	if err != nil {
-		return p, "", fmt.Errorf("pin %s@%s: %v", p.Name, p.Version, err)
-	}
-	p.Origin = origin
-	if p.Name == "" || strings.ContainsAny(p.Name, " \t\n|") {
-		return p, "", fmt.Errorf("pin: invalid name %q", p.Name)
-	}
-	p.Name = NormalizeName(p.Ecosystem, p.Name)
-	if !ExactVersion(p.Ecosystem, p.Version) {
-		return p, "", fmt.Errorf("pin %s: %q is not an exact version", p.Name, p.Version)
-	}
-	switch p.PinnedBy {
-	case PinModeTOFU, PinModeOperator:
-	default:
-		return p, "", fmt.Errorf("pin %s@%s: pinned_by must be tofu or operator", p.Name, p.Version)
-	}
-	if !p.Revoked {
-		in, err := ValidateIntegrity(p.Ecosystem, p.Integrity)
-		if err != nil {
-			return p, "", fmt.Errorf("pin %s@%s: %v", p.Name, p.Version, err)
-		}
-		if p.Ecosystem == "go" && in.H1 == "" {
-			return p, "", fmt.Errorf("pin %s@%s: go pins need the module zip hash", p.Name, p.Version)
-		}
-		p.Integrity = in
-	} else if in, err := ValidateIntegrity(p.Ecosystem, p.Integrity); err == nil {
-		p.Integrity = in
-	} else {
-		p.Integrity = Integrity{}
-	}
-	if p.Artifact != "" {
-		p.Artifact = CanonicalURL(p.Artifact)
-		if p.Ecosystem == "go" {
-			p.Artifact = ""
-		}
-	}
-	return p, PinKey(p.Ecosystem, p.Origin, p.Name, p.Version), nil
 }
 
 var (
@@ -616,37 +418,6 @@ func checkPolicyOverlap(regs map[string]Registry) error {
 	return nil
 }
 
-// LoadPins reads the local pin ledger. A missing file is empty.
-func LoadPins(file string) (Pins, error) {
-	p := Pins{Schema: PinsSchema, Pins: map[string]Pin{}}
-	if file == "" {
-		return p, nil
-	}
-	present, err := readStrict(file, &p)
-	if err != nil {
-		return p, err
-	}
-	if !present {
-		return Pins{Schema: PinsSchema, Pins: map[string]Pin{}}, nil
-	}
-	if p.Schema != PinsSchema {
-		return p, fmt.Errorf("%w: %s: schema must be %s", ErrMalformed, file, PinsSchema)
-	}
-	if p.Pins == nil {
-		p.Pins = map[string]Pin{}
-	}
-	out := map[string]Pin{}
-	for k, pin := range p.Pins {
-		cp, key, err := ValidatePin(pin)
-		if err != nil || key != k {
-			return p, fmt.Errorf("%w: %s: pin %q: invalid or mis-keyed", ErrMalformed, file, k)
-		}
-		out[key] = cp
-	}
-	p.Pins = out
-	return p, nil
-}
-
 // LoadFollowState reads the follower ledger. A missing file is empty.
 func LoadFollowState(file string) (FollowState, error) {
 	s := FollowState{Origins: map[string]FollowedOrigin{}}
@@ -666,9 +437,6 @@ func LoadFollowState(file string) (FollowState, error) {
 		}
 		if o.Registries == nil {
 			o.Registries = map[string]Registry{}
-		}
-		if o.Pins == nil {
-			o.Pins = map[string]Pin{}
 		}
 		s.Origins[host] = o
 	}
@@ -721,7 +489,7 @@ func sortedKeys[V any](m map[string]V) []string {
 // Effective view
 // ---------------------------------------------------------------------------
 
-// Source names where a registry or pin came from.
+// Source names where a registry came from.
 type Source struct {
 	Kind       string `json:"kind"`
 	RegistryID string `json:"registry_id,omitempty"`
@@ -735,22 +503,15 @@ type sourcedRegistry struct {
 	Source Source
 }
 
-type sourcedPin struct {
-	Pin
-	Source Source
-}
-
 // View is the union of local state and every followed origin whose signer is
 // still pinned. Followed state from an unpinned signer is invisible.
 type View struct {
 	registries []sourcedRegistry
-	pins       map[string][]sourcedPin
 }
 
 // Stores bundles the store paths.
 type Stores struct {
 	Policy      string
-	Pins        string
 	FollowState string
 	Config      string
 }
@@ -759,10 +520,6 @@ type Stores struct {
 // caller refuses rather than deciding from partial trust.
 func Load(s Stores) (*View, error) {
 	pol, err := LoadPolicy(s.Policy)
-	if err != nil {
-		return nil, err
-	}
-	pins, err := LoadPins(s.Pins)
 	if err != nil {
 		return nil, err
 	}
@@ -776,17 +533,14 @@ func Load(s Stores) (*View, error) {
 		// trust still applies.
 		signers = nil
 	}
-	return Build(pol, pins, fs, signers), nil
+	return Build(pol, fs, signers), nil
 }
 
 // Build assembles a view from already-loaded state.
-func Build(pol Policy, pins Pins, fs FollowState, signers []string) *View {
-	v := &View{pins: map[string][]sourcedPin{}}
+func Build(pol Policy, fs FollowState, signers []string) *View {
+	v := &View{}
 	for _, id := range sortedKeys(pol.Registries) {
 		v.registries = append(v.registries, sourcedRegistry{pol.Registries[id], Source{Kind: KindLocal, RegistryID: id}})
-	}
-	for _, k := range sortedKeys(pins.Pins) {
-		v.pins[k] = append(v.pins[k], sourcedPin{pins.Pins[k], Source{Kind: KindLocal}})
 	}
 	pinned := map[string]bool{}
 	for _, s := range signers {
@@ -807,33 +561,25 @@ func Build(pol Policy, pins Pins, fs FollowState, signers []string) *View {
 			s.RegistryID = id
 			v.registries = append(v.registries, sourcedRegistry{r, s})
 		}
-		for _, k := range sortedKeys(o.Pins) {
-			p, key, err := ValidatePin(o.Pins[k])
-			if err != nil {
-				continue
-			}
-			v.pins[key] = append(v.pins[key], sourcedPin{p, src})
-		}
 	}
 	return v
 }
 
 // Match is the registry decision for one package name.
 type Match struct {
-	Lane         string   `json:"lane"` // none | private | conflict
-	Ecosystem    string   `json:"ecosystem"`
-	Name         string   `json:"name"`
-	Origin       string   `json:"origin,omitempty"`
-	Origins      []string `json:"origins,omitempty"`
-	RegistryIDs  []string `json:"registry_ids,omitempty"`
-	PinMode      string   `json:"pin_mode,omitempty"`
-	CooldownDays int      `json:"cooldown_days"`
-	Sources      []Source `json:"sources,omitempty"`
+	Lane        string   `json:"lane"` // none | private | conflict
+	Ecosystem   string   `json:"ecosystem"`
+	Name        string   `json:"name"`
+	Origin      string   `json:"origin,omitempty"`
+	Origins     []string `json:"origins,omitempty"`
+	RegistryIDs []string `json:"registry_ids,omitempty"`
+	Namespace   []string `json:"namespace,omitempty"`
+	Sources     []Source `json:"sources,omitempty"`
 }
 
 // Match finds the registry a name belongs to. Several sources agreeing on the
-// origin merge (strictest pin mode, longest cooldown); different origins for
-// one name are a conflict and never pick a winner.
+// origin merge; different origins for one name are a conflict and never pick
+// a winner.
 func (v *View) Match(eco, name string) Match {
 	m := Match{Lane: "none", Ecosystem: eco, Name: NormalizeName(eco, name)}
 	origins := map[string]bool{}
@@ -842,15 +588,18 @@ func (v *View) Match(eco, name string) Match {
 		if r.Ecosystem != eco {
 			continue
 		}
-		hit := false
+		hit := ""
 		for _, ns := range r.Namespace {
 			if NamespaceMatches(eco, ns, name) {
-				hit = true
+				hit = ns
 				break
 			}
 		}
-		if !hit {
+		if hit == "" {
 			continue
+		}
+		if !slices.Contains(m.Namespace, hit) {
+			m.Namespace = append(m.Namespace, hit)
 		}
 		origins[r.Origin] = true
 		if !ids[r.Source.RegistryID] {
@@ -858,14 +607,6 @@ func (v *View) Match(eco, name string) Match {
 			m.RegistryIDs = append(m.RegistryIDs, r.Source.RegistryID)
 		}
 		m.Sources = append(m.Sources, r.Source)
-		if r.PinMode == PinModeOperator || m.PinMode == "" {
-			if m.PinMode != PinModeOperator {
-				m.PinMode = r.PinMode
-			}
-		}
-		if r.CooldownDays > m.CooldownDays {
-			m.CooldownDays = r.CooldownDays
-		}
 	}
 	switch len(origins) {
 	case 0:
@@ -878,119 +619,23 @@ func (v *View) Match(eco, name string) Match {
 	default:
 		m.Lane = "conflict"
 		m.Origins = sortedKeys(origins)
-		m.PinMode = ""
 	}
 	sort.Strings(m.RegistryIDs)
+	sort.Strings(m.Namespace)
 	return m
 }
 
-// Decision is the pin outcome for one exact artifact.
-type Decision struct {
-	Decision  string     `json:"decision"` // matched | tofu | missing | changed | revoked | conflict | cross_registry | invalid
-	Detail    string     `json:"detail,omitempty"`
-	Key       string     `json:"key,omitempty"`
-	Expected  *Integrity `json:"expected,omitempty"`
-	Observed  *Integrity `json:"observed,omitempty"`
-	PinnedBy  string     `json:"pinned_by,omitempty"`
-	PinSource *Source    `json:"pin_source,omitempty"`
-}
-
-// Decide compares the artifact the manager will install (observed) and the
-// artifact the policy origin serves (fetched) against the pins for the exact
-// identity. fetched may be nil when the observed artifact already comes
-// straight from the origin.
-func (v *View) Decide(m Match, version string, observed, fetched *Integrity) Decision {
-	if m.Lane != "private" {
-		return Decision{Decision: "invalid", Detail: "not on the private lane"}
-	}
-	key := PinKey(m.Ecosystem, m.Origin, m.Name, version)
-	d := Decision{Key: key}
-	if !ExactVersion(m.Ecosystem, version) {
-		d.Decision, d.Detail = "invalid", "not an exact version"
-		return d
-	}
-	if observed == nil {
-		d.Decision, d.Detail = "invalid", "no observed integrity"
-		return d
-	}
-	obs, err := ValidateIntegrity(m.Ecosystem, *observed)
-	if err != nil {
-		d.Decision, d.Detail = "invalid", err.Error()
-		return d
-	}
-	d.Observed = &obs
-	if fetched != nil {
-		f, err := ValidateIntegrity(m.Ecosystem, *fetched)
-		if err != nil {
-			d.Decision, d.Detail = "invalid", err.Error()
-			return d
-		}
-		if !IntegrityEqual(m.Ecosystem, obs, f) {
-			d.Decision = "cross_registry"
-			d.Detail = "the artifact the package manager will install is not the one the private origin serves"
-			d.Expected = &f
-			return d
+// Registries returns the effective registries of one ecosystem, in view order
+// (local first, then followed origins).
+func (v *View) Registries(eco string) []ListEntry {
+	var out []ListEntry
+	for _, r := range v.registries {
+		if r.Ecosystem == eco {
+			out = append(out, ListEntry{ID: r.Source.RegistryID, Ecosystem: r.Ecosystem,
+				Origin: r.Origin, Namespace: r.Namespace, Source: r.Source})
 		}
 	}
-	pins := v.pins[key]
-	for _, p := range pins {
-		if p.Revoked {
-			s := p.Source
-			d.Decision, d.PinSource = "revoked", &s
-			d.Detail = "this exact version was revoked"
-			return d
-		}
-	}
-	var followed, localOperator, localTOFU []sourcedPin
-	for _, p := range pins {
-		switch {
-		case p.Source.Kind == KindFollowed:
-			followed = append(followed, p)
-		case p.PinnedBy == PinModeOperator:
-			localOperator = append(localOperator, p)
-		default:
-			localTOFU = append(localTOFU, p)
-		}
-	}
-	for i := 1; i < len(followed); i++ {
-		if !IntegrityEqual(m.Ecosystem, followed[0].Integrity, followed[i].Integrity) {
-			d.Decision = "conflict"
-			d.Detail = fmt.Sprintf("signed statements from %s and %s pin different bytes", followed[0].Source.Host, followed[i].Source.Host)
-			return d
-		}
-	}
-	if len(followed) > 0 && len(localOperator) > 0 && !IntegrityEqual(m.Ecosystem, followed[0].Integrity, localOperator[0].Integrity) {
-		d.Decision = "conflict"
-		d.Detail = fmt.Sprintf("the local operator pin and the signed statement from %s pin different bytes", followed[0].Source.Host)
-		return d
-	}
-	var auth *sourcedPin
-	switch {
-	case len(followed) > 0:
-		auth = &followed[0]
-	case len(localOperator) > 0:
-		auth = &localOperator[0]
-	case len(localTOFU) > 0:
-		auth = &localTOFU[0]
-	}
-	if auth == nil {
-		if m.PinMode == PinModeOperator {
-			d.Decision, d.Detail = "missing", "registry requires an operator pin for each version"
-			return d
-		}
-		d.Decision = "tofu"
-		return d
-	}
-	exp := auth.Integrity
-	src := auth.Source
-	d.Expected, d.PinnedBy, d.PinSource = &exp, auth.PinnedBy, &src
-	if IntegrityEqual(m.Ecosystem, obs, exp) {
-		d.Decision = "matched"
-		return d
-	}
-	d.Decision = "changed"
-	d.Detail = "the artifact differs from the one pinned for this exact version"
-	return d
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,78 +679,91 @@ func MatchPrefixPatterns(globs, target string) bool {
 	return false
 }
 
-// GoRoute reports whether `go` would fetch module from origin: GONOPROXY
-// (defaulting to GOPRIVATE) must not send it direct, and the first GOPROXY
-// entry must be the policy origin. Returns "" when routed through origin.
-func GoRoute(module, origin, goproxy, gonoproxy, goprivate string) string {
+// GoRouteResult is where `go` would fetch a module path from.
+type GoRouteResult struct {
+	OK     bool   `json:"ok"`
+	Local  bool   `json:"local,omitempty"` // only file:// sources (or none) serve it
+	Route  string `json:"route,omitempty"` // the GOPROXY entries up to and including the origin
+	Reason string `json:"reason,omitempty"`
+}
+
+// GoRoute reports whether `go` would fetch modules under the module path
+// prefix ns from origin. GONOPROXY (defaulting to GOPRIVATE) must not send any
+// path of ns to its VCS directly. GOPROXY is walked in order: a file:// entry
+// is a local source (a local artifact, not a substitution) and the walk
+// continues past it, because go falls through when the local tree lacks a
+// version; the first other entry must be the origin. A list that ends (or
+// reaches off) after only file:// entries is local-only.
+func GoRoute(ns, origin, goproxy, gonoproxy, goprivate string) GoRouteResult {
 	noproxy := gonoproxy
 	if noproxy == "" {
 		noproxy = goprivate
 	}
-	if MatchPrefixPatterns(noproxy, module) {
-		return "GONOPROXY/GOPRIVATE sends this module to its VCS directly, not through the private registry"
+	if patternsReach(noproxy, ns) {
+		return GoRouteResult{Reason: "GONOPROXY/GOPRIVATE sends " + ns + " modules to their VCS directly, not through the private registry"}
 	}
-	if goproxy == "" {
+	if strings.TrimSpace(goproxy) == "" {
 		goproxy = "https://proxy.golang.org,direct"
 	}
-	first := goproxy
-	if i := strings.IndexAny(first, ",|"); i >= 0 {
-		first = first[:i]
-	}
-	first = strings.TrimSpace(first)
-	switch first {
-	case "off":
-		return "GOPROXY=off: module downloads are disabled"
-	case "direct", "":
-		return "GOPROXY does not list the private registry first"
-	}
-	if CanonicalURL(first) == "" || CanonicalURL(first) != CanonicalURL(origin) {
-		return "GOPROXY does not list the private registry first"
-	}
-	return ""
-}
-
-// GoSumEntry is one module version's hashes from go.sum.
-type GoSumEntry struct {
-	Module  string `json:"module"`
-	Version string `json:"version"`
-	H1      string `json:"h1,omitempty"`
-	Mod     string `json:"mod,omitempty"`
-}
-
-// ParseGoSum reads go.sum lines into per-version entries, sorted.
-func ParseGoSum(raw []byte) ([]GoSumEntry, error) {
-	idx := map[string]*GoSumEntry{}
-	for n, line := range strings.Split(string(raw), "\n") {
-		f := strings.Fields(line)
-		if len(f) == 0 {
+	var walked []string
+	for _, e := range strings.FieldsFunc(goproxy, func(r rune) bool { return r == ',' || r == '|' }) {
+		e = strings.TrimSpace(e)
+		if e == "" {
 			continue
 		}
-		if len(f) != 3 || !h1Re.MatchString(f[2]) {
-			if len(f) == 3 && !strings.HasPrefix(f[2], "h1:") {
-				continue // future hash algorithms: not ours to judge
+		if strings.HasPrefix(strings.ToLower(e), "file://") {
+			walked = append(walked, e)
+			continue
+		}
+		if e == "off" {
+			return GoRouteResult{OK: true, Local: true, Route: strings.Join(append(walked, "off"), ",")}
+		}
+		if e == "direct" {
+			return GoRouteResult{Reason: "GOPROXY sends " + ns + " modules to their VCS (direct) before the private registry"}
+		}
+		if c := CanonicalURL(e); c != "" && c == CanonicalURL(origin) {
+			return GoRouteResult{OK: true, Route: strings.Join(append(walked, c), ",")}
+		}
+		return GoRouteResult{Reason: "GOPROXY lists " + redactURL(e) + " ahead of the private registry"}
+	}
+	return GoRouteResult{OK: true, Local: true, Route: strings.Join(walked, ",")}
+}
+
+// patternsReach reports whether any GONOPROXY/GOPRIVATE pattern matches the
+// prefix ns itself or some path below it.
+func patternsReach(globs, ns string) bool {
+	if MatchPrefixPatterns(globs, ns) {
+		return true
+	}
+	nsElems := strings.Split(ns, "/")
+	for _, g := range strings.Split(globs, ",") {
+		g = strings.TrimSuffix(strings.TrimSpace(g), "/")
+		if g == "" {
+			continue
+		}
+		ge := strings.Split(g, "/")
+		if len(ge) <= len(nsElems) {
+			continue
+		}
+		reach := true
+		for i, e := range nsElems {
+			if ok, _ := path.Match(ge[i], e); !ok {
+				reach = false
+				break
 			}
-			return nil, fmt.Errorf("go.sum line %d is malformed", n+1)
 		}
-		mod, ver, isMod := f[0], f[1], false
-		if strings.HasSuffix(ver, "/go.mod") {
-			ver, isMod = strings.TrimSuffix(ver, "/go.mod"), true
-		}
-		k := mod + "@" + ver
-		e := idx[k]
-		if e == nil {
-			e = &GoSumEntry{Module: mod, Version: ver}
-			idx[k] = e
-		}
-		if isMod {
-			e.Mod = f[2]
-		} else {
-			e.H1 = f[2]
+		if reach {
+			return true
 		}
 	}
-	out := make([]GoSumEntry, 0, len(idx))
-	for _, k := range sortedKeys(idx) {
-		out = append(out, *idx[k])
+	return false
+}
+
+// redactURL drops any userinfo from a proxy URL before it is printed.
+func redactURL(raw string) string {
+	if u, err := url.Parse(raw); err == nil && u.User != nil {
+		u.User = nil
+		return u.String()
 	}
-	return out, nil
+	return raw
 }

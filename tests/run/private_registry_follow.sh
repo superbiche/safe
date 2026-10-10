@@ -40,16 +40,14 @@ chmod 700 "$GNUPGHOME"
 export PATH="$tmp/bin:$PATH"
 SYNC="$HOME/Sync/state/safe"
 NPM_ORIGIN="https://git.example.test:8443/api/packages/owner/npm"
-SRI_A="sha512-$(printf 'A%.0s' {1..86})=="
-SRI_B="sha512-$(printf 'B%.0s' {1..86})=="
-export NPM_ORIGIN SRI_A
+export NPM_ORIGIN
 
 set_host() { printf '#!/usr/bin/env bash\nprintf "%s\\n"\n' "$1" > "$tmp/bin/hostname"; chmod +x "$tmp/bin/hostname"; }
+# npm answers `config get <scope>:registry` (the lane's only question).
 cat > "$tmp/bin/npm" <<'NPM'
 #!/usr/bin/env bash
-spec="$2"; version="${spec##*@}"
-printf '{"version":"%s","dist":{"tarball":"%s/@p%%2fx/-/%s/x-%s.tgz","integrity":"%s"},"time":{}}\n' \
-  "$version" "$NPM_ORIGIN" "$version" "$version" "${FAKE_SRI:-$SRI_A}"
+[[ "$1 $2" == "config get" ]] && printf '%s\n' "${FAKE_NPM_SCOPE_REG-$NPM_ORIGIN/}"
+exit 0
 NPM
 chmod +x "$tmp/bin/npm"
 printf '@p:registry=%s/\n' "$NPM_ORIGIN" > "$HOME/.npmrc"
@@ -67,7 +65,6 @@ signers() { # signing key + pinned signers
   jq -n --arg k "$fpr" --args '{follow: {signing_key: $k, signers: $ARGS.positional}}' "$@" > "$config"
 }
 policy="$SAFE_RUN_CONFIG_DIR/private-registries.json"
-pins="$SAFE_RUN_CONFIG_DIR/private-pins.json"
 ledger="$SAFE_RUN_CONFIG_DIR/private-follow-state.json"
 gate() { # spec -> rc
   local rc=0
@@ -86,12 +83,10 @@ pty_run "$RUN" private-registry add p-npm --ecosystem npm --origin "$NPM_ORIGIN"
 statement="$SYNC/private-registries.rainbow.json"
 [[ -s "$statement" && -s "$statement.asc" ]] || fail "an origin add did not publish the signed statement: $(cat "$tmp/out")"
 gpg --no-options --batch --verify "$statement.asc" "$statement" > /dev/null 2>&1 || fail "statement signature"
-jq -e '.schema == "safe-private-registries-export/1" and .host == "rainbow" and (.registries["p-npm"].namespace == ["@p/*"])' "$statement" >/dev/null \
+jq -e '.schema == "safe-private-registries-export/2" and .host == "rainbow" and (.registries["p-npm"].namespace == ["@p/*"]) and (has("pins") | not)' "$statement" >/dev/null \
   || fail "statement shape: $(cat "$statement")"
 rc=0; "$RUN" private-registry export --sign > "$tmp/out" 2>&1 </dev/null || rc=$?
 [[ "$rc" == 102 ]] || fail "signed export without a terminal: rc=$rc"
-pty_run "$RUN" private-registry pin add @p/x@1.0.0 --ecosystem npm > "$tmp/out" 2>&1 || fail "origin pin add: $(cat "$tmp/out")"
-jq -e --arg s "$SRI_A" '.pins | to_entries | length == 1 and .[0].value.integrity.sri == $s' "$statement" >/dev/null || fail "pin not republished"
 ! grep -q '_authToken\|password\|token' "$statement" || fail "statement carries credential-shaped fields"
 pass "an origin publishes its private-registry statement with every TTY change; export --sign needs a terminal"
 cp "$statement" "$tmp/statement-gen1.json"; cp "$statement.asc" "$tmp/statement-gen1.json.asc"
@@ -105,16 +100,16 @@ signers "$fpr"
 grep -q 'would follow private registries from rainbow' "$tmp/out" || fail "dry run did not report: $(cat "$tmp/out")"
 [[ ! -e "$ledger" ]] || fail "dry run wrote the ledger"
 "$RUN" host-allow follow > "$tmp/out" 2>&1 || fail "follow: $(cat "$tmp/out")"
-jq -e '.origins.rainbow.registries["p-npm"] and (.origins.rainbow.pins | length == 1)' "$ledger" >/dev/null || fail "ledger: $(cat "$ledger" 2>/dev/null)"
-[[ ! -e "$policy" && ! -e "$pins" ]] || fail "follow wrote into the local stores"
+jq -e '.origins.rainbow.registries["p-npm"] and (.origins.rainbow | has("pins") | not)' "$ledger" >/dev/null || fail "ledger: $(cat "$ledger" 2>/dev/null)"
+[[ ! -e "$policy" ]] || fail "follow wrote into the local stores"
 r=$(gate @p/x@1.0.0)
-[[ "$r" == 18 ]] && jq -e '.private_registry.pin == "matched:operator:followed:rainbow"' "$tmp/result.json" >/dev/null \
+[[ "$r" == 18 ]] && jq -e '.private_registry.sources == ["followed:rainbow"] and (.private_registry.audit_extra | contains("name=@p/x version=1.0.0"))' "$tmp/result.json" >/dev/null \
   || fail "followed gate: rc=$r $(cat "$tmp/out")"
-r=$(FAKE_SRI="$SRI_B" gate @p/x@1.0.0)
-[[ "$r" == 20 ]] || fail "followed pin vs other bytes: $r"
+r=$(FAKE_NPM_SCOPE_REG=https://registry.npmjs.org/ gate @p/x@1.0.0)
+[[ "$r" == 20 ]] || fail "followed registry with the scope mapped elsewhere: $r"
 "$RUN" host-allow follow > "$tmp/out" 2>&1 || fail "second follow"
 grep -q 'already at the current generation' "$tmp/out" || fail "equal generation not a no-op: $(cat "$tmp/out")"
-pass "a follower takes the statement through host-allow follow into its ledger only; the followed pin decides (18 / 20)"
+pass "a follower takes the statement through host-allow follow into its ledger only; the followed registry decides by origin (18 / 20)"
 
 # signer removal withdraws at once, without a follow
 signers
@@ -141,19 +136,19 @@ rc=0; "$RUN" host-allow follow > "$tmp/out" 2>&1 || rc=$?
 [[ "$rc" == 1 ]] && grep -q 'collision' "$tmp/out" && cmp -s "$ledger" "$tmp/ledger.before" || fail "collision: rc=$rc $(cat "$tmp/out")"
 pass "tampered, foreign-signed, unsigned and same-generation-collision statements are refused (exit 1) and change nothing"
 
-# a newer generation replaces: removal at the origin propagates
+# a newer generation replaces: changes at the origin propagate
 set_host rainbow
 mv "$SAFE_RUN_CONFIG_DIR" "$tmp/follower-config"; mv "$tmp/origin-config" "$SAFE_RUN_CONFIG_DIR"
 cp "$tmp/statement-gen1.json" "$statement"; cp "$tmp/statement-gen1.json.asc" "$statement.asc"
 sleep 1
-printf '@p/x@1.0.0\n' | pty_run "$RUN" private-registry pin revoke @p/x@1.0.0 --ecosystem npm > "$tmp/out" 2>&1 || fail "origin revoke: $(cat "$tmp/out")"
+pty_run "$RUN" private-registry add q-npm --ecosystem npm --origin "$NPM_ORIGIN" --namespace '@q/*' --reason "second scope" > "$tmp/out" 2>&1 || fail "origin second add: $(cat "$tmp/out")"
 cp "$statement" "$tmp/statement-gen2.json"; cp "$statement.asc" "$tmp/statement-gen2.json.asc"
 set_host agent-dev
 mv "$SAFE_RUN_CONFIG_DIR" "$tmp/origin-config"; mv "$tmp/follower-config" "$SAFE_RUN_CONFIG_DIR"
 "$RUN" host-allow follow > "$tmp/out" 2>&1 || fail "follow gen2: $(cat "$tmp/out")"
-r=$(gate @p/x@1.0.0)
-[[ "$r" == 20 ]] && jq -e '.private_registry.decision == "private_pin_revoked"' "$tmp/result.json" >/dev/null || fail "revocation did not propagate: rc=$r"
-pass "a revocation at the origin propagates to followers (20)"
+r=$(gate @q/y@2.0.0)
+[[ "$r" == 18 ]] || fail "a registry added at the origin did not propagate: rc=$r $(cat "$tmp/out")"
+pass "a registry added at the origin propagates to followers with the next statement"
 
 cp "$tmp/statement-gen1.json" "$statement"; cp "$tmp/statement-gen1.json.asc" "$statement.asc"
 rc=0; "$RUN" host-allow follow > "$tmp/out" 2>&1 || rc=$?
@@ -168,14 +163,14 @@ pty_run "$RUN" private-registry remove p-npm > "$tmp/out" 2>&1 || fail "origin r
 set_host agent-dev
 mv "$SAFE_RUN_CONFIG_DIR" "$tmp/origin-config"; mv "$tmp/follower-config" "$SAFE_RUN_CONFIG_DIR"
 "$RUN" host-allow follow > "$tmp/out" 2>&1 || fail "follow gen3: $(cat "$tmp/out")"
-rc=0; "$AUDIT" private-fetch @p/x@1.0.0 --ecosystem npm > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 3 ]] || fail "registry removed at the origin still private on the follower: rc=$rc"
+lane=$("$tmp/safe-core" private-trust match --policy "$policy" --follow-state "$ledger" --config "$config" --ecosystem npm --name @p/x | jq -r .lane)
+[[ "$lane" == none ]] || fail "registry removed at the origin still private on the follower: $lane"
 pass "a registry removed at the origin is withdrawn from followers by the newer statement"
 
 # a local registry for the same namespace on another origin conflicts
 cp "$tmp/statement-gen2.json" "$tmp/s2.json"
 "$tmp/safe-core" private-trust forget-origin --follow-state "$ledger" --host rainbow || fail "forget-origin"
-jq -n --arg o "$NPM_ORIGIN" '{schema: "safe-private-registries/1", registries: {"local": {ecosystem: "npm", origin: "https://other.example.test/npm", namespace: ["@p/*"], pin_mode: "tofu", cooldown_days: 0}}}' > "$policy"
+jq -n '{schema: "safe-private-registries/2", registries: {"local": {ecosystem: "npm", origin: "https://other.example.test/npm", namespace: ["@p/*"]}}}' > "$policy"
 cp "$tmp/statement-gen2.json" "$statement"; cp "$tmp/statement-gen2.json.asc" "$statement.asc"
 "$RUN" host-allow follow > /dev/null 2>&1 || fail "re-follow gen2"
 r=$(gate @p/x@1.0.0)

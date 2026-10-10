@@ -256,21 +256,21 @@ composer update
 Non-install and non-exec commands pass through unchanged.
 
 When an operator-authorized private registry exists, project operations also
-decide every private identity they can materialize before delegating:
-npm `install|ci|update|dedupe|prune` sweep the lockfile (`ci`) or its
-`--package-lock-only` projection (projected whenever an npm private registry
-is configured), and `go build|test|vet|list`, a local `go run`/`go install`
-and the downloading `go mod` commands check the private modules of the
-module context Go selects (module root, `-modfile`, `go.work`; a missing sum
-is never authorization; `go mod tidy` and `-mod=mod` ask first about a
-private import no requirement pins). Each private identity logs
-`ALLOWED_VIA_PRIVATE_REGISTRY` or reaches the private termini 19/20; pnpm,
-yarn and bun projects naming a private package ask the operator. On Python
-installs the gate threads the installer's own `--no-deps`, whether pip reads
-its settings (not under `--isolated`), and how uv selects its configuration
-(an explicit `--config-file`, `UV_CONFIG_FILE`, `--directory` or
-`--project`; discovery unless `--no-config`). With no private registry
-configured this costs one file test. See [private registries](private-registries.md).
+check the origin binding of their private identities before delegating
+(trusted origins): npm `install|ci|update|dedupe|prune` check that every
+registered scope maps to its origin and that every private lockfile entry
+resolves there, and `go build|test|vet|list`, a local `go run`/`go install`
+and the downloading `go mod` commands check that `go env` routes every
+registered namespace to its origin (local `file://` sources may come first).
+Each private identity logs `ALLOWED_VIA_PRIVATE_REGISTRY` or reaches the
+private termini 19/20; pnpm, yarn and bun projects naming a private package
+ask the operator. Explicit `pip install` / `uv pip install` specs carry
+`--python-isolated`: when the lane allows a private name the delegate runs
+with its configuration switched off and its source environment dropped, so
+the argv sources the lane checked are the installer's whole source set;
+`uv --config-file` is flagged; a requirements file naming a private package
+asks. With no private registry configured this costs one file test. See
+[private registries](private-registries.md).
 
 ## Wrapped Exec and Update Commands
 

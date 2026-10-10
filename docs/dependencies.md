@@ -20,13 +20,11 @@ uses by downloading and running upstream installers on the user's behalf.
 | pip-audit | Python vulnerability checks | <https://github.com/pypa/pip-audit> |
 
 The private-registry lane ([private registries](private-registries.md)) runs no
-scanner: it asks the ecosystem's own client (`npm view` and an
-`npm --package-lock-only` projection in a scratch copy, `go mod edit -json`,
-`go work edit -json`, `go env`, `go list -mod=readonly` with `GOPROXY=off`
-and `go mod download` with a scratch cache, `curl --netrc-optional`
-for PyPI simple pages) for the identities an operation can materialize and
-the integrity a private registry serves, so the client's own credentials
-apply and safe never handles them.
+scanner: it asks the ecosystem's own client where it would fetch a private
+name from (`npm config get`, `go env`, and `go mod edit -json` for the audit
+line) and probes other Python indexes for a namesake with
+`curl --netrc-optional`, so the client's own credentials apply and safe never
+handles them.
 
 Install these tools through a channel you trust. That may be an OS package
 manager, a pinned release asset, a source build you reviewed, or an internal

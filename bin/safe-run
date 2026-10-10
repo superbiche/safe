@@ -1646,21 +1646,20 @@ handle_runner_invocation() {
 # ---------------------------------------------------------------------------
 # Subcommands: host-allow
 # ---------------------------------------------------------------------------
-# A name on a private-registry lane takes its integrity from that registry
-# (safe audit private-fetch, through the ecosystem's own client) and NEVER
-# falls back to the public registry, where the same name would be another
-# artifact. Prints the integrity and returns 0; returns 2 when the name is
-# not private; 1 when the private registry could not vouch for the version.
+# A name on a private-registry lane is trusted by its origin (ruling a37):
+# a host-allow pin cannot add anything, and the public registry's integrity
+# would describe another artifact with the same name. Returns 2 when the
+# name is not private; otherwise says why and returns 1.
 private_integrity_for_host_allow() {
-  local eco="$1" pkg="$2" version="$3" out rc=0
-  out=$("$SAFE_AUDIT_BIN" private-fetch "${pkg}@${version}" --ecosystem "$eco" 2>/dev/null) || rc=$?
-  case "$rc" in
-    0)
-      jq -r '.integrity | .sri // ((.files // {}) | to_entries | sort_by(.key) | first | "sha256-" + .value) // empty' <<<"$out"
-      ;;
-    3) return 2 ;;
-    *) return 1 ;;
+  local eco="$1" pkg="$2" lane
+  [[ -s "$(trust_store_file private-registries.json)" || -s "$(trust_store_file private-follow-state.json)" ]] || return 2
+  lane=$(private_core match --ecosystem "$eco" --name "$pkg" 2>/dev/null | jq -r '.lane // "none"' 2>/dev/null) || lane=""
+  case "$lane" in
+    none) return 2 ;;
+    private) err "$pkg is on a private-registry lane: installs from its origin are trusted already, so a host-allow pin adds nothing" ;;
+    *) err "$pkg could not be checked against the private-registry trust (malformed stores or conflicting origins); not pinned" ;;
   esac
+  return 1
 }
 
 registry_integrity_npm() {
@@ -2787,21 +2786,19 @@ cmd_host_allow_follow() (
 # ---------------------------------------------------------------------------
 # Subcommands: private-registry
 #
-# Operator-managed trust for owner-controlled private registries. A registry
-# declares that a namespace resolves ONLY from one canonical origin; the
-# install gate then binds every install of that namespace to the origin and
-# to the integrity pinned for the exact version (recorded on first use, or by
-# the operator here). The decision core is safe-core private-trust; the
-# fetchers live in safe-audit (private-fetch) and run each ecosystem's own
-# client, so safe never handles a registry credential.
+# Operator-managed trust for owner-controlled private registries (trusted
+# origins, ruling a37). A registry declares that a namespace resolves ONLY
+# from one canonical origin; the install gate trusts a package of that
+# namespace like a local artifact when the package manager would fetch it
+# from that origin, and blocks it otherwise. There is no per-version pin. The
+# decision core is safe-core private-trust; safe never handles a registry
+# credential.
 #
-# Registry and pin changes are operator-TTY only, refused on a redirected
-# trust root, and logged. A host that publishes a signed export republishes
+# Registry changes are operator-TTY only, refused on a redirected trust root,
+# and logged. A host that publishes a signed export republishes
 # its private-registry statement in the same gesture; followers take it
 # through `safe run host-allow follow` (or `private-registry follow`).
 # ---------------------------------------------------------------------------
-
-PRIVATE_STATEMENT_SCHEMA="safe-private-registries-export/1"
 
 private_core_path() {
   local bin="${SAFE_CORE_BIN:-}"
@@ -2818,7 +2815,6 @@ private_core() {
   shift
   "$(private_core_path)" private-trust "$sub" \
     --policy "$(trust_store_file private-registries.json)" \
-    --pins "$(trust_store_file private-pins.json)" \
     --follow-state "$(trust_store_file private-follow-state.json)" \
     --config "$(trust_store_file config.json)" "$@"
 }
@@ -2839,20 +2835,6 @@ private_eco_canonical() {
     py|python|pip|pypi|uv|pipx) printf 'python' ;;
     *) return 1 ;;
   esac
-}
-
-# Split <name>@<version>; scoped npm names keep their leading @.
-private_split_spec() {
-  local spec="$1"
-  local body="$spec" lead=""
-  if [[ "$body" == @* ]]; then
-    lead="@"
-    body="${body#@}"
-  fi
-  [[ "$body" == *@* ]] || return 1
-  PRIVATE_SPEC_NAME="${lead}${body%@*}"
-  PRIVATE_SPEC_VERSION="${body##*@}"
-  [[ -n "$PRIVATE_SPEC_NAME" && "$PRIVATE_SPEC_NAME" != "@" && -n "$PRIVATE_SPEC_VERSION" ]]
 }
 
 # A host is an origin when it already publishes a signed export.
@@ -2880,30 +2862,26 @@ cmd_private_registry() {
     add) cmd_private_registry_add "$@" ;;
     remove|rm) cmd_private_registry_remove "$@" ;;
     list|ls) cmd_private_registry_list "$@" ;;
-    pins) cmd_private_registry_pins "$@" ;;
-    pin) cmd_private_registry_pin "$@" ;;
     export) cmd_private_registry_export "$@" ;;
     follow) cmd_private_registry_follow "$@" ;;
     forget-origin) cmd_private_registry_forget_origin "$@" ;;
-    *) die "unknown private-registry subcommand: $sub (add|remove|list|pins|pin|export|follow|forget-origin)" ;;
+    *) die "unknown private-registry subcommand: $sub (add|remove|list|export|follow|forget-origin)" ;;
   esac
 }
 
 cmd_private_registry_add() {
   trust_redirected_guard write "private-registry-add"
   local id="${1:-}"
-  [[ -n "$id" && "$id" != -* ]] || die 'usage: safe run private-registry add <id> --ecosystem npm|go|python --origin <https-url> --namespace <ns> [--namespace <ns>]... [--pin-mode tofu|operator] [--cooldown-days N] [--owner <owner>] --reason "..."'
+  [[ -n "$id" && "$id" != -* ]] || die 'usage: safe run private-registry add <id> --ecosystem npm|go|python --origin <https-url> --namespace <ns> [--namespace <ns>]... [--owner <owner>] --reason "..."'
   shift
   require_operator_tty_private "add $id ..."
-  local ecosystem="" origin="" pin_mode="" cooldown="" owner="" reason=""
+  local ecosystem="" origin="" owner="" reason=""
   local -a ns_args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --ecosystem) ecosystem="${2:-}"; shift 2 ;;
       --origin) origin="${2:-}"; shift 2 ;;
       --namespace) ns_args+=(--namespace "${2:-}"); shift 2 ;;
-      --pin-mode) pin_mode="${2:-}"; shift 2 ;;
-      --cooldown-days) cooldown="${2:-}"; shift 2 ;;
       --owner) owner="${2:-}"; shift 2 ;;
       --reason) reason="${2:-}"; shift 2 ;;
       *) die "unknown flag: $1" ;;
@@ -2913,16 +2891,15 @@ cmd_private_registry_add() {
   [[ -n "$origin" ]] || die "--origin is required"
   (( ${#ns_args[@]} > 0 )) || die "--namespace is required"
   [[ -n "${reason// /}" ]] || die "--reason is required"
-  [[ -n "$cooldown" ]] || cooldown=0
   [[ "$SAFE_RUN_NO_INIT" == "1" ]] || ensure_dirs
   local out
   out=$(private_core registry-add --id "$id" --ecosystem "$ecosystem" --origin "$origin" "${ns_args[@]}" \
-    --pin-mode "${pin_mode:-tofu}" --cooldown-days "$cooldown" --owner "$owner" \
+    --owner "$owner" \
     --added "$(date -I)" --reason "$reason" 2>&1) || die "${out#safe-core: private-trust registry-add: }"
   audit_log "private-registry" "$id" "TRUST" "$(context_label)" "PRIVATE_REGISTRY_ADDED" \
-    "ecosystem=$ecosystem origin=$(jq -r '.origin' <<<"$out") namespace=$(jq -r '.namespace | join(",")' <<<"$out") pin_mode=$(jq -r '.pin_mode' <<<"$out")"
-  info "added private registry $id: $(jq -r '"\(.ecosystem) \(.origin) namespace \(.namespace | join(", ")) pin_mode \(.pin_mode) cooldown \(.cooldown_days)d"' <<<"$out")"
-  info "installs of that namespace now bind to this origin; package-manager credentials stay in the manager's own config (npm .npmrc, go GOAUTH/netrc, pip netrc)"
+    "ecosystem=$ecosystem origin=$(jq -r '.origin' <<<"$out") namespace=$(jq -r '.namespace | join(",")' <<<"$out")"
+  info "added private registry $id: $(jq -r '"\(.ecosystem) \(.origin) namespace \(.namespace | join(", "))"' <<<"$out")"
+  info "installs of that namespace fetched from this origin are now trusted without public audit, and any other source for it is blocked; package-manager credentials stay in the manager's own config (npm .npmrc, go GOAUTH/netrc, pip netrc)"
   private_registry_auto_export
 }
 
@@ -2934,7 +2911,7 @@ cmd_private_registry_remove() {
   local out
   out=$(private_core registry-remove --id "$id" 2>&1) || die "${out#safe-core: private-trust registry-remove: }"
   audit_log "private-registry" "$id" "TRUST" "$(context_label)" "PRIVATE_REGISTRY_REMOVED"
-  info "removed private registry $id (its pins stay as inert history)"
+  info "removed private registry $id"
   private_registry_auto_export
 }
 
@@ -2950,84 +2927,12 @@ cmd_private_registry_list() {
   if [[ "$(jq '.registries | length' <<<"$out")" == "0" ]]; then
     info "no private registries"
   else
-    jq -r '.registries[] | "\(.source.kind)\(if .source.host then " (" + .source.host + ")" else "" end)\t\(.id)\t\(.ecosystem)\t\(.origin)\t\(.namespace | join(","))\tpin_mode=\(.pin_mode)\tcooldown=\(.cooldown_days)d"' <<<"$out"
+    jq -r '.registries[] | "\(.source.kind)\(if .source.host then " (" + .source.host + ")" else "" end)\t\(.id)\t\(.ecosystem)\t\(.origin)\t\(.namespace | join(","))"' <<<"$out"
   fi
-  printf 'pins: %s local, %s followed\n' "$(jq -r '.local_pins' <<<"$out")" "$(jq -r '.followed_pins' <<<"$out")"
   if [[ "$(jq '.conflicts | length' <<<"$out")" != "0" ]]; then
     jq -r '.conflicts[] | "CONFLICT: " + .' <<<"$out" >&2
     return 1
   fi
-}
-
-cmd_private_registry_pins() {
-  local file
-  file=$(trust_store_file private-pins.json)
-  if [[ ! -s "$file" ]]; then
-    info "no local pins"
-    return 0
-  fi
-  if [[ "${1:-}" == "--json" ]]; then
-    cat -- "$file"
-    return 0
-  fi
-  jq -r '.pins // {} | to_entries[] | .value
-    | "\(.ecosystem)\t\(.name)@\(.version)\t\(.pinned_by)\(if .revoked then " REVOKED" else "" end)\t\(.origin)\t\(.integrity.sri // .integrity.h1 // ((.integrity.files // {}) | keys | join(",")))"' "$file" \
-    || die "malformed pin ledger: $file"
-}
-
-# pin add|replace|revoke <name>@<version> --ecosystem <eco>
-cmd_private_registry_pin() {
-  local action="${1:-}" spec="${2:-}"
-  [[ "$action" =~ ^(add|replace|revoke)$ && -n "$spec" ]] \
-    || die "usage: safe run private-registry pin add|replace|revoke <name>@<version> --ecosystem npm|go|python"
-  shift 2
-  trust_redirected_guard write "private-registry-pin-$action"
-  require_operator_tty_private "pin $action $spec --ecosystem ..."
-  local ecosystem=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --ecosystem) ecosystem="${2:-}"; shift 2 ;;
-      *) die "unknown flag: $1" ;;
-    esac
-  done
-  ecosystem=$(private_eco_canonical "$ecosystem") || die "--ecosystem must be npm, go or python"
-  private_split_spec "$spec" || die "pins name one exact version: <name>@<version>"
-  local name="$PRIVATE_SPEC_NAME" version="$PRIVATE_SPEC_VERSION" match origin
-  match=$(private_core match --ecosystem "$ecosystem" --name "$name" 2>&1) || die "${match#safe-core: private-trust match: }"
-  [[ "$(jq -r '.lane' <<<"$match")" == "private" ]] \
-    || die "$name is not on a private registry lane ($(jq -r '.lane' <<<"$match")); add the registry first: safe run private-registry add"
-  origin=$(jq -r '.origin' <<<"$match")
-  [[ "$SAFE_RUN_NO_INIT" == "1" ]] || ensure_dirs
-  local integrity="" artifact="" mode="$action"
-  if [[ "$action" != "revoke" ]]; then
-    local fetched rc=0
-    fetched=$("$SAFE_AUDIT_BIN" private-fetch "${name}@${version}" --ecosystem "$ecosystem") || rc=$?
-    case "$rc" in
-      0) ;;
-      41) die "the private registry $origin refused the request (credentials missing or rejected); configure the package manager's own credentials and retry" ;;
-      43) die "${name}@${version} is not published on $origin" ;;
-      44) die "$origin points ${name}@${version} at another source; not pinned" ;;
-      *) die "could not fetch ${name}@${version} from $origin (exit $rc); retry when the registry is reachable" ;;
-    esac
-    integrity=$(jq -c '.integrity' <<<"$fetched")
-    artifact=$(jq -r '.artifact // ""' <<<"$fetched")
-    version=$(jq -r '.version' <<<"$fetched")
-    info "${name}@${version} from ${origin}: $(jq -r '.sri // .h1 // ((.files // {}) | to_entries | map(.key + " sha256:" + .value) | join(", "))' <<<"$integrity")"
-  fi
-  if [[ "$action" == "replace" || "$action" == "revoke" ]]; then
-    local reply
-    printf 'safe: type %s@%s to %s this pin; anything else cancels: ' "$name" "$version" "$action" >&2
-    IFS= read -r reply </dev/tty || reply=""
-    [[ "$reply" == "${name}@${version}" ]] || die "cancelled"
-  fi
-  local out
-  out=$(private_core record --ecosystem "$ecosystem" --origin "$origin" --name "$name" --version "$version" \
-    ${integrity:+--integrity "$integrity"} ${artifact:+--artifact "$artifact"} --mode "$mode" 2>&1) \
-    || die "${out#safe-core: private-trust record: }"
-  audit_log "private-registry" "${name}@${version}" "TRUST" "$(context_label)" "PRIVATE_PIN_$(tr '[:lower:]' '[:upper:]' <<<"$action")" \
-    "ecosystem=$ecosystem origin=$origin${integrity:+ integrity=$(jq -r '.sri // .h1 // ((.files // {}) | to_entries | map(.key + "=sha256:" + .value) | join(","))' <<<"$integrity")}"
-  info "pin ${action}: ${name}@${version} ($ecosystem, $origin)"
-  private_registry_auto_export
 }
 
 cmd_private_registry_export() (
@@ -3067,7 +2972,7 @@ cmd_private_registry_export() (
 
 # Follow every other host's signed private-registry statement in the sync
 # directory. A newer generation REPLACES that origin's previous statement in
-# the local follow ledger (so its removals and revocations propagate); file
+# the local follow ledger (so its removals propagate); file
 # absence never revokes. Verification is the host-allow follow verifier.
 cmd_private_registry_follow() (
   trust_redirected_guard write "private-registry-follow"
@@ -3117,9 +3022,9 @@ cmd_private_registry_follow() (
           current=$((current + 1))
         else
           applied=$((applied + 1))
-          info "$( (( dry_run )) && printf 'would follow' || printf 'followed') private registries from $origin (generation $(jq -r '.generation' <<<"$out")): $(jq -r '.registries | join(", ")' <<<"$out"); $(jq -r '.pins' <<<"$out") pins"
+          info "$( (( dry_run )) && printf 'would follow' || printf 'followed') private registries from $origin (generation $(jq -r '.generation' <<<"$out")): $(jq -r '.registries | join(", ")' <<<"$out")"
           (( dry_run )) || audit_log "private-registry" "follow:$origin" "TRUST" "$(context_label)" "PRIVATE_STATEMENT_FOLLOWED" \
-            "generation=$(jq -r '.generation' <<<"$out") signer=$primary registries=$(jq -r '.registries | join(",")' <<<"$out") pins=$(jq -r '.pins' <<<"$out")"
+            "generation=$(jq -r '.generation' <<<"$out") signer=$primary registries=$(jq -r '.registries | join(",")' <<<"$out")"
         fi
         ;;
       5) warn "WARN private-registry follow: refused an older statement from $origin"; failures=$((failures + 1)) ;;

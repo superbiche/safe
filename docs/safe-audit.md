@@ -661,19 +661,16 @@ proceed:
   complete pinned command.
 - **Private registries (exits 18/19, BLOCK class `private`)**: a name in the
   namespace of an operator-authorized private registry never reaches public
-  evidence. It is bound to the registry's canonical origin and to the
-  integrity pinned for the exact version; exit 18 proceeds unattended and
-  names artifact and integrity, exit 19 needs an operator decision (102
-  unattended), and changed bytes, a revoked version or an artifact from
-  another source BLOCK with class `private` (never recordable). `safe audit
-  private-fetch <name>@<version> --ecosystem <eco>` prints the integrity the
-  registry serves; `safe audit private-npm-project` and `safe audit
-  private-gosum` are the npm-family and Go project lanes the wrappers run
-  before delegating (lockfile or projection sweep; the selected module
-  context's requirements plus its sums). `package-audit` takes the gate's
-  Python context flags `--find-links-selected`, `--no-deps-selected`,
-  `--pip-settings-apply` and `--uv-config explicit|ambient`. See
-  [private registries](private-registries.md).
+  evidence. It is a trusted origin (ruling a37): exit 18 proceeds unattended
+  when the package manager would fetch it from the registry's canonical
+  origin and names registry, origin, name and version; exit 19 needs an
+  operator decision (102 unattended); any other source BLOCKs with class
+  `private` (never recordable). `safe audit private-npm-project`,
+  `safe audit private-go` and `safe audit private-python-project` are the
+  npm-family, Go and requirements-file checks the wrappers run before
+  delegating. `package-audit` takes the gate's Python context flags
+  `--find-links-selected`, `--python-isolated` and
+  `--uv-config-file-selected`. See [private registries](private-registries.md).
 - **BLOCK** refuses (exit 20) and points at operator review. At an operator
   terminal, a BLOCK on one exact resolved version takes a typed override
   (`<pkg>@<version>` installs once; `record <pkg>@<version>` also records an

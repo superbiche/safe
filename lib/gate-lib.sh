@@ -48,9 +48,9 @@ SAFE_GATE_TOOL=""
 SAFE_GATE_NPM_USERCONFIG=""
 SAFE_GATE_NPM_GLOBALCONFIG=""
 SAFE_GATE_FIND_LINKS=0
-SAFE_GATE_NO_DEPS=0
-SAFE_GATE_PIP_SETTINGS=0
-SAFE_GATE_UV_CONFIG=""
+SAFE_GATE_PYTHON_ISOLATED=0
+SAFE_GATE_UV_CONFIG_FILE=0
+SAFE_GATE_PRIVATE_PY_ALLOWED=0
 SAFE_GATE_ENV_SCRUB=()
 
 safe_gate_err() {
@@ -252,7 +252,7 @@ safe_gate_exec_real() {
   # (PR#30 delta-2 finding P2). De-export all five before every delegate
   # exec — the audit child receives its values via argv flags, never env.
   export -n SAFE_GATE_DIST_TAG SAFE_GATE_REGISTRY SAFE_GATE_PROJECT_DIR \
-    SAFE_GATE_NPM_USERCONFIG SAFE_GATE_NPM_GLOBALCONFIG SAFE_GATE_FIND_LINKS SAFE_GATE_NO_DEPS SAFE_GATE_PIP_SETTINGS SAFE_GATE_UV_CONFIG 2>/dev/null || true
+    SAFE_GATE_NPM_USERCONFIG SAFE_GATE_NPM_GLOBALCONFIG SAFE_GATE_FIND_LINKS SAFE_GATE_PYTHON_ISOLATED SAFE_GATE_UV_CONFIG_FILE SAFE_GATE_PRIVATE_PY_ALLOWED 2>/dev/null || true
 
   # Environment names that are not valid shell identifiers (npm accepts
   # hyphenated npm_config_* keys) cannot be unset from bash: the scrub
@@ -381,15 +381,11 @@ safe_gate_run_audit() {
   # A find-links selector is a flat artifact source, not an index: the
   # private-registry lane cannot probe it for a namesake, so it must know.
   [[ "${SAFE_GATE_FIND_LINKS:-0}" == 1 ]] && extra+=(--find-links-selected)
-  # The private-registry lane allows an unattended install only when it
-  # fetches nothing beyond the checked root (python: the installer's own
-  # --no-deps; pip, outside --isolated, also honours PIP_NO_DEPS and pip
-  # config). uv's configuration files are sources the lane checks:
-  # `explicit` (a selected file or project directory) asks, `ambient` has
-  # safe-audit look for discovered uv config that sets sources.
-  [[ "${SAFE_GATE_NO_DEPS:-0}" == 1 ]] && extra+=(--no-deps-selected)
-  [[ "${SAFE_GATE_PIP_SETTINGS:-0}" == 1 ]] && extra+=(--pip-settings-apply)
-  [[ -n "${SAFE_GATE_UV_CONFIG:-}" ]] && extra+=(--uv-config "${SAFE_GATE_UV_CONFIG}")
+  # The private-registry lane trusts a private Python name only when the
+  # delegate runs with its configuration switched off (argv is then the
+  # whole source set): the explicit pip / uv pip install routes say so.
+  [[ "${SAFE_GATE_PYTHON_ISOLATED:-0}" == 1 ]] && extra+=(--python-isolated)
+  [[ "${SAFE_GATE_UV_CONFIG_FILE:-0}" == 1 ]] && extra+=(--uv-config-file-selected)
   # The npm lock-diff lane names the projected lockfile so the private-registry
   # lane can bind each private artifact's resolved origin and integrity.
   local artifact_lockfile="${SAFE_GATE_ARTIFACT_LOCKFILE:-}"
@@ -462,9 +458,8 @@ safe_gate_scan_target_flags() {
   SAFE_GATE_NPM_USERCONFIG=""
   SAFE_GATE_NPM_GLOBALCONFIG=""
   SAFE_GATE_FIND_LINKS=0
-  SAFE_GATE_NO_DEPS=0
-  SAFE_GATE_PIP_SETTINGS=0
-  SAFE_GATE_UV_CONFIG=""
+  SAFE_GATE_PYTHON_ISOLATED=0
+  SAFE_GATE_UV_CONFIG_FILE=0
   # The installer is set by the tool handler AFTER this reset (bun for the
   # bun wrapper and bun-selected mise npm installs); safe-audit defaults it
   # from the ecosystem otherwise.
@@ -3107,13 +3102,14 @@ safe_gate_private_terminus() {
   fi
   if [[ "${code}" == 18 ]]; then
     if [[ -z "${extra}" ]]; then
-      # An allow without its evidence line is not an allow: the audit line
-      # naming artifact and integrity is part of the contract.
+      # An allow without its audit line is not an allow: the line naming
+      # registry, origin, name and version is part of the contract.
       safe_gate_err "safe: BLOCKED ${label} of ${package} — the private-registry decision carried no evidence (audit-infrastructure breakage, not a package finding); rerun install.sh; details: safe explain"
       safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_AUDIT_INFRA"
       return 100
     fi
     safe_gate_audit_log "${ecosystem}" "${package}" "ALLOWED_VIA_PRIVATE_REGISTRY" "${extra}"
+    [[ "${ecosystem}" == python ]] && SAFE_GATE_PRIVATE_PY_ALLOWED=1
     return 0
   fi
   if ! safe_gate_operator_terminal; then
@@ -4404,8 +4400,8 @@ safe_gate_npm_like() {
   if (( project_present == 0 )); then
     safe_gate_scan_project || return $?
   fi
-  # Private-registry identities the operation can materialize (the public
-  # scan above does not know the private pins or revocations).
+  # Private-registry origin binding for the operation (the public scan above
+  # does not know which names are trusted origins).
   if [[ -f "${SAFE_GATE_PROJECT_DIR:-.}/package.json" ]]; then
     safe_gate_private_npm_project "${tool}" "${npm_class:-${subcommand}}" "$@" || return $?
   fi
@@ -4501,17 +4497,37 @@ safe_gate_yarn() {
   safe_gate_exec_real yarn "$@"
 }
 
-# The installer's own dependency switch, read from the install arguments
-# only (`pip install` / `uv pip install` options; a later program's argv is
-# never proof). pip spells it --no-deps or --no-dependencies.
-safe_gate_python_no_deps() {
-  local installer="$1" arg
-  shift
+# Isolate a Python delegate whose command installs a name the private-
+# registry lane allowed (trusted origin, ruling a37): no configuration file
+# and no source environment, so the argv sources the lane checked are the
+# installer's whole source set.
+safe_gate_python_isolate() {
+  local installer="$1"
+  (( SAFE_GATE_PRIVATE_PY_ALLOWED )) || return 0
+  case "${installer}" in
+    uv)
+      export UV_NO_CONFIG=1
+      unset UV_CONFIG_FILE UV_INDEX UV_INDEX_URL UV_EXTRA_INDEX_URL UV_DEFAULT_INDEX UV_FIND_LINKS UV_NO_INDEX
+      ;;
+    *)
+      export PIP_CONFIG_FILE=/dev/null
+      unset PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_FIND_LINKS PIP_NO_INDEX
+      ;;
+  esac
+}
+
+# Requirement and constraint files named on a pip / uv pip install command.
+safe_gate_python_requirement_files() {
+  local prev="" arg
   for arg in "$@"; do
-    case "${installer}:${arg}" in
-      *:--) return 0 ;;
-      *:--no-deps|pip:--no-dependencies) SAFE_GATE_NO_DEPS=1 ;;
+    case "${prev}" in
+      -r|--requirement|-c|--constraint) printf '%s\n' "${arg}" ;;
     esac
+    case "${arg}" in
+      --requirement=*|--constraint=*) printf '%s\n' "${arg#*=}" ;;
+      -r?*|-c?*) printf '%s\n' "${arg:2}" ;;
+    esac
+    prev="${arg}"
   done
 }
 
@@ -4526,9 +4542,11 @@ safe_gate_pip_like() {
   local extractor_out extractor_rc
 
   [[ "${subcommand}" == "install" || "${subcommand}" == "upgrade" ]] || safe_gate_exec_real "${tool}" "$@"
-  safe_gate_python_no_deps pip "${@:subidx+1}"
-  # pip reads PIP_NO_DEPS and its config files unless --isolated is given.
-  safe_gate_has_arg "--isolated" "$@" || SAFE_GATE_PIP_SETTINGS=1
+  local -a req_files=()
+  safe_gate_collect req_files "$(safe_gate_python_requirement_files "${@:subidx+1}")"
+  if (( ${#req_files[@]} > 0 )); then
+    safe_gate_private_project python-project python "${tool} ${subcommand}" -- "${req_files[@]}" || return $?
+  fi
 
   if safe_gate_pip_project_install "${@:subidx+1}"; then
     safe_gate_scan_project || return $?
@@ -4542,7 +4560,9 @@ safe_gate_pip_like() {
     safe_gate_exec_real "${tool}" "$@"
   fi
 
+  SAFE_GATE_PYTHON_ISOLATED=1
   safe_gate_check_many python "${packages[@]}" || return $?
+  safe_gate_python_isolate pip
   safe_gate_exec_real "${tool}" "$@"
 }
 
@@ -4557,16 +4577,11 @@ safe_gate_uv() {
   local second="${@:subidx+1:1}"
   local -a packages=()
   local extractor_out extractor_rc
-  # uv configuration can add indexes, find-links and sources. A selected
-  # file (--config-file, UV_CONFIG_FILE) or another discovery directory
-  # (--directory, --project) is not modelled; otherwise safe-audit checks the
-  # files uv discovers, unless --no-config / UV_NO_CONFIG turns them off.
-  if [[ -n "${UV_CONFIG_FILE:-}" ]] || safe_gate_has_arg "--config-file" "$@" || safe_gate_has_prefix_arg "--config-file=" "$@" \
-    || safe_gate_has_arg "--directory" "$@" || safe_gate_has_prefix_arg "--directory=" "$@" \
-    || safe_gate_has_arg "--project" "$@" || safe_gate_has_prefix_arg "--project=" "$@"; then
-    SAFE_GATE_UV_CONFIG="explicit"
-  elif ! safe_gate_has_arg "--no-config" "$@" && [[ -z "${UV_NO_CONFIG:-}" || "${UV_NO_CONFIG}" == 0 || "${UV_NO_CONFIG}" == false ]]; then
-    SAFE_GATE_UV_CONFIG="ambient"
+  # --config-file selects a whole uv configuration the private-registry
+  # lane does not model (UV_CONFIG_FILE is dropped from an isolated
+  # delegate).
+  if safe_gate_has_arg "--config-file" "$@" || safe_gate_has_prefix_arg "--config-file=" "$@"; then
+    SAFE_GATE_UV_CONFIG_FILE=1
   fi
 
   if [[ "${first}" == "sync" ]]; then
@@ -4657,7 +4672,11 @@ safe_gate_uv() {
   fi
 
   if [[ "${first}" == "pip" && "${second}" == "install" ]]; then
-    safe_gate_python_no_deps uv "${@:subidx+2}"
+    local -a req_files=()
+    safe_gate_collect req_files "$(safe_gate_python_requirement_files "${@:subidx+2}")"
+    if (( ${#req_files[@]} > 0 )); then
+      safe_gate_private_project python-project python "uv pip install" -- "${req_files[@]}" || return $?
+    fi
     if safe_gate_pip_project_install "${@:subidx+2}"; then
       safe_gate_scan_project || return $?
       safe_gate_exec_real uv "$@"
@@ -4670,7 +4689,9 @@ safe_gate_uv() {
       safe_gate_exec_real uv "$@"
     fi
 
+    SAFE_GATE_PYTHON_ISOLATED=1
     safe_gate_check_many python "${packages[@]}" || return $?
+    safe_gate_python_isolate uv
     safe_gate_exec_real uv "$@"
   fi
 
@@ -4720,48 +4741,43 @@ safe_gate_cargo() {
   safe_gate_exec_real cargo "$@"
 }
 
-# npm-family project lane of the private-registry trust: every private
-# identity an install/ci/update/dedupe/prune can materialize is decided
-# before delegation (safe audit private-npm-project). $1 tool, $2 subcommand
-# class (ci|install|update|lockdiff|...), then the manager argv after the
-# tool name. Exit codes map exactly like the go.sum lane.
-safe_gate_private_npm_project() {
-  local tool="$1" class="$2"
-  shift 2
-  local project_dir="${SAFE_GATE_PROJECT_DIR:-.}" result_out="" rc=0 package extra d any_store=0
+# Run one private-registry project check of safe audit (`private-<kind>`)
+# before delegation: 0 nothing private, 18 logs one audit line per private
+# identity, 19/20 reach the same termini as a package audit, anything else
+# is audit-infrastructure breakage. $1 kind, $2 ecosystem, $3 label, then the
+# check's own flags, `--`, and the manager argv.
+safe_gate_private_project() {
+  local kind="$1" ecosystem="$2" label="$3"
+  shift 3
+  local result_out="" rc=0 package extra d any_store=0
   for d in "$HOME/.config/safe/run" "$(safe_gate_run_config_dir)"; do
     [[ -s "${d}/private-registries.json" || -s "${d}/private-follow-state.json" ]] && any_store=1
   done
   (( any_store )) || return 0
-  [[ -f "${project_dir}/package.json" ]] || return 0
   safe_gate_audit_available || return 0
-  local -a cfg=()
-  [[ -n "${SAFE_GATE_NPM_USERCONFIG:-}" ]] && cfg+=(--npm-userconfig "${SAFE_GATE_NPM_USERCONFIG}")
-  [[ -n "${SAFE_GATE_NPM_GLOBALCONFIG:-}" ]] && cfg+=(--npm-globalconfig "${SAFE_GATE_NPM_GLOBALCONFIG}")
   result_out="$(mktemp "${TMPDIR:-/tmp}/safe-gate-result.XXXXXX")" || result_out=""
-  SAFE_AUDIT_RESULT_OUT="${result_out}" "${SAFE_GATE_AUDIT_BIN}" private-npm-project --tool "${tool}" --class "${class}" \
-    --project-dir "${project_dir}" --gate install "${cfg[@]}" -- "$@"
+  SAFE_AUDIT_RESULT_OUT="${result_out}" "${SAFE_GATE_AUDIT_BIN}" "private-${kind}" --gate install "$@"
   rc=$?
   case "${rc}" in
     0) ;;
     18)
       while IFS=$'\t' read -r package extra; do
         [[ -n "${package}" ]] || continue
-        safe_gate_audit_log npm "${package}" "ALLOWED_VIA_PRIVATE_REGISTRY" "${extra}"
+        safe_gate_audit_log "${ecosystem}" "${package}" "ALLOWED_VIA_PRIVATE_REGISTRY" "${extra}"
       done < <(jq -r '.private_registry_lines[]? | [.package, .extra] | @tsv' "${result_out}" 2>/dev/null)
       rc=0
       ;;
     19)
-      safe_gate_private_terminus 19 "$(jq -r '"\(.package)@\(.resolved_versions[0])"' "${result_out}" 2>/dev/null)" npm "${tool} ${SAFE_GATE_SUBCMD}" "${result_out}"
+      safe_gate_private_terminus 19 "$(jq -r '"\(.package)@\(.resolved_versions[0])"' "${result_out}" 2>/dev/null)" "${ecosystem}" "${label}" "${result_out}"
       rc=$?
       ;;
     20)
-      safe_gate_block_terminus 20 "$(jq -r '"\(.package)@\(.resolved_versions[0])"' "${result_out}" 2>/dev/null)" npm "${tool} ${SAFE_GATE_SUBCMD}" "${result_out}"
+      safe_gate_block_terminus 20 "$(jq -r '"\(.package)@\(.resolved_versions[0])"' "${result_out}" 2>/dev/null)" "${ecosystem}" "${label}" "${result_out}"
       rc=$?
       ;;
     *)
-      safe_gate_err "safe: BLOCKED ${tool} ${SAFE_GATE_SUBCMD} — the private-registry project check could not run (audit-infrastructure breakage, not a package finding); rerun install.sh or run safe doctor; details: safe explain"
-      safe_gate_audit_log npm "project" "REFUSED_AUDIT_INFRA"
+      safe_gate_err "safe: BLOCKED ${label} — the private-registry check could not run (audit-infrastructure breakage, not a package finding); rerun install.sh or run safe doctor; details: safe explain"
+      safe_gate_audit_log "${ecosystem}" "project" "REFUSED_AUDIT_INFRA"
       rc=100
       ;;
   esac
@@ -4769,48 +4785,25 @@ safe_gate_private_npm_project() {
   return "${rc}"
 }
 
-# Go project lane of the private-registry trust: go.sum entries for modules on
-# a private registry must match their pinned hashes (GONOSUMDB modules are
-# otherwise trust-on-first-use in go.sum alone). Public modules stay with
-# go's checksum database and the project scan. Exit 18 logs one audit line
-# per private module; 19/20 reach the same termini as a package audit.
-safe_gate_private_gosum() {
-  local project_dir="${SAFE_GATE_PROJECT_DIR:-.}" result_out="" rc=0 line package extra
-  # Fast path: no private-registry trust anywhere means nothing to check.
-  local d any_store=0
-  for d in "$HOME/.config/safe/run" "$(safe_gate_run_config_dir)"; do
-    [[ -s "${d}/private-registries.json" || -s "${d}/private-follow-state.json" ]] && any_store=1
-  done
-  (( any_store )) || return 0
-  safe_gate_audit_available || return 0
-  result_out="$(mktemp "${TMPDIR:-/tmp}/safe-gate-result.XXXXXX")" || result_out=""
-  SAFE_AUDIT_RESULT_OUT="${result_out}" "${SAFE_GATE_AUDIT_BIN}" private-gosum --project-dir "${project_dir}" --gate install -- "$@"
-  rc=$?
-  case "${rc}" in
-    0) ;;
-    18)
-      while IFS=$'\t' read -r package extra; do
-        [[ -n "${package}" ]] || continue
-        safe_gate_audit_log go "${package}" "ALLOWED_VIA_PRIVATE_REGISTRY" "${extra}"
-      done < <(jq -r '.private_registry_lines[]? | [.package, .extra] | @tsv' "${result_out}" 2>/dev/null)
-      rc=0
-      ;;
-    19)
-      safe_gate_private_terminus 19 "$(jq -r '"\(.package)@\(.resolved_versions[0])"' "${result_out}" 2>/dev/null)" go "go ${SAFE_GATE_SUBCMD}" "${result_out}"
-      rc=$?
-      ;;
-    20)
-      safe_gate_block_terminus 20 "$(jq -r '"\(.package)@\(.resolved_versions[0])"' "${result_out}" 2>/dev/null)" go "go ${SAFE_GATE_SUBCMD}" "${result_out}"
-      rc=$?
-      ;;
-    *)
-      safe_gate_err "safe: BLOCKED go ${SAFE_GATE_SUBCMD} — the private-registry go.sum check could not run (audit-infrastructure breakage, not a package finding); rerun install.sh or run safe doctor; details: safe explain"
-      safe_gate_audit_log go "go.sum" "REFUSED_AUDIT_INFRA"
-      rc=100
-      ;;
-  esac
-  [[ -z "${result_out}" ]] || rm -f -- "${result_out}"
-  return "${rc}"
+# npm-family project lane: scope mapping and lockfile resolved origins.
+# $1 tool, $2 subcommand class (ci|install|update|lockdiff|...), then the
+# manager argv after the tool name.
+safe_gate_private_npm_project() {
+  local tool="$1" class="$2"
+  shift 2
+  local project_dir="${SAFE_GATE_PROJECT_DIR:-.}"
+  [[ -f "${project_dir}/package.json" ]] || return 0
+  local -a cfg=()
+  [[ -n "${SAFE_GATE_NPM_USERCONFIG:-}" ]] && cfg+=(--npm-userconfig "${SAFE_GATE_NPM_USERCONFIG}")
+  [[ -n "${SAFE_GATE_NPM_GLOBALCONFIG:-}" ]] && cfg+=(--npm-globalconfig "${SAFE_GATE_NPM_GLOBALCONFIG}")
+  safe_gate_private_project npm-project npm "${tool} ${SAFE_GATE_SUBCMD}" --tool "${tool}" --class "${class}" \
+    --project-dir "${project_dir}" "${cfg[@]}" -- "$@"
+}
+
+# Go lane for module-downloading commands: `go env` must route every
+# registered namespace to its origin (local file:// sources may come first).
+safe_gate_private_go() {
+  safe_gate_private_project go go "go ${SAFE_GATE_SUBCMD}" --project-dir "${SAFE_GATE_PROJECT_DIR:-.}" -- "$@"
 }
 
 safe_gate_go() {
@@ -4864,7 +4857,7 @@ safe_gate_go() {
     else
       # A local run builds the current module: its requirements download
       # like a build's.
-      safe_gate_private_gosum "$@" || return $?
+      safe_gate_private_go "$@" || return $?
     fi
     safe_gate_exec_real go "$@"
   fi
@@ -4873,20 +4866,20 @@ safe_gate_go() {
     if [[ "${subcommand}" == "build" || "${subcommand}" == "test" ||
           "${subcommand}" == "vet" || "${subcommand}" == "list" ]]; then
       # The private lane follows go -C itself, so it runs whatever the cwd.
-      safe_gate_private_gosum "$@" || return $?
+      safe_gate_private_go "$@" || return $?
       if safe_gate_go_project_present; then
         safe_gate_scan_project || return $?
       fi
     elif [[ "${subcommand}" == "mod" ]]; then
       case "${second}" in
         download|tidy)
-          safe_gate_private_gosum "$@" || return $?
+          safe_gate_private_go "$@" || return $?
           if safe_gate_go_project_present; then
             safe_gate_scan_project || return $?
           fi
           ;;
         vendor|graph|why|verify)
-          safe_gate_private_gosum "$@" || return $?
+          safe_gate_private_go "$@" || return $?
           ;;
       esac
     fi
@@ -4907,7 +4900,7 @@ safe_gate_go() {
   done
   (( install_targets )) || install_local=1
   if (( install_local )); then
-    safe_gate_private_gosum "$@" || return $?
+    safe_gate_private_go "$@" || return $?
   fi
   if (( extractor_rc != 0 )); then
     safe_gate_exec_real go "$@"

@@ -989,7 +989,7 @@ case_leading_global_flag_gates_uv_tool_run() {
   prepare_case "leading-global-flag-gates-uv-tool-run"
   SAFE_INSTALL_TEST_SCRIPT='uv --offline tool run blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--uv-config\tambient' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -1240,7 +1240,7 @@ case_uv_python_selector_not_a_package() {
   # 2026-08-03). The real package must still be audited.
   SAFE_INSTALL_TEST_SCRIPT='uv tool install --python 3.12 okpkg==1.0.0' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\tokpkg@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--uv-config\tambient' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tokpkg@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'AUDIT\tpackage-audit\t3.12' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='uv tool install okpkg==1.0.0 --python 3.12' run_zsh
   assert_status 0 "$FUNCNAME" || return
@@ -1327,7 +1327,7 @@ case_pip_use_feature_takes_value() {
   # value as the subcommand and bypassed the gate (review round 1 High 4).
   SAFE_INSTALL_TEST_SCRIPT='pip --use-feature fast-deps install blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--pip-settings-apply' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--python-isolated' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tpip' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -1500,14 +1500,14 @@ case_uv_run_and_tool_run_gate() {
   prepare_case "uv-run-and-tool-run-gate"
   SAFE_INSTALL_TEST_SCRIPT='uv run --with warnme script.py' run_zsh
   assert_status 100 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\twarnme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--uv-config\tambient' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\twarnme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='uv run script.py' run_zsh
   assert_status 0 "$FUNCNAME" || return
   assert_log_contains $'REAL\tuv\trun\tscript.py' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='uv tool run ruff' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\truff\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--uv-config\tambient' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\truff\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   SAFE_INSTALL_TEST_SCRIPT='uv tool run --from blockme r' run_zsh
   assert_status 104 "$FUNCNAME" || return
   pass "$FUNCNAME"
@@ -1518,12 +1518,12 @@ case_uv_short_with_and_boundary() {
   # -w is the short --with and must be audited (review High 3).
   SAFE_INSTALL_TEST_SCRIPT='uv run -w blockme script.py' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--uv-config\tambient' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
   # A value flag before --with must not shift the boundary; --with rich audits.
   SAFE_INSTALL_TEST_SCRIPT='uv run --python 3.12 --with rich pytest' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\trich\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--uv-config\tambient' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\trich\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_contains $'REAL\tuv\trun\t--python\t3.12\t--with\trich\tpytest' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -1545,7 +1545,7 @@ case_uv_tool_run_short_with_keeps_tool() {
   # (review High 4).
   SAFE_INSTALL_TEST_SCRIPT='uv tool run -w ok-extra blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--uv-config\tambient' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -1556,13 +1556,13 @@ case_uv_tool_run_with_extra_is_audited() {
   # tool (re-review High 4).
   SAFE_INSTALL_TEST_SCRIPT='uv tool run -w blockme ruff' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--uv-config\tambient' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
   # Both clean → audited and delegated.
   SAFE_INSTALL_TEST_SCRIPT='uv tool run --with ok ruff' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\tok\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--uv-config\tambient' "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\truff\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--uv-config\tambient' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tok\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\truff\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -1572,7 +1572,7 @@ case_uv_run_value_flag_before_with() {
   # scan early and miss the later --with fetch (re-review High 5).
   SAFE_INSTALL_TEST_SCRIPT='uv run --no-extra dev --with blockme python' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--uv-config\tambient' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
   # -m is a switch; it must not fail closed (re-review Med 1).
   SAFE_INSTALL_TEST_SCRIPT='uv run -m pytest' run_zsh
@@ -3389,7 +3389,7 @@ case_audit_failure_blocks() {
   prepare_case "audit-failure-blocks"
   SAFE_AUDIT_CHECK_STATUS=42 SAFE_INSTALL_TEST_SCRIPT='uv tool install repomix' run_zsh
   assert_status 100 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\trepomix\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--uv-config\tambient' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\trepomix\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -3532,7 +3532,7 @@ case_pip_complex_flags() {
   prepare_case "pip-complex-flags"
   SAFE_INSTALL_TEST_SCRIPT='pip install --index-url https://pypi.example --constraint constraints.txt requests==2.32.0' run_zsh
   assert_status 0 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\trequests@2.32.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://pypi.example\t--pip-settings-apply' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\trequests@2.32.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://pypi.example\t--python-isolated' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\thttps://pypi.example@latest' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'\tconstraints.txt@latest' "$FUNCNAME" || return
   pass "$FUNCNAME"
@@ -4435,17 +4435,17 @@ case_uv_index_selectors_reach_audit() {
   # while uv installed from the custom index (review finding 1).
   SAFE_INSTALL_TEST_SCRIPT='uv tool install --default-index https://packages.example blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://packages.example\t--uv-config\tambient' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://packages.example' "$FUNCNAME" || return
 
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='uv pip install --index-url=https://pypi.example blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://pypi.example\t--uv-config\tambient' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://pypi.example\t--python-isolated' "$FUNCNAME" || return
 
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='uv run --index https://idx.example --with blockme script.py' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://idx.example\t--uv-config\tambient' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://idx.example' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -4644,38 +4644,31 @@ case_pip_cumulative_sources_all_reach_audit() {
   assert_status 104 "$FUNCNAME" || return
   # The find-links selector is also flagged for the private-registry lane,
   # which cannot probe a flat file page for a namesake (round-1 P2).
-  assert_log_contains $'AUDIT\tpackage-audit\tblockme@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://evil.example/wheels https://pypi.org/simple\t--find-links-selected\t--pip-settings-apply' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://evil.example/wheels https://pypi.org/simple\t--find-links-selected\t--python-isolated' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
-case_python_dependency_proof_context_reaches_audit() {
-  prepare_case "python-dependency-proof-context"
-  # The private-registry lane's dependency-free proof is the installer's own
-  # switch (review round 2 P7): pip/uv install arguments, or pip settings
-  # (PIP_NO_DEPS, pip config) only for pip outside --isolated; a later
-  # program's argv proves nothing. uv configuration is a source the lane
-  # checks (review round 2 P8): a selected file or discovery directory is
-  # `explicit`, otherwise `ambient` unless --no-config.
+case_python_private_route_context_reaches_audit() {
+  prepare_case "python-private-route-context"
+  # The private-registry lane trusts a private Python name only on the
+  # routes whose delegate the gate isolates (trusted origins, ruling a37):
+  # explicit pip / uv pip install specs carry --python-isolated; uv run and
+  # uv tool do not. uv --config-file is flagged as a configuration the lane
+  # does not model.
   SAFE_INSTALL_TEST_SCRIPT='pip install --no-deps okpkg==1.0.0' run_zsh
-  assert_log_contains $'AUDIT\tpackage-audit\tokpkg@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--no-deps-selected\t--pip-settings-apply' "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tokpkg@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--python-isolated' "$FUNCNAME" || return
   : > "${LOG_FILE}"
-  SAFE_INSTALL_TEST_SCRIPT='pip --isolated install okpkg==1.0.0' run_zsh
+  SAFE_INSTALL_TEST_SCRIPT='uv pip install okpkg==1.0.0' run_zsh
+  assert_log_contains $'AUDIT\tpackage-audit\tokpkg@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--python-isolated' "$FUNCNAME" || return
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='uv --config-file other.toml pip install okpkg==1.0.0' run_zsh
+  assert_log_contains $'AUDIT\tpackage-audit\tokpkg@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--python-isolated\t--uv-config-file-selected' "$FUNCNAME" || return
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='uv run --with okpkg==1.0.0 tool' run_zsh
   assert_log_contains $'AUDIT\tpackage-audit\tokpkg@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   : > "${LOG_FILE}"
-  SAFE_INSTALL_TEST_SCRIPT='uv pip install --no-deps okpkg==1.0.0' run_zsh
-  assert_log_contains $'AUDIT\tpackage-audit\tokpkg@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--no-deps-selected\t--uv-config\tambient' "$FUNCNAME" || return
-  : > "${LOG_FILE}"
-  SAFE_INSTALL_TEST_SCRIPT='uv --no-config pip install --no-deps okpkg==1.0.0' run_zsh
-  assert_log_contains $'AUDIT\tpackage-audit\tokpkg@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--no-deps-selected' "$FUNCNAME" || return
-  : > "${LOG_FILE}"
-  SAFE_INSTALL_TEST_SCRIPT='uv --config-file other.toml pip install --no-deps okpkg==1.0.0' run_zsh
-  assert_log_contains $'AUDIT\tpackage-audit\tokpkg@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--no-deps-selected\t--uv-config\texplicit' "$FUNCNAME" || return
-  : > "${LOG_FILE}"
-  SAFE_INSTALL_TEST_SCRIPT='UV_CONFIG_FILE=other.toml uv pip install okpkg==1.0.0' run_zsh
-  assert_log_contains $'AUDIT\tpackage-audit\tokpkg@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--uv-config\texplicit' "$FUNCNAME" || return
-  : > "${LOG_FILE}"
-  SAFE_INSTALL_TEST_SCRIPT='uv run --with okpkg==1.0.0 tool --no-deps' run_zsh
-  assert_log_contains $'AUDIT\tpackage-audit\tokpkg@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--uv-config\tambient' "$FUNCNAME" || return
+  SAFE_INSTALL_TEST_SCRIPT='uv tool install okpkg==1.0.0' run_zsh
+  assert_log_contains $'AUDIT\tpackage-audit\tokpkg@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -6719,7 +6712,7 @@ main() {
     case_go_parser \
     case_composer_parser \
     case_pip_cumulative_sources_all_reach_audit \
-    case_python_dependency_proof_context_reaches_audit \
+    case_python_private_route_context_reaches_audit \
     case_npm_scoped_and_userconfig_sources_reach_audit \
     case_source_credentials_preserved_for_audit \
     case_gate_never_leaks_sources_to_the_real_tool \

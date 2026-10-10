@@ -3,65 +3,49 @@
 ## Unreleased
 
 - Add operator-managed trust for owner-controlled private registries (npm, Go,
-  PyPI). `safe run private-registry add` declares that a namespace resolves
-  only from one canonical origin. An exact-pinned install of that namespace is
-  then bound to the origin and to the integrity pinned for the exact version
-  (recorded on first use or by `pin add`). It proceeds unattended as gate
-  exit 18 `ALLOWED_VIA_PRIVATE_REGISTRY`, with an audit line naming the
-  registry, origin, artifact and integrity. It never consults OSV, Socket or
-  public publish dates for the private name. Gate exit 19 asks the operator
-  (102 unattended) for the following cases:
-  - a namespace claimed by two origins;
-  - a missing operator pin;
-  - a non-exact spec or a version absent from the registry;
-  - missing credentials or an unreachable registry;
-  - a release inside the registry's cooldown.
+  PyPI) as trusted origins (operator ruling a37). `safe run private-registry
+  add` declares that a namespace resolves only from one canonical origin; a
+  package of that namespace the package manager fetches from that origin is
+  trusted like a local artifact. It proceeds unattended as gate exit 18
+  `ALLOWED_VIA_PRIVATE_REGISTRY`, with one audit line naming registry,
+  origin, name and version, and never consults OSV, Socket or public publish
+  dates for the private name. There is no per-version pin, integrity record
+  or revocation. The guardrail is origin binding, decided by asking or
+  controlling the manager:
+  - npm: `npm config get @scope:registry` (with the command's config files
+    and argv selectors) and every lockfile entry whose path, name or alias
+    target is private (v1, v2, v3) must resolve under the origin;
+  - Go: `go env` in the command's context must route each registered
+    namespace to its origin on every module-downloading command; local
+    `file://` GOPROXY entries may come first;
+  - Python: `pip install` / `uv pip install` of explicit specs delegate with
+    their configuration switched off (`PIP_CONFIG_FILE=/dev/null`,
+    `UV_NO_CONFIG=1`) and the source environment dropped, so an argv index
+    at the origin is checked against the whole source set; other argv
+    indexes and PyPI are probed for a namesake.
 
-  BLOCK class `private` (20/104, typed override at a terminal, never recorded)
-  covers changed bytes, a revoked version, disagreeing signed pins, and
-  cross-registry substitution: npm scope or lockfile entries elsewhere, a PyPI
-  namesake (dependency confusion), or Go routed around the private proxy.
-  Credentials stay with each client (`.npmrc`, `GOAUTH`/`.netrc`); safe never
-  reads or logs them. The Go project lane checks private `go.sum` entries on
-  `build|test|mod download|mod tidy`.
+  BLOCK class `private` (20/104, typed override at a terminal, never
+  recorded) covers any other source: a scope mapped elsewhere, a lockfile
+  entry resolved elsewhere, Go routed around the origin, a missing origin
+  index, a namesake on another index, argv find-links or `--no-index`. Gate
+  exit 19 asks the operator (102 unattended) for a namespace claimed by two
+  origins, a non-exact spec, and routes the lane does not model (bun, uv run
+  and uv tool, mise `pipx:`, requirements files, `uv --config-file`,
+  pnpm/yarn/bun projects, npm workspace roots, lockfile-redirecting flags,
+  lockfile entries without a resolved URL). Credentials stay with each
+  client; safe never reads or logs them.
 - Fleet propagation of that trust. An origin republishes a signed
   `private-registries.<host>.json` with every change, and `safe run host-allow
   follow` follows it. A newer statement replaces the origin's previous one, so
-  removals and revocations propagate, and `follow-signer remove` withdraws a
-  key's statements at once. The trust core is `safe-core private-trust`
-  (`internal/privtrust`). See `docs/private-registries.md`.
-- `safe run host-allow add|update` of a private name takes its integrity from
-  the private registry instead of the hardcoded npmjs/PyPI lookup.
-- The private lane covers every materialization boundary, not only named
-  specs: npm `ci` sweeps the lockfile and every other npm project operation
-  its `--package-lock-only` projection whenever an npm private registry is
-  configured (a private package a public one newly requires included); a
-  `lockfileVersion` 1 lockfile, pnpm/yarn/bun projects naming a private
-  package and unmodelled flags ask the operator. The Go lane reads the
-  context Go selects (module root above the cwd, `-modfile` from argv or
-  `GOFLAGS`, every `go.work` module), decides requirements that have no sum
-  line yet, runs for local `go run`/`go install`, `vet`, `list` and every
-  `go mod` download command, and asks before `go mod tidy` or `-mod=mod`
-  resolves a private import no requirement pins. A find-links
-  source or `--no-index` is a BLOCK for a private Python name, an npm
-  integrity with two different sha512 digests is refused, and the npm fetch
-  reads npm 12's array answer and keeps the selected npm config files.
+  removals propagate, and `follow-signer remove` withdraws a key's statements
+  at once. The trust core is `safe-core private-trust` (`internal/privtrust`).
+  See `docs/private-registries.md`.
+- `safe run host-allow add|update` of a private name is refused: its origin is
+  trusted already, and the public registry's integrity would describe another
+  artifact.
 - Safe audits the packages an operation names, not what a package manager
-  pulls in beside them (a pre-existing limitation, now documented). The
-  unattended private allow on an explicit spec therefore requires a
-  dependency-free install — the installer's own `--no-deps` for pip and
-  `uv pip install` (for pip outside `--isolated`, also `PIP_NO_DEPS` or pip
-  config `no-deps`, read with pip's precedence), an npm version without
-  dependencies or required peers, a Go module whose `go.mod` requires
-  nothing — and otherwise asks the operator (19,
-  `private_dependencies_unaudited`) with the recovery path. uv configuration
-  on a private install asks too when it is explicitly selected
-  (`--config-file`, `UV_CONFIG_FILE`, `--directory`, `--project`) or when a
-  discovered `uv.toml` / `[tool.uv]` sets package sources: it can select
-  sources the lane does not model.
-- `go mod download <module>@<version>` of a private module is decided by the
-  private lane, inside or outside a module. Public explicit downloads and
-  `go get` remain ungated, as before (documented).
+  pulls in beside them (a pre-existing limitation, now documented with its
+  follow-up). A private root is treated like any audited public root.
 
 ## 1.68.1 - 2026-10-07
 

@@ -4,25 +4,14 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
 const (
 	npmOrigin = "https://git.example.test:8443/api/packages/owner/npm"
 	goOrigin  = "https://git.example.test:8443/api/packages/owner/go"
-	pyOrigin  = "https://git.example.test:8443/api/packages/owner/pypi"
 	signerA   = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 	signerB   = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-)
-
-var (
-	sriA = "sha512-" + strings.Repeat("A", 86) + "=="
-	sriB = "sha512-" + strings.Repeat("B", 86) + "=="
-	h1A  = "h1:" + strings.Repeat("a", 43) + "="
-	h1B  = "h1:" + strings.Repeat("b", 43) + "="
-	shaA = strings.Repeat("a", 64)
-	shaB = strings.Repeat("b", 64)
 )
 
 func TestCanonicalOrigin(t *testing.T) {
@@ -90,36 +79,53 @@ func TestNamespaces(t *testing.T) {
 	}
 }
 
-func TestNormalizeSRI(t *testing.T) {
-	if got, err := NormalizeSRI("sha1-abc " + sriA); err != nil || got != sriA {
-		t.Errorf("multi-hash SRI: %q %v", got, err)
-	}
-	if _, err := NormalizeSRI("sha1-abc"); err == nil {
-		t.Error("sha1-only SRI accepted")
-	}
-	if _, err := NormalizeSRI(sriA + " " + sriB); err == nil {
-		t.Error("two distinct sha512 digests accepted (would admit either artifact)")
-	}
-	if got, err := NormalizeSRI(sriA + " " + sriA + "?opt"); err != nil || got != sriA {
-		t.Errorf("a repeated identical digest must normalize: %q %v", got, err)
-	}
-	if _, err := NormalizeSRI("sha999-zzz " + sriA); err == nil {
-		t.Error("unknown algorithm accepted")
-	}
-}
-
 func TestGoRoute(t *testing.T) {
-	if r := GoRoute("superbiche.me/caviar", goOrigin, goOrigin+",https://proxy.golang.org,direct", "", ""); r != "" {
-		t.Errorf("good route refused: %s", r)
+	ok := func(goproxy, gonoproxy, goprivate string) GoRouteResult {
+		return GoRoute("superbiche.me", goOrigin, goproxy, gonoproxy, goprivate)
 	}
-	if GoRoute("superbiche.me/caviar", goOrigin, goOrigin, "", "superbiche.me") == "" {
+	if r := ok(goOrigin+",https://proxy.golang.org,direct", "", ""); !r.OK || r.Local || r.Route != goOrigin {
+		t.Errorf("good route refused: %+v", r)
+	}
+	if r := ok("file:///repo/third_party/goproxy,"+goOrigin+",https://proxy.golang.org,direct", "", ""); !r.OK || r.Route != "file:///repo/third_party/goproxy,"+goOrigin {
+		t.Errorf("a local file:// source ahead of the origin is a local artifact: %+v", r)
+	}
+	if r := ok("file:///a|file:///b|"+goOrigin, "", ""); !r.OK {
+		t.Errorf("several file:// sources, pipe separators: %+v", r)
+	}
+	for _, bad := range []string{
+		"file:///repo/goproxy,https://proxy.golang.org," + goOrigin,
+		"https://proxy.golang.org," + goOrigin,
+		"direct," + goOrigin,
+		"https://user:tok@evil.example.test/go," + goOrigin,
+		"",
+	} {
+		if r := ok(bad, "", ""); r.OK {
+			t.Errorf("GOPROXY=%q accepted: %+v", bad, r)
+		}
+	}
+	if r := ok("https://user:tok@evil.example.test/go", "", ""); r.OK || containsTok(r.Reason) {
+		t.Errorf("credentials in the refusal reason: %+v", r)
+	}
+	if r := ok("file:///repo/goproxy,off", "", ""); !r.OK || !r.Local {
+		t.Errorf("file:// then off is local-only: %+v", r)
+	}
+	if r := ok("off", "", ""); !r.OK || !r.Local {
+		t.Errorf("off is local-only: %+v", r)
+	}
+	if r := ok(goOrigin, "", "superbiche.me"); r.OK {
 		t.Error("GOPRIVATE direct route accepted")
 	}
-	if GoRoute("superbiche.me/caviar", goOrigin, "https://proxy.golang.org,"+goOrigin, "", "") == "" {
-		t.Error("origin not first accepted")
+	if r := ok(goOrigin, "", "superbiche.me/caviar"); r.OK {
+		t.Error("GOPRIVATE below the namespace accepted")
 	}
-	if GoRoute("superbiche.me/caviar", goOrigin, goOrigin, "other.me", "superbiche.me") != "" {
+	if r := ok(goOrigin, "", "*.me"); r.OK {
+		t.Error("GOPRIVATE glob covering the namespace accepted")
+	}
+	if r := ok(goOrigin, "other.me", "superbiche.me"); !r.OK {
 		t.Error("GONOPROXY must override GOPRIVATE")
+	}
+	if r := ok(goOrigin, "superbiche.meevil", ""); !r.OK {
+		t.Error("a pattern for another domain refused")
 	}
 	if !MatchPrefixPatterns("*.corp.example.com,rsc.io/private", "git.corp.example.com/xyzzy") ||
 		!MatchPrefixPatterns("rsc.io/private", "rsc.io/private/quux") ||
@@ -128,15 +134,15 @@ func TestGoRoute(t *testing.T) {
 	}
 }
 
-func TestParseGoSum(t *testing.T) {
-	raw := "superbiche.me/caviar v0.2.0 " + h1A + "\nsuperbiche.me/caviar v0.2.0/go.mod " + h1B + "\nexample.com/x v1.0.0/go.mod " + h1A + "\n"
-	got, err := ParseGoSum([]byte(raw))
-	if err != nil || len(got) != 2 || got[1].H1 != h1A || got[1].Mod != h1B || got[0].H1 != "" {
-		t.Fatalf("ParseGoSum = %+v, %v", got, err)
+func containsTok(s string) bool { return stringsContains(s, "tok@") }
+
+func stringsContains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
 	}
-	if _, err := ParseGoSum([]byte("garbage line\n")); err == nil {
-		t.Error("malformed go.sum accepted")
-	}
+	return false
 }
 
 type fixture struct {
@@ -148,7 +154,7 @@ func newFixture(t *testing.T) fixture {
 	t.Helper()
 	dir := t.TempDir()
 	return fixture{dir, Stores{
-		Policy: filepath.Join(dir, "private-registries.json"), Pins: filepath.Join(dir, "private-pins.json"),
+		Policy:      filepath.Join(dir, "private-registries.json"),
 		FollowState: filepath.Join(dir, "private-follow-state.json"), Config: filepath.Join(dir, "config.json")}}
 }
 
@@ -173,7 +179,7 @@ func npmReg() Registry {
 	return Registry{Ecosystem: "npm", Origin: npmOrigin, Namespace: []string{"@p/*"}, Reason: "mine"}
 }
 
-func TestMatchAndTOFULifecycle(t *testing.T) {
+func TestMatchAndRegistries(t *testing.T) {
 	f := newFixture(t)
 	if _, err := AddRegistry(f.s, "p-npm", npmReg()); err != nil {
 		t.Fatal(err)
@@ -182,70 +188,24 @@ func TestMatchAndTOFULifecycle(t *testing.T) {
 		t.Error("duplicate id accepted")
 	}
 	v := f.view(t)
-	if m := v.Match("npm", "@other/x"); m.Lane != "none" {
-		t.Errorf("unrelated name matched: %+v", m)
-	}
 	m := v.Match("npm", "@p/x")
-	if m.Lane != "private" || m.Origin != npmOrigin || m.PinMode != PinModeTOFU {
-		t.Fatalf("match = %+v", m)
+	if m.Lane != "private" || m.Origin != npmOrigin || len(m.Namespace) != 1 || m.Namespace[0] != "@p/*" {
+		t.Errorf("match = %+v", m)
 	}
-	obs := &Integrity{SRI: sriA}
-	if d := v.Decide(m, "1.0.0", obs, nil); d.Decision != "tofu" {
-		t.Fatalf("first decide = %+v", d)
+	if v.Match("npm", "@q/x").Lane != "none" || v.Match("go", "@p/x").Lane != "none" {
+		t.Error("foreign names matched")
 	}
-	if _, w, err := WritePin(f.s.Pins, Pin{Ecosystem: "npm", Origin: npmOrigin, Name: "@p/x", Version: "1.0.0", Integrity: *obs}, PinWriteTOFU); err != nil || !w {
-		t.Fatal(err)
+	if regs := v.Registries("npm"); len(regs) != 1 || regs[0].ID != "p-npm" {
+		t.Errorf("registries = %+v", regs)
 	}
-	// A racing second TOFU writer keeps the first record.
-	if p, w, _ := WritePin(f.s.Pins, Pin{Ecosystem: "npm", Origin: npmOrigin, Name: "@p/x", Version: "1.0.0", Integrity: Integrity{SRI: sriB}}, PinWriteTOFU); w || p.Integrity.SRI != sriA {
-		t.Error("TOFU overwrote an existing pin")
-	}
-	v = f.view(t)
-	if d := v.Decide(m, "1.0.0", obs, nil); d.Decision != "matched" {
-		t.Errorf("second decide = %+v", d)
-	}
-	if d := v.Decide(m, "1.0.0", &Integrity{SRI: sriB}, nil); d.Decision != "changed" {
-		t.Errorf("changed bytes = %+v", d)
-	}
-	if d := v.Decide(m, "1.0.0", obs, &Integrity{SRI: sriB}); d.Decision != "cross_registry" {
-		t.Errorf("observed != fetched = %+v", d)
-	}
-	if d := v.Decide(m, "^1.0.0", obs, nil); d.Decision != "invalid" {
-		t.Errorf("range = %+v", d)
-	}
-	if _, _, err := WritePin(f.s.Pins, Pin{Ecosystem: "npm", Origin: npmOrigin, Name: "@p/x", Version: "1.0.0", Integrity: Integrity{SRI: sriB}}, PinWriteAdd); err == nil {
-		t.Error("operator add over a different pin accepted")
-	}
-	if _, _, err := WritePin(f.s.Pins, Pin{Ecosystem: "npm", Origin: npmOrigin, Name: "@p/x", Version: "1.0.0"}, PinWriteRevoke); err != nil {
-		t.Fatal(err)
-	}
-	if d := f.view(t).Decide(m, "1.0.0", obs, nil); d.Decision != "revoked" {
-		t.Errorf("revoked = %+v", d)
-	}
-	if _, _, err := WritePin(f.s.Pins, Pin{Ecosystem: "npm", Origin: npmOrigin, Name: "@p/x", Version: "1.0.0", Integrity: *obs}, PinWriteReplace); err != nil {
-		t.Fatal(err)
-	}
-	if d := f.view(t).Decide(m, "1.0.0", obs, nil); d.Decision != "matched" || d.PinnedBy != PinModeOperator {
-		t.Errorf("replaced = %+v", d)
+	if regs := v.Registries("go"); len(regs) != 0 {
+		t.Errorf("go registries = %+v", regs)
 	}
 	if err := RemoveRegistry(f.s, "p-npm"); err != nil {
 		t.Fatal(err)
 	}
-	if m := f.view(t).Match("npm", "@p/x"); m.Lane != "none" {
+	if f.view(t).Match("npm", "@p/x").Lane != "none" {
 		t.Error("removed registry still matches")
-	}
-}
-
-func TestOperatorPinMode(t *testing.T) {
-	f := newFixture(t)
-	r := npmReg()
-	r.PinMode = PinModeOperator
-	if _, err := AddRegistry(f.s, "p", r); err != nil {
-		t.Fatal(err)
-	}
-	v := f.view(t)
-	if d := v.Decide(v.Match("npm", "@p/x"), "1.0.0", &Integrity{SRI: sriA}, nil); d.Decision != "missing" {
-		t.Errorf("operator mode without pin = %+v", d)
 	}
 }
 
@@ -262,25 +222,19 @@ func TestLocalOverlapRefused(t *testing.T) {
 	}
 }
 
-func statement(t *testing.T, host, at string, regs map[string]Registry, pins map[string]Pin) []byte {
+func statement(t *testing.T, host, at string, regs map[string]Registry) []byte {
 	t.Helper()
-	b, err := json.Marshal(Statement{Schema: StatementSchema, Host: host, ExportedAt: at, Registries: regs, Pins: pins})
+	b, err := json.Marshal(Statement{Schema: StatementSchema, Host: host, ExportedAt: at, Registries: regs})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return b
 }
 
-func npmPin(sri string) (string, Pin) {
-	p := Pin{Ecosystem: "npm", Origin: npmOrigin, Name: "@p/x", Version: "1.0.0", Integrity: Integrity{SRI: sri}, PinnedBy: PinModeOperator}
-	return PinKey("npm", npmOrigin, "@p/x", "1.0.0"), p
-}
-
 func TestFollowLifecycle(t *testing.T) {
 	f := newFixture(t)
 	f.signers(t, signerA)
-	k, p := npmPin(sriA)
-	st1 := statement(t, "rainbow", "2026-10-10T10:00:00Z", map[string]Registry{"p": npmReg()}, map[string]Pin{k: p})
+	st1 := statement(t, "rainbow", "2026-10-10T10:00:00Z", map[string]Registry{"p": npmReg()})
 	if r, err := ApplyStatement(f.s.FollowState, "rainbow", signerA, st1, true); err != nil || r.Result != "applied" {
 		t.Fatalf("dry run = %+v %v", r, err)
 	}
@@ -290,31 +244,20 @@ func TestFollowLifecycle(t *testing.T) {
 	if r, err := ApplyStatement(f.s.FollowState, "rainbow", signerA, st1, false); err != nil || r.Result != "applied" {
 		t.Fatalf("apply = %+v %v", r, err)
 	}
-	v := f.view(t)
-	m := v.Match("npm", "@p/x")
+	m := f.view(t).Match("npm", "@p/x")
 	if m.Lane != "private" || m.Sources[0].Host != "rainbow" {
 		t.Fatalf("followed match = %+v", m)
-	}
-	if d := v.Decide(m, "1.0.0", &Integrity{SRI: sriA}, nil); d.Decision != "matched" {
-		t.Errorf("followed pin = %+v", d)
 	}
 	if r, _ := ApplyStatement(f.s.FollowState, "rainbow", signerA, st1, false); r.Result != "current" {
 		t.Errorf("same statement = %+v", r)
 	}
-	collide := statement(t, "rainbow", "2026-10-10T10:00:00Z", map[string]Registry{}, nil)
+	collide := statement(t, "rainbow", "2026-10-10T10:00:00Z", map[string]Registry{})
 	if r, _ := ApplyStatement(f.s.FollowState, "rainbow", signerA, collide, false); r.Result != "collision" {
 		t.Errorf("collision = %+v", r)
 	}
-	older := statement(t, "rainbow", "2026-10-09T10:00:00Z", map[string]Registry{}, nil)
+	older := statement(t, "rainbow", "2026-10-09T10:00:00Z", map[string]Registry{})
 	if r, _ := ApplyStatement(f.s.FollowState, "rainbow", signerA, older, false); r.Result != "older" {
 		t.Errorf("older = %+v", r)
-	}
-	// Local TOFU disagreeing with the signed pin: the signed pin decides.
-	if _, _, err := WritePin(f.s.Pins, Pin{Ecosystem: "npm", Origin: npmOrigin, Name: "@p/x", Version: "1.0.0", Integrity: Integrity{SRI: sriB}}, PinWriteTOFU); err != nil {
-		t.Fatal(err)
-	}
-	if d := f.view(t).Decide(m, "1.0.0", &Integrity{SRI: sriB}, nil); d.Decision != "changed" {
-		t.Errorf("local TOFU vs signed = %+v", d)
 	}
 	// Signer removal withdraws the followed state at once.
 	f.signers(t)
@@ -323,7 +266,7 @@ func TestFollowLifecycle(t *testing.T) {
 	}
 	f.signers(t, signerA)
 	// A newer statement without the registry withdraws it (replace, not union).
-	newer := statement(t, "rainbow", "2026-10-11T10:00:00Z", map[string]Registry{}, nil)
+	newer := statement(t, "rainbow", "2026-10-11T10:00:00Z", map[string]Registry{})
 	if r, _ := ApplyStatement(f.s.FollowState, "rainbow", signerA, newer, false); r.Result != "applied" {
 		t.Errorf("newer = %+v", r)
 	}
@@ -335,26 +278,18 @@ func TestFollowLifecycle(t *testing.T) {
 func TestFollowConflicts(t *testing.T) {
 	f := newFixture(t)
 	f.signers(t, signerA, signerB)
-	kA, pA := npmPin(sriA)
-	_, pB := npmPin(sriB)
-	if _, err := ApplyStatement(f.s.FollowState, "rainbow", signerA, statement(t, "rainbow", "2026-10-10T10:00:00Z", map[string]Registry{"p": npmReg()}, map[string]Pin{kA: pA}), false); err != nil {
+	if _, err := ApplyStatement(f.s.FollowState, "rainbow", signerA, statement(t, "rainbow", "2026-10-10T10:00:00Z", map[string]Registry{"p": npmReg()}), false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ApplyStatement(f.s.FollowState, "tuxedo", signerB, statement(t, "tuxedo", "2026-10-10T10:00:00Z", map[string]Registry{"p2": npmReg()}, map[string]Pin{kA: pB}), false); err != nil {
+	if _, err := ApplyStatement(f.s.FollowState, "tuxedo", signerB, statement(t, "tuxedo", "2026-10-10T10:00:00Z", map[string]Registry{"p2": npmReg()}), false); err != nil {
 		t.Fatal(err)
 	}
-	v := f.view(t)
-	m := v.Match("npm", "@p/x")
-	if m.Lane != "private" {
+	if m := f.view(t).Match("npm", "@p/x"); m.Lane != "private" {
 		t.Fatalf("same origin from two hosts must merge: %+v", m)
 	}
-	if d := v.Decide(m, "1.0.0", &Integrity{SRI: sriA}, nil); d.Decision != "conflict" {
-		t.Errorf("two signed pins disagree = %+v", d)
-	}
-	// A followed registry for the same namespace on another origin conflicts.
 	evil := npmReg()
 	evil.Origin = "https://evil.example.test/npm"
-	if _, err := ApplyStatement(f.s.FollowState, "agent-dev", signerA, statement(t, "agent-dev", "2026-10-10T10:00:00Z", map[string]Registry{"p": evil}, nil), false); err != nil {
+	if _, err := ApplyStatement(f.s.FollowState, "agent-dev", signerA, statement(t, "agent-dev", "2026-10-10T10:00:00Z", map[string]Registry{"p": evil}), false); err != nil {
 		t.Fatal(err)
 	}
 	if m := f.view(t).Match("npm", "@p/x"); m.Lane != "conflict" || len(m.Origins) != 2 {
@@ -366,25 +301,44 @@ func TestFollowConflicts(t *testing.T) {
 }
 
 func TestStatementValidation(t *testing.T) {
-	bad := []byte(`{"schema":"` + StatementSchema + `","host":"tuxedo","exported_at":"2026-10-10T10:00:00Z","registries":{},"pins":{}}`)
+	bad := []byte(`{"schema":"` + StatementSchema + `","host":"tuxedo","exported_at":"2026-10-10T10:00:00Z","registries":{}}`)
 	if _, _, err := ParseStatement(bad, "rainbow"); err == nil {
 		t.Error("host mismatch accepted")
 	}
-	extra := []byte(`{"schema":"` + StatementSchema + `","host":"rainbow","exported_at":"2026-10-10T10:00:00Z","registries":{},"pins":{},"auth":"x"}`)
+	extra := []byte(`{"schema":"` + StatementSchema + `","host":"rainbow","exported_at":"2026-10-10T10:00:00Z","registries":{},"auth":"x"}`)
 	if _, _, err := ParseStatement(extra, "rainbow"); err == nil {
 		t.Error("unknown field accepted")
 	}
+	old := []byte(`{"schema":"safe-private-registries-export/1","host":"rainbow","exported_at":"2026-10-10T10:00:00Z","registries":{},"pins":{}}`)
+	if _, _, err := ParseStatement(old, "rainbow"); err == nil {
+		t.Error("a pin-model /1 statement accepted")
+	}
 	r := npmReg()
 	r.Origin = "http://git.example.test/npm"
-	st, warns, err := ParseStatement(statement(t, "rainbow", "2026-10-10T10:00:00Z", map[string]Registry{"p": r, "q": npmReg()}, nil), "rainbow")
+	st, warns, err := ParseStatement(statement(t, "rainbow", "2026-10-10T10:00:00Z", map[string]Registry{"p": r, "q": npmReg()}), "rainbow")
 	if err != nil || len(st.Registries) != 1 || len(warns) != 1 {
 		t.Errorf("invalid entry handling: %+v %v %v", st.Registries, warns, err)
 	}
 }
 
+func TestExportCarriesRegistriesOnly(t *testing.T) {
+	f := newFixture(t)
+	if _, err := AddRegistry(f.s, "p-npm", npmReg()); err != nil {
+		t.Fatal(err)
+	}
+	st, err := Export(f.s, "rainbow", "2026-10-10T10:00:00Z")
+	if err != nil || st.Schema != StatementSchema || len(st.Registries) != 1 {
+		t.Fatalf("export = %+v %v", st, err)
+	}
+	b, _ := json.Marshal(st)
+	if stringsContains(string(b), "pin") {
+		t.Errorf("export carries pin data: %s", b)
+	}
+}
+
 func TestMalformedStoresFailClosed(t *testing.T) {
 	f := newFixture(t)
-	if err := os.WriteFile(f.s.Policy, []byte(`{"schema":"`+PolicySchema+`","registries":{"x":{"ecosystem":"npm","origin":"http://evil/","namespace":["@p/*"],"pin_mode":"tofu","cooldown_days":0}}}`), 0o600); err != nil {
+	if err := os.WriteFile(f.s.Policy, []byte(`{"schema":"`+PolicySchema+`","registries":{"x":{"ecosystem":"npm","origin":"http://evil/","namespace":["@p/*"]}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Load(f.s); err == nil {
@@ -396,25 +350,10 @@ func TestMalformedStoresFailClosed(t *testing.T) {
 	if _, err := Load(f.s); err == nil {
 		t.Error("repeated member accepted")
 	}
-}
-
-func TestGoAndPythonIntegrity(t *testing.T) {
-	if !IntegrityEqual("go", Integrity{H1: h1A, Mod: h1B}, Integrity{Mod: h1B}) ||
-		IntegrityEqual("go", Integrity{H1: h1A, Mod: h1B}, Integrity{H1: h1B, Mod: h1B}) {
-		t.Error("go comparison")
-	}
-	if _, _, err := ValidatePin(Pin{Ecosystem: "go", Origin: goOrigin, Name: "superbiche.me/caviar", Version: "v0.2.0", Integrity: Integrity{Mod: h1B}, PinnedBy: "tofu"}); err == nil {
-		t.Error("go pin without zip hash accepted")
-	}
-	a := Integrity{Files: map[string]string{"x-1.whl": shaA, "x-1.tar.gz": "sha256:" + shaB}}
-	va, err := ValidateIntegrity("python", a)
-	if err != nil {
+	if err := os.WriteFile(f.s.Policy, []byte(`{"schema":"safe-private-registries/1","registries":{}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if IntegrityEqual("python", va, Integrity{Files: map[string]string{"x-1.whl": shaA}}) {
-		t.Error("python subset compared equal")
-	}
-	if _, _, err := ValidatePin(Pin{Ecosystem: "python", Origin: pyOrigin, Name: "Caviar_Redact", Version: "0.2.0", Integrity: va, PinnedBy: "tofu"}); err != nil {
-		t.Error(err)
+	if _, err := Load(f.s); err == nil {
+		t.Error("a pin-model /1 policy loaded")
 	}
 }

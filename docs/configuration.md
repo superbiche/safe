@@ -7,7 +7,6 @@ Unified config lives under:
   run/
     host-allow.json
     private-registries.json
-    private-pins.json
     private-follow-state.json
     blocked.json
     sandbox-known.json
@@ -78,10 +77,10 @@ only the current pinned-version schema. `host-allow add` and `update` verify the
 exact version against its registry and obtain fresh integrity before writing;
 an unknown or unreachable version is refused.
 
-`private-registries.json`, `private-pins.json` and `private-follow-state.json`
-hold the operator-managed trust for owner-controlled private registries: the
-local registry policy, the per-version artifact pins, and the statements
-followed from fleet origins. They are trust stores (canonical root only,
+`private-registries.json` and `private-follow-state.json` hold the
+operator-managed trust for owner-controlled private registries (trusted
+origins): the local registry policy and the statements followed from fleet
+origins. They are trust stores (canonical root only,
 operator-TTY writes through `safe run private-registry`); see
 [private registries](private-registries.md).
 

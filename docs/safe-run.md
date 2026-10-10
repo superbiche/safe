@@ -458,15 +458,14 @@ recorded, so they never reach an export.
 ## Private registries
 
 `safe run private-registry` manages operator trust for owner-controlled
-private registries: `add|remove|list` for the registry policy,
-`pins` and `pin add|replace|revoke` for per-version integrity, and
-`export --sign`, `follow`, `forget-origin` for fleet propagation. Every change
+private registries (trusted origins): `add|remove|list` for the registry
+policy, and `export --sign`, `follow`, `forget-origin` for fleet propagation. Every change
 needs an operator terminal and the canonical trust root. An origin republishes
 `private-registries.<host>.json` with each change, and `safe run host-allow
 follow` follows those statements too: a newer statement replaces the origin's
-previous one, so removals and revocations propagate. `host-allow add|update`
-of a private name takes its integrity from the private registry, never the
-public one. See [private registries](private-registries.md).
+previous one, so removals propagate. `host-allow add|update` of a private
+name is refused: its origin is trusted already, and the public registry's
+integrity would describe another artifact. See [private registries](private-registries.md).
 
 ## Safe release follow
 

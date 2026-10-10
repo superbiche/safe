@@ -6,13 +6,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strconv"
 	"strings"
 
 	"github.com/superbiche/safe/internal/privtrust"
 )
 
-const privateTrustUsage = "safe-core: usage: safe-core private-trust <match|match-names|decide|record|registry-add|registry-remove|list|export|follow-apply|forget-origin|go-route|gosum|under-origin|canonical-url|canonical-origin> [flags]"
+const privateTrustUsage = "safe-core: usage: safe-core private-trust <match|match-names|registries|registry-add|registry-remove|list|export|follow-apply|forget-origin|go-route|under-origin|canonical-url|canonical-origin> [flags]"
 
 // privateTrust is the decision core behind safe's private-registry lane.
 // Exit codes: 0 ok; 2 usage; 3 malformed store or input (never a decision);
@@ -29,7 +28,7 @@ func privateTrust(args []string, stdinReader io.Reader, stdout, stderr io.Writer
 		fmt.Fprintln(stderr, privateTrustUsage)
 		return 2
 	}
-	stores := privtrust.Stores{Policy: flags["policy"], Pins: flags["pins"],
+	stores := privtrust.Stores{Policy: flags["policy"],
 		FollowState: flags["follow-state"], Config: flags["config"]}
 	emit := func(v any) int {
 		enc := json.NewEncoder(stdout)
@@ -67,52 +66,6 @@ func privateTrust(args []string, stdinReader io.Reader, stdout, stderr io.Writer
 			return fail(err)
 		}
 		return emit(v.Match(flags["ecosystem"], flags["name"]))
-	case "decide":
-		if !need("ecosystem", "name", "version", "observed") {
-			return 2
-		}
-		v, err := privtrust.Load(stores)
-		if err != nil {
-			return fail(err)
-		}
-		var observed, fetched *privtrust.Integrity
-		if observed, err = parseIntegrity(flags["observed"]); err != nil {
-			fmt.Fprintf(stderr, "safe-core: private-trust decide: --observed: %v\n", err)
-			return 3
-		}
-		if flags["fetched"] != "" {
-			if fetched, err = parseIntegrity(flags["fetched"]); err != nil {
-				fmt.Fprintf(stderr, "safe-core: private-trust decide: --fetched: %v\n", err)
-				return 3
-			}
-		}
-		m := v.Match(flags["ecosystem"], flags["name"])
-		return emit(struct {
-			Match    privtrust.Match    `json:"match"`
-			Decision privtrust.Decision `json:"decision"`
-		}{m, v.Decide(m, flags["version"], observed, fetched)})
-	case "record":
-		if !need("pins", "ecosystem", "origin", "name", "version", "mode") {
-			return 2
-		}
-		in := &privtrust.Integrity{}
-		if flags["integrity"] != "" {
-			var err error
-			if in, err = parseIntegrity(flags["integrity"]); err != nil {
-				fmt.Fprintf(stderr, "safe-core: private-trust record: --integrity: %v\n", err)
-				return 3
-			}
-		}
-		p, written, err := privtrust.WritePin(flags["pins"], privtrust.Pin{
-			Ecosystem: flags["ecosystem"], Origin: flags["origin"], Name: flags["name"],
-			Version: flags["version"], Integrity: *in, Artifact: flags["artifact"]}, flags["mode"])
-		if err != nil {
-			return fail(err)
-		}
-		return emit(struct {
-			Pin     privtrust.Pin `json:"pin"`
-			Written bool          `json:"written"`
-		}{p, written})
 	case "match-names":
 		// Names on stdin, one per line; prints the matches that are on a
 		// private or conflict lane (none-lane names are omitted).
@@ -141,23 +94,27 @@ func privateTrust(args []string, stdinReader io.Reader, stdout, stderr io.Writer
 			}
 		}
 		return emit(out)
+	case "registries":
+		// The effective registries of one ecosystem (local, then followed).
+		if !need("ecosystem") {
+			return 2
+		}
+		v, err := privtrust.Load(stores)
+		if err != nil {
+			return fail(err)
+		}
+		regs := v.Registries(flags["ecosystem"])
+		if regs == nil {
+			regs = []privtrust.ListEntry{}
+		}
+		return emit(regs)
 	case "registry-add":
 		if !need("policy", "id", "ecosystem", "origin") {
 			return 2
 		}
-		cooldown := 0
-		if c := flags["cooldown-days"]; c != "" {
-			n, err := strconv.Atoi(c)
-			if err != nil {
-				fmt.Fprintln(stderr, "safe-core: private-trust registry-add: --cooldown-days must be an integer")
-				return 2
-			}
-			cooldown = n
-		}
 		r, err := privtrust.AddRegistry(stores, flags["id"], privtrust.Registry{
 			Ecosystem: flags["ecosystem"], Origin: flags["origin"], Owner: flags["owner"],
-			Namespace: multi["namespace"], PinMode: flags["pin-mode"], CooldownDays: cooldown,
-			Added: flags["added"], Reason: flags["reason"]})
+			Namespace: multi["namespace"], Added: flags["added"], Reason: flags["reason"]})
 		if err != nil {
 			return fail(err)
 		}
@@ -227,29 +184,11 @@ func privateTrust(args []string, stdinReader io.Reader, stdout, stderr io.Writer
 		}
 		return 0
 	case "go-route":
+		// --module is a module path or namespace prefix.
 		if !need("module", "origin") {
 			return 2
 		}
-		reason := privtrust.GoRoute(flags["module"], flags["origin"], flags["goproxy"], flags["gonoproxy"], flags["goprivate"])
-		return emit(struct {
-			OK     bool   `json:"ok"`
-			Reason string `json:"reason,omitempty"`
-		}{reason == "", reason})
-	case "gosum":
-		if !need("file") {
-			return 2
-		}
-		raw, err := os.ReadFile(flags["file"])
-		if err != nil {
-			fmt.Fprintf(stderr, "safe-core: private-trust gosum: %v\n", err)
-			return 3
-		}
-		entries, err := privtrust.ParseGoSum(raw)
-		if err != nil {
-			fmt.Fprintf(stderr, "safe-core: private-trust gosum: %v\n", err)
-			return 3
-		}
-		return emit(entries)
+		return emit(privtrust.GoRoute(flags["module"], flags["origin"], flags["goproxy"], flags["gonoproxy"], flags["goprivate"]))
 	case "under-origin":
 		// Exit 0 when --url lies at or below --origin; 1 otherwise.
 		if !need("url", "origin") {
@@ -317,14 +256,4 @@ func parsePrivateFlags(args []string) (map[string]string, map[string][]string, b
 		flags[name] = value
 	}
 	return flags, multi, true
-}
-
-func parseIntegrity(raw string) (*privtrust.Integrity, error) {
-	var in privtrust.Integrity
-	dec := json.NewDecoder(strings.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&in); err != nil {
-		return nil, err
-	}
-	return &in, nil
 }

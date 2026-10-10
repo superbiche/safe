@@ -8240,33 +8240,33 @@ gate_warn_is_infra_only() {
 }
 
 # ---------------------------------------------------------------------------
-# Private registry lane (operator-managed trust for owner-controlled private
-# registries). A package whose name the operator declared private — a
-# registry in private-registries.json, or one followed from a signed fleet
-# statement whose signer is still pinned — never reaches public evidence
-# (OSV, Socket, public publish dates): those describe a public namesake, and
-# querying them leaks the private name. Instead the lane binds the install to
-# the registry's canonical origin and to the integrity pinned for the exact
-# version (recorded on first use, or by the operator), and decides:
+# Private registry lane: trusted origins (operator ruling a37, 2026-10-10).
+# A package whose name lies in a namespace the operator registered for an
+# owner-controlled registry — private-registries.json, or a registry followed
+# from a signed fleet statement whose signer is still pinned — is trusted like
+# a local artifact when the package manager would fetch it from that
+# registry's canonical origin. It never reaches public evidence (OSV, Socket,
+# public publish dates describe a public namesake, and querying them leaks
+# the private name), and there is no per-version pin, integrity record or
+# revocation: the guardrail is origin binding, decided by asking the manager
+# (npm config, go env) or by controlling it (Python installs delegate with
+# their configuration switched off, so argv is the only source):
 #
-#   gate 18  ALLOWED_VIA_PRIVATE_REGISTRY — unattended proceed, never GO;
+#   gate 18  ALLOWED_VIA_PRIVATE_REGISTRY — unattended proceed, never GO; one
+#            audit line naming registry, origin, name and version;
 #   gate 19  an operator decision is needed (TTY confirm, 102 unattended):
-#            conflicting registries, operator pin missing, non-exact version,
-#            version not on the registry, credentials missing, registry
-#            unreachable, inside the registry's cooldown;
+#            conflicting registries, a non-exact spec, or a route the lane
+#            does not model;
 #   gate 20  BLOCK class "private" (typed override at a TTY, 104 unattended):
-#            changed bytes for a pinned version, a revoked version, signed
-#            pins that disagree, or the artifact coming from another source
-#            than the private origin (cross-registry substitution).
+#            the manager would fetch the name from somewhere other than its
+#            origin (cross-registry substitution, a public namesake).
 #
-# The decision core is safe-core private-trust (internal/privtrust). Safe
-# never reads, stores or forwards a registry credential: npm reads its own
-# .npmrc, go its GOAUTH, and curl its ~/.netrc (or the operator's own index
-# URL), and no client stderr is echoed.
+# Safe never reads, stores or forwards a registry credential, and the lane
+# makes no registry request of its own except the Python namesake probe of
+# other argv indexes.
 # ---------------------------------------------------------------------------
 
 PRIVATE_POLICY_BASE="private-registries.json"
-PRIVATE_PINS_BASE="private-pins.json"
 PRIVATE_FOLLOW_BASE="private-follow-state.json"
 
 private_stores_present() {
@@ -8277,7 +8277,7 @@ private_stores_present() {
   return 1
 }
 
-# The verdict engine binary, version-pinned exactly like package-verdict.
+# The decision engine binary, version-pinned exactly like package-verdict.
 private_core_bin() {
   local bin="${SAFE_CORE_BIN:-}" reported
   [[ -n "$bin" ]] || bin="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/safe-core"
@@ -8294,23 +8294,22 @@ private_core() {
   shift 2
   "$bin" private-trust "$sub" \
     --policy "$(trust_store_file "$PRIVATE_POLICY_BASE")" \
-    --pins "$(trust_store_file "$PRIVATE_PINS_BASE")" \
     --follow-state "$(trust_store_file "$PRIVATE_FOLLOW_BASE")" \
     --config "$(trust_store_file config.json)" "$@"
 }
 
-# Whether the effective private-registry view (local and followed) has a
-# registry for ecosystem $2: 0 yes, 1 no, 2 the stores could not be loaded.
-private_has_registry() {
-  local core="$1" eco="$2" listing
-  listing=$(private_core "$core" list 2>/dev/null) || return 2
-  jq -e --arg e "$eco" 'any(.registries[]?; .ecosystem == $e)' <<<"$listing" >/dev/null 2>&1 || return 1
-  return 0
+PRIVATE_CORE_MISSING='safe audit: private-registry decision engine missing or version-skewed — audit-infrastructure breakage, not a package finding; rerun install.sh'
+PRIVATE_STORES_MALFORMED='safe audit: the private-registry trust stores are malformed — repair them at an operator terminal; nothing was decided'
+
+# The effective registries of one ecosystem as JSON (local, then followed).
+# Returns 2 when the stores could not be loaded.
+private_registries() {
+  local core="$1" eco="$2"
+  private_core "$core" registries --ecosystem "$eco" 2>/dev/null || return 2
 }
 
-# First executable <tool> on PATH that is not a safe gate wrapper: the
-# private fetchers run the ecosystem's own client for its credential lookup
-# and must never re-enter the gate.
+# First executable <tool> on PATH that is not a safe gate wrapper: the lane
+# asks the ecosystem's own client and must never re-enter the gate.
 private_real_tool() {
   local tool="$1" dir candidate line i
   local -a dirs=()
@@ -8334,356 +8333,15 @@ private_python_norm() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[-_.]+/-/g'
 }
 
-# Fetchers print {integrity, artifact, published} and return:
-#   0 ok; 41 credentials missing/refused; 42 unreachable or client failure;
-#   43 version not on the registry; 44 artifact outside the origin;
-#   45 integrity unusable; 46 client missing.
-private_fetch_npm() {
-  local core="$1" name="$2" version="$3" origin="$4" scratch="$5"
-  local npm_bin scope="${name%%/*}" rc=0 tarball sri published
-  npm_bin=$(private_real_tool npm) || return 46
-  # The operator's selected npm config files stay in force: they hold the
-  # credentials npm uses for the private origin.
-  local -a cfg=()
-  [[ -n "${CHECK_NPM_USERCONFIG:-}" ]] && cfg+=("--userconfig=${CHECK_NPM_USERCONFIG}")
-  [[ -n "${CHECK_NPM_GLOBALCONFIG:-}" ]] && cfg+=("--globalconfig=${CHECK_NPM_GLOBALCONFIG}")
-  (
-    cd -- "${CHECK_PROJECT_DIR:-.}" 2>/dev/null || cd -- "$HOME" || exit 42
-    timeout 30 "$npm_bin" view "${name}@${version}" version dist time dependencies optionalDependencies peerDependencies peerDependenciesMeta --json \
-      "--registry=${origin}/" "--${scope}:registry=${origin}/" "${cfg[@]}"
-  ) >"$scratch/private-npm.raw" 2>"$scratch/private-npm.err" || rc=$?
-  if (( rc != 0 )); then
-    if grep -Eq 'E401|E403|ENEEDAUTH|[Uu]nauthorized|[Ff]orbidden' "$scratch/private-npm.err" 2>/dev/null; then
-      return 41
-    elif grep -Eq 'E404|[Nn]ot [Ff]ound|ETARGET|No match found' "$scratch/private-npm.err" 2>/dev/null; then
-      return 43
-    fi
-    return 42
-  fi
-  # npm prints one object for an exact version, or (npm >= 12 with several
-  # fields) a one-element array of it. Anything else — several versions, an
-  # empty answer — is not one exact identity.
-  jq -e 'if type == "array" then (length == 1 and (.[0] | type == "object")) else type == "object" end' \
-    "$scratch/private-npm.raw" >/dev/null 2>&1 || return 43
-  jq 'if type == "array" then .[0] else . end' "$scratch/private-npm.raw" > "$scratch/private-npm.json" 2>/dev/null || return 43
-  [[ "$(jq -r '.version // "" | strings' "$scratch/private-npm.json" 2>/dev/null)" == "$version" ]] || return 43
-  tarball=$(jq -r '.dist.tarball // empty | strings' "$scratch/private-npm.json" 2>/dev/null) || tarball=""
-  sri=$(jq -r '.dist.integrity // empty | strings' "$scratch/private-npm.json" 2>/dev/null) || sri=""
-  [[ -n "$tarball" ]] || return 45
-  "$core" private-trust under-origin --url "$tarball" --origin "$origin" >/dev/null 2>&1 || return 44
-  [[ -n "$sri" ]] || return 45
-  published=$(jq -r --arg v "$version" '.time[$v] // empty | strings' "$scratch/private-npm.json" 2>/dev/null) || published=""
-  # What npm would install beside the root: dependencies, optional
-  # dependencies, and peers not marked optional (npm >= 7 installs peers).
-  local requires
-  requires=$(jq -c '((.dependencies // {}) | keys) + ((.optionalDependencies // {}) | keys)
-    + ((.peerDependencies // {}) | keys | map(select(. as $p | ($ARGS.named.meta[$p].optional // false) | not)))' \
-    --argjson meta "$(jq -c '.peerDependenciesMeta // {}' "$scratch/private-npm.json" 2>/dev/null || printf '{}')" \
-    "$scratch/private-npm.json" 2>/dev/null) || requires='null'
-  jq -cn --arg sri "$sri" --arg artifact "$(canonicalize_source "$tarball")" --arg published "$published" \
-    --argjson requires "$requires" \
-    '{integrity: {sri: $sri}, artifact: $artifact, published: $published, requires: $requires}'
-}
-
-# The index to read for a private python origin: the operator's own effective
-# index URL under that origin (it may carry the credentials pip uses), else
-# the origin's simple API.
-private_python_index() {
-  local core="$1" origin="$2" src url
-  # The OPERATIONAL selectors (argv as threaded by the gate, env and pip
-  # config), not the canonical identity set: an inline-credential index URL
-  # must reach curl exactly as pip would use it. It never reaches a sink.
-  for src in ${CHECK_REGISTRY:-} $(python_env_sources); do
-    url="$src"
-    if "$core" private-trust under-origin --url "$url" --origin "$origin" >/dev/null 2>&1; then
-      printf '%s' "${url%/}"
-      return 0
-    fi
-  done
-  printf '%s/simple' "$origin"
-}
-
-private_fetch_python() {
-  local core="$1" name="$2" version="$3" origin="$4" scratch="$5"
-  local index norm code ctype files='{}' published="" fname href hash uploaded dist ver base
-  index=$(private_python_index "$core" "$origin")
-  norm=$(private_python_norm "$name")
-  code=$(curl -sS --netrc-optional --max-time 10 \
-    -H 'Accept: application/vnd.pypi.simple.v1+json, text/html;q=0.1' \
-    -o "$scratch/private-py.body" -D "$scratch/private-py.hdr" -w '%{http_code}' \
-    "${index}/${norm}/" 2>/dev/null) || code="000"
-  case "$code" in
-    200) ;;
-    401|403) return 41 ;;
-    404|410) return 43 ;;
-    *) return 42 ;;
-  esac
-  ctype=$(grep -i '^content-type:' "$scratch/private-py.hdr" 2>/dev/null | tail -n 1 | tr -d '\r')
-  : >"$scratch/private-py.rows"
-  if [[ "${ctype,,}" == *"application/vnd.pypi.simple.v1+json"* ]]; then
-    jq -r '.files[]? | [(.filename // ""), (.url // ""), (.hashes.sha256 // ""), (."upload-time" // "")] | @tsv' \
-      "$scratch/private-py.body" >"$scratch/private-py.rows" 2>/dev/null || return 45
-  else
-    # PEP 503 HTML: <a href="URL#sha256=HEX" ...>FILENAME</a>
-    grep -oE '<a [^>]*href="[^"]*"[^>]*>[^<]*</a>' "$scratch/private-py.body" 2>/dev/null \
-      | while IFS= read -r line; do
-          href=$(sed -E 's/.*href="([^"]*)".*/\1/' <<<"$line")
-          fname=$(sed -E 's/.*>([^<]*)<\/a>$/\1/' <<<"$line")
-          hash=""
-          [[ "$href" == *"#sha256="* ]] && hash="${href##*#sha256=}"
-          printf '%s\t%s\t%s\t\n' "$fname" "${href%%#*}" "$hash"
-        done >"$scratch/private-py.rows"
-  fi
-  local scheme_host
-  scheme_host=$(sed -E 's#^([a-zA-Z]+://[^/]+).*#\1#' <<<"$index")
-  while IFS=$'\t' read -r fname href hash uploaded; do
-    [[ -n "$fname" ]] || continue
-    case "$fname" in
-      *.whl) base="${fname%.whl}"; dist="${base%%-*}"; ver="${base#*-}"; ver="${ver%%-*}" ;;
-      *.tar.gz) base="${fname%.tar.gz}"; dist="${base%-*}"; ver="${base##*-}" ;;
-      *.zip) base="${fname%.zip}"; dist="${base%-*}"; ver="${base##*-}" ;;
-      *) continue ;;
-    esac
-    [[ "$(private_python_norm "$dist")" == "$norm" && "$ver" == "$version" ]] || continue
-    case "$href" in
-      http://*|https://*) ;;
-      /*) href="${scheme_host}${href}" ;;
-      *) href="${index}/${norm}/${href}" ;;
-    esac
-    "$core" private-trust under-origin --url "$href" --origin "$origin" >/dev/null 2>&1 || return 44
-    [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]] || return 45
-    files=$(jq -c --arg f "$fname" --arg h "${hash,,}" '. + {($f): $h}' <<<"$files") || return 45
-    [[ -n "$uploaded" && "$uploaded" > "$published" ]] && published="$uploaded"
-  done <"$scratch/private-py.rows"
-  [[ "$files" != "{}" ]] || return 43
-  jq -cn --argjson files "$files" --arg artifact "$(canonicalize_source "${index}/${norm}/")" --arg published "$published" \
-    '{integrity: {files: $files}, artifact: $artifact, published: $published}'
-}
-
-# Ask go itself for the module hashes, through the private origin only. The
-# credentials stay go's (GOAUTH, default netrc); the cache is a scratch one.
-private_fetch_go() {
-  local core="$1" module="$2" version="$3" origin="$4" scratch="$5"
-  local go_bin rc=0 err sum gomodsum published info
-  go_bin=$(private_real_tool go) || return 46
-  mkdir -p "$scratch/private-go/work"
-  (
-    cd -- "$scratch/private-go/work" || exit 42
-    env GOPROXY="$origin" GONOSUMDB="$module" GOPRIVATE= GONOPROXY= GOINSECURE= \
-      GOFLAGS=-modcacherw GOMODCACHE="$scratch/private-go/modcache" GOPATH="$scratch/private-go/path" \
-      GOTOOLCHAIN=local GOWORK=off GO111MODULE=on \
-      timeout 60 "$go_bin" mod download -json "${module}@${version}"
-  ) >"$scratch/private-go.json" 2>"$scratch/private-go.err" || rc=$?
-  err=$(jq -r '.Error // empty' "$scratch/private-go.json" 2>/dev/null) || err=""
-  if (( rc != 0 )) || [[ -n "$err" ]]; then
-    { printf '%s\n' "$err"; cat "$scratch/private-go.err"; } >"$scratch/private-go.why" 2>/dev/null
-    if grep -Eq '401|403|[Uu]nauthorized|[Ff]orbidden|terminal prompts disabled' "$scratch/private-go.why"; then
-      return 41
-    elif grep -Eq '404|410|[Nn]ot [Ff]ound|unknown revision|invalid version' "$scratch/private-go.why"; then
-      return 43
-    fi
-    return 42
-  fi
-  [[ "$(jq -r '.Version // empty' "$scratch/private-go.json")" == "$version" ]] || return 43
-  sum=$(jq -r '.Sum // empty' "$scratch/private-go.json")
-  gomodsum=$(jq -r '.GoModSum // empty' "$scratch/private-go.json")
-  [[ -n "$sum" && -n "$gomodsum" ]] || return 45
-  info=$(jq -r '.Info // empty' "$scratch/private-go.json")
-  published=""
-  [[ -n "$info" && -f "$info" ]] && published=$(jq -r '.Time // empty' "$info" 2>/dev/null)
-  # The module's own requirements: go install/run builds against them.
-  local gomod requires='null'
-  gomod=$(jq -r '.GoMod // empty' "$scratch/private-go.json")
-  if [[ -n "$gomod" && -f "$gomod" ]]; then
-    requires=$(GOFLAGS= "$go_bin" mod edit -json "$gomod" 2>/dev/null | jq -c '[(.Require // [])[] | .Path]' 2>/dev/null) || requires='null'
-    [[ -n "$requires" ]] || requires='null'
-  fi
-  jq -cn --arg h1 "$sum" --arg mod "$gomodsum" --arg artifact "${module}@${version}" --arg published "$published" \
-    --argjson requires "$requires" \
-    '{integrity: {h1: $h1, mod: $mod}, artifact: $artifact, published: $published, requires: $requires}'
-}
-
-private_fetch() {
-  local ecosystem="$1"
-  shift
-  case "$ecosystem" in
-    npm) private_fetch_npm "$@" ;;
-    python) private_fetch_python "$@" ;;
-    go) private_fetch_go "$@" ;;
-    *) return 42 ;;
-  esac
-}
-
-# Python dependency-confusion guard: every other index pip may consult —
-# effective sources outside the origin, plus PyPI, which pip adds unless the
-# default index was replaced and safe cannot always tell — must NOT serve the
-# private name. Returns 0 clean, 44 shadowed (PRIVATE_SHADOW names where),
-# 42 a probe could not answer.
-private_python_shadow_check() {
-  local core="$1" name="$2" origin="$3" norm src url code
-  local -a probes=()
-  norm=$(private_python_norm "$name")
-  PRIVATE_SHADOW=""
-  for src in ${CHECK_EFFECTIVE_SOURCES:-}; do
-    url=$(source_element_url "$src")
-    "$core" private-trust under-origin --url "$url" --origin "$origin" >/dev/null 2>&1 && continue
-    case "$url" in
-      http://*|https://*) probes+=("${url%/}") ;;
-      *) PRIVATE_SHADOW=$(canonicalize_source "$url"); return 44 ;;
-    esac
-  done
-  probes+=("https://pypi.org/simple")
-  local seen="" p
-  for p in "${probes[@]}"; do
-    [[ " $seen " == *" $p "* ]] && continue
-    seen="$seen $p"
-    code=$(curl -sS --netrc-optional --max-time 10 -o /dev/null -w '%{http_code}' "${p}/${norm}/" 2>/dev/null) || code="000"
-    case "$code" in
-      404|410) ;;
-      200) PRIVATE_SHADOW=$(canonicalize_source "$p"); return 44 ;;
-      *) PRIVATE_SHADOW=$(canonicalize_source "$p"); return 42 ;;
-    esac
-  done
-  return 0
-}
-
-# pip's configuration files in pip's load order (later overrides earlier):
-# global (XDG_CONFIG_DIRS, /etc), user (legacy then XDG; skipped when
-# PIP_CONFIG_FILE names an existing file), site (the active virtualenv), then
-# PIP_CONFIG_FILE. PIP_CONFIG_FILE=/dev/null disables every file. Outside a
-# virtualenv the site prefix is unknown: those candidates are printed with a
-# `site?` tag so callers can fail closed on them.
-private_pip_config_files() {
-  local cfgf="${PIP_CONFIG_FILE:-}" d
-  [[ "$cfgf" == /dev/null ]] && return 0
-  [[ -n "$cfgf" ]] && cfgf=$(anchor_path "$cfgf")
-  local IFS=:
-  for d in ${XDG_CONFIG_DIRS:-/etc/xdg}; do
-    [[ -n "$d" ]] && printf 'global\t%s\n' "$d/pip/pip.conf"
-  done
-  unset IFS
-  printf 'global\t%s\n' /etc/pip.conf
-  if [[ -z "$cfgf" || ! -f "$cfgf" ]]; then
-    printf 'user\t%s\n' "$HOME/.pip/pip.conf" "${XDG_CONFIG_HOME:-$HOME/.config}/pip/pip.conf"
-  fi
-  if [[ -n "${VIRTUAL_ENV:-}" ]]; then
-    printf 'site\t%s\n' "$(anchor_path "$VIRTUAL_ENV")/pip.conf"
-  else
-    printf 'site?\t%s\n' /usr/pip.conf /usr/local/pip.conf
-  fi
-  [[ -n "$cfgf" ]] && printf 'env\t%s\n' "$cfgf"
-  return 0
-}
-
-# `section<TAB>key<TAB>value` for pip config keys $2.. in sections [global]
-# and [install] of file $1 (pip normalizes key spelling).
-private_pip_config_keys() {
-  local rc_file="$1"
-  shift
-  [[ -f "$rc_file" ]] || return 0
-  awk -v keys=" $* " '
-    function norm(s) { s = tolower(s); gsub(/_/, "-", s); sub(/^--/, "", s); return s }
-    function trimmed(s) { sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
-    {
-      line = trimmed($0)
-      if (line == "" || line ~ /^[#;]/) next
-      if (line ~ /^\[/) { sub(/^\[/, "", line); sub(/\].*$/, "", line); sect = tolower(trimmed(line)); next }
-      p = index(line, "="); c = index(line, ":"); d = p
-      if (d == 0 || (c > 0 && c < p)) d = c
-      if (d == 0) next
-      k = norm(trimmed(substr(line, 1, d - 1)))
-      if ((sect == "global" || sect == "install") && index(keys, " " k " ") > 0)
-        printf "%s\t%s\t%s\n", sect, k, trimmed(substr(line, d + 1))
-    }' "$rc_file" 2>/dev/null || true
-}
-
-# Flat artifact sources pip/uv would consult besides indexes: argv
-# (--find-links, threaded by the gate as --find-links-selected), the
-# PIP_FIND_LINKS/UV_FIND_LINKS environment, and find-links in any pip
-# config file. A find-links page lists files at its own URL, so it cannot be
-# probed for a namesake the way an index can; the private lane refuses it.
-private_python_find_links_present() {
-  [[ "${CHECK_FIND_LINKS_SELECTED:-0}" == 1 ]] && return 0
-  [[ -n "${PIP_FIND_LINKS:-}" || -n "${UV_FIND_LINKS:-}" ]] && return 0
-  local layer rc
-  while IFS=$'\t' read -r layer rc; do
-    [[ -n "$(private_pip_config_keys "$rc" find-links)" ]] && return 0
-  done < <(private_pip_config_files; printf 'user\t%s\n' "$HOME/.config/pip/pip.conf")
-  return 1
-}
-
-# The first uv configuration file uv would discover that sets package
-# sources: uv.toml or pyproject.toml ([tool.uv]) in the working directory or
-# a parent, the user file and the system files. Presence of a source key is
-# enough (no TOML parsing); exit 1 when none does.
-private_uv_source_config() {
-  local d f
-  local keys='^[[:space:]]*(\[+[[:space:]]*(index|sources|pip)([].[:space:]]|$)|(index-url|extra-index-url|find-links|no-index|default-index|index|sources)[[:space:]]*=)'
-  d=$(pwd -P)
-  while :; do
-    f="$d/uv.toml"
-    if [[ -f "$f" ]] && grep -Eq "$keys" "$f" 2>/dev/null; then
-      printf '%s' "$f"; return 0
-    fi
-    f="$d/pyproject.toml"
-    if [[ -f "$f" ]] && grep -q 'tool\.uv' "$f" 2>/dev/null \
-      && awk '/^[[:space:]]*\[/ { in_uv = ($0 ~ /^[[:space:]]*\[+[[:space:]]*tool\.uv([].]|$)/) } in_uv' "$f" 2>/dev/null \
-        | sed -E 's/^([[:space:]]*\[+[[:space:]]*)tool\.uv\.?/\1/' | grep -Eq "$keys"; then
-      printf '%s' "$f"; return 0
-    fi
-    [[ "$d" == / ]] && break
-    d=$(dirname -- "$d")
-  done
-  local -a sys=("${XDG_CONFIG_HOME:-$HOME/.config}/uv/uv.toml")
-  local IFS=:
-  for d in ${XDG_CONFIG_DIRS:-/etc/xdg}; do
-    [[ -n "$d" ]] && sys+=("$d/uv/uv.toml")
-  done
-  unset IFS
-  sys+=(/etc/uv/uv.toml)
-  for f in "${sys[@]}"; do
-    if [[ -f "$f" ]] && grep -Eq "$keys" "$f" 2>/dev/null; then
-      printf '%s' "$f"; return 0
-    fi
-  done
-  return 1
-}
-
-# Whether pip itself would skip dependencies without an argv --no-deps:
-# PIP_NO_DEPS when set, else [install] over [global] no-deps across the
-# config files in pip's precedence (pip reads them only outside --isolated;
-# the gate says so with --pip-settings-apply). The --no-dependencies
-# spelling, an unknown site prefix that sets the key, or a value pip would
-# not read as a boolean prove nothing.
-private_pip_effective_no_deps() {
-  [[ -n "${PIP_NO_DEPENDENCIES+x}" ]] && return 1
-  if [[ -n "${PIP_NO_DEPS+x}" ]]; then
-    python_bool_truthy "${PIP_NO_DEPS}"
-    return
-  fi
-  local layer rc sect key val g="" i=""
-  while IFS=$'\t' read -r layer rc; do
-    while IFS=$'\t' read -r sect key val; do
-      [[ -n "$sect" ]] || continue
-      [[ "$key" == no-dependencies || "$layer" == "site?" ]] && return 1
-      if [[ "$sect" == install ]]; then i="$val"; else g="$val"; fi
-    done < <(private_pip_config_keys "$rc" no-deps no-dependencies)
-  done < <(private_pip_config_files)
-  [[ -n "$i" ]] || i="$g"
-  [[ -n "$i" ]] && python_bool_truthy "$i"
-}
-
-# Whole days since an ISO instant; empty when unparseable.
-private_age_days() {
-  local ts="$1" then now
-  [[ -n "$ts" ]] || return 1
-  then=$(date -d "$ts" +%s 2>/dev/null) || return 1
-  now=$(date +%s)
-  printf '%s' $(( (now - then) / 86400 ))
+# The audit line of one bypass.
+private_audit_line() {
+  local ids="$1" origin="$2" name="$3" version="$4" route="${5:-}"
+  printf 'registry=%s origin=%s name=%s version=%s%s' "$ids" "$origin" "$name" "$version" "${route:+ route=${route}}"
 }
 
 # Emit the lane outcome. $1 = gate code (18 allow, 19 operator, 20 block),
-# $2 = decision token, $3 = human detail, $4 = hint, $5 = JSON extra.
+# $2 = decision token, $3 = human detail, $4 = hint, $5 = JSON extra (an
+# allow carries audit_extra, its audit line).
 private_finish() {
   local code="$1" decision="$2" detail="$3" hint="$4" extra_json="${5:-}"
   local version="${PKG_VERSION}" result
@@ -8730,50 +8388,72 @@ private_finish() {
   esac
 }
 
-# Fetch-failure codes to lane outcomes.
-private_fetch_failed() {
-  local rc="$1" origin="$2"
-  case "$rc" in
-    41) private_finish 19 private_registry_auth_missing \
-          "the private registry ${origin} refused the request (credentials missing or rejected) — audit-infrastructure breakage, not a package finding" \
-          "configure the package manager's own credentials for that origin (npm: .npmrc token; go: GOAUTH/~/.netrc; pip: ~/.netrc or the index URL), then retry; an operator may confirm at an interactive terminal" ;;
-    43) private_finish 19 private_version_missing \
-          "this exact version is not published on the private registry ${origin}" \
-          "check the version, or publish it first" ;;
-    44) private_finish 20 private_cross_registry \
-          "the private registry ${origin} points this artifact at another source" \
-          "fix the registry entry; an operator may type the override at an interactive terminal" ;;
-    45) private_finish 19 private_integrity_unusable \
-          "the private registry ${origin} returned no usable integrity for this version" \
-          "republish with integrity metadata (npm sha512, python sha256)" ;;
-    *) private_finish 19 private_registry_unreachable \
-          "the private registry ${origin} could not be reached (or its client is missing) — audit-infrastructure breakage, not a package finding" \
-          "retry when the registry is reachable; an operator may confirm at an interactive terminal" ;;
-  esac
+# npm's own answer for `@scope:registry` in the command's context: its cwd,
+# the selected --userconfig/--globalconfig, and the argv registry selectors
+# the gate threaded (CHECK_REGISTRY). Prints the URL, or nothing when the
+# scope is not mapped (npm then uses its default registry). Returns 46 when
+# no real npm is found, 42 when npm fails.
+private_npm_scope_registry() {
+  local scope="$1" npm_bin out tok
+  npm_bin=$(private_real_tool npm) || return 46
+  local -a args=(config get "${scope}:registry")
+  for tok in ${CHECK_REGISTRY:-}; do
+    [[ "$tok" == "${scope}:registry="* ]] && args+=("--${tok}")
+  done
+  [[ -n "${CHECK_NPM_USERCONFIG:-}" ]] && args+=("--userconfig=${CHECK_NPM_USERCONFIG}")
+  [[ -n "${CHECK_NPM_GLOBALCONFIG:-}" ]] && args+=("--globalconfig=${CHECK_NPM_GLOBALCONFIG}")
+  out=$(cd -- "${CHECK_PROJECT_DIR:-.}" 2>/dev/null && timeout 30 "$npm_bin" "${args[@]}" 2>/dev/null) || return 42
+  out=$(printf '%s' "$out" | tail -n 1 | tr -d '[:space:]')
+  [[ "$out" == undefined || "$out" == null ]] && out=""
+  printf '%s' "$out"
 }
 
-# npm lock-diff lane: every occurrence of name@version in the projected
-# lockfile (aliases included) must come from the origin with one integrity.
-# Prints {sri} or returns 44 (outside origin / disagreeing) / 45 (no integrity).
-private_npm_lockfile_observed() {
-  local core="$1" name="$2" version="$3" origin="$4" lockfile="$5" rows resolved integrity sri=""
-  rows=$(jq -r --arg n "$name" --arg v "$version" '
-    .packages // {} | to_entries[]
-    | select(.key | test("node_modules/"))
-    | select((.value.link // false) | not)
-    | select(((.value.name // (.key | sub(".*node_modules/"; ""))) == $n) and (.value.version == $v))
-    | [(.value.resolved // ""), (.value.integrity // "")] | @tsv' "$lockfile" 2>/dev/null) || return 45
-  [[ -n "$rows" ]] || return 45
-  while IFS=$'\t' read -r resolved integrity; do
-    "$core" private-trust under-origin --url "$resolved" --origin "$origin" >/dev/null 2>&1 || return 44
-    [[ -n "$integrity" ]] || return 45
-    if [[ -z "$sri" ]]; then
-      sri="$integrity"
-    elif [[ "$sri" != "$integrity" ]]; then
-      return 44
-    fi
-  done <<<"$rows"
-  jq -cn --arg sri "$sri" '{sri: $sri}'
+# One `go env` in the command's context, as JSON.
+private_go_env() {
+  local dir="$1" go_bin
+  go_bin=$(private_real_tool go) || return 46
+  (cd -- "$dir" 2>/dev/null && "$go_bin" env -json GOPROXY GONOPROXY GOPRIVATE 2>/dev/null) || return 42
+}
+
+# Where go would fetch modules under namespace prefix $2 from (origin $3),
+# given private_go_env JSON $4. Prints the core's GoRouteResult.
+private_go_route() {
+  local core="$1" ns="$2" origin="$3" goenv="$4"
+  "$core" private-trust go-route --module "$ns" --origin "$origin" \
+    --goproxy "$(jq -r '.GOPROXY // ""' <<<"$goenv")" \
+    --gonoproxy "$(jq -r '.GONOPROXY // ""' <<<"$goenv")" \
+    --goprivate "$(jq -r '.GOPRIVATE // ""' <<<"$goenv")"
+}
+
+# Python namesake probe: every argv index outside the origin, and PyPI
+# (pip's default when no --index-url replaces it), must not serve the name.
+# 0 none does; 44 one does (PRIVATE_SHADOW names it); 42 one is unreachable.
+private_python_shadow_check() {
+  local core="$1" name="$2" origin="$3" norm src url code
+  local -a probes=()
+  norm=$(private_python_norm "$name")
+  PRIVATE_SHADOW=""
+  for src in ${CHECK_REGISTRY:-}; do
+    url=$(source_element_url "$src")
+    "$core" private-trust under-origin --url "$url" --origin "$origin" >/dev/null 2>&1 && continue
+    case "$url" in
+      http://*|https://*) probes+=("${url%/}") ;;
+      *) PRIVATE_SHADOW=$(canonicalize_source "$url"); return 44 ;;
+    esac
+  done
+  probes+=("https://pypi.org/simple")
+  local seen="" p
+  for p in "${probes[@]}"; do
+    [[ " $seen " == *" $p "* ]] && continue
+    seen="$seen $p"
+    code=$(curl -sS --netrc-optional --max-time 10 -o /dev/null -w '%{http_code}' "${p}/${norm}/" 2>/dev/null) || code="000"
+    case "$code" in
+      404|410) ;;
+      200) PRIVATE_SHADOW=$(canonicalize_source "$p"); return 44 ;;
+      *) PRIVATE_SHADOW=$(canonicalize_source "$p"); return 42 ;;
+    esac
+  done
+  return 0
 }
 
 # Returns 255 when PKG_NAME is not on the private lane; otherwise the
@@ -8786,9 +8466,9 @@ private_lane_audit() {
   case "$ecosystem" in npm|go|python) ;; *) return 255 ;; esac
   private_stores_present || return 255
   trust_grant_ok "private-registry" || return 255
-  local core match lane origin pin_mode cooldown ids
+  local core match lane origin ids
   if ! core=$(private_core_bin); then
-    printf 'safe audit: private-registry decision engine missing or version-skewed — audit-infrastructure breakage, not a package finding; rerun install.sh\n' >&2
+    printf '%s\n' "$PRIVATE_CORE_MISSING" >&2
     return 30
   fi
   if ! match=$(private_core "$core" match --ecosystem "$ecosystem" --name "$PKG_NAME" 2>"$scratch/private-core.err"); then
@@ -8808,13 +8488,12 @@ private_lane_audit() {
     *) return 255 ;;
   esac
   origin=$(jq -r '.origin' <<<"$match")
-  pin_mode=$(jq -r '.pin_mode' <<<"$match")
-  cooldown=$(jq -r '.cooldown_days' <<<"$match")
   ids=$(jq -r '.registry_ids | join(",")' <<<"$match")
   local base_extra
-  base_extra=$(jq -c --arg origin "$origin" '{origin: $origin, registry: (.registry_ids | join(",")), pin_mode: .pin_mode,
-    cooldown_days: .cooldown_days, sources: [.sources[] | (.kind + (if .host then ":" + .host else "" end))]}' <<<"$match")
+  base_extra=$(jq -c --arg origin "$origin" '{origin: $origin, registry: (.registry_ids | join(",")),
+    sources: [.sources[] | (.kind + (if .host then ":" + .host else "" end))]}' <<<"$match")
 
+  # The audit line names one exact version (standing exact-pin rule).
   if [[ -z "$PKG_VERSION" || "$PKG_VERSION" == "latest" ]] || ! version_is_exact "$ecosystem" "$PKG_VERSION"; then
     private_finish 19 private_version_not_exact "private packages install by exact version only" \
       "pin one exact version (no ranges, tags or latest)" "$base_extra"
@@ -8827,535 +8506,202 @@ private_lane_audit() {
     return $?
   fi
 
-  # --- source binding, before any fetch. A caller that already holds the
-  # artifact identity the manager will install (go.sum) hands it in.
-  local observed="${PRIVATE_OBSERVED:-}" rc=0
+  local route="" rc=0
   case "$ecosystem" in
     npm)
-      local reg
-      reg=$(npm_registry_url "$PKG_NAME")
-      if ! "$core" private-trust under-origin --url "$reg" --origin "$origin" >/dev/null 2>&1; then
+      if [[ "${CHECK_INSTALLER:-npm}" == "bun" ]]; then
+        private_finish 19 private_route_unmodelled \
+          "bun reads its own registry configuration, which the private-registry lane does not model" \
+          "install it with npm, or an operator may confirm at an interactive terminal" "$base_extra"
+        return $?
+      fi
+      local scope="${PKG_NAME%%/*}" reg
+      reg=$(private_npm_scope_registry "$scope") || rc=$?
+      if (( rc != 0 )); then
+        private_finish 19 private_registry_unreachable \
+          "npm could not report its registry for ${scope} — audit-infrastructure breakage, not a package finding" \
+          "rerun install.sh; an operator may confirm at an interactive terminal" "$base_extra"
+        return $?
+      fi
+      if [[ -z "$reg" ]] || ! "$core" private-trust under-origin --url "$reg" --origin "$origin" >/dev/null 2>&1; then
         private_finish 20 private_cross_registry \
-          "npm would fetch this private name from $(canonicalize_source "$reg"), not from its private registry ${origin}" \
-          "map the scope to the private registry (${PKG_NAME%%/*}:registry=${origin}/); an operator may type the override at an interactive terminal" "$base_extra"
+          "npm would fetch this private name from ${reg:+$(canonicalize_source "$reg")}${reg:-its default registry}, not from its private registry ${origin}" \
+          "map the scope to the private registry (${scope}:registry=${origin}/ in .npmrc); an operator may type the override at an interactive terminal" "$base_extra"
         return $?
       fi
       if [[ -n "${SAFE_AUDIT_ARTIFACT_LOCKFILE:-}" && -f "${SAFE_AUDIT_ARTIFACT_LOCKFILE}" ]]; then
-        observed=$(private_npm_lockfile_observed "$core" "$PKG_NAME" "$PKG_VERSION" "$origin" "$SAFE_AUDIT_ARTIFACT_LOCKFILE") || rc=$?
-        if (( rc == 44 )); then
-          private_finish 20 private_cross_registry \
-            "the lockfile resolves this private name outside ${origin}, or with disagreeing integrity" \
-            "regenerate the lockfile against the private registry; an operator may type the override at an interactive terminal" "$base_extra"
-          return $?
-        elif (( rc != 0 )); then
-          private_finish 19 private_integrity_unusable \
-            "the lockfile carries no usable integrity for this private artifact" \
-            "regenerate the lockfile against the private registry; an operator may confirm at an interactive terminal" "$base_extra"
-          return $?
-        fi
+        local keep_name="$PKG_NAME" keep_version="$PKG_VERSION"
+        rc=0
+        private_npm_lock_sweep "$core" "$SAFE_AUDIT_ARTIFACT_LOCKFILE" "$PKG_NAME" >/dev/null || rc=$?
+        (( rc == 0 )) || return "$rc"
+        PKG_NAME="$keep_name" PKG_VERSION="$keep_version"
       fi
       ;;
+    go)
+      local goenv ns res
+      ns=$(jq -r '.namespace[0]' <<<"$match")
+      if ! goenv=$(private_go_env "${CHECK_PROJECT_DIR:-.}"); then
+        private_finish 19 private_registry_unreachable \
+          "go could not report its module routing — audit-infrastructure breakage, not a package finding" \
+          "rerun install.sh; an operator may confirm at an interactive terminal" "$base_extra"
+        return $?
+      fi
+      res=$(private_go_route "$core" "$ns" "$origin" "$goenv") || res='{}'
+      if [[ "$(jq -r '.ok' <<<"$res")" != true ]]; then
+        private_finish 20 private_cross_registry \
+          "$(jq -r '.reason // "go would not fetch this module from its private registry"' <<<"$res") (${origin})" \
+          "set GOPROXY=${origin},https://proxy.golang.org,direct (local file:// sources may come first) and GONOSUMDB to the module prefix, not GOPRIVATE; an operator may type the override at an interactive terminal" "$base_extra"
+        return $?
+      fi
+      route=$(jq -r '.route' <<<"$res")
+      ;;
     python)
-      local uv_conf=""
-      if [[ "${CHECK_UV_CONFIG:-}" == explicit ]]; then
-        private_finish 19 private_source_unmodelled \
-          "an explicit uv configuration (--config-file, UV_CONFIG_FILE, --directory or --project) is selected; it can add indexes or find-links that safe does not model, so it cannot show uv takes this private name from its private index" \
-          "drop that selector for this install; an operator may confirm at an interactive terminal" "$base_extra"
-        return $?
-      elif [[ "${CHECK_UV_CONFIG:-}" == ambient ]] && uv_conf=$(private_uv_source_config); then
-        private_finish 19 private_source_unmodelled \
-          "uv reads ${uv_conf}, which sets package sources (indexes, find-links or [sources]) that safe does not model, so it cannot show uv takes this private name from its private index" \
-          "run this install with uv --no-config, or an operator may confirm at an interactive terminal" "$base_extra"
+      # Only the routes whose delegate the gate isolates (pip / uv pip
+      # install of explicit specs: no configuration file, no source
+      # environment) have argv as their complete source set.
+      if [[ "${CHECK_PYTHON_ISOLATED:-0}" != 1 ]]; then
+        private_finish 19 private_route_unmodelled \
+          "this install route reads package sources safe does not control (only pip install and uv pip install of explicit specs run with their configuration switched off)" \
+          "install it with pip install / uv pip install --index-url ${origin}/simple <name>==<version>; an operator may confirm at an interactive terminal" "$base_extra"
         return $?
       fi
-      if private_python_find_links_present; then
-        private_finish 20 private_cross_registry \
-          "a find-links source is selected; pip may take this private name's files from it instead of the private index, and safe cannot model that source" \
-          "drop --find-links / PIP_FIND_LINKS / pip config find-links for this install; an operator may type the override at an interactive terminal" "$base_extra"
+      if [[ "${CHECK_UV_CONFIG_FILE:-0}" == 1 ]]; then
+        private_finish 19 private_route_unmodelled \
+          "uv --config-file selects a configuration the private-registry lane does not model" \
+          "drop --config-file for this install; an operator may confirm at an interactive terminal" "$base_extra"
         return $?
       fi
-      if [[ " ${CHECK_EFFECTIVE_SOURCES:-} " == *" local:no-index "* ]]; then
+      if [[ "${CHECK_FIND_LINKS_SELECTED:-0}" == 1 ]]; then
         private_finish 20 private_cross_registry \
-          "--no-index (or PIP_NO_INDEX) ignores every index, so the private registry is not where pip would resolve this name" \
+          "a find-links source is selected; the installer may take this private name's files from it instead of the private index" \
+          "drop --find-links for this install; an operator may type the override at an interactive terminal" "$base_extra"
+        return $?
+      fi
+      if [[ " ${CHECK_REGISTRY:-} " == *" local:no-index "* ]]; then
+        private_finish 20 private_cross_registry \
+          "--no-index ignores every index, so the private registry is not where the installer would resolve this name" \
           "install from the private index without --no-index; an operator may type the override at an interactive terminal" "$base_extra"
         return $?
       fi
       local src under=0
-      for src in ${CHECK_EFFECTIVE_SOURCES:-}; do
+      for src in ${CHECK_REGISTRY:-}; do
         "$core" private-trust under-origin --url "$(source_element_url "$src")" --origin "$origin" >/dev/null 2>&1 && under=1
       done
       if (( ! under )); then
         private_finish 20 private_cross_registry \
-          "no index serving the private registry ${origin} is configured, so pip would resolve this private name elsewhere" \
-          "install with --index-url ${origin}/simple (or the matching pip config); an operator may type the override at an interactive terminal" "$base_extra"
+          "no argv index serves the private registry ${origin}; this install runs with its configuration switched off, so the installer would resolve this private name elsewhere" \
+          "install with --index-url ${origin}/simple; an operator may type the override at an interactive terminal" "$base_extra"
         return $?
       fi
       rc=0
       private_python_shadow_check "$core" "$PKG_NAME" "$origin" || rc=$?
       if (( rc == 44 )); then
         private_finish 20 private_cross_registry \
-          "${PRIVATE_SHADOW} also serves this private name — pip could install that one instead (dependency confusion)" \
-          "rename the package or drop that index for this install; an operator may type the override at an interactive terminal" "$base_extra"
+          "${PRIVATE_SHADOW} also serves this private name — the installer could take that one instead (dependency confusion)" \
+          "drop that index for this install; an operator may type the override at an interactive terminal" "$base_extra"
         return $?
       elif (( rc != 0 )); then
         private_finish 19 private_registry_unreachable \
-          "could not confirm that ${PRIVATE_SHADOW} does not serve this private name — audit-infrastructure breakage, not a package finding" \
-          "retry when the index is reachable; an operator may confirm at an interactive terminal" "$base_extra"
-        return $?
-      fi
-      ;;
-    go)
-      local go_bin goenv route
-      if go_bin=$(private_real_tool go) && goenv=$("$go_bin" env -json GOPROXY GONOPROXY GOPRIVATE 2>/dev/null); then
-        route=$("$core" private-trust go-route --module "$PKG_NAME" --origin "$origin" \
-          --goproxy "$(jq -r '.GOPROXY // ""' <<<"$goenv")" --gonoproxy "$(jq -r '.GONOPROXY // ""' <<<"$goenv")" \
-          --goprivate "$(jq -r '.GOPRIVATE // ""' <<<"$goenv")" 2>/dev/null) || route=""
-        if [[ "$(jq -r '.ok // false' <<<"$route" 2>/dev/null)" != "true" ]]; then
-          private_finish 20 private_cross_registry \
-            "go would not fetch this module from its private registry: $(jq -r '.reason // "unreadable go environment"' <<<"$route" 2>/dev/null)" \
-            "set GOPROXY=${origin},https://proxy.golang.org,direct and GONOSUMDB to the module prefix (not GOPRIVATE); an operator may type the override at an interactive terminal" "$base_extra"
-          return $?
-        fi
-      else
-        private_finish 19 private_registry_unreachable "the go toolchain could not be queried — audit-infrastructure breakage, not a package finding" \
-          "retry; an operator may confirm at an interactive terminal" "$base_extra"
+          "the namesake probe of ${PRIVATE_SHADOW} failed — audit-infrastructure breakage, not a package finding" \
+          "retry when it is reachable; an operator may confirm at an interactive terminal" "$base_extra"
         return $?
       fi
       ;;
   esac
-
-  # --- decide; fetch from the origin only when the decision needs it
-  local decision_json="" decision="" fetched="" fetch_json="" artifact="" published=""
-  if [[ -n "$observed" ]]; then
-    decision_json=$(private_core "$core" decide --ecosystem "$ecosystem" --name "$PKG_NAME" --version "$PKG_VERSION" \
-      --observed "$observed" 2>/dev/null) || decision_json=""
-    decision=$(jq -r '.decision.decision // empty' <<<"$decision_json" 2>/dev/null)
-  fi
-  if [[ "${decision:-}" != "matched" ]] || (( cooldown > 0 )); then
-    rc=0
-    fetch_json=$(private_fetch "$ecosystem" "$core" "$PKG_NAME" "$PKG_VERSION" "$origin" "$scratch") || rc=$?
-    if (( rc != 0 )); then
-      private_fetch_failed "$rc" "$origin"
-      return $?
-    fi
-    fetched=$(jq -c '.integrity' <<<"$fetch_json")
-    artifact=$(jq -r '.artifact // ""' <<<"$fetch_json")
-    published=$(jq -r '.published // ""' <<<"$fetch_json")
-    local -a fetched_arg=()
-    if [[ -n "$observed" ]]; then
-      fetched_arg=(--fetched "$fetched")
-    else
-      observed="$fetched"
-    fi
-    decision_json=$(private_core "$core" decide --ecosystem "$ecosystem" --name "$PKG_NAME" --version "$PKG_VERSION" \
-      --observed "$observed" "${fetched_arg[@]}" 2>"$scratch/private-core.err") || decision_json=""
-    decision=$(jq -r '.decision.decision // empty' <<<"$decision_json" 2>/dev/null)
-  fi
-  [[ -n "$artifact" ]] || artifact=$(jq -r '.pin.artifact // empty' <<<"$decision_json" 2>/dev/null)
-  local integrity_label pin_label="matched"
-  integrity_label=$(jq -r '.decision.observed // {} | [(.sri // empty), (if .h1 then .h1 else empty end),
-    (if .mod then "mod=" + .mod else empty end), ((.files // {}) | to_entries[] | .key + "=sha256:" + .value)] | join(",")' \
-    <<<"$decision_json" 2>/dev/null) || integrity_label=""
-  local detail_extra
-  detail_extra=$(jq -c --arg artifact "$artifact" --arg integrity "$integrity_label" '. + {artifact: $artifact, integrity: $integrity}' <<<"$base_extra")
-
-  case "$decision" in
-    matched)
-      pin_label="matched:$(jq -r '.decision.pinned_by // ""' <<<"$decision_json")"
-      [[ "$(jq -r '.decision.pin_source.kind // ""' <<<"$decision_json")" == "followed" ]] \
-        && pin_label="${pin_label}:followed:$(jq -r '.decision.pin_source.host' <<<"$decision_json")"
-      ;;
-    tofu)
-      local record written
-      record=$("$core" private-trust record --pins "$(trust_store_file "$PRIVATE_PINS_BASE")" --ecosystem "$ecosystem" \
-        --origin "$origin" --name "$PKG_NAME" --version "$PKG_VERSION" --integrity "${fetched:-$observed}" \
-        --artifact "$artifact" --mode tofu 2>"$scratch/private-core.err") || record=""
-      written=$(jq -r '.written // empty' <<<"$record" 2>/dev/null)
-      if [[ "$written" == "true" ]]; then
-        pin_label="tofu-new"
-      elif [[ "$written" == "false" ]] \
-        && [[ "$(private_core "$core" decide --ecosystem "$ecosystem" --name "$PKG_NAME" --version "$PKG_VERSION" \
-              --observed "$observed" 2>/dev/null | jq -r '.decision.decision')" == "matched" ]]; then
-        pin_label="matched:tofu"
-      else
-        private_finish 20 private_artifact_changed \
-          "another install pinned different bytes for this exact version while this one was deciding" \
-          "inspect: safe run private-registry pins; an operator may type the override at an interactive terminal" "$detail_extra"
-        return $?
-      fi
-      ;;
-    missing)
-      private_finish 19 private_pin_missing "the registry requires an operator pin for each version" \
-        "ask the operator to run: safe run private-registry pin add ${PKG_NAME}@${PKG_VERSION} --ecosystem ${ecosystem}" "$detail_extra"
-      return $?
-      ;;
-    changed|revoked|conflict|cross_registry)
-      local token="private_artifact_changed"
-      case "$decision" in
-        revoked) token="private_pin_revoked" ;;
-        conflict) token="private_pin_conflict" ;;
-        cross_registry) token="private_cross_registry" ;;
-      esac
-      private_finish 20 "$token" "$(jq -r '.decision.detail // "integrity mismatch"' <<<"$decision_json")" \
-        "review it: safe run private-registry pins; a reviewed re-pin is safe run private-registry pin replace ${PKG_NAME}@${PKG_VERSION} --ecosystem ${ecosystem}; an operator may type the override at an interactive terminal" "$detail_extra"
-      return $?
-      ;;
-    invalid)
-      if jq -e '.decision.detail // "" | test("two different sha512")' <<<"$decision_json" >/dev/null 2>&1; then
-        private_finish 20 private_integrity_ambiguous \
-          "$(jq -r '.decision.detail' <<<"$decision_json")" \
-          "the lockfile or registry metadata must carry exactly one sha512 digest; an operator may type the override at an interactive terminal" "$detail_extra"
-        return $?
-      fi
-      private_finish 19 private_integrity_unusable \
-        "the artifact identity could not be decided ($(jq -r '.decision.detail // empty' <<<"$decision_json" 2>/dev/null))" \
-        "inspect: safe audit package-audit ${PKG_NAME}@${PKG_VERSION} --ecosystem ${ecosystem}" "$detail_extra"
-      return $?
-      ;;
-    *)
-      private_finish 19 private_integrity_unusable \
-        "the artifact identity could not be decided ($(jq -r '.decision.detail // empty' <<<"$decision_json" 2>/dev/null || head -n 1 "$scratch/private-core.err"))" \
-        "inspect: safe audit package-audit ${PKG_NAME}@${PKG_VERSION} --ecosystem ${ecosystem}" "$detail_extra"
-      return $?
-      ;;
-  esac
-
-  if (( cooldown > 0 )); then
-    local age
-    if ! age=$(private_age_days "$published") || (( age < cooldown )); then
-      private_finish 19 private_cooldown \
-        "inside this registry's ${cooldown}-day cooldown (published ${published:-at an unknown time})" \
-        "wait, or an operator may confirm at an interactive terminal" "$detail_extra"
-      return $?
-    fi
-  fi
-  # Roots-only audit (pre-existing for every root): safe does not audit what a
-  # package manager pulls in beside a named package. The unattended private
-  # allow therefore requires an install that fetches nothing beyond the
-  # checked root (coordinator ruling, review round 1 P5 option A). Project
-  # lanes (lockfile / module-graph sweeps) decide their own entries.
-  if [[ "${PRIVATE_COLLECT:-0}" != 1 && -z "${SAFE_AUDIT_ARTIFACT_LOCKFILE:-}" ]]; then
-    local dep_reason=""
-    case "$ecosystem" in
-      python)
-        if [[ "${CHECK_NO_DEPS_SELECTED:-0}" != 1 ]] \
-          && ! { [[ "${CHECK_PIP_SETTINGS:-0}" == 1 ]] && private_pip_effective_no_deps; }; then
-          dep_reason="the installer would also install this package's dependencies, which safe does not audit before the install"
-        fi
-        ;;
-      npm|go)
-        local requires_json
-        requires_json=$(jq -c '.requires // null' <<<"${fetch_json:-null}" 2>/dev/null) || requires_json='null'
-        if [[ "$requires_json" == "null" || -z "$requires_json" ]]; then
-          dep_reason="this version's dependency list could not be read, so safe cannot show the install fetches nothing beyond it"
-        elif [[ "$(jq 'length' <<<"$requires_json")" != "0" ]]; then
-          dep_reason="this version declares dependencies ($(jq -r 'join(", ")' <<<"$requires_json")) that the install would fetch without a safe audit"
-        fi
-        ;;
-    esac
-    if [[ -n "$dep_reason" ]]; then
-      local dep_hint
-      case "$ecosystem" in
-        python) dep_hint="install its dependencies first as exact pins (each is audited), then this package with --no-deps; or an operator may confirm at an interactive terminal" ;;
-        npm) dep_hint="install it inside an npm project (the project lane checks the lockfile), or install its dependencies first as exact pins; or an operator may confirm at an interactive terminal" ;;
-        go) dep_hint="build it as a requirement of a Go module (the project lane checks go.mod and go.sum); or an operator may confirm at an interactive terminal" ;;
-      esac
-      private_finish 19 private_dependencies_unaudited "$dep_reason" "$dep_hint" "$detail_extra"
-      return $?
-    fi
-  fi
-  local extra_line
-  extra_line="registry=${ids} origin=${origin} artifact=${artifact:-${PKG_NAME}@${PKG_VERSION}} integrity=${integrity_label} pin=${pin_label} cooldown=${cooldown}"
-  private_finish 18 ALLOWED_VIA_PRIVATE_REGISTRY "$extra_line" "" \
-    "$(jq -c --arg line "$extra_line" --arg pin "$pin_label" '. + {audit_extra: $line, pin: $pin}' <<<"$detail_extra")"
+  local line
+  line=$(private_audit_line "$ids" "$origin" "$PKG_NAME" "$PKG_VERSION" "$route")
+  private_finish 18 ALLOWED_VIA_PRIVATE_REGISTRY "$line" "" \
+    "$(jq -c --arg line "$line" '. + {audit_extra: $line}' <<<"$base_extra")"
 }
 
-# `safe audit private-fetch <name>@<version> --ecosystem <eco>`: the integrity
-# a private registry serves for one exact version, for the operator commands
-# (pin add/replace, host-allow add of a private name). Prints
-# {origin, registry_ids, integrity, artifact, published}. Exits 3 when the name
-# is not on the private lane, 30 when the decision engine is unusable, and the
-# fetcher codes (41 credentials, 42 unreachable, 43 missing, 44 outside the
-# origin, 45 unusable integrity, 46 client missing) otherwise.
-private_fetch_command() {
-  local spec="" ecosystem=""
-  local CHECK_DIST_TAG="" CHECK_REGISTRY="" CHECK_PROJECT_DIR="" CHECK_NPM_USERCONFIG="" CHECK_NPM_GLOBALCONFIG=""
-  local CHECK_EFFECTIVE_SOURCES="" CHECK_INSTALLER=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --ecosystem) [[ $# -ge 2 ]] || die "--ecosystem requires a value"; ecosystem="$2"; shift 2 ;;
-      -*) die "unknown private-fetch flag: $1" ;;
-      *) spec="$1"; shift ;;
-    esac
-  done
-  [[ -n "$spec" && -n "$ecosystem" ]] || die "usage: safe audit private-fetch <name>@<version> --ecosystem npm|go|python"
-  case "$ecosystem" in pip|pypi|py|uv|pipx) ecosystem="python" ;; bun) ecosystem="npm" ;; esac
-  parse_pkg_spec "$spec"
-  CHECK_INSTALLER=$(default_installer_for "$ecosystem")
-  case "$ecosystem" in npm|go|python) ;; *) return 3 ;; esac
-  private_stores_present || return 3
-  trust_grant_ok "private-registry" 2>/dev/null || return 3
-  derive_effective_sources "$ecosystem" "$PKG_NAME"
-  local core match origin scratch rc=0 out
-  core=$(private_core_bin) || { printf 'safe audit: private-registry decision engine missing or version-skewed; rerun install.sh\n' >&2; return 30; }
-  match=$(private_core "$core" match --ecosystem "$ecosystem" --name "$PKG_NAME") || return 30
-  if [[ "$(jq -r '.lane' <<<"$match")" != "private" ]]; then
-    printf 'safe audit: %s is not on a private registry lane (%s)\n' "$PKG_NAME" "$(jq -r '.lane' <<<"$match")" >&2
-    return 3
-  fi
-  version_is_exact "$ecosystem" "$PKG_VERSION" || { printf 'safe audit: %s is not an exact version\n' "$PKG_VERSION" >&2; return 43; }
-  [[ "$ecosystem" == "npm" ]] && PKG_VERSION="${PKG_VERSION#v}"
-  origin=$(jq -r '.origin' <<<"$match")
-  new_scratch_dir scratch
-  out=$(private_fetch "$ecosystem" "$core" "$PKG_NAME" "$PKG_VERSION" "$origin" "$scratch") || rc=$?
-  rm -rf "$scratch"
-  (( rc == 0 )) || return "$rc"
-  jq -c --argjson match "$match" --arg version "$PKG_VERSION" \
-    '. + {name: $match.name, version: $version, ecosystem: $match.ecosystem, origin: $match.origin, registry_ids: $match.registry_ids}' <<<"$out"
-}
-
-# `safe audit private-gosum --project-dir <dir> [--gate install] [-- <go argv>]`:
-# the Go project lane. Every module the operation can download that is on a
-# private lane must match its pin, or be confirmed against the private origin
-# and pinned on first use; a missing go.sum line is never authorization. The
-# identity set is read from the context the go command actually selects: the
-# module root above the working directory (go -C followed), an alternate
-# -modfile (argv, GOFLAGS or the go env file) with its own .sum, or every
-# module and go.work.sum of an active workspace — requirements with replaces
-# applied, every sum entry, and explicit `go mod download <mod>@<ver>`
-# targets. An operation that may add requirements itself (go mod tidy, or
-# -mod=mod) is first checked for private imports no requirement pins.
-# Pre-1.17 graphs and unreadable contexts fail closed to the operator while a
-# Go private registry is configured.
-# Exit 0 when nothing private is involved, 18 when every private module
-# passed (SAFE_AUDIT_RESULT_OUT carries one audit line per module),
-# otherwise the first refusal's 19/20/30.
-private_gosum_command() {
-  local project_dir="." gate=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --project-dir) [[ $# -ge 2 ]] || die "--project-dir requires a value"; project_dir="$2"; shift 2 ;;
-      --gate) [[ $# -ge 2 ]] || die "--gate requires a value"; gate="$2"; shift 2 ;;
-      --) shift; break ;;
-      *) die "unknown private-gosum flag: $1" ;;
-    esac
-  done
-  local -a go_argv=("$@")
-  private_stores_present || return 0
-  trust_grant_ok "private-registry" || return 0
-  local core rc=0
-  core=$(private_core_bin) || { printf 'safe audit: private-registry decision engine missing or version-skewed; rerun install.sh\n' >&2; return 30; }
-  private_has_registry "$core" go || { rc=$?; (( rc == 1 )) && return 0; printf 'safe audit: the private-registry trust stores are malformed — repair them at an operator terminal; nothing was decided\n' >&2; return 30; }
-  PRIVATE_ECO="go" PRIVATE_GATE="$gate" PRIVATE_JSON=0
-  # go -C <dir> runs the command in another directory: follow it. -modfile
-  # and -mod come from argv, else from the effective GOFLAGS.
-  local i a modfile="" modflag="" sub="" sub2="" skip=0
-  for (( i=0; i<${#go_argv[@]}; i++ )); do
-    a="${go_argv[$i]}"
-    if (( skip )); then skip=0; continue; fi
-    case "$a" in
-      -C|--C) project_dir="${go_argv[$((i+1))]:-$project_dir}"; skip=1; continue ;;
-      -C=*|--C=*) project_dir="${a#*=}"; continue ;;
-      -modfile|--modfile) modfile="${go_argv[$((i+1))]:-}"; skip=1; continue ;;
-      -modfile=*|--modfile=*) modfile="${a#*=}"; continue ;;
-      -mod|--mod) modflag="${go_argv[$((i+1))]:-}"; skip=1; continue ;;
-      -mod=*|--mod=*) modflag="${a#*=}"; continue ;;
-      -*) continue ;;
-    esac
-    if [[ -z "$sub" ]]; then sub="$a"; elif [[ -z "$sub2" ]]; then sub2="$a"; fi
-  done
-  # `go mod download <module>@<version>` names modules explicitly, inside a
-  # module or not: each one is a download target too (a query such as
-  # @latest is not an exact version and asks the operator on the lane).
-  local explicit='[]' seen_dl=0
-  for a in "${go_argv[@]}"; do
-    if (( seen_dl )); then
-      [[ "$a" == -* || "$a" != *@* ]] && continue
-      explicit=$(jq -c --arg m "${a%@*}" --arg v "${a##*@}" '. + [{module: $m, version: $v}]' <<<"$explicit")
-    elif [[ "$sub" == mod && "$a" == download ]]; then
-      seen_dl=1
-    fi
-  done
-  local root="" has_mod=0
-  if root=$(cd -- "$project_dir" 2>/dev/null && pwd -P); then
-    while [[ "$root" != "/" && ! -f "$root/go.mod" ]]; do root=$(dirname -- "$root"); done
-    [[ -f "$root/go.mod" ]] && has_mod=1
-  fi
-  (( has_mod )) || [[ "$explicit" != "[]" ]] || return 0
-  local go_bin scratch entries row any=0 goflags="" gowork="" t unreadable=""
-  new_scratch_dir scratch
-  if ! go_bin=$(private_real_tool go); then
-    PKG_NAME="go" PKG_VERSION="project"
-    private_finish 19 private_registry_unreachable "go could not be found to read the module graph — audit-infrastructure breakage, not a package finding" \
-      "rerun install.sh; an operator may confirm at an interactive terminal"
-    rc=$?; rm -rf "$scratch"; return "$rc"
-  fi
-  if (( has_mod )); then
-    goflags=$(cd -- "$project_dir" && "$go_bin" env GOFLAGS 2>/dev/null) || goflags=""
-    for t in $goflags; do
-      case "$t" in
-        -modfile=*|--modfile=*) [[ -n "$modfile" ]] || modfile="${t#*=}" ;;
-        -mod=*|--mod=*) [[ -n "$modflag" ]] || modflag="${t#*=}" ;;
-      esac
-    done
-    gowork=$(cd -- "$project_dir" && GOFLAGS= "$go_bin" env GOWORK 2>/dev/null) || gowork=""
-    [[ "$gowork" == off ]] && gowork=""
-  fi
-  # The module files and sum files of the selected context.
-  local -a modfiles=() sumfiles=()
-  if [[ -n "$gowork" ]]; then
-    local workjson wdir u
-    if workjson=$(GOFLAGS= "$go_bin" work edit -json "$gowork" 2>/dev/null); then
-      wdir=$(dirname -- "$gowork")
-      while IFS= read -r u; do
-        [[ -n "$u" ]] || continue
-        [[ "$u" == /* ]] || u="$wdir/$u"
-        modfiles+=("$u/go.mod"); sumfiles+=("$u/go.sum")
-      done < <(jq -r '.Use[]?.DiskPath' <<<"$workjson")
-      sumfiles+=("$wdir/go.work.sum")
-    else
-      unreadable="the workspace file ${gowork} could not be read"
-    fi
-  elif (( has_mod )); then
-    if [[ -n "$modfile" ]]; then
-      [[ "$modfile" == /* ]] || modfile="${project_dir%/}/$modfile"
-      modfiles+=("$modfile"); sumfiles+=("${modfile%.mod}.sum")
-    else
-      modfiles+=("$root/go.mod"); sumfiles+=("$root/go.sum")
-    fi
-  fi
-  local modjson='{"Go":"1.17","Require":[],"Replace":[],"Modules":[]}' one f
-  for f in "${modfiles[@]}"; do
-    if ! one=$(GOFLAGS= "$go_bin" mod edit -json "$f" 2>/dev/null); then
-      unreadable="the module file ${f} could not be read by the go toolchain"
-      break
-    fi
-    modjson=$(jq -c --argjson o "$one" '
-      .Require += ($o.Require // []) | .Replace = (($o.Replace // []) + .Replace)
-      | .Modules += [($o.Module.Path // "")]
-      | .Go = ([.Go, ($o.Go // "")] | if any(. == "") then "" else min_by(split(".") | map(tonumber? // 0)) end)' <<<"$modjson")
-  done
-  if [[ -n "$gowork" && -z "$unreadable" ]]; then
-    modjson=$(jq -c --argjson w "$workjson" '.Replace += ($w.Replace // [])' <<<"$modjson")
-  fi
-  entries='[]'
-  for f in "${sumfiles[@]}"; do
-    [[ -f "$f" ]] || continue
-    if ! one=$("$core" private-trust gosum --file "$f" 2>/dev/null); then
-      unreadable="the sum file ${f} is malformed"
-      break
-    fi
-    entries=$(jq -c --argjson o "$one" '. + $o' <<<"$entries")
-  done
-  local go_directive
-  go_directive=$(jq -r '.Go // ""' <<<"$modjson")
-  if [[ -z "$unreadable" ]] && (( ${#modfiles[@]} )) \
-    && { [[ -z "$go_directive" ]] || ! printf '%s\n%s\n' "1.17" "$go_directive" | sort -V -C; }; then
-    unreadable="a go.mod older than go 1.17 does not list its full module graph"
-  fi
-  if [[ -n "$unreadable" ]]; then
-    PKG_NAME="go" PKG_VERSION="project"
+# Sweep an npm lockfile (v1, v2 or v3) for private entries. An entry's
+# identities are its install path name, its declared `name` and an alias
+# target (`npm:@scope/x@v`); when any identity lies in a registered
+# namespace, the entry's `resolved` URL must lie under that origin (npm
+# fetches lockfile entries from `resolved`). With $3 set, only entries with
+# that identity count. Prints `name<TAB>version<TAB>origin<TAB>ids` per
+# private entry; refuses with 20 (outside the origin) or 19 (no resolved
+# URL, a bundled or unparseable entry) through private_finish.
+private_npm_lock_sweep() {
+  local core="$1" lockfile="$2" only="${3:-}" rows names matches
+  rows=$(jq -r '
+    def v1: to_entries[] | .key as $k | .value as $v
+      | ($v.version // "") as $ver
+      | (if ($ver | startswith("npm:")) then ($ver | ltrimstr("npm:") | sub("@[^@]*$"; "")) else "" end) as $alias
+      | (if ($ver | startswith("npm:")) then ($ver | sub("^.*@"; "")) else $ver end) as $version
+      | ([$k, "", $alias, $version, ($v.resolved // ""),
+          (if $v.bundled then "bundle" elif ($ver | test("^(file|link):")) then "link" else "" end)] | join("\u001f")),
+        ($v.dependencies // {} | v1);
+    if (.packages | type) == "object" then
+      .packages | to_entries[] | select(.key | test("(^|/)node_modules/")) | .key as $k | .value as $v
+      | [($k | sub("^.*node_modules/"; "")), ($v.name // ""), "", ($v.version // ""), ($v.resolved // ""),
+         (if $v.link then "link" elif $v.inBundle then "bundle" else "" end)] | join("\u001f")
+    elif (.dependencies | type) == "object" then .dependencies | v1
+    else error("no packages or dependencies map") end' "$lockfile" 2>/dev/null) || {
+    PKG_NAME="${only:-project}" PKG_VERSION="lockfile"
     private_finish 19 private_project_unmodelled \
-      "a Go private registry is configured, and ${unreadable}, so safe cannot show which private modules this command downloads" \
-      "run the command where the module graph is readable, or an operator may confirm at an interactive terminal"
-    rc=$?; rm -rf "$scratch"; return "$rc"
-  fi
-  # A command that may add requirements itself resolves a new import to a
-  # version nothing has decided yet: every private import must already be
-  # provided by a requirement (or a module of this context).
-  if [[ "$sub" == mod && "$sub2" == tidy ]] || [[ "$modflag" == mod ]]; then
-    local imports uncovered dir
-    : > "$scratch/imports"
-    for f in "${modfiles[@]}"; do
-      dir=$(dirname -- "$f")
-      [[ -n "$modfile" && -z "$gowork" ]] && dir="$root"
-      ( cd -- "$dir" && GOFLAGS= GOPROXY=off "$go_bin" list -e -mod=readonly \
-          ${modfile:+-modfile="$modfile"} \
-          -f '{{join .Imports "\n"}}{{"\n"}}{{join .TestImports "\n"}}{{"\n"}}{{join .XTestImports "\n"}}' ./... ) \
-        >> "$scratch/imports" 2>/dev/null || true
+      "the npm lockfile $(basename "$lockfile") could not be read, so safe cannot show where its private entries come from" \
+      "regenerate the lockfile with a current npm; an operator may confirm at an interactive terminal"
+    return $?
+  }
+  names=$(cut -d $'\x1f' -f1-3 <<<"$rows" | tr '\037' '\n' | { grep -v '^$' || true; } | sort -u)
+  [[ -n "$names" ]] || return 0
+  matches=$(private_core "$core" match-names --ecosystem npm <<<"$names" 2>/dev/null) || { printf '%s\n' "$PRIVATE_STORES_MALFORMED" >&2; return 30; }
+  [[ "$(jq 'length' <<<"$matches")" != 0 ]] || return 0
+  local p d a version resolved flag ident lane morigin mids
+  while IFS=$'\x1f' read -r p d a version resolved flag; do
+    [[ -n "$p$d$a" ]] || continue
+    for ident in "$p" "$d" "$a"; do
+      [[ -n "$ident" ]] || continue
+      [[ -z "$only" || "$ident" == "$only" || "$p" == "$only" || "$d" == "$only" || "$a" == "$only" ]] || continue
+      lane=$(jq -r --arg n "$ident" 'map(select(.name == $n)) | first | .lane // "none"' <<<"$matches")
+      [[ "$lane" != none ]] || continue
+      PKG_NAME="$ident" PKG_VERSION="${version:-unknown}"
+      if [[ "$lane" == conflict ]]; then
+        private_finish 19 private_registry_conflict \
+          "two trusted sources declare this name private on different origins" \
+          "remove one registry (safe run private-registry list); an operator may confirm at an interactive terminal"
+        return $?
+      fi
+      morigin=$(jq -r --arg n "$ident" 'map(select(.name == $n)) | first | .origin' <<<"$matches")
+      mids=$(jq -r --arg n "$ident" 'map(select(.name == $n)) | first | .registry_ids | join(",")' <<<"$matches")
+      case "$flag" in
+        link) continue ;;
+        bundle)
+          private_finish 19 private_project_unmodelled \
+            "the lockfile installs this private name bundled inside another package, so its bytes do not come from ${morigin}" \
+            "depend on it directly from the private registry; an operator may confirm at an interactive terminal"
+          return $?
+          ;;
+      esac
+      if [[ -z "$resolved" ]]; then
+        private_finish 19 private_project_unmodelled \
+          "the lockfile entry ${p} records no resolved URL, so safe cannot show it comes from ${morigin}" \
+          "regenerate the lockfile against the private registry; an operator may confirm at an interactive terminal"
+        return $?
+      fi
+      if ! "$core" private-trust under-origin --url "$resolved" --origin "$morigin" >/dev/null 2>&1; then
+        private_finish 20 private_cross_registry \
+          "the lockfile resolves this private name (entry ${p}) from $(canonicalize_source "$resolved"), not from its private registry ${morigin}" \
+          "regenerate the lockfile against the private registry; an operator may type the override at an interactive terminal"
+        return $?
+      fi
+      printf '%s\t%s\t%s\t%s\n' "$ident" "${version:-unknown}" "$morigin" "$mids"
     done
-    imports=$(sort -u "$scratch/imports" | grep -v '^$' || true)
-    if [[ -n "$imports" ]]; then
-      local imatches
-      if ! imatches=$(printf '%s\n' "$imports" | private_core "$core" match-names --ecosystem go 2>/dev/null); then
-        rm -rf "$scratch"; return 30
-      fi
-      uncovered=$(jq -r --argjson m "$modjson" '
-        ([$m.Require[]?.Path] + $m.Modules | map(select(. != ""))) as $have
-        | .[].name | select(. as $i | $have | any(. as $p | $i == $p or ($i | startswith($p + "/"))) | not)' <<<"$imatches")
-      if [[ -n "$uncovered" ]]; then
-        PKG_NAME=$(head -n 1 <<<"$uncovered") PKG_VERSION="unrequired"
-        private_finish 19 private_import_unrequired \
-          "this command may add requirements, and the code imports private-registry packages no requirement pins ($(paste -sd, <<<"$uncovered" | sed 's/,/, /g')); go would pick a version safe has not decided" \
-          "require an exact version first (go mod edit -require=<module>@<version>), then rerun; or an operator may confirm at an interactive terminal"
-        rc=$?; rm -rf "$scratch"; return "$rc"
-      fi
-    fi
-  fi
-  # The module identities this operation can download: every requirement
-  # (replace directives applied, the workspace's last; a local-directory
-  # replacement downloads nothing), every sum entry, and explicit targets.
-  local targets
-  targets=$(jq -c --argjson sum "$entries" --argjson explicit "$explicit" '
-    (.Replace // []) as $rep
-    | [ (.Require // [])[]
-        | . as $r
-        | ([ $rep[] | select(.Old.Path == $r.Path and ((.Old.Version // "") == "" or .Old.Version == $r.Version)) ] | last) as $x
-        | if $x == null then {module: $r.Path, version: $r.Version}
-          elif ($x.New.Version // "") == "" then empty
-          else {module: $x.New.Path, version: $x.New.Version} end ]
-      + [ $sum[] | {module, version} ]
-      + $ARGS.named.explicit
-    | unique_by(.module + "@" + .version)
-    | map(. as $t | ($sum | map(select(.module == $t.module and .version == $t.version)) | first) as $s
-          | $t + {h1: ($s.h1 // ""), mod: ($s.mod // "")})' <<<"$modjson") || { rm -rf "$scratch"; return 30; }
-  local matches
-  if ! matches=$(jq -r '.[].module' <<<"$targets" | private_core "$core" match-names --ecosystem go 2>/dev/null); then
-    rm -rf "$scratch"
-    return 30
-  fi
-  if [[ "$(jq 'length' <<<"$matches")" == "0" ]]; then
-    rm -rf "$scratch"
-    return 0
-  fi
-  local -a PRIVATE_COLLECTED=()
-  local PRIVATE_COLLECT=1 PRIVATE_OBSERVED
-  local CHECK_EFFECTIVE_SOURCES="" CHECK_PROJECT_DIR="$project_dir"
-  while IFS= read -r row; do
-    PKG_NAME=$(jq -r '.module' <<<"$row")
-    PKG_VERSION=$(jq -r '.version' <<<"$row")
-    if [[ -n "$(jq -r '.mod' <<<"$row")" ]]; then
-      PRIVATE_OBSERVED=$(jq -c '{mod: .mod} + (if .h1 != "" then {h1: .h1} else {} end)' <<<"$row")
-    else
-      PRIVATE_OBSERVED=""
-    fi
-    rc=0
-    private_lane_audit go "$gate" 0 "$scratch" || rc=$?
-    case "$rc" in
-      255) continue ;;
-      18) any=1 ;;
-      *) rm -rf "$scratch"; return "$rc" ;;
-    esac
-  done < <(jq -c '.[]' <<<"$targets")
-  rm -rf "$scratch"
-  (( any )) || return 0
-  if [[ -n "${SAFE_AUDIT_RESULT_OUT:-}" ]]; then
-    printf '%s\n' "${PRIVATE_COLLECTED[@]}" | jq -s '{gate_exit: 18, private_registry_lines: .}' > "$SAFE_AUDIT_RESULT_OUT" 2>/dev/null \
-      || rm -f -- "$SAFE_AUDIT_RESULT_OUT"
-  fi
-  return 18
+  done <<<"$rows"
+  return 0
 }
 
 # `safe audit private-npm-project --tool <npm|pnpm|yarn|bun> --class <class>
 #  --project-dir <dir> [--gate install] [--npm-userconfig F] [--npm-globalconfig F]
-#  -- <manager argv>`: the npm-family project lane of the private-registry
-# trust. Every private identity the operation can materialize is decided
-# BEFORE delegation: `npm ci` installs the lockfile as it stands; every other
-# project operation is projected first (`--package-lock-only` in a scratch
-# copy) and the projected lockfile is swept. Private names reached through a
-# manager whose lockfile safe does not model (pnpm, yarn, bun), a workspace
-# root, or a projection-redirecting flag fail closed to the operator (19).
-# Exit 0 when the project names nothing private; 18 when every private entry
+#  -- <manager argv>`: the npm-family project lane. With an npm private
+# registry configured, before delegation: every registered scope npm maps
+# must map to its origin (a scope mapped elsewhere, or unmapped while the
+# operation names a private package of it, BLOCKs); every private entry of
+# the current lockfile must resolve under its origin. New resolutions take
+# the checked scope mapping. Private names in a pnpm/yarn/bun project, an npm
+# workspace root or behind a lockfile-redirecting flag ask (19).
+# Exit 0 when nothing private is involved, 18 when every private entry
 # passed (SAFE_AUDIT_RESULT_OUT carries one audit line per entry); otherwise
 # the first refusal's 19/20, or 30 when nothing could be decided.
 private_npm_project_command() {
@@ -9379,168 +8725,254 @@ private_npm_project_command() {
   trust_grant_ok "private-registry" || return 0
   [[ -f "${project_dir%/}/package.json" ]] || return 0
   CHECK_PROJECT_DIR="$project_dir"
-  local core scratch names matches lockfile="" rc=0 lock_name=""
-  core=$(private_core_bin) || { printf 'safe audit: private-registry decision engine missing or version-skewed; rerun install.sh\n' >&2; return 30; }
-  new_scratch_dir scratch
+  local core regs rc=0 lock_name="" a
+  core=$(private_core_bin) || { printf '%s\n' "$PRIVATE_CORE_MISSING" >&2; return 30; }
+  regs=$(private_registries "$core" npm) || { printf '%s\n' "$PRIVATE_STORES_MALFORMED" >&2; return 30; }
+  [[ "$(jq 'length' <<<"$regs")" != 0 ]] || return 0
+  PRIVATE_ECO="npm" PRIVATE_GATE="$gate" PRIVATE_JSON=0 PKG_VERSION="project"
   [[ -f "${project_dir%/}/npm-shrinkwrap.json" ]] && lock_name="npm-shrinkwrap.json"
   [[ -z "$lock_name" && -f "${project_dir%/}/package-lock.json" ]] && lock_name="package-lock.json"
-  # Names this operation can touch: the manifest's dependency maps, the
-  # current lockfile, and the package argv (a spec's name part).
-  {
+  # Names visible before the operation: manifest maps (alias targets
+  # included), the argv package names, the lockfile identities.
+  local visible
+  visible=$({
     jq -r '[.dependencies, .devDependencies, .optionalDependencies, .peerDependencies]
-      | map(select(type == "object") | keys[]) | .[]' "${project_dir%/}/package.json" 2>/dev/null
-    [[ -n "$lock_name" ]] && jq -r '(.packages // {} | to_entries[]
-      | select(.key | test("node_modules/")) | (.value.name // (.key | sub(".*node_modules/"; "")))),
-      (.dependencies // {} | .. | objects | .dependencies? // empty | objects | keys[]),
-      (.dependencies // {} | objects | keys[])' \
-      "${project_dir%/}/$lock_name" 2>/dev/null
-    local a
+      | map(select(type == "object") | to_entries[]) | .[]
+      | .key, (.value | strings | select(startswith("npm:")) | ltrimstr("npm:") | sub("@[^@]*$"; ""))' \
+      "${project_dir%/}/package.json" 2>/dev/null || true
     for a in "${manager_argv[@]}"; do
       case "$a" in
         -*) ;;
+        *@npm:*) a="${a#*@npm:}"; printf '%s\n' "${a%@*}" ;;
         @*/*@*) printf '%s\n' "${a%@*}" ;;
         @*/*) printf '%s\n' "$a" ;;
         *@*) printf '%s\n' "${a%@*}" ;;
         *) printf '%s\n' "$a" ;;
       esac
     done
-  } > "$scratch/names"
-  if ! matches=$(private_core "$core" match-names --ecosystem npm < "$scratch/names" 2>"$scratch/core.err"); then
-    printf 'safe audit: the private-registry trust stores are malformed (%s) — repair them at an operator terminal; nothing was decided\n' \
-      "$(head -n 1 "$scratch/core.err" | sed 's/^safe-core: //')" >&2
-    rm -rf "$scratch"
-    return 30
-  fi
-  PRIVATE_ECO="npm" PRIVATE_GATE="$gate" PRIVATE_JSON=0
-  PKG_VERSION="project"
-  local unmodelled="" visible=1
-  [[ "$(jq 'length' <<<"$matches")" == "0" ]] && visible=0
-  if (( ! visible )); then
-    # Nothing private is visible yet. `ci` installs the lockfile as it
-    # stands (its names were all read above); any other npm operation can
-    # resolve new identities, so it is projected while an npm private
-    # registry is configured. Other managers' resolutions are not projected
-    # (documented limit).
-    if [[ "$class" == "ci" || "$tool" != "npm" ]]; then
-      rm -rf "$scratch"
-      return 0
+    [[ -n "$lock_name" ]] && jq -r '
+      def v1: to_entries[] | .key, (.value.version // "" | select(startswith("npm:")) | ltrimstr("npm:") | sub("@[^@]*$"; "")), (.value.dependencies // {} | v1);
+      (.packages // {} | to_entries[] | select(.key | test("(^|/)node_modules/")) | (.key | sub("^.*node_modules/"; "")), (.value.name // empty)),
+      (.dependencies // {} | v1)' "${project_dir%/}/$lock_name" 2>/dev/null
+    true
+  } | { grep -v '^$' || true; } | sort -u | private_core "$core" match-names --ecosystem npm 2>/dev/null) \
+    || { printf '%s\n' "$PRIVATE_STORES_MALFORMED" >&2; return 30; }
+  local nvisible
+  nvisible=$(jq 'length' <<<"$visible")
+  PKG_NAME=$(jq -r '.[0].name // "project"' <<<"$visible")
+  if (( nvisible > 0 )); then
+    local unmodelled=""
+    if [[ "$tool" != "npm" ]]; then
+      unmodelled="${tool} resolution is not modelled by the private-registry lane"
+    elif jq -e 'has("workspaces")' "${project_dir%/}/package.json" >/dev/null 2>&1; then
+      unmodelled="npm workspace roots are not modelled by the private-registry lane"
+    else
+      for a in "${manager_argv[@]}"; do
+        case "$a" in
+          --|--prefix|--prefix=*|-C|--cwd|--cwd=*|--dir|--dir=*|-g|--global|--global=*|--location|--location=*|--package-lock=false|--no-package-lock|--lockfile-version|--lockfile-version=*)
+            unmodelled="the npm argument ${a%%=*} redirects or disables the lockfile safe reads"; break ;;
+        esac
+      done
     fi
+    if [[ -n "$unmodelled" ]]; then
+      private_finish 19 private_project_unmodelled \
+        "this ${tool} project operation touches private-registry names ($(jq -r 'map(.name) | join(", ")' <<<"$visible")), and ${unmodelled}" \
+        "use npm without that argument in the project root, or an operator may confirm at an interactive terminal"
+      return $?
+    fi
+  elif [[ "$tool" != "npm" ]]; then
+    return 0
+  fi
+  # Scope mapping: new resolutions of a registered scope go where npm maps it.
+  local scope origin reg row
+  while IFS=$'\t' read -r scope origin; do
+    [[ -n "$scope" ]] || continue
     rc=0
-    private_has_registry "$core" npm || rc=$?
+    reg=$(private_npm_scope_registry "$scope") || rc=$?
     if (( rc != 0 )); then
-      rm -rf "$scratch"
-      (( rc == 1 )) && return 0
-      return 30
-    fi
-    PKG_NAME="project"
-  else
-    PKG_NAME=$(jq -r '.[0].name' <<<"$matches")
-  fi
-  if [[ "$tool" != "npm" ]]; then
-    unmodelled="${tool} lockfiles are not modelled by the private-registry lane"
-  elif jq -e 'has("workspaces")' "${project_dir%/}/package.json" >/dev/null 2>&1; then
-    unmodelled="npm workspace roots are not modelled by the private-registry lane"
-  else
-    for a in "${manager_argv[@]}"; do
-      case "$a" in
-        --|--prefix|--prefix=*|-C|--cwd|--cwd=*|--dir|--dir=*|-g|--global|--global=*|--location|--location=*|--package-lock=false|--no-package-lock|--lockfile-version|--lockfile-version=*)
-          unmodelled="the npm argument ${a%%=*} redirects or disables the lockfile safe would project"; break ;;
-      esac
-    done
-  fi
-  if [[ -n "$unmodelled" ]]; then
-    local touched="touches private-registry names ($(jq -r 'map(.name) | join(", ")' <<<"$matches"))"
-    (( visible )) || touched="may resolve private-registry packages (an npm private registry is configured)"
-    private_finish 19 private_project_unmodelled \
-      "this ${tool} project operation ${touched}, and ${unmodelled}" \
-      "use npm without that argument in the project root, or an operator may confirm at an interactive terminal"
-    rc=$?
-    rm -rf "$scratch"
-    return "$rc"
-  fi
-  if [[ "$class" == "ci" ]]; then
-    [[ -n "$lock_name" ]] || { rm -rf "$scratch"; return 0; }
-    lockfile="${project_dir%/}/$lock_name"
-  else
-    local npm_bin
-    if ! npm_bin=$(private_real_tool npm); then
-      private_finish 19 private_registry_unreachable "npm could not be found to project the lockfile — audit-infrastructure breakage, not a package finding" \
+      (( nvisible > 0 )) || continue
+      PKG_NAME="$scope"
+      private_finish 19 private_registry_unreachable \
+        "npm could not report its registry for ${scope} — audit-infrastructure breakage, not a package finding" \
         "rerun install.sh; an operator may confirm at an interactive terminal"
-      rc=$?; rm -rf "$scratch"; return "$rc"
+      return $?
     fi
-    mkdir -p "$scratch/proj"
-    cp -- "${project_dir%/}/package.json" "$scratch/proj/package.json" || { rm -rf "$scratch"; return 30; }
-    [[ -n "$lock_name" ]] && { cp -- "${project_dir%/}/$lock_name" "$scratch/proj/$lock_name" || { rm -rf "$scratch"; return 30; }; }
-    [[ -f "${project_dir%/}/.npmrc" ]] && { cp -- "${project_dir%/}/.npmrc" "$scratch/proj/.npmrc" || { rm -rf "$scratch"; return 30; }; }
-    local -a cfg=()
-    [[ -n "$CHECK_NPM_USERCONFIG" ]] && cfg+=("--userconfig=${CHECK_NPM_USERCONFIG}")
-    [[ -n "$CHECK_NPM_GLOBALCONFIG" ]] && cfg+=("--globalconfig=${CHECK_NPM_GLOBALCONFIG}")
-    rc=0
-    ( cd -- "$scratch/proj" && timeout 120 "$npm_bin" "${manager_argv[@]}" "${cfg[@]}" \
-        --package-lock-only --ignore-scripts --no-audit --no-fund ) >"$scratch/projection.log" 2>&1 || rc=$?
-    lock_name="package-lock.json"
-    [[ -f "$scratch/proj/npm-shrinkwrap.json" ]] && lock_name="npm-shrinkwrap.json"
-    if (( rc != 0 )) || [[ ! -f "$scratch/proj/$lock_name" ]]; then
-      if grep -Eq 'E401|E403|ENEEDAUTH' "$scratch/projection.log" 2>/dev/null; then
-        private_finish 19 private_registry_auth_missing \
-          "the lockfile projection for this private project was refused by a registry (credentials missing or rejected) — audit-infrastructure breakage, not a package finding" \
-          "configure npm's own credentials for the private registry, then retry; an operator may confirm at an interactive terminal"
-      else
-        private_finish 19 private_registry_unreachable \
-          "the lockfile projection for this private project failed (exit ${rc}) — audit-infrastructure breakage, not a package finding" \
-          "retry when the registries are reachable; an operator may confirm at an interactive terminal"
-      fi
-      rc=$?; rm -rf "$scratch"; return "$rc"
+    if [[ -z "$reg" ]]; then
+      jq -e --arg s "$scope/" 'any(.[]; .name | startswith($s))' <<<"$visible" >/dev/null || continue
+    elif "$core" private-trust under-origin --url "$reg" --origin "$origin" >/dev/null 2>&1; then
+      continue
     fi
-    lockfile="$scratch/proj/$lock_name"
-  fi
-  # A lockfile without the `packages` map (lockfileVersion 1) records its
-  # tree differently; it is not swept, and a private name in it asks.
-  if ! jq -e '.packages | type == "object"' "$lockfile" >/dev/null 2>&1; then
-    local touched="touches private-registry names ($(jq -r 'map(.name) | join(", ")' <<<"$matches"))"
-    (( visible )) || touched="may resolve private-registry packages (an npm private registry is configured)"
-    private_finish 19 private_project_unmodelled \
-      "this ${tool} project operation ${touched}, and its lockfile (lockfileVersion 1) is not modelled by the private-registry lane" \
-      "upgrade the lockfile with a current npm (npm install --package-lock-only), or an operator may confirm at an interactive terminal"
-    rc=$?
-    rm -rf "$scratch"
-    return "$rc"
-  fi
-  # Sweep every private identity of that lockfile (the projection may have
-  # introduced or changed some; a partial tree reifies unchanged ones too).
-  local projected_names
-  projected_names=$(jq -r '.packages // {} | to_entries[]
-      | select(.key | test("node_modules/")) | select((.value.link // false) | not)
-      | (.value.name // (.key | sub(".*node_modules/"; "")))' "$lockfile" 2>/dev/null)
-  if ! matches=$(printf '%s\n' "$projected_names" | private_core "$core" match-names --ecosystem npm 2>/dev/null); then
-    rm -rf "$scratch"
-    return 30
-  fi
+    PKG_NAME="$scope"
+    private_finish 20 private_cross_registry \
+      "npm maps ${scope} to ${reg:+$(canonicalize_source "$reg")}${reg:-its default registry}, not to its private registry ${origin}" \
+      "map the scope to the private registry (${scope}:registry=${origin}/ in .npmrc); an operator may type the override at an interactive terminal"
+    return $?
+  done < <(jq -r '.[] | .origin as $o | .namespace[] | select(startswith("@")) | [(split("/")[0]), $o] | @tsv' <<<"$regs" | sort -u)
+  # The current lockfile: npm installs its entries from their resolved URLs.
   local -a PRIVATE_COLLECTED=()
-  local PRIVATE_COLLECT=1 any=0 row
-  local SAFE_AUDIT_ARTIFACT_LOCKFILE="$lockfile"
-  while IFS=$'\t' read -r PKG_NAME PKG_VERSION; do
-    [[ -n "$PKG_NAME" ]] || continue
-    rc=0
-    private_lane_audit npm "$gate" 0 "$scratch" || rc=$?
-    case "$rc" in
-      255) ;;
-      18) any=1 ;;
-      *) rm -rf "$scratch"; return "$rc" ;;
-    esac
-  done < <(jq -r --argjson m "$matches" '($m | map(.name)) as $names
-      | .packages // {} | to_entries[]
-      | select(.key | test("node_modules/")) | select((.value.link // false) | not)
-      | (.value.name // (.key | sub(".*node_modules/"; ""))) as $n
-      | select($names | index($n) != null)
-      | [$n, (.value.version // "")] | @tsv' "$lockfile" | sort -u)
-  rm -rf "$scratch"
-  (( any )) || return 0
+  if [[ -n "$lock_name" ]]; then
+    local sweep name version morigin mids line
+    sweep=$(private_npm_lock_sweep "$core" "${project_dir%/}/$lock_name") || return $?
+    while IFS=$'\t' read -r name version morigin mids; do
+      [[ -n "$name" ]] || continue
+      line=$(private_audit_line "$mids" "$morigin" "$name" "$version")
+      PRIVATE_COLLECTED+=("$(jq -cn --arg p "${name}@${version}" --arg e "$line" '{package: $p, extra: $e}')")
+      printf '[safe audit] ALLOWED_VIA_PRIVATE_REGISTRY: %s@%s — %s\n' "$name" "$version" "$line" >&2
+    done < <(sort -u <<<"$sweep")
+  fi
+  (( ${#PRIVATE_COLLECTED[@]} > 0 )) || return 0
   if [[ -n "${SAFE_AUDIT_RESULT_OUT:-}" ]]; then
     printf '%s\n' "${PRIVATE_COLLECTED[@]}" | jq -s '{gate_exit: 18, private_registry_lines: .}' > "$SAFE_AUDIT_RESULT_OUT" 2>/dev/null \
       || rm -f -- "$SAFE_AUDIT_RESULT_OUT"
   fi
   return 18
+}
+
+# `safe audit private-go --project-dir <dir> [--gate install] [-- <go argv>]`:
+# the Go lane for module-downloading commands. With a Go private registry
+# configured, `go env` in the command's context (go -C followed) must route
+# every registered namespace to its origin: local file:// GOPROXY entries
+# may come first (a local artifact), any other entry ahead of the origin,
+# `direct`, or GONOPROXY/GOPRIVATE covering the namespace BLOCKs. The module
+# graph is not read for the decision; namespace requirements of the selected
+# go.mod (or -modfile) and explicit `go mod download <mod>@<ver>` targets are
+# read for the audit lines only. Exit 0 when no Go registry is configured or
+# nothing private is named, 18 with audit lines, 19/20 on refusal, 30 when
+# nothing could be decided.
+private_go_command() {
+  local project_dir="." gate=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project-dir) [[ $# -ge 2 ]] || die "--project-dir requires a value"; project_dir="$2"; shift 2 ;;
+      --gate) [[ $# -ge 2 ]] || die "--gate requires a value"; gate="$2"; shift 2 ;;
+      --) shift; break ;;
+      *) die "unknown private-go flag: $1" ;;
+    esac
+  done
+  local -a go_argv=("$@")
+  private_stores_present || return 0
+  trust_grant_ok "private-registry" || return 0
+  local core regs
+  core=$(private_core_bin) || { printf '%s\n' "$PRIVATE_CORE_MISSING" >&2; return 30; }
+  regs=$(private_registries "$core" go) || { printf '%s\n' "$PRIVATE_STORES_MALFORMED" >&2; return 30; }
+  [[ "$(jq 'length' <<<"$regs")" != 0 ]] || return 0
+  PRIVATE_ECO="go" PRIVATE_GATE="$gate" PRIVATE_JSON=0
+  local i a modfile="" sub="" skip=0
+  for (( i=0; i<${#go_argv[@]}; i++ )); do
+    a="${go_argv[$i]}"
+    if (( skip )); then skip=0; continue; fi
+    case "$a" in
+      -C|--C) project_dir="${go_argv[$((i+1))]:-$project_dir}"; skip=1 ;;
+      -C=*|--C=*) project_dir="${a#*=}" ;;
+      -modfile|--modfile) modfile="${go_argv[$((i+1))]:-}"; skip=1 ;;
+      -modfile=*|--modfile=*) modfile="${a#*=}" ;;
+      -*) ;;
+      *) [[ -n "$sub" ]] || sub="$a" ;;
+    esac
+  done
+  local goenv
+  if ! goenv=$(private_go_env "$project_dir"); then
+    PKG_NAME="go" PKG_VERSION="project"
+    private_finish 19 private_registry_unreachable \
+      "go could not report its module routing — audit-infrastructure breakage, not a package finding" \
+      "rerun install.sh; an operator may confirm at an interactive terminal"
+    return $?
+  fi
+  local ns origin id res
+  local -A routes=()
+  while IFS=$'\t' read -r id origin ns; do
+    [[ -n "$ns" ]] || continue
+    res=$(private_go_route "$core" "$ns" "$origin" "$goenv") || res='{}'
+    if [[ "$(jq -r '.ok' <<<"$res")" != true ]]; then
+      PKG_NAME="$ns" PKG_VERSION="project"
+      private_finish 20 private_cross_registry \
+        "$(jq -r '.reason // "go would not fetch these modules from their private registry"' <<<"$res") (${origin})" \
+        "set GOPROXY=${origin},https://proxy.golang.org,direct (local file:// sources may come first) and GONOSUMDB to the module prefix, not GOPRIVATE; an operator may type the override at an interactive terminal"
+      return $?
+    fi
+    routes["$ns"]="${id}"$'\t'"${origin}"$'\t'"$(jq -r '.route' <<<"$res")"
+  done < <(jq -r '.[] | .id as $i | .origin as $o | .namespace[] | [$i, $o, .] | @tsv' <<<"$regs")
+  # Audit lines (log only): namespace requirements of the selected module
+  # file, and explicit download targets.
+  local root="" file="" names=""
+  if root=$(cd -- "$project_dir" 2>/dev/null && pwd -P); then
+    while [[ "$root" != "/" && ! -f "$root/go.mod" ]]; do root=$(dirname -- "$root"); done
+    [[ -f "$root/go.mod" ]] && file="$root/go.mod"
+  fi
+  if [[ -n "$modfile" ]]; then
+    [[ "$modfile" == /* ]] || modfile="${project_dir%/}/$modfile"
+    file="$modfile"
+  fi
+  local go_bin modjson="" readable=1
+  if [[ -n "$file" ]] && go_bin=$(private_real_tool go); then
+    modjson=$(GOFLAGS= "$go_bin" mod edit -json "$file" 2>/dev/null) || readable=0
+  fi
+  names=$({
+    [[ -n "$modjson" ]] && jq -r '(.Require // [])[] | [.Path, .Version] | @tsv' <<<"$modjson"
+    if [[ "$sub" == mod ]]; then
+      local seen_dl=0
+      for a in "${go_argv[@]}"; do
+        if (( seen_dl )); then
+          [[ "$a" == -* || "$a" != *@* ]] || printf '%s\t%s\n' "${a%@*}" "${a##*@}"
+        elif [[ "$a" == download ]]; then
+          seen_dl=1
+        fi
+      done
+    fi
+  })
+  local -a PRIVATE_COLLECTED=()
+  local name version line r
+  while IFS=$'\t' read -r name version; do
+    [[ -n "$name" ]] || continue
+    for ns in "${!routes[@]}"; do
+      [[ "$name" == "$ns" || "$name" == "$ns/"* ]] || continue
+      IFS=$'\t' read -r id origin r <<<"${routes[$ns]}"
+      line=$(private_audit_line "$id" "$origin" "$name" "$version" "$r")
+      PRIVATE_COLLECTED+=("$(jq -cn --arg p "${name}@${version}" --arg e "$line" '{package: $p, extra: $e}')")
+      break
+    done
+  done < <(sort -u <<<"$names")
+  if (( ! readable )); then
+    for ns in "${!routes[@]}"; do
+      IFS=$'\t' read -r id origin r <<<"${routes[$ns]}"
+      line=$(private_audit_line "$id" "$origin" "$ns" "unknown" "$r")
+      PRIVATE_COLLECTED+=("$(jq -cn --arg p "${ns}@go-${sub:-command}" --arg e "$line" '{package: $p, extra: $e}')")
+    done
+  fi
+  (( ${#PRIVATE_COLLECTED[@]} > 0 )) || return 0
+  if [[ -n "${SAFE_AUDIT_RESULT_OUT:-}" ]]; then
+    printf '%s\n' "${PRIVATE_COLLECTED[@]}" | jq -s '{gate_exit: 18, private_registry_lines: .}' > "$SAFE_AUDIT_RESULT_OUT" 2>/dev/null \
+      || rm -f -- "$SAFE_AUDIT_RESULT_OUT"
+  fi
+  return 18
+}
+
+# `safe audit private-python-project [--gate install] -- <requirement files>`:
+# a private Python name inside -r/-c files is installed by a route the lane
+# does not isolate; it asks (19). Exit 0 when the files name nothing private.
+private_python_project_command() {
+  local gate=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --gate) gate="$2"; shift 2 ;;
+      --) shift; break ;;
+      *) die "unknown private-python-project flag: $1" ;;
+    esac
+  done
+  private_stores_present || return 0
+  trust_grant_ok "private-registry" || return 0
+  local core matches f
+  core=$(private_core_bin) || { printf '%s\n' "$PRIVATE_CORE_MISSING" >&2; return 30; }
+  matches=$(for f in "$@"; do
+      [[ ! -f "$f" ]] || sed -nE 's/^[[:space:]]*([A-Za-z0-9][A-Za-z0-9._-]*).*/\1/p' "$f"
+    done | sort -u | private_core "$core" match-names --ecosystem python 2>/dev/null) \
+    || { printf '%s\n' "$PRIVATE_STORES_MALFORMED" >&2; return 30; }
+  [[ "$(jq 'length' <<<"$matches")" != 0 ]] || return 0
+  PRIVATE_ECO="python" PRIVATE_GATE="$gate" PRIVATE_JSON=0 PKG_VERSION="requirements"
+  PKG_NAME=$(jq -r '.[0].name' <<<"$matches")
+  private_finish 19 private_route_unmodelled \
+    "a requirements file names private-registry packages ($(jq -r 'map(.name) | join(", ")' <<<"$matches")); that route reads package sources safe does not control" \
+    "install them as explicit specs (pip install --index-url <origin>/simple <name>==<version>), or an operator may confirm at an interactive terminal"
 }
 
 package_audit_command() {
@@ -9551,8 +8983,8 @@ package_audit_command() {
   # floor; the receipt writer derives evidence identity from it.
   local CHECK_DIST_TAG="" CHECK_REGISTRY="" CHECK_PROJECT_DIR=""
   local CHECK_NPM_USERCONFIG="" CHECK_NPM_GLOBALCONFIG=""
-  local CHECK_EFFECTIVE_SOURCES="" CHECK_INSTALLER="" CHECK_FIND_LINKS_SELECTED=0 CHECK_NO_DEPS_SELECTED=0
-  local CHECK_PIP_SETTINGS=0 CHECK_UV_CONFIG=""
+  local CHECK_EFFECTIVE_SOURCES="" CHECK_INSTALLER="" CHECK_FIND_LINKS_SELECTED=0
+  local CHECK_PYTHON_ISOLATED=0 CHECK_UV_CONFIG_FILE=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --ecosystem)
@@ -9585,18 +9017,13 @@ package_audit_command() {
         CHECK_FIND_LINKS_SELECTED=1
         shift
         ;;
-      --no-deps-selected)
-        CHECK_NO_DEPS_SELECTED=1
+      --python-isolated)
+        CHECK_PYTHON_ISOLATED=1
         shift
         ;;
-      --pip-settings-apply)
-        CHECK_PIP_SETTINGS=1
+      --uv-config-file-selected)
+        CHECK_UV_CONFIG_FILE=1
         shift
-        ;;
-      --uv-config)
-        [[ $# -lt 2 ]] && die "--uv-config requires a value"
-        case "$2" in explicit|ambient) CHECK_UV_CONFIG="$2" ;; *) die "unknown --uv-config: $2" ;; esac
-        shift 2
         ;;
       --op)
         [[ $# -lt 2 ]] && die "--op requires a value"
@@ -11965,9 +11392,9 @@ main() {
   fi
   case "$cmd" in
     package-audit) shift; package_audit_command "$@" ;;
-    private-fetch) shift; private_fetch_command "$@" ;;
-    private-gosum) shift; private_gosum_command "$@" ;;
+    private-go) shift; private_go_command "$@" ;;
     private-npm-project) shift; private_npm_project_command "$@" ;;
+    private-python-project) shift; private_python_project_command "$@" ;;
     # The alias callers keep reaching for (my-safe-gate said `check` for
     # years); identical surface, canonical name stays package-audit.
     check) shift; package_audit_command "$@" ;;

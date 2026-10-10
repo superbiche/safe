@@ -98,7 +98,7 @@ Flow:
    operator terminal a BLOCK on one exact version takes a typed override; an
    override recorded on this host is gate-only exit 17 (terminal confirm).
    A name on an operator-authorized private registry is decided by the
-   private lane instead: bound to its origin and pinned integrity, it
+   private lane instead: trusted when npm fetches it from its origin, it
    proceeds unattended (gate-only exit 18), asks the operator (19) or
    BLOCKs (20, class `private`) — see [private registries](private-registries.md).
 5. The real command runs through the first non-wrapper `npm` on PATH.

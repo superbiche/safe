@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Private-registry trust: the install-gate lane, its gate termini and the
-# operator commands. Registries, clients and network are fixtures: fake npm,
-# go and curl binaries on PATH stand in for the ecosystem clients the lane
-# runs, so no request leaves the machine and no credential exists.
+# Private-registry trust (trusted origins, ruling a37): the install-gate
+# lane, its gate termini and the operator commands. Registries, clients and
+# network are fixtures: fake npm, go and curl binaries on PATH stand in for
+# the ecosystem clients the lane asks, so no request leaves the machine and
+# no credential exists.
 
 set -uo pipefail
 
@@ -43,117 +44,64 @@ CORE="$SAFE_CORE_BIN"
 NPM_ORIGIN="https://git.example.test:8443/api/packages/owner/npm"
 GO_ORIGIN="https://git.example.test:8443/api/packages/owner/go"
 PY_ORIGIN="https://git.example.test:8443/api/packages/owner/pypi"
+EVIL="https://evil.example.test"
 SRI_A="sha512-$(printf 'A%.0s' {1..86})=="
-SRI_B="sha512-$(printf 'B%.0s' {1..86})=="
-H1_A="h1:$(printf 'a%.0s' {1..43})="
-H1_B="h1:$(printf 'b%.0s' {1..43})="
-SHA_A="$(printf 'a%.0s' {1..64})"
-SHA_B="$(printf 'b%.0s' {1..64})"
 SECRET="fixture-secret-token-must-never-appear"
-export NPM_ORIGIN GO_ORIGIN PY_ORIGIN SRI_A SRI_B H1_A H1_B SHA_A SHA_B SECRET
+export NPM_ORIGIN GO_ORIGIN PY_ORIGIN EVIL SRI_A SECRET
 
 # --- fake clients ----------------------------------------------------------
+# npm answers `config get <scope>:registry` from an argv --<scope>:registry,
+# else FAKE_NPM_SCOPE_REG, else the private origin; it never views metadata.
 cat > "$tmp/bin/npm" <<'NPM'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$tmp/npm.argv"
-case "${FAKE_NPM_MODE:-ok}" in
-  e401) printf 'npm error code E401\nnpm error Unable to authenticate, token %s\n' "$SECRET" >&2; exit 1 ;;
-  e404) printf 'npm error code E404\n' >&2; exit 1 ;;
-esac
-if [[ " $* " == *" --package-lock-only "* ]]; then
-  # Projection: the lockfile npm would write for this operation.
-  [[ -n "${FAKE_PROJECTION_LOCK:-}" ]] || exit 1
-  cp "$FAKE_PROJECTION_LOCK" package-lock.json
+if [[ "$1 $2" == "config get" ]]; then
+  key="$3"
+  for a in "$@"; do
+    [[ "$a" == "--${key}="* ]] && { printf '%s\n' "${a#*=}"; exit 0; }
+  done
+  [[ "${FAKE_NPM_MODE:-ok}" == fail ]] && exit 1
+  printf '%s\n' "${FAKE_NPM_SCOPE_REG-$NPM_ORIGIN/}"
   exit 0
 fi
-spec="$2"; version="${spec##*@}"
-# npm >= 12 answers a multi-field `view --json` with a one-element array.
-body=$(cat <<JSON
-{"version":"$version","dist":{"tarball":"${FAKE_TARBALL_BASE:-$NPM_ORIGIN}/@p%2fx/-/$version/x-$version.tgz","integrity":"${FAKE_SRI:-$SRI_A}"},"time":{"$version":"${FAKE_PUBLISHED:-2026-01-01T00:00:00Z}"}${FAKE_NPM_DEPS:+,$FAKE_NPM_DEPS}}
-JSON
-)
-case "${FAKE_NPM_SHAPE:-array}" in
-  array) printf '[%s]\n' "$body" ;;
-  object) printf '%s\n' "$body" ;;
-  multi) printf '[%s,%s]\n' "$body" "$body" ;;
-esac
+exit 0
 NPM
+# go answers `env -json` from FAKE_GOPROXY/FAKE_GONOPROXY/FAKE_GOPRIVATE and
+# `mod edit -json <file>` from <file>.fakejson (or FAKE_GO_MODJSON).
 cat > "$tmp/bin/go" <<'GO'
 #!/usr/bin/env bash
-printf '%s GOPROXY=%s\n' "$*" "${GOPROXY:-}" >> "$tmp/go.argv"
-if [[ "$1 $2" == "env GOWORK" ]]; then
-  printf '%s\n' "${FAKE_GOWORK:-}"
-  exit 0
-fi
-if [[ "$1 $2" == "env GOFLAGS" ]]; then
-  printf '%s\n' "${FAKE_GOFLAGS:-}"
-  exit 0
-fi
-if [[ "$1 $2 $3" == "work edit -json" ]]; then
-  cat "${FAKE_GOWORK_JSON:?}"
-  exit 0
-fi
-if [[ "$1" == list ]]; then
-  # the imports of the main module's packages
-  printf '%s\n' ${FAKE_GO_IMPORTS:-}
+printf '%s cwd=%s\n' "$*" "$PWD" >> "$tmp/go.argv"
+if [[ "$1 $2" == "env -json" ]]; then
+  jq -cn --arg p "${FAKE_GOPROXY-$GO_ORIGIN,https://proxy.golang.org,direct}" --arg n "${FAKE_GONOPROXY-}" --arg v "${FAKE_GOPRIVATE-}" \
+    '{GOPROXY: $p, GONOPROXY: $n, GOPRIVATE: $v}'
   exit 0
 fi
 if [[ "$1 $2 $3" == "mod edit -json" ]]; then
-  if [[ "${4:-}" == */dep.mod ]]; then
-    # the downloaded module's own go.mod
-    printf '%s\n' "${FAKE_GO_DEP_MODJSON:-{\"Require\":null\}}"
-  elif [[ "${4:-}" == *missing* ]]; then
-    printf 'go: cannot read %s\n' "$4" >&2
-    exit 1
-  elif [[ -n "${4:-}" && -f "$4.fakejson" ]]; then
-    cat "$4.fakejson"
-  else
-    cat "${FAKE_GO_MODJSON:?}"
-  fi
-  exit 0
-fi
-if [[ "$1" == env ]]; then
-  jq -cn --arg p "${GOPROXY-}" --arg n "${GONOPROXY-}" --arg v "${GOPRIVATE-}" '{GOPROXY: $p, GONOPROXY: $n, GOPRIVATE: $v}'
-  exit 0
-fi
-if [[ "$1 $2" == "mod download" ]]; then
-  mv="${!#}"
-  if [[ "${FAKE_GO_MODE:-ok}" == e401 ]]; then
-    jq -cn --arg e "reading $GOPROXY: 401 Unauthorized" '{Error: $e}'; exit 1
-  fi
-  mkdir -p "$GOMODCACHE"; printf '{"Version":"%s","Time":"2026-01-01T00:00:00Z"}' "${mv##*@}" > "$GOMODCACHE/info.json"
-  printf 'module %s\n' "${mv%@*}" > "$GOMODCACHE/dep.mod"
-  jq -cn --arg p "${mv%@*}" --arg v "${mv##*@}" --arg s "${FAKE_GO_H1:-$H1_A}" --arg m "${FAKE_GO_MOD:-$H1_B}" --arg i "$GOMODCACHE/info.json" --arg g "$GOMODCACHE/dep.mod" \
-    '{Path: $p, Version: $v, Sum: $s, GoModSum: $m, Info: $i, GoMod: $g}'
+  if [[ -f "${4:-}.fakejson" ]]; then cat "$4.fakejson"; exit 0; fi
+  [[ -n "${FAKE_GO_MODJSON:-}" ]] || exit 1
+  cat "$FAKE_GO_MODJSON"
   exit 0
 fi
 exit 0
 GO
+# curl answers the Python namesake probes: other indexes FAKE_OTHER_CODE,
+# PyPI FAKE_PYPI_CODE (404 = absent).
 cat > "$tmp/bin/curl" <<'CURL'
 #!/usr/bin/env bash
-out="" hdr="" w="" url="${!#}"
+w="" url="${!#}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -o) out="$2"; shift 2 ;;
-    -D) hdr="$2"; shift 2 ;;
     -w) w="$2"; shift 2 ;;
-    -H|--max-time) shift 2 ;;
+    -o|-D|-H|--max-time) shift 2 ;;
     *) shift ;;
   esac
 done
 printf '%s\n' "$url" >> "$tmp/curl.urls"
-code=404 body="" ctype="text/html"
 case "$(sed -E 's#://[^@/]+@#://#' <<<"$url")" in
-  "$PY_ORIGIN"/simple/caviar-redact/)
-    code="${FAKE_PY_CODE:-200}"; ctype="application/vnd.pypi.simple.v1+json"
-    body=$(jq -cn --arg o "${FAKE_PY_FILE_BASE:-$PY_ORIGIN}" --arg a "${FAKE_PY_SHA:-$SHA_A}" --arg b "$SHA_B" \
-      '{files: [{filename: "caviar_redact-0.2.0-py3-none-any.whl", url: ($o + "/files/caviar-redact/0.2.0/caviar_redact-0.2.0-py3-none-any.whl"), hashes: {sha256: $a}, "upload-time": "2026-01-01T00:00:00Z"},
-                {filename: "caviar_redact-0.2.0.tar.gz", url: ($o + "/files/caviar-redact/0.2.0/caviar_redact-0.2.0.tar.gz"), hashes: {sha256: $b}},
-                {filename: "caviar_redact-0.1.0.tar.gz", url: ($o + "/files/x"), hashes: {sha256: $b}}]}') ;;
-  https://pypi.org/simple/caviar-redact/) code="${FAKE_PYPI_CODE:-404}" ;;
+  https://pypi.org/simple/*) code="${FAKE_PYPI_CODE:-404}" ;;
+  "$PY_ORIGIN"/*) code=200 ;;
+  *) code="${FAKE_OTHER_CODE:-404}" ;;
 esac
-[[ -z "$out" ]] || printf '%s' "$body" > "$out"
-[[ -z "$hdr" ]] || printf 'HTTP/1.1 %s\r\ncontent-type: %s\r\n\r\n' "$code" "$ctype" > "$hdr"
 [[ -z "$w" ]] || printf '%s' "$code"
 exit 0
 CURL
@@ -161,179 +109,150 @@ chmod +x "$tmp/bin/npm" "$tmp/bin/go" "$tmp/bin/curl"
 printf '@p:registry=%s/\n//git.example.test:8443/api/packages/owner/npm/:_authToken=%s\n' "$NPM_ORIGIN" "$SECRET" > "$HOME/.npmrc"
 
 policy="$SAFE_RUN_CONFIG_DIR/private-registries.json"
-pins="$SAFE_RUN_CONFIG_DIR/private-pins.json"
-add_registry() { # id eco origin namespace [pin_mode]
+add_registry() { # id eco origin namespace
   "$CORE" private-trust registry-add --policy "$policy" --id "$1" --ecosystem "$2" --origin "$3" \
-    --namespace "$4" --pin-mode "${5:-tofu}" --reason test >/dev/null || fail "registry-add $1"
+    --namespace "$4" --reason test >/dev/null || fail "registry-add $1"
 }
-reset_state() { rm -f "$policy" "$pins" "$tmp/npm.argv" "$tmp/go.argv" "$tmp/curl.urls" "$SAFE_AUDIT_AUDIT_LOG"; }
-# audit <spec> <eco> [extra env...]: gate-mode package audit; sets rc and result
+reset_state() { rm -f "$policy" "$tmp/npm.argv" "$tmp/go.argv" "$tmp/curl.urls" "$SAFE_AUDIT_AUDIT_LOG"; }
+# audit <spec> <eco> [env...] [-- package-audit flags...]: gate-mode audit
 audit() {
   local spec="$1" eco="$2"
   shift 2
+  local -a envs=() flags=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do envs+=("$1"); shift; done
+  [[ "${1:-}" == "--" ]] && { shift; flags=("$@"); }
   rm -f "$tmp/result.json"
   rc=0
-  # python: the shape the pip gate passes outside --isolated (pip reads
-  # PIP_NO_DEPS and its config files).
-  local -a ctx=()
-  [[ "$eco" == python ]] && ctx=(--pip-settings-apply)
-  env "$@" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" package-audit "$spec" --ecosystem "$eco" --gate install "${ctx[@]}" \
+  env "${envs[@]}" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" package-audit "$spec" --ecosystem "$eco" --gate install "${flags[@]}" \
     > "$tmp/out" 2>&1 || rc=$?
 }
+decision() { jq -r '.private_registry.decision // empty' "$tmp/result.json" 2>/dev/null; }
 no_secret() {
-  ! grep -rqs "$SECRET" "$tmp/out" "$tmp/result.json" "$SAFE_AUDIT_AUDIT_LOG" "$pins" "$policy" "$tmp/data" \
+  ! grep -rqs "$SECRET" "$tmp/out" "$tmp/result.json" "$SAFE_AUDIT_AUDIT_LOG" "$policy" "$tmp/data" \
     || fail "the registry credential leaked: $1"
 }
 
 # --- not configured: nothing changes -----------------------------------------
 reset_state
-rc=0; "$AUDIT" private-fetch @p/x@1.0.0 --ecosystem npm > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 3 ]] || fail "private-fetch without a policy: rc=$rc $(cat "$tmp/out")"
-pass "no private-registry policy: the public path is untouched (private-fetch reports not-private)"
+mkdir -p "$tmp/fix/plain"; printf '{"name":"a","version":"1.0.0","dependencies":{"@p/x":"1.0.0"}}\n' > "$tmp/fix/plain/package.json"
+rc=0; "$AUDIT" private-npm-project --tool npm --class install --project-dir "$tmp/fix/plain" --gate install -- install > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 0 && ! -e "$tmp/npm.argv" ]] || fail "unconfigured npm project lane: rc=$rc"
+rc=0; "$AUDIT" private-go --project-dir "$tmp/fix/plain" --gate install -- build ./... > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 0 && ! -e "$tmp/go.argv" ]] || fail "unconfigured go lane: rc=$rc"
+pass "no private-registry policy: the lanes do nothing and ask no client"
 
-# --- npm ----------------------------------------------------------------------
-add_registry p-npm npm "$NPM_ORIGIN/" '@p/*'
+# --- npm explicit specs -------------------------------------------------------
+reset_state
+add_registry p-npm npm "$NPM_ORIGIN" '@p/*'
 audit @p/x@1.0.0 npm
-[[ "$rc" == 18 ]] || fail "npm first install: rc=$rc $(cat "$tmp/out")"
-jq -e --arg o "$NPM_ORIGIN" --arg s "$SRI_A" '.gate_exit == 18 and .private_registry.pin == "tofu-new"
-  and (.private_registry.audit_extra | contains("origin=" + $o) and contains("integrity=" + $s) and contains("artifact=" + $o + "/@p%2fx/-/1.0.0/x-1.0.0.tgz"))' \
-  "$tmp/result.json" >/dev/null || fail "npm allow evidence: $(cat "$tmp/result.json")"
-jq -e --arg s "$SRI_A" '.pins | to_entries | length == 1 and .[0].value.integrity.sri == $s and .[0].value.pinned_by == "tofu"' "$pins" >/dev/null \
-  || fail "TOFU pin not recorded"
-grep -q -- "--@p:registry=$NPM_ORIGIN/" "$tmp/npm.argv" || fail "npm view was not bound to the private origin: $(cat "$tmp/npm.argv")"
-jq -se 'map(select(.event == "private_registry")) | length == 1' "$SAFE_AUDIT_AUDIT_LOG" >/dev/null || fail "no verdict-log event"
+[[ "$rc" == 18 ]] || fail "npm private spec: rc=$rc $(cat "$tmp/out")"
+jq -e --arg o "$NPM_ORIGIN" '.private_registry.audit_extra == ("registry=p-npm origin=" + $o + " name=@p/x version=1.0.0")' "$tmp/result.json" >/dev/null \
+  || fail "npm audit line: $(cat "$tmp/result.json")"
+grep -q 'config get @p:registry' "$tmp/npm.argv" || fail "the scope mapping was not asked of npm"
+grep -q 'view' "$tmp/npm.argv" && fail "the lane fetched metadata"
+[[ ! -e "$tmp/curl.urls" ]] || fail "the npm lane made a network request"
 no_secret "npm allow"
-pass "npm: an exact private pin installs unattended (18), records the TOFU pin and names artifact and integrity"
-
-audit @p/x@1.0.0 npm
-[[ "$rc" == 18 && "$(jq -r '.private_registry.pin' "$tmp/result.json")" == "matched:tofu" ]] || fail "npm second install: rc=$rc"
-audit @p/x@1.0.0 npm FAKE_SRI="$SRI_B"
-[[ "$rc" == 20 && "$(jq -r '.block.class + ":" + .private_registry.decision' "$tmp/result.json")" == "private:private_artifact_changed" ]] \
-  || fail "changed bytes: rc=$rc $(cat "$tmp/result.json")"
-pass "npm: a matching reinstall passes; changed bytes for the pinned version BLOCK (20, class private)"
-
+pass "npm: a private spec npm maps to its origin installs unattended (18) with one audit line naming registry, origin, name and version; no metadata fetch"
 audit '@p/x@^1.0.0' npm
-[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_version_not_exact ]] || fail "range: rc=$rc"
-audit @p/x@latest npm
-[[ "$rc" == 19 ]] || fail "latest: rc=$rc"
-pass "npm: ranges and tags never reach the private lane's allow (19)"
-
+[[ "$rc" == 19 && "$(decision)" == private_version_not_exact ]] || fail "npm range: rc=$rc"
+audit @p/x@1.0.0 npm FAKE_NPM_SCOPE_REG=undefined
+[[ "$rc" == 20 && "$(decision)" == private_cross_registry ]] && grep -q 'default registry' "$tmp/out" || fail "unmapped scope: rc=$rc"
+audit @p/x@1.0.0 npm FAKE_NPM_SCOPE_REG=https://registry.npmjs.org/
+[[ "$rc" == 20 ]] || fail "scope mapped to npmjs: rc=$rc"
+audit @p/x@1.0.0 npm -- --registry "@p:registry=$EVIL/npm/"
+[[ "$rc" == 20 ]] || fail "argv scope selector elsewhere: rc=$rc"
+audit @p/x@1.0.0 npm -- --registry "@p:registry=$NPM_ORIGIN/"
+[[ "$rc" == 18 ]] || fail "argv scope selector at the origin: rc=$rc"
 rm -f "$tmp/npm.argv"
-audit @p/x@2.0.0 npm FAKE_NPM_MODE=e401
-[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_registry_auth_missing ]] || fail "auth: rc=$rc $(cat "$tmp/out")"
-grep -q 'not a package finding' "$tmp/out" || fail "auth failure reads as a finding"
-no_secret "npm auth failure"
-audit @p/x@2.0.0 npm FAKE_NPM_MODE=e404
-[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_version_missing ]] || fail "404: rc=$rc"
-pass "npm: missing credentials and missing versions stay visible (19) and never print the credential"
-
-audit @p/x@3.0.0 npm FAKE_TARBALL_BASE=https://evil.example.test/npm
-[[ "$rc" == 20 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_cross_registry ]] || fail "tarball elsewhere: rc=$rc"
-printf '@p:registry=https://registry.npmjs.org/\n' > "$tmp/fix/project.npmrc"
-mkdir -p "$tmp/fix/proj"; cp "$tmp/fix/project.npmrc" "$tmp/fix/proj/.npmrc"
-rc=0; ( cd "$tmp/fix/proj" && SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" package-audit @p/x@1.0.0 --ecosystem npm --gate install ) > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 20 ]] && grep -q 'registry.npmjs.org' "$tmp/out" || fail "scope remapped to npmjs: rc=$rc $(cat "$tmp/out")"
-pass "npm: a tarball or scope mapping outside the private origin is cross-registry substitution (20)"
-
-# lock-diff lane: the projected lockfile is the observed artifact
+printf '@p:registry=%s/\n' "$NPM_ORIGIN" > "$tmp/fix/alt.npmrc"
+audit @p/x@1.0.0 npm -- --npm-userconfig "$tmp/fix/alt.npmrc"
+grep -q -- "--userconfig=$tmp/fix/alt.npmrc" "$tmp/npm.argv" || fail "the selected npm userconfig did not reach npm"
+audit @p/x@1.0.0 npm -- --installer bun
+[[ "$rc" == 19 && "$(decision)" == private_route_unmodelled ]] || fail "bun: rc=$rc"
+audit @p/x@1.0.0 npm FAKE_NPM_MODE=fail
+[[ "$rc" == 19 && "$(decision)" == private_registry_unreachable ]] || fail "npm config failure: rc=$rc"
+pass "npm: ranges ask (19); a scope npm maps elsewhere or not at all is cross-registry substitution (20); argv and config selectors are npm's own answer; bun and npm failures ask"
 cat > "$tmp/fix/lock.json" <<JSON
 {"lockfileVersion":3,"packages":{"":{},"node_modules/@p/x":{"version":"1.0.0","resolved":"$NPM_ORIGIN/@p%2fx/-/1.0.0/x-1.0.0.tgz","integrity":"$SRI_A"},
  "node_modules/alias":{"name":"@p/x","version":"1.0.0","resolved":"$NPM_ORIGIN/@p%2fx/-/1.0.0/x-1.0.0.tgz","integrity":"$SRI_A"}}}
 JSON
-rm -f "$tmp/npm.argv"
 audit @p/x@1.0.0 npm SAFE_AUDIT_ARTIFACT_LOCKFILE="$tmp/fix/lock.json"
-[[ "$rc" == 18 && ! -e "$tmp/npm.argv" ]] || fail "lockfile matched pin: rc=$rc npm called: $(cat "$tmp/npm.argv" 2>/dev/null)"
+[[ "$rc" == 18 ]] && jq -e '.resolved_versions[0] == "1.0.0"' "$tmp/result.json" >/dev/null || fail "lock-diff at the origin: rc=$rc $(cat "$tmp/out")"
 jq '.packages["node_modules/alias"].resolved = "https://registry.npmjs.org/@p/x/-/x-1.0.0.tgz"' "$tmp/fix/lock.json" > "$tmp/fix/lock-evil.json"
 audit @p/x@1.0.0 npm SAFE_AUDIT_ARTIFACT_LOCKFILE="$tmp/fix/lock-evil.json"
-[[ "$rc" == 20 ]] || fail "lockfile occurrence outside origin: rc=$rc"
-jq --arg s "$SRI_B" '.packages["node_modules/@p/x"].integrity = $s | .packages["node_modules/alias"].integrity = $s' "$tmp/fix/lock.json" > "$tmp/fix/lock-changed.json"
-audit @p/x@1.0.0 npm SAFE_AUDIT_ARTIFACT_LOCKFILE="$tmp/fix/lock-changed.json"
-[[ "$rc" == 20 ]] || fail "lockfile integrity differs from the origin: rc=$rc"
-pass "npm lock-diff: a pinned lockfile artifact passes without a fetch; any occurrence elsewhere or with other bytes BLOCKs"
+[[ "$rc" == 20 ]] || fail "lock-diff alias resolved elsewhere: rc=$rc"
+pass "npm lock-diff: every lockfile entry of the name (aliases included) must resolve under the origin"
+rc=0; "$AUDIT" package-audit @p/x@1.0.0 --ecosystem npm > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 0 ]] && grep -q 'VERDICT: PRIVATE' "$tmp/out" || fail "direct check: rc=$rc $(cat "$tmp/out")"
+rc=0; "$AUDIT" package-audit @p/x@1.0.0 --ecosystem npm --json > "$tmp/out" 2>/dev/null || rc=$?
+jq -e '.verdict == "PRIVATE"' "$tmp/out" >/dev/null || fail "direct json verdict"
+pass "a direct package-audit reports PRIVATE, never GO"
 
-# round-1 P3: an SRI with two different sha512 digests admits either artifact
-jq --arg s "$SRI_A $SRI_B" '.packages["node_modules/@p/x"].integrity = $s | .packages["node_modules/alias"].integrity = $s' "$tmp/fix/lock.json" > "$tmp/fix/lock-two.json"
-audit @p/x@1.0.0 npm SAFE_AUDIT_ARTIFACT_LOCKFILE="$tmp/fix/lock-two.json"
-[[ "$rc" == 20 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_integrity_ambiguous ]] || fail "two sha512 digests: rc=$rc $(cat "$tmp/out")"
-audit @p/x@4.0.0 npm FAKE_SRI="$SRI_A $SRI_B"
-[[ "$rc" == 20 ]] || fail "registry metadata with two sha512 digests: rc=$rc"
-jq 'del(.packages["node_modules/@p/x"].integrity, .packages["node_modules/alias"].integrity)' "$tmp/fix/lock.json" > "$tmp/fix/lock-noint.json"
-audit @p/x@1.0.0 npm SAFE_AUDIT_ARTIFACT_LOCKFILE="$tmp/fix/lock-noint.json"
-[[ "$rc" == 19 ]] || fail "lockfile entry without integrity: rc=$rc"
-pass "npm: two sha512 digests BLOCK (lockfile or registry); a lockfile entry without integrity asks"
-
-# round-1 P6: npm's real view shapes
-audit @p/x@5.0.0 npm FAKE_NPM_SHAPE=object
-[[ "$rc" == 18 ]] || fail "object-shaped npm view: rc=$rc"
-audit @p/x@5.0.1 npm FAKE_NPM_SHAPE=array
-[[ "$rc" == 18 ]] || fail "array-shaped npm view (npm >= 12): rc=$rc"
-audit @p/x@5.0.2 npm FAKE_NPM_SHAPE=multi
-[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_version_missing ]] || fail "ambiguous npm view answer: rc=$rc"
-rm -f "$tmp/npm.argv"
-printf '@p:registry=%s/\n' "$NPM_ORIGIN" > "$tmp/fix/alt.npmrc"
-rc=0; "$AUDIT" package-audit @p/x@5.0.3 --ecosystem npm --gate install --npm-userconfig "$tmp/fix/alt.npmrc" > "$tmp/out" 2>&1 || rc=$?
-grep -q -- "--userconfig=$tmp/fix/alt.npmrc" "$tmp/npm.argv" || fail "the selected npm userconfig did not reach the private fetch: rc=$rc $(cat "$tmp/out")"
-pass "npm: the private fetch reads npm's object and one-element-array answers, refuses several versions, and keeps the selected npm config"
-
-# round-1 P1: every private identity an npm project operation materializes
+# --- npm projects ---------------------------------------------------------------
 mkdir -p "$tmp/fix/npmproj"
-printf '{"name":"app","version":"1.0.0","dependencies":{"@p/x":"1.0.0","left-pad":"1.3.0"}}\n' > "$tmp/fix/npmproj/package.json"
-cp "$tmp/fix/lock.json" "$tmp/fix/npmproj/package-lock.json"
 proj() { # class [env...] -- argv
   local class="$1"; shift
   local -a envs=()
   while [[ $# -gt 0 && "$1" != "--" ]]; do envs+=("$1"); shift; done
   shift
+  rm -f "$tmp/result.json"
   rc=0
   env "${envs[@]}" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-npm-project --tool "${PROJ_TOOL:-npm}" --class "$class" \
     --project-dir "$tmp/fix/npmproj" --gate install -- "$@" > "$tmp/out" 2>&1 || rc=$?
 }
-rm -f "$pins"
-proj ci -- ci
-[[ "$rc" == 18 ]] && jq -e '.private_registry_lines | length == 1 and .[0].package == "@p/x@1.0.0"' "$tmp/result.json" >/dev/null || fail "npm ci private sweep: rc=$rc $(cat "$tmp/out")"
-"$CORE" private-trust record --pins "$pins" --ecosystem npm --origin "$NPM_ORIGIN" --name @p/x --version 1.0.0 --mode revoke >/dev/null
-proj ci -- ci
-[[ "$rc" == 20 ]] && jq -e '.private_registry.decision == "private_pin_revoked"' "$tmp/result.json" >/dev/null || fail "npm ci of a revoked lockfile entry: rc=$rc"
-rm -f "$pins"
-jq --arg s "$SRI_B" '.packages["node_modules/@p/x"].integrity = $s | .packages["node_modules/alias"].integrity = $s' "$tmp/fix/lock.json" > "$tmp/fix/projected-changed.json"
-proj install FAKE_PROJECTION_LOCK="$tmp/fix/projected-changed.json" -- install
-[[ "$rc" == 20 ]] || fail "npm install whose projection resolves other bytes than the origin: rc=$rc $(cat "$tmp/out")"
-proj install FAKE_PROJECTION_LOCK="$tmp/fix/lock.json" -- install
-[[ "$rc" == 18 ]] || fail "npm install projection sweep: rc=$rc $(cat "$tmp/out")"
-proj install -- install --prefix /elsewhere
-[[ "$rc" == 19 ]] || fail "--prefix redirects the projection: rc=$rc"
-PROJ_TOOL=pnpm proj install -- install
-[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_project_unmodelled ]] || fail "pnpm project with a private name: rc=$rc"
-printf '{"name":"pub","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}\n' > "$tmp/fix/npmproj/package.json"
-jq 'del(.packages["node_modules/@p/x"], .packages["node_modules/alias"])' "$tmp/fix/lock.json" > "$tmp/fix/npmproj/package-lock.json"
-PROJ_TOOL=pnpm proj install -- install
-[[ "$rc" == 0 ]] || fail "a pnpm project naming nothing private is untouched: rc=$rc"
-proj ci -- ci
-[[ "$rc" == 0 ]] || fail "npm ci of a lockfile naming nothing private: rc=$rc"
-# round-2 P1: a public parent whose new version requires a private package
-"$CORE" private-trust record --pins "$pins" --ecosystem npm --origin "$NPM_ORIGIN" --name @p/x --version 1.0.0 --mode revoke >/dev/null
-proj install FAKE_PROJECTION_LOCK="$tmp/fix/lock.json" -- install pubparent@2.0.0
-[[ "$rc" == 20 ]] && jq -e '.private_registry.decision == "private_pin_revoked"' "$tmp/result.json" >/dev/null \
-  || fail "a private package introduced by resolution is decided from the projection: rc=$rc $(cat "$tmp/out")"
-proj install -- install --no-package-lock
-[[ "$rc" == 19 ]] || fail "an operation that cannot be projected asks while an npm private registry is configured: rc=$rc"
-# round-2 P1: a lockfileVersion 1 tree is not swept, so a private name in it asks
-jq -n --arg r "$NPM_ORIGIN/@p%2fx/-/1.0.0/x-1.0.0.tgz" --arg i "$SRI_A" \
-  '{lockfileVersion: 1, dependencies: {"pubparent": {version: "2.0.0", dependencies: {"@p/x": {version: "1.0.0", resolved: $r, integrity: $i}}}}}' \
-  > "$tmp/fix/npmproj/package-lock.json"
-proj ci -- ci
-[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_project_unmodelled ]] \
-  || fail "npm ci of a v1 lockfile with a nested private entry: rc=$rc $(cat "$tmp/out")"
-printf '{"name":"app","version":"1.0.0","dependencies":{"@p/x":"1.0.0"}}\n' > "$tmp/fix/npmproj/package.json"
-jq -n '{lockfileVersion: 1, dependencies: {}}' > "$tmp/fix/npmproj/package-lock.json"
-proj ci -- ci
-[[ "$rc" == 19 ]] || fail "npm ci of a v1 lockfile, private name in the manifest: rc=$rc"
-rm -f "$pins"
-printf '{"name":"app","version":"1.0.0","dependencies":{"@p/x":"1.0.0"}}\n' > "$tmp/fix/npmproj/package.json"
+manifest() { printf '%s\n' "$1" > "$tmp/fix/npmproj/package.json"; }
+lock() { printf '%s\n' "$1" > "$tmp/fix/npmproj/package-lock.json"; }
+manifest '{"name":"app","version":"1.0.0","dependencies":{"@p/x":"1.0.0","left-pad":"1.3.0"}}'
 cp "$tmp/fix/lock.json" "$tmp/fix/npmproj/package-lock.json"
-pass "npm project lane: ci sweeps the lockfile, other npm operations sweep their projection whenever an npm private registry is configured (a private package introduced by resolution included), v1 lockfiles and unmodelled managers/flags ask, projects without private names are untouched"
+proj ci -- ci
+[[ "$rc" == 18 ]] && jq -e --arg o "$NPM_ORIGIN" '.private_registry_lines | length == 1 and .[0].package == "@p/x@1.0.0" and (.[0].extra == ("registry=p-npm origin=" + $o + " name=@p/x version=1.0.0"))' "$tmp/result.json" >/dev/null \
+  || fail "npm ci private entries: rc=$rc $(cat "$tmp/out") $(cat "$tmp/result.json" 2>/dev/null)"
+lock "$(jq '.packages["node_modules/@p/x"].resolved = "https://registry.npmjs.org/@p/x/-/x-1.0.0.tgz"' "$tmp/fix/lock.json")"
+proj ci -- ci
+[[ "$rc" == 20 && "$(decision)" == private_cross_registry ]] || fail "lockfile entry resolved elsewhere: rc=$rc"
+manifest '{"name":"app","version":"1.0.0","dependencies":{"@p/x":"1.0.0"}}'
+lock "$(jq -n --arg r "$EVIL/x.tgz" '{lockfileVersion: 3, packages: {"": {}, "node_modules/@p/x": {name: "fixture-public", version: "1.0.0", resolved: $r}}}')"
+proj ci -- ci
+[[ "$rc" == 20 ]] || fail "a private install path hidden by an untrusted name field: rc=$rc"
+manifest '{"name":"app","version":"1.0.0","dependencies":{"private-alias":"npm:@p/x@1.0.0"}}'
+lock "$(jq -n --arg r "$EVIL/x.tgz" '{lockfileVersion: 1, dependencies: {"private-alias": {version: "npm:@p/x@1.0.0", resolved: $r}}}')"
+proj ci -- ci
+[[ "$rc" == 20 ]] || fail "a v1 alias resolved elsewhere: rc=$rc $(cat "$tmp/out")"
+lock "$(jq -n --arg r "$NPM_ORIGIN/@p%2fx/-/1.0.0/x-1.0.0.tgz" '{lockfileVersion: 1, dependencies: {"pub": {version: "2.0.0", resolved: "https://registry.npmjs.org/pub/-/pub-2.0.0.tgz", dependencies: {"private-alias": {version: "npm:@p/x@1.0.0", resolved: $r}}}}}')"
+proj ci -- ci
+[[ "$rc" == 18 ]] && jq -e '.private_registry_lines[0].package == "@p/x@1.0.0"' "$tmp/result.json" >/dev/null || fail "a nested v1 alias at the origin: rc=$rc $(cat "$tmp/out")"
+lock "$(jq -n '{lockfileVersion: 3, packages: {"": {}, "node_modules/@p/x": {version: "1.0.0"}}}')"
+proj ci -- ci
+[[ "$rc" == 19 && "$(decision)" == private_project_unmodelled ]] || fail "a private entry without a resolved URL: rc=$rc"
+lock "$(jq -n '{lockfileVersion: 3, packages: {"": {}, "node_modules/pub/node_modules/@p/x": {version: "1.0.0", inBundle: true}}}')"
+proj ci -- ci
+[[ "$rc" == 19 ]] || fail "a bundled private entry: rc=$rc"
+lock "$(jq -n '{lockfileVersion: 3, packages: {"": {}, "node_modules/@p/x": {resolved: "packages/x", link: true}}}')"
+proj ci -- ci
+[[ "$rc" == 0 ]] || fail "a linked workspace entry is local: rc=$rc"
+lock 'not json'
+proj ci -- ci
+[[ "$rc" == 19 ]] || fail "an unreadable lockfile with a private name: rc=$rc $(cat "$tmp/out")"
+pass "npm project lane: every lockfile entry whose path, name or alias target (v1 and v3) is private must resolve under its origin (20 otherwise); entries without a resolved URL, bundled or unreadable ask (19); links are local"
+manifest '{"name":"app","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}'
+lock '{"lockfileVersion":3,"packages":{"":{}}}'
+proj install -- install
+[[ "$rc" == 0 ]] || fail "a public project on a configured host: rc=$rc"
+proj install FAKE_NPM_SCOPE_REG=https://registry.npmjs.org/ -- install
+[[ "$rc" == 20 ]] || fail "a registered scope npm maps elsewhere BLOCKs even before a private name is visible: rc=$rc"
+proj install FAKE_NPM_SCOPE_REG=undefined -- install
+[[ "$rc" == 0 ]] || fail "an unmapped scope with nothing private named: rc=$rc"
+proj install FAKE_NPM_SCOPE_REG=undefined -- install @p/x@1.0.0
+[[ "$rc" == 20 ]] || fail "an unmapped scope when the operation names a private package: rc=$rc"
+PROJ_TOOL=pnpm proj install -- add @p/x@1.0.0
+[[ "$rc" == 19 && "$(decision)" == private_project_unmodelled ]] || fail "pnpm naming a private package: rc=$rc"
+PROJ_TOOL=pnpm proj install -- install
+[[ "$rc" == 0 ]] || fail "pnpm public project: rc=$rc"
+proj install -- install --prefix /elsewhere @p/x@1.0.0
+[[ "$rc" == 19 ]] || fail "--prefix with a private name: rc=$rc"
+pass "npm project lane: registered scopes must map to their origin (a scope mapped elsewhere BLOCKs; unmapped BLOCKs once the operation names a private package); pnpm/yarn/bun and lockfile-redirecting flags ask on a private name"
 
-# the shipped npm route reaches the project lane before delegation
+# the shipped npm ci route reaches the project lane before delegation
 cat > "$tmp/route.sh" <<'ROUTE'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -344,304 +263,153 @@ SAFE_GATE_AUDIT_BIN="$ROOT/bin/safe-audit"
 safe_gate_audit_available() { return 0; }
 safe_gate_operator_terminal() { return 1; }
 safe_gate_scan_project() { return 0; }
-safe_gate_exec_real() { printf 'DELEGATED %s\n' "$*" > "$tmp/delegated"; exit 0; }
-cd "$tmp/fix/npmproj"
-safe_gate_npm_like npm "$@"
+[[ "${ROUTE_REAL_CHECK:-0}" == 1 ]] || safe_gate_check_many() { printf 'SPEC %s\n' "$*" > "$tmp/spec"; return 0; }
+safe_gate_exec_real() { printf 'DELEGATED %s PIP_CONFIG_FILE=%s PIP_INDEX_URL=%s UV_NO_CONFIG=%s\n' "$*" "${PIP_CONFIG_FILE:-}" "${PIP_INDEX_URL:-}" "${UV_NO_CONFIG:-}" > "$tmp/delegated"; exit 0; }
+cd "${ROUTE_DIR:-$tmp/fix/npmproj}"
+"$@"
 ROUTE
 chmod +x "$tmp/route.sh"
-"$CORE" private-trust record --pins "$pins" --ecosystem npm --origin "$NPM_ORIGIN" --name @p/x --version 1.0.0 --mode revoke >/dev/null
+manifest '{"name":"app","version":"1.0.0","dependencies":{"@p/x":"1.0.0"}}'
+lock "$(jq '.packages["node_modules/@p/x"].resolved = "https://registry.npmjs.org/@p/x/-/x-1.0.0.tgz"' "$tmp/fix/lock.json")"
 rm -f "$tmp/delegated"
-rc=0; bash "$tmp/route.sh" ci > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 104 && ! -e "$tmp/delegated" ]] || fail "npm ci route delegated a revoked private identity: rc=$rc $(cat "$tmp/out")"
-grep -q 'REFUSED_BLOCK' "$tmp/rdata/audit.log" || fail "the route refusal was not logged"
-rm -f "$pins" "$tmp/delegated"
-rc=0; bash "$tmp/route.sh" ci > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 0 && -e "$tmp/delegated" ]] && grep -q 'ALLOWED_VIA_PRIVATE_REGISTRY' "$tmp/rdata/audit.log" || fail "npm ci route with a valid private entry: rc=$rc $(cat "$tmp/out")"
-pass "the shipped npm ci route decides private lockfile entries before delegating (104 revoked, 0 + audit line otherwise)"
-
-# revocation and operator pin mode
-"$CORE" private-trust record --pins "$pins" --ecosystem npm --origin "$NPM_ORIGIN" --name @p/x --version 1.0.0 --mode revoke >/dev/null || fail "revoke"
-audit @p/x@1.0.0 npm
-[[ "$rc" == 20 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_pin_revoked ]] || fail "revoked: rc=$rc"
-reset_state
-add_registry p-npm npm "$NPM_ORIGIN" '@p/*' operator
-audit @p/x@1.0.0 npm
-[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_pin_missing ]] || fail "operator mode: rc=$rc"
-grep -q 'safe run private-registry pin add @p/x@1.0.0 --ecosystem npm' "$tmp/out" || fail "operator mode hint"
-pass "npm: a revoked version BLOCKs; a registry in operator pin mode asks for the operator pin (19)"
-
-# direct (non-gate) check never reads as GO
-reset_state
-add_registry p-npm npm "$NPM_ORIGIN" '@p/*'
-rc=0; "$AUDIT" package-audit @p/x@1.0.0 --ecosystem npm > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 0 ]] && grep -q 'VERDICT: PRIVATE' "$tmp/out" || fail "direct check: rc=$rc $(cat "$tmp/out")"
-rc=0; "$AUDIT" package-audit @p/x@1.0.0 --ecosystem npm --json > "$tmp/out" 2>/dev/null || rc=$?
-jq -e '.verdict == "PRIVATE"' "$tmp/out" >/dev/null || fail "direct json verdict"
-pass "a direct package-audit reports PRIVATE, never GO"
+rc=0; bash "$tmp/route.sh" safe_gate_npm_like npm ci > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 104 && ! -e "$tmp/delegated" ]] || fail "npm ci route delegated a substituted private entry: rc=$rc $(cat "$tmp/out")"
+cp "$tmp/fix/lock.json" "$tmp/fix/npmproj/package-lock.json"
+rc=0; bash "$tmp/route.sh" safe_gate_npm_like npm ci > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 0 && -e "$tmp/delegated" ]] && grep -q 'ALLOWED_VIA_PRIVATE_REGISTRY.*name=@p/x version=1.0.0' "$tmp/rdata/audit.log" \
+  || fail "npm ci route with entries at the origin: rc=$rc $(cat "$tmp/out")"
+pass "the shipped npm ci route decides private lockfile entries before delegating (104 substituted, 0 + audit line otherwise)"
 
 # --- trust root and store integrity ------------------------------------------
-rc=0; SAFE_RUN_CONFIG_DIR="$tmp/elsewhere" "$AUDIT" private-fetch @p/x@1.0.0 --ecosystem npm > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 3 ]] || fail "redirected root honored the private policy: rc=$rc"
-printf '{"schema":"safe-private-registries/1","registries":{"x":{"ecosystem":"npm","origin":"http://evil.example.test/","namespace":["@p/*"],"pin_mode":"tofu","cooldown_days":0}}}\n' > "$policy"
+rc=0; SAFE_RUN_CONFIG_DIR="$tmp/elsewhere" "$AUDIT" private-npm-project --tool npm --class ci --project-dir "$tmp/fix/npmproj" --gate install -- ci > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 0 ]] || fail "redirected root honored the private policy: rc=$rc"
+cp "$policy" "$tmp/policy.bak"
+printf '{"schema":"safe-private-registries/2","registries":{"x":{"ecosystem":"npm","origin":"http://evil.example.test/","namespace":["@p/*"]}}}\n' > "$policy"
 audit @p/x@1.0.0 npm
 [[ "$rc" == 30 ]] && grep -q 'malformed' "$tmp/out" || fail "malformed policy: rc=$rc $(cat "$tmp/out")"
+cp "$tmp/policy.bak" "$policy"
 pass "an unblessed redirected trust root declines the policy; a malformed store decides nothing (30)"
 
 # --- python -------------------------------------------------------------------
 reset_state
 add_registry p-py python "$PY_ORIGIN" caviar-redact
-audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 PIP_INDEX_URL="$PY_ORIGIN/simple"
-[[ "$rc" == 18 ]] || fail "python: rc=$rc $(cat "$tmp/out")"
-jq -e --arg a "$SHA_A" --arg b "$SHA_B" '.pins | to_entries[0].value.integrity.files
-  == {"caviar_redact-0.2.0-py3-none-any.whl": $a, "caviar_redact-0.2.0.tar.gz": $b}' "$pins" >/dev/null || fail "python pin file set: $(cat "$pins")"
-grep -qx 'https://pypi.org/simple/caviar-redact/' "$tmp/curl.urls" || fail "public namesake probe missing"
-pass "python: an exact pin from the private index installs (18) and pins every distribution file of the version"
-audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 PIP_INDEX_URL="$PY_ORIGIN/simple" FAKE_PY_SHA="$SHA_B"
-[[ "$rc" == 20 ]] || fail "python changed: rc=$rc"
-audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 PIP_INDEX_URL="$PY_ORIGIN/simple" FAKE_PYPI_CODE=200
-[[ "$rc" == 20 ]] && grep -q 'dependency confusion' "$tmp/out" || fail "python namesake on PyPI: rc=$rc"
-audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 FAKE_PYPI_CODE=404
-[[ "$rc" == 20 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_cross_registry ]] || fail "python without the private index: rc=$rc"
-audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 PIP_INDEX_URL="$PY_ORIGIN/simple" FAKE_PYPI_CODE=503
-[[ "$rc" == 19 ]] || fail "python probe outage: rc=$rc"
-audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 PIP_INDEX_URL="$PY_ORIGIN/simple" FAKE_PY_FILE_BASE=https://cdn.example.test
-[[ "$rc" == 20 ]] || fail "python file outside origin: rc=$rc"
-pass "python: changed files, a public namesake, a missing private index and files hosted elsewhere BLOCK; a probe outage asks (19)"
-rc=0; PIP_INDEX_URL="$PY_ORIGIN/simple" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" package-audit caviar-redact@0.2.0 --ecosystem python --gate install --find-links-selected --no-deps-selected > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 20 ]] && grep -q 'find-links' "$tmp/out" || fail "argv find-links: rc=$rc"
-audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 PIP_INDEX_URL="$PY_ORIGIN/simple" PIP_FIND_LINKS=https://flat.example.test/
-[[ "$rc" == 20 ]] || fail "PIP_FIND_LINKS: rc=$rc"
-mkdir -p "$HOME/.config/pip"; printf '[global]\nfind-links = https://flat.example.test/\n' > "$HOME/.config/pip/pip.conf"
-audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 PIP_INDEX_URL="$PY_ORIGIN/simple"
-[[ "$rc" == 20 ]] || fail "pip config find-links: rc=$rc"
-rm -f "$HOME/.config/pip/pip.conf"
-audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 PIP_INDEX_URL="$PY_ORIGIN/simple" PIP_NO_INDEX=1
-[[ "$rc" == 20 ]] || fail "no-index: rc=$rc"
-( source "$ROOT/lib/gate-lib.sh"; safe_gate_scan_target_flags python install -f https://flat.example.test/ caviar-redact==0.2.0; [[ "$SAFE_GATE_FIND_LINKS" == 1 ]] ) || fail "the gate does not flag -f"
-( source "$ROOT/lib/gate-lib.sh"; safe_gate_scan_target_flags python install --find-links=https://f/ x; [[ "$SAFE_GATE_FIND_LINKS" == 1 ]] ) || fail "the gate does not flag --find-links="
-audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 PIP_INDEX_URL="https://user:$SECRET@git.example.test:8443/api/packages/owner/pypi/simple"
-[[ "$rc" == 18 ]] || fail "inline-credential index: rc=$rc"
-grep -q "user:$SECRET@git.example.test" "$tmp/curl.urls" || fail "the operator's inline-credential index URL did not reach the fetch"
-grep -q "$SECRET" "$tmp/out" "$tmp/result.json" "$SAFE_AUDIT_AUDIT_LOG" "$pins" && fail "the inline index credential leaked into an output or store"
-pass "python: find-links (argv, env, pip config) and --no-index BLOCK on the private lane; an inline-credential index URL is used for the fetch and never printed"
+PYI=(--python-isolated --registry "$PY_ORIGIN/simple")
+audit caviar-redact@0.2.0 python -- "${PYI[@]}"
+[[ "$rc" == 18 ]] && jq -e --arg o "$PY_ORIGIN" '.private_registry.audit_extra == ("registry=p-py origin=" + $o + " name=caviar-redact version=0.2.0")' "$tmp/result.json" >/dev/null \
+  || fail "python private spec: rc=$rc $(cat "$tmp/out")"
+grep -q 'https://pypi.org/simple/caviar-redact/' "$tmp/curl.urls" || fail "the PyPI namesake probe did not run"
+audit caviar-redact@0.2.0 python PIP_INDEX_URL="$EVIL/simple" PIP_EXTRA_INDEX_URL="$EVIL/simple" -- "${PYI[@]}"
+[[ "$rc" == 18 ]] || fail "source environment the isolated delegate drops still decided: rc=$rc"
+pass "python: an isolated pip/uv pip install whose argv index is the origin installs unattended (18) with the audit line; configuration and source env do not count (the delegate drops them)"
+audit caviar-redact@0.2.0 python -- --registry "$PY_ORIGIN/simple"
+[[ "$rc" == 19 && "$(decision)" == private_route_unmodelled ]] || fail "a route the gate does not isolate: rc=$rc"
+audit caviar-redact@0.2.0 python -- --python-isolated
+[[ "$rc" == 20 && "$(decision)" == private_cross_registry ]] || fail "no argv index at the origin: rc=$rc"
+audit caviar-redact@0.2.0 python -- "${PYI[@]}" --find-links-selected
+[[ "$rc" == 20 ]] || fail "argv find-links: rc=$rc"
+audit caviar-redact@0.2.0 python -- --python-isolated --registry "$PY_ORIGIN/simple local:no-index"
+[[ "$rc" == 20 ]] || fail "argv --no-index: rc=$rc"
+audit caviar-redact@0.2.0 python FAKE_OTHER_CODE=200 -- --python-isolated --registry "$PY_ORIGIN/simple $EVIL/simple"
+[[ "$rc" == 20 ]] && grep -q 'dependency confusion' "$tmp/out" || fail "another argv index serves the name: rc=$rc"
+audit caviar-redact@0.2.0 python -- --python-isolated --registry "$PY_ORIGIN/simple $EVIL/simple"
+[[ "$rc" == 18 ]] || fail "another argv index without the name: rc=$rc"
+audit caviar-redact@0.2.0 python FAKE_PYPI_CODE=200 -- "${PYI[@]}"
+[[ "$rc" == 20 ]] || fail "a PyPI namesake: rc=$rc"
+audit caviar-redact@0.2.0 python FAKE_PYPI_CODE=503 -- "${PYI[@]}"
+[[ "$rc" == 19 && "$(decision)" == private_registry_unreachable ]] || fail "probe outage: rc=$rc"
+audit caviar-redact@0.2.0 python -- "${PYI[@]}" --uv-config-file-selected
+[[ "$rc" == 19 ]] || fail "uv --config-file: rc=$rc"
+audit 'caviar-redact@>=0.2' python -- "${PYI[@]}"
+[[ "$rc" == 19 ]] || fail "python range: rc=$rc"
+audit caviar-redact@0.2.0 python -- --python-isolated --registry "https://user:$SECRET@git.example.test:8443/api/packages/owner/pypi/simple"
+[[ "$rc" == 18 ]] || fail "inline-credential origin index: rc=$rc"
+no_secret "python inline credential"
+pass "python: an unisolated route asks; no origin index, argv find-links/--no-index, another index or PyPI serving the name BLOCK; a probe outage, uv --config-file and ranges ask; an inline-credential index is never printed"
+printf 'caviar-redact==0.2.0\nrequests==2.32.0\n' > "$tmp/fix/req.txt"
+printf 'requests==2.32.0\n' > "$tmp/fix/req-public.txt"
+rc=0; SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-python-project --gate install -- "$tmp/fix/req.txt" > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 19 && "$(decision)" == private_route_unmodelled ]] || fail "a requirements file naming a private package: rc=$rc"
+rc=0; "$AUDIT" private-python-project --gate install -- "$tmp/fix/req-public.txt" > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 0 ]] || fail "a public requirements file: rc=$rc"
+pass "python: a requirements file naming a private package asks (19)"
+( source "$ROOT/lib/gate-lib.sh"
+  export PIP_INDEX_URL=x PIP_EXTRA_INDEX_URL=y UV_INDEX=z UV_CONFIG_FILE=c
+  SAFE_GATE_PRIVATE_PY_ALLOWED=0; safe_gate_python_isolate pip
+  [[ "$PIP_INDEX_URL" == x && -z "${PIP_CONFIG_FILE:-}" ]] || exit 1
+  SAFE_GATE_PRIVATE_PY_ALLOWED=1; safe_gate_python_isolate pip
+  [[ "$PIP_CONFIG_FILE" == /dev/null && -z "${PIP_INDEX_URL:-}" && -z "${PIP_EXTRA_INDEX_URL:-}" ]] || exit 2
+  safe_gate_python_isolate uv
+  [[ "$UV_NO_CONFIG" == 1 && -z "${UV_INDEX:-}" && -z "${UV_CONFIG_FILE:-}" ]] || exit 3
+  [[ "$(safe_gate_python_requirement_files install -r a.txt --constraint=b.txt -rc.txt x==1 | paste -sd,)" == "a.txt,b.txt,c.txt" ]] || exit 4
+) || fail "python delegate isolation helpers: $?"
+mkdir -p "$tmp/fix/pyproj"
+rm -f "$tmp/delegated"
+rc=0; ROUTE_REAL_CHECK=1 ROUTE_DIR="$tmp/fix/pyproj" PIP_INDEX_URL="$EVIL/simple" bash "$tmp/route.sh" safe_gate_pip_like pip install --index-url "$PY_ORIGIN/simple" caviar-redact==0.2.0 > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 0 ]] && grep -q 'PIP_CONFIG_FILE=/dev/null PIP_INDEX_URL= ' "$tmp/delegated" \
+  || fail "the shipped pip route did not isolate the delegate: rc=$rc $(cat "$tmp/out") $(cat "$tmp/delegated" 2>/dev/null)"
+pass "the shipped pip route delegates a private allow with its configuration switched off and the source env dropped"
 
 # --- go -----------------------------------------------------------------------
 reset_state
 add_registry p-go go "$GO_ORIGIN" superbiche.me
-audit superbiche.me/caviar@v0.2.0 go GOPROXY="$GO_ORIGIN,https://proxy.golang.org,direct" GONOSUMDB=superbiche.me
-[[ "$rc" == 18 ]] || fail "go: rc=$rc $(cat "$tmp/out")"
-grep -q "mod download -json superbiche.me/caviar@v0.2.0 GOPROXY=$GO_ORIGIN\$" "$tmp/go.argv" || fail "go fetch not pinned to the origin: $(cat "$tmp/go.argv")"
-audit superbiche.me/caviar@v0.2.0 go GOPROXY="$GO_ORIGIN" GOPRIVATE=superbiche.me
-[[ "$rc" == 20 ]] && grep -q 'VCS directly' "$tmp/out" || fail "GOPRIVATE route: rc=$rc"
-audit superbiche.me/caviar@v0.2.0 go GOPROXY="https://proxy.golang.org,$GO_ORIGIN"
-[[ "$rc" == 20 ]] || fail "origin not first: rc=$rc"
-audit superbiche.me/caviar@v0.2.0 go GOPROXY="$GO_ORIGIN" FAKE_GO_H1="$H1_B"
-[[ "$rc" == 20 ]] || fail "go changed: rc=$rc"
-audit superbiche.me/caviar@v0.3.0 go GOPROXY="$GO_ORIGIN" FAKE_GO_MODE=e401
-[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_registry_auth_missing ]] || fail "go auth: rc=$rc"
-pass "go: install through the private proxy pins h1 (18); GOPRIVATE/other-first routing and changed hashes BLOCK; auth asks"
-
-# go.sum project lane
-mkdir -p "$tmp/fix/gomod"
-printf 'module example.com/app\n' > "$tmp/fix/gomod/go.mod"
-printf '{"Module":{"Path":"example.com/app"},"Go":"1.22","Require":null,"Replace":null}\n' > "$tmp/fix/modjson-none.json"
-export FAKE_GO_MODJSON="$tmp/fix/modjson-none.json"
-printf 'superbiche.me/caviar v0.2.0 %s\nsuperbiche.me/caviar v0.2.0/go.mod %s\nexample.com/public v1.0.0/go.mod %s\n' "$H1_A" "$H1_B" "$H1_A" > "$tmp/fix/gomod/go.sum"
-rm -f "$tmp/go.argv"
-rc=0; GOPROXY="$GO_ORIGIN" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-gosum --project-dir "$tmp/fix/gomod" --gate install > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 18 ]] || fail "gosum matched: rc=$rc $(cat "$tmp/out")"
-jq -e '.private_registry_lines | length == 1 and (.[0].package == "superbiche.me/caviar@v0.2.0") and (.[0].extra | contains("pin=matched"))' "$tmp/result.json" >/dev/null \
-  || fail "gosum lines: $(cat "$tmp/result.json")"
-grep -q 'mod download' "$tmp/go.argv" 2>/dev/null && fail "a pinned go.sum entry fetched again"
-printf 'superbiche.me/caviar v0.2.0 %s\nsuperbiche.me/caviar v0.2.0/go.mod %s\n' "$H1_B" "$H1_B" > "$tmp/fix/gomod/go.sum"
-rc=0; GOPROXY="$GO_ORIGIN" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-gosum --project-dir "$tmp/fix/gomod" --gate install > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 20 ]] || fail "gosum changed: rc=$rc"
-rm -f "$pins"
-printf 'superbiche.me/caviar v0.2.0/go.mod %s\n' "$H1_B" > "$tmp/fix/gomod/go.sum"
-rc=0; GOPROXY="$GO_ORIGIN" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-gosum --project-dir "$tmp/fix/gomod" --gate install > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 18 ]] && jq -e '.pins | to_entries[0].value.integrity.h1 != null' "$pins" >/dev/null || fail "gosum TOFU from a go.mod-only line: rc=$rc"
-printf 'example.com/public v1.0.0/go.mod %s\n' "$H1_A" > "$tmp/fix/gomod/go.sum"
-rc=0; "$AUDIT" private-gosum --project-dir "$tmp/fix/gomod" --gate install > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 0 ]] || fail "public-only go.sum: rc=$rc"
-pass "go.sum lane: pinned private modules pass without a fetch, changed hashes BLOCK, first use pins from the origin, public modules are untouched"
-
-# go.mod requirements without go.sum lines (round-1 P4): no sum is not authorization
-rm -f "$tmp/fix/gomod/go.sum" "$pins"
-jq -n '{Module: {Path: "example.com/app"}, Go: "1.22", Require: [{Path: "superbiche.me/caviar", Version: "v0.2.0"}, {Path: "example.com/public", Version: "v1.0.0"}], Replace: null}' > "$tmp/fix/modjson-req.json"
-gosum() { rc=0; FAKE_GO_MODJSON="$tmp/fix/modjson-req.json" GOPROXY="$GO_ORIGIN" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-gosum --project-dir "$tmp/fix/gomod" --gate install "$@" > "$tmp/out" 2>&1 || rc=$?; }
-"$CORE" private-trust record --pins "$pins" --ecosystem go --origin "$GO_ORIGIN" --name superbiche.me/caviar --version v0.2.0 --mode revoke >/dev/null || fail "go revoke"
-gosum
-[[ "$rc" == 20 ]] && jq -e '.private_registry.decision == "private_pin_revoked"' "$tmp/result.json" >/dev/null || fail "revoked module required by go.mod, no go.sum: rc=$rc $(cat "$tmp/out")"
-rm -f "$pins"
-gosum
-[[ "$rc" == 18 ]] && jq -e '.pins | to_entries[0].value.pinned_by == "tofu"' "$pins" >/dev/null || fail "first ingress without go.sum must verify from the origin and pin: rc=$rc"
-grep -q 'mod download -json superbiche.me/caviar@v0.2.0' "$tmp/go.argv" || fail "first ingress was not confirmed against the origin"
-# round-2 P4: the context go actually selects is read, not the default go.mod
-rm -f "$pins"
-"$CORE" private-trust record --pins "$pins" --ecosystem go --origin "$GO_ORIGIN" --name superbiche.me/caviar --version v0.2.0 --mode revoke >/dev/null
-cp "$tmp/fix/modjson-req.json" "$tmp/fix/gomod/private.mod.fakejson"
-ctx() { rc=0; env FAKE_GO_MODJSON="$tmp/fix/modjson-none.json" GOPROXY="$GO_ORIGIN" "$@" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-gosum --project-dir "${CTX_DIR:-$tmp/fix/gomod}" --gate install -- ${CTX_ARGV:-build ./...} > "$tmp/out" 2>&1 || rc=$?; }
-CTX_ARGV="mod download -modfile=private.mod" ctx
-[[ "$rc" == 20 ]] || fail "-modfile requiring a revoked module (default go.mod requires nothing): rc=$rc $(cat "$tmp/out")"
-CTX_ARGV="build -modfile private.mod ./..." ctx
-[[ "$rc" == 20 ]] || fail "-modfile space form: rc=$rc"
-ctx FAKE_GOFLAGS=-modfile=private.mod
-[[ "$rc" == 20 ]] || fail "-modfile from GOFLAGS / the go env file: rc=$rc"
-CTX_ARGV="build -modfile=missing.mod ./..." ctx
-[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_project_unmodelled ]] || fail "an unreadable module file asks: rc=$rc"
-mkdir -p "$tmp/fix/gomod/sub/dir"
-CTX_DIR="$tmp/fix/gomod/sub/dir" ctx FAKE_GO_MODJSON="$tmp/fix/modjson-req.json"
-[[ "$rc" == 20 ]] || fail "a subdirectory of the module reads the module root: rc=$rc"
-mkdir -p "$tmp/fix/ws/a" "$tmp/fix/ws/b"
-printf 'module example.com/a\n' > "$tmp/fix/ws/a/go.mod"; printf 'module example.com/b\n' > "$tmp/fix/ws/b/go.mod"
-cp "$tmp/fix/modjson-none.json" "$tmp/fix/ws/a/go.mod.fakejson"; cp "$tmp/fix/modjson-req.json" "$tmp/fix/ws/b/go.mod.fakejson"
-printf '{"Go":"1.22","Use":[{"DiskPath":"./a"},{"DiskPath":"./b"}],"Replace":null}\n' > "$tmp/fix/ws/work.json"
-CTX_DIR="$tmp/fix/ws/a" ctx FAKE_GOWORK="$tmp/fix/ws/go.work" FAKE_GOWORK_JSON="$tmp/fix/ws/work.json"
-[[ "$rc" == 20 ]] || fail "workspace mode reads every used module: rc=$rc $(cat "$tmp/out")"
-CTX_ARGV="mod tidy" ctx FAKE_GO_IMPORTS="fmt superbiche.me/caviar/redact example.com/app/internal"
-[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_import_unrequired ]] || fail "tidy with a new private import asks before go resolves it: rc=$rc"
-CTX_ARGV="run -mod=mod ." ctx FAKE_GO_IMPORTS="superbiche.me/caviar/redact"
-[[ "$rc" == 19 ]] || fail "-mod=mod with a new private import: rc=$rc"
-ctx FAKE_GOFLAGS=-mod=mod FAKE_GO_IMPORTS="superbiche.me/caviar/redact"
-[[ "$rc" == 19 ]] || fail "-mod=mod from GOFLAGS with a new private import: rc=$rc"
-ctx FAKE_GO_IMPORTS="superbiche.me/caviar/redact"
-[[ "$rc" == 0 ]] || fail "a readonly build cannot add the import (go refuses it), nothing to decide: rc=$rc"
-CTX_ARGV="mod tidy" ctx FAKE_GO_MODJSON="$tmp/fix/modjson-req.json" FAKE_GO_IMPORTS="superbiche.me/caviar/redact"
-[[ "$rc" == 20 ]] || fail "tidy with a required private import decides the requirement: rc=$rc"
-CTX_ARGV="mod tidy" ctx FAKE_GO_IMPORTS="fmt example.com/app/internal"
-[[ "$rc" == 0 ]] || fail "tidy without private imports: rc=$rc"
-rm -f "$pins" "$tmp/fix/gomod/private.mod.fakejson"
-jq '.Go = "1.16"' "$tmp/fix/modjson-req.json" > "$tmp/fix/modjson-old.json"
-rc=0; FAKE_GO_MODJSON="$tmp/fix/modjson-old.json" GOPROXY="$GO_ORIGIN" "$AUDIT" private-gosum --project-dir "$tmp/fix/gomod" --gate install > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 19 ]] || fail "pre-1.17 graph: rc=$rc"
-jq '.Replace = [{Old: {Path: "superbiche.me/caviar"}, New: {Path: "../caviar"}}]' "$tmp/fix/modjson-req.json" > "$tmp/fix/modjson-local.json"
-"$CORE" private-trust record --pins "$pins" --ecosystem go --origin "$GO_ORIGIN" --name superbiche.me/caviar --version v0.2.0 --mode revoke >/dev/null
-rc=0; FAKE_GO_MODJSON="$tmp/fix/modjson-local.json" GOPROXY="$GO_ORIGIN" "$AUDIT" private-gosum --project-dir "$tmp/fix/gomod" --gate install > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 0 ]] || fail "a local-directory replace downloads nothing: rc=$rc"
-mkdir -p "$tmp/fix/other"; cp "$tmp/fix/gomod/go.mod" "$tmp/fix/other/go.mod"
-rc=0; FAKE_GO_MODJSON="$tmp/fix/modjson-req.json" GOPROXY="$GO_ORIGIN" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-gosum --project-dir "$tmp/fix/nonexistent" --gate install -- -C "$tmp/fix/other" mod download > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 20 ]] || fail "go -C must be followed: rc=$rc"
-rm -f "$pins"
-mkdir -p "$tmp/fix/nomod"
-dl() { rc=0; GOPROXY="$GO_ORIGIN" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-gosum --project-dir "$tmp/fix/nomod" --gate install -- "$@" > "$tmp/out" 2>&1 || rc=$?; }
-rm -f "$pins"
-"$CORE" private-trust record --pins "$pins" --ecosystem go --origin "$GO_ORIGIN" --name superbiche.me/caviar --version v0.2.0 --mode revoke >/dev/null
-dl mod download -json superbiche.me/caviar@v0.2.0
-[[ "$rc" == 20 ]] || fail "explicit go mod download of a revoked private module outside a module: rc=$rc $(cat "$tmp/out")"
-rm -f "$pins"
-dl mod download -json superbiche.me/caviar@v0.2.0
-[[ "$rc" == 18 ]] && jq -e '.private_registry_lines[0].package == "superbiche.me/caviar@v0.2.0"' "$tmp/result.json" >/dev/null || fail "explicit private download, first use: rc=$rc"
-dl mod download superbiche.me/caviar@latest
-[[ "$rc" == 19 ]] || fail "explicit private download by query: rc=$rc"
-dl mod download -json golang.org/x/text@v0.20.0
-[[ "$rc" == 0 ]] || fail "explicit public download is not on the private lane: rc=$rc"
-rc=0; FAKE_GO_MODJSON="$tmp/fix/modjson-none.json" GOPROXY="$GO_ORIGIN" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-gosum --project-dir "$tmp/fix/gomod" --gate install -- mod download superbiche.me/caviar@v0.2.0 > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 18 ]] || fail "explicit private download inside a module that does not require it: rc=$rc"
-# round-2 P4: local go run / install and the other module-downloading go
-# commands reach the project lane before delegation
-cat > "$tmp/route-go.sh" <<'ROUTE'
-#!/usr/bin/env bash
-set -uo pipefail
-export SAFE_RUN_DATA_DIR="$tmp/rdata" TMPDIR="$tmp/tmpdir"
-mkdir -p "$SAFE_RUN_DATA_DIR" "$TMPDIR"
-source "$ROOT/lib/gate-lib.sh"
-SAFE_GATE_AUDIT_BIN="$ROOT/bin/safe-audit"
-safe_gate_audit_available() { return 0; }
-safe_gate_operator_terminal() { return 1; }
-safe_gate_scan_project() { return 0; }
-safe_gate_check_many() { printf 'SPEC %s\n' "$*" > "$tmp/spec"; return 0; }
-safe_gate_exec_real() { printf 'DELEGATED %s\n' "$*" > "$tmp/delegated"; exit 0; }
-cd "$tmp/fix/gomod"
-safe_gate_go "$@"
-ROUTE
-rm -f "$pins"
-"$CORE" private-trust record --pins "$pins" --ecosystem go --origin "$GO_ORIGIN" --name superbiche.me/caviar --version v0.2.0 --mode revoke >/dev/null
-for cmd in "run ." "run -mod=mod ./cmd/app" "install" "install ./cmd/app" "vet ./..." "list -m all" "mod vendor" "mod graph" "build ./..."; do
-  rm -f "$tmp/delegated"
-  rc=0; FAKE_GO_MODJSON="$tmp/fix/modjson-req.json" GOPROXY="$GO_ORIGIN" bash "$tmp/route-go.sh" $cmd > "$tmp/out" 2>&1 || rc=$?
-  [[ "$rc" == 104 && ! -e "$tmp/delegated" ]] || fail "go $cmd delegated a module graph requiring a revoked private module: rc=$rc $(cat "$tmp/out")"
+audit superbiche.me/caviar@v0.2.0 go
+[[ "$rc" == 18 ]] && jq -e --arg o "$GO_ORIGIN" '.private_registry.audit_extra == ("registry=p-go origin=" + $o + " name=superbiche.me/caviar version=v0.2.0 route=" + $o)' "$tmp/result.json" >/dev/null \
+  || fail "go private spec: rc=$rc $(cat "$tmp/out") $(cat "$tmp/result.json" 2>/dev/null)"
+grep -q 'mod download' "$tmp/go.argv" && fail "the go lane downloaded"
+audit superbiche.me/caviar@v0.2.0 go FAKE_GOPROXY="file:///repo/third_party/goproxy,$GO_ORIGIN,https://proxy.golang.org,direct"
+[[ "$rc" == 18 ]] && jq -e '.private_registry.audit_extra | contains("route=file:///repo/third_party/goproxy,")' "$tmp/result.json" >/dev/null \
+  || fail "a local file:// GOPROXY ahead of the origin: rc=$rc"
+pass "go: a namespace module routed to its origin installs unattended (18) with the route in the audit line; local file:// GOPROXY entries ahead of the origin are local artifacts"
+for proxy in "https://proxy.golang.org,$GO_ORIGIN" "direct" "file:///repo/goproxy,https://proxy.golang.org,$GO_ORIGIN" "$EVIL/go,$GO_ORIGIN"; do
+  audit superbiche.me/caviar@v0.2.0 go FAKE_GOPROXY="$proxy"
+  [[ "$rc" == 20 && "$(decision)" == private_cross_registry ]] || fail "GOPROXY=$proxy: rc=$rc"
 done
+audit superbiche.me/caviar@v0.2.0 go FAKE_GOPRIVATE=superbiche.me
+[[ "$rc" == 20 ]] || fail "GOPRIVATE: rc=$rc"
+audit superbiche.me/caviar@latest go
+[[ "$rc" == 19 ]] || fail "go query: rc=$rc"
+pass "go: another proxy, direct or GOPRIVATE ahead of the origin BLOCK (20); queries ask"
+mkdir -p "$tmp/fix/gomod/sub"
+printf 'module example.com/app\n' > "$tmp/fix/gomod/go.mod"
+jq -n '{Module: {Path: "example.com/app"}, Go: "1.22", Require: [{Path: "superbiche.me/caviar", Version: "v0.2.0"}, {Path: "example.com/public", Version: "v1.0.0"}]}' > "$tmp/fix/gomod/go.mod.fakejson"
+gol() { local dir="$1"; shift; local -a envs=(); while [[ $# -gt 0 && "$1" != "--" ]]; do envs+=("$1"); shift; done; shift
+  rm -f "$tmp/result.json"; rc=0
+  env "${envs[@]}" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-go --project-dir "$dir" --gate install -- "$@" > "$tmp/out" 2>&1 || rc=$?; }
+gol "$tmp/fix/gomod/sub" -- build ./...
+[[ "$rc" == 18 ]] && jq -e '.private_registry_lines | length == 1 and .[0].package == "superbiche.me/caviar@v0.2.0"' "$tmp/result.json" >/dev/null \
+  || fail "go project audit lines: rc=$rc $(cat "$tmp/out")"
+gol "$tmp/fix/gomod" FAKE_GOPROXY="https://proxy.golang.org,direct" -- build ./...
+[[ "$rc" == 20 ]] || fail "a misrouted namespace BLOCKs every module command: rc=$rc"
+gol "$tmp/fix/plain" FAKE_GOPROXY="https://proxy.golang.org,direct" -- build ./...
+[[ "$rc" == 20 ]] || fail "a misrouted namespace BLOCKs outside a module too: rc=$rc"
+gol "$tmp/fix/gomod" FAKE_GOPROXY="file:///repo/third_party/goproxy,$GO_ORIGIN" -- test ./...
+[[ "$rc" == 18 ]] || fail "Memoire-style file:// then origin: rc=$rc"
+gol "$tmp/fix/gomod" FAKE_GOPROXY="file:///repo/third_party/goproxy,off" -- build ./...
+[[ "$rc" == 18 ]] && jq -e '.private_registry_lines[0].extra | contains("route=file:///repo/third_party/goproxy,off")' "$tmp/result.json" >/dev/null || fail "local-only routing: rc=$rc"
+gol "$tmp/fix/nonexistent" -- -C "$tmp/fix/plain" mod download superbiche.me/other@v1.2.3
+[[ "$rc" == 18 ]] && grep -q "cwd=$tmp/fix/plain" "$tmp/go.argv" && jq -e '.private_registry_lines[0].package == "superbiche.me/other@v1.2.3"' "$tmp/result.json" >/dev/null \
+  || fail "go -C and explicit download targets: rc=$rc"
+gol "$tmp/fix/gomod" -- build -modfile=missing.mod ./...
+[[ "$rc" == 18 ]] && jq -e '.private_registry_lines[0].extra | contains("version=unknown")' "$tmp/result.json" >/dev/null || fail "an unreadable module file still logs the route: rc=$rc"
+jq -n '{Module: {Path: "example.com/app"}, Go: "1.22", Require: [{Path: "example.com/public", Version: "v1.0.0"}]}' > "$tmp/fix/gomod/go.mod.fakejson"
+gol "$tmp/fix/gomod" -- build ./...
+[[ "$rc" == 0 ]] || fail "a module requiring nothing private: rc=$rc"
+pass "go lane: every module command checks the namespace routing in its own context (go -C followed; file:// sources local; misrouting BLOCKs); audit lines name the namespace requirements and explicit download targets"
+cp "$tmp/fix/gomod/go.mod.fakejson" "$tmp/fix/gomod/go.mod.public"
+jq -n '{Module: {Path: "example.com/app"}, Go: "1.22", Require: [{Path: "superbiche.me/caviar", Version: "v0.2.0"}]}' > "$tmp/fix/gomod/go.mod.fakejson"
+for cmd in "run ." "install" "install ./cmd/app" "vet ./..." "list -m all" "mod vendor" "mod tidy" "build ./..."; do
+  rm -f "$tmp/delegated"
+  rc=0; ROUTE_DIR="$tmp/fix/gomod" FAKE_GOPROXY="https://proxy.golang.org,direct" bash "$tmp/route.sh" safe_gate_go $cmd > "$tmp/out" 2>&1 || rc=$?
+  [[ "$rc" == 104 && ! -e "$tmp/delegated" ]] || fail "go $cmd delegated with the namespace misrouted: rc=$rc $(cat "$tmp/out")"
+done
+rm -f "$tmp/delegated"
+rc=0; ROUTE_DIR="$tmp/fix/gomod" bash "$tmp/route.sh" safe_gate_go run . > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 0 && -e "$tmp/delegated" ]] && grep -q 'ALLOWED_VIA_PRIVATE_REGISTRY.*name=superbiche.me/caviar version=v0.2.0' "$tmp/rdata/audit.log" \
+  || fail "go run with the namespace routed: rc=$rc $(cat "$tmp/out")"
 rm -f "$tmp/delegated" "$tmp/spec"
-rc=0; FAKE_GO_MODJSON="$tmp/fix/modjson-req.json" GOPROXY="$GO_ORIGIN" bash "$tmp/route-go.sh" install superbiche.me/tool@v1.0.0 > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 0 && -e "$tmp/spec" ]] || fail "go install <mod>@<ver> stays on the spec lane (outside the current module): rc=$rc $(cat "$tmp/out")"
-rm -f "$pins"
-pass "go project lane: go.mod requirements are decided without go.sum (revoked BLOCKs, first use pins from the origin); the selected context is read (-modfile in argv/GOFLAGS, module root above the cwd, every go.work module); new private imports ask before tidy/-mod=mod; pre-1.17 graphs and unreadable contexts ask; local replaces skip; -C is followed; explicit go mod download <mod>@<ver> targets are decided inside or outside a module"
-
-# round-1 P5 (option A): the unattended private allow needs an install that
-# fetches nothing beyond the checked root
-reset_state
-add_registry p-py python "$PY_ORIGIN" caviar-redact
-audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple"
-[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_dependencies_unaudited ]] || fail "pip without --no-deps: rc=$rc"
-grep -q -- '--no-deps' "$tmp/out" || fail "pip dependency hint"
-rc=0; PIP_INDEX_URL="$PY_ORIGIN/simple" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" package-audit caviar-redact@0.2.0 --ecosystem python --gate install --no-deps-selected > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 18 ]] || fail "pip --no-deps (argv): rc=$rc"
-PIPCONF="${XDG_CONFIG_HOME:-$HOME/.config}/pip/pip.conf"
-mkdir -p "$(dirname "$PIPCONF")"; printf '[install]\nno-deps = true\n' > "$PIPCONF"
-audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple"
-[[ "$rc" == 18 ]] || fail "pip config no-deps: rc=$rc"
-rm -f "$PIPCONF"
-( source "$ROOT/lib/gate-lib.sh"; safe_gate_python_no_deps pip x==1 --no-deps; [[ "$SAFE_GATE_NO_DEPS" == 1 ]] ) || fail "the gate does not flag --no-deps"
-( source "$ROOT/lib/gate-lib.sh"; safe_gate_python_no_deps uv x==1 --no-dependencies; [[ "$SAFE_GATE_NO_DEPS" == 1 ]] ) && fail "uv has no --no-dependencies spelling"
-# round-2 P7: the proof follows pip's own precedence, and only for pip
-alt_conf="$tmp/alt-pip.conf"
-printf '[install]\nno-deps = true\n' > "$PIPCONF"
-audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple" PIP_NO_DEPS=false
-[[ "$rc" == 19 ]] || fail "PIP_NO_DEPS=false overrides pip config for pip: rc=$rc"
-printf '[install]\nno-deps = false\n' > "$alt_conf"
-audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple" PIP_CONFIG_FILE="$alt_conf"
-[[ "$rc" == 19 ]] || fail "PIP_CONFIG_FILE is read after the user file: rc=$rc"
-printf '[global]\nno-deps = true\n' > "$PIPCONF"; printf '[install]\nno-deps = no\n' > "$alt_conf"
-audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple" PIP_CONFIG_FILE="$alt_conf"
-[[ "$rc" == 19 ]] || fail "[install] beats [global] across files: rc=$rc"
-audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple"
-[[ "$rc" == 18 ]] || fail "[global] no-deps alone: rc=$rc"
-printf '[install]\nno-dependencies = true\n' > "$PIPCONF"
-audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple"
-[[ "$rc" == 19 ]] || fail "the --no-dependencies config spelling is not modelled: rc=$rc"
-rm -f "$PIPCONF" "$alt_conf"
-rc=0; PIP_NO_DEPS=1 PIP_INDEX_URL="$PY_ORIGIN/simple" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" package-audit caviar-redact@0.2.0 --ecosystem python --gate install > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 19 ]] || fail "PIP_NO_DEPS proves nothing for uv or pip --isolated (no --pip-settings-apply): rc=$rc"
-# round-2 P8: an explicit uv config file is a source the lane does not model
-uvaudit() { rc=0; (cd "${UV_CWD:-$tmp}" && PIP_INDEX_URL="$PY_ORIGIN/simple" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" package-audit caviar-redact@0.2.0 --ecosystem python --gate install --no-deps-selected "$@") > "$tmp/out" 2>&1 || rc=$?; }
-uvaudit --uv-config explicit
-[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_source_unmodelled ]] || fail "uv --config-file on a private install: rc=$rc"
-mkdir -p "$tmp/uvproj/sub"
-uvaudit --uv-config ambient
-[[ "$rc" == 18 ]] || fail "uv without source configuration: rc=$rc $(cat "$tmp/out")"
-printf '[pip]\nfind-links = ["https://flat.example.test/"]\n' > "$tmp/uvproj/uv.toml"
-UV_CWD="$tmp/uvproj/sub" uvaudit --uv-config ambient
-[[ "$rc" == 19 ]] && grep -q 'uvproj/uv.toml' "$tmp/out" || fail "a discovered uv.toml setting sources asks: rc=$rc"
-UV_CWD="$tmp/uvproj/sub" uvaudit
-[[ "$rc" == 18 ]] || fail "uv --no-config (no --uv-config) skips discovery: rc=$rc"
-rm -f "$tmp/uvproj/uv.toml"
-printf '[project]\nname = "app"\n[tool.uv]\ndev-dependencies = []\n' > "$tmp/uvproj/pyproject.toml"
-UV_CWD="$tmp/uvproj/sub" uvaudit --uv-config ambient
-[[ "$rc" == 18 ]] || fail "[tool.uv] without sources: rc=$rc"
-printf '[[tool.uv.index]]\nurl = "https://other.example.test/simple"\n' >> "$tmp/uvproj/pyproject.toml"
-UV_CWD="$tmp/uvproj/sub" uvaudit --uv-config ambient
-[[ "$rc" == 19 ]] || fail "pyproject [[tool.uv.index]] asks: rc=$rc"
-rm -rf "$tmp/uvproj"
-mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/uv"; printf 'index-url = "https://other.example.test/simple"\n' > "${XDG_CONFIG_HOME:-$HOME/.config}/uv/uv.toml"
-uvaudit --uv-config ambient
-[[ "$rc" == 19 ]] || fail "the user uv.toml setting an index asks: rc=$rc"
-rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/uv/uv.toml"
-pass "round-2 P7/P8: pip's dependency switch is read with pip's precedence and only for pip outside --isolated; an explicit uv config, or a discovered one that sets sources, asks (19)"
-add_registry p-npm npm "$NPM_ORIGIN" '@p/*'
-audit @p/x@6.0.0 npm FAKE_NPM_DEPS='"dependencies":{"left-pad":"1.3.0"}'
-[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_dependencies_unaudited ]] && grep -q 'left-pad' "$tmp/out" || fail "npm spec with dependencies: rc=$rc"
-audit @p/x@6.0.1 npm FAKE_NPM_DEPS='"peerDependencies":{"react":"18.0.0"},"peerDependenciesMeta":{"react":{"optional":true}}'
-[[ "$rc" == 18 ]] || fail "an optional peer is not installed: rc=$rc"
-audit @p/x@6.0.2 npm FAKE_NPM_DEPS='"peerDependencies":{"react":"18.0.0"}'
-[[ "$rc" == 19 ]] || fail "a required peer is installed by npm: rc=$rc"
-audit @p/x@1.0.0 npm FAKE_NPM_DEPS='"dependencies":{"left-pad":"1.3.0"}' SAFE_AUDIT_ARTIFACT_LOCKFILE="$tmp/fix/lock.json"
-[[ "$rc" == 18 ]] || fail "the lockfile lane decides its own entries: rc=$rc"
-add_registry p-go go "$GO_ORIGIN" superbiche.me
-audit superbiche.me/caviar@v0.2.0 go GOPROXY="$GO_ORIGIN" FAKE_GO_DEP_MODJSON='{"Require":[{"Path":"golang.org/x/text","Version":"v0.20.0"}]}'
-[[ "$rc" == 19 ]] && grep -q 'golang.org/x/text' "$tmp/out" || fail "go install of a module with requirements: rc=$rc"
-audit superbiche.me/caviar@v0.2.0 go GOPROXY="$GO_ORIGIN"
-[[ "$rc" == 18 ]] || fail "go install of a dependency-free module: rc=$rc"
-pass "P5 option A: the unattended allow needs a dependency-free install (pip --no-deps/config, npm without dependencies or required peers, go without requirements); otherwise 19 with the recovery hint"
+rc=0; ROUTE_DIR="$tmp/fix/gomod" bash "$tmp/route.sh" safe_gate_go install superbiche.me/tool@v1.0.0 > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 0 && -e "$tmp/spec" ]] || fail "go install <mod>@<ver> stays on the spec lane: rc=$rc"
+pass "the shipped go routes (run, install, vet, list, go mod *, build) check the routing before delegating"
 
 # --- gate termini ---------------------------------------------------------------
 cat > "$tmp/scenario.sh" <<'SCENARIO'
@@ -670,17 +438,17 @@ gate_case() { # audit-rc terminal result answer
   cat "$tmp/grc" 2>/dev/null || printf none
 }
 last_line() { tail -n 1 "$tmp/gdata/audit.log" 2>/dev/null; }
-ALLOW='{"package":"@p/x","resolved_versions":["1.0.0"],"private_registry":{"decision":"ALLOWED_VIA_PRIVATE_REGISTRY","audit_extra":"registry=p-npm origin=https://o artifact=a integrity=sha512-X pin=matched cooldown=0"},"gate_exit":18}'
-ASK='{"package":"@p/x","resolved_versions":["1.0.0"],"private_registry":{"decision":"private_pin_missing","detail":"the registry requires an operator pin","hint":"ask the operator"},"gate_exit":19}'
-BLOCK='{"package":"@p/x","resolved_versions":["1.0.0"],"block":{"class":"private","detail":"the artifact differs"},"private_registry":{"decision":"private_artifact_changed"},"gate_exit":20}'
+ALLOW='{"package":"@p/x","resolved_versions":["1.0.0"],"private_registry":{"decision":"ALLOWED_VIA_PRIVATE_REGISTRY","audit_extra":"registry=p-npm origin=https://o name=@p/x version=1.0.0"},"gate_exit":18}'
+ASK='{"package":"@p/x","resolved_versions":["1.0.0"],"private_registry":{"decision":"private_route_unmodelled","detail":"this install route reads package sources safe does not control","hint":"install it with npm"},"gate_exit":19}'
+BLOCK='{"package":"@p/x","resolved_versions":["1.0.0"],"block":{"class":"private","detail":"npm would fetch it elsewhere"},"private_registry":{"decision":"private_cross_registry"},"gate_exit":20}'
 r="$(gate_case 18 0 "$ALLOW" '')"
-[[ "$r" == 0 ]] && last_line | grep -q '| ALLOWED_VIA_PRIVATE_REGISTRY | registry=p-npm origin=https://o artifact=a integrity=sha512-X' \
+[[ "$r" == 0 ]] && last_line | grep -q '| ALLOWED_VIA_PRIVATE_REGISTRY | registry=p-npm origin=https://o name=@p/x version=1.0.0' \
   || fail "18 unattended: rc=$r $(last_line)"
 r="$(gate_case 18 0 '{"package":"@p/x","resolved_versions":["1.0.0"],"gate_exit":18}' '')"
 [[ "$r" == 100 ]] || fail "18 without evidence: rc=$r"
-pass "gate 18 installs unattended with the evidence line; an allow without evidence refuses"
+pass "gate 18 installs unattended with the audit line (registry, origin, name, version); an allow without it refuses"
 r="$(gate_case 19 0 "$ASK" '')"
-[[ "$r" == 102 ]] && last_line | grep -q 'REFUSED_PRIVATE_NONTTY' && grep -q 'requires an operator pin' "$tmp/gout" || fail "19 non-tty: rc=$r"
+[[ "$r" == 102 ]] && last_line | grep -q 'REFUSED_PRIVATE_NONTTY' && grep -q 'reads package sources safe does not control' "$tmp/gout" || fail "19 non-tty: rc=$r"
 grep -q 'host-allow' "$tmp/gout" && fail "19 refusal suggests host-allow"
 r="$(gate_case 19 1 "$ASK" 'y')"
 [[ "$r" == 0 ]] && last_line | grep -q 'PRIVATE_TTY_OVERRIDE' || fail "19 tty y: rc=$r"
@@ -701,36 +469,29 @@ pty_run() { python3 -c 'import pty,sys,os; sys.exit(os.waitstatus_to_exitcode(pt
 rc=0; "$RUN" private-registry add p-npm --ecosystem npm --origin "$NPM_ORIGIN" --namespace '@p/*' --reason r > "$tmp/out" 2>&1 </dev/null || rc=$?
 [[ "$rc" == 102 && ! -e "$policy" ]] || fail "add without a terminal: rc=$rc"
 pty_run "$RUN" private-registry add p-npm --ecosystem npm --origin "$NPM_ORIGIN/" --namespace '@p/*' --reason "my registry" > "$tmp/out" 2>&1 || fail "add: $(cat "$tmp/out")"
-jq -e --arg o "$NPM_ORIGIN" '.registries["p-npm"].origin == $o' "$policy" >/dev/null || fail "add wrote no canonical origin"
+jq -e --arg o "$NPM_ORIGIN" '.registries["p-npm"].origin == $o and (.registries["p-npm"] | has("pin_mode") | not)' "$policy" >/dev/null || fail "add wrote no canonical origin"
 grep -q 'PRIVATE_REGISTRY_ADDED' "$SAFE_RUN_DATA_DIR/audit.log" || fail "add not logged"
-rc=0; pty_run "$RUN" private-registry add bad --ecosystem npm --origin "https://evil.example.test/npm" --namespace '@p/x' --reason r > "$tmp/out" 2>&1 || rc=$?
+rc=0; pty_run "$RUN" private-registry add bad --ecosystem npm --origin "$EVIL/npm" --namespace '@p/x' --reason r > "$tmp/out" 2>&1 || rc=$?
 [[ "$rc" != 0 ]] && grep -q 'overlapping' "$tmp/out" || fail "overlapping registry accepted: $(cat "$tmp/out")"
-rc=0; pty_run "$RUN" private-registry add bad --ecosystem npm --origin "https://evil.example.test/npm" --namespace '@q/*' > "$tmp/out" 2>&1 || rc=$?
+rc=0; pty_run "$RUN" private-registry add bad --ecosystem npm --origin "$EVIL/npm" --namespace '@q/*' > "$tmp/out" 2>&1 || rc=$?
 [[ "$rc" != 0 ]] || fail "add without a reason accepted"
+rc=0; pty_run "$RUN" private-registry add bad --ecosystem npm --origin "$EVIL/npm" --namespace '@q/*' --pin-mode operator --reason r > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" != 0 ]] || fail "the removed --pin-mode option was accepted"
 "$RUN" private-registry list > "$tmp/out" 2>&1 || fail "list: $(cat "$tmp/out")"
-grep -q "p-npm" "$tmp/out" || fail "list"
-pass "private-registry add: operator terminal only, canonical origin, overlap refused, logged; list is read-only"
-
-rc=0; "$RUN" private-registry pin add @p/x@1.0.0 --ecosystem npm > "$tmp/out" 2>&1 </dev/null || rc=$?
-[[ "$rc" == 102 ]] || fail "pin add without a terminal: rc=$rc"
-SAFE_AUDIT_BIN="$AUDIT" pty_run "$RUN" private-registry pin add @p/x@1.0.0 --ecosystem npm > "$tmp/out" 2>&1 || fail "pin add: $(cat "$tmp/out")"
-jq -e '.pins | to_entries[0].value.pinned_by == "operator"' "$pins" >/dev/null || fail "operator pin"
-printf 'nope\n' | SAFE_AUDIT_BIN="$AUDIT" pty_run "$RUN" private-registry pin revoke @p/x@1.0.0 --ecosystem npm > "$tmp/out" 2>&1
-jq -e '.pins | to_entries[0].value.revoked != true' "$pins" >/dev/null || fail "revoke without the typed identity"
-printf '@p/x@1.0.0\n' | SAFE_AUDIT_BIN="$AUDIT" pty_run "$RUN" private-registry pin revoke @p/x@1.0.0 --ecosystem npm > "$tmp/out" 2>&1 || fail "revoke: $(cat "$tmp/out")"
-jq -e '.pins | to_entries[0].value.revoked == true' "$pins" >/dev/null || fail "revoke not recorded"
+grep -q "p-npm" "$tmp/out" && ! grep -q 'pin' "$tmp/out" || fail "list: $(cat "$tmp/out")"
+rc=0; "$RUN" private-registry pin add @p/x@1.0.0 --ecosystem npm > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" != 0 ]] && grep -q 'unknown private-registry subcommand' "$tmp/out" || fail "the removed pin command still exists: rc=$rc"
 no_secret "operator commands"
-pass "pin add fetches through the private origin; revoke needs the typed identity"
+pass "private-registry add: operator terminal only, canonical origin, overlap refused, logged; list is read-only; there are no pin commands"
 
+rm -f "$tmp/npm.argv"
 rc=0; SAFE_AUDIT_BIN="$AUDIT" pty_run "$RUN" host-allow add @p/x@2.0.0 --reason "private grant" > "$tmp/out" 2>&1 || rc=$?
-jq -e --arg s "$SRI_A" '.packages["@p/x"].sha == $s' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null \
-  || fail "host-allow add of a private name did not use the private origin: rc=$rc $(cat "$tmp/out")"
-grep -q -- "--registry=$NPM_ORIGIN/" "$tmp/npm.argv" || fail "host-allow integrity not fetched from the private origin"
-pass "host-allow add of a private npm name takes its integrity from the private registry, not npmjs"
+[[ "$rc" != 0 ]] && grep -q 'trusted already' "$tmp/out" && ! jq -e '.packages["@p/x"]' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null 2>&1 \
+  || fail "host-allow add of a private name: rc=$rc $(cat "$tmp/out")"
+pass "host-allow add of a private name is refused (its origin is trusted already) and never takes public integrity"
 
 pty_run "$RUN" private-registry remove p-npm > "$tmp/out" 2>&1 || fail "remove"
-rc=0; "$AUDIT" private-fetch @p/x@1.0.0 --ecosystem npm > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 3 ]] || fail "removed registry still private: rc=$rc"
+[[ "$("$CORE" private-trust match --policy "$policy" --ecosystem npm --name @p/x | jq -r .lane)" == none ]] || fail "removed registry still private"
 pass "removing the registry withdraws the private lane"
 
 printf 'all private-registry tests passed\n'

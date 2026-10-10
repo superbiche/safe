@@ -120,7 +120,7 @@ func AddRegistry(s Stores, id string, r Registry) (Registry, error) {
 	return r, err
 }
 
-// RemoveRegistry drops a local registry. Its pins stay as inert history.
+// RemoveRegistry drops a local registry.
 func RemoveRegistry(s Stores, id string) error {
 	return withLock(s.Policy, func() error {
 		pol, err := LoadPolicy(s.Policy)
@@ -135,83 +135,11 @@ func RemoveRegistry(s Stores, id string) error {
 	})
 }
 
-// Pin write modes.
-const (
-	PinWriteTOFU    = "tofu"    // record only if absent; never overwrite
-	PinWriteAdd     = "add"     // operator pin; refuse a different existing pin
-	PinWriteReplace = "replace" // operator re-pin after review
-	PinWriteRevoke  = "revoke"  // tombstone
-)
-
-// WritePin records a pin. It returns the stored pin, and for TOFU a false
-// "written" when another writer recorded the identity first (the caller must
-// then re-decide against what was stored).
-func WritePin(file string, p Pin, mode string) (Pin, bool, error) {
-	switch mode {
-	case PinWriteTOFU:
-		p.PinnedBy = PinModeTOFU
-	case PinWriteAdd, PinWriteReplace:
-		p.PinnedBy = PinModeOperator
-	case PinWriteRevoke:
-		if p.PinnedBy == "" {
-			p.PinnedBy = PinModeOperator
-		}
-		p.Revoked = true
-	default:
-		return p, false, fmt.Errorf("unknown pin write mode %q", mode)
-	}
-	if p.PinnedAt == "" {
-		p.PinnedAt = time.Now().UTC().Format(time.RFC3339)
-	}
-	cp, key, err := ValidatePin(p)
-	if err != nil {
-		return p, false, err
-	}
-	written := false
-	err = withLock(file, func() error {
-		pins, err := LoadPins(file)
-		if err != nil {
-			return err
-		}
-		old, exists := pins.Pins[key]
-		switch mode {
-		case PinWriteTOFU:
-			if exists {
-				cp = old
-				return nil
-			}
-		case PinWriteAdd:
-			if exists && old.Revoked {
-				return fmt.Errorf("%s@%s is revoked; use pin replace to reinstate it", cp.Name, cp.Version)
-			}
-			if exists && !IntegrityEqual(cp.Ecosystem, old.Integrity, cp.Integrity) {
-				return fmt.Errorf("%s@%s is already pinned to different bytes; review, then use pin replace", cp.Name, cp.Version)
-			}
-			if exists && old.PinnedBy == PinModeOperator {
-				cp = old
-				return nil
-			}
-		case PinWriteRevoke:
-			if exists {
-				if len(cp.Integrity.Files) == 0 && cp.Integrity.SRI == "" && cp.Integrity.H1 == "" {
-					cp.Integrity = old.Integrity
-				}
-				cp.Artifact = old.Artifact
-			}
-		}
-		pins.Pins[key] = cp
-		pins.Schema = PinsSchema
-		written = true
-		return writeAtomic(file, pins)
-	})
-	return cp, written, err
-}
-
 // ---------------------------------------------------------------------------
 // Fleet statements
 // ---------------------------------------------------------------------------
 
-// Export builds the statement of this host's own registries and pins.
+// Export builds the statement of this host's own registries.
 func Export(s Stores, host, exportedAt string) (Statement, error) {
 	if !ValidHost(host) {
 		return Statement{}, fmt.Errorf("invalid short hostname")
@@ -223,12 +151,8 @@ func Export(s Stores, host, exportedAt string) (Statement, error) {
 	if err != nil {
 		return Statement{}, err
 	}
-	pins, err := LoadPins(s.Pins)
-	if err != nil {
-		return Statement{}, err
-	}
 	st := Statement{Schema: StatementSchema, Host: host, ExportedAt: exportedAt,
-		Registries: pol.Registries, Pins: pins.Pins}
+		Registries: pol.Registries}
 	for id, r := range st.Registries {
 		r.Reason = trimReason(r.Reason)
 		st.Registries[id] = r
@@ -249,13 +173,12 @@ type StatementResult struct {
 	Host       string   `json:"host"`
 	Generation string   `json:"generation"`
 	Registries []string `json:"registries"`
-	Pins       int      `json:"pins"`
 	Warnings   []string `json:"warnings,omitempty"`
 }
 
 // ParseStatement validates a signed statement's bytes as untrusted input:
-// envelope fields must be exact; each registry and pin is re-validated as if
-// typed locally, and invalid ones are dropped with a warning. Overlapping
+// envelope fields must be exact; each registry is re-validated as if typed
+// locally, and invalid ones are dropped with a warning. Overlapping
 // namespaces inside one statement drop the whole statement.
 func ParseStatement(raw []byte, host string) (Statement, []string, error) {
 	var st Statement
@@ -290,22 +213,13 @@ func ParseStatement(raw []byte, host string) (Statement, []string, error) {
 	if err := checkPolicyOverlap(regs); err != nil {
 		return st, warns, fmt.Errorf("statement: %v", err)
 	}
-	pins := map[string]Pin{}
-	for _, k := range sortedKeys(st.Pins) {
-		p, key, err := ValidatePin(st.Pins[k])
-		if err != nil || key != k {
-			warns = append(warns, fmt.Sprintf("skipped pin %q: invalid or mis-keyed", k))
-			continue
-		}
-		pins[key] = p
-	}
-	st.Registries, st.Pins = regs, pins
+	st.Registries = regs
 	return st, warns, nil
 }
 
 // ApplyStatement records a verified statement in the follow ledger. A newer
 // generation REPLACES the origin's previous statement (so an origin's
-// removals and revocations propagate); an older one is refused; an equal
+// removals propagate); an older one is refused; an equal
 // generation with different bytes is a collision and changes nothing.
 func ApplyStatement(stateFile, host, signer string, raw []byte, dryRun bool) (StatementResult, error) {
 	res := StatementResult{Host: host}
@@ -319,7 +233,6 @@ func ApplyStatement(stateFile, host, signer string, raw []byte, dryRun bool) (St
 	gen, _ := time.Parse(time.RFC3339, st.ExportedAt)
 	res.Generation = st.ExportedAt
 	res.Registries = sortedKeys(st.Registries)
-	res.Pins = len(st.Pins)
 	apply := func() error {
 		fs, err := LoadFollowState(stateFile)
 		if err != nil {
@@ -347,7 +260,7 @@ func ApplyStatement(stateFile, host, signer string, raw []byte, dryRun bool) (St
 			return nil
 		}
 		fs.Origins[host] = FollowedOrigin{Accepted: st.ExportedAt, StatementSHA256: digest,
-			Signer: signer, Registries: st.Registries, Pins: st.Pins}
+			Signer: signer, Registries: st.Registries}
 		return writeAtomic(stateFile, fs)
 	}
 	if dryRun {
@@ -376,21 +289,17 @@ func ForgetOrigin(stateFile, host string) (bool, error) {
 
 // ListEntry is one row of the effective registry listing.
 type ListEntry struct {
-	ID           string   `json:"id"`
-	Ecosystem    string   `json:"ecosystem"`
-	Origin       string   `json:"origin"`
-	Namespace    []string `json:"namespace"`
-	PinMode      string   `json:"pin_mode"`
-	CooldownDays int      `json:"cooldown_days"`
-	Source       Source   `json:"source"`
+	ID        string   `json:"id"`
+	Ecosystem string   `json:"ecosystem"`
+	Origin    string   `json:"origin"`
+	Namespace []string `json:"namespace"`
+	Source    Source   `json:"source"`
 }
 
 // Listing is the effective state for list/doctor.
 type Listing struct {
 	Registries []ListEntry `json:"registries"`
 	Conflicts  []string    `json:"conflicts"`
-	LocalPins  int         `json:"local_pins"`
-	PinsBySrc  int         `json:"followed_pins"`
 }
 
 // List reports the effective registries and any cross-source conflicts.
@@ -398,7 +307,7 @@ func (v *View) List() Listing {
 	l := Listing{Registries: []ListEntry{}, Conflicts: []string{}}
 	for _, r := range v.registries {
 		l.Registries = append(l.Registries, ListEntry{ID: r.Source.RegistryID, Ecosystem: r.Ecosystem,
-			Origin: r.Origin, Namespace: r.Namespace, PinMode: r.PinMode, CooldownDays: r.CooldownDays, Source: r.Source})
+			Origin: r.Origin, Namespace: r.Namespace, Source: r.Source})
 	}
 	for i, a := range v.registries {
 		for _, b := range v.registries[i+1:] {
@@ -412,15 +321,6 @@ func (v *View) List() Listing {
 							a.Ecosystem, na, a.Origin, srcLabel(a.Source), nb, b.Origin, srcLabel(b.Source)))
 					}
 				}
-			}
-		}
-	}
-	for _, ps := range v.pins {
-		for _, p := range ps {
-			if p.Source.Kind == KindLocal {
-				l.LocalPins++
-			} else {
-				l.PinsBySrc++
 			}
 		}
 	}

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# LIVE suite — the private-registry npm lane against the REAL npm client and a
-# loopback registry. The hermetic suite stubs npm; a stub that answered
-# `npm view --json` with a bare object (npm >= 12 prints a one-element array)
-# kept it green while the shipped fetch refused every first use (round-1 P6).
-# This suite asks the real client, through the shipped code paths:
-# `safe audit private-fetch` and the project projection of
-# `safe audit private-npm-project`. Offline: the registry is 127.0.0.1.
+# LIVE suite — the private-registry npm lane (trusted origins) against the
+# REAL npm client and a loopback registry. The hermetic suite stubs npm; this
+# one checks that the shipped code paths read the real client's answers: the
+# scope mapping (`npm config get @scope:registry`, with --userconfig) and the
+# lockfiles real npm writes (plain and aliased entries), through
+# `safe audit package-audit` and `safe audit private-npm-project`. Offline:
+# the registry is 127.0.0.1.
 set -uo pipefail
 
 # SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
@@ -96,22 +96,34 @@ printf '@p:registry=%s/\n' "$origin" > "$HOME/.npmrc"
 "$SAFE_CORE_BIN" private-trust registry-add --policy "$SAFE_RUN_CONFIG_DIR/private-registries.json" --id p --ecosystem npm \
   --origin "$origin" --namespace '@p/*' --reason live >/dev/null || fail "registry-add"
 
-out=$("$ROOT/bin/safe-audit" private-fetch @p/x@1.0.0 --ecosystem npm 2>"$tmp/fetch.err") || fail "private-fetch with real npm: $(cat "$tmp/fetch.err")"
-jq -e --arg s "$sri" --arg o "$origin" '.integrity.sri == $s and (.artifact | startswith($o))' <<<"$out" >/dev/null || fail "private-fetch answer: $out"
-pass "private-fetch reads the real npm client's answer for an exact private version"
-
 rc=0
 SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$ROOT/bin/safe-audit" package-audit @p/x@1.0.0 --ecosystem npm --gate install > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 18 ]] || fail "first-use gate audit with real npm: rc=$rc $(cat "$tmp/out")"
-pass "first use through the gate audit pins the real artifact (18)"
-
-mkdir -p "$tmp/proj"
-printf '{"name":"app","version":"1.0.0","dependencies":{"@p/x":"1.0.0"}}\n' > "$tmp/proj/package.json"
+[[ "$rc" == 18 ]] && jq -e --arg o "$origin" '.private_registry.audit_extra == ("registry=p origin=" + $o + " name=@p/x version=1.0.0")' "$tmp/result.json" >/dev/null \
+  || fail "spec audit with real npm: rc=$rc $(cat "$tmp/out")"
+printf '@p:registry=https://registry.npmjs.org/\n' > "$tmp/elsewhere.npmrc"
 rc=0
-SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$ROOT/bin/safe-audit" private-npm-project --tool npm --class install \
-  --project-dir "$tmp/proj" --gate install -- install > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 18 ]] && jq -e '.private_registry_lines[0].package == "@p/x@1.0.0"' "$tmp/result.json" >/dev/null \
-  || fail "real npm --package-lock-only projection sweep: rc=$rc $(cat "$tmp/out")"
-[[ ! -e "$tmp/proj/package-lock.json" ]] || fail "the projection wrote into the project"
-pass "the project lane projects with the real client in scratch and sweeps the private entry (18), leaving the project untouched"
+SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$ROOT/bin/safe-audit" package-audit @p/x@1.0.0 --ecosystem npm --gate install \
+  --npm-userconfig "$tmp/elsewhere.npmrc" > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 20 ]] || fail "real npm with a userconfig mapping the scope to npmjs: rc=$rc $(cat "$tmp/out")"
+pass "the spec lane reads the real npm client's scope mapping (18 at the origin, 20 with a --userconfig mapping it elsewhere)"
+
+proj() {
+  rm -f "$tmp/result.json"; rc=0
+  SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$ROOT/bin/safe-audit" private-npm-project --tool npm --class ci \
+    --project-dir "$tmp/proj" --gate install -- ci > "$tmp/out" 2>&1 || rc=$?
+}
+mkdir -p "$tmp/proj"
+printf '{"name":"app","version":"1.0.0","dependencies":{"@p/x":"1.0.0","private-alias":"npm:@p/x@1.0.0"}}\n' > "$tmp/proj/package.json"
+(cd "$tmp/proj" && "$real_npm" install --package-lock-only --ignore-scripts --no-audit --no-fund > "$tmp/npm.log" 2>&1) \
+  || fail "real npm could not write the lockfile: $(cat "$tmp/npm.log")"
+jq -e '.packages["node_modules/private-alias"].name == "@p/x"' "$tmp/proj/package-lock.json" >/dev/null \
+  || fail "real npm alias lockfile shape changed: $(cat "$tmp/proj/package-lock.json")"
+proj
+[[ "$rc" == 18 ]] && jq -e '[.private_registry_lines[].package] | unique == ["@p/x@1.0.0"]' "$tmp/result.json" >/dev/null \
+  || fail "lockfile written by real npm, at the origin: rc=$rc $(cat "$tmp/out")"
+jq '.packages["node_modules/private-alias"].resolved = "https://registry.npmjs.org/@p/x/-/x-1.0.0.tgz"' "$tmp/proj/package-lock.json" > "$tmp/l.json" \
+  && cp "$tmp/l.json" "$tmp/proj/package-lock.json"
+proj
+[[ "$rc" == 20 ]] || fail "real npm alias entry resolved elsewhere: rc=$rc $(cat "$tmp/out")"
+pass "the project lane sweeps the lockfile real npm writes, aliased entries included (18 at the origin, 20 elsewhere)"
 printf 'all live private-registry npm oracle checks passed\n'
