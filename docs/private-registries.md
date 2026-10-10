@@ -142,10 +142,7 @@ identity, before the package manager is delegated to:
   `--global`, `--package-lock=false`, a bare `--`) are not modelled and ask
   the operator (19). pnpm, yarn and bun: a private name visible in the
   manifest, the npm lockfile or the argv asks (19); their own resolution is
-  not projected, so a private package they would newly resolve behind a
-  public one is not seen (limit). The projection costs one
-  `npm install --package-lock-only` per project operation on hosts with an
-  npm private registry.
+  not projected (see [Known limitations](#known-limitations)).
 - **Python.** Explicit `pip`/`uv`/`pipx` specs. A find-links source (argv
   `--find-links`/`-f`, `PIP_FIND_LINKS`/`UV_FIND_LINKS`, pip config
   `find-links`) or `--no-index` is a BLOCK on the private lane: a flat file
@@ -187,6 +184,27 @@ identity, before the package manager is delegated to:
 
 An npm integrity carrying two different sha512 digests is refused: npm would
 accept bytes matching either.
+
+## Known limitations
+
+- **Roots-only audit.** Dependencies a package manager resolves beside a
+  named root are not audited before delegation; the dependency-free rule
+  above keeps the unattended private allow out of that gap. Closure planning
+  is tracked: [Superbiche/Tasks/752](https://superbiche.fibery.io/Superbiche/Tasks/752).
+- **pnpm, yarn and bun resolution is not projected.** A private name visible
+  in the manifest, the npm lockfile or the argv asks the operator (19), but a
+  private package one of these managers would newly resolve behind a public
+  one is installed without a private-lane decision (pin, revocation, origin
+  binding). Accepted while no pnpm/yarn/bun project consumes a private npm
+  namespace; when one adds or resolves such a package, the lane must fail
+  closed for those managers or project their resolution (tracked follow-up,
+  operator disposition of review round 2 residual R5).
+- **Projection cost.** On a host with an npm private registry, every npm
+  project operation other than `ci` runs one extra
+  `npm install --package-lock-only` in a scratch copy before delegating,
+  even when nothing private is visible yet.
+- **`go get` and public explicit `go mod download`** are not gated
+  ([Superbiche/Tasks/753](https://superbiche.fibery.io/Superbiche/Tasks/753)).
 
 ## Commands
 
