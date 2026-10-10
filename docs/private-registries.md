@@ -50,7 +50,8 @@ The trust label holds only because three guardrails stay in force:
      the origin; any other proxy, `direct`, or `GONOPROXY`/`GOPRIVATE`
      covering the namespace ahead of it BLOCKs. Go fetches every module of
      that path prefix through this routing, whatever the module graph,
-     workspace, replace or build tag.
+     workspace, replace or build tag. Entries after the origin are a
+     documented residual (see [Known limitations](#known-limitations)).
    - **Python.** For `pip install` and `uv pip install` of explicit specs,
      Safe controls the configuration. When the lane allows a private name,
      the gate runs the installer with its configuration switched off
@@ -69,7 +70,19 @@ The trust label holds only because three guardrails stay in force:
 3. **Audit trail.** Every bypass writes one gate line naming the registry,
    origin, name and version (see below).
 
-The local blocklist still applies to private names.
+The local blocklist still applies to private names: explicit specs, private
+npm lockfile entries and names an npm project operation names, and every
+private Go module a command names (download targets, requirements of the
+selected module context).
+
+### Trust perimeter
+
+Trust covers the bytes the registered origin serves **and every URL the
+origin server itself directs the client to**: npm tarball links in its
+metadata, simple-index file links, and HTTP redirects. Safe does not check
+those destinations separately. The operator's Forgejo keeps its package
+storage local (`FORGEJO__packages__STORAGE_TYPE=local` in the infra
+manifests), so its artifacts and redirects stay on the origin.
 
 ### Roots-only audit (pre-existing limitation)
 
@@ -116,13 +129,22 @@ The format of that line depends on the operation:
 
 - **Explicit specs** name their exact version.
 - **npm project operations** log one line per private lockfile entry.
+- **npm project operations** also log a line for a private name the operation
+  names that has no lockfile entry yet (a first install, a new dependency):
+  `version=unknown command=npm-<operation>`.
 - **Go commands** add `route=` with the GOPROXY entries up to the origin.
   When a `file://` entry comes first, Safe cannot know beforehand which entry
   serves a version, so the line names the route rather than claiming the
   origin served the bytes. A Go project command logs one line per namespace
-  requirement of the selected `go.mod` (or `-modfile`) and per explicit
-  `go mod download <module>@<version>` target. If that module file cannot be
-  read, it logs one line per namespace with `version=unknown`.
+  requirement of the context Go selects (every module of an active
+  `go.work`, else the `-modfile` from argv or `GOFLAGS`, else the module root
+  above the working directory) and per explicit
+  `go mod download <module>@<version>` target. Every registered namespace
+  with no such identity (a first `go mod tidy`, a new import, an absent or
+  unreadable module file, a public-only project) gets the fallback line
+  `name=<namespace> version=unknown ... command=go-<subcommand>`. An allow
+  that reaches the gate without a complete line is refused as
+  audit-infrastructure breakage.
 
 Each allow or refusal also writes a `private_registry` event to the verdict log
 (`~/.local/share/safe/audit/audit-log.jsonl`). The `safe install` lane logs
@@ -137,10 +159,15 @@ The lane runs before the package manager is delegated to:
   checked too.
 - **npm projects (`install`, `ci`, `update`, `dedupe`, `prune`).** On a host
   with an npm private registry, two checks run:
-  - **Scope mapping.** Every registered scope must map to its origin. A scope
-    mapped elsewhere BLOCKs any npm project operation. An unmapped scope
-    BLOCKs once the operation names a private package of it (manifest, alias
-    target, argv or lockfile).
+  - **Scope mapping (ruling a43).** Every registered scope must map to its
+    origin. A scope mapped elsewhere or not mapped at all BLOCKs every npm
+    project operation (`install`, `ci`, ...), whether or not it names a
+    private package: an unmapped scope would let a private package a public
+    dependency newly pulls in resolve from the default registry.
+    Provisioning (machine setup, the user `.npmrc`) writes the mapping.
+    Claiming the `@superbiche-private` organisation on npmjs is an
+    operator-side complement that keeps the public namespace from being
+    squatted; Safe does not depend on it.
   - **Lockfile.** Every private entry of the current lockfile must resolve
     under its origin. New resolutions take the checked scope mapping.
 
@@ -148,7 +175,11 @@ The lane runs before the package manager is delegated to:
   behind a lockfile-redirecting flag (`--prefix`, `--global`,
   `--package-lock=false`, a bare `--`) asks (19).
 - **Python.** `pip install` and `uv pip install` of explicit specs, with the
-  isolation above. A private name reached any other way asks (19). Use the
+  isolation above. A private name reached any other way asks (19). That
+  includes requirement and constraint files: Safe walks their `-r`/`-c`
+  includes (relative to the including file, at most 64 files and 16 levels,
+  cycle-safe), and a private name there, or a file set it cannot fully
+  inventory (an unreadable, remote or out-of-bounds include), asks. Use the
   explicit form:
 
   ```bash
@@ -174,16 +205,26 @@ The lane runs before the package manager is delegated to:
   namespace. The trigger is a pnpm/yarn/bun project that adds or resolves
   such a package; it then needs fail-closed handling or a resolution check:
   [Superbiche/Tasks/755](https://superbiche.fibery.io/Superbiche/Tasks/755).
-- **Unmapped scope behind a public package.** On a host where a registered npm
-  scope is not mapped at all, a private package that a public dependency
-  newly pulls in resolves from the default registry. No private name is
-  visible to the lane beforehand, so nothing refuses it (roots-only).
-  Provisioning the scope mapping on every machine closes it.
-- **Go routing on every module command.** While a Go private registry is
-  registered, every module-downloading Go command on the host checks the
-  routing. A host whose GOPROXY does not route the namespace to the origin
-  BLOCKs Go builds until it is provisioned (or a `file://`/`off` local-only
-  route is used).
+- **Go routing on every module command (ruling a41).** While a Go private
+  registry is registered, locally or through follow, every
+  module-downloading Go command on the host checks the routing, public-only,
+  cached and vendored projects included. The costs:
+  - A host whose GOPROXY does not route the namespace to the origin BLOCKs
+    Go commands until it is provisioned (or uses a `file://`/`off`
+    local-only route).
+  - A project that overrides GOPROXY for itself (in its environment or
+    tooling) BLOCKs on such a host.
+  - Two Go namespaces registered on different origins cannot both come
+    first, so every module command BLOCKs.
+- **Go proxies after the origin (ruling a42, residual).** Go moves on to the
+  next GOPROXY entry when the origin lacks a version: on 404/410 after a
+  comma, on any error after a pipe. A later public proxy or `direct` can then
+  serve a private module version the origin does not have, under the
+  origin's allow line. This is reachable only while a Go private namespace is
+  registered. Caviar, the only module under `superbiche.me/`, is going public
+  on `github.com/superbiche/caviar`; once Memoire migrates, the Go private
+  registry leaves the machine configuration and the routing rule goes
+  dormant.
 - **`go get` and public explicit `go mod download`** are not gated:
   [Superbiche/Tasks/753](https://superbiche.fibery.io/Superbiche/Tasks/753).
 
@@ -290,7 +331,8 @@ safe run private-registry add superbiche-pypi --ecosystem python \
 
 Then configure each client:
 
-- **npm:** map the scope in `.npmrc`:
+- **npm:** map the scope in `.npmrc` (required: without it every npm project
+  operation on the host BLOCKs):
   `@superbiche-private:registry=https://git.superbiche.me:8443/api/packages/superbiche-packages/npm/`.
 - **Go:** use `GONOSUMDB=superbiche.me` with the Forgejo proxy first in
   `GOPROXY`. Local `file://` module trees may come before it:

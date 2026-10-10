@@ -13,8 +13,10 @@
   or revocation. The guardrail is origin binding, decided by asking or
   controlling the manager:
   - npm: `npm config get @scope:registry` (with the command's config files
-    and argv selectors) and every lockfile entry whose path, name or alias
-    target is private (v1, v2, v3) must resolve under the origin;
+    and argv selectors) must map every registered scope to its origin (an
+    unmapped scope BLOCKs every npm install/ci, ruling a43), and every
+    lockfile entry whose path, name or alias target is private (v1, v2, v3)
+    must resolve under the origin;
   - Go: `go env` in the command's context must route each registered
     namespace to its origin on every module-downloading command; local
     `file://` GOPROXY entries may come first;
@@ -34,6 +36,13 @@
   pnpm/yarn/bun projects, npm workspace roots, lockfile-redirecting flags,
   lockfile entries without a resolved URL). Credentials stay with each
   client; safe never reads or logs them.
+- The private lane keeps the local blocklist for every named private Go module
+  and npm private entry, walks Python requirement files through their
+  `-r`/`-c` includes (bounded; an incomplete inventory asks), binds npm v3
+  alias entries to their private targets, prints sources without userinfo,
+  query or fragment in every sink, and logs an audit line for every bypass
+  (a Go namespace or npm name with no identity yet gets a `command=` line; an
+  allow without a line is refused).
 - Fleet propagation of that trust. An origin republishes a signed
   `private-registries.<host>.json` with every change, and `safe run host-allow
   follow` follows it. A newer statement replaces the origin's previous one, so

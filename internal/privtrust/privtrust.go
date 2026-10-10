@@ -712,7 +712,7 @@ func GoRoute(ns, origin, goproxy, gonoproxy, goprivate string) GoRouteResult {
 			continue
 		}
 		if strings.HasPrefix(strings.ToLower(e), "file://") {
-			walked = append(walked, e)
+			walked = append(walked, redactURL(e))
 			continue
 		}
 		if e == "off" {
@@ -759,11 +759,14 @@ func patternsReach(globs, ns string) bool {
 	return false
 }
 
-// redactURL drops any userinfo from a proxy URL before it is printed.
+// redactURL is the printable form of a proxy URL: no userinfo, query or
+// fragment (each can carry a credential). An unparseable value prints as a
+// placeholder, never verbatim.
 func redactURL(raw string) string {
-	if u, err := url.Parse(raw); err == nil && u.User != nil {
-		u.User = nil
-		return u.String()
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "an unparseable GOPROXY entry"
 	}
-	return raw
+	u.User, u.RawQuery, u.Fragment, u.RawFragment, u.ForceQuery = nil, "", "", "", false
+	return u.String()
 }

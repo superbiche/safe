@@ -269,7 +269,9 @@ ask the operator. Explicit `pip install` / `uv pip install` specs carry
 with its configuration switched off and its source environment dropped, so
 the argv sources the lane checked are the installer's whole source set;
 `uv --config-file` is flagged; a requirements file naming a private package
-asks. With no private registry configured this costs one file test. See
+(its `-r`/`-c` includes walked, bounded) asks, and so does one that cannot be
+fully inventoried. A private-registry allow on a project operation that
+carries no complete audit line is refused. With no private registry configured this costs one file test. See
 [private registries](private-registries.md).
 
 ## Wrapped Exec and Update Commands

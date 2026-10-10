@@ -4761,11 +4761,21 @@ safe_gate_private_project() {
   case "${rc}" in
     0) ;;
     18)
-      while IFS=$'\t' read -r package extra; do
-        [[ -n "${package}" ]] || continue
-        safe_gate_audit_log "${ecosystem}" "${package}" "ALLOWED_VIA_PRIVATE_REGISTRY" "${extra}"
-      done < <(jq -r '.private_registry_lines[]? | [.package, .extra] | @tsv' "${result_out}" 2>/dev/null)
-      rc=0
+      # An allow without its audit lines is not an allow: every line names
+      # registry, origin, name and version.
+      local -a lines=()
+      safe_gate_collect lines "$(jq -r '.private_registry_lines[]? | select((.package // "") != "" and (.extra // "") != "") | [.package, .extra] | @tsv' "${result_out}" 2>/dev/null)"
+      if (( ${#lines[@]} == 0 )); then
+        safe_gate_err "safe: BLOCKED ${label} — the private-registry decision carried no audit line (audit-infrastructure breakage, not a package finding); rerun install.sh; details: safe explain"
+        safe_gate_audit_log "${ecosystem}" "project" "REFUSED_AUDIT_INFRA"
+        rc=100
+      else
+        local entry
+        for entry in "${lines[@]}"; do
+          safe_gate_audit_log "${ecosystem}" "${entry%%$'\t'*}" "ALLOWED_VIA_PRIVATE_REGISTRY" "${entry#*$'\t'}"
+        done
+        rc=0
+      fi
       ;;
     19)
       safe_gate_private_terminus 19 "$(jq -r '"\(.package)@\(.resolved_versions[0])"' "${result_out}" 2>/dev/null)" "${ecosystem}" "${label}" "${result_out}"

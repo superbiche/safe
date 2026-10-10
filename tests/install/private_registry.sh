@@ -73,7 +73,11 @@ cat > "$tmp/bin/go" <<'GO'
 printf '%s cwd=%s\n' "$*" "$PWD" >> "$tmp/go.argv"
 if [[ "$1 $2" == "env -json" ]]; then
   jq -cn --arg p "${FAKE_GOPROXY-$GO_ORIGIN,https://proxy.golang.org,direct}" --arg n "${FAKE_GONOPROXY-}" --arg v "${FAKE_GOPRIVATE-}" \
-    '{GOPROXY: $p, GONOPROXY: $n, GOPRIVATE: $v}'
+    --arg f "${FAKE_GOFLAGS-}" --arg w "${FAKE_GOWORK-}" '{GOPROXY: $p, GONOPROXY: $n, GOPRIVATE: $v, GOFLAGS: $f, GOWORK: $w}'
+  exit 0
+fi
+if [[ "$1 $2 $3" == "work edit -json" ]]; then
+  cat "${FAKE_GOWORK_JSON:?}"
   exit 0
 fi
 if [[ "$1 $2 $3" == "mod edit -json" ]]; then
@@ -241,7 +245,11 @@ proj install -- install
 proj install FAKE_NPM_SCOPE_REG=https://registry.npmjs.org/ -- install
 [[ "$rc" == 20 ]] || fail "a registered scope npm maps elsewhere BLOCKs even before a private name is visible: rc=$rc"
 proj install FAKE_NPM_SCOPE_REG=undefined -- install
-[[ "$rc" == 0 ]] || fail "an unmapped scope with nothing private named: rc=$rc"
+[[ "$rc" == 20 && "$(decision)" == private_cross_registry ]] || fail "a43: an unmapped registered scope BLOCKs every npm project operation: rc=$rc"
+proj ci FAKE_NPM_SCOPE_REG=undefined -- ci
+[[ "$rc" == 20 ]] || fail "a43: an unmapped registered scope BLOCKs npm ci too: rc=$rc"
+proj install FAKE_NPM_MODE=fail -- install
+[[ "$rc" == 19 && "$(decision)" == private_registry_unreachable ]] || fail "a43: an unanswered scope mapping asks: rc=$rc"
 proj install FAKE_NPM_SCOPE_REG=undefined -- install @p/x@1.0.0
 [[ "$rc" == 20 ]] || fail "an unmapped scope when the operation names a private package: rc=$rc"
 PROJ_TOOL=pnpm proj install -- add @p/x@1.0.0
@@ -250,7 +258,7 @@ PROJ_TOOL=pnpm proj install -- install
 [[ "$rc" == 0 ]] || fail "pnpm public project: rc=$rc"
 proj install -- install --prefix /elsewhere @p/x@1.0.0
 [[ "$rc" == 19 ]] || fail "--prefix with a private name: rc=$rc"
-pass "npm project lane: registered scopes must map to their origin (a scope mapped elsewhere BLOCKs; unmapped BLOCKs once the operation names a private package); pnpm/yarn/bun and lockfile-redirecting flags ask on a private name"
+pass "npm project lane: registered scopes must map to their origin (mapped elsewhere or, ruling a43, not at all BLOCKs every npm install/ci); pnpm/yarn/bun and lockfile-redirecting flags ask on a private name"
 
 # the shipped npm ci route reaches the project lane before delegation
 cat > "$tmp/route.sh" <<'ROUTE'
@@ -393,7 +401,8 @@ gol "$tmp/fix/gomod" -- build -modfile=missing.mod ./...
 [[ "$rc" == 18 ]] && jq -e '.private_registry_lines[0].extra | contains("version=unknown")' "$tmp/result.json" >/dev/null || fail "an unreadable module file still logs the route: rc=$rc"
 jq -n '{Module: {Path: "example.com/app"}, Go: "1.22", Require: [{Path: "example.com/public", Version: "v1.0.0"}]}' > "$tmp/fix/gomod/go.mod.fakejson"
 gol "$tmp/fix/gomod" -- build ./...
-[[ "$rc" == 0 ]] || fail "a module requiring nothing private: rc=$rc"
+[[ "$rc" == 18 ]] && jq -e --arg o "$GO_ORIGIN" '.private_registry_lines | length == 1 and .[0].package == "superbiche.me@go-build" and (.[0].extra == ("registry=p-go origin=" + $o + " name=superbiche.me version=unknown route=" + $o + " command=go-build"))' "$tmp/result.json" >/dev/null \
+  || fail "a module requiring nothing private still logs the namespace fallback line: rc=$rc $(cat "$tmp/result.json" 2>/dev/null)"
 pass "go lane: every module command checks the namespace routing in its own context (go -C followed; file:// sources local; misrouting BLOCKs); audit lines name the namespace requirements and explicit download targets"
 cp "$tmp/fix/gomod/go.mod.fakejson" "$tmp/fix/gomod/go.mod.public"
 jq -n '{Module: {Path: "example.com/app"}, Go: "1.22", Require: [{Path: "superbiche.me/caviar", Version: "v0.2.0"}]}' > "$tmp/fix/gomod/go.mod.fakejson"
@@ -410,6 +419,136 @@ rm -f "$tmp/delegated" "$tmp/spec"
 rc=0; ROUTE_DIR="$tmp/fix/gomod" bash "$tmp/route.sh" safe_gate_go install superbiche.me/tool@v1.0.0 > "$tmp/out" 2>&1 || rc=$?
 [[ "$rc" == 0 && -e "$tmp/spec" ]] || fail "go install <mod>@<ver> stays on the spec lane: rc=$rc"
 pass "the shipped go routes (run, install, vet, list, go mod *, build) check the routing before delegating"
+
+# --- review round 4 correctives --------------------------------------------------
+reset_state
+add_registry p-npm npm "$NPM_ORIGIN" '@p/*'
+add_registry p-py python "$PY_ORIGIN" caviar-redact
+add_registry p-go go "$GO_ORIGIN" superbiche.me
+blocklist="$SAFE_RUN_CONFIG_DIR/blocked.json"
+
+# P1: a v3 alias whose installed key and declared name look public, bound to
+# its private target by the manifest or a lock entry's dependency map
+manifest '{"name":"app","version":"1.0.0","dependencies":{"alias":"npm:@p/x@1.0.0"}}'
+lock "$(jq -n --arg r "$EVIL/x.tgz" '{lockfileVersion: 3, packages: {"": {dependencies: {"alias": "npm:@p/x@1.0.0"}}, "node_modules/alias": {name: "fixture-public", version: "1.0.0", resolved: $r}}}')"
+proj ci -- ci
+[[ "$rc" == 20 && "$(decision)" == private_cross_registry ]] || fail "P1: v3 alias bound by the manifest, resolved elsewhere: rc=$rc $(cat "$tmp/out")"
+manifest '{"name":"app","version":"1.0.0","dependencies":{"pub":"1.0.0"}}'
+lock "$(jq -n --arg r "$EVIL/x.tgz" '{lockfileVersion: 3, packages: {"": {dependencies: {"pub": "1.0.0"}}, "node_modules/pub": {version: "1.0.0", resolved: "https://registry.npmjs.org/pub/-/pub-1.0.0.tgz", dependencies: {"alias": "npm:@p/x@1.0.0"}}, "node_modules/alias": {name: "fixture-public", version: "1.0.0", resolved: $r}}}')"
+proj ci -- ci
+[[ "$rc" == 20 ]] || fail "P1: v3 alias bound by a lock entry's dependency map, resolved elsewhere: rc=$rc"
+manifest '{"name":"app","version":"1.0.0","dependencies":{"alias":"npm:@p/x@1.0.0"}}'
+lock "$(jq -n --arg r "$NPM_ORIGIN/@p%2fx/-/1.0.0/x-1.0.0.tgz" '{lockfileVersion: 3, packages: {"": {dependencies: {"alias": "npm:@p/x@1.0.0"}}, "node_modules/alias": {name: "fixture-public", version: "1.0.0", resolved: $r}}}')"
+proj ci -- ci
+[[ "$rc" == 18 ]] && jq -e '[.private_registry_lines[].package] | index("@p/x@1.0.0") != null' "$tmp/result.json" >/dev/null || fail "P1: v3 alias at the origin: rc=$rc $(cat "$tmp/out")"
+pass "round-4 P1: a v3 alias entry is bound to its private target (manifest or any lock entry's dependency map) whatever its key and declared name"
+
+# P11: a synthetic query token in a source never reaches a sink
+TOK="SYNTHQUERYTOKEN"
+leak() { ! grep -rqs "$TOK" "$tmp/out" "$tmp/result.json" "$SAFE_AUDIT_AUDIT_LOG" || fail "P11: the query token leaked: $1"; }
+audit @p/x@1.0.0 npm FAKE_NPM_SCOPE_REG="$EVIL/npm/?token=$TOK#frag"
+[[ "$rc" == 20 ]] || fail "P11: npm spec scope elsewhere: rc=$rc"
+grep -q "$EVIL/npm" "$tmp/out" || fail "P11: the sanitized source is not named: $(cat "$tmp/out")"
+leak "npm spec refusal"
+manifest '{"name":"app","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}'
+lock '{"lockfileVersion":3,"packages":{"":{}}}'
+proj install FAKE_NPM_SCOPE_REG="https://u:$TOK@registry.npmjs.org/?t=$TOK" -- install
+[[ "$rc" == 20 ]] || fail "P11: npm project scope elsewhere: rc=$rc"
+leak "npm project refusal"
+manifest '{"name":"app","version":"1.0.0","dependencies":{"@p/x":"1.0.0"}}'
+lock "$(jq -n --arg r "$EVIL/x.tgz?token=$TOK" '{lockfileVersion: 3, packages: {"": {}, "node_modules/@p/x": {version: "1.0.0", resolved: $r}}}')"
+proj ci -- ci
+[[ "$rc" == 20 ]] || fail "P11: lockfile entry elsewhere: rc=$rc"
+leak "npm lockfile refusal"
+audit caviar-redact@0.2.0 python FAKE_OTHER_CODE=200 -- --python-isolated --registry "$PY_ORIGIN/simple https://u:$TOK@evil.example.test/simple?token=$TOK"
+[[ "$rc" == 20 ]] || fail "P11: python namesake index: rc=$rc"
+leak "python namesake refusal"
+audit superbiche.me/caviar@v0.2.0 go FAKE_GOPROXY="$EVIL/go?token=$TOK,$GO_ORIGIN"
+[[ "$rc" == 20 ]] || fail "P11: go route elsewhere: rc=$rc"
+leak "go route refusal"
+pass "round-4 P11: npm, lockfile, Python and Go refusals name a source without userinfo, query or fragment in every sink"
+
+# P12: every Go bypass logs a line, first use and workspace roots included;
+# npm first installs log theirs
+mkdir -p "$tmp/fix/ws/app" "$tmp/fix/ws/lib"
+printf 'module example.com/workapp\n' > "$tmp/fix/ws/app/go.mod"
+jq -n '{Module: {Path: "example.com/workapp"}, Require: [{Path: "superbiche.me/caviar", Version: "v0.2.0"}]}' > "$tmp/fix/ws/app/go.mod.fakejson"
+printf '{"Use":[{"DiskPath":"./app"},{"DiskPath":"./lib"}]}\n' > "$tmp/fix/ws/work.json"
+gol "$tmp/fix/ws" FAKE_GOWORK="$tmp/fix/ws/go.work" FAKE_GOWORK_JSON="$tmp/fix/ws/work.json" -- run ./app
+[[ "$rc" == 18 ]] && jq -e '.private_registry_lines | map(.package) == ["superbiche.me/caviar@v0.2.0"]' "$tmp/result.json" >/dev/null \
+  || fail "P12: a workspace root without go.mod logs its members' requirements: rc=$rc $(cat "$tmp/result.json" 2>/dev/null)"
+cp "$tmp/fix/ws/app/go.mod.fakejson" "$tmp/fix/gomod/alt.mod.fakejson"
+cp "$tmp/fix/gomod/go.mod.public" "$tmp/fix/gomod/go.mod.fakejson"
+gol "$tmp/fix/gomod" FAKE_GOFLAGS="-modfile=alt.mod" -- build ./...
+[[ "$rc" == 18 ]] && jq -e '.private_registry_lines[0].package == "superbiche.me/caviar@v0.2.0"' "$tmp/result.json" >/dev/null || fail "P12: a GOFLAGS -modfile logs its requirements: rc=$rc"
+mkdir -p "$tmp/fix/tidy"; printf 'module example.com/tidy\n' > "$tmp/fix/tidy/go.mod"
+jq -n '{Module: {Path: "example.com/tidy"}, Require: []}' > "$tmp/fix/tidy/go.mod.fakejson"
+gol "$tmp/fix/tidy" -- mod tidy
+[[ "$rc" == 18 ]] && jq -e '.private_registry_lines[0].extra | contains("name=superbiche.me version=unknown") and contains("command=go-mod")' "$tmp/result.json" >/dev/null \
+  || fail "P12: a first tidy logs the namespace fallback line: rc=$rc"
+mkdir -p "$tmp/fix/npmnew"; printf '{"name":"app","version":"1.0.0","dependencies":{"@p/x":"1.0.0"}}\n' > "$tmp/fix/npmnew/package.json"
+rc=0; SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-npm-project --tool npm --class install --project-dir "$tmp/fix/npmnew" --gate install -- install > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 18 ]] && jq -e '.private_registry_lines[0].package == "@p/x@npm-install" and (.private_registry_lines[0].extra | contains("command=npm-install"))' "$tmp/result.json" >/dev/null \
+  || fail "P12: an npm first install logs its private name: rc=$rc $(cat "$tmp/out")"
+cat > "$tmp/fake-audit" <<'FA'
+#!/usr/bin/env bash
+[[ -z "${SAFE_AUDIT_RESULT_OUT:-}" ]] || printf '%s\n' "${FAKE_RESULT:-{\"gate_exit\":18}}" > "$SAFE_AUDIT_RESULT_OUT"
+exit 18
+FA
+chmod +x "$tmp/fake-audit"
+for result in '{"gate_exit":18}' '{"gate_exit":18,"private_registry_lines":[{"package":"x@1"}]}' 'not json'; do
+  rc=0; FAKE_RESULT="$result" bash -c 'source "$ROOT/lib/gate-lib.sh"; SAFE_GATE_AUDIT_BIN="$tmp/fake-audit"; safe_gate_audit_available() { return 0; }; export SAFE_RUN_DATA_DIR="$tmp/fdata"; safe_gate_private_project go go "go build" -- build' > "$tmp/out" 2>&1 || rc=$?
+  [[ "$rc" == 100 ]] || fail "P12: the project helper accepted an allow without a complete audit line ($result): rc=$rc"
+done
+pass "round-4 P12: Go bypasses log the selected context's requirements (go.work members, GOFLAGS -modfile) or the namespace fallback line; npm first installs log theirs; an allow without a complete line refuses"
+
+# P13: requirement includes are walked (bounded, cycle-safe); what cannot be
+# inventoried asks
+mkdir -p "$tmp/fix/req/sub"
+printf -- '-r sub/child.txt\nrequests==2.32.0\n' > "$tmp/fix/req/parent.txt"
+printf 'caviar-redact==0.2.0\n' > "$tmp/fix/req/sub/child.txt"
+pyproj() { rc=0; SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-python-project --gate install -- "$@" > "$tmp/out" 2>&1 || rc=$?; }
+pyproj "$tmp/fix/req/parent.txt"
+[[ "$rc" == 19 && "$(decision)" == private_route_unmodelled ]] || fail "P13: a private name behind an include: rc=$rc $(cat "$tmp/out")"
+printf -- '--requirement=../b.txt\nrequests==2.32.0\n' > "$tmp/fix/req/sub/a.txt"
+printf -- '-csub/a.txt\nidna==3.7\n' > "$tmp/fix/req/b.txt"
+pyproj "$tmp/fix/req/sub/a.txt"
+[[ "$rc" == 0 ]] || fail "P13: a public include cycle terminates clean: rc=$rc $(cat "$tmp/out")"
+printf -- '-r missing.txt\n' > "$tmp/fix/req/broken.txt"
+pyproj "$tmp/fix/req/broken.txt"
+[[ "$rc" == 19 ]] && grep -q 'could not be fully inventoried' "$tmp/out" || fail "P13: a missing include asks: rc=$rc"
+printf -- '-r https://u:%s@example.test/req.txt\n' "$TOK" > "$tmp/fix/req/remote.txt"
+pyproj "$tmp/fix/req/remote.txt"
+[[ "$rc" == 19 ]] || fail "P13: a remote include asks: rc=$rc"
+leak "remote include"
+for i in $(seq 0 70); do printf -- '-r f%s.txt\n' "$((i + 1))" > "$tmp/fix/req/f$i.txt"; done
+printf 'idna==3.7\n' > "$tmp/fix/req/f71.txt"
+pyproj "$tmp/fix/req/f0.txt"
+[[ "$rc" == 19 ]] || fail "P13: an include chain past the bounds asks: rc=$rc"
+for tool_cmd in "safe_gate_pip_like pip install -r parent.txt" "safe_gate_uv pip install -r parent.txt"; do
+  rm -f "$tmp/delegated"
+  rc=0; ROUTE_DIR="$tmp/fix/req" bash "$tmp/route.sh" $tool_cmd > "$tmp/out" 2>&1 || rc=$?
+  [[ "$rc" == 102 && ! -e "$tmp/delegated" ]] || fail "P13: $tool_cmd delegated a nested private requirement: rc=$rc $(cat "$tmp/out")"
+done
+pass "round-4 P13: pip and uv requirement files are walked through their -r/-c includes (bounded, cycle-safe); a private name, an unreadable or remote include, or a set past the bounds asks"
+
+# P14: the local blocklist still decides named private Go modules (and npm
+# lockfile entries)
+printf '{"packages":{"superbiche.me/caviar":{"reason":"operator-blocked"},"@p/x":{"reason":"operator-blocked"}}}\n' > "$blocklist"
+audit superbiche.me/caviar@v0.2.0 go
+[[ "$rc" == 20 && "$(decision)" == blocklist ]] || fail "P14: explicit audit of a blocked private module: rc=$rc"
+gol "$tmp/fix/plain" -- mod download superbiche.me/caviar@v0.2.0
+[[ "$rc" == 20 && "$(decision)" == blocklist ]] || fail "P14: a blocked private module named for download: rc=$rc $(cat "$tmp/out")"
+gol "$tmp/fix/ws" FAKE_GOWORK="$tmp/fix/ws/go.work" FAKE_GOWORK_JSON="$tmp/fix/ws/work.json" -- run ./app
+[[ "$rc" == 20 ]] || fail "P14: a blocked private requirement: rc=$rc"
+manifest '{"name":"app","version":"1.0.0","dependencies":{"@p/x":"1.0.0"}}'
+cp "$tmp/fix/lock.json" "$tmp/fix/npmproj/package-lock.json"
+proj ci -- ci
+[[ "$rc" == 20 && "$(decision)" == blocklist ]] || fail "P14 sibling: a blocked private npm lockfile entry: rc=$rc"
+rc=0; "$AUDIT" private-npm-project --tool npm --class install --project-dir "$tmp/fix/npmnew" --gate install -- install > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 20 ]] || fail "P14 sibling: a blocked private npm name on a first install: rc=$rc"
+rm -f "$blocklist"
+pass "round-4 P14: the local blocklist decides named private Go modules (download targets, selected requirements) and npm private entries before delegation"
 
 # --- gate termini ---------------------------------------------------------------
 cat > "$tmp/scenario.sh" <<'SCENARIO'

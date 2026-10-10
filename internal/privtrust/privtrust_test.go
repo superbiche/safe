@@ -106,6 +106,12 @@ func TestGoRoute(t *testing.T) {
 	if r := ok("https://user:tok@evil.example.test/go", "", ""); r.OK || containsTok(r.Reason) {
 		t.Errorf("credentials in the refusal reason: %+v", r)
 	}
+	if r := ok("https://evil.example.test/go?token=SYNTHQ#frag", "", ""); r.OK || stringsContains(r.Reason, "SYNTHQ") || stringsContains(r.Reason, "frag") {
+		t.Errorf("a query credential in the refusal reason: %+v", r)
+	}
+	if r := ok("file:///repo/goproxy?token=SYNTHQ,"+goOrigin, "", ""); !r.OK || stringsContains(r.Route, "SYNTHQ") {
+		t.Errorf("a query credential in the route: %+v", r)
+	}
 	if r := ok("file:///repo/goproxy,off", "", ""); !r.OK || !r.Local {
 		t.Errorf("file:// then off is local-only: %+v", r)
 	}

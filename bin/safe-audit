@@ -8333,10 +8333,32 @@ private_python_norm() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[-_.]+/-/g'
 }
 
-# The audit line of one bypass.
+# The one printable form of a package source in any diagnostic, result or
+# audit sink: no userinfo, query or fragment, ever (a registry URL can carry
+# a credential in either). $2 names the source when $1 is empty.
+private_source_label() {
+  local v="$1" fallback="${2:-its default registry}"
+  if [[ -z "$v" ]]; then
+    printf '%s' "$fallback"
+    return 0
+  fi
+  v=$(source_element_url "$v")
+  v="${v%%#*}"
+  v="${v%%\?*}"
+  if [[ "$v" =~ ^([A-Za-z][A-Za-z0-9+.-]*://)([^/]*@)?([^/]*)(.*)$ ]]; then
+    v="${BASH_REMATCH[1]}${BASH_REMATCH[3]}${BASH_REMATCH[4]}"
+  elif [[ "$v" == *@* ]]; then
+    v="${v##*@}"
+  fi
+  strip_trailing_slashes "$v"
+}
+
+# The audit line of one bypass. $6 names the command when the identity set
+# behind it is unknown (the namespace fallback line).
 private_audit_line() {
-  local ids="$1" origin="$2" name="$3" version="$4" route="${5:-}"
-  printf 'registry=%s origin=%s name=%s version=%s%s' "$ids" "$origin" "$name" "$version" "${route:+ route=${route}}"
+  local ids="$1" origin="$2" name="$3" version="$4" route="${5:-}" command="${6:-}"
+  printf 'registry=%s origin=%s name=%s version=%s%s%s' "$ids" "$origin" "$name" "$version" \
+    "${route:+ route=${route}}" "${command:+ command=${command}}"
 }
 
 # Emit the lane outcome. $1 = gate code (18 allow, 19 operator, 20 block),
@@ -8412,7 +8434,7 @@ private_npm_scope_registry() {
 private_go_env() {
   local dir="$1" go_bin
   go_bin=$(private_real_tool go) || return 46
-  (cd -- "$dir" 2>/dev/null && "$go_bin" env -json GOPROXY GONOPROXY GOPRIVATE 2>/dev/null) || return 42
+  (cd -- "$dir" 2>/dev/null && "$go_bin" env -json GOPROXY GONOPROXY GOPRIVATE GOFLAGS GOWORK 2>/dev/null) || return 42
 }
 
 # Where go would fetch modules under namespace prefix $2 from (origin $3),
@@ -8438,7 +8460,7 @@ private_python_shadow_check() {
     "$core" private-trust under-origin --url "$url" --origin "$origin" >/dev/null 2>&1 && continue
     case "$url" in
       http://*|https://*) probes+=("${url%/}") ;;
-      *) PRIVATE_SHADOW=$(canonicalize_source "$url"); return 44 ;;
+      *) PRIVATE_SHADOW=$(private_source_label "$url"); return 44 ;;
     esac
   done
   probes+=("https://pypi.org/simple")
@@ -8449,8 +8471,8 @@ private_python_shadow_check() {
     code=$(curl -sS --netrc-optional --max-time 10 -o /dev/null -w '%{http_code}' "${p}/${norm}/" 2>/dev/null) || code="000"
     case "$code" in
       404|410) ;;
-      200) PRIVATE_SHADOW=$(canonicalize_source "$p"); return 44 ;;
-      *) PRIVATE_SHADOW=$(canonicalize_source "$p"); return 42 ;;
+      200) PRIVATE_SHADOW=$(private_source_label "$p"); return 44 ;;
+      *) PRIVATE_SHADOW=$(private_source_label "$p"); return 42 ;;
     esac
   done
   return 0
@@ -8525,14 +8547,14 @@ private_lane_audit() {
       fi
       if [[ -z "$reg" ]] || ! "$core" private-trust under-origin --url "$reg" --origin "$origin" >/dev/null 2>&1; then
         private_finish 20 private_cross_registry \
-          "npm would fetch this private name from ${reg:+$(canonicalize_source "$reg")}${reg:-its default registry}, not from its private registry ${origin}" \
+          "npm would fetch this private name from $(private_source_label "$reg"), not from its private registry ${origin}" \
           "map the scope to the private registry (${scope}:registry=${origin}/ in .npmrc); an operator may type the override at an interactive terminal" "$base_extra"
         return $?
       fi
       if [[ -n "${SAFE_AUDIT_ARTIFACT_LOCKFILE:-}" && -f "${SAFE_AUDIT_ARTIFACT_LOCKFILE}" ]]; then
         local keep_name="$PKG_NAME" keep_version="$PKG_VERSION"
         rc=0
-        private_npm_lock_sweep "$core" "$SAFE_AUDIT_ARTIFACT_LOCKFILE" "$PKG_NAME" >/dev/null || rc=$?
+        private_npm_lock_sweep "$core" "$SAFE_AUDIT_ARTIFACT_LOCKFILE" "$PKG_NAME" "${CHECK_PROJECT_DIR:-.}/package.json" >/dev/null || rc=$?
         (( rc == 0 )) || return "$rc"
         PKG_NAME="$keep_name" PKG_VERSION="$keep_version"
       fi
@@ -8615,16 +8637,27 @@ private_lane_audit() {
 }
 
 # Sweep an npm lockfile (v1, v2 or v3) for private entries. An entry's
-# identities are its install path name, its declared `name` and an alias
-# target (`npm:@scope/x@v`); when any identity lies in a registered
+# identities are its install path name, its declared `name` and every alias
+# target bound to its key (`npm:@scope/x@v` in the manifest $4 or any lock
+# entry's dependency map); when any identity lies in a registered
 # namespace, the entry's `resolved` URL must lie under that origin (npm
 # fetches lockfile entries from `resolved`). With $3 set, only entries with
 # that identity count. Prints `name<TAB>version<TAB>origin<TAB>ids` per
-# private entry; refuses with 20 (outside the origin) or 19 (no resolved
+# private entry (a local link prints `name<TAB>link` with no origin); refuses with 20 (outside the origin) or 19 (no resolved
 # URL, a bundled or unparseable entry) through private_finish.
 private_npm_lock_sweep() {
-  local core="$1" lockfile="$2" only="${3:-}" rows names matches
-  rows=$(jq -r '
+  local core="$1" lockfile="$2" only="${3:-}" manifest="${4:-}" rows names matches manifest_json='{}'
+  [[ -n "$manifest" && -f "$manifest" ]] && manifest_json=$(jq -c '.' "$manifest" 2>/dev/null || printf '{}')
+  rows=$(jq -r --argjson m "$manifest_json" '
+    # Alias targets by dependency key: `"<key>": "npm:<target>@<range>"` in
+    # the manifest or in any lockfile entry, bound to the entries installed
+    # under that key (a v3 alias entry may declare any `name`).
+    def deps: [.dependencies, .devDependencies, .optionalDependencies, .peerDependencies]
+      | map(select(type == "object") | to_entries[]) | .[];
+    def aliasmap: [ ($m | deps), (.packages // {} | .[] | deps) ]
+      | map(select(.value | type == "string" and startswith("npm:"))
+            | {key, target: (.value | ltrimstr("npm:") | sub("@[^@]*$"; ""))})
+      | group_by(.key) | map({key: .[0].key, value: (map(.target) | unique)}) | from_entries;
     def v1: to_entries[] | .key as $k | .value as $v
       | ($v.version // "") as $ver
       | (if ($ver | startswith("npm:")) then ($ver | ltrimstr("npm:") | sub("@[^@]*$"; "")) else "" end) as $alias
@@ -8633,8 +8666,11 @@ private_npm_lock_sweep() {
           (if $v.bundled then "bundle" elif ($ver | test("^(file|link):")) then "link" else "" end)] | join("\u001f")),
         ($v.dependencies // {} | v1);
     if (.packages | type) == "object" then
-      .packages | to_entries[] | select(.key | test("(^|/)node_modules/")) | .key as $k | .value as $v
-      | [($k | sub("^.*node_modules/"; "")), ($v.name // ""), "", ($v.version // ""), ($v.resolved // ""),
+      aliasmap as $aliases
+      | .packages | to_entries[] | select(.key | test("(^|/)node_modules/")) | .key as $k | .value as $v
+      | ($k | sub("^.*node_modules/"; "")) as $p
+      | (($aliases[$p] // []) | if length == 0 then [""] else . end)[] as $alias
+      | [$p, ($v.name // ""), $alias, ($v.version // ""), ($v.resolved // ""),
          (if $v.link then "link" elif $v.inBundle then "bundle" else "" end)] | join("\u001f")
     elif (.dependencies | type) == "object" then .dependencies | v1
     else error("no packages or dependencies map") end' "$lockfile" 2>/dev/null) || {
@@ -8666,7 +8702,9 @@ private_npm_lock_sweep() {
       morigin=$(jq -r --arg n "$ident" 'map(select(.name == $n)) | first | .origin' <<<"$matches")
       mids=$(jq -r --arg n "$ident" 'map(select(.name == $n)) | first | .registry_ids | join(",")' <<<"$matches")
       case "$flag" in
-        link) continue ;;
+        # A link is a local workspace package: no fetch, no audit line; it
+        # still counts as covered.
+        link) printf '%s\t%s\t\t\n' "$ident" "link"; continue ;;
         bundle)
           private_finish 19 private_project_unmodelled \
             "the lockfile installs this private name bundled inside another package, so its bytes do not come from ${morigin}" \
@@ -8682,13 +8720,26 @@ private_npm_lock_sweep() {
       fi
       if ! "$core" private-trust under-origin --url "$resolved" --origin "$morigin" >/dev/null 2>&1; then
         private_finish 20 private_cross_registry \
-          "the lockfile resolves this private name (entry ${p}) from $(canonicalize_source "$resolved"), not from its private registry ${morigin}" \
+          "the lockfile resolves this private name (entry ${p}) from $(private_source_label "$resolved"), not from its private registry ${morigin}" \
           "regenerate the lockfile against the private registry; an operator may type the override at an interactive terminal"
+        return $?
+      fi
+      local block_reason
+      if blocklist_authority_readable && block_reason=$(blocked_entry_reason "$ident"); then
+        private_finish 20 blocklist "this host's blocklist names it (${block_reason})" ""
         return $?
       fi
       printf '%s\t%s\t%s\t%s\n' "$ident" "${version:-unknown}" "$morigin" "$mids"
     done
   done <<<"$rows"
+  return 0
+}
+
+# Whether a registered npm scope npm does not map at all BLOCKs every npm
+# project operation, not only one that names a private package of the scope.
+# Operator ruling a43 (review round 4 residual R7): yes, the mapping is a
+# checked prerequisite (provisioning writes it).
+private_npm_unmapped_scope_blocks() {
   return 0
 }
 
@@ -8790,7 +8841,7 @@ private_npm_project_command() {
     rc=0
     reg=$(private_npm_scope_registry "$scope") || rc=$?
     if (( rc != 0 )); then
-      (( nvisible > 0 )) || continue
+      (( nvisible > 0 )) || private_npm_unmapped_scope_blocks || continue
       PKG_NAME="$scope"
       private_finish 19 private_registry_unreachable \
         "npm could not report its registry for ${scope} — audit-infrastructure breakage, not a package finding" \
@@ -8798,28 +8849,49 @@ private_npm_project_command() {
       return $?
     fi
     if [[ -z "$reg" ]]; then
-      jq -e --arg s "$scope/" 'any(.[]; .name | startswith($s))' <<<"$visible" >/dev/null || continue
+      if ! private_npm_unmapped_scope_blocks; then
+        jq -e --arg s "$scope/" 'any(.[]; .name | startswith($s))' <<<"$visible" >/dev/null || continue
+      fi
     elif "$core" private-trust under-origin --url "$reg" --origin "$origin" >/dev/null 2>&1; then
       continue
     fi
     PKG_NAME="$scope"
     private_finish 20 private_cross_registry \
-      "npm maps ${scope} to ${reg:+$(canonicalize_source "$reg")}${reg:-its default registry}, not to its private registry ${origin}" \
+      "npm maps ${scope} to $(private_source_label "$reg"), not to its private registry ${origin}" \
       "map the scope to the private registry (${scope}:registry=${origin}/ in .npmrc); an operator may type the override at an interactive terminal"
     return $?
   done < <(jq -r '.[] | .origin as $o | .namespace[] | select(startswith("@")) | [(split("/")[0]), $o] | @tsv' <<<"$regs" | sort -u)
   # The current lockfile: npm installs its entries from their resolved URLs.
   local -a PRIVATE_COLLECTED=()
+  local -A logged=()
+  local name version morigin mids line block_reason
   if [[ -n "$lock_name" ]]; then
-    local sweep name version morigin mids line
-    sweep=$(private_npm_lock_sweep "$core" "${project_dir%/}/$lock_name") || return $?
+    local sweep
+    sweep=$(private_npm_lock_sweep "$core" "${project_dir%/}/$lock_name" "" "${project_dir%/}/package.json") || return $?
     while IFS=$'\t' read -r name version morigin mids; do
       [[ -n "$name" ]] || continue
+      logged["$name"]=1
+      [[ -n "$morigin" ]] || continue
       line=$(private_audit_line "$mids" "$morigin" "$name" "$version")
       PRIVATE_COLLECTED+=("$(jq -cn --arg p "${name}@${version}" --arg e "$line" '{package: $p, extra: $e}')")
+      logged["$name"]=1
       printf '[safe audit] ALLOWED_VIA_PRIVATE_REGISTRY: %s@%s — %s\n' "$name" "$version" "$line" >&2
     done < <(sort -u <<<"$sweep")
   fi
+  # A private name the operation names with no lockfile entry yet (a first
+  # install, a new dependency) resolves through the checked scope mapping;
+  # it still gets its line, naming the command, and the blocklist.
+  while IFS=$'\t' read -r name morigin mids; do
+    [[ -n "$name" && -z "${logged[$name]:-}" ]] || continue
+    if blocklist_authority_readable && block_reason=$(blocked_entry_reason "$name"); then
+      PKG_NAME="$name" PKG_VERSION="unknown"
+      private_finish 20 blocklist "this host's blocklist names it (${block_reason})" ""
+      return $?
+    fi
+    line=$(private_audit_line "$mids" "$morigin" "$name" "unknown" "" "npm-${class:-install}")
+    PRIVATE_COLLECTED+=("$(jq -cn --arg p "${name}@npm-${class:-install}" --arg e "$line" '{package: $p, extra: $e}')")
+    printf '[safe audit] ALLOWED_VIA_PRIVATE_REGISTRY: %s — %s\n' "$name" "$line" >&2
+  done < <(jq -r '.[] | select(.lane == "private") | [.name, .origin, (.registry_ids | join(","))] | @tsv' <<<"$visible")
   (( ${#PRIVATE_COLLECTED[@]} > 0 )) || return 0
   if [[ -n "${SAFE_AUDIT_RESULT_OUT:-}" ]]; then
     printf '%s\n' "${PRIVATE_COLLECTED[@]}" | jq -s '{gate_exit: 18, private_registry_lines: .}' > "$SAFE_AUDIT_RESULT_OUT" 2>/dev/null \
@@ -8892,23 +8964,45 @@ private_go_command() {
     fi
     routes["$ns"]="${id}"$'\t'"${origin}"$'\t'"$(jq -r '.route' <<<"$res")"
   done < <(jq -r '.[] | .id as $i | .origin as $o | .namespace[] | [$i, $o, .] | @tsv' <<<"$regs")
-  # Audit lines (log only): namespace requirements of the selected module
-  # file, and explicit download targets.
-  local root="" file="" names=""
-  if root=$(cd -- "$project_dir" 2>/dev/null && pwd -P); then
-    while [[ "$root" != "/" && ! -f "$root/go.mod" ]]; do root=$(dirname -- "$root"); done
-    [[ -f "$root/go.mod" ]] && file="$root/go.mod"
+  # Identities of the namespaces, read from the context go selects (log and
+  # blocklist only, never authorization): every module of an active go.work,
+  # else the -modfile from argv or GOFLAGS, else the module root above the
+  # directory; plus explicit `go mod download <mod>@<ver>` targets.
+  local -a files=()
+  local gowork goflags t root="" go_bin=""
+  go_bin=$(private_real_tool go) || go_bin=""
+  gowork=$(jq -r '.GOWORK // ""' <<<"$goenv")
+  [[ "$gowork" == off ]] && gowork=""
+  if [[ -z "$modfile" ]]; then
+    goflags=$(jq -r '.GOFLAGS // ""' <<<"$goenv")
+    for t in $goflags; do
+      case "$t" in -modfile=*|--modfile=*) modfile="${t#*=}" ;; esac
+    done
   fi
-  if [[ -n "$modfile" ]]; then
+  if [[ -n "$gowork" && -n "$go_bin" ]]; then
+    local workjson wdir u
+    if workjson=$(GOFLAGS= "$go_bin" work edit -json "$gowork" 2>/dev/null); then
+      wdir=$(dirname -- "$gowork")
+      while IFS= read -r u; do
+        [[ -n "$u" ]] || continue
+        [[ "$u" == /* ]] || u="$wdir/$u"
+        files+=("$u/go.mod")
+      done < <(jq -r '.Use[]?.DiskPath' <<<"$workjson")
+    fi
+  elif [[ -n "$modfile" ]]; then
     [[ "$modfile" == /* ]] || modfile="${project_dir%/}/$modfile"
-    file="$modfile"
+    files+=("$modfile")
+  elif root=$(cd -- "$project_dir" 2>/dev/null && pwd -P); then
+    while [[ "$root" != "/" && ! -f "$root/go.mod" ]]; do root=$(dirname -- "$root"); done
+    [[ -f "$root/go.mod" ]] && files+=("$root/go.mod")
   fi
-  local go_bin modjson="" readable=1
-  if [[ -n "$file" ]] && go_bin=$(private_real_tool go); then
-    modjson=$(GOFLAGS= "$go_bin" mod edit -json "$file" 2>/dev/null) || readable=0
-  fi
+  local names="" f modjson
   names=$({
-    [[ -n "$modjson" ]] && jq -r '(.Require // [])[] | [.Path, .Version] | @tsv' <<<"$modjson"
+    for f in "${files[@]}"; do
+      [[ -n "$go_bin" ]] || break
+      modjson=$(GOFLAGS= "$go_bin" mod edit -json "$f" 2>/dev/null) || continue
+      jq -r '(.Require // [])[] | [.Path, .Version] | @tsv' <<<"$modjson"
+    done
     if [[ "$sub" == mod ]]; then
       local seen_dl=0
       for a in "${go_argv[@]}"; do
@@ -8919,9 +9013,25 @@ private_go_command() {
         fi
       done
     fi
-  })
+  } | sort -u)
+  # The local blocklist stays a malice decision for every named private
+  # module, whatever the route.
+  local name version line r block_reason
+  if blocklist_authority_readable; then
+    while IFS=$'\t' read -r name version; do
+      [[ -n "$name" ]] || continue
+      for ns in "${!routes[@]}"; do
+        [[ "$name" == "$ns" || "$name" == "$ns/"* ]] || continue
+        if block_reason=$(blocked_entry_reason "$name"); then
+          PKG_NAME="$name" PKG_VERSION="${version:-unknown}"
+          private_finish 20 blocklist "this host's blocklist names it (${block_reason})" ""
+          return $?
+        fi
+      done
+    done <<<"$names"
+  fi
   local -a PRIVATE_COLLECTED=()
-  local name version line r
+  local -A seen_ns=()
   while IFS=$'\t' read -r name version; do
     [[ -n "$name" ]] || continue
     for ns in "${!routes[@]}"; do
@@ -8929,16 +9039,19 @@ private_go_command() {
       IFS=$'\t' read -r id origin r <<<"${routes[$ns]}"
       line=$(private_audit_line "$id" "$origin" "$name" "$version" "$r")
       PRIVATE_COLLECTED+=("$(jq -cn --arg p "${name}@${version}" --arg e "$line" '{package: $p, extra: $e}')")
+      seen_ns["$ns"]=1
       break
     done
-  done < <(sort -u <<<"$names")
-  if (( ! readable )); then
-    for ns in "${!routes[@]}"; do
-      IFS=$'\t' read -r id origin r <<<"${routes[$ns]}"
-      line=$(private_audit_line "$id" "$origin" "$ns" "unknown" "$r")
-      PRIVATE_COLLECTED+=("$(jq -cn --arg p "${ns}@go-${sub:-command}" --arg e "$line" '{package: $p, extra: $e}')")
-    done
-  fi
+  done <<<"$names"
+  # The ratified fallback: a namespace whose identities the selected context
+  # does not name (first tidy, a new import, an unreadable or absent module
+  # file) still gets its line, naming origin, namespace and command.
+  for ns in "${!routes[@]}"; do
+    [[ -z "${seen_ns[$ns]:-}" ]] || continue
+    IFS=$'\t' read -r id origin r <<<"${routes[$ns]}"
+    line=$(private_audit_line "$id" "$origin" "$ns" "unknown" "$r" "go-${sub:-command}")
+    PRIVATE_COLLECTED+=("$(jq -cn --arg p "${ns}@go-${sub:-command}" --arg e "$line" '{package: $p, extra: $e}')")
+  done
   (( ${#PRIVATE_COLLECTED[@]} > 0 )) || return 0
   if [[ -n "${SAFE_AUDIT_RESULT_OUT:-}" ]]; then
     printf '%s\n' "${PRIVATE_COLLECTED[@]}" | jq -s '{gate_exit: 18, private_registry_lines: .}' > "$SAFE_AUDIT_RESULT_OUT" 2>/dev/null \
@@ -8947,9 +9060,64 @@ private_go_command() {
   return 18
 }
 
+# The private-registry lane does not isolate requirement-file installs, so a
+# private Python name inside one asks. The file set is walked through its
+# -r/-c includes (relative to the including file), bounded and cycle-safe;
+# a file that cannot be read, a URL include, or a set past the bounds cannot
+# be inventoried and asks too while a Python private registry exists.
+PRIVATE_REQ_MAX_FILES=64
+PRIVATE_REQ_MAX_DEPTH=16
+
+# private_python_requirement_inventory <file>...: prints `name` lines for
+# the requirement entries, or `!<reason>` lines for what it could not read.
+private_python_requirement_inventory() {
+  local -a queue=() depths=()
+  local -A seen=()
+  local f d real line joined inc base qi=0 count=0
+  for f in "$@"; do queue+=("$f"); depths+=(0); done
+  while (( qi < ${#queue[@]} )); do
+    f="${queue[$qi]}" d="${depths[$qi]}"
+    qi=$((qi + 1))
+    if (( d > PRIVATE_REQ_MAX_DEPTH )); then printf '!include depth past %s at %s\n' "$PRIVATE_REQ_MAX_DEPTH" "$f"; continue; fi
+    if ! real=$(realpath -e -- "$f" 2>/dev/null) || [[ ! -f "$real" || ! -r "$real" ]]; then
+      printf '!unreadable %s\n' "$f"; continue
+    fi
+    [[ -z "${seen[$real]:-}" ]] || continue
+    seen["$real"]=1
+    count=$((count + 1))
+    if (( count > PRIVATE_REQ_MAX_FILES )); then printf '!more than %s requirement files\n' "$PRIVATE_REQ_MAX_FILES"; break; fi
+    base=$(dirname -- "$real")
+    joined=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%$'\r'}"
+      if [[ "$line" == *\\ ]]; then joined+="${line%\\} "; continue; fi
+      line="${joined}${line}"; joined=""
+      line=$(sed -E 's/(^|[[:space:]])#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$line")
+      [[ -n "$line" ]] || continue
+      inc=""
+      case "$line" in
+        -r\ *|-c\ *|--requirement\ *|--constraint\ *) inc="${line#* }" ;;
+        --requirement=*|--constraint=*) inc="${line#*=}" ;;
+        -r*|-c*) inc="${line:2}" ;;
+        -*) continue ;;
+        *) sed -nE 's/^([A-Za-z0-9][A-Za-z0-9._-]*).*/\1/p' <<<"$line"; continue ;;
+      esac
+      inc=$(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$inc")
+      case "$inc" in
+        "") printf '!empty include in %s\n' "$real"; continue ;;
+        file://*) inc="${inc#file://}" ;;
+        *://*) printf '!remote include %s\n' "$(private_source_label "$inc")"; continue ;;
+      esac
+      [[ "$inc" == /* ]] || inc="$base/$inc"
+      queue+=("$inc"); depths+=($((d + 1)))
+    done < "$real"
+  done
+}
+
 # `safe audit private-python-project [--gate install] -- <requirement files>`:
-# a private Python name inside -r/-c files is installed by a route the lane
-# does not isolate; it asks (19). Exit 0 when the files name nothing private.
+# 19 when the files (with their includes) name a private Python package, or
+# cannot be fully inventoried while a Python private registry exists; 0
+# otherwise.
 private_python_project_command() {
   local gate=""
   while [[ $# -gt 0 ]]; do
@@ -8961,18 +9129,30 @@ private_python_project_command() {
   done
   private_stores_present || return 0
   trust_grant_ok "private-registry" || return 0
-  local core matches f
+  local core regs inventory matches gaps
   core=$(private_core_bin) || { printf '%s\n' "$PRIVATE_CORE_MISSING" >&2; return 30; }
-  matches=$(for f in "$@"; do
-      [[ ! -f "$f" ]] || sed -nE 's/^[[:space:]]*([A-Za-z0-9][A-Za-z0-9._-]*).*/\1/p' "$f"
-    done | sort -u | private_core "$core" match-names --ecosystem python 2>/dev/null) \
-    || { printf '%s\n' "$PRIVATE_STORES_MALFORMED" >&2; return 30; }
-  [[ "$(jq 'length' <<<"$matches")" != 0 ]] || return 0
+  regs=$(private_registries "$core" python) || { printf '%s\n' "$PRIVATE_STORES_MALFORMED" >&2; return 30; }
+  [[ "$(jq 'length' <<<"$regs")" != 0 ]] || return 0
+  inventory=$(private_python_requirement_inventory "$@")
   PRIVATE_ECO="python" PRIVATE_GATE="$gate" PRIVATE_JSON=0 PKG_VERSION="requirements"
-  PKG_NAME=$(jq -r '.[0].name' <<<"$matches")
-  private_finish 19 private_route_unmodelled \
-    "a requirements file names private-registry packages ($(jq -r 'map(.name) | join(", ")' <<<"$matches")); that route reads package sources safe does not control" \
-    "install them as explicit specs (pip install --index-url <origin>/simple <name>==<version>), or an operator may confirm at an interactive terminal"
+  matches=$({ grep -v '^!' <<<"$inventory" || true; } | sort -u | private_core "$core" match-names --ecosystem python 2>/dev/null) \
+    || { printf '%s\n' "$PRIVATE_STORES_MALFORMED" >&2; return 30; }
+  if [[ "$(jq 'length' <<<"$matches")" != 0 ]]; then
+    PKG_NAME=$(jq -r '.[0].name' <<<"$matches")
+    private_finish 19 private_route_unmodelled \
+      "a requirements file names private-registry packages ($(jq -r 'map(.name) | join(", ")' <<<"$matches")); that route reads package sources safe does not control" \
+      "install them as explicit specs (pip install --index-url <origin>/simple <name>==<version>), or an operator may confirm at an interactive terminal"
+    return $?
+  fi
+  gaps=$({ grep '^!' <<<"$inventory" || true; } | sed 's/^!//' | head -n 3 | paste -sd ';' | sed 's/;/; /g')
+  if [[ -n "$gaps" ]]; then
+    PKG_NAME="requirements"
+    private_finish 19 private_route_unmodelled \
+      "the requirement files could not be fully inventoried (${gaps}), so safe cannot show they name no private-registry package" \
+      "name the requirement files directly and keep their includes local, or an operator may confirm at an interactive terminal"
+    return $?
+  fi
+  return 0
 }
 
 package_audit_command() {
