@@ -85,10 +85,28 @@ if [[ "$1 $2" == "env GOWORK" ]]; then
   printf '%s\n' "${FAKE_GOWORK:-}"
   exit 0
 fi
+if [[ "$1 $2" == "env GOFLAGS" ]]; then
+  printf '%s\n' "${FAKE_GOFLAGS:-}"
+  exit 0
+fi
+if [[ "$1 $2 $3" == "work edit -json" ]]; then
+  cat "${FAKE_GOWORK_JSON:?}"
+  exit 0
+fi
+if [[ "$1" == list ]]; then
+  # the imports of the main module's packages
+  printf '%s\n' ${FAKE_GO_IMPORTS:-}
+  exit 0
+fi
 if [[ "$1 $2 $3" == "mod edit -json" ]]; then
-  if [[ -n "${4:-}" ]]; then
+  if [[ "${4:-}" == */dep.mod ]]; then
     # the downloaded module's own go.mod
     printf '%s\n' "${FAKE_GO_DEP_MODJSON:-{\"Require\":null\}}"
+  elif [[ "${4:-}" == *missing* ]]; then
+    printf 'go: cannot read %s\n' "$4" >&2
+    exit 1
+  elif [[ -n "${4:-}" && -f "$4.fakejson" ]]; then
+    cat "$4.fakejson"
   else
     cat "${FAKE_GO_MODJSON:?}"
   fi
@@ -155,7 +173,11 @@ audit() {
   shift 2
   rm -f "$tmp/result.json"
   rc=0
-  env "$@" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" package-audit "$spec" --ecosystem "$eco" --gate install \
+  # python: the shape the pip gate passes outside --isolated (pip reads
+  # PIP_NO_DEPS and its config files).
+  local -a ctx=()
+  [[ "$eco" == python ]] && ctx=(--pip-settings-apply)
+  env "$@" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" package-audit "$spec" --ecosystem "$eco" --gate install "${ctx[@]}" \
     > "$tmp/out" 2>&1 || rc=$?
 }
 no_secret() {
@@ -285,10 +307,31 @@ PROJ_TOOL=pnpm proj install -- install
 printf '{"name":"pub","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}\n' > "$tmp/fix/npmproj/package.json"
 jq 'del(.packages["node_modules/@p/x"], .packages["node_modules/alias"])' "$tmp/fix/lock.json" > "$tmp/fix/npmproj/package-lock.json"
 PROJ_TOOL=pnpm proj install -- install
-[[ "$rc" == 0 ]] || fail "a project naming nothing private is untouched: rc=$rc"
+[[ "$rc" == 0 ]] || fail "a pnpm project naming nothing private is untouched: rc=$rc"
+proj ci -- ci
+[[ "$rc" == 0 ]] || fail "npm ci of a lockfile naming nothing private: rc=$rc"
+# round-2 P1: a public parent whose new version requires a private package
+"$CORE" private-trust record --pins "$pins" --ecosystem npm --origin "$NPM_ORIGIN" --name @p/x --version 1.0.0 --mode revoke >/dev/null
+proj install FAKE_PROJECTION_LOCK="$tmp/fix/lock.json" -- install pubparent@2.0.0
+[[ "$rc" == 20 ]] && jq -e '.private_registry.decision == "private_pin_revoked"' "$tmp/result.json" >/dev/null \
+  || fail "a private package introduced by resolution is decided from the projection: rc=$rc $(cat "$tmp/out")"
+proj install -- install --no-package-lock
+[[ "$rc" == 19 ]] || fail "an operation that cannot be projected asks while an npm private registry is configured: rc=$rc"
+# round-2 P1: a lockfileVersion 1 tree is not swept, so a private name in it asks
+jq -n --arg r "$NPM_ORIGIN/@p%2fx/-/1.0.0/x-1.0.0.tgz" --arg i "$SRI_A" \
+  '{lockfileVersion: 1, dependencies: {"pubparent": {version: "2.0.0", dependencies: {"@p/x": {version: "1.0.0", resolved: $r, integrity: $i}}}}}' \
+  > "$tmp/fix/npmproj/package-lock.json"
+proj ci -- ci
+[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_project_unmodelled ]] \
+  || fail "npm ci of a v1 lockfile with a nested private entry: rc=$rc $(cat "$tmp/out")"
+printf '{"name":"app","version":"1.0.0","dependencies":{"@p/x":"1.0.0"}}\n' > "$tmp/fix/npmproj/package.json"
+jq -n '{lockfileVersion: 1, dependencies: {}}' > "$tmp/fix/npmproj/package-lock.json"
+proj ci -- ci
+[[ "$rc" == 19 ]] || fail "npm ci of a v1 lockfile, private name in the manifest: rc=$rc"
+rm -f "$pins"
 printf '{"name":"app","version":"1.0.0","dependencies":{"@p/x":"1.0.0"}}\n' > "$tmp/fix/npmproj/package.json"
 cp "$tmp/fix/lock.json" "$tmp/fix/npmproj/package-lock.json"
-pass "npm project lane: ci sweeps the lockfile, install sweeps its projection, unmodelled managers/flags ask, projects without private names are untouched"
+pass "npm project lane: ci sweeps the lockfile, other npm operations sweep their projection whenever an npm private registry is configured (a private package introduced by resolution included), v1 lockfiles and unmodelled managers/flags ask, projects without private names are untouched"
 
 # the shipped npm route reaches the project lane before delegation
 cat > "$tmp/route.sh" <<'ROUTE'
@@ -433,10 +476,41 @@ rm -f "$pins"
 gosum
 [[ "$rc" == 18 ]] && jq -e '.pins | to_entries[0].value.pinned_by == "tofu"' "$pins" >/dev/null || fail "first ingress without go.sum must verify from the origin and pin: rc=$rc"
 grep -q 'mod download -json superbiche.me/caviar@v0.2.0' "$tmp/go.argv" || fail "first ingress was not confirmed against the origin"
-gosum -- -modfile=alt.mod build ./...
-[[ "$rc" == 19 ]] || fail "-modfile: rc=$rc"
-rc=0; FAKE_GOWORK="$tmp/fix/go.work" FAKE_GO_MODJSON="$tmp/fix/modjson-req.json" GOPROXY="$GO_ORIGIN" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-gosum --project-dir "$tmp/fix/gomod" --gate install > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 19 ]] || fail "workspace mode: rc=$rc"
+# round-2 P4: the context go actually selects is read, not the default go.mod
+rm -f "$pins"
+"$CORE" private-trust record --pins "$pins" --ecosystem go --origin "$GO_ORIGIN" --name superbiche.me/caviar --version v0.2.0 --mode revoke >/dev/null
+cp "$tmp/fix/modjson-req.json" "$tmp/fix/gomod/private.mod.fakejson"
+ctx() { rc=0; env FAKE_GO_MODJSON="$tmp/fix/modjson-none.json" GOPROXY="$GO_ORIGIN" "$@" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-gosum --project-dir "${CTX_DIR:-$tmp/fix/gomod}" --gate install -- ${CTX_ARGV:-build ./...} > "$tmp/out" 2>&1 || rc=$?; }
+CTX_ARGV="mod download -modfile=private.mod" ctx
+[[ "$rc" == 20 ]] || fail "-modfile requiring a revoked module (default go.mod requires nothing): rc=$rc $(cat "$tmp/out")"
+CTX_ARGV="build -modfile private.mod ./..." ctx
+[[ "$rc" == 20 ]] || fail "-modfile space form: rc=$rc"
+ctx FAKE_GOFLAGS=-modfile=private.mod
+[[ "$rc" == 20 ]] || fail "-modfile from GOFLAGS / the go env file: rc=$rc"
+CTX_ARGV="build -modfile=missing.mod ./..." ctx
+[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_project_unmodelled ]] || fail "an unreadable module file asks: rc=$rc"
+mkdir -p "$tmp/fix/gomod/sub/dir"
+CTX_DIR="$tmp/fix/gomod/sub/dir" ctx FAKE_GO_MODJSON="$tmp/fix/modjson-req.json"
+[[ "$rc" == 20 ]] || fail "a subdirectory of the module reads the module root: rc=$rc"
+mkdir -p "$tmp/fix/ws/a" "$tmp/fix/ws/b"
+printf 'module example.com/a\n' > "$tmp/fix/ws/a/go.mod"; printf 'module example.com/b\n' > "$tmp/fix/ws/b/go.mod"
+cp "$tmp/fix/modjson-none.json" "$tmp/fix/ws/a/go.mod.fakejson"; cp "$tmp/fix/modjson-req.json" "$tmp/fix/ws/b/go.mod.fakejson"
+printf '{"Go":"1.22","Use":[{"DiskPath":"./a"},{"DiskPath":"./b"}],"Replace":null}\n' > "$tmp/fix/ws/work.json"
+CTX_DIR="$tmp/fix/ws/a" ctx FAKE_GOWORK="$tmp/fix/ws/go.work" FAKE_GOWORK_JSON="$tmp/fix/ws/work.json"
+[[ "$rc" == 20 ]] || fail "workspace mode reads every used module: rc=$rc $(cat "$tmp/out")"
+CTX_ARGV="mod tidy" ctx FAKE_GO_IMPORTS="fmt superbiche.me/caviar/redact example.com/app/internal"
+[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_import_unrequired ]] || fail "tidy with a new private import asks before go resolves it: rc=$rc"
+CTX_ARGV="run -mod=mod ." ctx FAKE_GO_IMPORTS="superbiche.me/caviar/redact"
+[[ "$rc" == 19 ]] || fail "-mod=mod with a new private import: rc=$rc"
+ctx FAKE_GOFLAGS=-mod=mod FAKE_GO_IMPORTS="superbiche.me/caviar/redact"
+[[ "$rc" == 19 ]] || fail "-mod=mod from GOFLAGS with a new private import: rc=$rc"
+ctx FAKE_GO_IMPORTS="superbiche.me/caviar/redact"
+[[ "$rc" == 0 ]] || fail "a readonly build cannot add the import (go refuses it), nothing to decide: rc=$rc"
+CTX_ARGV="mod tidy" ctx FAKE_GO_MODJSON="$tmp/fix/modjson-req.json" FAKE_GO_IMPORTS="superbiche.me/caviar/redact"
+[[ "$rc" == 20 ]] || fail "tidy with a required private import decides the requirement: rc=$rc"
+CTX_ARGV="mod tidy" ctx FAKE_GO_IMPORTS="fmt example.com/app/internal"
+[[ "$rc" == 0 ]] || fail "tidy without private imports: rc=$rc"
+rm -f "$pins" "$tmp/fix/gomod/private.mod.fakejson"
 jq '.Go = "1.16"' "$tmp/fix/modjson-req.json" > "$tmp/fix/modjson-old.json"
 rc=0; FAKE_GO_MODJSON="$tmp/fix/modjson-old.json" GOPROXY="$GO_ORIGIN" "$AUDIT" private-gosum --project-dir "$tmp/fix/gomod" --gate install > "$tmp/out" 2>&1 || rc=$?
 [[ "$rc" == 19 ]] || fail "pre-1.17 graph: rc=$rc"
@@ -463,8 +537,35 @@ dl mod download -json golang.org/x/text@v0.20.0
 [[ "$rc" == 0 ]] || fail "explicit public download is not on the private lane: rc=$rc"
 rc=0; FAKE_GO_MODJSON="$tmp/fix/modjson-none.json" GOPROXY="$GO_ORIGIN" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-gosum --project-dir "$tmp/fix/gomod" --gate install -- mod download superbiche.me/caviar@v0.2.0 > "$tmp/out" 2>&1 || rc=$?
 [[ "$rc" == 18 ]] || fail "explicit private download inside a module that does not require it: rc=$rc"
+# round-2 P4: local go run / install and the other module-downloading go
+# commands reach the project lane before delegation
+cat > "$tmp/route-go.sh" <<'ROUTE'
+#!/usr/bin/env bash
+set -uo pipefail
+export SAFE_RUN_DATA_DIR="$tmp/rdata" TMPDIR="$tmp/tmpdir"
+mkdir -p "$SAFE_RUN_DATA_DIR" "$TMPDIR"
+source "$ROOT/lib/gate-lib.sh"
+SAFE_GATE_AUDIT_BIN="$ROOT/bin/safe-audit"
+safe_gate_audit_available() { return 0; }
+safe_gate_operator_terminal() { return 1; }
+safe_gate_scan_project() { return 0; }
+safe_gate_check_many() { printf 'SPEC %s\n' "$*" > "$tmp/spec"; return 0; }
+safe_gate_exec_real() { printf 'DELEGATED %s\n' "$*" > "$tmp/delegated"; exit 0; }
+cd "$tmp/fix/gomod"
+safe_gate_go "$@"
+ROUTE
 rm -f "$pins"
-pass "go project lane: go.mod requirements are decided without go.sum (revoked BLOCKs, first use pins from the origin); -modfile, go.work and pre-1.17 graphs ask; local replaces skip; -C is followed; explicit go mod download <mod>@<ver> targets are decided inside or outside a module"
+"$CORE" private-trust record --pins "$pins" --ecosystem go --origin "$GO_ORIGIN" --name superbiche.me/caviar --version v0.2.0 --mode revoke >/dev/null
+for cmd in "run ." "run -mod=mod ./cmd/app" "install" "install ./cmd/app" "vet ./..." "list -m all" "mod vendor" "mod graph" "build ./..."; do
+  rm -f "$tmp/delegated"
+  rc=0; FAKE_GO_MODJSON="$tmp/fix/modjson-req.json" GOPROXY="$GO_ORIGIN" bash "$tmp/route-go.sh" $cmd > "$tmp/out" 2>&1 || rc=$?
+  [[ "$rc" == 104 && ! -e "$tmp/delegated" ]] || fail "go $cmd delegated a module graph requiring a revoked private module: rc=$rc $(cat "$tmp/out")"
+done
+rm -f "$tmp/delegated" "$tmp/spec"
+rc=0; FAKE_GO_MODJSON="$tmp/fix/modjson-req.json" GOPROXY="$GO_ORIGIN" bash "$tmp/route-go.sh" install superbiche.me/tool@v1.0.0 > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 0 && -e "$tmp/spec" ]] || fail "go install <mod>@<ver> stays on the spec lane (outside the current module): rc=$rc $(cat "$tmp/out")"
+rm -f "$pins"
+pass "go project lane: go.mod requirements are decided without go.sum (revoked BLOCKs, first use pins from the origin); the selected context is read (-modfile in argv/GOFLAGS, module root above the cwd, every go.work module); new private imports ask before tidy/-mod=mod; pre-1.17 graphs and unreadable contexts ask; local replaces skip; -C is followed; explicit go mod download <mod>@<ver> targets are decided inside or outside a module"
 
 # round-1 P5 (option A): the unattended private allow needs an install that
 # fetches nothing beyond the checked root
@@ -475,12 +576,57 @@ audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple"
 grep -q -- '--no-deps' "$tmp/out" || fail "pip dependency hint"
 rc=0; PIP_INDEX_URL="$PY_ORIGIN/simple" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" package-audit caviar-redact@0.2.0 --ecosystem python --gate install --no-deps-selected > "$tmp/out" 2>&1 || rc=$?
 [[ "$rc" == 18 ]] || fail "pip --no-deps (argv): rc=$rc"
-mkdir -p "$HOME/.config/pip"; printf '[install]\nno-deps = true\n' > "$HOME/.config/pip/pip.conf"
+PIPCONF="${XDG_CONFIG_HOME:-$HOME/.config}/pip/pip.conf"
+mkdir -p "$(dirname "$PIPCONF")"; printf '[install]\nno-deps = true\n' > "$PIPCONF"
 audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple"
 [[ "$rc" == 18 ]] || fail "pip config no-deps: rc=$rc"
-rm -f "$HOME/.config/pip/pip.conf"
-( source "$ROOT/lib/gate-lib.sh"; safe_gate_scan_target_flags python install --no-deps x==1; [[ "$SAFE_GATE_NO_DEPS" == 1 ]] ) || fail "the gate does not flag --no-deps"
-( source "$ROOT/lib/gate-lib.sh"; safe_gate_scan_target_flags python install --pip-args=--no-deps x; [[ "$SAFE_GATE_NO_DEPS" == 1 ]] ) || fail "the gate does not flag pipx --pip-args=--no-deps"
+rm -f "$PIPCONF"
+( source "$ROOT/lib/gate-lib.sh"; safe_gate_python_no_deps pip x==1 --no-deps; [[ "$SAFE_GATE_NO_DEPS" == 1 ]] ) || fail "the gate does not flag --no-deps"
+( source "$ROOT/lib/gate-lib.sh"; safe_gate_python_no_deps uv x==1 --no-dependencies; [[ "$SAFE_GATE_NO_DEPS" == 1 ]] ) && fail "uv has no --no-dependencies spelling"
+# round-2 P7: the proof follows pip's own precedence, and only for pip
+alt_conf="$tmp/alt-pip.conf"
+printf '[install]\nno-deps = true\n' > "$PIPCONF"
+audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple" PIP_NO_DEPS=false
+[[ "$rc" == 19 ]] || fail "PIP_NO_DEPS=false overrides pip config for pip: rc=$rc"
+printf '[install]\nno-deps = false\n' > "$alt_conf"
+audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple" PIP_CONFIG_FILE="$alt_conf"
+[[ "$rc" == 19 ]] || fail "PIP_CONFIG_FILE is read after the user file: rc=$rc"
+printf '[global]\nno-deps = true\n' > "$PIPCONF"; printf '[install]\nno-deps = no\n' > "$alt_conf"
+audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple" PIP_CONFIG_FILE="$alt_conf"
+[[ "$rc" == 19 ]] || fail "[install] beats [global] across files: rc=$rc"
+audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple"
+[[ "$rc" == 18 ]] || fail "[global] no-deps alone: rc=$rc"
+printf '[install]\nno-dependencies = true\n' > "$PIPCONF"
+audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple"
+[[ "$rc" == 19 ]] || fail "the --no-dependencies config spelling is not modelled: rc=$rc"
+rm -f "$PIPCONF" "$alt_conf"
+rc=0; PIP_NO_DEPS=1 PIP_INDEX_URL="$PY_ORIGIN/simple" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" package-audit caviar-redact@0.2.0 --ecosystem python --gate install > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 19 ]] || fail "PIP_NO_DEPS proves nothing for uv or pip --isolated (no --pip-settings-apply): rc=$rc"
+# round-2 P8: an explicit uv config file is a source the lane does not model
+uvaudit() { rc=0; (cd "${UV_CWD:-$tmp}" && PIP_INDEX_URL="$PY_ORIGIN/simple" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" package-audit caviar-redact@0.2.0 --ecosystem python --gate install --no-deps-selected "$@") > "$tmp/out" 2>&1 || rc=$?; }
+uvaudit --uv-config explicit
+[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_source_unmodelled ]] || fail "uv --config-file on a private install: rc=$rc"
+mkdir -p "$tmp/uvproj/sub"
+uvaudit --uv-config ambient
+[[ "$rc" == 18 ]] || fail "uv without source configuration: rc=$rc $(cat "$tmp/out")"
+printf '[pip]\nfind-links = ["https://flat.example.test/"]\n' > "$tmp/uvproj/uv.toml"
+UV_CWD="$tmp/uvproj/sub" uvaudit --uv-config ambient
+[[ "$rc" == 19 ]] && grep -q 'uvproj/uv.toml' "$tmp/out" || fail "a discovered uv.toml setting sources asks: rc=$rc"
+UV_CWD="$tmp/uvproj/sub" uvaudit
+[[ "$rc" == 18 ]] || fail "uv --no-config (no --uv-config) skips discovery: rc=$rc"
+rm -f "$tmp/uvproj/uv.toml"
+printf '[project]\nname = "app"\n[tool.uv]\ndev-dependencies = []\n' > "$tmp/uvproj/pyproject.toml"
+UV_CWD="$tmp/uvproj/sub" uvaudit --uv-config ambient
+[[ "$rc" == 18 ]] || fail "[tool.uv] without sources: rc=$rc"
+printf '[[tool.uv.index]]\nurl = "https://other.example.test/simple"\n' >> "$tmp/uvproj/pyproject.toml"
+UV_CWD="$tmp/uvproj/sub" uvaudit --uv-config ambient
+[[ "$rc" == 19 ]] || fail "pyproject [[tool.uv.index]] asks: rc=$rc"
+rm -rf "$tmp/uvproj"
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/uv"; printf 'index-url = "https://other.example.test/simple"\n' > "${XDG_CONFIG_HOME:-$HOME/.config}/uv/uv.toml"
+uvaudit --uv-config ambient
+[[ "$rc" == 19 ]] || fail "the user uv.toml setting an index asks: rc=$rc"
+rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/uv/uv.toml"
+pass "round-2 P7/P8: pip's dependency switch is read with pip's precedence and only for pip outside --isolated; an explicit uv config, or a discovered one that sets sources, asks (19)"
 add_registry p-npm npm "$NPM_ORIGIN" '@p/*'
 audit @p/x@6.0.0 npm FAKE_NPM_DEPS='"dependencies":{"left-pad":"1.3.0"}'
 [[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_dependencies_unaudited ]] && grep -q 'left-pad' "$tmp/out" || fail "npm spec with dependencies: rc=$rc"

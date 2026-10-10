@@ -669,8 +669,11 @@ proceed:
   private-fetch <name>@<version> --ecosystem <eco>` prints the integrity the
   registry serves; `safe audit private-npm-project` and `safe audit
   private-gosum` are the npm-family and Go project lanes the wrappers run
-  before delegating (lockfile or projection sweep; `go.mod` requirements plus
-  `go.sum`). See [private registries](private-registries.md).
+  before delegating (lockfile or projection sweep; the selected module
+  context's requirements plus its sums). `package-audit` takes the gate's
+  Python context flags `--find-links-selected`, `--no-deps-selected`,
+  `--pip-settings-apply` and `--uv-config explicit|ambient`. See
+  [private registries](private-registries.md).
 - **BLOCK** refuses (exit 20) and points at operator review. At an operator
   terminal, a BLOCK on one exact resolved version takes a typed override
   (`<pkg>@<version>` installs once; `record <pkg>@<version>` also records an

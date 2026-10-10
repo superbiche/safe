@@ -258,12 +258,19 @@ Non-install and non-exec commands pass through unchanged.
 When an operator-authorized private registry exists, project operations also
 decide every private identity they can materialize before delegating:
 npm `install|ci|update|dedupe|prune` sweep the lockfile (`ci`) or its
-`--package-lock-only` projection, and `go build|test|mod download|mod tidy`
-check the private modules of `go.mod` and `go.sum` (a missing sum is never
-authorization). Each private identity logs `ALLOWED_VIA_PRIVATE_REGISTRY` or
-reaches the private termini 19/20; pnpm, yarn and bun projects naming a
-private package ask the operator. With no private registry configured this
-costs one file test. See [private registries](private-registries.md).
+`--package-lock-only` projection (projected whenever an npm private registry
+is configured), and `go build|test|vet|list`, a local `go run`/`go install`
+and the downloading `go mod` commands check the private modules of the
+module context Go selects (module root, `-modfile`, `go.work`; a missing sum
+is never authorization; `go mod tidy` and `-mod=mod` ask first about a
+private import no requirement pins). Each private identity logs
+`ALLOWED_VIA_PRIVATE_REGISTRY` or reaches the private termini 19/20; pnpm,
+yarn and bun projects naming a private package ask the operator. On Python
+installs the gate threads the installer's own `--no-deps`, whether pip reads
+its settings (not under `--isolated`), and how uv selects its configuration
+(an explicit `--config-file`, `UV_CONFIG_FILE`, `--directory` or
+`--project`; discovery unless `--no-config`). With no private registry
+configured this costs one file test. See [private registries](private-registries.md).
 
 ## Wrapped Exec and Update Commands
 

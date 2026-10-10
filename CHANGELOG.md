@@ -33,20 +33,32 @@
 - `safe run host-allow add|update` of a private name takes its integrity from
   the private registry instead of the hardcoded npmjs/PyPI lookup.
 - The private lane covers every materialization boundary, not only named
-  specs: npm project `install|ci|update|dedupe|prune` sweep the lockfile or
-  its `--package-lock-only` projection, the Go lane decides `go.mod`
-  requirements that have no `go.sum` line yet, and pnpm/yarn/bun projects or
-  unmodelled flags naming a private package ask the operator. A find-links
+  specs: npm `ci` sweeps the lockfile and every other npm project operation
+  its `--package-lock-only` projection whenever an npm private registry is
+  configured (a private package a public one newly requires included); a
+  `lockfileVersion` 1 lockfile, pnpm/yarn/bun projects naming a private
+  package and unmodelled flags ask the operator. The Go lane reads the
+  context Go selects (module root above the cwd, `-modfile` from argv or
+  `GOFLAGS`, every `go.work` module), decides requirements that have no sum
+  line yet, runs for local `go run`/`go install`, `vet`, `list` and every
+  `go mod` download command, and asks before `go mod tidy` or `-mod=mod`
+  resolves a private import no requirement pins. A find-links
   source or `--no-index` is a BLOCK for a private Python name, an npm
   integrity with two different sha512 digests is refused, and the npm fetch
   reads npm 12's array answer and keeps the selected npm config files.
 - Safe audits the packages an operation names, not what a package manager
   pulls in beside them (a pre-existing limitation, now documented). The
   unattended private allow on an explicit spec therefore requires a
-  dependency-free install — pip/uv/pipx `--no-deps` (or `PIP_NO_DEPS`, pip
-  config `no-deps`), an npm version without dependencies or required peers, a
-  Go module whose `go.mod` requires nothing — and otherwise asks the operator
-  (19, `private_dependencies_unaudited`) with the recovery path.
+  dependency-free install — the installer's own `--no-deps` for pip and
+  `uv pip install` (for pip outside `--isolated`, also `PIP_NO_DEPS` or pip
+  config `no-deps`, read with pip's precedence), an npm version without
+  dependencies or required peers, a Go module whose `go.mod` requires
+  nothing — and otherwise asks the operator (19,
+  `private_dependencies_unaudited`) with the recovery path. uv configuration
+  on a private install asks too when it is explicitly selected
+  (`--config-file`, `UV_CONFIG_FILE`, `--directory`, `--project`) or when a
+  discovered `uv.toml` / `[tool.uv]` sets package sources: it can select
+  sources the lane does not model.
 - `go mod download <module>@<version>` of a private module is decided by the
   private lane, inside or outside a module. Public explicit downloads and
   `go get` remain ungated, as before (documented).

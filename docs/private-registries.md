@@ -60,8 +60,16 @@ this feature. Because an unattended private allow would otherwise carry that
 gap into an unattended install, exit 18 on an explicit spec requires an
 install that fetches nothing beyond the checked root:
 
-- pip, uv, pipx: `--no-deps` (pipx: inside `--pip-args`), `PIP_NO_DEPS`, or
-  pip config `no-deps = true`;
+- pip and `uv pip install`: the installer's own `--no-deps` among the install
+  arguments (pip also accepts `--no-dependencies`). For pip without
+  `--isolated` only, `PIP_NO_DEPS` or pip config `no-deps` also count, read
+  with pip's precedence: the environment variable over every file,
+  `[install]` over `[global]`, and the files in pip's order (global, user,
+  the active virtualenv, `PIP_CONFIG_FILE`). The `no-dependencies` config
+  spelling, a site file outside a virtualenv, and any value pip would not
+  read as true prove nothing. uv never reads pip's settings; `uv run --with`,
+  `uv tool` and mise's `pipx:` backend have no dependency switch safe can
+  see, so a private package there asks;
 - npm spec and `-g`: the exact version declares no `dependencies`, no
   `optionalDependencies` and no peer dependency npm would install (peers
   marked optional in `peerDependenciesMeta` do not count);
@@ -75,7 +83,8 @@ private package inside a project, whose lane checks the lockfile or module
 graph. The project lanes decide every private entry they sweep; public entries
 of a project's lockfile or module graph keep the project scan. Closure
 planning (auditing every planned dependency before delegating, for public
-roots too) is a tracked follow-up, not part of this lane.
+roots too) is a tracked follow-up, not part of this lane:
+[Superbiche/Tasks/752](https://superbiche.fibery.io/Superbiche/Tasks/752).
 
 Safe **never reads, stores or forwards a registry credential**. The lane runs
 each ecosystem's own client, which uses its own credentials:
@@ -121,39 +130,60 @@ identity, before the package manager is delegated to:
   older object answer are both read, several versions are refused), with the
   operator's selected `--userconfig`/`--globalconfig` kept in force.
 - **npm projects (`install`, `ci`, `update`, `dedupe`, `prune`, with or without
-  package arguments).** When the manifest, the lockfile or the argv names a
-  private namespace, `npm ci` sweeps the lockfile as it stands and every other
-  operation sweeps a `--package-lock-only` projection made in a scratch copy;
-  every private entry of that lockfile (aliases included) must lie under the
-  origin with exactly one sha512 integrity matching its pin (or be confirmed
-  against the origin and pinned on first use). pnpm, yarn and bun lockfiles,
-  npm workspace roots, and flags that redirect or disable the projected
-  lockfile (`--prefix`, `--global`, `--package-lock=false`, a bare `--`) are
-  not modelled: a private name there asks the operator (19). A project that
-  names nothing private is untouched.
+  package arguments).** `npm ci` sweeps the lockfile as it stands. Every other
+  npm operation sweeps a `--package-lock-only` projection made in a scratch
+  copy whenever an npm private registry is configured, even when nothing
+  private is visible yet: a public package whose new version requires a
+  private one is caught there. Every private entry of the swept lockfile
+  (aliases included) must lie under the origin with exactly one sha512
+  integrity matching its pin (or be confirmed against the origin and pinned
+  on first use). A `lockfileVersion` 1 lockfile, npm workspace roots, and
+  flags that redirect or disable the projected lockfile (`--prefix`,
+  `--global`, `--package-lock=false`, a bare `--`) are not modelled and ask
+  the operator (19). pnpm, yarn and bun: a private name visible in the
+  manifest, the npm lockfile or the argv asks (19); their own resolution is
+  not projected, so a private package they would newly resolve behind a
+  public one is not seen (limit). The projection costs one
+  `npm install --package-lock-only` per project operation on hosts with an
+  npm private registry.
 - **Python.** Explicit `pip`/`uv`/`pipx` specs. A find-links source (argv
   `--find-links`/`-f`, `PIP_FIND_LINKS`/`UV_FIND_LINKS`, pip config
   `find-links`) or `--no-index` is a BLOCK on the private lane: a flat file
   page cannot be probed for a namesake, and pip could take the private
-  name's files from it. The fetch uses the operator's own index URL (with any
-  inline credentials) and never prints it.
+  name's files from it. uv configuration can add indexes, find-links and
+  `[sources]` the lane does not model: on a private name, an explicitly
+  selected one (`uv --config-file`, `UV_CONFIG_FILE`, `--directory`,
+  `--project`) asks (19), and so does a discovered one that sets a source
+  key — `uv.toml` or `pyproject.toml` `[tool.uv]` in the working directory or
+  a parent, the user and the system `uv.toml` — unless `--no-config` /
+  `UV_NO_CONFIG` turns discovery off. The check looks for source keys
+  without parsing TOML, so it can over-ask, never under-ask. The fetch uses
+  the operator's own index URL (with any inline credentials) and never
+  prints it.
 - **Go.** `go install mod@version` and `go run mod@version`. In addition,
-  `go build|test|mod download|mod tidy` checks every module the operation can
-  download that is on a private lane: the `go.mod` requirements (replace
-  directives applied; a local-directory replace downloads nothing) and the
-  `go.sum` entries. A missing `go.sum` line is never authorization — that
-  module is confirmed against the origin and pinned on first use, and a
-  revoked or changed one BLOCKs before Go downloads it. `go -C <dir>` is
-  followed; `-modfile`, workspace mode (`go.work`) and `go.mod` files older
-  than go 1.17 (which do not list the full module graph) ask the operator
-  (19). Explicit `go mod download <module>@<version>` targets on a private
-  lane are decided too, inside a module or not (a query such as `@latest`
-  asks). Pre-existing gaps, public and private alike: `go get` is not gated,
+  every command that downloads the current module's graph — `go build`,
+  `test`, `vet`, `list`, a local `go run`/`go install`, and `go mod
+  download|tidy|vendor|graph|why|verify` — checks every module it can
+  download that is on a private lane, read from the context Go selects: the
+  module root above the working directory (`go -C <dir>` followed), an
+  alternate `-modfile` (argv, `GOFLAGS` or the go env file) with its own
+  `.sum`, or every module of an active `go.work` workspace with
+  `go.work.sum`. The identities are the requirements (replace directives
+  applied, the workspace's last; a local-directory replace downloads
+  nothing), every sum entry, and explicit `go mod download
+  <module>@<version>` targets inside a module or not (a query such as
+  `@latest` asks). A missing sum line is never authorization — that module
+  is confirmed against the origin and pinned on first use, and a revoked or
+  changed one BLOCKs before Go downloads it. `go mod tidy` and `-mod=mod`
+  (argv or `GOFLAGS`) can add requirements themselves: a private import that
+  no requirement pins asks (19) before Go picks a version; pin it first
+  (`go mod edit -require=<module>@<version>`). While a Go private registry
+  is configured, `go.mod` files older than go 1.17 (which do not list the
+  full module graph) and a module context Go cannot read ask the operator
+  (19). Pre-existing gap, public and private alike: `go get` is not gated,
   and neither is an explicit `go mod download <module>@<version>` of a public
-  module; a private module fetched by `go get` is checked by the next build,
-  download or tidy. A private module that `go mod tidy` adds from
-  a new import is checked by the next such command, not by the tidy that adds
-  it.
+  module ([Superbiche/Tasks/753](https://superbiche.fibery.io/Superbiche/Tasks/753));
+  a private module fetched by `go get` is checked by the next command above.
 
 An npm integrity carrying two different sha512 digests is refused: npm would
 accept bytes matching either.

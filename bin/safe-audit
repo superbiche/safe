@@ -8299,6 +8299,15 @@ private_core() {
     --config "$(trust_store_file config.json)" "$@"
 }
 
+# Whether the effective private-registry view (local and followed) has a
+# registry for ecosystem $2: 0 yes, 1 no, 2 the stores could not be loaded.
+private_has_registry() {
+  local core="$1" eco="$2" listing
+  listing=$(private_core "$core" list 2>/dev/null) || return 2
+  jq -e --arg e "$eco" 'any(.registries[]?; .ecosystem == $e)' <<<"$listing" >/dev/null 2>&1 || return 1
+  return 0
+}
+
 # First executable <tool> on PATH that is not a safe gate wrapper: the
 # private fetchers run the ecosystem's own client for its credential lookup
 # and must never re-enter the gate.
@@ -8538,39 +8547,130 @@ private_python_shadow_check() {
   return 0
 }
 
+# pip's configuration files in pip's load order (later overrides earlier):
+# global (XDG_CONFIG_DIRS, /etc), user (legacy then XDG; skipped when
+# PIP_CONFIG_FILE names an existing file), site (the active virtualenv), then
+# PIP_CONFIG_FILE. PIP_CONFIG_FILE=/dev/null disables every file. Outside a
+# virtualenv the site prefix is unknown: those candidates are printed with a
+# `site?` tag so callers can fail closed on them.
+private_pip_config_files() {
+  local cfgf="${PIP_CONFIG_FILE:-}" d
+  [[ "$cfgf" == /dev/null ]] && return 0
+  [[ -n "$cfgf" ]] && cfgf=$(anchor_path "$cfgf")
+  local IFS=:
+  for d in ${XDG_CONFIG_DIRS:-/etc/xdg}; do
+    [[ -n "$d" ]] && printf 'global\t%s\n' "$d/pip/pip.conf"
+  done
+  unset IFS
+  printf 'global\t%s\n' /etc/pip.conf
+  if [[ -z "$cfgf" || ! -f "$cfgf" ]]; then
+    printf 'user\t%s\n' "$HOME/.pip/pip.conf" "${XDG_CONFIG_HOME:-$HOME/.config}/pip/pip.conf"
+  fi
+  if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+    printf 'site\t%s\n' "$(anchor_path "$VIRTUAL_ENV")/pip.conf"
+  else
+    printf 'site?\t%s\n' /usr/pip.conf /usr/local/pip.conf
+  fi
+  [[ -n "$cfgf" ]] && printf 'env\t%s\n' "$cfgf"
+  return 0
+}
+
+# `section<TAB>key<TAB>value` for pip config keys $2.. in sections [global]
+# and [install] of file $1 (pip normalizes key spelling).
+private_pip_config_keys() {
+  local rc_file="$1"
+  shift
+  [[ -f "$rc_file" ]] || return 0
+  awk -v keys=" $* " '
+    function norm(s) { s = tolower(s); gsub(/_/, "-", s); sub(/^--/, "", s); return s }
+    function trimmed(s) { sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+    {
+      line = trimmed($0)
+      if (line == "" || line ~ /^[#;]/) next
+      if (line ~ /^\[/) { sub(/^\[/, "", line); sub(/\].*$/, "", line); sect = tolower(trimmed(line)); next }
+      p = index(line, "="); c = index(line, ":"); d = p
+      if (d == 0 || (c > 0 && c < p)) d = c
+      if (d == 0) next
+      k = norm(trimmed(substr(line, 1, d - 1)))
+      if ((sect == "global" || sect == "install") && index(keys, " " k " ") > 0)
+        printf "%s\t%s\t%s\n", sect, k, trimmed(substr(line, d + 1))
+    }' "$rc_file" 2>/dev/null || true
+}
+
 # Flat artifact sources pip/uv would consult besides indexes: argv
 # (--find-links, threaded by the gate as --find-links-selected), the
-# PIP_FIND_LINKS/UV_FIND_LINKS environment, and pip config find-links. A
-# find-links page lists files at its own URL, so it cannot be probed for a
-# namesake the way an index can; the private lane refuses it.
+# PIP_FIND_LINKS/UV_FIND_LINKS environment, and find-links in any pip
+# config file. A find-links page lists files at its own URL, so it cannot be
+# probed for a namesake the way an index can; the private lane refuses it.
 private_python_find_links_present() {
   [[ "${CHECK_FIND_LINKS_SELECTED:-0}" == 1 ]] && return 0
   [[ -n "${PIP_FIND_LINKS:-}" || -n "${UV_FIND_LINKS:-}" ]] && return 0
-  local -a rcs=()
-  [[ -n "${PIP_CONFIG_FILE:-}" ]] && rcs+=("$(anchor_path "$PIP_CONFIG_FILE")")
-  [[ -n "${VIRTUAL_ENV:-}" ]] && rcs+=("$(anchor_path "$VIRTUAL_ENV")/pip.conf")
-  rcs+=("$HOME/.config/pip/pip.conf" "$HOME/.pip/pip.conf")
-  local rc
-  for rc in "${rcs[@]}"; do
-    [[ -f "$rc" ]] || continue
-    [[ -n "$(pip_config_values "$rc" find-links)" ]] && return 0
+  local layer rc
+  while IFS=$'\t' read -r layer rc; do
+    [[ -n "$(private_pip_config_keys "$rc" find-links)" ]] && return 0
+  done < <(private_pip_config_files; printf 'user\t%s\n' "$HOME/.config/pip/pip.conf")
+  return 1
+}
+
+# The first uv configuration file uv would discover that sets package
+# sources: uv.toml or pyproject.toml ([tool.uv]) in the working directory or
+# a parent, the user file and the system files. Presence of a source key is
+# enough (no TOML parsing); exit 1 when none does.
+private_uv_source_config() {
+  local d f
+  local keys='^[[:space:]]*(\[+[[:space:]]*(index|sources|pip)([].[:space:]]|$)|(index-url|extra-index-url|find-links|no-index|default-index|index|sources)[[:space:]]*=)'
+  d=$(pwd -P)
+  while :; do
+    f="$d/uv.toml"
+    if [[ -f "$f" ]] && grep -Eq "$keys" "$f" 2>/dev/null; then
+      printf '%s' "$f"; return 0
+    fi
+    f="$d/pyproject.toml"
+    if [[ -f "$f" ]] && grep -q 'tool\.uv' "$f" 2>/dev/null \
+      && awk '/^[[:space:]]*\[/ { in_uv = ($0 ~ /^[[:space:]]*\[+[[:space:]]*tool\.uv([].]|$)/) } in_uv' "$f" 2>/dev/null \
+        | sed -E 's/^([[:space:]]*\[+[[:space:]]*)tool\.uv\.?/\1/' | grep -Eq "$keys"; then
+      printf '%s' "$f"; return 0
+    fi
+    [[ "$d" == / ]] && break
+    d=$(dirname -- "$d")
+  done
+  local -a sys=("${XDG_CONFIG_HOME:-$HOME/.config}/uv/uv.toml")
+  local IFS=:
+  for d in ${XDG_CONFIG_DIRS:-/etc/xdg}; do
+    [[ -n "$d" ]] && sys+=("$d/uv/uv.toml")
+  done
+  unset IFS
+  sys+=(/etc/uv/uv.toml)
+  for f in "${sys[@]}"; do
+    if [[ -f "$f" ]] && grep -Eq "$keys" "$f" 2>/dev/null; then
+      printf '%s' "$f"; return 0
+    fi
   done
   return 1
 }
 
-# pip config `no-deps = true` in a config file pip reads.
-private_python_config_no_deps() {
-  local -a rcs=()
-  [[ -n "${PIP_CONFIG_FILE:-}" ]] && rcs+=("$(anchor_path "$PIP_CONFIG_FILE")")
-  [[ -n "${VIRTUAL_ENV:-}" ]] && rcs+=("$(anchor_path "$VIRTUAL_ENV")/pip.conf")
-  rcs+=("$HOME/.config/pip/pip.conf" "$HOME/.pip/pip.conf")
-  local rc val
-  for rc in "${rcs[@]}"; do
-    [[ -f "$rc" ]] || continue
-    val=$(pip_config_values "$rc" no-deps | tail -n 1)
-    [[ -n "$val" ]] && python_bool_truthy "$val" && return 0
-  done
-  return 1
+# Whether pip itself would skip dependencies without an argv --no-deps:
+# PIP_NO_DEPS when set, else [install] over [global] no-deps across the
+# config files in pip's precedence (pip reads them only outside --isolated;
+# the gate says so with --pip-settings-apply). The --no-dependencies
+# spelling, an unknown site prefix that sets the key, or a value pip would
+# not read as a boolean prove nothing.
+private_pip_effective_no_deps() {
+  [[ -n "${PIP_NO_DEPENDENCIES+x}" ]] && return 1
+  if [[ -n "${PIP_NO_DEPS+x}" ]]; then
+    python_bool_truthy "${PIP_NO_DEPS}"
+    return
+  fi
+  local layer rc sect key val g="" i=""
+  while IFS=$'\t' read -r layer rc; do
+    while IFS=$'\t' read -r sect key val; do
+      [[ -n "$sect" ]] || continue
+      [[ "$key" == no-dependencies || "$layer" == "site?" ]] && return 1
+      if [[ "$sect" == install ]]; then i="$val"; else g="$val"; fi
+    done < <(private_pip_config_keys "$rc" no-deps no-dependencies)
+  done < <(private_pip_config_files)
+  [[ -n "$i" ]] || i="$g"
+  [[ -n "$i" ]] && python_bool_truthy "$i"
 }
 
 # Whole days since an ISO instant; empty when unparseable.
@@ -8756,6 +8856,18 @@ private_lane_audit() {
       fi
       ;;
     python)
+      local uv_conf=""
+      if [[ "${CHECK_UV_CONFIG:-}" == explicit ]]; then
+        private_finish 19 private_source_unmodelled \
+          "an explicit uv configuration (--config-file, UV_CONFIG_FILE, --directory or --project) is selected; it can add indexes or find-links that safe does not model, so it cannot show uv takes this private name from its private index" \
+          "drop that selector for this install; an operator may confirm at an interactive terminal" "$base_extra"
+        return $?
+      elif [[ "${CHECK_UV_CONFIG:-}" == ambient ]] && uv_conf=$(private_uv_source_config); then
+        private_finish 19 private_source_unmodelled \
+          "uv reads ${uv_conf}, which sets package sources (indexes, find-links or [sources]) that safe does not model, so it cannot show uv takes this private name from its private index" \
+          "run this install with uv --no-config, or an operator may confirm at an interactive terminal" "$base_extra"
+        return $?
+      fi
       if private_python_find_links_present; then
         private_finish 20 private_cross_registry \
           "a find-links source is selected; pip may take this private name's files from it instead of the private index, and safe cannot model that source" \
@@ -8926,9 +9038,9 @@ private_lane_audit() {
     local dep_reason=""
     case "$ecosystem" in
       python)
-        if [[ "${CHECK_NO_DEPS_SELECTED:-0}" != 1 ]] && ! python_bool_truthy "${PIP_NO_DEPS:-}" \
-          && ! private_python_config_no_deps; then
-          dep_reason="pip would also install this package's dependencies, which safe does not audit before the install"
+        if [[ "${CHECK_NO_DEPS_SELECTED:-0}" != 1 ]] \
+          && ! { [[ "${CHECK_PIP_SETTINGS:-0}" == 1 ]] && private_pip_effective_no_deps; }; then
+          dep_reason="the installer would also install this package's dependencies, which safe does not audit before the install"
         fi
         ;;
       npm|go)
@@ -9004,10 +9116,17 @@ private_fetch_command() {
 
 # `safe audit private-gosum --project-dir <dir> [--gate install] [-- <go argv>]`:
 # the Go project lane. Every module the operation can download that is on a
-# private lane — go.mod requirements (replaces applied) and go.sum entries —
-# must match its pin, or be confirmed against the private origin and pinned
-# on first use; a missing go.sum line is never authorization. -modfile,
-# workspace mode and pre-1.17 module graphs fail closed to the operator.
+# private lane must match its pin, or be confirmed against the private origin
+# and pinned on first use; a missing go.sum line is never authorization. The
+# identity set is read from the context the go command actually selects: the
+# module root above the working directory (go -C followed), an alternate
+# -modfile (argv, GOFLAGS or the go env file) with its own .sum, or every
+# module and go.work.sum of an active workspace — requirements with replaces
+# applied, every sum entry, and explicit `go mod download <mod>@<ver>`
+# targets. An operation that may add requirements itself (go mod tidy, or
+# -mod=mod) is first checked for private imports no requirement pins.
+# Pre-1.17 graphs and unreadable contexts fail closed to the operator while a
+# Go private registry is configured.
 # Exit 0 when nothing private is involved, 18 when every private module
 # passed (SAFE_AUDIT_RESULT_OUT carries one audit line per module),
 # otherwise the first refusal's 19/20/30.
@@ -9024,55 +9143,158 @@ private_gosum_command() {
   local -a go_argv=("$@")
   private_stores_present || return 0
   trust_grant_ok "private-registry" || return 0
-  # go -C <dir> runs the command in another module: follow it. -modfile (argv
-  # or GOFLAGS) swaps the module file safe would read: unmodelled.
-  local i a modfile=0
+  local core rc=0
+  core=$(private_core_bin) || { printf 'safe audit: private-registry decision engine missing or version-skewed; rerun install.sh\n' >&2; return 30; }
+  private_has_registry "$core" go || { rc=$?; (( rc == 1 )) && return 0; printf 'safe audit: the private-registry trust stores are malformed — repair them at an operator terminal; nothing was decided\n' >&2; return 30; }
+  PRIVATE_ECO="go" PRIVATE_GATE="$gate" PRIVATE_JSON=0
+  # go -C <dir> runs the command in another directory: follow it. -modfile
+  # and -mod come from argv, else from the effective GOFLAGS.
+  local i a modfile="" modflag="" sub="" sub2="" skip=0
   for (( i=0; i<${#go_argv[@]}; i++ )); do
     a="${go_argv[$i]}"
+    if (( skip )); then skip=0; continue; fi
     case "$a" in
-      -C) project_dir="${go_argv[$((i+1))]:-$project_dir}" ;;
-      -C=*) project_dir="${a#-C=}" ;;
-      -modfile|-modfile=*|--modfile|--modfile=*) modfile=1 ;;
+      -C|--C) project_dir="${go_argv[$((i+1))]:-$project_dir}"; skip=1; continue ;;
+      -C=*|--C=*) project_dir="${a#*=}"; continue ;;
+      -modfile|--modfile) modfile="${go_argv[$((i+1))]:-}"; skip=1; continue ;;
+      -modfile=*|--modfile=*) modfile="${a#*=}"; continue ;;
+      -mod|--mod) modflag="${go_argv[$((i+1))]:-}"; skip=1; continue ;;
+      -mod=*|--mod=*) modflag="${a#*=}"; continue ;;
+      -*) continue ;;
     esac
+    if [[ -z "$sub" ]]; then sub="$a"; elif [[ -z "$sub2" ]]; then sub2="$a"; fi
   done
-  [[ " ${GOFLAGS:-} " == *"-modfile"* ]] && modfile=1
   # `go mod download <module>@<version>` names modules explicitly, inside a
   # module or not: each one is a download target too (a query such as
   # @latest is not an exact version and asks the operator on the lane).
-  local explicit='[]' seen_mod=0 seen_dl=0
+  local explicit='[]' seen_dl=0
   for a in "${go_argv[@]}"; do
     if (( seen_dl )); then
       [[ "$a" == -* || "$a" != *@* ]] && continue
       explicit=$(jq -c --arg m "${a%@*}" --arg v "${a##*@}" '. + [{module: $m, version: $v}]' <<<"$explicit")
-    elif (( seen_mod )) && [[ "$a" == download ]]; then
+    elif [[ "$sub" == mod && "$a" == download ]]; then
       seen_dl=1
-    elif [[ "$a" == mod ]]; then
-      seen_mod=1
     fi
   done
-  local has_mod=0
-  [[ -f "${project_dir%/}/go.mod" ]] && has_mod=1
-  (( has_mod )) || [[ "$explicit" != "[]" ]] || return 0
-  local core go_bin scratch modjson='{"Go":"1.17"}' entries rc=0 any=0 row
-  core=$(private_core_bin) || { printf 'safe audit: private-registry decision engine missing or version-skewed; rerun install.sh\n' >&2; return 30; }
-  new_scratch_dir scratch
-  if (( has_mod )) && { ! go_bin=$(private_real_tool go) \
-    || ! modjson=$(cd -- "$project_dir" && GOFLAGS= "$go_bin" mod edit -json 2>/dev/null); }; then
-    printf 'safe audit: go.mod could not be read by the go toolchain; nothing was decided\n' >&2
-    rm -rf "$scratch"
-    return 30
+  local root="" has_mod=0
+  if root=$(cd -- "$project_dir" 2>/dev/null && pwd -P); then
+    while [[ "$root" != "/" && ! -f "$root/go.mod" ]]; do root=$(dirname -- "$root"); done
+    [[ -f "$root/go.mod" ]] && has_mod=1
   fi
-  (( has_mod )) || go_bin=$(private_real_tool go) || go_bin=""
+  (( has_mod )) || [[ "$explicit" != "[]" ]] || return 0
+  local go_bin scratch entries row any=0 goflags="" gowork="" t unreadable=""
+  new_scratch_dir scratch
+  if ! go_bin=$(private_real_tool go); then
+    PKG_NAME="go" PKG_VERSION="project"
+    private_finish 19 private_registry_unreachable "go could not be found to read the module graph — audit-infrastructure breakage, not a package finding" \
+      "rerun install.sh; an operator may confirm at an interactive terminal"
+    rc=$?; rm -rf "$scratch"; return "$rc"
+  fi
+  if (( has_mod )); then
+    goflags=$(cd -- "$project_dir" && "$go_bin" env GOFLAGS 2>/dev/null) || goflags=""
+    for t in $goflags; do
+      case "$t" in
+        -modfile=*|--modfile=*) [[ -n "$modfile" ]] || modfile="${t#*=}" ;;
+        -mod=*|--mod=*) [[ -n "$modflag" ]] || modflag="${t#*=}" ;;
+      esac
+    done
+    gowork=$(cd -- "$project_dir" && GOFLAGS= "$go_bin" env GOWORK 2>/dev/null) || gowork=""
+    [[ "$gowork" == off ]] && gowork=""
+  fi
+  # The module files and sum files of the selected context.
+  local -a modfiles=() sumfiles=()
+  if [[ -n "$gowork" ]]; then
+    local workjson wdir u
+    if workjson=$(GOFLAGS= "$go_bin" work edit -json "$gowork" 2>/dev/null); then
+      wdir=$(dirname -- "$gowork")
+      while IFS= read -r u; do
+        [[ -n "$u" ]] || continue
+        [[ "$u" == /* ]] || u="$wdir/$u"
+        modfiles+=("$u/go.mod"); sumfiles+=("$u/go.sum")
+      done < <(jq -r '.Use[]?.DiskPath' <<<"$workjson")
+      sumfiles+=("$wdir/go.work.sum")
+    else
+      unreadable="the workspace file ${gowork} could not be read"
+    fi
+  elif (( has_mod )); then
+    if [[ -n "$modfile" ]]; then
+      [[ "$modfile" == /* ]] || modfile="${project_dir%/}/$modfile"
+      modfiles+=("$modfile"); sumfiles+=("${modfile%.mod}.sum")
+    else
+      modfiles+=("$root/go.mod"); sumfiles+=("$root/go.sum")
+    fi
+  fi
+  local modjson='{"Go":"1.17","Require":[],"Replace":[],"Modules":[]}' one f
+  for f in "${modfiles[@]}"; do
+    if ! one=$(GOFLAGS= "$go_bin" mod edit -json "$f" 2>/dev/null); then
+      unreadable="the module file ${f} could not be read by the go toolchain"
+      break
+    fi
+    modjson=$(jq -c --argjson o "$one" '
+      .Require += ($o.Require // []) | .Replace = (($o.Replace // []) + .Replace)
+      | .Modules += [($o.Module.Path // "")]
+      | .Go = ([.Go, ($o.Go // "")] | if any(. == "") then "" else min_by(split(".") | map(tonumber? // 0)) end)' <<<"$modjson")
+  done
+  if [[ -n "$gowork" && -z "$unreadable" ]]; then
+    modjson=$(jq -c --argjson w "$workjson" '.Replace += ($w.Replace // [])' <<<"$modjson")
+  fi
   entries='[]'
-  if [[ -f "${project_dir%/}/go.sum" ]] && ! entries=$("$core" private-trust gosum --file "${project_dir%/}/go.sum" 2>/dev/null); then
-    printf 'safe audit: go.sum is malformed; nothing was decided\n' >&2
-    rm -rf "$scratch"
-    return 30
+  for f in "${sumfiles[@]}"; do
+    [[ -f "$f" ]] || continue
+    if ! one=$("$core" private-trust gosum --file "$f" 2>/dev/null); then
+      unreadable="the sum file ${f} is malformed"
+      break
+    fi
+    entries=$(jq -c --argjson o "$one" '. + $o' <<<"$entries")
+  done
+  local go_directive
+  go_directive=$(jq -r '.Go // ""' <<<"$modjson")
+  if [[ -z "$unreadable" ]] && (( ${#modfiles[@]} )) \
+    && { [[ -z "$go_directive" ]] || ! printf '%s\n%s\n' "1.17" "$go_directive" | sort -V -C; }; then
+    unreadable="a go.mod older than go 1.17 does not list its full module graph"
+  fi
+  if [[ -n "$unreadable" ]]; then
+    PKG_NAME="go" PKG_VERSION="project"
+    private_finish 19 private_project_unmodelled \
+      "a Go private registry is configured, and ${unreadable}, so safe cannot show which private modules this command downloads" \
+      "run the command where the module graph is readable, or an operator may confirm at an interactive terminal"
+    rc=$?; rm -rf "$scratch"; return "$rc"
+  fi
+  # A command that may add requirements itself resolves a new import to a
+  # version nothing has decided yet: every private import must already be
+  # provided by a requirement (or a module of this context).
+  if [[ "$sub" == mod && "$sub2" == tidy ]] || [[ "$modflag" == mod ]]; then
+    local imports uncovered dir
+    : > "$scratch/imports"
+    for f in "${modfiles[@]}"; do
+      dir=$(dirname -- "$f")
+      [[ -n "$modfile" && -z "$gowork" ]] && dir="$root"
+      ( cd -- "$dir" && GOFLAGS= GOPROXY=off "$go_bin" list -e -mod=readonly \
+          ${modfile:+-modfile="$modfile"} \
+          -f '{{join .Imports "\n"}}{{"\n"}}{{join .TestImports "\n"}}{{"\n"}}{{join .XTestImports "\n"}}' ./... ) \
+        >> "$scratch/imports" 2>/dev/null || true
+    done
+    imports=$(sort -u "$scratch/imports" | grep -v '^$' || true)
+    if [[ -n "$imports" ]]; then
+      local imatches
+      if ! imatches=$(printf '%s\n' "$imports" | private_core "$core" match-names --ecosystem go 2>/dev/null); then
+        rm -rf "$scratch"; return 30
+      fi
+      uncovered=$(jq -r --argjson m "$modjson" '
+        ([$m.Require[]?.Path] + $m.Modules | map(select(. != ""))) as $have
+        | .[].name | select(. as $i | $have | any(. as $p | $i == $p or ($i | startswith($p + "/"))) | not)' <<<"$imatches")
+      if [[ -n "$uncovered" ]]; then
+        PKG_NAME=$(head -n 1 <<<"$uncovered") PKG_VERSION="unrequired"
+        private_finish 19 private_import_unrequired \
+          "this command may add requirements, and the code imports private-registry packages no requirement pins ($(paste -sd, <<<"$uncovered" | sed 's/,/, /g')); go would pick a version safe has not decided" \
+          "require an exact version first (go mod edit -require=<module>@<version>), then rerun; or an operator may confirm at an interactive terminal"
+        rc=$?; rm -rf "$scratch"; return "$rc"
+      fi
+    fi
   fi
   # The module identities this operation can download: every requirement
-  # (replace directives applied; a local-directory replacement downloads
-  # nothing), plus every go.sum entry. Missing sums are not authorization:
-  # an identity with no observation is decided from the private origin.
+  # (replace directives applied, the workspace's last; a local-directory
+  # replacement downloads nothing), every sum entry, and explicit targets.
   local targets
   targets=$(jq -c --argjson sum "$entries" --argjson explicit "$explicit" '
     (.Replace // []) as $rep
@@ -9095,28 +9317,6 @@ private_gosum_command() {
   if [[ "$(jq 'length' <<<"$matches")" == "0" ]]; then
     rm -rf "$scratch"
     return 0
-  fi
-  PRIVATE_ECO="go" PRIVATE_GATE="$gate" PRIVATE_JSON=0
-  PKG_NAME=$(jq -r '.[0].name' <<<"$matches")
-  PKG_VERSION="project"
-  local unmodelled="" gowork go_directive
-  gowork=""
-  (( has_mod )) && { gowork=$(cd -- "$project_dir" && "$go_bin" env GOWORK 2>/dev/null) || gowork=""; }
-  go_directive=$(jq -r '.Go // ""' <<<"$modjson")
-  if (( modfile && has_mod )); then
-    unmodelled="-modfile swaps the module file safe reads"
-  elif [[ -n "$gowork" && "$gowork" != "off" ]]; then
-    unmodelled="workspace mode (go.work) is not modelled by the private-registry lane"
-  elif [[ -z "$go_directive" ]] || ! printf '%s\n%s\n' "1.17" "$go_directive" | sort -V -C; then
-    unmodelled="a go.mod older than go 1.17 does not list its full module graph"
-  fi
-  if [[ -n "$unmodelled" ]]; then
-    private_finish 19 private_project_unmodelled \
-      "this Go module requires private-registry modules ($(jq -r 'map(.name) | join(", ")' <<<"$matches")), and ${unmodelled}" \
-      "run the command in the module itself without that setting, or an operator may confirm at an interactive terminal"
-    rc=$?
-    rm -rf "$scratch"
-    return "$rc"
   fi
   local -a PRIVATE_COLLECTED=()
   local PRIVATE_COLLECT=1 PRIVATE_OBSERVED
@@ -9189,8 +9389,10 @@ private_npm_project_command() {
   {
     jq -r '[.dependencies, .devDependencies, .optionalDependencies, .peerDependencies]
       | map(select(type == "object") | keys[]) | .[]' "${project_dir%/}/package.json" 2>/dev/null
-    [[ -n "$lock_name" ]] && jq -r '.packages // {} | to_entries[]
-      | select(.key | test("node_modules/")) | (.value.name // (.key | sub(".*node_modules/"; "")))' \
+    [[ -n "$lock_name" ]] && jq -r '(.packages // {} | to_entries[]
+      | select(.key | test("node_modules/")) | (.value.name // (.key | sub(".*node_modules/"; "")))),
+      (.dependencies // {} | .. | objects | .dependencies? // empty | objects | keys[]),
+      (.dependencies // {} | objects | keys[])' \
       "${project_dir%/}/$lock_name" 2>/dev/null
     local a
     for a in "${manager_argv[@]}"; do
@@ -9209,14 +9411,31 @@ private_npm_project_command() {
     rm -rf "$scratch"
     return 30
   fi
-  if [[ "$(jq 'length' <<<"$matches")" == "0" ]]; then
-    rm -rf "$scratch"
-    return 0
-  fi
   PRIVATE_ECO="npm" PRIVATE_GATE="$gate" PRIVATE_JSON=0
-  PKG_NAME=$(jq -r '.[0].name' <<<"$matches")
   PKG_VERSION="project"
-  local unmodelled=""
+  local unmodelled="" visible=1
+  [[ "$(jq 'length' <<<"$matches")" == "0" ]] && visible=0
+  if (( ! visible )); then
+    # Nothing private is visible yet. `ci` installs the lockfile as it
+    # stands (its names were all read above); any other npm operation can
+    # resolve new identities, so it is projected while an npm private
+    # registry is configured. Other managers' resolutions are not projected
+    # (documented limit).
+    if [[ "$class" == "ci" || "$tool" != "npm" ]]; then
+      rm -rf "$scratch"
+      return 0
+    fi
+    rc=0
+    private_has_registry "$core" npm || rc=$?
+    if (( rc != 0 )); then
+      rm -rf "$scratch"
+      (( rc == 1 )) && return 0
+      return 30
+    fi
+    PKG_NAME="project"
+  else
+    PKG_NAME=$(jq -r '.[0].name' <<<"$matches")
+  fi
   if [[ "$tool" != "npm" ]]; then
     unmodelled="${tool} lockfiles are not modelled by the private-registry lane"
   elif jq -e 'has("workspaces")' "${project_dir%/}/package.json" >/dev/null 2>&1; then
@@ -9230,8 +9449,10 @@ private_npm_project_command() {
     done
   fi
   if [[ -n "$unmodelled" ]]; then
+    local touched="touches private-registry names ($(jq -r 'map(.name) | join(", ")' <<<"$matches"))"
+    (( visible )) || touched="may resolve private-registry packages (an npm private registry is configured)"
     private_finish 19 private_project_unmodelled \
-      "this ${tool} project operation touches private-registry names ($(jq -r 'map(.name) | join(", ")' <<<"$matches")), and ${unmodelled}" \
+      "this ${tool} project operation ${touched}, and ${unmodelled}" \
       "use npm without that argument in the project root, or an operator may confirm at an interactive terminal"
     rc=$?
     rm -rf "$scratch"
@@ -9272,6 +9493,18 @@ private_npm_project_command() {
       rc=$?; rm -rf "$scratch"; return "$rc"
     fi
     lockfile="$scratch/proj/$lock_name"
+  fi
+  # A lockfile without the `packages` map (lockfileVersion 1) records its
+  # tree differently; it is not swept, and a private name in it asks.
+  if ! jq -e '.packages | type == "object"' "$lockfile" >/dev/null 2>&1; then
+    local touched="touches private-registry names ($(jq -r 'map(.name) | join(", ")' <<<"$matches"))"
+    (( visible )) || touched="may resolve private-registry packages (an npm private registry is configured)"
+    private_finish 19 private_project_unmodelled \
+      "this ${tool} project operation ${touched}, and its lockfile (lockfileVersion 1) is not modelled by the private-registry lane" \
+      "upgrade the lockfile with a current npm (npm install --package-lock-only), or an operator may confirm at an interactive terminal"
+    rc=$?
+    rm -rf "$scratch"
+    return "$rc"
   fi
   # Sweep every private identity of that lockfile (the projection may have
   # introduced or changed some; a partial tree reifies unchanged ones too).
@@ -9319,6 +9552,7 @@ package_audit_command() {
   local CHECK_DIST_TAG="" CHECK_REGISTRY="" CHECK_PROJECT_DIR=""
   local CHECK_NPM_USERCONFIG="" CHECK_NPM_GLOBALCONFIG=""
   local CHECK_EFFECTIVE_SOURCES="" CHECK_INSTALLER="" CHECK_FIND_LINKS_SELECTED=0 CHECK_NO_DEPS_SELECTED=0
+  local CHECK_PIP_SETTINGS=0 CHECK_UV_CONFIG=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --ecosystem)
@@ -9354,6 +9588,15 @@ package_audit_command() {
       --no-deps-selected)
         CHECK_NO_DEPS_SELECTED=1
         shift
+        ;;
+      --pip-settings-apply)
+        CHECK_PIP_SETTINGS=1
+        shift
+        ;;
+      --uv-config)
+        [[ $# -lt 2 ]] && die "--uv-config requires a value"
+        case "$2" in explicit|ambient) CHECK_UV_CONFIG="$2" ;; *) die "unknown --uv-config: $2" ;; esac
+        shift 2
         ;;
       --op)
         [[ $# -lt 2 ]] && die "--op requires a value"

@@ -49,6 +49,8 @@ SAFE_GATE_NPM_USERCONFIG=""
 SAFE_GATE_NPM_GLOBALCONFIG=""
 SAFE_GATE_FIND_LINKS=0
 SAFE_GATE_NO_DEPS=0
+SAFE_GATE_PIP_SETTINGS=0
+SAFE_GATE_UV_CONFIG=""
 SAFE_GATE_ENV_SCRUB=()
 
 safe_gate_err() {
@@ -250,7 +252,7 @@ safe_gate_exec_real() {
   # (PR#30 delta-2 finding P2). De-export all five before every delegate
   # exec — the audit child receives its values via argv flags, never env.
   export -n SAFE_GATE_DIST_TAG SAFE_GATE_REGISTRY SAFE_GATE_PROJECT_DIR \
-    SAFE_GATE_NPM_USERCONFIG SAFE_GATE_NPM_GLOBALCONFIG SAFE_GATE_FIND_LINKS SAFE_GATE_NO_DEPS 2>/dev/null || true
+    SAFE_GATE_NPM_USERCONFIG SAFE_GATE_NPM_GLOBALCONFIG SAFE_GATE_FIND_LINKS SAFE_GATE_NO_DEPS SAFE_GATE_PIP_SETTINGS SAFE_GATE_UV_CONFIG 2>/dev/null || true
 
   # Environment names that are not valid shell identifiers (npm accepts
   # hyphenated npm_config_* keys) cannot be unset from bash: the scrub
@@ -380,8 +382,14 @@ safe_gate_run_audit() {
   # private-registry lane cannot probe it for a namesake, so it must know.
   [[ "${SAFE_GATE_FIND_LINKS:-0}" == 1 ]] && extra+=(--find-links-selected)
   # The private-registry lane allows an unattended install only when it
-  # fetches nothing beyond the checked root (python: --no-deps).
+  # fetches nothing beyond the checked root (python: the installer's own
+  # --no-deps; pip, outside --isolated, also honours PIP_NO_DEPS and pip
+  # config). uv's configuration files are sources the lane checks:
+  # `explicit` (a selected file or project directory) asks, `ambient` has
+  # safe-audit look for discovered uv config that sets sources.
   [[ "${SAFE_GATE_NO_DEPS:-0}" == 1 ]] && extra+=(--no-deps-selected)
+  [[ "${SAFE_GATE_PIP_SETTINGS:-0}" == 1 ]] && extra+=(--pip-settings-apply)
+  [[ -n "${SAFE_GATE_UV_CONFIG:-}" ]] && extra+=(--uv-config "${SAFE_GATE_UV_CONFIG}")
   # The npm lock-diff lane names the projected lockfile so the private-registry
   # lane can bind each private artifact's resolved origin and integrity.
   local artifact_lockfile="${SAFE_GATE_ARTIFACT_LOCKFILE:-}"
@@ -455,6 +463,8 @@ safe_gate_scan_target_flags() {
   SAFE_GATE_NPM_GLOBALCONFIG=""
   SAFE_GATE_FIND_LINKS=0
   SAFE_GATE_NO_DEPS=0
+  SAFE_GATE_PIP_SETTINGS=0
+  SAFE_GATE_UV_CONFIG=""
   # The installer is set by the tool handler AFTER this reset (bun for the
   # bun wrapper and bun-selected mise npm installs); safe-audit defaults it
   # from the ecosystem otherwise.
@@ -496,15 +506,11 @@ safe_gate_scan_target_flags() {
           # finding 3.2 mitigation). --no-index keeps its sentinel: it is a
           # boolean switch with no endpoint to record.
           --find-links|-f) safe_gate_add_source "${arg}"; SAFE_GATE_FIND_LINKS=1 ;;
-          --pip-args) [[ "${arg}" == *--no-deps* ]] && SAFE_GATE_NO_DEPS=1 ;;
         esac
         case "${arg}" in
           --index-url=*|--extra-index-url=*|--default-index=*|--index=*) safe_gate_add_source "${arg#*=}" ;;
           --find-links=*) safe_gate_add_source "${arg#*=}"; SAFE_GATE_FIND_LINKS=1 ;;
           -f?*) SAFE_GATE_FIND_LINKS=1 ;;
-          --no-deps) SAFE_GATE_NO_DEPS=1 ;;
-          # pipx forwards pip arguments as one value.
-          --pip-args=*--no-deps*) SAFE_GATE_NO_DEPS=1 ;;
           --no-index) safe_gate_add_source "local:no-index" ;;
         esac
         ;;
@@ -4495,6 +4501,20 @@ safe_gate_yarn() {
   safe_gate_exec_real yarn "$@"
 }
 
+# The installer's own dependency switch, read from the install arguments
+# only (`pip install` / `uv pip install` options; a later program's argv is
+# never proof). pip spells it --no-deps or --no-dependencies.
+safe_gate_python_no_deps() {
+  local installer="$1" arg
+  shift
+  for arg in "$@"; do
+    case "${installer}:${arg}" in
+      *:--) return 0 ;;
+      *:--no-deps|pip:--no-dependencies) SAFE_GATE_NO_DEPS=1 ;;
+    esac
+  done
+}
+
 safe_gate_pip_like() {
   local tool="$1"
   shift
@@ -4506,6 +4526,9 @@ safe_gate_pip_like() {
   local extractor_out extractor_rc
 
   [[ "${subcommand}" == "install" || "${subcommand}" == "upgrade" ]] || safe_gate_exec_real "${tool}" "$@"
+  safe_gate_python_no_deps pip "${@:subidx+1}"
+  # pip reads PIP_NO_DEPS and its config files unless --isolated is given.
+  safe_gate_has_arg "--isolated" "$@" || SAFE_GATE_PIP_SETTINGS=1
 
   if safe_gate_pip_project_install "${@:subidx+1}"; then
     safe_gate_scan_project || return $?
@@ -4534,6 +4557,17 @@ safe_gate_uv() {
   local second="${@:subidx+1:1}"
   local -a packages=()
   local extractor_out extractor_rc
+  # uv configuration can add indexes, find-links and sources. A selected
+  # file (--config-file, UV_CONFIG_FILE) or another discovery directory
+  # (--directory, --project) is not modelled; otherwise safe-audit checks the
+  # files uv discovers, unless --no-config / UV_NO_CONFIG turns them off.
+  if [[ -n "${UV_CONFIG_FILE:-}" ]] || safe_gate_has_arg "--config-file" "$@" || safe_gate_has_prefix_arg "--config-file=" "$@" \
+    || safe_gate_has_arg "--directory" "$@" || safe_gate_has_prefix_arg "--directory=" "$@" \
+    || safe_gate_has_arg "--project" "$@" || safe_gate_has_prefix_arg "--project=" "$@"; then
+    SAFE_GATE_UV_CONFIG="explicit"
+  elif ! safe_gate_has_arg "--no-config" "$@" && [[ -z "${UV_NO_CONFIG:-}" || "${UV_NO_CONFIG}" == 0 || "${UV_NO_CONFIG}" == false ]]; then
+    SAFE_GATE_UV_CONFIG="ambient"
+  fi
 
   if [[ "${first}" == "sync" ]]; then
     if safe_gate_uv_project_present; then
@@ -4623,6 +4657,7 @@ safe_gate_uv() {
   fi
 
   if [[ "${first}" == "pip" && "${second}" == "install" ]]; then
+    safe_gate_python_no_deps uv "${@:subidx+2}"
     if safe_gate_pip_project_install "${@:subidx+2}"; then
       safe_gate_scan_project || return $?
       safe_gate_exec_real uv "$@"
@@ -4826,18 +4861,34 @@ safe_gate_go() {
     done
     if [[ -n "${run_target}" && "${run_target}" == *@* && "${run_target}" != .* && "${run_target}" != /* ]]; then
       safe_gate_check_many go "$(safe_gate_go_spec "${run_target}")" || return $?
+    else
+      # A local run builds the current module: its requirements download
+      # like a build's.
+      safe_gate_private_gosum "$@" || return $?
     fi
     safe_gate_exec_real go "$@"
   fi
 
   if [[ "${subcommand}" != "install" ]]; then
     if [[ "${subcommand}" == "build" || "${subcommand}" == "test" ||
-          ( "${subcommand}" == "mod" && ( "${second}" == "download" || "${second}" == "tidy" ) ) ]]; then
+          "${subcommand}" == "vet" || "${subcommand}" == "list" ]]; then
       # The private lane follows go -C itself, so it runs whatever the cwd.
       safe_gate_private_gosum "$@" || return $?
       if safe_gate_go_project_present; then
         safe_gate_scan_project || return $?
       fi
+    elif [[ "${subcommand}" == "mod" ]]; then
+      case "${second}" in
+        download|tidy)
+          safe_gate_private_gosum "$@" || return $?
+          if safe_gate_go_project_present; then
+            safe_gate_scan_project || return $?
+          fi
+          ;;
+        vendor|graph|why|verify)
+          safe_gate_private_gosum "$@" || return $?
+          ;;
+      esac
     fi
 
     safe_gate_exec_real go "$@"
@@ -4845,6 +4896,19 @@ safe_gate_go() {
 
   extractor_out="$(safe_gate_go_packages "${@:subidx+1}")"
   extractor_rc=$?
+  # A local or in-module install (a target without @version) builds the
+  # current module's requirements.
+  local install_arg install_local=0 install_targets=0
+  (( extractor_rc != 0 )) && install_local=1
+  for install_arg in "${@:subidx+1}"; do
+    [[ "${install_arg}" == -* ]] && continue
+    install_targets=1
+    [[ "${install_arg}" == *@* ]] || install_local=1
+  done
+  (( install_targets )) || install_local=1
+  if (( install_local )); then
+    safe_gate_private_gosum "$@" || return $?
+  fi
   if (( extractor_rc != 0 )); then
     safe_gate_exec_real go "$@"
   fi
