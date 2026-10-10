@@ -550,6 +550,64 @@ rc=0; "$AUDIT" private-npm-project --tool npm --class install --project-dir "$tm
 rm -f "$blocklist"
 pass "round-4 P14: the local blocklist decides named private Go modules (download targets, selected requirements) and npm private entries before delegation"
 
+# --- review round 5 correctives --------------------------------------------------
+reset_state
+add_registry p-npm npm "$NPM_ORIGIN" '@p/*'
+add_registry p-py python "$PY_ORIGIN" caviar-redact
+add_registry p-go go "$GO_ORIGIN" superbiche.me
+
+# P13: requirement syntax the inventory does not model is incomplete, not absent
+mkdir -p "$tmp/fix/req5"
+printf 'caviar-redact==0.2.0\n' > "$tmp/fix/req5/child.txt"
+printf -- '--requirement\tchild.txt\n' > "$tmp/fix/req5/tab.txt"
+pyproj "$tmp/fix/req5/tab.txt"
+[[ "$rc" == 19 && "$(decision)" == private_route_unmodelled ]] || fail "P13: --requirement<TAB>file reaches the child: rc=$rc $(cat "$tmp/out")"
+printf -- '-r   child.txt\n' > "$tmp/fix/req5/spaces.txt"
+pyproj "$tmp/fix/req5/spaces.txt"
+[[ "$rc" == 19 ]] || fail "P13: -r with several spaces: rc=$rc"
+printf '${REVIEW_PACKAGE}==0.2.0\n' > "$tmp/fix/req5/env.txt"
+rc=0; REVIEW_PACKAGE=caviar-redact SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-python-project --gate install -- "$tmp/fix/req5/env.txt" > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 19 ]] && grep -q 'environment-variable' "$tmp/out" || fail "P13: an environment-expanded name asks: rc=$rc $(cat "$tmp/out")"
+for line in 'https://example.test/caviar_redact-0.2.0-py3-none-any.whl' '-e git+https://example.test/caviar.git#egg=caviar-redact' '--some-future-option x' '@weird'; do
+  printf '%s\n' "$line" > "$tmp/fix/req5/one.txt"
+  pyproj "$tmp/fix/req5/one.txt"
+  [[ "$rc" == 19 ]] || fail "P13: '$line' is not fully inventoried and must ask: rc=$rc"
+done
+printf -- '-e .\n./dist/local-0.1-py3-none-any.whl\n--index-url https://pypi.org/simple\n--extra-index-url=https://pypi.org/simple\nrequests==2.32.0  # comment\nidna; python_version >= "3.8"\n' > "$tmp/fix/req5/ok.txt"
+pyproj "$tmp/fix/req5/ok.txt"
+[[ "$rc" == 0 ]] || fail "P13: local editable, local wheel, source options and public names stay clean: rc=$rc $(cat "$tmp/out")"
+pass "round-5 P13: include whitespace is parsed; environment-expanded names, direct URLs, remote editables, unsupported options and unrecognized lines leave the inventory incomplete and ask"
+
+# P14: a remote replacement destination is a named private module
+mkdir -p "$tmp/fix/repl"; printf 'module example.com/app\n' > "$tmp/fix/repl/go.mod"
+jq -n '{Module: {Path: "example.com/app"}, Require: [{Path: "example.com/public", Version: "v0.1.0"}], Replace: [{Old: {Path: "example.com/public", Version: "v0.1.0"}, New: {Path: "superbiche.me/caviar", Version: "v0.2.0"}}, {Old: {Path: "example.com/other"}, New: {Path: "../local"}}]}' > "$tmp/fix/repl/go.mod.fakejson"
+gol "$tmp/fix/repl" -- mod download
+[[ "$rc" == 18 ]] && jq -e '[.private_registry_lines[].package] == ["superbiche.me/caviar@v0.2.0"]' "$tmp/result.json" >/dev/null || fail "P14: the replacement destination is logged: rc=$rc $(cat "$tmp/result.json" 2>/dev/null)"
+printf '{"packages":{"superbiche.me/caviar":{"reason":"operator-blocked"}}}\n' > "$SAFE_RUN_CONFIG_DIR/blocked.json"
+gol "$tmp/fix/repl" -- mod download
+[[ "$rc" == 20 && "$(decision)" == blocklist ]] || fail "P14: a blocked private replacement destination: rc=$rc $(cat "$tmp/out")"
+printf '{"Use":[{"DiskPath":"./app"}],"Replace":[{"Old":{"Path":"example.com/public"},"New":{"Path":"superbiche.me/caviar","Version":"v0.2.0"}}]}\n' > "$tmp/fix/ws/work-repl.json"
+jq -n '{Module: {Path: "example.com/workapp"}, Require: []}' > "$tmp/fix/ws/app/go.mod.fakejson"
+gol "$tmp/fix/ws" FAKE_GOWORK="$tmp/fix/ws/go.work" FAKE_GOWORK_JSON="$tmp/fix/ws/work-repl.json" -- build ./app
+[[ "$rc" == 20 ]] || fail "P14: a blocked private replacement in go.work: rc=$rc"
+rm -f "$SAFE_RUN_CONFIG_DIR/blocked.json"
+pass "round-5 P14: remote replacement destinations (go.mod and go.work) are named private modules for the blocklist and the audit line; local replacements stay local"
+
+# P15: a path that escapes the origin by dot segments is not under it
+manifest '{"name":"app","version":"1.0.0","dependencies":{"@p/x":"1.0.0"}}'
+for r in "$NPM_ORIGIN/../other/x.tgz" "$NPM_ORIGIN/%2e%2e/other/x.tgz" "$NPM_ORIGIN/%2E%2e/other/x.tgz" "$NPM_ORIGIN/sub/..%2f..%2fother/x.tgz"; do
+  lock "$(jq -n --arg r "$r" '{lockfileVersion: 3, packages: {"": {}, "node_modules/@p/x": {version: "1.0.0", resolved: $r}}}')"
+  proj ci -- ci
+  [[ "$rc" == 20 && "$(decision)" == private_cross_registry ]] || fail "P15: lockfile resolved $r is not under the origin: rc=$rc"
+done
+audit @p/x@1.0.0 npm FAKE_NPM_SCOPE_REG="$NPM_ORIGIN/../other/"
+[[ "$rc" == 20 ]] || fail "P15: a scope mapped through dot segments: rc=$rc"
+audit caviar-redact@0.2.0 python -- --python-isolated --registry "$PY_ORIGIN/../other/simple"
+[[ "$rc" == 20 ]] || fail "P15: a Python argv index escaping the origin: rc=$rc"
+audit superbiche.me/caviar@v0.2.0 go FAKE_GOPROXY="$GO_ORIGIN/../other"
+[[ "$rc" == 20 ]] || fail "P15: a GOPROXY entry escaping the origin: rc=$rc"
+pass "round-5 P15: observed sources with dot segments (literal or percent-encoded) never compare as under the origin (npm lockfile and scope, Python index, Go proxy)"
+
 # --- gate termini ---------------------------------------------------------------
 cat > "$tmp/scenario.sh" <<'SCENARIO'
 #!/usr/bin/env bash

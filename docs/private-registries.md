@@ -72,8 +72,13 @@ The trust label holds only because three guardrails stay in force:
 
 The local blocklist still applies to private names: explicit specs, private
 npm lockfile entries and names an npm project operation names, and every
-private Go module a command names (download targets, requirements of the
-selected module context).
+private Go module a command names (download targets, and the requirements and
+remote `replace` destinations of the selected module context and `go.work`).
+
+An observed source (a lockfile `resolved` URL, a scope registry, an argv
+index, a GOPROXY entry) counts as under an origin only on its literal path:
+one with a `.` or `..` segment, literal or percent-encoded, or a backslash,
+never does, because the client would fetch a normalized path elsewhere.
 
 ### Trust perimeter
 
@@ -177,10 +182,13 @@ The lane runs before the package manager is delegated to:
 - **Python.** `pip install` and `uv pip install` of explicit specs, with the
   isolation above. A private name reached any other way asks (19). That
   includes requirement and constraint files: Safe walks their `-r`/`-c`
-  includes (relative to the including file, at most 64 files and 16 levels,
-  cycle-safe), and a private name there, or a file set it cannot fully
-  inventory (an unreadable, remote or out-of-bounds include), asks. Use the
-  explicit form:
+  includes (`-r`, `-c`, `--requirement`, `--constraint`, with any whitespace
+  or `=`; relative to the including file; at most 64 files and 16 levels;
+  cycle-safe). A private name there asks. So does a file set it cannot fully
+  inventory: an unreadable, remote or out-of-bounds include, a line using
+  `${VAR}` expansion, a direct URL requirement, a remote editable, an option
+  it does not model, or an unrecognized line. Local paths and local
+  editables are local artifacts. Use the explicit form:
 
   ```bash
   pip install --index-url <origin>/simple <name>==<version>

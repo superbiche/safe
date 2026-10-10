@@ -8967,9 +8967,10 @@ private_go_command() {
   # Identities of the namespaces, read from the context go selects (log and
   # blocklist only, never authorization): every module of an active go.work,
   # else the -modfile from argv or GOFLAGS, else the module root above the
-  # directory; plus explicit `go mod download <mod>@<ver>` targets.
+  # directory — their requirements and remote replacement destinations (the
+  # workspace's too) — plus explicit `go mod download <mod>@<ver>` targets.
   local -a files=()
-  local gowork goflags t root="" go_bin=""
+  local gowork goflags t root="" go_bin="" workjson=""
   go_bin=$(private_real_tool go) || go_bin=""
   gowork=$(jq -r '.GOWORK // ""' <<<"$goenv")
   [[ "$gowork" == off ]] && gowork=""
@@ -8980,7 +8981,7 @@ private_go_command() {
     done
   fi
   if [[ -n "$gowork" && -n "$go_bin" ]]; then
-    local workjson wdir u
+    local wdir u
     if workjson=$(GOFLAGS= "$go_bin" work edit -json "$gowork" 2>/dev/null); then
       wdir=$(dirname -- "$gowork")
       while IFS= read -r u; do
@@ -9001,8 +9002,12 @@ private_go_command() {
     for f in "${files[@]}"; do
       [[ -n "$go_bin" ]] || break
       modjson=$(GOFLAGS= "$go_bin" mod edit -json "$f" 2>/dev/null) || continue
-      jq -r '(.Require // [])[] | [.Path, .Version] | @tsv' <<<"$modjson"
+      # Requirements and remote replacement destinations (a local-directory
+      # replacement carries no version: a local artifact).
+      jq -r '((.Require // [])[] | [.Path, .Version]),
+        ((.Replace // [])[] | .New | select((.Version // "") != "") | [.Path, .Version]) | @tsv' <<<"$modjson"
     done
+    [[ -n "${workjson:-}" ]] && jq -r '(.Replace // [])[] | .New | select((.Version // "") != "") | [.Path, .Version] | @tsv' <<<"$workjson"
     if [[ "$sub" == mod ]]; then
       local seen_dl=0
       for a in "${go_argv[@]}"; do
@@ -9094,14 +9099,34 @@ private_python_requirement_inventory() {
       line="${joined}${line}"; joined=""
       line=$(sed -E 's/(^|[[:space:]])#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$line")
       [[ -n "$line" ]] || continue
+      # pip expands ${VAR} in requirement files: the name is unknown here.
+      if [[ "$line" == *'${'* ]]; then
+        printf '!environment-variable expansion in %s\n' "$real"; continue
+      fi
       inc=""
-      case "$line" in
-        -r\ *|-c\ *|--requirement\ *|--constraint\ *) inc="${line#* }" ;;
-        --requirement=*|--constraint=*) inc="${line#*=}" ;;
-        -r*|-c*) inc="${line:2}" ;;
-        -*) continue ;;
-        *) sed -nE 's/^([A-Za-z0-9][A-Za-z0-9._-]*).*/\1/p' <<<"$line"; continue ;;
-      esac
+      if [[ "$line" =~ ^(--requirement|--constraint)([=[:space:]]+)(.+)$ ]]; then
+        inc="${BASH_REMATCH[3]}"
+      elif [[ "$line" =~ ^-[rc][[:space:]]*(.+)$ ]]; then
+        inc="${BASH_REMATCH[1]}"
+      elif [[ "$line" =~ ^(-e|--editable)([=[:space:]]+)(.+)$ ]]; then
+        # A local editable project is a local artifact; a remote one names
+        # a distribution fetched from that URL.
+        [[ "${BASH_REMATCH[3]}" != *://* && "${BASH_REMATCH[3]}" != git+* ]] && continue
+        printf '!remote editable requirement in %s\n' "$real"; continue
+      elif [[ "$line" =~ ^(-i|--index-url|--extra-index-url|--no-index|-f|--find-links|--pre|--trusted-host|--prefer-binary|--require-hashes|--only-binary|--no-binary|--use-feature|--config-settings)([=[:space:]]|$) ]]; then
+        continue
+      elif [[ "$line" == -* ]]; then
+        printf '!unsupported option %s in %s\n' "${line%%[=[:space:]]*}" "$real"; continue
+      elif [[ "$line" =~ ^[A-Za-z][A-Za-z0-9+.-]*:// ]]; then
+        # A bare URL requirement installs whatever distribution it serves.
+        printf '!direct URL requirement in %s\n' "$real"; continue
+      elif [[ "$line" =~ ^([A-Za-z0-9][A-Za-z0-9._-]*) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"; continue
+      else
+        # A local path (./dist/x.whl, ../pkg) is a local artifact.
+        [[ "$line" == .* || "$line" == /* || "$line" == '~'* ]] && continue
+        printf '!unrecognized requirement line in %s\n' "$real"; continue
+      fi
       inc=$(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$inc")
       case "$inc" in
         "") printf '!empty include in %s\n' "$real"; continue ;;

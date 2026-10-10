@@ -44,6 +44,14 @@ func TestUnderOriginBoundary(t *testing.T) {
 		npmOrigin + "x/evil":                                         false,
 		"https://git.example.test/api/packages/owner/npm/x":          false, // port is identity
 		"https://registry.npmjs.org/@scope/x/-/x-1.0.0.tgz":          false,
+		npmOrigin + "/../other/x.tgz":                                false, // dot segments escape the owner path
+		npmOrigin + "/%2e%2e/other/x.tgz":                            false,
+		npmOrigin + "/%2E%2e/other/x.tgz":                            false,
+		npmOrigin + "/./x.tgz":                                       false,
+		npmOrigin + "/..%2fother/x.tgz":                              false,
+		npmOrigin + "/sub\\..\\..\\other/x.tgz":                      false,
+		npmOrigin + "/%5c../other/x.tgz":                             false,
+		npmOrigin + "/x..y/z.tgz":                                    true, // dots inside a segment are a name
 	}
 	for u, want := range cases {
 		if got := UnderOrigin(u, npmOrigin); got != want {
@@ -93,6 +101,7 @@ func TestGoRoute(t *testing.T) {
 		t.Errorf("several file:// sources, pipe separators: %+v", r)
 	}
 	for _, bad := range []string{
+		goOrigin + "/../other," + goOrigin,
 		"file:///repo/goproxy,https://proxy.golang.org," + goOrigin,
 		"https://proxy.golang.org," + goOrigin,
 		"direct," + goOrigin,

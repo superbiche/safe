@@ -137,11 +137,22 @@ func CanonicalOrigin(raw string) (string, error) {
 // CanonicalURL is the identity form of an observed URL (a lockfile resolved
 // URL, an index URL): credentials, query and fragment dropped, scheme and host
 // lower-cased, default port dropped, trailing slashes stripped. It never
-// fails open: an unparseable URL returns "".
+// fails open: an unparseable URL returns "", and so does one whose path a
+// client would normalize differently from its spelling (a `.` or `..`
+// segment, literal or percent-encoded, or a backslash), so that a path that
+// escapes a registered origin cannot compare as below it.
 func CanonicalURL(raw string) string {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || u.Opaque != "" {
 		return ""
+	}
+	if strings.Contains(u.Path, "\\") || strings.Contains(strings.ToLower(u.RawPath), "%5c") {
+		return ""
+	}
+	for _, seg := range strings.Split(u.Path, "/") {
+		if seg == "." || seg == ".." {
+			return ""
+		}
 	}
 	scheme := strings.ToLower(u.Scheme)
 	if scheme != "https" && scheme != "http" {
