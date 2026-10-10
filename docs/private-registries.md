@@ -184,11 +184,11 @@ The lane runs before the package manager is delegated to:
   includes requirement and constraint files: Safe walks their `-r`/`-c`
   includes (`-r`, `-c`, `--requirement`, `--constraint`, with any whitespace
   or `=`; relative to the including file; at most 64 files and 16 levels;
-  cycle-safe). A private name there asks. So does a file set it cannot fully
-  inventory: an unreadable, remote or out-of-bounds include, a line using
-  `${VAR}` expansion, a direct URL requirement, a remote editable, an option
-  it does not model, or an unrecognized line. Local paths and local
-  editables are local artifacts. Use the explicit form:
+  cycle-safe). A private name there asks. So does an unreadable, remote or
+  out-of-bounds include. Other lines that name no readable package (`${VAR}`
+  spellings, URLs, options) are skipped: requirements-file installs retain
+  baseline public handling; the private lane does not certify a complete pip
+  requirement inventory. Use the explicit form:
 
   ```bash
   pip install --index-url <origin>/simple <name>==<version>

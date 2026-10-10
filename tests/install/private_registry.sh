@@ -565,18 +565,17 @@ pyproj "$tmp/fix/req5/tab.txt"
 printf -- '-r   child.txt\n' > "$tmp/fix/req5/spaces.txt"
 pyproj "$tmp/fix/req5/spaces.txt"
 [[ "$rc" == 19 ]] || fail "P13: -r with several spaces: rc=$rc"
-printf '${REVIEW_PACKAGE}==0.2.0\n' > "$tmp/fix/req5/env.txt"
-rc=0; REVIEW_PACKAGE=caviar-redact SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-python-project --gate install -- "$tmp/fix/req5/env.txt" > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" == 19 ]] && grep -q 'environment-variable' "$tmp/out" || fail "P13: an environment-expanded name asks: rc=$rc $(cat "$tmp/out")"
-for line in 'https://example.test/caviar_redact-0.2.0-py3-none-any.whl' '-e git+https://example.test/caviar.git#egg=caviar-redact' '--some-future-option x' '@weird'; do
+# a44: lines that name no readable package are skipped (baseline public
+# handling), never an ask — a ${VAR} public name must not prompt.
+for line in '${PUBLIC_PACKAGE}==2.32.0' 'https://example.test/x-0.1-py3-none-any.whl' '-e git+https://example.test/x.git#egg=x' '--some-future-option x' '@weird'; do
   printf '%s\n' "$line" > "$tmp/fix/req5/one.txt"
-  pyproj "$tmp/fix/req5/one.txt"
-  [[ "$rc" == 19 ]] || fail "P13: '$line' is not fully inventoried and must ask: rc=$rc"
+  rc=0; PUBLIC_PACKAGE=requests SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-python-project --gate install -- "$tmp/fix/req5/one.txt" > "$tmp/out" 2>&1 || rc=$?
+  [[ "$rc" == 0 ]] || fail "a44: '$line' names no readable private package and must not ask: rc=$rc $(cat "$tmp/out")"
 done
 printf -- '-e .\n./dist/local-0.1-py3-none-any.whl\n--index-url https://pypi.org/simple\n--extra-index-url=https://pypi.org/simple\nrequests==2.32.0  # comment\nidna; python_version >= "3.8"\n' > "$tmp/fix/req5/ok.txt"
 pyproj "$tmp/fix/req5/ok.txt"
 [[ "$rc" == 0 ]] || fail "P13: local editable, local wheel, source options and public names stay clean: rc=$rc $(cat "$tmp/out")"
-pass "round-5 P13: include whitespace is parsed; environment-expanded names, direct URLs, remote editables, unsupported options and unrecognized lines leave the inventory incomplete and ask"
+pass "round-5 P13 (a44): include whitespace is parsed and reaches private names; unreadable lines are skipped, not asked"
 
 # P14: a remote replacement destination is a named private module
 mkdir -p "$tmp/fix/repl"; printf 'module example.com/app\n' > "$tmp/fix/repl/go.mod"

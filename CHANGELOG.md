@@ -38,8 +38,8 @@
   client; safe never reads or logs them.
 - The private lane keeps the local blocklist for every named private Go module
   and npm private entry, walks Python requirement files through their
-  `-r`/`-c` includes (bounded; an incomplete inventory, such as `${VAR}`
-  expansion, a direct URL or an unmodelled option, asks), checks Go remote
+  `-r`/`-c` includes (bounded; an unreadable, remote or out-of-bounds
+  include asks; other files keep baseline public handling), checks Go remote
   `replace` destinations against the blocklist, never counts an observed
   source with `.`/`..` path segments as under the origin, binds npm v3
   alias entries to their private targets, prints sources without userinfo,

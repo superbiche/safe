@@ -9099,33 +9099,19 @@ private_python_requirement_inventory() {
       line="${joined}${line}"; joined=""
       line=$(sed -E 's/(^|[[:space:]])#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$line")
       [[ -n "$line" ]] || continue
-      # pip expands ${VAR} in requirement files: the name is unknown here.
-      if [[ "$line" == *'${'* ]]; then
-        printf '!environment-variable expansion in %s\n' "$real"; continue
-      fi
+      # Includes are followed; other options and lines that name no package
+      # (local paths, ${VAR} spellings, URLs) are skipped: requirement-file
+      # installs keep the baseline public handling, and this inventory only
+      # surfaces the private names it can read.
       inc=""
       if [[ "$line" =~ ^(--requirement|--constraint)([=[:space:]]+)(.+)$ ]]; then
         inc="${BASH_REMATCH[3]}"
       elif [[ "$line" =~ ^-[rc][[:space:]]*(.+)$ ]]; then
         inc="${BASH_REMATCH[1]}"
-      elif [[ "$line" =~ ^(-e|--editable)([=[:space:]]+)(.+)$ ]]; then
-        # A local editable project is a local artifact; a remote one names
-        # a distribution fetched from that URL.
-        [[ "${BASH_REMATCH[3]}" != *://* && "${BASH_REMATCH[3]}" != git+* ]] && continue
-        printf '!remote editable requirement in %s\n' "$real"; continue
-      elif [[ "$line" =~ ^(-i|--index-url|--extra-index-url|--no-index|-f|--find-links|--pre|--trusted-host|--prefer-binary|--require-hashes|--only-binary|--no-binary|--use-feature|--config-settings)([=[:space:]]|$) ]]; then
-        continue
       elif [[ "$line" == -* ]]; then
-        printf '!unsupported option %s in %s\n' "${line%%[=[:space:]]*}" "$real"; continue
-      elif [[ "$line" =~ ^[A-Za-z][A-Za-z0-9+.-]*:// ]]; then
-        # A bare URL requirement installs whatever distribution it serves.
-        printf '!direct URL requirement in %s\n' "$real"; continue
-      elif [[ "$line" =~ ^([A-Za-z0-9][A-Za-z0-9._-]*) ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"; continue
+        continue
       else
-        # A local path (./dist/x.whl, ../pkg) is a local artifact.
-        [[ "$line" == .* || "$line" == /* || "$line" == '~'* ]] && continue
-        printf '!unrecognized requirement line in %s\n' "$real"; continue
+        sed -nE 's/^([A-Za-z0-9][A-Za-z0-9._-]*).*/\1/p' <<<"$line"; continue
       fi
       inc=$(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$inc")
       case "$inc" in
