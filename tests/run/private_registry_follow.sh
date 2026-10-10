@@ -131,7 +131,15 @@ rc=0; "$RUN" host-allow follow > "$tmp/out" 2>&1 || rc=$?
 gpg --no-options --batch --yes --local-user "$other" --armor --detach-sign --output "$statement.asc" "$statement" 2>/dev/null
 rc=0; "$RUN" host-allow follow > "$tmp/out" 2>&1 || rc=$?
 [[ "$rc" == 1 ]] && cmp -s "$ledger" "$tmp/ledger.before" || fail "wrong key: rc=$rc"
-pass "tampered or foreign-signed statements are skipped (exit 1) and change nothing"
+rm -f "$statement.asc"
+rc=0; "$RUN" host-allow follow > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 1 ]] && cmp -s "$ledger" "$tmp/ledger.before" || fail "unsigned statement: rc=$rc"
+# equal generation, different bytes, validly signed: a collision changes nothing
+jq '.registries["p-npm"].reason = "replayed"' "$tmp/statement-gen1.json" > "$statement"
+gpg --no-options --batch --yes --local-user "$fpr" --armor --detach-sign --output "$statement.asc" "$statement" 2>/dev/null
+rc=0; "$RUN" host-allow follow > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 1 ]] && grep -q 'collision' "$tmp/out" && cmp -s "$ledger" "$tmp/ledger.before" || fail "collision: rc=$rc $(cat "$tmp/out")"
+pass "tampered, foreign-signed, unsigned and same-generation-collision statements are refused (exit 1) and change nothing"
 
 # a newer generation replaces: removal at the origin propagates
 set_host rainbow
