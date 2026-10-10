@@ -69,7 +69,7 @@ fi
 spec="$2"; version="${spec##*@}"
 # npm >= 12 answers a multi-field `view --json` with a one-element array.
 body=$(cat <<JSON
-{"version":"$version","dist":{"tarball":"${FAKE_TARBALL_BASE:-$NPM_ORIGIN}/@p%2fx/-/$version/x-$version.tgz","integrity":"${FAKE_SRI:-$SRI_A}"},"time":{"$version":"${FAKE_PUBLISHED:-2026-01-01T00:00:00Z}"}}
+{"version":"$version","dist":{"tarball":"${FAKE_TARBALL_BASE:-$NPM_ORIGIN}/@p%2fx/-/$version/x-$version.tgz","integrity":"${FAKE_SRI:-$SRI_A}"},"time":{"$version":"${FAKE_PUBLISHED:-2026-01-01T00:00:00Z}"}${FAKE_NPM_DEPS:+,$FAKE_NPM_DEPS}}
 JSON
 )
 case "${FAKE_NPM_SHAPE:-array}" in
@@ -86,7 +86,12 @@ if [[ "$1 $2" == "env GOWORK" ]]; then
   exit 0
 fi
 if [[ "$1 $2 $3" == "mod edit -json" ]]; then
-  cat "${FAKE_GO_MODJSON:?}"
+  if [[ -n "${4:-}" ]]; then
+    # the downloaded module's own go.mod
+    printf '%s\n' "${FAKE_GO_DEP_MODJSON:-{\"Require\":null\}}"
+  else
+    cat "${FAKE_GO_MODJSON:?}"
+  fi
   exit 0
 fi
 if [[ "$1" == env ]]; then
@@ -99,8 +104,9 @@ if [[ "$1 $2" == "mod download" ]]; then
     jq -cn --arg e "reading $GOPROXY: 401 Unauthorized" '{Error: $e}'; exit 1
   fi
   mkdir -p "$GOMODCACHE"; printf '{"Version":"%s","Time":"2026-01-01T00:00:00Z"}' "${mv##*@}" > "$GOMODCACHE/info.json"
-  jq -cn --arg p "${mv%@*}" --arg v "${mv##*@}" --arg s "${FAKE_GO_H1:-$H1_A}" --arg m "${FAKE_GO_MOD:-$H1_B}" --arg i "$GOMODCACHE/info.json" \
-    '{Path: $p, Version: $v, Sum: $s, GoModSum: $m, Info: $i}'
+  printf 'module %s\n' "${mv%@*}" > "$GOMODCACHE/dep.mod"
+  jq -cn --arg p "${mv%@*}" --arg v "${mv##*@}" --arg s "${FAKE_GO_H1:-$H1_A}" --arg m "${FAKE_GO_MOD:-$H1_B}" --arg i "$GOMODCACHE/info.json" --arg g "$GOMODCACHE/dep.mod" \
+    '{Path: $p, Version: $v, Sum: $s, GoModSum: $m, Info: $i, GoMod: $g}'
   exit 0
 fi
 exit 0
@@ -341,36 +347,36 @@ pass "an unblessed redirected trust root declines the policy; a malformed store 
 # --- python -------------------------------------------------------------------
 reset_state
 add_registry p-py python "$PY_ORIGIN" caviar-redact
-audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple"
+audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 PIP_INDEX_URL="$PY_ORIGIN/simple"
 [[ "$rc" == 18 ]] || fail "python: rc=$rc $(cat "$tmp/out")"
 jq -e --arg a "$SHA_A" --arg b "$SHA_B" '.pins | to_entries[0].value.integrity.files
   == {"caviar_redact-0.2.0-py3-none-any.whl": $a, "caviar_redact-0.2.0.tar.gz": $b}' "$pins" >/dev/null || fail "python pin file set: $(cat "$pins")"
 grep -qx 'https://pypi.org/simple/caviar-redact/' "$tmp/curl.urls" || fail "public namesake probe missing"
 pass "python: an exact pin from the private index installs (18) and pins every distribution file of the version"
-audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple" FAKE_PY_SHA="$SHA_B"
+audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 PIP_INDEX_URL="$PY_ORIGIN/simple" FAKE_PY_SHA="$SHA_B"
 [[ "$rc" == 20 ]] || fail "python changed: rc=$rc"
-audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple" FAKE_PYPI_CODE=200
+audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 PIP_INDEX_URL="$PY_ORIGIN/simple" FAKE_PYPI_CODE=200
 [[ "$rc" == 20 ]] && grep -q 'dependency confusion' "$tmp/out" || fail "python namesake on PyPI: rc=$rc"
-audit caviar-redact@0.2.0 python FAKE_PYPI_CODE=404
+audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 FAKE_PYPI_CODE=404
 [[ "$rc" == 20 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_cross_registry ]] || fail "python without the private index: rc=$rc"
-audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple" FAKE_PYPI_CODE=503
+audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 PIP_INDEX_URL="$PY_ORIGIN/simple" FAKE_PYPI_CODE=503
 [[ "$rc" == 19 ]] || fail "python probe outage: rc=$rc"
-audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple" FAKE_PY_FILE_BASE=https://cdn.example.test
+audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 PIP_INDEX_URL="$PY_ORIGIN/simple" FAKE_PY_FILE_BASE=https://cdn.example.test
 [[ "$rc" == 20 ]] || fail "python file outside origin: rc=$rc"
 pass "python: changed files, a public namesake, a missing private index and files hosted elsewhere BLOCK; a probe outage asks (19)"
-rc=0; PIP_INDEX_URL="$PY_ORIGIN/simple" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" package-audit caviar-redact@0.2.0 --ecosystem python --gate install --find-links-selected > "$tmp/out" 2>&1 || rc=$?
+rc=0; PIP_INDEX_URL="$PY_ORIGIN/simple" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" package-audit caviar-redact@0.2.0 --ecosystem python --gate install --find-links-selected --no-deps-selected > "$tmp/out" 2>&1 || rc=$?
 [[ "$rc" == 20 ]] && grep -q 'find-links' "$tmp/out" || fail "argv find-links: rc=$rc"
-audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple" PIP_FIND_LINKS=https://flat.example.test/
+audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 PIP_INDEX_URL="$PY_ORIGIN/simple" PIP_FIND_LINKS=https://flat.example.test/
 [[ "$rc" == 20 ]] || fail "PIP_FIND_LINKS: rc=$rc"
 mkdir -p "$HOME/.config/pip"; printf '[global]\nfind-links = https://flat.example.test/\n' > "$HOME/.config/pip/pip.conf"
-audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple"
+audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 PIP_INDEX_URL="$PY_ORIGIN/simple"
 [[ "$rc" == 20 ]] || fail "pip config find-links: rc=$rc"
 rm -f "$HOME/.config/pip/pip.conf"
-audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple" PIP_NO_INDEX=1
+audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 PIP_INDEX_URL="$PY_ORIGIN/simple" PIP_NO_INDEX=1
 [[ "$rc" == 20 ]] || fail "no-index: rc=$rc"
 ( source "$ROOT/lib/gate-lib.sh"; safe_gate_scan_target_flags python install -f https://flat.example.test/ caviar-redact==0.2.0; [[ "$SAFE_GATE_FIND_LINKS" == 1 ]] ) || fail "the gate does not flag -f"
 ( source "$ROOT/lib/gate-lib.sh"; safe_gate_scan_target_flags python install --find-links=https://f/ x; [[ "$SAFE_GATE_FIND_LINKS" == 1 ]] ) || fail "the gate does not flag --find-links="
-audit caviar-redact@0.2.0 python PIP_INDEX_URL="https://user:$SECRET@git.example.test:8443/api/packages/owner/pypi/simple"
+audit caviar-redact@0.2.0 python PIP_NO_DEPS=1 PIP_INDEX_URL="https://user:$SECRET@git.example.test:8443/api/packages/owner/pypi/simple"
 [[ "$rc" == 18 ]] || fail "inline-credential index: rc=$rc"
 grep -q "user:$SECRET@git.example.test" "$tmp/curl.urls" || fail "the operator's inline-credential index URL did not reach the fetch"
 grep -q "$SECRET" "$tmp/out" "$tmp/result.json" "$SAFE_AUDIT_AUDIT_LOG" "$pins" && fail "the inline index credential leaked into an output or store"
@@ -443,6 +449,37 @@ rc=0; FAKE_GO_MODJSON="$tmp/fix/modjson-req.json" GOPROXY="$GO_ORIGIN" SAFE_AUDI
 [[ "$rc" == 20 ]] || fail "go -C must be followed: rc=$rc"
 rm -f "$pins"
 pass "go project lane: go.mod requirements are decided without go.sum (revoked BLOCKs, first use pins from the origin); -modfile, go.work and pre-1.17 graphs ask; local replaces skip; -C is followed"
+
+# round-1 P5 (option A): the unattended private allow needs an install that
+# fetches nothing beyond the checked root
+reset_state
+add_registry p-py python "$PY_ORIGIN" caviar-redact
+audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple"
+[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_dependencies_unaudited ]] || fail "pip without --no-deps: rc=$rc"
+grep -q -- '--no-deps' "$tmp/out" || fail "pip dependency hint"
+rc=0; PIP_INDEX_URL="$PY_ORIGIN/simple" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" package-audit caviar-redact@0.2.0 --ecosystem python --gate install --no-deps-selected > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 18 ]] || fail "pip --no-deps (argv): rc=$rc"
+mkdir -p "$HOME/.config/pip"; printf '[install]\nno-deps = true\n' > "$HOME/.config/pip/pip.conf"
+audit caviar-redact@0.2.0 python PIP_INDEX_URL="$PY_ORIGIN/simple"
+[[ "$rc" == 18 ]] || fail "pip config no-deps: rc=$rc"
+rm -f "$HOME/.config/pip/pip.conf"
+( source "$ROOT/lib/gate-lib.sh"; safe_gate_scan_target_flags python install --no-deps x==1; [[ "$SAFE_GATE_NO_DEPS" == 1 ]] ) || fail "the gate does not flag --no-deps"
+( source "$ROOT/lib/gate-lib.sh"; safe_gate_scan_target_flags python install --pip-args=--no-deps x; [[ "$SAFE_GATE_NO_DEPS" == 1 ]] ) || fail "the gate does not flag pipx --pip-args=--no-deps"
+add_registry p-npm npm "$NPM_ORIGIN" '@p/*'
+audit @p/x@6.0.0 npm FAKE_NPM_DEPS='"dependencies":{"left-pad":"1.3.0"}'
+[[ "$rc" == 19 && "$(jq -r '.private_registry.decision' "$tmp/result.json")" == private_dependencies_unaudited ]] && grep -q 'left-pad' "$tmp/out" || fail "npm spec with dependencies: rc=$rc"
+audit @p/x@6.0.1 npm FAKE_NPM_DEPS='"peerDependencies":{"react":"18.0.0"},"peerDependenciesMeta":{"react":{"optional":true}}'
+[[ "$rc" == 18 ]] || fail "an optional peer is not installed: rc=$rc"
+audit @p/x@6.0.2 npm FAKE_NPM_DEPS='"peerDependencies":{"react":"18.0.0"}'
+[[ "$rc" == 19 ]] || fail "a required peer is installed by npm: rc=$rc"
+audit @p/x@1.0.0 npm FAKE_NPM_DEPS='"dependencies":{"left-pad":"1.3.0"}' SAFE_AUDIT_ARTIFACT_LOCKFILE="$tmp/fix/lock.json"
+[[ "$rc" == 18 ]] || fail "the lockfile lane decides its own entries: rc=$rc"
+add_registry p-go go "$GO_ORIGIN" superbiche.me
+audit superbiche.me/caviar@v0.2.0 go GOPROXY="$GO_ORIGIN" FAKE_GO_DEP_MODJSON='{"Require":[{"Path":"golang.org/x/text","Version":"v0.20.0"}]}'
+[[ "$rc" == 19 ]] && grep -q 'golang.org/x/text' "$tmp/out" || fail "go install of a module with requirements: rc=$rc"
+audit superbiche.me/caviar@v0.2.0 go GOPROXY="$GO_ORIGIN"
+[[ "$rc" == 18 ]] || fail "go install of a dependency-free module: rc=$rc"
+pass "P5 option A: the unattended allow needs a dependency-free install (pip --no-deps/config, npm without dependencies or required peers, go without requirements); otherwise 19 with the recovery hint"
 
 # --- gate termini ---------------------------------------------------------------
 cat > "$tmp/scenario.sh" <<'SCENARIO'

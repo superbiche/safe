@@ -40,6 +40,13 @@
   source or `--no-index` is a BLOCK for a private Python name, an npm
   integrity with two different sha512 digests is refused, and the npm fetch
   reads npm 12's array answer and keeps the selected npm config files.
+- Safe audits the packages an operation names, not what a package manager
+  pulls in beside them (a pre-existing limitation, now documented). The
+  unattended private allow on an explicit spec therefore requires a
+  dependency-free install — pip/uv/pipx `--no-deps` (or `PIP_NO_DEPS`, pip
+  config `no-deps`), an npm version without dependencies or required peers, a
+  Go module whose `go.mod` requires nothing — and otherwise asks the operator
+  (19, `private_dependencies_unaudited`) with the recovery path.
 
 ## 1.68.1 - 2026-10-07
 

@@ -48,6 +48,7 @@ SAFE_GATE_TOOL=""
 SAFE_GATE_NPM_USERCONFIG=""
 SAFE_GATE_NPM_GLOBALCONFIG=""
 SAFE_GATE_FIND_LINKS=0
+SAFE_GATE_NO_DEPS=0
 SAFE_GATE_ENV_SCRUB=()
 
 safe_gate_err() {
@@ -249,7 +250,7 @@ safe_gate_exec_real() {
   # (PR#30 delta-2 finding P2). De-export all five before every delegate
   # exec — the audit child receives its values via argv flags, never env.
   export -n SAFE_GATE_DIST_TAG SAFE_GATE_REGISTRY SAFE_GATE_PROJECT_DIR \
-    SAFE_GATE_NPM_USERCONFIG SAFE_GATE_NPM_GLOBALCONFIG SAFE_GATE_FIND_LINKS 2>/dev/null || true
+    SAFE_GATE_NPM_USERCONFIG SAFE_GATE_NPM_GLOBALCONFIG SAFE_GATE_FIND_LINKS SAFE_GATE_NO_DEPS 2>/dev/null || true
 
   # Environment names that are not valid shell identifiers (npm accepts
   # hyphenated npm_config_* keys) cannot be unset from bash: the scrub
@@ -378,6 +379,9 @@ safe_gate_run_audit() {
   # A find-links selector is a flat artifact source, not an index: the
   # private-registry lane cannot probe it for a namesake, so it must know.
   [[ "${SAFE_GATE_FIND_LINKS:-0}" == 1 ]] && extra+=(--find-links-selected)
+  # The private-registry lane allows an unattended install only when it
+  # fetches nothing beyond the checked root (python: --no-deps).
+  [[ "${SAFE_GATE_NO_DEPS:-0}" == 1 ]] && extra+=(--no-deps-selected)
   # The npm lock-diff lane names the projected lockfile so the private-registry
   # lane can bind each private artifact's resolved origin and integrity.
   local artifact_lockfile="${SAFE_GATE_ARTIFACT_LOCKFILE:-}"
@@ -450,6 +454,7 @@ safe_gate_scan_target_flags() {
   SAFE_GATE_NPM_USERCONFIG=""
   SAFE_GATE_NPM_GLOBALCONFIG=""
   SAFE_GATE_FIND_LINKS=0
+  SAFE_GATE_NO_DEPS=0
   # The installer is set by the tool handler AFTER this reset (bun for the
   # bun wrapper and bun-selected mise npm installs); safe-audit defaults it
   # from the ecosystem otherwise.
@@ -491,11 +496,15 @@ safe_gate_scan_target_flags() {
           # finding 3.2 mitigation). --no-index keeps its sentinel: it is a
           # boolean switch with no endpoint to record.
           --find-links|-f) safe_gate_add_source "${arg}"; SAFE_GATE_FIND_LINKS=1 ;;
+          --pip-args) [[ "${arg}" == *--no-deps* ]] && SAFE_GATE_NO_DEPS=1 ;;
         esac
         case "${arg}" in
           --index-url=*|--extra-index-url=*|--default-index=*|--index=*) safe_gate_add_source "${arg#*=}" ;;
           --find-links=*) safe_gate_add_source "${arg#*=}"; SAFE_GATE_FIND_LINKS=1 ;;
           -f?*) SAFE_GATE_FIND_LINKS=1 ;;
+          --no-deps) SAFE_GATE_NO_DEPS=1 ;;
+          # pipx forwards pip arguments as one value.
+          --pip-args=*--no-deps*) SAFE_GATE_NO_DEPS=1 ;;
           --no-index) safe_gate_add_source "local:no-index" ;;
         esac
         ;;

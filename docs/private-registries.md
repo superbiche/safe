@@ -48,10 +48,34 @@ the following:
 
 Names outside the namespace are unaffected, even when the private origin
 serves them: a public package keeps its ordinary audit when an operation names
-it. Dependencies a package manager resolves on its own while installing a
-named package are not audited before delegation, for private and public roots
-alike; the npm and Go project lanes do check every private entry of the
-lockfile or module graph they sweep.
+it.
+
+### Roots-only audit (pre-existing limitation) and the dependency-free rule
+
+Safe audits the packages an operation names (and the project's lockfile or
+module graph through the project scan); it does not audit, before delegation,
+the dependencies a package manager resolves on its own while installing a
+named package. That holds for public and private roots alike and predates
+this feature. Because an unattended private allow would otherwise carry that
+gap into an unattended install, exit 18 on an explicit spec requires an
+install that fetches nothing beyond the checked root:
+
+- pip, uv, pipx: `--no-deps` (pipx: inside `--pip-args`), `PIP_NO_DEPS`, or
+  pip config `no-deps = true`;
+- npm spec and `-g`: the exact version declares no `dependencies`, no
+  `optionalDependencies` and no peer dependency npm would install (peers
+  marked optional in `peerDependenciesMeta` do not count);
+- `go install`/`go run mod@version`: the module's own `go.mod` requires
+  nothing.
+
+Otherwise the decision is 19 (`private_dependencies_unaudited`) with the
+recovery: install the dependencies first as exact pins (each is audited), then
+the private package without its dependencies — or, for npm and Go, use the
+private package inside a project, whose lane checks the lockfile or module
+graph. The project lanes decide every private entry they sweep; public entries
+of a project's lockfile or module graph keep the project scan. Closure
+planning (auditing every planned dependency before delegating, for public
+roots too) is a tracked follow-up, not part of this lane.
 
 Safe **never reads, stores or forwards a registry credential**. The lane runs
 each ecosystem's own client, which uses its own credentials:
@@ -70,7 +94,7 @@ or stores goes through the credential-stripping canonical form.
 | Gate exit | Meaning | Unattended | Operator lane |
 | --- | --- | --- | --- |
 | 18 `ALLOWED_VIA_PRIVATE_REGISTRY` | origin binding holds and the integrity matches the pin (or was pinned on first use) | proceeds | n/a |
-| 19 | operator decision needed: namespace claimed by two origins, operator pin missing, non-exact spec, version not on the registry, credentials missing or rejected, registry unreachable, inside the cooldown | refuses 102 with the reason and its remedy | `[y/N]` install once at a terminal |
+| 19 | operator decision needed: namespace claimed by two origins, operator pin missing, non-exact spec, version not on the registry, credentials missing or rejected, registry unreachable, inside the cooldown, the install would fetch dependencies safe does not audit, a project shape the lane does not model | refuses 102 with the reason and its remedy | `[y/N]` install once at a terminal |
 | 20, class `private` | the pinned version's bytes changed, the version is revoked, signed pins disagree, or the artifact comes from another source (cross-registry substitution) | refuses 104 | typed `<name>@<version>` installs once; never recorded. A reviewed re-pin is `pin replace` |
 
 Missing credentials and outages are labelled audit-infrastructure breakage,

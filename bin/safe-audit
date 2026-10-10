@@ -8340,7 +8340,7 @@ private_fetch_npm() {
   [[ -n "${CHECK_NPM_GLOBALCONFIG:-}" ]] && cfg+=("--globalconfig=${CHECK_NPM_GLOBALCONFIG}")
   (
     cd -- "${CHECK_PROJECT_DIR:-.}" 2>/dev/null || cd -- "$HOME" || exit 42
-    timeout 30 "$npm_bin" view "${name}@${version}" version dist time dependencies optionalDependencies --json \
+    timeout 30 "$npm_bin" view "${name}@${version}" version dist time dependencies optionalDependencies peerDependencies peerDependenciesMeta --json \
       "--registry=${origin}/" "--${scope}:registry=${origin}/" "${cfg[@]}"
   ) >"$scratch/private-npm.raw" 2>"$scratch/private-npm.err" || rc=$?
   if (( rc != 0 )); then
@@ -8364,8 +8364,16 @@ private_fetch_npm() {
   "$core" private-trust under-origin --url "$tarball" --origin "$origin" >/dev/null 2>&1 || return 44
   [[ -n "$sri" ]] || return 45
   published=$(jq -r --arg v "$version" '.time[$v] // empty | strings' "$scratch/private-npm.json" 2>/dev/null) || published=""
+  # What npm would install beside the root: dependencies, optional
+  # dependencies, and peers not marked optional (npm >= 7 installs peers).
+  local requires
+  requires=$(jq -c '((.dependencies // {}) | keys) + ((.optionalDependencies // {}) | keys)
+    + ((.peerDependencies // {}) | keys | map(select(. as $p | ($ARGS.named.meta[$p].optional // false) | not)))' \
+    --argjson meta "$(jq -c '.peerDependenciesMeta // {}' "$scratch/private-npm.json" 2>/dev/null || printf '{}')" \
+    "$scratch/private-npm.json" 2>/dev/null) || requires='null'
   jq -cn --arg sri "$sri" --arg artifact "$(canonicalize_source "$tarball")" --arg published "$published" \
-    '{integrity: {sri: $sri}, artifact: $artifact, published: $published}'
+    --argjson requires "$requires" \
+    '{integrity: {sri: $sri}, artifact: $artifact, published: $published, requires: $requires}'
 }
 
 # The index to read for a private python origin: the operator's own effective
@@ -8474,8 +8482,16 @@ private_fetch_go() {
   info=$(jq -r '.Info // empty' "$scratch/private-go.json")
   published=""
   [[ -n "$info" && -f "$info" ]] && published=$(jq -r '.Time // empty' "$info" 2>/dev/null)
+  # The module's own requirements: go install/run builds against them.
+  local gomod requires='null'
+  gomod=$(jq -r '.GoMod // empty' "$scratch/private-go.json")
+  if [[ -n "$gomod" && -f "$gomod" ]]; then
+    requires=$(GOFLAGS= "$go_bin" mod edit -json "$gomod" 2>/dev/null | jq -c '[(.Require // [])[] | .Path]' 2>/dev/null) || requires='null'
+    [[ -n "$requires" ]] || requires='null'
+  fi
   jq -cn --arg h1 "$sum" --arg mod "$gomodsum" --arg artifact "${module}@${version}" --arg published "$published" \
-    '{integrity: {h1: $h1, mod: $mod}, artifact: $artifact, published: $published}'
+    --argjson requires "$requires" \
+    '{integrity: {h1: $h1, mod: $mod}, artifact: $artifact, published: $published, requires: $requires}'
 }
 
 private_fetch() {
@@ -8538,6 +8554,21 @@ private_python_find_links_present() {
   for rc in "${rcs[@]}"; do
     [[ -f "$rc" ]] || continue
     [[ -n "$(pip_config_values "$rc" find-links)" ]] && return 0
+  done
+  return 1
+}
+
+# pip config `no-deps = true` in a config file pip reads.
+private_python_config_no_deps() {
+  local -a rcs=()
+  [[ -n "${PIP_CONFIG_FILE:-}" ]] && rcs+=("$(anchor_path "$PIP_CONFIG_FILE")")
+  [[ -n "${VIRTUAL_ENV:-}" ]] && rcs+=("$(anchor_path "$VIRTUAL_ENV")/pip.conf")
+  rcs+=("$HOME/.config/pip/pip.conf" "$HOME/.pip/pip.conf")
+  local rc val
+  for rc in "${rcs[@]}"; do
+    [[ -f "$rc" ]] || continue
+    val=$(pip_config_values "$rc" no-deps | tail -n 1)
+    [[ -n "$val" ]] && python_bool_truthy "$val" && return 0
   done
   return 1
 }
@@ -8883,6 +8914,41 @@ private_lane_audit() {
       private_finish 19 private_cooldown \
         "inside this registry's ${cooldown}-day cooldown (published ${published:-at an unknown time})" \
         "wait, or an operator may confirm at an interactive terminal" "$detail_extra"
+      return $?
+    fi
+  fi
+  # Roots-only audit (pre-existing for every root): safe does not audit what a
+  # package manager pulls in beside a named package. The unattended private
+  # allow therefore requires an install that fetches nothing beyond the
+  # checked root (coordinator ruling, review round 1 P5 option A). Project
+  # lanes (lockfile / module-graph sweeps) decide their own entries.
+  if [[ "${PRIVATE_COLLECT:-0}" != 1 && -z "${SAFE_AUDIT_ARTIFACT_LOCKFILE:-}" ]]; then
+    local dep_reason=""
+    case "$ecosystem" in
+      python)
+        if [[ "${CHECK_NO_DEPS_SELECTED:-0}" != 1 ]] && ! python_bool_truthy "${PIP_NO_DEPS:-}" \
+          && ! private_python_config_no_deps; then
+          dep_reason="pip would also install this package's dependencies, which safe does not audit before the install"
+        fi
+        ;;
+      npm|go)
+        local requires_json
+        requires_json=$(jq -c '.requires // null' <<<"${fetch_json:-null}" 2>/dev/null) || requires_json='null'
+        if [[ "$requires_json" == "null" || -z "$requires_json" ]]; then
+          dep_reason="this version's dependency list could not be read, so safe cannot show the install fetches nothing beyond it"
+        elif [[ "$(jq 'length' <<<"$requires_json")" != "0" ]]; then
+          dep_reason="this version declares dependencies ($(jq -r 'join(", ")' <<<"$requires_json")) that the install would fetch without a safe audit"
+        fi
+        ;;
+    esac
+    if [[ -n "$dep_reason" ]]; then
+      local dep_hint
+      case "$ecosystem" in
+        python) dep_hint="install its dependencies first as exact pins (each is audited), then this package with --no-deps; or an operator may confirm at an interactive terminal" ;;
+        npm) dep_hint="install it inside an npm project (the project lane checks the lockfile), or install its dependencies first as exact pins; or an operator may confirm at an interactive terminal" ;;
+        go) dep_hint="build it as a requirement of a Go module (the project lane checks go.mod and go.sum); or an operator may confirm at an interactive terminal" ;;
+      esac
+      private_finish 19 private_dependencies_unaudited "$dep_reason" "$dep_hint" "$detail_extra"
       return $?
     fi
   fi
@@ -9233,7 +9299,7 @@ package_audit_command() {
   # floor; the receipt writer derives evidence identity from it.
   local CHECK_DIST_TAG="" CHECK_REGISTRY="" CHECK_PROJECT_DIR=""
   local CHECK_NPM_USERCONFIG="" CHECK_NPM_GLOBALCONFIG=""
-  local CHECK_EFFECTIVE_SOURCES="" CHECK_INSTALLER="" CHECK_FIND_LINKS_SELECTED=0
+  local CHECK_EFFECTIVE_SOURCES="" CHECK_INSTALLER="" CHECK_FIND_LINKS_SELECTED=0 CHECK_NO_DEPS_SELECTED=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --ecosystem)
@@ -9264,6 +9330,10 @@ package_audit_command() {
         ;;
       --find-links-selected)
         CHECK_FIND_LINKS_SELECTED=1
+        shift
+        ;;
+      --no-deps-selected)
+        CHECK_NO_DEPS_SELECTED=1
         shift
         ;;
       --op)
