@@ -50,11 +50,11 @@ func TestCanonicalOrigin(t *testing.T) {
 
 func TestUnderOriginBoundary(t *testing.T) {
 	cases := map[string]bool{
-		npmOrigin + "/@scope%2fx/-/x-1.0.0.tgz":                     true,
+		npmOrigin + "/@scope%2fx/-/x-1.0.0.tgz":                      true,
 		"https://tok:x@git.example.test:8443/api/packages/owner/npm": true,
-		npmOrigin + "x/evil":                                          false,
-		"https://git.example.test/api/packages/owner/npm/x":           false, // port is identity
-		"https://registry.npmjs.org/@scope/x/-/x-1.0.0.tgz":           false,
+		npmOrigin + "x/evil":                                         false,
+		"https://git.example.test/api/packages/owner/npm/x":          false, // port is identity
+		"https://registry.npmjs.org/@scope/x/-/x-1.0.0.tgz":          false,
 	}
 	for u, want := range cases {
 		if got := UnderOrigin(u, npmOrigin); got != want {
