@@ -374,6 +374,9 @@ safe_gate_run_audit() {
   [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]] && extra+=(--project-dir "${SAFE_GATE_PROJECT_DIR}")
   [[ -n "${SAFE_GATE_NPM_USERCONFIG:-}" ]] && extra+=(--npm-userconfig "${SAFE_GATE_NPM_USERCONFIG}")
   [[ -n "${SAFE_GATE_NPM_GLOBALCONFIG:-}" ]] && extra+=(--npm-globalconfig "${SAFE_GATE_NPM_GLOBALCONFIG}")
+  # The npm lock-diff lane names the projected lockfile so the private-registry
+  # lane can bind each private artifact's resolved origin and integrity.
+  local artifact_lockfile="${SAFE_GATE_ARTIFACT_LOCKFILE:-}"
   local socket_budget fresh_socket_budget audit_leash
   socket_budget="$(safe_gate_socket_budget)"
   fresh_socket_budget="$(safe_gate_socket_fresh_scan_budget)"
@@ -393,6 +396,7 @@ safe_gate_run_audit() {
     {
       SAFE_AUDIT_SOCKET_TIMEOUT="${socket_budget}" \
         SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT="${fresh_socket_budget}" \
+        SAFE_AUDIT_ARTIFACT_LOCKFILE="${artifact_lockfile}" \
         timeout --kill-after=2s "$audit_leash" \
         "${SAFE_GATE_AUDIT_BIN}" package-audit "$@" "${extra[@]}" 2>&3
       rc=$?
@@ -400,6 +404,7 @@ safe_gate_run_audit() {
   else
     SAFE_AUDIT_SOCKET_TIMEOUT="${socket_budget}" \
       SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT="${fresh_socket_budget}" \
+      SAFE_AUDIT_ARTIFACT_LOCKFILE="${artifact_lockfile}" \
       "${SAFE_GATE_AUDIT_BIN}" package-audit "$@" "${extra[@]}"
     rc=$?
   fi
@@ -2602,7 +2607,7 @@ safe_gate_npm_lockdiff_preflight() {
   fi
 
   for package in "${introduced[@]}"; do
-    safe_gate_check "${package}" npm
+    SAFE_GATE_ARTIFACT_LOCKFILE="${scratch}/${lockfile_name}" safe_gate_check "${package}" npm
     rc=$?
     if (( rc != 0 )); then
       rm -rf -- "${scratch}"
@@ -2876,6 +2881,8 @@ safe_gate_confirm_block() {
       safe_gate_err "safe: ${target} is BLOCKED: a known-malware record or a Socket critical supply-chain alert names it. Installing it runs code flagged as malicious; this override is never recorded." ;;
     blocklist)
       safe_gate_err "safe: ${target} is BLOCKED: this host's blocklist names it; this override is never recorded." ;;
+    private)
+      safe_gate_err "safe: ${target} is BLOCKED by its private registry trust: $(jq -r '.block.detail // "integrity or origin mismatch"' "${result}" 2>/dev/null). This override is never recorded; a reviewed re-pin is safe run private-registry pin replace." ;;
     *) return 1 ;;
   esac
   if (( recordable )); then
@@ -2947,7 +2954,7 @@ safe_gate_block_terminus() {
   # version (unresolved, several versions, or no readable result).
   if ! safe_gate_operator_terminal || [[ -z "${result}" || ! -s "${result}" ]] ||
      ! jq -e '(.package | type) == "string" and (.resolved_versions | length) == 1
-       and (.block.class == "advisory" or .block.class == "malware" or .block.class == "blocklist")' "${result}" >/dev/null 2>&1; then
+       and (.block.class == "advisory" or .block.class == "malware" or .block.class == "blocklist" or .block.class == "private")' "${result}" >/dev/null 2>&1; then
     safe_gate_err "safe: BLOCKED ${label} of ${package} — safe audit verdict BLOCK; operator review required: safe audit package-audit ${package} --ecosystem ${ecosystem} --json; details: safe explain"
     safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_BLOCK"
     return 104
@@ -3061,6 +3068,48 @@ safe_gate_confirm_tolerated() {
     return 1
   fi
   [[ "$reply" == "y" || "$reply" == "Y" || "$reply" == "yes" || "$reply" == "YES" ]]
+}
+
+# Private-registry lane outcomes (safe audit gate exits 18/19). 18 is the
+# operator's standing registry authorization plus a matching integrity pin:
+# it installs unattended and logs the registry, origin, artifact and
+# integrity. 19 needs an operator decision: a deliberate per-install
+# confirmation at an interactive terminal, 102 everywhere else — never a
+# host-allow hint (host-allow cannot express private-registry trust).
+safe_gate_private_terminus() {
+  local code="$1" package="$2" ecosystem="$3" label="$4" result="$5"
+  local detail="" hint="" extra="" reply=""
+  if [[ -n "${result}" && -s "${result}" ]]; then
+    detail="$(jq -r '.private_registry.detail // empty' "${result}" 2>/dev/null)" || detail=""
+    hint="$(jq -r '.private_registry.hint // empty' "${result}" 2>/dev/null)" || hint=""
+    extra="$(jq -r '.private_registry.audit_extra // empty' "${result}" 2>/dev/null)" || extra=""
+  fi
+  if [[ "${code}" == 18 ]]; then
+    if [[ -z "${extra}" ]]; then
+      # An allow without its evidence line is not an allow: the audit line
+      # naming artifact and integrity is part of the contract.
+      safe_gate_err "safe: BLOCKED ${label} of ${package} — the private-registry decision carried no evidence (audit-infrastructure breakage, not a package finding); rerun install.sh; details: safe explain"
+      safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_AUDIT_INFRA"
+      return 100
+    fi
+    safe_gate_audit_log "${ecosystem}" "${package}" "ALLOWED_VIA_PRIVATE_REGISTRY" "${extra}"
+    return 0
+  fi
+  if ! safe_gate_operator_terminal; then
+    safe_gate_err "safe: BLOCKED ${label} of ${package} — ${detail:-the private registry trust needs an operator decision}; ${hint:+${hint}; }details: safe explain"
+    safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_PRIVATE_NONTTY" "$(jq -r '.private_registry.decision // empty' "${result}" 2>/dev/null)"
+    return 102
+  fi
+  safe_gate_err "safe: ${package}: ${detail:-the private registry trust needs an operator decision}"
+  [[ -n "${hint}" ]] && safe_gate_err "safe: ${hint}"
+  printf 'safe: install this once anyway? [y/N] ' >&2
+  if IFS= read -r reply </dev/tty && [[ "$reply" == "y" || "$reply" == "Y" || "$reply" == "yes" || "$reply" == "YES" ]]; then
+    safe_gate_audit_log "${ecosystem}" "${package}" "PRIVATE_TTY_OVERRIDE" "$(jq -r '.private_registry.decision // empty' "${result}" 2>/dev/null)"
+    return 0
+  fi
+  safe_gate_err "safe: BLOCKED ${label} of ${package} — private registry decision declined; details: safe explain"
+  safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_PRIVATE_DECLINED"
+  return 100
 }
 
 # Check one package via safe audit's install gate.
@@ -3253,6 +3302,10 @@ safe_gate_check() {
       # its own decision token. The audit named origin and signer.
       safe_gate_audit_log "${ecosystem}" "${package}" "ALLOWED_VIA_FOLLOWED_GRANT"
       return 0
+      ;;
+    18|19)
+      safe_gate_private_terminus "${audit_status}" "${package}" "${ecosystem}" "${ecosystem} install" "${result_out}"
+      return $?
       ;;
     17|2|20)
       # BLOCK (rulings 2026-09-30). No allow hint: host-allow never clears a
@@ -4608,6 +4661,51 @@ safe_gate_cargo() {
   safe_gate_exec_real cargo "$@"
 }
 
+# Go project lane of the private-registry trust: go.sum entries for modules on
+# a private registry must match their pinned hashes (GONOSUMDB modules are
+# otherwise trust-on-first-use in go.sum alone). Public modules stay with
+# go's checksum database and the project scan. Exit 18 logs one audit line
+# per private module; 19/20 reach the same termini as a package audit.
+safe_gate_private_gosum() {
+  local project_dir="${SAFE_GATE_PROJECT_DIR:-.}" result_out="" rc=0 line package extra
+  [[ -f "${project_dir}/go.sum" ]] || return 0
+  # Fast path: no private-registry trust anywhere means nothing to check.
+  local d any_store=0
+  for d in "$HOME/.config/safe/run" "$(safe_gate_run_config_dir)"; do
+    [[ -s "${d}/private-registries.json" || -s "${d}/private-follow-state.json" ]] && any_store=1
+  done
+  (( any_store )) || return 0
+  safe_gate_audit_available || return 0
+  result_out="$(mktemp "${TMPDIR:-/tmp}/safe-gate-result.XXXXXX")" || result_out=""
+  SAFE_AUDIT_RESULT_OUT="${result_out}" "${SAFE_GATE_AUDIT_BIN}" private-gosum --project-dir "${project_dir}" --gate install
+  rc=$?
+  case "${rc}" in
+    0) ;;
+    18)
+      while IFS=$'\t' read -r package extra; do
+        [[ -n "${package}" ]] || continue
+        safe_gate_audit_log go "${package}" "ALLOWED_VIA_PRIVATE_REGISTRY" "${extra}"
+      done < <(jq -r '.private_registry_lines[]? | [.package, .extra] | @tsv' "${result_out}" 2>/dev/null)
+      rc=0
+      ;;
+    19)
+      safe_gate_private_terminus 19 "$(jq -r '"\(.package)@\(.resolved_versions[0])"' "${result_out}" 2>/dev/null)" go "go ${SAFE_GATE_SUBCMD}" "${result_out}"
+      rc=$?
+      ;;
+    20)
+      safe_gate_block_terminus 20 "$(jq -r '"\(.package)@\(.resolved_versions[0])"' "${result_out}" 2>/dev/null)" go "go ${SAFE_GATE_SUBCMD}" "${result_out}"
+      rc=$?
+      ;;
+    *)
+      safe_gate_err "safe: BLOCKED go ${SAFE_GATE_SUBCMD} — the private-registry go.sum check could not run (audit-infrastructure breakage, not a package finding); rerun install.sh or run safe doctor; details: safe explain"
+      safe_gate_audit_log go "go.sum" "REFUSED_AUDIT_INFRA"
+      rc=100
+      ;;
+  esac
+  [[ -z "${result_out}" ]] || rm -f -- "${result_out}"
+  return "${rc}"
+}
+
 safe_gate_go() {
   safe_gate_route go "$@" || return $?
   safe_gate_scan_target_flags go "$@"
@@ -4664,6 +4762,7 @@ safe_gate_go() {
     if [[ "${subcommand}" == "build" || "${subcommand}" == "test" ||
           ( "${subcommand}" == "mod" && ( "${second}" == "download" || "${second}" == "tidy" ) ) ]]; then
       if safe_gate_go_project_present; then
+        safe_gate_private_gosum || return $?
         safe_gate_scan_project || return $?
       fi
     fi

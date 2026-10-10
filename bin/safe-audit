@@ -8239,6 +8239,692 @@ gate_warn_is_infra_only() {
     <<<"$1" >/dev/null 2>&1
 }
 
+# ---------------------------------------------------------------------------
+# Private registry lane (operator-managed trust for owner-controlled private
+# registries). A package whose name the operator declared private — a
+# registry in private-registries.json, or one followed from a signed fleet
+# statement whose signer is still pinned — never reaches public evidence
+# (OSV, Socket, public publish dates): those describe a public namesake, and
+# querying them leaks the private name. Instead the lane binds the install to
+# the registry's canonical origin and to the integrity pinned for the exact
+# version (recorded on first use, or by the operator), and decides:
+#
+#   gate 18  ALLOWED_VIA_PRIVATE_REGISTRY — unattended proceed, never GO;
+#   gate 19  an operator decision is needed (TTY confirm, 102 unattended):
+#            conflicting registries, operator pin missing, non-exact version,
+#            version not on the registry, credentials missing, registry
+#            unreachable, inside the registry's cooldown;
+#   gate 20  BLOCK class "private" (typed override at a TTY, 104 unattended):
+#            changed bytes for a pinned version, a revoked version, signed
+#            pins that disagree, or the artifact coming from another source
+#            than the private origin (cross-registry substitution).
+#
+# The decision core is safe-core private-trust (internal/privtrust). Safe
+# never reads, stores or forwards a registry credential: npm reads its own
+# .npmrc, go its GOAUTH, and curl its ~/.netrc (or the operator's own index
+# URL), and no client stderr is echoed.
+# ---------------------------------------------------------------------------
+
+PRIVATE_POLICY_BASE="private-registries.json"
+PRIVATE_PINS_BASE="private-pins.json"
+PRIVATE_FOLLOW_BASE="private-follow-state.json"
+
+private_stores_present() {
+  local base
+  for base in "$PRIVATE_POLICY_BASE" "$PRIVATE_FOLLOW_BASE"; do
+    [[ -s "$(trust_store_file "$base")" ]] && return 0
+  done
+  return 1
+}
+
+# The verdict engine binary, version-pinned exactly like package-verdict.
+private_core_bin() {
+  local bin="${SAFE_CORE_BIN:-}" reported
+  [[ -n "$bin" ]] || bin="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/safe-core"
+  [[ -x "$bin" ]] || return 1
+  reported=$("$bin" --version 2>/dev/null) || return 1
+  [[ "$reported" == "${SAFE_VERSION}" ]] || return 1
+  printf '%s' "$bin"
+}
+
+# private_core <bin> <subcommand> [flags...]: the store flags are always the
+# guard-selected trust root.
+private_core() {
+  local bin="$1" sub="$2"
+  shift 2
+  "$bin" private-trust "$sub" \
+    --policy "$(trust_store_file "$PRIVATE_POLICY_BASE")" \
+    --pins "$(trust_store_file "$PRIVATE_PINS_BASE")" \
+    --follow-state "$(trust_store_file "$PRIVATE_FOLLOW_BASE")" \
+    --config "$(trust_store_file config.json)" "$@"
+}
+
+# First executable <tool> on PATH that is not a safe gate wrapper: the
+# private fetchers run the ecosystem's own client for its credential lookup
+# and must never re-enter the gate.
+private_real_tool() {
+  local tool="$1" dir candidate line i
+  local -a dirs=()
+  IFS=':' read -r -a dirs <<<"${PATH}"
+  for dir in "${dirs[@]}"; do
+    [[ -n "$dir" ]] || dir="."
+    candidate="$dir/$tool"
+    [[ -f "$candidate" && -x "$candidate" ]] || continue
+    i=0
+    while (( i < 2 )) && IFS= read -r line; do
+      i=$((i + 1))
+      [[ "$line" == *'# safe-gate-wrapper'* ]] && continue 2
+    done < <(LC_ALL=C head -c 4096 -- "$candidate" 2>/dev/null | tr -d '\0')
+    printf '%s' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+private_python_norm() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[-_.]+/-/g'
+}
+
+# Fetchers print {integrity, artifact, published} and return:
+#   0 ok; 41 credentials missing/refused; 42 unreachable or client failure;
+#   43 version not on the registry; 44 artifact outside the origin;
+#   45 integrity unusable; 46 client missing.
+private_fetch_npm() {
+  local core="$1" name="$2" version="$3" origin="$4" scratch="$5"
+  local npm_bin scope="${name%%/*}" rc=0 tarball sri published
+  npm_bin=$(private_real_tool npm) || return 46
+  (
+    cd -- "${CHECK_PROJECT_DIR:-.}" 2>/dev/null || cd -- "$HOME" || exit 42
+    timeout 30 "$npm_bin" view "${name}@${version}" version dist time --json \
+      "--registry=${origin}/" "--${scope}:registry=${origin}/"
+  ) >"$scratch/private-npm.json" 2>"$scratch/private-npm.err" || rc=$?
+  if (( rc != 0 )); then
+    if grep -Eq 'E401|E403|ENEEDAUTH|[Uu]nauthorized|[Ff]orbidden' "$scratch/private-npm.err" 2>/dev/null; then
+      return 41
+    elif grep -Eq 'E404|[Nn]ot [Ff]ound|ETARGET|No match found' "$scratch/private-npm.err" 2>/dev/null; then
+      return 43
+    fi
+    return 42
+  fi
+  [[ "$(jq -r 'if type == "object" then (.version // "") else "" end' "$scratch/private-npm.json" 2>/dev/null)" == "$version" ]] || return 43
+  tarball=$(jq -r '.dist.tarball // empty | strings' "$scratch/private-npm.json" 2>/dev/null) || tarball=""
+  sri=$(jq -r '.dist.integrity // empty | strings' "$scratch/private-npm.json" 2>/dev/null) || sri=""
+  [[ -n "$tarball" ]] || return 45
+  "$core" private-trust under-origin --url "$tarball" --origin "$origin" >/dev/null 2>&1 || return 44
+  [[ -n "$sri" ]] || return 45
+  published=$(jq -r --arg v "$version" '.time[$v] // empty | strings' "$scratch/private-npm.json" 2>/dev/null) || published=""
+  jq -cn --arg sri "$sri" --arg artifact "$(canonicalize_source "$tarball")" --arg published "$published" \
+    '{integrity: {sri: $sri}, artifact: $artifact, published: $published}'
+}
+
+# The index to read for a private python origin: the operator's own effective
+# index URL under that origin (it may carry the credentials pip uses), else
+# the origin's simple API.
+private_python_index() {
+  local core="$1" origin="$2" src url
+  for src in ${CHECK_EFFECTIVE_SOURCES:-}; do
+    url=$(source_element_url "$src")
+    if "$core" private-trust under-origin --url "$url" --origin "$origin" >/dev/null 2>&1; then
+      printf '%s' "${url%/}"
+      return 0
+    fi
+  done
+  printf '%s/simple' "$origin"
+}
+
+private_fetch_python() {
+  local core="$1" name="$2" version="$3" origin="$4" scratch="$5"
+  local index norm code ctype files='{}' published="" fname href hash uploaded dist ver base
+  index=$(private_python_index "$core" "$origin")
+  norm=$(private_python_norm "$name")
+  code=$(curl -sS --netrc-optional --max-time 10 \
+    -H 'Accept: application/vnd.pypi.simple.v1+json, text/html;q=0.1' \
+    -o "$scratch/private-py.body" -D "$scratch/private-py.hdr" -w '%{http_code}' \
+    "${index}/${norm}/" 2>/dev/null) || code="000"
+  case "$code" in
+    200) ;;
+    401|403) return 41 ;;
+    404|410) return 43 ;;
+    *) return 42 ;;
+  esac
+  ctype=$(grep -i '^content-type:' "$scratch/private-py.hdr" 2>/dev/null | tail -n 1 | tr -d '\r')
+  : >"$scratch/private-py.rows"
+  if [[ "${ctype,,}" == *"application/vnd.pypi.simple.v1+json"* ]]; then
+    jq -r '.files[]? | [(.filename // ""), (.url // ""), (.hashes.sha256 // ""), (."upload-time" // "")] | @tsv' \
+      "$scratch/private-py.body" >"$scratch/private-py.rows" 2>/dev/null || return 45
+  else
+    # PEP 503 HTML: <a href="URL#sha256=HEX" ...>FILENAME</a>
+    grep -oE '<a [^>]*href="[^"]*"[^>]*>[^<]*</a>' "$scratch/private-py.body" 2>/dev/null \
+      | while IFS= read -r line; do
+          href=$(sed -E 's/.*href="([^"]*)".*/\1/' <<<"$line")
+          fname=$(sed -E 's/.*>([^<]*)<\/a>$/\1/' <<<"$line")
+          hash=""
+          [[ "$href" == *"#sha256="* ]] && hash="${href##*#sha256=}"
+          printf '%s\t%s\t%s\t\n' "$fname" "${href%%#*}" "$hash"
+        done >"$scratch/private-py.rows"
+  fi
+  local scheme_host
+  scheme_host=$(sed -E 's#^([a-zA-Z]+://[^/]+).*#\1#' <<<"$index")
+  while IFS=$'\t' read -r fname href hash uploaded; do
+    [[ -n "$fname" ]] || continue
+    case "$fname" in
+      *.whl) base="${fname%.whl}"; dist="${base%%-*}"; ver="${base#*-}"; ver="${ver%%-*}" ;;
+      *.tar.gz) base="${fname%.tar.gz}"; dist="${base%-*}"; ver="${base##*-}" ;;
+      *.zip) base="${fname%.zip}"; dist="${base%-*}"; ver="${base##*-}" ;;
+      *) continue ;;
+    esac
+    [[ "$(private_python_norm "$dist")" == "$norm" && "$ver" == "$version" ]] || continue
+    case "$href" in
+      http://*|https://*) ;;
+      /*) href="${scheme_host}${href}" ;;
+      *) href="${index}/${norm}/${href}" ;;
+    esac
+    "$core" private-trust under-origin --url "$href" --origin "$origin" >/dev/null 2>&1 || return 44
+    [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]] || return 45
+    files=$(jq -c --arg f "$fname" --arg h "${hash,,}" '. + {($f): $h}' <<<"$files") || return 45
+    [[ -n "$uploaded" && "$uploaded" > "$published" ]] && published="$uploaded"
+  done <"$scratch/private-py.rows"
+  [[ "$files" != "{}" ]] || return 43
+  jq -cn --argjson files "$files" --arg artifact "$(canonicalize_source "${index}/${norm}/")" --arg published "$published" \
+    '{integrity: {files: $files}, artifact: $artifact, published: $published}'
+}
+
+# Ask go itself for the module hashes, through the private origin only. The
+# credentials stay go's (GOAUTH, default netrc); the cache is a scratch one.
+private_fetch_go() {
+  local core="$1" module="$2" version="$3" origin="$4" scratch="$5"
+  local go_bin rc=0 err sum gomodsum published info
+  go_bin=$(private_real_tool go) || return 46
+  mkdir -p "$scratch/private-go/work"
+  (
+    cd -- "$scratch/private-go/work" || exit 42
+    env GOPROXY="$origin" GONOSUMDB="$module" GOPRIVATE= GONOPROXY= GOINSECURE= \
+      GOFLAGS=-modcacherw GOMODCACHE="$scratch/private-go/modcache" GOPATH="$scratch/private-go/path" \
+      GOTOOLCHAIN=local GOWORK=off GO111MODULE=on \
+      timeout 60 "$go_bin" mod download -json "${module}@${version}"
+  ) >"$scratch/private-go.json" 2>"$scratch/private-go.err" || rc=$?
+  err=$(jq -r '.Error // empty' "$scratch/private-go.json" 2>/dev/null) || err=""
+  if (( rc != 0 )) || [[ -n "$err" ]]; then
+    { printf '%s\n' "$err"; cat "$scratch/private-go.err"; } >"$scratch/private-go.why" 2>/dev/null
+    if grep -Eq '401|403|[Uu]nauthorized|[Ff]orbidden|terminal prompts disabled' "$scratch/private-go.why"; then
+      return 41
+    elif grep -Eq '404|410|[Nn]ot [Ff]ound|unknown revision|invalid version' "$scratch/private-go.why"; then
+      return 43
+    fi
+    return 42
+  fi
+  [[ "$(jq -r '.Version // empty' "$scratch/private-go.json")" == "$version" ]] || return 43
+  sum=$(jq -r '.Sum // empty' "$scratch/private-go.json")
+  gomodsum=$(jq -r '.GoModSum // empty' "$scratch/private-go.json")
+  [[ -n "$sum" && -n "$gomodsum" ]] || return 45
+  info=$(jq -r '.Info // empty' "$scratch/private-go.json")
+  published=""
+  [[ -n "$info" && -f "$info" ]] && published=$(jq -r '.Time // empty' "$info" 2>/dev/null)
+  jq -cn --arg h1 "$sum" --arg mod "$gomodsum" --arg artifact "${module}@${version}" --arg published "$published" \
+    '{integrity: {h1: $h1, mod: $mod}, artifact: $artifact, published: $published}'
+}
+
+private_fetch() {
+  local ecosystem="$1"
+  shift
+  case "$ecosystem" in
+    npm) private_fetch_npm "$@" ;;
+    python) private_fetch_python "$@" ;;
+    go) private_fetch_go "$@" ;;
+    *) return 42 ;;
+  esac
+}
+
+# Python dependency-confusion guard: every other index pip may consult —
+# effective sources outside the origin, plus PyPI, which pip adds unless the
+# default index was replaced and safe cannot always tell — must NOT serve the
+# private name. Returns 0 clean, 44 shadowed (PRIVATE_SHADOW names where),
+# 42 a probe could not answer.
+private_python_shadow_check() {
+  local core="$1" name="$2" origin="$3" norm src url code
+  local -a probes=()
+  norm=$(private_python_norm "$name")
+  PRIVATE_SHADOW=""
+  for src in ${CHECK_EFFECTIVE_SOURCES:-}; do
+    url=$(source_element_url "$src")
+    "$core" private-trust under-origin --url "$url" --origin "$origin" >/dev/null 2>&1 && continue
+    case "$url" in
+      http://*|https://*) probes+=("${url%/}") ;;
+      *) PRIVATE_SHADOW=$(canonicalize_source "$url"); return 44 ;;
+    esac
+  done
+  probes+=("https://pypi.org/simple")
+  local seen="" p
+  for p in "${probes[@]}"; do
+    [[ " $seen " == *" $p "* ]] && continue
+    seen="$seen $p"
+    code=$(curl -sS --netrc-optional --max-time 10 -o /dev/null -w '%{http_code}' "${p}/${norm}/" 2>/dev/null) || code="000"
+    case "$code" in
+      404|410) ;;
+      200) PRIVATE_SHADOW=$(canonicalize_source "$p"); return 44 ;;
+      *) PRIVATE_SHADOW=$(canonicalize_source "$p"); return 42 ;;
+    esac
+  done
+  return 0
+}
+
+# Whole days since an ISO instant; empty when unparseable.
+private_age_days() {
+  local ts="$1" then now
+  [[ -n "$ts" ]] || return 1
+  then=$(date -d "$ts" +%s 2>/dev/null) || return 1
+  now=$(date +%s)
+  printf '%s' $(( (now - then) / 86400 ))
+}
+
+# Emit the lane outcome. $1 = gate code (18 allow, 19 operator, 20 block),
+# $2 = decision token, $3 = human detail, $4 = hint, $5 = JSON extra.
+private_finish() {
+  local code="$1" decision="$2" detail="$3" hint="$4" extra_json="${5:-}"
+  local version="${PKG_VERSION}" result
+  [[ -n "$extra_json" ]] || extra_json='{}'
+  result=$(jq -cn --arg pkg "$PKG_NAME" --arg v "$version" --arg eco "$PRIVATE_ECO" \
+    --arg decision "$decision" --arg detail "$detail" --arg hint "$hint" \
+    --argjson code "$code" --argjson extra "$extra_json" '
+    {package: $pkg, ecosystem: $eco, resolved_versions: [$v],
+     verdict: (if $code == 18 then "PRIVATE" elif $code == 20 then "BLOCK" else "WARN" end),
+     private_registry: ({decision: $decision, detail: $detail, hint: $hint} + $extra)}
+    + (if $code == 20 then {block: {class: "private", detail: $detail}} else {} end)') || result='{}'
+  local audit_log_file="${SAFE_AUDIT_AUDIT_LOG:-$DATA_DIR/audit-log.jsonl}"
+  if mkdir -p "$(dirname "$audit_log_file")" 2>/dev/null; then
+    jq -c --arg ts "$(now_iso)" --arg safe_version "${SAFE_VERSION}" \
+      '{ts: $ts, event: "private_registry", safe_version: $safe_version} + .' <<<"$result" >> "$audit_log_file" 2>/dev/null || true
+  fi
+  if (( code == 18 )); then
+    printf '[safe audit] ALLOWED_VIA_PRIVATE_REGISTRY: %s@%s — %s\n' "$PKG_NAME" "$version" "$detail" >&2
+    if [[ "${PRIVATE_COLLECT:-0}" == "1" ]]; then
+      PRIVATE_COLLECTED+=("$(jq -c '{package: (.package + "@" + .resolved_versions[0]), extra: .private_registry.audit_extra}' <<<"$result")")
+      return 18
+    fi
+  else
+    printf 'safe audit: %s@%s — %s\n' "$PKG_NAME" "$version" "$detail" >&2
+    [[ -n "$hint" ]] && printf 'safe audit: %s\n' "$hint" >&2
+  fi
+  if [[ "$PRIVATE_GATE" == "install" ]]; then
+    if [[ -n "${SAFE_AUDIT_RESULT_OUT:-}" ]]; then
+      jq --argjson gate_exit "$code" '. + {gate_exit: $gate_exit}' <<<"$result" > "$SAFE_AUDIT_RESULT_OUT" 2>/dev/null \
+        || rm -f -- "$SAFE_AUDIT_RESULT_OUT"
+    fi
+    return "$code"
+  fi
+  if [[ "$PRIVATE_JSON" == "1" ]]; then
+    printf '%s\n' "$result"
+  else
+    printf '[safe audit] checking %s@%s (%s, private registry)\n\nVERDICT: %s\n' "$PKG_NAME" "$version" "$PRIVATE_ECO" \
+      "$(jq -r '.verdict' <<<"$result")"
+  fi
+  case "$code" in
+    18) return 0 ;;
+    20) return 20 ;;
+    *) return 10 ;;
+  esac
+}
+
+# Fetch-failure codes to lane outcomes.
+private_fetch_failed() {
+  local rc="$1" origin="$2"
+  case "$rc" in
+    41) private_finish 19 private_registry_auth_missing \
+          "the private registry ${origin} refused the request (credentials missing or rejected) — audit-infrastructure breakage, not a package finding" \
+          "configure the package manager's own credentials for that origin (npm: .npmrc token; go: GOAUTH/~/.netrc; pip: ~/.netrc or the index URL), then retry; an operator may confirm at an interactive terminal" ;;
+    43) private_finish 19 private_version_missing \
+          "this exact version is not published on the private registry ${origin}" \
+          "check the version, or publish it first" ;;
+    44) private_finish 20 private_cross_registry \
+          "the private registry ${origin} points this artifact at another source" \
+          "fix the registry entry; an operator may type the override at an interactive terminal" ;;
+    45) private_finish 19 private_integrity_unusable \
+          "the private registry ${origin} returned no usable integrity for this version" \
+          "republish with integrity metadata (npm sha512, python sha256)" ;;
+    *) private_finish 19 private_registry_unreachable \
+          "the private registry ${origin} could not be reached (or its client is missing) — audit-infrastructure breakage, not a package finding" \
+          "retry when the registry is reachable; an operator may confirm at an interactive terminal" ;;
+  esac
+}
+
+# npm lock-diff lane: every occurrence of name@version in the projected
+# lockfile (aliases included) must come from the origin with one integrity.
+# Prints {sri} or returns 44 (outside origin / disagreeing) / 45 (no integrity).
+private_npm_lockfile_observed() {
+  local core="$1" name="$2" version="$3" origin="$4" lockfile="$5" rows resolved integrity sri=""
+  rows=$(jq -r --arg n "$name" --arg v "$version" '
+    .packages // {} | to_entries[]
+    | select(.key | test("node_modules/"))
+    | select((.value.link // false) | not)
+    | select(((.value.name // (.key | sub(".*node_modules/"; ""))) == $n) and (.value.version == $v))
+    | [(.value.resolved // ""), (.value.integrity // "")] | @tsv' "$lockfile" 2>/dev/null) || return 45
+  [[ -n "$rows" ]] || return 45
+  while IFS=$'\t' read -r resolved integrity; do
+    "$core" private-trust under-origin --url "$resolved" --origin "$origin" >/dev/null 2>&1 || return 44
+    [[ -n "$integrity" ]] || return 45
+    if [[ -z "$sri" ]]; then
+      sri="$integrity"
+    elif [[ "$sri" != "$integrity" ]]; then
+      return 44
+    fi
+  done <<<"$rows"
+  jq -cn --arg sri "$sri" '{sri: $sri}'
+}
+
+# Returns 255 when PKG_NAME is not on the private lane; otherwise the
+# package-audit exit for this decision.
+private_lane_audit() {
+  PRIVATE_ECO="$1"
+  PRIVATE_GATE="$2"
+  PRIVATE_JSON="$3"
+  local scratch="$4" ecosystem="$1"
+  case "$ecosystem" in npm|go|python) ;; *) return 255 ;; esac
+  private_stores_present || return 255
+  trust_grant_ok "private-registry" || return 255
+  local core match lane origin pin_mode cooldown ids
+  if ! core=$(private_core_bin); then
+    printf 'safe audit: private-registry decision engine missing or version-skewed — audit-infrastructure breakage, not a package finding; rerun install.sh\n' >&2
+    return 30
+  fi
+  if ! match=$(private_core "$core" match --ecosystem "$ecosystem" --name "$PKG_NAME" 2>"$scratch/private-core.err"); then
+    printf 'safe audit: the private-registry trust stores are malformed (%s) — repair them at an operator terminal; nothing was decided\n' \
+      "$(head -n 1 "$scratch/private-core.err" | sed 's/^safe-core: //')" >&2
+    return 30
+  fi
+  lane=$(jq -r '.lane' <<<"$match")
+  case "$lane" in
+    private) ;;
+    conflict)
+      private_finish 19 private_registry_conflict \
+        "two trusted sources declare this name private on different origins ($(jq -r '.origins | join(", ")' <<<"$match"))" \
+        "remove one registry (safe run private-registry list) or fix the publishing origin; an operator may confirm one install at an interactive terminal"
+      return $?
+      ;;
+    *) return 255 ;;
+  esac
+  origin=$(jq -r '.origin' <<<"$match")
+  pin_mode=$(jq -r '.pin_mode' <<<"$match")
+  cooldown=$(jq -r '.cooldown_days' <<<"$match")
+  ids=$(jq -r '.registry_ids | join(",")' <<<"$match")
+  local base_extra
+  base_extra=$(jq -c --arg origin "$origin" '{origin: $origin, registry: (.registry_ids | join(",")), pin_mode: .pin_mode,
+    cooldown_days: .cooldown_days, sources: [.sources[] | (.kind + (if .host then ":" + .host else "" end))]}' <<<"$match")
+
+  if [[ -z "$PKG_VERSION" || "$PKG_VERSION" == "latest" ]] || ! version_is_exact "$ecosystem" "$PKG_VERSION"; then
+    private_finish 19 private_version_not_exact "private packages install by exact version only" \
+      "pin one exact version (no ranges, tags or latest)" "$base_extra"
+    return $?
+  fi
+  [[ "$ecosystem" == "npm" ]] && PKG_VERSION="${PKG_VERSION#v}"
+  local block_reason
+  if blocklist_authority_readable && block_reason=$(blocked_entry_reason "$PKG_NAME"); then
+    private_finish 20 blocklist "this host's blocklist names it (${block_reason})" "" "$base_extra"
+    return $?
+  fi
+
+  # --- source binding, before any fetch. A caller that already holds the
+  # artifact identity the manager will install (go.sum) hands it in.
+  local observed="${PRIVATE_OBSERVED:-}" rc=0
+  case "$ecosystem" in
+    npm)
+      local reg
+      reg=$(npm_registry_url "$PKG_NAME")
+      if ! "$core" private-trust under-origin --url "$reg" --origin "$origin" >/dev/null 2>&1; then
+        private_finish 20 private_cross_registry \
+          "npm would fetch this private name from $(canonicalize_source "$reg"), not from its private registry ${origin}" \
+          "map the scope to the private registry (${PKG_NAME%%/*}:registry=${origin}/); an operator may type the override at an interactive terminal" "$base_extra"
+        return $?
+      fi
+      if [[ -n "${SAFE_AUDIT_ARTIFACT_LOCKFILE:-}" && -f "${SAFE_AUDIT_ARTIFACT_LOCKFILE}" ]]; then
+        observed=$(private_npm_lockfile_observed "$core" "$PKG_NAME" "$PKG_VERSION" "$origin" "$SAFE_AUDIT_ARTIFACT_LOCKFILE") || rc=$?
+        if (( rc == 44 )); then
+          private_finish 20 private_cross_registry \
+            "the lockfile resolves this private name outside ${origin}, or with disagreeing integrity" \
+            "regenerate the lockfile against the private registry; an operator may type the override at an interactive terminal" "$base_extra"
+          return $?
+        elif (( rc != 0 )); then
+          observed=""
+        fi
+      fi
+      ;;
+    python)
+      local src under=0
+      for src in ${CHECK_EFFECTIVE_SOURCES:-}; do
+        "$core" private-trust under-origin --url "$(source_element_url "$src")" --origin "$origin" >/dev/null 2>&1 && under=1
+      done
+      if (( ! under )); then
+        private_finish 20 private_cross_registry \
+          "no index serving the private registry ${origin} is configured, so pip would resolve this private name elsewhere" \
+          "install with --index-url ${origin}/simple (or the matching pip config); an operator may type the override at an interactive terminal" "$base_extra"
+        return $?
+      fi
+      rc=0
+      private_python_shadow_check "$core" "$PKG_NAME" "$origin" || rc=$?
+      if (( rc == 44 )); then
+        private_finish 20 private_cross_registry \
+          "${PRIVATE_SHADOW} also serves this private name — pip could install that one instead (dependency confusion)" \
+          "rename the package or drop that index for this install; an operator may type the override at an interactive terminal" "$base_extra"
+        return $?
+      elif (( rc != 0 )); then
+        private_finish 19 private_registry_unreachable \
+          "could not confirm that ${PRIVATE_SHADOW} does not serve this private name — audit-infrastructure breakage, not a package finding" \
+          "retry when the index is reachable; an operator may confirm at an interactive terminal" "$base_extra"
+        return $?
+      fi
+      ;;
+    go)
+      local go_bin goenv route
+      if go_bin=$(private_real_tool go) && goenv=$("$go_bin" env -json GOPROXY GONOPROXY GOPRIVATE 2>/dev/null); then
+        route=$("$core" private-trust go-route --module "$PKG_NAME" --origin "$origin" \
+          --goproxy "$(jq -r '.GOPROXY // ""' <<<"$goenv")" --gonoproxy "$(jq -r '.GONOPROXY // ""' <<<"$goenv")" \
+          --goprivate "$(jq -r '.GOPRIVATE // ""' <<<"$goenv")" 2>/dev/null) || route=""
+        if [[ "$(jq -r '.ok // false' <<<"$route" 2>/dev/null)" != "true" ]]; then
+          private_finish 20 private_cross_registry \
+            "go would not fetch this module from its private registry: $(jq -r '.reason // "unreadable go environment"' <<<"$route" 2>/dev/null)" \
+            "set GOPROXY=${origin},https://proxy.golang.org,direct and GONOSUMDB to the module prefix (not GOPRIVATE); an operator may type the override at an interactive terminal" "$base_extra"
+          return $?
+        fi
+      else
+        private_finish 19 private_registry_unreachable "the go toolchain could not be queried — audit-infrastructure breakage, not a package finding" \
+          "retry; an operator may confirm at an interactive terminal" "$base_extra"
+        return $?
+      fi
+      ;;
+  esac
+
+  # --- decide; fetch from the origin only when the decision needs it
+  local decision_json="" decision="" fetched="" fetch_json="" artifact="" published=""
+  if [[ -n "$observed" ]]; then
+    decision_json=$(private_core "$core" decide --ecosystem "$ecosystem" --name "$PKG_NAME" --version "$PKG_VERSION" \
+      --observed "$observed" 2>/dev/null) || decision_json=""
+    decision=$(jq -r '.decision.decision // empty' <<<"$decision_json" 2>/dev/null)
+  fi
+  if [[ "${decision:-}" != "matched" ]] || (( cooldown > 0 )); then
+    rc=0
+    fetch_json=$(private_fetch "$ecosystem" "$core" "$PKG_NAME" "$PKG_VERSION" "$origin" "$scratch") || rc=$?
+    if (( rc != 0 )); then
+      private_fetch_failed "$rc" "$origin"
+      return $?
+    fi
+    fetched=$(jq -c '.integrity' <<<"$fetch_json")
+    artifact=$(jq -r '.artifact // ""' <<<"$fetch_json")
+    published=$(jq -r '.published // ""' <<<"$fetch_json")
+    local -a fetched_arg=()
+    if [[ -n "$observed" ]]; then
+      fetched_arg=(--fetched "$fetched")
+    else
+      observed="$fetched"
+    fi
+    decision_json=$(private_core "$core" decide --ecosystem "$ecosystem" --name "$PKG_NAME" --version "$PKG_VERSION" \
+      --observed "$observed" "${fetched_arg[@]}" 2>"$scratch/private-core.err") || decision_json=""
+    decision=$(jq -r '.decision.decision // empty' <<<"$decision_json" 2>/dev/null)
+  fi
+  [[ -n "$artifact" ]] || artifact=$(jq -r '.pin.artifact // empty' <<<"$decision_json" 2>/dev/null)
+  local integrity_label pin_label="matched"
+  integrity_label=$(jq -r '.decision.observed // {} | [(.sri // empty), (if .h1 then .h1 else empty end),
+    (if .mod then "mod=" + .mod else empty end), ((.files // {}) | to_entries[] | .key + "=sha256:" + .value)] | join(",")' \
+    <<<"$decision_json" 2>/dev/null) || integrity_label=""
+  local detail_extra
+  detail_extra=$(jq -c --arg artifact "$artifact" --arg integrity "$integrity_label" '. + {artifact: $artifact, integrity: $integrity}' <<<"$base_extra")
+
+  case "$decision" in
+    matched)
+      pin_label="matched:$(jq -r '.decision.pinned_by // ""' <<<"$decision_json")"
+      [[ "$(jq -r '.decision.pin_source.kind // ""' <<<"$decision_json")" == "followed" ]] \
+        && pin_label="${pin_label}:followed:$(jq -r '.decision.pin_source.host' <<<"$decision_json")"
+      ;;
+    tofu)
+      local record written
+      record=$("$core" private-trust record --pins "$(trust_store_file "$PRIVATE_PINS_BASE")" --ecosystem "$ecosystem" \
+        --origin "$origin" --name "$PKG_NAME" --version "$PKG_VERSION" --integrity "${fetched:-$observed}" \
+        --artifact "$artifact" --mode tofu 2>"$scratch/private-core.err") || record=""
+      written=$(jq -r '.written // empty' <<<"$record" 2>/dev/null)
+      if [[ "$written" == "true" ]]; then
+        pin_label="tofu-new"
+      elif [[ "$written" == "false" ]] \
+        && [[ "$(private_core "$core" decide --ecosystem "$ecosystem" --name "$PKG_NAME" --version "$PKG_VERSION" \
+              --observed "$observed" 2>/dev/null | jq -r '.decision.decision')" == "matched" ]]; then
+        pin_label="matched:tofu"
+      else
+        private_finish 20 private_artifact_changed \
+          "another install pinned different bytes for this exact version while this one was deciding" \
+          "inspect: safe run private-registry pins; an operator may type the override at an interactive terminal" "$detail_extra"
+        return $?
+      fi
+      ;;
+    missing)
+      private_finish 19 private_pin_missing "the registry requires an operator pin for each version" \
+        "ask the operator to run: safe run private-registry pin add ${PKG_NAME}@${PKG_VERSION} --ecosystem ${ecosystem}" "$detail_extra"
+      return $?
+      ;;
+    changed|revoked|conflict|cross_registry)
+      local token="private_artifact_changed"
+      case "$decision" in
+        revoked) token="private_pin_revoked" ;;
+        conflict) token="private_pin_conflict" ;;
+        cross_registry) token="private_cross_registry" ;;
+      esac
+      private_finish 20 "$token" "$(jq -r '.decision.detail // "integrity mismatch"' <<<"$decision_json")" \
+        "review it: safe run private-registry pins; a reviewed re-pin is safe run private-registry pin replace ${PKG_NAME}@${PKG_VERSION} --ecosystem ${ecosystem}; an operator may type the override at an interactive terminal" "$detail_extra"
+      return $?
+      ;;
+    *)
+      private_finish 19 private_integrity_unusable \
+        "the artifact identity could not be decided ($(jq -r '.decision.detail // empty' <<<"$decision_json" 2>/dev/null || head -n 1 "$scratch/private-core.err"))" \
+        "inspect: safe audit package-audit ${PKG_NAME}@${PKG_VERSION} --ecosystem ${ecosystem}" "$detail_extra"
+      return $?
+      ;;
+  esac
+
+  if (( cooldown > 0 )); then
+    local age
+    if ! age=$(private_age_days "$published") || (( age < cooldown )); then
+      private_finish 19 private_cooldown \
+        "inside this registry's ${cooldown}-day cooldown (published ${published:-at an unknown time})" \
+        "wait, or an operator may confirm at an interactive terminal" "$detail_extra"
+      return $?
+    fi
+  fi
+  local extra_line
+  extra_line="registry=${ids} origin=${origin} artifact=${artifact:-${PKG_NAME}@${PKG_VERSION}} integrity=${integrity_label} pin=${pin_label} cooldown=${cooldown}"
+  private_finish 18 ALLOWED_VIA_PRIVATE_REGISTRY "$extra_line" "" \
+    "$(jq -c --arg line "$extra_line" --arg pin "$pin_label" '. + {audit_extra: $line, pin: $pin}' <<<"$detail_extra")"
+}
+
+# `safe audit private-fetch <name>@<version> --ecosystem <eco>`: the integrity
+# a private registry serves for one exact version, for the operator commands
+# (pin add/replace, host-allow add of a private name). Prints
+# {origin, registry_ids, integrity, artifact, published}. Exits 3 when the name
+# is not on the private lane, 30 when the decision engine is unusable, and the
+# fetcher codes (41 credentials, 42 unreachable, 43 missing, 44 outside the
+# origin, 45 unusable integrity, 46 client missing) otherwise.
+private_fetch_command() {
+  local spec="" ecosystem=""
+  local CHECK_DIST_TAG="" CHECK_REGISTRY="" CHECK_PROJECT_DIR="" CHECK_NPM_USERCONFIG="" CHECK_NPM_GLOBALCONFIG=""
+  local CHECK_EFFECTIVE_SOURCES="" CHECK_INSTALLER=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ecosystem) [[ $# -ge 2 ]] || die "--ecosystem requires a value"; ecosystem="$2"; shift 2 ;;
+      -*) die "unknown private-fetch flag: $1" ;;
+      *) spec="$1"; shift ;;
+    esac
+  done
+  [[ -n "$spec" && -n "$ecosystem" ]] || die "usage: safe audit private-fetch <name>@<version> --ecosystem npm|go|python"
+  case "$ecosystem" in pip|pypi|py|uv|pipx) ecosystem="python" ;; bun) ecosystem="npm" ;; esac
+  parse_pkg_spec "$spec"
+  CHECK_INSTALLER=$(default_installer_for "$ecosystem")
+  case "$ecosystem" in npm|go|python) ;; *) return 3 ;; esac
+  private_stores_present || return 3
+  trust_grant_ok "private-registry" 2>/dev/null || return 3
+  derive_effective_sources "$ecosystem" "$PKG_NAME"
+  local core match origin scratch rc=0 out
+  core=$(private_core_bin) || { printf 'safe audit: private-registry decision engine missing or version-skewed; rerun install.sh\n' >&2; return 30; }
+  match=$(private_core "$core" match --ecosystem "$ecosystem" --name "$PKG_NAME") || return 30
+  if [[ "$(jq -r '.lane' <<<"$match")" != "private" ]]; then
+    printf 'safe audit: %s is not on a private registry lane (%s)\n' "$PKG_NAME" "$(jq -r '.lane' <<<"$match")" >&2
+    return 3
+  fi
+  version_is_exact "$ecosystem" "$PKG_VERSION" || { printf 'safe audit: %s is not an exact version\n' "$PKG_VERSION" >&2; return 43; }
+  [[ "$ecosystem" == "npm" ]] && PKG_VERSION="${PKG_VERSION#v}"
+  origin=$(jq -r '.origin' <<<"$match")
+  new_scratch_dir scratch
+  out=$(private_fetch "$ecosystem" "$core" "$PKG_NAME" "$PKG_VERSION" "$origin" "$scratch") || rc=$?
+  rm -rf "$scratch"
+  (( rc == 0 )) || return "$rc"
+  jq -c --argjson match "$match" --arg version "$PKG_VERSION" \
+    '. + {name: $match.name, version: $version, ecosystem: $match.ecosystem, origin: $match.origin, registry_ids: $match.registry_ids}' <<<"$out"
+}
+
+# `safe audit private-gosum --project-dir <dir> [--gate install]`: the Go
+# project lane. Every go.sum module on a private lane must match its pin (or
+# be recorded on first use after its hashes are confirmed against the
+# private origin). Exit 0 when go.sum names no private module, 18 when every
+# private module passed (SAFE_AUDIT_RESULT_OUT carries one audit line per
+# module), otherwise the first refusal's 19/20/30.
+private_gosum_command() {
+  local project_dir="." gate=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project-dir) [[ $# -ge 2 ]] || die "--project-dir requires a value"; project_dir="$2"; shift 2 ;;
+      --gate) [[ $# -ge 2 ]] || die "--gate requires a value"; gate="$2"; shift 2 ;;
+      *) die "unknown private-gosum flag: $1" ;;
+    esac
+  done
+  local gosum="${project_dir%/}/go.sum"
+  [[ -f "$gosum" ]] || return 0
+  private_stores_present || return 0
+  trust_grant_ok "private-registry" || return 0
+  local core entries scratch rc=0 any=0 row
+  core=$(private_core_bin) || { printf 'safe audit: private-registry decision engine missing or version-skewed; rerun install.sh\n' >&2; return 30; }
+  if ! entries=$("$core" private-trust gosum --file "$gosum" 2>/dev/null); then
+    printf 'safe audit: go.sum is malformed; nothing was decided\n' >&2
+    return 30
+  fi
+  local -a PRIVATE_COLLECTED=()
+  local PRIVATE_COLLECT=1 PKG_NAME PKG_VERSION PRIVATE_OBSERVED
+  local CHECK_EFFECTIVE_SOURCES="" CHECK_PROJECT_DIR="$project_dir"
+  new_scratch_dir scratch
+  while IFS= read -r row; do
+    PKG_NAME=$(jq -r '.module' <<<"$row")
+    PKG_VERSION=$(jq -r '.version' <<<"$row")
+    PRIVATE_OBSERVED=$(jq -c '{mod: .mod} + (if (.h1 // "") != "" then {h1: .h1} else {} end)' <<<"$row")
+    rc=0
+    private_lane_audit go "$gate" 0 "$scratch" || rc=$?
+    case "$rc" in
+      255) continue ;;
+      18) any=1 ;;
+      *) rm -rf "$scratch"; return "$rc" ;;
+    esac
+  done < <(jq -c '.[] | select((.mod // "") != "")' <<<"$entries")
+  rm -rf "$scratch"
+  (( any )) || return 0
+  if [[ -n "${SAFE_AUDIT_RESULT_OUT:-}" ]]; then
+    printf '%s\n' "${PRIVATE_COLLECTED[@]}" | jq -s '{gate_exit: 18, private_registry_lines: .}' > "$SAFE_AUDIT_RESULT_OUT" 2>/dev/null \
+      || rm -f -- "$SAFE_AUDIT_RESULT_OUT"
+  fi
+  return 18
+}
+
 package_audit_command() {
   local ecosystem="" json_mode=0 spec="" op="install" gate=""
   # Target-context selectors from the audited command line (dynamically
@@ -8346,6 +9032,16 @@ package_audit_command() {
   # bun-effective registry through the same derivation inputs. Env + rc +
   # parseable config only, no network.
   derive_effective_sources "$ecosystem" "$PKG_NAME"
+
+  # A name the operator declared private never reaches public evidence: the
+  # private-registry lane decides it from origin binding and pinned
+  # integrity (255 = not a private name, continue the public audit).
+  local private_rc=0
+  private_lane_audit "$ecosystem" "$gate" "$json_mode" "$scratch" || private_rc=$?
+  if (( private_rc != 255 )); then
+    rm -rf "$scratch"
+    return "$private_rc"
+  fi
 
   # --- resolve the version(s) the package manager would actually install
   local resolution_ok=1 primary_version resolved_label=""
@@ -10633,6 +11329,8 @@ main() {
   fi
   case "$cmd" in
     package-audit) shift; package_audit_command "$@" ;;
+    private-fetch) shift; private_fetch_command "$@" ;;
+    private-gosum) shift; private_gosum_command "$@" ;;
     # The alias callers keep reaching for (my-safe-gate said `check` for
     # years); identical surface, canonical name stays package-audit.
     check) shift; package_audit_command "$@" ;;

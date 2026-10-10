@@ -12,7 +12,7 @@ import (
 	"github.com/superbiche/safe/internal/privtrust"
 )
 
-const privateTrustUsage = "safe-core: usage: safe-core private-trust <match|decide|record|registry-add|registry-remove|list|export|follow-apply|forget-origin|go-route|gosum|canonical-origin> [flags]"
+const privateTrustUsage = "safe-core: usage: safe-core private-trust <match|decide|record|registry-add|registry-remove|list|export|follow-apply|forget-origin|go-route|gosum|under-origin|canonical-url|canonical-origin> [flags]"
 
 // privateTrust is the decision core behind safe's private-registry lane.
 // Exit codes: 0 ok; 2 usage; 3 malformed store or input (never a decision);
@@ -222,6 +222,26 @@ func privateTrust(args []string, stdout, stderr io.Writer) int {
 			return 3
 		}
 		return emit(entries)
+	case "under-origin":
+		// Exit 0 when --url lies at or below --origin; 1 otherwise.
+		if !need("url", "origin") {
+			return 2
+		}
+		if privtrust.UnderOrigin(flags["url"], flags["origin"]) {
+			return 0
+		}
+		return 1
+	case "canonical-url":
+		if !need("url") {
+			return 2
+		}
+		c := privtrust.CanonicalURL(flags["url"])
+		if c == "" {
+			fmt.Fprintln(stderr, "safe-core: private-trust canonical-url: not an http(s) URL")
+			return 4
+		}
+		fmt.Fprintln(stdout, c)
+		return 0
 	case "canonical-origin":
 		if !need("origin") {
 			return 2
