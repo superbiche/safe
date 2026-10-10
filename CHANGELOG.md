@@ -32,6 +32,14 @@
   (`internal/privtrust`). See `docs/private-registries.md`.
 - `safe run host-allow add|update` of a private name takes its integrity from
   the private registry instead of the hardcoded npmjs/PyPI lookup.
+- The private lane covers every materialization boundary, not only named
+  specs: npm project `install|ci|update|dedupe|prune` sweep the lockfile or
+  its `--package-lock-only` projection, the Go lane decides `go.mod`
+  requirements that have no `go.sum` line yet, and pnpm/yarn/bun projects or
+  unmodelled flags naming a private package ask the operator. A find-links
+  source or `--no-index` is a BLOCK for a private Python name, an npm
+  integrity with two different sha512 digests is refused, and the npm fetch
+  reads npm 12's array answer and keeps the selected npm config files.
 
 ## 1.68.1 - 2026-10-07
 

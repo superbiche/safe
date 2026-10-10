@@ -399,18 +399,38 @@ func ValidateIntegrity(eco string, in Integrity) (Integrity, error) {
 	return in, fmt.Errorf("unsupported ecosystem %q", eco)
 }
 
-// NormalizeSRI extracts the sha512 member of an SRI string. A weaker-only SRI
-// (sha1 shasum) is not an artifact identity this package accepts.
+// NormalizeSRI returns the one sha512 member of an SRI string. npm accepts
+// bytes matching ANY digest of the strongest algorithm present, so an SRI
+// carrying two distinct sha512 digests admits two artifacts: it is refused,
+// never narrowed to one of them. A weaker-only SRI (sha1 shasum) or a token
+// of a stronger-than-sha512 or unknown algorithm npm might prefer is not an
+// identity this package can bind either.
 func NormalizeSRI(sri string) (string, error) {
+	found := ""
 	for _, tok := range strings.Fields(sri) {
 		if i := strings.IndexByte(tok, '?'); i >= 0 {
 			tok = tok[:i]
 		}
-		if sriSHA512Re.MatchString(tok) {
-			return tok, nil
+		algo, _, _ := strings.Cut(tok, "-")
+		switch algo {
+		case "sha512":
+			if !sriSHA512Re.MatchString(tok) {
+				return "", fmt.Errorf("npm integrity carries a malformed sha512 digest")
+			}
+			if found != "" && found != tok {
+				return "", fmt.Errorf("npm integrity carries two different sha512 digests; it would admit either artifact")
+			}
+			found = tok
+		case "sha1", "sha256", "sha384":
+			// Weaker than sha512: npm checks the strongest algorithm only.
+		default:
+			return "", fmt.Errorf("npm integrity carries an unsupported algorithm %q", algo)
 		}
 	}
-	return "", fmt.Errorf("npm integrity needs a sha512 SRI")
+	if found == "" {
+		return "", fmt.Errorf("npm integrity needs a sha512 SRI")
+	}
+	return found, nil
 }
 
 // IntegrityEqual compares two validated integrities of one ecosystem.

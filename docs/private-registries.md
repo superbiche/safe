@@ -46,9 +46,12 @@ the following:
 4. It applies the registry's own `cooldown_days`. The default is `0` and is
    disclosed on the audit line.
 
-Public and transitive dependencies of a private package keep their ordinary
-audit. Each one goes through the gate like any other package. Names outside the
-namespace are unaffected, even when the private origin serves them.
+Names outside the namespace are unaffected, even when the private origin
+serves them: a public package keeps its ordinary audit when an operation names
+it. Dependencies a package manager resolves on its own while installing a
+named package are not audited before delegation, for private and public roots
+alike; the npm and Go project lanes do check every private entry of the
+lockfile or module graph they sweep.
 
 Safe **never reads, stores or forwards a registry credential**. The lane runs
 each ecosystem's own client, which uses its own credentials:
@@ -86,20 +89,46 @@ Each allow or refusal also writes a `private_registry` event to the verdict log
 (`~/.local/share/safe/audit/audit-log.jsonl`). The `safe install` lane logs
 `INSTALL_UNATTENDED_PRIVATE_REGISTRY`.
 
-Where the lane runs:
+Where the lane runs — at every boundary that can materialize a private
+identity, before the package manager is delegated to:
 
-- **npm.** Explicit specs, `-g`, and the lock-diff projection of project
-  installs. In the lock-diff projection, every occurrence of the private
-  package in the projected lockfile (aliases included) must be under the
-  origin with one integrity. A lockfile integrity that matches the pin needs
-  no fetch.
-- **Python.** Explicit `pip`/`uv`/`pipx` specs.
+- **npm, explicit specs and `-g`.** The exact version's metadata comes from
+  the real npm client (`npm view`; npm 12's one-element array answer and the
+  older object answer are both read, several versions are refused), with the
+  operator's selected `--userconfig`/`--globalconfig` kept in force.
+- **npm projects (`install`, `ci`, `update`, `dedupe`, `prune`, with or without
+  package arguments).** When the manifest, the lockfile or the argv names a
+  private namespace, `npm ci` sweeps the lockfile as it stands and every other
+  operation sweeps a `--package-lock-only` projection made in a scratch copy;
+  every private entry of that lockfile (aliases included) must lie under the
+  origin with exactly one sha512 integrity matching its pin (or be confirmed
+  against the origin and pinned on first use). pnpm, yarn and bun lockfiles,
+  npm workspace roots, and flags that redirect or disable the projected
+  lockfile (`--prefix`, `--global`, `--package-lock=false`, a bare `--`) are
+  not modelled: a private name there asks the operator (19). A project that
+  names nothing private is untouched.
+- **Python.** Explicit `pip`/`uv`/`pipx` specs. A find-links source (argv
+  `--find-links`/`-f`, `PIP_FIND_LINKS`/`UV_FIND_LINKS`, pip config
+  `find-links`) or `--no-index` is a BLOCK on the private lane: a flat file
+  page cannot be probed for a namesake, and pip could take the private
+  name's files from it. The fetch uses the operator's own index URL (with any
+  inline credentials) and never prints it.
 - **Go.** `go install mod@version` and `go run mod@version`. In addition,
-  `go build|test|mod download|mod tidy` in a module checks every `go.sum`
-  entry whose module is on a private lane against its pin. A first-use entry
-  is confirmed against the origin before it is pinned. Public `go.sum`
-  entries stay with Go's checksum database. `go get` is not gated (it never
-  was); its `go.sum` result is checked on the next build.
+  `go build|test|mod download|mod tidy` checks every module the operation can
+  download that is on a private lane: the `go.mod` requirements (replace
+  directives applied; a local-directory replace downloads nothing) and the
+  `go.sum` entries. A missing `go.sum` line is never authorization — that
+  module is confirmed against the origin and pinned on first use, and a
+  revoked or changed one BLOCKs before Go downloads it. `go -C <dir>` is
+  followed; `-modfile`, workspace mode (`go.work`) and `go.mod` files older
+  than go 1.17 (which do not list the full module graph) ask the operator
+  (19). `go get` is not gated (it never was); its result is checked by the
+  next build, download or tidy. A private module that `go mod tidy` adds from
+  a new import is checked by the next such command, not by the tidy that adds
+  it.
+
+An npm integrity carrying two different sha512 digests is refused: npm would
+accept bytes matching either.
 
 ## Commands
 

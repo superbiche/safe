@@ -35,7 +35,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return toolsScan(args[1:], stdout, stderr)
 	}
 	if len(args) > 0 && args[0] == "private-trust" {
-		return privateTrust(args[1:], stdout, stderr)
+		return privateTrust(args[1:], stdin, stdout, stderr)
 	}
 
 	registryHosts, oldLockfile, newLockfile, ok := lockdiffArgs(args)

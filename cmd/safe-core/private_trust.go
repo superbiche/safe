@@ -12,13 +12,13 @@ import (
 	"github.com/superbiche/safe/internal/privtrust"
 )
 
-const privateTrustUsage = "safe-core: usage: safe-core private-trust <match|decide|record|registry-add|registry-remove|list|export|follow-apply|forget-origin|go-route|gosum|under-origin|canonical-url|canonical-origin> [flags]"
+const privateTrustUsage = "safe-core: usage: safe-core private-trust <match|match-names|decide|record|registry-add|registry-remove|list|export|follow-apply|forget-origin|go-route|gosum|under-origin|canonical-url|canonical-origin> [flags]"
 
 // privateTrust is the decision core behind safe's private-registry lane.
 // Exit codes: 0 ok; 2 usage; 3 malformed store or input (never a decision);
 // 4 refused operation (a validation or conflict the operator must resolve);
 // for follow-apply, 5 older generation and 6 collision.
-func privateTrust(args []string, stdout, stderr io.Writer) int {
+func privateTrust(args []string, stdinReader io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, privateTrustUsage)
 		return 2
@@ -113,6 +113,34 @@ func privateTrust(args []string, stdout, stderr io.Writer) int {
 			Pin     privtrust.Pin `json:"pin"`
 			Written bool          `json:"written"`
 		}{p, written})
+	case "match-names":
+		// Names on stdin, one per line; prints the matches that are on a
+		// private or conflict lane (none-lane names are omitted).
+		if !need("ecosystem") {
+			return 2
+		}
+		v, err := privtrust.Load(stores)
+		if err != nil {
+			return fail(err)
+		}
+		raw, err := io.ReadAll(stdinReader)
+		if err != nil {
+			fmt.Fprintf(stderr, "safe-core: private-trust match-names: %v\n", err)
+			return 3
+		}
+		out := []privtrust.Match{}
+		seen := map[string]bool{}
+		for _, name := range strings.Split(string(raw), "\n") {
+			name = strings.TrimSpace(name)
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			if m := v.Match(flags["ecosystem"], name); m.Lane != "none" {
+				out = append(out, m)
+			}
+		}
+		return emit(out)
 	case "registry-add":
 		if !need("policy", "id", "ecosystem", "origin") {
 			return 2

@@ -97,6 +97,15 @@ func TestNormalizeSRI(t *testing.T) {
 	if _, err := NormalizeSRI("sha1-abc"); err == nil {
 		t.Error("sha1-only SRI accepted")
 	}
+	if _, err := NormalizeSRI(sriA + " " + sriB); err == nil {
+		t.Error("two distinct sha512 digests accepted (would admit either artifact)")
+	}
+	if got, err := NormalizeSRI(sriA + " " + sriA + "?opt"); err != nil || got != sriA {
+		t.Errorf("a repeated identical digest must normalize: %q %v", got, err)
+	}
+	if _, err := NormalizeSRI("sha999-zzz " + sriA); err == nil {
+		t.Error("unknown algorithm accepted")
+	}
 }
 
 func TestGoRoute(t *testing.T) {

@@ -667,8 +667,10 @@ proceed:
   unattended), and changed bytes, a revoked version or an artifact from
   another source BLOCK with class `private` (never recordable). `safe audit
   private-fetch <name>@<version> --ecosystem <eco>` prints the integrity the
-  registry serves; `safe audit private-gosum --project-dir <dir>` is the Go
-  project lane over `go.sum`. See [private registries](private-registries.md).
+  registry serves; `safe audit private-npm-project` and `safe audit
+  private-gosum` are the npm-family and Go project lanes the wrappers run
+  before delegating (lockfile or projection sweep; `go.mod` requirements plus
+  `go.sum`). See [private registries](private-registries.md).
 - **BLOCK** refuses (exit 20) and points at operator review. At an operator
   terminal, a BLOCK on one exact resolved version takes a typed override
   (`<pkg>@<version>` installs once; `record <pkg>@<version>` also records an

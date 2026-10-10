@@ -255,12 +255,15 @@ composer update
 
 Non-install and non-exec commands pass through unchanged.
 
-`go build`, `go test`, `go mod download` and `go mod tidy` in a module also
-check every `go.sum` entry whose module belongs to an operator-authorized
-private registry against its pinned hashes (`ALLOWED_VIA_PRIVATE_REGISTRY`
-per module, or the private termini 19/20); public modules stay with Go's
-checksum database. With no private registry configured this costs one file
-test. See [private registries](private-registries.md).
+When an operator-authorized private registry exists, project operations also
+decide every private identity they can materialize before delegating:
+npm `install|ci|update|dedupe|prune` sweep the lockfile (`ci`) or its
+`--package-lock-only` projection, and `go build|test|mod download|mod tidy`
+check the private modules of `go.mod` and `go.sum` (a missing sum is never
+authorization). Each private identity logs `ALLOWED_VIA_PRIVATE_REGISTRY` or
+reaches the private termini 19/20; pnpm, yarn and bun projects naming a
+private package ask the operator. With no private registry configured this
+costs one file test. See [private registries](private-registries.md).
 
 ## Wrapped Exec and Update Commands
 

@@ -97,7 +97,8 @@ safe audit capabilities [--json]
 safe audit machine-audit [--verbose] [--deps-only | --full] [--project <path>] [--all | --machine <csv>]
 safe audit package-audit <pkg>@<version> [--ecosystem <name>] [--installer <name>] [--json]
 safe audit private-fetch <name>@<version> --ecosystem npm|go|python
-safe audit private-gosum --project-dir <dir> [--gate install]
+safe audit private-gosum --project-dir <dir> [--gate install] [-- <go argv>]
+safe audit private-npm-project --tool <npm|pnpm|yarn|bun> --class <class> --project-dir <dir> [--gate install] -- <argv>
 safe audit repo-audit [<path>] [--verbose] [--deps-only | --full] [--no-cache] [--result-out <file>] [--allow-missing-tools]
 safe audit tools-scan [--publish [--out <file>]] [--host <name>]
 safe audit ioc <identifier> [--all | --machine <csv>]

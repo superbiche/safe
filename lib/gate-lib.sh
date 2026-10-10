@@ -47,6 +47,7 @@ SAFE_GATE_GBOOL=""
 SAFE_GATE_TOOL=""
 SAFE_GATE_NPM_USERCONFIG=""
 SAFE_GATE_NPM_GLOBALCONFIG=""
+SAFE_GATE_FIND_LINKS=0
 SAFE_GATE_ENV_SCRUB=()
 
 safe_gate_err() {
@@ -248,7 +249,7 @@ safe_gate_exec_real() {
   # (PR#30 delta-2 finding P2). De-export all five before every delegate
   # exec — the audit child receives its values via argv flags, never env.
   export -n SAFE_GATE_DIST_TAG SAFE_GATE_REGISTRY SAFE_GATE_PROJECT_DIR \
-    SAFE_GATE_NPM_USERCONFIG SAFE_GATE_NPM_GLOBALCONFIG 2>/dev/null || true
+    SAFE_GATE_NPM_USERCONFIG SAFE_GATE_NPM_GLOBALCONFIG SAFE_GATE_FIND_LINKS 2>/dev/null || true
 
   # Environment names that are not valid shell identifiers (npm accepts
   # hyphenated npm_config_* keys) cannot be unset from bash: the scrub
@@ -374,6 +375,9 @@ safe_gate_run_audit() {
   [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]] && extra+=(--project-dir "${SAFE_GATE_PROJECT_DIR}")
   [[ -n "${SAFE_GATE_NPM_USERCONFIG:-}" ]] && extra+=(--npm-userconfig "${SAFE_GATE_NPM_USERCONFIG}")
   [[ -n "${SAFE_GATE_NPM_GLOBALCONFIG:-}" ]] && extra+=(--npm-globalconfig "${SAFE_GATE_NPM_GLOBALCONFIG}")
+  # A find-links selector is a flat artifact source, not an index: the
+  # private-registry lane cannot probe it for a namesake, so it must know.
+  [[ "${SAFE_GATE_FIND_LINKS:-0}" == 1 ]] && extra+=(--find-links-selected)
   # The npm lock-diff lane names the projected lockfile so the private-registry
   # lane can bind each private artifact's resolved origin and integrity.
   local artifact_lockfile="${SAFE_GATE_ARTIFACT_LOCKFILE:-}"
@@ -445,6 +449,7 @@ safe_gate_scan_target_flags() {
   SAFE_GATE_PROJECT_DIR=""
   SAFE_GATE_NPM_USERCONFIG=""
   SAFE_GATE_NPM_GLOBALCONFIG=""
+  SAFE_GATE_FIND_LINKS=0
   # The installer is set by the tool handler AFTER this reset (bun for the
   # bun wrapper and bun-selected mise npm installs); safe-audit defaults it
   # from the ecosystem otherwise.
@@ -485,11 +490,12 @@ safe_gate_scan_target_flags() {
           # a specific location instead of a blanket sentinel (PR#29 delta-5
           # finding 3.2 mitigation). --no-index keeps its sentinel: it is a
           # boolean switch with no endpoint to record.
-          --find-links|-f) safe_gate_add_source "${arg}" ;;
+          --find-links|-f) safe_gate_add_source "${arg}"; SAFE_GATE_FIND_LINKS=1 ;;
         esac
         case "${arg}" in
           --index-url=*|--extra-index-url=*|--default-index=*|--index=*) safe_gate_add_source "${arg#*=}" ;;
-          --find-links=*) safe_gate_add_source "${arg#*=}" ;;
+          --find-links=*) safe_gate_add_source "${arg#*=}"; SAFE_GATE_FIND_LINKS=1 ;;
+          -f?*) SAFE_GATE_FIND_LINKS=1 ;;
           --no-index) safe_gate_add_source "local:no-index" ;;
         esac
         ;;
@@ -4340,6 +4346,7 @@ safe_gate_npm_like() {
         safe_gate_err "safe: BLOCKED npm ${subcommand} --global — global dependency mutations have no project lockfile to audit; retry without --global; details: safe explain"
         return 100
       fi
+      safe_gate_private_npm_project npm lockdiff "$@" || return $?
       safe_gate_npm_lockdiff_preflight "${subcommand}" "$@" || return $?
       # The preflight has inspected the inherited script-policy environment.
       # Scrub it only after that check, before the real mutation delegates.
@@ -4381,6 +4388,11 @@ safe_gate_npm_like() {
 
   if (( project_present == 0 )); then
     safe_gate_scan_project || return $?
+  fi
+  # Private-registry identities the operation can materialize (the public
+  # scan above does not know the private pins or revocations).
+  if [[ -f "${SAFE_GATE_PROJECT_DIR:-.}/package.json" ]]; then
+    safe_gate_private_npm_project "${tool}" "${npm_class:-${subcommand}}" "$@" || return $?
   fi
 
   # npm's ci and install-ci-test families do not accept package argv. Their
@@ -4452,6 +4464,9 @@ safe_gate_yarn() {
     ""|install|add|up|upgrade|upgrade-interactive)
       if safe_gate_yarn_project_present; then
         safe_gate_scan_project || return $?
+      fi
+      if [[ -f "${SAFE_GATE_PROJECT_DIR:-.}/package.json" ]]; then
+        safe_gate_private_npm_project yarn "${first:-install}" "$@" || return $?
       fi
 
       if [[ "${first}" == "add" || "${first}" == "up" || "${first}" == "upgrade" ]]; then
@@ -4661,6 +4676,55 @@ safe_gate_cargo() {
   safe_gate_exec_real cargo "$@"
 }
 
+# npm-family project lane of the private-registry trust: every private
+# identity an install/ci/update/dedupe/prune can materialize is decided
+# before delegation (safe audit private-npm-project). $1 tool, $2 subcommand
+# class (ci|install|update|lockdiff|...), then the manager argv after the
+# tool name. Exit codes map exactly like the go.sum lane.
+safe_gate_private_npm_project() {
+  local tool="$1" class="$2"
+  shift 2
+  local project_dir="${SAFE_GATE_PROJECT_DIR:-.}" result_out="" rc=0 package extra d any_store=0
+  for d in "$HOME/.config/safe/run" "$(safe_gate_run_config_dir)"; do
+    [[ -s "${d}/private-registries.json" || -s "${d}/private-follow-state.json" ]] && any_store=1
+  done
+  (( any_store )) || return 0
+  [[ -f "${project_dir}/package.json" ]] || return 0
+  safe_gate_audit_available || return 0
+  local -a cfg=()
+  [[ -n "${SAFE_GATE_NPM_USERCONFIG:-}" ]] && cfg+=(--npm-userconfig "${SAFE_GATE_NPM_USERCONFIG}")
+  [[ -n "${SAFE_GATE_NPM_GLOBALCONFIG:-}" ]] && cfg+=(--npm-globalconfig "${SAFE_GATE_NPM_GLOBALCONFIG}")
+  result_out="$(mktemp "${TMPDIR:-/tmp}/safe-gate-result.XXXXXX")" || result_out=""
+  SAFE_AUDIT_RESULT_OUT="${result_out}" "${SAFE_GATE_AUDIT_BIN}" private-npm-project --tool "${tool}" --class "${class}" \
+    --project-dir "${project_dir}" --gate install "${cfg[@]}" -- "$@"
+  rc=$?
+  case "${rc}" in
+    0) ;;
+    18)
+      while IFS=$'\t' read -r package extra; do
+        [[ -n "${package}" ]] || continue
+        safe_gate_audit_log npm "${package}" "ALLOWED_VIA_PRIVATE_REGISTRY" "${extra}"
+      done < <(jq -r '.private_registry_lines[]? | [.package, .extra] | @tsv' "${result_out}" 2>/dev/null)
+      rc=0
+      ;;
+    19)
+      safe_gate_private_terminus 19 "$(jq -r '"\(.package)@\(.resolved_versions[0])"' "${result_out}" 2>/dev/null)" npm "${tool} ${SAFE_GATE_SUBCMD}" "${result_out}"
+      rc=$?
+      ;;
+    20)
+      safe_gate_block_terminus 20 "$(jq -r '"\(.package)@\(.resolved_versions[0])"' "${result_out}" 2>/dev/null)" npm "${tool} ${SAFE_GATE_SUBCMD}" "${result_out}"
+      rc=$?
+      ;;
+    *)
+      safe_gate_err "safe: BLOCKED ${tool} ${SAFE_GATE_SUBCMD} — the private-registry project check could not run (audit-infrastructure breakage, not a package finding); rerun install.sh or run safe doctor; details: safe explain"
+      safe_gate_audit_log npm "project" "REFUSED_AUDIT_INFRA"
+      rc=100
+      ;;
+  esac
+  [[ -z "${result_out}" ]] || rm -f -- "${result_out}"
+  return "${rc}"
+}
+
 # Go project lane of the private-registry trust: go.sum entries for modules on
 # a private registry must match their pinned hashes (GONOSUMDB modules are
 # otherwise trust-on-first-use in go.sum alone). Public modules stay with
@@ -4668,7 +4732,6 @@ safe_gate_cargo() {
 # per private module; 19/20 reach the same termini as a package audit.
 safe_gate_private_gosum() {
   local project_dir="${SAFE_GATE_PROJECT_DIR:-.}" result_out="" rc=0 line package extra
-  [[ -f "${project_dir}/go.sum" ]] || return 0
   # Fast path: no private-registry trust anywhere means nothing to check.
   local d any_store=0
   for d in "$HOME/.config/safe/run" "$(safe_gate_run_config_dir)"; do
@@ -4677,7 +4740,7 @@ safe_gate_private_gosum() {
   (( any_store )) || return 0
   safe_gate_audit_available || return 0
   result_out="$(mktemp "${TMPDIR:-/tmp}/safe-gate-result.XXXXXX")" || result_out=""
-  SAFE_AUDIT_RESULT_OUT="${result_out}" "${SAFE_GATE_AUDIT_BIN}" private-gosum --project-dir "${project_dir}" --gate install
+  SAFE_AUDIT_RESULT_OUT="${result_out}" "${SAFE_GATE_AUDIT_BIN}" private-gosum --project-dir "${project_dir}" --gate install -- "$@"
   rc=$?
   case "${rc}" in
     0) ;;
@@ -4761,8 +4824,9 @@ safe_gate_go() {
   if [[ "${subcommand}" != "install" ]]; then
     if [[ "${subcommand}" == "build" || "${subcommand}" == "test" ||
           ( "${subcommand}" == "mod" && ( "${second}" == "download" || "${second}" == "tidy" ) ) ]]; then
+      # The private lane follows go -C itself, so it runs whatever the cwd.
+      safe_gate_private_gosum "$@" || return $?
       if safe_gate_go_project_present; then
-        safe_gate_private_gosum || return $?
         safe_gate_scan_project || return $?
       fi
     fi

