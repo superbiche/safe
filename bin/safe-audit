@@ -9036,16 +9036,33 @@ private_gosum_command() {
     esac
   done
   [[ " ${GOFLAGS:-} " == *"-modfile"* ]] && modfile=1
-  [[ -f "${project_dir%/}/go.mod" ]] || return 0
-  local core go_bin scratch modjson entries rc=0 any=0 row
+  # `go mod download <module>@<version>` names modules explicitly, inside a
+  # module or not: each one is a download target too (a query such as
+  # @latest is not an exact version and asks the operator on the lane).
+  local explicit='[]' seen_mod=0 seen_dl=0
+  for a in "${go_argv[@]}"; do
+    if (( seen_dl )); then
+      [[ "$a" == -* || "$a" != *@* ]] && continue
+      explicit=$(jq -c --arg m "${a%@*}" --arg v "${a##*@}" '. + [{module: $m, version: $v}]' <<<"$explicit")
+    elif (( seen_mod )) && [[ "$a" == download ]]; then
+      seen_dl=1
+    elif [[ "$a" == mod ]]; then
+      seen_mod=1
+    fi
+  done
+  local has_mod=0
+  [[ -f "${project_dir%/}/go.mod" ]] && has_mod=1
+  (( has_mod )) || [[ "$explicit" != "[]" ]] || return 0
+  local core go_bin scratch modjson='{"Go":"1.17"}' entries rc=0 any=0 row
   core=$(private_core_bin) || { printf 'safe audit: private-registry decision engine missing or version-skewed; rerun install.sh\n' >&2; return 30; }
   new_scratch_dir scratch
-  if ! go_bin=$(private_real_tool go) \
-    || ! modjson=$(cd -- "$project_dir" && GOFLAGS= "$go_bin" mod edit -json 2>/dev/null); then
+  if (( has_mod )) && { ! go_bin=$(private_real_tool go) \
+    || ! modjson=$(cd -- "$project_dir" && GOFLAGS= "$go_bin" mod edit -json 2>/dev/null); }; then
     printf 'safe audit: go.mod could not be read by the go toolchain; nothing was decided\n' >&2
     rm -rf "$scratch"
     return 30
   fi
+  (( has_mod )) || go_bin=$(private_real_tool go) || go_bin=""
   entries='[]'
   if [[ -f "${project_dir%/}/go.sum" ]] && ! entries=$("$core" private-trust gosum --file "${project_dir%/}/go.sum" 2>/dev/null); then
     printf 'safe audit: go.sum is malformed; nothing was decided\n' >&2
@@ -9057,7 +9074,7 @@ private_gosum_command() {
   # nothing), plus every go.sum entry. Missing sums are not authorization:
   # an identity with no observation is decided from the private origin.
   local targets
-  targets=$(jq -c --argjson sum "$entries" '
+  targets=$(jq -c --argjson sum "$entries" --argjson explicit "$explicit" '
     (.Replace // []) as $rep
     | [ (.Require // [])[]
         | . as $r
@@ -9066,6 +9083,7 @@ private_gosum_command() {
           elif ($x.New.Version // "") == "" then empty
           else {module: $x.New.Path, version: $x.New.Version} end ]
       + [ $sum[] | {module, version} ]
+      + $ARGS.named.explicit
     | unique_by(.module + "@" + .version)
     | map(. as $t | ($sum | map(select(.module == $t.module and .version == $t.version)) | first) as $s
           | $t + {h1: ($s.h1 // ""), mod: ($s.mod // "")})' <<<"$modjson") || { rm -rf "$scratch"; return 30; }
@@ -9082,9 +9100,10 @@ private_gosum_command() {
   PKG_NAME=$(jq -r '.[0].name' <<<"$matches")
   PKG_VERSION="project"
   local unmodelled="" gowork go_directive
-  gowork=$(cd -- "$project_dir" && "$go_bin" env GOWORK 2>/dev/null) || gowork=""
+  gowork=""
+  (( has_mod )) && { gowork=$(cd -- "$project_dir" && "$go_bin" env GOWORK 2>/dev/null) || gowork=""; }
   go_directive=$(jq -r '.Go // ""' <<<"$modjson")
-  if (( modfile )); then
+  if (( modfile && has_mod )); then
     unmodelled="-modfile swaps the module file safe reads"
   elif [[ -n "$gowork" && "$gowork" != "off" ]]; then
     unmodelled="workspace mode (go.work) is not modelled by the private-registry lane"

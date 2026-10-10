@@ -47,6 +47,9 @@
   config `no-deps`), an npm version without dependencies or required peers, a
   Go module whose `go.mod` requires nothing — and otherwise asks the operator
   (19, `private_dependencies_unaudited`) with the recovery path.
+- `go mod download <module>@<version>` of a private module is decided by the
+  private lane, inside or outside a module. Public explicit downloads and
+  `go get` remain ungated, as before (documented).
 
 ## 1.68.1 - 2026-10-07
 

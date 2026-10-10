@@ -448,7 +448,23 @@ mkdir -p "$tmp/fix/other"; cp "$tmp/fix/gomod/go.mod" "$tmp/fix/other/go.mod"
 rc=0; FAKE_GO_MODJSON="$tmp/fix/modjson-req.json" GOPROXY="$GO_ORIGIN" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-gosum --project-dir "$tmp/fix/nonexistent" --gate install -- -C "$tmp/fix/other" mod download > "$tmp/out" 2>&1 || rc=$?
 [[ "$rc" == 20 ]] || fail "go -C must be followed: rc=$rc"
 rm -f "$pins"
-pass "go project lane: go.mod requirements are decided without go.sum (revoked BLOCKs, first use pins from the origin); -modfile, go.work and pre-1.17 graphs ask; local replaces skip; -C is followed"
+mkdir -p "$tmp/fix/nomod"
+dl() { rc=0; GOPROXY="$GO_ORIGIN" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-gosum --project-dir "$tmp/fix/nomod" --gate install -- "$@" > "$tmp/out" 2>&1 || rc=$?; }
+rm -f "$pins"
+"$CORE" private-trust record --pins "$pins" --ecosystem go --origin "$GO_ORIGIN" --name superbiche.me/caviar --version v0.2.0 --mode revoke >/dev/null
+dl mod download -json superbiche.me/caviar@v0.2.0
+[[ "$rc" == 20 ]] || fail "explicit go mod download of a revoked private module outside a module: rc=$rc $(cat "$tmp/out")"
+rm -f "$pins"
+dl mod download -json superbiche.me/caviar@v0.2.0
+[[ "$rc" == 18 ]] && jq -e '.private_registry_lines[0].package == "superbiche.me/caviar@v0.2.0"' "$tmp/result.json" >/dev/null || fail "explicit private download, first use: rc=$rc"
+dl mod download superbiche.me/caviar@latest
+[[ "$rc" == 19 ]] || fail "explicit private download by query: rc=$rc"
+dl mod download -json golang.org/x/text@v0.20.0
+[[ "$rc" == 0 ]] || fail "explicit public download is not on the private lane: rc=$rc"
+rc=0; FAKE_GO_MODJSON="$tmp/fix/modjson-none.json" GOPROXY="$GO_ORIGIN" SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$AUDIT" private-gosum --project-dir "$tmp/fix/gomod" --gate install -- mod download superbiche.me/caviar@v0.2.0 > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 18 ]] || fail "explicit private download inside a module that does not require it: rc=$rc"
+rm -f "$pins"
+pass "go project lane: go.mod requirements are decided without go.sum (revoked BLOCKs, first use pins from the origin); -modfile, go.work and pre-1.17 graphs ask; local replaces skip; -C is followed; explicit go mod download <mod>@<ver> targets are decided inside or outside a module"
 
 # round-1 P5 (option A): the unattended private allow needs an install that
 # fetches nothing beyond the checked root

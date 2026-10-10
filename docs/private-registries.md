@@ -146,8 +146,12 @@ identity, before the package manager is delegated to:
   revoked or changed one BLOCKs before Go downloads it. `go -C <dir>` is
   followed; `-modfile`, workspace mode (`go.work`) and `go.mod` files older
   than go 1.17 (which do not list the full module graph) ask the operator
-  (19). `go get` is not gated (it never was); its result is checked by the
-  next build, download or tidy. A private module that `go mod tidy` adds from
+  (19). Explicit `go mod download <module>@<version>` targets on a private
+  lane are decided too, inside a module or not (a query such as `@latest`
+  asks). Pre-existing gaps, public and private alike: `go get` is not gated,
+  and neither is an explicit `go mod download <module>@<version>` of a public
+  module; a private module fetched by `go get` is checked by the next build,
+  download or tidy. A private module that `go mod tidy` adds from
   a new import is checked by the next such command, not by the tidy that adds
   it.
 

@@ -23,7 +23,7 @@ sig = "f6afee705d288cc7"
 [[bindings]]
 doc = "docs/configuration.md"
 target = "bin/safe-audit"
-sig = "01b1610bc4698f02"
+sig = "5953cb015fb54125"
 
 [[bindings]]
 doc = "docs/configuration.md"
@@ -33,7 +33,7 @@ sig = "cd377501b1e3c83c"
 [[bindings]]
 doc = "docs/dependencies.md"
 target = "bin/safe-audit"
-sig = "01b1610bc4698f02"
+sig = "5953cb015fb54125"
 
 [[bindings]]
 doc = "docs/index.md"
@@ -78,7 +78,7 @@ sig = "cd377501b1e3c83c"
 [[bindings]]
 doc = "docs/private-registries.md"
 target = "bin/safe-audit"
-sig = "01b1610bc4698f02"
+sig = "5953cb015fb54125"
 
 [[bindings]]
 doc = "docs/private-registries.md"
@@ -108,7 +108,7 @@ sig = "cbad3bfbe77248a2"
 [[bindings]]
 doc = "docs/safe-audit.md"
 target = "bin/safe-audit"
-sig = "01b1610bc4698f02"
+sig = "5953cb015fb54125"
 
 [[bindings]]
 doc = "docs/safe-audit.md"
