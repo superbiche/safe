@@ -97,6 +97,10 @@ Flow:
    place of a BLOCK its origin overrode for the same advisories. At an
    operator terminal a BLOCK on one exact version takes a typed override; an
    override recorded on this host is gate-only exit 17 (terminal confirm).
+   A name on an operator-authorized private registry is decided by the
+   private lane instead: bound to its origin and pinned integrity, it
+   proceeds unattended (gate-only exit 18), asks the operator (19) or
+   BLOCKs (20, class `private`) — see [private registries](private-registries.md).
 5. The real command runs through the first non-wrapper `npm` on PATH.
 
 Equivalent gate routing exists for pnpm, pnpx, yarn, bun, uv, pip, pip3, cargo, go, composer, and mise (Volta is retired).

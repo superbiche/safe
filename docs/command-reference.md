@@ -53,6 +53,14 @@ safe run host-allow list
 safe run host-allow review [--json] [--digest] [--no-audit]
 safe run host-allow export [--json]
 safe run host-allow import <file> [--dry-run]
+safe run private-registry add <id> --ecosystem npm|go|python --origin <url> --namespace <ns>... --reason "..."
+safe run private-registry remove <id>
+safe run private-registry list [--json]
+safe run private-registry pins [--json]
+safe run private-registry pin add|replace|revoke <name>@<version> --ecosystem <eco>
+safe run private-registry export [--sign [--out <dir>]]
+safe run private-registry follow [--dry-run] [--from <dir>]
+safe run private-registry forget-origin <host>
 safe run scripts-allow add <pkg>@<x.y.z> --reason "..."
 safe run scripts-allow remove <pkg>
 safe run scripts-allow list
@@ -88,6 +96,8 @@ Runner flags:
 safe audit capabilities [--json]
 safe audit machine-audit [--verbose] [--deps-only | --full] [--project <path>] [--all | --machine <csv>]
 safe audit package-audit <pkg>@<version> [--ecosystem <name>] [--installer <name>] [--json]
+safe audit private-fetch <name>@<version> --ecosystem npm|go|python
+safe audit private-gosum --project-dir <dir> [--gate install]
 safe audit repo-audit [<path>] [--verbose] [--deps-only | --full] [--no-cache] [--result-out <file>] [--allow-missing-tools]
 safe audit tools-scan [--publish [--out <file>]] [--host <name>]
 safe audit ioc <identifier> [--all | --machine <csv>]

@@ -17,6 +17,7 @@ nav:
   - Vendor Updates: vendor.md
   - Agent Contract: agents.md
   - Integration Flows: integration-flows.md
+  - Private Registries: private-registries.md
   - Configuration: configuration.md
   - Operations: operations.md
   - Publishing: publishing.md

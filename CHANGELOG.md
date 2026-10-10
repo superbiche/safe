@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+- Add operator-managed trust for owner-controlled private registries (npm, Go,
+  PyPI). `safe run private-registry add` declares that a namespace resolves
+  only from one canonical origin. An exact-pinned install of that namespace is
+  then bound to the origin and to the integrity pinned for the exact version
+  (recorded on first use or by `pin add`). It proceeds unattended as gate
+  exit 18 `ALLOWED_VIA_PRIVATE_REGISTRY`, with an audit line naming the
+  registry, origin, artifact and integrity. It never consults OSV, Socket or
+  public publish dates for the private name. Gate exit 19 asks the operator
+  (102 unattended) for the following cases:
+  - a namespace claimed by two origins;
+  - a missing operator pin;
+  - a non-exact spec or a version absent from the registry;
+  - missing credentials or an unreachable registry;
+  - a release inside the registry's cooldown.
+
+  BLOCK class `private` (20/104, typed override at a terminal, never recorded)
+  covers changed bytes, a revoked version, disagreeing signed pins, and
+  cross-registry substitution: npm scope or lockfile entries elsewhere, a PyPI
+  namesake (dependency confusion), or Go routed around the private proxy.
+  Credentials stay with each client (`.npmrc`, `GOAUTH`/`.netrc`); safe never
+  reads or logs them. The Go project lane checks private `go.sum` entries on
+  `build|test|mod download|mod tidy`.
+- Fleet propagation of that trust. An origin republishes a signed
+  `private-registries.<host>.json` with every change, and `safe run host-allow
+  follow` follows it. A newer statement replaces the origin's previous one, so
+  removals and revocations propagate, and `follow-signer remove` withdraws a
+  key's statements at once. The trust core is `safe-core private-trust`
+  (`internal/privtrust`). See `docs/private-registries.md`.
+- `safe run host-allow add|update` of a private name takes its integrity from
+  the private registry instead of the hardcoded npmjs/PyPI lookup.
+
 ## 1.68.1 - 2026-10-07
 
 - `safe release follow` advances a checked-out default branch with its index

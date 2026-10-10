@@ -6,6 +6,9 @@ Unified config lives under:
 ~/.config/safe/
   run/
     host-allow.json
+    private-registries.json
+    private-pins.json
+    private-follow-state.json
     blocked.json
     sandbox-known.json
     install-known.json
@@ -74,6 +77,13 @@ Existing entries with retired metadata are ignored; newly written entries use
 only the current pinned-version schema. `host-allow add` and `update` verify the
 exact version against its registry and obtain fresh integrity before writing;
 an unknown or unreachable version is refused.
+
+`private-registries.json`, `private-pins.json` and `private-follow-state.json`
+hold the operator-managed trust for owner-controlled private registries: the
+local registry policy, the per-version artifact pins, and the statements
+followed from fleet origins. They are trust stores (canonical root only,
+operator-TTY writes through `safe run private-registry`); see
+[private registries](private-registries.md).
 
 `blocked.json` stores package names or patterns that should never run.
 
@@ -191,7 +201,10 @@ pass and warnings under `environment.release_follow`.
   private artifact of the same name@version. Non-URL identities are
   trusted verbatim: a cargo registry whose index URL safe cannot see is
   `cargo-registry:<name>`, and a disabled packagist is
-  `local:packagist-disabled`.
+  `local:packagist-disabled`. This list says "audit it like the public
+  registry"; it is not private-registry trust. An owner-controlled private
+  registry belongs in `safe run private-registry add`, whose lane decides
+  its namespace whatever this list says ([private registries](private-registries.md)).
 - `auto_allow_ttl_days`: freshness window for the offline/timeout fallback.
 - `reuse.enabled`: per-host rule for `safe install --reuse` (default `false`).
   `true` lets the reuse of an installed `vendor/` from another checkout of the

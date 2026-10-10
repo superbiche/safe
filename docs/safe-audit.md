@@ -659,6 +659,16 @@ proceed:
   `n` being that confirmation; no clean receipt is minted for a declined
   check. Non-interactive shells refuse 102 — the operator hands over the
   complete pinned command.
+- **Private registries (exits 18/19, BLOCK class `private`)**: a name in the
+  namespace of an operator-authorized private registry never reaches public
+  evidence. It is bound to the registry's canonical origin and to the
+  integrity pinned for the exact version; exit 18 proceeds unattended and
+  names artifact and integrity, exit 19 needs an operator decision (102
+  unattended), and changed bytes, a revoked version or an artifact from
+  another source BLOCK with class `private` (never recordable). `safe audit
+  private-fetch <name>@<version> --ecosystem <eco>` prints the integrity the
+  registry serves; `safe audit private-gosum --project-dir <dir>` is the Go
+  project lane over `go.sum`. See [private registries](private-registries.md).
 - **BLOCK** refuses (exit 20) and points at operator review. At an operator
   terminal, a BLOCK on one exact resolved version takes a typed override
   (`<pkg>@<version>` installs once; `record <pkg>@<version>` also records an

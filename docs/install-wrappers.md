@@ -255,6 +255,13 @@ composer update
 
 Non-install and non-exec commands pass through unchanged.
 
+`go build`, `go test`, `go mod download` and `go mod tidy` in a module also
+check every `go.sum` entry whose module belongs to an operator-authorized
+private registry against its pinned hashes (`ALLOWED_VIA_PRIVATE_REGISTRY`
+per module, or the private termini 19/20); public modules stay with Go's
+checksum database. With no private registry configured this costs one file
+test. See [private registries](private-registries.md).
+
 ## Wrapped Exec and Update Commands
 
 Exec-style subcommands that fetch and run registry packages are audited the

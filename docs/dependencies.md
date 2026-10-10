@@ -19,6 +19,12 @@ uses by downloading and running upstream installers on the user's behalf.
 | cargo-audit | Rust vulnerability checks | <https://github.com/rustsec/rustsec/tree/main/cargo-audit> |
 | pip-audit | Python vulnerability checks | <https://github.com/pypa/pip-audit> |
 
+The private-registry lane ([private registries](private-registries.md)) runs no
+scanner: it asks the ecosystem's own client (`npm view`, `go mod download`
+with a scratch cache, `curl --netrc-optional` for PyPI simple pages) for the
+integrity a private registry serves, so the client's own credentials apply
+and safe never handles them.
+
 Install these tools through a channel you trust. That may be an OS package
 manager, a pinned release asset, a source build you reviewed, or an internal
 tooling image. The right choice depends on your threat model.

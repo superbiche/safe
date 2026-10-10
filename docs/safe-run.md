@@ -455,6 +455,19 @@ an older safe ignore the field and keep refusing.
 Malware and blocklist BLOCKs are overridable per install only. They are never
 recorded, so they never reach an export.
 
+## Private registries
+
+`safe run private-registry` manages operator trust for owner-controlled
+private registries: `add|remove|list` for the registry policy,
+`pins` and `pin add|replace|revoke` for per-version integrity, and
+`export --sign`, `follow`, `forget-origin` for fleet propagation. Every change
+needs an operator terminal and the canonical trust root. An origin republishes
+`private-registries.<host>.json` with each change, and `safe run host-allow
+follow` follows those statements too: a newer statement replaces the origin's
+previous one, so removals and revocations propagate. `host-allow add|update`
+of a private name takes its integrity from the private registry, never the
+public one. See [private registries](private-registries.md).
+
 ## Safe release follow
 
 Each follower can update `safe` from its own checkout without a TTY, prompt, or
