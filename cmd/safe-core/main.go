@@ -34,6 +34,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "tools-scan" {
 		return toolsScan(args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "private-trust" {
+		return privateTrust(args[1:], stdout, stderr)
+	}
 
 	registryHosts, oldLockfile, newLockfile, ok := lockdiffArgs(args)
 	if !ok {
@@ -41,6 +44,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, reifyCandidatesUsage)
 		fmt.Fprintln(stderr, "safe-core: usage: safe-core package-verdict < evidence.json")
 		fmt.Fprintln(stderr, toolsScanUsage)
+		fmt.Fprintln(stderr, privateTrustUsage)
 		return 2
 	}
 
