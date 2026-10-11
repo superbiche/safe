@@ -359,4 +359,14 @@ Then configure each client:
     --extra-index-url https://pypi.org/simple caviar-redact==<version>
   ```
 
+  With uv, name the index so its credentials come from
+  `UV_INDEX_<NAME>_USERNAME` / `UV_INDEX_<NAME>_PASSWORD` instead of a
+  plaintext netrc. The lane checks the URL after `<name>=`; the delegate
+  keeps those credential variables while dropping every index variable:
+
+  ```bash
+  uv pip install --index superbiche-packages=https://git.superbiche.me:8443/api/packages/superbiche-packages/pypi/simple \
+    --default-index https://pypi.org/simple caviar-redact==<version>
+  ```
+
   The lane refuses if PyPI ever serves a package of the same name.

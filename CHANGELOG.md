@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- The private-registry Python lane accepts uv named indexes
+  (`--index <name>=<url>`, `--default-index <name>=<url>`, and the same form
+  in `UV_INDEX` / `UV_DEFAULT_INDEX`): the URL after `<name>=` is the source
+  it checks. The name selects `UV_INDEX_<NAME>_*` credentials, which the
+  isolated delegate keeps, so a private index authenticates without a
+  plaintext netrc. Before, a named index never matched the registry origin
+  and the install was refused (104).
+
 ## 1.69.1 - 2026-10-11
 
 - Fix: `go list` and `go vet` no longer run the project scan. The scanner's
