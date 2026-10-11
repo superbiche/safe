@@ -157,6 +157,23 @@ grep -q 'view' "$tmp/npm.argv" && fail "the lane fetched metadata"
 [[ ! -e "$tmp/curl.urls" ]] || fail "the npm lane made a network request"
 no_secret "npm allow"
 pass "npm: a private spec npm maps to its origin installs unattended (18) with one audit line naming registry, origin, name and version; no metadata fetch"
+
+# A host whose npm is reachable only through mise shims bound to the mise
+# wrapper (install.sh re-points them): the lane resolves the real npm through
+# the real mise and never runs the shim, which would re-enter the gate.
+mkdir -p "$tmp/mise-host/wrap" "$tmp/mise-host/shims" "$tmp/mise-host/mise"
+for w in "wrap/npm tool=npm" "shims/npm tool=mise"; do
+  printf '#!/usr/bin/env bash\n# safe-gate-wrapper v1 %s\nprintf reentered >> "$tmp/reentered"; exit 99\n' "${w#* }" > "$tmp/mise-host/${w%% *}"
+done
+printf '#!/usr/bin/env bash\nprintf "%%s cwd=%%s\\n" "$*" "$PWD" >> "$tmp/mise.argv"\n[[ "$1" == which && "$2" == npm ]] && { printf "%%s\\n" "$tmp/bin/npm"; exit 0; }\nexit 1\n' > "$tmp/mise-host/mise/mise"
+chmod +x "$tmp/mise-host/wrap/npm" "$tmp/mise-host/shims/npm" "$tmp/mise-host/mise/mise"
+rm -f "$tmp/npm.argv" "$tmp/reentered" "$tmp/mise.argv"
+audit @p/x@1.0.0 npm PATH="$tmp/mise-host/wrap:$tmp/mise-host/shims:$tmp/mise-host/mise:/usr/bin:/bin"
+[[ "$rc" == 18 ]] || fail "npm behind a mise-bound shim: rc=$rc $(cat "$tmp/out")"
+[[ ! -e "$tmp/reentered" ]] || fail "the lane ran a gate wrapper or the mise-bound shim"
+grep -q '^which npm ' "$tmp/mise.argv" && grep -q 'config get @p:registry' "$tmp/npm.argv" \
+  || fail "the real npm was not resolved through the real mise"
+pass "npm behind a mise shim bound to the mise wrapper: the lane resolves the real npm through the real mise (18), never re-entering the gate"
 audit '@p/x@^1.0.0' npm
 [[ "$rc" == 19 && "$(decision)" == private_version_not_exact ]] || fail "npm range: rc=$rc"
 audit @p/x@1.0.0 npm FAKE_NPM_SCOPE_REG=undefined
@@ -270,7 +287,7 @@ source "$ROOT/lib/gate-lib.sh"
 SAFE_GATE_AUDIT_BIN="$ROOT/bin/safe-audit"
 safe_gate_audit_available() { return 0; }
 safe_gate_operator_terminal() { return 1; }
-safe_gate_scan_project() { return 0; }
+safe_gate_scan_project() { printf 'SCAN\n' >> "$tmp/scanned"; return 0; }
 [[ "${ROUTE_REAL_CHECK:-0}" == 1 ]] || safe_gate_check_many() { printf 'SPEC %s\n' "$*" > "$tmp/spec"; return 0; }
 safe_gate_exec_real() { printf 'DELEGATED %s PIP_CONFIG_FILE=%s PIP_INDEX_URL=%s UV_NO_CONFIG=%s\n' "$*" "${PIP_CONFIG_FILE:-}" "${PIP_INDEX_URL:-}" "${UV_NO_CONFIG:-}" > "$tmp/delegated"; exit 0; }
 cd "${ROUTE_DIR:-$tmp/fix/npmproj}"
@@ -419,6 +436,17 @@ rm -f "$tmp/delegated" "$tmp/spec"
 rc=0; ROUTE_DIR="$tmp/fix/gomod" bash "$tmp/route.sh" safe_gate_go install superbiche.me/tool@v1.0.0 > "$tmp/out" 2>&1 || rc=$?
 [[ "$rc" == 0 && -e "$tmp/spec" ]] || fail "go install <mod>@<ver> stays on the spec lane: rc=$rc"
 pass "the shipped go routes (run, install, vet, list, go mod *, build) check the routing before delegating"
+# The repo-audit scanner's Go cataloger runs `go list` through the gate: a
+# project scan on list or vet re-entered the gate without end (1.69.0, live).
+for cmd in "vet ./..." "list -e -f {{context.ReleaseTags}} -- unsafe" "list -m all"; do
+  rm -f "$tmp/delegated" "$tmp/scanned"
+  rc=0; ROUTE_DIR="$tmp/fix/gomod" bash "$tmp/route.sh" safe_gate_go $cmd > "$tmp/out" 2>&1 || rc=$?
+  [[ "$rc" == 0 && -e "$tmp/delegated" && ! -e "$tmp/scanned" ]] || fail "go $cmd ran the project scan or did not delegate: rc=$rc $(cat "$tmp/out")"
+done
+rm -f "$tmp/delegated" "$tmp/scanned"
+rc=0; ROUTE_DIR="$tmp/fix/gomod" bash "$tmp/route.sh" safe_gate_go build ./... > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" == 0 && -e "$tmp/scanned" ]] || fail "go build no longer scans the project: rc=$rc"
+pass "go list and go vet check the private routing without a project scan (the scanner runs go list itself); go build still scans"
 
 # --- review round 4 correctives --------------------------------------------------
 reset_state

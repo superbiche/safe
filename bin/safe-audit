@@ -8309,20 +8309,32 @@ private_registries() {
 }
 
 # First executable <tool> on PATH that is not a safe gate wrapper: the lane
-# asks the ecosystem's own client and must never re-enter the gate.
+# asks the ecosystem's own client and must never re-enter the gate. A mise
+# shim bound to the mise wrapper (marker tool=mise; gate-lib accepts it as the
+# delegate) would re-enter the gate when run as <tool>, so it resolves through
+# the real mise in directory $2 instead, keeping per-project tool versions.
 private_real_tool() {
-  local tool="$1" dir candidate line i
+  local tool="$1" dir candidate line i marker mise_bin real
   local -a dirs=()
   IFS=':' read -r -a dirs <<<"${PATH}"
   for dir in "${dirs[@]}"; do
     [[ -n "$dir" ]] || dir="."
     candidate="$dir/$tool"
     [[ -f "$candidate" && -x "$candidate" ]] || continue
-    i=0
+    i=0 marker=""
     while (( i < 2 )) && IFS= read -r line; do
       i=$((i + 1))
-      [[ "$line" == *'# safe-gate-wrapper'* ]] && continue 2
+      [[ "$line" == *'# safe-gate-wrapper'* ]] && marker="$line"
     done < <(LC_ALL=C head -c 4096 -- "$candidate" 2>/dev/null | tr -d '\0')
+    if [[ -n "$marker" ]]; then
+      [[ "$tool" != mise && "$marker" == '# safe-gate-wrapper '*' tool=mise' ]] || continue
+      mise_bin=$(private_real_tool mise) || continue
+      real=$(cd -- "${2:-.}" 2>/dev/null && timeout 30 "$mise_bin" which "$tool" 2>/dev/null | tail -n 1) || continue
+      [[ -n "$real" && "$real" != "$candidate" && -f "$real" && -x "$real" ]] || continue
+      LC_ALL=C head -c 4096 -- "$real" 2>/dev/null | tr -d '\0' | head -n 2 | grep -q '# safe-gate-wrapper' && continue
+      printf '%s' "$real"
+      return 0
+    fi
     printf '%s' "$candidate"
     return 0
   done
@@ -8417,7 +8429,7 @@ private_finish() {
 # no real npm is found, 42 when npm fails.
 private_npm_scope_registry() {
   local scope="$1" npm_bin out tok
-  npm_bin=$(private_real_tool npm) || return 46
+  npm_bin=$(private_real_tool npm "${CHECK_PROJECT_DIR:-.}") || return 46
   local -a args=(config get "${scope}:registry")
   for tok in ${CHECK_REGISTRY:-}; do
     [[ "$tok" == "${scope}:registry="* ]] && args+=("--${tok}")
@@ -8433,7 +8445,7 @@ private_npm_scope_registry() {
 # One `go env` in the command's context, as JSON.
 private_go_env() {
   local dir="$1" go_bin
-  go_bin=$(private_real_tool go) || return 46
+  go_bin=$(private_real_tool go "$dir") || return 46
   (cd -- "$dir" 2>/dev/null && "$go_bin" env -json GOPROXY GONOPROXY GOPRIVATE GOFLAGS GOWORK 2>/dev/null) || return 42
 }
 
@@ -8971,7 +8983,7 @@ private_go_command() {
   # workspace's too) — plus explicit `go mod download <mod>@<ver>` targets.
   local -a files=()
   local gowork goflags t root="" go_bin="" workjson=""
-  go_bin=$(private_real_tool go) || go_bin=""
+  go_bin=$(private_real_tool go "$project_dir") || go_bin=""
   gowork=$(jq -r '.GOWORK // ""' <<<"$goenv")
   [[ "$gowork" == off ]] && gowork=""
   if [[ -z "$modfile" ]]; then
