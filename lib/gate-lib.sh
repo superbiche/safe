@@ -431,16 +431,6 @@ safe_gate_run_audit() {
 # Source selectors are cumulative (pip considers --find-links AND the index):
 # accumulate every one — a later trusted selector must never erase an earlier
 # untrusted one (PR#29 delta-2 finding 3).
-# The URL of a uv index value: `<name>=<url>` names an index (its name
-# selects UV_INDEX_<NAME>_* credentials), anything else is the URL itself.
-safe_gate_uv_index_url() {
-  local value="$1"
-  if [[ "${value}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*=(.+)$ ]]; then
-    value="${BASH_REMATCH[1]}"
-  fi
-  printf '%s' "${value}"
-}
-
 safe_gate_add_source() {
   local value="$1"
   while [[ "${value}" == */ ]]; do value="${value%/}"; done
@@ -505,10 +495,7 @@ safe_gate_scan_target_flags() {
         ;;
       python)
         case "${prev}" in
-          --index-url|-i|--extra-index-url) safe_gate_add_source "${arg}" ;;
-          # uv names an index as <name>=<url>; the name only selects its
-          # UV_INDEX_<NAME>_* credentials, the URL is the source.
-          --default-index|--index) safe_gate_add_source "$(safe_gate_uv_index_url "${arg}")" ;;
+          --index-url|-i|--extra-index-url|--default-index|--index) safe_gate_add_source "${arg}" ;;
           # find-links names a real endpoint: record it so operators can trust
           # a specific location instead of a blanket sentinel (PR#29 delta-5
           # finding 3.2 mitigation). --no-index keeps its sentinel: it is a
@@ -516,8 +503,7 @@ safe_gate_scan_target_flags() {
           --find-links|-f) safe_gate_add_source "${arg}"; SAFE_GATE_FIND_LINKS=1 ;;
         esac
         case "${arg}" in
-          --index-url=*|--extra-index-url=*) safe_gate_add_source "${arg#*=}" ;;
-          --default-index=*|--index=*) safe_gate_add_source "$(safe_gate_uv_index_url "${arg#*=}")" ;;
+          --index-url=*|--extra-index-url=*|--default-index=*|--index=*) safe_gate_add_source "${arg#*=}" ;;
           --find-links=*) safe_gate_add_source "${arg#*=}"; SAFE_GATE_FIND_LINKS=1 ;;
           -f?*) SAFE_GATE_FIND_LINKS=1 ;;
           --no-index) safe_gate_add_source "local:no-index" ;;

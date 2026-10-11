@@ -2,13 +2,13 @@
 
 ## Unreleased
 
-- The private-registry Python lane accepts uv named indexes
-  (`--index <name>=<url>`, `--default-index <name>=<url>`, and the same form
-  in `UV_INDEX` / `UV_DEFAULT_INDEX`): the URL after `<name>=` is the source
-  it checks. The name selects `UV_INDEX_<NAME>_*` credentials, which the
-  isolated delegate keeps, so a private index authenticates without a
-  plaintext netrc. Before, a named index never matched the registry origin
-  and the install was refused (104).
+- The private-registry Python lane accepts uv named indexes on the command
+  line (`--index <name>=<url>`, `--default-index <name>=<url>`): for a
+  private name, the URL after `<name>=` is the source it checks. The name
+  selects `UV_INDEX_<NAME>_*` credentials, which the isolated delegate keeps,
+  so a private index authenticates without a plaintext netrc. Before, a named
+  index never matched the registry origin and the install was refused (104).
+  Public audits keep the selector verbatim.
 
 ## 1.69.1 - 2026-10-11
 

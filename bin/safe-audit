@@ -6492,8 +6492,6 @@ python_env_sources() {
   local out="" v
   for v in ${PIP_INDEX_URL:-} ${PIP_EXTRA_INDEX_URL:-} ${UV_DEFAULT_INDEX:-} ${UV_INDEX_URL:-} ${UV_INDEX:-} \
     ${PIP_FIND_LINKS:-} ${UV_FIND_LINKS:-} ${UV_EXTRA_INDEX_URL:-}; do
-    # uv names an index as <name>=<url>; the URL is the source.
-    [[ "$v" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*=(.+)$ ]] && v="${BASH_REMATCH[1]}"
     out="${out:+$out }$v"
   done
   # no-index flips resolution to find-links/local sources entirely; the
@@ -8464,13 +8462,24 @@ private_go_route() {
 # Python namesake probe: every argv index outside the origin, and PyPI
 # (pip's default when no --index-url replaces it), must not serve the name.
 # 0 none does; 44 one does (PRIVATE_SHADOW names it); 42 one is unreachable.
+# The URL of one argv Python index source: uv names an index as
+# <name>=<url> (the name selects UV_INDEX_<NAME>_* credentials, which the
+# isolated delegate keeps). Only this lane reads the name off; the general
+# source set keeps the selector verbatim.
+private_python_index_url() {
+  local v
+  v=$(source_element_url "$1")
+  [[ "$v" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*=(.+)$ ]] && v="${BASH_REMATCH[1]}"
+  printf '%s' "$v"
+}
+
 private_python_shadow_check() {
   local core="$1" name="$2" origin="$3" norm src url code
   local -a probes=()
   norm=$(private_python_norm "$name")
   PRIVATE_SHADOW=""
   for src in ${CHECK_REGISTRY:-}; do
-    url=$(source_element_url "$src")
+    url=$(private_python_index_url "$src")
     "$core" private-trust under-origin --url "$url" --origin "$origin" >/dev/null 2>&1 && continue
     case "$url" in
       http://*|https://*) probes+=("${url%/}") ;;
@@ -8621,7 +8630,7 @@ private_lane_audit() {
       fi
       local src under=0
       for src in ${CHECK_REGISTRY:-}; do
-        "$core" private-trust under-origin --url "$(source_element_url "$src")" --origin "$origin" >/dev/null 2>&1 && under=1
+        "$core" private-trust under-origin --url "$(private_python_index_url "$src")" --origin "$origin" >/dev/null 2>&1 && under=1
       done
       if (( ! under )); then
         private_finish 20 private_cross_registry \

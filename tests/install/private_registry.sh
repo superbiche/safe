@@ -385,6 +385,12 @@ for flag in --index --default-index; do
   [[ "$rc" == 104 && ! -e "$tmp/delegated" ]] || fail "uv pip install $flag=<name>=<elsewhere>: rc=$rc $(cat "$tmp/out")"
 done
 pass "uv named indexes: --index/--default-index <name>=<origin> install unattended with the index credentials kept; a named index elsewhere BLOCKs (104)"
+( source "$ROOT/lib/gate-lib.sh"
+  SAFE_GATE_REGISTRY=""; safe_gate_scan_target_flags python pip install --index p=https://pypi.org/simple requests==2.32.0
+  [[ "$SAFE_GATE_REGISTRY" == "p=https://pypi.org/simple" ]] ) || fail "the general source set rewrote a uv named index"
+[[ "$(UV_INDEX=p=https://pypi.org/simple bash -c 'source <(sed -n "/^python_env_sources() {/,/^}/p" "$ROOT/bin/safe-audit"); python_bool_truthy() { return 1; }; python_env_sources' 2>/dev/null | head -n 1)" == p=https://pypi.org/simple* ]] \
+  || fail "the environment source set rewrote a uv named index"
+pass "public audits keep a uv named index selector verbatim; only the private lane reads its URL"
 
 # --- go -----------------------------------------------------------------------
 reset_state
