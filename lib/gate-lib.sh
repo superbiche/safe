@@ -4873,13 +4873,16 @@ safe_gate_go() {
   fi
 
   if [[ "${subcommand}" != "install" ]]; then
-    if [[ "${subcommand}" == "build" || "${subcommand}" == "test" ||
-          "${subcommand}" == "vet" || "${subcommand}" == "list" ]]; then
+    if [[ "${subcommand}" == "build" || "${subcommand}" == "test" ]]; then
       # The private lane follows go -C itself, so it runs whatever the cwd.
       safe_gate_private_go "$@" || return $?
       if safe_gate_go_project_present; then
         safe_gate_scan_project || return $?
       fi
+    elif [[ "${subcommand}" == "vet" || "${subcommand}" == "list" ]]; then
+      # No project scan: the scanner's own Go cataloger runs `go list`, so a
+      # scan here re-enters the gate without end.
+      safe_gate_private_go "$@" || return $?
     elif [[ "${subcommand}" == "mod" ]]; then
       case "${second}" in
         download|tidy)

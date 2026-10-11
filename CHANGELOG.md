@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Fix: `go list` and `go vet` no longer run the project scan. The scanner's
+  own Go cataloger runs `go list` through the gate, so on a host with a Go
+  private registry declared every scan started another without end (1.69.0).
+  Both still check the private-registry routing; `go build`, `go test`,
+  `go mod download` and `go mod tidy` scan as before.
+- Fix: the private-registry lane finds npm and go behind mise shims that
+  install.sh binds to the mise wrapper. It resolves the real binary through
+  the real mise in the project directory instead of refusing with "npm could
+  not report its registry" (exit 19, 102 unattended).
+
 ## 1.69.0 - 2026-10-11
 
 - Add operator-managed trust for owner-controlled private registries (npm, Go,
