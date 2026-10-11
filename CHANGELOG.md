@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.69.0 - 2026-10-11
 
 - Add operator-managed trust for owner-controlled private registries (npm, Go,
   PyPI) as trusted origins (operator ruling a37). `safe run private-registry
