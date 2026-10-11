@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.69.2 - 2026-10-11
 
 - The private-registry Python lane accepts uv named indexes on the command
   line (`--index <name>=<url>`, `--default-index <name>=<url>`): for a
