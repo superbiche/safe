@@ -289,7 +289,7 @@ safe_gate_audit_available() { return 0; }
 safe_gate_operator_terminal() { return 1; }
 safe_gate_scan_project() { printf 'SCAN\n' >> "$tmp/scanned"; return 0; }
 [[ "${ROUTE_REAL_CHECK:-0}" == 1 ]] || safe_gate_check_many() { printf 'SPEC %s\n' "$*" > "$tmp/spec"; return 0; }
-safe_gate_exec_real() { printf 'DELEGATED %s PIP_CONFIG_FILE=%s PIP_INDEX_URL=%s UV_NO_CONFIG=%s\n' "$*" "${PIP_CONFIG_FILE:-}" "${PIP_INDEX_URL:-}" "${UV_NO_CONFIG:-}" > "$tmp/delegated"; exit 0; }
+safe_gate_exec_real() { printf 'DELEGATED %s PIP_CONFIG_FILE=%s PIP_INDEX_URL=%s UV_NO_CONFIG=%s UV_INDEX=%s UV_INDEX_P_PASSWORD=%s\n' "$*" "${PIP_CONFIG_FILE:-}" "${PIP_INDEX_URL:-}" "${UV_NO_CONFIG:-}" "${UV_INDEX:-}" "${UV_INDEX_P_PASSWORD:+set}" > "$tmp/delegated"; exit 0; }
 cd "${ROUTE_DIR:-$tmp/fix/npmproj}"
 "$@"
 ROUTE
@@ -373,6 +373,24 @@ rc=0; ROUTE_REAL_CHECK=1 ROUTE_DIR="$tmp/fix/pyproj" PIP_INDEX_URL="$EVIL/simple
 [[ "$rc" == 0 ]] && grep -q 'PIP_CONFIG_FILE=/dev/null PIP_INDEX_URL= ' "$tmp/delegated" \
   || fail "the shipped pip route did not isolate the delegate: rc=$rc $(cat "$tmp/out") $(cat "$tmp/delegated" 2>/dev/null)"
 pass "the shipped pip route delegates a private allow with its configuration switched off and the source env dropped"
+# uv names an index as <name>=<url>: the URL is the source, and the name
+# selects its UV_INDEX_<NAME>_* credentials, which the delegate keeps.
+for flag in --index --default-index; do
+  rm -f "$tmp/delegated"
+  rc=0; ROUTE_REAL_CHECK=1 ROUTE_DIR="$tmp/fix/pyproj" UV_INDEX_P_PASSWORD=fixture UV_INDEX="q=$EVIL/simple" bash "$tmp/route.sh" safe_gate_uv pip install "$flag" "p=$PY_ORIGIN/simple" caviar-redact==0.2.0 > "$tmp/out" 2>&1 || rc=$?
+  [[ "$rc" == 0 ]] && grep -q 'UV_NO_CONFIG=1 UV_INDEX= UV_INDEX_P_PASSWORD=set' "$tmp/delegated" \
+    || fail "uv pip install $flag <name>=<origin>: rc=$rc $(cat "$tmp/out") $(cat "$tmp/delegated" 2>/dev/null)"
+  rm -f "$tmp/delegated"
+  rc=0; ROUTE_REAL_CHECK=1 ROUTE_DIR="$tmp/fix/pyproj" bash "$tmp/route.sh" safe_gate_uv pip install "$flag=p=$EVIL/simple" caviar-redact==0.2.0 > "$tmp/out" 2>&1 || rc=$?
+  [[ "$rc" == 104 && ! -e "$tmp/delegated" ]] || fail "uv pip install $flag=<name>=<elsewhere>: rc=$rc $(cat "$tmp/out")"
+done
+pass "uv named indexes: --index/--default-index <name>=<origin> install unattended with the index credentials kept; a named index elsewhere BLOCKs (104)"
+( source "$ROOT/lib/gate-lib.sh"
+  SAFE_GATE_REGISTRY=""; safe_gate_scan_target_flags python pip install --index p=https://pypi.org/simple requests==2.32.0
+  [[ "$SAFE_GATE_REGISTRY" == "p=https://pypi.org/simple" ]] ) || fail "the general source set rewrote a uv named index"
+[[ "$(UV_INDEX=p=https://pypi.org/simple bash -c 'source <(sed -n "/^python_env_sources() {/,/^}/p" "$ROOT/bin/safe-audit"); python_bool_truthy() { return 1; }; python_env_sources' 2>/dev/null | head -n 1)" == p=https://pypi.org/simple* ]] \
+  || fail "the environment source set rewrote a uv named index"
+pass "public audits keep a uv named index selector verbatim; only the private lane reads its URL"
 
 # --- go -----------------------------------------------------------------------
 reset_state
