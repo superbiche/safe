@@ -187,6 +187,9 @@ TTY gating retains the existing cooperative-agent boundary.
 See [Host Allowlist › Fleet replication](safe-run.md#fleet-replication-export--import)
 for validation, signature-keyring and operator-override details.
 
+The same follow also takes each origin's signed private-registry statement
+(`private-registries.<host>.json`); see [private registries](private-registries.md#fleet-propagation).
+
 ## Safe release follow
 
 `safe release follow` owns L7 release verification and installation. A daily

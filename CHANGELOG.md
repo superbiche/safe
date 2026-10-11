@@ -1,5 +1,64 @@
 # Changelog
 
+## Unreleased
+
+- Add operator-managed trust for owner-controlled private registries (npm, Go,
+  PyPI) as trusted origins (operator ruling a37). `safe run private-registry
+  add` declares that a namespace resolves only from one canonical origin; a
+  package of that namespace the package manager fetches from that origin is
+  trusted like a local artifact. It proceeds unattended as gate exit 18
+  `ALLOWED_VIA_PRIVATE_REGISTRY`, with one audit line naming registry,
+  origin, name and version, and never consults OSV, Socket or public publish
+  dates for the private name. There is no per-version pin, integrity record
+  or revocation. The guardrail is origin binding, decided by asking or
+  controlling the manager:
+  - npm: `npm config get @scope:registry` (with the command's config files
+    and argv selectors) must map every registered scope to its origin (an
+    unmapped scope BLOCKs every npm install/ci, ruling a43), and every
+    lockfile entry whose path, name or alias target is private (v1, v2, v3)
+    must resolve under the origin;
+  - Go: `go env` in the command's context must route each registered
+    namespace to its origin on every module-downloading command; local
+    `file://` GOPROXY entries may come first;
+  - Python: `pip install` / `uv pip install` of explicit specs delegate with
+    their configuration switched off (`PIP_CONFIG_FILE=/dev/null`,
+    `UV_NO_CONFIG=1`) and the source environment dropped, so an argv index
+    at the origin is checked against the whole source set; other argv
+    indexes and PyPI are probed for a namesake.
+
+  BLOCK class `private` (20/104, typed override at a terminal, never
+  recorded) covers any other source: a scope mapped elsewhere, a lockfile
+  entry resolved elsewhere, Go routed around the origin, a missing origin
+  index, a namesake on another index, argv find-links or `--no-index`. Gate
+  exit 19 asks the operator (102 unattended) for a namespace claimed by two
+  origins, a non-exact spec, and routes the lane does not model (bun, uv run
+  and uv tool, mise `pipx:`, requirements files, `uv --config-file`,
+  pnpm/yarn/bun projects, npm workspace roots, lockfile-redirecting flags,
+  lockfile entries without a resolved URL). Credentials stay with each
+  client; safe never reads or logs them.
+- The private lane keeps the local blocklist for every named private Go module
+  and npm private entry, walks Python requirement files through their
+  `-r`/`-c` includes (bounded; an unreadable, remote or out-of-bounds
+  include asks; other files keep baseline public handling), checks Go remote
+  `replace` destinations against the blocklist, never counts an observed
+  source with `.`/`..` path segments as under the origin, binds npm v3
+  alias entries to their private targets, prints sources without userinfo,
+  query or fragment in every sink, and logs an audit line for every bypass
+  (a Go namespace or npm name with no identity yet gets a `command=` line; an
+  allow without a line is refused).
+- Fleet propagation of that trust. An origin republishes a signed
+  `private-registries.<host>.json` with every change, and `safe run host-allow
+  follow` follows it. A newer statement replaces the origin's previous one, so
+  removals propagate, and `follow-signer remove` withdraws a key's statements
+  at once. The trust core is `safe-core private-trust` (`internal/privtrust`).
+  See `docs/private-registries.md`.
+- `safe run host-allow add|update` of a private name is refused: its origin is
+  trusted already, and the public registry's integrity would describe another
+  artifact.
+- Safe audits the packages an operation names, not what a package manager
+  pulls in beside them (a pre-existing limitation, now documented with its
+  follow-up). A private root is treated like any audited public root.
+
 ## 1.68.1 - 2026-10-07
 
 - `safe release follow` advances a checked-out default branch with its index

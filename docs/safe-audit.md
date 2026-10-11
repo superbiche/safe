@@ -659,6 +659,18 @@ proceed:
   `n` being that confirmation; no clean receipt is minted for a declined
   check. Non-interactive shells refuse 102 — the operator hands over the
   complete pinned command.
+- **Private registries (exits 18/19, BLOCK class `private`)**: a name in the
+  namespace of an operator-authorized private registry never reaches public
+  evidence. It is a trusted origin (ruling a37): exit 18 proceeds unattended
+  when the package manager would fetch it from the registry's canonical
+  origin and names registry, origin, name and version; exit 19 needs an
+  operator decision (102 unattended); any other source BLOCKs with class
+  `private` (never recordable). `safe audit private-npm-project`,
+  `safe audit private-go` and `safe audit private-python-project` are the
+  npm-family, Go and requirements-file checks the wrappers run before
+  delegating. `package-audit` takes the gate's Python context flags
+  `--find-links-selected`, `--python-isolated` and
+  `--uv-config-file-selected`. See [private registries](private-registries.md).
 - **BLOCK** refuses (exit 20) and points at operator review. At an operator
   terminal, a BLOCK on one exact resolved version takes a typed override
   (`<pkg>@<version>` installs once; `record <pkg>@<version>` also records an

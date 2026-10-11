@@ -255,6 +255,25 @@ composer update
 
 Non-install and non-exec commands pass through unchanged.
 
+When an operator-authorized private registry exists, project operations also
+check the origin binding of their private identities before delegating
+(trusted origins): npm `install|ci|update|dedupe|prune` check that every
+registered scope maps to its origin and that every private lockfile entry
+resolves there, and `go build|test|vet|list`, a local `go run`/`go install`
+and the downloading `go mod` commands check that `go env` routes every
+registered namespace to its origin (local `file://` sources may come first).
+Each private identity logs `ALLOWED_VIA_PRIVATE_REGISTRY` or reaches the
+private termini 19/20; pnpm, yarn and bun projects naming a private package
+ask the operator. Explicit `pip install` / `uv pip install` specs carry
+`--python-isolated`: when the lane allows a private name the delegate runs
+with its configuration switched off and its source environment dropped, so
+the argv sources the lane checked are the installer's whole source set;
+`uv --config-file` is flagged; a requirements file naming a private package
+(its `-r`/`-c` includes walked, bounded) asks, and so does one that cannot be
+fully inventoried. A private-registry allow on a project operation that
+carries no complete audit line is refused. With no private registry configured this costs one file test. See
+[private registries](private-registries.md).
+
 ## Wrapped Exec and Update Commands
 
 Exec-style subcommands that fetch and run registry packages are audited the

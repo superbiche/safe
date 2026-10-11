@@ -1646,8 +1646,30 @@ handle_runner_invocation() {
 # ---------------------------------------------------------------------------
 # Subcommands: host-allow
 # ---------------------------------------------------------------------------
+# A name on a private-registry lane is trusted by its origin (ruling a37):
+# a host-allow pin cannot add anything, and the public registry's integrity
+# would describe another artifact with the same name. Returns 2 when the
+# name is not private; otherwise says why and returns 1.
+private_integrity_for_host_allow() {
+  local eco="$1" pkg="$2" lane
+  [[ -s "$(trust_store_file private-registries.json)" || -s "$(trust_store_file private-follow-state.json)" ]] || return 2
+  lane=$(private_core match --ecosystem "$eco" --name "$pkg" 2>/dev/null | jq -r '.lane // "none"' 2>/dev/null) || lane=""
+  case "$lane" in
+    none) return 2 ;;
+    private) err "$pkg is on a private-registry lane: installs from its origin are trusted already, so a host-allow pin adds nothing" ;;
+    *) err "$pkg could not be checked against the private-registry trust (malformed stores or conflicting origins); not pinned" ;;
+  esac
+  return 1
+}
+
 registry_integrity_npm() {
-  local pkg="$1" version="$2" body resolved digest
+  local pkg="$1" version="$2" body resolved digest private_rc=0
+  digest=$(private_integrity_for_host_allow npm "$pkg" "$version") || private_rc=$?
+  case "$private_rc" in
+    0) [[ -n "$digest" ]] && { printf '%s' "$digest"; return 0; }; return 1 ;;
+    2) ;;
+    *) return 1 ;;
+  esac
   local url="https://registry.npmjs.org/${pkg}/${version}"
   body=$(curl -fsSL --max-time 10 "$url" 2>/dev/null) || return 1
   resolved=$(printf '%s' "$body" | jq -r '.version // empty' 2>/dev/null) || return 1
@@ -1658,7 +1680,13 @@ registry_integrity_npm() {
 }
 
 registry_integrity_pypi() {
-  local pkg="$1" version="$2" body resolved digest
+  local pkg="$1" version="$2" body resolved digest private_rc=0
+  digest=$(private_integrity_for_host_allow python "$pkg" "$version") || private_rc=$?
+  case "$private_rc" in
+    0) [[ -n "$digest" ]] && { printf '%s' "$digest"; return 0; }; return 1 ;;
+    2) ;;
+    *) return 1 ;;
+  esac
   local url="https://pypi.org/pypi/${pkg}/${version}/json"
   body=$(curl -fsSL --max-time 10 "$url" 2>/dev/null) || return 1
   resolved=$(printf '%s' "$body" | jq -r '.info.version // empty' 2>/dev/null) || return 1
@@ -1831,7 +1859,15 @@ cmd_host_allow() {
     review) cmd_host_allow_review "$@" ;;
     export) cmd_host_allow_export "$@" ;;
     import) cmd_host_allow_import "$@" ;;
-    follow) cmd_host_allow_follow "$@" ;;
+    follow)
+      # One follow covers both signed statements a fleet origin publishes:
+      # the host-allow grants and the private-registry trust.
+      local follow_rc=0 private_follow_rc=0
+      cmd_host_allow_follow "$@" || follow_rc=$?
+      cmd_private_registry_follow "$@" || private_follow_rc=$?
+      (( follow_rc == 0 )) || return "$follow_rc"
+      return "$private_follow_rc"
+      ;;
     follow-signer) cmd_host_allow_follow_signer "$@" ;;
     list|ls|"") cmd_host_allow_list ;;
     *)      die "unknown host-allow subcommand: $sub" ;;
@@ -1979,6 +2015,15 @@ host_allow_export_signed() (
     '.schema = "safe-host-allow-export/2" | .host = $host | .exported_at = $exported_at' \
     <<<"$document" > "$staging/export.json" \
     || die "could not project the signed export document"
+  signed_export_publish "$staging" "$dest" "safe run host-allow export --sign"
+)
+
+# Sign $staging/export.json and publish it with its detached signature at
+# $dest(.asc). The signature lands first; the two renames are individually
+# atomic and a reader seeing mixed generations rejects the pair. Shared by
+# the host-allow and private-registry exports. $3 is the retry command.
+signed_export_publish() {
+  local staging="$1" dest="$2" retry="$3" signing_key
   signing_key=$(config_get '.follow.signing_key' '')
   local key_args=()
   [[ -z "$signing_key" ]] || key_args=(--local-user "$signing_key")
@@ -1986,11 +2031,11 @@ host_allow_export_signed() (
     --output "$staging/export.json.asc" -- "$staging/export.json" \
     || die "could not sign export; check follow.signing_key or the default GPG key and retry at an operator terminal"
   mv -f -- "$staging/export.json.asc" "$dest.asc" \
-    || die "could not publish $dest.asc; the previous export is unchanged — retry: safe run host-allow export --sign"
+    || die "could not publish $dest.asc; the previous export is unchanged — retry: $retry"
   mv -f -- "$staging/export.json" "$dest" \
-    || die "could not publish $dest after its signature; followers reject the mismatched pair until you retry: safe run host-allow export --sign"
+    || die "could not publish $dest after its signature; followers reject the mismatched pair until you retry: $retry"
   info "signed export: $dest (signature: $dest.asc)"
-)
+}
 
 cmd_host_allow_import() {
   trust_redirected_guard write "host-allow-import"
@@ -2609,6 +2654,58 @@ follow_apply_generation() {
   return "$commit_rc"
 }
 
+# The pinned follow.signers as an upper-cased JSON array; non-zero when the
+# configuration is invalid (followers then verify nothing).
+follow_pinned_signers() {
+  local config
+  config=$(trust_store_file config.json)
+  if [[ ! -e "$config" ]]; then
+    printf '[]'
+    return 0
+  fi
+  jq -ce '
+    if .follow.signers == null then [] else .follow.signers end |
+    if type == "array" and all(.[]; type == "string" and test("^([A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})$"))
+    then map(ascii_upcase) | unique else error("invalid follow.signers") end' \
+    "$config" 2>/dev/null
+}
+
+# Build the isolated verifier keyring in $1/keyring from the pinned primary
+# keys only; it never fetches a key.
+follow_keyring_init() {
+  local staging="$1" signers="$2" fingerprint
+  mkdir -m 700 "$staging/keyring"
+  while IFS= read -r fingerprint; do
+    if follow_export_key "$fingerprint" "$staging/key.gpg"; then
+      gpg --no-options --homedir "$staging/keyring" --batch --no-auto-key-retrieve --auto-key-locate clear \
+        --import "$staging/key.gpg" >/dev/null 2>&1 || true
+    fi
+  done < <(jq -r '.[]' <<<"$signers")
+}
+
+# Copy a document and its signature into private staging (the sync
+# transport is untrusted and may replace the originals at any moment) and
+# verify them there; GPG status lands in $2/status.
+follow_verify_copy() {
+  local file="$1" staging="$2"
+  [[ -f "$file" && -f "$file.asc" ]] &&
+    cp -- "$file" "$staging/export.json" 2>/dev/null &&
+    cp -- "$file.asc" "$staging/export.json.asc" 2>/dev/null &&
+    gpg --no-options --homedir "$staging/keyring" --batch --no-auto-key-retrieve --auto-key-locate clear \
+      --status-fd 1 --verify "$staging/export.json.asc" "$staging/export.json" > "$staging/status" 2>/dev/null
+}
+
+# Print the verified primary fingerprint when the signature is current and
+# made by one pinned primary (or its certified subkey); non-zero otherwise.
+# GPG's machine-readable primary fingerprint is checked, not only its exit.
+follow_verified_primary() {
+  local staging="$1" signers="$2" primary
+  primary=$(awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" {print (NF >= 12 ? $12 : $3)}' "$staging/status")
+  follow_signature_current "$staging/status" || return 1
+  jq -e --arg f "$primary" 'index($f) != null' <<<"$signers" >/dev/null || return 1
+  printf '%s' "$primary"
+}
+
 cmd_host_allow_follow() (
   trust_redirected_guard write "host-allow-follow"
   local from="$HOME/Sync/state/safe" dry_run=0
@@ -2632,24 +2729,11 @@ cmd_host_allow_follow() (
   done
   (( ${#files[@]} )) || { info "follow: nothing to do"; return 0; }
   require_cmd gpg
-  local staging config signers='[]' fingerprint valid_config=1
+  local staging signers='[]' valid_config=1
   staging=$(mktemp -d)
   trap 'rm -rf -- "$staging"' EXIT
-  mkdir -m 700 "$staging/keyring"
-  config=$(trust_store_file config.json)
-  if [[ -e "$config" ]]; then
-    signers=$(jq -ce '
-      if .follow.signers == null then [] else .follow.signers end |
-      if type == "array" and all(.[]; type == "string" and test("^([A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})$"))
-      then map(ascii_upcase) | unique else error("invalid follow.signers") end' \
-      "$config" 2>/dev/null) || { signers='[]'; valid_config=0; }
-  fi
-  local verifier=(gpg --no-options --homedir "$staging/keyring" --batch --no-auto-key-retrieve --auto-key-locate clear)
-  while IFS= read -r fingerprint; do
-    if follow_export_key "$fingerprint" "$staging/key.gpg"; then
-      "${verifier[@]}" --import "$staging/key.gpg" >/dev/null 2>&1 || true
-    fi
-  done < <(jq -r '.[]' <<<"$signers")
+  signers=$(follow_pinned_signers) || { signers='[]'; valid_config=0; }
+  follow_keyring_init "$staging" "$signers"
 
   # Bind all local reads and writes to the guard-selected store. A corrupt
   # local store must never be silently replaced by a follower.
@@ -2665,18 +2749,11 @@ cmd_host_allow_follow() (
     # Work only on private snapshots after signature verification. The sync
     # transport is untrusted and may replace the original at any moment.
     if (( ! valid_config )) || [[ ! "$origin" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
-       [[ ! -f "$file" || ! -f "$file.asc" ]] ||
-       ! cp -- "$file" "$staging/export.json" 2>/dev/null ||
-       ! cp -- "$file.asc" "$staging/export.json.asc" 2>/dev/null ||
-       ! "${verifier[@]}" --status-fd 1 --verify "$staging/export.json.asc" "$staging/export.json" > "$staging/status" 2>/dev/null; then
+       ! follow_verify_copy "$file" "$staging"; then
       warn "WARN follow: skipped $(printf '%q' "$file") (unsigned, invalid signature, unavailable/unpinned key, or invalid signer config)"
       signature_skips=$((signature_skips + 1)); continue
     fi
-    # Check GPG's machine-readable primary fingerprint as well as its exit
-    # status. Trust belongs to a pinned primary and its certified subkeys.
-    verified_primary=$(awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" {print (NF >= 12 ? $12 : $3)}' "$staging/status")
-    if ! follow_signature_current "$staging/status" ||
-       ! jq -e --arg f "$verified_primary" 'index($f) != null' <<<"$signers" >/dev/null; then
+    if ! verified_primary=$(follow_verified_primary "$staging" "$signers"); then
       warn "WARN follow: skipped $(printf '%q' "$file") (signature is revoked, expired, or not good from one pinned primary key)"
       signature_skips=$((signature_skips + 1)); continue
     fi
@@ -2705,6 +2782,273 @@ cmd_host_allow_follow() (
     return 1
   fi
 )
+
+# ---------------------------------------------------------------------------
+# Subcommands: private-registry
+#
+# Operator-managed trust for owner-controlled private registries (trusted
+# origins, ruling a37). A registry declares that a namespace resolves ONLY
+# from one canonical origin; the install gate trusts a package of that
+# namespace like a local artifact when the package manager would fetch it
+# from that origin, and blocks it otherwise. There is no per-version pin. The
+# decision core is safe-core private-trust; safe never handles a registry
+# credential.
+#
+# Registry changes are operator-TTY only, refused on a redirected trust root,
+# and logged. A host that publishes a signed export republishes
+# its private-registry statement in the same gesture; followers take it
+# through `safe run host-allow follow` (or `private-registry follow`).
+# ---------------------------------------------------------------------------
+
+private_core_path() {
+  local bin="${SAFE_CORE_BIN:-}"
+  if [[ -z "$bin" ]]; then
+    bin="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/safe-core"
+  fi
+  [[ -x "$bin" ]] || die "safe-core is missing (expected beside safe-run); rerun install.sh"
+  printf '%s' "$bin"
+}
+
+# private_core <subcommand> [flags...] against the guard-selected trust root.
+private_core() {
+  local sub="$1"
+  shift
+  "$(private_core_path)" private-trust "$sub" \
+    --policy "$(trust_store_file private-registries.json)" \
+    --follow-state "$(trust_store_file private-follow-state.json)" \
+    --config "$(trust_store_file config.json)" "$@"
+}
+
+require_operator_tty_private() {
+  local action="$1"
+  is_tty && return 0
+  err "BLOCKED: private-registry $action requires an interactive operator terminal"
+  err "  ask the operator to run: safe run private-registry $action"
+  err "  agent contract: safe explain"
+  exit 102
+}
+
+private_eco_canonical() {
+  case "$1" in
+    npm|bun) printf 'npm' ;;
+    go|golang) printf 'go' ;;
+    py|python|pip|pypi|uv|pipx) printf 'python' ;;
+    *) return 1 ;;
+  esac
+}
+
+# A host is an origin when it already publishes a signed export.
+private_registry_auto_export() {
+  local host dir="$HOME/Sync/state/safe"
+  [[ "$(jq -r '.follow.auto_export | if . == false then "false" else "true" end' \
+    "$CONFIG_FILE" 2>/dev/null || echo true)" == "true" ]] || return 0
+  host=$(hostname -s 2>/dev/null) || return 0
+  [[ -f "$dir/host-allow.$host.json" || -f "$dir/private-registries.$host.json" ]] || return 0
+  if ! is_tty; then
+    warn "private-registry trust changed, but the signed statement was not refreshed (no operator terminal); followers keep the previous one until you run: safe run private-registry export --sign"
+    return 0
+  fi
+  info "republishing the signed private-registry statement for followers"
+  if ! ( cmd_private_registry_export --sign ); then
+    warn "private-registry trust changed, but the signed statement was not refreshed; followers keep the previous one until you run: safe run private-registry export --sign"
+  fi
+  return 0
+}
+
+cmd_private_registry() {
+  local sub="${1:-list}"
+  shift || true
+  case "$sub" in
+    add) cmd_private_registry_add "$@" ;;
+    remove|rm) cmd_private_registry_remove "$@" ;;
+    list|ls) cmd_private_registry_list "$@" ;;
+    export) cmd_private_registry_export "$@" ;;
+    follow) cmd_private_registry_follow "$@" ;;
+    forget-origin) cmd_private_registry_forget_origin "$@" ;;
+    *) die "unknown private-registry subcommand: $sub (add|remove|list|export|follow|forget-origin)" ;;
+  esac
+}
+
+cmd_private_registry_add() {
+  trust_redirected_guard write "private-registry-add"
+  local id="${1:-}"
+  [[ -n "$id" && "$id" != -* ]] || die 'usage: safe run private-registry add <id> --ecosystem npm|go|python --origin <https-url> --namespace <ns> [--namespace <ns>]... [--owner <owner>] --reason "..."'
+  shift
+  require_operator_tty_private "add $id ..."
+  local ecosystem="" origin="" owner="" reason=""
+  local -a ns_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ecosystem) ecosystem="${2:-}"; shift 2 ;;
+      --origin) origin="${2:-}"; shift 2 ;;
+      --namespace) ns_args+=(--namespace "${2:-}"); shift 2 ;;
+      --owner) owner="${2:-}"; shift 2 ;;
+      --reason) reason="${2:-}"; shift 2 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+  ecosystem=$(private_eco_canonical "$ecosystem") || die "--ecosystem must be npm, go or python"
+  [[ -n "$origin" ]] || die "--origin is required"
+  (( ${#ns_args[@]} > 0 )) || die "--namespace is required"
+  [[ -n "${reason// /}" ]] || die "--reason is required"
+  [[ "$SAFE_RUN_NO_INIT" == "1" ]] || ensure_dirs
+  local out
+  out=$(private_core registry-add --id "$id" --ecosystem "$ecosystem" --origin "$origin" "${ns_args[@]}" \
+    --owner "$owner" \
+    --added "$(date -I)" --reason "$reason" 2>&1) || die "${out#safe-core: private-trust registry-add: }"
+  audit_log "private-registry" "$id" "TRUST" "$(context_label)" "PRIVATE_REGISTRY_ADDED" \
+    "ecosystem=$ecosystem origin=$(jq -r '.origin' <<<"$out") namespace=$(jq -r '.namespace | join(",")' <<<"$out")"
+  info "added private registry $id: $(jq -r '"\(.ecosystem) \(.origin) namespace \(.namespace | join(", "))"' <<<"$out")"
+  info "installs of that namespace fetched from this origin are now trusted without public audit, and any other source for it is blocked; package-manager credentials stay in the manager's own config (npm .npmrc, go GOAUTH/netrc, pip netrc)"
+  private_registry_auto_export
+}
+
+cmd_private_registry_remove() {
+  trust_redirected_guard write "private-registry-remove"
+  local id="${1:-}"
+  [[ -n "$id" ]] || die "usage: safe run private-registry remove <id>"
+  require_operator_tty_private "remove $id"
+  local out
+  out=$(private_core registry-remove --id "$id" 2>&1) || die "${out#safe-core: private-trust registry-remove: }"
+  audit_log "private-registry" "$id" "TRUST" "$(context_label)" "PRIVATE_REGISTRY_REMOVED"
+  info "removed private registry $id"
+  private_registry_auto_export
+}
+
+cmd_private_registry_list() {
+  local json=0
+  [[ "${1:-}" == "--json" ]] && json=1
+  local out
+  out=$(private_core list 2>&1) || die "${out#safe-core: private-trust list: }"
+  if (( json )); then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  if [[ "$(jq '.registries | length' <<<"$out")" == "0" ]]; then
+    info "no private registries"
+  else
+    jq -r '.registries[] | "\(.source.kind)\(if .source.host then " (" + .source.host + ")" else "" end)\t\(.id)\t\(.ecosystem)\t\(.origin)\t\(.namespace | join(","))"' <<<"$out"
+  fi
+  if [[ "$(jq '.conflicts | length' <<<"$out")" != "0" ]]; then
+    jq -r '.conflicts[] | "CONFLICT: " + .' <<<"$out" >&2
+    return 1
+  fi
+}
+
+cmd_private_registry_export() (
+  local sign=0 out_dir="$HOME/Sync/state/safe" out_set=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --sign) sign=1; shift ;;
+      --out) [[ $# -ge 2 && -n "$2" ]] || die "--out requires a directory"
+        out_dir="$2"; out_set=1; shift 2 ;;
+      *) die "unknown flag: $1 (usage: safe run private-registry export [--sign [--out <dir>]])" ;;
+    esac
+  done
+  (( sign || ! out_set )) || die "--out requires --sign"
+  local host
+  host=$(hostname -s)
+  [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid short hostname"
+  if (( sign )); then
+    trust_redirected_guard write "private-registry-export-sign"
+    require_operator_tty_private "export --sign"
+    require_cmd gpg
+  fi
+  local document
+  document=$(private_core export --host "$host" --exported-at "$(now_iso)" 2>&1) \
+    || die "${document#safe-core: private-trust export: }"
+  if (( ! sign )); then
+    printf '%s\n' "$document"
+    return 0
+  fi
+  local staging dest="$out_dir/private-registries.$host.json"
+  mkdir -p -- "$out_dir" || die "could not create the export directory $out_dir"
+  staging=$(mktemp -d "$out_dir/.private-registries-sign.XXXXXX") || die "could not stage the signed statement in $out_dir"
+  trap 'rm -rf -- "$staging"' EXIT
+  printf '%s\n' "$document" > "$staging/export.json" || die "could not stage the signed statement"
+  signed_export_publish "$staging" "$dest" "safe run private-registry export --sign"
+  audit_log "private-registry" "export" "TRUST" "$(context_label)" "PRIVATE_STATEMENT_PUBLISHED" "dest=$dest"
+)
+
+# Follow every other host's signed private-registry statement in the sync
+# directory. A newer generation REPLACES that origin's previous statement in
+# the local follow ledger (so its removals propagate); file
+# absence never revokes. Verification is the host-allow follow verifier.
+cmd_private_registry_follow() (
+  trust_redirected_guard write "private-registry-follow"
+  local from="$HOME/Sync/state/safe" dry_run=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=1; shift ;;
+      --from) [[ $# -ge 2 && -n "$2" ]] || die "--from requires a directory"
+        from="$2"; shift 2 ;;
+      *) die "unknown flag: $1 (usage: safe run private-registry follow [--dry-run] [--from <dir>])" ;;
+    esac
+  done
+  [[ -e "$from" ]] || { info "private-registry follow: nothing to do ($from absent)"; return 0; }
+  [[ -d "$from" && -r "$from" && -x "$from" ]] || die "cannot read follow directory: $from"
+  local host file origin
+  host=$(hostname -s)
+  local files=()
+  shopt -s nullglob
+  for file in "$from"/private-registries.*.json; do
+    [[ "${file##*/}" == "private-registries.$host.json" ]] || files+=("$file")
+  done
+  (( ${#files[@]} )) || return 0
+  require_cmd gpg
+  local staging signers valid_config=1
+  staging=$(mktemp -d)
+  trap 'rm -rf -- "$staging"' EXIT
+  signers=$(follow_pinned_signers) || { signers='[]'; valid_config=0; }
+  follow_keyring_init "$staging" "$signers"
+  local -a dry=()
+  (( dry_run )) && dry=(--dry-run)
+  local applied=0 current=0 skips=0 failures=0 primary out rc
+  for file in "${files[@]}"; do
+    origin="${file##*/}"; origin="${origin#private-registries.}"; origin="${origin%.json}"
+    if (( ! valid_config )) || [[ ! "$origin" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+       ! follow_verify_copy "$file" "$staging" ||
+       ! primary=$(follow_verified_primary "$staging" "$signers"); then
+      warn "WARN private-registry follow: skipped $(printf '%q' "$file") (unsigned, invalid or unpinned signature, or invalid signer config)"
+      skips=$((skips + 1)); continue
+    fi
+    rc=0
+    out=$("$(private_core_path)" private-trust follow-apply \
+      --follow-state "$(trust_store_file private-follow-state.json)" \
+      --host "$origin" --signer "$primary" --statement "$staging/export.json" "${dry[@]}") || rc=$?
+    case "$rc" in
+      0)
+        if [[ "$(jq -r '.result' <<<"$out")" == "current" ]]; then
+          current=$((current + 1))
+        else
+          applied=$((applied + 1))
+          info "$( (( dry_run )) && printf 'would follow' || printf 'followed') private registries from $origin (generation $(jq -r '.generation' <<<"$out")): $(jq -r '.registries | join(", ")' <<<"$out")"
+          (( dry_run )) || audit_log "private-registry" "follow:$origin" "TRUST" "$(context_label)" "PRIVATE_STATEMENT_FOLLOWED" \
+            "generation=$(jq -r '.generation' <<<"$out") signer=$primary registries=$(jq -r '.registries | join(",")' <<<"$out")"
+        fi
+        ;;
+      5) warn "WARN private-registry follow: refused an older statement from $origin"; failures=$((failures + 1)) ;;
+      6) warn "WARN private-registry follow: refused a different statement with the already-accepted generation from $origin (collision)"; failures=$((failures + 1)) ;;
+      *) warn "WARN private-registry follow: invalid statement from $origin"; failures=$((failures + 1)) ;;
+    esac
+  done
+  if (( applied == 0 && skips == 0 && failures == 0 )); then
+    info "private-registry follow: already at the current generation ($current files)"
+  fi
+  (( skips == 0 && failures == 0 ))
+)
+
+cmd_private_registry_forget_origin() {
+  trust_redirected_guard write "private-registry-forget-origin"
+  local host="${1:-}"
+  [[ -n "$host" ]] || die "usage: safe run private-registry forget-origin <host>"
+  require_operator_tty_private "forget-origin $host"
+  local out
+  out=$("$(private_core_path)" private-trust forget-origin \
+    --follow-state "$(trust_store_file private-follow-state.json)" --host "$host" 2>&1) || die "${out#safe-core: private-trust forget-origin: }"
+  audit_log "private-registry" "follow:$host" "TRUST" "$(context_label)" "PRIVATE_ORIGIN_FORGOTTEN"
+  info "forgot the private-registry statement followed from $host (a still-present signed file is accepted again on the next follow unless its signer is removed)"
+}
 
 require_operator_tty() {
   # Trust escalations are operator-only: agents may suggest the command
@@ -4058,6 +4402,10 @@ main() {
           && ( "${2:-}" == "review" || "${2:-}" == "export" || "${2:-}" == "import" \
             || "${2:-}" == "follow" || "${2:-}" == "follow-signer" ) ]]; then
       :
+    elif [[ "$argv0" == "safe-run" && "${1:-}" == "private-registry" ]]; then
+      # Each private-registry write initializes state itself, after its
+      # operator-TTY gate; reports and follow must not seed trust files.
+      :
     else
       ensure_dirs
     fi
@@ -4069,6 +4417,7 @@ main() {
     fi
     case "$1" in
       host-allow) shift; cmd_host_allow "$@" ;;
+      private-registry) shift; cmd_private_registry "$@" ;;
       scripts-allow) shift; cmd_scripts_allow "$@" ;;
       block)      shift; cmd_block "$@" ;;
       audit)      shift; cmd_audit "$@" ;;

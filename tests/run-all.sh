@@ -27,6 +27,7 @@ SUITES=(
   tests/go/run.sh
   tests/live/npm_config_oracle.sh
   tests/live/npm_abbrev_oracle.sh
+  tests/live/private_registry_npm_oracle.sh
   tests/live/composer_abbrev_oracle.sh
   tests/live/shim_delegation.sh
   tests/install/run.sh
@@ -35,6 +36,7 @@ SUITES=(
   tests/install/gate_adverse_warn_override.sh
   tests/install/reuse.sh
   tests/install/gate_block_override.sh
+  tests/install/private_registry.sh
   tests/audit/check_version_aware.sh
   tests/audit/socket_tier.sh
   tests/audit/tools_scan.sh
@@ -55,6 +57,7 @@ SUITES=(
   tests/run/host_allow_review.sh
   tests/run/host_allow_export_import.sh
   tests/run/host_allow_follow.sh
+  tests/run/private_registry_follow.sh
   tests/run/release_follow.sh
   tests/run/safe_audit_integration.sh
   tests/run/scripts_allow.sh
