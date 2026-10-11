@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.69.1 - 2026-10-11
 
 - Fix: `go list` and `go vet` no longer run the project scan. The scanner's
   own Go cataloger runs `go list` through the gate, so on a host with a Go
