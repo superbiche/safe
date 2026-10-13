@@ -143,6 +143,10 @@ LAST_SCAN_RESULT_PATH=""
 # reads the snapshot instead.
 LAST_SCAN_RESULT_SNAPSHOT=""
 SCAN_RESULT_OUT=""
+# Requirement/constraint files a gate caller named explicitly
+# (--pip-requirement): audited by the pip-audit lane whatever their
+# basename, and part of the scan-cache evidence.
+declare -a SCAN_PIP_REQUIREMENTS=()
 # Which evidence tiers came back degraded on the last scan. The result JSON has
 # carried this in tool_status all along, but the surface's closing line said
 # "finished" either way, so a lost tier read as a completed audit.
@@ -1604,6 +1608,11 @@ project_ecosystem_should_audit() {
   local configured="${PROJECT_ECOSYSTEMS[$ecosystem]:-}"
   [[ "$configured" == "false" ]] && return 1
   [[ "$configured" == "true" ]] && return 0
+  # Requirement files named by the caller are python evidence even when
+  # the root carries no conventionally-named python file.
+  if [[ "$ecosystem" == "python" ]] && (( ${#SCAN_PIP_REQUIREMENTS[@]} > 0 )); then
+    return 0
+  fi
   project_ecosystem_detected "$root" "$ecosystem"
 }
 
@@ -2459,6 +2468,18 @@ run_pip_audit_dir() {
   local candidate
   for candidate in requirements.txt requirements-dev.txt; do
     [[ -f "$dir/$candidate" ]] && invocations+=("-r|$dir/$candidate")
+  done
+  # Files the caller named explicitly (--pip-requirement): audited
+  # whatever their basename, each once even if also discovered above.
+  local extra_req extra_real seen_inv
+  for extra_req in ${SCAN_PIP_REQUIREMENTS[@]+"${SCAN_PIP_REQUIREMENTS[@]}"}; do
+    extra_real="$(realpath -e -- "$extra_req" 2>/dev/null)" || continue
+    seen_inv=0
+    for candidate in ${invocations[@]+"${invocations[@]}"}; do
+      [[ "$candidate" == "-r|"* ]] || continue
+      [[ "$(realpath -e -- "${candidate#-r|}" 2>/dev/null)" == "$extra_real" ]] && seen_inv=1
+    done
+    (( seen_inv )) || invocations+=("-r|$extra_real")
   done
   [[ -f "$dir/pyproject.toml" ]] && invocations+=("project|$dir")
 
@@ -3353,7 +3374,8 @@ scan_cache_scanner_fingerprint() {
 scan_cache_evidence_paths() {
   local root name path
   for path in ${CURRENT_LOCKFILES[@]+"${CURRENT_LOCKFILES[@]}"} \
-              ${CURRENT_MANIFESTS[@]+"${CURRENT_MANIFESTS[@]}"}; do
+              ${CURRENT_MANIFESTS[@]+"${CURRENT_MANIFESTS[@]}"} \
+              ${SCAN_PIP_REQUIREMENTS[@]+"${SCAN_PIP_REQUIREMENTS[@]}"}; do
     [[ -n "$path" ]] && printf '%s\n' "$path"
   done
   for root in ${CURRENT_PROJECT_ROOTS[@]+"${CURRENT_PROJECT_ROOTS[@]}"}; do
@@ -4737,6 +4759,18 @@ run_pip_audit_dir() {
   local candidate
   for candidate in requirements.txt requirements-dev.txt; do
     [[ -f "$dir/$candidate" ]] && invocations+=("-r|$dir/$candidate")
+  done
+  # Files the caller named explicitly (--pip-requirement): audited
+  # whatever their basename, each once even if also discovered above.
+  local extra_req extra_real seen_inv
+  for extra_req in ${SCAN_PIP_REQUIREMENTS[@]+"${SCAN_PIP_REQUIREMENTS[@]}"}; do
+    extra_real="$(realpath -e -- "$extra_req" 2>/dev/null)" || continue
+    seen_inv=0
+    for candidate in ${invocations[@]+"${invocations[@]}"}; do
+      [[ "$candidate" == "-r|"* ]] || continue
+      [[ "$(realpath -e -- "${candidate#-r|}" 2>/dev/null)" == "$extra_real" ]] && seen_inv=1
+    done
+    (( seen_inv )) || invocations+=("-r|$extra_real")
   done
   [[ -f "$dir/pyproject.toml" ]] && invocations+=("project|$dir")
 
@@ -11454,6 +11488,18 @@ scan_parse_shared_flag() {
       SCAN_RESULT_OUT="$next"
       SCAN_FLAG_SHIFT=2
       ;;
+    --pip-requirement)
+      # A requirement/constraint file the install command named, threaded
+      # by the gate so its packages are audited whatever the basename.
+      [[ "$have_next" == "1" ]] || die "--pip-requirement requires a path"
+      SCAN_PIP_REQUIREMENTS+=("$next")
+      SCAN_FLAG_SHIFT=2
+      ;;
+    --pip-requirement=*)
+      [[ -n "${flag#*=}" ]] || die "--pip-requirement requires a path"
+      SCAN_PIP_REQUIREMENTS+=("${flag#*=}")
+      SCAN_FLAG_SHIFT=1
+      ;;
   esac
   return 0
 }
@@ -11502,6 +11548,20 @@ repo_audit_command() {
   done
   [[ -n "$project_target" ]] || project_target="."
   [[ -d "$project_target" ]] || die "repo-audit target is not a directory: $project_target"
+  # Named requirement files resolve against the project directory (the
+  # gate's cwd when it threaded them); normalize once so the pip-audit
+  # lane and the cache evidence hash the same paths.
+  if (( ${#SCAN_PIP_REQUIREMENTS[@]} > 0 )); then
+    local -a normalized_requirements=()
+    local req_file req_abs
+    for req_file in "${SCAN_PIP_REQUIREMENTS[@]}"; do
+      req_abs="$(cd -- "$project_target" 2>/dev/null && realpath -m -- "$req_file" 2>/dev/null)" \
+        || die "--pip-requirement path cannot be resolved: $req_file"
+      [[ -f "$req_abs" && -r "$req_abs" ]] || die "--pip-requirement file cannot be read: $req_file"
+      normalized_requirements+=("$req_abs")
+    done
+    SCAN_PIP_REQUIREMENTS=("${normalized_requirements[@]}")
+  fi
   SAFE_AUDIT_SCAN_MODE="${SCAN_MODE_PARSED:-${SAFE_AUDIT_SCAN_MODE:-source}}"
   scan_validate_result_out
 

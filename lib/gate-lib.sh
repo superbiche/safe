@@ -52,6 +52,9 @@ SAFE_GATE_PYTHON_ISOLATED=0
 SAFE_GATE_UV_CONFIG_FILE=0
 SAFE_GATE_PRIVATE_PY_ALLOWED=0
 SAFE_GATE_ENV_SCRUB=()
+# Requirement/constraint files named on a pip install command, threaded to
+# the project scan's pip-audit lane (any basename — inbox 2026-10-11).
+SAFE_GATE_SCAN_PIP_REQUIREMENTS=()
 
 safe_gate_err() {
   printf '%s\n' "$*" >&2
@@ -1517,6 +1520,14 @@ safe_gate_scan_project() {
     return 0
   fi
 
+  # Requirement/constraint files the install command named ride into the
+  # scan's pip-audit lane, whatever their basename (inbox 2026-10-11).
+  local -a scan_req_args=()
+  local scan_req
+  for scan_req in ${SAFE_GATE_SCAN_PIP_REQUIREMENTS[@]+"${SAFE_GATE_SCAN_PIP_REQUIREMENTS[@]}"}; do
+    scan_req_args+=(--pip-requirement "${scan_req}")
+  done
+
   # The decision comes from the RESULT DOCUMENT, not the exit code: a scan
   # that finds a critical advisory still exits 0 (its verdict lives in the
   # document), so gating on the exit code let every finding through. The copy
@@ -1535,7 +1546,7 @@ safe_gate_scan_project() {
     # that exits 0 says nothing about what it found. Say that plainly rather
     # than treating "no answer" as "clean".
     safe_gate_err "safe install: cannot allocate a scan result file (TMPDIR and ${fallback_dir} both unwritable); the project was NOT audit-gated — safe doctor"
-    "${SAFE_GATE_AUDIT_BIN}" repo-audit . --deps-only --allow-missing-tools 2>&1 || true
+    "${SAFE_GATE_AUDIT_BIN}" repo-audit . --deps-only --allow-missing-tools ${scan_req_args[@]+"${scan_req_args[@]}"} 2>&1 || true
     return 0
   fi
 
@@ -1545,6 +1556,7 @@ safe_gate_scan_project() {
   # full scanner run. --allow-missing-tools keeps an uninstalled ecosystem
   # auditor from aborting the scan: it comes back as reported-but-not-run.
   scan_output="$("${SAFE_GATE_AUDIT_BIN}" repo-audit . --deps-only --allow-missing-tools \
+    ${scan_req_args[@]+"${scan_req_args[@]}"} \
     --result-out "${result_file}" 2>&1)"
   scan_status=$?
 
@@ -2677,27 +2689,39 @@ safe_gate_go_project_present() {
   safe_gate_any_file go.sum go.mod
 }
 
+# Validate the -r/-c files a pip/uv install names before any route uses
+# them: a remote requirement file cannot be inventoried by the project
+# scan, and pip would fetch and install it unaudited — refuse with the
+# recovery on the line (inbox 2026-10-11: any -r file routes through the
+# scan, not only the requirements*.txt basenames). A missing local file
+# is not refused here: pip itself errors on it and installs nothing; it
+# simply does not ride into the scan (the lanes thread readable files).
+safe_gate_python_requirement_files_ok() {
+  local f
+  for f in "$@"; do
+    case "${f}" in
+      *://*)
+        safe_gate_err "safe: BLOCKED pip install — requirement file '${f}' is remote and cannot be audited; download it and pass the local path instead; details: safe explain"
+        return 1
+        ;;
+    esac
+  done
+  return 0
+}
+
+# Any -r file (any basename, any path spelling) or an editable install
+# makes this a project install: the named files ride into the project
+# scan's pip-audit lane via SAFE_GATE_SCAN_PIP_REQUIREMENTS. A -c alone
+# does not — explicit specs beside it keep their per-package audit, and
+# the constraints ride along whenever the project route is taken.
+# Pre-existing boundary, unchanged: explicit specs beside a -r file are
+# covered only by the project scan, exactly as with requirements.txt.
 safe_gate_pip_project_install() {
   local arg
-  local next_is_requirement=0
-  local next_is_editable=0
 
   for arg in "$@"; do
-    if (( next_is_requirement )); then
-      [[ "${arg}" == requirements.txt || "${arg}" == requirements-*.txt ]] && return 0
-      next_is_requirement=0
-      continue
-    fi
-
-    if (( next_is_editable )); then
-      return 0
-    fi
-
     case "${arg}" in
-      -r|--requirement)
-        next_is_requirement=1
-        ;;
-      --requirement=requirements.txt|--requirement=requirements-*.txt)
+      -r|--requirement|--requirement=*|-r?*)
         return 0
         ;;
       -e|--editable|--editable=*)
@@ -4660,7 +4684,13 @@ safe_gate_pip_like() {
   [[ "${subcommand}" == "install" || "${subcommand}" == "upgrade" ]] || safe_gate_exec_real "${tool}" "$@"
   local -a req_files=()
   safe_gate_collect req_files "$(safe_gate_python_requirement_files "${@:subidx+1}")"
+  SAFE_GATE_SCAN_PIP_REQUIREMENTS=()
   if (( ${#req_files[@]} > 0 )); then
+    safe_gate_python_requirement_files_ok "${req_files[@]}" || return 100
+    local req_file
+    for req_file in "${req_files[@]}"; do
+      [[ -f "${req_file}" && -r "${req_file}" ]] && SAFE_GATE_SCAN_PIP_REQUIREMENTS+=("${req_file}")
+    done
     safe_gate_private_project python-project python "${tool} ${subcommand}" -- "${req_files[@]}" || return $?
   fi
 
@@ -4792,7 +4822,13 @@ safe_gate_uv() {
   if [[ "${first}" == "pip" && "${second}" == "install" ]]; then
     local -a req_files=()
     safe_gate_collect req_files "$(safe_gate_python_requirement_files "${@:subidx+2}")"
+    SAFE_GATE_SCAN_PIP_REQUIREMENTS=()
     if (( ${#req_files[@]} > 0 )); then
+      safe_gate_python_requirement_files_ok "${req_files[@]}" || return 100
+      local req_file
+      for req_file in "${req_files[@]}"; do
+        [[ -f "${req_file}" && -r "${req_file}" ]] && SAFE_GATE_SCAN_PIP_REQUIREMENTS+=("${req_file}")
+      done
       safe_gate_private_project python-project python "uv pip install" -- "${req_files[@]}" || return $?
     fi
     if safe_gate_pip_project_install "${@:subidx+2}"; then

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Fix: `pip install -r <file>` with any basename other than
+  `requirements.txt` / `requirements-*.txt` (or spelled with a path)
+  reached pip with no audit of the packages it names. Any `-r` file now
+  routes through the project scan, and the named `-r`/`-c` files ride
+  into the scan's pip-audit lane via the new `repo-audit
+  --pip-requirement` flag (also part of the scan-cache evidence, and
+  enough on its own to trigger the python ecosystem audit). A remote
+  requirement file refuses with a download-locally recovery; a missing
+  local file still delegates to pip's own error (inbox 2026-10-11).
 - Fix: a bare-relative local wheel path (`pip install dist/x.whl`) was
   misparsed as an unresolved package name and refused; archive arguments
   (`.whl`, `.tar.gz`, `.tgz`, `.zip`) spelled as paths now take the same

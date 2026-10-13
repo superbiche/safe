@@ -255,6 +255,13 @@ composer update
 
 Non-install and non-exec commands pass through unchanged.
 
+Any `-r` file on a pip / `uv pip` install — whatever its basename — routes
+through the project scan, and the named `-r`/`-c` files ride into the scan's
+pip-audit lane (`--pip-requirement`), so their packages are audited even when
+no conventionally-named requirements file exists. A remote (`https://…`)
+requirement file cannot be inventoried and refuses, with the download-locally
+recovery on the line; a missing local file delegates to pip's own error.
+
 A pip/uv argument naming a local archive (`.whl`, `.tar.gz`, `.tgz`, `.zip`)
 is a local artifact, not a package identity — including the bare-relative
 spelling (`dist/x.whl`, not only `./dist/x.whl`). Local-artifact installs

@@ -3547,6 +3547,45 @@ case_requirement_install_scans() {
   pass "$FUNCNAME"
 }
 
+# A requirement file with any basename routes through the project scan and
+# its packages reach the scan's pip-audit lane (inbox 2026-10-11); a remote
+# requirement file cannot be inventoried and refuses before delegating.
+case_pip_requirement_any_basename() {
+  prepare_case "pip-requirement-any-basename"
+  mkdir -p "${WORK_DIR}/deps"
+  printf 'okpkg==1.0.0\n' > "${WORK_DIR}/deps/prod.txt"
+  SAFE_INSTALL_TEST_SCRIPT='pip install -r deps/prod.txt' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_project_scan_logged "$FUNCNAME" || return
+  grep -Fq $'AUDIT\trepo-audit\t.\t--deps-only\t--allow-missing-tools\t--pip-requirement\tdeps/prod.txt\t' "${LOG_FILE}" || { fail "$FUNCNAME"; return; }
+  assert_log_contains $'REAL\tpip\tinstall\t-r\tdeps/prod.txt' "$FUNCNAME" || return
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='pip install --requirement=deps/prod.txt' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  grep -Fq -- $'--pip-requirement\tdeps/prod.txt' "${LOG_FILE}" || { fail "$FUNCNAME"; return; }
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='uv pip install -r deps/prod.txt' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  grep -Fq -- $'--pip-requirement\tdeps/prod.txt' "${LOG_FILE}" || { fail "$FUNCNAME"; return; }
+
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='pip install -r https://example.invalid/req.txt' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tpip' "$FUNCNAME" || return
+  grep -Fq "is remote and cannot be audited" "${ERR_FILE}" || { fail "$FUNCNAME"; return; }
+
+  # A missing local file installs nothing (pip errors itself): delegated,
+  # and not threaded into the scan.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='pip install -r deps/missing.txt' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tpip\tinstall\t-r\tdeps/missing.txt' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'--pip-requirement' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 # A bare-relative wheel path is a local artifact, not a package identity
 # (inbox 2026-10-10): pip runs unaudited like the ./ spelling, and the gate
 # audit log names the artifact with its sha256 (inbox 2026-10-10, audit
@@ -6733,6 +6772,7 @@ main() {
     case_pip_complex_flags \
     case_requirement_install_scans \
     case_pip_local_wheel \
+    case_pip_requirement_any_basename \
     case_cargo_parser \
     case_go_parser \
     case_composer_parser \
