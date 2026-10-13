@@ -94,7 +94,10 @@ Flow:
    audits continue, and other outages/findings retain their own decision paths.
    An exact version covered by a followed operator-signed grant proceeds
    unattended (gate-only exit 16) in place of exits 13, 14 and 15, and in
-   place of a BLOCK its origin overrode for the same advisories. At an
+   place of a BLOCK its origin overrode for the same advisories. An exact
+   version the origin allowed to install (followed install allowance,
+   gate-only exit 21) likewise proceeds unattended in place of 13, 14, 15
+   and a one-version WARN, but never in place of a BLOCK. At an
    operator terminal a BLOCK on one exact version takes a typed override; an
    override recorded on this host is gate-only exit 17 (terminal confirm).
    A name on an operator-authorized private registry is decided by the

@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.3.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.69.2}"
+SAFE_VERSION="${SAFE_VERSION:-1.70.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -8069,6 +8069,81 @@ followed_grant_record() {
     "$FOLLOWED_GRANT_ORIGIN" "$FOLLOWED_GRANT_SIGNER" "$name" "$version" "$FOLLOWED_GRANT_GENERATION" >&2
 }
 
+# Followed install allowance (operator ruling 2026-10-13): an exact version
+# safe allowed to install on an exporting machine — a clean GO, a tolerated
+# WARN, or an operator-confirmed install recorded in that machine's
+# install-known set — rides the same signed export as the host-allow grants,
+# as a statement `install_allowances` entry. `host-allow follow` rewrites the
+# ledger's per-origin `installed` identities from every verified statement,
+# bound to the signer that verified it, exactly like `granted` above. The
+# follower then installs that exact version unattended (gate exit 21) in
+# place of the terminal termini (10/13/14/15): the origin already ran this
+# audit and allowed it. Unlike a followed grant it needs no local host-allow
+# pin (removing a pin cannot withdraw it; `follow-signer remove` can, by
+# unpinning the signer) and it grants no host-execution trust — install
+# only. It never clears a BLOCK: fresh blocking evidence on the follower
+# still blocks, and the recorded-override lane (16/17) stays the only
+# BLOCK propagation. Sets FOLLOWED_INSTALL_{ORIGIN,GENERATION,SIGNER}.
+followed_install_lookup() {
+  local ecosystem="$1" name="$2" version="$3"
+  FOLLOWED_INSTALL_ORIGIN="" FOLLOWED_INSTALL_GENERATION="" FOLLOWED_INSTALL_SIGNER=""
+  [[ -n "$ecosystem" && -n "$name" && -n "$version" ]] || return 1
+  local state_file config_file grant
+  state_file="$(followed_grant_ledger_file)"
+  config_file="$(trust_store_file config.json)"
+  [[ -f "$state_file" && -f "$config_file" ]] || return 1
+  grant=$(jq -cn --arg gid "$(host_allow_canonical_eco "$ecosystem"):$name@$version" \
+    --slurpfile ledger "$state_file" --slurpfile config "$config_file" '
+    ($config[0].follow.signers // []) as $raw
+    | (if ($raw | type) == "array"
+          and ($raw | all(.[]; type == "string" and test("^([A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})$")))
+       then ($raw | map(ascii_upcase)) else [] end) as $signers
+    | [ ($ledger[0].origins // {}) | to_entries[]
+        | select((.value | type) == "object")
+        | select((.value.installed | type) == "array" and (.value.installed | index($gid)) != null)
+        | select((.value.accepted | type) == "string")
+        | select((.value.signer | type) == "string")
+        | select((.value.signer | ascii_upcase) as $f | $signers | index($f) != null)
+        | {origin: .key, generation: .value.accepted, signer: (.value.signer | ascii_upcase)} ]
+    | sort_by(.origin)
+    | .[0] // empty' 2>/dev/null) || return 1
+  [[ -n "$grant" ]] || return 1
+  FOLLOWED_INSTALL_ORIGIN=$(jq -r '.origin' <<<"$grant")
+  FOLLOWED_INSTALL_GENERATION=$(jq -r '.generation' <<<"$grant")
+  FOLLOWED_INSTALL_SIGNER=$(jq -r '.signer' <<<"$grant")
+  [[ -n "$FOLLOWED_INSTALL_ORIGIN" && -n "$FOLLOWED_INSTALL_SIGNER" ]]
+}
+
+# Receipt, verdict-log event and the stderr line for one followed-install
+# pass. $5 names what the allowance stood in for
+# (warn|socket_consent|socket_pending). The install-known verdict is its own
+# token so an allowance pass here is never re-exported as this machine's own
+# allowance (no transitive laundering — the exporter derives allowances only
+# from locally-decided verdicts).
+followed_install_record() {
+  local ecosystem="$1" name="$2" version="$3" causes_json="$4" covered="$5" receipt_evidence="$6"
+  mark_install_known "$ecosystem" "$name" "$version" "ALLOWED_VIA_FOLLOWED_INSTALL" \
+    "$(jq -cn --argjson causes "$causes_json" --arg covered "$covered" \
+      --arg origin "$FOLLOWED_INSTALL_ORIGIN" --arg signer "$FOLLOWED_INSTALL_SIGNER" \
+      '["followed_install:" + $origin, "followed_signer:" + $signer, "covered:" + $covered] + $causes')" \
+    "$receipt_evidence"
+  local audit_log_file="${SAFE_AUDIT_AUDIT_LOG:-$DATA_DIR/audit-log.jsonl}"
+  if mkdir -p "$(dirname "$audit_log_file")" 2>/dev/null; then
+    jq -cn --arg ts "$(now_iso)" --arg safe_version "${SAFE_VERSION}" \
+      --arg eco "$ecosystem" --arg name "$name" --arg version "$version" \
+      --arg origin "$FOLLOWED_INSTALL_ORIGIN" --arg generation "$FOLLOWED_INSTALL_GENERATION" \
+      --arg signer "$FOLLOWED_INSTALL_SIGNER" --arg covered "$covered" \
+      --argjson causes "$causes_json" '
+      {ts: $ts, event: "followed_install", safe_version: $safe_version,
+       ecosystem: $eco, package: $name, version: $version,
+       decision: "ALLOWED_VIA_FOLLOWED_INSTALL", covered: $covered,
+       origin: $origin, generation: $generation, signer: $signer,
+       warn_causes: $causes}' >> "$audit_log_file" 2>/dev/null || true
+  fi
+  printf '[safe audit] ALLOWED_VIA_FOLLOWED_INSTALL (%s, %s): %s@%s was allowed to install on the origin (signed statement of generation %s); installing without a second confirmation\n' \
+    "$FOLLOWED_INSTALL_ORIGIN" "$FOLLOWED_INSTALL_SIGNER" "$name" "$version" "$FOLLOWED_INSTALL_GENERATION" >&2
+}
+
 # Recorded BLOCK override (operator rulings 2026-09-30). The host-allow entry
 # the caller already matched (host_allow_matches_resolved) may carry
 # `block_override: {advisories: [...], accepted: "YYYY-MM-DD"}`, written only by
@@ -8147,6 +8222,62 @@ scripts_allow_matches_resolved() {
   local entry_version
   entry_version=$(jq -r --arg p "$name" '.packages[$p].version // empty' "$SAFE_RUN_SCRIPTS_ALLOW_FILE" 2>/dev/null || true)
   [[ -n "$entry_version" && "$entry_version" == "$version" ]]
+}
+
+# Plumbing for the install gates (gate-lib, bin/safe): record an install
+# the operator confirmed at the gate into install-known, so the signed
+# export can carry it as a followed install allowance (2026-10-13 ruling).
+# The audit itself cannot mark these — at gate exits 10/13/14 the install
+# has not happened yet; only the gate knows the operator said yes. The
+# result document the gate already holds is the evidence: the verdict token
+# must match its gate_exit transition, and the identity comes from the
+# document, never from the caller's spec. Only gate-confirmed tokens are
+# accepted — GO is minted solely by the audit's own evidence path, so this
+# plumbing cannot forge clean evidence for the stale-evidence fallback
+# (known-matches reads verdict GO only). The source identity is the one
+# the gate derived through effective-sources for this same invocation, so
+# a custom-source install is never recorded as default-source evidence.
+# Usage: record-installed --result <file> --verdict <token> --source-id <id>
+record_installed_command() {
+  local result_file="" verdict="" source_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --result) [[ $# -lt 2 ]] && die "--result requires a value"; result_file="$2"; shift 2 ;;
+      --verdict) [[ $# -lt 2 ]] && die "--verdict requires a value"; verdict="$2"; shift 2 ;;
+      --source-id) [[ $# -lt 2 ]] && die "--source-id requires a value"; source_id="$2"; shift 2 ;;
+      *) die "unknown record-installed flag: $1" ;;
+    esac
+  done
+  [[ -n "$result_file" && -r "$result_file" ]] || die "record-installed: cannot read result document"
+  local want_gate_exit
+  case "$verdict" in
+    WARN_TTY_OVERRIDE) want_gate_exit=10 ;;
+    GO_SOCKET_DECLINED) want_gate_exit=13 ;;
+    GO_PENDING_CONFIRMED) want_gate_exit=14 ;;
+    *) die "record-installed: verdict not recordable here: ${verdict:-<empty>}" ;;
+  esac
+  case "$source_id" in
+    implicit-default) ;;
+    explicit:*) CHECK_EFFECTIVE_SOURCES="${source_id#explicit:}" ;;
+    *) die "record-installed: invalid source identity" ;;
+  esac
+  local doc_gate_exit ecosystem name version reasons_json
+  doc_gate_exit=$(jq -r '.gate_exit // empty' "$result_file" 2>/dev/null) || doc_gate_exit=""
+  [[ "$doc_gate_exit" == "$want_gate_exit" ]] \
+    || die "record-installed: result gate_exit ${doc_gate_exit:-<none>} does not match verdict $verdict"
+  [[ "$(jq -r '(.resolved_versions // []) | unique | length' "$result_file" 2>/dev/null)" == "1" ]] \
+    || die "record-installed: result names no single resolved version"
+  ecosystem=$(jq -er '.ecosystem | select(type == "string" and length > 0)' "$result_file" 2>/dev/null) \
+    || die "record-installed: result has no ecosystem"
+  name=$(jq -er '.package | select(type == "string" and length > 0)' "$result_file" 2>/dev/null) \
+    || die "record-installed: result has no package"
+  version=$(jq -er '.resolved_versions[0] | select(type == "string" and length > 0)' "$result_file" 2>/dev/null) \
+    || die "record-installed: result has no resolved version"
+  reasons_json=$(jq -cn --arg v "$verdict" --slurpfile doc "$result_file" \
+    '[($v | ascii_downcase)] + (($doc[0].warn_causes // []) | map(tostring))')
+  mark_install_known "$ecosystem" "$name" "$version" "$verdict" "$reasons_json" ""
+  printf '[safe audit] recorded gate-confirmed install: %s:%s@%s (%s)\n' \
+    "$ecosystem" "$name" "$version" "$verdict" >&2
 }
 
 # Plumbing for the stale-evidence readers (install wrappers, bin/safe,
@@ -10080,8 +10211,26 @@ package_audit_command() {
             followed_go=1
           fi
         fi
+        # A followed install allowance stands in for the same two termini
+        # when no host-allow grant applies (2026-10-13 ruling: a follower
+        # installs what the origin allowed). One distinct resolved version
+        # only — an allowance names one exact version and cannot authorize
+        # evidence attached to several. The ledger probe comes first, like
+        # the grant probe, so a machine that follows nothing pays no read.
+        local followed_install_go=0 followed_install_version=""
+        if (( ! followed_go )) && (( socket_consent_required || socket_pending )) && (( resolution_ok )) \
+          && [[ -f "$(followed_grant_ledger_file)" ]] \
+          && [[ "$(jq -r 'unique | length' <<<"$resolved_versions_json" 2>/dev/null)" == "1" ]]; then
+          followed_install_version=$(jq -r '.[0]' <<<"$resolved_versions_json")
+          if followed_install_lookup "$ecosystem" "$PKG_NAME" "$followed_install_version"; then
+            followed_install_go=1
+          fi
+        fi
         if (( followed_go )); then
           followed_grant_record "$ecosystem" "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION" "$warn_causes_json" \
+            "$( (( socket_consent_required )) && printf socket_consent || printf socket_pending )" "$result_json"
+        elif (( followed_install_go )); then
+          followed_install_record "$ecosystem" "$PKG_NAME" "$followed_install_version" "$warn_causes_json" \
             "$( (( socket_consent_required )) && printf socket_consent || printf socket_pending )" "$result_json"
         elif (( socket_consent_required )); then
           # The audit is otherwise GO, but a live Socket check awaits the
@@ -10126,6 +10275,8 @@ package_audit_command() {
         fi
         if (( followed_go )); then
           gate_exit=16
+        elif (( followed_install_go )); then
+          gate_exit=21
         elif (( socket_consent_required )); then
           : # gate_exit stays 13 (set above)
         elif (( socket_pending )); then
@@ -10186,6 +10337,17 @@ package_audit_command() {
             # refuse 102 and the terminal confirms as before.
             gate_exit=15
           fi
+        elif (( resolution_ok )) && [[ -f "$(followed_grant_ledger_file)" ]] \
+          && [[ "$(jq -r 'unique | length' <<<"$host_allow_versions_json" 2>/dev/null)" == "1" ]] \
+          && followed_install_lookup "$ecosystem" "$PKG_NAME" "$(jq -r '.[0]' <<<"$host_allow_versions_json")"; then
+          # Gate exit 21 (2026-10-13 ruling): the origin allowed this exact
+          # version to install and said so in a verified signed statement —
+          # every WARN cause attached to that one version is covered, no
+          # terminal. Placed where the followed grant sits (before the
+          # infra-only split), with the same one-version limit as a pin.
+          followed_install_record "$ecosystem" "$PKG_NAME" "$(jq -r '.[0]' <<<"$host_allow_versions_json")" \
+            "$warn_causes_json" warn "$result_json"
+          gate_exit=21
         elif [[ "$auto_allow" == "true" ]] && (( resolution_ok )) && (( aff_count == 0 )) \
           && [[ "$block_line" == PASS* ]] && (( ${#warn_causes[@]} > 0 )) \
           && [[ "$(jq -r --argjson causes "$warn_causes_json" '((.auto_allow_tolerate // []) | map(tostring)) as $tol | $causes | all(. as $c | $tol | index($c) != null)' <<<"$policy")" == "true" ]]; then
@@ -11587,6 +11749,11 @@ main() {
     effective-sources)
       shift
       effective_sources_command "$@"
+      return 0
+      ;;
+    record-installed)
+      shift
+      record_installed_command "$@"
       return 0
       ;;
     # Removed after 1.66.1 with its only consumer; named so a stale caller

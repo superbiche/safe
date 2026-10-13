@@ -159,7 +159,11 @@ safe run host-allow import allow.json
 
 The exported document (`schema: safe-host-allow-export/1`) carries only
 `name@version`, ecosystem, the public registry integrity hash, the original
-`--reason`, and the add date. There are no secrets in it.
+`--reason`, and the add date, plus `install_allowances` — the exact versions
+safe allowed to install on this machine (see Followed install allowances,
+below). There are no secrets in it. Unsigned `import` applies the packages
+and ignores the allowances; they gain authority only through a verified
+signed statement.
 
 `export --sign [--out <dir>]` requires an operator TTY and GPG. It writes
 `host-allow.<hostname -s>.json` and its detached armored `.json.asc` signature
@@ -404,6 +408,45 @@ passes as usage of the entry.
 
 The exporting machine gains nothing from its own export: its pins were typed
 at its terminal and keep the terminal requirement there.
+
+#### Followed install allowances at the install gate
+
+A grant needs a deliberate `host-allow` decision on the origin, but most
+fleet friction was simpler: the origin installed a package cleanly (a GO,
+perhaps after a terminal confirmation), no grant was ever minted, and every
+follower re-asked the same question from scratch — for a fast-moving tool,
+forever. Since 2026-10-13 the signed statement therefore also carries
+`install_allowances`: the exact versions safe allowed to install on the
+origin, derived at signing time from the origin's install-known record
+(verdicts GO, WARN_TOLERATED, and the gate-confirmed outcomes the gates
+record through `safe audit record-installed` — a Socket-consent decline, a
+confirmed pending score, a WARN the operator overrode at the terminal;
+default-registry-source entries only). Operator-confirmed installs are
+recorded by the gates at the moment of confirmation; unattended green
+installs are already in the record. Allowances refresh whenever the export
+is re-signed — `export --sign`, or in the same gesture as any host-allow
+change on an origin host — and the signing output states how many the
+statement carries.
+
+`follow` validates each entry (exact version, a locally-decided verdict) and
+rewrites the ledger's per-origin `installed`
+(`<ecosystem>:name@version`) from every verified statement, bound to the
+verifying signer like `granted`. At the gate, an exact resolved version in
+`installed`, under a still-pinned signer, installs unattended (gate exit 21)
+in place of a consent ask (13), a pending score (14), a tolerated pass (15)
+or a WARN (10) attached to that one version. Three deliberate differences
+from a followed grant: it needs no local host-allow pin, it grants no
+host-execution trust (install scripts and host execution keep their own
+grants), and it never clears a BLOCK — the follower still runs its own
+audit, and fresh blocking evidence blocks. It is never green: the gate logs
+`ALLOWED_VIA_FOLLOWED_INSTALL` (`INSTALL_UNATTENDED_FOLLOWED_INSTALL` for
+`safe install`), and the verdict log gains a `followed_install` event with
+origin, generation and signer. Withdrawing works like grants: an origin's
+newer statement replaces its set, and `follow-signer remove` unpins the
+authority. An allowance taken on a follower is never re-exported as that
+machine's own — only locally-decided verdicts become allowances. Unsigned
+`import` ignores the field: allowances gain authority only through verified
+signed statements.
 
 #### BLOCK overrides
 

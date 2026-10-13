@@ -608,6 +608,14 @@ recorded on this host (`host-allow add --accept-block`): the operator
 confirms at the terminal, unattended shells refuse 102. A followed grant whose
 origin recorded such an override clears the BLOCK as exit 16. See
 [BLOCK overrides](safe-run.md#block-overrides).
+A further gate-only code, **exit 21**, replaces 13, 14, 15 and a one-version
+WARN when the exact resolved version is covered by a followed install
+allowance: safe allowed it to install on the origin and its signed statement
+says so (`ALLOWED_VIA_FOLLOWED_INSTALL` receipt and a `followed_install`
+verdict-log event, both naming origin and signer). The audit still ran, so a
+BLOCK on fresh evidence remains exit 20. See
+[Followed install allowances at the install gate](safe-run.md#followed-install-allowances-at-the-install-gate).
+Exits 18 and 19 are the private-registry lane (below).
 
 The result document (`--json`, and the receipt) carries `package` and, on a
 BLOCK, `block: {class, advisories}` — `class` is `advisory`, `malware`,

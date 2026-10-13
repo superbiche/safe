@@ -170,7 +170,12 @@ Unpinning/revoking a signer stops future acceptance, not existing grants. It
 does end their unattended install pass: a followed grant installs without a
 terminal (gate exit 16) only while the signer recorded for its origin stays
 pinned, the identity is in that origin's accepted generation and the local pin
-exists. After upgrading a follower, run `safe run host-allow follow` once so the
+exists. The same signer condition governs followed install allowances (gate
+exit 21): the origin's signed statement lists the exact versions safe allowed
+to install there; a newer statement replaces the set, and unpinning the signer
+ends the pass. Allowances refresh whenever the origin re-signs its export —
+after installing something new on the origin, run
+`safe run host-allow export --sign` there to publish it fleet-wide. After upgrading a follower, run `safe run host-allow follow` once so the
 ledger records the signer; until then followed grants keep asking for a
 terminal. The same conditions govern a BLOCK override the origin recorded
 (`host-allow add --accept-block`): the next `follow` carries it to pins taken

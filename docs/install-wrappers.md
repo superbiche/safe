@@ -402,6 +402,11 @@ included: it replaces the consent ask (13), the pending-score confirm (14) and
 the host-allow/tolerated WARN confirm (15), and logs
 `ALLOWED_VIA_FOLLOWED_GRANT`. See
 [followed grants at the install gate](safe-run.md#followed-grants-at-the-install-gate).
+A followed install allowance (gate-only exit 21, 2026-10-13 ruling) does the
+same in every lane when safe allowed that exact version on the origin — no
+host-allow pin needed, no host-execution trust, never clearing a BLOCK — and
+logs `ALLOWED_VIA_FOLLOWED_INSTALL`. See
+[followed install allowances at the install gate](safe-run.md#followed-install-allowances-at-the-install-gate).
 
 A BLOCK (104) has an operator override at an interactive terminal (2026-09-30
 rulings), in every wrapper lane and `safe install`: when the audit resolved one
