@@ -214,7 +214,9 @@ pass and warnings under `environment.release_follow`.
   store: a redirected config root needs `SAFE_RUN_TRUST_OVERRIDE`. See
   [reuse of installed dependencies](command-reference.md#reuse-of-installed-dependencies).
 - `block_severities`: affecting-advisory severities that hard-BLOCK instead
-  of WARN.
+  of WARN. Values use the severity ladder's vocabulary (`critical`, `high`,
+  `moderate`, `low`); spelling is normalized (case-insensitive, `medium`
+  reads as `moderate`), so write the ladder words.
 - `cooldown_days`: WARN when any resolved version was published fewer than
   this many days ago (the compromised-release window; malicious versions are
   usually caught and yanked within days). Default: `3`; `0` disables. The

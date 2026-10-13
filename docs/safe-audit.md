@@ -527,8 +527,20 @@ Advisories are classified per resolved version as `affecting`, `remediated`
 **affecting** advisories drive the verdict: a bump that is itself the
 remediation gets a PASS with a notice naming the fixed advisories. An
 affecting advisory whose severity is listed in `install.block_severities`
-(default: `critical`) produces BLOCK; other affecting advisories produce
-WARN. An OSV outage produces WARN (fail closed), never a zero-CVE PASS.
+(default: `critical`) produces BLOCK. Other affecting advisories produce WARN
+— except advisories below **high** severity, which inform and never gate
+(operator ruling 2026-10-12): when every affecting advisory is moderate or
+low (and none blocks by policy and none is a malware record), on complete
+OSV data, the OSV line reads `INFO (… all below high severity —
+informational, not gating: …)`, naming the first three and any withheld
+count (the receipt lists them all), and adds no verdict cause — the install
+needs no confirmation for severity alone. Such a GO records
+`osv_below_high_only` in install-known (never a clean-OSV claim) and counts
+as GO evidence like a clean check: the signal was evaluated and ruled
+non-gating, not missing. An advisory whose severity cannot be read
+(`unknown`) is not provably below high and still WARNs, and so does a
+partial OSV answer. An OSV outage produces WARN
+(fail closed), never a zero-CVE PASS.
 
 Socket is the primary behavioral tier, scoped by the 2026-09-22 operator
 ruling: under `install.socket.mode: auto` (the default) it is consulted only

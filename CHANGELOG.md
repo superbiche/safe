@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Policy: advisories below High severity no longer gate installs
+  (operator ruling 2026-10-12). When every advisory affecting the
+  resolved version is moderate or low — and none blocks via
+  `install.block_severities` and none is a malware record — the
+  verdict engine emits an `INFO (… all below high severity —
+  informational, not gating: …)` OSV line naming them, records them
+  in the receipt, and adds no WARN cause, so the install proceeds
+  without a terminal confirmation (the Encre frozen-lockfile update
+  refused at 102 solely for a Medium `devalue` advisory). The lane
+  requires complete OSV data: a partial answer still WARNs. High
+  stays an adverse WARN, critical/malware keep blocking, and an
+  unreadable severity still WARNs; a present-but-unbandable CVSS v3
+  vector now floors at high like v4, and `install.block_severities`
+  values are spelling-normalized (`medium`/`Moderate` now mean
+  `moderate`). The recorded install-known reasons say
+  `osv_below_high_only` instead of claiming a clean OSV check, while
+  the verdict token stays GO — evaluated-and-ruled-non-gating counts
+  as GO evidence (stale fallback, followed allowances), unlike
+  missing evidence (inbox 2026-10-12; review round 1).
 - Fix: `pip install -r <file>` with any basename other than
   `requirements.txt` / `requirements-*.txt` (or spelled with a path)
   reached pip with no audit of the packages it names. Any `-r` file now

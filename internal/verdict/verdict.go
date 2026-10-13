@@ -488,21 +488,40 @@ func osvStage(ev Evidence, d *decision, res *Result) {
 	switch {
 	case affectingCount > 0:
 		summary := affectingSummary(o.Affecting, affectingCount)
-		res.Lines.OSV = fmt.Sprintf("WARN (%d of %d advisories affect %s: %s)",
-			affectingCount, o.TotalCount, label, summary)
-		d.warn("osv_affecting")
-
-		if countBlocked(o.Affecting, ev.BlockSeverities) > 0 {
-			res.Lines.OSV = fmt.Sprintf("BLOCK (%d of %d advisories affect %s: %s)",
+		blocked := countBlocked(o.Affecting, ev.BlockSeverities) > 0
+		malware := malwareIDs(o.Affecting)
+		// Below-high advisories inform, never gate (operator ruling
+		// 2026-10-12): when every affecting advisory is moderate or low
+		// and none blocks by policy or malware, the findings stay in the
+		// line and the receipt but add no cause, so no terminal
+		// confirmation is owed for severity alone. An "unknown" (or any
+		// unrecognized) severity is not provably below high and keeps
+		// the WARN — fail closed on unreadable severity, as elsewhere.
+		// Complete OSV data is required too: with a partial answer the
+		// unseen advisories are not provably below high either, and the
+		// outage tail below only appends its cause without bumping —
+		// on this lane that would leave a GO verdict carrying
+		// osv_unavailable (review round 1, B1).
+		if o.Status == "ok" && !blocked && malware == "" && allBelowHigh(o.Affecting) {
+			res.Lines.OSV = fmt.Sprintf("INFO (%d of %d advisories affect %s, all below high severity — informational, not gating: %s)",
 				affectingCount, o.TotalCount, label, summary)
-			d.bump(BLOCK)
-		}
-		// Malware records usually carry no CVSS, so the severity ladder ranks
-		// them "unknown" — which block_severities would leave overridable.
-		// Malware is never severity-policy business: BLOCK unconditionally.
-		if ids := malwareIDs(o.Affecting); ids != "" {
-			res.Lines.OSV = fmt.Sprintf("BLOCK (known-malware record affects %s: %s)", label, ids)
-			d.block("osv_malware")
+		} else {
+			res.Lines.OSV = fmt.Sprintf("WARN (%d of %d advisories affect %s: %s)",
+				affectingCount, o.TotalCount, label, summary)
+			d.warn("osv_affecting")
+
+			if blocked {
+				res.Lines.OSV = fmt.Sprintf("BLOCK (%d of %d advisories affect %s: %s)",
+					affectingCount, o.TotalCount, label, summary)
+				d.bump(BLOCK)
+			}
+			// Malware records usually carry no CVSS, so the severity ladder ranks
+			// them "unknown" — which block_severities would leave overridable.
+			// Malware is never severity-policy business: BLOCK unconditionally.
+			if malware != "" {
+				res.Lines.OSV = fmt.Sprintf("BLOCK (known-malware record affects %s: %s)", label, malware)
+				d.block("osv_malware")
+			}
 		}
 		if o.Status != "ok" {
 			res.Lines.OSV += "; OSV data incomplete (query failure)"
@@ -619,6 +638,20 @@ func affectingSummary(affecting []Advisory, total int) string {
 		summary += fmt.Sprintf(", +%d more", total-3)
 	}
 	return summary
+}
+
+// allBelowHigh reports whether every advisory carries a severity the
+// upstream ladder normalized to moderate or low. The vocabulary is the
+// ladder's (critical/high/moderate/low, everything else "unknown");
+// anything else — unknown, empty, unnormalized spellings — is not
+// provably below high.
+func allBelowHigh(affecting []Advisory) bool {
+	for _, a := range affecting {
+		if a.Severity != "moderate" && a.Severity != "low" {
+			return false
+		}
+	}
+	return len(affecting) > 0
 }
 
 func countBlocked(affecting []Advisory, blockSeverities []string) int {
