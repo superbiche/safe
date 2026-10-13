@@ -4760,6 +4760,18 @@ run_pip_audit_dir() {
   for candidate in requirements.txt requirements-dev.txt; do
     [[ -f "$dir/$candidate" ]] && invocations+=("-r|$dir/$candidate")
   done
+  # Files the caller named explicitly (--pip-requirement): audited
+  # whatever their basename, each once even if also discovered above.
+  local extra_req extra_real seen_inv
+  for extra_req in ${SCAN_PIP_REQUIREMENTS[@]+"${SCAN_PIP_REQUIREMENTS[@]}"}; do
+    extra_real="$(realpath -e -- "$extra_req" 2>/dev/null)" || continue
+    seen_inv=0
+    for candidate in ${invocations[@]+"${invocations[@]}"}; do
+      [[ "$candidate" == "-r|"* ]] || continue
+      [[ "$(realpath -e -- "${candidate#-r|}" 2>/dev/null)" == "$extra_real" ]] && seen_inv=1
+    done
+    (( seen_inv )) || invocations+=("-r|$extra_real")
+  done
   [[ -f "$dir/pyproject.toml" ]] && invocations+=("project|$dir")
 
   if [[ "${#invocations[@]}" -eq 0 ]]; then
