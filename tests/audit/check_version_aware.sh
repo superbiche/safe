@@ -178,6 +178,17 @@ JSON
   printf '%s' "$FIXTURES/osv-affect-mod.json"
 }
 
+osv_fixture_affecting_high() {
+  cat > "$FIXTURES/osv-affect-high.json" <<'JSON'
+{"vulns": [
+  {"id": "GHSA-AFFECTS-HIGH", "database_specific": {"severity": "HIGH"},
+   "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
+     "ranges": [{"type": "SEMVER", "events": [{"introduced": "2.0.0"}, {"fixed": "2.9.9"}]}]}]}
+]}
+JSON
+  printf '%s' "$FIXTURES/osv-affect-high.json"
+}
+
 osv_fixture_affecting_critical() {
   cat > "$FIXTURES/osv-affect-crit.json" <<'JSON'
 {"vulns": [
@@ -206,7 +217,7 @@ JSON
 osv_fixture_git_only() {
   cat > "$FIXTURES/osv-git-only.json" <<'JSON'
 {"vulns": [
-  {"id": "GHSA-GIT-ONLY", "database_specific": {"severity": "LOW"},
+  {"id": "GHSA-GIT-ONLY", "database_specific": {"severity": "HIGH"},
    "affected": [{"package": {"ecosystem": "npm", "name": "brace-expansion"},
      "ranges": [{"type": "GIT", "repo": "https://example.invalid/r", "events": [{"introduced": "abc123"}]}]}]}
 ]}
@@ -471,7 +482,9 @@ if expect_status 20 "standard CVSS v4 critical blocks without a qualitative labe
 fi
 
 # ---------------------------------------------------------------------------
-# 5b. Standard CVSS v4 moderate with no qualitative label -> WARN
+# 5b. Standard CVSS v4 moderate with no qualitative label -> INFO, not gating
+# (below-high advisories inform — operator ruling 2026-10-12). The band
+# derivation is still the point: a misread band would block or warn.
 # ---------------------------------------------------------------------------
 prepare_case cvss4-moderate
 fixture="$(osv_fixture_cvss4_moderate)"
@@ -481,8 +494,11 @@ run_check \
   MOCK_OSV_MATCH_VERSION=2.1.4 \
   MOCK_SOCKET_MODE=ok \
   -- brace-expansion@2.1.4 --ecosystem npm --gate install
-if expect_status 10 "standard CVSS v4 moderate warns without a qualitative label"; then
-  pass "standard CVSS v4 moderate warns without a qualitative label"
+if expect_status 0 "standard CVSS v4 moderate informs without gating (2026-10-12)"; then
+  pass "standard CVSS v4 moderate informs without gating (2026-10-12)"
+fi
+if expect_grep "$OUT_FILE" 'INFO.*GHSA-CVSS4-MODERATE \(moderate\)' "CVSS v4 moderate is named at moderate severity"; then
+  pass "CVSS v4 moderate is named at moderate severity"
 fi
 
 # ---------------------------------------------------------------------------
@@ -501,7 +517,8 @@ if expect_status 10 "malformed CVSS v4 vector retains the high floor"; then
 fi
 
 # ---------------------------------------------------------------------------
-# 6a. Affecting moderate -> WARN refusal with pinned host-allow hint
+# 6a. Affecting moderate -> GO: below-high advisories inform, never gate
+# (operator ruling 2026-10-12). The advisory is still named in the output.
 # ---------------------------------------------------------------------------
 prepare_case affect-moderate
 fixture="$(osv_fixture_affecting_moderate)"
@@ -511,14 +528,20 @@ run_check \
   MOCK_OSV_MATCH_VERSION=2.1.4 \
   MOCK_SOCKET_MODE=ok \
   -- brace-expansion@2.1.4 --ecosystem npm --gate install
-if expect_status 10 "moderate affecting advisory refuses at the gate"; then
-  pass "moderate affecting advisory refuses at the gate"
+if expect_status 0 "moderate-only affecting advisories proceed at the gate (2026-10-12)"; then
+  pass "moderate-only affecting advisories proceed at the gate (2026-10-12)"
 fi
-if expect_grep "$ERR_FILE" 'host-allow add brace-expansion@2\.1\.4' "refusal hint is pinned to the resolved version"; then
-  pass "refusal hint is pinned to the resolved version"
+if expect_grep "$OUT_FILE" 'INFO.*GHSA-AFFECTS-MOD \(moderate\)' "the moderate advisory is named, not hidden"; then
+  pass "the moderate advisory is named, not hidden"
 fi
-if expect_no_grep "$ERR_FILE" '@latest' "refusal hint never suggests @latest"; then
-  pass "refusal hint never suggests @latest"
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm
+if expect_status 0 "plain check of a moderate-only advisory also proceeds"; then
+  pass "plain check of a moderate-only advisory also proceeds"
 fi
 
 # ---------------------------------------------------------------------------
@@ -528,7 +551,7 @@ prepare_case host-allow-resolved
 printf '{"dependencies": {"brace-expansion": "^2.0.0"}}\n' > "$CASE_PROJECT/package.json"
 printf '{"packages": {"brace-expansion": {"version": "2.1.4", "ecosystem": "npm", "added": "2026-07-31", "reason": "test"}}}\n' \
   > "$CASE_RUN_CONFIG/host-allow.json"
-fixture="$(osv_fixture_affecting_moderate)"
+fixture="$(osv_fixture_affecting_high)"
 run_check \
   MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
   MOCK_OSV_FIXTURE="$fixture" \
@@ -548,7 +571,7 @@ fi
 prepare_case revoke-on-adverse
 printf '{"packages": {"npm:brace-expansion": {"version": "2.1.4", "verdict": "GO", "reasons": [], "evidence": "x", "first_allowed": "2026-07-31T10:00:00+02:00", "last_used": "2026-07-31", "times_used": 1}}}\n' \
   > "$CASE_RUN_CONFIG/install-known.json"
-fixture="$(osv_fixture_affecting_moderate)"
+fixture="$(osv_fixture_affecting_high)"
 run_check \
   MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
   MOCK_OSV_FIXTURE="$fixture" \
@@ -598,7 +621,7 @@ for rate_case in pure plain osv-down affecting; do
   osv_status=0
   if [[ "$rate_case" == plain ]]; then extra=(); expected=10; fi
   if [[ "$rate_case" == osv-down ]]; then osv_status=1; expected=11; fi
-  if [[ "$rate_case" == affecting ]]; then fixture="$(osv_fixture_affecting_moderate)"; expected=10; fi
+  if [[ "$rate_case" == affecting ]]; then fixture="$(osv_fixture_affecting_high)"; expected=10; fi
   run_check MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
     MOCK_SOCKET_MODE=rate MOCK_OSV_STATUS="$osv_status" \
     MOCK_OSV_MATCH_VERSION=2.1.4 MOCK_OSV_FIXTURE="$fixture" \
@@ -878,7 +901,7 @@ fi
 # 21. Non-gate mode is unchanged for consumers: WARN -> 10, GO -> 0
 # ---------------------------------------------------------------------------
 prepare_case plain-warn
-fixture="$(osv_fixture_affecting_moderate)"
+fixture="$(osv_fixture_affecting_high)"
 run_check \
   MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
   MOCK_OSV_FIXTURE="$fixture" \
@@ -1027,7 +1050,7 @@ printf '{"packages": {"brace-expansion": {"version": "2.1.4", "ecosystem": "npm"
   > "$CASE_RUN_CONFIG/host-allow.json"
 printf '{"packages": {"npm:brace-expansion": {"version": "2.1.4", "verdict": "GO", "reasons": [], "evidence": "x", "first_allowed": "2026-07-31T10:00:00+02:00", "last_used": "2026-07-31", "times_used": 1}}}\n' \
   > "$CASE_RUN_CONFIG/install-known.json"
-fixture="$(osv_fixture_affecting_moderate)"
+fixture="$(osv_fixture_affecting_high)"
 run_check \
   MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
   MOCK_OSV_FIXTURE="$fixture" \
@@ -2785,7 +2808,7 @@ else
 fi
 
 prepare_case direct-warn-hints
-fixture="$(osv_fixture_affecting_moderate)"
+fixture="$(osv_fixture_affecting_high)"
 run_check \
   MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
   MOCK_OSV_FIXTURE="$fixture" \

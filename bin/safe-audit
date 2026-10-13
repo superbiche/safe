@@ -10289,9 +10289,14 @@ package_audit_command() {
           elif [[ "$(jq -r '.status // empty' "$socket_json" 2>/dev/null)" == "out_of_scope" ]]; then
             socket_reason="socket_out_of_scope"
           fi
+          # A GO whose only advisories are below high (2026-10-12 ruling)
+          # is allowed, not clean: say so in the recorded reasons instead
+          # of claiming osv_clean_for_version.
+          local osv_reason="osv_clean_for_version"
+          (( aff_count > 0 )) && osv_reason="osv_below_high_only"
           mark_install_known "$ecosystem" "$PKG_NAME" "$primary_version" "$known_verdict" \
-            "$(jq -cn --arg socket_reason "$socket_reason" \
-              '["osv_clean_for_version",$socket_reason,"blocklist_pass"]')" "$result_json"
+            "$(jq -cn --arg osv_reason "$osv_reason" --arg socket_reason "$socket_reason" \
+              '[$osv_reason,$socket_reason,"blocklist_pass"]')" "$result_json"
           printf '[safe audit] recorded clean check: %s:%s@%s (install-known)\n' \
             "$ecosystem" "$PKG_NAME" "$primary_version" >&2
         fi

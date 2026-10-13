@@ -522,3 +522,53 @@ func TestBlockClassification(t *testing.T) {
 		})
 	}
 }
+
+// Below-high advisories inform, never gate (operator ruling 2026-10-12):
+// they stay in the OSV line but add no cause, so no terminal confirmation
+// is owed for severity alone. Anything not provably below high — high,
+// critical, unknown, unnormalized — keeps today's behavior, and
+// block_severities policy and malware still outrank the informational lane.
+func TestBelowHighAdvisoriesInform(t *testing.T) {
+	cases := []struct {
+		name      string
+		affecting []Advisory
+		blockSev  []string
+		verdict   string
+		cause     string // expected cause, "" for none
+		lineHas   string
+	}{
+		{"moderate only", []Advisory{{ID: "GHSA-1", Severity: "moderate"}}, nil, GO, "", "INFO"},
+		{"low and moderate", []Advisory{{ID: "GHSA-1", Severity: "low"}, {ID: "GHSA-2", Severity: "moderate"}}, nil, GO, "", "below high severity"},
+		{"moderate with unknown", []Advisory{{ID: "GHSA-1", Severity: "moderate"}, {ID: "GHSA-2", Severity: "unknown"}}, nil, WARN, "osv_affecting", "WARN"},
+		{"moderate with high", []Advisory{{ID: "GHSA-1", Severity: "moderate"}, {ID: "GHSA-2", Severity: "high"}}, nil, WARN, "osv_affecting", "WARN"},
+		{"unnormalized medium spelling", []Advisory{{ID: "GHSA-1", Severity: "medium"}}, nil, WARN, "osv_affecting", "WARN"},
+		{"empty severity", []Advisory{{ID: "GHSA-1", Severity: ""}}, nil, WARN, "osv_affecting", "WARN"},
+		{"moderate blocked by policy", []Advisory{{ID: "GHSA-1", Severity: "moderate"}}, []string{"critical", "moderate"}, BLOCK, "osv_affecting", "BLOCK"},
+		{"low severity malware record", []Advisory{{ID: "MAL-1", Severity: "low", Malware: true}}, nil, BLOCK, "osv_malware", "BLOCK"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := clean()
+			ev.OSV = OSV{Status: "ok", Affecting: tc.affecting, TotalCount: len(tc.affecting)}
+			if tc.blockSev != nil {
+				ev.BlockSeverities = tc.blockSev
+			}
+			got := Decide(ev)
+			if got.Verdict != tc.verdict {
+				t.Fatalf("verdict = %q, want %q (causes=%v)", got.Verdict, tc.verdict, got.Causes)
+			}
+			if tc.cause == "" && len(got.Causes) != 0 {
+				t.Fatalf("causes = %v, want none", got.Causes)
+			}
+			if tc.cause != "" && !hasCause(got.Causes, tc.cause) {
+				t.Fatalf("causes = %v, want %q", got.Causes, tc.cause)
+			}
+			if !strings.Contains(got.Lines.OSV, tc.lineHas) {
+				t.Fatalf("osv line = %q, want it to contain %q", got.Lines.OSV, tc.lineHas)
+			}
+			if !strings.Contains(got.Lines.OSV, tc.affecting[0].ID) {
+				t.Fatalf("osv line = %q, want the advisory named", got.Lines.OSV)
+			}
+		})
+	}
+}

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Policy: advisories below High severity no longer gate installs
+  (operator ruling 2026-10-12). When every advisory affecting the
+  resolved version is moderate or low — and none blocks via
+  `install.block_severities` and none is a malware record — the
+  verdict engine emits an `INFO (… all below high severity —
+  informational, not gating: …)` OSV line naming them, records them
+  in the receipt, and adds no WARN cause, so the install proceeds
+  without a terminal confirmation (the Encre frozen-lockfile update
+  refused at 102 solely for a Medium `devalue` advisory). High stays
+  an adverse WARN, critical/malware keep blocking, and an unreadable
+  severity still WARNs. The recorded install-known reasons say
+  `osv_below_high_only` instead of claiming a clean OSV check (inbox
+  2026-10-12).
 - Fix: `pip install -r <file>` with any basename other than
   `requirements.txt` / `requirements-*.txt` (or spelled with a path)
   reached pip with no audit of the packages it names. Any `-r` file now
