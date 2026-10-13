@@ -255,6 +255,13 @@ composer update
 
 Non-install and non-exec commands pass through unchanged.
 
+A pip/uv argument naming a local archive (`.whl`, `.tar.gz`, `.tgz`, `.zip`)
+is a local artifact, not a package identity — including the bare-relative
+spelling (`dist/x.whl`, not only `./dist/x.whl`). Local-artifact installs
+delegate without a package audit (the bytes are already on this machine),
+and the gate audit log gains one `LOCAL_ARTIFACT` line per archive naming
+its resolved path and sha256, so the log proves what was installed.
+
 When an operator-authorized private registry exists, project operations also
 check the origin binding of their private identities before delegating
 (trusted origins): npm `install|ci|update|dedupe|prune` check that every

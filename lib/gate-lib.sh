@@ -3834,6 +3834,55 @@ safe_gate_composer_create_project_packages() {
   (( ${#positionals[@]} > 0 ))
 }
 
+# A pip/uv argument naming a local archive file, not a package identity:
+# an archive suffix, spelled as a path (any separator — bare-relative
+# `dist/x.whl` included, inbox 2026-10-10) or naming an existing file.
+# pip treats `dist/x.whl` and `./dist/x.whl` identically; the extractor's
+# ./-only route misjudged the bare spelling as an unresolved package.
+safe_gate_python_is_local_artifact() {
+  case "$1" in
+    *://*|git+*) return 1 ;;
+    *.whl|*.tar.gz|*.tgz|*.zip) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in */*) return 0 ;; esac
+  [[ -f "$1" ]]
+}
+
+# One audit line per local archive on a delegated pip/uv install (inbox
+# 2026-10-10): the local-artifact route otherwise leaves only the generic
+# delegation line, so the log could not prove what was installed. Mirrors
+# the extractor's value-flag arm so flag values are never logged as
+# artifacts. Best-effort like every gate audit line.
+safe_gate_python_log_local_artifacts() {
+  local arg skip_next=0 abs sha
+  for arg in "$@"; do
+    if (( skip_next )); then
+      skip_next=0
+      continue
+    fi
+    case "${arg}" in
+      -c|--constraint|-i|--index-url|--index|--default-index|--extra-index-url|--find-links|--trusted-host|--platform|--python-version|--implementation|--abi|--target|--prefix|--src|--upgrade-strategy|--config-settings|-C|--python|-p|-r|--requirement|-e|--editable)
+        skip_next=1
+        continue
+        ;;
+      -*)
+        continue
+        ;;
+    esac
+    safe_gate_python_is_local_artifact "${arg}" || continue
+    abs="${arg}"
+    if [[ -f "${arg}" ]] && command -v realpath >/dev/null 2>&1; then
+      abs="$(realpath -- "${arg}" 2>/dev/null || printf '%s' "${arg}")"
+    fi
+    sha=""
+    if [[ -f "${arg}" ]] && command -v sha256sum >/dev/null 2>&1; then
+      sha="$(sha256sum -- "${arg}" 2>/dev/null | cut -d' ' -f1)"
+    fi
+    safe_gate_audit_log python "${arg}" "LOCAL_ARTIFACT" "path=${abs}${sha:+ sha256=${sha}}"
+  done
+}
+
 safe_gate_python_packages() {
   local -a packages=()
   local arg
@@ -3873,6 +3922,11 @@ safe_gate_python_packages() {
         return 1
         ;;
       *)
+        # Bare-relative local archive (dist/x.whl): same local-artifact
+        # route as the ./ spelling above, never a package identity.
+        if safe_gate_python_is_local_artifact "${arg}"; then
+          return 1
+        fi
         packages+=("$(safe_gate_python_spec "${arg}")")
         ;;
     esac
@@ -4619,6 +4673,7 @@ safe_gate_pip_like() {
   extractor_rc=$?
   safe_gate_collect packages "${extractor_out}"
   if (( extractor_rc != 0 || ${#packages[@]} == 0 )); then
+    safe_gate_python_log_local_artifacts "${@:subidx+1}"
     safe_gate_exec_real "${tool}" "$@"
   fi
 
@@ -4726,6 +4781,7 @@ safe_gate_uv() {
     extractor_rc=$?
     safe_gate_collect packages "${extractor_out}"
     if (( extractor_rc != 0 || ${#packages[@]} == 0 )); then
+      safe_gate_python_log_local_artifacts "${@:subidx+2}"
       safe_gate_exec_real uv "$@"
     fi
 
@@ -4748,6 +4804,7 @@ safe_gate_uv() {
     extractor_rc=$?
     safe_gate_collect packages "${extractor_out}"
     if (( extractor_rc != 0 || ${#packages[@]} == 0 )); then
+      safe_gate_python_log_local_artifacts "${@:subidx+2}"
       safe_gate_exec_real uv "$@"
     fi
 

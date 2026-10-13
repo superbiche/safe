@@ -3547,6 +3547,30 @@ case_requirement_install_scans() {
   pass "$FUNCNAME"
 }
 
+# A bare-relative wheel path is a local artifact, not a package identity
+# (inbox 2026-10-10): pip runs unaudited like the ./ spelling, and the gate
+# audit log names the artifact with its sha256 (inbox 2026-10-10, audit
+# line). Both spellings behave identically.
+case_pip_local_wheel() {
+  prepare_case "pip-local-wheel"
+  mkdir -p "${WORK_DIR}/dist"
+  printf 'wheel-bytes' > "${WORK_DIR}/dist/caviar_redact-0.2.0-py3-none-any.whl"
+  local want_sha
+  want_sha="$(sha256sum "${WORK_DIR}/dist/caviar_redact-0.2.0-py3-none-any.whl" | cut -d' ' -f1)"
+  local audit_log="${HOME_DIR}/.local/share/safe/run/audit.log"
+  local spelling
+  for spelling in 'dist/caviar_redact-0.2.0-py3-none-any.whl' './dist/caviar_redact-0.2.0-py3-none-any.whl'; do
+    SAFE_INSTALL_TEST_SCRIPT="pip install --no-index --no-deps ${spelling}" run_zsh
+    assert_status 0 "$FUNCNAME" || return
+    assert_log_contains $'REAL\tpip\tinstall\t--no-index\t--no-deps\t'"${spelling}" "$FUNCNAME" || return
+    assert_log_not_contains_fragment $'AUDIT\tpackage-audit' "$FUNCNAME" || return
+    grep -Fq "| install:python | ${spelling} | GATE |" "${audit_log}" || { fail "$FUNCNAME"; return; }
+    grep -Fq "| LOCAL_ARTIFACT | path=${WORK_DIR}/dist/caviar_redact-0.2.0-py3-none-any.whl sha256=${want_sha}" "${audit_log}" || { fail "$FUNCNAME"; return; }
+    : > "${LOG_FILE}"
+  done
+  pass "$FUNCNAME"
+}
+
 case_cargo_parser() {
   prepare_case "cargo-parser"
   SAFE_INSTALL_TEST_SCRIPT='cargo install ripgrep --version 14.1.1' run_zsh
@@ -6708,6 +6732,7 @@ main() {
     case_npm_complex_flags \
     case_pip_complex_flags \
     case_requirement_install_scans \
+    case_pip_local_wheel \
     case_cargo_parser \
     case_go_parser \
     case_composer_parser \
