@@ -78,7 +78,7 @@ signers "$fpr"
 mkdir -p "$SYNC"
 printf '{"packages":{}}\n' > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
 pty_run "$RUN" host-allow export --sign > "$tmp/out" 2>&1 || fail "host-allow export: $(cat "$tmp/out")"
-pty_run "$RUN" private-registry add p-npm --ecosystem npm --origin "$NPM_ORIGIN" --namespace '@p/*' --reason "my registry" > "$tmp/out" 2>&1 \
+pty_run "$RUN" private-registry add p-npm --ecosystem npm --origin "$NPM_ORIGIN" --namespace '@p/*' > "$tmp/out" 2>&1 \
   || fail "origin add: $(cat "$tmp/out")"
 statement="$SYNC/private-registries.rainbow.json"
 [[ -s "$statement" && -s "$statement.asc" ]] || fail "an origin add did not publish the signed statement: $(cat "$tmp/out")"
@@ -141,7 +141,7 @@ set_host rainbow
 mv "$SAFE_RUN_CONFIG_DIR" "$tmp/follower-config"; mv "$tmp/origin-config" "$SAFE_RUN_CONFIG_DIR"
 cp "$tmp/statement-gen1.json" "$statement"; cp "$tmp/statement-gen1.json.asc" "$statement.asc"
 sleep 1
-pty_run "$RUN" private-registry add q-npm --ecosystem npm --origin "$NPM_ORIGIN" --namespace '@q/*' --reason "second scope" > "$tmp/out" 2>&1 || fail "origin second add: $(cat "$tmp/out")"
+pty_run "$RUN" private-registry add q-npm --ecosystem npm --origin "$NPM_ORIGIN" --namespace '@q/*' > "$tmp/out" 2>&1 || fail "origin second add: $(cat "$tmp/out")"
 cp "$statement" "$tmp/statement-gen2.json"; cp "$statement.asc" "$tmp/statement-gen2.json.asc"
 set_host agent-dev
 mv "$SAFE_RUN_CONFIG_DIR" "$tmp/origin-config"; mv "$tmp/follower-config" "$SAFE_RUN_CONFIG_DIR"

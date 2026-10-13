@@ -149,7 +149,7 @@ JSON/signature pair during transport is safely rejected; retry after both arrive
 For an actual skip/error, the operator can review the file and run
 `safe run host-allow import <file>` at a TTY. Unsigned imports keep their
 conflict behavior and need the usual `safe run host-allow update
-<pkg>@<version> --reason "..."`; signed follow replaces a different local pin
+<pkg>@<version>`; signed follow replaces a different local pin
 when its generation is newer. A stale signed statement is warned, counted as a
 failure, and remains retryable for that identity until its origin publishes a
 newer generation.

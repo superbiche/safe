@@ -821,7 +821,7 @@ case_refusal_message_contract() {
   SAFE_INSTALL_TEST_SCRIPT='npm install -g warnme@1.0.0' run_zsh
   assert_status 100 "$FUNCNAME" || return
   assert_err_contains_fragment 'safe: BLOCKED npm install of warnme@1.0.0' "$FUNCNAME" || return
-  assert_err_contains_fragment 'safe run host-allow add warnme@1.0.0 --reason' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe run host-allow add warnme@1.0.0' "$FUNCNAME" || return
   assert_err_contains_fragment 'safe explain' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }

@@ -2641,14 +2641,14 @@ safe_install_allow_hint() {
   case "$(safe_install_canonical_eco "$ecosystem")" in
     npm)
       if [[ -n "$version" && "$version" != "latest" ]]; then
-        printf 'to allow: ask the operator to run: safe run host-allow add %s --reason "..." — then retry' "$package"
+        printf 'to allow: ask the operator to run: safe run host-allow add %s — then retry' "$package"
       else
         printf 'to allow: pin an exact version first (see the resolved-version hint above) — allow entries are never @latest'
       fi
       ;;
     python)
       if [[ -n "$version" && "$version" != "latest" ]]; then
-        printf 'to allow: ask the operator to run: safe run host-allow add %s --ecosystem python --reason "..." — then retry' "$package"
+        printf 'to allow: ask the operator to run: safe run host-allow add %s --ecosystem python — then retry' "$package"
       else
         printf 'to allow: pin an exact version first (see the resolved-version hint above) — allow entries are never @latest'
       fi
@@ -2803,7 +2803,6 @@ safe_install_confirm_warn() {
 safe_install_warn_grant_host_allow() {
   local package="$1"
   local ecosystem="$2"
-  local reason
 
   # Belt-and-suspenders for F1: never mint a defaulted-npm grant for an
   # ecosystem host-allow does not support. The confirm no longer offers [a]
@@ -2812,15 +2811,14 @@ safe_install_warn_grant_host_allow() {
     err "install proceeded; host-allow records standing grants only for npm and python, so none was recorded for $package ($ecosystem)."
     return 0
   fi
-  reason="operator override at the install gate ($(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u))"
-  local -a cmd=("$SAFE_RUN_PATH" host-allow add "$package" --reason "$reason")
+  local -a cmd=("$SAFE_RUN_PATH" host-allow add "$package")
   case "$(safe_install_canonical_eco "$ecosystem")" in
     python) cmd+=(--ecosystem python) ;;
   esac
   if "${cmd[@]}"; then
     err "recorded a host-allow grant for $package (future reinstalls permitted)"
   else
-    err "install proceeded, but the host-allow grant was not recorded; add it later: safe run host-allow add $package --reason \"...\""
+    err "install proceeded, but the host-allow grant was not recorded; add it later: safe run host-allow add $package"
   fi
 }
 

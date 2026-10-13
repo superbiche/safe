@@ -123,7 +123,7 @@ pass "y or a mistyped identity refuses 100"
 # --- record -------------------------------------------------------------------
 rc="$(run_case wrapper 20 1 "$ADVISORY" 'record blk@1.0.0')"
 [[ "$rc" == 0 && "$(last_token)" == BLOCK_TTY_OVERRIDE_RECORD ]] || fail "record: rc=$rc token=$(last_token)"
-grep -q -- '^host-allow add blk@1.0.0 --reason .* --accept-block$' "$tmp/safe-run.argv" \
+grep -q -- '^host-allow add blk@1.0.0 --accept-block$' "$tmp/safe-run.argv" \
   || fail "record argv: $(cat "$tmp/safe-run.argv" 2>/dev/null)"
 rc="$(run_case wrapper 20 1 '{"package":"blk","resolved_versions":["1.0.0"],"block":{"class":"advisory","advisories":["PYSEC-1"]},"gate_exit":20}' 'record blk@1.0.0' 'blk==1.0.0' python)"
 [[ "$rc" == 0 ]] && grep -q -- '--accept-block --ecosystem python$' "$tmp/safe-run.argv" || fail "python record argv: $(cat "$tmp/safe-run.argv" 2>/dev/null)"

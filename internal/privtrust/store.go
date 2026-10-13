@@ -154,17 +154,9 @@ func Export(s Stores, host, exportedAt string) (Statement, error) {
 	st := Statement{Schema: StatementSchema, Host: host, ExportedAt: exportedAt,
 		Registries: pol.Registries}
 	for id, r := range st.Registries {
-		r.Reason = trimReason(r.Reason)
 		st.Registries[id] = r
 	}
 	return st, nil
-}
-
-func trimReason(r string) string {
-	if len(r) > 500 {
-		return r[:500]
-	}
-	return r
 }
 
 // StatementResult reports a follow application.
@@ -207,7 +199,6 @@ func ParseStatement(raw []byte, host string) (Statement, []string, error) {
 			warns = append(warns, "skipped registry: "+err.Error())
 			continue
 		}
-		r.Reason = trimReason(r.Reason)
 		regs[id] = r
 	}
 	if err := checkPolicyOverlap(regs); err != nil {

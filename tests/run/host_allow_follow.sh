@@ -71,7 +71,7 @@ pty_run "$SAFE_RUN" host-allow export --sign > "$tmp/output" 2>&1 || fail 'signe
 export_file="$HOME/Sync/state/safe/host-allow.rainbow.json"
 [[ -s "$export_file" && -s "$export_file.asc" ]] || fail 'missing signed export pair'
 gpg --no-options --batch --verify "$export_file.asc" "$export_file" > "$tmp/verify.log" 2>&1 || fail 'signature does not verify'
-jq -e '.schema == "safe-host-allow-export/2" and .host == "rainbow" and (.exported_at | type == "string") and (.packages["fresh-pkg"] | keys == ["added","ecosystem","reason","sha","version"])' "$export_file" >/dev/null || fail 'wrong signed document'
+jq -e '.schema == "safe-host-allow-export/2" and .host == "rainbow" and (.exported_at | type == "string") and (.packages["fresh-pkg"] | keys == ["added","ecosystem","sha","version"])' "$export_file" >/dev/null || fail 'wrong signed document'
 pass 'signed export produces verifiable v2 document, metadata and portable fields'
 jq -e '.install_allowances == [
   {"ecosystem":"go","name":"example.invalid/tool","version":"v1.2.3","verdict":"WARN_TOLERATED","allowed":"2026-10-01T00:00:00+00:00"},
@@ -369,7 +369,7 @@ cmp "$tmp/bo-local.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'an orig
 jq '.packages["fresh-pkg"].block_override = {"advisories":["GHSA-aaaa"],"accepted":"2026-09-30"}' \
   "$tmp/bo-local.json" > "$SAFE_RUN_CONFIG_DIR/host-allow.json"
 expect_rc 0 "$SAFE_RUN" host-allow export
-jq -e '.packages["fresh-pkg"] | keys == ["added","block_override","ecosystem","reason","sha","version"]
+jq -e '.packages["fresh-pkg"] | keys == ["added","block_override","ecosystem","sha","version"]
   and .block_override.advisories == ["GHSA-aaaa"]' "$tmp/output" >/dev/null || fail 'export does not carry the override'
 cp "$tmp/bo-store-before.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json"
 cp "$tmp/bo-state-before.json" "$SAFE_RUN_CONFIG_DIR/follow-state.json"
@@ -520,7 +520,7 @@ printf '{"packages":{"fresh-pkg":{"version":"2.0.0","sha":"sha512-FRESH","ecosys
 printf '{"origins":{"rainbow":{"accepted":"%s","applied":["fresh-pkg@2.0.0"],"replaced":[]},"tuxedo":{"accepted":"%s","applied":[],"replaced":[]}}}\n' "$cross_newer" "$cross_older" > "$SAFE_RUN_CONFIG_DIR/follow-state.json"
 expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
 jq -e '.origins.tuxedo.refused == ["fresh-pkg@1.2.3"]' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'refusal was not recorded before the hinted update'
-printf 'y\n' | pty_run "$SAFE_RUN" host-allow update fresh-pkg@1.2.3 --reason "operator ruling" > "$tmp/output" 2>&1 || fail 'TTY update to refused version failed'
+printf 'y\n' | pty_run "$SAFE_RUN" host-allow update fresh-pkg@1.2.3 > "$tmp/output" 2>&1 || fail 'TTY update to refused version failed'
 cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/local-before-refused-version-follow.json"
 expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/incoming"
 cmp "$tmp/local-before-refused-version-follow.json" "$SAFE_RUN_CONFIG_DIR/host-allow.json" || fail 'equal-version retry rewrote the host-allow store'
@@ -578,7 +578,6 @@ pass 'removing signer revokes future acceptance without deleting existing grants
 # Fresh missing entries must pass every import validation check.
 reset_incoming
 jq '.packages = {
- "no-reason":{"version":"1.2.3","reason":""},
  "unknown-eco":{"version":"1.2.3","reason":"x","ecosystem":"cobol"},
  "tag-pkg":{"version":"latest","reason":"x"},
  "range-pkg":{"version":"1.x","reason":"x"},
@@ -592,10 +591,10 @@ jq 'del(.packages["fresh-pkg"])' "$tmp/local-before.json" > "$SAFE_RUN_CONFIG_DI
 cp "$SAFE_RUN_CONFIG_DIR/host-allow.json" "$tmp/local-before.json"
 sign_document "$fingerprint" "$tmp/incoming/host-allow.rainbow.json"
 expect_follow_failure
-for cause in 'no reason' 'unknown ecosystem' 'not an exact pinned' 'invalid entry field types' 'could not verify' 'integrity mismatch'; do
+for cause in 'unknown ecosystem' 'not an exact pinned' 'invalid entry field types' 'could not verify' 'integrity mismatch'; do
   grep -q "$cause" "$tmp/output" || fail "missing rejection: $cause"
 done
-pass 'same import validator rejects bad types, missing reasons, unknown ecosystems, non-exact pins, unresolved versions and changed integrity'
+pass 'same import validator rejects bad types, unknown ecosystems, non-exact pins, unresolved versions and changed integrity'
 
 # A malformed local entry is a named conflict, while a valid sibling in the
 # same signed file still applies. Exercise both null and versionless shapes.
@@ -1070,9 +1069,12 @@ pty_run "$SAFE_RUN" host-allow remove gone-pkg > "$tmp/output" 2>&1 || fail 'non
 pass 'a host without its own signed export never starts publishing one'
 
 seed_auto_export "$signing_config"
-printf 'y\n' | pty_run "$SAFE_RUN" host-allow update fresh-pkg@1.2.3 --reason "auto-export update" > "$tmp/output" 2>&1 || { cat "$tmp/output" >&2; fail 'TTY update on origin failed'; }
+export_gen_before=$(jq -r '.exported_at' "$export_file")
+sleep 1
+printf 'y\n' | pty_run "$SAFE_RUN" host-allow update fresh-pkg@1.2.3 > "$tmp/output" 2>&1 || { cat "$tmp/output" >&2; fail 'TTY update on origin failed'; }
 grep -q 'republishing the signed export' "$tmp/output" || fail 'update on an origin did not republish'
-jq -e '.packages["fresh-pkg"].reason == "auto-export update"' "$export_file" >/dev/null || fail 'update did not reach the republished export'
+[[ "$(jq -r '.exported_at' "$export_file")" != "$export_gen_before" ]] || fail 'update did not reach the republished export'
+jq -e '.packages["fresh-pkg"] | has("reason") | not' "$export_file" >/dev/null || fail 'republished export still carries a reason'
 gpg --no-options --batch --verify "$export_file.asc" "$export_file" > "$tmp/verify.log" 2>&1 || fail 'update re-export signature does not verify'
 pass 'host-allow update on an origin republishes the signed export'
 

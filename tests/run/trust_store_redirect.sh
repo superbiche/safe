@@ -62,7 +62,7 @@ redir_run() {
 
 for verb in add update; do
   set +e
-  out=$(redir_run host-allow "$verb" evil-pkg@1.0.0 --reason x </dev/null 2>&1); rc=$?
+  out=$(redir_run host-allow "$verb" evil-pkg@1.0.0 </dev/null 2>&1); rc=$?
   set -e
   [[ "$rc" -eq 100 ]] || fail "host-allow $verb on redirected store must exit 100 (got $rc)"
   grep -q "trust store redirected" <<<"$out" || fail "host-allow $verb refusal not legible"
@@ -81,7 +81,7 @@ jq -e '.packages | length == 0' "$REDIR/host-allow.json" >/dev/null \
 pass "host-allow import on a redirected store refuses (exit 100), nothing written"
 
 set +e
-out=$(redir_run scripts-allow add evil-pkg@1.0.0 --reason x </dev/null 2>&1); rc=$?
+out=$(redir_run scripts-allow add evil-pkg@1.0.0 </dev/null 2>&1); rc=$?
 set -e
 [[ "$rc" -eq 100 ]] || fail "scripts-allow add on redirected store must exit 100, not the TTY 102 (got $rc)"
 grep -q "trust store redirected" <<<"$out" || fail "scripts-allow add refusal not legible"
@@ -91,7 +91,7 @@ pass "scripts-allow add on a redirected store refuses (exit 100) before the TTY 
 set +e
 out=$(HOME="$H" SAFE_RUN_CONFIG_DIR="$REDIR" SAFE_RUN_DATA_DIR="$tmp/data" \
   SAFE_RUN_NO_INIT=1 SAFE_RUN_TRUST_OVERRIDE=1 \
-  "$SAFE_RUN" host-allow add evil-pkg@1.0.0 --reason x </dev/null 2>&1); rc=$?
+  "$SAFE_RUN" host-allow add evil-pkg@1.0.0 </dev/null 2>&1); rc=$?
 set -e
 [[ "$rc" -eq 102 ]] || fail "token must lift the write guard to the TTY gate exit 102 (got $rc)"
 pass "SAFE_RUN_TRUST_OVERRIDE lifts the write guard (falls through to the TTY gate)"
@@ -229,7 +229,7 @@ if [[ "$EUID" -ne 0 ]]; then
   chmod 000 "$baddata"
   set +e
   errout=$(HOME="$H" SAFE_RUN_CONFIG_DIR="$REDIR" SAFE_RUN_DATA_DIR="$baddata" \
-    SAFE_RUN_NO_INIT=1 "$SAFE_RUN" host-allow add evil-pkg@1.0.0 --reason x \
+    SAFE_RUN_NO_INIT=1 "$SAFE_RUN" host-allow add evil-pkg@1.0.0 \
     </dev/null 2>&1 >/dev/null); rc=$?
   set -e
   chmod 755 "$baddata"
