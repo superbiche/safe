@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Fix: a bare-relative local wheel path (`pip install dist/x.whl`) was
+  misparsed as an unresolved package name and refused; archive arguments
+  (`.whl`, `.tar.gz`, `.tgz`, `.zip`) spelled as paths now take the same
+  local-artifact route as the `./` spelling, for pip, `uv pip install`
+  and `uv tool install`. Local-artifact installs also leave an
+  `install:python | <path> | LOCAL_ARTIFACT` gate audit line with the
+  resolved path and sha256, instead of only the generic delegation line
+  (inbox 2026-10-10, both notes).
 - Followed install allowances (operator ruling 2026-10-13: a follower
   installs what the origin allowed). The signed host-allow statement now
   also carries `install_allowances` — the exact versions safe allowed to
