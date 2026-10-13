@@ -364,10 +364,12 @@ record with per-severity counts. Four rules govern that normalization:
 
 A scanner that is **absent** does warn (its coverage is genuinely missing), and
 a scanner that **failed** warns and blocks caching. `pip-audit` audits every
-declared target — `requirements.txt`, `requirements-dev.txt`, and a
-`pyproject.toml` *by path* — because a bare `pip-audit` audits the active
-Python environment rather than the project, and stopping at the first target
-hid every dev-only advisory.
+declared target — `requirements.txt`, `requirements-dev.txt`, a
+`pyproject.toml` *by path*, and every file named with `--pip-requirement`
+(the install gate threads the `-r`/`-c` files of the command being gated,
+whatever their basename; they join the scan-cache evidence) — because a bare
+`pip-audit` audits the active Python environment rather than the project,
+and stopping at the first target hid every dev-only advisory.
 
 `govulncheck` is required to exit 0: in `-json` mode it reports findings in
 the stream, so a nonzero exit means the run itself failed, whatever prefix it
