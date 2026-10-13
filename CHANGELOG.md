@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.71.0 - 2026-10-13
 
 - Breaking: operator grants no longer carry a `reason` (operator ruling
   2026-10-13). `safe run host-allow add|update`, `scripts-allow add`,
