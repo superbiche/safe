@@ -33,7 +33,7 @@
   "exit_codes": [
     {
       "code": 0,
-      "meaning": "clean verdict (GO) from `safe audit package-audit`, or a gated command that passed and ran",
+      "meaning": "GO verdict from `safe audit package-audit` (advisories below high severity may be present as informational findings), or a gated command that passed and ran",
       "agent_action": "Proceed."
     },
     {

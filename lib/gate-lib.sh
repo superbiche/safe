@@ -3436,7 +3436,7 @@ safe_gate_check() {
       ;;
     124|137)
       if safe_gate_known_matches "${package}" "${ecosystem}"; then
-        safe_gate_err "safe install: safe audit timed out; proceeding on recorded clean check for ${package} (stale evidence)"
+        safe_gate_err "safe install: safe audit timed out; proceeding on recorded GO check for ${package} (stale evidence)"
         safe_gate_audit_log "${ecosystem}" "${package}" "STALE_EVIDENCE"
         return 0
       fi
