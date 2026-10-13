@@ -533,23 +533,29 @@ func TestBelowHighAdvisoriesInform(t *testing.T) {
 		name      string
 		affecting []Advisory
 		blockSev  []string
+		status    string // OSV status override, "" means "ok"
 		verdict   string
 		cause     string // expected cause, "" for none
 		lineHas   string
 	}{
-		{"moderate only", []Advisory{{ID: "GHSA-1", Severity: "moderate"}}, nil, GO, "", "INFO"},
-		{"low and moderate", []Advisory{{ID: "GHSA-1", Severity: "low"}, {ID: "GHSA-2", Severity: "moderate"}}, nil, GO, "", "below high severity"},
-		{"moderate with unknown", []Advisory{{ID: "GHSA-1", Severity: "moderate"}, {ID: "GHSA-2", Severity: "unknown"}}, nil, WARN, "osv_affecting", "WARN"},
-		{"moderate with high", []Advisory{{ID: "GHSA-1", Severity: "moderate"}, {ID: "GHSA-2", Severity: "high"}}, nil, WARN, "osv_affecting", "WARN"},
-		{"unnormalized medium spelling", []Advisory{{ID: "GHSA-1", Severity: "medium"}}, nil, WARN, "osv_affecting", "WARN"},
-		{"empty severity", []Advisory{{ID: "GHSA-1", Severity: ""}}, nil, WARN, "osv_affecting", "WARN"},
-		{"moderate blocked by policy", []Advisory{{ID: "GHSA-1", Severity: "moderate"}}, []string{"critical", "moderate"}, BLOCK, "osv_affecting", "BLOCK"},
-		{"low severity malware record", []Advisory{{ID: "MAL-1", Severity: "low", Malware: true}}, nil, BLOCK, "osv_malware", "BLOCK"},
+		{"moderate only", []Advisory{{ID: "GHSA-1", Severity: "moderate"}}, nil, "", GO, "", "INFO"},
+		{"moderate with incomplete OSV data", []Advisory{{ID: "GHSA-1", Severity: "moderate"}}, nil, "error", WARN, "osv_unavailable", "WARN"},
+		{"low and moderate", []Advisory{{ID: "GHSA-1", Severity: "low"}, {ID: "GHSA-2", Severity: "moderate"}}, nil, "", GO, "", "below high severity"},
+		{"moderate with unknown", []Advisory{{ID: "GHSA-1", Severity: "moderate"}, {ID: "GHSA-2", Severity: "unknown"}}, nil, "", WARN, "osv_affecting", "WARN"},
+		{"moderate with high", []Advisory{{ID: "GHSA-1", Severity: "moderate"}, {ID: "GHSA-2", Severity: "high"}}, nil, "", WARN, "osv_affecting", "WARN"},
+		{"unnormalized medium spelling", []Advisory{{ID: "GHSA-1", Severity: "medium"}}, nil, "", WARN, "osv_affecting", "WARN"},
+		{"empty severity", []Advisory{{ID: "GHSA-1", Severity: ""}}, nil, "", WARN, "osv_affecting", "WARN"},
+		{"moderate blocked by policy", []Advisory{{ID: "GHSA-1", Severity: "moderate"}}, []string{"critical", "moderate"}, "", BLOCK, "osv_affecting", "BLOCK"},
+		{"low severity malware record", []Advisory{{ID: "MAL-1", Severity: "low", Malware: true}}, nil, "", BLOCK, "osv_malware", "BLOCK"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ev := clean()
-			ev.OSV = OSV{Status: "ok", Affecting: tc.affecting, TotalCount: len(tc.affecting)}
+			status := tc.status
+			if status == "" {
+				status = "ok"
+			}
+			ev.OSV = OSV{Status: status, Affecting: tc.affecting, TotalCount: len(tc.affecting)}
 			if tc.blockSev != nil {
 				ev.BlockSeverities = tc.blockSev
 			}

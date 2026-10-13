@@ -10,11 +10,17 @@
   informational, not gating: …)` OSV line naming them, records them
   in the receipt, and adds no WARN cause, so the install proceeds
   without a terminal confirmation (the Encre frozen-lockfile update
-  refused at 102 solely for a Medium `devalue` advisory). High stays
-  an adverse WARN, critical/malware keep blocking, and an unreadable
-  severity still WARNs. The recorded install-known reasons say
-  `osv_below_high_only` instead of claiming a clean OSV check (inbox
-  2026-10-12).
+  refused at 102 solely for a Medium `devalue` advisory). The lane
+  requires complete OSV data: a partial answer still WARNs. High
+  stays an adverse WARN, critical/malware keep blocking, and an
+  unreadable severity still WARNs; a present-but-unbandable CVSS v3
+  vector now floors at high like v4, and `install.block_severities`
+  values are spelling-normalized (`medium`/`Moderate` now mean
+  `moderate`). The recorded install-known reasons say
+  `osv_below_high_only` instead of claiming a clean OSV check, while
+  the verdict token stays GO — evaluated-and-ruled-non-gating counts
+  as GO evidence (stale fallback, followed allowances), unlike
+  missing evidence (inbox 2026-10-12; review round 1).
 - Fix: `pip install -r <file>` with any basename other than
   `requirements.txt` / `requirements-*.txt` (or spelled with a path)
   reached pip with no audit of the packages it names. Any `-r` file now

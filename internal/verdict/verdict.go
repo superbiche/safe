@@ -497,7 +497,12 @@ func osvStage(ev Evidence, d *decision, res *Result) {
 		// confirmation is owed for severity alone. An "unknown" (or any
 		// unrecognized) severity is not provably below high and keeps
 		// the WARN — fail closed on unreadable severity, as elsewhere.
-		if !blocked && malware == "" && allBelowHigh(o.Affecting) {
+		// Complete OSV data is required too: with a partial answer the
+		// unseen advisories are not provably below high either, and the
+		// outage tail below only appends its cause without bumping —
+		// on this lane that would leave a GO verdict carrying
+		// osv_unavailable (review round 1, B1).
+		if o.Status == "ok" && !blocked && malware == "" && allBelowHigh(o.Affecting) {
 			res.Lines.OSV = fmt.Sprintf("INFO (%d of %d advisories affect %s, all below high severity — informational, not gating: %s)",
 				affectingCount, o.TotalCount, label, summary)
 		} else {

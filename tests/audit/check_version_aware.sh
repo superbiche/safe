@@ -534,6 +534,18 @@ fi
 if expect_grep "$OUT_FILE" 'INFO.*GHSA-AFFECTS-MOD \(moderate\)' "the moderate advisory is named, not hidden"; then
   pass "the moderate advisory is named, not hidden"
 fi
+if expect_no_grep "$ERR_FILE" '@latest' "no output ever suggests @latest"; then
+  pass "no output ever suggests @latest"
+fi
+# The recorded GO names the below-high evidence honestly (2026-10-12):
+# verdict GO (it counts as GO evidence) but never osv_clean_for_version.
+if jq -e '.packages["npm:brace-expansion"] | .verdict == "GO" and (.reasons | index("osv_below_high_only") != null) and (.reasons | index("osv_clean_for_version") == null)' \
+  "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
+  pass "below-high GO records osv_below_high_only, never a clean claim"
+else
+  cat "$CASE_RUN_CONFIG/install-known.json" >&2
+  fail "below-high GO records osv_below_high_only, never a clean claim"
+fi
 run_check \
   MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
   MOCK_OSV_FIXTURE="$fixture" \
@@ -542,6 +554,20 @@ run_check \
   -- brace-expansion@2.1.4 --ecosystem npm
 if expect_status 0 "plain check of a moderate-only advisory also proceeds"; then
   pass "plain check of a moderate-only advisory also proceeds"
+fi
+# The informational lane requires complete OSV data (review B1): an OSV
+# outage beside a moderate fixture still refuses (here the full outage is
+# infra-only exit 11; the retained-partial-data shape — known moderate plus
+# an error status — is pinned at the Go layer in TestBelowHighAdvisoriesInform).
+run_check \
+  MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" \
+  MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 \
+  MOCK_OSV_STATUS=1 \
+  MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 11 "moderate with incomplete OSV data still refuses (review B1)"; then
+  pass "moderate with incomplete OSV data still refuses (review B1)"
 fi
 
 # ---------------------------------------------------------------------------

@@ -1235,8 +1235,11 @@ safe_gate_known_matches() {
   IFS=$'\t' read -r name version <<< "$(safe_gate_split_spec "${package}")"
   [[ -n "${name}" && -n "${version}" && "${version}" != "latest" ]] || return 1
 
-  # Only fully clean GO evidence may satisfy the offline fallback — a
-  # tolerated-WARN record is not clean evidence (PR#29 review finding 5).
+  # Only GO evidence may satisfy the offline fallback — a tolerated-WARN
+  # record is not clean evidence (PR#29 review finding 5). A GO whose only
+  # advisories are below high qualifies deliberately (2026-10-12 ruling):
+  # that signal was evaluated and ruled non-gating, not missing; its
+  # recorded reasons (osv_below_high_only) keep the distinction auditable.
   # The source identity (implicit-default vs explicit:<set>, delta-3
   # finding 5) must be byte-identical to what safe-audit's receipt writer
   # recorded; the derivation (argv + env + rc precedence, per ecosystem) is
