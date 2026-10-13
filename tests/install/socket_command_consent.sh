@@ -216,6 +216,12 @@ set +e
 SAFE_AUDIT_PATH="$tmp/audit"
 cat >"$SAFE_AUDIT_PATH" <<'STUB'
 #!/usr/bin/env bash
+# Plumbing subcommands (the gate's install recording) are not package
+# audits: answer them without touching the audit call count.
+case "$1" in
+  effective-sources) printf 'implicit-default\n'; exit 0 ;;
+  record-installed) exit 0 ;;
+esac
 n=$(cat "$CALLS" 2>/dev/null || echo 0); n=$((n+1)); printf '%s' "$n" >"$CALLS"
 printf '%s\n' "${SAFE_AUDIT_SOCKET_CONSENT-unset}" >>"$ENVLOG"
 [[ "$n" == 1 ]] && exit 13

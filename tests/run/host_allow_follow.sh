@@ -42,6 +42,19 @@ printf '{"follow":{"signing_key":"%s"}}\n' "$fingerprint" > "$SAFE_RUN_CONFIG_DI
 cat > "$SAFE_RUN_CONFIG_DIR/host-allow.json" <<'JSON'
 {"packages":{"fresh-pkg":{"version":"1.2.3","sha":"sha512-FRESH","ecosystem":"npm","added":"2026-07-01","reason":"origin grant","private_field":"must not export"}}}
 JSON
+# Origin install record (2026-10-13 ruling): exactly the locally-decided,
+# default-source, exact-version entries become signed install allowances.
+cat > "$SAFE_RUN_CONFIG_DIR/install-known.json" <<'JSON'
+{"packages":{
+ "npm:fresh-tool":{"version":"2.0.0","verdict":"GO","reasons":["socket_ok"],"evidence":"x","source":"implicit-default","first_allowed":"2026-10-01T00:00:00+00:00","last_used":"2026-10-01","times_used":1},
+ "npm:pending-tool":{"version":"1.0.0","verdict":"GO_PENDING_SOCKET","reasons":[],"evidence":"x","source":"implicit-default","first_allowed":"2026-10-01T00:00:00+00:00","last_used":"2026-10-01","times_used":1},
+ "npm:custom-tool":{"version":"1.0.0","verdict":"GO","reasons":[],"evidence":"x","source":"explicit:https://example.invalid","first_allowed":"2026-10-01T00:00:00+00:00","last_used":"2026-10-01","times_used":1},
+ "npm:borrowed-tool":{"version":"1.0.0","verdict":"ALLOWED_VIA_FOLLOWED_GRANT","reasons":[],"evidence":"x","source":"implicit-default","first_allowed":"2026-10-01T00:00:00+00:00","last_used":"2026-10-01","times_used":1},
+ "go:example.invalid/tool":{"version":"v1.2.3","verdict":"WARN_TOLERATED","reasons":["socket_not_found"],"evidence":"x","source":"implicit-default","first_allowed":"2026-10-01T00:00:00+00:00","last_used":"2026-10-01","times_used":1},
+ "npm:range-tool":{"version":"1.x","verdict":"GO","reasons":[],"evidence":"x","source":"implicit-default","first_allowed":"2026-10-01T00:00:00+00:00","last_used":"2026-10-01","times_used":1},
+ "python:py-tool":{"version":"1!2.0","verdict":"WARN_TTY_OVERRIDE","reasons":[],"evidence":"x","source":"implicit-default","first_allowed":"2026-10-01T00:00:00+00:00","last_used":"2026-10-01","times_used":1}
+}}
+JSON
 pty_run() {
   python3 -c 'import pty,sys,os; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' "$@"
 }
@@ -60,6 +73,12 @@ export_file="$HOME/Sync/state/safe/host-allow.rainbow.json"
 gpg --no-options --batch --verify "$export_file.asc" "$export_file" > "$tmp/verify.log" 2>&1 || fail 'signature does not verify'
 jq -e '.schema == "safe-host-allow-export/2" and .host == "rainbow" and (.exported_at | type == "string") and (.packages["fresh-pkg"] | keys == ["added","ecosystem","reason","sha","version"])' "$export_file" >/dev/null || fail 'wrong signed document'
 pass 'signed export produces verifiable v2 document, metadata and portable fields'
+jq -e '.install_allowances == [
+  {"ecosystem":"go","name":"example.invalid/tool","version":"v1.2.3","verdict":"WARN_TOLERATED","allowed":"2026-10-01T00:00:00+00:00"},
+  {"ecosystem":"npm","name":"fresh-tool","version":"2.0.0","verdict":"GO","allowed":"2026-10-01T00:00:00+00:00"},
+  {"ecosystem":"python","name":"py-tool","version":"1!2.0","verdict":"WARN_TTY_OVERRIDE","allowed":"2026-10-01T00:00:00+00:00"}
+]' "$export_file" >/dev/null || fail 'signed export install allowances differ (pending/custom-source/borrowed/range entries must not ride)'
+pass 'signed export carries exactly the origin-allowed exact versions as install allowances'
 pty_run "$SAFE_RUN" host-allow export --sign --out "$tmp/custom output" > "$tmp/output" 2>&1 || fail 'custom directory failed'
 [[ -s "$tmp/custom output/host-allow.rainbow.json.asc" ]] || fail 'custom directory ignored'
 pass 'signed export supports explicit output directory'
@@ -196,6 +215,48 @@ r1_sign "$fingerprint" ".exported_at = \"$r1_later\" | .packages[\"fresh-pkg\"].
 expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/r1-in"
 gate_followed_grant fresh-pkg 1.2.3 npm >/dev/null || fail 'a bun statement did not grant the npm identity'
 pass 'followed authority is bound to the canonical ecosystem of the signed statement'
+
+# Followed install allowances (2026-10-13 ruling): the statement's
+# install_allowances land in the ledger bound to the verifying signer, the
+# gate reader accepts exactly those identities, a malformed entry alarms
+# without granting, and a newer statement's snapshot replaces the set.
+gate_followed_install() (
+  trust_store_file() { printf '%s/%s' "$SAFE_RUN_CONFIG_DIR" "$1"; }
+  # shellcheck disable=SC1090
+  source <(sed -n '/^host_allow_canonical_eco() {$/,/^}$/p' "$ROOT/bin/safe-audit")
+  # shellcheck disable=SC1090
+  source <(sed -n '/^followed_grant_ledger_file() {$/,/^# Followed install allowance/p' "$ROOT/bin/safe-audit")
+  # shellcheck disable=SC1090
+  source <(sed -n '/^followed_install_lookup() {$/,/^# Receipt, verdict-log event and the stderr line for one followed-install/p' "$ROOT/bin/safe-audit")
+  followed_install_lookup "${3:-npm}" "$1" "$2" || exit 1
+  printf '%s %s\n' "$FOLLOWED_INSTALL_ORIGIN" "$FOLLOWED_INSTALL_SIGNER"
+)
+r1_restore
+jq -e '.origins.rainbow.installed == ["go:example.invalid/tool@v1.2.3","npm:fresh-tool@2.0.0","python:py-tool@1!2.0"]' \
+  "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'ledger does not hold the followed install allowances'
+[[ "$(gate_followed_install fresh-tool 2.0.0)" == "rainbow $fingerprint" ]] || fail 'gate does not recognize a followed install allowance'
+gate_followed_install example.invalid/tool v1.2.3 go >/dev/null || fail 'go allowance not recognized'
+! gate_followed_install fresh-tool 2.0.1 >/dev/null || fail 'allowance recognized for another version'
+! gate_followed_install fresh-tool 2.0.0 python >/dev/null || fail 'npm allowance vouched for python'
+r1_restore
+r1_sign "$fingerprint" ".exported_at = \"$r1_later\" | .install_allowances = [
+  {\"ecosystem\":\"npm\",\"name\":\"fresh-tool\",\"version\":\"2.0.0\",\"verdict\":\"GO\",\"allowed\":\"2026-10-01T00:00:00+00:00\"},
+  {\"ecosystem\":\"npm\",\"name\":\"range-tool\",\"version\":\"1.x\",\"verdict\":\"GO\",\"allowed\":\"\"},
+  {\"ecosystem\":\"npm\",\"name\":\"pending-tool\",\"version\":\"1.0.0\",\"verdict\":\"GO_PENDING_SOCKET\",\"allowed\":\"\"}
+]"
+expect_rc 1 "$SAFE_RUN" host-allow follow --from "$tmp/r1-in"
+grep -q 'skipped malformed install allowance' "$tmp/output" || fail 'malformed allowance was silent'
+jq -e '.origins.rainbow.installed == ["npm:fresh-tool@2.0.0"]' \
+  "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'malformed allowances reached the ledger'
+gate_followed_install fresh-tool 2.0.0 >/dev/null || fail 'valid allowance did not survive malformed siblings'
+! gate_followed_install range-tool 1.x >/dev/null || fail 'range allowance grants authority'
+r1_restore
+r1_sign "$fingerprint" ".exported_at = \"$r1_later\" | del(.install_allowances)"
+expect_rc 0 "$SAFE_RUN" host-allow follow --from "$tmp/r1-in"
+jq -e '.origins.rainbow.installed == []' "$SAFE_RUN_CONFIG_DIR/follow-state.json" >/dev/null || fail 'allowance snapshot was not replaced'
+! gate_followed_install fresh-tool 2.0.0 >/dev/null || fail 'withdrawn allowance still authorizes'
+r1_restore
+pass 'followed install allowances bind to the verifying signer; malformed entries alarm and grant nothing; the snapshot replaces'
 
 # F2: another pinned key signing an equal-generation statement WITHOUT the
 # identity does not inherit it.

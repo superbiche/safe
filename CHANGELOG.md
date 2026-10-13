@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- Followed install allowances (operator ruling 2026-10-13: a follower
+  installs what the origin allowed). The signed host-allow statement now
+  also carries `install_allowances` — the exact versions safe allowed to
+  install on the origin (clean GO, tolerated WARN, and operator-confirmed
+  gate outcomes, which the gates now record through the new
+  `safe audit record-installed` plumbing; default-registry-source entries
+  only), derived from install-known at signing time. `host-allow follow`
+  rewrites the ledger's per-origin `installed` identities from each
+  verified statement, bound to its signer. A follower installs such an
+  exact version unattended as gate exit 21
+  (`ALLOWED_VIA_FOLLOWED_INSTALL`, `INSTALL_UNATTENDED_FOLLOWED_INSTALL`
+  in the `safe install` lane) in place of a fresh-release consent ask, a
+  pending Socket score, a tolerated pass, or a WARN on that one version —
+  no host-allow pin required, no host-execution trust granted, and never
+  clearing a BLOCK (the follower's own audit still runs). This closes the
+  fleet stall where a fast-moving mise tool installed cleanly on the
+  origin was refused hourly on every follower until it aged out of the
+  Socket fresh window. Allowances refresh on every signed export (any
+  host-allow change on an origin republishes as before); unsigned
+  `import` ignores the field.
+
 ## 1.69.2 - 2026-10-11
 
 - The private-registry Python lane accepts uv named indexes on the command

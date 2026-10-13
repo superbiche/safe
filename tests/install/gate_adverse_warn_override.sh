@@ -251,4 +251,77 @@ rc="$(run_gate fresh@0.84.1 npm)"
 [[ "$rc" == "102" ]] || fail "plain host-allow pass: wrapper lane expected rc 102, got $rc"
 pass "a host-allow pass that is not a followed grant still refuses 102 in both lanes"
 
+# --- followed install allowance (gate exit 21, 2026-10-13 ruling) -------------
+# The exact failure fast-moving mise tools produced fleet-wide: the origin
+# installed, the signed statement says so, and the follower proceeds with no
+# terminal and no confirm in both lanes, under its own token.
+: >"$LOGF"; : >"$CONFIRM_LOG"
+safe_gate_run_audit() { return 21; }
+rc="$(run_gate fresh@0.84.0 npm)"
+[[ "$rc" == "0" ]] || fail "followed install: wrapper lane expected rc 0, got $rc"
+[[ "$(last_log)" == "ALLOWED_VIA_FOLLOWED_INSTALL" ]] || fail "followed install: wrapper lane logged $(last_log)"
+rc=0; safe_gate_mise_check_with_env '' fresh@0.84.0 npm >/dev/null 2>&1 || rc=$?
+[[ "$rc" == "0" ]] || fail "followed install: mise lane expected rc 0, got $rc"
+[[ "$(last_log)" == "ALLOWED_VIA_FOLLOWED_INSTALL" ]] || fail "followed install: mise lane logged $(last_log)"
+[[ ! -s "$CONFIRM_LOG" ]] || fail "followed install: a confirm was consulted"
+pass "followed install: wrapper and mise lanes proceed unattended under their own token"
+
+# An operator-confirmed [y] override is recorded for fleet follow through
+# the audit plumbing (token bound to the result document); a decline
+# records nothing. The stub audit plays both plumbing roles and records
+# the record-installed argv.
+cat > "$tmp/audit-stub" <<STUB
+#!/usr/bin/env bash
+case "\$1" in
+  effective-sources) printf 'implicit-default\n' ;;
+  record-installed) printf '%s\n' "\$*" >> "$tmp/mark.argv" ;;
+  *) exit 99 ;;
+esac
+STUB
+chmod +x "$tmp/audit-stub"
+SAFE_GATE_AUDIT_BIN="$tmp/audit-stub"
+safe_gate_run_audit() {
+  printf '{"gate_exit":10,"ecosystem":"npm","package":"pkg","resolved_versions":["1.0.0"],"warn_causes":["socket_low_score"]}\n' > "${SAFE_AUDIT_RESULT_OUT:-/dev/null}"
+  return 10
+}
+safe_gate_install_is_interactive() { return 0; }
+safe_gate_confirm_warn() { printf 'once'; }
+: >"$LOGF"; : >"$tmp/mark.argv"
+rc="$(run_gate pkg@1.0.0 npm)"
+[[ "$rc" == "0" ]] || fail "mark: expected rc 0, got $rc"
+grep -q "record-installed --result .* --verdict WARN_TTY_OVERRIDE --source-id implicit-default" "$tmp/mark.argv" \
+  || fail "mark: confirmed override was not recorded: $(cat "$tmp/mark.argv")"
+safe_gate_confirm_warn() { return 1; }
+: >"$LOGF"; : >"$tmp/mark.argv"
+rc="$(run_gate pkg@1.0.0 npm)"
+[[ "$rc" == "100" && ! -s "$tmp/mark.argv" ]] || fail "mark: a decline recorded an install"
+pass "a confirmed override is recorded for fleet follow; a decline records nothing"
+
+# The record-installed plumbing itself (real bin/safe-audit): the token must
+# match the document's gate_exit transition, GO can never be minted here,
+# and the recorded source identity is the caller's.
+PLUMB_DIR="$tmp/plumb"
+mkdir -p "$PLUMB_DIR/run"
+printf '{"gate_exit":13,"ecosystem":"npm","package":"fresh","resolved_versions":["0.9.0"],"warn_causes":[]}\n' > "$PLUMB_DIR/result13.json"
+SAFE_RUN_CONFIG_DIR="$PLUMB_DIR/run" SAFE_AUDIT_DATA_DIR="$PLUMB_DIR/audit" \
+  "$ROOT/bin/safe-audit" record-installed --result "$PLUMB_DIR/result13.json" \
+    --verdict GO_SOCKET_DECLINED --source-id implicit-default >/dev/null 2>&1 \
+  || fail "plumbing: a consent-declined install was not recorded"
+jq -e '.packages["npm:fresh"] | .version == "0.9.0" and .verdict == "GO_SOCKET_DECLINED" and .source == "implicit-default"' \
+  "$PLUMB_DIR/run/install-known.json" >/dev/null || fail "plumbing: recorded entry differs"
+for bad in "GO" "WARN_TTY_OVERRIDE"; do
+  SAFE_RUN_CONFIG_DIR="$PLUMB_DIR/run" SAFE_AUDIT_DATA_DIR="$PLUMB_DIR/audit" \
+    "$ROOT/bin/safe-audit" record-installed --result "$PLUMB_DIR/result13.json" \
+      --verdict "$bad" --source-id implicit-default >/dev/null 2>&1 \
+    && fail "plumbing: verdict $bad accepted for a gate_exit-13 document"
+done
+printf '{"gate_exit":10,"ecosystem":"npm","package":"multi","resolved_versions":["1.0.0","1.0.1"]}\n' > "$PLUMB_DIR/result-multi.json"
+SAFE_RUN_CONFIG_DIR="$PLUMB_DIR/run" SAFE_AUDIT_DATA_DIR="$PLUMB_DIR/audit" \
+  "$ROOT/bin/safe-audit" record-installed --result "$PLUMB_DIR/result-multi.json" \
+    --verdict WARN_TTY_OVERRIDE --source-id implicit-default >/dev/null 2>&1 \
+  && fail "plumbing: a multi-version document was recorded"
+jq -e '.packages | has("npm:multi") | not' "$PLUMB_DIR/run/install-known.json" >/dev/null \
+  || fail "plumbing: rejected documents still wrote install-known"
+pass "record-installed accepts only gate-confirmed tokens bound to their result document"
+
 printf 'all gate adverse-warn override checks passed\n'

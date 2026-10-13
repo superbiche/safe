@@ -3129,6 +3129,55 @@ safe_gate_private_terminus() {
   return 100
 }
 
+# Record an operator-confirmed install into install-known (2026-10-13
+# ruling: followers install what this machine allowed). Called only after
+# a real /dev/tty confirmation at gate exits 10/13/14; the audit's
+# record-installed plumbing validates the token against the result
+# document's gate_exit and takes the identity from the document. The
+# source identity is derived exactly as safe_gate_known_matches derives
+# it (same effective-sources call), so a custom-source install is never
+# recorded as default-source evidence. Fail-soft with one line: a marking
+# failure never blocks an install the operator just confirmed, but it is
+# never invisible either.
+# $1=package spec as audited, $2=tool ecosystem, $3=result doc, $4=token.
+safe_gate_mark_installed() {
+  local package="$1" ecosystem="$2" result_out="$3" verdict="$4"
+  [[ -n "${result_out}" && -r "${result_out}" ]] || return 0
+  safe_gate_audit_available || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  case "${ecosystem}" in
+    cargo) ecosystem="rust" ;;
+    composer) ecosystem="php" ;;
+    pip|uv) ecosystem="python" ;;
+  esac
+  local name version
+  IFS=$'\t' read -r name version <<< "$(safe_gate_split_spec "${package}")"
+  [[ -n "${name}" ]] || return 0
+  # The wrapper gates carry the selectors as SAFE_GATE_*; the bin/safe
+  # install lane (which sources this lib) spells them SAFE_INSTALL_*.
+  local sel_registry="${SAFE_GATE_REGISTRY:-${SAFE_INSTALL_REGISTRY:-}}"
+  local sel_installer="${SAFE_GATE_INSTALLER:-${SAFE_INSTALL_INSTALLER:-}}"
+  local sel_project="${SAFE_GATE_PROJECT_DIR:-${SAFE_INSTALL_PROJECT_DIR:-}}"
+  local sel_userconfig="${SAFE_GATE_NPM_USERCONFIG:-${SAFE_INSTALL_NPM_USERCONFIG:-}}"
+  local sel_globalconfig="${SAFE_GATE_NPM_GLOBALCONFIG:-${SAFE_INSTALL_NPM_GLOBALCONFIG:-}}"
+  local -a es_args=("${name}" --ecosystem "${ecosystem}")
+  [[ -n "${sel_registry}" ]] && es_args+=(--registry "${sel_registry}")
+  [[ -n "${sel_installer}" ]] && es_args+=(--installer "${sel_installer}")
+  [[ -n "${sel_project}" ]] && es_args+=(--project-dir "${sel_project}")
+  [[ -n "${sel_userconfig}" ]] && es_args+=(--npm-userconfig "${sel_userconfig}")
+  [[ -n "${sel_globalconfig}" ]] && es_args+=(--npm-globalconfig "${sel_globalconfig}")
+  local source_id
+  if ! source_id="$("${SAFE_GATE_AUDIT_BIN}" effective-sources "${es_args[@]}" 2>/dev/null)" \
+     || [[ -z "${source_id}" ]]; then
+    safe_gate_err "safe: could not record the confirmed install of ${package} for fleet follow (no source identity); the install proceeds"
+    return 0
+  fi
+  "${SAFE_GATE_AUDIT_BIN}" record-installed --result "${result_out}" \
+    --verdict "${verdict}" --source-id "${source_id}" >/dev/null 2>&1 \
+    || safe_gate_err "safe: could not record the confirmed install of ${package} for fleet follow; the install proceeds"
+  return 0
+}
+
 # Check one package via safe audit's install gate.
 # Returns: 0=GO/proceed, 100=policy refusal, 104=audit BLOCK verdict.
 safe_gate_check() {
@@ -3182,11 +3231,13 @@ safe_gate_check() {
         case "${warn_choice}" in
           once)
             safe_gate_audit_log "${ecosystem}" "${package}" "WARN_TTY_OVERRIDE"
+            safe_gate_mark_installed "${package}" "${ecosystem}" "${result_out}" WARN_TTY_OVERRIDE
             return 0
             ;;
           allow)
             safe_gate_audit_log "${ecosystem}" "${package}" "WARN_TTY_OVERRIDE_ALLOW"
             safe_gate_warn_grant_host_allow "${package}" "${ecosystem}"
+            safe_gate_mark_installed "${package}" "${ecosystem}" "${result_out}" WARN_TTY_OVERRIDE
             return 0
             ;;
           *)
@@ -3270,6 +3321,7 @@ safe_gate_check() {
       fi
       safe_gate_err "safe: ${package} — Socket check declined for this install; proceeding on advisories, blocklist and release age."
       safe_gate_audit_log "${ecosystem}" "${package}" "SOCKET_CONSENT_DECLINED"
+      safe_gate_mark_installed "${package}" "${ecosystem}" "${result_out}" GO_SOCKET_DECLINED
       return 0
       ;;
     14)
@@ -3286,6 +3338,7 @@ safe_gate_check() {
       fi
       if safe_gate_confirm_pending "${package}"; then
         safe_gate_audit_log "${ecosystem}" "${package}" "PENDING_SOCKET_TTY_OVERRIDE"
+        safe_gate_mark_installed "${package}" "${ecosystem}" "${result_out}" GO_PENDING_CONFIRMED
         return 0
       fi
       safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — Socket score pending and you declined; retry once the scan completes; details: safe explain"
@@ -3318,6 +3371,15 @@ safe_gate_check() {
       # the WARN, consent or pending state was. Not a green check: it keeps
       # its own decision token. The audit named origin and signer.
       safe_gate_audit_log "${ecosystem}" "${package}" "ALLOWED_VIA_FOLLOWED_GRANT"
+      return 0
+      ;;
+    21)
+      # Followed install allowance (2026-10-13 ruling): safe allowed this
+      # exact version to install on the origin and the signed statement
+      # says so, so it installs unattended here too. Not a green check and
+      # no host-execution trust — it keeps its own decision token. The
+      # audit named origin and signer.
+      safe_gate_audit_log "${ecosystem}" "${package}" "ALLOWED_VIA_FOLLOWED_INSTALL"
       return 0
       ;;
     18|19)
@@ -5597,6 +5659,7 @@ safe_gate_mise_check_with_env() {
     fi
     if safe_gate_confirm_pending "${pkg}"; then
       safe_gate_audit_log "${eco}" "${pkg}" "PENDING_SOCKET_TTY_OVERRIDE"
+      safe_gate_mark_installed "${pkg}" "${eco}" "${SAFE_GATE_RESULT_OUT:-}" GO_PENDING_CONFIRMED
       return 0
     fi
     safe_gate_err "safe: BLOCKED mise install of ${pkg} — Socket score pending and you declined; retry once the scan completes; details: safe explain"
@@ -5625,6 +5688,7 @@ safe_gate_mise_check_with_env() {
     fi
     safe_gate_err "safe: ${pkg} — Socket check declined for this install; proceeding on advisories, blocklist and release age."
     safe_gate_audit_log "${eco}" "${pkg}" "SOCKET_CONSENT_DECLINED"
+    safe_gate_mark_installed "${pkg}" "${eco}" "${SAFE_GATE_RESULT_OUT:-}" GO_SOCKET_DECLINED
     return 0
   else
     return "$audit_rc"

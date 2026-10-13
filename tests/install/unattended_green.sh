@@ -261,4 +261,30 @@ grep -q "INSTALL_UNATTENDED" "$tmp/gate-log" &&
   fail "followed+tolerated batch logged an unattended token"
 pass "a followed grant beside a tolerated WARN still refuses 102"
 
+# Non-TTY + followed install allowance (gate exit 21, 2026-10-13 ruling):
+# the origin allowed this exact version, so it installs without a terminal,
+# under its own tokens — never green, never the followed-grant token.
+: >"$tmp/gate-log"; : >"$tmp/confirm-log"
+rc="$(AUDIT_RC=21 WITH_YES=0 PACKAGES='allowed@1.0.0' run_cmd_install)"
+[[ "$rc" == "0" ]] || { printf 'followed install got %s; err:\n%s\n' "$rc" "$(cat "$tmp/err.txt" 2>/dev/null)" >&2; exit 1; }
+[[ ! -s "$tmp/confirm-log" ]] || fail "followed install consulted the confirm (no TTY exists)"
+grep -q "allowed@1.0.0 | ALLOWED_VIA_FOLLOWED_INSTALL" "$tmp/gate-log" ||
+  fail "followed install did not log its decision token"
+grep -q "allowed@1.0.0 | INSTALL_UNATTENDED_FOLLOWED_INSTALL" "$tmp/gate-log" ||
+  fail "followed install did not log the unattended token"
+grep -q "INSTALL_UNATTENDED_GREEN\|ALLOWED_VIA_FOLLOWED_GRANT" "$tmp/gate-log" &&
+  fail "followed install logged a green or grant token"
+pass "a followed install allowance installs without a terminal, never as green"
+
+# An allowance never carries a neighbour: beside a tolerated WARN (15) and
+# beside a pending score (14) the batch keeps the terminal requirement.
+for seq in '21 15' '21 14'; do
+  : >"$tmp/gate-log"; : >"$tmp/confirm-log"; rm -f "$tmp/mixed-calls"
+  rc="$(AUDIT_RC=seq AUDIT_SEQ="$seq" WITH_YES=0 PACKAGES='allowed@1.0.0 other@2.0.0' run_cmd_install)"
+  [[ "$rc" == "102" ]] || fail "allowance batch ($seq) did not refuse 102 (rc=$rc)"
+  grep -q "INSTALL_UNATTENDED" "$tmp/gate-log" &&
+    fail "allowance batch ($seq) logged an unattended token"
+done
+pass "a followed install allowance never carries a neighbour past the terminal"
+
 printf 'unattended-green: all cases passed\n'
