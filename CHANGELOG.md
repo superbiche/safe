@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.70.0 - 2026-10-13
 
 - Policy: advisories below High severity no longer gate installs
   (operator ruling 2026-10-12). When every advisory affecting the
