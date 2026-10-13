@@ -243,7 +243,7 @@ root, and are logged as `TRUST` lines.
 
 ```bash
 safe run private-registry add <id> --ecosystem npm|go|python --origin <https-url> \
-  --namespace <ns> [--namespace <ns>]... [--owner <owner>] --reason "..."
+  --namespace <ns> [--namespace <ns>]... [--owner <owner>]
 safe run private-registry remove <id>
 safe run private-registry list [--json]          # read-only; exits 1 on conflicts
 safe run private-registry export [--sign [--out <dir>]]
@@ -328,13 +328,13 @@ On the origin host, at an operator terminal:
 ```bash
 safe run private-registry add superbiche-npm --ecosystem npm \
   --origin https://git.superbiche.me:8443/api/packages/superbiche-packages/npm \
-  --namespace '@superbiche-private/*' --owner superbiche-packages --reason "own Forgejo npm registry"
+  --namespace '@superbiche-private/*' --owner superbiche-packages
 safe run private-registry add superbiche-go --ecosystem go \
   --origin https://git.superbiche.me:8443/api/packages/superbiche-packages/go \
-  --namespace superbiche.me --owner superbiche-packages --reason "own Forgejo Go proxy"
+  --namespace superbiche.me --owner superbiche-packages
 safe run private-registry add superbiche-pypi --ecosystem python \
   --origin https://git.superbiche.me:8443/api/packages/superbiche-packages/pypi \
-  --namespace caviar-redact --owner superbiche-packages --reason "own Forgejo PyPI registry"
+  --namespace caviar-redact --owner superbiche-packages
 ```
 
 Then configure each client:

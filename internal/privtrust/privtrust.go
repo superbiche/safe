@@ -46,7 +46,12 @@ type Registry struct {
 	Owner     string   `json:"owner,omitempty"`
 	Namespace []string `json:"namespace"`
 	Added     string   `json:"added,omitempty"`
-	Reason    string   `json:"reason,omitempty"`
+	// Reason is a legacy parse-tolerance shim only: pre-removal policy
+	// files and signed statements carry it, and strict decoders would
+	// reject the unknown field if it vanished from the struct. It is
+	// cleared in ValidateRegistry, never written (omitempty), and no
+	// consumer reads it. Grants carry no reason (2026-10-13).
+	Reason string `json:"reason,omitempty"`
 }
 
 // Policy is private-registries.json.
@@ -290,6 +295,7 @@ func NamespacesOverlap(eco, a, b string) bool {
 
 // ValidateRegistry checks a registry definition and returns it canonicalized.
 func ValidateRegistry(id string, r Registry) (Registry, error) {
+	r.Reason = "" // grants carry no reason (2026-10-13); drop legacy values
 	if !ValidRegistryID(id) {
 		return r, fmt.Errorf("registry id %q is invalid (lower-case letters, digits, . _ -)", id)
 	}

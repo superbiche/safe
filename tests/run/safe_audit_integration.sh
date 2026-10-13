@@ -166,15 +166,17 @@ ERR_FILE="$tmp/add-no-reason.err" \
     ensure_dirs
     registry_integrity_npm() { printf "sha512-fixture"; }
     require_operator_tty() { :; }
+    cmd_host_allow_add hostpkg@2.0.0 >/dev/null 2>&1
+    [[ "$(jq -r ".packages.hostpkg.version" "$HOST_ALLOW_FILE")" == "2.0.0" ]]
+    [[ "$(jq -r ".packages.hostpkg | has(\"reason\")" "$HOST_ALLOW_FILE")" == "false" ]]
     set +e
-    ( cmd_host_allow_add hostpkg@2.0.0 ) >/dev/null 2>"$ERR_FILE"
+    ( cmd_host_allow_add hostpkg@2.0.0 --reason "x" ) >/dev/null 2>"$ERR_FILE"
     rc=$?
     set -e
     [[ "$rc" -ne 0 ]]
-    grep -q "reason is required" "$ERR_FILE"
-    [[ "$(jq -r ".packages | length" "$HOST_ALLOW_FILE")" == "0" ]]
-  ' safe-run || fail "host-allow add without --reason was not refused"
-pass "host-allow add requires --reason (audit-gated skip removed)"
+    grep -q "unknown flag: --reason" "$ERR_FILE"
+  ' safe-run || fail "host-allow add needed a reason or accepted --reason"
+pass "host-allow add takes no reason: none needed, --reason refused, none stored"
 
 SAFE_RUN_CONFIG_DIR="$tmp/config-add-reason-equals" \
 SAFE_RUN_DATA_DIR="$tmp/data-add-reason-equals" \
@@ -188,11 +190,11 @@ PATH="$mockbin:$PATH" \
     ensure_dirs
     registry_integrity_npm() { printf "sha512-fixture"; }
     require_operator_tty() { :; }
-    cmd_host_allow_add @qwen-code/qwen-code@0.16.2 --reason="misses only Socket that fails" >/dev/null 2>&1
+    cmd_host_allow_add @qwen-code/qwen-code@0.16.2 >/dev/null 2>&1
     [[ "$(jq -r ".packages[\"@qwen-code/qwen-code\"].version" "$HOST_ALLOW_FILE")" == "0.16.2" ]]
-    [[ "$(jq -r ".packages[\"@qwen-code/qwen-code\"].reason" "$HOST_ALLOW_FILE")" == "misses only Socket that fails" ]]
-  ' safe-run || fail "host-allow add rejected --reason=value"
-pass "host-allow add accepts --reason=value"
+    [[ "$(jq -r ".packages[\"@qwen-code/qwen-code\"] | has(\"reason\")" "$HOST_ALLOW_FILE")" == "false" ]]
+  ' safe-run || fail "host-allow add failed without a reason"
+pass "host-allow add stores no reason"
 
 SAFE_RUN_CONFIG_DIR="$tmp/config-add-non-tty" \
 SAFE_RUN_DATA_DIR="$tmp/data-add-non-tty" \
@@ -248,14 +250,11 @@ SAFE_RUN_PATH="$SAFE_RUN" \
     jq --arg p hostpkg --arg v 2.0.0 ".packages[\$p] = {version:\$v, reason:\"old exception\", ecosystem:\"npm\"}" "$HOST_ALLOW_FILE" > "$tmpfile"
     mv "$tmpfile" "$HOST_ALLOW_FILE"
     require_operator_tty() { :; }
-    set +e
-    ( cmd_host_allow_update hostpkg@2.1.0 ) >/dev/null 2>&1
-    rc=$?
-    set -e
-    [[ "$rc" -ne 0 ]]
-    [[ "$(jq -r ".packages.hostpkg.version" "$HOST_ALLOW_FILE")" == "2.0.0" ]]
-  ' safe-run || fail "host-allow update without --reason was not refused"
-pass "host-allow update requires --reason (audit-gated skip removed)"
+    cmd_host_allow_update hostpkg@2.1.0 >/dev/null 2>&1
+    [[ "$(jq -r ".packages.hostpkg.version" "$HOST_ALLOW_FILE")" == "2.1.0" ]]
+    [[ "$(jq -r ".packages.hostpkg | has(\"reason\")" "$HOST_ALLOW_FILE")" == "false" ]]
+  ' safe-run || fail "host-allow update needed a reason or kept the legacy one"
+pass "host-allow update needs no reason and strips a legacy one on rewrite"
 
 SAFE_RUN_CONFIG_DIR="$tmp/config-update-reason" \
 SAFE_RUN_DATA_DIR="$tmp/data-update-reason" \
@@ -269,11 +268,11 @@ SAFE_RUN_PATH="$SAFE_RUN" \
     jq --arg p hostpkg --arg v 2.0.0 ".packages[\$p] = {version:\$v, reason:\"old\", ecosystem:\"npm\"}" "$HOST_ALLOW_FILE" > "$tmpfile"
     mv "$tmpfile" "$HOST_ALLOW_FILE"
     require_operator_tty() { :; }
-    cmd_host_allow_update hostpkg@2.1.0 --reason "bump for fix" >/dev/null 2>&1
+    cmd_host_allow_update hostpkg@2.1.0 >/dev/null 2>&1
     [[ "$(jq -r ".packages.hostpkg.version" "$HOST_ALLOW_FILE")" == "2.1.0" ]]
-    [[ "$(jq -r ".packages.hostpkg.reason" "$HOST_ALLOW_FILE")" == "bump for fix" ]]
-  ' safe-run || fail "host-allow update with --reason failed"
-pass "host-allow update with --reason bumps version"
+    [[ "$(jq -r ".packages.hostpkg | has(\"reason\")" "$HOST_ALLOW_FILE")" == "false" ]]
+  ' safe-run || fail "host-allow update failed"
+pass "host-allow update bumps version, stores no reason"
 
 podman_log="$tmp/podman.log"
 cat > "$mockbin/podman" <<'SH'
@@ -482,7 +481,7 @@ rc=$?
 set -e
 [[ "$rc" -eq 100 ]] || fail "blocked package with local bin expected rc=100, got $rc"
 [[ ! -e "$tmp/local-bin-blocked-call.log" ]] || fail "blocked package executed the local bin"
-grep -q 'fixture block' "$tmp/blocked-local.err" || fail "blocklist reason missing from refusal"
+grep -q 'operator blocklist' "$tmp/blocked-local.err" || fail "blocklist refusal does not name the operator blocklist"
 pass "blocklist wins over local-bin passthrough"
 
 # --no-install is npm/bun-only: via a uvx-shaped invocation it is refused as
@@ -611,7 +610,7 @@ rc=$?
 set -e
 [[ "$rc" -eq 100 ]] || fail "blocked parent-resolved bin expected rc=100, got $rc"
 [[ ! -e "$tmp/blocked-parent-call.log" ]] || fail "blocked package executed a parent-resolved bin"
-grep -q 'parent fixture block' "$tmp/blocked-parent.err" || fail "parent blocklist reason missing"
+grep -q 'operator blocklist' "$tmp/blocked-parent.err" || fail "parent blocklist refusal does not name the operator blocklist"
 pass "blocklist wins over a parent-resolved bin"
 
 # Audit log stays one-physical-line per decision even for hostile paths.
@@ -844,7 +843,7 @@ ERR_FILE="$tmp/grant-block.err" \
     registry_integrity_npm() { printf "sha512-fixture"; }
     require_operator_tty() { :; }
     set +e
-    ( cmd_host_allow_add newpkg@1.0.0 --reason "wants it" ) >/dev/null 2>"$ERR_FILE"
+    ( cmd_host_allow_add newpkg@1.0.0 ) >/dev/null 2>"$ERR_FILE"
     grc=$?
     set -e
     [[ "$grc" -ne 0 ]] || exit 1
@@ -867,7 +866,7 @@ SAFE_AUDIT_PROBE_LOG="$tmp/grant-go-probe.log" \
     ensure_dirs
     registry_integrity_npm() { printf "sha512-fixture"; }
     require_operator_tty() { :; }
-    cmd_host_allow_add okpkg@1.2.3 --reason "clean" >/dev/null 2>&1
+    cmd_host_allow_add okpkg@1.2.3 >/dev/null 2>&1
     [[ "$(jq -r ".packages.okpkg.version" "$HOST_ALLOW_FILE")" == "1.2.3" ]]
   ' safe-run || fail "host-allow add with a clean GO preflight failed"
 [[ -s "$tmp/grant-go-probe.log" ]] || fail "grant preflight did not audit on a clean add"
@@ -888,7 +887,7 @@ accept_block_run() { # <label> <probe-rc> <probe-json> <typed> <spec>
       source "$SAFE_RUN_PATH" >/dev/null
       ensure_dirs
       registry_integrity_npm() { printf "sha512-fixture"; }
-      cmd_host_allow_add "$AB_SPEC" --reason "accepted" --accept-block
+      cmd_host_allow_add "$AB_SPEC" --accept-block
     ' safe-run > "$tmp/ab-$label.out" 2>&1
 }
 AB_JSON='{"verdict":"BLOCK","warn_causes":["osv_affecting"],"resolved_versions":["1.0.0"],"block":{"class":"advisory","advisories":["GHSA-aaaa","GHSA-bbbb"]}}'
@@ -922,7 +921,7 @@ ERR_FILE="$tmp/grant-unknown-add.err" \
     registry_integrity_npm() { return 1; }
     require_operator_tty() { :; }
     set +e
-    ( cmd_host_allow_add nonexistent-pkg@9.9.9 --reason "unknown" ) >/dev/null 2>"$ERR_FILE"
+    ( cmd_host_allow_add nonexistent-pkg@9.9.9 ) >/dev/null 2>"$ERR_FILE"
     grc=$?
     set -e
     [[ "$grc" -ne 0 ]] || exit 1
@@ -943,7 +942,7 @@ ERR_FILE="$tmp/grant-unknown-update.err" \
     registry_integrity_npm() { return 1; }
     require_operator_tty() { :; }
     set +e
-    ( cmd_host_allow_update known-pkg@2.0.0 --reason "unknown" ) >/dev/null 2>"$ERR_FILE"
+    ( cmd_host_allow_update known-pkg@2.0.0 ) >/dev/null 2>"$ERR_FILE"
     grc=$?
     set -e
     [[ "$grc" -ne 0 ]] || exit 1
@@ -963,7 +962,7 @@ SAFE_AUDIT_PROBE_RC=10 SAFE_AUDIT_PROBE_JSON='{"verdict":"WARN","warn_causes":["
     ensure_dirs
     registry_integrity_npm() { printf "sha512-fixture"; }
     require_operator_tty() { :; }
-    cmd_host_allow_add infrapkg@2.0.0 --reason "infra" >/dev/null 2>&1
+    cmd_host_allow_add infrapkg@2.0.0 >/dev/null 2>&1
     [[ "$(jq -r ".packages.infrapkg.version" "$HOST_ALLOW_FILE")" == "2.0.0" ]]
   ' safe-run || fail "host-allow add blocked on an infra-only WARN (should degrade)"
 pass "host-allow add: infra-only WARN degrades, grant proceeds"
@@ -1066,7 +1065,7 @@ ERR_FILE="$tmp/f3.err" \
     ensure_dirs
     registry_integrity_npm() { printf "sha512-fixture"; }
     require_operator_tty() { :; }
-    cmd_host_allow_add incpkg@3.0.0 --reason "x" 2>"$ERR_FILE"
+    cmd_host_allow_add incpkg@3.0.0 2>"$ERR_FILE"
     [[ "$(jq -r ".packages.incpkg.version" "$HOST_ALLOW_FILE")" == "3.0.0" ]]
   ' safe-run
 rc=$?

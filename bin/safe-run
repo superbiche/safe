@@ -849,14 +849,14 @@ in_blocked() {
     fi
     entry=$(jq -r --arg p "$pkg" '.packages[$p] // empty' "$f")
     if [[ -n "$entry" ]]; then
-      BLOCKED_REASON=$(printf '%s' "$entry" | jq -r '.reason')
+      BLOCKED_REASON="operator blocklist"
       return 0
     fi
     if [[ "$pkg" == @*/* ]]; then
       local scope_wildcard="${pkg%%/*}/*"
       entry=$(jq -r --arg p "$scope_wildcard" '.packages[$p] // empty' "$f")
       if [[ -n "$entry" ]]; then
-        BLOCKED_REASON=$(printf '%s' "$entry" | jq -r '.reason')
+        BLOCKED_REASON="operator blocklist"
         return 0
       fi
     fi
@@ -1330,8 +1330,7 @@ unknown_preflight_audit() {
 # Grant-lane preflight (host-allow add/update, scripts-allow add). A grant
 # escalates a package to a host-execution / scripts-execution trust tier, so
 # re-audit it host-side first. WARN or BLOCK requires an explicit interactive
-# confirmation to proceed; --reason is required unconditionally elsewhere and
-# does NOT depend on the verdict. Audit-infrastructure breakage never blocks a
+# confirmation to proceed. Audit-infrastructure breakage never blocks a
 # grant — it degrades to a warning (an operator adding a pin is a deliberate
 # act; a wedged Socket call must not stop them).
 host_allow_preflight_audit() {
@@ -1491,7 +1490,7 @@ dispatch_run() {
     # Version mismatch: package is in host-allow but user requested a different version.
     if [[ -n "$HOST_ALLOW_PINNED_VERSION" ]]; then
       err "BLOCKED: $pkgver — host-allow pinned to ${pkg}@${HOST_ALLOW_PINNED_VERSION}"
-      err "  to update: safe run host-allow update ${pkg}@${version} --reason \"...\""
+      err "  to update: safe run host-allow update ${pkg}@${version}"
       err "  agent contract: safe explain"
       audit_log "$runner_label" "$pkgver" "BLOCKED" "$(context_label)" "VERSION_MISMATCH" "pinned=$HOST_ALLOW_PINNED_VERSION"
       exit 101
@@ -1523,7 +1522,7 @@ dispatch_run() {
 
   if ! is_tty; then
     err "BLOCKED: $pkgver is unknown and invocation is non-interactive"
-    err "  to allow: ask the operator to run interactively first, or: safe run host-allow add ${pkg}@<version> --reason \"...\""
+    err "  to allow: ask the operator to run interactively first, or: safe run host-allow add ${pkg}@<version>"
     err "  agent contract: safe explain"
     audit_log "$runner_label" "$pkgver" "UNKNOWN" "$(context_label)" "BLOCKED" "$(caller_info)"
     exit 102
@@ -1743,12 +1742,9 @@ HOST_ALLOW_BLOCK_OVERRIDE_VALID='(.block_override == null) or (.block_override |
        and all(.[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._:-]*$")))
   and (.accepted | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")))'
 
-# A trust escalation (host-allow add/update, scripts-allow add) must carry an
-# operator reason: it is the audit trail for bypassing the sandbox default.
-host_allow_require_reason() {
-  local reason="$1"
-  [[ -n "$reason" ]] || die "--reason is required"
-}
+# Operator grants carry no reason field (operator ruling 2026-10-13: the
+# operator owes no justification to themselves). Attribution lives in the
+# append-only audit log (who/when/what), not in a free-text store field.
 
 # All host-store read/modify/write operations share this lock. Callbacks that
 # already hold it use the internal locked writer directly (flock is not recursive).
@@ -1770,16 +1766,16 @@ write_host_allow_entry() {
 }
 
 write_host_allow_entry_locked() (
-  local pkg="$1" version="$2" sha="$3" reason="$4" ecosystem="$5"
+  local pkg="$1" version="$2" sha="$3" ecosystem="$4"
   # Callers that carry an original grant date (import, replicating another
-  # machine's set) pass it as $6 so a round trip does not reset the age the
+  # machine's set) pass it as $5 so a round trip does not reset the age the
   # staleness review computes from; add/update omit it and stamp today.
-  local added="${6:-$(date -I)}" followed_from="${7:-}"
-  local replace_local="${8:-0}" generation="${9:-}"
-  # $11: the entry's block_override as compact JSON ("" = none). A followed
+  local added="${5:-$(date -I)}" followed_from="${6:-}"
+  local replace_local="${7:-0}" generation="${8:-}"
+  # $10: the entry's block_override as compact JSON ("" = none). A followed
   # entry already pinned at this version is rewritten only when the SAME
   # origin changed its override; a local operator pin is never touched.
-  local block_override="${11:-}"
+  local block_override="${10:-}"
   local tmp ha_file
   # #87: write the sanctioned store (literal canonical, or a blessed redirect);
   # callers are already write-guarded against an unblessed redirect.
@@ -1798,7 +1794,7 @@ write_host_allow_entry_locked() (
           [[ -z "$block_override" ]] || incoming_override=$(jq -c . <<<"$block_override") || return 1
           [[ "$(jq -c '.entry.block_override // null' <<<"$local_entry")" != "$incoming_override" ]] || return 0
         elif [[ "$replace_local" != "1" ]]; then
-          warn "CONFLICT $pkg: local pins @$local_version, follow has @$version — resolve with: safe run host-allow update $pkg@$version --reason \"...\""
+          warn "CONFLICT $pkg: local pins @$local_version, follow has @$version — resolve with: safe run host-allow update $pkg@$version"
           return 1
         else
           local_generation=$(jq -r '.entry.followed_generation // empty' <<<"$local_entry") || return 1
@@ -1810,7 +1806,7 @@ write_host_allow_entry_locked() (
               return 1
             }
             if (( incoming_epoch <= existing_epoch )); then
-              warn "WARN follow: refusing $pkg@$version from $followed_from: local pin @$local_version from ${local_origin:-local operator} has generation $local_generation, which is not older than $generation — resolve with: safe run host-allow update $pkg@$version --reason \"...\""
+              warn "WARN follow: refusing $pkg@$version from $followed_from: local pin @$local_version from ${local_origin:-local operator} has generation $local_generation, which is not older than $generation — resolve with: safe run host-allow update $pkg@$version"
               return 1
             fi
           fi
@@ -1822,14 +1818,13 @@ write_host_allow_entry_locked() (
   fi
   tmp=$(stage_beside "$ha_file") || return 1
   jq --arg p "$pkg" --arg v "$version" --arg s "$sha" \
-     --arg r "$reason" --arg d "$added" --arg e "$ecosystem" --arg origin "$followed_from" --arg generation "$generation" \
+     --arg d "$added" --arg e "$ecosystem" --arg origin "$followed_from" --arg generation "$generation" \
      --arg override "$block_override" '
     .packages[$p] = {
       version: $v,
       sha: $s,
       ecosystem: $e,
-      added: $d,
-      reason: $r
+      added: $d
     } + (if $origin == "" then {} else
       {followed_from: $origin} + (if $generation == "" then {} else {followed_generation: $generation} end)
     end) + (if $override == "" then {} else {block_override: ($override | fromjson)} end)' "$ha_file" > "$tmp" || { rm -f -- "$tmp"; return 1; }
@@ -1838,7 +1833,7 @@ write_host_allow_entry_locked() (
   # audit log is the attribution trail the file mtime could not provide. Tier
   # TRUST + decision HOST_ALLOW_WRITE stay outside both shapes host-allow
   # review counts as usage (the execution log and the GATE override lines).
-  local write_op="${10:-write}" store_entries
+  local write_op="${9:-write}" store_entries
   store_entries=$(jq -r '.packages | length' "$ha_file" 2>/dev/null || echo '?')
   audit_log "host-allow" "$pkg@$version" "TRUST" "$(context_label)" "HOST_ALLOW_WRITE" \
     "op=$write_op entries=$store_entries"
@@ -2019,7 +2014,7 @@ cmd_host_allow_export() {
     # an origin-side BLOCK override propagates to followers). Older
     # followers read only the fields they know, so they keep refusing.
     packages=$(jq -c '(.packages // {})
-      | map_values({version, sha, ecosystem, added, reason}
+      | map_values({version, sha, ecosystem, added}
           + (if .block_override == null then {} else {block_override} end))' "$HOST_ALLOW_FILE")
   fi
   local allowances
@@ -2123,7 +2118,7 @@ cmd_host_allow_import() {
   # nor directory scaffolding can happen from a non-TTY shell. --dry-run is
   # read-only (an agent may run it to show the operator the delta) — it must
   # touch nothing, so it never initializes state either. The refusal names an
-  # import-specific, shell-replayable command (import takes no --reason).
+  # import-specific, shell-replayable command.
   if (( dry_run == 0 )); then
     if ! is_tty; then
       err "BLOCKED: host-allow import requires an interactive operator terminal"
@@ -2165,7 +2160,7 @@ host_allow_apply_export() {
   fi
 
   local added=0 skipped=0
-  local name version ecosystem file_sha reason added_date entry_override kind normalized local_entry local_version fetched_sha disposition planned_entry statement_generation
+  local name version ecosystem file_sha added_date entry_override kind normalized local_entry local_version fetched_sha disposition planned_entry statement_generation
   if [[ "$writer" == "follow_collect_entry" ]]; then
     statement_generation=$(jq -er '.exported_at' "$file") || return 1
   fi
@@ -2178,8 +2173,9 @@ host_allow_apply_export() {
       warn "skip ${name}: entry is not an object"; skipped=$((skipped + 1)); failures=$((failures + 1)); continue
     fi
     if ! jq -e --arg p "$name" '.packages[$p] |
-      (.version | type == "string") and (.reason | type == "string") and
+      (.version | type == "string") and
       ((.ecosystem == null) or (.ecosystem | type == "string")) and
+      ((.reason == null) or (.reason | type == "string")) and
       ((.sha == null) or (.sha | type == "string")) and
       ((.added == null) or (.added | type == "string")) and
       ('"$HOST_ALLOW_BLOCK_OVERRIDE_VALID"')' "$file" >/dev/null; then
@@ -2189,7 +2185,6 @@ host_allow_apply_export() {
     version=$(jq -r --arg p "$name" '.packages[$p].version // empty' "$file")
     ecosystem=$(jq -r --arg p "$name" '.packages[$p].ecosystem // "npm"' "$file")
     file_sha=$(jq -r --arg p "$name" '.packages[$p].sha // empty' "$file")
-    reason=$(jq -r --arg p "$name" '.packages[$p].reason // empty' "$file")
     added_date=$(jq -r --arg p "$name" '.packages[$p].added // empty' "$file")
     entry_override=$(jq -c --arg p "$name" '.packages[$p].block_override // empty' "$file")
 
@@ -2200,9 +2195,6 @@ host_allow_apply_export() {
     if [[ -z "$version" ]] || ! is_exact_version "$version"; then
       warn "skip ${name}: '${version}' is not an exact pinned version (no ranges, tags, or source specs)"
       skipped=$((skipped + 1)); failures=$((failures + 1)); continue
-    fi
-    if [[ -z "$reason" ]]; then
-      warn "skip ${name}: entry carries no reason (audit trail required)"; skipped=$((skipped + 1)); failures=$((failures + 1)); continue
     fi
     # Preserve the original grant date only when it is a REAL calendar date
     # (shape plus `date -d` round-trip, so 2026-02-30 is rejected); otherwise
@@ -2247,7 +2239,7 @@ host_allow_apply_export() {
       fi
       if [[ "$local_version" == "$version" ]]; then
         if [[ "$writer" == "follow_collect_entry" ]]; then
-          follow_collect_entry "$normalized" "$version" "$file_sha" "$reason" "$ecosystem" "$added_date" "$origin" present "$statement_generation" "$entry_override" || return 1
+          follow_collect_entry "$normalized" "$version" "$file_sha" "$ecosystem" "$added_date" "$origin" present "$statement_generation" "$entry_override" || return 1
           skipped=$((skipped + 1)); continue
         fi
         # A reviewed import may change only the recorded BLOCK override of a
@@ -2263,7 +2255,7 @@ host_allow_apply_export() {
       elif [[ "$writer" == "follow_collect_entry" ]]; then
         disposition="replace"
       else
-        printf '  CONFLICT %s: local pins @%s, import has @%s — resolve with: safe run host-allow update %s@%s --reason "..."\n' \
+        printf '  CONFLICT %s: local pins @%s, import has @%s — resolve with: safe run host-allow update %s@%s\n' \
           "$normalized" "$local_version" "$version" "$normalized" "$version" >&2
         skipped=$((skipped + 1)); failures=$((failures + 1)); continue
       fi
@@ -2287,7 +2279,7 @@ host_allow_apply_export() {
 
     if [[ "$writer" == "follow_collect_entry" ]]; then
       [[ -n "$disposition" ]] || disposition="verified"
-      follow_collect_entry "$normalized" "$version" "$fetched_sha" "$reason" "$ecosystem" "$added_date" "$origin" "$disposition" "$statement_generation" "$entry_override" || return 1
+      follow_collect_entry "$normalized" "$version" "$fetched_sha" "$ecosystem" "$added_date" "$origin" "$disposition" "$statement_generation" "$entry_override" || return 1
       added=$((added + 1)); continue
     fi
 
@@ -2300,7 +2292,7 @@ host_allow_apply_export() {
       added=$((added + 1)); continue
     fi
 
-    "$writer" "$normalized" "$version" "$fetched_sha" "$reason" "$ecosystem" "$added_date" "$origin" 0 "" "import" "$entry_override" || return 1
+    "$writer" "$normalized" "$version" "$fetched_sha" "$ecosystem" "$added_date" "$origin" 0 "" "import" "$entry_override" || return 1
     info "imported ${normalized}@${version}"
     added=$((added + 1))
   done
@@ -2464,8 +2456,8 @@ follow_publish_state() {
 # entry observed before fetch must not be resurrected if removed during fetch.
 follow_collect_entry() {
   follow_candidates=$(jq -c --arg p "$1" --arg v "$2" --arg s "$3" \
-    --arg r "$4" --arg e "$5" --arg d "$6" --arg disposition "$8" --arg generation "$9" --arg override "${10:-}" \
-    '. + [{name:$p, version:$v, sha:$s, reason:$r, ecosystem:$e, added:$d, disposition:$disposition, generation:$generation, block_override:$override}]' \
+    --arg e "$4" --arg d "$5" --arg disposition "$7" --arg generation "$8" --arg override "${9:-}" \
+    '. + [{name:$p, version:$v, sha:$s, ecosystem:$e, added:$d, disposition:$disposition, generation:$generation, block_override:$override}]' \
     <<<"$follow_candidates")
 }
 
@@ -2516,7 +2508,7 @@ follow_canonical_eco() {
 # writes; dry-run reads atomic snapshots without creating a lock or ledger.
 follow_commit_generation() {
   local dry_run="$1" origin="$2" ha_file="$3" stamp="$4" candidates="$5" signer="${6:-}" statement_ids="${7:-[]}" statement_overrides="${8:-\{\}}" statement_sha="${9:-}" statement_installs="${10:-[]}"
-  local state_file state selected next entry name version sha reason ecosystem added disposition id override_changed local_entry local_generation local_origin statement_generation planned_entry replacement replace_local generation_rc already_refused
+  local state_file state selected next entry name version sha ecosystem added disposition id override_changed local_entry local_generation local_origin statement_generation planned_entry replacement replace_local generation_rc already_refused
   local changed=0 failures=0
   state_file="$(dirname "$ha_file")/follow-state.json"
   state=$(follow_load_state "$state_file") || return 1
@@ -2584,7 +2576,7 @@ follow_commit_generation() {
     fi
     if [[ "$local_version" == "invalid" ]] ||
        [[ -n "$local_version" && "$local_version" != "$version" && "$disposition" != "replace" ]]; then
-      warn "CONFLICT $name: local pins @$local_version, follow has @$version — resolve with: safe run host-allow update $name@$version --reason \"...\""
+      warn "CONFLICT $name: local pins @$local_version, follow has @$version — resolve with: safe run host-allow update $name@$version"
       failures=$((failures + 1)); continue
     fi
     already_refused=0
@@ -2606,7 +2598,7 @@ follow_commit_generation() {
         if (( generation_rc == 2 )); then
           warn "WARN follow: local pin @$local_version has a malformed followed generation; repair the host-allow store at an operator terminal"
         else
-          warn "WARN follow: refusing $id from $origin: local pin @$local_version from ${local_origin:-local operator} has generation $local_generation, which is not older than $statement_generation — resolve with: safe run host-allow update $name@$version --reason \"...\""
+          warn "WARN follow: refusing $id from $origin: local pin @$local_version from ${local_origin:-local operator} has generation $local_generation, which is not older than $statement_generation — resolve with: safe run host-allow update $name@$version"
         fi
         if (( !already_refused )); then
           if (( dry_run )); then
@@ -2665,10 +2657,9 @@ follow_commit_generation() {
         # A refreshed pin keeps the integrity already verified for it; the
         # present path never re-fetched the registry.
         (( ! override_changed )) || sha=$(jq -r '.sha // empty' <<<"$local_entry")
-        reason=$(jq -r '.reason' <<<"$entry")
         ecosystem=$(jq -r '.ecosystem' <<<"$entry")
         added=$(jq -r '.added' <<<"$entry")
-        if ! write_host_allow_entry_locked "$name" "$version" "$sha" "$reason" "$ecosystem" "$added" "$origin" "$replace_local" "$stamp" "follow" "$(jq -r '.block_override' <<<"$entry")"; then
+        if ! write_host_allow_entry_locked "$name" "$version" "$sha" "$ecosystem" "$added" "$origin" "$replace_local" "$stamp" "follow" "$(jq -r '.block_override' <<<"$entry")"; then
           follow_publish_state "$state_file" "$state" || warn "follow: could not restore entry ledger after a failed write; operator repair/import required"
           return 1
         fi
@@ -2889,7 +2880,7 @@ cmd_host_allow_follow() (
     info "follow complete: $verified verified, $signature_skips signature skips, $freshness_skips freshness skips, $failed_files files with validation errors or conflicts"
   fi
   if (( signature_skips || freshness_skips || failed_files )); then
-    warn 'operator override: review the original file, then run safe run host-allow import <file> at an operator terminal; conflicting pins require host-allow update <pkg>@<version> --reason "..."'
+    warn 'operator override: review the original file, then run safe run host-allow import <file> at an operator terminal; conflicting pins require host-allow update <pkg>@<version>'
     return 1
   fi
 )
@@ -2983,10 +2974,10 @@ cmd_private_registry() {
 cmd_private_registry_add() {
   trust_redirected_guard write "private-registry-add"
   local id="${1:-}"
-  [[ -n "$id" && "$id" != -* ]] || die 'usage: safe run private-registry add <id> --ecosystem npm|go|python --origin <https-url> --namespace <ns> [--namespace <ns>]... [--owner <owner>] --reason "..."'
+  [[ -n "$id" && "$id" != -* ]] || die 'usage: safe run private-registry add <id> --ecosystem npm|go|python --origin <https-url> --namespace <ns> [--namespace <ns>]... [--owner <owner>]'
   shift
   require_operator_tty_private "add $id ..."
-  local ecosystem="" origin="" owner="" reason=""
+  local ecosystem="" origin="" owner=""
   local -a ns_args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -2994,19 +2985,17 @@ cmd_private_registry_add() {
       --origin) origin="${2:-}"; shift 2 ;;
       --namespace) ns_args+=(--namespace "${2:-}"); shift 2 ;;
       --owner) owner="${2:-}"; shift 2 ;;
-      --reason) reason="${2:-}"; shift 2 ;;
       *) die "unknown flag: $1" ;;
     esac
   done
   ecosystem=$(private_eco_canonical "$ecosystem") || die "--ecosystem must be npm, go or python"
   [[ -n "$origin" ]] || die "--origin is required"
   (( ${#ns_args[@]} > 0 )) || die "--namespace is required"
-  [[ -n "${reason// /}" ]] || die "--reason is required"
   [[ "$SAFE_RUN_NO_INIT" == "1" ]] || ensure_dirs
   local out
   out=$(private_core registry-add --id "$id" --ecosystem "$ecosystem" --origin "$origin" "${ns_args[@]}" \
     --owner "$owner" \
-    --added "$(date -I)" --reason "$reason" 2>&1) || die "${out#safe-core: private-trust registry-add: }"
+    --added "$(date -I)" 2>&1) || die "${out#safe-core: private-trust registry-add: }"
   audit_log "private-registry" "$id" "TRUST" "$(context_label)" "PRIVATE_REGISTRY_ADDED" \
     "ecosystem=$ecosystem origin=$(jq -r '.origin' <<<"$out") namespace=$(jq -r '.namespace | join(",")' <<<"$out")"
   info "added private registry $id: $(jq -r '"\(.ecosystem) \(.origin) namespace \(.namespace | join(", "))"' <<<"$out")"
@@ -3167,10 +3156,7 @@ require_operator_tty() {
   local action="$1" spec="$2"
   is_tty && return 0
   err "BLOCKED: host-allow $action requires an interactive operator terminal"
-  case "$action" in
-    add|update) err "  ask the operator to run: safe run host-allow $action ${spec} --reason \"...\"" ;;
-    *) err "  ask the operator to run: safe run host-allow $action $spec" ;;
-  esac
+  err "  ask the operator to run: safe run host-allow $action $spec"
   err "  agent contract: safe explain"
   exit 102
 }
@@ -3179,14 +3165,12 @@ cmd_host_allow_add() {
   trust_redirected_guard write "host-allow-add"
   local spec="${1:-}"
   shift || true
-  [[ -z "$spec" ]] && die "usage: safe run host-allow add <pkg>@<version> --reason \"...\" [--ecosystem <eco>] [--accept-block]"
+  [[ -z "$spec" ]] && die "usage: safe run host-allow add <pkg>@<version> [--ecosystem <eco>] [--accept-block]"
   require_operator_tty add "$spec"
-  local reason="" ecosystem="npm" accept_block=0 block_override=""
+  local ecosystem="npm" accept_block=0 block_override=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --accept-block) accept_block=1; shift ;;
-      --reason) reason="$2"; shift 2 ;;
-      --reason=*) reason="${1#--reason=}"; shift ;;
       --ecosystem) ecosystem="$2"; shift 2 ;;
       --ecosystem=*) ecosystem="${1#--ecosystem=}"; shift ;;
       *) die "unknown flag: $1" ;;
@@ -3197,7 +3181,6 @@ cmd_host_allow_add() {
   local package_kind
   package_kind=$(ecosystem_to_runner_kind "$ecosystem") || die "unknown --ecosystem: $ecosystem"
   PKG_NAME=$(normalize_and_validate_package_or_die "$PKG_NAME" "$package_kind" "$spec")
-  host_allow_require_reason "$reason"
   if (( accept_block )); then
     block_override=$(host_allow_accept_block "$PKG_NAME" "$PKG_VERSION" "$ecosystem")
   else
@@ -3212,7 +3195,7 @@ cmd_host_allow_add() {
   esac
   [[ -n "$sha" ]] || die "could not verify ${PKG_NAME}@${PKG_VERSION} against the registry (unknown version or registry unreachable) — retry when the registry is reachable"
 
-  write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem" "" "" 0 "" "add" "$block_override"
+  write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$ecosystem" "" "" 0 "" "add" "$block_override"
   if [[ -n "$block_override" ]]; then
     audit_log "host-allow" "${PKG_NAME}@${PKG_VERSION}" "TRUST" "$(context_label)" "BLOCK_OVERRIDE_RECORDED" \
       "advisories=$(jq -r '.advisories | join(",")' <<<"$block_override")"
@@ -3255,13 +3238,10 @@ cmd_host_allow_update() {
   trust_redirected_guard write "host-allow-update"
   local spec="${1:-}"
   shift || true
-  [[ -z "$spec" ]] && die "usage: safe run host-allow update <pkg>@<new-version> --reason \"...\""
+  [[ -z "$spec" ]] && die "usage: safe run host-allow update <pkg>@<new-version>"
   require_operator_tty update "$spec"
-  local reason=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --reason) reason="$2"; shift 2 ;;
-      --reason=*) reason="${1#--reason=}"; shift ;;
       *) die "unknown flag: $1" ;;
     esac
   done
@@ -3280,7 +3260,6 @@ cmd_host_allow_update() {
     local ok; read -r ok </dev/tty
     [[ "$ok" =~ ^[yY]$ ]] || die "aborted"
   fi
-  host_allow_require_reason "$reason"
   host_allow_preflight_audit "$PKG_NAME" "$PKG_VERSION" "$ecosystem" "update host-allow"
   local sha=""
   case "$ecosystem" in
@@ -3292,7 +3271,7 @@ cmd_host_allow_update() {
   # replace_local stays 0: the keyed jq assignment already replaces the
   # entry, and the follow-only REPLACED/replace machinery reads follow-scoped
   # state this caller does not have.
-  write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$reason" "$ecosystem" "" "" 0 "" "update"
+  write_host_allow_entry "$PKG_NAME" "$PKG_VERSION" "$sha" "$ecosystem" "" "" 0 "" "update"
   info "updated ${PKG_NAME}@${PKG_VERSION} in host-allow"
   host_allow_auto_export
 }
@@ -3300,8 +3279,8 @@ cmd_host_allow_update() {
 cmd_host_allow_list() {
   load_trust_store_json "$HOST_ALLOW_FILE" | \
     jq -r '.packages | to_entries[] |
-    "\(.key)@\(.value.version)\t\(.value.ecosystem // "npm")\t\(.value.added)\t\(.value.reason)\(if .value.block_override then " [BLOCK override: " + (.value.block_override.advisories | join(", ")) + "]" else "" end)"' | \
-    awk -F'\t' 'BEGIN{printf "%-40s %-8s %-12s %s\n","PACKAGE","ECO","ADDED","REASON"}
+    "\(.key)@\(.value.version)\t\(.value.ecosystem // "npm")\t\(.value.added)\t\(if .value.block_override then "[BLOCK override: " + (.value.block_override.advisories | join(", ")) + "]" else "" end)"' | \
+    awk -F'\t' 'BEGIN{printf "%-40s %-8s %-12s %s\n","PACKAGE","ECO","ADDED","NOTES"}
                 {printf "%-40s %-8s %-12s %s\n",$1,$2,$3,$4}'
   printf '\nnote: host-allow tier ONLY applies to npm/npx (uses --ignore-scripts).\n'
   printf '      bunx/uvx/pipx invocations of these packages still go through the sandbox.\n'
@@ -3310,7 +3289,7 @@ cmd_host_allow_list() {
 # ---------------------------------------------------------------------------
 # Subcommands: host-allow review (read-only staleness report)
 #
-# Entries outlive their reason: a pin added to override a WARN keeps granting
+# Entries outlive their occasion: a pin added to override a WARN keeps granting
 # host exec long after the pinned version audits clean on its own. The review
 # reports, per entry, its age, observed usage, and whether the pinned version
 # still needs the entry — removal itself stays operator-only (TTY-gated).
@@ -3622,7 +3601,7 @@ cmd_host_allow_review() {
   entries_tmp=$(mktemp)
   now_epoch=$(date +%s)
 
-  local entry name version ecosystem added reason age_days added_epoch malformed
+  local entry name version ecosystem added age_days added_epoch malformed
   while IFS= read -r entry; do
     [[ -n "$entry" ]] || continue
     # A malformed entry degrades to one unknown row and the review
@@ -3632,12 +3611,10 @@ cmd_host_allow_review() {
     version=$(jq -r '.value.version // empty' <<<"$entry" 2>/dev/null) || version=""
     ecosystem=$(jq -r '.value.ecosystem // "npm"' <<<"$entry" 2>/dev/null) || ecosystem="npm"
     added=$(jq -r '.value.added // empty' <<<"$entry" 2>/dev/null) || added=""
-    reason=$(jq -r '.value.reason // empty' <<<"$entry" 2>/dev/null) || reason=""
     malformed=0
     if [[ -z "$version" ]]; then
       malformed=1
       version="?"
-      reason="malformed host-allow entry"
     fi
     age_days=-1
     if [[ -n "$added" ]] && added_epoch=$(date -d "$added" +%s 2>/dev/null); then
@@ -3661,12 +3638,12 @@ cmd_host_allow_review() {
 
     jq -cn \
       --arg name "$name" --arg version "$version" --arg ecosystem "$ecosystem" \
-      --arg added "$added" --argjson age_days "$age_days" --arg reason "$reason" \
+      --arg added "$added" --argjson age_days "$age_days" \
       --argjson times_used "$REVIEW_TIMES_USED" --arg last_used "$REVIEW_LAST_USED" \
       --arg status "$REVIEW_STATUS" --argjson audit_exit "$REVIEW_AUDIT_EXIT" \
       --arg audit_verdict "$REVIEW_AUDIT_VERDICT" --argjson warn_causes "$REVIEW_WARN_CAUSES" \
       '{name:$name, version:$version, ecosystem:$ecosystem, added:$added,
-        age_days:$age_days, reason:$reason, times_used:$times_used,
+        age_days:$age_days, times_used:$times_used,
         last_used:(if $last_used == "" then null else $last_used end),
         never_used:($times_used == 0), status:$status,
         audit:{exit:$audit_exit, verdict:$audit_verdict, warn_causes:$warn_causes}}' >> "$entries_tmp"
@@ -3740,18 +3717,16 @@ cmd_scripts_allow_add() {
   trust_redirected_guard write "scripts-allow-add"
   local spec="${1:-}"
   shift || true
-  [[ -z "$spec" ]] && die "usage: safe run scripts-allow add <pkg>@<x.y.z> --reason \"...\""
+  [[ -z "$spec" ]] && die "usage: safe run scripts-allow add <pkg>@<x.y.z>"
   is_tty || {
     err "BLOCKED: scripts-allow add requires an interactive operator terminal"
-    err "  ask the operator to run: safe run scripts-allow add ${spec} --reason \"...\""
+    err "  ask the operator to run: safe run scripts-allow add ${spec}"
     err "  agent contract: safe explain"
     exit 102
   }
-  local reason="" ecosystem="npm"
+  local ecosystem="npm"
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --reason) reason="$2"; shift 2 ;;
-      --reason=*) reason="${1#--reason=}"; shift ;;
       --ecosystem) ecosystem="$2"; shift 2 ;;
       --ecosystem=*) ecosystem="${1#--ecosystem=}"; shift ;;
       *) die "unknown flag: $1" ;;
@@ -3765,7 +3740,6 @@ cmd_scripts_allow_add() {
     die "scripts-allow requires an exact version (got '${PKG_VERSION}'); never names, ranges, or tags"
   PKG_NAME=$(normalize_and_validate_package_or_die "$PKG_NAME" "npm" "$spec")
 
-  host_allow_require_reason "$reason"
   host_allow_preflight_audit "$PKG_NAME" "$PKG_VERSION" "$ecosystem" "grant scripts for"
 
   # The review step: show the operator what would be authorized. A grant is
@@ -3800,13 +3774,12 @@ cmd_scripts_allow_add() {
   sa_file="$(trust_store_file scripts-allow.json)"
   tmp=$(stage_beside "$sa_file")
   jq --arg p "$PKG_NAME" --arg v "$PKG_VERSION" --arg s "$sha" \
-     --arg r "$reason" --arg d "$(date -I)" --argjson scripts "$scripts_json" '
+     --arg d "$(date -I)" --argjson scripts "$scripts_json" '
     .packages[$p] = {
       version: $v,
       sha: $s,
       ecosystem: "npm",
       added: $d,
-      reason: $r,
       scripts: $scripts
     }' "$sa_file" > "$tmp"
   mv "$tmp" "$sa_file"
@@ -3831,9 +3804,9 @@ cmd_scripts_allow_remove() {
 cmd_scripts_allow_list() {
   load_trust_store_json "$SCRIPTS_ALLOW_FILE" | \
     jq -r '.packages | to_entries[] |
-    "\(.key)@\(.value.version)\t\(.value.added)\t\(if .value.scripts == null then "unreviewed(fetch failed)" else ((.value.scripts | keys | join(",")) // "none") end)\t\(.value.reason)"' | \
-    awk -F'\t' 'BEGIN{printf "%-40s %-12s %-28s %s\n","PACKAGE","ADDED","SCRIPTS","REASON"}
-                {printf "%-40s %-12s %-28s %s\n",$1,$2,($3==""?"none":$3),$4}'
+    "\(.key)@\(.value.version)\t\(.value.added)\t\(if .value.scripts == null then "unreviewed(fetch failed)" else ((.value.scripts | keys | join(",")) // "none") end)"' | \
+    awk -F'\t' 'BEGIN{printf "%-40s %-12s %s\n","PACKAGE","ADDED","SCRIPTS"}
+                {printf "%-40s %-12s %s\n",$1,$2,($3==""?"none":$3)}'
   printf '\nnote: grants apply to npm global installs in gated shells (npm >= 12 allow-scripts, strict).\n'
   printf '      the global ignore-scripts default never changes.\n'
 }
@@ -3856,19 +3829,16 @@ cmd_block() {
 cmd_block_add() {
   local pkg="${1:-}"
   shift || true
-  [[ -z "$pkg" ]] && die "usage: safe run block add <pkg> --reason \"...\""
-  local reason=""
+  [[ -z "$pkg" ]] && die "usage: safe run block add <pkg>"
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --reason) reason="$2"; shift 2 ;;
       *) die "unknown flag: $1" ;;
     esac
   done
-  [[ -z "$reason" ]] && die "--reason is required"
   pkg=$(normalize_block_package_name_or_die "$pkg")
   local tmp; tmp=$(stage_beside "$BLOCKED_FILE")
-  jq --arg p "$pkg" --arg r "$reason" --arg d "$(date -I)" '
-    .packages[$p] = { reason: $r, added: $d }' "$BLOCKED_FILE" > "$tmp"
+  jq --arg p "$pkg" --arg d "$(date -I)" '
+    .packages[$p] = { added: $d }' "$BLOCKED_FILE" > "$tmp"
   mv "$tmp" "$BLOCKED_FILE"
   info "blocked $pkg"
 }
@@ -3884,9 +3854,9 @@ cmd_block_remove() {
 }
 
 cmd_block_list() {
-  jq -r '.packages | to_entries[] | "\(.key)\t\(.value.added)\t\(.value.reason)"' "$BLOCKED_FILE" | \
-    awk -F'\t' 'BEGIN{printf "%-40s %-12s %s\n","PACKAGE","ADDED","REASON"}
-                {printf "%-40s %-12s %s\n",$1,$2,$3}'
+  jq -r '.packages | to_entries[] | "\(.key)\t\(.value.added)"' "$BLOCKED_FILE" | \
+    awk -F'\t' 'BEGIN{printf "%-40s %s\n","PACKAGE","ADDED"}
+                {printf "%-40s %s\n",$1,$2}'
 }
 
 cmd_block_import() {
@@ -3907,7 +3877,8 @@ cmd_block_import() {
     # JSON input: take .packages as-is.
     printf '%s' "$body" > "$imported_tmp"
   else
-    # Newline-delimited: each line is "pkg" or "pkg | reason".
+    # Newline-delimited: each line is "pkg" (a legacy "pkg | reason"
+    # suffix is tolerated and ignored).
     # Use jq -R -s to parse safely; never construct JSON via string concat.
     printf '%s' "$body" | jq -R -s --arg today "$today" '
       split("\n")
@@ -3917,7 +3888,7 @@ cmd_block_import() {
           as $parts
           | {
               key: $parts[0],
-              value: { reason: ($parts[1] // "imported"), added: $today }
+              value: { added: $today }
             }
         )
       | map(select(.key | length > 0))
@@ -3928,18 +3899,18 @@ cmd_block_import() {
   local normalized_tmp
   normalized_tmp=$(mktemp)
   printf '%s\n' '{"packages":{}}' > "$normalized_tmp"
-  while IFS=$'\t' read -r pkg reason added; do
+  while IFS=$'\t' read -r pkg added; do
     local normalized_pkg normalized_merge_tmp
     normalized_pkg=$(normalize_block_package_name_or_warn "$pkg") || continue
     normalized_merge_tmp=$(mktemp)
-    jq --arg p "$normalized_pkg" --arg r "$reason" --arg d "$added" '
-      .packages[$p] = { reason: $r, added: $d }' "$normalized_tmp" > "$normalized_merge_tmp"
+    jq --arg p "$normalized_pkg" --arg d "$added" '
+      .packages[$p] = { added: $d }' "$normalized_tmp" > "$normalized_merge_tmp"
     mv "$normalized_merge_tmp" "$normalized_tmp"
   done < <(
     jq -r --arg today "$today" '
       .packages
       | to_entries[]
-      | [.key, (.value.reason // "imported"), (.value.added // $today)]
+      | [.key, (.value.added // $today)]
       | @tsv
     ' "$imported_tmp"
   )
@@ -4422,8 +4393,8 @@ RUNNER-NATIVE FLAGS (when invoked as npx/bunx/uvx)
                         mistaken for the package name
 
 SUBCOMMANDS
-  host-allow add <pkg>@<ver> --reason "..."   Add package to host execution allowlist
-  host-allow update <pkg>@<new> --reason "..."
+  host-allow add <pkg>@<ver>   Add package to host execution allowlist
+  host-allow update <pkg>@<new>
                                               Update pinned version (prompts)
   host-allow remove <pkg>                     Remove from allowlist
   host-allow list                             Show allowlist
@@ -4445,8 +4416,7 @@ SUBCOMMANDS
                                               re-validates + re-fetches integrity,
                                               never overwrites a divergent pin;
                                               --dry-run previews the delta
-  scripts-allow add <pkg>@<x.y.z> --reason "..."
-                                              Operator grant (TTY): reviewed
+  scripts-allow add <pkg>@<x.y.z>              Operator grant (TTY): reviewed
                                               install scripts for one exact
                                               identity run on npm -g installs
                                               (npm >= 12 allow-scripts, strict);
@@ -4454,7 +4424,7 @@ SUBCOMMANDS
   scripts-allow remove <pkg>                  Revoke scripts grant
   scripts-allow list                          Show scripts grants
 
-  block add <pkg> --reason "..."              Block a package
+  block add <pkg>                             Block a package
   block remove <pkg>                          Unblock
   block list                                  Show blocklist
   block import <url-or-file>                  Import JSON or newline list

@@ -115,7 +115,7 @@ printf '@p:registry=%s/\n//git.example.test:8443/api/packages/owner/npm/:_authTo
 policy="$SAFE_RUN_CONFIG_DIR/private-registries.json"
 add_registry() { # id eco origin namespace
   "$CORE" private-trust registry-add --policy "$policy" --id "$1" --ecosystem "$2" --origin "$3" \
-    --namespace "$4" --reason test >/dev/null || fail "registry-add $1"
+    --namespace "$4" >/dev/null || fail "registry-add $1"
 }
 reset_state() { rm -f "$policy" "$tmp/npm.argv" "$tmp/go.argv" "$tmp/curl.urls" "$SAFE_AUDIT_AUDIT_LOG"; }
 # audit <spec> <eco> [env...] [-- package-audit flags...]: gate-mode audit
@@ -708,16 +708,19 @@ pass "gate 20 class private: 104 unattended, typed install-once at a terminal, n
 # --- operator commands ----------------------------------------------------------
 reset_state
 pty_run() { python3 -c 'import pty,sys,os; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' "$@"; }
-rc=0; "$RUN" private-registry add p-npm --ecosystem npm --origin "$NPM_ORIGIN" --namespace '@p/*' --reason r > "$tmp/out" 2>&1 </dev/null || rc=$?
+rc=0; "$RUN" private-registry add p-npm --ecosystem npm --origin "$NPM_ORIGIN" --namespace '@p/*' > "$tmp/out" 2>&1 </dev/null || rc=$?
 [[ "$rc" == 102 && ! -e "$policy" ]] || fail "add without a terminal: rc=$rc"
-pty_run "$RUN" private-registry add p-npm --ecosystem npm --origin "$NPM_ORIGIN/" --namespace '@p/*' --reason "my registry" > "$tmp/out" 2>&1 || fail "add: $(cat "$tmp/out")"
+pty_run "$RUN" private-registry add p-npm --ecosystem npm --origin "$NPM_ORIGIN/" --namespace '@p/*' > "$tmp/out" 2>&1 || fail "add: $(cat "$tmp/out")"
 jq -e --arg o "$NPM_ORIGIN" '.registries["p-npm"].origin == $o and (.registries["p-npm"] | has("pin_mode") | not)' "$policy" >/dev/null || fail "add wrote no canonical origin"
 grep -q 'PRIVATE_REGISTRY_ADDED' "$SAFE_RUN_DATA_DIR/audit.log" || fail "add not logged"
-rc=0; pty_run "$RUN" private-registry add bad --ecosystem npm --origin "$EVIL/npm" --namespace '@p/x' --reason r > "$tmp/out" 2>&1 || rc=$?
+rc=0; pty_run "$RUN" private-registry add bad --ecosystem npm --origin "$EVIL/npm" --namespace '@p/x' > "$tmp/out" 2>&1 || rc=$?
 [[ "$rc" != 0 ]] && grep -q 'overlapping' "$tmp/out" || fail "overlapping registry accepted: $(cat "$tmp/out")"
-rc=0; pty_run "$RUN" private-registry add bad --ecosystem npm --origin "$EVIL/npm" --namespace '@q/*' > "$tmp/out" 2>&1 || rc=$?
-[[ "$rc" != 0 ]] || fail "add without a reason accepted"
-rc=0; pty_run "$RUN" private-registry add bad --ecosystem npm --origin "$EVIL/npm" --namespace '@q/*' --pin-mode operator --reason r > "$tmp/out" 2>&1 || rc=$?
+pty_run "$RUN" private-registry add bad --ecosystem npm --origin "$EVIL/npm" --namespace '@q/*' > "$tmp/out" 2>&1 || fail "add without a reason refused (grants carry none): $(cat "$tmp/out")"
+jq -e '.registries["bad"] | has("reason") | not' "$policy" >/dev/null || fail "registry entry stored a reason"
+pty_run "$RUN" private-registry remove bad > "$tmp/out" 2>&1 || fail "remove cleanup: $(cat "$tmp/out")"
+rc=0; pty_run "$RUN" private-registry add bad --ecosystem npm --origin "$EVIL/npm" --namespace '@q/*' --reason x > "$tmp/out" 2>&1 || rc=$?
+[[ "$rc" != 0 ]] || fail "the removed --reason option was accepted"
+rc=0; pty_run "$RUN" private-registry add bad --ecosystem npm --origin "$EVIL/npm" --namespace '@q/*' --pin-mode operator > "$tmp/out" 2>&1 || rc=$?
 [[ "$rc" != 0 ]] || fail "the removed --pin-mode option was accepted"
 "$RUN" private-registry list > "$tmp/out" 2>&1 || fail "list: $(cat "$tmp/out")"
 grep -q "p-npm" "$tmp/out" && ! grep -q 'pin' "$tmp/out" || fail "list: $(cat "$tmp/out")"
@@ -727,7 +730,7 @@ no_secret "operator commands"
 pass "private-registry add: operator terminal only, canonical origin, overlap refused, logged; list is read-only; there are no pin commands"
 
 rm -f "$tmp/npm.argv"
-rc=0; SAFE_AUDIT_BIN="$AUDIT" pty_run "$RUN" host-allow add @p/x@2.0.0 --reason "private grant" > "$tmp/out" 2>&1 || rc=$?
+rc=0; SAFE_AUDIT_BIN="$AUDIT" pty_run "$RUN" host-allow add @p/x@2.0.0 > "$tmp/out" 2>&1 || rc=$?
 [[ "$rc" != 0 ]] && grep -q 'trusted already' "$tmp/out" && ! jq -e '.packages["@p/x"]' "$SAFE_RUN_CONFIG_DIR/host-allow.json" >/dev/null 2>&1 \
   || fail "host-allow add of a private name: rc=$rc $(cat "$tmp/out")"
 pass "host-allow add of a private name is refused (its origin is trusted already) and never takes public integrity"

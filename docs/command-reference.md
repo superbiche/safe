@@ -46,23 +46,23 @@ and the two drifted.
 
 ```bash
 safe run [flags] <package>[@<version>] [-- args...]
-safe run host-allow add <pkg>@<ver> --reason "..."
-safe run host-allow update <pkg>@<new> --reason "..."
+safe run host-allow add <pkg>@<ver>
+safe run host-allow update <pkg>@<new>
 safe run host-allow remove <pkg>
 safe run host-allow list
 safe run host-allow review [--json] [--digest] [--no-audit]
 safe run host-allow export [--json]
 safe run host-allow import <file> [--dry-run]
-safe run private-registry add <id> --ecosystem npm|go|python --origin <url> --namespace <ns>... --reason "..."
+safe run private-registry add <id> --ecosystem npm|go|python --origin <url> --namespace <ns>...
 safe run private-registry remove <id>
 safe run private-registry list [--json]
 safe run private-registry export [--sign [--out <dir>]]
 safe run private-registry follow [--dry-run] [--from <dir>]
 safe run private-registry forget-origin <host>
-safe run scripts-allow add <pkg>@<x.y.z> --reason "..."
+safe run scripts-allow add <pkg>@<x.y.z>
 safe run scripts-allow remove <pkg>
 safe run scripts-allow list
-safe run block add <pkg> --reason "..."
+safe run block add <pkg>
 safe run block remove <pkg>
 safe run block list
 safe run block import <url-or-file>
@@ -137,7 +137,7 @@ vendor-native updater. A `--preset` (claude, gh, op, uv, codex) fills
 `--name`, `--path`, and `--version-cmd` for a known vendor:
 
 ```bash
-safe vendor update --preset codex --reason "needed for a specific fixed bug" \
+safe vendor update --preset codex \
   --rollback "reinstall previous pinned version" -- codex update
 ```
 
@@ -148,7 +148,7 @@ safe vendor update \
   --name pulumi \
   --path "$(command -v pulumi)" \
   --version-cmd "version" \
-  --reason "pin to 3.x" \
+  \
   -- pulumi plugin install ...
 ```
 

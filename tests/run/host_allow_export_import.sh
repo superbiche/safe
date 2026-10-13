@@ -123,10 +123,10 @@ cat > "$tmp/config/host-allow.json" <<'JSON'
 JSON
 out=$(run_safe_run host-allow export)
 [[ "$(jq -r '.packages | keys | join(",")' <<<"$out")" == "fresh-pkg,keep-pkg" ]] || fail "export missing entries: $out"
-[[ "$(jq -r '.packages["fresh-pkg"].reason' <<<"$out")" == "machine-1 daily tool" ]] || fail "export dropped reason"
+[[ "$(jq -r '.packages["fresh-pkg"] | has("reason")' <<<"$out")" == "false" ]] || fail "export must not carry a reason (removed 2026-10-13)"
 [[ "$(jq -r '.packages["fresh-pkg"].sha' <<<"$out")" == "sha512-FRESH" ]] || fail "export dropped integrity"
 [[ "$(jq -r '.packages["fresh-pkg"] | has("behavioral_ack")' <<<"$out")" == "false" ]] || fail "export must not leak undeclared fields"
-[[ "$(jq -r '.packages["fresh-pkg"] | keys | join(",")' <<<"$out")" == "added,ecosystem,reason,sha,version" ]] || fail "export must project exactly the 5 declared fields: $(jq -c '.packages["fresh-pkg"]' <<<"$out")"
+[[ "$(jq -r '.packages["fresh-pkg"] | keys | join(",")' <<<"$out")" == "added,ecosystem,sha,version" ]] || fail "export must project exactly the 4 declared fields: $(jq -c '.packages["fresh-pkg"]' <<<"$out")"
 pass "export projects only the declared fields (no legacy-key leak)"
 
 # --- export: malformed local trust file fails loudly (F3) ------------------
@@ -172,7 +172,7 @@ rc=$?
 set -e
 [[ "$rc" == "102" ]] || fail "non-TTY real import must exit 102 (got $rc): $out"
 grep -q "safe run host-allow import" <<<"$out" || fail "refusal must name the import command: $out"
-grep -q -- "--reason" <<<"$out" && fail "import refusal must NOT append --reason (import takes none): $out"
+grep -q -- "--reason" <<<"$out" && fail "import refusal must not append a --reason flag: $out"
 [[ ! -e "$tmp/bare/config" ]] || fail "refused non-TTY import must seed nothing"
 pass "real import refuses non-TTY with exit 102, an import-specific hint, and seeds nothing"
 
@@ -194,10 +194,10 @@ if command -v python3 >/dev/null 2>&1; then
   entry=$(jq -c '.packages["fresh-pkg"]' "$tmp/config/host-allow.json")
   [[ "$(jq -r '.version' <<<"$entry")" == "1.2.3" ]] || fail "import wrong version: $entry"
   [[ "$(jq -r '.sha' <<<"$entry")" == "sha512-FRESH" ]] || fail "import must store the registry-fetched sha: $entry"
-  [[ "$(jq -r '.reason' <<<"$entry")" == "machine-1 daily tool" ]] || fail "import must preserve the reason: $entry"
+  [[ "$(jq -r 'has("reason")' <<<"$entry")" == "false" ]] || fail "import must drop a legacy reason: $entry"
   [[ "$(jq -r '.added' <<<"$entry")" == "2026-07-01" ]] || fail "import must preserve the original add date (F4): $entry"
   [[ "$(jq -r '.packages["keep-pkg"].version' "$tmp/config/host-allow.json")" == "4.5.6" ]] || fail "import dropped keep-pkg"
-  pass "TTY import stores the registry sha, preserves the reason, and preserves the original add date"
+  pass "TTY import stores the registry sha, drops the legacy reason, and preserves the original add date"
 
   # --- import: a legal PEP440 epoch version is not falsely rejected (N1) ----
   fresh_config
@@ -223,13 +223,13 @@ JSON
 
   # update (TTY, registry re-verified) -> op=update; the update prompts
   # [y/N], so the pty needs the answer piped in.
-  cmd="SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' host-allow update epoch-pkg@1!2.0 --reason 'rotate integrity'"
+  cmd="SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' host-allow update epoch-pkg@1!2.0"
   out=$(printf 'y\n' | pty_run "$cmd" 2>&1) || fail "TTY update failed: $out"
   grep -q 'HOST_ALLOW_WRITE.*op=update' "$audit_log_file" ||
     fail "the update write did not log HOST_ALLOW_WRITE op=update"
 
   # add (TTY, registry re-verified) -> op=add
-  cmd="SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' host-allow add epoch-pkg@1!2.0 --ecosystem python --reason 're-add for the audit-event case'"
+  cmd="SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' host-allow add epoch-pkg@1!2.0 --ecosystem python"
   out=$(printf 'y\n' | pty_run "$cmd" 2>&1) || fail "TTY add failed: $out"
   grep -q 'HOST_ALLOW_WRITE.*op=add entries=1' "$audit_log_file" ||
     fail "the add write did not log HOST_ALLOW_WRITE op=add entries=1"
@@ -242,7 +242,7 @@ JSON
 
   # Re-add epoch-pkg (it stays in the store) so review proves the TRUST-tier
   # write events do not count as usage: epoch-pkg has zero EXEC/override use.
-  cmd="SAFE_RUN_TRUST_OVERRIDE=1 SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' host-allow add epoch-pkg@1!2.0 --ecosystem python --reason 're-add for the review-count case'"
+  cmd="SAFE_RUN_TRUST_OVERRIDE=1 SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' host-allow add epoch-pkg@1!2.0 --ecosystem python"
   out=$(printf 'y\n' | pty_run "$cmd" 2>&1) || fail "TTY re-add failed: $out"
   review_json=$(SAFE_RUN_TRUST_OVERRIDE=1 SAFE_RUN_CONFIG_DIR="$tmp/config" SAFE_RUN_DATA_DIR="$tmp/data" \
     SAFE_AUDIT_DATA_DIR="$tmp/audit-data" PATH="$tmp/bin:$PATH" \
@@ -333,7 +333,7 @@ JSON
   cmd="SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' host-allow import '$tmp/conflict.json'"
   out=$(pty_run "$cmd" 2>&1) || fail "TTY conflict import failed: $out"
   grep -q "CONFLICT conflict-pkg" <<<"$out" || fail "must report the conflict: $out"
-  grep -qF 'resolve with: safe run host-allow update conflict-pkg@2.0.0 --reason "..."' <<<"$out" || fail "conflict remediation text changed: $out"
+  grep -qF 'resolve with: safe run host-allow update conflict-pkg@2.0.0' <<<"$out" || fail "conflict remediation text changed: $out"
   [[ "$(jq -r '.packages["conflict-pkg"].version' "$tmp/config/host-allow.json")" == "1.0.0" ]] || fail "import must not overwrite a divergent local pin"
   pass "import reports a divergent pin as a conflict and leaves the local entry untouched"
 
@@ -351,7 +351,7 @@ JSON
   [[ "$(jq -r '.packages | length' "$tmp/config/host-allow.json")" == "0" ]] || fail "mismatched entry must not be written"
   pass "import skips an entry whose file sha diverges from the registry"
 
-  # --- import: reason/ecosystem validation, valid entry applied -----------
+  # --- import: ecosystem validation; a reason-less entry is valid now ------
   fresh_config
   printf '{"packages":{}}\n' > "$tmp/config/host-allow.json"
   cat > "$tmp/mixed.json" <<'JSON'
@@ -364,7 +364,8 @@ JSON
   cmd="SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' host-allow import '$tmp/mixed.json'"
   out=$(pty_run "$cmd" 2>&1) || fail "TTY mixed import failed: $out"
   [[ "$(jq -r '.packages | keys | join(",")' "$tmp/config/host-allow.json")" == "fresh-pkg" ]] || fail "only the valid entry should be written: $(jq -c .packages "$tmp/config/host-allow.json")"
-  grep -q "no reason" <<<"$out" || fail "must explain the reason-less skip: $out"
+  grep -q "no-reason-pkg" <<<"$out" && grep -q "could not verify" <<<"$out" || fail "reason-less entry must reach verification, not a reason skip: $out"
+  grep -q "no reason" <<<"$out" && fail "import still demands a reason: $out"
   grep -q "unknown ecosystem" <<<"$out" || fail "must explain the ecosystem skip: $out"
   pass "import skips invalid entries with cause and applies the valid ones"
 else

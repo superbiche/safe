@@ -61,7 +61,7 @@ Flow:
 ## Host-Allow Promotion
 
 ```bash
-safe run host-allow add pnpm@10.11.0 --reason "daily package manager"
+safe run host-allow add pnpm@10.11.0
 ```
 
 Flow:

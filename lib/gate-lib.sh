@@ -2863,15 +2863,14 @@ safe_gate_resolve_run_bin() {
 }
 
 # The operator chose [a]: also record a standing host-allow grant so agents can
-# reinstall unattended. The reason is an acknowledgment, not a justification
-# (operator ruling 2026-09-07) — canned, never typed. safe-run host-allow add
+# reinstall unattended. safe-run host-allow add
 # re-audits host-side (a host-execution trust escalation earns its own confirm on
 # an adverse finding); the grant is best-effort — if it does not land, the install
 # still proceeded, so this surfaces the miss, never aborts.
 safe_gate_warn_grant_host_allow() {
   local package="$1"
   local ecosystem="$2"
-  local run_bin reason
+  local run_bin
 
   # Belt-and-suspenders for F1: never mint a defaulted-npm grant for an
   # ecosystem host-allow does not support. The confirm no longer offers [a]
@@ -2881,18 +2880,17 @@ safe_gate_warn_grant_host_allow() {
     return 0
   fi
   if ! run_bin="$(safe_gate_resolve_run_bin)"; then
-    safe_gate_err "safe: install proceeded, but safe-run was not found to record the host-allow grant; add it later: safe run host-allow add ${package} --reason \"...\""
+    safe_gate_err "safe: install proceeded, but safe-run was not found to record the host-allow grant; add it later: safe run host-allow add ${package}"
     return 0
   fi
-  reason="operator override at the install gate ($(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u))"
-  local -a cmd=("${run_bin}" host-allow add "${package}" --reason "${reason}")
+  local -a cmd=("${run_bin}" host-allow add "${package}")
   case "$(safe_gate_canonical_eco "${ecosystem}")" in
     python) cmd+=(--ecosystem python) ;;
   esac
   if "${cmd[@]}"; then
     safe_gate_err "safe: recorded a host-allow grant for ${package} (future reinstalls permitted)"
   else
-    safe_gate_err "safe: install proceeded, but the host-allow grant was not recorded; add it later: safe run host-allow add ${package} --reason \"...\""
+    safe_gate_err "safe: install proceeded, but the host-allow grant was not recorded; add it later: safe run host-allow add ${package}"
   fi
 }
 
@@ -2946,20 +2944,19 @@ safe_gate_confirm_block() {
 # Best-effort record of an accepted advisory BLOCK: the install proceeds
 # either way, so a miss is surfaced, never fatal.
 safe_gate_block_record_override() {
-  local target="$1" ecosystem="$2" run_bin reason
+  local target="$1" ecosystem="$2" run_bin
   if ! run_bin="$(safe_gate_resolve_run_bin)"; then
-    safe_gate_err "safe: install proceeded, but safe-run was not found to record the override; record it later: safe run host-allow add ${target} --reason \"...\" --accept-block"
+    safe_gate_err "safe: install proceeded, but safe-run was not found to record the override; record it later: safe run host-allow add ${target} --accept-block"
     return 0
   fi
-  reason="operator BLOCK override at the install gate ($(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u))"
-  local -a cmd=("${run_bin}" host-allow add "${target}" --reason "${reason}" --accept-block)
+  local -a cmd=("${run_bin}" host-allow add "${target}" --accept-block)
   case "$(safe_gate_canonical_eco "${ecosystem}")" in
     python) cmd+=(--ecosystem python) ;;
   esac
   if "${cmd[@]}"; then
     safe_gate_err "safe: recorded the BLOCK override for ${target}"
   else
-    safe_gate_err "safe: install proceeded, but the BLOCK override was not recorded; record it later: safe run host-allow add ${target} --reason \"...\" --accept-block"
+    safe_gate_err "safe: install proceeded, but the BLOCK override was not recorded; record it later: safe run host-allow add ${target} --accept-block"
   fi
 }
 
@@ -3029,14 +3026,14 @@ safe_gate_allow_hint() {
   case "$(safe_gate_canonical_eco "${ecosystem}")" in
     npm)
       if [[ -n "${version}" && "${version}" != "latest" ]]; then
-        printf 'to allow: ask the operator to run: safe run host-allow add %s --reason "..." — then retry' "${package}"
+        printf 'to allow: ask the operator to run: safe run host-allow add %s — then retry' "${package}"
       else
         printf 'to allow: pin an exact version first (see the resolved-version hint above) — allow entries are never @latest'
       fi
       ;;
     python)
       if [[ -n "${version}" && "${version}" != "latest" ]]; then
-        printf 'to allow: ask the operator to run: safe run host-allow add %s --ecosystem python --reason "..." — then retry' "${package}"
+        printf 'to allow: ask the operator to run: safe run host-allow add %s --ecosystem python — then retry' "${package}"
       else
         printf 'to allow: pin an exact version first (see the resolved-version hint above) — allow entries are never @latest'
       fi

@@ -734,11 +734,42 @@ detect_local_tools_json() {
   printf '%s\n' "${entries[@]}" | jq -s --arg machine "$machine" '{($machine): from_entries}'
 }
 
+# Grants carry no reason field (operator ruling 2026-10-13). Strip the
+# legacy key from existing grant stores at install time; writers no longer
+# emit it and readers ignore it, so this is the one-time cleanup. Signed
+# statement files in the sync state dir are NOT touched (editing would
+# break their signatures) — they regenerate clean on the next signed export.
+strip_grant_reasons() {
+  local file tmp
+  for file in "$RUN_CONFIG_DIR/host-allow.json" "$RUN_CONFIG_DIR/scripts-allow.json" "$RUN_CONFIG_DIR/blocked.json"; do
+    [[ -f "$file" ]] || continue
+    jq -e '(.packages // {}) | to_entries | map(.value | objects | has("reason")) | any' "$file" >/dev/null 2>&1 || continue
+    tmp=$(stage_beside "$file") || continue
+    if jq 'if (.packages | type) == "object" then .packages |= with_entries(.value |= (if type == "object" then del(.reason) else . end)) else . end' "$file" > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$file"
+      info "stripped legacy grant reasons: $file"
+    else
+      rm -f "$tmp"
+    fi
+  done
+  file="$RUN_CONFIG_DIR/private-registries.json"
+  if [[ -f "$file" ]] && jq -e '(.registries // {}) | to_entries | map(.value | objects | has("reason")) | any' "$file" >/dev/null 2>&1; then
+    tmp=$(stage_beside "$file") || tmp=""
+    if [[ -n "$tmp" ]] && jq 'if (.registries | type) == "object" then .registries |= with_entries(.value |= (if type == "object" then del(.reason) else . end)) else . end' "$file" > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$file"
+      info "stripped legacy grant reasons: $file"
+    else
+      [[ -n "$tmp" ]] && rm -f "$tmp"
+    fi
+  fi
+}
+
 migrate_dir "$LEGACY_SAFE_RUN_CONFIG_DIR" "$RUN_CONFIG_DIR"
 migrate_dir "$LEGACY_SAFE_AUDIT_CONFIG_DIR" "$AUDIT_CONFIG_DIR"
 migrate_dir "$LEGACY_SAFE_RUN_DATA_DIR" "$RUN_DATA_DIR"
 migrate_dir "$LEGACY_SAFE_AUDIT_DATA_DIR" "$AUDIT_DATA_DIR"
 merge_legacy_state
+strip_grant_reasons
 
 mkdir -p "$BIN_DIR"
 # The dispatcher and its installed gate library are ONE upgrade unit: a

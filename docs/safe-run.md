@@ -86,17 +86,17 @@ are handled explicitly instead of being mistaken for the package name:
 Use host allow for pinned, reviewed tools that must execute outside the sandbox:
 
 ```bash
-safe run host-allow add pnpm@10.11.0 --reason "daily package manager"
-safe run host-allow update pnpm@10.12.0 --reason "reviewed update"
+safe run host-allow add pnpm@10.11.0
+safe run host-allow update pnpm@10.12.0
 safe run host-allow list
 safe run host-allow remove pnpm
 ```
 
-`host-allow add` and `host-allow update` are operator-only trust escalations: they require an interactive terminal and refuse in non-TTY shells with exit 102, so a cooperative agent can suggest the command verbatim but not execute it. (The TTY check is a cooperative-agent boundary, not proof of operator presence — a process that allocates a pseudo-terminal can satisfy it; see the residual-risk note in `install-wrappers.md`.) Both require a `--reason` — the audit trail for bypassing the sandbox default — and refuse without one. Each exact version is verified against its public registry before the trust-store writer runs; unknown or unreachable versions fail closed.
+`host-allow add` and `host-allow update` are operator-only trust escalations: they require an interactive terminal and refuse in non-TTY shells with exit 102, so a cooperative agent can suggest the command verbatim but not execute it. (The TTY check is a cooperative-agent boundary, not proof of operator presence — a process that allocates a pseudo-terminal can satisfy it; see the residual-risk note in `install-wrappers.md`.) Grants carry no reason field (removed 2026-10-13: the operator owes no justification to themselves; attribution is the append-only audit log). Each exact version is verified against its public registry before the trust-store writer runs; unknown or unreachable versions fail closed.
 
 ### Staleness review
 
-Entries outlive their reason: a pin added to override a WARN keeps granting host
+Entries outlive their occasion: a pin added to override a WARN keeps granting host
 execution long after the pinned version audits clean on its own.
 
 ```bash
@@ -158,8 +158,8 @@ safe run host-allow import allow.json
 ```
 
 The exported document (`schema: safe-host-allow-export/1`) carries only
-`name@version`, ecosystem, the public registry integrity hash, the original
-`--reason`, and the add date, plus `install_allowances` — the exact versions
+`name@version`, ecosystem, the public registry integrity hash, and the
+add date, plus `install_allowances` — the exact versions
 safe allowed to install on this machine (see Followed install allowances,
 below). There are no secrets in it. Unsigned `import` applies the packages
 and ignores the allowances; they gain authority only through a verified
@@ -192,7 +192,7 @@ without its own export never starts publishing one.
   state before that gate. `--dry-run` is the one read-only exception (it touches
   nothing on a bare machine), so a cooperative agent can show the operator the
   delta.
-- Every entry is re-validated (name, ecosystem, non-empty reason) as if it were
+- Every entry is re-validated (name, ecosystem) as if it were
   typed into `add`; the file is treated as untrusted input, and a malformed
   document or a non-object entry is refused or skipped, never partially applied.
 - Only an **exact** version pin is accepted — never a range (`^1`, `1.x`), a
@@ -259,7 +259,7 @@ signer configuration produce one WARN per file
 and increment the signature-skip count. Signed `/2` metadata must identify the
 host in the filename. The default directory being absent is a successful no-op.
 
-The merge is **UNION**: missing grants pass the same name, ecosystem, reason,
+The merge is **UNION**: missing grants pass the same name, ecosystem,
 exact-version and registry-integrity validator as `import`. Already-present
 pins are no-ops, and a different local pin is replaced by the signed pin when
 the statement's generation is newer than the generation recorded on that
@@ -463,7 +463,7 @@ can also be recorded. At the gate prompt, type `record <pkg>@<version>`, or
 run:
 
 ```bash
-safe run host-allow add <pkg>@<version> --reason "..." --accept-block
+safe run host-allow add <pkg>@<version> --accept-block
 ```
 
 `--accept-block` re-audits the exact version, refuses anything but an
@@ -586,7 +586,7 @@ installs "successfully" but broken. A scripts-allow entry is an
 operator-reviewed grant for one exact identity:
 
 ```bash
-safe run scripts-allow add opencode-ai@0.5.0 --reason "fetches platform binary"
+safe run scripts-allow add opencode-ai@0.5.0
 safe run scripts-allow list
 safe run scripts-allow remove opencode-ai
 ```
@@ -594,7 +594,7 @@ safe run scripts-allow remove opencode-ai
 `add` is operator-only (TTY, exit 102 otherwise; the same cooperative-agent
 boundary as host-allow — see the residual-risk note in
 `install-wrappers.md`), requires an exact version (never names, ranges, or
-tags), requires a `--reason`, then fetches and **displays the package's
+tags), then fetches and **displays the package's
 install-time lifecycle scripts** for review before asking for confirmation —
 the grant is a statement that these scripts were seen. A registry fetch
 failure refuses the grant: sight-unseen authorization is not an option. The
@@ -623,7 +623,7 @@ cause and the exact operator command to fix it.
 ## Blocklist
 
 ```bash
-safe run block add bad-package --reason "known malicious package"
+safe run block add bad-package
 safe run block remove bad-package
 safe run block list
 safe run block import ./blocked-packages.txt

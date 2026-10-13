@@ -134,13 +134,13 @@ safe_gate_resolve_run_bin() { printf '%s\n' "$fake_run"; }
 
 : >"$ARGV_LOG"
 safe_gate_warn_grant_host_allow "left-pad@1.3.0" npm >/dev/null 2>&1
-grep -q "host-allow add left-pad@1.3.0 --reason " "$ARGV_LOG" || fail "grant(npm): wrong argv: $(cat "$ARGV_LOG")"
+grep -qx "host-allow add left-pad@1.3.0" "$ARGV_LOG" || fail "grant(npm): wrong argv: $(cat "$ARGV_LOG")"
 grep -q -- "--ecosystem" "$ARGV_LOG" && fail "grant(npm): must not pass --ecosystem for npm"
-pass "grant helper builds: host-allow add <pkg> --reason <canned> (npm)"
+pass "grant helper builds: host-allow add <pkg> (npm, no reason)"
 
 : >"$ARGV_LOG"
 safe_gate_warn_grant_host_allow "cowsay==6.1" python >/dev/null 2>&1
-grep -q "host-allow add cowsay==6.1 --reason .*--ecosystem python" "$ARGV_LOG" \
+grep -qx "host-allow add cowsay==6.1 --ecosystem python" "$ARGV_LOG" \
   || fail "grant(python): expected --ecosystem python: $(cat "$ARGV_LOG")"
 pass "grant helper appends --ecosystem python for the python family"
 
@@ -202,10 +202,10 @@ grep -q "^safe: install proceeded; host-allow records standing grants only for n
 grep -q "safe: safe:" <<<"$out" && fail "F2(bin/safe): doubled prefix on cargo message: $out"
 pass "F1(bin/safe): grant refuses cargo, no safe-run call, single prefix"
 
-# F1(bin/safe): npm grant builds host-allow add <pkg> --reason, no --ecosystem
+# F1(bin/safe): npm grant builds host-allow add <pkg>, no --ecosystem
 : >"$ARGV_LOG"
 out="$(bash -c "$SRC; SAFE_RUN_PATH='$fake_run'; safe_install_warn_grant_host_allow 'left-pad@1.3.0' npm" 2>&1)"
-grep -q "host-allow add left-pad@1.3.0 --reason " "$ARGV_LOG" || fail "F1(bin/safe npm): wrong argv: $(cat "$ARGV_LOG")"
+grep -qx "host-allow add left-pad@1.3.0" "$ARGV_LOG" || fail "F1(bin/safe npm): wrong argv: $(cat "$ARGV_LOG")"
 grep -q -- "--ecosystem" "$ARGV_LOG" && fail "F1(bin/safe npm): must not pass --ecosystem"
 grep -q "^safe: recorded a host-allow grant for left-pad@1.3.0" <<<"$out" || fail "F2(bin/safe): success msg not single-prefixed: $out"
 grep -q "safe: safe:" <<<"$out" && fail "F2(bin/safe): doubled prefix on success: $out"
@@ -214,7 +214,7 @@ pass "bin/safe grant(npm): correct argv + single-prefixed success message"
 # F1(bin/safe): python grant appends --ecosystem python
 : >"$ARGV_LOG"
 bash -c "$SRC; SAFE_RUN_PATH='$fake_run'; safe_install_warn_grant_host_allow 'cowsay==6.1' python" >/dev/null 2>&1
-grep -q "host-allow add cowsay==6.1 --reason .*--ecosystem python" "$ARGV_LOG" \
+grep -qx "host-allow add cowsay==6.1 --ecosystem python" "$ARGV_LOG" \
   || fail "F1(bin/safe python): expected --ecosystem python: $(cat "$ARGV_LOG")"
 pass "bin/safe grant(python): appends --ecosystem python"
 

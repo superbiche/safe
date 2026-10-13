@@ -114,7 +114,7 @@ func privateTrust(args []string, stdinReader io.Reader, stdout, stderr io.Writer
 		}
 		r, err := privtrust.AddRegistry(stores, flags["id"], privtrust.Registry{
 			Ecosystem: flags["ecosystem"], Origin: flags["origin"], Owner: flags["owner"],
-			Namespace: multi["namespace"], Added: flags["added"], Reason: flags["reason"]})
+			Namespace: multi["namespace"], Added: flags["added"]})
 		if err != nil {
 			return fail(err)
 		}

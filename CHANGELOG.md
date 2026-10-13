@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Breaking: operator grants no longer carry a `reason` (operator ruling
+  2026-10-13). `safe run host-allow add|update`, `scripts-allow add`,
+  `block add` and `private-registry add` lose the `--reason` flag
+  entirely; entries in `host-allow.json`, `scripts-allow.json`,
+  `blocked.json` and `private-registries.json` no longer store the
+  field, and signed host-allow/registry statements no longer carry it.
+  install.sh strips the legacy key from existing stores (signed
+  statement files are left untouched — re-sign exports after followers
+  take this release, or pre-removal followers skip the entries).
+  Readers ignore a legacy `reason`. Attribution remains the append-only
+  audit log. `safe vendor update --reason` is unchanged (it annotates
+  a one-off mutation, not a standing grant).
+
 ## 1.70.0 - 2026-10-13
 
 - Policy: advisories below High severity no longer gate installs

@@ -81,7 +81,7 @@ esac
 SH
   chmod +x "$tmp/bin/curl"
 
-  add_cmd="SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' scripts-allow add left-pad@1.3.0 --reason 'needs binary fetch'"
+  add_cmd="SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' scripts-allow add left-pad@1.3.0"
   out=$(pty_run "$add_cmd" 2>&1) || fail "TTY add failed: $out"
   grep -q "postinstall: node fetch-binary.js" <<<"$out" || fail "add must display the scripts being authorized"
   grep -q "granted install scripts for left-pad@1.3.0" <<<"$out" || fail "add did not confirm the grant"
@@ -93,7 +93,7 @@ SH
   [[ "$(jq -r '.sha' <<<"$entry")" == "sha512-STUB" ]] || fail "grant entry missing integrity"
   pass "TTY add reviews scripts, snapshots them, records integrity"
 
-  out=$(pty_run "SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' scripts-allow add left-pad@^1.3.0 --reason x" 2>&1) && \
+  out=$(pty_run "SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' scripts-allow add left-pad@^1.3.0" 2>&1) && \
     fail "range spec must be rejected"
   grep -q "exact version" <<<"$out" || fail "range rejection not legible: $out"
   pass "range/tag specs rejected (exact identity only)"
@@ -348,19 +348,19 @@ case "$url" in
 esac
 SH
   chmod +x "$tmp/bin/curl"
-  out=$(pty_run "SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' scripts-allow add ghost-pkg@1.0.0 --reason x" 2>&1) && \
+  out=$(pty_run "SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' scripts-allow add ghost-pkg@1.0.0" 2>&1) && \
     fail "fetch failure must refuse the grant"
   grep -q "sight-unseen" <<<"$out" || fail "sight-unseen refusal not legible: $out"
   [[ "$(jq -r '.packages | has("ghost-pkg")' "$tmp/config/scripts-allow.json")" == "false" ]] || fail "sight-unseen grant was written"
   pass "registry fetch failure refuses the grant (no sight-unseen authorization)"
 
-  out=$(pty_run "SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' scripts-allow add int-pkg@2.0.0 --reason x" 2>&1) && \
+  out=$(pty_run "SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' scripts-allow add int-pkg@2.0.0" 2>&1) && \
     fail "integrity fetch failure must refuse the grant"
   grep -q "not bound to the reviewed artifact" <<<"$out" || fail "integrity refusal not legible: $out"
   [[ "$(jq -r '.packages | has("int-pkg")' "$tmp/config/scripts-allow.json")" == "false" ]] || fail "integrity-less grant was written"
   pass "integrity fetch failure refuses the grant"
 
-  out=$(pty_run "SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' scripts-allow add 'Not/A,Npm?Name@1.0.0' --reason x" 2>&1) && \
+  out=$(pty_run "SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' SAFE_AUDIT_DATA_DIR='$tmp/audit-data' SAFE_RUN_NO_INIT=1 PATH='$tmp/bin':\$PATH '$SAFE_RUN' scripts-allow add 'Not/A,Npm?Name@1.0.0'" 2>&1) && \
     fail "invalid npm name must be rejected"
   grep -qi "invalid package name" <<<"$out" || fail "invalid-name rejection must name the cause: $out"
   pass "invalid npm names rejected at the trust boundary (review F7)"

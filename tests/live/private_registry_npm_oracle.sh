@@ -94,7 +94,7 @@ ln -s "$real_npm" "$tmp/bin/npm"
 export PATH="$tmp/bin:$PATH"
 printf '@p:registry=%s/\n' "$origin" > "$HOME/.npmrc"
 "$SAFE_CORE_BIN" private-trust registry-add --policy "$SAFE_RUN_CONFIG_DIR/private-registries.json" --id p --ecosystem npm \
-  --origin "$origin" --namespace '@p/*' --reason live >/dev/null || fail "registry-add"
+  --origin "$origin" --namespace '@p/*' >/dev/null || fail "registry-add"
 
 rc=0
 SAFE_AUDIT_RESULT_OUT="$tmp/result.json" "$ROOT/bin/safe-audit" package-audit @p/x@1.0.0 --ecosystem npm --gate install > "$tmp/out" 2>&1 || rc=$?
