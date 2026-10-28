@@ -2745,17 +2745,16 @@ build_delta_json() {
     ([ $cur[0].cve_scan.findings[]?.id ] - [ $prev[0].cve_scan.findings[]?.id ]) | unique
   ')
 
-  jq -n \
+  jq \
     --arg previous_scan "$previous_scan" \
     --argjson added "$added" \
     --argjson removed "$removed" \
-    --argjson new_cves "$new_cves" \
-    '{
+    '. as $new_cves | {
       previous_scan: ($previous_scan | select(length > 0) // null),
       packages_added: $added,
       packages_removed: $removed,
       new_cves: $new_cves
-    }'
+    }' <<<"$new_cves"
 }
 
 # Use the same OSV severity interpretation as the counts, including older
@@ -3120,10 +3119,10 @@ build_scan_result_from_artifacts() {
   # which double counting cannot change; consumers that show a number to a
   # human show the per-source breakdown instead.
   local audit_totals_json
-  audit_totals_json=$(jq -n \
+  audit_totals_json=$(jq \
     --argjson critical "$critical" --argjson high "$high" \
     --argjson medium "$medium" --argjson low "$low" \
-    --argjson audits "$ecosystem_audits_json" '
+    '. as $audits |
     def counted: (.status // "") as $s | ($s == "ok") or ($s == "partial");
     def sum(f): ([$audits[]? | select(counted) | (f // 0)] | add) // 0;
     {
@@ -3137,13 +3136,14 @@ build_scan_result_from_artifacts() {
                   | {scanner, status, total, critical, high, medium, low, unknown: (.unknown // 0),
                      root: (.root // ".")}],
       deduplicated: false
-    }' 2>/dev/null || printf '{"critical":%s,"high":%s,"medium":%s,"low":%s,"unknown":0,"deduplicated":false}' \
+    }' <<<"$ecosystem_audits_json" 2>/dev/null || printf '{"critical":%s,"high":%s,"medium":%s,"low":%s,"unknown":0,"deduplicated":false}' \
       "$critical" "$high" "$medium" "$low")
   if jq -e '(.critical + .high + .medium + .low + (.unknown // 0)) > 0' <<<"$audit_totals_json" >/dev/null 2>&1; then
     verdict="WARN"
   fi
 
-  jq -n \
+  # Scanner payloads can exceed the OS per-argument limit; preserve them through stdin, never argv.
+  printf '%s\n' "$ecosystem_audits_json" "$source_scan_json" "$tool_status_json" "$audit_totals_json" "$findings_json" | jq -s \
     --arg machine "$machine" \
     --arg date "$(today_date)" \
     --arg timestamp "$(now_iso)" \
@@ -3162,12 +3162,8 @@ build_scan_result_from_artifacts() {
     --argjson medium "$medium" \
     --argjson low "$low" \
     --arg verdict "$verdict" \
-    --argjson ecosystem_audits "$ecosystem_audits_json" \
-    --argjson source_scan "$source_scan_json" \
-    --argjson tool_status "$tool_status_json" \
-    --argjson audit_totals "$audit_totals_json" \
-    --argjson findings "$findings_json" \
-    '{
+    '.[0] as $ecosystem_audits | .[1] as $source_scan | .[2] as $tool_status
+    | .[3] as $audit_totals | .[4] as $findings | {
       machine: $machine,
       date: $date,
       timestamp: $timestamp,
@@ -3210,7 +3206,7 @@ build_scan_result_from_artifacts() {
   # function-local rm cannot reclaim it, but the process-exit trap can.
   new_scratch_dir __scratch
   snapshot="$__scratch/snapshot"
-  jq --argjson delta "$delta_json" '. + {delta: $delta}' "$build_tmp" > "$snapshot"
+  jq --slurpfile result "$build_tmp" '. as $delta | $result[0] + {delta: $delta}' <<<"$delta_json" > "$snapshot"
   rm -f "$build_tmp"
   # Publishing is a replace of a SHARED path, so it gets the same treatment as
   # every other one: stage beside the destination, then rename. A bare `cp`

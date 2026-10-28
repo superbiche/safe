@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Preserve large repository-audit findings, scanner records and scan deltas
+  without passing bulk JSON through process arguments. Reports that exceed
+  the operating system's argument-size limit now retain their complete
+  evidence, counts and verdict instead of failing to produce a result.
+
 ## 1.71.0 - 2026-10-13
 
 - Breaking: operator grants no longer carry a `reason` (operator ruling

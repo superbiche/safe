@@ -78,3 +78,48 @@ assert_line 'LONG p forged@1 (osv)' "$TEST_ROOT/long.txt"
 jq '.cve_scan.findings=[]' "$result" > "$TEST_ROOT/clean.json"
 [[ -z $(render_scan_advisories "$TEST_ROOT/clean.json") ]] || fail 'empty advisory heading on clean scan'
 pass 'long and empty reports stay concise; identifiers cannot forge lines'
+
+# Advisory descriptions and scanner notes are unbounded upstream data. Exercise
+# each independently so a failure in one JSON argument cannot hide another.
+printf '{"results":[]}\n' > "$TEST_ROOT/empty-osv.json"
+printf '{"matches":[]}\n' > "$TEST_ROOT/empty-grype.json"
+printf '[]\n' > "$TEST_ROOT/empty-audits.json"
+jq -n '{matches:[{artifact:{name:"large",version:"1"},vulnerability:{id:"CVE-2099-9999",severity:"Critical",description:("evidence" * 25000)}}]}' > "$TEST_ROOT/large-grype.json"
+jq -n '[{scanner:"npm-audit",status:"ok",root:".",note:("evidence" * 25000),total:1,critical:1,high:0,medium:0,low:0}]' > "$TEST_ROOT/large-audits.json"
+jq -n '{status:"ok",note:("evidence" * 25000),scanned_files:1,total:0,findings:[]}' > "$TEST_ROOT/large-source.json"
+for field in findings ecosystem source; do
+  grype="$TEST_ROOT/empty-grype.json"
+  audits="$TEST_ROOT/empty-audits.json"
+  source_doc=""
+  case "$field" in
+    findings) grype="$TEST_ROOT/large-grype.json" ;;
+    ecosystem) audits="$TEST_ROOT/large-audits.json" ;;
+    source) source_doc="$TEST_ROOT/large-source.json" ;;
+  esac
+  SCAN_RESULT_OUT="$TEST_ROOT/$field-result.json"
+  build_scan_result_from_artifacts "large-$field" /fixture local-direct "$TEST_ROOT/sbom.json" "$TEST_ROOT/empty-osv.json" "$grype" "$audits" source "$source_doc" > "$TEST_ROOT/$field.txt" 2> "$TEST_ROOT/$field.err"
+  [[ ! -s "$TEST_ROOT/$field.err" ]] || fail "large $field emitted an error"
+  case "$field" in
+    findings)
+      jq -e --slurpfile input "$grype" '.verdict == "WARN" and .audit_totals.critical == 1 and .cve_scan.findings[0].summary == $input[0].matches[0].vulnerability.description' "$SCAN_RESULT_OUT" >/dev/null || fail 'large advisory evidence lost'
+      ;;
+    ecosystem)
+      jq -e --slurpfile input "$audits" '.verdict == "WARN" and .audit_totals.critical == 1 and .ecosystem_audits == $input[0]' "$SCAN_RESULT_OUT" >/dev/null || fail 'large ecosystem evidence/counts lost'
+      ;;
+    source)
+      jq -e --slurpfile input "$source_doc" '.verdict == "GO" and .source_scan == $input[0]' "$SCAN_RESULT_OUT" >/dev/null || fail 'large source evidence lost'
+      ;;
+  esac
+  pass "large $field preserves complete evidence and verdict in result-out"
+done
+
+# A long advisory-ID list must survive both delta construction and attachment.
+mkdir -p "$RESULTS_DIR/large-delta" "$SBOM_DIR/large-delta"
+printf '{"date":"1900-01-01","cve_scan":{"findings":[]}}\n' > "$RESULTS_DIR/large-delta/1900-01-01-scan.json"
+cp "$TEST_ROOT/sbom.json" "$SBOM_DIR/large-delta/1900-01-01-sbom.cdx.json"
+jq -n '{matches:[range(0;8000) | {artifact:{name:"large",version:"1"},vulnerability:{id:("CVE-2099-" + (10000000 + . | tostring)),severity:"Low"}}]}' > "$TEST_ROOT/delta-grype.json"
+SCAN_RESULT_OUT="$TEST_ROOT/delta-result.json"
+build_scan_result_from_artifacts large-delta /fixture local-direct "$TEST_ROOT/sbom.json" "$TEST_ROOT/empty-osv.json" "$TEST_ROOT/delta-grype.json" "$TEST_ROOT/empty-audits.json" deps > "$TEST_ROOT/delta.txt" 2> "$TEST_ROOT/delta.err"
+[[ ! -s "$TEST_ROOT/delta.err" ]] || fail 'large delta emitted an error'
+jq -e '.verdict == "WARN" and .audit_totals.low == 8000 and (.delta.new_cves | length) == 8000 and .delta.previous_scan == "1900-01-01" and (.cve_scan.findings | length) == 8000' "$SCAN_RESULT_OUT" >/dev/null || fail 'large delta lost findings or changed verdict'
+pass 'large scan delta preserves every advisory ID'

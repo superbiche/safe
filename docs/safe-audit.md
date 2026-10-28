@@ -217,7 +217,9 @@ critical first, with each advisory ID, affected package/version, scanner, and
 upstream summary. Entries are deduplicated by scanner, advisory ID, package, and
 version; the headline counts include repeated occurrences across scanner inputs,
 so they can exceed the number of listed entries. Multiline summaries become one line, capped at 240 characters.
-The result JSON preserves the full upstream text. If the scanner or an older
+The result JSON preserves the full upstream text. Bulk report data passes through
+stdin rather than process arguments, so large findings and scan deltas are
+not constrained by the operating system's per-argument size limit. If the scanner or an older
 cache entry supplies no summary, the report says so and still shows the ID;
 `--no-cache` refreshes old results with any descriptions supplied by the scanners.
 
