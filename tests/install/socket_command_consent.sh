@@ -50,13 +50,15 @@ safe_gate_npm_like() { [[ $SAFE_GATE_SOCKET_COMMAND_CONSENT == 0 ]] || return 99
 export SAFE_GATE_SOCKET_COMMAND_CONSENT=1
 safe_gate_main npm install a@1.0.0 || fail 'entrypoint reset'
 pass 'new wrapper command resets inherited consent'
-terminal_rc=1; calls=0; actual=0
-safe_gate_check_many npm a@1 b@1 c@1 d@1 >"$tmp/out" 2>"$tmp/err" || actual=$?
-[[ $actual == 102 && $calls == 0 ]] || fail 'batch refusal must precede audits'
-audit_rc=0
-safe_gate_check_many npm a@1 b@1 c@1 || fail 'three should fit'
-[[ $calls == 3 ]] || fail 'three audits required'
-pass 'four refuses before audit, three audits normally'
+terminal_rc=1; calls=0; actual=0; audit_rc=0
+safe_gate_check_many npm a@1.0.0 b@1.0.0 c@1.0.0 d@1.0.0 || fail 'four clean targets should pass'
+[[ $calls == 4 ]] || fail 'all four audits required'
+for audit_rc in 11 12 13 14; do
+ calls=0; actual=0
+ safe_gate_check_many npm a@1.0.0 b@1.0.0 c@1.0.0 d@1.0.0 >"$tmp/out" 2>"$tmp/err" || actual=$?
+ [[ $actual == 102 && $calls == 1 ]] || fail "audit $audit_rc must still refuse 102"
+done
+pass 'four clean targets are audited; other terminal-only outcomes still refuse 102'
 # bin/safe sibling path: function definitions only, with isolated shell options.
 export ROOT tmp
 mkdir -p "$tmp/bin"
@@ -158,10 +160,10 @@ safe_gate_mise_check_with_env '' a@1.0.0 npm || fail 'mise first package'
 safe_gate_mise_check_with_env '' b@1.0.0 npm || fail 'mise second package'
 [[ $(wc -l <"$tmp/mise-prompts") == 1 ]] || fail 'mise consent lost between isolated audits'
 pass 'mise asks once across isolated package audits'
-# Explicit targets count; configuration expansion is not an argv batch.
+# Explicit and configuration-derived targets all retain their audits.
 safe_gate_operator_terminal() { return 1; }
 safe_gate_mise_parse_sub() { SAFE_GATE_MISE_SPECS=(); SAFE_GATE_MISE_MODE=0; }
-safe_gate_mise_collect_entries() { local -n dest="$3"; dest=(a@1 b@1 c@1 d@1); }
+safe_gate_mise_collect_entries() { local -n dest="$3"; dest=(a@1.0.0 b@1.0.0 c@1.0.0 d@1.0.0); }
 safe_gate_mise_filter_excluded() { :; }
 safe_gate_mise_min_age_guard() { :; }
 safe_gate_mise_overlay_or_refuse() { SAFE_GATE_MISE_OVERLAY=''; }
@@ -169,13 +171,14 @@ safe_gate_mise_check_spec() { checks=$((checks+1)); }
 checks=0
 safe_gate_mise_gate_install install || fail 'configuration set must not count as explicit batch'
 [[ $checks == 4 ]] || fail 'configuration audits must remain complete'
-safe_gate_mise_parse_sub() { SAFE_GATE_MISE_SPECS=(a@1 b@1 c@1 d@1); SAFE_GATE_MISE_MODE=0; }
-for sub in install exec; do
+safe_gate_mise_parse_sub() { SAFE_GATE_MISE_SPECS=(a@1.0.0 b@1.0.0 c@1.0.0 d@1.0.0); SAFE_GATE_MISE_MODE=0; }
+for sub in install upgrade use exec; do
  checks=0; actual=0
- "safe_gate_mise_gate_$sub" "$sub" >"$tmp/out" 2>"$tmp/err" || actual=$?
- [[ $actual == 102 && $checks == 0 ]] || fail "mise $sub explicit batch must refuse before audits"
+ gate_sub="$sub"; [[ "$sub" == upgrade ]] && gate_sub=install
+ "safe_gate_mise_gate_$gate_sub" "$sub" >"$tmp/out" 2>"$tmp/err" || actual=$?
+ [[ $actual == 0 && $checks == 4 ]] || fail "mise $sub must audit all four explicit targets"
 done
-pass 'mise explicit install/exec batch refuses before audits, configured set stays audited'
+pass 'mise explicit install/upgrade/use/exec and configured sets audit all four targets'
 # Inner preflight cannot import consent from mise's arbitrary environment overlay.
 safe_gate_mise_parse_sub() { SAFE_GATE_MISE_SPECS=(); SAFE_GATE_MISE_CMD=(npm install a@1.0.0); SAFE_GATE_MISE_CTX=(); }
 safe_gate_mise_exec_auto_install_enabled() { return 1; }

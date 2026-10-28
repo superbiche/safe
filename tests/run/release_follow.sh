@@ -37,13 +37,19 @@ printf '{"follow":{"signers":["%s"]}}\n' "$fingerprint" > "$SAFE_RUN_CONFIG_DIR/
 checkout="$tmp/checkout"
 origin="$tmp/origin.git"
 git clone --quiet --no-hardlinks "$ROOT" "$checkout"
-cp "$ROOT/bin/safe" "$checkout/bin/safe"
-cp "$ROOT/install.sh" "$checkout/install.sh"
 git init --bare --quiet "$origin"
 git -C "$checkout" remote set-url origin "$origin"
 git -C "$checkout" config user.name 'L7 test'
 git -C "$checkout" config user.email l7@example.invalid
 git -C "$checkout" config commit.gpgSign false
+# Exercise one coherent tracked candidate, including uncommitted release
+# metadata. Overlaying only the CLI mixed its new version with HEAD's old
+# VERSION and made the pre-commit release gate fail before testing followers.
+git -C "$ROOT" diff --binary HEAD -- | git -C "$checkout" apply --allow-empty
+git -C "$checkout" add -u
+if ! git -C "$checkout" diff --cached --quiet; then
+  git -C "$checkout" commit --quiet -m 'fixture tracked working-tree candidate'
+fi
 # The clone carries the repository's real tags; the fixture must not collide
 # with them, so strip every tag before building the ladder.
 git -C "$checkout" tag -l | xargs -r git -C "$checkout" tag -d

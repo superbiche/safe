@@ -2757,14 +2757,6 @@ safe_gate_operator_terminal() {
      -z "${CLAUDECODE:-}" && -z "${OPENCODE:-}" ]]
 }
 
-safe_gate_batch_limit() {
-  (( $1 <= 3 )) && return 0
-  if ! safe_gate_operator_terminal; then
-    safe_gate_err "safe: BLOCKED install — $1 requested packages exceeds the unattended maximum of 3; hand the complete command with exact pinned versions to the operator for an interactive terminal; do not split the task into smaller commands; details: safe explain"
-    return 102
-  fi
-}
-
 safe_gate_confirm_socket_command() {
   local reply
   safe_gate_err "safe: Socket is rate-limited. Approval covers missing Socket scores for this install command only; other security checks remain active."
@@ -3454,7 +3446,6 @@ safe_gate_check_many() {
   shift
   local package
 
-  safe_gate_batch_limit "$#" || return $?
   for package in "$@"; do
     safe_gate_check "${package}" "${ecosystem}" || return $?
   done
@@ -4456,11 +4447,6 @@ safe_gate_npm_like() {
       install|i|it|install-test|add|ci|update|u|up|upgrade|udpate|dedupe|ddp|prune) ;;
       *) (( npm_lockdiff_lane == 0 )) || safe_gate_exec_real "${tool}" "$@" ;;
     esac
-  fi
-
-  if [[ "${npm_class}" != "ci" ]]; then
-    safe_gate_collect raw "$("${parser}" "${rest[@]}")"
-    safe_gate_batch_limit "${#raw[@]}" || return $?
   fi
 
   if [[ "${tool}" == "npm" ]]; then
@@ -6418,7 +6404,6 @@ safe_gate_mise_gate_install() {
   local sub="$1"
   shift
   safe_gate_mise_parse_sub "$sub" "$@" || return $?
-  safe_gate_batch_limit "${#SAFE_GATE_MISE_SPECS[@]}" || return $?
 
   local -a specs=("${SAFE_GATE_MISE_SPECS[@]+"${SAFE_GATE_MISE_SPECS[@]}"}")
   if (( ${#specs[@]} == 0 )); then
@@ -6462,7 +6447,6 @@ safe_gate_mise_gate_use() {
   fi
   # `use` honors --minimum-release-age too: without the guard it audited an
   # unconstrained target while mise selected an older one (delta-2 F3).
-  safe_gate_batch_limit "${#SAFE_GATE_MISE_SPECS[@]}" || return $?
   safe_gate_mise_min_age_guard "${SAFE_GATE_MISE_SPECS[@]}" || return $?
   safe_gate_mise_overlay_or_refuse || return $?
   local spec
@@ -6487,7 +6471,6 @@ safe_gate_mise_exec_auto_install_enabled() {
 
 safe_gate_mise_gate_exec() {
   safe_gate_mise_parse_sub exec "$@" || return $?
-  safe_gate_batch_limit "${#SAFE_GATE_MISE_SPECS[@]}" || return $?
 
   local -a audit=("${SAFE_GATE_MISE_SPECS[@]+"${SAFE_GATE_MISE_SPECS[@]}"}")
   local -a cmd=("${SAFE_GATE_MISE_CMD[@]+"${SAFE_GATE_MISE_CMD[@]}"}")

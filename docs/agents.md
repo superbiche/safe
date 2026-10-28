@@ -182,8 +182,8 @@ and its `to allow:` command to the operator verbatim, and never bypass
 (no direct node_modules/.bin calls, alternate installers, or curl|sh).
 Suspected false positive: `safe report-fp <spec>`.
 ALWAYS use exact pinned package versions in installs and operator handoffs;
-NEVER use @latest, moving tags, ranges or unversioned targets. Maximum 3
-requested packages per unattended task; hand larger tasks to the operator
-without splitting them or manufacturing a TTY to obtain consent.
+NEVER use @latest, moving tags, ranges or unversioned targets.
+Any number of exact pinned targets may be requested in one command. Never
+manufacture a TTY, clear agent markers or answer operator-only prompts.
 ```
 <!-- END GENERATED: harness-snippet -->

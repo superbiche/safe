@@ -228,6 +228,18 @@ grep -Fq "INSTALL_UNATTENDED_GREEN" "$tmp/unattended-followed-grant-data/audit.l
   fail "a followed grant must never log the green token"
 pass "safe install proceeds without a terminal on a clean GO and on a followed operator-signed grant"
 
+large_install_output="$(PATH="$shim:$PATH" SAFE_CONFIG_DIR="$tmp/large-config" \
+  "$shim/safe" install -g a@1.0.0 b@1.0.0 c@1.0.0 d@1.0.0 </dev/null)"
+for spec in a@1.0.0 b@1.0.0 c@1.0.0 d@1.0.0; do
+  grep -Fq $'safe-audit\tpackage-audit\t'"$spec" <<<"$large_install_output" || fail "large safe install did not audit $spec"
+done
+grep -Fq $'npm\tinstall\t-g\ta@1.0.0\tb@1.0.0\tc@1.0.0\td@1.0.0' <<<"$large_install_output" || fail "large safe install did not reach installer"
+refusal_case large-infra 102 11 'audit infrastructure is unavailable' --yes -g a@1.0.0 b@1.0.0 c@1.0.0 d@1.0.0
+refusal_case large-socket-consent 102 13 'fresh release inside the Socket window' --yes -g a@1.0.0 b@1.0.0 c@1.0.0 d@1.0.0
+refusal_case large-pending 102 14 'Socket score for the fresh release is still pending' --yes -g a@1.0.0 b@1.0.0 c@1.0.0 d@1.0.0
+refusal_case large-block 104 20 'safe: BLOCKED npm install of a@1.0.0' --yes -g a@1.0.0 b@1.0.0 c@1.0.0 d@1.0.0
+pass "large safe install audits and delegates clean pins while preserving audit refusals"
+
 # --- safe install project mode ---------------------------------------------
 # No package spec + a manifest in cwd = bulk audit of the project's dependency
 # evidence. Audits only: it must never run a package manager.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SAFE_VERSION="1.71.0"
+SAFE_VERSION="1.71.1"
 # Exported at the top level, not per-subcommand: safe-audit pins itself to
 # this version, and every route that reaches it — the gate, `safe audit ...`,
 # `safe install`, the safe-audit compatibility command — must carry it or the
@@ -3731,7 +3731,6 @@ cmd_install() {
 
   [[ "${#audit_packages[@]}" -gt 0 ]] || die "usage: safe install --host [package-manager flags...] <pkg> [...]"
 
-  safe_gate_batch_limit "${#audit_packages[@]}" || return $?
   ecosystem="$(safe_install_ecosystem "$manager")"
   case "$manager" in
     composer) safe_install_scan_target_flags composer "${manager_args[@]}" ;;

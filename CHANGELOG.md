@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.71.1 - 2026-10-28
+
+- Remove the three-package limit for unattended install commands. Any number
+  of exact pinned targets now reaches the normal audits and installer; audit
+  refusals, operator-terminal consent and grant requirements remain active.
+
 - Preserve large repository-audit findings, scanner records and scan deltas
   without passing bulk JSON through process arguments. Reports that exceed
   the operating system's argument-size limit now retain their complete

@@ -826,12 +826,21 @@ case_refusal_message_contract() {
   pass "$FUNCNAME"
 }
 
-case_batch_limit_and_socket_rate_nontty() {
-  prepare_case "batch-limit"
-  SAFE_INSTALL_TEST_SCRIPT='npm install a@1.0.0 b@1.0.0 c@1.0.0 d@1.0.0' run_zsh
-  assert_status 102 "$FUNCNAME" || return
-  assert_err_contains_fragment 'maximum of 3' "$FUNCNAME" || return
-  [[ ! -s "$LOG_FILE" ]] || { fail "$FUNCNAME: audit ran before batch refusal"; return; }
+case_large_pinned_install_and_socket_rate_nontty() {
+  local command tool spec
+  for command in 'pnpm add' 'yarn add' 'bun add' 'pip install' 'uv pip install --python fixture-python'; do
+    tool="${command%% *}"
+    prepare_case "large-pinned-${tool}"
+    local -a specs=(a@1.0.0 b@1.0.0 c@1.0.0 d@1.0.0)
+    [[ "$tool" == pip || "$tool" == uv ]] && specs=(a==1.0.0 b==1.0.0 c==1.0.0 d==1.0.0)
+    SAFE_INSTALL_TEST_SCRIPT="${command} ${specs[*]}" run_zsh
+    assert_status 0 "$FUNCNAME ($tool)" || return
+    for spec in "${specs[@]}"; do
+      grep -Fq $'AUDIT\tpackage-audit\t'"${spec/==/@}"$'\t' "$LOG_FILE" || { fail "$FUNCNAME ($tool): missing audit for $spec"; return; }
+    done
+    local targets="${specs[*]}"
+    grep -Fq $'REAL\t'"${command// /$'\t'}"$'\t'"${targets// /$'\t'}" "$LOG_FILE" || { fail "$FUNCNAME ($tool): missing installer targets"; return; }
+  done
   prepare_case "socket-rate-nontty"
   SAFE_INSTALL_TEST_SCRIPT='npm install -g ratelimit@1.0.0' run_zsh
   assert_status 102 "$FUNCNAME" || return
@@ -6668,7 +6677,7 @@ main() {
     case_gate_lib_missing_fails_closed \
     case_wrapper_passthrough_is_cheap \
     case_refusal_message_contract \
-    case_batch_limit_and_socket_rate_nontty \
+    case_large_pinned_install_and_socket_rate_nontty \
     case_infra_only_warn_no_host_allow_and_needs_a_tty \
     case_npm_exec_fetch_audits \
     case_npm_exec_local_bin_passthrough \
