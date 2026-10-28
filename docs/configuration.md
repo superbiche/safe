@@ -91,8 +91,17 @@ operator-TTY writes through `safe run private-registry`); see
 `install-known.json` is machine-written by `safe audit package-audit --gate install`:
 one entry per `ecosystem:name` recording the pinned resolved version that
 passed a clean version-aware check, the reasons, and a pointer to the check
-receipt. It smooths the install gate only (offline/timeout fallback within
-`install.auto_allow_ttl_days`); no `safe run` exec path consults it. Operator
+receipt. Its `approvals` map also retains exact ecosystem/name/version/source
+consent from gate confirmations independently of the latest audit evidence.
+Later audits still run, but reuse that consent without another terminal prompt;
+revoking stale clean evidence does not erase an operator decision. Removing the
+corresponding `approvals` entry withdraws that local consent. Legacy
+`packages` receipts cannot prove operator presence and grant no install consent. Source identity binds the effective registry
+selectors, not a content digest: replaced bytes under the same registry version
+are not detected by this consent store. Package-manager integrity checks remain
+responsible for artifact integrity. Clean evidence still supports the separate
+offline/timeout fallback within `install.auto_allow_ttl_days`; no `safe run`
+exec path consults install consent. Operator
 host-execution trust stays in `host-allow.json`, which is TTY-gated and
 unchanged.
 

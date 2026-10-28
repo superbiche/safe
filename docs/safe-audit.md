@@ -610,9 +610,10 @@ it to a normal verdict (Y) or a consented proceed (n); a non-interactive
 shell receives the operator-TTY refusal instead. A sixth code, **exit 14**,
 means GO with a still-pending Socket score (`GO_PENDING_SOCKET` receipt): not
 all-green, so unattended shells refuse 102 and an interactive terminal
-confirms as before. A seventh code, **exit 15**, means a WARN passed via a
-host-allow entry or `auto_allow_tolerate` — a deliberate grant, not an
-all-green check: same terminal requirement, never the unattended proceed.
+confirms as before. Current local host-allow and standing tolerated WARN decisions use **exit 22**,
+`ALLOWED_VIA_LOCAL_APPROVAL`, and proceed unattended without claiming green.
+Prior source-bound gate confirmations also use 22 on later audits, including
+mise install followed by mise use. Legacy auditors used exit 15 for WARN passes.
 An eighth code, **exit 16**, replaces 13, 14 and 15 when the exact resolved
 version is covered by a followed operator-signed grant: the operator accepted
 that version on the exporting machine, so the follower installs it unattended
@@ -620,8 +621,8 @@ that version on the exporting machine, so the follower installs it unattended
 log, both naming origin and signer). See
 [Followed grants at the install gate](safe-run.md#followed-grants-at-the-install-gate).
 A ninth code, **exit 17**, means BLOCK covered by an operator override
-recorded on this host (`host-allow add --accept-block`): the operator
-confirms at the terminal, unattended shells refuse 102. A followed grant whose
+recorded on this host (`host-allow add --accept-block`). Current auditors
+resolve local approval to exit 22 without another terminal confirmation. A followed grant whose
 origin recorded such an override clears the BLOCK as exit 16. See
 [BLOCK overrides](safe-run.md#block-overrides).
 A further gate-only code, **exit 21**, replaces 13, 14, 15 and a one-version
@@ -655,7 +656,8 @@ proceed:
 - **GO** proceeds and records the pinned resolved version in
   `~/.config/safe/run/install-known.json` (machine-written evidence with a
   pointer to the check receipt) — no operator terminal involved.
-- **WARN** proceeds only when a pinned `host-allow` entry matches the
+- **WARN** proceeds when prior source-bound gate consent applies, a followed
+  allowance applies, a pinned `host-allow` entry matches the
   **resolved** version, or when every WARN cause is listed in the opt-in
   `install.auto_allow_tolerate` config and no advisory affects the resolved
   version. Otherwise it refuses with an actionable, always-pinned hint —
@@ -700,7 +702,8 @@ proceed:
   (`<pkg>@<version>` installs once; `record <pkg>@<version>` also records an
   advisory-only override); a BLOCK without one exact version prints the pin
   hint. An override recorded on this host that covers every blocking advisory
-  is exit 17.
+  now uses exit 22. A prior exact local approval also covers advisory-only
+  BLOCKs; malware, blocklist and supply-chain BLOCKs remain enforced.
 
 A Socket scoring failure (missing CLI, auth, rate limit) is reported as an
 infrastructure failure with a recovery path (`socket login`, `safe doctor`),

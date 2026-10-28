@@ -429,9 +429,11 @@ exact version, the gate names the evidence and asks the operator to type
 advisory-only BLOCK on npm/python, `record <pkg>@<version>` (also runs
 `safe run host-allow add --accept-block`, `BLOCK_TTY_OVERRIDE_RECORD`).
 Anything else refuses 100. A BLOCK covered by an override recorded on this
-host is gate exit 17: a `[y/N]` confirm at the terminal, 102 without one.
-`mise` defers both to its parent's terminal. Agents and non-interactive shells
-keep the unchanged 104 refusal. See
+host now proceeds as gate exit 22 (`ALLOWED_VIA_LOCAL_APPROVAL`), without
+another terminal prompt. Prior exact host-allow or source-bound gate consent
+also covers advisory-only BLOCKs. Malware, blocklist and supply-chain BLOCKs
+retain the 104 refusal unattended and their deliberate operator override.
+Mise consumes the same reusable approval as the other wrappers. See
 [BLOCK overrides](safe-run.md#block-overrides).
 
 A WARN caused solely by Socket rate limiting has gate-only exit 12. The
@@ -451,3 +453,18 @@ its normal audit and refusal paths; package count alone requires no terminal.
 ALWAYS pin exact versions in agent installs and operator handoffs; NEVER use
 `@latest`, moving tags, ranges or unversioned package targets. Lockfile installs
 retain their exact resolved versions without listing transitives on the CLI.
+
+Local exact host-allow grants, standing tolerated WARNs and source-bound gate
+confirmations proceed without duplicate approval (gate exit 22). Audits still
+run; reused approval never becomes a clean GO. This covers a later mise use
+of the same approved registry package. Changing the version, ecosystem or
+source does not inherit a gate confirmation. Direct host confirmations retain consent for a single resolved source-bound
+artifact; command-wide missing-signal permission still expires with the command. See
+[configuration](configuration.md) for consent storage and artifact identity limits.
+
+Reusable install consent is minted only by an operator-terminal receipt path;
+recognized agent sessions and headless callers cannot create it. Historical
+install-known verdicts without that provenance are not migrated as grants.
+Followed host-allow pins retain their ledger/signer revocation checks and never
+become independent local pins. A successful Socket Y recheck retains consent
+only after the recheck allows the install, so a later cache miss does not ask again.

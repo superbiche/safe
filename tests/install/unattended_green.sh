@@ -287,4 +287,15 @@ for seq in '21 15' '21 14'; do
 done
 pass "a followed install allowance never carries a neighbour past the terminal"
 
+# Local authority must pass the final CLI confirmation and stay per-package.
+: >"$tmp/gate-log"; : >"$tmp/confirm-log"
+rc="$(AUDIT_RC=22 WITH_YES=0 PACKAGES='accepted@1.0.0' run_cmd_install)"
+[[ "$rc" == 0 && ! -s "$tmp/confirm-log" ]] || fail "local approval did not bypass duplicate final confirmation"
+grep -q 'INSTALL_UNATTENDED_LOCAL_APPROVAL' "$tmp/gate-log" || fail "local approval lost its own token"
+grep -q 'INSTALL_UNATTENDED_GREEN' "$tmp/gate-log" && fail "local approval claimed green"
+: >"$tmp/gate-log"; : >"$tmp/confirm-log"; rm -f "$tmp/mixed-calls"
+rc="$(AUDIT_RC=seq AUDIT_SEQ='22 14' WITH_YES=0 PACKAGES='accepted@1.0.0 pending@2.0.0' run_cmd_install)"
+[[ "$rc" == 102 ]] || fail "local approval carried a pending neighbour"
+pass "local approval passes final confirmation without carrying another artifact"
+
 printf 'unattended-green: all cases passed\n'

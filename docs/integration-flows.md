@@ -99,7 +99,9 @@ Flow:
    gate-only exit 21) likewise proceeds unattended in place of 13, 14, 15
    and a one-version WARN, but never in place of a BLOCK. At an
    operator terminal a BLOCK on one exact version takes a typed override; an
-   override recorded on this host is gate-only exit 17 (terminal confirm).
+   existing local exact approval uses gate-only exit 22 without another prompt.
+   Gate confirmations bind the package source as well as ecosystem and version;
+   malware, blocklist and supply-chain BLOCKs stay enforced.
    A name on an operator-authorized private registry is decided by the
    private lane instead: trusted when npm fetches it from its origin, it
    proceeds unattended (gate-only exit 18), asks the operator (19) or

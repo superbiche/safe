@@ -239,3 +239,30 @@ safe_test_setup_isolation() {
   safe_test_assert_isolated_paths || return 1
   trap 'safe_test_cleanup' EXIT
 }
+
+# Synthetic operator terminal for receipt fixtures only. Never runs a package
+# manager or touches the real HOME; no parent agent markers are modified.
+safe_test_operator_receipt_fixture() {
+  python3 - "$@" <<'PY'
+import os, pathlib, pty, subprocess, sys
+assert sys.argv[1].endswith('/bin/safe-audit') and sys.argv[2] == 'record-installed'
+root = pathlib.Path(os.environ['SAFE_TEST_ROOT']).resolve()
+for name in ('HOME', 'SAFE_RUN_CONFIG_DIR', 'SAFE_AUDIT_DATA_DIR'):
+    if os.environ.get(name):
+        assert pathlib.Path(os.environ[name]).resolve().is_relative_to(root), name
+env = {k: os.environ[k] for k in ('PATH', 'HOME', 'SAFE_RUN_CONFIG_DIR',
+       'SAFE_AUDIT_DATA_DIR', 'SAFE_RUN_TRUST_OVERRIDE') if k in os.environ}
+if os.environ.get('SAFE_TEST_OPERATOR_AGENT_MARKER'):
+    env['CODEX_CI'] = 'fixture-agent'
+master, slave = pty.openpty()
+result = subprocess.run(sys.argv[1:], env=env, stdin=slave, stdout=slave, stderr=slave)
+os.close(slave)
+try:
+    while data := os.read(master, 65536):
+        sys.stdout.buffer.write(data)
+except OSError:
+    pass
+os.close(master)
+sys.exit(result.returncode)
+PY
+}

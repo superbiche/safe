@@ -584,7 +584,7 @@ run_check \
   MOCK_OSV_MATCH_VERSION=2.1.4 \
   MOCK_SOCKET_MODE=ok \
   -- brace-expansion --ecosystem npm --op update --gate install
-if expect_status 15 "pinned host-allow entry matches the RESOLVED version of an unversioned spec"; then
+if expect_status 22 "pinned host-allow entry matches the RESOLVED version of an unversioned spec"; then
   pass "pinned host-allow entry matches the RESOLVED version of an unversioned spec"
 fi
 if expect_grep "$ERR_FILE" 'host-allow entry brace-expansion@2\.1\.4 matches' "override notice names the pin"; then
@@ -669,7 +669,7 @@ run_check \
   MOCK_OSV_FIXTURE="$fixture" \
   -- brace-expansion@2.1.4 --ecosystem npm --gate install
 mv "$MOCKBIN/socket.hidden" "$MOCKBIN/socket"
-if expect_status 15 "auto_allow_tolerate opt-in yields the tolerated WARN pass (terminal required, 2026-09-22)"; then
+if expect_status 22 "auto_allow_tolerate opt-in yields the tolerated WARN pass (prior authorization reused)"; then
   pass "auto_allow_tolerate opt-in allows the tolerated cause"
 fi
 if jq -e '.packages["npm:brace-expansion"].verdict == "WARN_TOLERATED"' \
@@ -1083,7 +1083,7 @@ run_check \
   MOCK_OSV_MATCH_VERSION=2.1.4 \
   MOCK_SOCKET_MODE=ok \
   -- brace-expansion@2.1.4 --ecosystem npm --gate install
-if expect_status 15 "pinned host-allow still permits this invocation (terminal required, 2026-09-22)"; then
+if expect_status 22 "pinned host-allow still permits this invocation (prior authorization reused)"; then
   pass "pinned host-allow still permits this invocation"
 fi
 if jq -e '.packages["npm:brace-expansion"] == null' "$CASE_RUN_CONFIG/install-known.json" >/dev/null 2>&1; then
@@ -3675,6 +3675,61 @@ if jq -e '.verdict == "GO" and .spec == "brace-expansion@2.1.4"' "$OUT_FILE" >/d
 else
   fail "the check alias audits the requested spec and emits the verdict"
 fi
+
+# Local gate consent survives adverse receipt revocation and source/version changes.
+prepare_case local-consent-reuse
+fixture="$(osv_fixture_affecting_high)"
+result="$CASE_DIR/result.json"
+run_check MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 MOCK_SOCKET_MODE=ok SAFE_AUDIT_RESULT_OUT="$result" \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 10 "first adverse install needs consent"; then pass "first adverse install needs consent"; fi
+HOME="$CASE_HOME" SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" \
+  safe_test_operator_receipt_fixture "$SAFE_AUDIT" record-installed --result "$result" --verdict WARN_TTY_OVERRIDE --source-id implicit-default > /dev/null
+for attempt in 1 2; do
+  run_check MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" MOCK_OSV_FIXTURE="$fixture" \
+    MOCK_OSV_MATCH_VERSION=2.1.4 MOCK_SOCKET_MODE=ok \
+    -- brace-expansion@2.1.4 --ecosystem npm --gate install
+  if expect_status 22 "local consent reused after adverse audit $attempt"; then pass "local consent reused after adverse audit $attempt"; fi
+done
+run_check MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" MOCK_OSV_FIXTURE="$(osv_fixture_affecting_critical)" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 22 "operator acceptance covers later non-malware critical advisories on this identity"; then pass "operator acceptance covers later non-malware critical advisories on this identity"; fi
+run_check MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --registry https://changed.example --gate install
+if expect_status 10 "different source cannot inherit consent"; then pass "different source cannot inherit consent"; fi
+run_check MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION=5.0.1 MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@5.0.1 --ecosystem npm --gate install
+if expect_status 10 "different version cannot inherit consent"; then pass "different version cannot inherit consent"; fi
+printf '{"packages":{"brace-expansion":{"ecosystem":"npm","version":"2.1.4"}}}\n' > "$CASE_RUN_CONFIG/host-allow.json"
+run_check MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --registry https://changed.example --gate install
+if expect_status 15 "public host-allow does not silently authorize a changed registry artifact"; then pass "public host-allow does not silently authorize a changed registry artifact"; fi
+rm "$CASE_RUN_CONFIG/host-allow.json"
+# An already-recorded pending-score confirmation is reusable after upgrade.
+jq '.packages["npm:brace-expansion"] = {version:"2.1.4",source:"implicit-default",verdict:"GO_PENDING_CONFIRMED"} | del(.approvals)' \
+  "$CASE_RUN_CONFIG/install-known.json" > "$CASE_DIR/legacy.json"
+mv "$CASE_DIR/legacy.json" "$CASE_RUN_CONFIG/install-known.json"
+run_check MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 10 "legacy receipt without operator provenance cannot grant consent"; then pass "legacy receipt without operator provenance cannot grant consent"; fi
+if jq -e '(.approvals["npm:brace-expansion"] // []) | length == 0' "$CASE_RUN_CONFIG/install-known.json" >/dev/null; then
+  pass "legacy evidence is not silently promoted to durable approval"
+else fail "legacy evidence is not silently promoted to durable approval"; fi
+
+printf '{"gate_exit":10,"ecosystem":"npm","package":"brace-expansion","resolved_versions":["2.1.4"]}\n' > "$result"
+HOME="$CASE_HOME" SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" \
+  safe_test_operator_receipt_fixture "$SAFE_AUDIT" record-installed --result "$result" --verdict WARN_TTY_OVERRIDE --source-id implicit-default >/dev/null
+fixture="$(osv_fixture_malware)"
+run_check MOCK_REGISTRY_FIXTURE="$FIXTURES/packument.json" MOCK_OSV_FIXTURE="$fixture" \
+  MOCK_OSV_MATCH_VERSION=2.1.4 MOCK_SOCKET_MODE=ok \
+  -- brace-expansion@2.1.4 --ecosystem npm --gate install
+if expect_status 20 "malware still blocks a locally approved identity"; then pass "malware still blocks a locally approved identity"; fi
 
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

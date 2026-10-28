@@ -303,21 +303,21 @@ pass "a confirmed override is recorded for fleet follow; a decline records nothi
 PLUMB_DIR="$tmp/plumb"
 mkdir -p "$PLUMB_DIR/run"
 printf '{"gate_exit":13,"ecosystem":"npm","package":"fresh","resolved_versions":["0.9.0"],"warn_causes":[]}\n' > "$PLUMB_DIR/result13.json"
-SAFE_RUN_CONFIG_DIR="$PLUMB_DIR/run" SAFE_AUDIT_DATA_DIR="$PLUMB_DIR/audit" \
-  "$ROOT/bin/safe-audit" record-installed --result "$PLUMB_DIR/result13.json" \
+SAFE_RUN_TRUST_OVERRIDE=1 SAFE_RUN_CONFIG_DIR="$PLUMB_DIR/run" SAFE_AUDIT_DATA_DIR="$PLUMB_DIR/audit" \
+  safe_test_operator_receipt_fixture "$ROOT/bin/safe-audit" record-installed --result "$PLUMB_DIR/result13.json" \
     --verdict GO_SOCKET_DECLINED --source-id implicit-default >/dev/null 2>&1 \
   || fail "plumbing: a consent-declined install was not recorded"
 jq -e '.packages["npm:fresh"] | .version == "0.9.0" and .verdict == "GO_SOCKET_DECLINED" and .source == "implicit-default"' \
   "$PLUMB_DIR/run/install-known.json" >/dev/null || fail "plumbing: recorded entry differs"
 for bad in "GO" "WARN_TTY_OVERRIDE"; do
-  SAFE_RUN_CONFIG_DIR="$PLUMB_DIR/run" SAFE_AUDIT_DATA_DIR="$PLUMB_DIR/audit" \
-    "$ROOT/bin/safe-audit" record-installed --result "$PLUMB_DIR/result13.json" \
+  SAFE_RUN_TRUST_OVERRIDE=1 SAFE_RUN_CONFIG_DIR="$PLUMB_DIR/run" SAFE_AUDIT_DATA_DIR="$PLUMB_DIR/audit" \
+    safe_test_operator_receipt_fixture "$ROOT/bin/safe-audit" record-installed --result "$PLUMB_DIR/result13.json" \
       --verdict "$bad" --source-id implicit-default >/dev/null 2>&1 \
     && fail "plumbing: verdict $bad accepted for a gate_exit-13 document"
 done
 printf '{"gate_exit":10,"ecosystem":"npm","package":"multi","resolved_versions":["1.0.0","1.0.1"]}\n' > "$PLUMB_DIR/result-multi.json"
-SAFE_RUN_CONFIG_DIR="$PLUMB_DIR/run" SAFE_AUDIT_DATA_DIR="$PLUMB_DIR/audit" \
-  "$ROOT/bin/safe-audit" record-installed --result "$PLUMB_DIR/result-multi.json" \
+SAFE_RUN_TRUST_OVERRIDE=1 SAFE_RUN_CONFIG_DIR="$PLUMB_DIR/run" SAFE_AUDIT_DATA_DIR="$PLUMB_DIR/audit" \
+  safe_test_operator_receipt_fixture "$ROOT/bin/safe-audit" record-installed --result "$PLUMB_DIR/result-multi.json" \
     --verdict WARN_TTY_OVERRIDE --source-id implicit-default >/dev/null 2>&1 \
   && fail "plumbing: a multi-version document was recorded"
 jq -e '.packages | has("npm:multi") | not' "$PLUMB_DIR/run/install-known.json" >/dev/null \

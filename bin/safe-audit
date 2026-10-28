@@ -10,7 +10,7 @@ SAFE_AUDIT_VERSION="0.3.0"
 # and a conditional pin silently does not apply (delta review F2). It knows
 # its own release and only defers to an inherited value when one exists.
 # Guarded against the VERSION file by tests/contract/drift.sh.
-SAFE_VERSION="${SAFE_VERSION:-1.71.1}"
+SAFE_VERSION="${SAFE_VERSION:-1.72.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
@@ -7972,6 +7972,37 @@ mark_install_known() {
     }' "$INSTALL_KNOWN_FILE" > "$tmp" && mv "$tmp" "$INSTALL_KNOWN_FILE"
 }
 
+# Durable local consent is separate from the latest audit evidence. Refreshing
+# or revoking a clean receipt must not erase a deliberate operator decision.
+local_install_approval_matches() {
+  local ecosystem="$1" name="$2" version="$3" file
+  trust_grant_ok "install approval" || return 1
+  file="$(trust_store_file install-known.json)"
+  [[ -f "$file" ]] || return 1
+  jq -e --arg k "$ecosystem:$name" --arg v "$version" --arg src "$(source_identity)" '
+    ((.approvals[$k] // []) | any(.[]; .version == $v and .source == $src))
+
+  ' "$file" >/dev/null 2>&1
+}
+
+record_local_install_approval() {
+  local ecosystem="$1" name="$2" version="$3" file tmp
+  trust_grant_ok "install approval" || return 1
+  file="$(trust_store_file install-known.json)"
+  mkdir -p "$(dirname "$file")" || return 1
+  [[ -f "$file" ]] || printf '{"packages":{}}\n' > "$file"
+  tmp=$(mktemp "$file.XXXXXX") || return 1
+  if jq --arg k "$ecosystem:$name" --arg v "$version" --arg src "$(source_identity)" '
+    .approvals[$k] = (((.approvals[$k] // [])
+      | map(select(.version != $v or .source != $src)))
+      + [{version: $v, source: $src}])
+  ' "$file" > "$tmp" && mv "$tmp" "$file"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
 # Operator-pinned host-allow entry matching every version whose evidence the
 # caller asks it to override. The schema stores one exact version, so a single
 # pin can never authorize adverse evidence attached to multiple versions.
@@ -8014,6 +8045,14 @@ host_allow_matches_resolved() {
   done
   HOST_ALLOW_RESOLVED_VERSION="$entry_version"
   return 0
+}
+
+# A followed pin keeps the verified ledger/signer's authority and revocation.
+# Its store copy must never be promoted into an independent local grant.
+local_host_allow_matches_resolved() {
+  host_allow_matches_resolved "$@" || return 1
+  jq -e --arg p "$2" '(.packages[$p].followed_from // "") == ""' \
+    "$(trust_store_file host-allow.json)" >/dev/null 2>&1
 }
 
 # Followed operator-signed grant (operator direction 2026-09-29): a host-allow
@@ -8269,6 +8308,11 @@ scripts_allow_matches_resolved() {
 # a custom-source install is never recorded as default-source evidence.
 # Usage: record-installed --result <file> --verdict <token> --source-id <id>
 record_installed_command() {
+  if [[ ! -t 0 || ! -t 1 || -n "${CODEX_THREAD_ID:-}" || -n "${CODEX_CI:-}" ||
+        -n "${CLAUDECODE:-}" || -n "${OPENCODE:-}" ]]; then
+    printf 'safe audit: BLOCKED record-installed — reusable consent requires the operator terminal; agents must ask the operator to accept the exact artifact; details: safe explain\n' >&2
+    return 102
+  fi
   local result_file="" verdict="" source_id=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -8282,8 +8326,16 @@ record_installed_command() {
   local want_gate_exit
   case "$verdict" in
     WARN_TTY_OVERRIDE) want_gate_exit=10 ;;
-    GO_SOCKET_DECLINED) want_gate_exit=13 ;;
+    INFRA_TTY_OVERRIDE) want_gate_exit=11 ;;
+    SOCKET_RATE_LIMIT_COMMAND_OVERRIDE) want_gate_exit=12 ;;
+    GO_SOCKET_DECLINED|GO_SOCKET_CONFIRMED) want_gate_exit=13 ;;
     GO_PENDING_CONFIRMED) want_gate_exit=14 ;;
+    TOLERATED_WARN_TTY_OVERRIDE) want_gate_exit=15 ;;
+    RECORDED_BLOCK_OVERRIDE_TTY) want_gate_exit=17 ;;
+    BLOCK_TTY_OVERRIDE)
+      jq -e '.block.class == "advisory"' "$result_file" >/dev/null 2>&1 \
+        || die "record-installed: malware or non-advisory BLOCK is not reusable"
+      want_gate_exit=20 ;;
     *) die "record-installed: verdict not recordable here: ${verdict:-<empty>}" ;;
   esac
   case "$source_id" in
@@ -8305,7 +8357,14 @@ record_installed_command() {
     || die "record-installed: result has no resolved version"
   reasons_json=$(jq -cn --arg v "$verdict" --slurpfile doc "$result_file" \
     '[($v | ascii_downcase)] + (($doc[0].warn_causes // []) | map(tostring))')
-  mark_install_known "$ecosystem" "$name" "$version" "$verdict" "$reasons_json" ""
+  # Preserve the original receipt/export behavior for existing outcomes.
+  # New consent tokens belong only to the approval map, not latest evidence.
+  case "$verdict" in
+    WARN_TTY_OVERRIDE|GO_SOCKET_DECLINED|GO_PENDING_CONFIRMED)
+      mark_install_known "$ecosystem" "$name" "$version" "$verdict" "$reasons_json" "" ;;
+  esac
+  record_local_install_approval "$ecosystem" "$name" "$version" \
+    || die "cannot record reusable local install approval"
   printf '[safe audit] recorded gate-confirmed install: %s:%s@%s (%s)\n' \
     "$ecosystem" "$name" "$version" "$verdict" >&2
 }
@@ -10056,6 +10115,7 @@ package_audit_command() {
   result_json="$CHECKS_DIR/$(today_date)-$(slugify "$PKG_NAME")-${version_slug}.json"
   jq -n \
     --arg timestamp "$(now_iso)" \
+    --arg source_identity "$(source_identity)" \
     --arg spec "$spec" \
     --arg op "$op" \
     --arg ecosystem "$ecosystem" \
@@ -10088,6 +10148,7 @@ package_audit_command() {
     --slurpfile osv "$osv_json" '
     {
       timestamp: $timestamp,
+      source_identity: $source_identity,
       spec: $spec,
       package: $package,
       op: $op,
@@ -10222,6 +10283,13 @@ package_audit_command() {
     local policy auto_allow gate_exit=-1
     policy=$(install_policy_json)
     auto_allow=$(jq -r 'if .auto_allow == false then "false" else "true" end' <<<"$policy")
+    local local_approved=0
+    if (( resolution_ok )) && [[ "$(jq -r 'unique | length' <<<"$resolved_versions_json")" == 1 ]] \
+      && local_install_approval_matches "$ecosystem" "$PKG_NAME" "$primary_version"; then
+      local_approved=1
+      record_local_install_approval "$ecosystem" "$PKG_NAME" "$primary_version" \
+        || die "cannot preserve reusable local install approval"
+    fi
     case "$verdict" in
       GO)
         # A followed operator-signed grant stands in for the two GO termini
@@ -10487,6 +10555,41 @@ package_audit_command() {
         fi
         ;;
     esac
+    # The operator accepts an artifact once. Keep the underlying verdict and
+    # findings visible; only remove a duplicate approval terminus. Malware,
+    # blocklist and supply-chain BLOCKs never enter this lane.
+    local reusable=0
+    case "$gate_exit" in
+      10|11|12|13|14)
+        if (( local_approved )); then
+          reusable=1
+        elif (( resolution_ok )) && [[ "$(jq -r 'unique | length' <<<"$resolved_versions_json")" == 1 ]] \
+          && [[ "$(source_identity)" == implicit-default ]] \
+          && local_host_allow_matches_resolved "$ecosystem" "$PKG_NAME" "$primary_version"; then
+          reusable=1
+        fi
+        ;;
+      20)
+        if [[ "$block_class" == advisory ]] && (( resolution_ok )) \
+          && [[ "$(jq -r 'unique | length' <<<"$resolved_versions_json")" == 1 ]]; then
+          if (( local_approved )) || { [[ "$(source_identity)" == implicit-default ]] \
+            && local_host_allow_matches_resolved "$ecosystem" "$PKG_NAME" "$primary_version"; }; then
+            reusable=1
+          fi
+        fi
+        ;;
+      15|17)
+        if (( local_approved )) || { [[ "$(source_identity)" == implicit-default ]] \
+          && { [[ -z "${HOST_ALLOW_RESOLVED_VERSION:-}" ]] \
+            || local_host_allow_matches_resolved "$ecosystem" "$PKG_NAME" "$HOST_ALLOW_RESOLVED_VERSION"; }; }; then
+          reusable=1
+        fi
+        ;;
+    esac
+    if (( reusable )); then
+      printf '[safe audit] ALLOWED_VIA_LOCAL_APPROVAL: %s@%s already accepted; no second confirmation\n' "$PKG_NAME" "$primary_version" >&2
+      gate_exit=22
+    fi
     if (( gate_exit >= 0 )); then
       # The install gates read the decided result (resolved version, block
       # class and advisories) from SAFE_AUDIT_RESULT_OUT to put the BLOCK
