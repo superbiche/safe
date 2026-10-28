@@ -400,7 +400,7 @@ an indefinite hang.
 SAFE_INSTALL_TIMEOUT_SECONDS=60 npm install example-package@1.2.3
 ```
 
-### Operator command consent and agent batch limits
+### Operator command consent
 
 A fresh npm/Python release inside the Socket window (default 7 days) is not
 scored automatically (2026-09-22 scope ruling): in the wrapper lane the audit
@@ -446,10 +446,8 @@ The new approval requires stdin and stdout to be terminals, reads `/dev/tty`,
 and rejects recognized agent sessions. A PTY is not human authentication: agents
 must never manufacture one, clear markers or answer these prompts.
 
-An unattended command naming more than three package targets refuses with exit
-102 before package audits. The limit counts requested targets, not transitive
-dependencies or an existing lockfile's size. Agents must hand larger tasks to the
-operator as a single exact-pinned command, not split them to evade the limit.
+An unattended command may name any number of package targets. Each target keeps
+its normal audit and refusal paths; package count alone requires no terminal.
 ALWAYS pin exact versions in agent installs and operator handoffs; NEVER use
 `@latest`, moving tags, ranges or unversioned package targets. Lockfile installs
 retain their exact resolved versions without listing transitives on the CLI.

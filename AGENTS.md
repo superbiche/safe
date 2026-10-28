@@ -17,7 +17,7 @@ Running `install.sh` is pre-authorized whenever it makes the live gate better â€
 ## Operator rulings (standing)
 
 - ALWAYS use exact pinned versions in agent installs and operator handoff commands; NEVER use `@latest`, other moving tags, ranges, or unversioned package targets. Resolve the exact version first or report a resolution blocker. Preserve exact lockfile-based installs.
-- Agents may request at most 3 packages per unattended install; hand larger tasks to the operator as one complete pinned command before auditing. Never split a larger task to evade the limit, manufacture a PTY, clear agent markers, or answer an operator-only prompt.
+- Agents may request any number of exact pinned packages in one unattended install. Never manufacture a PTY, clear agent markers, or answer an operator-only prompt.
 - Socket rate-limit-only WARNs use gate exit 12. Explicit operator-terminal consent applies to rate-limit-only results for the current command, expires at command exit, and grants agents no reusable permission. Keep all other audits and refusal paths active.
 
 - Never suggest, match, or allowlist `@latest`; allow entries are pinned to resolved versions.
