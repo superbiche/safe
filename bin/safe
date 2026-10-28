@@ -2784,9 +2784,9 @@ safe_install_confirm_warn() {
 
   err "${package} — safe audit returned WARN: a finding about the package (see the report above), not an audit-infrastructure outage."
   if safe_install_ecosystem_grant_capable "$ecosystem"; then
-    printf 'safe: override deliberately? [y] install once  [a] install and allow future reinstalls  [N] cancel: ' >&2
+    printf 'safe: override deliberately? [y] accept this exact artifact  [a] accept and grant host execution  [N] cancel: ' >&2
   else
-    printf 'safe: override deliberately? [y] install once  [N] cancel: ' >&2
+    printf 'safe: override deliberately? [y] accept this exact artifact  [N] cancel: ' >&2
   fi
   if ! IFS= read -r reply </dev/tty; then
     return 1

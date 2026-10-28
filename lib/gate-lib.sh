@@ -2899,7 +2899,7 @@ safe_gate_warn_grant_host_allow() {
 # `once` or `record <name>@<version>`; returns non-zero otherwise.
 safe_gate_confirm_block() {
   local ecosystem="$1" result="$2"
-  local target class ids reply recordable=0
+  local target class ids reply recordable=0 action="install once despite the BLOCK"
   target="$(jq -r 'if (.package | type) == "string" and (.resolved_versions | length) == 1
     then "\(.package)@\(.resolved_versions[0])" else empty end' "${result}" 2>/dev/null)" || target=""
   class="$(jq -r '.block.class // empty' "${result}" 2>/dev/null)" || class=""
@@ -2908,6 +2908,8 @@ safe_gate_confirm_block() {
   case "${class}" in
     advisory)
       safe_gate_err "safe: ${target} is BLOCKED: critical advisories affect this exact version (${ids})."
+      action="accept this exact artifact"
+      safe_gate_err "safe: acceptance of this exact version and source is reused for future installs."
       safe_gate_ecosystem_grant_capable "${ecosystem}" && recordable=1
       ;;
     malware)
@@ -2919,9 +2921,9 @@ safe_gate_confirm_block() {
     *) return 1 ;;
   esac
   if (( recordable )); then
-    printf "safe: type %s to install once, or 'record %s' to install and record the override (signed exports carry it to followed hosts); anything else cancels: " "${target}" "${target}" >&2
+    printf "safe: type %s to accept this exact artifact, or 'record %s' to also record a host-allow override (signed exports carry it to followed hosts); anything else cancels: " "${target}" "${target}" >&2
   else
-    printf 'safe: type %s to install once despite the BLOCK; anything else cancels: ' "${target}" >&2
+    printf 'safe: type %s to %s; anything else cancels: ' "${target}" "${action}" >&2
   fi
   IFS= read -r reply </dev/tty || return 1
   if [[ "${reply}" == "${target}" ]]; then

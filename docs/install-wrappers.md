@@ -361,7 +361,7 @@ operator a deliberate override rather than only the host-allow copy-paste. Any
 other infra-only WARN (every cause an audit-infrastructure outage, with no package
 finding — gate exit `11`)
 prompts a one-shot confirmation; an adverse WARN (a real package finding)
-prints it and offers `[y]` install once / `[a]` install and record a standing
+prints it and offers `[y]` accept this exact artifact / `[a]` accept and record a standing
 host-allow grant (npm/python only) / `[N]` cancel. The override reads
 `/dev/tty`, never stdin, so a non-interactive caller (agent, CI, `mise upgrade`
 without `--raw`) always refuses with the hint instead — `--yes` cannot reach
@@ -425,7 +425,7 @@ logs `ALLOWED_VIA_FOLLOWED_INSTALL`. See
 A BLOCK (104) has an operator override at an interactive terminal (2026-09-30
 rulings), in every wrapper lane and `safe install`: when the audit resolved one
 exact version, the gate names the evidence and asks the operator to type
-`<pkg>@<version>` (install once, `BLOCK_TTY_OVERRIDE`) or, for an
+`<pkg>@<version>` (reusable advisory acceptance; other BLOCK classes install once, `BLOCK_TTY_OVERRIDE`) or, for an
 advisory-only BLOCK on npm/python, `record <pkg>@<version>` (also runs
 `safe run host-allow add --accept-block`, `BLOCK_TTY_OVERRIDE_RECORD`).
 Anything else refuses 100. A BLOCK covered by an override recorded on this
