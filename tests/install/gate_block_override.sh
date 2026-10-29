@@ -72,6 +72,10 @@ case "$LANE" in
     SAFE_AUDIT_PATH="$tmp/audit-stub"
     cat > "$SAFE_AUDIT_PATH" <<'AUDIT'
 #!/usr/bin/env bash
+case "$1" in
+  effective-sources) printf implicit-default; exit 0 ;;
+  record-installed) exit 0 ;;
+esac
 [[ -z "${SAFE_AUDIT_RESULT_OUT:-}" || -z "${TEST_RESULT:-}" ]] || printf '%s\n' "$TEST_RESULT" > "$SAFE_AUDIT_RESULT_OUT"
 printf '%s\n' "${SAFE_AUDIT_RESULT_OUT:-none}" > "$tmp/result-path"
 exit "$TEST_AUDIT_RC"

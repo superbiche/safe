@@ -372,7 +372,7 @@ grep -q 'auto_allow_tolerate' "$CASE_ERR" && pass 'the skip names the way to run
 prepare_case disabled-tolerated
 printf '{"install":{"cooldown_days":0,"auto_allow_tolerate":["socket_disabled"],"socket":{"mode":"never","cache_ttl_days":7}}}\n' > "$CASE_RUN_CONFIG/config.json"
 run_check clean --gate install
-expect_rc 15 'a declared skip posture is a tolerated WARN pass (terminal required, 2026-09-22)'
+expect_rc 22 'a declared skip posture is a tolerated WARN pass (local authority reused)'
 [[ "$(socket_calls)" == "0" ]] && pass 'tolerated skip still makes no Socket request' || fail 'tolerated skip still makes no Socket request'
 
 # Maven has no Socket tier (ticket #145), and since the 2026-09-22 scope
@@ -615,7 +615,7 @@ fi
 prepare_case not-found-gate-tolerated
 printf '{"install":{"cooldown_days":0,"socket":{"mode":"always","cache_ttl_days":7},"auto_allow_tolerate":["socket_not_found"]}}\n' > "$CASE_RUN_CONFIG/config.json"
 run_check not-found --gate install --op install
-expect_rc 15 'a tolerated socket_not_found pass requires a terminal (2026-09-22)'
+expect_rc 22 'a tolerated socket_not_found pass reuses local authority'
 
 # A tolerated socket outage must NOT drag not_found through, and vice versa:
 # tolerating socket_error alone still refuses a not_found.
@@ -671,7 +671,7 @@ multi_project
 printf '{"install":{"cooldown_days":0,"socket":{"mode":"always","cache_ttl_days":7},"auto_allow_tolerate":["socket_not_found"]}}\n' \
   > "$CASE_RUN_CONFIG/config.json"
 run_multi sibling-not-found --gate install
-expect_rc 15 'a ranged tolerated pass requires a terminal (2026-09-22)'
+expect_rc 22 'a ranged tolerated pass reuses local authority'
 
 # Regression: a SINGLE-version install whose primary itself warned is still
 # host-allowable by an exact pin — the fix must not close the legitimate lane
@@ -680,7 +680,7 @@ prepare_case single-host-allow-primary-pin-covers
 printf '{"packages":{"fixture":{"version":"1.0.0","sha":"x","ecosystem":"npm","added":"2026-08-01","reason":"exact pin"}}}\n' \
   > "$CASE_RUN_CONFIG/host-allow.json"
 run_check not-found --gate install --op install
-expect_rc 15 'a host-allow covered primary warn requires a terminal (2026-09-22)'
+expect_rc 22 'a host-allow covered primary warn reuses local authority'
 if grep -q 'matches every warned resolved version' "$CASE_ERR"; then
   pass 'the single-version pin is honored'
 else
@@ -757,7 +757,7 @@ seed_followed_grant 1.0.0 "" "[\"$FOLLOW_SIGNER\"]" "$FRESH_AUTO"
 jq 'del(.packages.fixture.followed_from, .packages.fixture.followed_generation)' \
   "$CASE_RUN_CONFIG/host-allow.json" > "$CASE/ha.json" && mv "$CASE/ha.json" "$CASE_RUN_CONFIG/host-allow.json"
 run_check clean MOCK_RELEASE_FRESH=1 --gate install --op install
-expect_rc 15 'a local host-allow pin keeps the terminal requirement'
+expect_rc 22 'a local host-allow pin reuses local authority'
 
 # followed_from in the store is a label, not authority: without the ledger
 # identity the pass stays a terminal decision.
@@ -880,7 +880,7 @@ seed_followed_grant 1.0.0 "" '[]' "$BLOCK_INSTALL"
 drop_follow_label
 seed_block_override '["GHSA-aaaa","GHSA-bbbb"]'
 run_check clean MOCK_OSV_CRITICAL=GHSA-aaaa --gate install --op install
-expect_rc 17 'a local recorded override covers the BLOCK behind a terminal confirm'
+expect_rc 22 'a local recorded override covers the BLOCK without duplicate confirmation'
 grep -q 'recorded on this host' "$CASE_ERR" \
   && pass 'the audit names the recorded override' || fail 'the audit names the recorded override'
 
@@ -932,7 +932,7 @@ drop_follow_label
 seed_block_override '["GHSA-aaaa"]'
 ledger_block_override '["GHSA-aaaa"]'
 run_check clean MOCK_OSV_CRITICAL=GHSA-aaaa --gate install --op install
-expect_rc 17 'a local override never rides a WARN-era ledger identity unattended'
+expect_rc 22 'a local override uses local authority, never a WARN-era followed identity'
 
 prepare_case block-override-new-advisory
 seed_followed_grant 1.0.0 "$(follow_ledger '["fixture@1.0.0"]' "$FOLLOW_SIGNER")" "[\"$FOLLOW_SIGNER\"]" "$BLOCK_INSTALL"

@@ -2815,9 +2815,9 @@ safe_gate_confirm_warn() {
 
   safe_gate_err "safe: ${package} — safe audit returned WARN: a finding about the package (see the report above), not an audit-infrastructure outage."
   if safe_gate_ecosystem_grant_capable "${ecosystem}"; then
-    printf 'safe: override deliberately? [y] install once  [a] install and allow future reinstalls  [N] cancel: ' >&2
+    printf 'safe: override deliberately? [y] accept this exact artifact  [a] accept and grant host execution  [N] cancel: ' >&2
   else
-    printf 'safe: override deliberately? [y] install once  [N] cancel: ' >&2
+    printf 'safe: override deliberately? [y] accept this exact artifact  [N] cancel: ' >&2
   fi
   if ! IFS= read -r reply </dev/tty; then
     return 1
@@ -2899,7 +2899,7 @@ safe_gate_warn_grant_host_allow() {
 # `once` or `record <name>@<version>`; returns non-zero otherwise.
 safe_gate_confirm_block() {
   local ecosystem="$1" result="$2"
-  local target class ids reply recordable=0
+  local target class ids reply recordable=0 action="install once despite the BLOCK"
   target="$(jq -r 'if (.package | type) == "string" and (.resolved_versions | length) == 1
     then "\(.package)@\(.resolved_versions[0])" else empty end' "${result}" 2>/dev/null)" || target=""
   class="$(jq -r '.block.class // empty' "${result}" 2>/dev/null)" || class=""
@@ -2908,6 +2908,8 @@ safe_gate_confirm_block() {
   case "${class}" in
     advisory)
       safe_gate_err "safe: ${target} is BLOCKED: critical advisories affect this exact version (${ids})."
+      action="accept this exact artifact"
+      safe_gate_err "safe: acceptance of this exact version and source is reused for future installs."
       safe_gate_ecosystem_grant_capable "${ecosystem}" && recordable=1
       ;;
     malware)
@@ -2919,9 +2921,9 @@ safe_gate_confirm_block() {
     *) return 1 ;;
   esac
   if (( recordable )); then
-    printf "safe: type %s to install once, or 'record %s' to install and record the override (signed exports carry it to followed hosts); anything else cancels: " "${target}" "${target}" >&2
+    printf "safe: type %s to accept this exact artifact, or 'record %s' to also record a host-allow override (signed exports carry it to followed hosts); anything else cancels: " "${target}" "${target}" >&2
   else
-    printf 'safe: type %s to install once despite the BLOCK; anything else cancels: ' "${target}" >&2
+    printf 'safe: type %s to %s; anything else cancels: ' "${target}" "${action}" >&2
   fi
   IFS= read -r reply </dev/tty || return 1
   if [[ "${reply}" == "${target}" ]]; then
@@ -2976,6 +2978,7 @@ safe_gate_block_terminus() {
     fi
     if safe_gate_confirm_recorded_block "${package}"; then
       safe_gate_audit_log "${ecosystem}" "${package}" "RECORDED_BLOCK_OVERRIDE_TTY"
+      safe_gate_mark_installed "$package" "$ecosystem" "$result" RECORDED_BLOCK_OVERRIDE_TTY
       return 0
     fi
     safe_gate_err "safe: BLOCKED ${label} of ${package} — recorded BLOCK override and you declined; details: safe explain"
@@ -2995,7 +2998,10 @@ safe_gate_block_terminus() {
   case "${choice}" in
     once)
       safe_gate_audit_log "${ecosystem}" "${package}" "BLOCK_TTY_OVERRIDE"
-      safe_gate_err "safe: installing ${package} despite the BLOCK by your override (this install only)."
+      if jq -e '.block.class == "advisory"' "${result}" >/dev/null 2>&1; then
+        safe_gate_mark_installed "${package}" "${ecosystem}" "${result}" BLOCK_TTY_OVERRIDE
+      fi
+      safe_gate_err "safe: installing ${package} despite the BLOCK by your override."
       return 0
       ;;
     record\ *)
@@ -3158,6 +3164,8 @@ safe_gate_private_terminus() {
 # $1=package spec as audited, $2=tool ecosystem, $3=result doc, $4=token.
 safe_gate_mark_installed() {
   local package="$1" ecosystem="$2" result_out="$3" verdict="$4"
+  # Also covers the CLI's final command confirmation in this same invocation.
+  SAFE_INSTALL_LOCAL_APPROVAL=1
   [[ -n "${result_out}" && -r "${result_out}" ]] || return 0
   safe_gate_audit_available || return 0
   command -v jq >/dev/null 2>&1 || return 0
@@ -3183,15 +3191,37 @@ safe_gate_mark_installed() {
   [[ -n "${sel_userconfig}" ]] && es_args+=(--npm-userconfig "${sel_userconfig}")
   [[ -n "${sel_globalconfig}" ]] && es_args+=(--npm-globalconfig "${sel_globalconfig}")
   local source_id
-  if ! source_id="$("${SAFE_GATE_AUDIT_BIN}" effective-sources "${es_args[@]}" 2>/dev/null)" \
+  source_id=$(jq -r '.source_identity // empty' "$result_out" 2>/dev/null) || source_id=""
+  if [[ -z "$source_id" ]] && ! source_id="$("${SAFE_GATE_AUDIT_BIN}" effective-sources "${es_args[@]}" 2>/dev/null)" \
      || [[ -z "${source_id}" ]]; then
     safe_gate_err "safe: could not record the confirmed install of ${package} for fleet follow (no source identity); the install proceeds"
     return 0
   fi
   "${SAFE_GATE_AUDIT_BIN}" record-installed --result "${result_out}" \
-    --verdict "${verdict}" --source-id "${source_id}" >/dev/null 2>&1 \
+    --verdict "${verdict}" --source-id "${source_id}" 2>/dev/null \
     || safe_gate_err "safe: could not record the confirmed install of ${package} for fleet follow; the install proceeds"
   return 0
+}
+
+# Retain the original consent document across the recheck's temp-file cleanup.
+# The approval is minted only after that recheck allows the install, and only
+# by record-installed's operator-terminal path. A failed check mints nothing.
+safe_gate_socket_recheck() {
+  local package="$1" ecosystem="$2" result="$3" snapshot="" rc=0
+  shift 3
+  if [[ -s "$result" ]]; then
+    snapshot=$(mktemp "${TMPDIR:-/tmp}/safe-consent-result.XXXXXX") || snapshot=""
+    if [[ -n "$snapshot" ]] && ! cp -- "$result" "$snapshot"; then
+      rm -f -- "$snapshot"
+      snapshot=""
+    fi
+  fi
+  "$@" || rc=$?
+  if (( rc == 0 )) && [[ -n "$snapshot" ]]; then
+    safe_gate_mark_installed "$package" "$ecosystem" "$snapshot" GO_SOCKET_CONFIRMED
+  fi
+  [[ -z "$snapshot" ]] || rm -f -- "$snapshot"
+  return "$rc"
 }
 
 # Check one package via safe audit's install gate.
@@ -3278,8 +3308,9 @@ safe_gate_check() {
       # A mise package audit runs under an isolated env/cwd. Defer only this
       # decision to its parent so the consent lasts across sibling packages.
       [[ "${3:-}" == defer-socket-consent ]] && return 12
-      safe_gate_accept_socket_rate_limit "$package" "$ecosystem"
-      return $?
+      safe_gate_accept_socket_rate_limit "$package" "$ecosystem" || return $?
+      safe_gate_mark_installed "$package" "$ecosystem" "$result_out" SOCKET_RATE_LIMIT_COMMAND_OVERRIDE
+      return 0
       ;;
     11)
       # Infra-only WARN: every cause is an audit-tier outage, NOT a package
@@ -3297,6 +3328,7 @@ safe_gate_check() {
       if [[ -t 0 && -t 1 ]]; then
         if safe_gate_confirm_infra "${package}"; then
           safe_gate_audit_log "${ecosystem}" "${package}" "INFRA_TTY_OVERRIDE"
+          safe_gate_mark_installed "$package" "$ecosystem" "$result_out" INFRA_TTY_OVERRIDE
           return 0
         fi
         safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — audit infrastructure is unavailable (not a package finding) and you declined to proceed without it; fix it (socket login / wait / safe doctor) and retry; details: safe explain"
@@ -3332,7 +3364,8 @@ safe_gate_check() {
       if safe_gate_confirm_socket_consent "${package}"; then
         safe_gate_audit_log "${ecosystem}" "${package}" "SOCKET_CONSENT_GRANTED"
         SAFE_GATE_CONSENT_RECURSION=1 SAFE_AUDIT_SOCKET_CONSENT=granted \
-          safe_gate_check "${package}" "${ecosystem}" "${3:-}"
+          safe_gate_socket_recheck "$package" "$ecosystem" "$result_out" \
+            safe_gate_check "${package}" "${ecosystem}" "${3:-}"
         return $?
       fi
       safe_gate_err "safe: ${package} — Socket check declined for this install; proceeding on advisories, blocklist and release age."
@@ -3374,6 +3407,7 @@ safe_gate_check() {
       fi
       if safe_gate_confirm_tolerated "${package}"; then
         safe_gate_audit_log "${ecosystem}" "${package}" "TOLERATED_WARN_TTY_OVERRIDE"
+        safe_gate_mark_installed "$package" "$ecosystem" "$result_out" TOLERATED_WARN_TTY_OVERRIDE
         return 0
       fi
       safe_gate_err "safe: BLOCKED ${ecosystem} install of ${package} — tolerated WARN and you declined; details: safe explain"
@@ -3387,6 +3421,10 @@ safe_gate_check() {
       # the WARN, consent or pending state was. Not a green check: it keeps
       # its own decision token. The audit named origin and signer.
       safe_gate_audit_log "${ecosystem}" "${package}" "ALLOWED_VIA_FOLLOWED_GRANT"
+      return 0
+      ;;
+    22)
+      safe_gate_audit_log "${ecosystem}" "${package}" "ALLOWED_VIA_LOCAL_APPROVAL"
       return 0
       ;;
     21)
@@ -5712,7 +5750,9 @@ safe_gate_mise_check_with_env() {
     safe_gate_block_terminus "${audit_rc}" "${pkg}" "${eco}" "${eco} install" "${SAFE_GATE_RESULT_OUT:-}"
     return $?
   elif (( audit_rc == 12 )); then
-    safe_gate_accept_socket_rate_limit "$pkg" "$eco"
+    safe_gate_accept_socket_rate_limit "$pkg" "$eco" || return $?
+    safe_gate_mark_installed "$pkg" "$eco" "${SAFE_GATE_RESULT_OUT:-}" SOCKET_RATE_LIMIT_COMMAND_OVERRIDE
+    return 0
   elif (( audit_rc == 15 )); then
     # Tolerated/host-allowed WARN deferred by the child: operator confirms at
     # this terminal, no re-audit needed.
@@ -5723,6 +5763,7 @@ safe_gate_mise_check_with_env() {
     fi
     if safe_gate_confirm_tolerated "${pkg}"; then
       safe_gate_audit_log "${eco}" "${pkg}" "TOLERATED_WARN_TTY_OVERRIDE"
+      safe_gate_mark_installed "$pkg" "$eco" "${SAFE_GATE_RESULT_OUT:-}" TOLERATED_WARN_TTY_OVERRIDE
       return 0
     fi
     safe_gate_err "safe: BLOCKED mise install of ${pkg} — tolerated WARN and you declined; details: safe explain"
@@ -5762,7 +5803,8 @@ safe_gate_mise_check_with_env() {
     if safe_gate_confirm_socket_consent "${pkg}"; then
       safe_gate_audit_log "${eco}" "${pkg}" "SOCKET_CONSENT_GRANTED"
       SAFE_GATE_CONSENT_RECURSION=1 SAFE_AUDIT_SOCKET_CONSENT=granted \
-        safe_gate_mise_check_with_env "$overlay" "$pkg" "$eco" "$installer"
+        safe_gate_socket_recheck "$pkg" "$eco" "${SAFE_GATE_RESULT_OUT:-}" \
+          safe_gate_mise_check_with_env "$overlay" "$pkg" "$eco" "$installer"
       return $?
     fi
     safe_gate_err "safe: ${pkg} — Socket check declined for this install; proceeding on advisories, blocklist and release age."

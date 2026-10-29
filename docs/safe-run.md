@@ -453,9 +453,11 @@ signed statements.
 A BLOCK has an operator override too (operator rulings 2026-09-30). At an
 operator terminal, when the audit resolved one exact version, the install gate
 names the evidence and asks the operator to type `<pkg>@<version>`; that
-installs once and records nothing. A BLOCK without one exact version (an
+accepts an advisory-only artifact for later source-bound install reuse.
+Malware, blocklist and integrity BLOCK overrides install once and record nothing. A BLOCK without one exact version (an
 unresolved or ranged spec) still refuses 104 with a hint to pin one. Off a
-terminal, and for every agent, a BLOCK refuses 104 exactly as before.
+terminal, an unapproved BLOCK refuses 104. Prior exact local approval can
+cover advisory-only BLOCKs; malware, blocklist and integrity BLOCKs stay enforced.
 
 An advisory-only BLOCK — critical advisories on the resolved version, no
 malware record, no Socket critical supply-chain alert, no blocklist entry —
@@ -474,9 +476,11 @@ covers an install only while every blocking advisory is one it accepted: a new
 advisory, another version, or a malware or blocklist signal asks again.
 `host-allow update` drops it, and `host-allow list` shows it.
 
-On the host that recorded it, a covered BLOCK is gate exit 17: the operator
-confirms at the terminal (`RECORDED_BLOCK_OVERRIDE_TTY`), unattended shells
-refuse 102. Signed exports carry the override as an optional per-entry field
+On the host that recorded it, current auditors resolve the approval to gate
+exit 22 (`ALLOWED_VIA_LOCAL_APPROVAL`), without another terminal prompt.
+Prior exact local host-allow or source-bound gate consent also covers new
+advisory-only findings on that identity; it never covers malware or blocklist
+signals. The narrower accepted-advisory list remains the signed override's scope. Signed exports carry the override as an optional per-entry field
 (schema unchanged), and a follower pinned at that version from that origin
 takes changes to it — added, widened or dropped — on the next `follow`. On a
 follower the covered BLOCK installs unattended as a followed grant (exit 16,
@@ -492,7 +496,8 @@ same `exported_at` instant is a collision, refused without changing the ledger,
 so an older statement of that second cannot be replayed to restore a withdrawn
 override. `follow --dry-run` prints the `would-set-block-override` /
 `would-drop-block-override` changes. An override present only in the store (a
-local pin, or a stale copy) stays a terminal decision (exit 17). Followers on
+local pin, or a stale copy) can authorize a local install as exit 22; it
+never claims a followed decision (16). Followers on
 an older safe ignore the field and keep refusing.
 
 Malware and blocklist BLOCKs are overridable per install only. They are never

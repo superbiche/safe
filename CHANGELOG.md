@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.72.0 - 2026-10-29
+
+- Reuse local exact host-allow grants and source-bound operator install
+  confirmations across installs and mise use, without duplicate terminal
+  approval. Keep approval provenance operator-only, retain followed-grant
+  revocation, and preserve malware, supply-chain and integrity blocking.
+
 ## 1.71.1 - 2026-10-28
 
 - Remove the three-package limit for unattended install commands. Any number
