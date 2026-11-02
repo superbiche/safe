@@ -28,7 +28,7 @@ sig = "104ef611705e9bdb"
 [[bindings]]
 doc = "docs/configuration.md"
 target = "bin/safe-run"
-sig = "16af42f3c62d81ba"
+sig = "618cc11998c8a265"
 
 [[bindings]]
 doc = "docs/dependencies.md"
@@ -48,7 +48,7 @@ sig = "f8cccce6a5faf41c"
 [[bindings]]
 doc = "docs/install-wrappers.md"
 target = "lib/gate-lib.sh"
-sig = "6d484df6de33a8a3"
+sig = "80981eab71dc5cb3"
 
 [[bindings]]
 doc = "docs/installation.md"
@@ -68,12 +68,12 @@ sig = "f8cccce6a5faf41c"
 [[bindings]]
 doc = "docs/integration-flows.md"
 target = "lib/gate-lib.sh"
-sig = "6d484df6de33a8a3"
+sig = "80981eab71dc5cb3"
 
 [[bindings]]
 doc = "docs/operations.md"
 target = "bin/safe-run"
-sig = "16af42f3c62d81ba"
+sig = "618cc11998c8a265"
 
 [[bindings]]
 doc = "docs/private-registries.md"
@@ -83,7 +83,7 @@ sig = "104ef611705e9bdb"
 [[bindings]]
 doc = "docs/private-registries.md"
 target = "bin/safe-run"
-sig = "16af42f3c62d81ba"
+sig = "618cc11998c8a265"
 
 [[bindings]]
 doc = "docs/private-registries.md"
@@ -103,7 +103,7 @@ sig = "777d4d9bbd15aa2a"
 [[bindings]]
 doc = "docs/private-registries.md"
 target = "lib/gate-lib.sh"
-sig = "6d484df6de33a8a3"
+sig = "80981eab71dc5cb3"
 
 [[bindings]]
 doc = "docs/safe-audit.md"
@@ -118,7 +118,7 @@ sig = "06592133c2df48cf"
 [[bindings]]
 doc = "docs/safe-run.md"
 target = "bin/safe-run"
-sig = "16af42f3c62d81ba"
+sig = "618cc11998c8a265"
 
 [[bindings]]
 doc = "docs/tools-scan.md"

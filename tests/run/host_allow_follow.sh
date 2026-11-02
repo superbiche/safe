@@ -56,7 +56,7 @@ cat > "$SAFE_RUN_CONFIG_DIR/install-known.json" <<'JSON'
 }}
 JSON
 pty_run() {
-  python3 -c 'import pty,sys,os; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' "$@"
+  env -u CODEX_THREAD_ID -u CODEX_CI -u CLAUDECODE -u OPENCODE python3 -c 'import pty,sys,os; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' "$@"
 }
 expect_rc() {
   local expected="$1"; shift

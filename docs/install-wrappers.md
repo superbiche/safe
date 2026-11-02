@@ -363,8 +363,8 @@ finding — gate exit `11`)
 prompts a one-shot confirmation; an adverse WARN (a real package finding)
 prints it and offers `[y]` accept this exact artifact / `[a]` accept and record a standing
 host-allow grant (npm/python only) / `[N]` cancel. The override reads
-`/dev/tty`, never stdin, so a non-interactive caller (agent, CI, `mise upgrade`
-without `--raw`) always refuses with the hint instead — `--yes` cannot reach
+`/dev/tty`, never stdin, so a non-interactive caller (an agent, CI, or a parent
+that does not hand the terminal over as stdin) always refuses with the hint instead — `--yes` cannot reach
 it. See the [Agent Contract](agents.md).
 
 Every gate prompt uses one operator-terminal test: stdin is a terminal and no
@@ -373,7 +373,12 @@ recognized agent session is running (`CODEX_THREAD_ID`, `CODEX_CI`,
 parent captures them — a script that runs `uv sync` through
 `subprocess.run(..., capture_output=True)` — the prompt and the finding it asks
 about are written to `/dev/tty`, so the operator can still override instead of
-meeting an unanswerable `102`.
+meeting an unanswerable `102`. In that captured-output mode the gate also
+copies its stderr — audit reports, BLOCK and WARN explanations, refusals — onto
+`/dev/tty` while the parent keeps receiving the unchanged stream, and shows the
+repo-audit report on the terminal when stdout is captured. `safe run host-allow
+add` (the `[a]` grant and the BLOCK `record` path) uses the same
+operator-terminal test.
 
 ## Snapshot-stripped shells are no longer a special case
 

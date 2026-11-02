@@ -353,7 +353,7 @@ case_operator_terminal_helpers_match_between_gates() {
   # operator-terminal predicate and prompt writer. Both copies must stay
   # byte-identical or the two install gates disagree on who the operator is.
   local fn lib_def safe_def
-  for fn in safe_gate_operator_terminal safe_gate_tty_printf; do
+  for fn in safe_gate_operator_terminal safe_gate_tty_printf safe_gate_mirror_stderr; do
     lib_def="$(sed -n "/^${fn}() {$/,/^}$/p" "$ROOT/lib/gate-lib.sh")"
     safe_def="$(sed -n "/^${fn}() {$/,/^}$/p" "$ROOT/bin/safe")"
     if [[ -z "$lib_def" || "$lib_def" != "$safe_def" ]]; then
@@ -361,6 +361,12 @@ case_operator_terminal_helpers_match_between_gates() {
       return
     fi
   done
+  lib_def="$(sed -n "/^safe_gate_operator_terminal() {$/,/^}$/p" "$ROOT/lib/gate-lib.sh")"
+  safe_def="$(sed -n "/^safe_gate_operator_terminal() {$/,/^}$/p" "$ROOT/bin/safe-run")"
+  if [[ "$lib_def" != "$safe_def" ]]; then
+    fail "$FUNCNAME (safe_gate_operator_terminal differs between lib/gate-lib.sh and bin/safe-run)"
+    return
+  fi
   pass "$FUNCNAME"
 }
 

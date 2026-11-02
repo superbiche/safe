@@ -882,7 +882,7 @@ accept_block_run() { # <label> <probe-rc> <probe-json> <typed> <spec>
   printf '%s\n' "$4" | SAFE_RUN_CONFIG_DIR="$tmp/config-ab-$label" SAFE_RUN_DATA_DIR="$tmp/data-ab-$label" \
     SAFE_RUN_PATH="$SAFE_RUN" SAFE_AUDIT_PROBE_RC="$2" SAFE_AUDIT_PROBE_JSON="$3" \
     AB_SPEC="$5" \
-    python3 -c 'import pty,sys,os; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' bash -c '
+    env -u CODEX_THREAD_ID -u CODEX_CI -u CLAUDECODE -u OPENCODE python3 -c 'import pty,sys,os; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' bash -c '
       set -- version
       source "$SAFE_RUN_PATH" >/dev/null
       ensure_dirs

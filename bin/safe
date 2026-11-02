@@ -64,8 +64,8 @@ die() { err "$@"; exit 1; }
 # Policy refusal: legible one-line contract + dedicated exit code (see safe explain).
 refuse() { local code="$1"; shift; err "$@"; exit "$code"; }
 
-# Operator-terminal predicate and prompt writer, byte-identical to
-# lib/gate-lib.sh (tests/contract/drift.sh guards it): bin/safe sources the gate
+# Operator-terminal predicate, prompt writer and stderr mirror, byte-identical
+# to lib/gate-lib.sh (tests/contract/drift.sh guards it): bin/safe sources the gate
 # library lazily, and prompts can run before it is loaded.
 safe_gate_operator_terminal() {
   [[ -t 0 && -z "${CODEX_THREAD_ID:-}" && -z "${CODEX_CI:-}" &&
@@ -81,6 +81,24 @@ safe_gate_tty_printf() {
     # shellcheck disable=SC2059
     printf "${fmt}" "$@" >&2
   fi
+}
+
+# Captured-output operator mode: at the operator terminal with stderr captured
+# by a parent, copy everything this process (and its children) writes to
+# stderr onto /dev/tty as well, so the findings a prompt asks about reach the
+# operator. The parent still receives the unchanged stderr stream. A nested
+# gate whose stderr is already the mirror pipe does not mirror again.
+safe_gate_mirror_stderr() {
+  [[ ! -t 2 ]] && safe_gate_operator_terminal || return 0
+  { : >/dev/tty; } 2>/dev/null || return 0
+  local current=""
+  current="$(readlink "/proc/$$/fd/2" 2>/dev/null)" || current=""
+  if [[ -n "${current}" && "${current}" == "${SAFE_GATE_TTY_MIRROR:-}" ]]; then
+    return 0
+  fi
+  exec 2> >(tee -a /dev/tty >&2 2>/dev/null)
+  SAFE_GATE_TTY_MIRROR="$(readlink "/proc/$$/fd/2" 2>/dev/null)" || SAFE_GATE_TTY_MIRROR=""
+  export SAFE_GATE_TTY_MIRROR
 }
 
 show_usage() {
@@ -3599,6 +3617,7 @@ cmd_install_reuse() {
 }
 
 cmd_install() {
+  safe_gate_mirror_stderr
   local SAFE_GATE_SOCKET_COMMAND_CONSENT=0
   export -n SAFE_GATE_SOCKET_COMMAND_CONSENT
   # The consent channel and its recursion guard are the gate's own per-command

@@ -1564,6 +1564,11 @@ safe_gate_scan_project() {
   scan_status=$?
 
   [[ -n "${scan_output}" ]] && printf '%s\n' "${scan_output}"
+  # stdout may be captured by a parent; the operator must still see the report
+  # the critical prompt below asks about.
+  if [[ -n "${scan_output}" && ! -t 1 ]] && safe_gate_operator_terminal; then
+    safe_gate_tty_printf '%s\n' "${scan_output}"
+  fi
 
   local critical=0 broken="" have_verdict=0
   # Non-empty is not the same as readable. Against a truncated or malformed
@@ -2776,6 +2781,24 @@ safe_gate_tty_printf() {
     # shellcheck disable=SC2059
     printf "${fmt}" "$@" >&2
   fi
+}
+
+# Captured-output operator mode: at the operator terminal with stderr captured
+# by a parent, copy everything this process (and its children) writes to
+# stderr onto /dev/tty as well, so the findings a prompt asks about reach the
+# operator. The parent still receives the unchanged stderr stream. A nested
+# gate whose stderr is already the mirror pipe does not mirror again.
+safe_gate_mirror_stderr() {
+  [[ ! -t 2 ]] && safe_gate_operator_terminal || return 0
+  { : >/dev/tty; } 2>/dev/null || return 0
+  local current=""
+  current="$(readlink "/proc/$$/fd/2" 2>/dev/null)" || current=""
+  if [[ -n "${current}" && "${current}" == "${SAFE_GATE_TTY_MIRROR:-}" ]]; then
+    return 0
+  fi
+  exec 2> >(tee -a /dev/tty >&2 2>/dev/null)
+  SAFE_GATE_TTY_MIRROR="$(readlink "/proc/$$/fd/2" 2>/dev/null)" || SAFE_GATE_TTY_MIRROR=""
+  export SAFE_GATE_TTY_MIRROR
 }
 
 safe_gate_confirm_socket_command() {
@@ -6768,6 +6791,7 @@ safe_gate_mise() {
 }
 
 safe_gate_main() {
+  safe_gate_mirror_stderr
   local SAFE_GATE_SOCKET_COMMAND_CONSENT=0
   export -n SAFE_GATE_SOCKET_COMMAND_CONSENT
   # The consent channel and its recursion guard are the gate's own per-command

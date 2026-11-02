@@ -110,6 +110,13 @@ info() { printf '\033[36msafe run:\033[0m %s\n' "$*" >&2; }
 die()  { err "$@"; exit 1; }
 
 is_tty() { [[ -t 0 && -t 1 ]]; }
+# Operator terminal for trust decisions, byte-identical to lib/gate-lib.sh
+# (tests/contract/drift.sh guards it): stdin is a terminal and no recognized
+# agent session; stdout may be captured by a parent (operator ruling 2026-11-02).
+safe_gate_operator_terminal() {
+  [[ -t 0 && -z "${CODEX_THREAD_ID:-}" && -z "${CODEX_CI:-}" &&
+     -z "${CLAUDECODE:-}" && -z "${OPENCODE:-}" ]]
+}
 now_iso() { date -Iseconds; }
 
 # Stage a replacement BESIDE the file it will replace, and print its path.
@@ -1227,7 +1234,7 @@ runner_kind_to_ecosystem() {
 # flagged; abort otherwise. Non-TTY callers (already TTY-gated upstream) die.
 audit_confirm_or_die() {
   local action="$1" ok
-  is_tty || die "safe audit flagged this package; ${action} requires an interactive operator terminal"
+  safe_gate_operator_terminal || die "safe audit flagged this package; ${action} requires an interactive operator terminal"
   printf '\033[33msafe run:\033[0m %s anyway? [y/N] ' "$action" >&2
   read -r ok </dev/tty
   [[ "$ok" =~ ^[yY]$ ]] || die "aborted"
@@ -3154,7 +3161,7 @@ require_operator_tty() {
   # Trust escalations are operator-only: agents may suggest the command
   # verbatim but must not be able to execute it from a non-interactive shell.
   local action="$1" spec="$2"
-  is_tty && return 0
+  safe_gate_operator_terminal && return 0
   err "BLOCKED: host-allow $action requires an interactive operator terminal"
   err "  ask the operator to run: safe run host-allow $action $spec"
   err "  agent contract: safe explain"

@@ -8,8 +8,13 @@
   `uv sync` with `capture_output=True`). Prompts and the findings they ask
   about go to `/dev/tty` when stderr is captured, so the repo-audit
   critical override, WARN overrides and the other gate confirmations no
-  longer end in an unanswerable `102`. Recognized agent sessions are now
-  non-interactive on every gate prompt, even with a PTY.
+  longer end in an unanswerable `102`. In that mode the gate mirrors its
+  stderr (audit reports, BLOCK/WARN explanations, refusals) and the
+  repo-audit report to the terminal while the parent keeps its captured
+  streams. `safe run host-allow add` and its other trust escalations use
+  the same operator-terminal test, so the `[a]` grant works there too.
+  Recognized agent sessions are now non-interactive on every gate prompt
+  and trust escalation, even with a PTY.
 
 ## 1.72.0 - 2026-10-29
 
