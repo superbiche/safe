@@ -675,7 +675,7 @@ chmod +x "$tmp/scenario.sh"
 gate_case() { # audit-rc terminal result answer
   rm -f "$tmp/grc" "$tmp/gdata/audit.log"
   printf '%s\n' "$4" | TEST_AUDIT_RC="$1" TEST_TERMINAL="$2" TEST_RESULT="$3" \
-    python3 -c 'import pty,sys,os; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' \
+    env -u CODEX_THREAD_ID -u CODEX_CI -u CLAUDECODE -u OPENCODE python3 -c 'import pty,sys,os; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' \
     bash "$tmp/scenario.sh" > "$tmp/gout" 2>&1
   cat "$tmp/grc" 2>/dev/null || printf none
 }
@@ -707,7 +707,7 @@ pass "gate 20 class private: 104 unattended, typed install-once at a terminal, n
 
 # --- operator commands ----------------------------------------------------------
 reset_state
-pty_run() { python3 -c 'import pty,sys,os; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' "$@"; }
+pty_run() { env -u CODEX_THREAD_ID -u CODEX_CI -u CLAUDECODE -u OPENCODE python3 -c 'import pty,sys,os; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' "$@"; }
 rc=0; "$RUN" private-registry add p-npm --ecosystem npm --origin "$NPM_ORIGIN" --namespace '@p/*' > "$tmp/out" 2>&1 </dev/null || rc=$?
 [[ "$rc" == 102 && ! -e "$policy" ]] || fail "add without a terminal: rc=$rc"
 pty_run "$RUN" private-registry add p-npm --ecosystem npm --origin "$NPM_ORIGIN/" --namespace '@p/*' > "$tmp/out" 2>&1 || fail "add: $(cat "$tmp/out")"

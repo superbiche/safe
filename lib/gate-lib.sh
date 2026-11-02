@@ -1138,7 +1138,7 @@ safe_gate_audit_log() {
   local ecosystem="$1" package="$2" decision="$3" extra="${4:-}"
   local data_dir="${SAFE_RUN_DATA_DIR:-${SAFE_DATA_DIR:-$HOME/.local/share/safe}/run}"
   local context="non-tty"
-  [[ -t 0 && -t 1 ]] && context="interactive"
+  safe_gate_operator_terminal && context="interactive"
   mkdir -p "${data_dir}" 2>/dev/null || return 0
   local line
   line="$(date -Iseconds) | install:${ecosystem} | ${package} | GATE | ${context} | ${decision}${extra:+ | ${extra}}"
@@ -1502,10 +1502,10 @@ safe_gate_npm_scripts_env() {
 # ---------------------------------------------------------------------------
 
 safe_gate_confirm_critical() {
-  if [[ -t 0 && -t 1 ]]; then
+  if safe_gate_operator_terminal; then
     local reply
-    printf 'Proceed anyway? [y/N] '
-    read -r reply
+    safe_gate_tty_printf 'safe install: proceed despite the critical findings (full report: safe audit repo-audit .)? [y/N] '
+    IFS= read -r reply </dev/tty || return 1
     [[ "${reply}" == "y" || "${reply}" == "Y" || "${reply}" == "yes" || "${reply}" == "YES" ]]
     return $?
   fi
@@ -1564,6 +1564,11 @@ safe_gate_scan_project() {
   scan_status=$?
 
   [[ -n "${scan_output}" ]] && printf '%s\n' "${scan_output}"
+  # stdout may be captured by a parent; the operator must still see the report
+  # the critical prompt below asks about.
+  if [[ -n "${scan_output}" && ! -t 1 ]] && safe_gate_operator_terminal; then
+    safe_gate_tty_printf '%s\n' "${scan_output}"
+  fi
 
   local critical=0 broken="" have_verdict=0
   # Non-empty is not the same as readable. Against a truncated or malformed
@@ -1591,8 +1596,8 @@ safe_gate_scan_project() {
   rm -f "${result_file}"
 
   if (( critical > 0 )); then
-    if [[ -t 0 && -t 1 ]]; then
-      safe_gate_err "safe install: safe audit repo-audit reported ${critical} critical finding(s) in this project's dependencies"
+    if safe_gate_operator_terminal; then
+      safe_gate_tty_printf '%s\n' "safe install: safe audit repo-audit reported ${critical} critical finding(s) in this project's dependencies"
     fi
     safe_gate_confirm_critical
     return $?
@@ -1616,8 +1621,8 @@ safe_gate_scan_project() {
   # infrastructure breakage a vulnerability finding is the one thing a
   # security tool must never do.
   if [[ "${scan_output,,}" == *critical* ]]; then
-    if [[ -t 0 && -t 1 ]]; then
-      safe_gate_err "safe install: safe audit repo-audit failed with exit ${scan_status} after reporting critical findings"
+    if safe_gate_operator_terminal; then
+      safe_gate_tty_printf '%s\n' "safe install: safe audit repo-audit failed with exit ${scan_status} after reporting critical findings"
     fi
     safe_gate_confirm_critical
     return $?
@@ -1630,8 +1635,8 @@ safe_gate_scan_project() {
   # audit must never silently pass the install. In non-TTY this is
   # audit-infrastructure breakage to fix, not a clean tree — fail closed with a
   # recovery path, mirroring the projected-dependency scan guard.
-  if [[ -t 0 && -t 1 ]]; then
-    safe_gate_err "safe install: safe audit repo-audit failed with exit ${scan_status}; the project was not fully audited — safe doctor; proceeding"
+  if safe_gate_operator_terminal; then
+    safe_gate_tty_printf '%s\n' "safe install: safe audit repo-audit failed with exit ${scan_status}; the project was not fully audited — safe doctor; proceeding"
     return 0
   fi
   safe_gate_err "safe: BLOCKED install — safe audit repo-audit failed with exit ${scan_status} (audit-infrastructure breakage, not a package finding); fix the scanner and retry — safe doctor; details: safe explain"
@@ -2749,18 +2754,57 @@ safe_gate_pip_project_install() {
 # Reads /dev/tty, never stdin (the wrapped tool owns stdin); reached only after
 # the caller confirmed a TTY. Declining or an unreadable tty returns non-zero.
 # Command-local consent is initialized by safe_gate_main, never imported from
-# the environment or persisted. A PTY is necessary, not proof of human identity:
+# the environment or persisted.
+#
+# The operator's terminal (operator ruling 2026-11-02): stdin is a terminal and
+# no recognized agent session is running. stdout/stderr need not be terminals:
+# a parent that captures output (a script's subprocess capture_output) still
+# has the operator at the keyboard, so every prompt goes through
+# safe_gate_tty_printf. A PTY is necessary, not proof of human identity:
 # recognized agent sessions are also refused; agent instructions prohibit PTYs
 # or marker removal to obtain operator privileges.
 safe_gate_operator_terminal() {
-  [[ -t 0 && -t 1 && -z "${CODEX_THREAD_ID:-}" && -z "${CODEX_CI:-}" &&
+  [[ -t 0 && -z "${CODEX_THREAD_ID:-}" && -z "${CODEX_CI:-}" &&
      -z "${CLAUDECODE:-}" && -z "${OPENCODE:-}" ]]
+}
+
+# Operator-facing text of an interactive decision (prompts and the finding they
+# ask about): stderr when that is the terminal, else /dev/tty, so a parent that
+# captured stderr cannot hide the question from the operator.
+safe_gate_tty_printf() {
+  local fmt="$1"
+  shift
+  if [[ ! -t 2 ]] && { : >/dev/tty; } 2>/dev/null; then
+    # shellcheck disable=SC2059 # callers pass a literal format string
+    printf "${fmt}" "$@" >/dev/tty
+  else
+    # shellcheck disable=SC2059
+    printf "${fmt}" "$@" >&2
+  fi
+}
+
+# Captured-output operator mode: at the operator terminal with stderr captured
+# by a parent, copy everything this process (and its children) writes to
+# stderr onto /dev/tty as well, so the findings a prompt asks about reach the
+# operator. The parent still receives the unchanged stderr stream. A nested
+# gate whose stderr is already the mirror pipe does not mirror again.
+safe_gate_mirror_stderr() {
+  [[ ! -t 2 ]] && safe_gate_operator_terminal || return 0
+  { : >/dev/tty; } 2>/dev/null || return 0
+  local current=""
+  current="$(readlink "/proc/$$/fd/2" 2>/dev/null)" || current=""
+  if [[ -n "${current}" && "${current}" == "${SAFE_GATE_TTY_MIRROR:-}" ]]; then
+    return 0
+  fi
+  exec 2> >(tee -a /dev/tty >&2 2>/dev/null)
+  SAFE_GATE_TTY_MIRROR="$(readlink "/proc/$$/fd/2" 2>/dev/null)" || SAFE_GATE_TTY_MIRROR=""
+  export SAFE_GATE_TTY_MIRROR
 }
 
 safe_gate_confirm_socket_command() {
   local reply
-  safe_gate_err "safe: Socket is rate-limited. Approval covers missing Socket scores for this install command only; other security checks remain active."
-  printf 'safe: continue this install without Socket scores? [y/N] ' >&2
+  safe_gate_tty_printf '%s\n' "safe: Socket is rate-limited. Approval covers missing Socket scores for this install command only; other security checks remain active."
+  safe_gate_tty_printf 'safe: continue this install without Socket scores? [y/N] '
   IFS= read -r reply </dev/tty || return 1
   case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
@@ -2769,9 +2813,9 @@ safe_gate_confirm_infra() {
   local package="$1"
   local reply
 
-  safe_gate_err "safe: audit infrastructure is unavailable for ${package} — infrastructure breakage, NOT a package finding."
-  safe_gate_err "safe: proceeding installs ${package} WITHOUT the behavioral (Socket) signal; the recommended fix is to restore it (socket login / wait and retry / safe doctor)."
-  printf 'safe: proceed without the behavioral signal? [y/N] ' >&2
+  safe_gate_tty_printf '%s\n' "safe: audit infrastructure is unavailable for ${package} — infrastructure breakage, NOT a package finding."
+  safe_gate_tty_printf '%s\n' "safe: proceeding installs ${package} WITHOUT the behavioral (Socket) signal; the recommended fix is to restore it (socket login / wait and retry / safe doctor)."
+  safe_gate_tty_printf 'safe: proceed without the behavioral signal? [y/N] '
   if ! IFS= read -r reply </dev/tty; then
     return 1
   fi
@@ -2788,11 +2832,11 @@ safe_gate_confirm_infra() {
 # it (no silent auto-pass, terminus ruling). Unlike the infra override (exit 11),
 # an adverse WARN offers [a]: recording a host-allow grant here is a genuine
 # operator vouch for a real finding, not a vouch for a non-event.
-# The gate is interactive when both stdin and stdout are a terminal. Factored
+# The gate is interactive at the operator's terminal. Factored
 # out so the exit-10 override routing is unit-testable by stubbing it (the
 # confirm helpers read /dev/tty, which no non-pty test can drive).
 safe_gate_install_is_interactive() {
-  [[ -t 0 && -t 1 ]]
+  safe_gate_operator_terminal
 }
 
 # host-allow records standing grants ONLY for npm and python (bin/safe-run).
@@ -2813,11 +2857,11 @@ safe_gate_confirm_warn() {
   local ecosystem="$2"
   local reply
 
-  safe_gate_err "safe: ${package} — safe audit returned WARN: a finding about the package (see the report above), not an audit-infrastructure outage."
+  safe_gate_tty_printf '%s\n' "safe: ${package} — safe audit returned WARN: a finding about the package (see the report above), not an audit-infrastructure outage."
   if safe_gate_ecosystem_grant_capable "${ecosystem}"; then
-    printf 'safe: override deliberately? [y] accept this exact artifact  [a] accept and grant host execution  [N] cancel: ' >&2
+    safe_gate_tty_printf 'safe: override deliberately? [y] accept this exact artifact  [a] accept and grant host execution  [N] cancel: '
   else
-    printf 'safe: override deliberately? [y] accept this exact artifact  [N] cancel: ' >&2
+    safe_gate_tty_printf 'safe: override deliberately? [y] accept this exact artifact  [N] cancel: '
   fi
   if ! IFS= read -r reply </dev/tty; then
     return 1
@@ -2921,9 +2965,9 @@ safe_gate_confirm_block() {
     *) return 1 ;;
   esac
   if (( recordable )); then
-    printf "safe: type %s to accept this exact artifact, or 'record %s' to also record a host-allow override (signed exports carry it to followed hosts); anything else cancels: " "${target}" "${target}" >&2
+    safe_gate_tty_printf "safe: type %s to accept this exact artifact, or 'record %s' to also record a host-allow override (signed exports carry it to followed hosts); anything else cancels: " "${target}" "${target}"
   else
-    printf 'safe: type %s to %s; anything else cancels: ' "${target}" "${action}" >&2
+    safe_gate_tty_printf 'safe: type %s to %s; anything else cancels: ' "${target}" "${action}"
   fi
   IFS= read -r reply </dev/tty || return 1
   if [[ "${reply}" == "${target}" ]]; then
@@ -2959,8 +3003,8 @@ safe_gate_block_record_override() {
 # the operator confirms at the terminal; unattended shells refuse 102.
 safe_gate_confirm_recorded_block() {
   local package="$1" reply
-  safe_gate_err "safe: ${package} is BLOCKED by critical advisories that the operator override recorded on this host accepts."
-  printf 'safe: install now? [y/N] ' >&2
+  safe_gate_tty_printf '%s\n' "safe: ${package} is BLOCKED by critical advisories that the operator override recorded on this host accepts."
+  safe_gate_tty_printf 'safe: install now? [y/N] '
   IFS= read -r reply </dev/tty || return 1
   [[ "$reply" == "y" || "$reply" == "Y" || "$reply" == "yes" || "$reply" == "YES" ]]
 }
@@ -3072,8 +3116,8 @@ safe_gate_accept_socket_rate_limit() {
 safe_gate_confirm_socket_consent() {
   local package="$1"
   local reply
-  safe_gate_err "safe: ${package} resolves to a fresh (or unknown-age) release inside the Socket window — no behavioral evidence yet."
-  printf 'safe: run the Socket behavioral check now? [Y/n] ' >&2
+  safe_gate_tty_printf '%s\n' "safe: ${package} resolves to a fresh (or unknown-age) release inside the Socket window — no behavioral evidence yet."
+  safe_gate_tty_printf 'safe: run the Socket behavioral check now? [Y/n] '
   if ! IFS= read -r reply </dev/tty; then
     return 1
   fi
@@ -3086,8 +3130,8 @@ safe_gate_confirm_socket_consent() {
 safe_gate_confirm_pending() {
   local package="$1"
   local reply
-  safe_gate_err "safe: ${package} resolves to a fresh release whose Socket score is still pending — this install is not all-green."
-  printf 'safe: install now anyway? [y/N] ' >&2
+  safe_gate_tty_printf '%s\n' "safe: ${package} resolves to a fresh release whose Socket score is still pending — this install is not all-green."
+  safe_gate_tty_printf 'safe: install now anyway? [y/N] '
   if ! IFS= read -r reply </dev/tty; then
     return 1
   fi
@@ -3100,8 +3144,8 @@ safe_gate_confirm_pending() {
 safe_gate_confirm_tolerated() {
   local package="$1"
   local reply
-  safe_gate_err "safe: ${package}'s WARN passes via host-allow/tolerate — a deliberate grant, not an all-green check."
-  printf 'safe: install now anyway? [y/N] ' >&2
+  safe_gate_tty_printf '%s\n' "safe: ${package}'s WARN passes via host-allow/tolerate — a deliberate grant, not an all-green check."
+  safe_gate_tty_printf 'safe: install now anyway? [y/N] '
   if ! IFS= read -r reply </dev/tty; then
     return 1
   fi
@@ -3139,9 +3183,9 @@ safe_gate_private_terminus() {
     safe_gate_audit_log "${ecosystem}" "${package}" "REFUSED_PRIVATE_NONTTY" "$(jq -r '.private_registry.decision // empty' "${result}" 2>/dev/null)"
     return 102
   fi
-  safe_gate_err "safe: ${package}: ${detail:-the private registry trust needs an operator decision}"
-  [[ -n "${hint}" ]] && safe_gate_err "safe: ${hint}"
-  printf 'safe: install this once anyway? [y/N] ' >&2
+  safe_gate_tty_printf '%s\n' "safe: ${package}: ${detail:-the private registry trust needs an operator decision}"
+  [[ -n "${hint}" ]] && safe_gate_tty_printf '%s\n' "safe: ${hint}"
+  safe_gate_tty_printf 'safe: install this once anyway? [y/N] '
   if IFS= read -r reply </dev/tty && [[ "$reply" == "y" || "$reply" == "Y" || "$reply" == "yes" || "$reply" == "YES" ]]; then
     safe_gate_audit_log "${ecosystem}" "${package}" "PRIVATE_TTY_OVERRIDE" "$(jq -r '.private_registry.decision // empty' "${result}" 2>/dev/null)"
     return 0
@@ -3325,7 +3369,7 @@ safe_gate_check() {
         safe_gate_audit_log "${ecosystem}" "${package}" "HOST_ALLOW_OVERRIDE"
         return 0
       fi
-      if [[ -t 0 && -t 1 ]]; then
+      if safe_gate_operator_terminal; then
         if safe_gate_confirm_infra "${package}"; then
           safe_gate_audit_log "${ecosystem}" "${package}" "INFRA_TTY_OVERRIDE"
           safe_gate_mark_installed "$package" "$ecosystem" "$result_out" INFRA_TTY_OVERRIDE
@@ -6747,6 +6791,7 @@ safe_gate_mise() {
 }
 
 safe_gate_main() {
+  safe_gate_mirror_stderr
   local SAFE_GATE_SOCKET_COMMAND_CONSENT=0
   export -n SAFE_GATE_SOCKET_COMMAND_CONSENT
   # The consent channel and its recursion guard are the gate's own per-command

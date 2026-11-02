@@ -64,6 +64,43 @@ die() { err "$@"; exit 1; }
 # Policy refusal: legible one-line contract + dedicated exit code (see safe explain).
 refuse() { local code="$1"; shift; err "$@"; exit "$code"; }
 
+# Operator-terminal predicate, prompt writer and stderr mirror, byte-identical
+# to lib/gate-lib.sh (tests/contract/drift.sh guards it): bin/safe sources the gate
+# library lazily, and prompts can run before it is loaded.
+safe_gate_operator_terminal() {
+  [[ -t 0 && -z "${CODEX_THREAD_ID:-}" && -z "${CODEX_CI:-}" &&
+     -z "${CLAUDECODE:-}" && -z "${OPENCODE:-}" ]]
+}
+safe_gate_tty_printf() {
+  local fmt="$1"
+  shift
+  if [[ ! -t 2 ]] && { : >/dev/tty; } 2>/dev/null; then
+    # shellcheck disable=SC2059 # callers pass a literal format string
+    printf "${fmt}" "$@" >/dev/tty
+  else
+    # shellcheck disable=SC2059
+    printf "${fmt}" "$@" >&2
+  fi
+}
+
+# Captured-output operator mode: at the operator terminal with stderr captured
+# by a parent, copy everything this process (and its children) writes to
+# stderr onto /dev/tty as well, so the findings a prompt asks about reach the
+# operator. The parent still receives the unchanged stderr stream. A nested
+# gate whose stderr is already the mirror pipe does not mirror again.
+safe_gate_mirror_stderr() {
+  [[ ! -t 2 ]] && safe_gate_operator_terminal || return 0
+  { : >/dev/tty; } 2>/dev/null || return 0
+  local current=""
+  current="$(readlink "/proc/$$/fd/2" 2>/dev/null)" || current=""
+  if [[ -n "${current}" && "${current}" == "${SAFE_GATE_TTY_MIRROR:-}" ]]; then
+    return 0
+  fi
+  exec 2> >(tee -a /dev/tty >&2 2>/dev/null)
+  SAFE_GATE_TTY_MIRROR="$(readlink "/proc/$$/fd/2" 2>/dev/null)" || SAFE_GATE_TTY_MIRROR=""
+  export SAFE_GATE_TTY_MIRROR
+}
+
 show_usage() {
   cat <<'EOF'
 safe: consolidated safe run, safe audit, and install wrapper tooling
@@ -2180,7 +2217,7 @@ safe_install_gate_log() {
   local ecosystem="$1" package="$2" decision="$3" extra="${4:-}"
   local data_dir="${SAFE_RUN_DATA_DIR:-${SAFE_DATA_DIR:-$HOME/.local/share/safe}/run}"
   local context="non-tty"
-  [[ -t 0 && -t 1 ]] && context="interactive"
+  safe_gate_operator_terminal && context="interactive"
   mkdir -p "$data_dir" 2>/dev/null || return 0
   local line
   line="$(date -Iseconds) | install:${ecosystem} | ${package} | GATE | ${context} | ${decision}${extra:+ | ${extra}}"
@@ -2385,7 +2422,7 @@ safe_install_audit_package() {
         safe_install_gate_log "$ecosystem" "$package" "HOST_ALLOW_OVERRIDE"
         return 0
       fi
-      if [[ -t 0 && -t 1 ]]; then
+      if safe_gate_operator_terminal; then
         local warn_choice=""
         warn_choice="$(safe_install_confirm_warn "$package" "$ecosystem")" || warn_choice=""
         case "$warn_choice" in
@@ -2484,7 +2521,7 @@ safe_install_audit_package() {
         safe_install_gate_log "$ecosystem" "$package" "SOCKET_FAIL_SANDBOX_ROUTE_ACTIVE"
         return 0
       fi
-      if [[ -t 0 && -t 1 ]]; then
+      if safe_gate_operator_terminal; then
         if safe_install_sandbox_capable \
           && [[ "${SAFE_INSTALL_SOCKET_FALLBACK:-}" != "host" ]]; then
           local fb_choice_11=""
@@ -2676,11 +2713,11 @@ safe_install_confirm() {
   local -a install_cmd=("$@")
   local reply
 
-  if [[ ! -t 0 || ! -t 1 ]]; then
+  if ! safe_gate_operator_terminal; then
     refuse 102 "BLOCKED install — interactive confirmation required and this shell is non-interactive; to allow: ask the operator to run it interactively, or re-run with --yes after operator review; details: safe explain"
   fi
 
-  printf 'safe: install with `%s`? [y/N] ' "$(quote_command "${install_cmd[@]}")" >&2
+  safe_gate_tty_printf 'safe: install with `%s`? [y/N] ' "$(quote_command "${install_cmd[@]}")"
   if ! IFS= read -r reply </dev/tty; then
     return 1
   fi
@@ -2696,9 +2733,9 @@ safe_install_confirm_infra() {
   local package="$1"
   local reply
 
-  printf 'safe: audit infrastructure is unavailable for %s — infrastructure breakage, NOT a package finding.\n' "$package" >&2
-  printf 'safe: proceeding installs %s WITHOUT the behavioral (Socket) signal; the recommended fix is to restore it (socket login / wait and retry / safe doctor).\n' "$package" >&2
-  printf 'safe: proceed without the behavioral signal? [y/N] ' >&2
+  safe_gate_tty_printf 'safe: audit infrastructure is unavailable for %s — infrastructure breakage, NOT a package finding.\n' "$package"
+  safe_gate_tty_printf 'safe: proceeding installs %s WITHOUT the behavioral (Socket) signal; the recommended fix is to restore it (socket login / wait and retry / safe doctor).\n' "$package"
+  safe_gate_tty_printf 'safe: proceed without the behavioral signal? [y/N] '
   if ! IFS= read -r reply </dev/tty; then
     return 1
   fi
@@ -2716,8 +2753,8 @@ safe_install_confirm_socket_consent() {
   local package="$1"
   local reply
 
-  printf 'safe: %s resolves to a fresh (or unknown-age) release inside the Socket window — no behavioral evidence yet.\n' "$package" >&2
-  printf 'safe: run the Socket behavioral check now? [Y/n] ' >&2
+  safe_gate_tty_printf 'safe: %s resolves to a fresh (or unknown-age) release inside the Socket window — no behavioral evidence yet.\n' "$package"
+  safe_gate_tty_printf 'safe: run the Socket behavioral check now? [Y/n] '
   if ! IFS= read -r reply </dev/tty; then
     return 1
   fi
@@ -2744,10 +2781,10 @@ safe_install_confirm_sandbox_fallback() {
   local cause="$2"
   local reply
 
-  printf 'safe: %s for %s — the install would proceed WITHOUT the behavioral (Socket) signal; infrastructure failure, NOT a package finding.\n' "$cause" "$package" >&2
-  printf 'safe: Y runs: safe run install -w -n %s\n' \
-    "$(quote_command ${manager_args[@]+"${manager_args[@]}"})" >&2
-  printf 'safe: install under the safe run sandbox instead? [Y/n] ' >&2
+  safe_gate_tty_printf 'safe: %s for %s — the install would proceed WITHOUT the behavioral (Socket) signal; infrastructure failure, NOT a package finding.\n' "$cause" "$package"
+  safe_gate_tty_printf 'safe: Y runs: safe run install -w -n %s\n' \
+    "$(quote_command ${manager_args[@]+"${manager_args[@]}"})"
+  safe_gate_tty_printf 'safe: install under the safe run sandbox instead? [Y/n] '
   if ! IFS= read -r reply </dev/tty; then
     return 1
   fi
@@ -2782,11 +2819,11 @@ safe_install_confirm_warn() {
   local ecosystem="$2"
   local reply
 
-  err "${package} — safe audit returned WARN: a finding about the package (see the report above), not an audit-infrastructure outage."
+  safe_gate_tty_printf 'safe: %s\n' "${package} — safe audit returned WARN: a finding about the package (see the report above), not an audit-infrastructure outage."
   if safe_install_ecosystem_grant_capable "$ecosystem"; then
-    printf 'safe: override deliberately? [y] accept this exact artifact  [a] accept and grant host execution  [N] cancel: ' >&2
+    safe_gate_tty_printf 'safe: override deliberately? [y] accept this exact artifact  [a] accept and grant host execution  [N] cancel: '
   else
-    printf 'safe: override deliberately? [y] accept this exact artifact  [N] cancel: ' >&2
+    safe_gate_tty_printf 'safe: override deliberately? [y] accept this exact artifact  [N] cancel: '
   fi
   if ! IFS= read -r reply </dev/tty; then
     return 1
@@ -2839,11 +2876,11 @@ safe_install_confirm_trust() {
   local package="$1"
   local reply
 
-  if [[ ! -t 0 || ! -t 1 ]]; then
+  if ! safe_gate_operator_terminal; then
     return 1
   fi
 
-  printf 'safe: trust %s for future safe run host execution? [y/N] ' "$package" >&2
+  safe_gate_tty_printf 'safe: trust %s for future safe run host execution? [y/N] ' "$package"
   if ! IFS= read -r reply </dev/tty; then
     return 1
   fi
@@ -2885,7 +2922,7 @@ safe_install_project_log_path() {
 safe_install_project_confirm() {
   local reply
 
-  printf 'safe: accept these audit results for this project? [y/N] ' >&2
+  safe_gate_tty_printf 'safe: accept these audit results for this project? [y/N] '
   if ! IFS= read -r reply </dev/tty; then
     return 1
   fi
@@ -3074,7 +3111,7 @@ cmd_install_project() {
 
   if [[ "$verdict" == "GO" ]]; then
     safe_install_gate_log "project" "$(pwd)" "PROCEED" "verdict=GO"
-    if [[ "$yes" == "1" || ! -t 0 || ! -t 1 ]]; then
+    if [[ "$yes" == "1" ]] || ! safe_gate_operator_terminal; then
       return 0
     fi
     safe_install_project_confirm || { err "project audit not accepted"; return 1; }
@@ -3086,7 +3123,7 @@ cmd_install_project() {
     return 0
   fi
 
-  if [[ ! -t 0 || ! -t 1 ]]; then
+  if ! safe_gate_operator_terminal; then
     safe_install_gate_log "project" "$(pwd)" "REFUSED_WARN" "verdict=${verdict}"
     refuse 102 "BLOCKED project audit — verdict ${verdict} needs operator review and this shell is non-interactive; to allow: ask the operator to re-run it interactively, or re-run with --yes after review; details: safe explain"
   fi
@@ -3287,7 +3324,7 @@ safe_install_reuse_baseline_state() {
 
 safe_install_reuse_confirm() {
   local reply
-  printf 'safe: copy this installed tree into %s? [y/N] ' "$1" >&2
+  safe_gate_tty_printf 'safe: copy this installed tree into %s? [y/N] ' "$1"
   IFS= read -r reply </dev/tty || return 1
   [[ "$reply" == "y" || "$reply" == "Y" || "$reply" == "yes" || "$reply" == "YES" ]]
 }
@@ -3300,8 +3337,8 @@ safe_install_reuse_confirm() {
 safe_install_reuse_evidence_gap() {
   local target="$1" problem="$2" dry_run="$3" reply
   if [[ "$dry_run" == "0" ]] && safe_gate_operator_terminal; then
-    err "reuse evidence gap: ${problem}"
-    printf 'safe: copy it anyway, recorded as an operator override? [y/N] ' >&2
+    safe_gate_tty_printf 'safe: %s\n' "reuse evidence gap: ${problem}"
+    safe_gate_tty_printf 'safe: copy it anyway, recorded as an operator override? [y/N] '
     IFS= read -r reply </dev/tty || reply=""
     case "$reply" in
       y|Y|yes|YES) return 0 ;;
@@ -3580,6 +3617,7 @@ cmd_install_reuse() {
 }
 
 cmd_install() {
+  safe_gate_mirror_stderr
   local SAFE_GATE_SOCKET_COMMAND_CONSENT=0
   export -n SAFE_GATE_SOCKET_COMMAND_CONSENT
   # The consent channel and its recursion guard are the gate's own per-command
@@ -3784,14 +3822,14 @@ cmd_install() {
   if [[ "$yes" != "1" ]]; then
     if (( any_local_approval )) && [[ "$unattended_all" == 1 ]]; then
       safe_install_gate_log "$ecosystem" "${audit_packages[*]}" "INSTALL_UNATTENDED_LOCAL_APPROVAL"
-    elif [[ ! -t 0 || ! -t 1 ]] && [[ "$green_all" == "1" ]]; then
+    elif ! safe_gate_operator_terminal && [[ "$green_all" == "1" ]]; then
       # Unattended all-green install (operator direction 2026-09-22): every
       # package ended clean-GO (final Socket answer or a ruled out-of-scope
       # skip) — any WARN, tolerate, host-allow override, stale-evidence
       # timeout, pending score, consent ask or BLOCK keeps its own terminal
       # requirement below. Logged as its own decision token.
       safe_install_gate_log "$ecosystem" "${audit_packages[*]}" "INSTALL_UNATTENDED_GREEN"
-    elif [[ ! -t 0 || ! -t 1 ]] && [[ "$unattended_all" == "1" ]]; then
+    elif ! safe_gate_operator_terminal && [[ "$unattended_all" == "1" ]]; then
       # Every package is clean-GO, covered by a followed operator-signed
       # grant (2026-09-29 direction) or by the operator's private-registry
       # authorization with a matching pin. Never logged as green.

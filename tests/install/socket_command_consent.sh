@@ -30,7 +30,7 @@ audit_rc=20; run_check bad@1.0.0
 [[ $actual == 104 ]] || fail 'BLOCK survives consent'
 audit_rc=10; safe_gate_install_is_interactive() { return 1; }; run_check warn@1.0.0
 [[ $actual == 100 ]] || fail 'adverse WARN survives consent'
-audit_rc=11; run_check outage@1.0.0
+audit_rc=11; terminal_rc=1; run_check outage@1.0.0; terminal_rc=0
 [[ $actual == 102 ]] || fail 'other infrastructure still needs independent consent'
 pass 'consent does not cover BLOCK, adverse WARN or another outage'
 audit_rc=12; terminal_rc=1; run_check a@1.0.0
@@ -146,6 +146,138 @@ try:
 finally: os.close(fd)
 PY
 pass 'real terminal prompts once per command and asks again for the next command'
+# Operator terminal with captured output (ruling 2026-11-02): a parent that
+# pipes stdout/stderr (subprocess capture_output) still has the operator at the
+# keyboard. The predicate holds on a terminal stdin, and the repo-audit
+# critical prompt reaches /dev/tty instead of the captured streams.
+python3 <<'PY' || exit 1
+import os, pty, subprocess
+root=os.environ['ROOT']
+env={k:v for k,v in os.environ.items() if k not in ('CODEX_THREAD_ID','CODEX_CI','CLAUDECODE','OPENCODE')}
+m,s=pty.openpty()
+p=subprocess.run(['bash','-c','source "$ROOT/lib/gate-lib.sh"; safe_gate_operator_terminal'],stdin=s,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
+assert p.returncode==0,'terminal stdin with captured output must be the operator terminal'
+p=subprocess.run(['bash','-c','source "$ROOT/lib/gate-lib.sh"; safe_gate_operator_terminal'],stdin=subprocess.DEVNULL,stdout=s,stderr=s,env=env)
+assert p.returncode!=0,'a non-terminal stdin is never the operator terminal'
+os.close(s); os.close(m)
+PY
+pass 'operator terminal holds on a terminal stdin when stdout and stderr are captured'
+cat >"$tmp/captured-critical-fixture" <<'FIXTURE'
+exec >"$CAPTURE_DIR/out" 2>"$CAPTURE_DIR/err"
+source "$ROOT/lib/gate-lib.sh"
+rc=0
+safe_gate_confirm_critical || rc=$?
+printf '%s\n' "$rc" >"$CAPTURE_DIR/rc"
+FIXTURE
+mkdir -p "$tmp/captured"
+export fixture_path="$tmp/captured-critical-fixture" CAPTURE_DIR="$tmp/captured"
+python3 <<'PY' || exit 1
+import os, pty, select, time, signal
+cap=os.environ['CAPTURE_DIR']
+for answer,want in ((b'y\n','0'),(b'n\n','1')):
+ pid,fd=pty.fork()
+ if pid==0:
+  os.execve('/bin/bash',['bash',os.environ['fixture_path']],{'PATH':'/usr/bin:/bin','ROOT':os.environ['ROOT'],'CAPTURE_DIR':cap})
+ buf=b''; answered=False; deadline=time.monotonic()+10
+ try:
+  while time.monotonic()<deadline:
+   if not select.select([fd],[],[],0.1)[0]: continue
+   try: chunk=os.read(fd,65536)
+   except OSError: break
+   if not chunk: break
+   buf+=chunk
+   if not answered and b'proceed despite the critical findings' in buf:
+    os.write(fd,answer); answered=True
+  else:
+   os.kill(pid,signal.SIGKILL); raise AssertionError('fixture timed out: '+repr(buf))
+  os.waitpid(pid,0)
+ finally: os.close(fd)
+ assert answered,repr(buf)
+ assert open(cap+'/rc').read().strip()==want,(answer,open(cap+'/rc').read(),open(cap+'/err').read())
+ captured=open(cap+'/out').read()+open(cap+'/err').read()
+ assert 'proceed despite' not in captured,captured
+PY
+pass 'repo-audit critical prompt reaches the terminal while a parent captures stdout and stderr'
+# Captured-output operator mode (ruling 2026-11-02, review F1/F2): through the
+# real entry points, what a prompt asks about reaches the terminal while the
+# parent keeps its captured streams; safe-run's trust escalation accepts the
+# operator terminal with captured stdout and still refuses agent markers.
+mkdir -p "$tmp/cap-fix/bin" "$tmp/cap-fix/project" "$tmp/cap-fix/home"
+cat >"$tmp/cap-fix/audit" <<'AUDIT'
+#!/bin/bash
+if [[ "$1" == repo-audit ]]; then
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == --result-out ]]; then shift; printf '{"audit_totals":{"critical":1}}' >"$1"; fi
+    shift
+  done
+  echo 'CRITICAL_DETAIL fixture-vulnerable@1.0.0 GHSA-fixture'
+fi
+AUDIT
+printf '#!/bin/bash\necho REAL_UV_FIXTURE "$@"\n' >"$tmp/cap-fix/bin/uv"
+chmod +x "$tmp/cap-fix/audit" "$tmp/cap-fix/bin/uv"
+printf '[project]\nname="fixture"\nversion="1.0.0"\n' >"$tmp/cap-fix/project/pyproject.toml"
+printf '%s' '{"package":"fixture","resolved_versions":["1.0.0"],"block":{"class":"malware","advisories":[]}}' >"$tmp/cap-fix/block.json"
+cat >"$tmp/cap-fix/uvscan" <<'FIX'
+source "$ROOT/lib/gate-lib.sh"
+export SAFE_AUDIT_BIN="$FIX/audit"
+export PATH="$FIX/bin:$PATH"
+cd "$FIX/project"
+safe_gate_main uv sync --frozen
+FIX
+cat >"$tmp/cap-fix/block" <<'FIX'
+source "$ROOT/lib/gate-lib.sh"
+safe_gate_audit_log() { :; }
+safe_gate_dispatch() { safe_gate_block_terminus 20 fixture@1.0.0 npm 'npm install' "$FIX/block.json"; }
+safe_gate_main npm install fixture@1.0.0
+FIX
+cat >"$tmp/cap-fix/parent.py" <<'FIX'
+import subprocess, pathlib, sys
+p = subprocess.run(sys.argv[3:], capture_output=True, text=True)
+out = pathlib.Path(sys.argv[2])
+(out / 'stdout').write_text(p.stdout); (out / 'stderr').write_text(p.stderr); (out / 'rc').write_text(str(p.returncode))
+FIX
+export CAP_FIX="$tmp/cap-fix"
+python3 <<'PY' || exit 1
+import os, pathlib, pty, select, signal, time
+root = os.environ['ROOT']; fix = pathlib.Path(os.environ['CAP_FIX'])
+def run(name, argv, answer, extra_env=None):
+    cap = fix / ('capture-' + name); cap.mkdir(exist_ok=True)
+    env = {'PATH': '/usr/bin:/bin', 'ROOT': root, 'FIX': str(fix), 'HOME': str(fix / 'home'), 'SAFE_RUN_NO_INIT': '1'}
+    env.update(extra_env or {})
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execve('/usr/bin/python3', ['python3', str(fix / 'parent.py'), name, str(cap)] + argv, env)
+    buf = b''; sent = answer is None; deadline = time.monotonic() + 20
+    try:
+        while time.monotonic() < deadline:
+            if not select.select([fd], [], [], 0.1)[0]: continue
+            try: chunk = os.read(fd, 65536)
+            except OSError: break
+            if not chunk: break
+            buf += chunk
+            if not sent and (b'[y/N]' in buf or b'anything else cancels:' in buf):
+                os.write(fd, answer); sent = True
+        else:
+            os.kill(pid, signal.SIGKILL); raise AssertionError(name + ' timed out: ' + repr(buf))
+        os.waitpid(pid, 0)
+    finally:
+        os.close(fd)
+    return dict(terminal=buf.decode(errors='replace'), rc=(cap / 'rc').read_text(),
+                stdout=(cap / 'stdout').read_text(), stderr=(cap / 'stderr').read_text())
+r = run('uvscan', ['/bin/bash', str(fix / 'uvscan')], b'y\n')
+assert r['rc'] == '0' and 'REAL_UV_FIXTURE sync --frozen' in r['stdout'], r
+assert 'CRITICAL_DETAIL' in r['terminal'] and 'CRITICAL_DETAIL' in r['stdout'], r
+assert 'proceed despite' in r['terminal'] and 'proceed despite' not in r['stderr'] + r['stdout'], r
+r = run('block', ['/bin/bash', str(fix / 'block')], b'n\n')
+assert r['rc'] != '0', r
+assert 'malicious' in r['terminal'] and 'malicious' in r['stderr'], r
+r = run('hostallow', [root + '/bin/safe-run', 'host-allow', 'add', 'fixture@1.0.0', '--fixture-unknown'], None)
+assert 'requires an interactive operator terminal' not in r['stderr'] and 'unknown flag: --fixture-unknown' in r['stderr'], r
+for marker in ('CODEX_THREAD_ID', 'CODEX_CI', 'CLAUDECODE', 'OPENCODE'):
+    r = run('hostallow-' + marker, [root + '/bin/safe-run', 'host-allow', 'add', 'fixture@1.0.0', '--fixture-unknown'], None, {marker: 'fixture-agent'})
+    assert r['rc'] == '102' and 'requires an interactive operator terminal' in r['stderr'], (marker, r)
+PY
+pass 'captured-output operator mode mirrors findings to the terminal and safe-run grants accept it'
 # Mise retains isolated env/cwd audits but consent belongs to the command parent.
 source "$ROOT/lib/gate-lib.sh"
 safe_gate_audit_available() { return 0; }
@@ -319,7 +451,7 @@ printf '#!/bin/sh\nexit 11\n' >"$SAFE_AUDIT_PATH"
 safe_install_audit_package infry@1 npm || exit 1
 [[ "$(wc -l <"$SANDBOXLOG")" == 0 ]] || exit 1
 # Route unset: case 11 stays a non-interactive refusal.
-rc=0; ( SAFE_INSTALL_SOCKET_FALLBACK="" safe_install_audit_package infry@1 npm ) 2>/dev/null || rc=$?
+rc=0; ( safe_gate_operator_terminal() { return 1; }; SAFE_INSTALL_SOCKET_FALLBACK="" safe_install_audit_package infry@1 npm ) 2>/dev/null || rc=$?
 [[ $rc == 102 ]] || exit 1
 # The route execs safe run from cmd_install.
 gate_lib_path() { printf '%s' "$tmp/empty-lib"; }

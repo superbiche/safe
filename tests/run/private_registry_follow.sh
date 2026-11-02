@@ -51,7 +51,7 @@ exit 0
 NPM
 chmod +x "$tmp/bin/npm"
 printf '@p:registry=%s/\n' "$NPM_ORIGIN" > "$HOME/.npmrc"
-pty_run() { python3 -c 'import pty,sys,os; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' "$@"; }
+pty_run() { env -u CODEX_THREAD_ID -u CODEX_CI -u CLAUDECODE -u OPENCODE python3 -c 'import pty,sys,os; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' "$@"; }
 
 keygen() {
   gpg --no-options --batch --pinentry-mode loopback --passphrase '' \
