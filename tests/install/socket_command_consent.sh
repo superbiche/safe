@@ -30,7 +30,7 @@ audit_rc=20; run_check bad@1.0.0
 [[ $actual == 104 ]] || fail 'BLOCK survives consent'
 audit_rc=10; safe_gate_install_is_interactive() { return 1; }; run_check warn@1.0.0
 [[ $actual == 100 ]] || fail 'adverse WARN survives consent'
-audit_rc=11; run_check outage@1.0.0
+audit_rc=11; terminal_rc=1; run_check outage@1.0.0; terminal_rc=0
 [[ $actual == 102 ]] || fail 'other infrastructure still needs independent consent'
 pass 'consent does not cover BLOCK, adverse WARN or another outage'
 audit_rc=12; terminal_rc=1; run_check a@1.0.0
@@ -146,6 +146,58 @@ try:
 finally: os.close(fd)
 PY
 pass 'real terminal prompts once per command and asks again for the next command'
+# Operator terminal with captured output (ruling 2026-11-02): a parent that
+# pipes stdout/stderr (subprocess capture_output) still has the operator at the
+# keyboard. The predicate holds on a terminal stdin, and the repo-audit
+# critical prompt reaches /dev/tty instead of the captured streams.
+python3 <<'PY' || exit 1
+import os, pty, subprocess
+root=os.environ['ROOT']
+env={k:v for k,v in os.environ.items() if k not in ('CODEX_THREAD_ID','CODEX_CI','CLAUDECODE','OPENCODE')}
+m,s=pty.openpty()
+p=subprocess.run(['bash','-c','source "$ROOT/lib/gate-lib.sh"; safe_gate_operator_terminal'],stdin=s,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
+assert p.returncode==0,'terminal stdin with captured output must be the operator terminal'
+p=subprocess.run(['bash','-c','source "$ROOT/lib/gate-lib.sh"; safe_gate_operator_terminal'],stdin=subprocess.DEVNULL,stdout=s,stderr=s,env=env)
+assert p.returncode!=0,'a non-terminal stdin is never the operator terminal'
+os.close(s); os.close(m)
+PY
+pass 'operator terminal holds on a terminal stdin when stdout and stderr are captured'
+cat >"$tmp/captured-critical-fixture" <<'FIXTURE'
+exec >"$CAPTURE_DIR/out" 2>"$CAPTURE_DIR/err"
+source "$ROOT/lib/gate-lib.sh"
+rc=0
+safe_gate_confirm_critical || rc=$?
+printf '%s\n' "$rc" >"$CAPTURE_DIR/rc"
+FIXTURE
+mkdir -p "$tmp/captured"
+export fixture_path="$tmp/captured-critical-fixture" CAPTURE_DIR="$tmp/captured"
+python3 <<'PY' || exit 1
+import os, pty, select, time, signal
+cap=os.environ['CAPTURE_DIR']
+for answer,want in ((b'y\n','0'),(b'n\n','1')):
+ pid,fd=pty.fork()
+ if pid==0:
+  os.execve('/bin/bash',['bash',os.environ['fixture_path']],{'PATH':'/usr/bin:/bin','ROOT':os.environ['ROOT'],'CAPTURE_DIR':cap})
+ buf=b''; answered=False; deadline=time.monotonic()+10
+ try:
+  while time.monotonic()<deadline:
+   if not select.select([fd],[],[],0.1)[0]: continue
+   try: chunk=os.read(fd,65536)
+   except OSError: break
+   if not chunk: break
+   buf+=chunk
+   if not answered and b'proceed despite the critical findings' in buf:
+    os.write(fd,answer); answered=True
+  else:
+   os.kill(pid,signal.SIGKILL); raise AssertionError('fixture timed out: '+repr(buf))
+  os.waitpid(pid,0)
+ finally: os.close(fd)
+ assert answered,repr(buf)
+ assert open(cap+'/rc').read().strip()==want,(answer,open(cap+'/rc').read(),open(cap+'/err').read())
+ captured=open(cap+'/out').read()+open(cap+'/err').read()
+ assert 'proceed despite' not in captured,captured
+PY
+pass 'repo-audit critical prompt reaches the terminal while a parent captures stdout and stderr'
 # Mise retains isolated env/cwd audits but consent belongs to the command parent.
 source "$ROOT/lib/gate-lib.sh"
 safe_gate_audit_available() { return 0; }
@@ -319,7 +371,7 @@ printf '#!/bin/sh\nexit 11\n' >"$SAFE_AUDIT_PATH"
 safe_install_audit_package infry@1 npm || exit 1
 [[ "$(wc -l <"$SANDBOXLOG")" == 0 ]] || exit 1
 # Route unset: case 11 stays a non-interactive refusal.
-rc=0; ( SAFE_INSTALL_SOCKET_FALLBACK="" safe_install_audit_package infry@1 npm ) 2>/dev/null || rc=$?
+rc=0; ( safe_gate_operator_terminal() { return 1; }; SAFE_INSTALL_SOCKET_FALLBACK="" safe_install_audit_package infry@1 npm ) 2>/dev/null || rc=$?
 [[ $rc == 102 ]] || exit 1
 # The route execs safe run from cmd_install.
 gate_lib_path() { printf '%s' "$tmp/empty-lib"; }

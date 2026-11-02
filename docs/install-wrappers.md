@@ -367,6 +367,14 @@ host-allow grant (npm/python only) / `[N]` cancel. The override reads
 without `--raw`) always refuses with the hint instead — `--yes` cannot reach
 it. See the [Agent Contract](agents.md).
 
+Every gate prompt uses one operator-terminal test: stdin is a terminal and no
+recognized agent session is running (`CODEX_THREAD_ID`, `CODEX_CI`,
+`CLAUDECODE`, `OPENCODE`). stdout and stderr need not be terminals: when a
+parent captures them — a script that runs `uv sync` through
+`subprocess.run(..., capture_output=True)` — the prompt and the finding it asks
+about are written to `/dev/tty`, so the operator can still override instead of
+meeting an unanswerable `102`.
+
 ## Snapshot-stripped shells are no longer a special case
 
 The zsh wrappers carried inlined "degraded mode" guards for harnesses that
@@ -444,7 +452,7 @@ An existing exact host-allow grant remains effective; this feature creates none.
 Consent lives only in the gate process, expires at command exit and is never
 saved as host trust or exposed as an environment bypass switch.
 
-The new approval requires stdin and stdout to be terminals, reads `/dev/tty`,
+The new approval requires the operator terminal (below), reads `/dev/tty`,
 and rejects recognized agent sessions. A PTY is not human authentication: agents
 must never manufacture one, clear markers or answer these prompts.
 

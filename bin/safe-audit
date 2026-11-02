@@ -8308,7 +8308,7 @@ scripts_allow_matches_resolved() {
 # a custom-source install is never recorded as default-source evidence.
 # Usage: record-installed --result <file> --verdict <token> --source-id <id>
 record_installed_command() {
-  if [[ ! -t 0 || ! -t 1 || -n "${CODEX_THREAD_ID:-}" || -n "${CODEX_CI:-}" ||
+  if [[ ! -t 0 || -n "${CODEX_THREAD_ID:-}" || -n "${CODEX_CI:-}" ||
         -n "${CLAUDECODE:-}" || -n "${OPENCODE:-}" ]]; then
     printf 'safe audit: BLOCKED record-installed — reusable consent requires the operator terminal; agents must ask the operator to accept the exact artifact; details: safe explain\n' >&2
     return 102

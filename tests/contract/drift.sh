@@ -348,6 +348,22 @@ case_infra_cause_sets_match_between_gates() {
   fi
 }
 
+case_operator_terminal_helpers_match_between_gates() {
+  # bin/safe loads lib/gate-lib.sh lazily, so it carries its own copy of the
+  # operator-terminal predicate and prompt writer. Both copies must stay
+  # byte-identical or the two install gates disagree on who the operator is.
+  local fn lib_def safe_def
+  for fn in safe_gate_operator_terminal safe_gate_tty_printf; do
+    lib_def="$(sed -n "/^${fn}() {$/,/^}$/p" "$ROOT/lib/gate-lib.sh")"
+    safe_def="$(sed -n "/^${fn}() {$/,/^}$/p" "$ROOT/bin/safe")"
+    if [[ -z "$lib_def" || "$lib_def" != "$safe_def" ]]; then
+      fail "$FUNCNAME ($fn differs between lib/gate-lib.sh and bin/safe)"
+      return
+    fi
+  done
+  pass "$FUNCNAME"
+}
+
 case_contract_is_valid_json
 case_contract_has_every_required_key
 case_every_exit_code_tells_an_agent_what_to_do
@@ -367,6 +383,7 @@ case_gated_tool_lists_stay_in_sync
 case_npm_classifier_snapshot_routes_every_alias
 case_npm_literal_sites_consult_the_classifier
 case_infra_cause_sets_match_between_gates
+case_operator_terminal_helpers_match_between_gates
 
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
