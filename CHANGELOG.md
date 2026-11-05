@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- The mise gate now models `mise use --tool-option` and `--postinstall`
+  instead of refusing them as unrecognized flags. Option keys bind to the
+  tool that follows them (mise's own attribution) and are classified like
+  bracket and configured options: identity-neutral keys keep the audit,
+  anything else takes the not-audit-gated notice path, and unattributable
+  or malformed options fail closed. `allow_low_downloads` joins the
+  neutral set on every surface — it lifts only the installer's own
+  download-count reputation threshold, so the exact package still gets
+  safe's audit. This unblocks the approval command mise itself prescribes
+  for low-download tools (`mise use --tool-option
+  allow_low_downloads=true <tool>@<version>`), previously unreachable
+  through the gate.
+
 - Gate prompts reach the operator when a parent captures output. The
   operator terminal is now stdin-is-a-terminal with no recognized agent
   session; stdout and stderr may be piped (for example a script running

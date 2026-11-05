@@ -103,9 +103,15 @@ are honored, not discarded: an identity-neutral option (`bin_path`, `exe`,
 `package_manager`, which selects an installer whose own registry inputs
 differ — can change the source, so the spec takes the not-audit-gated
 notice path instead of a verdict for a package that may come from
-elsewhere. Configured tools carry options too, and `mise ls` does not show
-them, so the bare preflight reads each entry's options with
-`mise tool --json` before trusting `key@version`.
+elsewhere. The same classification covers options from every surface:
+bracket syntax in a spec, configured options, and `mise use`'s
+`--tool-option`/`--postinstall` flags (bound to the tool that follows
+them; unattributable or malformed options fail closed).
+`allow_low_downloads` is neutral: it lifts only the installer-internal
+download-count reputation threshold and selects no source, so the audit
+still judges the exact package. Configured tools carry options too, and
+`mise ls` does not show them, so the bare preflight reads each entry's
+options with `mise tool --json` before trusting `key@version`.
 
 The audit's source derivation covers every wrapped ecosystem: npm, Python
 (pip/uv env and config), Go (GOPROXY), Cargo, Composer, and Bun — env

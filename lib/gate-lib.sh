@@ -5351,17 +5351,24 @@ safe_gate_mise_infra_refuse() {
 # source for a bun-selected install (delta-2 finding F1). The CONFIGURED
 # npm.package_manager setting routes through the installer-aware audit; a
 # per-spec bracket option still takes the notice path.
-SAFE_GATE_MISE_NEUTRAL_OPTS='bin_path|exe|strip_components|platform|version_prefix|os|arch|depends'
+# `allow_low_downloads` IS neutral: it lifts only the npm installer's own
+# download-count reputation threshold (aube's lowDownloadThreshold). It
+# selects no source, version or content — safe's own audit still judges the
+# exact resolved package — so classifying it as an offender only pushed
+# first-party low-download tools (the operator's own forks) off the audited
+# lane for a check safe duplicates with better evidence. Its aube siblings
+# stay offenders: `allow_builds` enables dependency build scripts,
+# `allow_exotic_deps` admits non-registry dependency sources, and
+# `trust_policy_excludes` weakens the installer's trust policy.
+SAFE_GATE_MISE_NEUTRAL_OPTS='bin_path|exe|strip_components|platform|version_prefix|os|arch|depends|allow_low_downloads'
 
-safe_gate_mise_strip_opts() {
-  local spec="$1" head tail opts offender="" kv key
-  [[ "$spec" == *'['* ]] || { printf '%s\t\n' "$spec"; return 0; }
-  head="${spec%%\[*}"
-  tail="${spec#*\[}"
-  [[ "$tail" == *']'* ]] || return 1
-  opts="${tail%%\]*}"
-  tail="${tail#*\]}"
-  [[ -z "$tail" || "$tail" == @* ]] || return 1
+# First non-neutral key in a comma-separated option list (entries are
+# key=value or bare keys; one leading/trailing space per entry is mise's
+# bracket syntax, not part of the key). Prints nothing when all neutral.
+# Shared by the bracket, configured and CLI option paths so the three
+# classifications cannot drift.
+safe_gate_mise_opts_offender() {
+  local opts="$1" kv key
   local old_ifs="$IFS"
   IFS=','
   for kv in $opts; do
@@ -5371,12 +5378,25 @@ safe_gate_mise_strip_opts() {
     key="${key# }"
     key="${key% }"
     if ! safe_gate_alt_match "$key" "$SAFE_GATE_MISE_NEUTRAL_OPTS"; then
-      offender="$key"
-      break
+      printf '%s\n' "$key"
+      return 0
     fi
     IFS=','
   done
   IFS="$old_ifs"
+  return 0
+}
+
+safe_gate_mise_strip_opts() {
+  local spec="$1" head tail opts offender=""
+  [[ "$spec" == *'['* ]] || { printf '%s\t\n' "$spec"; return 0; }
+  head="${spec%%\[*}"
+  tail="${spec#*\[}"
+  [[ "$tail" == *']'* ]] || return 1
+  opts="${tail%%\]*}"
+  tail="${tail#*\]}"
+  [[ -z "$tail" || "$tail" == @* ]] || return 1
+  offender="$(safe_gate_mise_opts_offender "$opts")"
   printf '%s\t%s\n' "${head}${tail}" "$offender"
 }
 
@@ -5866,7 +5886,7 @@ safe_gate_mise_check_with_env() {
 # shorthand owner/repo, non-registry name shapes) take the notice path — a
 # public-registry audit must never vouch for code fetched elsewhere.
 safe_gate_mise_check_spec() {
-  local spec="$1" overlay="${2:-}" skip_config_opts="${3:-0}"
+  local spec="$1" overlay="${2:-}" skip_config_opts="${3:-0}" cli_optkeys="${4:-}"
   local stripped opt_offender backend rest name version="" eco pkg
   local parsed
   if ! parsed="$(safe_gate_mise_strip_opts "$spec")"; then
@@ -5877,6 +5897,17 @@ safe_gate_mise_check_spec() {
   if [[ -n "$opt_offender" ]]; then
     safe_gate_err "safe: mise ${spec}: tool option '${opt_offender}' can change the install source or run installer arguments safe cannot model — not audit-gated; review manually, or install without the option to get a checked verdict"
     return 0
+  fi
+  # CLI --tool-option/--postinstall keys bound to this spec classify
+  # exactly like bracket options: neutral keys keep the audit, anything
+  # else takes the same notice path.
+  if [[ -n "$cli_optkeys" ]]; then
+    local cli_offender
+    cli_offender="$(safe_gate_mise_opts_offender "$cli_optkeys")"
+    if [[ -n "$cli_offender" ]]; then
+      safe_gate_err "safe: mise ${spec}: tool option '${cli_offender}' can change the install source or run installer arguments safe cannot model — not audit-gated; review manually, or install without the option to get a checked verdict"
+      return 0
+    fi
   fi
   if [[ "$stripped" != *:* ]]; then
     local bare_name="$stripped" bare_ver=""
@@ -6077,6 +6108,26 @@ safe_gate_mise_record_ctx() {
       # exact pin it would audit a version mise will not install.
       SAFE_GATE_MISE_MIN_AGE=1
       ;;
+    --tool-option)
+      # `use --tool-option KEY=VALUE` binds options to the tool that
+      # follows. The gate classifies keys exactly like bracket/configured
+      # options (check_spec), so only the key is recorded here; the value
+      # reaches mise untouched in the delegated argv. A token without a
+      # well-formed key cannot be attributed — fail closed like malformed
+      # bracket syntax.
+      local opt_key="${value%%=*}"
+      if [[ "$value" != *=* || ! "$opt_key" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        safe_gate_err "safe: BLOCKED mise ${sub} — malformed --tool-option '${value}' (expected KEY=VALUE); details: safe explain"
+        return 100
+      fi
+      SAFE_GATE_MISE_PENDING_OPTKEYS+=("$opt_key")
+      ;;
+    --postinstall)
+      # A postinstall command is an installer argument safe cannot model;
+      # recorded under its own key so it takes the same not-audit-gated
+      # notice path as any other unmodeled option.
+      SAFE_GATE_MISE_PENDING_OPTKEYS+=("postinstall")
+      ;;
   esac
   return 0
 }
@@ -6085,6 +6136,8 @@ safe_gate_mise_parse_sub() {
   local sub="$1"
   shift
   SAFE_GATE_MISE_SPECS=()
+  SAFE_GATE_MISE_SPEC_OPTKEYS=()
+  SAFE_GATE_MISE_PENDING_OPTKEYS=()
   SAFE_GATE_MISE_CMD=()
   SAFE_GATE_MISE_EXCLUDE=()
   SAFE_GATE_MISE_MODE=0
@@ -6111,7 +6164,7 @@ safe_gate_mise_parse_sub() {
       SAFE_GATE_MISE_MODE=1
       ;;
     use)
-      gval='-e|--env|-j|--jobs|-p|--path|--remove|--minimum-release-age|-C|--cd'
+      gval='-e|--env|-j|--jobs|-p|--path|--remove|--minimum-release-age|--tool-option|--postinstall|-C|--cd'
       gbool='-f|--force|-g|--global|-n|--dry-run|--dry-run-code|--fuzzy|--pin|--raw|-q|--quiet|-v|--verbose|-vv|-y|--yes|--locked|--silent|-h|--help'
       ;;
     exec)
@@ -6200,11 +6253,27 @@ safe_gate_mise_parse_sub() {
         ;;
       *)
         SAFE_GATE_MISE_SPECS+=("$arg")
+        # Pending --tool-option/--postinstall keys bind to the tool that
+        # follows them (mise's own attribution rule): snapshot them with
+        # this spec, index-aligned, and start a fresh group.
+        local joined=""
+        if (( ${#SAFE_GATE_MISE_PENDING_OPTKEYS[@]} > 0 )); then
+          local old_ifs="$IFS"
+          IFS=','
+          joined="${SAFE_GATE_MISE_PENDING_OPTKEYS[*]}"
+          IFS="$old_ifs"
+        fi
+        SAFE_GATE_MISE_SPEC_OPTKEYS+=("$joined")
+        SAFE_GATE_MISE_PENDING_OPTKEYS=()
         i=$((i + 1))
         continue
         ;;
     esac
   done
+  if (( ${#SAFE_GATE_MISE_PENDING_OPTKEYS[@]} > 0 )); then
+    safe_gate_err "safe: BLOCKED mise ${sub} — --tool-option/--postinstall with no following tool cannot be attributed; put each option before the tool it applies to; details: safe explain"
+    return 100
+  fi
   return 0
 }
 
@@ -6535,10 +6604,12 @@ safe_gate_mise_gate_use() {
   # unconstrained target while mise selected an older one (delta-2 F3).
   safe_gate_mise_min_age_guard "${SAFE_GATE_MISE_SPECS[@]}" || return $?
   safe_gate_mise_overlay_or_refuse || return $?
-  local spec
+  local spec i_spec
   SAFE_GATE_MISE_RELEASE_PASSED=()
-  for spec in "${SAFE_GATE_MISE_SPECS[@]}"; do
-    safe_gate_mise_check_spec "$spec" "$SAFE_GATE_MISE_OVERLAY" || return $?
+  for (( i_spec = 0; i_spec < ${#SAFE_GATE_MISE_SPECS[@]}; i_spec++ )); do
+    spec="${SAFE_GATE_MISE_SPECS[$i_spec]}"
+    safe_gate_mise_check_spec "$spec" "$SAFE_GATE_MISE_OVERLAY" 0 \
+      "${SAFE_GATE_MISE_SPEC_OPTKEYS[$i_spec]:-}" || return $?
   done
   safe_gate_mise_release_notice_flush
   return 0
