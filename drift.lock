@@ -48,7 +48,7 @@ sig = "f8cccce6a5faf41c"
 [[bindings]]
 doc = "docs/install-wrappers.md"
 target = "lib/gate-lib.sh"
-sig = "80981eab71dc5cb3"
+sig = "29ef367474a2d5b2"
 
 [[bindings]]
 doc = "docs/installation.md"
@@ -68,7 +68,7 @@ sig = "f8cccce6a5faf41c"
 [[bindings]]
 doc = "docs/integration-flows.md"
 target = "lib/gate-lib.sh"
-sig = "80981eab71dc5cb3"
+sig = "29ef367474a2d5b2"
 
 [[bindings]]
 doc = "docs/operations.md"
@@ -103,7 +103,7 @@ sig = "777d4d9bbd15aa2a"
 [[bindings]]
 doc = "docs/private-registries.md"
 target = "lib/gate-lib.sh"
-sig = "80981eab71dc5cb3"
+sig = "29ef367474a2d5b2"
 
 [[bindings]]
 doc = "docs/safe-audit.md"
