@@ -5515,6 +5515,15 @@ case_mise_tool_options_are_not_discarded() {
     SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
   assert_status 104 "$FUNCNAME" || return
   assert_log_contains $'AUDIT\tpackage-audit\tblockme@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+
+  # A configured allow_low_downloads approval is source-neutral too (it
+  # lifts only the installer's reputation threshold): the audit still runs.
+  : > "${LOG_FILE}"
+  MISE_LS_JSON='{"npm:blockme": [{"version": "1.0.0", "requested_version": "1.0.0", "installed": false}]}' \
+    MISE_TOOL_JSON='{"tool_options": {"allow_low_downloads": true}}' \
+    SAFE_INSTALL_TEST_SCRIPT='mise install' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme@1.0.0\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -5575,6 +5584,14 @@ case_mise_use_tool_option_modeled() {
   SAFE_INSTALL_TEST_SCRIPT='mise use --tool-option justakey npm:okpkg@1.2.3' run_zsh
   assert_status 100 "$FUNCNAME" || return
   assert_log_not_contains_fragment 'REAL' "$FUNCNAME" || return
+
+  # CLI and bracket forms of one neutral key collide only inside mise
+  # (duplicate keys are its parse error, after the gate): both classify
+  # neutral here, so the audit still runs first and blocks.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='mise use --tool-option allow_low_downloads=true "npm:blockme[allow_low_downloads=false]@1.0.0"' run_zsh
+  assert_status 104 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME" || return
 
   # install has no --tool-option in mise: still refused as unrecognized.
   : > "${LOG_FILE}"
