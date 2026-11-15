@@ -905,7 +905,7 @@ case_npm_exec_versioned_spec_audits_despite_local_bin() {
 case_npm_exec_hoisted_parent_bin_passthrough() {
   prepare_case "npm-exec-hoisted-parent-bin-passthrough"
   # Hoisted monorepo: the bin lives at the workspace root, the command runs
-  # from a workspace subdirectory (agentrh envsub shape, PR #19 parity).
+  # from a workspace subdirectory (a monorepo whose workspace subdirectory resolves dependencies upward, PR #19 parity).
   mkdir -p "${WORK_DIR}/node_modules/.bin" "${WORK_DIR}/apps/web"
   printf '#!/bin/sh\n' > "${WORK_DIR}/node_modules/.bin/envsub"
   chmod +x "${WORK_DIR}/node_modules/.bin/envsub"

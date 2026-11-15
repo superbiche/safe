@@ -46,7 +46,7 @@ missing.
 ## Unknown Package Execution
 
 ```bash
-safe run create-vite@latest -- my-app
+safe run create-vite@9.3.4 -- my-app
 ```
 
 Flow:

@@ -9,7 +9,7 @@ Full documentation is published at <https://superbiche.github.io/safe/>.
 ## Quick Start
 
 ```bash
-git clone <repo-url> safe
+git clone https://github.com/superbiche/safe.git safe
 cd safe
 safe audit repo-audit .
 bash install.sh
@@ -37,7 +37,7 @@ The installer is idempotent. Reruns refresh binaries and wrappers while preservi
 ## Core Commands
 
 ```bash
-safe run repomix@latest -- --help
+safe run repomix@1.19.0 -- --help
 safe audit repo-audit .
 safe audit repo-audit . --deps-only
 safe audit repo-audit . --full

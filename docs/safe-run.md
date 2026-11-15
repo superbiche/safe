@@ -35,7 +35,7 @@ Relaxations are explicit:
 
 ```bash
 safe run --write eslint@9.0.0 -- --fix .
-safe run --network create-vite@latest -- my-app
+safe run --network create-vite@9.3.4 -- my-app
 safe run --allow-secrets some-tool@1.2.3
 safe run --proxy --network package-that-needs-proxy@1.0.0
 ```
@@ -44,7 +44,7 @@ Use alternate runtime images:
 
 ```bash
 safe run --node22 eslint@9.0.0 -- --version
-safe run --py312 ruff@latest -- --version
+safe run --py312 ruff@0.17.5 -- --version
 ```
 
 ## Decision Order

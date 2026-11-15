@@ -34,7 +34,7 @@ safe status
 Run a package in a sandbox:
 
 ```bash
-safe run repomix@latest -- --help
+safe run repomix@1.19.0 -- --help
 ```
 
 Scan the current project:
