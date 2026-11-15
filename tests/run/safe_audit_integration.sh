@@ -499,7 +499,7 @@ grep -q 'node_modules' "$tmp/uvx-noinstall.err" && fail "uvx --no-install took t
 pass "uvx --no-install refuses as unrecognized flag (npm-specific path not taken)"
 
 # Hoisted monorepo: the bin lives in a parent directory's node_modules/.bin
-# (npm's own upward resolution). Regression for the agentrh envsub case.
+# (npm's own upward resolution). Regression for a monorepo whose workspace subdirectory resolves dependencies upward.
 mono="$tmp/mono"
 mkdir -p "$mono/node_modules/.bin" "$mono/apps/web"
 cat > "$mono/node_modules/.bin/envsub" <<'SH'
