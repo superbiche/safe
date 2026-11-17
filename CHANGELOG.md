@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Agents hand the operator the original command to run at their terminal
+  instead of relaying the `safe run host-allow add` hint (operator ruling
+  2026-11-17): at a terminal safe re-runs the full audit and offers the
+  override, while a host-allow grant tolerates the finding without it. The
+  contract's rules, exit-code actions and harness snippet say so; the hint
+  is relayed only when the operator asks for a standing grant.
+- The agent skill keeps only what an agent acts on (rules, gate refusal
+  codes, the commands it runs) and points to `safe explain --json` for the
+  rest: 6.5 KB instead of 15 KB. Allow flows an agent runs carry
+  `"agent": true` in the contract.
+
 - Ship the agent skill with safe. `share/agent/skills/safe/SKILL.md` tells an
   AI coding agent how to read a refusal, hand the operator a command, use
   exact versions, the allow flows and worktree reuse; its contract sections

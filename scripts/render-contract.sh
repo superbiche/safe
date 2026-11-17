@@ -81,7 +81,16 @@ section_body() {
       ' < "$CONTRACT"
       ;;
     skill-rules)
-      jq -r '.intro, "", .one_rule, "", (.agent_rules[] | "- " + .)' < "$CONTRACT"
+      jq -r '.one_rule, "", (.agent_rules[] | "- " + .)' < "$CONTRACT"
+      ;;
+    skill-allow-flows)
+      # Only the flows an agent runs itself; the fleet and trust-store flows
+      # are the operator's (safe explain lists them all).
+      jq -r '
+        "```bash",
+        (.allow_flows[] | select(.agent == true) | .command, "  # " + .purpose),
+        "```"
+      ' < "$CONTRACT"
       ;;
     refusal-codes)
       jq -r '
@@ -90,9 +99,7 @@ section_body() {
         (.exit_codes[] | select(.code >= 100)
          | "| \(.code) | \(.meaning | ascii_downcase[0:1] as $f | ($f | ascii_upcase) + .[1:]) | \(.agent_action) |"),
         "",
-        "Refusal shape: `" + .refusal_format + "`",
-        "",
-        .refusal_note
+        "The refusal is the final stderr line: `" + .refusal_format + "`"
       ' < "$CONTRACT"
       ;;
     harness-snippet)

@@ -3,12 +3,12 @@ version = 1
 [[bindings]]
 doc = "docs/agents.md"
 target = "docs/contract/agent-contract.json"
-sig = "020ec1f1d30dccf0"
+sig = "5f043208664e640c"
 
 [[bindings]]
 doc = "docs/agents.md"
 target = "scripts/render-contract.sh"
-sig = "0dc29b141c021366"
+sig = "a123258635256dff"
 
 [[bindings]]
 doc = "docs/command-reference.md"
