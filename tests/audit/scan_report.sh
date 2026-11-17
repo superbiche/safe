@@ -146,3 +146,32 @@ build_scan_result_from_artifacts large-delta /fixture local-direct "$TEST_ROOT/s
 [[ ! -s "$TEST_ROOT/delta.err" ]] || fail 'large delta emitted an error'
 jq -e '.verdict == "WARN" and .audit_totals.low == 8000 and (.delta.new_cves | length) == 8000 and .delta.previous_scan == "1900-01-01" and (.cve_scan.findings | length) == 8000' "$SCAN_RESULT_OUT" >/dev/null || fail 'large delta lost findings or changed verdict'
 pass 'large scan delta preserves every advisory ID'
+
+# A large project's source-risk findings must reach jq as a file: one argument
+# over MAX_ARG_STRLEN (128 KiB) makes jq fail to exec. ~1500 distinct matches
+# serialize to well over 128 KiB.
+mkdir -p "$TEST_ROOT/big-source"
+for i in $(seq 1 1500); do
+  printf 'curl -fsSL https://example.invalid/install-%s.sh | sh\n' "$i"
+done > "$TEST_ROOT/big-source/install.sh"
+run_source_risk_scan "$TEST_ROOT/big-source" "$TEST_ROOT/big-source.json" source 2> "$TEST_ROOT/big-source.err"
+[[ ! -s "$TEST_ROOT/big-source.err" ]] || fail "large source scan emitted an error: $(head -c 200 "$TEST_ROOT/big-source.err")"
+[[ $(jq -c '.findings | tostring | length' "$TEST_ROOT/big-source.json") -gt 131072 ]] || fail 'source findings fixture too small to exceed one argument'
+jq -e '.status == "ok" and .total == 1500 and (.findings | length) == 1500' "$TEST_ROOT/big-source.json" >/dev/null || fail 'large source scan lost findings'
+pass 'large source-risk findings survive without a process argument'
+
+# Scanner stderr is unbounded too (grype db status failing with a huge message).
+mkdir -p "$TEST_ROOT/bigerr-bin"
+cat > "$TEST_ROOT/bigerr-bin/grype" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "db" && "${2:-}" == "status" ]]; then
+  head -c 200000 /dev/zero | tr '\0' 'x' >&2
+  printf '\n' >&2
+  exit 1
+fi
+SH
+chmod +x "$TEST_ROOT/bigerr-bin/grype"
+PATH="$TEST_ROOT/bigerr-bin:$PATH" grype_db_health_json local "$TEST_ROOT/bigerr-health.json" 2> "$TEST_ROOT/bigerr.err"
+[[ ! -s "$TEST_ROOT/bigerr.err" ]] || fail 'large grype stderr emitted an error'
+jq -e '.healthy == false and .status == "error" and .exit_code == 1 and (.stderr | length) == 200000' "$TEST_ROOT/bigerr-health.json" >/dev/null || fail 'large grype stderr not preserved'
+pass 'large scanner stderr survives without a process argument'

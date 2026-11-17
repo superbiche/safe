@@ -23,17 +23,17 @@ sig = "f6afee705d288cc7"
 [[bindings]]
 doc = "docs/configuration.md"
 target = "bin/safe-audit"
-sig = "90f1290c78704101"
+sig = "e22b4e38fdca6d26"
 
 [[bindings]]
 doc = "docs/configuration.md"
 target = "bin/safe-run"
-sig = "618cc11998c8a265"
+sig = "38a63bcec68e5ec5"
 
 [[bindings]]
 doc = "docs/dependencies.md"
 target = "bin/safe-audit"
-sig = "90f1290c78704101"
+sig = "e22b4e38fdca6d26"
 
 [[bindings]]
 doc = "docs/index.md"
@@ -73,17 +73,17 @@ sig = "80e2990cb678d6a0"
 [[bindings]]
 doc = "docs/operations.md"
 target = "bin/safe-run"
-sig = "618cc11998c8a265"
+sig = "38a63bcec68e5ec5"
 
 [[bindings]]
 doc = "docs/private-registries.md"
 target = "bin/safe-audit"
-sig = "90f1290c78704101"
+sig = "e22b4e38fdca6d26"
 
 [[bindings]]
 doc = "docs/private-registries.md"
 target = "bin/safe-run"
-sig = "618cc11998c8a265"
+sig = "38a63bcec68e5ec5"
 
 [[bindings]]
 doc = "docs/private-registries.md"
@@ -108,7 +108,7 @@ sig = "80e2990cb678d6a0"
 [[bindings]]
 doc = "docs/safe-audit.md"
 target = "bin/safe-audit"
-sig = "90f1290c78704101"
+sig = "e22b4e38fdca6d26"
 
 [[bindings]]
 doc = "docs/safe-audit.md"
@@ -118,7 +118,7 @@ sig = "06592133c2df48cf"
 [[bindings]]
 doc = "docs/safe-run.md"
 target = "bin/safe-run"
-sig = "618cc11998c8a265"
+sig = "38a63bcec68e5ec5"
 
 [[bindings]]
 doc = "docs/tools-scan.md"
