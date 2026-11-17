@@ -2108,8 +2108,11 @@ grype_db_health_json() {
   run_machine_capture "$machine" "$(printf '%q' "$grype") db status -o json -q" > "$raw" 2>"$stderr" || rc=$?
 
   if ! jq -e 'type == "object"' "$raw" >/dev/null 2>&1; then
-    jq -n --arg note "grype db status failed" --arg stderr "$(cat "$stderr" 2>/dev/null || true)" --argjson rc "$rc" '
-      {healthy:false,status:"error",note:$note,exit_code:$rc,stderr:$stderr}
+    # Scanner stderr is unbounded: it enters by file, never as an argument
+    # (a single argument over MAX_ARG_STRLEN, 128 KiB, makes jq fail to exec).
+    [[ -e "$stderr" ]] || : > "$stderr"
+    jq -n --arg note "grype db status failed" --rawfile stderr "$stderr" --argjson rc "$rc" '
+      {healthy:false,status:"error",note:$note,exit_code:$rc,stderr:($stderr | sub("\n+$"; ""))}
     ' > "$output"
     return 0
   fi
@@ -2621,8 +2624,9 @@ run_source_risk_scan() {
     return 0
   fi
 
-  local findings_file findings_json scanned_files
+  local findings_file findings_doc scanned_files
   findings_file=$(mktemp)
+  findings_doc=$(mktemp)
   : > "$findings_file"
   scanned_files=$(find "$source" -type f 2>/dev/null | wc -l | tr -d '[:space:]')
 
@@ -2638,16 +2642,18 @@ run_source_risk_scan() {
     '((GITHUB_TOKEN|NPM_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|SSH_AUTH_SOCK)[^#]*(fetch|axios|curl|wget|https?://))|((fetch|axios|curl|wget|https?://)[^#]*(GITHUB_TOKEN|NPM_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|SSH_AUTH_SOCK))'
 
   if [[ -s "$findings_file" ]]; then
-    findings_json=$(jq -s 'unique_by(.rule + ":" + .file + ":" + (.line|tostring))' "$findings_file")
+    jq -s 'unique_by(.rule + ":" + .file + ":" + (.line|tostring))' "$findings_file" > "$findings_doc"
   else
-    findings_json='[]'
+    printf '[]\n' > "$findings_doc"
   fi
 
+  # The findings grow with the project: they reach jq as a file, never as an
+  # argument (one argument over 128 KiB fails to exec).
   jq -n \
     --argjson scanned_files "$scanned_files" \
-    --argjson findings "$findings_json" \
-    '{status:"ok",note:null,scanned_files:$scanned_files,total:($findings | length),findings:$findings}' > "$output"
-  rm -f "$findings_file"
+    --slurpfile findings "$findings_doc" \
+    '$findings[0] as $f | {status:"ok",note:null,scanned_files:$scanned_files,total:($f | length),findings:$f}' > "$output"
+  rm -f "$findings_file" "$findings_doc"
 }
 
 latest_previous_result() {

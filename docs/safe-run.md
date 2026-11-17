@@ -477,6 +477,10 @@ covers an install only while every blocking advisory is one it accepted: a new
 advisory, another version, or a malware or blocklist signal asks again.
 `host-allow update` drops it, and `host-allow list` shows it.
 
+`host-allow add` and `update` ask at the operator's terminal even when a parent
+process captures their output: the audit warnings are copied to `/dev/tty` (the
+parent keeps them on its stderr) and the question itself is written there only.
+
 On the host that recorded it, current auditors resolve the approval to gate
 exit 22 (`ALLOWED_VIA_LOCAL_APPROVAL`), without another terminal prompt.
 Prior exact local host-allow or source-bound gate consent also covers new

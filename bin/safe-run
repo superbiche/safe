@@ -118,6 +118,39 @@ safe_gate_operator_terminal() {
      -z "${CLAUDECODE:-}" && -z "${OPENCODE:-}" ]]
 }
 now_iso() { date -Iseconds; }
+# Operator-facing text of an interactive decision, byte-identical to
+# lib/gate-lib.sh (tests/contract/drift.sh guards it): stderr when that is the
+# terminal, else /dev/tty, so a parent that captured stderr cannot hide the
+# question from the operator.
+safe_gate_tty_printf() {
+  local fmt="$1"
+  shift
+  if [[ ! -t 2 ]] && { : >/dev/tty; } 2>/dev/null; then
+    # shellcheck disable=SC2059 # callers pass a literal format string
+    printf "${fmt}" "$@" >/dev/tty
+  else
+    # shellcheck disable=SC2059
+    printf "${fmt}" "$@" >&2
+  fi
+}
+
+# Captured-output operator mode, byte-identical to lib/gate-lib.sh: copy this
+# process's stderr onto /dev/tty so the findings a prompt asks about reach the
+# operator while the parent still receives the unchanged stream. Called at
+# safe-run's interactive host-allow entries, which have no install gate around
+# them to mirror for them.
+safe_gate_mirror_stderr() {
+  [[ ! -t 2 ]] && safe_gate_operator_terminal || return 0
+  { : >/dev/tty; } 2>/dev/null || return 0
+  local current=""
+  current="$(readlink "/proc/$$/fd/2" 2>/dev/null)" || current=""
+  if [[ -n "${current}" && "${current}" == "${SAFE_GATE_TTY_MIRROR:-}" ]]; then
+    return 0
+  fi
+  exec 2> >(tee -a /dev/tty >&2 2>/dev/null)
+  SAFE_GATE_TTY_MIRROR="$(readlink "/proc/$$/fd/2" 2>/dev/null)" || SAFE_GATE_TTY_MIRROR=""
+  export SAFE_GATE_TTY_MIRROR
+}
 
 # Stage a replacement BESIDE the file it will replace, and print its path.
 #
@@ -1235,7 +1268,7 @@ runner_kind_to_ecosystem() {
 audit_confirm_or_die() {
   local action="$1" ok
   safe_gate_operator_terminal || die "safe audit flagged this package; ${action} requires an interactive operator terminal"
-  printf '\033[33msafe run:\033[0m %s anyway? [y/N] ' "$action" >&2
+  safe_gate_tty_printf '\033[33msafe run:\033[0m %s anyway? [y/N] ' "$action"
   read -r ok </dev/tty
   [[ "$ok" =~ ^[yY]$ ]] || die "aborted"
 }
@@ -1737,7 +1770,7 @@ host_allow_accept_block() {
   warn "safe audit reported BLOCK for $pkgver: critical advisories $(jq -r '.block.advisories | join(", ")' <<<"$out")"
   warn "  inspect: safe audit package-audit $pkgver --ecosystem $audit_eco"
   warn "  recording accepts exactly these advisories for this exact version; the install gate asks again if another one appears, and signed exports carry the override to followed hosts"
-  printf '\033[33msafe run:\033[0m type %s to accept them: ' "$pkgver" >&2
+  safe_gate_tty_printf '\033[33msafe run:\033[0m type %s to accept them: ' "$pkgver"
   IFS= read -r typed </dev/tty || typed=""
   [[ "$typed" == "$pkgver" ]] || die "aborted (typed text did not match $pkgver)"
   jq -c --arg d "$(date -I)" '{advisories: .block.advisories, accepted: $d}' <<<"$out"
@@ -3174,6 +3207,9 @@ cmd_host_allow_add() {
   shift || true
   [[ -z "$spec" ]] && die "usage: safe run host-allow add <pkg>@<version> [--ecosystem <eco>] [--accept-block]"
   require_operator_tty add "$spec"
+  # The audit findings and the question below are for the operator even when a
+  # parent captures stderr (operator ruling 2026-11-02).
+  safe_gate_mirror_stderr
   local ecosystem="npm" accept_block=0 block_override=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -3247,6 +3283,7 @@ cmd_host_allow_update() {
   shift || true
   [[ -z "$spec" ]] && die "usage: safe run host-allow update <pkg>@<new-version>"
   require_operator_tty update "$spec"
+  safe_gate_mirror_stderr
   while [[ $# -gt 0 ]]; do
     case "$1" in
       *) die "unknown flag: $1" ;;
@@ -3263,7 +3300,7 @@ cmd_host_allow_update() {
   if is_tty; then
     local old_version
     old_version=$(printf '%s' "$existing" | jq -r '.version')
-    printf '\033[33msafe run:\033[0m update %s from %s to %s? [y/N] ' "$PKG_NAME" "$old_version" "$PKG_VERSION" >&2
+    safe_gate_tty_printf '\033[33msafe run:\033[0m update %s from %s to %s? [y/N] ' "$PKG_NAME" "$old_version" "$PKG_VERSION"
     local ok; read -r ok </dev/tty
     [[ "$ok" =~ ^[yY]$ ]] || die "aborted"
   fi
