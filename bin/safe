@@ -2416,9 +2416,10 @@ safe_install_audit_package() {
       # at every terminus (AGENTS.md, 2026-09-07): at an interactive terminal the
       # operator overrides deliberately — [y] once, or [a] also record a standing
       # host-allow grant (agents reinstall unattended). Non-interactively this
-      # stays a refusal with the host-allow hint — the agent asks the operator to
-      # pre-authorize, exactly host-allow's purpose (operator ruling: leave the
-      # agent path as-is). A pre-existing exact host-allow entry is honored first.
+      # stays a refusal with the host-allow hint (operator ruling: leave the
+      # agent path as-is); the agent hands the operator the original command to
+      # run at their terminal, and relays the hint only as the standing grant it
+      # is (ruling 2026-11-17). A pre-existing exact host-allow entry is honored first.
       if safe_install_host_allow_matches "$package" "$ecosystem"; then
         err "safe audit warned for $package; exact host-allow entry permits install"
         safe_install_gate_log "$ecosystem" "$package" "HOST_ALLOW_OVERRIDE"
