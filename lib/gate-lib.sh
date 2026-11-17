@@ -4167,9 +4167,15 @@ safe_gate_pnpm_verify_deps_guard() {
   done
   # The command line outranks the environment in pnpm.
   SAFE_GATE_PNPM_VERIFY_DEPS="${cli:-${envv}}"
-  if [[ -z "${SAFE_GATE_PNPM_VERIFY_DEPS}" ]]; then
+  # Unless the environment itself already holds a non-installing value, the
+  # child gets one. A non-installing flag seen on the command line is not
+  # proof: after `exec <bin>` or `run <script>` the same spelling belongs to
+  # the child (`pnpm exec vitest --config.verify-deps-before-run=false`) and
+  # pnpm never reads it. A flag pnpm does read outranks the environment, so
+  # forcing the variable costs a real one nothing.
+  if [[ "${SAFE_GATE_PNPM_VERIFY_DEPS}" != "install" && "${envv}" != "safe" ]]; then
     export pnpm_config_verify_deps_before_run=warn PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN=warn
-    SAFE_GATE_PNPM_VERIFY_DEPS="forced"
+    [[ -n "${SAFE_GATE_PNPM_VERIFY_DEPS}" ]] || SAFE_GATE_PNPM_VERIFY_DEPS="forced"
   fi
   return 0
 }

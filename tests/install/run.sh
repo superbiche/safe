@@ -7100,6 +7100,20 @@ case_pnpm_run_verbs_cannot_auto_install() {
   assert_status 0 "$FUNCNAME cli" || return
   assert_log_has $'REAL\tpnpm\t--config.verify-deps-before-run=error\texec\tvitest' "$FUNCNAME cli" || return
   assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME cli" || return
+  # The same spelling after the binary or script name belongs to the child,
+  # not to pnpm: the environment is forced all the same.
+  for script in 'pnpm exec vitest --config.verify-deps-before-run=false' 'pnpm run test --verify-deps-before-run=error'; do
+    prepare_case "pnpm-verify-deps-child-arg-$((++CASE_SEQ))"
+    touch "${WORK_DIR}/package.json"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 0 "$FUNCNAME ${script}" || return
+    assert_log_has $'VERIFYDEPS\twarn' "$FUNCNAME ${script}" || return
+  done
+  prepare_case "pnpm-verify-deps-child-arg-env-install-$((++CASE_SEQ))"
+  touch "${WORK_DIR}/package.json"
+  pnpm_config_verify_deps_before_run=install SAFE_INSTALL_TEST_SCRIPT='pnpm exec vitest --config.verify-deps-before-run=false' run_zsh
+  assert_status 0 "$FUNCNAME child arg over env install" || return
+  assert_log_has $'VERIFYDEPS\twarn' "$FUNCNAME child arg over env install" || return
   prepare_case "pnpm-verify-deps-user-env-$((++CASE_SEQ))"
   pnpm_config_verify_deps_before_run=false SAFE_INSTALL_TEST_SCRIPT='pnpm exec vitest' run_zsh
   assert_status 0 "$FUNCNAME env" || return

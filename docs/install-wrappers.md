@@ -299,8 +299,11 @@ date, range-resolved and unaudited, unless `verify-deps-before-run` says
 otherwise. The gate sets `pnpm_config_verify_deps_before_run=warn` for the
 delegate (it outranks the project's `pnpm-workspace.yaml` and `.npmrc`; the
 `npm_config_` spelling is not read by pnpm), also behind `mise exec --`.
-A `false`, `warn` or `error` the command line (`--config.verify-deps-before-run=…`)
-or the environment already sets stands. Any installing request (`install`,
+A `false`, `warn` or `error` the environment already sets stands; one given on
+the command line (`--config.verify-deps-before-run=…`) stands too, since a flag
+pnpm reads outranks the variable, but the gate still sets the variable: the same
+spelling after the binary or script name belongs to the child and pnpm never
+reads it. Any installing request (`install`,
 `prompt`, a bare flag) makes the verb an install: it takes the project gate
 that `pnpm install` takes (scan, and the usual 102 at a non-terminal), and
 the verb's own arguments are never audited as packages.
