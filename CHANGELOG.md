@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.73.0 - 2026-11-17
+
 - A package manager's project gate weighs only its own ecosystem's critical
   findings (operator ruling 2026-11-17). `safe audit repo-audit` adds
   `audit_totals.by_ecosystem`, the same counts per ecosystem (osv, grype and
