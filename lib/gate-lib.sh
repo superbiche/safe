@@ -1518,9 +1518,9 @@ safe_gate_confirm_critical() {
 # it; empty for a tool the project scan is not scoped for.
 safe_gate_scan_scope() {
   case "${SAFE_GATE_TOOL:-}" in
-    npm|npx|pnpm|pnpx|yarn|bun|bunx) printf 'npm' ;;
+    npm|pnpm|pnpx|yarn|bun) printf 'npm' ;;
     composer) printf 'composer' ;;
-    pip|pip3|uv|uvx) printf 'python' ;;
+    pip|pip3|uv) printf 'python' ;;
     cargo) printf 'rust' ;;
     go) printf 'go' ;;
   esac
@@ -4696,10 +4696,20 @@ safe_gate_yarn() {
   local first="${SAFE_GATE_SUBCMD}"
   # A bare `yarn` installs, but `yarn --version` or `yarn --help` only
   # prints: with no subcommand, a version or help flag is not an install.
+  # Values are skipped with the router's own table: in `yarn --cwd -v` the
+  # -v is the project directory, and that command installs.
   if [[ -z "${first}" ]]; then
-    local flag_arg
+    local flag_arg skip_value=0
     for flag_arg in "$@"; do
+      if (( skip_value )); then
+        skip_value=0
+        continue
+      fi
       [[ "${flag_arg}" == "--" ]] && break
+      if safe_gate_alt_match "${flag_arg}" "${SAFE_GATE_GVAL}"; then
+        skip_value=1
+        continue
+      fi
       case "${flag_arg}" in
         -v|--version|-h|--help) safe_gate_exec_real yarn "$@"; return $? ;;
       esac

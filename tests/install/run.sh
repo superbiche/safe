@@ -3481,6 +3481,9 @@ case_scan_scope_own_ecosystem_still_gates() {
     SAFE_INSTALL_TEST_SCRIPT='yarn install' run_zsh
   assert_status 102 "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tyarn' "$FUNCNAME" || return
+  # The other-ecosystem note comes first; the refusal stays the final line.
+  assert_err_contains_fragment "1 critical finding(s) in this project's composer dependencies do not gate this yarn install" "$FUNCNAME" || return
+  [[ "$(tail -n 1 "${ERR_FILE}")" == "safe: BLOCKED install"* ]] || { printf 'last stderr line: %s\n' "$(tail -n 1 "${ERR_FILE}")" >&2; fail "$FUNCNAME final line"; return; }
   pass "$FUNCNAME"
 }
 
@@ -3513,6 +3516,17 @@ case_yarn_version_or_help_is_not_an_install() {
     assert_status 0 "$FUNCNAME ${script}" || return
     assert_log_contains "REAL"$'\t'"$(tr ' ' '\t' <<<"${script}")" "$FUNCNAME ${script}" || return
     assert_log_not_contains_fragment 'repo-audit' "$FUNCNAME ${script}" || return
+  done
+  # A value-taking flag's value is not a version or help flag: these install.
+  for script in 'yarn --cwd -v' 'yarn --modules-folder --help'; do
+    prepare_case "yarn-flag-value"
+    touch "${WORK_DIR}/package.json"
+    mkdir -p -- "${WORK_DIR}/-v"
+    touch "${WORK_DIR}/-v/package.json"
+    SAFE_AUDIT_SCAN_STATUS=0 SAFE_AUDIT_SCAN_VERDICT=WARN SAFE_AUDIT_SCAN_CRITICAL=1 \
+      SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 102 "$FUNCNAME ${script}" || return
+    assert_log_not_contains_fragment $'REAL\tyarn' "$FUNCNAME ${script}" || return
   done
   prepare_case "yarn-bare-installs"
   touch "${WORK_DIR}/package.json"
