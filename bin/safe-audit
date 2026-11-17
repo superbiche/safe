@@ -37,7 +37,9 @@ SCAN_CACHE_TTL_SECONDS="${SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS:-86400}"
 #     the composer lane this version intended to recompute.
 #   3: cargo-audit only reads an explicit existing lockfile; missing locks
 #     report missing coverage rather than invoking Cargo to generate evidence.
-SCAN_CACHE_SCHEMA=3
+#   4: audit_totals carries by_ecosystem; replaying an older document would
+#     make every install gate fall back to the project-wide total.
+SCAN_CACHE_SCHEMA=4
 CHECKS_DIR="$DATA_DIR/checks"
 SOCKET_CACHE_SCHEMA=1
 SOCKET_CACHE_STALE_SCORE=""
@@ -3006,6 +3008,35 @@ build_scan_result_from_artifacts() {
     esac
   done < <(summarize_osv_counts "$osv_json")
 
+  # The same counts per ecosystem, so a package manager's install gate can
+  # weigh the findings of the dependencies it installs (a yarn install does
+  # not stop on a PHP advisory). Severity mapping is the totals' own; an
+  # ecosystem the scanners do not name is "other", which every gate counts.
+  local cve_by_ecosystem_json eco_line eco_name
+  local -A eco_counts=()
+  while IFS=$'\t' read -r eco_name severity; do
+    severity=$(severity_from_osv_entry "$severity")
+    [[ "$severity" == "unknown" ]] && severity=medium
+    eco_counts["$eco_name"$'\t'"$severity"]=$(( ${eco_counts["$eco_name"$'\t'"$severity"]:-0} + 1 ))
+  done < <(jq -r '
+      def eco: {"npm":"npm","packagist":"composer","pypi":"python","go":"go","crates.io":"rust"}[ascii_downcase] // "other";
+      .results[]?.packages[]? | ((.package.ecosystem // "") | eco) as $e
+      | .vulnerabilities[]? | [$e, (.database_specific.severity // .severity[0].score // "unknown")] | @tsv
+    ' "$osv_json" 2>/dev/null || true)
+  while IFS=$'\t' read -r eco_name severity; do
+    case "$severity" in critical|high|medium|low) ;; *) continue ;; esac
+    eco_counts["$eco_name"$'\t'"$severity"]=$(( ${eco_counts["$eco_name"$'\t'"$severity"]:-0} + 1 ))
+  done < <(jq -r '
+      def eco: {"npm":"npm","php-composer":"composer","python":"python","go-module":"go","rust-crate":"rust"}[.] // "other";
+      .matches[]? | [((.artifact.type // "") | eco), (.vulnerability.severity // "" | ascii_downcase)] | @tsv
+    ' "$grype_json" 2>/dev/null || true)
+  cve_by_ecosystem_json=$(for eco_line in "${!eco_counts[@]}"; do
+      printf '%s\t%s\n' "$eco_line" "${eco_counts[$eco_line]}"
+    done | jq -R -s '
+      [split("\n")[] | select(length > 0) | split("\t") | {e: .[0], s: .[1], n: (.[2] | tonumber)}]
+      | reduce .[] as $x ({}; .[$x.e][$x.s] += $x.n)')
+  [[ -n "$cve_by_ecosystem_json" ]] || cve_by_ecosystem_json='{}'
+
   local findings_json
   findings_json=$(jq -n --slurpfile osv "$osv_json" --slurpfile grype "$grype_json" '
     def osv_severity:
@@ -3122,6 +3153,7 @@ build_scan_result_from_artifacts() {
   audit_totals_json=$(jq \
     --argjson critical "$critical" --argjson high "$high" \
     --argjson medium "$medium" --argjson low "$low" \
+    --argjson cve_by_ecosystem "$cve_by_ecosystem_json" \
     '. as $audits |
     def counted: (.status // "") as $s | ($s == "ok") or ($s == "partial");
     def sum(f): ([$audits[]? | select(counted) | (f // 0)] | add) // 0;
@@ -3135,6 +3167,15 @@ build_scan_result_from_artifacts() {
       ecosystem: [$audits[]? | select(counted)
                   | {scanner, status, total, critical, high, medium, low, unknown: (.unknown // 0),
                      root: (.root // ".")}],
+      by_ecosystem: (
+        reduce ($audits[]? | select(counted)) as $a ($cve_by_ecosystem;
+          ({"npm-audit":"npm","composer-audit":"composer","pip-audit":"python",
+            "govulncheck":"go","cargo-audit":"rust"}[$a.scanner // ""] // "other") as $e
+          | .[$e].critical += ($a.critical // 0) | .[$e].high += ($a.high // 0)
+          | .[$e].medium += ($a.medium // 0) | .[$e].low += ($a.low // 0)
+          | .[$e].unknown += ($a.unknown // 0))
+        | with_entries(.value |= {critical: (.critical // 0), high: (.high // 0), medium: (.medium // 0),
+                                   low: (.low // 0), unknown: (.unknown // 0)})),
       deduplicated: false
     }' <<<"$ecosystem_audits_json" 2>/dev/null || printf '{"critical":%s,"high":%s,"medium":%s,"low":%s,"unknown":0,"deduplicated":false}' \
       "$critical" "$high" "$medium" "$low")

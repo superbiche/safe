@@ -431,6 +431,13 @@ so one advisory seen by three scanners counts three times. The aggregate
 answers "is there a critical anywhere", which double counting cannot change;
 anything showing a number to a human shows the per-scanner breakdown instead.
 
+`.audit_totals.by_ecosystem` splits the same counts by ecosystem (`npm`,
+`composer`, `python`, `go`, `rust`, and `other` for findings no scanner
+attributes to one): osv by the package's ecosystem, grype by the artifact type,
+each ecosystem audit by its scanner. It adds up to the totals. An install
+gate's project scan reads it to weigh only the ecosystem the tool installs,
+plus `other` ([install wrappers](install-wrappers.md)).
+
 ### JVM / Maven and Gradle
 
 JVM dependencies get **coverage without command-gating**. Gradle and Maven are

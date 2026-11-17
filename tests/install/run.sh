@@ -308,6 +308,8 @@ if [[ "${1:-}" == "repo-audit" ]]; then
     stub_eco_audits="${SAFE_AUDIT_SCAN_ECOSYSTEM_AUDITS:-}"
     [[ -n "${stub_eco_audits}" ]] || stub_eco_audits='[]'
     scan_critical="${SAFE_AUDIT_SCAN_CRITICAL:-0}"
+    stub_by_ecosystem=""
+    [[ -z "${SAFE_AUDIT_SCAN_BY_ECOSYSTEM:-}" ]] || stub_by_ecosystem=", \"by_ecosystem\": ${SAFE_AUDIT_SCAN_BY_ECOSYSTEM}"
     if [[ -n "${SAFE_AUDIT_SCAN_CRITICAL_PROJECT:-}" ]]; then
       if [[ "$PWD" == "${SAFE_AUDIT_SCAN_CRITICAL_PROJECT}" ]]; then
         scan_critical=1
@@ -323,7 +325,7 @@ if [[ "${1:-}" == "repo-audit" ]]; then
   "audit_totals": {
     "critical": ${scan_critical}, "high": 0, "medium": 0, "low": 0, "unknown": 0,
     "cve_scan": {"critical": ${scan_critical}, "high": 0, "medium": 0, "low": 0},
-    "ecosystem": [], "deduplicated": false
+    "ecosystem": [], "deduplicated": false${stub_by_ecosystem}
   },
   "tool_status": ${stub_tool_status},
   "ecosystem_audits": ${stub_eco_audits}
@@ -3454,6 +3456,83 @@ case_critical_in_result_blocks_despite_exit_zero() {
   assert_project_scan_logged "$FUNCNAME" || return
   assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
   assert_err_contains_fragment 'safe: BLOCKED install — safe audit repo-audit found critical findings' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# A package manager's install gates on its own ecosystem's criticals (and on
+# findings no ecosystem claims); other ecosystems' are reported, never gating.
+case_scan_scope_other_ecosystem_reported_not_gating() {
+  prepare_case "scan-scope-other-ecosystem"
+  touch "${WORK_DIR}/package.json"
+  SAFE_AUDIT_SCAN_STATUS=0 SAFE_AUDIT_SCAN_VERDICT=WARN SAFE_AUDIT_SCAN_CRITICAL=2 \
+    SAFE_AUDIT_SCAN_BY_ECOSYSTEM='{"composer":{"critical":2,"high":0,"medium":0,"low":0,"unknown":0},"npm":{"critical":0,"high":3,"medium":0,"low":0,"unknown":0}}' \
+    SAFE_INSTALL_TEST_SCRIPT='npm ci' run_zsh
+  assert_status 0 "$FUNCNAME" || return
+  assert_log_contains $'REAL\tnpm\tci' "$FUNCNAME" || return
+  assert_err_contains_fragment "2 critical finding(s) in this project's composer dependencies do not gate this npm install" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_scan_scope_own_ecosystem_still_gates() {
+  prepare_case "scan-scope-own-ecosystem"
+  touch "${WORK_DIR}/package.json"
+  SAFE_AUDIT_SCAN_STATUS=0 SAFE_AUDIT_SCAN_VERDICT=WARN SAFE_AUDIT_SCAN_CRITICAL=2 \
+    SAFE_AUDIT_SCAN_BY_ECOSYSTEM='{"composer":{"critical":1},"npm":{"critical":1}}' \
+    SAFE_INSTALL_TEST_SCRIPT='yarn install' run_zsh
+  assert_status 102 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tyarn' "$FUNCNAME" || return
+  # The other-ecosystem note comes first; the refusal stays the final line.
+  assert_err_contains_fragment "1 critical finding(s) in this project's composer dependencies do not gate this yarn install" "$FUNCNAME" || return
+  [[ "$(tail -n 1 "${ERR_FILE}")" == "safe: BLOCKED install"* ]] || { printf 'last stderr line: %s\n' "$(tail -n 1 "${ERR_FILE}")" >&2; fail "$FUNCNAME final line"; return; }
+  pass "$FUNCNAME"
+}
+
+case_scan_scope_unattributed_or_inconsistent_gates() {
+  prepare_case "scan-scope-unattributed"
+  touch "${WORK_DIR}/package.json"
+  SAFE_AUDIT_SCAN_STATUS=0 SAFE_AUDIT_SCAN_VERDICT=WARN SAFE_AUDIT_SCAN_CRITICAL=1 \
+    SAFE_AUDIT_SCAN_BY_ECOSYSTEM='{"other":{"critical":1}}' \
+    SAFE_INSTALL_TEST_SCRIPT='npm ci' run_zsh
+  assert_status 102 "$FUNCNAME" || return
+  # A breakdown that does not add up to the total gates on the total.
+  prepare_case "scan-scope-inconsistent"
+  touch "${WORK_DIR}/package.json"
+  SAFE_AUDIT_SCAN_STATUS=0 SAFE_AUDIT_SCAN_VERDICT=WARN SAFE_AUDIT_SCAN_CRITICAL=3 \
+    SAFE_AUDIT_SCAN_BY_ECOSYSTEM='{"composer":{"critical":1}}' \
+    SAFE_INSTALL_TEST_SCRIPT='npm ci' run_zsh
+  assert_status 102 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# `yarn --version` and `yarn --help` print; only a bare `yarn` installs.
+case_yarn_version_or_help_is_not_an_install() {
+  local script
+  for script in 'yarn --version' 'yarn -v' 'yarn --help' 'yarn --cwd sub -h'; do
+    prepare_case "yarn-flag-only"
+    touch "${WORK_DIR}/package.json"
+    mkdir -p "${WORK_DIR}/sub"
+    SAFE_AUDIT_SCAN_CRITICAL=1 SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 0 "$FUNCNAME ${script}" || return
+    assert_log_contains "REAL"$'\t'"$(tr ' ' '\t' <<<"${script}")" "$FUNCNAME ${script}" || return
+    assert_log_not_contains_fragment 'repo-audit' "$FUNCNAME ${script}" || return
+  done
+  # A value-taking flag's value is not a version or help flag: these install.
+  for script in 'yarn --cwd -v' 'yarn --modules-folder --help'; do
+    prepare_case "yarn-flag-value"
+    touch "${WORK_DIR}/package.json"
+    mkdir -p -- "${WORK_DIR}/-v"
+    touch "${WORK_DIR}/-v/package.json"
+    SAFE_AUDIT_SCAN_STATUS=0 SAFE_AUDIT_SCAN_VERDICT=WARN SAFE_AUDIT_SCAN_CRITICAL=1 \
+      SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 102 "$FUNCNAME ${script}" || return
+    assert_log_not_contains_fragment $'REAL\tyarn' "$FUNCNAME ${script}" || return
+  done
+  prepare_case "yarn-bare-installs"
+  touch "${WORK_DIR}/package.json"
+  SAFE_AUDIT_SCAN_STATUS=0 SAFE_AUDIT_SCAN_VERDICT=WARN SAFE_AUDIT_SCAN_CRITICAL=1 \
+    SAFE_INSTALL_TEST_SCRIPT='yarn --frozen-lockfile' run_zsh
+  assert_status 102 "$FUNCNAME bare" || return
   pass "$FUNCNAME"
 }
 
@@ -6855,6 +6934,10 @@ main() {
     case_critical_scan_non_tty_aborts \
     case_scan_failed_outright_non_tty_blocks \
     case_critical_in_result_blocks_despite_exit_zero \
+    case_scan_scope_other_ecosystem_reported_not_gating \
+    case_scan_scope_own_ecosystem_still_gates \
+    case_scan_scope_unattributed_or_inconsistent_gates \
+    case_yarn_version_or_help_is_not_an_install \
     case_broken_scanner_warns_and_proceeds \
     case_malformed_result_document_is_not_read_as_clean \
     case_clean_result_proceeds_quietly \
