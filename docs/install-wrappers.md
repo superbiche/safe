@@ -79,7 +79,11 @@ per-project tool versions keep resolving.
 invocations preflight the configured tools and audit not-yet-installed (and,
 on `up`, non-exactly-pinned; on `up --bump`, all) backend entries — and a
 gated command behind `mise exec --` gets the routing/audit pass while mise
-keeps the execution. `mise exec` also preflights configured tools unless
+keeps the execution. The inner command is classified exactly as the direct
+gate classifies it: the pass ends where the direct gate would have delegated,
+so a verb that installs nothing (`pnpm run check:docs`, `pnpm pack
+--pack-destination out/`) is not audited as a package under `mise exec`
+either, while `mise exec -- pnpm add <pkg>` is audited as before. `mise exec` also preflights configured tools unless
 `exec_auto_install` is verifiably disabled, since exec installs missing
 tools on demand. Bare shorthands (`mise install prettier`) resolve to their
 effective backend via `mise registry` before the runtime-vs-package call is
@@ -274,14 +278,61 @@ composer update
 
 Non-install and non-exec commands pass through unchanged. A bare `yarn`
 installs, but `yarn --version`, `yarn -v`, `yarn --help` and `yarn -h` only
-print and pass through.
+print and pass through. So do `bun -e <code>` / `--eval <code>` and
+`-p` / `--print <code>`: the code is the flag's separate value, parsed like
+the `=` form (`bun -e` still lets bun auto-install what the code imports;
+that boundary is the same for both spellings).
 
-Any `-r` file on a pip / `uv pip` install — whatever its basename — routes
-through the project scan, and the named `-r`/`-c` files ride into the scan's
+`pack` (`npm pack`, `pnpm pack`) builds a tarball and installs nothing, so it
+passes through; `--pack-destination` takes a value, never a package.
+`npm pack <registry-spec>` downloads a tarball without extracting it or
+running any script, the same class as `pip download` and `npm view`, which
+pass through today; it is not audited. If fetch-only commands should be
+gated, that is a policy change for all of them together.
+
+A `pkg@catalog:` or `pkg@catalog:<name>` specifier on `pnpm` and `bun` is
+resolved against the workspace catalog before the audit (pnpm:
+`catalog:`/`catalogs:` of the nearest `pnpm-workspace.yaml`; bun: `catalog`/
+`catalogs` of the workspace root `package.json`, top level or under
+`workspaces`), searched upward from the command's directory. The audit then
+judges the version or range the entry names. bun ignores a member package's
+own catalog, and the gate does not evaluate workspace globs, so for bun every
+manifest that could be the root must name the same entry: each manifest
+upward that declares `workspaces`, plus the nearest one when it carries
+catalog fields. An entry the gate cannot read (no catalog, no such entry,
+candidates that disagree, one manifest naming the entry both at the top
+level and under `workspaces` with different values, a manifest that is not
+strict JSON, no `workspaces` declaration at all, a git/file/workspace value,
+a layout the line reader does not model, or a global install) leaves the
+specifier unresolved, and the audit refuses it as before.
+
+pnpm 12 checks a project's dependencies before it runs a script or binary
+(`run`, `exec`, `test`, `start`, a bare `<script>`) and installs what is out of
+date, range-resolved and unaudited, unless `verify-deps-before-run` says
+otherwise. The gate sets `pnpm_config_verify_deps_before_run=warn` for the
+delegate (it outranks the project's `pnpm-workspace.yaml` and `.npmrc`; the
+`npm_config_` spelling is not read by pnpm), also behind `mise exec --`.
+A `false`, `warn` or `error` the environment already sets stands; one given on
+the command line (`--config.verify-deps-before-run=…`) stands too, since a flag
+pnpm reads outranks the variable, but the gate still sets the variable: the same
+spelling after the binary or script name belongs to the child and pnpm never
+reads it. Any installing request (`install`,
+`prompt`, a bare flag) makes the verb an install: it takes the project gate
+that `pnpm install` takes (scan, and the usual 102 at a non-terminal), and
+the verb's own arguments are never audited as packages.
+
+Any `-r` file on a pip / `uv pip` install — whatever its basename, and in
+uv's plural spelling `--requirements` as well — routes
+through the project scan, and the named `-r`/`-c` files (`--constraints`,
+`--overrides` and `--build-constraints` too) ride into the scan's
 pip-audit lane (`--pip-requirement`), so their packages are audited even when
 no conventionally-named requirements file exists. A remote (`https://…`)
 requirement file cannot be inventoried and refuses, with the download-locally
 recovery on the line; a missing local file delegates to pip's own error.
+`--only-binary` and `--no-binary` take a value on pip and `uv pip install`
+(`:all:`, `:none:`, package names), so the value is not read as a package;
+on `uv tool install`, `uv tool run` and `uv run` `--no-binary` is a switch,
+and `--no-binary-package`/`--no-build-package` take the value.
 
 A pip/uv argument naming a local archive (`.whl`, `.tar.gz`, `.tgz`, `.zip`)
 is a local artifact, not a package identity — including the bare-relative
@@ -355,7 +406,8 @@ for named specs): `npm update|u|up|upgrade|udpate`, `npm it|install-test`,
 `yarn global upgrade`.
 
 Passthrough by design — these never fetch registry packages: `pnpm exec`
-and `composer exec` (project/vendor binaries only), `uv run` without
+(project binaries only, with pnpm's own pre-run install switched off as
+described above) and `composer exec` (vendor binaries only), `uv run` without
 `--with`/`-w`, and `go run` of local paths.
 `npm exec <tool>` / `bun x <tool>` pass through only for a **bare** command
 name backed by `node_modules/.bin/<tool>` in the physical cwd or a parent

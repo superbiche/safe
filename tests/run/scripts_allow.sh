@@ -225,7 +225,7 @@ env npm_config_dangerously_allow_all_scripts=true NPM_CONFIG_IGNORE_SCRIPTS=fals
 grep -q '^ignore_scripts=unset$' "$tmp/npm-invocation.log" || fail "inherited NPM_CONFIG_IGNORE_SCRIPTS must be scrubbed"
 env_dump=$(env npm_config_dangerously_allow_all_scripts=true \
   bash -c "PATH='$tmp/bin:/usr/bin:/bin' SAFE_RUN_CONFIG_DIR='$tmp/config' SAFE_RUN_DATA_DIR='$tmp/data' \
-    bash -c \"source '$GATE_LIB'; SAFE_GATE_NO_EXEC=1 safe_gate_main npm install -g left-pad@9.9.9; env\"" 2>/dev/null)
+    bash -c \"source '$GATE_LIB'; trap env EXIT; SAFE_GATE_NO_EXEC=1 safe_gate_main npm install -g left-pad@9.9.9\"" 2>/dev/null)
 grep -q "dangerously_allow_all" <<<"$env_dump" && fail "inherited dangerously-allow-all env must be scrubbed"
 pass "inherited script-policy env scrubbed before the delegate"
 

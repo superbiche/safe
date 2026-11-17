@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Gate verb parsing sweep (six inbox findings):
+  - `mise exec -- <tool> <verb>` classifies the inner command exactly as the
+    direct gate does. The audit-only exec used to return where the direct
+    gate delegates, so `mise exec node@X -- pnpm run check:docs` audited
+    `check@docs` and `pnpm pack --pack-destination <dir>` audited `<dir>` as
+    packages. Same for npm, yarn and bun inner commands.
+  - `bun -e <code>`, `--eval <code>`, `-p <code>` and `--print <code>` take a
+    separate value, like their `=` forms, instead of refusing.
+  - `pkg@catalog:` / `pkg@catalog:<name>` on `pnpm` and `bun` resolve against
+    the workspace catalog (`pnpm-workspace.yaml`, root `package.json`) and are
+    audited as the version they name; an unreadable entry keeps the refusal.
+  - uv's `--requirements` is handled wherever `-r` is (project scan, remote
+    refusal, local-artifact route); `--constraints`, `--overrides` and
+    `--build-constraints` join the constraint files. `--only-binary` /
+    `--no-binary` take their value on pip and `uv pip install` (`:all:` is no
+    longer read as a package) and stay switches on `uv tool install`/`run`.
+  - pnpm verbs that run something (`exec`, `run`, `test`, `start`, bare
+    `<script>`) can no longer install on their own: the gate sets
+    `pnpm_config_verify_deps_before_run=warn` for the delegate (also behind
+    `mise exec`) unless the command or environment already sets a
+    non-installing value. An explicit installing value gates the verb as a
+    project install, like `pnpm install`.
 - safe now owns the `npx`, `bunx` and `uvx` runner links. `install.sh` creates
   them in `~/.local/bin` (ahead of mise shims), keeps or adopts a link that
   already points at `safe-run`, moves a uv-installed `uvx` aside like `uv`,

@@ -84,6 +84,11 @@ tool="$(basename -- "$0")"
     printf '\t%s' "${arg}"
   done
   printf '\n'
+  # pnpm's dependency check before a script run: the value the delegate
+  # would see (logged only when set, so other assertions are unaffected).
+  if [[ -n "${pnpm_config_verify_deps_before_run:-}" ]]; then
+    printf 'VERIFYDEPS\t%s\n' "${pnpm_config_verify_deps_before_run}"
+  fi
   # Any source-set variable reaching the delegated tool's environment is a
   # credential leak: the gate accumulates them, the real tool must never see
   # them. Logged only when non-empty so existing assertions are unaffected.
@@ -467,6 +472,7 @@ case "$sub" in
     ;;
 esac
 log_line REAL mise "$@"
+[[ -z "${pnpm_config_verify_deps_before_run:-}" ]] || log_line VERIFYDEPS "${pnpm_config_verify_deps_before_run}"
 exit "${SAFE_INSTALL_REAL_STATUS:-0}"
 STUB
   chmod +x "${bin_dir}/mise"
@@ -566,7 +572,8 @@ prepare_case() {
   # run_zsh forwards these npm config keys into the gated shell, so a value
   # inherited from the environment the suite was launched in would reach the
   # npm stub and move a hermetic case's effective config.
-  unset npm_config_os NPM_CONFIG_OS npm_config_userconfig npm_config_globalconfig
+  unset npm_config_os NPM_CONFIG_OS npm_config_userconfig npm_config_globalconfig \
+    pnpm_config_verify_deps_before_run PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN
 
   mkdir -p "${BIN_DIR}" "${WRAPPER_DIR}" "${WORK_DIR}" "${HOME_DIR}"
   : > "${LOG_FILE}"
@@ -7044,6 +7051,328 @@ EOF
   pass "$FUNCNAME"
 }
 
+# Fragment match (assert_log_contains wants the whole line): for audit lines
+# whose tail carries gate flags that are not the point of the case.
+CASE_SEQ=0
+assert_log_has() {
+  local needle="$1"
+  local label="$2"
+  if ! grep -Fq -- "${needle}" "${LOG_FILE}"; then
+    printf 'missing log fragment: %s\n' "${needle}" >&2
+    printf 'log:\n%s\n' "$(cat "${LOG_FILE}")" >&2
+    fail "${label}"
+    return 1
+  fi
+  return 0
+}
+
+# --- gate verb parsing sweep (inbox 2026-10-14..2026-11-02) ------------------
+
+# `mise exec -- <tool> <verb>` must classify the inner command exactly as the
+# direct gate does. The audit-only exec used to RETURN instead of ending the
+# scan, so a pass-through verb (`pnpm run`, `pack`) fell into the install lane
+# and its script name or destination was audited as a package.
+case_mise_exec_inner_non_install_verbs_pass_through() {
+  local script
+  for script in \
+    'pnpm run check:docs' 'pnpm run check' 'pnpm run build:test' \
+    'npm run build' 'yarn run build' 'bun run dev' \
+    'pnpm pack --pack-destination /tmp/safe-pack-out' 'npm pack'; do
+    prepare_case "mise-inner-passthrough-$((++CASE_SEQ))"
+    touch "${WORK_DIR}/package.json"
+    SAFE_INSTALL_TEST_SCRIPT="mise exec node@26.10.0 -- ${script}" run_zsh
+    assert_status 0 "$FUNCNAME ${script}" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME ${script}" || return
+    assert_log_has "REAL"$'\t'"mise"$'\t'"exec"$'\t'"node@26.10.0"$'\t'"--"$'\t'"$(tr ' ' '\t' <<<"${script}")" "$FUNCNAME ${script}" || return
+    # The direct gate agrees on every one of them.
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 0 "$FUNCNAME direct ${script}" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME direct ${script}" || return
+  done
+  # The verb position is exact: the same words as package names still audit.
+  for script in 'pnpm add blockme run' 'pnpm add blockme pack' 'npm install blockme pack' 'bun add blockme run'; do
+    prepare_case "mise-inner-verb-position-$((++CASE_SEQ))"
+    SAFE_INSTALL_TEST_SCRIPT="mise exec -- ${script}" run_zsh
+    assert_status 104 "$FUNCNAME ${script}" || return
+    assert_log_has $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tnpm' "$FUNCNAME ${script}" || return
+    assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME ${script}" || return
+  done
+  # An install verb through mise still takes the project scan.
+  prepare_case "mise-inner-install-scans-$((++CASE_SEQ))"
+  touch "${WORK_DIR}/package.json"
+  SAFE_AUDIT_SCAN_STATUS=0 SAFE_AUDIT_SCAN_VERDICT=WARN SAFE_AUDIT_SCAN_CRITICAL=1 \
+    SAFE_INSTALL_TEST_SCRIPT='mise exec -- pnpm install' run_zsh
+  assert_status 102 "$FUNCNAME install" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME install" || return
+  pass "$FUNCNAME"
+}
+
+# `bun -e <code>` / `-p <code>` take a separate value like their `=` forms.
+case_bun_eval_print_separate_value() {
+  local script
+  for script in "bun -e 'console.log(1)'" "bun --eval 'console.log(1)'" "bun -p '1+1'" "bun --print '1+1'" \
+    "bun --eval='console.log(1)'"; do
+    prepare_case "bun-eval-separate-$((++CASE_SEQ))"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 0 "$FUNCNAME ${script}" || return
+    assert_log_has $'REAL\tbun' "$FUNCNAME ${script}" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME ${script}" || return
+  done
+  # The value is consumed, not the subcommand after it.
+  for script in "bun --print 1 add blockme" "bun -e 'x' install blockme"; do
+    prepare_case "bun-eval-then-install-$((++CASE_SEQ))"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 104 "$FUNCNAME ${script}" || return
+    assert_log_has $'AUDIT\tpackage-audit\tblockme' "$FUNCNAME ${script}" || return
+  done
+  prepare_case "bun-eval-others-still-fail-closed-$((++CASE_SEQ))"
+  SAFE_INSTALL_TEST_SCRIPT='bun --frobnicate add blockme' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tbun' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# `pkg@catalog:` / `pkg@catalog:<name>` resolve against the workspace catalog.
+case_catalog_specifiers_resolve_against_workspace() {
+  prepare_case "catalog-pnpm-$((++CASE_SEQ))"
+  mkdir -p "${WORK_DIR}/packages/app"
+  cat > "${WORK_DIR}/pnpm-workspace.yaml" <<'YAML'
+packages:
+  - 'packages/*'
+catalog:
+  okpkg: ^1.2.0   # trailing comment
+  '@scope/lib': "2.0.1"
+  blockme: 9.9.9
+catalogs:
+  ui:
+    okpkg: ~3.1.0
+YAML
+  printf '{"name":"app"}\n' > "${WORK_DIR}/packages/app/package.json"
+  printf '{"name":"root"}\n' > "${WORK_DIR}/package.json"
+  SAFE_INSTALL_TEST_SCRIPT='cd packages/app && pnpm add okpkg@catalog: @scope/lib@catalog:' run_zsh
+  assert_status 0 "$FUNCNAME pnpm default" || return
+  assert_log_has $'AUDIT\tpackage-audit\tokpkg@^1.2.0\t' "$FUNCNAME" || return
+  assert_log_has $'AUDIT\tpackage-audit\t@scope/lib@2.0.1\t' "$FUNCNAME" || return
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='cd packages/app && pnpm add okpkg@catalog:ui' run_zsh
+  assert_status 0 "$FUNCNAME pnpm named" || return
+  assert_log_has $'AUDIT\tpackage-audit\tokpkg@~3.1.0\t' "$FUNCNAME" || return
+  assert_log_has $'REAL\tpnpm\tadd\tokpkg@catalog:ui' "$FUNCNAME" || return
+  # The resolved version is what the verdict covers: a blocked catalog entry blocks.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='pnpm add blockme@catalog:' run_zsh
+  assert_status 104 "$FUNCNAME pnpm blocked" || return
+  assert_log_has $'AUDIT\tpackage-audit\tblockme@9.9.9\t' "$FUNCNAME" || return
+  # No entry: the specifier stays as typed (today's honest refusal path).
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='pnpm add okpkg@catalog:nope missing@catalog:' run_zsh
+  assert_log_has $'AUDIT\tpackage-audit\tokpkg@catalog@nope\t' "$FUNCNAME unresolved" || return
+  assert_log_has $'AUDIT\tpackage-audit\tmissing@catalog\t' "$FUNCNAME unresolved" || return
+
+  prepare_case "catalog-bun-$((++CASE_SEQ))"
+  cat > "${WORK_DIR}/package.json" <<'JSON'
+{"name":"root","workspaces":{"packages":["packages/*"],"catalog":{"okpkg":"^4.0.0"},"catalogs":{"native":{"@opentui/core":"0.1.5"}}}}
+JSON
+  SAFE_INSTALL_TEST_SCRIPT='bun install "--os=*" "--cpu=*" @opentui/core@catalog:native okpkg@catalog:' run_zsh
+  assert_status 0 "$FUNCNAME bun" || return
+  assert_log_has $'AUDIT\tpackage-audit\t@opentui/core@0.1.5\t' "$FUNCNAME bun" || return
+  assert_log_has $'AUDIT\tpackage-audit\tokpkg@^4.0.0\t' "$FUNCNAME bun" || return
+  # Top-level `catalog` of the root manifest, and a missing named catalog.
+  printf '{"name":"root","workspaces":["packages/*"],"catalog":{"okpkg":"5.0.0"}}\n' > "${WORK_DIR}/package.json"
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='bun add okpkg@catalog: okpkg@catalog:absent' run_zsh
+  assert_log_has $'AUDIT\tpackage-audit\tokpkg@5.0.0\t' "$FUNCNAME bun top-level" || return
+  assert_log_has $'AUDIT\tpackage-audit\tokpkg@catalog@absent\t' "$FUNCNAME bun absent" || return
+  # A non-registry value (git URL) is not read as a version.
+  printf '{"name":"root","workspaces":["packages/*"],"catalog":{"okpkg":"github:foo/bar"}}\n' > "${WORK_DIR}/package.json"
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='bun add okpkg@catalog:' run_zsh
+  assert_log_has $'AUDIT\tpackage-audit\tokpkg@catalog\t' "$FUNCNAME bun git value" || return
+  # bun reads the workspace root's catalog and ignores a member's own: from
+  # a member the root's entry is audited, and a member manifest that carries a
+  # different entry (a decoy the gate would otherwise audit instead of what
+  # bun installs) leaves the specifier unresolved.
+  prepare_case "catalog-bun-member-$((++CASE_SEQ))"
+  mkdir -p "${WORK_DIR}/packages/app" "${WORK_DIR}/packages/decoy"
+  printf '{"name":"root","workspaces":{"packages":["packages/*"],"catalog":{"okpkg":"7.0.0"}}}\n' > "${WORK_DIR}/package.json"
+  printf '{"name":"app"}\n' > "${WORK_DIR}/packages/app/package.json"
+  printf '{"name":"decoy","catalog":{"okpkg":"6.0.0"}}\n' > "${WORK_DIR}/packages/decoy/package.json"
+  SAFE_INSTALL_TEST_SCRIPT='cd packages/app && bun add okpkg@catalog:' run_zsh
+  assert_log_has $'AUDIT\tpackage-audit\tokpkg@7.0.0\t' "$FUNCNAME bun member" || return
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='cd packages/decoy && bun add okpkg@catalog:' run_zsh
+  assert_log_has $'AUDIT\tpackage-audit\tokpkg@catalog\t' "$FUNCNAME bun member decoy" || return
+  assert_log_not_contains_fragment 'okpkg@6.0.0' "$FUNCNAME bun member decoy" || return
+  assert_log_not_contains_fragment 'okpkg@7.0.0' "$FUNCNAME bun member decoy" || return
+  # One manifest naming the entry at the top level AND under `workspaces`
+  # with different values: which one bun takes is not the gate's to guess.
+  printf '{"name":"root","catalog":{"okpkg":"6.0.0"},"workspaces":{"packages":["packages/*"],"catalog":{"okpkg":"7.0.0"}}}\n' > "${WORK_DIR}/package.json"
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='cd packages/app && bun add okpkg@catalog:' run_zsh
+  assert_log_has $'AUDIT\tpackage-audit\tokpkg@catalog\t' "$FUNCNAME bun both locations" || return
+  assert_log_not_contains_fragment 'okpkg@6.0.0' "$FUNCNAME bun both locations" || return
+  # A root manifest bun can read and jq cannot (a comment) is an unknown
+  # answer, not an absent root: the member's own catalog is not promoted.
+  printf '{\n  // comment\n  "name":"root","workspaces":{"packages":["packages/*"],"catalog":{"okpkg":"7.0.0"}}}\n' > "${WORK_DIR}/package.json"
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='cd packages/decoy && bun add okpkg@catalog:' run_zsh
+  assert_log_has $'AUDIT\tpackage-audit\tokpkg@catalog\t' "$FUNCNAME bun jsonc root" || return
+  assert_log_not_contains_fragment 'okpkg@6.0.0' "$FUNCNAME bun jsonc root" || return
+  # No manifest declares workspaces: bun refuses catalogs there, nothing resolves.
+  printf '{"name":"root","catalog":{"okpkg":"5.0.0"}}\n' > "${WORK_DIR}/package.json"
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='bun add okpkg@catalog:' run_zsh
+  assert_log_not_contains_fragment 'okpkg@5.0.0' "$FUNCNAME bun no workspaces" || return
+  printf '{"name":"root","workspaces":{"packages":["packages/*"],"catalog":{"okpkg":"7.0.0"}}}\n' > "${WORK_DIR}/package.json"
+  # A global install has no workspace: the specifier is never resolved.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='bun add -g okpkg@catalog:' run_zsh
+  assert_log_not_contains_fragment 'okpkg@7.0.0' "$FUNCNAME bun global" || return
+  : > "${LOG_FILE}"
+  printf "catalog:\n  okpkg: 1.0.0\n" > "${WORK_DIR}/pnpm-workspace.yaml"
+  SAFE_INSTALL_TEST_SCRIPT='pnpm add -g okpkg@catalog:' run_zsh
+  assert_log_not_contains_fragment 'okpkg@1.0.0' "$FUNCNAME pnpm global" || return
+  # npm has no catalogs: its specs are never rewritten.
+  prepare_case "catalog-npm-untouched-$((++CASE_SEQ))"
+  printf '{"name":"root","catalog":{"okpkg":"5.0.0"}}\n' > "${WORK_DIR}/package.json"
+  SAFE_INSTALL_TEST_SCRIPT='npm install okpkg@catalog:' run_zsh
+  assert_log_not_contains_fragment 'okpkg@5.0.0' "$FUNCNAME npm" || return
+  pass "$FUNCNAME"
+}
+
+# uv's plural spellings and the format-control flags' values.
+case_uv_plural_spellings_and_format_control() {
+  local script
+  prepare_case "uv-requirements-plural-$((++CASE_SEQ))"
+  mkdir -p "${WORK_DIR}/deps"
+  printf 'okpkg==1.0.0\n' > "${WORK_DIR}/deps/prod.txt"
+  printf 'okpkg==1.0.0\n' > "${CASE_DIR}/outside.txt"
+  for script in 'uv pip install --requirements deps/prod.txt' 'uv pip install --requirements=deps/prod.txt' \
+    "uv pip install --requirements ${CASE_DIR}/outside.txt" 'uv pip install --requirements deps/prod.txt --constraints deps/prod.txt --overrides deps/prod.txt'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 0 "$FUNCNAME ${script}" || return
+    assert_project_scan_logged "$FUNCNAME ${script}" || return
+    grep -Fq -- $'--pip-requirement\t' "${LOG_FILE}" || { fail "$FUNCNAME ${script}: no requirement reached the scan"; return; }
+    assert_log_not_contains_fragment $'LOCAL_ARTIFACT' "$FUNCNAME ${script}" || return
+  done
+  # A remote requirement file is refused in the plural spelling too.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='uv pip install --requirements https://example.invalid/req.txt' run_zsh
+  assert_status 100 "$FUNCNAME remote" || return
+  assert_log_not_contains_fragment $'REAL\tuv' "$FUNCNAME remote" || return
+  # --only-binary / --no-binary take a value on pip and `uv pip install`:
+  # `:all:` is not a package, the real package after it is audited.
+  for script in 'uv pip install --only-binary :all: blockme' 'uv pip install --no-binary :none: blockme' \
+    'pip install --only-binary :all: blockme' 'pip install --no-binary=:all: blockme'; do
+    prepare_case "uv-format-control-$((++CASE_SEQ))"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 104 "$FUNCNAME ${script}" || return
+    assert_log_has $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython' "$FUNCNAME ${script}" || return
+    assert_log_not_contains_fragment $'package-audit\t:all:' "$FUNCNAME ${script}" || return
+    assert_log_not_contains_fragment $'package-audit\t:none:' "$FUNCNAME ${script}" || return
+  done
+  prepare_case "uv-format-control-clean-$((++CASE_SEQ))"
+  SAFE_INSTALL_TEST_SCRIPT="uv pip install --only-binary :all: okpkg --constraints ${CASE_DIR}/outside.txt" run_zsh
+  assert_status 0 "$FUNCNAME clean" || return
+  assert_log_has $'AUDIT\tpackage-audit\tokpkg\t--ecosystem\tpython' "$FUNCNAME clean" || return
+  # On `uv tool install` --no-binary is a switch: it must not eat the package.
+  prepare_case "uv-tool-install-no-binary-switch-$((++CASE_SEQ))"
+  SAFE_INSTALL_TEST_SCRIPT='uv tool install --no-binary blockme' run_zsh
+  assert_status 104 "$FUNCNAME tool" || return
+  assert_log_has $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tpython' "$FUNCNAME tool" || return
+  # uv run / tool run: --no-binary is a switch there too.
+  prepare_case "uv-run-no-binary-switch-$((++CASE_SEQ))"
+  SAFE_INSTALL_TEST_SCRIPT='uv run --no-binary --with blockme python -c 1' run_zsh
+  assert_status 104 "$FUNCNAME run" || return
+  SAFE_INSTALL_TEST_SCRIPT='uv tool run --no-binary --from blockme prog' run_zsh
+  assert_status 104 "$FUNCNAME tool run" || return
+  pass "$FUNCNAME"
+}
+
+# pnpm verbs that run something must not install on their own.
+case_pnpm_run_verbs_cannot_auto_install() {
+  local script
+  for script in 'pnpm exec vitest' 'pnpm run test' 'pnpm test' 'pnpm start' 'pnpm build' 'pnpm exec -- vitest run'; do
+    prepare_case "pnpm-verify-deps-forced-$((++CASE_SEQ))"
+    touch "${WORK_DIR}/package.json"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 0 "$FUNCNAME ${script}" || return
+    assert_log_has "REAL"$'\t'"$(tr ' ' '\t' <<<"${script}")" "$FUNCNAME ${script}" || return
+    assert_log_has $'VERIFYDEPS\twarn' "$FUNCNAME ${script}" || return
+    assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME ${script}" || return
+  done
+  # Through mise exec the child that mise starts carries it too.
+  prepare_case "pnpm-verify-deps-mise-$((++CASE_SEQ))"
+  touch "${WORK_DIR}/package.json"
+  SAFE_INSTALL_TEST_SCRIPT='mise exec node@26.10.0 -- pnpm exec vitest' run_zsh
+  assert_status 0 "$FUNCNAME mise" || return
+  assert_log_has $'REAL\tmise\texec' "$FUNCNAME mise" || return
+  assert_log_has $'VERIFYDEPS\twarn' "$FUNCNAME mise" || return
+  # A non-installing value the user set stands (command line outranks env).
+  prepare_case "pnpm-verify-deps-user-cli-$((++CASE_SEQ))"
+  SAFE_INSTALL_TEST_SCRIPT='pnpm --config.verify-deps-before-run=error exec vitest' run_zsh
+  assert_status 0 "$FUNCNAME cli" || return
+  assert_log_has $'REAL\tpnpm\t--config.verify-deps-before-run=error\texec\tvitest' "$FUNCNAME cli" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME cli" || return
+  # The same spelling after the binary or script name belongs to the child,
+  # not to pnpm: the environment is forced all the same.
+  for script in 'pnpm exec vitest --config.verify-deps-before-run=false' 'pnpm run test --verify-deps-before-run=error'; do
+    prepare_case "pnpm-verify-deps-child-arg-$((++CASE_SEQ))"
+    touch "${WORK_DIR}/package.json"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 0 "$FUNCNAME ${script}" || return
+    assert_log_has $'VERIFYDEPS\twarn' "$FUNCNAME ${script}" || return
+  done
+  prepare_case "pnpm-verify-deps-child-arg-env-install-$((++CASE_SEQ))"
+  touch "${WORK_DIR}/package.json"
+  pnpm_config_verify_deps_before_run=install SAFE_INSTALL_TEST_SCRIPT='pnpm exec vitest --config.verify-deps-before-run=false' run_zsh
+  assert_status 0 "$FUNCNAME child arg over env install" || return
+  assert_log_has $'VERIFYDEPS\twarn' "$FUNCNAME child arg over env install" || return
+  prepare_case "pnpm-verify-deps-user-env-$((++CASE_SEQ))"
+  pnpm_config_verify_deps_before_run=false SAFE_INSTALL_TEST_SCRIPT='pnpm exec vitest' run_zsh
+  assert_status 0 "$FUNCNAME env" || return
+  assert_log_has $'VERIFYDEPS\tfalse' "$FUNCNAME env" || return
+  assert_log_not_contains_fragment 'AUDIT' "$FUNCNAME env" || return
+  # An explicit installing value is an install: the project gate, as for
+  # `pnpm install` — never a silent pass, never the verb's argument as a package.
+  for script in 'pnpm exec --config.verify-deps-before-run=install vitest' \
+    'pnpm --config.verifyDepsBeforeRun=prompt run test' 'pnpm exec --config.verify-deps-before-run vitest'; do
+    prepare_case "pnpm-verify-deps-install-$((++CASE_SEQ))"
+    touch "${WORK_DIR}/package.json"
+    SAFE_AUDIT_SCAN_STATUS=0 SAFE_AUDIT_SCAN_VERDICT=WARN SAFE_AUDIT_SCAN_CRITICAL=1 \
+      SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 102 "$FUNCNAME ${script}" || return
+    assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME ${script}" || return
+    assert_log_not_contains_fragment 'package-audit' "$FUNCNAME ${script}" || return
+  done
+  prepare_case "pnpm-verify-deps-install-clean-$((++CASE_SEQ))"
+  touch "${WORK_DIR}/package.json"
+  SAFE_INSTALL_TEST_SCRIPT='pnpm exec --config.verify-deps-before-run=install vitest' run_zsh
+  assert_status 0 "$FUNCNAME install clean" || return
+  assert_project_scan_logged "$FUNCNAME install clean" || return
+  assert_log_not_contains_fragment 'package-audit' "$FUNCNAME install clean" || return
+  assert_log_has $'REAL\tpnpm\texec' "$FUNCNAME install clean" || return
+  prepare_case "pnpm-verify-deps-install-env-$((++CASE_SEQ))"
+  touch "${WORK_DIR}/package.json"
+  pnpm_config_verify_deps_before_run=install SAFE_AUDIT_SCAN_STATUS=0 SAFE_AUDIT_SCAN_VERDICT=WARN SAFE_AUDIT_SCAN_CRITICAL=1 \
+    SAFE_INSTALL_TEST_SCRIPT='pnpm exec vitest' run_zsh
+  assert_status 102 "$FUNCNAME env install" || return
+  assert_log_not_contains_fragment $'REAL\tpnpm' "$FUNCNAME env install" || return
+  prepare_case "pnpm-verify-deps-install-mise-$((++CASE_SEQ))"
+  touch "${WORK_DIR}/package.json"
+  SAFE_AUDIT_SCAN_STATUS=0 SAFE_AUDIT_SCAN_VERDICT=WARN SAFE_AUDIT_SCAN_CRITICAL=1 \
+    SAFE_INSTALL_TEST_SCRIPT='mise exec -- pnpm exec --config.verify-deps-before-run=install vitest' run_zsh
+  assert_status 102 "$FUNCNAME mise install" || return
+  assert_log_not_contains_fragment $'REAL\tmise' "$FUNCNAME mise install" || return
+  # Install verbs are untouched: audited as before.
+  prepare_case "pnpm-verify-deps-add-still-audited-$((++CASE_SEQ))"
+  SAFE_INSTALL_TEST_SCRIPT='pnpm add blockme' run_zsh
+  assert_status 104 "$FUNCNAME add" || return
+  pass "$FUNCNAME"
+}
+
 main() {
   local case
   for case in \
@@ -7149,6 +7478,11 @@ main() {
     case_scan_scope_own_ecosystem_still_gates \
     case_scan_scope_unattributed_or_inconsistent_gates \
     case_yarn_version_or_help_is_not_an_install \
+    case_mise_exec_inner_non_install_verbs_pass_through \
+    case_bun_eval_print_separate_value \
+    case_catalog_specifiers_resolve_against_workspace \
+    case_uv_plural_spellings_and_format_control \
+    case_pnpm_run_verbs_cannot_auto_install \
     case_broken_scanner_warns_and_proceeds \
     case_malformed_result_document_is_not_read_as_clean \
     case_clean_result_proceeds_quietly \
