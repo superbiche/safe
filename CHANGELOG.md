@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Composer reuse no longer stops on different root autoload rules. The
+  copied autoloader encodes the root project (its autoload rules, those of
+  path-repository packages, and with `optimize-autoloader` a class map of
+  the source branch's classes): project code, not a dependency, and stale
+  even when the rules match. Every Composer reuse now ends with
+  `next: composer dump-autoload` (required when the root rules differ),
+  recorded in the receipt as `root_autoload` and `next_steps`. A path
+  repository that holds another package in the target is still a gap.
+
 - `safe install --reuse` covers Node projects (operator ruling 2026-11-17).
   A worktree's missing `node_modules/` is copied from another checkout of the
   same repository whose lockfiles are byte-identical, whatever manager

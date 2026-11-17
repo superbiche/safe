@@ -111,6 +111,8 @@ grep -Fq 'status:    reused-existing-vendor' "$tmp/out.txt" || fail "reuse does 
 grep -Fq 'audit:     not run' "$tmp/out.txt" || fail "reuse does not say it ran no audit"
 grep -Fq 'integrity: baseline-recorded' "$tmp/out.txt" || fail "the first reuse does not record a baseline"
 grep -Fq "source:    $MAIN" "$tmp/out.txt" || fail "the source checkout is not named"
+grep -Fq 'next:      composer dump-autoload — the copied autoloader lists the source checkout' "$tmp/out.txt" ||
+  fail "a Composer reuse does not name the dump-autoload step"
 [[ ! -s "$tmp/err.txt" ]] || fail "a clean reuse wrote to stderr: $(cat "$tmp/err.txt")"
 pass "reuse copies the resident tree unattended under the host rule"
 
@@ -218,10 +220,11 @@ done
 reuse "$WT"
 expect_refusal 102 'would dangle here (packages/local is absent)' "a path-repository link that would dangle in the target is refused"
 printf '{"name":"acme/local","autoload":{"psr-4":{"Local\\\\":"src/"}}}\n' > "$MAIN/packages/local/composer.json"
-mkdir -p "$WT/packages/local" && printf '{"name":"acme/local","autoload":{"psr-4":{"Local\\\\":"lib/"}}}\n' > "$WT/packages/local/composer.json"
+mkdir -p "$WT/packages/local" && printf '{"name":"acme/other","autoload":{"psr-4":{"Local\\\\":"src/"}}}\n' > "$WT/packages/local/composer.json"
 reuse "$WT"
-expect_refusal 102 'reaches packages/local, whose name or autoload rules differ here' "a path repository with other autoload rules in the target is refused"
-cp "$MAIN/packages/local/composer.json" "$WT/packages/local/composer.json"
+expect_refusal 102 'reaches packages/local, whose package name differs here' "a path repository holding another package in the target is refused"
+# Other autoload rules are project code dump-autoload regenerates: no gap.
+printf '{"name":"acme/local","autoload":{"psr-4":{"Local\\\\":"lib/"}}}\n' > "$WT/packages/local/composer.json"
 printf 'this branch\n' > "$WT/packages/local/a.php"
 reuse "$WT"
 [[ "$RC" == "0" && -L "$WT/vendor/acme/local" && "$(cat "$WT/vendor/acme/local/a.php")" == "this branch" ]] ||
@@ -256,7 +259,12 @@ expect_refusal 100 'holds an installed vendor/ for this composer.lock' "auto-det
 make_repo autoload-rules
 jq '.autoload["psr-4"]["Other\\"] = "lib/"' "$WT/composer.json" > "$tmp/c.json" && mv "$tmp/c.json" "$WT/composer.json"
 reuse "$WT"
-expect_refusal 102 'autoload rules differ' "different root autoload rules are an evidence gap for the operator"
+[[ "$RC" == "0" && ! -s "$tmp/err.txt" ]] &&
+  grep -Fq 'next:      composer dump-autoload — required: the autoload rules of composer.json differ' "$tmp/out.txt" ||
+  { cat "$tmp/out.txt" "$tmp/err.txt" >&2; fail "different root autoload rules are not a plain reuse with the dump-autoload step (rc=$RC)"; }
+jq -e '.root_autoload == "differs" and .next_steps == ["composer dump-autoload"] and .operator_override == []' "$(receipt_of "$tmp/out.txt")" >/dev/null ||
+  fail "the receipt does not record the root autoload difference and the next step"
+pass "different root autoload rules are no evidence gap: the reuse names composer dump-autoload as required"
 
 make_repo unwritable-store
 printf 'not a directory\n' > "$tmp/store-file"

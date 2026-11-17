@@ -3261,12 +3261,13 @@ safe_install_reuse_tree_problem() {
     fi
     # A path repository links to the checkout's own copy of the package, as
     # Composer itself would install it there; its sources may differ between
-    # branches. What the copied autoloader encodes is the package's name and
-    # autoload rules, so those must agree.
+    # branches. It must be the same package. Its autoload rules may differ:
+    # like the root's, they are project code the next composer dump-autoload
+    # regenerates.
     if [[ -f "$source/$rel/composer.json" || -f "$target/$rel/composer.json" ]] &&
-       [[ "$(jq -cS '[.name, .autoload, .["autoload-dev"]]' "$source/$rel/composer.json" 2>/dev/null)" != \
-          "$(jq -cS '[.name, .autoload, .["autoload-dev"]]' "$target/$rel/composer.json" 2>/dev/null)" ]]; then
-      printf 'symlink vendor/%s -> %s reaches %s, whose name or autoload rules differ here' "$where" "$dest" "$rel"; return 0
+       [[ "$(jq -c '.name' "$source/$rel/composer.json" 2>/dev/null)" != \
+          "$(jq -c '.name' "$target/$rel/composer.json" 2>/dev/null)" ]]; then
+      printf 'symlink vendor/%s -> %s reaches %s, whose package name differs here' "$where" "$dest" "$rel"; return 0
     fi
   done < <(find "${copied[@]}" -type l -print0 2>/dev/null)
 }
@@ -3676,17 +3677,20 @@ safe_install_reuse_one() {
     safe_install_reuse_refuse 100 REFUSED_REUSE_LOCK_MISMATCH "$target" "BLOCKED reuse — ${target_locks//,/ + } differs between ${source} (sha256 ${source_lock_sha:0:12}) and this project (sha256 ${lock_sha:0:12}); a changed lockfile is a new install, not a reuse; details: safe explain"
 
   local -a overrides=()
-  local core="" primary="" report_file="" prune_csv=""
+  local core="" primary="" report_file="" prune_csv="" root_autoload=""
   local -a node_dirs=()
   if [[ "$eco" == "composer" ]]; then
     lock_desc="composer.lock"
     prune_csv="$(IFS=,; printf '%s' "${SAFE_REUSE_COMPOSER_CACHES[*]}")"
-    # The generated autoloader also encodes the ROOT package's autoload rules,
-    # which the lockfile does not cover.
+    # The generated autoloader also encodes the ROOT package: its autoload
+    # rules and, with optimize-autoloader, a class map of the source
+    # branch's own classes. That is project code, not a dependency, so it is
+    # no evidence gap: the copy is correct for this checkout only once
+    # composer dump-autoload regenerates it, which every Composer reuse says.
+    root_autoload="same"
     if [[ "$(jq -cS '[.autoload, .["autoload-dev"]]' "$source/composer.json" 2>/dev/null)" != \
           "$(jq -cS '[.autoload, .["autoload-dev"]]' "$target/composer.json" 2>/dev/null)" ]]; then
-      safe_install_reuse_evidence_gap "$target" "composer.json autoload rules differ between ${source} and this project, so the copied autoloader would be wrong here until composer dump-autoload runs" "$dry_run"
-      overrides+=("root autoload rules differ")
+      root_autoload="differs"
     fi
   else
     core="$(safe_install_reuse_safe_core)" ||
@@ -3749,6 +3753,13 @@ safe_install_reuse_one() {
     [[ -z "$scripts" ]] || printf '  scripts:   not run — package.json declares %s; run it yourself if this checkout needs it\n' "$scripts"
   fi
   printf '  audit:     not run — reuse copies what is already on this machine; audit it with: safe audit repo-audit .\n'
+  if [[ "$eco" == "composer" ]]; then
+    if [[ "$root_autoload" == "differs" ]]; then
+      printf '  next:      composer dump-autoload — required: the autoload rules of composer.json differ from the source, so the copied autoloader misses this checkout'"'"'s classes\n'
+    else
+      printf '  next:      composer dump-autoload — the copied autoloader lists the source checkout'"'"'s own classes; regenerate it for this branch\n'
+    fi
+  fi
 
   # The integrity baseline is per source and ecosystem; the Composer key
   # predates Node reuse and stays as it was.
@@ -3874,7 +3885,7 @@ safe_install_reuse_one() {
     --arg repository "$target_common" --arg lock_name "$lock_desc" --arg lock_sha "$lock_sha" \
     --argjson inventory "$inventory" \
     --arg integrity "$integrity" --arg recorded_at "$recorded_at" --arg manifest_sha "$manifest_sha" \
-    --argjson files "${files:-0}" --arg skipped "$skipped" --arg scripts "$scripts" \
+    --argjson files "${files:-0}" --arg skipped "$skipped" --arg scripts "$scripts" --arg root_autoload "$root_autoload" \
     --argjson overrides "$(printf '%s\n' ${overrides[@]+"${overrides[@]}"} | jq -R . | jq -cs 'map(select(length > 0))')" \
     --arg rule "$([[ "$enabled" == "1" ]] && printf 'install.reuse.enabled' || printf 'operator-terminal')" '
     {ts: $ts, safe_version: $safe_version, operation: "reuse", ecosystem: $ecosystem,
@@ -3887,7 +3898,8 @@ safe_install_reuse_one() {
                  manifest_sha256: $manifest_sha, files: $files},
      audit: "not run: reuse copies dependencies already on this machine",
      network: false, package_manager: false, scripts_executed: false}
-    + (if $scripts == "" then {} else {scripts_not_run: ($scripts | split(", "))} end)' > "$SAFE_REUSE_TMP_RECEIPT"; }; then
+    + (if $scripts == "" then {} else {scripts_not_run: ($scripts | split(", "))} end)
+    + (if $root_autoload == "" then {} else {root_autoload: $root_autoload, next_steps: ["composer dump-autoload"]} end)' > "$SAFE_REUSE_TMP_RECEIPT"; }; then
     safe_install_reuse_refuse 100 REFUSED_REUSE_RECEIPT "$target" "BLOCKED reuse — the receipt could not be written in ${reuse_dir}; nothing was installed; details: safe explain"
   fi
   if [[ "$integrity" != "baseline-matched" && -n "$manifest" ]]; then
