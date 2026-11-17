@@ -7017,6 +7017,30 @@ JSON
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='bun add okpkg@catalog:' run_zsh
   assert_log_has $'AUDIT\tpackage-audit\tokpkg@catalog\t' "$FUNCNAME bun git value" || return
+  # bun reads the workspace root's catalog and ignores a member's own: from
+  # a member the root's entry is audited, and a member manifest that carries a
+  # different entry (a decoy the gate would otherwise audit instead of what
+  # bun installs) leaves the specifier unresolved.
+  prepare_case "catalog-bun-member-$((++CASE_SEQ))"
+  mkdir -p "${WORK_DIR}/packages/app" "${WORK_DIR}/packages/decoy"
+  printf '{"name":"root","workspaces":{"packages":["packages/*"],"catalog":{"okpkg":"7.0.0"}}}\n' > "${WORK_DIR}/package.json"
+  printf '{"name":"app"}\n' > "${WORK_DIR}/packages/app/package.json"
+  printf '{"name":"decoy","catalog":{"okpkg":"6.0.0"}}\n' > "${WORK_DIR}/packages/decoy/package.json"
+  SAFE_INSTALL_TEST_SCRIPT='cd packages/app && bun add okpkg@catalog:' run_zsh
+  assert_log_has $'AUDIT\tpackage-audit\tokpkg@7.0.0\t' "$FUNCNAME bun member" || return
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='cd packages/decoy && bun add okpkg@catalog:' run_zsh
+  assert_log_has $'AUDIT\tpackage-audit\tokpkg@catalog\t' "$FUNCNAME bun member decoy" || return
+  assert_log_not_contains_fragment 'okpkg@6.0.0' "$FUNCNAME bun member decoy" || return
+  assert_log_not_contains_fragment 'okpkg@7.0.0' "$FUNCNAME bun member decoy" || return
+  # A global install has no workspace: the specifier is never resolved.
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='bun add -g okpkg@catalog:' run_zsh
+  assert_log_not_contains_fragment 'okpkg@7.0.0' "$FUNCNAME bun global" || return
+  : > "${LOG_FILE}"
+  printf "catalog:\n  okpkg: 1.0.0\n" > "${WORK_DIR}/pnpm-workspace.yaml"
+  SAFE_INSTALL_TEST_SCRIPT='pnpm add -g okpkg@catalog:' run_zsh
+  assert_log_not_contains_fragment 'okpkg@1.0.0' "$FUNCNAME pnpm global" || return
   # npm has no catalogs: its specs are never rewritten.
   prepare_case "catalog-npm-untouched-$((++CASE_SEQ))"
   printf '{"name":"root","catalog":{"okpkg":"5.0.0"}}\n' > "${WORK_DIR}/package.json"

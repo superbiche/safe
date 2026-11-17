@@ -4285,25 +4285,63 @@ safe_gate_catalog_spec() {
   # (--dir/--cwd/-C included) upward, like the managers do.
   dir="${SAFE_GATE_PROJECT_DIR:-.}"
   dir="$(CDPATH= cd -P -- "${dir}" 2>/dev/null && pwd -P)" || dir=""
-  while [[ -n "${dir}" ]]; do
-    if [[ "${tool}" == "pnpm" ]]; then
+  if [[ "${tool}" == "pnpm" ]]; then
+    # pnpm: the nearest pnpm-workspace.yaml upward is the workspace root.
+    while [[ -n "${dir}" ]]; do
       probe="${dir}/pnpm-workspace.yaml"
       if [[ -f "${probe}" ]]; then
         entry="$(safe_gate_pnpm_catalog_entry "${probe}" "${catname}" "${name}")"
         break
       fi
-    else
+      parent="$(dirname -- "${dir}")"
+      [[ "${parent}" != "${dir}" ]] || break
+      dir="${parent}"
+    done
+  else
+    # bun reads the catalog of the WORKSPACE ROOT manifest only and ignores
+    # the one a member package carries, so the nearest manifest with catalog
+    # fields is not the answer (a member's own `catalog` would be audited
+    # while bun installs the root's version). Which ancestor is the root
+    # depends on workspace globs the gate does not evaluate, so every
+    # manifest that could be it must agree: each ancestor-or-self manifest
+    # with a `workspaces` field, plus the nearest manifest when it carries
+    # catalog fields itself or when no manifest declares workspaces (a
+    # single-package project). One shared, non-empty answer resolves; any
+    # disagreement, or a candidate without the entry, leaves the specifier
+    # unresolved.
+    local nearest="" candidate answer agreed="" first=1 conflict=0
+    local -a roots=()
+    while [[ -n "${dir}" ]]; do
       probe="${dir}/package.json"
-      if [[ -f "${probe}" ]] \
-         && jq -e '(.catalog? // .catalogs? // (.workspaces | objects | (.catalog? // .catalogs?))) != null' "${probe}" >/dev/null 2>&1; then
-        entry="$(safe_gate_bun_catalog_entry "${probe}" "${catname}" "${name}")"
-        break
+      if [[ -f "${probe}" ]]; then
+        [[ -n "${nearest}" ]] || nearest="${probe}"
+        if jq -e '(.workspaces? // null) != null' "${probe}" >/dev/null 2>&1; then
+          roots+=("${probe}")
+        fi
+      fi
+      parent="$(dirname -- "${dir}")"
+      [[ "${parent}" != "${dir}" ]] || break
+      dir="${parent}"
+    done
+    if [[ -n "${nearest}" ]]; then
+      if (( ${#roots[@]} == 0 )); then
+        roots=("${nearest}")
+      elif [[ "${roots[0]}" != "${nearest}" ]] \
+           && jq -e '(.catalog? // .catalogs? // null) != null' "${nearest}" >/dev/null 2>&1; then
+        roots=("${nearest}" "${roots[@]}")
       fi
     fi
-    parent="$(dirname -- "${dir}")"
-    [[ "${parent}" != "${dir}" ]] || break
-    dir="${parent}"
-  done
+    for candidate in "${roots[@]}"; do
+      answer="$(safe_gate_bun_catalog_entry "${candidate}" "${catname}" "${name}")"
+      if (( first )); then
+        agreed="${answer}"
+        first=0
+      elif [[ "${answer}" != "${agreed}" ]]; then
+        conflict=1
+      fi
+    done
+    (( conflict )) || entry="${agreed}"
+  fi
   # A version or range (or an npm: alias, which the spec parser unwraps);
   # git/file/link/workspace values are not a registry version to audit.
   if [[ -n "${entry}" && ( "${entry}" =~ ^[0-9A-Za-z.*+^~\<\>=\|\ -]+$ || "${entry}" == npm:* ) ]]; then
@@ -4850,7 +4888,10 @@ safe_gate_npm_like() {
     safe_gate_collect raw "$("${parser}" "${rest[@]}")"
     packages=()
     for raw_package in "${raw[@]}"; do
-      packages+=("$(safe_gate_npm_spec "$(safe_gate_catalog_spec "${tool}" "${raw_package}")")")
+      # No catalog resolution here: a global install has no workspace the
+      # gate can name as the one the manager reads, so a `catalog:`
+      # specifier keeps its refusal.
+      packages+=("$(safe_gate_npm_spec "${raw_package}")")
     done
 
     if (( ${#packages[@]} > 0 )); then
