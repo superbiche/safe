@@ -215,8 +215,8 @@ pass and warnings under `environment.release_follow`.
   its namespace whatever this list says ([private registries](private-registries.md)).
 - `auto_allow_ttl_days`: freshness window for the offline/timeout fallback.
 - `reuse.enabled`: per-host rule for `safe install --reuse` (default `false`).
-  `true` lets the reuse of an installed `vendor/` from another checkout of the
-  same repository run unattended, agents included; reuse runs no audit, and its
+  `true` lets the reuse of an installed `vendor/` or `node_modules/` from
+  another checkout of the same repository run unattended, agents included; reuse runs no audit, and its
   receipt says so. `false` keeps each
   reuse an operator decision at an interactive terminal (exit 102 otherwise).
   Only the JSON boolean `true` enables it, and only from the canonical run

@@ -243,13 +243,22 @@ install flag present and no package named, the usage error stands.
 
 ### Reuse of installed dependencies
 
-A fresh git worktree has no `vendor/`. A normal `composer install` there is new
-package ingress and is refused when the unchanged `composer.lock` carries
-critical advisories — even though the exact same tree already sits in the main
-checkout. `safe install --reuse` covers that case as its own operation: it
-copies dependencies that are already on this machine. It runs no audit, no
-`php`, no package manager and no network access, so its outcome is never an
-audit result (operator rulings 2026-09-30).
+A fresh git worktree has no `vendor/` and no `node_modules/`. A normal
+`composer install` or `yarn install` there is new package ingress and is
+refused when the unchanged lockfile carries critical advisories — even though
+the exact same tree already sits in the main checkout. `safe install --reuse`
+covers that case as its own operation: it copies dependencies that are already
+on this machine. It runs no audit, no `php`, no `node`, no package manager and
+no network access, so its outcome is never an audit result (operator rulings
+2026-09-30, and 2026-11-17 for Node).
+
+It covers Composer projects (`composer.json` with `composer.lock`) and Node
+projects (`package.json` with `package-lock.json`, `npm-shrinkwrap.json`,
+`yarn.lock`, `pnpm-lock.yaml`, `bun.lock` or `bun.lockb`), whatever manager
+installed the tree: npm, Yarn classic, Yarn Berry with `nodeLinker:
+node-modules`, pnpm or bun. A project with both is reused in one run, one
+ecosystem after the other; each reports and records its own outcome. An
+ecosystem whose tree already exists in the target is left as it is.
 
 ```bash
 cd <worktree>/<project>
@@ -264,9 +273,11 @@ normal install, with its own operator overrides at the terminal:
 
 | Check | Refused when |
 | --- | --- |
-| Provenance | the source is not the same project path in a checkout of the same git repository, or its `vendor/` is a symlink or belongs to another user |
-| Lockfile | `composer.lock` is not byte-identical (SHA-256) in both checkouts |
-| Target | `vendor/` already exists and is not empty — reuse never overwrites, even if it appears during the copy |
+| Provenance | the source is not the same project path in a checkout of the same git repository, or its `vendor/` or `node_modules/` is a symlink or belongs to another user |
+| Lockfile | `composer.lock`, or every Node lockfile the project carries, is not byte-identical (SHA-256) in both checkouts |
+| Target | `vendor/` (or `node_modules/`) already exists and is not empty in a project with no other ecosystem to reuse — reuse never overwrites, even if it appears during the copy |
+| Layout | the source is a Yarn Plug'n'Play install (`.pnp.cjs`): its loader encodes checkout-relative paths and there is no tree to copy; run the gated install |
+| safe-core | the `safe-core` of this release is not installed beside `safe`, so a Node tree cannot be checked (rerun `install.sh`) |
 
 The tree itself must be complete and self-contained. A gap here is an operator
 decision: unattended shells and dry runs refuse with exit 102; at the
@@ -282,6 +293,25 @@ the receipt records as `operator_override`:
 | Autoload rules | the root `autoload`/`autoload-dev` sections of `composer.json` differ, so the copied autoloader is wrong until `composer dump-autoload` runs |
 | Integrity | the tree changed since its baseline (below), its baseline record is unreadable, or a file cannot be read and hashed |
 
+For a Node project `safe-core node-tree` checks the tree against the lockfile.
+It reads every `package.json` under the copied `node_modules` directories, so
+it does not depend on a manager's own state file, and compares the installed
+`name@version` set with the lockfile's:
+
+| Evidence | Gap when |
+| --- | --- |
+| Inventory | a package the lockfile requires is missing, or the tree holds a package, version or file module (`node_modules/x.js`, or an extensionless `node_modules/x`) the lockfile does not pin. Required means reachable from the dependencies of the project and its workspaces (declared in `package.json` `workspaces`, `pnpm-workspace.yaml` or the lockfile); optional packages, packages whose `os`/`cpu`/`libc` allowlist excludes this machine, and those only they need may be absent. Bundled dependencies are checked against npm's `inBundle` pins, and skipped for the lockfiles that do not record them; pnpm's not-yet-pruned virtual-store orphans are not counted |
+| Links | a symlink in the copied tree dangles (except a virtual-store link to an optional package, or a stale link in pnpm's hidden hoisting folder to a package nothing pins), leaves the project, reaches a workspace folder that is absent in the target, or is absolute outside the system prefixes (`/usr`, `/bin`, `/lib`, `/etc`…); node-gyp's build-time `build/node_gyp_bins/python3` link to a Python binary is kept |
+| Integrity | as for Composer, below |
+
+A stale tree in the source — the lockfile moved on after the last install — is
+the usual gap, and the refusal names the first differences. The copy carries
+the root `node_modules/` and each workspace package's own (a tracked
+`package.json` folder with no lockfile of its own), minus tool caches
+(`.cache`, `.vite`, `.vite-temp`), plus Yarn Berry's `.yarn/install-state.gz`.
+Root lifecycle scripts (`preinstall`, `install`, `postinstall`, `prepare`) do
+not run; the output and the receipt name the ones `package.json` declares.
+
 Only what the inventory describes is copied: `vendor/composer`, the
 autoloader and other top-level generated files, `vendor/bin`, and each
 package's install path. Any other directory or link in `vendor/` is left
@@ -290,8 +320,11 @@ link is copied as a link, so in the target it reaches the target's own copy of
 the package, as `composer install` would have made it.
 
 Integrity is trust on first use. The first reuse from a source checkout records
-a baseline: the SHA-256 of every file and the target of every link in its
-`vendor/`. Later reuses from that checkout must match it; a changed file is a
+a baseline per ecosystem: the SHA-256 of every file and the target of every
+link it copies. Caches that test and build tools write inside the tree —
+pest's `vendor/pestphp/pest/.temp`, the Node caches above — are neither copied
+nor part of the baseline, so a coverage run in the source does not read as a
+change (a baseline recorded with them still matches). Later reuses from that checkout must match it; a changed file is a
 gap, and an operator who accepts it re-records the baseline. A source
 reinstalled with a new lockfile starts a new baseline. The first use is not
 verified, and the receipt says which case applied. `--dry-run` hashes the
@@ -307,10 +340,13 @@ into place. One reuse per target runs at a time; an interrupted or refused
 reuse removes its staging. If the receipt store under
 `~/.local/share/safe/install/reuse/` is not writable, nothing is copied.
 
-Every successful reuse ends as `reused-existing-vendor` with exit 0 (gate log
-`REUSED_EXISTING`, or `REUSED_EXISTING_OPERATOR_OVERRIDE` after an accepted
-gap). The receipt names the source checkout, the lockfile hash, the package
-count, the integrity state and `audit: not run`. The copied dependencies keep
+Every successful reuse ends as `reused-existing-vendor` or
+`reused-existing-node-modules` with exit 0 (gate log `reuse:composer` or
+`reuse:node`, `REUSED_EXISTING`, or `REUSED_EXISTING_OPERATOR_OVERRIDE` after an
+accepted gap). The receipt names the source checkout, the lockfile and its
+hash, the package count (and for Node the lockfile format and the trees), the
+integrity state and `audit: not run`. When a later ecosystem is refused, the
+refusal says which tree was already reused; it stays in place. The copied dependencies keep
 whatever advisories they had; audit them with `safe audit repo-audit .`.
 Platform compatibility is not checked: the project's runtime (for example its
 container image) decides it.
@@ -321,8 +357,8 @@ it (the default) the operator confirms each reuse at an interactive terminal,
 and a non-interactive or agent session refuses with exit 102. `--dry-run` works
 either way.
 
-Only Composer projects are covered. `--reuse` takes no package and cannot be
-combined with `--project`, `--sandbox` or the host install flags.
+`--reuse` takes no package and cannot be combined with `--project`,
+`--sandbox` or the host install flags.
 
 `safe install --sandbox ...` preserves the isolated `safe run install` workflow.
 
