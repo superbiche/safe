@@ -3255,6 +3255,13 @@ build_scan_result_from_artifacts() {
   snapshot="$__scratch/snapshot"
   jq --slurpfile result "$build_tmp" '. as $delta | $result[0] + {delta: $delta}' <<<"$delta_json" > "$snapshot"
   rm -f "$build_tmp"
+  # A caller that records this function's status (`... || build_rc=$?`) runs
+  # it with errexit off, so any step above can fail and leave an empty or
+  # partial snapshot behind while the scan still exits 0. A scan that could
+  # not write its verdict did not produce one: say so and fail, rather than
+  # publishing a document nobody can decide from.
+  jq -e 'type == "object" and ((.audit_totals.critical | type) == "number")' "$snapshot" >/dev/null 2>&1 \
+    || die "cannot assemble the scan result document; this scan produced no verdict"
   # Publishing is a replace of a SHARED path, so it gets the same treatment as
   # every other one: stage beside the destination, then rename. A bare `cp`
   # onto the live path leaves it truncated for as long as the copy takes, and

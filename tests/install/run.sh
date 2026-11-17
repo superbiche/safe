@@ -3448,7 +3448,7 @@ case_critical_scan_non_tty_aborts() {
 # with exit 100 rather than delegating an unaudited install — mirroring the
 # projected-dependency scan guard and the critical-findings non-TTY refusal
 # above. The sibling no-verdict sites (unwritable destination; exit-0 unreadable
-# document) still warn-and-proceed by policy — see the malformed-result case.
+# document) share this terminus since 2026-11-17 — see the malformed-result case.
 case_scan_failed_outright_non_tty_blocks() {
   prepare_case "scan-failed-outright-non-tty-blocks"
   touch "${WORK_DIR}/package.json"
@@ -3561,17 +3561,68 @@ case_yarn_version_or_help_is_not_an_install() {
 # Every jq read against a truncated document falls back to its default, and
 # defaulted zeros are indistinguishable from "scanned it, found nothing" — so
 # the gate used to announce a clean project it had never actually read.
+# Ruled 2026-11-17: a scan with no verdict is one terminus whatever the cause.
+# With no operator present it refuses (100, audit-infrastructure breakage),
+# exactly like a scan that failed outright.
 case_malformed_result_document_is_not_read_as_clean() {
   prepare_case "malformed-result-not-clean"
   touch "${WORK_DIR}/package.json"
   SAFE_AUDIT_SCAN_STATUS=0 SAFE_AUDIT_SCAN_MALFORMED_RESULT=1 \
     SAFE_INSTALL_TEST_SCRIPT='npm ci' run_zsh
-  # Policy is unchanged: a scan that produced no verdict warns and proceeds.
-  # What must never happen is proceeding SILENTLY.
-  assert_status 0 "$FUNCNAME" || return
+  assert_status 100 "$FUNCNAME" || return
   assert_project_scan_logged "$FUNCNAME" || return
-  assert_err_contains_fragment 'produced no readable result' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe: BLOCKED install — safe audit repo-audit produced no readable result' "$FUNCNAME" || return
+  assert_err_contains_fragment 'audit-infrastructure breakage, not a package finding' "$FUNCNAME" || return
   assert_err_contains_fragment 'NOT audit-gated' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'proceeding' "$FUNCNAME" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { cat "${ERR_FILE}" >&2; fail "$FUNCNAME"; return 1; }
+
+  # A successful scan's summary prints the word "critical" with a count. With
+  # no readable document that word is not evidence of a finding: the refusal
+  # stays an infrastructure one and never asks for a critical confirmation.
+  prepare_case "malformed-result-summary-mentions-critical"
+  touch "${WORK_DIR}/package.json"
+  SAFE_AUDIT_SCAN_OUTPUT='  CRITICAL: 0' SAFE_AUDIT_SCAN_STATUS=0 SAFE_AUDIT_SCAN_MALFORMED_RESULT=1 \
+    SAFE_INSTALL_TEST_SCRIPT='npm ci' run_zsh
+  assert_status 100 "$FUNCNAME summary" || return
+  assert_err_contains_fragment 'produced no readable result' "$FUNCNAME summary" || return
+  assert_err_not_contains_fragment 'critical finding' "$FUNCNAME summary" || return
+  pass "$FUNCNAME"
+}
+
+# The third no-verdict cause: nowhere to write the result document. Same
+# terminus, and with no operator the scan is not even run — there would be
+# nothing to decide from.
+case_unwritable_result_destination_blocks_without_operator() {
+  prepare_case "unwritable-result-destination"
+  touch "${WORK_DIR}/package.json"
+  : > "${WORK_DIR}/not-a-dir"
+  TMPDIR="${WORK_DIR}/not-a-dir/tmp" SAFE_DATA_DIR="${WORK_DIR}/not-a-dir/data" \
+    SAFE_INSTALL_TEST_SCRIPT='npm ci' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm' "$FUNCNAME" || return
+  assert_err_contains_fragment 'safe: BLOCKED install — cannot allocate a scan result file' "$FUNCNAME" || return
+  assert_err_contains_fragment 'audit-infrastructure breakage, not a package finding' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# The operator's side of that terminus: at their terminal every no-verdict
+# cause warns, says the project was not audit-gated, and proceeds — the
+# override lane the refusal points to. The predicate and the terminal writer
+# are stubbed; no PTY is manufactured.
+case_no_verdict_scan_warns_and_proceeds_at_operator_terminal() {
+  prepare_case "no-verdict-operator-terminal"
+  local out status=0
+  out="$(GATE_LIB="${ROOT_DIR}/lib/gate-lib.sh" bash -c '
+    source "${GATE_LIB}"
+    safe_gate_operator_terminal() { return 0; }
+    safe_gate_tty_printf() { local fmt="$1"; shift; printf "${fmt}" "$@" >&2; }
+    safe_gate_scan_no_verdict "safe audit repo-audit produced no readable result"
+  ' 2>&1)" || status=$?
+  [[ "${status}" -eq 0 ]] || { printf '%s\n' "${out}" >&2; fail "$FUNCNAME status ${status}"; return 1; }
+  [[ "${out}" == 'safe install: safe audit repo-audit produced no readable result; the project was NOT audit-gated — safe doctor; proceeding' ]] ||
+    { printf '%s\n' "${out}" >&2; fail "$FUNCNAME message"; return 1; }
   pass "$FUNCNAME"
 }
 
@@ -7485,6 +7536,8 @@ main() {
     case_pnpm_run_verbs_cannot_auto_install \
     case_broken_scanner_warns_and_proceeds \
     case_malformed_result_document_is_not_read_as_clean \
+    case_unwritable_result_destination_blocks_without_operator \
+    case_no_verdict_scan_warns_and_proceeds_at_operator_terminal \
     case_clean_result_proceeds_quietly \
     case_missing_safe_audit_warns_per_command \
     case_non_install_passthrough \

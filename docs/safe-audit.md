@@ -470,6 +470,9 @@ which scan's document it gets is whichever wrote last. Any caller that
 *decides* something from a scan (`safe install --project` does) must read its
 own copy instead. Single-target scans only.
 
+A scan that cannot assemble its result document fails with a non-zero exit and
+writes nothing to either path: exit 0 always comes with a complete document.
+
 Full filesystem scan, including installed dependency trees:
 
 ```bash

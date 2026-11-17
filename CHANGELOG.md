@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- A project scan with no verdict is one terminus (operator ruling 2026-11-17).
+  The install gates used to refuse only when `safe audit repo-audit` failed
+  outright; a scan that exited 0 without a readable result document, or a gate
+  with nowhere to write that document, warned and let the install through —
+  for an agent too. All three now behave alike: the operator's terminal says
+  the project was not audit-gated and proceeds, and a session with no operator
+  is refused with exit 100 (`audit-infrastructure breakage, not a package
+  finding`). `safe audit` also fails a scan whose result document it could not
+  assemble, instead of exiting 0 with an empty one.
 - Gate verb parsing sweep (six inbox findings):
   - `mise exec -- <tool> <verb>` classifies the inner command exactly as the
     direct gate does. The audit-only exec used to return where the direct
