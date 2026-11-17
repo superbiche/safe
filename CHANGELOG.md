@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- safe now owns the `npx`, `bunx` and `uvx` runner links. `install.sh` creates
+  them in `~/.local/bin` (ahead of mise shims), keeps or adopts a link that
+  already points at `safe-run`, moves a uv-installed `uvx` aside like `uv`,
+  and never overwrites another file. A bare `bunx` previously resolved through
+  the mise shim to the raw bun binary, ungated. The mise wrapper now also
+  routes a shim named `npx`, `bunx` or `uvx` to `safe-run`. `safe doctor`
+  (`runner_links`) and `safe status` report what each runner resolves to on
+  the host, flagging an ungated one; `uninstall.sh` removes only the links
+  listed in `~/.config/safe/runner-links`.
+
 ## 1.74.0 - 2026-11-17
 
 - Agents hand the operator the original command to run at their terminal

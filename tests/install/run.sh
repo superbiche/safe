@@ -494,8 +494,22 @@ EOF
 #!/usr/bin/env bash
 # safe-gate-wrapper v1 tool=mise
 __safe_gated_argv0s=(npm pnpm pnpx yarn bun pip pip3 uv cargo go composer)
+__safe_runner_argv0s=(npx bunx uvx)
 __safe_argv0="${0##*/}"
 if [[ "$__safe_argv0" != "mise" ]]; then
+  for __t in "${__safe_runner_argv0s[@]}"; do
+    [[ "$__safe_argv0" == "$__t" ]] || continue
+    __r="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null)"
+    __r="${__r%/*}/safe-run"
+    if [[ ! -x "$__r" ]]; then
+      __r="$(command -v safe-run 2>/dev/null)" || __r=""
+    fi
+    if [[ -z "$__r" ]]; then
+      printf 'safe gate: BLOCKED %s — safe-run not found beside the mise wrapper; rerun install.sh\n' "$__safe_argv0" >&2
+      exit 100
+    fi
+    SAFE_RUN_RUNNER_ARGV0="$__safe_argv0" exec "$__r" "$@"
+  done
   for __t in "${__safe_gated_argv0s[@]}"; do
     [[ "$__safe_argv0" == "$__t" ]] || continue
     exec safe gate "$__safe_argv0" -- "$@"
@@ -6481,6 +6495,164 @@ case_mise_wrapper_helper_matches_installer_output() {
   pass "$FUNCNAME"
 }
 
+# Fetch-and-execute runners (npx/bunx/uvx) are links to safe-run owned by
+# install.sh. A bare `bunx` used to resolve through the mise shim to the raw
+# bun binary: ungated. These cases pin ownership, adoption, no-clobber,
+# the mise second line, doctor/status reporting and uninstall.
+runner_sandbox() {
+  # $1 = dir. HOME with a mise shims dir, plus a place for a stand-in "real" mise.
+  mkdir -p "$1/home/.local/share/mise/shims" "$1/real"
+}
+
+case_install_links_runners_ahead_of_mise_shims() {
+  local dir="${TEST_ROOT}/${FUNCNAME}" home shims bin runner
+  home="${dir}/home"; shims="${home}/.local/share/mise/shims"; bin="${home}/.local/bin"
+  runner_sandbox "${dir}"
+  printf '#!/usr/bin/env bash\necho real-mise\n' > "${dir}/real/mise"
+  chmod +x "${dir}/real/mise"
+  for runner in npx bunx uvx npm node; do ln -s "${dir}/real/mise" "${shims}/${runner}"; done
+
+  HOME="${home}" SAFE_ZSHRC="${dir}/zshrc" bash "${ROOT_DIR}/install.sh" --wrappers \
+    >"${dir}/out" 2>"${dir}/err" || { fail "$FUNCNAME: install failed"; return; }
+
+  # Every runner resolves to a gate FIRST on PATH, shims dir present.
+  local path="${bin}:${shims}:/usr/bin:/bin" resolved canon
+  for runner in npx bunx uvx; do
+    resolved="$(PATH="${path}" command -v "${runner}")"
+    canon="$(readlink -f "${resolved}")"
+    [[ "${resolved}" == "${bin}/${runner}" && "${canon}" == "$(readlink -f "${bin}/safe-run")" ]] \
+      || { fail "$FUNCNAME: ${runner} resolved to ${resolved} (${canon})"; return; }
+  done
+  # pnpx is a gate wrapper; `bun x` enters through the bun wrapper.
+  for runner in pnpx bun; do
+    resolved="$(PATH="${path}" command -v "${runner}")"
+    head -n 2 "${resolved}" | grep -Fqx "# safe-gate-wrapper v1 tool=${runner}" \
+      || { fail "$FUNCNAME: ${runner} is not a gate wrapper (${resolved})"; return; }
+  done
+  # The shims themselves (the bypass layout) are bound to the mise wrapper.
+  for runner in npx bunx uvx; do
+    [[ "${shims}/${runner}" -ef "${bin}/mise" ]] || { fail "$FUNCNAME: shim ${runner} not bound to the wrapper"; return; }
+  done
+  [[ "$(cat "${home}/.config/safe/runner-links")" == $'npx\nbunx\nuvx' ]] || { fail "$FUNCNAME: manifest"; return; }
+  pass "$FUNCNAME"
+}
+
+case_mise_wrapper_routes_runner_argv0_to_safe_run() {
+  local dir="${TEST_ROOT}/${FUNCNAME}" home bin shims runner out rc=0
+  home="${dir}/home"; bin="${home}/.local/bin"; shims="${home}/.local/share/mise/shims"
+  runner_sandbox "${dir}"
+  HOME="${home}" SAFE_ZSHRC="${dir}/zshrc" bash "${ROOT_DIR}/install.sh" --wrappers >/dev/null 2>&1
+  # Swap safe-run for a recorder: what matters is that the shim reaches it
+  # naming the runner, not the raw binary the real mise would pick.
+  unlink "${bin}/safe-run"
+  cat > "${bin}/safe-run" <<'STUB'
+#!/usr/bin/env bash
+printf 'SAFERUN argv0=%s args=%s\n' "${SAFE_RUN_RUNNER_ARGV0:-${0##*/}}" "$*"
+STUB
+  chmod +x "${bin}/safe-run"
+  printf '#!/usr/bin/env bash\necho RAW-MISE-OR-BINARY\n' > "${dir}/real/mise"
+  chmod +x "${dir}/real/mise"
+  for runner in npx bunx uvx; do
+    ln -sfn "${bin}/mise" "${shims}/${runner}"
+    out="$(PATH="${shims}:${dir}/real:/usr/bin:/bin" "${shims}/${runner}" pkg@1.0.0 --flag 2>&1)"
+    [[ "${out}" == "SAFERUN argv0=${runner} args=pkg@1.0.0 --flag" ]] \
+      || { fail "$FUNCNAME: ${runner} -> ${out}"; return; }
+  done
+  # The real safe-run must take the runner path from that out-of-band name
+  # (exec -a cannot rename a script): `status` is a package here, not the
+  # subcommand.
+  out="$(HOME="${dir}/runhome" SAFE_RUN_RUNNER_ARGV0=bunx bash "${ROOT_DIR}/bin/safe-run" status </dev/null 2>&1)" || true
+  [[ "${out}" == *'BLOCKED: status@latest'* ]] || { fail "$FUNCNAME: real safe-run ignored the runner name: ${out}"; return; }
+  # Fail closed: no safe-run reachable -> refusal 100, never the raw binary.
+  unlink "${bin}/safe-run"
+  out="$(PATH="/usr/bin:/bin" "${shims}/bunx" pkg 2>&1)" || rc=$?
+  [[ "${rc}" -eq 100 && "${out}" == *'BLOCKED bunx'* ]] || { fail "$FUNCNAME: no safe-run -> rc=${rc} ${out}"; return; }
+  pass "$FUNCNAME"
+}
+
+case_install_runner_links_adopt_keep_and_never_clobber() {
+  local dir="${TEST_ROOT}/${FUNCNAME}" home bin
+  home="${dir}/home"; bin="${home}/.local/bin"
+  mkdir -p "${bin}"
+  # Hand-made interim link (bunx), foreign regular file (npx), uv-installed uvx.
+  ln -s "${bin}/safe-run" "${bin}/bunx"
+  printf '#!/usr/bin/env bash\n# foreign npx\n' > "${bin}/npx"; chmod +x "${bin}/npx"
+  printf '#!/usr/bin/env bash\n# real uvx\n' > "${bin}/uvx"; chmod +x "${bin}/uvx"
+
+  HOME="${home}" SAFE_ZSHRC="${dir}/zshrc" bash "${ROOT_DIR}/install.sh" --wrappers \
+    >"${dir}/out" 2>"${dir}/err" || { fail "$FUNCNAME: install failed"; return; }
+
+  [[ "$(readlink "${bin}/bunx")" == "${bin}/safe-run" ]] || { fail "$FUNCNAME: bunx not kept"; return; }
+  grep -Fqx '# foreign npx' "${bin}/npx" && [[ ! -L "${bin}/npx" ]] || { fail "$FUNCNAME: foreign npx overwritten"; return; }
+  grep -Fq 'runner gating NOT active from' "${dir}/err" && grep -Fq ': npx' "${dir}/err" || { fail "$FUNCNAME: no foreign warning"; return; }
+  [[ -L "${bin}/uvx" && "$(readlink -f "${bin}/uvx")" == "$(readlink -f "${bin}/safe-run")" ]] || { fail "$FUNCNAME: uvx not linked"; return; }
+  grep -Fqx '# real uvx' "${bin}/uvx.original" || { fail "$FUNCNAME: uvx not displaced"; return; }
+  [[ "$(jq -r '.runners.uvx_real' "${home}/.config/safe/run/config.json")" == "${bin}/uvx.original" ]] \
+    || { fail "$FUNCNAME: uvx_real not recorded"; return; }
+  [[ "$(cat "${home}/.config/safe/runner-links")" == $'bunx\nuvx' ]] || { fail "$FUNCNAME: manifest"; return; }
+
+  # Reinstall: links kept, nothing re-displaced or clobbered.
+  HOME="${home}" SAFE_ZSHRC="${dir}/zshrc" bash "${ROOT_DIR}/install.sh" --wrappers \
+    >"${dir}/out2" 2>"${dir}/err2" || { fail "$FUNCNAME: reinstall failed"; return; }
+  grep -Fqx '# real uvx' "${bin}/uvx.original" && [[ "$(readlink "${bin}/bunx")" == "${bin}/safe-run" ]] \
+    || { fail "$FUNCNAME: reinstall changed links"; return; }
+  grep -Fq 'already point to safe-run (kept): bunx uvx' "${dir}/err2" || { fail "$FUNCNAME: reinstall report"; return; }
+  pass "$FUNCNAME"
+}
+
+case_doctor_and_status_report_runner_resolution() {
+  local dir="${TEST_ROOT}/${FUNCNAME}" home bin shims out runner
+  home="${dir}/home"; bin="${home}/.local/bin"; shims="${home}/.local/share/mise/shims"
+  runner_sandbox "${dir}"
+  printf '#!/usr/bin/env bash\necho real-mise\n' > "${dir}/real/mise"; chmod +x "${dir}/real/mise"
+  HOME="${home}" SAFE_ZSHRC="${dir}/zshrc" bash "${ROOT_DIR}/install.sh" --wrappers >/dev/null 2>&1
+  for runner in npx bunx uvx; do ln -sfn "${bin}/mise" "${shims}/${runner}"; done
+
+  out="$(PATH="${bin}:${shims}:/usr/bin:/bin" HOME="${home}" "${bin}/safe" doctor --json 2>&1)"
+  jq -e '.environment.install_wrappers.runner_links_healthy == true
+         and .environment.install_wrappers.runner_links.bunx.state == "gated"' <<<"${out}" >/dev/null \
+    || { fail "$FUNCNAME: healthy layout: ${out}"; return; }
+  out="$(PATH="${bin}:${shims}:/usr/bin:/bin" HOME="${home}" "${bin}/safe" status 2>&1)"
+  grep -Fq 'runners:        ok (3/3' <<<"${out}" || { fail "$FUNCNAME: status ok line: ${out}"; return; }
+
+  # Shims ahead and no link: via the wrapper it is still gated (second line);
+  # a shim pointed at the raw mise/binary must be flagged.
+  unlink "${bin}/bunx"
+  out="$(PATH="${shims}:/usr/bin:/bin" HOME="${home}" "${bin}/safe" doctor --json 2>&1)"
+  jq -e '.environment.install_wrappers.runner_links.bunx.state == "gated-via-mise"
+         and .environment.install_wrappers.runner_links_healthy == true' <<<"${out}" >/dev/null \
+    || { fail "$FUNCNAME: via-mise: ${out}"; return; }
+  ln -sfn "${dir}/real/mise" "${shims}/bunx"
+  out="$(PATH="${shims}:/usr/bin:/bin" HOME="${home}" "${bin}/safe" doctor --json 2>&1)"
+  jq -e '.environment.install_wrappers.runner_links.bunx.state == "ungated"
+         and .environment.install_wrappers.runner_links_healthy == false' <<<"${out}" >/dev/null \
+    || { fail "$FUNCNAME: ungated: ${out}"; return; }
+  out="$(PATH="${shims}:/usr/bin:/bin" HOME="${home}" "${bin}/safe" doctor 2>&1)"
+  grep -Fq 'bunx: UNGATED' <<<"${out}" || { fail "$FUNCNAME: human doctor: ${out}"; return; }
+  out="$(PATH="${shims}:/usr/bin:/bin" HOME="${home}" "${bin}/safe" status 2>&1)"
+  grep -Fq 'runners:        DEGRADED' <<<"${out}" || { fail "$FUNCNAME: status degraded"; return; }
+  pass "$FUNCNAME"
+}
+
+case_uninstall_removes_only_runner_links_safe_made() {
+  local dir="${TEST_ROOT}/${FUNCNAME}" home bin
+  home="${dir}/home"; bin="${home}/.local/bin"
+  mkdir -p "${bin}"
+  printf '#!/usr/bin/env bash\n# foreign npx\n' > "${bin}/npx"; chmod +x "${bin}/npx"
+  printf '#!/usr/bin/env bash\n# real uvx\n' > "${bin}/uvx"; chmod +x "${bin}/uvx"
+  HOME="${home}" SAFE_ZSHRC="${dir}/zshrc" bash "${ROOT_DIR}/install.sh" --wrappers >/dev/null 2>&1
+  # A link the operator made AFTER install (not in the manifest) must survive.
+  ln -s /bin/true "${bin}/extra-link"
+  HOME="${home}" SAFE_ZSHRC="${dir}/zshrc" bash "${ROOT_DIR}/uninstall.sh" >/dev/null 2>"${dir}/uerr" \
+    || { fail "$FUNCNAME: uninstall failed"; return; }
+  [[ ! -e "${bin}/bunx" && ! -L "${bin}/bunx" ]] || { fail "$FUNCNAME: bunx link left"; return; }
+  grep -Fqx '# foreign npx' "${bin}/npx" || { fail "$FUNCNAME: foreign npx touched"; return; }
+  grep -Fqx '# real uvx' "${bin}/uvx" && [[ ! -L "${bin}/uvx" ]] || { fail "$FUNCNAME: uvx not restored"; return; }
+  [[ -L "${bin}/extra-link" ]] || { fail "$FUNCNAME: unrelated link removed"; return; }
+  [[ ! -e "${home}/.config/safe/runner-links" ]] || { fail "$FUNCNAME: manifest left"; return; }
+  pass "$FUNCNAME"
+}
+
 case_mise_wrapper_gates_a_gated_argv0() {
   # The hole closed in 1.56.0 (2026-08-31): a mise shim whose name is itself a
   # GATED tool forwarded to the real installer with zero audit, so on any PATH
@@ -7079,6 +7251,11 @@ main() {
     case_mise_wrapper_gates_a_gated_argv0 \
     case_mise_shims_ahead_of_the_gate_still_audit \
     case_install_normalizes_mise_shims \
+    case_install_links_runners_ahead_of_mise_shims \
+    case_mise_wrapper_routes_runner_argv0_to_safe_run \
+    case_install_runner_links_adopt_keep_and_never_clobber \
+    case_doctor_and_status_report_runner_resolution \
+    case_uninstall_removes_only_runner_links_safe_made \
     case_uninstall_restores_mise_shims \
     case_uninstall_cleans_shell_and_legacy_binaries \
     case_safe_run_gated_tool_delegation

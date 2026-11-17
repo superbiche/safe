@@ -16,6 +16,13 @@ Each one is a three-line shim:
 exec safe gate npm -- "$@"
 ```
 
+The fetch-and-execute runners are not wrappers: the `npx`, `bunx` and `uvx`
+commands are symlinks to `~/.local/bin/safe-run` that `install.sh` owns (see
+[Installation](installation.md)). The `mise` wrapper also sends a shim named
+after one of them to `safe-run`, so a bare `bunx` through the mise shims never
+reaches the raw binary. `pnpx` is a wrapper above and `bun x` is audited by the
+`bun` wrapper. `safe doctor` reports what each runner resolves to.
+
 All routing lives in `safe gate` (`~/.config/safe/gate-lib.sh`), so upgrading
 safe upgrades the gate — the wrappers themselves never need rewriting.
 

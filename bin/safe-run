@@ -4478,6 +4478,13 @@ main() {
 
   local argv0
   argv0=$(basename "$0")
+  # A script exec'd with `exec -a NAME` still sees its own path as $0 (the
+  # kernel hands the interpreter the script path), so the mise wrapper names the
+  # runner out of band. Only the three runner names are honored.
+  case "${SAFE_RUN_RUNNER_ARGV0:-}" in
+    npx|bunx|uvx) [[ "$argv0" == "safe-run" ]] && argv0="$SAFE_RUN_RUNNER_ARGV0" ;;
+  esac
+  unset SAFE_RUN_RUNNER_ARGV0
   detect_runner "$argv0"
   if [[ "$SAFE_RUN_NO_INIT" != "1" ]]; then
     # host-allow review and export are read-only reports over the trust
