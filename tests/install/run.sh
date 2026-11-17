@@ -7179,13 +7179,13 @@ JSON
   assert_log_has $'AUDIT\tpackage-audit\t@opentui/core@0.1.5\t' "$FUNCNAME bun" || return
   assert_log_has $'AUDIT\tpackage-audit\tokpkg@^4.0.0\t' "$FUNCNAME bun" || return
   # Top-level `catalog` of the root manifest, and a missing named catalog.
-  printf '{"name":"root","catalog":{"okpkg":"5.0.0"}}\n' > "${WORK_DIR}/package.json"
+  printf '{"name":"root","workspaces":["packages/*"],"catalog":{"okpkg":"5.0.0"}}\n' > "${WORK_DIR}/package.json"
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='bun add okpkg@catalog: okpkg@catalog:absent' run_zsh
   assert_log_has $'AUDIT\tpackage-audit\tokpkg@5.0.0\t' "$FUNCNAME bun top-level" || return
   assert_log_has $'AUDIT\tpackage-audit\tokpkg@catalog@absent\t' "$FUNCNAME bun absent" || return
   # A non-registry value (git URL) is not read as a version.
-  printf '{"name":"root","catalog":{"okpkg":"github:foo/bar"}}\n' > "${WORK_DIR}/package.json"
+  printf '{"name":"root","workspaces":["packages/*"],"catalog":{"okpkg":"github:foo/bar"}}\n' > "${WORK_DIR}/package.json"
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='bun add okpkg@catalog:' run_zsh
   assert_log_has $'AUDIT\tpackage-audit\tokpkg@catalog\t' "$FUNCNAME bun git value" || return
@@ -7205,6 +7205,26 @@ JSON
   assert_log_has $'AUDIT\tpackage-audit\tokpkg@catalog\t' "$FUNCNAME bun member decoy" || return
   assert_log_not_contains_fragment 'okpkg@6.0.0' "$FUNCNAME bun member decoy" || return
   assert_log_not_contains_fragment 'okpkg@7.0.0' "$FUNCNAME bun member decoy" || return
+  # One manifest naming the entry at the top level AND under `workspaces`
+  # with different values: which one bun takes is not the gate's to guess.
+  printf '{"name":"root","catalog":{"okpkg":"6.0.0"},"workspaces":{"packages":["packages/*"],"catalog":{"okpkg":"7.0.0"}}}\n' > "${WORK_DIR}/package.json"
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='cd packages/app && bun add okpkg@catalog:' run_zsh
+  assert_log_has $'AUDIT\tpackage-audit\tokpkg@catalog\t' "$FUNCNAME bun both locations" || return
+  assert_log_not_contains_fragment 'okpkg@6.0.0' "$FUNCNAME bun both locations" || return
+  # A root manifest bun can read and jq cannot (a comment) is an unknown
+  # answer, not an absent root: the member's own catalog is not promoted.
+  printf '{\n  // comment\n  "name":"root","workspaces":{"packages":["packages/*"],"catalog":{"okpkg":"7.0.0"}}}\n' > "${WORK_DIR}/package.json"
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='cd packages/decoy && bun add okpkg@catalog:' run_zsh
+  assert_log_has $'AUDIT\tpackage-audit\tokpkg@catalog\t' "$FUNCNAME bun jsonc root" || return
+  assert_log_not_contains_fragment 'okpkg@6.0.0' "$FUNCNAME bun jsonc root" || return
+  # No manifest declares workspaces: bun refuses catalogs there, nothing resolves.
+  printf '{"name":"root","catalog":{"okpkg":"5.0.0"}}\n' > "${WORK_DIR}/package.json"
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='bun add okpkg@catalog:' run_zsh
+  assert_log_not_contains_fragment 'okpkg@5.0.0' "$FUNCNAME bun no workspaces" || return
+  printf '{"name":"root","workspaces":{"packages":["packages/*"],"catalog":{"okpkg":"7.0.0"}}}\n' > "${WORK_DIR}/package.json"
   # A global install has no workspace: the specifier is never resolved.
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='bun add -g okpkg@catalog:' run_zsh

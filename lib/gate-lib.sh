@@ -4255,14 +4255,17 @@ safe_gate_pnpm_catalog_entry() {
 }
 
 # Entry <key> of catalog <name> in a bun root package.json, else nothing.
+# bun accepts the catalog at the top level and under `workspaces`; when one
+# manifest names the entry in both places with different values, which one
+# bun takes is bun's business, so that manifest answers nothing.
 safe_gate_bun_catalog_entry() {
   local file="$1" catname="$2" key="$3"
   jq -r --arg c "${catname}" --arg k "${key}" '
-    (if $c == "" then
-       (.catalog // (.workspaces | objects | .catalog) // {})
-     else
-       ((.catalogs // {}) + ((.workspaces | objects | .catalogs) // {}))[$c] // {}
-     end) | objects | .[$k] | strings
+    [ (if $c == "" then .catalog else (.catalogs | objects | .[$c]) end),
+      (.workspaces | objects
+       | if $c == "" then .catalog else (.catalogs | objects | .[$c]) end) ]
+    | map(objects | .[$k] | strings) | unique
+    | if length == 1 then .[0] else empty end
   ' "${file}" 2>/dev/null
 }
 
@@ -4305,15 +4308,18 @@ safe_gate_catalog_spec() {
     # depends on workspace globs the gate does not evaluate, so every
     # manifest that could be it must agree: each ancestor-or-self manifest
     # with a `workspaces` field, plus the nearest manifest when it carries
-    # catalog fields itself or when no manifest declares workspaces (a
-    # single-package project). One shared, non-empty answer resolves; any
-    # disagreement, or a candidate without the entry, leaves the specifier
+    # catalog fields itself. One shared, non-empty answer resolves; any
+    # disagreement, a candidate without the entry, a manifest jq cannot
+    # read, or no `workspaces` declaration at all leaves the specifier
     # unresolved.
     local nearest="" candidate answer agreed="" first=1 conflict=0
     local -a roots=()
     while [[ -n "${dir}" ]]; do
       probe="${dir}/package.json"
       if [[ -f "${probe}" ]]; then
+        # bun reads manifests jq cannot (comments, trailing commas): such a
+        # manifest is a candidate with an unknown answer, never an absent one.
+        jq -e 'type == "object"' "${probe}" >/dev/null 2>&1 || conflict=1
         [[ -n "${nearest}" ]] || nearest="${probe}"
         if jq -e '(.workspaces? // null) != null' "${probe}" >/dev/null 2>&1; then
           roots+=("${probe}")
@@ -4323,13 +4329,13 @@ safe_gate_catalog_spec() {
       [[ "${parent}" != "${dir}" ]] || break
       dir="${parent}"
     done
-    if [[ -n "${nearest}" ]]; then
-      if (( ${#roots[@]} == 0 )); then
-        roots=("${nearest}")
-      elif [[ "${roots[0]}" != "${nearest}" ]] \
-           && jq -e '(.catalog? // .catalogs? // null) != null' "${nearest}" >/dev/null 2>&1; then
-        roots=("${nearest}" "${roots[@]}")
-      fi
+    # No manifest declares workspaces: bun refuses `catalog:` there
+    # ("catalogs require a workspaces field in the root package.json"), so
+    # there is nothing to resolve.
+    (( ${#roots[@]} > 0 )) || conflict=1
+    if (( conflict == 0 )) && [[ "${roots[0]}" != "${nearest}" ]] \
+       && jq -e '(.catalog? // .catalogs? // null) != null' "${nearest}" >/dev/null 2>&1; then
+      roots=("${nearest}" "${roots[@]}")
     fi
     for candidate in "${roots[@]}"; do
       answer="$(safe_gate_bun_catalog_entry "${candidate}" "${catname}" "${name}")"

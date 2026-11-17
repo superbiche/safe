@@ -299,11 +299,12 @@ judges the version or range the entry names. bun ignores a member package's
 own catalog, and the gate does not evaluate workspace globs, so for bun every
 manifest that could be the root must name the same entry: each manifest
 upward that declares `workspaces`, plus the nearest one when it carries
-catalog fields or when none declares workspaces. An entry the gate cannot
-read (no catalog, no such entry, candidates that disagree, a
-git/file/workspace value, a layout the line reader does not model, or a
-global install) leaves the specifier unresolved, and the audit refuses it as
-before.
+catalog fields. An entry the gate cannot read (no catalog, no such entry,
+candidates that disagree, one manifest naming the entry both at the top
+level and under `workspaces` with different values, a manifest that is not
+strict JSON, no `workspaces` declaration at all, a git/file/workspace value,
+a layout the line reader does not model, or a global install) leaves the
+specifier unresolved, and the audit refuses it as before.
 
 pnpm 12 checks a project's dependencies before it runs a script or binary
 (`run`, `exec`, `test`, `start`, a bare `<script>`) and installs what is out of
