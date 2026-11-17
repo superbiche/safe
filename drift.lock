@@ -8,12 +8,12 @@ sig = "020ec1f1d30dccf0"
 [[bindings]]
 doc = "docs/agents.md"
 target = "scripts/render-contract.sh"
-sig = "bb00aa18e9045036"
+sig = "0dc29b141c021366"
 
 [[bindings]]
 doc = "docs/command-reference.md"
 target = "install.sh"
-sig = "f8cccce6a5faf41c"
+sig = "79660d907230cbde"
 
 [[bindings]]
 doc = "docs/command-reference.md"
@@ -38,12 +38,12 @@ sig = "eb64308dcf57bd72"
 [[bindings]]
 doc = "docs/index.md"
 target = "install.sh"
-sig = "f8cccce6a5faf41c"
+sig = "79660d907230cbde"
 
 [[bindings]]
 doc = "docs/install-wrappers.md"
 target = "install.sh"
-sig = "f8cccce6a5faf41c"
+sig = "79660d907230cbde"
 
 [[bindings]]
 doc = "docs/install-wrappers.md"
@@ -53,17 +53,17 @@ sig = "80e2990cb678d6a0"
 [[bindings]]
 doc = "docs/installation.md"
 target = "install.sh"
-sig = "f8cccce6a5faf41c"
+sig = "79660d907230cbde"
 
 [[bindings]]
 doc = "docs/installation.md"
 target = "uninstall.sh"
-sig = "5671727a27b08249"
+sig = "55d74c753af0fcb5"
 
 [[bindings]]
 doc = "docs/integration-flows.md"
 target = "install.sh"
-sig = "f8cccce6a5faf41c"
+sig = "79660d907230cbde"
 
 [[bindings]]
 doc = "docs/integration-flows.md"

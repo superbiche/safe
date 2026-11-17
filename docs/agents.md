@@ -168,6 +168,14 @@ safe release follow [--dry-run] [--checkout <dir>]           # agent-permitted i
 ```
 <!-- END GENERATED: allow-flows -->
 
+## Agent skill
+
+`install.sh` installs the agent skill `safe` to
+`~/.local/share/safe/skills/safe/SKILL.md`; `install.sh --agent-skills` links
+it into the Claude Code and Codex skill directories
+([installation](installation.md#install-modes)). Its contract sections are
+rendered from `docs/contract/agent-contract.json` like this page's.
+
 ## Snippet for harness instruction files
 
 Paste into `AGENTS.md` / `CLAUDE.md` on gated machines:

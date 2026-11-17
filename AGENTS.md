@@ -38,7 +38,7 @@ Running `install.sh` is pre-authorized whenever it makes the live gate better â€
 
 ## Contract and docs single-source
 
-`docs/contract/agent-contract.json` is the only source for the agent contract. Rendered surfaces (`docs/agents.md` generated blocks, `safe explain`) regenerate via `scripts/render-contract.sh`; never hand-edit generated blocks. `tests/contract/drift.sh` enforces this.
+`docs/contract/agent-contract.json` is the only source for the agent contract. Rendered surfaces (`docs/agents.md` and `share/agent/skills/safe/SKILL.md` generated blocks, `safe explain`) regenerate via `scripts/render-contract.sh`; never hand-edit generated blocks. `tests/contract/drift.sh` enforces this.
 
 ## Releases
 

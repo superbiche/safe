@@ -88,7 +88,11 @@ case_hand_editing_a_generated_block_is_caught() {
   # accident. Edit a copy and prove --check rejects it.
   local sandbox="$TEST_ROOT/sandbox"
   mkdir -p "$sandbox"
-  cp -rL "$ROOT/docs" "$ROOT/scripts" "$sandbox/"
+  cp -rL "$ROOT/docs" "$ROOT/scripts" "$ROOT/share" "$sandbox/"
+  "$sandbox/scripts/render-contract.sh" --check >/dev/null 2>&1 || {
+    fail "$FUNCNAME (the unedited copy does not pass --check)"
+    return
+  }
   [[ -f "$sandbox/docs/agents.md" && ! -L "$sandbox/docs/agents.md" ]] || {
     fail 'generated surface copy is not a regular file'
     return
@@ -99,6 +103,13 @@ case_hand_editing_a_generated_block_is_caught() {
   # Re-anchor the copy's ROOT by running the copied script from the copy.
   if "$sandbox/scripts/render-contract.sh" --check >/dev/null 2>&1; then
     fail "$FUNCNAME (a hand-edited doc passed --check)"
+    return
+  fi
+  # The agent skill is a rendered surface too.
+  cp "$ROOT/docs/agents.md" "$sandbox/docs/agents.md"
+  sed -i 's/^| 102 |/| 102 | HAND EDITED |/' "$sandbox/share/agent/skills/safe/SKILL.md"
+  if "$sandbox/scripts/render-contract.sh" --check >/dev/null 2>&1; then
+    fail "$FUNCNAME (a hand-edited agent skill passed --check)"
   else
     pass "$FUNCNAME"
   fi

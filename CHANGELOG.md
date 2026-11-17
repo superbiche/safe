@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Ship the agent skill with safe. `share/agent/skills/safe/SKILL.md` tells an
+  AI coding agent how to read a refusal, hand the operator a command, use
+  exact versions, the allow flows and worktree reuse; its contract sections
+  are rendered from `docs/contract/agent-contract.json` (drift-guarded like
+  `docs/agents.md`). Every install puts it in
+  `~/.local/share/safe/skills/safe`; the new `install.sh --agent-skills`
+  links it into `~/.claude/skills` and `~/.codex/skills` for each harness
+  present, never over an entry it did not create. `safe release follow`
+  repeats the flag; `uninstall.sh` removes the skill and only its own links.
+
 ## 1.73.0 - 2026-11-17
 
 - A package manager's project gate weighs only its own ecosystem's critical

@@ -3767,6 +3767,45 @@ case_install_idempotent_with_completions() {
   pass "$FUNCNAME"
 }
 
+# The agent skill ships with the release: installed on every run, linked
+# into present harnesses only with --agent-skills, never over an entry safe
+# did not create, recorded for release follow, removed by uninstall.
+case_install_agent_skills() {
+  prepare_case "install-agent-skills"
+  local data="${HOME_DIR}/.local/share/safe" installed
+  installed="${data}/skills/safe"
+  mkdir -p "${HOME_DIR}/.claude" "${HOME_DIR}/.codex/skills/safe"
+  printf 'their own skill\n' > "${HOME_DIR}/.codex/skills/safe/SKILL.md"
+  HOME="${HOME_DIR}" SAFE_DATA_DIR="${data}" SAFE_CONFIG_DIR="${HOME_DIR}/.config/safe" \
+    bash "${ROOT_DIR}/install.sh" >"${OUT_FILE}" 2>"${ERR_FILE}"
+  STATUS=$?
+  assert_status 0 "$FUNCNAME default" || return
+  cmp -s "${ROOT_DIR}/share/agent/skills/safe/SKILL.md" "${installed}/SKILL.md" || { fail "$FUNCNAME: skill not installed"; return; }
+  [[ ! -e "${HOME_DIR}/.claude/skills/safe" ]] || { fail "$FUNCNAME: linked without --agent-skills"; return; }
+
+  printf 'dropped by a newer release\n' > "${installed}/stale.md"
+  HOME="${HOME_DIR}" SAFE_DATA_DIR="${data}" SAFE_CONFIG_DIR="${HOME_DIR}/.config/safe" \
+    bash "${ROOT_DIR}/install.sh" --all --agent-skills >>"${OUT_FILE}" 2>>"${ERR_FILE}" || STATUS=$?
+  assert_status 0 "$FUNCNAME --agent-skills" || return
+  [[ ! -e "${installed}/stale.md" ]] || { fail "$FUNCNAME: a stale skill file survived the reinstall"; return; }
+  [[ -L "${HOME_DIR}/.claude/skills/safe" && "$(readlink "${HOME_DIR}/.claude/skills/safe")" == "${installed}" ]] ||
+    { fail "$FUNCNAME: the skill was not linked into .claude/skills"; return; }
+  [[ -d "${HOME_DIR}/.codex/skills/safe" && ! -L "${HOME_DIR}/.codex/skills/safe" ]] &&
+    grep -q 'their own skill' "${HOME_DIR}/.codex/skills/safe/SKILL.md" ||
+    { fail "$FUNCNAME: an existing skill directory was replaced"; return; }
+  assert_err_contains_fragment "${HOME_DIR}/.codex/skills/safe already exists; left as is" "$FUNCNAME" || return
+  jq -e '.install_flags == ["--all", "--agent-skills"]' "${HOME_DIR}/.config/safe/release-follow.json" >/dev/null ||
+    { fail "$FUNCNAME: release follow does not record --agent-skills"; return; }
+
+  HOME="${HOME_DIR}" SAFE_DATA_DIR="${data}" SAFE_CONFIG_DIR="${HOME_DIR}/.config/safe" \
+    bash "${ROOT_DIR}/uninstall.sh" >>"${OUT_FILE}" 2>>"${ERR_FILE}" || STATUS=$?
+  assert_status 0 "$FUNCNAME uninstall" || return
+  [[ ! -e "${HOME_DIR}/.claude/skills/safe" && ! -L "${HOME_DIR}/.claude/skills/safe" && ! -e "${installed}" ]] ||
+    { fail "$FUNCNAME: uninstall left the skill or its link"; return; }
+  [[ -f "${HOME_DIR}/.codex/skills/safe/SKILL.md" ]] || { fail "$FUNCNAME: uninstall removed a skill safe did not create"; return; }
+  pass "$FUNCNAME"
+}
+
 case_install_writes_gate_wrappers() {
   prepare_case "install-writes-gate-wrappers"
   mkdir -p "${HOME_DIR}/.local/bin"
@@ -6960,6 +6999,7 @@ main() {
     case_stale_evidence_is_source_scoped \
     case_install_idempotent_no_wrappers \
     case_install_idempotent_with_completions \
+    case_install_agent_skills \
     case_install_writes_gate_wrappers \
     case_uv_binary_is_displaced_and_gated \
     case_uv_displacement_refuses_to_clobber_an_existing_original \
