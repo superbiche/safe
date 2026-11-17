@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# safe install --reuse: reuse of already-installed Composer dependencies in a
-# worktree (operator rulings 2026-09-30). Real git checkouts and a real copy.
-# The operation runs no audit, no php and no package manager: each is a
-# logging fixture here whose log must stay empty.
+# safe install --reuse: reuse of already-installed Composer and Node
+# dependencies in a worktree (operator rulings 2026-09-30 and 2026-11-17).
+# Real git checkouts and a real copy. The operation runs no audit, no php, no
+# node and no package manager: each is a logging fixture here whose log must
+# stay empty.
 
 set -uo pipefail
 
@@ -459,7 +460,7 @@ expect_refusal 100 'vendor is a symlink or belongs to another user' "a symlinked
 mkdir -p "$tmp/not-a-project"
 WT="$tmp/not-a-project"
 reuse "$WT"
-expect_refusal 100 'has no composer.json with a composer.lock' "a directory without a Composer project is refused"
+expect_refusal 100 'has no committed lockfile reuse covers' "a directory without a Composer or Node project is refused"
 
 mkdir -p "$tmp/no-git" && printf '{}\n' > "$tmp/no-git/composer.json" && printf '%s\n' "$LOCK" > "$tmp/no-git/composer.lock"
 WT="$tmp/no-git"
@@ -482,6 +483,195 @@ reuse "$WT"
   { cat "$tmp/out.txt" "$tmp/err.txt" >&2; fail "subdirectory project (rc=$RC)"; }
 grep -Fq "source:    $MAIN" "$tmp/out.txt" || fail "subdirectory project used the wrong source"
 pass "a project in a repository subdirectory reuses the same subdirectory of the main checkout"
+
+# --- node_modules (operator ruling 2026-11-17) --------------------------------------
+# The tree check runs in safe-core, built from this working tree.
+# shellcheck source=tests/lib/safe-core.sh
+source "$ROOT/tests/lib/safe-core.sh"
+if ! safe_core_test_prepare "$ROOT" "$tmp/safe-core"; then
+  [[ "${SAFE_TEST_STRICT:-}" == "1" ]] && fail "safe-core could not be built and SAFE_TEST_STRICT=1"
+  printf '\n%d passed, 0 failed (node_modules cases skipped: no Go toolchain)\n' "$PASS_COUNT"
+  exit 0
+fi
+for tool in yarn pnpm bun node; do
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$0 $*" >> "%s/forbidden-calls"\nexit 97\n' "$tmp" > "$tmp/bin/$tool"
+  chmod +x "$tmp/bin/$tool"
+done
+
+NPM_LOCK='{"name":"web","lockfileVersion":3,"packages":{"":{"name":"web","workspaces":["packages/ui"],"dependencies":{"left-pad":"^1.3.0"}},"packages/ui":{"name":"@web/ui","version":"0.1.0","dependencies":{"tiny":"2.0.0"}},"node_modules/@web/ui":{"resolved":"packages/ui","link":true},"node_modules/left-pad":{"version":"1.3.0"},"node_modules/fsevents":{"version":"2.3.3","optional":true,"os":["darwin"]},"packages/ui/node_modules/tiny":{"version":"2.0.0"}}}'
+
+# node_install_tree <project>: an npm workspace install of $NPM_LOCK.
+node_install_tree() {
+  local dir="$1"
+  mkdir -p "$dir/node_modules/left-pad" "$dir/node_modules/@web" "$dir/node_modules/.bin" "$dir/node_modules/.cache/babel" \
+    "$dir/packages/ui/node_modules/tiny"
+  printf '{"name":"left-pad","version":"1.3.0","bin":"cli.js"}\n' > "$dir/node_modules/left-pad/package.json"
+  printf 'module.exports = 1\n' > "$dir/node_modules/left-pad/cli.js"
+  ln -s ../left-pad/cli.js "$dir/node_modules/.bin/left-pad"
+  ln -s ../../packages/ui "$dir/node_modules/@web/ui"
+  printf '{"name":"tiny","version":"2.0.0"}\n' > "$dir/packages/ui/node_modules/tiny/package.json"
+  printf '{}\n' > "$dir/node_modules/.package-lock.json"
+  printf 'cache written by a build\n' > "$dir/node_modules/.cache/babel/entry.json"
+}
+
+# make_node_repo <name> [composer]: a main checkout with an installed Node
+# workspace (and a Composer project too with "composer"), plus worktree wt.
+make_node_repo() {
+  local name="$1" main="$tmp/$1/main"
+  mkdir -p "$main/packages/ui"
+  git_q -C "$main" init || fail "git init"
+  printf '{"name":"web","private":true,"workspaces":["packages/ui"],"dependencies":{"left-pad":"^1.3.0"},"scripts":{"prepare":"husky"}}\n' > "$main/package.json"
+  printf '{"name":"@web/ui","version":"0.1.0","dependencies":{"tiny":"2.0.0"}}\n' > "$main/packages/ui/package.json"
+  printf '%s\n' "$NPM_LOCK" > "$main/package-lock.json"
+  printf 'node_modules/\nvendor/\n' > "$main/.gitignore"
+  if [[ "${2:-}" == "composer" ]]; then
+    printf '{"name":"acme/app","autoload":{"psr-4":{"App\\\\":"src/"}}}\n' > "$main/composer.json"
+    printf '%s\n' "$LOCK" > "$main/composer.lock"
+  fi
+  git_q -C "$main" add -A && git_q -C "$main" commit -m init || fail "git commit"
+  node_install_tree "$main"
+  [[ "${2:-}" == "composer" ]] && install_tree "$main"
+  git_q -C "$main" worktree add "$tmp/$1/wt" -b "wt-$name" || fail "git worktree add"
+  MAIN="$main" WT="$tmp/$1/wt"
+}
+
+export SAFE_CORE_BIN="$tmp/safe-core"
+make_node_repo node
+reuse "$WT"
+[[ "$RC" == "0" ]] || { cat "$tmp/out.txt" "$tmp/err.txt" >&2; fail "node_modules reuse failed (rc=$RC)"; }
+diff -r --exclude=.cache "$MAIN/node_modules" "$WT/node_modules" >/dev/null || fail "the copied node_modules differs from the source"
+diff -r "$MAIN/packages/ui/node_modules" "$WT/packages/ui/node_modules" >/dev/null || fail "the workspace node_modules was not copied"
+[[ -L "$WT/node_modules/@web/ui" && "$(readlink "$WT/node_modules/@web/ui")" == "../../packages/ui" ]] ||
+  fail "the workspace link did not survive the copy"
+[[ ! -e "$WT/node_modules/.cache" ]] || fail "a tool cache was copied"
+[[ "$(stat -c %i "$WT/node_modules/left-pad/cli.js")" != "$(stat -c %i "$MAIN/node_modules/left-pad/cli.js")" ]] ||
+  fail "the copy shares an inode with the source"
+grep -Fq 'status:    reused-existing-node-modules' "$tmp/out.txt" || fail "node reuse does not carry its status"
+grep -Fq 'the tree matches the lockfile' "$tmp/out.txt" || fail "node reuse does not report the tree check"
+grep -Fq 'trees:     node_modules, packages/ui/node_modules' "$tmp/out.txt" || fail "node reuse does not name the trees it copies"
+grep -Fq 'skipped:   node_modules/.cache (tool caches; not copied)' "$tmp/out.txt" || fail "the skipped cache is not reported"
+grep -Fq 'scripts:   not run — package.json declares prepare' "$tmp/out.txt" || fail "the root lifecycle script is not reported"
+[[ ! -s "$tmp/err.txt" ]] || fail "a clean node reuse wrote to stderr: $(cat "$tmp/err.txt")"
+receipt="$(receipt_of "$tmp/out.txt")"
+jq -e --arg s "$MAIN" --arg sha "$(sha256sum "$WT/package-lock.json" | cut -d' ' -f1)" '
+  .ecosystem == "node" and .status == "reused-existing-node-modules" and .source == $s
+  and .lockfile == {name: "package-lock.json", sha256: $sha}
+  and .inventory == {packages: 2, format: "npm", trees: ["node_modules", "packages/ui/node_modules"]}
+  and .skipped == ["node_modules/.cache"] and .scripts_not_run == ["prepare"]
+  and .integrity.state == "baseline-recorded"
+  and .network == false and .package_manager == false and .scripts_executed == false' "$receipt" >/dev/null ||
+  { cat "$receipt" >&2; fail "node receipt content differs"; }
+gate_log | grep -Fq "reuse:node | $WT | GATE | non-tty | REUSED_EXISTING | source=$MAIN" ||
+  fail "the gate log lacks the node reuse decision"
+pass "an npm workspace node_modules is reused unattended: workspace trees and links, caches left behind, scripts reported"
+
+rm -rf "$WT/node_modules" "$WT/packages/ui/node_modules"
+printf 'rewritten by a build\n' > "$MAIN/node_modules/.cache/babel/entry.json"
+reuse "$WT"
+[[ "$RC" == "0" ]] && grep -Fq 'integrity: baseline-matched' "$tmp/out.txt" ||
+  { cat "$tmp/out.txt" "$tmp/err.txt" >&2; fail "a tool cache write broke the node baseline (rc=$RC)"; }
+pass "a second node reuse matches its baseline; tool caches are not part of it"
+
+reuse "$WT"
+expect_refusal 100 'node_modules already exists and reuse never overwrites' "an existing node_modules is never overwritten"
+
+# A stale source tree: the lockfile moved on, the install did not.
+rm -rf "$WT/node_modules" "$WT/packages/ui/node_modules"
+printf '{"name":"left-pad","version":"1.2.0"}\n' > "$MAIN/node_modules/left-pad/package.json"
+reuse "$WT"
+RC_STALE="$RC"
+WT_SAVED="$WT"
+[[ "$RC_STALE" == "102" ]] && grep -Fq 'missing left-pad@1.3.0, not in the lockfile: left-pad@1.2.0' "$tmp/err.txt" &&
+  [[ ! -e "$WT/node_modules" ]] ||
+  { cat "$tmp/out.txt" "$tmp/err.txt" >&2; fail "a stale node_modules was not an evidence gap (rc=$RC)"; }
+pass "a source node_modules that no longer matches the lockfile is an operator decision (102 unattended)"
+printf '{"name":"left-pad","version":"1.3.0","bin":"cli.js"}\n' > "$MAIN/node_modules/left-pad/package.json"
+
+# A workspace link whose folder the target lacks would dangle.
+mv "$WT/packages/ui" "$tmp/ui-aside"
+reuse "$WT"
+[[ "$RC" == "102" ]] && grep -Fq 'symlink node_modules/@web/ui -> ../../packages/ui would dangle here' "$tmp/err.txt" ||
+  { cat "$tmp/err.txt" >&2; fail "a dangling workspace link was not caught (rc=$RC)"; }
+mv "$tmp/ui-aside" "$WT/packages/ui"
+pass "a workspace link the target cannot satisfy is an evidence gap"
+
+# Lockfile identity.
+printf '%s\n' "${NPM_LOCK/1.3.0/1.3.1}" > "$WT/package-lock.json"
+reuse "$WT"
+expect_refusal 100 'holds an installed node_modules/ for this package-lock.json' "no checkout holds a tree for a changed package-lock.json"
+reuse "$WT" --reuse-from "$MAIN"
+expect_refusal 100 'package-lock.json differs between' "a changed package-lock.json is a new install, not a reuse"
+git -C "$WT" checkout -q -- package-lock.json
+
+# Yarn Plug'n'Play has no tree to copy.
+touch "$MAIN/.pnp.cjs"
+reuse "$WT"
+expect_refusal 100 "Yarn Plug'n'Play install, which reuse does not cover" "a Plug'n'Play source is refused with the install lane"
+rm -f "$MAIN/.pnp.cjs"
+
+# Without safe-core the tree cannot be checked: infrastructure, never a pass.
+SAFE_CORE_BIN="$tmp/missing-safe-core" reuse "$WT"
+expect_refusal 100 'safe-core' "a missing safe-core refuses instead of copying an unchecked tree"
+printf '#!/usr/bin/env bash\necho 0.0.0\n' > "$tmp/stale-safe-core" && chmod +x "$tmp/stale-safe-core"
+SAFE_CORE_BIN="$tmp/stale-safe-core" reuse "$WT"
+expect_refusal 100 'safe-core' "a safe-core of another release refuses"
+
+# One project, two ecosystems, one command.
+make_node_repo both composer
+reuse "$WT"
+[[ "$RC" == "0" ]] && diff -r "$MAIN/vendor" "$WT/vendor" >/dev/null && [[ -d "$WT/node_modules/left-pad" ]] ||
+  { cat "$tmp/out.txt" "$tmp/err.txt" >&2; fail "a Composer and Node project was not reused in one run (rc=$RC)"; }
+[[ "$(grep -c '^  status:    reused-existing-' "$tmp/out.txt")" == "2" ]] || fail "each ecosystem does not report its own status"
+pass "a project with vendor/ and node_modules/ reuses both in one run"
+
+rm -rf "$WT/node_modules" "$WT/packages/ui/node_modules"
+reuse "$WT"
+[[ "$RC" == "0" ]] && grep -Fq "$WT/vendor already exists; reuse never overwrites, so it is left as it is" "$tmp/out.txt" &&
+  grep -Fq 'status:    reused-existing-node-modules' "$tmp/out.txt" ||
+  { cat "$tmp/out.txt" "$tmp/err.txt" >&2; fail "a present vendor/ blocked the node_modules reuse (rc=$RC)"; }
+pass "an ecosystem already installed in the target is left as it is while the other is reused"
+
+rm -rf "$WT/vendor" "$WT/node_modules" "$WT/packages/ui/node_modules"
+printf '{"name":"left-pad","version":"1.2.0"}\n' > "$MAIN/node_modules/left-pad/package.json"
+reuse "$WT"
+[[ "$RC" == "102" && -d "$WT/vendor" && ! -e "$WT/node_modules" ]] &&
+  grep -Fq 'vendor/ was reused before this refusal and stays in place' "$tmp/err.txt" ||
+  { cat "$tmp/out.txt" "$tmp/err.txt" >&2; fail "a node refusal after the vendor/ reuse does not say vendor/ stays (rc=$RC)"; }
+[[ "$(wc -l < "$tmp/err.txt")" == "1" ]] || fail "the refusal is not one stderr line"
+pass "a refusal of the second ecosystem says the first one was reused and stays"
+
+# Composer: pest's coverage cache is not a dependency. A test run in the
+# source writes it; it is neither copied nor part of the baseline, and a
+# baseline recorded before the exclusion still matches.
+LOCK_SAVED="$LOCK" INSTALLED_SAVED="$INSTALLED"
+LOCK="$(jq -c '.["packages-dev"] += [{"name":"pestphp/pest","version":"4.1.0"}]' <<<"$LOCK")"
+INSTALLED="$(jq -c '.packages += [{"name":"pestphp/pest","version":"4.1.0","install-path":"../pestphp/pest"}]' <<<"$INSTALLED")"
+make_repo pest
+mkdir -p "$MAIN/vendor/pestphp/pest/src" "$MAIN/vendor/pestphp/pest/.temp/code-coverage"
+printf '<?php // pest\n' > "$MAIN/vendor/pestphp/pest/src/Pest.php"
+printf 'coverage 1\n' > "$MAIN/vendor/pestphp/pest/.temp/code-coverage/a"
+reuse "$WT"
+[[ "$RC" == "0" && -f "$WT/vendor/pestphp/pest/src/Pest.php" && ! -e "$WT/vendor/pestphp/pest/.temp" ]] ||
+  { cat "$tmp/out.txt" "$tmp/err.txt" >&2; fail "pest's cache was copied, or the package was not (rc=$RC)"; }
+rm -rf "$WT/vendor"
+printf 'coverage 2\n' > "$MAIN/vendor/pestphp/pest/.temp/code-coverage/b"
+reuse "$WT"
+[[ "$RC" == "0" ]] && grep -Fq 'integrity: baseline-matched' "$tmp/out.txt" ||
+  { cat "$tmp/out.txt" "$tmp/err.txt" >&2; fail "a coverage run in the source broke the baseline (rc=$RC)"; }
+pass "pest's coverage cache is neither copied nor part of the integrity baseline"
+
+baseline="$SAFE_DATA_DIR/install/reuse/baselines/$(printf '%s' "$MAIN" | sha256sum | cut -c1-32)"
+printf '%s  ./pestphp/pest/.temp/code-coverage/a\n' "$(printf 'old' | sha256sum | cut -d' ' -f1)" >> "$baseline.manifest"
+LC_ALL=C sort -k2 -o "$baseline.manifest" "$baseline.manifest"
+jq --arg m "$(sha256sum < "$baseline.manifest" | cut -d' ' -f1)" '.manifest_sha256 = $m' "$baseline.json" > "$baseline.tmp" &&
+  mv "$baseline.tmp" "$baseline.json"
+rm -rf "$WT/vendor"
+reuse "$WT"
+[[ "$RC" == "0" ]] && grep -Fq 'integrity: baseline-matched' "$tmp/out.txt" ||
+  { cat "$tmp/out.txt" "$tmp/err.txt" >&2; fail "a baseline recorded with pest's cache no longer matches (rc=$RC)"; }
+pass "a baseline recorded before the cache exclusion still matches"
+LOCK="$LOCK_SAVED" INSTALLED="$INSTALLED_SAVED"
+unset SAFE_CORE_BIN
 
 # --- argument contract -----------------------------------------------------------
 make_repo arguments

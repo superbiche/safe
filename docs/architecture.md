@@ -55,7 +55,7 @@ trail for intentional updates that bypass package-manager safeguards.
 ## Direction: Go
 
 `safe-core` (`cmd/safe-core`, with `internal/lockdiff`, `internal/strictjson`,
-`internal/verdict` and `internal/toolscan`) is the start of a gradual migration of `safe`'s logic
+`internal/verdict`, `internal/toolscan` and `internal/nodetree`) is the start of a gradual migration of `safe`'s logic
 out of bash and into Go. New capability grows in Go, not bash, wherever the
 choice exists.
 

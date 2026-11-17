@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- `safe install --reuse` covers Node projects (operator ruling 2026-11-17).
+  A worktree's missing `node_modules/` is copied from another checkout of the
+  same repository whose lockfiles are byte-identical, whatever manager
+  installed it: npm (`package-lock.json`, `npm-shrinkwrap.json`), Yarn
+  classic and Berry with `nodeLinker: node-modules` (`yarn.lock`), pnpm
+  (`pnpm-lock.yaml`) and bun (`bun.lock`; `bun.lockb` is binary and is an
+  operator decision). A new `safe-core node-tree` checks the installed tree
+  against the lockfile from the `package.json` files on disk: a stale tree,
+  a missing required package or a dangling workspace link is an evidence gap
+  (102 unattended, operator decision at the terminal); optional and
+  platform-conditional packages may be absent. Workspace `node_modules`
+  directories and Yarn Berry's install state are carried; tool caches
+  (`.cache`, `.vite`) are not. Root lifecycle scripts do not run and are
+  named in the output. A project with both `vendor/` and `node_modules/` is
+  reused in one run; an ecosystem already present in the target is left as
+  it is. Yarn Plug'n'Play installs are refused with the install lane. The
+  status is `reused-existing-node-modules`.
+- Composer reuse no longer copies or baselines pest's
+  `vendor/pestphp/pest/.temp` (code-coverage and test-result caches): a test
+  run in the source checkout no longer reads as a changed tree at the next
+  reuse. Baselines recorded with those files still match.
+
 - The mise gate now models `mise use --tool-option` and `--postinstall`
   instead of refusing them as unrecognized flags. Option keys bind to the
   tool that follows them (mise's own attribution) and are classified like
