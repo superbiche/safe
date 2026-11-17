@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 )
 
@@ -44,6 +45,10 @@ type Entry struct {
 type Lockfile struct {
 	Format  string
 	Entries []Entry
+	// roots are the dependencies the lockfile itself records for the
+	// project and its workspaces (Yarn Berry workspace entries, bun's
+	// workspaces section).
+	roots []Root
 }
 
 // ErrUnsupported marks a lockfile safe cannot read (bun.lockb is binary).
@@ -418,13 +423,20 @@ func loadBerry(raw []byte) (Lockfile, error) {
 		if !ok {
 			return Lockfile{}, fmt.Errorf("entry %q has no resolution", strings.TrimSpace(b.header))
 		}
-		// Workspaces, portals and links are the project's own folders.
+		// Workspaces, portals and links are the project's own folders; a
+		// workspace's dependencies are the project's own.
 		if lt, _ := field(b.lines, "linkType", 2, ": "); lt == "soft" {
+			if strings.Contains(resolution, "@workspace:") {
+				for _, d := range berryDescriptors(section(b.lines, "dependencies", 2)) {
+					lf.roots = append(lf.roots, Root{d})
+				}
+			}
 			continue
 		}
 		version, _ := field(b.lines, "version", 2, ": ")
 		name, _ := splitDescriptor(resolution)
-		_, conditional := field(b.lines, "conditions", 2, ": ")
+		conditions, _ := field(b.lines, "conditions", 2, ": ")
+		conditional := conditions != "" && !berryConditionsHold(conditions)
 		e := Entry{Name: name, Version: version, Optional: conditional,
 			ids:     headerPatterns(b.header),
 			optDeps: berryDescriptors(section(b.lines, "optionalDependencies", 2))}
@@ -568,7 +580,11 @@ func loadPnpm(raw []byte) (Lockfile, error) {
 					current.Optional = true
 				}
 			case "os", "cpu", "libc":
-				current.Optional = true
+				// An allowlist, not a mark: the package may be absent only
+				// where it does not apply to this machine.
+				if !platformAllows(k, inlineList(v)) {
+					current.Optional = true
+				}
 			case "name":
 				// Tarball and git packages carry their real name and version.
 				if sectionName == "packages" {
@@ -604,12 +620,24 @@ var trailingComma = regexp.MustCompile(`,(\s*[}\]])`)
 
 func loadBun(raw []byte) (Lockfile, error) {
 	var doc struct {
+		Workspaces map[string]struct {
+			Name            string            `json:"name"`
+			Dependencies    map[string]string `json:"dependencies"`
+			DevDependencies map[string]string `json:"devDependencies"`
+		} `json:"workspaces"`
 		Packages map[string][]json.RawMessage `json:"packages"`
 	}
 	if err := json.Unmarshal(trailingComma.ReplaceAll(raw, []byte("$1")), &doc); err != nil {
 		return Lockfile{}, err
 	}
 	lf := Lockfile{Format: "bun"}
+	for _, ws := range doc.Workspaces {
+		for _, deps := range []map[string]string{ws.Dependencies, ws.DevDependencies} {
+			for name := range deps {
+				lf.roots = append(lf.roots, Root{ws.Name + "/" + name, name})
+			}
+		}
+	}
 	// A bun.lock key is the package's place in the tree ("a/node_modules/b"
 	// written "a/b"); a dependency resolves like Node does, from the
 	// dependent's own place up to the top level.
@@ -654,7 +682,8 @@ func loadBun(raw []byte) (Lockfile, error) {
 			if json.Unmarshal(el, &meta) != nil {
 				continue
 			}
-			e.Optional = e.Optional || meta.Optional || len(meta.OS) > 0 || len(meta.CPU) > 0
+			e.Optional = e.Optional || meta.Optional ||
+				!platformAllows("os", jsonList(meta.OS)) || !platformAllows("cpu", jsonList(meta.CPU))
 			for d := range meta.Dependencies {
 				e.deps = append(e.deps, resolveKey(key, d))
 			}
@@ -665,4 +694,99 @@ func loadBun(raw []byte) (Lockfile, error) {
 		lf.Entries = append(lf.Entries, e)
 	}
 	return lf, nil
+}
+
+// --- platform -------------------------------------------------------------------------
+
+// The machine's identity in npm's terms (process.platform, process.arch).
+var (
+	hostOS   = map[string]string{"windows": "win32"}[runtime.GOOS]
+	hostCPU  = map[string]string{"amd64": "x64", "386": "ia32", "arm64": "arm64", "arm": "arm", "ppc64le": "ppc64", "s390x": "s390x", "riscv64": "riscv64", "loong64": "loong64"}[runtime.GOARCH]
+	hostLibc = detectLibc()
+)
+
+func init() {
+	if hostOS == "" {
+		hostOS = runtime.GOOS
+	}
+	if hostCPU == "" {
+		hostCPU = runtime.GOARCH
+	}
+}
+
+func detectLibc() string {
+	if runtime.GOOS != "linux" {
+		return ""
+	}
+	if matches, _ := filepath.Glob("/lib/ld-musl-*"); len(matches) > 0 {
+		return "musl"
+	}
+	return "glibc"
+}
+
+// platformAllows evaluates an npm os/cpu/libc allowlist ("darwin",
+// "!win32") for this machine. An empty list allows everything.
+func platformAllows(kind string, list []string) bool {
+	host := map[string]string{"os": hostOS, "cpu": hostCPU, "libc": hostLibc}[kind]
+	if len(list) == 0 || host == "" && kind == "libc" {
+		return true
+	}
+	positive, matched := false, false
+	for _, v := range list {
+		if neg, ok := strings.CutPrefix(v, "!"); ok {
+			if neg == host {
+				return false
+			}
+			continue
+		}
+		positive = true
+		if v == host || v == "any" {
+			matched = true
+		}
+	}
+	return !positive || matched
+}
+
+// berryConditionsHold evaluates Yarn Berry's "os=darwin & cpu=arm64"
+// (alternatives joined by "|").
+func berryConditionsHold(conditions string) bool {
+	for _, alt := range strings.Split(conditions, "|") {
+		holds := true
+		for _, term := range strings.Split(alt, "&") {
+			k, v, ok := strings.Cut(strings.Trim(strings.TrimSpace(term), "()"), "=")
+			if ok && !platformAllows(strings.TrimSpace(k), []string{strings.TrimSpace(v)}) {
+				holds = false
+			}
+		}
+		if holds {
+			return true
+		}
+	}
+	return false
+}
+
+// inlineList reads a YAML flow list ("[darwin, linux]") or a scalar.
+func inlineList(v string) []string {
+	v = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(v), "["), "]")
+	var out []string
+	for _, item := range strings.Split(v, ",") {
+		if item = unquote(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+// jsonList reads a bun os/cpu value: a string ("darwin", "none") or a list.
+func jsonList(raw json.RawMessage) []string {
+	var one string
+	if json.Unmarshal(raw, &one) == nil {
+		if one == "" || one == "none" {
+			return nil
+		}
+		return []string{one}
+	}
+	var list []string
+	_ = json.Unmarshal(raw, &list)
+	return list
 }

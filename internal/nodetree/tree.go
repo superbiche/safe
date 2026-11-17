@@ -66,7 +66,7 @@ func Check(o Options) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
-	lf.markRequired(roots)
+	lf.markRequired(append(roots, lf.roots...))
 	r := Report{Schema: 1, Format: lf.Format, Problems: []string{}}
 	exclude := map[string]bool{}
 	for _, e := range o.Exclude {
@@ -84,7 +84,7 @@ func Check(o Options) (Report, error) {
 			r.Problems = append(r.Problems, fmt.Sprintf("%s is a symlink or not a directory", rel))
 			continue
 		}
-		pk, problems, err := listPackages(dir, rel, exclude, true)
+		pk, problems, err := listPackages(dir, rel, exclude, true, nil)
 		if err != nil {
 			return Report{}, err
 		}
@@ -102,14 +102,36 @@ func Check(o Options) (Report, error) {
 	return r, nil
 }
 
-// projectRoots reads the dependencies each package folder that owns a
-// modules directory declares (the project root, and each workspace), as the
-// target checkout declares them: the tree is checked for the project it will
-// serve, and a staged copy carries no manifest of its own.
+// projectRoots reads the dependencies the project and each of its
+// workspaces declare, as the target checkout declares them: the tree is
+// checked for the project it will serve, and a staged copy carries no
+// manifest of its own. Workspaces come from the root manifest's
+// "workspaces" and pnpm-workspace.yaml, and from every folder owning a
+// copied modules directory: a hoisted workspace owns none, yet its
+// dependencies are required at the root.
 func projectRoots(format, project string, modules []string) ([]Root, error) {
-	var roots []Root
+	dirs := map[string]bool{".": true}
 	for _, rel := range modules {
-		raw, err := os.ReadFile(filepath.Join(project, filepath.Dir(rel), "package.json"))
+		dirs[filepath.Dir(rel)] = true
+	}
+	patterns, err := workspacePatterns(project)
+	if err != nil {
+		return nil, err
+	}
+	for _, pattern := range patterns {
+		matches, _ := filepath.Glob(filepath.Join(project, pattern))
+		for _, m := range matches {
+			if fi, err := os.Stat(m); err != nil || !fi.IsDir() {
+				continue
+			}
+			if rel, err := filepath.Rel(project, m); err == nil && !strings.Contains("/"+rel+"/", "/node_modules/") {
+				dirs[rel] = true
+			}
+		}
+	}
+	var roots []Root
+	for dir := range dirs {
+		raw, err := os.ReadFile(filepath.Join(project, dir, "package.json"))
 		if errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
@@ -122,7 +144,7 @@ func projectRoots(format, project string, modules []string) ([]Root, error) {
 			DevDependencies map[string]string `json:"devDependencies"`
 		}
 		if err := json.Unmarshal(raw, &pj); err != nil {
-			return nil, fmt.Errorf("%s: %v", filepath.Join(filepath.Dir(rel), "package.json"), err)
+			return nil, fmt.Errorf("%s: %v", filepath.Join(dir, "package.json"), err)
 		}
 		for _, deps := range []map[string]string{pj.Dependencies, pj.DevDependencies} {
 			for name, rng := range deps {
@@ -140,11 +162,73 @@ func projectRoots(format, project string, modules []string) ([]Root, error) {
 	return roots, nil
 }
 
+// workspacePatterns reads the workspace globs of the root manifest
+// ("workspaces": [...] or {"packages": [...]}) and of pnpm-workspace.yaml.
+// Negated patterns are ignored: over-including a workspace can only add a
+// requirement, never hide one.
+func workspacePatterns(project string) ([]string, error) {
+	var out []string
+	raw, err := os.ReadFile(filepath.Join(project, "package.json"))
+	if err == nil {
+		var pj struct {
+			Workspaces json.RawMessage `json:"workspaces"`
+		}
+		if json.Unmarshal(raw, &pj) == nil && len(pj.Workspaces) > 0 {
+			var list []string
+			if json.Unmarshal(pj.Workspaces, &list) != nil {
+				var obj struct {
+					Packages []string `json:"packages"`
+				}
+				_ = json.Unmarshal(pj.Workspaces, &obj)
+				list = obj.Packages
+			}
+			out = append(out, list...)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	if raw, err := os.ReadFile(filepath.Join(project, "pnpm-workspace.yaml")); err == nil {
+		in := false
+		for _, line := range strings.Split(string(raw), "\n") {
+			t := strings.TrimSpace(line)
+			if indentOf(line) == 0 {
+				in = t == "packages:"
+				continue
+			}
+			if v, ok := strings.CutPrefix(t, "- "); in && ok {
+				out = append(out, unquote(v))
+			}
+		}
+	}
+	var kept []string
+	for _, p := range out {
+		if p = strings.TrimSuffix(strings.TrimPrefix(p, "./"), "/"); p != "" && !strings.HasPrefix(p, "!") {
+			// filepath.Glob has no "**": a recursive pattern is read at
+			// its first level and below, one level at a time, up to four.
+			if strings.Contains(p, "**") {
+				base := p[:strings.Index(p, "**")]
+				for depth, g := 0, "*"; depth < 4; depth, g = depth+1, g+"/*" {
+					kept = append(kept, base+g)
+				}
+				continue
+			}
+			kept = append(kept, p)
+		}
+	}
+	return kept, nil
+}
+
 // storeDirs hold the real package folders of isolated layouts
 // (node_modules/.pnpm/<id>/node_modules/<name>, and bun's .bun likewise).
 var storeDirs = map[string]bool{".pnpm": true, ".bun": true}
 
-func listPackages(dir, rel string, exclude map[string]bool, top bool) ([]installed, []string, error) {
+// moduleFile: a regular file Node resolves as a module from node_modules
+// (require("x") finds node_modules/x.js).
+var moduleFile = map[string]bool{".js": true, ".cjs": true, ".mjs": true, ".json": true, ".node": true}
+
+// listPackages reads the packages of one node_modules directory. skip names
+// the bundled dependencies of the package that owns it.
+func listPackages(dir, rel string, exclude map[string]bool, top bool, skip map[string]bool) ([]installed, []string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, nil, err
@@ -158,10 +242,12 @@ func listPackages(dir, rel string, exclude map[string]bool, top bool) ([]install
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if top && exclude[name] {
+		if top && exclude[name] || skip[name] {
 			continue
 		}
 		switch {
+		case e.Type().IsRegular() && !strings.HasPrefix(name, ".") && moduleFile[filepath.Ext(name)]:
+			problems = append(problems, fmt.Sprintf("%s is a file module the lockfile does not describe", filepath.Join(rel, name)))
 		case storeDirs[name] && e.IsDir():
 			ids, err := os.ReadDir(filepath.Join(dir, name))
 			if err != nil {
@@ -175,7 +261,7 @@ func listPackages(dir, rel string, exclude map[string]bool, top bool) ([]install
 				if fi, err := os.Lstat(nm); err != nil || !fi.IsDir() {
 					continue
 				}
-				pk, pr, err := listPackages(nm, filepath.Join(rel, name, id.Name(), "node_modules"), nil, false)
+				pk, pr, err := listPackages(nm, filepath.Join(rel, name, id.Name(), "node_modules"), nil, false, nil)
 				for i := range pk {
 					pk[i].store = true
 				}
@@ -191,6 +277,13 @@ func listPackages(dir, rel string, exclude map[string]bool, top bool) ([]install
 				return nil, nil, err
 			}
 			for _, s := range scoped {
+				if skip[name+"/"+s.Name()] {
+					continue
+				}
+				if s.Type().IsRegular() && moduleFile[filepath.Ext(s.Name())] {
+					problems = append(problems, fmt.Sprintf("%s is a file module the lockfile does not describe", filepath.Join(rel, name, s.Name())))
+					continue
+				}
 				if err := add(readPackage(filepath.Join(dir, name, s.Name()), filepath.Join(rel, name, s.Name()), s)); err != nil {
 					return nil, nil, err
 				}
@@ -218,10 +311,11 @@ func readPackage(dir, rel string, e fs.DirEntry) ([]installed, []string, error) 
 		return nil, nil, err
 	}
 	var pj struct {
-		Name    string          `json:"name"`
-		Version string          `json:"version"`
-		Bundle  json.RawMessage `json:"bundleDependencies"`
-		Bundled json.RawMessage `json:"bundledDependencies"`
+		Name         string            `json:"name"`
+		Version      string            `json:"version"`
+		Dependencies map[string]string `json:"dependencies"`
+		Bundle       json.RawMessage   `json:"bundleDependencies"`
+		Bundled      json.RawMessage   `json:"bundledDependencies"`
 	}
 	if err := json.Unmarshal(raw, &pj); err != nil {
 		return nil, []string{fmt.Sprintf("%s/package.json is not readable JSON", rel)}, nil
@@ -233,13 +327,16 @@ func readPackage(dir, rel string, e fs.DirEntry) ([]installed, []string, error) 
 	pj.Version = strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(pj.Version), "v"), "=")
 	out := []installed{{name: pj.Name, version: pj.Version}}
 	// Bundled dependencies ship inside the package's own tarball and are
-	// not lockfile entries for every manager: they belong to the package.
-	if bundles(pj.Bundle) || bundles(pj.Bundled) {
-		return out, nil, nil
-	}
+	// not lockfile entries for every manager: those the package names are
+	// its own; anything else nested beside them is checked as usual.
 	nested := filepath.Join(dir, "node_modules")
+	skip := bundled(pj.Bundle, pj.Dependencies)
+	for name := range bundled(pj.Bundled, pj.Dependencies) {
+		skip[name] = true
+	}
+	bundleClosure(nested, skip)
 	if fi, err := os.Lstat(nested); err == nil && fi.IsDir() {
-		pk, pr, err := listPackages(nested, filepath.Join(rel, "node_modules"), nil, false)
+		pk, pr, err := listPackages(nested, filepath.Join(rel, "node_modules"), nil, false, skip)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -249,9 +346,57 @@ func readPackage(dir, rel string, e fs.DirEntry) ([]installed, []string, error) 
 	return out, nil, nil
 }
 
-func bundles(raw json.RawMessage) bool {
-	s := strings.TrimSpace(string(raw))
-	return s != "" && s != "null" && s != "false" && s != "[]" && s != "{}"
+// bundleClosure adds to skip the dependencies of bundled packages that the
+// tarball hoisted beside them in <nested> (npm marks them inBundle too).
+func bundleClosure(nested string, skip map[string]bool) {
+	queue := make([]string, 0, len(skip))
+	for name := range skip {
+		queue = append(queue, name)
+	}
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+		raw, err := os.ReadFile(filepath.Join(nested, name, "package.json"))
+		if err != nil {
+			continue
+		}
+		var pj struct {
+			Dependencies         map[string]string `json:"dependencies"`
+			OptionalDependencies map[string]string `json:"optionalDependencies"`
+		}
+		if json.Unmarshal(raw, &pj) != nil {
+			continue
+		}
+		for _, deps := range []map[string]string{pj.Dependencies, pj.OptionalDependencies} {
+			for dep := range deps {
+				if _, err := os.Lstat(filepath.Join(nested, dep)); err == nil && !skip[dep] {
+					skip[dep] = true
+					queue = append(queue, dep)
+				}
+			}
+		}
+	}
+}
+
+// bundled reads a bundleDependencies value: a list of names, or true for
+// every dependency.
+func bundled(raw json.RawMessage, deps map[string]string) map[string]bool {
+	out := map[string]bool{}
+	var all bool
+	if json.Unmarshal(raw, &all) == nil {
+		if all {
+			for name := range deps {
+				out[name] = true
+			}
+		}
+		return out
+	}
+	var list []string
+	_ = json.Unmarshal(raw, &list)
+	for _, name := range list {
+		out[name] = true
+	}
+	return out
 }
 
 // checkLinks verifies every symlink under one modules directory as it will
@@ -297,16 +442,28 @@ func checkLinks(o Options, rel string, exclude map[string]bool) ([]string, error
 			return err
 		}
 		if filepath.IsAbs(dest) {
-			// A link to a system path (node-gyp's build/node_gyp_bins/python3
-			// -> /usr/bin/python3) resolves the same in every checkout; one
-			// into either checkout would share the source's files.
+			// Only a system path resolves the same for every checkout, and
+			// node-gyp's build-time interpreter link is never loaded at run
+			// time; any other absolute link would load code from outside
+			// the copied tree, which the baseline cannot see.
 			if within(dest, o.Source) || within(dest, o.Target) || within(dest, sourceReal) || within(dest, targetReal) {
 				problems = append(problems, fmt.Sprintf("symlink %s -> %s is absolute and points into a checkout", where, dest))
+			} else if !systemPath(dest) && !strings.Contains("/"+filepath.ToSlash(where), "/build/node_gyp_bins/") {
+				problems = append(problems, fmt.Sprintf("symlink %s -> %s is absolute and points outside the project", where, dest))
 			}
 			return nil
 		}
 		logical := filepath.Join(o.Target, filepath.Dir(where), dest)
 		if inModules(logical) {
+			// It travels with the copy: it must resolve in the tree copied.
+			// An isolated layout links every optional dependency, installed
+			// or skipped for this platform; a required one missing from the
+			// store is already a missing package.
+			inStore := strings.Contains(filepath.ToSlash(dest), "/.pnpm/") || strings.Contains(filepath.ToSlash(where), "/.pnpm/") ||
+				strings.Contains(filepath.ToSlash(dest), "/.bun/") || strings.Contains(filepath.ToSlash(where), "/.bun/")
+			if _, err := os.Stat(filepath.Join(o.Source, filepath.Dir(where), dest)); err != nil && !inStore {
+				problems = append(problems, fmt.Sprintf("symlink %s -> %s dangles in the installed tree", where, dest))
+			}
 			return nil
 		}
 		if logical != o.Target && !strings.HasPrefix(logical, o.Target+string(filepath.Separator)) {
@@ -327,6 +484,19 @@ func checkLinks(o Options, rel string, exclude map[string]bool) ([]string, error
 	return problems, err
 }
 
+// systemPrefixes hold what the operating system installs, the same for
+// every checkout on the machine.
+var systemPrefixes = []string{"/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc"}
+
+func systemPath(p string) bool {
+	for _, prefix := range systemPrefixes {
+		if within(p, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func within(p, dir string) bool {
 	p, dir = filepath.Clean(p), filepath.Clean(dir)
 	return p == dir || strings.HasPrefix(p, dir+string(filepath.Separator))
@@ -338,42 +508,72 @@ func looseVersion(v string) bool {
 	return v == "" || strings.ContainsAny(v, ":/#")
 }
 
+// compare matches the installed packages with the lockfile, name by name.
+// A registry entry is matched by exact version. A loose entry (a git commit,
+// a tarball URL) is matched by a copy of its name that no registry entry of
+// that name claims, one copy per entry.
 func compare(entries []Entry, found []installed) []string {
-	expected := map[string]bool{} // name@version -> required
-	loose := map[string]bool{}    // names with a non-registry entry
-	names := map[string]bool{}
-	for _, e := range entries {
-		key := e.Name + "@" + e.Version
-		expected[key] = expected[key] || !e.Optional
-		names[e.Name] = true
-		if looseVersion(e.Version) {
-			loose[e.Name] = true
-		}
+	type want struct {
+		exact    map[string]bool // version -> required
+		loose    int
+		looseReq int
 	}
-	have := map[string]bool{} // name@version -> outside a virtual store
-	haveName := map[string]bool{}
+	byName := map[string]*want{}
+	for _, e := range entries {
+		w := byName[e.Name]
+		if w == nil {
+			w = &want{exact: map[string]bool{}}
+			byName[e.Name] = w
+		}
+		if looseVersion(e.Version) {
+			w.loose++
+			if !e.Optional {
+				w.looseReq++
+			}
+			continue
+		}
+		w.exact[e.Version] = w.exact[e.Version] || !e.Optional
+	}
+	// name -> version -> found outside a virtual store
+	have := map[string]map[string]bool{}
 	for _, f := range found {
-		key := f.name + "@" + f.version
-		have[key] = have[key] || !f.store
-		haveName[f.name] = true
+		if have[f.name] == nil {
+			have[f.name] = map[string]bool{}
+		}
+		have[f.name][f.version] = have[f.name][f.version] || !f.store
 	}
 	var missing, extra []string
-	for key, required := range expected {
-		name := key[:strings.LastIndex(key, "@")]
-		if _, ok := have[key]; !required || ok || loose[name] && haveName[name] {
-			continue
+	for name, w := range byName {
+		for version, required := range w.exact {
+			if _, ok := have[name][version]; required && !ok {
+				missing = append(missing, "missing "+name+"@"+version)
+			}
 		}
-		missing = append(missing, "missing "+key)
+		var spare []string
+		for version := range have[name] {
+			if _, ok := w.exact[version]; !ok {
+				spare = append(spare, version)
+			}
+		}
+		sort.Strings(spare)
+		if len(spare) < w.looseReq {
+			missing = append(missing, fmt.Sprintf("missing %s (%d non-registry cop%s)", name, w.looseReq-len(spare), map[bool]string{true: "y", false: "ies"}[w.looseReq-len(spare) == 1]))
+		}
+		for i, version := range spare {
+			if i >= w.loose && have[name][version] {
+				extra = append(extra, "not in the lockfile: "+name+"@"+version)
+			}
+		}
 	}
-	for key, outsideStore := range have {
-		if !outsideStore {
+	for name, versions := range have {
+		if byName[name] != nil {
 			continue
 		}
-		name := key[:strings.LastIndex(key, "@")]
-		if _, ok := expected[key]; ok || names[name] && (loose[name] || looseVersion(key[len(name)+1:])) {
-			continue
+		for version, outsideStore := range versions {
+			if outsideStore {
+				extra = append(extra, "not in the lockfile: "+name+"@"+version)
+			}
 		}
-		extra = append(extra, "not in the lockfile: "+key)
 	}
 	sort.Strings(missing)
 	sort.Strings(extra)

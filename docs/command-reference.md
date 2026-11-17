@@ -300,8 +300,8 @@ it does not depend on a manager's own state file, and compares the installed
 
 | Evidence | Gap when |
 | --- | --- |
-| Inventory | a package the lockfile requires is missing, or the tree holds a package or version the lockfile does not pin. Optional and platform-conditional packages, and those only they need, may be absent; pnpm's not-yet-pruned virtual-store orphans are not counted |
-| Links | a symlink in the copied tree points into a checkout by absolute path, leaves the project, or reaches a workspace folder that is absent in the target (links to system paths, such as node-gyp's `python3`, are kept) |
+| Inventory | a package the lockfile requires is missing, or the tree holds a package, version or file module (`node_modules/x.js`) the lockfile does not pin. Required means reachable from the dependencies of the project and its workspaces (declared in `package.json` `workspaces`, `pnpm-workspace.yaml` or the lockfile); optional packages, packages whose `os`/`cpu`/`libc` allowlist excludes this machine, and those only they need may be absent. A package's own bundled dependencies are not counted; pnpm's not-yet-pruned virtual-store orphans are not counted |
+| Links | a symlink in the copied tree dangles, leaves the project, reaches a workspace folder that is absent in the target, or is absolute outside the system prefixes (`/usr`, `/bin`, `/lib`, `/etc`…); node-gyp's build-time interpreter link (`build/node_gyp_bins/`) is kept |
 | Integrity | as for Composer, below |
 
 A stale tree in the source — the lockfile moved on after the last install — is

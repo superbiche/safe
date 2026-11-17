@@ -79,6 +79,7 @@ func TestNpmLockfileTree(t *testing.T) {
 		"node_modules/bundler/node_modules/inside/package.json": pkg("inside", "0.0.0-not-locked"),
 		"node_modules/alias/package.json":                       pkg("real-pkg", "4.0.0"),
 		"node_modules/.bin/pad":                                 "->../left-pad/index.js",
+		"node_modules/left-pad/index.js":                        "module.exports = 1",
 		"node_modules/.package-lock.json":                       `{}`,
 		"node_modules/.cache/babel/x.json":                      `{}`,
 	})
@@ -320,6 +321,8 @@ snapshots:
 		t.Fatalf("format %q expected %d, want pnpm 4 (the env document is not the project's)", r.Format, r.Expected)
 	}
 	os.RemoveAll(filepath.Join(dir, "node_modules/.pnpm/peer@2.0.0"))
+	// The store links that pointed at it now dangle; the missing package
+	// is the finding, not each link.
 	wantProblems(t, check(t, dir, "pnpm-lock.yaml"), "missing peer@2.0.0")
 }
 
@@ -415,4 +418,153 @@ func TestSymlinkedModulesDirectory(t *testing.T) {
 	dir, other := t.TempDir(), t.TempDir()
 	write(t, dir, map[string]string{"package-lock.json": `{"lockfileVersion":3,"packages":{"":{}}}`, "node_modules": "->" + other})
 	wantProblems(t, check(t, dir, "package-lock.json"), "node_modules is a symlink or not a directory")
+}
+
+// Review findings (2026-11-17): each was a silent pass.
+
+func TestAbsoluteLinkOutsideSystemPathsIsAProblem(t *testing.T) {
+	src, dst, elsewhere := t.TempDir(), t.TempDir(), t.TempDir()
+	lock := `{"lockfileVersion":3,"packages":{"":{},"node_modules/a":{"version":"1.0.0"}}}`
+	write(t, src, map[string]string{
+		"package-lock.json":                          lock,
+		"node_modules/a/package.json":                pkg("a", "1.0.0"),
+		"node_modules/a/lib":                         "->" + elsewhere,
+		"node_modules/a/build/node_gyp_bins/python3": "->" + elsewhere + "/python3",
+		"node_modules/.bin/sh":                       "->/usr/bin/sh",
+	})
+	write(t, dst, map[string]string{"package-lock.json": lock})
+	r, err := Check(Options{Lockfile: filepath.Join(dst, "package-lock.json"), Source: src, Target: dst, Modules: []string{"node_modules"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantProblems(t, r, "symlink node_modules/a/lib -> "+elsewhere+" is absolute and points outside the project")
+}
+
+func TestHoistedWorkspaceDependenciesAreRequired(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, map[string]string{
+		"package.json":             `{"private":true,"workspaces":["packages/*"],"dependencies":{"left-pad":"^1.0.0"}}`,
+		"packages/ui/package.json": `{"name":"ui","dependencies":{"tiny":"^2.0.0"}}`,
+		"packages/README.md":       "not a workspace",
+		"yarn.lock": `# yarn lockfile v1
+
+
+left-pad@^1.0.0:
+  version "1.3.0"
+
+tiny@^2.0.0:
+  version "2.0.0"
+`,
+		"node_modules/left-pad/package.json": pkg("left-pad", "1.3.0"),
+	})
+	// packages/ui owns no node_modules: tiny is hoisted to the root, or missing.
+	wantProblems(t, check(t, dir, "yarn.lock"), "missing tiny@2.0.0")
+}
+
+func TestPlatformAllowlistKeepsApplicablePackagesRequired(t *testing.T) {
+	if !platformAllows("os", []string{hostOS}) {
+		t.Fatal("the host must allow itself")
+	}
+	if platformAllows("os", []string{"!" + hostOS}) || !platformAllows("os", []string{"!plan9"}) || platformAllows("os", []string{"plan9"}) {
+		t.Fatal("negated and foreign entries are misread")
+	}
+	if !berryConditionsHold("os="+hostOS) || berryConditionsHold("os=plan9 & cpu="+hostCPU) || !berryConditionsHold("os=plan9 | os="+hostOS) {
+		t.Fatal("Berry conditions are misread")
+	}
+	dir := t.TempDir()
+	write(t, dir, map[string]string{
+		"package.json": `{"dependencies":{"native":"1.0.0"}}`,
+		"pnpm-lock.yaml": `lockfileVersion: '9.0'
+
+packages:
+
+  native@1.0.0:
+    resolution: {integrity: sha512-n}
+    os: [` + hostOS + `, plan9]
+    cpu: [` + hostCPU + `]
+
+  foreign@1.0.0:
+    resolution: {integrity: sha512-f}
+    os: [plan9]
+
+snapshots:
+
+  native@1.0.0: {}
+
+  foreign@1.0.0: {}
+`,
+	})
+	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wantProblems(t, check(t, dir, "pnpm-lock.yaml"), "missing native@1.0.0")
+}
+
+func TestBundleSkipsOnlyBundledPackages(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, map[string]string{
+		"package-lock.json": `{"lockfileVersion":3,"packages":{"":{},"node_modules/bundler":{"version":"1.0.0"},
+			"node_modules/bundler/node_modules/inside":{"version":"1.0.0","inBundle":true},
+			"node_modules/bundler/node_modules/hoisted":{"version":"1.0.0","inBundle":true}}}`,
+		"node_modules/bundler/package.json":                      `{"name":"bundler","version":"1.0.0","dependencies":{"inside":"1"},"bundleDependencies":["inside"]}`,
+		"node_modules/bundler/node_modules/inside/package.json":  `{"name":"inside","version":"1.0.0","dependencies":{"hoisted":"1"}}`,
+		"node_modules/bundler/node_modules/hoisted/package.json": pkg("hoisted", "1.0.0"),
+		"node_modules/bundler/node_modules/evil/package.json":    pkg("evil", "9.9.9"),
+	})
+	wantProblems(t, check(t, dir, "package-lock.json"), "not in the lockfile: evil@9.9.9")
+}
+
+func TestLooseEntryDoesNotCoverARegistryNamesake(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, map[string]string{
+		"package-lock.json": `{"lockfileVersion":3,"packages":{"":{},
+			"node_modules/foo":{"version":"git+ssh://git@example.invalid/foo.git#abc"},
+			"node_modules/bar/node_modules/foo":{"version":"2.0.0"}}}`,
+		"node_modules/foo/package.json": pkg("foo", "1.5.0"),
+		"node_modules/bar/package.json": pkg("bar", "1.0.0"),
+	})
+	r := check(t, dir, "package-lock.json")
+	wantProblems(t, r, "missing foo@2.0.0", "not in the lockfile: bar@1.0.0")
+}
+
+func TestFileModuleIsAProblem(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, map[string]string{
+		"package-lock.json":    `{"lockfileVersion":3,"packages":{"":{}}}`,
+		"node_modules/evil.js": "module.exports = 1",
+		"node_modules/README":  "not a module",
+	})
+	wantProblems(t, check(t, dir, "package-lock.json"), "node_modules/evil.js is a file module the lockfile does not describe")
+}
+
+func TestDanglingLinkInsideTheTreeIsAProblem(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, map[string]string{
+		"package-lock.json":      `{"lockfileVersion":3,"packages":{"":{}}}`,
+		"node_modules/.bin/tool": "->../missing-pkg/index.js",
+	})
+	wantProblems(t, check(t, dir, "package-lock.json"), "symlink node_modules/.bin/tool -> ../missing-pkg/index.js dangles in the installed tree")
+}
+
+func TestBunWorkspacesSectionGivesRoots(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, map[string]string{
+		"package.json": `{"name":"app"}`,
+		"bun.lock": `{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": { "name": "app" },
+    "packages/ui": { "name": "ui", "dependencies": { "tiny": "^2.0.0" } },
+  },
+  "packages": {
+    "tiny": ["tiny@2.0.0", "", {}, "sha512-t"],
+    "ui": ["ui@workspace:packages/ui"],
+  },
+}
+`,
+	})
+	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wantProblems(t, check(t, dir, "bun.lock"), "missing tiny@2.0.0")
 }

@@ -3407,6 +3407,9 @@ safe_install_reuse_node_primary() {
       printf 'pnpm-lock.yaml'; return 0
     elif [[ -e "$nm/.yarn-state.yml" || -e "$nm/.yarn-integrity" ]] && [[ -f "$dir/yarn.lock" ]]; then
       printf 'yarn.lock'; return 0
+    elif [[ -d "$nm/.bun" || -e "$nm/.bun-tag" ]] && [[ -f "$dir/bun.lock" || -f "$dir/bun.lockb" ]]; then
+      [[ -f "$dir/bun.lock" ]] && { printf 'bun.lock'; return 0; }
+      printf 'bun.lockb'; return 0
     elif [[ -e "$nm/.package-lock.json" ]]; then
       [[ -f "$dir/npm-shrinkwrap.json" ]] && { printf 'npm-shrinkwrap.json'; return 0; }
       [[ -f "$dir/package-lock.json" ]] && { printf 'package-lock.json'; return 0; }
@@ -3481,6 +3484,12 @@ safe_install_reuse_node_skipped() {
     done
   done
   return 0
+}
+
+# True when <dir> may receive a published tree: absent, or an empty real
+# directory. Reuse never overwrites.
+safe_install_reuse_dest_free() {
+  [[ ! -e "$1" && ! -L "$1" ]] || { [[ -d "$1" && ! -L "$1" && -z "$(ls -A -- "$1" 2>/dev/null)" ]]; }
 }
 
 # safe-core checks a node_modules tree against its lockfile. It is the
@@ -3656,11 +3665,13 @@ safe_install_reuse_one() {
   [[ -O "$source/$tree" && ! -L "$source/$tree" ]] ||
     safe_install_reuse_refuse 100 REFUSED_REUSE_PROVENANCE "$target" "BLOCKED reuse — ${source}/${tree} is a symlink or belongs to another user; details: safe explain"
 
-  local source_lock_sha
-  source_lock_sha="$(safe_install_reuse_lock_identity "$eco" "$source" 2>/dev/null || true)"
-  if [[ "$eco" == "node" && "$(safe_install_reuse_node_lockfiles "$source" | paste -sd, -)" != "$target_locks" ]]; then
-    source_lock_sha="(other lockfiles)"
+  local source_lock_sha source_locks
+  if [[ "$eco" == "node" ]]; then
+    source_locks="$(safe_install_reuse_node_lockfiles "$source" | paste -sd, -)"
+    [[ "$source_locks" == "$target_locks" ]] ||
+      safe_install_reuse_refuse 100 REFUSED_REUSE_LOCK_MISMATCH "$target" "BLOCKED reuse — ${source} carries ${source_locks:-no lockfile} and this project ${target_locks}; different lockfiles are a new install, not a reuse; details: safe explain"
   fi
+  source_lock_sha="$(safe_install_reuse_lock_identity "$eco" "$source" 2>/dev/null || true)"
   [[ "$source_lock_sha" == "$lock_sha" ]] ||
     safe_install_reuse_refuse 100 REFUSED_REUSE_LOCK_MISMATCH "$target" "BLOCKED reuse — ${target_locks//,/ + } differs between ${source} (sha256 ${source_lock_sha:0:12}) and this project (sha256 ${lock_sha:0:12}); a changed lockfile is a new install, not a reuse; details: safe explain"
 
@@ -3683,6 +3694,11 @@ safe_install_reuse_one() {
     primary="$(safe_install_reuse_node_primary "$source")"
     lock_desc="$primary"
     mapfile -t node_dirs < <(safe_install_reuse_node_dirs "$source" "$target")
+    local rel_dir
+    for rel_dir in "${node_dirs[@]}"; do
+      safe_install_reuse_dest_free "$target/$rel_dir" ||
+        safe_install_reuse_refuse 100 REFUSED_REUSE_TARGET_EXISTS "$target" "BLOCKED reuse — ${target}/${rel_dir} already exists and reuse never overwrites; to allow: remove it yourself, then retry; details: safe explain"
+    done
   fi
 
   local problem report_dir
@@ -3890,12 +3906,18 @@ safe_install_reuse_one() {
   if [[ "$eco" == "node" ]]; then
     publish=("${node_dirs[@]}")
   fi
+  # Every destination is checked before the first rename, so a refusal here
+  # leaves the ecosystem untouched; the per-rename check guards the race.
   for rel in "${publish[@]}"; do
-    if ! { { [[ ! -e "$target/$rel" && ! -L "$target/$rel" ]] ||
-             { [[ -d "$target/$rel" && ! -L "$target/$rel" && -z "$(ls -A -- "$target/$rel" 2>/dev/null)" ]]; }; } &&
-           mv -T -- "$SAFE_REUSE_STAGING/$rel" "$target/$rel" 2>/dev/null; }; then
-      safe_install_reuse_refuse 100 REFUSED_REUSE_TARGET_EXISTS "$target" "BLOCKED reuse — ${target}/${rel} appeared while copying and reuse never overwrites; nothing more was installed; details: safe explain"
+    safe_install_reuse_dest_free "$target/$rel" ||
+      safe_install_reuse_refuse 100 REFUSED_REUSE_TARGET_EXISTS "$target" "BLOCKED reuse — ${target}/${rel} appeared while copying and reuse never overwrites; nothing was installed; details: safe explain"
+  done
+  local published=""
+  for rel in "${publish[@]}"; do
+    if ! { safe_install_reuse_dest_free "$target/$rel" && mv -T -- "$SAFE_REUSE_STAGING/$rel" "$target/$rel" 2>/dev/null; }; then
+      safe_install_reuse_refuse 100 REFUSED_REUSE_TARGET_EXISTS "$target" "BLOCKED reuse — ${target}/${rel} appeared while copying and reuse never overwrites; ${published:-nothing} was installed before it and has no receipt (remove it, then retry); details: safe explain"
     fi
+    published="${published:+${published}, }${rel}"
   done
   if [[ "$eco" == "node" && -f "$staged_base/.yarn/install-state.gz" && ! -e "$target/.yarn/install-state.gz" ]]; then
     mkdir -p -- "$target/.yarn" && mv -- "$staged_base/.yarn/install-state.gz" "$target/.yarn/install-state.gz" || true

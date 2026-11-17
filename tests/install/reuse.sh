@@ -603,6 +603,19 @@ reuse "$WT" --reuse-from "$MAIN"
 expect_refusal 100 'package-lock.json differs between' "a changed package-lock.json is a new install, not a reuse"
 git -C "$WT" checkout -q -- package-lock.json
 
+# A different set of lockfiles is a different install.
+touch "$WT/yarn.lock"
+reuse "$WT" --reuse-from "$MAIN"
+expect_refusal 100 "carries package-lock.json and this project package-lock.json,yarn.lock" "a different set of lockfiles is named, not hashed"
+rm -f "$WT/yarn.lock"
+
+# A workspace tree already in the target refuses before anything is copied.
+mkdir -p "$WT/packages/ui/node_modules/stale"
+reuse "$WT"
+expect_refusal 100 "packages/ui/node_modules already exists and reuse never overwrites" "an existing workspace node_modules refuses before the root tree is published"
+[[ ! -e "$WT/node_modules" ]] || fail "the root node_modules was published before the workspace refusal"
+rm -rf "$WT/packages/ui/node_modules"
+
 # Yarn Plug'n'Play has no tree to copy.
 touch "$MAIN/.pnp.cjs"
 reuse "$WT"
