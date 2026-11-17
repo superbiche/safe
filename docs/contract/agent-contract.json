@@ -6,7 +6,7 @@
   "gated_surfaces": [
     {
       "surface": "npx, bunx, uvx",
-      "mechanism": "Binaries are symlinked to `safe run`: packages run from a project node_modules/.bin (bare unversioned names, current or parent dir), an allowlist, a Podman sandbox, or not at all. A bare name for a gate-bound package-manager tool silently delegates to that tool's PATH wrapper; a missing or non-gate-bound target refuses.",
+      "mechanism": "Binaries are symlinked to `safe run` (install.sh owns the npx/bunx/uvx links in ~/.local/bin, ahead of mise shims; a mise shim named after a runner is routed to `safe run` by the mise wrapper; `safe doctor` and `safe status` report any runner that does not resolve to the gate on this host): packages run from a project node_modules/.bin (bare unversioned names, current or parent dir), an allowlist, a Podman sandbox, or not at all. A bare name for a gate-bound package-manager tool silently delegates to that tool's PATH wrapper; a missing or non-gate-bound target refuses.",
       "refusal": "`safe run: BLOCKED ...` + exit 100-104"
     },
     {

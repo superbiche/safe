@@ -24,6 +24,29 @@
     `mise exec`) unless the command or environment already sets a
     non-installing value. An explicit installing value gates the verb as a
     project install, like `pnpm install`.
+- safe now owns the `npx`, `bunx` and `uvx` runner links. `install.sh` creates
+  them in `~/.local/bin` (ahead of mise shims), keeps or adopts a link that
+  already points at `safe-run`, moves a uv-installed `uvx` aside like `uv`,
+  and never overwrites another file. A bare `bunx` previously resolved through
+  the mise shim to the raw bun binary, ungated. The mise wrapper now also
+  routes a shim named `npx`, `bunx` or `uvx` to `safe-run`. `safe doctor`
+  (`runner_links`) and `safe status` report what each runner resolves to on
+  the host, flagging an ungated one; `uninstall.sh` removes only the links
+  listed in `~/.config/safe/runner-links`.
+- `safe audit` no longer hands jq unbounded data as an argument on two more
+  report paths: the source-risk findings of a `--full`/source scan and the
+  stderr of a failing `grype db status` now reach jq through a file, so a large
+  project cannot hit the kernel's per-argument limit (128 KiB,
+  `jq: Argument list too long`). The project-scan assembly itself was fixed in
+  #198; behavior when a project audit fails for another reason is unchanged.
+- Standalone `safe run host-allow add` / `update` show their audit warning and
+  the flagged-package question (`add to host-allow anyway?`, the typed
+  `--accept-block` confirmation, the update confirm) on the operator's terminal
+  when a parent captures stderr: safe-run mirrors its stderr to `/dev/tty` at
+  those entries and asks through `safe_gate_tty_printf` (operator ruling
+  2026-11-02). The captured stream keeps the diagnostics, never the question;
+  the agent-marker checks and the terminal predicate are unchanged. The two
+  helpers join the byte-identity drift guard.
 
 ## 1.74.0 - 2026-11-17
 

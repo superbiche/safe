@@ -14,7 +14,7 @@ Machine-readable:
 safe doctor --json
 ```
 
-`doctor` checks dispatcher parity, installed component paths, core tools, verifier dependencies, sandbox readiness, installed wrappers, completions, and linked runner state. It does not create config or data directories.
+`doctor` checks dispatcher parity, installed component paths, core tools, verifier dependencies, sandbox readiness, installed wrappers, completions, linked runner state, and whether each fetch-and-execute runner (`npx`, `bunx`, `uvx`) resolves to the gate on the current PATH. It does not create config or data directories.
 
 ## Status
 

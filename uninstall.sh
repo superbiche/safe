@@ -74,6 +74,28 @@ if [[ -x "$BIN_DIR/safe-run" ]]; then
   fi
 fi
 
+# Runner links install.sh created or adopted, per its manifest. Only a symlink
+# that still resolves to safe-run is removed; a file the operator replaced it
+# with since is theirs. Runs before safe-run is deleted so the comparison holds.
+remove_runner_links() {
+  local manifest="$CONFIG_BASE/runner-links" runner target removed=()
+  [[ -f "$manifest" ]] || return 0
+  while IFS= read -r runner; do
+    case "$runner" in npx|bunx|uvx) ;; *) continue ;; esac
+    target="$BIN_DIR/$runner"
+    [[ -L "$target" ]] || continue
+    [[ "$(readlink -f -- "$target" 2>/dev/null)" == "$(readlink -f -- "$BIN_DIR/safe-run" 2>/dev/null)" ]] || continue
+    rm -f -- "$target" && removed+=("$runner")
+    # A displaced original (uvx) goes back where uv put it.
+    if [[ -f "$target.original" && ! -e "$target" ]]; then
+      mv -- "$target.original" "$target"
+    fi
+  done < "$manifest"
+  rm -f -- "$manifest"
+  [[ "${#removed[@]}" -eq 0 ]] || info "removed runner links: ${removed[*]}"
+}
+remove_runner_links
+
 rm -f \
   "$BIN_DIR/safe" \
   "$BIN_DIR/safe-run" \

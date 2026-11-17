@@ -104,7 +104,18 @@ installer scripts.
 Scanner dependency policy and upstream project links are documented in
 [External Dependencies](dependencies.md).
 
-`safe run link` replaces host package-runner commands with safe shims where supported. It is transactional and backs up originals before linking.
+`install.sh` owns the `npx`, `bunx` and `uvx` runner links in `~/.local/bin`
+(symlinks to `safe-run`, ahead of mise shims on PATH) and lists them in
+`~/.config/safe/runner-links`. A reinstall keeps a link that already points at
+`safe-run` (a hand-made one is adopted), moves a uv-installed `uvx` aside to
+`uvx.original` as it does for `uv`, and leaves any other existing file alone
+with a warning. The mise wrapper also routes a shim named `npx`, `bunx` or
+`uvx` to `safe-run`. `pnpx` and `bun x` are gate routes through the `pnpx` and
+`bun` wrappers. `safe doctor` and `safe status` report which runners really
+resolve to the gate on the current PATH. `uninstall.sh` removes only the links
+listed in that manifest that still point at `safe-run`.
+
+`safe run link` additionally replaces runners found elsewhere on PATH with safe shims where supported. It is transactional and backs up originals before linking.
 
 ## Uninstall
 
