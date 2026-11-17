@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.74.0 - 2026-11-17
+
 - Agents hand the operator the original command to run at their terminal
   instead of relaying the `safe run host-allow add` hint (operator ruling
   2026-11-17): at a terminal safe re-runs the full audit and offers the
