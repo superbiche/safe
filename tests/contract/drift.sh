@@ -372,12 +372,14 @@ case_operator_terminal_helpers_match_between_gates() {
       return
     fi
   done
-  lib_def="$(sed -n "/^safe_gate_operator_terminal() {$/,/^}$/p" "$ROOT/lib/gate-lib.sh")"
-  safe_def="$(sed -n "/^safe_gate_operator_terminal() {$/,/^}$/p" "$ROOT/bin/safe-run")"
-  if [[ "$lib_def" != "$safe_def" ]]; then
-    fail "$FUNCNAME (safe_gate_operator_terminal differs between lib/gate-lib.sh and bin/safe-run)"
-    return
-  fi
+  for fn in safe_gate_operator_terminal safe_gate_tty_printf safe_gate_mirror_stderr; do
+    lib_def="$(sed -n "/^${fn}() {$/,/^}$/p" "$ROOT/lib/gate-lib.sh")"
+    safe_def="$(sed -n "/^${fn}() {$/,/^}$/p" "$ROOT/bin/safe-run")"
+    if [[ -z "$lib_def" || "$lib_def" != "$safe_def" ]]; then
+      fail "$FUNCNAME ($fn differs between lib/gate-lib.sh and bin/safe-run)"
+      return
+    fi
+  done
   pass "$FUNCNAME"
 }
 

@@ -278,6 +278,57 @@ for marker in ('CODEX_THREAD_ID', 'CODEX_CI', 'CLAUDECODE', 'OPENCODE'):
     assert r['rc'] == '102' and 'requires an interactive operator terminal' in r['stderr'], (marker, r)
 PY
 pass 'captured-output operator mode mirrors findings to the terminal and safe-run grants accept it'
+# Standalone `safe run host-allow add` (review F4 of the operator-terminal
+# change): with no install gate around it, safe-run mirrors its own stderr to
+# the terminal and asks its flagged-package question there, while the parent
+# keeps the diagnostics on its captured stderr and never receives the question.
+cat >"$tmp/cap-fix/ha-audit" <<'AUDIT'
+#!/bin/bash
+if [[ "$FIXTURE_AUDIT_MODE" == block ]]; then
+  printf '%s' '{"verdict":"BLOCK","block":{"class":"advisory","advisories":["GHSA-fixt-ure1-0000"]},"resolved_versions":["1.0.0"]}'
+  exit 20
+fi
+printf '%s' '{"verdict":"WARN","warn_causes":["socket_low_score"]}'
+exit 10
+AUDIT
+chmod +x "$tmp/cap-fix/ha-audit"
+python3 <<'PY' || exit 1
+import os, pathlib, pty, select, signal, time
+root = os.environ['ROOT']; fix = pathlib.Path(os.environ['CAP_FIX'])
+def run(name, argv, mode):
+    cap = fix / ('capture-' + name); cap.mkdir(exist_ok=True)
+    env = {'PATH': '/usr/bin:/bin', 'ROOT': root, 'FIX': str(fix), 'HOME': str(fix / 'home'), 'SAFE_RUN_NO_INIT': '1',
+           'SAFE_AUDIT_BIN': str(fix / 'ha-audit'), 'FIXTURE_AUDIT_MODE': mode}
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execve('/usr/bin/python3', ['python3', str(fix / 'parent.py'), name, str(cap)] + argv, env)
+    buf = b''; sent = False; deadline = time.monotonic() + 20
+    try:
+        while time.monotonic() < deadline:
+            if not select.select([fd], [], [], 0.1)[0]: continue
+            try: chunk = os.read(fd, 65536)
+            except OSError: break
+            if not chunk: break
+            buf += chunk
+            if not sent and (b'[y/N]' in buf or b'to accept them:' in buf):
+                os.write(fd, b'n\n'); sent = True
+        else:
+            os.kill(pid, signal.SIGKILL); raise AssertionError(name + ' timed out: ' + repr(buf))
+        os.waitpid(pid, 0)
+    finally:
+        os.close(fd)
+    return dict(terminal=buf.decode(errors='replace'), rc=(cap / 'rc').read_text(),
+                stdout=(cap / 'stdout').read_text(), stderr=(cap / 'stderr').read_text())
+r = run('ha-warn', [root + '/bin/safe-run', 'host-allow', 'add', 'fixture@1.0.0'], 'warn')
+assert 'flagged fixture@1.0.0 for review' in r['terminal'] and 'add to host-allow anyway? [y/N]' in r['terminal'], r
+assert 'flagged fixture@1.0.0 for review' in r['stderr'], r
+assert 'anyway?' not in r['stderr'] + r['stdout'] and r['rc'] != '0' and 'aborted' in r['stderr'], r
+r = run('ha-block', [root + '/bin/safe-run', 'host-allow', 'add', 'fixture@1.0.0', '--accept-block'], 'block')
+assert 'GHSA-fixt-ure1-0000' in r['terminal'] and 'type fixture@1.0.0 to accept them:' in r['terminal'], r
+assert 'GHSA-fixt-ure1-0000' in r['stderr'] and 'to accept them' not in r['stderr'] + r['stdout'], r
+assert r['rc'] != '0' and 'aborted' in r['stderr'], r
+PY
+pass 'standalone host-allow add shows its warning and question on the terminal while stderr stays captured'
 # Mise retains isolated env/cwd audits but consent belongs to the command parent.
 source "$ROOT/lib/gate-lib.sh"
 safe_gate_audit_available() { return 0; }
