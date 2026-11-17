@@ -26,6 +26,14 @@ GATE_TOOLS=(npm pnpm pnpx yarn bun pip pip3 uv cargo go composer mise)
 # Tools installed at exactly the path their wrapper must occupy, so the only
 # way to gate them is to move the real binary to <tool>.original.
 GATE_DISPLACE_TOOLS=(uv)
+# Fetch-and-execute runners. Each is a symlink to $BIN_DIR/safe-run (which
+# dispatches on argv[0]), owned by this installer and listed in the manifest
+# below so uninstall removes exactly what install made. uvx is installed by uv
+# at the very path its link needs, so it is displaced like uv (RUNNER_DISPLACE).
+# pnpx and `bun x` are not runner links: they are gate routes (GATE_TOOLS).
+RUNNER_LINKS=(npx bunx uvx)
+RUNNER_DISPLACE=(uvx)
+RUNNER_LINKS_MANIFEST="$CONFIG_BASE/runner-links"
 # Tools whose wrapper could not be written. Non-empty means the install did not
 # achieve what it was asked to, and the exit status must say so.
 GATE_WRAPPER_FAILURES=()
@@ -351,13 +359,35 @@ write_gate_wrapper() {
       [[ "$candidate" == "mise" ]] && continue
       gated+="${gated:+ }$(printf '%q' "$candidate")"
     done
+    # Runners (npx/bunx/uvx) are not `safe gate` tools: a shim named after one
+    # was a silent fetch-and-execute bypass (bunx resolved through the shim to
+    # the raw bun binary). They route to safe-run beside this wrapper — the
+    # same gate their $BIN_DIR link reaches — with argv[0] preserved.
+    local runners=""
+    for candidate in "${RUNNER_LINKS[@]}"; do
+      runners+="${runners:+ }$(printf '%q' "$candidate")"
+    done
     {
       printf '%s\n' '#!/usr/bin/env bash'
       printf '%s\n' '# safe-gate-wrapper v1 tool=mise'
       printf '__safe_gated_argv0s=(%s)\n' "$gated"
+      printf '__safe_runner_argv0s=(%s)\n' "$runners"
       cat <<'EOF'
 __safe_argv0="${0##*/}"
 if [[ "$__safe_argv0" != "mise" ]]; then
+  for __t in "${__safe_runner_argv0s[@]}"; do
+    [[ "$__safe_argv0" == "$__t" ]] || continue
+    __r="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null)"
+    __r="${__r%/*}/safe-run"
+    if [[ ! -x "$__r" ]]; then
+      __r="$(command -v safe-run 2>/dev/null)" || __r=""
+    fi
+    if [[ -z "$__r" ]]; then
+      printf 'safe gate: BLOCKED %s — safe-run not found beside the mise wrapper; rerun install.sh\n' "$__safe_argv0" >&2
+      exit 100
+    fi
+    SAFE_RUN_RUNNER_ARGV0="$__safe_argv0" exec "$__r" "$@"
+  done
   for __t in "${__safe_gated_argv0s[@]}"; do
     [[ "$__safe_argv0" == "$__t" ]] || continue
     exec safe gate "$__safe_argv0" -- "$@"
@@ -463,6 +493,88 @@ install_gate_wrappers() {
   fi
   if [[ "${#skipped[@]}" -gt 0 ]]; then
     warn "kept existing non-safe files, gating NOT active for: ${skipped[*]} (remove them and re-run to gate these tools)"
+  fi
+}
+
+runner_in_list() {
+  local needle="$1"; shift
+  local item
+  for item in "$@"; do [[ "$item" == "$needle" ]] && return 0; done
+  return 1
+}
+
+# Own the fetch-and-execute runner links in $BIN_DIR, ahead of the mise shims.
+# Per runner: absent -> link; a symlink already resolving to safe-run (ours, or
+# a hand-made one) -> kept and adopted; a displaceable regular file (uvx, put
+# there by uv itself) -> moved to <runner>.original and recorded as the real
+# runner; anything else is somebody else's and is left alone with a warning.
+install_runner_links() {
+  local safe_run="$BIN_DIR/safe-run" runner target
+  local -a created=() kept=() displaced=() skipped=() failed=() owned=()
+
+  mkdir -p "$BIN_DIR"
+  for runner in "${RUNNER_LINKS[@]}"; do
+    target="$BIN_DIR/$runner"
+    if [[ -L "$target" ]]; then
+      if [[ "$(readlink -f -- "$target" 2>/dev/null)" == "$(readlink -f -- "$safe_run" 2>/dev/null)" ]]; then
+        kept+=("$runner"); owned+=("$runner")
+      else
+        skipped+=("$runner")
+      fi
+      continue
+    fi
+    if [[ -e "$target" ]]; then
+      if runner_in_list "$runner" "${RUNNER_DISPLACE[@]}" && [[ -f "$target" ]] \
+         && [[ ! -e "$target.original" && ! -L "$target.original" ]]; then
+        if mv -- "$target" "$target.original" && ln -s -- "$safe_run" "$target"; then
+          record_runner_real "$runner" "$target.original"
+          displaced+=("$runner"); owned+=("$runner")
+        else
+          [[ -e "$target" || -L "$target" ]] || mv -- "$target.original" "$target" 2>/dev/null || true
+          failed+=("$runner")
+        fi
+      else
+        skipped+=("$runner")
+      fi
+      continue
+    fi
+    if ln -s -- "$safe_run" "$target"; then
+      created+=("$runner"); owned+=("$runner")
+    else
+      failed+=("$runner")
+    fi
+  done
+
+  mkdir -p "$CONFIG_BASE"
+  if [[ "${#owned[@]}" -gt 0 ]]; then
+    printf '%s\n' "${owned[@]}" > "$RUNNER_LINKS_MANIFEST"
+  else
+    rm -f -- "$RUNNER_LINKS_MANIFEST"
+  fi
+
+  [[ "${#created[@]}" -eq 0 ]] || info "linked runners to safe-run in $BIN_DIR: ${created[*]}"
+  [[ "${#displaced[@]}" -eq 0 ]] || info "moved real runners aside to <runner>.original and linked them: ${displaced[*]}"
+  [[ "${#kept[@]}" -eq 0 ]] || info "runner links already point to safe-run (kept): ${kept[*]}"
+  if [[ "${#skipped[@]}" -gt 0 ]]; then
+    warn "kept existing non-safe files, runner gating NOT active from $BIN_DIR for: ${skipped[*]} (remove them and re-run; safe doctor reports what resolves)"
+  fi
+  if [[ "${#failed[@]}" -gt 0 ]]; then
+    warn "could not link runners: ${failed[*]} — nothing was left half-installed, and these stay ungated"
+    GATE_WRAPPER_FAILURES+=("${failed[@]}")
+  fi
+}
+
+# Same record `safe run link` writes: runners.<runner>_real -> the real binary.
+record_runner_real() {
+  local runner="$1" real="$2" cfg="$RUN_CONFIG_DIR/config.json" tmp
+  mkdir -p "$RUN_CONFIG_DIR"
+  [[ -f "$cfg" ]] || printf '{}\n' > "$cfg"
+  tmp="$(mktemp "$cfg.XXXXXX")" || return 1
+  if jq --arg k "${runner}_real" --arg v "$real" '.runners = ((.runners // {}) + {($k): $v})' "$cfg" > "$tmp"; then
+    mv -- "$tmp" "$cfg"
+  else
+    rm -f -- "$tmp"
+    warn "could not record $runner real path in $cfg"
   fi
 }
 
@@ -915,6 +1027,7 @@ if (( DO_WRAPPERS )); then
   install -m 0644 "$REPO_DIR/lib/install-wrappers.zsh" "$WRAPPER_TARGET"
   install -m 0644 "$REPO_DIR/lib/gate-lib.sh" "$GATE_LIB_TARGET"
   install_gate_wrappers
+  install_runner_links
   normalize_mise_shims
   touch "$ZSHRC"
   if grep -Fqx "$SOURCE_LINE" "$ZSHRC" || grep -Fqx 'source ~/.config/safe/install-wrappers.zsh' "$ZSHRC"; then

@@ -554,6 +554,36 @@ gate_wrapper_state() {
   printf 'installed'
 }
 
+# Fetch-and-execute runners resolve through safe-run (argv0 dispatch). Keep in
+# sync with RUNNER_LINKS in install.sh. pnpx and `bun x` are gate routes and are
+# covered by the SAFE_GATE_TOOL_LIST wrapper states (pnpx, bun).
+SAFE_RUNNER_LIST=(npx bunx uvx)
+
+# Per-runner state, from what THIS PATH really resolves: gated (resolves to
+# safe-run) | gated-via-mise (a mise shim whose wrapper routes the runner to
+# safe-run) | ungated (resolves to something else) | missing (not on PATH).
+# Prints "<state> <resolved path>".
+runner_gate_state() {
+  local runner="$1" resolved canon run_canon mise_canon
+  resolved="$(command -v "$runner" 2>/dev/null || true)"
+  if [[ -z "$resolved" || ! -x "$resolved" ]]; then
+    printf 'missing'
+    return 0
+  fi
+  canon="$(readlink -f -- "$resolved" 2>/dev/null || true)"
+  run_canon="$(readlink -f -- "$SAFE_BIN_ROOT/safe-run" 2>/dev/null || true)"
+  mise_canon="$(readlink -f -- "$SAFE_BIN_ROOT/mise" 2>/dev/null || true)"
+  if [[ -n "$canon" && "$canon" == "$run_canon" ]]; then
+    printf 'gated %s' "$resolved"
+  elif [[ -n "$canon" && "$canon" == "$mise_canon" ]] && gate_wrapper_marked "$SAFE_BIN_ROOT/mise" mise \
+       && LC_ALL=C grep -E '^__safe_runner_argv0s=\(' -- "$SAFE_BIN_ROOT/mise" 2>/dev/null \
+          | LC_ALL=C grep -qE "[( ]${runner}[ )]"; then
+    printf 'gated-via-mise %s' "$resolved"
+  else
+    printf 'ungated %s' "$resolved"
+  fi
+}
+
 cmd_status() {
   echo "safe $SAFE_VERSION"
   echo
@@ -581,6 +611,20 @@ cmd_status() {
     echo "wrappers:       DEGRADED (${healthy}/${#SAFE_GATE_TOOL_LIST[@]} healthy) — ${unhealthy[*]}"
     echo "                foreign/shadowed/missing/not-on-path tools are NOT gated; fix and re-run install.sh"
     echo "                not-on-path means the wrapper exists but $SAFE_BIN_ROOT is not on PATH here"
+  fi
+  local runner rstate rpath rhealthy=0 runner_bad=()
+  for runner in "${SAFE_RUNNER_LIST[@]}"; do
+    read -r rstate rpath <<<"$(runner_gate_state "$runner")"
+    case "$rstate" in
+      gated|gated-via-mise) rhealthy=$((rhealthy + 1)) ;;
+      *) runner_bad+=("$runner:$rstate${rpath:+ ($rpath)}") ;;
+    esac
+  done
+  if [[ "${#runner_bad[@]}" -eq 0 ]]; then
+    echo "runners:        ok (${rhealthy}/${#SAFE_RUNNER_LIST[@]} resolve to the gate; pnpx and bun x via the wrappers above)"
+  else
+    echo "runners:        DEGRADED (${rhealthy}/${#SAFE_RUNNER_LIST[@]} resolve to the gate) — ${runner_bad[*]}"
+    echo "                ungated/missing runners fetch and execute with no audit; fix and re-run install.sh"
   fi
   release_follow_status_line
 }
@@ -1463,6 +1507,13 @@ doctor_payload_json() {
     [[ "$gw_state" == "installed" ]] || gate_wrappers_healthy=false
     gate_wrappers_json=$(jq -cn --argjson acc "$gate_wrappers_json" --arg t "$gw_tool" --arg s "$gw_state" '$acc + {($t): $s}')
   done
+  local runner_links_json='{}' runner_links_healthy=true rl_runner rl_state rl_path
+  for rl_runner in "${SAFE_RUNNER_LIST[@]}"; do
+    read -r rl_state rl_path <<<"$(runner_gate_state "$rl_runner")"
+    case "$rl_state" in gated|gated-via-mise) ;; *) runner_links_healthy=false ;; esac
+    runner_links_json=$(jq -cn --argjson acc "$runner_links_json" --arg t "$rl_runner" --arg s "$rl_state" --arg p "${rl_path:-}" \
+      '$acc + {($t): {state: $s, resolved: (if $p == "" then null else $p end)}}')
+  done
   local completion_file="$SAFE_ZSH_COMPLETION_DIR/_safe"
 
   # mise shims bound to the gate wrapper (a reshim ran while the wrapper sat
@@ -1665,6 +1716,8 @@ doctor_payload_json() {
     --argjson gate_wrappers "$gate_wrappers_json" \
     --argjson gate_wrappers_healthy "$gate_wrappers_healthy" \
     --argjson mise_shims_bound "$mise_shims_bound" \
+    --argjson runner_links "$runner_links_json" \
+    --argjson runner_links_healthy "$runner_links_healthy" \
     --arg gate_bin_root "$SAFE_BIN_ROOT" \
     --argjson completion_present "$( [[ -f "$completion_file" ]] && printf 'true' || printf 'false' )" \
     '{
@@ -1745,6 +1798,8 @@ doctor_payload_json() {
         install_wrappers: {
           gate_wrappers: $gate_wrappers,
           gate_wrappers_healthy: $gate_wrappers_healthy,
+          runner_links: $runner_links,
+          runner_links_healthy: $runner_links_healthy,
           mise_shims_bound_to_wrapper: $mise_shims_bound,
           bin_root: $gate_bin_root,
           script_present: $wrapper_present,
@@ -1814,6 +1869,15 @@ print_doctor_human() {
     "socket wiring (install gate scoring):",
     "  cli: " + (if .environment.socket.cli_present then .environment.socket.cli_path else "MISSING — install socket CLI" end),
     "  token: " + (if .environment.socket.token_env_set then "env" elif .environment.socket.vault_mapping_present then "vault mapping" else "MISSING — socket login or add bw-env socket mapping" end),
+    "",
+    "fetch-and-execute runners (what this PATH resolves):",
+    ((.environment.install_wrappers.runner_links // {}) | to_entries[]
+      | "  " + .key + ": " + (
+          if .value.state == "gated" then "gated (safe-run)"
+          elif .value.state == "gated-via-mise" then "gated (mise shim routed to safe-run)"
+          elif .value.state == "missing" then "NOT ON PATH — rerun install.sh"
+          else "UNGATED — resolves to " + (.value.resolved // "?") + "; fetch-and-execute with no audit (rerun install.sh)" end)),
+    "  pnpx, bun x: gate wrappers, see install_wrappers.gate_wrappers",
     (if (.environment.install_wrappers.mise_shims_bound_to_wrapper // 0) > 0 then
       "\nmise shims: " + (.environment.install_wrappers.mise_shims_bound_to_wrapper | tostring)
       + " bound to the gate wrapper — dispatch still works (argv0 branch) but pays an extra exec per call."

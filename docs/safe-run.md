@@ -17,7 +17,8 @@ safe-uvx
 safe-pipx-run
 ```
 
-After `safe run link`, host `npx`, `bunx`, and `uvx` can be routed through
+`install.sh` links `npx`, `bunx`, and `uvx` in `~/.local/bin` to `safe-run`,
+and `safe run link` can route copies found elsewhere on PATH through
 `safe run`. `pipx` is not auto-linked; use `safe-pipx-run`.
 
 ## Sandbox Defaults
