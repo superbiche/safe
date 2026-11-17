@@ -195,11 +195,16 @@ safe_gate_resolve_real() {
   printf '%s\n' "$displaced"
 }
 
-# Delegate to the real tool. Never returns — except in audit-only mode
+# Delegate to the real tool. Never returns. In audit-only mode
 # (SAFE_GATE_NO_EXEC=1, used when mise wraps an inner gated command: the
-# routing/audit runs, the exec is the outer tool's job). A stray external
-# SAFE_GATE_NO_EXEC makes commands audit-then-not-run: fail-safe, not a
-# bypass.
+# routing/audit runs, the exec is the outer tool's job) it ENDS the
+# process the same way exec would: every caller treats this call as the
+# terminus of its route ("not an install, pass through" or "audited, run"),
+# so returning let a pass-through verb fall into the install lane below it
+# (`mise exec -- pnpm run check:docs` audited `check@docs`). The audit-only
+# caller runs the inner gate in a subshell, so this exit ends only that
+# scan. A stray external SAFE_GATE_NO_EXEC makes commands audit-then-not-run:
+# fail-safe, not a bypass.
 safe_gate_exec_real() {
   local tool="$1"
   shift
@@ -207,7 +212,7 @@ safe_gate_exec_real() {
   local exec_argv0=""
 
   if [[ "${SAFE_GATE_NO_EXEC:-}" == "1" ]]; then
-    return 0
+    exit 0
   fi
 
   real="$(safe_gate_resolve_real "$tool")"
@@ -2770,7 +2775,7 @@ safe_gate_pip_project_install() {
 
   for arg in "$@"; do
     case "${arg}" in
-      -r|--requirement|--requirement=*|-r?*)
+      -r|--requirement|--requirement=*|--requirements|--requirements=*|-r?*)
         return 0
         ;;
       -e|--editable|--editable=*)
@@ -4000,8 +4005,12 @@ safe_gate_python_log_local_artifacts() {
       continue
     fi
     case "${arg}" in
-      -c|--constraint|-i|--index-url|--index|--default-index|--extra-index-url|--find-links|--trusted-host|--platform|--python-version|--implementation|--abi|--target|--prefix|--src|--upgrade-strategy|--config-settings|-C|--python|-p|-r|--requirement|-e|--editable)
+      -c|--constraint|--constraints|--overrides|--build-constraints|-i|--index-url|--index|--default-index|--extra-index-url|--find-links|--trusted-host|--platform|--python-version|--implementation|--abi|--target|--prefix|--src|--upgrade-strategy|--config-settings|-C|--python|-p|-r|--requirement|--requirements|-e|--editable|--no-build-package|--no-binary-package|--no-build-isolation-package)
         skip_next=1
+        continue
+        ;;
+      --only-binary|--no-binary)
+        if [[ "${SAFE_GATE_PY_BOOL_NO_BINARY:-0}" != 1 ]]; then skip_next=1; fi
         continue
         ;;
       -*)
@@ -4033,10 +4042,19 @@ safe_gate_python_packages() {
     fi
 
     case "${arg}" in
-      -r|--requirement|--requirement=*|-e|--editable|--editable=*)
+      -r|--requirement|--requirement=*|--requirements|--requirements=*|-e|--editable|--editable=*)
         return 1
         ;;
-      -c|--constraint|-i|--index-url|--index|--default-index|--extra-index-url|--find-links|--trusted-host|--platform|--python-version|--implementation|--abi|--target|--prefix|--src|--upgrade-strategy|--config-settings|-C|--python|-p)
+      --only-binary|--no-binary)
+        # pip's and `uv pip install`'s format control takes a value
+        # (`--only-binary :all:`); on `uv tool install` --no-binary is a
+        # switch, and that caller says so. Reading `:all:` as a package
+        # name made a plain install refuse, and a following /tmp path
+        # route the command as a local artifact.
+        [[ "${SAFE_GATE_PY_BOOL_NO_BINARY:-0}" == 1 ]] || skip_next=1
+        continue
+        ;;
+      -c|--constraint|--constraints|--overrides|--build-constraints|--no-build-package|--no-binary-package|--no-build-isolation-package|-i|--index-url|--index|--default-index|--extra-index-url|--find-links|--trusted-host|--platform|--python-version|--implementation|--abi|--target|--prefix|--src|--upgrade-strategy|--config-settings|-C|--python|-p)
         # -i/--index/--default-index take a value: dropping it made the URL
         # look like a package spec and fail-opened the extractor (PR#30
         # review finding 1 sibling). The selector itself is threaded to the
@@ -4047,7 +4065,7 @@ safe_gate_python_packages() {
         skip_next=1
         continue
         ;;
-      --constraint=*|--index-url=*|--index=*|--default-index=*|--extra-index-url=*|--find-links=*|--trusted-host=*|--platform=*|--python-version=*|--implementation=*|--abi=*|--target=*|--prefix=*|--src=*|--upgrade-strategy=*|--config-settings=*|--python=*)
+      --constraint=*|--constraints=*|--overrides=*|--build-constraints=*|--index-url=*|--index=*|--default-index=*|--extra-index-url=*|--find-links=*|--trusted-host=*|--platform=*|--python-version=*|--implementation=*|--abi=*|--target=*|--prefix=*|--src=*|--upgrade-strategy=*|--config-settings=*|--python=*)
         continue
         ;;
       --upgrade|-U|--force-reinstall|--ignore-installed|--user|--break-system-packages|--no-deps|--pre)
@@ -4103,6 +4121,190 @@ safe_gate_npm_spec() {
   fi
 
   safe_gate_print_spec "${name}" "${version}"
+}
+
+# --- pnpm verify-deps-before-run ----------------------------------------------
+# pnpm >= 12 checks the project's dependencies before it runs a script or a
+# binary (`run`, `exec`, `test`, `start`, bare `<script>`) and, with the
+# default `install`, INSTALLS what is out of date: range-resolved, unaudited
+# (encre #1184: 204 packages behind a `pnpm exec`). Those verbs are not
+# installs to the gate, so the check is forced to a non-installing value for
+# the child. Verified against pnpm 12.18.0: the `pnpm_config_` environment
+# variable (either case) overrides the project's pnpm-workspace.yaml and
+# .npmrc and is honored without an argv change; `npm_config_` is NOT read.
+# A value the command line or environment already sets to a non-installing
+# one (`false`, `warn`, `error`) stands.
+#
+# An explicit request for the installing behavior (`install`, `prompt`, a bare
+# flag, anything unrecognized) makes the verb an install: it takes the same
+# project gate as `pnpm install` (SAFE_GATE_PNPM_VERIFY_DEPS=install), never a
+# silent pass.
+safe_gate_pnpm_verify_deps_guard() {
+  local arg v name cli="" envv=""
+  SAFE_GATE_PNPM_VERIFY_DEPS=""
+  for arg in "$@"; do
+    [[ "${arg}" == "--" ]] && break
+    case "${arg}" in
+      --config.verify-deps-before-run=*|--config.verifyDepsBeforeRun=*|--verify-deps-before-run=*)
+        v="${arg#*=}"
+        case "${v}" in
+          false|warn|error) [[ "${cli}" == "install" ]] || cli="safe" ;;
+          *) cli="install" ;;
+        esac
+        ;;
+      --config.verify-deps-before-run|--config.verifyDepsBeforeRun|--verify-deps-before-run|--no-verify-deps-before-run|--config.no-verify-deps-before-run)
+        cli="install"
+        ;;
+    esac
+  done
+  for name in pnpm_config_verify_deps_before_run PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN; do
+    v="${!name-}"
+    [[ -n "${v}" ]] || continue
+    case "${v}" in
+      false|warn|error) [[ "${envv}" == "install" ]] || envv="safe" ;;
+      *) envv="install" ;;
+    esac
+  done
+  # The command line outranks the environment in pnpm.
+  SAFE_GATE_PNPM_VERIFY_DEPS="${cli:-${envv}}"
+  if [[ -z "${SAFE_GATE_PNPM_VERIFY_DEPS}" ]]; then
+    export pnpm_config_verify_deps_before_run=warn PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN=warn
+    SAFE_GATE_PNPM_VERIFY_DEPS="forced"
+  fi
+  return 0
+}
+
+# --- catalog: specifiers (pnpm, bun) ---------------------------------------
+# `pkg@catalog:` / `pkg@catalog:<name>` names a version that the workspace
+# root declares (pnpm: pnpm-workspace.yaml `catalog:` / `catalogs:`; bun: the
+# root package.json `catalog` / `catalogs`, also nested under `workspaces`).
+# The audit cannot resolve the protocol itself, so the specifier is replaced
+# by the version or range the catalog entry names, then audited as that.
+# Anything the reader cannot take at face value (no catalog, no entry, a
+# non-version value such as a git URL or `workspace:`) leaves the specifier
+# unchanged: the audit then refuses it honestly, as before.
+
+# Entry <key> of catalog <name> ("" = the default catalog) in a
+# pnpm-workspace.yaml. A line reader for the block-style layout pnpm writes
+# (two-level indentation, optionally quoted keys and values); flow maps,
+# anchors and multi-line scalars are not read and so resolve to nothing.
+safe_gate_pnpm_catalog_entry() {
+  local file="$1" catname="$2" key="$3"
+  awk -v want_cat="${catname}" -v want_key="${key}" '
+    function unq(v) {
+      sub(/^[ \t]+/, "", v); sub(/[ \t]+$/, "", v)
+      if (v ~ /^"/) { sub(/^"/, "", v); sub(/".*$/, "", v); return v }
+      if (v ~ /^\047/) { sub(/^\047/, "", v); sub(/\047.*$/, "", v); return v }
+      sub(/[ \t]+#.*$/, "", v)
+      return v
+    }
+    # Split "key: value" into KEY / VAL; quoted keys may hold a colon.
+    function split_kv(t,    m) {
+      KEY = ""; VAL = ""
+      if (t ~ /^"/) {
+        if (!match(t, /^"[^"]*"[ \t]*:([ \t]|$)/)) return 0
+        m = substr(t, 1, RLENGTH); VAL = substr(t, RLENGTH + 1)
+        sub(/[ \t]*:([ \t]|$)$/, "", m); KEY = unq(m); return 1
+      }
+      if (t ~ /^\047/) {
+        if (!match(t, /^\047[^\047]*\047[ \t]*:([ \t]|$)/)) return 0
+        m = substr(t, 1, RLENGTH); VAL = substr(t, RLENGTH + 1)
+        sub(/[ \t]*:([ \t]|$)$/, "", m); KEY = unq(m); return 1
+      }
+      if (!match(t, /:([ \t]|$)/)) return 0
+      KEY = substr(t, 1, RSTART - 1); VAL = substr(t, RSTART + RLENGTH)
+      sub(/[ \t]+$/, "", KEY); return 1
+    }
+    BEGIN { mode = ""; cur = ""; ci1 = -1; ci2 = -1 }
+    /^[ \t]*(#.*)?$/ { next }
+    {
+      line = $0; ind = match(line, /[^ ]/) - 1
+      t = substr(line, ind + 1)
+      if (ind == 0) {
+        mode = ""; cur = ""; ci1 = -1; ci2 = -1
+        if (!split_kv(t)) next
+        if (KEY == "catalog" && unq(VAL) == "") mode = "default"
+        else if (KEY == "catalogs" && unq(VAL) == "") mode = "named"
+        next
+      }
+      if (mode == "") next
+      if (ci1 < 0) ci1 = ind
+      if (mode == "default") {
+        if (ind != ci1 || !split_kv(t)) next
+        if ((want_cat == "" || want_cat == "default") && KEY == want_key) { print unq(VAL); exit }
+        next
+      }
+      # mode == "named": catalog names at ci1, entries one level deeper
+      if (ind == ci1) {
+        cur = split_kv(t) && unq(VAL) == "" ? KEY : ""
+        ci2 = -1
+        next
+      }
+      if (cur == "") next
+      if (ci2 < 0) ci2 = ind
+      if (ind != ci2 || !split_kv(t)) next
+      if (cur == (want_cat == "" ? "default" : want_cat) && KEY == want_key) { print unq(VAL); exit }
+    }
+  ' "${file}" 2>/dev/null
+}
+
+# Entry <key> of catalog <name> in a bun root package.json, else nothing.
+safe_gate_bun_catalog_entry() {
+  local file="$1" catname="$2" key="$3"
+  jq -r --arg c "${catname}" --arg k "${key}" '
+    (if $c == "" then
+       (.catalog // (.workspaces | objects | .catalog) // {})
+     else
+       ((.catalogs // {}) + ((.workspaces | objects | .catalogs) // {}))[$c] // {}
+     end) | objects | .[$k] | strings
+  ' "${file}" 2>/dev/null
+}
+
+# Print the raw package spec with a `@catalog:` specifier replaced by the
+# catalog entry it names, or the spec unchanged when it cannot be resolved.
+safe_gate_catalog_spec() {
+  local tool="$1" raw="$2"
+  local name catname dir entry="" probe parent
+  if [[ "${tool}" != "pnpm" && "${tool}" != "bun" ]] || [[ "${raw}" != *@catalog:* ]]; then
+    printf '%s\n' "${raw}"
+    return 0
+  fi
+  name="${raw%@catalog:*}"
+  catname="${raw##*@catalog:}"
+  if [[ -z "${name}" || "${name}" == "@" || "${name}" == *" "* ]]; then
+    printf '%s\n' "${raw}"
+    return 0
+  fi
+  # The workspace root is searched from the directory the command runs in
+  # (--dir/--cwd/-C included) upward, like the managers do.
+  dir="${SAFE_GATE_PROJECT_DIR:-.}"
+  dir="$(CDPATH= cd -P -- "${dir}" 2>/dev/null && pwd -P)" || dir=""
+  while [[ -n "${dir}" ]]; do
+    if [[ "${tool}" == "pnpm" ]]; then
+      probe="${dir}/pnpm-workspace.yaml"
+      if [[ -f "${probe}" ]]; then
+        entry="$(safe_gate_pnpm_catalog_entry "${probe}" "${catname}" "${name}")"
+        break
+      fi
+    else
+      probe="${dir}/package.json"
+      if [[ -f "${probe}" ]] \
+         && jq -e '(.catalog? // .catalogs? // (.workspaces | objects | (.catalog? // .catalogs?))) != null' "${probe}" >/dev/null 2>&1; then
+        entry="$(safe_gate_bun_catalog_entry "${probe}" "${catname}" "${name}")"
+        break
+      fi
+    fi
+    parent="$(dirname -- "${dir}")"
+    [[ "${parent}" != "${dir}" ]] || break
+    dir="${parent}"
+  done
+  # A version or range (or an npm: alias, which the spec parser unwraps);
+  # git/file/link/workspace values are not a registry version to audit.
+  if [[ -n "${entry}" && ( "${entry}" =~ ^[0-9A-Za-z.*+^~\<\>=\|\ -]+$ || "${entry}" == npm:* ) ]]; then
+    printf '%s@%s\n' "${name}" "${entry}"
+    return 0
+  fi
+  printf '%s\n' "${raw}"
 }
 
 safe_gate_python_spec() {
@@ -4308,7 +4510,10 @@ safe_gate_global_flags() {
       # not consume a following space-form token, so they must not sit in the
       # space-form value table (that would eat the subcommand). The =form is
       # covered by the generic --*=* skip; bare space-form fails closed.
-      SAFE_GATE_GVAL=''
+      # -e/--eval and -p/--print DO accept a separate value (`bun -e 'code'`,
+      # help prints `--eval=<val>` but the parser takes both spellings), so
+      # the space form parses like the `=` form: no subcommand, passthrough.
+      SAFE_GATE_GVAL='-e|--eval|-p|--print'
       SAFE_GATE_GBOOL='--version|-v|--help|-h|--silent|--global|-g|--no-cache|--no-progress' ;;
     yarn)
       SAFE_GATE_GVAL='--cwd|--registry|--modules-folder|--cache-folder|--mutex|--network-timeout|--network-concurrency|--proxy|--https-proxy'
@@ -4493,12 +4698,14 @@ safe_gate_npm_like() {
   # for the same npm ecosystem; the audit models that only when told which
   # installer runs (delta-4 finding F4: selectors key off the installer).
   [[ "${tool}" == "bun" ]] && SAFE_GATE_INSTALLER="bun"
+  # pnpm's run-verbs must not install on their own (see the guard).
+  [[ "${tool}" == "pnpm" ]] && safe_gate_pnpm_verify_deps_guard "$@"
   local subcommand="${SAFE_GATE_SUBCMD}"
   local npm_class=""
   if [[ "${tool}" == "npm" ]]; then
     npm_class="$(safe_gate_npm_subcommand_class "${subcommand}")" || npm_class=""
   fi
-  local npm_lockdiff_lane=1
+  local npm_lockdiff_lane=1 pnpm_verify_install=0
   if [[ "${tool}" == "npm" ]] && safe_gate_npm_lockdiff_subcommand "${subcommand}"; then
     npm_lockdiff_lane=0
   fi
@@ -4568,7 +4775,17 @@ safe_gate_npm_like() {
   else
     case "${subcommand}" in
       install|i|it|install-test|add|ci|update|u|up|upgrade|udpate|dedupe|ddp|prune) ;;
-      *) (( npm_lockdiff_lane == 0 )) || safe_gate_exec_real "${tool}" "$@" ;;
+      *)
+        if [[ "${tool}" == "pnpm" && "${SAFE_GATE_PNPM_VERIFY_DEPS}" == "install" ]]; then
+          # The command asks pnpm to install before it runs: that is an
+          # install, gated like `pnpm install` (project scan, no package
+          # targets — the verb's own arguments are a script or a binary).
+          pnpm_verify_install=1
+          safe_gate_err "safe: pnpm ${subcommand:-<script>} is set to install dependencies before it runs (verify-deps-before-run); gating it as a project install"
+        else
+          (( npm_lockdiff_lane == 0 )) || safe_gate_exec_real "${tool}" "$@"
+        fi
+        ;;
     esac
   fi
 
@@ -4627,7 +4844,7 @@ safe_gate_npm_like() {
     safe_gate_collect raw "$("${parser}" "${rest[@]}")"
     packages=()
     for raw_package in "${raw[@]}"; do
-      packages+=("$(safe_gate_npm_spec "${raw_package}")")
+      packages+=("$(safe_gate_npm_spec "$(safe_gate_catalog_spec "${tool}" "${raw_package}")")")
     done
 
     if (( ${#packages[@]} > 0 )); then
@@ -4655,6 +4872,10 @@ safe_gate_npm_like() {
     safe_gate_private_npm_project "${tool}" "${npm_class:-${subcommand}}" "$@" || return $?
   fi
 
+  if (( pnpm_verify_install )); then
+    safe_gate_exec_real "${tool}" "$@"
+  fi
+
   # npm's ci and install-ci-test families do not accept package argv. Their
   # aliases/prefixes still receive the project scan above, while leaving the
   # original command token for npm to validate and execute.
@@ -4666,7 +4887,7 @@ safe_gate_npm_like() {
   safe_gate_collect raw "$("${parser}" "${rest[@]}")"
   packages=()
   for raw_package in "${raw[@]}"; do
-    packages+=("$(safe_gate_npm_spec "${raw_package}")")
+    packages+=("$(safe_gate_npm_spec "$(safe_gate_catalog_spec "${tool}" "${raw_package}")")")
   done
 
   if (( ${#packages[@]} > 0 )); then
@@ -4791,10 +5012,10 @@ safe_gate_python_requirement_files() {
   local prev="" arg
   for arg in "$@"; do
     case "${prev}" in
-      -r|--requirement|-c|--constraint) printf '%s\n' "${arg}" ;;
+      -r|--requirement|--requirements|-c|--constraint|--constraints|--overrides|--build-constraints) printf '%s\n' "${arg}" ;;
     esac
     case "${arg}" in
-      --requirement=*|--constraint=*) printf '%s\n' "${arg#*=}" ;;
+      --requirement=*|--requirements=*|--constraint=*|--constraints=*|--overrides=*|--build-constraints=*) printf '%s\n' "${arg#*=}" ;;
       -r?*|-c?*) printf '%s\n' "${arg:2}" ;;
     esac
     prev="${arg}"
@@ -4879,7 +5100,7 @@ safe_gate_uv() {
     local -a with_specs=() normalized_with=()
     local run_arg expect_with=0 skip_with_next=0
     # --with-requirements names a file of packages we cannot vet inline → refuse.
-    local uv_val='--python|-p|--with-editable|--index|--index-url|--extra-index-url|--default-index|--constraint|-c|--index-strategy|--keyring-provider|--resolution|--prerelease|--exclude-newer|--config-setting|--refresh-package|--group|--only-group|--no-group|--extra|--no-extra|--project|--directory|--python-preference'
+    local uv_val='--python|-p|--with-editable|--index|--index-url|--extra-index-url|--default-index|--constraint|--constraints|--overrides|--build-constraints|-c|--index-strategy|--keyring-provider|--resolution|--prerelease|--exclude-newer|--config-setting|--refresh-package|--no-build-package|--no-binary-package|--no-build-isolation-package|--group|--only-group|--no-group|--extra|--no-extra|--project|--directory|--python-preference'
     local uv_bool='--frozen|--locked|--no-sync|--offline|--isolated|--no-project|--all-extras|--no-dev|--dev|--only-dev|--no-default-groups|--all-groups|--refresh|--reinstall|--upgrade|--all-packages|--no-editable|--exact|--inexact|--no-binary|--no-build|--compile-bytecode|--no-compile-bytecode|--native-tls|--no-cache|-n|-q|--quiet|-v|--verbose|--managed-python|--no-managed-python|--script|-s|-m|--module'
     for run_arg in "${@:subidx+1}"; do
       if (( expect_with )); then
@@ -4929,19 +5150,19 @@ safe_gate_uv() {
   if [[ "${first}" == "tool" && "${second}" == "run" ]]; then
     safe_gate_exec_gate "uv tool run" python 0 0 \
       '--from' '--with|-w' \
-      '--python|-p|--with-editable|--index|--index-url|--extra-index-url|--default-index|--constraint|-c|--index-strategy|--keyring-provider|--resolution|--prerelease|--exclude-newer|--config-setting|--refresh-package' \
-      '--offline|--isolated|--system|--no-project|--refresh|--reinstall|--upgrade|-q|--quiet|-v|--verbose|--native-tls|--no-cache|-n' \
+      '--python|-p|--with-editable|--index|--index-url|--extra-index-url|--default-index|--constraint|--constraints|--overrides|--build-constraints|-c|--index-strategy|--keyring-provider|--resolution|--prerelease|--exclude-newer|--config-setting|--refresh-package|--no-build-package|--no-binary-package|--no-build-isolation-package' \
+      '--offline|--isolated|--system|--no-project|--refresh|--reinstall|--upgrade|-q|--quiet|-v|--verbose|--native-tls|--no-cache|-n|--no-binary|--no-build' \
       '--with-requirements' \
       "${@:subidx+2}" || return $?
     safe_gate_exec_real uv "$@"
   fi
 
   if [[ "${first}" == "tool" && "${second}" == "install" ]]; then
-    extractor_out="$(safe_gate_python_packages "${@:subidx+2}")"
+    extractor_out="$(SAFE_GATE_PY_BOOL_NO_BINARY=1 safe_gate_python_packages "${@:subidx+2}")"
     extractor_rc=$?
     safe_gate_collect packages "${extractor_out}"
     if (( extractor_rc != 0 || ${#packages[@]} == 0 )); then
-      safe_gate_python_log_local_artifacts "${@:subidx+2}"
+      SAFE_GATE_PY_BOOL_NO_BINARY=1 safe_gate_python_log_local_artifacts "${@:subidx+2}"
       safe_gate_exec_real uv "$@"
     fi
 
@@ -6750,6 +6971,9 @@ safe_gate_mise_gate_exec() {
     # gate's own scrub cannot reach: a script-policy key in the overlay
     # would resurrect exactly what the scrub removed. Fail closed and name
     # the key — the operator removes it from the mise config if intended.
+    # mise execs the inner pnpm itself: the inner scan below runs in a
+    # subshell, so the verify-deps guard must set its environment here.
+    [[ "${cmd[0]}" == "pnpm" ]] && safe_gate_pnpm_verify_deps_guard "${cmd[@]:1}"
     case "${cmd[0]}" in
       npm|pnpm|bun)
         if safe_gate_mise_overlay_scripts_policy "$SAFE_GATE_MISE_OVERLAY"; then
