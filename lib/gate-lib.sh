@@ -1514,6 +1514,18 @@ safe_gate_confirm_critical() {
   return 102
 }
 
+# The ecosystem a gated tool installs, as safe audit's by_ecosystem names
+# it; empty for a tool the project scan is not scoped for.
+safe_gate_scan_scope() {
+  case "${SAFE_GATE_TOOL:-}" in
+    npm|npx|pnpm|pnpx|yarn|bun|bunx) printf 'npm' ;;
+    composer) printf 'composer' ;;
+    pip|pip3|uv|uvx) printf 'python' ;;
+    cargo) printf 'rust' ;;
+    go) printf 'go' ;;
+  esac
+}
+
 safe_gate_scan_project() {
   local scan_output
   local scan_status
@@ -1570,7 +1582,7 @@ safe_gate_scan_project() {
     safe_gate_tty_printf '%s\n' "${scan_output}"
   fi
 
-  local critical=0 broken="" have_verdict=0
+  local critical=0 broken="" have_verdict=0 scope="" scoped="" other_critical=0 other_ecosystems=""
   # Non-empty is not the same as readable. Against a truncated or malformed
   # document every jq expression below falls back to its default, and a
   # defaulted 0 criticals with no broken scanners is indistinguishable from
@@ -1585,6 +1597,32 @@ safe_gate_scan_project() {
     have_verdict=1
     critical="$(jq -r '.audit_totals.critical // .cve_scan.critical // 0' "${result_file}" 2>/dev/null || printf '0')"
     [[ "${critical}" =~ ^[0-9]+$ ]] || critical=0
+    # A package manager's install changes only its own ecosystem's
+    # dependencies: it gates on those findings, plus any the scanners could
+    # not attribute to an ecosystem. The rest of the project is reported,
+    # never silently dropped. A document without the breakdown, or whose
+    # breakdown does not add up to the total, gates on the total.
+    scope="$(safe_gate_scan_scope)"
+    if [[ -n "${scope}" ]]; then
+      scoped="$(jq -r --arg scope "${scope}" --argjson total "${critical}" '
+        .audit_totals.by_ecosystem as $b
+        | if ($b | type) != "object" then empty
+          elif ([$b[] | .critical // 0] | add // 0) != $total then empty
+          else
+            ([$b | to_entries[]
+              | select(.key == $scope or ([.key] | inside(["npm","composer","python","go","rust"]) | not))
+              | .value.critical // 0] | add // 0) as $mine
+            | ([$b | to_entries[] | select((.value.critical // 0) > 0 and .key != $scope
+                 and ([.key] | inside(["npm","composer","python","go","rust"])))
+                | .key] | join(", ")) as $others
+            | "\($mine)\t\($total - $mine)\t\($others)"
+          end' "${result_file}" 2>/dev/null || true)"
+      if [[ "${scoped}" =~ ^([0-9]+)$'\t'([0-9]+)$'\t'(.*)$ ]]; then
+        critical="${BASH_REMATCH[1]}"
+        other_critical="${BASH_REMATCH[2]}"
+        other_ecosystems="${BASH_REMATCH[3]}"
+      fi
+    fi
     broken="$(jq -r '
       def broken: (.status // "ok") as $s
         | ($s == "error") or (($s != "ok") and (((.note // "") | test("fail|error"; "i"))));
@@ -1595,9 +1633,12 @@ safe_gate_scan_project() {
   fi
   rm -f "${result_file}"
 
+  if (( other_critical > 0 )); then
+    safe_gate_err "safe install: ${other_critical} critical finding(s) in this project's ${other_ecosystems} dependencies do not gate this ${SAFE_GATE_TOOL:-} install (it changes only ${scope} dependencies); review them: safe audit repo-audit ."
+  fi
   if (( critical > 0 )); then
     if safe_gate_operator_terminal; then
-      safe_gate_tty_printf '%s\n' "safe install: safe audit repo-audit reported ${critical} critical finding(s) in this project's dependencies"
+      safe_gate_tty_printf '%s\n' "safe install: safe audit repo-audit reported ${critical} critical finding(s) in this project's ${scope:+${scope} }dependencies"
     fi
     safe_gate_confirm_critical
     return $?
@@ -4653,6 +4694,17 @@ safe_gate_yarn() {
   safe_gate_route yarn "$@" || return $?
   safe_gate_scan_target_flags npm "$@"
   local first="${SAFE_GATE_SUBCMD}"
+  # A bare `yarn` installs, but `yarn --version` or `yarn --help` only
+  # prints: with no subcommand, a version or help flag is not an install.
+  if [[ -z "${first}" ]]; then
+    local flag_arg
+    for flag_arg in "$@"; do
+      [[ "${flag_arg}" == "--" ]] && break
+      case "${flag_arg}" in
+        -v|--version|-h|--help) safe_gate_exec_real yarn "$@"; return $? ;;
+      esac
+    done
+  fi
   local subidx=$SAFE_GATE_SUBCMD_IDX
   local second="${@:subidx+1:1}"
   local -a raw=() packages=()

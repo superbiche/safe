@@ -56,6 +56,29 @@ awk '/^  - \[HIGH\]/{high=1} /^  - \[CRITICAL\]/{if(high)exit 1}' "$TEST_ROOT/fr
 ! LC_ALL=C grep -q $'\033' "$TEST_ROOT/fresh.txt" || fail 'terminal escape leaked'
 jq -e '.cve_scan.findings[] | select(.id == "GHSA-test-high") | .summary == "Header injection\nthrough unchecked input\u001b[31m"' "$result" >/dev/null || fail 'full upstream summary not preserved'
 jq -e '.verdict == "WARN" and .cve_scan.critical == 3 and .cve_scan.high == 3 and .cve_scan.medium == 1 and .audit_totals.high == 4' "$result" >/dev/null || fail 'report changed counts/verdict'
+# The per-ecosystem view adds up to the totals; findings no scanner
+# attributes to an ecosystem land in "other", which every gate counts.
+jq -e '.audit_totals as $t | ([$t.by_ecosystem[] | .critical] | add) == $t.critical
+  and ([$t.by_ecosystem[] | .high] | add) == $t.high
+  and $t.by_ecosystem.composer.high == 1 and $t.by_ecosystem.other.critical == 3' "$result" >/dev/null ||
+  fail "by_ecosystem does not add up: $(jq -c '.audit_totals' "$result")"
+mkdir -p "$TEST_ROOT/eco"
+cat > "$TEST_ROOT/eco/osv.json" <<'JSON'
+{"results":[{"packages":[
+ {"package":{"name":"laravel/framework","version":"11","ecosystem":"Packagist"},"vulnerabilities":[{"id":"GHSA-php","database_specific":{"severity":"CRITICAL"}}]},
+ {"package":{"name":"tar","version":"7.4.3","ecosystem":"npm"},"vulnerabilities":[{"id":"GHSA-tar","severity":[{"score":"9.8"}]}]}
+]}]}
+JSON
+cat > "$TEST_ROOT/eco/grype.json" <<'JSON'
+{"matches":[{"artifact":{"name":"jmespath","version":"2.8.0","type":"php-composer"},"vulnerability":{"id":"CVE-1","severity":"Critical"}},
+{"artifact":{"name":"blob","version":"1","type":"binary"},"vulnerability":{"id":"CVE-3","severity":"Critical"}}]}
+JSON
+printf '[{"scanner":"composer-audit","status":"ok","root":".","total":2,"critical":2,"high":0,"medium":0,"low":0},{"scanner":"npm-audit","status":"error","root":".","total":0,"critical":0,"high":0,"medium":0,"low":0}]\n' > "$TEST_ROOT/eco/audits.json"
+build_scan_result_from_artifacts test /fixture local-direct "$TEST_ROOT/sbom.json" "$TEST_ROOT/eco/osv.json" "$TEST_ROOT/eco/grype.json" "$TEST_ROOT/eco/audits.json" deps > /dev/null
+jq -e '.audit_totals as $t | $t.critical == 6 and $t.by_ecosystem.composer.critical == 4
+  and $t.by_ecosystem.npm.critical == 1 and $t.by_ecosystem.other.critical == 1' "$LAST_SCAN_RESULT_SNAPSHOT" >/dev/null ||
+  fail "by_ecosystem misattributes: $(jq -c '.audit_totals.by_ecosystem' "$LAST_SCAN_RESULT_SNAPSHOT")"
+pass 'audit_totals.by_ecosystem attributes osv, grype and ecosystem-audit counts and adds up to the totals'
 pass 'critical/high details preserve scanner text in JSON and render safe one-line summaries'
 # Replay through the real cache path with old entries that have no summaries.
 # Remove the deliberately broken ecosystem fixture only to make it cacheable.

@@ -204,7 +204,13 @@ Project scans are stricter for critical findings. The preflight reads the
 scan's **result document**, not its exit code — a scan that finds a critical
 advisory still exits 0, since its verdict lives in the document — so a critical
 count above zero prompts interactively and refuses with exit 102 in a
-non-interactive shell. Non-critical scan failures warn and continue, and a
+non-interactive shell. The count is the one of the ecosystem the tool installs
+(npm, pnpm, yarn, bun: npm; composer; pip and uv: python; cargo: rust; go),
+read from the document's `audit_totals.by_ecosystem`, plus every finding the
+scanners could not attribute to an ecosystem: a `yarn install` does not stop on
+a PHP advisory it cannot change. Critical findings of the project's other
+ecosystems are named on stderr, never dropped silently. A document without that
+breakdown, or whose breakdown does not add up to its total, gates on the total. Non-critical scan failures warn and continue, and a
 scanner that ran and failed is named in that warning rather than passing
 silently: the install proceeds, but what was not checked is said out loud. The
 same holds when no verdict can be read at all — an unwritable result
@@ -259,7 +265,9 @@ composer install
 composer update
 ```
 
-Non-install and non-exec commands pass through unchanged.
+Non-install and non-exec commands pass through unchanged. A bare `yarn`
+installs, but `yarn --version`, `yarn -v`, `yarn --help` and `yarn -h` only
+print and pass through.
 
 Any `-r` file on a pip / `uv pip` install — whatever its basename — routes
 through the project scan, and the named `-r`/`-c` files ride into the scan's

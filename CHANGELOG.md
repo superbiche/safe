@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- A package manager's project gate weighs only its own ecosystem's critical
+  findings (operator ruling 2026-11-17). `safe audit repo-audit` adds
+  `audit_totals.by_ecosystem`, the same counts per ecosystem (osv, grype and
+  the ecosystem audits; unattributed findings under `other`). npm, pnpm,
+  yarn and bun gate on npm findings, composer on composer, pip and uv on
+  python, cargo on rust, go on go — plus `other`. A `yarn install` in a
+  Laravel project no longer stops on PHP advisories; they are named on
+  stderr. A document without the breakdown, or whose breakdown does not add
+  up, gates on the total.
+- `yarn --version`, `yarn -v`, `yarn --help` and `yarn -h` pass through: a
+  flag-only `yarn` with a version or help flag is not an install and no
+  longer runs a project audit.
+
 - Composer reuse no longer stops on different root autoload rules. The
   copied autoloader encodes the root project (its autoload rules, those of
   path-repository packages, and with `optimize-autoloader` a class map of
