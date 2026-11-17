@@ -98,6 +98,25 @@ risk context, then the registry.
 - Operator, 2026-11-17: safe's primitives stay; what changes is how and when
   the operator is solicited, and the operator is not the agent.
 - Operator, 2026-11-17: the first slice is the differential project gate.
+- [Prior art survey](https://superbiche.fibery.io/Superbiche/Tasks/1498),
+  2026-11-18: release age is native in almost every manager of the fleet and
+  can be passed per invocation, but a locked install skips it, so safe keeps
+  its own exact-artifact check; bots let a security fix bypass the wait while
+  npm and Composer do not. Diff-based gating exists (GitHub dependency review)
+  but judges vulnerable added artifacts, not (package, advisory) identities.
+  KEV, EPSS and the CVSS vector are context, never proof of unreachability;
+  Grype consumes VEX. Real quarantine exists only in Sonatype Firewall and
+  JFrog Curation; light registries can serve a validated-only namespace.
+  OpenSSF Package Analysis and GuardDog run locally; Socket stays an API
+  signal.
+- [Lockfile projection survey](https://superbiche.fibery.io/Superbiche/Tasks/1499),
+  2026-11-18: a lockfile-only projection exists for npm, pnpm, Bun, Yarn
+  Berry, Composer, uv projects and Cargo; Go has a module graph; Yarn Classic
+  and pip keep today's gate. No projection is network-free and several can run
+  code unless guarded, so the first adapters accept declarative registry
+  projects only. The npm diff document is too narrow to generalise. The
+  delegate must install the projected result, not resolve again. Order: npm,
+  pnpm, Bun, Yarn Berry, Composer, uv, Cargo, Go.
 
 ## Not yet specified
 
@@ -121,16 +140,17 @@ risk context, then the registry.
 - The Go migration itself.
 - Operating the cluster services the origin or a registry would need.
 
-## Tickets (index at export time, 2026-11-17)
+## Tickets (index at export time, 2026-11-18)
 
-- [Prior art survey](https://superbiche.fibery.io/Superbiche/Tasks/1498) — research, open.
-- [Lockfile projection per package manager](https://superbiche.fibery.io/Superbiche/Tasks/1499) — research, open.
+- [Prior art survey](https://superbiche.fibery.io/Superbiche/Tasks/1498) — research, CLOSED 2026-11-18.
+- [Lockfile projection per package manager](https://superbiche.fibery.io/Superbiche/Tasks/1499) — research, CLOSED 2026-11-18.
 - [What gates a project update or add under the differential gate](https://superbiche.fibery.io/Superbiche/Tasks/1500) — grilling, open. First slice.
 - [Lane selection and the first-seen boundary](https://superbiche.fibery.io/Superbiche/Tasks/1501) — grilling, open.
 - [Version targeting and cooldown](https://superbiche.fibery.io/Superbiche/Tasks/1502) — grilling, open.
 - [Operator and agent: identification, and where decisions arrive](https://superbiche.fibery.io/Superbiche/Tasks/1503) — grilling, open.
-- [Risk context: which findings may be set aside without the operator](https://superbiche.fibery.io/Superbiche/Tasks/1504) — grilling, open, blocked by the prior art survey.
+- [Risk context: which findings may be set aside without the operator](https://superbiche.fibery.io/Superbiche/Tasks/1504) — grilling, open.
 - [Decontamination battery dry run on one workstation's outdated tools](https://superbiche.fibery.io/Superbiche/Tasks/1505) — prototype, open; starts on the operator's go.
-- [Decontamination origin: where it runs, what it holds, what validated means](https://superbiche.fibery.io/Superbiche/Tasks/1506) — grilling, open, blocked by the dry run and the prior art survey.
+- [Decontamination origin: where it runs, what it holds, what validated means](https://superbiche.fibery.io/Superbiche/Tasks/1506) — grilling, open, blocked by the dry run.
 - [Host update path for habitual tooling](https://superbiche.fibery.io/Superbiche/Tasks/1507) — grilling, open, blocked by the origin ticket.
-- [Package registry on the cluster: custody of validated bytes](https://superbiche.fibery.io/Superbiche/Tasks/1508) — grilling, open, blocked by the prior art survey and the origin ticket.
+- [Package registry on the cluster: custody of validated bytes](https://superbiche.fibery.io/Superbiche/Tasks/1508) — grilling, open, blocked by the origin ticket.
+- [Binding the audited projection to the real command](https://superbiche.fibery.io/Superbiche/Tasks/1509) — prototype, open; starts on the operator's go.
