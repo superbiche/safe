@@ -14,6 +14,11 @@ GATE_LIB_TARGET="$CONFIG_BASE/gate-lib.sh"
 # The agent contract travels with the dispatcher: `safe explain` runs from
 # ~/.local/bin, which has no ../docs, so the single source is installed here.
 AGENT_CONTRACT_TARGET="$CONFIG_BASE/agent-contract.json"
+# Agent skills travel with the release that implements what they describe:
+# installed on every run, linked into agent harnesses only with
+# --agent-skills, and never over a skill directory safe did not create.
+SKILL_SOURCE_DIR="$REPO_DIR/share/agent/skills"
+SKILL_TARGET_DIR="$DATA_BASE/skills"
 # Tools that get a PATH wrapper. Every wrapper is a dumb 3-line shim into
 # `safe gate`; all routing lives in gate-lib.sh, so upgrading safe upgrades the
 # gate without rewriting a single wrapper.
@@ -44,6 +49,7 @@ DO_AUDIT=0
 DO_WRAPPERS=0
 DO_REVIEW_TIMER=0
 DO_TOOLS_SCAN_TIMER=0
+DO_AGENT_SKILLS=0
 INSTALL_FLAGS_WERE_SUPPLIED=0
 WITH_COMPLETIONS=0
 
@@ -108,12 +114,15 @@ resolve_real_go() {
 
 usage() {
   cat <<'EOF'
-usage: bash install.sh [--all] [--run] [--audit] [--wrappers] [--no-wrappers] [--review-timer] [--tools-scan-timer] [--uninstall]
+usage: bash install.sh [--all] [--run] [--audit] [--wrappers] [--no-wrappers] [--review-timer] [--tools-scan-timer] [--agent-skills] [--uninstall]
 
 Default is --all. --review-timer additionally installs and enables the weekly
 host-allow staleness review as a systemd user timer (opt-in; machine state).
 --tools-scan-timer installs and enables the daily tools-scan, which publishes
 advisories in installed mise tools to ~/Sync/state/tool-vulns (opt-in).
+The agent skill is installed to ~/.local/share/safe/skills/safe on every run;
+--agent-skills also links it into ~/.claude/skills and ~/.codex/skills (for
+each harness present), never over an existing entry (opt-in).
 EOF
 }
 
@@ -161,6 +170,10 @@ while [[ $# -gt 0 ]]; do
       INSTALL_FLAGS_WERE_SUPPLIED=1
       WITH_COMPLETIONS=1
       ;;
+    --agent-skills)
+      INSTALL_FLAGS_WERE_SUPPLIED=1
+      DO_AGENT_SKILLS=1
+      ;;
     --uninstall)
       exec "$REPO_DIR/uninstall.sh"
       ;;
@@ -194,6 +207,7 @@ release_follow_install_flags_json() {
   (( DO_REVIEW_TIMER )) && flags+=(--review-timer)
   (( DO_TOOLS_SCAN_TIMER )) && flags+=(--tools-scan-timer)
   (( WITH_COMPLETIONS )) && flags+=(--with-completions)
+  (( DO_AGENT_SKILLS )) && flags+=(--agent-skills)
   printf '%s\n' "${flags[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))'
 }
 
@@ -219,7 +233,8 @@ release_follow_union_install_flags_json() {
        ]) end)
     + (if any($components[]; . == "--review-timer") then ["--review-timer"] else [] end)
     + (if any($components[]; . == "--tools-scan-timer") then ["--tools-scan-timer"] else [] end)
-    + (if any($components[]; . == "--with-completions") then ["--with-completions"] else [] end)'
+    + (if any($components[]; . == "--with-completions") then ["--with-completions"] else [] end)
+    + (if any($components[]; . == "--agent-skills") then ["--agent-skills"] else [] end)'
 }
 
 record_release_follow_source() {
@@ -714,6 +729,67 @@ merge_legacy_state() {
   merge_audit_machine_data_tree "$LEGACY_SAFE_AUDIT_DATA_DIR/sbom" "$AUDIT_DATA_DIR/sbom" "$AUDIT_CONFIG_DIR/machines.json"
 }
 
+# Replace each installed skill directory as a whole: a file a newer release
+# dropped must not linger in it.
+install_agent_skills() {
+  local src skill dest tmp
+  [[ -d "$SKILL_SOURCE_DIR" ]] || die "missing agent skills source: $SKILL_SOURCE_DIR"
+  mkdir -p -- "$SKILL_TARGET_DIR"
+  for src in "$SKILL_SOURCE_DIR"/*/; do
+    skill="$(basename -- "$src")"
+    dest="$SKILL_TARGET_DIR/$skill"
+    tmp="$(mktemp -d "$SKILL_TARGET_DIR/.$skill.XXXXXX")" || die "cannot stage agent skill $skill"
+    if ! cp -R -- "$src." "$tmp/" || ! chmod -R u=rwX,go=rX -- "$tmp"; then
+      rm -rf -- "$tmp"
+      die "cannot stage agent skill $skill"
+    fi
+    rm -rf -- "$dest.previous"
+    if [[ -e "$dest" || -L "$dest" ]]; then
+      mv -- "$dest" "$dest.previous" || { rm -rf -- "$tmp"; die "cannot replace agent skill $dest"; }
+    fi
+    mv -- "$tmp" "$dest" || die "cannot install agent skill $dest"
+    rm -rf -- "$dest.previous"
+  done
+  info "installed agent skills to $SKILL_TARGET_DIR"
+}
+
+# Link every installed skill into each present harness's skill directory.
+# An entry safe did not create is never replaced: it is named and left.
+link_agent_skills() {
+  local dir root src skill link want
+  local -a dirs=()
+  if [[ -n "${SAFE_AGENT_SKILL_DIRS:-}" ]]; then
+    IFS=':' read -r -a dirs <<<"$SAFE_AGENT_SKILL_DIRS"
+  else
+    dirs=("$HOME/.claude/skills" "$HOME/.codex/skills")
+  fi
+  for dir in "${dirs[@]}"; do
+    [[ -n "$dir" ]] || continue
+    root="$(dirname -- "$dir")"
+    if [[ ! -d "$root" ]]; then
+      info "agent skills: $root absent, not linking into $dir"
+      continue
+    fi
+    mkdir -p -- "$dir"
+    for src in "$SKILL_TARGET_DIR"/*/; do
+      skill="$(basename -- "$src")"
+      link="$dir/$skill"
+      want="$SKILL_TARGET_DIR/$skill"
+      if [[ -L "$link" ]]; then
+        if [[ "$(readlink -- "$link")" == "$want" ]]; then
+          continue
+        fi
+        warn "agent skills: $link already links to $(readlink -- "$link"); left as is"
+      elif [[ -e "$link" ]]; then
+        warn "agent skills: $link already exists; left as is (remove it to let safe link its skill)"
+      else
+        ln -s -- "$want" "$link"
+        info "agent skills: linked $link"
+      fi
+    done
+  done
+}
+
 seed_file() {
   local src="$1" dst="$2"
   if [[ -e "$dst" ]]; then
@@ -789,6 +865,8 @@ install -m 0644 "$REPO_DIR/docs/contract/agent-contract.json" "$AGENT_CONTRACT_T
 # scanner contract (mise aube via AUBE_SECURITY_SCANNER, bun >= 1.3 via
 # bunfig). The gate injects the env var when this file is present.
 install -m 0644 "$REPO_DIR/share/scanner.mjs" "$CONFIG_BASE/scanner.mjs"
+install_agent_skills
+(( DO_AGENT_SKILLS )) && link_agent_skills
 safe_core_build="$(mktemp "${TMPDIR:-/tmp}/safe-core.XXXXXX" 2>/dev/null)" || die "cannot allocate safe-core build output"
 if ! (
   cd "$REPO_DIR"

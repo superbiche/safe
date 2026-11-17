@@ -193,6 +193,18 @@ rm -f "$CONFIG_BASE/agent-contract.json"
 # any host still configured to load it (bunfig, AUBE_SECURITY_SCANNER) fail
 # closed on every install until the stale module is diagnosed.
 rm -f "$CONFIG_BASE/scanner.mjs"
+# Agent skills: the installed copies, and only the harness links that point
+# at them (a skill directory or link safe did not create is left alone).
+skill_dirs=("$HOME/.claude/skills" "$HOME/.codex/skills")
+[[ -z "${SAFE_AGENT_SKILL_DIRS:-}" ]] || IFS=':' read -r -a skill_dirs <<<"$SAFE_AGENT_SKILL_DIRS"
+for skill_dir in "${skill_dirs[@]}"; do
+  for link in "$skill_dir"/*; do
+    if [[ -L "$link" && "$(readlink -- "$link")" == "$DATA_BASE/skills/"* ]]; then
+      rm -f -- "$link"
+    fi
+  done
+done
+rm -rf -- "$DATA_BASE/skills"
 if [[ "${#removed_wrappers[@]}" -gt 0 ]]; then
   info "removed gate wrappers: ${removed_wrappers[*]}"
 fi

@@ -40,6 +40,7 @@ bash install.sh --wrappers
 bash install.sh --no-wrappers
 bash install.sh --review-timer
 bash install.sh --tools-scan-timer
+bash install.sh --agent-skills
 ```
 
 `--review-timer` and `--tools-scan-timer` add opt-in systemd user timers: the
@@ -48,6 +49,15 @@ weekly host-allow staleness review ([safe-run](safe-run.md)) and the daily
 When the user systemd manager cannot be reached (as under `safe release
 follow`), the units are still installed and the installer warns with the
 `systemctl --user enable --now` command instead of failing.
+
+Every install also installs the agent skill, `~/.local/share/safe/skills/safe`
+(`SKILL.md`): what an AI coding agent needs to read a refusal, hand the operator
+a command and use the allow flows, rendered from the same agent contract as
+`safe explain`, so it changes with the release that changes the gate.
+`--agent-skills` links it into `~/.claude/skills/safe` and
+`~/.codex/skills/safe` for each harness present. It never replaces an entry it
+did not create (it names it and leaves it), `safe release follow` repeats the
+flag, and `uninstall.sh` removes the skill and only its own links.
 
 `--no-wrappers` installs the run and audit tools without generating the
 PATH gate wrappers. On an existing installation the gate library
