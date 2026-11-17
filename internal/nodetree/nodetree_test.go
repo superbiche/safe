@@ -76,7 +76,7 @@ func TestNpmLockfileTree(t *testing.T) {
 		"node_modules/@s/nested/package.json":                   pkg("@s/nested", "2.0.0"),
 		"node_modules/left-pad/node_modules/dep/package.json":   pkg("dep", "0.1.0"),
 		"node_modules/bundler/package.json":                     `{"name":"bundler","version":"1.0.0","bundleDependencies":["inside"]}`,
-		"node_modules/bundler/node_modules/inside/package.json": pkg("inside", "0.0.0-not-locked"),
+		"node_modules/bundler/node_modules/inside/package.json": pkg("inside", "9.9.9"),
 		"node_modules/alias/package.json":                       pkg("real-pkg", "4.0.0"),
 		"node_modules/.bin/pad":                                 "->../left-pad/index.js",
 		"node_modules/left-pad/index.js":                        "module.exports = 1",
@@ -85,8 +85,8 @@ func TestNpmLockfileTree(t *testing.T) {
 	})
 	r := check(t, dir, "package-lock.json")
 	wantProblems(t, r)
-	if r.Format != "npm" || r.Installed != 5 {
-		t.Fatalf("format %q installed %d, want npm 5", r.Format, r.Installed)
+	if r.Format != "npm" || r.Installed != 6 {
+		t.Fatalf("format %q installed %d, want npm 6 (bundled packages count for npm)", r.Format, r.Installed)
 	}
 
 	// A stale tree: a version the lockfile no longer pins, and a package
@@ -321,9 +321,10 @@ snapshots:
 		t.Fatalf("format %q expected %d, want pnpm 4 (the env document is not the project's)", r.Format, r.Expected)
 	}
 	os.RemoveAll(filepath.Join(dir, "node_modules/.pnpm/peer@2.0.0"))
-	// The store links that pointed at it now dangle; the missing package
-	// is the finding, not each link.
-	wantProblems(t, check(t, dir, "pnpm-lock.yaml"), "missing peer@2.0.0")
+	// The links that resolved to it now dangle too: a required package.
+	wantProblems(t, check(t, dir, "pnpm-lock.yaml"), "missing peer@2.0.0",
+		"symlink node_modules/.pnpm/a@1.0.0_peer@2.0.0/node_modules/peer -> ../../peer@2.0.0/node_modules/peer dangles in the installed tree",
+		"symlink node_modules/.pnpm/node_modules/peer -> ../peer@2.0.0/node_modules/peer dangles in the installed tree")
 }
 
 func TestPnpmOlderKeys(t *testing.T) {
@@ -530,11 +531,15 @@ func TestLooseEntryDoesNotCoverARegistryNamesake(t *testing.T) {
 func TestFileModuleIsAProblem(t *testing.T) {
 	dir := t.TempDir()
 	write(t, dir, map[string]string{
-		"package-lock.json":    `{"lockfileVersion":3,"packages":{"":{}}}`,
-		"node_modules/evil.js": "module.exports = 1",
-		"node_modules/README":  "not a module",
+		"package-lock.json":            `{"lockfileVersion":3,"packages":{"":{}}}`,
+		"node_modules/evil.js":         "module.exports = 1",
+		"node_modules/evilpkg":         "module.exports = 42",
+		"node_modules/.yarn-state.yml": "manager state",
 	})
-	wantProblems(t, check(t, dir, "package-lock.json"), "node_modules/evil.js is a file module the lockfile does not describe")
+	// require("evilpkg") loads an extensionless file as well.
+	wantProblems(t, check(t, dir, "package-lock.json"),
+		"node_modules/evil.js is a file module the lockfile does not describe",
+		"node_modules/evilpkg is a file module the lockfile does not describe")
 }
 
 func TestDanglingLinkInsideTheTreeIsAProblem(t *testing.T) {
@@ -567,4 +572,82 @@ func TestBunWorkspacesSectionGivesRoots(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantProblems(t, check(t, dir, "bun.lock"), "missing tiny@2.0.0")
+}
+
+// Round 2 (2026-11-17).
+
+func TestNodeGypExceptionIsTheInterpreterLinkOnly(t *testing.T) {
+	src, dst, elsewhere := t.TempDir(), t.TempDir(), t.TempDir()
+	lock := `{"lockfileVersion":3,"packages":{"":{},"node_modules/a":{"version":"1.0.0"}}}`
+	write(t, src, map[string]string{
+		"package-lock.json":                              lock,
+		"node_modules/a/package.json":                    pkg("a", "1.0.0"),
+		"node_modules/a/build/node_gyp_bins/python3":     "->" + elsewhere + "/bin/python3.12",
+		"node_modules/a/build/node_gyp_bins/payload.js":  "->" + elsewhere + "/evil.js",
+		"node_modules/a/build/node_gyp_bins/sub/python3": "->" + elsewhere + "/evil",
+	})
+	write(t, dst, map[string]string{"package-lock.json": lock})
+	r, err := Check(Options{Lockfile: filepath.Join(dst, "package-lock.json"), Source: src, Target: dst, Modules: []string{"node_modules"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantProblems(t, r,
+		"symlink node_modules/a/build/node_gyp_bins/payload.js -> "+elsewhere+"/evil.js is absolute and points outside the project",
+		"symlink node_modules/a/build/node_gyp_bins/sub/python3 -> "+elsewhere+"/evil is absolute and points outside the project")
+}
+
+func TestBerryNegatedAndUnknownConditions(t *testing.T) {
+	if berryConditionsHold("!os=" + hostOS) {
+		t.Fatal("a negated condition naming this machine must not hold")
+	}
+	if !berryConditionsHold("!os=plan9") {
+		t.Fatal("a negated foreign condition must hold")
+	}
+	if !berryConditionsHold("future=thing") {
+		t.Fatal("an unknown condition must keep the package required")
+	}
+}
+
+func TestRecursiveWorkspaceGlobHasNoDepthCap(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, map[string]string{
+		"package.json":               `{"private":true,"workspaces":["pk/**"]}`,
+		"pk/a/b/c/d/ui/package.json": `{"name":"ui","dependencies":{"tiny":"^2.0.0"}}`,
+		"yarn.lock":                  "# yarn lockfile v1\n\n\ntiny@^2.0.0:\n  version \"2.0.0\"\n",
+	})
+	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wantProblems(t, check(t, dir, "yarn.lock"), "missing tiny@2.0.0")
+}
+
+func TestNpmBundledVersionIsChecked(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, map[string]string{
+		"package-lock.json": `{"lockfileVersion":3,"packages":{"":{},"node_modules/bundler":{"version":"1.0.0"},
+			"node_modules/bundler/node_modules/inside":{"version":"1.0.0","inBundle":true},
+			"node_modules/bundler/node_modules/lodash":{"version":"4.17.21","inBundle":true},
+			"node_modules/lodash":{"version":"4.17.21"}}}`,
+		"node_modules/bundler/package.json":                     `{"name":"bundler","version":"1.0.0","dependencies":{"inside":"1"},"bundleDependencies":["inside"]}`,
+		"node_modules/bundler/node_modules/inside/package.json": `{"name":"inside","version":"1.0.0","dependencies":{"lodash":"^4"}}`,
+		"node_modules/bundler/node_modules/lodash/package.json": pkg("lodash", "3.0.0-evil"),
+		"node_modules/lodash/package.json":                      pkg("lodash", "4.17.21"),
+	})
+	wantProblems(t, check(t, dir, "package-lock.json"), "not in the lockfile: lodash@3.0.0-evil")
+}
+
+func TestPnpmHoistOrphanLinkMayDangle(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, map[string]string{
+		"package.json":   `{"dependencies":{"a":"1.0.0"}}`,
+		"pnpm-lock.yaml": "lockfileVersion: '9.0'\n\npackages:\n\n  a@1.0.0:\n    resolution: {integrity: sha512-a}\n\nsnapshots:\n\n  a@1.0.0: {}\n",
+		"node_modules/a": "->.pnpm/a@1.0.0/node_modules/a",
+		"node_modules/.pnpm/a@1.0.0/node_modules/a/package.json": pkg("a", "1.0.0"),
+		// Left by an earlier install: nothing pins old@0.1.0.
+		"node_modules/.pnpm/node_modules/old": "->../old@0.1.0/node_modules/old",
+		// A dependency link of a package must resolve.
+		"node_modules/.pnpm/a@1.0.0/node_modules/b": "->../../b@9.9.9/node_modules/b",
+	})
+	wantProblems(t, check(t, dir, "pnpm-lock.yaml"),
+		"symlink node_modules/.pnpm/a@1.0.0/node_modules/b -> ../../b@9.9.9/node_modules/b dangles in the installed tree")
 }

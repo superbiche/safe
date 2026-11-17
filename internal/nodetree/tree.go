@@ -84,13 +84,13 @@ func Check(o Options) (Report, error) {
 			r.Problems = append(r.Problems, fmt.Sprintf("%s is a symlink or not a directory", rel))
 			continue
 		}
-		pk, problems, err := listPackages(dir, rel, exclude, true, nil)
+		pk, problems, err := listPackages(dir, rel, exclude, true, nil, lf.Format != "npm")
 		if err != nil {
 			return Report{}, err
 		}
 		found = append(found, pk...)
 		r.Problems = append(r.Problems, problems...)
-		lp, err := checkLinks(o, rel, exclude)
+		lp, err := checkLinks(o, rel, exclude, optionalSet(lf.Entries), uniqueEntries(lf.Entries))
 		if err != nil {
 			return Report{}, err
 		}
@@ -203,13 +203,23 @@ func workspacePatterns(project string) ([]string, error) {
 	var kept []string
 	for _, p := range out {
 		if p = strings.TrimSuffix(strings.TrimPrefix(p, "./"), "/"); p != "" && !strings.HasPrefix(p, "!") {
-			// filepath.Glob has no "**": a recursive pattern is read at
-			// its first level and below, one level at a time, up to four.
-			if strings.Contains(p, "**") {
-				base := p[:strings.Index(p, "**")]
-				for depth, g := 0, "*"; depth < 4; depth, g = depth+1, g+"/*" {
-					kept = append(kept, base+g)
-				}
+			// filepath.Glob has no "**": every folder under the literal
+			// prefix is a candidate; those without a package.json add
+			// nothing.
+			if i := strings.Index(p, "**"); i >= 0 {
+				base := filepath.Join(project, p[:i])
+				_ = filepath.WalkDir(base, func(q string, d fs.DirEntry, err error) error {
+					if err != nil || !d.IsDir() {
+						return nil
+					}
+					if d.Name() == "node_modules" || strings.HasPrefix(d.Name(), ".") && q != base {
+						return filepath.SkipDir
+					}
+					if rel, err := filepath.Rel(project, q); err == nil {
+						kept = append(kept, rel)
+					}
+					return nil
+				})
 				continue
 			}
 			kept = append(kept, p)
@@ -223,12 +233,13 @@ func workspacePatterns(project string) ([]string, error) {
 var storeDirs = map[string]bool{".pnpm": true, ".bun": true}
 
 // moduleFile: a regular file Node resolves as a module from node_modules
-// (require("x") finds node_modules/x.js).
+// (require("x") finds node_modules/x, x.js, x.json...). No manager writes a
+// file at package position, extensionless ones included.
 var moduleFile = map[string]bool{".js": true, ".cjs": true, ".mjs": true, ".json": true, ".node": true}
 
 // listPackages reads the packages of one node_modules directory. skip names
 // the bundled dependencies of the package that owns it.
-func listPackages(dir, rel string, exclude map[string]bool, top bool, skip map[string]bool) ([]installed, []string, error) {
+func listPackages(dir, rel string, exclude map[string]bool, top bool, skip map[string]bool, honorBundles bool) ([]installed, []string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, nil, err
@@ -246,7 +257,7 @@ func listPackages(dir, rel string, exclude map[string]bool, top bool, skip map[s
 			continue
 		}
 		switch {
-		case e.Type().IsRegular() && !strings.HasPrefix(name, ".") && moduleFile[filepath.Ext(name)]:
+		case e.Type().IsRegular() && !strings.HasPrefix(name, ".") && (moduleFile[filepath.Ext(name)] || filepath.Ext(name) == ""):
 			problems = append(problems, fmt.Sprintf("%s is a file module the lockfile does not describe", filepath.Join(rel, name)))
 		case storeDirs[name] && e.IsDir():
 			ids, err := os.ReadDir(filepath.Join(dir, name))
@@ -261,7 +272,7 @@ func listPackages(dir, rel string, exclude map[string]bool, top bool, skip map[s
 				if fi, err := os.Lstat(nm); err != nil || !fi.IsDir() {
 					continue
 				}
-				pk, pr, err := listPackages(nm, filepath.Join(rel, name, id.Name(), "node_modules"), nil, false, nil)
+				pk, pr, err := listPackages(nm, filepath.Join(rel, name, id.Name(), "node_modules"), nil, false, nil, honorBundles)
 				for i := range pk {
 					pk[i].store = true
 				}
@@ -280,16 +291,16 @@ func listPackages(dir, rel string, exclude map[string]bool, top bool, skip map[s
 				if skip[name+"/"+s.Name()] {
 					continue
 				}
-				if s.Type().IsRegular() && moduleFile[filepath.Ext(s.Name())] {
+				if s.Type().IsRegular() && (moduleFile[filepath.Ext(s.Name())] || filepath.Ext(s.Name()) == "") {
 					problems = append(problems, fmt.Sprintf("%s is a file module the lockfile does not describe", filepath.Join(rel, name, s.Name())))
 					continue
 				}
-				if err := add(readPackage(filepath.Join(dir, name, s.Name()), filepath.Join(rel, name, s.Name()), s)); err != nil {
+				if err := add(readPackage(filepath.Join(dir, name, s.Name()), filepath.Join(rel, name, s.Name()), s, honorBundles)); err != nil {
 					return nil, nil, err
 				}
 			}
 		default:
-			if err := add(readPackage(filepath.Join(dir, name), filepath.Join(rel, name), e)); err != nil {
+			if err := add(readPackage(filepath.Join(dir, name), filepath.Join(rel, name), e, honorBundles)); err != nil {
 				return nil, nil, err
 			}
 		}
@@ -297,7 +308,7 @@ func listPackages(dir, rel string, exclude map[string]bool, top bool, skip map[s
 	return out, problems, nil
 }
 
-func readPackage(dir, rel string, e fs.DirEntry) ([]installed, []string, error) {
+func readPackage(dir, rel string, e fs.DirEntry, honorBundles bool) ([]installed, []string, error) {
 	// A symlink is either an alias to a package counted where it lives, or
 	// a link to a workspace folder; checkLinks decides whether it holds.
 	if e.Type()&fs.ModeSymlink != 0 || !e.IsDir() {
@@ -329,14 +340,20 @@ func readPackage(dir, rel string, e fs.DirEntry) ([]installed, []string, error) 
 	// Bundled dependencies ship inside the package's own tarball and are
 	// not lockfile entries for every manager: those the package names are
 	// its own; anything else nested beside them is checked as usual.
+	// npm's lockfile pins bundled packages (inBundle) with their versions,
+	// so an npm tree checks them like any other; other lockfiles do not
+	// record them, and only there are they skipped.
 	nested := filepath.Join(dir, "node_modules")
-	skip := bundled(pj.Bundle, pj.Dependencies)
-	for name := range bundled(pj.Bundled, pj.Dependencies) {
-		skip[name] = true
+	skip := map[string]bool{}
+	if honorBundles {
+		skip = bundled(pj.Bundle, pj.Dependencies)
+		for name := range bundled(pj.Bundled, pj.Dependencies) {
+			skip[name] = true
+		}
+		bundleClosure(nested, skip)
 	}
-	bundleClosure(nested, skip)
 	if fi, err := os.Lstat(nested); err == nil && fi.IsDir() {
-		pk, pr, err := listPackages(nested, filepath.Join(rel, "node_modules"), nil, false, skip)
+		pk, pr, err := listPackages(nested, filepath.Join(rel, "node_modules"), nil, false, skip, honorBundles)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -403,7 +420,7 @@ func bundled(raw json.RawMessage, deps map[string]string) map[string]bool {
 // sit in the target: inside a copied modules directory it travels with the
 // copy; inside the project (a workspace package) it must exist there and
 // stay there physically; anything else would dangle or reach outside.
-func checkLinks(o Options, rel string, exclude map[string]bool) ([]string, error) {
+func checkLinks(o Options, rel string, exclude map[string]bool, optional, known map[string]bool) ([]string, error) {
 	var problems []string
 	targetReal, err := filepath.EvalSymlinks(o.Target)
 	if err != nil {
@@ -448,7 +465,7 @@ func checkLinks(o Options, rel string, exclude map[string]bool) ([]string, error
 			// the copied tree, which the baseline cannot see.
 			if within(dest, o.Source) || within(dest, o.Target) || within(dest, sourceReal) || within(dest, targetReal) {
 				problems = append(problems, fmt.Sprintf("symlink %s -> %s is absolute and points into a checkout", where, dest))
-			} else if !systemPath(dest) && !strings.Contains("/"+filepath.ToSlash(where), "/build/node_gyp_bins/") {
+			} else if !systemPath(dest) && !nodeGypInterpreter(where, dest) {
 				problems = append(problems, fmt.Sprintf("symlink %s -> %s is absolute and points outside the project", where, dest))
 			}
 			return nil
@@ -457,11 +474,14 @@ func checkLinks(o Options, rel string, exclude map[string]bool) ([]string, error
 		if inModules(logical) {
 			// It travels with the copy: it must resolve in the tree copied.
 			// An isolated layout links every optional dependency, installed
-			// or skipped for this platform; a required one missing from the
-			// store is already a missing package.
-			inStore := strings.Contains(filepath.ToSlash(dest), "/.pnpm/") || strings.Contains(filepath.ToSlash(where), "/.pnpm/") ||
-				strings.Contains(filepath.ToSlash(dest), "/.bun/") || strings.Contains(filepath.ToSlash(where), "/.bun/")
-			if _, err := os.Stat(filepath.Join(o.Source, filepath.Dir(where), dest)); err != nil && !inStore {
+			// or skipped for this platform: only a link into the virtual
+			// store, to a package the lockfile holds as optional, may dangle.
+			// pnpm's hidden hoisting folder (.pnpm/node_modules) also keeps
+			// links to orphans of earlier installs, which nothing pins.
+			resolved := filepath.Join(o.Source, filepath.Dir(where), dest)
+			pkg := storePackage(resolved)
+			hoistOrphan := pkg != "" && !known[pkg] && inHoistDir(where)
+			if _, err := os.Stat(resolved); err != nil && !optional[pkg] && !hoistOrphan {
 				problems = append(problems, fmt.Sprintf("symlink %s -> %s dangles in the installed tree", where, dest))
 			}
 			return nil
@@ -482,6 +502,62 @@ func checkLinks(o Options, rel string, exclude map[string]bool) ([]string, error
 		return nil
 	})
 	return problems, err
+}
+
+// nodeGypInterpreter: node-gyp links the Python it built with as
+// <package>/build/node_gyp_bins/python3; nothing loads it at run time. Only
+// that exact link, to a python binary, is exempt.
+func nodeGypInterpreter(where, dest string) bool {
+	where = filepath.ToSlash(where)
+	return strings.HasSuffix(where, "/build/node_gyp_bins/python3") &&
+		strings.HasPrefix(filepath.Base(dest), "python")
+}
+
+// optionalSet: the name@version of every entry a complete install may lack.
+func optionalSet(entries []Entry) map[string]bool {
+	required := map[string]bool{}
+	for _, e := range entries {
+		if !e.Optional {
+			required[e.Name+"@"+e.Version] = true
+		}
+	}
+	out := map[string]bool{}
+	for _, e := range entries {
+		if key := e.Name + "@" + e.Version; e.Optional && !required[key] {
+			out[key] = true
+		}
+	}
+	return out
+}
+
+// inHoistDir: the link sits in a virtual store's hidden hoisting folder.
+func inHoistDir(where string) bool {
+	parts := strings.Split(filepath.ToSlash(where), "/")
+	for i := 0; i+2 < len(parts); i++ {
+		if parts[i] == "node_modules" && storeDirs[parts[i+1]] && parts[i+2] == "node_modules" {
+			return true
+		}
+	}
+	return false
+}
+
+// storePackage reads the name@version of the virtual-store folder a path
+// lies in (node_modules/.pnpm/@scope+name@1.0.0_peer/...); "" when none.
+func storePackage(p string) string {
+	parts := strings.Split(filepath.ToSlash(p), "/")
+	for i := 0; i+2 < len(parts); i++ {
+		if parts[i] != "node_modules" || !storeDirs[parts[i+1]] {
+			continue
+		}
+		id := strings.Replace(parts[i+2], "+", "/", 1)
+		if j := strings.IndexAny(id, "(_"); j > 0 {
+			id = id[:j]
+		}
+		if name, version := splitDescriptor(id); version != "" {
+			return name + "@" + version
+		}
+	}
+	return ""
 }
 
 // systemPrefixes hold what the operating system installs, the same for

@@ -197,14 +197,16 @@ func loadNpm(raw []byte) (Lockfile, error) {
 			// The root and workspace package folders are the project's
 			// own sources, links are not installed copies, and bundled
 			// packages ship inside their parent's tarball.
-			if i < 0 || p.Link || p.InBundle {
+			if i < 0 || p.Link {
 				continue
 			}
 			name := p.Name
 			if name == "" {
 				name = key[i+len("node_modules/"):]
 			}
-			lf.Entries = append(lf.Entries, Entry{Name: name, Version: p.Version, Optional: p.Optional || p.DevOptional})
+			// A bundled package ships inside its parent's tarball: it may be
+			// there or not, but never in another version.
+			lf.Entries = append(lf.Entries, Entry{Name: name, Version: p.Version, Optional: p.Optional || p.DevOptional || p.InBundle})
 		}
 		return lf, nil
 	}
@@ -753,8 +755,18 @@ func berryConditionsHold(conditions string) bool {
 	for _, alt := range strings.Split(conditions, "|") {
 		holds := true
 		for _, term := range strings.Split(alt, "&") {
-			k, v, ok := strings.Cut(strings.Trim(strings.TrimSpace(term), "()"), "=")
-			if ok && !platformAllows(strings.TrimSpace(k), []string{strings.TrimSpace(v)}) {
+			term = strings.Trim(strings.TrimSpace(term), "()")
+			negated := strings.HasPrefix(term, "!")
+			k, v, ok := strings.Cut(strings.TrimPrefix(term, "!"), "=")
+			k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+			if !ok || (k != "os" && k != "cpu" && k != "libc") {
+				// Unknown syntax holds: the package stays required.
+				continue
+			}
+			if negated {
+				v = "!" + v
+			}
+			if !platformAllows(k, []string{v}) {
 				holds = false
 			}
 		}
