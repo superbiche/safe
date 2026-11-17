@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.75.0 - 2026-11-18
+
 - A project scan with no verdict is one terminus (operator ruling 2026-11-17).
   The install gates used to refuse only when `safe audit repo-audit` failed
   outright; a scan that exited 0 without a readable result document, or a gate
