@@ -221,18 +221,21 @@ read from the document's `audit_totals.by_ecosystem`, plus every finding the
 scanners could not attribute to an ecosystem: a `yarn install` does not stop on
 a PHP advisory it cannot change. Critical findings of the project's other
 ecosystems are named on stderr, never dropped silently. A document without that
-breakdown, or whose breakdown does not add up to its total, gates on the total. Non-critical scan failures warn and continue, and a
-scanner that ran and failed is named in that warning rather than passing
-silently: the install proceeds, but what was not checked is said out loud. The
-same holds when no verdict can be read at all — an unwritable result
-destination, or a scan that produced no readable document: the preflight says
-the project was not audit-gated instead of treating silence as a clean result,
-and it never describes infrastructure breakage as a vulnerability finding. A
-scan that fails **outright** (a non-zero exit — required scanners missing is the
-common case) is audit-infrastructure breakage: an interactive shell says so and
-proceeds, but a non-interactive shell has no operator to weigh that and refuses
-with exit 100, mirroring the projected-dependency scan guard rather than letting
-an unaudited install through.
+breakdown, or whose breakdown does not add up to its total, gates on the total. A scanner that ran
+and failed does not stop the install, and it is named in a warning rather than
+passing silently: the install proceeds, but what was not checked is said out
+loud.
+
+A scan that produced **no verdict at all** is different, and it is one terminus
+whatever the cause (ruled 2026-11-17): the scan failed outright (a non-zero exit
+— required scanners missing is the common case), it exited 0 without a readable
+result document, or the gate had nowhere to write that document. This is
+audit-infrastructure breakage; the preflight never treats the silence as a clean
+result and never describes it as a vulnerability finding. At the operator's
+terminal it says the project was not audit-gated and proceeds. A session with no
+operator has no one to weigh that and is refused with exit 100, mirroring the
+projected-dependency scan guard rather than letting an unaudited install
+through; the operator's lane is the same command at their terminal.
 
 ## Wrapped Package Installs
 

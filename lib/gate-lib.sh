@@ -1531,6 +1531,24 @@ safe_gate_scan_scope() {
   esac
 }
 
+# The one terminus for a project scan that produced no verdict, whatever the
+# reason ($1): the scan failed outright, exited 0 without a readable result
+# document, or had nowhere to write one (operator ruling 2026-11-17). An
+# operator at their terminal sees the warning and the install proceeds — that
+# is their override lane. A session with no operator has no one to weigh it,
+# and a gate that could not audit must never pass the install silently: it is
+# audit-infrastructure breakage to fix, never a clean tree and never a package
+# finding. Refuses with one line and exit 100.
+safe_gate_scan_no_verdict() {
+  local what="$1"
+  if safe_gate_operator_terminal; then
+    safe_gate_tty_printf '%s\n' "safe install: ${what}; the project was NOT audit-gated — safe doctor; proceeding"
+    return 0
+  fi
+  safe_gate_err "safe: BLOCKED install — ${what} (audit-infrastructure breakage, not a package finding); the project was NOT audit-gated; fix the scanner and retry — safe doctor; details: safe explain"
+  return 100
+}
+
 safe_gate_scan_project() {
   local scan_output
   local scan_status
@@ -1563,11 +1581,14 @@ safe_gate_scan_project() {
   fi
   if [[ -z "${result_file}" ]]; then
     # Without a private destination there is no verdict to read, and a scan
-    # that exits 0 says nothing about what it found. Say that plainly rather
-    # than treating "no answer" as "clean".
-    safe_gate_err "safe install: cannot allocate a scan result file (TMPDIR and ${fallback_dir} both unwritable); the project was NOT audit-gated — safe doctor"
-    "${SAFE_GATE_AUDIT_BIN}" repo-audit . --deps-only --allow-missing-tools ${scan_req_args[@]+"${scan_req_args[@]}"} 2>&1 || true
-    return 0
+    # that exits 0 says nothing about what it found: "no answer" is never
+    # "clean". The operator still gets the scan's report to weigh; a session
+    # with no operator has nothing to decide from, so the scan is not run.
+    if safe_gate_operator_terminal; then
+      "${SAFE_GATE_AUDIT_BIN}" repo-audit . --deps-only --allow-missing-tools ${scan_req_args[@]+"${scan_req_args[@]}"} 2>&1 || true
+    fi
+    safe_gate_scan_no_verdict "cannot allocate a scan result file (TMPDIR and ${fallback_dir} both unwritable)"
+    return $?
   fi
 
   # --deps-only: the preflight only cares about the dependency evidence the
@@ -1651,8 +1672,13 @@ safe_gate_scan_project() {
 
   if (( scan_status == 0 )); then
     if (( have_verdict == 0 )); then
-      safe_gate_err "safe install: safe audit repo-audit produced no readable result; the project was NOT audit-gated — safe doctor"
-      return 0
+      # Exit 0 without a readable document is a scan that did not report: the
+      # same missing verdict as a scan that failed outright, and the same
+      # terminus (operator ruling 2026-11-17). The word "critical" in its
+      # output proves nothing here — a successful scan's summary prints it
+      # with a count — so the output is not read for it.
+      safe_gate_scan_no_verdict "safe audit repo-audit produced no readable result"
+      return $?
     fi
     # A scanner that broke does not stop an install — the documented policy is
     # that non-critical scan failures warn and continue — but it is never
@@ -1676,17 +1702,7 @@ safe_gate_scan_project() {
 
   # The scan failed outright (a non-zero exit — required scanners missing is
   # the common case) and said nothing about criticals, so there is no verdict.
-  # An interactive operator can see the warning and choose to proceed; a
-  # non-interactive shell has no one to weigh that, and a gate that cannot
-  # audit must never silently pass the install. In non-TTY this is
-  # audit-infrastructure breakage to fix, not a clean tree — fail closed with a
-  # recovery path, mirroring the projected-dependency scan guard.
-  if safe_gate_operator_terminal; then
-    safe_gate_tty_printf '%s\n' "safe install: safe audit repo-audit failed with exit ${scan_status}; the project was not fully audited — safe doctor; proceeding"
-    return 0
-  fi
-  safe_gate_err "safe: BLOCKED install — safe audit repo-audit failed with exit ${scan_status} (audit-infrastructure breakage, not a package finding); fix the scanner and retry — safe doctor; details: safe explain"
-  return 100
+  safe_gate_scan_no_verdict "safe audit repo-audit failed with exit ${scan_status}"
 }
 
 # Prefer npm-shrinkwrap.json because npm treats it as the authoritative lock;

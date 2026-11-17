@@ -175,3 +175,21 @@ PATH="$TEST_ROOT/bigerr-bin:$PATH" grype_db_health_json local "$TEST_ROOT/bigerr
 [[ ! -s "$TEST_ROOT/bigerr.err" ]] || fail 'large grype stderr emitted an error'
 jq -e '.healthy == false and .status == "error" and .exit_code == 1 and (.stderr | length) == 200000' "$TEST_ROOT/bigerr-health.json" >/dev/null || fail 'large grype stderr not preserved'
 pass 'large scanner stderr survives without a process argument'
+
+# A result document that cannot be assembled is a scan with no verdict: the
+# scan fails. The scan paths record this function's status with `||`, which
+# turns errexit off inside it, so a failed step used to leave an empty
+# snapshot behind while the scan still exited 0.
+SCAN_RESULT_OUT="$TEST_ROOT/unassembled-result.json"
+unassembled_rc=0
+(
+  build_delta_json() { return 1; }
+  rc=0
+  build_scan_result_from_artifacts unassembled /fixture local-direct "$TEST_ROOT/sbom.json" "$TEST_ROOT/empty-osv.json" "$TEST_ROOT/empty-grype.json" "$TEST_ROOT/empty-audits.json" deps || rc=$?
+  exit "$rc"
+) > "$TEST_ROOT/unassembled.txt" 2> "$TEST_ROOT/unassembled.err" || unassembled_rc=$?
+[[ "$unassembled_rc" -ne 0 ]] || fail 'a scan that could not assemble its result exited 0'
+grep -qF 'cannot assemble the scan result document' "$TEST_ROOT/unassembled.err" || fail 'unassembled result not reported'
+[[ ! -e "$SCAN_RESULT_OUT" ]] || fail 'an unassembled result was delivered to --result-out'
+[[ ! -e "$RESULTS_DIR/unassembled/$(today_date)-scan.json" ]] || fail 'an unassembled result was published'
+pass 'a result that cannot be assembled fails the scan instead of exiting 0'
