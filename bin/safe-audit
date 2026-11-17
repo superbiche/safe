@@ -37,7 +37,9 @@ SCAN_CACHE_TTL_SECONDS="${SAFE_AUDIT_SCAN_CACHE_TTL_SECONDS:-86400}"
 #     the composer lane this version intended to recompute.
 #   3: cargo-audit only reads an explicit existing lockfile; missing locks
 #     report missing coverage rather than invoking Cargo to generate evidence.
-SCAN_CACHE_SCHEMA=3
+#   4: audit_totals carries by_ecosystem; replaying an older document would
+#     make every install gate fall back to the project-wide total.
+SCAN_CACHE_SCHEMA=4
 CHECKS_DIR="$DATA_DIR/checks"
 SOCKET_CACHE_SCHEMA=1
 SOCKET_CACHE_STALE_SCORE=""
