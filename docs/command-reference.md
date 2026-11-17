@@ -289,8 +289,7 @@ the receipt records as `operator_override`:
 | Inventory | `vendor/composer/installed.json` does not list exactly the lockfile's packages (dev packages count when the source was installed with them), or is not in the Composer 2 format |
 | Tree | a package has no install path, or its directory is missing or outside `vendor/` |
 | Autoloader | `vendor/autoload.php` or `vendor/composer/autoload_real.php` is missing |
-| Links | a symlink in the copied tree is absolute or leaves the project (also through another link in the target), or reaches a path repository that is absent in the target or whose package name or autoload rules differ there |
-| Autoload rules | the root `autoload`/`autoload-dev` sections of `composer.json` differ, so the copied autoloader is wrong until `composer dump-autoload` runs |
+| Links | a symlink in the copied tree is absolute or leaves the project (also through another link in the target), or reaches a path repository that is absent in the target or holds another package there |
 | Integrity | the tree changed since its baseline (below), its baseline record is unreadable, or a file cannot be read and hashed |
 
 For a Node project `safe-core node-tree` checks the tree against the lockfile.
@@ -311,6 +310,15 @@ the root `node_modules/` and each workspace package's own (a tracked
 (`.cache`, `.vite`, `.vite-temp`), plus Yarn Berry's `.yarn/install-state.gz`.
 Root lifecycle scripts (`preinstall`, `install`, `postinstall`, `prepare`) do
 not run; the output and the receipt name the ones `package.json` declares.
+
+The copied autoloader is not this checkout's yet. Composer's generated
+autoloader also encodes the root project: its `autoload`/`autoload-dev` rules,
+the same rules of path-repository packages, and, with `optimize-autoloader`, a
+class map of the source branch's own classes. That is project code, not a
+dependency, so it is no evidence gap: every Composer reuse ends with
+`next: composer dump-autoload` (marked required when the root rules differ),
+and the receipt records `root_autoload` and `next_steps`. `composer
+dump-autoload` is not gated; reuse does not run it, as it runs no `php`.
 
 Only what the inventory describes is copied: `vendor/composer`, the
 autoloader and other top-level generated files, `vendor/bin`, and each
