@@ -117,6 +117,28 @@ risk context, then the registry.
   projects only. The npm diff document is too narrow to generalise. The
   delegate must install the projected result, not resolve again. Order: npm,
   pnpm, Bun, Yarn Berry, Composer, uv, Cargo, Go.
+- Operator, 2026-11-18,
+  [differential gate rule](https://superbiche.fibery.io/Superbiche/Tasks/1500):
+  a project command is judged on the set it introduces, direct or transitive.
+  Malice signals gate wherever they are found. An advisory gates only when
+  introduced, with (package name, advisory id) as identity; one that was
+  already there is accepted because it was already there, and is reported. No
+  arithmetic between fixed and introduced. The whole-project scan becomes a
+  report. Coordinator's reading, open to the operator: with no lockfile the
+  baseline is empty and the whole closure is audited; a projection that cannot
+  run keeps today's gate.
+- [Binding prototype on npm](https://superbiche.fibery.io/Superbiche/Tasks/1509),
+  2026-11-18: without binding the installed graph drifts from the audited one
+  (4 of 67 packages over two months for an add, 2 for an update over three
+  weeks). Bind by consuming the projected lockfile: write the projected
+  manifests and lockfile, then run a locked materialisation (`npm ci`, or
+  `npm ci --dry-run` then a plain `npm install`), and compare lockfile and tree
+  afterwards. The user's verb is never run again: `npm update` on a seeded
+  lockfile resolves again. Projection costs 0.2 to 0.6 s for one more
+  dependency and 4 to 15 s for a full re-resolution of 950 entries; today's
+  gate dominates the wall clock. Workspace members, `file:` directories and git
+  dependencies are not bound by a lockfile. The `npm dedupe` / `npm prune` lane
+  moves to the same shape with the first slice.
 
 ## Not yet specified
 
@@ -140,11 +162,11 @@ risk context, then the registry.
 - The Go migration itself.
 - Operating the cluster services the origin or a registry would need.
 
-## Tickets (index at export time, 2026-11-18)
+## Tickets (index at export time, 2026-11-18, third export)
 
 - [Prior art survey](https://superbiche.fibery.io/Superbiche/Tasks/1498) — research, CLOSED 2026-11-18.
 - [Lockfile projection per package manager](https://superbiche.fibery.io/Superbiche/Tasks/1499) — research, CLOSED 2026-11-18.
-- [What gates a project update or add under the differential gate](https://superbiche.fibery.io/Superbiche/Tasks/1500) — grilling, open. First slice.
+- [What gates a project update or add under the differential gate](https://superbiche.fibery.io/Superbiche/Tasks/1500) — grilling, CLOSED 2026-11-18 (operator ruling). First slice.
 - [Lane selection and the first-seen boundary](https://superbiche.fibery.io/Superbiche/Tasks/1501) — grilling, open.
 - [Version targeting and cooldown](https://superbiche.fibery.io/Superbiche/Tasks/1502) — grilling, open.
 - [Operator and agent: identification, and where decisions arrive](https://superbiche.fibery.io/Superbiche/Tasks/1503) — grilling, open.
@@ -153,4 +175,4 @@ risk context, then the registry.
 - [Decontamination origin: where it runs, what it holds, what validated means](https://superbiche.fibery.io/Superbiche/Tasks/1506) — grilling, open, blocked by the dry run.
 - [Host update path for habitual tooling](https://superbiche.fibery.io/Superbiche/Tasks/1507) — grilling, open, blocked by the origin ticket.
 - [Package registry on the cluster: custody of validated bytes](https://superbiche.fibery.io/Superbiche/Tasks/1508) — grilling, open, blocked by the origin ticket.
-- [Binding the audited projection to the real command](https://superbiche.fibery.io/Superbiche/Tasks/1509) — prototype, open; starts on the operator's go.
+- [Binding the audited projection to the real command](https://superbiche.fibery.io/Superbiche/Tasks/1509) — prototype, CLOSED 2026-11-18.
