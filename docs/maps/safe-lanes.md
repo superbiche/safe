@@ -139,6 +139,17 @@ risk context, then the registry.
   gate dominates the wall clock. Workspace members, `file:` directories and git
   dependencies are not bound by a lockfile. The `npm dedupe` / `npm prune` lane
   moves to the same shape with the first slice.
+- [Battery dry run](https://superbiche.fibery.io/Superbiche/Tasks/1505),
+  2026-11-18: one day's seven outdated npm tools cost about two minutes and
+  under 1 GB of scratch, with no Socket call (an unattended session cannot
+  obtain one for a fresh release). Every candidate is fresh and stops at
+  today's gate on its age or on the Socket consent. A scan of what was
+  installed sees advisories the root audit does not; against the installed
+  versions, six of seven updates introduce no critical or high advisory. Three
+  steps cannot run through `safe run`'s sandbox today: a host-allow pin refuses
+  another version of the tool, install scripts do not run even when asked, and
+  nothing records network destinations or file writes. Release-binary tools
+  were not covered.
 
 ## Not yet specified
 
@@ -171,8 +182,8 @@ risk context, then the registry.
 - [Version targeting and cooldown](https://superbiche.fibery.io/Superbiche/Tasks/1502) — grilling, open.
 - [Operator and agent: identification, and where decisions arrive](https://superbiche.fibery.io/Superbiche/Tasks/1503) — grilling, open.
 - [Risk context: which findings may be set aside without the operator](https://superbiche.fibery.io/Superbiche/Tasks/1504) — grilling, open.
-- [Decontamination battery dry run on one workstation's outdated tools](https://superbiche.fibery.io/Superbiche/Tasks/1505) — prototype, open; starts on the operator's go.
-- [Decontamination origin: where it runs, what it holds, what validated means](https://superbiche.fibery.io/Superbiche/Tasks/1506) — grilling, open, blocked by the dry run.
+- [Decontamination battery dry run on one workstation's outdated tools](https://superbiche.fibery.io/Superbiche/Tasks/1505) — prototype, CLOSED 2026-11-18.
+- [Decontamination origin: where it runs, what it holds, what validated means](https://superbiche.fibery.io/Superbiche/Tasks/1506) — grilling, open.
 - [Host update path for habitual tooling](https://superbiche.fibery.io/Superbiche/Tasks/1507) — grilling, open, blocked by the origin ticket.
 - [Package registry on the cluster: custody of validated bytes](https://superbiche.fibery.io/Superbiche/Tasks/1508) — grilling, open, blocked by the origin ticket.
 - [Binding the audited projection to the real command](https://superbiche.fibery.io/Superbiche/Tasks/1509) — prototype, CLOSED 2026-11-18.
