@@ -22,7 +22,9 @@ const (
 // unattended session (the gate's contract: 100 policy, 102 operator terminal
 // needed, 104 audit BLOCK). A graph safe cannot bind has no class: it is
 // refused before anything is written, with the operator's deliberate route,
-// so it reads as 102.
+// so it reads as 102. That route leads to the one-shot lane, which does not
+// judge the closure: a malice signal or a blocking advisory already known
+// here is therefore decided first, and the unbound outcome only after them.
 const (
 	ExitPolicy   = 100
 	ExitOperator = 102
@@ -233,15 +235,18 @@ func Decide(in Input) Report {
 		{Class: ClassMissingEvidence, Exit: ExitOperator, AtStake: len(report.Coverage), Outstanding: len(report.Coverage)},
 	}
 	report.Outcome = Outcome{Status: "clear"}
-	if !report.Bindability.Bound {
-		report.Outcome = Outcome{Status: "unbound", Exit: ExitOperator}
-		return report
-	}
 	for _, class := range report.Classes {
-		if class.Outstanding > 0 {
-			report.Outcome = Outcome{Status: "stopped", Class: class.Class, Exit: class.Exit}
+		if class.Outstanding == 0 {
+			continue
+		}
+		if class.Exit != ExitBlock && !report.Bindability.Bound {
 			break
 		}
+		report.Outcome = Outcome{Status: "stopped", Class: class.Class, Exit: class.Exit}
+		return report
+	}
+	if !report.Bindability.Bound {
+		report.Outcome = Outcome{Status: "unbound", Exit: ExitOperator}
 	}
 	return report
 }

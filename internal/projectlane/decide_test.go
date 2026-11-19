@@ -373,6 +373,30 @@ func TestDecide(t *testing.T) {
 					t.Fatalf("bindability = %+v", r.Bindability)
 				}
 			}},
+		{name: "a malice signal is decided before a graph safe cannot bind",
+			target: map[string]map[string]any{
+				"node_modules/p": with(entry("p", "1.0.0"), map[string]any{"integrity": nil}),
+				"node_modules/m": entry("m", "1.0.0"),
+			},
+			noBaseline: true,
+			evidence:   evidenceOf(read("p", "1.0.0"), read("m", "1.0.0", mal("MAL-2026-2"))),
+			want:       outcomeWant{"stopped", ClassMalice, ExitBlock}},
+		{name: "a blocking advisory is decided before a graph safe cannot bind",
+			target: map[string]map[string]any{
+				"node_modules/p": with(entry("p", "1.0.0"), map[string]any{"integrity": nil}),
+				"node_modules/c": entry("c", "1.0.0"),
+			},
+			noBaseline: true,
+			evidence:   evidenceOf(read("p", "1.0.0"), read("c", "1.0.0", hit("GHSA-c", "critical"))),
+			want:       outcomeWant{"stopped", ClassBlockingAdvisory, ExitBlock}},
+		{name: "an adverse advisory does not hide a graph safe cannot bind",
+			target: map[string]map[string]any{
+				"node_modules/p": with(entry("p", "1.0.0"), map[string]any{"integrity": nil}),
+				"node_modules/h": entry("h", "1.0.0"),
+			},
+			noBaseline: true,
+			evidence:   evidenceOf(read("p", "1.0.0"), read("h", "1.0.0", hit("GHSA-h", "high"))),
+			want:       outcomeWant{"unbound", "", ExitOperator}},
 		{name: "a clean graph from an empty baseline is clear and introduces everything",
 			target: pkgs("p", "1.0.0"), noBaseline: true, evidence: evidenceOf(read("p", "1.0.0")),
 			want: outcomeWant{"clear", "", 0},
