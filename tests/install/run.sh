@@ -11272,10 +11272,12 @@ case_project_lane_routing_the_lane_runs_in_a_subshell_and_hands_over_by_status()
   out="$(bash -c '
     source "$1/lib/gate-lib.sh"
     export KEEP=mine
+    trap_before="$(trap -p INT)"
     safe_gate_project_lane_run() { export LEAK=1; LEAKTOO=2; unset KEEP; trap "echo trapped" INT; SAFE_GATE_LANE_PASS=1; return 0; }
     ( safe_gate_project_lane_in_subshell ); rc=$?
-    printf "%s|%s|%s|%s|%s|%s\n" "${rc}" "${KEEP-unset}" "${LEAK-unset}" "${LEAKTOO-unset}" "$(trap -p INT)" "${SAFE_GATE_LANE_PASS-unset}"' _ "${ROOT_DIR}" 2>&1)"
-  [[ "${out}" == "253|mine|unset|unset||unset" ]] || { fail "$FUNCNAME: the lane's state reached the caller (${out})"; return; }
+    same=different; [[ "$(trap -p INT)" == "${trap_before}" ]] && same=same
+    printf "%s|%s|%s|%s|%s|%s\n" "${rc}" "${KEEP-unset}" "${LEAK-unset}" "${LEAKTOO-unset}" "${same}" "${SAFE_GATE_LANE_PASS-unset}"' _ "${ROOT_DIR}" 2>&1)"
+  [[ "${out}" == "253|mine|unset|unset|same|unset" ]] || { fail "$FUNCNAME: the lane's state reached the caller (${out})"; return; }
   # a lane status that equals the reserved one is the command's failure, never a hand-over
   out="$(bash -c '
     source "$1/lib/gate-lib.sh"
