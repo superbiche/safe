@@ -13,10 +13,15 @@
   goes on only when both readings give the same, ungated command. It covers abbreviated names, shorthands and
   clusters, `npm exec`/`x`, and the audit-only pass under `mise exec -- npm`. Global mode is read from the same
   reading (`-gf`, `--local false`, `--cache -g`). Found by the differential oracle against npm's own parser
-  (`tests/live/npm_option_oracle.sh`): `npm exec --yes true evil` audited `true`, and `npm install --filter
+  (`tests/live/npm_option_oracle.sh`): `npm exec --yes true evil` audited `true`; `npm install --filter
   evil` / `--@scope:registry http://…` skipped the package (options npm does not define are switches there);
-  `-p` is `--parseable`, not `--package`, in `npm exec`. Residual, listed in the oracle's known file: a
-  shorthand cluster whose expansion leaves a fixed word (`-Cq` installs `warn`).
+  `-p` is `--parseable`, not `--package`, in `npm exec`; `npm exec --no-package=evil` fetched a package no
+  scanner looked for (refused: `--no-` on an option that takes a value); `npm exec --package -- evil` made npm
+  fetch the package `true` (refused). An option name the snapshot does not know is read both ways, so an
+  unknown plain `--name=value` before a command the gate audits now refuses (scoped and nerf-darted keys such
+  as `--@scope:registry=…` and `--//host/:_authToken=…` are not affected). Residual, listed in the oracle's
+  known file: a shorthand cluster whose expansion leaves a fixed word (`npm install -Cq evil` also installs a
+  package named `warn`).
 - Project lane: `npm ci`, `npm dedupe` and `npm prune` (still behind `install.project_lane`). `ci` has no
   projection: its plan is the lockfile on disk, checked against the manifest by npm's own frozen check (`npm
   ci --dry-run`; a lockfile out of step or missing is npm's own error, shown as npm's, with npm's status),

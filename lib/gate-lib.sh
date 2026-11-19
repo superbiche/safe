@@ -7315,6 +7315,12 @@ safe_gate_exec_gate() {
   refuse_msg="safe: BLOCKED ${label} — cannot vet the packages named by a requirements file inline; to allow: ask the operator to review them (safe audit package-audit <pkg> --ecosystem ${ecosystem}), then retry; details: safe explain"
 
   for arg in "$@"; do
+    if (( expect_from || expect_extra )) && [[ "${arg}" =~ ^-{2,}$ ]]; then
+      # the option terminator is no value: npm reads the option as given with no value (and its parser then
+      # fetches another package than the word the gate would audit)
+      safe_gate_err "safe: BLOCKED ${label} — an option that selects the package is followed by '${arg}', which is the option terminator, not a package; to allow: name the package (--package=<spec>), then retry; details: safe explain"
+      return 100
+    fi
     if (( expect_from )); then
       from_specs+=("${arg}"); expect_from=0; continue
     fi

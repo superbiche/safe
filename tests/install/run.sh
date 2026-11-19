@@ -12582,6 +12582,18 @@ case_npm_global_mode_is_read_as_npm_reads_it() {
   pass "$FUNCNAME"
 }
 
+
+case_npm_exec_package_then_terminator_fails_closed() {
+  prepare_case "npm-exec-package-terminator"
+  # npm reads `--package --` as the option with the value true (the terminator is not a value) and fetches the
+  # package `true`: the gate does not take the terminator for the package to audit.
+  SAFE_INSTALL_TEST_SCRIPT='npm exec --package -- blockme' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'is the option terminator, not a package' "$FUNCNAME" || return
+  ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: npm was delegated to"; return; }
+  pass "$FUNCNAME"
+}
+
 main() {
   local case
   for case in \
@@ -12593,6 +12605,7 @@ main() {
     case_npm_front_door_is_free_without_an_equals_form \
     case_npm_front_door_covers_mise_exec_and_the_exec_switches \
     case_npm_global_mode_is_read_as_npm_reads_it \
+    case_npm_exec_package_then_terminator_fails_closed \
     case_refusal_message_contract \
     case_large_pinned_install_and_socket_rate_nontty \
     case_infra_only_warn_no_host_allow_and_needs_a_tty \
