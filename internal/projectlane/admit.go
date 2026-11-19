@@ -1,0 +1,710 @@
+package projectlane
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"os"
+	"regexp"
+	"sort"
+	"strings"
+
+	"github.com/superbiche/safe/internal/strictjson"
+)
+
+// Admission: before npm runs anything, every source the command, the manifest,
+// its overrides and the committed lockfile's dependency edges name must be a
+// registry package, classified the way npm classifies it (npm-package-arg's
+// decision: file, alias, URL, git shorthand, then registry version, range or
+// tag). The port is deliberately conservative: it never admits a spelling npm
+// would not take for the registry, and refuses some spellings npm would (any
+// non-ASCII text, loose semver forms). tests/live/npm_spec_oracle.sh checks it
+// against the npm that is installed.
+
+// AdmitSchema is the version of the admission document.
+const AdmitSchema = 1
+
+// Spec classes. The registry ones are Version, Range and Tag.
+const (
+	ClassVersion   = "version"
+	ClassRange     = "range"
+	ClassTag       = "tag"
+	ClassFile      = "file"
+	ClassAlias     = "alias"
+	ClassGit       = "git"
+	ClassRemote    = "remote"
+	ClassInvalid   = "invalid"
+	maxSafeInteger = uint64(9007199254740991)
+)
+
+var (
+	reURL      = regexp.MustCompile(`(?i)^(?:git[+])?[a-z]+:`)
+	reGit      = regexp.MustCompile(`(?i)^[^@]+@[^:.]+\.[^:]+:.+$`)
+	reFileType = regexp.MustCompile(`(?i)[.](?:tgz|tar\.gz|tar)$`)
+	reFileSpec = regexp.MustCompile(`^(?:[.]|~[/]|[/]|[a-zA-Z]:)`)
+
+	numeric   = `(?:0|[1-9][0-9]*)`
+	xIdent    = `(?:` + numeric + `|x|X|\*)`
+	preIdent  = `(?:[0-9]*[a-zA-Z-][a-zA-Z0-9-]*|` + numeric + `)`
+	preRel    = `(?:-(` + preIdent + `(?:\.` + preIdent + `)*))`
+	buildPart = `(?:\+([a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*))`
+	fullPlain = `v?(` + numeric + `)\.(` + numeric + `)\.(` + numeric + `)` + preRel + `?` + buildPart + `?`
+	xPlain    = `(?:v|=)*(` + xIdent + `)(?:\.(` + xIdent + `)(?:\.(` + xIdent + `)(?:` + preRel + `)?` + buildPart + `?)?)?`
+
+	reFull       = regexp.MustCompile(`^` + fullPlain + `$`)
+	reComparator = regexp.MustCompile(`^((?:<|>)?=?) ?` + xPlain + `$`)
+	reTilde      = regexp.MustCompile(`^(?:~>?)` + xPlain + `$`)
+	reCaret      = regexp.MustCompile(`^(?:\^)` + xPlain + `$`)
+	reHyphen     = regexp.MustCompile(`^` + xPlain + ` - ` + xPlain + `$`)
+	reSpaces     = regexp.MustCompile(`[ \t\n\v\f\r]+`)
+	reTrimOp     = regexp.MustCompile(`((?:<|>)=?|=) +`)
+	reTrimTilde  = regexp.MustCompile(`(~>?) +`)
+	reTrimCaret  = regexp.MustCompile(`(\^) +`)
+)
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func trimASCII(s string) string { return strings.Trim(s, " \t\n\v\f\r") }
+
+// withinSafeInteger reports whether every digit run in the text is a number
+// semver would accept (at most MAX_SAFE_INTEGER): an oversized component makes
+// npm read the spelling as a tag, never as a version or a range.
+func withinSafeInteger(s string) bool { return withinLimit(s, maxSafeInteger) }
+
+// withinLimit reports whether every digit run is at most limit.
+func withinLimit(s string, limit uint64) bool {
+	max := fmt.Sprint(limit)
+	for _, run := range regexp.MustCompile(`[0-9]+`).FindAllString(s, -1) {
+		trimmed := strings.TrimLeft(run, "0")
+		if len(trimmed) > len(max) || (len(trimmed) == len(max) && trimmed > max) {
+			return false
+		}
+	}
+	return true
+}
+
+// StrictVersion reports whether the text is a strict semantic version
+// (x.y.z[-pre][+build], no prefix, no loose form) within semver's limits.
+func StrictVersion(s string) bool {
+	return len(s) <= 256 && !strings.HasPrefix(s, "v") && reFull.MatchString(s) && withinSafeInteger(strictComponents(s))
+}
+
+// strictComponents is the part of a version whose digit runs are components
+// (the prerelease and build identifiers are text).
+func strictComponents(s string) string {
+	if i := strings.IndexAny(s, "-+"); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// strictRange reports whether the text is a semver range every comparator of
+// which parses in the strict grammar (a subset of what npm's loose reader takes).
+func strictRange(raw string) bool {
+	if len(raw) > 256 || !isASCII(raw) {
+		return false
+	}
+	norm := reSpaces.ReplaceAllString(trimASCII(raw), " ")
+	for _, set := range strings.Split(norm, "||") {
+		set = trimASCII(set)
+		if set == "" {
+			continue // the empty set is "any version"
+		}
+		if reHyphen.MatchString(set) {
+			if !withinLimit(set, maxSafeInteger-1) {
+				return false
+			}
+			continue
+		}
+		set = reTrimOp.ReplaceAllString(set, "$1")
+		set = reTrimTilde.ReplaceAllString(set, "$1")
+		set = reTrimCaret.ReplaceAllString(set, "$1")
+		for _, comparator := range strings.Split(set, " ") {
+			if comparator == "" {
+				return false
+			}
+			if !(reComparator.MatchString(comparator) || reTilde.MatchString(comparator) || reCaret.MatchString(comparator)) {
+				return false
+			}
+			// a caret, tilde or x-range computes an upper bound one above its
+			// largest component, which semver rejects past MAX_SAFE_INTEGER
+			if !withinLimit(comparator, maxSafeInteger-1) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// tagSafe is encodeURIComponent(spec) === spec.
+func tagSafe(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case strings.IndexByte("-_.!~*'()", c) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// ValidPackageName is validate-npm-package-name's validForOldPackages, narrowed
+// to ASCII: the whole name, or both halves of a scoped one, must survive
+// encodeURIComponent unchanged.
+func ValidPackageName(name string) bool {
+	if name == "" || len(name) > 214 || !isASCII(name) || name != trimASCII(name) {
+		return false
+	}
+	if name[0] == '.' || name[0] == '_' || name[0] == '-' {
+		return false
+	}
+	switch strings.ToLower(name) {
+	case "node_modules", "favicon.ico":
+		return false
+	}
+	if tagSafe(name) {
+		return true
+	}
+	if name[0] == '@' {
+		scope, pkg, ok := strings.Cut(name[1:], "/")
+		// the package half of a scoped name follows the same leading rules
+		return ok && scope != "" && pkg != "" && !strings.Contains(pkg, "/") && tagSafe(scope) && tagSafe(pkg) &&
+			pkg[0] != '.' && pkg[0] != '_' && pkg[0] != '-'
+	}
+	return false
+}
+
+// ClassifySpec classifies the spec part of a dependency (npa.resolve with the
+// name already known): file, alias, url or git, or a registry version, range or
+// tag. Text npm would reject reads as invalid.
+func ClassifySpec(spec string) string {
+	if !isASCII(spec) {
+		return ClassInvalid
+	}
+	lower := strings.ToLower(spec)
+	if strings.HasPrefix(lower, "file:") || reFileSpec.MatchString(spec) {
+		return ClassFile
+	}
+	if strings.HasPrefix(lower, "npm:") {
+		return ClassAlias
+	}
+	// Hosted-git shorthands, URLs and scp-like git all carry a colon or a slash.
+	if reURL.MatchString(spec) {
+		if strings.HasPrefix(lower, "http:") || strings.HasPrefix(lower, "https:") {
+			return ClassRemote
+		}
+		return ClassGit
+	}
+	if strings.Contains(spec, ":") || strings.Contains(spec, "/") {
+		return ClassGit
+	}
+	if reFileType.MatchString(spec) {
+		return ClassFile
+	}
+	trimmed := trimASCII(spec)
+	if trimmed == "" {
+		return ClassRange
+	}
+	switch {
+	case StrictVersion(trimmed):
+		return ClassVersion
+	case strictRange(trimmed):
+		return ClassRange
+	case tagSafe(trimmed):
+		return ClassTag
+	}
+	return ClassInvalid
+}
+
+// IsRegistry reports whether a class is one the registry resolves.
+func IsRegistry(class string) bool {
+	return class == ClassVersion || class == ClassRange || class == ClassTag
+}
+
+// ClassifyArg classifies a command-line package argument the way npa(arg)
+// reads it. It returns the class, and the name and spec it split into ("" when
+// the argument names no package).
+func ClassifyArg(arg string) (class, name, spec string) {
+	if !isASCII(arg) {
+		return ClassInvalid, "", ""
+	}
+	nameEnds := -1
+	if len(arg) > 1 {
+		if i := strings.Index(arg[1:], "@"); i >= 0 {
+			nameEnds = i + 1
+		}
+	}
+	namePart := arg
+	if nameEnds > 0 {
+		namePart = arg[:nameEnds]
+	}
+	switch {
+	case reURL.MatchString(arg):
+		return ClassifySpec(arg), "", arg
+	case reGit.MatchString(arg):
+		return ClassGit, "", arg
+	case !strings.HasPrefix(namePart, "@") && (strings.Contains(namePart, "/") || reFileType.MatchString(namePart)):
+		return ClassifySpec(arg), "", arg
+	case nameEnds > 0:
+		name, spec = namePart, arg[nameEnds+1:]
+		if spec == "" {
+			spec = "*"
+		}
+	default:
+		if ValidPackageName(arg) {
+			name, spec = arg, "*"
+		} else {
+			return ClassifySpec(arg), "", arg
+		}
+	}
+	if !ValidPackageName(name) {
+		return ClassInvalid, name, spec
+	}
+	return ClassifySpec(spec), name, spec
+}
+
+// ExactArg reports whether a command-line argument is `name@x.y.z` and nothing
+// else: a package, a strict exact version.
+func ExactArg(arg string) bool {
+	class, name, spec := ClassifyArg(arg)
+	return class == ClassVersion && name != "" && StrictVersion(spec) && strings.HasSuffix(arg, "@"+spec)
+}
+
+// Refusal is one thing admission does not take.
+type Refusal struct {
+	Where  string `json:"where"`
+	Text   string `json:"text"`
+	Reason string `json:"reason"`
+}
+
+// Admission is the document of project-admit.
+type Admission struct {
+	SchemaVersion int       `json:"schema_version"`
+	Ok            bool      `json:"ok"`
+	Refusals      []Refusal `json:"refusals"`
+	// Names are the distinct package names the checked inputs carry, which the
+	// registry rules were applied to.
+	Names []string `json:"names"`
+	// Checked are the strings admission took for registry requests, exactly as
+	// it read them, so that the selected npm's own parser can be asked about the
+	// same ones (kind: arg, dep, override-key, override-value, name).
+	Checked []Checked `json:"checked"`
+}
+
+// Checked is one string admission admitted.
+type Checked struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+	Spec string `json:"spec"`
+}
+
+// AdmitInput is what one admission reads. Every part is optional.
+type AdmitInput struct {
+	Args         []string
+	ManifestFile string
+	LockfileFile string
+	ConfigFile   string
+	NpmrcFile    string
+	// RegistriesOnly skips the classification of dependency specs and applies
+	// only the registry rules to the names found (the projected lockfile, before
+	// public evidence is asked for anything).
+	RegistriesOnly bool
+}
+
+// LockfileError is a lockfile that cannot be read or decoded (wrong shape,
+// repeated members, not JSON): evidence about the baseline that is missing, as
+// opposed to a source that is readable and not supported.
+type LockfileError struct{ Err error }
+
+func (e *LockfileError) Error() string { return "lockfile: " + e.Err.Error() }
+func (e *LockfileError) Unwrap() error { return e.Err }
+
+// CanonicalRegistry is the one registry the lane supports.
+const CanonicalRegistry = "https://registry.npmjs.org/"
+
+// Admit checks the command arguments, the manifest (dependency sections and
+// typed overrides), the lockfile's dependency edges and the registry rules on
+// every package name found.
+func Admit(in AdmitInput) (Admission, error) {
+	result := Admission{SchemaVersion: AdmitSchema, Refusals: []Refusal{}, Names: []string{}, Checked: []Checked{}}
+	seenChecked := map[Checked]bool{}
+	note := func(kind, name, spec string) {
+		c := Checked{kind, name, spec}
+		if !seenChecked[c] {
+			seenChecked[c] = true
+			result.Checked = append(result.Checked, c)
+		}
+	}
+	names := map[string]struct{}{}
+	refuse := func(where, text, reason string) {
+		result.Refusals = append(result.Refusals, Refusal{Where: where, Text: text, Reason: reason})
+	}
+	addName := func(name string) {
+		if name != "" {
+			names[name] = struct{}{}
+		}
+	}
+
+	for i, arg := range in.Args {
+		if !ExactArg(arg) {
+			refuse(fmt.Sprintf("argument %d", i+1), arg, "not an exact name@version registry spec")
+			continue
+		}
+		_, name, _ := ClassifyArg(arg)
+		addName(name)
+		note("arg", "", arg)
+	}
+
+	if in.ManifestFile != "" {
+		raw, err := os.ReadFile(in.ManifestFile)
+		if err != nil {
+			return result, err
+		}
+		if err := strictjson.RejectRepeatedMembers(raw); err != nil {
+			return result, fmt.Errorf("manifest: %w", err)
+		}
+		var manifest map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &manifest); err != nil || manifest == nil {
+			return result, fmt.Errorf("manifest: not a JSON object")
+		}
+		if value, ok := manifest["workspaces"]; ok && string(value) != "null" {
+			refuse("manifest.workspaces", "", "a project with workspaces")
+		}
+		for _, section := range []string{"dependencies", "devDependencies", "optionalDependencies", "peerDependencies"} {
+			value, ok := manifest[section]
+			if !ok || string(value) == "null" {
+				continue
+			}
+			var deps map[string]any
+			if err := json.Unmarshal(value, &deps); err != nil || deps == nil {
+				refuse("manifest."+section, "", "not a map")
+				continue
+			}
+			for _, name := range sortedStringKeys(deps) {
+				where := "manifest." + section + "." + name
+				text, isString := deps[name].(string)
+				if !isString {
+					refuse(where, "", "a dependency spec that is not a string")
+					continue
+				}
+				checkDep(where, name, text, refuse, addName, note)
+			}
+		}
+		rootDeps := map[string]string{}
+		for _, section := range []string{"peerDependencies", "devDependencies", "optionalDependencies", "dependencies"} {
+			if value, ok := manifest[section]; ok {
+				var deps map[string]any
+				if json.Unmarshal(value, &deps) == nil {
+					for name, spec := range deps {
+						if text, ok := spec.(string); ok {
+							rootDeps[name] = text
+						}
+					}
+				}
+			}
+		}
+		if value, ok := manifest["overrides"]; ok && string(value) != "null" {
+			var overrides any
+			if err := json.Unmarshal(value, &overrides); err != nil {
+				return result, fmt.Errorf("manifest: overrides: %w", err)
+			}
+			walkOverrides("manifest.overrides", overrides, "", 0, rootDeps, refuse, addName, note)
+		}
+	}
+
+	if in.LockfileFile != "" {
+		raw, err := os.ReadFile(in.LockfileFile)
+		if err != nil {
+			return result, &LockfileError{err}
+		}
+		var lock struct {
+			Legacy   map[string]any `json:"dependencies"`
+			Packages map[string]struct {
+				Name                 string         `json:"name"`
+				Dependencies         map[string]any `json:"dependencies"`
+				DevDependencies      map[string]any `json:"devDependencies"`
+				OptionalDependencies map[string]any `json:"optionalDependencies"`
+				PeerDependencies     map[string]any `json:"peerDependencies"`
+			} `json:"packages"`
+		}
+		if err := strictjson.RejectRepeatedMembers(raw); err != nil {
+			return result, &LockfileError{err}
+		}
+		if err := json.Unmarshal(raw, &lock); err != nil {
+			return result, &LockfileError{err}
+		}
+		legacyNames(lock.Legacy, 0, addName)
+		paths := make([]string, 0, len(lock.Packages))
+		for path := range lock.Packages {
+			paths = append(paths, path)
+		}
+		sort.Strings(paths)
+		for _, path := range paths {
+			entry := lock.Packages[path]
+			if path != "" {
+				name := entry.Name
+				if name == "" {
+					name = packageNameOfPath(path)
+				}
+				addName(name)
+				// every name the path carries, nested ones included
+				for _, carried := range pathNames(path) {
+					addName(carried)
+				}
+			}
+			for kind, deps := range map[string]map[string]any{"dependencies": entry.Dependencies, "devDependencies": entry.DevDependencies,
+				"optionalDependencies": entry.OptionalDependencies, "peerDependencies": entry.PeerDependencies} {
+				for _, name := range sortedStringKeys(deps) {
+					where := fmt.Sprintf("lockfile[%s].%s.%s", path, kind, name)
+					if in.RegistriesOnly {
+						if ValidPackageName(name) {
+							addName(name)
+						}
+						continue
+					}
+					text, isString := deps[name].(string)
+					if !isString {
+						refuse(where, "", "a dependency spec that is not a string")
+						continue
+					}
+					checkDep(where, name, text, refuse, addName, note)
+				}
+			}
+		}
+	}
+
+	if in.NpmrcFile != "" {
+		raw, err := os.ReadFile(in.NpmrcFile)
+		if err != nil {
+			return result, err
+		}
+		for _, refusal := range AdmitNpmrc(raw) {
+			refuse(refusal.Where, refusal.Text, refusal.Reason)
+		}
+	}
+
+	var config map[string]any
+	if in.ConfigFile != "" {
+		raw, err := os.ReadFile(in.ConfigFile)
+		if err != nil {
+			return result, err
+		}
+		if err := json.Unmarshal(raw, &config); err != nil || config == nil {
+			return result, fmt.Errorf("configuration: not a JSON object")
+		}
+		checkRegistries(config, names, refuse)
+	}
+
+	for name := range names {
+		result.Names = append(result.Names, name)
+	}
+	sort.Strings(result.Names)
+	sort.SliceStable(result.Refusals, func(i, j int) bool { return result.Refusals[i].Where < result.Refusals[j].Where })
+	result.Ok = len(result.Refusals) == 0
+	return result, nil
+}
+
+// pathNames are the package names a lockfile path carries: one per
+// node_modules/ segment.
+func pathNames(path string) []string {
+	var names []string
+	for _, part := range strings.Split(path, "node_modules/")[1:] {
+		part = strings.TrimSuffix(part, "/")
+		segments := strings.SplitN(part, "/", 3)
+		switch {
+		case strings.HasPrefix(part, "@") && len(segments) >= 2:
+			names = append(names, segments[0]+"/"+segments[1])
+		case len(segments) >= 1 && segments[0] != "":
+			names = append(names, segments[0])
+		}
+	}
+	return names
+}
+
+// legacyNames adds the names of a version 2 lockfile's legacy dependencies
+// tree: its keys, the target of an `npm:` alias in a version, and its nested trees.
+func legacyNames(tree map[string]any, depth int, addName func(string)) {
+	if depth > 64 {
+		return
+	}
+	for name, node := range tree {
+		addName(name)
+		entry, ok := node.(map[string]any)
+		if !ok {
+			continue
+		}
+		if version, ok := entry["version"].(string); ok && strings.HasPrefix(strings.ToLower(version), "npm:") {
+			if class, target, _ := ClassifyArg(version[4:]); target != "" && class != "" {
+				addName(target)
+			}
+		}
+		if nested, ok := entry["dependencies"].(map[string]any); ok {
+			legacyNames(nested, depth+1, addName)
+		}
+	}
+}
+
+func sortedStringKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func checkDep(where, name, spec string, refuse func(w, t, r string), addName func(string), note func(k, n, s string)) {
+	if !ValidPackageName(name) {
+		refuse(where, name, "a dependency name that is not a registry package name")
+		return
+	}
+	addName(name)
+	if class := ClassifySpec(spec); !IsRegistry(class) {
+		refuse(where, spec, "a dependency that is not a registry package ("+class+")")
+		return
+	}
+	note("name", name, "")
+	note("dep", name, spec)
+}
+
+// walkOverrides checks an overrides tree as npm's Arborist reads it: an object
+// whose keys are selectors (npm-package-arg must read each as a registry
+// package with a name) and whose values are a spec string, a `$name` reference
+// or a nested object; the `.` key of an object holds the string that overrides
+// the object's own selector. Anything else is not typed overrides.
+func walkOverrides(where string, node any, parentName string, depth int, rootDeps map[string]string, refuse func(w, t, r string), addName func(string), note func(k, n, s string)) {
+	if depth > 32 {
+		refuse(where, "", "overrides nested too deeply")
+		return
+	}
+	object, ok := node.(map[string]any)
+	if !ok {
+		refuse(where, "", "overrides that are not an object")
+		return
+	}
+	for _, key := range sortedStringKeys(object) {
+		keyWhere := where + "." + key
+		name := parentName
+		if key != "." {
+			class, selector, _ := ClassifyArg(key)
+			if selector == "" || !IsRegistry(class) {
+				refuse(keyWhere, key, "an override selector that is not a registry package")
+				continue
+			}
+			name = selector
+			addName(selector)
+			note("override-key", "", key)
+		}
+		switch value := object[key].(type) {
+		case string:
+			if strings.HasPrefix(value, "$") {
+				// A reference is resolved against the ROOT's own dependency of that name; the
+				// spec it denotes is admitted. A reference the root does not declare would be
+				// resolved against the depending package: refused.
+				ref := value[1:]
+				spec, declared := rootDeps[ref]
+				switch {
+				case !ValidPackageName(ref):
+					refuse(keyWhere, value, "an override reference that is not a package name")
+				case !declared:
+					refuse(keyWhere, value, "an override reference to a dependency the root does not declare")
+				case !IsRegistry(ClassifySpec(spec)):
+					refuse(keyWhere, value, "an override reference to a dependency that is not a registry package")
+				default:
+					note("override-value", ref, spec)
+				}
+				continue
+			}
+			if class := ClassifySpec(value); !IsRegistry(class) {
+				refuse(keyWhere, value, "an override that is not a registry package ("+class+")")
+				continue
+			}
+			note("override-value", name, value)
+		case map[string]any:
+			if key == "." {
+				refuse(keyWhere, "", "a self-override that is an object, not a string")
+				continue
+			}
+			walkOverrides(keyWhere, value, name, depth+1, rootDeps, refuse, addName, note)
+		default:
+			refuse(keyWhere, "", "an override that is neither a string nor an object")
+		}
+	}
+}
+
+// pickRegistry is npm-registry-fetch's choice for a package name: the registry
+// of its scope, else of the configured default scope, else the default registry.
+func pickRegistry(config map[string]any, name string) (registry, scope string) {
+	get := func(key string) string {
+		if value, ok := config[key].(string); ok {
+			return value
+		}
+		return ""
+	}
+	if strings.HasPrefix(name, "@") {
+		if i := strings.Index(name, "/"); i > 0 {
+			scope = name[:i]
+		}
+		if registry = get(scope + ":registry"); registry != "" {
+			return registry, scope
+		}
+	}
+	if def := get("scope"); def != "" {
+		def = "@" + strings.TrimPrefix(def, "@")
+		if registry = get(def + ":registry"); registry != "" {
+			return registry, def
+		}
+	}
+	return get("registry"), scope
+}
+
+func canonicalRegistry(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "https" && u.Host == "registry.npmjs.org" && u.User == nil && (u.Path == "/" || u.Path == "") &&
+		u.RawQuery == "" && u.Fragment == "" && strings.EqualFold(raw, CanonicalRegistry)
+}
+
+// checkRegistries decides registries on parsed identities: the default
+// registry must be the canonical public one; every package name found picks a
+// registry by npm's rule, and that must be canonical too (a scope mapped to the
+// canonical registry is accepted; one mapped elsewhere refuses when a package
+// of that scope is in the judged graph).
+func checkRegistries(config map[string]any, names map[string]struct{}, refuse func(w, t, r string)) {
+	registry, _ := config["registry"].(string)
+	if !canonicalRegistry(registry) {
+		refuse("configuration.registry", registry, "a registry other than the canonical public one over https")
+	}
+	sorted := make([]string, 0, len(names))
+	for name := range names {
+		sorted = append(sorted, name)
+	}
+	sort.Strings(sorted)
+	reported := map[string]bool{}
+	for _, name := range sorted {
+		picked, scope := pickRegistry(config, name)
+		if picked == "" || canonicalRegistry(picked) {
+			continue
+		}
+		key := scope
+		if key == "" {
+			key = "(default scope)"
+		}
+		if reported[key] {
+			continue
+		}
+		reported[key] = true
+		refuse("configuration.registry", picked, "the package "+name+" resolves through a registry other than the canonical public one")
+	}
+}

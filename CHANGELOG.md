@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+- Project lane hardening, third part (still behind `install.project_lane`): nothing
+  the project controls is read as configuration before admission (a configuration
+  file or destination in the arguments refuses at the shell; the routing probe is
+  given only global-deciding flags and keeps the operator's configuration sources;
+  environment destinations are read as npm reads them or refuse; a project inside a
+  workspace root refuses); two launcher forms (the version manager's launcher run as
+  it is in every phase, or npm's own CLI file run by the Node beside it), anything
+  else refuses; the lane runs no auditor and one matcher covers every name,
+  including lockfile paths, legacy identities and projected names; npm's own parser
+  agrees with the final admission before a dry run or binding, and a `$name`
+  override reference is resolved or refused; a committed lockfile the core cannot
+  decode is missing evidence (102); the renderer ignores header case and Unicode
+  format characters; a binder killed by the forwarded signal before its document is
+  an interruption (128+signal); `--update-notifier=false` is forced; the npm floor is
+  compared with npm's semver. The live test runs a forwarding launcher behind a
+  version manager and has strict negative controls.
+- Project lane hardening, second part (still behind `install.project_lane`): the
+  project's own `.npmrc` is read by safe as text, before any npm runs, against a
+  short allow-list (`docs/configuration.md`); every npm command of the lane carries
+  an explicit cache and log destination in safe's private directory and
+  `--replace-registry-host=never`, and the operator's destinations in the
+  environment may not point into the project; the selected npm's own definitions
+  must define the options the lane relies on and its own parsers must agree with
+  safe's admission (an npm that only echoes `allow-git` refuses; floor 11.12.1);
+  the Node is the one beside the resolved npm's own launcher and `NODE_ENV` is
+  carried; platform and omissions are computed once by the selected Node; the
+  private check does not run its own npm and refuses a project that touches a
+  registered namespace; consumed fields of every document are checked and a
+  committed lockfile that cannot be parsed is missing evidence (102); one renderer
+  cleans every child diagnostic; the signal handler is held until the binder's
+  report is delivered; a known block outranks an unsupported dependency edge. The
+  live test now asserts the ordered npm calls against the projection the gate made.
+- Project lane hardening (still behind `install.project_lane`, off by default; with
+  it off nothing changes): one Node and one npm for every phase, resolved once in
+  the project's context and run directly with one allow-listed environment
+  (documented in `docs/configuration.md`; a Node preload option refuses); admission
+  by npm's own rules in Go (`safe-core project-admit`: arguments, manifest ranges,
+  typed overrides, the lockfile's dependency edges, scopes and registries by parsed
+  identity, the delegated npm's git options shown to work before projecting),
+  checked against npm's classifier by `tests/live/npm_spec_oracle.sh`; nothing is
+  written into the project before publication (npm's cache and logs, safe's
+  storage, a special-file `.npmrc`, `git replace`); malformed output of every
+  producer refuses and an unreadable committed graph is missing evidence (102); the
+  platform selection comes from the selected Node runtime, exactly; everything npm
+  and the binder print is cleaned at the lane's boundary and a signal to the shell
+  is forwarded to the binder. The live test now makes the registry answer
+  differently between projection and materialisation and fails a lane that
+  resolves again.
 - Project lane, first end-to-end pass for npm, behind the new `install.project_lane`
   switch (default off; with it off nothing changes). With it on, `npm install`
   (bare or exact `name@version` specs) and `npm update` in a project whose

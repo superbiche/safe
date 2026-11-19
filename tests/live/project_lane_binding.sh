@@ -1,28 +1,39 @@
 #!/usr/bin/env bash
 # LIVE suite (opt-in, network) — the project lane installs exactly what it
-# judged, with the REAL npm reached the way the fleet reaches it, when the
-# registry answers differently between the projection and a resolving command.
+# judged, with the REAL npm, when the registry answers differently between the
+# projection and the materialisation.
 #
 # Why this exists: the hermetic install suite stubs npm. The claim of spec 1625
 # ("the tree on disk after the command is the graph that was judged") is a claim
 # about npm: that the frozen install of the judged lockfile cannot resolve
 # again, and that safe's strict verifier accepts the tree npm really produces
-# (staged in a directory of the project, published once verified). Only the
-# real npm can attest both.
+# (staged in a directory of the project, published once verified).
 #
-# The npm is the one the gate's delegate would run. On a fleet machine `npm` on
-# PATH is a gate wrapper and the next candidate is a version manager's shim that
-# routes back into the gate: the suite puts neither of them out of the way. The
-# checkout's gate resolves the real mise under argv0 npm itself (the lane's one
-# npm); this suite reaches the same binary the same way for its independent
-# runs. If no such chain exists the suite names a genuine npm in SAFE_LIVE_NPM.
+# Two scenarios, both through the checkout's gate:
 #
-# How the registry is made to answer differently, as in the binding prototype:
-# npm's `--before=<date>` resolves against the registry as it was on that date.
-# `npm_config_before` dates the whole gate run, so the projection resolves the
-# T1 graph; the frozen install resolves nothing. A control resolution without
-# the date, from the same starting project, is what a resolving command would
-# have installed NOW, and it must differ.
+#   A. the fleet chain. `npm` on PATH is a gate wrapper and the next candidate a
+#      version manager's shim; the lane asks the real manager (`mise which`),
+#      once, in the project, for node and npm and runs that pair directly.
+#      npm's `before` date dates the whole invocation, so the projection
+#      resolves the historical graph and the tree must equal it.
+#
+#   B. a delegate that answers differently per phase. A version manager's
+#      installation reached the supported way (a shim on PATH, a manager that
+#      names a FORWARDING launcher, the Node beside it a recording wrapper) dates
+#      only the projection (the call that carries --package-lock-only) to <T1> and
+#      runs everything else against the registry as it is NOW, logging every call. A lane that
+#      resolved again at materialisation would install today's graph. The suite
+#      captures the successful projection independently, then asserts: the final
+#      npm command is `ci` exactly once and nothing else resolved outside the
+#      dated projection; the lockfile published is that projection byte for
+#      byte; the installed tree is it (strict verifier, npm's own record, and a
+#      version-by-version read); and it is NOT today's resolution.
+#
+#   The negative controls (each must fail on the intended assertion ONLY, after a
+#   set-up that itself succeeded): the same scenario B against a copy of the gate
+#   whose frozen install is `update` (a resolving command); a second resolution
+#   that gives the same graph; a launcher that exits 99 (the lane executes the
+#   launcher the manager names, so the gate cannot succeed and the launcher ran).
 #
 # Only the npm registry is live. The advisory reader is a local stand-in that
 # reports every identity as read completely with no advisory: the judging core
@@ -52,43 +63,43 @@ for tool in jq git curl flock; do
   command -v "${tool}" >/dev/null 2>&1 || { printf 'SKIP: %s is unavailable\n' "${tool}"; exit 0; }
 done
 
-# The command that runs the genuine npm: the gate's own way (a real binary, or
-# the real mise under argv0 npm when the delegate is a version manager's shim).
-real_npm=""
+# The genuine node and npm, found the way the gate finds them: a real npm on
+# PATH, or the real version manager's answer (`mise which`) behind a shim, or
+# SAFE_LIVE_NPM.
+real_npm_bin=""
+real_node_bin=""
 while IFS= read -r candidate; do
   [[ -x "${candidate}" ]] || continue
   head=$(LC_ALL=C head -n 2 -- "${candidate}" 2>/dev/null)
   if grep -q '^# safe-gate-wrapper' <<<"${head}"; then
-    if grep -q 'tool=mise' <<<"${head}" && [[ -z "${real_npm}" ]]; then
-      real_mise=""
+    if grep -q 'tool=mise' <<<"${head}" && [[ -z "${real_npm_bin}" ]]; then
       while IFS= read -r m; do
         [[ -x "${m}" ]] || continue
         LC_ALL=C head -n 2 -- "${m}" 2>/dev/null | grep -q '^# safe-gate-wrapper' && continue
-        real_mise="${m}"
-        break
+        real_npm_bin="$("${m}" which npm 2>/dev/null)" && real_node_bin="$("${m}" which node 2>/dev/null)" && break
+        real_npm_bin=""
       done < <(type -a -p mise 2>/dev/null)
-      [[ -n "${real_mise}" ]] && { real_npm="mise:${real_mise}"; break; }
     fi
+    [[ -n "${real_npm_bin}" ]] && break
     continue
   fi
-  real_npm="${candidate}"
+  real_npm_bin="${candidate}"
   break
 done < <(type -a -p npm 2>/dev/null)
-if [[ -z "${real_npm}" && -n "${SAFE_LIVE_NPM:-}" && -x "${SAFE_LIVE_NPM}" ]]; then
-  real_npm="${SAFE_LIVE_NPM}"
+if [[ -z "${real_npm_bin}" && -n "${SAFE_LIVE_NPM:-}" && -x "${SAFE_LIVE_NPM}" ]]; then
+  real_npm_bin="${SAFE_LIVE_NPM}"
 fi
-if [[ -z "${real_npm}" ]]; then
-  printf 'SKIP: no real npm available (set SAFE_LIVE_NPM to name one)\n'
+[[ -n "${real_node_bin}" ]] || real_node_bin="$(dirname -- "${real_npm_bin}")/node"
+if [[ -z "${real_npm_bin}" || ! -x "${real_node_bin}" ]]; then
+  printf 'SKIP: no real npm and node available (set SAFE_LIVE_NPM to name an npm)\n'
   exit 0
 fi
-npm_run() {
-  if [[ "${real_npm}" == mise:* ]]; then
-    ( exec -a npm "${real_npm#mise:}" "$@" )
-  else
-    "${real_npm}" "$@"
-  fi
-}
-printf '# npm: %s (%s)\n' "${real_npm}" "$(npm_run --version 2>/dev/null || printf 'version unknown')"
+npm_dir="$(cd -- "$(dirname -- "${real_npm_bin}")/../lib/node_modules/npm" 2>/dev/null && pwd -P)" \
+  || npm_dir="$(cd -- "$(dirname -- "$(realpath -- "${real_npm_bin}")")/.." && pwd -P)"
+npm_cli="${npm_dir}/bin/npm-cli.js"
+[[ -f "${npm_cli}" ]] || { printf 'SKIP: npm-cli.js not found for %s\n' "${real_npm_bin}"; exit 0; }
+real_npm() { env PATH="$(dirname -- "${real_node_bin}"):${PATH}" "${real_node_bin}" "${npm_cli}" "$@"; }
+printf '# npm: %s (%s), node: %s\n' "${real_npm_bin}" "$(real_npm --version 2>/dev/null || printf '?')" "${real_node_bin}"
 if ! curl -fsS --max-time 15 -o /dev/null https://registry.npmjs.org/express; then
   printf 'SKIP: the npm registry is not reachable\n'
   exit 0
@@ -103,13 +114,10 @@ fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/safe-live-lane.XXXXXX")" || exit 1
 safe_test_compose_exit_trap "rm -rf -- \"\${WORK}\""
-
-# Installed layout: a copied dispatcher with its sibling safe-core, the library
-# of the checkout, and a stand-in advisory reader.
-mkdir -p "${WORK}/safe/bin" "${WORK}/control" "${WORK}/independent" "${WORK}/project"
+mkdir -p "${WORK}/safe/bin" "${WORK}/control" "${WORK}/independent" "${WORK}/delegate"
 cp "${ROOT}/bin/safe" "${WORK}/safe/bin/safe"
-ln -s "${ROOT}/lib" "${WORK}/safe/lib"
 ln -s "${ROOT}/bin/safe-run" "${WORK}/safe/bin/safe-run"
+ln -s "${ROOT}/lib" "${WORK}/safe/lib"
 if ! ( cd "${ROOT}" && "${GO_BIN}" build -trimpath -ldflags "-X main.version=$(tr -d '[:space:]' < VERSION)" \
     -o "${WORK}/safe/bin/safe-core" ./cmd/safe-core ); then
   fail "safe-core builds"
@@ -126,51 +134,46 @@ fi
 exit 0
 AUDIT
 chmod +x "${WORK}/safe/bin/safe-audit"
-
-# The switch is read from the operator's canonical configuration only.
-run_config_dir="${HOME}/.config/safe/run"
-mkdir -p "${run_config_dir}"
-printf '{"install":{"project_lane":true}}\n' > "${run_config_dir}/config.json"
+# The operator's canonical configuration (the switch is read from there only).
+mkdir -p "${HOME}/.config/safe/run"
+printf '{"install":{"project_lane":true}}\n' > "${HOME}/.config/safe/run/config.json"
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
 T1="2025-04-02"
-ARGS=(install express@5.1.0 --ignore-scripts)
+entries() { jq -r '.packages | to_entries[] | select(.key | test("node_modules/")) | "\(.key)@\(.value.version)"' "$1" | LC_ALL=C sort; }
 
-# The starting project: no dependency, the lockfile npm writes for it, committed.
-cd "${WORK}/project" || exit 1
-printf '{"name":"live-lane","version":"1.0.0"}\n' > package.json
-if ! npm_run install --package-lock-only --ignore-scripts --no-audit --no-fund >/dev/null 2>&1; then
-  fail "the starting lockfile is written"
-  exit 1
-fi
-export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
-git init -q -b main
-git add package.json package-lock.json
-git -c user.name=lane -c user.email=lane@example.invalid commit -q -m base
-cp package.json package-lock.json "${WORK}/control/"
-cp package.json package-lock.json "${WORK}/independent/"
+# A starting project: no dependency, the lockfile npm writes for it, committed.
+new_project() { # <dir>
+  mkdir -p "$1"
+  ( cd "$1" || exit 1
+    printf '{"name":"live-lane","version":"1.0.0"}\n' > package.json
+    real_npm install --package-lock-only --ignore-scripts --no-audit --no-fund >/dev/null 2>&1 || exit 1
+    git init -q -b main && git add package.json package-lock.json \
+      && git -c user.name=lane -c user.email=lane@example.invalid commit -q -m base )
+}
 
 # Both resolutions must succeed and carry the requested root; a control that
 # failed would make "the registry answers differently" vacuously true.
 resolve() { # <dir> [--before=<date>]
   local dir="$1"
   shift
-  ( cd "${dir}" && npm_run install express@5.1.0 --package-lock-only --ignore-scripts --no-audit --no-fund "$@" >"${dir}/resolve.log" 2>&1 ) || return 1
+  ( cd "${dir}" && real_npm install express@5.1.0 --package-lock-only --ignore-scripts --no-audit --no-fund "$@" >"${dir}/resolve.log" 2>&1 ) || return 1
   jq -e '.packages["node_modules/express"].version == "5.1.0"' "${dir}/package-lock.json" >/dev/null
 }
+new_project "${WORK}/control" && new_project "${WORK}/independent" || { fail "the starting projects are written"; exit 1; }
 if resolve "${WORK}/control"; then
   pass "the control resolution (now) succeeds and holds express@5.1.0"
 else
-  fail "the control resolution (now) succeeds and holds express@5.1.0: $(tail -n 3 "${WORK}/control/resolve.log")"
+  fail "the control resolution (now) succeeds: $(tail -n 3 "${WORK}/control/resolve.log")"
   exit 1
 fi
 if resolve "${WORK}/independent" "--before=${T1}"; then
   pass "the independent projection (as of ${T1}) succeeds and holds express@5.1.0"
 else
-  fail "the independent projection (as of ${T1}) succeeds and holds express@5.1.0: $(tail -n 3 "${WORK}/independent/resolve.log")"
+  fail "the independent projection (as of ${T1}) succeeds: $(tail -n 3 "${WORK}/independent/resolve.log")"
   exit 1
 fi
 judged="${WORK}/independent/package-lock.json"
-entries() { jq -r '.packages | to_entries[] | select(.key | test("node_modules/")) | "\(.key)@\(.value.version)"' "$1" | LC_ALL=C sort; }
 entries "${judged}" > "${WORK}/judged.txt"
 entries "${WORK}/control/package-lock.json" > "${WORK}/now.txt"
 differing="$(LC_ALL=C comm -3 "${WORK}/judged.txt" "${WORK}/now.txt" | wc -l)"
@@ -178,69 +181,175 @@ if (( differing > 0 )); then
   pass "the registry answers differently now: ${differing} lockfile lines differ between the judged graph and what a resolving command gives today"
 else
   fail "the fixture is vacuous: the registry answers today as it did at ${T1}"
-fi
-
-# The lane, through the checkout's gate. npm is whatever the gate resolves.
-npm_config_before="${T1}" SAFE_AUDIT_PATH="${WORK}/safe/bin/safe-audit" \
-  "${WORK}/safe/bin/safe" gate npm "${ARGS[@]}" >"${WORK}/gate.out" 2>"${WORK}/gate.err"
-status=$?
-sed 's/^/# gate: /' "${WORK}/gate.err" | tail -n 25
-if (( status == 0 )); then
-  pass "the lane installs express@5.1.0 (gate exit 0)"
-else
-  fail "the lane installs express@5.1.0 (gate exit ${status})"
-  printf '# the lane did not publish; the project is: %s\n' "$(ls -A "${WORK}/project" | tr '\n' ' ')"
   exit 1
 fi
 
-# The lockfile on disk is the independently captured projection, byte for byte.
-if cmp -s package-lock.json "${judged}"; then
-  pass "the final lockfile is byte-identical to the independently captured projection"
+selection=(--os "$("${real_node_bin}" -p 'process.platform')" --cpu "$("${real_node_bin}" -p 'process.arch')")
+
+# --- scenario A: the fleet chain, the whole invocation dated -------------------
+new_project "${WORK}/a" || { fail "scenario A project"; exit 1; }
+( cd "${WORK}/a" && npm_config_before="${T1}" SAFE_AUDIT_PATH="${WORK}/safe/bin/safe-audit" "${WORK}/safe/bin/safe" gate npm install express@5.1.0 --ignore-scripts \
+    >"${WORK}/a.out" 2>"${WORK}/a.err" )
+status=$?
+sed 's/^/# A gate: /' "${WORK}/a.err" | tail -n 8
+if (( status == 0 )) && cmp -s "${WORK}/a/package-lock.json" "${judged}"; then
+  pass "A (fleet chain): the lane installs express@5.1.0 and publishes the independently captured projection byte for byte"
 else
-  fail "the final lockfile differs from the independently captured projection"
-  diff <(entries package-lock.json) "${WORK}/judged.txt" | head -5
-fi
-if [[ "$(jq -r '.dependencies.express' package.json)" == "^5.1.0" ]]; then
-  pass "the judged manifest was written"
-else
-  fail "the judged manifest was not written"
+  fail "A (fleet chain): exit ${status}; lockfile $(cmp -s "${WORK}/a/package-lock.json" "${judged}" && echo equal || echo differs)"
 fi
 
-# The tree is the judged lockfile: by safe's strict verifier, and independently.
-selection=(--os "$(uname -s | tr '[:upper:]' '[:lower:]')" --cpu "$(case "$(uname -m)" in x86_64) echo x64;; aarch64) echo arm64;; *) uname -m;; esac)" --libc "$(ldd --version 2>&1 | grep -qi musl && echo musl || echo glibc)")
-tree_json="$("${WORK}/safe/bin/safe-core" project-tree "${selection[@]}" "${judged}" . 2>/dev/null)"
-tree_status=$?
-if (( tree_status == 0 )) && jq -e '.ok == true and .checked > 10' <<<"${tree_json}" >/dev/null 2>&1; then
-  pass "the installed tree is the independently captured lockfile (project-tree: $(jq -r '.checked' <<<"${tree_json}") entries checked)"
-else
-  fail "the installed tree is the independently captured lockfile (exit ${tree_status}): $(jq -c '.problems[:3]' <<<"${tree_json}" 2>/dev/null)"
+# --- scenario B: a delegate that answers differently per phase -----------------
+# An installation the lane follows the supported way (a launcher, the Node beside
+# it, the npm-cli.js of the same installation) whose Node is a recording wrapper:
+# the projection (the call that begins with --package-lock-only) is dated as of
+# T1, everything else runs against the registry as it is NOW, and every call is
+# logged. The projection the gate actually made is kept as it is.
+# The launcher form the lane executes as it is (a): forwards to its sibling node on its
+# own npm-cli.js. A fake version manager (marked shim + a real-manager stand-in on PATH)
+# names it, as `mise which npm` does.
+make_delegate() { # <dir> <launcher kind: forward|exit99>
+  local d="$1" kind="$2"
+  mkdir -p "${d}/bin" "${d}/lib/node_modules"
+  if [[ "${kind}" == forward ]]; then
+    printf '#!/usr/bin/env bash\nexec "$(dirname "$0")/node" "$(dirname "$0")/../lib/node_modules/npm/bin/npm-cli.js" "$@"\n' > "${d}/bin/npm"
+  else
+    printf '#!/bin/sh\ntouch "%s/launcher99.ran"\nexit 99\n' "${WORK}" > "${d}/bin/npm"
+  fi
+  cat > "${d}/bin/node" <<DELEGATE
+#!/usr/bin/env bash
+if [[ "\${1:-}" == */node_modules/npm/bin/npm-cli.js ]]; then
+  printf '%s\\n' "\${*:2}" >> "${WORK}/delegate.log"
+  if [[ "\${2:-}" == "--package-lock-only" ]]; then
+    "${real_node_bin}" "\$@" "--before=${T1}"
+    status=\$?
+    n=\$(ls "${WORK}"/captured-*.json 2>/dev/null | wc -l)
+    [[ -f package-lock.json ]] && cp package-lock.json "${WORK}/captured-\$((n + 1)).json"
+    exit \$status
+  fi
 fi
-mismatch=0
-while IFS=$'\t' read -r key version; do
-  have="$(jq -r '.version' "${key}/package.json" 2>/dev/null)"
-  [[ "${have}" == "${version}" ]] || { mismatch=$((mismatch + 1)); printf '# %s: lockfile %s, tree %s\n' "${key}" "${version}" "${have:-absent}"; }
-done < <(jq -r '.packages | to_entries[] | select(.key | test("node_modules/")) | select(.value.optional | not) | [.key, .value.version] | @tsv' "${judged}")
-if (( mismatch == 0 )); then
-  pass "every non-optional entry of the judged lockfile is installed at its locked version"
-else
-  fail "${mismatch} entries differ between the judged lockfile and the tree"
+exec "${real_node_bin}" "\$@"
+DELEGATE
+  chmod +x "${d}/bin/npm" "${d}/bin/node"
+  ln -sfn "${npm_dir}" "${d}/lib/node_modules/npm"
+}
+mkdir -p "${WORK}/shims" "${WORK}/realmise"
+printf '#!/usr/bin/env bash\n# safe-gate-wrapper v1 tool=mise\nexit 97\n' > "${WORK}/shims/npm"
+chmod +x "${WORK}/shims/npm"
+cat > "${WORK}/realmise/mise" <<REALMISE
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "which" ]]; then
+  printf '%s/bin/%s\\n' "${WORK}/delegate" "\${2:-}"
+  exit 0
 fi
-# What npm recorded as installed (its hidden lockfile) is the judged graph, and
-# not the one a resolving command gives today.
-entries node_modules/.package-lock.json > "${WORK}/installed.txt"
-if cmp -s "${WORK}/installed.txt" "${WORK}/judged.txt" && ! cmp -s "${WORK}/installed.txt" "${WORK}/now.txt"; then
-  pass "npm's own record of the installed tree is the judged graph and not today's resolution"
+exit 98
+REALMISE
+chmod +x "${WORK}/realmise/mise"
+make_delegate "${WORK}/delegate" forward
+
+run_b() { # <name> <lib dir>
+  local name="$1" lib="$2"
+  new_project "${WORK}/${name}" || return 99
+  : > "${WORK}/delegate.log"
+  rm -f "${WORK}"/captured-*.json
+  rm -rf "${WORK}/safe/lib"
+  ln -s "${lib}" "${WORK}/safe/lib"
+  ( cd "${WORK}/${name}" && PATH="${WORK}/shims:${WORK}/realmise:${PATH}" SAFE_AUDIT_PATH="${WORK}/safe/bin/safe-audit" \
+      "${WORK}/safe/bin/safe" gate npm install express@5.1.0 --ignore-scripts >"${WORK}/${name}.out" 2>"${WORK}/${name}.err" )
+  return $?
+}
+# The assertions of B, as a function: returns non-zero when any fails.
+assert_b() { # <name>
+  local name="$1" ok=0 dir="${WORK}/$1" log="${WORK}/delegate.log" captured calls
+  # the ordered npm calls, configuration probes aside: exactly one resolution, then exactly one frozen install
+  calls="$(grep -v '^config ' "${log}" | awk '/^--package-lock-only /{print "resolve"; next} /^ci --ignore-scripts --no-audit --no-fund /{print "ci"; next} {print "OTHER: " $0}' | tr '\n' ' ')"
+  if [[ "${calls}" != "resolve ci " ]]; then echo "# the ordered npm calls are not exactly one resolution then exactly one frozen install: ${calls}"; ok=1; fi
+  # the projection the gate actually made is what was published, byte for byte, and it is the independent one
+  captured="${WORK}/captured-1.json"
+  if [[ ! -f "${captured}" ]]; then echo "# no projection was captured"; ok=1
+  else
+    cmp -s "${dir}/package-lock.json" "${captured}" || { echo "# the published lockfile is not the projection the gate made"; ok=1; }
+    cmp -s "${captured}" "${judged}" || { echo "# the projection the gate made is not the independently captured one"; ok=1; }
+  fi
+  # the tree is the judged lockfile (strict verifier), npm's own record agrees, and it is not today's graph
+  if ! "${WORK}/safe/bin/safe-core" project-tree "${selection[@]}" "${judged}" "${dir}" 2>/dev/null | jq -e '.ok == true and .checked > 10' >/dev/null 2>&1; then echo "# the tree is not the judged lockfile"; ok=1; fi
+  if [[ -f "${dir}/node_modules/.package-lock.json" ]]; then
+    entries "${dir}/node_modules/.package-lock.json" > "${WORK}/${name}.installed.txt"
+    cmp -s "${WORK}/${name}.installed.txt" "${WORK}/judged.txt" || { echo "# npm's record differs from the judged graph"; ok=1; }
+    ! cmp -s "${WORK}/${name}.installed.txt" "${WORK}/now.txt" || { echo "# the installed graph IS today's resolution"; ok=1; }
+  else
+    echo "# npm left no record of what it installed"; ok=1
+  fi
+  return "${ok}"
+}
+
+run_b b "${ROOT}/lib"
+status=$?
+sed 's/^/# B gate: /' "${WORK}/b.err" | tail -n 5
+if (( status == 0 )) && problems="$(assert_b b)"; then
+  pass "B (per-phase registry): the final npm command is ci once, the lockfile published is the captured projection, the tree is it and not today's"
 else
-  fail "npm's own record of the installed tree differs from the judged graph: $(LC_ALL=C comm -3 "${WORK}/installed.txt" "${WORK}/judged.txt" | head -3 | tr '\n' ' ')"
+  fail "B (per-phase registry): exit ${status} ${problems:-}"
+fi
+if compgen -G "${WORK}/b/.safe-bind-*" >/dev/null; then fail "a staging directory is left in the project"; else pass "no staging directory is left in the project"; fi
+flock -n -x "${WORK}/b" true && pass "the project lock was released" || fail "the project lock was not released"
+
+# --- the negative controls ------------------------------------------------------
+# 1. a lane that resolves again at materialisation (its frozen install is `update`)
+# 2. a lane that makes a SECOND resolution that gives the very same graph: every byte
+#    published agrees, and only the ordered calls tell it
+mkdir -p "${WORK}/broken-lib" "${WORK}/twice-lib"
+cp -r "${ROOT}/lib/." "${WORK}/broken-lib/"
+cp -r "${ROOT}/lib/." "${WORK}/twice-lib/"
+ORDERED_MSG='not exactly one resolution then exactly one frozen install'
+if grep -q 'frozen_args=(ci ' "${WORK}/broken-lib/gate-lib.sh"; then
+  sed -i 's/frozen_args=(ci /frozen_args=(update /' "${WORK}/broken-lib/gate-lib.sh"
+  run_b broken "${WORK}/broken-lib"
+  status=$?
+  problems="$(assert_b broken 2>&1)"
+  # the set-up must have worked (npm ran to its end: the gate's own verifier then
+  # refused the tree, publishing nothing) and the ordered-calls assertion must be
+  # among those that failed
+  if (( status == 100 )) && grep -q 'the installed tree differs from the judged lockfile' "${WORK}/broken.err" \
+      && [[ "${problems}" == *"${ORDERED_MSG}: resolve OTHER: update"* ]]; then
+    pass "the assertions of B fail, on the ordered calls, for a lane that resolves again at materialisation (and the gate's verifier refused its tree)"
+  else
+    fail "the resolving-materialisation control: gate exit ${status}, assertions said: ${problems:-nothing}"
+  fi
+else
+  fail "the negative control cannot be built: frozen_args is not where it was"
+fi
+python3 -I - "${WORK}/twice-lib/gate-lib.sh" <<'PY' || fail "the second-resolution control cannot be built"
+import sys
+p = sys.argv[1]
+s = open(p).read()
+start = s.index('  safe_gate_lane_npm_in "${proj}" --package-lock-only')
+end = s.index('|| rc=$?', start) + len('|| rc=$?')
+block = s[start:end]
+open(p, 'w').write(s[:start] + block + '\n' + block + s[end:])
+PY
+run_b twice "${WORK}/twice-lib"
+status=$?
+problems="$(assert_b twice 2>&1)"
+if (( status == 0 )) && [[ "${problems}" == *"not exactly one resolution then exactly one frozen install: resolve resolve ci"* ]] \
+    && ! grep -q 'published lockfile\|tree is not\|IS today' <<<"${problems}"; then
+  pass "a second resolution that gives the same graph fails on the ordered-calls assertion alone"
+else
+  fail "the second-resolution control: gate exit ${status}, assertions said: ${problems}"
 fi
 
-# Nothing is left behind, and the lock is released.
-if compgen -G '.safe-bind-*' >/dev/null; then
-  fail "a staging directory is left in the project"
+# 3. the launcher the manager names is the one that runs: a launcher that exits 99 ends
+#    the command and leaves its mark, and no assertion of B can pass on what it left
+make_delegate "${WORK}/delegate99" exit99
+rm -f "${WORK}/launcher99.ran"
+sed -i "s|${WORK}/delegate|${WORK}/delegate99|" "${WORK}/realmise/mise"
+run_b launcher99 "${ROOT}/lib"
+status=$?
+problems="$(assert_b launcher99 2>&1)"
+if (( status != 0 )) && [[ -f "${WORK}/launcher99.ran" ]] && [[ "${problems}" == *"no projection was captured"* ]]; then
+  pass "the launcher the manager names is the one the lane runs (an exit-99 launcher ran and ended the command, exit ${status})"
 else
-  pass "no staging directory is left in the project"
+  fail "the exit-99 launcher control: gate exit ${status}, launcher ran: $([[ -f "${WORK}/launcher99.ran" ]] && echo yes || echo no), assertions said: ${problems:-nothing}"
 fi
-flock -n -x "${WORK}/project" true && pass "the project lock was released" || fail "the project lock was not released"
 
 printf '%s passed, %s failed\n' "${PASS}" "${FAIL}"
 (( FAIL == 0 ))
