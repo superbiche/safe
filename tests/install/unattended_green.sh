@@ -298,4 +298,28 @@ rc="$(AUDIT_RC=seq AUDIT_SEQ='22 14' WITH_YES=0 PACKAGES='accepted@1.0.0 pending
 [[ "$rc" == 102 ]] || fail "local approval carried a pending neighbour"
 pass "local approval passes final confirmation without carrying another artifact"
 
+# The lane's mise-ownership state is the parent's, set for ONE child: the host-install entry initialises
+# it, so an inherited value changes nothing there (the wrapper entry does the same, see tests/install/run.sh).
+rm -f "$tmp/entry-state"
+SAFE_GATE_MISE_LANE_RESULT=/inherited/result SAFE_GATE_MISE_LANE_DONE=1 SAFE_GATE_MISE_LANE_NONPLAIN=x bash <<'INNER'
+source <(sed '/^argv0=/,$d' "$ROOT/bin/safe")
+source "$ROOT/lib/gate-lib.sh"
+set +e
+printf '#!/bin/sh\nexit 0\n' > "$tmp/audit"; chmod +x "$tmp/audit"
+SAFE_AUDIT_PATH="$tmp/audit"
+export SAFE_RUN_CONFIG_DIR="$tmp/run-config" SAFE_AUDIT_DATA_DIR="$tmp/audit-data"
+mkdir -p "$SAFE_RUN_CONFIG_DIR" "$SAFE_AUDIT_DATA_DIR"
+gate_lib_path() { printf '%s' "$tmp/empty-lib"; }
+manager=npm
+global_mode=0
+safe_install_gate_log() { :; }
+safe_install_confirm() { exit 102; }
+safe_install_trustable_package() { return 1; }
+safe_gate_dispatch() { printf '%s|%s|%s\n' "${SAFE_GATE_MISE_LANE_RESULT-unset}" "${SAFE_GATE_MISE_LANE_DONE-unset}" "${SAFE_GATE_MISE_LANE_NONPLAIN-unset}" >"$tmp/entry-state"; return 0; }
+( cmd_install --host --yes green@1.0.0 ) 2>/dev/null
+exit 0
+INNER
+[[ "$(cat "$tmp/entry-state" 2>/dev/null)" == "unset|unset|unset" ]] || fail "the host-install entry passed inherited ownership state on ($(cat "$tmp/entry-state" 2>/dev/null))"
+pass "the host-install entry initialises the lane's mise ownership state"
+
 printf 'unattended-green: all cases passed\n'

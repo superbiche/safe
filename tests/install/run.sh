@@ -7793,6 +7793,7 @@ case "${tamper}:${sub}" in
   admit-fails:project-admit)             exit 2 ;;
   admit-bad-names:project-admit)         jq -c '.names = [1]' <<<"${out}"; exit "${rc}" ;;
   graph-bound-contradiction:project-graph) [[ "${last}" != */projection/* ]] || emit; jq -c '.bindability.bound = true | .bindability.unbound = [{"path":"x","name":"x","version":"1","origin":"","reason":"y"}]' <<<"${out}"; exit "${rc}" ;;
+  bind-lose-result:project-bind)         for f in "${TMPDIR:-/tmp}"/safe-mise-lane.*/result; do rm -f "$f"; mkdir "$f"; done; printf '%s\n' "${out}"; exit "${rc}" ;;
   bind-retained:project-bind)            jq -c '.publication.retained = [{"name":"x","location":"staging","observed":"y"}]' <<<"${out}"; exit "${rc}" ;;
   bind-one-file:project-bind)            jq -c '.publication.published = ["package.json"]' <<<"${out}"; exit "${rc}" ;;
   bind-no-problems:project-bind)         jq -c 'del(.verification.problems)' <<<"${out}"; exit "${rc}" ;;
@@ -8126,6 +8127,12 @@ case_project_lane_committed_lockfile_entries_are_admitted_before_npm_runs() {
     lane_prepare "${label}" kept@1.0.0
     lane_lock kept@1.0.0 | jq -c "${mutate}" > "${WORK_DIR}/package-lock.json"
     lane_commit
+    if [[ "${mutate}" == *'"link": true'* ]]; then
+      # a link that leaves the project is UNSAFE: refused, committed or not
+      lane_run 'npm install clean@1.0.0'
+      lane_unsupported_case "$FUNCNAME: ${mutate}" install 'a committed link outside the project' || return
+      continue
+    fi
     # committed: an established shape the lane cannot bind: today's gate, after the one-shot line
     lane_oneshot_case "$FUNCNAME: ${mutate}" install 'lockfile' 'npm install clean@1.0.0' || return
     # the same lockfile in uncommitted changes: a refusal, before npm runs
@@ -8446,49 +8453,84 @@ case_project_lane_every_npm_run_gets_exactly_the_listed_environment() {
 # The one-shot route: today's gate, after ONE line naming the reason, and exactly what it does with
 # the switch off (the same status, the same delegation). $1 label, $2 verb, $3 a fragment of the
 # reason, $4 the command, then VAR=value pairs the case needs in the environment.
-# What today's gate delegated to and audited, without the lane's own probes of npm's configuration
-# and without per-run temporary names.
+# What today's gate did, in ORDER: its audits and delegations with each delegate's environment, without
+# the lane's own probes of npm (a configuration probe carrying the lane's fixed destinations, and the
+# lines that describe that probe's run). $1 the log, $2 and $3 a path of the other fixture to rewrite.
 lane_delegation_of_log() {
-  grep -P '^(REAL|AUDIT)\t' "${LOG_FILE}" | grep -vP '^REAL\tnpm\tconfig\t' | sed -E 's#(safe-gate-scan\.)[A-Za-z0-9]+#\1X#' | sort
+  local log="${1:-${LOG_FILE}}"
+  # Each event is preceded by lines that describe it (the environment names, the node used) and
+  # followed by the npm file it ran: those travel with the event, kept or dropped as it is.
+  awk '
+    function flush(   i) { for (i = 0; i < n; i++) print held[i]; n = 0 }
+    /^(ENVNAMES|NODEBIN|LOCKFD_INHERITED|PRIVATE_PATH)\t/ { held[n++] = $0; next }
+    /^NPMBIN\t/ { if (!skip) print; next }
+    /^REAL\tnpm\tconfig\t/ && /replace-registry-host=never/ { n = 0; skip = 1; next }
+    /^(REAL|AUDIT|MISEQ|MISE_REACHED|PROJECTION|EVIDENCE_INPUT|EVIDENCE_NAMES|CORE_BIND_ARGS)\t/ { skip = 0; flush(); print; next }
+    { flush(); print }
+    END { flush() }
+  ' "${log}" | sed -E 's#(safe-gate-scan\.)[A-Za-z0-9]+#\1X#' | { if [[ -n "${2:-}" ]]; then sed "s#${2}#${3}#g"; else cat; fi; }
 }
 
+# The one-shot route: today's gate, after ONE line naming the reason, and EXACTLY what it does with the
+# switch off, run on a second, independent fixture (a copy of the project and of the home, the switch
+# off): the same status, the same standard output, the same standard error but for the one line, the
+# same events in the same order, the same delegate environments. The switch-on trace is kept in
+# ${LANE_ONESHOT_TRACE} for the caller's own assertions. A case where today's gate itself refuses is
+# fine: its refusal is today's gate's, never the lane's.
+# $1 label, $2 verb, $3 a fragment of the reason, $4 the command, then VAR=value pairs.
 lane_oneshot_case() {
-  local label="$1" verb="$2" fragment="$3" script="$4" kv status_on real_on err_on status_off real_off err_off
+  local label="$1" verb="$2" fragment="$3" script="$4" kv
   shift 4
+  local on_status on_out on_err off_status off_out off_err on_events off_events
+  local twin="${CASE_DIR}/off-fixture" work_on="${WORK_DIR}" home_on="${HOME_DIR}"
+  rm -rf "${twin}"
+  mkdir -p "${twin}"
+  cp -a "${work_on}" "${twin}/work" && cp -a "${home_on}" "${twin}/home" || { fail "${label}: cannot build the second fixture"; return 1; }
+  : > "${home_on}/.stub-log-env"
+  : > "${twin}/home/.stub-log-env"
   for kv in "$@"; do export "${kv?}"; done
   : > "${LOG_FILE}"
   lane_run "${script}"
-  status_on="${STATUS}"
-  real_on="$(lane_delegation_of_log)"
-  err_on="$(cat "${ERR_FILE}")"
-  local config="${HOME_DIR}/.config/safe/run/config.json" saved
-  saved="$(cat "${config}")"
-  printf '{"install":{"project_lane":false}}\n' > "${config}"
+  on_status="${STATUS}"
+  on_out="$(cat "${OUT_FILE}")"
+  on_err="$(cat "${ERR_FILE}")"
+  LANE_ONESHOT_TRACE="${CASE_DIR}/oneshot-on.log"
+  cp -- "${LOG_FILE}" "${LANE_ONESHOT_TRACE}"
+  on_events="$(lane_delegation_of_log "${LANE_ONESHOT_TRACE}" "${work_on}" "<W>" | sed "s#${home_on}#<H>#g")"
+  # the same command on the independent fixture, the switch off
+  printf '{"install":{"project_lane":false}}\n' > "${twin}/home/.config/safe/run/config.json"
+  local saved_work="${WORK_DIR}" saved_home_install="${SAFE_INSTALL_HOME:-}"
+  WORK_DIR="${twin}/work"
+  SAFE_INSTALL_HOME="${twin}/home"
   : > "${LOG_FILE}"
   lane_run "${script}"
-  status_off="${STATUS}"
-  real_off="$(lane_delegation_of_log)"
-  err_off="$(cat "${ERR_FILE}")"
-  printf '%s\n' "${saved}" > "${config}"
+  off_status="${STATUS}"
+  off_out="$(cat "${OUT_FILE}")"
+  off_err="$(cat "${ERR_FILE}")"
+  off_events="$(lane_delegation_of_log "${LOG_FILE}" "${twin}/work" "<W>" | sed "s#${twin}/home#<H>#g")"
+  WORK_DIR="${saved_work}"
+  if [[ -n "${saved_home_install}" ]]; then SAFE_INSTALL_HOME="${saved_home_install}"; else unset SAFE_INSTALL_HOME; fi
   for kv in "$@"; do unset "${kv%%=*}"; done
-  local fragment_re
+  local fragment_re line_re
   fragment_re="$(printf '%s' "${fragment}" | sed 's/[][\.*^$()+?{}|]/\\&/g')"
-  local line_re="^safe: project lane: npm ${verb} \\[lane: one-shot, .*${fragment_re}.*\\] — the closure is not judged on this route$"
-  if [[ "$(printf '%s\n' "${err_on}" | grep -cE "^safe: project lane: ")" -ne 1 ]] || ! printf '%s\n' "${err_on}" | grep -qE -- "${line_re}"; then
-    printf 'stderr with the switch on:\n%s\n' "${err_on}" >&2
+  line_re="^safe: project lane: npm ${verb} \\[lane: one-shot, .*${fragment_re}.*\\] — the closure is not judged on this route$"
+  if [[ "$(printf '%s\n' "${on_err}" | grep -cE "^safe: project lane: ")" -ne 1 ]] || ! printf '%s\n' "${on_err}" | grep -qE -- "${line_re}"; then
+    printf 'stderr with the switch on:\n%s\n' "${on_err}" >&2
     fail "${label}: no single one-shot line for ${fragment}"
     return 1
   fi
-  if printf '%s\n' "${err_on}" | grep -q 'safe: BLOCKED'; then
-    fail "${label}: a refusal came with the one-shot line"
+  if printf '%s\n' "${on_err}" | grep -q '\[lane: project\]'; then
+    fail "${label}: a lane refusal came with the one-shot line"
     return 1
   fi
-  [[ "${status_on}" == "${status_off}" ]] || { fail "${label}: status ${status_on} with the switch on, ${status_off} with it off"; return 1; }
-  [[ "${real_on}" == "${real_off}" ]] || { printf 'on:\n%s\noff:\n%s\n' "${real_on}" "${real_off}" >&2; fail "${label}: today's gate did not delegate as with the switch off"; return 1; }
-  [[ -n "${real_on}" ]] || { fail "${label}: nothing was delegated: today's gate did not run"; return 1; }
-  # the rest of stderr is today's gate's own
-  [[ "$(printf '%s\n' "${err_on}" | grep -v '^safe: project lane: ')" == "${err_off}" ]] || { printf 'on:\n%s\noff:\n%s\n' "${err_on}" "${err_off}" >&2; fail "${label}: today's gate printed something else"; return 1; }
-  assert_log_not_contains_fragment 'PROJECTION' "${label}" || return 1
+  [[ "${on_status}" == "${off_status}" ]] || { fail "${label}: status ${on_status} with the switch on, ${off_status} with it off"; return 1; }
+  [[ "${on_out}" == "${off_out}" ]] || { printf 'on:\n%s\noff:\n%s\n' "${on_out}" "${off_out}" >&2; fail "${label}: standard output differs"; return 1; }
+  [[ "${on_events}" == "${off_events}" ]] || { diff <(printf '%s\n' "${on_events}") <(printf '%s\n' "${off_events}") >&2; fail "${label}: today's gate did not run as with the switch off (events, order or delegate environment)"; return 1; }
+  [[ -n "${on_events}" ]] || { fail "${label}: nothing was delegated or audited: today's gate did not run"; return 1; }
+  [[ "$(printf '%s\n' "${on_err}" | grep -v '^safe: project lane: ' | sed "s#${work_on}#<W>#g; s#${home_on}#<H>#g")" == "$(printf '%s\n' "${off_err}" | sed "s#${twin}/work#<W>#g; s#${twin}/home#<H>#g")" ]] \
+    || { printf 'on:\n%s\noff:\n%s\n' "${on_err}" "${off_err}" >&2; fail "${label}: today's gate printed something else"; return 1; }
+  ! grep -q $'^PROJECTION\ttnpm' "${LANE_ONESHOT_TRACE}" || { fail "${label}: the lane projected"; return 1; }
+  ! grep -q '^PROJECTION' "${LANE_ONESHOT_TRACE}" || { fail "${label}: the lane projected"; return 1; }
   return 0
 }
 
@@ -9111,7 +9153,6 @@ case_project_lane_nothing_is_written_to_the_project_before_publication() {
   lane_prepare "lane-no-writes" kept@1.0.0
   # A project-relative cache: npm creates it in the directory it runs in.
   printf 'cache=./.npm-cache\n' > "${WORK_DIR}/.npmrc"
-  lane_commit
   local before
   before="$(lane_listing)"
   # refused: a cache inside the project is not carried (by the parity probe)
@@ -9470,17 +9511,28 @@ case_project_lane_launcher_that_cannot_be_followed_refuses() {
   rm -f "${NODE_BIN}/npm"
   printf '#!/bin/sh\nexit 99\n' > "${NODE_BIN}/npm"
   chmod +x "${NODE_BIN}/npm"
-  # a property of the HOST (the npm it offers): today's gate, after the one-shot line
-  lane_oneshot_case "$FUNCNAME" install 'an npm launcher the lane cannot follow' 'npm install clean@2.0.0' || return
+  # its provenance cannot be established (which npm, which Node, from which search path): the lane's line,
+  # never today's gate. The refusal of ci, dedupe and prune comes first.
+  lane_run 'npm install clean@2.0.0'
+  lane_unsupported_case "$FUNCNAME" install 'an opaque launcher' || return
+  assert_err_contains_fragment 'an npm launcher the lane cannot follow' "$FUNCNAME" || return
+  : > "${LOG_FILE}"
+  lane_run 'npm ci'
+  assert_status 100 "$FUNCNAME: ci" || return
+  assert_err_contains_fragment 'npm ci is not routed by the project lane yet' "$FUNCNAME: ci" || return
   # npm's own CLI file with no Node beside its link
   lane_prepare "lane-launcher-no-node" kept@1.0.0
   rm -f "${NODE_BIN}/node"
-  lane_oneshot_case "$FUNCNAME" install 'an npm launcher the lane cannot follow' 'npm install clean@2.0.0' || return
+  lane_run 'npm install clean@2.0.0'
+  lane_unsupported_case "$FUNCNAME" install 'a launcher with no node beside it' || return
+  assert_err_contains_fragment 'an npm launcher the lane cannot follow' "$FUNCNAME" || return
   # a version manager's launcher with no Node beside it
   lane_mise_layout "lane-launcher-manager-no-node" kept@1.0.0
   rm -f "${NODE_DIR}/bin/node"
-  lane_oneshot_case "$FUNCNAME" install 'a version manager' 'npm install clean@2.0.0' || return
+  lane_run 'npm install clean@2.0.0'
   unset SAFE_TEST_PATH_MID
+  lane_unsupported_case "$FUNCNAME" install 'a manager launcher with no node' || return
+  assert_err_contains_fragment 'a version manager' "$FUNCNAME" || return
   # the launcher the manager names is the one that runs: a launcher that refuses an invocation is obeyed
   lane_mise_layout "lane-launcher-obeyed" kept@1.0.0
   printf '#!/usr/bin/env bash\nprintf "refused by the operator wrapper\\n" >&2\nexit 77\n' > "${NODE_DIR}/bin/npm"
@@ -10967,6 +11019,299 @@ case_project_lane_routing_mise_exec_with_an_inner_command_that_is_not_the_lanes_
 }
 
 
+# ---- routing, review of the first pass (ticket 1633) ----------------------------------------
+
+# 1. Safety before compatibility: a reason that is only UNSUPPORTED never outranks a safety check.
+case_project_lane_routing_a_compatibility_reason_never_outranks_a_safety_check() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local before
+  # a committed version 1 lockfile together with a refused argument: the argument refuses
+  lane_prepare "lane-safety-arg" kept@1.0.0
+  lane_lock kept@1.0.0 | jq -c '.lockfileVersion = 1' > "${WORK_DIR}/package-lock.json"
+  lane_commit
+  : > "${LOG_FILE}"
+  lane_run 'npm install clean'
+  lane_unsupported_case "$FUNCNAME" install 'a refused argument beside a v1 lockfile' || return
+  assert_err_not_contains_fragment 'one-shot' "$FUNCNAME" || return
+  # ... with a private name: the private-name guard refuses
+  lane_prepare "lane-safety-private" kept@1.0.0
+  lane_private_store || { fail "$FUNCNAME: store"; return; }
+  lane_lock kept@1.0.0 | jq -c '.lockfileVersion = 1' > "${WORK_DIR}/package-lock.json"
+  jq -c '.dependencies["@p/lib"] = "^1.0.0"' "${WORK_DIR}/package.json" > "${WORK_DIR}/package.json.new"
+  mv "${WORK_DIR}/package.json.new" "${WORK_DIR}/package.json"
+  lane_commit
+  : > "${LOG_FILE}"
+  lane_run 'npm install clean@2.0.0'
+  lane_unsupported_case "$FUNCNAME" install 'a private name beside a v1 lockfile' || return
+  assert_err_contains_fragment 'touches the private-registry store' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'one-shot' "$FUNCNAME" || return
+  # ... with an .npmrc that is not admitted: both are compatibility reasons, both established, and NO npm of
+  # the lane reads that project (only the route probe, in a scratch directory, ran) before today's gate
+  lane_prepare "lane-safety-npmrc" kept@1.0.0
+  lane_lock kept@1.0.0 | jq -c '.lockfileVersion = 1' > "${WORK_DIR}/package-lock.json"
+  printf 'strict-ssl=false\n' > "${WORK_DIR}/.npmrc"
+  lane_commit
+  lane_oneshot_case "$FUNCNAME" install 'is not a version 2 or 3 lockfile; .npmrc line 1' 'npm install clean@2.0.0' || return
+  [[ "$(grep -c 'replace-registry-host=never' "${LANE_ONESHOT_TRACE}")" == 1 ]] || { fail "$FUNCNAME: the lane probed a project whose .npmrc was not admitted ($(grep -c 'replace-registry-host=never' "${LANE_ONESHOT_TRACE}") lane probes)"; return; }
+  # contrast: the same v1 lockfile with an admitted configuration is probed by the guards before the one-shot
+  lane_prepare "lane-safety-guards-ran" kept@1.0.0
+  lane_lock kept@1.0.0 | jq -c '.lockfileVersion = 1' > "${WORK_DIR}/package-lock.json"
+  lane_commit
+  lane_oneshot_case "$FUNCNAME" install 'is not a version 2 or 3 lockfile' 'npm install clean@2.0.0' || return
+  [[ "$(grep -c 'replace-registry-host=never' "${LANE_ONESHOT_TRACE}")" -ge 3 ]] || { fail "$FUNCNAME: the guards did not run before the one-shot"; return; }
+  # a committed lockfile with a path outside the tree is UNSAFE: refused, committed or not
+  local how
+  for how in committed uncommitted; do
+    lane_prepare "lane-safety-outside-${how}" kept@1.0.0
+    lane_lock kept@1.0.0 | jq -c '.packages["../outside/pkg"] = {"version":"1.0.0"}' > "${WORK_DIR}/package-lock.json"
+    [[ "${how}" == committed ]] && lane_commit
+    before="$(lane_digests)"
+    : > "${LOG_FILE}"
+    lane_run 'npm install clean@2.0.0'
+    lane_unsupported_case "$FUNCNAME" install "a path outside the tree (${how})" || return
+    assert_err_contains_fragment 'names a path outside the tree' "$FUNCNAME: ${how}" || return
+    assert_err_not_contains_fragment 'one-shot' "$FUNCNAME: ${how}" || return
+    assert_lane_untouched "${before}" "$FUNCNAME: ${how}" || return
+  done
+  # mixed causes: one established (a committed v1 lockfile), one not (a manifest source in uncommitted changes): refused
+  lane_prepare "lane-safety-mixed" kept@1.0.0
+  lane_lock kept@1.0.0 | jq -c '.lockfileVersion = 1' > "${WORK_DIR}/package-lock.json"
+  lane_commit
+  jq -c '.dependencies.odd = "git+https://example.invalid/x.git"' "${WORK_DIR}/package.json" > "${WORK_DIR}/package.json.new"
+  mv "${WORK_DIR}/package.json.new" "${WORK_DIR}/package.json"
+  : > "${LOG_FILE}"
+  lane_run 'npm install clean@2.0.0'
+  lane_unsupported_case "$FUNCNAME" install 'mixed causes' || return
+  assert_err_contains_fragment 'package.json differs from the committed one' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'one-shot' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# the one-shot route where today's gate itself refuses: its refusal is the delegate's, never the lane's
+case_project_lane_routing_the_one_shot_route_carries_todays_gates_own_refusal() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-oneshot-refusal" kept@1.0.0
+  jq -c '.dependencies.odd = "git+https://example.invalid/x.git"' "${WORK_DIR}/package.json" > "${WORK_DIR}/package.json.new"
+  mv "${WORK_DIR}/package.json.new" "${WORK_DIR}/package.json"
+  lane_commit
+  lane_oneshot_case "$FUNCNAME" install 'manifest.dependencies.odd' 'npm install blockme@1.0.0' || return
+  [[ "${STATUS}" == 0 ]] || true
+  pass "$FUNCNAME"
+}
+
+# 2. Provenance of the host decision.
+case_project_lane_routing_a_configuration_file_chosen_through_the_environment_refuses() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local name
+  for name in npm_config_userconfig NPM_CONFIG_USERCONFIG npm_config_globalconfig NPM_CONFIG_GLOBALCONFIG; do
+    lane_prepare "lane-provenance-${RANDOM}" kept@1.0.0
+    : > "${LOG_FILE}"
+    export "${name}=${CASE_DIR}/some-npmrc"
+    NPM_LOCKDIFF_REGISTRY_CONFIG_JSON='{"registry":"https://r.example/"}' lane_run 'npm install clean@2.0.0'
+    unset "${name}"
+    assert_status 100 "$FUNCNAME: ${name}" || return
+    assert_lane_final_line install "$FUNCNAME: ${name}" || return
+    assert_err_contains_fragment "${name}" "$FUNCNAME: ${name}" || return
+    assert_err_contains_fragment 'selects a configuration file for this command' "$FUNCNAME: ${name}" || return
+    assert_err_not_contains_fragment 'one-shot' "$FUNCNAME: ${name}" || return
+    assert_lane_no_delegate "$FUNCNAME: ${name}" || return
+  done
+  pass "$FUNCNAME"
+}
+
+case_project_lane_routing_a_probe_that_fails_to_load_is_a_refusal_never_missing_capabilities() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  # the gate: a probe that exits non-zero or answers nothing
+  local status
+  for status in 3 1; do
+    lane_prepare "lane-probe-status-${status}" kept@1.0.0
+    : > "${LOG_FILE}"
+    NODE_PROBE_STATUS="${status}" lane_run 'npm install clean@2.0.0'
+    assert_status 100 "$FUNCNAME: probe status ${status}" || return
+    assert_lane_final_line install "$FUNCNAME: probe status ${status}" || return
+    assert_err_not_contains_fragment 'one-shot' "$FUNCNAME: probe status ${status}" || return
+  done
+  # the probe itself, on a real node, against an npm whose definitions module THROWS
+  local real_node
+  real_node="$(command -v node 2>/dev/null)" || { printf '# %s: no node here for the throwing-module check\n' "$FUNCNAME"; pass "$FUNCNAME"; return; }
+  local npm_dir="${CASE_DIR}/fake-npm" script="${CASE_DIR}/lane-probe.cjs" out
+  mkdir -p "${npm_dir}/node_modules/@npmcli/config/lib" "${npm_dir}/node_modules/semver"
+  printf '{"name":"npm","version":"11.20.0"}\n' > "${npm_dir}/package.json"
+  printf 'exports.valid = (v) => v; exports.gte = () => true\n' > "${npm_dir}/node_modules/semver/index.js"
+  printf 'throw new Error("cannot load")\n' > "${npm_dir}/node_modules/@npmcli/config/lib/definitions.js"
+  ( source "${ROOT_DIR}/lib/gate-lib.sh"; safe_gate_lane_write_probe_script "${script}" ) || { fail "$FUNCNAME: cannot write the probe"; return; }
+  out="$(printf '{"floor":"11.12.1","options":["allow-git"]}' | "${real_node}" "${script}" "${npm_dir}" capability 2>/dev/null)"
+  local rc=$?
+  [[ "${rc}" == 3 && -z "${out}" ]] || { fail "$FUNCNAME: a definitions module that throws answered (rc ${rc}: ${out})"; return; }
+  # ... and one that loads but lacks the option is the positive "missing" answer
+  printf 'exports.definitions = { cache: {}, git: {} }\n' > "${npm_dir}/node_modules/@npmcli/config/lib/definitions.js"
+  out="$(printf '{"floor":"11.12.1","options":["allow-git","cache"]}' | "${real_node}" "${script}" "${npm_dir}" capability 2>/dev/null)"
+  [[ "$(jq -c '.missing' <<<"${out}")" == '["allow-git"]' ]] || { fail "$FUNCNAME: a definitions module without the option did not answer 'missing' (${out})"; return; }
+  pass "$FUNCNAME"
+}
+
+# 3. mise exec: the lane owns the plain form only.
+case_project_lane_routing_mise_exec_owns_only_the_plain_form() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local script
+  for script in 'mise exec node@20 -- npm install clean@2.0.0' 'mise x node@20 -- npm install clean@2.0.0' 'mise exec --raw -- npm install clean@2.0.0' \
+      'mise --raw exec -- npm install clean@2.0.0' 'mise exec -E dev -- npm install clean@2.0.0'; do
+    lane_prepare "lane-mise-plain-${RANDOM}" kept@1.0.0
+    : > "${LOG_FILE}"
+    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run "${script}"
+    assert_status 100 "$FUNCNAME: ${script}" || return
+    assert_lane_final_line install "$FUNCNAME: ${script}" || return
+    assert_err_contains_fragment 'is not covered by the project lane' "$FUNCNAME: ${script}" || return
+    assert_err_contains_fragment 'run npm in the project directory directly, or drop the option' "$FUNCNAME: ${script}" || return
+    assert_log_not_contains_fragment $'REAL\tmise\texec' "$FUNCNAME: ${script}" || return
+    assert_log_not_contains_fragment 'PROJECTION' "$FUNCNAME: ${script}" || return
+  done
+  # the plain forms, -C included, are the lane's
+  lane_prepare "lane-mise-plain-ok" kept@1.0.0
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run "mise x --cd '${WORK_DIR}' -- npm install clean@2.0.0"
+  assert_status 0 "$FUNCNAME: --cd" || return
+  grep -q $'^PROJECTION\tnpm' "${LOG_FILE}" || { fail "$FUNCNAME: --cd did not reach the lane"; return; }
+  # a global install under mise exec behaves exactly as with the switch off, an overlay key the lane could not carry included
+  lane_prepare "lane-mise-global-overlay" kept@1.0.0
+  lane_oneshot_global_equal "$FUNCNAME" 'mise exec -- npm install -g okpkg' 'MISE_ENV_JSON={"npm_config_git":"/bin/x"}' || return
+  lane_oneshot_global_equal "$FUNCNAME" 'mise exec node@20 -- npm install -g okpkg' || return
+  pass "$FUNCNAME"
+}
+
+# A command that is not the lane's runs as with the switch off: same status, standard output and error, events.
+lane_oneshot_global_equal() { # label script [VAR=value ...]
+  local label="$1" script="$2" kv on_status on_out on_err on_events
+  shift 2
+  for kv in "$@"; do export "${kv?}"; done
+  : > "${LOG_FILE}"
+  lane_run "${script}"
+  on_status="${STATUS}"; on_out="$(cat "${OUT_FILE}")"; on_err="$(cat "${ERR_FILE}")"; on_events="$(lane_delegation_of_log "${LOG_FILE}")"
+  printf '{"install":{"project_lane":false}}\n' > "${HOME_DIR}/.config/safe/run/config.json"
+  : > "${LOG_FILE}"
+  lane_run "${script}"
+  local same=1
+  [[ "${STATUS}" == "${on_status}" && "$(cat "${OUT_FILE}")" == "${on_out}" && "$(cat "${ERR_FILE}")" == "${on_err}" && "$(lane_delegation_of_log "${LOG_FILE}")" == "${on_events}" ]] || same=0
+  printf '{"install":{"project_lane":true}}\n' > "${HOME_DIR}/.config/safe/run/config.json"
+  for kv in "$@"; do unset "${kv%%=*}"; done
+  (( same )) || { printf 'on: %s\n%s\n' "${on_status}" "${on_err}" >&2; fail "${label}: ${script} differs from the switch off"; return 1; }
+  [[ -n "${on_events}" ]] || { fail "${label}: ${script}: nothing ran"; return 1; }
+  return 0
+}
+
+# 4. The result channel.
+case_project_lane_routing_the_original_command_never_runs_when_the_lanes_result_is_lost() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-mise-result-lost" kept@1.0.0
+  : > "${LOG_FILE}"
+  SAFE_CORE_TAMPER=bind-lose-result NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" \
+    lane_run 'mise exec -- npm install clean@2.0.0'
+  assert_status 100 "$FUNCNAME" || return
+  assert_lane_final_line install "$FUNCNAME" || return
+  assert_err_contains_fragment 'result' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tmise\texec' "$FUNCNAME" || return
+  [[ "$(grep -cP '^REAL\tnpm\tci\t' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: the lane did not run exactly once"; return; }
+  # the lane's own failure still ends the command with its status, and the original is not run either
+  lane_prepare "lane-mise-result-failure" kept@1.0.0
+  : > "${LOG_FILE}"
+  NPM_CI_STATUS=7 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'mise exec -- npm install clean@2.0.0'
+  assert_status 7 "$FUNCNAME: a failed materialisation" || return
+  assert_log_not_contains_fragment $'REAL\tmise\texec' "$FUNCNAME: a failed materialisation" || return
+  pass "$FUNCNAME"
+}
+
+case_project_lane_routing_inherited_ownership_state_changes_nothing_at_the_wrapper_entry() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local state='export SAFE_GATE_MISE_LANE_RESULT=/inherited/result SAFE_GATE_MISE_LANE_DONE=1 SAFE_GATE_MISE_LANE_NONPLAIN=x; '
+  # switch off: identical to the same command without it
+  lane_prepare "lane-inherit-off" kept@1.0.0
+  printf '{"install":{"project_lane":false}}\n' > "${HOME_DIR}/.config/safe/run/config.json"
+  : > "${LOG_FILE}"
+  lane_run 'npm install clean@2.0.0'
+  local status_plain="${STATUS}" events_plain err_plain
+  events_plain="$(lane_delegation_of_log)"; err_plain="$(cat "${ERR_FILE}")"
+  : > "${LOG_FILE}"
+  lane_run "${state}npm install clean@2.0.0"
+  [[ "${STATUS}" == "${status_plain}" && "$(lane_delegation_of_log)" == "${events_plain}" && "$(cat "${ERR_FILE}")" == "${err_plain}" ]] \
+    || { fail "$FUNCNAME: inherited state changed a command with the switch off"; return; }
+  assert_log_contains $'REAL\tnpm\tinstall\tclean@2.0.0' "$FUNCNAME" || return
+  # switch on: the lane runs as always, the inherited result path is never written
+  lane_prepare "lane-inherit-on" kept@1.0.0
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run "${state}npm install clean@2.0.0"
+  assert_status 0 "$FUNCNAME: switch on" || return
+  grep -q $'^PROJECTION\tnpm' "${LOG_FILE}" || { fail "$FUNCNAME: the lane did not run"; return; }
+  [[ ! -e /inherited ]] || { fail "$FUNCNAME: something was written under the inherited path"; return; }
+  # mise exec with the same inherited state and the switch on: the lane is the command
+  lane_prepare "lane-inherit-mise" kept@1.0.0
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run "${state}mise exec -- npm install clean@2.0.0"
+  assert_status 0 "$FUNCNAME: mise exec" || return
+  assert_log_not_contains_fragment $'REAL\tmise\texec' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_project_lane_routing_mise_exec_with_a_relative_directory() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-mise-relative-C" kept@1.0.0
+  local rel="${WORK_DIR#${CASE_DIR}/}"
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" \
+    lane_run "cd '${CASE_DIR}' && mise -C '${rel}' exec -- npm install clean@2.0.0"
+  assert_status 0 "$FUNCNAME" || return
+  [[ -d "${WORK_DIR}/node_modules/clean" ]] || { fail "$FUNCNAME: the relative -C directory was not the project"; return; }
+  assert_log_not_contains_fragment $'REAL\tmise\texec' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# 5. Every refusal goes through the lane's renderer.
+case_project_lane_routing_every_new_refusal_has_the_lanes_final_line() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  # the guards' copy of the project cannot be made (the fallback helper)
+  local out rc
+  out="$(bash -c '
+    source "$1/lib/gate-lib.sh"
+    verb=install lane_sub="install [lane: project]" dest=() proj_args=() orig_args=() snap=/nonexistent proj=/nonexistent SAFE_GATE_LANE_GIT=/bin/false
+    safe_gate_lane_guard() { return 0; }
+    safe_gate_lane_cp() { return 1; }
+    safe_gate_project_lane_guards_first
+    echo "rc=$?"' _ "${ROOT_DIR}" 2>&1)"
+  [[ "$(printf '%s\n' "${out}" | tail -n 1)" == "rc=100" ]] || { fail "$FUNCNAME: the copy failure did not return 100 ($out)"; return; }
+  printf '%s\n' "${out}" | grep -qE '^safe: BLOCKED npm install \[lane: project\] — .*; details: safe explain$' || { fail "$FUNCNAME: the copy failure has no lane line ($out)"; return; }
+  # the overlay refusal, under mise exec
+  lane_prepare "lane-final-line-overlay" kept@1.0.0
+  MISE_ENV_JSON='{"npm_config_git":"/bin/x"}' lane_run 'mise exec -- npm install clean@2.0.0'
+  assert_status 100 "$FUNCNAME: overlay" || return
+  assert_lane_final_line install "$FUNCNAME: overlay" || return
+  assert_err_contains_fragment 'npm_config_git' "$FUNCNAME: overlay" || return
+  pass "$FUNCNAME"
+}
+
+# 6. Nothing of the lane reaches today's gate.
+case_project_lane_routing_whatever_the_lane_or_its_probes_set_is_put_back() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local out
+  out="$(bash -c '
+    source "$1/lib/gate-lib.sh"
+    export SAFE_GATE_LOCKDIFF_KEEP=before SAFE_GATE_LANE_FOREIGN=theirs
+    SAFE_GATE_LOCKDIFF_PLAIN=plain
+    safe_gate_project_lane_run() {
+      SAFE_GATE_LOCKDIFF_KEEP=changed; SAFE_GATE_LOCKDIFF_NEW=probe; unset SAFE_GATE_LOCKDIFF_PLAIN
+      SAFE_GATE_LANE_PASS=1; return 0
+    }
+    safe_gate_project_lane_npm; rc=$?
+    printf "%s|%s|%s|%s|%s|%s|%s\n" "${rc}" "${SAFE_GATE_LOCKDIFF_KEEP-unset}" "${SAFE_GATE_LOCKDIFF_NEW-unset}" "${SAFE_GATE_LOCKDIFF_PLAIN-unset}" "${SAFE_GATE_LANE_FOREIGN-unset}" "${SAFE_GATE_LANE_PASS-unset}" "$(env | grep -c "^SAFE_GATE_LOCKDIFF_KEEP=before$")"' _ "${ROOT_DIR}" 2>&1)"
+  [[ "${out}" == "0|before|unset|plain|theirs|1|1" ]] || { fail "$FUNCNAME: the lane's state reached the delegate (${out})"; return; }
+  # and through the one-shot route: the delegate's environment names are the switch-off ones (lane_oneshot_case)
+  lane_prepare "lane-state-oneshot" kept@1.0.0
+  jq -c '.dependencies.odd = "git+https://example.invalid/x.git"' "${WORK_DIR}/package.json" > "${WORK_DIR}/package.json.new"
+  mv "${WORK_DIR}/package.json.new" "${WORK_DIR}/package.json"
+  lane_commit
+  lane_oneshot_case "$FUNCNAME" install 'manifest.dependencies.odd' 'npm install clean@2.0.0' || return
+  [[ ! -d "${WORK_DIR}/.safe-bind-"* ]] 2>/dev/null || { fail "$FUNCNAME: a staging directory is left"; return; }
+  pass "$FUNCNAME"
+}
+
+
 main() {
   local case
   for case in \
@@ -11119,6 +11464,16 @@ main() {
     case_project_lane_baseline_a_fresh_clone_starts_from_its_committed_lockfile \
     case_project_lane_baseline_a_project_outside_git_starts_empty_then_from_what_safe_stored \
     case_project_lane_baseline_nothing_is_recorded_unless_the_decision_is_clear \
+    case_project_lane_routing_a_compatibility_reason_never_outranks_a_safety_check \
+    case_project_lane_routing_the_one_shot_route_carries_todays_gates_own_refusal \
+    case_project_lane_routing_a_configuration_file_chosen_through_the_environment_refuses \
+    case_project_lane_routing_a_probe_that_fails_to_load_is_a_refusal_never_missing_capabilities \
+    case_project_lane_routing_mise_exec_owns_only_the_plain_form \
+    case_project_lane_routing_the_original_command_never_runs_when_the_lanes_result_is_lost \
+    case_project_lane_routing_inherited_ownership_state_changes_nothing_at_the_wrapper_entry \
+    case_project_lane_routing_mise_exec_with_a_relative_directory \
+    case_project_lane_routing_every_new_refusal_has_the_lanes_final_line \
+    case_project_lane_routing_whatever_the_lane_or_its_probes_set_is_put_back \
     case_project_lane_routing_a_committed_npmrc_outside_the_allow_list_takes_the_one_shot_route \
     case_project_lane_routing_an_npm_without_the_capabilities_takes_the_one_shot_route \
     case_project_lane_routing_a_flag_an_environment_setting_a_broken_guard_and_a_dirty_lockfile_cannot_reach_the_one_shot_route \

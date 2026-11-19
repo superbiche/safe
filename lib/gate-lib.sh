@@ -2799,6 +2799,11 @@ safe_gate_project_lane_unsupported() {
   safe_gate_project_lane_refuse 100 "$1" "$2 is not covered by the project lane" "change the command, or the project, to a form the lane covers (npm install or npm update on registry packages), then retry"
 }
 
+# ci, dedupe and prune: not routed by the lane yet; refused before any property of the host is read.
+safe_gate_project_lane_verb_refusal() {
+  safe_gate_project_lane_refuse 100 "$1" "npm $1 is not routed by the project lane yet, and the gate it replaces cannot judge what it would install" "use npm install or npm update, which the lane covers, then retry"
+}
+
 # --- routing -------------------------------------------------------------------------
 # A command the lane cannot judge goes one of three ways (spec 1625, Routing):
 #   - today's gate, for a shape that is ESTABLISHED (committed at the head of the project's
@@ -2825,9 +2830,12 @@ safe_gate_project_lane_guards_first() {
   safe_gate_lane_guard safe_gate_npm_lockdiff_config_path_guard "${lane_sub}" "${orig_args[@]}" || return $?
   safe_gate_lane_guard safe_gate_npm_lockdiff_effective_config "${snap}" "${lane_sub}" "${probe_args[@]}" || return $?
   safe_gate_lane_guard safe_gate_npm_lockdiff_hidden_config_guard "${snap}" "${lane_sub}" "${probe_args[@]}" || return $?
-  safe_gate_lane_cp "${snap}/package.json" "${proj}/package.json" || return 100
-  [[ ! -f "${snap}/package-lock.json" ]] || safe_gate_lane_cp "${snap}/package-lock.json" "${proj}/package-lock.json" || return 100
-  [[ ! -f "${snap}/.npmrc" ]] || safe_gate_lane_cp "${snap}/.npmrc" "${proj}/.npmrc" || return 100
+  if ! { safe_gate_lane_cp "${snap}/package.json" "${proj}/package.json" \
+      && { [[ ! -f "${snap}/package-lock.json" ]] || safe_gate_lane_cp "${snap}/package-lock.json" "${proj}/package-lock.json"; } \
+      && { [[ ! -f "${snap}/.npmrc" ]] || safe_gate_lane_cp "${snap}/.npmrc" "${proj}/.npmrc"; }; }; then
+    safe_gate_project_lane_refuse 100 "${verb}" "the guards' copy of the project cannot be prepared (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
+    return $?
+  fi
   safe_gate_lane_guard safe_gate_npm_lockdiff_config_parity "${proj}" "${lane_sub}" "${probe_args[@]}" || return $?
   return 0
 }
@@ -2864,56 +2872,95 @@ safe_gate_project_lane_established() {
   esac
 }
 
-# An unsupported shape found in the project's FILES: the one-shot route when every named file
-# is established, a refusal otherwise (and for a failing guard, whatever the shape).
-# $1 verb, $2 reason, rest: the files the shape comes from.
-safe_gate_project_lane_shape() {
-  local verb="$1" reason="$2" file
-  shift 2
+# THE ORDER OF THE ROUTE DECISION (two passes):
+#   1. every safety check that runs without npm: the caller's arguments and environment, special
+#      files, the admission of the project's .npmrc, manifest and lockfile (a lockfile the core
+#      refuses as UNSAFE, a path outside the tree or a link leaving the project, refuses whether
+#      committed or not), the private-name guard. A refusal from any of them ends the command.
+#      A reason that is only UNSUPPORTED is merely COLLECTED here (safe_gate_project_lane_collect).
+#   2. only then (safe_gate_project_lane_decide): every collected reason must come from an
+#      ESTABLISHED file (committed and unchanged) or from the host; then the guards of the lane's
+#      own invocation, unless the project's .npmrc was not admitted (no npm probe of the lane runs
+#      on a configuration that was not admitted); then, and only then, the one-shot line and
+#      today's gate. Nothing found after that point is a compatibility reason that skipped a check.
+# The unsafe lockfile reasons are lockfile_path_outside_tree, link_outside_project and
+# identity_invalid (and lockfile_unreadable, which is missing evidence, 102); the merely unsupported
+# ones are links_not_supported (an in-project link), kind_not_admitted (git, file, remote),
+# integrity_missing, integrity_malformed, origin_missing, origin_not_canonical (another host),
+# own_shrinkwrap and bundled_parent_unbound, and a lockfile that is not version 2 or 3.
+# Run from safe_gate_project_lane_run: it reads and writes that function's locals.
+
+# Records a compatibility reason (and the files it comes from); the command goes on.
+safe_gate_project_lane_collect() {
+  local reason="$1" file
+  shift
+  local seen dup=0
+  for seen in ${compat_reasons[@]+"${compat_reasons[@]}"}; do
+    [[ "${seen}" != "${reason}" ]] || dup=1
+  done
+  (( dup )) || compat_reasons+=("${reason}")
   for file in "$@"; do
+    [[ " ${compat_files[*]-} " == *" ${file} "* ]] || compat_files+=("${file}")
+  done
+  return 0
+}
+
+# Decides the route of the collected reasons: 0 and nothing collected = the lane goes on;
+# 0 with SAFE_GATE_LANE_PASS=1 = today's gate (after the one-shot line); non-zero = refused.
+# $1 verb, $2 = 1 when a reason comes from the host's configuration (provenance is checked).
+safe_gate_project_lane_decide() {
+  local verb="$1" file reasons name
+  (( ${#compat_reasons[@]} > 0 )) || return 0
+  reasons="$(printf '%s; ' "${compat_reasons[@]}")"
+  reasons="${reasons%; }"
+  for file in ${compat_files[@]+"${compat_files[@]}"}; do
     if ! safe_gate_project_lane_established "${file}"; then
-      safe_gate_project_lane_refuse 100 "${verb}" "$(safe_gate_lane_clean "${reason}") is not covered by the project lane, and ${SAFE_GATE_LANE_REASON}, so there is no established state to route it by" "commit the change, or put the project in a form the lane covers (registry dependencies, a version 2 or 3 lockfile), then retry"
+      safe_gate_project_lane_refuse 100 "${verb}" "$(safe_gate_lane_clean "${reasons}") is not covered by the project lane, and ${SAFE_GATE_LANE_REASON}, so there is no established state to route it by" "commit the change, or put the project in a form the lane covers (registry dependencies, a version 2 or 3 lockfile), then retry"
       return $?
     fi
   done
-  safe_gate_project_lane_guards_first || return $?
-  safe_gate_project_lane_oneshot "${verb}" "${reason}"
-}
-
-# An unsupported property of the HOST (its npm, its configuration). The caller's own
-# environment is not the host: an npm_config_* setting present means the cause may be the
-# caller's, and the command refuses naming the key. $3 = guards: run the guards first.
-safe_gate_project_lane_host() {
-  local verb="$1" reason="$2" guards="${3:-0}" config="${4:-0}" name
-  if [[ "${config}" == 1 ]]; then
-    # A configuration reason may come from the caller's environment rather than the host's own
-    # files. An environment setting that NAMES the setting the reason is about (npm_config_registry
-    # for a registry reason, npm_config_workspaces for a workspace one, ...) makes the cause
-    # undecidable, and the command refuses naming the key; unrelated npm settings do not (npm
-    # itself skips an empty value, and the script policy and the settings the lane fixes itself
-    # are set or dropped by the lane anyway).
+  if (( compat_host )); then
+    # PROVENANCE of a host configuration reason. A configuration FILE chosen through the caller's
+    # environment cannot be told from a setting chosen for this command (the host's own files are the
+    # ones npm finds by itself); nor can a setting the environment names itself: those refuse, naming
+    # the key. The script policy and the settings the lane fixes itself are set or dropped anyway.
     local lowered key
-    lowered="$(printf '%s' "${reason,,}" | sed -E 's#[a-z][a-z0-9+.-]*://[^[:space:])]*##g')"
+    lowered="$(printf '%s' "${reasons,,}" | sed -E 's#[a-z][a-z0-9+.-]*://[^[:space:])]*##g')"
     while IFS= read -r name; do
+      [[ -n "${!name}" ]] || continue
       key="${name,,}"
       key="${key#npm_config_}"
       key="${key//_/-}"
       case "${key}" in
+        userconfig|globalconfig) ;;
         ignore-scripts|allow-scripts|strict-allow-scripts|dangerously-allow-all-scripts|git|allow-git|node-options) continue ;;
+        *)
+          [[ "${lowered}" =~ (^|[^a-z0-9-])${key//./\.}([^a-z0-9-]|$) ]] \
+            || { [[ "${key}" == workspace* && "${lowered}" == *workspace* ]]; } \
+            || { [[ "${lowered}" == *registry* && ( "${key}" == *registry || "${key}" == scope ) ]]; } || continue
+          ;;
       esac
-      [[ -n "${!name}" ]] || continue
-      if [[ "${lowered}" =~ (^|[^a-z0-9-])${key//./\\.}([^a-z0-9-]|$) ]] \
-          || { [[ "${key}" == workspace* && "${lowered}" == *workspace* ]]; } \
-          || { [[ "${lowered}" == *registry* && ( "${key}" == *registry || "${key}" == scope ) ]]; }; then
-        safe_gate_project_lane_refuse 100 "${verb}" "$(safe_gate_lane_clean "${reason}") is not covered by the project lane, and the environment setting ${name} may be what causes it, so it cannot be told from the host" "unset ${name} and retry"
-        return $?
-      fi
+      safe_gate_project_lane_refuse 100 "${verb}" "$(safe_gate_lane_clean "${reasons}") is not covered by the project lane, and the environment setting ${name} $([[ "${key}" == userconfig || "${key}" == globalconfig ]] && printf 'selects a configuration file for this command' || printf 'may be what causes it'), so the cause cannot be told from the host" "unset ${name} and retry"
+      return $?
     done < <(compgen -e | grep -i '^npm_config_' || true)
   fi
-  if [[ "${guards}" == 1 ]]; then
+  if (( npmrc_unadmitted )); then
+    # The project's .npmrc was not admitted: no npm of the lane reads it. Today's gate applies its own checks.
+    :
+  else
     safe_gate_project_lane_guards_first || return $?
   fi
-  safe_gate_project_lane_oneshot "${verb}" "${reason}"
+  safe_gate_project_lane_oneshot "${verb}" "${reasons}"
+}
+
+# An unsupported property of the HOST found after the lane started to probe npm: collected and decided
+# at once. $2 = 1 when it comes from the configuration (an environment setting that names the same
+# setting makes the cause undecidable: refused, naming the key).
+safe_gate_project_lane_host_now() {
+  local verb="$1" reason="$2" config="${3:-0}"
+  [[ "${config}" != 1 ]] || compat_host=1
+  safe_gate_project_lane_collect "${reason}"
+  safe_gate_project_lane_decide "${verb}"
 }
 
 # The last lines of an npm run's own diagnostic, cleaned, before the final line.
@@ -3161,9 +3208,12 @@ if (mode === 'capability') {
   const version = JSON.parse(fs.readFileSync(path.join(npmDir, 'package.json'), 'utf8')).version
   const semver = mod('semver')
   const atFloor = semver.valid(version) !== null && semver.gte(version, input.floor)
+  // a definitions module that does not load (or has no definitions) is a probe that FAILED, never
+  // "the options are missing": the answer then says nothing about the npm
   let defs = null
-  try { defs = mod('@npmcli/config/lib/definitions').definitions } catch (e) { defs = null }
-  const missing = input.options.filter((k) => !(defs && Object.prototype.hasOwnProperty.call(defs, k)))
+  try { defs = mod('@npmcli/config/lib/definitions').definitions } catch (e) { process.exit(3) }
+  if (!defs || typeof defs !== 'object') process.exit(3)
+  const missing = input.options.filter((k) => !Object.prototype.hasOwnProperty.call(defs, k))
   out({ version, atFloor, missing })
 } else if (mode === 'selection') {
   const env = mod('npm-install-checks/lib/current-env.js')
@@ -3332,25 +3382,26 @@ safe_gate_project_lane_admit() {
       safe_gate_project_lane_unsupported "${verb}" "${text}"
       return $?
     fi
-    local wheres file_list="" host=0 kind
+    local wheres kind
     wheres="$(jq -r '.refusals[].where' "${doc}" 2>/dev/null)"
+    # An argument or workspaces refuse at once (safety, not compatibility). Anything found in the
+    # snapshot's own files is only COLLECTED here: the route is decided once every safety check
+    # that needs no npm has run.
     while IFS= read -r kind; do
       case "${kind}" in
         argument*|manifest.workspaces*|"") safe_gate_project_lane_unsupported "${verb}" "${text}"; return $? ;;
-        manifest.*) [[ " ${file_list} " == *" package.json "* ]] || file_list+=" package.json" ;;
-        lockfile\[*) [[ " ${file_list} " == *" package-lock.json "* ]] || file_list+=" package-lock.json" ;;
-        .npmrc*) [[ " ${file_list} " == *" .npmrc "* ]] || file_list+=" .npmrc" ;;
-        configuration.*) host=1 ;;
+        manifest.*|lockfile\[*|.npmrc*|configuration.*) ;;
         *) safe_gate_project_lane_unsupported "${verb}" "${text}"; return $? ;;
       esac
     done <<<"${wheres}"
-    if [[ -n "${file_list}" ]]; then
-      # shellcheck disable=SC2086
-      safe_gate_project_lane_shape "${verb}" "${text}" ${file_list}
-      return $?
-    fi
-    safe_gate_project_lane_host "${verb}" "${text}" 1 1
-    return $?
+    while IFS= read -r kind; do
+      case "${kind}" in
+        manifest.*) safe_gate_project_lane_collect "${text}" package.json ;;
+        lockfile\[*) safe_gate_project_lane_collect "${text}" package-lock.json ;;
+        .npmrc*) safe_gate_project_lane_collect "${text}" .npmrc; npmrc_unadmitted=1 ;;
+        configuration.*) safe_gate_project_lane_collect "${text}"; compat_host=1 ;;
+      esac
+    done <<<"${wheres}"
   fi
   return 0
 }
@@ -3534,7 +3585,14 @@ safe_gate_project_lane_workspace_ancestor() {
 # says the command is global it is not a lane command: SAFE_GATE_LANE_PASS=1 and
 # the caller continues with the gate it had.
 safe_gate_project_lane_npm() {
-  local rc=0
+  local rc=0 lane_saved_state="" lane_probe_name
+  # What the lane's probes (the lock-diff guards) leave in the shell is the lane's, not the delegate's:
+  # the state of SAFE_GATE_LOCKDIFF_* at entry (set or not, exported or not) is put back at exit.
+  local -a lane_probe_names=()
+  mapfile -t lane_probe_names < <(compgen -v SAFE_GATE_LOCKDIFF_; compgen -v SAFE_GATE_LANE_)
+  if (( ${#lane_probe_names[@]} > 0 )); then
+    lane_saved_state="$(declare -p "${lane_probe_names[@]}" 2>/dev/null | sed 's/^declare /declare -g /')"
+  fi
   safe_gate_lane_discard_inherited
   SAFE_GATE_LANE_PASS=0
   SAFE_GATE_LANE_SCRATCH=""
@@ -3549,6 +3607,14 @@ safe_gate_project_lane_npm() {
   safe_gate_project_lane_run "$@" || rc=$?
   trap - INT TERM HUP
   safe_gate_project_lane_cleanup
+  # (SAFE_GATE_LANE_PASS is the caller's answer and goes on; whatever else the lane or its probes set,
+  # or discarded of the caller's, is put back as it was at entry.)
+  local lane_pass="${SAFE_GATE_LANE_PASS:-0}"
+  while IFS= read -r lane_probe_name; do
+    unset "${lane_probe_name}"
+  done < <(compgen -v SAFE_GATE_LOCKDIFF_; compgen -v SAFE_GATE_LANE_)
+  [[ -z "${lane_saved_state}" ]] || eval "${lane_saved_state}"
+  SAFE_GATE_LANE_PASS="${lane_pass}"
   return "${rc}"
 }
 
@@ -3649,6 +3715,8 @@ safe_gate_project_lane_run() {
   local project_dir="" scratch="" snap="" proj="" frozen="" rc=0 safe_core="" safe_core_version="" lock_only=0
   local state_dir="" config_json="" frozen_json="" differing="" data_root="${SAFE_DATA_DIR:-${HOME}/.local/share/safe}"
   local -a specs=() carry=() proj_args=() probe_args=() frozen_args=() orig_args=("$@")
+  local -a compat_reasons=() compat_files=()
+  local compat_host=0 npmrc_unadmitted=0
 
   verb="$(safe_gate_npm_canonical_command "${subcommand}")" || verb="${subcommand}"
   lane_sub="${verb} [lane: project]"
@@ -3712,10 +3780,13 @@ safe_gate_project_lane_run() {
     safe_gate_err "safe: gate: npm: command not found (no non-wrapper npm on PATH, or none that answers in this project)"
     return 127
   elif (( rc != 0 )); then
-    # The npm the host offers cannot be driven by the lane (a launcher it cannot follow): a
-    # property of the HOST. No guard can run without an npm the lane drives; today's gate
-    # applies its own.
-    safe_gate_project_lane_host "${verb}" "${SAFE_GATE_LANE_REASON}" 0
+    # A launcher the lane cannot follow: its provenance cannot be established (which npm, which
+    # Node, from which search path), so the command refuses with the lane's line rather than
+    # going to today's gate. The refusal of ci, dedupe and prune comes first.
+    case "${verb}" in
+      ci|dedupe|prune) safe_gate_project_lane_verb_refusal "${verb}"; return $? ;;
+    esac
+    safe_gate_project_lane_unsupported "${verb}" "${SAFE_GATE_LANE_REASON}"
     return $?
   fi
   if ! safe_gate_lane_build_env; then
@@ -3776,6 +3847,18 @@ safe_gate_project_lane_run() {
     SAFE_GATE_LANE_PASS=1
     return 0
   fi
+  # Under `mise exec` the lane owns only the plain form, and the overlay may not hold what the lane
+  # cannot carry. Both are decided here, once npm has said the command is not a global one.
+  if [[ -n "${SAFE_GATE_MISE_LANE_RESULT:-}" ]]; then
+    if [[ -n "${SAFE_GATE_MISE_LANE_NONPLAIN:-}" ]]; then
+      safe_gate_project_lane_refuse 100 "${verb}" "mise exec with ${SAFE_GATE_MISE_LANE_NONPLAIN} (a tool selector or an option) is not covered by the project lane, which would run npm without it" "run npm in the project directory directly, or drop the option, then retry"
+      return $?
+    fi
+    if safe_gate_mise_overlay_lane_blocker "${SAFE_GATE_MISE_OVERLAY:-}"; then
+      safe_gate_project_lane_refuse 100 "${verb}" "the mise [env] overlay sets ${SAFE_GATE_MISE_POLICY_KEY}, which the project lane fixes itself and cannot carry to the npm it runs" "remove it from the mise config (operator) and retry"
+      return $?
+    fi
+  fi
   for arg in "$@"; do
     if [[ "${arg}" == "--" ]]; then
       safe_gate_project_lane_unsupported "${verb}" "the option terminator --"
@@ -3787,7 +3870,7 @@ safe_gate_project_lane_run() {
     *)
       # ci, dedupe and prune are not routed by the lane yet (their own ticket), and today's gate
       # has no judgement of the projected closure to give them: they are refused, not sent there.
-      safe_gate_project_lane_refuse 100 "${verb}" "npm ${verb} is not routed by the project lane yet, and the gate it replaces cannot judge what it would install" "use npm install or npm update, which the lane covers, then retry"
+      safe_gate_project_lane_verb_refusal "${verb}"
       return $?
       ;;
   esac
@@ -3988,6 +4071,7 @@ safe_gate_project_lane_run() {
   [[ -z "${baseline_file}" ]] || baseline_args=(--baseline "${baseline_file}")
   # What is read must decode, and be a version the lane binds, whichever it is.
   local lock_label admit_text
+  local -A lock_compat=([baseline]=0 [disk]=0)
   for lock_label in "baseline|${baseline_file}" "disk|$( (( disk_lock && ! disk_is_baseline )) && printf '%s' "${snap}/package-lock.json")"; do
     local lock_which="${lock_label%%|*}" lock_path="${lock_label#*|}" lock_text=""
     [[ -n "${lock_path}" ]] || continue
@@ -4001,8 +4085,9 @@ safe_gate_project_lane_run() {
       return $?
     fi
     if ! jq -e '(.lockfileVersion == 2 or .lockfileVersion == 3) and (.packages | type == "object")' "${lock_path}" >/dev/null 2>&1; then
-      safe_gate_project_lane_shape "${verb}" "${lock_text} is not a version 2 or 3 lockfile" package-lock.json
-      return $?
+      safe_gate_project_lane_collect "${lock_text} is not a version 2 or 3 lockfile" package-lock.json
+      lock_compat["${lock_which}"]=1
+      continue
     fi
     # The binder's own lockfile admission (every key a chain of package segments inside the
     # tree, no link entry) on what npm is about to read: Arborist loads EVERY entry of the
@@ -4012,9 +4097,14 @@ safe_gate_project_lane_run() {
     if (( rc == 30 )) && [[ "${admit_text}" == lockfile_unreadable:* ]]; then
       safe_gate_project_lane_refuse 102 "${verb}" "${lock_text} cannot be decoded (${admit_text#*: }), so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the lockfile and retry"
       return $?
-    elif (( rc == 30 )); then
-      safe_gate_project_lane_shape "${verb}" "${lock_text} that the lane cannot admit (${admit_text})" package-lock.json
+    elif (( rc == 30 )) && [[ "${admit_text}" == lockfile_path_outside_tree:* ]]; then
+      # UNSAFE, committed or not: a key outside the tree would be a path npm reads or writes
+      safe_gate_project_lane_refuse 100 "${verb}" "${lock_text} names a path outside the tree (${admit_text#*: }), which is not covered by the project lane" "repair the lockfile and retry"
       return $?
+    elif (( rc == 30 )); then
+      # (a lockfile that decodes still goes through the graph check below: a link that LEAVES the
+      # project is unsafe, whatever else the lockfile holds)
+      safe_gate_project_lane_collect "${lock_text} that the lane cannot admit (${admit_text})" package-lock.json
     elif (( rc != 0 )); then
       safe_gate_project_lane_refuse 102 "${verb}" "${lock_text} could not be checked (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
       return $?
@@ -4037,18 +4127,64 @@ safe_gate_project_lane_run() {
   safe_gate_project_lane_admit "${verb}" "${admit_args[@]}"
   rc=$?
   SAFE_GATE_LANE_ADMIT_BASELINE=0
-  if (( rc != 0 )) || [[ "${SAFE_GATE_LANE_PASS:-0}" == 1 ]]; then
+  if (( rc != 0 )); then
     SAFE_GATE_LANE_ADMIT_SNAPSHOT=0
     return "${rc}"
   fi
   cp -- "${scratch}/admit.json" "${scratch}/admit1.json" || return 100
+  # Every entry of the baseline is bound, and none is a link: what is established
+  # is a shape the lane supports. A baseline graph that cannot be read is missing
+  # evidence, not a policy refusal. The lockfile on disk, when it is not the
+  # baseline, gets the same two checks: its entries are then judged with the target.
+  local graph_json="" graph_label graph_which
+  for graph_label in "baseline|${baseline_file}" "disk|$( (( disk_lock && ! disk_is_baseline )) && printf '%s' "${snap}/package-lock.json")"; do
+    [[ "${graph_label#*|}" != "" ]] || continue
+    [[ "${lock_compat[${graph_label%%|*}]}" != 1 ]] || continue
+    rc=0
+    graph_json="$("${safe_core}" project-graph "${graph_label#*|}" 2>/dev/null)" || rc=$?
+    if (( rc != 0 )) || ! safe_gate_lane_one_doc '.schema_version == 1 and (.bindability.bound | type == "boolean") and (.bindability.unbound | type == "array") and ((.bindability.bound) == ((.bindability.unbound | length) == 0)) and (.graph.occurrences | type == "array")' "${graph_json}"; then
+      safe_gate_project_lane_refuse 102 "${verb}" "the $([[ "${graph_label%%|*}" == baseline ]] && printf '%s' "${baseline_kind} lockfile" || printf 'lockfile on disk') cannot be read, so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the lockfile and retry"
+      return $?
+    fi
+    # Every lockfile npm may read is admitted BEFORE npm uses it: the baseline, and the
+    # lockfile on disk when it is another: a fetch during resolution cannot be undone by
+    # a refusal after it. (What the projection itself adds is the decision's.)
+    graph_which="a ${baseline_kind} lockfile"
+    [[ "${graph_label%%|*}" == baseline ]] || graph_which="the lockfile on disk"
+    if jq -e '[.bindability.unbound[] | select(.reason == "link_outside_project" or .reason == "identity_invalid")] | length > 0' <<<"${graph_json}" >/dev/null 2>&1; then
+      # UNSAFE, committed or not: a link that leaves the project, an identity that cannot stand in a URL
+      safe_gate_project_lane_refuse 100 "${verb}" "${graph_which} with an entry that is not safe to read ($(jq -r '[.bindability.unbound[] | select(.reason == "link_outside_project" or .reason == "identity_invalid")][0] | "\(.name)@\(.version): \(.reason)"' <<<"${graph_json}" 2>/dev/null)), which is not covered by the project lane" "repair the lockfile and retry"
+      return $?
+    fi
+    if jq -e '.bindability.bound == false' <<<"${graph_json}" >/dev/null 2>&1; then
+      safe_gate_project_lane_collect "${graph_which} with an entry safe cannot bind ($(jq -r '.bindability.unbound[0] | "\(.name)@\(.version): \(.reason)"' <<<"${graph_json}" 2>/dev/null))" package-lock.json
+    elif jq -e '[.graph.occurrences[] | select(.kind == "link" or .kind == "local")] | length > 0' <<<"${graph_json}" >/dev/null 2>&1; then
+      safe_gate_project_lane_collect "${graph_which} with in-project links" package-lock.json
+    fi
+  done
+
+  # --- private origins: today's check, first, as in today's gate --------------
+  safe_gate_project_lane_private_names "${verb}" "${scratch}/admit1.json"
+  rc=$?
+  if (( rc != 0 )); then
+    return "${rc}"
+  fi
+
+  # --- the route: every safety check that needs no npm has run -------------------
+  safe_gate_project_lane_decide "${verb}"
+  rc=$?
+  if (( rc != 0 )) || [[ "${SAFE_GATE_LANE_PASS:-0}" == 1 ]]; then
+    SAFE_GATE_LANE_ADMIT_SNAPSHOT=0
+    return "${rc}"
+  fi
   # npm's own parsers read what was admitted, and the npm is shown to enforce
   # the options the lane relies on, before anything is projected.
   rc=0
   safe_gate_lane_capability || rc=$?
   if (( rc == 2 )); then
-    safe_gate_project_lane_host "${verb}" "${SAFE_GATE_LANE_REASON}" 1
-    return $?
+    safe_gate_project_lane_host_now "${verb}" "${SAFE_GATE_LANE_REASON}" 0
+    rc=$?
+    return "${rc}"
   elif (( rc != 0 )); then
     safe_gate_project_lane_refuse 100 "${verb}" "the selected npm's definitions cannot be read (audit-infrastructure breakage, not a package finding)" "rerun install.sh or run safe doctor, then retry"
     return $?
@@ -4062,41 +4198,6 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_refuse 100 "${verb}" "the selected npm's parser cannot be asked (audit-infrastructure breakage, not a package finding)" "rerun install.sh or run safe doctor, then retry"
     return $?
   fi
-  # Every entry of the baseline is bound, and none is a link: what is established
-  # is a shape the lane supports. A baseline graph that cannot be read is missing
-  # evidence, not a policy refusal. The lockfile on disk, when it is not the
-  # baseline, gets the same two checks: its entries are then judged with the target.
-  local graph_json="" graph_label graph_which
-  for graph_label in "baseline|${baseline_file}" "disk|$( (( disk_lock && ! disk_is_baseline )) && printf '%s' "${snap}/package-lock.json")"; do
-    [[ "${graph_label#*|}" != "" ]] || continue
-    rc=0
-    graph_json="$("${safe_core}" project-graph "${graph_label#*|}" 2>/dev/null)" || rc=$?
-    if (( rc != 0 )) || ! safe_gate_lane_one_doc '.schema_version == 1 and (.bindability.bound | type == "boolean") and (.bindability.unbound | type == "array") and ((.bindability.bound) == ((.bindability.unbound | length) == 0)) and (.graph.occurrences | type == "array")' "${graph_json}"; then
-      safe_gate_project_lane_refuse 102 "${verb}" "the $([[ "${graph_label%%|*}" == baseline ]] && printf '%s' "${baseline_kind} lockfile" || printf 'lockfile on disk') cannot be read, so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the lockfile and retry"
-      return $?
-    fi
-    # Every lockfile npm may read is admitted BEFORE npm uses it: the baseline, and the
-    # lockfile on disk when it is another: a fetch during resolution cannot be undone by
-    # a refusal after it. (What the projection itself adds is the decision's.)
-    graph_which="a ${baseline_kind} lockfile"
-    [[ "${graph_label%%|*}" == baseline ]] || graph_which="the lockfile on disk"
-    if jq -e '.bindability.bound == false' <<<"${graph_json}" >/dev/null 2>&1; then
-      safe_gate_project_lane_shape "${verb}" "${graph_which} with an entry safe cannot bind ($(jq -r '.bindability.unbound[0] | "\(.name)@\(.version): \(.reason)"' <<<"${graph_json}" 2>/dev/null))" package-lock.json
-      return $?
-    fi
-    if jq -e '[.graph.occurrences[] | select(.kind == "link" or .kind == "local")] | length > 0' <<<"${graph_json}" >/dev/null 2>&1; then
-      safe_gate_project_lane_shape "${verb}" "${graph_which} with in-project links" package-lock.json
-      return $?
-    fi
-  done
-
-  # --- private origins: today's check, first, as in today's gate --------------
-  safe_gate_project_lane_private_names "${verb}" "${scratch}/admit1.json"
-  rc=$?
-  if (( rc != 0 )); then
-    return "${rc}"
-  fi
-
   # --- 4. guards and projection, on the snapshot ------------------------------
   # The guards probe the projection's own settings, git sources disabled included.
   probe_args=("--git=${SAFE_GATE_LANE_GIT}" --allow-git=none "${dest[@]}" "${proj_args[@]}")
@@ -4110,7 +4211,7 @@ safe_gate_project_lane_run() {
   fi
   printf '%s\n' "${config_json}" > "${scratch}/config.json"
   if value="$(safe_gate_project_lane_config_reason "${config_json}")"; then
-    safe_gate_project_lane_host "${verb}" "${value}" 0 1
+    safe_gate_project_lane_host_now "${verb}" "${value}" 1
     return $?
   fi
   if value="$(safe_gate_project_lane_paths_reason "${config_json}" "${project_dir}")"; then
@@ -4121,6 +4222,10 @@ safe_gate_project_lane_run() {
   safe_gate_project_lane_admit "${verb}" "${admit_args[@]}" --config "${scratch}/config.json"
   rc=$?
   SAFE_GATE_LANE_ADMIT_SNAPSHOT=0
+  if (( rc == 0 )); then
+    safe_gate_project_lane_decide "${verb}"
+    rc=$?
+  fi
   if (( rc != 0 )) || [[ "${SAFE_GATE_LANE_PASS:-0}" == 1 ]]; then
     return "${rc}"
   fi
@@ -4145,11 +4250,11 @@ safe_gate_project_lane_run() {
     return $?
   fi
   if (( ! lock_only )) && jq -e '."package-lock-only" == true' <<<"${frozen_json}" >/dev/null 2>&1; then
-    safe_gate_project_lane_host "${verb}" "package-lock-only set by the configuration (the frozen installation would extract nothing)" 0 1
+    safe_gate_project_lane_host_now "${verb}" "package-lock-only set by the configuration (the frozen installation would extract nothing)" 1
     return $?
   fi
   if value="$(safe_gate_project_lane_config_reason "${frozen_json}")"; then
-    safe_gate_project_lane_host "${verb}" "${value}" 0 1
+    safe_gate_project_lane_host_now "${verb}" "${value}" 1
     return $?
   fi
   if value="$(safe_gate_project_lane_paths_reason "${frozen_json}" "${project_dir}")"; then
@@ -4158,7 +4263,7 @@ safe_gate_project_lane_run() {
   fi
   differing="$(safe_gate_project_lane_config_diff "${config_json}" "${frozen_json}")" || differing="?"
   if [[ -n "${differing}" ]]; then
-    safe_gate_project_lane_host "${verb}" "a configuration the frozen installation reads differently from the projection (${differing})" 0 1
+    safe_gate_project_lane_host_now "${verb}" "a configuration the frozen installation reads differently from the projection (${differing})" 1
     return $?
   fi
   # The platform and the omissions the frozen install selects: once, by the
@@ -6748,14 +6853,20 @@ safe_gate_npm_like() {
           if [[ "${SAFE_GATE_LANE_PASS:-0}" == "1" ]]; then
             unset SAFE_GATE_LANE_PASS
             # Under `mise exec` the lane owned the command; handed to today's gate it goes on as
-            # the audit-only pass it always was (the outer process then runs the command).
-            [[ -z "${SAFE_GATE_MISE_LANE_MARKER:-}" ]] || SAFE_GATE_NO_EXEC=1
+            # the audit-only pass it always was (the outer process then runs the command): the
+            # hand-back is written, explicitly, before anything else happens.
+            if [[ -n "${SAFE_GATE_MISE_LANE_RESULT:-}" ]]; then
+              safe_gate_mise_lane_result handback || return $?
+              SAFE_GATE_NO_EXEC=1
+            fi
           else
             unset SAFE_GATE_LANE_PASS
-            [[ -z "${SAFE_GATE_MISE_LANE_MARKER:-}" ]] || : >"${SAFE_GATE_MISE_LANE_MARKER}"
+            if [[ -n "${SAFE_GATE_MISE_LANE_RESULT:-}" ]]; then
+              safe_gate_mise_lane_result "done ${lane_rc}" || return $?
+            fi
             return "${lane_rc}"
           fi
-        elif [[ -n "${SAFE_GATE_MISE_LANE_MARKER:-}" ]]; then
+        elif [[ -n "${SAFE_GATE_MISE_LANE_RESULT:-}" ]]; then
           SAFE_GATE_NO_EXEC=1
         fi
         ;;
@@ -9003,8 +9114,45 @@ safe_gate_mise_overlay_lane_blocker() {
   return 1
 }
 
+# The plain form the lane owns: `mise exec` / `mise x`, an optional -C <dir> (or --cd), then `--` and the
+# command. Prints the first thing that makes it more than that (a tool selector, any other option,
+# a leading option), or nothing; returns 0 when the form is plain.
+safe_gate_mise_exec_plain_form() {
+  local arg skip=0
+  [[ -z "${SAFE_GATE_MISE_EXTRA_OPT:-}" ]] || { printf '%s' "${SAFE_GATE_MISE_EXTRA_OPT}"; return 1; }
+  for arg in "$@"; do
+    [[ "${arg}" != "--" ]] || return 0
+    if (( skip )); then skip=0; continue; fi
+    case "${arg}" in
+      -C|--cd) skip=1 ;;
+      -C=*|--cd=*) ;;
+      *) printf '%s' "${arg}"; return 1 ;;
+    esac
+  done
+  return 0
+}
+
+safe_gate_mise_inner_npm_verb() {
+  (
+    safe_gate_route npm "$@" >/dev/null 2>&1 || exit 1
+    safe_gate_npm_canonical_command "${SAFE_GATE_SUBCMD}" 2>/dev/null || printf '%s' "${SAFE_GATE_SUBCMD}"
+  )
+}
+
+# The child's side of the result channel: writes the lane's outcome to the file the parent made, and
+# fails (status 100, the lane's line) when it cannot: the parent would then never get a hand-back.
+safe_gate_mise_lane_result() {
+  local path="${SAFE_GATE_MISE_LANE_RESULT:-}"
+  if [[ "${path}" != /* || ! -f "${path}" || -L "${path}" ]] || ! printf '%s\n' "$1" >"${path}" 2>/dev/null; then
+    safe_gate_project_lane_refuse 100 "${SAFE_GATE_SUBCMD:-install}" "the project lane could not write its outcome to the result channel of mise exec, so the original command was not run" "rerun the command; run safe doctor if it repeats"
+    return 100
+  fi
+  return 0
+}
+
 safe_gate_mise_gate_exec() {
   safe_gate_mise_parse_sub exec "$@" || return $?
+  local plain_rest=("$@")
 
   local -a audit=("${SAFE_GATE_MISE_SPECS[@]+"${SAFE_GATE_MISE_SPECS[@]}"}")
   local -a cmd=("${SAFE_GATE_MISE_CMD[@]+"${SAFE_GATE_MISE_CMD[@]}"}")
@@ -9076,18 +9224,24 @@ safe_gate_mise_gate_exec() {
         fi
         ;;
     esac
-    local lane_inner=0 lane_marker=""
+    # The lane owns `mise exec -- npm <lane command>` in its PLAIN form only. The parent creates a
+    # private result file (an absolute path in a scratch directory of its own, kept until it has
+    # read it); the child writes the lane's outcome there. The original command runs only on an
+    # explicit hand-back the child wrote: a result that is missing, empty or malformed is a failure.
+    local lane_inner=0 lane_dir="" lane_result="" lane_nonplain="" inner_verb=""
     if [[ "${cmd[0]}" == "npm" ]] && safe_gate_mise_inner_npm_is_lane "${cmd[@]:1}"; then
-      if safe_gate_mise_overlay_lane_blocker "$SAFE_GATE_MISE_OVERLAY"; then
-        safe_gate_err "safe: BLOCKED mise exec npm — the mise [env] overlay sets ${SAFE_GATE_MISE_POLICY_KEY}, which the project lane fixes itself and cannot carry to the npm it runs; remove it from the mise config (operator) and retry; details: safe explain"
-        return 100
-      fi
       lane_inner=1
-      lane_marker="$(mktemp "${TMPDIR:-/tmp}/safe-mise-lane.XXXXXX")" || {
-        safe_gate_mise_infra_refuse "cannot allocate the marker of the project lane's run"
-        return 100
-      }
-      rm -f -- "${lane_marker}"
+      # an option or a tool selector the lane cannot honour is refused by the lane once npm has
+      # said the command is not a global one (a global install keeps today's behaviour)
+      lane_nonplain="$(safe_gate_mise_exec_plain_form "${plain_rest[@]}")" || true
+      lane_dir="$(mktemp -d "$(realpath -m -- "${TMPDIR:-/tmp}")/safe-mise-lane.XXXXXX" 2>/dev/null)" || lane_dir=""
+      lane_result="${lane_dir}/result"
+      if [[ -z "${lane_dir}" || "${lane_dir}" != /* ]] || ! : >"${lane_result}" 2>/dev/null || ! chmod 600 -- "${lane_result}" 2>/dev/null; then
+        [[ -z "${lane_dir}" ]] || rm -rf -- "${lane_dir}"
+        inner_verb="$(safe_gate_mise_inner_npm_verb "${cmd[@]:1}")" || inner_verb="install"
+        safe_gate_project_lane_refuse 100 "${inner_verb}" "the project lane's result channel under mise exec cannot be created (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
+        return $?
+      fi
     fi
     local inner_rc=0
     (
@@ -9108,10 +9262,11 @@ safe_gate_mise_gate_exec() {
         exit 100
       }
       if (( lane_inner )); then
-        # The lane owns this command: it must NOT run audit-only. safe_gate_npm_like leaves a
-        # marker when the lane ran to its end and puts the audit-only mode back when the lane
-        # hands the command to today's gate (a global install).
-        SAFE_GATE_MISE_LANE_MARKER="${lane_marker}"
+        # The lane owns this command: it must NOT run audit-only. safe_gate_npm_like writes the
+        # lane's outcome to the result file and puts the audit-only mode back when the lane hands
+        # the command to today's gate (a global install).
+        SAFE_GATE_MISE_LANE_RESULT="${lane_result}"
+        SAFE_GATE_MISE_LANE_NONPLAIN="${lane_nonplain}"
       else
         SAFE_GATE_NO_EXEC=1
       fi
@@ -9120,11 +9275,35 @@ safe_gate_mise_gate_exec() {
       shift
       safe_gate_dispatch "$@"
     ) || inner_rc=$?
-    if (( lane_inner )) && [[ -e "${lane_marker}" ]]; then
-      # The lane ran in this directory with this environment and was the command: the outer
-      # process does not run the original command after it.
-      rm -f -- "${lane_marker}"
-      SAFE_GATE_MISE_LANE_DONE=1
+    if (( lane_inner )); then
+      local result_text="" result_ok=0
+      if [[ -f "${lane_result}" && ! -L "${lane_result}" && -O "${lane_result}" ]]; then
+        result_text="$(head -c 64 -- "${lane_result}" 2>/dev/null)" && result_ok=1
+      fi
+      rm -rf -- "${lane_dir}"
+      case "${result_text}" in
+        handback)
+          (( result_ok )) || { inner_rc=100; }
+          ;;
+        "done "[0-9]|"done "[0-9][0-9]|"done "[0-9][0-9][0-9])
+          # the lane ran and was the command: the outer process does not run the original one
+          if (( result_ok )) && [[ "${result_text#done }" == "${inner_rc}" ]]; then
+            SAFE_GATE_MISE_LANE_DONE=1
+            return "${inner_rc}"
+          fi
+          result_text=""
+          ;;
+        *) result_text="" ;;
+      esac
+      if [[ -z "${result_text}" ]]; then
+        # missing, empty or malformed: never permission to run the original command
+        if (( inner_rc == 0 )); then
+          inner_verb="$(safe_gate_mise_inner_npm_verb "${cmd[@]:1}")" || inner_verb="install"
+          safe_gate_project_lane_refuse 100 "${inner_verb}" "the project lane's result under mise exec is missing or malformed, so the original command was not run" "rerun the command; run safe doctor if it repeats"
+          return $?
+        fi
+        return "${inner_rc}"
+      fi
     fi
     (( inner_rc == 0 )) || return "${inner_rc}"
   fi
@@ -9160,6 +9339,8 @@ safe_gate_mise() {
   SAFE_GATE_MISE_CTX=()
   SAFE_GATE_MISE_OVERLAY=""
   SAFE_GATE_MISE_CD=""
+  # The first leading option that is not -C/--cd: the lane owns only the plain form of exec.
+  SAFE_GATE_MISE_EXTRA_OPT=""
   # The row snapshot is per invocation: context flags parsed below
   # change which configuration it must describe.
   SAFE_GATE_MISE_ROWS=""
@@ -9174,6 +9355,10 @@ safe_gate_mise() {
     case "$arg" in
       -*)
         base="${arg%%=*}"
+        case "$base" in
+          -C|--cd) ;;
+          *) [[ -n "${SAFE_GATE_MISE_EXTRA_OPT}" ]] || SAFE_GATE_MISE_EXTRA_OPT="${base}" ;;
+        esac
         # Counted verbosity (-vvv) is legal mise (delta-1 finding 10).
         if [[ "$arg" =~ ^-v+$ ]]; then
           i=$((i + 1))
@@ -9273,6 +9458,12 @@ safe_gate_mise() {
   safe_gate_exec_real mise "$@"
 }
 
+# The ownership state of the lane's mise route: set by the parent for ONE child, never inherited.
+# Initialised at both entries of the gate (the wrapper's and the one `safe install --host` uses).
+safe_gate_reset_entry_state() {
+  unset SAFE_GATE_MISE_LANE_RESULT SAFE_GATE_MISE_LANE_NONPLAIN SAFE_GATE_MISE_LANE_DONE SAFE_GATE_MISE_LANE_MARKER
+}
+
 safe_gate_main() {
   safe_gate_mirror_stderr
   local SAFE_GATE_SOCKET_COMMAND_CONSENT=0
@@ -9285,8 +9476,8 @@ safe_gate_main() {
   unset SAFE_AUDIT_SOCKET_CONSENT SAFE_GATE_CONSENT_RECURSION
   # The BLOCK-override result channel is set per audit call, never inherited.
   unset SAFE_GATE_RESULT_OUT SAFE_AUDIT_RESULT_OUT
-  # The mise route's own per-command state is never inherited either.
-  unset SAFE_GATE_MISE_LANE_MARKER SAFE_GATE_MISE_LANE_DONE
+  # The mise route's own per-command state is never inherited either (nor at the host-install entry).
+  safe_gate_reset_entry_state
   safe_gate_dispatch "$@"
 }
 
