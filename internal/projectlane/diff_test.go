@@ -40,7 +40,7 @@ func TestDiff(t *testing.T) {
 			target:   map[string]map[string]any{"node_modules/a": changedOrigin("a", "1.0.0")},
 			changed:  []NameChange{{"a", []string{"1.0.0"}, []string{"1.0.0"}}},
 			introduced: []Introduced{{
-				ArtifactKey: ArtifactKey{"a", "1.0.0", tarball("a", "1.0.0") + "?x=1", integrityOf("a@1.0.0")},
+				ArtifactKey: ArtifactKey{Name: "a", Version: "1.0.0", Origin: tarball("a", "1.0.0") + "?x=1", Integrity: integrityOf("a@1.0.0")},
 				Reason:      IntroducedOrigin, Occurrences: []string{"node_modules/a"}}},
 			dropped: []ArtifactKey{key("a", "1.0.0")}},
 		{name: "same version, different hash is introduced",
@@ -48,7 +48,7 @@ func TestDiff(t *testing.T) {
 			target:   map[string]map[string]any{"node_modules/a": changedHash("a", "1.0.0")},
 			changed:  []NameChange{{"a", []string{"1.0.0"}, []string{"1.0.0"}}},
 			introduced: []Introduced{{
-				ArtifactKey: ArtifactKey{"a", "1.0.0", tarball("a", "1.0.0"), integrityOf("other")},
+				ArtifactKey: ArtifactKey{Name: "a", Version: "1.0.0", Origin: tarball("a", "1.0.0"), Integrity: integrityOf("other")},
 				Reason:      IntroducedIntegrity, Occurrences: []string{"node_modules/a"}}},
 			dropped: []ArtifactKey{key("a", "1.0.0")}},
 		{name: "same artifact at another path is not introduced",

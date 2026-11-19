@@ -140,48 +140,9 @@ type Record struct {
 // entries carry their path and target only: npm never fetches them.
 func LoadRecords(path string, registryHosts []string) ([]Record, error) {
 	allowedRegistryHosts := registryHostSet(registryHosts)
-	data, err := os.ReadFile(path)
+	entries, err := readPackagesMap(path)
 	if err != nil {
-		return nil, fmt.Errorf("read %q: %w", path, err)
-	}
-
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	var root map[string]json.RawMessage
-	if err := decoder.Decode(&root); err != nil {
-		return nil, fmt.Errorf("parse %q: invalid JSON: %w", path, err)
-	}
-	if root == nil {
-		return nil, fmt.Errorf("parse %q: lockfile must be a JSON object", path)
-	}
-	var extra any
-	if err := decoder.Decode(&extra); err == nil {
-		return nil, fmt.Errorf("parse %q: lockfile contains multiple JSON documents", path)
-	} else if err != io.EOF {
-		return nil, fmt.Errorf("parse %q: invalid trailing JSON: %w", path, err)
-	}
-
-	versionRaw, ok := root["lockfileVersion"]
-	if !ok {
-		return nil, fmt.Errorf("parse %q: lockfileVersion is required", path)
-	}
-	var lockfileVersion int64
-	if err := json.Unmarshal(versionRaw, &lockfileVersion); err != nil {
-		return nil, fmt.Errorf("parse %q: lockfileVersion must be a number", path)
-	}
-	if lockfileVersion == 1 {
-		return nil, fmt.Errorf("parse %q: lockfileVersion 1 is unsupported because it has no .packages map", path)
-	}
-	if lockfileVersion != 2 && lockfileVersion != 3 {
-		return nil, fmt.Errorf("parse %q: unsupported lockfileVersion %d (expected 2 or 3)", path, lockfileVersion)
-	}
-
-	packagesRaw, ok := root["packages"]
-	if !ok {
-		return nil, fmt.Errorf("parse %q: lockfileVersion %d requires a .packages map", path, lockfileVersion)
-	}
-	var entries map[string]json.RawMessage
-	if err := json.Unmarshal(packagesRaw, &entries); err != nil || entries == nil {
-		return nil, fmt.Errorf("parse %q: .packages must be a JSON object", path)
+		return nil, err
 	}
 
 	loaded := make([]Record, 0, len(entries))
@@ -208,10 +169,10 @@ func LoadRecords(path string, registryHosts []string) ([]Record, error) {
 			return nil, fmt.Errorf("parse %q: .packages[%q] must be an object", path, key)
 		}
 		if entry.Link != nil && *entry.Link {
-			target, _, err := optionalString(entry.Resolved)
-			if err != nil {
-				return nil, fmt.Errorf("parse %q: .packages[%q] resolved must be a string", path, key)
-			}
+			// A link's resolved that is not a string reads as no target, exactly as
+			// LoadEntries always ignored it: the reify lane never reads a link's
+			// target, and a reader it shares must not refuse what it accepted.
+			target, _, _ := optionalString(entry.Resolved)
 			loaded = append(loaded, Record{Path: key, Link: true, LinkTarget: target})
 			continue
 		}
@@ -468,4 +429,108 @@ func packageLess(a, b Package) bool {
 		return a.Source < b.Source
 	}
 	return a.Integrity < b.Integrity
+}
+
+// readPackagesMap reads and checks the lockfile document and returns its
+// .packages map, the one reading every loader here shares.
+func readPackagesMap(path string) (map[string]json.RawMessage, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %q: %w", path, err)
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	var root map[string]json.RawMessage
+	if err := decoder.Decode(&root); err != nil {
+		return nil, fmt.Errorf("parse %q: invalid JSON: %w", path, err)
+	}
+	if root == nil {
+		return nil, fmt.Errorf("parse %q: lockfile must be a JSON object", path)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err == nil {
+		return nil, fmt.Errorf("parse %q: lockfile contains multiple JSON documents", path)
+	} else if err != io.EOF {
+		return nil, fmt.Errorf("parse %q: invalid trailing JSON: %w", path, err)
+	}
+
+	versionRaw, ok := root["lockfileVersion"]
+	if !ok {
+		return nil, fmt.Errorf("parse %q: lockfileVersion is required", path)
+	}
+	var lockfileVersion int64
+	if err := json.Unmarshal(versionRaw, &lockfileVersion); err != nil {
+		return nil, fmt.Errorf("parse %q: lockfileVersion must be a number", path)
+	}
+	if lockfileVersion == 1 {
+		return nil, fmt.Errorf("parse %q: lockfileVersion 1 is unsupported because it has no .packages map", path)
+	}
+	if lockfileVersion != 2 && lockfileVersion != 3 {
+		return nil, fmt.Errorf("parse %q: unsupported lockfileVersion %d (expected 2 or 3)", path, lockfileVersion)
+	}
+
+	packagesRaw, ok := root["packages"]
+	if !ok {
+		return nil, fmt.Errorf("parse %q: lockfileVersion %d requires a .packages map", path, lockfileVersion)
+	}
+	var entries map[string]json.RawMessage
+	if err := json.Unmarshal(packagesRaw, &entries); err != nil || entries == nil {
+		return nil, fmt.Errorf("parse %q: .packages must be a JSON object", path)
+	}
+	return entries, nil
+}
+
+// LocalPackage is a workspace member or in-project directory a link entry
+// points at: the lockfile key that is not under node_modules.
+type LocalPackage struct {
+	Path    string
+	Name    string
+	Version string
+}
+
+// LoadLocalPackages returns the entries of the lockfile that are not under
+// node_modules and that some link entry targets, by their key. Their version
+// is what makes a workspace member's change visible in a difference.
+func LoadLocalPackages(path string) ([]LocalPackage, error) {
+	entries, err := readPackagesMap(path)
+	if err != nil {
+		return nil, err
+	}
+	targets := map[string]struct{}{}
+	for key, raw := range entries {
+		if _, include := packageName(key); !include {
+			continue
+		}
+		var link struct {
+			Link     *bool           `json:"link"`
+			Resolved json.RawMessage `json:"resolved"`
+		}
+		if json.Unmarshal(raw, &link) != nil || link.Link == nil || !*link.Link {
+			continue
+		}
+		if target, _, _ := optionalString(link.Resolved); target != "" {
+			targets[target] = struct{}{}
+		}
+	}
+	var locals []LocalPackage
+	for target := range targets {
+		raw, ok := entries[target]
+		if !ok {
+			continue
+		}
+		var entry struct {
+			Name    string `json:"name"`
+			Version string `json:"version"`
+		}
+		if json.Unmarshal(raw, &entry) != nil {
+			continue
+		}
+		name := entry.Name
+		if name == "" {
+			name = target[strings.LastIndex(target, "/")+1:]
+		}
+		locals = append(locals, LocalPackage{Path: target, Name: name, Version: entry.Version})
+	}
+	sort.Slice(locals, func(i, j int) bool { return locals[i].Path < locals[j].Path })
+	return locals, nil
 }

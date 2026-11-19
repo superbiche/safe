@@ -223,3 +223,50 @@ func TestLoadRecordsKeepsTheFactsLoadEntriesDrops(t *testing.T) {
 		t.Fatalf("LoadRecords() = %#v, want %#v", records, want)
 	}
 }
+
+func TestLoadEntriesIgnoresALinkResolvedThatIsNotAString(t *testing.T) {
+	// The reify lane never reads a link's target. A reader it shares with the
+	// project lane must keep accepting what it always accepted.
+	file := writeLockfile(t, t.TempDir(), `{
+	  "lockfileVersion": 3,
+	  "packages": {
+	    "": {"name": "root"},
+	    "node_modules/linked": {"link": true, "resolved": 7},
+	    "node_modules/plain": {"version": "1.0.0"}
+	  }
+	}`)
+	entries, err := LoadEntries(file, nil)
+	if err != nil {
+		t.Fatalf("LoadEntries() error = %v, want the link accepted as before", err)
+	}
+	if len(entries) != 2 || !entries[0].Link || entries[0].Path != "node_modules/linked" {
+		t.Fatalf("entries = %#v", entries)
+	}
+	records, err := LoadRecords(file, nil)
+	if err != nil || !records[0].Link || records[0].LinkTarget != "" {
+		t.Fatalf("LoadRecords() = %#v, %v", records, err)
+	}
+}
+
+func TestLoadLocalPackagesReadsOnlyWhatALinkPointsAt(t *testing.T) {
+	file := writeLockfile(t, t.TempDir(), `{
+	  "lockfileVersion": 3,
+	  "packages": {
+	    "": {"name": "root", "version": "9.9.9"},
+	    "node_modules/ws": {"link": true, "resolved": "packages/ws"},
+	    "node_modules/noname": {"link": true, "resolved": "packages/noname"},
+	    "node_modules/gone": {"link": true, "resolved": "packages/gone"},
+	    "packages/ws": {"name": "ws", "version": "1.2.3"},
+	    "packages/noname": {"version": "0.1.0"},
+	    "packages/unlinked": {"name": "unlinked", "version": "5.0.0"}
+	  }
+	}`)
+	got, err := LoadLocalPackages(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []LocalPackage{{Path: "packages/noname", Name: "noname", Version: "0.1.0"}, {Path: "packages/ws", Name: "ws", Version: "1.2.3"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("LoadLocalPackages() = %#v, want %#v", got, want)
+	}
+}

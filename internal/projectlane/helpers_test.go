@@ -72,7 +72,7 @@ func writeLock(t *testing.T, packages map[string]map[string]any) string {
 
 func graphOf(t *testing.T, packages map[string]map[string]any) Graph {
 	t.Helper()
-	graph, err := LoadGraph(writeLock(t, packages), nil)
+	graph, err := LoadGraph(writeLock(t, packages), Hosts{})
 	if err != nil {
 		t.Fatalf("LoadGraph() error = %v", err)
 	}

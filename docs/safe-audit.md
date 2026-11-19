@@ -746,13 +746,19 @@ and keeps the answer as a document instead:
 
 Each exact identity carries its own validated advisories and its own coverage.
 A chunk, page or advisory detail that fails marks only the identities it covered
-as `missing` and says why in `gap`; every other validated hit stays, and a
-malformed answer is a gap, never an empty reading. A `MAL-` record keeps the
+as `missing` and says why in `gap`; every other validated hit stays. Within a
+chunk whose answer is paired to the queries, each result stands or falls on its
+own; the hits of an identity whose pages are re-queried are the union of the
+batch answer's and of every page read, so a failure on page two keeps what page
+one carried. A malformed answer, or one that repeats a member (which `jq` would
+resolve silently to the last), is a gap, never an empty reading. The mode asks
+`safe-core` (at safe's own version) to detect repeated members, so it needs it
+installed; without it the exit is 4. A `MAL-` record keeps the
 name and version it affects (`malware: true`). The blocklist is reported by
 name, independently of every OSV outcome. The document carries no verdict:
 `safe-core project-decide` reads it, with the standing acceptances added, and
 decides what a command introduces. The exit is 0 with a document, 2 for
-malformed input and 4 when no document can be trusted (an unreadable blocklist).
+malformed input and 4 when no document can be trusted (an unreadable blocklist, or no `safe-core`).
 
 ## IOC Workflows
 

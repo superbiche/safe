@@ -1,7 +1,6 @@
 package projectlane
 
 import (
-	"net/url"
 	"sort"
 	"strings"
 )
@@ -285,7 +284,7 @@ type side struct {
 func sideOf(graph Graph) map[string]*side {
 	out := map[string]*side{}
 	for _, occurrence := range graph.Occurrences {
-		if !occurrence.Public() {
+		if !occurrence.Public {
 			continue
 		}
 		s := out[occurrence.Name]
@@ -298,10 +297,12 @@ func sideOf(graph Graph) map[string]*side {
 	return out
 }
 
-// advisoryFacts is what one side reads for one (name, advisory id).
+// advisoryFacts is what one side reads for one (name, advisory id): the
+// severity it has at each version that carries it, and how many occurrences
+// carry it.
 type advisoryFacts struct {
 	severities map[string]struct{}
-	versions   map[string]struct{}
+	versions   map[string]string // version -> severity at that version
 	count      int
 }
 
@@ -326,15 +327,24 @@ func (s *side) read(evidence evidenceIndex) (map[string]*advisoryFacts, bool, []
 			}
 			fact := facts[hit.ID]
 			if fact == nil {
-				fact = &advisoryFacts{severities: map[string]struct{}{}, versions: map[string]struct{}{}}
+				fact = &advisoryFacts{severities: map[string]struct{}{}, versions: map[string]string{}}
 				facts[hit.ID] = fact
 			}
 			fact.severities[hit.Severity] = struct{}{}
-			fact.versions[identity.Version] = struct{}{}
+			fact.versions[identity.Version] = hit.Severity
 			fact.count += occurrences
 		}
 	}
 	return facts, complete, gaps
+}
+
+func (f *advisoryFacts) versionList() []string {
+	versions := make([]string, 0, len(f.versions))
+	for version := range f.versions {
+		versions = append(versions, version)
+	}
+	sort.Strings(versions)
+	return versions
 }
 
 func differential(report *Report, baseline, target Graph, evidence evidenceIndex, doc Evidence) {
@@ -370,6 +380,10 @@ func differential(report *Report, baseline, target Graph, evidence evidenceIndex
 			report.Coverage = append(report.Coverage, coverageGaps(name, beforeGaps, afterGaps, evidence)...)
 		}
 
+		// The differential identity is (name, advisory id): which advisories are
+		// introduced is settled on the name. What each introduced advisory
+		// means is then settled per artifact, below.
+		introduced := map[string]*advisoryFacts{}
 		for _, id := range sortedFactIDs(afterFacts) {
 			fact := afterFacts[id]
 			if previous, present := beforeFacts[id]; present {
@@ -381,15 +395,16 @@ func differential(report *Report, baseline, target Graph, evidence evidenceIndex
 				// baseline holds: that is the coverage gap's to carry.
 				continue
 			}
-			report.Advisories.Introduced = append(report.Advisories.Introduced,
-				introducedAdvisory(name, id, fact, target, evidence, doc, blockSet))
+			introduced[id] = fact
 		}
+		report.Advisories.Introduced = append(report.Advisories.Introduced,
+			introducedAdvisories(name, introduced, target, doc, blockSet)...)
 		if afterComplete {
 			for _, id := range sortedFactIDs(beforeFacts) {
 				if _, still := afterFacts[id]; !still {
 					fact := beforeFacts[id]
 					report.Advisories.Fixed = append(report.Advisories.Fixed, FixedAdvisory{
-						Name: name, ID: id, Severity: maxSeverity(fact.severities), Versions: sortedIDs(fact.versions),
+						Name: name, ID: id, Severity: maxSeverity(fact.severities), Versions: fact.versionList(),
 					})
 				}
 			}
@@ -409,7 +424,7 @@ func sortedFactIDs(facts map[string]*advisoryFacts) []string {
 func presentAdvisory(name, id string, before, after *advisoryFacts) PresentAdvisory {
 	item := PresentAdvisory{
 		Name: name, ID: id, Severity: maxSeverity(after.severities),
-		VersionsBefore: sortedIDs(before.versions), VersionsAfter: sortedIDs(after.versions),
+		VersionsBefore: before.versionList(), VersionsAfter: after.versionList(),
 		OccurrencesBefore: before.count, OccurrencesAfter: after.count,
 	}
 	item.ExposureChanged = !equalStrings(item.VersionsBefore, item.VersionsAfter) || before.count != after.count
@@ -469,70 +484,116 @@ func maxSeverity(set map[string]struct{}) string {
 	return best
 }
 
-func introducedAdvisory(name, id string, fact *advisoryFacts, target Graph, evidence evidenceIndex, doc Evidence, blockSet map[string]struct{}) IntroducedAdvice {
-	item := IntroducedAdvice{
-		Name: name, ID: id, Severity: maxSeverity(fact.severities), Versions: sortedIDs(fact.versions),
-		ClearedBy: []string{},
+// severityClass is what a severity means for the install: blocking when the
+// policy lists it, adverse at high or unreadable, below high otherwise.
+func severityClass(severity string, blockSet map[string]struct{}) string {
+	if _, blocks := blockSet[severity]; blocks {
+		return AdvisoryBlocking
 	}
-	class := AdvisoryBelowHigh
-	for severity := range fact.severities {
-		if _, blocks := blockSet[severity]; blocks {
-			class = AdvisoryBlocking
-			break
-		}
+	if severityRank(severity) >= severityRank(SeverityUnknown) {
+		return AdvisoryAdverse
 	}
-	if class != AdvisoryBlocking {
-		for severity := range fact.severities {
-			if severityRank(severity) >= severityRank(SeverityUnknown) {
-				class = AdvisoryAdverse
+	return AdvisoryBelowHigh
+}
+
+// introducedAdvisories turns the introduced (name, advisory id) pairs of one
+// package name into report items, one per advisory and class. The class is a
+// property of the artifact that carries the advisory, not of the aggregate: an
+// advisory that is critical at one version and high at another is a blocking
+// item for the first and an adverse item for the second, each cleared (or
+// not) by an authority of its own class and only for the artifacts it names.
+func introducedAdvisories(name string, introduced map[string]*advisoryFacts, target Graph, doc Evidence, blockSet map[string]struct{}) []IntroducedAdvice {
+	// The introduced blocking advisories of each version: what a followed
+	// advisory override must cover for that artifact. An advisory already
+	// present never gates and is never demanded.
+	blockingAt := map[string]map[string]struct{}{}
+	for id, fact := range introduced {
+		for version, severity := range fact.versions {
+			if severityClass(severity, blockSet) == AdvisoryBlocking {
+				if blockingAt[version] == nil {
+					blockingAt[version] = map[string]struct{}{}
+				}
+				blockingAt[version][id] = struct{}{}
 			}
 		}
 	}
-	item.Class = class
-	if class == AdvisoryBelowHigh {
-		item.Cleared = true
-		return item
-	}
 
-	// Every artifact that carries the advisory must be covered.
-	carriers := map[ArtifactKey]struct{}{}
-	for _, occurrence := range target.Occurrences {
-		if occurrence.Name != name || !occurrence.Public() {
-			continue
+	ids := make([]string, 0, len(introduced))
+	for id := range introduced {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	var items []IntroducedAdvice
+	for _, id := range ids {
+		fact := introduced[id]
+		byClass := map[string]map[string]struct{}{}
+		severities := map[string]map[string]struct{}{}
+		for version, severity := range fact.versions {
+			class := severityClass(severity, blockSet)
+			if byClass[class] == nil {
+				byClass[class] = map[string]struct{}{}
+				severities[class] = map[string]struct{}{}
+			}
+			byClass[class][version] = struct{}{}
+			severities[class][severity] = struct{}{}
 		}
-		if _, carries := fact.versions[occurrence.Version]; carries {
-			carriers[occurrence.Key()] = struct{}{}
+		for _, class := range []string{AdvisoryBlocking, AdvisoryAdverse, AdvisoryBelowHigh} {
+			versions, ok := byClass[class]
+			if !ok {
+				continue
+			}
+			item := IntroducedAdvice{
+				Name: name, ID: id, Severity: maxSeverity(severities[class]), Versions: sortedIDs(versions),
+				Class: class, ClearedBy: []string{},
+			}
+			if class == AdvisoryBelowHigh {
+				item.Cleared = true
+				items = append(items, item)
+				continue
+			}
+			used := map[string]struct{}{}
+			carried := 0
+			cleared := true
+			seen := map[string]struct{}{}
+			for _, occurrence := range target.Occurrences {
+				if occurrence.Name != name || !occurrence.Public {
+					continue
+				}
+				if _, carries := versions[occurrence.Version]; !carries {
+					continue
+				}
+				marker := keyText(occurrence.Key()) + "\x00" + occurrence.Host + "\x00" + occurrence.CoveredBy + "\x00" + occurrence.Member
+				if _, dup := seen[marker]; dup {
+					continue
+				}
+				seen[marker] = struct{}{}
+				carried++
+				kind, ok := clearingAcceptance(class, occurrence, doc, blockingAt[occurrence.Version])
+				if !ok {
+					cleared = false
+					continue
+				}
+				used[kind] = struct{}{}
+			}
+			item.Cleared = cleared && carried > 0
+			if item.Cleared {
+				item.ClearedBy = sortedIDs(used)
+			}
+			items = append(items, item)
 		}
 	}
-	used := map[string]struct{}{}
-	item.Cleared = len(carriers) > 0
-	for key := range carriers {
-		kind, ok := clearingAcceptance(class, key, doc, evidence, blockSet)
-		if !ok {
-			item.Cleared = false
-			continue
-		}
-		used[kind] = struct{}{}
-	}
-	if item.Cleared {
-		item.ClearedBy = sortedIDs(used)
-	}
-	return item
+	return items
 }
 
 // clearingAcceptance finds the standing acceptance that clears one artifact
-// for an advisory class, by the class's own authority list.
-func clearingAcceptance(class string, key ArtifactKey, doc Evidence, evidence evidenceIndex, blockSet map[string]struct{}) (string, bool) {
-	host := hostOf(key.Origin)
-	identity := evidence[Identity{Name: key.Name, Version: key.Version}]
-	blocking := map[string]struct{}{}
-	for _, hit := range identity.Advisories {
-		if _, blocks := blockSet[hit.Severity]; blocks && !hit.Malware {
-			blocking[hit.ID] = struct{}{}
-		}
-	}
+// for an advisory class, by the class's own authority list. introducedBlocking
+// is the introduced blocking advisories of the artifact: what a followed
+// advisory override has to cover.
+func clearingAcceptance(class string, occurrence Occurrence, doc Evidence, introducedBlocking map[string]struct{}) (string, bool) {
 	for _, acceptance := range doc.Acceptances {
-		if acceptance.Name != key.Name || acceptance.Version != key.Version || !strings.EqualFold(acceptance.Host, host) {
+		if acceptance.Name != occurrence.Name || acceptance.Version != occurrence.Version ||
+			occurrence.Host == "" || !strings.EqualFold(acceptance.Host, occurrence.Host) {
 			continue
 		}
 		switch class {
@@ -541,7 +602,7 @@ func clearingAcceptance(class string, key ArtifactKey, doc Evidence, evidence ev
 			case AcceptLocalExact:
 				return acceptance.Kind, true
 			case AcceptFollowedOverride:
-				if covers(acceptance.Advisories, blocking) {
+				if covers(acceptance.Advisories, introducedBlocking) {
 					return acceptance.Kind, true
 				}
 			}
@@ -568,17 +629,6 @@ func covers(listed []string, required map[string]struct{}) bool {
 		}
 	}
 	return true
-}
-
-func hostOf(origin string) string {
-	if strings.HasPrefix(strings.ToLower(origin), DefaultRegistryHost+"/") {
-		return DefaultRegistryHost
-	}
-	parsed, err := url.Parse(origin)
-	if err != nil {
-		return ""
-	}
-	return strings.ToLower(parsed.Host)
 }
 
 // maliceItems reads malice on the target graph alone and independently of the

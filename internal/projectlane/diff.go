@@ -8,6 +8,9 @@ const (
 	IntroducedOrigin    = "origin_changed"
 	IntroducedIntegrity = "integrity_changed"
 	IntroducedBoth      = "origin_and_integrity_changed"
+	// IntroducedCovering is a bundled entry whose own identity is unchanged
+	// but whose covering artifact (or place in it) is not.
+	IntroducedCovering = "covering_changed"
 )
 
 // Introduced is an artifact the target graph has and the baseline does not.
@@ -79,6 +82,8 @@ func Diff(baseline, target Graph) Difference {
 			originChanged := old.Origin != key.Origin
 			integrityChanged := old.Integrity != key.Integrity
 			switch {
+			case !originChanged && !integrityChanged:
+				reason = IntroducedCovering
 			case originChanged && integrityChanged:
 				reason = IntroducedBoth
 			case originChanged:
@@ -148,7 +153,7 @@ func versionsByName(graph Graph) map[string]nameVersions {
 		sort.Strings(list)
 		signature := ""
 		for _, key := range keys[name] {
-			signature += key.Version + "\x00" + key.Origin + "\x00" + key.Integrity + "\x01"
+			signature += key.Version + "\x00" + key.Origin + "\x00" + key.Integrity + "\x00" + key.CoveredBy + "\x00" + key.Member + "\x01"
 		}
 		out[name] = nameVersions{versions: list, signature: signature}
 	}
@@ -185,7 +190,13 @@ func keyLess(a, b ArtifactKey) bool {
 	if a.Origin != b.Origin {
 		return a.Origin < b.Origin
 	}
-	return a.Integrity < b.Integrity
+	if a.Integrity != b.Integrity {
+		return a.Integrity < b.Integrity
+	}
+	if a.CoveredBy != b.CoveredBy {
+		return a.CoveredBy < b.CoveredBy
+	}
+	return a.Member < b.Member
 }
 
 func equalStrings(a, b []string) bool {

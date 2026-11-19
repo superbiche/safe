@@ -6132,6 +6132,13 @@ osv_query_package_json() {
       osv_write_package_query_result "$output" error "OSV response is not a single JSON document" "$vulns_file"
       return 0
     fi
+    # The evidence mode asks for a repeated member to be refused as well: jq
+    # would keep the last of two same-named members without a word. The page
+    # is not merged, so what earlier pages carried is kept.
+    if [[ -n "${OSV_REJECT_REPEATED_MEMBERS:-}" ]] && scanner_batch_has_repeated_members "$output.raw"; then
+      osv_write_package_query_result "$output" error "OSV response has a repeated member" "$vulns_file"
+      return 0
+    fi
     # Validation is two-stage with the merge in between (delta-2 F1): the
     # vulns payload is judged first, its records merged into the
     # accumulator, and only THEN is the pagination token judged — so a
@@ -10844,22 +10851,58 @@ scanner_batch_single_document() {
 # a vuln without a string id, or a token of the wrong shape must fail closed
 # here — optional iterators (`.vulns[]?`) would otherwise read each of those
 # as "no advisories" and exit 0 clean (PR#64 review F2). $1 file, $2 count.
+SCANNER_BATCH_RESULT_PRED='
+  (type == "object")
+  and ((has("vulns") | not)
+       or (.vulns | (type == "array")
+           and ([.[] | (type == "object")
+                 and ((.id? | type) == "string")
+                 and (.id | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))
+                 and ((.id | test("[\\n\\r]")) | not)] | all)))
+  and ((has("next_page_token") | not)
+       or (.next_page_token | (type == "string") and (length > 0)
+           and test("^[[:graph:]]+$")))'
+
 scanner_batch_response_valid() {
-  jq -e --argjson n "$2" '
-    (.results | type == "array") and (.results | length == $n)
-    and ([.results[]
-          | (type == "object")
-            and ((has("vulns") | not)
-                 or (.vulns | (type == "array")
-                     and ([.[] | (type == "object")
-                           and ((.id? | type) == "string")
-                           and (.id | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))
-                           and ((.id | test("[\\n\\r]")) | not)] | all)))
-            and ((has("next_page_token") | not)
-                 or (.next_page_token | (type == "string") and (length > 0)
-                     and test("^[[:graph:]]+$")))
-         ] | all)
-  ' "$1" >/dev/null 2>&1
+  jq -e --argjson n "$2" '(.results | type == "array") and (.results | length == $n)
+    and ([.results[] | '"$SCANNER_BATCH_RESULT_PRED"'] | all)' "$1" >/dev/null 2>&1
+}
+
+# The batch answer's shape (an array of exactly one result per query) is what
+# establishes positional pairing; each result is then judged on its own, so a
+# malformed neighbour loses only itself. Prints a JSON array of booleans.
+scanner_batch_paired() {
+  jq -e --argjson n "$2" '(.results | type == "array") and (.results | length == $n)' "$1" >/dev/null 2>&1
+}
+
+scanner_batch_result_validity() {
+  jq -c '[.results[] | '"$SCANNER_BATCH_RESULT_PRED"']' "$1"
+}
+
+# jq keeps the last of two members of one name without a word, so a repeated
+# member is looked for by safe-core, whose reader sees every token (the same
+# strictjson check the verdict engine applies to its own evidence). Used by the
+# evidence mode only (the plain batch is unchanged): the mode first requires
+# safe-core at safe's own version, see scanner_batch_core_ready.
+SCANNER_BATCH_CORE_BIN=""
+scanner_batch_core_ready() {
+  local bin="${SAFE_CORE_BIN:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/safe-core}" reported
+  if [[ ! -x "$bin" ]]; then
+    printf 'safe audit: scanner-batch: safe-core is not installed — audit-infrastructure breakage, not a package finding; rerun install.sh\n' >&2
+    return 1
+  fi
+  reported=$("$bin" --version 2>/dev/null) || reported=""
+  if [[ "$reported" != "${SAFE_VERSION}" ]]; then
+    printf 'safe audit: scanner-batch: safe-core version %s does not match safe %s — audit-infrastructure breakage, not a package finding; rerun install.sh\n' \
+      "${reported:-unknown}" "${SAFE_VERSION}" >&2
+    return 1
+  fi
+  SCANNER_BATCH_CORE_BIN="$bin"
+}
+
+scanner_batch_has_repeated_members() {
+  "$SCANNER_BATCH_CORE_BIN" repeated-members < "$1" >/dev/null 2>&1
+  (( $? == 1 ))
 }
 
 # A paginated re-query replaces ALREADY-VALIDATED batch results, so the same
@@ -11124,6 +11167,7 @@ scanner_batch_command() {
 # trusted at all (scratch, unreadable blocklist, assembly failure).
 scanner_batch_evidence_command() {
   local input="$1" scratch
+  scanner_batch_core_ready || return 4
   new_scratch_dir scratch || {
     printf 'safe audit: scanner-batch: could not create scratch dir\n' >&2
     return 4
@@ -11143,7 +11187,7 @@ scanner_batch_evidence_command() {
 
   # paired: one {pkg, res, gaps} per identity, in input order. gaps collects
   # every reason the identity's reading is incomplete.
-  local total chunk_start chunk chunk_len body paired='[]' gap
+  local total chunk_start chunk chunk_len body paired='[]' gap validity
   total=$(jq 'length' <<<"$pkgs")
   chunk_start=0
   while (( chunk_start < total )); do
@@ -11156,39 +11200,48 @@ scanner_batch_evidence_command() {
       gap="OSV batch query failed (network/timeout/HTTP error)"
     elif ! scanner_batch_single_document "$scratch/batch.json"; then
       gap="malformed OSV batch response (not a single JSON document)"
-    elif ! scanner_batch_response_valid "$scratch/batch.json" "$chunk_len"; then
+    elif scanner_batch_has_repeated_members "$scratch/batch.json"; then
+      gap="malformed OSV batch response (repeated member)"
+    elif ! scanner_batch_paired "$scratch/batch.json" "$chunk_len"; then
       gap="malformed OSV batch response"
     fi
     if [[ -n "$gap" ]]; then
       paired=$(jq -cn --argjson acc "$paired" --argjson chunk "$chunk" --arg gap "$gap" \
         '$acc + ($chunk | map({pkg: ., res: {vulns: []}, gaps: [$gap]}))')
     else
-      paired=$(jq -cn --argjson acc "$paired" --argjson chunk "$chunk" --slurpfile b "$scratch/batch.json" \
-        '$acc + ([$chunk, $b[0].results] | transpose | map({pkg: .[0], res: .[1], gaps: []}))')
+      # Positional pairing holds: each result stands or falls on its own.
+      validity=$(scanner_batch_result_validity "$scratch/batch.json")
+      paired=$(jq -cn --argjson acc "$paired" --argjson chunk "$chunk" --argjson ok "$validity" \
+        --slurpfile b "$scratch/batch.json" '
+        $acc + ([range(0; ($chunk | length))] | map(
+          if $ok[.] then {pkg: $chunk[.], res: $b[0].results[.], gaps: []}
+          else {pkg: $chunk[.], res: {vulns: []}, gaps: ["malformed OSV batch response"]} end))')
     fi
     chunk_start=$((chunk_start + 100))
   done
 
-  # A truncated page keeps the validated first page when its re-query fails.
-  local idx pkg_name pkg_version pagefile
+  # A truncated page is read to the end where it can be. The hits of an
+  # identity are the union of the validated hits of the batch answer and of
+  # every page the re-query read (the helper keeps what it accumulated when a
+  # later page fails); coverage is tracked apart, so a failure on page two
+  # never erases the hit page one carried.
+  local idx pkg_name pkg_version pagefile note
   while IFS= read -r idx; do
     pkg_name=$(jq -r --argjson i "$idx" '.[$i].pkg.name' <<<"$paired")
     pkg_version=$(jq -r --argjson i "$idx" '.[$i].pkg.version' <<<"$paired")
     pagefile="$scratch/paged-$idx.json"
-    gap=""
-    osv_query_package_json npm "$pkg_name" "$pkg_version" "$pagefile"
-    if ! jq -e '.status? != "error"' "$pagefile" >/dev/null 2>&1; then
-      gap="OSV pagination re-query failed"
-    elif ! scanner_batch_page_valid "$pagefile"; then
-      gap="malformed paginated OSV response"
-    fi
-    if [[ -n "$gap" ]]; then
-      paired=$(jq -c --argjson i "$idx" --arg gap "$gap" \
-        '.[$i].res = {vulns: (.[$i].res.vulns // [])} | .[$i].gaps += [$gap]' <<<"$paired")
-    else
-      paired=$(jq -c --argjson i "$idx" --slurpfile p "$pagefile" \
-        '.[$i].res = {vulns: ($p[0].vulns // [])}' <<<"$paired")
-    fi
+    OSV_REJECT_REPEATED_MEMBERS=1 osv_query_package_json npm "$pkg_name" "$pkg_version" "$pagefile"
+    note=$(jq -r 'if (type == "object") and (.status == "ok") then "" else "OSV pagination re-query failed" end' "$pagefile" 2>/dev/null) \
+      || note="OSV pagination re-query failed"
+    paired=$(jq -c --argjson i "$idx" --arg note "$note" --slurpfile p "$pagefile" '
+      def wellformed: (type == "object") and ((.id? | type) == "string")
+        and (.id | test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and ((.id | test("[\\n\\r]")) | not);
+      (if ($p[0] | type) == "object" and (($p[0].vulns? // []) | type) == "array" then $p[0].vulns // [] else [] end) as $page
+      | ($page | map(select(wellformed))) as $good
+      | .[$i].res = {vulns: ((.[$i].res.vulns + $good) | unique_by(.id))}
+      | .[$i].gaps += (if $note != "" then [$note]
+                       elif ($good | length) != ($page | length) then ["malformed paginated OSV response"]
+                       else [] end)' <<<"$paired")
   done < <(jq -r 'to_entries[] | select(.value.res.next_page_token? | strings | length > 0) | .key' <<<"$paired")
 
   # Severity per (advisory, queried package); an advisory whose record cannot
@@ -11200,7 +11253,7 @@ scanner_batch_evidence_command() {
       failed_map=$(jq -c --arg id "$id" '. + {($id): "OSV advisory fetch failed"}' <<<"$failed_map")
       continue
     fi
-    if ! scanner_batch_detail_valid "$scratch/vuln.json" "$id"; then
+    if scanner_batch_has_repeated_members "$scratch/vuln.json" || ! scanner_batch_detail_valid "$scratch/vuln.json" "$id"; then
       failed_map=$(jq -c --arg id "$id" '. + {($id): "OSV advisory record malformed"}' <<<"$failed_map")
       continue
     fi

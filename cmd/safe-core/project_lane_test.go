@@ -191,3 +191,48 @@ func TestProjectLaneRefusesUnusableInput(t *testing.T) {
 		})
 	}
 }
+
+func TestRepeatedMembersSeesWhatJQAndEncodingJSONKeepLastOf(t *testing.T) {
+	for name, tc := range map[string]struct {
+		document string
+		code     int
+	}{
+		"clean":                      {`{"results":[{"vulns":[{"id":"A"}]}]}`, 0},
+		"repeated container":         {`{"results":[{"vulns":[{"id":"A"}],"vulns":[]}]}`, 1},
+		"repeated scalar":            {`{"id":"A","id":"B"}`, 1},
+		"repeated in a nested array": {`{"a":[{"x":1},{"y":2,"y":3}]}`, 1},
+		"not JSON":                   {`{"a":`, 3},
+		"two documents":              {`{} {}`, 3},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if got := run([]string{"repeated-members"}, strings.NewReader(tc.document), &stdout, &stderr); got != tc.code {
+				t.Fatalf("run() = %d, want %d (stderr %q)", got, tc.code, stderr.String())
+			}
+		})
+	}
+	var stdout, stderr bytes.Buffer
+	if got := run([]string{"repeated-members", "x"}, strings.NewReader("{}"), &stdout, &stderr); got != 2 {
+		t.Fatalf("run() with an argument = %d, want 2", got)
+	}
+}
+
+func TestProjectLaneTakesBindingAndPublicEvidenceHostsApart(t *testing.T) {
+	dir := t.TempDir()
+	packages := map[string]any{"": map[string]any{"name": "root"}, "node_modules/p": map[string]any{
+		"version": "1.0.0", "resolved": "https://npm.internal.example/p/-/p-1.0.0.tgz", "integrity": laneIntegrity("p"),
+	}}
+	data, _ := json.Marshal(map[string]any{"lockfileVersion": 3, "packages": packages})
+	lock := filepath.Join(dir, "lock.json")
+	if err := os.WriteFile(lock, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := runLane("project-diff", "--registry-host", "npm.internal.example", "--no-baseline", lock)
+	if code != 0 || !strings.Contains(stdout, `"bound":true`) || !strings.Contains(stdout, `"evidence_request":[]`) {
+		t.Fatalf("binding host only: code = %d, stdout = %s, stderr = %s", code, stdout, stderr)
+	}
+	code, stdout, _ = runLane("project-diff", "--registry-host", "npm.internal.example", "--public-evidence-host", "npm.internal.example", "--no-baseline", lock)
+	if code != 0 || !strings.Contains(stdout, `"evidence_request":[{"name":"p","version":"1.0.0"}]`) {
+		t.Fatalf("both: code = %d, stdout = %s", code, stdout)
+	}
+}

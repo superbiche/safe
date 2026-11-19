@@ -8,6 +8,7 @@ import (
 	"sort"
 
 	"github.com/superbiche/safe/internal/projectlane"
+	"github.com/superbiche/safe/internal/strictjson"
 )
 
 // The project-lane subcommands are the judging core as pure commands over
@@ -19,9 +20,9 @@ import (
 // be read, never an empty result.
 
 const (
-	projectGraphUsage  = "safe-core: usage: safe-core project-graph [--registry-host <host>]... <lockfile>"
-	projectDiffUsage   = "safe-core: usage: safe-core project-diff [--registry-host <host>]... (--baseline <lockfile> | --no-baseline) <target-lockfile>"
-	projectDecideUsage = "safe-core: usage: safe-core project-decide [--registry-host <host>]... (--baseline <lockfile> | --no-baseline) --evidence <file> <target-lockfile>"
+	projectGraphUsage  = "safe-core: usage: safe-core project-graph [--registry-host <host>]... [--public-evidence-host <host>]... <lockfile>"
+	projectDiffUsage   = "safe-core: usage: safe-core project-diff [--registry-host <host>]... [--public-evidence-host <host>]... (--baseline <lockfile> | --no-baseline) <target-lockfile>"
+	projectDecideUsage = "safe-core: usage: safe-core project-decide [--registry-host <host>]... [--public-evidence-host <host>]... (--baseline <lockfile> | --no-baseline) --evidence <file> <target-lockfile>"
 )
 
 // projectLaneSchema versions the documents the graph and diff commands print.
@@ -29,17 +30,25 @@ const projectLaneSchema = 1
 
 type projectArgs struct {
 	registryHosts []string
+	publicHosts   []string
 	baseline      string
 	noBaseline    bool
 	evidence      string
 	target        string
 }
 
+// hosts are the two host sets the core takes: where artifacts may be bound
+// (--registry-host) and whose artifacts public evidence may speak for
+// (--public-evidence-host), each in addition to npm's public registry.
+func (p projectArgs) hosts() projectlane.Hosts {
+	return projectlane.Hosts{Registry: p.registryHosts, PublicEvidence: p.publicHosts}
+}
+
 func parseProjectArgs(args []string, allowBaseline, needEvidence bool) (projectArgs, bool) {
 	var parsed projectArgs
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
-		case "--registry-host", "--baseline", "--evidence":
+		case "--registry-host", "--public-evidence-host", "--baseline", "--evidence":
 			if i+1 >= len(args) || args[i+1] == "" {
 				return projectArgs{}, false
 			}
@@ -48,6 +57,8 @@ func parseProjectArgs(args []string, allowBaseline, needEvidence bool) (projectA
 			switch args[i-1] {
 			case "--registry-host":
 				parsed.registryHosts = append(parsed.registryHosts, value)
+			case "--public-evidence-host":
+				parsed.publicHosts = append(parsed.publicHosts, value)
 			case "--baseline":
 				if !allowBaseline || parsed.baseline != "" {
 					return projectArgs{}, false
@@ -101,7 +112,7 @@ func projectGraph(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, projectGraphUsage)
 		return 2
 	}
-	graph, err := projectlane.LoadGraph(parsed.target, parsed.registryHosts)
+	graph, err := projectlane.LoadGraph(parsed.target, parsed.hosts())
 	if err != nil {
 		fmt.Fprintf(stderr, "safe-core: project-graph: %v\n", err)
 		return 3
@@ -121,7 +132,7 @@ func loadBaseline(parsed projectArgs) (graph projectlane.Graph, unreadable strin
 	if parsed.noBaseline {
 		return projectlane.Graph{}, ""
 	}
-	graph, err := projectlane.LoadGraph(parsed.baseline, parsed.registryHosts)
+	graph, err := projectlane.LoadGraph(parsed.baseline, parsed.hosts())
 	if err != nil {
 		return projectlane.Graph{}, err.Error()
 	}
@@ -136,7 +147,7 @@ func projectDiff(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, projectDiffUsage)
 		return 2
 	}
-	target, err := projectlane.LoadGraph(parsed.target, parsed.registryHosts)
+	target, err := projectlane.LoadGraph(parsed.target, parsed.hosts())
 	if err != nil {
 		fmt.Fprintf(stderr, "safe-core: project-diff: %v\n", err)
 		return 3
@@ -191,7 +202,7 @@ func projectDecide(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "safe-core: project-decide: %v\n", err)
 		return 3
 	}
-	target, err := projectlane.LoadGraph(parsed.target, parsed.registryHosts)
+	target, err := projectlane.LoadGraph(parsed.target, parsed.hosts())
 	if err != nil {
 		fmt.Fprintf(stderr, "safe-core: project-decide: %v\n", err)
 		return 3
@@ -201,4 +212,29 @@ func projectDecide(args []string, stdout, stderr io.Writer) int {
 		Baseline: baseline, BaselineError: unreadable, HasBaseline: !parsed.noBaseline,
 		Target: target, Evidence: evidence, RegistryHosts: parsed.registryHosts,
 	}))
+}
+
+// repeatedMembers reads one JSON document on stdin and says whether any object
+// in it names a member twice (exit 1), which encoding/json and jq would
+// otherwise settle silently by keeping the last. Exit 0: none; 3: not JSON.
+// The advisory readers of safe audit call it before they trust an OSV answer.
+func repeatedMembers(args []string, stdin io.Reader, stderr io.Writer) int {
+	if len(args) != 0 {
+		fmt.Fprintln(stderr, "safe-core: usage: safe-core repeated-members < document.json")
+		return 2
+	}
+	raw, err := io.ReadAll(stdin)
+	if err != nil {
+		fmt.Fprintf(stderr, "safe-core: repeated-members: read: %v\n", err)
+		return 3
+	}
+	if !json.Valid(raw) {
+		fmt.Fprintln(stderr, "safe-core: repeated-members: not a single valid JSON document")
+		return 3
+	}
+	if err := strictjson.RejectRepeatedMembers(raw); err != nil {
+		fmt.Fprintf(stderr, "safe-core: repeated-members: %v\n", err)
+		return 1
+	}
+	return 0
 }

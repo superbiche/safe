@@ -34,10 +34,14 @@ import (
 const (
 	KindRegistry = "registry"
 	KindLink     = "link"
-	KindGit      = "git"
-	KindFile     = "file"
-	KindRemote   = "remote"
-	KindUnknown  = "unknown"
+	// KindLocal is an in-project package a link entry points at (a workspace
+	// member): the target of a link, kept as a record of its own so that a
+	// change of its version shows in a difference.
+	KindLocal   = "local"
+	KindGit     = "git"
+	KindFile    = "file"
+	KindRemote  = "remote"
+	KindUnknown = "unknown"
 )
 
 // Occurrence is one lockfile entry: an artifact at a path.
@@ -50,7 +54,7 @@ type Occurrence struct {
 	Alias   string `json:"alias,omitempty"`
 	Version string `json:"version"`
 	// Origin is the resolved location with credentials removed. For a link it
-	// is the link's target path.
+	// is the link's target path, for a local record its own path.
 	Origin     string `json:"origin"`
 	Integrity  string `json:"integrity"`
 	Kind       string `json:"kind"`
@@ -58,15 +62,38 @@ type Occurrence struct {
 	Dev        bool   `json:"dev"`
 	Bundled    bool   `json:"bundled"`
 	Shrinkwrap bool   `json:"shrinkwrap"`
+	// Host is the registry host the artifact came from; a bundled entry has
+	// its covering artifact's.
+	Host string `json:"host"`
+	// CoveredBy and Member say which artifact's tarball carries a bundled
+	// entry, and where in it: the covering artifact's key and the path of the
+	// entry below the covering artifact's own. Both are empty for an artifact
+	// that is fetched on its own.
+	CoveredBy string `json:"covered_by,omitempty"`
+	Member    string `json:"member,omitempty"`
+	// Public is whether public advisory evidence speaks for this occurrence
+	// (see Hosts.PublicEvidence); a bundled entry follows its covering
+	// artifact. It is the only door into the advisory reading and the
+	// identity request.
+	Public bool `json:"public_evidence"`
+
+	// descriptor is the resolved string as written in the lockfile, before any
+	// redaction: binding judges what npm would fetch, not what is reported.
+	descriptor string
 }
 
 // ArtifactKey identifies the bytes an occurrence stands for. A different
-// origin or hash at the same version is a different artifact.
+// origin or hash at the same version is a different artifact, and a bundled
+// entry is the entry of one covering artifact: the same child identity
+// carried by another parent, or by the same parent at another hash, is
+// another artifact.
 type ArtifactKey struct {
 	Name      string `json:"name"`
 	Version   string `json:"version"`
 	Origin    string `json:"origin"`
 	Integrity string `json:"integrity"`
+	CoveredBy string `json:"covered_by,omitempty"`
+	Member    string `json:"member,omitempty"`
 }
 
 // Identity is the exact public identity advisories are read for.
@@ -77,7 +104,7 @@ type Identity struct {
 
 // Key returns the artifact an occurrence installs.
 func (o Occurrence) Key() ArtifactKey {
-	return ArtifactKey{Name: o.Name, Version: o.Version, Origin: o.Origin, Integrity: o.Integrity}
+	return ArtifactKey{Name: o.Name, Version: o.Version, Origin: o.Origin, Integrity: o.Integrity, CoveredBy: o.CoveredBy, Member: o.Member}
 }
 
 // Identity returns the advisory identity of an occurrence.
@@ -85,37 +112,45 @@ func (o Occurrence) Identity() Identity {
 	return Identity{Name: o.Name, Version: o.Version}
 }
 
-// Public reports whether public advisory evidence speaks for this occurrence:
-// registry artifacts, and bundled entries, which are public packages carried
-// inside a registry parent. A link, git, file or remote entry is not a public
-// identity, and neither is a private-origin artifact's namesake here: the
-// private-origin rules are the gate's, and this package never feeds a private
-// artifact to a public reading.
-func (o Occurrence) Public() bool {
-	if o.Kind == KindLink {
-		return false
-	}
-	return o.Kind == KindRegistry || (o.Bundled && o.Kind == KindUnknown)
-}
-
 // Graph is the artifact graph of one lockfile: its occurrences sorted by path.
 type Graph struct {
 	Occurrences []Occurrence `json:"occurrences"`
 }
 
+// Hosts are the two sets of registry hosts the core is given, kept apart
+// because they answer different questions. Registry is where an artifact may
+// be bound to (the hosts safe expects to fetch tarballs from, adding to npm's
+// public registry); PublicEvidence is whose artifacts public advisory evidence
+// may speak for (adding to npm's public registry). A trusted private mirror is
+// the first without being the second. Which hosts are private is the gate's
+// lookup, not this package's.
+type Hosts struct {
+	Registry       []string
+	PublicEvidence []string
+}
+
 // LoadGraph reads an npm lockfile (version 2 or 3) into its artifact graph.
-// registryHosts adds hosts to npm's default registry for the descriptor
-// classification, exactly as the other safe-core readers do.
-func LoadGraph(lockfile string, registryHosts []string) (Graph, error) {
-	records, err := lockdiff.LoadRecords(lockfile, registryHosts)
+func LoadGraph(lockfile string, hosts Hosts) (Graph, error) {
+	records, err := lockdiff.LoadRecords(lockfile, hosts.Registry)
 	if err != nil {
 		return Graph{}, err
 	}
-	return graphFromRecords(records), nil
+	locals, err := lockdiff.LoadLocalPackages(lockfile)
+	if err != nil {
+		return Graph{}, err
+	}
+	return graphFromRecords(records, locals, hosts), nil
 }
 
-func graphFromRecords(records []lockdiff.Record) Graph {
-	graph := Graph{Occurrences: make([]Occurrence, 0, len(records))}
+func graphFromRecords(records []lockdiff.Record, locals []lockdiff.LocalPackage, hosts Hosts) Graph {
+	eligible := map[string]struct{}{DefaultRegistryHost: {}}
+	for _, host := range hosts.PublicEvidence {
+		if host = strings.ToLower(strings.TrimSpace(host)); host != "" {
+			eligible[host] = struct{}{}
+		}
+	}
+
+	graph := Graph{Occurrences: make([]Occurrence, 0, len(records)+len(locals))}
 	for _, record := range records {
 		if record.Link {
 			graph.Occurrences = append(graph.Occurrences, Occurrence{
@@ -126,24 +161,91 @@ func graphFromRecords(records []lockdiff.Record) Graph {
 			})
 			continue
 		}
+		origin := stripCredentials(record.Resolved)
 		graph.Occurrences = append(graph.Occurrences, Occurrence{
 			Path:       record.Path,
 			Name:       record.Name,
 			Alias:      record.Alias,
 			Version:    record.Version,
-			Origin:     stripCredentials(record.Resolved),
+			Origin:     origin,
 			Integrity:  record.Integrity,
 			Kind:       record.Source,
 			Optional:   record.Optional,
 			Dev:        record.Dev,
 			Bundled:    record.InBundle,
 			Shrinkwrap: record.HasShrinkwrap,
+			Host:       hostOf(origin),
+			descriptor: record.Resolved,
+		})
+	}
+	for _, local := range locals {
+		graph.Occurrences = append(graph.Occurrences, Occurrence{
+			Path: local.Path, Name: local.Name, Version: local.Version, Origin: local.Path, Kind: KindLocal,
 		})
 	}
 	sort.Slice(graph.Occurrences, func(i, j int) bool {
 		return graph.Occurrences[i].Path < graph.Occurrences[j].Path
 	})
+
+	byPath := make(map[string]int, len(graph.Occurrences))
+	for i, occurrence := range graph.Occurrences {
+		byPath[occurrence.Path] = i
+	}
+	for i := range graph.Occurrences {
+		occurrence := &graph.Occurrences[i]
+		if occurrence.Bundled && occurrence.Kind != KindLink {
+			root, ok := coveringRoot(graph.Occurrences, byPath, occurrence.Path)
+			if ok {
+				occurrence.CoveredBy = keyText(graph.Occurrences[root].Key())
+				occurrence.Member = strings.TrimPrefix(occurrence.Path, graph.Occurrences[root].Path+"/")
+				occurrence.Host = graph.Occurrences[root].Host
+				_, occurrence.Public = eligible[graph.Occurrences[root].Host]
+			} else {
+				// A bundled entry whose covering artifact is not in the lockfile
+				// is unbound anyway; it stays in the evidence request.
+				occurrence.Public = true
+			}
+			continue
+		}
+		if occurrence.Kind == KindRegistry {
+			_, occurrence.Public = eligible[occurrence.Host]
+		}
+	}
 	return graph
+}
+
+// coveringRoot walks up the bundled chain of a path to the first entry that is
+// not itself bundled: the artifact whose tarball carries the whole chain.
+func coveringRoot(occurrences []Occurrence, byPath map[string]int, path string) (int, bool) {
+	for depth := 0; depth < 64; depth++ {
+		parent, ok := byPath[bundledParentPath(path)]
+		if !ok {
+			return 0, false
+		}
+		if !occurrences[parent].Bundled {
+			return parent, true
+		}
+		path = occurrences[parent].Path
+	}
+	return 0, false
+}
+
+func keyText(key ArtifactKey) string {
+	return key.Name + "@" + key.Version + "\x00" + key.Origin + "\x00" + key.Integrity
+}
+
+func hostOf(origin string) string {
+	if strings.HasPrefix(strings.ToLower(origin), DefaultRegistryHost+"/") {
+		return DefaultRegistryHost
+	}
+	if !strings.Contains(origin, "://") {
+		return ""
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(parsed.Host)
 }
 
 func packageNameOfPath(path string) string {
@@ -173,7 +275,7 @@ func stripCredentials(resolved string) string {
 func (g Graph) Identities() []Identity {
 	seen := map[Identity]struct{}{}
 	for _, occurrence := range g.Occurrences {
-		if occurrence.Public() {
+		if occurrence.Public {
 			seen[occurrence.Identity()] = struct{}{}
 		}
 	}

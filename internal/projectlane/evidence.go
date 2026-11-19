@@ -187,14 +187,26 @@ func requireShape(raw []byte) error {
 	return nil
 }
 
+// requireKeys demands exactly the schema's members at one object level: every
+// listed key present and non-null, and no other key at all. The comparison is
+// byte for byte. A reader that skipped a stray key would leave a second
+// spelling of a schema field (a case or Unicode fold of it, which the struct
+// decoder below would bind to the same field) free to replace the real one.
 func requireKeys(object map[string]any, prefix string, keys ...string) error {
+	allowed := make(map[string]struct{}, len(keys))
 	for _, key := range keys {
+		allowed[key] = struct{}{}
 		value, present := object[key]
 		if !present {
 			return fmt.Errorf("field %s%s is missing", prefix, key)
 		}
 		if value == nil {
 			return fmt.Errorf("field %s%s is null", prefix, key)
+		}
+	}
+	for key := range object {
+		if _, ok := allowed[key]; !ok {
+			return fmt.Errorf("field %s%q is not part of the schema", prefix, key)
 		}
 	}
 	return nil

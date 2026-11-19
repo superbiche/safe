@@ -21,21 +21,31 @@ func TestLoadGraphRecordsEveryField(t *testing.T) {
 
 	got := map[string]Occurrence{}
 	for _, occurrence := range graph.Occurrences {
+		occurrence.descriptor = "" // what binding reads, not what is reported
 		got[occurrence.Path] = occurrence
 	}
+	canonical := func(name, version string) Occurrence {
+		return Occurrence{Name: name, Version: version, Origin: tarball(name, version), Integrity: integrityOf(name + "@" + version),
+			Kind: KindRegistry, Host: DefaultRegistryHost, Public: true}
+	}
+	with := func(base Occurrence, path string, edit func(*Occurrence)) Occurrence {
+		base.Path = path
+		if edit != nil {
+			edit(&base)
+		}
+		return base
+	}
+	shrink := canonical("shrink", "1.0.0")
 	want := map[string]Occurrence{
-		"node_modules/plain": {Path: "node_modules/plain", Name: "plain", Version: "1.0.0",
-			Origin: tarball("plain", "1.0.0"), Integrity: integrityOf("plain@1.0.0"), Kind: KindRegistry},
-		"node_modules/alias": {Path: "node_modules/alias", Name: "real-name", Alias: "alias", Version: "2.0.0",
-			Origin: tarball("real-name", "2.0.0"), Integrity: integrityOf("real-name@2.0.0"), Kind: KindRegistry},
-		"node_modules/dev": {Path: "node_modules/dev", Name: "dev", Version: "1.0.0",
-			Origin: tarball("dev", "1.0.0"), Integrity: integrityOf("dev@1.0.0"), Kind: KindRegistry, Dev: true, Optional: true},
-		"node_modules/cred": {Path: "node_modules/cred", Name: "cred", Version: "1.0.0",
-			Origin: tarball("cred", "1.0.0"), Integrity: integrityOf("cred@1.0.0"), Kind: KindRegistry},
-		"node_modules/shrink": {Path: "node_modules/shrink", Name: "shrink", Version: "1.0.0",
-			Origin: tarball("shrink", "1.0.0"), Integrity: integrityOf("shrink@1.0.0"), Kind: KindRegistry, Shrinkwrap: true},
-		"node_modules/shrink/node_modules/inner": {Path: "node_modules/shrink/node_modules/inner", Name: "inner",
-			Version: "3.0.0", Kind: KindUnknown, Bundled: true},
+		"node_modules/plain": with(canonical("plain", "1.0.0"), "node_modules/plain", nil),
+		"node_modules/alias": with(canonical("real-name", "2.0.0"), "node_modules/alias", func(o *Occurrence) { o.Alias = "alias" }),
+		"node_modules/dev":   with(canonical("dev", "1.0.0"), "node_modules/dev", func(o *Occurrence) { o.Dev, o.Optional = true, true }),
+		// Credentials are redacted for the report; binding reads the original.
+		"node_modules/cred":   with(canonical("cred", "1.0.0"), "node_modules/cred", nil),
+		"node_modules/shrink": with(shrink, "node_modules/shrink", func(o *Occurrence) { o.Shrinkwrap = true }),
+		"node_modules/shrink/node_modules/inner": {Path: "node_modules/shrink/node_modules/inner", Name: "inner", Version: "3.0.0",
+			Kind: KindUnknown, Bundled: true, Host: DefaultRegistryHost, Public: true,
+			CoveredBy: keyText(shrink.Key()), Member: "node_modules/inner"},
 		"node_modules/linked": {Path: "node_modules/linked", Name: "linked", Origin: "packages/local", Kind: KindLink},
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -59,12 +69,12 @@ func TestLoadGraphRefusesWhatLockdiffRefuses(t *testing.T) {
 			if err := writeFile(file, content); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := LoadGraph(file, nil); err == nil {
+			if _, err := LoadGraph(file, Hosts{}); err == nil {
 				t.Fatal("LoadGraph() error = nil, want an error")
 			}
 		})
 	}
-	if _, err := LoadGraph(t.TempDir()+"/absent.json", nil); err == nil {
+	if _, err := LoadGraph(t.TempDir()+"/absent.json", Hosts{}); err == nil {
 		t.Fatal("LoadGraph() on an absent file: error = nil, want an error")
 	}
 }
