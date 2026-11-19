@@ -9,7 +9,7 @@
 # again, and that safe's strict verifier accepts the tree npm really produces
 # (staged in a directory of the project, published once verified).
 #
-# Two scenarios, both through the checkout's gate:
+# Three scenarios, all through the checkout's gate:
 #
 #   A. the fleet chain. `npm` on PATH is a gate wrapper and the next candidate a
 #      version manager's shim; the lane asks the real manager (`mise which`),
@@ -196,6 +196,55 @@ if (( status == 0 )) && cmp -s "${WORK}/a/package-lock.json" "${judged}"; then
   pass "A (fleet chain): the lane installs express@5.1.0 and publishes the independently captured projection byte for byte"
 else
   fail "A (fleet chain): exit ${status}; lockfile $(cmp -s "${WORK}/a/package-lock.json" "${judged}" && echo equal || echo differs)"
+fi
+
+# --- scenario C: two commands in a row before a commit, on the real npm --------------
+# The second starts from the first's stored result (its lockfile is neither committed
+# nor edited by hand), then a lockfile-only command publishes the files, installs no
+# tree and advances the baseline again.
+new_project "${WORK}/c" || { fail "scenario C project"; exit 1; }
+gate_c() { ( cd "${WORK}/c" && npm_config_before="${T1}" SAFE_AUDIT_PATH="${WORK}/safe/bin/safe-audit" "${WORK}/safe/bin/safe" gate npm "$@" >"${WORK}/c.out" 2>"${WORK}/c.err" ); }
+gate_c install express@5.1.0 --ignore-scripts
+status=$?
+if (( status == 0 )) && grep -q 'baseline: the lockfile committed' "${WORK}/c.err" && [[ -d "${WORK}/c/node_modules/express" ]] \
+    && [[ -n "$(git -C "${WORK}/c" status --porcelain -- package-lock.json)" ]]; then
+  pass "C1: the first command installs express and leaves its lockfile uncommitted"
+else
+  fail "C1: exit ${status}; $(tail -n 3 "${WORK}/c.err")"
+fi
+lock_after_first="$(sha256sum < "${WORK}/c/package-lock.json")"
+gate_c install ms@2.1.3 --ignore-scripts
+status=$?
+if (( status == 0 )) && grep -q 'baseline: the lockfile safe stored after its own last command' "${WORK}/c.err" \
+    && ! grep -q 'the lockfile on disk is not the baseline' "${WORK}/c.err" \
+    && [[ -d "${WORK}/c/node_modules/ms" && -d "${WORK}/c/node_modules/express" ]] \
+    && [[ "$(sha256sum < "${WORK}/c/package-lock.json")" != "${lock_after_first}" ]]; then
+  pass "C2: the second command starts from the first's stored result and installs both"
+else
+  fail "C2: exit ${status}; $(tail -n 4 "${WORK}/c.err")"
+fi
+if "${WORK}/safe/bin/safe-core" project-tree "${selection[@]}" "${WORK}/c/package-lock.json" "${WORK}/c" 2>/dev/null | jq -e '.ok == true and .checked > 10' >/dev/null 2>&1; then
+  pass "C3: the tree on disk is the lockfile the second command published (strict verifier)"
+else
+  fail "C3: the tree is not the published lockfile"
+fi
+lock_before_only="$(sha256sum < "${WORK}/c/package-lock.json")"
+gate_c install ms@2.1.2 --ignore-scripts --package-lock-only
+status=$?
+if (( status == 0 )) && grep -q 'package-lock-only: the judged package.json and package-lock.json were published' "${WORK}/c.err" \
+    && [[ "$(sha256sum < "${WORK}/c/package-lock.json")" != "${lock_before_only}" ]] \
+    && jq -e '.packages["node_modules/ms"].version == "2.1.2"' "${WORK}/c/package-lock.json" >/dev/null 2>&1 \
+    && [[ "$(jq -r .version "${WORK}/c/node_modules/ms/package.json")" == "2.1.3" ]]; then
+  pass "C4: --package-lock-only publishes the judged files and leaves the installed tree alone"
+else
+  fail "C4: exit ${status}; $(tail -n 4 "${WORK}/c.err")"
+fi
+gate_c install ms@2.1.2 --ignore-scripts
+status=$?
+if (( status == 0 )) && grep -q 'baseline: the lockfile safe stored' "${WORK}/c.err" && [[ "$(jq -r .version "${WORK}/c/node_modules/ms/package.json")" == "2.1.2" ]]; then
+  pass "C5: the next command starts from the lockfile-only result"
+else
+  fail "C5: exit ${status}; $(tail -n 4 "${WORK}/c.err")"
 fi
 
 # --- scenario B: a delegate that answers differently per phase -----------------

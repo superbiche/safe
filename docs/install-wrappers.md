@@ -345,7 +345,7 @@ and the gate audit log gains one `LOCAL_ARTIFACT` line per archive naming
 its resolved path and sha256, so the log proves what was installed.
 
 With `install.project_lane` on ([configuration](configuration.md)), npm
-`install` and `update` of a project whose lockfile is the committed one take
+`install` and `update` (with `--dry-run` and `--package-lock-only`) take
 the project lane instead: judged on what they introduce, installed by
 `safe-core project-bind` from the judged lockfile; every other gated npm verb
 refuses there with `[lane: project]` rather than falling back (a global command,

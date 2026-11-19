@@ -147,6 +147,13 @@ type BindRequest struct {
 	Argv      []string
 	Env       []string
 	Selection Selection
+	// FilesOnly publishes the judged files and nothing else: no install command,
+	// no staged tree, no tree exchange (npm install --package-lock-only). Every
+	// other check is the same: the lock, the live inputs against their judged
+	// digests, the atomic exchange of each file with the displaced object
+	// inspected, the last check of everything. Argv and Env must then be empty
+	// and the tree root is not looked at: it is neither read nor touched.
+	FilesOnly bool
 	Lock      LockMode
 	// ChildOutput receives the child's stdout and stderr.
 	ChildOutput io.Writer
@@ -300,6 +307,7 @@ type transaction struct {
 	noTree       bool       // nothing to publish: no old tree and the install selected none
 	treeSwapped  bool       // the tree exchange or move succeeded (recorded the moment it did)
 
+	filesOnly   bool // publish the files alone
 	releaseLock func()
 	crashed     bool
 	keep        bool // keep staging (it holds something the undo could not put back)
@@ -355,7 +363,7 @@ func signalOf(ctx context.Context) string {
 // Bind runs the transaction. ctx is cancelled by the caller on a signal; the
 // cause names it. The returned report is complete whatever happened.
 func Bind(ctx context.Context, req BindRequest) BindReport {
-	t := &transaction{req: req, ctx: ctx, report: newReport(req.Selection), judged: map[string]File{}}
+	t := &transaction{req: req, ctx: ctx, report: newReport(req.Selection), judged: map[string]File{}, filesOnly: req.FilesOnly}
 	t.report.Project = req.Project
 	report := t.run()
 	if !t.crashed {
@@ -446,6 +454,10 @@ func (t *transaction) run() BindReport {
 	if t.ctx.Err() != nil {
 		return t.interrupted()
 	}
+	if t.filesOnly {
+		// No install command, no tree: publication of the judged files alone.
+		return t.publish()
+	}
 	if report, ok := t.install(); !ok {
 		return report
 	}
@@ -472,14 +484,20 @@ func (t *transaction) run() BindReport {
 // admit checks the request in itself, before the filesystem is consulted.
 func (t *transaction) admit() (BindReport, bool) {
 	req := t.req
-	if err := req.Selection.Validate(); err != nil {
-		return t.refuse(ReasonRequestInvalid, "selection: %v", err), false
-	}
-	if len(req.Argv) == 0 || !filepath.IsAbs(req.Argv[0]) {
-		return t.refuse(ReasonRequestInvalid, "the install command must be an absolute path"), false
-	}
-	if req.Env == nil {
-		return t.refuse(ReasonRequestInvalid, "the install environment must be given"), false
+	if req.FilesOnly {
+		if len(req.Argv) != 0 || len(req.Env) != 0 {
+			return t.refuse(ReasonRequestInvalid, "a files-only publication runs no install command and takes no environment"), false
+		}
+	} else {
+		if err := req.Selection.Validate(); err != nil {
+			return t.refuse(ReasonRequestInvalid, "selection: %v", err), false
+		}
+		if len(req.Argv) == 0 || !filepath.IsAbs(req.Argv[0]) {
+			return t.refuse(ReasonRequestInvalid, "the install command must be an absolute path"), false
+		}
+		if req.Env == nil {
+			return t.refuse(ReasonRequestInvalid, "the install environment must be given"), false
+		}
 	}
 	if !filepath.IsAbs(req.StateDir) {
 		return t.refuse(ReasonStateDirInvalid, "the state directory must be an absolute path"), false
@@ -947,7 +965,9 @@ func ownedByUs(info os.FileInfo) bool {
 
 // checkProject checks the tree root and the live inputs before anything runs.
 func (t *transaction) checkProject() (BindReport, bool) {
-	if reason, detail := t.checkTreeRoot(); reason != "" {
+	if t.filesOnly {
+		t.report.Publication.Tree = StateOld
+	} else if reason, detail := t.checkTreeRoot(); reason != "" {
 		return t.refuse(reason, "%s", detail), false
 	}
 	changes, unsafe := t.liveChanges(nil)
@@ -1405,6 +1425,9 @@ func (t *transaction) verify() (BindReport, bool) {
 // still the very directory that was held and verified (or, when there is no
 // tree to publish, that none appeared).
 func (t *transaction) stagedTreeIsVerified() bool {
+	if t.filesOnly {
+		return true
+	}
 	info, err := t.staging.lstat("node_modules")
 	if t.noTree {
 		return errors.Is(err, os.ErrNotExist)
@@ -1486,7 +1509,7 @@ func (t *transaction) retain(name, why string) {
 }
 
 func (t *transaction) publish() BindReport {
-	if t.initial == "absent" {
+	if t.initial == "absent" && !t.filesOnly {
 		t.report.Publication.Tree = StateNone
 	}
 	// Prepare every replacement file in staging. Interruptible: nothing in the
@@ -1528,7 +1551,9 @@ func (t *transaction) publish() BindReport {
 	}
 
 	// The last pass over the live inputs, and the last look at the tree root.
-	if reason, detail := t.checkTreeRoot(); reason != "" {
+	if t.filesOnly {
+		// the tree root is not this command's: it is not looked at
+	} else if reason, detail := t.checkTreeRoot(); reason != "" {
 		return t.end(OutcomeInputsChanged, ReasonInputsChanged, "before publication: "+detail)
 	}
 	changes, unsafe := t.liveChanges(nil)
@@ -1612,7 +1637,7 @@ func (t *transaction) publish() BindReport {
 		}
 		return failure(OutcomePublicationFailed, ReasonPublication, err)
 	}
-	if !t.noTree {
+	if !t.noTree && !t.filesOnly {
 		t.report.Publication.Tree = StateVerified
 	}
 	if err := hook("publish:tree"); err != nil {
@@ -1749,7 +1774,7 @@ func (t *transaction) displacedIs(name, digest string, perm os.FileMode) bool {
 // moved in without replacing when there was none. The step is recorded the
 // moment it succeeds.
 func (t *transaction) publishTree() error {
-	if t.noTree {
+	if t.noTree || t.filesOnly {
 		return nil // no old tree and none selected: nothing to put in place
 	}
 	if t.initial == "absent" {
@@ -1813,6 +1838,8 @@ func (t *transaction) finalCheck(plan []*plannedFile) []InputChange {
 	}
 	info, err := t.project.lstat("node_modules")
 	switch {
+	case t.filesOnly:
+		// the tree root is not this command's
 	case t.noTree:
 		if !errors.Is(err, os.ErrNotExist) {
 			changes = append(changes, InputChange{Path: "node_modules", Judged: "absent", Found: "present"})

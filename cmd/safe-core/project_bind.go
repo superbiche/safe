@@ -46,7 +46,8 @@ import (
 const (
 	projectBindUsage = "safe-core: usage: safe-core project-bind --project <dir> (--lock-fd <n> | --take-lock)\n" +
 		"    --publish <rel>=<judged-file>... --copy <rel>=<judged-file>... --live <rel>=(sha256:<hex>|absent)...\n" +
-		"    --env-file <file> --state-dir <dir> [--omit dev|optional|peer]... --os <os> --cpu <cpu> [--libc <libc>] -- <absolute-command> [<arg>...]"
+		"    --env-file <file> --state-dir <dir> [--omit dev|optional|peer]... --os <os> --cpu <cpu> [--libc <libc>] -- <absolute-command> [<arg>...]\n" +
+		"    safe-core project-bind --files-only --project <dir> (--lock-fd <n> | --take-lock) --publish <rel>=<judged-file>... --copy <rel>=<judged-file>... --live <rel>=(sha256:<hex>|absent)... --state-dir <dir>"
 )
 
 type bindArgs struct {
@@ -59,8 +60,10 @@ type bindArgs struct {
 	lockFD   int
 	take     bool
 	hasFD    bool
-	argv     []string
-	selected projectlaneSelection
+	// filesOnly publishes the judged files and installs nothing (--package-lock-only).
+	filesOnly bool
+	argv      []string
+	selected  projectlaneSelection
 }
 
 func parseBindArgs(args []string) (bindArgs, bool) {
@@ -80,6 +83,8 @@ func parseBindArgs(args []string) (bindArgs, bool) {
 		switch args[i] {
 		case "--take-lock":
 			parsed.take = true
+		case "--files-only":
+			parsed.filesOnly = true
 		case "--project", "--publish", "--copy", "--live", "--env-file", "--lock-fd", "--state-dir":
 			if i+1 >= len(args) || args[i+1] == "" {
 				return bindArgs{}, false
@@ -119,9 +124,15 @@ func parseBindArgs(args []string) (bindArgs, bool) {
 			return bindArgs{}, false
 		}
 	}
-	if parsed.project == "" || parsed.envFile == "" || parsed.stateDir == "" || len(parsed.argv) == 0 ||
-		parsed.hasFD == parsed.take || len(parsed.publish) == 0 || len(parsed.live) == 0 ||
-		parsed.selected.os == "" || parsed.selected.cpu == "" {
+	if parsed.project == "" || parsed.stateDir == "" || parsed.hasFD == parsed.take || len(parsed.publish) == 0 || len(parsed.live) == 0 {
+		return bindArgs{}, false
+	}
+	if parsed.filesOnly {
+		// no install command, environment or selection: nothing runs
+		if parsed.envFile != "" || len(parsed.argv) != 0 || parsed.selected.os != "" || parsed.selected.cpu != "" || parsed.selected.lib != "" || len(parsed.selected.omit) != 0 {
+			return bindArgs{}, false
+		}
+	} else if parsed.envFile == "" || len(parsed.argv) == 0 || parsed.selected.os == "" || parsed.selected.cpu == "" {
 		return bindArgs{}, false
 	}
 	return parsed, true
@@ -174,7 +185,7 @@ func projectBind(args []string, stdout, stderr io.Writer) int {
 	}
 	request := projectlane.BindRequest{
 		Project: parsed.project, StateDir: parsed.stateDir, Argv: parsed.argv, Selection: parsed.selected.selection(),
-		Live: map[string]string{}, ChildOutput: stderr,
+		Live: map[string]string{}, ChildOutput: stderr, FilesOnly: parsed.filesOnly,
 		Lock: projectlane.LockMode{FD: parsed.lockFD, Take: parsed.take},
 	}
 	unusable := func(format string, a ...any) int {
@@ -210,12 +221,14 @@ func projectBind(args []string, stdout, stderr io.Writer) int {
 		}
 		request.Live[rel] = digest
 	}
-	rawEnv, err := os.ReadFile(parsed.envFile)
-	if err != nil {
-		return unusable("environment file: %v", err)
-	}
-	if request.Env, err = parseEnvFile(rawEnv); err != nil {
-		return unusable("environment file: %v", err)
+	if !parsed.filesOnly {
+		rawEnv, err := os.ReadFile(parsed.envFile)
+		if err != nil {
+			return unusable("environment file: %v", err)
+		}
+		if request.Env, err = parseEnvFile(rawEnv); err != nil {
+			return unusable("environment file: %v", err)
+		}
 	}
 
 	// Signals: before publication one ends the run and leaves the project as

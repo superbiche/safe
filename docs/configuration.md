@@ -221,9 +221,8 @@ pass and warnings under `environment.release_follow`.
   run-config directory does not turn it on unless trusted with
   `SAFE_RUN_TRUST_OVERRIDE`). With it off the gate behaves exactly as before. With it on, `npm
   install` (bare or with exact `name@version` registry specs) and `npm update` in
-  a project whose `package-lock.json` (version 2 or 3) is the one committed at the
-  head of its git work tree, and identical on disk, are judged on what they
-  introduce (that lockfile is the baseline) and installed exactly as judged: the
+  a project are judged on what they introduce over an established baseline (see
+  below) and installed exactly as judged: the
   lane takes an exclusive lock on the project directory, works on one snapshot of
   the manifest, lockfile and `.npmrc`, projects the command in a scratch copy
   with one npm (the one the gate's delegate would run, reached without passing
@@ -235,14 +234,48 @@ pass and warnings under `environment.release_follow`.
   advisory, 102 missing evidence or a graph safe cannot bind), for the operator
   too: this first pass has no prompt, no install record and no scripts. Any
   command or project it does not cover yet (another verb, a lockfile that is not
-  the committed one, a registry that is not the canonical public one, workspaces,
+  version 2 or 3, a registry that is not the canonical public one, workspaces,
   links, git or tarball sources, a symbolic-linked `node_modules`, an audit-only
   pass of `mise exec`, an option it cannot carry to the frozen install) refuses
   with `safe: BLOCKED npm <verb> [lane: project] — … not supported by the project
   lane yet` and does not fall back to the older gate; a command npm's effective
   configuration says is global is not the lane's. `--dry-run` runs the decision
-  and the report and writes nothing. Each decision report is kept under
+  and the report and writes nothing. `--package-lock-only` judges as usual, then
+  publishes the judged `package.json` and `package-lock.json` (the binder's
+  files-only mode: the same checks on the live inputs, the same atomic exchange of
+  each file, no staged tree, no tree exchange, no install command) and installs
+  nothing. Each decision report is kept under
   `project-lane/reports` in safe's data directory. Spec: Safe Lanes slice 1.
+  **The baseline** is what the differential is taken against, and what decides which
+  advisories are "already present" and never gate. An *established* baseline is the
+  lockfile committed at the head of the project's git work tree (read with
+  replacement objects disabled), or the one safe stored after its own last command in
+  this project that was judged on complete evidence. When the lockfile on disk is
+  byte-identical to the committed one, or to the stored one, it is the baseline.
+  Otherwise the baseline is the committed lockfile, else the stored one, else empty,
+  and the lockfile on disk is part of what the command introduces: its entries are in
+  the target the decision runs on, judged against that baseline, and the report says
+  how many of them were judged as introduced (`safe: project lane: baseline: …` names
+  which baseline was used: committed, stored or empty). With no lockfile on disk and
+  none established the baseline is empty and the whole resolved graph is introduced. A
+  baseline that exists but cannot be read or decoded (a committed blob that does not
+  parse, a stored record that does not match its digest) is missing evidence (exit
+  102), never an empty baseline. A project outside a git work tree has only the stored
+  baseline, or none. **The stored baseline** is a record under `project-lane/state/
+  project-baseline/<sha256 of the canonical project path>/package-lock.json.json` in
+  safe's data directory, outside the project: the lockfile itself (base64) with its
+  digest, the canonical project path and the identity of the project directory (a
+  fresh clone at the same path is another project and has none). Every directory of
+  the chain belongs to the user, is not writable by group or others and is never a
+  link; the record is a regular `0600` file of exactly the shape safe wrote, and one
+  whose digest does not match is unreadable, not trusted. It is replaced atomically
+  and only after a decision made on complete evidence and, when the command
+  materialises, after the binder reported a committed publication (a lockfile-only
+  command advances it too). A refusal, a failed or unverified materialisation, a
+  dry run and any outcome with missing evidence leave it as it was. It is read only
+  when it can matter (the lockfile on disk is not the committed one). A record that
+  cannot be trusted stops the command with the way out: commit the lockfile, or
+  remove that project's record.
   **The project's own `.npmrc`** is read by safe, as text, before any npm runs in
   the project's context (a special file or a link there refuses first). It is
   admitted against a short allow-list, and anything else refuses naming the

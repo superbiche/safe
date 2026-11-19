@@ -3247,7 +3247,7 @@ safe_gate_project_lane_report_ok() {
     and (($r.outcome.status == "clear") == ($rc == 0))
     and (if $rc == 0 then
            $r.outcome.status == "clear" and $r.bindability.bound
-           and ($r.baseline.source == "graph")
+           and ($r.baseline.source == "graph" or $r.baseline.source == "empty")
            and ([$r.classes[] | .class] | sort) == ["adverse_advisory", "blocking_advisory", "malice", "missing_evidence"]
            and ([$r.classes[] | .outstanding] | add) == 0
            and ($r.malice | length) == 0 and ($r.coverage | length) == 0
@@ -3492,7 +3492,7 @@ safe_gate_lane_one_doc() {
 
 safe_gate_project_lane_run() {
   local subcommand="${SAFE_GATE_SUBCMD}" verb="" lane_sub="" arg="" value="" first=1 dry_run=0
-  local project_dir="" scratch="" snap="" proj="" frozen="" rc=0 safe_core="" safe_core_version=""
+  local project_dir="" scratch="" snap="" proj="" frozen="" rc=0 safe_core="" safe_core_version="" lock_only=0
   local state_dir="" config_json="" frozen_json="" differing="" data_root="${SAFE_DATA_DIR:-${HOME}/.local/share/safe}"
   local -a specs=() carry=() proj_args=() probe_args=() frozen_args=()
 
@@ -3676,8 +3676,9 @@ safe_gate_project_lane_run() {
         safe_gate_project_lane_unsupported "${verb}" "a workspace selection"
         return $?
         ;;
-      --package-lock-only|--package-lock-only=*)
-        safe_gate_project_lane_unsupported "${verb}" "--package-lock-only"
+      --package-lock-only|--package-lock-only=true) lock_only=1 ;;
+      --package-lock-only=*)
+        safe_gate_project_lane_unsupported "${verb}" "${arg%%=*} with a value other than true"
         return $?
         ;;
       -*)
@@ -3703,14 +3704,18 @@ safe_gate_project_lane_run() {
 
   # --- 3. one snapshot --------------------------------------------------------
   # Regular-file checks come before the first read or npm run of the project: a
-  # FIFO or a link as a configuration file must not hold the command.
+  # FIFO or a link as a configuration file must not hold the command. The lockfile
+  # may be absent (then nothing on disk is established and the whole resolved graph
+  # is introduced); a link or a special file in its place is refused.
   local name
-  for name in package.json package-lock.json; do
-    if [[ -L "${project_dir}/${name}" || ! -f "${project_dir}/${name}" ]]; then
-      safe_gate_project_lane_unsupported "${verb}" "a project without a regular ${name} (missing, a link or a special file)"
-      return $?
-    fi
-  done
+  if [[ -L "${project_dir}/package.json" || ! -f "${project_dir}/package.json" ]]; then
+    safe_gate_project_lane_unsupported "${verb}" "a project without a regular package.json (missing, a link or a special file)"
+    return $?
+  fi
+  if [[ -L "${project_dir}/package-lock.json" || ( -e "${project_dir}/package-lock.json" && ! -f "${project_dir}/package-lock.json" ) ]]; then
+    safe_gate_project_lane_unsupported "${verb}" "a package-lock.json that is a link or a special file"
+    return $?
+  fi
   if [[ -e "${project_dir}/npm-shrinkwrap.json" || -L "${project_dir}/npm-shrinkwrap.json" ]]; then
     safe_gate_project_lane_unsupported "${verb}" "a project with an npm-shrinkwrap.json"
     return $?
@@ -3726,33 +3731,16 @@ safe_gate_project_lane_run() {
       return $?
     fi
   done
-  local manifest_sum lock_sum npmrc_sum="absent"
+  local manifest_sum lock_sum="absent" npmrc_sum="absent" disk_lock=0
   manifest_sum="sha256:$(safe_gate_sha256_file "${snap}/package.json")"
-  lock_sum="sha256:$(safe_gate_sha256_file "${snap}/package-lock.json")"
+  if [[ -f "${snap}/package-lock.json" ]]; then
+    disk_lock=1
+    lock_sum="sha256:$(safe_gate_sha256_file "${snap}/package-lock.json")"
+  fi
   [[ -f "${snap}/.npmrc" ]] && npmrc_sum="sha256:$(safe_gate_sha256_file "${snap}/.npmrc")"
-  # A committed lockfile that cannot be parsed is missing evidence, whichever
-  # step meets it first.
-  if ! jq -e . "${snap}/package-lock.json" >/dev/null 2>&1; then
-    safe_gate_project_lane_refuse 102 "${verb}" "the committed lockfile cannot be parsed, so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the lockfile and retry"
-    return $?
-  fi
-  # The baseline is the committed lockfile: the SNAPSHOT's bytes against the
-  # HEAD blob, read with replacement objects disabled.
-  if ! safe_gate_project_lane_git "${project_dir}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    safe_gate_project_lane_unsupported "${verb}" "a project outside a git work tree"
-    return $?
-  fi
-  if ! safe_gate_project_lane_git "${project_dir}" cat-file blob "HEAD:./package-lock.json" 2>/dev/null \
-      | cmp -s -- - "${snap}/package-lock.json"; then
-    safe_gate_project_lane_unsupported "${verb}" "a lockfile that is not the one committed at the head of the git work tree (package-lock.json is untracked, uncommitted or edited)"
-    return $?
-  fi
-  if ! jq -e '(.lockfileVersion == 2 or .lockfileVersion == 3) and (.packages | type == "object")' "${snap}/package-lock.json" >/dev/null 2>&1; then
-    safe_gate_project_lane_unsupported "${verb}" "a lockfile that is not version 2 or 3"
-    return $?
-  fi
-  # The tree root is absent or a real directory, before npm can touch it.
-  if [[ -L "${project_dir}/node_modules" ]] || { [[ -e "${project_dir}/node_modules" ]] && [[ ! -d "${project_dir}/node_modules" ]]; }; then
+  # The tree root is absent or a real directory, before npm can touch it (a
+  # lockfile-only command does not look at it).
+  if (( ! lock_only )) && { [[ -L "${project_dir}/node_modules" ]] || { [[ -e "${project_dir}/node_modules" ]] && [[ ! -d "${project_dir}/node_modules" ]]; }; }; then
     safe_gate_project_lane_unsupported "${verb}" "a node_modules that is a symbolic link or not a directory"
     return $?
   fi
@@ -3771,11 +3759,84 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_refuse 102 "${verb}" "the advisory reader is unavailable (audit-infrastructure breakage, not a package finding)" "rerun install.sh"
     return $?
   fi
+  state_dir="${lane_dir}/state"
+
+  # --- the baseline -------------------------------------------------------------
+  # Established: the lockfile committed at the head of the git work tree (read with
+  # replacement objects disabled), or the one safe stored after its own last command
+  # judged on complete evidence. The lockfile on disk is the baseline when it is one
+  # of those; otherwise the baseline is the committed one, else the stored one, else
+  # empty, and what the disk lockfile adds is part of what the command introduces
+  # (its entries are in the target the decision runs on, against that baseline).
+  # A baseline that exists and cannot be read or decoded is missing evidence (102),
+  # never an empty baseline.
+  local baseline_kind="empty" baseline_file="" disk_is_baseline=0 have_committed=0 have_stored=0
+  local committed_file="${scratch}/baseline-committed.json" stored_file="${scratch}/baseline-stored.json"
+  local -a baseline_args=(--no-baseline)
+  if safe_gate_project_lane_git "${project_dir}" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+      && safe_gate_project_lane_git "${project_dir}" cat-file -e "HEAD:./package-lock.json" 2>/dev/null; then
+    if [[ "$(safe_gate_project_lane_git "${project_dir}" cat-file -t "HEAD:./package-lock.json" 2>/dev/null)" != "blob" ]] \
+        || ! safe_gate_project_lane_git "${project_dir}" cat-file blob "HEAD:./package-lock.json" >"${committed_file}" 2>/dev/null; then
+      safe_gate_project_lane_refuse 102 "${verb}" "the committed lockfile cannot be read from the head of the git work tree, so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the repository and retry"
+      return $?
+    fi
+    have_committed=1
+  fi
+  if (( disk_lock && have_committed )) && cmp -s -- "${committed_file}" "${snap}/package-lock.json"; then
+    baseline_kind="committed"
+    baseline_file="${snap}/package-lock.json"
+    disk_is_baseline=1
+  else
+    # The stored one is consulted only when it can matter.
+    if (( disk_lock || ! have_committed )); then
+      rc=0
+      "${safe_core}" project-baseline read --state-dir "${state_dir}" --project "${project_dir}" --name package-lock.json --out "${stored_file}" \
+        >/dev/null 2>"${scratch}/baseline.err" || rc=$?
+      if (( rc == 0 )); then
+        have_stored=1
+      elif (( rc != 4 )); then
+        safe_gate_project_lane_refuse 102 "${verb}" "the baseline safe stored for this project cannot be trusted ($(safe_gate_lane_clean "$(head -n 1 "${scratch}/baseline.err" 2>/dev/null)")), so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "commit the lockfile, or remove this project's record under ${state_dir}/project-baseline, and retry"
+        return $?
+      fi
+    fi
+    if (( disk_lock && have_stored )) && cmp -s -- "${stored_file}" "${snap}/package-lock.json"; then
+      baseline_kind="stored"
+      baseline_file="${snap}/package-lock.json"
+      disk_is_baseline=1
+    elif (( have_committed )); then
+      baseline_kind="committed"
+      baseline_file="${committed_file}"
+    elif (( have_stored )); then
+      baseline_kind="stored"
+      baseline_file="${stored_file}"
+    fi
+  fi
+  [[ -z "${baseline_file}" ]] || baseline_args=(--baseline "${baseline_file}")
+  # What is read must decode, and be a version the lane binds, whichever it is.
+  local lock_label
+  for lock_label in "baseline|${baseline_file}" "disk|$( (( disk_lock && ! disk_is_baseline )) && printf '%s' "${snap}/package-lock.json")"; do
+    local lock_which="${lock_label%%|*}" lock_path="${lock_label#*|}" lock_text=""
+    [[ -n "${lock_path}" ]] || continue
+    if [[ "${lock_which}" == "baseline" ]]; then
+      lock_text="the ${baseline_kind} lockfile"
+    else
+      lock_text="the lockfile on disk"
+    fi
+    if ! jq -e . "${lock_path}" >/dev/null 2>&1; then
+      safe_gate_project_lane_refuse 102 "${verb}" "${lock_text} cannot be parsed, so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the lockfile and retry"
+      return $?
+    fi
+    if ! jq -e '(.lockfileVersion == 2 or .lockfileVersion == 3) and (.packages | type == "object")' "${lock_path}" >/dev/null 2>&1; then
+      safe_gate_project_lane_unsupported "${verb}" "${lock_text} is not a version 2 or 3 lockfile"
+      return $?
+    fi
+  done
 
   # --- admission, before npm resolves anything -------------------------------
   # Sources: the arguments, the manifest and its typed overrides, and every
   # dependency edge the committed lockfile carries, as npm classifies them.
-  local -a admit_args=(--manifest "${snap}/package.json" --lockfile "${snap}/package-lock.json")
+  local -a admit_args=(--manifest "${snap}/package.json")
+  (( ! disk_lock )) || admit_args+=(--lockfile "${snap}/package-lock.json")
   for arg in ${specs[@]+"${specs[@]}"}; do
     admit_args+=(--arg "${arg}")
   done
@@ -3806,23 +3867,29 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_refuse 100 "${verb}" "the selected npm's parser cannot be asked (audit-infrastructure breakage, not a package finding)" "rerun install.sh or run safe doctor, then retry"
     return $?
   fi
-  # Every entry of the snapshot's lockfile is bound, and none is a link. A
-  # committed graph that cannot be read is missing evidence, not a policy refusal.
-  local graph_json=""
-  rc=0
-  graph_json="$("${safe_core}" project-graph "${snap}/package-lock.json" 2>/dev/null)" || rc=$?
-  if (( rc != 0 )) || ! safe_gate_lane_one_doc '.schema_version == 1 and (.bindability.bound | type == "boolean") and (.bindability.unbound | type == "array") and ((.bindability.bound) == ((.bindability.unbound | length) == 0)) and (.graph.occurrences | type == "array")' "${graph_json}"; then
-    safe_gate_project_lane_refuse 102 "${verb}" "the committed lockfile cannot be read, so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the lockfile and retry"
-    return $?
-  fi
-  if jq -e '.bindability.bound == false' <<<"${graph_json}" >/dev/null 2>&1; then
-    safe_gate_project_lane_unsupported "${verb}" "a committed lockfile with an entry safe cannot bind ($(jq -r '.bindability.unbound[0] | "\(.name)@\(.version): \(.reason)"' <<<"${graph_json}" 2>/dev/null))"
-    return $?
-  fi
-  if jq -e '[.graph.occurrences[] | select(.kind == "link" or .kind == "local")] | length > 0' <<<"${graph_json}" >/dev/null 2>&1; then
-    safe_gate_project_lane_unsupported "${verb}" "a committed lockfile with in-project links"
-    return $?
-  fi
+  # Every entry of the baseline is bound, and none is a link: what is established
+  # is a shape the lane supports. A baseline graph that cannot be read is missing
+  # evidence, not a policy refusal. The lockfile on disk, when it is not the
+  # baseline, is only decoded here: its entries are judged with the target.
+  local graph_json="" graph_label
+  for graph_label in "baseline|${baseline_file}" "disk|$( (( disk_lock && ! disk_is_baseline )) && printf '%s' "${snap}/package-lock.json")"; do
+    [[ "${graph_label#*|}" != "" ]] || continue
+    rc=0
+    graph_json="$("${safe_core}" project-graph "${graph_label#*|}" 2>/dev/null)" || rc=$?
+    if (( rc != 0 )) || ! safe_gate_lane_one_doc '.schema_version == 1 and (.bindability.bound | type == "boolean") and (.bindability.unbound | type == "array") and ((.bindability.bound) == ((.bindability.unbound | length) == 0)) and (.graph.occurrences | type == "array")' "${graph_json}"; then
+      safe_gate_project_lane_refuse 102 "${verb}" "the $([[ "${graph_label%%|*}" == baseline ]] && printf '%s' "${baseline_kind} lockfile" || printf 'lockfile on disk') cannot be read, so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the lockfile and retry"
+      return $?
+    fi
+    [[ "${graph_label%%|*}" == baseline ]] || continue
+    if jq -e '.bindability.bound == false' <<<"${graph_json}" >/dev/null 2>&1; then
+      safe_gate_project_lane_unsupported "${verb}" "a ${baseline_kind} lockfile with an entry safe cannot bind ($(jq -r '.bindability.unbound[0] | "\(.name)@\(.version): \(.reason)"' <<<"${graph_json}" 2>/dev/null))"
+      return $?
+    fi
+    if jq -e '[.graph.occurrences[] | select(.kind == "link" or .kind == "local")] | length > 0' <<<"${graph_json}" >/dev/null 2>&1; then
+      safe_gate_project_lane_unsupported "${verb}" "a ${baseline_kind} lockfile with in-project links"
+      return $?
+    fi
+  done
 
   # --- private origins: today's check, first, as in today's gate --------------
   safe_gate_project_lane_private_names "${verb}" "${scratch}/admit1.json"
@@ -3853,7 +3920,7 @@ safe_gate_project_lane_run() {
   fi
   # Scopes and registries by parsed identity, over everything named so far.
   safe_gate_project_lane_admit "${verb}" "${admit_args[@]}" --config "${scratch}/config.json" || return $?
-  safe_gate_lane_cp "${snap}/package.json" "${proj}/package.json" && safe_gate_lane_cp "${snap}/package-lock.json" "${proj}/package-lock.json" \
+  safe_gate_lane_cp "${snap}/package.json" "${proj}/package.json" && { (( ! disk_lock )) || safe_gate_lane_cp "${snap}/package-lock.json" "${proj}/package-lock.json"; } \
     && { [[ ! -f "${snap}/.npmrc" ]] || safe_gate_lane_cp "${snap}/.npmrc" "${proj}/.npmrc"; } || {
     safe_gate_project_lane_refuse 100 "${verb}" "cannot prepare the projection (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
     return $?
@@ -3863,7 +3930,7 @@ safe_gate_project_lane_run() {
   # The frozen invocation, probed as npm will see it, with the same settings
   # as the projection.
   frozen_args=(ci --ignore-scripts --no-audit --no-fund "--git=${SAFE_GATE_LANE_GIT}" --allow-git=none "${dest[@]}" ${carry[@]+"${carry[@]}"})
-  safe_gate_lane_cp "${snap}/package.json" "${frozen}/package.json" && safe_gate_lane_cp "${snap}/package-lock.json" "${frozen}/package-lock.json" \
+  safe_gate_lane_cp "${snap}/package.json" "${frozen}/package.json" && { (( ! disk_lock )) || safe_gate_lane_cp "${snap}/package-lock.json" "${frozen}/package-lock.json"; } \
     && { [[ ! -f "${snap}/.npmrc" ]] || safe_gate_lane_cp "${snap}/.npmrc" "${frozen}/.npmrc"; } || {
     safe_gate_project_lane_refuse 100 "${verb}" "cannot prepare the frozen probe (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
     return $?
@@ -3873,7 +3940,7 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_refuse 100 "${verb}" "npm's configuration for the frozen installation cannot be read (audit-infrastructure breakage, not a package finding)" "fix npm configuration and retry — safe doctor"
     return $?
   fi
-  if jq -e '."package-lock-only" == true' <<<"${frozen_json}" >/dev/null 2>&1; then
+  if (( ! lock_only )) && jq -e '."package-lock-only" == true' <<<"${frozen_json}" >/dev/null 2>&1; then
     safe_gate_project_lane_unsupported "${verb}" "package-lock-only set by the configuration (the frozen installation would extract nothing)"
     return $?
   fi
@@ -3934,10 +4001,10 @@ safe_gate_project_lane_run() {
   # rule on (a known block outranks it), not refused here; the binder refuses
   # links when nothing else is at stake.
   rc=0
-  diff_json="$("${safe_core}" project-diff --baseline "${snap}/package-lock.json" "${proj}/package-lock.json" 2>"${scratch}/diff.err")" || rc=$?
+  diff_json="$("${safe_core}" project-diff "${baseline_args[@]}" "${proj}/package-lock.json" 2>"${scratch}/diff.err")" || rc=$?
   if (( rc == 3 )); then
     # A baseline that cannot be read is missing evidence about the project.
-    safe_gate_project_lane_refuse 102 "${verb}" "the baseline lockfile cannot be read, so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the lockfile and retry"
+    safe_gate_project_lane_refuse 102 "${verb}" "the ${baseline_kind} baseline lockfile cannot be read, so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the lockfile and retry"
     return $?
   elif (( rc != 0 )) || ! safe_gate_lane_one_doc '.schema_version == 1 and (.difference | type == "object") and (.evidence_request | type == "array")
       and ([.evidence_request[] | (.name | type == "string") and (.version | type == "string")] | all)' "${diff_json}"; then
@@ -3960,7 +4027,7 @@ safe_gate_project_lane_run() {
   fi
   # The evidence reaches the decision exactly as the reader wrote it.
   rc=0
-  "${safe_core}" project-decide --baseline "${snap}/package-lock.json" --evidence "${evidence}" "${proj}/package-lock.json" >"${report}" 2>"${scratch}/decide.err" || rc=$?
+  "${safe_core}" project-decide "${baseline_args[@]}" --evidence "${evidence}" "${proj}/package-lock.json" >"${report}" 2>"${scratch}/decide.err" || rc=$?
   if (( rc != 0 && rc != 100 && rc != 102 && rc != 104 )); then
     safe_gate_project_lane_refuse 102 "${verb}" "the decision cannot read its evidence (exit ${rc}; audit-infrastructure breakage, not a package finding)" "rerun install.sh or run safe doctor, then retry"
     return $?
@@ -3980,6 +4047,27 @@ safe_gate_project_lane_run() {
   if ! safe_gate_project_lane_report "${verb}" "${report}" "${evidence}" "${proj}/package-lock.json"; then
     safe_gate_project_lane_refuse 102 "${verb}" "the decision report cannot be rendered (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
     return $?
+  fi
+  # Which baseline the differential was taken against, and what the lockfile on disk
+  # added to it. SEAM (age of entries, ticket 1635): ${scratch}/disk-introduced.json
+  # lists the artifacts the lockfile on disk carries that the baseline does not, that
+  # is, what this command introduces WITHOUT this projection having resolved it.
+  case "${baseline_kind}" in
+    committed) safe_gate_err "safe: project lane: baseline: the lockfile committed at the head of the git work tree" ;;
+    stored) safe_gate_err "safe: project lane: baseline: the lockfile safe stored after its own last command in this project" ;;
+    *) safe_gate_err "safe: project lane: baseline: empty (no lockfile is committed or stored: the whole resolved graph is introduced)" ;;
+  esac
+  if (( disk_lock && ! disk_is_baseline )); then
+    local disk_json="" disk_count=""
+    disk_json="$("${safe_core}" project-diff "${baseline_args[@]}" "${snap}/package-lock.json" 2>/dev/null)" \
+      && jq '.difference.introduced' <<<"${disk_json}" >"${scratch}/disk-introduced.json" 2>/dev/null \
+      && disk_count="$(jq -r 'length' "${scratch}/disk-introduced.json" 2>/dev/null)"
+    if [[ "${disk_count}" =~ ^[0-9]+$ ]]; then
+      safe_gate_err "safe: project lane: the lockfile on disk is not the baseline: ${disk_count} of its entries were judged as introduced"
+    else
+      safe_gate_project_lane_refuse 102 "${verb}" "the lockfile on disk could not be compared with the baseline (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
+      return $?
+    fi
   fi
   if (( rc != 0 )); then
     local text="" stake todo
@@ -4035,10 +4123,20 @@ safe_gate_project_lane_run() {
   local -a copy_args=() live_args=(
     --live "package.json=${manifest_sum}" --live "package-lock.json=${lock_sum}" --live "npm-shrinkwrap.json=absent")
   if [[ -f "${snap}/.npmrc" ]]; then
-    copy_args=(--copy ".npmrc=${snap}/.npmrc")
+    (( lock_only )) || copy_args=(--copy ".npmrc=${snap}/.npmrc")
     live_args+=(--live ".npmrc=${npmrc_sum}")
   else
     live_args+=(--live ".npmrc=absent")
+  fi
+  local -a bind_cmd=("${safe_core}" project-bind --project "${project_dir}" --lock-fd "${SAFE_GATE_LANE_LOCKFD}" --state-dir "${state_dir}"
+    --publish "package.json=${proj}/package.json" --publish "package-lock.json=${proj}/package-lock.json")
+  if (( lock_only )); then
+    # npm install --package-lock-only: the judged files are published and nothing is
+    # installed (no command, no environment, no selection, no tree).
+    bind_cmd+=(--files-only ${copy_args[@]+"${copy_args[@]}"} "${live_args[@]}")
+  else
+    bind_cmd+=(${copy_args[@]+"${copy_args[@]}"} "${live_args[@]}" --env-file "${scratch}/env" "${bind_selection[@]}"
+      -- "${SAFE_GATE_LANE_NPM[@]}" "${frozen_args[@]}")
   fi
   # The binder runs as a child that is waited for. From BEFORE it is started until
   # its report is delivered, a signal to this shell is only recorded and forwarded
@@ -4047,10 +4145,7 @@ safe_gate_project_lane_run() {
   local bind_rc=0 bind_pid="" rc2=0
   SAFE_GATE_LANE_DEFER=1
   SAFE_GATE_LANE_BIND_PID=""
-  "${safe_core}" project-bind --project "${project_dir}" --lock-fd "${SAFE_GATE_LANE_LOCKFD}" --state-dir "${state_dir}" \
-    --publish "package.json=${proj}/package.json" --publish "package-lock.json=${proj}/package-lock.json" \
-    ${copy_args[@]+"${copy_args[@]}"} "${live_args[@]}" --env-file "${scratch}/env" "${bind_selection[@]}" \
-    -- "${SAFE_GATE_LANE_NPM[@]}" "${frozen_args[@]}" >"${scratch}/bind.json" 2>"${scratch}/bind.err" </dev/null &
+  "${bind_cmd[@]}" >"${scratch}/bind.json" 2>"${scratch}/bind.err" </dev/null &
   bind_pid=$!
   SAFE_GATE_LANE_BIND_PID="${bind_pid}"
   # a signal that arrived between the spawn and this line
@@ -4067,15 +4162,26 @@ safe_gate_project_lane_run() {
     (( rc2 == 127 )) || bind_rc="${rc2}"
   fi
   safe_gate_lane_render "${scratch}/bind.err"
-  safe_gate_project_lane_bind_result "${verb}" "${bind_rc}" "${scratch}/bind.json"
+  safe_gate_project_lane_bind_result "${verb}" "${bind_rc}" "${scratch}/bind.json" "${lock_only}"
   rc=$?
+  if (( rc == 0 )); then
+    # A committed publication after a decision made on complete evidence: the judged
+    # lockfile becomes the baseline of this project's next command. Never earlier,
+    # never after a refusal, a failed or unverified materialisation or a dry run.
+    if "${safe_core}" project-baseline write --state-dir "${state_dir}" --project "${project_dir}" --name package-lock.json \
+        --file "${proj}/package-lock.json" >/dev/null 2>"${scratch}/baseline-write.err"; then
+      (( ! lock_only )) || safe_gate_err "safe: project lane: --package-lock-only: the judged package.json and package-lock.json were published; no tree was installed"
+    else
+      safe_gate_err "safe: project lane: the baseline could not be stored ($(safe_gate_lane_clean "$(head -n 1 "${scratch}/baseline-write.err" 2>/dev/null)")); the next command is judged against the committed lockfile"
+    fi
+  fi
   SAFE_GATE_LANE_DEFER=0
   return "${rc}"
 }
 
 # What the binder reported, to the operator, and the command's exit status.
 safe_gate_project_lane_bind_result() {
-  local verb="$1" rc="$2" doc="$3" outcome="" line="" detail="" npm_status=""
+  local verb="$1" rc="$2" doc="$3" files_only="${4:-0}" outcome="" line="" detail="" npm_status=""
   # One document whose outcome and exit agree with each other and with the
   # process status; a success also shows the strict verification and a
   # committed publication (the empty-tree success is a verified empty install).
@@ -4085,14 +4191,15 @@ safe_gate_project_lane_bind_result() {
     safe_gate_project_lane_refuse "${rc}" "${verb}" "interrupted before the binder reported anything; the project is as it was" "rerun the command"
     return $?
   fi
-  if ! jq -e -s --argjson rc "${rc}" '
+  if ! jq -e -s --argjson rc "${rc}" --argjson lo "${files_only}" '
       length == 1 and (.[0] | . as $d
       | $d.schema_version == 1 and ($d.outcome | type == "string") and ($d.exit | type == "number") and $d.exit == $rc
       and ($d.recovery.left | type == "array") and ($d.publication.retained | type == "array")
       and ({"published": 0, "refused": 30, "install_failed": 31, "verification_failed": 32, "inputs_changed": 33,
             "interrupted": 34, "publication_failed": 35, "install_unsettled": 36}[$d.outcome] == $rc)
       and (if $d.outcome == "published"
-           then $rc == 0 and ($d.verification.ok == true) and ($d.verification.problems | type == "array") and ($d.verification.problems | length) == 0
+           then $rc == 0 and (if $lo == 1 then ($d.verification == null and $d.install.ran == false)
+                              else ($d.verification.ok == true) and ($d.verification.problems | type == "array") and ($d.verification.problems | length) == 0 end)
                 and ($d.publication.state == "committed") and ($d.inputs_changed | type == "array") and ($d.inputs_changed | length) == 0
            else $rc != 0 end))' "${doc}" >/dev/null 2>&1; then
     safe_gate_project_lane_refuse 100 "${verb}" "project-bind returned no usable result (exit ${rc}); the project may hold a leftover staging directory" "rerun the command; run safe doctor if it repeats"

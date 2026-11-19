@@ -15,3 +15,10 @@ func projectBind(_ []string, _, stderr io.Writer) int {
 	fmt.Fprintln(stderr, projectBindUsage)
 	return 2
 }
+
+const projectBaselineUsage = "safe-core: project-baseline is only available on Linux"
+
+func projectBaseline(_ []string, _, stderr io.Writer) int {
+	fmt.Fprintln(stderr, projectBaselineUsage)
+	return 2
+}

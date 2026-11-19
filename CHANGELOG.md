@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Project lane baseline (still behind `install.project_lane`): the lane no longer
+  requires the lockfile on disk to be the committed one. An established baseline is
+  the lockfile committed at the head of the git work tree or the one safe stored
+  (outside the project, with its digest, private and checked like the binder's state)
+  after its own last command judged on complete evidence; a lockfile on disk that is
+  neither is judged against the committed one, else the stored one, else an empty
+  baseline, and its entries are introduced. Two commands in a row before a commit, a
+  first install with no lockfile, a hand-edited lockfile and a project outside git
+  now work; a baseline that exists and cannot be read is missing evidence (102). The
+  stored baseline advances only after a decision on complete evidence and a committed
+  publication, never after a refusal, a failed materialisation, a tree mismatch or a
+  dry run. `npm install|update --package-lock-only` publishes the judged files and
+  installs nothing (`safe-core project-bind --files-only`, the same checks and atomic
+  exchange without the staged tree) and advances the baseline. The report names the
+  baseline used and how many lockfile entries on disk were judged as introduced. New
+  `safe-core project-baseline`. The live test runs two commands in a row and a
+  lockfile-only command on the real npm.
 - Project lane hardening, third part (still behind `install.project_lane`): nothing
   the project controls is read as configuration before admission (a configuration
   file or destination in the arguments refuses at the shell; the routing probe is

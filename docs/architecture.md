@@ -104,7 +104,7 @@ every time) and exits with the outcome's status:
 
 | Exit | `outcome` | Meaning |
 | --- | --- | --- |
-| 0 | `published` | the verified tree and the judged files are in place |
+| 0 | `published` | the verified tree and the judged files are in place (`--files-only`: the judged files are in place) |
 | 2 | | usage |
 | 3 | | a judged input or the environment file cannot be read |
 | 30 | `refused` | refused before anything ran; `reason` says why (descriptor table unreadable, lock not held or lock operation failed, tree root a symbolic link, input a symbolic link or with set-id bits, lockfile with links or paths outside the tree, competing lockfile, state directory invalid or not private, ...) |
@@ -191,6 +191,22 @@ whose directory is gone. This run's own cleanup removes the directory it holds
 only if the name still refers to it. Limit: the record is not defended against a
 writer running as the same user, nor against an inode reused under the same
 128-bit random name.
+
+**Files-only publication** (`project-bind --files-only --project <dir> (--lock-fd <n> |
+--take-lock) --state-dir <dir> --publish ... [--copy ...] --live ...`, no `--env-file`,
+selection or command: usage error otherwise) is the gate's `npm install
+--package-lock-only`. It runs the same transaction without its install and tree
+steps: the lock, the sweep of recorded leftovers, the live inputs against their
+judged digests, the staging directory and its atomic-exchange probe, then publication
+of the files by atomic exchange with the displaced object inspected, the last check of
+everything and the undo, all unchanged. The tree root is neither read nor touched
+(`publication.tree` is `old`, `install.ran` false, `verification` null). It exists so
+that a lockfile-only command is bound by exactly the checks a full one is.
+
+**The stored baseline** is kept by `safe-core project-baseline (read | write)`: see
+[configuration](configuration.md) for what it holds and when it advances. `read` exits
+0 (the lockfile is in `--out`), 4 (none stored for this project), 3 (a record or the
+state directory that cannot be trusted); `write` stores `--file` atomically.
 
 **The lock** is the caller's: the gate takes `flock(LOCK_EX)` on the project
 directory before it reads anything and keeps it until it exits, so `project-bind`
