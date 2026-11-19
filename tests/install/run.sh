@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -u
 
+# A real node binary (not a shim), found BEFORE the harness isolates HOME and PATH: for the probe script, which runs on a real node.
+REAL_NODE_BIN="$(node -p process.execPath 2>/dev/null || true)"
+[[ -x "${REAL_NODE_BIN}" ]] || REAL_NODE_BIN=""
 # SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
 # shellcheck source=tests/lib/test-isolation.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
@@ -11136,8 +11139,8 @@ case_project_lane_routing_a_probe_that_fails_to_load_is_a_refusal_never_missing_
     assert_err_not_contains_fragment 'one-shot' "$FUNCNAME: probe status ${status}" || return
   done
   # the probe itself, on a real node, against an npm whose definitions module THROWS
-  local real_node
-  real_node="$(command -v node 2>/dev/null)" || { printf '# %s: no node here for the throwing-module check\n' "$FUNCNAME"; pass "$FUNCNAME"; return; }
+  local real_node="${REAL_NODE_BIN}"
+  [[ -n "${real_node}" ]] || { printf '# %s: no node here for the throwing-module check\n' "$FUNCNAME"; pass "$FUNCNAME"; return; }
   local npm_dir="${CASE_DIR}/fake-npm" script="${CASE_DIR}/lane-probe.cjs" out
   mkdir -p "${npm_dir}/node_modules/@npmcli/config/lib" "${npm_dir}/node_modules/semver"
   printf '{"name":"npm","version":"11.20.0"}\n' > "${npm_dir}/package.json"
