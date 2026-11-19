@@ -6135,9 +6135,15 @@ osv_query_package_json() {
     # The evidence mode asks for a repeated member to be refused as well: jq
     # would keep the last of two same-named members without a word. The page
     # is not merged, so what earlier pages carried is kept.
-    if [[ -n "${OSV_REJECT_REPEATED_MEMBERS:-}" ]] && scanner_batch_has_repeated_members "$output.raw"; then
-      osv_write_package_query_result "$output" error "OSV response has a repeated member" "$vulns_file"
-      return 0
+    if [[ -n "${OSV_REJECT_REPEATED_MEMBERS:-}" ]]; then
+      local member_rc=0
+      scanner_batch_member_paths "$output.raw" || member_rc=$?
+      case "$member_rc" in
+        0) ;;
+        1) osv_write_package_query_result "$output" error "OSV response has a repeated member" "$vulns_file"; return 0 ;;
+        3) osv_write_package_query_result "$output" error "OSV response is not valid JSON" "$vulns_file"; return 0 ;;
+        *) osv_write_package_query_result "$output" error "OSV member check unusable" "$vulns_file"; return 0 ;;
+      esac
     fi
     # Validation is two-stage with the merge in between (delta-2 F1): the
     # vulns payload is judged first, its records merged into the
@@ -10900,9 +10906,30 @@ scanner_batch_core_ready() {
   SCANNER_BATCH_CORE_BIN="$bin"
 }
 
-scanner_batch_has_repeated_members() {
-  "$SCANNER_BATCH_CORE_BIN" repeated-members < "$1" >/dev/null 2>&1
-  (( $? == 1 ))
+# Three outcomes, told apart (a checker that cannot answer is never "clean"):
+#   0  the check ran and found no repeated member (SCANNER_BATCH_PATHS = [])
+#   1  the answer repeats a member (SCANNER_BATCH_PATHS = the paths, each a JSON
+#      array of member names and array indexes)
+#   3  the answer is not one valid JSON document (jq accepts NaN; JSON has none)
+#   4  the checker is unusable: missing output, an unknown subcommand, any
+#      other status. The caller turns that into exit 4, as for a missing binary.
+SCANNER_BATCH_PATHS='[]'
+scanner_batch_member_paths() {
+  local out rc=0
+  SCANNER_BATCH_PATHS='[]'
+  out=$("$SCANNER_BATCH_CORE_BIN" repeated-members < "$1" 2>/dev/null) || rc=$?
+  case "$rc" in
+    0) [[ "$out" == "[]" ]] || return 4 ;;
+    1) jq -e 'type == "array" and length > 0 and all(.[]; type == "array")' <<<"$out" >/dev/null 2>&1 || return 4 ;;
+    3) return 3 ;;
+    *) return 4 ;;
+  esac
+  SCANNER_BATCH_PATHS="$out"
+  return "$rc"
+}
+
+scanner_batch_checker_unusable() {
+  printf 'safe audit: scanner-batch: the repeated-member check of safe-core is unusable — audit-infrastructure breakage, not a package finding; rerun install.sh\n' >&2
 }
 
 # A paginated re-query replaces ALREADY-VALIDATED batch results, so the same
@@ -11187,7 +11214,7 @@ scanner_batch_evidence_command() {
 
   # paired: one {pkg, res, gaps} per identity, in input order. gaps collects
   # every reason the identity's reading is incomplete.
-  local total chunk_start chunk chunk_len body paired='[]' gap validity
+  local total chunk_start chunk chunk_len body paired='[]' gap validity bad member_rc
   total=$(jq 'length' <<<"$pkgs")
   chunk_start=0
   while (( chunk_start < total )); do
@@ -11195,15 +11222,34 @@ scanner_batch_evidence_command() {
     chunk_len=$(jq 'length' <<<"$chunk")
     body=$(jq -c '{queries: [.[] | {package: {ecosystem: "npm", name: .name}, version: .version}]}' <<<"$chunk")
     gap=""
+    bad='[]'
     if ! curl -fsS --max-time 10 https://api.osv.dev/v1/querybatch \
       -H 'content-type: application/json' -d "$body" > "$scratch/batch.json"; then
       gap="OSV batch query failed (network/timeout/HTTP error)"
     elif ! scanner_batch_single_document "$scratch/batch.json"; then
       gap="malformed OSV batch response (not a single JSON document)"
-    elif scanner_batch_has_repeated_members "$scratch/batch.json"; then
-      gap="malformed OSV batch response (repeated member)"
-    elif ! scanner_batch_paired "$scratch/batch.json" "$chunk_len"; then
-      gap="malformed OSV batch response"
+    else
+      member_rc=0
+      scanner_batch_member_paths "$scratch/batch.json" || member_rc=$?
+      case "$member_rc" in
+        0|1) ;;
+        3) gap="malformed OSV batch response (not valid JSON)" ;;
+        *) scanner_batch_checker_unusable; return 4 ;;
+      esac
+      if [[ -z "$gap" ]] && ! scanner_batch_paired "$scratch/batch.json" "$chunk_len"; then
+        gap="malformed OSV batch response"
+      fi
+      if [[ -z "$gap" && "$member_rc" == "1" ]]; then
+        # A repeated member inside one result costs that result only, once the
+        # envelope and the pairing are sound. One anywhere else (the envelope,
+        # a second "results") makes the answer untrustworthy as a whole.
+        if jq -e --argjson n "$chunk_len" 'any(.[]; (length >= 2 and .[0] == "results" and (.[1] | type) == "number" and .[1] < $n) | not)' \
+            <<<"$SCANNER_BATCH_PATHS" >/dev/null 2>&1; then
+          gap="malformed OSV batch response (repeated member)"
+        else
+          bad=$(jq -c '[.[] | .[1]] | unique' <<<"$SCANNER_BATCH_PATHS")
+        fi
+      fi
     fi
     if [[ -n "$gap" ]]; then
       paired=$(jq -cn --argjson acc "$paired" --argjson chunk "$chunk" --arg gap "$gap" \
@@ -11211,11 +11257,12 @@ scanner_batch_evidence_command() {
     else
       # Positional pairing holds: each result stands or falls on its own.
       validity=$(scanner_batch_result_validity "$scratch/batch.json")
-      paired=$(jq -cn --argjson acc "$paired" --argjson chunk "$chunk" --argjson ok "$validity" \
+      paired=$(jq -cn --argjson acc "$paired" --argjson chunk "$chunk" --argjson ok "$validity" --argjson bad "$bad" \
         --slurpfile b "$scratch/batch.json" '
-        $acc + ([range(0; ($chunk | length))] | map(
-          if $ok[.] then {pkg: $chunk[.], res: $b[0].results[.], gaps: []}
-          else {pkg: $chunk[.], res: {vulns: []}, gaps: ["malformed OSV batch response"]} end))')
+        $acc + ([range(0; ($chunk | length))] | map(. as $i |
+          if ($bad | index($i)) != null then {pkg: $chunk[$i], res: {vulns: []}, gaps: ["malformed OSV batch response (repeated member)"]}
+          elif $ok[$i] then {pkg: $chunk[$i], res: $b[0].results[$i], gaps: []}
+          else {pkg: $chunk[$i], res: {vulns: []}, gaps: ["malformed OSV batch response"]} end))')
     fi
     chunk_start=$((chunk_start + 100))
   done
@@ -11233,6 +11280,10 @@ scanner_batch_evidence_command() {
     OSV_REJECT_REPEATED_MEMBERS=1 osv_query_package_json npm "$pkg_name" "$pkg_version" "$pagefile"
     note=$(jq -r 'if (type == "object") and (.status == "ok") then "" else "OSV pagination re-query failed" end' "$pagefile" 2>/dev/null) \
       || note="OSV pagination re-query failed"
+    if jq -e '(type == "object") and ((.note // "") | test("member check unusable"))' "$pagefile" >/dev/null 2>&1; then
+      scanner_batch_checker_unusable
+      return 4
+    fi
     paired=$(jq -c --argjson i "$idx" --arg note "$note" --slurpfile p "$pagefile" '
       def wellformed: (type == "object") and ((.id? | type) == "string")
         and (.id | test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and ((.id | test("[\\n\\r]")) | not);
@@ -11247,13 +11298,19 @@ scanner_batch_evidence_command() {
   # Severity per (advisory, queried package); an advisory whose record cannot
   # be fetched, validated or classified is recorded in `failed` with the
   # reason, and is neither guessed at nor dropped silently.
-  local sev_map='{}' failed_map='{}' label pkg_ref id
+  local sev_map='{}' failed_map='{}' label pkg_ref id member_rc
   while IFS= read -r id; do
     if ! curl -fsS --max-time 8 "https://api.osv.dev/v1/vulns/$id" > "$scratch/vuln.json"; then
       failed_map=$(jq -c --arg id "$id" '. + {($id): "OSV advisory fetch failed"}' <<<"$failed_map")
       continue
     fi
-    if scanner_batch_has_repeated_members "$scratch/vuln.json" || ! scanner_batch_detail_valid "$scratch/vuln.json" "$id"; then
+    member_rc=0
+    scanner_batch_member_paths "$scratch/vuln.json" || member_rc=$?
+    if (( member_rc == 4 || member_rc == 2 || member_rc > 4 )); then
+      scanner_batch_checker_unusable
+      return 4
+    fi
+    if (( member_rc != 0 )) || ! scanner_batch_detail_valid "$scratch/vuln.json" "$id"; then
       failed_map=$(jq -c --arg id "$id" '. + {($id): "OSV advisory record malformed"}' <<<"$failed_map")
       continue
     fi

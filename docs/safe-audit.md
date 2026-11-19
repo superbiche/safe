@@ -750,10 +750,14 @@ as `missing` and says why in `gap`; every other validated hit stays. Within a
 chunk whose answer is paired to the queries, each result stands or falls on its
 own; the hits of an identity whose pages are re-queried are the union of the
 batch answer's and of every page read, so a failure on page two keeps what page
-one carried. A malformed answer, or one that repeats a member (which `jq` would
-resolve silently to the last), is a gap, never an empty reading. The mode asks
-`safe-core` (at safe's own version) to detect repeated members, so it needs it
-installed; without it the exit is 4. A `MAL-` record keeps the
+one carried. A malformed answer (`NaN` is accepted by `jq` and is not JSON), or one that
+repeats a member (which `jq` would resolve silently to the last), is a gap,
+never an empty reading; a repeated member inside one result costs that result
+only, one in the envelope costs the whole chunk. The mode asks `safe-core` (at
+safe's own version) for the paths of repeated members, so it needs it
+installed: a checker that is missing, of another version, or that answers
+anything but "none" or "these paths" is breakage and the exit is 4, never a
+clean answer. A `MAL-` record keeps the
 name and version it affects (`malware: true`). The blocklist is reported by
 name, independently of every OSV outcome. The document carries no verdict:
 `safe-core project-decide` reads it, with the standing acceptances added, and

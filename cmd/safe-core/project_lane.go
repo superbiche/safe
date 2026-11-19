@@ -214,11 +214,14 @@ func projectDecide(args []string, stdout, stderr io.Writer) int {
 	}))
 }
 
-// repeatedMembers reads one JSON document on stdin and says whether any object
-// in it names a member twice (exit 1), which encoding/json and jq would
-// otherwise settle silently by keeping the last. Exit 0: none; 3: not JSON.
-// The advisory readers of safe audit call it before they trust an OSV answer.
-func repeatedMembers(args []string, stdin io.Reader, stderr io.Writer) int {
+// repeatedMembers reads one JSON document on stdin and prints, as a JSON
+// array, the path of every object member named a second time in its object
+// (see strictjson.RepeatedMemberPaths). Exit 0: none found, prints []. Exit 1:
+// some found, prints their paths. Exit 3: the input is not one valid JSON
+// document, or could not be read to its end. Exit 2: usage. The advisory
+// readers of safe audit call it before they trust an OSV answer and treat any
+// other status as an unusable checker, never as a clean answer.
+func repeatedMembers(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) != 0 {
 		fmt.Fprintln(stderr, "safe-core: usage: safe-core repeated-members < document.json")
 		return 2
@@ -228,12 +231,15 @@ func repeatedMembers(args []string, stdin io.Reader, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "safe-core: repeated-members: read: %v\n", err)
 		return 3
 	}
-	if !json.Valid(raw) {
-		fmt.Fprintln(stderr, "safe-core: repeated-members: not a single valid JSON document")
+	paths, err := strictjson.RepeatedMemberPaths(raw)
+	if err != nil {
+		fmt.Fprintf(stderr, "safe-core: repeated-members: %v\n", err)
 		return 3
 	}
-	if err := strictjson.RejectRepeatedMembers(raw); err != nil {
-		fmt.Fprintf(stderr, "safe-core: repeated-members: %v\n", err)
+	if code := printJSON(stdout, "repeated-members", stderr, paths); code != 0 {
+		return code
+	}
+	if len(paths) > 0 {
 		return 1
 	}
 	return 0

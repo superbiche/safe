@@ -77,6 +77,10 @@ type Occurrence struct {
 	// identity request.
 	Public bool `json:"public_evidence"`
 
+	// coverName and coverVersion name the covering artifact of a covered
+	// member: the identity a standing acceptance has to match.
+	coverName, coverVersion string
+
 	// descriptor is the resolved string as written in the lockfile, before any
 	// redaction: binding judges what npm would fetch, not what is reported.
 	descriptor string
@@ -105,6 +109,14 @@ type Identity struct {
 // Key returns the artifact an occurrence installs.
 func (o Occurrence) Key() ArtifactKey {
 	return ArtifactKey{Name: o.Name, Version: o.Version, Origin: o.Origin, Integrity: o.Integrity, CoveredBy: o.CoveredBy, Member: o.Member}
+}
+
+// covered reports whether the occurrence is a member of another artifact's
+// tarball: bundled, and with no location of its own. An entry that names its
+// own location is fetched on its own, whatever its bundle flag says, and is
+// judged on that location.
+func (o Occurrence) covered() bool {
+	return o.Bundled && o.Kind != KindLink && o.descriptor == ""
 }
 
 // Identity returns the advisory identity of an occurrence.
@@ -162,10 +174,17 @@ func graphFromRecords(records []lockdiff.Record, locals []lockdiff.LocalPackage,
 			continue
 		}
 		origin := stripCredentials(record.Resolved)
+		name, alias := record.Name, record.Alias
+		if record.InBundle && record.Resolved == "" && record.DeclaredName != "" && record.DeclaredName != name {
+			// A descriptor-less bundled entry is the package it declares to be,
+			// mounted under another name: advisories and the blocklist are
+			// read for the package, the mount name is the alias.
+			name, alias = record.DeclaredName, name
+		}
 		graph.Occurrences = append(graph.Occurrences, Occurrence{
 			Path:       record.Path,
-			Name:       record.Name,
-			Alias:      record.Alias,
+			Name:       name,
+			Alias:      alias,
 			Version:    record.Version,
 			Origin:     origin,
 			Integrity:  record.Integrity,
@@ -193,13 +212,19 @@ func graphFromRecords(records []lockdiff.Record, locals []lockdiff.LocalPackage,
 	}
 	for i := range graph.Occurrences {
 		occurrence := &graph.Occurrences[i]
-		if occurrence.Bundled && occurrence.Kind != KindLink {
+		if occurrence.covered() {
+			// One covering rule for binding, identity, evidence eligibility and
+			// the artifact key: a member with no location of its own is its
+			// covering artifact's bytes, so it takes that artifact's host,
+			// eligibility and key.
 			root, ok := coveringRoot(graph.Occurrences, byPath, occurrence.Path)
 			if ok {
-				occurrence.CoveredBy = keyText(graph.Occurrences[root].Key())
-				occurrence.Member = strings.TrimPrefix(occurrence.Path, graph.Occurrences[root].Path+"/")
-				occurrence.Host = graph.Occurrences[root].Host
-				_, occurrence.Public = eligible[graph.Occurrences[root].Host]
+				cover := graph.Occurrences[root]
+				occurrence.CoveredBy = keyText(cover.Key())
+				occurrence.coverName, occurrence.coverVersion = cover.Name, cover.Version
+				occurrence.Member = strings.TrimPrefix(occurrence.Path, cover.Path+"/")
+				occurrence.Host = cover.Host
+				_, occurrence.Public = eligible[cover.Host]
 			} else {
 				// A bundled entry whose covering artifact is not in the lockfile
 				// is unbound anyway; it stays in the evidence request.
@@ -207,8 +232,13 @@ func graphFromRecords(records []lockdiff.Record, locals []lockdiff.LocalPackage,
 			}
 			continue
 		}
-		if occurrence.Kind == KindRegistry {
+		switch {
+		case occurrence.Kind == KindRegistry:
 			_, occurrence.Public = eligible[occurrence.Host]
+		case occurrence.Bundled && occurrence.Kind != KindLink:
+			// Names a location that is not a registry's: unbound, but still a
+			// public identity whose reading is owed.
+			occurrence.Public = true
 		}
 	}
 	return graph
@@ -222,7 +252,7 @@ func coveringRoot(occurrences []Occurrence, byPath map[string]int, path string) 
 		if !ok {
 			return 0, false
 		}
-		if !occurrences[parent].Bundled {
+		if !occurrences[parent].covered() {
 			return parent, true
 		}
 		path = occurrences[parent].Path

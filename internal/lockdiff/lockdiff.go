@@ -117,11 +117,16 @@ type Record struct {
 	// Name is the identity the audit vouches for: the registry name an alias
 	// points at, else the install-path name. Alias is the install-path name
 	// when it differs from Name, empty otherwise.
-	Name      string
-	Alias     string
-	Version   string
-	Resolved  string
-	Integrity string
+	Name  string
+	Alias string
+	// DeclaredName is the entry's own "name" member as written, whatever its
+	// source class. LoadEntries ignores it for entries without a registry
+	// descriptor; a reader that must know what a descriptor-less bundled entry
+	// declares to be (a mount name can differ from the package's) reads it here.
+	DeclaredName string
+	Version      string
+	Resolved     string
+	Integrity    string
 	// Source is the descriptor class: registry, git, file, remote or unknown.
 	Source     string
 	Link       bool
@@ -215,6 +220,7 @@ func LoadRecords(path string, registryHosts []string) ([]Record, error) {
 			Path:          key,
 			Name:          name,
 			Alias:         alias,
+			DeclaredName:  entry.Name,
 			Version:       entry.Version,
 			Resolved:      resolved,
 			Integrity:     integrity,

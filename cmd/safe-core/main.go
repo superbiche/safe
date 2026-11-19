@@ -38,7 +38,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return nodeTree(args[1:], stdout, stderr)
 	}
 	if len(args) > 0 && args[0] == "repeated-members" {
-		return repeatedMembers(args[1:], stdin, stderr)
+		return repeatedMembers(args[1:], stdin, stdout, stderr)
 	}
 	if len(args) > 0 && args[0] == "project-graph" {
 		return projectGraph(args[1:], stdout, stderr)

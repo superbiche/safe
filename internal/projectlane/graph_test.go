@@ -21,7 +21,7 @@ func TestLoadGraphRecordsEveryField(t *testing.T) {
 
 	got := map[string]Occurrence{}
 	for _, occurrence := range graph.Occurrences {
-		occurrence.descriptor = "" // what binding reads, not what is reported
+		occurrence.descriptor, occurrence.coverName, occurrence.coverVersion = "", "", "" // internals, not what is reported
 		got[occurrence.Path] = occurrence
 	}
 	canonical := func(name, version string) Occurrence {

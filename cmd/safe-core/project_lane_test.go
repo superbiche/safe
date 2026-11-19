@@ -192,22 +192,26 @@ func TestProjectLaneRefusesUnusableInput(t *testing.T) {
 	}
 }
 
-func TestRepeatedMembersSeesWhatJQAndEncodingJSONKeepLastOf(t *testing.T) {
+func TestRepeatedMembersTellsThreeOutcomesApart(t *testing.T) {
 	for name, tc := range map[string]struct {
 		document string
 		code     int
+		stdout   string
 	}{
-		"clean":                      {`{"results":[{"vulns":[{"id":"A"}]}]}`, 0},
-		"repeated container":         {`{"results":[{"vulns":[{"id":"A"}],"vulns":[]}]}`, 1},
-		"repeated scalar":            {`{"id":"A","id":"B"}`, 1},
-		"repeated in a nested array": {`{"a":[{"x":1},{"y":2,"y":3}]}`, 1},
-		"not JSON":                   {`{"a":`, 3},
-		"two documents":              {`{} {}`, 3},
+		"clean":                       {`{"results":[{"vulns":[{"id":"A"}]}]}`, 0, "[]\n"},
+		"repeated container":          {`{"results":[{"vulns":[{"id":"A"}],"vulns":[]}]}`, 1, `[["results",0,"vulns"]]` + "\n"},
+		"repeated scalar":             {`{"id":"A","id":"B"}`, 1, `[["id"]]` + "\n"},
+		"repeated in a nested array":  {`{"a":[{"x":1},{"y":2,"y":3}]}`, 1, `[["a",1,"y"]]` + "\n"},
+		"case and Case are two":       {`{"case":1,"Case":2}`, 0, "[]\n"},
+		"1e400 does not end the walk": {`{"extra":1e400,"results":[{"vulns":[{"id":"TEST-A"}],"vulns":[]},{}]}`, 1, `[["results",0,"vulns"]]` + "\n"},
+		"NaN is malformed":            {`{"extra":NaN,"results":[{},{}]}`, 3, ""},
+		"not JSON":                    {`{"a":`, 3, ""},
+		"two documents":               {`{} {}`, 3, ""},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			if got := run([]string{"repeated-members"}, strings.NewReader(tc.document), &stdout, &stderr); got != tc.code {
-				t.Fatalf("run() = %d, want %d (stderr %q)", got, tc.code, stderr.String())
+			if got := run([]string{"repeated-members"}, strings.NewReader(tc.document), &stdout, &stderr); got != tc.code || stdout.String() != tc.stdout {
+				t.Fatalf("run() = %d, stdout %q; want %d, %q (stderr %q)", got, stdout.String(), tc.code, tc.stdout, stderr.String())
 			}
 		})
 	}

@@ -17,7 +17,9 @@
   batch output is unchanged. Binding judges the lockfile's resolved string as
   written, a bundled entry is bound only by a bound registry artifact that
   covers it and is keyed by it, and the core takes binding hosts and
-  public-evidence hosts as two inputs. Spec: Safe Lanes slice 1.
+  public-evidence hosts as two inputs; a bundled entry with a location of its
+  own keeps its own source and key, and a standalone approval has no authority
+  over bytes a covering artifact carries. Spec: Safe Lanes slice 1.
 
 ## 1.75.0 - 2026-11-18
 

@@ -76,7 +76,7 @@ func CheckBindable(graph Graph, registryHosts []string) Bindability {
 		}
 		result := ""
 		switch {
-		case occurrence.Bundled && occurrence.Kind != KindLink && occurrence.descriptor == "":
+		case occurrence.covered():
 			// A bundled entry with no location of its own rides inside the
 			// tarball of the artifact that covers it, and its parent's hash
 			// covers it only when that covering artifact is a registry
@@ -84,7 +84,9 @@ func CheckBindable(graph Graph, registryHosts []string) Bindability {
 			// flags proves nothing: npm fetches a child it does not find in
 			// the bundle from the registry, by name and version.
 			result = ReasonParentUnbound
-			if occurrence.Shrinkwrap {
+			if !validPackageName(occurrence.Name) {
+				result = ReasonIdentityInvalid
+			} else if occurrence.Shrinkwrap {
 				result = ReasonOwnShrinkwrap
 			} else if root, ok := coveringRoot(graph.Occurrences, byPath, occurrence.Path); ok && depth <= 64 {
 				cover := graph.Occurrences[root]
@@ -227,6 +229,13 @@ func validVersion(version string) bool  { return semverText.MatchString(version)
 // match proves nothing about the request), no credentials, query, fragment,
 // port, path prefix or host-only descriptor. Credentials are redacted for the
 // report in a separate step, which binding never sees.
+//
+// Documented limit: a descriptor spelled any other way is not bound, even when
+// it names the right package on the right host. Refused spellings include no
+// scheme ("registry.npmjs.org/..."), another scheme ("http://"), an explicit
+// port (":443"), an upper-case host, percent-encoding and credentials. Such an
+// entry is not installed by the lane: the gate routes it (the operator's
+// deliberate route) instead of normalising it into a match.
 func canonicalTarball(resolved, name, version string, expected map[string]struct{}) bool {
 	const scheme = "https://"
 	if !strings.HasPrefix(resolved, scheme) {

@@ -28,7 +28,7 @@ func TestCheckBindable(t *testing.T) {
 		{name: "poisoned location: port", packages: map[string]map[string]any{
 			"node_modules/a": with(entry("a", "1.0.0"), map[string]any{"resolved": "https://registry.npmjs.org:8443/a/-/a-1.0.0.tgz"}),
 		}, want: map[string]string{"node_modules/a": ReasonKindNotAdmitted}},
-		{name: "poisoned location: upper-case host is not the written canonical string", packages: map[string]map[string]any{
+		{name: "refused spelling: upper-case host is not the written canonical string", packages: map[string]map[string]any{
 			"node_modules/a": with(entry("a", "1.0.0"), map[string]any{"resolved": "https://Registry.npmjs.org/a/-/a-1.0.0.tgz"}),
 		}, want: map[string]string{"node_modules/a": ReasonOriginNotCanonical}},
 		{name: "a version that is not an exact version has no canonical location", packages: map[string]map[string]any{

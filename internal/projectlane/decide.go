@@ -591,8 +591,16 @@ func introducedAdvisories(name string, introduced map[string]*advisoryFacts, tar
 // is the introduced blocking advisories of the artifact: what a followed
 // advisory override has to cover.
 func clearingAcceptance(class string, occurrence Occurrence, doc Evidence, introducedBlocking map[string]struct{}) (string, bool) {
+	// A covered member's bytes are its covering artifact's: only an acceptance
+	// of that artifact (its name, version and host) has authority over them,
+	// never one of a standalone artifact that merely shares the member's name
+	// and version.
+	name, version := occurrence.Name, occurrence.Version
+	if occurrence.CoveredBy != "" {
+		name, version = occurrence.coverName, occurrence.coverVersion
+	}
 	for _, acceptance := range doc.Acceptances {
-		if acceptance.Name != occurrence.Name || acceptance.Version != occurrence.Version ||
+		if acceptance.Name != name || acceptance.Version != version ||
 			occurrence.Host == "" || !strings.EqualFold(acceptance.Host, occurrence.Host) {
 			continue
 		}

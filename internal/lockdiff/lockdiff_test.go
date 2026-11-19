@@ -214,7 +214,7 @@ func TestLoadRecordsKeepsTheFactsLoadEntriesDrops(t *testing.T) {
 		t.Fatalf("LoadRecords() error = %v", err)
 	}
 	want := []Record{
-		{Path: "node_modules/alias", Name: "real", Alias: "alias", Version: "2.0.0",
+		{Path: "node_modules/alias", Name: "real", Alias: "alias", DeclaredName: "real", Version: "2.0.0",
 			Resolved: "https://registry.npmjs.org/real/-/real-2.0.0.tgz", Integrity: "sha512-x", Source: "registry", HasShrinkwrap: true},
 		{Path: "node_modules/linked", Link: true, LinkTarget: "packages/local"},
 		{Path: "node_modules/p/node_modules/inner", Name: "inner", Version: "1.0.0", Source: "unknown", InBundle: true},
@@ -268,5 +268,23 @@ func TestLoadLocalPackagesReadsOnlyWhatALinkPointsAt(t *testing.T) {
 	want := []LocalPackage{{Path: "packages/noname", Name: "noname", Version: "0.1.0"}, {Path: "packages/ws", Name: "ws", Version: "1.2.3"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("LoadLocalPackages() = %#v, want %#v", got, want)
+	}
+}
+
+func TestLoadRecordsKeepsTheDeclaredNameOfADescriptorlessEntryWhileLoadEntriesDoesNot(t *testing.T) {
+	file := writeLockfile(t, t.TempDir(), `{
+	  "lockfileVersion": 3,
+	  "packages": {
+	    "": {"name": "root"},
+	    "node_modules/p/node_modules/alias": {"name": "real", "version": "1.0.0", "inBundle": true}
+	  }
+	}`)
+	records, err := LoadRecords(file, nil)
+	if err != nil || len(records) != 1 || records[0].Name != "alias" || records[0].DeclaredName != "real" {
+		t.Fatalf("LoadRecords() = %#v, %v", records, err)
+	}
+	entries, err := LoadEntries(file, nil)
+	if err != nil || len(entries) != 1 || entries[0].Package.Name != "alias" {
+		t.Fatalf("LoadEntries() = %#v, %v; want the mount name, as before", entries, err)
 	}
 }
