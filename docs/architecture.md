@@ -104,7 +104,7 @@ every time) and exits with the outcome's status:
 
 | Exit | `outcome` | Meaning |
 | --- | --- | --- |
-| 0 | `published` | the verified tree and the judged files are in place |
+| 0 | `published` | the verified tree and the judged files are in place (`--files-only`: the judged files are in place) |
 | 2 | | usage |
 | 3 | | a judged input or the environment file cannot be read |
 | 30 | `refused` | refused before anything ran; `reason` says why (descriptor table unreadable, lock not held or lock operation failed, tree root a symbolic link, input a symbolic link or with set-id bits, lockfile with links or paths outside the tree, competing lockfile, state directory invalid or not private, ...) |
@@ -191,6 +191,29 @@ whose directory is gone. This run's own cleanup removes the directory it holds
 only if the name still refers to it. Limit: the record is not defended against a
 writer running as the same user, nor against an inode reused under the same
 128-bit random name.
+
+**Files-only publication** (`project-bind --files-only --project <dir> (--lock-fd <n> |
+--take-lock) --state-dir <dir> --publish ... [--copy ...] --live ...`, no `--env-file`,
+selection or command: usage error otherwise) is the gate's `npm install
+--package-lock-only`. It runs the same transaction without its install and tree
+steps: the lock, the sweep of recorded leftovers, the live inputs against their
+judged digests, the staging directory and its atomic-exchange probe, then publication
+of the files by atomic exchange with the displaced object inspected, the last check of
+everything and the undo, all unchanged. The tree root is neither read nor touched
+(`publication.tree` is `old`, `install.ran` false, `verification` null). It exists so
+that a lockfile-only command is bound by exactly the checks a full one is.
+
+**The recorded baselines** are kept by `safe-core project-baseline record --state-dir <dir>
+--project <canonical dir> --name <lockfile> --file <file>` and `... read (--digest <sha256> [--out <file>]`, see [configuration](configuration.md) for the layout, what makes a
+record trusted and the rule of choice. `record` exits 0 or 3 (it cannot be stored); `read` exits
+0 (a trusted record is stored under that digest; with `--out` its bytes are written, without it only
+the match is asked) or 4 (none: nothing recorded, or what is there is not
+trusted: an untrusted record is named on stderr as ignored and is never an error). Two small
+helpers serve the gate: `project-lockfile-admit <lockfile>` (the binder's own lockfile admission
+on a lockfile that has not been judged: exit 0, or 30 with the reason) and `git-tree-entry
+--hash-bytes <20|32> --name <name>` (reads a raw git tree on stdin, validates every entry, refuses a
+tree too large to read whole, and prints the entry's RAW mode and id) and `exact-versions` (every
+version of an evidence request checked as a whole string).
 
 **The lock** is the caller's: the gate takes `flock(LOCK_EX)` on the project
 directory before it reads anything and keeps it until it exits, so `project-bind`

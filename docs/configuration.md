@@ -221,9 +221,8 @@ pass and warnings under `environment.release_follow`.
   run-config directory does not turn it on unless trusted with
   `SAFE_RUN_TRUST_OVERRIDE`). With it off the gate behaves exactly as before. With it on, `npm
   install` (bare or with exact `name@version` registry specs) and `npm update` in
-  a project whose `package-lock.json` (version 2 or 3) is the one committed at the
-  head of its git work tree, and identical on disk, are judged on what they
-  introduce (that lockfile is the baseline) and installed exactly as judged: the
+  a project are judged on what they introduce over an established baseline (see
+  below) and installed exactly as judged: the
   lane takes an exclusive lock on the project directory, works on one snapshot of
   the manifest, lockfile and `.npmrc`, projects the command in a scratch copy
   with one npm (the one the gate's delegate would run, reached without passing
@@ -235,14 +234,89 @@ pass and warnings under `environment.release_follow`.
   advisory, 102 missing evidence or a graph safe cannot bind), for the operator
   too: this first pass has no prompt, no install record and no scripts. Any
   command or project it does not cover yet (another verb, a lockfile that is not
-  the committed one, a registry that is not the canonical public one, workspaces,
+  version 2 or 3, a registry that is not the canonical public one, workspaces,
   links, git or tarball sources, a symbolic-linked `node_modules`, an audit-only
   pass of `mise exec`, an option it cannot carry to the frozen install) refuses
   with `safe: BLOCKED npm <verb> [lane: project] — … not supported by the project
   lane yet` and does not fall back to the older gate; a command npm's effective
   configuration says is global is not the lane's. `--dry-run` runs the decision
-  and the report and writes nothing. Each decision report is kept under
+  and the report and writes nothing. `--package-lock-only` judges as usual, then
+  publishes the judged `package.json` and `package-lock.json` (the binder's
+  files-only mode: the same checks on the live inputs, the same atomic exchange of
+  each file, no staged tree, no tree exchange, no install command) and installs
+  nothing. Each decision report is kept under
   `project-lane/reports` in safe's data directory. Spec: Safe Lanes slice 1.
+  **The baseline** is what the differential is taken against, and what decides which
+  advisories are "already present" and never gate. It is the lockfile committed at the
+  head of the project's git work tree, or one safe itself judged clear and recorded (below);
+  the report says how many entries added on disk (and still in the judged target) were judged as introduced and
+  `safe: project lane: baseline: …` names which baseline was used: committed, recorded or
+  empty. With no lockfile on disk and nothing established the baseline is empty and the whole
+  resolved graph is introduced. A *committed* lockfile that exists but cannot be read or
+  decoded is missing evidence (exit 102), never an empty baseline; a recorded one that cannot
+  be trusted is ignored. A project outside a git work tree has only the recorded baselines, or
+  none. **The recorded baselines.** safe keeps, per canonical project path, the lockfiles it
+  judged clear on complete evidence, each under its own digest:
+  `project-lane/state/project-baseline/<sha256 of the project path>/<lockfile name>/<sha256
+  of the bytes>` in safe's data directory, outside the project. A record is the lockfile's
+  bytes. At most 16 records are kept per project and name: when one is written the older ones
+  (by modification time, the entry being written counted so the bound holds) are pruned, best
+  effort; a pruning that fails or goes wrong is not an error and only makes more be judged. A lockfile is recorded right
+  after a decision that is clear on complete evidence and **before** the binder runs, full
+  or files-only; if it cannot be recorded the command refuses (102, "cannot be recorded")
+  and nothing is published. A dry run, a refusal and a command with missing evidence record
+  nothing; recording a lockfile that is already recorded only refreshes its time. A record is
+  trusted only when the bytes read hash to the digest it is stored under and it is a regular
+  file of mode exactly `0600` owned by the user; anything else (corrupted, truncated, linked,
+  another mode) is **ignored**, named once on stderr as an ignored record, and never an error:
+  ignoring a record only makes more of the graph be judged. The directories of the chain
+  belong to the user, are not writable by group or others and are never links, and are held by
+  descriptor. Whether a publication completed does not matter to the baseline: if it did, the
+  lockfile on disk is the recorded one; if it did not, the lockfile on disk is still the
+  previous one, which is recorded or committed too. A recorded lockfile is a baseline whenever
+  and however it comes to be on disk: restoring a judged lockfile by hand is the same as
+  checking out an old commit. Two path names for one directory are two stores, and a missing
+  record only makes more be judged.
+  **The rule of choice.** The committed lockfile is read first, with three outcomes (below);
+  a present one must decode (it does not: missing evidence, 102, whatever the lockfile on
+  disk holds). The lockfile on disk is the baseline (`committed`) when it is byte-identical to
+  the committed one, or (`recorded`) when its digest names a trusted record. Otherwise the
+  baseline is the committed lockfile, else empty, and the entries the lockfile on disk adds are
+  introduced. **A record is a baseline only when the lockfile on disk is byte-identical to it:**
+  nothing falls back to "the most recent record", because that could be a plan judged clear whose
+  installation failed, and an advisory disclosed in between would count as already present on a
+  package the project never carried. The cost, accepted: in a project with no committed lockfile
+  a lockfile edited by hand is judged whole. A record that cannot be trusted is ignored (named
+  once: it is no match, and the baseline used instead is said).
+  **The committed lockfile** is read with three outcomes: present, *established absent*
+  (no git work tree, an unborn branch, or no `package-lock.json` in the head commit's tree)
+  and unreadable (102: a git that cannot be bound to local reads, a repository that cannot be
+  probed or that git does not select where the `.git` is, a `HEAD` that does not name a commit,
+  a reference whose lookup fails, a missing or corrupt commit, tree or blob, a blob whose hash
+  is not its name, a tree entry that is not a regular file). The lane **requires a git that can
+  disable lazy fetches** (git 2.45.0 or newer; 2.44.0 lacks the option; the lane does not trust the version alone: every
+  git call passes `--no-lazy-fetch`, and a probe with that very invocation, on a command that
+  cannot fetch, must succeed, else the committed lockfile is unreadable). The workspace probe
+  uses the same bounded invocation. git discovers the repository once, from the project
+  directory, in one git process, and every later command names that git directory and work
+  tree explicitly; every path handed to git is literal (`--literal-pathspecs`), the project's
+  directory must come back as exactly one NUL-delimited entry of the path asked for, and the
+  raw tree reader validates the mode and the framing of every entry it walks and refuses a
+  tree it could not read whole (never an absence). A project path with a newline in it cannot
+  be captured exactly by the shell and refuses before anything is opened. None of the
+  caller's `GIT_*` variables reaches git; replacement objects are disabled. Reference absence is
+  decided by git's own `show-ref --exists` (missing is distinct from a failed lookup). The raw
+  tree-entry mode is read from the raw tree (git shows `100664` as `100644`): accepted are
+  `100644`, `100664` and `100755`; `120000`, `160000` and anything else are unreadable. Object
+  identifiers along the tree path are not re-verified (whoever can forge an object in the
+  repository can also make a commit, which is a baseline by ruling). Only an established absence
+  lets the empty baseline apply. Every lockfile on disk, the baseline or not,
+  gets the binding and link checks and the binder's own lockfile admission (every key a chain
+  of package segments inside the tree, no link entry, whether or not anything references it)
+  before npm uses it. No private-registry name goes to the public advisory service: the matcher
+  runs, case-folded for the purpose of refusing only (no grant is widened), over the evidence
+  request itself, the baseline side included, and every identity in it must have an exact
+  version (a bundled member's included).
   **The project's own `.npmrc`** is read by safe, as text, before any npm runs in
   the project's context (a special file or a link there refuses first). It is
   admitted against a short allow-list, and anything else refuses naming the

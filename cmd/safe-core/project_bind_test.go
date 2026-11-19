@@ -527,3 +527,246 @@ func TestProjectTreeCommand(t *testing.T) {
 		})
 	}
 }
+
+// --files-only (npm install --package-lock-only): the judged files are
+// published, nothing is installed, the tree is not touched, one document.
+func TestProjectBindFilesOnlyPublishesTheFilesAndInstallsNothing(t *testing.T) {
+	p := newBindProject(t)
+	filesOnly := []string{
+		"project-bind", "--files-only", "--project", p.project, "--take-lock", "--state-dir", p.state,
+		"--publish", "package.json=" + filepath.Join(p.judged, "package.json"),
+		"--publish", "package-lock.json=" + filepath.Join(p.judged, "package-lock.json"),
+		"--live", "package.json=" + digest(bindOldManifest),
+		"--live", "package-lock.json=" + digest(bindOldLock),
+		"--live", "npm-shrinkwrap.json=absent",
+	}
+	treeBefore := tree(t, filepath.Join(p.project, "node_modules"))
+	out, code, stderr := run3(safeCore(filesOnly...))
+	if code != 0 || out.Outcome != "published" || out.Install.Ran || !out.Staging.Removed {
+		t.Fatalf("exit %d, %+v, %s", code, out, stderr)
+	}
+	if raw, _ := os.ReadFile(filepath.Join(p.project, "package-lock.json")); string(raw) != bindNewLock {
+		t.Fatalf("package-lock.json = %q", raw)
+	}
+	sameTree(t, treeBefore, tree(t, filepath.Join(p.project, "node_modules")))
+	if _, err := os.Stat(filepath.Join(p.project, "node_modules/a")); err == nil {
+		t.Fatal("a tree was installed")
+	}
+
+	// A command, an environment file or a selection beside --files-only is usage (2).
+	for _, extra := range [][]string{{"--env-file", p.env}, {"--os", "linux"}, {"--", "/bin/true"}} {
+		q := newBindProject(t)
+		args := []string{
+			"project-bind", "--files-only", "--project", q.project, "--take-lock", "--state-dir", q.state,
+			"--publish", "package.json=" + filepath.Join(q.judged, "package.json"),
+			"--publish", "package-lock.json=" + filepath.Join(q.judged, "package-lock.json"),
+			"--live", "package.json=" + digest(bindOldManifest),
+			"--live", "package-lock.json=" + digest(bindOldLock),
+			"--live", "npm-shrinkwrap.json=absent",
+		}
+		before := tree(t, q.project)
+		if _, code, _ := run3(safeCore(append(args, extra...)...)); code != 2 {
+			t.Fatalf("%v: exit %d, want 2", extra, code)
+		}
+		sameTree(t, before, tree(t, q.project))
+	}
+
+	// An input that changed since it was judged is refused (33) and nothing is written.
+	q := newBindProject(t)
+	if err := os.WriteFile(filepath.Join(q.project, "package.json"), []byte(`{"edited":1}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	before := tree(t, q.project)
+	args := []string{
+		"project-bind", "--files-only", "--project", q.project, "--take-lock", "--state-dir", q.state,
+		"--publish", "package.json=" + filepath.Join(q.judged, "package.json"),
+		"--publish", "package-lock.json=" + filepath.Join(q.judged, "package-lock.json"),
+		"--live", "package.json=" + digest(bindOldManifest),
+		"--live", "package-lock.json=" + digest(bindOldLock),
+		"--live", "npm-shrinkwrap.json=absent",
+	}
+	if out, code, _ := run3(safeCore(args...)); code != 33 || out.Outcome != "inputs_changed" {
+		t.Fatalf("exit %d, %+v", code, out)
+	}
+	sameTree(t, before, tree(t, q.project))
+}
+
+func TestProjectBaselineCommand(t *testing.T) {
+	p := newBindProject(t)
+	file := filepath.Join(filepath.Dir(p.project), "lock.json")
+	out := filepath.Join(filepath.Dir(p.project), "out.json")
+	if err := os.WriteFile(file, []byte(bindNewLock), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	call := func(mode string, extra ...string) (int, string) {
+		_, code, stderr := run3(safeCore(append([]string{"project-baseline", mode, "--state-dir", p.state, "--project", p.project, "--name", "package-lock.json"}, extra...)...))
+		return code, stderr
+	}
+	want := strings.TrimPrefix(digest(bindNewLock), "sha256:")
+	if code, _ := call("read", "--digest", want); code != 4 {
+		t.Fatalf("none recorded: exit %d, want 4", code)
+	}
+	if code, stderr := call("record", "--file", file); code != 0 {
+		t.Fatalf("record: exit %d %s", code, stderr)
+	}
+	if code, stderr := call("record", "--file", file); code != 0 {
+		t.Fatalf("recording it again: exit %d %s", code, stderr)
+	}
+	if code, stderr := call("read", "--digest", want); code != 0 {
+		t.Fatalf("a match with no output: exit %d %s", code, stderr)
+	}
+	if _, err := os.Stat(out); err == nil {
+		t.Fatal("a match with no --out wrote a file")
+	}
+	if code, _ := call("read", "--digest", want, "--out", out); code != 0 {
+		t.Fatalf("read by digest: exit %d", code)
+	}
+	if raw, _ := os.ReadFile(out); string(raw) != bindNewLock {
+		t.Fatalf("read back %q", raw)
+	}
+	if code, _ := call("read", "--digest", want, "--out", filepath.Join(p.state, "no-such-dir", "x")); code != 3 {
+		t.Fatalf("a record whose bytes cannot be handed over is an error, not an absence: exit %d", code)
+	}
+	if code, _ := call("read", "--digest", strings.Repeat("0", 64), "--out", out); code != 4 {
+		t.Fatalf("an unknown digest: exit %d, want 4", code)
+	}
+	// a record that does not hash to its name is IGNORED: exit 4 like none, named on stderr
+	records, _ := filepath.Glob(filepath.Join(p.state, "project-baseline", "*", "package-lock.json", "*"))
+	if len(records) != 1 {
+		t.Fatalf("records: %v", records)
+	}
+	if err := os.WriteFile(records[0], []byte("tampered"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, stderr := call("read", "--digest", want)
+	if code != 4 || !strings.Contains(stderr, "ignored record") {
+		t.Fatalf("tampered: exit %d, stderr %q", code, stderr)
+	}
+	for _, args := range [][]string{
+		{"project-baseline"}, {"project-baseline", "read"}, {"project-baseline", "confirm"},
+		{"project-baseline", "record", "--state-dir", p.state, "--project", p.project, "--name", "package-lock.json"},
+		{"project-baseline", "read", "--state-dir", p.state, "--project", p.project, "--name", "package-lock.json", "--out", out},
+		{"project-baseline", "read", "--state-dir", p.state, "--project", p.project, "--name", "package-lock.json", "--latest", "--out", out},
+		{"project-baseline", "record", "--state-dir", p.state, "--project", p.project, "--name", "package-lock.json", "--file", file, "--out", out},
+		{"project-baseline", "read", "--project-fd", "3", "--state-dir", p.state, "--name", "package-lock.json", "--latest", "--out", out},
+	} {
+		if _, code, _ := run3(safeCore(args...)); code != 2 {
+			t.Fatalf("%v: exit %d, want 2", args, code)
+		}
+	}
+	// a project that is not canonical cannot be recorded
+	if _, code, _ := run3(safeCore("project-baseline", "record", "--state-dir", p.state, "--project", "relative", "--name", "package-lock.json", "--file", file)); code != 3 {
+		t.Fatalf("a relative project: exit %d, want 3", code)
+	}
+}
+
+func TestProjectLockfileAdmitAndGitTreeEntry(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	_, code, _ := run3(safeCore("project-lockfile-admit", write("ok.json", bindNewLock)))
+	if code != 0 {
+		t.Fatalf("a lockfile of the tree: exit %d", code)
+	}
+	for name, body := range map[string]string{
+		"outside": `{"lockfileVersion":3,"packages":{"":{},"vendor/x":{"version":"1.0.0"}}}`,
+		"link":    `{"lockfileVersion":3,"packages":{"":{},"node_modules/l":{"resolved":"../l","link":true}}}`,
+	} {
+		_, code, stderr := run3(safeCore("project-lockfile-admit", write(name+".json", body)))
+		if code != 30 || stderr == "" {
+			t.Fatalf("%s: exit %d %q", name, code, stderr)
+		}
+	}
+	if _, code, _ := run3(safeCore("project-lockfile-admit", write("bad.json", "{"))); code != 30 {
+		t.Fatalf("an unreadable lockfile: exit %d", code)
+	}
+	if _, code, _ := run3(safeCore("project-lockfile-admit", filepath.Join(dir, "missing.json"))); code != 3 {
+		t.Fatal("a missing file")
+	}
+
+	// git-tree-entry: the RAW mode, not git's canonical one
+	id := strings.Repeat("\x11", 20)
+	tree := "100664 package-lock.json\x00" + id + "40000 sub\x00" + strings.Repeat("\x22", 20) + "100644 package.json\x00" + strings.Repeat("\x33", 20)
+	run := func(name string, stdin string, args ...string) (string, int) {
+		cmd := safeCore(append([]string{"git-tree-entry"}, args...)...)
+		cmd.Stdin = strings.NewReader(stdin)
+		var stdout bytes.Buffer
+		cmd.Stdout = &stdout
+		err := cmd.Run()
+		code := 0
+		if exit, ok := err.(*exec.ExitError); ok {
+			code = exit.ExitCode()
+		}
+		return stdout.String(), code
+	}
+	if out, code := run("raw", tree, "--hash-bytes", "20", "--name", "package-lock.json"); code != 0 || out != "100664 "+strings.Repeat("11", 20)+"\n" {
+		t.Fatalf("raw mode: %q %d", out, code)
+	}
+	if _, code := run("absent", tree, "--hash-bytes", "20", "--name", "nope"); code != 4 {
+		t.Fatalf("absent: %d", code)
+	}
+	if _, code := run("malformed", "100644 x", "--hash-bytes", "20", "--name", "x"); code != 3 {
+		t.Fatalf("malformed: %d", code)
+	}
+	if _, code := run("short id", "100644 x\x00abc", "--hash-bytes", "20", "--name", "x"); code != 3 {
+		t.Fatalf("short id: %d", code)
+	}
+	twice := "100644 a\x00" + id + "100644 a\x00" + id
+	if _, code := run("twice", twice, "--hash-bytes", "20", "--name", "a"); code != 3 {
+		t.Fatalf("named twice: %d", code)
+	}
+	if _, code := run("usage", tree, "--hash-bytes", "21", "--name", "a"); code != 2 {
+		t.Fatalf("usage: %d", code)
+	}
+	// every entry walked is validated, the wanted one or not
+	for name, body := range map[string]string{
+		"non-octal mode":  "10064x a\x00" + id + "100644 package-lock.json\x00" + id,
+		"mode too short":  "644 a\x00" + id + "100644 package-lock.json\x00" + id,
+		"mode too long":   "1006440 a\x00" + id + "100644 package-lock.json\x00" + id,
+		"empty name":      "100644 \x00" + id + "100644 package-lock.json\x00" + id,
+		"slash in a name": "100644 a/b\x00" + id + "100644 package-lock.json\x00" + id,
+		"cut short later": "100644 package-lock.json\x00" + id + "100644 z\x00abc",
+	} {
+		if _, code := run(name, body, "--hash-bytes", "20", "--name", "package-lock.json"); code != 3 {
+			t.Fatalf("%s: exit %d, want 3 (unreadable, never found or absent)", name, code)
+		}
+	}
+	// an object past the size the reader accepts is refused, never read in part: the wanted
+	// entry sits beyond the limit here, and the answer must not be "absent"
+	whole := "100644 a\x00" + id + "100644 package-lock.json\x00" + id
+	if _, code := run("past the limit", whole, "--hash-bytes", "20", "--name", "package-lock.json", "--max-bytes", "40"); code != 3 {
+		t.Fatalf("past the limit: exit %d, want 3", code)
+	}
+	if out, code := run("at the limit", whole, "--hash-bytes", "20", "--name", "package-lock.json", "--max-bytes", strconv.Itoa(len(whole))); code != 0 || !strings.HasPrefix(out, "100644 ") {
+		t.Fatalf("at the limit: %q %d", out, code)
+	}
+}
+
+func TestExactVersionsChecksTheWholeString(t *testing.T) {
+	check := func(body string) int {
+		cmd := safeCore("exact-versions")
+		cmd.Stdin = strings.NewReader(body)
+		_, code, _ := run3(cmd)
+		return code
+	}
+	if code := check(`{"packages":[{"name":"a","version":"1.2.3"},{"name":"b","version":"1.0.0-rc.1+x"}]}`); code != 0 {
+		t.Fatalf("exact versions: exit %d", code)
+	}
+	for _, version := range []string{"npm:@p/x@1.0.0", "1.2.3\n1.2.3", "1.2.3\n", "^1.0.0", "", "1.2", "v1.2.3", " 1.2.3"} {
+		body, _ := json.Marshal(map[string]any{"packages": []map[string]string{{"name": "a", "version": version}}})
+		if code := check(string(body)); code != 30 {
+			t.Fatalf("%q: exit %d, want 30", version, code)
+		}
+	}
+	if code := check(`{"packages":[{"name":"a"}]}`); code != 3 {
+		t.Fatalf("an identity without a version: exit %d", code)
+	}
+	if code := check(`nonsense`); code != 3 {
+		t.Fatalf("not a document: exit %d", code)
+	}
+}

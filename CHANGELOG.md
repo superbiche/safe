@@ -2,22 +2,39 @@
 
 ## Unreleased
 
-- Project lane hardening, third part (still behind `install.project_lane`): nothing
-  the project controls is read as configuration before admission (a configuration
-  file or destination in the arguments refuses at the shell; the routing probe is
-  given only global-deciding flags and keeps the operator's configuration sources;
-  environment destinations are read as npm reads them or refuse; a project inside a
-  workspace root refuses); two launcher forms (the version manager's launcher run as
-  it is in every phase, or npm's own CLI file run by the Node beside it), anything
-  else refuses; the lane runs no auditor and one matcher covers every name,
-  including lockfile paths, legacy identities and projected names; npm's own parser
-  agrees with the final admission before a dry run or binding, and a `$name`
-  override reference is resolved or refused; a committed lockfile the core cannot
-  decode is missing evidence (102); the renderer ignores header case and Unicode
-  format characters; a binder killed by the forwarded signal before its document is
-  an interruption (128+signal); `--update-notifier=false` is forced; the npm floor is
-  compared with npm's semver. The live test runs a forwarding launcher behind a
-  version manager and has strict negative controls.
+- Project lane baseline, closing reviews: safe records, per project path, the lockfiles it
+  judged clear on complete evidence, each under its own digest, before the binder runs (full or
+  files-only; a record that cannot be written refuses 102 and publishes nothing; at most 16 are
+  kept, pruned best effort). A record is a baseline ONLY when the lockfile on disk is
+  byte-identical to it: there is no fallback to "the most recent record" (a plan judged clear
+  whose installation failed must not become the baseline of its own retry). The rule: the
+  committed lockfile is read first (a present one must decode, else 102); the lockfile on disk
+  equal to it is `committed`, equal to a trusted record `recorded`; otherwise the committed
+  lockfile, else empty, and what the disk adds is introduced. A record that does not hash to its
+  name or is not a private regular file is ignored and named. Also: the committed lockfile is
+  read by a git that is probed to support `--no-lazy-fetch` (2.45.0 or newer; else 102), with
+  the repository discovered once in one process and pinned, literal pathspecs, exactly one
+  NUL-delimited entry of the path asked for, a raw tree reader that validates every entry and
+  refuses a tree it did not read whole, reference absence decided by `git show-ref --exists` and
+  the raw mode checked; the binder's own lockfile admission runs on the lockfile on disk before
+  the projection; the private-store matcher (case-folded, for refusing only) is the same at every
+  call site and every identity of the evidence request must have an exact version (checked as a
+  whole string); a project path with a newline refuses; the report counts the entries added on
+  disk that are still in the judged target. A successful publication needs an empty `retained`
+  list and both files. The agent contract is unchanged.
+- Project lane baseline (still behind `install.project_lane`): the lane no longer
+  requires the lockfile on disk to be the committed one. The baseline is the lockfile
+  committed at the head of the git work tree, or a lockfile safe itself judged clear and
+  recorded (outside the project, under its digest); a lockfile on disk that is neither is
+  judged against the committed one, else the most recent record, else an empty baseline, and
+  its entries are introduced. Two commands in a row before a commit, a first install with no
+  lockfile, a hand-edited lockfile and a project outside git now work; a committed lockfile
+  that exists and cannot be read is missing evidence (102). `npm install|update
+  --package-lock-only` publishes the judged files and installs nothing (`safe-core
+  project-bind --files-only`, the same checks and atomic exchange without the staged tree).
+  The report names the baseline used and how many lockfile entries added on disk were judged
+  as introduced. New `safe-core project-baseline`. The live test runs two commands in a row
+  and a lockfile-only command on the real npm.
 - Project lane hardening, second part (still behind `install.project_lane`): the
   project's own `.npmrc` is read by safe as text, before any npm runs, against a
   short allow-list (`docs/configuration.md`); every npm command of the lane carries
