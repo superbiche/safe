@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Project lane routing (still behind `install.project_lane`): a command the lane cannot judge
+  now goes one of three ways. An *established* unsupported shape (committed at the head of the
+  git work tree and unchanged on disk, or a property of the host: a version 1 lockfile, committed
+  non-registry dependencies or overrides, a committed `.npmrc` setting outside the allow-list, an
+  npm without the capabilities, a host configuration the lane cannot mirror) goes to today's gate
+  exactly as with the switch off, after one `[lane: one-shot, <reason>]` line saying the closure
+  is not judged there; the `install-test` families are classified apart and always take it.
+  Everything else that keeps the lane from its evidence refuses with a final line naming the cause
+  and the way out: a flag or environment setting, a failed guard (guards run before any one-shot),
+  the same shapes in uncommitted changes or outside git, `npm ci`/`dedupe`/`prune`. No refusal
+  suggests turning the lane off. `mise exec -- npm <lane command>`: the outer process runs the lane
+  itself, in mise's directory (`-C` included) and with mise's overlay applied, and does not then run
+  the original command; keys the lane cannot carry refuse by name.
 - Project lane baseline, closing reviews: safe records, per project path, the lockfiles it
   judged clear on complete evidence, each under its own digest, before the binder runs (full or
   files-only; a record that cannot be written refuses 102 and publishes nothing; at most 16 are

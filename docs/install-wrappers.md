@@ -347,9 +347,12 @@ its resolved path and sha256, so the log proves what was installed.
 With `install.project_lane` on ([configuration](configuration.md)), npm
 `install` and `update` (with `--dry-run` and `--package-lock-only`) take
 the project lane instead: judged on what they introduce, installed by
-`safe-core project-bind` from the judged lockfile; every other gated npm verb
-refuses there with `[lane: project]` rather than falling back (a global command,
-by npm's effective setting, keeps the checks below).
+`safe-core project-bind` from the judged lockfile. A shape the lane cannot judge
+that is established (committed and unchanged, or a property of the host) and the
+`install-test` families go to the checks below after a `[lane: one-shot, …]` line;
+`npm ci`, `dedupe` and `prune`, a flag or environment setting, a failed guard and
+the same shapes in uncommitted changes refuse with `[lane: project]`; a global
+command, by npm's effective setting, keeps the checks below ([routing](configuration.md)).
 
 When an operator-authorized private registry exists, project operations also
 check the origin binding of their private identities before delegating

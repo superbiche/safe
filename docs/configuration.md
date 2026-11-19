@@ -233,13 +233,46 @@ pass and warnings under `environment.release_follow`.
   class at stake refuses (104 malice or a blocking advisory, 100 a high-severity
   advisory, 102 missing evidence or a graph safe cannot bind), for the operator
   too: this first pass has no prompt, no install record and no scripts. Any
-  command or project it does not cover yet (another verb, a lockfile that is not
-  version 2 or 3, a registry that is not the canonical public one, workspaces,
-  links, git or tarball sources, a symbolic-linked `node_modules`, an audit-only
-  pass of `mise exec`, an option it cannot carry to the frozen install) refuses
-  with `safe: BLOCKED npm <verb> [lane: project] — … not supported by the project
-  lane yet` and does not fall back to the older gate; a command npm's effective
-  configuration says is global is not the lane's. `--dry-run` runs the decision
+  command or project it does not cover goes one of three ways (**routing**):
+  **(1) The one-shot route**, for a shape that is *established*: committed at the head of the
+  project's git work tree, read with the bounded git reader and byte for byte what is on disk
+  (`package.json`, `package-lock.json`, `.npmrc`), or a property of the host (its npm, its
+  configuration). The cases: a committed lockfile that is not version 2 or 3, or whose entries
+  the lane cannot bind (another host, no integrity, a link); committed dependencies or overrides
+  that are not registry packages (git, file, link, remote tarball, workspace protocol, aliases);
+  a committed `.npmrc` setting outside the allow-list; an npm without the capabilities the lane
+  needs, or a launcher the lane cannot follow; a host configuration the lane cannot mirror
+  (a registry other than the canonical public one, an install strategy, ...). The command goes to
+  today's gate exactly as it would with the switch off, after ONE stderr line
+  `safe: project lane: npm <verb> [lane: one-shot, <reason>] — the closure is not judged on this
+  route` (the reason is specific and sanitised). The `install-test` families (`install-test`,
+  `install-ci-test` and their aliases and prefixes: `it`, `cit`, `sit`, ...) are classified apart
+  from `install` and `ci` and always take it, with the reason "its test phase runs project code".
+  **(2) A refusal** (`safe: BLOCKED npm <verb> [lane: project] — … ; details: safe explain`, one
+  final line naming the cause and the way out; no refusal suggests turning the lane off) for
+  everything else that keeps the lane from its evidence: a command-line or environment setting; a
+  failed guard (the guards of the lane's own invocation run BEFORE any one-shot, so a failing guard
+  always wins); the same unsupported shapes when they exist only in uncommitted changes or when the
+  project is not in a git work tree (there is no established state to appeal to); an unsupported
+  option; a workspace; `npm ci`, `npm dedupe` and `npm prune`, which the lane does not route yet
+  and for which today's gate has no judgement of the projected closure to give. A host
+  configuration reason is refused, naming the key, when an environment setting that names the same
+  setting is present (the caller could have caused it). **(3) Unchanged**: a command npm's own
+  effective configuration says is global, `npm exec`, `npm uninstall`, every other verb and every
+  other manager.
+  **`mise exec -- npm <lane command>`** with the switch on: the OUTER process runs the lane itself,
+  in the directory mise would run it in (`-C` included) and with mise's `[env]` overlay applied to
+  that run, and does not then run the original command (an audit-only pass followed by mise running
+  the original arguments would bind nothing). The lane resolves npm exactly as it does anywhere,
+  from that directory, and builds its own allow-listed environment: of the overlay the gate reads
+  (npm settings and source selectors) only what the allow-list admits reaches the lane's npm; a
+  key the lane fixes itself and cannot carry (`npm_config_git`, `npm_config_allow_git`,
+  `npm_config_node_options`) refuses naming the key, as a script-policy key already did. The lane's
+  status is the command's. An inner command that is not a lane command (`npm view`, `npm install
+  -g`, an `install-test`, `npm uninstall`) keeps today's audit-only pass and the outer exec, byte for
+  byte; the other tools mise wraps (pnpm, bun, yarn, pip, uv, cargo, go, composer, node and the
+  rest) are untouched by the lane.
+  `--dry-run` runs the decision
   and the report and writes nothing. `--package-lock-only` judges as usual, then
   publishes the judged `package.json` and `package-lock.json` (the binder's
   files-only mode: the same checks on the live inputs, the same atomic exchange of
