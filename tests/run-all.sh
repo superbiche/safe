@@ -72,6 +72,7 @@ SUITES=(
 EXCLUDED=(
   tests/audit/cvss4_exhaustive.sh   # dev cross-check needing a bootstrapped oracle
   tests/audit/fetch_cvss4_ref.sh    # dev bootstrap helper for that oracle
+  tests/live/project_lane_binding.sh # opt-in live npm registry probe (SAFE_LIVE_NETWORK=1), excluded per its own header
   tests/live/socket_envelope.sh     # opt-in live network probe, excluded per its own header
   tests/live/syft_exclude_oracle.sh # opt-in live probe needing an installed syft, excluded per its own header
   tests/lib/test-isolation.sh       # shared HOME/state isolation helper, not a suite

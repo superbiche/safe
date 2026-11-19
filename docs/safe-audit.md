@@ -759,7 +759,11 @@ installed: a checker that is missing, of another version, or that answers
 anything but "none" or "these paths" is breakage and the exit is 4, never a
 clean answer. A `MAL-` record keeps the
 name and version it affects (`malware: true`). The blocklist is reported by
-name, independently of every OSV outcome. The document carries no verdict:
+name, independently of every OSV outcome. The input may also carry `"blocklist_names": [...]`: names checked against the
+blocklist and reported in `blocklist` exactly like the packages' names, but never
+sent to OSV (the project lane gives it every name of the target graph, whatever
+the advisory request holds). In this mode `packages` may be empty; the blocklist
+is still read, and an unreadable one is still exit 4. The document carries no verdict:
 `safe-core project-decide` reads it as written and decides what a command
 introduces. The standing acceptances are a second, separate input
 (`--acceptances <file>`: a strict document `{"schema_version": 1, "acceptances": [...]}`), so

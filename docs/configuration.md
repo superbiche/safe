@@ -185,6 +185,7 @@ pass and warnings under `environment.release_follow`.
     "cooldown_days": 3,
     "cooldown_security_fix": "exempt",
     "reuse": { "enabled": false },
+    "project_lane": false,
     "socket": {
       "mode": "auto",
       "cache_ttl_days": 7,
@@ -214,6 +215,32 @@ pass and warnings under `environment.release_follow`.
   registry belongs in `safe run private-registry add`, whose lane decides
   its namespace whatever this list says ([private registries](private-registries.md)).
 - `auto_allow_ttl_days`: freshness window for the offline/timeout fallback.
+- `project_lane`: switch for the npm project lane (default `false`; on only when
+  the run config is exactly one JSON document that sets it to the boolean
+  `true`). With it off the gate behaves exactly as before. With it on, `npm
+  install` (bare or with exact `name@version` registry specs) and `npm update` in
+  a project whose `package-lock.json` (version 2 or 3) is the one committed at the
+  head of its git work tree, and identical on disk, are judged on what they
+  introduce (that lockfile is the baseline) and installed exactly as judged: the
+  lane takes an exclusive lock on the project directory, works on one snapshot of
+  the manifest, lockfile and `.npmrc`, projects the command in a scratch copy
+  with one npm (the one the gate's delegate would run, reached without passing
+  through the gate again, with Node's start-up options removed), decides, and
+  hands the judged files to `safe-core project-bind`, which stages the tree,
+  verifies it strictly and publishes it ([architecture](architecture.md)). Until
+  publication the project is untouched; the user's own verb is never run. Every
+  class at stake refuses (104 malice or a blocking advisory, 100 a high-severity
+  advisory, 102 missing evidence or a graph safe cannot bind), for the operator
+  too: this first pass has no prompt, no install record and no scripts. Any
+  command or project it does not cover yet (another verb, a lockfile that is not
+  the committed one, a registry that is not the canonical public one, workspaces,
+  links, git or tarball sources, a symbolic-linked `node_modules`, an audit-only
+  pass of `mise exec`, an option it cannot carry to the frozen install) refuses
+  with `safe: BLOCKED npm <verb> [lane: project] — … not supported by the project
+  lane yet` and does not fall back to the older gate; a command npm's effective
+  configuration says is global is not the lane's. `--dry-run` runs the decision
+  and the report and writes nothing. Each decision report is kept under
+  `project-lane/reports` in safe's data directory. Spec: Safe Lanes slice 1.
 - `reuse.enabled`: per-host rule for `safe install --reuse` (default `false`).
   `true` lets the reuse of an installed `vendor/` or `node_modules/` from
   another checkout of the same repository run unattended, agents included; reuse runs no audit, and its

@@ -344,6 +344,13 @@ delegate without a package audit (the bytes are already on this machine),
 and the gate audit log gains one `LOCAL_ARTIFACT` line per archive naming
 its resolved path and sha256, so the log proves what was installed.
 
+With `install.project_lane` on ([configuration](configuration.md)), npm
+`install` and `update` of a project whose lockfile is the committed one take
+the project lane instead: judged on what they introduce, installed by
+`safe-core project-bind` from the judged lockfile; every other gated npm verb
+refuses there with `[lane: project]` rather than falling back (a global command,
+by npm's effective setting, keeps the checks below).
+
 When an operator-authorized private registry exists, project operations also
 check the origin binding of their private identities before delegating
 (trusted origins): npm `install|ci|update|dedupe|prune` check that every

@@ -68,8 +68,11 @@ as not advisory-audited.
 
 ### Project lane: the binding transaction
 
-Groundwork only: nothing an installed gate executes calls these commands yet.
-The project lane judges an npm command on what it introduces and must then
+Behind the `install.project_lane` switch (off by default, see
+[configuration](configuration.md)) the gate calls these commands for `npm install`
+and `npm update`; with the switch off nothing calls them. The lane's own order of
+steps is the header comment of "Project lane (npm)" in `lib/gate-lib.sh`. The
+project lane judges an npm command on what it introduces and must then
 install exactly what was judged. That last step is `safe-core project-bind`
 (`internal/projectlane/transaction.go`), and the tree check it relies on is
 `safe-core project-tree` (`internal/projectlane/tree.go`), usable on its own.

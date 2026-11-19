@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Project lane, first end-to-end pass for npm, behind the new `install.project_lane`
+  switch (default off; with it off nothing changes). With it on, `npm install`
+  (bare or exact `name@version` specs) and `npm update` in a project whose
+  `package-lock.json` is the one committed at HEAD are judged on what they
+  introduce and installed exactly as judged. The gate takes one exclusive lock on
+  the project directory, works on one snapshot of the manifest, lockfile and
+  `.npmrc`, admits sources before npm runs, projects in a scratch copy with one
+  npm (the one the delegate would run, reached without re-entering the gate, with
+  Node's start-up options removed and git disabled), decides with `project-diff`,
+  `scanner-batch --evidence` (now also given every name of the target graph for the
+  blocklist, and accepting an empty request) and `project-decide`, then hands the
+  judged files to `safe-core project-bind` (staging, strict verification,
+  publication: the project is untouched until the verified tree is published). A
+  lane command reached in audit-only mode (`mise exec`) refuses; a command npm's
+  effective configuration says is global is not the lane's. Refusals end on one
+  sanitised line naming `[lane: project]`; what the binder left or retained is
+  shown. No prompt, install record or script yet. Spec: Safe Lanes slice 1.
 - Project-lane binding transaction, groundwork only: no installed gate calls it
   yet. `safe-core project-bind` (Linux) builds the judged tree in a private
   staging directory inside the project (frozen install as a child with a given

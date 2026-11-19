@@ -10832,8 +10832,9 @@ gate_emit_refusal_hints() {
 # one value into separately-processed fragments — the same fragment
 # defect class as delta-2 F14.
 scanner_batch_input_valid() {
-  jq -e '
-    (.packages | type == "array") and (.packages | length > 0)
+  local allow_empty="${2:-0}"
+  jq -e --argjson empty "$allow_empty" '
+    (.packages | type == "array") and ($empty == 1 or (.packages | length > 0))
     and ([.packages[]
           | (type == "object")
             and ((.name? | type) == "string") and (.name | length > 0)
@@ -10841,6 +10842,8 @@ scanner_batch_input_valid() {
             and ((.version? | type) == "string") and (.version | length > 0)
             and ((.version | test("[[:space:][:cntrl:]]")) | not)]
          | all)
+    and ((.blocklist_names // []) | type == "array"
+         and ([.[] | (type == "string") and (length > 0) and ((test("[[:space:][:cntrl:]]")) | not)] | all))
   ' <<<"$1" >/dev/null 2>&1
 }
 
@@ -11010,7 +11013,7 @@ scanner_batch_command() {
   fi
   local input
   input=$(cat 2>/dev/null) || input=""
-  if ! scanner_batch_input_valid "$input"; then
+  if ! scanner_batch_input_valid "$input" "$evidence_mode"; then
     printf 'safe audit: scanner-batch: malformed input — expected {"packages":[{"name":…,"version":…},…]} on stdin\n' >&2
     return 2
   fi
@@ -11210,7 +11213,7 @@ scanner_batch_evidence_command() {
     if reason=$(blocked_entry_reason "$name"); then
       blocklist=$(jq -c --arg n "$name" --arg r "$reason" '. + [{name: $n, reason: $r}]' <<<"$blocklist")
     fi
-  done < <(jq -r '.[].name' <<<"$pkgs" | sort -u)
+  done < <({ jq -r '.[].name' <<<"$pkgs"; jq -r '(.blocklist_names // [])[]' <<<"$input"; } | sort -u)
 
   # paired: one {pkg, res, gaps} per identity, in input order. gaps collects
   # every reason the identity's reading is incomplete.

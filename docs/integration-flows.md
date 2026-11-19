@@ -110,6 +110,11 @@ Flow:
 
 Equivalent gate routing exists for pnpm, pnpx, yarn, bun, uv, pip, pip3, cargo, go, composer, and mise (Volta is retired).
 
+With `install.project_lane` on, `npm install` and `npm update` in a project with
+a committed lockfile are judged on what they introduce and installed exactly as
+judged (a staged, verified tree published by `safe-core project-bind`); see
+[configuration](configuration.md).
+
 ## Release Binaries
 
 Release binaries (GitHub, GitLab and similar release assets) are installed
