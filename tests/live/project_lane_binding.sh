@@ -195,41 +195,57 @@ else
 fi
 
 # --- scenario B: a delegate that answers differently per phase -----------------
-# The delegate's dating is by what is asked: the projection (the call that begins
-# with --package-lock-only) as of T1, everything else as of now; every call is
-# logged.
-cat > "${WORK}/delegate/npm" <<DELEGATE
+# An installation the lane follows the supported way (a launcher, the Node beside
+# it, the npm-cli.js of the same installation) whose Node is a recording wrapper:
+# the projection (the call that begins with --package-lock-only) is dated as of
+# T1, everything else runs against the registry as it is NOW, and every call is
+# logged. The projection the gate actually made is kept as it is.
+mkdir -p "${WORK}/delegate/bin" "${WORK}/delegate/lib/node_modules"
+printf '#!/bin/sh\nexit 99\n' > "${WORK}/delegate/bin/npm"
+cat > "${WORK}/delegate/bin/node" <<DELEGATE
 #!/usr/bin/env bash
-printf '%s\\n' "\$*" >> "${WORK}/delegate.log"
-# the projection itself (its first argument), not a configuration probe
-if [[ "\${1:-}" == "--package-lock-only" ]]; then
-  set -- "\$@" "--before=${T1}"
+if [[ "\${1:-}" == "${npm_cli}" ]]; then
+  shift
+  printf '%s\\n' "\$*" >> "${WORK}/delegate.log"
+  if [[ "\${1:-}" == "--package-lock-only" ]]; then
+    set -- "\$@" "--before=${T1}"
+    "${real_node_bin}" "${npm_cli}" "\$@"
+    status=\$?
+    n=\$(ls "${WORK}"/captured-*.json 2>/dev/null | wc -l)
+    [[ -f package-lock.json ]] && cp package-lock.json "${WORK}/captured-\$((n + 1)).json"
+    exit \$status
+  fi
+  exec "${real_node_bin}" "${npm_cli}" "\$@"
 fi
-exec "${real_node_bin}" "${npm_cli}" "\$@"
+exec "${real_node_bin}" "\$@"
 DELEGATE
-chmod +x "${WORK}/delegate/npm"
-ln -sf "${real_node_bin}" "${WORK}/delegate/node"
-# The lane finds npm's own platform module beside the npm it was given: here, in
-# the directory above the delegate.
-ln -sfn "${npm_dir}/node_modules" "${WORK}/node_modules"
+chmod +x "${WORK}/delegate/bin/npm" "${WORK}/delegate/bin/node"
+ln -sfn "${npm_dir}" "${WORK}/delegate/lib/node_modules/npm"
 
 run_b() { # <name> <lib dir>
   local name="$1" lib="$2"
   new_project "${WORK}/${name}" || return 99
   : > "${WORK}/delegate.log"
+  rm -f "${WORK}"/captured-*.json
   rm -rf "${WORK}/safe/lib"
   ln -s "${lib}" "${WORK}/safe/lib"
-  ( cd "${WORK}/${name}" && PATH="${WORK}/delegate:${PATH}" SAFE_AUDIT_PATH="${WORK}/safe/bin/safe-audit" \
+  ( cd "${WORK}/${name}" && PATH="${WORK}/delegate/bin:${PATH}" SAFE_AUDIT_PATH="${WORK}/safe/bin/safe-audit" \
       "${WORK}/safe/bin/safe" gate npm install express@5.1.0 --ignore-scripts >"${WORK}/${name}.out" 2>"${WORK}/${name}.err" )
   return $?
 }
 # The assertions of B, as a function: returns non-zero when any fails.
 assert_b() { # <name>
-  local name="$1" ok=0 dir="${WORK}/$1" log="${WORK}/delegate.log"
-  if cmp -s "${dir}/package-lock.json" "${judged}"; then :; else echo "# the published lockfile is not the captured projection"; ok=1; fi
-  # the final npm command: ci, once, with scripts off; nothing else resolved outside the dated projection
-  if [[ "$(grep -c '^ci --ignore-scripts --no-audit --no-fund ' "${log}")" != "1" ]]; then echo "# the frozen install was not 'ci' exactly once: $(grep -v '^config' "${log}" | cut -c1-80 | tr '\n' '|')"; ok=1; fi
-  if grep -v '^config ' "${log}" | grep -v -e '^ci ' -e '^--package-lock-only ' | grep -q .; then echo "# npm resolved outside the dated projection: $(grep -v '^config ' "${log}" | grep -v -e '^ci ' -e '^--package-lock-only ' | head -2 | tr '\n' '|')"; ok=1; fi
+  local name="$1" ok=0 dir="${WORK}/$1" log="${WORK}/delegate.log" captured calls
+  # the ordered npm calls, configuration probes aside: exactly one resolution, then exactly one frozen install
+  calls="$(grep -v '^config ' "${log}" | awk '/^--package-lock-only /{print "resolve"; next} /^ci --ignore-scripts --no-audit --no-fund /{print "ci"; next} {print "OTHER: " $0}' | tr '\n' ' ')"
+  if [[ "${calls}" != "resolve ci " ]]; then echo "# the ordered npm calls are not exactly one resolution then exactly one frozen install: ${calls}"; ok=1; fi
+  # the projection the gate actually made is what was published, byte for byte, and it is the independent one
+  captured="${WORK}/captured-1.json"
+  if [[ ! -f "${captured}" ]]; then echo "# no projection was captured"; ok=1
+  else
+    cmp -s "${dir}/package-lock.json" "${captured}" || { echo "# the published lockfile is not the projection the gate made"; ok=1; }
+    cmp -s "${captured}" "${judged}" || { echo "# the projection the gate made is not the independently captured one"; ok=1; }
+  fi
   # the tree is the judged lockfile (strict verifier), npm's own record agrees, and it is not today's graph
   if ! "${WORK}/safe/bin/safe-core" project-tree "${selection[@]}" "${judged}" "${dir}" 2>/dev/null | jq -e '.ok == true and .checked > 10' >/dev/null 2>&1; then echo "# the tree is not the judged lockfile"; ok=1; fi
   if [[ -f "${dir}/node_modules/.package-lock.json" ]]; then
@@ -253,9 +269,13 @@ fi
 if compgen -G "${WORK}/b/.safe-bind-*" >/dev/null; then fail "a staging directory is left in the project"; else pass "no staging directory is left in the project"; fi
 flock -n -x "${WORK}/b" true && pass "the project lock was released" || fail "the project lock was not released"
 
-# --- the negative control: a lane that resolves again at materialisation -------
-mkdir -p "${WORK}/broken-lib"
+# --- the negative controls ------------------------------------------------------
+# 1. a lane that resolves again at materialisation (its frozen install is `update`)
+# 2. a lane that makes a SECOND resolution that gives the very same graph: every byte
+#    published agrees, and only the ordered calls tell it
+mkdir -p "${WORK}/broken-lib" "${WORK}/twice-lib"
 cp -r "${ROOT}/lib/." "${WORK}/broken-lib/"
+cp -r "${ROOT}/lib/." "${WORK}/twice-lib/"
 if grep -q 'frozen_args=(ci ' "${WORK}/broken-lib/gate-lib.sh"; then
   sed -i 's/frozen_args=(ci /frozen_args=(update /' "${WORK}/broken-lib/gate-lib.sh"
   run_b broken "${WORK}/broken-lib"
@@ -267,6 +287,24 @@ if grep -q 'frozen_args=(ci ' "${WORK}/broken-lib/gate-lib.sh"; then
   fi
 else
   fail "the negative control cannot be built: frozen_args is not where it was"
+fi
+python3 -I - "${WORK}/twice-lib/gate-lib.sh" <<'PY' || fail "the second-resolution control cannot be built"
+import sys
+p = sys.argv[1]
+s = open(p).read()
+start = s.index('  safe_gate_lane_npm_in "${proj}" --package-lock-only')
+end = s.index('|| rc=$?', start) + len('|| rc=$?')
+block = s[start:end]
+open(p, 'w').write(s[:start] + block + '\n' + block + s[end:])
+PY
+run_b twice "${WORK}/twice-lib"
+status=$?
+problems="$(assert_b twice 2>&1)"
+if (( status == 0 )) && [[ "${problems}" == *"not exactly one resolution then exactly one frozen install: resolve resolve ci"* ]] \
+    && ! grep -q 'published lockfile\|tree is not\|IS today' <<<"${problems}"; then
+  pass "a second resolution that gives the same graph fails on the ordered-calls assertion alone"
+else
+  fail "the second-resolution control: gate exit ${status}, assertions said: ${problems}"
 fi
 
 printf '%s passed, %s failed\n' "${PASS}" "${FAIL}"

@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Project lane hardening, second part (still behind `install.project_lane`): the
+  project's own `.npmrc` is read by safe as text, before any npm runs, against a
+  short allow-list (`docs/configuration.md`); every npm command of the lane carries
+  an explicit cache and log destination in safe's private directory and
+  `--replace-registry-host=never`, and the operator's destinations in the
+  environment may not point into the project; the selected npm's own definitions
+  must define the options the lane relies on and its own parsers must agree with
+  safe's admission (an npm that only echoes `allow-git` refuses; floor 11.12.1);
+  the Node is the one beside the resolved npm's own launcher and `NODE_ENV` is
+  carried; platform and omissions are computed once by the selected Node; the
+  private check does not run its own npm and refuses a project that touches a
+  registered namespace; consumed fields of every document are checked and a
+  committed lockfile that cannot be parsed is missing evidence (102); one renderer
+  cleans every child diagnostic; the signal handler is held until the binder's
+  report is delivered; a known block outranks an unsupported dependency edge. The
+  live test now asserts the ordered npm calls against the projection the gate made.
 - Project lane hardening (still behind `install.project_lane`, off by default; with
   it off nothing changes): one Node and one npm for every phase, resolved once in
   the project's context and run directly with one allow-listed environment

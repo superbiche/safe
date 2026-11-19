@@ -61,6 +61,17 @@ pass() {
 write_node_stub() {
   cat > "$1/node" <<'NODE'
 #!/usr/bin/env bash
+# The "npm-cli.js" of the hermetic layout is a shell script of the npm stub; the
+# node that starts it is logged, and nothing else of the case's knobs is read here.
+case "${1:-}" in
+  *npm-cli.js)
+    if [[ -n "${HOME:-}" && -r "${HOME}/.stub-env0" ]]; then
+      node_log="$(tr '\0' '\n' < "${HOME}/.stub-env0" | sed -n 's/^SAFE_INSTALL_COMMAND_LOG=//p' | head -n1)"
+      [[ -z "${node_log}" ]] || printf 'NODEBIN\t%s\n' "$0" >> "${node_log}"
+    fi
+    exec bash "$@"
+    ;;
+esac
 if [[ -n "${HOME:-}" && -r "${HOME}/.stub-env0" ]]; then
   while IFS= read -r -d '' kv; do
     name="${kv%%=*}"
@@ -72,11 +83,35 @@ fi
 [[ -z "${SAFE_INSTALL_COMMAND_LOG:-}" ]] || printf 'NODEBIN\t%s\n' "$0" >> "${SAFE_INSTALL_COMMAND_LOG}"
 case "${1:-}" in
   --version) echo v99.0.0; exit 0 ;;
-  -e)
-    selection="${NODE_SELECTION_JSON:-}"
-    [[ -n "${selection}" ]] || selection='{"os":"linux","cpu":"x64","libc":"glibc"}'
-    printf '%s' "${selection}"
-    exit "${NODE_SELECTION_STATUS:-0}"
+  *lane-probe.cjs)
+    mode="${3:-}"
+    input="$(cat)"
+    case "${mode}" in
+      capability)
+        out="${NODE_CAPABILITY_JSON:-}"
+        [[ -n "${out}" ]] || out='{"version":"11.20.0","atFloor":true,"missing":[]}'
+        printf '%s' "${out}"
+        ;;
+      agreement)
+        out="${NODE_AGREEMENT_JSON:-}"
+        [[ -n "${out}" ]] || out='{"disagreements":[]}'
+        printf '%s' "${out}"
+        ;;
+      selection)
+        [[ "${NODE_PROBE_STATUS:-0}" == "0" ]] || exit "${NODE_PROBE_STATUS}"
+        if [[ -n "${NODE_SELECTION_RAW:-}" ]]; then
+          printf '%s' "${NODE_SELECTION_RAW}"
+        else
+          runtime="${NODE_SELECTION_JSON:-}"
+          [[ -n "${runtime}" ]] || runtime='{"os":"linux","cpu":"x64","libc":"glibc"}'
+          jq -c --argjson rt "${runtime}" '.config as $c
+            | def given($k): if ($c[$k] | type) == "string" and $c[$k] != "" then $c[$k] else null end;
+              {os: (given("os") // $rt.os), cpu: (given("cpu") // $rt.cpu), libc: (given("libc") // $rt.libc),
+               omit: (($c.omit // []) - ($c.include // []))}' <<<"${input}"
+        fi
+        ;;
+    esac
+    exit 0
     ;;
 esac
 exit 0
@@ -91,6 +126,7 @@ write_tool_stub() {
   cat > "${bin_dir}/${tool}" <<'STUB'
 #!/usr/bin/env bash
 tool="$(basename -- "$0")"
+[[ "${tool}" != "npm-cli.js" ]] || tool=npm
 # What the process was handed, before anything is re-read (the lane's npm gets an
 # allow-listed environment, so the case's knobs travel in a file under HOME).
 stub_env_names_before="$(env | cut -d= -f1 | LC_ALL=C sort | tr '\n' ' ')"
@@ -327,7 +363,11 @@ if [[ "${tool}" == "npm" && "${1:-}" == "ci" && ${is_projection} -eq 0 && "${NPM
   [[ "${NPM_CI_INTERRUPT:-0}" == "1" ]] && { kill -TERM "${PPID}"; sleep 1; }
   # A signal to the SHELL that waits for the binder (the binder's parent).
   [[ "${NPM_CI_SIGNAL_GATE:-0}" == "1" ]] && { kill -TERM "$(ps -o ppid= -p "${PPID}" | tr -d ' ')"; sleep 1; }
-  [[ -z "${NPM_CI_DIAGNOSTIC:-}" ]] || printf 'npm error fetch https://user:hunter2@registry.example/x?token=abc123 \033[31mred\033[0m\nnpm error code E500\n' >&2
+  if [[ "${NPM_CI_DIAGNOSTIC:-}" == "2" ]]; then
+    printf 'npm error Authorization: Bearer abc.def.ghi123456\nnpm error fetch https://h.example/x#frag-secret\nnpm error c1 \xc2\x9b31mred\nnpm error code E500\nnpm error last-line no-newline-token=abc999' >&2
+  elif [[ -n "${NPM_CI_DIAGNOSTIC:-}" ]]; then
+    printf 'npm error fetch https://user:hunter2@registry.example/x?token=abc123 \033[31mred\033[0m\nnpm error code E500\n' >&2
+  fi
   exit "${NPM_CI_STATUS:-0}"
 fi
 
@@ -387,9 +427,16 @@ write_safe_audit_stub() {
 if [[ "${1:-}" == "effective-sources" ]]; then
   exec "${ROOT_DIR}/bin/safe-audit" "$@"
 fi
+# A scripted private-registry check: a status and a result document.
+if [[ "${1:-}" == "private-npm-project" && -n "${SAFE_AUDIT_PRIVATE_MOCK_STATUS:-}" ]]; then
+  printf 'AUDIT\tprivate-npm-project\n' >> "${SAFE_INSTALL_COMMAND_LOG}"
+  [[ -z "${SAFE_AUDIT_RESULT_OUT:-}" ]] || printf '%s' "${SAFE_AUDIT_PRIVATE_MOCK_RESULT:-}" > "${SAFE_AUDIT_RESULT_OUT}"
+  exit "${SAFE_AUDIT_PRIVATE_MOCK_STATUS}"
+fi
 # The private-registry project check is the real one when a case asks for it.
 if [[ "${1:-}" == "private-npm-project" && "${SAFE_AUDIT_REAL_PRIVATE:-0}" == "1" ]]; then
   printf 'AUDIT\tprivate-npm-project\n' >> "${SAFE_INSTALL_COMMAND_LOG}"
+  printf 'PRIVATE_PATH\t%s\n' "${PATH}" >> "${SAFE_INSTALL_COMMAND_LOG}"
   exec "${ROOT_DIR}/bin/safe-audit" "$@"
 fi
 {
@@ -737,7 +784,15 @@ prepare_case() {
     write_tool_stub "${BIN_DIR}" "${tool}"
   done
   write_mise_stub "${BIN_DIR}"
-  write_node_stub "${BIN_DIR}"
+  # An installed Node the way the lane follows one: the launcher beside its Node,
+  # and the npm-cli.js of the same installation (here a shell script of the stub).
+  NODE_DIR="${CASE_DIR}/node"
+  NODE_BIN="${NODE_DIR}/bin"
+  mkdir -p "${NODE_BIN}" "${NODE_DIR}/lib/node_modules/npm/bin"
+  write_node_stub "${NODE_BIN}"
+  cp "${BIN_DIR}/npm" "${NODE_BIN}/npm"
+  cp "${BIN_DIR}/npm" "${NODE_DIR}/lib/node_modules/npm/bin/npm-cli.js"
+  rm -f "${BIN_DIR}/npm"
 
   # The real dispatcher: `safe gate` is under test, so nothing about it is
   # stubbed. Only safe-audit is (via SAFE_AUDIT_PATH, see run_zsh).
@@ -790,7 +845,7 @@ run_zsh() {
     cd "${WORK_DIR}" || exit 99
     ROOT_DIR="${ROOT_DIR}" \
     HOME="${SAFE_INSTALL_HOME:-${HOME_DIR}}" \
-    PATH="${WRAPPER_DIR}:${SAFE_TEST_PATH_MID:+${SAFE_TEST_PATH_MID}:}${BIN_DIR}:/usr/bin:/bin" \
+    PATH="${WRAPPER_DIR}:${SAFE_TEST_PATH_MID:+${SAFE_TEST_PATH_MID}:}${NODE_BIN:+${NODE_BIN}:}${BIN_DIR}:/usr/bin:/bin" \
     SAFE_AUDIT_PATH="${BIN_DIR}/safe-audit" \
     SAFE_INSTALL_COMMAND_LOG="${LOG_FILE}" \
     SAFE_INSTALL_TEST_SCRIPT="${SAFE_INSTALL_TEST_SCRIPT:-}" \
@@ -835,17 +890,23 @@ run_zsh() {
     SAFE_GATE_NO_EXEC="${SAFE_GATE_NO_EXEC:-}" \
     NODE_OPTIONS="${NODE_OPTIONS:-}" \
     NODE_SELECTION_JSON="${NODE_SELECTION_JSON:-}" \
-    NODE_SELECTION_STATUS="${NODE_SELECTION_STATUS:-}" \
+    NODE_SELECTION_RAW="${NODE_SELECTION_RAW:-}" \
+    NODE_CAPABILITY_JSON="${NODE_CAPABILITY_JSON:-}" \
+    NODE_AGREEMENT_JSON="${NODE_AGREEMENT_JSON:-}" \
+    NODE_PROBE_STATUS="${NODE_PROBE_STATUS:-}" \
     NPM_CONFIG_LIST_RAW="${NPM_CONFIG_LIST_RAW:-}" \
     NPM_STUB_NO_GIT_OPTIONS="${NPM_STUB_NO_GIT_OPTIONS:-}" \
     LANE_TEST_PROJECT="${LANE_TEST_PROJECT:-}" \
     NPM_LOCK_MUTATION_FILE="${NPM_LOCK_MUTATION_FILE:-}" \
     SAFE_AUDIT_REAL_PRIVATE="${SAFE_AUDIT_REAL_PRIVATE:-}" \
+    SAFE_AUDIT_PRIVATE_MOCK_STATUS="${SAFE_AUDIT_PRIVATE_MOCK_STATUS:-}" \
+    SAFE_AUDIT_PRIVATE_MOCK_RESULT="${SAFE_AUDIT_PRIVATE_MOCK_RESULT:-}" \
     SAFE_CORE_BIN="${SAFE_CORE_BIN_FOR_AUDIT:-${SAFE_CORE_BIN:-}}" \
     SAFE_DATA_DIR="${SAFE_DATA_DIR_FOR_CASE:-${SAFE_DATA_DIR:-}}" \
     NPM_CI_DIAGNOSTIC="${NPM_CI_DIAGNOSTIC:-}" \
     NPM_CI_SIGNAL_GATE="${NPM_CI_SIGNAL_GATE:-}" \
     SAFE_CORE_TAMPER="${SAFE_CORE_TAMPER:-}" \
+    SAFE_CORE_SIGNAL_EARLY="${SAFE_CORE_SIGNAL_EARLY:-}" \
     SAFE_CORE_REAL="${SAFE_CORE_TEST_BIN}" \
     SAFE_RUN_CONFIG_DIR="${SAFE_RUN_CONFIG_DIR_FOR_CASE:-${SAFE_RUN_CONFIG_DIR:-}}" \
     SAFE_GATE_LANE_NPM="${SAFE_GATE_LANE_NPM:-}" \
@@ -7675,6 +7736,13 @@ tamper="${SAFE_CORE_TAMPER:-}"
 if [[ "${sub}" == "project-bind" && -n "${SAFE_INSTALL_COMMAND_LOG:-}" ]]; then
   { printf 'CORE_BIND_ARGS'; for a in "$@"; do printf '\t%q' "${a}"; done; printf '\n'; } >> "${SAFE_INSTALL_COMMAND_LOG}"
 fi
+if [[ "${sub}" == "project-bind" && "${SAFE_CORE_SIGNAL_EARLY:-0}" == "1" ]]; then
+  # A signal to the shell in the window right after the binder is started.
+  trap '' TERM
+  kill -TERM "${PPID}"
+  sleep 0.4
+  exec "${real}" "$@"
+fi
 case "${sub}" in project-decide|project-bind|project-graph|project-diff|project-admit) ;; *) exec "${real}" "$@" ;; esac
 [[ -n "${tamper}" ]] || exec "${real}" "$@"
 last="${*: -1}"
@@ -7706,6 +7774,10 @@ case "${tamper}:${sub}" in
   admit-ok-with-refusals:project-admit)  jq -c '.ok = true | .refusals = [{"where": "x", "text": "", "reason": "y"}]' <<<"${out}"; exit 0 ;;
   admit-two-documents:project-admit)     printf '%s\n%s\n' "${out}" "${out}"; exit "${rc}" ;;
   admit-fails:project-admit)             exit 2 ;;
+  admit-bad-names:project-admit)         jq -c '.names = [1]' <<<"${out}"; exit "${rc}" ;;
+  graph-bound-contradiction:project-graph) [[ "${last}" != */projection/* ]] || emit; jq -c '.bindability.bound = true | .bindability.unbound = [{"path":"x","name":"x","version":"1","origin":"","reason":"y"}]' <<<"${out}"; exit "${rc}" ;;
+  bind-no-problems:project-bind)         jq -c 'del(.verification.problems)' <<<"${out}"; exit "${rc}" ;;
+  bind-no-inputs-changed:project-bind)   jq -c 'del(.inputs_changed)' <<<"${out}"; exit "${rc}" ;;
 esac
 emit
 WRAP
@@ -7875,7 +7947,7 @@ case_project_lane_clean_add_in_a_project_with_findings_passes() {
   assert_err_contains_fragment '1 already present (highest: critical)' "$FUNCNAME" || return
   assert_err_contains_fragment 'install scripts are declared by clean@2.0.0, vuln@1.0.0' "$FUNCNAME" || return
   assert_err_contains_fragment 'scripts do not run on this lane yet' "$FUNCNAME" || return
-  assert_log_contains $'PROJECTION\tnpm\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund\t'"--git=/bin/false"$'\t--allow-git=none\tinstall\tclean@2.0.0' "$FUNCNAME" || return
+  grep -qP '^PROJECTION\tnpm\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund\t--git=/bin/false\t--allow-git=none\t--cache=\S+\t--logs-dir=\S+\t--logs-max=0\t--replace-registry-host=never\tinstall\tclean@2.0.0$' "${LOG_FILE}" || { fail "$FUNCNAME: the projection's command line"; return; }
   assert_log_not_contains_fragment $'REAL\tnpm\tinstall' "$FUNCNAME" || return
   [[ "$(cat "${WORK_DIR}/package.json")" == "${LANE_CLEAN_ADD_MANIFEST}" ]] || { fail "$FUNCNAME: manifest is not the judged one"; return; }
   [[ "$(cat "${WORK_DIR}/package-lock.json")" == "${target}" ]] || { fail "$FUNCNAME: lockfile is not the judged one"; return; }
@@ -8181,8 +8253,8 @@ lane_mise_layout() {
   local name="$1"
   shift
   lane_prepare "${name}" "$@"
-  local shims="${CASE_DIR}/shims" real="${CASE_DIR}/realmise" pinned="${CASE_DIR}/pinned/bin"
-  mkdir -p "${shims}" "${real}" "${pinned}"
+  local shims="${CASE_DIR}/shims" real="${CASE_DIR}/realmise" pinned="${CASE_DIR}/pinned"
+  mkdir -p "${shims}" "${real}" "${pinned}/bin" "${pinned}/lib/node_modules/npm/bin"
   cat > "${shims}/npm" <<SHIM
 #!/usr/bin/env bash
 # safe-gate-wrapper v1 tool=mise
@@ -8190,24 +8262,28 @@ printf 'SHIM_REENTRY\t%s\n' "\$*" >> "${LOG_FILE}"
 exec safe gate npm -- "\$@"
 SHIM
   chmod +x "${shims}/npm"
+  # A second installation, the one a project pins: its launcher, its Node, its npm-cli.js.
+  cp "${NODE_BIN}/npm" "${pinned}/bin/npm"
+  cp "${NODE_BIN}/node" "${pinned}/bin/node"
+  cp "${NODE_DIR}/lib/node_modules/npm/bin/npm-cli.js" "${pinned}/lib/node_modules/npm/bin/npm-cli.js"
   # The real mise answers `which` in the directory it is run in: a project that
-  # pins its own tools (a .pin file here) gets its own node and npm.
-  cp "${BIN_DIR}/npm" "${pinned}/npm"
-  cp "${BIN_DIR}/node" "${pinned}/node"
+  # pins its own tools (a .pin file here) gets the pinned installation.
   cat > "${real}/mise" <<REALMISE
 #!/usr/bin/env bash
 printf 'MISE_REACHED\t%s\t%s\n' "\$*" "\$PWD" >> "${LOG_FILE}"
 if [[ "\${1:-}" == "which" ]]; then
-  base="${BIN_DIR}"
+  base="${NODE_DIR}"
   [[ -e "\${PWD}/.pin" ]] && base="${pinned}"
-  printf '%s/%s\n' "\${base}" "\${2:-}"
+  printf '%s/bin/%s\n' "\${base}" "\${2:-}"
   exit 0
 fi
 exit 98
 REALMISE
   chmod +x "${real}/mise"
-  # The gate wrapper's own mise shadows the real one on PATH, as installed.
+  # The gate wrapper's own mise shadows the real one on PATH, as installed; the
+  # installed Node is reached only through the shim.
   rm -f "${BIN_DIR}/mise"
+  NODE_BIN=""
   SAFE_TEST_PATH_MID="${shims}:${real}"
 }
 
@@ -8225,9 +8301,10 @@ case_project_lane_reaches_one_npm_through_a_version_manager_shim() {
   grep -qP '^REAL\tnpm\tci\t' "${LOG_FILE}" || { fail "$FUNCNAME: the frozen install did not reach npm"; return; }
   # The version manager answers once, in the project, for npm and for node; every
   # run of every phase is then the same binary.
-  [[ "$(grep -c $'^MISE_REACHED\twhich ' "${LOG_FILE}")" -eq 2 ]] || { fail "$FUNCNAME: mise was asked more than twice"; return; }
+  [[ "$(grep -c $'^MISE_REACHED\twhich ' "${LOG_FILE}")" -eq 1 ]] || { fail "$FUNCNAME: mise was asked more than once"; return; }
   [[ "$(grep '^MISE_REACHED' "${LOG_FILE}" | cut -f3 | sort -u)" == "$(cd "${WORK_DIR}" && pwd -P)" ]] || { fail "$FUNCNAME: mise was not asked in the project"; return; }
-  [[ "$(grep '^NPMBIN' "${LOG_FILE}" | sort -u)" == $'NPMBIN\t'"${BIN_DIR}/npm" ]] || { fail "$FUNCNAME: runs used another npm"; return; }
+  [[ "$(grep '^NPMBIN' "${LOG_FILE}" | sort -u)" == $'NPMBIN\t'"${NODE_DIR}/lib/node_modules/npm/bin/npm-cli.js" ]] || { fail "$FUNCNAME: runs used another npm"; return; }
+  [[ "$(grep '^NODEBIN' "${LOG_FILE}" | sort -u)" == $'NODEBIN\t'"${NODE_DIR}/bin/node" ]] || { fail "$FUNCNAME: another node ran"; return; }
   jq -e '.version == "2.0.0"' "${WORK_DIR}/node_modules/clean/package.json" >/dev/null || { fail "$FUNCNAME: tree"; return; }
   pass "$FUNCNAME"
 }
@@ -8239,15 +8316,17 @@ case_project_lane_pinned_project_runs_one_pair_in_every_phase() {
   lane_mise_layout "lane-pinned" kept@1.0.0
   touch "${WORK_DIR}/.pin"
   lane_commit
-  local pinned="${CASE_DIR}/pinned/bin"
+  local pinned="${CASE_DIR}/pinned"
   NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" \
     lane_run 'npm install clean@2.0.0'
   local status_now="${STATUS}"
   unset SAFE_TEST_PATH_MID
   STATUS="${status_now}"
   assert_status 0 "$FUNCNAME" || return
-  [[ "$(grep '^NPMBIN' "${LOG_FILE}" | sort -u)" == $'NPMBIN\t'"${pinned}/npm" ]] || { fail "$FUNCNAME: a phase did not use the pinned npm: $(grep '^NPMBIN' "${LOG_FILE}" | sort -u)"; return; }
-  [[ "$(grep '^NODEBIN' "${LOG_FILE}" | sort -u)" == $'NODEBIN\t'"${pinned}/node" ]] || { fail "$FUNCNAME: the node is not the pinned one: $(grep '^NODEBIN' "${LOG_FILE}" | sort -u)"; return; }
+  [[ "$(grep '^NPMBIN' "${LOG_FILE}" | sort -u)" == $'NPMBIN\t'"${pinned}/lib/node_modules/npm/bin/npm-cli.js" ]] || { fail "$FUNCNAME: a phase did not use the pinned npm: $(grep '^NPMBIN' "${LOG_FILE}" | sort -u)"; return; }
+  # the interpreter of every npm invocation is the pinned installation's own node
+  [[ "$(grep '^NODEBIN' "${LOG_FILE}" | sort -u)" == $'NODEBIN\t'"${pinned}/bin/node" ]] || { fail "$FUNCNAME: the node is not the pinned one: $(grep '^NODEBIN' "${LOG_FILE}" | sort -u)"; return; }
+  [[ "$(grep -c '^NODEBIN' "${LOG_FILE}")" -ge "$(grep -c '^NPMBIN' "${LOG_FILE}")" ]] || { fail "$FUNCNAME: an npm run was not started by the pinned node"; return; }
   grep -q $'^CICWD\t.safe-bind-' "${LOG_FILE}" || { fail "$FUNCNAME: ci did not run in staging"; return; }
   [[ "$(grep -c '^NPMBIN' "${LOG_FILE}")" -ge 6 ]] || { fail "$FUNCNAME: too few npm runs seen"; return; }
   pass "$FUNCNAME"
@@ -8313,7 +8392,7 @@ case_project_lane_every_npm_run_gets_exactly_the_listed_environment() {
     for name in ${line#ENVNAMES$'\t'}; do
       case "${name}" in
         PWD|OLDPWD|SHLVL|_) continue ;;
-        PATH|HOME|USER|LOGNAME|LANG|LANGUAGE|TZ|TMPDIR|SSL_CERT_FILE|SSL_CERT_DIR|NODE_EXTRA_CA_CERTS|NODE_OPTIONS) continue ;;
+        PATH|HOME|USER|LOGNAME|LANG|LANGUAGE|TZ|TMPDIR|NODE_ENV|SSL_CERT_FILE|SSL_CERT_DIR|NODE_EXTRA_CA_CERTS|NODE_OPTIONS) continue ;;
         HTTP_PROXY|HTTPS_PROXY|NO_PROXY|ALL_PROXY|http_proxy|https_proxy|no_proxy|all_proxy) continue ;;
         LC_*|npm_config_*|NPM_CONFIG_*) continue ;;
       esac
@@ -8718,7 +8797,8 @@ case_project_lane_guards_refuse_in_the_lane_form() {
 # ---- second review: what returns a wrong success, what changes a host with the switch off ----
 
 # A private-registry refusal keeps its status and ends on the lane's line, through
-# the REAL private store and the REAL project check, with nothing reading a terminal.
+# the REAL private store and the REAL project check, with nothing reading a terminal:
+# a registered scope that npm does not map to its origin, the project not touching it.
 lane_private_store() {
   mkdir -p "${HOME_DIR}/.config/safe/run"
   "${SAFE_CORE_TEST_BIN}" private-trust registry-add --policy "${HOME_DIR}/.config/safe/run/private-registries.json" \
@@ -8730,10 +8810,6 @@ case_project_lane_private_refusal_keeps_its_status() {
   lane_prepare "lane-private-refusal" kept@1.0.0
   lane_private_store || { fail "$FUNCNAME: cannot seed the private store"; return; }
   local before
-  # The project names a registered scope that npm does not map to its origin.
-  jq -c '.dependencies["@p/x"] = "^1.0.0"' "${WORK_DIR}/package.json" > "${WORK_DIR}/package.json.new"
-  mv "${WORK_DIR}/package.json.new" "${WORK_DIR}/package.json"
-  lane_commit
   before="$(lane_digests)"
   SAFE_AUDIT_REAL_PRIVATE=1 SAFE_CORE_BIN_FOR_AUDIT="${SAFE_CORE_TEST_BIN}" \
     NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
@@ -8744,6 +8820,31 @@ case_project_lane_private_refusal_keeps_its_status() {
   assert_err_contains_fragment 'private-registry check' "$FUNCNAME" || return
   assert_lane_untouched "${before}" "$FUNCNAME" || return
   assert_log_not_contains_fragment 'PROJECTION' "$FUNCNAME" || return
+  # the auditor ran with the lane's launcher first on its PATH, never its own resolver's answer
+  grep -q $'^PRIVATE_PATH\t'"${NODE_BIN}"':' "${LOG_FILE}" || { fail "$FUNCNAME: the check did not run with the lane's launcher first"; return; }
+  pass "$FUNCNAME"
+}
+
+# A project that touches an entry of a non-empty private store refuses BEFORE the
+# auditor runs anything (it resolves an npm of its own): trusted private origins
+# are the routing ticket's.
+case_project_lane_project_touching_the_private_store_refuses_before_the_auditor() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-private-touch" kept@1.0.0
+  lane_private_store || { fail "$FUNCNAME: cannot seed the private store"; return; }
+  jq -c '.dependencies["@p/lib"] = "^1.0.0"' "${WORK_DIR}/package.json" > "${WORK_DIR}/package.json.new"
+  mv "${WORK_DIR}/package.json.new" "${WORK_DIR}/package.json"
+  lane_commit
+  local before
+  before="$(lane_digests)"
+  SAFE_AUDIT_REAL_PRIVATE=1 SAFE_CORE_BIN_FOR_AUDIT="${SAFE_CORE_TEST_BIN}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" \
+    lane_run 'npm install clean@2.0.0'
+  assert_status 100 "$FUNCNAME" || return
+  assert_lane_final_line install "$FUNCNAME" || return
+  assert_err_contains_fragment 'touches the private-registry namespace @p/*' "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'private-npm-project' "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'PROJECTION' "$FUNCNAME" || return
+  assert_lane_untouched "${before}" "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -8974,7 +9075,7 @@ case_project_lane_nothing_is_written_to_the_project_before_publication() {
   : > "${LOG_FILE}"
   SAFE_DATA_DIR_FOR_CASE="${WORK_DIR}/.safe-data" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0 --dry-run'
   assert_status 100 "$FUNCNAME" || return
-  assert_err_contains_fragment "data directory or the temporary directory is inside the project" "$FUNCNAME" || return
+  assert_err_contains_fragment "data directory or the temporary directory overlaps the project" "$FUNCNAME" || return
   [[ "$(lane_listing)" == "${before}" ]] || { fail "$FUNCNAME: a data root inside the project was written to"; return; }
   # and a data directory that is a link is not used
   : > "${LOG_FILE}"
@@ -9050,11 +9151,13 @@ case_project_lane_admission_is_npms_not_a_pattern() {
   lane_run 'npm install clean@2.0.0'
   lane_unsupported_case "$FUNCNAME" install 'a lockfile edge to git' || return
   assert_err_contains_fragment 'lockfile[node_modules/kept].dependencies.sneaky' "$FUNCNAME" || return
-  # the capability of the delegated npm: one that ignores the git options refuses
+  # the capability of the delegated npm is read from ITS definitions: one that
+  # merely echoes the options in its configuration listing (npm 10.9.2) refuses
   lane_prepare "lane-admission-capability" kept@1.0.0
-  NPM_STUB_NO_GIT_OPTIONS=1 lane_run 'npm install clean@2.0.0'
-  lane_unsupported_case "$FUNCNAME" install 'an npm without the git options' || return
-  assert_err_contains_fragment 'does not honour --allow-git=none' "$FUNCNAME" || return
+  NODE_CAPABILITY_JSON='{"version":"10.9.2","atFloor":false,"missing":["allow-git"]}' lane_run 'npm install clean@2.0.0'
+  lane_unsupported_case "$FUNCNAME" install 'an npm that echoes the git options' || return
+  assert_err_contains_fragment 'older than 11.12.1 or does not define allow-git' "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'PROJECTION' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -9087,12 +9190,12 @@ case_project_lane_malformed_output_of_every_producer_refuses() {
   for kind in 'garbage' '{"os":"linux"}{"os":"linux","cpu":"x64","libc":null}' '{"os":"","cpu":"x64","libc":null}' '{"os":"linux","cpu":7,"libc":null}'; do
     lane_prepare "lane-producer-selection-${RANDOM}" kept@1.0.0
     before="$(lane_digests)"
-    NODE_SELECTION_JSON="${kind}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+    NODE_SELECTION_RAW="${kind}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
     lane_unsupported_case "$FUNCNAME" install "selection ${kind}" || return
     assert_lane_untouched "${before}" "$FUNCNAME: selection ${kind}" || return
   done
   lane_prepare "lane-producer-selection-status" kept@1.0.0
-  NODE_SELECTION_STATUS=3 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  NODE_PROBE_STATUS=3 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
   lane_unsupported_case "$FUNCNAME" install 'selection status' || return
   pass "$FUNCNAME"
 }
@@ -9163,6 +9266,267 @@ case_project_lane_signal_to_the_shell_is_forwarded_and_the_report_still_arrives(
   assert_err_contains_fragment 'interrupted before publication; the project is as it was' "$FUNCNAME" || return
   assert_err_contains_fragment 'left in the project, not removed: .safe-bind-0123456789abcdef' "$FUNCNAME" || return
   [[ "$(lane_digests)" == "${before}" && ! -e "${WORK_DIR}/node_modules" ]] || { fail "$FUNCNAME: the project changed"; return; }
+  pass "$FUNCNAME"
+}
+
+# ---- review of the hardening (ticket 1648) ------------------------------------
+
+# How many npm runs happened in the project's context: every `config list` but
+# the first (the neutral probe that recognises a global command) and everything
+# else that is npm.
+lane_project_npm_runs() {
+  grep -cP '^(PROJECTION|REAL)\tnpm\t' "${LOG_FILE}"
+}
+
+# S1. The project's own .npmrc is read as text, before any npm run in the
+# project's context, against a short allow-list; a refusal names the setting and
+# never its value.
+case_project_lane_project_npmrc_is_admitted_as_text_before_any_npm_run() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-npmrc" kept@1.0.0
+  local before line name
+  before="$(lane_digests)"
+  # a scoped registry whose URL carries a password: refused before npm runs, redacted
+  printf '@p:registry=https://user:hunter2@npm.private.example/\n' > "${WORK_DIR}/.npmrc"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  lane_unsupported_case "$FUNCNAME" install 'a scoped registry with a password' || return
+  assert_err_contains_fragment '.npmrc line 1' "$FUNCNAME" || return
+  assert_err_contains_fragment '@p:registry' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'hunter2' "$FUNCNAME" || return
+  [[ "$(lane_project_npm_runs)" == "1" ]] || { fail "$FUNCNAME: npm ran in the project's context before the refusal ($(lane_project_npm_runs))"; return; }
+  assert_lane_untouched "${before}" "$FUNCNAME" || return
+  # each of these settings refuses, by name, with no npm run in the project's context
+  for line in 'cache=./.npm' 'logs-dir=/tmp/x' 'prefix=/tmp/x' 'location=global' 'global=true' 'registry=https://npm.private.example/' \
+      'registry=http://registry.npmjs.org/' '//registry.npmjs.org/:_authToken=abc' 'proxy=http://p' 'https-proxy=http://p' 'cafile=/x' \
+      'strict-ssl=false' 'script-shell=/bin/x' 'git=/bin/git' 'allow-git=all' 'min-release-age=3' 'before=2020-01-01' 'workspaces=true' \
+      'package-lock=false' 'package-lock-only=true' 'dry-run=true' 'ignore-scripts=false' 'registry=${REG}' '[section]' 'fund=false \'; do
+    name="${line%%=*}"
+    : > "${LOG_FILE}"
+    printf '%s\n' "${line}" > "${WORK_DIR}/.npmrc"
+    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+    lane_unsupported_case "$FUNCNAME" install "npmrc ${line}" || return
+    [[ "$(lane_project_npm_runs)" == "1" ]] || { fail "$FUNCNAME: ${line}: npm ran in the project's context"; return; }
+  done
+  # the allow-list itself passes, and a repeated setting does not
+  : > "${LOG_FILE}"
+  printf '; kept small\nsave-exact=true\nsave-prefix=~\nengine-strict=false\nfund=false\naudit=false\nupdate-notifier=false\nloglevel=warn\nprogress=false\nregistry=https://registry.npmjs.org/\n@scope:registry=https://registry.npmjs.org/\n' > "${WORK_DIR}/.npmrc"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME" || return
+  printf 'fund=true\nfund=false\n' > "${WORK_DIR}/.npmrc"
+  : > "${LOG_FILE}"
+  lane_run 'npm install clean@2.0.0'
+  lane_unsupported_case "$FUNCNAME" install 'a repeated setting' || return
+  pass "$FUNCNAME"
+}
+
+# S2. Every npm run carries an explicit cache and log destination outside the
+# project and no registry rewriting; the operator's destinations in the
+# environment are checked as strings before the first npm run.
+case_project_lane_every_npm_command_line_fixes_its_destinations() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-destinations" kept@1.0.0
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME" || return
+  local line total=0
+  while IFS= read -r line; do
+    total=$((total + 1))
+    [[ "${line}" == *"--cache=${HOME_DIR}/.local/share/safe/project-lane/npm-cache"* && "${line}" == *"--logs-dir=${HOME_DIR}/.local/share/safe/project-lane/npm-logs"* \
+      && "${line}" == *"--replace-registry-host=never"* ]] || { fail "$FUNCNAME: a command line lacks its destinations: ${line}"; return; }
+  done < <(grep -P '^(PROJECTION|REAL)\tnpm\t' "${LOG_FILE}")
+  (( total >= 5 )) || { fail "$FUNCNAME: too few npm command lines seen"; return; }
+  grep -q $'^REAL\tnpm\tci\t' "${LOG_FILE}" || { fail "$FUNCNAME: no frozen install"; return; }
+  # operator-level destinations in the environment that lie inside the project refuse before any npm run
+  local name
+  for name in npm_config_cache NPM_CONFIG_CACHE npm_config_logs_dir npm_config_prefix npm_config_userconfig npm_config_globalconfig; do
+    lane_prepare "lane-destinations-${name}" kept@1.0.0
+    export "${name}=${WORK_DIR}/.inside"
+    lane_run 'npm install clean@2.0.0'
+    unset "${name}"
+    lane_unsupported_case "$FUNCNAME" install "${name}" || return
+    assert_err_contains_fragment "the environment setting ${name}" "$FUNCNAME" || return
+    [[ "$(grep -c '^REAL' "${LOG_FILE}")" == "0" ]] || { fail "$FUNCNAME: ${name}: npm ran before the refusal"; return; }
+  done
+  lane_prepare "lane-destinations-relative" kept@1.0.0
+  export npm_config_cache="relative-cache"
+  lane_run 'npm install clean@2.0.0'
+  unset npm_config_cache
+  lane_unsupported_case "$FUNCNAME" install 'a relative cache' || return
+  # one outside the project is carried (the command-line destination still wins)
+  lane_prepare "lane-destinations-outside" kept@1.0.0
+  export npm_config_cache="${CASE_DIR}/operator-cache"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  unset npm_config_cache
+  assert_status 0 "$FUNCNAME" || return
+  # report and state destinations are checked in both directions: the project inside the lane's directory
+  lane_prepare "lane-destinations-overlap" kept@1.0.0
+  mkdir -p "${CASE_DIR}/dr/project-lane"
+  mv "${WORK_DIR}" "${CASE_DIR}/dr/project-lane/work"
+  WORK_DIR="${CASE_DIR}/dr/project-lane/work"
+  local before
+  before="$(lane_listing)"
+  SAFE_DATA_DIR_FOR_CASE="${CASE_DIR}/dr" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0 --dry-run'
+  assert_status 100 "$FUNCNAME" || return
+  assert_lane_final_line install "$FUNCNAME" || return
+  assert_err_contains_fragment 'overlaps the project' "$FUNCNAME" || return
+  [[ "$(lane_listing)" == "${before}" ]] || { fail "$FUNCNAME: the project was written to"; return; }
+  [[ -z "$(ls -A "${CASE_DIR}/dr/project-lane" | grep -v '^work$')" ]] || { fail "$FUNCNAME: something was created beside the project in the lane's directory"; return; }
+  pass "$FUNCNAME"
+}
+
+# S3. The capability is READ from the selected npm's own definitions: the floor, and
+# every option the lane passes defined. One that merely echoes an option refuses.
+case_project_lane_capability_is_read_from_the_npms_definitions() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local json
+  for json in '{"version":"10.9.2","atFloor":false,"missing":["allow-git"]}' \
+      '{"version":"11.20.0","atFloor":true,"missing":["allow-git"]}' \
+      '{"version":"11.0.0","atFloor":false,"missing":[]}' \
+      '{"version":"11.20.0","atFloor":true}' 'not json'; do
+    lane_prepare "lane-capability-${RANDOM}" kept@1.0.0
+    : > "${LOG_FILE}"
+    NODE_CAPABILITY_JSON="${json}" lane_run 'npm install clean@2.0.0'
+    [[ "${STATUS}" -ne 0 ]] || { fail "$FUNCNAME: ${json} was accepted"; return; }
+    assert_lane_final_line install "$FUNCNAME: ${json}" || return
+    assert_log_not_contains_fragment 'PROJECTION' "$FUNCNAME" || return
+  done
+  lane_prepare "lane-capability-ok" kept@1.0.0
+  NODE_CAPABILITY_JSON='{"version":"11.12.1","atFloor":true,"missing":[]}' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# S4. One pair: the Node of the resolved npm's own installation; a launcher that
+# cannot be followed refuses; NODE_ENV is carried.
+case_project_lane_launcher_that_cannot_be_followed_refuses() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-launcher-no-cli" kept@1.0.0
+  rm -f "${NODE_DIR}/lib/node_modules/npm/bin/npm-cli.js"
+  lane_run 'npm install clean@2.0.0'
+  lane_unsupported_case "$FUNCNAME" install 'a launcher with no npm-cli.js' || return
+  assert_err_contains_fragment 'cannot be followed to its npm-cli.js' "$FUNCNAME" || return
+  lane_prepare "lane-launcher-no-node" kept@1.0.0
+  rm -f "${NODE_BIN}/node"
+  lane_run 'npm install clean@2.0.0'
+  lane_unsupported_case "$FUNCNAME" install 'a launcher with no node beside it' || return
+  # NODE_ENV reaches every run (it changes npm's default omission)
+  lane_prepare "lane-node-env" kept@1.0.0
+  : > "${HOME_DIR}/.stub-log-env"
+  NODE_ENV=production NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME" || return
+  [[ "$(grep '^ENVNAMES' "${LOG_FILE}" | grep -c 'NODE_ENV')" == "$(grep -c '^ENVNAMES' "${LOG_FILE}")" ]] || { fail "$FUNCNAME: NODE_ENV was not carried to every run"; return; }
+  pass "$FUNCNAME"
+}
+
+# S5. After the Go admission, the selected npm's own parser reads the same strings.
+case_project_lane_the_selected_npms_parser_must_agree() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-agreement" kept@1.0.0
+  local before
+  before="$(lane_digests)"
+  NODE_AGREEMENT_JSON='{"disagreements":[{"kind":"dep","name":"a","spec":"1.x"}]}' lane_run 'npm install clean@2.0.0'
+  lane_unsupported_case "$FUNCNAME" install 'a disagreement' || return
+  assert_err_contains_fragment "which npm's own parser does not read as a registry request" "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'PROJECTION' "$FUNCNAME" || return
+  assert_lane_untouched "${before}" "$FUNCNAME" || return
+  for json in 'garbage' '{"disagreements":"x"}'; do
+    : > "${LOG_FILE}"
+    NODE_AGREEMENT_JSON="${json}" lane_run 'npm install clean@2.0.0'
+    assert_status 100 "$FUNCNAME" || return
+    assert_lane_final_line install "$FUNCNAME" || return
+  done
+  pass "$FUNCNAME"
+}
+
+# 7. The documents the gate consumes, the rest of them; a committed lockfile that
+# cannot be parsed is missing evidence.
+case_project_lane_the_consumed_fields_of_every_document_are_checked() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local pair kind status before
+  for pair in 'bind-no-problems:100' 'bind-no-inputs-changed:100' 'graph-bound-contradiction:102' 'admit-bad-names:100'; do
+    kind="${pair%%:*}"
+    status="${pair##*:}"
+    lane_prepare "lane-consumed-${kind}" kept@1.0.0
+    before="$(lane_digests)"
+    : > "${LOG_FILE}"
+    SAFE_CORE_TAMPER="${kind}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+    assert_status "${status}" "$FUNCNAME: ${kind}" || return
+    assert_lane_final_line install "$FUNCNAME: ${kind}" || return
+    [[ "${kind}" == bind-* ]] || assert_lane_untouched "${before}" "$FUNCNAME: ${kind}" || return
+  done
+  # a committed lockfile that is not JSON: missing evidence, at the first step that meets it
+  lane_prepare "lane-unparsable-lock" kept@1.0.0
+  lane_lock kept@1.0.0 | head -c 60 > "${WORK_DIR}/package-lock.json"
+  lane_commit
+  before="$(lane_digests)"
+  lane_run 'npm install clean@2.0.0'
+  assert_status 102 "$FUNCNAME" || return
+  assert_lane_final_line install "$FUNCNAME" || return
+  assert_err_contains_fragment 'committed lockfile cannot be parsed' "$FUNCNAME" || return
+  assert_lane_untouched "${before}" "$FUNCNAME" || return
+  # the private check's result: a stream is not read for its detail
+  lane_prepare "lane-private-stream" kept@1.0.0
+  lane_private_store || { fail "$FUNCNAME: private store"; return; }
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_PRIVATE_MOCK_STATUS=20 SAFE_AUDIT_PRIVATE_MOCK_RESULT='{"private_registry":{"detail":"SECRET-DETAIL"}}{"private_registry":{"detail":"SECOND"}}' \
+    lane_run 'npm install clean@2.0.0'
+  assert_status 104 "$FUNCNAME" || return
+  assert_lane_final_line install "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'SECRET-DETAIL' "$FUNCNAME" || return
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_PRIVATE_MOCK_STATUS=20 SAFE_AUDIT_PRIVATE_MOCK_RESULT='{"private_registry":{"detail":"one-document-detail"}}' lane_run 'npm install clean@2.0.0'
+  assert_status 104 "$FUNCNAME" || return
+  assert_err_contains_fragment 'one-document-detail' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# 8. One renderer: bearer values, URL fragments, non-ASCII controls and a last line
+# without a newline.
+case_project_lane_one_renderer_for_every_child_diagnostic() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-renderer" kept@1.0.0
+  NPM_CI_DIAGNOSTIC=2 NPM_CI_STATUS=9 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 9 "$FUNCNAME" || return
+  assert_lane_final_line install "$FUNCNAME" || return
+  assert_err_contains_fragment 'npm error code E500' "$FUNCNAME" || return
+  assert_err_contains_fragment 'npm error last-line' "$FUNCNAME" || return
+  local secret
+  for secret in 'ghi123456' 'frag-secret' 'abc999'; do
+    assert_err_not_contains_fragment "${secret}" "$FUNCNAME" || return
+  done
+  ! LC_ALL=C grep -qP '\xc2[\x80-\x9f]' "${ERR_FILE}" || { fail "$FUNCNAME: a C1 control reached stderr"; return; }
+  pass "$FUNCNAME"
+}
+
+# 8. A signal to the shell in the window right after the binder starts is held
+# until the binder has finished, never ends the command with the child outstanding.
+case_project_lane_a_signal_in_the_window_after_spawn_is_held() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-signal-early" kept@1.0.0
+  SAFE_CORE_SIGNAL_EARLY=1 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" \
+    lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME" || return
+  [[ -f "${WORK_DIR}/node_modules/clean/package.json" ]] || { fail "$FUNCNAME: the binder did not finish"; return; }
+  assert_lane_no_leftover "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# After the projection, the decision runs before an unsupported edge refuses: a
+# known block outranks it.
+case_project_lane_a_known_block_outranks_an_unsupported_dependency_edge() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-edge-vs-block" kept@1.0.0
+  local before target
+  before="$(lane_digests)"
+  target="$(lane_lock kept@1.0.0 evil@1.0.0 | jq -c '.packages["node_modules/kept"].dependencies = {"sneaky": "github:user/repo"}')"
+  NPM_LOCK_MUTATION_JSON="${target}" SAFE_AUDIT_EVIDENCE_HITS='{"evil@1.0.0":[{"id":"MAL-2026-0009","severity":"critical","malware":true}]}' \
+    lane_run 'npm install evil@1.0.0'
+  assert_status 104 "$FUNCNAME" || return
+  assert_err_contains_fragment 'known-malware record on evil@1.0.0' "$FUNCNAME" || return
+  assert_lane_untouched "${before}" "$FUNCNAME" || return
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="${target}" lane_run 'npm install evil@1.0.0'
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'lockfile[node_modules/kept].dependencies.sneaky' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -9287,6 +9651,7 @@ main() {
     case_project_lane_projection_failure_stays_npms \
     case_project_lane_guards_refuse_in_the_lane_form \
     case_project_lane_private_refusal_keeps_its_status \
+    case_project_lane_project_touching_the_private_store_refuses_before_the_auditor \
     case_project_lane_inherited_runner_state_is_discarded \
     case_project_lane_redirected_configuration_does_not_enable_the_lane \
     case_project_lane_large_graph_reaches_a_verdict \
@@ -9302,6 +9667,15 @@ main() {
     case_project_lane_selection_comes_from_the_selected_node_exactly \
     case_project_lane_frozen_diagnostics_are_cleaned_and_npms_status_kept \
     case_project_lane_signal_to_the_shell_is_forwarded_and_the_report_still_arrives \
+    case_project_lane_project_npmrc_is_admitted_as_text_before_any_npm_run \
+    case_project_lane_every_npm_command_line_fixes_its_destinations \
+    case_project_lane_capability_is_read_from_the_npms_definitions \
+    case_project_lane_launcher_that_cannot_be_followed_refuses \
+    case_project_lane_the_selected_npms_parser_must_agree \
+    case_project_lane_the_consumed_fields_of_every_document_are_checked \
+    case_project_lane_one_renderer_for_every_child_diagnostic \
+    case_project_lane_a_signal_in_the_window_after_spawn_is_held \
+    case_project_lane_a_known_block_outranks_an_unsupported_dependency_edge \
     case_npm_lockdiff_refuses_bare_option_terminator \
     case_npm_lockdiff_effective_config_oracle \
     case_npm_lockdiff_refuses_nonregistry_sources \

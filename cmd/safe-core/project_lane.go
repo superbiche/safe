@@ -274,7 +274,7 @@ func repeatedMembers(args []string, stdin io.Reader, stdout, stderr io.Writer) i
 	return 0
 }
 
-const projectAdmitUsage = "safe-core: usage: safe-core project-admit [--arg <package-arg>]... [--manifest <file>] [--lockfile <file>] [--config <effective-config.json>]\n" +
+const projectAdmitUsage = "safe-core: usage: safe-core project-admit [--arg <package-arg>]... [--manifest <file>] [--lockfile <file>] [--npmrc <file>] [--config <effective-config.json>]\n" +
 	"       safe-core project-admit --classify < NUL-separated-specs"
 
 // projectAdmit checks that every source a command names is a registry package,
@@ -292,7 +292,9 @@ func projectAdmit(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		switch args[i] {
 		case "--classify":
 			classify = true
-		case "--arg", "--manifest", "--lockfile", "--config":
+		case "--registries-only":
+			in.RegistriesOnly = true
+		case "--arg", "--manifest", "--lockfile", "--config", "--npmrc":
 			if i+1 >= len(args) || args[i+1] == "" {
 				fmt.Fprintln(stderr, projectAdmitUsage)
 				return 2
@@ -308,6 +310,8 @@ func projectAdmit(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 				in.LockfileFile = value
 			case "--config":
 				in.ConfigFile = value
+			case "--npmrc":
+				in.NpmrcFile = value
 			}
 		default:
 			fmt.Fprintln(stderr, projectAdmitUsage)
@@ -325,11 +329,15 @@ func projectAdmit(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 			Spec  string `json:"spec"`
 			Arg   string `json:"arg"`
 			Exact bool   `json:"exact"`
+			Name  bool   `json:"name"`
+			Key   bool   `json:"override_key"`
 		}
 		rows := []row{}
 		for _, text := range strings.Split(strings.TrimSuffix(string(raw), "\x00"), "\x00") {
 			argClass, _, _ := projectlane.ClassifyArg(text)
-			rows = append(rows, row{text, projectlane.ClassifySpec(text), argClass, projectlane.ExactArg(text)})
+			keyClass, keyName, _ := projectlane.ClassifyArg(text)
+			rows = append(rows, row{text, projectlane.ClassifySpec(text), argClass, projectlane.ExactArg(text),
+				projectlane.ValidPackageName(text), keyName != "" && projectlane.IsRegistry(keyClass)})
 		}
 		return printJSON(stdout, "project-admit", stderr, rows)
 	}

@@ -75,7 +75,11 @@ python3 -I - "${ROOT}/tests/fixtures/admit-spellings.txt" > "${WORK}/spellings.b
 import sys
 rows = [l.rstrip("\n") for l in open(sys.argv[1], encoding="utf-8")]
 out = []
-for r in rows:
+names = ["a", "A", "a-b", "a.b", "a_b", ".a", "_a", "a b", " a", "a ", "@s/a", "@s/.a", "@s/_a", "@s/-a", "-a", "@-s/a", "@s/", "@/a", "@s/a/b", "a/b", "node_modules", "favicon.ico",
+         "a~b", "a'b", "a(b)", "a*b", "a!b", "a%b", "a@b", "é", "x" * 214, "x" * 215, "@" + "s" * 100 + "/" + "a" * 100,
+         "a@^1", "a@1.x", "@s/a@1.2.3", "a@npm:b@1", "a@file:../x", "a@git+https://x/y.git", "x.tgz", "x.TGZ@1", "a@1.2.3-x.tgz",
+         "^9007199254740991.0.0", "^9007199254740990.0.0", "~9007199254740991.0.0", ">=9007199254740991.0.0", "9007199254740991.0.0"]
+for r in rows + names:
     out += [r, r.upper(), "x@" + r, "@s/x@" + r, "1.2.3-" + r, r + ".tgz", r + ".TAR.GZ", "v" + r]
 seen = []
 for r in out:
@@ -89,6 +93,7 @@ PY
 cat > "${WORK}/oracle.cjs" <<'JS'
 const fs = require('fs')
 const npa = require(process.argv[2] + '/node_modules/npm-package-arg')
+const validate = require(process.argv[2] + '/node_modules/validate-npm-package-name')
 const rows = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'))
 const registry = new Set(['version', 'range', 'tag'])
 const out = []
@@ -97,7 +102,13 @@ for (const row of rows) {
   let spec, arg
   try { const r = npa.resolve('x', s, '/tmp/w'); spec = r.type } catch { spec = 'error' }
   try { const r = npa(s, '/tmp/w'); arg = r.registry && r.name ? r.type : (r.type || 'other') } catch { arg = 'error' }
-  out.push({ raw: s, spec, arg, ours: row.spec, ourArg: row.arg, exact: row.exact })
+  // names: the old-package rule npm applies to the name part of a dependency
+  let name = false
+  try { name = !!validate(s).validForOldPackages } catch { name = false }
+  // override selectors: Arborist parses the whole key with npa and needs a name
+  let key = false
+  try { const r = npa(s, '/tmp/w'); key = !!(r.name && r.registry && registry.has(r.type)) } catch { key = false }
+  out.push({ raw: s, spec, arg, ours: row.spec, ourArg: row.arg, exact: row.exact, name, ourName: row.name, key, ourKey: row.override_key })
 }
 process.stdout.write(JSON.stringify(out))
 JS
@@ -125,6 +136,78 @@ if [[ "${wrong}" == "[]" ]]; then
 else
   fail "exact arguments that npm does not read as a version: $(jq -c '.[0:8] | map({raw, arg})' <<<"${wrong}")"
 fi
+# Names and override selectors: never admitted when npm does not take them.
+wrong="$(jq -c '[.[] | select(.ourName == true and .name == false)]' "${WORK}/both.json")"
+if [[ "${wrong}" == "[]" ]]; then
+  pass "no package name is admitted that npm's validate-npm-package-name refuses"
+else
+  fail "names admitted that npm refuses: $(jq -c '.[0:8] | map(.raw)' <<<"${wrong}")"
+fi
+wrong="$(jq -c '[.[] | select(.ourKey == true and .key == false)]' "${WORK}/both.json")"
+if [[ "${wrong}" == "[]" ]]; then
+  pass "no override selector is admitted that npm's parser does not read as a named registry package"
+else
+  fail "override selectors admitted that npm does not read so: $(jq -c '.[0:8] | map(.raw)' <<<"${wrong}")"
+fi
 refused="$(jq '[.[] | select(.ours == "invalid" and (.spec | IN("version","range","tag")))] | length' "${WORK}/both.json")"
 printf '# safe refuses %s of %s spellings that npm takes for the registry (loose or non-ASCII forms)\n' "${refused}" "${total}"
+# --- the probe script the gate runs with the selected node (capability, selection,
+# agreement), against this npm's own modules ---------------------------------------
+probe="${WORK}/lane-probe.cjs"
+GATE_LIB="${ROOT}/lib/gate-lib.sh" bash -c 'source "$GATE_LIB"; safe_gate_lane_write_probe_script "$1"' _ "${probe}" || { fail "the probe script is written"; exit 1; }
+run_probe() { # <npm dir> <mode> <json>
+  printf '%s' "$3" | "${node_bin}" "${probe}" "$1" "$2"
+}
+opts='["allow-git","git","replace-registry-host","cache","logs-dir","logs-max"]'
+out="$(run_probe "${npm_dir}" capability "{\"floor\":\"11.12.1\",\"options\":${opts}}")"
+if jq -e '.atFloor == true and (.missing | length) == 0' <<<"${out}" >/dev/null 2>&1; then
+  pass "capability: this npm ($(jq -r .version <<<"${out}")) is at the floor and defines every option the lane passes"
+else
+  fail "capability on this npm: ${out}"
+fi
+old_npm=""
+for d in "$(cd "${npm_dir}/../../../.." 2>/dev/null && pwd)"/*/lib/node_modules/npm; do
+  [[ -f "${d}/package.json" ]] && grep -q '"version": "10\.' "${d}/package.json" && { old_npm="${d}"; break; }
+done
+if [[ -n "${old_npm}" && -d "${old_npm}" ]]; then
+  out="$(run_probe "${old_npm}" capability "{\"floor\":\"11.12.1\",\"options\":${opts}}")"
+  if jq -e '.atFloor == false and (.missing | index("allow-git"))' <<<"${out}" >/dev/null 2>&1; then
+    pass "capability: npm $(jq -r .version <<<"${out}") is refused: below the floor and it does not define allow-git (though it echoes it)"
+  else
+    fail "capability on the older npm: ${out}"
+  fi
+else
+  printf '# note: no older npm installed to show the refusal on\n'
+fi
+out="$(run_probe "${npm_dir}" selection '{"config":{"os":"darwin","cpu":null,"libc":null,"omit":["dev","optional"],"include":["optional"]}}')"
+if jq -e '.os == "darwin" and .libc == null and .omit == ["dev"]' <<<"${out}" >/dev/null 2>&1; then
+  pass "selection: libc is judged against the effective os (none for darwin), include removes an omission"
+else
+  fail "selection with os=darwin: ${out}"
+fi
+out="$(run_probe "${npm_dir}" selection '{"config":{"os":null,"cpu":null,"libc":null,"omit":[],"include":[]}}')"
+if jq -e --arg os "$("${node_bin}" -p 'process.platform')" --arg cpu "$("${node_bin}" -p 'process.arch')" '.os == $os and .cpu == $cpu' <<<"${out}" >/dev/null 2>&1; then
+  pass "selection: without settings, the selected node's own platform"
+else
+  fail "selection without settings: ${out}"
+fi
+# agreement: what project-admit admits, npm's own parsers read the same way
+cat > "${WORK}/m.json" <<'JSON'
+{"name":"p","dependencies":{"a":"^1.0.0","b":"latest","@s/c":"1.2.3 - 2"},"devDependencies":{"d":"~1.2.3"},
+ "overrides":{"a":"1.2.3","b@^2":{".":"2.0.0","e":{"f":"$a"}}}}
+JSON
+"${WORK}/safe-core" project-admit --arg foo@1.2.3 --manifest "${WORK}/m.json" > "${WORK}/admit.json"
+out="$(run_probe "${npm_dir}" agreement "$(jq -c '{checked}' "${WORK}/admit.json")")"
+if jq -e '.disagreements == [] and (.disagreements | type == "array")' <<<"${out}" >/dev/null 2>&1 && jq -e '[.checked[].kind] | unique | length >= 4' "${WORK}/admit.json" >/dev/null; then
+  pass "agreement: npm's parsers read every admitted string ($(jq '.checked | length' "${WORK}/admit.json")) as a registry request"
+else
+  fail "agreement on an admitted manifest: ${out}"
+fi
+out="$(run_probe "${npm_dir}" agreement '{"checked":[{"kind":"dep","name":"a","spec":"git+https://example.invalid/x.git"},{"kind":"arg","name":"","spec":"foo@^1"},{"kind":"override-key","name":"","spec":"x.tgz"},{"kind":"name","name":".a","spec":""}]}')"
+if [[ "$(jq '.disagreements | length' <<<"${out}")" == "4" ]]; then
+  pass "agreement: npm's parsers refuse a git dependency, a range as an exact argument, an unnamed selector and a bad name"
+else
+  fail "agreement on refused strings: ${out}"
+fi
+
 exit "${FAILED}"

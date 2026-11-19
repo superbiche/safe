@@ -243,43 +243,74 @@ pass and warnings under `environment.release_follow`.
   configuration says is global is not the lane's. `--dry-run` runs the decision
   and the report and writes nothing. Each decision report is kept under
   `project-lane/reports` in safe's data directory. Spec: Safe Lanes slice 1.
+  **The project's own `.npmrc`** is read by safe, as text, before any npm runs in
+  the project's context (a special file or a link there refuses first). It is
+  admitted against a short allow-list, and anything else refuses naming the
+  setting (never its value): `save-exact`, `engine-strict`, `fund`, `audit`,
+  `update-notifier` and `progress` (`true` or `false`), `save-prefix` (`^`, `~` or
+  empty), `loglevel` (npm's levels), `registry` and `@scope:registry` (exactly
+  `https://registry.npmjs.org/`). The reader takes the ini subset npm writes (one
+  `key=value` per line, `;` and `#` comments, blank lines): a section,
+  interpolation (`${`), a continuation, a quote or an inline comment, a repeated
+  setting, a byte-order mark or a line it cannot parse refuses. Not admitted, among
+  others: cache, logs, prefix, location, global, any other registry, authentication,
+  proxy and certificate settings, script and git settings, release-age settings,
+  workspaces, and the package-lock and dry-run switches.
   **One runtime, one environment.** The lane resolves, once and in the project's
-  context, the Node and the npm the gate's delegate would run there (behind a
-  version manager's shim, the real manager is asked, `mise which`), and runs that
-  pair directly for every probe, the projection and the frozen install, from the
-  project, a scratch directory and the binder's staging directory alike; nothing
-  is resolved again. Every one of those runs gets exactly this environment and
-  nothing else of the caller's: `PATH` (the selected node's directory, then
-  `/usr/local/bin:/usr/bin:/bin`); `HOME`, `USER`, `LOGNAME`, `LANG`, `LANGUAGE`,
-  `LC_*`, `TZ`, `TMPDIR` (where npm finds its configuration and cache, and the
-  locale); `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`; `HTTP_PROXY`,
-  `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY` and their lower-case spellings (how npm
-  reaches the registry); every `npm_config_*` setting except the script policy,
-  `git`, `allow-git` and `node-options`, which the lane sets itself (so npm reads
-  the same configuration in every phase, and the parity probes compare it); and
-  `NODE_OPTIONS` only when it carries `--max-old-space-size`,
-  `--max-http-header-size`, `--stack-trace-limit` or `--no-warnings`. A Node
-  option that would load code (`--require`, `--import`, a loader, an inspector)
-  cannot be carried, and the command refuses. `MISE_*`, `NODE_*`, `SAFE_*`,
-  `BASH_ENV`, `LD_*`, `SSH_AUTH_SOCK`, `CI` and the rest are dropped. The lock
-  descriptor is closed in every child. Nothing is written into the project before
-  publication: npm's cache and logs must lie outside it, safe's data directory and
-  the temporary directory must too, the lane's own storage is private (and not a
-  link) before it is used, the committed-lockfile comparison reads the git objects
-  with replacement refs disabled, and a project `.npmrc` that is not a regular file
-  refuses before any npm runs. Sources are admitted by npm's own classification
-  (`safe-core project-admit`, tested against npm's classifier): command arguments
-  (`name@x.y.z` exactly), manifest ranges, typed overrides and the dependency edges
-  the committed lockfile carries must be registry packages; a scope mapped to the
-  canonical public registry is accepted, a scope (or the configured default scope)
-  mapped elsewhere refuses when a package of the judged graph, one first found by
-  the projection included, belongs to it; and the delegated npm must show it honours
-  `--allow-git=none` and `--git` before anything is projected. The platform of the
-  materialisation (os, cpu, libc) is read from the selected Node runtime with npm's
-  own module, exactly; a setting of npm's own wins. Everything npm, the binder or the
-  project prints is cleaned (control characters, credentials in URLs and query
-  strings) at the lane's boundary; npm's exit status is kept; a signal to the shell
-  is forwarded to the binder, whose report still reaches the operator.
+  context, the npm the gate's delegate would run there (behind a version manager's
+  shim, the real manager is asked, `mise which npm`), and takes the Node and the
+  `npm-cli.js` of that npm's own installation (the Node beside its launcher): a
+  launcher the lane cannot follow to both refuses. That pair is run directly for
+  every probe, the projection and the frozen install, from the project, a scratch
+  directory and the binder's staging directory alike; nothing is resolved again.
+  Every one of those runs gets exactly this environment and nothing else of the
+  caller's: `PATH` (the Node's directory, then `/usr/local/bin:/usr/bin:/bin`);
+  `HOME`, `USER`, `LOGNAME`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `TMPDIR` (where npm
+  finds its configuration, and the locale); `NODE_ENV` (npm's default omission of
+  development dependencies follows it); `SSL_CERT_FILE`, `SSL_CERT_DIR`,
+  `NODE_EXTRA_CA_CERTS`; `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY` and
+  their lower-case spellings (how npm reaches the registry); every `npm_config_*`
+  setting except the script policy, `git`, `allow-git` and `node-options`, which the
+  lane sets itself (so npm reads the same configuration in every phase, and the
+  parity probes compare it); and `NODE_OPTIONS` only when it carries
+  `--max-old-space-size`, `--max-http-header-size`, `--stack-trace-limit` or
+  `--no-warnings`. A Node option that would load code (`--require`, `--import`, a
+  loader, an inspector) cannot be carried, and the command refuses. `MISE_*`,
+  `NODE_*`, `SAFE_*`, `BASH_ENV`, `LD_*`, `SSH_AUTH_SOCK`, `CI` and the rest are
+  dropped. The lock descriptor is closed in every child.
+  **Nothing is written into the project before publication.** Every npm command of
+  the lane carries an explicit cache and log destination in safe's own private
+  directory (`project-lane/npm-cache`, `npm-logs`, under the data directory) and
+  `--replace-registry-host=never`, so a resolved location is fetched as written. The
+  operator-level destinations found in the environment (`npm_config_cache`, logs,
+  prefix, user and global configuration, in either case) are checked as strings,
+  without npm, and one that lies inside the project refuses. safe's data directory
+  and the temporary directory must not overlap the project in either direction, the
+  lane's directories are private and not links before they are used, the committed
+  lockfile comparison reads the git objects with replacement refs disabled, and
+  every copy is verified. **Admission** is npm's own classification: in Go
+  (`safe-core project-admit`, checked against npm's classifier by
+  `tests/live/npm_spec_oracle.sh`) and then again by the selected npm's own
+  `npm-package-arg` and `validate-npm-package-name`, over the same strings: command
+  arguments (`name@x.y.z` exactly), manifest ranges, typed overrides, and the
+  dependency edges of the committed lockfile must be registry packages, or the
+  command refuses. A scope mapped to the canonical public registry is accepted; a
+  scope (or the configured default scope) mapped elsewhere refuses when a package of
+  the judged graph, one first found by the projection included, belongs to it.
+  **Capability:** the npm must be at least 11.12.1 (the oldest release found to
+  define `allow-git`) and its own definitions module must define every option the
+  lane passes (`allow-git`, `git`, `replace-registry-host`, `cache`, `logs-dir`,
+  `logs-max`); an npm that merely echoes an option in its configuration listing
+  (10.9.2 does) refuses. **Selection:** omissions, os, cpu and libc are computed
+  once, by the selected Node with npm's own modules over npm's effective settings
+  (libc judged against the effective os), and passed as one checked document. A
+  project that touches an entry of a non-empty private-registry store refuses before
+  the private check runs (trusted private origins are not supported yet); otherwise
+  that check runs with the lane's launcher first on its `PATH`. Everything npm, the
+  binder or the project prints is cleaned (control characters, bearer and basic
+  authorisation, credentials in URLs, queries and fragments) at the lane's boundary,
+  the last partial line included; npm's exit status is kept; a signal to the shell,
+  from before the binder starts until its report is delivered, is forwarded to it.
 - `reuse.enabled`: per-host rule for `safe install --reuse` (default `false`).
   `true` lets the reuse of an installed `vendor/` or `node_modules/` from
   another checkout of the same repository run unattended, agents included; reuse runs no audit, and its

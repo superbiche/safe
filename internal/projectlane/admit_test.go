@@ -2,6 +2,7 @@ package projectlane
 
 import (
 	"bufio"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -181,5 +182,113 @@ func TestSpellingsFixtureIsClassifiable(t *testing.T) {
 	}
 	if rows < 100 {
 		t.Fatalf("the spellings table has %d rows", rows)
+	}
+}
+
+func TestAdmitNpmrcAllowList(t *testing.T) {
+	good := "; a comment\n# another\n\nsave-exact=true\nsave-prefix=~\nengine-strict=false\nfund=false\naudit=false\nupdate-notifier=false\nloglevel=warn\nprogress=false\nregistry=https://registry.npmjs.org/\n@scope:registry=https://registry.npmjs.org/\n"
+	if got := AdmitNpmrc([]byte(good)); len(got) != 0 {
+		t.Fatalf("the allow-list refused itself: %+v", got)
+	}
+	bad := map[string]string{
+		"cache":             "cache=./.npm\n",
+		"logs":              "logs-dir=/tmp/x\n",
+		"prefix":            "prefix=/tmp/x\n",
+		"location":          "location=global\n",
+		"global":            "global=true\n",
+		"other registry":    "registry=https://npm.private.example/\n",
+		"http registry":     "registry=http://registry.npmjs.org/\n",
+		"scoped elsewhere":  "@p:registry=https://npm.private.example/\n",
+		"scoped credential": "@p:registry=https://user:hunter2@npm.private.example/\n",
+		"auth":              "//registry.npmjs.org/:_authToken=abc\n",
+		"proxy":             "proxy=http://p\n",
+		"https-proxy":       "https-proxy=http://p\n",
+		"cafile":            "cafile=/x\n",
+		"strict-ssl":        "strict-ssl=false\n",
+		"script-shell":      "script-shell=/bin/x\n",
+		"git":               "git=/bin/git\n",
+		"allow-git":         "allow-git=all\n",
+		"min-release-age":   "min-release-age=3\n",
+		"before":            "before=2020-01-01\n",
+		"workspaces":        "workspaces=true\n",
+		"package-lock":      "package-lock=false\n",
+		"package-lock-only": "package-lock-only=true\n",
+		"dry-run":           "dry-run=true\n",
+		"ignore-scripts":    "ignore-scripts=false\n",
+		"section":           "[section]\nsave-exact=true\n",
+		"interpolation":     "registry=${REG}\n",
+		"continuation":      "loglevel=warn\\\n",
+		"duplicate":         "fund=true\nfund=false\n",
+		"no equals":         "fund\n",
+		"quoted":            "loglevel=\"warn\"\n",
+		"inline comment":    "fund=false ; no\n",
+		"bad bool":          "fund=maybe\n",
+		"bad prefix":        "save-prefix=>=\n",
+		"bad level":         "loglevel=loud\n",
+		"array":             "fund[]=true\n",
+		"bom":               "\xef\xbb\xbffund=true\n",
+		"crlf":              "fund=true\r\n",
+		"nul":               "fund=true\x00\n",
+		"invalid utf8":      "fund=\xff\n",
+		"upper key":         "Fund=true\n",
+	}
+	for name, text := range bad {
+		got := AdmitNpmrc([]byte(text))
+		if len(got) == 0 {
+			t.Errorf("%s: admitted", name)
+			continue
+		}
+		for _, r := range got {
+			if strings.Contains(r.Text, "hunter2") || strings.Contains(r.Reason, "hunter2") {
+				t.Errorf("%s: a credential in the refusal %+v", name, r)
+			}
+		}
+	}
+}
+
+func TestAdmitNpmrcThroughTheDocument(t *testing.T) {
+	file := writeAdmitFile(t, ".npmrc", "@p:registry=https://user:hunter2@npm.private.example/\n")
+	got, err := Admit(AdmitInput{NpmrcFile: file})
+	if err != nil || got.Ok || len(got.Refusals) != 1 {
+		t.Fatalf("got %+v err=%v", got, err)
+	}
+	raw, _ := json.Marshal(got)
+	if strings.Contains(string(raw), "hunter2") {
+		t.Fatalf("the document carries the credential: %s", raw)
+	}
+}
+
+func TestOverridesAndNamesLikeNpm(t *testing.T) {
+	cases := map[string]bool{
+		`{"overrides":{"a":"1.0.0"}}`:                             true,
+		`{"overrides":{"a@^1":{".":"1.2.3","b":"$a"}}}`:           true,
+		`{"overrides":{"@s/a@1.x":"1.0.0"}}`:                      true,
+		`{"overrides":{"a":{".":{"x":"1.0.0"}}}}`:                 false, // a self-override that is an object
+		`{"overrides":{"x.tgz":"1.0.0"}}`:                         false, // an archive-suffixed selector has no package name
+		`{"overrides":{"a@file:../x":"1.0.0"}}`:                   false,
+		`{"overrides":{"a@npm:b@1":"1.0.0"}}`:                     false,
+		`{"overrides":{"@s/.sample":"1.0.0"}}`:                    false,
+		`{"dependencies":{"@s/.sample":"1.0.0"}}`:                 false,
+		`{"dependencies":{"a":"^9007199254740991.0.0"}}`:          false, // npm: invalid tag name
+		`{"dependencies":{"a":"9007199254740991.0.0"}}`:           true,
+		`{"dependencies":{"a":">=9007199254740990.0.0"}}`:         true,
+		`{"dependencies":{"a":"~9007199254740991.0.0"}}`:          true, // npm reads it as a dist-tag named so
+		`{"overrides":{"a":"git+https://example.invalid/x.git"}}`: false,
+	}
+	for body, want := range cases {
+		got, err := Admit(AdmitInput{ManifestFile: writeAdmitFile(t, "package.json", body)})
+		if err != nil || got.Ok != want {
+			t.Errorf("%s: ok=%v want %v (%+v err=%v)", body, got.Ok, want, got.Refusals, err)
+		}
+	}
+	got, _ := Admit(AdmitInput{Args: []string{"foo@1.2.3"}, ManifestFile: writeAdmitFile(t, "package.json", `{"dependencies":{"a":"^1.0.0"},"overrides":{"b@2":"2.0.0"}}`)})
+	kinds := map[string]bool{}
+	for _, c := range got.Checked {
+		kinds[c.Kind] = true
+	}
+	for _, kind := range []string{"arg", "dep", "name", "override-key", "override-value"} {
+		if !kinds[kind] {
+			t.Errorf("the document does not list %s among what it checked: %+v", kind, got.Checked)
+		}
 	}
 }

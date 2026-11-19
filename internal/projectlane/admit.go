@@ -34,7 +34,7 @@ const (
 	ClassGit       = "git"
 	ClassRemote    = "remote"
 	ClassInvalid   = "invalid"
-	maxSafeInteger = 9007199254740991
+	maxSafeInteger = uint64(9007199254740991)
 )
 
 var (
@@ -76,13 +76,14 @@ func trimASCII(s string) string { return strings.Trim(s, " \t\n\v\f\r") }
 // withinSafeInteger reports whether every digit run in the text is a number
 // semver would accept (at most MAX_SAFE_INTEGER): an oversized component makes
 // npm read the spelling as a tag, never as a version or a range.
-func withinSafeInteger(s string) bool {
+func withinSafeInteger(s string) bool { return withinLimit(s, maxSafeInteger) }
+
+// withinLimit reports whether every digit run is at most limit.
+func withinLimit(s string, limit uint64) bool {
+	max := fmt.Sprint(limit)
 	for _, run := range regexp.MustCompile(`[0-9]+`).FindAllString(s, -1) {
 		trimmed := strings.TrimLeft(run, "0")
-		if len(trimmed) > 16 {
-			return false
-		}
-		if len(trimmed) == 16 && trimmed > fmt.Sprint(maxSafeInteger) {
+		if len(trimmed) > len(max) || (len(trimmed) == len(max) && trimmed > max) {
 			return false
 		}
 	}
@@ -117,7 +118,7 @@ func strictRange(raw string) bool {
 			continue // the empty set is "any version"
 		}
 		if reHyphen.MatchString(set) {
-			if !withinSafeInteger(set) {
+			if !withinLimit(set, maxSafeInteger-1) {
 				return false
 			}
 			continue
@@ -132,7 +133,9 @@ func strictRange(raw string) bool {
 			if !(reComparator.MatchString(comparator) || reTilde.MatchString(comparator) || reCaret.MatchString(comparator)) {
 				return false
 			}
-			if !withinSafeInteger(comparator) {
+			// a caret, tilde or x-range computes an upper bound one above its
+			// largest component, which semver rejects past MAX_SAFE_INTEGER
+			if !withinLimit(comparator, maxSafeInteger-1) {
 				return false
 			}
 		}
@@ -161,7 +164,7 @@ func ValidPackageName(name string) bool {
 	if name == "" || len(name) > 214 || !isASCII(name) || name != trimASCII(name) {
 		return false
 	}
-	if name[0] == '.' || name[0] == '_' {
+	if name[0] == '.' || name[0] == '_' || name[0] == '-' {
 		return false
 	}
 	switch strings.ToLower(name) {
@@ -173,7 +176,9 @@ func ValidPackageName(name string) bool {
 	}
 	if name[0] == '@' {
 		scope, pkg, ok := strings.Cut(name[1:], "/")
-		return ok && scope != "" && pkg != "" && !strings.Contains(pkg, "/") && tagSafe(scope) && tagSafe(pkg)
+		// the package half of a scoped name follows the same leading rules
+		return ok && scope != "" && pkg != "" && !strings.Contains(pkg, "/") && tagSafe(scope) && tagSafe(pkg) &&
+			pkg[0] != '.' && pkg[0] != '_' && pkg[0] != '-'
 	}
 	return false
 }
@@ -289,6 +294,17 @@ type Admission struct {
 	// Names are the distinct package names the checked inputs carry, which the
 	// registry rules were applied to.
 	Names []string `json:"names"`
+	// Checked are the strings admission took for registry requests, exactly as
+	// it read them, so that the selected npm's own parser can be asked about the
+	// same ones (kind: arg, dep, override-key, override-value, name).
+	Checked []Checked `json:"checked"`
+}
+
+// Checked is one string admission admitted.
+type Checked struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+	Spec string `json:"spec"`
 }
 
 // AdmitInput is what one admission reads. Every part is optional.
@@ -297,6 +313,11 @@ type AdmitInput struct {
 	ManifestFile string
 	LockfileFile string
 	ConfigFile   string
+	NpmrcFile    string
+	// RegistriesOnly skips the classification of dependency specs and applies
+	// only the registry rules to the names found (the projected lockfile, before
+	// public evidence is asked for anything).
+	RegistriesOnly bool
 }
 
 // CanonicalRegistry is the one registry the lane supports.
@@ -306,7 +327,15 @@ const CanonicalRegistry = "https://registry.npmjs.org/"
 // typed overrides), the lockfile's dependency edges and the registry rules on
 // every package name found.
 func Admit(in AdmitInput) (Admission, error) {
-	result := Admission{SchemaVersion: AdmitSchema, Refusals: []Refusal{}, Names: []string{}}
+	result := Admission{SchemaVersion: AdmitSchema, Refusals: []Refusal{}, Names: []string{}, Checked: []Checked{}}
+	seenChecked := map[Checked]bool{}
+	note := func(kind, name, spec string) {
+		c := Checked{kind, name, spec}
+		if !seenChecked[c] {
+			seenChecked[c] = true
+			result.Checked = append(result.Checked, c)
+		}
+	}
 	names := map[string]struct{}{}
 	refuse := func(where, text, reason string) {
 		result.Refusals = append(result.Refusals, Refusal{Where: where, Text: text, Reason: reason})
@@ -324,6 +353,7 @@ func Admit(in AdmitInput) (Admission, error) {
 		}
 		_, name, _ := ClassifyArg(arg)
 		addName(name)
+		note("arg", "", arg)
 	}
 
 	if in.ManifestFile != "" {
@@ -358,7 +388,7 @@ func Admit(in AdmitInput) (Admission, error) {
 					refuse(where, "", "a dependency spec that is not a string")
 					continue
 				}
-				checkDep(where, name, text, refuse, addName)
+				checkDep(where, name, text, refuse, addName, note)
 			}
 		}
 		if value, ok := manifest["overrides"]; ok && string(value) != "null" {
@@ -366,7 +396,7 @@ func Admit(in AdmitInput) (Admission, error) {
 			if err := json.Unmarshal(value, &overrides); err != nil {
 				return result, fmt.Errorf("manifest: overrides: %w", err)
 			}
-			walkOverrides("manifest.overrides", overrides, 0, refuse, addName)
+			walkOverrides("manifest.overrides", overrides, "", 0, refuse, addName, note)
 		}
 	}
 
@@ -408,14 +438,30 @@ func Admit(in AdmitInput) (Admission, error) {
 				"optionalDependencies": entry.OptionalDependencies, "peerDependencies": entry.PeerDependencies} {
 				for _, name := range sortedStringKeys(deps) {
 					where := fmt.Sprintf("lockfile[%s].%s.%s", path, kind, name)
+					if in.RegistriesOnly {
+						if ValidPackageName(name) {
+							addName(name)
+						}
+						continue
+					}
 					text, isString := deps[name].(string)
 					if !isString {
 						refuse(where, "", "a dependency spec that is not a string")
 						continue
 					}
-					checkDep(where, name, text, refuse, addName)
+					checkDep(where, name, text, refuse, addName, note)
 				}
 			}
+		}
+	}
+
+	if in.NpmrcFile != "" {
+		raw, err := os.ReadFile(in.NpmrcFile)
+		if err != nil {
+			return result, err
+		}
+		for _, refusal := range AdmitNpmrc(raw) {
+			refuse(refusal.Where, refusal.Text, refusal.Reason)
 		}
 	}
 
@@ -449,7 +495,7 @@ func sortedStringKeys[V any](m map[string]V) []string {
 	return keys
 }
 
-func checkDep(where, name, spec string, refuse func(w, t, r string), addName func(string)) {
+func checkDep(where, name, spec string, refuse func(w, t, r string), addName func(string), note func(k, n, s string)) {
 	if !ValidPackageName(name) {
 		refuse(where, name, "a dependency name that is not a registry package name")
 		return
@@ -457,13 +503,18 @@ func checkDep(where, name, spec string, refuse func(w, t, r string), addName fun
 	addName(name)
 	if class := ClassifySpec(spec); !IsRegistry(class) {
 		refuse(where, spec, "a dependency that is not a registry package ("+class+")")
+		return
 	}
+	note("name", name, "")
+	note("dep", name, spec)
 }
 
-// walkOverrides checks an overrides tree as npm reads it: keys are selectors
-// (`name`, `name@range`, `.` inside an object), values are a spec, a `$name`
-// reference, or a nested object; anything else is not typed overrides.
-func walkOverrides(where string, node any, depth int, refuse func(w, t, r string), addName func(string)) {
+// walkOverrides checks an overrides tree as npm's Arborist reads it: an object
+// whose keys are selectors (npm-package-arg must read each as a registry
+// package with a name) and whose values are a spec string, a `$name` reference
+// or a nested object; the `.` key of an object holds the string that overrides
+// the object's own selector. Anything else is not typed overrides.
+func walkOverrides(where string, node any, parentName string, depth int, refuse func(w, t, r string), addName func(string), note func(k, n, s string)) {
 	if depth > 32 {
 		refuse(where, "", "overrides nested too deeply")
 		return
@@ -475,25 +526,16 @@ func walkOverrides(where string, node any, depth int, refuse func(w, t, r string
 	}
 	for _, key := range sortedStringKeys(object) {
 		keyWhere := where + "." + key
-		selectorName := ""
+		name := parentName
 		if key != "." {
-			sel := key
-			rangePart := ""
-			hasRange := false
-			if i := strings.Index(sel[min(1, len(sel)):], "@"); i >= 0 {
-				i++
-				sel, rangePart, hasRange = key[:i], key[i+1:], true
-			}
-			if !ValidPackageName(sel) {
+			class, selector, _ := ClassifyArg(key)
+			if selector == "" || !IsRegistry(class) {
 				refuse(keyWhere, key, "an override selector that is not a registry package")
 				continue
 			}
-			if hasRange && !IsRegistry(ClassifySpec(rangePart)) {
-				refuse(keyWhere, key, "an override selector whose range is not a registry range")
-				continue
-			}
-			selectorName = sel
-			addName(sel)
+			name = selector
+			addName(selector)
+			note("override-key", "", key)
 		}
 		switch value := object[key].(type) {
 		case string:
@@ -505,10 +547,15 @@ func walkOverrides(where string, node any, depth int, refuse func(w, t, r string
 			}
 			if class := ClassifySpec(value); !IsRegistry(class) {
 				refuse(keyWhere, value, "an override that is not a registry package ("+class+")")
+				continue
 			}
+			note("override-value", name, value)
 		case map[string]any:
-			_ = selectorName
-			walkOverrides(keyWhere, value, depth+1, refuse, addName)
+			if key == "." {
+				refuse(keyWhere, "", "a self-override that is an object, not a string")
+				continue
+			}
+			walkOverrides(keyWhere, value, name, depth+1, refuse, addName, note)
 		default:
 			refuse(keyWhere, "", "an override that is neither a string nor an object")
 		}
