@@ -290,7 +290,7 @@ pass and warnings under `environment.release_follow`.
   disk is byte-identical to the current stored or committed baseline (the publication
   did not commit), and otherwise stops with missing evidence (102) and a way out. A
   confirmation that fails after a committed publication is reported for what it is, with
-  exit 105 (the files ARE published, nothing is blocked), and the pending record stays
+  a notice on stderr and a successful exit (the files ARE published, nothing is blocked), and the pending record stays
   for the next command. A refusal, a failed or unverified materialisation, a dry run and
   any outcome with missing evidence never confirm anything.
   **The committed lockfile** is read with three outcomes: present, *established absent*

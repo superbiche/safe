@@ -12,7 +12,7 @@
   absent); the private-store matcher runs over the identities of the evidence request,
   baseline side included; the record follows the publication in two steps (pending before
   the binder publishes, confirmed after a committed publication, settled by the next run;
-  a failed confirmation is exit 105, new in the contract); the workspace-ancestor check
+  a failed confirmation is a notice, the command succeeds and the next one settles the record); the workspace-ancestor check
   no longer depends on git; a successful publication needs an empty `retained` list and
   both files; the report counts entries "added on disk".
 - Project lane baseline (still behind `install.project_lane`): the lane no longer

@@ -4239,10 +4239,11 @@ safe_gate_project_lane_run() {
     # baseline is confirmed (it replaces the current record). Never earlier, never after a
     # refusal, a failed or unverified materialisation or a dry run. A confirmation that
     # fails is reported for what it is: the files ARE published; the pending record stays
-    # and the next command settles it (exit 105, apart from every refusal).
+    # and the next command settles it. The command itself succeeded (the judged files
+    # are in place), so its status stays 0: no new exit status enters the agent contract
+    # before the cutover, and the pending record heals at the next run.
     if (( can_store )) && ! "${safe_core}" project-baseline confirm "${record_args[@]}" >/dev/null 2>"${scratch}/baseline-write.err"; then
       safe_gate_err "safe: project lane: BASELINE NOT CONFIRMED: the judged files were published$( (( lock_only )) || printf ' and the tree installed') but the baseline record could not be confirmed ($(safe_gate_lane_clean "$(head -n 1 "${scratch}/baseline-write.err" 2>/dev/null)")); the pending record stays and the next command settles it or stops with the way out"
-      rc=105
     elif (( lock_only )); then
       safe_gate_err "safe: project lane: --package-lock-only: the judged package.json and package-lock.json were published; no tree was installed"
     fi

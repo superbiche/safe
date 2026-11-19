@@ -10279,11 +10279,11 @@ case_project_lane_baseline_the_record_follows_the_publication_in_two_steps() {
   local stored
   stored="$(lane_stored_digest)"
   [[ -z "$(lane_pending_records)" && "${stored}" != none ]] || { fail "$FUNCNAME: a settled record is expected"; return; }
-  # a command drops vuln, and its confirmation fails: the files are published, the exit is 105, apart from a refusal
+  # a command drops vuln, and its confirmation fails: the files are published and the command succeeds; the pending record stays
   : > "${LOG_FILE}"
   SAFE_CORE_TAMPER=confirm-fails NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" \
     lane_run 'npm install other@1.0.0'
-  assert_status 105 "$FUNCNAME: a failed confirmation" || return
+  assert_status 0 "$FUNCNAME: a failed confirmation" || return
   assert_err_contains_fragment 'BASELINE NOT CONFIRMED' "$FUNCNAME" || return
   assert_err_contains_fragment 'the judged files were published and the tree installed' "$FUNCNAME" || return
   assert_err_not_contains_fragment 'safe: BLOCKED' "$FUNCNAME" || return
@@ -10344,7 +10344,7 @@ case_project_lane_baseline_a_pending_record_the_lockfile_does_not_explain_is_mis
   lane_first_command "$FUNCNAME" || return
   SAFE_CORE_TAMPER=confirm-fails NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" \
     lane_run 'npm install other@1.0.0'
-  assert_status 105 "$FUNCNAME" || return
+  assert_status 0 "$FUNCNAME" || return
   # the lockfile on disk is now neither the pending one nor the previous baseline
   lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0 extra@1.0.0 > "${WORK_DIR}/package-lock.json"
   local before
