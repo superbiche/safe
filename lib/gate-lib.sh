@@ -3359,11 +3359,17 @@ safe_gate_project_lane_private_names() {
 # An ancestor of the project, up to the git top level, whose manifest declares
 # workspaces. Prints its directory. An ancestor manifest that cannot be read counts.
 safe_gate_project_lane_workspace_ancestor() {
-  local project_dir="$1" top dir parent
-  top="$(safe_gate_project_lane_git "${project_dir}" rev-parse --show-toplevel 2>/dev/null)" || return 1
-  top="$(realpath -- "${top}" 2>/dev/null)" || return 1
+  local project_dir="$1" top="" dir parent
+  # Inside a git work tree the search stops at its top level; outside one (or when git
+  # cannot say) it walks to the filesystem root: the workspace refusal does not depend on git.
+  if top="$(safe_gate_project_lane_git "${project_dir}" rev-parse --show-toplevel 2>/dev/null)"; then
+    top="$(realpath -- "${top}" 2>/dev/null)" || top=""
+  else
+    top=""
+  fi
   dir="${project_dir}"
-  while [[ "${dir}" != "${top}" && "${dir}" == "${top}/"* ]]; do
+  while [[ "${dir}" != "/" ]]; do
+    [[ -z "${top}" || "${dir}" != "${top}" ]] || break
     parent="$(dirname -- "${dir}")"
     dir="${parent}"
     if [[ -f "${dir}/package.json" ]]; then
@@ -3769,18 +3775,55 @@ safe_gate_project_lane_run() {
   # empty, and what the disk lockfile adds is part of what the command introduces
   # (its entries are in the target the decision runs on, against that baseline).
   # A baseline that exists and cannot be read or decoded is missing evidence (102),
-  # never an empty baseline.
-  local baseline_kind="empty" baseline_file="" disk_is_baseline=0 have_committed=0 have_stored=0
+  # never an empty baseline; only an ESTABLISHED absence lets the next one apply.
+  local baseline_kind="empty" baseline_file="" disk_is_baseline=0 have_committed=0 have_stored=0 can_store=1
   local committed_file="${scratch}/baseline-committed.json" stored_file="${scratch}/baseline-stored.json"
   local -a baseline_args=(--no-baseline)
-  if safe_gate_project_lane_git "${project_dir}" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
-      && safe_gate_project_lane_git "${project_dir}" cat-file -e "HEAD:./package-lock.json" 2>/dev/null; then
-    if [[ "$(safe_gate_project_lane_git "${project_dir}" cat-file -t "HEAD:./package-lock.json" 2>/dev/null)" != "blob" ]] \
-        || ! safe_gate_project_lane_git "${project_dir}" cat-file blob "HEAD:./package-lock.json" >"${committed_file}" 2>/dev/null; then
-      safe_gate_project_lane_refuse 102 "${verb}" "the committed lockfile cannot be read from the head of the git work tree, so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the repository and retry"
-      return $?
-    fi
+  local -a record_args=(--project-fd "${SAFE_GATE_LANE_LOCKFD}" --state-dir "${state_dir}" --name package-lock.json)
+  rc=0
+  safe_gate_project_lane_committed "${project_dir}" "${committed_file}" || rc=$?
+  if (( rc == 0 )); then
     have_committed=1
+  elif (( rc == 2 )); then
+    safe_gate_project_lane_refuse 102 "${verb}" "the committed lockfile cannot be read (${SAFE_GATE_LANE_REASON}), so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the repository and retry"
+    return $?
+  fi
+  # An earlier command's baseline update that is not settled: it recorded the baseline it
+  # meant to publish as PENDING before it published, and confirmed it after. A pending
+  # record found now is confirmed when the lockfile on disk is that one (the publication
+  # went through and the confirmation did not), dropped when the lockfile on disk is still
+  # the previous baseline (the publication did not commit), and is missing evidence
+  # otherwise: what was published cannot be told from what the record says.
+  local pending_file="${scratch}/baseline-pending.json" previous_file="${scratch}/baseline-previous.json"
+  rc=0
+  "${safe_core}" project-baseline read "${record_args[@]}" --kind pending --out "${pending_file}" >/dev/null 2>"${scratch}/baseline.err" || rc=$?
+  if (( rc == 0 )); then
+    local prev_ok=0 prev_rc=0
+    if (( disk_lock )) && cmp -s -- "${pending_file}" "${snap}/package-lock.json"; then
+      if ! "${safe_core}" project-baseline confirm "${record_args[@]}" >/dev/null 2>"${scratch}/baseline.err"; then
+        safe_gate_project_lane_refuse 102 "${verb}" "an earlier command's baseline update cannot be confirmed ($(safe_gate_lane_clean "$(head -n 1 "${scratch}/baseline.err" 2>/dev/null)")), so the baseline cannot be told (audit-infrastructure breakage, not a package finding)" "retry; if it repeats, remove this project's record under ${state_dir}/project-baseline after committing the lockfile"
+        return $?
+      fi
+    else
+      "${safe_core}" project-baseline read "${record_args[@]}" --kind current --out "${previous_file}" >/dev/null 2>"${scratch}/baseline.err" || prev_rc=$?
+      if (( prev_rc != 0 && prev_rc != 4 )); then
+        safe_gate_project_lane_refuse 102 "${verb}" "the baseline safe stored for this project cannot be trusted ($(safe_gate_lane_clean "$(head -n 1 "${scratch}/baseline.err" 2>/dev/null)")), so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "commit the lockfile, or remove this project's record under ${state_dir}/project-baseline, and retry"
+        return $?
+      fi
+      if (( disk_lock )); then
+        { (( have_committed )) && cmp -s -- "${committed_file}" "${snap}/package-lock.json"; } && prev_ok=1
+        { (( prev_rc == 0 )) && cmp -s -- "${previous_file}" "${snap}/package-lock.json"; } && prev_ok=1
+      elif (( ! have_committed && prev_rc == 4 )); then
+        prev_ok=1
+      fi
+      if (( ! prev_ok )) || ! "${safe_core}" project-baseline drop "${record_args[@]}" >/dev/null 2>&1; then
+        safe_gate_project_lane_refuse 102 "${verb}" "an earlier command's baseline update is unsettled: the lockfile on disk is neither the one it meant to publish nor the previous baseline, so what was published cannot be told" "restore the lockfile (the committed one, or the one in the pending record), or remove this project's pending record under ${state_dir}/project-baseline, and retry"
+        return $?
+      fi
+    fi
+  elif (( rc != 4 )); then
+    safe_gate_project_lane_refuse 102 "${verb}" "the pending baseline update of this project cannot be trusted ($(safe_gate_lane_clean "$(head -n 1 "${scratch}/baseline.err" 2>/dev/null)")), so the baseline cannot be told (audit-infrastructure breakage, not a package finding)" "remove this project's pending record under ${state_dir}/project-baseline, or commit the lockfile, and retry"
+    return $?
   fi
   if (( disk_lock && have_committed )) && cmp -s -- "${committed_file}" "${snap}/package-lock.json"; then
     baseline_kind="committed"
@@ -3790,8 +3833,7 @@ safe_gate_project_lane_run() {
     # The stored one is consulted only when it can matter.
     if (( disk_lock || ! have_committed )); then
       rc=0
-      "${safe_core}" project-baseline read --state-dir "${state_dir}" --project "${project_dir}" --name package-lock.json --out "${stored_file}" \
-        >/dev/null 2>"${scratch}/baseline.err" || rc=$?
+      "${safe_core}" project-baseline read "${record_args[@]}" --kind current --out "${stored_file}" >/dev/null 2>"${scratch}/baseline.err" || rc=$?
       if (( rc == 0 )); then
         have_stored=1
       elif (( rc != 4 )); then
@@ -3870,8 +3912,8 @@ safe_gate_project_lane_run() {
   # Every entry of the baseline is bound, and none is a link: what is established
   # is a shape the lane supports. A baseline graph that cannot be read is missing
   # evidence, not a policy refusal. The lockfile on disk, when it is not the
-  # baseline, is only decoded here: its entries are judged with the target.
-  local graph_json="" graph_label
+  # baseline, gets the same two checks: its entries are then judged with the target.
+  local graph_json="" graph_label graph_which
   for graph_label in "baseline|${baseline_file}" "disk|$( (( disk_lock && ! disk_is_baseline )) && printf '%s' "${snap}/package-lock.json")"; do
     [[ "${graph_label#*|}" != "" ]] || continue
     rc=0
@@ -3880,13 +3922,17 @@ safe_gate_project_lane_run() {
       safe_gate_project_lane_refuse 102 "${verb}" "the $([[ "${graph_label%%|*}" == baseline ]] && printf '%s' "${baseline_kind} lockfile" || printf 'lockfile on disk') cannot be read, so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the lockfile and retry"
       return $?
     fi
-    [[ "${graph_label%%|*}" == baseline ]] || continue
+    # Every lockfile npm may read is admitted BEFORE npm uses it: the baseline, and the
+    # lockfile on disk when it is another: a fetch during resolution cannot be undone by
+    # a refusal after it. (What the projection itself adds is the decision's.)
+    graph_which="a ${baseline_kind} lockfile"
+    [[ "${graph_label%%|*}" == baseline ]] || graph_which="the lockfile on disk"
     if jq -e '.bindability.bound == false' <<<"${graph_json}" >/dev/null 2>&1; then
-      safe_gate_project_lane_unsupported "${verb}" "a ${baseline_kind} lockfile with an entry safe cannot bind ($(jq -r '.bindability.unbound[0] | "\(.name)@\(.version): \(.reason)"' <<<"${graph_json}" 2>/dev/null))"
+      safe_gate_project_lane_unsupported "${verb}" "${graph_which} with an entry safe cannot bind ($(jq -r '.bindability.unbound[0] | "\(.name)@\(.version): \(.reason)"' <<<"${graph_json}" 2>/dev/null))"
       return $?
     fi
     if jq -e '[.graph.occurrences[] | select(.kind == "link" or .kind == "local")] | length > 0' <<<"${graph_json}" >/dev/null 2>&1; then
-      safe_gate_project_lane_unsupported "${verb}" "a ${baseline_kind} lockfile with in-project links"
+      safe_gate_project_lane_unsupported "${verb}" "${graph_which} with in-project links"
       return $?
     fi
   done
@@ -4019,6 +4065,18 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_refuse 100 "${verb}" "the lockfile analysis returned an unreadable result (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
     return $?
   fi
+  # No private name goes to a public advisory service: the matcher runs over the identities
+  # of the request itself, the baseline side included (a name only the baseline carries is
+  # in the request when the command drops it), before anything is sent.
+  if ! jq -ec '{names: ([.packages[].name] + .blocklist_names | unique)}' <<<"${request}" >"${scratch}/evidence-names.json" 2>/dev/null; then
+    safe_gate_project_lane_refuse 100 "${verb}" "the evidence request cannot be read back (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
+    return $?
+  fi
+  safe_gate_project_lane_private_names "${verb}" "${scratch}/evidence-names.json"
+  rc=$?
+  if (( rc != 0 )); then
+    return "${rc}"
+  fi
   rc=0
   "${SAFE_GATE_AUDIT_BIN}" scanner-batch --evidence <<<"${request}" >"${evidence}" 2>"${scratch}/evidence.err" || rc=$?
   if (( rc != 0 )); then
@@ -4063,7 +4121,7 @@ safe_gate_project_lane_run() {
       && jq '.difference.introduced' <<<"${disk_json}" >"${scratch}/disk-introduced.json" 2>/dev/null \
       && disk_count="$(jq -r 'length' "${scratch}/disk-introduced.json" 2>/dev/null)"
     if [[ "${disk_count}" =~ ^[0-9]+$ ]]; then
-      safe_gate_err "safe: project lane: the lockfile on disk is not the baseline: ${disk_count} of its entries were judged as introduced"
+      safe_gate_err "safe: project lane: the lockfile on disk is not the baseline: ${disk_count} entries added on disk were judged as introduced"
     else
       safe_gate_project_lane_refuse 102 "${verb}" "the lockfile on disk could not be compared with the baseline (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
       return $?
@@ -4138,6 +4196,18 @@ safe_gate_project_lane_run() {
     bind_cmd+=(${copy_args[@]+"${copy_args[@]}"} "${live_args[@]}" --env-file "${scratch}/env" "${bind_selection[@]}"
       -- "${SAFE_GATE_LANE_NPM[@]}" "${frozen_args[@]}")
   fi
+  # The baseline this command means to leave is recorded as PENDING before the binder
+  # publishes, and confirmed after a committed publication; where this directory has no
+  # identity that can be established nothing can be stored (and nothing is).
+  rc=0
+  "${safe_core}" project-baseline write "${record_args[@]}" --kind pending --file "${proj}/package-lock.json" >/dev/null 2>"${scratch}/baseline-write.err" || rc=$?
+  if (( rc == 5 )); then
+    can_store=0
+    safe_gate_err "safe: project lane: no baseline can be stored for this project on this filesystem (its directory has no birth time); the next command is judged against the committed lockfile"
+  elif (( rc != 0 )); then
+    safe_gate_project_lane_refuse 102 "${verb}" "the baseline update cannot be recorded ($(safe_gate_lane_clean "$(head -n 1 "${scratch}/baseline-write.err" 2>/dev/null)")), so nothing was published (audit-infrastructure breakage, not a package finding)" "fix safe's data directory, or remove this project's record under ${state_dir}/project-baseline, and retry"
+    return $?
+  fi
   # The binder runs as a child that is waited for. From BEFORE it is started until
   # its report is delivered, a signal to this shell is only recorded and forwarded
   # to it (never ends this command with the child outstanding); its real status is
@@ -4165,14 +4235,16 @@ safe_gate_project_lane_run() {
   safe_gate_project_lane_bind_result "${verb}" "${bind_rc}" "${scratch}/bind.json" "${lock_only}"
   rc=$?
   if (( rc == 0 )); then
-    # A committed publication after a decision made on complete evidence: the judged
-    # lockfile becomes the baseline of this project's next command. Never earlier,
-    # never after a refusal, a failed or unverified materialisation or a dry run.
-    if "${safe_core}" project-baseline write --state-dir "${state_dir}" --project "${project_dir}" --name package-lock.json \
-        --file "${proj}/package-lock.json" >/dev/null 2>"${scratch}/baseline-write.err"; then
-      (( ! lock_only )) || safe_gate_err "safe: project lane: --package-lock-only: the judged package.json and package-lock.json were published; no tree was installed"
-    else
-      safe_gate_err "safe: project lane: the baseline could not be stored ($(safe_gate_lane_clean "$(head -n 1 "${scratch}/baseline-write.err" 2>/dev/null)")); the next command is judged against the committed lockfile"
+    # A committed publication after a decision made on complete evidence: the pending
+    # baseline is confirmed (it replaces the current record). Never earlier, never after a
+    # refusal, a failed or unverified materialisation or a dry run. A confirmation that
+    # fails is reported for what it is: the files ARE published; the pending record stays
+    # and the next command settles it (exit 105, apart from every refusal).
+    if (( can_store )) && ! "${safe_core}" project-baseline confirm "${record_args[@]}" >/dev/null 2>"${scratch}/baseline-write.err"; then
+      safe_gate_err "safe: project lane: BASELINE NOT CONFIRMED: the judged files were published$( (( lock_only )) || printf ' and the tree installed') but the baseline record could not be confirmed ($(safe_gate_lane_clean "$(head -n 1 "${scratch}/baseline-write.err" 2>/dev/null)")); the pending record stays and the next command settles it or stops with the way out"
+      rc=105
+    elif (( lock_only )); then
+      safe_gate_err "safe: project lane: --package-lock-only: the judged package.json and package-lock.json were published; no tree was installed"
     fi
   fi
   SAFE_GATE_LANE_DEFER=0
@@ -4200,7 +4272,8 @@ safe_gate_project_lane_bind_result() {
       and (if $d.outcome == "published"
            then $rc == 0 and (if $lo == 1 then ($d.verification == null and $d.install.ran == false)
                               else ($d.verification.ok == true) and ($d.verification.problems | type == "array") and ($d.verification.problems | length) == 0 end)
-                and ($d.publication.state == "committed") and ($d.inputs_changed | type == "array") and ($d.inputs_changed | length) == 0
+                and ($d.publication.state == "committed") and ($d.publication.retained | length) == 0
+                and (($d.publication.published | sort) == ["package-lock.json", "package.json"]) and ($d.inputs_changed | type == "array") and ($d.inputs_changed | length) == 0
            else $rc != 0 end))' "${doc}" >/dev/null 2>&1; then
     safe_gate_project_lane_refuse 100 "${verb}" "project-bind returned no usable result (exit ${rc}); the project may hold a leftover staging directory" "rerun the command; run safe doctor if it repeats"
     return $?
@@ -4272,11 +4345,77 @@ safe_gate_project_lane_bind_result() {
 }
 
 safe_gate_project_lane_git() {
-  local project_dir="$1"
+  local project_dir="$1" name
+  local -a unset_args=()
   shift
-  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY \
-    -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_COMMON_DIR -u GIT_NAMESPACE \
-    GIT_NO_REPLACE_OBJECTS=1 git --no-replace-objects -C "${project_dir}" "$@"
+  # A bounded environment: none of the caller's GIT_* variables (a different repository,
+  # object store, index, configuration or namespace) reaches git; replacement objects and
+  # lazy fetching of missing objects are off, and nothing prompts.
+  while IFS= read -r name; do
+    unset_args+=(-u "${name}")
+  done < <(compgen -e | grep '^GIT_' || true)
+  env ${unset_args[@]+"${unset_args[@]}"} GIT_NO_REPLACE_OBJECTS=1 GIT_NO_LAZY_FETCH=1 GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 \
+    git --no-replace-objects -C "${project_dir}" "$@"
+}
+
+# The lockfile committed at the head of the project's git work tree, read with three
+# outcomes: 0 present (the bytes are in $2), 1 ESTABLISHED absent (no work tree, an unborn
+# branch, or the path is not in the head's tree), 2 UNREADABLE (a repository that cannot be
+# probed, HEAD that does not name a commit, a missing or corrupt commit, tree or blob, an
+# entry that is not a regular file); the reason is in SAFE_GATE_LANE_REASON. HEAD is resolved
+# to ONE commit, once, and everything is read from that commit. Accepted tree-entry modes:
+# 100644 and 100755 (a regular file; npm reads the same bytes whatever the executable bit);
+# a link (120000), a submodule (160000) and a directory are refused.
+safe_gate_lane_why() { SAFE_GATE_LANE_REASON="$1"; }
+
+safe_gate_project_lane_committed() {
+  local project_dir="$1" out="$2" dir="$1" found=0 inside prefix commit ref entry meta mode kind sha
+  SAFE_GATE_LANE_REASON=""
+  while :; do
+    # A candidate repository: a .git file or link, or a .git directory that has a HEAD (git
+    # itself walks past an empty or foreign .git directory; a damaged one is NOT passed over).
+    if [[ -f "${dir}/.git" || -L "${dir}/.git" || ( -d "${dir}/.git" && ( -e "${dir}/.git/HEAD" || -L "${dir}/.git/HEAD" ) ) ]]; then
+      found=1
+      break
+    fi
+    [[ "${dir}" != "/" ]] || break
+    dir="$(dirname -- "${dir}")"
+  done
+  (( found )) || return 1
+  inside="$(safe_gate_project_lane_git "${project_dir}" rev-parse --is-inside-work-tree 2>/dev/null)" || { safe_gate_lane_why "the git repository cannot be probed"; return 2; }
+  [[ "${inside}" == "true" ]] || { safe_gate_lane_why "the project is not in a git work tree although a .git is above it"; return 2; }
+  prefix="$(safe_gate_project_lane_git "${project_dir}" rev-parse --show-prefix 2>/dev/null)" || { safe_gate_lane_why "the project's place in the repository cannot be read"; return 2; }
+  if commit="$(safe_gate_project_lane_git "${project_dir}" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)"; then
+    [[ "${commit}" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] || { safe_gate_lane_why "HEAD does not name a commit"; return 2; }
+  else
+    ref="$(safe_gate_project_lane_git "${project_dir}" symbolic-ref -q HEAD 2>/dev/null)" || { safe_gate_lane_why "HEAD does not name a commit"; return 2; }
+    if safe_gate_project_lane_git "${project_dir}" rev-parse --verify --quiet "${ref}" >/dev/null 2>&1; then
+      safe_gate_lane_why "HEAD names a commit that is missing or corrupt"
+      return 2
+    fi
+    safe_gate_project_lane_git "${project_dir}" show-ref --verify --quiet "${ref}" >/dev/null 2>&1
+    case $? in
+      1) return 1 ;; # an unborn branch: nothing is committed yet
+      *) unreadable "HEAD does not name a commit"; return 2 ;;
+    esac
+  fi
+  entry="$(safe_gate_project_lane_git "${project_dir}" ls-tree -z "${commit}" -- package-lock.json 2>/dev/null | tr '\0' '\n')"
+  [[ "${PIPESTATUS[0]}" == 0 ]] || { safe_gate_lane_why "the head commit's tree cannot be read"; return 2; }
+  [[ -n "${entry}" ]] || return 1
+  [[ "$(printf '%s\n' "${entry}" | wc -l)" == 1 ]] || { safe_gate_lane_why "the head commit's tree names package-lock.json more than once"; return 2; }
+  meta="${entry%%$'\t'*}"
+  mode="${meta%% *}"
+  kind="${meta#* }"
+  sha="${kind#* }"
+  kind="${kind%% *}"
+  if [[ "${kind}" != "blob" || ( "${mode}" != "100644" && "${mode}" != "100755" ) || ! "${sha}" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]]; then
+    safe_gate_lane_why "package-lock.json is not a regular file in the head commit (mode ${mode}, ${kind})"
+    return 2
+  fi
+  safe_gate_project_lane_git "${project_dir}" cat-file blob "${sha}" >"${out}" 2>/dev/null || { safe_gate_lane_why "the committed lockfile's object is missing or corrupt"; return 2; }
+  [[ "$(safe_gate_project_lane_git "${project_dir}" hash-object -t blob --stdin <"${out}" 2>/dev/null)" == "${sha}" ]] || { safe_gate_lane_why "the committed lockfile's object does not match its name"; return 2; }
+  : "${prefix}"
+  return 0
 }
 
 

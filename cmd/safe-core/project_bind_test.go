@@ -593,25 +593,55 @@ func TestProjectBindFilesOnlyPublishesTheFilesAndInstallsNothing(t *testing.T) {
 
 func TestProjectBaselineCommand(t *testing.T) {
 	p := newBindProject(t)
+	held, err := os.Open(p.project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
 	file := filepath.Join(filepath.Dir(p.project), "lock.json")
 	out := filepath.Join(filepath.Dir(p.project), "out.json")
 	if err := os.WriteFile(file, []byte(bindNewLock), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	base := func(mode string, extra ...string) []string {
-		return append([]string{"project-baseline", mode, "--state-dir", p.state, "--project", p.project, "--name", "package-lock.json"}, extra...)
+	// the project is the directory descriptor 3 holds
+	call := func(mode string, extra ...string) (int, string) {
+		cmd := safeCore(append([]string{"project-baseline", mode, "--project-fd", "3", "--state-dir", p.state, "--name", "package-lock.json"}, extra...)...)
+		cmd.ExtraFiles = []*os.File{held}
+		_, code, stderr := run3(cmd)
+		return code, stderr
 	}
-	if _, code, _ := run3(safeCore(base("read", "--out", out)...)); code != 4 {
+	if code, _ := call("read", "--kind", "current", "--out", out); code != 4 {
 		t.Fatalf("none stored: exit %d, want 4", code)
 	}
-	if _, code, stderr := run3(safeCore(base("write", "--file", file)...)); code != 0 {
-		t.Fatalf("write: exit %d %s", code, stderr)
+	if code, stderr := call("write", "--kind", "pending", "--file", file); code != 0 {
+		t.Fatalf("write pending: exit %d %s", code, stderr)
 	}
-	if _, code, stderr := run3(safeCore(base("read", "--out", out)...)); code != 0 {
-		t.Fatalf("read: exit %d %s", code, stderr)
+	if code, _ := call("read", "--kind", "current", "--out", out); code != 4 {
+		t.Fatalf("a pending record is not the current one: exit %d", code)
+	}
+	if code, stderr := call("read", "--kind", "pending", "--out", out); code != 0 {
+		t.Fatalf("read pending: exit %d %s", code, stderr)
 	}
 	if raw, _ := os.ReadFile(out); string(raw) != bindNewLock {
 		t.Fatalf("read back %q", raw)
+	}
+	if code, stderr := call("confirm"); code != 0 {
+		t.Fatalf("confirm: exit %d %s", code, stderr)
+	}
+	if code, _ := call("confirm"); code != 4 {
+		t.Fatalf("confirm with nothing pending: exit %d, want 4", code)
+	}
+	if code, _ := call("read", "--kind", "current", "--out", out); code != 0 {
+		t.Fatalf("read current: exit %d", code)
+	}
+	if code, _ := call("write", "--kind", "pending", "--file", file); code != 0 {
+		t.Fatal("write pending")
+	}
+	if code, _ := call("drop"); code != 0 {
+		t.Fatalf("drop: exit %d", code)
+	}
+	if code, _ := call("read", "--kind", "pending", "--out", out); code != 4 {
+		t.Fatalf("dropped: exit %d, want 4", code)
 	}
 	// a record that no longer matches its digest is unreadable (3), never absent (4)
 	records, _ := filepath.Glob(filepath.Join(p.state, "project-baseline", "*", "package-lock.json.json"))
@@ -622,10 +652,16 @@ func TestProjectBaselineCommand(t *testing.T) {
 	if err := os.WriteFile(records[0], []byte(strings.Replace(string(raw), `"digest":"sha256:`, `"digest":"sha256:0`, 1)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, code, _ := run3(safeCore(base("read", "--out", out)...)); code != 3 {
+	if code, _ := call("read", "--kind", "current", "--out", out); code != 3 {
 		t.Fatalf("tampered: exit %d, want 3", code)
 	}
-	for _, args := range [][]string{{"project-baseline"}, {"project-baseline", "read"}, base("read"), base("write", "--out", out), base("read", "--out", out, "--file", file)} {
+	for _, args := range [][]string{
+		{"project-baseline"}, {"project-baseline", "read"}, {"project-baseline", "read", "--project-fd", "3"},
+		{"project-baseline", "write", "--project-fd", "3", "--state-dir", p.state, "--name", "package-lock.json", "--kind", "current", "--out", out},
+		{"project-baseline", "read", "--project-fd", "2", "--state-dir", p.state, "--name", "package-lock.json", "--kind", "current", "--out", out},
+		{"project-baseline", "read", "--project", p.project, "--state-dir", p.state, "--name", "package-lock.json", "--kind", "current", "--out", out},
+		{"project-baseline", "confirm", "--project-fd", "3", "--state-dir", p.state, "--name", "package-lock.json", "--kind", "current"},
+	} {
 		if _, code, _ := run3(safeCore(args...)); code != 2 {
 			t.Fatalf("%v: exit %d, want 2", args, code)
 		}

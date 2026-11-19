@@ -255,27 +255,57 @@ pass and warnings under `environment.release_follow`.
   Otherwise the baseline is the committed lockfile, else the stored one, else empty,
   and the lockfile on disk is part of what the command introduces: its entries are in
   the target the decision runs on, judged against that baseline, and the report says
-  how many of them were judged as introduced (`safe: project lane: baseline: …` names
+  how many entries added on disk were judged as introduced (`safe: project lane: baseline: …` names
   which baseline was used: committed, stored or empty). With no lockfile on disk and
   none established the baseline is empty and the whole resolved graph is introduced. A
   baseline that exists but cannot be read or decoded (a committed blob that does not
   parse, a stored record that does not match its digest) is missing evidence (exit
   102), never an empty baseline. A project outside a git work tree has only the stored
-  baseline, or none. **The stored baseline** is a record under `project-lane/state/
-  project-baseline/<sha256 of the canonical project path>/package-lock.json.json` in
-  safe's data directory, outside the project: the lockfile itself (base64) with its
-  digest, the canonical project path and the identity of the project directory (a
-  fresh clone at the same path is another project and has none). Every directory of
-  the chain belongs to the user, is not writable by group or others and is never a
-  link; the record is a regular `0600` file of exactly the shape safe wrote, and one
-  whose digest does not match is unreadable, not trusted. It is replaced atomically
-  and only after a decision made on complete evidence and, when the command
-  materialises, after the binder reported a committed publication (a lockfile-only
-  command advances it too). A refusal, a failed or unverified materialisation, a
-  dry run and any outcome with missing evidence leave it as it was. It is read only
-  when it can matter (the lockfile on disk is not the committed one). A record that
-  cannot be trusted stops the command with the way out: commit the lockfile, or
-  remove that project's record.
+  baseline, or none. **The stored baseline** is a record in safe's data directory, outside the project,
+  under `project-lane/state/project-baseline/<sha256 of the canonical project path>/`:
+  `package-lock.json.json` (the current record) and, between a command's judgement and
+  its confirmation, `package-lock.json.pending.json`. A record is one exact JSON
+  document (every member required with its exact name and type, no other member, no
+  second spelling, nothing after it) holding the lockfile itself (base64) with its
+  digest, the canonical project path and the identity of the project directory: its
+  device, inode and **birth time**. The record is read and written for the directory
+  the lane holds locked (a descriptor, never a path looked up again). An ordinary edit
+  keeps the identity; deleting and recreating the directory changes the birth time even
+  when the inode is recycled. A record that lacks any member, differs in the identity,
+  or cannot be compared because the filesystem reports no birth time, is unreadable
+  (exit 102, "cannot be trusted"), never "none stored"; where no birth time exists
+  nothing can be stored at all, and the lane says so and judges against the committed
+  lockfile. Every directory of the chain belongs to the user, is not writable by group
+  or others and is never a link; the record is a regular file of mode exactly `0600`;
+  a digest that does not match is unreadable. It is read only when it can matter (the
+  lockfile on disk is not the committed one). A record that cannot be trusted stops
+  the command with the way out: commit the lockfile, or remove that project's record.
+  **Two steps.** Before the binder publishes, the baseline the command means to leave
+  is written as the *pending* record (failing that, nothing is published: 102). After a
+  committed publication (an empty `retained` list, both files published) it is
+  *confirmed*: the pending record replaces the current one by an atomic rename. A
+  command that finds a pending record settles it first: it **confirms** it when the
+  lockfile on disk is byte-identical to it (the publication went through and the
+  confirmation did not happen: a kill, a failure), **drops** it when the lockfile on
+  disk is byte-identical to the current stored or committed baseline (the publication
+  did not commit), and otherwise stops with missing evidence (102) and a way out. A
+  confirmation that fails after a committed publication is reported for what it is, with
+  exit 105 (the files ARE published, nothing is blocked), and the pending record stays
+  for the next command. A refusal, a failed or unverified materialisation, a dry run and
+  any outcome with missing evidence never confirm anything.
+  **The committed lockfile** is read with three outcomes: present, *established absent*
+  (no git work tree, an unborn branch, or no `package-lock.json` in the head commit's
+  tree) and unreadable (a repository that cannot be probed, a `HEAD` that does not name
+  a commit, a missing or corrupt commit, tree or blob, a blob whose hash is not its name,
+  a tree entry that is not a regular file). `HEAD` is resolved to one commit, once; git
+  runs with none of the caller's `GIT_*` variables, replacement objects disabled and no
+  lazy fetching. Tree-entry modes accepted: `100644` and `100755` (a regular file; npm
+  reads the same bytes whatever the executable bit); a link (`120000`), a submodule
+  (`160000`) and anything else are unreadable. Only an established absence lets the
+  stored or the empty baseline apply. Every lockfile on disk, the baseline or not, gets
+  the binding and link checks before npm uses it, and no private-registry name goes to
+  the public advisory service: the matcher runs over the evidence request itself, the
+  baseline side included.
   **The project's own `.npmrc`** is read by safe, as text, before any npm runs in
   the project's context (a special file or a link there refuses first). It is
   admitted against a short allow-list, and anything else refuses naming the

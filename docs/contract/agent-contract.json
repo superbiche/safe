@@ -127,6 +127,11 @@
       "agent_action": "The audit returned BLOCK. That can be a critical advisory affecting the resolved version, a known-malware or blocklist entry, a Socket critical supply-chain-risk alert, or a critical advisory safe could not tie to a resolved version — the reason is in the receipt. Inspect it, and use `safe report-fp <spec>` only when its resolved-version and advisory evidence are inconsistent with the refusal. The operator's override is a typed confirmation at an interactive terminal; for an advisory-only BLOCK they may record it (`safe run host-allow add <pkg>@<version> --accept-block`)."
     },
     {
+      "code": 105,
+      "meaning": "project lane (`install.project_lane`): the command's files were published (and, unless `--package-lock-only`, its tree installed and verified), but the baseline record that follows the publication could not be confirmed. Not a refusal: nothing was blocked and nothing is undone. The pending record stays and the next lane command in the project settles it, or stops with a way out.",
+      "agent_action": "Report it: the install happened and the project is as judged. Do not rerun the command to \"fix\" it. The next lane command in this project confirms the record, or refuses 102 naming the way out (restore the lockfile, or ask the operator to remove the project's pending record)."
+    },
+    {
       "code": 127,
       "meaning": "genuinely missing command (never a policy refusal)",
       "agent_action": "The command is not installed, or `safe` is missing from PATH. Report it; never treat it as a reason to bypass."

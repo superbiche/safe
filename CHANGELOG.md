@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Project lane baseline, review of the first pass: the stored baseline belongs to the
+  directory the lane holds locked (read and written through its descriptor, tied to its
+  device, inode and birth time; a different incarnation, a missing identity or a malformed
+  record is unreadable, 102, never "none stored"; strict exact-document reader, mode
+  exactly 0600); every lockfile on disk gets the binding and link checks before npm uses
+  it; the committed lockfile is read with three outcomes from one resolved commit with a
+  bounded git environment (corrupt objects, a link or a submodule are unreadable, not
+  absent); the private-store matcher runs over the identities of the evidence request,
+  baseline side included; the record follows the publication in two steps (pending before
+  the binder publishes, confirmed after a committed publication, settled by the next run;
+  a failed confirmation is exit 105, new in the contract); the workspace-ancestor check
+  no longer depends on git; a successful publication needs an empty `retained` list and
+  both files; the report counts entries "added on disk".
 - Project lane baseline (still behind `install.project_lane`): the lane no longer
   requires the lockfile on disk to be the committed one. An established baseline is
   the lockfile committed at the head of the git work tree or the one safe stored

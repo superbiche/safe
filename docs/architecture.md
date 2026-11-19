@@ -203,10 +203,15 @@ everything and the undo, all unchanged. The tree root is neither read nor touche
 (`publication.tree` is `old`, `install.ran` false, `verification` null). It exists so
 that a lockfile-only command is bound by exactly the checks a full one is.
 
-**The stored baseline** is kept by `safe-core project-baseline (read | write)`: see
-[configuration](configuration.md) for what it holds and when it advances. `read` exits
-0 (the lockfile is in `--out`), 4 (none stored for this project), 3 (a record or the
-state directory that cannot be trusted); `write` stores `--file` atomically.
+**The stored baseline** is kept by `safe-core project-baseline (read | write | confirm | drop)
+--project-fd <n> --state-dir <dir> --name <lockfile> [--kind current|pending]`: the project
+is the directory the descriptor holds (the gate's locked one), see
+[configuration](configuration.md) for what a record holds, the identity it is tied to
+(device, inode, birth time) and when it advances. `read` exits 0 (the lockfile is in
+`--out`), 4 (none stored), 3 (a record or the state directory that cannot be trusted); `write`
+exits 0, 3 or 5 (no identity can be established here: nothing can be stored); `confirm`
+renames the pending record over the current one (0, 4 when none is pending, 3); `drop`
+removes the pending one.
 
 **The lock** is the caller's: the gate takes `flock(LOCK_EX)` on the project
 directory before it reads anything and keeps it until it exits, so `project-bind`
