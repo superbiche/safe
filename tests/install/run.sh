@@ -11199,7 +11199,6 @@ case_project_lane_routing_a_committed_cause_never_masks_a_refusal_found_later() 
   lane_refusal_case "$FUNCNAME: with a refusing setting" install 'legacy-peer-deps' 'npm install clean@2.0.0' \
     'NPM_LOCKDIFF_EFFECTIVE_CONFIG_JSON={"package-lock":true,"ignore-scripts":true,"legacy-peer-deps":true}' || return
   # ... with an npm that fails its probe
-  lane_refusal_case "$FUNCNAME: with a failing probe" install '' 'npm install clean@2.0.0' 'NODE_CAPABILITY_STATUS=3' 2>/dev/null || true
   : > "${LOG_FILE}"
   NODE_CAPABILITY_STATUS=3 lane_run 'npm install clean@2.0.0'
   assert_status 100 "$FUNCNAME: a failing probe" || return
