@@ -2946,10 +2946,18 @@ safe_gate_project_lane_decide() {
 # follows an EUSAGE message left out. Shows them prefixed on stderr and sets SAFE_GATE_LANE_NPM_CODE
 # to npm's error code ("" when npm gave none; only [A-Za-z0-9_-] is kept).
 safe_gate_lane_show_npm_error() {
-  local file="$1" text count=0 code="" body="${SAFE_GATE_LANE_SCRATCH:-/tmp}/npm-error-lines.$$"
+  local file="$1" text count=0 code="" body=""
   SAFE_GATE_LANE_NPM_CODE=""
   SAFE_GATE_LANE_NPM_SHOWN_TEXT="npm printed nothing"
   [[ -s "${file}" ]] || return 0
+  # the lines are sorted in the lane's own scratch directory, never under a shared, guessable name;
+  # without that directory the cleaned end of npm's output is shown, as when no error line can be read
+  if [[ -z "${SAFE_GATE_LANE_SCRATCH:-}" || ! -d "${SAFE_GATE_LANE_SCRATCH}" ]]; then
+    safe_gate_lane_render "${file}" "npm output: " 12
+    SAFE_GATE_LANE_NPM_SHOWN_TEXT="npm printed no error line that could be read, so the end of its output is above"
+    return 0
+  fi
+  body="${SAFE_GATE_LANE_SCRATCH}/npm-error-lines"
   # npm's error lines, whatever the log noise around them (the lane runs npm with a fixed heading, no
   # colour and a log level that shows errors, so they carry the `npm error` prefix)
   LC_ALL=C grep -a -E '^npm (error|ERR!)( |$)' -- "${file}" 2>/dev/null | LC_ALL=C sed -E 's/^npm (error|ERR!) ?//' > "${body}" || true
