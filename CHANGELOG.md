@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+- Project-lane binding transaction, groundwork only: no installed gate calls it
+  yet. `safe-core project-bind` (Linux) builds the judged tree in a private
+  staging directory inside the project (frozen install as a child with a given
+  environment; once it exits its process group is killed and waited for),
+  verifies it against the judged lockfile and only then publishes it: the judged
+  manifests and lockfile by atomic exchange (the displaced object inspected for
+  bytes and permission bits, an edit that landed since exchanged back), then the
+  tree by atomic exchange, then a last check of everything. It works relative to
+  held directory descriptors and follows no symbolic link. There is no journal and
+  no replay: every interruption of the process leaves the old tree, no tree
+  (only when there was none) or the verified tree, and each file either the old
+  or the judged bytes (not a power-loss guarantee); undo and cleanup never delete
+  an object they cannot identify (it is retained, named in the document, and the
+  staging directory is kept and marked so in safe's record); a leftover staging
+  directory is removed by a later run only on a valid, not-kept record in safe's
+  own state directory (`--state-dir`, private to the user), any other
+  `.safe-bind-*` directory is left and named. It requires the caller's exclusive
+  lock on the project directory and refuses a symbolic-link tree root,
+  symbolic-link or set-id inputs, inputs that changed since they were judged, a
+  tree root that appears during the run, lockfiles with links or escaping paths.
+  An install that selects no tree publishes (no tree, or an empty one replacing
+  an old one). It exits with its outcome (30 refused, 31 install failed, 32
+  verification failed, 33 inputs changed, 34 interrupted, 35 publication failed,
+  36 install unsettled: completion could not be established) and its document
+  states its assumptions and limits (the install command is trusted, payload
+  integrity rests on npm, a lockfile whose flags lie yields an incomplete tree
+  and never a foreign or an extra package). `safe-core project-tree` is its
+  strict verifier on its own: no symbolic link followed, hidden extras refused,
+  `.bin` links required to be the text npm writes for a declared command,
+  absence excused only on the lockfile's own flags and the platform (never below
+  a present occurrence), npm's hidden lockfile compared strictly. Lockfiles,
+  installed manifests and the hidden lockfile are read by exact, case-sensitive
+  member names, in the judging core's loader too (every entry, the root
+  included): a repeated member, a second spelling of a field that matters (such
+  as a differently cased `Resolved` beside `resolved`), a null identity field or
+  content after the document refuses; a byte-order mark and merge-conflict
+  markers refuse too (compatibility limits). `project-decide` now exits with its
+  outcome's status (0 clear, 100, 102 or 104) and reads the standing acceptances
+  from a separate `--acceptances` document: the evidence document no longer
+  carries an `acceptances` member (a document that does is refused), so nothing
+  merges or re-encodes it.
 - Project-lane judging core, groundwork only: no installed gate calls it yet and
   nothing about an install command changes. `safe-core` gains `project-graph`
   (an npm lockfile's artifact graph and whether safe can bind every artifact),

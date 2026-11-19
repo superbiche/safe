@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+
+	"github.com/superbiche/safe/internal/strictjson"
 )
 
 // Package identifies one registry package occurrence in an npm lockfile.
@@ -157,6 +159,9 @@ func LoadRecords(path string, registryHosts []string) ([]Record, error) {
 			continue
 		}
 
+		if err := CheckEntry(raw); err != nil {
+			return nil, fmt.Errorf("parse %q: .packages[%q]: %w", path, key, err)
+		}
 		var entry struct {
 			Link          *bool           `json:"link"`
 			Optional      *bool           `json:"optional"`
@@ -437,6 +442,47 @@ func packageLess(a, b Package) bool {
 	return a.Integrity < b.Integrity
 }
 
+// EntryFields are the members of a lockfile entry that decide what is
+// installed, where from and for whom. They are read by exact, case-sensitive
+// name: an entry that carries a second spelling of one of them is refused.
+// Unrelated npm members stay allowed.
+var EntryFields = []string{
+	"name", "version", "resolved", "integrity", "link", "inBundle", "hasShrinkwrap",
+	"dev", "optional", "devOptional", "peer", "os", "cpu", "libc", "bin",
+	"dependencies", "optionalDependencies", "peerDependencies", "devDependencies",
+	"peerDependenciesMeta", "bundleDependencies", "bundledDependencies",
+}
+
+// IdentityFields are the scalar members of an entry that say what it is and
+// where it came from. One that is present is never null: a null is not an
+// absent member (npm reads the property as written), and treating it as one
+// would let "absent" stand for a value somebody wrote.
+var IdentityFields = []string{
+	"name", "version", "resolved", "integrity", "link", "inBundle", "hasShrinkwrap",
+	"dev", "optional", "devOptional", "peer",
+}
+
+// CheckEntry refuses a lockfile entry that carries a second spelling of one of
+// its EntryFields or a null identity member. (Repeated members are refused for
+// the whole document by the reader.) An entry that is not an object is the
+// caller's error. Every entry goes through it, the root and the ones a loader
+// goes on to skip included.
+func CheckEntry(raw json.RawMessage) error {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil {
+		return nil
+	}
+	if err := strictjson.RejectVariants(members, EntryFields...); err != nil {
+		return err
+	}
+	for _, key := range IdentityFields {
+		if value, ok := members[key]; ok && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("member %q is null", key)
+		}
+	}
+	return nil
+}
+
 // readPackagesMap reads and checks the lockfile document and returns its
 // .packages map, the one reading every loader here shares.
 func readPackagesMap(path string) (map[string]json.RawMessage, error) {
@@ -458,6 +504,19 @@ func readPackagesMap(path string) (map[string]json.RawMessage, error) {
 		return nil, fmt.Errorf("parse %q: lockfile contains multiple JSON documents", path)
 	} else if err != io.EOF {
 		return nil, fmt.Errorf("parse %q: invalid trailing JSON: %w", path, err)
+	}
+
+	// Exact, case-sensitive members (npm reads them so): a repeated member or
+	// a second spelling of one of the document's own fields would let this
+	// reader and npm read two different lockfiles.
+	if err := strictjson.RejectConflictMarkers(data); err != nil {
+		return nil, fmt.Errorf("parse %q: %w", path, err)
+	}
+	if err := strictjson.ExactDocument(data); err != nil {
+		return nil, fmt.Errorf("parse %q: %w", path, err)
+	}
+	if err := strictjson.RejectVariants(root, "lockfileVersion", "packages"); err != nil {
+		return nil, fmt.Errorf("parse %q: %w", path, err)
 	}
 
 	versionRaw, ok := root["lockfileVersion"]
@@ -483,6 +542,14 @@ func readPackagesMap(path string) (map[string]json.RawMessage, error) {
 	if err := json.Unmarshal(packagesRaw, &entries); err != nil || entries == nil {
 		return nil, fmt.Errorf("parse %q: .packages must be a JSON object", path)
 	}
+	// Every entry is held to the exact-name rules, the root and the entries
+	// the loaders below skip (workspace members, anything outside node_modules)
+	// included: what is skipped here is still read by npm.
+	for key, raw := range entries {
+		if err := CheckEntry(raw); err != nil {
+			return nil, fmt.Errorf("parse %q: .packages[%q]: %w", path, key, err)
+		}
+	}
 	return entries, nil
 }
 
@@ -507,6 +574,9 @@ func LoadLocalPackages(path string) ([]LocalPackage, error) {
 		if _, include := packageName(key); !include {
 			continue
 		}
+		if CheckEntry(raw) != nil {
+			continue
+		}
 		var link struct {
 			Link     *bool           `json:"link"`
 			Resolved json.RawMessage `json:"resolved"`
@@ -523,6 +593,9 @@ func LoadLocalPackages(path string) ([]LocalPackage, error) {
 		raw, ok := entries[target]
 		if !ok {
 			continue
+		}
+		if err := CheckEntry(raw); err != nil {
+			return nil, fmt.Errorf("parse %q: .packages[%q]: %w", path, target, err)
 		}
 		var entry struct {
 			Name    string `json:"name"`

@@ -49,6 +49,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "project-decide" {
 		return projectDecide(args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "project-bind" {
+		return projectBind(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "project-tree" {
+		return projectTree(args[1:], stdout, stderr)
+	}
 	if len(args) > 0 && args[0] == "private-trust" {
 		return privateTrust(args[1:], stdin, stdout, stderr)
 	}
@@ -64,6 +70,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, projectGraphUsage)
 		fmt.Fprintln(stderr, projectDiffUsage)
 		fmt.Fprintln(stderr, projectDecideUsage)
+		fmt.Fprintln(stderr, projectBindUsage)
+		fmt.Fprintln(stderr, projectTreeUsage)
 		return 2
 	}
 

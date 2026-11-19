@@ -1,6 +1,7 @@
 package lockdiff
 
 import (
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -286,5 +287,87 @@ func TestLoadRecordsKeepsTheDeclaredNameOfADescriptorlessEntryWhileLoadEntriesDo
 	entries, err := LoadEntries(file, nil)
 	if err != nil || len(entries) != 1 || entries[0].Package.Name != "alias" {
 		t.Fatalf("LoadEntries() = %#v, %v; want the mount name, as before", entries, err)
+	}
+}
+
+// A lockfile entry is read by exact, case-sensitive member names, as npm reads
+// it: a second spelling of a field that matters, a repeated member and content
+// after the document are refused, in every member order; unrelated npm members
+// stay allowed.
+func TestLoadRefusesAmbiguousLockfiles(t *testing.T) {
+	const canonical = "https://registry.npmjs.org/p/-/p-1.0.0.tgz"
+	const elsewhere = "https://evil.example/p-1.0.0.tgz"
+	doc := func(entry string) string {
+		return `{"lockfileVersion":3,"packages":{"":{"name":"root"},"node_modules/p":` + entry + `}}`
+	}
+	refused := map[string]string{
+		"a differently cased resolved after the real one":                          doc(`{"version":"1.0.0","resolved":"` + elsewhere + `","Resolved":"` + canonical + `"}`),
+		"a differently cased resolved before the real one":                         doc(`{"version":"1.0.0","Resolved":"` + canonical + `","resolved":"` + elsewhere + `"}`),
+		"an upper case integrity":                                                  doc(`{"version":"1.0.0","resolved":"` + canonical + `","INTEGRITY":"sha512-x"}`),
+		"a Unicode fold of link (Kelvin sign is not in it, long s is in inBundle)": doc(`{"version":"1.0.0","inBundle":true,"inBundle":false}`),
+		"a repeated resolved":                                                      doc(`{"version":"1.0.0","resolved":"` + canonical + `","resolved":"` + elsewhere + `"}`),
+		"a repeated packages":                                                      `{"lockfileVersion":3,"packages":{},"packages":{}}`,
+		"a second spelling of packages":                                            `{"lockfileVersion":3,"packages":{},"Packages":{}}`,
+		"a second spelling of lockfileVersion":                                     `{"lockfileVersion":3,"LockfileVersion":2,"packages":{}}`,
+		"a stray closing brace":                                                    doc(`{"version":"1.0.0"}`) + `}`,
+		"a second document":                                                        doc(`{"version":"1.0.0"}`) + doc(`{"version":"1.0.0"}`),
+	}
+	for name, content := range refused {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "package-lock.json")
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadRecords(path, nil); err == nil {
+				t.Fatal("LoadRecords() error = nil")
+			}
+			if _, err := LoadEntries(path, nil); err == nil {
+				t.Fatal("LoadEntries() error = nil")
+			}
+		})
+	}
+	allowed := doc(`{"version":"1.0.0","resolved":"` + canonical + `","Funding":{"url":"x"},"funding":{"url":"y"},"engines":{"node":">=1"}}`)
+	path := filepath.Join(t.TempDir(), "package-lock.json")
+	if err := os.WriteFile(path, []byte(allowed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if records, err := LoadRecords(path, nil); err != nil || len(records) != 1 || records[0].Resolved != canonical {
+		t.Fatalf("LoadRecords() = %+v, %v", records, err)
+	}
+}
+
+// Every entry goes through the exact-name check, the root and the entries a
+// loader skips included, and a null identity member is not an absent one.
+func TestLoadHoldsEveryEntryToTheExactNameRules(t *testing.T) {
+	const entry = `"node_modules/p":{"version":"1.0.0"}`
+	for name, doc := range map[string]string{
+		"a root entry with a second spelling": `{"lockfileVersion":3,"packages":{"":{"name":"root","Name":"x"},` + entry + `}}`,
+		"a workspace entry the loader skips":  `{"lockfileVersion":3,"packages":{"":{},"packages/w":{"version":"1.0.0","Version":"2.0.0"},` + entry + `}}`,
+		"a null resolved":                     `{"lockfileVersion":3,"packages":{"":{},"node_modules/p":{"version":"1.0.0","resolved":null}}}`,
+		"a null integrity":                    `{"lockfileVersion":3,"packages":{"":{},"node_modules/p":{"version":"1.0.0","integrity":null}}}`,
+		"a null inBundle":                     `{"lockfileVersion":3,"packages":{"":{},"node_modules/p":{"version":"1.0.0","inBundle":null}}}`,
+		"a null root name":                    `{"lockfileVersion":3,"packages":{"":{"name":null},` + entry + `}}`,
+		"a byte-order mark":                   "\xef\xbb\xbf" + `{"lockfileVersion":3,"packages":{"":{},` + entry + `}}`,
+		"merge-conflict markers in a string":  `{"lockfileVersion":3,"packages":{"":{"description":"<<<<<<< ======= >>>>>>>"},` + entry + `}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "package-lock.json")
+			if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadRecords(path, nil); err == nil {
+				t.Fatal("LoadRecords() error = nil")
+			}
+			if _, err := LoadLocalPackages(path); err == nil {
+				t.Fatal("LoadLocalPackages() error = nil")
+			}
+		})
+	}
+	// An absent member is fine, and unrelated members stay free.
+	ok := `{"lockfileVersion":3,"packages":{"":{"name":"root","Funding":1},` + entry + `}}`
+	path := filepath.Join(t.TempDir(), "package-lock.json")
+	_ = os.WriteFile(path, []byte(ok), 0o600)
+	if _, err := LoadRecords(path, nil); err != nil {
+		t.Fatalf("LoadRecords() error = %v", err)
 	}
 }

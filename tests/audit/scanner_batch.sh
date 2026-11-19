@@ -1137,8 +1137,9 @@ case_evidence_unreadable_blocklist_fails_closed() {
 
 case_evidence_document_is_read_by_the_decision() {
   # The two sides of the contract in one run: the evidence this mode writes,
-  # plus the acceptances the gate adds, is a document safe-core's decision
-  # reads; a malformed answer on the target side is Missing evidence there.
+  # untouched (the standing acceptances are a separate input of the decision),
+  # is a document safe-core's decision reads; its exit status is the
+  # outcome's; a malformed answer on the target side is Missing evidence there.
   setup_case ev-contract
   MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-contract.json"
   printf '%s\n' '{"results": [{"vulns": [{"id": "GHSA-evx-0012"}]}, {}, {"vulns": [{"id": "MAL-2026-1"}]}]}' > "$MOCK_BATCH_FIXTURE"
@@ -1146,19 +1147,19 @@ case_evidence_document_is_read_by_the_decision() {
   local evidence="$TEST_ROOT/ev-contract.json" lock="$TEST_ROOT/ev-contract-lock.json" out rc=0 sri
   sri="sha512-$(head -c 64 /dev/zero | base64 -w0)"
   printf '{"packages":[{"name":"crit","version":"1.0.0"},{"name":"mal","version":"1.0.0"},{"name":"fine","version":"1.0.0"}]}' \
-    | run_evidence 2>/dev/null | jq -c '. + {acceptances: []}' > "$evidence"
+    | run_evidence 2>/dev/null > "$evidence"
   jq -n --arg sri "$sri" '{lockfileVersion: 3, packages: ({"": {name: "root"}} + ([["crit","1.0.0"],["mal","1.0.0"],["fine","1.0.0"]] | map({key: ("node_modules/" + .[0]),
     value: {version: .[1], resolved: ("https://registry.npmjs.org/" + .[0] + "/-/" + .[0] + "-" + .[1] + ".tgz"),
             integrity: $sri}}) | from_entries))}' > "$lock"
   out=$("$SAFE_CORE_BIN" project-decide --no-baseline --evidence "$evidence" "$lock") || rc=$?
-  if [[ "$rc" == "0" ]] \
+  if [[ "$rc" == "104" ]] \
     && jq -e '.outcome == {status:"stopped",class:"malice",exit:104}
         and (.malice | length == 1 and .[0].name == "mal" and .[0].versions == ["1.0.0"] and .[0].id == "MAL-2026-1")
         and (.advisories.introduced | length == 1 and .[0].name == "crit" and .[0].class == "blocking")' <<<"$out" >/dev/null; then
-    pass "evidence: the document the mode writes is the one safe-core project-decide reads"
+    pass "evidence: the document the mode writes is the one safe-core project-decide reads, unmodified, and the exit is the outcome's"
   else
     printf 'rc=%s out=%s\n' "$rc" "$out" >&2
-    fail "evidence: the document the mode writes is the one safe-core project-decide reads"
+    fail "evidence: the document the mode writes is the one safe-core project-decide reads, unmodified, and the exit is the outcome's"
   fi
 }
 

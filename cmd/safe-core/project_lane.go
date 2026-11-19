@@ -17,12 +17,13 @@ import (
 // evidence file to read what a change would introduce; the gate calls the same
 // commands. Exit 0 means a document was written, whatever it says (the
 // outcome is IN the document); exit 2 is usage; exit 3 is an input that cannot
-// be read, never an empty result.
+// be read, never an empty result. project-decide is the one command whose exit
+// carries its outcome (0 clear, otherwise the class's 100, 102 or 104).
 
 const (
 	projectGraphUsage  = "safe-core: usage: safe-core project-graph [--registry-host <host>]... [--public-evidence-host <host>]... <lockfile>"
 	projectDiffUsage   = "safe-core: usage: safe-core project-diff [--registry-host <host>]... [--public-evidence-host <host>]... (--baseline <lockfile> | --no-baseline) <target-lockfile>"
-	projectDecideUsage = "safe-core: usage: safe-core project-decide [--registry-host <host>]... [--public-evidence-host <host>]... (--baseline <lockfile> | --no-baseline) --evidence <file> <target-lockfile>"
+	projectDecideUsage = "safe-core: usage: safe-core project-decide [--registry-host <host>]... [--public-evidence-host <host>]... (--baseline <lockfile> | --no-baseline) --evidence <file> [--acceptances <file>] <target-lockfile>"
 )
 
 // projectLaneSchema versions the documents the graph and diff commands print.
@@ -34,6 +35,7 @@ type projectArgs struct {
 	baseline      string
 	noBaseline    bool
 	evidence      string
+	acceptances   string
 	target        string
 }
 
@@ -48,7 +50,7 @@ func parseProjectArgs(args []string, allowBaseline, needEvidence bool) (projectA
 	var parsed projectArgs
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
-		case "--registry-host", "--public-evidence-host", "--baseline", "--evidence":
+		case "--registry-host", "--public-evidence-host", "--baseline", "--evidence", "--acceptances":
 			if i+1 >= len(args) || args[i+1] == "" {
 				return projectArgs{}, false
 			}
@@ -69,6 +71,11 @@ func parseProjectArgs(args []string, allowBaseline, needEvidence bool) (projectA
 					return projectArgs{}, false
 				}
 				parsed.evidence = value
+			case "--acceptances":
+				if !needEvidence || parsed.acceptances != "" {
+					return projectArgs{}, false
+				}
+				parsed.acceptances = value
 			}
 		case "--no-baseline":
 			if !allowBaseline {
@@ -180,7 +187,13 @@ func projectDiff(args []string, stdout, stderr io.Writer) int {
 }
 
 // projectDecide prints the decision report over two lockfiles and an evidence
-// document.
+// document, with the standing acceptances as a separate document: the caller
+// hands both files as they are and never merges or re-encodes either.
+//
+// The exit status is the outcome's: 0 when the decision is clear, otherwise the
+// exit of the class left (100, 102, 104; an unbound graph is 102). The report
+// is printed whatever the status. Usage is 2 and an input that cannot be read
+// is 3, neither of which an outcome can be.
 //
 // Evidence that cannot be read is exit 3, never a report: a decision over
 // evidence nobody could read would vouch for a check that did not happen. A
@@ -202,16 +215,31 @@ func projectDecide(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "safe-core: project-decide: %v\n", err)
 		return 3
 	}
+	if parsed.acceptances != "" {
+		rawAcceptances, err := os.ReadFile(parsed.acceptances)
+		if err != nil {
+			fmt.Fprintf(stderr, "safe-core: project-decide: read acceptances: %v\n", err)
+			return 3
+		}
+		if evidence.Acceptances, err = projectlane.ReadAcceptances(rawAcceptances); err != nil {
+			fmt.Fprintf(stderr, "safe-core: project-decide: %v\n", err)
+			return 3
+		}
+	}
 	target, err := projectlane.LoadGraph(parsed.target, parsed.hosts())
 	if err != nil {
 		fmt.Fprintf(stderr, "safe-core: project-decide: %v\n", err)
 		return 3
 	}
 	baseline, unreadable := loadBaseline(parsed)
-	return printJSON(stdout, "project-decide", stderr, projectlane.Decide(projectlane.Input{
+	report := projectlane.Decide(projectlane.Input{
 		Baseline: baseline, BaselineError: unreadable, HasBaseline: !parsed.noBaseline,
 		Target: target, Evidence: evidence, RegistryHosts: parsed.registryHosts,
-	}))
+	})
+	if code := printJSON(stdout, "project-decide", stderr, report); code != 0 {
+		return code
+	}
+	return report.Outcome.Exit
 }
 
 // repeatedMembers reads one JSON document on stdin and prints, as a JSON
