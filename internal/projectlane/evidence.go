@@ -47,15 +47,20 @@ var advisoryID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 // Evidence is the strict, versioned input of the decision: what was read, kept
 // apart from what it means. Advisories and coverage are per exact identity;
-// the blocklist is per name; acceptances are standing authorities already
-// verified by whoever assembled the document (signers, generations and
-// ecosystems are checked there, not here).
+// the blocklist is per name. Standing acceptances are NOT part of this
+// document: they are authorities verified elsewhere (signers, generations and
+// ecosystems are checked there, not here) and arrive as their own strict
+// document (see ReadAcceptances), so that nobody merges or re-encodes the
+// evidence to add them. A document that carries an "acceptances" member is
+// refused like any other foreign member.
 type Evidence struct {
 	SchemaVersion int                `json:"schema_version"`
 	Policy        Policy             `json:"policy"`
 	Identities    []IdentityEvidence `json:"identities"`
 	Blocklist     []BlocklistHit     `json:"blocklist"`
-	Acceptances   []Acceptance       `json:"acceptances"`
+	// Acceptances is set by the caller from the separate acceptances input;
+	// the evidence document never carries it.
+	Acceptances []Acceptance `json:"-"`
 }
 
 // Policy is the operator's install policy the decision applies.
@@ -134,7 +139,7 @@ func requireShape(raw []byte) error {
 	if err := json.Unmarshal(raw, &root); err != nil || root == nil {
 		return fmt.Errorf("not a JSON object")
 	}
-	if err := requireKeys(root, "", "schema_version", "policy", "identities", "blocklist", "acceptances"); err != nil {
+	if err := requireKeys(root, "", "schema_version", "policy", "identities", "blocklist"); err != nil {
 		return err
 	}
 	policy, _ := root["policy"].(map[string]any)
@@ -150,7 +155,6 @@ func requireShape(raw []byte) error {
 	}{
 		{"identities", []string{"name", "version", "coverage", "gap", "advisories"}},
 		{"blocklist", []string{"name", "reason"}},
-		{"acceptances", []string{"kind", "name", "version", "host", "advisories"}},
 	}
 	for _, list := range lists {
 		items, ok := root[list.key].([]any)
@@ -166,7 +170,7 @@ func requireShape(raw []byte) error {
 			if err := requireKeys(object, prefix, list.keys...); err != nil {
 				return err
 			}
-			if list.key == "identities" || list.key == "acceptances" {
+			if list.key == "identities" {
 				if _, ok := object["advisories"].([]any); !ok {
 					return fmt.Errorf("%sadvisories must be a list", prefix)
 				}
@@ -265,7 +269,65 @@ func (e Evidence) validate() error {
 			return fmt.Errorf("blocklist[%d]: name is required", i)
 		}
 	}
-	for i, acceptance := range e.Acceptances {
+	return nil
+}
+
+// AcceptancesSchema is the version of the acceptances document.
+const AcceptancesSchema = 1
+
+// ReadAcceptances decodes the standing-acceptances document strictly, with the
+// same discipline as ReadEvidence: one JSON document, no repeated member, no
+// unknown member, every member present, every value in its domain.
+func ReadAcceptances(raw []byte) ([]Acceptance, error) {
+	if err := strictjson.RejectRepeatedMembers(raw); err != nil {
+		return nil, fmt.Errorf("acceptances: %w", err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(raw, &root); err != nil || root == nil {
+		return nil, fmt.Errorf("acceptances: not a JSON object")
+	}
+	if err := requireKeys(root, "", "schema_version", "acceptances"); err != nil {
+		return nil, fmt.Errorf("acceptances: %w", err)
+	}
+	items, ok := root["acceptances"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("acceptances: acceptances must be a list")
+	}
+	for i, item := range items {
+		object, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("acceptances: acceptances[%d] must be an object", i)
+		}
+		if err := requireKeys(object, fmt.Sprintf("acceptances[%d].", i), "kind", "name", "version", "host", "advisories"); err != nil {
+			return nil, fmt.Errorf("acceptances: %w", err)
+		}
+		if _, ok := object["advisories"].([]any); !ok {
+			return nil, fmt.Errorf("acceptances: acceptances[%d].advisories must be a list", i)
+		}
+	}
+	var document struct {
+		SchemaVersion int          `json:"schema_version"`
+		Acceptances   []Acceptance `json:"acceptances"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&document); err != nil {
+		return nil, fmt.Errorf("acceptances: %w", err)
+	}
+	if decoder.More() {
+		return nil, fmt.Errorf("acceptances: more than one JSON document")
+	}
+	if document.SchemaVersion != AcceptancesSchema {
+		return nil, fmt.Errorf("acceptances: unsupported schema_version %d (this reader knows %d)", document.SchemaVersion, AcceptancesSchema)
+	}
+	if err := validateAcceptances(document.Acceptances); err != nil {
+		return nil, fmt.Errorf("acceptances: %w", err)
+	}
+	return document.Acceptances, nil
+}
+
+func validateAcceptances(acceptances []Acceptance) error {
+	for i, acceptance := range acceptances {
 		switch acceptance.Kind {
 		case AcceptLocalExact, AcceptFollowedGrant, AcceptFollowedInstall:
 			if len(acceptance.Advisories) != 0 {

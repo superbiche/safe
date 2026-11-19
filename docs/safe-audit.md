@@ -760,9 +760,16 @@ anything but "none" or "these paths" is breakage and the exit is 4, never a
 clean answer. A `MAL-` record keeps the
 name and version it affects (`malware: true`). The blocklist is reported by
 name, independently of every OSV outcome. The document carries no verdict:
-`safe-core project-decide` reads it, with the standing acceptances added, and
-decides what a command introduces. The exit is 0 with a document, 2 for
-malformed input and 4 when no document can be trusted (an unreadable blocklist, or no `safe-core`).
+`safe-core project-decide` reads it as written and decides what a command
+introduces. The standing acceptances are a second, separate input
+(`--acceptances <file>`: a strict document `{"schema_version": 1, "acceptances": [...]}`), so
+nobody merges or re-encodes the evidence to add them; an evidence document that
+carries an `acceptances` member, a repeated member or any other foreign member
+is refused. `project-decide` prints its report and exits with the outcome's
+status (0 clear, otherwise the exit of the first class left: 100, 102 or 104);
+2 is usage and 3 an input that cannot be read, never a report. The mode itself
+exits 0 with a document, 2 for malformed input and 4 when no document can be
+trusted (an unreadable blocklist, or no `safe-core`).
 
 ## IOC Workflows
 

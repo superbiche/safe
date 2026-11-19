@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Project-lane binding transaction, groundwork only: no installed gate calls it
+  yet. `safe-core project-bind` builds the judged tree in a private staging
+  directory inside the project (frozen install as a child, with a given
+  environment), verifies it against the judged lockfile and only then publishes
+  it, with the judged manifests and lockfile replaced atomically in their own
+  mode; before publication any failure, signal or child death leaves the project
+  byte for byte as it was, and an interrupted publication is journaled and
+  undone by the next run. It requires the caller's exclusive lock on the
+  project directory and refuses a symbolic-link tree root, symbolic-link inputs,
+  inputs that changed since they were judged and lockfiles with links. It exits
+  with its outcome (30 refused, 31 install failed, 32 verification failed, 33
+  inputs changed, 34 interrupted, 35 publication failed). `safe-core
+  project-tree` is its strict verifier on its own: no symbolic link followed,
+  hidden extras refused, absence only when the selection provably deselects the
+  entry, npm's hidden lockfile validated. `project-decide` now exits with its
+  outcome's status (0 clear, 100, 102 or 104) and reads the standing acceptances
+  from a separate `--acceptances` document: the evidence document no longer
+  carries an `acceptances` member (a document that does is refused), so
+  nothing merges or re-encodes it.
 - Project-lane judging core, groundwork only: no installed gate calls it yet and
   nothing about an install command changes. `safe-core` gains `project-graph`
   (an npm lockfile's artifact graph and whether safe can bind every artifact),

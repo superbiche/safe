@@ -250,12 +250,12 @@ func TestReadEvidenceRefusesASecondSpellingOfASchemaField(t *testing.T) {
 	// under strings.ToLower, so it slips the repeated-member guard; the exact
 	// allowlist is what refuses it.
 	cases := map[string]string{
-		"top level":    `{"schema_version":1,"policy":{"block_severities":["critical"]},"identities":[],"blocklist":[],"acceptances":[],"identitieſ":[]}`,
-		"policy":       `{"schema_version":1,"policy":{"block_severities":["critical"],"block_ſeverities":[]},"identities":[],"blocklist":[],"acceptances":[]}`,
-		"upper case":   `{"schema_version":1,"policy":{"block_severities":["critical"],"Block_Severities":[]},"identities":[],"blocklist":[],"acceptances":[]}`,
-		"in a list":    `{"schema_version":1,"policy":{"block_severities":[]},"identities":[{"name":"p","version":"1","coverage":"complete","gap":"","advisories":[],"Name":"q"}],"blocklist":[],"acceptances":[]}`,
-		"kelvin sign":  `{"schema_version":1,"policy":{"block_severities":[]},"identities":[],"blocklist":[{"name":"p","reaſon":"x","reason":"y"}],"acceptances":[]}`,
-		"advisory hit": `{"schema_version":1,"policy":{"block_severities":[]},"identities":[{"name":"p","version":"1","coverage":"complete","gap":"","advisories":[{"id":"A-1","severity":"low","malware":false,"ſeverity":"critical"}]}],"blocklist":[],"acceptances":[]}`,
+		"top level":    `{"schema_version":1,"policy":{"block_severities":["critical"]},"identities":[],"blocklist":[],"identitieſ":[]}`,
+		"policy":       `{"schema_version":1,"policy":{"block_severities":["critical"],"block_ſeverities":[]},"identities":[],"blocklist":[]}`,
+		"upper case":   `{"schema_version":1,"policy":{"block_severities":["critical"],"Block_Severities":[]},"identities":[],"blocklist":[]}`,
+		"in a list":    `{"schema_version":1,"policy":{"block_severities":[]},"identities":[{"name":"p","version":"1","coverage":"complete","gap":"","advisories":[],"Name":"q"}],"blocklist":[]}`,
+		"kelvin sign":  `{"schema_version":1,"policy":{"block_severities":[]},"identities":[],"blocklist":[{"name":"p","reaſon":"x","reason":"y"}]}`,
+		"advisory hit": `{"schema_version":1,"policy":{"block_severities":[]},"identities":[{"name":"p","version":"1","coverage":"complete","gap":"","advisories":[{"id":"A-1","severity":"low","malware":false,"ſeverity":"critical"}]}],"blocklist":[]}`,
 	}
 	for name, document := range cases {
 		t.Run(name, func(t *testing.T) {

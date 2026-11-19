@@ -60,7 +60,7 @@ const laneEvidenceDoc = `{"schema_version":1,"policy":{"block_severities":["crit
   {"name":"p","version":"1.0.0","coverage":"complete","gap":"","advisories":[{"id":"GHSA-a","severity":"critical","malware":false}]},
   {"name":"p","version":"1.1.0","coverage":"complete","gap":"","advisories":[]},
   {"name":"q","version":"1.0.0","coverage":"complete","gap":"","advisories":[{"id":"GHSA-b","severity":"critical","malware":false}]}],
- "blocklist":[],"acceptances":[]}`
+ "blocklist":[]}`
 
 func TestProjectGraphReportsBindability(t *testing.T) {
 	dir := t.TempDir()
@@ -121,8 +121,8 @@ func TestProjectDecideOnTwoLockfilesAndAnEvidenceFile(t *testing.T) {
 	evidence := laneEvidence(t, dir, laneEvidenceDoc)
 
 	code, stdout, stderr := runLane("project-decide", "--baseline", before, "--evidence", evidence, after)
-	if code != 0 {
-		t.Fatalf("code = %d, stderr = %s", code, stderr)
+	if code != 104 {
+		t.Fatalf("code = %d, want the outcome's 104, stderr = %s", code, stderr)
 	}
 	var report struct {
 		Advisories struct {
@@ -144,6 +144,82 @@ func TestProjectDecideOnTwoLockfilesAndAnEvidenceFile(t *testing.T) {
 	}
 }
 
+// The exit status of project-decide is its outcome's, and the standing
+// acceptances are a second file handed as it is: a clear decision exits 0, an
+// outstanding class exits with the class's status, and an acceptance clears a
+// class without anything being merged into the evidence document.
+func TestProjectDecideExitIsTheOutcomesAndAcceptancesAreSeparate(t *testing.T) {
+	dir := t.TempDir()
+	clean := laneLock(t, dir, "clean.json", nil, "p", "1.1.0")
+	blocked := laneLock(t, dir, "blocked.json", nil, "q", "1.0.0")
+	adverse := laneLock(t, dir, "adverse.json", nil, "r", "1.0.0")
+	evidence := laneEvidence(t, dir, laneEvidenceDoc)
+	adverseEvidence := laneEvidence(t, t.TempDir(), `{"schema_version":1,"policy":{"block_severities":["critical"]},
+ "identities":[{"name":"r","version":"1.0.0","coverage":"complete","gap":"","advisories":[{"id":"GHSA-r","severity":"high","malware":false}]}],
+ "blocklist":[]}`)
+	approval := func(name string) string {
+		path := filepath.Join(dir, "acceptances-"+name+".json")
+		doc := `{"schema_version":1,"acceptances":[{"kind":"local_exact_approval","name":"` + name + `","version":"1.0.0","host":"registry.npmjs.org","advisories":[]}]}`
+		if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	cases := map[string]struct {
+		args []string
+		code int
+	}{
+		"clear is 0":                                {[]string{"--no-baseline", "--evidence", evidence, clean}, 0},
+		"a blocking advisory is 104":                {[]string{"--no-baseline", "--evidence", evidence, blocked}, 104},
+		"an adverse advisory is 100":                {[]string{"--no-baseline", "--evidence", adverseEvidence, adverse}, 100},
+		"an acceptance clears the adverse advisory": {[]string{"--no-baseline", "--evidence", adverseEvidence, "--acceptances", approval("r"), adverse}, 0},
+		"an acceptance of another artifact is not":  {[]string{"--no-baseline", "--evidence", adverseEvidence, "--acceptances", approval("x"), adverse}, 100},
+		"an acceptance clears the blocking one":     {[]string{"--no-baseline", "--evidence", evidence, "--acceptances", approval("q"), blocked}, 0},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			code, stdout, stderr := runLane(append([]string{"project-decide"}, tc.args...)...)
+			if code != tc.code || !strings.Contains(stdout, `"outcome"`) {
+				t.Fatalf("code = %d (want %d), stdout = %s, stderr = %s", code, tc.code, stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestProjectDecideRefusesAMalformedAcceptancesOrEvidenceDocument(t *testing.T) {
+	dir := t.TempDir()
+	lock := laneLock(t, dir, "lock.json", nil, "p", "1.0.0")
+	evidence := laneEvidence(t, dir, laneEvidenceDoc)
+	write := func(name, doc string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	repeated := write("repeated.json", `{"schema_version":1,"policy":{"block_severities":["critical"]},"identities":[],"blocklist":[],"blocklist":[]}`)
+	foreign := write("foreign.json", `{"schema_version":1,"policy":{"block_severities":["critical"]},"identities":[],"blocklist":[],"acceptances":[]}`)
+	for name, args := range map[string][]string{
+		"an evidence document with a repeated member": {"--evidence", repeated, lock},
+		"an evidence document with a foreign member":  {"--evidence", foreign, lock},
+		"acceptances with a repeated member":          {"--evidence", evidence, "--acceptances", write("a1.json", `{"schema_version":1,"acceptances":[],"acceptances":[]}`), lock},
+		"acceptances with a foreign member":           {"--evidence", evidence, "--acceptances", write("a2.json", `{"schema_version":1,"acceptances":[],"extra":1}`), lock},
+		"acceptances that cannot be read":             {"--evidence", evidence, "--acceptances", filepath.Join(dir, "none"), lock},
+		"acceptances named twice":                     {"--evidence", evidence, "--acceptances", write("a3.json", `{"schema_version":1,"acceptances":[]}`), "--acceptances", write("a4.json", `{"schema_version":1,"acceptances":[]}`), lock},
+	} {
+		t.Run(name, func(t *testing.T) {
+			code, stdout, stderr := runLane(append([]string{"project-decide", "--no-baseline"}, args...)...)
+			want := 3
+			if strings.Contains(name, "twice") {
+				want = 2
+			}
+			if code != want || stdout != "" || stderr == "" {
+				t.Fatalf("code = %d (want %d), stdout = %q, stderr = %q", code, want, stdout, stderr)
+			}
+		})
+	}
+}
+
 func TestProjectDecideTreatsAnUnreadableBaselineAsMissingEvidence(t *testing.T) {
 	dir := t.TempDir()
 	after := laneLock(t, dir, "after.json", nil, "p", "1.1.0")
@@ -155,7 +231,7 @@ func TestProjectDecideTreatsAnUnreadableBaselineAsMissingEvidence(t *testing.T) 
 	}()} {
 		t.Run(name, func(t *testing.T) {
 			code, stdout, stderr := runLane("project-decide", "--baseline", baseline, "--evidence", evidence, after)
-			if code != 0 || !strings.Contains(stdout, `"source":"unreadable"`) || !strings.Contains(stdout, `"class":"missing_evidence"`) {
+			if code != 102 || !strings.Contains(stdout, `"source":"unreadable"`) || !strings.Contains(stdout, `"class":"missing_evidence"`) {
 				t.Fatalf("code = %d, stdout = %s, stderr = %s", code, stdout, stderr)
 			}
 		})
