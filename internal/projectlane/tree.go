@@ -60,11 +60,7 @@ const (
 	// TreeBinInvalid: an entry of a .bin directory that is not a link to a
 	// regular file, inside the tree, of a package whose lockfile entry
 	// declares that command under that name.
-	TreeBinInvalid = "bin_invalid"
-	// TreeFlagsInconsistent: the lockfile's optional, dev, devOptional or peer
-	// flag of an entry contradicts its own dependency edges, so the flag cannot
-	// be trusted to deselect the entry.
-	TreeFlagsInconsistent          = "flags_inconsistent"
+	TreeBinInvalid                 = "bin_invalid"
 	TreeHiddenLockfileUnreadable   = "hidden_lockfile_unreadable"
 	TreeHiddenLockfileInconsistent = "hidden_lockfile_inconsistent"
 )
@@ -181,13 +177,6 @@ type lockEntry struct {
 	Libc        json.RawMessage
 	Bin         json.RawMessage
 
-	// Dependency edges, by name; the kind of an edge is the map it is in.
-	Dependencies         []string
-	OptionalDependencies []string
-	PeerDependencies     []string
-	DevDependencies      []string
-	PeerOptional         map[string]bool
-
 	path         string
 	expectedName string
 }
@@ -201,8 +190,6 @@ type judgedLock struct {
 	// outside lists the keys that are not a chain of node_modules/<package>
 	// segments. They are never joined to a directory.
 	outside []string
-	// inconsistent lists the entries whose flags contradict their edges.
-	inconsistent []string
 }
 
 // decodeEntry reads one lockfile (or hidden lockfile) entry by exact,
@@ -220,6 +207,13 @@ func decodeEntry(raw json.RawMessage) (lockEntry, error) {
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &members); err != nil {
 		return entry, err
+	}
+	// A null is not an absent member: npm reads the property as written, and
+	// a comparison of "absent against absent" must not be satisfied by it.
+	for _, key := range lockdiff.IdentityFields {
+		if value, ok := members[key]; ok && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return entry, fmt.Errorf("%s is null", key)
+		}
 	}
 	text := func(key string, into *string) error {
 		value, ok := members[key]
@@ -241,21 +235,6 @@ func decodeEntry(raw json.RawMessage) (lockEntry, error) {
 		}
 		return nil
 	}
-	names := func(key string, into *[]string) error {
-		value, ok := members[key]
-		if !ok {
-			return nil
-		}
-		var edges map[string]json.RawMessage
-		if err := json.Unmarshal(value, &edges); err != nil || edges == nil {
-			return fmt.Errorf("%s is not an object", key)
-		}
-		for name := range edges {
-			*into = append(*into, name)
-		}
-		sort.Strings(*into)
-		return nil
-	}
 	for _, step := range []func() error{
 		func() error { return text("name", &entry.Name) },
 		func() error { return text("version", &entry.Version) },
@@ -267,28 +246,12 @@ func decodeEntry(raw json.RawMessage) (lockEntry, error) {
 		func() error { return flag("optional", &entry.Optional) },
 		func() error { return flag("devOptional", &entry.DevOptional) },
 		func() error { return flag("peer", &entry.Peer) },
-		func() error { return names("dependencies", &entry.Dependencies) },
-		func() error { return names("optionalDependencies", &entry.OptionalDependencies) },
-		func() error { return names("peerDependencies", &entry.PeerDependencies) },
-		func() error { return names("devDependencies", &entry.DevDependencies) },
 	} {
 		if err := step(); err != nil {
 			return entry, err
 		}
 	}
 	entry.OS, entry.CPU, entry.Libc, entry.Bin = members["os"], members["cpu"], members["libc"], members["bin"]
-	if meta, ok := members["peerDependenciesMeta"]; ok {
-		var parsed map[string]struct {
-			Optional bool `json:"optional"`
-		}
-		if err := json.Unmarshal(meta, &parsed); err != nil {
-			return entry, errors.New("peerDependenciesMeta is not an object")
-		}
-		entry.PeerOptional = map[string]bool{}
-		for name, value := range parsed {
-			entry.PeerOptional[name] = value.Optional
-		}
-	}
 	return entry, nil
 }
 
@@ -296,6 +259,9 @@ func decodeEntry(raw json.RawMessage) (lockEntry, error) {
 // JSON document with exactly named members and no repeated member, version 2
 // or 3. A lockfile with link entries is ErrLinkEntries.
 func parseJudgedLockfile(raw []byte) (*judgedLock, error) {
+	if err := strictjson.RejectConflictMarkers(raw); err != nil {
+		return nil, fmt.Errorf("lockfile: %w", err)
+	}
 	root, err := strictjson.ParseObject(raw)
 	if err != nil {
 		return nil, fmt.Errorf("lockfile: %w", err)
@@ -342,114 +308,12 @@ func parseJudgedLockfile(raw []byte) (*judgedLock, error) {
 	if links {
 		return lock, ErrLinkEntries
 	}
-	lock.inconsistent = lock.checkFlags()
 	return lock, nil
 }
 
-// resolveEdge finds the occurrence a dependency of an occurrence resolves to,
-// as node's resolution does: the nearest node_modules up the tree.
-func (l *judgedLock) resolveEdge(from, name string) (string, bool) {
-	for current := from; ; current = parentEntry(current) {
-		key := "node_modules/" + name
-		if current != "" {
-			key = current + "/node_modules/" + name
-		}
-		if _, ok := l.entries[key]; ok {
-			return key, true
-		}
-		if current == "" {
-			return "", false
-		}
-	}
-}
-
-type edgeKind int
-
-const (
-	edgeProd edgeKind = iota
-	edgeOptional
-	edgePeer
-	edgePeerOptional
-	edgeDev
-)
-
-// edges lists the dependency edges of an occurrence by kind. An optional
-// dependency overrides the same name among the plain ones, as in npm.
-func edgesOf(entry *lockEntry) map[string]edgeKind {
-	edges := map[string]edgeKind{}
-	for _, name := range entry.DevDependencies {
-		edges[name] = edgeDev
-	}
-	for _, name := range entry.PeerDependencies {
-		if entry.PeerOptional[name] {
-			edges[name] = edgePeerOptional
-		} else {
-			edges[name] = edgePeer
-		}
-	}
-	for _, name := range entry.Dependencies {
-		edges[name] = edgeProd
-	}
-	for _, name := range entry.OptionalDependencies {
-		edges[name] = edgeOptional
-	}
-	return edges
-}
-
-// closure returns the occurrences reachable from the root through edges of the
-// allowed kinds only. Dev edges exist only on the root.
-func (l *judgedLock) closure(allowed ...edgeKind) map[string]bool {
-	allow := map[edgeKind]bool{}
-	for _, kind := range allowed {
-		allow[kind] = true
-	}
-	reached := map[string]bool{}
-	queue := []string{""}
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-		entry := &l.root
-		if current != "" {
-			entry = l.entries[current]
-		}
-		for name, kind := range edgesOf(entry) {
-			if !allow[kind] || (kind == edgeDev && current != "") {
-				continue
-			}
-			if target, ok := l.resolveEdge(current, name); ok && !reached[target] {
-				reached[target] = true
-				queue = append(queue, target)
-			}
-		}
-	}
-	return reached
-}
-
-// checkFlags returns the entries whose flag claims a deselection their own
-// dependency edges contradict: a dev entry reachable without a development
-// edge, an optional one reachable without an optional edge, a devOptional one
-// reachable through required production edges only, a peer one reachable
-// without a peer edge. Flags the edges do not support in the other direction
-// (a missing flag) only make the verifier stricter and are not an error.
-func (l *judgedLock) checkFlags() []string {
-	noDev := l.closure(edgeProd, edgeOptional, edgePeer, edgePeerOptional)
-	noOptional := l.closure(edgeProd, edgeDev, edgePeer)
-	production := l.closure(edgeProd, edgePeer)
-	noPeer := l.closure(edgeProd, edgeOptional, edgeDev)
-	var bad []string
-	for _, key := range l.paths {
-		entry := l.entries[key]
-		if entry.Dev && noDev[key] || entry.Optional && noOptional[key] ||
-			entry.DevOptional && production[key] || entry.Peer && noPeer[key] {
-			bad = append(bad, key)
-		}
-	}
-	return bad
-}
-
 // AdmitLockfile is the check made before anything runs: the lockfile reads
-// strictly, carries no link entries, keeps every key inside the tree and has
-// flags its edges support. It returns a stable reason and a detail, or "".
+// strictly, carries no link entries and keeps every key inside the tree. It
+// returns a stable reason and a detail, or "".
 func AdmitLockfile(raw []byte) (reason, detail string) {
 	lock, err := parseJudgedLockfile(raw)
 	switch {
@@ -459,8 +323,6 @@ func AdmitLockfile(raw []byte) (reason, detail string) {
 		return ReasonLockfileUnreadable, err.Error()
 	case len(lock.outside) > 0:
 		return ReasonLockfilePathsOutside, fmt.Sprintf("the lockfile names %q, which is not inside the tree", lock.outside[0])
-	case len(lock.inconsistent) > 0:
-		return ReasonFlagsInconsistent, fmt.Sprintf("the flags of %q contradict its dependency edges", lock.inconsistent[0])
 	}
 	return "", ""
 }
@@ -586,6 +448,19 @@ const (
 // (ErrLinkEntries included); everything about the tree is a problem in the
 // report.
 func VerifyTree(lockfile []byte, treeParent string, selection Selection) (TreeReport, error) {
+	return verifyTree(lockfile, treeParent, "", selection)
+}
+
+// VerifyHeldTree verifies a node_modules directory the caller holds open,
+// given as the /proc/self/fd path of its descriptor: the object verified is
+// that directory, whatever happens to the pathnames above it. Each name below
+// it is still resolved by an Lstat per component (no link followed); it is not
+// an openat chain.
+func VerifyHeldTree(lockfile []byte, treeRoot string, selection Selection) (TreeReport, error) {
+	return verifyTree(lockfile, "", treeRoot, selection)
+}
+
+func verifyTree(lockfile []byte, treeParent, treeRoot string, selection Selection) (TreeReport, error) {
 	if err := selection.Validate(); err != nil {
 		return TreeReport{}, fmt.Errorf("selection: %w", err)
 	}
@@ -596,14 +471,18 @@ func VerifyTree(lockfile []byte, treeParent string, selection Selection) (TreeRe
 	// treeParent is a path the caller trusts (a project directory, or a
 	// descriptor path of a directory it holds); everything below it is read
 	// without following a link.
-	info, err := os.Stat(treeParent)
+	checked := treeParent
+	if treeRoot != "" {
+		checked = treeRoot
+	}
+	info, err := os.Stat(checked)
 	if err != nil {
 		return TreeReport{}, err
 	}
 	if !info.IsDir() {
-		return TreeReport{}, fmt.Errorf("%q is not a directory", treeParent)
+		return TreeReport{}, fmt.Errorf("%q is not a directory", checked)
 	}
-	v := &verifier{root: treeParent, lock: lock, sel: selection, seen: map[string]bool{}, present: map[string]bool{}}
+	v := &verifier{root: treeParent, treeRoot: treeRoot, lock: lock, sel: selection, seen: map[string]bool{}, present: map[string]bool{}}
 	report := TreeReport{SchemaVersion: TreeSchema, Selection: selection.normalized(), Problems: []TreeProblem{}, Limits: append([]string{}, VerifierLimits...)}
 	v.report = &report
 	v.run()
@@ -619,12 +498,16 @@ func VerifyTree(lockfile []byte, treeParent string, selection Selection) (TreeRe
 }
 
 type verifier struct {
-	root    string
-	lock    *judgedLock
-	sel     Selection
-	report  *TreeReport
-	seen    map[string]bool // problem dedup
-	present map[string]bool // entry paths found as directories
+	// root is the directory that holds node_modules. When treeRoot is set the
+	// verifier is anchored on a held descriptor of the node_modules directory
+	// itself (a /proc/self/fd path) and every name below it resolves from there.
+	root     string
+	treeRoot string
+	lock     *judgedLock
+	sel      Selection
+	report   *TreeReport
+	seen     map[string]bool // problem dedup
+	present  map[string]bool // entry paths found as directories
 }
 
 func (v *verifier) problem(p TreeProblem) {
@@ -637,17 +520,20 @@ func (v *verifier) problem(p TreeProblem) {
 }
 
 func (v *verifier) abs(rel string) string {
+	if v.treeRoot != "" {
+		if rel == "node_modules" {
+			return v.treeRoot
+		}
+		if rest, ok := strings.CutPrefix(rel, "node_modules/"); ok {
+			return filepath.Join(v.treeRoot, filepath.FromSlash(rest))
+		}
+	}
 	return filepath.Join(v.root, filepath.FromSlash(rel))
 }
 
 func (v *verifier) run() {
 	for _, key := range v.lock.outside {
 		v.problem(TreeProblem{Path: key, Problem: TreePathOutside, Detail: "lockfile key is not a chain of node_modules/<package> segments"})
-	}
-	for _, key := range v.lock.inconsistent {
-		entry := v.lock.entries[key]
-		v.problem(TreeProblem{Path: key, Problem: TreeFlagsInconsistent, Name: entry.expectedName, Version: entry.Version,
-			Detail: "the lockfile's flags contradict its dependency edges; no deselection is trusted"})
 	}
 	rootState := v.rootState()
 	if rootState == stateDirectory {
@@ -683,6 +569,9 @@ const (
 // rootState inspects node_modules itself, reporting a link, a file or an
 // unreadable root.
 func (v *verifier) rootState() pathState {
+	if v.treeRoot != "" {
+		return stateDirectory // a held directory descriptor: nothing to follow
+	}
 	return v.lstatDir("node_modules", false)
 }
 
@@ -920,6 +809,11 @@ func (e *lockEntry) binCommands() map[string]string {
 		if path.IsAbs(cleaned) || cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
 			return "", false
 		}
+		for _, segment := range strings.Split(cleaned, "/") {
+			if segment == "node_modules" {
+				return "", false // another package's territory
+			}
+		}
 		return cleaned, true
 	}
 	var many map[string]string
@@ -941,7 +835,8 @@ func (e *lockEntry) binCommands() map[string]string {
 }
 
 // regularFileBeneath checks that rel is a regular file reached through real
-// directories only: no component of it, the last included, is a link.
+// directories only: no component of it, the last included, is a link, and the
+// file opens without following one.
 func (v *verifier) regularFileBeneath(rel string) string {
 	parts := strings.Split(rel, "/")
 	for i := 1; i < len(parts); i++ {
@@ -957,15 +852,27 @@ func (v *verifier) regularFileBeneath(rel string) string {
 			return "the target is not a regular file"
 		}
 	}
+	file, err := os.OpenFile(v.abs(rel), os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return "the target cannot be opened without following a link: " + err.Error()
+	}
+	defer file.Close()
+	if info, err := file.Stat(); err != nil || !info.Mode().IsRegular() {
+		return "the target is not a regular file"
+	}
 	return ""
 }
 
-// checkBin accepts npm's .bin directory entry by entry: each must be a link
-// that resolves, inside this node_modules directory, to a regular file of a
-// package whose lockfile entry declares that command at that file. A dangling
-// link, a link to another package's file or to a file the lockfile does not
-// declare, a link through another link, and a file or directory in .bin are
-// all failures.
+// checkBin accepts npm's .bin directory entry by entry. Only the links that are
+// present are attributed (npm skips a command whose file is missing). Each
+// must be a symbolic link whose TEXT is exactly the relative path npm's linker
+// writes for a command a package's lockfile entry declares, that is
+// "../<package>/<declared file>" (bin-links computes relative(dirname(link),
+// resolve(package, file)) from the normalised manifest), and the declared file
+// must be a regular file beneath that package directory reached without
+// following a link. A link with any other spelling, cancelling or redundant
+// components included, a file or directory in .bin, and a link to a command no
+// entry declares are failures.
 func (v *verifier) checkBin(binRel string) {
 	nm := path.Dir(binRel)
 	items, err := os.ReadDir(v.abs(binRel))
@@ -983,37 +890,41 @@ func (v *verifier) checkBin(binRel string) {
 			bad(TreeBinInvalid, "an entry of .bin that is not a link")
 			continue
 		}
-		target, err := os.Readlink(v.abs(entryRel))
+		text, err := os.Readlink(v.abs(entryRel))
 		if err != nil {
 			bad(TreeUnreadable, err.Error())
 			continue
 		}
-		resolved := path.Join(binRel, target)
-		if path.IsAbs(target) || !strings.HasPrefix(resolved, "node_modules/") {
+		if cleaned := path.Join(binRel, text); path.IsAbs(text) || !strings.HasPrefix(cleaned, "node_modules/") {
 			bad(TreePathOutside, "the link leaves the tree")
 			continue
 		}
-		rest, inside := strings.CutPrefix(resolved, nm+"/")
-		if !inside {
-			bad(TreeBinInvalid, "the link does not point into the package directories beside .bin")
+		rest, ok := strings.CutPrefix(text, "../")
+		if !ok {
+			bad(TreeBinInvalid, "the link is not a relative path to a package beside .bin")
 			continue
 		}
 		segments := strings.Split(rest, "/")
-		pkg, used := segments[0], 1
+		pkg := segments[0]
 		if strings.HasPrefix(pkg, "@") && len(segments) > 1 {
-			pkg, used = pkg+"/"+segments[1], 2
+			pkg += "/" + segments[1]
 		}
 		entry, known := v.lock.entries[nm+"/"+pkg]
-		file := strings.Join(segments[used:], "/")
-		switch {
-		case !known:
+		if !known {
 			bad(TreeBinInvalid, "the link points into a package the lockfile does not name")
-		case file == "" || entry.binCommands()[command] != file:
-			bad(TreeBinInvalid, "the package's lockfile entry does not declare this command at this file")
-		default:
-			if detail := v.regularFileBeneath(resolved); detail != "" {
-				bad(TreeBinInvalid, detail)
-			}
+			continue
+		}
+		declared, ok := entry.binCommands()[command]
+		if !ok {
+			bad(TreeBinInvalid, "the package's lockfile entry does not declare this command")
+			continue
+		}
+		if text != "../"+pkg+"/"+declared {
+			bad(TreeBinInvalid, "the link text is not the path npm writes for the declared command")
+			continue
+		}
+		if detail := v.regularFileBeneath(nm + "/" + pkg + "/" + declared); detail != "" {
+			bad(TreeBinInvalid, detail)
 		}
 	}
 }
@@ -1097,6 +1008,10 @@ func (v *verifier) checkHiddenLockfile() {
 	}
 	raw, err := readFileNoFollow(v.abs(rel), maxHiddenLockfileBytes)
 	if err != nil {
+		fail(TreeHiddenLockfileUnreadable, err.Error())
+		return
+	}
+	if err := strictjson.RejectConflictMarkers(raw); err != nil {
 		fail(TreeHiddenLockfileUnreadable, err.Error())
 		return
 	}

@@ -3,6 +3,7 @@ package strictjson
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -58,4 +59,22 @@ func ParseObject(raw []byte) (map[string]json.RawMessage, error) {
 		return nil, fmt.Errorf("not a JSON object")
 	}
 	return members, nil
+}
+
+var (
+	markerOurs   = regexp.MustCompile(`<{7,}`)
+	markerTheirs = regexp.MustCompile(`={7,}`)
+	markerEnd    = regexp.MustCompile(`>{7,}`)
+)
+
+// RejectConflictMarkers refuses a document that npm's lockfile reader would
+// take for a merge-conflicted file: one holding a run of seven or more of each
+// of '<', '=' and '>' anywhere in its text, inside a JSON string included. npm
+// then parses its own reconstruction of the two sides, not the document, so
+// such an input is outside the language this reader and npm agree on.
+func RejectConflictMarkers(raw []byte) error {
+	if markerOurs.Match(raw) && markerTheirs.Match(raw) && markerEnd.Match(raw) {
+		return fmt.Errorf("the document carries merge-conflict markers, which npm's lockfile reader interprets differently")
+	}
+	return nil
 }

@@ -48,3 +48,30 @@ func TestRejectVariants(t *testing.T) {
 		}
 	}
 }
+
+func TestRejectConflictMarkers(t *testing.T) {
+	for name, raw := range map[string]string{
+		"a git conflict":          "<<<<<<< HEAD\n{}\n=======\n{}\n>>>>>>> branch\n",
+		"the markers in a string": `{"description":"<<<<<<< ======= >>>>>>>"}`,
+	} {
+		if RejectConflictMarkers([]byte(raw)) == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	for name, raw := range map[string]string{
+		"a plain document":        `{"a":1}`,
+		"two of the three":        `{"d":"<<<<<<< >>>>>>>"}`,
+		"runs that are too short": `{"d":"<<<<<< ====== >>>>>>"}`,
+		"base64 padding":          `{"integrity":"sha512-AAAA=="}`,
+	} {
+		if err := RejectConflictMarkers([]byte(raw)); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+func TestExactDocumentRefusesAByteOrderMark(t *testing.T) {
+	if err := ExactDocument([]byte("\xef\xbb\xbf{\"a\":1}")); err == nil {
+		t.Fatal("a UTF-8 byte-order mark was accepted (npm strips it; this reader refuses it: a compatibility limit)")
+	}
+}

@@ -16,7 +16,6 @@ import (
 	"strings"
 	"syscall"
 	"testing"
-	"time"
 )
 
 // Scenarios of the critical review of pull request 223, one per finding, each
@@ -280,29 +279,29 @@ func TestReviewFinding4NoInheritedDescriptorReachesTheChild(t *testing.T) {
 	}
 }
 
-func TestReviewFinding4NothingOfTheInstallIsLeftRunningBeforeVerification(t *testing.T) {
+func TestReviewFinding4TheInstallsProcessGroupIsGoneBeforeVerification(t *testing.T) {
 	p := rsNew(t)
 	pidFile := filepath.Join(rsDir(t), "pid")
-	p.req.Argv = []string{"/bin/sh", "-c", `cp -a "$SRC/node_modules" node_modules; setsid sh -c 'echo $$ > "$PIDF"; exec sleep 60' >/dev/null 2>&1 &
+	// A background process in the install's own process group, still running
+	// when the install exits. (A process that leaves the group is outside the
+	// stated assumption: the install command is trusted and runs no script.)
+	p.req.Argv = []string{"/bin/sh", "-c", `cp -a "$SRC/node_modules" node_modules; sh -c 'echo $$ > "$PIDF"; exec sleep 60' >/dev/null 2>&1 &
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -s "$PIDF" ] && break; sleep 0.05; done`}
 	p.req.Env = append(p.req.Env, "PIDF="+pidFile)
 	report := p.bind()
 	raw, _ := os.ReadFile(pidFile)
 	pid, _ := strconv.Atoi(strings.TrimSpace(string(raw)))
 	if pid <= 0 {
-		t.Fatalf("the escapee never wrote its pid (outcome %s)", report.Outcome)
+		t.Fatalf("the background process never wrote its pid (outcome %s)", report.Outcome)
 	}
-	{
-		defer func() { _ = syscall.Kill(pid, syscall.SIGKILL) }()
-		deadline := time.Now().Add(2 * time.Second)
-		for syscall.Kill(pid, 0) == nil && time.Now().Before(deadline) {
-			time.Sleep(10 * time.Millisecond)
-		}
-		if syscall.Kill(pid, 0) == nil {
-			if stat, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat"); !strings.Contains(string(stat), ") Z ") {
-				t.Fatalf("a process of the install (pid %d, outside its process group) is still running after %s", pid, report.Outcome)
-			}
-		}
+	defer func() { _ = syscall.Kill(pid, syscall.SIGKILL) }()
+	if report.Outcome != OutcomePublished {
+		t.Fatalf("outcome = %s (%s)", report.Outcome, report.Detail)
+	}
+	// Bind returned: the group was empty before verification started, so the
+	// process is gone, not merely a zombie.
+	if err := syscall.Kill(pid, 0); err == nil {
+		t.Fatalf("pid %d of the install's process group still exists after the run", pid)
 	}
 }
 
@@ -365,23 +364,6 @@ func TestReviewFinding6APresentOptionalParentDoesNotExcuseAMissingChild(t *testi
 	}
 }
 
-func TestReviewFinding6AFlagThatContradictsARequiredEdgeExcusesNothing(t *testing.T) {
-	root := rsDir(t)
-	lock := rsLock(map[string]any{
-		"":                    map[string]any{"name": "root", "dependencies": map[string]any{"app": "1"}},
-		"node_modules/app":    with(rsEntry("app", "1.0.0"), map[string]any{"dependencies": map[string]any{"shared": "1"}}),
-		"node_modules/shared": with(rsEntry("shared", "1.0.0"), map[string]any{"dev": true}),
-	})
-	rsInstall(t, root, "node_modules/app", "app", "1.0.0")
-	report, err := VerifyTree(lock, root, Selection{OS: "linux", CPU: "x64", Omit: []string{"dev"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if report.Ok {
-		t.Fatalf("a missing production dependency was excused by a dev flag its own edge contradicts: %+v", report)
-	}
-}
-
 // Finding 7: publication can overwrite an edit or report success with the wrong lockfile.
 func TestReviewFinding7AnEditToAPublishedFileIsNotReportedAsPublished(t *testing.T) {
 	p := rsNew(t)
@@ -416,21 +398,39 @@ func TestReviewFinding8ASecondSpellingOfResolvedIsRefused(t *testing.T) {
 	}
 }
 
-func TestReviewFinding8TrailingContentAndSpellingsInInstalledDocuments(t *testing.T) {
-	root := rsDir(t)
-	lock := rsLock(map[string]any{"node_modules/a": rsEntry("a", "1.0.0")})
-	for name, content := range map[string]string{
-		"a second spelling of name": `{"name":"evil","Name":"a","version":"1.0.0"}`,
-		"a stray closing brace":     `{"name":"a","version":"1.0.0"}}`,
-	} {
-		rsPut(t, filepath.Join(root, "node_modules/a/package.json"), content, 0o644)
-		report, err := VerifyTree(lock, root, Selection{OS: "linux", CPU: "x64"})
-		if err == nil && report.Ok {
-			t.Fatalf("%s: accepted", name)
-		}
+func rsTreeWith(t *testing.T, manifest string) (root string, lock []byte) {
+	t.Helper()
+	root = rsDir(t)
+	lock = rsLock(map[string]any{"node_modules/a": rsEntry("a", "1.0.0")})
+	rsPut(t, filepath.Join(root, "node_modules/a/package.json"), manifest, 0o644)
+	return root, lock
+}
+
+func rsRefused(root string, lock []byte) bool {
+	report, err := VerifyTree(lock, root, Selection{OS: "linux", CPU: "x64"})
+	return err != nil || !report.Ok
+}
+
+func TestReviewFinding8AManifestWithASecondSpellingOfNameIsRefused(t *testing.T) {
+	root, lock := rsTreeWith(t, `{"name":"evil","Name":"a","version":"1.0.0"}`)
+	if !rsRefused(root, lock) {
+		t.Fatal("accepted")
 	}
-	rsPut(t, filepath.Join(root, "node_modules/a/package.json"), `{"name":"a","version":"1.0.0"}`, 0o644)
-	if _, err := VerifyTree(append(append([]byte{}, lock...), '}'), root, Selection{OS: "linux", CPU: "x64"}); err == nil {
+}
+
+func TestReviewFinding8AManifestWithAStrayClosingBraceIsRefused(t *testing.T) {
+	root, lock := rsTreeWith(t, `{"name":"a","version":"1.0.0"}}`)
+	if !rsRefused(root, lock) {
+		t.Fatal("accepted")
+	}
+}
+
+func TestReviewFinding8ALockfileWithAStrayClosingBraceIsRefused(t *testing.T) {
+	root, lock := rsTreeWith(t, `{"name":"a","version":"1.0.0"}`)
+	if rsRefused(root, lock) {
+		t.Fatal("the control tree is refused")
+	}
+	if !rsRefused(root, append(append([]byte{}, lock...), '}')) {
 		t.Fatal("a lockfile with a stray closing brace was accepted")
 	}
 }
@@ -461,5 +461,140 @@ func TestReviewModesASetIdDestinationRefuses(t *testing.T) {
 	report := p.bind()
 	if report.Outcome == OutcomePublished {
 		t.Fatalf("published over a set-id destination: %+v", report)
+	}
+}
+
+// Round 2 (review of ecedff8). Same rule: only the API both heads share.
+
+func TestReview2Point1ACreatedFileEditedBeforeTheFinalCheckIsNotDeleted(t *testing.T) {
+	p := rsNew(t)
+	if err := os.Remove(filepath.Join(p.dir, "package-lock.json")); err != nil {
+		t.Fatal(err)
+	}
+	p.req.Live["package-lock.json"] = "absent"
+	name := filepath.Join(p.dir, "package-lock.json")
+	rsHook(t, "publish:tree", func() {
+		_ = os.WriteFile(name, []byte(`{"edited":"after the run created it"}`), 0o644)
+	})
+	p.bind()
+	if raw, err := os.ReadFile(name); err != nil || !strings.Contains(string(raw), "edited") {
+		t.Fatalf("the edited file was deleted or reverted: %q %v", raw, err)
+	}
+}
+
+func TestReview2Point1APermissionTighteningAfterPreparationIsNotLost(t *testing.T) {
+	p := rsNew(t)
+	name := filepath.Join(p.dir, "package.json")
+	rsHook(t, "publish:file:0:before", func() { _ = os.Chmod(name, 0o600) })
+	p.bind()
+	if info, err := os.Stat(name); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("the destination's mode was widened by the publication: %v %v", info, err)
+	}
+}
+
+func TestReview2Point3ATreeRootThatAppearsDuringTheRunIsNotTakenForTheOldTree(t *testing.T) {
+	p := rsNew(t)
+	if err := os.RemoveAll(filepath.Join(p.dir, "node_modules")); err != nil {
+		t.Fatal(err)
+	}
+	rsHook(t, "installed", func() {
+		rsPut(t, filepath.Join(p.dir, "node_modules/precious"), "mine", 0o644)
+	})
+	report := p.bind()
+	if raw, _ := os.ReadFile(filepath.Join(p.dir, "node_modules/precious")); string(raw) != "mine" || report.Outcome == OutcomePublished {
+		t.Fatalf("outcome = %s; the tree that appeared was discarded or published over", report.Outcome)
+	}
+}
+
+func TestReview2Point3AParentThatDisappearsBeforeTheFinalCheckDoesNotPanic(t *testing.T) {
+	p := rsNew(t)
+	ws := filepath.Join(p.dir, "ws")
+	rsPut(t, filepath.Join(ws, "package.json"), `{"name":"ws"}`, 0o644)
+	p.req.Publish = append(p.req.Publish, File{Rel: "ws/package.json", Content: []byte(`{"name":"ws","version":"2"}`)})
+	p.req.Live["ws/package.json"] = rsDigest(`{"name":"ws"}`)
+	rsHook(t, "publish:tree", func() { _ = os.Rename(ws, ws+".gone") })
+	if report := p.bind(); report.Outcome == OutcomePublished {
+		t.Fatalf("published although a published file's directory is gone: %+v", report)
+	}
+}
+
+func TestReview2Point4ACommandLinkIsTheTextNpmWrites(t *testing.T) {
+	root := rsDir(t)
+	a := with(rsEntry("a", "1.0.0"), map[string]any{"bin": map[string]any{"a": "bin.js"}})
+	lock := rsLock(map[string]any{"node_modules/a": a})
+	rsInstall(t, root, "node_modules/a", "a", "1.0.0")
+	rsPut(t, filepath.Join(root, "node_modules/a/bin.js"), "x", 0o644)
+	if err := os.MkdirAll(filepath.Join(root, "node_modules/.bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The cleaned text names the declared file; the text itself does not
+	// resolve there ("ghost" does not exist).
+	if err := os.Symlink("../ghost/../a/bin.js", filepath.Join(root, "node_modules/.bin/a")); err != nil {
+		t.Fatal(err)
+	}
+	report, err := VerifyTree(lock, root, Selection{OS: "linux", CPU: "x64"})
+	if err == nil && report.Ok {
+		t.Fatalf("a link whose text is not what npm writes was accepted: %+v", report)
+	}
+}
+
+func TestReview2Point5ARootEntryAndNullIdentityFieldsAreHeldToTheSameRules(t *testing.T) {
+	for name, doc := range map[string]string{
+		"a root entry with a second spelling": `{"lockfileVersion":3,"packages":{"":{"name":"root","Name":"x"}}}`,
+		"a null resolved":                     `{"lockfileVersion":3,"packages":{"":{"name":"root"},"node_modules/p":{"version":"1.0.0","resolved":null}}}`,
+	} {
+		path := filepath.Join(rsDir(t), "package-lock.json")
+		if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if graph, err := LoadGraph(path, Hosts{}); err == nil {
+			t.Errorf("%s: the graph was loaded: %+v", name, graph)
+		}
+	}
+}
+
+func TestReview2Point6AnInstallThatSelectsNoTreePublishes(t *testing.T) {
+	p := rsNew(t)
+	if err := os.RemoveAll(filepath.Join(p.dir, "node_modules")); err != nil {
+		t.Fatal(err)
+	}
+	empty := []byte(`{"lockfileVersion":3,"packages":{"":{"name":"root"}}}`)
+	p.req.Publish[1].Content = empty
+	p.req.Argv = []string{"/bin/sh", "-c", "true"}
+	if report := p.bind(); report.Outcome != OutcomePublished {
+		t.Fatalf("outcome = %s (%s)", report.Outcome, report.Detail)
+	}
+}
+
+func TestReview2Point5TheLockfilesNpmWritesAreAccepted(t *testing.T) {
+	sel := Selection{OS: "linux", CPU: "x64"}
+	for name, build := range map[string]func(root string) []byte{
+		"a root dependency that is both dev and peer": func(root string) []byte {
+			rsInstall(t, root, "node_modules/x", "x", "1.0.0")
+			return rsLock(map[string]any{
+				"":               map[string]any{"name": "root", "devDependencies": map[string]any{"x": "1"}, "peerDependencies": map[string]any{"x": "1"}},
+				"node_modules/x": with(rsEntry("x", "1.0.0"), map[string]any{"dev": true, "peer": true})})
+		},
+		"a root dependency that is both dev and production": func(root string) []byte {
+			rsInstall(t, root, "node_modules/x", "x", "1.0.0")
+			return rsLock(map[string]any{
+				"":               map[string]any{"name": "root", "dependencies": map[string]any{"x": "1"}, "devDependencies": map[string]any{"x": "1"}},
+				"node_modules/x": rsEntry("x", "1.0.0")})
+		},
+		"a production package's peer that is also a root dev dependency": func(root string) []byte {
+			rsInstall(t, root, "node_modules/app", "app", "1.0.0")
+			rsInstall(t, root, "node_modules/shared", "shared", "1.0.0")
+			return rsLock(map[string]any{
+				"":                    map[string]any{"name": "root", "dependencies": map[string]any{"app": "1"}, "devDependencies": map[string]any{"shared": "1"}},
+				"node_modules/app":    with(rsEntry("app", "1.0.0"), map[string]any{"peerDependencies": map[string]any{"shared": "1"}}),
+				"node_modules/shared": with(rsEntry("shared", "1.0.0"), map[string]any{"dev": true, "peer": true})})
+		},
+	} {
+		root := rsDir(t)
+		lock := build(root)
+		report, err := VerifyTree(lock, root, sel)
+		if err != nil || !report.Ok {
+			t.Errorf("%s: a complete tree was refused: %+v %v", name, report.Problems, err)
+		}
 	}
 }

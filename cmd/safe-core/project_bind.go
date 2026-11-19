@@ -35,6 +35,9 @@ import (
 //	33  a project input changed since it was judged
 //	34  interrupted by a signal; the project is as it was
 //	35  publication failed (the document says what state it left)
+//	36  the install ran but its completion could not be established (its process
+//	    group could not be shown empty): told apart from an install failure; the
+//	    staging directory is kept
 //
 // project-tree exits 0 when the tree is the judged one, 32 when it is not (the
 // document lists the problems), 30 for a lockfile it refuses (links), 3 for

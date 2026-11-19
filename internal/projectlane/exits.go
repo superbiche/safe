@@ -13,6 +13,10 @@ const (
 	OutcomeInputsChanged      = "inputs_changed"
 	OutcomeInterrupted        = "interrupted"
 	OutcomePublicationFailed  = "publication_failed"
+	// OutcomeInstallUnsettled: the install command ran, but it could not be
+	// established that nothing it started is left running (or that it ended).
+	// Told apart from a failed install: the staging directory is kept.
+	OutcomeInstallUnsettled = "install_unsettled"
 
 	ExitPublished          = 0
 	ExitRefused            = 30
@@ -21,6 +25,7 @@ const (
 	ExitInputsChanged      = 33
 	ExitInterrupted        = 34
 	ExitPublicationFailed  = 35
+	ExitInstallUnsettled   = 36
 )
 
 // Reasons a bind is refused, or fails. Stable identifiers.
@@ -37,11 +42,13 @@ const (
 	ReasonLockfileUnreadable   = "lockfile_unreadable"
 	ReasonLinksNotSupported    = "links_not_supported"
 	ReasonLockfilePathsOutside = "lockfile_path_outside_tree"
-	ReasonFlagsInconsistent    = "lockfile_flags_inconsistent"
 	ReasonStagingFailed        = "staging_failed"
 	ReasonStateDirInvalid      = "state_dir_invalid"
 	ReasonPlatformUnsupported  = "platform_unsupported"
+	ReasonDescriptorsUnsealed  = "descriptors_unsealed"
 	ReasonStartFailed          = "install_start_failed"
+	ReasonGroupRemains         = "install_group_remains"
+	ReasonWaitTimeout          = "install_wait_timeout"
 	ReasonInstallExit          = "install_exit"
 	ReasonInstallSignaled      = "install_signaled"
 	ReasonProcessesRemain      = "install_processes_remain"

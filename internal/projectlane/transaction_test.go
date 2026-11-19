@@ -945,6 +945,7 @@ func TestBindInterruptedPublicationLeavesAValidStateAtEveryStep(t *testing.T) {
 				t.Fatalf("package.json mode = %v", info.Mode())
 			}
 			// What the next run finds: a staging directory safe recorded, and no journal.
+			// (A process kill is what is simulated: the filesystem keeps running.)
 			items, _ := os.ReadDir(f.project)
 			var staging string
 			for _, item := range items {
@@ -960,10 +961,25 @@ func TestBindInterruptedPublicationLeavesAValidStateAtEveryStep(t *testing.T) {
 			}
 			next := f
 			after := next.bind()
-			if len(after.Recovery.Removed) != 1 || after.Recovery.Removed[0] != staging || len(after.Recovery.Left) != 0 {
-				t.Fatalf("the next run found %+v, want the recorded staging directory removed", after.Recovery)
+			// A run killed before the first exchange left an ordinary staging
+			// directory: removed on safe's record. From the first exchange on the
+			// record says "kept" (the directory may hold an object displaced from
+			// the project that nobody has inspected): left, named, never removed.
+			kept := step.stage != "publish:prepared" && step.stage != "publish:digested"
+			if kept {
+				if len(after.Recovery.Removed) != 0 || len(after.Recovery.Left) != 1 || after.Recovery.Left[0].Name != staging ||
+					!strings.HasPrefix(after.Recovery.Left[0].Reason, "kept:") {
+					t.Fatalf("the next run found %+v, want the kept staging directory left and named", after.Recovery)
+				}
+				if _, err := os.Stat(filepath.Join(f.project, staging)); err != nil {
+					t.Fatalf("a kept staging directory was removed: %v", err)
+				}
+			} else {
+				if len(after.Recovery.Removed) != 1 || after.Recovery.Removed[0] != staging || len(after.Recovery.Left) != 0 {
+					t.Fatalf("the next run found %+v, want the recorded staging directory removed", after.Recovery)
+				}
+				noStaging(t, f.project)
 			}
-			noStaging(t, f.project)
 			if step.want.files == old {
 				// Nothing was published: the same judgement still holds and the next run publishes.
 				wantOutcome(t, after, OutcomePublished, ExitPublished)
@@ -1358,5 +1374,521 @@ func TestBindTheDocumentStatesItsAssumptions(t *testing.T) {
 	}
 	if report.Verification == nil || len(report.Verification.Limits) == 0 {
 		t.Fatal("the verification does not state its limits")
+	}
+}
+
+func faultAt(t *testing.T, ops ...string) {
+	t.Helper()
+	faultHook = func(op string) error {
+		for _, want := range ops {
+			if op == want {
+				return errors.New("injected failure of " + op)
+			}
+		}
+		return nil
+	}
+	t.Cleanup(func() { faultHook = nil })
+}
+
+func recordsOf(t *testing.T, f *bindFx) []stagingRecord {
+	t.Helper()
+	var out []stagingRecord
+	root := filepath.Join(f.req.StateDir, "project-bind")
+	_ = filepath.WalkDir(root, func(name string, entry os.DirEntry, err error) error {
+		if err == nil && !entry.IsDir() && strings.HasPrefix(entry.Name(), stagingPrefix) {
+			var record stagingRecord
+			raw, _ := os.ReadFile(name)
+			if json.Unmarshal(raw, &record) == nil {
+				out = append(out, record)
+			}
+		}
+		return nil
+	})
+	return out
+}
+
+// Point 1. A file the run created, edited in place before the final check, is
+// never deleted by the undo: it is moved out, inspected, found not to be what
+// was created, and put back.
+func TestBindUndoNeverDeletesAnEditedCreatedFile(t *testing.T) {
+	f := newBindFx(t)
+	if err := os.Remove(filepath.Join(f.project, "package-lock.json")); err != nil {
+		t.Fatal(err)
+	}
+	f.judge()
+	name := filepath.Join(f.project, "package-lock.json")
+	hookAt(t, "publish:tree", func() error {
+		return os.WriteFile(name, []byte(`{"edited":"in place, after the run created it"}`), 0o644)
+	})
+	report := f.bind()
+	wantOutcome(t, report, OutcomeInputsChanged, ExitInputsChanged)
+	raw, err := os.ReadFile(name)
+	if err != nil || !strings.Contains(string(raw), "edited") {
+		t.Fatalf("the edited file was deleted or reverted: %q %v", raw, err)
+	}
+	pub := report.Publication
+	if pub.State != PublicationPartial || len(pub.Conflicts) != 1 || pub.Conflicts[0] != "package-lock.json" {
+		t.Fatalf("publication = %+v", pub)
+	}
+	for _, file := range pub.Files {
+		if file.Path == "package-lock.json" && file.State != StateChanged {
+			t.Fatalf("files = %+v", pub.Files)
+		}
+	}
+	if data, err := os.ReadFile(filepath.Join(f.project, "node_modules/old/data")); err != nil || string(data) != "old tree content" {
+		t.Fatalf("the old tree was not put back: %v", err)
+	}
+}
+
+// An exchange-back that fails: the displaced object (an editor's save) is in
+// staging, which is kept, marked kept in the record and named in the document.
+func TestBindAFailedExchangeBackRetainsTheDisplacedObject(t *testing.T) {
+	f := newBindFx(t)
+	name := filepath.Join(f.project, "package.json")
+	hookAt(t, "publish:file:0:before", func() error {
+		if err := os.WriteFile(name+".swp", []byte(`{"edited":"an editor's save"}`), 0o640); err != nil {
+			return err
+		}
+		return os.Rename(name+".swp", name)
+	})
+	faultAt(t, "exchange:file:package.json:back", "exchange:file:package.json:undo")
+	report := f.bind()
+	wantOutcome(t, report, OutcomeInputsChanged, ExitInputsChanged)
+	pub := report.Publication
+	if len(pub.Retained) != 1 || pub.Retained[0].Name != "new-0" || !strings.Contains(pub.Retained[0].Observed, "sha256:") {
+		t.Fatalf("publication = %+v", pub)
+	}
+	if report.Staging.Removed || report.Staging.Path == "" {
+		t.Fatalf("staging = %+v", report.Staging)
+	}
+	// The editor's save is where the document says it is.
+	raw, err := os.ReadFile(filepath.Join(f.project, report.Staging.Path, "new-0"))
+	if err != nil || !strings.Contains(string(raw), "an editor's save") {
+		t.Fatalf("the displaced object is not in staging: %q %v", raw, err)
+	}
+	records := recordsOf(t, f)
+	if len(records) != 1 || !records[0].Kept {
+		t.Fatalf("the record does not say kept: %+v", records)
+	}
+	// A later run does not remove it.
+	faultHook = nil
+	bindHook = nil
+	f.command("exit 3")
+	next := f.bind()
+	if len(next.Recovery.Removed) != 0 || len(next.Recovery.Left) != 1 || !strings.HasPrefix(next.Recovery.Left[0].Reason, "kept:") {
+		t.Fatalf("recovery = %+v", next.Recovery)
+	}
+	if _, err := os.Stat(filepath.Join(f.project, report.Staging.Path, "new-0")); err != nil {
+		t.Fatal("a later run removed the retained object")
+	}
+}
+
+// A first exchange-back that fails but is retried by the undo puts the editor's
+// save back where it was, and nothing is retained.
+func TestBindTheUndoRetriesAnExchangeBackThatFailed(t *testing.T) {
+	f := newBindFx(t)
+	name := filepath.Join(f.project, "package.json")
+	hookAt(t, "publish:file:0:before", func() error {
+		if err := os.WriteFile(name+".swp", []byte(`{"edited":"an editor's save"}`), 0o640); err != nil {
+			return err
+		}
+		return os.Rename(name+".swp", name)
+	})
+	faultAt(t, "exchange:file:package.json:back")
+	report := f.bind()
+	wantOutcome(t, report, OutcomeInputsChanged, ExitInputsChanged)
+	if raw, _ := os.ReadFile(name); !strings.Contains(string(raw), "an editor's save") {
+		t.Fatalf("the editor's save was lost: %q", raw)
+	}
+	if len(report.Publication.Retained) != 0 || !report.Staging.Removed {
+		t.Fatalf("report = %+v", report)
+	}
+}
+
+// A process that dies after displacing an editor's save, before inspecting it:
+// staging is kept and the save is there for a person.
+func TestBindKillAfterTheExchangeBeforeTheInspectionKeepsTheDisplacedObject(t *testing.T) {
+	f := newBindFx(t)
+	name := filepath.Join(f.project, "package.json")
+	hookAt(t, "publish:file:0:before", func() error {
+		if err := os.WriteFile(name+".swp", []byte(`{"edited":"an editor's save"}`), 0o640); err != nil {
+			return err
+		}
+		return os.Rename(name+".swp", name)
+	})
+	bindHook = func(stage string) error {
+		switch stage {
+		case "publish:file:0:before":
+			if err := os.WriteFile(name+".swp", []byte(`{"edited":"an editor's save"}`), 0o640); err != nil {
+				return err
+			}
+			return os.Rename(name+".swp", name)
+		case "publish:file:new-0:exchanged":
+			return errCrash
+		}
+		return nil
+	}
+	f.bind()
+	bindHook = nil
+	items, _ := os.ReadDir(f.project)
+	var staging string
+	for _, item := range items {
+		if strings.HasPrefix(item.Name(), stagingPrefix) {
+			staging = item.Name()
+		}
+	}
+	f.command("exit 3")
+	next := f.bind()
+	if len(next.Recovery.Removed) != 0 || len(next.Recovery.Left) != 1 || next.Recovery.Left[0].Name != staging {
+		t.Fatalf("recovery = %+v", next.Recovery)
+	}
+	raw, err := os.ReadFile(filepath.Join(f.project, staging, "new-0"))
+	if err != nil || !strings.Contains(string(raw), "an editor's save") {
+		t.Fatalf("the editor's save was not kept: %q %v", raw, err)
+	}
+}
+
+// The displaced file's permission bits must be the ones seen at preparation.
+func TestBindAPermissionChangeAfterPreparationIsNotLost(t *testing.T) {
+	f := newBindFx(t)
+	name := filepath.Join(f.project, "package.json")
+	hookAt(t, "publish:file:0:before", func() error { return os.Chmod(name, 0o600) })
+	report := f.bind()
+	wantOutcome(t, report, OutcomeInputsChanged, ExitInputsChanged)
+	info, err := os.Stat(name)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("the tightened mode was lost: %v %v", info, err)
+	}
+	if raw, _ := os.ReadFile(name); string(raw) != oldManifest {
+		t.Fatalf("package.json = %q", raw)
+	}
+	if len(report.Changed) == 0 || !strings.Contains(report.Changed[0].Found, "600") {
+		t.Fatalf("changed = %+v", report.Changed)
+	}
+}
+
+// Point 2. The record directories belong to the user and are not writable by
+// group or others, and no step of the path is a link; pruning touches only
+// records it validated.
+func TestBindRefusesARecordDirectoryOthersCanWriteOrThatIsALink(t *testing.T) {
+	for name, prepare := range map[string]func(f *bindFx){
+		"a state directory writable by group":  func(f *bindFx) { _ = os.Chmod(f.req.StateDir, 0o775) },
+		"a state directory writable by others": func(f *bindFx) { _ = os.Chmod(f.req.StateDir, 0o707) },
+		"a record directory writable by group": func(f *bindFx) {
+			dir := filepath.Join(f.req.StateDir, "project-bind")
+			_ = os.MkdirAll(dir, 0o700)
+			_ = os.Chmod(dir, 0o770)
+		},
+		"a project record directory writable by others": func(f *bindFx) {
+			id := statID(t, f.project)
+			dir := filepath.Join(f.req.StateDir, "project-bind", fmt.Sprintf("%x-%x", id.dev, id.ino))
+			_ = os.MkdirAll(dir, 0o700)
+			_ = os.Chmod(dir, 0o703)
+		},
+		"a record directory that is a link": func(f *bindFx) {
+			elsewhere := evalDir(t)
+			_ = os.Symlink(elsewhere, filepath.Join(f.req.StateDir, "project-bind"))
+		},
+		"a project record directory that is a link": func(f *bindFx) {
+			id := statID(t, f.project)
+			_ = os.MkdirAll(filepath.Join(f.req.StateDir, "project-bind"), 0o700)
+			_ = os.Symlink(evalDir(t), filepath.Join(f.req.StateDir, "project-bind", fmt.Sprintf("%x-%x", id.dev, id.ino)))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newBindFx(t)
+			prepare(f)
+			before := snapshot(t, f.project)
+			report := f.bind()
+			wantOutcome(t, report, OutcomeRefused, ExitRefused)
+			if report.Reason != ReasonStateDirInvalid || f.ran() {
+				t.Fatalf("report = %+v", report)
+			}
+			sameSnapshot(t, before, snapshot(t, f.project))
+		})
+	}
+}
+
+func statID(t *testing.T, path string) fileID {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return idOf(info)
+}
+
+func TestBindPruningTouchesOnlyRecordsItValidated(t *testing.T) {
+	f := newBindFx(t)
+	id := statID(t, f.project)
+	dir := filepath.Join(f.req.StateDir, "project-bind", fmt.Sprintf("%x-%x", id.dev, id.ino))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(evalDir(t), "victim")
+	put(t, other, "not a record", 0o600)
+	stale := ".safe-bind-" + strings.Repeat("a", 32)
+	forged := ".safe-bind-" + strings.Repeat("b", 32)
+	valid := ".safe-bind-" + strings.Repeat("c", 32)
+	put(t, filepath.Join(dir, "unrelated.txt"), "keep me", 0o600)
+	put(t, filepath.Join(dir, stale), `not json`, 0o600)                                                                                                                                         // looks like a record, is not
+	put(t, filepath.Join(dir, forged), fmt.Sprintf(`{"schema":1,"project_dev":%d,"project_ino":%d,"name":"%s","dev":1,"ino":1,"kept":false,"kept_reason":""}`, id.dev+1, id.ino, forged), 0o600) // another project's
+	put(t, filepath.Join(dir, valid), fmt.Sprintf(`{"schema":1,"project_dev":%d,"project_ino":%d,"name":"%s","dev":1,"ino":1,"kept":false,"kept_reason":""}`, id.dev, id.ino, valid), 0o600)
+	if err := os.Mkdir(filepath.Join(dir, "a-directory"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(other, filepath.Join(dir, ".safe-bind-"+strings.Repeat("d", 32))); err != nil {
+		t.Fatal(err)
+	}
+	wantOutcome(t, f.bind(), OutcomePublished, ExitPublished)
+	for _, name := range []string{"unrelated.txt", stale, forged, "a-directory", ".safe-bind-" + strings.Repeat("d", 32)} {
+		if _, err := os.Lstat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("%s was removed although it is not a record this project validates", name)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(dir, valid)); err == nil {
+		t.Error("a valid stale record of this project was not pruned")
+	}
+	if raw, _ := os.ReadFile(other); string(raw) != "not a record" {
+		t.Error("a link in the record directory was followed")
+	}
+}
+
+// This run's cleanup removes the directory it holds, never whatever the name
+// came to refer to.
+func TestBindCleanupComparesTheNameWithTheHeldDescriptor(t *testing.T) {
+	f := newBindFx(t)
+	var moved, decoy string
+	hookAt(t, "installed", func() error {
+		items, _ := os.ReadDir(f.project)
+		for _, item := range items {
+			if strings.HasPrefix(item.Name(), stagingPrefix) {
+				decoy = filepath.Join(f.project, item.Name())
+				moved = decoy + "-moved"
+			}
+		}
+		if err := os.Rename(decoy, moved); err != nil {
+			return err
+		}
+		put(t, filepath.Join(decoy, "keep"), "a directory that is not the staging directory", 0o644)
+		return nil
+	})
+	report := f.bind()
+	if report.Staging.Removed || report.Staging.Path == "" {
+		t.Fatalf("staging = %+v", report.Staging)
+	}
+	if raw, err := os.ReadFile(filepath.Join(decoy, "keep")); err != nil || string(raw) != "a directory that is not the staging directory" {
+		t.Fatalf("a directory that merely took the name was removed: %v", err)
+	}
+}
+
+// Point 3. A tree root that appears while the run is going is not the old
+// tree: it refuses as changed input and is left exactly as it is.
+func TestBindATreeRootThatAppearsDuringTheRunIsLeftAlone(t *testing.T) {
+	for _, stage := range []string{"staged", "installed", "verified", "publish:prepared"} {
+		t.Run(stage, func(t *testing.T) {
+			f := newBindFx(t)
+			if err := os.RemoveAll(filepath.Join(f.project, "node_modules")); err != nil {
+				t.Fatal(err)
+			}
+			hookAt(t, stage, func() error {
+				put(t, filepath.Join(f.project, "node_modules/precious"), "mine", 0o644)
+				return nil
+			})
+			report := f.bind()
+			wantOutcome(t, report, OutcomeInputsChanged, ExitInputsChanged)
+			if raw, _ := os.ReadFile(filepath.Join(f.project, "node_modules/precious")); string(raw) != "mine" {
+				t.Fatal("the tree that appeared was discarded")
+			}
+			if report.Publication.State != PublicationNotStarted {
+				t.Fatalf("publication = %+v", report.Publication)
+			}
+			for _, rel := range []string{"package.json", "package-lock.json"} {
+				got, _ := os.ReadFile(filepath.Join(f.project, rel))
+				want := map[string]string{"package.json": oldManifest, "package-lock.json": oldLockfile}[rel]
+				if string(got) != want {
+					t.Fatalf("%s = %q", rel, got)
+				}
+			}
+		})
+	}
+}
+
+// A parent directory that disappears before the final check is a change, not a panic.
+func TestBindAPublishedFilesDirectoryDisappearingDuringPublicationDoesNotPanic(t *testing.T) {
+	f := newBindFx(t)
+	ws := filepath.Join(f.project, "ws")
+	put(t, filepath.Join(ws, "package.json"), `{"name":"ws","version":"1.0.0"}`, 0o644)
+	f.req.Publish = append(f.req.Publish, File{Rel: "ws/package.json", Content: []byte(`{"name":"ws","version":"2.0.0"}`)})
+	f.judge()
+	f.req.Live["ws/package.json"] = sum(`{"name":"ws","version":"1.0.0"}`)
+	hookAt(t, "publish:tree", func() error { return os.Rename(ws, ws+".gone") })
+	report := f.bind()
+	wantOutcome(t, report, OutcomeInputsChanged, ExitInputsChanged)
+	if _, err := os.Stat(ws + ".gone/package.json"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Point 6 (decisions-2 #9). An install that selects no tree publishes.
+func TestBindAnEmptyInstallWithNoOldTreePublishesNoTree(t *testing.T) {
+	f := newBindFx(t)
+	if err := os.RemoveAll(filepath.Join(f.project, "node_modules")); err != nil {
+		t.Fatal(err)
+	}
+	f.lockfile = []byte(`{"lockfileVersion":3,"packages":{"":{"name":"root"}}}`)
+	f.req.Publish[1].Content = f.lockfile
+	f.command(`echo ran > "$MARK"`)
+	report := f.bind()
+	wantOutcome(t, report, OutcomePublished, ExitPublished)
+	if report.Publication.Tree != StateNone || report.Verification == nil || !report.Verification.Ok {
+		t.Fatalf("publication = %+v", report.Publication)
+	}
+	if _, err := os.Lstat(filepath.Join(f.project, "node_modules")); err == nil {
+		t.Fatal("a tree was made out of nothing")
+	}
+	if raw, _ := os.ReadFile(filepath.Join(f.project, "package-lock.json")); string(raw) != string(f.lockfile) {
+		t.Fatalf("lockfile = %q", raw)
+	}
+}
+
+func TestBindAnEmptyInstallReplacesAnOldTreeByAnEmptyOne(t *testing.T) {
+	f := newBindFx(t)
+	f.lockfile = []byte(`{"lockfileVersion":3,"packages":{"":{"name":"root"}}}`)
+	f.req.Publish[1].Content = f.lockfile
+	f.command(`echo ran > "$MARK"`)
+	report := f.bind()
+	wantOutcome(t, report, OutcomePublished, ExitPublished)
+	if report.Publication.Tree != StateVerified {
+		t.Fatalf("publication = %+v", report.Publication)
+	}
+	entries, err := os.ReadDir(filepath.Join(f.project, "node_modules"))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("the old tree was not replaced by an empty one: %v %v", entries, err)
+	}
+	if report, err := VerifyTree(f.lockfile, f.project, linuxX64); err != nil || !report.Ok {
+		t.Fatalf("%+v %v", report, err)
+	}
+}
+
+func TestBindALockfileWhoseEveryEntryIsDeselectedPublishesAnEmptyTree(t *testing.T) {
+	f := newBindFx(t)
+	f.lockfile = rsLock(map[string]any{"node_modules/devonly": with(rsEntry("devonly", "1.0.0"), map[string]any{"dev": true})})
+	f.req.Publish[1].Content = f.lockfile
+	f.req.Selection = Selection{OS: "linux", CPU: "x64", Omit: []string{"dev"}}
+	f.command(`true`)
+	wantOutcome(t, f.bind(), OutcomePublished, ExitPublished)
+	if entries, err := os.ReadDir(filepath.Join(f.project, "node_modules")); err != nil || len(entries) != 0 {
+		t.Fatalf("%v %v", entries, err)
+	}
+}
+
+// Point 5 (decisions-2 #6): setup is checked, completion is told apart.
+func TestBindRefusesWhenTheDescriptorTableCannotBeRead(t *testing.T) {
+	f := newBindFx(t)
+	procFdDir = "/nonexistent/fd"
+	t.Cleanup(func() { procFdDir = "/proc/self/fd" })
+	before := snapshot(t, f.project)
+	report := f.bind()
+	wantOutcome(t, report, OutcomeRefused, ExitRefused)
+	if report.Reason != ReasonDescriptorsUnsealed || f.ran() {
+		t.Fatalf("report = %+v", report)
+	}
+	sameSnapshot(t, before, snapshot(t, f.project))
+}
+
+func TestBindCompletionThatCannotBeEstablishedIsItsOwnOutcome(t *testing.T) {
+	f := newBindFx(t)
+	hookAt(t, "install:settle", func() error { return errors.New("the group could not be inspected") })
+	bindHook = func(stage string) error {
+		if stage == "install:settle" {
+			return errors.New("the group could not be inspected")
+		}
+		return nil
+	}
+	before := snapshot(t, f.project)
+	report := f.bind()
+	wantOutcome(t, report, OutcomeInstallUnsettled, ExitInstallUnsettled)
+	if report.Reason != ReasonGroupRemains || report.Staging.Removed || report.Publication.State != PublicationNotStarted {
+		t.Fatalf("report = %+v", report)
+	}
+	after := snapshot(t, f.project)
+	for name, state := range before {
+		if after[name] != state {
+			t.Fatalf("%s changed", name)
+		}
+	}
+	if records := recordsOf(t, f); len(records) != 1 || !records[0].Kept {
+		t.Fatalf("records = %+v", records)
+	}
+}
+
+func TestBindEndsWhatTheInstallLeftInItsProcessGroupAndSaysOtherwiseNever(t *testing.T) {
+	f := newBindFx(t)
+	pidFile := filepath.Join(evalDir(t), "pid")
+	f.command(`cp -a "$FAKE_TREE/node_modules" node_modules; sh -c 'echo $$ > "$PIDF"; exec sleep 60' >/dev/null 2>&1 &
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -s "$PIDF" ] && break; sleep 0.05; done`)
+	f.req.Env = append(f.req.Env, "PIDF="+pidFile)
+	wantOutcome(t, f.bind(), OutcomePublished, ExitPublished)
+	raw, _ := os.ReadFile(pidFile)
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if pid <= 0 {
+		t.Fatal("no pid")
+	}
+	defer func() { _ = syscall.Kill(pid, syscall.SIGKILL) }()
+	if err := syscall.Kill(pid, 0); err == nil {
+		t.Fatalf("pid %d of the install's process group is still there", pid)
+	}
+}
+
+func TestBindTheDocumentStatesTheFlagLimitAndThePowerLossScope(t *testing.T) {
+	report := newBindFx(t).bind()
+	joined := strings.Join(report.Assumptions, "\n")
+	for _, want := range []string{"lockfile_flags_as_written", "record_not_defended_against_same_user", "process_interruption_not_power_loss"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("assumptions = %v", report.Assumptions)
+		}
+	}
+}
+
+// A complete tree for each of the three lockfile shapes npm 11 writes and the
+// previous round refused (a root dependency that is both dev and peer, both dev
+// and production, a production package's peer that is also a root dev
+// dependency) verifies and publishes.
+func TestBindPublishesTheLockfilesNpmWrites(t *testing.T) {
+	shapes := map[string]struct {
+		packages map[string]any
+		installs [][2]string
+	}{
+		"dev and peer": {map[string]any{
+			"":               map[string]any{"name": "root", "devDependencies": map[string]any{"x": "1"}, "peerDependencies": map[string]any{"x": "1"}},
+			"node_modules/x": with(rsEntry("x", "1.0.0"), map[string]any{"dev": true, "peer": true})},
+			[][2]string{{"x", "1.0.0"}}},
+		"dev and production": {map[string]any{
+			"":               map[string]any{"name": "root", "dependencies": map[string]any{"x": "1"}, "devDependencies": map[string]any{"x": "1"}},
+			"node_modules/x": rsEntry("x", "1.0.0")},
+			[][2]string{{"x", "1.0.0"}}},
+		"a peer that is also a root dev dependency": {map[string]any{
+			"":                    map[string]any{"name": "root", "dependencies": map[string]any{"app": "1"}, "devDependencies": map[string]any{"shared": "1"}},
+			"node_modules/app":    with(rsEntry("app", "1.0.0"), map[string]any{"peerDependencies": map[string]any{"shared": "1"}}),
+			"node_modules/shared": with(rsEntry("shared", "1.0.0"), map[string]any{"dev": true, "peer": true})},
+			[][2]string{{"app", "1.0.0"}, {"shared", "1.0.0"}}},
+	}
+	for name, shape := range shapes {
+		t.Run(name, func(t *testing.T) {
+			f := newBindFx(t)
+			src := evalDir(t)
+			for _, install := range shape.installs {
+				rsInstall(t, src, "node_modules/"+install[0], install[0], install[1])
+			}
+			f.lockfile = rsLock(shape.packages)
+			f.req.Publish[1].Content = f.lockfile
+			f.req.Env = []string{"PATH=/usr/bin:/bin", "FAKE_TREE=" + src, "MARK=" + f.mark}
+			report := f.bind()
+			wantOutcome(t, report, OutcomePublished, ExitPublished)
+			if verified, err := VerifyTree(f.lockfile, f.project, linuxX64); err != nil || !verified.Ok {
+				t.Fatalf("%+v %v", verified, err)
+			}
+		})
 	}
 }

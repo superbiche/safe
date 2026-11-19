@@ -323,3 +323,29 @@ func removeAllAt(parent *dirHandle, name string, rootDev fileID, rootMount strin
 	}
 	return parent.remove(name)
 }
+
+// names lists the entries of the directory, through a fresh open file
+// description (a duplicated descriptor shares its read offset with its owner).
+func (d *dirHandle) names() ([]string, error) {
+	fd, err := syscall.Openat(d.fd(), ".", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	listing := newHandle(fd, "listing")
+	defer listing.Close()
+	entries, err := listing.f.ReadDir(-1)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return names, nil
+}
+
+// hasNo reports that nothing is named so in the directory.
+func (d *dirHandle) hasNo(name string) bool {
+	_, err := d.lstat(name)
+	return errors.Is(err, os.ErrNotExist)
+}

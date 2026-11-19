@@ -335,3 +335,39 @@ func TestLoadRefusesAmbiguousLockfiles(t *testing.T) {
 		t.Fatalf("LoadRecords() = %+v, %v", records, err)
 	}
 }
+
+// Every entry goes through the exact-name check, the root and the entries a
+// loader skips included, and a null identity member is not an absent one.
+func TestLoadHoldsEveryEntryToTheExactNameRules(t *testing.T) {
+	const entry = `"node_modules/p":{"version":"1.0.0"}`
+	for name, doc := range map[string]string{
+		"a root entry with a second spelling": `{"lockfileVersion":3,"packages":{"":{"name":"root","Name":"x"},` + entry + `}}`,
+		"a workspace entry the loader skips":  `{"lockfileVersion":3,"packages":{"":{},"packages/w":{"version":"1.0.0","Version":"2.0.0"},` + entry + `}}`,
+		"a null resolved":                     `{"lockfileVersion":3,"packages":{"":{},"node_modules/p":{"version":"1.0.0","resolved":null}}}`,
+		"a null integrity":                    `{"lockfileVersion":3,"packages":{"":{},"node_modules/p":{"version":"1.0.0","integrity":null}}}`,
+		"a null inBundle":                     `{"lockfileVersion":3,"packages":{"":{},"node_modules/p":{"version":"1.0.0","inBundle":null}}}`,
+		"a null root name":                    `{"lockfileVersion":3,"packages":{"":{"name":null},` + entry + `}}`,
+		"a byte-order mark":                   "\xef\xbb\xbf" + `{"lockfileVersion":3,"packages":{"":{},` + entry + `}}`,
+		"merge-conflict markers in a string":  `{"lockfileVersion":3,"packages":{"":{"description":"<<<<<<< ======= >>>>>>>"},` + entry + `}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "package-lock.json")
+			if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadRecords(path, nil); err == nil {
+				t.Fatal("LoadRecords() error = nil")
+			}
+			if _, err := LoadLocalPackages(path); err == nil {
+				t.Fatal("LoadLocalPackages() error = nil")
+			}
+		})
+	}
+	// An absent member is fine, and unrelated members stay free.
+	ok := `{"lockfileVersion":3,"packages":{"":{"name":"root","Funding":1},` + entry + `}}`
+	path := filepath.Join(t.TempDir(), "package-lock.json")
+	_ = os.WriteFile(path, []byte(ok), 0o600)
+	if _, err := LoadRecords(path, nil); err != nil {
+		t.Fatalf("LoadRecords() error = %v", err)
+	}
+}

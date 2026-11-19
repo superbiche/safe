@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -95,6 +96,9 @@ func (f *treeFx) hiddenLockfile(edit func(map[string]any)) {
 	f.t.Helper()
 	packages := map[string]any{}
 	for path, e := range f.lock {
+		if path == "" {
+			continue // npm's hidden lockfile has no root entry
+		}
 		if _, err := os.Lstat(filepath.Join(f.root, filepath.FromSlash(path))); err == nil {
 			packages[path] = e
 		}
@@ -227,9 +231,41 @@ func TestVerifyTreeFindsWhatTheLockfileDoesNotSay(t *testing.T) {
 		"an absolute .bin link": {
 			func(f *treeFx) { f.symlink("/etc/passwd", "node_modules/.bin/x") },
 			map[string]string{"node_modules/.bin/x": TreePathOutside}},
-		"a dangling .bin link": {
-			func(f *treeFx) { f.symlink("../a/bin.js", "node_modules/.bin/a") },
+		// The declaration is there, so these two stop at existence, not at attribution.
+		"a dangling .bin link to a declared command": {
+			func(f *treeFx) {
+				f.lock["node_modules/a"]["bin"] = map[string]any{"a": "bin.js"}
+				f.symlink("../a/bin.js", "node_modules/.bin/a")
+			},
 			map[string]string{"node_modules/.bin/a": TreeBinInvalid}},
+		"a .bin link text that cancels a component before it resolves": {
+			func(f *treeFx) {
+				f.lock["node_modules/a"]["bin"] = map[string]any{"a": "bin.js"}
+				f.write("node_modules/a/bin.js", "x")
+				f.symlink("../ghost/../a/bin.js", "node_modules/.bin/a")
+			},
+			map[string]string{"node_modules/.bin/a": TreeBinInvalid}},
+		"a .bin link text with a redundant component": {
+			func(f *treeFx) {
+				f.lock["node_modules/a"]["bin"] = map[string]any{"a": "bin.js"}
+				f.write("node_modules/a/bin.js", "x")
+				f.symlink("../a/./bin.js", "node_modules/.bin/a")
+			},
+			map[string]string{"node_modules/.bin/a": TreeBinInvalid}},
+		"a .bin link that goes through the nested node_modules of the package": {
+			func(f *treeFx) {
+				f.lock["node_modules/a"]["bin"] = map[string]any{"c": "node_modules/c/x.js"}
+				f.write("node_modules/a/node_modules/c/x.js", "x")
+				f.symlink("../a/node_modules/c/x.js", "node_modules/.bin/c")
+			},
+			map[string]string{"node_modules/.bin/c": TreeBinInvalid}},
+		"a nested .bin link to the nested package's own declared command": {
+			func(f *treeFx) {
+				f.lock["node_modules/a/node_modules/c"]["bin"] = map[string]any{"c": "x.js"}
+				f.write("node_modules/a/node_modules/c/x.js", "x")
+				f.symlink("../c/x.js", "node_modules/a/node_modules/.bin/c")
+			},
+			nil},
 		"a .bin link to a file the lockfile declares for another command": {
 			func(f *treeFx) {
 				f.lock["node_modules/a"]["bin"] = map[string]any{"a": "bin.js"}
@@ -342,7 +378,7 @@ func TestVerifyTreeFindsWhatTheLockfileDoesNotSay(t *testing.T) {
 			func(f *treeFx) { f.entry("node_modules/a/node_modules/../../../x", "x", "1.0.0") },
 			map[string]string{"node_modules/a/node_modules/../../../x": TreePathOutside}},
 		"a lockfile entry without a version": {
-			func(f *treeFx) { f.lock["node_modules/a"]["version"] = nil },
+			func(f *treeFx) { delete(f.lock["node_modules/a"], "version") },
 			map[string]string{"node_modules/a": TreeLockfileIncomplete}},
 	}
 	for name, tc := range cases {
@@ -628,104 +664,6 @@ func TestVerifyTreePresentDeselectedParentDoesNotExcuseAMissingChild(t *testing.
 		"node_modules/needed": TreeMissing, "node_modules/needed/node_modules/inner": TreeMissing})
 }
 
-// The flags of the judged lockfile are checked against its own dependency
-// edges: a flag that claims a deselection a required path contradicts cannot
-// excuse a missing package.
-func TestVerifyTreeRefusesFlagsThatContradictTheEdges(t *testing.T) {
-	root := func(f *treeFx, members map[string]any) {
-		f.lock[""] = members
-	}
-	cases := map[string]struct {
-		build func(f *treeFx)
-		sel   Selection
-		want  map[string]string
-	}{
-		"a dev flag on a package a production edge requires": {
-			func(f *treeFx) {
-				f.entry("node_modules/shared", "shared", "1.0.0", map[string]any{"dev": true})
-				f.pkg("node_modules/app", "app", "1.0.0", map[string]any{"dependencies": map[string]any{"shared": "1"}})
-			},
-			Selection{OS: "linux", CPU: "x64", Omit: []string{"dev"}},
-			map[string]string{"node_modules/shared": TreeFlagsInconsistent}},
-		"an optional flag on a package a required edge reaches": {
-			func(f *treeFx) {
-				f.entry("node_modules/shared", "shared", "1.0.0", map[string]any{"optional": true})
-				f.pkg("node_modules/app", "app", "1.0.0", map[string]any{"dependencies": map[string]any{"shared": "1"}})
-			},
-			Selection{OS: "linux", CPU: "x64", Omit: []string{"optional"}},
-			map[string]string{"node_modules/shared": TreeFlagsInconsistent}},
-		"a devOptional flag on a production package": {
-			func(f *treeFx) {
-				f.entry("node_modules/shared", "shared", "1.0.0", map[string]any{"devOptional": true})
-				f.pkg("node_modules/app", "app", "1.0.0", map[string]any{"dependencies": map[string]any{"shared": "1"}})
-			},
-			Selection{OS: "linux", CPU: "x64", Omit: []string{"dev", "optional"}},
-			map[string]string{"node_modules/shared": TreeFlagsInconsistent}},
-		"a peer flag on a package a plain edge reaches": {
-			func(f *treeFx) {
-				f.entry("node_modules/shared", "shared", "1.0.0", map[string]any{"peer": true})
-				f.pkg("node_modules/app", "app", "1.0.0", map[string]any{"dependencies": map[string]any{"shared": "1"}})
-			},
-			Selection{OS: "linux", CPU: "x64", Omit: []string{"peer"}},
-			map[string]string{"node_modules/shared": TreeFlagsInconsistent}},
-		"a nested occurrence resolves to the nearest one": {
-			func(f *treeFx) {
-				f.pkg("node_modules/app", "app", "1.0.0", map[string]any{"dependencies": map[string]any{"shared": "1"}})
-				f.entry("node_modules/app/node_modules/shared", "shared", "1.0.0", map[string]any{"dev": true})
-				f.pkg("node_modules/shared", "shared", "2.0.0", map[string]any{"dev": true})
-			},
-			Selection{OS: "linux", CPU: "x64", Omit: []string{"dev"}},
-			map[string]string{"node_modules/app/node_modules/shared": TreeFlagsInconsistent, "node_modules/shared": TreeMissing + "+" + TreeNotInLockfile}},
-		"consistent flags are accepted": {
-			func(f *treeFx) {
-				f.pkg("node_modules/app", "app", "1.0.0", map[string]any{"dependencies": map[string]any{"shared": "1"}, "optionalDependencies": map[string]any{"opt": "1"}})
-				f.pkg("node_modules/shared", "shared", "1.0.0")
-				f.entry("node_modules/opt", "opt", "1.0.0", map[string]any{"optional": true})
-				f.entry("node_modules/devtool", "devtool", "1.0.0", map[string]any{"dev": true})
-				root(f, map[string]any{"name": "root", "dependencies": map[string]any{"app": "1"}, "devDependencies": map[string]any{"devtool": "1"}})
-			},
-			Selection{OS: "linux", CPU: "x64", Omit: []string{"dev", "optional"}},
-			nil},
-		"a dev dependency's optional dependency is both dev and optional": {
-			func(f *treeFx) {
-				f.entry("node_modules/devtool", "devtool", "1.0.0", map[string]any{"dev": true, "optionalDependencies": map[string]any{"opt": "1"}})
-				f.entry("node_modules/opt", "opt", "1.0.0", map[string]any{"dev": true, "optional": true})
-				root(f, map[string]any{"name": "root", "devDependencies": map[string]any{"devtool": "1"}})
-			},
-			Selection{OS: "linux", CPU: "x64", Omit: []string{"dev"}},
-			nil},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			f := newTreeFx(t)
-			f.lock[""] = map[string]any{"name": "root", "dependencies": map[string]any{"app": "1"}}
-			tc.build(f)
-			if name == "a nested occurrence resolves to the nearest one" {
-				// the top-level shared is the one the root does not reach: only the
-				// nested occurrence is contradicted; keep the test about that one
-				delete(f.lock, "node_modules/shared")
-				_ = os.RemoveAll(filepath.Join(f.root, "node_modules/shared"))
-				tc.want = map[string]string{"node_modules/app/node_modules/shared": TreeFlagsInconsistent}
-			}
-			expectProblems(t, f.verify(tc.sel), tc.want)
-		})
-	}
-}
-
-func TestAdmitLockfile(t *testing.T) {
-	f := newTreeFx(t)
-	f.entry("node_modules/shared", "shared", "1.0.0", map[string]any{"dev": true})
-	f.entry("node_modules/app", "app", "1.0.0", map[string]any{"dependencies": map[string]any{"shared": "1"}})
-	f.lock[""] = map[string]any{"name": "root", "dependencies": map[string]any{"app": "1"}}
-	if reason, _ := AdmitLockfile(f.lockBytes()); reason != ReasonFlagsInconsistent {
-		t.Fatalf("reason = %q", reason)
-	}
-	g := completeTree(t)
-	if reason, detail := AdmitLockfile(g.lockBytes()); reason != "" {
-		t.Fatalf("a consistent lockfile: %s %s", reason, detail)
-	}
-}
-
 // Installed manifests and the lockfiles are read by exact, case-sensitive
 // member names, as one document.
 func TestVerifyTreeReadsDocumentsByExactNames(t *testing.T) {
@@ -825,5 +763,131 @@ func TestVerifyTreeStatesItsLimits(t *testing.T) {
 	report := completeTree(t).verify(linuxX64)
 	if len(report.Limits) == 0 || !strings.Contains(strings.Join(report.Limits, " "), "not the bytes of their files") {
 		t.Fatalf("limits = %v", report.Limits)
+	}
+}
+
+// Lockfiles npm 11 itself writes for a root dependency that is both dev and
+// peer, both dev and production, and a production package's peer that is also a
+// root dev dependency, are accepted: the flags are the lockfile's own, absence
+// is excused on them and on the platform alone, and a complete tree verifies
+// whatever the selection.
+func TestVerifyTreeAcceptsTheLockfilesNpmWrites(t *testing.T) {
+	shapes := map[string]func(f *treeFx){
+		"a root dependency that is both dev and peer": func(f *treeFx) {
+			f.lock[""] = map[string]any{"name": "root", "devDependencies": map[string]any{"x": "1"}, "peerDependencies": map[string]any{"x": "1"}}
+			f.pkg("node_modules/x", "x", "1.0.0", map[string]any{"dev": true, "peer": true})
+		},
+		"a root dependency that is both dev and production": func(f *treeFx) {
+			f.lock[""] = map[string]any{"name": "root", "dependencies": map[string]any{"x": "1"}, "devDependencies": map[string]any{"x": "1"}}
+			f.pkg("node_modules/x", "x", "1.0.0")
+		},
+		"a production package's peer that is also a root dev dependency": func(f *treeFx) {
+			f.lock[""] = map[string]any{"name": "root", "dependencies": map[string]any{"app": "1"}, "devDependencies": map[string]any{"shared": "1"}}
+			f.pkg("node_modules/app", "app", "1.0.0", map[string]any{"peerDependencies": map[string]any{"shared": "1"}})
+			f.pkg("node_modules/shared", "shared", "1.0.0", map[string]any{"dev": true, "peer": true})
+		},
+	}
+	for name, build := range shapes {
+		t.Run(name, func(t *testing.T) {
+			f := newTreeFx(t)
+			build(f)
+			f.hiddenLockfile(nil)
+			for _, sel := range []Selection{linuxX64, {OS: "linux", CPU: "x64", Omit: []string{"optional"}}} {
+				expectProblems(t, f.verify(sel), nil)
+			}
+			if reason, detail := AdmitLockfile(f.lockBytes()); reason != "" {
+				t.Fatalf("a lockfile npm writes was refused: %s %s", reason, detail)
+			}
+		})
+	}
+}
+
+// A lockfile whose flags lie yields an incomplete tree, never a foreign or an
+// extra package: the flag excuses an absence (the stated limit) and nothing else.
+func TestVerifyTreeTrustsFlagsOnlyForAbsence(t *testing.T) {
+	f := newTreeFx(t)
+	f.entry("node_modules/liar", "liar", "1.0.0", map[string]any{"dev": true})
+	sel := Selection{OS: "linux", CPU: "x64", Omit: []string{"dev"}}
+	expectProblems(t, f.verify(sel), nil) // absent, excused by its own flag
+	f.install("node_modules/liar", "liar", "1.0.1")
+	expectProblems(t, f.verify(sel), map[string]string{"node_modules/liar": TreeWrongVersion})
+	g := newTreeFx(t)
+	g.install("node_modules/extra", "extra", "1.0.0")
+	expectProblems(t, g.verify(sel), map[string]string{"node_modules/extra": TreeNotInLockfile})
+}
+
+// With both occurrences present in the lockfile, the nested one is judged on
+// its own: the top-level one being deselected and absent excuses nothing below
+// or beside it.
+func TestVerifyTreeNestedConflictKeepsBothOccurrences(t *testing.T) {
+	f := newTreeFx(t)
+	f.pkg("node_modules/app", "app", "1.0.0")
+	f.entry("node_modules/shared", "shared", "2.0.0", map[string]any{"dev": true})
+	f.entry("node_modules/app/node_modules/shared", "shared", "1.0.0")
+	sel := Selection{OS: "linux", CPU: "x64", Omit: []string{"dev"}}
+	expectProblems(t, f.verify(sel), map[string]string{"node_modules/app/node_modules/shared": TreeMissing})
+	f.install("node_modules/app/node_modules/shared", "shared", "1.0.0")
+	expectProblems(t, f.verify(sel), nil)
+}
+
+// A null is not an absent member, a byte-order mark and merge-conflict markers
+// are outside the admitted language.
+func TestVerifyTreeRefusesNullsBomAndConflictMarkers(t *testing.T) {
+	f := completeTree(t)
+	good := string(f.lockBytes())
+	for name, doc := range map[string]string{
+		"a null resolved":   strings.Replace(good, `"resolved":"https://registry.npmjs.org/a/-/a-1.0.0.tgz"`, `"resolved":null`, 1),
+		"a null version":    strings.Replace(good, `"version":"1.0.0"`, `"version":null`, 1),
+		"a null flag":       strings.Replace(good, `"version":"1.0.0"`, `"version":"1.0.0","dev":null`, 1),
+		"a byte-order mark": "\xef\xbb\xbf" + good,
+		"conflict markers":  strings.Replace(good, `"name":"root"`, `"name":"<<<<<<< ======= >>>>>>>"`, 1),
+	} {
+		if _, err := VerifyTree([]byte(doc), f.root, linuxX64); err == nil {
+			t.Errorf("lockfile with %s was accepted", name)
+		}
+	}
+	// Installed manifests: null and BOM refuse; the hidden lockfile too.
+	for name, content := range map[string]string{
+		"a null version":    `{"name":"a","version":null}`,
+		"a byte-order mark": "\xef\xbb\xbf" + `{"name":"a","version":"1.0.0"}`,
+	} {
+		g := completeTree(t)
+		g.write("node_modules/a/package.json", content)
+		if g.verify(linuxX64).Ok {
+			t.Errorf("manifest with %s was accepted", name)
+		}
+	}
+	h := completeTree(t)
+	h.hiddenLockfile(func(p map[string]any) {
+		p["node_modules/a"] = map[string]any{"version": "1.0.0", "resolved": nil, "integrity": nil}
+	})
+	if h.verify(linuxX64).Ok {
+		t.Error("a hidden record with null identity fields was accepted")
+	}
+	k := completeTree(t)
+	k.write("node_modules/.package-lock.json", "\xef\xbb\xbf"+`{"lockfileVersion":3,"packages":{}}`)
+	if k.verify(linuxX64).Ok {
+		t.Error("a hidden lockfile with a byte-order mark was accepted")
+	}
+}
+
+// The verifier can walk from a held tree descriptor.
+func TestVerifyHeldTree(t *testing.T) {
+	f := completeTree(t)
+	f.hiddenLockfile(nil)
+	handle, err := os.Open(filepath.Join(f.root, "node_modules"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	held := "/proc/self/fd/" + strconv.Itoa(int(handle.Fd()))
+	report, err := VerifyHeldTree(f.lockBytes(), held, linuxX64)
+	if err != nil || !report.Ok || report.Checked != 3 {
+		t.Fatalf("report = %+v, %v", report, err)
+	}
+	f.install("node_modules/extra", "extra", "1.0.0")
+	report, _ = VerifyHeldTree(f.lockBytes(), held, linuxX64)
+	if report.Ok {
+		t.Fatal("an extra entry below the held tree was not found")
 	}
 }

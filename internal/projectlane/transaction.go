@@ -3,6 +3,7 @@
 package projectlane
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -15,6 +16,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -38,9 +40,12 @@ import (
 //
 // The tree is built in a staging directory inside the project, private to the
 // user, and published only once it has been verified against the judged
-// lockfile. Everything is done relative to descriptors held for the project
-// (the caller's locked directory), the staging directory and the tree, never by
-// pathname, and no symbolic link is followed.
+// lockfile. Every operation of the transaction itself is relative to descriptors
+// held for the project (the caller's locked directory), the staging directory,
+// the record directory and the live and staged trees, and no symbolic link is
+// followed. The verifier is anchored on the held staged-tree descriptor and
+// resolves each name below it with an Lstat per component (no link followed):
+// it is not an openat chain.
 //
 // There is NO journal and NO replay. A leftover staging directory is removed by
 // a later run only when safe's own state directory, outside the project, holds
@@ -48,34 +53,46 @@ import (
 // any other .safe-bind-* directory is left as it is and named in the document.
 //
 // ORDER OF THE STEPS and the state each interruption leaves (see also
-// docs/architecture.md):
+// docs/architecture.md). The guarantee is about the PROCESS being interrupted or
+// killed (a signal, SIGKILL, a crash of project-bind) with the filesystem
+// running on: it is not a power-loss guarantee, for which the extracted tree,
+// the state record and the directories touched by renames would need durability
+// barriers this transaction does not implement.
 //
-//	 1  check the request, take or prove the lock                nothing written
-//	 2  remove recorded leftovers, name the others                an earlier run's own staging only
+//	 1  check the request, seal descriptors, take or prove the lock   nothing written
+//	 2  remove recorded leftovers, name the others                    an earlier run's own staging only
 //	 3  check the tree root (identity, mount) and every live
-//	    input against its judged digest                           nothing written
+//	    input against its judged digest                               nothing written
 //	 4  create staging, record it in the state directory, copy
-//	    the judged inputs in, probe the atomic exchange           staging only
-//	 5  run the install command in staging, wait for the whole
-//	    tree of processes it started to be gone                   staging only
-//	 6  verify the staged tree against the judged lockfile        staging only
-//	 7  publish, files first (each by atomic exchange, the
-//	    displaced object inspected), then the tree (by atomic
-//	    exchange, the displaced tree's identity checked), then a
-//	    last check of everything, then remove staging:
-//	      7a  files 0..k-1 judged, k..n old; tree old or none     every file is the old or the judged bytes
-//	      7b  all files judged; tree old or none                  the next lane command re-judges
-//	      7c  all files judged; tree verified (old one in staging)  published; staging is garbage
+//	    the judged inputs in, probe the atomic exchange               staging only
+//	 5  run the install command in staging; once it has exited kill
+//	    its process group and wait until the group is empty           staging only
+//	 6  verify the staged tree against the judged lockfile            staging only
+//	 7  publish: the record is marked kept; files first (each by
+//	    atomic exchange, the displaced object inspected), then the
+//	    tree (atomic exchange, the displaced tree's identity
+//	    checked), then a last check of everything:
+//	      7a  files 0..k-1 judged, k..n old; tree old or none         every file is the old or the judged bytes
+//	      7b  all files judged; tree old or none                      the next lane command re-judges
+//	      7c  all files judged; tree verified (old one in staging)    published
+//	 8  mark the record not kept, remove staging
 //
 // Interrupted anywhere up to 7a, the project is byte for byte as it was. After
-// the first exchange a kill (SIGKILL, power) leaves one of the 7a/7b/7c states:
-// the tree in place is the old one, none, or the verified one, never anything
-// else, and each manifest or lockfile is either the old bytes or the judged
-// bytes. Nothing is replayed: the next run removes the recorded staging
-// directory (which holds only displaced old objects and the old tree) and the
-// lane re-judges from what it finds. A signal received from the first exchange
-// on is deferred until the end of publication. A failure inside publication is
-// undone in process, best effort, and the document says which state was left.
+// the first exchange a kill leaves one of the 7a/7b/7c states: the tree in
+// place is the old one, none (only when there was none), or the verified one,
+// and each manifest or lockfile is either the old bytes or the judged bytes.
+// Nothing is replayed. The staging directory of a run killed from 7 on is KEPT:
+// its record says so, no later sweep removes it, and it is named in the next
+// document, because it may hold an object displaced from the project (an
+// editor's save) that nobody has inspected. A failure inside publication is
+// undone in process, best effort, and the document says which state was left;
+// undo and cleanup never delete an object they cannot identify.
+//
+// LIMITS stated here and in the document: a lockfile whose flags lie yields an
+// incomplete tree, never a foreign or an extra package (absence is excused on
+// the judged lockfile's own flags and on the platform, as npm does); the record
+// of a staging directory is not defended against a writer running as the same
+// user, nor against an inode reused under the same 128-bit random name.
 
 const (
 	stagingPrefix = ".safe-bind-"
@@ -87,6 +104,9 @@ var Assumptions = []string{
 	"install_command_trusted: the install command is the admitted npm with scripts off, trusted as the gate's delegate is; it runs with the installing user's filesystem access and its writes are not confined",
 	"payload_integrity_rests_on_npm: the verifier attests the set of packages and their identities; npm checks each tarball against the lockfile's integrity hash",
 	"project_content_untrusted: nothing found in the project steers the transaction; leftovers are removed only on safe's own record",
+	"lockfile_flags_as_written: absence is excused on the judged lockfile's own optional, dev and peer flags and on the platform, as npm does; a lockfile whose flags lie yields an incomplete tree, never a foreign or an extra package",
+	"record_not_defended_against_same_user: the staging record is not defended against a writer running as the same user, nor against an inode reused under the same random name",
+	"process_interruption_not_power_loss: the interruption guarantees concern a process that is interrupted or killed, not power loss",
 }
 
 // File is a judged input: a project-relative path and the bytes judged.
@@ -180,6 +200,17 @@ type PublicationReport struct {
 	// Conflicts lists what an undo left alone because it had been changed
 	// since the transaction wrote it.
 	Conflicts []string `json:"conflicts"`
+	// Retained lists the objects kept in the staging directory because the
+	// transaction could not tell what they are or could not put them back:
+	// what they are called, where they are and what was observed of them.
+	Retained []RetainedObject `json:"retained"`
+}
+
+// RetainedObject is an object kept in staging that nothing deletes.
+type RetainedObject struct {
+	Name     string `json:"name"`
+	Location string `json:"location"`
+	Observed string `json:"observed"`
 }
 
 // StagingReport says whether the staging directory is gone.
@@ -258,9 +289,16 @@ type transaction struct {
 	staging      *dirHandle
 	stagingName  string
 	stagingID    fileID
-	recordFile   string
-	oldTree      *fileID // the live tree root when the run started
-	treeID       *fileID // the staged tree, as verified
+	records      *dirHandle    // the private record directory, held
+	record       stagingRecord // what safe recorded for this staging directory
+	recorded     bool
+	initial      string     // "": not looked at yet; "absent" or "present": the live tree root at the start
+	oldTree      *fileID    // the live tree root when the run started (initial == "present")
+	liveTree     *dirHandle // held live tree root
+	treeID       *fileID    // the staged tree, as verified
+	stagedTree   *dirHandle // held staged tree
+	noTree       bool       // nothing to publish: no old tree and the install selected none
+	treeSwapped  bool       // the tree exchange or move succeeded (recorded the moment it did)
 
 	releaseLock func()
 	crashed     bool
@@ -273,7 +311,7 @@ func newReport(selection Selection) BindReport {
 		Selection:     selection.normalized(),
 		Assumptions:   append([]string{}, Assumptions...),
 		Changed:       []InputChange{},
-		Publication:   PublicationReport{State: PublicationNotStarted, Tree: StateOld, Files: []FileState{}, Published: []string{}, Conflicts: []string{}},
+		Publication:   PublicationReport{State: PublicationNotStarted, Tree: StateOld, Files: []FileState{}, Published: []string{}, Conflicts: []string{}, Retained: []RetainedObject{}},
 		Recovery:      RecoveryReport{Removed: []string{}, Left: []LeftDirectory{}},
 	}
 }
@@ -292,6 +330,8 @@ func exitFor(outcome string) int {
 		return ExitInputsChanged
 	case OutcomeInterrupted:
 		return ExitInterrupted
+	case OutcomeInstallUnsettled:
+		return ExitInstallUnsettled
 	}
 	return ExitPublicationFailed
 }
@@ -324,26 +364,29 @@ func Bind(ctx context.Context, req BindRequest) BindReport {
 	return report
 }
 
-// finish removes the staging directory, releases what it holds and reports
-// what is left. It runs after every outcome but a simulated crash.
+// finish removes the staging directory (only the very directory this run holds,
+// and never one that is kept), releases what it holds and reports what is left.
+// It runs after every outcome but a simulated crash.
 func (t *transaction) finish(report *BindReport) {
 	report.Staging = StagingReport{Removed: true}
 	if t.staging != nil {
-		var err error
-		if t.keep {
-			err = errors.New("kept")
-		} else {
-			err = removeAllAt(t.project, t.stagingName, t.projectID, t.projectMount)
+		left := t.keep
+		if !left {
+			if info, err := t.project.lstat(t.stagingName); err != nil || !info.IsDir() || idOf(info) != t.stagingID {
+				left = true // the name no longer refers to the directory this run holds
+			} else if err := removeAllAt(t.project, t.stagingName, t.projectID, t.projectMount); err != nil {
+				left = true
+			}
 		}
-		if err != nil {
+		if left {
 			report.Staging = StagingReport{Removed: false, Path: t.stagingName}
-		} else if t.recordFile != "" {
-			_ = os.Remove(t.recordFile)
+		} else if t.records != nil && t.recorded {
+			_ = t.records.remove(t.stagingName)
 		}
 		t.staging.Close()
 	}
-	if t.project != nil {
-		t.project.Close()
+	for _, handle := range []*dirHandle{t.stagedTree, t.liveTree, t.records, t.project} {
+		handle.Close()
 	}
 	if t.releaseLock != nil {
 		t.releaseLock()
@@ -379,6 +422,11 @@ func (t *transaction) run() BindReport {
 	}
 	if t.ctx.Err() != nil {
 		return t.interrupted()
+	}
+	// Every inherited descriptor is close-on-exec before anything else is
+	// opened or run; a descriptor table that cannot be read refuses.
+	if err := sealDescriptors(); err != nil {
+		return t.refuse(ReasonDescriptorsUnsealed, "%v", err)
 	}
 	if err := t.takeLock(); err != nil {
 		return t.refuse(err.reason, "%s", err.detail)
@@ -658,21 +706,91 @@ type stagingRecord struct {
 	Name       string `json:"name"`
 	Dev        uint64 `json:"dev"`
 	Ino        uint64 `json:"ino"`
+	// Kept says no sweep may remove this directory: it may hold an object
+	// displaced from the project that nobody has inspected.
+	Kept       bool   `json:"kept"`
+	KeptReason string `json:"kept_reason"`
 }
 
-func (t *transaction) recordDir() string {
-	return filepath.Join(t.req.StateDir, "project-bind", fmt.Sprintf("%x-%x", t.projectID.dev, t.projectID.ino))
+var recordName = regexp.MustCompile(`^\.safe-bind-[0-9a-f]{32}$`)
+
+// checkPrivate requires a directory that belongs to the user and that group
+// and others cannot write: the authority of what it holds depends on it.
+func checkPrivate(handle *dirHandle, what string) error {
+	info, err := handle.f.Stat()
+	if err != nil {
+		return err
+	}
+	if !ownedByUs(info) {
+		return fmt.Errorf("%s is not owned by this user", what)
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%s is writable by group or others", what)
+	}
+	return nil
 }
 
-// checkStateDir refuses a state directory that is, or is below, the project.
+// openPrivateChild opens (creating it, mode 0700) a directory below a held one
+// without following a link, and checks it is private.
+func openPrivateChild(parent *dirHandle, name, what string) (*dirHandle, error) {
+	child, err := parent.openDirNoFollow(name)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := parent.mkdir(name, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("%s cannot be created: %w", what, err)
+		}
+		child, err = parent.openDirNoFollow(name)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%s cannot be opened without following a link: %w", what, err)
+	}
+	if err := checkPrivate(child, what); err != nil {
+		child.Close()
+		return nil, err
+	}
+	return child, nil
+}
+
+// openRecordDir opens safe's record directory for this project through held
+// descriptors: the state directory, its project-bind directory and the
+// per-project directory below it must each belong to the user and not be
+// writable by group or others, and none may be a link.
+func (t *transaction) openRecordDir() (*dirHandle, error) {
+	state, err := filepath.EvalSymlinks(t.req.StateDir)
+	if err != nil {
+		return nil, err
+	}
+	root, err := openDirPath(state)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	if err := checkPrivate(root, "the state directory"); err != nil {
+		return nil, err
+	}
+	sub, err := openPrivateChild(root, "project-bind", "the record directory")
+	if err != nil {
+		return nil, err
+	}
+	defer sub.Close()
+	return openPrivateChild(sub, fmt.Sprintf("%x-%x", t.projectID.dev, t.projectID.ino), "this project's record directory")
+}
+
+// checkStateDir refuses a state directory that overlaps the project: inside it,
+// or holding it.
 func (t *transaction) checkStateDir() error {
 	state, err := filepath.EvalSymlinks(t.req.StateDir)
 	if err != nil {
 		return err
 	}
-	rel, err := filepath.Rel(t.projectPath, state)
-	if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	inside := func(base, target string) bool {
+		rel, err := filepath.Rel(base, target)
+		return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	}
+	if inside(t.projectPath, state) {
 		return errors.New("the state directory is inside the project")
+	}
+	if inside(state, t.projectPath) {
+		return errors.New("the project is inside the state directory")
 	}
 	return nil
 }
@@ -685,26 +803,17 @@ func (t *transaction) sweep() (BindReport, bool) {
 	if err := t.checkStateDir(); err != nil {
 		return t.refuse(ReasonStateDirInvalid, "%v", err), false
 	}
-	reader, err := t.project.walk("")
+	records, err := t.openRecordDir()
 	if err != nil {
-		return t.refuse(ReasonProjectInvalid, "%v", err), false
+		return t.refuse(ReasonStateDirInvalid, "%v", err), false
 	}
-	defer reader.Close()
-	// A fresh open file description: the lock descriptor's offset is shared
-	// with its caller.
-	fresh, err := syscall.Openat(reader.fd(), ".", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
-	if err != nil {
-		return t.refuse(ReasonProjectInvalid, "%v", err), false
-	}
-	listing := newHandle(fresh, "listing")
-	defer listing.Close()
-	entries, err := listing.f.ReadDir(-1)
+	t.records = records
+	names, err := t.project.names()
 	if err != nil {
 		return t.refuse(ReasonProjectInvalid, "%v", err), false
 	}
 	present := map[string]bool{}
-	for _, entry := range entries {
-		name := entry.Name()
+	for _, name := range names {
 		if !strings.HasPrefix(name, stagingPrefix) {
 			continue
 		}
@@ -716,11 +825,16 @@ func (t *transaction) sweep() (BindReport, bool) {
 			t.report.Recovery.Removed = append(t.report.Recovery.Removed, name)
 		}
 	}
-	// Records of directories that are gone are dropped.
-	if records, err := os.ReadDir(t.recordDir()); err == nil {
-		for _, record := range records {
-			if !present[record.Name()] {
-				if os.Remove(filepath.Join(t.recordDir(), record.Name())) == nil {
+	// Prune the records of directories that are gone. Only a record that
+	// validates is touched: right name, a regular file of ours, this project's
+	// identity; anything else in the record directory is left alone.
+	if listed, err := t.records.names(); err == nil {
+		for _, name := range listed {
+			if !recordName.MatchString(name) || present[name] {
+				continue
+			}
+			if _, ok := t.readRecord(name); ok && t.project.hasNo(name) {
+				if t.records.remove(name) == nil {
 					t.report.Recovery.StaleRecords++
 				}
 			}
@@ -731,19 +845,45 @@ func (t *transaction) sweep() (BindReport, bool) {
 	return BindReport{}, true
 }
 
-// removeRecorded removes one staging directory if, and only if, safe's record
-// says this command created it for this project and the directory is the very
-// object recorded. It returns why it did not.
-func (t *transaction) removeRecorded(name string) string {
-	recordPath := filepath.Join(t.recordDir(), name)
-	raw, err := os.ReadFile(recordPath)
+// readRecord reads and validates one record of this project: a regular file of
+// ours, strict JSON of the schema, this project's identity, the name it is
+// filed under.
+func (t *transaction) readRecord(name string) (stagingRecord, bool) {
+	var record stagingRecord
+	info, err := t.records.lstat(name)
+	if err != nil || !info.Mode().IsRegular() || !ownedByUs(info) {
+		return record, false
+	}
+	raw, _, err := t.records.readRegular(name, 1<<16)
 	if err != nil {
+		return record, false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&record); err != nil || decoder.More() || record.Schema != 1 || record.Name != name ||
+		record.ProjectDev != t.projectID.dev || record.ProjectIno != t.projectID.ino {
+		return stagingRecord{}, false
+	}
+	return record, true
+}
+
+// removeRecorded removes one staging directory if, and only if, safe's record
+// says this command created it for this project, the record does not say it is
+// kept, and the directory is the very object recorded. It returns why it did
+// not.
+func (t *transaction) removeRecorded(name string) string {
+	if !recordName.MatchString(name) {
 		return "safe has no record of creating it for this project"
 	}
-	var record stagingRecord
-	if err := json.Unmarshal(raw, &record); err != nil || record.Schema != 1 || record.Name != name ||
-		record.ProjectDev != t.projectID.dev || record.ProjectIno != t.projectID.ino {
-		return "the record does not match this project and name"
+	if _, err := t.records.lstat(name); err != nil {
+		return "safe has no record of creating it for this project"
+	}
+	record, ok := t.readRecord(name)
+	if !ok {
+		return "the record is not valid for this project and name"
+	}
+	if record.Kept {
+		return "kept: " + record.KeptReason
 	}
 	info, err := t.project.lstat(name)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
@@ -758,8 +898,44 @@ func (t *transaction) removeRecorded(name string) string {
 	if err := removeAllAt(t.project, name, t.projectID, t.projectMount); err != nil {
 		return "removal stopped: " + err.Error()
 	}
-	_ = os.Remove(recordPath)
+	_ = t.records.remove(name)
 	return ""
+}
+
+// writeRecord writes this run's record through the held record directory:
+// a temporary file, then a rename over the name.
+func (t *transaction) writeRecord(record stagingRecord) error {
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	temp := record.Name + ".tmp"
+	_ = t.records.remove(temp)
+	if _, err := t.records.createExclusive(temp, raw, 0o600); err != nil {
+		return err
+	}
+	if err := syscall.Renameat(t.records.fd(), temp, t.records.fd(), record.Name); err != nil {
+		_ = t.records.remove(temp)
+		return err
+	}
+	_ = t.records.f.Sync()
+	t.record, t.recorded = record, true
+	return nil
+}
+
+// markKept rewrites this run's record so that no sweep removes the directory;
+// clearKept undoes it. Publication marks it before the first exchange and
+// clears it only when the run ends with nothing in staging that matters.
+func (t *transaction) markKept(reason string) error {
+	record := t.record
+	record.Kept, record.KeptReason = true, reason
+	return t.writeRecord(record)
+}
+
+func (t *transaction) clearKept() error {
+	record := t.record
+	record.Kept, record.KeptReason = false, ""
+	return t.writeRecord(record)
 }
 
 func ownedByUs(info os.FileInfo) bool {
@@ -785,16 +961,14 @@ func (t *transaction) checkProject() (BindReport, bool) {
 	return BindReport{}, true
 }
 
-// checkTreeRoot checks the live tree root: absent, or a real directory on the
-// project's own mount. The first time it records the identity of what it
-// found; later it requires that very object.
 func (t *transaction) checkTreeRoot() (reason, detail string) {
 	info, err := t.project.lstat("node_modules")
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		if t.oldTree != nil {
+		if t.initial == "present" {
 			return ReasonTreeRootInvalid, "the tree root that was there at the start is gone"
 		}
+		t.initial = "absent"
 		return "", ""
 	case err != nil:
 		return ReasonTreeRootInvalid, "the tree root cannot be read: " + err.Error()
@@ -803,7 +977,17 @@ func (t *transaction) checkTreeRoot() (reason, detail string) {
 	case !info.IsDir():
 		return ReasonTreeRootInvalid, "node_modules is not a directory"
 	}
+	if t.initial == "absent" {
+		return ReasonTreeRootInvalid, "a tree root appeared during the run; it is left exactly as it is"
+	}
 	id := idOf(info)
+	if t.liveTree != nil {
+		// The held handle is the object: the name must still refer to it.
+		if held, err := t.liveTree.id(); err != nil || id != held {
+			return ReasonTreeRootInvalid, "the tree root is not the one that was there at the start (replaced)"
+		}
+		return "", ""
+	}
 	if id.dev != t.projectID.dev {
 		return ReasonTreeRootInvalid, "node_modules is a mount point of another device and cannot be moved aside"
 	}
@@ -811,18 +995,15 @@ func (t *transaction) checkTreeRoot() (reason, detail string) {
 	if err != nil {
 		return ReasonTreeRootInvalid, "the tree root cannot be opened: " + err.Error()
 	}
-	defer handle.Close()
 	if mount, err := handle.mountID(); err != nil || mount != t.projectMount {
+		handle.Close()
 		return ReasonTreeRootInvalid, "node_modules is on another mount than the project and cannot be moved aside"
 	}
 	if now, err := handle.id(); err != nil || now != id {
+		handle.Close()
 		return ReasonTreeRootInvalid, "node_modules was replaced while it was checked"
 	}
-	if t.oldTree == nil {
-		t.oldTree = &id
-	} else if *t.oldTree != id {
-		return ReasonTreeRootInvalid, "the tree root is not the one that was there at the start (replaced)"
-	}
+	t.liveTree, t.oldTree, t.initial = handle, &id, "present"
 	return "", ""
 }
 
@@ -924,7 +1105,9 @@ func (t *transaction) createStaging() (BindReport, bool) {
 	if t.staging == nil {
 		return fail(ReasonStagingFailed, errors.New("no free staging name"))
 	}
-	_ = syscall.Fchmod(t.staging.fd(), 0o700)
+	if err := syscall.Fchmod(t.staging.fd(), 0o700); err != nil {
+		return fail(ReasonStagingFailed, err)
+	}
 	id, err := t.staging.id()
 	if err != nil {
 		return fail(ReasonStagingFailed, err)
@@ -951,8 +1134,11 @@ func (t *transaction) createStaging() (BindReport, bool) {
 	if err := exchange(t.staging, "probe-a", t.staging, "probe-b"); err != nil {
 		return fail(ReasonPlatformUnsupported, fmt.Errorf("the filesystem does not support an atomic exchange: %w", err))
 	}
-	_ = t.staging.remove("probe-a")
-	_ = t.staging.remove("probe-b")
+	for _, probe := range []string{"probe-a", "probe-b"} {
+		if err := t.staging.remove(probe); err != nil {
+			return fail(ReasonStagingFailed, err)
+		}
+	}
 
 	for _, file := range t.judgedL {
 		parent, base := splitRel(file.Rel)
@@ -996,142 +1182,81 @@ func (t *transaction) stagingParent(parent string) (*dirHandle, error) {
 	return current, nil
 }
 
-func (t *transaction) writeRecord(record stagingRecord) error {
-	dir := t.recordDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	raw, err := json.Marshal(record)
+// --- the install ---------------------------------------------------------------
+
+// procFdDir is the descriptor table; a variable so a test can point it away.
+var procFdDir = "/proc/self/fd"
+
+// sealDescriptors marks every inherited descriptor above stderr close-on-exec,
+// whatever its number, and checks that each call worked. The descriptor table
+// is read, there is no fixed upper bound and no fallback: a table that cannot
+// be read is an error, and so is a descriptor that cannot be marked. The child,
+// which gets the environment it is given and nothing else, then keeps neither
+// the project lock nor anything of the caller's.
+func sealDescriptors() error {
+	entries, err := os.ReadDir(procFdDir)
 	if err != nil {
-		return err
+		return fmt.Errorf("the descriptor table cannot be read: %w", err)
 	}
-	final := filepath.Join(dir, record.Name)
-	temp := final + ".tmp"
-	if err := os.WriteFile(temp, raw, 0o600); err != nil {
-		return err
+	for _, entry := range entries {
+		fd, err := strconv.Atoi(entry.Name())
+		if err != nil || fd <= 2 {
+			continue
+		}
+		flags, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), syscall.F_GETFD, 0)
+		if errno == syscall.EBADF {
+			continue // the descriptor of the directory listing itself
+		}
+		if errno != 0 {
+			return fmt.Errorf("descriptor %d cannot be inspected: %w", fd, errno)
+		}
+		if flags&syscall.FD_CLOEXEC != 0 {
+			continue
+		}
+		if _, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), syscall.F_SETFD, flags|syscall.FD_CLOEXEC); errno != 0 {
+			return fmt.Errorf("descriptor %d cannot be made close-on-exec: %w", fd, errno)
+		}
 	}
-	if err := os.Rename(temp, final); err != nil {
-		_ = os.Remove(temp)
-		return err
-	}
-	t.recordFile = final
 	return nil
 }
 
-// --- the install ---------------------------------------------------------------
-
-// sealDescriptors marks every inherited descriptor above stderr close-on-exec,
-// whatever its number (the descriptor table is read, there is no fixed upper
-// bound), so that the child, which gets the environment it is given and
-// nothing else, does not keep the project lock or anything of the caller's.
-func sealDescriptors() {
-	entries, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		for fd := 3; fd < 1<<16; fd++ {
-			syscall.CloseOnExec(fd)
-		}
-		return
-	}
-	for _, entry := range entries {
-		if fd, err := strconv.Atoi(entry.Name()); err == nil && fd > 2 {
-			syscall.CloseOnExec(fd)
-		}
-	}
-}
-
-// processTable reads the parent of every process.
-func processTable() map[int]int {
-	parents := map[int]int{}
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return parents
-	}
-	for _, entry := range entries {
-		pid, err := strconv.Atoi(entry.Name())
-		if err != nil {
-			continue
-		}
-		raw, err := os.ReadFile("/proc/" + entry.Name() + "/stat")
-		if err != nil {
-			continue
-		}
-		text := string(raw)
-		end := strings.LastIndex(text, ")")
-		if end < 0 {
-			continue
-		}
-		fields := strings.Fields(text[end+1:])
-		if len(fields) < 2 {
-			continue
-		}
-		if ppid, err := strconv.Atoi(fields[1]); err == nil {
-			parents[pid] = ppid
-		}
-	}
-	return parents
-}
-
-// descendants lists the processes below this one, except the ones that were
-// already children when the install started.
-func descendants(except map[int]bool) []int {
-	parents := processTable()
-	children := map[int][]int{}
-	for pid, parent := range parents {
-		children[parent] = append(children[parent], pid)
-	}
-	var found []int
-	queue := []int{os.Getpid()}
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-		for _, child := range children[current] {
-			if except[child] {
-				continue
-			}
-			found = append(found, child)
-			queue = append(queue, child)
-		}
-	}
-	return found
-}
-
-// quiesce kills whatever the install left running below this process (its own
-// process group and anything that left it: a daemon started with setsid, a
-// double fork reparented to this process, which is made a subreaper for that)
-// and waits until nothing is left, so that nothing writes into staging while
-// it is verified and published.
-func quiesce(pgid int, except map[int]bool) error {
+// settleGroup ends whatever is left of the install's process group once its
+// leader has exited, and waits until the group is empty. Nothing else is looked
+// for: a process that left the group is outside the stated assumption (the
+// install command is trusted and runs no script). The group id is not reused
+// while any member exists. An error means completion could not be established.
+func settleGroup(pgid int) error {
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		_ = syscall.Kill(-pgid, syscall.SIGKILL)
-		found := descendants(except)
-		for _, pid := range found {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
-			var status syscall.WaitStatus
-			_, _ = syscall.Wait4(pid, &status, syscall.WNOHANG, nil)
+		if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return fmt.Errorf("the install's process group cannot be signalled: %w", err)
 		}
-		if len(found) == 0 && errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) {
+		err := syscall.Kill(-pgid, 0)
+		if errors.Is(err, syscall.ESRCH) {
 			return nil
 		}
+		if err != nil {
+			return fmt.Errorf("the install's process group cannot be inspected: %w", err)
+		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("%d processes of the install command are still there", len(found))
+			return errors.New("the install's process group is not empty after its leader exited")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 }
 
-const prSetChildSubreaper = 36
+// unsettled reports an install whose completion cannot be established. The
+// staging directory is kept (something may still write into it), and the record
+// says so.
+func (t *transaction) unsettled(reason, detail string) BindReport {
+	t.keep = true
+	_ = t.markKept("the install's completion could not be established")
+	return t.end(OutcomeInstallUnsettled, reason, detail)
+}
 
-// install runs the frozen install in staging and waits for it and for
-// everything it started. Its status is reported apart from the transaction's.
+// install runs the frozen install in staging, waits for it, then ends and waits
+// for its process group. Its status is reported apart from the transaction's.
 func (t *transaction) install() (BindReport, bool) {
-	sealDescriptors()
-	_, _, _ = syscall.RawSyscall(syscall.SYS_PRCTL, prSetChildSubreaper, 1, 0)
-	before := map[int]bool{}
-	for _, pid := range descendants(nil) {
-		before[pid] = true
-	}
-
 	cmd := exec.Command(t.req.Argv[0], t.req.Argv[1:]...)
 	cmd.Dir = t.staging.procPath("")
 	cmd.Env = append([]string{}, t.req.Env...)
@@ -1155,25 +1280,29 @@ func (t *transaction) install() (BindReport, bool) {
 	t.report.Install.Ran = true
 	pgid := cmd.Process.Pid
 
-	done := make(chan struct{})
-	watched := make(chan struct{})
-	go func() {
-		defer close(watched)
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	var waitErr error
+	select {
+	case waitErr = <-exited:
+	case <-t.ctx.Done():
+		_ = syscall.Kill(-pgid, syscall.SIGTERM)
 		select {
-		case <-t.ctx.Done():
-			_ = syscall.Kill(-pgid, syscall.SIGTERM)
+		case waitErr = <-exited:
+		case <-time.After(3 * time.Second):
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
 			select {
-			case <-done:
-			case <-time.After(3 * time.Second):
-				_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			case waitErr = <-exited:
+			case <-time.After(10 * time.Second):
+				// Stuck (uninterruptible I/O): do not hold the lock for ever.
+				return t.unsettled(ReasonWaitTimeout, "the install command did not end after SIGKILL"), false
 			}
-		case <-done:
 		}
-	}()
-	waitErr := cmd.Wait()
-	close(done)
-	<-watched
-	quiesceErr := quiesce(pgid, before)
+	}
+	settled := settleGroup(pgid)
+	if herr := hook("install:settle"); herr != nil {
+		settled = herr // tests: completion that cannot be established
+	}
 	t.report.Install.DurationMS = time.Since(started).Milliseconds()
 
 	if state := cmd.ProcessState; state != nil {
@@ -1184,12 +1313,14 @@ func (t *transaction) install() (BindReport, bool) {
 			t.report.Install.ExitCode = &code
 		}
 	}
+	if settled != nil {
+		// Also when a signal arrived: completion not established wins.
+		return t.unsettled(ReasonGroupRemains, settled.Error()), false
+	}
 	if t.ctx.Err() != nil {
 		return t.interrupted(), false
 	}
 	switch {
-	case quiesceErr != nil:
-		return t.end(OutcomeInstallFailed, ReasonProcessesRemain, quiesceErr.Error()), false
 	case t.report.Install.Signal != "":
 		return t.end(OutcomeInstallFailed, ReasonInstallSignaled, "the install command was killed by "+t.report.Install.Signal), false
 	case waitErr != nil:
@@ -1205,22 +1336,31 @@ func (t *transaction) install() (BindReport, bool) {
 // --- verification --------------------------------------------------------------
 
 // verify checks the staged tree against the judged lockfile bytes (not a file
-// the child could have touched), through the held staging directory, and holds
-// the identity of the tree that was verified: it is that object that is later
-// moved in.
+// the child could have touched), from the held tree directory, and keeps that
+// handle: it is that object that is later moved in. When the install left no
+// tree and the lockfile selects none, there is nothing to publish: with an old
+// tree the old tree is replaced by an EMPTY node_modules directory, made here
+// and verified like any other; with none, the result is no tree.
 func (t *transaction) verify() (BindReport, bool) {
 	if err := hook("verifying"); err != nil {
 		return t.hookFailure(err), false
 	}
-	var tree *dirHandle
+	absent := false
 	if handle, err := t.staging.openDirNoFollow("node_modules"); err == nil {
-		tree = handle
-		defer tree.Close()
-		if id, err := tree.id(); err == nil {
+		t.stagedTree = handle
+		if id, err := handle.id(); err == nil {
 			t.treeID = &id
 		}
+	} else if errors.Is(err, os.ErrNotExist) {
+		absent = true
 	}
-	verification, err := VerifyTree(t.lockfile, t.staging.procPath(""), t.req.Selection)
+	var verification TreeReport
+	var err error
+	if t.stagedTree != nil {
+		verification, err = VerifyHeldTree(t.lockfile, t.stagedTree.procPath(""), t.req.Selection)
+	} else {
+		verification, err = VerifyTree(t.lockfile, t.staging.procPath(""), t.req.Selection)
+	}
 	if err != nil {
 		return t.end(OutcomeVerificationFailed, ReasonVerification, "the staged tree could not be verified: "+err.Error()), false
 	}
@@ -1235,20 +1375,73 @@ func (t *transaction) verify() (BindReport, bool) {
 			fmt.Sprintf("the staged tree is not the judged one (%d problems, first: %s at %s)",
 				len(verification.Problems), verification.Problems[0].Problem, verification.Problems[0].Path)), false
 	}
-	if t.treeID == nil || !t.stagedTreeIsVerified() {
+	if absent {
+		// Verified with no tree: every entry is deselected, the selected tree is empty.
+		if t.initial == "present" {
+			if err := t.staging.mkdir("node_modules", 0o777); err != nil {
+				return t.end(OutcomeVerificationFailed, ReasonVerification, "the empty tree cannot be made: "+err.Error()), false
+			}
+			handle, err := t.staging.openDirNoFollow("node_modules")
+			if err != nil {
+				return t.end(OutcomeVerificationFailed, ReasonVerification, "the empty tree cannot be opened: "+err.Error()), false
+			}
+			t.stagedTree = handle
+			id, err := handle.id()
+			if err != nil {
+				return t.end(OutcomeVerificationFailed, ReasonVerification, err.Error()), false
+			}
+			t.treeID = &id
+		} else {
+			t.noTree = true
+		}
+	}
+	if !t.stagedTreeIsVerified() {
 		return t.end(OutcomeVerificationFailed, ReasonVerification, "the staged tree is not the object that was verified"), false
 	}
 	return BindReport{}, true
 }
 
 // stagedTreeIsVerified checks that the entry named node_modules in staging is
-// still the very directory that was opened and verified.
+// still the very directory that was held and verified (or, when there is no
+// tree to publish, that none appeared).
 func (t *transaction) stagedTreeIsVerified() bool {
 	info, err := t.staging.lstat("node_modules")
-	return err == nil && info.IsDir() && t.treeID != nil && idOf(info) == *t.treeID
+	if t.noTree {
+		return errors.Is(err, os.ErrNotExist)
+	}
+	if err != nil || !info.IsDir() || t.treeID == nil || t.stagedTree == nil {
+		return false
+	}
+	held, herr := t.stagedTree.id()
+	return herr == nil && idOf(info) == *t.treeID && held == *t.treeID
 }
 
 // --- publication ---------------------------------------------------------------
+
+// faultHook, when set by a test, is asked before every exchange or move of
+// publication and undo and can make it fail. Tests only.
+var faultHook func(op string) error
+
+func fault(op string) error {
+	if faultHook == nil {
+		return nil
+	}
+	return faultHook(op)
+}
+
+func (t *transaction) xchg(label string, aDir *dirHandle, a string, bDir *dirHandle, b string) error {
+	if err := fault("exchange:" + label); err != nil {
+		return err
+	}
+	return exchange(aDir, a, bDir, b)
+}
+
+func (t *transaction) mv(label string, aDir *dirHandle, a string, bDir *dirHandle, b string) error {
+	if err := fault("move:" + label); err != nil {
+		return err
+	}
+	return moveNoReplace(aDir, a, bDir, b)
+}
 
 type plannedFile struct {
 	rel, parent, base string
@@ -1257,12 +1450,43 @@ type plannedFile struct {
 	old, judged       string
 	perm              os.FileMode
 	newID             fileID
-	done              bool
-	state             string
+	// exchanged is recorded the moment the exchange (or the creation) succeeds,
+	// before anything is inspected; done once the displaced object has been
+	// accepted. exchanged && !done is the uncertain case.
+	exchanged, done bool
+	state           string
+}
+
+// observe describes an object in staging for the document.
+func (t *transaction) observe(name string) string {
+	info, err := t.staging.lstat(name)
+	if err != nil {
+		return "cannot be inspected: " + err.Error()
+	}
+	text := fmt.Sprintf("%s, mode %o, device %d inode %d", info.Mode().Type().String(), info.Mode().Perm(), idOf(info).dev, idOf(info).ino)
+	if info.Mode().IsRegular() {
+		if raw, _, err := t.staging.readRegular(name, maxInputBytes); err == nil {
+			text += ", " + digestOf(raw)
+		}
+	}
+	return text
+}
+
+// retain keeps an object in staging that the transaction could not identify or
+// could not put back: staging is not removed (the record already says kept).
+func (t *transaction) retain(name, why string) {
+	t.keep = true
+	for _, object := range t.report.Publication.Retained {
+		if object.Name == name {
+			return
+		}
+	}
+	t.report.Publication.Retained = append(t.report.Publication.Retained, RetainedObject{
+		Name: name, Location: t.stagingName + "/" + name, Observed: why + "; " + t.observe(name)})
 }
 
 func (t *transaction) publish() BindReport {
-	if t.oldTree == nil {
+	if t.initial == "absent" {
 		t.report.Publication.Tree = StateNone
 	}
 	// Prepare every replacement file in staging. Interruptible: nothing in the
@@ -1327,6 +1551,12 @@ func (t *transaction) publish() BindReport {
 	if t.ctx.Err() != nil {
 		return t.interrupted()
 	}
+	// From the first exchange on the staging directory may hold an object
+	// displaced from the project that nobody has inspected: mark it kept, so
+	// that a run killed from here on leaves it for a person.
+	if err := t.markKept("publication began: staging may hold objects displaced from the project"); err != nil {
+		return t.end(OutcomeRefused, ReasonStateDirInvalid, "the staging record cannot be marked: "+err.Error())
+	}
 
 	failure := func(outcome, reason string, err error) BindReport {
 		if errors.Is(err, errCrash) {
@@ -1335,9 +1565,13 @@ func (t *transaction) publish() BindReport {
 		}
 		complete := t.undo(plan)
 		t.report.Publication.State = PublicationRolledBack
-		if !complete || len(t.report.Publication.Conflicts) > 0 {
+		if !complete || len(t.report.Publication.Conflicts) > 0 || len(t.report.Publication.Retained) > 0 {
 			t.report.Publication.State = PublicationPartial
-			t.keep = !complete
+		}
+		if !t.keep {
+			if err := t.clearKept(); err != nil {
+				t.keep = true
+			}
 		}
 		if len(t.report.Changed) > 0 && outcome == OutcomePublicationFailed {
 			outcome, reason = OutcomeInputsChanged, ReasonInputsChanged
@@ -1378,7 +1612,9 @@ func (t *transaction) publish() BindReport {
 		}
 		return failure(OutcomePublicationFailed, ReasonPublication, err)
 	}
-	t.report.Publication.Tree = StateVerified
+	if !t.noTree {
+		t.report.Publication.Tree = StateVerified
+	}
 	if err := hook("publish:tree"); err != nil {
 		return failure(OutcomePublicationFailed, ReasonPublication, err)
 	}
@@ -1395,6 +1631,9 @@ func (t *transaction) publish() BindReport {
 	t.report.Publication.State = PublicationCommitted
 	for _, file := range plan {
 		t.report.Publication.Published = append(t.report.Publication.Published, file.rel)
+	}
+	if err := t.clearKept(); err != nil {
+		t.keep = true // the record could not be cleared: staging stays, and says so
 	}
 	t.report.Signal = signalOf(t.ctx)
 	return t.end(OutcomePublished, "", "")
@@ -1418,11 +1657,12 @@ type changedError struct {
 func (e *changedError) Error() string { return e.text }
 
 // publishFile puts one judged file in place. An existing destination is
-// exchanged with the prepared file atomically, and the object that was
-// displaced is inspected: anything but the bytes that were judged (an edit
-// that landed since, an editor's atomic save, a link, a special file) is
-// exchanged back, and the transaction stops. A file that did not exist is
-// created without replacing anything.
+// exchanged with the prepared file atomically, the exchange is recorded the
+// moment it succeeds, and the object that was displaced is inspected: anything
+// but the judged-old bytes with the permission bits seen at preparation (an
+// edit that landed since, an editor's atomic save, a chmod, a link, a special
+// file) is exchanged back, and the transaction stops. A file that did not exist
+// is created without replacing anything.
 func (t *transaction) publishFile(file *plannedFile) error {
 	dir, err := t.project.walk(file.parent)
 	if err != nil {
@@ -1433,95 +1673,117 @@ func (t *transaction) publishFile(file *plannedFile) error {
 		return fmt.Errorf("%s: its directory is on another device", file.rel)
 	}
 	if !file.existing {
-		if err := moveNoReplace(t.staging, file.tmp, dir, file.base); err != nil {
+		if err := t.mv("create:"+file.rel, t.staging, file.tmp, dir, file.base); err != nil {
 			if errors.Is(err, os.ErrExist) {
 				return &changedError{InputChange{Path: file.rel, Judged: "absent", Found: "present"}, file.rel + " appeared during publication; it was kept"}
 			}
 			return fmt.Errorf("creating %s: %w", file.rel, err)
 		}
-		file.done = true
+		file.exchanged, file.done = true, true
 		return nil
 	}
-	if err := exchange(t.staging, file.tmp, dir, file.base); err != nil {
+	if err := t.xchg("file:"+file.rel, t.staging, file.tmp, dir, file.base); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return &changedError{InputChange{Path: file.rel, Judged: file.old, Found: "absent"}, file.rel + " disappeared during publication"}
 		}
 		return fmt.Errorf("replacing %s: %w", file.rel, err)
 	}
+	file.exchanged = true // recorded before anything is looked at
+	if err := hook(fmt.Sprintf("publish:file:%s:exchanged", file.tmp)); err != nil {
+		return err
+	}
 	// What was displaced is now at staging/<tmp>.
-	found, problem := t.displacedDigest(file.tmp)
-	if problem == "" && found == file.old {
+	found, perm, problem := t.displaced(file.tmp)
+	if problem == "" && found == file.old && perm == file.perm {
 		file.done = true
 		return nil
 	}
-	if err := exchange(t.staging, file.tmp, dir, file.base); err != nil {
-		return fmt.Errorf("%s changed during publication and could not be put back: %w", file.rel, err)
-	}
+	observed := found
 	if problem != "" {
-		found = problem
+		observed = problem
+	} else if perm != file.perm {
+		observed = fmt.Sprintf("permission bits %o (seen at preparation: %o)", perm, file.perm)
 	}
-	return &changedError{InputChange{Path: file.rel, Judged: file.old, Found: found}, file.rel + " changed during publication; the change was kept"}
+	if err := t.xchg("file:"+file.rel+":back", t.staging, file.tmp, dir, file.base); err != nil {
+		// The displaced object (somebody's save) is in staging and the judged
+		// file is in place: keep it, name it, stop.
+		t.retain(file.tmp, "the object displaced from "+file.rel+" is not the judged one and could not be exchanged back ("+err.Error()+")")
+		t.report.Changed = append(t.report.Changed, InputChange{Path: file.rel, Judged: file.old, Found: observed})
+		return fmt.Errorf("%s changed during publication and the displaced object could not be put back: %w", file.rel, err)
+	}
+	file.exchanged = false
+	return &changedError{InputChange{Path: file.rel, Judged: file.old, Found: observed}, file.rel + " changed during publication; the change was kept"}
 }
 
-// displacedDigest inspects an object that publication displaced into staging.
-func (t *transaction) displacedDigest(name string) (digest, problem string) {
+// displaced inspects an object that publication displaced into staging: its
+// bytes, its permission bits and whether it is a plain regular file.
+func (t *transaction) displaced(name string) (digest string, perm os.FileMode, problem string) {
 	info, err := t.staging.lstat(name)
 	if err != nil {
-		return "", err.Error()
+		return "", 0, err.Error()
 	}
 	if !info.Mode().IsRegular() {
-		return "", "not a regular file"
+		return "", 0, "not a regular file"
 	}
 	if info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 {
-		return "", "set-id or sticky mode bits"
+		return "", 0, "set-id or sticky mode bits"
 	}
 	raw, _, err := t.staging.readRegular(name, maxInputBytes)
 	if err != nil {
-		return "", err.Error()
+		return "", 0, err.Error()
 	}
-	return digestOf(raw), ""
+	return digestOf(raw), info.Mode().Perm(), ""
 }
 
 // displacedIs reports whether the object displaced into staging holds the
-// bytes with this digest: an edit made in place to the file the transaction
-// published keeps its identity and is told apart by its content.
-func (t *transaction) displacedIs(name, digest string) bool {
-	found, problem := t.displacedDigest(name)
-	return problem == "" && found == digest
+// bytes with this digest and these permission bits: an edit made in place to
+// the file the transaction published keeps its identity and is told apart by
+// its content.
+func (t *transaction) displacedIs(name, digest string, perm os.FileMode) bool {
+	found, got, problem := t.displaced(name)
+	return problem == "" && found == digest && got == perm
 }
 
 // publishTree puts the verified tree in place in one atomic step: exchanged
-// with the live tree (whose identity must be the one checked at the start), or
-// moved in without replacing when there was none.
+// with the live tree (whose identity must be the one held since the start), or
+// moved in without replacing when there was none. The step is recorded the
+// moment it succeeds.
 func (t *transaction) publishTree() error {
-	if t.oldTree == nil {
-		if err := moveNoReplace(t.staging, "node_modules", t.project, "node_modules"); err != nil {
+	if t.noTree {
+		return nil // no old tree and none selected: nothing to put in place
+	}
+	if t.initial == "absent" {
+		if err := t.mv("tree", t.staging, "node_modules", t.project, "node_modules"); err != nil {
 			if errors.Is(err, os.ErrExist) {
 				return &changedError{InputChange{Path: "node_modules", Judged: "absent", Found: "present"}, "a tree root appeared during publication; it was kept"}
 			}
 			return fmt.Errorf("moving the tree in: %w", err)
 		}
+		t.treeSwapped = true
 		return nil
 	}
-	if err := exchange(t.staging, "node_modules", t.project, "node_modules"); err != nil {
+	if err := t.xchg("tree", t.staging, "node_modules", t.project, "node_modules"); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return &changedError{InputChange{Path: "node_modules", Judged: "directory", Found: "absent"}, "the tree root disappeared during publication"}
 		}
 		return fmt.Errorf("exchanging the tree: %w", err)
 	}
-	// What was displaced is the old tree, or it is not and goes back.
+	t.treeSwapped = true
+	// What was displaced must be the old tree that was held since the start.
 	info, err := t.staging.lstat("node_modules")
-	if err == nil && info.IsDir() && idOf(info) == *t.oldTree {
-		t.report.Publication.Tree = StateVerified
+	if held, herr := t.liveTree.id(); err == nil && herr == nil && info.IsDir() && idOf(info) == held {
 		return nil
 	}
-	if err := exchange(t.staging, "node_modules", t.project, "node_modules"); err != nil {
+	if err := t.xchg("tree:back", t.staging, "node_modules", t.project, "node_modules"); err != nil {
+		t.retain("node_modules", "the object displaced from the tree root is not the old tree and could not be exchanged back ("+err.Error()+")")
 		return fmt.Errorf("the tree root was replaced during publication and could not be put back: %w", err)
 	}
+	t.treeSwapped = false
 	return &changedError{InputChange{Path: "node_modules", Judged: "the tree checked at the start", Found: "another object"}, "the tree root was replaced during publication; it was kept"}
 }
 
-// finalCheck looks at everything once more with the new tree in place.
+// finalCheck looks at everything once more with the new tree in place, reading
+// each published file through one checked parent handle.
 func (t *transaction) finalCheck(plan []*plannedFile) []InputChange {
 	skip := map[string]bool{}
 	for _, file := range plan {
@@ -1538,96 +1800,179 @@ func (t *transaction) finalCheck(plan []*plannedFile) []InputChange {
 			continue
 		}
 		info, err := dir.lstat(file.base)
-		dir.Close()
-		if err != nil || !info.Mode().IsRegular() || idOf(info) != file.newID {
+		switch {
+		case err != nil || !info.Mode().IsRegular() || idOf(info) != file.newID:
 			changes = append(changes, InputChange{Path: file.rel, Judged: file.judged, Found: "another object"})
-			continue
+		default:
+			raw, _, rerr := dir.readRegular(file.base, maxInputBytes)
+			if rerr != nil || digestOf(raw) != file.judged {
+				changes = append(changes, InputChange{Path: file.rel, Judged: file.judged, Found: "other bytes"})
+			}
 		}
-		dir2, _ := t.project.walk(file.parent)
-		raw, _, rerr := dir2.readRegular(file.base, maxInputBytes)
-		dir2.Close()
-		if rerr != nil || digestOf(raw) != file.judged {
-			changes = append(changes, InputChange{Path: file.rel, Judged: file.judged, Found: "other bytes"})
-		}
+		dir.Close()
 	}
-	if info, err := t.project.lstat("node_modules"); err != nil || !info.IsDir() || t.treeID == nil || idOf(info) != *t.treeID {
+	info, err := t.project.lstat("node_modules")
+	switch {
+	case t.noTree:
+		if !errors.Is(err, os.ErrNotExist) {
+			changes = append(changes, InputChange{Path: "node_modules", Judged: "absent", Found: "present"})
+		}
+	case err != nil || !info.IsDir() || t.treeID == nil || idOf(info) != *t.treeID:
 		changes = append(changes, InputChange{Path: "node_modules", Judged: "the verified tree", Found: "another object"})
 	}
 	return changes
 }
 
 // undo reverses what publication did, in reverse order, best effort, and
-// records in the report where everything stands. It returns false when the old
-// tree could not be put back (staging is then kept: it holds it). Each step
-// puts something back only if what is there is still the object the
-// transaction placed; anything else is someone's change, is left as it is and
-// reported as a conflict.
+// records in the report where everything stands. It never deletes an object it
+// cannot identify: every object it takes out of the project is inspected (its
+// identity, its bytes and its permission bits) and, if it is not the one the
+// transaction placed, is put back where it was; if that fails too, the object
+// is retained in staging, named in the document, and staging is kept. It
+// returns false when the old tree could not be put back.
 func (t *transaction) undo(plan []*plannedFile) bool {
 	complete := true
 	pub := &t.report.Publication
 	conflict := func(what string) { pub.Conflicts = append(pub.Conflicts, what) }
 
-	if pub.Tree == StateVerified {
-		switch {
-		case t.oldTree != nil:
-			if err := exchange(t.staging, "node_modules", t.project, "node_modules"); err != nil {
-				complete = false
-				conflict("node_modules")
-			} else if info, err := t.staging.lstat("node_modules"); err == nil && t.treeID != nil && idOf(info) == *t.treeID {
-				pub.Tree = StateOld
-			} else {
-				_ = exchange(t.staging, "node_modules", t.project, "node_modules")
-				pub.Tree = StateChanged
-				conflict("node_modules")
-			}
-		default:
-			if info, err := t.project.lstat("node_modules"); err == nil && t.treeID != nil && idOf(info) == *t.treeID {
-				if moveNoReplace(t.project, "node_modules", t.staging, "node_modules") == nil {
-					pub.Tree = StateNone
-				} else {
-					complete = false
-					conflict("node_modules")
-				}
-			} else {
-				pub.Tree = StateChanged
-				conflict("node_modules")
-			}
-		}
+	if t.treeSwapped && !t.noTree {
+		complete = t.undoTree(conflict) && complete
 	}
 	for i := len(plan) - 1; i >= 0; i-- {
 		file := plan[i]
-		if !file.done {
+		if !file.exchanged {
 			continue
 		}
 		dir, err := t.project.walk(file.parent)
 		if err != nil {
 			conflict(file.rel)
 			t.setFileState(file, StateChanged)
+			t.retainFile(file, "the directory of "+file.rel+" cannot be reached to undo it")
 			continue
 		}
-		if file.existing {
-			if err := exchange(t.staging, file.tmp, dir, file.base); err != nil {
-				conflict(file.rel)
-				t.setFileState(file, StateChanged)
-			} else if info, err := t.staging.lstat(file.tmp); err == nil && idOf(info) == file.newID && t.displacedIs(file.tmp, file.judged) {
-				t.setFileState(file, StateOld)
-			} else {
-				_ = exchange(t.staging, file.tmp, dir, file.base)
-				conflict(file.rel)
-				t.setFileState(file, StateChanged)
-			}
-		} else if info, err := dir.lstat(file.base); err == nil && idOf(info) == file.newID {
-			if moveNoReplace(dir, file.base, t.staging, "undone-"+file.tmp) == nil {
-				t.setFileState(file, StateOld)
-			} else {
-				conflict(file.rel)
-				t.setFileState(file, StateChanged)
-			}
+		if !file.existing {
+			t.undoCreated(file, dir, conflict)
 		} else {
-			conflict(file.rel)
-			t.setFileState(file, StateChanged)
+			t.undoExchanged(file, dir, conflict)
 		}
 		dir.Close()
 	}
 	return complete
+}
+
+// unretain forgets an object that turned out to be ours after all (a retry
+// put everything back); staging is no longer kept for it.
+func (t *transaction) unretain(name string) {
+	kept := t.report.Publication.Retained[:0]
+	for _, object := range t.report.Publication.Retained {
+		if object.Name != name {
+			kept = append(kept, object)
+		}
+	}
+	t.report.Publication.Retained = kept
+	if len(kept) == 0 {
+		t.keep = false
+	}
+}
+
+func (t *transaction) retainFile(file *plannedFile, why string) {
+	if _, err := t.staging.lstat(file.tmp); err == nil {
+		t.retain(file.tmp, why)
+	}
+}
+
+// undoExchanged reverses the exchange of an existing file: exchange back, then
+// look at what came out. The judged object comes back to staging; anything
+// else is somebody's and goes straight back into the project.
+func (t *transaction) undoExchanged(file *plannedFile, dir *dirHandle, conflict func(string)) {
+	if err := t.xchg("file:"+file.rel+":undo", t.staging, file.tmp, dir, file.base); err != nil {
+		conflict(file.rel)
+		t.setFileState(file, StateJudged)
+		if !file.done {
+			t.setFileState(file, StateChanged)
+		}
+		t.retainFile(file, "the exchange of "+file.rel+" could not be reversed ("+err.Error()+"); staging holds the object displaced at publication")
+		return
+	}
+	if !file.done {
+		// The first exchange back failed earlier: what was displaced then is
+		// the editor's object, and it is in place again now.
+		t.unretain(file.tmp)
+		t.setFileState(file, StateChanged)
+		conflict(file.rel)
+		return
+	}
+	if info, err := t.staging.lstat(file.tmp); err == nil && idOf(info) == file.newID && t.displacedIs(file.tmp, file.judged, file.perm) {
+		t.setFileState(file, StateOld)
+		return
+	}
+	// Not the object the transaction placed (an edit, an atomic save): put it back.
+	conflict(file.rel)
+	t.setFileState(file, StateChanged)
+	if err := t.xchg("file:"+file.rel+":undo-again", t.staging, file.tmp, dir, file.base); err != nil {
+		t.retainFile(file, "the object found at "+file.rel+" is not the judged one and could not be put back ("+err.Error()+")")
+	}
+}
+
+// undoCreated reverses the creation of a file that did not exist: the file is
+// MOVED to staging (never deleted), inspected, and moved back if it is not the
+// object the transaction created.
+func (t *transaction) undoCreated(file *plannedFile, dir *dirHandle, conflict func(string)) {
+	undone := "undone-" + file.tmp
+	if err := t.mv("create:"+file.rel+":undo", dir, file.base, t.staging, undone); err != nil {
+		conflict(file.rel)
+		t.setFileState(file, StateChanged)
+		return // still in the project, untouched
+	}
+	if info, err := t.staging.lstat(undone); err == nil && idOf(info) == file.newID && t.displacedIs(undone, file.judged, 0) {
+		t.setFileState(file, StateOld)
+		return
+	}
+	conflict(file.rel)
+	t.setFileState(file, StateChanged)
+	if err := t.mv("create:"+file.rel+":undo-back", t.staging, undone, dir, file.base); err != nil {
+		t.retain(undone, "the file found at "+file.rel+" is not the one the transaction created and could not be put back ("+err.Error()+")")
+	}
+}
+
+// undoTree reverses the tree exchange or move, inspecting what comes out.
+func (t *transaction) undoTree(conflict func(string)) bool {
+	pub := &t.report.Publication
+	if t.initial == "absent" {
+		if err := t.mv("tree:undo", t.project, "node_modules", t.staging, "node_modules"); err != nil {
+			conflict("node_modules")
+			return false
+		}
+		if info, err := t.staging.lstat("node_modules"); err == nil && t.treeID != nil && info.IsDir() && idOf(info) == *t.treeID {
+			pub.Tree = StateNone
+			t.treeSwapped = false
+			return true
+		}
+		conflict("node_modules")
+		pub.Tree = StateChanged
+		if err := t.mv("tree:undo-back", t.staging, "node_modules", t.project, "node_modules"); err != nil {
+			t.retain("node_modules", "the object found at the tree root is not the verified tree and could not be put back ("+err.Error()+")")
+			return false
+		}
+		return true
+	}
+	if err := t.xchg("tree:undo", t.staging, "node_modules", t.project, "node_modules"); err != nil {
+		conflict("node_modules")
+		t.retain("node_modules", "the old tree could not be put back ("+err.Error()+")")
+		return false
+	}
+	t.treeSwapped = false
+	if info, err := t.staging.lstat("node_modules"); err == nil && t.treeID != nil && info.IsDir() && idOf(info) == *t.treeID {
+		pub.Tree = StateOld
+		return true
+	}
+	// Not the verified tree: someone replaced it. Put it back, as it was.
+	conflict("node_modules")
+	pub.Tree = StateChanged
+	t.treeSwapped = true
+	if err := t.xchg("tree:undo-again", t.staging, "node_modules", t.project, "node_modules"); err != nil {
+		t.retain("node_modules", "the object found at the tree root is not the verified tree and could not be put back ("+err.Error()+")")
+		return false
+	}
+	return true
 }
