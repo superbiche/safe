@@ -23,7 +23,7 @@ import (
 // carries its outcome (0 clear, otherwise the class's 100, 102 or 104).
 
 const (
-	projectGraphUsage  = "safe-core: usage: safe-core project-graph [--registry-host <host>]... [--public-evidence-host <host>]... <lockfile>"
+	projectGraphUsage  = "safe-core: usage: safe-core project-graph [--any-version] [--project-root <dir>] [--registry-host <host>]... [--public-evidence-host <host>]... <lockfile>"
 	projectDiffUsage   = "safe-core: usage: safe-core project-diff [--registry-host <host>]... [--public-evidence-host <host>]... (--baseline <lockfile> | --no-baseline) <target-lockfile>"
 	projectDecideUsage = "safe-core: usage: safe-core project-decide [--registry-host <host>]... [--public-evidence-host <host>]... (--baseline <lockfile> | --no-baseline) --evidence <file> [--acceptances <file>] <target-lockfile>"
 )
@@ -116,21 +116,53 @@ func printJSON(stdout io.Writer, name string, stderr io.Writer, document any) in
 // projectGraph prints the artifact graph of a lockfile and whether safe can
 // bind every artifact in it.
 func projectGraph(args []string, stdout, stderr io.Writer) int {
-	parsed, ok := parseProjectArgs(args, false, false)
+	// --any-version reads the package map whatever the declared lockfile version says, and
+	// --project-root names the project directory, against which a link target is resolved on the
+	// filesystem (a link inside the project in the lockfile's text can still leave it).
+	anyVersion, root := false, ""
+	rest := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--any-version":
+			anyVersion = true
+		case "--project-root":
+			if i+1 >= len(args) || args[i+1] == "" || root != "" {
+				fmt.Fprintln(stderr, projectGraphUsage)
+				return 2
+			}
+			root = args[i+1]
+			i++
+		default:
+			rest = append(rest, args[i])
+		}
+	}
+	parsed, ok := parseProjectArgs(rest, false, false)
 	if !ok {
 		fmt.Fprintln(stderr, projectGraphUsage)
 		return 2
 	}
-	graph, err := projectlane.LoadGraph(parsed.target, parsed.hosts())
+	load := projectlane.LoadGraph
+	if anyVersion {
+		load = projectlane.LoadGraphAnyVersion
+	}
+	graph, err := load(parsed.target, parsed.hosts())
 	if err != nil {
 		fmt.Fprintf(stderr, "safe-core: project-graph: %v\n", err)
 		return 3
+	}
+	bindability := projectlane.CheckBindable(graph, parsed.registryHosts)
+	if root != "" {
+		bindability, err = projectlane.CheckLinksInRoot(graph, bindability, root)
+		if err != nil {
+			fmt.Fprintf(stderr, "safe-core: project-graph: %v\n", err)
+			return 3
+		}
 	}
 	return printJSON(stdout, "project-graph", stderr, struct {
 		SchemaVersion int                     `json:"schema_version"`
 		Graph         projectlane.Graph       `json:"graph"`
 		Bindability   projectlane.Bindability `json:"bindability"`
-	}{projectLaneSchema, graph, projectlane.CheckBindable(graph, parsed.registryHosts)})
+	}{projectLaneSchema, graph, bindability})
 }
 
 // loadBaseline reads the baseline a command names. An explicit --no-baseline

@@ -146,8 +146,19 @@ type Record struct {
 // the validation LoadEntries applies, keeping every fact of each entry. Link
 // entries carry their path and target only: npm never fetches them.
 func LoadRecords(path string, registryHosts []string) ([]Record, error) {
+	return loadRecords(path, registryHosts, false)
+}
+
+// LoadRecordsAnyVersion is LoadRecords for a lockfile whose declared version is not
+// judged: the package map, when there is one, is read whatever the version says, so that the
+// safety checks on its entries (identity, link targets) never depend on a declared version.
+func LoadRecordsAnyVersion(path string, registryHosts []string) ([]Record, error) {
+	return loadRecords(path, registryHosts, true)
+}
+
+func loadRecords(path string, registryHosts []string, anyVersion bool) ([]Record, error) {
 	allowedRegistryHosts := registryHostSet(registryHosts)
-	entries, err := readPackagesMap(path)
+	entries, err := readPackagesMap(path, anyVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -485,7 +496,7 @@ func CheckEntry(raw json.RawMessage) error {
 
 // readPackagesMap reads and checks the lockfile document and returns its
 // .packages map, the one reading every loader here shares.
-func readPackagesMap(path string) (map[string]json.RawMessage, error) {
+func readPackagesMap(path string, anyVersion bool) (map[string]json.RawMessage, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read %q: %w", path, err)
@@ -519,19 +530,21 @@ func readPackagesMap(path string) (map[string]json.RawMessage, error) {
 		return nil, fmt.Errorf("parse %q: %w", path, err)
 	}
 
-	versionRaw, ok := root["lockfileVersion"]
-	if !ok {
-		return nil, fmt.Errorf("parse %q: lockfileVersion is required", path)
-	}
 	var lockfileVersion int64
-	if err := json.Unmarshal(versionRaw, &lockfileVersion); err != nil {
-		return nil, fmt.Errorf("parse %q: lockfileVersion must be a number", path)
-	}
-	if lockfileVersion == 1 {
-		return nil, fmt.Errorf("parse %q: lockfileVersion 1 is unsupported because it has no .packages map", path)
-	}
-	if lockfileVersion != 2 && lockfileVersion != 3 {
-		return nil, fmt.Errorf("parse %q: unsupported lockfileVersion %d (expected 2 or 3)", path, lockfileVersion)
+	if !anyVersion {
+		versionRaw, ok := root["lockfileVersion"]
+		if !ok {
+			return nil, fmt.Errorf("parse %q: lockfileVersion is required", path)
+		}
+		if err := json.Unmarshal(versionRaw, &lockfileVersion); err != nil {
+			return nil, fmt.Errorf("parse %q: lockfileVersion must be a number", path)
+		}
+		if lockfileVersion == 1 {
+			return nil, fmt.Errorf("parse %q: lockfileVersion 1 is unsupported because it has no .packages map", path)
+		}
+		if lockfileVersion != 2 && lockfileVersion != 3 {
+			return nil, fmt.Errorf("parse %q: unsupported lockfileVersion %d (expected 2 or 3)", path, lockfileVersion)
+		}
 	}
 
 	packagesRaw, ok := root["packages"]
@@ -565,7 +578,16 @@ type LocalPackage struct {
 // node_modules and that some link entry targets, by their key. Their version
 // is what makes a workspace member's change visible in a difference.
 func LoadLocalPackages(path string) ([]LocalPackage, error) {
-	entries, err := readPackagesMap(path)
+	return loadLocalPackages(path, false)
+}
+
+// LoadLocalPackagesAnyVersion is LoadLocalPackages without judging the declared version.
+func LoadLocalPackagesAnyVersion(path string) ([]LocalPackage, error) {
+	return loadLocalPackages(path, true)
+}
+
+func loadLocalPackages(path string, anyVersion bool) ([]LocalPackage, error) {
+	entries, err := readPackagesMap(path, anyVersion)
 	if err != nil {
 		return nil, err
 	}
