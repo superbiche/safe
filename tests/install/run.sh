@@ -8377,7 +8377,7 @@ case_project_lane_audit_only_mode_refuses() {
   [[ "${STATUS}" -ne 0 ]] || { fail "$FUNCNAME: audit-only mode returned success"; return; }
   assert_status 100 "$FUNCNAME" || return
   assert_lane_final_line install "$FUNCNAME" || return
-  assert_err_contains_fragment 'audit-only pass of a version manager' "$FUNCNAME" || return
+  assert_err_contains_fragment 'audit-only pass (SAFE_GATE_NO_EXEC)' "$FUNCNAME" || return
   assert_lane_untouched "${before}" "$FUNCNAME" || return
   assert_log_not_contains_fragment 'PROJECTION' "$FUNCNAME" || return
   : > "${LOG_FILE}"
@@ -8471,7 +8471,9 @@ lane_oneshot_case() {
   err_off="$(cat "${ERR_FILE}")"
   printf '%s\n' "${saved}" > "${config}"
   for kv in "$@"; do unset "${kv%%=*}"; done
-  local line_re="^safe: project lane: npm ${verb} \\[lane: one-shot, .*${fragment}.*\\] — the closure is not judged on this route$"
+  local fragment_re
+  fragment_re="$(printf '%s' "${fragment}" | sed 's/[][\.*^$()+?{}|]/\\&/g')"
+  local line_re="^safe: project lane: npm ${verb} \\[lane: one-shot, .*${fragment_re}.*\\] — the closure is not judged on this route$"
   if [[ "$(printf '%s\n' "${err_on}" | grep -cE "^safe: project lane: ")" -ne 1 ]] || ! printf '%s\n' "${err_on}" | grep -qE -- "${line_re}"; then
     printf 'stderr with the switch on:\n%s\n' "${err_on}" >&2
     fail "${label}: no single one-shot line for ${fragment}"
@@ -9212,23 +9214,18 @@ case_project_lane_admission_is_npms_not_a_pattern() {
     jq -c "${body}" "${WORK_DIR}/package.json" > "${WORK_DIR}/package.json.new"
     mv "${WORK_DIR}/package.json.new" "${WORK_DIR}/package.json"
     lane_commit
-    lane_run 'npm install clean@2.0.0'
-    lane_unsupported_case "$FUNCNAME" install "${body}" || return
+    lane_oneshot_case "$FUNCNAME" install 'manifest' 'npm install clean@2.0.0' || return
   done
   # the committed lockfile's own dependency edges
   lane_prepare "lane-admission-edge" kept@1.0.0
   lane_lock kept@1.0.0 | jq -c '.packages["node_modules/kept"].dependencies = {"sneaky": "github:user/repo"}' > "${WORK_DIR}/package-lock.json"
   lane_commit
-  lane_run 'npm install clean@2.0.0'
-  lane_unsupported_case "$FUNCNAME" install 'a lockfile edge to git' || return
-  assert_err_contains_fragment 'lockfile[node_modules/kept].dependencies.sneaky' "$FUNCNAME" || return
+  lane_oneshot_case "$FUNCNAME" install 'lockfile[node_modules/kept].dependencies.sneaky' 'npm install clean@2.0.0' || return
   # the capability of the delegated npm is read from ITS definitions: one that
   # merely echoes the options in its configuration listing (npm 10.9.2) refuses
   lane_prepare "lane-admission-capability" kept@1.0.0
-  NODE_CAPABILITY_JSON='{"version":"10.9.2","atFloor":false,"missing":["allow-git"]}' lane_run 'npm install clean@2.0.0'
-  lane_unsupported_case "$FUNCNAME" install 'an npm that echoes the git options' || return
-  assert_err_contains_fragment 'older than 11.12.1 or does not define allow-git' "$FUNCNAME" || return
-  assert_log_not_contains_fragment 'PROJECTION' "$FUNCNAME" || return
+  lane_oneshot_case "$FUNCNAME" install 'older than 11.12.1 or does not define allow-git' 'npm install clean@2.0.0' \
+    'NODE_CAPABILITY_JSON={"version":"10.9.2","atFloor":false,"missing":["allow-git"]}' || return
   pass "$FUNCNAME"
 }
 
@@ -9833,10 +9830,14 @@ case_project_lane_a_committed_lockfile_of_the_wrong_shape_is_missing_evidence() 
     assert_err_contains_fragment 'committed lockfile cannot be decoded' "$FUNCNAME" || return
     assert_lane_untouched "${before}" "$FUNCNAME" || return
   done
-  # a readable, unsupported source stays a policy refusal
+  # a readable, unsupported source is never missing evidence: committed it takes the one-shot route,
+  # uncommitted it is a policy refusal
   lane_prepare "lane-readable-unsupported" kept@1.0.0
   lane_lock kept@1.0.0 | jq -c '.packages["node_modules/kept"].dependencies = {"s": "github:u/r"}' > "${WORK_DIR}/package-lock.json"
   lane_commit
+  lane_oneshot_case "$FUNCNAME" install 'lockfile[node_modules/kept]' 'npm install clean@2.0.0' || return
+  lane_prepare "lane-readable-unsupported-dirty" kept@1.0.0
+  lane_lock kept@1.0.0 | jq -c '.packages["node_modules/kept"].dependencies = {"s": "github:u/r"}' > "${WORK_DIR}/package-lock.json"
   lane_run 'npm install clean@2.0.0'
   assert_status 100 "$FUNCNAME" || return
   pass "$FUNCNAME"
