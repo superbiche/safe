@@ -126,8 +126,10 @@ fi
 cat > "${WORK}/safe/bin/safe-audit" <<'AUDIT'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "scanner-batch" ]]; then
-  jq -c '{schema_version: 1, policy: {block_severities: ["critical"]},
-          identities: [.packages[] | {name, version, coverage: "complete", gap: "", advisories: []}],
+  jq -c --arg adv "${LIVE_ADVISORY_NAME:-}" --arg mal "${LIVE_MALWARE_NAME:-}" '{schema_version: 1, policy: {block_severities: ["critical"]},
+          identities: [.packages[] | {name, version, coverage: "complete", gap: "",
+            advisories: (if .name == $mal then [{id: "MAL-live-0001", severity: "critical", malware: true}]
+                         elif .name == $adv then [{id: "GHSA-live-0001", severity: "critical", malware: false}] else [] end)}],
           blocklist: []}'
   exit 0
 fi
@@ -274,6 +276,278 @@ if [[ -n "${real_mise_bin:-}" ]] && ! LC_ALL=C head -n 2 -- "${real_mise_bin}" 2
 else
   printf '# D (mise exec) skipped: no real mise on this machine\n'
 fi
+
+# --- scenarios E, F, G: ci, dedupe and prune on the REAL npm ------------------------------------------
+# The fixtures are hand-written lockfiles of registry packages (integrity hashes read from the registry), so
+# the plans are known in advance: E. a fresh clone's `npm ci`; F. a dedupe that needs doing; G. a prune that
+# changes the lockfile, and one that changes only the tree.
+MS_211='"node_modules/debug/node_modules/ms":{"version":"2.1.1","resolved":"https://registry.npmjs.org/ms/-/ms-2.1.1.tgz","integrity":"sha512-tgp+dl5cGk28utYktBsrFqA7HKgrhgPsg6Z/EfhWI4gl1Hwq8B/GmY/0oXZ6nF8hDVesS/FpnYaD/kOWhYQvyg=="}'
+MS_213='"node_modules/ms":{"version":"2.1.3","resolved":"https://registry.npmjs.org/ms/-/ms-2.1.3.tgz","integrity":"sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA=="}'
+DEBUG_411='"node_modules/debug":{"version":"4.1.1","resolved":"https://registry.npmjs.org/debug/-/debug-4.1.1.tgz","integrity":"sha512-pYAIzeRo8J6KPEaJ0VWOh5Pzkbw/RetuzehGM7QRRX5he4fPHx2rdKMB256ehJCkX+XRQm16eZLqLNS8RSZXZw==","dependencies":{"ms":"^2.1.1"}}'
+ISNUMBER_700='"node_modules/is-number":{"version":"7.0.0","resolved":"https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz","integrity":"sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng=="}'
+fixture_project() { # <dir> <dependencies json> <packages entries (after the root)>
+  mkdir -p "$1"
+  ( cd "$1" || exit 1
+    printf '{"name":"live-lane","version":"1.0.0","dependencies":%s}\n' "$2" > package.json
+    printf '{"name":"live-lane","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"live-lane","version":"1.0.0","dependencies":%s},%s}}\n' "$2" "$3" > package-lock.json
+    git init -q -b main && git add package.json package-lock.json && git -c user.name=lane -c user.email=lane@example.invalid commit -q -m base )
+}
+gate_in() { # <dir> <out prefix> <args...> : runs the checkout's gate in <dir>
+  local dir="$1" out="$2"
+  shift 2
+  ( cd "${dir}" && SAFE_AUDIT_PATH="${WORK}/safe/bin/safe-audit" "${WORK}/safe/bin/safe" gate npm "$@" >"${out}.out" 2>"${out}.err" )
+}
+
+# E. ci in a fresh clone of a project whose committed lockfile carries an advisory
+fixture_project "${WORK}/e-origin" '{"debug":"4.1.1","ms":"2.1.3"}' "${DEBUG_411},${MS_211},${MS_213}"
+git clone -q "${WORK}/e-origin" "${WORK}/e1" && git clone -q "${WORK}/e-origin" "${WORK}/e2" && git clone -q "${WORK}/e-origin" "${WORK}/e3"
+lock_e="$(sha256sum < "${WORK}/e1/package-lock.json")"
+LIVE_ADVISORY_NAME=ms gate_in "${WORK}/e1" "${WORK}/e1" ci --ignore-scripts
+status=$?
+sed 's/^/# E gate: /' "${WORK}/e1.err" | tail -n 8
+if (( status == 0 )) && grep -q 'npm ci: 3 entries of the lockfile checked for malice' "${WORK}/e1.err" && grep -q 'baseline: committed' "${WORK}/e1.err" \
+    && grep -q '1 advisories already present (critical 1)' "${WORK}/e1.err" && [[ -d "${WORK}/e1/node_modules/debug/node_modules/ms" ]] \
+    && [[ "$(sha256sum < "${WORK}/e1/package-lock.json")" == "${lock_e}" ]]; then
+  pass "E1 (ci, fresh clone): installs without stopping on the advisory its committed lockfile carries, reports it, leaves the lockfile as committed"
+else
+  fail "E1 (ci, fresh clone): exit ${status}; $(tail -n 3 "${WORK}/e1.err")"
+fi
+if "${WORK}/safe/bin/safe-core" project-tree "${selection[@]}" "${WORK}/e1/package-lock.json" "${WORK}/e1" 2>/dev/null | jq -e '.ok == true and .checked >= 3' >/dev/null 2>&1; then
+  pass "E2: the tree the real npm built is the lockfile (strict verifier)"
+else
+  fail "E2: the tree is not the lockfile"
+fi
+LIVE_MALWARE_NAME=debug gate_in "${WORK}/e2" "${WORK}/e2" ci --ignore-scripts
+status=$?
+if (( status == 104 )) && grep -q 'known-malware record on debug@4.1.1' "${WORK}/e2.err" && [[ ! -e "${WORK}/e2/node_modules" ]]; then
+  pass "E3 (ci): a malware record anywhere in the graph refuses 104 and nothing is installed"
+else
+  fail "E3 (ci): exit ${status}; $(tail -n 2 "${WORK}/e2.err")"
+fi
+# the manifest moves, the lockfile does not: npm's own error, recognisable as npm's
+jq '.dependencies.ms = "2.1.2"' "${WORK}/e3/package.json" > "${WORK}/e3/package.json.new" && mv "${WORK}/e3/package.json.new" "${WORK}/e3/package.json"
+gate_in "${WORK}/e3" "${WORK}/e3" ci --ignore-scripts
+status=$?
+if (( status == 1 )) && grep -q 'npm: code EUSAGE' "${WORK}/e3.err" && grep -q 'in sync' "${WORK}/e3.err" && ! grep -q 'install-strategy' "${WORK}/e3.err" && grep -q "npm's own frozen check failed" "${WORK}/e3.err" && [[ ! -e "${WORK}/e3/node_modules" ]]; then
+  pass "E4 (ci): a manifest out of step with its lockfile is npm's own error, with npm's diagnostic and status, and nothing is installed"
+else
+  fail "E4 (ci): exit ${status}; $(tail -n 3 "${WORK}/e3.err")"
+fi
+
+# F. dedupe: the real npm writes a changed plan on a fixture that needs deduplication
+fixture_project "${WORK}/f" '{"debug":"4.1.1","ms":"2.1.3"}' "${DEBUG_411},${MS_211},${MS_213}"
+mkdir -p "${WORK}/f-plan" && cp "${WORK}/f/package.json" "${WORK}/f/package-lock.json" "${WORK}/f-plan/"
+( cd "${WORK}/f-plan" && real_npm dedupe --package-lock-only --ignore-scripts --no-audit --no-fund >"${WORK}/f-plan.log" 2>&1 )
+if jq -e '(.packages | has("node_modules/debug/node_modules/ms")) | not' "${WORK}/f-plan/package-lock.json" >/dev/null 2>&1 \
+    && jq -e 'has("node_modules/debug/node_modules/ms")' <<<"$(jq '.packages' "${WORK}/f/package-lock.json")" >/dev/null 2>&1 \
+    && ! cmp -s "${WORK}/f/package-lock.json" "${WORK}/f-plan/package-lock.json"; then
+  pass "F1: the real npm writes a CHANGED plan for dedupe on a fixture that needs it (the nested ms 2.1.1 is dropped from the lockfile)"
+else
+  fail "F1: the real npm's dedupe plan: $(tail -n 3 "${WORK}/f-plan.log")"
+fi
+gate_in "${WORK}/f" "${WORK}/f" dedupe --ignore-scripts
+status=$?
+sed 's/^/# F gate: /' "${WORK}/f.err" | tail -n 6
+if (( status == 0 )) && cmp -s "${WORK}/f/package-lock.json" "${WORK}/f-plan/package-lock.json" && [[ -d "${WORK}/f/node_modules/debug" && ! -e "${WORK}/f/node_modules/debug/node_modules" ]] \
+    && grep -q '0 packages added, 1 changed, 0 removed' "${WORK}/f.err"; then
+  pass "F2 (dedupe): the lane publishes the plan the real npm made (byte for byte) and builds the tree from it by one frozen installation"
+else
+  fail "F2 (dedupe): exit ${status}; $(tail -n 3 "${WORK}/f.err")"
+fi
+
+# G. prune: (1) a lockfile that holds an entry nothing needs; (2) a tree that holds a package the lockfile lacks
+fixture_project "${WORK}/g1" '{"ms":"2.1.3"}' "${ISNUMBER_700},${MS_213}"
+mkdir -p "${WORK}/g1-plan" && cp "${WORK}/g1/package.json" "${WORK}/g1/package-lock.json" "${WORK}/g1-plan/"
+( cd "${WORK}/g1-plan" && real_npm prune --package-lock-only --ignore-scripts --no-audit --no-fund >"${WORK}/g1-plan.log" 2>&1 )
+if jq -e '(.packages | has("node_modules/is-number")) | not' "${WORK}/g1-plan/package-lock.json" >/dev/null 2>&1; then
+  pass "G1: the real npm's prune drops from the lockfile an entry nothing needs"
+else
+  fail "G1: the real npm's prune plan: $(tail -n 3 "${WORK}/g1-plan.log")"
+fi
+gate_in "${WORK}/g1" "${WORK}/g1" prune --ignore-scripts
+status=$?
+sed 's/^/# G gate: /' "${WORK}/g1.err" | tail -n 5
+if (( status == 0 )) && cmp -s "${WORK}/g1/package-lock.json" "${WORK}/g1-plan/package-lock.json" && [[ -d "${WORK}/g1/node_modules/ms" && ! -e "${WORK}/g1/node_modules/is-number" ]] \
+    && grep -q '0 packages added, 0 changed, 1 removed' "${WORK}/g1.err"; then
+  pass "G2 (prune, lockfile changed): the lane publishes npm's plan, nothing is introduced, the tree is the frozen installation of it"
+else
+  fail "G2 (prune): exit ${status}; $(tail -n 3 "${WORK}/g1.err")"
+fi
+fixture_project "${WORK}/g2" '{"ms":"2.1.3"}' "${MS_213}"
+gate_in "${WORK}/g2" "${WORK}/g2-first" ci --ignore-scripts || fail "G3 set-up: ci"
+mkdir -p "${WORK}/g2/node_modules/stray" && printf '{"name":"stray","version":"9.9.9"}\n' > "${WORK}/g2/node_modules/stray/package.json"
+lock_g2="$(jq -S -c '.packages' "${WORK}/g2/package-lock.json")"
+gate_in "${WORK}/g2" "${WORK}/g2" prune --ignore-scripts
+status=$?
+if (( status == 0 )) && [[ "$(jq -S -c '.packages' "${WORK}/g2/package-lock.json")" == "${lock_g2}" ]] && [[ ! -e "${WORK}/g2/node_modules/stray" && -d "${WORK}/g2/node_modules/ms" ]] \
+    && grep -q '0 packages added, 0 changed, 0 removed' "${WORK}/g2.err"; then
+  pass "G3 (prune, tree only): the lockfile's packages are unchanged (npm rewrites the file's formatting), nothing is introduced, and the frozen installation of the same lockfile yields the pruned tree"
+else
+  fail "G3 (prune, tree only): exit ${status}; lock $([[ "$(jq -S -c '.packages' "${WORK}/g2/package-lock.json")" == "${lock_g2}" ]] && echo same || echo changed); stray $([[ -e "${WORK}/g2/node_modules/stray" ]] && echo present || echo gone); $(grep -c '0 packages added, 0 changed, 0 removed' "${WORK}/g2.err") report lines; $(head -n 6 "${WORK}/g2.err" | tr '\n' '|')"
+fi
+
+# H. dedupe and prune on the REAL npm, against npm's own plan. Nothing stands in for npm's dedupe: when its
+# lockfile-only run writes a lockfile that differs, that is the plan; when it writes none, the plan is the lockfile on
+# disk, provided npm's own frozen check accepts it; no lockfile refuses. npm's own plan is computed independently of the
+# lane, by `npm dedupe --dry-run --json` in an untouched copy (no tree), and the lane's published lockfile is compared with it.
+npm_alone() { # <dir> <verb>: the real npm's lockfile-only run of the verb on a copy; prints entries or ABSENT or UNCHANGED
+  local src="$1" verb="$2" tmp="${WORK}/alone-$(basename "$1")-$2"
+  rm -rf "${tmp}"; mkdir -p "${tmp}"
+  cp "${src}/package.json" "${tmp}/"; [[ ! -f "${src}/package-lock.json" ]] || cp "${src}/package-lock.json" "${tmp}/"
+  ( cd "${tmp}" && real_npm "${verb}" --package-lock-only --ignore-scripts --no-audit --no-fund >/dev/null 2>&1 )
+  if [[ ! -f "${tmp}/package-lock.json" ]]; then printf 'ABSENT'
+  elif [[ -f "${src}/package-lock.json" ]] && cmp -s "${src}/package-lock.json" "${tmp}/package-lock.json"; then printf 'UNCHANGED'
+  else printf 'entries=%s' "$(jq '[.packages | keys[] | select(test("node_modules/"))] | length' "${tmp}/package-lock.json")"; fi
+}
+native_plan() { # <dir>: what npm's own dedupe would install, sorted name@version lines (an untouched copy, no tree)
+  local src="$1" tmp="${WORK}/native-$(basename "$1")"
+  rm -rf "${tmp}"; mkdir -p "${tmp}"
+  cp "${src}/package.json" "${src}/package-lock.json" "${tmp}/"
+  ( cd "${tmp}" && real_npm dedupe --dry-run --json --long --ignore-scripts --no-audit --no-fund 2>/dev/null ) | jq -r '[.add[] | "\(.name)@\(.version)"] | sort | .[]' 2>/dev/null
+}
+published_plan() { # <dir>: the lockfile's entries, sorted name@version lines
+  jq -r '[.packages | to_entries[] | select(.key | test("node_modules/")) | "\(.key | sub("^.*node_modules/"; ""))@\(.value.version)"] | sort | .[]' "$1/package-lock.json"
+}
+DEBUG_NESTED_MS="${DEBUG_411},${MS_211},${MS_213}"
+fixture_project "${WORK}/h-dups" '{"debug":"4.1.1","ms":"2.1.3"}' "${DEBUG_411},${MS_211},${MS_213}"
+fixture_project "${WORK}/h-overlap" '{"debug":"4.1.1","ms":"^2.1.0"}' "${DEBUG_411},${MS_211},${MS_213}"
+fixture_project "${WORK}/h-nothing" '{"ms":"2.1.3"}' "${MS_213}"
+fixture_project "${WORK}/h-surplus" '{"ms":"2.1.3"}' "${ISNUMBER_700},${MS_213}"
+mkdir -p "${WORK}/h-nolock" && ( cd "${WORK}/h-nolock" && printf '{"name":"live-lane","version":"1.0.0","dependencies":{"ms":"2.1.3"}}\n' > package.json \
+  && git init -q -b main && git add package.json && git -c user.name=lane -c user.email=lane@example.invalid commit -q -m base )
+alone_dups="$(npm_alone "${WORK}/h-dups" dedupe)"; alone_overlap="$(npm_alone "${WORK}/h-overlap" dedupe)"; alone_surplus="$(npm_alone "${WORK}/h-surplus" dedupe)"
+alone_nothing="$(npm_alone "${WORK}/h-nothing" dedupe)"; alone_nolock="$(npm_alone "${WORK}/h-nolock" dedupe)"
+printf '# H: the real npm dedupe alone, lockfile-only: duplicates=%s overlap=%s surplus=%s nothing=%s no-lockfile=%s\n' "${alone_dups}" "${alone_overlap}" "${alone_surplus}" "${alone_nothing}" "${alone_nolock}"
+if [[ "${alone_dups}" == entries=2 && "${alone_surplus}" == UNCHANGED && "${alone_nothing}" == UNCHANGED && "${alone_nolock}" == ABSENT ]]; then
+  pass "H1: the real npm's dedupe writes its plan only when a name is duplicated (surplus entry kept, nothing to do, no lockfile: nothing written)"
+else
+  fail "H1: the real npm's dedupe alone: duplicates=${alone_dups} surplus=${alone_surplus} nothing=${alone_nothing} no-lockfile=${alone_nolock}"
+fi
+native_dups="$(native_plan "${WORK}/h-dups")"; native_overlap="$(native_plan "${WORK}/h-overlap")"; native_nothing="$(native_plan "${WORK}/h-nothing")"
+for fx in dups overlap nothing; do
+  gate_in "${WORK}/h-${fx}" "${WORK}/h-${fx}" dedupe --ignore-scripts
+  status=$?
+  sed "s/^/# H ${fx} gate: /" "${WORK}/h-${fx}.err" | tail -n 3
+  native_var="native_${fx}"; ok=$(( status == 0 ))
+  [[ "$(published_plan "${WORK}/h-${fx}")" == "${!native_var}" && -n "${!native_var}" ]] || ok=0
+  "${WORK}/safe/bin/safe-core" project-tree "${selection[@]}" "${WORK}/h-${fx}/package-lock.json" "${WORK}/h-${fx}" 2>/dev/null | jq -e '.ok == true' >/dev/null 2>&1 || ok=0
+  if (( ok )); then pass "H2 (${fx}): the lane's published lockfile is npm's own dedupe plan ($(tr '\n' ' ' <<<"${!native_var}")), and the tree is its frozen installation"
+  else fail "H2 (${fx}): exit ${status}; native: $(tr '\n' ' ' <<<"${!native_var}") lane: $(published_plan "${WORK}/h-${fx}" | tr '\n' ' '); $(tail -n 2 "${WORK}/h-${fx}.err")"; fi
+done
+# the surplus entry: npm's dedupe leaves the lockfile alone and its frozen check accepts it, `npm ci` builds only what the
+# manifest reaches, and the binder's verification refuses BEFORE anything is published, naming the cause and a way out
+surplus_before="$(sha256sum < "${WORK}/h-surplus/package-lock.json")"
+mkdir -p "${WORK}/h-surplus-ci" && cp "${WORK}/h-surplus/package.json" "${WORK}/h-surplus/package-lock.json" "${WORK}/h-surplus-ci/"
+( cd "${WORK}/h-surplus-ci" && real_npm ci --ignore-scripts --no-audit --no-fund >/dev/null 2>&1 )
+gate_in "${WORK}/h-surplus" "${WORK}/h-surplus" dedupe --ignore-scripts
+status=$?
+sed "s/^/# H surplus gate: /" "${WORK}/h-surplus.err" | tail -n 2
+if [[ -d "${WORK}/h-surplus-ci/node_modules/ms" && ! -e "${WORK}/h-surplus-ci/node_modules/is-number" ]] && (( status == 100 )) \
+    && grep -q 'node_modules/is-number: missing' "${WORK}/h-surplus.err" && grep -q 'run npm install first to refresh it' "${WORK}/h-surplus.err" \
+    && grep -q 'nothing was published' "${WORK}/h-surplus.err" && [[ "$(sha256sum < "${WORK}/h-surplus/package-lock.json")" == "${surplus_before}" && ! -e "${WORK}/h-surplus/node_modules" ]]; then
+  pass "H3 (surplus entry): the real npm ci builds only ms; the binder refuses before publishing, naming the missing entry and the way out; the project is as it was"
+else
+  fail "H3 (surplus entry): exit ${status}; $(tail -n 2 "${WORK}/h-surplus.err")"
+fi
+# no lockfile: dedupe and prune refuse 100 (npm would work from the installed tree, which the lane does not read)
+for verb in dedupe prune; do
+  rm -rf "${WORK}/h-nolock-${verb}"; mkdir -p "${WORK}/h-nolock-${verb}"; cp -r "${WORK}/h-nolock/." "${WORK}/h-nolock-${verb}/"
+  gate_in "${WORK}/h-nolock-${verb}" "${WORK}/h-nolock-${verb}" "${verb}" --ignore-scripts
+  status=$?
+  if (( status == 100 )) && grep -q "npm ${verb} on a project with no lockfile" "${WORK}/h-nolock-${verb}.err" && grep -q 'run npm install first' "${WORK}/h-nolock-${verb}.err" \
+      && [[ ! -e "${WORK}/h-nolock-${verb}/package-lock.json" && ! -e "${WORK}/h-nolock-${verb}/node_modules" ]]; then
+    pass "H4 (${verb}, no lockfile): refused 100 with the way out; nothing was resolved or written"
+  else
+    fail "H4 (${verb}, no lockfile): exit ${status}; $(tail -n 2 "${WORK}/h-nolock-${verb}.err")"
+  fi
+done
+# why: a lockless project with a RESIDENT tree. Native prune/dedupe keep the resident ms; a lockfile-only run in a copy without the tree resolves the latest
+mkdir -p "${WORK}/h-resident/node_modules/ms" && printf '{"name":"live-lane","version":"1.0.0","dependencies":{"ms":"^2.0.0"}}\n' > "${WORK}/h-resident/package.json" \
+  && printf '{"name":"ms","version":"2.0.0"}\n' > "${WORK}/h-resident/node_modules/ms/package.json"
+( cd "${WORK}/h-resident" && git init -q -b main && git add package.json && git -c user.name=lane -c user.email=lane@example.invalid commit -q -m base )
+native_resident="$( cd "${WORK}/h-resident" && real_npm prune --dry-run --json --ignore-scripts --no-audit --no-fund 2>/dev/null | jq -c '[.add, .change, .remove] | map(length)' )"
+alone_resident="$(npm_alone "${WORK}/h-resident" prune)"
+gate_in "${WORK}/h-resident" "${WORK}/h-resident" prune --ignore-scripts
+status=$?
+if [[ "${native_resident}" == '[0,0,0]' && "${alone_resident}" == entries=1 ]] && (( status == 100 )) && [[ "$(jq -r .version "${WORK}/h-resident/node_modules/ms/package.json")" == 2.0.0 ]]; then
+  pass "H5: on a lockless project with a resident ms@2.0.0, the real npm's prune changes nothing while a lockfile-only run would resolve a newer ms: the lane refuses, the resident tree is untouched"
+else
+  fail "H5: native=${native_resident} lockfile-only=${alone_resident} exit ${status}"
+fi
+# out of step: npm saves nothing, its own frozen check refuses, and that is what the operator sees
+fixture_project "${WORK}/h-step" '{"ms":"2.1.3"}' "${MS_213}"
+jq '.dependencies.ms = "2.1.2"' "${WORK}/h-step/package.json" > "${WORK}/h-step/p.new" && mv "${WORK}/h-step/p.new" "${WORK}/h-step/package.json"
+gate_in "${WORK}/h-step" "${WORK}/h-step" dedupe --ignore-scripts
+status=$?
+if (( status == 1 )) && grep -q 'npm: code EUSAGE' "${WORK}/h-step.err" && grep -q 'run npm install first' "${WORK}/h-step.err" && [[ ! -e "${WORK}/h-step/node_modules" ]]; then
+  pass "H6 (dedupe, lockfile out of step): npm's own frozen check refuses with npm's diagnostic and status; the way out is npm install first"
+else
+  fail "H6: exit ${status}; $(tail -n 3 "${WORK}/h-step.err")"
+fi
+# prune keeps its plan (its lockfile-only run writes in every case where a lockfile exists)
+fixture_project "${WORK}/h-prune-surplus" '{"ms":"2.1.3"}' "${ISNUMBER_700},${MS_213}"
+p1="$(npm_alone "${WORK}/h-prune-surplus" prune)"
+gate_in "${WORK}/h-prune-surplus" "${WORK}/h-prune-surplus" prune --ignore-scripts
+status=$?
+if [[ "${p1}" == entries=1 ]] && (( status == 0 )) && [[ ! -e "${WORK}/h-prune-surplus/node_modules/is-number" && -d "${WORK}/h-prune-surplus/node_modules/ms" ]]; then
+  pass "H7 (prune, surplus entry): the real npm's prune writes the lockfile without it; the lane judges that plan and builds the tree"
+else
+  fail "H7: prune alone=${p1} exit ${status}; $(tail -n 2 "${WORK}/h-prune-surplus.err")"
+fi
+# npm does not resolve `clean` (the gate's conservative classifier takes it for ci): the lane does nothing with the
+# project, and what happens is what the switch off does
+fixture_project "${WORK}/h-clean" '{"ms":"2.1.3"}' "${MS_213}"
+gate_in "${WORK}/h-clean" "${WORK}/h-clean-first" ci --ignore-scripts || fail "H8 set-up: ci"
+mkdir -p "${WORK}/h-clean/node_modules/marker"; printf '{"name":"marker","version":"1.0.0"}\n' > "${WORK}/h-clean/node_modules/marker/package.json"
+lock_h="$(sha256sum < "${WORK}/h-clean/package-lock.json")"
+gate_in "${WORK}/h-clean" "${WORK}/h-clean" clean
+status=$?
+printf '{"install":{"project_lane":false}}\n' > "${HOME}/.config/safe/run/config.json"
+gate_in "${WORK}/h-clean" "${WORK}/h-clean-off" clean
+status_off=$?
+printf '{"install":{"project_lane":true}}\n' > "${HOME}/.config/safe/run/config.json"
+if (( status != 0 )) && (( status == status_off )) && cmp -s "${WORK}/h-clean.err" "${WORK}/h-clean-off.err" \
+    && [[ -f "${WORK}/h-clean/node_modules/marker/package.json" && -d "${WORK}/h-clean/node_modules/ms" ]] \
+    && [[ "$(sha256sum < "${WORK}/h-clean/package-lock.json")" == "${lock_h}" ]] && ! grep -q 'project lane' "${WORK}/h-clean.err"; then
+  pass "H8 (npm clean): not the lane's, and not npm's to run (exit ${status}, as with the switch off); the tree and the lockfile are as they were"
+else
+  fail "H8 (npm clean): exit ${status} (switch off: ${status_off}); $(tail -n 3 "${WORK}/h-clean.err")"
+fi
+# an option before the verb refuses before npm is asked (npm takes `prefix` for the command in `npm --json=prefix de`)
+gate_in "${WORK}/h-clean" "${WORK}/h-opt" --json=prefix de
+status=$?
+if (( status == 100 )) && grep -q 'an option before the verb' "${WORK}/h-opt.err" && ! grep -q "${WORK}/h-clean" "${WORK}/h-opt.out" 2>/dev/null; then
+  pass "H9 (option before the verb): refused in the lane's form; npm did not run the command it would have taken (prefix)"
+else
+  fail "H9: exit ${status}; $(tail -n 2 "${WORK}/h-opt.err")"
+fi
+
+# I. npm's own errors, on the real npm, whatever the caller's presentation settings
+FSEVENTS_233='"node_modules/fsevents":{"version":"2.3.3","resolved":"https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz","integrity":"sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==","os":["darwin"]}'
+fixture_project "${WORK}/i-platform" '{"fsevents":"2.3.3"}' "${FSEVENTS_233}"
+gate_in "${WORK}/i-platform" "${WORK}/i-platform" ci --ignore-scripts
+status=$?
+sed 's/^/# I platform gate: /' "${WORK}/i-platform.err" | tail -n 3
+if (( status == 1 )) && grep -q 'npm: code EBADPLATFORM' "${WORK}/i-platform.err" && grep -q 'Unsupported platform for fsevents@2.3.3' "${WORK}/i-platform.err" \
+    && grep -q "npm's own frozen check failed with npm exit 1 (code EBADPLATFORM)" "${WORK}/i-platform.err" && [[ ! -e "${WORK}/i-platform/node_modules" ]]; then
+  pass "I1 (ci): a platform error on a synchronised project is shown as npm's EBADPLATFORM, with npm's status, and the final line names no other cause"
+else
+  fail "I1 (ci): exit ${status}; $(tail -n 3 "${WORK}/i-platform.err")"
+fi
+mkdir -p "${WORK}/i-nolock" && ( cd "${WORK}/i-nolock" && printf '{"name":"live-lane","version":"1.0.0","dependencies":{"ms":"2.1.3"}}\n' > package.json \
+  && git init -q -b main && git add package.json && git -c user.name=lane -c user.email=lane@example.invalid commit -q -m base )
+for setting in npm_config_loglevel=silly npm_config_heading=review-npm npm_config_color=always npm_config_loglevel=silent; do
+  export "${setting?}"
+  gate_in "${WORK}/i-nolock" "${WORK}/i-nolock" ci --ignore-scripts
+  status=$?
+  unset "${setting%%=*}"
+  if (( status == 1 )) && grep -q 'npm: code EUSAGE' "${WORK}/i-nolock.err" && grep -q 'can only install with an existing package-lock.json' "${WORK}/i-nolock.err" \
+      && ! grep -q 'install-strategy' "${WORK}/i-nolock.err" && grep -q "(code EUSAGE); npm's diagnostic is above" "${WORK}/i-nolock.err" && [[ ! -e "${WORK}/i-nolock/node_modules" ]]; then
+    pass "I2 (ci, ${setting}): a missing lockfile still shows npm's code and explanation (usage text left out)"
+  else
+    fail "I2 (ci, ${setting}): exit ${status}; $(tail -n 3 "${WORK}/i-nolock.err")"
+  fi
+done
 
 # --- scenario B: a delegate that answers differently per phase -----------------
 # An installation the lane follows the supported way (a launcher, the Node beside

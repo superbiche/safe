@@ -345,16 +345,18 @@ and the gate audit log gains one `LOCAL_ARTIFACT` line per archive naming
 its resolved path and sha256, so the log proves what was installed.
 
 With `install.project_lane` on ([configuration](configuration.md)), npm
-`install` and `update` (with `--dry-run` and `--package-lock-only`) take
-the project lane instead: judged on what they introduce, installed by
-`safe-core project-bind` from the judged lockfile. A shape the lane cannot judge
-that is established (every file it comes from committed and unchanged: a recognised legacy lockfile,
-a source that is not a registry package, a committed `.npmrc` setting outside the allow-list) and the
-`install-test` families go to the checks below after a `[lane: one-shot, …]` line;
-`npm ci`, `dedupe` and `prune`, a flag or environment setting, a failed guard, an npm without the
-capabilities the lane needs, `mise exec -- npm <lane command>` and the same shapes in uncommitted
-changes refuse with `[lane: project]`; a global command, in the plain form `-g` or `--global` only,
-keeps the checks below ([routing](configuration.md)).
+`install`, `update`, `ci`, `dedupe` and `prune` (with `--dry-run`; with `--package-lock-only` for
+`install`, `update` and `dedupe` only) take the project lane instead: judged on what they introduce, installed by
+`safe-core project-bind` from the judged lockfile. `ci` has no projection: its plan is the lockfile on
+disk, and malice is read over the whole graph. A shape the lane cannot judge that is established (every
+file it comes from committed and unchanged: a recognised legacy lockfile, a source that is not a registry
+package, a committed `.npmrc` setting outside the allow-list) goes to the checks below after a
+`[lane: one-shot, …]` line for `install`, `update` and `ci`, as do the `install-test` families; `dedupe`
+and `prune` have no other gate and refuse. A flag or environment setting, a failed guard, an npm without
+the capabilities the lane needs, `mise exec -- npm <lane command>`, `ci` or `prune` with `--package-lock-only` and the same
+shapes in uncommitted changes refuse with `[lane: project]`; a global command, in the plain form `-g` or
+`--global` only, keeps the checks below ([routing](configuration.md)). With the switch off, `dedupe` and
+`prune` keep the older lock-diff path.
 
 When an operator-authorized private registry exists, project operations also
 check the origin binding of their private identities before delegating

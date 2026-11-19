@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- Project lane: `npm ci`, `npm dedupe` and `npm prune` (still behind `install.project_lane`). `ci` has no
+  projection: its plan is the lockfile on disk, checked against the manifest by npm's own frozen check (`npm
+  ci --dry-run`; a lockfile out of step or missing is npm's own error, shown as npm's, with npm's status),
+  judged against the baseline rules (a lockfile identical to the committed or a recorded one introduces
+  nothing, so a fresh clone installs without stopping on the advisories its committed lockfile carries and
+  the report lists them; any other lockfile is judged against the committed one), with malice read over the
+  whole graph every time (blocklist, known-malware records), every entry bound, and one frozen `npm ci` in
+  staging that replaces an existing tree. Its report says how many entries were checked for malice (it
+  counts the target's distinct identities and says so when some were not read), which baseline was used and
+  how many advisories are already present, by severity. `ci --package-lock-only` refuses as undefined;
+  `--dry-run` decides and writes nothing. `dedupe` and `prune` take their plan from npm's own lockfile-only
+  run in the scratch copy and are judged and bound the same way, in one process for the whole closure
+  instead of one audit per introduced artifact. Nothing stands in for npm's own `dedupe`: a lockfile npm
+  wrote is the plan; when it wrote none (no name is duplicated), the plan is the lockfile on disk, byte for
+  byte, after npm's own frozen check, and a lockfile out of step refuses with npm's diagnostic and status.
+  With no lockfile `dedupe` and `prune` refuse (npm would work from the installed tree, which the lane does
+  not read), and `prune --package-lock-only` refuses. A lockfile entry the frozen install does not build is
+  refused by the binder's verification before publication, with a way out. `ci`, `dedupe` and `prune` name
+  no packages. A verb is the lane's only when the selected npm itself resolves the caller's first argument
+  to it (its own `deref`, asked through one offline Node run): `npm clean`, `install-c` and ambiguous
+  prefixes are left to npm, never run as `ci`; a token npm resolves to another command than safe's table
+  does refuses; an option before the verb refuses before npm is asked (`npm --json=prefix de`: npm takes
+  `prefix`). npm's own error (code and message, wherever they are in its output; no log noise or usage text)
+  is shown, the final line is neutral about the cause and the exit status is npm's; the runs whose output
+  the lane reads carry a fixed heading, no colour and a log level that shows errors (the selected npm must
+  define them), and when no error line can be read the end of npm's output is shown and the final line says
+  so. An established shape the lane cannot judge goes to today's gate for `ci` and refuses for `dedupe` and
+  `prune`, which have no other gate; a global `dedupe`/`prune` is refused at the boundary the global rule
+  uses. The older differential path stays reachable only with the switch off (its deletion is listed in the
+  code for the cutover); the lane never calls it. Live: the lane's `dedupe` result is compared with npm's
+  own `dedupe --dry-run`, `prune` drops the lockfile entries nothing needs, and a fresh clone's `ci`
+  installs. The passing `ci` fixtures are graphs npm would build, checked with npm's offline modules where a
+  node is at hand.
 - Project lane routing (still behind `install.project_lane`). The lane runs in a subshell; its parent
   forwards a cancellation to it and waits for its terminal result, and otherwise acts only on its exit
   status (253 hands the command to today's gate). Nothing is assigned when the library is sourced and the

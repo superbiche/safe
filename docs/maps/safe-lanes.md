@@ -50,7 +50,9 @@ exists today, and what each lane builds on:
   ([#752](https://superbiche.fibery.io/Superbiche/Tasks/752)).
 - One differential lane: `npm dedupe` and `npm prune` are projected to a
   lockfile in a scratch directory, the two lockfiles are diffed by
-  `safe-core lockdiff`, and only the introduced set is audited.
+  `safe-core lockdiff`, and only the introduced set is audited (one audit process per
+  introduced artifact). With `install.project_lane` on, the project lane carries both verbs and this
+  path is not entered; it stays reachable with the switch off until the cutover deletes it.
 - Severity rules: an advisory below high informs and never gates; high is an
   adverse WARN; critical blocks.
 - Consent that travels: an exact artifact accepted once is reused locally, and
