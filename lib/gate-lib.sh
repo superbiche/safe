@@ -2946,8 +2946,11 @@ safe_gate_project_lane_decide() {
 # follows an EUSAGE message left out. Shows them prefixed on stderr and sets SAFE_GATE_LANE_NPM_CODE
 # to npm's error code ("" when npm gave none; only [A-Za-z0-9_-] is kept).
 safe_gate_lane_show_npm_error() {
-  local file="$1" text count=0 code="" body="${SAFE_GATE_LANE_SCRATCH:-/tmp}/npm-error-lines.$$"
+  local file="$1" text count=0 code="" body=""
   SAFE_GATE_LANE_NPM_CODE=""
+  # the lines are sorted in the lane's own scratch directory, never under a shared, guessable name
+  [[ -n "${SAFE_GATE_LANE_SCRATCH:-}" && -d "${SAFE_GATE_LANE_SCRATCH}" ]] || return 0
+  body="${SAFE_GATE_LANE_SCRATCH}/npm-error-lines"
   [[ -s "${file}" ]] || return 0
   LC_ALL=C grep -a -E '^npm (error|ERR!)( |$)' -- "${file}" 2>/dev/null | LC_ALL=C sed -E 's/^npm (error|ERR!) ?//' > "${body}" || true
   code="$(sed -n -E 's/^code ([A-Za-z0-9_-]+).*$/\1/p' "${body}" | head -n 1)"
@@ -3626,8 +3629,8 @@ safe_gate_project_lane_handover_status() {
   printf '253'
 }
 
-# The second reserved status: "the selected npm resolves the caller's token to no command of the lane
-# (to none at all, or to another): leave the command to npm". Nothing of the project was touched.
+# The second reserved status: "the selected npm resolves the caller's token to no command at all:
+# leave the command to npm, which rejects it". Nothing of the project was touched.
 safe_gate_project_lane_unresolved_status() {
   printf '252'
 }
@@ -3945,15 +3948,24 @@ safe_gate_project_lane_run() {
   # to it. The gate's classifier is conservative (an unknown prefix of `ci` is a `ci` to it, so it audits);
   # npm rejects such a token (`clean`, `install-c`, an ambiguous prefix) and runs nothing. The lane does
   # nothing with the project for it and refuses nothing in npm's place: the command goes to today's gate
-  # exactly as with the switch off, which delegates it to npm for npm's own rejection.
+  # exactly as with the switch off, which delegates it to npm for npm's own rejection. That holds only
+  # for a token npm resolves to NO command.
   local resolved_command=""
   if ! resolved_command="$(safe_gate_lane_resolve_command "${subcommand}")"; then
     safe_gate_project_lane_refuse 100 "${verb}" "the selected npm's command resolution cannot be asked (audit-infrastructure breakage, not a package finding)" "rerun install.sh or run safe doctor, then retry"
     return $?
   fi
-  if [[ "${resolved_command}" != "${verb}" ]]; then
+  if [[ -z "${resolved_command}" ]]; then
     SAFE_GATE_LANE_PASS=2
     return 0
+  fi
+  # npm resolves the token to ANOTHER command than safe's table does: the table does not match this npm.
+  # Nothing says npm rejects such a command, so it is neither left to npm nor judged under a verb npm
+  # will not run: it refuses. (No token does this on the npm the table was taken from; the live oracle
+  # compares the two.)
+  if [[ "${resolved_command}" != "${verb}" ]]; then
+    safe_gate_project_lane_refuse 100 "${verb}" "safe reads this command as npm ${verb} and the selected npm resolves it to npm ${resolved_command}: safe's command table does not match this npm (audit-infrastructure breakage, not a package finding)" "type the command's full name, or update safe, then retry"
+    return $?
   fi
   # Under `mise exec` the inner gate runs audit-only and the outer process then runs the ORIGINAL
   # command: a lane decision made there would bind nothing. The lane does not take the command over.
@@ -7054,7 +7066,7 @@ safe_gate_npm_like() {
           local +x lane_rc=0
           safe_gate_project_lane_dispatch "$@" || lane_rc=$?
           if (( lane_rc == $(safe_gate_project_lane_unresolved_status) )); then
-            # npm resolves the token to none of the lane's verbs (`npm clean`): it rejects it and runs
+            # npm resolves the token to no command at all (`npm clean`): it rejects it and runs
             # nothing. For dedupe and prune the command goes straight to npm (never to the older
             # differential path); for the others, to today's gate exactly as with the switch off.
             if [[ "${npm_class}" == "lockdiff" ]]; then

@@ -4,7 +4,8 @@
 
 - Project lane, `ci`/`dedupe`/`prune`, after the critical review. The lane substitutes a canonical verb only
   when the selected npm itself resolves the caller's token to it (its own `deref`, asked through one offline
-  Node run): `npm clean`, `install-c` and ambiguous prefixes are left to npm, never run as `ci`. npm's
+  Node run): `npm clean`, `install-c` and ambiguous prefixes are left to npm, never run as `ci`; a token
+  npm resolves to another command than safe's table does refuses, never passes through. npm's
   `dedupe` saves nothing in lockfile-only mode when no name is duplicated, so the plan it leaves (a surplus
   entry dropped, a lockfile created) is obtained by a second lockfile-only step instead of taking the copied
   lockfile for it (`prune` writes in every case). npm's own error from the frozen check (code and message,

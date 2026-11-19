@@ -248,7 +248,10 @@ pass and warnings under `environment.release_follow`.
   resolves the caller's token to it: a token the gate's conservative classifier takes for one of the
   lane's verbs and npm does not resolve (`clean`, `install-c`, an ambiguous prefix) is left to npm
   (today's gate exactly as with the switch off, which delegates it for npm's own rejection); the lane
-  does nothing with the project and refuses nothing in npm's place. `ci`: no projection; the plan is the lockfile on disk, checked against the manifest by npm's own
+  does nothing with the project and refuses nothing in npm's place. That holds only for a token npm
+  resolves to no command: a token npm resolves to another command than safe's table does refuses (the
+  table does not match that npm, and nothing says npm would reject the command; none does on the npm
+  the table was taken from). `ci`: no projection; the plan is the lockfile on disk, checked against the manifest by npm's own
   frozen check (`npm ci --dry-run` in the scratch copy: whatever npm refuses, a lockfile out of step with
   the manifest, a missing one, a platform error, is npm's own error: npm's code and message, taken from
   wherever they are in its output, are shown without its log noise or usage text, the exit status is

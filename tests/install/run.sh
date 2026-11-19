@@ -99,6 +99,8 @@ case "${1:-}" in
       deref)
         # npm 11.20's own resolution (lib/utils/cmd-list.js): exact name, alias, unique abbreviation.
         [[ "${NODE_DEREF_STATUS:-0}" == "0" ]] || exit "${NODE_DEREF_STATUS}"
+        # an npm whose table differs from the gate's: it resolves every token to this command
+        [[ -z "${NODE_DEREF_COMMAND:-}" ]] || { printf '{"command":"%s"}' "${NODE_DEREF_COMMAND}"; exit 0; }
         npm_commands="access adduser approve-scripts audit bugs cache ci completion config dedupe deny-scripts deprecate diff dist-tag docs doctor edit exec explain explore find-dupes fund get help help-search init install install-ci-test install-scripts install-test link ll login logout ls org outdated owner pack ping pkg prefix profile prune publish query rebuild repo restart root run sbom search set shrinkwrap stage star stars start stop team test token trust undeprecate uninstall unpublish unstar update version view whoami"
         npm_aliases="author=owner home=docs issues=bugs info=view show=view find=search add=install unlink=uninstall remove=uninstall rm=uninstall r=uninstall un=uninstall rb=rebuild list=ls ln=link create=init i=install it=install-test u=update up=update c=config s=search se=search tst=test t=test ddp=dedupe v=view run-script=run clean-install=ci clean-install-test=install-ci-test x=exec why=explain la=ll verison=version ic=ci innit=init in=install ins=install inst=install insta=install instal=install isnt=install isnta=install isntal=install isntall=install install-clean=ci isntall-clean=ci hlep=help dist-tags=dist-tag upgrade=update udpate=update rum=run sit=install-ci-test urn=run ogr=org add-user=adduser"
         token="$(jq -r '.token' <<<"${input}")"
@@ -986,6 +988,7 @@ run_zsh() {
     NODE_AGREEMENT_SECOND_JSON="${NODE_AGREEMENT_SECOND_JSON:-}" \
     NODE_PROBE_STATUS="${NODE_PROBE_STATUS:-}" \
     NODE_DEREF_STATUS="${NODE_DEREF_STATUS:-}" \
+    NODE_DEREF_COMMAND="${NODE_DEREF_COMMAND:-}" \
     NODE_CAPABILITY_STATUS="${NODE_CAPABILITY_STATUS:-}" \
     NPM_CONFIG_LIST_RAW="${NPM_CONFIG_LIST_RAW:-}" \
     NPM_STUB_NO_GIT_OPTIONS="${NPM_STUB_NO_GIT_OPTIONS:-}" \
@@ -12112,6 +12115,24 @@ case_project_lane_routing_a_token_npm_does_not_resolve_is_left_to_npm() {
   assert_status 100 "$FUNCNAME: probe fails" || return
   assert_lane_final_line ci "$FUNCNAME: probe fails" || return
   assert_err_contains_fragment "command resolution cannot be asked" "$FUNCNAME: probe fails" || return
+  # npm resolves the token to ANOTHER command than the gate's table (a table that does not match this npm):
+  # nothing says npm rejects it, so it is neither left to npm nor judged under a verb npm will not run
+  local skewed
+  for skewed in 'ci:install' 'dedupe:install' 'prune:dedupe' 'install:ci'; do
+    lane_prepare "lane-table-skew-${skewed%%:*}" kept@1.0.0
+    lane_consistent_graph kept@1.0.0
+    mkdir -p "${WORK_DIR}/node_modules/marker"
+    printf '{"name":"marker","version":"1.0.0"}\n' > "${WORK_DIR}/node_modules/marker/package.json"
+    before="$(lane_digests)"
+    : > "${LOG_FILE}"
+    NODE_DEREF_COMMAND="${skewed##*:}" lane_run "npm ${skewed%%:*}"
+    assert_status 100 "$FUNCNAME: table skew ${skewed}" || return
+    assert_lane_final_line "${skewed%%:*}" "$FUNCNAME: table skew ${skewed}" || return
+    assert_err_contains_fragment "the selected npm resolves it to npm ${skewed##*:}: safe's command table does not match this npm" "$FUNCNAME: table skew ${skewed}" || return
+    [[ -f "${WORK_DIR}/node_modules/marker/package.json" && "$(lane_digests)" == "${before}" ]] || { fail "$FUNCNAME: table skew ${skewed}: the project was touched"; return; }
+    ! grep -q $'^REAL\tnpm\t' "${LOG_FILE}" || { grep $'^REAL\t' "${LOG_FILE}" >&2; fail "$FUNCNAME: table skew ${skewed}: the command reached npm"; return; }
+    ! grep -q -E $'^(PROJECTION|CICHECK)\t' "${LOG_FILE}" || { fail "$FUNCNAME: table skew ${skewed}: the lane went on"; return; }
+  done
   # on a real node: npm's own resolver, not the stub's table
   if [[ -n "${REAL_NODE_BIN}" ]]; then
     local npm_dir script="${CASE_DIR}/lane-probe.cjs" out

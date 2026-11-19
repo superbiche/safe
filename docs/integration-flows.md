@@ -110,11 +110,12 @@ Flow:
 
 Equivalent gate routing exists for pnpm, pnpx, yarn, bun, uv, pip, pip3, cargo, go, composer, and mise (Volta is retired).
 
-With `install.project_lane` on, `npm install` and `npm update` in a project are
-judged on what they introduce over an established baseline (the committed
+With `install.project_lane` on, `npm install`, `update`, `dedupe` and `prune` in a
+project are judged on what they introduce over an established baseline (the committed
 lockfile, or the one safe stored after its own last command) and installed
-exactly as judged (a staged, verified tree published by `safe-core project-bind`); see
-[configuration](configuration.md).
+exactly as judged (a staged, verified tree published by `safe-core project-bind`).
+`npm ci` introduces nothing: its lockfile is read whole for malice and installed the
+same way; see [configuration](configuration.md).
 
 ## Release Binaries
 
