@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 import (
@@ -50,6 +52,7 @@ type bindProject struct {
 	project  string
 	judged   string
 	env      string
+	state    string
 	baseArgs []string
 }
 
@@ -77,6 +80,10 @@ func newBindProject(t *testing.T) *bindProject {
 	write(filepath.Join(p.judged, "package.json"), bindNewManifest, 0o644)
 	write(filepath.Join(p.judged, "package-lock.json"), bindNewLock, 0o644)
 	p.env = filepath.Join(root, "env")
+	p.state = filepath.Join(root, "state")
+	if err := os.MkdirAll(p.state, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	write(p.env, "PATH=/usr/bin:/bin\x00MARK="+filepath.Join(root, "mark")+"\x00", 0o600)
 	p.baseArgs = []string{
 		"project-bind", "--project", p.project,
@@ -85,9 +92,23 @@ func newBindProject(t *testing.T) *bindProject {
 		"--live", "package.json=" + digest(bindOldManifest),
 		"--live", "package-lock.json=" + digest(bindOldLock),
 		"--live", "npm-shrinkwrap.json=absent",
-		"--env-file", p.env, "--os", "linux", "--cpu", "x64",
+		"--env-file", p.env, "--state-dir", p.state, "--os", "linux", "--cpu", "x64",
 	}
 	return p
+}
+
+// argsWithout is a complete request without one flag and its value.
+func (p *bindProject) argsWithout(flag string) []string {
+	var out []string
+	args := p.args([]string{"--take-lock"}, buildTree)
+	for i := 0; i < len(args); i++ {
+		if args[i] == flag {
+			i++
+			continue
+		}
+		out = append(out, args[i])
+	}
+	return out
 }
 
 func (p *bindProject) args(extra []string, script string) []string {
@@ -108,7 +129,8 @@ type bound struct {
 		ExitCode *int `json:"exit_code"`
 	} `json:"install"`
 	Recovery struct {
-		Found, Removed int
+		Found   int
+		Removed []string
 	} `json:"recovery"`
 }
 
@@ -453,7 +475,7 @@ func TestProjectBindKilledLeavesNoRunningChildAndTheNextRunCleansUp(t *testing.T
 		t.Fatal("expected a staging directory after a SIGKILL")
 	}
 	out, code, stderr := run3(safeCore(p.args([]string{"--take-lock"}, buildTree)...))
-	if code != 0 || out.Outcome != "published" || out.Recovery.Found != 1 || out.Recovery.Removed != 1 {
+	if code != 0 || out.Outcome != "published" || out.Recovery.Found != 1 || len(out.Recovery.Removed) != 1 {
 		t.Fatalf("code = %d, document = %+v\n%s", code, out, stderr)
 	}
 	if _, err := os.Lstat(filepath.Join(p.project, left)); err == nil {

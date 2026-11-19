@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+
+	"github.com/superbiche/safe/internal/strictjson"
 )
 
 // Package identifies one registry package occurrence in an npm lockfile.
@@ -157,6 +159,9 @@ func LoadRecords(path string, registryHosts []string) ([]Record, error) {
 			continue
 		}
 
+		if err := CheckEntry(raw); err != nil {
+			return nil, fmt.Errorf("parse %q: .packages[%q]: %w", path, key, err)
+		}
 		var entry struct {
 			Link          *bool           `json:"link"`
 			Optional      *bool           `json:"optional"`
@@ -437,6 +442,28 @@ func packageLess(a, b Package) bool {
 	return a.Integrity < b.Integrity
 }
 
+// EntryFields are the members of a lockfile entry that decide what is
+// installed, where from and for whom. They are read by exact, case-sensitive
+// name: an entry that carries a second spelling of one of them is refused.
+// Unrelated npm members stay allowed.
+var EntryFields = []string{
+	"name", "version", "resolved", "integrity", "link", "inBundle", "hasShrinkwrap",
+	"dev", "optional", "devOptional", "peer", "os", "cpu", "libc", "bin",
+	"dependencies", "optionalDependencies", "peerDependencies", "devDependencies",
+	"peerDependenciesMeta", "bundleDependencies", "bundledDependencies",
+}
+
+// CheckEntry refuses a lockfile entry that carries a second spelling of one of
+// its EntryFields. (Repeated members are refused for the whole document by
+// the reader.) An entry that is not an object is the caller's error.
+func CheckEntry(raw json.RawMessage) error {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil {
+		return nil
+	}
+	return strictjson.RejectVariants(members, EntryFields...)
+}
+
 // readPackagesMap reads and checks the lockfile document and returns its
 // .packages map, the one reading every loader here shares.
 func readPackagesMap(path string) (map[string]json.RawMessage, error) {
@@ -458,6 +485,16 @@ func readPackagesMap(path string) (map[string]json.RawMessage, error) {
 		return nil, fmt.Errorf("parse %q: lockfile contains multiple JSON documents", path)
 	} else if err != io.EOF {
 		return nil, fmt.Errorf("parse %q: invalid trailing JSON: %w", path, err)
+	}
+
+	// Exact, case-sensitive members (npm reads them so): a repeated member or
+	// a second spelling of one of the document's own fields would let this
+	// reader and npm read two different lockfiles.
+	if err := strictjson.ExactDocument(data); err != nil {
+		return nil, fmt.Errorf("parse %q: %w", path, err)
+	}
+	if err := strictjson.RejectVariants(root, "lockfileVersion", "packages"); err != nil {
+		return nil, fmt.Errorf("parse %q: %w", path, err)
 	}
 
 	versionRaw, ok := root["lockfileVersion"]
@@ -507,6 +544,9 @@ func LoadLocalPackages(path string) ([]LocalPackage, error) {
 		if _, include := packageName(key); !include {
 			continue
 		}
+		if CheckEntry(raw) != nil {
+			continue
+		}
 		var link struct {
 			Link     *bool           `json:"link"`
 			Resolved json.RawMessage `json:"resolved"`
@@ -523,6 +563,9 @@ func LoadLocalPackages(path string) ([]LocalPackage, error) {
 		raw, ok := entries[target]
 		if !ok {
 			continue
+		}
+		if err := CheckEntry(raw); err != nil {
+			return nil, fmt.Errorf("parse %q: .packages[%q]: %w", path, target, err)
 		}
 		var entry struct {
 			Name    string `json:"name"`

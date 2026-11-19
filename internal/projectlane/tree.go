@@ -13,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/superbiche/safe/internal/lockdiff"
 	"github.com/superbiche/safe/internal/strictjson"
 )
 
@@ -56,6 +57,14 @@ const (
 	// TreeHiddenLockfileUnreadable and TreeHiddenLockfileInconsistent: npm's
 	// own record of the tree (node_modules/.package-lock.json) is present and
 	// cannot be read, or does not describe the tree the lockfile does.
+	// TreeBinInvalid: an entry of a .bin directory that is not a link to a
+	// regular file, inside the tree, of a package whose lockfile entry
+	// declares that command under that name.
+	TreeBinInvalid = "bin_invalid"
+	// TreeFlagsInconsistent: the lockfile's optional, dev, devOptional or peer
+	// flag of an entry contradicts its own dependency edges, so the flag cannot
+	// be trusted to deselect the entry.
+	TreeFlagsInconsistent          = "flags_inconsistent"
 	TreeHiddenLockfileUnreadable   = "hidden_lockfile_unreadable"
 	TreeHiddenLockfileInconsistent = "hidden_lockfile_inconsistent"
 )
@@ -140,21 +149,44 @@ type TreeReport struct {
 	Checked       int           `json:"checked"`
 	Absent        int           `json:"absent_deselected"`
 	Problems      []TreeProblem `json:"problems"`
+	// Limits says what a passing verification does not attest.
+	Limits []string `json:"limits"`
+}
+
+// VerifierLimits is the statement carried by every tree report: the verifier
+// attests the SET of packages in the tree and their identities (name and
+// version, npm's own record of origin and hash); it does not attest the bytes
+// of their files. That rests on npm checking each tarball against the hash in
+// the lockfile as it extracts it, which the transaction trusts as it trusts
+// the install command.
+var VerifierLimits = []string{
+	"attests the set of packages and their identities, not the bytes of their files",
+	"payload integrity rests on npm checking each tarball against the integrity hash of the lockfile",
+	"npm's hidden lockfile is read as written by the install command that is trusted to write it",
 }
 
 type lockEntry struct {
-	Name        string          `json:"name"`
-	Version     string          `json:"version"`
-	Resolved    string          `json:"resolved"`
-	Integrity   string          `json:"integrity"`
-	Link        bool            `json:"link"`
-	Dev         bool            `json:"dev"`
-	Optional    bool            `json:"optional"`
-	DevOptional bool            `json:"devOptional"`
-	Peer        bool            `json:"peer"`
-	OS          json.RawMessage `json:"os"`
-	CPU         json.RawMessage `json:"cpu"`
-	Libc        json.RawMessage `json:"libc"`
+	Name        string
+	Version     string
+	Resolved    string
+	Integrity   string
+	Link        bool
+	InBundle    bool
+	Dev         bool
+	Optional    bool
+	DevOptional bool
+	Peer        bool
+	OS          json.RawMessage
+	CPU         json.RawMessage
+	Libc        json.RawMessage
+	Bin         json.RawMessage
+
+	// Dependency edges, by name; the kind of an edge is the map it is in.
+	Dependencies         []string
+	OptionalDependencies []string
+	PeerDependencies     []string
+	DevDependencies      []string
+	PeerOptional         map[string]bool
 
 	path         string
 	expectedName string
@@ -163,52 +195,134 @@ type lockEntry struct {
 // judgedLock is a lockfile read for verification: the entries that stand for
 // a directory of the tree, and the keys that cannot.
 type judgedLock struct {
+	root    lockEntry
 	entries map[string]*lockEntry
 	paths   []string
 	// outside lists the keys that are not a chain of node_modules/<package>
 	// segments. They are never joined to a directory.
 	outside []string
+	// inconsistent lists the entries whose flags contradict their edges.
+	inconsistent []string
 }
 
-// ParseLockfile reads the lockfile a tree is verified against: strictly (one
-// document, no repeated member), version 2 or 3. A lockfile with link entries
-// is ErrLinkEntries.
+// decodeEntry reads one lockfile (or hidden lockfile) entry by exact,
+// case-sensitive member names. A second spelling of a member that matters is an
+// error; members that do not matter are ignored in whatever spelling.
+func decodeEntry(raw json.RawMessage) (lockEntry, error) {
+	var entry lockEntry
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return entry, errors.New("not an object")
+	}
+	if err := lockdiff.CheckEntry(raw); err != nil {
+		return entry, err
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil {
+		return entry, err
+	}
+	text := func(key string, into *string) error {
+		value, ok := members[key]
+		if !ok {
+			return nil
+		}
+		if err := json.Unmarshal(value, into); err != nil {
+			return fmt.Errorf("%s is not a string", key)
+		}
+		return nil
+	}
+	flag := func(key string, into *bool) error {
+		value, ok := members[key]
+		if !ok {
+			return nil
+		}
+		if err := json.Unmarshal(value, into); err != nil {
+			return fmt.Errorf("%s is not a boolean", key)
+		}
+		return nil
+	}
+	names := func(key string, into *[]string) error {
+		value, ok := members[key]
+		if !ok {
+			return nil
+		}
+		var edges map[string]json.RawMessage
+		if err := json.Unmarshal(value, &edges); err != nil || edges == nil {
+			return fmt.Errorf("%s is not an object", key)
+		}
+		for name := range edges {
+			*into = append(*into, name)
+		}
+		sort.Strings(*into)
+		return nil
+	}
+	for _, step := range []func() error{
+		func() error { return text("name", &entry.Name) },
+		func() error { return text("version", &entry.Version) },
+		func() error { return text("resolved", &entry.Resolved) },
+		func() error { return text("integrity", &entry.Integrity) },
+		func() error { return flag("link", &entry.Link) },
+		func() error { return flag("inBundle", &entry.InBundle) },
+		func() error { return flag("dev", &entry.Dev) },
+		func() error { return flag("optional", &entry.Optional) },
+		func() error { return flag("devOptional", &entry.DevOptional) },
+		func() error { return flag("peer", &entry.Peer) },
+		func() error { return names("dependencies", &entry.Dependencies) },
+		func() error { return names("optionalDependencies", &entry.OptionalDependencies) },
+		func() error { return names("peerDependencies", &entry.PeerDependencies) },
+		func() error { return names("devDependencies", &entry.DevDependencies) },
+	} {
+		if err := step(); err != nil {
+			return entry, err
+		}
+	}
+	entry.OS, entry.CPU, entry.Libc, entry.Bin = members["os"], members["cpu"], members["libc"], members["bin"]
+	if meta, ok := members["peerDependenciesMeta"]; ok {
+		var parsed map[string]struct {
+			Optional bool `json:"optional"`
+		}
+		if err := json.Unmarshal(meta, &parsed); err != nil {
+			return entry, errors.New("peerDependenciesMeta is not an object")
+		}
+		entry.PeerOptional = map[string]bool{}
+		for name, value := range parsed {
+			entry.PeerOptional[name] = value.Optional
+		}
+	}
+	return entry, nil
+}
+
+// ParseLockfile reads the lockfile a tree is verified against: exactly one
+// JSON document with exactly named members and no repeated member, version 2
+// or 3. A lockfile with link entries is ErrLinkEntries.
 func parseJudgedLockfile(raw []byte) (*judgedLock, error) {
-	if err := strictjson.RejectRepeatedMembers(raw); err != nil {
+	root, err := strictjson.ParseObject(raw)
+	if err != nil {
 		return nil, fmt.Errorf("lockfile: %w", err)
 	}
-	var document struct {
-		LockfileVersion int                        `json:"lockfileVersion"`
-		Packages        map[string]json.RawMessage `json:"packages"`
-	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	if err := decoder.Decode(&document); err != nil {
+	if err := strictjson.RejectVariants(root, "lockfileVersion", "packages"); err != nil {
 		return nil, fmt.Errorf("lockfile: %w", err)
 	}
-	if decoder.More() {
-		return nil, errors.New("lockfile: more than one JSON document")
+	var version int
+	if err := json.Unmarshal(root["lockfileVersion"], &version); err != nil || (version != 2 && version != 3) {
+		return nil, errors.New("lockfile: lockfileVersion is not 2 or 3")
 	}
-	if document.LockfileVersion != 2 && document.LockfileVersion != 3 {
-		return nil, fmt.Errorf("lockfile: lockfileVersion %d is not 2 or 3", document.LockfileVersion)
-	}
-	if document.Packages == nil {
+	var packages map[string]json.RawMessage
+	if err := json.Unmarshal(root["packages"], &packages); err != nil || packages == nil {
 		return nil, errors.New("lockfile: no packages member")
 	}
 	lock := &judgedLock{entries: map[string]*lockEntry{}}
 	links := false
-	for key, rawEntry := range document.Packages {
-		trimmed := bytes.TrimSpace(rawEntry)
-		if len(trimmed) == 0 || trimmed[0] != '{' {
-			return nil, fmt.Errorf("lockfile: packages[%q] is not an object", key)
-		}
-		var entry lockEntry
-		if err := json.Unmarshal(rawEntry, &entry); err != nil {
+	for key, rawEntry := range packages {
+		entry, err := decodeEntry(rawEntry)
+		if err != nil {
 			return nil, fmt.Errorf("lockfile: packages[%q]: %w", key, err)
 		}
 		if entry.Link {
 			links = true
 		}
 		if key == "" {
+			lock.root = entry
 			continue
 		}
 		if !validTreeKey(key) {
@@ -228,7 +342,127 @@ func parseJudgedLockfile(raw []byte) (*judgedLock, error) {
 	if links {
 		return lock, ErrLinkEntries
 	}
+	lock.inconsistent = lock.checkFlags()
 	return lock, nil
+}
+
+// resolveEdge finds the occurrence a dependency of an occurrence resolves to,
+// as node's resolution does: the nearest node_modules up the tree.
+func (l *judgedLock) resolveEdge(from, name string) (string, bool) {
+	for current := from; ; current = parentEntry(current) {
+		key := "node_modules/" + name
+		if current != "" {
+			key = current + "/node_modules/" + name
+		}
+		if _, ok := l.entries[key]; ok {
+			return key, true
+		}
+		if current == "" {
+			return "", false
+		}
+	}
+}
+
+type edgeKind int
+
+const (
+	edgeProd edgeKind = iota
+	edgeOptional
+	edgePeer
+	edgePeerOptional
+	edgeDev
+)
+
+// edges lists the dependency edges of an occurrence by kind. An optional
+// dependency overrides the same name among the plain ones, as in npm.
+func edgesOf(entry *lockEntry) map[string]edgeKind {
+	edges := map[string]edgeKind{}
+	for _, name := range entry.DevDependencies {
+		edges[name] = edgeDev
+	}
+	for _, name := range entry.PeerDependencies {
+		if entry.PeerOptional[name] {
+			edges[name] = edgePeerOptional
+		} else {
+			edges[name] = edgePeer
+		}
+	}
+	for _, name := range entry.Dependencies {
+		edges[name] = edgeProd
+	}
+	for _, name := range entry.OptionalDependencies {
+		edges[name] = edgeOptional
+	}
+	return edges
+}
+
+// closure returns the occurrences reachable from the root through edges of the
+// allowed kinds only. Dev edges exist only on the root.
+func (l *judgedLock) closure(allowed ...edgeKind) map[string]bool {
+	allow := map[edgeKind]bool{}
+	for _, kind := range allowed {
+		allow[kind] = true
+	}
+	reached := map[string]bool{}
+	queue := []string{""}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		entry := &l.root
+		if current != "" {
+			entry = l.entries[current]
+		}
+		for name, kind := range edgesOf(entry) {
+			if !allow[kind] || (kind == edgeDev && current != "") {
+				continue
+			}
+			if target, ok := l.resolveEdge(current, name); ok && !reached[target] {
+				reached[target] = true
+				queue = append(queue, target)
+			}
+		}
+	}
+	return reached
+}
+
+// checkFlags returns the entries whose flag claims a deselection their own
+// dependency edges contradict: a dev entry reachable without a development
+// edge, an optional one reachable without an optional edge, a devOptional one
+// reachable through required production edges only, a peer one reachable
+// without a peer edge. Flags the edges do not support in the other direction
+// (a missing flag) only make the verifier stricter and are not an error.
+func (l *judgedLock) checkFlags() []string {
+	noDev := l.closure(edgeProd, edgeOptional, edgePeer, edgePeerOptional)
+	noOptional := l.closure(edgeProd, edgeDev, edgePeer)
+	production := l.closure(edgeProd, edgePeer)
+	noPeer := l.closure(edgeProd, edgeOptional, edgeDev)
+	var bad []string
+	for _, key := range l.paths {
+		entry := l.entries[key]
+		if entry.Dev && noDev[key] || entry.Optional && noOptional[key] ||
+			entry.DevOptional && production[key] || entry.Peer && noPeer[key] {
+			bad = append(bad, key)
+		}
+	}
+	return bad
+}
+
+// AdmitLockfile is the check made before anything runs: the lockfile reads
+// strictly, carries no link entries, keeps every key inside the tree and has
+// flags its edges support. It returns a stable reason and a detail, or "".
+func AdmitLockfile(raw []byte) (reason, detail string) {
+	lock, err := parseJudgedLockfile(raw)
+	switch {
+	case errors.Is(err, ErrLinkEntries):
+		return ReasonLinksNotSupported, err.Error()
+	case err != nil:
+		return ReasonLockfileUnreadable, err.Error()
+	case len(lock.outside) > 0:
+		return ReasonLockfilePathsOutside, fmt.Sprintf("the lockfile names %q, which is not inside the tree", lock.outside[0])
+	case len(lock.inconsistent) > 0:
+		return ReasonFlagsInconsistent, fmt.Sprintf("the flags of %q contradict its dependency edges", lock.inconsistent[0])
+	}
+	return "", ""
 }
 
 // validTreeKey accepts exactly a chain node_modules/<package>[/node_modules/
@@ -359,7 +593,10 @@ func VerifyTree(lockfile []byte, treeParent string, selection Selection) (TreeRe
 	if err != nil {
 		return TreeReport{}, err
 	}
-	info, err := os.Lstat(treeParent)
+	// treeParent is a path the caller trusts (a project directory, or a
+	// descriptor path of a directory it holds); everything below it is read
+	// without following a link.
+	info, err := os.Stat(treeParent)
 	if err != nil {
 		return TreeReport{}, err
 	}
@@ -367,7 +604,7 @@ func VerifyTree(lockfile []byte, treeParent string, selection Selection) (TreeRe
 		return TreeReport{}, fmt.Errorf("%q is not a directory", treeParent)
 	}
 	v := &verifier{root: treeParent, lock: lock, sel: selection, seen: map[string]bool{}, present: map[string]bool{}}
-	report := TreeReport{SchemaVersion: TreeSchema, Selection: selection.normalized(), Problems: []TreeProblem{}}
+	report := TreeReport{SchemaVersion: TreeSchema, Selection: selection.normalized(), Problems: []TreeProblem{}, Limits: append([]string{}, VerifierLimits...)}
 	v.report = &report
 	v.run()
 	sort.SliceStable(report.Problems, func(i, j int) bool {
@@ -406,6 +643,11 @@ func (v *verifier) abs(rel string) string {
 func (v *verifier) run() {
 	for _, key := range v.lock.outside {
 		v.problem(TreeProblem{Path: key, Problem: TreePathOutside, Detail: "lockfile key is not a chain of node_modules/<package> segments"})
+	}
+	for _, key := range v.lock.inconsistent {
+		entry := v.lock.entries[key]
+		v.problem(TreeProblem{Path: key, Problem: TreeFlagsInconsistent, Name: entry.expectedName, Version: entry.Version,
+			Detail: "the lockfile's flags contradict its dependency edges; no deselection is trusted"})
 	}
 	rootState := v.rootState()
 	if rootState == stateDirectory {
@@ -493,12 +735,17 @@ func (v *verifier) chain(rel string) pathState {
 	return stateDirectory
 }
 
-// ancestorDeselected reports whether an entry the path lives inside is
-// deselected: what is absent below a deselected, absent package is deselected
-// with it.
+// ancestorDeselected reports whether the occurrence an entry is nested under
+// is itself deselected AND absent from the tree: what is missing below a
+// package that is there is missing, deselected or not, and an ancestor that is
+// absent without being provably deselected is its own problem, never an excuse.
 func (v *verifier) ancestorDeselected(key string) bool {
 	for parent := parentEntry(key); parent != ""; parent = parentEntry(parent) {
-		if entry, ok := v.lock.entries[parent]; ok && entry.deselected(v.sel) {
+		entry, ok := v.lock.entries[parent]
+		if !ok || !entry.deselected(v.sel) {
+			continue
+		}
+		if _, err := os.Lstat(v.abs(parent)); errors.Is(err, os.ErrNotExist) {
 			return true
 		}
 	}
@@ -581,17 +828,23 @@ func (v *verifier) readManifest(dir string) (name, version, problem, detail stri
 	if err != nil {
 		return "", "", TreeManifestUnusable, err.Error()
 	}
-	if err := strictjson.RejectRepeatedMembers(raw); err != nil {
+	// npm's property names are case-sensitive: exact members, no second
+	// spelling of the identity, one document.
+	members, err := strictjson.ParseObject(raw)
+	if err != nil {
 		return "", "", TreeManifestUnusable, err.Error()
 	}
-	var declared struct {
-		Name    string `json:"name"`
-		Version string `json:"version"`
-	}
-	if err := json.Unmarshal(raw, &declared); err != nil {
+	if err := strictjson.RejectVariants(members, "name", "version"); err != nil {
 		return "", "", TreeManifestUnusable, err.Error()
 	}
-	return declared.Name, declared.Version, "", ""
+	for key, into := range map[string]*string{"name": &name, "version": &version} {
+		if value, ok := members[key]; ok {
+			if err := json.Unmarshal(value, into); err != nil {
+				return "", "", TreeManifestUnusable, key + " is not a string"
+			}
+		}
+	}
+	return name, version, "", ""
 }
 
 // readFileNoFollow reads a regular file of at most limit bytes, refusing a
@@ -658,28 +911,109 @@ func (v *verifier) hidden(dir, name string, item os.DirEntry) {
 	v.problem(TreeProblem{Path: rel, Problem: TreeHiddenNotAllowed, Detail: "a hidden entry npm does not write"})
 }
 
-// checkBin accepts npm's .bin directory: links whose target stays inside the
-// tree's top node_modules.
-func (v *verifier) checkBin(rel string) {
-	items, err := os.ReadDir(v.abs(rel))
+// binCommands returns the commands a lockfile entry declares: command name to
+// the cleaned path of its file inside the package.
+func (e *lockEntry) binCommands() map[string]string {
+	commands := map[string]string{}
+	clean := func(file string) (string, bool) {
+		cleaned := path.Clean(file)
+		if path.IsAbs(cleaned) || cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+			return "", false
+		}
+		return cleaned, true
+	}
+	var many map[string]string
+	if json.Unmarshal(e.Bin, &many) == nil {
+		for command, file := range many {
+			if cleaned, ok := clean(file); ok {
+				commands[command] = cleaned
+			}
+		}
+		return commands
+	}
+	var one string
+	if json.Unmarshal(e.Bin, &one) == nil {
+		if cleaned, ok := clean(one); ok {
+			commands[path.Base(e.expectedName)] = cleaned
+		}
+	}
+	return commands
+}
+
+// regularFileBeneath checks that rel is a regular file reached through real
+// directories only: no component of it, the last included, is a link.
+func (v *verifier) regularFileBeneath(rel string) string {
+	parts := strings.Split(rel, "/")
+	for i := 1; i < len(parts); i++ {
+		info, err := os.Lstat(v.abs(strings.Join(parts[:i+1], "/")))
+		switch {
+		case err != nil:
+			return "the target does not exist"
+		case info.Mode()&os.ModeSymlink != 0:
+			return "the target is reached through a link"
+		case i < len(parts)-1 && !info.IsDir():
+			return "the target is below a file"
+		case i == len(parts)-1 && !info.Mode().IsRegular():
+			return "the target is not a regular file"
+		}
+	}
+	return ""
+}
+
+// checkBin accepts npm's .bin directory entry by entry: each must be a link
+// that resolves, inside this node_modules directory, to a regular file of a
+// package whose lockfile entry declares that command at that file. A dangling
+// link, a link to another package's file or to a file the lockfile does not
+// declare, a link through another link, and a file or directory in .bin are
+// all failures.
+func (v *verifier) checkBin(binRel string) {
+	nm := path.Dir(binRel)
+	items, err := os.ReadDir(v.abs(binRel))
 	if err != nil {
-		v.problem(TreeProblem{Path: rel, Problem: TreeUnreadable, Detail: err.Error()})
+		v.problem(TreeProblem{Path: binRel, Problem: TreeUnreadable, Detail: err.Error()})
 		return
 	}
 	for _, item := range items {
-		entryRel := rel + "/" + item.Name()
+		command := item.Name()
+		entryRel := binRel + "/" + command
+		bad := func(problem, detail string) {
+			v.problem(TreeProblem{Path: entryRel, Problem: problem, Detail: detail})
+		}
 		if item.Type()&os.ModeSymlink == 0 {
-			v.problem(TreeProblem{Path: entryRel, Problem: TreeHiddenNotAllowed, Detail: "an entry of .bin that is not a link"})
+			bad(TreeBinInvalid, "an entry of .bin that is not a link")
 			continue
 		}
 		target, err := os.Readlink(v.abs(entryRel))
 		if err != nil {
-			v.problem(TreeProblem{Path: entryRel, Problem: TreeUnreadable, Detail: err.Error()})
+			bad(TreeUnreadable, err.Error())
 			continue
 		}
-		resolved := path.Join(rel, target)
-		if path.IsAbs(target) || resolved != "node_modules" && !strings.HasPrefix(resolved, "node_modules/") {
-			v.problem(TreeProblem{Path: entryRel, Problem: TreePathOutside, Detail: "the link leaves the tree"})
+		resolved := path.Join(binRel, target)
+		if path.IsAbs(target) || !strings.HasPrefix(resolved, "node_modules/") {
+			bad(TreePathOutside, "the link leaves the tree")
+			continue
+		}
+		rest, inside := strings.CutPrefix(resolved, nm+"/")
+		if !inside {
+			bad(TreeBinInvalid, "the link does not point into the package directories beside .bin")
+			continue
+		}
+		segments := strings.Split(rest, "/")
+		pkg, used := segments[0], 1
+		if strings.HasPrefix(pkg, "@") && len(segments) > 1 {
+			pkg, used = pkg+"/"+segments[1], 2
+		}
+		entry, known := v.lock.entries[nm+"/"+pkg]
+		file := strings.Join(segments[used:], "/")
+		switch {
+		case !known:
+			bad(TreeBinInvalid, "the link points into a package the lockfile does not name")
+		case file == "" || entry.binCommands()[command] != file:
+			bad(TreeBinInvalid, "the package's lockfile entry does not declare this command at this file")
+		default:
+			if detail := v.regularFileBeneath(resolved); detail != "" {
+				bad(TreeBinInvalid, detail)
+			}
 		}
 	}
 }
@@ -766,19 +1100,23 @@ func (v *verifier) checkHiddenLockfile() {
 		fail(TreeHiddenLockfileUnreadable, err.Error())
 		return
 	}
-	if err := strictjson.RejectRepeatedMembers(raw); err != nil {
+	members, err := strictjson.ParseObject(raw)
+	if err != nil {
+		fail(TreeHiddenLockfileUnreadable, err.Error())
+		return
+	}
+	if err := strictjson.RejectVariants(members, "lockfileVersion", "packages"); err != nil {
 		fail(TreeHiddenLockfileUnreadable, err.Error())
 		return
 	}
 	var hidden struct {
-		LockfileVersion int                        `json:"lockfileVersion"`
-		Packages        map[string]json.RawMessage `json:"packages"`
+		LockfileVersion int
+		Packages        map[string]json.RawMessage
 	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	if err := decoder.Decode(&hidden); err != nil || decoder.More() {
-		fail(TreeHiddenLockfileUnreadable, "not one JSON document")
-		return
+	if err := json.Unmarshal(members["lockfileVersion"], &hidden.LockfileVersion); err != nil {
+		hidden.LockfileVersion = 0
 	}
+	_ = json.Unmarshal(members["packages"], &hidden.Packages)
 	if hidden.LockfileVersion < 2 || hidden.Packages == nil {
 		fail(TreeHiddenLockfileInconsistent, "no lockfileVersion of 2 or more, or no packages member")
 		return
@@ -791,10 +1129,9 @@ func (v *verifier) checkHiddenLockfile() {
 	sort.Strings(keys)
 	for _, key := range keys {
 		raw := hidden.Packages[key]
-		var record lockEntry
-		trimmed := bytes.TrimSpace(raw)
-		if len(trimmed) == 0 || trimmed[0] != '{' || json.Unmarshal(raw, &record) != nil {
-			fail(TreeHiddenLockfileInconsistent, fmt.Sprintf("record %q is not an object", key))
+		record, err := decodeEntry(raw)
+		if err != nil {
+			fail(TreeHiddenLockfileInconsistent, fmt.Sprintf("record %q: %v", key, err))
 			continue
 		}
 		want, ok := v.lock.entries[key]
@@ -814,17 +1151,27 @@ func (v *verifier) checkHiddenLockfile() {
 			v.problem(TreeProblem{Path: key, Problem: TreeHiddenLockfileInconsistent, Name: want.expectedName, Version: want.Version, Detail: "npm recorded an entry the tree does not hold"})
 			continue
 		}
-		problem := TreeProblem{Path: key, Name: want.expectedName, Version: want.Version, FoundVersion: record.Version}
+		// Every identity field is compared as it is, absent against absent
+		// included: a record may not hold an origin or a hash the lockfile
+		// does not, nor lack one it does, and a bundled member keeps its
+		// bundle flag and its recorded name.
+		problem := TreeProblem{Path: key, Name: want.expectedName, Version: want.Version, FoundName: record.Name, FoundVersion: record.Version}
 		switch {
 		case record.Version != want.Version:
 			problem.Problem = TreeWrongVersion
 			problem.Detail = "npm's record says another version"
-		case want.Resolved != "" && record.Resolved != want.Resolved:
+		case record.Name != want.Name:
+			problem.Problem = TreeWrongName
+			problem.Detail = "npm's record says another package name"
+		case record.Resolved != want.Resolved:
 			problem.Problem = TreeWrongOrigin
 			problem.Detail = "npm's record says another resolved location, or none"
-		case want.Integrity != "" && record.Integrity != want.Integrity:
+		case record.Integrity != want.Integrity:
 			problem.Problem = TreeWrongOrigin
 			problem.Detail = "npm's record says another hash, or none"
+		case record.InBundle != want.InBundle:
+			problem.Problem = TreeWrongOrigin
+			problem.Detail = "npm's record says another bundling"
 		default:
 			continue
 		}

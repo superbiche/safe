@@ -1,9 +1,10 @@
+//go:build linux
+
 package main
 
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,6 +19,11 @@ import (
 // project-bind is the binding transaction of the project lane; project-tree is
 // its tree verifier, usable on its own. See internal/projectlane/transaction.go
 // for the order of the steps and what each failure leaves on disk.
+//
+// The install command given after "--" is TRUSTED as the gate's delegate is:
+// it runs with the installing user's filesystem access and its writes are not
+// confined (no sandbox). What project-bind guarantees concerns the project:
+// what lands in it is what was judged and verified. The document says so.
 //
 // project-bind exits:
 //
@@ -37,8 +43,7 @@ import (
 const (
 	projectBindUsage = "safe-core: usage: safe-core project-bind --project <dir> (--lock-fd <n> | --take-lock)\n" +
 		"    --publish <rel>=<judged-file>... --copy <rel>=<judged-file>... --live <rel>=(sha256:<hex>|absent)...\n" +
-		"    --env-file <file> [--omit dev|optional|peer]... --os <os> --cpu <cpu> [--libc <libc>] -- <absolute-command> [<arg>...]"
-	projectTreeUsage = "safe-core: usage: safe-core project-tree [--omit dev|optional|peer]... --os <os> --cpu <cpu> [--libc <libc>] <lockfile> <dir-holding-node_modules>"
+		"    --env-file <file> --state-dir <dir> [--omit dev|optional|peer]... --os <os> --cpu <cpu> [--libc <libc>] -- <absolute-command> [<arg>...]"
 )
 
 type bindArgs struct {
@@ -47,53 +52,12 @@ type bindArgs struct {
 	copy     []string
 	live     []string
 	envFile  string
+	stateDir string
 	lockFD   int
 	take     bool
 	hasFD    bool
 	argv     []string
 	selected projectlaneSelection
-}
-
-type projectlaneSelection struct {
-	omit         []string
-	os, cpu, lib string
-}
-
-func (s projectlaneSelection) selection() projectlane.Selection {
-	return projectlane.Selection{Omit: s.omit, OS: s.os, CPU: s.cpu, Libc: s.lib}
-}
-
-// parseSelectionFlag consumes one selection flag at args[i], reporting the
-// index of its last argument.
-func parseSelectionFlag(sel *projectlaneSelection, args []string, i int) (int, bool, bool) {
-	switch args[i] {
-	case "--omit", "--os", "--cpu", "--libc":
-		if i+1 >= len(args) || args[i+1] == "" {
-			return i, true, false
-		}
-		value := args[i+1]
-		switch args[i] {
-		case "--omit":
-			sel.omit = append(sel.omit, value)
-		case "--os":
-			if sel.os != "" {
-				return i, true, false
-			}
-			sel.os = value
-		case "--cpu":
-			if sel.cpu != "" {
-				return i, true, false
-			}
-			sel.cpu = value
-		case "--libc":
-			if sel.lib != "" {
-				return i, true, false
-			}
-			sel.lib = value
-		}
-		return i + 1, true, true
-	}
-	return i, false, true
 }
 
 func parseBindArgs(args []string) (bindArgs, bool) {
@@ -113,7 +77,7 @@ func parseBindArgs(args []string) (bindArgs, bool) {
 		switch args[i] {
 		case "--take-lock":
 			parsed.take = true
-		case "--project", "--publish", "--copy", "--live", "--env-file", "--lock-fd":
+		case "--project", "--publish", "--copy", "--live", "--env-file", "--lock-fd", "--state-dir":
 			if i+1 >= len(args) || args[i+1] == "" {
 				return bindArgs{}, false
 			}
@@ -130,6 +94,11 @@ func parseBindArgs(args []string) (bindArgs, bool) {
 				parsed.copy = append(parsed.copy, value)
 			case "--live":
 				parsed.live = append(parsed.live, value)
+			case "--state-dir":
+				if parsed.stateDir != "" {
+					return bindArgs{}, false
+				}
+				parsed.stateDir = value
 			case "--env-file":
 				if parsed.envFile != "" {
 					return bindArgs{}, false
@@ -147,7 +116,7 @@ func parseBindArgs(args []string) (bindArgs, bool) {
 			return bindArgs{}, false
 		}
 	}
-	if parsed.project == "" || parsed.envFile == "" || len(parsed.argv) == 0 ||
+	if parsed.project == "" || parsed.envFile == "" || parsed.stateDir == "" || len(parsed.argv) == 0 ||
 		parsed.hasFD == parsed.take || len(parsed.publish) == 0 || len(parsed.live) == 0 ||
 		parsed.selected.os == "" || parsed.selected.cpu == "" {
 		return bindArgs{}, false
@@ -201,7 +170,7 @@ func projectBind(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	request := projectlane.BindRequest{
-		Project: parsed.project, Argv: parsed.argv, Selection: parsed.selected.selection(),
+		Project: parsed.project, StateDir: parsed.stateDir, Argv: parsed.argv, Selection: parsed.selected.selection(),
 		Live: map[string]string{}, ChildOutput: stderr,
 		Lock: projectlane.LockMode{FD: parsed.lockFD, Take: parsed.take},
 	}
@@ -264,49 +233,4 @@ func projectBind(args []string, stdout, stderr io.Writer) int {
 		return code
 	}
 	return report.Exit
-}
-
-func projectTree(args []string, stdout, stderr io.Writer) int {
-	var sel projectlaneSelection
-	var positional []string
-	for i := 0; i < len(args); i++ {
-		next, handled, ok := parseSelectionFlag(&sel, args, i)
-		if handled {
-			if !ok {
-				fmt.Fprintln(stderr, projectTreeUsage)
-				return 2
-			}
-			i = next
-			continue
-		}
-		if len(args[i]) > 1 && args[i][0] == '-' {
-			fmt.Fprintln(stderr, projectTreeUsage)
-			return 2
-		}
-		positional = append(positional, args[i])
-	}
-	if len(positional) != 2 || sel.os == "" || sel.cpu == "" {
-		fmt.Fprintln(stderr, projectTreeUsage)
-		return 2
-	}
-	raw, err := os.ReadFile(positional[0])
-	if err != nil {
-		fmt.Fprintf(stderr, "safe-core: project-tree: %v\n", err)
-		return 3
-	}
-	report, err := projectlane.VerifyTree(raw, positional[1], sel.selection())
-	if err != nil {
-		fmt.Fprintf(stderr, "safe-core: project-tree: %v\n", err)
-		if errors.Is(err, projectlane.ErrLinkEntries) {
-			return projectlane.ExitRefused
-		}
-		return 3
-	}
-	if code := printJSON(stdout, "project-tree", stderr, report); code != 0 {
-		return code
-	}
-	if !report.Ok {
-		return projectlane.ExitVerificationFailed
-	}
-	return 0
 }
