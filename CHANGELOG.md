@@ -19,9 +19,10 @@
   scanner looked for (refused: `--no-` on an option that takes a value); `npm exec --package -- evil` made npm
   fetch the package `true` (refused). An option name the snapshot does not know is read both ways, so an
   unknown plain `--name=value` before a command the gate audits now refuses (scoped and nerf-darted keys such
-  as `--@scope:registry=…` and `--//host/:_authToken=…` are not affected). Residual, listed in the oracle's
-  known file: a shorthand cluster whose expansion leaves a fixed word (`npm install -Cq evil` also installs a
-  package named `warn`).
+  as `--@scope:registry=…` and `--//host/:_authToken=…` are not affected; the refusal's way out is the
+  environment, `npm_config_<name>=<value>`, and the route's refusal of an unknown space-form flag says so for
+  npm). A shorthand cluster that leaves a word over or gives one option another's flag as its value (`npm
+  install -Cq evil` also installs a package named `warn`) is refused at the front door.
 - Project lane: `npm ci`, `npm dedupe` and `npm prune` (still behind `install.project_lane`). `ci` has no
   projection: its plan is the lockfile on disk, checked against the manifest by npm's own frozen check (`npm
   ci --dry-run`; a lockfile out of step or missing is npm's own error, shown as npm's, with npm's status),

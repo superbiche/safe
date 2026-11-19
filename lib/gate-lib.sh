@@ -728,14 +728,15 @@ safe_gate_nopt_abbrev() {
 # expands to other arguments. $1 the argument (with its dashes). Sets SAFE_GATE_NOPT_SH to the
 # expansion; returns 1 when the argument is not a shorthand (an option, or nothing known).
 safe_gate_nopt_resolve_short() {
-  local a="${1#"${1%%[!-]*}"}" c k s
+  local a="${1#"${1%%[!-]*}"}" c k s g
   local -a chrs=() out=()
-  SAFE_GATE_NOPT_SH=()
+  SAFE_GATE_NOPT_SH=() SAFE_GATE_NOPT_SHG=()
   [[ "${a}" =~ ^[A-Za-z0-9_.?-]*$ ]] || return 1
   # an exact option is not a shorthand
   if [[ -n "${a}" && -n "${SAFE_GATE_NOPT_FLAGS[${a}]+set}" ]]; then return 1; fi
   if [[ -n "${a}" && -n "${SAFE_GATE_NOPT_SHORT[${a}]+set}" ]]; then
     read -r -a SAFE_GATE_NOPT_SH <<<"${SAFE_GATE_NOPT_SHORT[${a}]}"
+    for (( g=0; g<${#SAFE_GATE_NOPT_SH[@]}; g++ )); do SAFE_GATE_NOPT_SHG+=(1); done
     return 0
   fi
   # a cluster of single-letter shorthands (-gf)
@@ -745,9 +746,13 @@ safe_gate_nopt_resolve_short() {
     if [[ -n "${SAFE_GATE_NOPT_SHORT[${c}]+set}" ]]; then chrs+=("${c}"); else all=0; fi
   done
   if (( all )); then
+    # each letter's expansion is a group of its own: what one letter's option takes must come from its own group
+    g=0
     for c in "${chrs[@]}"; do
+      g=$((g + 1))
       read -r -a out <<<"${SAFE_GATE_NOPT_SHORT[${c}]}"
       SAFE_GATE_NOPT_SH+=("${out[@]}")
+      for k in "${out[@]}"; do SAFE_GATE_NOPT_SHG+=("${g}"); done
     done
     # an empty argument expands to nothing (and nopt then drops it)
     return 0
@@ -758,6 +763,7 @@ safe_gate_nopt_resolve_short() {
   s="${SAFE_GATE_NOPT_ABBR}"
   read -r -a SAFE_GATE_NOPT_SH <<<"${SAFE_GATE_NOPT_SHORT[${s}]}"
   (( ${#SAFE_GATE_NOPT_SH[@]} )) || return 1
+  for (( g=0; g<${#SAFE_GATE_NOPT_SH[@]}; g++ )); do SAFE_GATE_NOPT_SHG+=(1); done
   return 0
 }
 
@@ -780,10 +786,10 @@ safe_gate_nopt_parse() {
   printf -v key '%s\x1f' "$@"
   if [[ "${SAFE_GATE_NOPT_KEY+set}" == set && "${SAFE_GATE_NOPT_KEY}" == "${key}" ]]; then return 0; fi
   SAFE_GATE_NOPT_KEY="${key}"
-  local -a na=("$@") ne=()
-  local i n name arg orig v la no flags known isbool val consume gval="" lval="" had_eq la_set
-  for (( i=0; i<$#; i++ )); do ne+=(0); done
-  SAFE_GATE_NOPT_REMAIN=() SAFE_GATE_NOPT_LOOSE=() SAFE_GATE_NOPT_UNKNOWN=() SAFE_GATE_NOPT_NEGATED=() SAFE_GATE_NOPT_GLOBAL=0
+  local -a na=("$@") ne=() ng=() gsrc=()
+  local i n name arg orig v la no flags known isbool val consume gval="" lval="" had_eq la_set gctr=0 gbase
+  for (( i=0; i<$#; i++ )); do ne+=(0); ng+=(0); done
+  SAFE_GATE_NOPT_REMAIN=() SAFE_GATE_NOPT_LOOSE=() SAFE_GATE_NOPT_UNKNOWN=() SAFE_GATE_NOPT_NEGATED=() SAFE_GATE_NOPT_CLUSTER=() SAFE_GATE_NOPT_GLOBAL=0
   i=0
   while (( i < ${#na[@]} )); do
     arg="${na[i]}"
@@ -793,6 +799,8 @@ safe_gate_nopt_parse() {
       break
     fi
     if [[ "${arg}" != -* || ${#arg} -lt 2 ]]; then
+      # a word a shorthand's expansion leaves as an argument (nothing took it): `-Cd` is --prefix --loglevel info
+      if (( ng[i] > 0 )); then SAFE_GATE_NOPT_CLUSTER+=("${gsrc[ng[i]]}"); fi
       SAFE_GATE_NOPT_REMAIN+=("${arg}")
       i=$((i + 1))
       continue
@@ -805,13 +813,21 @@ safe_gate_nopt_parse() {
       arg="${arg%%=*}"
       na=("${na[@]:0:i}" "${arg}" "${v}" "${na[@]:i+1}")
       ne=("${ne[@]:0:i}" 0 1 "${ne[@]:i+1}")
+      ng=("${ng[@]:0:i}" "${ng[i]}" 0 "${ng[@]:i+1}")
     fi
     if safe_gate_nopt_resolve_short "${arg}"; then
       na=("${na[@]:0:i}" ${SAFE_GATE_NOPT_SH[@]+"${SAFE_GATE_NOPT_SH[@]}"} "${na[@]:i+1}")
-      local -a zeros=()
-      for (( n=0; n<${#SAFE_GATE_NOPT_SH[@]}; n++ )); do zeros+=(0); done
+      local -a zeros=() gids=()
+      gbase="${gctr}"
+      for (( n=0; n<${#SAFE_GATE_NOPT_SH[@]}; n++ )); do
+        zeros+=(0)
+        gids+=("$(( gbase + SAFE_GATE_NOPT_SHG[n] ))")
+        (( gbase + SAFE_GATE_NOPT_SHG[n] > gctr )) && gctr=$(( gbase + SAFE_GATE_NOPT_SHG[n] ))
+        gsrc[gbase + SAFE_GATE_NOPT_SHG[n]]="${orig}"
+      done
       ne=("${ne[@]:0:i}" ${zeros[@]+"${zeros[@]}"} "${ne[@]:i+1}")
-      unset zeros
+      ng=("${ng[@]:0:i}" ${gids[@]+"${gids[@]}"} "${ng[@]:i+1}")
+      unset zeros gids
       # nopt re-reads the expansion's first word unless the shorthand expanded to itself
       if (( ${#SAFE_GATE_NOPT_SH[@]} == 0 )) || [[ "${arg}" != "${SAFE_GATE_NOPT_SH[0]}" ]]; then continue; fi
     fi
@@ -854,7 +870,10 @@ safe_gate_nopt_parse() {
           consume=1
         fi
       fi
-      (( consume )) && ne[i+1]=2
+      if (( consume )); then
+        ne[i+1]=2
+        if (( ng[i+1] > 0 && ng[i+1] != ng[i] )); then SAFE_GATE_NOPT_CLUSTER+=("${gsrc[ng[i+1]]}"); fi
+      fi
       [[ "${name}" == global ]] && gval="${val}"
       i=$((i + 1 + consume))
       continue
@@ -869,12 +888,27 @@ safe_gate_nopt_parse() {
     (( ! la_set )) && consume=0
     if (( consume )); then
       ne[i+1]=2
+      # an option a shorthand expanded to taking another shorthand's option as its value (`-Cq`: --prefix --loglevel)
+      if (( ng[i+1] > 0 && ng[i+1] != ng[i] )); then SAFE_GATE_NOPT_CLUSTER+=("${gsrc[ng[i+1]]}"); fi
       [[ "${name}" == location ]] && lval="${la}"
     fi
     i=$((i + 1 + consume))
   done
   if [[ "${gval}" == 1 || "${lval}" == global ]]; then SAFE_GATE_NOPT_GLOBAL=1; fi
   return 0
+}
+
+# Does the snapshot know the option or shorthand $1 names (dashes, a --no- prefix and abbreviations as nopt reads
+# them)? 0 yes. Used to say what a refused unknown flag can be rewritten as.
+safe_gate_nopt_known_flag() {
+  safe_gate_nopt_load
+  local name="${1#"${1%%[!-]*}"}"
+  name="${name%%=*}"
+  while [[ "${name,,}" == no-* ]]; do name="${name:3}"; done
+  safe_gate_nopt_abbrev "${name}" options && return 0
+  safe_gate_nopt_abbrev "${name}" shorthands && return 0
+  safe_gate_nopt_resolve_short "-${name}" && return 0
+  return 1
 }
 
 # The command word npm takes from "$@" (its first positional argument), the way npm reads the vector.
@@ -890,6 +924,8 @@ safe_gate_npm_front_door() {
   for arg in "$@"; do
     [[ "${arg}" =~ ^-{2,}$ ]] && break
     if [[ "${arg}" == -* && ${#arg} -gt 1 && "${arg}" == *=* ]]; then has_eq=1; break; fi
+    # a single-dash cluster (-Cq, -gf): nopt expands each letter, and one letter's option may take the next one's
+    if [[ "${arg}" =~ ^-[^-=][^=]+$ ]]; then has_eq=1; break; fi
   done
   (( has_eq )) || return 0
   safe_gate_nopt_parse "$@"
@@ -901,6 +937,10 @@ safe_gate_npm_front_door() {
     done
     [[ -n "${bad}" ]] || bad="${loose}"
     safe_gate_err "safe: BLOCKED npm — npm reads the value of '$(safe_gate_lane_clean "${bad}")' as a separate argument, not as the option's, which the gate cannot audit as written; to allow: write the option without the value (${bad%%=*}), then retry; details: safe explain"
+    return 100
+  fi
+  if (( ${#SAFE_GATE_NOPT_CLUSTER[@]} )); then
+    safe_gate_err "safe: BLOCKED npm — the shorthand '$(safe_gate_lane_clean "${SAFE_GATE_NOPT_CLUSTER[0]}")' expands to options that npm reads together in a way the gate cannot audit (one option takes another's flag as its value, or a word is left over as an argument, which npm then installs or runs); to allow: write the options separately (for example '-C <dir> -q' instead of '-Cq'), then retry; details: safe explain"
     return 100
   fi
   if (( ${#SAFE_GATE_NOPT_NEGATED[@]} )); then
@@ -927,7 +967,9 @@ safe_gate_npm_front_door() {
     if [[ "${first[0]-}" != "${second[0]-}" ]] \
         || { [[ -n "${first[0]-}" ]] && safe_gate_npm_subcommand_class "${first[0]}" >/dev/null 2>&1; } \
         || { [[ -n "${second[0]-}" ]] && safe_gate_npm_subcommand_class "${second[0]}" >/dev/null 2>&1; }; then
-      safe_gate_err "safe: BLOCKED npm — the option '$(safe_gate_lane_clean "${unk[0]}")' is not one the gate knows, so the value after its '=' may be npm's argument or the option's, and the command differs or is one the gate audits; to allow: write the option without the value, or use an option the gate knows (npm may read the value as the option's or as an argument), then retry; details: safe explain"
+      local uname="${unk[0]%%=*}" uvalue="${unk[0]#*=}"
+      uname="${uname#"${uname%%[!-]*}"}"
+      safe_gate_err "safe: BLOCKED npm — the option '$(safe_gate_lane_clean "${unk[0]%%=*}")' is not one the gate knows, so the value after its '=' may be npm's argument or the option's, and the command differs or is one the gate audits; to allow: pass the setting in the environment instead (npm_config_$(safe_gate_lane_clean "${uname//-/_}")=$(safe_gate_lane_clean "${uvalue}") npm …), which npm reads as the same configuration, or drop the option; details: safe explain"
       return 100
     fi
   fi
@@ -7265,7 +7307,15 @@ safe_gate_route() {
   safe_gate_locate_subcommand "${SAFE_GATE_GVAL}" "${SAFE_GATE_GBOOL}" "$@"
   case $? in
     2)
-      safe_gate_err "safe: BLOCKED ${tool} — cannot find the subcommand past unrecognized flag '${SAFE_GATE_SUBCMD_BADFLAG}'; to allow: rewrite it as '${SAFE_GATE_SUBCMD_BADFLAG}=<value>', then retry; details: safe explain"
+      if [[ "${tool}" == npm ]] && ! safe_gate_nopt_known_flag "${SAFE_GATE_SUBCMD_BADFLAG}"; then
+        # a name npm's option table does not hold: the `=` form is read both ways by the front door and refused
+        # where the command differs, so the way out that works is the environment (npm reads npm_config_* as the same setting)
+        local envname="${SAFE_GATE_SUBCMD_BADFLAG#"${SAFE_GATE_SUBCMD_BADFLAG%%[!-]*}"}"
+        envname="${envname//-/_}"
+        safe_gate_err "safe: BLOCKED ${tool} — cannot find the subcommand past unrecognized flag '${SAFE_GATE_SUBCMD_BADFLAG}', which is not an option npm defines as far as the gate knows; to allow: pass the setting in the environment (npm_config_${envname}=<value> npm …), or drop the flag, then retry; details: safe explain"
+      else
+        safe_gate_err "safe: BLOCKED ${tool} — cannot find the subcommand past unrecognized flag '${SAFE_GATE_SUBCMD_BADFLAG}'; to allow: rewrite it as '${SAFE_GATE_SUBCMD_BADFLAG}=<value>', then retry; details: safe explain"
+      fi
       return 100 ;;
   esac
   return 0

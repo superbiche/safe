@@ -12471,7 +12471,7 @@ assert_front_door_refusal() { # <label> <script>
   assert_status 100 "${label}" || return 1
   [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { printf 'stderr:\n%s\n' "$(cat "${ERR_FILE}")" >&2; fail "${label}: not one stderr line"; return 1; }
   assert_err_contains_fragment 'safe: BLOCKED npm — ' "${label}" || return 1
-  assert_err_contains_fragment 'to allow: write the option without the value' "${label}" || return 1
+  assert_err_contains_fragment 'to allow: write the option' "${label}" || return 1
   assert_err_contains_fragment 'details: safe explain' "${label}" || return 1
   ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "${label}: npm was delegated to"; return 1; }
   return 0
@@ -12486,9 +12486,10 @@ case_npm_front_door_refuses_a_value_npm_leaves_as_an_argument() {
     assert_front_door_refusal "$FUNCNAME: ${script}" "${script}" || return
   done
   # more spellings of the same fact: a negated flag, an abbreviated name, a shorthand cluster, a shorthand,
-  # a Boolean-and-String flag with a value npm takes as its own (control below), a String flag whose value npm re-reads as a flag
+  # a Boolean-and-String flag with a value npm takes as its own (control below), a String flag whose value npm re-reads as a flag,
+  # clusters whose letters leave a word over or hand one option to another (they install a package named warn, info, ...)
   for script in 'npm install --no-json=blockme' 'npm install --no-frobnicate=blockme' 'npm install --jso=blockme' 'npm install -gf=blockme' 'npm install -f=blockme' 'npm install --tag=-g blockme' \
-      'npm exec --no-package=blockme cowsay' 'npm exec cowsay --no-package=blockme' 'npm install --no-registry=https://r.example/ okpkg' 'npm --json=install exec blockme' 'npm --json=install x blockme' 'npm x --json=blockme' 'npm exec --yes=blockme' 'npm exec -y=blockme'; do
+      'npm install -Cq blockme' 'npm install blockme -Cd' 'npm install -Ls blockme' 'npm install -wq blockme' 'npm exec -Cq blockme' 'npm exec --no-package=blockme cowsay' 'npm exec cowsay --no-package=blockme' 'npm install --no-registry=https://r.example/ okpkg' 'npm --json=install exec blockme' 'npm --json=install x blockme' 'npm x --json=blockme' 'npm exec --yes=blockme' 'npm exec -y=blockme'; do
     assert_front_door_refusal "$FUNCNAME: ${script}" "${script}" || return
   done
   pass "$FUNCNAME"
@@ -12503,7 +12504,7 @@ case_npm_front_door_leaves_what_npm_reads_as_written() {
   assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME: space form" || return
   for script in 'npm install --registry=https://registry.npmjs.org/ blockme' 'npm install --json=true blockme' 'npm install --json=false blockme' \
       'npm --loglevel=error install blockme' 'npm install --save-prefix=~ blockme' 'npm install --global=true blockme' 'npm install --tag=latest blockme' \
-      'npm install --omit=dev blockme' 'npm install --browser=firefox blockme' 'npm install --no-json blockme'; do
+      'npm install --omit=dev blockme' 'npm install --browser=firefox blockme' 'npm install --no-json blockme' 'npm install -gD blockme' 'npm install -gf blockme' 'npm install -qg blockme' 'npm install -dd blockme' 'npm install -DE blockme'; do
     : > "${LOG_FILE}"
     SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
     assert_status 104 "$FUNCNAME: ${script}" || return
@@ -12594,6 +12595,154 @@ case_npm_exec_package_then_terminator_fails_closed() {
   pass "$FUNCNAME"
 }
 
+
+# The way out of the unknown-name refusal works, and the advice of the route's refusal is true for npm.
+case_npm_front_door_way_out_is_the_environment_for_an_unknown_name() {
+  prepare_case "npm-front-door-environment"
+  # the refusal names the way out
+  SAFE_INSTALL_TEST_SCRIPT='npm install --my-setting=1.2.3 blockme' run_zsh
+  assert_status 100 "$FUNCNAME: refusal" || return
+  assert_err_contains_fragment 'npm_config_my_setting=1.2.3 npm' "$FUNCNAME: refusal" || return
+  # ... and it works: the environment variable does not make the gate refuse or mis-handle the command
+  npm_config_my_setting=1.2.3 SAFE_INSTALL_TEST_SCRIPT='npm install -g blockme' run_zsh
+  assert_status 104 "$FUNCNAME: audited" || return
+  grep -q $'^AUDIT\tpackage-audit\tblockme\t' "${LOG_FILE}" || { fail "$FUNCNAME: blockme was not audited"; return; }
+  ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: npm was delegated to"; return; }
+  : > "${LOG_FILE}"
+  : > "${HOME_DIR}/.stub-log-env"
+  npm_config_target=1.2.3 SAFE_INSTALL_TEST_SCRIPT='npm install -g okpkg' run_zsh
+  assert_status 0 "$FUNCNAME: a clean package passes" || return
+  grep -q $'^AUDIT\tpackage-audit\tokpkg\t' "${LOG_FILE}" || { fail "$FUNCNAME: okpkg was not audited"; return; }
+  grep $'^ENVNAMES\t' "${LOG_FILE}" | grep -q 'npm_config_target' || { fail "$FUNCNAME: the variable did not reach npm"; return; }
+  # the route's refusal of an unknown space-form flag before the command: the environment for an unknown name ...
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm --my-setting install blockme' run_zsh
+  assert_status 100 "$FUNCNAME: unknown flag" || return
+  assert_err_contains_fragment 'npm_config_my_setting=<value> npm' "$FUNCNAME: unknown flag" || return
+  assert_err_not_contains_fragment "rewrite it as" "$FUNCNAME: unknown flag" || return
+  # ... and the `=` form for a name npm defines, which works
+  SAFE_INSTALL_TEST_SCRIPT='npm --fetch-retries 3 install blockme' run_zsh
+  assert_status 100 "$FUNCNAME: known flag" || return
+  assert_err_contains_fragment "rewrite it as '--fetch-retries=<value>'" "$FUNCNAME: known flag" || return
+  SAFE_INSTALL_TEST_SCRIPT='npm --fetch-retries=3 install blockme' run_zsh
+  assert_status 104 "$FUNCNAME: the known flag's = form" || return
+  # the other tools' text is as it was
+  SAFE_INSTALL_TEST_SCRIPT='pip --my-setting install blockme' run_zsh
+  assert_err_contains_fragment "rewrite it as '--my-setting=<value>'" "$FUNCNAME: pip" || return
+  pass "$FUNCNAME"
+}
+
+
+# Everyday npm command lines read exactly as before the front door: the same status, the same audited packages and the
+# same delegation through the gate of the base branch (SAFE_TEST_BASE_REF, default origin/main) and through this one.
+# The gate's effects are stubbed the way the option oracle stubs them (tests/lib/npm-option-gate-oracle.sh).
+case_npm_everyday_commands_are_unchanged_by_the_front_door() {
+  prepare_case "npm-everyday-unchanged"
+  local base_ref="${SAFE_TEST_BASE_REF:-origin/main}" base_lib="${CASE_DIR}/base-gate-lib.sh"
+  if ! git -C "${ROOT_DIR}" show "${base_ref}:lib/gate-lib.sh" > "${base_lib}" 2>/dev/null || [[ ! -s "${base_lib}" ]]; then
+    printf '# %s: no %s to compare with; skipped\n' "$FUNCNAME" "${base_ref}"
+    pass "$FUNCNAME"
+    return
+  fi
+  local lines="${CASE_DIR}/everyday.lines" runner="${CASE_DIR}/everyday-runner.sh" project="${CASE_DIR}/everyday-project"
+  mkdir -p "${project}"
+  printf '{"name":"everyday","version":"1.0.0"}\n' > "${project}/package.json"
+  cat > "${lines}" <<'LINES'
+install okpkg
+install -D okpkg
+i --save-dev okpkg
+add --save-exact okpkg
+install -g okpkg
+install --legacy-peer-deps okpkg
+install --no-audit --no-fund okpkg
+install --prefer-offline okpkg
+install --omit=dev okpkg
+install --registry=https://registry.npmjs.org/ okpkg
+--loglevel=error install okpkg
+install --loglevel=error okpkg
+install okpkg --loglevel=error
+install --prefix=dir okpkg
+install --cache=dir okpkg
+install --tag=next okpkg
+install --before=2026-01-01 okpkg
+install --install-strategy=nested okpkg
+install --cpu=x64 okpkg
+install --os=linux okpkg
+install --save-exact=true okpkg
+install --include=dev okpkg
+install -S okpkg
+install
+ci
+ci --omit=dev
+update
+update okpkg
+exec --yes cowsay
+x cowsay
+exec --package=cowsay -- cowsay hi
+exec -c "cowsay hi"
+exec --yes --package=cowsay@1.6.0 -- cowsay
+run build --silent
+run test -- --watch=false
+run build --mode=production
+run build --if-present
+view okpkg --json
+view okpkg version
+publish --access=public
+version patch --message="chore: %s"
+--version
+--help
+ls --depth=0
+outdated --json
+audit --audit-level=high
+config set registry=https://registry.npmjs.org/
+uninstall okpkg
+LINES
+  cat > "${runner}" <<'RUNNER'
+#!/usr/bin/env bash
+# $1 the gate library, stdin the command lines
+lib="$1"
+cd "$2" || exit 1
+export HOME="$3"
+# shellcheck source=/dev/null
+source "${lib}" >/dev/null 2>&1 || exit 99
+REC="$3/record"
+safe_gate_exec_real() { printf 'DELEGATE %s\n' "$*" >> "${REC}"; exit 0; }
+safe_gate_check() { printf 'AUDIT %s\n' "$1" >> "${REC}"; return 0; }
+safe_gate_check_many() { shift; local p; for p in "$@"; do printf 'AUDIT %s\n' "${p}" >> "${REC}"; done; return 0; }
+safe_gate_scan_project() { printf 'SCAN\n' >> "${REC}"; return 0; }
+safe_gate_private_npm_project() { return 0; }
+safe_gate_project_lane_enabled() { return 1; }
+safe_gate_npm_scripts_env() { return 0; }
+safe_gate_err() { printf 'ERR %s\n' "$*" >> "${REC}"; }
+while IFS= read -r line; do
+  : > "${REC}"
+  eval "set -- ${line}"
+  ( safe_gate_npm_like npm "$@" ) >/dev/null 2>&1
+  printf '%s => rc=%s | %s\n' "${line}" "$?" "$(tr '\n' ';' < "${REC}")"
+done
+RUNNER
+  local base_out="${CASE_DIR}/everyday-base.out" new_out="${CASE_DIR}/everyday-new.out" count
+  mkdir -p "${CASE_DIR}/everyday-home-a" "${CASE_DIR}/everyday-home-b"
+  bash "${runner}" "${base_lib}" "${project}" "${CASE_DIR}/everyday-home-a" < "${lines}" > "${base_out}" 2>&1
+  bash "${runner}" "${ROOT_DIR}/lib/gate-lib.sh" "${project}" "${CASE_DIR}/everyday-home-b" < "${lines}" > "${new_out}" 2>&1
+  count="$(wc -l < "${lines}")"
+  (( count >= 30 )) || { fail "$FUNCNAME: only ${count} lines"; return; }
+  [[ "$(wc -l < "${base_out}")" == "${count}" ]] || { fail "$FUNCNAME: the base gate did not read every line ($(head -n 3 "${base_out}"))"; return; }
+  if ! diff -u "${base_out}" "${new_out}" >&2; then
+    fail "$FUNCNAME: a line reads differently through this gate than through ${base_ref}"
+    return
+  fi
+  printf '# %s: %s command lines, the same through both gates\n' "$FUNCNAME" "${count}"
+  # The one difference this change makes to an everyday line: a shorthand cluster that contains -g is a global install
+  # for npm (nopt expands -gD to --global --save-dev), and so for the gate (it used to take it for a project install).
+  printf 'install -gD okpkg\n' > "${CASE_DIR}/everyday-cluster.lines"
+  bash "${runner}" "${base_lib}" "${project}" "${CASE_DIR}/everyday-home-a" < "${CASE_DIR}/everyday-cluster.lines" > "${base_out}" 2>&1
+  bash "${runner}" "${ROOT_DIR}/lib/gate-lib.sh" "${project}" "${CASE_DIR}/everyday-home-b" < "${CASE_DIR}/everyday-cluster.lines" > "${new_out}" 2>&1
+  grep -q 'SCAN;AUDIT okpkg;DELEGATE' "${base_out}" && grep -q 'rc=0 | AUDIT okpkg;DELEGATE npm install -gD okpkg;' "${new_out}" \
+    || { cat "${base_out}" "${new_out}" >&2; fail "$FUNCNAME: -gD is not read as a global install"; return; }
+  pass "$FUNCNAME"
+}
+
 main() {
   local case
   for case in \
@@ -12606,6 +12755,8 @@ main() {
     case_npm_front_door_covers_mise_exec_and_the_exec_switches \
     case_npm_global_mode_is_read_as_npm_reads_it \
     case_npm_exec_package_then_terminator_fails_closed \
+    case_npm_front_door_way_out_is_the_environment_for_an_unknown_name \
+    case_npm_everyday_commands_are_unchanged_by_the_front_door \
     case_refusal_message_contract \
     case_large_pinned_install_and_socket_rate_nontty \
     case_infra_only_warn_no_host_allow_and_needs_a_tty \

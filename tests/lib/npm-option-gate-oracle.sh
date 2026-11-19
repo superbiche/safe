@@ -13,11 +13,22 @@
 # the global mode. The gate may be stricter than npm (it audits a word npm discards; it classifies a word
 # npm rejects as an install): that is not a disagreement.
 #
-#   bash tests/lib/npm-option-gate-oracle.sh [--show N] < corpus
+#   bash tests/lib/npm-option-gate-oracle.sh [--show N] [--emit FILE] < corpus
+#
+# SAFE_ORACLE_GATE_LIB names another gate library to read the corpus through (the base branch's, to count what a
+# change newly refuses); --emit writes one line per case: its number, ok|refused, and the gate's refusal line.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 SHOW=20
-[[ "${1:-}" == "--show" ]] && SHOW="${2:-20}"
+EMIT=""
+while (( $# )); do
+  case "$1" in
+    --show) SHOW="${2:-20}"; shift 2 ;;
+    --emit) EMIT="${2:-}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[[ -z "${EMIT}" ]] || : > "${EMIT}"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/safe-npm-option-oracle.XXXXXX")
 trap 'rm -rf -- "${WORK}"' EXIT
 export HOME="${WORK}/home"
@@ -25,7 +36,7 @@ mkdir -p "${HOME}" "${WORK}/project"
 printf '{"name":"oracle","version":"1.0.0"}\n' > "${WORK}/project/package.json"
 cd "${WORK}/project" || exit 1
 # shellcheck source=/dev/null
-source "${ROOT}/lib/gate-lib.sh" >/dev/null 2>&1 || { echo "cannot source the gate library"; exit 1; }
+source "${SAFE_ORACLE_GATE_LIB:-${ROOT}/lib/gate-lib.sh}" >/dev/null 2>&1 || { echo "cannot source the gate library"; exit 1; }
 REC="${WORK}/record"
 safe_gate_exec_real() { printf 'DELEGATE\n' >> "${REC}"; exit 0; }
 safe_gate_check() { printf 'AUDIT\t%s\n' "$1" >> "${REC}"; return 0; }
@@ -53,6 +64,10 @@ while IFS=$'\x1e' read -r argsline remain global command pkgopt; do
   ( safe_gate_npm_like npm "${args[@]}" ) >/dev/null 2>&1
   rc=$?
   shown="${argsline//${US}/ }"
+  if [[ -n "${EMIT}" ]]; then
+    if (( rc != 0 )); then printf '%d\trefused\t%s\t%s\n' "${total}" "${argsline//${US}/ }" "$(head -n 1 "${WORK}/err" | cut -c1-400)" >> "${EMIT}"
+    else printf '%d\tok\t%s\t\n' "${total}" "${argsline//${US}/ }" >> "${EMIT}"; fi
+  fi
   if (( rc != 0 )); then refused=$((refused + 1)); continue; fi
   # what the gate did
   mapfile -t audited < <(sed -n 's/^AUDIT\t//p' "${REC}")
