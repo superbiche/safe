@@ -37,6 +37,18 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "node-tree" {
 		return nodeTree(args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "repeated-members" {
+		return repeatedMembers(args[1:], stdin, stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "project-graph" {
+		return projectGraph(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "project-diff" {
+		return projectDiff(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "project-decide" {
+		return projectDecide(args[1:], stdout, stderr)
+	}
 	if len(args) > 0 && args[0] == "private-trust" {
 		return privateTrust(args[1:], stdin, stdout, stderr)
 	}
@@ -49,6 +61,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, toolsScanUsage)
 		fmt.Fprintln(stderr, privateTrustUsage)
 		fmt.Fprintln(stderr, nodeTreeUsage)
+		fmt.Fprintln(stderr, projectGraphUsage)
+		fmt.Fprintln(stderr, projectDiffUsage)
+		fmt.Fprintln(stderr, projectDecideUsage)
 		return 2
 	}
 

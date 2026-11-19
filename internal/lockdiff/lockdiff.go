@@ -84,52 +84,73 @@ func LoadWithRegistryHosts(path string, registryHosts []string) ([]Package, erro
 // are returned carrying nothing but their path: npm never fetches them, so
 // they are neither validated nor classified here.
 func LoadEntries(path string, registryHosts []string) ([]Entry, error) {
-	allowedRegistryHosts := registryHostSet(registryHosts)
-	data, err := os.ReadFile(path)
+	records, err := LoadRecords(path, registryHosts)
 	if err != nil {
-		return nil, fmt.Errorf("read %q: %w", path, err)
+		return nil, err
+	}
+	loaded := make([]Entry, 0, len(records))
+	for _, record := range records {
+		if record.Link {
+			loaded = append(loaded, Entry{Path: record.Path, Link: true})
+			continue
+		}
+		loaded = append(loaded, Entry{
+			Path:     record.Path,
+			Package:  Package{Name: record.Name, Version: record.Version, Source: record.Source, Integrity: record.Integrity},
+			Optional: record.Optional,
+			Dev:      record.Dev,
+			OS:       record.OS,
+			CPU:      record.CPU,
+		})
+	}
+	return loaded, nil
+}
+
+// Record is one .packages occurrence with every lockfile fact the project
+// lane's artifact graph reads. LoadEntries reads the same entries through the
+// same validation and keeps the subset the reify lane needs; the fields here
+// that it drops (the resolved descriptor, bundling, an own shrinkwrap, a
+// link's target and the install-path alias) are exactly the ones a binding
+// decision cannot do without.
+type Record struct {
+	Path string
+	// Name is the identity the audit vouches for: the registry name an alias
+	// points at, else the install-path name. Alias is the install-path name
+	// when it differs from Name, empty otherwise.
+	Name  string
+	Alias string
+	// DeclaredName is the entry's own "name" member as written, whatever its
+	// source class. LoadEntries ignores it for entries without a registry
+	// descriptor; a reader that must know what a descriptor-less bundled entry
+	// declares to be (a mount name can differ from the package's) reads it here.
+	DeclaredName string
+	Version      string
+	Resolved     string
+	Integrity    string
+	// Source is the descriptor class: registry, git, file, remote or unknown.
+	Source     string
+	Link       bool
+	LinkTarget string
+	Optional   bool
+	Dev        bool
+	InBundle   bool
+	// HasShrinkwrap is npm's own-shrinkwrap marker on the entry.
+	HasShrinkwrap bool
+	OS            []string
+	CPU           []string
+}
+
+// LoadRecords reads the .packages map of an npm lockfileVersion 2 or 3 with
+// the validation LoadEntries applies, keeping every fact of each entry. Link
+// entries carry their path and target only: npm never fetches them.
+func LoadRecords(path string, registryHosts []string) ([]Record, error) {
+	allowedRegistryHosts := registryHostSet(registryHosts)
+	entries, err := readPackagesMap(path)
+	if err != nil {
+		return nil, err
 	}
 
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	var root map[string]json.RawMessage
-	if err := decoder.Decode(&root); err != nil {
-		return nil, fmt.Errorf("parse %q: invalid JSON: %w", path, err)
-	}
-	if root == nil {
-		return nil, fmt.Errorf("parse %q: lockfile must be a JSON object", path)
-	}
-	var extra any
-	if err := decoder.Decode(&extra); err == nil {
-		return nil, fmt.Errorf("parse %q: lockfile contains multiple JSON documents", path)
-	} else if err != io.EOF {
-		return nil, fmt.Errorf("parse %q: invalid trailing JSON: %w", path, err)
-	}
-
-	versionRaw, ok := root["lockfileVersion"]
-	if !ok {
-		return nil, fmt.Errorf("parse %q: lockfileVersion is required", path)
-	}
-	var lockfileVersion int64
-	if err := json.Unmarshal(versionRaw, &lockfileVersion); err != nil {
-		return nil, fmt.Errorf("parse %q: lockfileVersion must be a number", path)
-	}
-	if lockfileVersion == 1 {
-		return nil, fmt.Errorf("parse %q: lockfileVersion 1 is unsupported because it has no .packages map", path)
-	}
-	if lockfileVersion != 2 && lockfileVersion != 3 {
-		return nil, fmt.Errorf("parse %q: unsupported lockfileVersion %d (expected 2 or 3)", path, lockfileVersion)
-	}
-
-	packagesRaw, ok := root["packages"]
-	if !ok {
-		return nil, fmt.Errorf("parse %q: lockfileVersion %d requires a .packages map", path, lockfileVersion)
-	}
-	var entries map[string]json.RawMessage
-	if err := json.Unmarshal(packagesRaw, &entries); err != nil || entries == nil {
-		return nil, fmt.Errorf("parse %q: .packages must be a JSON object", path)
-	}
-
-	loaded := make([]Entry, 0, len(entries))
+	loaded := make([]Record, 0, len(entries))
 	for key, raw := range entries {
 		name, include := packageName(key)
 		if !include {
@@ -137,21 +158,27 @@ func LoadEntries(path string, registryHosts []string) ([]Entry, error) {
 		}
 
 		var entry struct {
-			Link      *bool           `json:"link"`
-			Optional  *bool           `json:"optional"`
-			Dev       *bool           `json:"dev"`
-			Name      string          `json:"name"`
-			Version   string          `json:"version"`
-			Resolved  json.RawMessage `json:"resolved"`
-			Integrity json.RawMessage `json:"integrity"`
-			OS        json.RawMessage `json:"os"`
-			CPU       json.RawMessage `json:"cpu"`
+			Link          *bool           `json:"link"`
+			Optional      *bool           `json:"optional"`
+			Dev           *bool           `json:"dev"`
+			InBundle      *bool           `json:"inBundle"`
+			HasShrinkwrap *bool           `json:"hasShrinkwrap"`
+			Name          string          `json:"name"`
+			Version       string          `json:"version"`
+			Resolved      json.RawMessage `json:"resolved"`
+			Integrity     json.RawMessage `json:"integrity"`
+			OS            json.RawMessage `json:"os"`
+			CPU           json.RawMessage `json:"cpu"`
 		}
 		if err := json.Unmarshal(raw, &entry); err != nil {
 			return nil, fmt.Errorf("parse %q: .packages[%q] must be an object", path, key)
 		}
 		if entry.Link != nil && *entry.Link {
-			loaded = append(loaded, Entry{Path: key, Link: true})
+			// A link's resolved that is not a string reads as no target, exactly as
+			// LoadEntries always ignored it: the reify lane never reads a link's
+			// target, and a reader it shares must not refuse what it accepted.
+			target, _, _ := optionalString(entry.Resolved)
+			loaded = append(loaded, Record{Path: key, Link: true, LinkTarget: target})
 			continue
 		}
 		if entry.Version == "" {
@@ -171,7 +198,11 @@ func LoadEntries(path string, registryHosts []string) ([]Entry, error) {
 		// for that identity only when the descriptor is a registry artifact.
 		// A non-registry descriptor can self-declare a registry name, but that
 		// must not make an audit of that namesake vouch for its real source.
+		alias := ""
 		if source == "registry" && entry.Name != "" {
+			if entry.Name != name {
+				alias = name
+			}
 			name = entry.Name
 		}
 		if err := validatePackageName(name); err != nil {
@@ -185,13 +216,21 @@ func LoadEntries(path string, registryHosts []string) ([]Entry, error) {
 				return nil, fmt.Errorf("parse %q: .packages[%q] %w", path, key, err)
 			}
 		}
-		loaded = append(loaded, Entry{
-			Path:     key,
-			Package:  Package{Name: name, Version: entry.Version, Source: source, Integrity: integrity},
-			Optional: entry.Optional != nil && *entry.Optional,
-			Dev:      entry.Dev != nil && *entry.Dev,
-			OS:       stringList(entry.OS),
-			CPU:      stringList(entry.CPU),
+		loaded = append(loaded, Record{
+			Path:          key,
+			Name:          name,
+			Alias:         alias,
+			DeclaredName:  entry.Name,
+			Version:       entry.Version,
+			Resolved:      resolved,
+			Integrity:     integrity,
+			Source:        source,
+			Optional:      entry.Optional != nil && *entry.Optional,
+			Dev:           entry.Dev != nil && *entry.Dev,
+			InBundle:      entry.InBundle != nil && *entry.InBundle,
+			HasShrinkwrap: entry.HasShrinkwrap != nil && *entry.HasShrinkwrap,
+			OS:            stringList(entry.OS),
+			CPU:           stringList(entry.CPU),
 		})
 	}
 
@@ -396,4 +435,108 @@ func packageLess(a, b Package) bool {
 		return a.Source < b.Source
 	}
 	return a.Integrity < b.Integrity
+}
+
+// readPackagesMap reads and checks the lockfile document and returns its
+// .packages map, the one reading every loader here shares.
+func readPackagesMap(path string) (map[string]json.RawMessage, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %q: %w", path, err)
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	var root map[string]json.RawMessage
+	if err := decoder.Decode(&root); err != nil {
+		return nil, fmt.Errorf("parse %q: invalid JSON: %w", path, err)
+	}
+	if root == nil {
+		return nil, fmt.Errorf("parse %q: lockfile must be a JSON object", path)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err == nil {
+		return nil, fmt.Errorf("parse %q: lockfile contains multiple JSON documents", path)
+	} else if err != io.EOF {
+		return nil, fmt.Errorf("parse %q: invalid trailing JSON: %w", path, err)
+	}
+
+	versionRaw, ok := root["lockfileVersion"]
+	if !ok {
+		return nil, fmt.Errorf("parse %q: lockfileVersion is required", path)
+	}
+	var lockfileVersion int64
+	if err := json.Unmarshal(versionRaw, &lockfileVersion); err != nil {
+		return nil, fmt.Errorf("parse %q: lockfileVersion must be a number", path)
+	}
+	if lockfileVersion == 1 {
+		return nil, fmt.Errorf("parse %q: lockfileVersion 1 is unsupported because it has no .packages map", path)
+	}
+	if lockfileVersion != 2 && lockfileVersion != 3 {
+		return nil, fmt.Errorf("parse %q: unsupported lockfileVersion %d (expected 2 or 3)", path, lockfileVersion)
+	}
+
+	packagesRaw, ok := root["packages"]
+	if !ok {
+		return nil, fmt.Errorf("parse %q: lockfileVersion %d requires a .packages map", path, lockfileVersion)
+	}
+	var entries map[string]json.RawMessage
+	if err := json.Unmarshal(packagesRaw, &entries); err != nil || entries == nil {
+		return nil, fmt.Errorf("parse %q: .packages must be a JSON object", path)
+	}
+	return entries, nil
+}
+
+// LocalPackage is a workspace member or in-project directory a link entry
+// points at: the lockfile key that is not under node_modules.
+type LocalPackage struct {
+	Path    string
+	Name    string
+	Version string
+}
+
+// LoadLocalPackages returns the entries of the lockfile that are not under
+// node_modules and that some link entry targets, by their key. Their version
+// is what makes a workspace member's change visible in a difference.
+func LoadLocalPackages(path string) ([]LocalPackage, error) {
+	entries, err := readPackagesMap(path)
+	if err != nil {
+		return nil, err
+	}
+	targets := map[string]struct{}{}
+	for key, raw := range entries {
+		if _, include := packageName(key); !include {
+			continue
+		}
+		var link struct {
+			Link     *bool           `json:"link"`
+			Resolved json.RawMessage `json:"resolved"`
+		}
+		if json.Unmarshal(raw, &link) != nil || link.Link == nil || !*link.Link {
+			continue
+		}
+		if target, _, _ := optionalString(link.Resolved); target != "" {
+			targets[target] = struct{}{}
+		}
+	}
+	var locals []LocalPackage
+	for target := range targets {
+		raw, ok := entries[target]
+		if !ok {
+			continue
+		}
+		var entry struct {
+			Name    string `json:"name"`
+			Version string `json:"version"`
+		}
+		if json.Unmarshal(raw, &entry) != nil {
+			continue
+		}
+		name := entry.Name
+		if name == "" {
+			name = target[strings.LastIndex(target, "/")+1:]
+		}
+		locals = append(locals, LocalPackage{Path: target, Name: name, Version: entry.Version})
+	}
+	sort.Slice(locals, func(i, j int) bool { return locals[i].Path < locals[j].Path })
+	return locals, nil
 }

@@ -1,6 +1,7 @@
 package strictjson
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -75,6 +76,48 @@ func TestRejectRepeatedMembers(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.wantSub) {
 				t.Fatalf("RejectRepeatedMembers(%s) = %q; want substring %q", tc.raw, err.Error(), tc.wantSub)
+			}
+		})
+	}
+}
+
+func TestRepeatedMemberPaths(t *testing.T) {
+	cases := []struct {
+		name     string
+		document string
+		want     string // JSON of the paths, or "" for an error
+	}{
+		{"clean", `{"a":[{"b":1}],"c":2}`, `[]`},
+		{"top-level scalar", `7`, `[]`},
+		{"repeated scalar", `{"id":"A","id":"B"}`, `[["id"]]`},
+		{"repeated container beside a populated one", `{"results":[{"vulns":[{"id":"A"}]},{"vulns":[],"vulns":[]}]}`, `[["results",1,"vulns"]]`},
+		{"repeated in the envelope", `{"results":[],"results":[]}`, `[["results"]]`},
+		{"several, in document order", `{"x":{"y":1,"y":2},"z":[{"q":1,"q":2}],"x":3}`, `[["x","y"],["z",0,"q"],["x"]]`},
+		{"names differing only by case are two names", `{"case":1,"Case":2}`, `[]`},
+		{"an escaped spelling is the same name", `{"a":1,"a":2}`, `[["a"]]`},
+		{"a number no float64 holds is still a number", `{"extra":1e400,"results":[{"v":1,"v":2}]}`, `[["results",0,"v"]]`},
+		{"NaN is not JSON", `{"extra":NaN,"results":[]}`, ``},
+		{"Infinity is not JSON", `[Infinity]`, ``},
+		{"truncated", `{"a":1,"a":`, ``},
+		{"empty", ``, ``},
+		{"two documents", `{} {}`, ``},
+		{"trailing garbage", `{"a":1} x`, ``},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			paths, err := RepeatedMemberPaths([]byte(tc.document))
+			if tc.want == "" {
+				if err == nil {
+					t.Fatalf("RepeatedMemberPaths() = %v, want an error", paths)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("RepeatedMemberPaths() error = %v", err)
+			}
+			got, _ := json.Marshal(paths)
+			if string(got) != tc.want {
+				t.Fatalf("RepeatedMemberPaths() = %s, want %s", got, tc.want)
 			}
 		})
 	}

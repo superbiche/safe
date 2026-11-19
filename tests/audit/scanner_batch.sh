@@ -32,6 +32,14 @@ fail() { printf 'not ok - %s\n' "$*" >&2; FAIL_COUNT=$((FAIL_COUNT + 1)); }
 TEST_ROOT="$(mktemp -d)"
 safe_test_compose_exit_trap "rm -rf \"\$TEST_ROOT\""
 
+# The evidence mode asks safe-core (built from the working tree, at this tree's
+# version) whether an OSV answer repeats a member; without a Go toolchain those
+# cases are skipped, as the contract case below always was.
+# shellcheck source=tests/lib/safe-core.sh
+. "$ROOT/tests/lib/safe-core.sh"
+SC_OK=0
+if safe_core_test_prepare "$ROOT" "$TEST_ROOT/safe-core-ev" 2>/dev/null; then SC_OK=1; fi
+
 MOCKBIN="$TEST_ROOT/mockbin"
 FIXDIR="$TEST_ROOT/fixtures"
 mkdir -p "$MOCKBIN" "$FIXDIR"
@@ -60,6 +68,8 @@ case "$url" in
       count_file="${MOCK_BATCH_DIR}/.count"
       count=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
       printf '%s' "$count" > "$count_file"
+      # A batchN.fail marker makes the Nth call a transport failure.
+      [[ ! -e "${MOCK_BATCH_DIR}/batch${count}.fail" ]] || exit 22
       cat "${MOCK_BATCH_DIR}/batch${count}.json"
     else
       cat "${MOCK_BATCH_FIXTURE:?}"
@@ -68,11 +78,23 @@ case "$url" in
   *api.osv.dev/v1/vulns/*)
     [[ "${MOCK_VULN_STATUS:-0}" == "0" ]] || exit 22
     id="${url##*/}"
+    # A vuln-<id>.fail marker makes that one advisory fetch a transport failure.
+    [[ ! -e "${MOCK_FIXDIR:?}/vuln-${id}.fail" ]] || exit 22
     cat "${MOCK_FIXDIR:?}/vuln-${id}.json"
     ;;
   *api.osv.dev/v1/query*)
     [[ "${MOCK_QUERY_STATUS:-0}" == "0" ]] || exit 22
-    cat "${MOCK_QUERY_FIXTURE:?}"
+    if [[ -n "${MOCK_QUERY_DIR:-}" ]]; then
+      # Page N of a paginated query: queryN.json, or a transport failure when
+      # queryN.fail exists.
+      qcount_file="${MOCK_QUERY_DIR}/.count"
+      qcount=$(( $(cat "$qcount_file" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$qcount" > "$qcount_file"
+      [[ ! -e "${MOCK_QUERY_DIR}/query${qcount}.fail" ]] || exit 22
+      cat "${MOCK_QUERY_DIR}/query${qcount}.json"
+    else
+      cat "${MOCK_QUERY_FIXTURE:?}"
+    fi
     ;;
   *)
     exit 22
@@ -104,8 +126,13 @@ run_batch() {
     MOCK_VULN_STATUS="${MOCK_VULN_STATUS:-0}" \
     MOCK_QUERY_FIXTURE="${MOCK_QUERY_FIXTURE:-}" \
     MOCK_QUERY_STATUS="${MOCK_QUERY_STATUS:-0}" \
-    bash "$SAFE_AUDIT" scanner-batch
+    MOCK_QUERY_DIR="${MOCK_QUERY_DIR:-}" \
+    SAFE_CORE_BIN="${SAFE_CORE_BIN:-}" \
+    FAKE_COUNT="${FAKE_COUNT:-}" FAKE_MODE="${FAKE_MODE:-}" FAKE_OK="${FAKE_OK:-}" \
+    bash "$SAFE_AUDIT" scanner-batch "$@"
 }
+
+run_evidence() { run_batch --evidence "$@"; }
 
 # --- cases: scanner-batch ----------------------------------------------------
 
@@ -799,6 +826,496 @@ STUB
   fi
 }
 
+# --- cases: scanner-batch --evidence -----------------------------------------
+# The structured twin of the batch: one document, each identity's validated
+# answer and coverage kept apart, so a later failure never erases a validated
+# hit and a malformed answer is never read as empty.
+
+evidence_identity() { # <doc> <name> <version> <jq filter on the identity>
+  jq -e --arg n "$2" --arg v "$3" ".identities[] | select(.name == \$n and .version == \$v) | $4" <<<"$1" >/dev/null
+}
+
+case_evidence_clean_tree_is_complete_and_empty() {
+  setup_case ev-clean
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-clean.json"
+  printf '{"results": [{}, {}]}\n' > "$MOCK_BATCH_FIXTURE"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"left-pad","version":"1.3.0"},{"name":"lodash","version":"4.17.21"}]}' | run_evidence) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e '.schema_version == 1 and .policy.block_severities == ["critical"] and .blocklist == []
+        and (.identities | length == 2)
+        and ([.identities[] | .coverage == "complete" and .gap == "" and .advisories == []] | all)' <<<"$out" >/dev/null; then
+    pass "evidence: clean tree is complete with empty advisories"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: clean tree is complete with empty advisories"
+  fi
+}
+
+case_evidence_malformed_stdin_refuses() {
+  setup_case ev-malformed
+  local rc=0 out
+  out=$(printf 'not json' | run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "2" && -z "$out" ]]; then
+    pass "evidence: malformed stdin exits 2 with no document"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: malformed stdin exits 2 with no document"
+  fi
+}
+
+case_evidence_keeps_severity_ladder_and_malware_identity() {
+  setup_case ev-ladder
+  printf '{"install": {"block_severities": ["critical", "Medium"]}}\n' > "$RUN_DIR/config.json"
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-ladder.json"
+  printf '%s\n' '{"results": [
+    {"vulns": [{"id": "GHSA-evc-0001"}]},
+    {"vulns": [{"id": "MAL-2026-4242"}]},
+    {"vulns": [{"id": "GHSA-evv-0002"}, {"id": "GHSA-evu-0003"}]}]}' > "$MOCK_BATCH_FIXTURE"
+  # aaa: a CVSS vector must band through the existing ladder (critical), not
+  # read as "low". ccc: one record without any severity reads "unknown".
+  # No vuln-MAL-* fixture exists: a fetch attempt would fail the case.
+  printf '{"id": "GHSA-evc-0001", "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]}\n' > "$FIXDIR/vuln-GHSA-evc-0001.json"
+  printf '{"id": "GHSA-evv-0002", "database_specific": {"severity": "MODERATE"}}\n' > "$FIXDIR/vuln-GHSA-evv-0002.json"
+  printf '{"id": "GHSA-evu-0003"}\n' > "$FIXDIR/vuln-GHSA-evu-0003.json"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"aaa","version":"1.0.0"},{"name":"bbb","version":"2.0.0"},{"name":"ccc","version":"3.0.0"}]}' | run_evidence) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e '.policy.block_severities == ["critical","moderate"]' <<<"$out" >/dev/null \
+    && evidence_identity "$out" aaa 1.0.0 '.coverage == "complete" and .advisories == [{id:"GHSA-evc-0001",severity:"critical",malware:false}]' \
+    && evidence_identity "$out" bbb 2.0.0 '.coverage == "complete" and .advisories == [{id:"MAL-2026-4242",severity:"critical",malware:true}]' \
+    && evidence_identity "$out" ccc 3.0.0 '.advisories == [{id:"GHSA-evu-0003",severity:"unknown",malware:false},{id:"GHSA-evv-0002",severity:"moderate",malware:false}]'; then
+    pass "evidence: ladder severities, block_severities, and MAL keeps its affected version"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: ladder severities, block_severities, and MAL keeps its affected version"
+  fi
+}
+
+case_evidence_same_name_versions_stay_apart() {
+  setup_case ev-versions
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-versions.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-evs-0004"}]}, {}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": "GHSA-evs-0004", "database_specific": {"severity": "HIGH"}}\n' > "$FIXDIR/vuln-GHSA-evs-0004.json"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"multi","version":"1.0.0"},{"name":"multi","version":"2.0.0"},{"name":"multi","version":"1.0.0"}]}' | run_evidence) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e '.identities | length == 2' <<<"$out" >/dev/null \
+    && evidence_identity "$out" multi 1.0.0 '.advisories | length == 1' \
+    && evidence_identity "$out" multi 2.0.0 '.advisories == [] and .coverage == "complete"'; then
+    pass "evidence: one package at several versions keeps each answer on its own identity"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: one package at several versions keeps each answer on its own identity"
+  fi
+}
+
+case_evidence_later_chunk_failure_keeps_earlier_hits() {
+  # 150 identities → two querybatch calls. The first answers with a validated
+  # critical on its first identity; the second fails in transport. The batch
+  # aborts with nothing; the evidence keeps the hit and marks only the second
+  # chunk's identities missing.
+  setup_case ev-chunk-fail
+  local batchdir="$FIXDIR/ev-chunk-fail"
+  mkdir -p "$batchdir"; rm -f "$batchdir/.count" "$batchdir"/batch2.*
+  jq -n '{results: ([{vulns: [{id: "GHSA-evk-0005"}]}] + [range(99) | {}])}' > "$batchdir/batch1.json"
+  : > "$batchdir/batch2.fail"
+  printf '{"id": "GHSA-evk-0005", "database_specific": {"severity": "CRITICAL"}}\n' > "$FIXDIR/vuln-GHSA-evk-0005.json"
+  local input out rc=0 first last
+  input=$(jq -n '{packages: [range(150) | {name: ("pkg-" + (. + 1000 | tostring)), version: "1.0.0"}]}')
+  first=$(jq -r '[.packages[].name] | sort | .[0]' <<<"$input")
+  last=$(jq -r '[.packages[].name] | sort | .[149]' <<<"$input")
+  out=$(printf '%s' "$input" | MOCK_BATCH_DIR="$batchdir" MOCK_BATCH_FIXTURE= run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e '[.identities[] | select(.coverage == "complete")] | length == 100' <<<"$out" >/dev/null \
+    && jq -e '[.identities[] | select(.coverage == "missing")] | length == 50' <<<"$out" >/dev/null \
+    && evidence_identity "$out" "$first" 1.0.0 '.advisories[0].id == "GHSA-evk-0005" and .advisories[0].severity == "critical"' \
+    && evidence_identity "$out" "$last" 1.0.0 '.coverage == "missing" and (.gap | contains("OSV batch query failed")) and .advisories == []'; then
+    pass "evidence: a later chunk's failure keeps the earlier validated hit and marks only its own identities"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: a later chunk's failure keeps the earlier validated hit and marks only its own identities"
+  fi
+  # The batch over the same fixtures still aborts on that failure.
+  rm -f "$batchdir/.count"
+  rc=0
+  out=$(printf '%s' "$input" | MOCK_BATCH_DIR="$batchdir" MOCK_BATCH_FIXTURE= run_batch 2>/dev/null) || rc=$?
+  if [[ "$rc" == "4" && -z "$out" ]]; then
+    pass "evidence: the batch itself still fails closed on the same chunk failure"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: the batch itself still fails closed on the same chunk failure"
+  fi
+}
+
+case_evidence_malformed_result_loses_only_itself() {
+  # Positional pairing holds (one result per query), so each result stands or
+  # falls alone: a sound hit beside a bare string and a null keeps the hit; a
+  # chunk whose length does not match loses all of its identities.
+  setup_case ev-chunk-malformed
+  local batchdir="$FIXDIR/ev-chunk-malformed"
+  mkdir -p "$batchdir"; rm -f "$batchdir/.count" "$batchdir"/batch2.*
+  jq -n '{results: [range(100) | {}]}' > "$batchdir/batch1.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-evm-0013"}]}, "oops", null]}\n' > "$batchdir/batch2.json"
+  printf '{"id": "GHSA-evm-0013", "database_specific": {"severity": "CRITICAL"}}\n' > "$FIXDIR/vuln-GHSA-evm-0013.json"
+  local input out rc=0 first second third
+  input=$(jq -n '{packages: [range(103) | {name: ("pkg-" + (. + 1000 | tostring)), version: "1.0.0"}]}')
+  first=$(jq -r '[.packages[].name] | sort | .[100]' <<<"$input")
+  second=$(jq -r '[.packages[].name] | sort | .[101]' <<<"$input")
+  third=$(jq -r '[.packages[].name] | sort | .[102]' <<<"$input")
+  out=$(printf '%s' "$input" | MOCK_BATCH_DIR="$batchdir" MOCK_BATCH_FIXTURE= run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e '[.identities[] | select(.coverage == "missing")] | length == 2' <<<"$out" >/dev/null \
+    && evidence_identity "$out" "$first" 1.0.0 '.coverage == "complete" and .advisories[0].severity == "critical"' \
+    && evidence_identity "$out" "$second" 1.0.0 '.coverage == "missing" and (.gap | contains("malformed OSV batch response")) and .advisories == []' \
+    && evidence_identity "$out" "$third" 1.0.0 '.coverage == "missing"'; then
+    pass "evidence: a malformed result loses only itself, its sound neighbour keeps its hit"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$(jq -c '[.identities[] | select(.coverage == "missing" or (.advisories | length > 0))]' <<<"$out" 2>/dev/null)" >&2
+    fail "evidence: a malformed result loses only itself, its sound neighbour keeps its hit"
+  fi
+  # A chunk answered with the wrong number of results has no positional
+  # pairing: every identity in it is a gap, never an empty reading.
+  rm -f "$batchdir/.count"
+  printf '{"results": [{}, {}]}\n' > "$batchdir/batch2.json"
+  rc=0
+  out=$(printf '%s' "$input" | MOCK_BATCH_DIR="$batchdir" MOCK_BATCH_FIXTURE= run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] && jq -e '[.identities[] | select(.coverage == "missing")] | length == 3' <<<"$out" >/dev/null; then
+    pass "evidence: a chunk answered with the wrong number of results is a gap on all its identities"
+  else
+    fail "evidence: a chunk answered with the wrong number of results is a gap on all its identities"
+  fi
+}
+
+case_evidence_repeated_member_is_a_gap() {
+  # jq keeps the last of two same-named members: {"vulns":[critical],"vulns":[]}
+  # would read as an empty answer. A repeated member is refused as malformed.
+  setup_case ev-repeated
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-repeated.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-evr-0014"}], "vulns": []}]}\n' > "$MOCK_BATCH_FIXTURE"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"rep","version":"1.0.0"}]}' | run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] && evidence_identity "$out" rep 1.0.0 '.coverage == "missing" and (.gap | contains("repeated member"))'; then
+    pass "evidence: a repeated member in the batch answer is a gap, not the last value"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: a repeated member in the batch answer is a gap, not the last value"
+  fi
+  # And in an advisory record: the identity keeps its other hits and is missing.
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-repeated2.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-evr-0015"}]}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": "GHSA-evr-0015", "database_specific": {"severity": "CRITICAL", "severity": "LOW"}}\n' > "$FIXDIR/vuln-GHSA-evr-0015.json"
+  rc=0
+  out=$(printf '{"packages":[{"name":"rep","version":"2.0.0"}]}' | run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] && evidence_identity "$out" rep 2.0.0 '.coverage == "missing" and .advisories == [] and (.gap | contains("GHSA-evr-0015: OSV advisory record malformed"))'; then
+    pass "evidence: a repeated member in an advisory record is a gap, not the last value"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: a repeated member in an advisory record is a gap, not the last value"
+  fi
+}
+
+case_evidence_pagination_failure_keeps_first_page() {
+  setup_case ev-page-fail
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-page.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-evp-0006"}], "next_page_token": "tok"}, {"vulns": [{"id": "GHSA-evp-0007"}]}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": "GHSA-evp-0006", "database_specific": {"severity": "CRITICAL"}}\n' > "$FIXDIR/vuln-GHSA-evp-0006.json"
+  printf '{"id": "GHSA-evp-0007", "database_specific": {"severity": "LOW"}}\n' > "$FIXDIR/vuln-GHSA-evp-0007.json"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"paged","version":"1.0.0"},{"name":"plain","version":"1.0.0"}]}' | MOCK_QUERY_STATUS=1 run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && evidence_identity "$out" paged 1.0.0 '.coverage == "missing" and (.gap | contains("pagination")) and .advisories == [{id:"GHSA-evp-0006",severity:"critical",malware:false}]' \
+    && evidence_identity "$out" plain 1.0.0 '.coverage == "complete" and .advisories[0].severity == "low"'; then
+    pass "evidence: a failed pagination re-query keeps the validated first page and marks the identity missing"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: a failed pagination re-query keeps the validated first page and marks the identity missing"
+  fi
+  # The validated hit of page ONE survives a failure on page two, with the
+  # batch answer carrying nothing but a token (the shape a truncated page has).
+  local qdir="$FIXDIR/ev-pages"
+  mkdir -p "$qdir"; rm -f "$qdir/.count" "$qdir"/query2.*
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-tokenonly.json"
+  printf '{"results": [{"next_page_token": "tok"}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"vulns": [{"id": "GHSA-evp-0016"}], "next_page_token": "tok2"}\n' > "$qdir/query1.json"
+  : > "$qdir/query2.fail"
+  printf '{"id": "GHSA-evp-0016", "database_specific": {"severity": "CRITICAL"}}\n' > "$FIXDIR/vuln-GHSA-evp-0016.json"
+  rc=0
+  out=$(printf '{"packages":[{"name":"twopage","version":"1.0.0"}]}' | MOCK_QUERY_DIR="$qdir" run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && evidence_identity "$out" twopage 1.0.0 '.coverage == "missing" and (.gap | contains("pagination")) and .advisories == [{id:"GHSA-evp-0016",severity:"critical",malware:false}]'; then
+    pass "evidence: a hit read on page one survives a failure on page two"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: a hit read on page one survives a failure on page two"
+  fi
+  # A successful re-query keeps the batch answer's validated hits too, even
+  # when the re-query's own pages do not repeat them.
+  rm -f "$qdir/.count" "$qdir"/query2.*
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-keep.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-evp-0017"}], "next_page_token": "tok"}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"vulns": [{"id": "GHSA-evp-0016"}]}\n' > "$qdir/query1.json"
+  printf '{"id": "GHSA-evp-0017", "database_specific": {"severity": "LOW"}}\n' > "$FIXDIR/vuln-GHSA-evp-0017.json"
+  rc=0
+  out=$(printf '{"packages":[{"name":"twopage","version":"1.0.0"}]}' | MOCK_QUERY_DIR="$qdir" run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && evidence_identity "$out" twopage 1.0.0 '.coverage == "complete" and ([.advisories[].id] == ["GHSA-evp-0016","GHSA-evp-0017"])'; then
+    pass "evidence: a successful re-query is the union with the batch answer's validated hits"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: a successful re-query is the union with the batch answer's validated hits"
+  fi
+  # And a complete re-query still merges to completeness.
+  MOCK_QUERY_FIXTURE="$FIXDIR/query-ev-page.json"
+  printf '{"vulns": [{"id": "GHSA-evp-0006"}, {"id": "GHSA-evp-0008"}]}\n' > "$MOCK_QUERY_FIXTURE"
+  printf '{"id": "GHSA-evp-0008", "database_specific": {"severity": "HIGH"}}\n' > "$FIXDIR/vuln-GHSA-evp-0008.json"
+  rc=0
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-page1.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-evp-0006"}], "next_page_token": "tok"}]}\n' > "$MOCK_BATCH_FIXTURE"
+  out=$(printf '{"packages":[{"name":"paged","version":"1.0.0"}]}' | run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && evidence_identity "$out" paged 1.0.0 '.coverage == "complete" and ([.advisories[].id] == ["GHSA-evp-0006","GHSA-evp-0008"])'; then
+    pass "evidence: a complete pagination re-query is read to completeness"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: a complete pagination re-query is read to completeness"
+  fi
+}
+
+case_evidence_detail_failure_keeps_other_hits() {
+  setup_case ev-detail
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-detail.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-evd-0009"}, {"id": "GHSA-evd-0010"}, {"id": "MAL-2026-777"}]}, {"vulns": [{"id": "GHSA-evd-0011"}]}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": "GHSA-evd-0009", "database_specific": {"severity": "CRITICAL"}}\n' > "$FIXDIR/vuln-GHSA-evd-0009.json"
+  # 0010: an advisory record that is not the advisory asked for; 0011: no
+  # fixture at all (the fetch fails).
+  printf '{"id": "GHSA-someone-else"}\n' > "$FIXDIR/vuln-GHSA-evd-0010.json"
+  : > "$FIXDIR/vuln-GHSA-evd-0011.fail"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"dd1","version":"1.0.0"},{"name":"dd2","version":"1.0.0"}]}' | run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && evidence_identity "$out" dd1 1.0.0 '.coverage == "missing" and (.gap | contains("GHSA-evd-0010: OSV advisory record malformed"))
+        and ([.advisories[] | .id] == ["GHSA-evd-0009","MAL-2026-777"])' \
+    && evidence_identity "$out" dd2 1.0.0 '.coverage == "missing" and (.gap | contains("GHSA-evd-0011: OSV advisory fetch failed")) and .advisories == []'; then
+    pass "evidence: a failed or malformed detail drops only that advisory and names it in the gap"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: a failed or malformed detail drops only that advisory and names it in the gap"
+  fi
+}
+
+case_evidence_blocklist_is_independent_of_osv() {
+  setup_case ev-blocklist
+  printf '{"packages": {"evil-pkg": {"reason": "operator blocklist test"}, "@scope/*": {"reason": "scope blocked"}}}\n' > "$RUN_DIR/blocked.json"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"evil-pkg","version":"1.0.0"},{"name":"@scope/x","version":"2.0.0"},{"name":"fine","version":"1.0.0"}]}' \
+    | MOCK_BATCH_STATUS=1 run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e '.blocklist == [{name:"@scope/x",reason:"scope blocked"},{name:"evil-pkg",reason:"operator blocklist test"}]
+        and ([.identities[] | .coverage == "missing"] | all)' <<<"$out" >/dev/null; then
+    pass "evidence: blocklist hits are reported by name whatever the OSV reading did"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: blocklist hits are reported by name whatever the OSV reading did"
+  fi
+}
+
+case_evidence_unreadable_blocklist_fails_closed() {
+  setup_case ev-blocklist-bad
+  printf '{"packages": [1]}\n' > "$RUN_DIR/blocked.json"
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-bl.json"
+  printf '{"results": [{}]}\n' > "$MOCK_BATCH_FIXTURE"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"x","version":"1.0.0"}]}' | run_evidence 2>"$TEST_ROOT/ev-bl.err") || rc=$?
+  if [[ "$rc" == "4" && -z "$out" ]] && grep -q "blocklist file unreadable" "$TEST_ROOT/ev-bl.err"; then
+    pass "evidence: an unreadable blocklist yields no document"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: an unreadable blocklist yields no document"
+  fi
+}
+
+case_evidence_document_is_read_by_the_decision() {
+  # The two sides of the contract in one run: the evidence this mode writes,
+  # plus the acceptances the gate adds, is a document safe-core's decision
+  # reads; a malformed answer on the target side is Missing evidence there.
+  setup_case ev-contract
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-contract.json"
+  printf '%s\n' '{"results": [{"vulns": [{"id": "GHSA-evx-0012"}]}, {}, {"vulns": [{"id": "MAL-2026-1"}]}]}' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": "GHSA-evx-0012", "database_specific": {"severity": "CRITICAL"}}\n' > "$FIXDIR/vuln-GHSA-evx-0012.json"
+  local evidence="$TEST_ROOT/ev-contract.json" lock="$TEST_ROOT/ev-contract-lock.json" out rc=0 sri
+  sri="sha512-$(head -c 64 /dev/zero | base64 -w0)"
+  printf '{"packages":[{"name":"crit","version":"1.0.0"},{"name":"mal","version":"1.0.0"},{"name":"fine","version":"1.0.0"}]}' \
+    | run_evidence 2>/dev/null | jq -c '. + {acceptances: []}' > "$evidence"
+  jq -n --arg sri "$sri" '{lockfileVersion: 3, packages: ({"": {name: "root"}} + ([["crit","1.0.0"],["mal","1.0.0"],["fine","1.0.0"]] | map({key: ("node_modules/" + .[0]),
+    value: {version: .[1], resolved: ("https://registry.npmjs.org/" + .[0] + "/-/" + .[0] + "-" + .[1] + ".tgz"),
+            integrity: $sri}}) | from_entries))}' > "$lock"
+  out=$("$SAFE_CORE_BIN" project-decide --no-baseline --evidence "$evidence" "$lock") || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e '.outcome == {status:"stopped",class:"malice",exit:104}
+        and (.malice | length == 1 and .[0].name == "mal" and .[0].versions == ["1.0.0"] and .[0].id == "MAL-2026-1")
+        and (.advisories.introduced | length == 1 and .[0].name == "crit" and .[0].class == "blocking")' <<<"$out" >/dev/null; then
+    pass "evidence: the document the mode writes is the one safe-core project-decide reads"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: the document the mode writes is the one safe-core project-decide reads"
+  fi
+}
+
+# A stand-in for safe-core that reports the tree's version and answers the
+# repeated-member check as told: the real answer for the first FAKE_OK calls,
+# then FAKE_MODE ("exit2": status 2, "garbage": status 0 with a non-array on
+# stdout).
+make_fake_core() { # <path>
+  cat > "$1" <<FAKE
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "--version" ]]; then printf '%s\n' "$(tr -d '[:space:]' < "$ROOT/VERSION")"; exit 0; fi
+count_file="\${FAKE_COUNT:?}"
+count=\$(( \$(cat "\$count_file" 2>/dev/null || echo 0) + 1 ))
+printf '%s' "\$count" > "\$count_file"
+if (( count > \${FAKE_OK:-0} )); then
+  case "\${FAKE_MODE:-exit2}" in
+    exit2) exit 2 ;;
+    garbage) printf 'not an array\n'; exit 0 ;;
+  esac
+fi
+exec "$SAFE_CORE_BIN" "\$@"
+FAKE
+  chmod +x "$1"
+}
+
+case_evidence_duplicate_in_one_result_keeps_its_neighbour() {
+  # Pairing is sound (one results array of the right length); the duplicate is
+  # confined to the second result, so only that result is lost.
+  setup_case ev-dup-one
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-dup-one.json"
+  printf '{"results":[{"vulns":[{"id":"TEST-A"}]},{"vulns":[],"vulns":[]}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": "TEST-A", "database_specific": {"severity": "CRITICAL"}}\n' > "$FIXDIR/vuln-TEST-A.json"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"aaa","version":"1.0.0"},{"name":"bbb","version":"1.0.0"}]}' | run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && evidence_identity "$out" aaa 1.0.0 '.coverage == "complete" and .advisories == [{id:"TEST-A",severity:"critical",malware:false}]' \
+    && evidence_identity "$out" bbb 1.0.0 '.coverage == "missing" and (.gap | contains("repeated member")) and .advisories == []'; then
+    pass "evidence: a repeated member inside one result costs that result only"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: a repeated member inside one result costs that result only"
+  fi
+  # A repeated member in the envelope cannot be trusted per result.
+  printf '{"results":[{"vulns":[{"id":"TEST-A"}]},{}],"results":[{},{}]}\n' > "$MOCK_BATCH_FIXTURE"
+  rc=0
+  out=$(printf '{"packages":[{"name":"aaa","version":"1.0.0"},{"name":"bbb","version":"1.0.0"}]}' | run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] && jq -e '[.identities[] | .coverage == "missing"] | all' <<<"$out" >/dev/null; then
+    pass "evidence: a repeated envelope member leaves the whole chunk missing"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: a repeated envelope member leaves the whole chunk missing"
+  fi
+  # Member names are compared exactly: case and Case are two names.
+  printf '{"results":[{"vulns":[{"id":"TEST-A","case":1,"Case":2}]},{}]}\n' > "$MOCK_BATCH_FIXTURE"
+  rc=0
+  out=$(printf '{"packages":[{"name":"aaa","version":"1.0.0"},{"name":"bbb","version":"1.0.0"}]}' | run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] && jq -e '[.identities[] | .coverage == "complete"] | all' <<<"$out" >/dev/null; then
+    pass "evidence: names differing only by case are not a repeated member"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: names differing only by case are not a repeated member"
+  fi
+}
+
+case_evidence_checker_does_not_fail_open() {
+  setup_case ev-checker
+  local input='{"packages":[{"name":"aaa","version":"1.0.0"},{"name":"bbb","version":"1.0.0"}]}' out rc=0
+  # 1e400 is a number no float64 holds; the walk must go on to the duplicate.
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-big.json"
+  printf '{"extra":1e400,"results":[{"vulns":[{"id":"TEST-A"}],"vulns":[]},{}]}\n' > "$MOCK_BATCH_FIXTURE"
+  out=$(printf '%s' "$input" | run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && evidence_identity "$out" aaa 1.0.0 '.coverage == "missing" and (.gap | contains("repeated member"))' \
+    && evidence_identity "$out" bbb 1.0.0 '.coverage == "complete"'; then
+    pass "evidence: 1e400 does not end the repeated-member walk"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: 1e400 does not end the repeated-member walk"
+  fi
+  # jq accepts NaN; it is not JSON.
+  printf '{"extra":NaN,"results":[{},{}]}\n' > "$MOCK_BATCH_FIXTURE"
+  rc=0
+  out=$(printf '%s' "$input" | run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] && jq -e '[.identities[] | .coverage == "missing" and (.gap | contains("not valid JSON"))] | all' <<<"$out" >/dev/null; then
+    pass "evidence: a NaN in the batch answer is a malformed answer, not a clean reading"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: a NaN in the batch answer is a malformed answer, not a clean reading"
+  fi
+  # A checker that cannot answer is breakage (exit 4), never "no duplicate".
+  local fake="$TEST_ROOT/fake-core"
+  make_fake_core "$fake"
+  printf '{"results":[{},{}]}\n' > "$MOCK_BATCH_FIXTURE"
+  local mode
+  for mode in exit2 garbage; do
+    rc=0
+    : > "$TEST_ROOT/fake-count"
+    out=$(printf '%s' "$input" | SAFE_CORE_BIN="$fake" FAKE_COUNT="$TEST_ROOT/fake-count" FAKE_MODE="$mode" FAKE_OK=0 run_evidence 2>"$TEST_ROOT/fake.err") || rc=$?
+    if [[ "$rc" == "4" && -z "$out" ]] && grep -q "unusable" "$TEST_ROOT/fake.err"; then
+      pass "evidence: a checker that answers '$mode' is audit-infrastructure breakage (exit 4)"
+    else
+      printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+      fail "evidence: a checker that answers '$mode' is audit-infrastructure breakage (exit 4)"
+    fi
+  done
+  # The same at the page boundary (second call) and the detail boundary (third).
+  printf '{"results":[{"vulns":[{"id":"TEST-A"}],"next_page_token":"tok"},{}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"vulns":[{"id":"TEST-A"}]}\n' > "$FIXDIR/query-ev-fake.json"
+  printf '{"id": "TEST-A", "database_specific": {"severity": "CRITICAL"}}\n' > "$FIXDIR/vuln-TEST-A.json"
+  local ok
+  for ok in 1 2; do
+    rc=0
+    : > "$TEST_ROOT/fake-count"
+    out=$(printf '%s' "$input" | SAFE_CORE_BIN="$fake" FAKE_COUNT="$TEST_ROOT/fake-count" FAKE_MODE=exit2 FAKE_OK="$ok" \
+      MOCK_QUERY_FIXTURE="$FIXDIR/query-ev-fake.json" run_evidence 2>"$TEST_ROOT/fake.err") || rc=$?
+    if [[ "$rc" == "4" && -z "$out" ]] && grep -q "unusable" "$TEST_ROOT/fake.err"; then
+      pass "evidence: an unusable checker after $ok good call(s) is exit 4 (page/detail boundary)"
+    else
+      printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+      fail "evidence: an unusable checker after $ok good call(s) is exit 4 (page/detail boundary)"
+    fi
+  done
+}
+
+case_evidence_page_and_detail_answers_are_checked_too() {
+  setup_case ev-page-detail
+  local input='{"packages":[{"name":"pg","version":"1.0.0"}]}' out rc=0
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-pd.json"
+  printf '{"results":[{"vulns":[{"id":"TEST-B"}],"next_page_token":"tok"}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": "TEST-B", "database_specific": {"severity": "CRITICAL"}}\n' > "$FIXDIR/vuln-TEST-B.json"
+  local body
+  for body in '{"vulns":[{"id":"TEST-B"}],"extra":NaN}' '{"vulns":[{"id":"TEST-B"}],"vulns":[]}'; do
+    printf '%s\n' "$body" > "$FIXDIR/query-ev-pd.json"
+    rc=0
+    out=$(printf '%s' "$input" | MOCK_QUERY_FIXTURE="$FIXDIR/query-ev-pd.json" run_evidence 2>/dev/null) || rc=$?
+    if [[ "$rc" == "0" ]] \
+      && evidence_identity "$out" pg 1.0.0 '.coverage == "missing" and (.gap | contains("pagination")) and ([.advisories[].id] == ["TEST-B"])'; then
+      pass "evidence: a page that is not valid JSON or repeats a member is a gap that keeps the batch hit"
+    else
+      printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+      fail "evidence: a page that is not valid JSON or repeats a member is a gap that keeps the batch hit"
+    fi
+  done
+  # A detail record with a NaN is malformed; the other hits stay.
+  printf '{"results":[{"vulns":[{"id":"TEST-C"},{"id":"MAL-2026-5"}]}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": "TEST-C", "database_specific": {"severity": NaN}}\n' > "$FIXDIR/vuln-TEST-C.json"
+  rc=0
+  out=$(printf '%s' "$input" | run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && evidence_identity "$out" pg 1.0.0 '.coverage == "missing" and (.gap | contains("TEST-C: OSV advisory record malformed")) and ([.advisories[].id] == ["MAL-2026-5"])'; then
+    pass "evidence: a detail record that is not valid JSON is a gap, the other hits stay"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: a detail record that is not valid JSON is a gap, the other hits stay"
+  fi
+}
+
 # --- run ---------------------------------------------------------------------
 
 case_clean_tree_returns_empty_array
@@ -835,6 +1352,25 @@ case_adapter_rejects_malformed_advisory_elements
 case_adapter_throws_on_missing_binary
 case_adapter_times_out_hung_child
 case_adapter_rejects_partial_request_channel
+if (( SC_OK )); then
+  case_evidence_clean_tree_is_complete_and_empty
+  case_evidence_malformed_stdin_refuses
+  case_evidence_keeps_severity_ladder_and_malware_identity
+  case_evidence_same_name_versions_stay_apart
+  case_evidence_later_chunk_failure_keeps_earlier_hits
+  case_evidence_malformed_result_loses_only_itself
+  case_evidence_repeated_member_is_a_gap
+  case_evidence_pagination_failure_keeps_first_page
+  case_evidence_detail_failure_keeps_other_hits
+  case_evidence_blocklist_is_independent_of_osv
+  case_evidence_unreadable_blocklist_fails_closed
+  case_evidence_document_is_read_by_the_decision
+  case_evidence_duplicate_in_one_result_keeps_its_neighbour
+  case_evidence_checker_does_not_fail_open
+  case_evidence_page_and_detail_answers_are_checked_too
+else
+  pass "evidence cases (SKIPPED: safe-core not buildable here)"
+fi
 
 printf '%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 (( FAIL_COUNT == 0 ))
