@@ -4413,6 +4413,10 @@ safe_gate_project_lane_committed() {
   hashlen="${found_fields[3]}"
   case "${hashlen}" in sha1) hashlen=20 ;; sha256) hashlen=32 ;; *) safe_gate_lane_why "an object format this lane does not know"; return 2 ;; esac
   [[ "${gitdir}" == /* && "${worktree}" == /* ]] || { safe_gate_lane_why "the repository's location cannot be pinned"; return 2; }
+  if [[ "$(realpath -- "${worktree}" 2>/dev/null)" != "$(realpath -- "${dir}" 2>/dev/null)" ]]; then
+    safe_gate_lane_why "git selected another repository (${worktree}) than the one at ${dir}, which cannot be used"
+    return 2
+  fi
   repo=(--git-dir="${gitdir}" --work-tree="${worktree}")
   # from here on no command rediscovers: every one names the repository and the work tree
   g() { safe_gate_project_lane_git "${project_dir}" "${repo[@]}" "$@"; }
