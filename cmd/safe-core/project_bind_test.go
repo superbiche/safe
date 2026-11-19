@@ -593,77 +593,128 @@ func TestProjectBindFilesOnlyPublishesTheFilesAndInstallsNothing(t *testing.T) {
 
 func TestProjectBaselineCommand(t *testing.T) {
 	p := newBindProject(t)
-	held, err := os.Open(p.project)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer held.Close()
 	file := filepath.Join(filepath.Dir(p.project), "lock.json")
 	out := filepath.Join(filepath.Dir(p.project), "out.json")
 	if err := os.WriteFile(file, []byte(bindNewLock), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// the project is the directory descriptor 3 holds
 	call := func(mode string, extra ...string) (int, string) {
-		cmd := safeCore(append([]string{"project-baseline", mode, "--project-fd", "3", "--state-dir", p.state, "--name", "package-lock.json"}, extra...)...)
-		cmd.ExtraFiles = []*os.File{held}
-		_, code, stderr := run3(cmd)
+		_, code, stderr := run3(safeCore(append([]string{"project-baseline", mode, "--state-dir", p.state, "--project", p.project, "--name", "package-lock.json"}, extra...)...))
 		return code, stderr
 	}
-	if code, _ := call("read", "--kind", "current", "--out", out); code != 4 {
-		t.Fatalf("none stored: exit %d, want 4", code)
+	if code, _ := call("read", "--latest", "--out", out); code != 4 {
+		t.Fatalf("none recorded: exit %d, want 4", code)
 	}
-	if code, stderr := call("write", "--kind", "pending", "--file", file); code != 0 {
-		t.Fatalf("write pending: exit %d %s", code, stderr)
+	if code, stderr := call("record", "--file", file); code != 0 {
+		t.Fatalf("record: exit %d %s", code, stderr)
 	}
-	if code, _ := call("read", "--kind", "current", "--out", out); code != 4 {
-		t.Fatalf("a pending record is not the current one: exit %d", code)
+	if code, stderr := call("record", "--file", file); code != 0 {
+		t.Fatalf("recording it again: exit %d %s", code, stderr)
 	}
-	if code, stderr := call("read", "--kind", "pending", "--out", out); code != 0 {
-		t.Fatalf("read pending: exit %d %s", code, stderr)
+	if code, stderr := call("read", "--latest", "--out", out); code != 0 {
+		t.Fatalf("read latest: exit %d %s", code, stderr)
 	}
 	if raw, _ := os.ReadFile(out); string(raw) != bindNewLock {
 		t.Fatalf("read back %q", raw)
 	}
-	if code, stderr := call("confirm"); code != 0 {
-		t.Fatalf("confirm: exit %d %s", code, stderr)
+	_ = os.Remove(out)
+	if code, _ := call("read", "--digest", strings.TrimPrefix(digest(bindNewLock), "sha256:"), "--out", out); code != 0 {
+		t.Fatalf("read by digest: exit %d", code)
 	}
-	if code, _ := call("confirm"); code != 4 {
-		t.Fatalf("confirm with nothing pending: exit %d, want 4", code)
+	if code, _ := call("read", "--digest", strings.Repeat("0", 64), "--out", out); code != 4 {
+		t.Fatalf("an unknown digest: exit %d, want 4", code)
 	}
-	if code, _ := call("read", "--kind", "current", "--out", out); code != 0 {
-		t.Fatalf("read current: exit %d", code)
-	}
-	if code, _ := call("write", "--kind", "pending", "--file", file); code != 0 {
-		t.Fatal("write pending")
-	}
-	if code, _ := call("drop"); code != 0 {
-		t.Fatalf("drop: exit %d", code)
-	}
-	if code, _ := call("read", "--kind", "pending", "--out", out); code != 4 {
-		t.Fatalf("dropped: exit %d, want 4", code)
-	}
-	// a record that no longer matches its digest is unreadable (3), never absent (4)
-	records, _ := filepath.Glob(filepath.Join(p.state, "project-baseline", "*", "package-lock.json.json"))
+	// a record that does not hash to its name is IGNORED: exit 4 like none, named on stderr
+	records, _ := filepath.Glob(filepath.Join(p.state, "project-baseline", "*", "package-lock.json", "*"))
 	if len(records) != 1 {
 		t.Fatalf("records: %v", records)
 	}
-	raw, _ := os.ReadFile(records[0])
-	if err := os.WriteFile(records[0], []byte(strings.Replace(string(raw), `"digest":"sha256:`, `"digest":"sha256:0`, 1)), 0o600); err != nil {
+	if err := os.WriteFile(records[0], []byte("tampered"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if code, _ := call("read", "--kind", "current", "--out", out); code != 3 {
-		t.Fatalf("tampered: exit %d, want 3", code)
+	code, stderr := call("read", "--latest", "--out", out)
+	if code != 4 || !strings.Contains(stderr, "ignored record") {
+		t.Fatalf("tampered: exit %d, stderr %q", code, stderr)
 	}
 	for _, args := range [][]string{
-		{"project-baseline"}, {"project-baseline", "read"}, {"project-baseline", "read", "--project-fd", "3"},
-		{"project-baseline", "write", "--project-fd", "3", "--state-dir", p.state, "--name", "package-lock.json", "--kind", "current", "--out", out},
-		{"project-baseline", "read", "--project-fd", "2", "--state-dir", p.state, "--name", "package-lock.json", "--kind", "current", "--out", out},
-		{"project-baseline", "read", "--project", p.project, "--state-dir", p.state, "--name", "package-lock.json", "--kind", "current", "--out", out},
-		{"project-baseline", "confirm", "--project-fd", "3", "--state-dir", p.state, "--name", "package-lock.json", "--kind", "current"},
+		{"project-baseline"}, {"project-baseline", "read"}, {"project-baseline", "confirm"},
+		{"project-baseline", "record", "--state-dir", p.state, "--project", p.project, "--name", "package-lock.json"},
+		{"project-baseline", "read", "--state-dir", p.state, "--project", p.project, "--name", "package-lock.json", "--out", out},
+		{"project-baseline", "read", "--state-dir", p.state, "--project", p.project, "--name", "package-lock.json", "--latest", "--digest", "a", "--out", out},
+		{"project-baseline", "record", "--state-dir", p.state, "--project", p.project, "--name", "package-lock.json", "--file", file, "--out", out},
+		{"project-baseline", "read", "--project-fd", "3", "--state-dir", p.state, "--name", "package-lock.json", "--latest", "--out", out},
 	} {
 		if _, code, _ := run3(safeCore(args...)); code != 2 {
 			t.Fatalf("%v: exit %d, want 2", args, code)
 		}
+	}
+	// a project that is not canonical cannot be recorded
+	if _, code, _ := run3(safeCore("project-baseline", "record", "--state-dir", p.state, "--project", "relative", "--name", "package-lock.json", "--file", file)); code != 3 {
+		t.Fatalf("a relative project: exit %d, want 3", code)
+	}
+}
+
+func TestProjectLockfileAdmitAndGitTreeEntry(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	_, code, _ := run3(safeCore("project-lockfile-admit", write("ok.json", bindNewLock)))
+	if code != 0 {
+		t.Fatalf("a lockfile of the tree: exit %d", code)
+	}
+	for name, body := range map[string]string{
+		"outside": `{"lockfileVersion":3,"packages":{"":{},"vendor/x":{"version":"1.0.0"}}}`,
+		"link":    `{"lockfileVersion":3,"packages":{"":{},"node_modules/l":{"resolved":"../l","link":true}}}`,
+	} {
+		_, code, stderr := run3(safeCore("project-lockfile-admit", write(name+".json", body)))
+		if code != 30 || stderr == "" {
+			t.Fatalf("%s: exit %d %q", name, code, stderr)
+		}
+	}
+	if _, code, _ := run3(safeCore("project-lockfile-admit", write("bad.json", "{"))); code != 30 {
+		t.Fatalf("an unreadable lockfile: exit %d", code)
+	}
+	if _, code, _ := run3(safeCore("project-lockfile-admit", filepath.Join(dir, "missing.json"))); code != 3 {
+		t.Fatal("a missing file")
+	}
+
+	// git-tree-entry: the RAW mode, not git's canonical one
+	id := strings.Repeat("\x11", 20)
+	tree := "100664 package-lock.json\x00" + id + "40000 sub\x00" + strings.Repeat("\x22", 20) + "100644 package.json\x00" + strings.Repeat("\x33", 20)
+	run := func(name string, stdin string, args ...string) (string, int) {
+		cmd := safeCore(append([]string{"git-tree-entry"}, args...)...)
+		cmd.Stdin = strings.NewReader(stdin)
+		var stdout bytes.Buffer
+		cmd.Stdout = &stdout
+		err := cmd.Run()
+		code := 0
+		if exit, ok := err.(*exec.ExitError); ok {
+			code = exit.ExitCode()
+		}
+		return stdout.String(), code
+	}
+	if out, code := run("raw", tree, "--hash-bytes", "20", "--name", "package-lock.json"); code != 0 || out != "100664 "+strings.Repeat("11", 20)+"\n" {
+		t.Fatalf("raw mode: %q %d", out, code)
+	}
+	if _, code := run("absent", tree, "--hash-bytes", "20", "--name", "nope"); code != 4 {
+		t.Fatalf("absent: %d", code)
+	}
+	if _, code := run("malformed", "100644 x", "--hash-bytes", "20", "--name", "x"); code != 3 {
+		t.Fatalf("malformed: %d", code)
+	}
+	if _, code := run("short id", "100644 x\x00abc", "--hash-bytes", "20", "--name", "x"); code != 3 {
+		t.Fatalf("short id: %d", code)
+	}
+	twice := "100644 a\x00" + id + "100644 a\x00" + id
+	if _, code := run("twice", twice, "--hash-bytes", "20", "--name", "a"); code != 3 {
+		t.Fatalf("named twice: %d", code)
+	}
+	if _, code := run("usage", tree, "--hash-bytes", "21", "--name", "a"); code != 2 {
+		t.Fatalf("usage: %d", code)
 	}
 }

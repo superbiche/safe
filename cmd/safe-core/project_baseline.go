@@ -3,49 +3,46 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
-	"strconv"
 
 	"github.com/superbiche/safe/internal/projectlane"
 )
 
-// project-baseline keeps the lockfile safe judged and published last in a project
-// (see internal/projectlane/baseline.go for the format, the two states and what
-// protects them). The project is the directory a DESCRIPTOR holds (the one the
-// gate holds locked), never a pathname:
+// project-baseline keeps the lockfiles safe judged clear in a project, each under its
+// own digest (see internal/projectlane/baseline.go for the layout and what protects it):
 //
-//	safe-core project-baseline read    --project-fd <n> --state-dir <dir> --name <lockfile> --kind current|pending --out <file>
-//	safe-core project-baseline write   --project-fd <n> --state-dir <dir> --name <lockfile> --kind current|pending --file <file>
-//	safe-core project-baseline confirm --project-fd <n> --state-dir <dir> --name <lockfile>
-//	safe-core project-baseline drop    --project-fd <n> --state-dir <dir> --name <lockfile>
+//	safe-core project-baseline record --state-dir <dir> --project <canonical dir> --name <lockfile> --file <file>
+//	safe-core project-baseline read   --state-dir <dir> --project <canonical dir> --name <lockfile> (--digest <sha256 hex> | --latest) --out <file>
 //
-// confirm makes the pending record the current one; drop removes the pending one.
-//
-// exits: 0 done (read: the baseline is in <file>); 4 read or confirm: none stored;
-// 5 write: this directory's identity (birth time) cannot be established, nothing
-// can be stored; 3 a record, the state directory or the identity cannot be trusted
-// or an input cannot be read; 2 usage.
-const projectBaselineUsage = "safe-core: usage: safe-core project-baseline (read --out <file> | write --file <file> | confirm | drop) --project-fd <n> --state-dir <dir> --name <lockfile> [--kind current|pending]"
+// record exits 0 (stored, or already stored and refreshed), 3 (it cannot be stored: the
+// state directory cannot be trusted or written, the input cannot be read), 2 usage.
+// read exits 0 (a trusted record is in --out), 4 (none: nothing recorded, or what is
+// there is not trusted), 2 usage. A record that is not trusted (its bytes do not hash to
+// its name, not a private regular file, ...) is IGNORED, never an error: it is named on
+// stderr ("ignored record ...") and the exit status is the same as if it were not there.
+const projectBaselineUsage = "safe-core: usage: safe-core project-baseline (record --file <file> | read (--digest <sha256> | --latest) --out <file>) --state-dir <dir> --project <canonical dir> --name <lockfile>"
 
 func projectBaseline(args []string, stdout, stderr io.Writer) int {
 	usage := func() int {
 		fmt.Fprintln(stderr, projectBaselineUsage)
 		return 2
 	}
-	if len(args) == 0 {
+	if len(args) == 0 || (args[0] != "record" && args[0] != "read") {
 		return usage()
 	}
 	mode := args[0]
-	if mode != "read" && mode != "write" && mode != "confirm" && mode != "drop" {
-		return usage()
-	}
 	values := map[string]string{}
-	for i := 1; i < len(args); i += 2 {
+	latest := false
+	for i := 1; i < len(args); i++ {
 		switch args[i] {
-		case "--project-fd", "--state-dir", "--name", "--kind", "--out", "--file":
+		case "--latest":
+			if latest {
+				return usage()
+			}
+			latest = true
+		case "--state-dir", "--project", "--name", "--digest", "--out", "--file":
 			if i+1 >= len(args) || args[i+1] == "" {
 				return usage()
 			}
@@ -53,88 +50,64 @@ func projectBaseline(args []string, stdout, stderr io.Writer) int {
 				return usage()
 			}
 			values[args[i]] = args[i+1]
+			i++
 		default:
 			return usage()
 		}
 	}
-	allowed := map[string]map[string]bool{
-		"read":    {"--project-fd": true, "--state-dir": true, "--name": true, "--kind": true, "--out": true},
-		"write":   {"--project-fd": true, "--state-dir": true, "--name": true, "--kind": true, "--file": true},
-		"confirm": {"--project-fd": true, "--state-dir": true, "--name": true},
-		"drop":    {"--project-fd": true, "--state-dir": true, "--name": true},
-	}[mode]
-	for key := range values {
-		if !allowed[key] {
-			return usage()
-		}
-	}
-	required := []string{"--project-fd", "--state-dir", "--name"}
-	switch mode {
-	case "read":
-		required = append(required, "--kind", "--out")
-	case "write":
-		required = append(required, "--kind", "--file")
-	}
-	for _, key := range required {
+	for _, key := range []string{"--state-dir", "--project", "--name"} {
 		if values[key] == "" {
 			return usage()
 		}
 	}
-	fd, convErr := strconv.Atoi(values["--project-fd"])
-	if convErr != nil || fd < 3 {
-		return usage()
-	}
-	kind := projectlane.RecordKind(values["--kind"])
-	if values["--kind"] != "" && kind != projectlane.RecordCurrent && kind != projectlane.RecordPending {
-		return usage()
-	}
-	state, name := values["--state-dir"], values["--name"]
-	fail := func(err error) int {
-		fmt.Fprintf(stderr, "safe-core: project-baseline: %v\n", err)
-		return 3
-	}
-	switch mode {
-	case "write":
+	state, project, name := values["--state-dir"], values["--project"], values["--name"]
+	if mode == "record" {
+		if values["--file"] == "" || values["--out"] != "" || values["--digest"] != "" || latest {
+			return usage()
+		}
 		info, err := os.Lstat(values["--file"])
 		if err != nil || !info.Mode().IsRegular() {
-			return fail(errors.New("the baseline to store is not a regular file"))
+			fmt.Fprintln(stderr, "safe-core: project-baseline: the lockfile to record is not a regular file")
+			return 3
 		}
 		content, err := os.ReadFile(values["--file"])
 		if err != nil {
-			return fail(err)
+			fmt.Fprintf(stderr, "safe-core: project-baseline: %v\n", err)
+			return 3
 		}
-		if err := projectlane.WriteBaseline(state, fd, name, kind, content); err != nil {
-			if errors.Is(err, projectlane.ErrNoIdentity) {
-				fmt.Fprintf(stderr, "safe-core: project-baseline: %v\n", err)
-				return 5
-			}
-			return fail(err)
-		}
-		return 0
-	case "confirm":
-		status, err := projectlane.ConfirmBaseline(state, fd, name)
-		if err != nil {
-			return fail(err)
-		}
-		if status == projectlane.StoredAbsent {
-			return 4
-		}
-		return 0
-	case "drop":
-		if err := projectlane.DropPending(state, fd, name); err != nil {
-			return fail(err)
+		if err := projectlane.RecordBaseline(state, project, name, content, projectlane.BaselineKeep); err != nil {
+			fmt.Fprintf(stderr, "safe-core: project-baseline: %v\n", err)
+			return 3
 		}
 		return 0
 	}
-	content, status, err := projectlane.ReadBaseline(state, fd, name, kind)
+	if values["--out"] == "" || values["--file"] != "" || (latest == (values["--digest"] != "")) {
+		return usage()
+	}
+	var (
+		content []byte
+		found   bool
+		ignored []projectlane.Ignored
+		err     error
+	)
+	if latest {
+		content, found, ignored, err = projectlane.LatestRecorded(state, project, name)
+	} else {
+		content, found, ignored, err = projectlane.ReadRecorded(state, project, name, values["--digest"])
+	}
+	for _, item := range ignored {
+		fmt.Fprintf(stderr, "safe-core: project-baseline: ignored record %s: %s\n", item.Digest, item.Why)
+	}
 	if err != nil {
-		return fail(err)
+		fmt.Fprintf(stderr, "safe-core: project-baseline: %v\n", err)
+		return 2
 	}
-	if status == projectlane.StoredAbsent {
+	if !found {
 		return 4
 	}
 	if err := os.WriteFile(values["--out"], content, 0o600); err != nil {
-		return fail(err)
+		fmt.Fprintf(stderr, "safe-core: project-baseline: %v\n", err)
+		return 3
 	}
 	return 0
 }

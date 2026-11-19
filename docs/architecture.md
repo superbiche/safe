@@ -203,15 +203,16 @@ everything and the undo, all unchanged. The tree root is neither read nor touche
 (`publication.tree` is `old`, `install.ran` false, `verification` null). It exists so
 that a lockfile-only command is bound by exactly the checks a full one is.
 
-**The stored baseline** is kept by `safe-core project-baseline (read | write | confirm | drop)
---project-fd <n> --state-dir <dir> --name <lockfile> [--kind current|pending]`: the project
-is the directory the descriptor holds (the gate's locked one), see
-[configuration](configuration.md) for what a record holds, the identity it is tied to
-(device, inode, birth time) and when it advances. `read` exits 0 (the lockfile is in
-`--out`), 4 (none stored), 3 (a record or the state directory that cannot be trusted); `write`
-exits 0, 3 or 5 (no identity can be established here: nothing can be stored); `confirm`
-renames the pending record over the current one (0, 4 when none is pending, 3); `drop`
-removes the pending one.
+**The recorded baselines** are kept by `safe-core project-baseline record --state-dir <dir>
+--project <canonical dir> --name <lockfile> --file <file>` and `... read (--digest <sha256> |
+--latest) --out <file>`, see [configuration](configuration.md) for the layout, what makes a
+record trusted and the rule of choice. `record` exits 0 or 3 (it cannot be stored); `read` exits
+0 (the trusted lockfile is in `--out`) or 4 (none: nothing recorded, or what is there is not
+trusted: an untrusted record is named on stderr as ignored and is never an error). Two small
+helpers serve the gate: `project-lockfile-admit <lockfile>` (the binder's own lockfile admission
+on a lockfile that has not been judged: exit 0, or 30 with the reason) and `git-tree-entry
+--hash-bytes <20|32> --name <name>` (reads a raw git tree on stdin and prints the entry's RAW
+mode and id).
 
 **The lock** is the caller's: the gate takes `flock(LOCK_EX)` on the project
 directory before it reads anything and keeps it until it exits, so `project-bind`

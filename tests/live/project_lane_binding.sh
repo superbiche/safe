@@ -199,7 +199,7 @@ else
 fi
 
 # --- scenario C: two commands in a row before a commit, on the real npm --------------
-# The second starts from the first's stored result (its lockfile is neither committed
+# The second starts from the lockfile the first judged and recorded (its lockfile is neither committed
 # nor edited by hand), then a lockfile-only command publishes the files, installs no
 # tree and advances the baseline again.
 new_project "${WORK}/c" || { fail "scenario C project"; exit 1; }
@@ -215,11 +215,11 @@ fi
 lock_after_first="$(sha256sum < "${WORK}/c/package-lock.json")"
 gate_c install ms@2.1.3 --ignore-scripts
 status=$?
-if (( status == 0 )) && grep -q 'baseline: the lockfile safe stored after its own last command' "${WORK}/c.err" \
+if (( status == 0 )) && grep -q 'baseline: a lockfile safe judged clear and recorded' "${WORK}/c.err" \
     && ! grep -q 'the lockfile on disk is not the baseline' "${WORK}/c.err" \
     && [[ -d "${WORK}/c/node_modules/ms" && -d "${WORK}/c/node_modules/express" ]] \
     && [[ "$(sha256sum < "${WORK}/c/package-lock.json")" != "${lock_after_first}" ]]; then
-  pass "C2: the second command starts from the first's stored result and installs both"
+  pass "C2: the second command starts from the lockfile the first judged and recorded and installs both"
 else
   fail "C2: exit ${status}; $(tail -n 4 "${WORK}/c.err")"
 fi
@@ -241,7 +241,7 @@ else
 fi
 gate_c install ms@2.1.2 --ignore-scripts
 status=$?
-if (( status == 0 )) && grep -q 'baseline: the lockfile safe stored' "${WORK}/c.err" && [[ "$(jq -r .version "${WORK}/c/node_modules/ms/package.json")" == "2.1.2" ]]; then
+if (( status == 0 )) && grep -q 'baseline: a lockfile safe judged clear and recorded' "${WORK}/c.err" && [[ "$(jq -r .version "${WORK}/c/node_modules/ms/package.json")" == "2.1.2" ]]; then
   pass "C5: the next command starts from the lockfile-only result"
 else
   fail "C5: exit ${status}; $(tail -n 4 "${WORK}/c.err")"

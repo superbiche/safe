@@ -7757,9 +7757,6 @@ if [[ "${sub}" == "project-bind" && "${SAFE_CORE_SIGNAL_EARLY:-0}" == "1" ]]; th
 fi
 if [[ "${sub}" == "project-baseline" ]]; then
   case "${tamper}:${2:-}" in
-    confirm-fails:confirm) echo "disk on fire" >&2; exit 3 ;;
-    confirm-kill:confirm) kill -KILL "${PPID}"; exit 137 ;;
-    write-no-identity:write) echo "no identity" >&2; exit 5 ;;
   esac
   exec "${real}" "$@"
 fi
@@ -9813,15 +9810,20 @@ case_project_lane_the_update_notifier_is_forced_off_and_a_nul_platform_refuses()
 
 # Where safe keeps its record of the last judged lockfile of a project, and what it holds.
 lane_baseline_records() {
-  compgen -G "${HOME_DIR}/.local/share/safe/project-lane/state/project-baseline/*/package-lock.json.json" || true
+  compgen -G "${HOME_DIR}/.local/share/safe/project-lane/state/project-baseline/*/package-lock.json/*" || true
 }
 
-lane_stored_digest() { # the sha256 of the lockfile the stored record carries, "none" without one
-  local record
-  record="$(lane_baseline_records | head -n 1)"
-  [[ -n "${record}" ]] || { printf 'none'; return 0; }
-  jq -r '.lockfile_base64' "${record}" | base64 -d | sha256sum | cut -d' ' -f1
+lane_stored_digest() { # the digest of the most recently written record, "none" without one
+  local newest
+  newest="$(lane_baseline_records | xargs -r ls -t 2>/dev/null | head -n 1)"
+  [[ -n "${newest}" ]] || { printf 'none'; return 0; }
+  basename -- "${newest}"
 }
+
+lane_record_count() { lane_baseline_records | wc -l; }
+
+# the digest a lockfile is recorded under
+lane_digest_of() { sha256sum < "$1" | cut -d' ' -f1; }
 
 LANE_TWO_DEPS_MANIFEST='{"name":"lane-test","version":"1.0.0","dependencies":{"kept":"^1.0.0","clean":"^2.0.0","other":"^1.0.0"}}'
 
@@ -9904,7 +9906,7 @@ case_project_lane_baseline_two_commands_in_a_row_the_second_starts_from_the_firs
   NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" \
     SAFE_AUDIT_EVIDENCE_HITS="{\"clean@2.0.0\":${LANE_HIT_CRITICAL}}" lane_run 'npm install other@1.0.0'
   assert_status 0 "$FUNCNAME" || return
-  assert_err_contains_fragment 'baseline: the lockfile safe stored after its own last command' "$FUNCNAME" || return
+  assert_err_contains_fragment 'baseline: a lockfile safe judged clear and recorded' "$FUNCNAME" || return
   assert_err_not_contains_fragment 'the lockfile on disk is not the baseline' "$FUNCNAME" || return
   assert_err_contains_fragment '1 already present (highest: critical)' "$FUNCNAME" || return
   assert_err_contains_fragment '1 packages added' "$FUNCNAME" || return
@@ -9969,17 +9971,18 @@ case_project_lane_baseline_a_project_outside_git_starts_empty_then_from_what_saf
   NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" \
     SAFE_AUDIT_EVIDENCE_HITS="{\"kept@1.0.0\":${LANE_HIT_CRITICAL}}" lane_run 'npm install other@1.0.0'
   assert_status 0 "$FUNCNAME" || return
-  assert_err_contains_fragment 'baseline: the lockfile safe stored' "$FUNCNAME" || return
+  assert_err_contains_fragment 'baseline: a lockfile safe judged clear and recorded' "$FUNCNAME" || return
   assert_err_contains_fragment '1 already present (highest: critical)' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
-case_project_lane_baseline_the_stored_baseline_does_not_advance_without_a_verified_publication() {
+case_project_lane_baseline_nothing_is_recorded_unless_the_decision_is_clear() {
   skip_lockdiff_case "$FUNCNAME" || return
   lane_prepare "lane-baseline-advance" kept@1.0.0
   lane_first_command "$FUNCNAME" || return
-  local stored label before want
+  local stored label before want records
   stored="$(lane_stored_digest)"
+  records="$(lane_record_count)"
   before="$(lane_digests)"
   for label in refusal failed-materialisation tree-mismatch dry-run missing-evidence package-lock-only-refusal; do
     : > "${LOG_FILE}"
@@ -10011,50 +10014,18 @@ case_project_lane_baseline_the_stored_baseline_does_not_advance_without_a_verifi
       dry-run) want=0 ;;
     esac
     assert_status "${want}" "$FUNCNAME: ${label}" || return
-    [[ "$(lane_stored_digest)" == "${stored}" ]] || { fail "$FUNCNAME: ${label} advanced the stored baseline"; return; }
+    # A refusal, a dry run and missing evidence record nothing: the decision was not clear, or
+    # nothing was to be written. A lockfile judged clear IS recorded before the binder runs; when
+    # the materialisation then fails the record is harmless (see the case that follows).
+    case "${label}" in
+      failed-materialisation|tree-mismatch) ;;
+      *) [[ "$(lane_stored_digest)" == "${stored}" && "$(lane_record_count)" == "${records}" ]] || { fail "$FUNCNAME: ${label} recorded something"; return; } ;;
+    esac
     [[ "$(lane_digests)" == "${before}" ]] || { fail "$FUNCNAME: ${label} changed the project's files"; return; }
+    stored="$(lane_stored_digest)"
+    records="$(lane_record_count)"
     assert_lane_no_leftover "$FUNCNAME: ${label}" || return
   done
-  pass "$FUNCNAME"
-}
-
-case_project_lane_baseline_a_tampered_stored_baseline_is_refused_as_unreadable() {
-  skip_lockdiff_case "$FUNCNAME" || return
-  lane_prepare "lane-baseline-tampered" kept@1.0.0
-  lane_first_command "$FUNCNAME" || return
-  local record before how
-  record="$(lane_baseline_records | head -n 1)"
-  [[ -n "${record}" ]] || { fail "$FUNCNAME: no record"; return; }
-  cp -- "${record}" "${CASE_DIR}/record.good"
-  # an edit of the disk lockfile makes the stored baseline matter
-  lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0 > "${WORK_DIR}/package-lock.json"
-  before="$(lane_digests)"
-  for how in digest content garbage link loose-mode; do
-    cp -- "${CASE_DIR}/record.good" "${record}"
-    chmod 600 "${record}"
-    case "${how}" in
-      digest) sed -i 's/"digest":"sha256:/"digest":"sha256:0/' "${record}" ;;
-      content) sed -i 's/"lockfile_base64":"/"lockfile_base64":"e30=/' "${record}" ;;
-      garbage) printf 'not a record' > "${record}" ;;
-      link) rm -f "${record}"; ln -s "${CASE_DIR}/record.good" "${record}" ;;
-      loose-mode) chmod 644 "${record}" ;;
-    esac
-    : > "${LOG_FILE}"
-    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" lane_run 'npm install other@1.0.0'
-    assert_status 102 "$FUNCNAME: ${how}" || return
-    assert_lane_final_line install "$FUNCNAME: ${how}" || return
-    assert_err_contains_fragment 'the baseline safe stored for this project cannot be trusted' "$FUNCNAME: ${how}" || return
-    assert_log_not_contains_fragment 'EVIDENCE_INPUT' "$FUNCNAME: ${how}" || return
-    [[ "$(lane_digests)" == "${before}" ]] || { fail "$FUNCNAME: ${how}: the project changed"; return; }
-    rm -f "${record}"
-  done
-  # a stored record that nothing needs is not read: a lockfile equal to the committed one
-  git -C "${WORK_DIR}" checkout -q -- package-lock.json
-  printf 'not a record' > "${record}"
-  chmod 600 "${record}"
-  : > "${LOG_FILE}"
-  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run 'npm install clean@2.0.0'
-  assert_status 0 "$FUNCNAME: a committed lockfile does not need the stored one" || return
   pass "$FUNCNAME"
 }
 
@@ -10096,7 +10067,7 @@ case_project_lane_package_lock_only_publishes_the_judged_files_and_installs_noth
   : > "${LOG_FILE}"
   NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" lane_run 'npm install other@1.0.0'
   assert_status 0 "$FUNCNAME" || return
-  assert_err_contains_fragment 'baseline: the lockfile safe stored' "$FUNCNAME" || return
+  assert_err_contains_fragment 'baseline: a lockfile safe judged clear and recorded' "$FUNCNAME" || return
   # a dry run beside it writes nothing
   lane_prepare "lane-lock-only-dry" kept@1.0.0
   local before
@@ -10110,40 +10081,6 @@ case_project_lane_package_lock_only_publishes_the_judged_files_and_installs_noth
 
 
 # ---- review of the baseline (ticket 1632, second pass) ---------------------------------
-
-lane_pending_records() {
-  compgen -G "${HOME_DIR}/.local/share/safe/project-lane/state/project-baseline/*/package-lock.json.pending.json" || true
-}
-
-# 1. The record belongs to the directory the lane holds locked.
-case_project_lane_baseline_a_record_of_another_incarnation_of_the_directory_is_unreadable() {
-  skip_lockdiff_case "$FUNCNAME" || return
-  lane_prepare "lane-baseline-incarnation" kept@1.0.0
-  lane_first_command "$FUNCNAME" || return
-  # the checkout is replaced at the same path: a new directory, the same files
-  cp -a "${WORK_DIR}" "${CASE_DIR}/keep" || { fail "$FUNCNAME: copy"; return; }
-  rm -rf "${WORK_DIR}"
-  cp -a "${CASE_DIR}/keep" "${WORK_DIR}" || { fail "$FUNCNAME: copy back"; return; }
-  # a hand edit makes the stored baseline matter
-  lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0 > "${WORK_DIR}/package-lock.json"
-  local before
-  before="$(lane_digests)"
-  : > "${LOG_FILE}"
-  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" lane_run 'npm install other@1.0.0'
-  assert_status 102 "$FUNCNAME" || return
-  assert_lane_final_line install "$FUNCNAME" || return
-  assert_err_contains_fragment 'the baseline safe stored for this project cannot be trusted' "$FUNCNAME" || return
-  assert_err_contains_fragment 'another incarnation of this project directory' "$FUNCNAME" || return
-  assert_err_contains_fragment 'remove this project' "$FUNCNAME" || return
-  assert_log_not_contains_fragment 'EVIDENCE_INPUT' "$FUNCNAME" || return
-  [[ "$(lane_digests)" == "${before}" ]] || { fail "$FUNCNAME: the project changed"; return; }
-  # a lockfile equal to the committed one needs no stored record: the command goes on
-  git -C "${WORK_DIR}" checkout -q -- package-lock.json
-  : > "${LOG_FILE}"
-  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run 'npm install clean@2.0.0'
-  assert_status 0 "$FUNCNAME" || return
-  pass "$FUNCNAME"
-}
 
 # 2. Every lockfile on disk is admitted before npm uses it.
 case_project_lane_baseline_a_hand_edited_lockfile_is_admitted_before_the_projection() {
@@ -10161,7 +10098,7 @@ case_project_lane_baseline_a_hand_edited_lockfile_is_admitted_before_the_project
     : > "${LOG_FILE}"
     NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
     lane_unsupported_case "$FUNCNAME" install "${how}" || return
-    assert_err_contains_fragment 'the lockfile on disk with' "$FUNCNAME: ${how}" || return
+    assert_err_contains_fragment 'the lockfile on disk' "$FUNCNAME: ${how}" || return
     assert_log_not_contains_fragment 'PROJECTION' "$FUNCNAME: ${how}" || return
     assert_lane_untouched "${before}" "$FUNCNAME: ${how}" || return
   done
@@ -10222,7 +10159,7 @@ case_project_lane_baseline_the_committed_lockfile_is_read_with_three_outcomes() 
   : > "${LOG_FILE}"
   NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" lane_run 'npm install other@1.0.0'
   assert_status 0 "$FUNCNAME: unborn branch" || return
-  assert_err_contains_fragment 'baseline: the lockfile safe stored' "$FUNCNAME: unborn branch" || return
+  assert_err_contains_fragment 'baseline: a lockfile safe judged clear and recorded' "$FUNCNAME: unborn branch" || return
   # present, in a subdirectory of the repository
   lane_prepare "lane-committed-subdir" kept@1.0.0
   mkdir -p "${WORK_DIR}/pkg"
@@ -10262,123 +10199,6 @@ case_project_lane_baseline_a_private_name_only_the_baseline_carries_never_reache
   pass "$FUNCNAME"
 }
 
-# 5. The record follows the publication in two steps.
-case_project_lane_baseline_the_record_follows_the_publication_in_two_steps() {
-  skip_lockdiff_case "$FUNCNAME" || return
-  # outside git there is only the stored baseline: the case of the review
-  lane_prepare "lane-two-steps" kept@1.0.0 vuln@1.0.0
-  rm -rf "${WORK_DIR}/.git"
-  # the stored baseline holds kept and vuln (which carries a critical advisory, present from the start)
-  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 vuln@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" \
-    SAFE_AUDIT_EVIDENCE_HITS="{\"vuln@1.0.0\":${LANE_HIT_CRITICAL}}" lane_run 'npm install clean@2.0.0'
-  # (no baseline at all yet: the whole graph is introduced, so a critical refuses; accept it with no advisory)
-  assert_status 104 "$FUNCNAME: the first command meets a critical with no baseline" || return
-  : > "${LOG_FILE}"
-  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 vuln@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run 'npm install clean@2.0.0'
-  assert_status 0 "$FUNCNAME: the first command" || return
-  local stored
-  stored="$(lane_stored_digest)"
-  [[ -z "$(lane_pending_records)" && "${stored}" != none ]] || { fail "$FUNCNAME: a settled record is expected"; return; }
-  # a command drops vuln, and its confirmation fails: the files are published and the command succeeds; the pending record stays
-  : > "${LOG_FILE}"
-  SAFE_CORE_TAMPER=confirm-fails NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" \
-    lane_run 'npm install other@1.0.0'
-  assert_status 0 "$FUNCNAME: a failed confirmation" || return
-  assert_err_contains_fragment 'BASELINE NOT CONFIRMED' "$FUNCNAME" || return
-  assert_err_contains_fragment 'the judged files were published and the tree installed' "$FUNCNAME" || return
-  assert_err_not_contains_fragment 'safe: BLOCKED' "$FUNCNAME" || return
-  [[ "$(sha256sum < "${WORK_DIR}/package-lock.json" | cut -d' ' -f1)" == "$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0 | sha256sum | cut -d' ' -f1)" ]] || { fail "$FUNCNAME: the files were not published"; return; }
-  [[ "$(lane_stored_digest)" == "${stored}" && -n "$(lane_pending_records)" ]] || { fail "$FUNCNAME: the pending record must stay, the current one be untouched"; return; }
-  # the next command settles it, then judges: reintroducing vuln is INTRODUCED, not already present
-  : > "${LOG_FILE}"
-  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0 vuln@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" \
-    SAFE_AUDIT_EVIDENCE_HITS="{\"vuln@1.0.0\":${LANE_HIT_CRITICAL}}" lane_run 'npm install vuln@1.0.0'
-  assert_status 104 "$FUNCNAME: the reintroduction" || return
-  assert_err_contains_fragment 'baseline: the lockfile safe stored' "$FUNCNAME" || return
-  [[ -z "$(lane_pending_records)" ]] || { fail "$FUNCNAME: the pending record was not settled"; return; }
-  pass "$FUNCNAME"
-}
-
-case_project_lane_baseline_a_kill_between_publication_and_confirmation_is_settled_by_the_next_run() {
-  skip_lockdiff_case "$FUNCNAME" || return
-  lane_prepare "lane-kill-confirm" kept@1.0.0
-  rm -rf "${WORK_DIR}/.git"
-  lane_first_command "$FUNCNAME" || return
-  : > "${LOG_FILE}"
-  SAFE_CORE_TAMPER=confirm-kill NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" \
-    lane_run 'npm install other@1.0.0'
-  [[ "${STATUS}" != 0 ]] || { fail "$FUNCNAME: the killed command reported success"; return; }
-  [[ -n "$(lane_pending_records)" && -d "${WORK_DIR}/node_modules/other" ]] || { fail "$FUNCNAME: expected a published tree and a pending record"; return; }
-  sleep 1 # the killed command's descendants release the project's lock
-  : > "${LOG_FILE}"
-  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" lane_run 'npm install other@1.0.0 --dry-run'
-  assert_status 0 "$FUNCNAME: the next run" || return
-  assert_err_contains_fragment 'baseline: the lockfile safe stored' "$FUNCNAME" || return
-  assert_err_not_contains_fragment 'the lockfile on disk is not the baseline' "$FUNCNAME" || return
-  [[ -z "$(lane_pending_records)" && "$(lane_stored_digest)" == "$(sha256sum < "${WORK_DIR}/package-lock.json" | cut -d' ' -f1)" ]] || { fail "$FUNCNAME: not confirmed"; return; }
-  pass "$FUNCNAME"
-}
-
-case_project_lane_baseline_a_publication_that_did_not_commit_leaves_a_pending_record_the_next_run_drops() {
-  skip_lockdiff_case "$FUNCNAME" || return
-  lane_prepare "lane-pending-dropped" kept@1.0.0
-  lane_first_command "$FUNCNAME" || return
-  local stored
-  stored="$(lane_stored_digest)"
-  NPM_CI_STATUS=7 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" \
-    lane_run 'npm install other@1.0.0'
-  assert_status 7 "$FUNCNAME" || return
-  [[ -n "$(lane_pending_records)" && "$(lane_stored_digest)" == "${stored}" ]] || { fail "$FUNCNAME: expected a pending record and the current one untouched"; return; }
-  : > "${LOG_FILE}"
-  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" lane_run 'npm install other@1.0.0'
-  assert_status 0 "$FUNCNAME: the next command" || return
-  [[ -z "$(lane_pending_records)" ]] || { fail "$FUNCNAME: the pending record was not dropped"; return; }
-  [[ "$(lane_stored_digest)" == "$(sha256sum < "${WORK_DIR}/package-lock.json" | cut -d' ' -f1)" ]] || { fail "$FUNCNAME: not advanced by the new command"; return; }
-  pass "$FUNCNAME"
-}
-
-case_project_lane_baseline_a_pending_record_the_lockfile_does_not_explain_is_missing_evidence() {
-  skip_lockdiff_case "$FUNCNAME" || return
-  lane_prepare "lane-pending-unexplained" kept@1.0.0
-  rm -rf "${WORK_DIR}/.git"
-  lane_first_command "$FUNCNAME" || return
-  SAFE_CORE_TAMPER=confirm-fails NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" \
-    lane_run 'npm install other@1.0.0'
-  assert_status 0 "$FUNCNAME" || return
-  # the lockfile on disk is now neither the pending one nor the previous baseline
-  lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0 extra@1.0.0 > "${WORK_DIR}/package-lock.json"
-  local before
-  before="$(lane_digests)"
-  : > "${LOG_FILE}"
-  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0 extra@1.0.0)" lane_run 'npm install other@1.0.0'
-  assert_status 102 "$FUNCNAME: unexplained" || return
-  assert_lane_final_line install "$FUNCNAME" || return
-  assert_err_contains_fragment "an earlier command's baseline update is unsettled" "$FUNCNAME" || return
-  assert_err_contains_fragment 'restore the lockfile' "$FUNCNAME" || return
-  assert_log_not_contains_fragment 'EVIDENCE_INPUT' "$FUNCNAME" || return
-  [[ "$(lane_digests)" == "${before}" ]] || { fail "$FUNCNAME: the project changed"; return; }
-  # an unreadable pending record is the same
-  local pending
-  pending="$(lane_pending_records | head -n 1)"
-  printf 'not a record' > "${pending}"
-  chmod 600 "${pending}"
-  : > "${LOG_FILE}"
-  lane_run 'npm install other@1.0.0'
-  assert_status 102 "$FUNCNAME: unreadable pending" || return
-  assert_err_contains_fragment 'the pending baseline update of this project cannot be trusted' "$FUNCNAME" || return
-  pass "$FUNCNAME"
-}
-
-case_project_lane_baseline_where_no_identity_can_be_established_nothing_is_stored() {
-  skip_lockdiff_case "$FUNCNAME" || return
-  lane_prepare "lane-no-identity" kept@1.0.0
-  SAFE_CORE_TAMPER=write-no-identity NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run 'npm install clean@2.0.0'
-  assert_status 0 "$FUNCNAME" || return
-  assert_err_contains_fragment 'no baseline can be stored for this project on this filesystem' "$FUNCNAME" || return
-  [[ -d "${WORK_DIR}/node_modules/clean" && -z "$(lane_pending_records)" && "$(lane_stored_digest)" == none ]] || { fail "$FUNCNAME: nothing should be stored"; return; }
-  pass "$FUNCNAME"
-}
-
 # 6. The workspace refusal does not depend on git.
 case_project_lane_a_member_of_a_workspace_that_is_not_a_repository_refuses() {
   skip_lockdiff_case "$FUNCNAME" || return
@@ -10399,41 +10219,6 @@ case_project_lane_a_member_of_a_workspace_that_is_not_a_repository_refuses() {
   pass "$FUNCNAME"
 }
 
-# 8. The strict reader of the record.
-case_project_lane_baseline_a_malformed_record_is_unreadable_never_none_stored() {
-  skip_lockdiff_case "$FUNCNAME" || return
-  lane_prepare "lane-record-strict" kept@1.0.0
-  lane_first_command "$FUNCNAME" || return
-  local record how before
-  record="$(lane_baseline_records | head -n 1)"
-  cp -- "${record}" "${CASE_DIR}/record.good"
-  lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0 > "${WORK_DIR}/package-lock.json"
-  before="$(lane_digests)"
-  for how in missing-dev missing-ino missing-birth-time second-spelling repeated trailing-content executable-mode null-member; do
-    cp -- "${CASE_DIR}/record.good" "${record}"
-    chmod 600 "${record}"
-    case "${how}" in
-      missing-dev) jq -c 'del(.dev)' "${CASE_DIR}/record.good" > "${record}" ;;
-      missing-ino) jq -c 'del(.ino)' "${CASE_DIR}/record.good" > "${record}" ;;
-      missing-birth-time) jq -c 'del(.btime_sec, .btime_nsec)' "${CASE_DIR}/record.good" > "${record}" ;;
-      second-spelling) sed -i 's/"dev":/"Dev":0,"dev":/' "${record}" ;;
-      repeated) sed -i 's/"ino":/"ino":0,"ino":/' "${record}" ;;
-      trailing-content) printf '{"second":1}\n' >> "${record}" ;;
-      executable-mode) chmod 700 "${record}" ;;
-      null-member) jq -c '.ino = null' "${CASE_DIR}/record.good" > "${record}" ;;
-    esac
-    chmod "$([[ "${how}" == executable-mode ]] && echo 700 || echo 600)" "${record}"
-    : > "${LOG_FILE}"
-    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" lane_run 'npm install other@1.0.0'
-    assert_status 102 "$FUNCNAME: ${how}" || return
-    assert_lane_final_line install "$FUNCNAME: ${how}" || return
-    assert_err_contains_fragment 'the baseline safe stored for this project cannot be trusted' "$FUNCNAME: ${how}" || return
-    assert_log_not_contains_fragment 'EVIDENCE_INPUT' "$FUNCNAME: ${how}" || return
-    [[ "$(lane_digests)" == "${before}" ]] || { fail "$FUNCNAME: ${how}: the project changed"; return; }
-  done
-  pass "$FUNCNAME"
-}
-
 # Smaller points: what a successful publication must show.
 case_project_lane_baseline_a_publication_report_must_be_whole_to_count() {
   skip_lockdiff_case "$FUNCNAME" || return
@@ -10443,7 +10228,292 @@ case_project_lane_baseline_a_publication_report_must_be_whole_to_count() {
     SAFE_CORE_TAMPER="${kind}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run 'npm install clean@2.0.0'
     assert_status 100 "$FUNCNAME: ${kind}" || return
     assert_err_contains_fragment 'project-bind returned no usable result' "$FUNCNAME: ${kind}" || return
-    [[ "$(lane_stored_digest)" == none ]] || { fail "$FUNCNAME: ${kind}: advanced the baseline"; return; }
+  done
+  pass "$FUNCNAME"
+}
+
+
+# ---- the recorded baselines (ticket 1632, closing pass) ------------------------------
+
+case_project_lane_baseline_a_lockfile_restored_by_hand_to_a_judged_one_is_a_baseline() {
+  # A lockfile on disk whose bytes are one safe judged clear is a baseline whenever and however
+  # it came to be there: this is the case of an old commit checked out (the record stands for it).
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-restored" kept@1.0.0
+  lane_first_command "$FUNCNAME" || return
+  cp -- "${WORK_DIR}/package-lock.json" "${CASE_DIR}/judged.json"
+  # a hand edit, then the judged lockfile put back by hand
+  lane_lock kept@1.0.0 clean@2.0.0 junk@1.0.0 > "${WORK_DIR}/package-lock.json"
+  cp -- "${CASE_DIR}/judged.json" "${WORK_DIR}/package-lock.json"
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" \
+    SAFE_AUDIT_EVIDENCE_HITS="{\"clean@2.0.0\":${LANE_HIT_CRITICAL}}" lane_run 'npm install other@1.0.0'
+  assert_status 0 "$FUNCNAME" || return
+  assert_err_contains_fragment 'baseline: a lockfile safe judged clear and recorded' "$FUNCNAME" || return
+  assert_err_contains_fragment '1 already present (highest: critical)' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'the lockfile on disk is not the baseline' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_project_lane_baseline_a_failed_materialisation_leaves_a_record_that_is_harmless() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-record-harmless" kept@1.0.0
+  lane_first_command "$FUNCNAME" || return
+  local first records
+  first="$(lane_stored_digest)"
+  records="$(lane_record_count)"
+  # clear on complete evidence (so recorded) but the installation fails: nothing is published
+  NPM_CI_STATUS=7 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" \
+    lane_run 'npm install other@1.0.0'
+  assert_status 7 "$FUNCNAME" || return
+  [[ "$(lane_record_count)" == "$((records + 1))" && "$(lane_stored_digest)" != "${first}" ]] || { fail "$FUNCNAME: the judged lockfile should be recorded"; return; }
+  [[ "$(lane_digest_of "${WORK_DIR}/package-lock.json")" == "${first}" ]] || { fail "$FUNCNAME: the lockfile on disk changed"; return; }
+  # the next command starts from the lockfile on disk, which is still the previous baseline;
+  # what the failed command would have brought (other@1.0.0, here with a critical advisory) is introduced
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" \
+    SAFE_AUDIT_EVIDENCE_HITS="{\"other@1.0.0\":${LANE_HIT_CRITICAL}}" lane_run 'npm install other@1.0.0'
+  assert_status 104 "$FUNCNAME: the next command" || return
+  assert_err_contains_fragment 'baseline: a lockfile safe judged clear and recorded' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'the lockfile on disk is not the baseline' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_project_lane_baseline_a_lockfile_that_cannot_be_recorded_refuses_before_any_publication() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-record-unwritable" kept@1.0.0
+  local state="${HOME_DIR}/.local/share/safe/project-lane/state" d before
+  for d in "${HOME_DIR}/.local" "${HOME_DIR}/.local/share" "${HOME_DIR}/.local/share/safe" "${HOME_DIR}/.local/share/safe/project-lane" "${state}"; do
+    mkdir -p "${d}" && chmod 700 "${d}"
+  done
+  : > "${state}/project-baseline"   # a file where the record directory must be
+  before="$(lane_digests)"
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run 'npm install clean@2.0.0'
+  assert_status 102 "$FUNCNAME" || return
+  assert_lane_final_line install "$FUNCNAME" || return
+  assert_err_contains_fragment 'the judged lockfile cannot be recorded' "$FUNCNAME" || return
+  assert_err_contains_fragment 'nothing was published' "$FUNCNAME" || return
+  assert_lane_untouched "${before}" "$FUNCNAME" || return
+  assert_log_not_contains_fragment 'CORE_BIND_ARGS' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_project_lane_baseline_a_record_that_cannot_be_trusted_is_ignored_and_more_is_judged() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local how record
+  for how in content truncated empty link loose-mode directory; do
+    lane_prepare "lane-record-ignored-${how}" kept@1.0.0
+    lane_first_command "$FUNCNAME: ${how}" || return
+    record="$(lane_baseline_records | head -n 1)"
+    cp -- "${record}" "${CASE_DIR}/record.good"
+    case "${how}" in
+      content) printf '%s\n' '{"lockfileVersion":3,"packages":{}}' > "${record}" ;;
+      truncated) head -c 40 "${CASE_DIR}/record.good" > "${record}" ;;
+      empty) : > "${record}" ;;
+      link) rm -f "${record}"; ln -s "${CASE_DIR}/record.good" "${record}" ;;
+      loose-mode) chmod 644 "${record}" ;;
+      directory) rm -f "${record}"; mkdir "${record}" ;;
+    esac
+    # the lockfile on disk IS the recorded one, but its record cannot be trusted: it is not a
+    # baseline, so the committed lockfile is, and what the lockfile on disk adds is introduced
+    : > "${LOG_FILE}"
+    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" \
+      SAFE_AUDIT_EVIDENCE_HITS="{\"clean@2.0.0\":${LANE_HIT_CRITICAL}}" lane_run 'npm install other@1.0.0'
+    assert_status 104 "$FUNCNAME: ${how}" || return
+    assert_err_contains_fragment 'baseline: the lockfile committed at the head' "$FUNCNAME: ${how}" || return
+    assert_err_contains_fragment 'ignored record' "$FUNCNAME: ${how}" || return
+    assert_err_contains_fragment 'the lockfile on disk is not the baseline: 1 entries added on disk' "$FUNCNAME: ${how}" || return
+  done
+  # outside git and with nothing to trust: the baseline is empty, the whole graph introduced
+  lane_prepare "lane-record-ignored-nogit" kept@1.0.0
+  rm -rf "${WORK_DIR}/.git"
+  lane_first_command "$FUNCNAME: no git" || return
+  record="$(lane_baseline_records | head -n 1)"
+  printf 'x' > "${record}"
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" \
+    SAFE_AUDIT_EVIDENCE_HITS="{\"kept@1.0.0\":${LANE_HIT_CRITICAL}}" lane_run 'npm install other@1.0.0'
+  assert_status 104 "$FUNCNAME: no git" || return
+  assert_err_contains_fragment 'baseline: empty' "$FUNCNAME: no git" || return
+  assert_err_contains_fragment 'ignored record' "$FUNCNAME: no git" || return
+  pass "$FUNCNAME"
+}
+
+case_project_lane_baseline_without_a_lockfile_on_disk_the_most_recent_record_is_the_baseline() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-latest-record" kept@1.0.0
+  rm -rf "${WORK_DIR}/.git"
+  lane_first_command "$FUNCNAME" || return
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" lane_run 'npm install other@1.0.0'
+  assert_status 0 "$FUNCNAME: the second command" || return
+  local newest
+  newest="$(lane_stored_digest)"
+  [[ "${newest}" == "$(lane_digest_of "${WORK_DIR}/package-lock.json")" ]] || { fail "$FUNCNAME: the newest record is not the last lockfile"; return; }
+  rm -f "${WORK_DIR}/package-lock.json"
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" \
+    SAFE_AUDIT_EVIDENCE_HITS="{\"other@1.0.0\":${LANE_HIT_CRITICAL}}" lane_run 'npm install other@1.0.0'
+  assert_status 0 "$FUNCNAME: the lockfile removed" || return
+  assert_err_contains_fragment 'baseline: a lockfile safe judged clear and recorded' "$FUNCNAME" || return
+  assert_err_contains_fragment '1 already present (highest: critical)' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# Git: the invocation is bound to local reads, the repository is pinned, the mode is the raw one.
+case_project_lane_baseline_a_git_that_may_fetch_is_not_used() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-old-git" kept@1.0.0
+  local real_git
+  real_git="$(command -v git)"
+  mkdir -p "${CASE_DIR}/oldgit"
+  cat > "${CASE_DIR}/oldgit/git" <<OLDGIT
+#!/usr/bin/env bash
+# a git that does not know the no-lazy-fetch switch
+for a in "\$@"; do [[ "\$a" != --no-lazy-fetch ]] || { echo "unknown option: --no-lazy-fetch" >&2; exit 129; }; done
+exec "${real_git}" "\$@"
+OLDGIT
+  chmod +x "${CASE_DIR}/oldgit/git"
+  local before
+  before="$(lane_digests)"
+  SAFE_TEST_PATH_MID="${CASE_DIR}/oldgit" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  unset SAFE_TEST_PATH_MID
+  assert_status 102 "$FUNCNAME" || return
+  assert_lane_final_line install "$FUNCNAME" || return
+  assert_err_contains_fragment 'does not support disabling lazy fetches (git 2.44.0 or newer is required)' "$FUNCNAME" || return
+  assert_lane_untouched "${before}" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_project_lane_baseline_a_damaged_repository_is_not_replaced_by_the_one_around_it() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-pinned-repo" kept@1.0.0
+  # the project is its own repository, inside another one that also commits it
+  local outer="${CASE_DIR}/outer" proj
+  mkdir -p "${outer}"
+  mv "${WORK_DIR}" "${outer}/proj"
+  proj="${outer}/proj"
+  rm -rf "${proj}/.git"
+  (cd "${outer}" && export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null && git init -q -b main && git add -A \
+    && git -c user.name=l -c user.email=l@example.invalid commit -q -m outer) >/dev/null 2>&1
+  (cd "${proj}" && export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null && git init -q -b main && git add -A \
+    && git -c user.name=l -c user.email=l@example.invalid commit -q -m inner) >/dev/null 2>&1
+  rm -f "${proj}/.git/HEAD"      # the inner repository is damaged: git itself would walk up to the outer one
+  WORK_DIR="${proj}"
+  local before
+  before="$(lane_digests)"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 102 "$FUNCNAME" || return
+  assert_lane_final_line install "$FUNCNAME" || return
+  assert_err_contains_fragment 'the committed lockfile cannot be read' "$FUNCNAME" || return
+  assert_err_contains_fragment 'another repository' "$FUNCNAME" || return
+  [[ "$(lane_digests)" == "${before}" ]] || { fail "$FUNCNAME: the project changed"; return; }
+  pass "$FUNCNAME"
+}
+
+lane_commit_with_raw_mode() { # <raw mode> -- commits package-lock.json under a hand-made tree entry of that raw mode
+  local mode="$1" blob tree commit
+  (
+    cd "${WORK_DIR}" || exit 1
+    export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+    blob="$(git hash-object -w package-lock.json)"
+    manifest="$(git hash-object -w package.json)"
+    tree="$( { printf '%s package-lock.json\0' "${mode}"; printf '%s' "${blob}" | xxd -r -p; printf '100644 package.json\0'; printf '%s' "${manifest}" | xxd -r -p; } \
+      | git hash-object -w -t tree --literally --stdin)"
+    commit="$(git -c user.name=l -c user.email=l@example.invalid commit-tree "${tree}" -p HEAD -m rawmode)"
+    git update-ref HEAD "${commit}"
+  ) >/dev/null 2>&1
+}
+
+case_project_lane_baseline_the_committed_lockfile_is_read_with_its_raw_mode() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local mode
+  for mode in 100664 100600 100777 100645; do
+    lane_prepare "lane-raw-mode-${mode}" kept@1.0.0
+    lane_commit_with_raw_mode "${mode}"
+    [[ "$(git -C "${WORK_DIR}" ls-tree HEAD -- package-lock.json | cut -d' ' -f1)" == "$([[ "${mode}" == 100664 || "${mode}" == 100600 || "${mode}" == 100645 ]] && echo 100644 || echo 100755)" ]] || { fail "$FUNCNAME: ${mode}: the fixture is not the intended one"; return; }
+    : > "${LOG_FILE}"
+    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run 'npm install clean@2.0.0'
+    case "${mode}" in
+      100664) assert_status 0 "$FUNCNAME: ${mode}" || return ;; # what git itself writes for a legacy regular file
+      *)
+        assert_status 102 "$FUNCNAME: ${mode}" || return
+        assert_err_contains_fragment "not a regular file in the head commit (raw mode ${mode})" "$FUNCNAME: ${mode}" || return ;;
+    esac
+  done
+  # a reference that git cannot look up is a failed lookup, not an unborn branch
+  lane_prepare "lane-bad-ref" kept@1.0.0
+  printf 'garbage\n' > "${WORK_DIR}/.git/refs/heads/main"
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 102 "$FUNCNAME: a garbage reference" || return
+  assert_err_contains_fragment 'the committed lockfile cannot be read' "$FUNCNAME: a garbage reference" || return
+  pass "$FUNCNAME"
+}
+
+# The lockfile on disk passes the binder's own admission before npm reads it.
+case_project_lane_baseline_every_entry_of_the_lockfile_on_disk_is_admitted_before_the_projection() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local how before
+  for how in outside-key inside-link malformed; do
+    lane_prepare "lane-admit-all-${how}" kept@1.0.0
+    case "${how}" in
+      outside-key) lane_lock kept@1.0.0 | jq -c '.packages["vendor/x"] = {"version":"1.0.0","resolved":"https://registry.npmjs.org/x/-/x-1.0.0.tgz","integrity":"'"$(lane_integrity x)"'"}' > "${WORK_DIR}/package-lock.json" ;;
+      inside-link) lane_lock kept@1.0.0 | jq -c '.packages["packages/l"] = {"name":"l","version":"1.0.0"} | .packages["node_modules/l"] = {"resolved":"packages/l","link":true}' > "${WORK_DIR}/package-lock.json" ;;
+      malformed) printf '{"lockfileVersion":3,"packages":{"":{},"node_modules/kept":{"version":"1.0.0"}},"packages":{}}\n' > "${WORK_DIR}/package-lock.json" ;;
+    esac
+    before="$(lane_digests)"
+    : > "${LOG_FILE}"
+    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+    if [[ "${how}" == malformed ]]; then
+      assert_status 102 "$FUNCNAME: ${how}" || return
+      # a malformed lockfile that differs from the committed one is named for what it is
+      assert_err_contains_fragment 'the lockfile on disk' "$FUNCNAME: ${how}" || return
+      assert_err_not_contains_fragment 'committed lockfile cannot' "$FUNCNAME: ${how}" || return
+    else
+      lane_unsupported_case "$FUNCNAME" install "${how}" || return
+      assert_err_contains_fragment 'the lockfile on disk that the lane cannot admit' "$FUNCNAME: ${how}" || return
+    fi
+    assert_log_not_contains_fragment 'PROJECTION' "$FUNCNAME: ${how}" || return
+    assert_lane_untouched "${before}" "$FUNCNAME: ${how}" || return
+  done
+  pass "$FUNCNAME"
+}
+
+# The privacy of the evidence request: names are compared case-folded for refusing, versions must be exact.
+case_project_lane_baseline_the_evidence_request_never_carries_a_private_name_in_another_spelling_or_a_version_that_is_not_one() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local how before
+  for how in scope-case exact-grant-case bundled-version; do
+    case "${how}" in
+      scope-case) lane_prepare "lane-private-${how}" kept@1.0.0 @P/lib@1.0.0 ;;
+      exact-grant-case) lane_prepare "lane-private-${how}" kept@1.0.0 @Q/Internal-Tool@1.0.0 ;;
+      bundled-version) lane_prepare "lane-private-${how}" kept@1.0.0 ;;
+    esac
+    lane_private_store || { fail "$FUNCNAME: store"; return; }
+    if [[ "${how}" == exact-grant-case ]]; then
+      "${SAFE_CORE_TEST_BIN}" private-trust registry-add --policy "${HOME_DIR}/.config/safe/run/private-registries.json" \
+        --id p-exact --ecosystem npm --origin https://npm.private.example --namespace '@q/internal-tool' >/dev/null || { fail "$FUNCNAME: exact grant"; return; }
+    fi
+    if [[ "${how}" == bundled-version ]]; then
+      # a bundled member of a public package whose version field names something else
+      lane_lock kept@1.0.0 | jq -c '.packages["node_modules/kept/node_modules/inner"] = {"version":"npm:@p/secret@1.0.0","inBundle":true}' > "${WORK_DIR}/package-lock.json"
+      lane_commit
+    fi
+    # the edit drops it from the lockfile on disk: it is on the baseline side of the request only
+    lane_lock kept@1.0.0 > "${WORK_DIR}/package-lock.json"
+    before="$(lane_digests)"
+    : > "${LOG_FILE}"
+    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+    assert_status 100 "$FUNCNAME: ${how}" || return
+    assert_lane_final_line install "$FUNCNAME: ${how}" || return
+    assert_log_not_contains_fragment 'EVIDENCE_INPUT' "$FUNCNAME: ${how}" || return
+    [[ "$(lane_digests)" == "${before}" ]] || { fail "$FUNCNAME: ${how}: the project changed"; return; }
+    if [[ "${how}" == bundled-version ]]; then
+      assert_err_contains_fragment 'whose version is not an exact version' "$FUNCNAME: ${how}" || return
+    else
+      assert_err_contains_fragment 'touches the private-registry store' "$FUNCNAME: ${how}" || return
+    fi
   done
   pass "$FUNCNAME"
 }
@@ -10600,20 +10670,22 @@ main() {
     case_project_lane_baseline_a_dirty_edit_after_a_verified_uncommitted_install_is_judged \
     case_project_lane_baseline_a_fresh_clone_starts_from_its_committed_lockfile \
     case_project_lane_baseline_a_project_outside_git_starts_empty_then_from_what_safe_stored \
-    case_project_lane_baseline_the_stored_baseline_does_not_advance_without_a_verified_publication \
-    case_project_lane_baseline_a_record_of_another_incarnation_of_the_directory_is_unreadable \
+    case_project_lane_baseline_nothing_is_recorded_unless_the_decision_is_clear \
+    case_project_lane_baseline_a_lockfile_restored_by_hand_to_a_judged_one_is_a_baseline \
+    case_project_lane_baseline_a_failed_materialisation_leaves_a_record_that_is_harmless \
+    case_project_lane_baseline_a_lockfile_that_cannot_be_recorded_refuses_before_any_publication \
+    case_project_lane_baseline_a_record_that_cannot_be_trusted_is_ignored_and_more_is_judged \
+    case_project_lane_baseline_without_a_lockfile_on_disk_the_most_recent_record_is_the_baseline \
+    case_project_lane_baseline_a_git_that_may_fetch_is_not_used \
+    case_project_lane_baseline_a_damaged_repository_is_not_replaced_by_the_one_around_it \
+    case_project_lane_baseline_the_committed_lockfile_is_read_with_its_raw_mode \
+    case_project_lane_baseline_every_entry_of_the_lockfile_on_disk_is_admitted_before_the_projection \
+    case_project_lane_baseline_the_evidence_request_never_carries_a_private_name_in_another_spelling_or_a_version_that_is_not_one \
     case_project_lane_baseline_a_hand_edited_lockfile_is_admitted_before_the_projection \
     case_project_lane_baseline_the_committed_lockfile_is_read_with_three_outcomes \
     case_project_lane_baseline_a_private_name_only_the_baseline_carries_never_reaches_the_evidence_request \
-    case_project_lane_baseline_the_record_follows_the_publication_in_two_steps \
-    case_project_lane_baseline_a_kill_between_publication_and_confirmation_is_settled_by_the_next_run \
-    case_project_lane_baseline_a_publication_that_did_not_commit_leaves_a_pending_record_the_next_run_drops \
-    case_project_lane_baseline_a_pending_record_the_lockfile_does_not_explain_is_missing_evidence \
-    case_project_lane_baseline_where_no_identity_can_be_established_nothing_is_stored \
     case_project_lane_a_member_of_a_workspace_that_is_not_a_repository_refuses \
-    case_project_lane_baseline_a_malformed_record_is_unreadable_never_none_stored \
     case_project_lane_baseline_a_publication_report_must_be_whole_to_count \
-    case_project_lane_baseline_a_tampered_stored_baseline_is_refused_as_unreadable \
     case_project_lane_baseline_a_committed_lockfile_that_cannot_be_decoded_is_not_an_empty_baseline \
     case_project_lane_package_lock_only_publishes_the_judged_files_and_installs_nothing \
     case_project_lane_config_selectors_in_the_arguments_refuse_before_any_npm \

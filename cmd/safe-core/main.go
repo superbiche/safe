@@ -52,6 +52,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "project-bind" {
 		return projectBind(args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "project-lockfile-admit" {
+		return projectLockfileAdmit(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "git-tree-entry" {
+		return gitTreeEntry(args[1:], stdin, stdout, stderr)
+	}
 	if len(args) > 0 && args[0] == "project-baseline" {
 		return projectBaseline(args[1:], stdout, stderr)
 	}
@@ -78,6 +84,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, projectDecideUsage)
 		fmt.Fprintln(stderr, projectBindUsage)
 		fmt.Fprintln(stderr, projectBaselineUsage)
+		fmt.Fprintln(stderr, projectLockfileAdmitUsage)
+		fmt.Fprintln(stderr, gitTreeEntryUsage)
 		fmt.Fprintln(stderr, projectTreeUsage)
 		return 2
 	}
