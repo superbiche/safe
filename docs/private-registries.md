@@ -162,6 +162,10 @@ The lane runs before the package manager is delegated to:
 - **npm, explicit specs and `-g`.** The scope mapping check. With the lock-diff
   lane (`dedupe`, `prune`), the projected lockfile entries of the name are
   checked too.
+  With the project lane switched on (`install.project_lane`) a registry that is
+  not the canonical public one, or a package of a scope mapped to another
+  registry, is refused after this check, not judged: the lane does not support
+  private origins yet.
 - **npm projects (`install`, `ci`, `update`, `dedupe`, `prune`).** On a host
   with an npm private registry, two checks run:
   - **Scope mapping (ruling a43).** Every registered scope must map to its

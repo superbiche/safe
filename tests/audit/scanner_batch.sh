@@ -150,6 +150,25 @@ case_clean_tree_returns_empty_array() {
   fi
 }
 
+# blocklist_names belongs to the evidence mode: the plain batch accepts what it
+# always accepted, an unrelated member of that name included.
+case_plain_batch_ignores_an_unrelated_blocklist_names_member() {
+  setup_case plain-extension
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-plain-ext.json"
+  printf '{"results": [{}]}\n' > "$MOCK_BATCH_FIXTURE"
+  local out rc=0 value
+  for value in '"x"' '{"a":1}' '7'; do
+    rc=0
+    out=$(printf '{"packages":[{"name":"left-pad","version":"1.3.0"}],"blocklist_names":%s}' "$value" | run_batch) || rc=$?
+    if [[ "$rc" == "0" && "$(jq -c . <<<"$out")" == "[]" ]]; then
+      pass "plain batch: an unrelated blocklist_names member (${value}) is accepted as before"
+    else
+      printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+      fail "plain batch: an unrelated blocklist_names member (${value}) is accepted as before"
+    fi
+  done
+}
+
 case_malformed_stdin_refuses() {
   setup_case malformed
   local rc=0 err
@@ -1120,6 +1139,40 @@ case_evidence_blocklist_is_independent_of_osv() {
   fi
 }
 
+case_evidence_blocklist_names_and_empty_requests() {
+  setup_case ev-blocklist-names
+  printf '{"packages": {"private-thing": {"reason": "operator blocklist test"}}}\n' > "$RUN_DIR/blocked.json"
+  local out rc=0
+  # A name that is not an advisory identity (a link, a private artifact) is
+  # still checked against the blocklist, and is never sent to OSV.
+  out=$(printf '{"packages":[],"blocklist_names":["private-thing","other"]}' | MOCK_BATCH_STATUS=1 run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e '.blocklist == [{name:"private-thing",reason:"operator blocklist test"}] and .identities == []' <<<"$out" >/dev/null; then
+    pass "evidence: blocklist_names are checked by name and never queried; an empty request is allowed"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: blocklist_names are checked by name and never queried; an empty request is allowed"
+  fi
+  # An empty request still reads the blocklist: an unreadable one fails closed.
+  printf '{"packages": [1]}\n' > "$RUN_DIR/blocked.json"
+  rc=0
+  out=$(printf '{"packages":[]}' | run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "4" && -z "$out" ]]; then
+    pass "evidence: an empty request over an unreadable blocklist yields no document"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: an empty request over an unreadable blocklist yields no document"
+  fi
+  # The plain batch still refuses an empty request.
+  rc=0
+  printf '{"packages":[]}' | run_batch >/dev/null 2>&1 || rc=$?
+  if [[ "$rc" == "2" ]]; then
+    pass "evidence: the plain batch still refuses an empty request"
+  else
+    fail "evidence: the plain batch still refuses an empty request (rc=$rc)"
+  fi
+}
+
 case_evidence_unreadable_blocklist_fails_closed() {
   setup_case ev-blocklist-bad
   printf '{"packages": [1]}\n' > "$RUN_DIR/blocked.json"
@@ -1353,6 +1406,7 @@ case_adapter_rejects_malformed_advisory_elements
 case_adapter_throws_on_missing_binary
 case_adapter_times_out_hung_child
 case_adapter_rejects_partial_request_channel
+case_plain_batch_ignores_an_unrelated_blocklist_names_member
 if (( SC_OK )); then
   case_evidence_clean_tree_is_complete_and_empty
   case_evidence_malformed_stdin_refuses
@@ -1364,6 +1418,7 @@ if (( SC_OK )); then
   case_evidence_pagination_failure_keeps_first_page
   case_evidence_detail_failure_keeps_other_hits
   case_evidence_blocklist_is_independent_of_osv
+  case_evidence_blocklist_names_and_empty_requests
   case_evidence_unreadable_blocklist_fails_closed
   case_evidence_document_is_read_by_the_decision
   case_evidence_duplicate_in_one_result_keeps_its_neighbour
