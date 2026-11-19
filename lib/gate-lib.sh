@@ -3853,7 +3853,7 @@ safe_gate_project_lane_run() {
     rc=0
     admit_text="$("${safe_core}" project-lockfile-admit "${lock_path}" 2>&1)" || rc=$?
     if (( rc == 30 )) && [[ "${admit_text}" == lockfile_unreadable:* ]]; then
-      safe_gate_project_lane_refuse 102 "${verb}" "${lock_text} cannot be read strictly (${admit_text#*: }), so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the lockfile and retry"
+      safe_gate_project_lane_refuse 102 "${verb}" "${lock_text} cannot be decoded (${admit_text#*: }), so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the lockfile and retry"
       return $?
     elif (( rc == 30 )); then
       safe_gate_project_lane_unsupported "${verb}" "${lock_text} that the lane cannot admit (${admit_text})"
