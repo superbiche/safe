@@ -258,7 +258,7 @@ func decodeEntry(raw json.RawMessage) (lockEntry, error) {
 // ParseLockfile reads the lockfile a tree is verified against: exactly one
 // JSON document with exactly named members and no repeated member, version 2
 // or 3. A lockfile with link entries is ErrLinkEntries.
-func parseJudgedLockfile(raw []byte) (*judgedLock, error) {
+func parseJudgedLockfile(raw []byte, anyVersion bool) (*judgedLock, error) {
 	if err := strictjson.RejectConflictMarkers(raw); err != nil {
 		return nil, fmt.Errorf("lockfile: %w", err)
 	}
@@ -269,9 +269,11 @@ func parseJudgedLockfile(raw []byte) (*judgedLock, error) {
 	if err := strictjson.RejectVariants(root, "lockfileVersion", "packages"); err != nil {
 		return nil, fmt.Errorf("lockfile: %w", err)
 	}
-	var version int
-	if err := json.Unmarshal(root["lockfileVersion"], &version); err != nil || (version != 2 && version != 3) {
-		return nil, errors.New("lockfile: lockfileVersion is not 2 or 3")
+	if !anyVersion {
+		var version int
+		if err := json.Unmarshal(root["lockfileVersion"], &version); err != nil || (version != 2 && version != 3) {
+			return nil, errors.New("lockfile: lockfileVersion is not 2 or 3")
+		}
 	}
 	var packages map[string]json.RawMessage
 	if err := json.Unmarshal(root["packages"], &packages); err != nil || packages == nil {
@@ -319,7 +321,7 @@ type AdmitFinding struct{ Reason, Detail string }
 // key inside the tree. A link entry never hides an outside key (or the other way round): a
 // router that refuses on any unsafe reason sees them all.
 func AdmitLockfileFindings(raw []byte) []AdmitFinding {
-	lock, err := parseJudgedLockfile(raw)
+	lock, err := parseJudgedLockfile(raw, true)
 	var findings []AdmitFinding
 	switch {
 	case err != nil && !errors.Is(err, ErrLinkEntries):
@@ -479,7 +481,7 @@ func verifyTree(lockfile []byte, treeParent, treeRoot string, selection Selectio
 	if err := selection.Validate(); err != nil {
 		return TreeReport{}, fmt.Errorf("selection: %w", err)
 	}
-	lock, err := parseJudgedLockfile(lockfile)
+	lock, err := parseJudgedLockfile(lockfile, false)
 	if err != nil {
 		return TreeReport{}, err
 	}

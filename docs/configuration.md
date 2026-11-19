@@ -242,23 +242,26 @@ pass and warnings under `environment.release_follow`.
   **The checks.** The caller's arguments and environment, special files, the admission of the project's
   `.npmrc`, manifest and lockfile (a lockfile with ANY unsafe finding refuses whatever else it holds,
   committed or not: a key outside the tree, a link leaving the project, an identity that cannot stand in a
-  URL; a lockfile that declares version 2 or 3 and has no package map cannot be decoded: 102), the
+  URL; every reason of every entry is reported, a link target is judged on the path it resolves to on the
+  filesystem, and none of this depends on the declared lockfile version; a lockfile that declares version 2
+  or 3 and has no package map cannot be decoded: 102), the
   private-name guard and, when the project's `.npmrc` was admitted, the effective npm configuration, the
   capability and parser probes and the guards of the lane's own invocation. A refusal from any of them ends
   the command. A cause that is only *unsupported* is accumulated with its own text and its own source
   files. **One decision after all of them:** the **one-shot route** is for an *established project shape*
-  only: every file a cause comes from (`package.json`, `package-lock.json`, `.npmrc`, or the tool
-  configuration below) is committed at the head of the project's git work tree and byte for byte what is on
-  disk (the bounded git reader). The causes: a lockfile that is not version 2 or 3, lockfile entries the
+  only: every file a cause comes from (`package.json`, `package-lock.json` or `.npmrc`) is committed at the head of the project's git work tree and byte for byte what is on
+  disk (the bounded git reader). The causes: a *recognised legacy* lockfile (version 1, or no version declared
+  with the legacy dependency map and no package map; any other version is refused), lockfile entries the
   lane cannot bind (a source that is not a registry package, no integrity, another host, an in-project
   link, an entry with its own shrinkwrap), committed dependencies or overrides that are not registry
-  packages, a committed `.npmrc` setting outside the allow-list, and an npm without the capabilities the
-  lane needs **when its selection is established**: the version manager (`mise ls --current --json`) names
-  the file the selected Node comes from, and that file is a committed, unchanged file directly in the
-  project; selected by the operator's global tool configuration, by the environment, by an uncommitted file
-  or when the source cannot be read, it refuses, naming that. Capability metadata that is malformed (a
-  version that is not a semantic version, definitions that are not a map of options) is a failed probe: a
-  refusal. When the project's `.npmrc` was not admitted no npm of the lane reads that project: the decision
+  packages and a committed `.npmrc` setting outside the allow-list. With an admitted `.npmrc` the decision
+  is taken after every configuration probe (effective, parity, frozen, platform selection) has refused
+  nothing. **An npm without the capabilities the lane needs refuses**: what selects a tool version (a
+  lockfile of the version manager, a profile, the environment) cannot be established from the project, so
+  the lane reads none of it; the refusal says the operator can put the project on the one-shot lane (a
+  standing per-project decision, part of the operator-overrides work). Capability metadata that is
+  malformed (a version that is not a semantic version, definitions that are not a map of options) is a
+  failed probe: a refusal. When the project's `.npmrc` was not admitted no npm of the lane reads that project: the decision
   is taken at once and today's gate applies its own checks. The command then goes to today's gate exactly
   as with the switch off, after ONE stderr line `safe: project lane: npm <verb> [lane: one-shot, <reason>]
   — the closure is not judged on this route`; the lane ran in a subshell, so nothing it set, exported or
@@ -268,16 +271,19 @@ pass and warnings under `environment.release_follow`.
   `install` and `ci` and always take the one-shot route, with the reason "its test phase runs project code".
   **Refusals** (`safe: BLOCKED npm <verb> [lane: project] — … ; details: safe explain`, one final line
   naming the cause and the way out; none suggests turning the lane off): a command-line or environment
-  setting; an npm configuration the lane cannot carry; a failed guard; the same shapes when one of the
+  setting (the environment variables `PREFIX` and `DESTDIR`, which select where npm's configuration loader
+  reads its files from, refuse by name before the environment is replaced); an npm configuration the lane
+  cannot carry, global mode set by configuration included; a failed guard; the same shapes when one of the
   files they come from exists only in uncommitted changes (mixed causes included) or the project is not in
   a git work tree; an unsupported option; a workspace; a launcher the lane cannot follow; a failed probe;
   and `npm ci`, `npm dedupe` and `npm prune`, which the lane does not route yet (that refusal comes before
-  any property of the host is read). **Unchanged**: a command npm's own effective configuration says is
-  global (decided from the operator's layers, and only once the project's `.npmrc` has been admitted as
-  text, so a project cannot set it), `npm exec`, `npm uninstall`, every other verb and every other manager.
+  any property of the host is read). **Unchanged**: a global command, which is only a command whose
+  arguments say so in the plain form (`-g` or `--global`, with no value; no npm run decides the route, and
+  any other spelling that selects or negates global mode, `--global=…`, a separate boolean value,
+  `--no-global`, `--location…`, refuses with the plain form as the way out), `npm exec`, `npm uninstall`, every other verb and every other manager.
   **`mise exec -- npm <lane command>` refuses**, with the lane's line and the way out: mise would run the
   original command after an audit that binds nothing; run npm in the project directory instead (the mise
-  shims select the same tools). A command that npm's effective setting calls global, an inner command that
+  shims select the same tools). A plain-form global command, an inner command that
   is not a lane command (`npm view`, `npm install-test`, `npm uninstall`) and every other tool mise wraps
   behave exactly as without the lane. Whether the lane should own `mise exec` is the operator's decision
   and its own ticket.
@@ -405,9 +411,7 @@ pass and warnings under `environment.release_follow`.
   project controls is read as configuration before the project is admitted: the
   caller's own arguments may not select a configuration file or a destination
   (`--userconfig`, `--globalconfig`, `--prefix`, `-C`, `--cache`, `--logs-dir`,
-  refused at the shell before any npm runs), and the probe that decides whether the
-  command is global or local is given only the flags that decide that, with the
-  operator's own configuration sources kept. The operator-level destinations found
+  refused at the shell before any npm runs); the route is decided from the arguments alone, with no npm probe. The operator-level destinations found
   in the environment (`npm_config_cache`, logs, prefix, user and global
   configuration, in either case) are read the way npm reads a path setting
   (trimmed, nothing else interpolated): one that is not a plain absolute path

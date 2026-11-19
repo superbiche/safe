@@ -2,7 +2,10 @@ package projectlane
 
 import (
 	"encoding/base64"
+	"fmt"
+	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -68,13 +71,13 @@ func CheckBindable(graph Graph, registryHosts []string) Bindability {
 
 	byPath := indexByPath(graph)
 
-	memo := map[string]string{}
-	var reason func(Occurrence, int) string
-	reason = func(occurrence Occurrence, depth int) string {
+	memo := map[string][]string{}
+	var reasons func(Occurrence, int) []string
+	reasons = func(occurrence Occurrence, depth int) []string {
 		if cached, ok := memo[occurrence.Path]; ok {
 			return cached
 		}
-		result := ""
+		var result []string
 		switch {
 		case occurrence.covered():
 			// A bundled entry with no location of its own rides inside the
@@ -82,22 +85,29 @@ func CheckBindable(graph Graph, registryHosts []string) Bindability {
 			// covers it only when that covering artifact is a registry
 			// artifact safe has itself bound. A flag, a link or a chain of
 			// flags proves nothing: npm fetches a child it does not find in
-			// the bundle from the registry, by name and version.
-			result = ReasonParentUnbound
+			// the bundle from the registry, by name and version. Every reason
+			// that holds is reported, not the first: an invalid identity is
+			// not hidden by a shrinkwrap marker.
 			if !validPackageName(occurrence.Name) {
-				result = ReasonIdentityInvalid
-			} else if occurrence.Shrinkwrap {
-				result = ReasonOwnShrinkwrap
-			} else if root, ok := coveringRoot(graph.Occurrences, byPath, occurrence.Path); ok && depth <= 64 {
+				result = append(result, ReasonIdentityInvalid)
+			}
+			if occurrence.Shrinkwrap {
+				result = append(result, ReasonOwnShrinkwrap)
+			}
+			parentBound := false
+			if root, ok := coveringRoot(graph.Occurrences, byPath, occurrence.Path); ok && depth <= 64 {
 				cover := graph.Occurrences[root]
-				if cover.Kind == KindRegistry && reason(cover, depth+1) == "" {
-					result = ""
+				if cover.Kind == KindRegistry && len(reasons(cover, depth+1)) == 0 {
+					parentBound = true
 				}
+			}
+			if !parentBound {
+				result = append(result, ReasonParentUnbound)
 			}
 		default:
 			// Everything else, a bundled entry that names a location of its own
 			// included, is bound on its own evidence.
-			result = bindReason(occurrence, expected)
+			result = bindReasons(occurrence, expected)
 		}
 		memo[occurrence.Path] = result
 		return result
@@ -105,7 +115,7 @@ func CheckBindable(graph Graph, registryHosts []string) Bindability {
 
 	out := Bindability{Bound: true, Unbound: []Unbound{}}
 	for _, occurrence := range graph.Occurrences {
-		if why := reason(occurrence, 0); why != "" {
+		for _, why := range reasons(occurrence, 0) {
 			out.Bound = false
 			out.Unbound = append(out.Unbound, Unbound{
 				Path: occurrence.Path, Name: occurrence.Name, Version: occurrence.Version,
@@ -113,7 +123,7 @@ func CheckBindable(graph Graph, registryHosts []string) Bindability {
 			})
 		}
 	}
-	sort.Slice(out.Unbound, func(i, j int) bool { return out.Unbound[i].Path < out.Unbound[j].Path })
+	sort.SliceStable(out.Unbound, func(i, j int) bool { return out.Unbound[i].Path < out.Unbound[j].Path })
 	return out
 }
 
@@ -125,36 +135,38 @@ func indexByPath(graph Graph) map[string]int {
 	return byPath
 }
 
-func bindReason(occurrence Occurrence, expected map[string]struct{}) string {
+// bindReasons is EVERY reason an occurrence cannot be bound, in a stable order: what makes one
+// unsafe to read (an identity that cannot stand in a URL, a link that leaves the project) is
+// never hidden by a reason that only makes it unsupported.
+func bindReasons(occurrence Occurrence, expected map[string]struct{}) []string {
+	var out []string
 	switch occurrence.Kind {
 	case KindLink, KindLocal:
 		if !linkInsideProject(occurrence.Origin) {
-			return ReasonLinkOutsideProject
+			out = append(out, ReasonLinkOutsideProject)
 		}
-		return ""
+		return out
 	case KindRegistry:
 	default:
-		return ReasonKindNotAdmitted
-	}
-	if occurrence.Shrinkwrap {
-		return ReasonOwnShrinkwrap
-	}
-	if occurrence.Integrity == "" {
-		return ReasonIntegrityMissing
-	}
-	if !validIntegrity(occurrence.Integrity) {
-		return ReasonIntegrityMalformed
-	}
-	if occurrence.descriptor == "" {
-		return ReasonOriginMissing
+		return []string{ReasonKindNotAdmitted}
 	}
 	if !validPackageName(occurrence.Name) || !validVersion(occurrence.Version) {
-		return ReasonIdentityInvalid
+		out = append(out, ReasonIdentityInvalid)
 	}
-	if !canonicalTarball(occurrence.descriptor, occurrence.Name, occurrence.Version, expected) {
-		return ReasonOriginNotCanonical
+	if occurrence.Shrinkwrap {
+		out = append(out, ReasonOwnShrinkwrap)
 	}
-	return ""
+	if occurrence.Integrity == "" {
+		out = append(out, ReasonIntegrityMissing)
+	} else if !validIntegrity(occurrence.Integrity) {
+		out = append(out, ReasonIntegrityMalformed)
+	}
+	if occurrence.descriptor == "" {
+		out = append(out, ReasonOriginMissing)
+	} else if (validPackageName(occurrence.Name) && validVersion(occurrence.Version)) && !canonicalTarball(occurrence.descriptor, occurrence.Name, occurrence.Version, expected) {
+		out = append(out, ReasonOriginNotCanonical)
+	}
+	return out
 }
 
 // bundledParentPath names the entry whose tarball carries a bundled entry:
@@ -256,4 +268,62 @@ func canonicalTarball(resolved, name, version string, expected map[string]struct
 		unscoped = name[i+1:]
 	}
 	return path == name+"/-/"+unscoped+"-"+version+".tgz"
+}
+
+// CheckLinksInRoot adds to a verdict the links whose target, resolved on the filesystem under the
+// project directory, leaves it: the text of a target can look inside the project and still
+// reach, through a link of the filesystem, a directory outside it. A target that does not exist
+// yet is resolved through its longest existing prefix. An error means the project directory
+// itself cannot be resolved.
+func CheckLinksInRoot(graph Graph, verdict Bindability, root string) (Bindability, error) {
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return verdict, fmt.Errorf("the project directory cannot be resolved: %w", err)
+	}
+	realRoot = filepath.Clean(realRoot)
+	already := map[string]bool{}
+	for _, unbound := range verdict.Unbound {
+		if unbound.Reason == ReasonLinkOutsideProject {
+			already[unbound.Path] = true
+		}
+	}
+	for _, occurrence := range graph.Occurrences {
+		if (occurrence.Kind != KindLink && occurrence.Kind != KindLocal) || already[occurrence.Path] || !linkInsideProject(occurrence.Origin) {
+			continue
+		}
+		if physicallyInside(realRoot, occurrence.Origin) {
+			continue
+		}
+		verdict.Bound = false
+		verdict.Unbound = append(verdict.Unbound, Unbound{
+			Path: occurrence.Path, Name: occurrence.Name, Version: occurrence.Version,
+			Origin: occurrence.Origin, Reason: ReasonLinkOutsideProject,
+		})
+	}
+	sort.SliceStable(verdict.Unbound, func(i, j int) bool { return verdict.Unbound[i].Path < verdict.Unbound[j].Path })
+	return verdict, nil
+}
+
+// physicallyInside resolves a relative target under the resolved project directory, following
+// every link of the filesystem on the way, and reports whether it stays inside.
+func physicallyInside(realRoot, target string) bool {
+	full := filepath.Join(realRoot, filepath.FromSlash(target))
+	existing, rest := full, ""
+	for {
+		if _, err := os.Lstat(existing); err == nil {
+			break
+		}
+		parent := filepath.Dir(existing)
+		if parent == existing {
+			return false
+		}
+		rest = filepath.Join(filepath.Base(existing), rest)
+		existing = parent
+	}
+	resolved, err := filepath.EvalSymlinks(existing)
+	if err != nil {
+		return false
+	}
+	resolved = filepath.Clean(filepath.Join(resolved, rest))
+	return resolved == realRoot || strings.HasPrefix(resolved, realRoot+string(filepath.Separator))
 }

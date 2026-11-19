@@ -316,3 +316,32 @@ func TestProjectLaneTakesBindingAndPublicEvidenceHostsApart(t *testing.T) {
 		t.Fatalf("both: code = %d, stdout = %s", code, stdout)
 	}
 }
+
+// project-graph --project-root judges a link on the path it resolves to; --any-version reads a package
+// map whatever version the lockfile declares; without them a version 1 lockfile is unreadable (exit 3).
+func TestProjectGraphResolvesLinksAndReadsAnyVersion(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "project")
+	if err := os.MkdirAll(filepath.Join(root, "packages"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(base, filepath.Join(root, "packages", "sneaky")); err != nil {
+		t.Fatal(err)
+	}
+	doc := `{"lockfileVersion":1,"packages":{"":{},"node_modules/s":{"resolved":"packages/sneaky","link":true}}}`
+	lock := filepath.Join(base, "lock.json")
+	if err := os.WriteFile(lock, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, _ := runLane("project-graph", lock); code != 3 {
+		t.Fatalf("a version 1 lockfile without --any-version: code = %d, want 3", code)
+	}
+	code, stdout, stderr := runLane("project-graph", "--any-version", lock)
+	if code != 0 || !strings.Contains(stdout, `"bound":true`) {
+		t.Fatalf("without a root the target looks inside the project: code = %d, %s %s", code, stdout, stderr)
+	}
+	code, stdout, stderr = runLane("project-graph", "--any-version", "--project-root", root, lock)
+	if code != 0 || !strings.Contains(stdout, `"reason":"link_outside_project"`) || !strings.Contains(stdout, `"bound":false`) {
+		t.Fatalf("the physical target leaves the project: code = %d, %s %s", code, stdout, stderr)
+	}
+}

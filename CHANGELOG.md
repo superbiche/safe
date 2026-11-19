@@ -2,23 +2,29 @@
 
 ## Unreleased
 
-- Project lane routing (still behind `install.project_lane`). The lane runs in a subshell; its parent acts
-  only on its exit status (253 hands the command to today's gate), so nothing the lane sets reaches the
-  delegate, and with the switch absent or false its code is not entered. A command the lane cannot judge is
-  decided ONCE, after every check: an *established* project shape (every file the cause comes from
-  committed at the head of the git work tree and unchanged: a version 1 lockfile, committed non-registry
-  dependencies, a committed `.npmrc` outside the allow-list, or an npm that lacks the capabilities whose
-  selection a committed project file establishes) goes to today's gate exactly as with the switch off after
-  one `[lane: one-shot, <reason>]` line; the `install-test` families always do. Everything else refuses
-  with the lane's line, naming the cause and the way out: a flag or environment setting, any npm
-  configuration the lane cannot carry (no attempt to tell the host's from the caller's: a host on which the
-  lane is turned on has a supported npm configuration), a failed guard or probe, an uncommitted or
-  non-git shape, mixed causes, a lockfile with any unsafe finding (all findings are reported), `npm
-  ci`/`dedupe`/`prune`. A lockfile of version 2 or 3 with no package map is undecodable (102). `mise exec
-  -- npm <lane command>` refuses with the way out (run npm in the project directory); global and
-  non-lane inner commands are as before. Global mode is decided after the project's `.npmrc` has been
-  admitted as text. Capability metadata that is malformed is a failed probe. No refusal suggests turning
-  the lane off.
+- Project lane routing (still behind `install.project_lane`). The lane runs in a subshell; its parent
+  forwards a cancellation to it and waits for its terminal result, and otherwise acts only on its exit
+  status (253 hands the command to today's gate). Nothing is assigned when the library is sourced and the
+  lane's own variables never carry an export attribute, so with the switch absent or false (or on a
+  hand-over) the delegate's environment is the caller's. A command the lane cannot judge is decided ONCE,
+  after every check (the frozen probe and the platform selection included): an *established* project shape
+  (every file the cause comes from committed at the head of the git work tree and unchanged: a recognised
+  legacy lockfile, committed non-registry dependencies, a committed `.npmrc` outside the allow-list) goes
+  to today's gate exactly as with the switch off after one `[lane: one-shot, <reason>]` line; the
+  `install-test` families always do. Everything else refuses with the lane's line, naming the cause and
+  the way out: a flag or environment setting (`PREFIX` and `DESTDIR`, which select where npm reads its
+  configuration, refuse by name before the environment is replaced), any npm configuration the lane cannot
+  carry (global mode included), an npm without the capabilities the lane needs (the refusal says the
+  operator can put the project on the one-shot lane; the version manager's sources are no longer read), a
+  failed guard or probe, an uncommitted or non-git shape, mixed causes, `npm ci`/`dedupe`/`prune`. A
+  lockfile with any unsafe finding refuses whatever it declares: every reason of every entry is reported,
+  a link is judged on the path it resolves to, and only a recognised legacy lockfile (version 1, or none
+  declared with the legacy dependency map and no package map) takes the one-shot route; any other version
+  refuses. A lockfile of version 2 or 3 with no package map is undecodable (102). Global mode is read from
+  the arguments alone, in the plain form (`-g` or `--global`); no npm run decides the route, and any
+  other spelling that selects or negates it refuses. `mise exec -- npm <lane command>` refuses with the way
+  out (run npm in the project directory); non-lane inner commands are as before. Capability metadata that
+  is malformed is a failed probe. No refusal suggests turning the lane off.
 - Project lane baseline, closing reviews: safe records, per project path, the lockfiles it
   judged clear on complete evidence, each under its own digest, before the binder runs (full or
   files-only; a record that cannot be written refuses 102 and publishes nothing; at most 16 are

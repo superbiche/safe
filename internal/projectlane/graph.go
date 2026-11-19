@@ -154,6 +154,21 @@ func LoadGraph(lockfile string, hosts Hosts) (Graph, error) {
 	return graphFromRecords(records, locals, hosts), nil
 }
 
+// LoadGraphAnyVersion is LoadGraph for a lockfile whose declared version is not judged: the
+// package map is read whatever the version says, so that the safety checks on its entries never
+// depend on a declared version.
+func LoadGraphAnyVersion(lockfile string, hosts Hosts) (Graph, error) {
+	records, err := lockdiff.LoadRecordsAnyVersion(lockfile, hosts.Registry)
+	if err != nil {
+		return Graph{}, err
+	}
+	locals, err := lockdiff.LoadLocalPackagesAnyVersion(lockfile)
+	if err != nil {
+		return Graph{}, err
+	}
+	return graphFromRecords(records, locals, hosts), nil
+}
+
 func graphFromRecords(records []lockdiff.Record, locals []lockdiff.LocalPackage, hosts Hosts) Graph {
 	eligible := map[string]struct{}{DefaultRegistryHost: {}}
 	for _, host := range hosts.PublicEvidence {
