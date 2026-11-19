@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -344,6 +345,11 @@ func projectAdmit(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	result, err := projectlane.Admit(in)
 	if err != nil {
 		fmt.Fprintf(stderr, "safe-core: project-admit: %v\n", err)
+		var lockErr *projectlane.LockfileError
+		if errors.As(err, &lockErr) {
+			// a lockfile that cannot be read: missing evidence, apart from an input that cannot be read
+			return 4
+		}
 		return 3
 	}
 	return printJSON(stdout, "project-admit", stderr, result)

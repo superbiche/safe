@@ -165,7 +165,11 @@ The lane runs before the package manager is delegated to:
   With the project lane switched on (`install.project_lane`) a registry that is
   not the canonical public one, or a package of a scope mapped to another
   registry, is refused after this check, not judged: the lane does not support
-  private origins yet.
+  private origins yet. The lane runs no auditor for the private store: one matcher
+  (the store's namespace rules) is applied in the shell to every name the lane
+  knows (manifest, lockfile paths and legacy identities, projected names) before
+  any public evidence is asked for, and a project that touches a registered name
+  refuses.
 - **npm projects (`install`, `ci`, `update`, `dedupe`, `prune`).** On a host
   with an npm private registry, two checks run:
   - **Scope mapping (ruling a43).** Every registered scope must map to its

@@ -23,13 +23,12 @@ import (
 // git settings, release-age settings, workspaces, package-lock and dry-run
 // switches, ...) refuses.
 var npmrcSettings = map[string]func(string) bool{
-	"save-exact":      isBool,
-	"engine-strict":   isBool,
-	"fund":            isBool,
-	"audit":           isBool,
-	"update-notifier": isBool,
-	"progress":        isBool,
-	"save-prefix":     func(v string) bool { return v == "^" || v == "~" || v == "" },
+	"save-exact":    isBool,
+	"engine-strict": isBool,
+	"fund":          isBool,
+	"audit":         isBool,
+	"progress":      isBool,
+	"save-prefix":   func(v string) bool { return v == "^" || v == "~" || v == "" },
 	"loglevel": func(v string) bool {
 		switch v {
 		case "silent", "error", "warn", "notice", "http", "info", "verbose", "silly":

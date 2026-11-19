@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Project lane hardening, third part (still behind `install.project_lane`): nothing
+  the project controls is read as configuration before admission (a configuration
+  file or destination in the arguments refuses at the shell; the routing probe is
+  given only global-deciding flags and keeps the operator's configuration sources;
+  environment destinations are read as npm reads them or refuse; a project inside a
+  workspace root refuses); two launcher forms (the version manager's launcher run as
+  it is in every phase, or npm's own CLI file run by the Node beside it), anything
+  else refuses; the lane runs no auditor and one matcher covers every name,
+  including lockfile paths, legacy identities and projected names; npm's own parser
+  agrees with the final admission before a dry run or binding, and a `$name`
+  override reference is resolved or refused; a committed lockfile the core cannot
+  decode is missing evidence (102); the renderer ignores header case and Unicode
+  format characters; a binder killed by the forwarded signal before its document is
+  an interruption (128+signal); `--update-notifier=false` is forced; the npm floor is
+  compared with npm's semver. The live test runs a forwarding launcher behind a
+  version manager and has strict negative controls.
 - Project lane hardening, second part (still behind `install.project_lane`): the
   project's own `.npmrc` is read by safe as text, before any npm runs, against a
   short allow-list (`docs/configuration.md`); every npm command of the lane carries

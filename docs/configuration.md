@@ -246,8 +246,8 @@ pass and warnings under `environment.release_follow`.
   **The project's own `.npmrc`** is read by safe, as text, before any npm runs in
   the project's context (a special file or a link there refuses first). It is
   admitted against a short allow-list, and anything else refuses naming the
-  setting (never its value): `save-exact`, `engine-strict`, `fund`, `audit`,
-  `update-notifier` and `progress` (`true` or `false`), `save-prefix` (`^`, `~` or
+  setting (never its value): `save-exact`, `engine-strict`, `fund`, `audit`
+  and `progress` (`true` or `false`), `save-prefix` (`^`, `~` or
   empty), `loglevel` (npm's levels), `registry` and `@scope:registry` (exactly
   `https://registry.npmjs.org/`). The reader takes the ini subset npm writes (one
   `key=value` per line, `;` and `#` comments, blank lines): a section,
@@ -258,9 +258,12 @@ pass and warnings under `environment.release_follow`.
   workspaces, and the package-lock and dry-run switches.
   **One runtime, one environment.** The lane resolves, once and in the project's
   context, the npm the gate's delegate would run there (behind a version manager's
-  shim, the real manager is asked, `mise which npm`), and takes the Node and the
-  `npm-cli.js` of that npm's own installation (the Node beside its launcher): a
-  launcher the lane cannot follow to both refuses. That pair is run directly for
+  shim, the real manager is asked, `mise which npm`). Two forms are supported and
+  anything else refuses: (a) the launcher a version manager names, inside its own
+  installation with its Node beside it, **executed as it is** in every phase (it
+  picks its own Node, so the npm that runs is the one the manager chose), the
+  sibling Node serving only the lane's own Node runs (probes); (b) npm's own CLI
+  file, or a link to it, run by the Node beside the link. That one npm is used for
   every probe, the projection and the frozen install, from the project, a scratch
   directory and the binder's staging directory alike; nothing is resolved again.
   Every one of those runs gets exactly this environment and nothing else of the
@@ -281,10 +284,22 @@ pass and warnings under `environment.release_follow`.
   **Nothing is written into the project before publication.** Every npm command of
   the lane carries an explicit cache and log destination in safe's own private
   directory (`project-lane/npm-cache`, `npm-logs`, under the data directory) and
-  `--replace-registry-host=never`, so a resolved location is fetched as written. The
-  operator-level destinations found in the environment (`npm_config_cache`, logs,
-  prefix, user and global configuration, in either case) are checked as strings,
-  without npm, and one that lies inside the project refuses. safe's data directory
+  `--replace-registry-host=never` and `--update-notifier=false` (forced, so it is not a
+  project choice), so a resolved location is fetched as written. No file the
+  project controls is read as configuration before the project is admitted: the
+  caller's own arguments may not select a configuration file or a destination
+  (`--userconfig`, `--globalconfig`, `--prefix`, `-C`, `--cache`, `--logs-dir`,
+  refused at the shell before any npm runs), and the probe that decides whether the
+  command is global or local is given only the flags that decide that, with the
+  operator's own configuration sources kept. The operator-level destinations found
+  in the environment (`npm_config_cache`, logs, prefix, user and global
+  configuration, in either case) are read the way npm reads a path setting
+  (trimmed, nothing else interpolated): one that is not a plain absolute path
+  after that (blank, `~`, `${…}`, relative, a control character) or that lies inside
+  the project refuses; the storage paths of the lane are made canonical and absolute
+  once, and a link in them is judged by where it leads. A project that sits inside
+  a workspace root (an ancestor up to the git top level declaring `workspaces`)
+  refuses. safe's data directory
   and the temporary directory must not overlap the project in either direction, the
   lane's directories are private and not links before they are used, the committed
   lockfile comparison reads the git objects with replacement refs disabled, and
@@ -292,25 +307,37 @@ pass and warnings under `environment.release_follow`.
   (`safe-core project-admit`, checked against npm's classifier by
   `tests/live/npm_spec_oracle.sh`) and then again by the selected npm's own
   `npm-package-arg` and `validate-npm-package-name`, over the same strings: command
-  arguments (`name@x.y.z` exactly), manifest ranges, typed overrides, and the
-  dependency edges of the committed lockfile must be registry packages, or the
-  command refuses. A scope mapped to the canonical public registry is accepted; a
+  arguments (`name@x.y.z` exactly), manifest ranges, typed overrides (a `$name`
+  reference is resolved against the root's own declared dependencies as npm
+  resolves it, and refuses when the root does not declare it), and the dependency
+  edges of the committed lockfile must be registry packages, or the command
+  refuses. The agreement is asked again on the **final** admission (the
+  projection's manifest), before a dry run returns and before binding. A committed
+  lockfile that safe's core cannot decode (a wrong shape, a repeated member) is
+  missing evidence (exit 102); one it reads but cannot support stays a policy
+  refusal (100). A scope mapped to the canonical public registry is accepted; a
   scope (or the configured default scope) mapped elsewhere refuses when a package of
   the judged graph, one first found by the projection included, belongs to it.
-  **Capability:** the npm must be at least 11.12.1 (the oldest release found to
-  define `allow-git`) and its own definitions module must define every option the
+  **Capability:** the npm must be at least 11.12.1, compared with npm's own semver
+  (the oldest release found to define `allow-git`) and its own definitions module must define every option the
   lane passes (`allow-git`, `git`, `replace-registry-host`, `cache`, `logs-dir`,
   `logs-max`); an npm that merely echoes an option in its configuration listing
   (10.9.2 does) refuses. **Selection:** omissions, os, cpu and libc are computed
   once, by the selected Node with npm's own modules over npm's effective settings
   (libc judged against the effective os), and passed as one checked document. A
-  project that touches an entry of a non-empty private-registry store refuses before
-  the private check runs (trusted private origins are not supported yet); otherwise
-  that check runs with the lane's launcher first on its `PATH`. Everything npm, the
+  platform value carrying a NUL refuses. The lane runs no auditor of its own for the
+  private-registry store: one matcher (the store's namespace rules) is applied to
+  every name the lane knows (manifest names and ranges, the paths and legacy
+  identities of the committed lockfile, the names the projection adds) before any
+  public evidence is requested, and a project that touches an entry of a non-empty
+  store refuses (trusted private origins are not supported yet). Everything npm, the
   binder or the project prints is cleaned (control characters, bearer and basic
-  authorisation, credentials in URLs, queries and fragments) at the lane's boundary,
+  authorisation, credentials in URLs, queries and fragments; headers in any case; Unicode
+  format characters) at the lane's boundary,
   the last partial line included; npm's exit status is kept; a signal to the shell,
-  from before the binder starts until its report is delivered, is forwarded to it.
+  from before the binder starts until its report is delivered, is forwarded to it,
+  and a binder that dies of it before it produced a document is an interruption
+  (128 plus the signal), not a refusal.
 - `reuse.enabled`: per-host rule for `safe install --reuse` (default `false`).
   `true` lets the reuse of an installed `vendor/` or `node_modules/` from
   another checkout of the same repository run unattended, agents included; reuse runs no audit, and its

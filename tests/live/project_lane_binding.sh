@@ -17,10 +17,11 @@
 #      npm's `before` date dates the whole invocation, so the projection
 #      resolves the historical graph and the tree must equal it.
 #
-#   B. a delegate that answers differently per phase. An unmarked `npm` on PATH
-#      (what the gate's delegate resolves to) dates only the projection (the
-#      call that carries --package-lock-only) to <T1> and runs everything else
-#      against the registry as it is NOW, logging every call. A lane that
+#   B. a delegate that answers differently per phase. A version manager's
+#      installation reached the supported way (a shim on PATH, a manager that
+#      names a FORWARDING launcher, the Node beside it a recording wrapper) dates
+#      only the projection (the call that carries --package-lock-only) to <T1> and
+#      runs everything else against the registry as it is NOW, logging every call. A lane that
 #      resolved again at materialisation would install today's graph. The suite
 #      captures the successful projection independently, then asserts: the final
 #      npm command is `ci` exactly once and nothing else resolved outside the
@@ -28,8 +29,11 @@
 #      byte; the installed tree is it (strict verifier, npm's own record, and a
 #      version-by-version read); and it is NOT today's resolution.
 #
-#   The negative control: the same scenario B against a copy of the gate whose
-#   frozen install is `update` (a resolving command) must FAIL its assertions.
+#   The negative controls (each must fail on the intended assertion ONLY, after a
+#   set-up that itself succeeded): the same scenario B against a copy of the gate
+#   whose frozen install is `update` (a resolving command); a second resolution
+#   that gives the same graph; a launcher that exits 99 (the lane executes the
+#   launcher the manager names, so the gate cannot succeed and the launcher ran).
 #
 # Only the npm registry is live. The advisory reader is a local stand-in that
 # reports every identity as read completely with no advisory: the judging core
@@ -200,27 +204,47 @@ fi
 # the projection (the call that begins with --package-lock-only) is dated as of
 # T1, everything else runs against the registry as it is NOW, and every call is
 # logged. The projection the gate actually made is kept as it is.
-mkdir -p "${WORK}/delegate/bin" "${WORK}/delegate/lib/node_modules"
-printf '#!/bin/sh\nexit 99\n' > "${WORK}/delegate/bin/npm"
-cat > "${WORK}/delegate/bin/node" <<DELEGATE
+# The launcher form the lane executes as it is (a): forwards to its sibling node on its
+# own npm-cli.js. A fake version manager (marked shim + a real-manager stand-in on PATH)
+# names it, as `mise which npm` does.
+make_delegate() { # <dir> <launcher kind: forward|exit99>
+  local d="$1" kind="$2"
+  mkdir -p "${d}/bin" "${d}/lib/node_modules"
+  if [[ "${kind}" == forward ]]; then
+    printf '#!/usr/bin/env bash\nexec "$(dirname "$0")/node" "$(dirname "$0")/../lib/node_modules/npm/bin/npm-cli.js" "$@"\n' > "${d}/bin/npm"
+  else
+    printf '#!/bin/sh\ntouch "%s/launcher99.ran"\nexit 99\n' "${WORK}" > "${d}/bin/npm"
+  fi
+  cat > "${d}/bin/node" <<DELEGATE
 #!/usr/bin/env bash
-if [[ "\${1:-}" == "${npm_cli}" ]]; then
-  shift
-  printf '%s\\n' "\$*" >> "${WORK}/delegate.log"
-  if [[ "\${1:-}" == "--package-lock-only" ]]; then
-    set -- "\$@" "--before=${T1}"
-    "${real_node_bin}" "${npm_cli}" "\$@"
+if [[ "\${1:-}" == */node_modules/npm/bin/npm-cli.js ]]; then
+  printf '%s\\n' "\${*:2}" >> "${WORK}/delegate.log"
+  if [[ "\${2:-}" == "--package-lock-only" ]]; then
+    "${real_node_bin}" "\$@" "--before=${T1}"
     status=\$?
     n=\$(ls "${WORK}"/captured-*.json 2>/dev/null | wc -l)
     [[ -f package-lock.json ]] && cp package-lock.json "${WORK}/captured-\$((n + 1)).json"
     exit \$status
   fi
-  exec "${real_node_bin}" "${npm_cli}" "\$@"
 fi
 exec "${real_node_bin}" "\$@"
 DELEGATE
-chmod +x "${WORK}/delegate/bin/npm" "${WORK}/delegate/bin/node"
-ln -sfn "${npm_dir}" "${WORK}/delegate/lib/node_modules/npm"
+  chmod +x "${d}/bin/npm" "${d}/bin/node"
+  ln -sfn "${npm_dir}" "${d}/lib/node_modules/npm"
+}
+mkdir -p "${WORK}/shims" "${WORK}/realmise"
+printf '#!/usr/bin/env bash\n# safe-gate-wrapper v1 tool=mise\nexit 97\n' > "${WORK}/shims/npm"
+chmod +x "${WORK}/shims/npm"
+cat > "${WORK}/realmise/mise" <<REALMISE
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "which" ]]; then
+  printf '%s/bin/%s\\n' "${WORK}/delegate" "\${2:-}"
+  exit 0
+fi
+exit 98
+REALMISE
+chmod +x "${WORK}/realmise/mise"
+make_delegate "${WORK}/delegate" forward
 
 run_b() { # <name> <lib dir>
   local name="$1" lib="$2"
@@ -229,7 +253,7 @@ run_b() { # <name> <lib dir>
   rm -f "${WORK}"/captured-*.json
   rm -rf "${WORK}/safe/lib"
   ln -s "${lib}" "${WORK}/safe/lib"
-  ( cd "${WORK}/${name}" && PATH="${WORK}/delegate/bin:${PATH}" SAFE_AUDIT_PATH="${WORK}/safe/bin/safe-audit" \
+  ( cd "${WORK}/${name}" && PATH="${WORK}/shims:${WORK}/realmise:${PATH}" SAFE_AUDIT_PATH="${WORK}/safe/bin/safe-audit" \
       "${WORK}/safe/bin/safe" gate npm install express@5.1.0 --ignore-scripts >"${WORK}/${name}.out" 2>"${WORK}/${name}.err" )
   return $?
 }
@@ -276,14 +300,20 @@ flock -n -x "${WORK}/b" true && pass "the project lock was released" || fail "th
 mkdir -p "${WORK}/broken-lib" "${WORK}/twice-lib"
 cp -r "${ROOT}/lib/." "${WORK}/broken-lib/"
 cp -r "${ROOT}/lib/." "${WORK}/twice-lib/"
+ORDERED_MSG='not exactly one resolution then exactly one frozen install'
 if grep -q 'frozen_args=(ci ' "${WORK}/broken-lib/gate-lib.sh"; then
   sed -i 's/frozen_args=(ci /frozen_args=(update /' "${WORK}/broken-lib/gate-lib.sh"
   run_b broken "${WORK}/broken-lib"
   status=$?
-  if (( status == 0 )) && assert_b broken >"${WORK}/broken.problems"; then
-    fail "the assertions of B cannot tell a lane that resolves again at materialisation (it passed)"
+  problems="$(assert_b broken 2>&1)"
+  # the set-up must have worked (npm ran to its end: the gate's own verifier then
+  # refused the tree, publishing nothing) and the ordered-calls assertion must be
+  # among those that failed
+  if (( status == 100 )) && grep -q 'the installed tree differs from the judged lockfile' "${WORK}/broken.err" \
+      && [[ "${problems}" == *"${ORDERED_MSG}: resolve OTHER: update"* ]]; then
+    pass "the assertions of B fail, on the ordered calls, for a lane that resolves again at materialisation (and the gate's verifier refused its tree)"
   else
-    pass "the assertions of B fail on a lane that resolves again at materialisation ($(head -n 1 "${WORK}/broken.problems" 2>/dev/null || echo "gate exit ${status}"))"
+    fail "the resolving-materialisation control: gate exit ${status}, assertions said: ${problems:-nothing}"
   fi
 else
   fail "the negative control cannot be built: frozen_args is not where it was"
@@ -305,6 +335,20 @@ if (( status == 0 )) && [[ "${problems}" == *"not exactly one resolution then ex
   pass "a second resolution that gives the same graph fails on the ordered-calls assertion alone"
 else
   fail "the second-resolution control: gate exit ${status}, assertions said: ${problems}"
+fi
+
+# 3. the launcher the manager names is the one that runs: a launcher that exits 99 ends
+#    the command and leaves its mark, and no assertion of B can pass on what it left
+make_delegate "${WORK}/delegate99" exit99
+rm -f "${WORK}/launcher99.ran"
+sed -i "s|${WORK}/delegate|${WORK}/delegate99|" "${WORK}/realmise/mise"
+run_b launcher99 "${ROOT}/lib"
+status=$?
+problems="$(assert_b launcher99 2>&1)"
+if (( status != 0 )) && [[ -f "${WORK}/launcher99.ran" ]] && [[ "${problems}" == *"no projection was captured"* ]]; then
+  pass "the launcher the manager names is the one the lane runs (an exit-99 launcher ran and ended the command, exit ${status})"
+else
+  fail "the exit-99 launcher control: gate exit ${status}, launcher ran: $([[ -f "${WORK}/launcher99.ran" ]] && echo yes || echo no), assertions said: ${problems:-nothing}"
 fi
 
 printf '%s passed, %s failed\n' "${PASS}" "${FAIL}"

@@ -3,6 +3,7 @@ package projectlane
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -187,7 +188,7 @@ func TestSpellingsFixtureIsClassifiable(t *testing.T) {
 }
 
 func TestAdmitNpmrcAllowList(t *testing.T) {
-	good := "; a comment\n# another\n\nsave-exact=true\nsave-prefix=~\nengine-strict=false\nfund=false\naudit=false\nupdate-notifier=false\nloglevel=warn\nprogress=false\nregistry=https://registry.npmjs.org/\n@scope:registry=https://registry.npmjs.org/\n"
+	good := "; a comment\n# another\n\nsave-exact=true\nsave-prefix=~\nengine-strict=false\nfund=false\naudit=false\nloglevel=warn\nprogress=false\nregistry=https://registry.npmjs.org/\n@scope:registry=https://registry.npmjs.org/\n"
 	if got := AdmitNpmrc([]byte(good)); len(got) != 0 {
 		t.Fatalf("the allow-list refused itself: %+v", got)
 	}
@@ -261,20 +262,20 @@ func TestAdmitNpmrcThroughTheDocument(t *testing.T) {
 
 func TestOverridesAndNamesLikeNpm(t *testing.T) {
 	cases := map[string]bool{
-		`{"overrides":{"a":"1.0.0"}}`:                             true,
-		`{"overrides":{"a@^1":{".":"1.2.3","b":"$a"}}}`:           true,
-		`{"overrides":{"@s/a@1.x":"1.0.0"}}`:                      true,
-		`{"overrides":{"a":{".":{"x":"1.0.0"}}}}`:                 false, // a self-override that is an object
-		`{"overrides":{"x.tgz":"1.0.0"}}`:                         false, // an archive-suffixed selector has no package name
-		`{"overrides":{"a@file:../x":"1.0.0"}}`:                   false,
-		`{"overrides":{"a@npm:b@1":"1.0.0"}}`:                     false,
-		`{"overrides":{"@s/.sample":"1.0.0"}}`:                    false,
-		`{"dependencies":{"@s/.sample":"1.0.0"}}`:                 false,
-		`{"dependencies":{"a":"^9007199254740991.0.0"}}`:          false, // npm: invalid tag name
-		`{"dependencies":{"a":"9007199254740991.0.0"}}`:           true,
-		`{"dependencies":{"a":">=9007199254740990.0.0"}}`:         true,
-		`{"dependencies":{"a":"~9007199254740991.0.0"}}`:          true, // npm reads it as a dist-tag named so
-		`{"overrides":{"a":"git+https://example.invalid/x.git"}}`: false,
+		`{"overrides":{"a":"1.0.0"}}`: true,
+		`{"dependencies":{"a":"^1.0.0"},"overrides":{"a@^1":{".":"1.2.3","b":"$a"}}}`: true,
+		`{"overrides":{"@s/a@1.x":"1.0.0"}}`:                                          true,
+		`{"overrides":{"a":{".":{"x":"1.0.0"}}}}`:                                     false, // a self-override that is an object
+		`{"overrides":{"x.tgz":"1.0.0"}}`:                                             false, // an archive-suffixed selector has no package name
+		`{"overrides":{"a@file:../x":"1.0.0"}}`:                                       false,
+		`{"overrides":{"a@npm:b@1":"1.0.0"}}`:                                         false,
+		`{"overrides":{"@s/.sample":"1.0.0"}}`:                                        false,
+		`{"dependencies":{"@s/.sample":"1.0.0"}}`:                                     false,
+		`{"dependencies":{"a":"^9007199254740991.0.0"}}`:                              false, // npm: invalid tag name
+		`{"dependencies":{"a":"9007199254740991.0.0"}}`:                               true,
+		`{"dependencies":{"a":">=9007199254740990.0.0"}}`:                             true,
+		`{"dependencies":{"a":"~9007199254740991.0.0"}}`:                              true, // npm reads it as a dist-tag named so
+		`{"overrides":{"a":"git+https://example.invalid/x.git"}}`:                     false,
 	}
 	for body, want := range cases {
 		got, err := Admit(AdmitInput{ManifestFile: writeAdmitFile(t, "package.json", body)})
@@ -290,6 +291,80 @@ func TestOverridesAndNamesLikeNpm(t *testing.T) {
 	for _, kind := range []string{"arg", "dep", "name", "override-key", "override-value"} {
 		if !kinds[kind] {
 			t.Errorf("the document does not list %s among what it checked: %+v", kind, got.Checked)
+		}
+	}
+}
+
+func TestUpdateNotifierIsNotOnTheNpmrcAllowList(t *testing.T) {
+	if got := AdmitNpmrc([]byte("update-notifier=false\n")); len(got) != 1 {
+		t.Fatalf("update-notifier must be refused (the lane forces it off): %+v", got)
+	}
+}
+
+func TestOverrideReferencesAreResolvedLikeArborist(t *testing.T) {
+	cases := map[string]bool{
+		`{"dependencies":{"a":"^1.0.0"},"overrides":{"b":"$a"}}`:          true,
+		`{"devDependencies":{"a":"~1.2.3"},"overrides":{"b":{".":"$a"}}}`: true,
+		`{"overrides":{"b":"$a"}}`:                                        false, // the root does not declare a
+		`{"dependencies":{"a":"github:u/r"},"overrides":{"b":"$a"}}`:      false,
+		`{"dependencies":{"a":"^1.0.0"},"overrides":{"b":"$../x"}}`:       false,
+	}
+	for body, want := range cases {
+		got, err := Admit(AdmitInput{ManifestFile: writeAdmitFile(t, "package.json", body)})
+		if body == `{"dependencies":{"a":"github:u/r"},"overrides":{"b":"$a"}}` {
+			want = false
+		}
+		if err != nil || got.Ok != want {
+			t.Errorf("%s: ok=%v want %v (%+v err=%v)", body, got.Ok, want, got.Refusals, err)
+		}
+	}
+	got, _ := Admit(AdmitInput{ManifestFile: writeAdmitFile(t, "package.json", `{"dependencies":{"a":"^1.0.0"},"overrides":{"b":"$a"}}`)})
+	found := false
+	for _, c := range got.Checked {
+		if c.Kind == "override-value" && c.Name == "a" && c.Spec == "^1.0.0" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the spec a reference denotes is not among what is checked: %+v", got.Checked)
+	}
+}
+
+func TestLockfileDecodingFailureIsABaselineError(t *testing.T) {
+	for name, body := range map[string]string{
+		"wrong shape":     `{"lockfileVersion":3,"packages":{"":{},"node_modules/a":{"dependencies":["x"]}}}`,
+		"repeated member": `{"lockfileVersion":3,"packages":{},"packages":{}}`,
+		"not json":        `{"lockfileVersion":3,`,
+	} {
+		_, err := Admit(AdmitInput{LockfileFile: writeAdmitFile(t, "package-lock.json", body)})
+		var lockErr *LockfileError
+		if !errors.As(err, &lockErr) {
+			t.Errorf("%s: err = %v, want a LockfileError", name, err)
+		}
+	}
+	// a readable but unsupported source is a refusal, not an error
+	got, err := Admit(AdmitInput{LockfileFile: writeAdmitFile(t, "package-lock.json", `{"lockfileVersion":3,"packages":{"":{},"node_modules/a":{"dependencies":{"b":"github:u/r"}}}}`)})
+	if err != nil || got.Ok {
+		t.Fatalf("a git edge: %+v err=%v", got, err)
+	}
+}
+
+func TestAdmissionKnowsEveryNameAProjectCarries(t *testing.T) {
+	lock := writeAdmitFile(t, "package-lock.json", `{"lockfileVersion":2,"packages":{"":{},
+	  "node_modules/outer/node_modules/@p/inner":{"version":"1.0.0"},
+	  "node_modules/alias":{"name":"@p/real","version":"1.0.0"}},
+	  "dependencies":{"legacy":{"version":"1.0.0","dependencies":{"deep":{"version":"npm:@p/aliased@1.0.0"}}}}}`)
+	got, err := Admit(AdmitInput{LockfileFile: lock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	have := map[string]bool{}
+	for _, n := range got.Names {
+		have[n] = true
+	}
+	for _, want := range []string{"outer", "@p/inner", "@p/real", "alias", "legacy", "deep", "@p/aliased"} {
+		if !have[want] {
+			t.Errorf("name %s is not among %v", want, got.Names)
 		}
 	}
 }

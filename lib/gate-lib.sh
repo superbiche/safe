@@ -2762,10 +2762,10 @@ safe_gate_project_lane_enabled() {
 # redacted (userinfo of a URL, auth/token/password settings).
 safe_gate_lane_clean() {
   printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013-\037\177' | LC_ALL=C tr '\t\n' '  ' \
-    | LC_ALL=C sed -E $'s/\xc2[\x80-\x9f]//g; s/\xe2\x80[\xa8\xa9\xaa-\xae]//g; s/\xe2\x81[\xa6-\xa9]//g' \
+    | LC_ALL=C sed -E $'s/\xc2[\x80-\x9f]//g; s/\xe2\x80[\x8b-\x8f\xa8-\xae]//g; s/\xe2\x81[\xa0-\xaf]//g; s/\xef\xbb\xbf//g; s/\xd8\x9c//g' \
     | LC_ALL=C sed -E '
-      s#([Aa]uthorization|[Pp]roxy-[Aa]uthorization)[[:space:]]*[:=][[:space:]]*[^[:space:]]+([[:space:]]+[^[:space:]]+)?#\1: ***#g;
-      s#([Bb]earer|[Bb]asic|[Tt]oken)[[:space:]]+[A-Za-z0-9._~+/=-]{6,}#\1 ***#g;
+      s#([Pp][Rr][Oo][Xx][Yy]-)?[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn][[:space:]]*[:=][[:space:]]*[^[:space:]]+([[:space:]]+[^[:space:]]+)?#Authorization: ***#g;
+      s#(([Bb][Ee][Aa][Rr][Ee][Rr])|([Bb][Aa][Ss][Ii][Cc])|([Tt][Oo][Kk][Ee][Nn]))[[:space:]]+[A-Za-z0-9._~+/=-]{6,}#\1 ***#g;
       s#(://)[^/@[:space:]]*@#\1***@#g;
       s#(://[^[:space:]?\#]*)[?\#][^[:space:]]*#\1?***#g;
       s#((_auth|_authToken|_auth_token|_password|token|password|secret|apikey|api_key)[=:][[:space:]]*)[^[:space:]]+#\1***#Ig'
@@ -2859,7 +2859,7 @@ safe_gate_lane_abs() {
 }
 
 safe_gate_lane_resolve_runtime() {
-  local project_dir="$1" real="" real_mise="" npm_bin="" bindir="" npm_real="" cli="" node_bin="" npm_dir=""
+  local project_dir="$1" real="" real_mise="" npm_bin="" bindir="" npm_real="" node_bin="" npm_dir="" via_manager=0
   SAFE_GATE_LANE_NPM=()
   real="$(safe_gate_resolve_real npm)" || return 1
   real="$(safe_gate_lane_abs "${real}")" || return 1
@@ -2868,29 +2868,37 @@ safe_gate_lane_resolve_runtime() {
     real_mise="$(safe_gate_resolve_real mise)" || return 1
     real_mise="$(safe_gate_lane_abs "${real_mise}")" || return 1
     npm_bin="$(cd -- "${project_dir}" 2>/dev/null && "${real_mise}" which npm 2>/dev/null </dev/null)" || return 1
+    via_manager=1
   else
     npm_bin="${real}"
   fi
   [[ "${npm_bin}" == /* && -x "${npm_bin}" ]] || return 1
-  # The pair is the resolved npm's OWN installation: the Node beside its launcher
-  # and its npm-cli.js. A launcher the lane cannot follow to both refuses.
   bindir="$(dirname -- "${npm_bin}")"
-  npm_real="$(realpath -- "${npm_bin}" 2>/dev/null)" || return 1
-  if [[ "${npm_real}" == *.js && -f "${npm_real}" ]]; then
-    cli="${npm_real}"
-  elif [[ -f "${bindir}/../lib/node_modules/npm/bin/npm-cli.js" ]]; then
-    cli="$(cd -- "${bindir}/../lib/node_modules/npm/bin" 2>/dev/null && pwd -P)/npm-cli.js"
-  else
-    SAFE_GATE_LANE_REASON="an npm launcher that cannot be followed to its npm-cli.js (${npm_bin##*/})"
-    return 2
-  fi
   node_bin="${bindir}/node"
-  if [[ ! -x "${node_bin}" ]]; then
-    SAFE_GATE_LANE_REASON="an npm launcher with no Node beside it"
+  npm_real="$(realpath -- "${npm_bin}" 2>/dev/null)" || return 1
+  # Two supported forms, anything else refuses:
+  #  (a) the launcher a version manager names (`mise which npm`), inside its own
+  #      installation directory with its Node beside it: executed as it is, in every
+  #      phase (it picks its own Node); the sibling Node serves the lane's own Node runs;
+  #  (b) npm's own CLI file, or a link to it, run by the Node beside the link.
+  if (( via_manager )); then
+    if [[ ! -x "${node_bin}" ]]; then
+      SAFE_GATE_LANE_REASON="a version manager's npm launcher with no Node beside it"
+      return 2
+    fi
+    SAFE_GATE_LANE_NPM=("${npm_bin}")
+    npm_dir="$(cd -- "${bindir}/../lib/node_modules/npm" 2>/dev/null && pwd -P)" || npm_dir=""
+    if [[ -z "${npm_dir}" ]]; then
+      SAFE_GATE_LANE_REASON="a version manager's npm installation whose npm directory cannot be found (${npm_bin##*/})"
+      return 2
+    fi
+  elif [[ "${npm_real}" == */npm-cli.js && -f "${npm_real}" && -x "${node_bin}" ]]; then
+    SAFE_GATE_LANE_NPM=("${node_bin}" "${npm_real}")
+    npm_dir="$(cd -- "$(dirname -- "${npm_real}")/.." 2>/dev/null && pwd -P)" || return 2
+  else
+    SAFE_GATE_LANE_REASON="an npm launcher the lane cannot follow (it is neither a version manager's launcher nor npm's own CLI file with a Node beside it): ${npm_bin##*/}"
     return 2
   fi
-  npm_dir="$(cd -- "$(dirname -- "${cli}")/.." 2>/dev/null && pwd -P)" || return 2
-  SAFE_GATE_LANE_NPM=("${node_bin}" "${cli}")
   SAFE_GATE_LANE_NODE="${node_bin}"
   SAFE_GATE_LANE_NPM_DIR="${npm_dir}"
   SAFE_GATE_LANE_NPM_LAUNCHER="${npm_bin}"
@@ -3030,12 +3038,8 @@ const out = (o) => process.stdout.write(JSON.stringify(o))
 const REGISTRY = new Set(['version', 'range', 'tag'])
 if (mode === 'capability') {
   const version = JSON.parse(fs.readFileSync(path.join(npmDir, 'package.json'), 'utf8')).version
-  const have = String(version).split('-')[0].split('.').map(Number)
-  const floor = String(input.floor).split('.').map(Number)
-  let atFloor = true
-  for (let i = 0; i < 3; i++) {
-    if (have[i] !== floor[i]) { atFloor = have[i] > floor[i]; break }
-  }
+  const semver = mod('semver')
+  const atFloor = semver.valid(version) !== null && semver.gte(version, input.floor)
   let defs = null
   try { defs = mod('@npmcli/config/lib/definitions').definitions } catch (e) { defs = null }
   const missing = input.options.filter((k) => !(defs && Object.prototype.hasOwnProperty.call(defs, k)))
@@ -3130,6 +3134,8 @@ safe_gate_lane_selection() {
   jq -e -s 'length == 1 and (.[0] | type == "object" and (.os | type == "string" and length > 0) and (.cpu | type == "string" and length > 0)
     and (.libc == null or (.libc | type == "string" and length > 0))
     and (.omit | type == "array") and ([.omit[] | . == "dev" or . == "optional" or . == "peer"] | all))' "${out}" >/dev/null 2>&1 || return 1
+  # a NUL in a platform value cannot be framed and is never a platform
+  jq -e -s '.[0] | [.os, .cpu, .libc] | map(select(. != null) | contains("\u0000")) | any | not' "${out}" >/dev/null 2>&1 || return 1
   jq -j -s '.[0] | .os, "\u0000", .cpu, "\u0000", (.libc // ""), "\u0000", (.omit[] | ., "\u0000")' "${out}" > "${fields}" || return 1
   SAFE_GATE_LANE_SEL=()
   mapfile -d '' -t SAFE_GATE_LANE_SEL < "${fields}" || return 1
@@ -3180,6 +3186,11 @@ safe_gate_project_lane_admit() {
   local verb="$1" doc="${SAFE_GATE_LANE_SCRATCH}/admit.json" rc=0 text=""
   shift
   "${SAFE_GATE_LANE_CORE}" project-admit "$@" >"${doc}" 2>"${SAFE_GATE_LANE_SCRATCH}/admit.err" || rc=$?
+  if (( rc == 4 )) && [[ "${SAFE_GATE_LANE_ADMIT_BASELINE:-0}" == "1" ]]; then
+    # A committed lockfile the core cannot decode is missing evidence, whichever step meets it.
+    safe_gate_project_lane_refuse 102 "${verb}" "the committed lockfile cannot be decoded, so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the lockfile and retry"
+    return $?
+  fi
   if (( rc != 0 )); then
     safe_gate_project_lane_refuse 100 "${verb}" "admission cannot read its inputs (exit ${rc}; audit-infrastructure breakage, not a package finding)" "repair the manifest or lockfile and retry"
     return $?
@@ -3307,77 +3318,62 @@ safe_gate_project_lane_cleanup() {
   fi
   unset SAFE_GATE_LANE_SCRATCH SAFE_GATE_LANE_LOCKFD SAFE_GATE_LANE_NPM SAFE_GATE_LANE_ENV SAFE_GATE_LANE_NODE \
     SAFE_GATE_LANE_NPM_DIR SAFE_GATE_LANE_GIT SAFE_GATE_LANE_REASON SAFE_GATE_LANE_CORE SAFE_GATE_LANE_BIND_PID \
-    SAFE_GATE_LANE_SEL SAFE_GATE_LANE_NPM_LAUNCHER SAFE_GATE_LANE_SIGNAL SAFE_GATE_LANE_DEFER SAFE_GATE_LANE_CAP_VERSION
+    SAFE_GATE_LANE_SEL SAFE_GATE_LANE_ADMIT_BASELINE SAFE_GATE_LANE_NPM_LAUNCHER SAFE_GATE_LANE_SIGNAL SAFE_GATE_LANE_DEFER SAFE_GATE_LANE_CAP_VERSION
   return 0
 }
 
-# Today's private-origin check for the project, with no prompt reachable: the
-# lane has no operator step in this ticket, so a decision that would ask (19)
-# refuses 102, a block (20) refuses 104, and nothing is read from a terminal.
-# A project that touches an entry of a non-empty private store (a package name
-# or scope in the judged graph) refuses BEFORE the auditor runs anything: trusted
-# private origins are the routing ticket's, and the auditor resolves an npm of its
-# own. When the project touches none, the check runs with the lane's launcher
-# first on its PATH (never a version manager's answer of its own), without the
-# lock descriptor and without Node options.
-# $1 verb, $2 project (snapshot) dir, $3 the admission document (its names), rest: argv.
-safe_gate_project_lane_private_check() {
-  local verb="$1" project_dir="$2" names_doc="$3" d any_store=0 result_out="" rc=0 detail="" pattern name
-  shift 3
+# The lane does not run the private-registry auditor (it resolves an npm of its own).
+# With a non-empty private store, ONE matcher, the store's own namespace rules
+# (`safe-core private-trust match-names`), is applied to every name the lane knows:
+# the manifest's, the lockfile's entry names and the names their paths carry, the legacy
+# identities, and, after the projection and before any public evidence is asked for,
+# every projected name. A project that touches the store refuses (trusted private
+# origins are the routing ticket's); one that touches nothing goes on.
+# $1 verb, $2 an admission document (its names).
+safe_gate_project_lane_private_names() {
+  local verb="$1" names_doc="$2" d any_store=0 matches="" name
   for d in "${HOME}/.config/safe/run" "$(safe_gate_run_config_dir)"; do
     [[ -s "${d}/private-registries.json" || -s "${d}/private-follow-state.json" ]] && any_store=1
   done
   (( any_store )) || return 0
-  safe_gate_audit_available || return 0
-  local registries
-  registries="$("${SAFE_GATE_LANE_CORE}" private-trust registries --ecosystem npm \
+  if jq -e -s 'any(.[0].names[]; test("[\n\r]"))' "${names_doc}" >/dev/null 2>&1; then
+    safe_gate_project_lane_unsupported "${verb}" "a package name that cannot be matched against the private-registry store"
+    return $?
+  fi
+  matches="$(jq -r -s '.[0].names[]' "${names_doc}" 2>/dev/null | "${SAFE_GATE_LANE_CORE}" private-trust match-names --ecosystem npm \
     --policy "$(safe_gate_trust_store_file private-registries.json)" \
     --follow-state "$(safe_gate_trust_store_file private-follow-state.json)" \
-    --config "$(safe_gate_trust_store_file config.json)" 2>/dev/null)" || registries=""
-  if ! safe_gate_lane_one_doc 'type == "array"' "${registries}"; then
+    --config "$(safe_gate_trust_store_file config.json)" 2>/dev/null)" || matches=""
+  if ! safe_gate_lane_one_doc 'type == "array"' "${matches}"; then
     safe_gate_project_lane_refuse 100 "${verb}" "the private-registry stores cannot be read (audit-infrastructure breakage, not a package finding)" "repair them at an operator terminal and retry"
     return $?
   fi
-  while IFS= read -r pattern; do
-    [[ -n "${pattern}" ]] || continue
-    while IFS= read -r name; do
-      # shellcheck disable=SC2053 # the namespace is a glob, as the store writes it
-      if [[ "${name}" == ${pattern} ]]; then
-        safe_gate_project_lane_unsupported "${verb}" "a project that touches the private-registry namespace ${pattern} (${name})"
-        return $?
-      fi
-    done < <(jq -r -s '.[0].names[]' "${names_doc}" 2>/dev/null)
-  done < <(jq -r '.[] | .namespace[]?' <<<"${registries}" 2>/dev/null)
-  result_out="$(mktemp "${SAFE_GATE_LANE_SCRATCH}/private-result.XXXXXX" 2>/dev/null)" || result_out=""
-  local -a cfg=()
-  [[ -n "${SAFE_GATE_NPM_USERCONFIG:-}" ]] && cfg+=(--npm-userconfig "${SAFE_GATE_NPM_USERCONFIG}")
-  [[ -n "${SAFE_GATE_NPM_GLOBALCONFIG:-}" ]] && cfg+=(--npm-globalconfig "${SAFE_GATE_NPM_GLOBALCONFIG}")
-  (
-    [[ ! "${SAFE_GATE_LANE_LOCKFD:-}" =~ ^[0-9]+$ ]] || eval "exec ${SAFE_GATE_LANE_LOCKFD}<&-"
-    export PATH="$(dirname -- "${SAFE_GATE_LANE_NPM_LAUNCHER}"):${PATH}"
-    unset NODE_OPTIONS
-    SAFE_AUDIT_RESULT_OUT="${result_out}" exec "${SAFE_GATE_AUDIT_BIN}" private-npm-project --gate install --tool npm \
-      --class install --project-dir "${project_dir}" ${cfg[@]+"${cfg[@]}"} -- "$@"
-  ) </dev/null >/dev/null 2>"${SAFE_GATE_LANE_SCRATCH}/private.err"
-  rc=$?
-  if [[ -n "${result_out}" && -s "${result_out}" ]] && jq -e -s 'length == 1' "${result_out}" >/dev/null 2>&1; then
-    detail="$(jq -r -s '.[0].private_registry.detail // empty' "${result_out}" 2>/dev/null)" || detail=""
+  if jq -e 'length > 0' <<<"${matches}" >/dev/null 2>&1; then
+    name="$(jq -r '.[0].name // .[0].package // empty' <<<"${matches}" 2>/dev/null)"
+    safe_gate_project_lane_unsupported "${verb}" "a project that touches the private-registry store (${name:-a registered name})"
+    return $?
   fi
-  case "${rc}" in
-    0|18) return 0 ;;
-    19)
-      safe_gate_project_lane_refuse 102 "${verb}" "the private-registry check needs an operator decision${detail:+ (${detail})}" "the project lane has no operator step yet; run the command with the lane off at an operator terminal"
-      return $?
-      ;;
-    20)
-      safe_gate_project_lane_refuse 104 "${verb}" "the private-registry check blocks this project${detail:+ (${detail})}" "fix the scope mapping or the lockfile origins it names"
-      return $?
-      ;;
-    *)
-      safe_gate_project_lane_refuse 100 "${verb}" "the private-registry check could not run (exit ${rc}; audit-infrastructure breakage, not a package finding)" "rerun install.sh or run safe doctor, then retry"
-      return $?
-      ;;
-  esac
+  return 0
+}
+
+# An ancestor of the project, up to the git top level, whose manifest declares
+# workspaces. Prints its directory. An ancestor manifest that cannot be read counts.
+safe_gate_project_lane_workspace_ancestor() {
+  local project_dir="$1" top dir parent
+  top="$(safe_gate_project_lane_git "${project_dir}" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  top="$(realpath -- "${top}" 2>/dev/null)" || return 1
+  dir="${project_dir}"
+  while [[ "${dir}" != "${top}" && "${dir}" == "${top}/"* ]]; do
+    parent="$(dirname -- "${dir}")"
+    dir="${parent}"
+    if [[ -f "${dir}/package.json" ]]; then
+      if ! jq -e '.workspaces == null' "${dir}/package.json" >/dev/null 2>&1; then
+        printf '%s' "${dir}"
+        return 0
+      fi
+    fi
+  done
+  return 1
 }
 
 # Entry. Returns the command's exit status. When npm's effective configuration
@@ -3448,13 +3444,16 @@ safe_gate_lane_env_destinations() {
       *) continue ;;
     esac
     value="${!name}"
+    # npm skips an empty value; it trims every other one and resolves it ($HOME for
+    # `~/`, interpolation, the current directory for a relative one). Only a plain
+    # absolute path is accepted, and it must not lie inside the project.
     [[ -n "${value}" ]] || continue
-    case "${value}" in
-      '~/'*) value="${HOME}/${value:2}" ;;
-      '~') value="${HOME}" ;;
-      /*) ;;
-      *) value="${project_dir}/${value}" ;;
-    esac
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ ! "${value}" =~ ^/[^[:cntrl:]\$\{\}]*$ ]] || ! LC_ALL=C grep -q -- '^[ -~]*$' <<<"${value}"; then
+      printf '%s' "${name}"
+      return 0
+    fi
     if safe_gate_lane_inside "${value}" "${project_dir}"; then
       printf '%s' "${name}"
       return 0
@@ -3509,12 +3508,34 @@ safe_gate_project_lane_run() {
   # ours is ever written into it before publication.
   # Checked in both directions: the lane's directory inside the project, or the
   # project inside the lane's directory, would write into the project.
+  # safe's own storage paths are made canonical and absolute once, here, and used as such
+  # everywhere (a relative path would mean different directories in different phases).
+  data_root="$(realpath -m -- "${data_root}" 2>/dev/null)" || data_root=""
+  local tmp_root
+  tmp_root="$(realpath -m -- "${TMPDIR:-/tmp}" 2>/dev/null)" || tmp_root=""
+  if [[ "${data_root}" != /* || "${tmp_root}" != /* ]]; then
+    safe_gate_project_lane_refuse 100 "${verb}" "safe's data or temporary directory cannot be made absolute" "set SAFE_DATA_DIR and TMPDIR to absolute paths and retry"
+    return $?
+  fi
   local lane_dir="${data_root}/project-lane"
-  if safe_gate_lane_inside "${data_root}" "${project_dir}" || safe_gate_lane_inside "${TMPDIR:-/tmp}" "${project_dir}" \
-      || safe_gate_lane_project_inside "${project_dir}" "${lane_dir}" || safe_gate_lane_project_inside "${project_dir}" "${TMPDIR:-/tmp}/safe-gate-project-lane."; then
+  if safe_gate_lane_inside "${data_root}" "${project_dir}" || safe_gate_lane_inside "${tmp_root}" "${project_dir}" \
+      || safe_gate_lane_project_inside "${project_dir}" "${lane_dir}" || safe_gate_lane_project_inside "${project_dir}" "${tmp_root}/safe-gate-project-lane."; then
     safe_gate_project_lane_refuse 100 "${verb}" "safe's data directory or the temporary directory overlaps the project, where the lane writes nothing before publication" "point SAFE_DATA_DIR and TMPDIR outside the project and retry"
     return $?
   fi
+  # Configuration-file selectors and destination options in the caller's arguments would
+  # make npm read or write a path the caller names before anything is admitted: they
+  # refuse here, at the shell, before any npm run (an option after `--` is an operand).
+  local prev="" cfg_arg
+  for cfg_arg in "$@"; do
+    [[ "${cfg_arg}" != "--" ]] || break
+    case "${cfg_arg}" in
+      --userconfig|--userconfig=*|--globalconfig|--globalconfig=*|--prefix|--prefix=*|-C|--cache|--cache=*|--logs-dir|--logs-dir=*)
+        safe_gate_project_lane_unsupported "${verb}" "the option ${cfg_arg%%=*}, which selects a configuration file or a destination before it can be admitted"
+        return $?
+        ;;
+    esac
+  done
   # The operator-level destinations of npm in the environment are checked as
   # strings, without npm, before the first npm run.
   if value="$(safe_gate_lane_env_destinations "${project_dir}")"; then
@@ -3544,8 +3565,8 @@ safe_gate_project_lane_run() {
   fi
   # On every npm command line of the lane: an explicit cache and log destination
   # (outside the project) and no rewriting of a resolved registry host.
-  local -a dest=("--cache=${lane_dir}/npm-cache" "--logs-dir=${lane_dir}/npm-logs" "--logs-max=0" "--replace-registry-host=never")
-  scratch="$(mktemp -d "${TMPDIR:-/tmp}/safe-gate-project-lane.XXXXXX" 2>/dev/null)" || {
+  local -a dest=("--cache=${lane_dir}/npm-cache" "--logs-dir=${lane_dir}/npm-logs" "--logs-max=0" "--replace-registry-host=never" "--update-notifier=false")
+  scratch="$(mktemp -d "${tmp_root}/safe-gate-project-lane.XXXXXX" 2>/dev/null)" || {
     safe_gate_project_lane_refuse 100 "${verb}" "cannot allocate lane storage (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
     return $?
   }
@@ -3559,18 +3580,24 @@ safe_gate_project_lane_run() {
   fi
   # A genuine global install is not the lane's: it is recognised first, before
   # the lock and before the terminator refusal, and goes to today's gate. The
-  # probe runs in a scratch directory, so no project file or directory is read
-  # or created by it. `--json` goes before the terminator, where npm still reads
-  # it as an option.
-  local -a pre=() post=()
-  local split=0
+  # probe runs in a scratch directory, keeps the operator's own configuration
+  # sources (no prefix override), and is given ONLY the flags that decide global
+  # or local: never the caller's argument list.
+  local -a route_args=()
+  local route_next=0
   for arg in "$@"; do
-    if (( split == 0 )) && [[ "${arg}" == "--" ]]; then
-      split=1
+    [[ "${arg}" != "--" ]] || break
+    if (( route_next )); then
+      route_args+=("${arg}")
+      route_next=0
+      continue
     fi
-    if (( split )); then post+=("${arg}"); else pre+=("${arg}"); fi
+    case "${arg}" in
+      -g|--global|--global=*|--no-global|--location=*|--no-location) route_args+=("${arg}") ;;
+      --location) route_args+=("${arg}"); route_next=1 ;;
+    esac
   done
-  config_json="$(safe_gate_lane_npm_in "${scratch}/neutral" config list ${pre[@]+"${pre[@]}"} "${dest[@]}" "--prefix=${scratch}/neutral" --json ${post[@]+"${post[@]}"} 2>/dev/null)" || {
+  config_json="$(safe_gate_lane_npm_in "${scratch}/neutral" config list ${route_args[@]+"${route_args[@]}"} "${dest[@]}" --json 2>/dev/null)" || {
     safe_gate_project_lane_refuse 100 "${verb}" "npm's effective configuration cannot be read (audit-infrastructure breakage, not a package finding)" "fix npm configuration and retry — safe doctor"
     return $?
   }
@@ -3595,6 +3622,12 @@ safe_gate_project_lane_run() {
       return $?
       ;;
   esac
+  # A project inside a workspace root: npm would select the ancestor, and the lane would
+  # judge the member alone. Refused, before anything else is read from the project.
+  if value="$(safe_gate_project_lane_workspace_ancestor "${project_dir}")"; then
+    safe_gate_project_lane_unsupported "${verb}" "a project inside the workspace root ${value}"
+    return $?
+  fi
   # One exclusive kernel lock on the project directory, held until this process
   # exits, dry runs included.
   if ! command -v flock >/dev/null 2>&1; then
@@ -3749,7 +3782,9 @@ safe_gate_project_lane_run() {
   # The project's own .npmrc is read as text, here, before any npm run in the
   # project's context, and admitted against the allow-list.
   [[ ! -f "${snap}/.npmrc" ]] || admit_args+=(--npmrc "${snap}/.npmrc")
+  SAFE_GATE_LANE_ADMIT_BASELINE=1
   safe_gate_project_lane_admit "${verb}" "${admit_args[@]}" || return $?
+  SAFE_GATE_LANE_ADMIT_BASELINE=0
   cp -- "${scratch}/admit.json" "${scratch}/admit1.json" || return 100
   # npm's own parsers read what was admitted, and the npm is shown to enforce
   # the options the lane relies on, before anything is projected.
@@ -3790,7 +3825,7 @@ safe_gate_project_lane_run() {
   fi
 
   # --- private origins: today's check, first, as in today's gate --------------
-  safe_gate_project_lane_private_check "${verb}" "${snap}" "${scratch}/admit1.json" "$@"
+  safe_gate_project_lane_private_names "${verb}" "${scratch}/admit1.json"
   rc=$?
   if (( rc != 0 )); then
     return "${rc}"
@@ -3880,6 +3915,12 @@ safe_gate_project_lane_run() {
   # the sources its dependency edges name are held to the same rules after the
   # decision (a known block outranks an unsupported edge).
   safe_gate_project_lane_admit "${verb}" --registries-only --lockfile "${proj}/package-lock.json" --config "${scratch}/config.json" || return $?
+  # every projected name is matched against the private store before public evidence is requested
+  safe_gate_project_lane_private_names "${verb}" "${scratch}/admit.json"
+  rc=$?
+  if (( rc != 0 )); then
+    return "${rc}"
+  fi
 
   # --- 5. judging ---------------------------------------------------------------
   local target_graph="" diff_json="" request="" evidence="${scratch}/evidence.json" report="${scratch}/report.json"
@@ -3951,6 +3992,17 @@ safe_gate_project_lane_run() {
   fi
   # The decision is clear: the projected graph's sources are held to the rules now.
   safe_gate_project_lane_admit "${verb}" --lockfile "${proj}/package-lock.json" --config "${scratch}/config.json" || return $?
+  # ... and npm's own parser reads what this final admission admitted, before a dry run
+  # returns and before anything is bound.
+  rc=0
+  safe_gate_lane_agreement "${scratch}/admit.json" || rc=$?
+  if (( rc == 2 )); then
+    safe_gate_project_lane_unsupported "${verb}" "${SAFE_GATE_LANE_REASON}"
+    return $?
+  elif (( rc != 0 )); then
+    safe_gate_project_lane_refuse 100 "${verb}" "the selected npm's parser cannot be asked (audit-infrastructure breakage, not a package finding)" "rerun install.sh or run safe doctor, then retry"
+    return $?
+  fi
   if (( dry_run )); then
     safe_gate_err "safe: project lane: --dry-run: nothing was written to the project"
     return 0
@@ -4027,6 +4079,12 @@ safe_gate_project_lane_bind_result() {
   # One document whose outcome and exit agree with each other and with the
   # process status; a success also shows the strict verification and a
   # committed publication (the empty-tree success is a verified empty install).
+  # A binder that died of a signal before it produced any document was cancelled during
+  # start-up: an interruption (128 plus the signal), never an unusable result.
+  if [[ ! -s "${doc}" ]] && (( rc > 128 && rc < 193 )); then
+    safe_gate_project_lane_refuse "${rc}" "${verb}" "interrupted before the binder reported anything; the project is as it was" "rerun the command"
+    return $?
+  fi
   if ! jq -e -s --argjson rc "${rc}" '
       length == 1 and (.[0] | . as $d
       | $d.schema_version == 1 and ($d.outcome | type == "string") and ($d.exit | type == "number") and $d.exit == $rc

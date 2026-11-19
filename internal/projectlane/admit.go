@@ -320,6 +320,14 @@ type AdmitInput struct {
 	RegistriesOnly bool
 }
 
+// LockfileError is a lockfile that cannot be read or decoded (wrong shape,
+// repeated members, not JSON): evidence about the baseline that is missing, as
+// opposed to a source that is readable and not supported.
+type LockfileError struct{ Err error }
+
+func (e *LockfileError) Error() string { return "lockfile: " + e.Err.Error() }
+func (e *LockfileError) Unwrap() error { return e.Err }
+
 // CanonicalRegistry is the one registry the lane supports.
 const CanonicalRegistry = "https://registry.npmjs.org/"
 
@@ -391,21 +399,35 @@ func Admit(in AdmitInput) (Admission, error) {
 				checkDep(where, name, text, refuse, addName, note)
 			}
 		}
+		rootDeps := map[string]string{}
+		for _, section := range []string{"peerDependencies", "devDependencies", "optionalDependencies", "dependencies"} {
+			if value, ok := manifest[section]; ok {
+				var deps map[string]any
+				if json.Unmarshal(value, &deps) == nil {
+					for name, spec := range deps {
+						if text, ok := spec.(string); ok {
+							rootDeps[name] = text
+						}
+					}
+				}
+			}
+		}
 		if value, ok := manifest["overrides"]; ok && string(value) != "null" {
 			var overrides any
 			if err := json.Unmarshal(value, &overrides); err != nil {
 				return result, fmt.Errorf("manifest: overrides: %w", err)
 			}
-			walkOverrides("manifest.overrides", overrides, "", 0, refuse, addName, note)
+			walkOverrides("manifest.overrides", overrides, "", 0, rootDeps, refuse, addName, note)
 		}
 	}
 
 	if in.LockfileFile != "" {
 		raw, err := os.ReadFile(in.LockfileFile)
 		if err != nil {
-			return result, err
+			return result, &LockfileError{err}
 		}
 		var lock struct {
+			Legacy   map[string]any `json:"dependencies"`
 			Packages map[string]struct {
 				Name                 string         `json:"name"`
 				Dependencies         map[string]any `json:"dependencies"`
@@ -415,11 +437,12 @@ func Admit(in AdmitInput) (Admission, error) {
 			} `json:"packages"`
 		}
 		if err := strictjson.RejectRepeatedMembers(raw); err != nil {
-			return result, fmt.Errorf("lockfile: %w", err)
+			return result, &LockfileError{err}
 		}
 		if err := json.Unmarshal(raw, &lock); err != nil {
-			return result, fmt.Errorf("lockfile: %w", err)
+			return result, &LockfileError{err}
 		}
+		legacyNames(lock.Legacy, 0, addName)
 		paths := make([]string, 0, len(lock.Packages))
 		for path := range lock.Packages {
 			paths = append(paths, path)
@@ -433,6 +456,10 @@ func Admit(in AdmitInput) (Admission, error) {
 					name = packageNameOfPath(path)
 				}
 				addName(name)
+				// every name the path carries, nested ones included
+				for _, carried := range pathNames(path) {
+					addName(carried)
+				}
 			}
 			for kind, deps := range map[string]map[string]any{"dependencies": entry.Dependencies, "devDependencies": entry.DevDependencies,
 				"optionalDependencies": entry.OptionalDependencies, "peerDependencies": entry.PeerDependencies} {
@@ -486,6 +513,46 @@ func Admit(in AdmitInput) (Admission, error) {
 	return result, nil
 }
 
+// pathNames are the package names a lockfile path carries: one per
+// node_modules/ segment.
+func pathNames(path string) []string {
+	var names []string
+	for _, part := range strings.Split(path, "node_modules/")[1:] {
+		part = strings.TrimSuffix(part, "/")
+		segments := strings.SplitN(part, "/", 3)
+		switch {
+		case strings.HasPrefix(part, "@") && len(segments) >= 2:
+			names = append(names, segments[0]+"/"+segments[1])
+		case len(segments) >= 1 && segments[0] != "":
+			names = append(names, segments[0])
+		}
+	}
+	return names
+}
+
+// legacyNames adds the names of a version 2 lockfile's legacy dependencies
+// tree: its keys, the target of an `npm:` alias in a version, and its nested trees.
+func legacyNames(tree map[string]any, depth int, addName func(string)) {
+	if depth > 64 {
+		return
+	}
+	for name, node := range tree {
+		addName(name)
+		entry, ok := node.(map[string]any)
+		if !ok {
+			continue
+		}
+		if version, ok := entry["version"].(string); ok && strings.HasPrefix(strings.ToLower(version), "npm:") {
+			if class, target, _ := ClassifyArg(version[4:]); target != "" && class != "" {
+				addName(target)
+			}
+		}
+		if nested, ok := entry["dependencies"].(map[string]any); ok {
+			legacyNames(nested, depth+1, addName)
+		}
+	}
+}
+
 func sortedStringKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for key := range m {
@@ -514,7 +581,7 @@ func checkDep(where, name, spec string, refuse func(w, t, r string), addName fun
 // package with a name) and whose values are a spec string, a `$name` reference
 // or a nested object; the `.` key of an object holds the string that overrides
 // the object's own selector. Anything else is not typed overrides.
-func walkOverrides(where string, node any, parentName string, depth int, refuse func(w, t, r string), addName func(string), note func(k, n, s string)) {
+func walkOverrides(where string, node any, parentName string, depth int, rootDeps map[string]string, refuse func(w, t, r string), addName func(string), note func(k, n, s string)) {
 	if depth > 32 {
 		refuse(where, "", "overrides nested too deeply")
 		return
@@ -540,8 +607,20 @@ func walkOverrides(where string, node any, parentName string, depth int, refuse 
 		switch value := object[key].(type) {
 		case string:
 			if strings.HasPrefix(value, "$") {
-				if !ValidPackageName(value[1:]) {
+				// A reference is resolved against the ROOT's own dependency of that name; the
+				// spec it denotes is admitted. A reference the root does not declare would be
+				// resolved against the depending package: refused.
+				ref := value[1:]
+				spec, declared := rootDeps[ref]
+				switch {
+				case !ValidPackageName(ref):
 					refuse(keyWhere, value, "an override reference that is not a package name")
+				case !declared:
+					refuse(keyWhere, value, "an override reference to a dependency the root does not declare")
+				case !IsRegistry(ClassifySpec(spec)):
+					refuse(keyWhere, value, "an override reference to a dependency that is not a registry package")
+				default:
+					note("override-value", ref, spec)
 				}
 				continue
 			}
@@ -555,7 +634,7 @@ func walkOverrides(where string, node any, parentName string, depth int, refuse 
 				refuse(keyWhere, "", "a self-override that is an object, not a string")
 				continue
 			}
-			walkOverrides(keyWhere, value, name, depth+1, refuse, addName, note)
+			walkOverrides(keyWhere, value, name, depth+1, rootDeps, refuse, addName, note)
 		default:
 			refuse(keyWhere, "", "an override that is neither a string nor an object")
 		}
