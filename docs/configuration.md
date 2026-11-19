@@ -239,12 +239,21 @@ pass and warnings under `environment.release_follow`.
   a changed plan for `dedupe` on a project that needs it, and `prune` drops from the lockfile the entries
   nothing needs; when `prune` only has a tree to prune, the plan is the lockfile unchanged and nothing is
   introduced); the frozen installation of the judged lockfile is what yields the deduplicated or pruned
-  tree. npm's `dedupe` saves nothing in lockfile-only mode when no package name is duplicated (a surplus
-  entry stays in the lockfile it leaves behind, and with no lockfile nothing is written), so then the
-  judged plan is obtained from npm by a second lockfile-only step, a plain `install` of the same
-  arguments, which makes npm write the lockfile of the ideal tree it computed (the manifest must come
-  out as it went in; a plan that cannot be obtained refuses). npm's `prune` writes its lockfile in every
-  case and needs no second step. The lane substitutes a canonical verb only when the selected npm itself
+  tree. Nothing stands in for npm's own `dedupe`. npm's `dedupe` saves nothing in lockfile-only mode when no
+  package name is duplicated, so: when npm's run wrote a lockfile that differs from the snapshot's, that
+  lockfile is the plan; when it wrote none (or left the bytes as they were), the plan is the lockfile on disk,
+  byte for byte, provided npm's own frozen check (the one `ci` runs) accepts it. A lockfile out of step with
+  the manifest refuses with npm's diagnostic and status (the way out is `npm install` first). With no
+  lockfile, `dedupe` and `prune` refuse 100: npm would work from the installed tree, which the lane does not
+  read (a lockfile-only run in the scratch copy would resolve a newer version than the resident one).
+  A lockfile entry the frozen installation does not build (one nothing in the manifest needs) is caught by the
+  binder's tree verification before anything is published, and the refusal says to run `npm install` first.
+  npm's `prune` writes its lockfile in every case where one exists. Every npm run whose output the lane reads
+  (the frozen check, the projections) carries its own heading, no colour and a log level that shows errors
+  (the selected npm must define them), so the caller's presentation settings cannot hide npm's error; when no
+  error line can be read the cleaned end of npm's output is shown and the final line says so. An option before
+  the verb refuses before npm is asked about the token (safe's and npm's readings of which word is the command
+  can differ there). The lane substitutes a canonical verb only when the selected npm itself
   resolves the caller's token to it: a token the gate's conservative classifier takes for one of the
   lane's verbs and npm does not resolve (`clean`, `install-c`, an ambiguous prefix) is left to npm
   (today's gate exactly as with the switch off, which delegates it for npm's own rejection); the lane

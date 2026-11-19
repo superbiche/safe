@@ -2,12 +2,22 @@
 
 ## Unreleased
 
+- Project lane, `ci`/`dedupe`/`prune`, second critical review. An option before the verb refuses before npm
+  is asked what the token resolves to (`npm --json=prefix de`: npm takes `prefix`). Nothing stands in for npm's
+  own `dedupe` any more (the second lockfile-only `install` is gone): a lockfile npm wrote is the plan; if it
+  wrote none, the plan is the lockfile on disk, byte for byte, after npm's own frozen check (the check `ci`
+  runs; out of step refuses with npm's diagnostic and status); with no lockfile `dedupe` and `prune` refuse
+  (npm would work from the installed tree, which the lane does not read); an entry the frozen install does
+  not build is refused by the binder's verification before publication, with a way out. The runs whose output
+  the lane reads carry a fixed heading, no colour and a log level that shows errors (the selected npm must
+  define them), and when no error line can be read the end of npm's output is shown and the final line says
+  so. The `ci` malice line counts the target's distinct identities.
 - Project lane, `ci`/`dedupe`/`prune`, after the critical review. The lane substitutes a canonical verb only
   when the selected npm itself resolves the caller's token to it (its own `deref`, asked through one offline
   Node run): `npm clean`, `install-c` and ambiguous prefixes are left to npm, never run as `ci`; a token
   npm resolves to another command than safe's table does refuses, never passes through. npm's
   `dedupe` saves nothing in lockfile-only mode when no name is duplicated, so the plan it leaves (a surplus
-  entry dropped, a lockfile created) is obtained by a second lockfile-only step instead of taking the copied
+  entry dropped, a lockfile created) was first obtained by a second lockfile-only step (replaced by the rule of the entry above) instead of taking the copied
   lockfile for it (`prune` writes in every case). npm's own error from the frozen check (code and message,
   wherever they are in its output; no log noise or usage text) is shown, the final line is neutral about the
   cause, and the exit status is npm's. `prune --package-lock-only` refuses. The `ci` report tells entries

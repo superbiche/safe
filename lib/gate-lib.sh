@@ -2946,12 +2946,12 @@ safe_gate_project_lane_decide() {
 # follows an EUSAGE message left out. Shows them prefixed on stderr and sets SAFE_GATE_LANE_NPM_CODE
 # to npm's error code ("" when npm gave none; only [A-Za-z0-9_-] is kept).
 safe_gate_lane_show_npm_error() {
-  local file="$1" text count=0 code="" body=""
+  local file="$1" text count=0 code="" body="${SAFE_GATE_LANE_SCRATCH:-/tmp}/npm-error-lines.$$"
   SAFE_GATE_LANE_NPM_CODE=""
-  # the lines are sorted in the lane's own scratch directory, never under a shared, guessable name
-  [[ -n "${SAFE_GATE_LANE_SCRATCH:-}" && -d "${SAFE_GATE_LANE_SCRATCH}" ]] || return 0
-  body="${SAFE_GATE_LANE_SCRATCH}/npm-error-lines"
+  SAFE_GATE_LANE_NPM_SHOWN_TEXT="npm printed nothing"
   [[ -s "${file}" ]] || return 0
+  # npm's error lines, whatever the log noise around them (the lane runs npm with a fixed heading, no
+  # colour and a log level that shows errors, so they carry the `npm error` prefix)
   LC_ALL=C grep -a -E '^npm (error|ERR!)( |$)' -- "${file}" 2>/dev/null | LC_ALL=C sed -E 's/^npm (error|ERR!) ?//' > "${body}" || true
   code="$(sed -n -E 's/^code ([A-Za-z0-9_-]+).*$/\1/p' "${body}" | head -n 1)"
   SAFE_GATE_LANE_NPM_CODE="${code}"
@@ -2963,7 +2963,6 @@ safe_gate_lane_show_npm_error() {
   for (( i=0; i<${#all[@]}; i++ )); do
     if [[ "${all[i]}" == "Usage:" ]]; then
       cut=$i
-      # back over the blank line and the description before it
       while (( cut > 0 )) && [[ -z "${all[cut-1]// /}" ]]; do cut=$((cut - 1)); done
       (( cut > 0 )) && cut=$((cut - 1))
       break
@@ -2978,6 +2977,13 @@ safe_gate_lane_show_npm_error() {
     (( count < 14 )) || break
   done
   rm -f -- "${body}"
+  if (( count > 0 )); then
+    SAFE_GATE_LANE_NPM_SHOWN_TEXT="npm's diagnostic is above"
+    return 0
+  fi
+  # no error line could be read: the cleaned end of npm's output is shown instead, and said to be that
+  safe_gate_lane_render "${file}" "npm output: " 12
+  SAFE_GATE_LANE_NPM_SHOWN_TEXT="npm printed no error line that could be read, so the end of its output is above"
   return 0
 }
 
@@ -3308,12 +3314,12 @@ safe_gate_lane_resolve_command() {
 safe_gate_lane_capability() {
   local in="${SAFE_GATE_LANE_SCRATCH}/capability.in" out="${SAFE_GATE_LANE_SCRATCH}/capability.out" floor="11.12.1"
   jq -n --arg floor "${floor}" '$ARGS.positional as $o | {floor: $floor, options: $o}' \
-    --args allow-git git replace-registry-host cache logs-dir logs-max > "${in}" || return 1
+    --args allow-git git replace-registry-host cache logs-dir logs-max heading color loglevel > "${in}" || return 1
   safe_gate_lane_probe_node capability "${in}" "${out}" || return 1
   # a positive "this npm lacks them" needs a semantic version and options that were asked about
   jq -e -s 'length == 1 and (.[0] | (.version | type == "string") and (.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.+-]*)?$"))
       and (.atFloor | type == "boolean") and (.missing | type == "array")
-      and ([.missing[] | . as $m | ["allow-git","git","replace-registry-host","cache","logs-dir","logs-max"] | index($m) != null] | all))' "${out}" >/dev/null 2>&1 || return 1
+      and ([.missing[] | . as $m | ["allow-git","git","replace-registry-host","cache","logs-dir","logs-max","heading","color","loglevel"] | index($m) != null] | all))' "${out}" >/dev/null 2>&1 || return 1
   SAFE_GATE_LANE_CAP_VERSION="$(jq -r -s '.[0].version' "${out}")"
   jq -e -s '.[0] | .atFloor == true and (.missing | length) == 0' "${out}" >/dev/null 2>&1 || {
     SAFE_GATE_LANE_REASON="an npm (${SAFE_GATE_LANE_CAP_VERSION}) that is older than ${floor} or does not define $(jq -r -s '.[0].missing | join(", ")' "${out}") — it cannot be shown to keep git sources out"
@@ -3944,6 +3950,14 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_refuse 100 "${verb}" "cannot prepare lane storage (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
     return $?
   fi
+  # An option before the verb refuses BEFORE npm is asked what the token resolves to: safe's reading of
+  # which word is the command and npm's can differ when an option precedes it (`npm --json=prefix de`:
+  # npm takes `prefix`), and the answer about the token says nothing about the command npm will run.
+  # Only with the token as the first argument is "the word npm takes for its command" the token.
+  if (( SAFE_GATE_SUBCMD_IDX != 1 )) || [[ "${1:-}" != "${subcommand}" ]]; then
+    safe_gate_project_lane_unsupported "${verb}" "an option before the verb"
+    return $?
+  fi
   # The lane substitutes a canonical verb only when the selected npm ITSELF resolves the caller's token
   # to it. The gate's classifier is conservative (an unknown prefix of `ci` is a `ci` to it, so it audits);
   # npm rejects such a token (`clean`, `install-c`, an ambiguous prefix) and runs nothing. The lane does
@@ -4005,10 +4019,6 @@ safe_gate_project_lane_run() {
   fi
   if ! flock -n -x "${SAFE_GATE_LANE_LOCKFD}"; then
     safe_gate_project_lane_refuse 100 "${verb}" "another command holds this project's lock" "wait for it to finish, then retry"
-    return $?
-  fi
-  if (( SAFE_GATE_SUBCMD_IDX != 1 )); then
-    safe_gate_project_lane_unsupported "${verb}" "an option before the verb"
     return $?
   fi
   if [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]]; then
@@ -4423,55 +4433,47 @@ safe_gate_project_lane_run() {
     return "${rc}"
   fi
   rc=0
+  # The options of every npm run whose output the lane CAPTURES and reads (the frozen check, the
+  # projections): a fixed heading, no colour and a log level that shows errors, on the command line, so
+  # that the caller's presentation settings (heading, colour, log level, in the environment or a
+  # configuration file) cannot hide npm's own error from the lane. The run whose output goes to the user
+  # (the binder's frozen installation) keeps the caller's settings.
+  local -a capture_flags=(--heading=npm --no-color --loglevel=error)
   if [[ "${verb}" == "ci" ]]; then
     # ci has no projection: the plan IS the lockfile on disk, checked against the manifest by npm's
-    # own frozen check (`npm ci --dry-run`, in the frozen copy, with the lane's flags: no tree is
-    # touched and nothing is fetched for a lockfile in step). npm's own diagnostic, and its status,
-    # reach the operator when the two are out of step or the lockfile is missing.
-    safe_gate_lane_npm_in "${frozen}" ci --dry-run --ignore-scripts --no-audit --no-fund \
-      "--git=${SAFE_GATE_LANE_GIT}" --allow-git=none "${dest[@]}" ${carry[@]+"${carry[@]}"} >"${scratch}/npm-frozen-check.log" 2>&1 || rc=$?
-    if (( rc != 0 )); then
-      safe_gate_lane_show_npm_error "${scratch}/npm-frozen-check.log"
-      safe_gate_project_lane_refuse "${rc}" "${verb}" "npm's own frozen check failed with npm exit ${rc}${SAFE_GATE_LANE_NPM_CODE:+ (code ${SAFE_GATE_LANE_NPM_CODE})}; npm's diagnostic is above" "fix the cause npm printed and retry"
-      return $?
-    fi
+    # own frozen check (see safe_gate_project_lane_frozen_check)
+    safe_gate_project_lane_frozen_check "${verb}" "fix the cause npm printed and retry" || return $?
     # the judged plan is the snapshot's lockfile, byte for byte
     if ! safe_gate_lane_cp "${snap}/package-lock.json" "${proj}/package-lock.json"; then
       safe_gate_project_lane_refuse 100 "${verb}" "cannot prepare the judged plan (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
       return $?
     fi
   else
+    # dedupe and prune work, without a lockfile, from the INSTALLED tree (npm reads the resident
+    # packages and keeps them), which the lane does not read; a lockfile-only run in the scratch copy
+    # would resolve a different graph (a resident x@1.0.0 against a range that also takes 1.1.0). The
+    # lane's plan for them is a lockfile on disk or nothing.
+    if [[ "${verb}" == "dedupe" || "${verb}" == "prune" ]] && (( ! disk_lock )); then
+      safe_gate_project_lane_refuse 100 "${verb}" "npm ${verb} on a project with no lockfile is not covered by the project lane: without one npm works from the installed tree, which the lane does not read" "run npm install first, so that the project has a lockfile, then retry"
+      return $?
+    fi
     safe_gate_lane_npm_in "${proj}" --package-lock-only --ignore-scripts --no-audit --no-fund \
-      "--git=${SAFE_GATE_LANE_GIT}" --allow-git=none "${dest[@]}" "${proj_args[@]}" >"${scratch}/npm-projection.log" 2>&1 || rc=$?
+      "--git=${SAFE_GATE_LANE_GIT}" --allow-git=none "${dest[@]}" "${capture_flags[@]}" "${proj_args[@]}" >"${scratch}/npm-projection.log" 2>&1 || rc=$?
     if (( rc != 0 )); then
-      safe_gate_lane_show_npm_log "${scratch}/npm-projection.log"
-      safe_gate_project_lane_refuse "${rc}" "${verb}" "the projection failed with npm exit ${rc} (npm could not resolve the command; its own diagnostic is above)" "fix the cause npm printed and retry"
+      safe_gate_lane_show_npm_error "${scratch}/npm-projection.log"
+      safe_gate_project_lane_refuse "${rc}" "${verb}" "the projection failed with npm exit ${rc}${SAFE_GATE_LANE_NPM_CODE:+ (code ${SAFE_GATE_LANE_NPM_CODE})}; ${SAFE_GATE_LANE_NPM_SHOWN_TEXT}" "fix the cause npm printed and retry"
       return $?
     fi
     # npm's `dedupe` saves nothing in lockfile-only mode when no package name is duplicated (it sets
-    # save to false, and only an update list of duplicate names makes it write the lockfile). The
-    # lockfile in the scratch copy is then the OLD one, while the ideal tree npm computed may differ
-    # (a surplus entry dropped; with no lockfile, a whole graph) and the command would leave the project
-    # in THAT state. The judged plan must be what npm leaves, so it is obtained from npm: a second
-    # lockfile-only step, a plain `install` of the same arguments, makes npm write the lockfile of the
-    # ideal tree it computes from the same manifest and lockfile. With no duplicate name there is nothing
-    # for dedupe's preference to prefer, so that tree is dedupe's. The manifest must come out as it went
-    # in, and a plan that cannot be obtained refuses. (npm's `prune` writes its lockfile in every case.)
+    # save to false, and only an update list of duplicate names makes it write the lockfile). Nothing
+    # stands in for npm's own plan: when npm WROTE a lockfile that differs from the snapshot's, that
+    # lockfile is the plan; when it wrote none (or left the bytes as they were), the plan is the lockfile
+    # on disk, byte for byte, provided npm's own frozen check accepts it (the check `ci` runs). A
+    # lockfile out of step with the manifest fails that check, and is refused with npm's diagnostic.
     if [[ "${verb}" == "dedupe" ]] && { [[ ! -f "${proj}/package-lock.json" ]] || cmp -s -- "${snap}/package-lock.json" "${proj}/package-lock.json" 2>/dev/null; }; then
-      rc=0
-      safe_gate_lane_npm_in "${proj}" --package-lock-only --ignore-scripts --no-audit --no-fund \
-        "--git=${SAFE_GATE_LANE_GIT}" --allow-git=none "${dest[@]}" install "${proj_args[@]:1}" >"${scratch}/npm-projection2.log" 2>&1 || rc=$?
-      if (( rc != 0 )); then
-        safe_gate_lane_show_npm_log "${scratch}/npm-projection2.log"
-        safe_gate_project_lane_refuse "${rc}" "${verb}" "npm's dedupe saved no lockfile and the plan it leaves could not be obtained (the lockfile-only step that writes it failed with npm exit ${rc}; its own diagnostic is above)" "fix the cause npm printed and retry"
-        return $?
-      fi
-      if ! cmp -s -- "${snap}/package.json" "${proj}/package.json"; then
-        safe_gate_project_lane_refuse 100 "${verb}" "the step that obtains npm's dedupe plan changed package.json, which a dedupe never does, so the plan cannot be judged" "run npm install yourself, review the result, and retry"
-        return $?
-      fi
-      if [[ ! -f "${proj}/package-lock.json" ]]; then
-        safe_gate_project_lane_refuse 100 "${verb}" "npm's dedupe left no lockfile to judge" "run npm install to create one, then retry"
+      safe_gate_project_lane_frozen_check "${verb}" "run npm install first, so that the lockfile is in step with the manifest, then retry" || return $?
+      if ! safe_gate_lane_cp "${snap}/package-lock.json" "${proj}/package-lock.json"; then
+        safe_gate_project_lane_refuse 100 "${verb}" "cannot prepare the judged plan (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
         return $?
       fi
     fi
@@ -4581,11 +4583,12 @@ safe_gate_project_lane_run() {
     local ci_line=""
     ci_line="$(jq -r --slurpfile g "${scratch}/target-graph.json" --slurpfile e "${evidence}" --arg kind "${baseline_kind}" '
       def n($s): [.advisories.already_present[] | select(.severity == $s)] | length;
-      ([$e[0].identities[] | select(.coverage == "complete")] | length) as $ok
-      | ($e[0].identities | length) as $all
+      ([$g[0].graph.occurrences[] | select(.kind == "registry") | "\(.name)@\(.version)"] | unique) as $t
+      | ([$e[0].identities[] | select(.coverage == "complete") | "\(.name)@\(.version)" | select(. as $k | $t | index($k) != null)] | length) as $ok
+      | ($t | length) as $all
       | "safe: project lane: npm ci: \($g[0].graph.occurrences | length) entries of the lockfile "
         + (if $ok == $all then "checked for malice (blocklist by name, known-malware records)"
-           else "submitted for the malice check (blocklist by name checked; known-malware records read for \($ok) of \($all) identities, the rest unread)" end)
+           else "submitted for the malice check (blocklist by name checked; known-malware records read for \($ok) of \($all) identities of the target, the rest unread)" end)
         + "; baseline: \($kind); \(.advisories.already_present | length) advisories already present"
         + (if (.advisories.already_present | length) > 0
            then " (" + ([["critical", n("critical")], ["high", n("high")], ["moderate", n("moderate")], ["low", n("low")], ["unknown", ([.advisories.already_present[] | select(.severity != "critical" and .severity != "high" and .severity != "moderate" and .severity != "low")] | length)]]
@@ -4725,6 +4728,22 @@ safe_gate_project_lane_run() {
   return "${rc}"
 }
 
+# npm's own frozen check of the lockfile on disk against the manifest: `npm ci --dry-run`, in the frozen
+# copy, with the lane's flags (no tree is touched, nothing is fetched for a lockfile in step). npm's
+# error, and its status, reach the operator when it fails. $1 verb, $2 the way out for the final line.
+# Reads the locals of safe_gate_project_lane_run (scratch, frozen, dest, carry, capture_flags).
+safe_gate_project_lane_frozen_check() {
+  local verb="$1" todo="$2" rc=0
+  safe_gate_lane_npm_in "${frozen}" ci --dry-run --ignore-scripts --no-audit --no-fund \
+    "--git=${SAFE_GATE_LANE_GIT}" --allow-git=none "${dest[@]}" "${capture_flags[@]}" ${carry[@]+"${carry[@]}"} >"${scratch}/npm-frozen-check.log" 2>&1 || rc=$?
+  if (( rc != 0 )); then
+    safe_gate_lane_show_npm_error "${scratch}/npm-frozen-check.log"
+    safe_gate_project_lane_refuse "${rc}" "${verb}" "npm's own frozen check failed with npm exit ${rc}${SAFE_GATE_LANE_NPM_CODE:+ (code ${SAFE_GATE_LANE_NPM_CODE})}; ${SAFE_GATE_LANE_NPM_SHOWN_TEXT}" "${todo}"
+    return $?
+  fi
+  return 0
+}
+
 # What the binder reported, to the operator, and the command's exit status.
 safe_gate_project_lane_bind_result() {
   local verb="$1" rc="$2" doc="$3" files_only="${4:-0}" outcome="" line="" detail="" npm_status=""
@@ -4788,7 +4807,7 @@ safe_gate_project_lane_bind_result() {
       return $?
       ;;
     verification_failed)
-      safe_gate_project_lane_refuse 100 "${verb}" "the installed tree differs from the judged lockfile ($(jq -r '[.verification.problems[]? | "\(.path): \(.problem)"] | .[0:3] | join("; ")' "${doc}" 2>/dev/null)); nothing was published: the project is as it was" "retry the command; if it repeats, report it with safe doctor"
+      safe_gate_project_lane_refuse 100 "${verb}" "the installed tree differs from the judged lockfile ($(jq -r '[.verification.problems[]? | "\(.path): \(.problem)"] | .[0:3] | join("; ")' "${doc}" 2>/dev/null)); nothing was published: the project is as it was" "if the lockfile lists entries that no dependency of the manifest needs (a stale or hand-edited one), run npm install first to refresh it and retry; otherwise retry, and report it with safe doctor if it repeats"
       return $?
       ;;
     inputs_changed)

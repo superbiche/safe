@@ -371,26 +371,47 @@ if [[ "${tool}" == "npm" && "${1:-}" == "config" && "${2:-}" == "get" ]]; then
   exit "${NPM_LOCKDIFF_CONFIG_STATUS:-0}"
 fi
 
+# What npm prints, as the caller's presentation settings (and the lane's own flags, which win) shape it: the
+# heading, colour (an escape at the start of a line), and a log level that drops what is below it.
+stub_emit() {
+  local heading="${npm_config_heading:-npm}" color="${npm_config_color:-}" level="${npm_config_loglevel:-notice}" a line
+  for a in "${stub_args[@]}"; do
+    case "${a}" in --heading=*) heading="${a#--heading=}" ;; --no-color) color=false ;; --loglevel=*) level="${a#--loglevel=}" ;; esac
+  done
+  [[ "${level}" != silent ]] || { cat >/dev/null; return 0; }
+  while IFS= read -r line; do
+    case "${line}" in "npm silly "*|"npm verbose "*) [[ "${level}" == silly || "${level}" == verbose ]] || continue ;; esac
+    line="${heading} ${line#npm }"
+    if [[ "${color}" == always ]]; then printf '\033[31m%s\033[0m\n' "${line}"; else printf '%s\n' "${line}"; fi
+  done
+}
+
 # Project lane, ci: npm's own frozen check (`npm ci --dry-run`): a missing lockfile or one out of step
 # with the manifest is npm's own error (code EUSAGE), nothing is touched, nothing is installed.
 if [[ "${tool}" == "npm" && "${1:-}" == "ci" && ${is_projection} -eq 0 && " $* " == *" --dry-run "* ]]; then
   printf 'CICHECK\t%s\n' "$(basename "${PWD}")" >> "${SAFE_INSTALL_COMMAND_LOG}"
+  stub_args=("$@")
+  if [[ "${NPM_CI_CHECK_ERROR:-}" == "NOLINES" ]]; then
+    printf 'npm warn something odd happened\nsomething else went wrong\nnpm notice and then it stopped\n' | stub_emit >&2
+    exit 1
+  fi
+  if [[ "${NPM_CI_CHECK_ERROR:-}" == "EMPTY" ]]; then exit 1; fi
   # a verbose log level: npm's log noise comes BEFORE its error, and some after it
   if [[ "${NPM_CI_CHECK_NOISE:-0}" == "1" ]]; then
-    for noise in $(seq 1 120); do printf 'npm silly config load:file:/x/%s\n' "${noise}" >&2; done
+    for noise in $(seq 1 120); do printf 'npm silly config load:file:/x/%s\n' "${noise}"; done | stub_emit >&2
   fi
   if [[ "${NPM_CI_CHECK_ERROR:-}" == "EBADPLATFORM" ]]; then
-    printf 'npm error code EBADPLATFORM\nnpm error notsup Unsupported platform for fsevents@2.3.3: wanted {"os":"aix"} (current: {"os":"linux","arch":"x64"})\nnpm error notsup Valid os:  aix\nnpm error notsup Actual os: linux\n' >&2
-    [[ "${NPM_CI_CHECK_NOISE:-0}" != "1" ]] || printf 'npm verbose exit 1\nnpm verbose code 1\n' >&2
+    printf 'npm error code EBADPLATFORM\nnpm error notsup Unsupported platform for fsevents@2.3.3: wanted {"os":"aix"} (current: {"os":"linux","arch":"x64"})\nnpm error notsup Valid os:  aix\nnpm error notsup Actual os: linux\n' | stub_emit >&2
+    [[ "${NPM_CI_CHECK_NOISE:-0}" != "1" ]] || printf 'npm verbose exit 1\nnpm verbose code 1\n' | stub_emit >&2
     exit 1
   fi
   if [[ ! -f package-lock.json ]]; then
-    printf 'npm error code EUSAGE\nnpm error\nnpm error The `npm ci` command can only install with an existing package-lock.json or\nnpm error npm-shrinkwrap.json with lockfileVersion >= 1.\n' >&2
-    [[ "${NPM_CI_CHECK_NOISE:-0}" != "1" ]] || printf 'npm verbose exit 1\n' >&2
+    printf 'npm error code EUSAGE\nnpm error\nnpm error The `npm ci` command can only install with an existing package-lock.json or\nnpm error npm-shrinkwrap.json with lockfileVersion >= 1.\n' | stub_emit >&2
+    [[ "${NPM_CI_CHECK_NOISE:-0}" != "1" ]] || printf 'npm verbose exit 1\n' | stub_emit >&2
     exit 1
   fi
   if [[ -n "${NPM_CI_CHECK_STATUS:-}" ]]; then
-    printf 'npm error code EUSAGE\nnpm error\nnpm error `npm ci` can only install packages when your package.json and package-lock.json or npm-shrinkwrap.json are in sync. Please update your lock file with `npm install` before continuing.\nnpm error\nnpm error Invalid: lock file'"'"'s kept@1.0.0 does not satisfy kept@^2.0.0\nnpm error\nnpm error Clean install a project\nnpm error\nnpm error Usage:\nnpm error npm ci\nnpm error\nnpm error Options:\nnpm error [--install-strategy <hoisted|nested|shallow|linked>]\n' >&2
+    printf 'npm error code EUSAGE\nnpm error\nnpm error `npm ci` can only install packages when your package.json and package-lock.json or npm-shrinkwrap.json are in sync. Please update your lock file with `npm install` before continuing.\nnpm error\nnpm error Invalid: lock file'"'"'s kept@1.0.0 does not satisfy kept@^2.0.0\nnpm error\nnpm error Clean install a project\nnpm error\nnpm error Usage:\nnpm error npm ci\nnpm error\nnpm error Options:\nnpm error [--install-strategy <hoisted|nested|shallow|linked>]\n' | stub_emit >&2
     exit "${NPM_CI_CHECK_STATUS}"
   fi
   exit 0
@@ -453,12 +474,9 @@ if [[ "${tool}" == "npm" && ${is_projection} -eq 1 && "${1:-}" == "--package-loc
     : > "${HOME}/.projection-started"
     sleep "${NPM_PROJECTION_SLEEP}"
   fi
-  if [[ -n "${NPM_DEDUPE_SECOND_FAIL:-}" && " $* " == *" install "* ]]; then
-    printf 'npm error code E500\nnpm error the second step failed\n' >&2
-    exit "${NPM_DEDUPE_SECOND_FAIL}"
-  fi
   if [[ -n "${NPM_PROJECTION_FAIL:-}" ]]; then
-    printf 'npm error code E404\nnpm error 404 Not Found - GET https://user:hunter2@registry.example/x\n' >&2
+    stub_args=("$@")
+    printf 'npm error code E404\nnpm error 404 Not Found - GET https://user:hunter2@registry.example/x\n' | stub_emit >&2
     exit "${NPM_PROJECTION_FAIL}"
   fi
 fi
@@ -965,7 +983,6 @@ run_zsh() {
     NPM_CI_INTERRUPT="${NPM_CI_INTERRUPT:-}" \
     NPM_CI_STATUS="${NPM_CI_STATUS:-}" \
     NPM_CI_CHECK_STATUS="${NPM_CI_CHECK_STATUS:-}" \
-    NPM_DEDUPE_SECOND_FAIL="${NPM_DEDUPE_SECOND_FAIL:-}" \
     NPM_DEDUPE_SAVES_NOTHING="${NPM_DEDUPE_SAVES_NOTHING:-}" \
     NPM_CI_CHECK_ERROR="${NPM_CI_CHECK_ERROR:-}" \
     NPM_CI_CHECK_NOISE="${NPM_CI_CHECK_NOISE:-}" \
@@ -8051,7 +8068,7 @@ case_project_lane_clean_add_in_a_project_with_findings_passes() {
   assert_err_contains_fragment '1 already present (highest: critical)' "$FUNCNAME" || return
   assert_err_contains_fragment 'install scripts are declared by clean@2.0.0, vuln@1.0.0' "$FUNCNAME" || return
   assert_err_contains_fragment 'scripts do not run on this lane yet' "$FUNCNAME" || return
-  grep -qP '^PROJECTION\tnpm\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund\t--git=/bin/false\t--allow-git=none\t--cache=\S+\t--logs-dir=\S+\t--logs-max=0\t--replace-registry-host=never\t--update-notifier=false\tinstall\tclean@2.0.0$' "${LOG_FILE}" || { fail "$FUNCNAME: the projection's command line"; return; }
+  grep -qP '^PROJECTION\tnpm\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund\t--git=/bin/false\t--allow-git=none\t--cache=\S+\t--logs-dir=\S+\t--logs-max=0\t--replace-registry-host=never\t--update-notifier=false\t--heading=npm\t--no-color\t--loglevel=error\tinstall\tclean@2.0.0$' "${LOG_FILE}" || { fail "$FUNCNAME: the projection's command line"; return; }
   assert_log_not_contains_fragment $'REAL\tnpm\tinstall' "$FUNCNAME" || return
   [[ "$(cat "${WORK_DIR}/package.json")" == "${LANE_CLEAN_ADD_MANIFEST}" ]] || { fail "$FUNCNAME: manifest is not the judged one"; return; }
   [[ "$(cat "${WORK_DIR}/package-lock.json")" == "${target}" ]] || { fail "$FUNCNAME: lockfile is not the judged one"; return; }
@@ -9011,7 +9028,7 @@ case_project_lane_projection_failure_stays_npms() {
   NPM_PROJECTION_FAIL=1 lane_run 'npm install clean@2.0.0'
   assert_status 1 "$FUNCNAME" || return
   assert_lane_final_line install "$FUNCNAME" || return
-  assert_err_contains_fragment 'npm: npm error code E404' "$FUNCNAME" || return
+  assert_err_contains_fragment 'npm: code E404' "$FUNCNAME" || return
   assert_err_contains_fragment 'the projection failed with npm exit 1' "$FUNCNAME" || return
   assert_err_not_contains_fragment 'hunter2' "$FUNCNAME" || return
   assert_lane_untouched "${before}" "$FUNCNAME" || return
@@ -12152,87 +12169,85 @@ case_project_lane_routing_a_token_npm_does_not_resolve_is_left_to_npm() {
   pass "$FUNCNAME"
 }
 
-# 2. dedupe's real plan. npm's dedupe, in lockfile-only mode, writes nothing when no name is duplicated: the lane
-# obtains the plan npm leaves by a second lockfile-only step (a plain install of the same arguments), and judges
-# THAT, never the copied lockfile. The four cases: duplicates present (npm writes), no duplicate but a surplus
-# entry, nothing to do, no lockfile. prune writes its lockfile in every case.
+# 2. Nothing stands in for npm's own dedupe. When npm's lockfile-only dedupe WROTE a lockfile that differs from the
+# snapshot's, that lockfile is the plan; when it wrote none (it saves nothing when no name is duplicated), the plan is
+# the lockfile on disk, byte for byte, provided npm's own frozen check accepts it (the check ci runs). A lockfile out of
+# step refuses with npm's diagnostic and status; no lockfile refuses 100 (dedupe and prune); a lockfile entry the
+# frozen installation does not build is caught by the binder's verification before anything is published.
 case_project_lane_dedupe_judges_the_plan_npm_leaves() {
   skip_lockdiff_case "$FUNCNAME" || return
   local before target
-  # (a) duplicates present: npm writes the plan; no second step
+  # (a) duplicates present: npm writes the plan; that lockfile is judged; no frozen check of the old one
   lane_prepare "lane-dedupe-dups" kept@1.0.0 dup@1.1.0
   lane_consistent_graph kept@1.0.0 dup@1.1.0
   jq -c --argjson old "$(lane_lock dup@1.0.0 | jq -c '.packages["node_modules/dup"]')" '.packages["node_modules/kept/node_modules/dup"] = $old' "${WORK_DIR}/package-lock.json" > "${WORK_DIR}/lock.new"
   mv "${WORK_DIR}/lock.new" "${WORK_DIR}/package-lock.json"
   lane_commit
   target="$(lane_lock kept@1.0.0 dup@1.1.0 | jq -c '.packages[""] += {dependencies: {kept: "1.0.0", dup: "1.1.0"}}')"
+  : > "${LOG_FILE}"
   NPM_LOCK_MUTATION_JSON="${target}" lane_run 'npm dedupe'
   assert_status 0 "$FUNCNAME: duplicates" || return
-  [[ "$(grep -c $'^PROJECTION\t' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: duplicates: a second step ran although npm wrote its plan"; return; }
-  # (b) no duplicate, a surplus entry: npm saves nothing, the lockfile in the scratch copy is the OLD one; the plan
-  # is what the second step makes npm write (the surplus entry gone). A blocklisted surplus entry does not stop the
-  # operation whose result drops it.
-  lane_prepare "lane-dedupe-surplus" kept@1.0.0 old@1.0.0
-  lane_consistent_graph kept@1.0.0
-  lane_lock kept@1.0.0 old@1.0.0 | jq -c '.packages[""] += {dependencies: {kept: "1.0.0"}}' > "${WORK_DIR}/package-lock.json"
-  lane_commit
-  target="$(lane_lock kept@1.0.0 | jq -c '.packages[""] += {dependencies: {kept: "1.0.0"}}')"
-  : > "${LOG_FILE}"
-  NPM_DEDUPE_SAVES_NOTHING=1 NPM_LOCK_MUTATION_JSON="${target}" SAFE_AUDIT_EVIDENCE_BLOCKLIST='[{"name":"old","reason":"operator blocklist"}]' lane_run 'npm dedupe'
-  assert_status 0 "$FUNCNAME: surplus" || return
-  [[ "$(grep -c $'^PROJECTION\t' "${LOG_FILE}")" == 2 ]] || { fail "$FUNCNAME: surplus: not dedupe then one second step"; return; }
-  grep -qP '^PROJECTION\tnpm\t--package-lock-only\t.*\tinstall$' "${LOG_FILE}" || { fail "$FUNCNAME: surplus: the second step is not a plain install"; return; }
-  [[ "$(cat "${WORK_DIR}/package-lock.json")" == "${target}" ]] || { fail "$FUNCNAME: surplus: the published lockfile is not the plan npm leaves"; return; }
-  assert_err_contains_fragment '0 packages added, 0 changed, 1 removed' "$FUNCNAME: surplus" || return
-  [[ -d "${WORK_DIR}/node_modules/kept" && ! -e "${WORK_DIR}/node_modules/old" ]] || { fail "$FUNCNAME: surplus: tree"; return; }
-  # (c) nothing to do: the second step rewrites the same plan
+  [[ "$(grep -c $'^PROJECTION\t' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: duplicates: more than npm's own dedupe ran"; return; }
+  ! grep -q $'^CICHECK\t' "${LOG_FILE}" || { fail "$FUNCNAME: duplicates: the frozen check ran on a plan npm wrote"; return; }
+  [[ "$(cat "${WORK_DIR}/package-lock.json")" == "${target}" ]] || { fail "$FUNCNAME: duplicates: the published lockfile is not npm's plan"; return; }
+  # (b) nothing to do: npm saves nothing; the plan is the lockfile on disk, byte for byte, after npm's own frozen check
   lane_prepare "lane-dedupe-nothing" kept@1.0.0
   lane_consistent_graph kept@1.0.0
   target="$(cat "${WORK_DIR}/package-lock.json")"
   : > "${LOG_FILE}"
-  NPM_DEDUPE_SAVES_NOTHING=1 NPM_LOCK_MUTATION_JSON="${target}" lane_run 'npm dedupe'
+  NPM_DEDUPE_SAVES_NOTHING=1 lane_run 'npm dedupe'
   assert_status 0 "$FUNCNAME: nothing" || return
+  [[ "$(grep -c $'^PROJECTION\t' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: nothing: a second lockfile step ran"; return; }
+  grep -q $'^CICHECK\t' "${LOG_FILE}" || { fail "$FUNCNAME: nothing: npm's frozen check did not run"; return; }
   assert_err_contains_fragment '0 packages added, 0 changed, 0 removed' "$FUNCNAME: nothing" || return
   [[ "$(cat "${WORK_DIR}/package-lock.json")" == "${target}" ]] || { fail "$FUNCNAME: nothing: the lockfile changed"; return; }
-  # (d) no lockfile: npm's dedupe writes nothing at all; the plan is the one the second step makes npm write, judged against
-  # an empty baseline (the whole graph is introduced)
-  lane_prepare "lane-dedupe-nolock" kept@1.0.0
+  # (c) npm saves nothing and the lockfile is out of step with the manifest: npm's own frozen-check error and status
+  lane_prepare "lane-dedupe-outofstep" kept@1.0.0
   lane_consistent_graph kept@1.0.0
-  target="$(cat "${WORK_DIR}/package-lock.json")"
-  rm -f "${WORK_DIR}/package-lock.json"
+  before="$(lane_digests)"
+  : > "${LOG_FILE}"
+  NPM_DEDUPE_SAVES_NOTHING=1 NPM_CI_CHECK_STATUS=1 lane_run 'npm dedupe'
+  assert_status 1 "$FUNCNAME: out of step" || return
+  assert_lane_final_line dedupe "$FUNCNAME: out of step" || return
+  assert_err_contains_fragment 'npm: code EUSAGE' "$FUNCNAME: out of step" || return
+  assert_err_contains_fragment "npm's own frozen check failed with npm exit 1" "$FUNCNAME: out of step" || return
+  assert_err_contains_fragment 'run npm install first' "$FUNCNAME: out of step" || return
+  assert_lane_untouched "${before}" "$FUNCNAME: out of step" || return
+  ! grep -q $'^EVIDENCE_INPUT' "${LOG_FILE}" || { fail "$FUNCNAME: out of step: evidence was read for a plan npm refused"; return; }
+  # (d) no lockfile: dedupe and prune refuse 100 before anything is resolved (npm would work from the installed tree)
+  local verb
+  for verb in dedupe prune; do
+    lane_prepare "lane-${verb}-nolock" kept@1.0.0
+    lane_consistent_graph kept@1.0.0
+    rm -f "${WORK_DIR}/package-lock.json"
+    lane_commit
+    before="$(sha256sum "${WORK_DIR}/package.json" | cut -d' ' -f1)"
+    : > "${LOG_FILE}"
+    lane_run "npm ${verb}"
+    lane_unsupported_case "$FUNCNAME: ${verb} no lockfile" "${verb}" "npm ${verb} with no lockfile" || return
+    assert_err_contains_fragment "npm ${verb} on a project with no lockfile" "$FUNCNAME: ${verb}" || return
+    assert_err_contains_fragment 'run npm install first' "$FUNCNAME: ${verb}" || return
+    ! grep -q $'^PROJECTION\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${verb}: a plan was resolved"; return; }
+    [[ ! -e "${WORK_DIR}/package-lock.json" && ! -e "${WORK_DIR}/node_modules" ]] || { fail "$FUNCNAME: ${verb}: the project was touched"; return; }
+  done
+  # (e) a lockfile entry the frozen installation does not build (a surplus entry nothing needs): npm accepts the lockfile, its
+  # `npm ci` builds only what the manifest reaches, and the binder's verification refuses BEFORE anything is published,
+  # saying what to do
+  lane_prepare "lane-dedupe-surplus" kept@1.0.0 old@1.0.0
+  lane_consistent_graph kept@1.0.0
+  lane_lock kept@1.0.0 old@1.0.0 | jq -c '.packages[""] += {dependencies: {kept: "1.0.0"}}' > "${WORK_DIR}/package-lock.json"
   lane_commit
-  : > "${LOG_FILE}"
-  NPM_DEDUPE_SAVES_NOTHING=1 NPM_LOCK_MUTATION_JSON="${target}" lane_run 'npm dedupe'
-  assert_status 0 "$FUNCNAME: no lockfile" || return
-  assert_err_contains_fragment 'baseline: empty' "$FUNCNAME: no lockfile" || return
-  assert_err_contains_fragment '1 packages added, 0 changed, 0 removed' "$FUNCNAME: no lockfile" || return
-  [[ "$(cat "${WORK_DIR}/package-lock.json")" == "${target}" && -d "${WORK_DIR}/node_modules/kept" ]] || { fail "$FUNCNAME: no lockfile: plan or tree"; return; }
-  # a plan that cannot be obtained refuses with npm's status, and the project is as it was
-  lane_prepare "lane-dedupe-second-fails" kept@1.0.0
-  lane_consistent_graph kept@1.0.0
   before="$(lane_digests)"
   : > "${LOG_FILE}"
-  NPM_DEDUPE_SAVES_NOTHING=1 NPM_DEDUPE_SECOND_FAIL=7 NPM_LOCK_MUTATION_JSON="$(cat "${WORK_DIR}/package-lock.json")" lane_run 'npm dedupe'
-  assert_status 7 "$FUNCNAME: second step fails" || return
-  assert_lane_final_line dedupe "$FUNCNAME: second step fails" || return
-  assert_err_contains_fragment 'the plan it leaves could not be obtained' "$FUNCNAME: second step fails" || return
-  assert_lane_untouched "${before}" "$FUNCNAME: second step fails" || return
-  # a second step that touches package.json is not a plan to judge
-  lane_prepare "lane-dedupe-manifest" kept@1.0.0
-  lane_consistent_graph kept@1.0.0
-  before="$(lane_digests)"
-  : > "${LOG_FILE}"
-  NPM_DEDUPE_SAVES_NOTHING=1 NPM_LOCK_MUTATION_JSON="$(cat "${WORK_DIR}/package-lock.json")" NPM_PROJECTION_MANIFEST_JSON='{"name":"lane-test","version":"1.0.0","dependencies":{"kept":"1.0.0","extra":"1.0.0"}}' lane_run 'npm dedupe'
-  assert_status 100 "$FUNCNAME: manifest" || return
-  assert_err_contains_fragment 'changed package.json' "$FUNCNAME: manifest" || return
-  assert_lane_untouched "${before}" "$FUNCNAME: manifest" || return
-  # prune writes its lockfile in every case: no second step
-  lane_prepare "lane-prune-one-step" kept@1.0.0
-  lane_consistent_graph kept@1.0.0
-  : > "${LOG_FILE}"
-  NPM_LOCK_MUTATION_JSON="$(cat "${WORK_DIR}/package-lock.json")" lane_run 'npm prune'
-  assert_status 0 "$FUNCNAME: prune" || return
-  [[ "$(grep -c $'^PROJECTION\t' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: prune: a second step ran"; return; }
+  NPM_DEDUPE_SAVES_NOTHING=1 NPM_CI_SKIP='node_modules/old' lane_run 'npm dedupe'
+  assert_status 100 "$FUNCNAME: surplus" || return
+  assert_lane_final_line dedupe "$FUNCNAME: surplus" || return
+  assert_err_contains_fragment 'node_modules/old: missing' "$FUNCNAME: surplus" || return
+  assert_err_contains_fragment 'run npm install first to refresh it' "$FUNCNAME: surplus" || return
+  assert_err_contains_fragment 'nothing was published' "$FUNCNAME: surplus" || return
+  # (the binder's staged frozen installation ran; the project is as it was)
+  [[ "$(lane_digests)" == "${before}" && ! -e "${WORK_DIR}/node_modules" ]] || { fail "$FUNCNAME: surplus: the project changed"; return; }
+  assert_lane_no_leftover "$FUNCNAME: surplus" || return
   pass "$FUNCNAME"
 }
 
@@ -12337,6 +12352,98 @@ case_project_lane_the_ci_fixtures_are_checked_against_npms_offline_modules() {
   (( rc == 0 )) || { fail "$FUNCNAME: a consistent graph was refused (${out})"; return; }
   pass "$FUNCNAME"
 }
+
+
+# ---- ci/dedupe/prune: the second critical review (ticket 1634) ---------------------------------------
+
+# 1. An option before the verb refuses BEFORE npm is asked what the token resolves to: with `npm --json=prefix de`
+# safe takes `de` for the command and npm takes `prefix` (npm leaves the value of a boolean flag written `--flag=word`
+# as a positional), so passing `de` through as "a word npm rejects" would run a command npm does run.
+case_project_lane_routing_an_option_before_the_verb_refuses_before_npm_is_asked() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local script before
+  for script in 'npm --json=prefix de' 'npm --json=install de' 'npm --json=prefix clean' 'npm -- de' 'npm --json=prefix ci' 'npm --json=prefix dedupe'; do
+    lane_prepare "lane-option-before-${RANDOM}" kept@1.0.0
+    lane_consistent_graph kept@1.0.0
+    mkdir -p "${WORK_DIR}/node_modules/marker"
+    printf '{"name":"marker","version":"1.0.0"}\n' > "${WORK_DIR}/node_modules/marker/package.json"
+    before="$(lane_digests)"
+    : > "${LOG_FILE}"
+    lane_run "${script}"
+    assert_status 100 "$FUNCNAME: ${script}" || return
+    # the verb in the lane's line is whatever safe took the token for: only the form is asserted
+    [[ "$(tail -n 1 "${ERR_FILE}")" == "safe: BLOCKED npm "*" [lane: project] — "*"; details: safe explain" && "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { fail "$FUNCNAME: ${script}: not the lane's single final line"; return; }
+    assert_err_contains_fragment 'an option before the verb' "$FUNCNAME: ${script}" || return
+    ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: something was delegated ($(grep '^REAL' "${LOG_FILE}" | head -n 2))"; return; }
+    [[ -f "${WORK_DIR}/node_modules/marker/package.json" && "$(lane_digests)" == "${before}" ]] || { fail "$FUNCNAME: ${script}: the project was touched"; return; }
+  done
+  pass "$FUNCNAME"
+}
+
+# 3. npm's own error survives the caller's presentation settings: a heading, colour and a log level that hides errors
+# change what npm prints; the runs whose output the lane reads carry their own heading, colour off and a log level
+# that shows errors (and the capability list requires the selected npm to define them). When no error line can be
+# read the cleaned end of npm's output is shown, and the final line says so.
+case_project_lane_ci_error_survives_the_callers_presentation_settings() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local setting
+  for setting in 'npm_config_heading=review-npm' 'npm_config_color=always' 'npm_config_loglevel=silent' 'npm_config_loglevel=silly'; do
+    lane_prepare "lane-ci-present-${RANDOM}" kept@1.0.0
+    rm -f "${WORK_DIR}/package-lock.json"
+    : > "${LOG_FILE}"
+    export "${setting?}"
+    lane_run 'npm ci'
+    unset "${setting%%=*}"
+    assert_status 1 "$FUNCNAME: ${setting}" || return
+    assert_err_contains_fragment 'npm: code EUSAGE' "$FUNCNAME: ${setting}" || return
+    assert_err_contains_fragment 'can only install with an existing package-lock.json' "$FUNCNAME: ${setting}" || return
+    assert_err_contains_fragment "npm's own frozen check failed with npm exit 1 (code EUSAGE); npm's diagnostic is above" "$FUNCNAME: ${setting}" || return
+    grep -qP '^REAL\tnpm\tci\t--dry-run\t.*\t--heading=npm\t--no-color\t--loglevel=error' "${LOG_FILE}" || { fail "$FUNCNAME: ${setting}: the check does not carry its own presentation flags"; return; }
+  done
+  # the projection too
+  lane_prepare "lane-proj-present" kept@1.0.0
+  : > "${LOG_FILE}"
+  export npm_config_heading=review-npm
+  NPM_PROJECTION_FAIL=1 lane_run 'npm install clean@2.0.0'
+  unset npm_config_heading
+  assert_err_contains_fragment 'npm: code E404' "$FUNCNAME: projection" || return
+  grep -qP '^PROJECTION\tnpm\t--package-lock-only\t.*\t--heading=npm\t--no-color\t--loglevel=error\tinstall\tclean@2.0.0$' "${LOG_FILE}" || { fail "$FUNCNAME: the projection does not carry its own presentation flags"; return; }
+  # no error line to read: the end of npm's output is shown, and the final line says so; nothing printed is said too
+  lane_prepare "lane-ci-nolines" kept@1.0.0
+  lane_consistent_graph kept@1.0.0
+  : > "${LOG_FILE}"
+  NPM_CI_CHECK_ERROR=NOLINES lane_run 'npm ci'
+  assert_status 1 "$FUNCNAME: no error line" || return
+  assert_err_contains_fragment 'npm output: ' "$FUNCNAME: no error line" || return
+  assert_err_contains_fragment 'something else went wrong' "$FUNCNAME: no error line" || return
+  assert_err_contains_fragment 'npm printed no error line that could be read, so the end of its output is above' "$FUNCNAME: no error line" || return
+  assert_err_not_contains_fragment "npm's diagnostic is above" "$FUNCNAME: no error line" || return
+  : > "${LOG_FILE}"
+  NPM_CI_CHECK_ERROR=EMPTY lane_run 'npm ci'
+  assert_status 1 "$FUNCNAME: empty" || return
+  assert_err_contains_fragment 'npm printed nothing' "$FUNCNAME: empty" || return
+  assert_err_not_contains_fragment "diagnostic is above" "$FUNCNAME: empty" || return
+  # the capability list the selected npm must define carries the three options
+  [[ "$(source "${ROOT_DIR}/lib/gate-lib.sh"; type safe_gate_lane_capability | grep -c 'heading color loglevel')" == 1 ]] || { fail "$FUNCNAME: heading, color and loglevel are not in the capability list"; return; }
+  pass "$FUNCNAME"
+}
+
+# 4. The ci malice line counts the target's distinct identities: evidence missing only for a package the command
+# removes does not make the line say the target was partly unread.
+case_project_lane_ci_malice_line_counts_the_targets_identities() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-ci-removed" kept@1.0.0 old@1.0.0
+  lane_consistent_graph kept@1.0.0 old@1.0.0
+  LANE_UNCOMMITTED=1 lane_consistent_graph kept@1.0.0
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_EVIDENCE_MISSING='["old@1.0.0"]' lane_run 'npm ci'
+  assert_status 0 "$FUNCNAME" || return
+  assert_err_contains_fragment 'npm ci: 1 entries of the lockfile checked for malice' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'the rest unread' "$FUNCNAME" || return
+  assert_err_contains_fragment 'identities read completely' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
 
 main() {
   local case
@@ -12522,6 +12629,9 @@ main() {
     case_project_lane_routing_the_old_differential_path_is_reachable_only_with_the_switch_off \
     case_project_lane_ci_reads_the_whole_graph_of_a_thousand_entries \
     case_project_lane_the_ci_fixtures_are_checked_against_npms_offline_modules \
+    case_project_lane_routing_an_option_before_the_verb_refuses_before_npm_is_asked \
+    case_project_lane_ci_error_survives_the_callers_presentation_settings \
+    case_project_lane_ci_malice_line_counts_the_targets_identities \
     case_project_lane_routing_a_token_npm_does_not_resolve_is_left_to_npm \
     case_project_lane_dedupe_judges_the_plan_npm_leaves \
     case_project_lane_ci_shows_npms_error_wherever_it_is_in_its_output \
