@@ -920,3 +920,24 @@ func TestVerifyHeldTree(t *testing.T) {
 		t.Fatal("an extra entry below the held tree was not found")
 	}
 }
+
+func TestAdmitLockfileFindingsReportsEveryReason(t *testing.T) {
+	both := []byte(`{"lockfileVersion":3,"packages":{"":{},"node_modules/l":{"resolved":"packages/l","link":true},"../outside/pkg":{"version":"1.0.0"}}}`)
+	findings := AdmitLockfileFindings(both)
+	var reasons []string
+	for _, f := range findings {
+		reasons = append(reasons, f.Reason)
+	}
+	if len(reasons) != 2 || reasons[0] != ReasonLinksNotSupported || reasons[1] != ReasonLockfilePathsOutside {
+		t.Fatalf("findings = %v", reasons)
+	}
+	if reason, _ := AdmitLockfile(both); reason != ReasonLinksNotSupported {
+		t.Fatalf("the binder's first reason changed: %s", reason)
+	}
+	if got := AdmitLockfileFindings([]byte(`{"lockfileVersion":3,"packages":{"":{},"node_modules/a":{"version":"1.0.0"}}}`)); len(got) != 0 {
+		t.Fatalf("a clean lockfile has findings: %v", got)
+	}
+	if got := AdmitLockfileFindings([]byte(`{"lockfileVersion":3}`)); len(got) != 1 || got[0].Reason != ReasonLockfileUnreadable {
+		t.Fatalf("a lockfile without a package map: %v", got)
+	}
+}

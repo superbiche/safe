@@ -2,24 +2,23 @@
 
 ## Unreleased
 
-- Project lane routing (still behind `install.project_lane`), decided in two passes. Pass 1 runs every
-  safety check that needs no npm (arguments, environment, special files, the private-name guard, the
-  admission of the project's `.npmrc`, manifest and lockfile); a lockfile the core refuses as unsafe (a
-  path outside the tree, a link leaving the project) refuses, committed or not; unsupported reasons are
-  only collected. Pass 2 sends an *established* shape (committed at the head of the git work tree and
-  unchanged on disk, or a host property: a version 1 lockfile, committed non-registry dependencies, a
-  committed `.npmrc` outside the allow-list, an npm positively lacking the capabilities, a host
-  configuration the lane cannot mirror) to today's gate exactly as with the switch off, after one
-  `[lane: one-shot, <reason>]` line, once the guards have run (no npm of the lane reads a project whose
-  `.npmrc` was not admitted); the lane's scratch, lock and every variable it or its probes set are
-  cleared first. A launcher the lane cannot follow, a probe that fails, a configuration file chosen
-  through the environment, the same shapes in uncommitted changes, outside git or with mixed causes, a
-  flag or an environment setting refuse with the lane's line; so do `npm ci`/`dedupe`/`prune`, first.
-  The `install-test` families are classified apart and always take the one-shot route. `mise exec --
-  npm <lane command>` in its plain form (`-C` optional): the outer process runs the lane itself, in
-  mise's directory and with its overlay, through a private result channel (the original command runs
-  only on an explicit hand-back); a tool selector or another option refuses; the ownership state is
-  initialised at both entries of the gate. No refusal suggests turning the lane off.
+- Project lane routing (still behind `install.project_lane`). The lane runs in a subshell; its parent acts
+  only on its exit status (253 hands the command to today's gate), so nothing the lane sets reaches the
+  delegate, and with the switch absent or false its code is not entered. A command the lane cannot judge is
+  decided ONCE, after every check: an *established* project shape (every file the cause comes from
+  committed at the head of the git work tree and unchanged: a version 1 lockfile, committed non-registry
+  dependencies, a committed `.npmrc` outside the allow-list, or an npm that lacks the capabilities whose
+  selection a committed project file establishes) goes to today's gate exactly as with the switch off after
+  one `[lane: one-shot, <reason>]` line; the `install-test` families always do. Everything else refuses
+  with the lane's line, naming the cause and the way out: a flag or environment setting, any npm
+  configuration the lane cannot carry (no attempt to tell the host's from the caller's: a host on which the
+  lane is turned on has a supported npm configuration), a failed guard or probe, an uncommitted or
+  non-git shape, mixed causes, a lockfile with any unsafe finding (all findings are reported), `npm
+  ci`/`dedupe`/`prune`. A lockfile of version 2 or 3 with no package map is undecodable (102). `mise exec
+  -- npm <lane command>` refuses with the way out (run npm in the project directory); global and
+  non-lane inner commands are as before. Global mode is decided after the project's `.npmrc` has been
+  admitted as text. Capability metadata that is malformed is a failed probe. No refusal suggests turning
+  the lane off.
 - Project lane baseline, closing reviews: safe records, per project path, the lockfiles it
   judged clear on complete evidence, each under its own digest, before the binder runs (full or
   files-only; a record that cannot be written refuses 102 and publishes nothing; at most 16 are

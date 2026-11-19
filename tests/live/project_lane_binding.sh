@@ -247,10 +247,9 @@ else
   fail "C5: exit ${status}; $(tail -n 4 "${WORK}/c.err")"
 fi
 
-# --- scenario D: `mise exec -- npm install` through the REAL mise ---------------------------
-# The outer process runs the lane itself (the audit-only pass followed by mise running the original
-# command would bind nothing): one lane run, the frozen tree verified, and no second resolution by
-# mise afterwards.
+# --- scenario D: `mise exec -- npm install` through the REAL mise is refused ----------------------
+# The lane does not take `mise exec` over (mise would run the original command after an audit that binds
+# nothing): the lane's line names the way out, and nothing is installed or written.
 if real_mise_bin="$(command -v mise 2>/dev/null)" && [[ -n "${real_mise_bin}" ]]; then
   while IFS= read -r candidate; do
     LC_ALL=C head -n 2 -- "${candidate}" 2>/dev/null | grep -q '^# safe-gate-wrapper' && continue
@@ -260,13 +259,15 @@ if real_mise_bin="$(command -v mise 2>/dev/null)" && [[ -n "${real_mise_bin}" ]]
 fi
 if [[ -n "${real_mise_bin:-}" ]] && ! LC_ALL=C head -n 2 -- "${real_mise_bin}" 2>/dev/null | grep -q '^# safe-gate-wrapper'; then
   new_project "${WORK}/d" || { fail "scenario D project"; exit 1; }
+  before_d="$(sha256sum "${WORK}/d/package.json" "${WORK}/d/package-lock.json" | cut -d' ' -f1 | tr '\n' ' ')"
   ( cd "${WORK}/d" && PATH="$(dirname -- "${real_mise_bin}"):${PATH}" npm_config_before="${T1}" SAFE_AUDIT_PATH="${WORK}/safe/bin/safe-audit" \
       "${WORK}/safe/bin/safe" gate mise exec -- npm install express@5.1.0 --ignore-scripts >"${WORK}/d.out" 2>"${WORK}/d.err" )
   status=$?
-  sed 's/^/# D gate: /' "${WORK}/d.err" | tail -n 6
-  if (( status == 0 )) && grep -q 'project lane: npm install:' "${WORK}/d.err" && cmp -s "${WORK}/d/package-lock.json" "${judged}" \
-      && "${WORK}/safe/bin/safe-core" project-tree "${selection[@]}" "${judged}" "${WORK}/d" 2>/dev/null | jq -e '.ok == true and .checked > 10' >/dev/null 2>&1; then
-    pass "D (mise exec): the outer process ran the lane, published the judged lockfile and a tree that verifies"
+  sed 's/^/# D gate: /' "${WORK}/d.err" | tail -n 3
+  if (( status == 100 )) && grep -q 'mise would run the original command after an audit that binds nothing' "${WORK}/d.err" \
+      && grep -q 'run npm in the project directory instead' "${WORK}/d.err" && [[ ! -e "${WORK}/d/node_modules" ]] \
+      && [[ "$(sha256sum "${WORK}/d/package.json" "${WORK}/d/package-lock.json" | cut -d' ' -f1 | tr '\n' ' ')" == "${before_d}" ]]; then
+    pass "D (mise exec): the lane refuses with its line and the way out, and nothing is installed or written"
   else
     fail "D (mise exec): exit ${status}; $(tail -n 3 "${WORK}/d.err")"
   fi

@@ -4256,7 +4256,7 @@ cmd_install() {
   # Continue through the same wrapper policy in-process, preserving only this
   # command's local consent. The subshell contains exec and shell-option changes;
   # a separately invoked wrapper or lifecycle child still starts without consent.
-  ( export SAFE_DIR SAFE_VERSION; safe_gate_reset_entry_state; safe_gate_dispatch "${install_cmd[@]}" )
+  ( export SAFE_DIR SAFE_VERSION; safe_gate_dispatch "${install_cmd[@]}" )
   install_rc=$?
   set -e
   [[ "$install_rc" -eq 0 ]] || return "$install_rc"

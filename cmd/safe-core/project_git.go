@@ -14,8 +14,8 @@ import (
 // project-lockfile-admit <lockfile> runs the binder's own lockfile admission on a
 // lockfile that has not been judged yet (the one on disk, before npm reads it): the
 // lockfile reads strictly, every key is a chain of package segments inside the tree,
-// and no entry is a link. Exits 0 (admitted), 30 (refused: "<reason>: <detail>" on
-// stderr; reason lockfile_unreadable means it cannot be read at all), 3 (unreadable
+// and no entry is a link. Exits 0 (admitted), 30 (refused: EVERY reason, one "<reason>: <detail>"
+// line each, on stderr; reason lockfile_unreadable means it cannot be read at all), 3 (unreadable
 // input), 2 (usage).
 const projectLockfileAdmitUsage = "safe-core: usage: safe-core project-lockfile-admit <lockfile>"
 
@@ -34,8 +34,10 @@ func projectLockfileAdmit(args []string, _, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "safe-core: project-lockfile-admit: %v\n", err)
 		return 3
 	}
-	if reason, detail := projectlane.AdmitLockfile(raw); reason != "" {
-		fmt.Fprintf(stderr, "%s: %s\n", reason, detail)
+	if findings := projectlane.AdmitLockfileFindings(raw); len(findings) > 0 {
+		for _, finding := range findings {
+			fmt.Fprintf(stderr, "%s: %s\n", finding.Reason, finding.Detail)
+		}
 		return 30
 	}
 	return 0
