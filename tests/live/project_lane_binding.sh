@@ -127,7 +127,8 @@ exit 0
 AUDIT
 chmod +x "${WORK}/safe/bin/safe-audit"
 
-run_config_dir="${SAFE_RUN_CONFIG_DIR:-${SAFE_CONFIG_DIR:-${HOME}/.config/safe}/run}"
+# The switch is read from the operator's canonical configuration only.
+run_config_dir="${HOME}/.config/safe/run"
 mkdir -p "${run_config_dir}"
 printf '{"install":{"project_lane":true}}\n' > "${run_config_dir}/config.json"
 

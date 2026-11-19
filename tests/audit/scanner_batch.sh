@@ -150,6 +150,25 @@ case_clean_tree_returns_empty_array() {
   fi
 }
 
+# blocklist_names belongs to the evidence mode: the plain batch accepts what it
+# always accepted, an unrelated member of that name included.
+case_plain_batch_ignores_an_unrelated_blocklist_names_member() {
+  setup_case plain-extension
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-plain-ext.json"
+  printf '{"results": [{}]}\n' > "$MOCK_BATCH_FIXTURE"
+  local out rc=0 value
+  for value in '"x"' '{"a":1}' '7'; do
+    rc=0
+    out=$(printf '{"packages":[{"name":"left-pad","version":"1.3.0"}],"blocklist_names":%s}' "$value" | run_batch) || rc=$?
+    if [[ "$rc" == "0" && "$(jq -c . <<<"$out")" == "[]" ]]; then
+      pass "plain batch: an unrelated blocklist_names member (${value}) is accepted as before"
+    else
+      printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+      fail "plain batch: an unrelated blocklist_names member (${value}) is accepted as before"
+    fi
+  done
+}
+
 case_malformed_stdin_refuses() {
   setup_case malformed
   local rc=0 err
@@ -1387,6 +1406,7 @@ case_adapter_rejects_malformed_advisory_elements
 case_adapter_throws_on_missing_binary
 case_adapter_times_out_hung_child
 case_adapter_rejects_partial_request_channel
+case_plain_batch_ignores_an_unrelated_blocklist_names_member
 if (( SC_OK )); then
   case_evidence_clean_tree_is_complete_and_empty
   case_evidence_malformed_stdin_refuses

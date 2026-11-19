@@ -18,7 +18,13 @@
   lane command reached in audit-only mode (`mise exec`) refuses; a command npm's
   effective configuration says is global is not the lane's. Refusals end on one
   sanitised line naming `[lane: project]`; what the binder left or retained is
-  shown. No prompt, install record or script yet. Spec: Safe Lanes slice 1.
+  shown. No prompt, install record or script yet. The switch is read from the
+  operator's canonical run configuration only; the lane's runner state is local to
+  one invocation (an inherited `SAFE_GATE_LANE_*` value changes nothing, with the
+  switch off or on); a private-registry refusal keeps its status and never
+  prompts; a decision or bind document that is not whole and consistent is
+  refused; a genuine global install goes to the older gate before the lane
+  locks or refuses a terminator. Spec: Safe Lanes slice 1.
 - Project-lane binding transaction, groundwork only: no installed gate calls it
   yet. `safe-core project-bind` (Linux) builds the judged tree in a private
   staging directory inside the project (frozen install as a child with a given

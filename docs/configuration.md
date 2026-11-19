@@ -216,8 +216,10 @@ pass and warnings under `environment.release_follow`.
   its namespace whatever this list says ([private registries](private-registries.md)).
 - `auto_allow_ttl_days`: freshness window for the offline/timeout fallback.
 - `project_lane`: switch for the npm project lane (default `false`; on only when
-  the run config is exactly one JSON document that sets it to the boolean
-  `true`). With it off the gate behaves exactly as before. With it on, `npm
+  the operator's canonical run config, `~/.config/safe/run/config.json`, is
+  exactly one JSON document that sets it to the boolean `true`; a redirected
+  run-config directory does not turn it on unless trusted with
+  `SAFE_RUN_TRUST_OVERRIDE`). With it off the gate behaves exactly as before. With it on, `npm
   install` (bare or with exact `name@version` registry specs) and `npm update` in
   a project whose `package-lock.json` (version 2 or 3) is the one committed at the
   head of its git work tree, and identical on disk, are judged on what they

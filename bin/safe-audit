@@ -10833,6 +10833,7 @@ gate_emit_refusal_hints() {
 # defect class as delta-2 F14.
 scanner_batch_input_valid() {
   local allow_empty="${2:-0}"
+  # Evidence mode only: it alone may carry blocklist_names and an empty request.
   jq -e --argjson empty "$allow_empty" '
     (.packages | type == "array") and ($empty == 1 or (.packages | length > 0))
     and ([.packages[]
@@ -10842,8 +10843,8 @@ scanner_batch_input_valid() {
             and ((.version? | type) == "string") and (.version | length > 0)
             and ((.version | test("[[:space:][:cntrl:]]")) | not)]
          | all)
-    and ((.blocklist_names // []) | type == "array"
-         and ([.[] | (type == "string") and (length > 0) and ((test("[[:space:][:cntrl:]]")) | not)] | all))
+    and ($empty == 0 or ((.blocklist_names // []) | type == "array"
+         and ([.[] | (type == "string") and (length > 0) and ((test("[[:space:][:cntrl:]]")) | not)] | all)))
   ' <<<"$1" >/dev/null 2>&1
 }
 

@@ -2748,7 +2748,10 @@ safe_gate_npm_lockdiff_preflight() {
 # exactly one JSON document that sets install.project_lane to the boolean true.
 safe_gate_project_lane_enabled() {
   local config out
-  config="$(safe_gate_run_config_dir)/config.json"
+  # The operator's canonical configuration only (or a redirected root the
+  # operator blessed with SAFE_RUN_TRUST_OVERRIDE, as for every trust grant): a
+  # run-config directory redirected into a project must not opt it in.
+  config="$(safe_gate_trust_store_file config.json)"
   [[ -f "${config}" ]] || return 1
   out="$(jq -e -s 'length == 1 and (.[0] | type == "object") and (.[0].install.project_lane? == true)' "${config}" 2>/dev/null)" || return 1
   [[ "${out}" == "true" ]]
@@ -2886,7 +2889,7 @@ safe_gate_lane_npm_in() {
   (
     cd -- "${dir}" || exit 125
     safe_gate_lockdiff_restore_oldpwd "${had_oldpwd}" "${ambient_oldpwd}"
-    [[ -z "${SAFE_GATE_LANE_LOCKFD:-}" ]] || eval "exec ${SAFE_GATE_LANE_LOCKFD}<&-"
+    [[ ! "${SAFE_GATE_LANE_LOCKFD:-}" =~ ^[0-9]+$ ]] || eval "exec ${SAFE_GATE_LANE_LOCKFD}<&-"
     exec env "${SAFE_GATE_LANE_ENV_U[@]}" ${SAFE_GATE_LANE_EXTRA_ENV[@]+"${SAFE_GATE_LANE_EXTRA_ENV[@]}"} \
       "${SAFE_GATE_LANE_NPM[@]}" "$@"
   )
@@ -2897,11 +2900,30 @@ safe_gate_lane_npm_in() {
 safe_gate_npm_probe_run() {
   local real="$1"
   shift
-  if [[ "${SAFE_GATE_LANE_NPM+set}" == "set" ]]; then
+  if safe_gate_lane_armed; then
     env "${SAFE_GATE_LANE_ENV_U[@]}" "${SAFE_GATE_LANE_NPM[@]}" "$@"
   else
     "${real}" "$@"
   fi
+}
+
+# The lane's runner is armed only by this process: an array, which an
+# environment variable inherited from the caller can never be.
+safe_gate_lane_armed() {
+  local declared
+  declared="$(declare -p SAFE_GATE_LANE_NPM 2>/dev/null)" || return 1
+  [[ "${declared}" == "declare -a SAFE_GATE_LANE_NPM="* ]]
+}
+
+# Every SAFE_GATE_LANE_* value the caller handed in is discarded before the lane
+# reads anything: its state is this invocation's alone.
+safe_gate_lane_discard_inherited() {
+  local name
+  while IFS= read -r name; do
+    case "${name}" in
+      SAFE_GATE_LANE_*) unset "${name}" ;;
+    esac
+  done < <(compgen -v SAFE_GATE_LANE_)
 }
 
 # --- admission ---------------------------------------------------------------
@@ -3076,22 +3098,30 @@ safe_gate_lane_host_libc() {
   fi
 }
 
-# A decision report that is complete and consistent, or nothing: every member
-# the rendering reads, and a "clear" only when nothing is outstanding.
+# A decision report that is complete and consistent, or nothing: ONE document,
+# every member the rendering reads, the exit status the outcome's, and a
+# "clear" only when nothing is outstanding anywhere (no class, no coverage gap,
+# no uncleared introduced advisory, no malice, a bound graph, a graph baseline).
 safe_gate_project_lane_report_ok() {
-  jq -e --argjson rc "$2" '
-    .schema_version == 1
-    and (.baseline | type == "object") and (.outcome | type == "object")
-    and (.outcome.status | type == "string") and (.outcome.exit | type == "number")
-    and (.difference.added | type == "array") and (.difference.removed | type == "array") and (.difference.changed | type == "array")
-    and (.bindability.bound | type == "boolean")
-    and (.advisories.fixed | type == "array") and (.advisories.already_present | type == "array") and (.advisories.introduced | type == "array")
-    and (.malice | type == "array") and (.coverage | type == "array") and (.classes | type == "array")
-    and ((.outcome.status == "clear") == ($rc == 0))
-    and (.outcome.exit == $rc)
-    and (if .outcome.status == "clear"
-         then .bindability.bound and ([.classes[] | .outstanding] | add // 0) == 0 and (.malice | length) == 0
-         else true end)' "$1" >/dev/null 2>&1
+  jq -e -s --argjson rc "$2" '
+    length == 1 and (.[0] | . as $r |
+    $r.schema_version == 1
+    and ($r.baseline | type == "object") and ($r.outcome | type == "object")
+    and ($r.outcome.status | type == "string") and ($r.outcome.exit | type == "number")
+    and ($r.difference.added | type == "array") and ($r.difference.removed | type == "array") and ($r.difference.changed | type == "array")
+    and ($r.bindability.bound | type == "boolean")
+    and ($r.advisories.fixed | type == "array") and ($r.advisories.already_present | type == "array") and ($r.advisories.introduced | type == "array")
+    and ($r.malice | type == "array") and ($r.coverage | type == "array") and ($r.classes | type == "array")
+    and ($r.outcome.exit == $rc)
+    and (($r.outcome.status == "clear") == ($rc == 0))
+    and (if $rc == 0 then
+           $r.outcome.status == "clear" and $r.bindability.bound
+           and ($r.baseline.source == "graph")
+           and ([$r.classes[] | .class] | sort) == ["adverse_advisory", "blocking_advisory", "malice", "missing_evidence"]
+           and ([$r.classes[] | .outstanding] | add) == 0
+           and ($r.malice | length) == 0 and ($r.coverage | length) == 0
+           and ([$r.advisories.introduced[] | select(.class != "below_high" and (.cleared | not))] | length) == 0
+         else ($rc == 100 or $rc == 102 or $rc == 104) end))' "$1" >/dev/null 2>&1
 }
 
 # The report lines, on stderr, after the decision. Fails when it cannot render.
@@ -3151,7 +3181,8 @@ safe_gate_project_lane_outcome_text() {
 
 safe_gate_project_lane_cleanup() {
   [[ -z "${SAFE_GATE_LANE_SCRATCH:-}" ]] || rm -rf -- "${SAFE_GATE_LANE_SCRATCH}" 2>/dev/null
-  if [[ -n "${SAFE_GATE_LANE_LOCKFD:-}" ]]; then
+  # Only a descriptor this process opened: a validated number.
+  if [[ "${SAFE_GATE_LANE_LOCKFD:-}" =~ ^[0-9]+$ ]]; then
     { eval "exec ${SAFE_GATE_LANE_LOCKFD}<&-"; } 2>/dev/null
   fi
   unset SAFE_GATE_LANE_SCRATCH SAFE_GATE_LANE_LOCKFD SAFE_GATE_LANE_NPM SAFE_GATE_LANE_ENV_U \
@@ -3159,11 +3190,51 @@ safe_gate_project_lane_cleanup() {
   return 0
 }
 
+# Today's private-origin check for the project, with no prompt reachable: the
+# lane has no operator step in this ticket, so a decision that would ask (19)
+# refuses 102, a block (20) refuses 104, and nothing is read from a terminal.
+# Prints nothing on success; the one refusal line on failure, with the status.
+safe_gate_project_lane_private_check() {
+  local verb="$1" project_dir="$2" d any_store=0 result_out="" rc=0 detail=""
+  shift 2
+  for d in "${HOME}/.config/safe/run" "$(safe_gate_run_config_dir)"; do
+    [[ -s "${d}/private-registries.json" || -s "${d}/private-follow-state.json" ]] && any_store=1
+  done
+  (( any_store )) || return 0
+  safe_gate_audit_available || return 0
+  result_out="$(mktemp "${SAFE_GATE_LANE_SCRATCH}/private-result.XXXXXX" 2>/dev/null)" || result_out=""
+  local -a cfg=()
+  [[ -n "${SAFE_GATE_NPM_USERCONFIG:-}" ]] && cfg+=(--npm-userconfig "${SAFE_GATE_NPM_USERCONFIG}")
+  [[ -n "${SAFE_GATE_NPM_GLOBALCONFIG:-}" ]] && cfg+=(--npm-globalconfig "${SAFE_GATE_NPM_GLOBALCONFIG}")
+  SAFE_AUDIT_RESULT_OUT="${result_out}" "${SAFE_GATE_AUDIT_BIN}" private-npm-project --gate install --tool npm \
+    --class install --project-dir "${project_dir}" ${cfg[@]+"${cfg[@]}"} -- "$@" </dev/null >/dev/null 2>"${SAFE_GATE_LANE_SCRATCH}/private.err"
+  rc=$?
+  if [[ -n "${result_out}" && -s "${result_out}" ]]; then
+    detail="$(jq -r '.private_registry.detail // empty' "${result_out}" 2>/dev/null)" || detail=""
+  fi
+  case "${rc}" in
+    0|18) return 0 ;;
+    19)
+      safe_gate_project_lane_refuse 102 "${verb}" "the private-registry check needs an operator decision${detail:+ (${detail})}" "the project lane has no operator step yet; run the command with the lane off at an operator terminal"
+      return $?
+      ;;
+    20)
+      safe_gate_project_lane_refuse 104 "${verb}" "the private-registry check blocks this project${detail:+ (${detail})}" "fix the scope mapping or the lockfile origins it names"
+      return $?
+      ;;
+    *)
+      safe_gate_project_lane_refuse 100 "${verb}" "the private-registry check could not run (exit ${rc}; audit-infrastructure breakage, not a package finding)" "rerun install.sh or run safe doctor, then retry"
+      return $?
+      ;;
+  esac
+}
+
 # Entry. Returns the command's exit status. When npm's effective configuration
 # says the command is global it is not a lane command: SAFE_GATE_LANE_PASS=1 and
 # the caller continues with the gate it had.
 safe_gate_project_lane_npm() {
   local rc=0
+  safe_gate_lane_discard_inherited
   SAFE_GATE_LANE_PASS=0
   SAFE_GATE_LANE_SCRATCH=""
   trap 'safe_gate_project_lane_cleanup; exit 130' INT
@@ -3184,13 +3255,9 @@ safe_gate_project_lane_run() {
   verb="$(safe_gate_npm_canonical_command "${subcommand}")" || verb="${subcommand}"
   lane_sub="${verb} [lane: project]"
 
-  # --- 1. route: the arguments, then npm's own word on global ---------------
-  for arg in "$@"; do
-    if [[ "${arg}" == "--" ]]; then
-      safe_gate_project_lane_unsupported "${verb}" "the option terminator --"
-      return $?
-    fi
-  done
+  # --- 1. route: npm's own word on global, then the arguments ----------------
+  # A genuine global install is not the lane's: it is recognised first, before
+  # the lock and before the terminator refusal, and goes to today's gate.
   if safe_gate_lane_resolve_npm; then
     :
   else
@@ -3198,33 +3265,20 @@ safe_gate_project_lane_run() {
     return 127
   fi
   safe_gate_lane_build_env
-  scratch="$(mktemp -d "${TMPDIR:-/tmp}/safe-gate-project-lane.XXXXXX" 2>/dev/null)" || {
-    safe_gate_project_lane_refuse 100 "${verb}" "cannot allocate lane storage (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
-    return $?
-  }
-  SAFE_GATE_LANE_SCRATCH="${scratch}"
-  # One exclusive kernel lock on the project directory before the first read,
-  # held until this process exits, dry runs included.
   if ! project_dir="$(cd -- "." 2>/dev/null && pwd -P)"; then
     safe_gate_project_lane_refuse 100 "${verb}" "the project directory cannot be read" "retry from the project root"
     return $?
   fi
-  if ! command -v flock >/dev/null 2>&1; then
-    safe_gate_project_lane_refuse 100 "${verb}" "flock is unavailable, so the project cannot be locked (audit-infrastructure breakage, not a package finding)" "install util-linux and retry"
-    return $?
-  fi
-  if ! { exec {SAFE_GATE_LANE_LOCKFD}<"${project_dir}"; } 2>/dev/null; then
-    SAFE_GATE_LANE_LOCKFD=""
-    safe_gate_project_lane_refuse 100 "${verb}" "the project directory cannot be opened for locking" "retry from a readable project root"
-    return $?
-  fi
-  if ! flock -n -x "${SAFE_GATE_LANE_LOCKFD}"; then
-    safe_gate_project_lane_refuse 100 "${verb}" "another command holds this project's lock" "wait for it to finish, then retry"
-    return $?
-  fi
-  # The effective `global` setting decides the exception, not a scan of the
-  # arguments: a global command is not the lane's.
-  config_json="$(safe_gate_lane_npm_in "${project_dir}" config list "$@" --json 2>/dev/null)" || {
+  # `--json` goes before the terminator, where npm still reads it as an option.
+  local -a pre=() post=()
+  local split=0
+  for arg in "$@"; do
+    if (( split == 0 )) && [[ "${arg}" == "--" ]]; then
+      split=1
+    fi
+    if (( split )); then post+=("${arg}"); else pre+=("${arg}"); fi
+  done
+  config_json="$(safe_gate_lane_npm_in "${project_dir}" config list ${pre[@]+"${pre[@]}"} --json ${post[@]+"${post[@]}"} 2>/dev/null)" || {
     safe_gate_project_lane_refuse 100 "${verb}" "npm's effective configuration cannot be read (audit-infrastructure breakage, not a package finding)" "fix npm configuration and retry — safe doctor"
     return $?
   }
@@ -3235,6 +3289,32 @@ safe_gate_project_lane_run() {
   if jq -e '.global == true or .location == "global"' <<<"${config_json}" >/dev/null 2>&1; then
     SAFE_GATE_LANE_PASS=1
     return 0
+  fi
+  for arg in "$@"; do
+    if [[ "${arg}" == "--" ]]; then
+      safe_gate_project_lane_unsupported "${verb}" "the option terminator --"
+      return $?
+    fi
+  done
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/safe-gate-project-lane.XXXXXX" 2>/dev/null)" || {
+    safe_gate_project_lane_refuse 100 "${verb}" "cannot allocate lane storage (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
+    return $?
+  }
+  SAFE_GATE_LANE_SCRATCH="${scratch}"
+  # One exclusive kernel lock on the project directory, held until this process
+  # exits, dry runs included.
+  if ! command -v flock >/dev/null 2>&1; then
+    safe_gate_project_lane_refuse 100 "${verb}" "flock is unavailable, so the project cannot be locked (audit-infrastructure breakage, not a package finding)" "install util-linux and retry"
+    return $?
+  fi
+  if ! { exec {SAFE_GATE_LANE_LOCKFD}<"${project_dir}"; } 2>/dev/null; then
+    unset SAFE_GATE_LANE_LOCKFD
+    safe_gate_project_lane_refuse 100 "${verb}" "the project directory cannot be opened for locking" "retry from a readable project root"
+    return $?
+  fi
+  if ! flock -n -x "${SAFE_GATE_LANE_LOCKFD}"; then
+    safe_gate_project_lane_refuse 100 "${verb}" "another command holds this project's lock" "wait for it to finish, then retry"
+    return $?
   fi
   case "${verb}" in
     install|update) ;;
@@ -3390,8 +3470,10 @@ safe_gate_project_lane_run() {
   fi
 
   # --- private origins: today's check, first, as in today's gate --------------
-  if ! safe_gate_private_npm_project npm "${verb}" "$@"; then
-    return $?
+  safe_gate_project_lane_private_check "${verb}" "${snap}" "$@"
+  rc=$?
+  if (( rc != 0 )); then
+    return "${rc}"
   fi
 
   # --- 4. guards and projection, on the snapshot ------------------------------
@@ -3460,10 +3542,9 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_refuse 100 "${verb}" "the projected lockfile cannot be analysed (audit-infrastructure breakage, not a package finding)" "retry after repairing the project"
     return $?
   fi
-  if jq -e '[.graph.occurrences[] | select(.kind == "link" or .kind == "local")] | length > 0' <<<"${target_graph}" >/dev/null 2>&1; then
-    safe_gate_project_lane_unsupported "${verb}" "a projected graph with in-project links"
-    return $?
-  fi
+  # An entry of the projected graph that cannot be bound is the decision's to
+  # rule on (a known block outranks it), not refused here; the binder refuses
+  # links when nothing else is at stake.
   rc=0
   diff_json="$("${safe_core}" project-diff --baseline "${snap}/package-lock.json" "${proj}/package-lock.json" 2>"${scratch}/diff.err")" || rc=$?
   if (( rc == 3 )); then
@@ -3474,8 +3555,11 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_refuse 100 "${verb}" "the lockfile analysis failed with exit ${rc} (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
     return $?
   fi
-  if ! request="$(jq -ec --argjson g "${target_graph}" '{packages: [.evidence_request[] | {name, version}],
-        blocklist_names: ([$g.graph.occurrences[].name] | unique)}' <<<"${diff_json}" 2>/dev/null)"; then
+  # Both documents travel in files: a graph can be larger than one argument may be.
+  printf '%s\n' "${target_graph}" > "${scratch}/target-graph.json"
+  printf '%s\n' "${diff_json}" > "${scratch}/diff.json"
+  if ! request="$(jq -ec --slurpfile g "${scratch}/target-graph.json" '{packages: [.evidence_request[] | {name, version}],
+        blocklist_names: ([$g[0].graph.occurrences[].name] | unique)}' "${scratch}/diff.json" 2>/dev/null)"; then
     safe_gate_project_lane_refuse 100 "${verb}" "the lockfile analysis returned an unreadable result (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
     return $?
   fi
@@ -3575,8 +3659,19 @@ safe_gate_project_lane_run() {
 # What the binder reported, to the operator, and the command's exit status.
 safe_gate_project_lane_bind_result() {
   local verb="$1" rc="$2" doc="$3" outcome="" line="" detail="" npm_status=""
-  if ! jq -e --argjson rc "${rc}" '.schema_version == 1 and (.outcome | type == "string") and .exit == $rc
-      and (.recovery.left | type == "array") and (.publication.retained | type == "array")' "${doc}" >/dev/null 2>&1; then
+  # One document whose outcome and exit agree with each other and with the
+  # process status; a success also shows the strict verification and a
+  # committed publication (the empty-tree success is a verified empty install).
+  if ! jq -e -s --argjson rc "${rc}" '
+      length == 1 and (.[0] | . as $d
+      | $d.schema_version == 1 and ($d.outcome | type == "string") and ($d.exit | type == "number") and $d.exit == $rc
+      and ($d.recovery.left | type == "array") and ($d.publication.retained | type == "array")
+      and ({"published": 0, "refused": 30, "install_failed": 31, "verification_failed": 32, "inputs_changed": 33,
+            "interrupted": 34, "publication_failed": 35, "install_unsettled": 36}[$d.outcome] == $rc)
+      and (if $d.outcome == "published"
+           then $rc == 0 and ($d.verification.ok == true) and ($d.verification.problems | length) == 0
+                and ($d.publication.state == "committed") and ($d.inputs_changed | length) == 0
+           else $rc != 0 end))' "${doc}" >/dev/null 2>&1; then
     safe_gate_project_lane_refuse 100 "${verb}" "project-bind returned no usable result (exit ${rc}); the project may hold a leftover staging directory" "rerun the command; run safe doctor if it repeats"
     return $?
   fi
