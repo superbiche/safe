@@ -574,10 +574,6 @@ func TestVerifyTreeHiddenLockfile(t *testing.T) {
 		"an installed entry npm did not record": {func(f *treeFx) {
 			f.hiddenLockfile(func(p map[string]any) { delete(p, "node_modules/a") })
 		}, map[string]string{"node_modules/a": TreeHiddenLockfileInconsistent}},
-		"a record of an entry the tree does not hold": {func(f *treeFx) {
-			f.entry("node_modules/n", "n", "1.0.0", map[string]any{"optional": true, "os": []string{"win32"}})
-			f.hiddenLockfile(func(p map[string]any) { p["node_modules/n"] = entry("n", "1.0.0") })
-		}, map[string]string{"node_modules/n": TreeHiddenLockfileInconsistent}},
 		"a record that is not an object": {func(f *treeFx) {
 			f.hiddenLockfile(func(p map[string]any) { p["node_modules/a"] = "x" })
 		}, map[string]string{"node_modules/.package-lock.json": TreeHiddenLockfileInconsistent, "node_modules/a": TreeHiddenLockfileInconsistent}},
@@ -711,6 +707,39 @@ func TestVerifyTreeReadsDocumentsByExactNames(t *testing.T) {
 }
 
 // The hidden lockfile is compared strictly, bundled entries and names included.
+// npm 11 records in its hidden lockfile the optional entries it did not
+// install for the platform, marked ideallyInert (seen on a real tree: esbuild's
+// platform packages). Such a record is consistent with the tree only when the
+// entry is provably deselected; the mark alone excuses nothing.
+func TestVerifyTreeHiddenRecordOfADeselectedEntry(t *testing.T) {
+	inert := func(members map[string]any) func(map[string]any) {
+		return func(packages map[string]any) {
+			packages["node_modules/o"] = with(with(entry("o", "1.0.0"), members), map[string]any{"ideallyInert": true})
+		}
+	}
+	t.Run("recorded and deselected by the platform", func(t *testing.T) {
+		members := map[string]any{"optional": true, "os": []string{"win32"}}
+		f := newTreeFx(t)
+		f.pkg("node_modules/p", "p", "1.0.0")
+		f.entry("node_modules/o", "o", "1.0.0", members)
+		f.hiddenLockfile(inert(members))
+		if report := f.verify(linuxX64); !report.Ok {
+			t.Fatalf("a recorded, absent and deselected entry must verify: %+v", report.Problems)
+		}
+	})
+	t.Run("recorded as inert but required on this platform", func(t *testing.T) {
+		members := map[string]any{"optional": true, "os": []string{"linux"}, "cpu": []string{"x64"}}
+		f := newTreeFx(t)
+		f.pkg("node_modules/p", "p", "1.0.0")
+		f.entry("node_modules/o", "o", "1.0.0", members)
+		f.hiddenLockfile(inert(members))
+		report := f.verify(linuxX64)
+		if report.Ok {
+			t.Fatalf("an entry required on this platform is missing, whatever npm recorded")
+		}
+	})
+}
+
 func TestVerifyTreeHiddenLockfileStrictness(t *testing.T) {
 	full := func(members map[string]any) map[string]any { return with(entry("c", "3.0.0"), members) }
 	bundled := map[string]any{"inBundle": true, "resolved": nil, "integrity": nil}

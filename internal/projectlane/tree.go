@@ -1063,6 +1063,14 @@ func (v *verifier) checkHiddenLockfile() {
 		}
 		recorded[key] = true
 		if !v.present[key] {
+			// npm records an optional entry it did not install for this
+			// platform (it marks it ideallyInert). A record of an entry that
+			// is absent and provably deselected, by the same rule the tree
+			// walk applies, is consistent with the tree; the flag npm wrote
+			// is not what excuses it.
+			if want.deselected(v.sel) || v.ancestorDeselected(key) {
+				continue
+			}
 			v.problem(TreeProblem{Path: key, Problem: TreeHiddenLockfileInconsistent, Name: want.expectedName, Version: want.Version, Detail: "npm recorded an entry the tree does not hold"})
 			continue
 		}
