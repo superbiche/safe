@@ -10582,7 +10582,11 @@ case_project_lane_baseline_every_entry_of_the_lockfile_on_disk_is_admitted_befor
       assert_err_not_contains_fragment 'committed lockfile cannot' "$FUNCNAME: ${how}" || return
     else
       lane_unsupported_case "$FUNCNAME" install "${how}" || return
-      assert_err_contains_fragment 'the lockfile on disk that the lane cannot admit' "$FUNCNAME: ${how}" || return
+      if [[ "${how}" == outside-key ]]; then
+        assert_err_contains_fragment 'the lockfile on disk names a path outside the tree' "$FUNCNAME: ${how}" || return
+      else
+        assert_err_contains_fragment 'the lockfile on disk that the lane cannot admit' "$FUNCNAME: ${how}" || return
+      fi
     fi
     assert_log_not_contains_fragment 'PROJECTION' "$FUNCNAME: ${how}" || return
     assert_lane_untouched "${before}" "$FUNCNAME: ${how}" || return
