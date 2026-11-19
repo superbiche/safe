@@ -1,0 +1,13 @@
+# Disagreements between the gate's reading of an npm command line and npm's own that the oracle
+# (tests/live/npm_option_oracle.sh, SAFE_ORACLE_GATE=1) finds and that are LISTED, not closed: one extended regular
+# expression per line, matched against the oracle's `DISAGREE kind: <arguments>  (<what>)` line. Each entry says
+# why it stays.
+
+# A cluster of single-letter shorthands in which a value-taking shorthand (-C is --prefix, -L is --location) is
+# followed by one that expands to `--loglevel <word>` (-q warn, -d info, -s silent): npm gives the next argument
+# to the first option, so the word the second shorthand leaves behind (warn, info, silent, verbose, silly) is a
+# positional argument, installed as a package of that name. The gate audits the arguments it can read and not
+# that word. The word is one of five fixed ones a caller cannot choose, so this cannot name an attacker's
+# package; closing it means reading every shorthand cluster, which the scanners do not do. Reproduction:
+# `npm install -Cq evilpkg` (npm installs `warn` and `evilpkg`; the gate audits `evilpkg`).
+DISAGREE package-unaudited: .* -[CL][A-Za-z]+( .*)?  \(npm fetches (warn|info|silent|verbose|silly)[;)]

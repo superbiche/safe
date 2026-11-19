@@ -28,6 +28,7 @@ SUITES=(
   tests/live/npm_config_oracle.sh
   tests/live/npm_spec_oracle.sh
   tests/live/npm_abbrev_oracle.sh
+  tests/live/npm_option_oracle.sh
   tests/live/private_registry_npm_oracle.sh
   tests/live/composer_abbrev_oracle.sh
   tests/live/shim_delegation.sh
@@ -79,6 +80,7 @@ EXCLUDED=(
   tests/lib/test-isolation.sh       # shared HOME/state isolation helper, not a suite
   tests/lib/safe-core.sh            # shared helper, not a suite
   tests/lib/real-tool.sh            # shared helper (real-toolchain resolver), not a suite
+  tests/lib/npm-option-gate-oracle.sh # the gate-level half of tests/live/npm_option_oracle.sh (SAFE_ORACLE_GATE=1), not a suite
   tests/fixtures/release_follow_pre_fix.sh # checked-in pre-fix driver for the release-follow non-vacuity case, not a suite
 )
 for f in "$ROOT"/tests/*/*.sh; do

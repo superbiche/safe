@@ -1661,11 +1661,16 @@ case_unknown_leading_flag_fails_closed() {
 
 case_unknown_leading_flag_eqform_escapes() {
   prepare_case "unknown-leading-flag-eqform-escapes"
-  # The =form of an unknown flag is unambiguous → the gate proceeds and the
-  # real install is still audited.
-  SAFE_INSTALL_TEST_SCRIPT='npm --totally-unknown-flag=value install -g blockme' run_zsh
+  # The =form of a scoped or nerf-darted config key (`--@scope:registry=url`, `--//host/:_authToken=x`) is
+  # unambiguous (no npm types those, nopt always gives them their value) → the gate proceeds and the real
+  # install is still audited. A plain unknown name is NOT: a newer npm may define it Boolean (and leave the value
+  # as an argument), so the front door reads the command both ways and refuses where they differ (ticket 1675).
+  SAFE_INSTALL_TEST_SCRIPT='npm --@scope:registry=https://registry.npmjs.org/ install -g blockme' run_zsh
   assert_status 104 "$FUNCNAME" || return
-  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME" || return
+  grep -q $'^AUDIT\tpackage-audit\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "${LOG_FILE}" || { fail "$FUNCNAME: blockme was not audited"; return; }
+  SAFE_INSTALL_TEST_SCRIPT='npm --totally-unknown-flag=value install -g blockme' run_zsh
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment 'is not one the gate knows' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -3500,7 +3505,7 @@ case_npm_lockdiff_effective_config_oracle() {
   # reproduction. The oracle, rather than argv pattern matching, decides it.
   rm -f "${WORK_DIR}/.npmrc"
   NPM_LOCKDIFF_EFFECTIVE_CONFIG_JSON='{"package-lock":false,"ignore-scripts":true}' \
-    SAFE_INSTALL_TEST_SCRIPT='npm dedupe --no-package-lock=0' run_zsh
+    SAFE_INSTALL_TEST_SCRIPT='npm dedupe --no-package-lock' run_zsh
   assert_status 100 "$FUNCNAME" || return
   assert_err_contains_fragment 'effective npm config disables the lock-diff projection: package-lock is off' "$FUNCNAME" || return
   assert_log_not_contains_fragment $'PROJECTION\tnpm' "$FUNCNAME" || return
@@ -12362,7 +12367,7 @@ case_project_lane_the_ci_fixtures_are_checked_against_npms_offline_modules() {
 case_project_lane_routing_an_option_before_the_verb_refuses_before_npm_is_asked() {
   skip_lockdiff_case "$FUNCNAME" || return
   local script before
-  for script in 'npm --json=prefix de' 'npm --json=install de' 'npm --json=prefix clean' 'npm -- de' 'npm --json=prefix ci' 'npm --json=prefix dedupe'; do
+  for script in 'npm --loglevel=error de' 'npm --loglevel=error clean' 'npm -- de' 'npm --loglevel=error ci' 'npm --loglevel=error dedupe' 'npm --loglevel=error install clean'; do
     lane_prepare "lane-option-before-${RANDOM}" kept@1.0.0
     lane_consistent_graph kept@1.0.0
     mkdir -p "${WORK_DIR}/node_modules/marker"
@@ -12376,6 +12381,15 @@ case_project_lane_routing_an_option_before_the_verb_refuses_before_npm_is_asked(
     assert_err_contains_fragment 'an option before the verb' "$FUNCNAME: ${script}" || return
     ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: something was delegated ($(grep '^REAL' "${LOG_FILE}" | head -n 2))"; return; }
     [[ -f "${WORK_DIR}/node_modules/marker/package.json" && "$(lane_digests)" == "${before}" ]] || { fail "$FUNCNAME: ${script}: the project was touched"; return; }
+  done
+  # the forms npm reads differently (a Boolean's value is the command) never reach the lane: the front door refuses them
+  for script in 'npm --json=prefix de' 'npm --json=install de' 'npm --json=prefix clean' 'npm --json=prefix ci' 'npm --json=prefix dedupe'; do
+    lane_prepare "lane-option-before-fd-${RANDOM}" kept@1.0.0
+    : > "${LOG_FILE}"
+    lane_run "${script}"
+    assert_status 100 "$FUNCNAME: ${script}" || return
+    assert_err_contains_fragment 'to allow: write the option without the value' "$FUNCNAME: ${script}" || return
+    ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: something was delegated"; return; }
   done
   pass "$FUNCNAME"
 }
@@ -12445,11 +12459,140 @@ case_project_lane_ci_malice_line_counts_the_targets_identities() {
 }
 
 
+
+# ---- the front door: npm's `--flag=word` of a Boolean-typed flag (ticket 1675) -----------------------------
+# nopt reads `--flag=value` as `--flag value`: a Boolean flag leaves a value other than true/false as a
+# positional argument, so `npm --json=install blockme` runs `install blockme` and `npm install --json=blockme`
+# installs blockme. The gate used to skip every `=` form as one unambiguous word and never audited the package.
+
+assert_front_door_refusal() { # <label> <script>
+  local label="$1" script="$2"
+  SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+  assert_status 100 "${label}" || return 1
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { printf 'stderr:\n%s\n' "$(cat "${ERR_FILE}")" >&2; fail "${label}: not one stderr line"; return 1; }
+  assert_err_contains_fragment 'safe: BLOCKED npm — ' "${label}" || return 1
+  assert_err_contains_fragment 'to allow: write the option without the value' "${label}" || return 1
+  assert_err_contains_fragment 'details: safe explain' "${label}" || return 1
+  ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "${label}: npm was delegated to"; return 1; }
+  return 0
+}
+
+case_npm_front_door_refuses_a_value_npm_leaves_as_an_argument() {
+  prepare_case "npm-front-door-refuses"
+  local script
+  # the seven forms of the ticket: each exited 0 with a delegation and no audit before the front door
+  for script in 'npm --json=install -g blockme' 'npm --json=install blockme' 'npm -g=install blockme' 'npm install -g --json=blockme' \
+      'npm install --json=blockme' 'npm install -g --force=blockme' 'npm exec --json=blockme'; do
+    assert_front_door_refusal "$FUNCNAME: ${script}" "${script}" || return
+  done
+  # more spellings of the same fact: a negated flag, an abbreviated name, a shorthand cluster, a shorthand,
+  # a Boolean-and-String flag with a value npm takes as its own (control below), a String flag whose value npm re-reads as a flag
+  for script in 'npm install --no-json=blockme' 'npm install --no-frobnicate=blockme' 'npm install --jso=blockme' 'npm install -gf=blockme' 'npm install -f=blockme' 'npm install --tag=-g blockme' \
+      'npm exec --no-package=blockme cowsay' 'npm exec cowsay --no-package=blockme' 'npm install --no-registry=https://r.example/ okpkg' 'npm --json=install exec blockme' 'npm --json=install x blockme' 'npm x --json=blockme' 'npm exec --yes=blockme' 'npm exec -y=blockme'; do
+    assert_front_door_refusal "$FUNCNAME: ${script}" "${script}" || return
+  done
+  pass "$FUNCNAME"
+}
+
+# The control: the space form is audited as before, and so is every `=` form whose value the option takes.
+case_npm_front_door_leaves_what_npm_reads_as_written() {
+  prepare_case "npm-front-door-leaves"
+  local script
+  SAFE_INSTALL_TEST_SCRIPT='npm --json install -g blockme' run_zsh
+  assert_status 104 "$FUNCNAME: space form" || return
+  assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME: space form" || return
+  for script in 'npm install --registry=https://registry.npmjs.org/ blockme' 'npm install --json=true blockme' 'npm install --json=false blockme' \
+      'npm --loglevel=error install blockme' 'npm install --save-prefix=~ blockme' 'npm install --global=true blockme' 'npm install --tag=latest blockme' \
+      'npm install --omit=dev blockme' 'npm install --browser=firefox blockme' 'npm install --no-json blockme'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 104 "$FUNCNAME: ${script}" || return
+    grep -q $'^AUDIT\tpackage-audit\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: blockme was not audited"; return; }
+  done
+  # an `=` option the gate does not know, on a command it does not gate: both readings give the same command
+  SAFE_INSTALL_TEST_SCRIPT='npm view --frobnicate=x kept' run_zsh
+  assert_status 0 "$FUNCNAME: unknown option, ungated command" || return
+  assert_log_contains $'REAL\tnpm\tview\t--frobnicate=x\tkept' "$FUNCNAME: unknown option, ungated command" || return
+  pass "$FUNCNAME"
+}
+
+# A name the snapshot does not know: read the command both ways, proceed only when both give the same ungated command.
+case_npm_front_door_reads_an_unknown_option_both_ways() {
+  prepare_case "npm-front-door-unknown"
+  local script
+  for script in 'npm install --frobnicate=blockme' 'npm --frobnicate=install blockme' 'npm exec --frobnicate=blockme'; do
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 100 "$FUNCNAME: ${script}" || return
+    assert_err_contains_fragment 'is not one the gate knows' "$FUNCNAME: ${script}" || return
+    assert_err_contains_fragment 'details: safe explain' "$FUNCNAME: ${script}" || return
+    ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: npm was delegated to"; return; }
+  done
+  pass "$FUNCNAME"
+}
+
+# With no `=` form the front door costs nothing and changes nothing.
+case_npm_front_door_is_free_without_an_equals_form() {
+  prepare_case "npm-front-door-free"
+  local out
+  out="$(bash -c 'source "$1/lib/gate-lib.sh"; safe_gate_nopt_load_called=0; safe_gate_nopt_load() { echo LOADED; }; safe_gate_npm_front_door install --save-dev -g blockme -- --json=x; echo "rc=$?"' _ "${ROOT_DIR}" 2>&1)"
+  [[ "${out}" == "rc=0" ]] || { fail "$FUNCNAME: the option tables were read or the command was refused (${out})"; return; }
+  pass "$FUNCNAME"
+}
+
+
+# The same front door under the audit-only pass of `mise exec -- npm …`, and for npm exec's own spellings.
+case_npm_front_door_covers_mise_exec_and_the_exec_switches() {
+  prepare_case "npm-front-door-mise-exec"
+  local script
+  for script in 'mise exec -- npm --json=install blockme' 'mise exec -- npm install --json=blockme' 'mise exec -- npm exec --json=blockme'; do
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 100 "$FUNCNAME: ${script}" || return
+    assert_err_contains_fragment 'to allow: write the option without the value' "$FUNCNAME: ${script}" || return
+    ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: something was delegated"; return; }
+  done
+  # npm reads `true`/`false` after a switch as the switch's value: the package is the next word (found by the oracle)
+  for script in 'npm exec --yes true blockme' 'npm exec -y false blockme' 'npm exec -p true blockme' 'npm exec --no true blockme'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 104 "$FUNCNAME: ${script}" || return
+    assert_log_contains $'AUDIT\tpackage-audit\tblockme\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall' "$FUNCNAME: ${script}" || return
+  done
+  # --quiet and --silent are shorthands of --loglevel: they take no value, the next word is the package
+  SAFE_INSTALL_TEST_SCRIPT='npm exec --quiet true' run_zsh
+  assert_status 0 "$FUNCNAME: quiet" || return
+  # options npm does not define (pnpm's and bun's) are switches there: the next word is a package
+  for script in 'npm install --filter blockme' 'npm install --cwd blockme' 'npm install --@scope:registry blockme'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 104 "$FUNCNAME: ${script}" || return
+  done
+  pass "$FUNCNAME"
+}
+
+case_npm_global_mode_is_read_as_npm_reads_it() {
+  prepare_case "npm-global-mode-like-npm"
+  # a cluster, a negated shorthand and an option that swallows a following -g
+  local script verdicts
+  verdicts="$(bash -c 'source "$1/lib/gate-lib.sh"
+    for args in "-gf" "-fg" "--local=false" "--local false" "-g --no-global" "--cache -g" "--tag -g" "--registry -g" "--location=global" "-L global" "-g=false" "-g false" "-gD"; do
+      safe_gate_npm_global_true install ${args} evilpkg && printf "%s=global\n" "${args}" || printf "%s=local\n" "${args}"
+    done' _ "${ROOT_DIR}" 2>&1 | tr '\n' ' ')"
+  [[ "${verdicts}" == '-gf=global -fg=global --local=false=global --local false=global -g --no-global=local --cache -g=local --tag -g=global --registry -g=local --location=global=global -L global=global -g=false=local -g false=local -gD=global ' ]] \
+    || { fail "$FUNCNAME: ${verdicts}"; return; }
+  pass "$FUNCNAME"
+}
+
 main() {
   local case
   for case in \
     case_gate_lib_missing_fails_closed \
     case_wrapper_passthrough_is_cheap \
+    case_npm_front_door_refuses_a_value_npm_leaves_as_an_argument \
+    case_npm_front_door_leaves_what_npm_reads_as_written \
+    case_npm_front_door_reads_an_unknown_option_both_ways \
+    case_npm_front_door_is_free_without_an_equals_form \
+    case_npm_front_door_covers_mise_exec_and_the_exec_switches \
+    case_npm_global_mode_is_read_as_npm_reads_it \
     case_refusal_message_contract \
     case_large_pinned_install_and_socket_rate_nontty \
     case_infra_only_warn_no_host_allow_and_needs_a_tty \
