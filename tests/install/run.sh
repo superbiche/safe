@@ -11622,12 +11622,22 @@ lane_consistent_graph() { # <specs...>
 # declared edge reaches is NOT in it). $@ the expected tree locations; OMIT_JSON the omissions. Skips, and
 # says so, where no node with an npm is at hand.
 lane_fixture_is_what_npm_builds() { # <label> <locations...>
-  local label="$1" npm_dir="" script="${CASE_DIR}/fixture-check.cjs" out rc expected
+  local label="$1" out rc
   shift
+  out="$(lane_fixture_npm_verdict "$@")"; rc=$?
+  case "${rc}" in
+    0) return 0 ;;
+    77) printf '# %s: no node with an npm here; the fixture was not checked against npm'"'"'s offline modules\n' "${label}"; return 0 ;;
+    *) printf '%s\n' "${out}" >&2; fail "${label}: the fixture is not what npm would build (${out})"; return 1 ;;
+  esac
+}
+
+# The verdict itself: prints npm's findings; returns 0 (a consistent graph), 77 (no npm to ask), other (not).
+lane_fixture_npm_verdict() { # <locations...>
+  local npm_dir="" script="${CASE_DIR}/fixture-check.cjs" out rc expected
   [[ -n "${REAL_NODE_BIN}" ]] && npm_dir="$(cd -- "$(dirname -- "${REAL_NODE_BIN}")/../lib/node_modules/npm" 2>/dev/null && pwd -P)" || npm_dir=""
   if [[ -z "${npm_dir}" || ! -f "${npm_dir}/node_modules/@npmcli/arborist/lib/index.js" ]]; then
-    printf '# %s: no node with an npm here; the fixture was not checked against npm'"'"'s offline modules\n' "${label}"
-    return 0
+    return 77
   fi
   cat > "${script}" <<'JS'
 'use strict'
@@ -11652,8 +11662,8 @@ const opts = { path: dir, packageLock: true, save: false, offline: true, cache: 
 JS
   expected="$(printf '%s\n' "$@" | jq -R . | jq -sc .)"
   out="$("${REAL_NODE_BIN}" "${script}" "${npm_dir}" "${WORK_DIR}" "${expected}" "${OMIT_JSON:-[]}" "${CASE_DIR}/fixture-npm-cache" 2>&1)"; rc=$?
-  (( rc == 0 )) || { printf '%s\n' "${out}" >&2; fail "${label}: the fixture is not what npm would build (${out})"; return 1; }
-  return 0
+  printf '%s' "${out}"
+  return "${rc}"
 }
 
 # A project the way a fresh clone has it: its lockfile committed, no tree.
@@ -12283,6 +12293,30 @@ case_project_lane_ci_report_does_not_overstate_incomplete_coverage_and_the_guard
 }
 
 
+# 5. The checker itself: the shapes the review found are NOT what npm builds (a lockfile entry no declared edge
+# reaches is not in the ideal tree; a root dependency missing from the lockfile needs resolution), and the
+# consistent shapes are.
+case_project_lane_the_ci_fixtures_are_checked_against_npms_offline_modules() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local out rc
+  # the old fresh-clone shape: the manifest requires only kept, the lockfile also lists vuln and risky
+  lane_prepare "lane-fixture-surplus" kept@1.0.0 vuln@1.0.0 risky@1.0.0
+  out="$(lane_fixture_npm_verdict node_modules/kept node_modules/vuln node_modules/risky)"; rc=$?
+  if (( rc == 77 )); then printf '# %s: no node with an npm here; the checker was not exercised\n' "$FUNCNAME"; pass "$FUNCNAME"; return; fi
+  (( rc != 0 )) && [[ "${out}" == *'"missing":["node_modules/vuln","node_modules/risky"]'* ]] || { fail "$FUNCNAME: an unreachable lockfile entry was taken for installed (${rc}: ${out})"; return; }
+  # the old 1,000-entry shape: the manifest requires kept, which the lockfile lacks
+  lane_prepare "lane-fixture-missing-root" kept@1.0.0
+  lane_lock bulk@1.0.0 > "${WORK_DIR}/package-lock.json"
+  out="$(lane_fixture_npm_verdict node_modules/bulk)"; rc=$?
+  (( rc != 0 )) || { fail "$FUNCNAME: a lockfile without the manifest's own dependency was accepted"; return; }
+  # the consistent shape
+  lane_prepare "lane-fixture-consistent" kept@1.0.0
+  lane_consistent_graph kept@1.0.0 vuln@1.0.0 risky@1.0.0
+  out="$(lane_fixture_npm_verdict node_modules/kept node_modules/vuln node_modules/risky)"; rc=$?
+  (( rc == 0 )) || { fail "$FUNCNAME: a consistent graph was refused (${out})"; return; }
+  pass "$FUNCNAME"
+}
+
 main() {
   local case
   for case in \
@@ -12466,6 +12500,7 @@ main() {
     case_project_lane_routing_ci_dedupe_and_prune_follow_the_routing_rule \
     case_project_lane_routing_the_old_differential_path_is_reachable_only_with_the_switch_off \
     case_project_lane_ci_reads_the_whole_graph_of_a_thousand_entries \
+    case_project_lane_the_ci_fixtures_are_checked_against_npms_offline_modules \
     case_project_lane_routing_a_token_npm_does_not_resolve_is_left_to_npm \
     case_project_lane_dedupe_judges_the_plan_npm_leaves \
     case_project_lane_ci_shows_npms_error_wherever_it_is_in_its_output \
