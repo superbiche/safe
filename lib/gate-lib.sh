@@ -2762,7 +2762,7 @@ safe_gate_project_lane_enabled() {
 # redacted (userinfo of a URL, auth/token/password settings).
 safe_gate_lane_clean() {
   printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013-\037\177' | LC_ALL=C tr '\t\n' '  ' \
-    | LC_ALL=C sed -E 's#(://)[^/@[:space:]]*@#\1***@#g; s#((_auth|_authToken|_auth_token|_password|token|password|secret)[=:][[:space:]]*)[^[:space:]]+#\1***#Ig'
+    | LC_ALL=C sed -E 's#(://)[^/@[:space:]]*@#\1***@#g; s#(://[^[:space:]?]*)\?[^[:space:]]*#\1?***#g; s#((_auth|_authToken|_auth_token|_password|token|password|secret|apikey|api_key)[=:][[:space:]]*)[^[:space:]]+#\1***#Ig'
 }
 
 # The one final stderr line of every refusal of this lane.
@@ -2826,93 +2826,150 @@ safe_gate_sha256_file() {
   fi
 }
 
-# --- the one npm ------------------------------------------------------------
+# --- the one runtime ---------------------------------------------------------
 #
-# Every npm run of the lane goes through safe_gate_lane_npm_in, which reaches
-# the underlying npm the way safe_gate_exec_real would exec it, never through a
-# wrapper: the real binary, or, when the delegate is a version manager's shim
-# (a marked wrapper whose argv0 dispatch routes back into the gate), the REAL
-# mise under the tool's argv0. SAFE_GATE_LANE_NPM is the absolute-path prefix
-# of that command; SAFE_GATE_LANE_ENV_U the `env -u` list of the controlled
-# start-up environment; SAFE_GATE_LANE_GIT the command npm is told to use for
-# git (one that always fails: git sources are not admitted).
-safe_gate_lane_resolve_npm() {
-  local real="" real_mise="" dir=""
+# The Node and the npm every npm run of the lane uses are resolved ONCE, in the
+# project's context (what the gate's delegate would run there), and that pair is
+# run directly in every phase (probes, projection, frozen install), whatever
+# the working directory: project, scratch or staging. No version manager decides
+# again after this. SAFE_GATE_LANE_NPM is the absolute-path command (node, then
+# npm-cli.js; or the npm file itself when it is not a script of Node's),
+# SAFE_GATE_LANE_NODE the node, SAFE_GATE_LANE_NPM_DIR npm's directory,
+# SAFE_GATE_LANE_ENV the one allow-listed environment (`env -i NAME=value ...`),
+# SAFE_GATE_LANE_GIT the command npm is told to use for git.
+safe_gate_lane_abs() {
+  local path="$1" dir=""
+  case "${path}" in
+    /*) printf '%s' "${path}" ;;
+    *) dir="$(cd -- "$(dirname -- "${path}")" 2>/dev/null && pwd -P)" || return 1; printf '%s/%s' "${dir}" "$(basename -- "${path}")" ;;
+  esac
+}
+
+safe_gate_lane_resolve_runtime() {
+  local project_dir="$1" real="" real_mise="" npm_bin="" node_bin="" npm_dir="" npm_real=""
   SAFE_GATE_LANE_NPM=()
   real="$(safe_gate_resolve_real npm)" || return 1
-  case "${real}" in
-    /*) ;;
-    *) dir="$(cd -- "$(dirname -- "${real}")" 2>/dev/null && pwd -P)" || return 1; real="${dir}/$(basename -- "${real}")" ;;
-  esac
+  real="$(safe_gate_lane_abs "${real}")" || return 1
   if [[ "$(safe_gate_wrapper_marker_tool "${real}")" == "mise" ]]; then
+    # A version manager's shim: the real manager answers, in the project's context.
     real_mise="$(safe_gate_resolve_real mise)" || return 1
-    case "${real_mise}" in
-      /*) ;;
-      *) dir="$(cd -- "$(dirname -- "${real_mise}")" 2>/dev/null && pwd -P)" || return 1; real_mise="${dir}/$(basename -- "${real_mise}")" ;;
-    esac
-    SAFE_GATE_LANE_NPM=("${BASH}" -c 'exec -a "$1" "$2" "${@:3}"' safe-lane npm "${real_mise}")
+    real_mise="$(safe_gate_lane_abs "${real_mise}")" || return 1
+    npm_bin="$(cd -- "${project_dir}" 2>/dev/null && "${real_mise}" which npm 2>/dev/null </dev/null)" || return 1
+    node_bin="$(cd -- "${project_dir}" 2>/dev/null && "${real_mise}" which node 2>/dev/null </dev/null)" || return 1
   else
-    SAFE_GATE_LANE_NPM=("${real}")
+    npm_bin="${real}"
+    node_bin="$(dirname -- "${npm_bin}")/node"
+    [[ -x "${node_bin}" ]] || node_bin="$(command -v node 2>/dev/null)" || return 1
   fi
+  [[ "${npm_bin}" == /* && "${node_bin}" == /* && -x "${npm_bin}" && -x "${node_bin}" ]] || return 1
+  npm_dir="$(cd -- "$(dirname -- "${npm_bin}")/../lib/node_modules/npm" 2>/dev/null && pwd -P)" || npm_dir=""
+  npm_real="$(realpath -- "${npm_bin}" 2>/dev/null)" || return 1
+  if [[ -n "${npm_dir}" && -f "${npm_dir}/bin/npm-cli.js" ]]; then
+    SAFE_GATE_LANE_NPM=("${node_bin}" "${npm_dir}/bin/npm-cli.js")
+  elif [[ "${npm_real}" == *.js && -f "${npm_real}" ]]; then
+    SAFE_GATE_LANE_NPM=("${node_bin}" "${npm_real}")
+    npm_dir="$(cd -- "$(dirname -- "${npm_real}")/.." 2>/dev/null && pwd -P)" || npm_dir=""
+  else
+    SAFE_GATE_LANE_NPM=("${npm_bin}")
+  fi
+  [[ -n "${npm_dir}" ]] || npm_dir="$(cd -- "$(dirname -- "${npm_bin}")/.." 2>/dev/null && pwd -P)" || return 1
+  SAFE_GATE_LANE_NODE="${node_bin}"
+  SAFE_GATE_LANE_NPM_DIR="${npm_dir}"
   SAFE_GATE_LANE_GIT="/bin/false"
   return 0
 }
 
-# The controlled start-up environment: Node's start-up options (a preload runs
-# before npm reads its first setting), safe's own gate state and the script
-# policy of the caller's environment (scrubbed as today) are removed from every
-# npm run of the lane, from the first probe.
+# The one allow-listed environment of every npm run of the lane, from the first
+# probe: nothing is inherited that is not named here.
+#   PATH              the selected node's directory, then /usr/local/bin:/usr/bin:/bin
+#   HOME USER LOGNAME LANG LANGUAGE LC_* TZ TMPDIR
+#                     where npm finds its user configuration and cache, and its locale
+#   SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS
+#   HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY (and lower case)
+#                     how it reaches the registry
+#   npm_config_* / NPM_CONFIG_*
+#                     npm's own settings, carried to every phase and compared by the
+#                     parity probes; EXCEPT the script policy, git and Node options,
+#                     which the lane sets itself
+#   NODE_OPTIONS      only --max-old-space-size, --max-http-header-size,
+#                     --stack-trace-limit and --no-warnings; any other token (a
+#                     preload, a loader, an inspector) cannot be carried and refuses
+# Everything else (MISE_*, NODE_*, SAFE_*, BASH_ENV, LD_*, SSH_AUTH_SOCK, CI, ...)
+# is dropped. Sets SAFE_GATE_LANE_REASON and fails when a setting cannot be carried.
 safe_gate_lane_build_env() {
-  local name key
-  SAFE_GATE_LANE_ENV_U=()
+  local name key token
+  SAFE_GATE_LANE_ENV=(env -i "PATH=$(dirname -- "${SAFE_GATE_LANE_NODE}"):/usr/local/bin:/usr/bin:/bin")
+  for name in HOME USER LOGNAME LANG LANGUAGE TZ TMPDIR SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS \
+      HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy; do
+    [[ -v "${name}" ]] && SAFE_GATE_LANE_ENV+=("${name}=${!name}")
+  done
   while IFS= read -r name; do
     key="${name,,}"
     key="${key//-/_}"
     case "${key}" in
-      node_options|node_path|npm_config_node_options|npm_config_ignore_scripts|npm_config_allow_scripts|npm_config_strict_allow_scripts|npm_config_dangerously_allow_all_scripts|npm_config_git|npm_config_allow_git|safe_gate_*)
-        SAFE_GATE_LANE_ENV_U+=(-u "${name}")
-        ;;
+      lc_*) SAFE_GATE_LANE_ENV+=("${name}=${!name}") ;;
+      npm_config_ignore_scripts|npm_config_allow_scripts|npm_config_strict_allow_scripts|npm_config_dangerously_allow_all_scripts|npm_config_git|npm_config_allow_git|npm_config_node_options) ;;
+      npm_config_*) SAFE_GATE_LANE_ENV+=("${name}=${!name}") ;;
     esac
   done < <(compgen -e)
+  if [[ -n "${NODE_OPTIONS:-}" ]]; then
+    for token in ${NODE_OPTIONS}; do
+      if [[ ! "${token}" =~ ^(--max-old-space-size=[0-9]+|--max-http-header-size=[0-9]+|--stack-trace-limit=[0-9]+|--no-warnings)$ ]]; then
+        SAFE_GATE_LANE_REASON="NODE_OPTIONS carrying ${token%%=*}, which cannot be carried to the npm runs of the lane"
+        return 1
+      fi
+    done
+    SAFE_GATE_LANE_ENV+=("NODE_OPTIONS=${NODE_OPTIONS}")
+  fi
+  return 0
 }
 
-# Runs the lane's npm in a directory, with the controlled environment, any
-# `NAME=value` words of SAFE_GATE_LANE_EXTRA_ENV, and without the lock
+# Runs the lane's npm in a directory with the one environment, without the lock
 # descriptor (a child must never keep the project lock alive).
 safe_gate_lane_npm_in() {
-  local dir="$1" had_oldpwd=0 ambient_oldpwd=""
+  local dir="$1"
   shift
-  if [[ -n "${OLDPWD+x}" ]]; then
-    had_oldpwd=1
-    ambient_oldpwd="${OLDPWD}"
-  fi
   (
     cd -- "${dir}" || exit 125
-    safe_gate_lockdiff_restore_oldpwd "${had_oldpwd}" "${ambient_oldpwd}"
     [[ ! "${SAFE_GATE_LANE_LOCKFD:-}" =~ ^[0-9]+$ ]] || eval "exec ${SAFE_GATE_LANE_LOCKFD}<&-"
-    exec env "${SAFE_GATE_LANE_ENV_U[@]}" ${SAFE_GATE_LANE_EXTRA_ENV[@]+"${SAFE_GATE_LANE_EXTRA_ENV[@]}"} \
-      "${SAFE_GATE_LANE_NPM[@]}" "$@"
+    exec "${SAFE_GATE_LANE_ENV[@]}" "${SAFE_GATE_LANE_NPM[@]}" "$@"
   )
 }
 
-# Reused by the dedupe/prune lane's probes: with the lane's npm resolved they
-# reach it; otherwise the delegate they resolved, as before.
+# The selected node, same environment, same descriptor discipline.
+safe_gate_lane_node_in() {
+  local dir="$1"
+  shift
+  (
+    cd -- "${dir}" || exit 125
+    [[ ! "${SAFE_GATE_LANE_LOCKFD:-}" =~ ^[0-9]+$ ]] || eval "exec ${SAFE_GATE_LANE_LOCKFD}<&-"
+    exec "${SAFE_GATE_LANE_ENV[@]}" "${SAFE_GATE_LANE_NODE}" "$@"
+  )
+}
+
+# Reused by the dedupe/prune lane's probes: with the lane's runtime armed they
+# reach it (lock descriptor closed); otherwise the delegate they resolved.
 safe_gate_npm_probe_run() {
   local real="$1"
   shift
   if safe_gate_lane_armed; then
-    env "${SAFE_GATE_LANE_ENV_U[@]}" "${SAFE_GATE_LANE_NPM[@]}" "$@"
+    (
+      [[ ! "${SAFE_GATE_LANE_LOCKFD:-}" =~ ^[0-9]+$ ]] || eval "exec ${SAFE_GATE_LANE_LOCKFD}<&-"
+      exec "${SAFE_GATE_LANE_ENV[@]}" "${SAFE_GATE_LANE_NPM[@]}" "$@"
+    )
   else
     "${real}" "$@"
   fi
 }
 
-# The lane's runner is armed only by this process: an array, which an
+# The lane's runtime is armed only by this process: arrays, which an
 # environment variable inherited from the caller can never be.
 safe_gate_lane_armed() {
   local declared
   declared="$(declare -p SAFE_GATE_LANE_NPM 2>/dev/null)" || return 1
-  [[ "${declared}" == "declare -a SAFE_GATE_LANE_NPM="* ]]
+  [[ "${declared}" == "declare -a SAFE_GATE_LANE_NPM="* ]] || return 1
+  declared="$(declare -p SAFE_GATE_LANE_ENV 2>/dev/null)" || return 1
+  [[ "${declared}" == "declare -a SAFE_GATE_LANE_ENV="* ]]
 }
 
 # Every SAFE_GATE_LANE_* value the caller handed in is discarded before the lane
@@ -2926,97 +2983,28 @@ safe_gate_lane_discard_inherited() {
   done < <(compgen -v SAFE_GATE_LANE_)
 }
 
-# --- admission ---------------------------------------------------------------
-
-# Exact registry package spec: [@scope/]name@x.y.z[-pre][+build], nothing else.
-safe_gate_lane_exact_spec() {
-  local LC_ALL=C
-  [[ "$1" =~ ^(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9_][A-Za-z0-9._~-]*@(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]
-}
-
-# A registry range by a strict grammar: a dist-tag, `*`, or comparator sets
-# (operators, x-ranges, hyphen ranges) joined by `||`. Never a path, a URL, a
-# scheme or a file name.
-safe_gate_lane_range() {
-  local LC_ALL=C range="$1"
-  local v='(x|X|\*|[0-9]+)(\.(x|X|\*|[0-9]+)){0,2}(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?'
-  local c="(\\^|~>?|>=|<=|>|<|=)? *${v}"
-  local set="(${c}( +${c})*|${v} +- +${v})"
-  (( ${#range} <= 256 )) || return 1
-  [[ "${range}" =~ \.(tgz|tar|tar\.gz)$ ]] && return 1
-  [[ -z "${range}" || "${range}" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] && return 0
-  [[ "${range}" =~ ^\ *${set}(\ *\|\|\ *${set})*\ *$ ]]
-}
-
-# An override selector: `.`, or a registry package name with an optional
-# registry range (`name`, `name@^1`, `@scope/name@1.x`).
-safe_gate_lane_selector() {
-  local LC_ALL=C sel="$1"
-  [[ "${sel}" == "." ]] && return 0
-  [[ "${sel}" =~ ^((@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9_][A-Za-z0-9._~-]*)(@(.*))?$ ]] || return 1
-  [[ -z "${BASH_REMATCH[3]}" ]] && return 0
-  safe_gate_lane_range "${BASH_REMATCH[4]}"
-}
-
-# The sources the snapshot manifest and its overrides name: registry ranges by
-# a strict pattern, nothing else (not a link: the binder does not verify one).
-# Sets SAFE_GATE_LANE_REASON and fails on the first thing that is not.
-safe_gate_project_lane_manifest_admission() {
-  local manifest="$1" kind="" value="" LC_ALL=C
-  if ! jq -e 'type == "object"
-      and ([.dependencies, .devDependencies, .optionalDependencies, .peerDependencies]
-           | map(select(. != null) | type == "object" and ([.[] | type == "string"] | all)) | all)
-      and (.overrides == null or (.overrides | type == "object"))' "${manifest}" >/dev/null 2>&1; then
-    SAFE_GATE_LANE_REASON="a manifest whose dependency sections or overrides are not maps of strings"
-    return 1
-  fi
-  if jq -e '.workspaces != null' "${manifest}" >/dev/null 2>&1; then
-    SAFE_GATE_LANE_REASON="a project with workspaces"
-    return 1
-  fi
-  local list="${SAFE_GATE_LANE_SCRATCH}/manifest-sources"
-  if ! jq -j '
-      def emit($k; $v): $k + "\u0000" + $v + "\u0000";
-      ( [.dependencies, .devDependencies, .optionalDependencies, .peerDependencies]
-        | map(select(. != null) | to_entries[])
-        | .[] | emit("name"; .key), emit("range"; .value) ),
-      ( (.overrides // {}) | [paths] | .[] | emit("selector"; (.[-1] | tostring)) ),
-      ( (.overrides // {}) | [.. | strings] | .[]
-        | if startswith("$") then emit("reference"; .) else emit("range"; .) end )' \
-      "${manifest}" > "${list}" 2>/dev/null; then
-    SAFE_GATE_LANE_REASON="a manifest whose sources cannot be read"
-    return 1
-  fi
-  while IFS= read -r -d '' kind && IFS= read -r -d '' value; do
-    case "${kind}" in
-      name)
-        [[ "${value}" =~ ^(@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9_][A-Za-z0-9._~-]*$ ]] || {
-          SAFE_GATE_LANE_REASON="a dependency name that is not a registry package name"
-          return 1
-        }
-        ;;
-      range)
-        safe_gate_lane_range "${value}" || {
-          SAFE_GATE_LANE_REASON="a manifest dependency that is not a registry range"
-          return 1
-        }
-        ;;
-      reference)
-        [[ "${value}" =~ ^\$[A-Za-z0-9_][A-Za-z0-9._~@/-]*$ ]] || {
-          SAFE_GATE_LANE_REASON="an override that is not a registry range"
-          return 1
-        }
-        ;;
-      selector)
-        safe_gate_lane_selector "${value}" || {
-          SAFE_GATE_LANE_REASON="an override selector that is not a registry package"
-          return 1
-        }
-        ;;
-    esac
-  done < "${list}"
+# The platform npm selects for optional dependencies, from the SELECTED node and
+# npm's own module, values exact (read NUL-delimited, never through a command
+# substitution that strips them). Sets the SAFE_GATE_LANE_SEL_* values.
+safe_gate_lane_selection() {
+  local dir="$1" out="${SAFE_GATE_LANE_SCRATCH}/selection.json" fields="${SAFE_GATE_LANE_SCRATCH}/selection.fields" status=0
+  local script='const c=require(process.argv[1]);const o=c.os();process.stdout.write(JSON.stringify({os:o,cpu:c.cpu(),libc:c.libc(o)===undefined?null:c.libc(o)}))'
+  safe_gate_lane_node_in "${dir}" -e "${script}" "${SAFE_GATE_LANE_NPM_DIR}/node_modules/npm-install-checks/lib/current-env.js" >"${out}" 2>/dev/null || status=$?
+  (( status == 0 )) || return 1
+  jq -e -s 'length == 1 and (.[0] | type == "object" and (.os | type == "string" and length > 0) and (.cpu | type == "string" and length > 0)
+    and (.libc == null or (.libc | type == "string" and length > 0)))' "${out}" >/dev/null 2>&1 || return 1
+  jq -j -s '.[0] | .os, "\u0000", .cpu, "\u0000", (.libc // ""), "\u0000", (if .libc == null then "0" else "1" end), "\u0000"' "${out}" > "${fields}" 2>/dev/null || return 1
+  local -a values=()
+  mapfile -d '' -t values < "${fields}" || return 1
+  (( ${#values[@]} == 4 )) || return 1
+  SAFE_GATE_LANE_SEL_OS="${values[0]}"
+  SAFE_GATE_LANE_SEL_CPU="${values[1]}"
+  SAFE_GATE_LANE_SEL_LIBC="${values[2]}"
+  SAFE_GATE_LANE_SEL_HAS_LIBC="${values[3]}"
   return 0
 }
+
+# --- admission ---------------------------------------------------------------
 
 # Settings of npm's effective configuration the frozen materialisation cannot
 # carry faithfully, or that the lane does not support yet. Prints the reason.
@@ -3034,27 +3022,45 @@ safe_gate_project_lane_config_reason() {
     else empty end' <<<"$1" 2>/dev/null
 }
 
-# The project's registry is exactly the canonical public one, over https, and
-# no package of the project lives under a scope mapped to another registry.
-# $1 effective configuration (JSON), $2 manifest, $3 lockfile, rest: specs.
-safe_gate_project_lane_registry_reason() {
-  local config="$1" manifest="$2" lockfile="$3" scope=""
-  shift 3
-  if ! jq -e '.registry == "https://registry.npmjs.org/"' <<<"${config}" >/dev/null 2>&1; then
-    printf 'a registry other than the canonical public one over https in the configuration'
-    return 0
-  fi
-  while IFS= read -r scope; do
-    [[ -n "${scope}" ]] || continue
-    if grep -Fq -- "${scope}/" "${manifest}" "${lockfile}" 2>/dev/null; then
-      printf 'a package of the scope %s, which the configuration maps to another registry' "${scope}"
+# npm's cache and log destinations must lie outside the project: nothing of
+# npm's is written into it before publication. Prints the reason when one does.
+safe_gate_project_lane_paths_reason() {
+  local config="$1" project_dir="$2" key path
+  for key in cache logs-dir; do
+    path="$(jq -r --arg k "${key}" '.[$k] // empty | strings' <<<"${config}" 2>/dev/null)" || path=""
+    [[ -n "${path}" ]] || continue
+    if safe_gate_lane_inside "${path}" "${project_dir}"; then
+      printf 'npm setting %s inside the project, where npm would write before publication' "${key}"
       return 0
     fi
-    for spec in "$@"; do
-      [[ "${spec}" == "${scope}/"* ]] && { printf 'a package of the scope %s, which the configuration maps to another registry' "${scope}"; return 0; }
-    done
-  done < <(jq -r 'keys[] | select(test("^@.+:registry$")) | sub(":registry$"; "")' <<<"${config}" 2>/dev/null)
+  done
   return 1
+}
+
+# Admission, in Go (internal/projectlane/admit.go): every source the arguments,
+# the manifest and its typed overrides, and the lockfile's dependency edges name
+# is a registry package as npm classifies it, and the registry rules hold for
+# every package name found. $1 verb, rest: project-admit arguments. Prints the
+# lane's refusal and returns its status when something is not admitted.
+safe_gate_project_lane_admit() {
+  local verb="$1" doc="${SAFE_GATE_LANE_SCRATCH}/admit.json" rc=0 text=""
+  shift
+  "${SAFE_GATE_LANE_CORE}" project-admit "$@" >"${doc}" 2>"${SAFE_GATE_LANE_SCRATCH}/admit.err" || rc=$?
+  if (( rc != 0 )); then
+    safe_gate_project_lane_refuse 100 "${verb}" "admission cannot read its inputs (exit ${rc}; audit-infrastructure breakage, not a package finding)" "repair the manifest or lockfile and retry"
+    return $?
+  fi
+  if ! jq -e -s 'length == 1 and (.[0] | .schema_version == 1 and (.ok | type == "boolean") and (.refusals | type == "array") and (.names | type == "array")
+      and (.ok == ((.refusals | length) == 0)))' "${doc}" >/dev/null 2>&1; then
+    safe_gate_project_lane_refuse 100 "${verb}" "admission returned no usable document (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
+    return $?
+  fi
+  if jq -e '.ok == false' "${doc}" >/dev/null 2>&1; then
+    text="$(jq -r '.refusals[0] | "\(.where): \(.reason)\(if (.text // "") != "" then " (\(.text))" else "" end)"' "${doc}" 2>/dev/null)"
+    safe_gate_project_lane_unsupported "${verb}" "${text:-a source that is not a registry package}"
+    return $?
+  fi
+  return 0
 }
 
 # Probes the frozen invocation as npm will see it (no lockfile-only mode, the
@@ -3074,28 +3080,6 @@ safe_gate_project_lane_config_diff() {
     [ (($a | keys) + ($b | keys)) | unique | .[]
       | select(. as $k | ["package-lock-only","dry-run","save","save-exact","save-dev","save-prod","save-optional","save-peer"] | index($k) | not)
       | select($a[.] != $b[.]) ] | join(", ")' 2>/dev/null
-}
-
-# The host's npm platform names, for a selection npm leaves unset.
-safe_gate_lane_host_cpu() {
-  case "$(uname -m 2>/dev/null)" in
-    x86_64|amd64) printf 'x64' ;;
-    aarch64|arm64) printf 'arm64' ;;
-    i?86) printf 'ia32' ;;
-    ppc64le|ppc64) printf 'ppc64' ;;
-    s390x) printf 's390x' ;;
-    riscv64) printf 'riscv64' ;;
-    loongarch64) printf 'loong64' ;;
-    *) return 1 ;;
-  esac
-}
-
-safe_gate_lane_host_libc() {
-  if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
-    printf 'musl'
-  else
-    printf 'glibc'
-  fi
 }
 
 # A decision report that is complete and consistent, or nothing: ONE document,
@@ -3185,8 +3169,9 @@ safe_gate_project_lane_cleanup() {
   if [[ "${SAFE_GATE_LANE_LOCKFD:-}" =~ ^[0-9]+$ ]]; then
     { eval "exec ${SAFE_GATE_LANE_LOCKFD}<&-"; } 2>/dev/null
   fi
-  unset SAFE_GATE_LANE_SCRATCH SAFE_GATE_LANE_LOCKFD SAFE_GATE_LANE_NPM SAFE_GATE_LANE_ENV_U \
-    SAFE_GATE_LANE_EXTRA_ENV SAFE_GATE_LANE_GIT SAFE_GATE_LANE_REASON
+  unset SAFE_GATE_LANE_SCRATCH SAFE_GATE_LANE_LOCKFD SAFE_GATE_LANE_NPM SAFE_GATE_LANE_ENV SAFE_GATE_LANE_NODE \
+    SAFE_GATE_LANE_NPM_DIR SAFE_GATE_LANE_GIT SAFE_GATE_LANE_REASON SAFE_GATE_LANE_CORE SAFE_GATE_LANE_BIND_PID \
+    SAFE_GATE_LANE_SEL_OS SAFE_GATE_LANE_SEL_CPU SAFE_GATE_LANE_SEL_LIBC SAFE_GATE_LANE_SEL_HAS_LIBC
   return 0
 }
 
@@ -3246,30 +3231,92 @@ safe_gate_project_lane_npm() {
   return "${rc}"
 }
 
+# Private storage of safe's own, outside the project, checked before use: a real
+# directory (never a link), the user's, closed to group and others.
+safe_gate_lane_private_dir() {
+  local path="$1"
+  [[ ! -L "${path}" ]] || return 1
+  mkdir -p -m 700 -- "${path}" 2>/dev/null || return 1
+  [[ -d "${path}" && ! -L "${path}" ]] || return 1
+  [[ "$(stat -c '%u' -- "${path}" 2>/dev/null)" == "$(id -u)" ]] || return 1
+  chmod 700 -- "${path}" 2>/dev/null || return 1
+  [[ "$(stat -c '%a' -- "${path}" 2>/dev/null)" == "700" ]]
+}
+
+# True when a path is, or lies inside, the project directory.
+safe_gate_lane_inside() {
+  local path="$1" project_dir="$2" resolved
+  resolved="$(realpath -m -- "${path}" 2>/dev/null)" || return 0
+  [[ "${resolved}" == "${project_dir}" || "${resolved}" == "${project_dir}/"* ]]
+}
+
+# A copy that is checked: the lane never goes on with a file that did not arrive.
+safe_gate_lane_cp() {
+  cp -- "$1" "$2" 2>/dev/null && cmp -s -- "$1" "$2"
+}
+
+# Runs a reused guard with its stderr kept at the lane's boundary: what reaches
+# the terminal is cleaned, line by line (the guards print project-derived text).
+safe_gate_lane_guard() {
+  local rc=0 line
+  "$@" 2>"${SAFE_GATE_LANE_SCRATCH}/guard.err" || rc=$?
+  while IFS= read -r line; do
+    safe_gate_err "$(safe_gate_lane_clean "${line}")"
+  done < "${SAFE_GATE_LANE_SCRATCH}/guard.err"
+  return "${rc}"
+}
+
+# One JSON document, of the given jq test, or nothing.
+safe_gate_lane_one_doc() {
+  local test="$1" text="$2"
+  jq -e -s "length == 1 and (.[0] | ${test})" <<<"${text}" >/dev/null 2>&1
+}
+
 safe_gate_project_lane_run() {
   local subcommand="${SAFE_GATE_SUBCMD}" verb="" lane_sub="" arg="" value="" first=1 dry_run=0
   local project_dir="" scratch="" snap="" proj="" frozen="" rc=0 safe_core="" safe_core_version=""
-  local state_dir="" config_json="" frozen_json="" differing=""
-  local -a specs=() carry=() omit_arg=() include_arg=() proj_args=() probe_args=() frozen_args=()
+  local state_dir="" config_json="" frozen_json="" differing="" data_root="${SAFE_DATA_DIR:-${HOME}/.local/share/safe}"
+  local -a specs=() carry=() proj_args=() probe_args=() frozen_args=()
 
   verb="$(safe_gate_npm_canonical_command "${subcommand}")" || verb="${subcommand}"
   lane_sub="${verb} [lane: project]"
 
-  # --- 1. route: npm's own word on global, then the arguments ----------------
-  # A genuine global install is not the lane's: it is recognised first, before
-  # the lock and before the terminator refusal, and goes to today's gate.
-  if safe_gate_lane_resolve_npm; then
-    :
-  else
-    safe_gate_err "safe: gate: npm: command not found (no non-wrapper npm on PATH)"
-    return 127
-  fi
-  safe_gate_lane_build_env
+  # --- 1. route: the runtime, then npm's own word on global --------------------
   if ! project_dir="$(cd -- "." 2>/dev/null && pwd -P)"; then
     safe_gate_project_lane_refuse 100 "${verb}" "the project directory cannot be read" "retry from the project root"
     return $?
   fi
-  # `--json` goes before the terminator, where npm still reads it as an option.
+  # safe's own storage, and the scratch, are outside the project: nothing of
+  # ours is ever written into it before publication.
+  if safe_gate_lane_inside "${data_root}" "${project_dir}" || safe_gate_lane_inside "${TMPDIR:-/tmp}" "${project_dir}"; then
+    safe_gate_project_lane_refuse 100 "${verb}" "safe's data directory or the temporary directory is inside the project, where the lane writes nothing before publication" "point SAFE_DATA_DIR and TMPDIR outside the project and retry"
+    return $?
+  fi
+  if ! safe_gate_lane_resolve_runtime "${project_dir}"; then
+    safe_gate_err "safe: gate: npm: command not found (no non-wrapper npm on PATH, or its Node cannot be resolved in this project)"
+    return 127
+  fi
+  if ! safe_gate_lane_build_env; then
+    safe_gate_project_lane_unsupported "${verb}" "${SAFE_GATE_LANE_REASON}"
+    return $?
+  fi
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/safe-gate-project-lane.XXXXXX" 2>/dev/null)" || {
+    safe_gate_project_lane_refuse 100 "${verb}" "cannot allocate lane storage (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
+    return $?
+  }
+  SAFE_GATE_LANE_SCRATCH="${scratch}"
+  snap="${scratch}/snapshot"
+  proj="${scratch}/projection"
+  frozen="${scratch}/frozen"
+  if ! mkdir -p -- "${scratch}/neutral" "${snap}" "${proj}" "${frozen}"; then
+    safe_gate_project_lane_refuse 100 "${verb}" "cannot prepare lane storage (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
+    return $?
+  fi
+  # A genuine global install is not the lane's: it is recognised first, before
+  # the lock and before the terminator refusal, and goes to today's gate. The
+  # probe runs in a scratch directory, so no project file or directory is read
+  # or created by it. `--json` goes before the terminator, where npm still reads
+  # it as an option.
   local -a pre=() post=()
   local split=0
   for arg in "$@"; do
@@ -3278,11 +3325,11 @@ safe_gate_project_lane_run() {
     fi
     if (( split )); then post+=("${arg}"); else pre+=("${arg}"); fi
   done
-  config_json="$(safe_gate_lane_npm_in "${project_dir}" config list ${pre[@]+"${pre[@]}"} --json ${post[@]+"${post[@]}"} 2>/dev/null)" || {
+  config_json="$(safe_gate_lane_npm_in "${scratch}/neutral" config list ${pre[@]+"${pre[@]}"} --json ${post[@]+"${post[@]}"} 2>/dev/null)" || {
     safe_gate_project_lane_refuse 100 "${verb}" "npm's effective configuration cannot be read (audit-infrastructure breakage, not a package finding)" "fix npm configuration and retry — safe doctor"
     return $?
   }
-  if ! jq -e 'type == "object"' <<<"${config_json}" >/dev/null 2>&1; then
+  if ! safe_gate_lane_one_doc 'type == "object"' "${config_json}"; then
     safe_gate_project_lane_refuse 100 "${verb}" "npm's effective configuration is unreadable (audit-infrastructure breakage, not a package finding)" "fix npm configuration and retry — safe doctor"
     return $?
   fi
@@ -3296,11 +3343,13 @@ safe_gate_project_lane_run() {
       return $?
     fi
   done
-  scratch="$(mktemp -d "${TMPDIR:-/tmp}/safe-gate-project-lane.XXXXXX" 2>/dev/null)" || {
-    safe_gate_project_lane_refuse 100 "${verb}" "cannot allocate lane storage (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
-    return $?
-  }
-  SAFE_GATE_LANE_SCRATCH="${scratch}"
+  case "${verb}" in
+    install|update) ;;
+    *)
+      safe_gate_project_lane_unsupported "${verb}" "npm ${verb}"
+      return $?
+      ;;
+  esac
   # One exclusive kernel lock on the project directory, held until this process
   # exits, dry runs included.
   if ! command -v flock >/dev/null 2>&1; then
@@ -3316,13 +3365,6 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_refuse 100 "${verb}" "another command holds this project's lock" "wait for it to finish, then retry"
     return $?
   fi
-  case "${verb}" in
-    install|update) ;;
-    *)
-      safe_gate_project_lane_unsupported "${verb}" "npm ${verb}"
-      return $?
-      ;;
-  esac
   # A version manager's audit-only pass runs this gate for an outer process that
   # would run the ORIGINAL arguments afterwards: the lane cannot own the
   # installation there, and must never report success (routing ticket).
@@ -3369,10 +3411,6 @@ safe_gate_project_lane_run() {
           safe_gate_project_lane_unsupported "${verb}" "naming packages to update"
           return $?
         fi
-        if ! safe_gate_lane_exact_spec "${arg}"; then
-          safe_gate_project_lane_unsupported "${verb}" "the argument ${arg}, which is not an exact name@version registry spec"
-          return $?
-        fi
         specs+=("${arg}")
         ;;
     esac
@@ -3386,14 +3424,12 @@ safe_gate_project_lane_run() {
   done
 
   # --- 3. one snapshot --------------------------------------------------------
-  snap="${scratch}/snapshot"
-  proj="${scratch}/projection"
-  frozen="${scratch}/frozen"
-  mkdir -p -- "${snap}" "${proj}" "${frozen}"
+  # Regular-file checks come before the first read or npm run of the project: a
+  # FIFO or a link as a configuration file must not hold the command.
   local name
   for name in package.json package-lock.json; do
     if [[ -L "${project_dir}/${name}" || ! -f "${project_dir}/${name}" ]]; then
-      safe_gate_project_lane_unsupported "${verb}" "a project without a regular ${name} (missing, or a symbolic link)"
+      safe_gate_project_lane_unsupported "${verb}" "a project without a regular ${name} (missing, a link or a special file)"
       return $?
     fi
   done
@@ -3407,7 +3443,7 @@ safe_gate_project_lane_run() {
   fi
   for name in package.json package-lock.json .npmrc; do
     [[ -f "${project_dir}/${name}" ]] || continue
-    if ! cp -- "${project_dir}/${name}" "${snap}/${name}" 2>/dev/null; then
+    if ! safe_gate_lane_cp "${project_dir}/${name}" "${snap}/${name}"; then
       safe_gate_project_lane_refuse 100 "${verb}" "cannot snapshot ${name} (audit-infrastructure breakage, not a package finding)" "verify the project files and retry"
       return $?
     fi
@@ -3416,7 +3452,8 @@ safe_gate_project_lane_run() {
   manifest_sum="sha256:$(safe_gate_sha256_file "${snap}/package.json")"
   lock_sum="sha256:$(safe_gate_sha256_file "${snap}/package-lock.json")"
   [[ -f "${snap}/.npmrc" ]] && npmrc_sum="sha256:$(safe_gate_sha256_file "${snap}/.npmrc")"
-  # The baseline is the committed lockfile: the SNAPSHOT's bytes against HEAD.
+  # The baseline is the committed lockfile: the SNAPSHOT's bytes against the
+  # HEAD blob, read with replacement objects disabled.
   if ! safe_gate_project_lane_git "${project_dir}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     safe_gate_project_lane_unsupported "${verb}" "a project outside a git work tree"
     return $?
@@ -3428,10 +3465,6 @@ safe_gate_project_lane_run() {
   fi
   if ! jq -e '(.lockfileVersion == 2 or .lockfileVersion == 3) and (.packages | type == "object")' "${snap}/package-lock.json" >/dev/null 2>&1; then
     safe_gate_project_lane_unsupported "${verb}" "a lockfile that is not version 2 or 3"
-    return $?
-  fi
-  if ! safe_gate_project_lane_manifest_admission "${snap}/package.json"; then
-    safe_gate_project_lane_unsupported "${verb}" "${SAFE_GATE_LANE_REASON}"
     return $?
   fi
   # The tree root is absent or a real directory, before npm can touch it.
@@ -3449,15 +3482,27 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_refuse 100 "${verb}" "safe-core ${safe_core_version:-unreadable} does not match safe ${SAFE_VERSION:-unknown} (audit-infrastructure breakage, not a package finding)" "rerun install.sh"
     return $?
   fi
+  SAFE_GATE_LANE_CORE="${safe_core}"
   if ! safe_gate_audit_available; then
     safe_gate_project_lane_refuse 102 "${verb}" "the advisory reader is unavailable (audit-infrastructure breakage, not a package finding)" "rerun install.sh"
     return $?
   fi
-  # Every entry of the snapshot's lockfile is bound, and none is a link.
+
+  # --- admission, before npm resolves anything -------------------------------
+  # Sources: the arguments, the manifest and its typed overrides, and every
+  # dependency edge the committed lockfile carries, as npm classifies them.
+  local -a admit_args=(--manifest "${snap}/package.json" --lockfile "${snap}/package-lock.json")
+  for arg in ${specs[@]+"${specs[@]}"}; do
+    admit_args+=(--arg "${arg}")
+  done
+  safe_gate_project_lane_admit "${verb}" "${admit_args[@]}" || return $?
+  # Every entry of the snapshot's lockfile is bound, and none is a link. A
+  # committed graph that cannot be read is missing evidence, not a policy refusal.
   local graph_json=""
-  if ! graph_json="$("${safe_core}" project-graph "${snap}/package-lock.json" 2>/dev/null)" \
-      || ! jq -e '.schema_version == 1 and (.bindability.bound | type == "boolean")' <<<"${graph_json}" >/dev/null 2>&1; then
-    safe_gate_project_lane_refuse 100 "${verb}" "the committed lockfile cannot be analysed (audit-infrastructure breakage, not a package finding)" "repair the lockfile and retry"
+  rc=0
+  graph_json="$("${safe_core}" project-graph "${snap}/package-lock.json" 2>/dev/null)" || rc=$?
+  if (( rc != 0 )) || ! safe_gate_lane_one_doc '.schema_version == 1 and (.bindability.bound | type == "boolean") and (.bindability.unbound | type == "array") and (.graph.occurrences | type == "array")' "${graph_json}"; then
+    safe_gate_project_lane_refuse 102 "${verb}" "the committed lockfile cannot be read, so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the lockfile and retry"
     return $?
   fi
   if jq -e '.bindability.bound == false' <<<"${graph_json}" >/dev/null 2>&1; then
@@ -3479,31 +3524,47 @@ safe_gate_project_lane_run() {
   # --- 4. guards and projection, on the snapshot ------------------------------
   # The guards probe the projection's own settings, git sources disabled included.
   probe_args=("--git=${SAFE_GATE_LANE_GIT}" --allow-git=none "${proj_args[@]}")
-  safe_gate_npm_lockdiff_config_path_guard "${lane_sub}" "$@" || return $?
-  safe_gate_npm_lockdiff_effective_config "${snap}" "${lane_sub}" "${probe_args[@]}" || return $?
-  safe_gate_npm_lockdiff_hidden_config_guard "${snap}" "${lane_sub}" "${probe_args[@]}" || return $?
+  safe_gate_lane_guard safe_gate_npm_lockdiff_config_path_guard "${lane_sub}" "$@" || return $?
+  safe_gate_lane_guard safe_gate_npm_lockdiff_effective_config "${snap}" "${lane_sub}" "${probe_args[@]}" || return $?
+  safe_gate_lane_guard safe_gate_npm_lockdiff_hidden_config_guard "${snap}" "${lane_sub}" "${probe_args[@]}" || return $?
   config_json="${SAFE_GATE_LOCKDIFF_CONFIG_JSON}"
-  if value="$(safe_gate_project_lane_registry_reason "${config_json}" "${snap}/package.json" "${snap}/package-lock.json" ${specs[@]+"${specs[@]}"})"; then
-    safe_gate_project_lane_unsupported "${verb}" "${value}"
+  if ! safe_gate_lane_one_doc 'type == "object"' "${config_json}"; then
+    safe_gate_project_lane_refuse 100 "${verb}" "npm's effective configuration is unreadable (audit-infrastructure breakage, not a package finding)" "fix npm configuration and retry — safe doctor"
+    return $?
+  fi
+  printf '%s\n' "${config_json}" > "${scratch}/config.json"
+  # What the lane relies on to keep git out is shown to work on THIS npm.
+  if ! jq -e --arg git "${SAFE_GATE_LANE_GIT}" '.["allow-git"] == "none" and .git == $git' <<<"${config_json}" >/dev/null 2>&1; then
+    safe_gate_project_lane_unsupported "${verb}" "an npm that does not honour --allow-git=none and --git (it cannot keep git sources out)"
     return $?
   fi
   if value="$(safe_gate_project_lane_config_reason "${config_json}")"; then
     safe_gate_project_lane_unsupported "${verb}" "${value}"
     return $?
   fi
-  cp -- "${snap}/package.json" "${proj}/package.json"
-  cp -- "${snap}/package-lock.json" "${proj}/package-lock.json"
-  [[ -f "${snap}/.npmrc" ]] && cp -- "${snap}/.npmrc" "${proj}/.npmrc"
-  safe_gate_npm_lockdiff_config_parity "${proj}" "${lane_sub}" "${probe_args[@]}" || return $?
+  if value="$(safe_gate_project_lane_paths_reason "${config_json}" "${project_dir}")"; then
+    safe_gate_project_lane_unsupported "${verb}" "${value}"
+    return $?
+  fi
+  # Scopes and registries by parsed identity, over everything named so far.
+  safe_gate_project_lane_admit "${verb}" "${admit_args[@]}" --config "${scratch}/config.json" || return $?
+  safe_gate_lane_cp "${snap}/package.json" "${proj}/package.json" && safe_gate_lane_cp "${snap}/package-lock.json" "${proj}/package-lock.json" \
+    && { [[ ! -f "${snap}/.npmrc" ]] || safe_gate_lane_cp "${snap}/.npmrc" "${proj}/.npmrc"; } || {
+    safe_gate_project_lane_refuse 100 "${verb}" "cannot prepare the projection (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
+    return $?
+  }
+  safe_gate_lane_guard safe_gate_npm_lockdiff_config_parity "${proj}" "${lane_sub}" "${probe_args[@]}" || return $?
 
   # The frozen invocation, probed as npm will see it, with the same settings
   # as the projection.
   frozen_args=(ci --ignore-scripts --no-audit --no-fund "--git=${SAFE_GATE_LANE_GIT}" --allow-git=none ${carry[@]+"${carry[@]}"})
-  [[ -f "${snap}/.npmrc" ]] && cp -- "${snap}/.npmrc" "${frozen}/.npmrc"
-  cp -- "${snap}/package.json" "${frozen}/package.json"
-  cp -- "${snap}/package-lock.json" "${frozen}/package-lock.json"
-  if ! frozen_json="$(safe_gate_project_lane_frozen_probe "${frozen}" ${carry[@]+"${carry[@]}"})" \
-      || ! jq -e 'type == "object"' <<<"${frozen_json}" >/dev/null 2>&1; then
+  safe_gate_lane_cp "${snap}/package.json" "${frozen}/package.json" && safe_gate_lane_cp "${snap}/package-lock.json" "${frozen}/package-lock.json" \
+    && { [[ ! -f "${snap}/.npmrc" ]] || safe_gate_lane_cp "${snap}/.npmrc" "${frozen}/.npmrc"; } || {
+    safe_gate_project_lane_refuse 100 "${verb}" "cannot prepare the frozen probe (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
+    return $?
+  }
+  frozen_json="$(safe_gate_project_lane_frozen_probe "${frozen}" ${carry[@]+"${carry[@]}"})" || frozen_json=""
+  if ! safe_gate_lane_one_doc 'type == "object"' "${frozen_json}"; then
     safe_gate_project_lane_refuse 100 "${verb}" "npm's configuration for the frozen installation cannot be read (audit-infrastructure breakage, not a package finding)" "fix npm configuration and retry — safe doctor"
     return $?
   fi
@@ -3515,7 +3576,7 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_unsupported "${verb}" "${value}"
     return $?
   fi
-  if value="$(safe_gate_project_lane_registry_reason "${frozen_json}" "${snap}/package.json" "${snap}/package-lock.json" ${specs[@]+"${specs[@]}"})"; then
+  if value="$(safe_gate_project_lane_paths_reason "${frozen_json}" "${project_dir}")"; then
     safe_gate_project_lane_unsupported "${verb}" "${value}"
     return $?
   fi
@@ -3524,21 +3585,33 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_unsupported "${verb}" "a configuration the frozen installation reads differently from the projection (${differing})"
     return $?
   fi
+  # The platform npm selects, from the selected Node (npm's own settings win).
+  if ! safe_gate_lane_selection "${scratch}/neutral"; then
+    safe_gate_project_lane_unsupported "${verb}" "an npm whose platform selection cannot be read from its Node runtime"
+    return $?
+  fi
 
-  SAFE_GATE_LANE_EXTRA_ENV=(SAFE_GATE_LOCKDIFF_PROJECTION=1)
+  rc=0
   safe_gate_lane_npm_in "${proj}" --package-lock-only --ignore-scripts --no-audit --no-fund \
     "--git=${SAFE_GATE_LANE_GIT}" --allow-git=none "${proj_args[@]}" >"${scratch}/npm-projection.log" 2>&1 || rc=$?
-  SAFE_GATE_LANE_EXTRA_ENV=()
   if (( rc != 0 )); then
     safe_gate_lane_show_npm_log "${scratch}/npm-projection.log"
     safe_gate_project_lane_refuse "${rc}" "${verb}" "the projection failed with npm exit ${rc} (npm could not resolve the command; its own diagnostic is above)" "fix the cause npm printed and retry"
     return $?
   fi
+  if ! jq -e '(.lockfileVersion == 2 or .lockfileVersion == 3) and (.packages | type == "object")' "${proj}/package-lock.json" >/dev/null 2>&1; then
+    safe_gate_project_lane_refuse 100 "${verb}" "the projection produced a lockfile that is not version 2 or 3" "retry after repairing the project"
+    return $?
+  fi
+  # What resolution discovered is held to the same rules: sources, and the
+  # scopes and registries of every package of the projected graph.
+  safe_gate_project_lane_admit "${verb}" --lockfile "${proj}/package-lock.json" --config "${scratch}/config.json" || return $?
 
   # --- 5. judging ---------------------------------------------------------------
   local target_graph="" diff_json="" request="" evidence="${scratch}/evidence.json" report="${scratch}/report.json"
-  if ! target_graph="$("${safe_core}" project-graph "${proj}/package-lock.json" 2>/dev/null)" \
-      || ! jq -e '.schema_version == 1 and (.bindability.bound | type == "boolean") and (.graph.occurrences | type == "array")' <<<"${target_graph}" >/dev/null 2>&1; then
+  rc=0
+  target_graph="$("${safe_core}" project-graph "${proj}/package-lock.json" 2>/dev/null)" || rc=$?
+  if (( rc != 0 )) || ! safe_gate_lane_one_doc '.schema_version == 1 and (.bindability.bound | type == "boolean") and (.bindability.unbound | type == "array") and (.graph.occurrences | type == "array")' "${target_graph}"; then
     safe_gate_project_lane_refuse 100 "${verb}" "the projected lockfile cannot be analysed (audit-infrastructure breakage, not a package finding)" "retry after repairing the project"
     return $?
   fi
@@ -3551,8 +3624,9 @@ safe_gate_project_lane_run() {
     # A baseline that cannot be read is missing evidence about the project.
     safe_gate_project_lane_refuse 102 "${verb}" "the baseline lockfile cannot be read, so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the lockfile and retry"
     return $?
-  elif (( rc != 0 )); then
-    safe_gate_project_lane_refuse 100 "${verb}" "the lockfile analysis failed with exit ${rc} (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
+  elif (( rc != 0 )) || ! safe_gate_lane_one_doc '.schema_version == 1 and (.difference | type == "object") and (.evidence_request | type == "array")
+      and ([.evidence_request[] | (.name | type == "string") and (.version | type == "string")] | all)' "${diff_json}"; then
+    safe_gate_project_lane_refuse 100 "${verb}" "the lockfile analysis failed or returned an unreadable result (exit ${rc}; audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
     return $?
   fi
   # Both documents travel in files: a graph can be larger than one argument may be.
@@ -3580,10 +3654,14 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_refuse 102 "${verb}" "the decision returned an incomplete or inconsistent report (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
     return $?
   fi
-  # The versioned differential is kept in safe's data directory, best effort.
-  local reports="${SAFE_DATA_DIR:-${HOME}/.local/share/safe}/project-lane/reports"
-  if mkdir -p -m 700 -- "${reports}" 2>/dev/null; then
-    cp -- "${report}" "${reports}/$(date -u +%Y%m%dT%H%M%SZ)-$$.json" 2>/dev/null || true
+  # The versioned differential is kept in safe's data directory, which is
+  # established private first; a failure to keep it is said, not hidden.
+  local reports="${data_root}/project-lane/reports"
+  if [[ ! -L "${data_root}" ]] && safe_gate_lane_private_dir "${data_root}/project-lane" && safe_gate_lane_private_dir "${reports}" \
+      && cp -- "${report}" "${reports}/$(date -u +%Y%m%dT%H%M%SZ)-$$.json" 2>/dev/null; then
+    :
+  else
+    safe_gate_err "safe: project lane: the decision report could not be kept in safe's data directory"
   fi
   if ! safe_gate_project_lane_report "${verb}" "${report}" "${evidence}" "${proj}/package-lock.json"; then
     safe_gate_project_lane_refuse 102 "${verb}" "the decision report cannot be rendered (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
@@ -3604,25 +3682,25 @@ safe_gate_project_lane_run() {
   fi
 
   # --- 6. bind ----------------------------------------------------------------------
-  state_dir="${SAFE_DATA_DIR:-${HOME}/.local/share/safe}/project-lane/state"
-  if ! mkdir -p -m 700 -- "${state_dir}" 2>/dev/null || ! chmod 700 -- "${state_dir}" 2>/dev/null; then
-    safe_gate_project_lane_refuse 100 "${verb}" "safe's lane state directory cannot be prepared (audit-infrastructure breakage, not a package finding)" "fix the safe data directory and retry — safe doctor"
+  state_dir="${data_root}/project-lane/state"
+  if [[ -L "${data_root}" ]] || ! safe_gate_lane_private_dir "${data_root}/project-lane" || ! safe_gate_lane_private_dir "${state_dir}"; then
+    safe_gate_project_lane_refuse 100 "${verb}" "safe's lane state directory cannot be established as private (audit-infrastructure breakage, not a package finding)" "fix the safe data directory and retry — safe doctor"
     return $?
   fi
-  # The selection comes from npm's effective configuration for the frozen
-  # invocation, never from NODE_ENV.
-  local sel_os sel_cpu sel_libc sel_omit
+  # The selection: npm's own settings win, then what the SELECTED Node runtime
+  # reports (values exact); omissions come from npm's effective configuration,
+  # never from NODE_ENV.
+  local sel_os sel_cpu sel_libc="" sel_omit
   local -a bind_selection=()
-  sel_os="$(jq -r '.os // empty' <<<"${frozen_json}")"
-  sel_cpu="$(jq -r '.cpu // empty' <<<"${frozen_json}")"
-  sel_libc="$(jq -r '.libc // empty' <<<"${frozen_json}")"
-  [[ -n "${sel_os}" ]] || sel_os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-  [[ -n "${sel_cpu}" ]] || sel_cpu="$(safe_gate_lane_host_cpu)" || {
-    safe_gate_project_lane_unsupported "${verb}" "this machine's CPU architecture"
-    return $?
-  }
-  [[ -n "${sel_libc}" ]] || sel_libc="$(safe_gate_lane_host_libc)"
-  bind_selection=(--os "${sel_os}" --cpu "${sel_cpu}" --libc "${sel_libc}")
+  sel_os="${SAFE_GATE_LANE_SEL_OS}"
+  sel_cpu="${SAFE_GATE_LANE_SEL_CPU}"
+  [[ "${SAFE_GATE_LANE_SEL_HAS_LIBC}" == "1" ]] && sel_libc="${SAFE_GATE_LANE_SEL_LIBC}"
+  value="$(jq -r '.os // empty' <<<"${frozen_json}")";   [[ -z "${value}" ]] || sel_os="${value}"
+  value="$(jq -r '.cpu // empty' <<<"${frozen_json}")";  [[ -z "${value}" ]] || sel_cpu="${value}"
+  value="$(jq -r '.libc // empty' <<<"${frozen_json}")"; [[ -z "${value}" ]] || sel_libc="${value}"
+  bind_selection=(--os "${sel_os}" --cpu "${sel_cpu}")
+  [[ -z "${sel_libc}" ]] || bind_selection+=(--libc "${sel_libc}")
+  rc=0
   while IFS= read -r sel_omit; do
     [[ -n "${sel_omit}" ]] || continue
     case "${sel_omit}" in
@@ -3632,13 +3710,18 @@ safe_gate_project_lane_run() {
         return $?
         ;;
     esac
-  done < <(jq -r '((.omit // []) - (.include // []))[]' <<<"${frozen_json}" 2>/dev/null)
+  done < <(jq -r '((.omit // []) - (.include // []))[]' <<<"${frozen_json}" 2>/dev/null; exit "${PIPESTATUS[0]}")
 
   safe_gate_npm_scrub_script_env
-  if ! env "${SAFE_GATE_LANE_ENV_U[@]}" env -0 > "${scratch}/env" 2>/dev/null; then
+  # The installation's whole environment is the allow-listed one, exactly.
+  local env_entry
+  : > "${scratch}/env" || {
     safe_gate_project_lane_refuse 100 "${verb}" "the installation environment cannot be prepared (audit-infrastructure breakage, not a package finding)" "retry after safe doctor"
     return $?
-  fi
+  }
+  for env_entry in "${SAFE_GATE_LANE_ENV[@]:2}"; do
+    printf '%s\0' "${env_entry}" >> "${scratch}/env"
+  done
   local -a copy_args=() live_args=(
     --live "package.json=${manifest_sum}" --live "package-lock.json=${lock_sum}" --live "npm-shrinkwrap.json=absent")
   if [[ -f "${snap}/.npmrc" ]]; then
@@ -3647,11 +3730,29 @@ safe_gate_project_lane_run() {
   else
     live_args+=(--live ".npmrc=absent")
   fi
-  local bind_rc=0
+  # The binder runs as a child that is waited for: a signal to this shell is
+  # forwarded to it, and its report still reaches the operator. Everything it
+  # (and its npm child) prints is cleaned at this boundary.
+  local bind_rc=0 bind_pid=""
   "${safe_core}" project-bind --project "${project_dir}" --lock-fd "${SAFE_GATE_LANE_LOCKFD}" --state-dir "${state_dir}" \
     --publish "package.json=${proj}/package.json" --publish "package-lock.json=${proj}/package-lock.json" \
     ${copy_args[@]+"${copy_args[@]}"} "${live_args[@]}" --env-file "${scratch}/env" "${bind_selection[@]}" \
-    -- "${SAFE_GATE_LANE_NPM[@]}" "${frozen_args[@]}" >"${scratch}/bind.json" || bind_rc=$?
+    -- "${SAFE_GATE_LANE_NPM[@]}" "${frozen_args[@]}" >"${scratch}/bind.json" 2>"${scratch}/bind.err" </dev/null &
+  bind_pid=$!
+  SAFE_GATE_LANE_BIND_PID="${bind_pid}"
+  trap 'kill -INT "${SAFE_GATE_LANE_BIND_PID}" 2>/dev/null' INT
+  trap 'kill -TERM "${SAFE_GATE_LANE_BIND_PID}" 2>/dev/null' TERM
+  trap 'kill -HUP "${SAFE_GATE_LANE_BIND_PID}" 2>/dev/null' HUP
+  while :; do
+    wait "${bind_pid}"
+    bind_rc=$?
+    kill -0 "${bind_pid}" 2>/dev/null || break
+  done
+  trap - INT TERM HUP
+  local line
+  while IFS= read -r line; do
+    safe_gate_err "$(safe_gate_lane_clean "${line}")"
+  done < "${scratch}/bind.err"
   safe_gate_project_lane_bind_result "${verb}" "${bind_rc}" "${scratch}/bind.json"
   return $?
 }
@@ -3693,8 +3794,21 @@ safe_gate_project_lane_bind_result() {
       ;;
     install_failed)
       npm_status="$(jq -r '.install.exit_code // empty' "${doc}")"
-      [[ "${npm_status}" =~ ^[0-9]+$ ]] && (( npm_status >= 1 && npm_status <= 255 )) || npm_status=1
-      safe_gate_project_lane_refuse "${npm_status}" "${verb}" "the frozen installation failed (npm exit ${npm_status}; its own diagnostic is above) and nothing was published: the project is as it was" "fix the cause npm printed and rerun the command"
+      local npm_signal how
+      npm_signal="$(jq -r '.install.signal // empty' "${doc}")"
+      if [[ "${npm_status}" =~ ^[0-9]+$ ]] && (( npm_status >= 1 && npm_status <= 255 )); then
+        how="npm exit ${npm_status}"
+      elif [[ -n "${npm_signal}" ]]; then
+        case "${npm_signal}" in
+          hangup) npm_status=129 ;; interrupt) npm_status=130 ;; quit) npm_status=131 ;; aborted) npm_status=134 ;;
+          killed) npm_status=137 ;; "segmentation fault") npm_status=139 ;; terminated) npm_status=143 ;; *) npm_status=137 ;;
+        esac
+        how="npm killed by a signal (${npm_signal})"
+      else
+        npm_status=1
+        how="npm failed"
+      fi
+      safe_gate_project_lane_refuse "${npm_status}" "${verb}" "the frozen installation failed (${how}; its own diagnostic is above) and nothing was published: the project is as it was" "fix the cause npm printed and rerun the command"
       return $?
       ;;
     verification_failed)
@@ -3733,7 +3847,7 @@ safe_gate_project_lane_git() {
   shift
   env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY \
     -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_COMMON_DIR -u GIT_NAMESPACE \
-    git -C "${project_dir}" "$@"
+    GIT_NO_REPLACE_OBJECTS=1 git --no-replace-objects -C "${project_dir}" "$@"
 }
 
 

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/superbiche/safe/internal/projectlane"
 	"github.com/superbiche/safe/internal/strictjson"
@@ -271,4 +272,71 @@ func repeatedMembers(args []string, stdin io.Reader, stdout, stderr io.Writer) i
 		return 1
 	}
 	return 0
+}
+
+const projectAdmitUsage = "safe-core: usage: safe-core project-admit [--arg <package-arg>]... [--manifest <file>] [--lockfile <file>] [--config <effective-config.json>]\n" +
+	"       safe-core project-admit --classify < NUL-separated-specs"
+
+// projectAdmit checks that every source a command names is a registry package,
+// as npm classifies it (see projectlane.Admit), and that the registry rules
+// hold for every package name found. The document is printed whatever it says;
+// exit 3 is an input that cannot be read, never an admission.
+//
+// --classify reads NUL-separated spellings on stdin and prints how each is
+// classified as a dependency spec ("spec") and as a command argument ("arg"):
+// the table tests/live/npm_spec_oracle.sh compares with npm's own classifier.
+func projectAdmit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	var in projectlane.AdmitInput
+	classify := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--classify":
+			classify = true
+		case "--arg", "--manifest", "--lockfile", "--config":
+			if i+1 >= len(args) || args[i+1] == "" {
+				fmt.Fprintln(stderr, projectAdmitUsage)
+				return 2
+			}
+			value := args[i+1]
+			i++
+			switch args[i-1] {
+			case "--arg":
+				in.Args = append(in.Args, value)
+			case "--manifest":
+				in.ManifestFile = value
+			case "--lockfile":
+				in.LockfileFile = value
+			case "--config":
+				in.ConfigFile = value
+			}
+		default:
+			fmt.Fprintln(stderr, projectAdmitUsage)
+			return 2
+		}
+	}
+	if classify {
+		raw, err := io.ReadAll(stdin)
+		if err != nil {
+			fmt.Fprintf(stderr, "safe-core: project-admit: read: %v\n", err)
+			return 3
+		}
+		type row struct {
+			Raw   string `json:"raw"`
+			Spec  string `json:"spec"`
+			Arg   string `json:"arg"`
+			Exact bool   `json:"exact"`
+		}
+		rows := []row{}
+		for _, text := range strings.Split(strings.TrimSuffix(string(raw), "\x00"), "\x00") {
+			argClass, _, _ := projectlane.ClassifyArg(text)
+			rows = append(rows, row{text, projectlane.ClassifySpec(text), argClass, projectlane.ExactArg(text)})
+		}
+		return printJSON(stdout, "project-admit", stderr, rows)
+	}
+	result, err := projectlane.Admit(in)
+	if err != nil {
+		fmt.Fprintf(stderr, "safe-core: project-admit: %v\n", err)
+		return 3
+	}
+	return printJSON(stdout, "project-admit", stderr, result)
 }

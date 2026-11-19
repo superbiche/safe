@@ -1,0 +1,106 @@
+1.2.3
+v1.2.3
+=1.2.3
+1.2.3-beta.1
+1.2.3+build.5
+1.2.3-x.tgz
+1.2.3-X.TGZ
+1.2.3-x.tar.gz
+1.2.3.TAR
+99999999999999999999.0.0
+9007199254740991.0.0
+9007199254740992.0.0
+^1.0.0
+~1.2.3
+~>1.2
+>=1.0.0 <2.0.0
+>= 1.0.0 < 2.0.0
+1.x
+1.2.x
+*
+x
+ 
+latest
+next
+beta-1
+my_tag
+1.0.0 - 2.0.0
+^1.0.0 || ^2.0.0
+||
+^ 1.2.3
+~ 1.2.3
+1.0.0   1.0.0
+1.2.3 garbage
+foo bar
+a b
+npm:foo@1.0.0
+NPM:foo@1.0.0
+npm:@scope/foo@^1
+file:../x
+FILE:../x
+file:x.tgz
+./x
+../x
+/abs/x
+~/x
+C:\x
+fixture.tgz
+Fixture.TGZ
+x.tar.gz
+x.tar
+x.TAR.GZ
+github:user/repo
+user/repo
+user/repo#semver:^1
+gitlab:user/repo
+git+https://example.com/x.git
+git+ssh://git@example.com/x.git
+git://example.com/x.git
+git@github.com:user/repo.git
+https://example.com/x.tgz
+http://example.com/x
+HTTPS://example.com/x
+ssh://example.com/x
+workspace:*
+workspace:^1.0.0
+link:../x
+portal:../x
+patch:foo
+catalog:
+catalog:default
+@scope/name
+@scope/name@1.2.3
+foo@1.2.3
+foo@
+foo@latest
+foo@^1
+foo@npm:bar@1
+foo@file:../x
+foo@github:user/repo
+foo@git+https://example.com/x.git
+foo@https://example.com/x.tgz
+.hidden
+_hidden
+-1
+1.0.0/x
+1.0.0:x
+é1.0.0
+1.0.0é
+１.０.０
+ ^1.0.0 
+	^1.0.0
+1.0.0 || 
+ || 1.0.0
+>1
+<=2.x
+=1
+>=1.2.3-beta
+1.2.3-beta.01
+01.2.3
+1.02.3
+1.2
+1
+1.2.3.4
+a@b
+node_modules
+favicon.ico

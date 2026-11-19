@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Project lane hardening (still behind `install.project_lane`, off by default; with
+  it off nothing changes): one Node and one npm for every phase, resolved once in
+  the project's context and run directly with one allow-listed environment
+  (documented in `docs/configuration.md`; a Node preload option refuses); admission
+  by npm's own rules in Go (`safe-core project-admit`: arguments, manifest ranges,
+  typed overrides, the lockfile's dependency edges, scopes and registries by parsed
+  identity, the delegated npm's git options shown to work before projecting),
+  checked against npm's classifier by `tests/live/npm_spec_oracle.sh`; nothing is
+  written into the project before publication (npm's cache and logs, safe's
+  storage, a special-file `.npmrc`, `git replace`); malformed output of every
+  producer refuses and an unreadable committed graph is missing evidence (102); the
+  platform selection comes from the selected Node runtime, exactly; everything npm
+  and the binder print is cleaned at the lane's boundary and a signal to the shell
+  is forwarded to the binder. The live test now makes the registry answer
+  differently between projection and materialisation and fails a lane that
+  resolves again.
 - Project lane, first end-to-end pass for npm, behind the new `install.project_lane`
   switch (default off; with it off nothing changes). With it on, `npm install`
   (bare or exact `name@version` specs) and `npm update` in a project whose
