@@ -2423,6 +2423,16 @@ safe_gate_lockdiff_scan_project() {
 # Project an npm dedupe/prune lockfile mutation into a scratch directory, then
 # audit only the package identities introduced by that projection. Existing
 # project findings are deliberately not decisions in this lane.
+#
+# CUTOVER (ticket 1641): this is the OLD differential path. The project lane (install.project_lane)
+# carries npm dedupe and prune now (one process for the whole closure, the plan frozen and bound), and
+# never calls this function or the per-artifact audit loop at its end. It stays reachable ONLY with the
+# switch off, where today's behaviour is kept (the case_npm_*lockdiff* suite is its parity belt); the
+# cutover commit that turns the switch on by default deletes it, with the functions only it uses
+# (safe_gate_npm_lockdiff_unsafe_argv, _mirror_manifests, _member_set_belt, _registry_hosts,
+# safe_gate_lockdiff_scan_project; safe-core's `lockdiff` and `reify-candidates` commands) and those
+# cases. What the project lane reuses stays: safe_gate_npm_lockdiff_config_path_guard, _effective_config,
+# _hidden_config_guard, _config_parity and safe_gate_lockdiff_restore_oldpwd.
 safe_gate_npm_lockdiff_preflight() {
   local subcommand="$1"
   shift
@@ -2779,11 +2789,11 @@ safe_gate_lane_clean() {
 # included when it has no newline; $2 prefixes each line, $3 keeps only the last
 # N lines.
 safe_gate_lane_render() {
-  local file="$1" prefix="${2:-}" tail_n="${3:-0}" line
+  local file="$1" prefix="${2:-}" tail_n="${3:-0}" from="${4:-tail}" line
   [[ -s "${file}" ]] || return 0
   while IFS= read -r line || [[ -n "${line}" ]]; do
     safe_gate_err "${prefix}$(safe_gate_lane_clean "${line}")"
-  done < <(if (( tail_n > 0 )); then tail -n "${tail_n}" -- "${file}"; else cat -- "${file}"; fi 2>/dev/null)
+  done < <(if (( tail_n > 0 )) && [[ "${from}" == head ]]; then head -n "${tail_n}" -- "${file}"; elif (( tail_n > 0 )); then tail -n "${tail_n}" -- "${file}"; else cat -- "${file}"; fi 2>/dev/null)
 }
 
 # The one final stderr line of every refusal of this lane.
@@ -2799,9 +2809,9 @@ safe_gate_project_lane_unsupported() {
   safe_gate_project_lane_refuse 100 "$1" "$2 is not covered by the project lane" "change the command, or the project, to a form the lane covers (npm install or npm update on registry packages), then retry"
 }
 
-# ci, dedupe and prune: not routed by the lane yet; refused before any property of the host is read.
+# A verb the lane does not route (install, update, ci, dedupe and prune are its verbs).
 safe_gate_project_lane_verb_refusal() {
-  safe_gate_project_lane_refuse 100 "$1" "npm $1 is not routed by the project lane yet, and the gate it replaces cannot judge what it would install" "use npm install or npm update, which the lane covers, then retry"
+  safe_gate_project_lane_refuse 100 "$1" "npm $1 is not routed by the project lane" "use npm install, update, ci, dedupe or prune, which the lane covers, then retry"
 }
 
 # --- routing -------------------------------------------------------------------------
@@ -2918,6 +2928,16 @@ safe_gate_project_lane_decide() {
     done
     reasons+="${reasons:+; }${compat_reasons[i]}"
   done
+  case "${verb}" in
+    dedupe|prune)
+      # These two have no gate but the lane: the older differential path is not a gate for an
+      # established shape either (it refuses a version 1 lockfile and every non-registry source
+      # itself), so the one-shot route would hand the command to a refusal, or to nothing that
+      # judges it. They keep refusing where install would take the one-shot route.
+      safe_gate_project_lane_refuse 100 "${verb}" "$(safe_gate_lane_clean "${reasons}") is an established shape the project lane cannot judge, and npm ${verb} has no other gate to send it to, so it is not covered by the project lane" "use a project the lane covers (registry dependencies, a version 2 or 3 lockfile), then retry"
+      return $?
+      ;;
+  esac
   safe_gate_project_lane_oneshot "${verb}" "${reasons}"
 }
 
@@ -3828,10 +3848,7 @@ safe_gate_project_lane_run() {
   elif (( rc != 0 )); then
     # A launcher the lane cannot follow: its provenance cannot be established (which npm, which
     # Node, from which search path), so the command refuses with the lane's line rather than
-    # going to today's gate. The refusal of ci, dedupe and prune comes first.
-    case "${verb}" in
-      ci|dedupe|prune) safe_gate_project_lane_verb_refusal "${verb}"; return $? ;;
-    esac
+    # going to today's gate.
     safe_gate_project_lane_unsupported "${verb}" "${SAFE_GATE_LANE_REASON}"
     return $?
   fi
@@ -3875,10 +3892,8 @@ safe_gate_project_lane_run() {
     fi
   done
   case "${verb}" in
-    install|update) ;;
+    install|update|ci|dedupe|prune) ;;
     *)
-      # ci, dedupe and prune are not routed by the lane yet (their own ticket), and today's gate
-      # has no judgement of the projected closure to give them: they are refused, not sent there.
       safe_gate_project_lane_verb_refusal "${verb}"
       return $?
       ;;
@@ -3930,7 +3945,14 @@ safe_gate_project_lane_run() {
         safe_gate_project_lane_unsupported "${verb}" "a workspace selection"
         return $?
         ;;
-      --package-lock-only|--package-lock-only=true) lock_only=1 ;;
+      --package-lock-only|--package-lock-only=true)
+        if [[ "${verb}" == "ci" ]]; then
+          # ci is frozen: it has no mutable lockfile to write, and npm does not define the combination
+          safe_gate_project_lane_unsupported "${verb}" "npm ci with --package-lock-only (a combination npm does not define: ci installs from the lockfile and never writes one)"
+          return $?
+        fi
+        lock_only=1
+        ;;
       --package-lock-only=*)
         safe_gate_project_lane_unsupported "${verb}" "${arg%%=*} with a value other than true"
         return $?
@@ -3940,10 +3962,10 @@ safe_gate_project_lane_run() {
         return $?
         ;;
       *)
-        if [[ "${verb}" == "update" ]]; then
-          safe_gate_project_lane_unsupported "${verb}" "naming packages to update"
-          return $?
-        fi
+        case "${verb}" in
+          update) safe_gate_project_lane_unsupported "${verb}" "naming packages to update"; return $? ;;
+          ci|dedupe|prune) safe_gate_project_lane_unsupported "${verb}" "naming packages to npm ${verb}"; return $? ;;
+        esac
         specs+=("${arg}")
         ;;
     esac
@@ -4308,15 +4330,34 @@ safe_gate_project_lane_run() {
     return "${rc}"
   fi
   rc=0
-  safe_gate_lane_npm_in "${proj}" --package-lock-only --ignore-scripts --no-audit --no-fund \
-    "--git=${SAFE_GATE_LANE_GIT}" --allow-git=none "${dest[@]}" "${proj_args[@]}" >"${scratch}/npm-projection.log" 2>&1 || rc=$?
-  if (( rc != 0 )); then
-    safe_gate_lane_show_npm_log "${scratch}/npm-projection.log"
-    safe_gate_project_lane_refuse "${rc}" "${verb}" "the projection failed with npm exit ${rc} (npm could not resolve the command; its own diagnostic is above)" "fix the cause npm printed and retry"
-    return $?
+  if [[ "${verb}" == "ci" ]]; then
+    # ci has no projection: the plan IS the lockfile on disk, checked against the manifest by npm's
+    # own frozen check (`npm ci --dry-run`, in the frozen copy, with the lane's flags: no tree is
+    # touched and nothing is fetched for a lockfile in step). npm's own diagnostic, and its status,
+    # reach the operator when the two are out of step or the lockfile is missing.
+    safe_gate_lane_npm_in "${frozen}" ci --dry-run --ignore-scripts --no-audit --no-fund \
+      "--git=${SAFE_GATE_LANE_GIT}" --allow-git=none "${dest[@]}" ${carry[@]+"${carry[@]}"} >"${scratch}/npm-frozen-check.log" 2>&1 || rc=$?
+    if (( rc != 0 )); then
+      safe_gate_lane_render "${scratch}/npm-frozen-check.log" "npm: " 10 head
+      safe_gate_project_lane_refuse "${rc}" "${verb}" "npm's own frozen check failed with npm exit ${rc} (the lockfile is missing or out of step with the manifest; npm's diagnostic is above)" "fix the cause npm printed and retry"
+      return $?
+    fi
+    # the judged plan is the snapshot's lockfile, byte for byte
+    if ! safe_gate_lane_cp "${snap}/package-lock.json" "${proj}/package-lock.json"; then
+      safe_gate_project_lane_refuse 100 "${verb}" "cannot prepare the judged plan (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
+      return $?
+    fi
+  else
+    safe_gate_lane_npm_in "${proj}" --package-lock-only --ignore-scripts --no-audit --no-fund \
+      "--git=${SAFE_GATE_LANE_GIT}" --allow-git=none "${dest[@]}" "${proj_args[@]}" >"${scratch}/npm-projection.log" 2>&1 || rc=$?
+    if (( rc != 0 )); then
+      safe_gate_lane_show_npm_log "${scratch}/npm-projection.log"
+      safe_gate_project_lane_refuse "${rc}" "${verb}" "the projection failed with npm exit ${rc} (npm could not resolve the command; its own diagnostic is above)" "fix the cause npm printed and retry"
+      return $?
+    fi
   fi
   if ! jq -e '(.lockfileVersion == 2 or .lockfileVersion == 3) and (.packages | type == "object")' "${proj}/package-lock.json" >/dev/null 2>&1; then
-    safe_gate_project_lane_refuse 100 "${verb}" "the projection produced a lockfile that is not version 2 or 3" "retry after repairing the project"
+    safe_gate_project_lane_refuse 100 "${verb}" "the plan is a lockfile that is not version 2 or 3" "retry after repairing the project"
     return $?
   fi
   # What resolution discovered: the scopes and registries of every package of
@@ -4414,6 +4455,20 @@ safe_gate_project_lane_run() {
   # added to it. SEAM (age of entries, ticket 1635): ${scratch}/disk-introduced.json
   # lists the artifacts the lockfile on disk carries that the baseline does not, that
   # is, what this command introduces WITHOUT this projection having resolved it.
+  if [[ "${verb}" == "ci" ]]; then
+    # ci judges no difference: what it installs is the whole lockfile, so malice is read over every
+    # entry of it and the advisories the baseline already carries are reported, never gating.
+    local ci_line=""
+    ci_line="$(jq -r --slurpfile g "${scratch}/target-graph.json" --arg kind "${baseline_kind}" '
+      def n($s): [.advisories.already_present[] | select(.severity == $s)] | length;
+      ([.advisories.already_present[] | .severity] | unique) as $seen
+      | "safe: project lane: npm ci: \($g[0].graph.occurrences | length) entries of the lockfile checked for malice (blocklist by name, known-malware records); baseline: \($kind); \(.advisories.already_present | length) advisories already present"
+        + (if (.advisories.already_present | length) > 0
+           then " (" + ([["critical", n("critical")], ["high", n("high")], ["moderate", n("moderate")], ["low", n("low")], ["unknown", ([.advisories.already_present[] | select(.severity != "critical" and .severity != "high" and .severity != "moderate" and .severity != "low")] | length)]]
+                         | map(select(.[1] > 0) | "\(.[0]) \(.[1])") | join(", ")) + ")"
+           else "" end)' "${report}" 2>/dev/null)" && [[ -n "${ci_line}" ]] || ci_line=""
+    [[ -z "${ci_line}" ]] || safe_gate_err "${ci_line}"
+  fi
   case "${baseline_kind}" in
     committed) safe_gate_err "safe: project lane: baseline: the lockfile committed at the head of the git work tree" ;;
     recorded) safe_gate_err "safe: project lane: baseline: a lockfile safe judged clear and recorded for this project" ;;
@@ -6887,6 +6942,12 @@ safe_gate_npm_like() {
           local +x lane_rc=0
           safe_gate_project_lane_dispatch "$@" || lane_rc=$?
           (( lane_rc == $(safe_gate_project_lane_handover_status) )) || return "${lane_rc}"
+          # dedupe and prune are handed to the older differential path only when they are global
+          # (which that path refuses at once); the lane never hands it a project command.
+          if [[ "${npm_class}" == "lockdiff" ]] && ! safe_gate_npm_global_true "$@"; then
+            safe_gate_err "safe: BLOCKED npm ${subcommand} [lane: project] — the lane handed a project command to the older differential path, which it never does (a defect, not a package finding); rerun install.sh and retry; details: safe explain"
+            return 100
+          fi
         fi
         ;;
     esac

@@ -220,8 +220,8 @@ pass and warnings under `environment.release_follow`.
   exactly one JSON document that sets it to the boolean `true`; a redirected
   run-config directory does not turn it on unless trusted with
   `SAFE_RUN_TRUST_OVERRIDE`). With it off the gate behaves exactly as before. With it on, `npm
-  install` (bare or with exact `name@version` registry specs) and `npm update` in
-  a project are judged on what they introduce over an established baseline (see
+  install` (bare or with exact `name@version` registry specs), `npm update`, `npm ci`, `npm dedupe` and
+  `npm prune` in a project are judged on what they introduce over an established baseline (see
   below) and installed exactly as judged: the
   lane takes an exclusive lock on the project directory, works on one snapshot of
   the manifest, lockfile and `.npmrc`, projects the command in a scratch copy
@@ -234,6 +234,27 @@ pass and warnings under `environment.release_follow`.
   advisory, 102 missing evidence or a graph safe cannot bind), for the operator
   too: this first pass has no prompt, no install record and no scripts. Any
   command or project it does not cover goes one of three ways (**routing**).
+  **How each verb yields its plan.** `install` and `update`: the original arguments resolved in the
+  scratch copy, lockfile only. `dedupe` and `prune`: the same, with the verb's own arguments (npm writes
+  a changed plan for `dedupe` on a project that needs it, and `prune` drops from the lockfile the entries
+  nothing needs; when `prune` only has a tree to prune, the plan is the lockfile unchanged and nothing is
+  introduced); the frozen installation of the judged lockfile is what yields the deduplicated or pruned
+  tree. `ci`: no projection; the plan is the lockfile on disk, checked against the manifest by npm's own
+  frozen check (`npm ci --dry-run` in the scratch copy: a lockfile out of step with the manifest, or
+  missing, is npm's own error, with npm's diagnostic and status), judged against the baseline (a lockfile
+  on disk identical to the committed or to a recorded one introduces nothing, so its advisories are
+  reported and never gate; any other is judged against the committed one, else empty). Malice is read over
+  the WHOLE graph every time (blocklist by name, known-malware records), entries the command would not
+  materialise included, and every entry must be bound; the advisory request therefore covers every
+  identity of the lockfile. The binder then runs one frozen `npm ci` in staging, verifies the tree and
+  publishes it, replacing an existing tree. `ci` says how many entries it checked for malice, which
+  baseline it used, and how many advisories are already present, with their severities. `ci
+  --package-lock-only` refuses (npm does not define it); `--dry-run` decides, reports and writes nothing.
+  A clear `ci` records its lockfile as judged, like the other verbs. `dedupe` and `prune` name no
+  packages (that refuses), and have no gate other than the lane: an established shape the lane cannot
+  judge, which sends `install` and `ci` to today's gate, refuses for them. The older differential path
+  (one audit process per introduced artifact, resolved again by npm after its checks) is reachable only
+  with the switch off, until the cutover deletes it.
   **Condition for turning the lane on:** the host's npm configuration (the operator's user and global
   configuration, the environment) must be one the lane supports (the canonical public registry, no
   install strategy other than hoisted, no workspaces, no `legacy-peer-deps`, no cache or log destination
@@ -276,8 +297,7 @@ pass and warnings under `environment.release_follow`.
   cannot carry, global mode set by configuration included; a failed guard; the same shapes when one of the
   files they come from exists only in uncommitted changes (mixed causes included) or the project is not in
   a git work tree; an unsupported option; a workspace; a launcher the lane cannot follow; a failed probe;
-  and `npm ci`, `npm dedupe` and `npm prune`, which the lane does not route yet (that refusal comes before
-  any property of the host is read). **Unchanged**: a global command, which is only a command whose
+  `npm ci --package-lock-only`; and naming packages to `ci`, `dedupe` or `prune`. **Unchanged**: a global command, which is only a command whose
   arguments say so in the plain form (`-g` or `--global`, with no value; no npm run decides the route, and
   any other spelling that selects or negates global mode, `--global=…`, a separate boolean value,
   `--no-global`, `--location…`, refuses with the plain form as the way out), `npm exec`, `npm uninstall`, every other verb and every other manager.

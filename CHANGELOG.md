@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Project lane: `npm ci`, `npm dedupe` and `npm prune` (still behind `install.project_lane`). `ci` has no
+  projection: its plan is the lockfile on disk, checked against the manifest by npm's own frozen check
+  (`npm ci --dry-run`; a lockfile out of step or missing is npm's own error, shown as npm's, with npm's
+  status), judged against the baseline rules (a lockfile identical to the committed or a recorded one
+  introduces nothing, so a fresh clone installs without stopping on the advisories its committed lockfile
+  carries and the report lists them; any other lockfile is judged against the committed one), with malice
+  read over the whole graph every time (blocklist, known-malware records), every entry bound, and one
+  frozen `npm ci` in staging that replaces an existing tree. Its report says how many entries were checked
+  for malice, which baseline was used and how many advisories are already present, by severity. `ci
+  --package-lock-only` refuses as undefined; `--dry-run` decides and writes nothing. `dedupe` and `prune`
+  obtain their plan as `install` does (their own arguments, lockfile only, in the scratch copy) and are
+  judged and bound the same way, in one process for the whole closure instead of one audit per introduced
+  artifact; `ci`, `dedupe` and `prune` name no packages. An established shape the lane cannot judge goes to
+  today's gate for `ci` and refuses for `dedupe` and `prune`, which have no other gate. The older
+  differential path stays reachable only with the switch off (its deletion is listed in the code for the
+  cutover); the lane never calls it. Live: the real npm writes a changed plan for `dedupe` on a fixture that
+  needs it, `prune` drops the lockfile entries nothing needs, and a fresh clone's `ci` installs.
 - Project lane routing (still behind `install.project_lane`). The lane runs in a subshell; its parent
   forwards a cancellation to it and waits for its terminal result, and otherwise acts only on its exit
   status (253 hands the command to today's gate). Nothing is assigned when the library is sourced and the
