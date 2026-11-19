@@ -239,17 +239,30 @@ pass and warnings under `environment.release_follow`.
   a changed plan for `dedupe` on a project that needs it, and `prune` drops from the lockfile the entries
   nothing needs; when `prune` only has a tree to prune, the plan is the lockfile unchanged and nothing is
   introduced); the frozen installation of the judged lockfile is what yields the deduplicated or pruned
-  tree. `ci`: no projection; the plan is the lockfile on disk, checked against the manifest by npm's own
-  frozen check (`npm ci --dry-run` in the scratch copy: a lockfile out of step with the manifest, or
-  missing, is npm's own error, with npm's diagnostic and status), judged against the baseline (a lockfile
+  tree. npm's `dedupe` saves nothing in lockfile-only mode when no package name is duplicated (a surplus
+  entry stays in the lockfile it leaves behind, and with no lockfile nothing is written), so then the
+  judged plan is obtained from npm by a second lockfile-only step, a plain `install` of the same
+  arguments, which makes npm write the lockfile of the ideal tree it computed (the manifest must come
+  out as it went in; a plan that cannot be obtained refuses). npm's `prune` writes its lockfile in every
+  case and needs no second step. The lane substitutes a canonical verb only when the selected npm itself
+  resolves the caller's token to it: a token the gate's conservative classifier takes for one of the
+  lane's verbs and npm does not resolve (`clean`, `install-c`, an ambiguous prefix) is left to npm
+  (today's gate exactly as with the switch off, which delegates it for npm's own rejection); the lane
+  does nothing with the project and refuses nothing in npm's place. `ci`: no projection; the plan is the lockfile on disk, checked against the manifest by npm's own
+  frozen check (`npm ci --dry-run` in the scratch copy: whatever npm refuses, a lockfile out of step with
+  the manifest, a missing one, a platform error, is npm's own error: npm's code and message, taken from
+  wherever they are in its output, are shown without its log noise or usage text, the exit status is
+  npm's, and the final line says only that npm's own frozen check failed, with npm's code), judged against the baseline (a lockfile
   on disk identical to the committed or to a recorded one introduces nothing, so its advisories are
   reported and never gate; any other is judged against the committed one, else empty). Malice is read over
   the WHOLE graph every time (blocklist by name, known-malware records), entries the command would not
   materialise included, and every entry must be bound; the advisory request therefore covers every
   identity of the lockfile. The binder then runs one frozen `npm ci` in staging, verifies the tree and
-  publishes it, replacing an existing tree. `ci` says how many entries it checked for malice, which
-  baseline it used, and how many advisories are already present, with their severities. `ci
-  --package-lock-only` refuses (npm does not define it); `--dry-run` decides, reports and writes nothing.
+  publishes it, replacing an existing tree. `ci` says how many entries of the lockfile it checked for malice
+  (or only submitted for the check, when some identities could not be read completely), which baseline it
+  used, and how many advisories are already present, with their severities. `ci
+  --package-lock-only` refuses (npm does not define it), and so does `prune --package-lock-only` (the
+  lockfile-only caller mode belongs to `install`, `update` and `dedupe`); `--dry-run` decides, reports and writes nothing.
   A clear `ci` records its lockfile as judged, like the other verbs. `dedupe` and `prune` name no
   packages (that refuses), and have no gate other than the lane: an established shape the lane cannot
   judge, which sends `install` and `ci` to today's gate, refuses for them. The older differential path

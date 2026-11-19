@@ -96,6 +96,32 @@ case "${1:-}" in
         [[ -n "${out}" ]] || out='{"version":"11.20.0","atFloor":true,"missing":[]}'
         printf '%s' "${out}"
         ;;
+      deref)
+        # npm 11.20's own resolution (lib/utils/cmd-list.js): exact name, alias, unique abbreviation.
+        [[ "${NODE_DEREF_STATUS:-0}" == "0" ]] || exit "${NODE_DEREF_STATUS}"
+        npm_commands="access adduser approve-scripts audit bugs cache ci completion config dedupe deny-scripts deprecate diff dist-tag docs doctor edit exec explain explore find-dupes fund get help help-search init install install-ci-test install-scripts install-test link ll login logout ls org outdated owner pack ping pkg prefix profile prune publish query rebuild repo restart root run sbom search set shrinkwrap stage star stars start stop team test token trust undeprecate uninstall unpublish unstar update version view whoami"
+        npm_aliases="author=owner home=docs issues=bugs info=view show=view find=search add=install unlink=uninstall remove=uninstall rm=uninstall r=uninstall un=uninstall rb=rebuild list=ls ln=link create=init i=install it=install-test u=update up=update c=config s=search se=search tst=test t=test ddp=dedupe v=view run-script=run clean-install=ci clean-install-test=install-ci-test x=exec why=explain la=ll verison=version ic=ci innit=init in=install ins=install inst=install insta=install instal=install isnt=install isnta=install isntal=install isntall=install install-clean=ci isntall-clean=ci hlep=help dist-tags=dist-tag upgrade=update udpate=update rum=run sit=install-ci-test urn=run ogr=org add-user=adduser"
+        token="$(jq -r '.token' <<<"${input}")"
+        c="$(sed -E 's/([A-Z])/-\L\1/g' <<<"${token}")"
+        res=""
+        for w in ${npm_commands}; do [[ "${w}" == "${c}" ]] && res="${w}"; done
+        if [[ -z "${res}" ]]; then
+          for pair in ${npm_aliases}; do [[ "${pair%%=*}" == "${c}" ]] && res="${pair#*=}"; done
+        fi
+        if [[ -z "${res}" && -n "${c}" ]]; then
+          matches=()
+          for w in ${npm_commands} $(for pair in ${npm_aliases}; do printf '%s ' "${pair%%=*}"; done); do
+            [[ "${w}" == "${c}"* ]] && matches+=("${w}")
+          done
+          if (( ${#matches[@]} == 1 )); then
+            res="${matches[0]}"
+            for _ in 1 2 3; do
+              for pair in ${npm_aliases}; do [[ "${pair%%=*}" == "${res}" ]] && { res="${pair#*=}"; break; }; done
+            done
+          fi
+        fi
+        if [[ -n "${res}" ]]; then printf '{"command":"%s"}' "${res}"; else printf '{"command":null}'; fi
+        ;;
       agreement)
         count="$(( $(cat "${HOME}/.agreement-count" 2>/dev/null || echo 0) + 1 ))"
         printf '%s' "${count}" > "${HOME}/.agreement-count"
@@ -347,12 +373,22 @@ fi
 # with the manifest is npm's own error (code EUSAGE), nothing is touched, nothing is installed.
 if [[ "${tool}" == "npm" && "${1:-}" == "ci" && ${is_projection} -eq 0 && " $* " == *" --dry-run "* ]]; then
   printf 'CICHECK\t%s\n' "$(basename "${PWD}")" >> "${SAFE_INSTALL_COMMAND_LOG}"
+  # a verbose log level: npm's log noise comes BEFORE its error, and some after it
+  if [[ "${NPM_CI_CHECK_NOISE:-0}" == "1" ]]; then
+    for noise in $(seq 1 120); do printf 'npm silly config load:file:/x/%s\n' "${noise}" >&2; done
+  fi
+  if [[ "${NPM_CI_CHECK_ERROR:-}" == "EBADPLATFORM" ]]; then
+    printf 'npm error code EBADPLATFORM\nnpm error notsup Unsupported platform for fsevents@2.3.3: wanted {"os":"aix"} (current: {"os":"linux","arch":"x64"})\nnpm error notsup Valid os:  aix\nnpm error notsup Actual os: linux\n' >&2
+    [[ "${NPM_CI_CHECK_NOISE:-0}" != "1" ]] || printf 'npm verbose exit 1\nnpm verbose code 1\n' >&2
+    exit 1
+  fi
   if [[ ! -f package-lock.json ]]; then
     printf 'npm error code EUSAGE\nnpm error\nnpm error The `npm ci` command can only install with an existing package-lock.json or\nnpm error npm-shrinkwrap.json with lockfileVersion >= 1.\n' >&2
+    [[ "${NPM_CI_CHECK_NOISE:-0}" != "1" ]] || printf 'npm verbose exit 1\n' >&2
     exit 1
   fi
   if [[ -n "${NPM_CI_CHECK_STATUS:-}" ]]; then
-    printf 'npm error code EUSAGE\nnpm error\nnpm error `npm ci` can only install packages when your package.json and package-lock.json or npm-shrinkwrap.json are in sync. Please update your lock file with `npm install` before continuing.\nnpm error\nnpm error Invalid: lock file'"'"'s kept@1.0.0 does not satisfy kept@^2.0.0\nnpm error\nnpm error Clean install a project\n' >&2
+    printf 'npm error code EUSAGE\nnpm error\nnpm error `npm ci` can only install packages when your package.json and package-lock.json or npm-shrinkwrap.json are in sync. Please update your lock file with `npm install` before continuing.\nnpm error\nnpm error Invalid: lock file'"'"'s kept@1.0.0 does not satisfy kept@^2.0.0\nnpm error\nnpm error Clean install a project\nnpm error\nnpm error Usage:\nnpm error npm ci\nnpm error\nnpm error Options:\nnpm error [--install-strategy <hoisted|nested|shallow|linked>]\n' >&2
     exit "${NPM_CI_CHECK_STATUS}"
   fi
   exit 0
@@ -415,6 +451,10 @@ if [[ "${tool}" == "npm" && ${is_projection} -eq 1 && "${1:-}" == "--package-loc
     : > "${HOME}/.projection-started"
     sleep "${NPM_PROJECTION_SLEEP}"
   fi
+  if [[ -n "${NPM_DEDUPE_SECOND_FAIL:-}" && " $* " == *" install "* ]]; then
+    printf 'npm error code E500\nnpm error the second step failed\n' >&2
+    exit "${NPM_DEDUPE_SECOND_FAIL}"
+  fi
   if [[ -n "${NPM_PROJECTION_FAIL:-}" ]]; then
     printf 'npm error code E404\nnpm error 404 Not Found - GET https://user:hunter2@registry.example/x\n' >&2
     exit "${NPM_PROJECTION_FAIL}"
@@ -443,6 +483,8 @@ if [[ "${tool}" == "npm" && -n "${NPM_LOCK_MUTATION_JSON:-}" ]]; then
   done
   if [[ "${npm_config_package_lock_only:-}" == "true" ]]; then package_lock_only=1; fi
   if [[ "${npm_config_package_lock:-}" == "false" ]]; then package_lock=0; fi
+  # npm's dedupe saves nothing, in lockfile-only mode, when no package name is duplicated
+  if [[ "${NPM_DEDUPE_SAVES_NOTHING:-0}" == "1" && " $* " == *" dedupe "* ]]; then package_lock_only=0; fi
   if (( package_lock_only && package_lock )); then
     lockfile="package-lock.json"
     [[ -f "npm-shrinkwrap.json" ]] && lockfile="npm-shrinkwrap.json"
@@ -921,6 +963,10 @@ run_zsh() {
     NPM_CI_INTERRUPT="${NPM_CI_INTERRUPT:-}" \
     NPM_CI_STATUS="${NPM_CI_STATUS:-}" \
     NPM_CI_CHECK_STATUS="${NPM_CI_CHECK_STATUS:-}" \
+    NPM_DEDUPE_SECOND_FAIL="${NPM_DEDUPE_SECOND_FAIL:-}" \
+    NPM_DEDUPE_SAVES_NOTHING="${NPM_DEDUPE_SAVES_NOTHING:-}" \
+    NPM_CI_CHECK_ERROR="${NPM_CI_CHECK_ERROR:-}" \
+    NPM_CI_CHECK_NOISE="${NPM_CI_CHECK_NOISE:-}" \
     NPM_PROJECTION_MANIFEST_JSON="${NPM_PROJECTION_MANIFEST_JSON:-}" \
     NPM_PROJECTION_FAIL="${NPM_PROJECTION_FAIL:-}" \
     NPM_PROJECTION_SLEEP="${NPM_PROJECTION_SLEEP:-}" \
@@ -939,6 +985,7 @@ run_zsh() {
     NODE_AGREEMENT_JSON="${NODE_AGREEMENT_JSON:-}" \
     NODE_AGREEMENT_SECOND_JSON="${NODE_AGREEMENT_SECOND_JSON:-}" \
     NODE_PROBE_STATUS="${NODE_PROBE_STATUS:-}" \
+    NODE_DEREF_STATUS="${NODE_DEREF_STATUS:-}" \
     NODE_CAPABILITY_STATUS="${NODE_CAPABILITY_STATUS:-}" \
     NPM_CONFIG_LIST_RAW="${NPM_CONFIG_LIST_RAW:-}" \
     NPM_STUB_NO_GIT_OPTIONS="${NPM_STUB_NO_GIT_OPTIONS:-}" \
@@ -11548,11 +11595,73 @@ assert_lane_ci_not_installed() {
   return 0
 }
 
+# A consistent graph, the way npm builds one: the lockfile's entries are exactly the root's dependencies (a
+# `name@version:dev` spec is a devDependency), declared in the manifest and in the lockfile's root, every entry
+# reachable through a declared edge. Writes the manifest and the lockfile (committed unless LANE_UNCOMMITTED=1).
+lane_consistent_graph() { # <specs...>
+  local spec name version deps='{}' devdeps='{}'
+  for spec in "$@"; do
+    name="${spec%%@*}"
+    version="${spec#*@}"
+    version="${version%%:*}"
+    if [[ "${spec}" == *:dev ]]; then
+      devdeps="$(jq -c --arg n "${name}" --arg v "${version}" '. + {($n): $v}' <<<"${devdeps}")"
+    else
+      deps="$(jq -c --arg n "${name}" --arg v "${version}" '. + {($n): $v}' <<<"${deps}")"
+    fi
+  done
+  jq -nc --argjson d "${deps}" --argjson dd "${devdeps}" '{name: "lane-test", version: "1.0.0", dependencies: $d}
+    + (if ($dd | length) > 0 then {devDependencies: $dd} else {} end)' > "${WORK_DIR}/package.json"
+  lane_lock "$@" | jq -c --argjson d "${deps}" --argjson dd "${devdeps}" '.packages[""] += {dependencies: $d}
+    + (if ($dd | length) > 0 then {devDependencies: $dd} else {} end)' > "${WORK_DIR}/package-lock.json"
+  [[ "${LANE_UNCOMMITTED:-0}" == 1 ]] || lane_commit
+}
+
+# What the real npm says about the fixture in WORK_DIR, with its offline modules: the frozen validation accepts
+# the lockfile, and the ideal tree holds every entry the case asserts was installed (a lockfile entry that no
+# declared edge reaches is NOT in it). $@ the expected tree locations; OMIT_JSON the omissions. Skips, and
+# says so, where no node with an npm is at hand.
+lane_fixture_is_what_npm_builds() { # <label> <locations...>
+  local label="$1" npm_dir="" script="${CASE_DIR}/fixture-check.cjs" out rc expected
+  shift
+  [[ -n "${REAL_NODE_BIN}" ]] && npm_dir="$(cd -- "$(dirname -- "${REAL_NODE_BIN}")/../lib/node_modules/npm" 2>/dev/null && pwd -P)" || npm_dir=""
+  if [[ -z "${npm_dir}" || ! -f "${npm_dir}/node_modules/@npmcli/arborist/lib/index.js" ]]; then
+    printf '# %s: no node with an npm here; the fixture was not checked against npm'"'"'s offline modules\n' "${label}"
+    return 0
+  fi
+  cat > "${script}" <<'JS'
+'use strict'
+const path = require('path')
+const [npmDir, dir, expectJson, omitJson, cacheDir] = process.argv.slice(2)
+const Arborist = require(path.join(npmDir, 'node_modules', '@npmcli', 'arborist'))
+const validate = require(path.join(npmDir, 'lib', 'utils', 'validate-lockfile.js'))
+const opts = { path: dir, packageLock: true, save: false, offline: true, cache: cacheDir, omit: JSON.parse(omitJson), ignoreScripts: true }
+;(async () => {
+  const virtual = new Arborist(opts)
+  await virtual.loadVirtual()
+  const ideal = new Arborist(opts)
+  await ideal.buildIdealTree()
+  const errors = validate(new Map(virtual.virtualTree.inventory), new Map(ideal.idealTree.inventory))
+  const have = new Set([...ideal.idealTree.inventory.values()].filter((n) => !n.isRoot).map((n) => n.location))
+  const missing = JSON.parse(expectJson).filter((l) => !have.has(l))
+  if (errors.length || missing.length) {
+    console.log(JSON.stringify({ errors, missing }))
+    process.exit(1)
+  }
+})().catch((e) => { console.log(JSON.stringify({ error: `${e.code}: ${e.message}` })); process.exit(2) })
+JS
+  expected="$(printf '%s\n' "$@" | jq -R . | jq -sc .)"
+  out="$("${REAL_NODE_BIN}" "${script}" "${npm_dir}" "${WORK_DIR}" "${expected}" "${OMIT_JSON:-[]}" "${CASE_DIR}/fixture-npm-cache" 2>&1)"; rc=$?
+  (( rc == 0 )) || { printf '%s\n' "${out}" >&2; fail "${label}: the fixture is not what npm would build (${out})"; return 1; }
+  return 0
+}
+
 # A project the way a fresh clone has it: its lockfile committed, no tree.
 lane_fresh_clone() { # <case> <lockfile specs...>
   local name="$1"
   shift
   lane_prepare "${name}" "$@"
+  lane_consistent_graph "$@"
   local clone="${CASE_DIR}/clone"
   rm -rf "${clone}"
   git clone -q "${WORK_DIR}" "${clone}" >/dev/null 2>&1 || { fail "${name}: cannot clone"; return 1; }
@@ -11566,6 +11675,7 @@ lane_fresh_clone() { # <case> <lockfile specs...>
 case_project_lane_ci_in_a_fresh_clone_passes_on_the_advisories_its_lockfile_carries() {
   skip_lockdiff_case "$FUNCNAME" || return
   lane_fresh_clone "lane-ci-fresh" kept@1.0.0 vuln@1.0.0 risky@1.0.0 || return
+  lane_fixture_is_what_npm_builds "$FUNCNAME" node_modules/kept node_modules/vuln node_modules/risky || return
   local lock
   lock="$(cat "${WORK_DIR}/package-lock.json")"
   SAFE_AUDIT_EVIDENCE_HITS="{\"vuln@1.0.0\":${LANE_HIT_CRITICAL},\"risky@1.0.0\":${LANE_HIT_HIGH}}" lane_run 'npm ci'
@@ -11601,6 +11711,7 @@ case_project_lane_ci_blocks_on_malice_anywhere_in_the_graph() {
   local kind
   for kind in malware blocklist; do
     lane_fresh_clone "lane-ci-malice-${kind}" kept@1.0.0 old@1.0.0 deep@1.0.0 || return
+    lane_fixture_is_what_npm_builds "$FUNCNAME: ${kind}" node_modules/kept node_modules/old node_modules/deep || return
     if [[ "${kind}" == malware ]]; then
       SAFE_AUDIT_EVIDENCE_HITS='{"old@1.0.0":[{"id":"MAL-2026-0001","severity":"critical","malware":true}]}' lane_run 'npm ci'
       assert_err_contains_fragment 'known-malware record on old@1.0.0' "$FUNCNAME: ${kind}" || return
@@ -11624,7 +11735,9 @@ case_project_lane_ci_blocks_on_malice_anywhere_in_the_graph() {
 case_project_lane_ci_with_a_lockfile_that_is_not_the_baseline_is_judged_against_the_committed_one() {
   skip_lockdiff_case "$FUNCNAME" || return
   lane_prepare "lane-ci-edited" kept@1.0.0
-  lane_lock kept@1.0.0 vuln@1.0.0 > "${WORK_DIR}/package-lock.json"
+  lane_consistent_graph kept@1.0.0
+  LANE_UNCOMMITTED=1 lane_consistent_graph kept@1.0.0 vuln@1.0.0
+  lane_fixture_is_what_npm_builds "$FUNCNAME" node_modules/kept node_modules/vuln || return
   local before
   before="$(lane_digests)"
   SAFE_AUDIT_EVIDENCE_HITS="{\"vuln@1.0.0\":${LANE_HIT_CRITICAL}}" lane_run 'npm ci'
@@ -11656,6 +11769,8 @@ case_project_lane_ci_with_a_lockfile_that_is_not_the_baseline_is_judged_against_
 case_project_lane_ci_on_an_existing_tree_replaces_it_and_stays_frozen() {
   skip_lockdiff_case "$FUNCNAME" || return
   lane_prepare "lane-ci-tree" kept@1.0.0 clean@2.0.0
+  lane_consistent_graph kept@1.0.0 clean@2.0.0
+  lane_fixture_is_what_npm_builds "$FUNCNAME" node_modules/kept node_modules/clean || return
   mkdir -p "${WORK_DIR}/node_modules/old"
   printf '{"name":"old","version":"1.0.0"}\n' > "${WORK_DIR}/node_modules/old/package.json"
   NPM_CI_SKIP='node_modules/clean' lane_run 'npm ci'
@@ -11671,6 +11786,8 @@ case_project_lane_ci_on_an_existing_tree_replaces_it_and_stays_frozen() {
   assert_lane_no_leftover "$FUNCNAME" || return
   # the selection of the original command carries to the frozen installation
   lane_prepare "lane-ci-omit" kept@1.0.0 dev@1.0.0:dev
+  lane_consistent_graph kept@1.0.0 dev@1.0.0:dev
+  OMIT_JSON='["dev"]' lane_fixture_is_what_npm_builds "$FUNCNAME: omit" node_modules/kept || return
   NPM_LOCKDIFF_EFFECTIVE_CONFIG_JSON='{"package-lock":true,"ignore-scripts":true,"omit":["dev"]}' lane_run 'npm ci --omit=dev'
   assert_status 0 "$FUNCNAME: omit" || return
   grep -qP '^REAL\tnpm\tci\t--ignore-scripts\t--no-audit\t--no-fund\t.*--omit=dev' "${LOG_FILE}" || { fail "$FUNCNAME: --omit=dev did not reach the frozen installation"; return; }
@@ -11682,6 +11799,7 @@ case_project_lane_ci_on_an_existing_tree_replaces_it_and_stays_frozen() {
 case_project_lane_ci_dry_run_decides_and_package_lock_only_refuses() {
   skip_lockdiff_case "$FUNCNAME" || return
   lane_prepare "lane-ci-dry" kept@1.0.0 vuln@1.0.0
+  lane_consistent_graph kept@1.0.0 vuln@1.0.0
   local before
   before="$(lane_digests)"
   SAFE_AUDIT_EVIDENCE_HITS="{\"vuln@1.0.0\":${LANE_HIT_CRITICAL}}" lane_run 'npm ci --dry-run'
@@ -11720,8 +11838,10 @@ case_project_lane_ci_refuses_before_npm_for_an_unbound_entry_and_leaves_npms_own
   : > "${LOG_FILE}"
   NPM_CI_CHECK_STATUS=1 lane_run 'npm ci'
   assert_status 1 "$FUNCNAME: sync" || return
-  assert_err_contains_fragment 'npm: npm error code EUSAGE' "$FUNCNAME: sync" || return
+  assert_err_contains_fragment 'npm: code EUSAGE' "$FUNCNAME: sync" || return
   assert_err_contains_fragment 'can only install packages when your package.json and package-lock.json' "$FUNCNAME: sync" || return
+  assert_err_not_contains_fragment '[--install-strategy' "$FUNCNAME: sync (npm's usage text shown)" || return
+  assert_err_contains_fragment "Invalid: lock file's kept@1.0.0 does not satisfy kept@^2.0.0" "$FUNCNAME: sync" || return
   assert_lane_final_line ci "$FUNCNAME: sync" || return
   assert_err_contains_fragment "npm's own frozen check failed with npm exit 1" "$FUNCNAME: sync" || return
   assert_lane_ci_not_installed "$FUNCNAME: sync" || return
@@ -11904,20 +12024,261 @@ case_project_lane_ci_reads_the_whole_graph_of_a_thousand_entries() {
   lane_prepare "lane-ci-thousand" kept@1.0.0
   local file="${CASE_DIR}/thousand-lock.json" integrity started elapsed
   integrity="$(lane_integrity bulk)"
-  jq -nc --arg i "${integrity}" '{lockfileVersion: 3, requires: true,
-    packages: ({"": {name: "lane-test", version: "1.0.0"}}
-      + ([range(0; 1000) | {key: "node_modules/bulk-package-\(.)", value: {version: "1.0.0",
-          resolved: "https://registry.npmjs.org/bulk-package-\(.)/-/bulk-package-\(.)-1.0.0.tgz", integrity: $i}}] | from_entries))}' > "${file}"
+  # 1,000 entries: the root requires `kept` and 999 bulk packages, every entry reachable from the manifest
+  jq -nc --arg i "${integrity}" --arg ki "$(lane_integrity kept@1.0.0)" '
+    ([range(0; 999) | {key: "bulk-package-\(.)", value: "1.0.0"}] | from_entries + {kept: "1.0.0"}) as $deps
+    | {name: "lane-test", version: "1.0.0", dependencies: $deps} as $manifest
+    | {lockfileVersion: 3, requires: true,
+       packages: ({"": ($manifest | {name, version, dependencies})}
+         + {"node_modules/kept": {version: "1.0.0", resolved: "https://registry.npmjs.org/kept/-/kept-1.0.0.tgz", integrity: $ki}}
+         + ([range(0; 999) | {key: "node_modules/bulk-package-\(.)", value: {version: "1.0.0",
+             resolved: "https://registry.npmjs.org/bulk-package-\(.)/-/bulk-package-\(.)-1.0.0.tgz", integrity: $i}}] | from_entries))}' > "${file}"
+  jq -c '.packages[""] | {name, version, dependencies}' "${file}" > "${WORK_DIR}/package.json"
   cp -- "${file}" "${WORK_DIR}/package-lock.json"
   lane_commit
+  lane_fixture_is_what_npm_builds "$FUNCNAME" node_modules/kept node_modules/bulk-package-0 node_modules/bulk-package-998 || return
   started="${SECONDS}"
   lane_run 'npm ci'
   elapsed=$((SECONDS - started))
   assert_status 0 "$FUNCNAME" || return
   assert_err_contains_fragment 'npm ci: 1000 entries of the lockfile checked for malice' "$FUNCNAME" || return
   [[ "$(grep '^EVIDENCE_INPUT' "${LOG_FILE}" | cut -f2 | jq 'length')" == 1000 ]] || { fail "$FUNCNAME: the evidence request does not cover the whole graph"; return; }
-  [[ -f "${WORK_DIR}/node_modules/bulk-package-999/package.json" ]] || { fail "$FUNCNAME: tree"; return; }
+  [[ -f "${WORK_DIR}/node_modules/bulk-package-998/package.json" ]] || { fail "$FUNCNAME: tree"; return; }
   printf '# %s: 1000 entries, whole ci command with the stub reader: %ss\n' "$FUNCNAME" "${elapsed}"
+  pass "$FUNCNAME"
+}
+
+
+
+# ---- ci, dedupe and prune: the critical review (ticket 1634) ------------------------------------------
+
+# 1. Only what npm resolves. A token the gate's conservative classifier takes for ci, dedupe, prune, install or
+# update and that the selected npm does not resolve (`clean`, `install-c`, an ambiguous prefix) is left to npm,
+# which rejects it: the lane does nothing with the project and refuses nothing in npm's place. With the switch on
+# it goes to today's gate exactly as with the switch off.
+case_project_lane_routing_a_token_npm_does_not_resolve_is_left_to_npm() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local token on_status on_out on_err off_status off_out off_err on_events off_events marker
+  for token in clean install-c cl; do
+    lane_prepare "lane-unresolved-${token}" kept@1.0.0 clean@2.0.0
+    lane_consistent_graph kept@1.0.0 clean@2.0.0
+    mkdir -p "${WORK_DIR}/node_modules/marker"
+    printf '{"name":"marker","version":"1.0.0"}\n' > "${WORK_DIR}/node_modules/marker/package.json"
+    local before
+    before="$(lane_digests)"
+    : > "${HOME_DIR}/.stub-log-env"
+    : > "${LOG_FILE}"
+    lane_run "npm ${token}"
+    on_status="${STATUS}"; on_out="$(cat "${OUT_FILE}")"; on_err="$(cat "${ERR_FILE}")"; on_events="$(lane_delegation_of_log "${LOG_FILE}" "${WORK_DIR}" "<W>")"
+    # the lane did nothing with the project: the tree, the lockfile and the manifest are as they were
+    [[ -f "${WORK_DIR}/node_modules/marker/package.json" && "$(lane_digests)" == "${before}" ]] || { fail "$FUNCNAME: ${token}: the project was touched"; return; }
+    ! grep -q $'^PROJECTION\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${token}: the lane projected"; return; }
+    assert_log_not_contains_fragment $'REAL\tnpm\tci' "$FUNCNAME: ${token}" || return
+    ! grep -q $'^CICHECK\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${token}: the lane checked"; return; }
+    [[ "${on_err}" != *'[lane: project]'* && "${on_err}" != *'project lane:'* ]] || { fail "$FUNCNAME: ${token}: the lane spoke (${on_err})"; return; }
+    # the same command with the switch off
+    printf '{"install":{"project_lane":false}}\n' > "${HOME_DIR}/.config/safe/run/config.json"
+    : > "${LOG_FILE}"
+    lane_run "npm ${token}"
+    off_status="${STATUS}"; off_out="$(cat "${OUT_FILE}")"; off_err="$(cat "${ERR_FILE}")"; off_events="$(lane_delegation_of_log "${LOG_FILE}" "${WORK_DIR}" "<W>")"
+    [[ "${on_status}" == "${off_status}" && "${on_out}" == "${off_out}" && "${on_err//${WORK_DIR}/<W>}" == "${off_err//${WORK_DIR}/<W>}" ]] \
+      || { printf 'on: %s\n%s\noff: %s\n%s\n' "${on_status}" "${on_err}" "${off_status}" "${off_err}" >&2; fail "$FUNCNAME: ${token}: not the switch-off behaviour"; return; }
+    [[ "${on_events}" == "${off_events}" ]] || { diff <(printf '%s\n' "${on_events}") <(printf '%s\n' "${off_events}") >&2; fail "$FUNCNAME: ${token}: today's gate did not run as with the switch off"; return; }
+    [[ -n "${on_events}" ]] || { fail "$FUNCNAME: ${token}: nothing was delegated"; return; }
+  done
+  # npm's resolution, not the classifier's, decides in the other direction too: every spelling npm resolves is the lane's
+  for token in ic clean-install install-clean isntall-clean ci; do
+    lane_prepare "lane-resolved-${token}" kept@1.0.0
+    lane_consistent_graph kept@1.0.0
+    : > "${LOG_FILE}"
+    lane_run "npm ${token}"
+    assert_status 0 "$FUNCNAME: ${token}" || return
+    grep -q $'^CICHECK\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${token}: not the lane's ci"; return; }
+  done
+  # the question to npm cannot be asked: infrastructure breakage, refused in the lane's form
+  lane_prepare "lane-resolve-fails" kept@1.0.0
+  : > "${LOG_FILE}"
+  NODE_DEREF_STATUS=3 lane_run 'npm ci'
+  assert_status 100 "$FUNCNAME: probe fails" || return
+  assert_lane_final_line ci "$FUNCNAME: probe fails" || return
+  assert_err_contains_fragment "command resolution cannot be asked" "$FUNCNAME: probe fails" || return
+  # on a real node: npm's own resolver, not the stub's table
+  if [[ -n "${REAL_NODE_BIN}" ]]; then
+    local npm_dir script="${CASE_DIR}/lane-probe.cjs" out
+    npm_dir="$(cd -- "$(dirname -- "${REAL_NODE_BIN}")/../lib/node_modules/npm" 2>/dev/null && pwd -P)" || npm_dir=""
+    if [[ -f "${npm_dir}/lib/utils/cmd-list.js" ]]; then
+      ( source "${ROOT_DIR}/lib/gate-lib.sh"; safe_gate_lane_write_probe_script "${script}" ) || { fail "$FUNCNAME: probe script"; return; }
+      for token in clean install-c ic ddp dedupe; do
+        out="$(printf '{"token":"%s"}' "${token}" | "${REAL_NODE_BIN}" "${script}" "${npm_dir}" deref 2>/dev/null)"
+        case "${token}" in
+          clean|install-c) [[ "${out}" == '{"command":null}' ]] || { fail "$FUNCNAME: real npm resolved ${token} (${out})"; return; } ;;
+          ic) [[ "${out}" == '{"command":"ci"}' ]] || { fail "$FUNCNAME: real npm: ic (${out})"; return; } ;;
+          ddp|dedupe) [[ "${out}" == '{"command":"dedupe"}' ]] || { fail "$FUNCNAME: real npm: ${token} (${out})"; return; } ;;
+        esac
+      done
+    fi
+  fi
+  pass "$FUNCNAME"
+}
+
+# 2. dedupe's real plan. npm's dedupe, in lockfile-only mode, writes nothing when no name is duplicated: the lane
+# obtains the plan npm leaves by a second lockfile-only step (a plain install of the same arguments), and judges
+# THAT, never the copied lockfile. The four cases: duplicates present (npm writes), no duplicate but a surplus
+# entry, nothing to do, no lockfile. prune writes its lockfile in every case.
+case_project_lane_dedupe_judges_the_plan_npm_leaves() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local before target
+  # (a) duplicates present: npm writes the plan; no second step
+  lane_prepare "lane-dedupe-dups" kept@1.0.0 dup@1.1.0
+  lane_consistent_graph kept@1.0.0 dup@1.1.0
+  jq -c --argjson old "$(lane_lock dup@1.0.0 | jq -c '.packages["node_modules/dup"]')" '.packages["node_modules/kept/node_modules/dup"] = $old' "${WORK_DIR}/package-lock.json" > "${WORK_DIR}/lock.new"
+  mv "${WORK_DIR}/lock.new" "${WORK_DIR}/package-lock.json"
+  lane_commit
+  target="$(lane_lock kept@1.0.0 dup@1.1.0 | jq -c '.packages[""] += {dependencies: {kept: "1.0.0", dup: "1.1.0"}}')"
+  NPM_LOCK_MUTATION_JSON="${target}" lane_run 'npm dedupe'
+  assert_status 0 "$FUNCNAME: duplicates" || return
+  [[ "$(grep -c $'^PROJECTION\t' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: duplicates: a second step ran although npm wrote its plan"; return; }
+  # (b) no duplicate, a surplus entry: npm saves nothing, the lockfile in the scratch copy is the OLD one; the plan
+  # is what the second step makes npm write (the surplus entry gone). A blocklisted surplus entry does not stop the
+  # operation whose result drops it.
+  lane_prepare "lane-dedupe-surplus" kept@1.0.0 old@1.0.0
+  lane_consistent_graph kept@1.0.0
+  lane_lock kept@1.0.0 old@1.0.0 | jq -c '.packages[""] += {dependencies: {kept: "1.0.0"}}' > "${WORK_DIR}/package-lock.json"
+  lane_commit
+  target="$(lane_lock kept@1.0.0 | jq -c '.packages[""] += {dependencies: {kept: "1.0.0"}}')"
+  : > "${LOG_FILE}"
+  NPM_DEDUPE_SAVES_NOTHING=1 NPM_LOCK_MUTATION_JSON="${target}" SAFE_AUDIT_EVIDENCE_BLOCKLIST='[{"name":"old","reason":"operator blocklist"}]' lane_run 'npm dedupe'
+  assert_status 0 "$FUNCNAME: surplus" || return
+  [[ "$(grep -c $'^PROJECTION\t' "${LOG_FILE}")" == 2 ]] || { fail "$FUNCNAME: surplus: not dedupe then one second step"; return; }
+  grep -qP '^PROJECTION\tnpm\t--package-lock-only\t.*\tinstall$' "${LOG_FILE}" || { fail "$FUNCNAME: surplus: the second step is not a plain install"; return; }
+  [[ "$(cat "${WORK_DIR}/package-lock.json")" == "${target}" ]] || { fail "$FUNCNAME: surplus: the published lockfile is not the plan npm leaves"; return; }
+  assert_err_contains_fragment '0 packages added, 0 changed, 1 removed' "$FUNCNAME: surplus" || return
+  [[ -d "${WORK_DIR}/node_modules/kept" && ! -e "${WORK_DIR}/node_modules/old" ]] || { fail "$FUNCNAME: surplus: tree"; return; }
+  # (c) nothing to do: the second step rewrites the same plan
+  lane_prepare "lane-dedupe-nothing" kept@1.0.0
+  lane_consistent_graph kept@1.0.0
+  target="$(cat "${WORK_DIR}/package-lock.json")"
+  : > "${LOG_FILE}"
+  NPM_DEDUPE_SAVES_NOTHING=1 NPM_LOCK_MUTATION_JSON="${target}" lane_run 'npm dedupe'
+  assert_status 0 "$FUNCNAME: nothing" || return
+  assert_err_contains_fragment '0 packages added, 0 changed, 0 removed' "$FUNCNAME: nothing" || return
+  [[ "$(cat "${WORK_DIR}/package-lock.json")" == "${target}" ]] || { fail "$FUNCNAME: nothing: the lockfile changed"; return; }
+  # (d) no lockfile: npm's dedupe writes nothing at all; the plan is the one the second step makes npm write, judged against
+  # an empty baseline (the whole graph is introduced)
+  lane_prepare "lane-dedupe-nolock" kept@1.0.0
+  lane_consistent_graph kept@1.0.0
+  target="$(cat "${WORK_DIR}/package-lock.json")"
+  rm -f "${WORK_DIR}/package-lock.json"
+  lane_commit
+  : > "${LOG_FILE}"
+  NPM_DEDUPE_SAVES_NOTHING=1 NPM_LOCK_MUTATION_JSON="${target}" lane_run 'npm dedupe'
+  assert_status 0 "$FUNCNAME: no lockfile" || return
+  assert_err_contains_fragment 'baseline: empty' "$FUNCNAME: no lockfile" || return
+  assert_err_contains_fragment '1 packages added, 0 changed, 0 removed' "$FUNCNAME: no lockfile" || return
+  [[ "$(cat "${WORK_DIR}/package-lock.json")" == "${target}" && -d "${WORK_DIR}/node_modules/kept" ]] || { fail "$FUNCNAME: no lockfile: plan or tree"; return; }
+  # a plan that cannot be obtained refuses with npm's status, and the project is as it was
+  lane_prepare "lane-dedupe-second-fails" kept@1.0.0
+  lane_consistent_graph kept@1.0.0
+  before="$(lane_digests)"
+  : > "${LOG_FILE}"
+  NPM_DEDUPE_SAVES_NOTHING=1 NPM_DEDUPE_SECOND_FAIL=7 NPM_LOCK_MUTATION_JSON="$(cat "${WORK_DIR}/package-lock.json")" lane_run 'npm dedupe'
+  assert_status 7 "$FUNCNAME: second step fails" || return
+  assert_lane_final_line dedupe "$FUNCNAME: second step fails" || return
+  assert_err_contains_fragment 'the plan it leaves could not be obtained' "$FUNCNAME: second step fails" || return
+  assert_lane_untouched "${before}" "$FUNCNAME: second step fails" || return
+  # a second step that touches package.json is not a plan to judge
+  lane_prepare "lane-dedupe-manifest" kept@1.0.0
+  lane_consistent_graph kept@1.0.0
+  before="$(lane_digests)"
+  : > "${LOG_FILE}"
+  NPM_DEDUPE_SAVES_NOTHING=1 NPM_LOCK_MUTATION_JSON="$(cat "${WORK_DIR}/package-lock.json")" NPM_PROJECTION_MANIFEST_JSON='{"name":"lane-test","version":"1.0.0","dependencies":{"kept":"1.0.0","extra":"1.0.0"}}' lane_run 'npm dedupe'
+  assert_status 100 "$FUNCNAME: manifest" || return
+  assert_err_contains_fragment 'changed package.json' "$FUNCNAME: manifest" || return
+  assert_lane_untouched "${before}" "$FUNCNAME: manifest" || return
+  # prune writes its lockfile in every case: no second step
+  lane_prepare "lane-prune-one-step" kept@1.0.0
+  lane_consistent_graph kept@1.0.0
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(cat "${WORK_DIR}/package-lock.json")" lane_run 'npm prune'
+  assert_status 0 "$FUNCNAME: prune" || return
+  [[ "$(grep -c $'^PROJECTION\t' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: prune: a second step ran"; return; }
+  pass "$FUNCNAME"
+}
+
+# 3. npm's own errors, wherever they are in its output.
+case_project_lane_ci_shows_npms_error_wherever_it_is_in_its_output() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  # a missing lockfile under a verbose log level: npm's explanation and its code come after 120 lines of log
+  lane_prepare "lane-ci-verbose-nolock" kept@1.0.0
+  rm -f "${WORK_DIR}/package-lock.json"
+  : > "${LOG_FILE}"
+  NPM_CI_CHECK_NOISE=1 lane_run 'npm ci'
+  assert_status 1 "$FUNCNAME: verbose, no lockfile" || return
+  assert_err_contains_fragment 'npm: code EUSAGE' "$FUNCNAME: verbose, no lockfile" || return
+  assert_err_contains_fragment 'can only install with an existing package-lock.json' "$FUNCNAME: verbose, no lockfile" || return
+  assert_err_not_contains_fragment 'config load:file' "$FUNCNAME: verbose, no lockfile (log noise shown)" || return
+  assert_err_contains_fragment "npm's own frozen check failed with npm exit 1 (code EUSAGE)" "$FUNCNAME: verbose, no lockfile" || return
+  assert_lane_final_line ci "$FUNCNAME: verbose, no lockfile" || return
+  assert_lane_ci_not_installed "$FUNCNAME: verbose, no lockfile" || return
+  # a platform error on a synchronised project: not a missing or out-of-step lockfile, and the final line does not say so
+  lane_prepare "lane-ci-platform" kept@1.0.0
+  lane_consistent_graph kept@1.0.0
+  : > "${LOG_FILE}"
+  NPM_CI_CHECK_ERROR=EBADPLATFORM NPM_CI_CHECK_NOISE=1 lane_run 'npm ci'
+  assert_status 1 "$FUNCNAME: platform" || return
+  assert_err_contains_fragment 'npm: code EBADPLATFORM' "$FUNCNAME: platform" || return
+  assert_err_contains_fragment 'Unsupported platform for fsevents@2.3.3' "$FUNCNAME: platform" || return
+  assert_err_contains_fragment "npm's own frozen check failed with npm exit 1 (code EBADPLATFORM)" "$FUNCNAME: platform" || return
+  [[ "$(tail -n 1 "${ERR_FILE}")" != *'out of step'* && "$(tail -n 1 "${ERR_FILE}")" != *'missing'* ]] || { fail "$FUNCNAME: platform: the final line names a cause npm did not give"; return; }
+  assert_lane_ci_not_installed "$FUNCNAME: platform" || return
+  pass "$FUNCNAME"
+}
+
+# 4. prune --package-lock-only: not a caller mode of prune; the lane's own lockfile-only projection of a plain prune stays.
+case_project_lane_prune_package_lock_only_refuses() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-prune-lock-only" kept@1.0.0
+  lane_consistent_graph kept@1.0.0
+  local before arg
+  before="$(lane_digests)"
+  for arg in '--package-lock-only' '--package-lock-only=true'; do
+    : > "${LOG_FILE}"
+    lane_run "npm prune ${arg}"
+    lane_unsupported_case "$FUNCNAME: ${arg}" prune "npm prune ${arg}" || return
+    assert_err_contains_fragment 'npm prune with --package-lock-only' "$FUNCNAME: ${arg}" || return
+    assert_lane_untouched "${before}" "$FUNCNAME: ${arg}" || return
+  done
+  # the plain prune keeps its internal lockfile-only projection, and dedupe keeps the caller mode
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(cat "${WORK_DIR}/package-lock.json")" lane_run 'npm prune'
+  assert_status 0 "$FUNCNAME: plain prune" || return
+  grep -q $'^PROJECTION\tnpm\t--package-lock-only' "${LOG_FILE}" || { fail "$FUNCNAME: plain prune: no projection"; return; }
+  pass "$FUNCNAME"
+}
+
+# 6. Smaller points: the report tells entries submitted for the malice check from identities read completely; the
+# defensive guard for dedupe/prune reads the arguments up to the option terminator, as the global rule does.
+case_project_lane_ci_report_does_not_overstate_incomplete_coverage_and_the_guard_uses_the_global_boundary() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-ci-incomplete" kept@1.0.0
+  lane_consistent_graph kept@1.0.0
+  : > "${LOG_FILE}"
+  SAFE_AUDIT_EVIDENCE_MISSING='["kept@1.0.0"]' lane_run 'npm ci'
+  assert_status 102 "$FUNCNAME: incomplete" || return
+  assert_err_contains_fragment '0 of 1 identities read completely' "$FUNCNAME: incomplete" || return
+  assert_err_contains_fragment '1 entries of the lockfile submitted for the malice check' "$FUNCNAME: incomplete" || return
+  assert_err_not_contains_fragment 'entries of the lockfile checked for malice' "$FUNCNAME: incomplete" || return
+  assert_lane_ci_not_installed "$FUNCNAME: incomplete" || return
+  # the global rule's argument boundary: `npm prune -g -- --no-global` is global, handed to the old code's own refusal
+  local verb
+  for verb in prune dedupe; do
+    lane_prepare "lane-guard-boundary-${verb}" kept@1.0.0
+    : > "${LOG_FILE}"
+    lane_run "npm ${verb} -g -- --no-global"
+    assert_status 100 "$FUNCNAME: ${verb} -g" || return
+    assert_err_contains_fragment 'global dependency mutations have no project lockfile to audit' "$FUNCNAME: ${verb} -g" || return
+    assert_err_not_contains_fragment 'install.sh' "$FUNCNAME: ${verb} -g" || return
+  done
   pass "$FUNCNAME"
 }
 
@@ -12105,6 +12466,11 @@ main() {
     case_project_lane_routing_ci_dedupe_and_prune_follow_the_routing_rule \
     case_project_lane_routing_the_old_differential_path_is_reachable_only_with_the_switch_off \
     case_project_lane_ci_reads_the_whole_graph_of_a_thousand_entries \
+    case_project_lane_routing_a_token_npm_does_not_resolve_is_left_to_npm \
+    case_project_lane_dedupe_judges_the_plan_npm_leaves \
+    case_project_lane_ci_shows_npms_error_wherever_it_is_in_its_output \
+    case_project_lane_prune_package_lock_only_refuses \
+    case_project_lane_ci_report_does_not_overstate_incomplete_coverage_and_the_guard_uses_the_global_boundary \
     case_project_lane_routing_the_install_test_families_keep_todays_gate_with_a_one_shot_line \
     case_project_lane_routing_aliases_and_prefixes_of_every_verb_keep_their_route \
     case_project_lane_routing_mise_exec_with_an_inner_command_that_is_not_the_lanes_is_unchanged \

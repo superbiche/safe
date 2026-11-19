@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Project lane, `ci`/`dedupe`/`prune`, after the critical review. The lane substitutes a canonical verb only
+  when the selected npm itself resolves the caller's token to it (its own `deref`, asked through one offline
+  Node run): `npm clean`, `install-c` and ambiguous prefixes are left to npm, never run as `ci`. npm's
+  `dedupe` saves nothing in lockfile-only mode when no name is duplicated, so the plan it leaves (a surplus
+  entry dropped, a lockfile created) is obtained by a second lockfile-only step instead of taking the copied
+  lockfile for it (`prune` writes in every case). npm's own error from the frozen check (code and message,
+  wherever they are in its output; no log noise or usage text) is shown, the final line is neutral about the
+  cause, and the exit status is npm's. `prune --package-lock-only` refuses. The `ci` report tells entries
+  submitted for the malice check from identities read completely. A global `dedupe`/`prune` is refused at the
+  boundary the global rule uses, without advice to rerun `install.sh`. The passing `ci` fixtures are graphs
+  npm would build, checked with npm's offline modules where a node is at hand.
 - Project lane: `npm ci`, `npm dedupe` and `npm prune` (still behind `install.project_lane`). `ci` has no
   projection: its plan is the lockfile on disk, checked against the manifest by npm's own frozen check
   (`npm ci --dry-run`; a lockfile out of step or missing is npm's own error, shown as npm's, with npm's
