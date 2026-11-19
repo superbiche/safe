@@ -84,6 +84,61 @@ func LoadWithRegistryHosts(path string, registryHosts []string) ([]Package, erro
 // are returned carrying nothing but their path: npm never fetches them, so
 // they are neither validated nor classified here.
 func LoadEntries(path string, registryHosts []string) ([]Entry, error) {
+	records, err := LoadRecords(path, registryHosts)
+	if err != nil {
+		return nil, err
+	}
+	loaded := make([]Entry, 0, len(records))
+	for _, record := range records {
+		if record.Link {
+			loaded = append(loaded, Entry{Path: record.Path, Link: true})
+			continue
+		}
+		loaded = append(loaded, Entry{
+			Path:     record.Path,
+			Package:  Package{Name: record.Name, Version: record.Version, Source: record.Source, Integrity: record.Integrity},
+			Optional: record.Optional,
+			Dev:      record.Dev,
+			OS:       record.OS,
+			CPU:      record.CPU,
+		})
+	}
+	return loaded, nil
+}
+
+// Record is one .packages occurrence with every lockfile fact the project
+// lane's artifact graph reads. LoadEntries reads the same entries through the
+// same validation and keeps the subset the reify lane needs; the fields here
+// that it drops (the resolved descriptor, bundling, an own shrinkwrap, a
+// link's target and the install-path alias) are exactly the ones a binding
+// decision cannot do without.
+type Record struct {
+	Path string
+	// Name is the identity the audit vouches for: the registry name an alias
+	// points at, else the install-path name. Alias is the install-path name
+	// when it differs from Name, empty otherwise.
+	Name      string
+	Alias     string
+	Version   string
+	Resolved  string
+	Integrity string
+	// Source is the descriptor class: registry, git, file, remote or unknown.
+	Source     string
+	Link       bool
+	LinkTarget string
+	Optional   bool
+	Dev        bool
+	InBundle   bool
+	// HasShrinkwrap is npm's own-shrinkwrap marker on the entry.
+	HasShrinkwrap bool
+	OS            []string
+	CPU           []string
+}
+
+// LoadRecords reads the .packages map of an npm lockfileVersion 2 or 3 with
+// the validation LoadEntries applies, keeping every fact of each entry. Link
+// entries carry their path and target only: npm never fetches them.
+func LoadRecords(path string, registryHosts []string) ([]Record, error) {
 	allowedRegistryHosts := registryHostSet(registryHosts)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -129,7 +184,7 @@ func LoadEntries(path string, registryHosts []string) ([]Entry, error) {
 		return nil, fmt.Errorf("parse %q: .packages must be a JSON object", path)
 	}
 
-	loaded := make([]Entry, 0, len(entries))
+	loaded := make([]Record, 0, len(entries))
 	for key, raw := range entries {
 		name, include := packageName(key)
 		if !include {
@@ -137,21 +192,27 @@ func LoadEntries(path string, registryHosts []string) ([]Entry, error) {
 		}
 
 		var entry struct {
-			Link      *bool           `json:"link"`
-			Optional  *bool           `json:"optional"`
-			Dev       *bool           `json:"dev"`
-			Name      string          `json:"name"`
-			Version   string          `json:"version"`
-			Resolved  json.RawMessage `json:"resolved"`
-			Integrity json.RawMessage `json:"integrity"`
-			OS        json.RawMessage `json:"os"`
-			CPU       json.RawMessage `json:"cpu"`
+			Link          *bool           `json:"link"`
+			Optional      *bool           `json:"optional"`
+			Dev           *bool           `json:"dev"`
+			InBundle      *bool           `json:"inBundle"`
+			HasShrinkwrap *bool           `json:"hasShrinkwrap"`
+			Name          string          `json:"name"`
+			Version       string          `json:"version"`
+			Resolved      json.RawMessage `json:"resolved"`
+			Integrity     json.RawMessage `json:"integrity"`
+			OS            json.RawMessage `json:"os"`
+			CPU           json.RawMessage `json:"cpu"`
 		}
 		if err := json.Unmarshal(raw, &entry); err != nil {
 			return nil, fmt.Errorf("parse %q: .packages[%q] must be an object", path, key)
 		}
 		if entry.Link != nil && *entry.Link {
-			loaded = append(loaded, Entry{Path: key, Link: true})
+			target, _, err := optionalString(entry.Resolved)
+			if err != nil {
+				return nil, fmt.Errorf("parse %q: .packages[%q] resolved must be a string", path, key)
+			}
+			loaded = append(loaded, Record{Path: key, Link: true, LinkTarget: target})
 			continue
 		}
 		if entry.Version == "" {
@@ -171,7 +232,11 @@ func LoadEntries(path string, registryHosts []string) ([]Entry, error) {
 		// for that identity only when the descriptor is a registry artifact.
 		// A non-registry descriptor can self-declare a registry name, but that
 		// must not make an audit of that namesake vouch for its real source.
+		alias := ""
 		if source == "registry" && entry.Name != "" {
+			if entry.Name != name {
+				alias = name
+			}
 			name = entry.Name
 		}
 		if err := validatePackageName(name); err != nil {
@@ -185,13 +250,20 @@ func LoadEntries(path string, registryHosts []string) ([]Entry, error) {
 				return nil, fmt.Errorf("parse %q: .packages[%q] %w", path, key, err)
 			}
 		}
-		loaded = append(loaded, Entry{
-			Path:     key,
-			Package:  Package{Name: name, Version: entry.Version, Source: source, Integrity: integrity},
-			Optional: entry.Optional != nil && *entry.Optional,
-			Dev:      entry.Dev != nil && *entry.Dev,
-			OS:       stringList(entry.OS),
-			CPU:      stringList(entry.CPU),
+		loaded = append(loaded, Record{
+			Path:          key,
+			Name:          name,
+			Alias:         alias,
+			Version:       entry.Version,
+			Resolved:      resolved,
+			Integrity:     integrity,
+			Source:        source,
+			Optional:      entry.Optional != nil && *entry.Optional,
+			Dev:           entry.Dev != nil && *entry.Dev,
+			InBundle:      entry.InBundle != nil && *entry.InBundle,
+			HasShrinkwrap: entry.HasShrinkwrap != nil && *entry.HasShrinkwrap,
+			OS:            stringList(entry.OS),
+			CPU:           stringList(entry.CPU),
 		})
 	}
 

@@ -60,6 +60,8 @@ case "$url" in
       count_file="${MOCK_BATCH_DIR}/.count"
       count=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
       printf '%s' "$count" > "$count_file"
+      # A batchN.fail marker makes the Nth call a transport failure.
+      [[ ! -e "${MOCK_BATCH_DIR}/batch${count}.fail" ]] || exit 22
       cat "${MOCK_BATCH_DIR}/batch${count}.json"
     else
       cat "${MOCK_BATCH_FIXTURE:?}"
@@ -68,6 +70,8 @@ case "$url" in
   *api.osv.dev/v1/vulns/*)
     [[ "${MOCK_VULN_STATUS:-0}" == "0" ]] || exit 22
     id="${url##*/}"
+    # A vuln-<id>.fail marker makes that one advisory fetch a transport failure.
+    [[ ! -e "${MOCK_FIXDIR:?}/vuln-${id}.fail" ]] || exit 22
     cat "${MOCK_FIXDIR:?}/vuln-${id}.json"
     ;;
   *api.osv.dev/v1/query*)
@@ -104,8 +108,10 @@ run_batch() {
     MOCK_VULN_STATUS="${MOCK_VULN_STATUS:-0}" \
     MOCK_QUERY_FIXTURE="${MOCK_QUERY_FIXTURE:-}" \
     MOCK_QUERY_STATUS="${MOCK_QUERY_STATUS:-0}" \
-    bash "$SAFE_AUDIT" scanner-batch
+    bash "$SAFE_AUDIT" scanner-batch "$@"
 }
+
+run_evidence() { run_batch --evidence "$@"; }
 
 # --- cases: scanner-batch ----------------------------------------------------
 
@@ -799,6 +805,268 @@ STUB
   fi
 }
 
+# --- cases: scanner-batch --evidence -----------------------------------------
+# The structured twin of the batch: one document, each identity's validated
+# answer and coverage kept apart, so a later failure never erases a validated
+# hit and a malformed answer is never read as empty.
+
+evidence_identity() { # <doc> <name> <version> <jq filter on the identity>
+  jq -e --arg n "$2" --arg v "$3" ".identities[] | select(.name == \$n and .version == \$v) | $4" <<<"$1" >/dev/null
+}
+
+case_evidence_clean_tree_is_complete_and_empty() {
+  setup_case ev-clean
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-clean.json"
+  printf '{"results": [{}, {}]}\n' > "$MOCK_BATCH_FIXTURE"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"left-pad","version":"1.3.0"},{"name":"lodash","version":"4.17.21"}]}' | run_evidence) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e '.schema_version == 1 and .policy.block_severities == ["critical"] and .blocklist == []
+        and (.identities | length == 2)
+        and ([.identities[] | .coverage == "complete" and .gap == "" and .advisories == []] | all)' <<<"$out" >/dev/null; then
+    pass "evidence: clean tree is complete with empty advisories"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: clean tree is complete with empty advisories"
+  fi
+}
+
+case_evidence_malformed_stdin_refuses() {
+  setup_case ev-malformed
+  local rc=0 out
+  out=$(printf 'not json' | run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "2" && -z "$out" ]]; then
+    pass "evidence: malformed stdin exits 2 with no document"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: malformed stdin exits 2 with no document"
+  fi
+}
+
+case_evidence_keeps_severity_ladder_and_malware_identity() {
+  setup_case ev-ladder
+  printf '{"install": {"block_severities": ["critical", "Medium"]}}\n' > "$RUN_DIR/config.json"
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-ladder.json"
+  printf '%s\n' '{"results": [
+    {"vulns": [{"id": "GHSA-evc-0001"}]},
+    {"vulns": [{"id": "MAL-2026-4242"}]},
+    {"vulns": [{"id": "GHSA-evv-0002"}, {"id": "GHSA-evu-0003"}]}]}' > "$MOCK_BATCH_FIXTURE"
+  # aaa: a CVSS vector must band through the existing ladder (critical), not
+  # read as "low". ccc: one record without any severity reads "unknown".
+  # No vuln-MAL-* fixture exists: a fetch attempt would fail the case.
+  printf '{"id": "GHSA-evc-0001", "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]}\n' > "$FIXDIR/vuln-GHSA-evc-0001.json"
+  printf '{"id": "GHSA-evv-0002", "database_specific": {"severity": "MODERATE"}}\n' > "$FIXDIR/vuln-GHSA-evv-0002.json"
+  printf '{"id": "GHSA-evu-0003"}\n' > "$FIXDIR/vuln-GHSA-evu-0003.json"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"aaa","version":"1.0.0"},{"name":"bbb","version":"2.0.0"},{"name":"ccc","version":"3.0.0"}]}' | run_evidence) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e '.policy.block_severities == ["critical","moderate"]' <<<"$out" >/dev/null \
+    && evidence_identity "$out" aaa 1.0.0 '.coverage == "complete" and .advisories == [{id:"GHSA-evc-0001",severity:"critical",malware:false}]' \
+    && evidence_identity "$out" bbb 2.0.0 '.coverage == "complete" and .advisories == [{id:"MAL-2026-4242",severity:"critical",malware:true}]' \
+    && evidence_identity "$out" ccc 3.0.0 '.advisories == [{id:"GHSA-evu-0003",severity:"unknown",malware:false},{id:"GHSA-evv-0002",severity:"moderate",malware:false}]'; then
+    pass "evidence: ladder severities, block_severities, and MAL keeps its affected version"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: ladder severities, block_severities, and MAL keeps its affected version"
+  fi
+}
+
+case_evidence_same_name_versions_stay_apart() {
+  setup_case ev-versions
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-versions.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-evs-0004"}]}, {}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": "GHSA-evs-0004", "database_specific": {"severity": "HIGH"}}\n' > "$FIXDIR/vuln-GHSA-evs-0004.json"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"multi","version":"1.0.0"},{"name":"multi","version":"2.0.0"},{"name":"multi","version":"1.0.0"}]}' | run_evidence) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e '.identities | length == 2' <<<"$out" >/dev/null \
+    && evidence_identity "$out" multi 1.0.0 '.advisories | length == 1' \
+    && evidence_identity "$out" multi 2.0.0 '.advisories == [] and .coverage == "complete"'; then
+    pass "evidence: one package at several versions keeps each answer on its own identity"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: one package at several versions keeps each answer on its own identity"
+  fi
+}
+
+case_evidence_later_chunk_failure_keeps_earlier_hits() {
+  # 150 identities → two querybatch calls. The first answers with a validated
+  # critical on its first identity; the second fails in transport. The batch
+  # aborts with nothing; the evidence keeps the hit and marks only the second
+  # chunk's identities missing.
+  setup_case ev-chunk-fail
+  local batchdir="$FIXDIR/ev-chunk-fail"
+  mkdir -p "$batchdir"; rm -f "$batchdir/.count" "$batchdir"/batch2.*
+  jq -n '{results: ([{vulns: [{id: "GHSA-evk-0005"}]}] + [range(99) | {}])}' > "$batchdir/batch1.json"
+  : > "$batchdir/batch2.fail"
+  printf '{"id": "GHSA-evk-0005", "database_specific": {"severity": "CRITICAL"}}\n' > "$FIXDIR/vuln-GHSA-evk-0005.json"
+  local input out rc=0 first last
+  input=$(jq -n '{packages: [range(150) | {name: ("pkg-" + (. + 1000 | tostring)), version: "1.0.0"}]}')
+  first=$(jq -r '[.packages[].name] | sort | .[0]' <<<"$input")
+  last=$(jq -r '[.packages[].name] | sort | .[149]' <<<"$input")
+  out=$(printf '%s' "$input" | MOCK_BATCH_DIR="$batchdir" MOCK_BATCH_FIXTURE= run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e '[.identities[] | select(.coverage == "complete")] | length == 100' <<<"$out" >/dev/null \
+    && jq -e '[.identities[] | select(.coverage == "missing")] | length == 50' <<<"$out" >/dev/null \
+    && evidence_identity "$out" "$first" 1.0.0 '.advisories[0].id == "GHSA-evk-0005" and .advisories[0].severity == "critical"' \
+    && evidence_identity "$out" "$last" 1.0.0 '.coverage == "missing" and (.gap | contains("OSV batch query failed")) and .advisories == []'; then
+    pass "evidence: a later chunk's failure keeps the earlier validated hit and marks only its own identities"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: a later chunk's failure keeps the earlier validated hit and marks only its own identities"
+  fi
+  # The batch over the same fixtures still aborts on that failure.
+  rm -f "$batchdir/.count"
+  rc=0
+  out=$(printf '%s' "$input" | MOCK_BATCH_DIR="$batchdir" MOCK_BATCH_FIXTURE= run_batch 2>/dev/null) || rc=$?
+  if [[ "$rc" == "4" && -z "$out" ]]; then
+    pass "evidence: the batch itself still fails closed on the same chunk failure"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: the batch itself still fails closed on the same chunk failure"
+  fi
+}
+
+case_evidence_malformed_chunk_is_a_gap_never_empty() {
+  setup_case ev-chunk-malformed
+  local batchdir="$FIXDIR/ev-chunk-malformed"
+  mkdir -p "$batchdir"; rm -f "$batchdir/.count" "$batchdir"/batch2.*
+  jq -n '{results: [range(100) | {}]}' > "$batchdir/batch1.json"
+  # Second chunk: a result entry without the shape (a bare string), then a
+  # null — each would read as "no advisories" through an optional iterator.
+  printf '{"results": ["oops", null, {}]}\n' > "$batchdir/batch2.json"
+  local input out rc=0 last
+  input=$(jq -n '{packages: [range(103) | {name: ("pkg-" + (. + 1000 | tostring)), version: "1.0.0"}]}')
+  last=$(jq -r '[.packages[].name] | sort | .[102]' <<<"$input")
+  out=$(printf '%s' "$input" | MOCK_BATCH_DIR="$batchdir" MOCK_BATCH_FIXTURE= run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e '[.identities[] | select(.coverage == "missing")] | length == 3' <<<"$out" >/dev/null \
+    && evidence_identity "$out" "$last" 1.0.0 '.coverage == "missing" and (.gap | contains("malformed OSV batch response"))'; then
+    pass "evidence: a malformed batch answer is a gap on its identities, never an empty reading"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: a malformed batch answer is a gap on its identities, never an empty reading"
+  fi
+}
+
+case_evidence_pagination_failure_keeps_first_page() {
+  setup_case ev-page-fail
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-page.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-evp-0006"}], "next_page_token": "tok"}, {"vulns": [{"id": "GHSA-evp-0007"}]}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": "GHSA-evp-0006", "database_specific": {"severity": "CRITICAL"}}\n' > "$FIXDIR/vuln-GHSA-evp-0006.json"
+  printf '{"id": "GHSA-evp-0007", "database_specific": {"severity": "LOW"}}\n' > "$FIXDIR/vuln-GHSA-evp-0007.json"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"paged","version":"1.0.0"},{"name":"plain","version":"1.0.0"}]}' | MOCK_QUERY_STATUS=1 run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && evidence_identity "$out" paged 1.0.0 '.coverage == "missing" and (.gap | contains("pagination")) and .advisories == [{id:"GHSA-evp-0006",severity:"critical",malware:false}]' \
+    && evidence_identity "$out" plain 1.0.0 '.coverage == "complete" and .advisories[0].severity == "low"'; then
+    pass "evidence: a failed pagination re-query keeps the validated first page and marks the identity missing"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: a failed pagination re-query keeps the validated first page and marks the identity missing"
+  fi
+  # And a complete re-query still merges to completeness.
+  MOCK_QUERY_FIXTURE="$FIXDIR/query-ev-page.json"
+  printf '{"vulns": [{"id": "GHSA-evp-0006"}, {"id": "GHSA-evp-0008"}]}\n' > "$MOCK_QUERY_FIXTURE"
+  printf '{"id": "GHSA-evp-0008", "database_specific": {"severity": "HIGH"}}\n' > "$FIXDIR/vuln-GHSA-evp-0008.json"
+  rc=0
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-page1.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-evp-0006"}], "next_page_token": "tok"}]}\n' > "$MOCK_BATCH_FIXTURE"
+  out=$(printf '{"packages":[{"name":"paged","version":"1.0.0"}]}' | run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && evidence_identity "$out" paged 1.0.0 '.coverage == "complete" and ([.advisories[].id] == ["GHSA-evp-0006","GHSA-evp-0008"])'; then
+    pass "evidence: a complete pagination re-query is read to completeness"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: a complete pagination re-query is read to completeness"
+  fi
+}
+
+case_evidence_detail_failure_keeps_other_hits() {
+  setup_case ev-detail
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-detail.json"
+  printf '{"results": [{"vulns": [{"id": "GHSA-evd-0009"}, {"id": "GHSA-evd-0010"}, {"id": "MAL-2026-777"}]}, {"vulns": [{"id": "GHSA-evd-0011"}]}]}\n' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": "GHSA-evd-0009", "database_specific": {"severity": "CRITICAL"}}\n' > "$FIXDIR/vuln-GHSA-evd-0009.json"
+  # 0010: an advisory record that is not the advisory asked for; 0011: no
+  # fixture at all (the fetch fails).
+  printf '{"id": "GHSA-someone-else"}\n' > "$FIXDIR/vuln-GHSA-evd-0010.json"
+  : > "$FIXDIR/vuln-GHSA-evd-0011.fail"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"dd1","version":"1.0.0"},{"name":"dd2","version":"1.0.0"}]}' | run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && evidence_identity "$out" dd1 1.0.0 '.coverage == "missing" and (.gap | contains("GHSA-evd-0010: OSV advisory record malformed"))
+        and ([.advisories[] | .id] == ["GHSA-evd-0009","MAL-2026-777"])' \
+    && evidence_identity "$out" dd2 1.0.0 '.coverage == "missing" and (.gap | contains("GHSA-evd-0011: OSV advisory fetch failed")) and .advisories == []'; then
+    pass "evidence: a failed or malformed detail drops only that advisory and names it in the gap"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: a failed or malformed detail drops only that advisory and names it in the gap"
+  fi
+}
+
+case_evidence_blocklist_is_independent_of_osv() {
+  setup_case ev-blocklist
+  printf '{"packages": {"evil-pkg": {"reason": "operator blocklist test"}, "@scope/*": {"reason": "scope blocked"}}}\n' > "$RUN_DIR/blocked.json"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"evil-pkg","version":"1.0.0"},{"name":"@scope/x","version":"2.0.0"},{"name":"fine","version":"1.0.0"}]}' \
+    | MOCK_BATCH_STATUS=1 run_evidence 2>/dev/null) || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e '.blocklist == [{name:"@scope/x",reason:"scope blocked"},{name:"evil-pkg",reason:"operator blocklist test"}]
+        and ([.identities[] | .coverage == "missing"] | all)' <<<"$out" >/dev/null; then
+    pass "evidence: blocklist hits are reported by name whatever the OSV reading did"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: blocklist hits are reported by name whatever the OSV reading did"
+  fi
+}
+
+case_evidence_unreadable_blocklist_fails_closed() {
+  setup_case ev-blocklist-bad
+  printf '{"packages": [1]}\n' > "$RUN_DIR/blocked.json"
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-bl.json"
+  printf '{"results": [{}]}\n' > "$MOCK_BATCH_FIXTURE"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"x","version":"1.0.0"}]}' | run_evidence 2>"$TEST_ROOT/ev-bl.err") || rc=$?
+  if [[ "$rc" == "4" && -z "$out" ]] && grep -q "blocklist file unreadable" "$TEST_ROOT/ev-bl.err"; then
+    pass "evidence: an unreadable blocklist yields no document"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: an unreadable blocklist yields no document"
+  fi
+}
+
+case_evidence_document_is_read_by_the_decision() {
+  # The two sides of the contract in one run: the evidence this mode writes,
+  # plus the acceptances the gate adds, is a document safe-core's decision
+  # reads; a malformed answer on the target side is Missing evidence there.
+  setup_case ev-contract
+  . "$ROOT/tests/lib/safe-core.sh"
+  if ! safe_core_test_prepare "$ROOT" "$TEST_ROOT/safe-core-ev" 2>/dev/null; then
+    pass "evidence: contract with safe-core project-decide (SKIPPED: safe-core not buildable here)"
+    return
+  fi
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-contract.json"
+  printf '%s\n' '{"results": [{"vulns": [{"id": "GHSA-evx-0012"}]}, {}, {"vulns": [{"id": "MAL-2026-1"}]}]}' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": "GHSA-evx-0012", "database_specific": {"severity": "CRITICAL"}}\n' > "$FIXDIR/vuln-GHSA-evx-0012.json"
+  local evidence="$TEST_ROOT/ev-contract.json" lock="$TEST_ROOT/ev-contract-lock.json" out rc=0 sri
+  sri="sha512-$(head -c 64 /dev/zero | base64 -w0)"
+  printf '{"packages":[{"name":"crit","version":"1.0.0"},{"name":"mal","version":"1.0.0"},{"name":"fine","version":"1.0.0"}]}' \
+    | run_evidence 2>/dev/null | jq -c '. + {acceptances: []}' > "$evidence"
+  jq -n --arg sri "$sri" '{lockfileVersion: 3, packages: ({"": {name: "root"}} + ([["crit","1.0.0"],["mal","1.0.0"],["fine","1.0.0"]] | map({key: ("node_modules/" + .[0]),
+    value: {version: .[1], resolved: ("https://registry.npmjs.org/" + .[0] + "/-/" + .[0] + "-" + .[1] + ".tgz"),
+            integrity: $sri}}) | from_entries))}' > "$lock"
+  out=$("$SAFE_CORE_BIN" project-decide --no-baseline --evidence "$evidence" "$lock") || rc=$?
+  if [[ "$rc" == "0" ]] \
+    && jq -e '.outcome == {status:"stopped",class:"malice",exit:104}
+        and (.malice | length == 1 and .[0].name == "mal" and .[0].versions == ["1.0.0"] and .[0].id == "MAL-2026-1")
+        and (.advisories.introduced | length == 1 and .[0].name == "crit" and .[0].class == "blocking")' <<<"$out" >/dev/null; then
+    pass "evidence: the document the mode writes is the one safe-core project-decide reads"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: the document the mode writes is the one safe-core project-decide reads"
+  fi
+}
+
 # --- run ---------------------------------------------------------------------
 
 case_clean_tree_returns_empty_array
@@ -835,6 +1103,17 @@ case_adapter_rejects_malformed_advisory_elements
 case_adapter_throws_on_missing_binary
 case_adapter_times_out_hung_child
 case_adapter_rejects_partial_request_channel
+case_evidence_clean_tree_is_complete_and_empty
+case_evidence_malformed_stdin_refuses
+case_evidence_keeps_severity_ladder_and_malware_identity
+case_evidence_same_name_versions_stay_apart
+case_evidence_later_chunk_failure_keeps_earlier_hits
+case_evidence_malformed_chunk_is_a_gap_never_empty
+case_evidence_pagination_failure_keeps_first_page
+case_evidence_detail_failure_keeps_other_hits
+case_evidence_blocklist_is_independent_of_osv
+case_evidence_unreadable_blocklist_fails_closed
+case_evidence_document_is_read_by_the_decision
 
 printf '%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 (( FAIL_COUNT == 0 ))

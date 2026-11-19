@@ -198,3 +198,28 @@ func TestLoadRegistryHostProvenance(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadRecordsKeepsTheFactsLoadEntriesDrops(t *testing.T) {
+	file := writeLockfile(t, t.TempDir(), `{
+	  "lockfileVersion": 3,
+	  "packages": {
+	    "": {"name": "root", "version": "1.0.0"},
+	    "node_modules/alias": {"name": "real", "version": "2.0.0", "resolved": "https://registry.npmjs.org/real/-/real-2.0.0.tgz", "integrity": "sha512-x", "hasShrinkwrap": true},
+	    "node_modules/p/node_modules/inner": {"version": "1.0.0", "inBundle": true},
+	    "node_modules/linked": {"resolved": "packages/local", "link": true}
+	  }
+	}`)
+	records, err := LoadRecords(file, nil)
+	if err != nil {
+		t.Fatalf("LoadRecords() error = %v", err)
+	}
+	want := []Record{
+		{Path: "node_modules/alias", Name: "real", Alias: "alias", Version: "2.0.0",
+			Resolved: "https://registry.npmjs.org/real/-/real-2.0.0.tgz", Integrity: "sha512-x", Source: "registry", HasShrinkwrap: true},
+		{Path: "node_modules/linked", Link: true, LinkTarget: "packages/local"},
+		{Path: "node_modules/p/node_modules/inner", Name: "inner", Version: "1.0.0", Source: "unknown", InBundle: true},
+	}
+	if !reflect.DeepEqual(records, want) {
+		t.Fatalf("LoadRecords() = %#v, want %#v", records, want)
+	}
+}

@@ -728,6 +728,32 @@ socket login
 
 For predictable repeated use, use a Socket account token. The practical token scope for `socket package score` is `packages:list`. `safe doctor` reports the Socket CLI and token wiring.
 
+### Advisory evidence for the project lane
+
+`safe audit scanner-batch` is the OSV batch path behind the Bun scanner backend:
+packages in on stdin, a Bun-shaped advisory array out, and any infrastructure
+failure a nonzero exit with no advisories. `safe audit scanner-batch --evidence`
+reads the same input through the same validation, pagination and severity ladder
+and keeps the answer as a document instead:
+
+```json
+{"schema_version": 1,
+ "policy": {"block_severities": ["critical"]},
+ "identities": [{"name": "p", "version": "1.0.0", "coverage": "complete", "gap": "",
+                 "advisories": [{"id": "GHSA-…", "severity": "high", "malware": false}]}],
+ "blocklist": [{"name": "evil", "reason": "…"}]}
+```
+
+Each exact identity carries its own validated advisories and its own coverage.
+A chunk, page or advisory detail that fails marks only the identities it covered
+as `missing` and says why in `gap`; every other validated hit stays, and a
+malformed answer is a gap, never an empty reading. A `MAL-` record keeps the
+name and version it affects (`malware: true`). The blocklist is reported by
+name, independently of every OSV outcome. The document carries no verdict:
+`safe-core project-decide` reads it, with the standing acceptances added, and
+decides what a command introduces. The exit is 0 with a document, 2 for
+malformed input and 4 when no document can be trusted (an unreadable blocklist).
+
 ## IOC Workflows
 
 Lookup one advisory and scan the default machine:

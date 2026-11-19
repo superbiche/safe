@@ -10809,6 +10809,113 @@ gate_emit_refusal_hints() {
   fi
 }
 
+# --- scanner-batch validators (shared by the batch and its evidence mode) ----
+# One definition of "a well-formed OSV answer", so the evidence mode cannot
+# drift from the batch it is a structured twin of.
+
+# Names and versions must be whitespace/control-free: they travel through
+# line-oriented read loops (blocklist names, per-package severity scoping)
+# and into advisory descriptions, where an embedded newline would split
+# one value into separately-processed fragments — the same fragment
+# defect class as delta-2 F14.
+scanner_batch_input_valid() {
+  jq -e '
+    (.packages | type == "array") and (.packages | length > 0)
+    and ([.packages[]
+          | (type == "object")
+            and ((.name? | type) == "string") and (.name | length > 0)
+            and ((.name | test("[[:space:][:cntrl:]]")) | not)
+            and ((.version? | type) == "string") and (.version | length > 0)
+            and ((.version | test("[[:space:][:cntrl:]]")) | not)]
+         | all)
+  ' <<<"$1" >/dev/null 2>&1
+}
+
+# Exactly one JSON document: a JSON *stream* is not a JSON response — jq
+# validates every document and reports the last one's status while the
+# pairing consumes only the first, so a two-document body would validate on
+# its tail and silently drop the advisories in it (PR#64 delta F10).
+scanner_batch_single_document() {
+  jq -es 'length == 1' "$1" >/dev/null 2>&1
+}
+
+# Every result entry is validated to the shape the classification relies on
+# BEFORE any optional iteration touches it: a null entry, a non-array vulns,
+# a vuln without a string id, or a token of the wrong shape must fail closed
+# here — optional iterators (`.vulns[]?`) would otherwise read each of those
+# as "no advisories" and exit 0 clean (PR#64 review F2). $1 file, $2 count.
+scanner_batch_response_valid() {
+  jq -e --argjson n "$2" '
+    (.results | type == "array") and (.results | length == $n)
+    and ([.results[]
+          | (type == "object")
+            and ((has("vulns") | not)
+                 or (.vulns | (type == "array")
+                     and ([.[] | (type == "object")
+                           and ((.id? | type) == "string")
+                           and (.id | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))
+                           and ((.id | test("[\\n\\r]")) | not)] | all)))
+            and ((has("next_page_token") | not)
+                 or (.next_page_token | (type == "string") and (length > 0)
+                     and test("^[[:graph:]]+$")))
+         ] | all)
+  ' "$1" >/dev/null 2>&1
+}
+
+# A paginated re-query replaces ALREADY-VALIDATED batch results, so the same
+# id schema must hold or a numeric/null id rides past the upfront guard as a
+# stringified warning (PR#64 delta F11). $1 file.
+scanner_batch_page_valid() {
+  jq -e '
+    (.vulns // []) | (type == "array")
+    and ([.[] | (type == "object")
+          and ((.id? | type) == "string")
+          and (.id | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))
+          and ((.id | test("[\\n\\r]")) | not)] | all)
+  ' "$1" >/dev/null 2>&1
+}
+
+# One document, an object, and a STRING id equal to the request (tostring let
+# a numeric 42 impersonate "42" — delta re-check F3). $1 file, $2 id.
+scanner_batch_detail_valid() {
+  scanner_batch_single_document "$1" \
+    && jq -e --arg id "$2" '(type == "object") and ((.id? | type) == "string") and (.id == $id)' \
+      "$1" >/dev/null 2>&1
+}
+
+# Severity is scoped per QUERIED package, exactly as package_audit_command
+# scopes vuln_sev to matching_affected: whole-record aggregation imported
+# another affected package's critical into this package's verdict (PR#64
+# delta F12). Top-level severity and database_specific.severity stay
+# record-global, as in check. The most-severe-candidate-wins ladder is
+# package_audit_command's (qualitative labels + every CVSS v3/v4 vector); the
+# legacy substring matcher read a raw "CVSS:3.1/..." vector as "low" and
+# downgraded criticals to warn (PR#64 review F1). Prints the label; fails on
+# an unreadable record. $1 file, $2 queried package name.
+scanner_batch_detail_label() {
+  local label
+  label=$(jq -r --arg name "$2" "$JQ_SEVERITY_DEFS"'
+    [ .affected[]? | select(((.package.ecosystem // "") == "npm") and ((.package.name // "") == $name)) ] as $aff
+    | (
+        [ .database_specific.severity? // empty | norm_qual ]
+        + [ ((.severity // []) + ([ $aff[].severity? // empty ] | add // []))[]
+            | select(.type == "CVSS_V3") | (.score // empty) | cvss3_band ]
+        + [ ((.severity // []) + ([ $aff[].severity? // empty ] | add // []))[]
+            | select(.type == "CVSS_V4")
+            | ((try ((.score // "") | cvss4_band) catch empty) // "high") ]
+        + [ $aff[].ecosystem_specific.severity? // empty | norm_qual ]
+      ) as $cands
+    | if ($cands | length) > 0 then ($cands | max_by(band_rank(.))) else "unknown" end
+  ' "$1" 2>/dev/null) || return 1
+  [[ -n "$label" ]] || return 1
+  printf '%s' "$label"
+}
+
+# install.block_severities, lowercased, with "medium" read as "moderate".
+scanner_batch_block_severities() {
+  install_policy_json | jq -c '[(.block_severities // ["critical"])[] | tostring | ascii_downcase | if . == "medium" then "moderate" else . end]'
+}
+
 # --- Bun Security Scanner API backend ---------------------------------------
 # Consumed by share/scanner.mjs under hosts implementing Bun's scanner
 # contract (mise's embedded aube installer, bun >= 1.3): the resolved
@@ -10820,26 +10927,26 @@ gate_emit_refusal_hints() {
 # failure exits nonzero WITHOUT emitting advisories: the host's fail-closed
 # contract blocks the install, and the stderr cause reads as
 # breakage-to-fix, never as a package finding.
+#
+# `scanner-batch --evidence` is the structured twin the project lane reads:
+# the same validators, pagination and severity ladder, but the answer is kept
+# per exact identity with its coverage, so a failure of one chunk, page or
+# detail leaves every other validated hit in place and names what was not
+# read. See scanner_batch_evidence_command.
 scanner_batch_command() {
+  local evidence_mode=0
+  if [[ "${1:-}" == "--evidence" ]]; then
+    evidence_mode=1
+  fi
   local input
   input=$(cat 2>/dev/null) || input=""
-  # Names and versions must be whitespace/control-free: they travel through
-  # line-oriented read loops (blocklist names, per-package severity scoping)
-  # and into advisory descriptions, where an embedded newline would split
-  # one value into separately-processed fragments — the same fragment
-  # defect class as delta-2 F14.
-  if ! jq -e '
-    (.packages | type == "array") and (.packages | length > 0)
-    and ([.packages[]
-          | (type == "object")
-            and ((.name? | type) == "string") and (.name | length > 0)
-            and ((.name | test("[[:space:][:cntrl:]]")) | not)
-            and ((.version? | type) == "string") and (.version | length > 0)
-            and ((.version | test("[[:space:][:cntrl:]]")) | not)]
-         | all)
-  ' <<<"$input" >/dev/null 2>&1; then
+  if ! scanner_batch_input_valid "$input"; then
     printf 'safe audit: scanner-batch: malformed input — expected {"packages":[{"name":…,"version":…},…]} on stdin\n' >&2
     return 2
+  fi
+  if (( evidence_mode )); then
+    scanner_batch_evidence_command "$input"
+    return
   fi
 
   local scratch
@@ -10886,36 +10993,11 @@ scanner_batch_command() {
       printf 'safe audit: scanner-batch: OSV batch query failed (network/timeout/HTTP error) — audit-infrastructure breakage, not a package finding; check connectivity or run safe doctor\n' >&2
       return 4
     fi
-    # A JSON *stream* is not a JSON response: jq validates every document
-    # and reports the last one's status while the pairing below consumes
-    # only the first — a two-document body would validate on its tail and
-    # silently drop the advisories in it (PR#64 delta F10). Exactly one
-    # document, then shape.
-    if ! jq -es 'length == 1' "$scratch/batch.json" >/dev/null 2>&1; then
+    if ! scanner_batch_single_document "$scratch/batch.json"; then
       printf 'safe audit: scanner-batch: malformed OSV batch response (not a single JSON document) — audit-infrastructure breakage, not a package finding\n' >&2
       return 4
     fi
-    # Every result entry is validated to the shape the classification below
-    # relies on BEFORE any optional iteration touches it: a null entry, a
-    # non-array vulns, a vuln without a string id, or a token of the wrong
-    # shape must fail closed here — optional iterators (`.vulns[]?`) would
-    # otherwise read each of those as "no advisories" and exit 0 clean
-    # (PR#64 review F2).
-    if ! jq -e --argjson n "$chunk_len" '
-      (.results | type == "array") and (.results | length == $n)
-      and ([.results[]
-            | (type == "object")
-              and ((has("vulns") | not)
-                   or (.vulns | (type == "array")
-                       and ([.[] | (type == "object")
-                             and ((.id? | type) == "string")
-                             and (.id | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))
-                             and ((.id | test("[\\n\\r]")) | not)] | all)))
-              and ((has("next_page_token") | not)
-                   or (.next_page_token | (type == "string") and (length > 0)
-                       and test("^[[:graph:]]+$")))
-           ] | all)
-    ' "$scratch/batch.json" >/dev/null 2>&1; then
+    if ! scanner_batch_response_valid "$scratch/batch.json" "$chunk_len"; then
       printf 'safe audit: scanner-batch: malformed OSV batch response — audit-infrastructure breakage, not a package finding\n' >&2
       return 4
     fi
@@ -10938,17 +11020,7 @@ scanner_batch_command() {
       printf 'safe audit: scanner-batch: OSV pagination re-query failed for %s — audit-infrastructure breakage, not a package finding\n' "$pkg_name" >&2
       return 4
     fi
-    # The paginated helper only guarantees vulns is an array; the entries
-    # replace ALREADY-VALIDATED batch results, so the same id schema must
-    # hold or a numeric/null id rides past the upfront guard as a
-    # stringified warning (PR#64 delta F11).
-    if ! jq -e '
-      (.vulns // []) | (type == "array")
-      and ([.[] | (type == "object")
-            and ((.id? | type) == "string")
-            and (.id | test("^[A-Za-z0-9][A-Za-z0-9._-]*$"))
-            and ((.id | test("[\\n\\r]")) | not)] | all)
-    ' "$pagefile" >/dev/null 2>&1; then
+    if ! scanner_batch_page_valid "$pagefile"; then
       printf 'safe audit: scanner-batch: malformed paginated OSV response for %s — audit-infrastructure breakage, not a package finding\n' "$pkg_name" >&2
       return 4
     fi
@@ -10967,46 +11039,21 @@ scanner_batch_command() {
   # MAL-* ids are known-malware and need no fetch. Everything else is
   # fetched once per distinct id, the record validated as the advisory it
   # claims to be, and classified by the SAME most-severe-candidate-wins
-  # ladder package_audit_command uses (qualitative labels + every CVSS v3/v4
-  # vector) — the legacy substring matcher read a raw "CVSS:3.1/..." vector
-  # as "low" and downgraded criticals to warn (PR#64 review F1). A record
-  # that cannot be parsed is infrastructure breakage, never an
-  # unknown-severity finding (PR#64 review F3).
+  # ladder package_audit_command uses. A record that cannot be parsed is
+  # infrastructure breakage, never an unknown-severity finding (PR#64
+  # review F3).
   local sev_map='{}' label pkg_ref
   while IFS= read -r id; do
     if ! curl -fsS --max-time 8 "https://api.osv.dev/v1/vulns/$id" > "$scratch/vuln.json"; then
       printf 'safe audit: scanner-batch: OSV advisory fetch failed (%s) — audit-infrastructure breakage, not a package finding; check connectivity or run safe doctor\n' "$id" >&2
       return 4
     fi
-    # Exactly one JSON document (a stream validates on its tail while the
-    # extraction below concatenates one value per document — PR#64 delta
-    # F10), an object, and a STRING id equal to the request (tostring let a
-    # numeric 42 impersonate "42" — delta re-check F3).
-    if ! jq -es 'length == 1' "$scratch/vuln.json" >/dev/null 2>&1 \
-      || ! jq -e --arg id "$id" '(type == "object") and ((.id? | type) == "string") and (.id == $id)' \
-        "$scratch/vuln.json" >/dev/null 2>&1; then
+    if ! scanner_batch_detail_valid "$scratch/vuln.json" "$id"; then
       printf 'safe audit: scanner-batch: OSV advisory record malformed (%s) — audit-infrastructure breakage, not a package finding\n' "$id" >&2
       return 4
     fi
-    # Severity is scoped per QUERIED package, exactly as package_audit_command
-    # scopes vuln_sev to matching_affected: whole-record aggregation
-    # imported another affected package's critical into this package's
-    # verdict (PR#64 delta F12). Top-level severity and
-    # database_specific.severity stay record-global, as in check.
     while IFS= read -r pkg_ref; do
-      if ! label=$(jq -r --arg name "$pkg_ref" "$JQ_SEVERITY_DEFS"'
-        [ .affected[]? | select(((.package.ecosystem // "") == "npm") and ((.package.name // "") == $name)) ] as $aff
-        | (
-            [ .database_specific.severity? // empty | norm_qual ]
-            + [ ((.severity // []) + ([ $aff[].severity? // empty ] | add // []))[]
-                | select(.type == "CVSS_V3") | (.score // empty) | cvss3_band ]
-            + [ ((.severity // []) + ([ $aff[].severity? // empty ] | add // []))[]
-                | select(.type == "CVSS_V4")
-                | ((try ((.score // "") | cvss4_band) catch empty) // "high") ]
-            + [ $aff[].ecosystem_specific.severity? // empty | norm_qual ]
-          ) as $cands
-        | if ($cands | length) > 0 then ($cands | max_by(band_rank(.))) else "unknown" end
-      ' "$scratch/vuln.json" 2>/dev/null) || [[ -z "$label" ]]; then
+      if ! label=$(scanner_batch_detail_label "$scratch/vuln.json" "$pkg_ref"); then
         printf 'safe audit: scanner-batch: OSV advisory severity unreadable (%s) — audit-infrastructure breakage, not a package finding\n' "$id" >&2
         return 4
       fi
@@ -11020,7 +11067,7 @@ scanner_batch_command() {
   # blocklist-class malware: fatal unconditionally, never severity-policy
   # business.
   local block_severities
-  block_severities=$(install_policy_json | jq -c '[(.block_severities // ["critical"])[] | tostring | ascii_downcase | if . == "medium" then "moderate" else . end]')
+  block_severities=$(scanner_batch_block_severities)
   # Guarded: an assembly failure (including a missing severity entry, which
   # error() turns into one) must never fall through to printing the
   # blocklist-only accumulator as the complete answer.
@@ -11042,6 +11089,164 @@ scanner_batch_command() {
     return 4
   fi
   printf '%s\n' "$advisories"
+}
+
+# Structured evidence mode of the OSV batch path (project lane, spec 1625).
+#
+# stdin is the batch's own input. The answer is one document,
+#
+#   {"schema_version":1,
+#    "policy":{"block_severities":[…]},
+#    "identities":[{"name","version","coverage":"complete"|"missing","gap",
+#                   "advisories":[{"id","severity","malware"}]}],
+#    "blocklist":[{"name","reason"}]}
+#
+# that keeps each validated answer and its coverage apart per exact identity:
+#
+#   - a failed chunk (transport, malformed answer) marks only its identities
+#     missing; the other chunks' hits stay;
+#   - a failed pagination re-query keeps the page that WAS validated and marks
+#     the identity missing — a partial reading is never presented as complete;
+#   - a failed or malformed advisory detail drops only that advisory from the
+#     hit list (its severity is unknown, not guessed) and marks every identity
+#     carrying it missing, naming the id;
+#   - a malformed answer is never read as empty: it is a gap;
+#   - MAL-* records keep the identity (name AND version) they affect, flagged
+#     malware, severity critical — never severity-policy business;
+#   - the blocklist is read by name over the whole input and reported on its
+#     own, independently of every OSV outcome; deciding that a hit gates (it
+#     does not when the package is not in the graph the command installs) is
+#     the decision's, not this reader's.
+#
+# The document carries no verdict and no acceptances: those are the decision
+# layer's (safe-core project-decide). Exit 0 with a document, even when some
+# identities are missing; 2 malformed input; 4 when no document can be
+# trusted at all (scratch, unreadable blocklist, assembly failure).
+scanner_batch_evidence_command() {
+  local input="$1" scratch
+  new_scratch_dir scratch || {
+    printf 'safe audit: scanner-batch: could not create scratch dir\n' >&2
+    return 4
+  }
+  if ! blocklist_authority_readable; then
+    printf 'safe audit: scanner-batch: blocklist file unreadable (%s) — local audit-infrastructure breakage, not a package finding; repair or remove the file\n' "$BLOCKLIST_UNREADABLE_FILE" >&2
+    return 4
+  fi
+
+  local pkgs name reason blocklist='[]'
+  pkgs=$(jq -c '[.packages[] | {name, version}] | unique' <<<"$input")
+  while IFS= read -r name; do
+    if reason=$(blocked_entry_reason "$name"); then
+      blocklist=$(jq -c --arg n "$name" --arg r "$reason" '. + [{name: $n, reason: $r}]' <<<"$blocklist")
+    fi
+  done < <(jq -r '.[].name' <<<"$pkgs" | sort -u)
+
+  # paired: one {pkg, res, gaps} per identity, in input order. gaps collects
+  # every reason the identity's reading is incomplete.
+  local total chunk_start chunk chunk_len body paired='[]' gap
+  total=$(jq 'length' <<<"$pkgs")
+  chunk_start=0
+  while (( chunk_start < total )); do
+    chunk=$(jq -c --argjson s "$chunk_start" '.[$s:$s+100]' <<<"$pkgs")
+    chunk_len=$(jq 'length' <<<"$chunk")
+    body=$(jq -c '{queries: [.[] | {package: {ecosystem: "npm", name: .name}, version: .version}]}' <<<"$chunk")
+    gap=""
+    if ! curl -fsS --max-time 10 https://api.osv.dev/v1/querybatch \
+      -H 'content-type: application/json' -d "$body" > "$scratch/batch.json"; then
+      gap="OSV batch query failed (network/timeout/HTTP error)"
+    elif ! scanner_batch_single_document "$scratch/batch.json"; then
+      gap="malformed OSV batch response (not a single JSON document)"
+    elif ! scanner_batch_response_valid "$scratch/batch.json" "$chunk_len"; then
+      gap="malformed OSV batch response"
+    fi
+    if [[ -n "$gap" ]]; then
+      paired=$(jq -cn --argjson acc "$paired" --argjson chunk "$chunk" --arg gap "$gap" \
+        '$acc + ($chunk | map({pkg: ., res: {vulns: []}, gaps: [$gap]}))')
+    else
+      paired=$(jq -cn --argjson acc "$paired" --argjson chunk "$chunk" --slurpfile b "$scratch/batch.json" \
+        '$acc + ([$chunk, $b[0].results] | transpose | map({pkg: .[0], res: .[1], gaps: []}))')
+    fi
+    chunk_start=$((chunk_start + 100))
+  done
+
+  # A truncated page keeps the validated first page when its re-query fails.
+  local idx pkg_name pkg_version pagefile
+  while IFS= read -r idx; do
+    pkg_name=$(jq -r --argjson i "$idx" '.[$i].pkg.name' <<<"$paired")
+    pkg_version=$(jq -r --argjson i "$idx" '.[$i].pkg.version' <<<"$paired")
+    pagefile="$scratch/paged-$idx.json"
+    gap=""
+    osv_query_package_json npm "$pkg_name" "$pkg_version" "$pagefile"
+    if ! jq -e '.status? != "error"' "$pagefile" >/dev/null 2>&1; then
+      gap="OSV pagination re-query failed"
+    elif ! scanner_batch_page_valid "$pagefile"; then
+      gap="malformed paginated OSV response"
+    fi
+    if [[ -n "$gap" ]]; then
+      paired=$(jq -c --argjson i "$idx" --arg gap "$gap" \
+        '.[$i].res = {vulns: (.[$i].res.vulns // [])} | .[$i].gaps += [$gap]' <<<"$paired")
+    else
+      paired=$(jq -c --argjson i "$idx" --slurpfile p "$pagefile" \
+        '.[$i].res = {vulns: ($p[0].vulns // [])}' <<<"$paired")
+    fi
+  done < <(jq -r 'to_entries[] | select(.value.res.next_page_token? | strings | length > 0) | .key' <<<"$paired")
+
+  # Severity per (advisory, queried package); an advisory whose record cannot
+  # be fetched, validated or classified is recorded in `failed` with the
+  # reason, and is neither guessed at nor dropped silently.
+  local sev_map='{}' failed_map='{}' label pkg_ref id
+  while IFS= read -r id; do
+    if ! curl -fsS --max-time 8 "https://api.osv.dev/v1/vulns/$id" > "$scratch/vuln.json"; then
+      failed_map=$(jq -c --arg id "$id" '. + {($id): "OSV advisory fetch failed"}' <<<"$failed_map")
+      continue
+    fi
+    if ! scanner_batch_detail_valid "$scratch/vuln.json" "$id"; then
+      failed_map=$(jq -c --arg id "$id" '. + {($id): "OSV advisory record malformed"}' <<<"$failed_map")
+      continue
+    fi
+    while IFS= read -r pkg_ref; do
+      if label=$(scanner_batch_detail_label "$scratch/vuln.json" "$pkg_ref"); then
+        sev_map=$(jq -c --arg k "${id}|${pkg_ref}" --arg l "$label" '. + {($k): $l}' <<<"$sev_map")
+      else
+        failed_map=$(jq -c --arg k "${id}|${pkg_ref}" '. + {($k): "OSV advisory severity unreadable"}' <<<"$failed_map")
+      fi
+    done < <(jq -r --arg id "$id" \
+      '[.[] | select([.res.vulns[]? | .id] | index($id)) | .pkg.name] | unique | .[]' <<<"$paired")
+  done < <(jq -r '[.[].res.vulns[]? | .id | strings | select(test("^MAL-") | not)] | unique | .[]' <<<"$paired")
+
+  local block_severities document
+  block_severities=$(scanner_batch_block_severities)
+  if ! document=$(jq -cn \
+    --argjson paired "$paired" --argjson sev "$sev_map" --argjson failed "$failed_map" \
+    --argjson block "$block_severities" --argjson blocklist "$blocklist" '
+    def hit($p):
+      .id as $id
+      | if ($id | test("^MAL-")) then {id: $id, severity: "critical", malware: true}
+        elif $sev[$id + "|" + $p.name] then {id: $id, severity: $sev[$id + "|" + $p.name], malware: false}
+        else empty end;
+    {schema_version: 1,
+     policy: {block_severities: $block},
+     identities: [ $paired[] | .pkg as $p
+       | ([.res.vulns[]? | .id as $id
+           | ($failed[$id] // $failed[$id + "|" + $p.name]) as $why
+           | select($why != null and ($id | test("^MAL-") | not))
+           | ($id + ": " + $why)]) as $lost
+       | ((.gaps + $lost) | unique) as $gaps
+       | {name: $p.name, version: $p.version,
+          coverage: (if ($gaps | length) == 0 then "complete" else "missing" end),
+          gap: ($gaps | join("; ")),
+          advisories: ([.res.vulns[]? | hit($p)] | unique_by(.id) | sort_by(.id))} ],
+     blocklist: $blocklist}' 2>/dev/null); then
+    printf 'safe audit: scanner-batch: evidence assembly failed — audit-infrastructure breakage, not a package finding\n' >&2
+    return 4
+  fi
+  local missing
+  missing=$(jq '[.identities[] | select(.coverage == "missing")] | length' <<<"$document")
+  if (( missing > 0 )); then
+    printf 'safe audit: scanner-batch: %s of %s identities not fully read — audit-infrastructure breakage, not a package finding; the evidence document names each gap\n' \
+      "$missing" "$(jq '.identities | length' <<<"$document")" >&2
+  fi
+  printf '%s\n' "$document"
 }
 
 fetch_osv_vuln() {
@@ -11943,6 +12148,7 @@ USAGE
   safe audit tools-scan [--publish [--out <file>]] [--host <name>]
 
   safe audit scanner-batch   (stdin: {"packages":[{"name","version"},…]} — Bun scanner API backend)
+  safe audit scanner-batch --evidence   (same stdin — per-identity advisory evidence with coverage, for the project lane)
   safe audit lockfile-support [--json]   (which lockfile formats the installed osv-scanner still reads)
   safe audit ioc <identifier> [--all | --machine <csv>]
   safe audit ioc --list <ioc.json> [--all | --machine <csv>]

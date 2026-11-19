@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Project-lane judging core, groundwork only: no installed gate calls it yet and
+  nothing about an install command changes. `safe-core` gains `project-graph`
+  (an npm lockfile's artifact graph and whether safe can bind every artifact),
+  `project-diff` (what a target lockfile introduces over a baseline, with the
+  exact identities an advisory reading must cover) and `project-decide` (the
+  decision report over two lockfiles and a strict, versioned evidence document:
+  malice, blocking advisory, adverse advisory and missing evidence, with their
+  precedence and standing acceptances). `safe audit scanner-batch --evidence`
+  is the structured mode of the OSV batch path that feeds it: each validated
+  answer and its coverage per exact identity, kept when a later chunk, page or
+  detail fails; the plain batch output is unchanged. Spec: Safe Lanes slice 1.
+
 ## 1.75.0 - 2026-11-18
 
 - A project scan with no verdict is one terminus (operator ruling 2026-11-17).
