@@ -7959,7 +7959,7 @@ case_project_lane_clean_add_in_a_project_with_findings_passes() {
   assert_err_contains_fragment '1 already present (highest: critical)' "$FUNCNAME" || return
   assert_err_contains_fragment 'install scripts are declared by clean@2.0.0, vuln@1.0.0' "$FUNCNAME" || return
   assert_err_contains_fragment 'scripts do not run on this lane yet' "$FUNCNAME" || return
-  grep -qP '^PROJECTION\tnpm\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund\t--git=/bin/false\t--allow-git=none\t--cache=\S+\t--logs-dir=\S+\t--logs-max=0\t--replace-registry-host=never\tinstall\tclean@2.0.0$' "${LOG_FILE}" || { fail "$FUNCNAME: the projection's command line"; return; }
+  grep -qP '^PROJECTION\tnpm\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund\t--git=/bin/false\t--allow-git=none\t--cache=\S+\t--logs-dir=\S+\t--logs-max=0\t--replace-registry-host=never\t--update-notifier=false\tinstall\tclean@2.0.0$' "${LOG_FILE}" || { fail "$FUNCNAME: the projection's command line"; return; }
   assert_log_not_contains_fragment $'REAL\tnpm\tinstall' "$FUNCNAME" || return
   [[ "$(cat "${WORK_DIR}/package.json")" == "${LANE_CLEAN_ADD_MANIFEST}" ]] || { fail "$FUNCNAME: manifest is not the judged one"; return; }
   [[ "$(cat "${WORK_DIR}/package-lock.json")" == "${target}" ]] || { fail "$FUNCNAME: lockfile is not the judged one"; return; }
@@ -9508,15 +9508,20 @@ case_project_lane_one_renderer_for_every_child_diagnostic() {
   pass "$FUNCNAME"
 }
 
-# 8. A signal to the shell in the window right after the binder starts is held
-# until the binder has finished, never ends the command with the child outstanding.
-case_project_lane_a_signal_in_the_window_after_spawn_is_held() {
+# 7. A cancellation that reaches the binder before it has produced any document (it is
+# killed by the forwarded signal at start-up) is an interruption of the command: 128 plus
+# the signal, one final line saying so, the project as it was, nothing left behind.
+case_project_lane_a_binder_killed_at_start_up_is_an_interruption() {
   skip_lockdiff_case "$FUNCNAME" || return
   lane_prepare "lane-signal-early" kept@1.0.0
+  local before
+  before="$(lane_digests)"
   SAFE_CORE_SIGNAL_EARLY=1 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" \
     lane_run 'npm install clean@2.0.0'
-  assert_status 0 "$FUNCNAME" || return
-  [[ -f "${WORK_DIR}/node_modules/clean/package.json" ]] || { fail "$FUNCNAME: the binder did not finish"; return; }
+  assert_status 143 "$FUNCNAME" || return
+  assert_lane_final_line install "$FUNCNAME" || return
+  assert_err_contains_fragment 'interrupted before the binder reported anything' "$FUNCNAME" || return
+  assert_lane_untouched "${before}" "$FUNCNAME" || return
   assert_lane_no_leftover "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
@@ -9954,7 +9959,7 @@ main() {
     case_project_lane_the_selected_npms_parser_must_agree \
     case_project_lane_the_consumed_fields_of_every_document_are_checked \
     case_project_lane_one_renderer_for_every_child_diagnostic \
-    case_project_lane_a_signal_in_the_window_after_spawn_is_held \
+    case_project_lane_a_binder_killed_at_start_up_is_an_interruption \
     case_project_lane_a_known_block_outranks_an_unsupported_dependency_edge \
     case_project_lane_config_selectors_in_the_arguments_refuse_before_any_npm \
     case_project_lane_environment_destinations_are_compared_after_npms_trimming \
