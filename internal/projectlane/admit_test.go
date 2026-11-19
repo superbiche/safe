@@ -177,8 +177,9 @@ func TestSpellingsFixtureIsClassifiable(t *testing.T) {
 	rows := 0
 	for scanner.Scan() {
 		rows++
-		_ = ClassifySpec(scanner.Text())
-		_, _, _ = ClassifyArg(scanner.Text())
+		text := strings.NewReplacer(`\s`, " ", `\t`, "\t").Replace(scanner.Text())
+		_ = ClassifySpec(text)
+		_, _, _ = ClassifyArg(text)
 	}
 	if rows < 100 {
 		t.Fatalf("the spellings table has %d rows", rows)

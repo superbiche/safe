@@ -792,7 +792,6 @@ prepare_case() {
   write_node_stub "${NODE_BIN}"
   cp "${BIN_DIR}/npm" "${NODE_BIN}/npm"
   cp "${BIN_DIR}/npm" "${NODE_DIR}/lib/node_modules/npm/bin/npm-cli.js"
-  rm -f "${BIN_DIR}/npm"
 
   # The real dispatcher: `safe gate` is under test, so nothing about it is
   # stubbed. Only safe-audit is (via SAFE_AUDIT_PATH, see run_zsh).

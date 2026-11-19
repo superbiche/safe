@@ -73,7 +73,9 @@ safe_core_test_prepare "${ROOT}" "${WORK}/safe-core" || { printf 'SKIP: safe-cor
 # The spellings: the table, and variants of each.
 python3 -I - "${ROOT}/tests/fixtures/admit-spellings.txt" > "${WORK}/spellings.bin" <<'PY' || { printf 'SKIP: python3 unavailable\n'; exit 0; }
 import sys
-rows = [l.rstrip("\n") for l in open(sys.argv[1], encoding="utf-8")]
+# \s is a space and \t a tab: written out so that the fixture carries no trailing
+# whitespace (git diff --check) while the spellings do.
+rows = [l.rstrip("\n").replace("\\s", " ").replace("\\t", "\t") for l in open(sys.argv[1], encoding="utf-8")]
 out = []
 names = ["a", "A", "a-b", "a.b", "a_b", ".a", "_a", "a b", " a", "a ", "@s/a", "@s/.a", "@s/_a", "@s/-a", "-a", "@-s/a", "@s/", "@/a", "@s/a/b", "a/b", "node_modules", "favicon.ico",
          "a~b", "a'b", "a(b)", "a*b", "a!b", "a%b", "a@b", "é", "x" * 214, "x" * 215, "@" + "s" * 100 + "/" + "a" * 100,
