@@ -219,6 +219,9 @@ var (
 func validPackageName(name string) bool { return len(name) <= 214 && npmName.MatchString(name) }
 func validVersion(version string) bool  { return semverText.MatchString(version) }
 
+// ExactVersion reports whether the WHOLE string is an exact semantic version.
+func ExactVersion(version string) bool { return validVersion(version) }
+
 // canonicalTarball reports whether resolved, AS WRITTEN in the lockfile, is
 // exactly the registry tarball location of name@version on an expected host:
 //

@@ -27,15 +27,18 @@ import (
 // a property of the content and of the judgement it went through, not of when it was
 // written.
 //
-// A record is trusted ONLY when the bytes read hash to the digest it is stored under
+// A record is a baseline ONLY when the lockfile on disk is byte-identical to it: nothing
+// ever picks "the most recent one" (an unpublished plan must not stand for what the project
+// carried). A record is trusted ONLY when the bytes read hash to the digest it is stored under
 // and it is a regular file of mode exactly 0600 owned by the user. Anything else is
 // IGNORED (and named, so it can be reported once): ignoring a record can only make more
 // of the graph be judged. The chain of directories is outside the project, held by
 // descriptor, owned by the user, not writable by group or others and never a link.
-// Writing is atomic (a private temporary name, renamed into place); writing a record
-// that already exists is a no-op that refreshes its time (its modification time is the
-// order records are kept in). A bounded number of the most recent records is kept per
-// project and name: older ones are pruned when one is written.
+// Writing is atomic (a private temporary name, renamed into place); writing a record that
+// already exists is a no-op that refreshes its modification time. A bounded number of
+// records is kept per project and name: older ones (by modification time, the entry being
+// written counted) are pruned when one is written, best effort: a pruning that fails or goes
+// wrong only makes more of the graph be judged, and is not an error.
 
 const (
 	baselineDir     = "project-baseline"
@@ -180,7 +183,8 @@ func RecordBaseline(stateDir, project, name string, content []byte, keep int) er
 			return ferr
 		}
 	}
-	return prune(dir, keep, digest)
+	prune(dir, keep, digest)
+	return nil
 }
 
 type recordInfo struct {
@@ -213,22 +217,40 @@ func listRecords(dir *dirHandle) ([]recordInfo, error) {
 	return out, nil
 }
 
-// prune removes the records beyond the keep most recent; the one just written stays.
-func prune(dir *dirHandle, keep int, keepDigest string) error {
+// prune removes the records beyond the keep most recent by modification time, the entry
+// just written counted among them (so the bound holds). Best effort: never an error.
+func prune(dir *dirHandle, keep int, written string) {
 	records, err := listRecords(dir)
 	if err != nil {
-		return err
+		return
 	}
-	for i, record := range records {
-		if i < keep || record.digest == keepDigest {
+	kept := 0
+	if _, ok := indexOf(records, written); ok {
+		kept = 1 // the entry being written takes its place whatever its time says
+	}
+	for _, record := range records {
+		if record.digest == written {
+			continue
+		}
+		if kept < keep {
+			kept++
 			continue
 		}
 		_ = dir.remove(record.digest)
 	}
-	return nil
 }
 
-// ReadRecorded returns the recorded lockfile stored under digest, when trusted.
+func indexOf(records []recordInfo, digest string) (int, bool) {
+	for i, record := range records {
+		if record.digest == digest {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// ReadRecorded returns the recorded lockfile stored under digest, when trusted. found false
+// with no error: there is no (trusted) record under that digest.
 func ReadRecorded(stateDir, project, name, digest string) (content []byte, found bool, ignored []Ignored, err error) {
 	if !recordDigest.MatchString(digest) {
 		return nil, false, nil, errors.New("not a sha256 digest")
@@ -246,28 +268,6 @@ func ReadRecorded(stateDir, project, name, digest string) (content []byte, found
 		return nil, false, []Ignored{{digest, why}}, nil
 	}
 	return raw, true, nil, nil
-}
-
-// LatestRecorded returns the most recently written trusted record.
-func LatestRecorded(stateDir, project, name string) (content []byte, found bool, ignored []Ignored, err error) {
-	dir, derr := recordDir(stateDir, project, name, false)
-	if derr != nil {
-		return nil, false, notTrusted(derr), nil
-	}
-	defer dir.Close()
-	records, lerr := listRecords(dir)
-	if lerr != nil {
-		return nil, false, []Ignored{{"", lerr.Error()}}, nil
-	}
-	for _, record := range records {
-		raw, why := readTrusted(dir, record.digest)
-		if why != "" {
-			ignored = append(ignored, Ignored{record.digest, why})
-			continue
-		}
-		return raw, true, ignored, nil
-	}
-	return nil, false, ignored, nil
 }
 
 // A directory that is simply not there means nothing was recorded; any other failure

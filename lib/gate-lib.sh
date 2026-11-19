@@ -3340,7 +3340,10 @@ safe_gate_project_lane_private_names() {
     safe_gate_project_lane_unsupported "${verb}" "a package name that cannot be matched against the private-registry store"
     return $?
   fi
-  matches="$(jq -r -s '.[0].names[]' "${names_doc}" 2>/dev/null | "${SAFE_GATE_LANE_CORE}" private-trust match-names --ecosystem npm \
+  # For the purpose of REFUSING only, every name is also compared case-folded (the store holds
+  # lowercase namespaces, npm's graph and manifests accept other spellings): this matcher is the
+  # one every call site uses, the first one (before any npm run) included. No grant is widened.
+  matches="$(jq -r -s '.[0].names | map(., ascii_downcase) | unique | .[]' "${names_doc}" 2>/dev/null | "${SAFE_GATE_LANE_CORE}" private-trust match-names --ecosystem npm \
     --policy "$(safe_gate_trust_store_file private-registries.json)" \
     --follow-state "$(safe_gate_trust_store_file private-follow-state.json)" \
     --config "$(safe_gate_trust_store_file config.json)" 2>/dev/null)" || matches=""
@@ -3506,8 +3509,18 @@ safe_gate_project_lane_run() {
   lane_sub="${verb} [lane: project]"
 
   # --- 1. route: the runtime, then npm's own word on global --------------------
-  if ! project_dir="$(cd -- "." 2>/dev/null && pwd -P)"; then
+  # The physical path is captured byte for byte: command substitution strips EVERY trailing
+  # newline, which could turn a directory into its sibling. One newline (the one pwd adds) is
+  # removed; a path with another newline in it cannot be captured exactly and refuses, before
+  # anything is opened, locked or recorded.
+  if ! project_dir="$(cd -- "." 2>/dev/null && pwd -P && printf x)"; then
     safe_gate_project_lane_refuse 100 "${verb}" "the project directory cannot be read" "retry from the project root"
+    return $?
+  fi
+  project_dir="${project_dir%x}"
+  project_dir="${project_dir%$'\n'}"
+  if [[ "${project_dir}" == *$'\n'* ]]; then
+    safe_gate_project_lane_refuse 100 "${verb}" "the project's path contains a newline, so it cannot be captured exactly (it could name a sibling directory)" "run the command from a directory whose path has no newline"
     return $?
   fi
   # safe's own storage, and the scratch, are outside the project: nothing of
@@ -3768,48 +3781,47 @@ safe_gate_project_lane_run() {
   state_dir="${lane_dir}/state"
 
   # --- the baseline -------------------------------------------------------------
-  # safe keeps, per project path, the lockfiles it judged clear on complete evidence
-  # (each stored under its own digest; see docs/configuration.md). The lockfile on disk
-  # is the baseline when it is byte-identical to the committed one or to a recorded one
-  # (whenever and however it came to be on disk, as an old commit checked out would).
-  # Otherwise the baseline is the committed lockfile, else the most recently recorded
-  # one, else empty, and what the lockfile on disk adds is introduced (its entries are in
-  # the target the decision runs on, against that baseline). A COMMITTED lockfile that
-  # exists and cannot be read is missing evidence (102), never an empty baseline; a
-  # recorded one that cannot be trusted is ignored (and named once): ignoring a record
-  # only makes more of the graph be judged.
-  local baseline_kind="empty" baseline_file="" disk_is_baseline=0 have_committed=0
-  local committed_file="${scratch}/baseline-committed.json" recorded_file="${scratch}/baseline-recorded.json"
+  # safe keeps, per project path, the lockfiles it judged clear on complete evidence (each
+  # stored under its own digest; see docs/configuration.md). A record is a baseline ONLY when
+  # the lockfile on disk is byte-identical to it (whenever and however it came to be there, as
+  # an old commit checked out would): nothing ever falls back to "the most recent record", which
+  # could be a plan whose installation failed. The rule: the committed lockfile is read first
+  # (a present one must DECODE: missing evidence otherwise, whatever the disk holds); the
+  # lockfile on disk byte-identical to it is `committed`; else, its digest naming a trusted
+  # record, `recorded`; else the baseline is the committed lockfile, else empty, and what the
+  # lockfile on disk adds is introduced (its entries are in the target the decision runs on).
+  # A recorded one that cannot be trusted is ignored (and named): it is no match.
+  local baseline_kind="empty" baseline_file="" disk_is_baseline=0 have_committed=0 ignored_note=""
+  local committed_file="${scratch}/baseline-committed.json"
   local -a baseline_args=(--no-baseline)
   local -a record_args=(--state-dir "${state_dir}" --project "${project_dir}" --name package-lock.json)
   rc=0
   safe_gate_project_lane_committed "${project_dir}" "${committed_file}" || rc=$?
   if (( rc == 0 )); then
     have_committed=1
+    if ! jq -e . "${committed_file}" >/dev/null 2>&1; then
+      safe_gate_project_lane_refuse 102 "${verb}" "the committed lockfile cannot be parsed, so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the lockfile and retry"
+      return $?
+    fi
   elif (( rc == 2 )); then
     safe_gate_project_lane_refuse 102 "${verb}" "the committed lockfile cannot be read (${SAFE_GATE_LANE_REASON}), so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the repository and retry"
     return $?
   fi
-  local ignored_seen=0
-  safe_gate_project_lane_recorded_note() { # relays what the store ignored, once
-    local line
-    while IFS= read -r line; do
-      [[ "${line}" == *"ignored record"* ]] || continue
-      (( ignored_seen )) || safe_gate_err "safe: project lane: $(safe_gate_lane_clean "${line#safe-core: project-baseline: }") (it is not trusted, so more of the graph is judged)"
-      ignored_seen=1
-    done <"${scratch}/baseline.err"
-  }
   if (( disk_lock && have_committed )) && cmp -s -- "${committed_file}" "${snap}/package-lock.json"; then
     baseline_kind="committed"
     baseline_file="${snap}/package-lock.json"
     disk_is_baseline=1
   else
-    rc=0
+    rc=4
     if (( disk_lock )); then
-      "${safe_core}" project-baseline read "${record_args[@]}" --digest "${lock_sum#sha256:}" --out "${recorded_file}" >/dev/null 2>"${scratch}/baseline.err" || rc=$?
-      safe_gate_project_lane_recorded_note
-    else
-      rc=4
+      # only the match is asked (nothing is written to scratch): the bytes are the disk's own
+      rc=0
+      "${safe_core}" project-baseline read "${record_args[@]}" --digest "${lock_sum#sha256:}" >/dev/null 2>"${scratch}/baseline.err" || rc=$?
+      ignored_note="$(grep -m1 'ignored record' "${scratch}/baseline.err" 2>/dev/null)" || ignored_note=""
+      if (( rc != 0 && rc != 4 )); then
+        safe_gate_project_lane_refuse 102 "${verb}" "the recorded baselines cannot be consulted (audit-infrastructure breakage, not a package finding)" "run safe doctor and retry"
+        return $?
+      fi
     fi
     if (( rc == 0 )); then
       baseline_kind="recorded"
@@ -3818,15 +3830,10 @@ safe_gate_project_lane_run() {
     elif (( have_committed )); then
       baseline_kind="committed"
       baseline_file="${committed_file}"
-    else
-      rc=0
-      "${safe_core}" project-baseline read "${record_args[@]}" --latest --out "${recorded_file}" >/dev/null 2>"${scratch}/baseline.err" || rc=$?
-      safe_gate_project_lane_recorded_note
-      if (( rc == 0 )); then
-        baseline_kind="recorded"
-        baseline_file="${recorded_file}"
-      fi
     fi
+  fi
+  if [[ -n "${ignored_note}" ]]; then
+    safe_gate_err "safe: project lane: $(safe_gate_lane_clean "${ignored_note#safe-core: project-baseline: }"); the lockfile on disk is therefore not a recorded baseline, and the baseline used instead is the ${baseline_kind} one"
   fi
   [[ -z "${baseline_file}" ]] || baseline_args=(--baseline "${baseline_file}")
   # What is read must decode, and be a version the lane binds, whichever it is.
@@ -4058,11 +4065,11 @@ safe_gate_project_lane_run() {
   # No private name goes to a public advisory service: the matcher runs over the identities
   # of the request itself, the baseline side included (a name only the baseline carries is
   # in the request when the command drops it), before anything is sent.
-  # Every identity in it has an exact version (the grammar of bind.go validVersion, a bundled
-  # member's included): a version string is sent verbatim and could name something else. For
+  # Every identity in it has an exact version (the whole string, checked by safe-core with the
+  # binder's own grammar, a bundled member's included): a version string is sent verbatim and could name something else. For
   # the purpose of REFUSING only, names are compared case-folded as well (the store holds
   # lowercase namespaces; npm's graph admits other spellings); no grant is widened by it.
-  if ! jq -e '[.packages[] | .version | type == "string" and test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$")] | all' <<<"${request}" >/dev/null 2>&1; then
+  if ! "${safe_core}" exact-versions <<<"${request}" >/dev/null 2>&1; then
     safe_gate_project_lane_unsupported "${verb}" "a package in the evidence request whose version is not an exact version"
     return $?
   fi
@@ -4116,10 +4123,13 @@ safe_gate_project_lane_run() {
   if (( disk_lock && ! disk_is_baseline )); then
     local disk_json="" disk_count=""
     disk_json="$("${safe_core}" project-diff "${baseline_args[@]}" "${snap}/package-lock.json" 2>/dev/null)" \
-      && jq '.difference.introduced' <<<"${disk_json}" >"${scratch}/disk-introduced.json" 2>/dev/null \
+      && jq --slurpfile g "${scratch}/target-graph.json" '
+           ([$g[0].graph.occurrences[] | [.name, .version, .origin, .integrity]]) as $target
+           | .difference.introduced | map(select([.name, .version, .origin, .integrity] as $k | any($target[]; . == $k)))' \
+           <<<"${disk_json}" >"${scratch}/disk-introduced.json" 2>/dev/null \
       && disk_count="$(jq -r 'length' "${scratch}/disk-introduced.json" 2>/dev/null)"
     if [[ "${disk_count}" =~ ^[0-9]+$ ]]; then
-      safe_gate_err "safe: project lane: the lockfile on disk is not the baseline: ${disk_count} entries added on disk were judged as introduced"
+      safe_gate_err "safe: project lane: the lockfile on disk is not the baseline: ${disk_count} entries added on disk and kept in the judged target were judged as introduced"
     else
       safe_gate_project_lane_refuse 102 "${verb}" "the lockfile on disk could not be compared with the baseline (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
       return $?
@@ -4341,21 +4351,21 @@ safe_gate_project_lane_git() {
   while IFS= read -r name; do
     unset_args+=(-u "${name}")
   done < <(compgen -e | grep '^GIT_' || true)
-  env ${unset_args[@]+"${unset_args[@]}"} GIT_NO_REPLACE_OBJECTS=1 GIT_NO_LAZY_FETCH=1 GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 LC_ALL=C \
-    git --no-replace-objects --no-lazy-fetch -C "${project_dir}" "$@"
+  env ${unset_args[@]+"${unset_args[@]}"} GIT_NO_REPLACE_OBJECTS=1 GIT_NO_LAZY_FETCH=1 GIT_LITERAL_PATHSPECS=1 GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 LC_ALL=C \
+    git --no-replace-objects --no-lazy-fetch --literal-pathspecs -C "${project_dir}" "$@"
 }
 
 safe_gate_lane_why() { SAFE_GATE_LANE_REASON="$1"; }
 
 # The oldest git with the no-lazy-fetch switch (`git --no-lazy-fetch`, GIT_NO_LAZY_FETCH) is
-# 2.44.0. The lane does not trust the version number alone: it PROBES the very invocation it
+# 2.45.0. The lane does not trust the version number alone: it PROBES the very invocation it
 # uses, on a command that cannot fetch, and refuses a git that does not accept it.
 # Returns 0 when this git can be bound to local-only reads.
 safe_gate_project_lane_git_local_only() {
   local project_dir="$1" version
   if ! safe_gate_project_lane_git "${project_dir}" version >/dev/null 2>&1; then
     version="$(git --version 2>/dev/null)" || version="no git"
-    safe_gate_lane_why "this git (${version}) cannot be bound to local-only reads: it does not support disabling lazy fetches (git 2.44.0 or newer is required)"
+    safe_gate_lane_why "this git (${version}) cannot be bound to local-only reads: it does not support disabling lazy fetches (git 2.45.0 or newer is required)"
     return 1
   fi
   return 0
@@ -4390,16 +4400,19 @@ safe_gate_project_lane_committed() {
   (( found )) || return 1
   safe_gate_project_lane_git_local_only "${project_dir}" || return 2
   # discovery, once
-  gitdir="$(safe_gate_project_lane_git "${project_dir}" rev-parse --absolute-git-dir 2>/dev/null)" || { safe_gate_lane_why "the git repository cannot be probed"; return 2; }
-  worktree="$(safe_gate_project_lane_git "${project_dir}" rev-parse --show-toplevel 2>/dev/null)" || { safe_gate_lane_why "the project is not in a git work tree although a .git is above it"; return 2; }
-  prefix="$(safe_gate_project_lane_git "${project_dir}" rev-parse --show-prefix 2>/dev/null)" || { safe_gate_lane_why "the project's place in the repository cannot be read"; return 2; }
-  hashlen="$(safe_gate_project_lane_git "${project_dir}" rev-parse --show-object-format 2>/dev/null)" || { safe_gate_lane_why "the repository's object format cannot be read"; return 2; }
-  case "${hashlen}" in sha1) hashlen=20 ;; sha256) hashlen=32 ;; *) safe_gate_lane_why "an object format this lane does not know"; return 2 ;; esac
-  [[ "${gitdir}" == /* && "${worktree}" == /* ]] || { safe_gate_lane_why "the repository's location cannot be pinned"; return 2; }
-  if [[ "$(realpath -- "${worktree}" 2>/dev/null)" != "$(realpath -- "${dir}" 2>/dev/null)" ]]; then
-    safe_gate_lane_why "git selected another repository (${worktree}) than the one at ${dir}, which cannot be used"
+  # discovery, in ONE git process: its four answers cannot come from two repositories
+  local -a found_fields=()
+  if ! mapfile -t found_fields < <(safe_gate_project_lane_git "${project_dir}" rev-parse --absolute-git-dir --show-toplevel --show-prefix --show-object-format 2>/dev/null) \
+      || [[ "${#found_fields[@]}" != 4 ]]; then
+    safe_gate_lane_why "the git repository cannot be probed (or its answer is not four lines)"
     return 2
   fi
+  gitdir="${found_fields[0]}"
+  worktree="${found_fields[1]}"
+  prefix="${found_fields[2]}"
+  hashlen="${found_fields[3]}"
+  case "${hashlen}" in sha1) hashlen=20 ;; sha256) hashlen=32 ;; *) safe_gate_lane_why "an object format this lane does not know"; return 2 ;; esac
+  [[ "${gitdir}" == /* && "${worktree}" == /* ]] || { safe_gate_lane_why "the repository's location cannot be pinned"; return 2; }
   repo=(--git-dir="${gitdir}" --work-tree="${worktree}")
   # from here on no command rediscovers: every one names the repository and the work tree
   g() { safe_gate_project_lane_git "${project_dir}" "${repo[@]}" "$@"; }
@@ -4427,9 +4440,16 @@ safe_gate_project_lane_committed() {
       unset -f g
       return 2
     fi
-    entry="$(tr '\0' '\n' <"${raw}")"
+    # exactly ONE entry, NUL-delimited, and its path is the one asked for (a literal path)
+    local entry_rest=""
+    { IFS= read -r -d '' entry; IFS= read -r -d '' entry_rest; } <"${raw}"
     rm -f -- "${raw}"
-    [[ -n "${entry}" ]] || { unset -f g; return 1; }
+    [[ -z "${entry}" ]] && { unset -f g; return 1; }
+    if [[ -n "${entry_rest}" ]] || [[ "${entry#*$'\t'}" != "${prefix%/}" ]]; then
+      safe_gate_lane_why "the head commit's tree did not answer with exactly the project's directory"
+      unset -f g
+      return 2
+    fi
     kind="${entry%%$'\t'*}"
     tree_sha="${kind##* }"
     kind="${kind#* }"

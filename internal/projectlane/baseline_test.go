@@ -46,9 +46,9 @@ func mustRecord(t *testing.T, state, project, content string, keep int) {
 	}
 }
 
-func TestRecordedBaselineRoundTripAndLatest(t *testing.T) {
+func TestRecordedBaselineRoundTrip(t *testing.T) {
 	state, project := baselineFx(t)
-	if _, found, ignored, err := LatestRecorded(state, project, lockName); err != nil || found || len(ignored) != 0 {
+	if _, found, ignored, err := ReadRecorded(state, project, lockName, digestHex(`{"a":1}`)); err != nil || found || len(ignored) != 0 {
 		t.Fatalf("nothing recorded: %v %v %v", found, ignored, err)
 	}
 	mustRecord(t, state, project, `{"a":1}`, BaselineKeep)
@@ -60,33 +60,43 @@ func TestRecordedBaselineRoundTripAndLatest(t *testing.T) {
 	if info.Mode() != 0o600 {
 		t.Fatalf("mode = %v", info.Mode())
 	}
-	// the digest of something never recorded
 	if _, found, _, _ := ReadRecorded(state, project, lockName, digestHex("other")); found {
 		t.Fatal("found a record that was never written")
 	}
-	// the most recently written one is the latest, and writing a known one again refreshes its time
-	past := time.Now().Add(-time.Hour)
-	_ = os.Chtimes(recordFilePath(state, project, `{"a":1}`), past, past)
+	// recording it again is a no-op that refreshes its time; a second record is its own
+	mustRecord(t, state, project, `{"a":1}`, BaselineKeep)
 	mustRecord(t, state, project, `{"b":2}`, BaselineKeep)
-	if got, _, _, _ := LatestRecorded(state, project, lockName); string(got) != `{"b":2}` {
-		t.Fatalf("latest = %q", got)
-	}
-	_ = os.Chtimes(recordFilePath(state, project, `{"b":2}`), past.Add(-time.Hour), past.Add(-time.Hour))
-	mustRecord(t, state, project, `{"a":1}`, BaselineKeep) // a no-op that refreshes its time
-	if got, _, _, _ := LatestRecorded(state, project, lockName); string(got) != `{"a":1}` {
-		t.Fatalf("latest after refresh = %q", got)
-	}
 	entries, _ := os.ReadDir(recordDirPath(state, project))
 	if len(entries) != 2 {
 		t.Fatalf("entries: %v", entries)
 	}
 	// another project and another name have their own records
 	_, other := baselineFx(t)
-	if _, found, _, _ := LatestRecorded(state, other, lockName); found {
+	if _, found, _, _ := ReadRecorded(state, other, lockName, digestHex(`{"a":1}`)); found {
 		t.Fatal("another project found a record")
 	}
-	if _, found, _, _ := LatestRecorded(state, project, "other.json"); found {
+	if _, found, _, _ := ReadRecorded(state, project, "other.json", digestHex(`{"a":1}`)); found {
 		t.Fatal("another name found a record")
+	}
+}
+
+// The bound holds counting the entry being written, even when the clock went backwards and
+// every older record looks newer than the new one.
+func TestRecordedBaselineBoundHoldsWhenTheClockWentBackwards(t *testing.T) {
+	state, project := baselineFx(t)
+	future := time.Now().Add(24 * time.Hour)
+	for i := 0; i < 5; i++ {
+		content := fmt.Sprintf(`{"n":%d}`, i)
+		mustRecord(t, state, project, content, 5)
+		_ = os.Chtimes(recordFilePath(state, project, content), future, future)
+	}
+	mustRecord(t, state, project, `{"new":1}`, 5)
+	entries, _ := os.ReadDir(recordDirPath(state, project))
+	if len(entries) != 5 {
+		t.Fatalf("kept %d records, want 5", len(entries))
+	}
+	if _, err := os.Stat(recordFilePath(state, project, `{"new":1}`)); err != nil {
+		t.Fatal("the record being written was pruned")
 	}
 }
 
@@ -143,22 +153,7 @@ func TestRecordedBaselineIgnoresWhatItCannotTrust(t *testing.T) {
 			if err != nil || found || len(ignored) != 1 || ignored[0].Digest != digestHex(content) {
 				t.Fatalf("by digest: %q found=%v ignored=%v err=%v", got, found, ignored, err)
 			}
-			_, found, ignored, err = LatestRecorded(state, project, lockName)
-			if err != nil || found || len(ignored) != 1 {
-				t.Fatalf("latest: found=%v ignored=%v err=%v", found, ignored, err)
-			}
 		})
-	}
-	// an untrusted newer record does not hide a trusted older one
-	state, project := baselineFx(t)
-	mustRecord(t, state, project, `{"good":1}`, BaselineKeep)
-	past := time.Now().Add(-time.Hour)
-	_ = os.Chtimes(recordFilePath(state, project, `{"good":1}`), past, past)
-	mustRecord(t, state, project, `{"bad":1}`, BaselineKeep)
-	_ = os.WriteFile(recordFilePath(state, project, `{"bad":1}`), []byte("x"), 0o600)
-	got, found, ignored, _ := LatestRecorded(state, project, lockName)
-	if !found || string(got) != `{"good":1}` || len(ignored) != 1 {
-		t.Fatalf("latest = %q %v %v", got, found, ignored)
 	}
 }
 
@@ -173,7 +168,7 @@ func TestRecordedBaselineStateDirectoryThatCannotBeTrusted(t *testing.T) {
 		t.Fatal("recorded into a state directory others can write")
 	}
 	// ... reading trusts nothing in it, without an error
-	got, found, ignored, err := LatestRecorded(state, project, lockName)
+	got, found, ignored, err := ReadRecorded(state, project, lockName, digestHex(`{"a":1}`))
 	if err != nil || found || len(ignored) == 0 {
 		t.Fatalf("read: %q %v %v %v", got, found, ignored, err)
 	}
@@ -185,7 +180,7 @@ func TestRecordedBaselineStateDirectoryThatCannotBeTrusted(t *testing.T) {
 	if err := os.Symlink(moved, filepath.Join(state, baselineDir)); err != nil {
 		t.Fatal(err)
 	}
-	if _, found, _, _ := LatestRecorded(state, project, lockName); found {
+	if _, found, _, _ := ReadRecorded(state, project, lockName, digestHex(`{"a":1}`)); found {
 		t.Fatal("trusted through a link")
 	}
 	if err := RecordBaseline(state, project, lockName, []byte(`{"b":1}`), BaselineKeep); err == nil {
@@ -207,7 +202,7 @@ func TestRecordedBaselineWriteIsAtomic(t *testing.T) {
 		t.Fatal("a failed write reported success")
 	}
 	faultHook = nil
-	if got, found, _, _ := LatestRecorded(state, project, lockName); !found || string(got) != `{"old":1}` {
+	if got, found, _, _ := ReadRecorded(state, project, lockName, digestHex(`{"old":1}`)); !found || string(got) != `{"old":1}` {
 		t.Fatalf("the previous record did not survive: %q", got)
 	}
 	entries, _ := os.ReadDir(recordDirPath(state, project))
@@ -248,7 +243,7 @@ func TestRecordedBaselineIsKeyedByThePathTheLaneResolved(t *testing.T) {
 	if err := os.Rename(project, renamed); err != nil {
 		t.Fatal(err)
 	}
-	if _, found, _, _ := LatestRecorded(state, renamed, lockName); found {
+	if _, found, _, _ := ReadRecorded(state, renamed, lockName, digestHex(`{"a":1}`)); found {
 		t.Fatal("a renamed directory inherited a record")
 	}
 }

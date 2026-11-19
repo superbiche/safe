@@ -249,7 +249,7 @@ pass and warnings under `environment.release_follow`.
   **The baseline** is what the differential is taken against, and what decides which
   advisories are "already present" and never gate. It is the lockfile committed at the
   head of the project's git work tree, or one safe itself judged clear and recorded (below);
-  the report says how many entries added on disk were judged as introduced and
+  the report says how many entries added on disk (and still in the judged target) were judged as introduced and
   `safe: project lane: baseline: …` names which baseline was used: committed, recorded or
   empty. With no lockfile on disk and nothing established the baseline is empty and the whole
   resolved graph is introduced. A *committed* lockfile that exists but cannot be read or
@@ -259,8 +259,9 @@ pass and warnings under `environment.release_follow`.
   judged clear on complete evidence, each under its own digest:
   `project-lane/state/project-baseline/<sha256 of the project path>/<lockfile name>/<sha256
   of the bytes>` in safe's data directory, outside the project. A record is the lockfile's
-  bytes; its file's modification time orders the records, and the most recent 16 are kept
-  per project (older ones are pruned when one is written). A lockfile is recorded right
+  bytes. At most 16 records are kept per project and name: when one is written the older ones
+  (by modification time, the entry being written counted so the bound holds) are pruned, best
+  effort; a pruning that fails or goes wrong is not an error and only makes more be judged. A lockfile is recorded right
   after a decision that is clear on complete evidence and **before** the binder runs, full
   or files-only; if it cannot be recorded the command refuses (102, "cannot be recorded")
   and nothing is published. A dry run, a refusal and a command with missing evidence record
@@ -276,29 +277,40 @@ pass and warnings under `environment.release_follow`.
   and however it comes to be on disk: restoring a judged lockfile by hand is the same as
   checking out an old commit. Two path names for one directory are two stores, and a missing
   record only makes more be judged.
-  **The rule of choice.** The lockfile on disk is the baseline when it is byte-identical to the
-  committed one, or when its digest names a trusted record (a recorded one). Otherwise the
-  baseline is the committed lockfile, else the most recently written trusted record, else
-  empty, and the entries the lockfile on disk adds are introduced. With no lockfile on disk the
-  baseline is the committed one, else the most recent record, else empty.
+  **The rule of choice.** The committed lockfile is read first, with three outcomes (below);
+  a present one must decode (it does not: missing evidence, 102, whatever the lockfile on
+  disk holds). The lockfile on disk is the baseline (`committed`) when it is byte-identical to
+  the committed one, or (`recorded`) when its digest names a trusted record. Otherwise the
+  baseline is the committed lockfile, else empty, and the entries the lockfile on disk adds are
+  introduced. **A record is a baseline only when the lockfile on disk is byte-identical to it:**
+  nothing falls back to "the most recent record", because that could be a plan judged clear whose
+  installation failed, and an advisory disclosed in between would count as already present on a
+  package the project never carried. The cost, accepted: in a project with no committed lockfile
+  a lockfile edited by hand is judged whole. A record that cannot be trusted is ignored (named
+  once: it is no match, and the baseline used instead is said).
   **The committed lockfile** is read with three outcomes: present, *established absent*
   (no git work tree, an unborn branch, or no `package-lock.json` in the head commit's tree)
   and unreadable (102: a git that cannot be bound to local reads, a repository that cannot be
   probed or that git does not select where the `.git` is, a `HEAD` that does not name a commit,
   a reference whose lookup fails, a missing or corrupt commit, tree or blob, a blob whose hash
   is not its name, a tree entry that is not a regular file). The lane **requires a git that can
-  disable lazy fetches** (git 2.44.0 or newer; the lane does not trust the version alone: every
+  disable lazy fetches** (git 2.45.0 or newer; 2.44.0 lacks the option; the lane does not trust the version alone: every
   git call passes `--no-lazy-fetch`, and a probe with that very invocation, on a command that
   cannot fetch, must succeed, else the committed lockfile is unreadable). The workspace probe
   uses the same bounded invocation. git discovers the repository once, from the project
-  directory; every later command names that git directory and work tree explicitly. None of the
+  directory, in one git process, and every later command names that git directory and work
+  tree explicitly; every path handed to git is literal (`--literal-pathspecs`), the project's
+  directory must come back as exactly one NUL-delimited entry of the path asked for, and the
+  raw tree reader validates the mode and the framing of every entry it walks and refuses a
+  tree it could not read whole (never an absence). A project path with a newline in it cannot
+  be captured exactly by the shell and refuses before anything is opened. None of the
   caller's `GIT_*` variables reaches git; replacement objects are disabled. Reference absence is
   decided by git's own `show-ref --exists` (missing is distinct from a failed lookup). The raw
   tree-entry mode is read from the raw tree (git shows `100664` as `100644`): accepted are
   `100644`, `100664` and `100755`; `120000`, `160000` and anything else are unreadable. Object
   identifiers along the tree path are not re-verified (whoever can forge an object in the
   repository can also make a commit, which is a baseline by ruling). Only an established absence
-  lets the recorded or the empty baseline apply. Every lockfile on disk, the baseline or not,
+  lets the empty baseline apply. Every lockfile on disk, the baseline or not,
   gets the binding and link checks and the binder's own lockfile admission (every key a chain
   of package segments inside the tree, no link entry, whether or not anything references it)
   before npm uses it. No private-registry name goes to the public advisory service: the matcher

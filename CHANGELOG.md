@@ -2,23 +2,26 @@
 
 ## Unreleased
 
-- Project lane baseline, closing review: the stored baseline is now the set of lockfiles
-  safe judged clear on complete evidence, each recorded under its own digest per project path
-  (before the binder runs, full or files-only; a record that cannot be written refuses 102
-  and publishes nothing; a bounded number of the most recent is kept). A lockfile on disk is
-  the baseline when it is the committed one or a trusted record; otherwise the committed
-  lockfile, else the most recent trusted record, else empty. A record that does not hash to
-  its name or is not a private regular file is ignored and named, never an error. This
-  replaces the current-and-pending record, the device/inode/birth-time identity and the
-  recovery by comparison. Also: the committed lockfile is read by a git that is probed to
-  support `--no-lazy-fetch` (2.44.0 or newer; else 102), with the repository discovered once
-  and pinned, reference absence decided by `git show-ref --exists` and the raw tree-entry mode
-  checked; the binder's own lockfile admission runs on the lockfile on disk before the
-  projection; the private-store matcher is case-folded for refusing and every identity of the
-  evidence request must have an exact version; the workspace probe uses the same bounded git;
-  the diagnostics name the lockfile on disk when it is the malformed one. A successful
-  publication needs an empty `retained` list and both files; the report counts entries "added
-  on disk". The agent contract is unchanged.
+- Project lane baseline, closing reviews: safe records, per project path, the lockfiles it
+  judged clear on complete evidence, each under its own digest, before the binder runs (full or
+  files-only; a record that cannot be written refuses 102 and publishes nothing; at most 16 are
+  kept, pruned best effort). A record is a baseline ONLY when the lockfile on disk is
+  byte-identical to it: there is no fallback to "the most recent record" (a plan judged clear
+  whose installation failed must not become the baseline of its own retry). The rule: the
+  committed lockfile is read first (a present one must decode, else 102); the lockfile on disk
+  equal to it is `committed`, equal to a trusted record `recorded`; otherwise the committed
+  lockfile, else empty, and what the disk adds is introduced. A record that does not hash to its
+  name or is not a private regular file is ignored and named. Also: the committed lockfile is
+  read by a git that is probed to support `--no-lazy-fetch` (2.45.0 or newer; else 102), with
+  the repository discovered once in one process and pinned, literal pathspecs, exactly one
+  NUL-delimited entry of the path asked for, a raw tree reader that validates every entry and
+  refuses a tree it did not read whole, reference absence decided by `git show-ref --exists` and
+  the raw mode checked; the binder's own lockfile admission runs on the lockfile on disk before
+  the projection; the private-store matcher (case-folded, for refusing only) is the same at every
+  call site and every identity of the evidence request must have an exact version (checked as a
+  whole string); a project path with a newline refuses; the report counts the entries added on
+  disk that are still in the judged target. A successful publication needs an empty `retained`
+  list and both files. The agent contract is unchanged.
 - Project lane baseline (still behind `install.project_lane`): the lane no longer
   requires the lockfile on disk to be the committed one. The baseline is the lockfile
   committed at the head of the git work tree, or a lockfile safe itself judged clear and

@@ -602,7 +602,8 @@ func TestProjectBaselineCommand(t *testing.T) {
 		_, code, stderr := run3(safeCore(append([]string{"project-baseline", mode, "--state-dir", p.state, "--project", p.project, "--name", "package-lock.json"}, extra...)...))
 		return code, stderr
 	}
-	if code, _ := call("read", "--latest", "--out", out); code != 4 {
+	want := strings.TrimPrefix(digest(bindNewLock), "sha256:")
+	if code, _ := call("read", "--digest", want); code != 4 {
 		t.Fatalf("none recorded: exit %d, want 4", code)
 	}
 	if code, stderr := call("record", "--file", file); code != 0 {
@@ -611,15 +612,20 @@ func TestProjectBaselineCommand(t *testing.T) {
 	if code, stderr := call("record", "--file", file); code != 0 {
 		t.Fatalf("recording it again: exit %d %s", code, stderr)
 	}
-	if code, stderr := call("read", "--latest", "--out", out); code != 0 {
-		t.Fatalf("read latest: exit %d %s", code, stderr)
+	if code, stderr := call("read", "--digest", want); code != 0 {
+		t.Fatalf("a match with no output: exit %d %s", code, stderr)
+	}
+	if _, err := os.Stat(out); err == nil {
+		t.Fatal("a match with no --out wrote a file")
+	}
+	if code, _ := call("read", "--digest", want, "--out", out); code != 0 {
+		t.Fatalf("read by digest: exit %d", code)
 	}
 	if raw, _ := os.ReadFile(out); string(raw) != bindNewLock {
 		t.Fatalf("read back %q", raw)
 	}
-	_ = os.Remove(out)
-	if code, _ := call("read", "--digest", strings.TrimPrefix(digest(bindNewLock), "sha256:"), "--out", out); code != 0 {
-		t.Fatalf("read by digest: exit %d", code)
+	if code, _ := call("read", "--digest", want, "--out", filepath.Join(p.state, "no-such-dir", "x")); code != 3 {
+		t.Fatalf("a record whose bytes cannot be handed over is an error, not an absence: exit %d", code)
 	}
 	if code, _ := call("read", "--digest", strings.Repeat("0", 64), "--out", out); code != 4 {
 		t.Fatalf("an unknown digest: exit %d, want 4", code)
@@ -632,7 +638,7 @@ func TestProjectBaselineCommand(t *testing.T) {
 	if err := os.WriteFile(records[0], []byte("tampered"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	code, stderr := call("read", "--latest", "--out", out)
+	code, stderr := call("read", "--digest", want)
 	if code != 4 || !strings.Contains(stderr, "ignored record") {
 		t.Fatalf("tampered: exit %d, stderr %q", code, stderr)
 	}
@@ -640,7 +646,7 @@ func TestProjectBaselineCommand(t *testing.T) {
 		{"project-baseline"}, {"project-baseline", "read"}, {"project-baseline", "confirm"},
 		{"project-baseline", "record", "--state-dir", p.state, "--project", p.project, "--name", "package-lock.json"},
 		{"project-baseline", "read", "--state-dir", p.state, "--project", p.project, "--name", "package-lock.json", "--out", out},
-		{"project-baseline", "read", "--state-dir", p.state, "--project", p.project, "--name", "package-lock.json", "--latest", "--digest", "a", "--out", out},
+		{"project-baseline", "read", "--state-dir", p.state, "--project", p.project, "--name", "package-lock.json", "--latest", "--out", out},
 		{"project-baseline", "record", "--state-dir", p.state, "--project", p.project, "--name", "package-lock.json", "--file", file, "--out", out},
 		{"project-baseline", "read", "--project-fd", "3", "--state-dir", p.state, "--name", "package-lock.json", "--latest", "--out", out},
 	} {
@@ -716,5 +722,51 @@ func TestProjectLockfileAdmitAndGitTreeEntry(t *testing.T) {
 	}
 	if _, code := run("usage", tree, "--hash-bytes", "21", "--name", "a"); code != 2 {
 		t.Fatalf("usage: %d", code)
+	}
+	// every entry walked is validated, the wanted one or not
+	for name, body := range map[string]string{
+		"non-octal mode":  "10064x a\x00" + id + "100644 package-lock.json\x00" + id,
+		"mode too short":  "644 a\x00" + id + "100644 package-lock.json\x00" + id,
+		"mode too long":   "1006440 a\x00" + id + "100644 package-lock.json\x00" + id,
+		"empty name":      "100644 \x00" + id + "100644 package-lock.json\x00" + id,
+		"slash in a name": "100644 a/b\x00" + id + "100644 package-lock.json\x00" + id,
+		"cut short later": "100644 package-lock.json\x00" + id + "100644 z\x00abc",
+	} {
+		if _, code := run(name, body, "--hash-bytes", "20", "--name", "package-lock.json"); code != 3 {
+			t.Fatalf("%s: exit %d, want 3 (unreadable, never found or absent)", name, code)
+		}
+	}
+	// an object past the size the reader accepts is refused, never read in part: the wanted
+	// entry sits beyond the limit here, and the answer must not be "absent"
+	whole := "100644 a\x00" + id + "100644 package-lock.json\x00" + id
+	if _, code := run("past the limit", whole, "--hash-bytes", "20", "--name", "package-lock.json", "--max-bytes", "40"); code != 3 {
+		t.Fatalf("past the limit: exit %d, want 3", code)
+	}
+	if out, code := run("at the limit", whole, "--hash-bytes", "20", "--name", "package-lock.json", "--max-bytes", strconv.Itoa(len(whole))); code != 0 || !strings.HasPrefix(out, "100644 ") {
+		t.Fatalf("at the limit: %q %d", out, code)
+	}
+}
+
+func TestExactVersionsChecksTheWholeString(t *testing.T) {
+	check := func(body string) int {
+		cmd := safeCore("exact-versions")
+		cmd.Stdin = strings.NewReader(body)
+		_, code, _ := run3(cmd)
+		return code
+	}
+	if code := check(`{"packages":[{"name":"a","version":"1.2.3"},{"name":"b","version":"1.0.0-rc.1+x"}]}`); code != 0 {
+		t.Fatalf("exact versions: exit %d", code)
+	}
+	for _, version := range []string{"npm:@p/x@1.0.0", "1.2.3\n1.2.3", "1.2.3\n", "^1.0.0", "", "1.2", "v1.2.3", " 1.2.3"} {
+		body, _ := json.Marshal(map[string]any{"packages": []map[string]string{{"name": "a", "version": version}}})
+		if code := check(string(body)); code != 30 {
+			t.Fatalf("%q: exit %d, want 30", version, code)
+		}
+	}
+	if code := check(`{"packages":[{"name":"a"}]}`); code != 3 {
+		t.Fatalf("an identity without a version: exit %d", code)
+	}
+	if code := check(`nonsense`); code != 3 {
+		t.Fatalf("not a document: exit %d", code)
 	}
 }
