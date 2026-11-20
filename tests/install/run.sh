@@ -2972,7 +2972,7 @@ case_npm_lockdiff_target_platform_follows_npm_argv() {
   printf '%s\n' "${lock}" > "${WORK_DIR}/package-lock.json"
 
   local invocation
-  for invocation in 'npm dedupe --os=aix' 'npm prune --os aix'; do
+  for invocation in 'npm dedupe --os=aix' 'npm prune --os=aix'; do
     : > "${LOG_FILE}"
     NPM_LOCK_MUTATION_JSON="${lock}" SAFE_INSTALL_TEST_SCRIPT="${invocation}" run_zsh
     assert_status 104 "$FUNCNAME (${invocation})" || return
@@ -9794,7 +9794,7 @@ case_project_lane_config_selectors_in_the_arguments_refuse_before_any_npm() {
   local before opt
   before="$(lane_digests)"
   for opt in '--userconfig=/x/rc' '--userconfig /x/rc' '--globalconfig=/x/rc' '--globalconfig /x/rc' '--prefix=.' '--prefix .' '-C .' \
-      '--cache=/x' '--cache /x' '--logs-dir=/x' '--logs-dir /x'; do
+      '--cache=/x' '--cache /x' '--logs-dir=/x'; do
     : > "${LOG_FILE}"
     lane_run "npm install clean@2.0.0 ${opt}"
     lane_unsupported_case "$FUNCNAME" install "${opt}" || return
@@ -12543,7 +12543,7 @@ case_npm_front_door_is_free_without_an_equals_form() {
   local out
   out="$(bash -c 'source "$1/lib/gate-lib.sh"; safe_gate_nopt_load() { echo LOADED; }; safe_gate_npm_front_door install blockme okpkg@1.0.0 -- --json=x; echo "rc=$?"' _ "${ROOT_DIR}" 2>&1)"
   [[ "${out}" == "rc=0" ]] || { fail "$FUNCNAME: the option tables were read or the command was refused (${out})"; return; }
-  out="$(bash -c 'source "$1/lib/gate-lib.sh"; safe_gate_nopt_load() { echo LOADED; }; safe_gate_nopt_parse() { echo READ; SAFE_GATE_NOPT_LOOSE=(); SAFE_GATE_NOPT_CLUSTER=(); SAFE_GATE_NOPT_NEGATED=(); SAFE_GATE_NOPT_UNSTABLE=(); SAFE_GATE_NOPT_UNKNOWN=(); }; for a in --save-dev -g --Cq -x; do safe_gate_npm_front_door install "$a" blockme; done' _ "${ROOT_DIR}" 2>&1 | tr '\n' ' ')"
+  out="$(bash -c 'source "$1/lib/gate-lib.sh"; safe_gate_nopt_load() { declare -gA SAFE_GATE_NOPT_VARIANT_OPT=() SAFE_GATE_NOPT_VARIANT_SHORT=() SAFE_GATE_NOPT_FLAGS=() SAFE_GATE_NOPT_SHORT=() SAFE_GATE_NOPT_LITS=(); }; safe_gate_nopt_parse() { echo READ; SAFE_GATE_NOPT_LOOSE=(); SAFE_GATE_NOPT_CLUSTER=(); SAFE_GATE_NOPT_NEGATED=(); SAFE_GATE_NOPT_UNSTABLE=(); SAFE_GATE_NOPT_UNKNOWN=(); }; for a in --save-dev -g --Cq -x; do safe_gate_npm_front_door install "$a" blockme; done' _ "${ROOT_DIR}" 2>&1 | tr '\n' ' ')"
   [[ "${out}" == "READ READ READ READ " ]] || { fail "$FUNCNAME: an argument that starts with a dash did not make the front door read the vector (${out})"; return; }
   pass "$FUNCNAME"
 }
@@ -12770,13 +12770,23 @@ case_npm_version_dependent_options_are_read_every_way() {
   local script
   # each must refuse, or audit blockme: here they refuse (the readings give different packages)
   for script in 'npm install --allow-git blockme' 'npm install --min-release-age blockme' 'npm install --cpu blockme' 'npm install -g --allow-git blockme' \
-      'npm install --install-strategy blockme' 'npm install --install-strategy nested blockme' 'npm --cpu x64 install blockme' 'npm exec --cpu blockme'; do
+      'npm install --install-strategy blockme' 'npm install --install-strategy nested blockme' 'npm --cpu x64 install blockme' 'npm exec --cpu blockme' \
+      'npm install --logs-dir /x blockme' 'npm prune --os aix'; do
     : > "${LOG_FILE}"
     SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
     assert_status 100 "$FUNCNAME: ${script}" || return
     [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { fail "$FUNCNAME: ${script}: not one line"; return; }
     assert_err_contains_fragment 'read differently by the npm versions the gate vouches for' "$FUNCNAME: ${script}" || return
     assert_err_not_contains_fragment 'blockme' "$FUNCNAME: ${script}" || return
+    ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: npm was delegated to"; return; }
+  done
+  # an abbreviation of such a name: an option's name to one npm, an unknown name to another
+  for script in 'npm install --allow-d blockme' 'npm install --allow- blockme' 'npm install --min-rel blockme'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 100 "$FUNCNAME: ${script}" || return
+    assert_err_contains_fragment 'is an abbreviation that the npm versions the gate vouches for read differently' "$FUNCNAME: ${script}" || return
+    assert_err_contains_fragment 'write the full option name' "$FUNCNAME: ${script}" || return
     ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: npm was delegated to"; return; }
   done
   # the way out printed: the value attached. Every version consumes an = value for a name it does not define as Boolean,
