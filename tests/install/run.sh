@@ -15782,6 +15782,7 @@ case_project_lane_oneshot_the_one_outcome_handler_rules() {
   assert_status 102 "$FUNCNAME: end of input" || return
   assert_lane_final_line install "$FUNCNAME: end of input" || return
   assert_err_contains_fragment 'end of input' "$FUNCNAME" || return
+  assert_err_contains_fragment 'the refusal stands: ' "$FUNCNAME: the original refusal is not lost" || return
   assert_lane_no_delegate "$FUNCNAME: a failed read delegated" || return
   for sentinel in "${TMPDIR:-/tmp}/ask.out" "${HOME_DIR}/ask.out" "${CASE_DIR}/ask.out" "${WORK_DIR}/ask.out"; do
     [[ "$(cat "${sentinel}")" == sentinel ]] || { fail "$FUNCNAME: a prompt opened ${sentinel}"; return; }
@@ -15797,6 +15798,7 @@ case_project_lane_oneshot_the_one_outcome_handler_rules() {
   LANE_PTY=1 LANE_PTY_ANSWERS=$'y\n' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0 --save-peer-x --dry-run'
   assert_no_prompt "$FUNCNAME: dry run by argument" || return
   assert_lane_no_delegate "$FUNCNAME: dry run by argument" || return
+  assert_err_not_contains_fragment 'one-shot-project' "$FUNCNAME: a known dry run is not offered the confirmation by the line either" || return
   LANE_PTY=1 LANE_PTY_ANSWERS=$'y\n' npm_config_dry_run=true NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0 --save-peer-x'
   assert_no_prompt "$FUNCNAME: dry run by environment" || return
   # a dry run only in a configuration file cannot be known before the probe: the confirmation is offered (it writes nothing)

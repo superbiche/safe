@@ -3614,7 +3614,7 @@ safe_gate_project_lane_verb_refusal() {
 # The final line of the recorded refusal, as the lane has always printed it; a marked one also names the two ways out.
 safe_gate_project_lane_print_refusal() {
   local todo="${SAFE_GATE_LANE_REFUSAL_TODO}"
-  if [[ "${SAFE_GATE_LANE_REFUSAL_MARK:-0}" == 1 ]]; then
+  if [[ "${SAFE_GATE_LANE_REFUSAL_MARK:-0}" == 1 && "${SAFE_GATE_LANE_DRY:-0}" != 1 ]]; then
     todo+="; the operator can confirm the one-shot route for this command at their terminal, or put this project on it: safe run one-shot-project add"
   fi
   safe_gate_err "safe: BLOCKED npm ${SAFE_GATE_LANE_REFUSAL_VERB} [lane: project] — ${SAFE_GATE_LANE_REFUSAL_STAKE}; ${todo}; details: safe explain"
@@ -3662,7 +3662,7 @@ safe_gate_project_lane_conclude() {
       3)
         # a failed read is no answer: 102, and nothing else happens
         SAFE_GATE_LANE_REFUSAL_CODE=102
-        SAFE_GATE_LANE_REFUSAL_STAKE="${decline_text%%; *}"
+        SAFE_GATE_LANE_REFUSAL_STAKE="${decline_text%%; *} (the refusal stands: ${stake})"
         SAFE_GATE_LANE_REFUSAL_TODO="run the command again at a terminal"
         SAFE_GATE_LANE_REFUSAL_MARK=0
         ;;
