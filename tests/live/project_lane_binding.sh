@@ -14,8 +14,11 @@
 #   A. the fleet chain. `npm` on PATH is a gate wrapper and the next candidate a
 #      version manager's shim; the lane asks the real manager (`mise which`),
 #      once, in the project, for node and npm and runs that pair directly.
-#      npm's `before` date dates the whole invocation, so the projection
-#      resolves the historical graph and the tree must equal it.
+#      the window of the lane's cooldown (install.cooldown_days, set to the days since <T1>, so
+#      that its cutoff is T1) dates the whole invocation, so the projection resolves the
+#      historical graph and the tree must equal it. (An invocation cannot be dated with
+#      `npm_config_before`: the lane sets npm's release-age window on its own command line, which
+#      outranks every `before`, and refuses a `before` it cannot honour.)
 #
 #   B. a delegate that answers differently per phase. A version manager's
 #      installation reached the supported way (a shim on PATH, a manager that
@@ -138,10 +141,16 @@ AUDIT
 chmod +x "${WORK}/safe/bin/safe-audit"
 # The operator's canonical configuration (the switch is read from there only).
 mkdir -p "${HOME}/.config/safe/run"
-printf '{"install":{"project_lane":true}}\n' > "${HOME}/.config/safe/run/config.json"
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
+# T1 dates the historical graph: the cooldown window is the number of days from T1 to now, plus one, so that the
+# cutoff of npm's release-age filter is at (just before) T1 and every version of the graph is older than the window
 T1="2025-04-02"
+WINDOW=$(( ( $(date +%s) - $(date -u -d "${T1}" +%s) ) / 86400 + 1 ))
+write_cooldown_config() { # <days>
+  printf '{"install":{"project_lane":true,"cooldown_days":%s}}\n' "$1" > "${HOME}/.config/safe/run/config.json"
+}
+write_cooldown_config "${WINDOW}"
 entries() { jq -r '.packages | to_entries[] | select(.key | test("node_modules/")) | "\(.key)@\(.value.version)"' "$1" | LC_ALL=C sort; }
 
 # A starting project: no dependency, the lockfile npm writes for it, committed.
@@ -156,20 +165,21 @@ new_project() { # <dir>
 
 # Both resolutions must succeed and carry the requested root; a control that
 # failed would make "the registry answers differently" vacuously true.
-resolve() { # <dir> [--before=<date>]
+resolve() { # <dir> [--min-release-age=<days>]
   local dir="$1"
   shift
   ( cd "${dir}" && real_npm install express@5.1.0 --package-lock-only --ignore-scripts --no-audit --no-fund "$@" >"${dir}/resolve.log" 2>&1 ) || return 1
   jq -e '.packages["node_modules/express"].version == "5.1.0"' "${dir}/package-lock.json" >/dev/null
 }
 new_project "${WORK}/control" && new_project "${WORK}/independent" || { fail "the starting projects are written"; exit 1; }
-if resolve "${WORK}/control"; then
-  pass "the control resolution (now) succeeds and holds express@5.1.0"
+# today's resolution under the window the lane runs everything but the dated projection with in scenario B (3 days)
+if resolve "${WORK}/control" "--min-release-age=3"; then
+  pass "the control resolution (now, 3-day window) succeeds and holds express@5.1.0"
 else
   fail "the control resolution (now) succeeds: $(tail -n 3 "${WORK}/control/resolve.log")"
   exit 1
 fi
-if resolve "${WORK}/independent" "--before=${T1}"; then
+if resolve "${WORK}/independent" "--min-release-age=${WINDOW}"; then
   pass "the independent projection (as of ${T1}) succeeds and holds express@5.1.0"
 else
   fail "the independent projection (as of ${T1}) succeeds: $(tail -n 3 "${WORK}/independent/resolve.log")"
@@ -190,7 +200,7 @@ selection=(--os "$("${real_node_bin}" -p 'process.platform')" --cpu "$("${real_n
 
 # --- scenario A: the fleet chain, the whole invocation dated -------------------
 new_project "${WORK}/a" || { fail "scenario A project"; exit 1; }
-( cd "${WORK}/a" && npm_config_before="${T1}" SAFE_AUDIT_PATH="${WORK}/safe/bin/safe-audit" "${WORK}/safe/bin/safe" gate npm install express@5.1.0 --ignore-scripts \
+( cd "${WORK}/a" && SAFE_AUDIT_PATH="${WORK}/safe/bin/safe-audit" "${WORK}/safe/bin/safe" gate npm install express@5.1.0 --ignore-scripts \
     >"${WORK}/a.out" 2>"${WORK}/a.err" )
 status=$?
 sed 's/^/# A gate: /' "${WORK}/a.err" | tail -n 8
@@ -205,7 +215,7 @@ fi
 # nor edited by hand), then a lockfile-only command publishes the files, installs no
 # tree and advances the baseline again.
 new_project "${WORK}/c" || { fail "scenario C project"; exit 1; }
-gate_c() { ( cd "${WORK}/c" && npm_config_before="${T1}" SAFE_AUDIT_PATH="${WORK}/safe/bin/safe-audit" "${WORK}/safe/bin/safe" gate npm "$@" >"${WORK}/c.out" 2>"${WORK}/c.err" ); }
+gate_c() { ( cd "${WORK}/c" && SAFE_AUDIT_PATH="${WORK}/safe/bin/safe-audit" "${WORK}/safe/bin/safe" gate npm "$@" >"${WORK}/c.out" 2>"${WORK}/c.err" ); }
 gate_c install express@5.1.0 --ignore-scripts
 status=$?
 if (( status == 0 )) && grep -q 'baseline: the lockfile committed' "${WORK}/c.err" && [[ -d "${WORK}/c/node_modules/express" ]] \
@@ -262,7 +272,7 @@ fi
 if [[ -n "${real_mise_bin:-}" ]] && ! LC_ALL=C head -n 2 -- "${real_mise_bin}" 2>/dev/null | grep -q '^# safe-gate-wrapper'; then
   new_project "${WORK}/d" || { fail "scenario D project"; exit 1; }
   before_d="$(sha256sum "${WORK}/d/package.json" "${WORK}/d/package-lock.json" | cut -d' ' -f1 | tr '\n' ' ')"
-  ( cd "${WORK}/d" && PATH="$(dirname -- "${real_mise_bin}"):${PATH}" npm_config_before="${T1}" SAFE_AUDIT_PATH="${WORK}/safe/bin/safe-audit" \
+  ( cd "${WORK}/d" && PATH="$(dirname -- "${real_mise_bin}"):${PATH}" SAFE_AUDIT_PATH="${WORK}/safe/bin/safe-audit" \
       "${WORK}/safe/bin/safe" gate mise exec -- npm install express@5.1.0 --ignore-scripts >"${WORK}/d.out" 2>"${WORK}/d.err" )
   status=$?
   sed 's/^/# D gate: /' "${WORK}/d.err" | tail -n 3
@@ -560,6 +570,9 @@ for setting in npm_config_loglevel=silly npm_config_heading=review-npm npm_confi
 done
 
 # --- scenario B: a delegate that answers differently per phase -----------------
+# B needs the lane's own window to be the one the control resolved with: 3 days, explicit (the earlier scenarios set
+# others). Only the dated projection (the recording wrapper below) is given the longer one.
+write_cooldown_config 3
 # An installation the lane follows the supported way (a launcher, the Node beside
 # it, the npm-cli.js of the same installation) whose Node is a recording wrapper:
 # the projection (the call that begins with --package-lock-only) is dated as of
@@ -581,7 +594,7 @@ make_delegate() { # <dir> <launcher kind: forward|exit99>
 if [[ "\${1:-}" == */node_modules/npm/bin/npm-cli.js ]]; then
   printf '%s\\n' "\${*:2}" >> "${WORK}/delegate.log"
   if [[ "\${2:-}" == "--package-lock-only" ]]; then
-    "${real_node_bin}" "\$@" "--before=${T1}"
+    "${real_node_bin}" "\$@" "--min-release-age=${WINDOW}"
     status=\$?
     n=\$(ls "${WORK}"/captured-*.json 2>/dev/null | wc -l)
     [[ -f package-lock.json ]] && cp package-lock.json "${WORK}/captured-\$((n + 1)).json"
@@ -710,6 +723,72 @@ if (( status != 0 )) && [[ -f "${WORK}/launcher99.ran" ]] && [[ "${problems}" ==
   pass "the launcher the manager names is the one the lane runs (an exit-99 launcher ran and ended the command, exit ${status})"
 else
   fail "the exit-99 launcher control: gate exit ${status}, launcher ran: $([[ -f "${WORK}/launcher99.ran" ]] && echo yes || echo no), assertions said: ${problems:-nothing}"
+fi
+
+# --- scenario J: the cooldown, on the real npm (ticket 1635) ---------------------------------------
+# The window is WINDOW days (the cutoff is T1). npm's release-age filter is on every command line of the lane, so a bare
+# install resolves nothing younger than the window and the report lists nothing young; a version the caller names exactly
+# is excluded from the filter BY NAME (npm would refuse it with ETARGET and hide the wait), so safe's own reading is what
+# refuses it, with the date; and a young version of the same name that nobody named, which npm's filter no longer sees
+# either, is caught by the same reading. `semver` is the fixture: 7.7.1 is older than the window, 7.8.6 younger.
+write_cooldown_config "${WINDOW}"
+epoch() { date -u -d "$1" +%s; }
+gate_e() { # <dir> <npm args...>: the gate with the real advisory-reader stand-in
+  local dir="$1"
+  shift
+  ( cd "${dir}" && SAFE_AUDIT_PATH="${WORK}/safe/bin/safe-audit" "${WORK}/safe/bin/safe" gate npm "$@" >"${dir}.out" 2>"${dir}.err" )
+}
+sem_times="${WORK}/semver-packument.json"
+if curl -fsS --max-time 60 https://registry.npmjs.org/semver -o "${sem_times}" \
+    && jq -e '.time["7.7.1"] != null and .time["7.8.6"] != null and .time["5.7.2"] != null' "${sem_times}" >/dev/null 2>&1 \
+    && (( $(epoch "$(jq -r '.time["7.7.1"]' "${sem_times}")") < $(date +%s) - WINDOW * 86400 )) \
+    && (( $(epoch "$(jq -r '.time["7.8.6"]' "${sem_times}")") > $(date +%s) - WINDOW * 86400 )); then
+  mkdir -p "${WORK}/j1" && ( cd "${WORK}/j1" && printf '{"name":"live-cooldown","version":"1.0.0","dependencies":{"semver":"^7.0.0"}}\n' > package.json \
+    && git init -q -b main && git add package.json && git -c user.name=lane -c user.email=lane@example.invalid commit -q -m base )
+  gate_e "${WORK}/j1" install --ignore-scripts
+  status=$?
+  got="$(jq -r '.packages["node_modules/semver"].version' "${WORK}/j1/package-lock.json" 2>/dev/null)"
+  published="$(jq -r --arg v "${got}" '.time[$v] // empty' "${sem_times}")"
+  latest7="$(jq -r '[.versions | keys[] | select(test("^7\\.[0-9]+\\.[0-9]+$"))] | map(split(".") | map(tonumber)) | sort | last | map(tostring) | join(".")' "${sem_times}")"
+  if (( status == 0 )) && [[ -n "${published}" ]] && (( $(epoch "${published}") <= $(date +%s) - WINDOW * 86400 )) && [[ "${got}" != "${latest7}" ]] \
+      && grep -q 'cooldown: .* introduced version(s) judged against the '"${WINDOW}"'-day window' "${WORK}/j1.err" && ! grep -q 'was published' "${WORK}/j1.err"; then
+    pass "J1 (the filter): a bare install resolves semver ${got}, older than the ${WINDOW}-day window (not ${latest7}), and the report lists nothing young"
+  else
+    fail "J1 (the filter): exit ${status}, semver ${got:-none} (latest 7.x ${latest7}); $(tail -n 4 "${WORK}/j1.err")"
+  fi
+
+  new_project "${WORK}/j2" || { fail "scenario J2 project"; exit 1; }
+  j2_before="$(sha256sum "${WORK}/j2/package.json" "${WORK}/j2/package-lock.json" | cut -d' ' -f1 | tr '\n' ' ')"
+  gate_e "${WORK}/j2" install semver@7.8.6 --ignore-scripts
+  status=$?
+  if (( status == 100 )) && tail -n 1 "${WORK}/j2.err" | grep -qE '^safe: BLOCKED npm install \[lane: project\] — semver@7\.8\.6 was published 2026-11-02T17:05:43\.359Z and is inside the '"${WINDOW}"'-day cooldown; it becomes installable on 20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z' \
+      && ! grep -qiE 'notarget|ETARGET' "${WORK}/j2.err" \
+      && [[ "$(sha256sum "${WORK}/j2/package.json" "${WORK}/j2/package-lock.json" | cut -d' ' -f1 | tr '\n' ' ')" == "${j2_before}" && ! -e "${WORK}/j2/node_modules" ]]; then
+    pass "J2 (a named young version): excluded from npm's filter by name, so safe's own reading refuses it with the date it becomes installable (not npm's ETARGET); nothing was written"
+  else
+    fail "J2 (a named young version): exit ${status}; $(tail -n 3 "${WORK}/j2.err")"
+  fi
+
+  new_project "${WORK}/j3" || { fail "scenario J3 project"; exit 1; }
+  gate_e "${WORK}/j3" install semver@5.7.2 npm-package-arg@12.0.0 --ignore-scripts
+  status=$?
+  if (( status == 100 )) && tail -n 1 "${WORK}/j3.err" | grep -qE '^safe: BLOCKED npm install \[lane: project\] — semver@7\.[0-9]+\.[0-9]+ was published .* and is inside the '"${WINDOW}"'-day cooldown' \
+      && ! grep -q 'semver@5.7.2 was published' "${WORK}/j3.err"; then
+    pass "J3 (another young version of an excluded name): semver is excluded by name for the named 5.7.2, and the young 7.x that npm-package-arg's dependency resolves to is caught by safe's own reading"
+  else
+    fail "J3 (another young version of an excluded name): exit ${status}; $(tail -n 3 "${WORK}/j3.err")"
+  fi
+
+  new_project "${WORK}/j4" || { fail "scenario J4 project"; exit 1; }
+  ( cd "${WORK}/j4" && npm_config_before=2030-01-01 SAFE_AUDIT_PATH="${WORK}/safe/bin/safe-audit" "${WORK}/safe/bin/safe" gate npm install ms@2.1.3 --ignore-scripts >"${WORK}/j4.out" 2>"${WORK}/j4.err" )
+  status=$?
+  if (( status == 100 )) && grep -q 'a before date' "${WORK}/j4.err" && [[ ! -e "${WORK}/j4/node_modules" ]]; then
+    pass "J4 (a configuration cannot widen the cooldown): a before date from the environment is read back from npm and refused"
+  else
+    fail "J4: exit ${status}; $(tail -n 2 "${WORK}/j4.err")"
+  fi
+else
+  fail "J (the cooldown): the registry's semver packument is not what the scenario needs (7.7.1 older and 7.8.6 younger than the ${WINDOW}-day window)"
 fi
 
 printf '%s passed, %s failed\n' "${PASS}" "${FAIL}"

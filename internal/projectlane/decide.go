@@ -55,6 +55,9 @@ type Input struct {
 	Target        Graph
 	Evidence      Evidence
 	RegistryHosts []string
+	// Releases is the publish-time reading of the cooldown (nil: the cooldown
+	// is not judged and the report has no wait class).
+	Releases *Releases
 }
 
 // Report is the decision document: everything found, classed, with what is
@@ -67,8 +70,10 @@ type Report struct {
 	Advisories    AdvisoryReport `json:"advisories"`
 	Malice        []MaliceItem   `json:"malice"`
 	Coverage      []CoverageGap  `json:"coverage"`
-	Classes       []ClassOutcome `json:"classes"`
-	Outcome       Outcome        `json:"outcome"`
+	// Cooldown is the release-age judgement, present when a reading was given.
+	Cooldown *CooldownReport `json:"cooldown,omitempty"`
+	Classes  []ClassOutcome  `json:"classes"`
+	Outcome  Outcome         `json:"outcome"`
 }
 
 // BaselineStatus says what the difference was taken against.
@@ -231,8 +236,25 @@ func Decide(in Input) Report {
 		{Class: ClassMalice, Exit: ExitBlock, AtStake: len(report.Malice), Outstanding: len(report.Malice)},
 		classCount(ClassBlockingAdvisory, ExitBlock, report.Advisories.Introduced, AdvisoryBlocking),
 		classCount(ClassAdverseAdvisory, ExitPolicy, report.Advisories.Introduced, AdvisoryAdverse),
-		{Class: ClassMissingEvidence, Exit: ExitOperator, AtStake: len(report.Coverage), Outstanding: len(report.Coverage)},
 	}
+	if in.Releases != nil {
+		cooldown, err := judgeCooldown(in, baseline, &report)
+		if err != nil {
+			// A reading that cannot be judged is not an empty one: it is missing evidence.
+			cooldown = CooldownReport{Days: in.Releases.Policy.CooldownDays, SecurityFix: in.Releases.Policy.SecurityFix,
+				Waits: []CooldownWait{}, Waived: []CooldownWaiver{}, Missing: []CooldownGap{{Gap: err.Error()}}}
+		}
+		// A publish time that could not be read is missing evidence like an advisory reading that could not be.
+		for _, missing := range cooldown.Missing {
+			report.Coverage = append(report.Coverage, CoverageGap{
+				Name: missing.Name, Version: missing.Version, Sides: []string{"target"}, Gap: "publish time not read: " + missing.Gap,
+			})
+		}
+		report.Cooldown = &cooldown
+		report.Classes = append(report.Classes, waitClass(cooldown))
+	}
+	report.Classes = append(report.Classes,
+		ClassOutcome{Class: ClassMissingEvidence, Exit: ExitOperator, AtStake: len(report.Coverage), Outstanding: len(report.Coverage)})
 	report.Outcome = Outcome{Status: "clear"}
 	for _, class := range report.Classes {
 		if class.Outstanding == 0 {

@@ -11318,6 +11318,11 @@ scanner_batch_evidence_command() {
       failed_map=$(jq -c --arg id "$id" '. + {($id): "OSV advisory record malformed"}' <<<"$failed_map")
       continue
     fi
+    # A withdrawn advisory (the record carries a withdrawal date) is not an advisory of anything: it is removed before
+    # it can count as present, introduced or fixed. It gets no severity, so no hit is made of it, and it is not a gap.
+    if jq -e '(.withdrawn? // "") | (type == "string" and length > 0)' "$scratch/vuln.json" >/dev/null 2>&1; then
+      continue
+    fi
     while IFS= read -r pkg_ref; do
       if label=$(scanner_batch_detail_label "$scratch/vuln.json" "$pkg_ref"); then
         sev_map=$(jq -c --arg k "${id}|${pkg_ref}" --arg l "$label" '. + {($k): $l}' <<<"$sev_map")

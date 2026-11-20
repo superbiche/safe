@@ -794,3 +794,11 @@ Update the CISA KEV-derived IOC catalog and scan:
 ```bash
 safe audit ioc --update --since 7d --all
 ```
+
+## Advisory evidence for the project lane
+
+`safe audit scanner-batch --evidence` is the structured reader the project lane takes its advisory evidence from (the
+lane runs the one installed beside safe's own dispatcher, never one named by `SAFE_AUDIT_BIN`, `SAFE_AUDIT_PATH` or
+`PATH`). It keeps each validated answer per exact identity with its coverage. An advisory whose OSV record carries a
+withdrawal date (`withdrawn`) is removed before it can count: it is no hit and no gap, so it can neither be present,
+introduced nor fixed.

@@ -25,7 +25,7 @@ import (
 const (
 	projectGraphUsage  = "safe-core: usage: safe-core project-graph [--any-version] [--project-root <dir>] [--registry-host <host>]... [--public-evidence-host <host>]... <lockfile>"
 	projectDiffUsage   = "safe-core: usage: safe-core project-diff [--registry-host <host>]... [--public-evidence-host <host>]... (--baseline <lockfile> | --no-baseline) <target-lockfile>"
-	projectDecideUsage = "safe-core: usage: safe-core project-decide [--registry-host <host>]... [--public-evidence-host <host>]... (--baseline <lockfile> | --no-baseline) --evidence <file> [--acceptances <file>] <target-lockfile>"
+	projectDecideUsage = "safe-core: usage: safe-core project-decide [--registry-host <host>]... [--public-evidence-host <host>]... (--baseline <lockfile> | --no-baseline) --evidence <file> [--acceptances <file>] [--releases <file>] <target-lockfile>"
 )
 
 // projectLaneSchema versions the documents the graph and diff commands print.
@@ -38,6 +38,7 @@ type projectArgs struct {
 	noBaseline    bool
 	evidence      string
 	acceptances   string
+	releases      string
 	target        string
 }
 
@@ -52,7 +53,7 @@ func parseProjectArgs(args []string, allowBaseline, needEvidence bool) (projectA
 	var parsed projectArgs
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
-		case "--registry-host", "--public-evidence-host", "--baseline", "--evidence", "--acceptances":
+		case "--registry-host", "--public-evidence-host", "--baseline", "--evidence", "--acceptances", "--releases":
 			if i+1 >= len(args) || args[i+1] == "" {
 				return projectArgs{}, false
 			}
@@ -78,6 +79,11 @@ func parseProjectArgs(args []string, allowBaseline, needEvidence bool) (projectA
 					return projectArgs{}, false
 				}
 				parsed.acceptances = value
+			case "--releases":
+				if !needEvidence || parsed.releases != "" {
+					return projectArgs{}, false
+				}
+				parsed.releases = value
 			}
 		case "--no-baseline":
 			if !allowBaseline {
@@ -212,12 +218,19 @@ func projectDiff(args []string, stdout, stderr io.Writer) int {
 		}
 		return request[i].Version < request[j].Version
 	})
+	difference := projectlane.Diff(baseline, target)
+	// The identities the cooldown judges (see projectlane.CooldownCandidates), with the host each is read from.
+	cooldown := []projectlane.ReleaseQuery{}
+	for _, candidate := range projectlane.CooldownCandidates(difference, target) {
+		cooldown = append(cooldown, projectlane.ReleaseQuery{Name: candidate.Name, Version: candidate.Version, Host: candidate.Host})
+	}
 	return printJSON(stdout, "project-diff", stderr, struct {
-		SchemaVersion   int                     `json:"schema_version"`
-		Difference      projectlane.Difference  `json:"difference"`
-		Bindability     projectlane.Bindability `json:"bindability"`
-		EvidenceRequest []projectlane.Identity  `json:"evidence_request"`
-	}{projectLaneSchema, projectlane.Diff(baseline, target), projectlane.CheckBindable(target, parsed.registryHosts), request})
+		SchemaVersion   int                        `json:"schema_version"`
+		Difference      projectlane.Difference     `json:"difference"`
+		Bindability     projectlane.Bindability    `json:"bindability"`
+		EvidenceRequest []projectlane.Identity     `json:"evidence_request"`
+		CooldownRequest []projectlane.ReleaseQuery `json:"cooldown_request"`
+	}{projectLaneSchema, difference, projectlane.CheckBindable(target, parsed.registryHosts), request, cooldown})
 }
 
 // projectDecide prints the decision report over two lockfiles and an evidence
@@ -260,6 +273,20 @@ func projectDecide(args []string, stdout, stderr io.Writer) int {
 			return 3
 		}
 	}
+	var releases *projectlane.Releases
+	if parsed.releases != "" {
+		rawReleases, err := os.ReadFile(parsed.releases)
+		if err != nil {
+			fmt.Fprintf(stderr, "safe-core: project-decide: read releases: %v\n", err)
+			return 3
+		}
+		read, err := projectlane.ReadReleases(rawReleases)
+		if err != nil {
+			fmt.Fprintf(stderr, "safe-core: project-decide: %v\n", err)
+			return 3
+		}
+		releases = &read
+	}
 	target, err := projectlane.LoadGraph(parsed.target, parsed.hosts())
 	if err != nil {
 		fmt.Fprintf(stderr, "safe-core: project-decide: %v\n", err)
@@ -268,7 +295,7 @@ func projectDecide(args []string, stdout, stderr io.Writer) int {
 	baseline, unreadable := loadBaseline(parsed)
 	report := projectlane.Decide(projectlane.Input{
 		Baseline: baseline, BaselineError: unreadable, HasBaseline: !parsed.noBaseline,
-		Target: target, Evidence: evidence, RegistryHosts: parsed.registryHosts,
+		Target: target, Evidence: evidence, RegistryHosts: parsed.registryHosts, Releases: releases,
 	})
 	if code := printJSON(stdout, "project-decide", stderr, report); code != 0 {
 		return code
