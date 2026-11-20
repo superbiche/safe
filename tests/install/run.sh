@@ -9984,7 +9984,11 @@ case_project_lane_config_selectors_in_the_arguments_refuse_before_any_npm() {
     : > "${LOG_FILE}"
     lane_run "npm install clean@2.0.0 ${opt}"
     lane_unsupported_case "$FUNCNAME" install "${opt}" || return
-    assert_err_contains_fragment 'selects a configuration file or a destination before it can be admitted' "$FUNCNAME" || return
+    case "${opt}" in
+      --userconfig*|--globalconfig*) assert_err_contains_fragment 'selects a configuration file before it can be admitted' "$FUNCNAME: ${opt}" || return ;;
+      --prefix*|-C*) assert_err_contains_fragment 'selects another project directory before it can be admitted' "$FUNCNAME: ${opt}" || return ;;
+      *) assert_err_contains_fragment 'selects a storage destination before it can be admitted' "$FUNCNAME: ${opt}" || return ;;
+    esac
     [[ "$(grep -c '^REAL' "${LOG_FILE}")" == "0" ]] || { fail "$FUNCNAME: ${opt}: npm ran before the refusal"; return; }
   done
   # a special file named as a configuration file never reaches npm
@@ -12189,7 +12193,7 @@ case_project_lane_routing_ci_dedupe_and_prune_follow_the_routing_rule() {
     : > "${LOG_FILE}"
     lane_run "npm ${verb}"
     assert_err_contains_fragment '[lane: one-shot, the committed lockfile is not a version 2 or 3 lockfile' "$FUNCNAME: ${verb}" || return
-    assert_err_contains_fragment "npm ${verb} then goes to today's older differential path" "$FUNCNAME: ${verb}" || return
+    assert_err_contains_fragment "npm ${verb} goes to today's older differential path" "$FUNCNAME: ${verb}" || return
     assert_err_contains_fragment "BLOCKED npm ${verb} —" "$FUNCNAME: ${verb}: the older path's own refusal" || return
     ! grep -q '\[lane: project\]' "${ERR_FILE}" || { fail "$FUNCNAME: ${verb}: a lane refusal"; return; }
     assert_log_not_contains_fragment 'PROJECTION' "$FUNCNAME: ${verb}" || return
