@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+[[ -n "${MOCK_SOCKET_LOG:-}" ]] && printf 'call\n' >> "$MOCK_SOCKET_LOG"
+# evidence-only suite: one named package whose score never arrives (the provider has already printed what it reflects)
+if [[ -n "${MOCK_SOCKET_STALL_NAME:-}" && "$*" == *"$MOCK_SOCKET_STALL_NAME"* ]]; then
+  printf '{"message":"working on it for token %s"}\n' "${SOCKET_SECURITY_API_TOKEN:-}"
+  sleep 30
+  exit 1
+fi
+# evidence-only suite: one named package whose score cannot be fetched
+if [[ -n "${MOCK_SOCKET_FAIL_NAME:-}" && "$*" == *"$MOCK_SOCKET_FAIL_NAME"* ]]; then printf '{"message":"mock failure"}\n'; exit 1; fi
+# Mirrors the real package-score envelope: `transitively` is an OBJECT
+# describing the dependency tree (dependencyCount/alerts/score/...), not an
+# array. Pinned live in tests/live/socket_envelope.sh — a fixture that invents
+# a shape tests a fiction, which is exactly how an every-response-invalid bug
+# passed 50 green cases once already.
+envelope() {
+  local score="$1" alerts="$2"
+  printf '{"ok":true,"data":{"self":{"score":{"overall":%s},"alerts":%s},"transitively":{"dependencyCount":0,"alerts":[],"score":{"overall":100}}}}\n' "$score" "$alerts"
+}
+# The scored purl is the last non-flag argument: `... score npm name@version --json`.
+scored_version=""
+for arg in "$@"; do
+  case "$arg" in *@*) scored_version="${arg##*@}" ;; esac
+done
+case "${MOCK_SOCKET_MODE:-clean}" in
+  clean) envelope 95 '[]' ;;
+  # evidence-only suite: answers that REFLECT the credential in the environment, as a misbehaving provider could
+  reflect-error) printf '{"message":"Unauthorized for token %s","cause":"credential %s"}\n' "${SOCKET_SECURITY_API_TOKEN:-}" "${SOCKET_SECURITY_API_TOKEN:-}"; exit 1 ;;
+  reflect-success) printf '{"ok":true,"data":{"self":{"score":{"overall":95},"alerts":[]},"transitively":{"dependencyCount":0,"alerts":[],"score":{"overall":100}}},"diagnostic":"%s"}\n' "${SOCKET_SECURITY_API_TOKEN:-}" ;;
+  # Primary (1.0.0) is clean, the sibling major (2.0.0) is malicious: the exact
+  # shape of the coverage gap review F1 found after GuardDog's multi-version
+  # scan was removed.
+  sibling-malware)
+    if [[ "$scored_version" == "2.0.0" ]]; then
+      envelope 95 '[{"name":"malware","severity":"critical","category":"supplyChainRisk","example":"npm/fixture@2.0.0"}]'
+    else
+      envelope 95 '[]'
+    fi
+    ;;
+  sibling-error)
+    if [[ "$scored_version" == "2.0.0" ]]; then
+      printf '{"message":"mock failure"}\n'; exit 1
+    else
+      envelope 95 '[]'
+    fi
+    ;;
+  # A critical alert in a category safe does not map: must never reach PASS.
+  unknown-category) envelope 95 '[{"name":"future-risk","severity":"critical","category":"newCategory","example":"npm/fixture@1.0.0"}]' ;;
+  malware) envelope 95 '[{"name":"malware","severity":"critical","category":"supplyChainRisk","example":"npm/fixture@1.0.0"}]' ;;
+  critical-cve) envelope 95 '[{"name":"cve","severity":"critical","category":"vulnerability","example":"npm/fixture@1.0.0"}]' ;;
+  high) envelope 95 '[{"name":"risky","severity":"high","category":"supplyChainRisk","example":"npm/fixture@1.0.0"}]' ;;
+  low) envelope 40 '[]' ;;
+  bad-severity) envelope 95 '[{"name":"odd","severity":"unknown","category":"supplyChainRisk","example":"npm/fixture@1.0.0"}]' ;;
+  missing-name) envelope 95 '[{"severity":"critical","category":"supplyChainRisk"}]' ;;
+  missing-category) envelope 95 '[{"name":"incomplete","severity":"critical"}]' ;;
+  bad-score) printf '{"ok":true,"data":{"self":{"score":{"overall":"95"},"alerts":[]}}}\n' ;;
+  missing-self) printf '{"ok":true,"data":{"transitively":{"dependencyCount":0}}}\n' ;;
+  non-object-alert) envelope 95 '[true]' ;;
+  rate) printf '{"message":"Too Many Requests","cause":"429"}\n'; exit 1 ;;
+  # Socket answered and simply has no record of this package version (404) —
+  # an absence of behavioral data, distinct from an outage.
+  not-found) printf '{"message":"Not Found","cause":"404"}\n'; exit 1 ;;
+  sibling-not-found)
+    if [[ "$scored_version" == "2.0.0" ]]; then
+      printf '{"message":"Not Found","cause":"404"}\n'; exit 1
+    else
+      envelope 95 '[]'
+    fi
+    ;;
+  # Carries account context the way a real provider error body can. The
+  # sentinel must reach no receipt, cache, stdout, or stderr (review F5).
+  auth-leaky) printf '{"message":"Unauthorized for operator@example.com","cause":"account SENTINELACCT9137"}\n'; exit 1 ;;
+  pending) sleep 5 ;;
+  *) printf '{"message":"mock failure"}\n'; exit 1 ;;
+esac

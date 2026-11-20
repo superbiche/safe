@@ -652,6 +652,31 @@ decided result is also written, with `gate_exit`, to `SAFE_AUDIT_RESULT_OUT`
 when the caller sets it; the install gates use it to put the BLOCK override
 to the operator without re-running the audit.
 
+### Evidence-only mode
+
+```bash
+safe audit package-audit <pkg>@<exact version> --ecosystem npm --evidence-only          # one root, one document
+safe audit package-audit --ecosystem npm --evidence-only < {"roots":[…],"cached":[…]}  # the batch (one process)
+```
+
+The project lane's reading of Socket on the packages a command names. It collects what the per-root audit collects,
+with the same verdict engine and the same Socket cache, then reports the Socket facts and stops: it asks nothing (a
+consent ask is reported as `consent_required`; the batch refuses a terminal as its input), decides nothing (no allow
+policy, no `--gate` exit) and writes nothing, from a cold start: it is dispatched before the initialisation that creates
+the registries and the host-allow log, stores no cache entry, and gives a private identity a read-only `unavailable`
+outcome without running the private decision. A root's document carries its `outcome` (`clear`, `adverse`,
+`unavailable`, `rate_limited`, `consent_required`, `pending`, `blocked`), `gate_exit` (the exit the install gate takes
+for that Socket result: 0, 10, 11, 12, 13, 14, 20), the Socket line, the Socket causes and whether the result came from
+the cache. It takes the Socket tool from the operator's tool configuration (`tools.json`, then the standard install
+directories) and never from `PATH`. For `cached`, the batch reads the cache alone, no call, one requested key at a time:
+the blocking results found are reported, an absent entry is nothing, an entry that cannot be read or is dated in the
+future is a `cache_gap`, and the blocks already read are kept. Only a path shown to be absent (ENOENT) is an absent cache directory; a permission or input/output failure is a gap.
+The credential helper (`bw-env-run`) is resolved like the Socket tool, from the operator's locations only; when
+injection is needed and it is not there, the reading is `unavailable`. `--evidence-progress <file>` (with the batch)
+appends each root's document as it completes, so a supervising process keeps what was classified before it stopped the
+batch. The mode is set by the parsed flag alone: a value of its internal variable in the environment is overwritten at
+start-up and reaches nothing. The normal paths of `package-audit` are unchanged.
+
 ### Install gate mode
 
 The shell install wrappers and `safe install` invoke the check as a gate:

@@ -345,3 +345,35 @@ func TestProjectGraphResolvesLinksAndReadsAnyVersion(t *testing.T) {
 		t.Fatalf("the physical target leaves the project: code = %d, %s %s", code, stdout, stderr)
 	}
 }
+
+// project-decide --socket reads the Socket evidence strictly and judges it: a named root that Socket rates adverse is
+// policy (100), a document that cannot be read is exit 3 (never "nothing found").
+func TestProjectDecideReadsTheSocketEvidence(t *testing.T) {
+	dir := t.TempDir()
+	after := laneLock(t, dir, "after.json", nil, "p", "1.0.0")
+	evidence := laneEvidence(t, dir, `{"schema_version":1,"policy":{"block_severities":["critical"]},"identities":[{"name":"p","version":"1.0.0","coverage":"complete","gap":"","advisories":[]}],"blocklist":[]}`)
+	write := func(name, doc string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	adverse := write("adverse.json", `{"schema_version":1,"roots":[{"name":"p","version":"1.0.0","outcome":"adverse","gate_exit":10,"line":"WARN (score=40)","causes":["socket_low_score"],"cached":false}],"cached_blocks":[],"cache_gap":"","untied":[]}`)
+	code, stdout, stderr := runLane("project-decide", "--no-baseline", "--evidence", evidence, "--socket", adverse, after)
+	if code != 100 || !strings.Contains(stdout, `"class":"socket_root"`) {
+		t.Fatalf("adverse: code = %d, stdout = %s, stderr = %s", code, stdout, stderr)
+	}
+	blocked := write("blocked.json", `{"schema_version":1,"roots":[],"cached_blocks":[{"name":"p","version":"1.0.0","line":"BLOCK (critical supply-chain-risk alert)"}],"cache_gap":"","untied":[]}`)
+	code, stdout, _ = runLane("project-decide", "--no-baseline", "--evidence", evidence, "--socket", blocked, after)
+	if code != 104 || !strings.Contains(stdout, `"signal":"socket_block"`) {
+		t.Fatalf("cached block: code = %d, stdout = %s", code, stdout)
+	}
+	bad := write("bad.json", `{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":"","untied":[],"extra":1}`)
+	if code, _, _ = runLane("project-decide", "--no-baseline", "--evidence", evidence, "--socket", bad, after); code != 3 {
+		t.Fatalf("a document with an unknown member: code = %d, want 3", code)
+	}
+	if code, _, _ = runLane("project-decide", "--no-baseline", "--evidence", evidence, "--socket", filepath.Join(dir, "missing.json"), after); code != 3 {
+		t.Fatalf("a missing document: code = %d, want 3", code)
+	}
+}

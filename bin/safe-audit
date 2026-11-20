@@ -12,6 +12,10 @@ SAFE_AUDIT_VERSION="0.3.0"
 # Guarded against the VERSION file by tests/contract/drift.sh.
 SAFE_VERSION="${SAFE_VERSION:-1.75.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
+# The evidence-only mode (the project lane's reading of Socket) is set by the parsed flag alone: a value inherited from
+# the environment is overwritten here, so that it can never reach the ordinary audit.
+EVIDENCE_ONLY_RUN=0
+EVIDENCE_PROGRESS_FILE=""
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
 
@@ -5798,7 +5802,11 @@ socket_cache_replay() {
   fi
   now=$(date +%s)
   age=$(( now - fetched ))
-  (( age >= 0 )) || age=0
+  if (( age < 0 )); then
+    # an entry dated in the future is not a valid entry for the evidence-only reading
+    if [[ "${EVIDENCE_ONLY_RUN:-0}" == "1" ]]; then rm -f "$cached_result"; return 1; fi
+    age=0
+  fi
   if (( age > ttl )); then
     SOCKET_CACHE_STALE_SCORE=$(jq -r '.data.self.score.overall // empty' "$cached_result" 2>/dev/null || true)
     [[ "$SOCKET_CACHE_STALE_SCORE" =~ ^[0-9]+([.][0-9]+)?$ ]] || SOCKET_CACHE_STALE_SCORE=""
@@ -5817,6 +5825,8 @@ socket_cache_replay() {
 socket_cache_store() {
   local ecosystem="$1" name="$2" version="$3" raw="$4"
   local ttl identity key tmp cache_dir
+  # the evidence-only reading stores nothing: it only reads what is already there
+  [[ "${EVIDENCE_ONLY_RUN:-0}" != "1" ]] || return 0
   ttl=$(socket_cache_ttl_seconds)
   (( ttl > 0 )) || return 0
   socket_envelope_valid "$raw" || return 0
@@ -5870,7 +5880,11 @@ socket_score_json() {
   # mise shim, which the old two-directory prepend never covered, so a caller
   # whose PATH lacked the shim dir got "socket CLI not available" — a WARN
   # that reads like a supply-chain signal rather than a missing binary.
-  socket_cmd=$(resolve_local_tool socket)
+  if [[ "${EVIDENCE_ONLY_RUN:-0}" == "1" ]]; then
+    socket_cmd=$(evidence_socket_tool)
+  else
+    socket_cmd=$(resolve_local_tool socket)
+  fi
   if [[ -z "$socket_cmd" ]]; then
     printf '{"available":false,"status":"error","note":"socket CLI not available"}\n' > "$output"
     return 0
@@ -5880,7 +5894,21 @@ socket_score_json() {
   # the CLI binary directly — inject it from Bitwarden via bw-env-run when the
   # helper and its mapping file exist and the token is not already in the env.
   local bw_env_run socket_mapping="$HOME/.config/setup-new-machines/bw-env.d/socket.env"
-  bw_env_run=$(PATH="$HOME/.local/bin:$PATH" command -v bw-env-run 2>/dev/null || true)
+  if [[ "${EVIDENCE_ONLY_RUN:-0}" == "1" ]]; then
+    # the evidence reading resolves the credential helper like the Socket tool: the operator's locations only, never the
+    # caller's PATH; when injection is needed and the helper is not there, the reading is unavailable
+    bw_env_run=""
+    local helper_dir
+    for helper_dir in "${TOOL_PROBE_DIRS[@]}"; do
+      if [[ -x "$helper_dir/bw-env-run" && ! -d "$helper_dir/bw-env-run" ]]; then bw_env_run="$helper_dir/bw-env-run"; break; fi
+    done
+    if [[ -z "$bw_env_run" && -z "${SOCKET_SECURITY_API_TOKEN:-}" && -f "$socket_mapping" ]]; then
+      printf '{"available":true,"status":"error","reason":"helper","note":"socket credential helper not found in the operator'"'"'s locations"}\n' > "$output"
+      return 0
+    fi
+  else
+    bw_env_run=$(PATH="$HOME/.local/bin:$PATH" command -v bw-env-run 2>/dev/null || true)
+  fi
   local can_inject=false
   [[ -n "$bw_env_run" && -f "$socket_mapping" ]] && can_inject=true
 
@@ -9476,8 +9504,186 @@ private_python_project_command() {
   return 0
 }
 
+# --- the evidence-only mode of package-audit (the project lane's named roots) ----------------------------------------
+#
+# `package-audit --evidence-only` collects what today's per-root audit collects and decides with the SAME verdict
+# engine, then REPORTS the Socket facts and stops. It asks nothing (no prompt, stdin is closed, a consent ask is
+# a fact: consent_required), decides nothing (the verdict is not applied: the lane's decision is safe-core's) and
+# writes no record: no check file, no receipt, no install-known entry, no consent, no host-allow or followed-grant
+# record, nothing exported. It returns before the first of those writes (package_audit_command: the emit point
+# sits before `result_json` is made). What it may touch is what any reading touches: the scratch directory it
+# removes and Socket's own result cache.
+#
+#   package-audit <name>@<version> --ecosystem npm --evidence-only       one root, one document
+#   package-audit --ecosystem npm --evidence-only < {"roots":[...],"cached":[...]}
+#       the batch the lane calls ONCE: every root is audited in this process (never one safe-audit process per
+#       artifact); `cached` are identities whose Socket result is read from the cache alone, no call.
+#
+# A root's document carries the Socket outcome the gate would take for it, by the auditor's own rules: the Socket
+# causes of the verdict, the consent and pending states, and gate_exit, the exit the install gate takes for that
+# Socket result alone (0 clear, 10 adverse, 11 infrastructure, 12 rate limit, 13 consent, 14 pending, 20 block).
+package_audit_evidence_emit() { # name version resolved line causes_json consent pending cached [forced outcome]
+  local name="$1" version="$2" resolved="$3" line="$4" causes="$5" consent="$6" pending="$7" cached="$8" forced="${9:-}"
+  local socket_causes outcome gate_exit
+  socket_causes=$(jq -c '[.[] | select(startswith("socket_"))]' <<<"$causes" 2>/dev/null) || socket_causes='[]'
+  if [[ "$forced" == "unavailable" ]]; then
+    outcome=unavailable; gate_exit=11
+  elif [[ "$resolved" != "true" ]]; then
+    outcome=unavailable; gate_exit=11
+  elif jq -e 'index("socket_malware") != null' <<<"$socket_causes" >/dev/null 2>&1; then
+    outcome=blocked; gate_exit=20
+  elif [[ "$consent" == "true" ]]; then
+    outcome=consent_required; gate_exit=13
+  elif [[ "$pending" == "true" ]]; then
+    outcome=pending; gate_exit=14
+  elif [[ "$socket_causes" == "[]" ]]; then
+    outcome=clear; gate_exit=0
+  elif jq -e 'all(.[]; . == "socket_rate_limited")' <<<"$socket_causes" >/dev/null 2>&1; then
+    outcome=rate_limited; gate_exit=12
+  elif gate_warn_is_infra_only "$socket_causes"; then
+    outcome=unavailable; gate_exit=11
+  else
+    outcome=adverse; gate_exit=10
+  fi
+  jq -cn --arg name "$name" --arg version "$version" --arg outcome "$outcome" --argjson gate_exit "$gate_exit" \
+    --arg line "$line" --argjson causes "$socket_causes" --argjson cached "$cached" \
+    '{name: $name, version: $version, outcome: $outcome, gate_exit: $gate_exit, line: $line, causes: $causes, cached: $cached}'
+}
+
+package_audit_evidence_batch() {
+  local ecosystem="${1:-npm}" input roots='[]' blocks='[]' cache_gap="" root_json rc spec name version doc
+  if [[ -t 0 ]]; then
+    die "package-audit --evidence-only: the request is read from stdin; refusing to wait on a terminal"
+  fi
+  input=$(cat 2>/dev/null) || input=""
+  if ! jq -e '(type == "object") and ((.roots | type) == "array") and ((.cached | type) == "array")
+      and ([.roots[], .cached[] | (.name | type == "string") and (.version | type == "string") and (.name | length > 0) and (.version | length > 0)] | all)' \
+      <<<"$input" >/dev/null 2>&1; then
+    die "package-audit --evidence-only: expected {\"roots\":[{\"name\":..,\"version\":..}],\"cached\":[...]} on stdin"
+  fi
+  while IFS= read -r root_json; do
+    name=$(jq -r '.name' <<<"$root_json"); version=$(jq -r '.version' <<<"$root_json")
+    rc=0
+    # one subshell per root, in THIS process: closed stdin (nothing can be asked), its own failure contained
+    doc=$( ( package_audit_command "${name}@${version}" --ecosystem "$ecosystem" --evidence-only ) </dev/null 2>/dev/null ) || rc=$?
+    if (( rc != 0 )) || ! jq -e '(type == "object") and .name == "'"$name"'" and (.outcome | type == "string")' <<<"$doc" >/dev/null 2>&1; then
+      doc=$(jq -cn --arg name "$name" --arg version "$version" --arg line "audit infrastructure unavailable (the evidence reader exited ${rc})" \
+        '{name: $name, version: $version, outcome: "unavailable", gate_exit: 11, line: $line, causes: [], cached: false}')
+    fi
+    roots=$(jq -c --argjson d "$doc" '. + [$d]' <<<"$roots")
+    # each completed root is kept where the supervising process can read it: a deadline later in the batch loses
+    # nothing that was already classified
+    [[ -z "$EVIDENCE_PROGRESS_FILE" ]] || jq -c . <<<"$doc" >> "$EVIDENCE_PROGRESS_FILE" 2>/dev/null || true
+  done < <(jq -c '.roots[]' <<<"$input")
+  # the cache alone, no call: a blocking Socket result already cached for an artifact counts, named or not
+  if [[ "$(jq '.cached | length' <<<"$input")" != 0 ]]; then
+    local cached_doc
+    if cached_doc=$(package_audit_cached_blocks "$ecosystem" "$(jq -c '.cached' <<<"$input")") && jq -e '(.blocks | type == "array") and (.gap | type == "string")' <<<"$cached_doc" >/dev/null 2>&1; then
+      blocks=$(jq -c '.blocks' <<<"$cached_doc")
+      cache_gap=$(jq -r '.gap' <<<"$cached_doc")
+    else
+      blocks='[]'; cache_gap="the Socket cache could not be read"
+    fi
+  fi
+  jq -cn --argjson roots "$roots" --argjson blocks "$blocks" --arg gap "$cache_gap" \
+    '{schema_version: 1, roots: $roots, cached_blocks: $blocks, cache_gap: $gap}'
+}
+
+# The Socket tool of the evidence-only reading: the operator's tool configuration names it (tools.json, the absolute
+# path captured when the machine was detected), and the standard install directories hold it when the configuration
+# names none; the caller's PATH is never consulted, so a tool placed there cannot answer for Socket. Nothing is
+# written. Prints the path, or nothing.
+evidence_socket_tool() {
+  local machine="" cached="" dir
+  if [[ -r "$MACHINES_FILE" ]]; then
+    machine=$(jq -r '.machines | to_entries[]? | select(.value.type == "local") | .key' "$MACHINES_FILE" 2>/dev/null | head -n 1) || machine=""
+  fi
+  [[ -n "$machine" ]] || machine="$DEFAULT_LOCAL_MACHINE"
+  if [[ -r "$TOOLS_FILE" ]]; then
+    cached=$(jq -r --arg m "$machine" '.[$m].socket // empty' "$TOOLS_FILE" 2>/dev/null) || cached=""
+  fi
+  # a configured value that is not an absolute path (a bare tool name) names no tool: it would be a PATH lookup
+  if [[ "$cached" == /* && -x "$cached" ]]; then
+    printf '%s' "$cached"
+    return 0
+  fi
+  for dir in "${TOOL_PROBE_DIRS[@]}"; do
+    if [[ -x "$dir/socket" && ! -d "$dir/socket" ]]; then
+      printf '%s' "$dir/socket"
+      return 0
+    fi
+  done
+  printf ''
+}
+
+# Whether the package is one the operator declared private. Read-only: the private decision (which records an event in
+# the audit log) is never run. Prints "private" / "unknown" for those, nothing for a public name.
+evidence_private_lane() {
+  local ecosystem="$1" core match lane
+  case "$ecosystem" in npm|go|python) ;; *) return 0 ;; esac
+  private_stores_present || return 0
+  trust_grant_ok "private-registry" || return 0
+  if ! core=$(private_core_bin); then printf 'unknown'; return 0; fi
+  if ! match=$(private_core "$core" match --ecosystem "$ecosystem" --name "$PKG_NAME" 2>/dev/null); then printf 'unknown'; return 0; fi
+  lane=$(jq -r '.lane' <<<"$match" 2>/dev/null) || { printf 'unknown'; return 0; }
+  case "$lane" in private|conflict) printf 'private' ;; esac
+}
+
+# The identities among $2 (a JSON list of {name,version}) whose Socket result is in the cache, found by looking up each
+# requested key (never by enumerating the directory): an absent entry is not a failure, an entry that is present and
+# cannot be read is, and every blocking result that validates is kept whatever else fails. The replay and the
+# classifier are the auditor's own (socket_cache_replay, socket_classify); no call is made. Prints
+# {"blocks":[{name,version,line}],"gap":""|"<why>"}.
+package_audit_cached_blocks() {
+  local ecosystem="$1" wanted="$2" dir ttl gap="" blocks='[]' n i key entry tmp work
+  local -a materials=() names=() versions=() keys=()
+  ttl=$(socket_cache_ttl_seconds)
+  if (( ttl <= 0 )); then printf '{"blocks":[],"gap":""}\n'; return 0; fi
+  dir=$(socket_cache_dir)
+  # only a path shown to be ABSENT is absent: ENOENT is the one answer that is; a permission or input/output failure, a
+  # component that is not a directory, anything else, is a gap
+  local stat_err
+  stat_err=$(LC_ALL=C stat -- "$dir" 2>&1 >/dev/null) || {
+    if [[ "$stat_err" == *"No such file or directory"* ]]; then printf '{"blocks":[],"gap":""}\n'; return 0; fi
+    printf '{"blocks":[],"gap":"the Socket cache directory cannot be inspected"}\n'; return 0
+  }
+  if [[ ! -d "$dir" || ! -r "$dir" || ! -x "$dir" ]]; then
+    printf '{"blocks":[],"gap":"the Socket cache directory cannot be read"}\n'; return 0
+  fi
+  # the canonical key material of every wanted identity, in one pass; hashed in one more
+  mapfile -t materials < <(jq -cS --arg eco "$ecosystem" '.[] | {schema:1,source:{name:"socket",envelope:1},identity:{ecosystem:$eco,name:.name,version:.version}}' <<<"$wanted" 2>/dev/null)
+  mapfile -t names < <(jq -r '.[].name' <<<"$wanted" 2>/dev/null)
+  mapfile -t versions < <(jq -r '.[].version' <<<"$wanted" 2>/dev/null)
+  n=${#materials[@]}
+  if (( n == 0 || n != ${#names[@]} || n != ${#versions[@]} )); then
+    printf '{"blocks":[],"gap":"the Socket cache request cannot be read"}\n'; return 0
+  fi
+  work=$(mktemp -d "${TMPDIR:-/tmp}/safe-evidence-keys.XXXXXX") || { printf '{"blocks":[],"gap":"the Socket cache cannot be read"}\n'; return 0; }
+  for ((i = 0; i < n; i++)); do printf '%s' "${materials[$i]}" > "$work/$i"; done
+  mapfile -t keys < <(cd "$work" && sha256sum -- $(seq 0 $((n - 1))) 2>/dev/null | awk '{print $1}')
+  rm -rf "$work"
+  if (( ${#keys[@]} != n )); then printf '{"blocks":[],"gap":"the Socket cache cannot be read"}\n'; return 0; fi
+  tmp=$(mktemp "${TMPDIR:-/tmp}/safe-evidence-cache.XXXXXX") || { printf '{"blocks":[],"gap":"the Socket cache cannot be read"}\n'; return 0; }
+  for ((i = 0; i < n; i++)); do
+    entry="$dir/${keys[$i]}.json"
+    if [[ ! -e "$entry" && ! -L "$entry" ]]; then continue; fi       # absent: nothing cached, not a failure
+    if [[ ! -f "$entry" || ! -r "$entry" ]]; then gap="a Socket cache entry cannot be read"; continue; fi
+    SOCKET_CACHE_STALE_AGE_DAYS=""
+    if socket_cache_replay "$ecosystem" "${names[$i]}" "${versions[$i]}" "$tmp"; then
+      [[ "$(socket_classify "$tmp")" == "malware" ]] || continue
+      blocks=$(jq -c --arg n "${names[$i]}" --arg v "${versions[$i]}" '. + [{name: $n, version: $v, line: "BLOCK (critical supply-chain-risk alert)"}]' <<<"$blocks")
+    elif [[ -n "$SOCKET_CACHE_STALE_AGE_DAYS" ]]; then
+      continue                                                       # expired: no verdict, not a failure
+    else
+      gap="a Socket cache entry is not valid"                        # unreadable, malformed, or dated in the future
+    fi
+  done
+  rm -f "$tmp"
+  jq -cn --argjson blocks "$blocks" --arg gap "$gap" '{blocks: $blocks, gap: $gap}'
+}
+
 package_audit_command() {
-  local ecosystem="" json_mode=0 spec="" op="install" gate=""
+  local ecosystem="" json_mode=0 spec="" op="install" gate="" evidence_only=0
   # Target-context selectors from the audited command line (dynamically
   # scoped: the resolver helpers read them). CHECK_EFFECTIVE_SOURCES is the
   # argv set plus any env/npmrc-configured npm source, computed at the trust
@@ -9513,6 +9719,16 @@ package_audit_command() {
       --json)
         json_mode=1
         shift
+        ;;
+      --evidence-only)
+        evidence_only=1
+        EVIDENCE_ONLY_RUN=1
+        shift
+        ;;
+      --evidence-progress)
+        [[ $# -ge 2 ]] || die "--evidence-progress needs a file"
+        EVIDENCE_PROGRESS_FILE="$2"
+        shift 2
         ;;
       --find-links-selected)
         CHECK_FIND_LINKS_SELECTED=1
@@ -9563,7 +9779,14 @@ package_audit_command() {
         ;;
     esac
   done
-  [[ -z "$spec" ]] && die "usage: safe audit package-audit <pkg>[@<version>] [--ecosystem <name>] [--installer <name>] [--op install|update] [--gate install] [--dist-tag <t>] [--registry <url>] [--project-dir <dir>] [--json]"
+  [[ -z "$EVIDENCE_PROGRESS_FILE" ]] || (( evidence_only )) || die "--evidence-progress needs --evidence-only"
+  if (( evidence_only )) && [[ -z "$spec" ]]; then
+    [[ -z "$gate" ]] || die "--evidence-only takes no --gate"
+    package_audit_evidence_batch "${ecosystem:-npm}"
+    return
+  fi
+  (( ! evidence_only )) || [[ -z "$gate" ]] || die "--evidence-only takes no --gate"
+  [[ -z "$spec" ]] && die "usage: safe audit package-audit <pkg>[@<version>] [--ecosystem <name>] [--installer <name>] [--op install|update] [--gate install] [--dist-tag <t>] [--registry <url>] [--project-dir <dir>] [--json] [--evidence-only]"
   [[ "$op" == "install" || "$op" == "update" ]] || die "--op must be install or update"
   [[ -z "$gate" || "$gate" == "install" ]] || die "--gate supports only: install"
 
@@ -9601,8 +9824,21 @@ package_audit_command() {
   # private-registry lane decides it from origin binding and pinned
   # integrity (255 = not a private name, continue the public audit).
   local private_rc=0
-  private_lane_audit "$ecosystem" "$gate" "$json_mode" "$scratch" || private_rc=$?
-  if (( private_rc != 255 )); then
+  if (( evidence_only )); then
+    # Socket evidence is never applied to a private-origin artifact; the private decision (which writes an event to the
+    # audit log) is not run. A name that cannot be told apart from a private one is unavailable, never clear.
+    local private_state
+    private_state=$(evidence_private_lane "$ecosystem")
+    if [[ -n "$private_state" ]]; then
+      package_audit_evidence_emit "$PKG_NAME" "${PKG_VERSION:-}" "true" \
+        "Socket evidence is not applied to a private-origin artifact" "[]" false false false unavailable
+      rm -rf "$scratch"
+      return 0
+    fi
+  else
+    private_lane_audit "$ecosystem" "$gate" "$json_mode" "$scratch" || private_rc=$?
+  fi
+  if (( ! evidence_only )) && (( private_rc != 255 )); then
     rm -rf "$scratch"
     return "$private_rc"
   fi
@@ -10172,6 +10408,18 @@ package_audit_command() {
   local warn_causes_json='[]'
   if (( ${#warn_causes[@]} > 0 )); then
     warn_causes_json=$(printf '%s\n' "${warn_causes[@]}" | jq -cR . | jq -cs .)
+  fi
+
+  # The evidence-only mode ends here: the facts are reported and nothing below this point runs. Everything
+  # below writes (the check file, the receipts, install-known, followed-grant records, local approvals) or
+  # decides (the gate's allow policy and its exits).
+  if (( evidence_only )); then
+    package_audit_evidence_emit "$PKG_NAME" "${primary_version:-}" "$( (( resolution_ok )) && printf true || printf false)" \
+      "$socket_line" "$warn_causes_json" "$( (( socket_consent_required )) && printf true || printf false)" \
+      "$( (( socket_pending )) && printf true || printf false)" \
+      "$(jq -r '(.cached // false) == true' "$socket_json" 2>/dev/null || printf false)"
+    rm -rf "$scratch"
+    return 0
   fi
 
   local result_json resolved_versions_json='[]'
@@ -12290,6 +12538,19 @@ FILES
 EOF
 }
 
+# Whether the flag is an option of package-audit, read as its parser reads the arguments: the value of an option that
+# takes one is never the flag.
+evidence_flag_present() {
+  while (( $# > 0 )); do
+    case "$1" in
+      --evidence-only) return 0 ;;
+      --ecosystem|--installer|--npm-userconfig|--npm-globalconfig|--op|--gate|--dist-tag|--registry|--project-dir|--evidence-progress) shift 2 || return 1 ;;
+      *) shift ;;
+    esac
+  done
+  return 1
+}
+
 main() {
   ensure_dependencies
   local cmd="${1:-}"
@@ -12321,7 +12582,12 @@ main() {
       return 0
       ;;
   esac
-  if [[ "$SAFE_AUDIT_NO_INIT" != "1" ]]; then
+  # The evidence-only reading (the project lane's) writes nothing, a cold start included: it is dispatched before the
+  # initialisation that creates the registries, the host-allow log and the directories.
+  if [[ "$cmd" == "package-audit" || "$cmd" == "check" ]] && evidence_flag_present "${@:2}"; then
+    EVIDENCE_ONLY_RUN=1
+  fi
+  if [[ "$SAFE_AUDIT_NO_INIT" != "1" && "${EVIDENCE_ONLY_RUN:-0}" != "1" ]]; then
     ensure_dirs
   fi
   case "$cmd" in
