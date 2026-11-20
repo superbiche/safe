@@ -588,6 +588,23 @@ tag_object=<sha>`. No newer tag is a quiet exit-0 no-op. Removing a signer at a
 TTY stops future release acceptance; it does not roll back an already installed
 release.
 
+## One-shot projects
+
+The npm project lane judges `install`, `update`, `ci`, `dedupe` and `prune` before they run. A project the lane cannot judge (for
+instance one pinned to an npm older than 11.17.0) can be put on the **one-shot route** by the operator: today's gate runs its commands
+and the closure is not judged on that route (`dedupe` and `prune` go to the older differential path, which refuses what it cannot
+judge).
+
+```bash
+safe run one-shot-project add [<dir>…]      # default: the current directory (operator TTY)
+safe run one-shot-project remove [<dir>…]   # operator TTY
+safe run one-shot-project list              # read-only; says when a directory was replaced
+```
+
+`add` and `remove` are operator-only (TTY, exit 102 otherwise). The entry is the physical path of the directory with its device and
+inode, kept in `one-shot-projects.json` under the canonical operator store (never a redirected one; a file that is not the
+operator's own is ignored), with no reason: the audit log records who and when. It matters only while `install.project_lane` is on.
+
 ## Scripts Allowlist
 
 `~/.npmrc` keeps `ignore-scripts=true` globally, so a package whose

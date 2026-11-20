@@ -460,6 +460,52 @@ case_npm_option_snapshot_is_consistent_and_reads_like_nopt() {
   fi
 }
 
+# The project lane's refusals are terminal (ticket 1686): every call that records a refusal or a hand-over is followed at once by a
+# return, so nothing of the lane runs between a refusal and the lane's top level, where the operator is asked.
+case_lane_refusals_and_hand_overs_return_at_once() {
+  local bad
+  bad="$(awk '
+    /^safe_gate_[a-z_]+\(\) *\{/ { fn = $1 }
+    fn ~ /^safe_gate_project_lane_(refuse|refuse_fixed|unsupported|verb_refusal|window_refuse|oneshot)\(\)$/ { next }
+    { lines[NR] = $0; names[NR] = fn }
+    END {
+      for (i = 1; i <= NR; i++) {
+        l = lines[i]
+        if (l ~ /^[[:space:]]*#/) continue
+        if (l !~ /safe_gate_project_lane_(refuse|refuse_fixed|unsupported|verb_refusal|window_refuse|oneshot)[[:space:]]/) continue
+        if (l ~ /return/) continue
+        j = i + 1
+        while (j <= NR && lines[j] ~ /^[[:space:]]*$/) j++
+        if (lines[j] !~ /^[[:space:]]*return/) printf "%d(%s) ", i, names[i]
+      }
+    }' "${ROOT}/lib/gate-lib.sh")"
+  if [[ -z "${bad}" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (a refusal or hand-over is not followed by a return, line(s): ${bad})"
+  fi
+}
+
+# The lane asks the operator about a refusal in ONE place: its top level. The hand-over flag is raised only there, in the routing
+# decision, for a standing decision and for the global form; and the confirmation prompt is called nowhere else.
+case_lane_asks_about_a_refusal_only_at_its_top_level() {
+  local bad
+  bad="$(awk '
+    /^safe_gate_[a-z_]+\(\) *\{/ { fn = $1 }
+    /^[[:space:]]*#/ { next }
+    /SAFE_GATE_LANE_PASS=1/ && fn !~ /^safe_gate_project_lane_(oneshot|conclude|run)\(\)$/ { printf "PASS=1 in %s; ", fn }
+    /safe_gate_project_lane_conclude/ && fn !~ /^safe_gate_project_lane_(in_subshell|conclude)\(\)$/ { printf "conclude called from %s; ", fn }
+    /safe_gate_project_lane_query .*one-shot route/ && fn != "safe_gate_project_lane_conclude()" { printf "one-shot question in %s; ", fn }
+    /safe_gate_project_lane_query .*you declined the one-shot route/ && fn == "safe_gate_project_lane_conclude()" { asked = 1 }
+    END { if (!asked) printf "the lane has no top-level question; " }
+  ' "${ROOT}/lib/gate-lib.sh")"
+  if [[ -z "${bad}" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (${bad})"
+  fi
+}
+
 case_contract_is_valid_json
 case_contract_has_every_required_key
 case_every_exit_code_tells_an_agent_what_to_do
@@ -481,6 +527,8 @@ case_npm_literal_sites_consult_the_classifier
 case_infra_cause_sets_match_between_gates
 case_operator_terminal_helpers_match_between_gates
 case_npm_option_snapshot_is_consistent_and_reads_like_nopt
+case_lane_refusals_and_hand_overs_return_at_once
+case_lane_asks_about_a_refusal_only_at_its_top_level
 
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

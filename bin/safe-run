@@ -3856,6 +3856,121 @@ cmd_scripts_allow_list() {
 }
 
 # ---------------------------------------------------------------------------
+# Subcommands: one-shot-project
+# The operator's standing decision to put a project on the one-shot route of the npm project lane (today's gate, which does
+# not judge the closure). Kept ONLY in the canonical operator store, by the physical path of the project directory and its
+# device and inode (a replaced directory is not honoured). It carries no reason: the audit log is the attribution (the
+# 2026-10-13 ruling). Set and withdrawn at the operator's terminal only; `list` is read-only.
+# ---------------------------------------------------------------------------
+ONE_SHOT_PROJECTS_FILE="$CANONICAL_RUN_CONFIG_DIR/one-shot-projects.json"
+
+cmd_one_shot_project() {
+  local sub="${1:-list}"
+  shift || true
+  case "$sub" in
+    add)        cmd_one_shot_project_change add "$@" ;;
+    remove|rm)  cmd_one_shot_project_change remove "$@" ;;
+    list|ls|"") cmd_one_shot_project_list ;;
+    *)          die "unknown one-shot-project subcommand: $sub" ;;
+  esac
+}
+
+# The store is the operator's own: a regular file of this user that nobody else can write.
+one_shot_projects_readable() {
+  local f="$ONE_SHOT_PROJECTS_FILE"
+  [[ -f "$f" && ! -L "$f" ]] || return 1
+  [[ "$(stat -c '%u' -- "$f" 2>/dev/null)" == "$(id -u)" ]] || return 1
+  [[ "$(( 8#$(stat -c '%a' -- "$f" 2>/dev/null || echo 777) & 8#022 ))" == 0 ]] || return 1
+  jq -e '(.projects // {}) | type == "object"' "$f" >/dev/null 2>&1
+}
+
+cmd_one_shot_project_list() {
+  printf '%-60s %-26s %s\n' "PROJECT" "ADDED" "STATE"
+  if [[ -e "$ONE_SHOT_PROJECTS_FILE" ]] && ! one_shot_projects_readable; then
+    err "the one-shot project store is not readable as the operator's own (owner, permissions or content): it is ignored, so no project is on the one-shot route"
+    return 0
+  fi
+  [[ -f "$ONE_SHOT_PROJECTS_FILE" ]] || return 0
+  local path added dev inode state now
+  while IFS=$'\t' read -r path added dev inode; do
+    [[ -n "$path" ]] || continue
+    if [[ ! -d "$path" ]]; then
+      state="directory gone"
+    else
+      now="$(stat -c '%d:%i' -- "$path" 2>/dev/null)" || now=""
+      if [[ "$now" == "${dev}:${inode}" ]]; then state="honoured"; else state="not honoured (directory replaced)"; fi
+    fi
+    printf '%-60s %-26s %s\n' "$path" "$added" "$state"
+  done < <(jq -r '(.projects // {}) | to_entries[] | [.key, (.value.added // ""), (.value.dev | tostring), (.value.inode | tostring)] | @tsv' "$ONE_SHOT_PROJECTS_FILE")
+}
+
+cmd_one_shot_project_change() {
+  local verb="$1"
+  shift
+  local -a dirs=() paths=()
+  local d p
+  if ! trust_store_is_canonical; then
+    err "BLOCKED: the one-shot project store lives only in the canonical operator store ($CANONICAL_RUN_CONFIG_DIR); a redirected root is never used for it"
+    exit 100
+  fi
+  if ! safe_gate_operator_terminal; then
+    err "BLOCKED: one-shot-project ${verb} requires an interactive operator terminal"
+    err "  ask the operator to run: safe run one-shot-project ${verb} ${*:-<dir>}"
+    err "  agent contract: safe explain"
+    exit 102
+  fi
+  dirs=("$@")
+  (( ${#dirs[@]} )) || dirs=(".")
+  for d in "${dirs[@]}"; do
+    if [[ -d "$d" ]]; then
+      p="$(cd -P -- "$d" 2>/dev/null && pwd -P)" || die "cannot read the directory: $d"
+    elif [[ "$verb" == remove ]]; then
+      p="$d"
+    else
+      die "not a directory: $d"
+    fi
+    [[ "$p" == /* && "$p" != *$'\n'* ]] || die "the project path cannot be recorded exactly: $d"
+    if [[ "$verb" == add && ! -f "$p/package.json" ]]; then
+      die "no package.json in $p: only an npm project can be put on the one-shot route"
+    fi
+    paths+=("$p")
+  done
+  if [[ "$verb" == add ]]; then
+    printf '%s\n' "safe run: these projects will take the one-shot route for every npm install, update, ci, dedupe and prune:" >&2
+    for p in "${paths[@]}"; do printf '  %s\n' "$p" >&2; done
+    printf '%s\n' "safe run: today's gate runs those commands; the closure of a project install is NOT judged on that route (dedupe and prune go to the older differential path)." >&2
+    printf '%s' "safe run: put them on the one-shot route? [y/N] " >&2
+    local answer=""
+    IFS= read -r answer </dev/tty || answer=""
+    [[ "$answer" == y || "$answer" == Y ]] || die "one-shot-project add cancelled"
+  fi
+  mkdir -p "$CANONICAL_RUN_CONFIG_DIR"
+  local f="$ONE_SHOT_PROJECTS_FILE" tmp doc
+  if [[ -e "$f" ]]; then
+    one_shot_projects_readable || die "the one-shot project store is not the operator's own (owner, permissions or content): fix or remove $f first"
+    doc="$(cat -- "$f")"
+  else
+    doc='{"projects":{}}'
+  fi
+  for p in "${paths[@]}"; do
+    if [[ "$verb" == add ]]; then
+      doc="$(jq -c --arg p "$p" --arg t "$(now_iso)" --arg dev "$(stat -c '%d' -- "$p")" --arg ino "$(stat -c '%i' -- "$p")" \
+        '.projects //= {} | .projects[$p] = {added: $t, dev: ($dev | tonumber), inode: ($ino | tonumber)}' <<<"$doc")" || die "cannot update the store"
+      audit_log "one-shot-project" "$p" "ONE_SHOT_PROJECT_ADD" "$(context_label)" "" || true
+      info "project put on the one-shot route: $p"
+    else
+      doc="$(jq -c --arg p "$p" 'del(.projects[$p])' <<<"$doc")" || die "cannot update the store"
+      audit_log "one-shot-project" "$p" "ONE_SHOT_PROJECT_REMOVE" "$(context_label)" "" || true
+      info "project taken off the one-shot route: $p"
+    fi
+  done
+  tmp="$(stage_beside "$f")"
+  printf '%s\n' "$doc" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$f"
+}
+
+# ---------------------------------------------------------------------------
 # Subcommands: block
 # ---------------------------------------------------------------------------
 cmd_block() {
@@ -4467,6 +4582,9 @@ SUBCOMMANDS
                                               global ignore-scripts unchanged
   scripts-allow remove <pkg>                  Revoke scripts grant
   scripts-allow list                          Show scripts grants
+  one-shot-project add [<dir>…]               Operator (TTY): put npm projects on the one-shot route
+  one-shot-project remove [<dir>…]            Operator (TTY): take them off it
+  one-shot-project list                       Show the projects on it (read-only)
 
   block add <pkg>                             Block a package
   block remove <pkg>                          Unblock
@@ -4551,6 +4669,7 @@ main() {
       host-allow) shift; cmd_host_allow "$@" ;;
       private-registry) shift; cmd_private_registry "$@" ;;
       scripts-allow) shift; cmd_scripts_allow "$@" ;;
+      one-shot-project) shift; cmd_one_shot_project "$@" ;;
       block)      shift; cmd_block "$@" ;;
       audit)      shift; cmd_audit "$@" ;;
       status)     shift; cmd_status "$@" ;;
