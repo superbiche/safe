@@ -79,6 +79,9 @@ type Report struct {
 	Socket  *SocketReport  `json:"socket,omitempty"`
 	Classes []ClassOutcome `json:"classes"`
 	Outcome Outcome        `json:"outcome"`
+	// Records are the artifacts of a clear decision the gate may leave an install record for, after a verified
+	// materialisation (see records.go). Empty unless the decision is clear.
+	Records []RecordItem `json:"records"`
 }
 
 // BaselineStatus says what the difference was taken against.
@@ -207,6 +210,7 @@ func Decide(in Input) Report {
 		Advisories:    AdvisoryReport{Fixed: []FixedAdvisory{}, AlreadyPresent: []PresentAdvisory{}, Introduced: []IntroducedAdvice{}},
 		Malice:        []MaliceItem{},
 		Coverage:      []CoverageGap{},
+		Records:       []RecordItem{},
 	}
 	baseline := in.Baseline
 	switch {
@@ -300,6 +304,7 @@ func Decide(in Input) Report {
 	if !report.Bindability.Bound {
 		report.Outcome = Outcome{Status: "unbound", Exit: ExitOperator}
 	}
+	report.Records = recordsFor(report, in, evidence)
 	return report
 }
 

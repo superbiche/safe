@@ -20,8 +20,8 @@ const validEvidence = `{
 const validAcceptances = `{
   "schema_version": 1,
   "acceptances": [
-    {"kind": "local_exact_approval", "name": "p", "version": "1.0.0", "host": "registry.npmjs.org", "advisories": []},
-    {"kind": "followed_advisory_override", "name": "p", "version": "1.0.0", "host": "registry.npmjs.org", "advisories": ["GHSA-abcd-0001"]}
+    {"kind": "local_exact_approval", "name": "p", "version": "1.0.0", "host": "registry.npmjs.org", "advisories": [], "causes": []},
+    {"kind": "followed_advisory_override", "name": "p", "version": "1.0.0", "host": "registry.npmjs.org", "advisories": ["GHSA-abcd-0001"], "causes": []}
   ]
 }`
 

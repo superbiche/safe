@@ -31,6 +31,10 @@ const (
 	AcceptFollowedGrant    = "followed_grant"
 	AcceptFollowedOverride = "followed_advisory_override"
 	AcceptFollowedInstall  = "followed_install_allowance"
+	// AcceptLocalTolerance is the operator's standing install.auto_allow_tolerate: it covers the listed WARN
+	// causes of an artifact (a young release, a Socket result short of a block) and nothing else: never an
+	// advisory, never malice.
+	AcceptLocalTolerance = "local_tolerance"
 )
 
 // Severity labels of the existing ladder. "unknown" is the ladder's label for
@@ -42,6 +46,8 @@ const (
 	SeverityLow      = "low"
 	SeverityUnknown  = "unknown"
 )
+
+var socketOrReleaseCause = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 var advisoryID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
@@ -106,6 +112,8 @@ type Acceptance struct {
 	Version    string   `json:"version"`
 	Host       string   `json:"host"`
 	Advisories []string `json:"advisories"`
+	// Causes are the WARN causes a local tolerance covers; empty for every other kind.
+	Causes []string `json:"causes"`
 }
 
 // ReadEvidence decodes an evidence document strictly: no repeated member, no
@@ -298,11 +306,14 @@ func ReadAcceptances(raw []byte) ([]Acceptance, error) {
 		if !ok {
 			return nil, fmt.Errorf("acceptances: acceptances[%d] must be an object", i)
 		}
-		if err := requireKeys(object, fmt.Sprintf("acceptances[%d].", i), "kind", "name", "version", "host", "advisories"); err != nil {
+		if err := requireKeys(object, fmt.Sprintf("acceptances[%d].", i), "kind", "name", "version", "host", "advisories", "causes"); err != nil {
 			return nil, fmt.Errorf("acceptances: %w", err)
 		}
 		if _, ok := object["advisories"].([]any); !ok {
 			return nil, fmt.Errorf("acceptances: acceptances[%d].advisories must be a list", i)
+		}
+		if _, ok := object["causes"].([]any); !ok {
+			return nil, fmt.Errorf("acceptances: acceptances[%d].causes must be a list", i)
 		}
 	}
 	var document struct {
@@ -328,10 +339,22 @@ func ReadAcceptances(raw []byte) ([]Acceptance, error) {
 
 func validateAcceptances(acceptances []Acceptance) error {
 	for i, acceptance := range acceptances {
+		if acceptance.Kind != AcceptLocalTolerance && len(acceptance.Causes) != 0 {
+			return fmt.Errorf("acceptances[%d]: only a local tolerance lists causes", i)
+		}
 		switch acceptance.Kind {
 		case AcceptLocalExact, AcceptFollowedGrant, AcceptFollowedInstall:
 			if len(acceptance.Advisories) != 0 {
 				return fmt.Errorf("acceptances[%d]: %s covers an artifact, not a list of advisories", i, acceptance.Kind)
+			}
+		case AcceptLocalTolerance:
+			if len(acceptance.Advisories) != 0 || len(acceptance.Causes) == 0 {
+				return fmt.Errorf("acceptances[%d]: a local tolerance lists WARN causes and no advisories", i)
+			}
+			for _, cause := range acceptance.Causes {
+				if !socketOrReleaseCause.MatchString(cause) {
+					return fmt.Errorf("acceptances[%d]: malformed cause", i)
+				}
 			}
 		case AcceptFollowedOverride:
 			if len(acceptance.Advisories) == 0 {

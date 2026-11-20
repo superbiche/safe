@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/superbiche/safe/internal/strictjson"
@@ -354,7 +355,7 @@ func judgeCooldown(in Input, baseline Graph, decided *Report) (CooldownReport, e
 		if len(fixes) > 0 {
 			wait.Remediates, wait.Enforced = fixes, true
 		}
-		wait.Cleared, wait.ClearedBy = waitCleared(candidate.Identity, in)
+		wait.Cleared, wait.ClearedBy = waitCleared(candidate.Identity, in, []string{"release_too_new"})
 		report.Waits = append(report.Waits, wait)
 	}
 	return report, nil
@@ -365,7 +366,7 @@ func judgeCooldown(in Input, baseline Graph, decided *Report) (CooldownReport, e
 // advisory's (a local exact approval, a followed grant, a followed install
 // allowance): a release that is too young is a WARN cause of today's gate, which
 // those clear.
-func waitCleared(identity Identity, in Input) (bool, []string) {
+func waitCleared(identity Identity, in Input, causes []string) (bool, []string) {
 	used := map[string]struct{}{}
 	carried := 0
 	seen := map[string]struct{}{}
@@ -380,6 +381,9 @@ func waitCleared(identity Identity, in Input) (bool, []string) {
 		seen[marker] = struct{}{}
 		carried++
 		kind, ok := clearingAcceptance(AdvisoryAdverse, occurrence, in.Evidence, nil)
+		if !ok {
+			kind, ok = tolerates(occurrence, in.Evidence, causes)
+		}
 		if !ok {
 			return false, []string{}
 		}
@@ -546,4 +550,37 @@ func ReadReleaseRequest(raw []byte) (ReleaseRequest, error) {
 		}
 	}
 	return request, nil
+}
+
+// tolerates finds the operator's standing tolerance for one artifact: it clears a wait or a Socket result only when
+// EVERY cause of the item is one it lists (today's install.auto_allow_tolerate rule). An item with no cause (a consent
+// ask, a pending score) is not a WARN, so a tolerance never covers it.
+func tolerates(occurrence Occurrence, doc Evidence, causes []string) (string, bool) {
+	if len(causes) == 0 {
+		return "", false
+	}
+	name, version := occurrence.Name, occurrence.Version
+	if occurrence.CoveredBy != "" {
+		name, version = occurrence.coverName, occurrence.coverVersion
+	}
+	for _, acceptance := range doc.Acceptances {
+		if acceptance.Kind != AcceptLocalTolerance || acceptance.Name != name || acceptance.Version != version ||
+			occurrence.Host == "" || !strings.EqualFold(acceptance.Host, occurrence.Host) {
+			continue
+		}
+		listed := map[string]struct{}{}
+		for _, cause := range acceptance.Causes {
+			listed[cause] = struct{}{}
+		}
+		all := true
+		for _, cause := range causes {
+			if _, ok := listed[cause]; !ok {
+				all = false
+			}
+		}
+		if all {
+			return acceptance.Kind, true
+		}
+	}
+	return "", false
 }

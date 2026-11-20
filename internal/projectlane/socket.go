@@ -157,7 +157,11 @@ func judgeSocket(in Input) (malice []MaliceItem, report SocketReport, class Clas
 			item.Exit = ExitBlock
 		default:
 			item.Exit = outcomeExit(root.Outcome)
-			item.Cleared, item.ClearedBy = waitCleared(identity, in)
+			var causes []string
+			if root.Outcome == SocketAdverse || root.Outcome == SocketRateLimited || root.Outcome == SocketUnavailable {
+				causes = root.Causes
+			}
+			item.Cleared, item.ClearedBy = waitCleared(identity, in, causes)
 			class.AtStake++
 			if !item.Cleared {
 				class.Outstanding++

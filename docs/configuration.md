@@ -296,6 +296,35 @@ pass and warnings under `environment.release_follow`.
   `CooldownCandidates`, holds the choice); an entry the lockfile on disk carries that the baseline does not is
   introduced, and is judged. The npm must define `min-release-age-exclude` (npm 11.17.0 or later, which the
   capability probe checks on top of the 11.12.1 floor).
+  **Standing acceptances.** The decision takes the operator's standing acceptances as a document of its own, read by safe's
+  own reader (`safe audit lane-acceptances`, which calls the functions today's install gate calls and has no store, format or
+  rule of its own) for exactly the artifacts a first decision leaves outstanding, from the stores where the lane reads its
+  switch (`safe_gate_trust_store_file`; a store root the caller names is never read), and the decision is made again with
+  them. A reader that fails gives no acceptance: nothing is cleared. What clears what: a **local exact approval** (the
+  source-bound gate consent, or an exact local host-allow pin that is not a followed copy) clears a blocking advisory, an
+  adverse advisory, a wait and a Socket outcome of that artifact; a **followed advisory override** (signer, generation,
+  ecosystem and source checks of the follow ledger) clears a blocking advisory only when it covers every blocking advisory
+  of the artifact; a **followed grant** and a **followed install allowance** clear an adverse advisory, a wait and a Socket
+  outcome, never a blocking advisory; the standing **tolerance** (`install.auto_allow_tolerate`) clears a wait or a Socket
+  result that is a WARN only when every cause of it is listed, never an advisory, never a consent ask or a pending score.
+  Nothing clears malice, a graph that cannot be bound or missing evidence. What nothing clears ends the command with its
+  own exit, in the decision's order. There is no terminal prompt for these classes yet (the operator terminal is its own
+  ticket).
+
+  **Install records.** After the binder reports a verified, published tree, and only then (a refusal, a failed
+  materialisation, `--dry-run` and `--package-lock-only` record nothing), the lane leaves one record per introduced public
+  registry artifact in the receipts the signed export reads (`install-known.json`, through `safe audit lane-record`, which
+  writes with the same writer as today's gate): verdict `GO` for an artifact whose own advisory reading is complete and
+  carries nothing at high or above (below-high advisories are named in the record), `WARN_TOLERATED` for one a standing
+  tolerance cleared. Never for an artifact that passed only because its advisories were already present in the project,
+  for one cleared by a local approval, a followed grant or a followed install allowance (another decision, already stored
+  or another origin's: a follower's authority is never exported again), after missing evidence, a block override or the
+  one-shot route. The signed export takes the records as it takes today's: exact versions of the default registry. A
+  named root whose outcome the operator confirmed at a terminal is the third eligible kind and comes with the operator
+  terminal. A record that cannot be written after the publication is reported on stderr and in the audit log and undoes
+  nothing; the next command that judges the artifact clear records it. A `GO` record of an artifact the lane did not score
+  with Socket says so in its reasons (`socket_not_scored_by_the_lane`).
+
   **Socket on a named root.** The artifacts the command names are scored by Socket as today's per-root audit scores
   them, and nothing else is: one call of the auditor beside safe's dispatcher in its evidence-only mode
   (`package-audit --evidence-only`), whatever the number of roots, and never for an artifact from a private origin.

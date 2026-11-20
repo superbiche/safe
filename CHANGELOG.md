@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Project lane (still behind `install.project_lane`): standing acceptances and install records, **no terminal prompt**. The
+  decision takes the operator's standing acceptances (a local exact approval or pin, a followed grant, a followed install
+  allowance, a followed advisory override with its signer, generation, ecosystem and source checks, the
+  `install.auto_allow_tolerate` tolerance), read by safe's own reader (`safe audit lane-acceptances`: the same functions as
+  today's install gate) from the stores where the lane reads its switch, for the artifacts a first decision leaves
+  outstanding. A local approval clears a blocking advisory; a followed install allowance does not; a followed override clears
+  it only when it covers every blocking advisory; adverse advisories, waits and Socket outcomes on a named root are cleared
+  by the authorities of today's adverse warning; nothing clears malice, an unbound graph or missing evidence. After a
+  verified, published tree (never for a refusal, a failed materialisation, `--dry-run` or `--package-lock-only`) the lane
+  leaves install records (`safe audit lane-record`, today's writer) for introduced artifacts whose own evidence is clean or
+  below high and for those a local tolerance cleared; never for an artifact that passed only because its advisories were
+  already present, and never for another authority's decision, so a follower never re-exports an authority. A record that
+  cannot be written is reported and undoes nothing. The operator-confirmed named root is the operator-terminal ticket's.
+
 - Project lane (still behind `install.project_lane`): Socket on the named roots. The projected root is scored by Socket
   as today's per-root audit scores it (each named operand tied to its direct occurrence in the projected lockfile, so
   `pkg@1.0.0+build.1` scores `1.0.0`; an operand that cannot be tied is missing evidence): one call of the auditor
