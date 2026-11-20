@@ -79,6 +79,18 @@ func recordsFor(report Report, in Input, evidence evidenceIndex) []RecordItem {
 		}
 		return false
 	}
+	// with a cooldown set, the publish time of a root is part of its evidence: an exact reading of the registry's own record
+	// (a bound from the document's last-modified time is not one). With the cooldown off (days 0) the operator has switched
+	// age off, and a root is as eligible as today's gate makes it.
+	needsPublishTime := in.Releases != nil && in.Releases.Policy.CooldownDays > 0
+	published := map[Identity]struct{}{}
+	if in.Releases != nil {
+		for _, reading := range in.Releases.Identities {
+			if reading.Status == ReadingRead {
+				published[Identity{Name: reading.Name, Version: reading.Version}] = struct{}{}
+			}
+		}
+	}
 	seen := map[Identity]struct{}{}
 	for _, occurrence := range in.Target.Occurrences {
 		identity := occurrence.Identity()
@@ -95,6 +107,9 @@ func recordsFor(report Report, in Input, evidence evidenceIndex) []RecordItem {
 		}
 		read, ok := evidence[identity]
 		if !ok || read.Coverage != CoverageComplete || gating(identity) {
+			continue
+		}
+		if _, read := published[identity]; needsPublishTime && !read {
 			continue
 		}
 		// a root whose BYTES carry a high or blocking advisory, introduced or already present, is not eligible: a bundled
@@ -136,9 +151,11 @@ func onlyTolerance(kinds []string) bool {
 	return len(kinds) == 1 && kinds[0] == AcceptLocalTolerance
 }
 
-// adverseIdentities lists the exact identities the decision established adverse evidence on, whatever the outcome: malice,
-// a blocking or adverse introduced advisory, a Socket finding on a named root, a version inside the cooldown.
-func adverseIdentities(report Report) []Identity {
+// adverseIdentities lists the exact artifacts (name, version, source host) a receipt of which the decision's evidence
+// supersedes, whatever the outcome: the identity the evidence is on (malice, a blocking or adverse introduced advisory, a
+// Socket finding on a named root, a version inside the cooldown) AND the artifact whose bytes carry it (a bundled member's
+// covering artifact). The gate removes those receipts locally; there is no limit on their number.
+func adverseIdentities(report Report, in Input) []AdverseItem {
 	set := map[Identity]struct{}{}
 	for _, item := range report.Malice {
 		for _, version := range item.Versions {
@@ -164,7 +181,31 @@ func adverseIdentities(report Report) []Identity {
 			set[Identity{Name: wait.Name, Version: wait.Version}] = struct{}{}
 		}
 	}
-	return sortedIdentities(set)
+	type key struct{ name, version, host string }
+	items := map[key]struct{}{}
+	for _, occurrence := range in.Target.Occurrences {
+		if _, adverse := set[occurrence.Identity()]; !adverse || !occurrence.Public || occurrence.Host == "" {
+			continue
+		}
+		host := strings.ToLower(occurrence.Host)
+		items[key{occurrence.Name, occurrence.Version, host}] = struct{}{}
+		coverName, coverVersion := coverArtifact(occurrence)
+		items[key{coverName, coverVersion, host}] = struct{}{}
+	}
+	out := make([]AdverseItem, 0, len(items))
+	for k := range items {
+		out = append(out, AdverseItem{Name: k.name, Version: k.version, Host: k.host})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		if out[i].Version != out[j].Version {
+			return out[i].Version < out[j].Version
+		}
+		return out[i].Host < out[j].Host
+	})
+	return out
 }
 
 // wantedAcceptances lists the artifacts whose standing acceptances the decision would use: for every item still

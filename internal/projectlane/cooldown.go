@@ -382,7 +382,7 @@ func waitCleared(identity Identity, in Input, causes []string) (bool, []string) 
 		carried++
 		kind, ok := clearingAcceptance(AdvisoryAdverse, occurrence, in.Evidence, nil)
 		if !ok {
-			kind, ok = tolerates(occurrence, in.Evidence, causes)
+			kind, ok = tolerates(occurrence, in.Evidence, in.Target, causes)
 		}
 		if !ok {
 			return false, []string{}
@@ -555,7 +555,7 @@ func ReadReleaseRequest(raw []byte) (ReleaseRequest, error) {
 // tolerates finds the operator's standing tolerance for one artifact: it clears a wait or a Socket result only when
 // EVERY cause of the item is one it lists (today's install.auto_allow_tolerate rule). An item with no cause (a consent
 // ask, a pending score) is not a WARN, so a tolerance never covers it.
-func tolerates(occurrence Occurrence, doc Evidence, causes []string) (string, bool) {
+func tolerates(occurrence Occurrence, doc Evidence, target Graph, causes []string) (string, bool) {
 	if len(causes) == 0 {
 		return "", false
 	}
@@ -565,8 +565,15 @@ func tolerates(occurrence Occurrence, doc Evidence, causes []string) (string, bo
 	}
 	// today's predicate: a tolerance applies only to an artifact with no affecting advisory at all (a moderate one
 	// included: it is informational for a GO, but a WARN with an affecting advisory is the adverse warning's decision)
+	// (the bytes of an artifact are its own and its bundled members': an advisory on a member vetoes it too)
+	carried := map[Identity]struct{}{{Name: name, Version: version}: {}}
+	for _, member := range target.Occurrences {
+		if member.CoveredBy != "" && member.coverName == name && member.coverVersion == version && strings.EqualFold(member.Host, occurrence.Host) {
+			carried[member.Identity()] = struct{}{}
+		}
+	}
 	for _, identity := range doc.Identities {
-		if identity.Name == name && identity.Version == version && len(identity.Advisories) > 0 {
+		if _, ours := carried[Identity{Name: identity.Name, Version: identity.Version}]; ours && len(identity.Advisories) > 0 {
 			return "", false
 		}
 	}

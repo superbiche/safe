@@ -86,12 +86,20 @@ type Report struct {
 	// Adverse are the exact identities the decision established adverse evidence on (malice, a blocking or adverse
 	// advisory, a Socket finding): the gate asks today's audit to look at them, so that a receipt the evidence supersedes
 	// is revoked by today's own rule.
-	Adverse []Identity `json:"adverse"`
+	Adverse []AdverseItem `json:"adverse"`
 	// Wanted are the artifacts whose standing acceptances the decision would use, by the relation the decision clears
 	// with: the artifact whose bytes carry the item, and every blocking advisory introduced under those bytes.
 	Wanted []WantedAcceptance `json:"wanted"`
 
 	coverBlocking map[string]map[string]struct{}
+}
+
+// AdverseItem is an exact artifact (name, version, source host) a receipt of which the decision's evidence supersedes: the
+// identity the evidence is on and the artifact whose bytes carry it.
+type AdverseItem struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Host    string `json:"host"`
 }
 
 // WantedAcceptance is one artifact an acceptance reader is asked about.
@@ -229,7 +237,7 @@ func Decide(in Input) Report {
 		Malice:        []MaliceItem{},
 		Coverage:      []CoverageGap{},
 		Records:       []RecordItem{},
-		Adverse:       []Identity{},
+		Adverse:       []AdverseItem{},
 		Wanted:        []WantedAcceptance{},
 	}
 	baseline := in.Baseline
@@ -310,7 +318,7 @@ func Decide(in Input) Report {
 	}
 	report.Classes = append(report.Classes,
 		ClassOutcome{Class: ClassMissingEvidence, Exit: ExitOperator, AtStake: len(report.Coverage), Outstanding: len(report.Coverage)})
-	report.Adverse = adverseIdentities(report)
+	report.Adverse = adverseIdentities(report, in)
 	report.Wanted = wantedAcceptances(report, in)
 	report.Outcome = Outcome{Status: "clear"}
 	for _, class := range report.Classes {
@@ -513,6 +521,18 @@ func differential(report *Report, baseline, target Graph, evidence evidenceIndex
 					}
 					report.coverBlocking[key][id] = struct{}{}
 				}
+			}
+		}
+	}
+	// Once the blocking class is raised (by what is introduced) for an artifact's bytes, an override must cover EVERY blocking
+	// advisory the target's evidence shows under them, inherited ones included: as today's reader requires of a follower.
+	for _, occurrence := range target.Occurrences {
+		if _, raised := report.coverBlocking[coverKey(occurrence)]; !raised || !occurrence.Public {
+			continue
+		}
+		for _, hit := range evidence[occurrence.Identity()].Advisories {
+			if !hit.Malware && severityClass(hit.Severity, blockSet) == AdvisoryBlocking {
+				report.coverBlocking[coverKey(occurrence)][hit.ID] = struct{}{}
 			}
 		}
 	}

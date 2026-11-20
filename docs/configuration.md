@@ -306,10 +306,11 @@ pass and warnings under `environment.release_follow`.
   ecosystem and source checks of the follow ledger) clears a blocking advisory only when it covers every blocking advisory
   of the artifact; a **followed grant** and a **followed install allowance** clear an adverse advisory, a wait and a Socket
   outcome, never a blocking advisory; the standing **tolerance** (`install.auto_allow_tolerate`) clears a wait or a Socket
-  result that is a WARN only when every cause of it is listed and the artifact has no affecting advisory at all (today's
+  result that is a WARN only when every cause of it is listed and the artifact has no affecting advisory at all, on the artifact or on a member its bytes carry (today's
   predicate), never an advisory, never a consent ask or a pending score. Bundled bytes are judged under their covering
   artifact: an acceptance is for the artifact whose bytes carry the advisory, and a followed override must cover every
-  blocking advisory under those bytes.
+  blocking advisory the evidence shows under those bytes, inherited or new, once one is introduced (the trigger stays
+  differential). The tolerance's veto covers the artifact and every member its bytes carry.
   Nothing clears malice, a graph that cannot be bound or missing evidence. What nothing clears ends the command with its
   own exit, in the decision's order. There is no terminal prompt for these classes yet (the operator terminal is its own
   ticket).
@@ -330,10 +331,20 @@ pass and warnings under `environment.release_follow`.
   or prune names no root), a root cleared by a local approval, a followed grant or a followed install allowance, one that
   passed only because its advisories were already present, anything after missing evidence, a block override or the one-shot
   route. At most 16 roots are audited per command; the lane reads back what the store holds and says what was recorded.
-  **Revocation:** when the decision establishes adverse evidence on an exact identity (malice, a blocking or adverse
-  advisory, a Socket finding, a young version), the lane asks the same audit about that identity if the store holds a receipt
-  of that exact version (at most 16), and today's own rule revokes a receipt the evidence supersedes; operator approvals are
-  not receipts and are untouched. The signed export takes the receipts as it takes today's. A named root whose outcome the
+  **Revocation:** when the decision establishes adverse evidence on an artifact (malice, a blocking or adverse advisory, a
+  Socket finding, a young version), the receipts of the exact identity the evidence is on and of the artifact whose bytes carry it
+  (a bundled member's covering artifact) are removed by `safe audit lane-revoke`, bound to the exact version and the default
+  registry source. It is a local operation that only removes: it never audits, never reaches the network and cannot create,
+  promote or refresh a receipt (it deletes through the function today's audit uses when its evidence supersedes one); it has no
+  limit on the number of receipts, and operator approvals are not receipts and are untouched. It runs whatever the command's
+  end (a refusal, a dry run). The audits that can WRITE (the ordinary audit of a named root) run only after a verified
+  publication, for the named roots the binder reported present among the direct packages of the tree it published
+  (`verification.present_direct`; the lane does not look at the tree again), at most 16 per command. With `install.cooldown_days`
+  set, a root is submitted only on an exact reading of its publish time; with the cooldown off (0) it is as eligible as today's
+  gate makes it. The lane compares the receipt before and after and says whether the audit wrote, left unchanged or removed
+  it, and a block or an adverse result the audit sees on a root that was just installed is printed as a finding of its own
+  (`FINDING: <package> is installed, and today's audit now reports a BLOCK`), the command's exit unchanged. The signed export
+  takes the receipts as it takes today's. The signed export takes the receipts as it takes today's. A named root whose outcome the
   operator confirmed at a terminal is the third eligible kind and comes with the operator terminal.
 
   **Socket on a named root.** The artifacts the command names are scored by Socket as today's per-root audit scores

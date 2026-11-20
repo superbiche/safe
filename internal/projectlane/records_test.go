@@ -229,3 +229,87 @@ func TestTheDecisionNamesTheIdentitiesItFoundAdverseEvidenceOn(t *testing.T) {
 		t.Fatalf("adverse = %v", got)
 	}
 }
+
+func bundledGraph(parent, member string) map[string]map[string]any {
+	return map[string]map[string]any{
+		"node_modules/" + parent:                             entry(parent, "2.0.0"),
+		"node_modules/" + parent + "/node_modules/" + member: {"version": "2.0.0", "inBundle": true},
+	}
+}
+
+// An override of the covering artifact covers EVERY blocking advisory under its bytes, inherited or new, once one is new.
+func TestAnOverrideOfTheCoveringArtifactCoversInheritedAndNewAdvisoriesUnderItsBytes(t *testing.T) {
+	base := bundledGraph("parent", "member")
+	base["node_modules/parent"] = entry("parent", "1.0.0")
+	base["node_modules/parent/node_modules/member"] = map[string]any{"version": "1.0.0", "inBundle": true}
+	target := bundledGraph("parent", "member")
+	ev := evidenceOf(read("parent", "1.0.0"), read("parent", "2.0.0"), read("member", "1.0.0", hit("GHSA-old", SeverityCritical)),
+		read("member", "2.0.0", hit("GHSA-old", SeverityCritical), hit("GHSA-new", SeverityCritical)))
+	decide := func(acceptance Acceptance) Report {
+		return Decide(Input{Baseline: graphOf(t, base), HasBaseline: true, Target: graphOf(t, target), Evidence: ev.accepting(acceptance)})
+	}
+	if r := decide(accept(AcceptFollowedOverride, "parent", "2.0.0", "GHSA-new")); r.Outcome.Status == "clear" {
+		t.Fatalf("an override listing only the new advisory cleared the bytes: %+v", r.Outcome)
+	}
+	if r := decide(accept(AcceptFollowedOverride, "parent", "2.0.0", "GHSA-new", "GHSA-old")); r.Outcome.Status != "clear" {
+		t.Fatalf("an override listing both did not: %+v", r.Outcome)
+	}
+	r := Decide(Input{Baseline: graphOf(t, base), HasBaseline: true, Target: graphOf(t, target), Evidence: ev})
+	if len(r.Wanted) != 1 || r.Wanted[0].Name != "parent" || !reflect.DeepEqual(r.Wanted[0].BlockingAdvisories, []string{"GHSA-new", "GHSA-old"}) {
+		t.Fatalf("the reader is asked for the whole set: %+v", r.Wanted)
+	}
+}
+
+// A moderate advisory on a member bundled in the root vetoes the tolerance, as one on the root does.
+func TestAToleranceIsVetoedByAnAdvisoryOnABundledMember(t *testing.T) {
+	target := bundledGraph("parent", "member")
+	low := sroot("parent", "2.0.0", SocketAdverse)
+	low.Causes = []string{"socket_low_score"}
+	for name, c := range map[string]struct {
+		evidence Evidence
+		clear    bool
+	}{
+		"member with a moderate advisory": {evidenceOf(read("parent", "2.0.0"), read("member", "2.0.0", hit("GHSA-m", SeverityModerate))), false},
+		"member with none":                {evidenceOf(read("parent", "2.0.0"), read("member", "2.0.0")), true},
+	} {
+		r := Decide(Input{Target: graphOf(t, target), Evidence: c.evidence.accepting(tolerance("parent", "2.0.0", "socket_low_score")), Socket: socketOf(low)})
+		if (r.Outcome.Status == "clear") != c.clear {
+			t.Errorf("%s: %+v", name, r.Outcome)
+		}
+	}
+}
+
+// The artifacts whose receipts are superseded: the identity the evidence is on and the artifact whose bytes carry it,
+// bound to exact version and host, and no limit on their number.
+func TestTheReceiptsSupersededAreTheIdentityAndTheArtifactWhoseBytesCarryIt(t *testing.T) {
+	target := bundledGraph("parent", "member")
+	r := Decide(Input{Target: graphOf(t, target), Evidence: evidenceOf(read("parent", "2.0.0"), read("member", "2.0.0", hit("GHSA-c", SeverityCritical)))})
+	got := []string{}
+	for _, item := range r.Adverse {
+		got = append(got, item.Name+"@"+item.Version+" "+item.Host)
+	}
+	if !reflect.DeepEqual(got, []string{"member@2.0.0 " + DefaultRegistryHost, "parent@2.0.0 " + DefaultRegistryHost}) {
+		t.Fatalf("adverse = %v", got)
+	}
+}
+
+// With a cooldown set, a root is eligible only on an exact publish-time reading; with the cooldown off it is as eligible as
+// today's gate makes it.
+func TestARootNeedsItsPublishTimeOnlyWhenACooldownIsSet(t *testing.T) {
+	ev := evidenceOf(read("pk", "1.0.0"))
+	for name, c := range map[string]struct {
+		releases *Releases
+		want     int
+	}{
+		"cooldown set, exact time":      {releasesOf(3, SecurityFixExempt, reading("pk", "1.0.0", 2400)), 1},
+		"cooldown set, bounded":         {releasesOf(3, SecurityFixExempt, reading("pk", "1.0.0", 2400).bounded(2400)), 0},
+		"cooldown set, no reading":      {releasesOf(3, SecurityFixExempt), 0},
+		"cooldown off, no reading":      {releasesOf(0, SecurityFixExempt), 1},
+		"no release reading in a given": {nil, 1},
+	} {
+		r := Decide(Input{Target: graphOf(t, pkgs("pk", "1.0.0")), Evidence: ev, Releases: c.releases, Socket: socketOf(sroot("pk", "1.0.0", SocketClear))})
+		if len(r.Records) != c.want {
+			t.Errorf("%s: records = %v", name, installRecordsOf(r))
+		}
+	}
+}

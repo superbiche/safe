@@ -16,7 +16,13 @@
   `--package-lock-only`) it asks today's auditor to audit, by its ordinary path, each named root the decision left eligible
   and the tree holds; that audit records or does not by its own rules (clean receipts switched off, Socket not consulted, a
   tolerance, a followed authority), and the lane reports what the store holds. When the decision establishes adverse evidence
-  on an identity that holds a receipt, the same audit revokes it by today's rule. At most 16 audits of each kind per command.
+  on an artifact, the receipts of that identity and of the artifact whose bytes carry it are removed by a local operation that only
+  removes (`safe audit lane-revoke`: it never audits and cannot create, promote or refresh a receipt; no limit on their
+  number); the audits that can write run only after a verified publication, for the named roots the binder reports present in
+  the tree it published (`verification.present_direct`), at most 16 per command, with the publish time required only when a
+  cooldown is set. A followed override must cover every blocking advisory under the bytes once one is introduced; the tolerance
+  is vetoed by an advisory on a bundled member; the report says whether the audit wrote, left unchanged or removed a receipt,
+  and a block seen on a root just installed is a finding of its own.
   Nothing is recorded for a transitive package nobody named, nor for another authority's decision, so a follower never
   re-exports an authority. The operator-confirmed named root is the operator-terminal ticket's.
 

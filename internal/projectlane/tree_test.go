@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -939,5 +941,39 @@ func TestAdmitLockfileFindingsReportsEveryReason(t *testing.T) {
 	}
 	if got := AdmitLockfileFindings([]byte(`{"lockfileVersion":3}`)); len(got) != 1 || got[0].Reason != ReasonLockfileUnreadable {
 		t.Fatalf("a lockfile without a package map: %v", got)
+	}
+}
+
+// The verified tree names the direct packages it holds: what a caller may take as installed. A deselected package that is
+// absent is not listed, one nested below another is not direct, and a failing verification lists nothing.
+func TestVerifyTreeReportsTheDirectPackagesItHolds(t *testing.T) {
+	f := newTreeFx(t)
+	f.pkg("node_modules/clean", "clean", "2.0.0")
+	f.pkg("node_modules/@s/scoped", "@s/scoped", "1.1.0")
+	f.pkg("node_modules/clean/node_modules/nested", "nested", "1.0.0")
+	f.entry("node_modules/devonly", "devonly", "3.0.0", map[string]any{"dev": true})
+	report := f.verify(Selection{OS: "linux", CPU: "x64", Omit: []string{"dev"}})
+	if !report.Ok {
+		t.Fatalf("%+v", report.Problems)
+	}
+	var got []string
+	for _, present := range report.Present {
+		got = append(got, present.Name+"@"+present.Version+" "+present.Path)
+	}
+	want := []string{"@s/scoped@1.1.0 node_modules/@s/scoped", "clean@2.0.0 node_modules/clean"}
+	sort.Strings(got)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("present = %v, want %v", got, want)
+	}
+	// the same lockfile with the deselected root installed (a stray copy) is verified like any entry, and then it IS held
+	f.install("node_modules/devonly", "devonly", "3.0.0")
+	if report = f.verify(Selection{OS: "linux", CPU: "x64", Omit: []string{"dev"}}); len(report.Present) != 3 {
+		t.Fatalf("%+v", report.Present)
+	}
+	// a failing verification lists nothing
+	g := newTreeFx(t)
+	g.entry("node_modules/clean", "clean", "2.0.0")
+	if report = g.verify(linuxX64); report.Ok || len(report.Present) != 0 {
+		t.Fatalf("%+v", report)
 	}
 }
