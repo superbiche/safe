@@ -8,5 +8,6 @@
 #    (`if (call && args.length)` in lib/exec.js / lib/commands/exec.js), so this is an over-audit, never a miss. It is kept
 #    on purpose: the gate audits what a command line names as a package wherever it could be one, so that a later npm that
 #    accepts the combination cannot fetch an unaudited name. Reproduction: `npm exec --call=true cowsay` audits cowsay.
-#    Only package-extra lines of exec/x command lines that carry --call or -c are listed.
-^DISAGREE package-extra: (exec|x)\\ .*(--call|-c)
+#    Only package-extra lines of exec/x command lines that carry --call or -c as a word of its own, and for which npm
+#    fetches nothing, are listed (an option that merely begins with -c, such as --color or --cache, does not match).
+^DISAGREE package-extra: (exec|x)\\ (.*\\ )?(--call|-c)(=[^\\ ]*)?(\\ .*)?  \(audited '[^']*', which npm does not fetch \(npm fetches: nothing\)\)$
