@@ -12725,6 +12725,38 @@ case_npm_argument_hygiene_refuses_what_extractors_and_npm_read_differently() {
   pass "$FUNCNAME"
 }
 
+# What the differential oracle found in round 2: the command and the packages are npm's reading, not a short list's.
+case_npm_reading_decides_command_and_packages_found_by_the_oracle() {
+  prepare_case "npm-reading-decides"
+  local script
+  # a negated option takes a listed literal as its value (nopt's Boolean branch): the command is `install`, not `always`
+  for script in 'npm --no-color always install blockme' 'npm install --package --prefix blockme' 'npm install --package --registry blockme'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 104 "$FUNCNAME: ${script}" || return
+    grep -q $'^AUDIT\tpackage-audit\tblockme\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: blockme was not audited"; return; }
+    ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: npm was delegated to"; return; }
+  done
+  # `--no-location global` is global mode: no project scan
+  printf '{"name":"scan-decision","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm --no-location global install blockme' run_zsh
+  assert_status 104 "$FUNCNAME: --no-location global" || return
+  ! grep -q 'repo-audit' "${LOG_FILE}" || { fail "$FUNCNAME: --no-location global ran the project scan"; return; }
+  # an option terminator before the command makes every later option an argument: refused, with a way out that works
+  for script in 'npm -- x -c cmd' 'npm --cache -- x -c cmd' 'npm -- install -D blockme'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 100 "$FUNCNAME: ${script}" || return
+    assert_err_contains_fragment 'terminator is written before the command' "$FUNCNAME: ${script}" || return
+    ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: npm was delegated to"; return; }
+  done
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm install -D blockme' run_zsh
+  assert_status 104 "$FUNCNAME: the way out" || return
+  pass "$FUNCNAME"
+}
+
 # The oracle can fail: its judge reports a wrong observation of each kind (a gate that agreed with everything would pass
 # any corpus), and the helper fails when it did not evaluate every case.
 case_npm_option_oracle_can_fail() {
@@ -12929,6 +12961,7 @@ main() {
     case_npm_front_door_reads_abbreviations_and_combinations \
     case_npm_argument_hygiene_refuses_what_extractors_and_npm_read_differently \
     case_npm_option_oracle_can_fail \
+    case_npm_reading_decides_command_and_packages_found_by_the_oracle \
     case_refusal_message_contract \
     case_large_pinned_install_and_socket_rate_nontty \
     case_infra_only_warn_no_host_allow_and_needs_a_tty \

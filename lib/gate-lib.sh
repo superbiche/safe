@@ -930,6 +930,15 @@ safe_gate_nopt_parse() {
         gval="${val}"
         gmodes+=("$(( val == 1 ? 1 : 0 ))")
       fi
+      if [[ "${name}" == location ]]; then
+        # `--no-location global`: a listed literal after a negated option is the option's value (nopt's isBool branch)
+        if (( consume )) && [[ "${la}" == global || "${la}" == user || "${la}" == project ]]; then
+          lval="${la}"
+          if [[ "${la}" == global ]]; then gmodes+=(1); else gmodes+=(0); fi
+        else
+          SAFE_GATE_NOPT_UNSTABLE+=("${name}")
+        fi
+      fi
       i=$((i + 1 + consume))
       continue
     fi
@@ -1004,6 +1013,13 @@ safe_gate_npm_argument_hygiene() {
         safe_gate_err "safe: BLOCKED npm — an argument holds a line break, which the gate's extractors read as two arguments and npm as one; to allow: pass one package or value per argument, without line breaks, then retry; details: safe explain"
         return 100 ;;
     esac
+  done
+  # an option terminator written before the command: npm reads everything after it as arguments, options included
+  for (( i=1; i<SAFE_GATE_SUBCMD_IDX; i++ )); do
+    if [[ "${!i}" == -- ]]; then
+      safe_gate_err "safe: BLOCKED npm — the option terminator is written before the command, so npm reads the options after it as packages or arguments, which the gate does not read that way; to allow: write the command first and the terminator after it, then retry; details: safe explain"
+      return 100
+    fi
   done
   safe_gate_nopt_parse "$@"
   for (( i=1; i<${#SAFE_GATE_NOPT_REMAIN[@]}; i++ )); do
@@ -6512,6 +6528,15 @@ safe_gate_npm_packages() {
       i=$((i + 1))
     fi
   done
+  # With an option in the vector the packages are the positional arguments npm reads (its own parser's reading,
+  # the snapshot of its option types), not what a hand-kept list of switches guesses.
+  local arg dashed=0
+  for arg in "$@"; do [[ "${arg}" == -* && "${#arg}" -gt 1 ]] && { dashed=1; break; }; done
+  if (( dashed )); then
+    safe_gate_nopt_parse "$@"
+    safe_gate_print_list ${SAFE_GATE_NOPT_REMAIN[@]+"${SAFE_GATE_NOPT_REMAIN[@]}"}
+    return 0
+  fi
   SAFE_GATE_NPM_ONLY=1 safe_gate_npm_like_packages ${filtered[@]+"${filtered[@]}"}
 }
 
@@ -7482,7 +7507,19 @@ safe_gate_route() {
   SAFE_GATE_TOOL="${tool}"
   safe_gate_global_flags "${tool}"
   safe_gate_locate_subcommand "${SAFE_GATE_GVAL}" "${SAFE_GATE_GBOOL}" "$@"
-  case $? in
+  local locate_rc=$?
+  # npm: the tables above are the gate's own short list of options; when an option written before the command is
+  # one npm defines, npm's own reading of the vector (the snapshot of its option types) says where the command is,
+  # and it wins (`--no-color always install` is the command install: `always` is the option's)
+  if [[ "${tool}" == npm ]] && (( locate_rc == 0 )) && [[ "${1:-}" == -* ]]; then
+    local old_word="${SAFE_GATE_SUBCMD}" old_idx="${SAFE_GATE_SUBCMD_IDX}"
+    if safe_gate_npm_locate_by_reading "$@"; then
+      return 0
+    fi
+    SAFE_GATE_SUBCMD="${old_word}"; SAFE_GATE_SUBCMD_IDX="${old_idx}"
+    if [[ -n "${SAFE_GATE_SUBCMD_BADFLAG}" ]]; then locate_rc=2; fi
+  fi
+  case ${locate_rc} in
     2)
       # npm: a flag the tables above do not list may still be an option npm defines, and then npm's own reading
       # of the vector (the snapshot of its option types) says where the command is
