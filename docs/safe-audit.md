@@ -652,6 +652,12 @@ decided result is also written, with `gate_exit`, to `SAFE_AUDIT_RESULT_OUT`
 when the caller sets it; the install gates use it to put the BLOCK override
 to the operator without re-running the audit.
 
+`SAFE_AUDIT_NO_RECORDS=1` switches off every write the audit makes of an install
+(the install-known receipts and approvals, the local approvals) and nothing
+else: the verdict, the gate exit and the reads are unchanged, so setting it can
+only remove records, never admit anything. The install gates set it for a
+command the operator confirmed at the terminal on the one-shot route.
+
 ### Evidence-only mode
 
 ```bash

@@ -324,6 +324,7 @@ func projectDecide(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "safe-core: project-decide: %v\n", err)
 			return 3
 		}
+		evidence.Answered = confirmations.Answered
 	}
 	target, err := projectlane.LoadGraph(parsed.target, parsed.hosts())
 	if err != nil {

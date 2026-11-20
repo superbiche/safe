@@ -14,7 +14,15 @@
   class (`outstanding`). An acceptance is recorded when it is given, by today's writers, so the next run passes unprompted; a
   named root whose outcome the operator confirmed is recorded after a verified publication through `record-installed` and is
   exportable. A dry run asks nothing; a prompt phase longer than 15 minutes is refused before binding (the acceptances stay
-  recorded). No change to the agent contract: no exit code or agent-visible wording changes.
+  recorded). No change to the agent contract: no exit code or agent-visible wording changes. Second round: a read from the
+  terminal that fails authorises nothing (102 before any write); every class at stake is asked within one command (an answer
+  clears its own class only); both receipt writers take eligibility from the final decision (command-wide exclusions, a root
+  introduced and not resting on a followed authority, a confirmed outage keeps the lockfile out of the recorded baseline); new
+  adverse evidence revokes at once; every refusal of the lane has its deliberate confirmation at the terminal (the command runs
+  on the one-shot route with recording switched off, `SAFE_AUDIT_NO_RECORDS`, and keeps its own status); the terminal paths
+  use the operator's root and the programs beside the dispatcher; each prompt lists the unresolved items of its class; a
+  cancellation at a prompt frees the lock; the evidence window starts before the first read and is enforced before the
+  baseline and the binder.
 
 - Project lane (still behind `install.project_lane`): standing acceptances and install records, **no terminal prompt**. The
   decision takes the operator's standing acceptances (a local exact approval or pin, a followed grant, a followed install

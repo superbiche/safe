@@ -47,7 +47,7 @@ type RecordItem struct {
 // recordsFor lists the eligible named roots of a CLEAR decision. It is empty for any other outcome.
 func recordsFor(report Report, in Input, evidence evidenceIndex) []RecordItem {
 	records := []RecordItem{}
-	if report.Outcome.Status != "clear" {
+	if report.Outcome.Status != "clear" || commandExcluded(report, in) {
 		return records
 	}
 	introduced := map[ArtifactKey]struct{}{}
@@ -262,6 +262,123 @@ func wantedAcceptances(report Report, in Input) []WantedAcceptance {
 			return out[i].Version < out[j].Version
 		}
 		return out[i].Host < out[j].Host
+	})
+	return out
+}
+
+// commandExcluded says whether this command may leave any install record at all: never a command confirmed on missing evidence
+// or on a Socket outage, one that carries a malice override, or one that carries a block override (an answer to a blocking
+// advisory): the command was not judged clean, whatever its other roots are.
+func commandExcluded(report Report, in Input) bool {
+	if in.Confirmations.EvidenceGap && len(report.Coverage) > 0 {
+		return true
+	}
+	if len(in.Confirmations.Socket) > 0 {
+		return true
+	}
+	for _, item := range report.Malice {
+		if item.Overridden {
+			return true
+		}
+	}
+	for _, answer := range in.Evidence.Answered {
+		if answer.Class == ClassBlockingAdvisory {
+			return true
+		}
+	}
+	return false
+}
+
+// ConfirmedRecord is a named root whose outcome the operator confirmed, with the token today's operator-terminal record path
+// writes for it.
+type ConfirmedRecord struct {
+	Name     string `json:"name"`
+	Version  string `json:"version"`
+	Token    string `json:"token"`
+	GateExit int    `json:"gate_exit"`
+}
+
+var confirmedTokenRank = map[string]int{"WARN_TTY_OVERRIDE": 3, "GO_PENDING_CONFIRMED": 2, "GO_SOCKET_DECLINED": 1}
+var confirmedTokenExit = map[string]int{"WARN_TTY_OVERRIDE": 10, "GO_PENDING_CONFIRMED": 14, "GO_SOCKET_DECLINED": 13}
+
+// confirmedRecordsFor lists, from the FINAL decision, the named roots the operator confirmed that may be recorded after a
+// verified publication: introduced by this command, a public registry artifact, named (it has a Socket row), not rested on a
+// followed authority in any class, in a command nothing excludes.
+func confirmedRecordsFor(report Report, in Input, evidence evidenceIndex) []ConfirmedRecord {
+	out := []ConfirmedRecord{}
+	if report.Outcome.Status != "clear" || commandExcluded(report, in) || report.Socket == nil {
+		return out
+	}
+	introduced := map[Identity]struct{}{}
+	introducedKeys := map[ArtifactKey]struct{}{}
+	for _, item := range report.Difference.Introduced {
+		introducedKeys[item.ArtifactKey] = struct{}{}
+	}
+	for _, occurrence := range in.Target.Occurrences {
+		if _, isNew := introducedKeys[occurrence.Key()]; isNew && occurrence.Public && occurrence.Kind == KindRegistry && !occurrence.covered() {
+			introduced[occurrence.Identity()] = struct{}{}
+		}
+	}
+	roots := map[Identity]struct{}{}
+	for _, root := range report.Socket.Roots {
+		roots[Identity{Name: root.Name, Version: root.Version}] = struct{}{}
+	}
+	followed := func(kinds []string) bool {
+		for _, kind := range kinds {
+			if kind == AcceptFollowedGrant || kind == AcceptFollowedInstall || kind == AcceptFollowedOverride {
+				return true
+			}
+		}
+		return false
+	}
+	reliesOnFollowed := func(identity Identity) bool {
+		for _, item := range report.Advisories.Introduced {
+			if item.Name == identity.Name && followed(item.ClearedBy) {
+				for _, version := range item.Versions {
+					if version == identity.Version {
+						return true
+					}
+				}
+			}
+		}
+		if report.Cooldown != nil {
+			for _, wait := range report.Cooldown.Waits {
+				if wait.Name == identity.Name && wait.Version == identity.Version && followed(wait.ClearedBy) {
+					return true
+				}
+			}
+		}
+		for _, root := range report.Socket.Roots {
+			if root.Name == identity.Name && root.Version == identity.Version && followed(root.ClearedBy) {
+				return true
+			}
+		}
+		return false
+	}
+	best := map[Identity]string{}
+	for _, answer := range in.Evidence.Answered {
+		if answer.Token == "" {
+			continue
+		}
+		identity := Identity{Name: answer.Name, Version: answer.Version}
+		if _, named := roots[identity]; !named {
+			continue
+		}
+		if _, isNew := introduced[identity]; !isNew || reliesOnFollowed(identity) {
+			continue
+		}
+		if confirmedTokenRank[answer.Token] > confirmedTokenRank[best[identity]] {
+			best[identity] = answer.Token
+		}
+	}
+	for identity, token := range best {
+		out = append(out, ConfirmedRecord{Name: identity.Name, Version: identity.Version, Token: token, GateExit: confirmedTokenExit[token]})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].Version < out[j].Version
 	})
 	return out
 }

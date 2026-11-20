@@ -8033,6 +8033,9 @@ revoke_install_known() {
 }
 
 mark_install_known() {
+  # A command that took the one-shot route by the operator's confirmation records nothing (the project lane's routing row).
+  # The switch can only REMOVE a write: it grants nothing, reads are untouched, and every verdict is what it was.
+  [[ "${SAFE_AUDIT_NO_RECORDS:-0}" != "1" ]] || return 0
   local ecosystem="$1" name="$2" version="$3" verdict="$4" reasons_json="$5" evidence="$6"
   local tmp key source_id
   key="$ecosystem:$name"
@@ -8081,6 +8084,7 @@ local_install_approval_matches() {
 }
 
 record_local_install_approval() {
+  [[ "${SAFE_AUDIT_NO_RECORDS:-0}" != "1" ]] || return 0
   local ecosystem="$1" name="$2" version="$3" file tmp
   trust_grant_ok "install approval" || return 1
   file="$(trust_store_file install-known.json)"
@@ -8403,6 +8407,10 @@ scripts_allow_matches_resolved() {
 # a custom-source install is never recorded as default-source evidence.
 # Usage: record-installed --result <file> --verdict <token> --source-id <id>
 record_installed_command() {
+  if [[ "${SAFE_AUDIT_NO_RECORDS:-0}" == "1" ]]; then
+    printf '[safe audit] nothing recorded: this command took the one-shot route by the operator'"'"'s confirmation\n' >&2
+    return 0
+  fi
   if [[ ! -t 0 || -n "${CODEX_THREAD_ID:-}" || -n "${CODEX_CI:-}" ||
         -n "${CLAUDECODE:-}" || -n "${OPENCODE:-}" ]]; then
     printf 'safe audit: BLOCKED record-installed — reusable consent requires the operator terminal; agents must ask the operator to accept the exact artifact; details: safe explain\n' >&2

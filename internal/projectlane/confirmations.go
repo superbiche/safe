@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/superbiche/safe/internal/strictjson"
 )
@@ -29,6 +30,19 @@ type Confirmations struct {
 	Malice        []Identity `json:"malice"`
 	EvidenceGap   bool       `json:"evidence_gap"`
 	Socket        []Identity `json:"socket"`
+	// Answered are the answers given during this command that were RECORDED when given (an approval, a host-allow entry):
+	// the next command reuses them as standing acceptances, but within this one an answer clears its own class only, so
+	// that every class at stake is shown to the operator.
+	Answered []Answered `json:"answered"`
+}
+
+// Answered is one recorded answer: the artifact, the class it answered and, for a named root the operator confirmed, the
+// token today's record path writes after a verified publication ("" when nothing is recorded for the answer).
+type Answered struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Class   string `json:"class"`
+	Token   string `json:"token"`
 }
 
 // ConfirmedByOperator is the kind recorded as the authority that cleared an item for this command.
@@ -43,7 +57,7 @@ func ReadConfirmations(raw []byte) (Confirmations, error) {
 	if err := json.Unmarshal(raw, &shape); err != nil || shape == nil {
 		return Confirmations{}, fmt.Errorf("confirmations: not a JSON object")
 	}
-	if err := requireKeys(shape, "", "schema_version", "malice", "evidence_gap", "socket"); err != nil {
+	if err := requireKeys(shape, "", "schema_version", "malice", "evidence_gap", "socket", "answered"); err != nil {
 		return Confirmations{}, fmt.Errorf("confirmations: %w", err)
 	}
 	for _, key := range []string{"malice", "socket"} {
@@ -59,6 +73,19 @@ func ReadConfirmations(raw []byte) (Confirmations, error) {
 			if err := requireKeys(object, fmt.Sprintf("%s[%d].", key, i), "name", "version"); err != nil {
 				return Confirmations{}, fmt.Errorf("confirmations: %w", err)
 			}
+		}
+	}
+	answered, ok := shape["answered"].([]any)
+	if !ok {
+		return Confirmations{}, fmt.Errorf("confirmations: answered must be a list")
+	}
+	for i, item := range answered {
+		object, ok := item.(map[string]any)
+		if !ok {
+			return Confirmations{}, fmt.Errorf("confirmations: answered[%d] must be an object", i)
+		}
+		if err := requireKeys(object, fmt.Sprintf("answered[%d].", i), "name", "version", "class", "token"); err != nil {
+			return Confirmations{}, fmt.Errorf("confirmations: %w", err)
 		}
 	}
 	var confirmations Confirmations
@@ -78,6 +105,21 @@ func ReadConfirmations(raw []byte) (Confirmations, error) {
 			if identity.Name == "" || identity.Version == "" {
 				return Confirmations{}, fmt.Errorf("confirmations: item %d: name and version are required", i)
 			}
+		}
+	}
+	for i, item := range confirmations.Answered {
+		if item.Name == "" || item.Version == "" {
+			return Confirmations{}, fmt.Errorf("confirmations: answered[%d]: name and version are required", i)
+		}
+		switch item.Class {
+		case ClassBlockingAdvisory, ClassAdverseAdvisory, ClassWait, ClassSocketRoot:
+		default:
+			return Confirmations{}, fmt.Errorf("confirmations: answered[%d]: unknown class %q", i, item.Class)
+		}
+		switch item.Token {
+		case "", "WARN_TTY_OVERRIDE", "GO_SOCKET_DECLINED", "GO_PENDING_CONFIRMED":
+		default:
+			return Confirmations{}, fmt.Errorf("confirmations: answered[%d]: unknown token %q", i, item.Token)
 		}
 	}
 	return confirmations, nil
@@ -113,6 +155,10 @@ type OutstandingItem struct {
 	Signal     string   `json:"signal"`
 	Class      string   `json:"class"`
 	Root       bool     `json:"root"`
+	// Signals are the malice signals on the artifact, one question per artifact; Mixed is true for an artifact that carries
+	// a blocking advisory AND a malice signal: such a block is never recordable.
+	Signals []string `json:"signals"`
+	Mixed   bool     `json:"mixed"`
 }
 
 // outstandingClasses lists, in the decision's own order, what each class still leaves at stake and what the operator is asked
@@ -126,6 +172,12 @@ func outstandingClasses(report Report, in Input) []OutstandingClass {
 		}
 		return ""
 	}
+	maliceOn := map[Identity]struct{}{}
+	for _, item := range report.Malice {
+		for _, version := range item.Versions {
+			maliceOn[Identity{Name: item.Name, Version: version}] = struct{}{}
+		}
+	}
 	out := []OutstandingClass{}
 	for _, class := range report.Classes {
 		if class.Outstanding == 0 {
@@ -134,14 +186,36 @@ func outstandingClasses(report Report, in Input) []OutstandingClass {
 		entry := OutstandingClass{Class: class.Class, Exit: class.Exit, Items: []OutstandingItem{}}
 		switch class.Class {
 		case ClassMalice:
+			// ONE question per artifact, whatever its signals
+			type key struct{ name, version string }
+			merged := map[key]*OutstandingItem{}
 			for _, item := range report.Malice {
 				if item.Overridden {
 					continue
 				}
 				for _, version := range item.Versions {
-					entry.Items = append(entry.Items, OutstandingItem{Name: item.Name, Version: version, Host: hostOf(item.Name, version),
-						Advisories: []string{}, Carried: []string{}, Signal: item.Signal, Detail: firstNonEmpty(item.ID, item.Reason), Class: class.Class})
+					k := key{item.Name, version}
+					if merged[k] == nil {
+						merged[k] = &OutstandingItem{Name: item.Name, Version: version, Host: hostOf(item.Name, version), Advisories: []string{}, Carried: []string{}, Class: class.Class}
+					}
+					label := item.Signal
+					if detail := firstNonEmpty(item.ID, item.Reason); detail != "" {
+						label += ": " + detail
+					}
+					merged[k].Signals = append(merged[k].Signals, label)
 				}
+			}
+			for _, item := range merged {
+				item.Signals = sortedUnique(item.Signals)
+				item.Detail = strings.Join(item.Signals, "; ")
+				// the strongest signal names the prompt: a malware record or a Socket block, otherwise the blocklist
+				item.Signal = "blocklist"
+				for _, label := range item.Signals {
+					if !strings.HasPrefix(label, "blocklist") {
+						item.Signal = "malware"
+					}
+				}
+				entry.Items = append(entry.Items, *item)
 			}
 		case ClassBlockingAdvisory, ClassAdverseAdvisory:
 			wanted := AdvisoryBlocking
@@ -159,10 +233,19 @@ func outstandingClasses(report Report, in Input) []OutstandingClass {
 						if occurrence.Name != item.Name || occurrence.Version != version || !occurrence.Public {
 							continue
 						}
+						// only the occurrences nothing has cleared yet: an artifact the operator (or a standing acceptance) cleared
+						// is not asked about again
+						if _, cleared := clearingAcceptance(item.Class, classOfAdvisory(item.Class), occurrence, in.Evidence, report.coverBlocking[coverKey(occurrence)]); cleared {
+							continue
+						}
 						coverName, coverVersion := coverArtifact(occurrence)
 						k := key{coverName, coverVersion, occurrence.Host}
 						if merged[k] == nil {
-							merged[k] = &OutstandingItem{Name: coverName, Version: coverVersion, Host: occurrence.Host, Advisories: []string{}, Carried: []string{}, Class: class.Class}
+							_, mixed := maliceOn[Identity{Name: coverName, Version: coverVersion}]
+							if !mixed {
+								_, mixed = maliceOn[occurrence.Identity()]
+							}
+							merged[k] = &OutstandingItem{Name: coverName, Version: coverVersion, Host: occurrence.Host, Advisories: []string{}, Carried: []string{}, Class: class.Class, Mixed: mixed}
 						}
 						target := merged[k]
 						target.Advisories = append(target.Advisories, item.ID)
@@ -193,7 +276,8 @@ func outstandingClasses(report Report, in Input) []OutstandingClass {
 		case ClassSocketRoot:
 			if report.Socket != nil {
 				for _, root := range report.Socket.Roots {
-					if root.Cleared {
+					// a Socket BLOCK is malice and nothing else: it never belongs to this class
+					if root.Cleared || root.Outcome == SocketBlocked {
 						continue
 					}
 					causes := rootCausesOf(in, root.Name, root.Version)

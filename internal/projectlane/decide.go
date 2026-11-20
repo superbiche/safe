@@ -94,6 +94,12 @@ type Report struct {
 	Wanted []WantedAcceptance `json:"wanted"`
 	// Outstanding are the classes the decision leaves at stake, in its order, with what the operator is asked about.
 	Outstanding []OutstandingClass `json:"outstanding"`
+	// ConfirmedRecords are the named roots whose outcome the operator confirmed at the terminal and that the final decision
+	// leaves eligible for the record today's operator-terminal path writes after a verified publication.
+	ConfirmedRecords []ConfirmedRecord `json:"confirmed_records"`
+	// Unjudged is true when this command went on with something that could not be judged (missing evidence, a Socket outage)
+	// on the operator's confirmation: nothing of it is recorded, and the lockfile is not recorded as judged.
+	Unjudged bool `json:"unjudged"`
 	// GapConfirmed is true when the operator confirmed missing evidence for this command: the gaps stay listed, and nothing
 	// of this command may be recorded as judged (the baseline is not advanced).
 	GapConfirmed bool `json:"gap_confirmed"`
@@ -240,15 +246,16 @@ func Decide(in Input) Report {
 	evidence := indexEvidence(in.Evidence)
 
 	report := Report{
-		SchemaVersion: ReportSchema,
-		Bindability:   CheckBindable(in.Target, in.RegistryHosts),
-		Advisories:    AdvisoryReport{Fixed: []FixedAdvisory{}, AlreadyPresent: []PresentAdvisory{}, Introduced: []IntroducedAdvice{}},
-		Malice:        []MaliceItem{},
-		Coverage:      []CoverageGap{},
-		Records:       []RecordItem{},
-		Adverse:       []AdverseItem{},
-		Wanted:        []WantedAcceptance{},
-		Outstanding:   []OutstandingClass{},
+		SchemaVersion:    ReportSchema,
+		Bindability:      CheckBindable(in.Target, in.RegistryHosts),
+		Advisories:       AdvisoryReport{Fixed: []FixedAdvisory{}, AlreadyPresent: []PresentAdvisory{}, Introduced: []IntroducedAdvice{}},
+		Malice:           []MaliceItem{},
+		Coverage:         []CoverageGap{},
+		Records:          []RecordItem{},
+		Adverse:          []AdverseItem{},
+		Wanted:           []WantedAcceptance{},
+		Outstanding:      []OutstandingClass{},
+		ConfirmedRecords: []ConfirmedRecord{},
 	}
 	baseline := in.Baseline
 	switch {
@@ -353,7 +360,9 @@ func Decide(in Input) Report {
 	if !report.Bindability.Bound {
 		report.Outcome = Outcome{Status: "unbound", Exit: ExitOperator}
 	}
+	report.Unjudged = report.GapConfirmed || (len(in.Confirmations.Socket) > 0 && report.Outcome.Status == "clear")
 	report.Records = recordsFor(report, in, evidence)
+	report.ConfirmedRecords = confirmedRecordsFor(report, in, evidence)
 	return report
 }
 
@@ -720,7 +729,7 @@ func introducedAdvisories(name string, introduced map[string]*advisoryFacts, tar
 				}
 				seen[marker] = struct{}{}
 				carried++
-				kind, ok := clearingAcceptance(class, occurrence, doc, coverBlocking[coverKey(occurrence)])
+				kind, ok := clearingAcceptance(class, classOfAdvisory(class), occurrence, doc, coverBlocking[coverKey(occurrence)])
 				if !ok {
 					cleared = false
 					continue
@@ -741,7 +750,7 @@ func introducedAdvisories(name string, introduced map[string]*advisoryFacts, tar
 // for an advisory class, by the class's own authority list. introducedBlocking
 // is the introduced blocking advisories of the artifact: what a followed
 // advisory override has to cover.
-func clearingAcceptance(class string, occurrence Occurrence, doc Evidence, introducedBlocking map[string]struct{}) (string, bool) {
+func clearingAcceptance(class, clearClass string, occurrence Occurrence, doc Evidence, introducedBlocking map[string]struct{}) (string, bool) {
 	// A covered member's bytes are its covering artifact's: only an acceptance
 	// of that artifact (its name, version and host) has authority over them,
 	// never one of a standalone artifact that merely shares the member's name
@@ -753,6 +762,11 @@ func clearingAcceptance(class string, occurrence Occurrence, doc Evidence, intro
 	for _, acceptance := range doc.Acceptances {
 		if acceptance.Name != name || acceptance.Version != version ||
 			occurrence.Host == "" || !strings.EqualFold(acceptance.Host, occurrence.Host) {
+			continue
+		}
+		// An approval or pin written by an answer given DURING this command clears the class that answer was for, and no
+		// other: within one command every class at stake is shown to the operator (the next command reuses it in full).
+		if acceptance.Kind == AcceptLocalExact && !doc.answeredFor(name, version, clearClass) {
 			continue
 		}
 		switch class {
@@ -860,4 +874,27 @@ func unconfirmedGaps(gaps []CoverageGap, c Confirmations) int {
 		return 0
 	}
 	return len(gaps)
+}
+
+// classOfAdvisory is the decision class of an advisory class.
+func classOfAdvisory(class string) string {
+	if class == AdvisoryBlocking {
+		return ClassBlockingAdvisory
+	}
+	return ClassAdverseAdvisory
+}
+
+// answeredFor says whether an acceptance of this artifact may clear this class: true when no answer given during this command
+// is behind it (a standing acceptance), or when one of those answers was for this class.
+func (d Evidence) answeredFor(name, version, clearClass string) bool {
+	fresh := false
+	for _, answer := range d.Answered {
+		if answer.Name == name && answer.Version == version {
+			fresh = true
+			if answer.Class == clearClass {
+				return true
+			}
+		}
+	}
+	return !fresh
 }

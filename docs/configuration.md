@@ -313,16 +313,30 @@ pass and warnings under `environment.release_follow`.
   **Missing evidence:** the deliberate confirmation of the infrastructure ruling, for this command, recording nothing, never
   `[a]`; the lockfile is then not recorded as judged, so what could not be judged is judged again the next time and is never
   read as already present. A decline ends the command with the exit of the class left (104, 102 or 100). An acceptance is
-  recorded when it is given, in today's stores by today's writers (`safe audit record-installed`, `safe-run host-allow`, both
-  the ones beside the dispatcher, on the store root the lane reads its switch from), so the standing acceptances clear the same
-  command the next time without a prompt. A named root whose outcome the operator confirmed (an adverse override, a Socket
+  recorded when it is given, in today's stores by today's writers (`safe audit record-installed`, `safe-run host-allow`),
+  on the operator's established root (`$HOME/.config/safe/run`: never a redirect the environment names) and with the programs
+  beside the dispatcher (the auditor inside `safe-run` included; a missing sibling `safe-run` refuses, it is never looked up on
+  the `PATH`), so the standing acceptances clear the same command the next time without a prompt. **A read from the terminal
+  that fails (end of input) authorises nothing**: it ends the command 102 before anything is written, apart from an explicit no.
+  **Each class is shown within one command:** an answer clears its own class for this command and is recorded when given, so
+  the next command reuses it; the other classes at stake on the same artifact (an advisory, then a wait, then a pending Socket
+  score) are still asked. Each prompt lists only the unresolved items of its class (an advisory over two versions with one
+  accepted lists the other); a Socket BLOCK is malice and is asked there only, once per artifact with all its signals; a block
+  that is also malice is never recordable. A named root whose outcome the operator confirmed (an adverse override, a Socket
   consent declined, a pending score confirmed) is recorded after a verified publication through the same `record-installed`
-  (`WARN_TTY_OVERRIDE`, `GO_SOCKET_DECLINED`, `GO_PENDING_CONFIRMED`: exportable, as the 2026-10-13 ruling says); never a malice
-  override, a block override, missing evidence or the one-shot confirmation. A dry run is not prompted. While the operator
-  thinks the project lock stays held and the binder still refuses (33) if the manifest or the lockfiles changed; when the
-  prompts end the evidence read before them may not be older than 15 minutes (`install.lane_evidence_window_seconds` in the
-  operator's configuration may shorten it): otherwise the command is refused before it binds, and what was accepted stays
-  recorded, so the rerun asks nothing again. An agent session is never prompted: it ends as it does unattended.
+  (`WARN_TTY_OVERRIDE`, `GO_SOCKET_DECLINED`, `GO_PENDING_CONFIRMED`: exportable), as the FINAL decision leaves it eligible:
+  the root was introduced by the command, relies on no followed authority in any class, and nothing excludes the command as a
+  whole (confirmed missing evidence, a confirmed Socket outage, a malice or block override record nothing). New adverse
+  evidence revokes the receipt it supersedes at once, after every reading. **Every refusal of the lane has its deliberate
+  confirmation at the operator's terminal** (an accepted missing publish time, an unreadable baseline, a routing refusal): the
+  command then runs on the one-shot route, records nothing and advances no baseline (today's gate runs it with recording
+  switched off, and the command's own status is the answer); not offered: an established block (decided first), a dry run,
+  `dedupe` and `prune` (no other gate), and the lane's own safety refusals (its lock, directories, safe-core, a link out of the
+  project). A cancellation (TERM, INT) at a prompt ends it and frees the project lock; nothing is recorded or published. When
+  the prompts end the evidence may not be older than 15 minutes counted from BEFORE the first evidence read
+  (`install.lane_evidence_window_seconds` in the operator's configuration may shorten it), checked immediately before the
+  baseline is recorded and the binder starts: otherwise the command is refused, and what was accepted stays recorded, so the
+  rerun asks nothing again. An agent session is never prompted: it ends as it does unattended.
 
   **Standing acceptances.** The decision takes the operator's standing acceptances as a document of its own, read by safe's
   own reader (`safe audit lane-acceptances`, which calls the functions today's install gate calls and has no store, format or
