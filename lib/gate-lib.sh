@@ -4000,6 +4000,10 @@ safe_gate_lane_discard_inherited() {
 # `allow-git` (npm 10.9.2 lists the option in its configuration output without
 # defining it, and its hosted-archive path does not call the configured git); the
 # definitions are read from the selected npm itself, so the floor is a guard, not the test.
+# The cooldown (ticket 1635) adds two options the lane puts on every npm command line:
+# `min-release-age` (defined from 11.12.1) and `min-release-age-exclude` (defined from 11.17.0, the first
+# version that can exempt a named version from the filter). An npm that does not define both is refused by
+# the capability probe, so the lane's working floor is the first npm that defines them, 11.17.0.
 
 safe_gate_lane_write_probe_script() {
   cat > "$1" <<'JS'
@@ -4098,12 +4102,12 @@ safe_gate_lane_resolve_command() {
 safe_gate_lane_capability() {
   local in="${SAFE_GATE_LANE_SCRATCH}/capability.in" out="${SAFE_GATE_LANE_SCRATCH}/capability.out" floor="11.12.1"
   jq -n --arg floor "${floor}" '$ARGS.positional as $o | {floor: $floor, options: $o}' \
-    --args allow-git git replace-registry-host cache logs-dir logs-max heading color loglevel > "${in}" || return 1
+    --args allow-git git replace-registry-host cache logs-dir logs-max heading color loglevel min-release-age min-release-age-exclude > "${in}" || return 1
   safe_gate_lane_probe_node capability "${in}" "${out}" || return 1
   # a positive "this npm lacks them" needs a semantic version and options that were asked about
   jq -e -s 'length == 1 and (.[0] | (.version | type == "string") and (.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.+-]*)?$"))
       and (.atFloor | type == "boolean") and (.missing | type == "array")
-      and ([.missing[] | . as $m | ["allow-git","git","replace-registry-host","cache","logs-dir","logs-max","heading","color","loglevel"] | index($m) != null] | all))' "${out}" >/dev/null 2>&1 || return 1
+      and ([.missing[] | . as $m | ["allow-git","git","replace-registry-host","cache","logs-dir","logs-max","heading","color","loglevel","min-release-age","min-release-age-exclude"] | index($m) != null] | all))' "${out}" >/dev/null 2>&1 || return 1
   SAFE_GATE_LANE_CAP_VERSION="$(jq -r -s '.[0].version' "${out}")"
   jq -e -s '.[0] | .atFloor == true and (.missing | length) == 0' "${out}" >/dev/null 2>&1 || {
     SAFE_GATE_LANE_REASON="an npm (${SAFE_GATE_LANE_CAP_VERSION}) that is older than ${floor} or does not define $(jq -r -s '.[0].missing | join(", ")' "${out}") — it cannot be shown to keep git sources out"
@@ -4146,6 +4150,44 @@ safe_gate_lane_selection() {
 
 
 # --- admission ---------------------------------------------------------------
+
+# The cooldown's policy, from the operator's canonical configuration, read as today's auditor reads it
+# (bin/safe-audit): install.cooldown_days (a non-negative integer, 0 disables, 3 by default and when the
+# value is not an integer) and install.cooldown_security_fix (exempt, or enforce; exempt otherwise).
+# Prints "<days> <mode>". Whether a command is judged by age is decided from safe's own reading
+# (internal/projectlane/cooldown.go); npm's filter below is the selection aid.
+safe_gate_project_lane_cooldown_policy() {
+  local config days=3 fix=exempt
+  config="$(safe_gate_trust_store_file config.json)"
+  if [[ -f "${config}" ]]; then
+    days="$(jq -r '(.install.cooldown_days? // 3) | tostring' "${config}" 2>/dev/null)" || days=3
+    fix="$(jq -r '(.install.cooldown_security_fix? // "exempt") | tostring' "${config}" 2>/dev/null)" || fix=exempt
+  fi
+  [[ "${days}" =~ ^[0-9]+$ ]] || days=3
+  days=$((10#${days}))
+  (( days <= 3650 )) || days=3650
+  [[ "${fix}" == exempt || "${fix}" == enforce ]] || fix=exempt
+  printf '%s %s' "${days}" "${fix}"
+}
+
+# The effective release-age filter, asserted: npm's effective configuration holds EXACTLY the window and the
+# exclusions the lane put on the command line (a configuration file or an environment variable cannot widen
+# the cooldown: the command line outranks them, and the settings are read back to prove it), and no
+# absolute `before` date at all (it competes with the window; an explicit date wins within one source).
+# $1 the effective configuration (JSON), $2 the days, the rest the excluded names. Prints the reason.
+safe_gate_project_lane_cooldown_reason() {
+  local config="$1" days="$2" expected
+  shift 2
+  expected="$(printf '%s\n' "$@" | jq -R . | jq -sc 'map(select(. != "")) | sort')" || expected='["?"]'
+  jq -er --argjson days "${days}" --argjson ex "${expected}" '
+    if (."min-release-age" | type) != "number" or ."min-release-age" != $days then
+      "min-release-age " + ((."min-release-age" // "unset") | tostring) + " where the cooldown sets " + ($days | tostring)
+    elif ((."min-release-age-exclude" // []) | map(select(. != "")) | sort) != $ex then
+      "min-release-age-exclude that is not the list of the exact versions the command names"
+    elif ((."before" // null) != null) then
+      "a before date (an absolute date competes with the release-age window of the cooldown)"
+    else empty end' <<<"${config}" 2>/dev/null
+}
 
 # Settings of npm's effective configuration the frozen materialisation cannot
 # carry faithfully, or that the lane does not support yet. Prints the reason.
@@ -4269,16 +4311,27 @@ safe_gate_project_lane_report_ok() {
     and ($r.bindability.bound | type == "boolean")
     and ($r.advisories.fixed | type == "array") and ($r.advisories.already_present | type == "array") and ($r.advisories.introduced | type == "array")
     and ($r.malice | type == "array") and ($r.coverage | type == "array") and ($r.classes | type == "array")
+    and ($r.cooldown | type == "object") and ($r.cooldown.days | type == "number") and ($r.cooldown.waits | type == "array")
+    and ($r.cooldown.waived | type == "array") and ($r.cooldown.unreadable | type == "array")
     and ($r.outcome.exit == $rc)
     and (($r.outcome.status == "clear") == ($rc == 0))
     and (if $rc == 0 then
            $r.outcome.status == "clear" and $r.bindability.bound
            and ($r.baseline.source == "graph" or $r.baseline.source == "empty")
-           and ([$r.classes[] | .class] | sort) == ["adverse_advisory", "blocking_advisory", "malice", "missing_evidence"]
+           and ([$r.classes[] | .class] | sort) == ["adverse_advisory", "blocking_advisory", "malice", "missing_evidence", "wait"]
+           and ([$r.cooldown.waits[] | select(.cleared | not)] | length) == 0
            and ([$r.classes[] | .outstanding] | add) == 0
            and ($r.malice | length) == 0 and ($r.coverage | length) == 0
            and ([$r.advisories.introduced[] | select(.class != "below_high" and (.cleared | not))] | length) == 0
          else ($rc == 100 or $rc == 102 or $rc == 104) end))' "$1" >/dev/null 2>&1
+}
+
+# Lines made of names and our own words, printed one per stderr line through the lane's cleaner.
+safe_gate_err_lines_clean() {
+  local line
+  while IFS= read -r line; do
+    safe_gate_err "$(safe_gate_lane_clean "${line}")"
+  done <<<"$1"
 }
 
 # The report lines, on stderr, after the decision. Fails when it cannot render.
@@ -4299,6 +4352,19 @@ safe_gate_project_lane_report() {
     | "safe: project lane: evidence: \($ok) of \(.identities | length) identities read completely; blocklist checked by name (\(.blocklist | length) hits)"
   ' "${evidence}" 2>/dev/null)" && [[ -n "${lines}" ]] || return 1
   printf '%s\n' "${lines}" >&2
+  # the cooldown: what was judged, what a named security fix waived, and the publish times that could not be read
+  # (disclosed, never a stop)
+  lines="$(jq -r '
+    .cooldown as $c
+    | if $c.days == 0 then "safe: project lane: cooldown: off (install.cooldown_days is 0)"
+      else "safe: project lane: cooldown: \($c.checked) introduced version(s) judged against the \($c.days)-day window (npm'"'"'s release-age filter is set to the same window on the projection)"
+        + (if ($c.waived | length) > 0 then "; waived as the security fix it names: " + ([$c.waived[] | "\(.name)@\(.version) (fixes \(.remediates | join(", ")))"] | join(", ")) else "" end)
+      end,
+      (if ($c.unreadable | length) > 0
+       then "safe: project lane: cooldown: publish time not read for \($c.unreadable | length) version(s), disclosed and not stopping: " + ([$c.unreadable[:5][] | if .name == "" then .gap else "\(.name)@\(.version) (\(.gap))" end] | join("; ")) + (if ($c.unreadable | length) > 5 then "; and \(($c.unreadable | length) - 5) more" else "" end)
+       else empty end)
+  ' "${report}" 2>/dev/null)" && [[ -n "${lines}" ]] || return 1
+  safe_gate_err_lines_clean "${lines}"
   scripts="$(jq -r '
     [ .packages | to_entries[]
       | select(.key | test("node_modules/")) | select(.value.hasInstallScript == true)
@@ -4329,6 +4395,9 @@ safe_gate_project_lane_outcome_text() {
       elif $o.class == "adverse_advisory" then
         (gating("adverse")) as $a
         | "the command introduces a high-severity advisory: \(ident($a[0])) carries \($a[0].id) (\($a[0].severity))\(if ($a | length) > 1 then " and \(($a | length) - 1) more" else "" end)|choose a version without it; the project lane has no acceptance step yet"
+      elif $o.class == "wait" then
+        ([.cooldown.waits[] | select(.cleared | not)]) as $w
+        | "\($w[0].name)@\($w[0].version) was published \($w[0].published) and is inside the \(.cooldown.days)-day cooldown; it becomes installable on \($w[0].installable)\(if $w[0].enforced then " (it fixes \($w[0].remediates | join(", ")), but install.cooldown_security_fix is enforce)" else "" end)\(if ($w | length) > 1 then " (and \(($w | length) - 1) more)" else "" end)|retry on or after that date, or name an older exact version; the project lane has no acceptance step for a wait yet"
       elif $o.class == "missing_evidence" then
         (.coverage[0]) as $c
         | "advisory evidence is missing (\(if $c.name == "" then $c.gap else "\($c.name)@\($c.version): \($c.gap)" end))\(if (.coverage | length) > 1 then " and \((.coverage | length) - 1) more" else "" end) — audit-infrastructure breakage, not a package finding|fix connectivity or run safe doctor, then retry"
@@ -4715,7 +4784,7 @@ safe_gate_project_lane_run() {
   # first npm run: npm's cache and logs live there for every phase.
   if [[ -L "${data_root}" ]] || ! safe_gate_lane_private_dir "${lane_dir}" || ! safe_gate_lane_private_dir "${lane_dir}/npm-cache" \
       || ! safe_gate_lane_private_dir "${lane_dir}/npm-logs" || ! safe_gate_lane_private_dir "${lane_dir}/state" \
-      || ! safe_gate_lane_private_dir "${lane_dir}/reports"; then
+      || ! safe_gate_lane_private_dir "${lane_dir}/reports" || ! safe_gate_lane_private_dir "${lane_dir}/publish-times"; then
     safe_gate_project_lane_refuse 100 "${verb}" "safe's lane storage cannot be established as private (audit-infrastructure breakage, not a package finding)" "fix the safe data directory and retry — safe doctor"
     return $?
   fi
@@ -4918,6 +4987,37 @@ safe_gate_project_lane_run() {
     return $?
   fi
   SAFE_GATE_LANE_CORE="${safe_core}"
+  # --- the cooldown's selection aid, on every npm command line of the lane -------------------------------
+  # npm's release-age filter at install.cooldown_days; a version the caller names EXACTLY is excluded from
+  # it by name (npm refuses an exact version inside the window with ETARGET, which would hide the wait
+  # safe's own reading reports with its date), and safe's reading judges that version as a root. With no
+  # exact name the exclusion list is set empty, so that no outside source can exclude a package. These are
+  # the lane's own invocations of the real npm: they never go through the caller's front door.
+  local cooldown_days=3 cooldown_fix=exempt roots_json="[]" root_name=""
+  local -a cooldown_excludes=()
+  read -r cooldown_days cooldown_fix <<<"$(safe_gate_project_lane_cooldown_policy)"
+  if (( ${#specs[@]} )); then
+    roots_json="$(printf '%s\0' "${specs[@]}" | "${safe_core}" project-roots 2>/dev/null)" || roots_json=""
+    if ! safe_gate_lane_one_doc 'type == "array" and ([.[] | (.name | type == "string") and (.version | type == "string")] | all)' "${roots_json}"; then
+      safe_gate_project_lane_refuse 100 "${verb}" "the exact versions named on the command line cannot be read (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
+      return $?
+    fi
+    while IFS= read -r root_name; do
+      [[ -n "${root_name}" ]] || continue
+      # a name is excluded by the pattern npm matches it with: a name that carries a pattern character is not one
+      if [[ "${root_name}" == *[\*\?\[\]\{\}\(\)\!\,]* ]]; then
+        safe_gate_project_lane_unsupported "${verb}" "a named package whose name carries a glob character, which cannot be excluded from the release-age filter by name"
+        return $?
+      fi
+      cooldown_excludes+=("${root_name}")
+    done < <(jq -r '[.[].name] | unique | .[]' <<<"${roots_json}")
+  fi
+  dest+=("--min-release-age=${cooldown_days}")
+  if (( ${#cooldown_excludes[@]} )); then
+    for root_name in "${cooldown_excludes[@]}"; do dest+=("--min-release-age-exclude=${root_name}"); done
+  else
+    dest+=("--min-release-age-exclude=")
+  fi
   if ! safe_gate_audit_available; then
     safe_gate_project_lane_refuse 102 "${verb}" "the advisory reader is unavailable (audit-infrastructure breakage, not a package finding)" "rerun install.sh"
     return $?
@@ -5151,7 +5251,8 @@ safe_gate_project_lane_run() {
     return $?
   fi
   printf '%s\n' "${config_json}" > "${scratch}/config.json"
-  if value="$(safe_gate_project_lane_config_reason "${config_json}")"; then
+  if value="$(safe_gate_project_lane_config_reason "${config_json}")" \
+      || value="$(safe_gate_project_lane_cooldown_reason "${config_json}" "${cooldown_days}" "${cooldown_excludes[@]+"${cooldown_excludes[@]}"}")"; then
     safe_gate_project_lane_unsupported "${verb}" "the npm setting (${value})"
     return $?
   fi
@@ -5188,7 +5289,8 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_unsupported "${verb}" "package-lock-only set by the npm configuration (the frozen installation would extract nothing)"
     return $?
   fi
-  if value="$(safe_gate_project_lane_config_reason "${frozen_json}")"; then
+  if value="$(safe_gate_project_lane_config_reason "${frozen_json}")" \
+      || value="$(safe_gate_project_lane_cooldown_reason "${frozen_json}" "${cooldown_days}" "${cooldown_excludes[@]+"${cooldown_excludes[@]}"}")"; then
     safe_gate_project_lane_unsupported "${verb}" "the npm setting (${value})"
     return $?
   fi
@@ -5296,7 +5398,8 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_refuse 102 "${verb}" "the ${baseline_kind} baseline lockfile cannot be read, so what the command introduces cannot be told (audit-infrastructure breakage, not a package finding)" "repair the lockfile and retry"
     return $?
   elif (( rc != 0 )) || ! safe_gate_lane_one_doc '.schema_version == 1 and (.difference | type == "object") and (.evidence_request | type == "array")
-      and ([.evidence_request[] | (.name | type == "string") and (.version | type == "string")] | all)' "${diff_json}"; then
+      and ([.evidence_request[] | (.name | type == "string") and (.version | type == "string")] | all)
+      and (.cooldown_request | type == "array") and ([.cooldown_request[] | (.name | type == "string") and (.version | type == "string") and (.host | type == "string")] | all)' "${diff_json}"; then
     safe_gate_project_lane_refuse 100 "${verb}" "the lockfile analysis failed or returned an unreadable result (exit ${rc}; audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
     return $?
   fi
@@ -5334,9 +5437,24 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_refuse 102 "${verb}" "advisory evidence cannot be read (the reader exited ${rc}; audit-infrastructure breakage, not a package finding)" "fix connectivity or run safe doctor, then retry"
     return $?
   fi
+  # The cooldown's reading: the publish time of every introduced registry version of a public host, per exact
+  # version (cached in safe's data directory), and for a named exact version inside the window the advisories it
+  # fixes. A time that cannot be read is a gap in the document, not a failure of this step.
+  local releases="${scratch}/releases.json" release_request="${scratch}/release-request.json"
+  if ! jq -ec --argjson days "${cooldown_days}" --arg fix "${cooldown_fix}" --argjson roots "${roots_json}" \
+      '{schema_version: 1, policy: {cooldown_days: $days, security_fix: $fix}, roots: $roots, identities: .cooldown_request}' "${scratch}/diff.json" >"${release_request}" 2>/dev/null; then
+    safe_gate_project_lane_refuse 100 "${verb}" "the cooldown's request cannot be formed (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
+    return $?
+  fi
+  rc=0
+  "${safe_core}" project-releases --request "${release_request}" --cache-dir "${lane_dir}/publish-times" >"${releases}" 2>"${scratch}/releases.err" || rc=$?
+  if (( rc != 0 )); then
+    safe_gate_project_lane_refuse 102 "${verb}" "publish times cannot be read (the reader exited ${rc}; audit-infrastructure breakage, not a package finding)" "rerun install.sh or run safe doctor, then retry"
+    return $?
+  fi
   # The evidence reaches the decision exactly as the reader wrote it.
   rc=0
-  "${safe_core}" project-decide "${baseline_args[@]}" --evidence "${evidence}" "${proj}/package-lock.json" >"${report}" 2>"${scratch}/decide.err" || rc=$?
+  "${safe_core}" project-decide "${baseline_args[@]}" --evidence "${evidence}" --releases "${releases}" "${proj}/package-lock.json" >"${report}" 2>"${scratch}/decide.err" || rc=$?
   if (( rc != 0 && rc != 100 && rc != 102 && rc != 104 )); then
     safe_gate_project_lane_refuse 102 "${verb}" "the decision cannot read its evidence (exit ${rc}; audit-infrastructure breakage, not a package finding)" "rerun install.sh or run safe doctor, then retry"
     return $?
@@ -5358,9 +5476,10 @@ safe_gate_project_lane_run() {
     return $?
   fi
   # Which baseline the differential was taken against, and what the lockfile on disk
-  # added to it. SEAM (age of entries, ticket 1635): ${scratch}/disk-introduced.json
-  # lists the artifacts the lockfile on disk carries that the baseline does not, that
-  # is, what this command introduces WITHOUT this projection having resolved it.
+  # added to it. An entry the lockfile on disk carries that the baseline does not is an introduced
+  # artifact of the target like any other, so the decision (advisories, malice and the cooldown's
+  # reading of its age) already judged it; ${scratch}/disk-introduced.json only says how many there
+  # are, for the report.
   if [[ "${verb}" == "ci" ]]; then
     # ci judges no difference: what it installs is the whole lockfile, so malice is read over every
     # entry of it and the advisories the baseline already carries are reported, never gating.

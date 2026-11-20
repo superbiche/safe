@@ -246,6 +246,24 @@ pass and warnings under `environment.release_follow`.
   the manifest refuses with npm's diagnostic and status (the way out is `npm install` first). With no
   lockfile, `dedupe` and `prune` refuse 100: npm would work from the installed tree, which the lane does not
   read (a lockfile-only run in the scratch copy would resolve a newer version than the resident one).
+  **Cooldown.** `install.cooldown_days` (3 by default, 0 disables) and `install.cooldown_security_fix` apply on
+  the lane as they do on today's gate, on what a command introduces. npm's release-age filter is set to the same
+  window, on the command line of every npm run of the lane (`--min-release-age`), with the exact versions the
+  command names excluded by name (`--min-release-age-exclude`; npm refuses an exact version inside the window with
+  its own error, which would hide the wait): a selection aid, so that `npm update` resolves nothing younger than the
+  window. npm's effective configuration is read back and must hold exactly that window and those exclusions and no
+  absolute `before` date, so no configuration file or environment variable can widen the cooldown (a project `.npmrc`
+  that sets any of the three is not on the allow-list: the command takes the one-shot route). The decision is safe's own
+  reading: the publish time of every introduced registry version of a public host, read from that registry and cached
+  per exact version in safe's data directory (`project-lane/publish-times`). An introduced version younger than the
+  window is a wait: it refuses 100, naming the package, the version and the date it becomes installable (a wait has no
+  acceptance step on this lane yet). A version the caller named exactly that fixes a published advisory is waived under
+  `exempt` and waits under `enforce`, which says so; the exemption belongs to that exact version, so another young
+  version of the same name, or a young fix nobody named, waits. A version already in the baseline is not judged for its
+  age, whoever locked it (the spec's open question 1; one predicate, `CooldownCandidates`, holds the choice); an entry the
+  lockfile on disk carries that the baseline does not is introduced, and is judged. A publish time that cannot be read is
+  disclosed in the report and does not stop the command. The npm must define `min-release-age-exclude` (npm 11.17.0 or
+  later, which the capability probe checks on top of the 11.12.1 floor).
   A lockfile entry the frozen installation does not build (one nothing in the manifest needs) is caught by the
   binder's tree verification before anything is published, and the refusal says to run `npm install` first.
   npm's `prune` writes its lockfile in every case where one exists. Every npm run whose output the lane reads
