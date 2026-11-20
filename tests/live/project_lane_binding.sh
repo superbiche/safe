@@ -136,6 +136,12 @@ if [[ "${1:-}" == "scanner-batch" ]]; then
           blocklist: []}'
   exit 0
 fi
+# Socket's facts on the named roots (package-audit --evidence-only): a fixture, because no Socket credential is
+# available to a live run; every named root scores clear and no block is cached.
+if [[ "${1:-}" == "package-audit" && "$*" == *"--evidence-only"* ]]; then
+  jq -c '{schema_version: 1, roots: [.roots[] | {name, version, outcome: "clear", gate_exit: 0, line: "PASS (score=95)", causes: [], cached: false}], cached_blocks: [], cache_gap: ""}'
+  exit 0
+fi
 exit 0
 AUDIT
 chmod +x "${WORK}/safe/bin/safe-audit"
