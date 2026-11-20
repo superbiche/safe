@@ -11405,8 +11405,7 @@ case_project_lane_routing_global_mode_is_read_from_the_arguments_in_the_plain_fo
   done
   for script in 'npm install --global=false clean@2.0.0' 'npm install --global=true clean@2.0.0' 'npm install -g=true clean@2.0.0' \
       'npm install --global false clean@2.0.0' 'npm install -g true clean@2.0.0' 'npm install --no-global clean@2.0.0' \
-      'npm install --location=global clean@2.0.0' 'npm install --location project clean@2.0.0' 'npm install --location=project clean@2.0.0' \
-      'npm install --no-location clean@2.0.0'; do
+      'npm install --location=global clean@2.0.0' 'npm install --location project clean@2.0.0' 'npm install --location=project clean@2.0.0'; do
     lane_prepare "lane-global-forms-${RANDOM}" kept@1.0.0
     : > "${LOG_FILE}"
     lane_run "${script}"
@@ -11414,6 +11413,13 @@ case_project_lane_routing_global_mode_is_read_from_the_arguments_in_the_plain_fo
     assert_err_contains_fragment 'use the plain form -g or --global' "$FUNCNAME: ${script}" || return
     [[ "$(lane_project_npm_runs)" == "0" ]] || { fail "$FUNCNAME: ${script}: npm ran"; return; }
   done
+  # `--no-location` sets no location npm can be asked about: the front door refuses it (its own line, not the lane's)
+  lane_prepare "lane-global-no-location" kept@1.0.0
+  : > "${LOG_FILE}"
+  lane_run 'npm install --no-location clean@2.0.0'
+  assert_status 100 "$FUNCNAME: --no-location" || return
+  assert_err_contains_fragment "the value of '--location'" "$FUNCNAME: --no-location" || return
+  [[ "$(lane_project_npm_runs)" == "0" ]] || { fail "$FUNCNAME: --no-location: npm ran"; return; }
   # the operand after a terminator is an operand: the terminator refuses, a -g there never makes it global
   lane_prepare "lane-global-terminator" kept@1.0.0
   : > "${LOG_FILE}"

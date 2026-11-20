@@ -7491,6 +7491,9 @@ safe_gate_npm_locate_by_reading() {
     (( i < at )) || break
     [[ "${arg}" =~ ^-{2,}$ ]] && return 1
     if [[ "${arg}" == -* && ${#arg} -gt 1 ]]; then
+      # (a scoped or nerf-darted key, `--@scope:registry`, `--//host/:_authToken`, is one no npm types: nopt reads it as
+      # an unknown name, which is what the reading above did with it)
+      if [[ "${arg%%=*}" == *[:/@]* ]]; then continue; fi
       if ! safe_gate_nopt_known_flag "${arg}"; then SAFE_GATE_SUBCMD_BADFLAG="${arg%%=*}"; return 1; fi
     fi
   done
