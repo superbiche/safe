@@ -12763,6 +12763,46 @@ case_npm_reading_decides_command_and_packages_found_by_the_oracle() {
   pass "$FUNCNAME"
 }
 
+# An option only some npm versions define is read every way the versions read it (the snapshot is a union over npm 8.1 to
+# 12.2, and an older npm takes the word after `--allow-git` for a package, a newer one for the option's value).
+case_npm_version_dependent_options_are_read_every_way() {
+  prepare_case "npm-version-dependent-options"
+  local script
+  # each must refuse, or audit blockme: here they refuse (the readings give different packages)
+  for script in 'npm install --allow-git blockme' 'npm install --min-release-age blockme' 'npm install --cpu blockme' 'npm install -g --allow-git blockme' \
+      'npm install --install-strategy blockme' 'npm install --install-strategy nested blockme' 'npm --cpu x64 install blockme' 'npm exec --cpu blockme'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 100 "$FUNCNAME: ${script}" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { fail "$FUNCNAME: ${script}: not one line"; return; }
+    assert_err_contains_fragment 'read differently by the npm versions the gate vouches for' "$FUNCNAME: ${script}" || return
+    assert_err_not_contains_fragment 'blockme' "$FUNCNAME: ${script}" || return
+    ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: npm was delegated to"; return; }
+  done
+  # the way out printed: the value attached. Every version consumes an = value for a name it does not define as Boolean,
+  # and the audit sees the package
+  for script in 'npm install --install-strategy=nested blockme' 'npm install --cpu=x64 blockme' 'npm install --allow-git=none blockme' 'npm install -g --min-release-age=7 blockme' \
+      'npm install --loglevel=info blockme' 'npm install --no-install-links blockme' 'npm install --init-private blockme'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 104 "$FUNCNAME: ${script}" || return
+    grep -q $'^AUDIT\tpackage-audit\tblockme\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: blockme was not audited"; return; }
+  done
+  # a command the gate does not audit under any reading goes on
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm run build --cpu x64' run_zsh
+  assert_status 0 "$FUNCNAME: ungated" || return
+  # up to four such options are read in every combination; five refuse, agreement or not
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm install --cpu=x64 --os=linux --libc=glibc --allow-git=none --min-release-age=1 blockme' run_zsh
+  assert_status 100 "$FUNCNAME: five" || return
+  assert_err_contains_fragment 'too many to read every way' "$FUNCNAME: five" || return
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm install --cpu=x64 --os=linux --libc=glibc --allow-git=none blockme' run_zsh
+  assert_status 104 "$FUNCNAME: four" || return
+  pass "$FUNCNAME"
+}
+
 # The oracle can fail: its judge reports a wrong observation of each kind (a gate that agreed with everything would pass
 # any corpus), and the helper fails when it did not evaluate every case.
 case_npm_option_oracle_can_fail() {
@@ -12967,6 +13007,7 @@ main() {
     case_npm_front_door_reads_abbreviations_and_combinations \
     case_npm_argument_hygiene_refuses_what_extractors_and_npm_read_differently \
     case_npm_option_oracle_can_fail \
+    case_npm_version_dependent_options_are_read_every_way \
     case_npm_reading_decides_command_and_packages_found_by_the_oracle \
     case_refusal_message_contract \
     case_large_pinned_install_and_socket_rate_nontty \

@@ -8,7 +8,11 @@
 // survives), comma separated; the empty string is `%00` and the empty list is a lone `%` (see
 // tests/lib/npm-option-corpus.sh, which decodes).
 //
-//   node tests/lib/npm-option-corpus.cjs <npm dir> [--quick | --sample=N]
+//   node tests/lib/npm-option-corpus.cjs <npm dir> [--union=<dir>,<dir>...] [--quick | --sample=N]
+//
+// --union: the names (options and shorthands) the cases are made of are the union of those of the given npm
+// installations and the one under test; npm's parser under test reads them with ITS OWN definitions, so a name this npm
+// does not define (one a newer npm adds) is tried against it as an unknown name, which is how an older npm reads it.
 //
 // Families (each counted on stderr): every option npm defines in the forms --x, --x=v, --x v, --no-x, with the
 // values true, false, a command name, a package name, a word that looks like an option and the terminator, before
@@ -24,8 +28,27 @@ const sample = sampleArg ? Number(sampleArg.slice(9)) : (process.argv.includes('
 const quick = sample > 1
 const nopt = require(path.join(npmDir, 'node_modules', 'nopt'))
 const abbrev = require(path.join(npmDir, 'node_modules', 'abbrev'))
-const { definitions, shorthands } = require(path.join(npmDir, 'node_modules', '@npmcli', 'config', 'lib', 'definitions'))
-const { deref } = require(path.join(npmDir, 'lib', 'utils', 'cmd-list.js'))
+function loadDefinitions(dir) {
+  for (const rel of [['node_modules', '@npmcli', 'config', 'lib', 'definitions'], ['lib', 'utils', 'config']]) {
+    try { return require(path.join(dir, ...rel)) } catch (e) { /* the other layout */ }
+  }
+  throw new Error(`no option definitions under ${dir}`)
+}
+const { definitions, shorthands } = loadDefinitions(npmDir)
+const unionArg = process.argv.find((a) => a.startsWith('--union='))
+// the generation tables: this npm's own, extended with the names the other installations define
+const genTypes = {}
+const genShorthands = { ...shorthands }
+for (const [k, d] of Object.entries(definitions)) genTypes[k] = d.type
+for (const dir of unionArg ? unionArg.slice(8).split(',').filter(Boolean) : []) {
+  const other = loadDefinitions(dir)
+  for (const [k, d] of Object.entries(other.definitions)) if (genTypes[k] === undefined) genTypes[k] = d.type
+  for (const [k, v] of Object.entries(other.shorthands)) if (genShorthands[k] === undefined) genShorthands[k] = v
+}
+// npm 8 keeps the command resolution in lib/utils/deref-command.js, later versions in cmd-list.js
+let deref
+try { ({ deref } = require(path.join(npmDir, 'lib', 'utils', 'cmd-list.js'))) } catch (e) { deref = undefined }
+if (typeof deref !== 'function') deref = require(path.join(npmDir, 'lib', 'utils', 'deref-command.js'))
 const types = {}
 for (const [k, d] of Object.entries(definitions)) types[k] = d.type
 nopt.invalidHandler = () => {}
@@ -52,21 +75,21 @@ function emit(family, args) {
   families[family] = (families[family] || 0) + 1
 }
 
-const names = Object.keys(types).sort()
+const names = Object.keys(genTypes).sort()
 const keys = quick ? names.filter((_, i) => i % sample === 0) : names
-const abbrevs = abbrev(Object.keys(types))
+const abbrevs = abbrev(Object.keys(genTypes))
 function allAbbreviations(name) {
   const out = []
   for (let n = 1; n < name.length; n++) if (abbrevs[name.slice(0, n)] === name) out.push(name.slice(0, n))
   return out
 }
 function literals(name) {
-  const t = types[name]
+  const t = genTypes[name]
   if (!Array.isArray(t) || name === 'local-address') return []
   return t.filter((m) => typeof m === 'string')
 }
 const values = ['true', 'false', 'install', 'evilpkg', '-g', '--']
-const shortNames = Object.keys(shorthands).sort()
+const shortNames = Object.keys(genShorthands).sort()
 
 // the places a spelling can sit
 function placements(spelling) {
@@ -121,7 +144,7 @@ for (const u of ['--frobnicate', '--no-frobnicate', '--frobnicate=true', '--frob
   fam('unknown', [[u], [u, 'evilpkg']])
 }
 // pairs of options, the ones the gate interprets and the common ones: every order, both sides of the verb
-const pairNames = ['global', 'location', 'package', 'call', 'json', 'yes', 'prefix', 'registry', 'color', 'save-dev'].filter((n) => types[n] !== undefined)
+const pairNames = ['global', 'location', 'package', 'call', 'json', 'yes', 'prefix', 'registry', 'color', 'save-dev'].filter((n) => genTypes[n] !== undefined)
 const pairSpell = (n) => [[`--${n}`], [`--${n}=true`], [`--${n}=evilpkg`], [`--${n}=global`], [`--${n}`, 'evilpkg']]
 const pairUnits = pairNames.flatMap(pairSpell).filter((_, i) => !quick || i % sample === 0)
 for (const a of pairUnits) for (const b of pairUnits) {
@@ -136,4 +159,4 @@ for (const o of odd) {
 }
 // the terminator
 for (const full of [['--', 'install', 'evilpkg'], ['install', '--', '--json=evilpkg'], ['install', '--json=evilpkg', '--', 'x'], ['exec', '--', '--json=evilpkg'], ['---', 'install', 'evilpkg'], ['install', '---', 'evilpkg']]) emit('terminator', full)
-process.stderr.write(`corpus: ${count} cases from ${keys.length} of ${names.length} options and ${shortNames.length} shorthands (${Object.entries(families).map(([k, v]) => `${k} ${v}`).join(', ')})\n`)
+process.stderr.write(`corpus: ${count} cases from ${keys.length} of ${names.length} options (${Object.keys(types).length} defined by this npm) and ${shortNames.length} shorthands (${Object.entries(families).map(([k, v]) => `${k} ${v}`).join(', ')})\n`)

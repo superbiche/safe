@@ -33,6 +33,13 @@
   gate's reading after its own extraction. The differential oracle now compares exact identities, the
   delegation, the scan decision and global mode, can fail (self-test), and fails when it evaluated fewer cases
   than it was given.
+  Version-dependent options: the snapshot is a union over npm 8.1 to 12.2, and an option only some versions define
+  is read differently by them (npm 8.1 and 10.9 install `evil` for `npm install --allow-git evil`; npm 11.20
+  consumes it as the option's value). Such options, abbreviations of their names included, are now read under every
+  combination of their readings (up to four; five refuse) and the command goes on only when every reading agrees on
+  the command, the packages and global mode; the way out is the value attached (`--install-strategy=nested`). The
+  space forms of the newer options (`--install-strategy nested`, `--cpu x64`, `--os linux`) therefore refuse; the `=`
+  forms pass. An npm older than the oldest reference version (8.1.0) is outside what the snapshot can vouch for.
 - Project lane: `npm ci`, `npm dedupe` and `npm prune` (still behind `install.project_lane`). `ci` has no
   projection: its plan is the lockfile on disk, checked against the manifest by npm's own frozen check (`npm
   ci --dry-run`; a lockfile out of step or missing is npm's own error, shown as npm's, with npm's status),

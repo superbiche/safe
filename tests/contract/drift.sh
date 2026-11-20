@@ -429,6 +429,28 @@ case_npm_option_snapshot_is_consistent_and_reads_like_nopt() {
   check 0 'install evil' 1 --location=global install evil
   check 0 'install evil' 0 --frobnicate=x install evil    # an unknown name consumes it
   check 0 'install --json=evil' 0 install -- --json=evil  # after the terminator nothing is an option
+  # the version-dependent names: each is a known option (or shorthand), has at least two distinct readings, and every
+  # reading is `@` (a version that does not define it) or the same letters the union holds; the oldest reference is 8.1.0
+  local r n
+  for pair in "${SAFE_GATE_NPM_VARIANT_OPTIONS[@]}"; do
+    key="${pair%%=*}"
+    [[ -n "${SAFE_GATE_NOPT_FLAGS[${key}]+set}" ]] || bad="${bad} ${key}(variant of no known option)"
+    IFS=';' read -r -a rs <<<"${pair#*=}"
+    (( ${#rs[@]} >= 2 )) || bad="${bad} ${key}(variant with one reading)"
+    for r in "${rs[@]}"; do
+      [[ "${r}" == @ || "${r}" =~ ^(-|[ABSNTY]+)(:[A-Za-z0-9_.,-]*)?$ ]] || bad="${bad} ${key}(reading ${r})"
+    done
+  done
+  for pair in "${SAFE_GATE_NPM_VARIANT_SHORTHANDS[@]}"; do
+    key="${pair%%=*}"
+    [[ -n "${SAFE_GATE_NOPT_SHORT[${key}]+set}" ]] || bad="${bad} ${key}(variant of no known shorthand)"
+  done
+  [[ " ${SAFE_GATE_NPM_REFERENCE_VERSIONS} " == *" 8.1.0 "* ]] || bad="${bad} (the reference versions do not include 8.1.0)"
+  n=0; for pair in "${SAFE_GATE_NPM_VARIANT_OPTIONS[@]}"; do n=$((n + 1)); done
+  (( n >= 40 )) || bad="${bad} (only ${n} version-dependent options)"
+  # a version-dependent option is read every way: the five lines of the review each refuse or audit the package
+  safe_gate_npm_variant_check install --allow-git evilpkg >/dev/null 2>&1 && bad="${bad} (--allow-git evilpkg went through)"
+  safe_gate_npm_variant_check install --allow-git=none evilpkg >/dev/null 2>&1 || bad="${bad} (--allow-git=none refused)"
   if [[ -z "${bad}" ]]; then
     pass "$FUNCNAME"
   else

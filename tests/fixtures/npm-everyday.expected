@@ -48,3 +48,12 @@ config set registry=https://registry.npmjs.org/ => rc=0 | DELEGATE npm config se
 uninstall okpkg => rc=0 | DELEGATE npm uninstall okpkg;
 install --color=always okpkg => rc=0 | SCAN;AUDIT okpkg;DELEGATE npm install --color=always okpkg;
 --color=always install okpkg => rc=0 | SCAN;AUDIT okpkg;DELEGATE npm --color=always install okpkg;
+install --install-strategy nested okpkg => rc=100 | ERR safe: BLOCKED npm — the option '--install-strategy' is read differently by the npm versions the gate vouches for (an older npm takes the word after it as a package, a newer one as its value), so the gate cannot tell which packages npm would install; to allow: write the value attached (--install-strategy=<value>), or drop the option or pass it in the environment (npm_config_<name>=<value> npm …), then retry; details: safe explain;
+install --cpu x64 okpkg => rc=100 | ERR safe: BLOCKED npm — the option '--cpu' is read differently by the npm versions the gate vouches for (an older npm takes the word after it as a package, a newer one as its value), so the gate cannot tell which packages npm would install; to allow: write the value attached (--cpu=<value>), or drop the option or pass it in the environment (npm_config_<name>=<value> npm …), then retry; details: safe explain;
+install --loglevel error okpkg => rc=0 | SCAN;AUDIT okpkg;DELEGATE npm install --loglevel error okpkg;
+install --omit dev okpkg => rc=0 | SCAN;AUDIT okpkg;DELEGATE npm install --omit dev okpkg;
+install --include dev okpkg => rc=0 | SCAN;AUDIT okpkg;DELEGATE npm install --include dev okpkg;
+install --tag next okpkg => rc=0 | SCAN;AUDIT okpkg;DELEGATE npm install --tag next okpkg;
+install --before 2026-01-01 okpkg => rc=0 | SCAN;AUDIT okpkg;DELEGATE npm install --before 2026-01-01 okpkg;
+install --os linux okpkg => rc=100 | ERR safe: BLOCKED npm — the option '--os' is read differently by the npm versions the gate vouches for (an older npm takes the word after it as a package, a newer one as its value), so the gate cannot tell which packages npm would install; to allow: write the value attached (--os=<value>), or drop the option or pass it in the environment (npm_config_<name>=<value> npm …), then retry; details: safe explain;
+install --min-release-age=7 okpkg => rc=0 | SCAN;AUDIT okpkg;DELEGATE npm install --min-release-age=7 okpkg;

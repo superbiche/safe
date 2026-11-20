@@ -20,6 +20,7 @@
 # Corpus size: tiny by default (one option in 16), SAFE_ORACLE_SAMPLE=N for one in N, SAFE_ORACLE_FULL=1 for all.
 set -uo pipefail
 
+HOME_REAL="$HOME"   # (the isolation below replaces HOME; the reference npm installs live under the real one)
 # SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
 # shellcheck source=tests/lib/test-isolation.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-isolation.sh"
@@ -55,7 +56,8 @@ else
   fi
   npm_dir="${prefix%/}/lib/node_modules/npm"
 fi
-if [[ ! -r "$npm_dir/node_modules/nopt/lib/nopt-lib.js" || ! -r "$npm_dir/node_modules/@npmcli/config/lib/definitions/index.js" ]]; then
+# (npm 8 has no nopt-lib.js and keeps its definitions under lib/utils/config)
+if [[ ! -r "$npm_dir/node_modules/nopt/package.json" ]] || { [[ ! -r "$npm_dir/node_modules/@npmcli/config/lib/definitions/index.js" ]] && [[ ! -r "$npm_dir/lib/utils/config/definitions.js" ]]; }; then
   fail "npm's parser and definitions are unavailable at $npm_dir"
   printf '%s passed, %s failed\n' "$PASS" "$FAIL"
   exit 1
@@ -70,8 +72,22 @@ if ! node "$ROOT/scripts/npm-option-snapshot.cjs" --one "$npm_dir" > "$WORK/inst
   fail "the installed npm's definitions could not be read ($(head -n 1 "$WORK/installed.err"))"
 else
   missing=""
-  while IFS=$'\t' read -r kind name value; do
+  while IFS=$'\t' read -r kind name value lits; do
     if [[ "$kind" == opt ]]; then
+      # the reading of this npm must be one the snapshot lists: among the variants of a version-dependent name, the
+      # shipped one otherwise
+      reading="${value:--}${lits:+:$lits}"
+      listed=""
+      for pair in "${SAFE_GATE_NPM_VARIANT_OPTIONS[@]}"; do
+        [[ "${pair%%=*}" == "$name" ]] && listed=";${pair#*=};"
+      done
+      if [[ -n "$listed" && "$listed" != *";${reading};"* ]]; then
+        missing="$missing $name(reading ${reading} is not among its variants)"
+      elif [[ -z "$listed" ]]; then
+        for pair in "${SAFE_GATE_NPM_OPTIONS[@]}"; do
+          [[ "${pair%%=*}" == "$name" && "${pair#*=}" != "$reading" && "${pair#*=}" != "${reading}:" ]] && missing="$missing $name(shipped ${pair#*=}, installed ${reading}, and not a listed variant)"
+        done
+      fi
       shipped=""
       for pair in "${SAFE_GATE_NPM_OPTIONS[@]}"; do [[ "${pair%%=*}" == "$name" ]] && shipped="${pair#*=}"; done
       [[ -n "$shipped" ]] || { missing="$missing $name(not in the snapshot)"; continue; }
@@ -96,7 +112,16 @@ fi
 # --- 2. the reading -----------------------------------------------------------------------
 sample="${SAFE_ORACLE_SAMPLE:-16}"
 [[ "${SAFE_ORACLE_FULL:-0}" != 1 ]] || sample=1
-node "$ROOT/tests/lib/npm-option-corpus.cjs" "$npm_dir" --sample="$sample" > "$WORK/corpus" 2>"$WORK/corpus.err"
+# The corpus is made of the union of the names the reference npm versions define (SAFE_LIVE_NPM_REFERENCES, a
+# comma separated list of npm directories; default: every npm of the mise node installs), read by THIS npm's own parser:
+# a name this npm does not define is tried against it as the unknown name it is to it.
+references="${SAFE_LIVE_NPM_REFERENCES:-}"
+if [[ -z "$references" ]]; then
+  for d in "${HOME_REAL:-$HOME}"/.local/share/mise/installs/node/*.*.*/lib/node_modules/npm; do
+    [[ -r "$d/package.json" ]] && references="${references:+$references,}$d"
+  done
+fi
+node "$ROOT/tests/lib/npm-option-corpus.cjs" "$npm_dir" ${references:+--union="$references"} --sample="$sample" > "$WORK/corpus" 2>"$WORK/corpus.err"
 corpus_size="$(wc -l < "$WORK/corpus")"
 printf '# corpus: %s cases (%s)\n' "$corpus_size" "$(cat "$WORK/corpus.err")"
 if (( corpus_size < 100 )); then

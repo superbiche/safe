@@ -48,3 +48,12 @@ config set registry=https://registry.npmjs.org/
 uninstall okpkg
 install --color=always okpkg
 --color=always install okpkg
+install --install-strategy nested okpkg
+install --cpu x64 okpkg
+install --loglevel error okpkg
+install --omit dev okpkg
+install --include dev okpkg
+install --tag next okpkg
+install --before 2026-01-01 okpkg
+install --os linux okpkg
+install --min-release-age=7 okpkg
