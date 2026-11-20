@@ -246,41 +246,56 @@ pass and warnings under `environment.release_follow`.
   the manifest refuses with npm's diagnostic and status (the way out is `npm install` first). With no
   lockfile, `dedupe` and `prune` refuse 100: npm would work from the installed tree, which the lane does not
   read (a lockfile-only run in the scratch copy would resolve a newer version than the resident one).
-  **Cooldown.** `install.cooldown_days` (3 by default, 0 disables, at most 36500; a value above that, or one that
-  is not honourable, refuses 100 with a configuration error naming the key, and is never capped or wrapped; a
-  negative or non-integer number, a string that is not digits and any other type read as 3, as in today's gate) and
-  `install.cooldown_security_fix` apply on the lane on what a command introduces. npm's release-age filter is set to
-  the same window, on the command line of every npm run of the lane (`--min-release-age`), with the exact versions the
-  command names excluded by name (`--min-release-age-exclude`; npm refuses an exact version inside the window with
-  its own error, which would hide the wait): a selection aid, so that `npm update` resolves nothing younger than the
-  window. npm's effective configuration is read back, positively and typed (an absent or mistyped field refuses), and
-  must hold exactly that window and those exclusions and no absolute `before` date, so no configuration file or
-  environment variable can widen the cooldown (a project `.npmrc` that sets any of the three is not on the allow-list:
-  the command takes the one-shot route). The decision is safe's own reading: the publish time of every introduced
-  registry version of a public host, read from the registry the artifact is bound to over a transport the caller does
-  not steer (no proxy, no redirect, the system's TLS roots only), the answer having to be for the package asked. An
-  introduced version younger than the window is a wait: it refuses 100, naming the package, the version, its publish
-  time and the instant it becomes installable (rounded up to the second; a wait has no acceptance step on this lane
-  yet). **The one gap that does not stop** is a registry that answered completely for the package and holds no time
-  for the version: it is disclosed in the report, and the lockfile is not recorded as a baseline (the next command
-  reads the time again). **Every other failure to read a time** (registry unreachable, an error status or a redirect, an
-  unreadable or oversized answer, an answer for another package, a reading not attempted because the shared time limit
-  ran out) is missing evidence: 102, naming how many readings are missing, after what the evidence already establishes
-  (a blocklist hit or a blocking advisory is decided first, 104). The limits: one packument is read in at most 60 s
-  and 512 MiB, and all the readings of a command share 15 minutes; on the public registry the largest packument
-  measured was 16 MiB (typescript) and 1,300 identities (1,188 packuments, 8 at a time) took 17 s cold (0.06 s from
-  the cache). Publish times safe read are cached per exact version and per source in the lane's own store
-  (`project-lane/state/publish-times/<source>/<entry>`), under the checks the recorded lockfiles get (a chain of
-  private directories held by descriptor, entries that are regular files of mode 0600 owned by the user, opened
-  without following a link); an entry that fails a check is ignored and read again. A version the caller named
-  exactly that REPLACES a version of the same package in the baseline and thereby removes an advisory the baseline
-  carries for it (the lane's own advisory reading, the difference's fixed advisories) is waived under `exempt` and
-  waits under `enforce`, which says so; a young version of a package the project does not have yet fixes nothing
-  for the project and waits, as do another young version of the same name and a young fix nobody named. This is
-  narrower than today's gate on purpose. A version already in the baseline is not judged for its age, whoever locked
-  it (the spec's open question 1; one predicate, `CooldownCandidates`, holds the choice); an entry the lockfile on
-  disk carries that the baseline does not is introduced, and is judged. The npm must define
-  `min-release-age-exclude` (npm 11.17.0 or later, which the capability probe checks on top of the 11.12.1 floor).
+  **Cooldown.** `install.cooldown_days` (3 by default, 0 disables, at most 36500) and `install.cooldown_security_fix`
+  apply on the lane on what a command introduces. The days are read by value before any arithmetic: a JSON number is a
+  whole number of days when it equals its integer part (`4e3` is 4000, `36500.0` is 36500), a digit string is read as
+  decimal; a negative or fractional number, a string that is not digits and any other type read as 3 (as in today's
+  gate); a value above 36500 (`4e4`, `1e50`, 19 digits) refuses 100 with a configuration error naming the key, and is
+  never capped or wrapped. npm's release-age filter is set to the same window, on the command line of every npm run of
+  the lane (`--min-release-age`), with the exact versions the command names excluded by name
+  (`--min-release-age-exclude`; npm refuses an exact version inside the window with its own error, which would hide the
+  wait): a selection aid, so that `npm update` resolves nothing younger than the window. npm's effective configuration
+  is read back, positively and typed (an absent or mistyped field refuses), and must hold exactly that window and
+  those exclusions and no absolute `before` date (absent or null: `false` refuses), so no configuration file or
+  environment variable can widen the cooldown (a project `.npmrc` that sets any of the three is not on the
+  allow-list: the command takes the one-shot route). The decision is safe's own reading: the publish time of every
+  introduced registry version of a public host, read from the registry the artifact is bound to over a transport the
+  caller does not steer (no proxy, no redirect, the system's TLS roots only). **There is no publish time the lane lets
+  pass unread.** One complete answer is accepted: the registry's full metadata document, read to its end with
+  nothing after it, whose name is the package asked and which lists the version asked; the version's time is its own
+  (`time[version]`), or, when the document lists the version without one, the document's last-modified time
+  (`time.modified`), which no publish time in the document can exceed (measured on the public registry for seven
+  packages of different ages: left-pad, semver, express, typescript, lodash, react, ms; the abbreviated document has no
+  `time` at all, only a top-level `modified`, so it is not accepted) - older than the cooldown means old enough, younger
+  means the version waits until the bound is old enough. Everything else is missing evidence, 102, naming how many
+  readings are missing (registry unreachable, an error status or a redirect, a time or size limit, a reading not
+  attempted, an abbreviated or truncated answer, another package's answer, a version the answer does not list, no
+  last-modified time), after what the evidence already establishes: a blocklist hit or a blocking advisory is decided
+  first (104) and **before any publish time is read**, so no network wait is spent under the project lock on a command
+  that ends there; a lockfile judged on missing evidence is refused, so nothing is recorded as a baseline. The answer is
+  read as a stream and only the name, the versions' names and times and the last-modified time are kept, so an answer's
+  size does not set the memory a reading takes. Measured on the public registry: the largest full documents are `next`
+  (30 MiB), `npm` (25 MiB), `gatsby` (23 MiB), `react-native` (15 MiB) and `typescript` (15 MiB); 1,300 identities
+  (1,188 packuments, 8 at a time) of a real 2,640-entry lockfile took 18 s cold with a peak of 143 MB (0.08 s and 14 MB
+  from the cache). The limits follow: one answer at most 256 MiB (eight times the largest) and 60 s, and 5 minutes for
+  all the readings of a command (sixteen times the cold run). Publish times safe read are cached per exact version and
+  per source in the lane's own store (`project-lane/state/publish-times/<source>/<entry>`), under the checks the
+  recorded lockfiles get (a chain of private directories held by descriptor, entries that are regular files of mode
+  0600 owned by the user, opened without following a link, and read with the repository's exact-object validator:
+  repeated members, a second spelling of a field or trailing data make the entry ignored); an entry that fails a check
+  is ignored and read again, and a reading bounded by the last-modified time is never cached. A version the caller
+  named exactly is waived under `exempt` (and waits under `enforce`, which says so) only when it REPLACES, at the same
+  place in the graph, a baseline version of the same package that an advisory affects and that advisory is gone from
+  the result, as the lane's own advisory evidence shows (aliases are matched by registry identity); when several
+  versions of the package are involved and that relation cannot be told, it waits; so does a young version of a
+  package the project does not have yet, another young version of the same name, and a young fix nobody named. This
+  is narrower than today's gate on purpose. The advisory evidence comes from the auditor installed beside safe's own
+  dispatcher, never from one the caller names (`SAFE_AUDIT_BIN`, `SAFE_AUDIT_PATH`, `PATH`), and an advisory whose
+  record carries a withdrawal date is removed before it can count as present, introduced or fixed. A version already
+  in the baseline is not judged for its age, whoever locked it (the spec's open question 1; one predicate,
+  `CooldownCandidates`, holds the choice); an entry the lockfile on disk carries that the baseline does not is
+  introduced, and is judged. The npm must define `min-release-age-exclude` (npm 11.17.0 or later, which the
+  capability probe checks on top of the 11.12.1 floor).
   A lockfile entry the frozen installation does not build (one nothing in the manifest needs) is caught by the
   binder's tree verification before anything is published, and the refusal says to run `npm install` first.
   npm's `prune` writes its lockfile in every case where one exists. Every npm run whose output the lane reads

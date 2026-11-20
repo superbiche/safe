@@ -911,6 +911,24 @@ case_evidence_keeps_severity_ladder_and_malware_identity() {
   fi
 }
 
+# A withdrawn advisory (its record carries a withdrawal date) is removed before it can count: no hit, no gap. The one that
+# is not withdrawn stays. (The lane's security-fix waiver rests on this evidence.)
+case_evidence_a_withdrawn_advisory_is_removed() {
+  setup_case ev-withdrawn
+  MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-withdrawn.json"
+  printf '%s\n' '{"results": [{"vulns": [{"id": "GHSA-wd-0001"}, {"id": "GHSA-wd-0002"}]}]}' > "$MOCK_BATCH_FIXTURE"
+  printf '{"id": "GHSA-wd-0001", "withdrawn": "2026-10-01T00:00:00Z", "database_specific": {"severity": "HIGH"}}\n' > "$FIXDIR/vuln-GHSA-wd-0001.json"
+  printf '{"id": "GHSA-wd-0002", "withdrawn": "", "database_specific": {"severity": "HIGH"}}\n' > "$FIXDIR/vuln-GHSA-wd-0002.json"
+  local out rc=0
+  out=$(printf '{"packages":[{"name":"wdp","version":"1.0.0"}]}' | run_evidence) || rc=$?
+  if [[ "$rc" == "0" ]] && evidence_identity "$out" wdp 1.0.0 '.coverage == "complete" and .advisories == [{id:"GHSA-wd-0002",severity:"high",malware:false}]'; then
+    pass "evidence: a withdrawn advisory is removed, the live one stays, and nothing is a gap"
+  else
+    printf 'rc=%s out=%s\n' "$rc" "$out" >&2
+    fail "evidence: a withdrawn advisory is removed, the live one stays, and nothing is a gap"
+  fi
+}
+
 case_evidence_same_name_versions_stay_apart() {
   setup_case ev-versions
   MOCK_BATCH_FIXTURE="$FIXDIR/batch-ev-versions.json"
@@ -1411,6 +1429,7 @@ if (( SC_OK )); then
   case_evidence_clean_tree_is_complete_and_empty
   case_evidence_malformed_stdin_refuses
   case_evidence_keeps_severity_ladder_and_malware_identity
+  case_evidence_a_withdrawn_advisory_is_removed
   case_evidence_same_name_versions_stay_apart
   case_evidence_later_chunk_failure_keeps_earlier_hits
   case_evidence_malformed_result_loses_only_itself

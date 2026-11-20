@@ -4153,19 +4153,31 @@ safe_gate_lane_selection() {
 
 # The cooldown's policy, from the operator's canonical configuration, read as today's auditor reads it
 # (bin/safe-audit: `jq -r '.cooldown_days // 3'`, then 3 unless the text is decimal digits): install.cooldown_days
-# is a whole number of days, 0 disables, and a missing value, a negative or non-integer number, a string that is
-# not digits and any other type read as 3; install.cooldown_security_fix is exempt or enforce (exempt otherwise).
-# Unlike the auditor, whose shell arithmetic wraps a value of 19 digits or more (and, a value above its own
-# limits, silently shortens the window), the value is validated as a decimal string BEFORE any arithmetic: a value
-# the lane cannot honour (more than the longest window, MaxCooldownDays = 36500) is a configuration error, never
-# capped or wrapped.
+# is a whole number of days, 0 disables, and a missing value, a negative or genuinely fractional number, a string
+# that is not digits and any other type read as 3; install.cooldown_security_fix is exempt or enforce (exempt
+# otherwise). Unlike the auditor, whose shell arithmetic wraps a value of 19 digits or more and which reads a
+# number written with an exponent or a decimal point (4e3, 36500.0) as 3, the value is read BY VALUE and checked
+# before any arithmetic: a JSON number is a whole number of days when it equals its integer part (4e3 is 4000,
+# 36500.0 is 36500), a digit string is read as decimal; a value beyond the longest window the lane honours
+# (MaxCooldownDays = 36500; 4e4, 1e50, 19 digits) is a configuration error, never capped or wrapped.
 # Prints "<days> <mode>" and returns 0, or prints the configured text and returns 2 (out of range).
 safe_gate_project_lane_cooldown_policy() {
   local config days=3 fix=exempt digits
   config="$(safe_gate_trust_store_file config.json)"
   if [[ -f "${config}" ]]; then
-    days="$(jq -r '.install.cooldown_days? // 3' "${config}" 2>/dev/null)" || days=3
+    days="$(jq -r '
+      (.install.cooldown_days? // 3) as $v
+      | if ($v | type) == "number" then
+          (if $v < 0 or $v != ($v | floor) then "3"
+           elif $v > 36500 then "large:" + ($v | tojson)
+           else ($v | floor | tostring) end)
+        elif ($v | type) == "string" then $v
+        else "3" end' "${config}" 2>/dev/null)" || days=3
     fix="$(jq -r '(.install.cooldown_security_fix? // "exempt") | tostring' "${config}" 2>/dev/null)" || fix=exempt
+  fi
+  if [[ "${days}" == large:* ]]; then
+    printf '%s' "${days#large:}" | cut -c1-40
+    return 2
   fi
   [[ "${days}" =~ ^[0-9]+$ ]] || days=3
   # leading zeros are not part of the value (the digits are decimal); what remains must fit the longest window
@@ -4200,7 +4212,7 @@ safe_gate_project_lane_cooldown_reason() {
     elif (has("min-release-age-exclude") | not) then "min-release-age-exclude absent where the cooldown sets the exact versions the command names"
     elif ((."min-release-age-exclude" | type) != "array") or ((."min-release-age-exclude" | map(type == "string") | all) | not) then "min-release-age-exclude that is not a list of names"
     elif (."min-release-age-exclude" | map(select(. != "")) | sort) != $ex then "min-release-age-exclude that is not the list of the exact versions the command names"
-    elif ((."before" // null) != null) then "a before date (an absolute date competes with the release-age window of the cooldown)"
+    elif (has("before") and (.before != null)) then "a before date (an absolute date competes with the release-age window of the cooldown)"
     else "ok" end' <<<"${config}" 2>/dev/null)" || rc=$?
   if (( rc != 0 )) || [[ -z "${verdict}" ]]; then
     printf 'an effective configuration whose release-age settings cannot be read'
@@ -4333,7 +4345,7 @@ safe_gate_project_lane_report_ok() {
     and ($r.advisories.fixed | type == "array") and ($r.advisories.already_present | type == "array") and ($r.advisories.introduced | type == "array")
     and ($r.malice | type == "array") and ($r.coverage | type == "array") and ($r.classes | type == "array")
     and ($r.cooldown | type == "object") and ($r.cooldown.days | type == "number") and ($r.cooldown.waits | type == "array")
-    and ($r.cooldown.waived | type == "array") and ($r.cooldown.unreadable | type == "array") and ($r.cooldown.missing | type == "array")
+    and ($r.cooldown.waived | type == "array") and ($r.cooldown.missing | type == "array")
     and ($r.outcome.exit == $rc)
     and (($r.outcome.status == "clear") == ($rc == 0))
     and (if $rc == 0 then
@@ -4373,17 +4385,15 @@ safe_gate_project_lane_report() {
     | "safe: project lane: evidence: \($ok) of \(.identities | length) identities read completely; blocklist checked by name (\(.blocklist | length) hits)"
   ' "${evidence}" 2>/dev/null)" && [[ -n "${lines}" ]] || return 1
   printf '%s\n' "${lines}" >&2
-  # the cooldown: what was judged, what a named security fix waived, and the publish times that could not be read
-  # (disclosed, never a stop)
+  # the cooldown: what was judged and what a named security fix waived (a publish time that cannot be read is missing
+  # evidence, not a line here)
   lines="$(jq -r '
     .cooldown as $c
     | if $c.days == 0 then "safe: project lane: cooldown: off (install.cooldown_days is 0)"
       else "safe: project lane: cooldown: \($c.checked) introduced version(s) judged against the \($c.days)-day window (npm'"'"'s release-age filter is set to the same window on the projection)"
         + (if ($c.waived | length) > 0 then "; waived as the security fix it names: " + ([$c.waived[] | "\(.name)@\(.version) (fixes \(.remediates | join(", ")))"] | join(", ")) else "" end)
       end,
-      (if ($c.unreadable | length) > 0
-       then "safe: project lane: cooldown: publish time not read for \($c.unreadable | length) version(s), disclosed and not stopping: " + ([$c.unreadable[:5][] | if .name == "" then .gap else "\(.name)@\(.version) (\(.gap))" end] | join("; ")) + (if ($c.unreadable | length) > 5 then "; and \(($c.unreadable | length) - 5) more" else "" end)
-       else empty end)
+      empty
   ' "${report}" 2>/dev/null)" && [[ -n "${lines}" ]] || return 1
   safe_gate_err_lines_clean "${lines}"
   scripts="$(jq -r '
@@ -4418,7 +4428,7 @@ safe_gate_project_lane_outcome_text() {
         | "the command introduces a high-severity advisory: \(ident($a[0])) carries \($a[0].id) (\($a[0].severity))\(if ($a | length) > 1 then " and \(($a | length) - 1) more" else "" end)|choose a version without it; the project lane has no acceptance step yet"
       elif $o.class == "wait" then
         ([.cooldown.waits[] | select(.cleared | not)]) as $w
-        | "\($w[0].name)@\($w[0].version) was published \($w[0].published) and is inside the \(.cooldown.days)-day cooldown; it becomes installable on \($w[0].installable)\(if $w[0].enforced then " (it fixes \($w[0].remediates | join(", ")), but install.cooldown_security_fix is enforce)" else "" end)\(if ($w | length) > 1 then " (and \(($w | length) - 1) more)" else "" end)|retry on or after that date, or name an older exact version; the project lane has no acceptance step for a wait yet"
+        | "\($w[0].name)@\($w[0].version) \(if $w[0].bounded then "has no publish time of its own in the registry'"'"'s document (last modified \($w[0].published)), so it may be inside the \(.cooldown.days)-day cooldown; it is certainly old enough on \($w[0].installable)" else "was published \($w[0].published) and is inside the \(.cooldown.days)-day cooldown; it becomes installable on \($w[0].installable)" end)\(if $w[0].enforced then " (it fixes \($w[0].remediates | join(", ")), but install.cooldown_security_fix is enforce)" else "" end)\(if ($w | length) > 1 then " (and \(($w | length) - 1) more)" else "" end)|retry on or after that date, or name an older exact version; the project lane has no acceptance step for a wait yet"
       elif $o.class == "missing_evidence" then
         ([.coverage[] | select(.gap | startswith("publish time not read: ") | not)]) as $adv
         | (.cooldown.missing // []) as $pub
@@ -4697,7 +4707,7 @@ safe_gate_project_lane_releases_missing() {
 
 safe_gate_project_lane_run() {
   local subcommand="${SAFE_GATE_SUBCMD}" verb="" lane_sub="" arg="" value="" first=1 dry_run=0
-  local project_dir="" scratch="" snap="" proj="" frozen="" rc=0 safe_core="" safe_core_version="" lock_only=0
+  local project_dir="" scratch="" snap="" proj="" frozen="" rc=0 safe_core="" safe_core_version="" lock_only=0 lane_audit=""
   local state_dir="" config_json="" frozen_json="" differing="" data_root="${SAFE_DATA_DIR:-${HOME}/.local/share/safe}"
   local -a specs=() carry=() proj_args=() probe_args=() frozen_args=() orig_args=("$@")
   local -a compat_reasons=() compat_cause_files=()
@@ -5060,7 +5070,10 @@ safe_gate_project_lane_run() {
   else
     dest+=("--min-release-age-exclude=")
   fi
-  if ! safe_gate_audit_available; then
+  # The advisory reader is the one installed beside safe's own dispatcher, like safe-core: never one the caller names
+  # (SAFE_AUDIT_BIN, SAFE_AUDIT_PATH) or one found on PATH, because what a security-fix waiver rests on is its evidence.
+  lane_audit="${SAFE_DIR}/safe-audit"
+  if [[ ! -x "${lane_audit}" ]]; then
     safe_gate_project_lane_refuse 102 "${verb}" "the advisory reader is unavailable (audit-infrastructure breakage, not a package finding)" "rerun install.sh"
     return $?
   fi
@@ -5474,7 +5487,7 @@ safe_gate_project_lane_run() {
     return "${rc}"
   fi
   rc=0
-  "${SAFE_GATE_AUDIT_BIN}" scanner-batch --evidence <<<"${request}" >"${evidence}" 2>"${scratch}/evidence.err" || rc=$?
+  "${lane_audit}" scanner-batch --evidence <<<"${request}" >"${evidence}" 2>"${scratch}/evidence.err" || rc=$?
   if (( rc != 0 )); then
     safe_gate_project_lane_refuse 102 "${verb}" "advisory evidence cannot be read (the reader exited ${rc}; audit-infrastructure breakage, not a package finding)" "fix connectivity or run safe doctor, then retry"
     return $?
@@ -5488,32 +5501,43 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_refuse 100 "${verb}" "the cooldown's request cannot be formed (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
     return $?
   fi
-  # A reader that fails, or whose document is not whole, is the publish times being MISSING, not a reason to stop
-  # before the decision: what the evidence already establishes (a malice signal, a blocking advisory) is decided
-  # first, and the missing readings are applied after it as missing evidence (102).
+  # What the evidence already establishes is decided BEFORE any publish time is read: a malice signal or a blocking
+  # advisory ends the command (104) without the registry being asked, so that no network wait is spent under the
+  # project lock on a command that cannot go on. The first decision carries the readings as not made; it is
+  # decisive only when it ends in a block, and the reading and the final decision follow otherwise.
   local releases_failure=""
-  rc=0
-  "${safe_core}" project-releases --request "${release_request}" --state-dir "${state_dir}" >"${releases}" 2>"${scratch}/releases.err" || rc=$?
-  if (( rc != 0 )); then
-    releases_failure="the reader exited ${rc}"
-  elif ! safe_gate_lane_one_doc '.schema_version == 1 and (.identities | type == "array")' "$(cat -- "${releases}" 2>/dev/null)"; then
-    releases_failure="the reader's document is not whole"
-  fi
-  if [[ -n "${releases_failure}" ]]; then
-    safe_gate_project_lane_releases_missing "${release_request}" "${releases_failure}" "${releases}" || {
-      safe_gate_project_lane_refuse 100 "${verb}" "the cooldown's readings cannot be set aside (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
-      return $?
-    }
-  fi
-  # The evidence reaches the decision exactly as the reader wrote it.
+  safe_gate_project_lane_releases_missing "${release_request}" "not read: an established block ends the command first" "${releases}" || {
+    safe_gate_project_lane_refuse 100 "${verb}" "the cooldown's readings cannot be set aside (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
+    return $?
+  }
   rc=0
   "${safe_core}" project-decide "${baseline_args[@]}" --evidence "${evidence}" --releases "${releases}" "${proj}/package-lock.json" >"${report}" 2>"${scratch}/decide.err" || rc=$?
-  if (( rc == 3 )) && [[ -z "${releases_failure}" ]]; then
-    # the decision could not read the reader's document: the evidence is judged all the same, the readings missing
-    releases_failure="the decision could not read the reader's document"
-    if safe_gate_project_lane_releases_missing "${release_request}" "${releases_failure}" "${releases}"; then
-      rc=0
-      "${safe_core}" project-decide "${baseline_args[@]}" --evidence "${evidence}" --releases "${releases}" "${proj}/package-lock.json" >"${report}" 2>"${scratch}/decide.err" || rc=$?
+  if (( rc != 104 )); then
+    # no block established: the publish times are read. A reader that fails, or whose document is not whole, leaves
+    # the readings MISSING (102), applied after the evidence like any other missing evidence.
+    rc=0
+    "${safe_core}" project-releases --request "${release_request}" --state-dir "${state_dir}" >"${releases}" 2>"${scratch}/releases.err" || rc=$?
+    if (( rc != 0 )); then
+      releases_failure="the reader exited ${rc}"
+    elif ! safe_gate_lane_one_doc '.schema_version == 1 and (.identities | type == "array")' "$(cat -- "${releases}" 2>/dev/null)"; then
+      releases_failure="the reader's document is not whole"
+    fi
+    if [[ -n "${releases_failure}" ]]; then
+      safe_gate_project_lane_releases_missing "${release_request}" "${releases_failure}" "${releases}" || {
+        safe_gate_project_lane_refuse 100 "${verb}" "the cooldown's readings cannot be set aside (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
+        return $?
+      }
+    fi
+    # The evidence reaches the decision exactly as the reader wrote it.
+    rc=0
+    "${safe_core}" project-decide "${baseline_args[@]}" --evidence "${evidence}" --releases "${releases}" "${proj}/package-lock.json" >"${report}" 2>"${scratch}/decide.err" || rc=$?
+    if (( rc == 3 )) && [[ -z "${releases_failure}" ]]; then
+      # the decision could not read the reader's document: the evidence is judged all the same, the readings missing
+      releases_failure="the decision could not read the reader's document"
+      if safe_gate_project_lane_releases_missing "${release_request}" "${releases_failure}" "${releases}"; then
+        rc=0
+        "${safe_core}" project-decide "${baseline_args[@]}" --evidence "${evidence}" --releases "${releases}" "${proj}/package-lock.json" >"${report}" 2>"${scratch}/decide.err" || rc=$?
+      fi
     fi
   fi
   if (( rc != 0 && rc != 100 && rc != 102 && rc != 104 )); then
@@ -5653,14 +5677,8 @@ safe_gate_project_lane_run() {
   # binder runs: if it cannot be recorded nothing is published. Whether the publication then
   # completes no longer matters to the baseline: if it did, the lockfile on disk is the
   # recorded one; if it did not, the lockfile on disk is still the previous baseline.
-  # A lockfile judged with a publish time disclosed as missing (the registry answered and holds none) is not
-  # recorded: the baseline is what was judged on COMPLETE evidence, so that the next run reads the time again.
   rc=0
-  if jq -e '(.cooldown.unreadable | length) > 0' "${report}" >/dev/null 2>&1; then
-    safe_gate_err "safe: project lane: the lockfile is not recorded as a baseline: a publish time was not read for it, so the next command reads it again"
-  else
-    "${safe_core}" project-baseline record "${record_args[@]}" --file "${proj}/package-lock.json" >/dev/null 2>"${scratch}/baseline-write.err" || rc=$?
-  fi
+  "${safe_core}" project-baseline record "${record_args[@]}" --file "${proj}/package-lock.json" >/dev/null 2>"${scratch}/baseline-write.err" || rc=$?
   if (( rc != 0 )); then
     safe_gate_project_lane_refuse 102 "${verb}" "the judged lockfile cannot be recorded ($(safe_gate_lane_clean "$(head -n 1 "${scratch}/baseline-write.err" 2>/dev/null)")), so nothing was published (audit-infrastructure breakage, not a package finding)" "fix safe's data directory (${state_dir}) and retry"
     return $?
