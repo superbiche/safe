@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Project lane (still behind `install.project_lane`): the operator sends a command or a project to the one-shot route. Every
+  refusal of the lane now records itself and returns, and the final line is printed once at the lane's top level, after the lock
+  and scratch are freed; a refusal raised before the first evidence reading and not part of the lane's own safety is *marked*: at
+  the operator's terminal, on a command that is not a dry run, the lane asks once whether to run the command on the one-shot route
+  (a failed read is 102 and no answer; an agent session is never asked), and its final line names both ways out. A yes ends the
+  lane at once and today's gate runs the command exactly as with the switch off. The standing decision per project is
+  `safe run one-shot-project add|remove|list` (operator terminal; owner-checked store under the operator's root; the physical path
+  with device and inode; no reason). `dedupe` and `prune` go to the older differential path on both routes (an established shape no
+  longer refuses them). A hand-over returns through the same non-zero path as a refusal. Agent contract: a new allow flow, the
+  agent rule and exit codes 100 and 102 name the confirmation and the standing command.
+  Review round: the pin is read and written only by `safe-core one-shot-store` (verified directories, one descriptor for check and read,
+  a lock over each change, announced and logged after the commit) and is honoured only for the project npm will operate on (the gate's
+  own reading of npm's arguments, a workspace root above, a lost manifest, workspace or global mode set anywhere); `safe run
+  one-shot-project` does no generic initialisation, asks on the terminal and answers a failed read with 102; a lockfile key outside the
+  tree and the lane's other safety checks are never confirmable; the dry run is read from the parsed values and every effective-
+  configuration document; the consequence the operator reads is that of the actual input; the refusal line names the standing option
+  in words, not as a command; the structural lint reads shell commands and keeps its known mutations as fixtures.
 - Project lane (still behind `install.project_lane`): the operator's terminal. At the operator's terminal only (today's
   predicate: a terminal on stdin and no recognized agent marker; an agent session is never prompted and ends as it does
   unattended, and a dry run is never prompted), each class the decision leaves at stake and the lane goes on with is resolved on
