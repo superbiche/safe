@@ -238,11 +238,17 @@ func Decide(in Input) Report {
 		classCount(ClassAdverseAdvisory, ExitPolicy, report.Advisories.Introduced, AdvisoryAdverse),
 	}
 	if in.Releases != nil {
-		cooldown, err := judgeCooldown(in, report.Difference)
+		cooldown, err := judgeCooldown(in, baseline, &report)
 		if err != nil {
-			// A reading that cannot be judged is not an empty one: every candidate is disclosed as unreadable.
+			// A reading that cannot be judged is not an empty one: it is missing evidence.
 			cooldown = CooldownReport{Days: in.Releases.Policy.CooldownDays, SecurityFix: in.Releases.Policy.SecurityFix,
-				Waits: []CooldownWait{}, Waived: []CooldownWaiver{}, Unreadable: []CooldownGap{{Gap: err.Error()}}}
+				Waits: []CooldownWait{}, Waived: []CooldownWaiver{}, Unreadable: []CooldownGap{}, Missing: []CooldownGap{{Gap: err.Error()}}}
+		}
+		// A publish time that could not be read is missing evidence like an advisory reading that could not be.
+		for _, missing := range cooldown.Missing {
+			report.Coverage = append(report.Coverage, CoverageGap{
+				Name: missing.Name, Version: missing.Version, Sides: []string{"target"}, Gap: "publish time not read: " + missing.Gap,
+			})
 		}
 		report.Cooldown = &cooldown
 		report.Classes = append(report.Classes, waitClass(cooldown))

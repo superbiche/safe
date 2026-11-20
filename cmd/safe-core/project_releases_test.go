@@ -18,21 +18,29 @@ func runWithStdin(stdin string, args ...string) (int, string, string) {
 	return code, stdout.String(), stderr.String()
 }
 
-// registryAndOSV serves packuments (by escaped name) and a package-level OSV answer.
-func registryAndOSV(t *testing.T, times map[string]map[string]string, osv string) (*httptest.Server, *httptest.Server) {
+func registryServer(t *testing.T, times map[string]map[string]string) *httptest.Server {
 	t.Helper()
 	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		doc, ok := times[strings.TrimPrefix(r.URL.EscapedPath(), "/")]
+		path := strings.TrimPrefix(r.URL.EscapedPath(), "/")
+		doc, ok := times[path]
 		if !ok {
 			http.NotFound(w, r)
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]any{"time": doc})
+		name := strings.ReplaceAll(path, "%2F", "/")
+		if _, other := doc["__name"]; other {
+			name = doc["__name"]
+		}
+		body := map[string]string{}
+		for k, v := range doc {
+			if k != "__name" {
+				body[k] = v
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"name": name, "time": body})
 	}))
-	advisories := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(osv)) }))
 	t.Cleanup(registry.Close)
-	t.Cleanup(advisories.Close)
-	return registry, advisories
+	return registry
 }
 
 func releasesRequest(t *testing.T, dir string, days int, fix string, roots []string, identities ...string) string {
@@ -57,26 +65,35 @@ func releasesRequest(t *testing.T, dir string, days int, fix string, roots []str
 	return path
 }
 
-func TestProjectReleasesReadsTimesRootsFixesAndGaps(t *testing.T) {
-	young := time.Now().UTC().Add(-10 * time.Hour).Format("2006-01-02T15:04:05.000Z")
-	old := "2020-01-01T00:00:00.000Z"
-	registry, osv := registryAndOSV(t, map[string]map[string]string{
-		"fixer":  {"1.0.1": young},
-		"old":    {"1.0.0": old},
-		"@s%2Fp": {"1.0.0": old},
-	}, `{"vulns":[{"id":"GHSA-fix","affected":[{"package":{"name":"fixer","ecosystem":"npm"},"ranges":[{"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"1.0.1"}]}]}]}]}`)
+func privateStateDir(t *testing.T) string {
+	t.Helper()
+	state := filepath.Join(t.TempDir(), "state")
+	if err := os.Mkdir(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return state
+}
+
+func TestProjectReleasesReadsTimesRootsAndTellsTheGapsApart(t *testing.T) {
+	old := "2020-01-01T00:00:00.123Z"
+	registry := registryServer(t, map[string]map[string]string{
+		"fixer":    {"1.0.1": time.Now().UTC().Add(-10 * time.Hour).Format("2006-01-02T15:04:05.000Z")},
+		"old":      {"1.0.0": old},
+		"@s%2Fp":   {"1.0.0": old},
+		"notimes":  {"9.9.9": old},
+		"impostor": {"__name": "someone-else", "1.0.0": old},
+	})
 	dir := t.TempDir()
-	request := releasesRequest(t, dir, 3, "exempt", []string{"fixer@1.0.1"}, "fixer@1.0.1", "old@1.0.0", "@s/p@1.0.0", "missing@1.0.0")
-	code, stdout, stderr := runLane("project-releases", "--request", request, "--cache-dir", filepath.Join(dir, "cache"), "--registry-base", registry.URL, "--osv-url", osv.URL)
+	state := privateStateDir(t)
+	request := releasesRequest(t, dir, 3, "exempt", []string{"fixer@1.0.1"}, "fixer@1.0.1", "old@1.0.0", "@s/p@1.0.0", "notimes@1.0.0", "impostor@1.0.0", "unknown@1.0.0")
+	code, stdout, stderr := runLane("project-releases", "--request", request, "--state-dir", state, "--registry-base", registry.URL)
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, stderr)
 	}
 	var doc struct {
-		Policy     map[string]any
 		Identities []struct {
 			Name, Version, Status, Published, Gap string
 			Root                                  bool
-			Remediates                            []string
 		}
 	}
 	if err := json.Unmarshal([]byte(stdout), &doc); err != nil {
@@ -86,22 +103,52 @@ func TestProjectReleasesReadsTimesRootsFixesAndGaps(t *testing.T) {
 	for i, id := range doc.Identities {
 		got[id.Name+"@"+id.Version] = i
 	}
-	fixer := doc.Identities[got["fixer@1.0.1"]]
-	if fixer.Status != "read" || !fixer.Root || strings.Join(fixer.Remediates, ",") != "GHSA-fix" {
-		t.Fatalf("fixer: %+v", fixer)
+	byName := func(n string) (r struct {
+		Name, Version, Status, Published, Gap string
+		Root                                  bool
+	}) {
+		return doc.Identities[got[n]]
 	}
-	if o := doc.Identities[got["old@1.0.0"]]; o.Status != "read" || o.Root || len(o.Remediates) != 0 {
-		t.Fatalf("old: %+v", o)
+	if f := byName("fixer@1.0.1"); f.Status != "read" || !f.Root {
+		t.Fatalf("fixer: %+v", f)
 	}
-	if s := doc.Identities[got["@s/p@1.0.0"]]; s.Status != "read" {
+	if o := byName("old@1.0.0"); o.Status != "read" || o.Root || o.Published != "2020-01-01T00:00:00.123Z" {
+		t.Fatalf("old (the fractional second must survive): %+v", o)
+	}
+	if s := byName("@s/p@1.0.0"); s.Status != "read" {
 		t.Fatalf("scoped: %+v", s)
 	}
-	if m := doc.Identities[got["missing@1.0.0"]]; m.Status != "unreadable" || m.Gap == "" || m.Published != "" {
-		t.Fatalf("missing: %+v", m)
+	if n := byName("notimes@1.0.0"); n.Status != "no_time" || n.Published != "" || n.Gap == "" {
+		t.Fatalf("a complete answer without a time is the no_time gap: %+v", n)
 	}
-	// the document is what project-decide reads: strictly
-	if _, err := os.Stat(filepath.Join(dir, "cache")); err != nil {
-		t.Fatalf("no cache directory: %v", err)
+	for _, name := range []string{"impostor@1.0.0", "unknown@1.0.0"} {
+		if m := byName(name); m.Status != "missing" || m.Gap == "" {
+			t.Fatalf("%s must be missing evidence: %+v", name, m)
+		}
+	}
+	if !strings.Contains(byName("impostor@1.0.0").Gap, "another package") {
+		t.Fatalf("impostor gap: %q", byName("impostor@1.0.0").Gap)
+	}
+	// the readings are in the lane's store, in private directories
+	if info, err := os.Stat(filepath.Join(state, "publish-times")); err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("store: %v %v", info, err)
+	}
+}
+
+func TestProjectReleasesIgnoresTheCallersTLSAndProxyEnvironment(t *testing.T) {
+	registry := registryServer(t, map[string]map[string]string{"old": {"1.0.0": "2020-01-01T00:00:00.000Z"}})
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
+	t.Setenv("http_proxy", "http://127.0.0.1:1")
+	t.Setenv("SSL_CERT_FILE", "/nonexistent/ca.pem")
+	t.Setenv("SSL_CERT_DIR", "/nonexistent")
+	dir := t.TempDir()
+	request := releasesRequest(t, dir, 3, "exempt", nil, "old@1.0.0")
+	code, stdout, stderr := runLane("project-releases", "--request", request, "--state-dir", privateStateDir(t), "--registry-base", registry.URL)
+	if code != 0 || !strings.Contains(stdout, `"status":"read"`) {
+		t.Fatalf("code %d stdout %s stderr %s", code, stdout, stderr)
+	}
+	if os.Getenv("SSL_CERT_FILE") != "" || os.Getenv("SSL_CERT_DIR") != "" {
+		t.Fatal("the caller's TLS roots are still named in the environment")
 	}
 }
 
@@ -109,7 +156,7 @@ func TestProjectReleasesWithCooldownOffReadsNothing(t *testing.T) {
 	dir := t.TempDir()
 	request := releasesRequest(t, dir, 0, "exempt", nil, "pk@1.0.0")
 	// an address nothing listens on: a read would be a gap, so reading nothing is visible
-	code, stdout, stderr := runLane("project-releases", "--request", request, "--cache-dir", filepath.Join(dir, "cache"), "--registry-base", "http://127.0.0.1:1")
+	code, stdout, stderr := runLane("project-releases", "--request", request, "--state-dir", privateStateDir(t), "--registry-base", "http://127.0.0.1:1")
 	if code != 0 || !strings.Contains(stdout, `"identities":[]`) {
 		t.Fatalf("code %d stdout %s stderr %s", code, stdout, stderr)
 	}
@@ -119,13 +166,13 @@ func TestProjectReleasesFailsOnAnUnreadableRequestAndOnUsage(t *testing.T) {
 	dir := t.TempDir()
 	bad := filepath.Join(dir, "bad.json")
 	os.WriteFile(bad, []byte(`{"schema_version":1}`), 0o600)
-	if code, _, _ := runLane("project-releases", "--request", bad, "--cache-dir", dir); code != 3 {
+	if code, _, _ := runLane("project-releases", "--request", bad, "--state-dir", dir); code != 3 {
 		t.Fatalf("an unreadable request is exit 3, got %d", code)
 	}
-	if code, _, _ := runLane("project-releases", "--cache-dir", dir); code != 2 {
+	if code, _, _ := runLane("project-releases", "--state-dir", dir); code != 2 {
 		t.Fatalf("usage is exit 2, got %d", code)
 	}
-	if code, _, _ := runLane("project-releases", "--request", filepath.Join(dir, "nope"), "--cache-dir", dir); code != 3 {
+	if code, _, _ := runLane("project-releases", "--request", filepath.Join(dir, "nope"), "--state-dir", dir); code != 3 {
 		t.Fatalf("a missing request is exit 3, got %d", code)
 	}
 }
@@ -174,7 +221,7 @@ func TestProjectDecideTakesReleasesAndStopsOnAWait(t *testing.T) {
 	now := time.Now().UTC()
 	releases := filepath.Join(dir, "releases.json")
 	doc := `{"schema_version":1,"now":"` + now.Format(time.RFC3339) + `","policy":{"cooldown_days":3,"security_fix":"exempt"},"identities":[
-	  {"name":"fresh","version":"2.0.0","host":"registry.npmjs.org","root":false,"status":"read","published":"` + now.Add(-2*time.Hour).Format(time.RFC3339) + `","gap":"","remediates":[],"remediation_gap":""}]}`
+	  {"name":"fresh","version":"2.0.0","host":"registry.npmjs.org","root":false,"status":"read","published":"` + now.Add(-2*time.Hour).Format(time.RFC3339Nano) + `","gap":""}]}`
 	os.WriteFile(releases, []byte(doc), 0o600)
 	code, stdout, stderr := runLane("project-decide", "--no-baseline", "--evidence", evidence, "--releases", releases, target)
 	if code != 100 {

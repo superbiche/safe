@@ -36,10 +36,22 @@ const (
 )
 
 // Statuses of one publish-time reading.
+//
+//   - read: the registry gave the publish time.
+//   - no_time: the registry answered completely for the package and holds no time
+//     for the version. The one gap that is disclosed and does not stop.
+//   - missing: anything else that leaves the version without a time (the registry
+//     unreachable, an error status, a time or size limit, a reading never
+//     attempted, an answer for another package). Missing evidence: refuses 102.
 const (
-	ReadingRead       = "read"
-	ReadingUnreadable = "unreadable"
+	ReadingRead    = "read"
+	ReadingNoTime  = "no_time"
+	ReadingMissing = "missing"
 )
+
+// MaxCooldownDays is the longest window the lane honours (100 years); a longer one
+// is a configuration the lane refuses, never one it shortens.
+const MaxCooldownDays = 36500
 
 const day = 24 * time.Hour
 
@@ -74,19 +86,16 @@ type ReleaseRequest struct {
 }
 
 // ReleaseReading is what was read for one identity. Status "read" carries the
-// publish time; "unreadable" carries the gap. Remediates is the advisories the
-// version fixes (read for a named root that is inside the cooldown, to judge the
-// security-fix exemption); RemediationGap says why that could not be read.
+// publish time (RFC 3339 with its fractional seconds); "no_time" and "missing"
+// carry the gap.
 type ReleaseReading struct {
-	Name           string   `json:"name"`
-	Version        string   `json:"version"`
-	Host           string   `json:"host"`
-	Root           bool     `json:"root"`
-	Status         string   `json:"status"`
-	Published      string   `json:"published"`
-	Gap            string   `json:"gap"`
-	Remediates     []string `json:"remediates"`
-	RemediationGap string   `json:"remediation_gap"`
+	Name      string `json:"name"`
+	Version   string `json:"version"`
+	Host      string `json:"host"`
+	Root      bool   `json:"root"`
+	Status    string `json:"status"`
+	Published string `json:"published"`
+	Gap       string `json:"gap"`
 }
 
 // Releases is the strict, versioned input of the cooldown judgement.
@@ -163,9 +172,12 @@ type CooldownReport struct {
 	// Waived are the named exact versions inside the cooldown that remediate an
 	// advisory, under install.cooldown_security_fix=exempt.
 	Waived []CooldownWaiver `json:"waived"`
-	// Unreadable are the identities whose publish time could not be read: they
-	// are disclosed and do not stop the command.
+	// Unreadable are the identities for which the registry answered completely
+	// and holds no publish time: they are disclosed and do not stop the command.
 	Unreadable []CooldownGap `json:"unreadable"`
+	// Missing are the identities whose publish time could not be read for any
+	// other reason: missing evidence (also in the report's coverage), exit 102.
+	Missing []CooldownGap `json:"missing"`
 }
 
 // CooldownWait is one version inside the cooldown.
@@ -208,13 +220,48 @@ func installable(published time.Time, days int) time.Time {
 	return published.Add(time.Duration(days) * day)
 }
 
+// installableText prints the instant a version becomes installable, rounded UP to
+// the second: the printed time is never earlier than eligibility.
+func installableText(published time.Time, days int) string {
+	at := installable(published, days).UTC()
+	if rounded := at.Truncate(time.Second); rounded.Before(at) {
+		at = rounded.Add(time.Second)
+	}
+	return at.Format("2006-01-02T15:04:05Z")
+}
+
 // judgeCooldown applies the cooldown to the candidates. A candidate with no
 // reading in the document is unreadable (disclosed), never old.
-func judgeCooldown(in Input, diff Difference) (CooldownReport, error) {
+func judgeCooldown(in Input, baseline Graph, decided *Report) (CooldownReport, error) {
 	rel := in.Releases
+	diff := decided.Difference
 	report := CooldownReport{
 		Days: rel.Policy.CooldownDays, SecurityFix: rel.Policy.SecurityFix,
-		Waits: []CooldownWait{}, Waived: []CooldownWaiver{}, Unreadable: []CooldownGap{},
+		Waits: []CooldownWait{}, Waived: []CooldownWaiver{}, Unreadable: []CooldownGap{}, Missing: []CooldownGap{},
+	}
+	// The security-fix exemption is differential: the lane's own advisory reading says which advisories the
+	// command removes (the difference's fixed advisories), and the baseline says which packages it replaces.
+	fixedBy := map[string][]string{}
+	for _, fixed := range decided.Advisories.Fixed {
+		fixedBy[fixed.Name] = append(fixedBy[fixed.Name], fixed.ID)
+	}
+	baselineVersions := map[string]map[string]struct{}{}
+	for _, occurrence := range baseline.Occurrences {
+		if !occurrence.Public || occurrence.Kind != KindRegistry {
+			continue
+		}
+		if baselineVersions[occurrence.Name] == nil {
+			baselineVersions[occurrence.Name] = map[string]struct{}{}
+		}
+		baselineVersions[occurrence.Name][occurrence.Version] = struct{}{}
+	}
+	replacesBaselineVersion := func(identity Identity) bool {
+		for version := range baselineVersions[identity.Name] {
+			if version != identity.Version {
+				return true
+			}
+		}
+		return false
 	}
 	if rel.Policy.CooldownDays <= 0 {
 		return report, nil
@@ -235,12 +282,17 @@ func judgeCooldown(in Input, diff Difference) (CooldownReport, error) {
 		done[candidate.Identity] = struct{}{}
 		report.Checked++
 		reading, ok := readings[candidate.Identity]
-		if !ok || reading.Status != ReadingRead {
-			gap := "no publish time was supplied for this identity"
-			if ok {
-				gap = reading.Gap
-			}
-			report.Unreadable = append(report.Unreadable, CooldownGap{Name: candidate.Name, Version: candidate.Version, Gap: gap})
+		if !ok {
+			// a reading nobody made is missing evidence, never an old version
+			report.Missing = append(report.Missing, CooldownGap{Name: candidate.Name, Version: candidate.Version, Gap: "no publish time was supplied for this identity"})
+			continue
+		}
+		switch reading.Status {
+		case ReadingMissing:
+			report.Missing = append(report.Missing, CooldownGap{Name: candidate.Name, Version: candidate.Version, Gap: reading.Gap})
+			continue
+		case ReadingNoTime:
+			report.Unreadable = append(report.Unreadable, CooldownGap{Name: candidate.Name, Version: candidate.Version, Gap: reading.Gap})
 			continue
 		}
 		published, err := time.Parse(time.RFC3339, reading.Published)
@@ -254,25 +306,29 @@ func judgeCooldown(in Input, diff Difference) (CooldownReport, error) {
 		if age >= rel.Policy.CooldownDays {
 			continue
 		}
-		when := installable(published, rel.Policy.CooldownDays).UTC().Format("2006-01-02T15:04Z")
-		stamp := published.UTC().Format(time.RFC3339)
-		// The exemption belongs to the exact version the caller named: a young
-		// fix nobody named is not selected, and another young version of the same
-		// name is a wait of its own.
-		if reading.Root && len(reading.Remediates) > 0 {
-			if rel.Policy.SecurityFix == SecurityFixExempt {
-				report.Waived = append(report.Waived, CooldownWaiver{
-					Name: candidate.Name, Version: candidate.Version, Published: stamp, AgeDays: age, Remediates: reading.Remediates,
-				})
-				continue
-			}
+		when := installableText(published, rel.Policy.CooldownDays)
+		stamp := published.UTC().Format(time.RFC3339Nano)
+		// The exemption belongs to the exact version the caller named, and only where the version
+		// replaces a version of the same package in the baseline and thereby removes an advisory the
+		// baseline carries for it. A young version of a package the project does not have yet fixes
+		// nothing for this project and waits; a young fix nobody named is not selected; another young
+		// version of the same name is a wait of its own.
+		var fixes []string
+		if reading.Root && replacesBaselineVersion(candidate.Identity) {
+			fixes = sortedUnique(fixedBy[candidate.Name])
+		}
+		if len(fixes) > 0 && rel.Policy.SecurityFix == SecurityFixExempt {
+			report.Waived = append(report.Waived, CooldownWaiver{
+				Name: candidate.Name, Version: candidate.Version, Published: stamp, AgeDays: age, Remediates: fixes,
+			})
+			continue
 		}
 		wait := CooldownWait{
 			Name: candidate.Name, Version: candidate.Version, Published: stamp, AgeDays: age, Installable: when,
 			Root: reading.Root, Remediates: []string{}, ClearedBy: []string{},
 		}
-		if reading.Root && len(reading.Remediates) > 0 {
-			wait.Remediates, wait.Enforced = reading.Remediates, true
+		if len(fixes) > 0 {
+			wait.Remediates, wait.Enforced = fixes, true
 		}
 		wait.Cleared, wait.ClearedBy = waitCleared(candidate.Identity, in)
 		report.Waits = append(report.Waits, wait)
@@ -309,6 +365,14 @@ func waitCleared(identity Identity, in Input) (bool, []string) {
 		return false, []string{}
 	}
 	return true, sortedIDs(used)
+}
+
+func sortedUnique(ids []string) []string {
+	set := map[string]struct{}{}
+	for _, id := range ids {
+		set[id] = struct{}{}
+	}
+	return sortedIDs(set)
 }
 
 func waitClass(report CooldownReport) ClassOutcome {
@@ -348,11 +412,8 @@ func ReadReleases(raw []byte) (Releases, error) {
 		if !ok {
 			return Releases{}, fmt.Errorf("releases: identities[%d] must be an object", i)
 		}
-		if err := requireKeys(object, fmt.Sprintf("identities[%d].", i), "name", "version", "host", "root", "status", "published", "gap", "remediates", "remediation_gap"); err != nil {
+		if err := requireKeys(object, fmt.Sprintf("identities[%d].", i), "name", "version", "host", "root", "status", "published", "gap"); err != nil {
 			return Releases{}, fmt.Errorf("releases: %w", err)
-		}
-		if _, ok := object["remediates"].([]any); !ok {
-			return Releases{}, fmt.Errorf("releases: identities[%d].remediates must be a list", i)
 		}
 	}
 	var releases Releases
@@ -379,8 +440,8 @@ func asObject(value any) map[string]any {
 }
 
 func (p ReleasePolicy) validate() error {
-	if p.CooldownDays < 0 || p.CooldownDays > 3650 {
-		return fmt.Errorf("policy.cooldown_days must be between 0 and 3650")
+	if p.CooldownDays < 0 || p.CooldownDays > MaxCooldownDays {
+		return fmt.Errorf("policy.cooldown_days must be between 0 and %d", MaxCooldownDays)
 	}
 	if p.SecurityFix != SecurityFixExempt && p.SecurityFix != SecurityFixEnforce {
 		return fmt.Errorf("policy.security_fix must be exempt or enforce")
@@ -413,17 +474,12 @@ func (r Releases) validate() error {
 			if _, err := time.Parse(time.RFC3339, reading.Published); err != nil || reading.Gap != "" {
 				return fmt.Errorf("identities[%d]: a reading carries a publish time and no gap", i)
 			}
-		case ReadingUnreadable:
+		case ReadingNoTime, ReadingMissing:
 			if reading.Published != "" || reading.Gap == "" {
-				return fmt.Errorf("identities[%d]: an unreadable reading carries a gap and no publish time", i)
+				return fmt.Errorf("identities[%d]: a reading without a time carries a gap and no publish time", i)
 			}
 		default:
 			return fmt.Errorf("identities[%d]: unknown status %q", i, reading.Status)
-		}
-		for _, id := range reading.Remediates {
-			if !advisoryID.MatchString(id) {
-				return fmt.Errorf("identities[%d].remediates: malformed advisory id", i)
-			}
 		}
 	}
 	return nil

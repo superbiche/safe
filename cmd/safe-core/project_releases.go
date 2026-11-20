@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -15,28 +14,30 @@ import (
 )
 
 const (
-	projectReleasesUsage = "safe-core: usage: safe-core project-releases --request <file> --cache-dir <dir> [--registry-base <url>] [--osv-url <url>]"
+	projectReleasesUsage = "safe-core: usage: safe-core project-releases --request <file> --state-dir <dir> [--registry-base <url>]"
 	projectRootsUsage    = "safe-core: usage: safe-core project-roots < NUL-separated-package-arguments"
-	osvDefaultURL        = "https://api.osv.dev"
+	// releasesDeadline bounds all the readings of one command together; a reading still queued when it ends is
+	// missing evidence (never a gap), so it is generous: see docs/configuration.md for the measurement.
+	releasesDeadline = 15 * time.Minute
 )
 
 // projectReleases reads the publish time of every identity of a request (the
 // cooldown's reading, see projectlane.CooldownCandidates) and prints the
-// releases document project-decide judges. Publish times are cached per exact
-// version in --cache-dir. For a version the caller named exactly that is inside
-// the cooldown, it also reads the advisories the version fixes, for the
-// security-fix exemption.
+// releases document project-decide judges. A publish time safe read is cached
+// per exact version and per source in the lane's own store under --state-dir
+// (see projectlane.PublishCache).
 //
-// --registry-base and --osv-url replace the registries' addresses (tests, a
-// mirror of the public registry); without them a packument is read from the host
-// the identity was resolved from. An identity that cannot be read is in the
-// document as unreadable, with the gap, never as old; exit 3 is a request that
-// cannot be read.
+// --registry-base replaces the registry's address (tests, a mirror); without it a
+// packument is read from the host the identity was resolved from. The caller's
+// proxy and TLS settings are not used (see package releases). Each identity is in
+// the document as read, no_time (the registry answered completely and holds no
+// time: disclosed, not stopping) or missing (any other reason: missing
+// evidence). Exit 3 is a request that cannot be read.
 func projectReleases(args []string, stdout, stderr io.Writer) int {
-	var requestFile, cacheDir, registryBase, osvURL string
+	var requestFile, stateDir, registryBase string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
-		case "--request", "--cache-dir", "--registry-base", "--osv-url":
+		case "--request", "--state-dir", "--registry-base":
 			if i+1 >= len(args) || args[i+1] == "" {
 				fmt.Fprintln(stderr, projectReleasesUsage)
 				return 2
@@ -46,19 +47,17 @@ func projectReleases(args []string, stdout, stderr io.Writer) int {
 			switch args[i-1] {
 			case "--request":
 				requestFile = value
-			case "--cache-dir":
-				cacheDir = value
+			case "--state-dir":
+				stateDir = value
 			case "--registry-base":
 				registryBase = value
-			case "--osv-url":
-				osvURL = value
 			}
 		default:
 			fmt.Fprintln(stderr, projectReleasesUsage)
 			return 2
 		}
 	}
-	if requestFile == "" || cacheDir == "" {
+	if requestFile == "" || stateDir == "" {
 		fmt.Fprintln(stderr, projectReleasesUsage)
 		return 2
 	}
@@ -72,20 +71,19 @@ func projectReleases(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "safe-core: project-releases: %v\n", err)
 		return 3
 	}
-	if osvURL == "" {
-		osvURL = osvDefaultURL
-	}
+	// The TLS roots are the system's: Go reads the roots a caller names with these two variables.
+	os.Unsetenv("SSL_CERT_FILE")
+	os.Unsetenv("SSL_CERT_DIR")
 	document := projectlane.Releases{
 		SchemaVersion: projectlane.ReleasesSchema,
-		Now:           time.Now().UTC().Format(time.RFC3339),
+		Now:           time.Now().UTC().Format(time.RFC3339Nano),
 		Policy:        request.Policy,
 		Identities:    []projectlane.ReleaseReading{},
 	}
 	if request.Policy.CooldownDays > 0 {
-		now := time.Now().UTC()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), releasesDeadline)
 		defer cancel()
-		reader := &releases.Reader{CacheDir: cacheDir, Parallel: 8}
+		reader := &releases.Reader{Parallel: 8, Cache: publishCache(stateDir)}
 		if registryBase != "" {
 			reader.BaseFor = func(string) string { return registryBase }
 		}
@@ -93,56 +91,23 @@ func projectReleases(args []string, stdout, stderr io.Writer) int {
 		for _, item := range request.Identities {
 			queries = append(queries, releases.Query{Name: item.Name, Version: item.Version, Host: item.Host})
 		}
-		results := reader.Read(ctx, queries)
 		roots := map[projectlane.Identity]struct{}{}
 		for _, root := range request.Roots {
 			roots[projectlane.Identity{Name: root.Name, Version: root.Version}] = struct{}{}
 		}
-		// the named roots inside the cooldown: their fixes are read, by name
-		youngRoots := map[string][]string{}
-		for _, result := range results {
-			if _, isRoot := roots[projectlane.Identity{Name: result.Name, Version: result.Version}]; !isRoot || !result.OK {
-				continue
-			}
-			age := int(now.Sub(result.Published) / (24 * time.Hour))
-			if age < request.Policy.CooldownDays {
-				youngRoots[result.Name] = append(youngRoots[result.Name], result.Version)
-			}
-		}
-		fixes := map[projectlane.Identity][]string{}
-		fixGap := map[projectlane.Identity]string{}
-		names := make([]string, 0, len(youngRoots))
-		for name := range youngRoots {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			versions := youngRoots[name]
-			found, err := releases.Remediation(ctx, http.DefaultClient, osvURL, name, versions)
-			for _, version := range versions {
-				identity := projectlane.Identity{Name: name, Version: version}
-				if err != nil {
-					fixGap[identity] = err.Error()
-					continue
+		for _, result := range reader.Read(ctx, queries) {
+			_, isRoot := roots[projectlane.Identity{Name: result.Name, Version: result.Version}]
+			reading := projectlane.ReleaseReading{Name: result.Name, Version: result.Version, Host: result.Host, Root: isRoot}
+			switch {
+			case result.OK:
+				reading.Status, reading.Published = projectlane.ReadingRead, result.Published.UTC().Format(time.RFC3339Nano)
+			case result.NoTime:
+				reading.Status, reading.Gap = projectlane.ReadingNoTime, "the registry answered completely for this package and holds no publish time for this version"
+			default:
+				reading.Status, reading.Gap = projectlane.ReadingMissing, strings.TrimSpace(result.Failure)
+				if reading.Gap == "" {
+					reading.Gap = "the publish time could not be read"
 				}
-				fixes[identity] = found[version]
-			}
-		}
-		for _, result := range results {
-			identity := projectlane.Identity{Name: result.Name, Version: result.Version}
-			_, isRoot := roots[identity]
-			reading := projectlane.ReleaseReading{
-				Name: result.Name, Version: result.Version, Host: result.Host, Root: isRoot,
-				Status: projectlane.ReadingUnreadable, Gap: strings.TrimSpace(result.Gap), Remediates: []string{},
-			}
-			if result.OK {
-				reading.Status, reading.Gap, reading.Published = projectlane.ReadingRead, "", result.Published.UTC().Format(time.RFC3339)
-				if ids := fixes[identity]; ids != nil {
-					reading.Remediates = ids
-				}
-				reading.RemediationGap = fixGap[identity]
-			} else if reading.Gap == "" {
-				reading.Gap = "the publish time could not be read"
 			}
 			document.Identities = append(document.Identities, reading)
 		}
