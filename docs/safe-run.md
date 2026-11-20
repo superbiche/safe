@@ -601,9 +601,14 @@ safe run one-shot-project remove [<dir>…]   # operator TTY
 safe run one-shot-project list              # read-only; says when a directory was replaced
 ```
 
-`add` and `remove` are operator-only (TTY, exit 102 otherwise). The entry is the physical path of the directory with its device and
-inode, kept in `one-shot-projects.json` under the canonical operator store (never a redirected one; a file that is not the
-operator's own is ignored), with no reason: the audit log records who and when. It matters only while `install.project_lane` is on.
+`add` and `remove` are operator-only (TTY, exit 102 otherwise; a failed terminal read is 102 too, never a cancellation). The
+entry is the physical path of the directory (its bytes) with its device and inode, kept in `one-shot-projects.json` under the
+canonical operator store (`$HOME/.config/safe/run`, never a redirected one) and read and written only by `safe-core
+one-shot-store` (verified directories, one descriptor for check and read, a lock over read, change and rename; a change is announced
+and logged once it is committed), with no reason: the audit log records who and when. `list` creates nothing; `add` shows the
+resolved identity it will commit, asks on the terminal, and records nothing the directory no longer matches. It matters only while
+`install.project_lane` is on. Accepted residual: a remount at the same path with the same device and inode, or a reused inode,
+cannot be told from the pinned directory.
 
 ## Scripts Allowlist
 

@@ -858,7 +858,7 @@ safe_gate_nopt_parse() {
   local i n name arg orig v la no flags known isbool val consume gval="" lval="" had_eq la_set gctr=0 gbase at lits abbreviated
   for (( i=0; i<$#; i++ )); do ne+=(0); ng+=(0); nat+=("$((i + 1))"); done
   SAFE_GATE_NOPT_REMAIN=() SAFE_GATE_NOPT_REMAIN_AT=() SAFE_GATE_NOPT_LOOSE=() SAFE_GATE_NOPT_UNKNOWN=() SAFE_GATE_NOPT_UNKNOWN_AT=() SAFE_GATE_NOPT_UNKNOWN_ABBREV=()
-  SAFE_GATE_NOPT_NEGATED=() SAFE_GATE_NOPT_CLUSTER=() SAFE_GATE_NOPT_UNSTABLE=() SAFE_GATE_NOPT_SEEN="|" SAFE_GATE_NOPT_GLOBAL=0 SAFE_GATE_NOPT_LOCGLOBAL=0 SAFE_GATE_NOPT_NEGWORD=()
+  SAFE_GATE_NOPT_NEGATED=() SAFE_GATE_NOPT_CLUSTER=() SAFE_GATE_NOPT_UNSTABLE=() SAFE_GATE_NOPT_SEEN="|" SAFE_GATE_NOPT_BOOLS="|" SAFE_GATE_NOPT_GLOBAL=0 SAFE_GATE_NOPT_LOCGLOBAL=0 SAFE_GATE_NOPT_NEGWORD=()
   i=0
   while (( i < ${#na[@]} )); do
     arg="${na[i]}"
@@ -974,6 +974,8 @@ safe_gate_nopt_parse() {
           && { (( consume )) || [[ "${la}" != -* ]]; }; then
         SAFE_GATE_NOPT_NEGWORD+=("${orig}")
       fi
+      # the value of a Boolean option as npm reads it (the last setting wins): `|dry-run=0|force=1|`
+      (( known )) && SAFE_GATE_NOPT_BOOLS+="${name}=${val}|"
       if [[ "${name}" == global ]]; then
         gval="${val}"
         gmodes+=("$(( val == 1 ? 1 : 0 ))")
@@ -3586,7 +3588,7 @@ safe_gate_project_lane_refuse() {
   SAFE_GATE_LANE_REFUSAL_VERB="${verb}"
   SAFE_GATE_LANE_REFUSAL_STAKE="${stake}"
   SAFE_GATE_LANE_REFUSAL_TODO="${todo}"
-  SAFE_GATE_LANE_REFUSAL_CONSEQUENCE="$(safe_gate_lane_clean "${5:-}")"
+  safe_gate_project_lane_note "$(safe_gate_lane_clean "${5:-}")"
   SAFE_GATE_LANE_REFUSAL_MARK=0
   if [[ "${SAFE_GATE_LANE_PHASE:-}" == routing && "${SAFE_GATE_LANE_FIXED:-0}" != 1 ]]; then
     SAFE_GATE_LANE_REFUSAL_MARK=1
@@ -3606,6 +3608,11 @@ safe_gate_project_lane_unsupported() {
   safe_gate_project_lane_refuse 100 "$1" "$2 is not covered by the project lane" "change the command, or the project, to a form the lane covers (npm install or npm update on registry packages), then retry" "${3:-}"
 }
 
+safe_gate_project_lane_unsupported_fixed() {
+  SAFE_GATE_LANE_FIXED=1
+  safe_gate_project_lane_unsupported "$@"
+}
+
 # A verb the lane does not route (install, update, ci, dedupe and prune are its verbs).
 safe_gate_project_lane_verb_refusal() {
   safe_gate_project_lane_refuse 100 "$1" "npm $1 is not routed by the project lane" "use npm install, update, ci, dedupe or prune, which the lane covers, then retry"
@@ -3615,22 +3622,68 @@ safe_gate_project_lane_verb_refusal() {
 safe_gate_project_lane_print_refusal() {
   local todo="${SAFE_GATE_LANE_REFUSAL_TODO}"
   if [[ "${SAFE_GATE_LANE_REFUSAL_MARK:-0}" == 1 && "${SAFE_GATE_LANE_DRY:-0}" != 1 ]]; then
-    todo+="; the operator can confirm the one-shot route for this command at their terminal, or put this project on it: safe run one-shot-project add"
+    todo+="; at their terminal the operator can confirm the one-shot route for this command, or put this project on it"
   fi
   safe_gate_err "safe: BLOCKED npm ${SAFE_GATE_LANE_REFUSAL_VERB} [lane: project] — ${SAFE_GATE_LANE_REFUSAL_STAKE}; ${todo}; details: safe explain"
 }
 
-# Can the lane know that this command is a dry run? By argument (any spelling of the option: the lane recognises only two, so
-# any other is treated as possibly one) or by environment. A dry run set only in a configuration file cannot be known before
-# the probe has run: the confirmation is then offered, it writes nothing, and the command only dry-runs on today's gate.
-safe_gate_project_lane_known_dry_run() {
-  local arg
-  for arg in "$@"; do
-    [[ "${arg}" != "--" ]] || break
-    case "${arg}" in --dry-run|--dry-run=*|--no-dry-run|--no-dry-run=*) return 0 ;; esac
+# Every effective-configuration document, as soon as there is one: what it says about a dry run and about start-up code.
+safe_gate_project_lane_config_seen() { # <document>
+  [[ -n "$1" ]] || return 0
+  safe_gate_project_lane_dry_from_config "$1"
+  if jq -e '(."node-options" // "") != ""' <<<"$1" >/dev/null 2>&1; then
+    safe_gate_project_lane_note "npm would pass its node-options setting to the Node processes of the lifecycle scripts it runs, not to npm itself."
+  fi
+  return 0
+}
+
+# Can the lane know that this command is a dry run? From the PARSED option values (the gate's own reading of npm's arguments:
+# abbreviations and shorthands included, the last setting wins, an explicit false is false), from the environment, and from every
+# effective-configuration document as soon as there is one (safe_gate_project_lane_dry_from_config), whatever refusal is reported.
+# A dry run set only in a configuration file cannot be known before the probe has run: the confirmation is then offered, it writes
+# nothing, and the command only dry-runs on today's gate.
+safe_gate_project_lane_dry_arg() { # prints 1, 0, or nothing
+  safe_gate_nopt_parse "$@" || return 0
+  if [[ "${SAFE_GATE_NOPT_BOOLS}" =~ ^.*\|dry-run=([01])\| ]]; then printf '%s' "${BASH_REMATCH[1]}"; fi
+  return 0
+}
+safe_gate_project_lane_dry_from_config() { # <effective configuration document>
+  [[ "${SAFE_GATE_LANE_DRY_ARG:-}" != 0 ]] || return 0
+  if jq -e '."dry-run" == true' <<<"$1" >/dev/null 2>&1; then SAFE_GATE_LANE_DRY=1; fi
+  return 0
+}
+
+# What the one-shot route would do at start-up that the lane does not do, for the INPUTS the command carries (kept whichever
+# refusal is met first): one sentence each, added once, shown with the question.
+safe_gate_project_lane_note() {
+  [[ -n "$1" && "${SAFE_GATE_LANE_NOTES:-}" != *"$1"* ]] || return 0
+  SAFE_GATE_LANE_NOTES+="${SAFE_GATE_LANE_NOTES:+ }$1"
+}
+safe_gate_project_lane_ambient_notes() {
+  local token loads=""
+  for token in ${NODE_OPTIONS:-}; do
+    case "${token}" in --require|--require=*|-r|-r=*|--import|--import=*|--loader|--loader=*|--experimental-loader|--experimental-loader=*) loads+="${loads:+ }${token%%=*}" ;; esac
   done
-  [[ -n "${npm_config_dry_run:-}${NPM_CONFIG_DRY_RUN:-}" ]] && return 0
-  return 1
+  [[ -z "${loads}" ]] || safe_gate_project_lane_note "the delegated Node process would load what NODE_OPTIONS names (${loads}) at start-up, before safe sees anything."
+  [[ "${SAFE_GATE_NOPT_SEEN:-|}" != *"|userconfig|"* && "${SAFE_GATE_NOPT_SEEN:-|}" != *"|globalconfig|"* ]] \
+    || safe_gate_project_lane_note "npm will read the configuration file you named at start-up, before safe has seen it."
+  [[ "${SAFE_GATE_NOPT_SEEN:-|}" != *"|prefix|"* ]] || safe_gate_project_lane_note "npm will operate on the project directory you named, which the lane has not read."
+  [[ "${SAFE_GATE_NOPT_SEEN:-|}" != *"|cache|"* && "${SAFE_GATE_NOPT_SEEN:-|}" != *"|logs-dir|"* ]] \
+    || safe_gate_project_lane_note "npm will write its cache or logs where you named, outside the lane's storage."
+  if [[ -n "${npm_config_userconfig:-}${NPM_CONFIG_USERCONFIG:-}${npm_config_globalconfig:-}${NPM_CONFIG_GLOBALCONFIG:-}" ]]; then
+    safe_gate_project_lane_note "npm will read the configuration file an environment variable names at start-up, before safe has seen it."
+  fi
+  return 0
+}
+
+# THE one question of the one-shot route: the only place it is asked (the structural lint checks it by name). 0 yes, 1 no, 3 a
+# failed read. $1 what is at stake, $2 what the one-shot route does not judge.
+safe_gate_project_lane_one_shot_question() {
+  lane_ask_out=/dev/null
+  safe_gate_project_lane_query "you declined the one-shot route" safe_gate_confirm_infra "this command" \
+    "safe: the project lane cannot judge this command: $1 — not a package finding." \
+    "$2" \
+    "safe: run this command on the one-shot route? [y/N] "
 }
 
 # The lane's top level: after the lane's cleanup (the lock and the scratch are free), the recorded refusal is printed, or, for a
@@ -3642,21 +3695,17 @@ safe_gate_project_lane_conclude() {
   verb="${SAFE_GATE_LANE_REFUSAL_VERB}"
   if [[ "${SAFE_GATE_LANE_REFUSAL_MARK:-0}" == 1 && "${SAFE_GATE_LANE_DRY:-0}" != 1 ]] && safe_gate_operator_terminal; then
     stake="${SAFE_GATE_LANE_REFUSAL_STAKE}"
-    conseq="${SAFE_GATE_LANE_REFUSAL_CONSEQUENCE}"
+    conseq="${SAFE_GATE_LANE_NOTES:-}"
     wording="safe: running it on the one-shot route (today's gate) does not judge the closure: only what that gate judges."
     case "${verb}" in
       dedupe|prune) wording="safe: ${verb} goes to today's older differential path, which judges it where it can and refuses otherwise, with no override of its own; the closure is not judged by the lane." ;;
     esac
     [[ -z "${conseq}" ]] || wording+=" ${conseq}"
-    lane_ask_out=/dev/null
-    safe_gate_project_lane_query "you declined the one-shot route" safe_gate_confirm_infra "this command" \
-      "safe: the project lane cannot judge this command: ${stake} — not a package finding." \
-      "${wording}" \
-      "safe: run this command on the one-shot route? [y/N] " || q=$?
+    safe_gate_project_lane_one_shot_question "${stake}" "${wording}" || q=$?
     case "${q}" in
       0)
         safe_gate_project_lane_oneshot_line "${verb}" "confirmed at the operator's terminal: ${stake}"
-        SAFE_GATE_LANE_PASS=1
+        safe_gate_project_lane_hand_over_silent || true
         return 0
         ;;
       3)
@@ -3685,50 +3734,72 @@ safe_gate_project_lane_conclude() {
 # fails takes precedence over the compatibility route: the guards run BEFORE a one-shot.
 
 # The operator's standing decision for a project (safe run one-shot-project): kept in the operator's own store under the established
-# root (the function of ticket 1684: never a redirect the environment names, never a file of the project), by the physical path of
-# the project directory and its device and inode. A decision can only WEAKEN the route, so anything unreadable is "not pinned".
-# $1 the project directory (physical). 0 pinned and honoured, 1 not pinned, 2 pinned but the directory was replaced (not honoured).
+# root, by the physical path of the project directory and its device and inode. ONE reader and ONE writer, in the core
+# (`safe-core one-shot-store`): the directory chain below the home is opened through verified descriptors (no link followed, each
+# directory the user's and closed to group and others) and the file is validated and read on the same open descriptor. A decision
+# can only WEAKEN the route, so anything the core cannot trust, or a core that is not the one beside the dispatcher, is "not pinned".
+# $1 the project directory (physical). 0 pinned and honoured, 1 not pinned, 2 pinned but the directory was replaced.
 safe_gate_project_lane_pin_state() {
-  local dir="$1" file recorded now
-  file="$(safe_gate_project_lane_operator_root)/one-shot-projects.json"
-  [[ -f "${file}" && ! -L "${file}" ]] || return 1
-  [[ "$(stat -c '%u' -- "${file}" 2>/dev/null)" == "$(id -u)" ]] || return 1
-  [[ "$(( 8#$(stat -c '%a' -- "${file}" 2>/dev/null || echo 777) & 8#022 ))" == 0 ]] || return 1
-  recorded="$(jq -er --arg p "${dir}" '(.projects // {}) | .[$p] | select(type == "object") | "\(.dev):\(.inode)"' "${file}" 2>/dev/null)" || return 1
-  [[ -n "${recorded}" ]] || return 1
-  now="$(stat -c '%d:%i' -- "${dir}" 2>/dev/null)" || return 2
-  [[ "${recorded}" == "${now}" ]] || return 2
+  local dir="$1" core="${SAFE_DIR:-}/safe-core" rc=0
+  [[ -n "${SAFE_DIR:-}" && -x "${core}" && "${HOME:-}" == /* ]] || return 1
+  [[ "$("${core}" --version 2>/dev/null)" == "${SAFE_VERSION:-unset}" ]] || return 1
+  "${core}" one-shot-store check --home "${HOME}" --project "${dir}" </dev/null >/dev/null 2>&1 || rc=$?
+  case "${rc}" in 0) return 0 ;; 2) return 2 ;; *) return 1 ;; esac
+}
+
+# Is this command one npm will run on THE PROJECT DIRECTORY the pin names? The standing decision is for the project npm operates
+# on, so it is honoured only when the local project root the lane itself would use is this directory and nothing says npm will
+# act elsewhere. npm's options are read with the gate's own reading of its arguments (abbreviations and shorthands included:
+# `--prefi` is `--prefix`), not by a list; the environment and the configuration files that select a project, a workspace or
+# global mode count too. Reads dynamic `project_dir` of the lane's runner. $@ the command's arguments.
+safe_gate_project_lane_pin_applies() {
+  local name file
+  safe_gate_nopt_parse "$@" || return 1
+  (( ${#SAFE_GATE_NOPT_UNSTABLE[@]} == 0 && ${#SAFE_GATE_NOPT_CLUSTER[@]} == 0 )) || return 1
+  for name in prefix workspace workspaces include-workspace-root global location; do
+    [[ "${SAFE_GATE_NOPT_SEEN}" != *"|${name}|"* ]] || return 1
+  done
+  [[ "${SAFE_GATE_NOPT_GLOBAL}" == 0 && "${SAFE_GATE_NOPT_LOCGLOBAL}" == 0 ]] || return 1
+  while IFS= read -r name; do
+    case "${name,,}" in
+      npm_config_workspace|npm_config_workspaces|npm_config_include_workspace_root|npm_config_global|npm_config_location|npm_config_workspaces_update) return 1 ;;
+    esac
+  done < <(compgen -e)
+  # a workspace or global mode set in a configuration file of the project or the user
+  for file in "${project_dir}/.npmrc" "${HOME}/.npmrc"; do
+    [[ -f "${file}" ]] || continue
+    ! grep -qiE '^[[:space:]]*(global|location|workspace|workspaces|include-workspace-root)[[:space:]]*=' "${file}" 2>/dev/null || return 1
+  done
+  # the local project root: this directory holds a regular package.json (npm's own walk stops here) and no workspace root above it
+  [[ -f "${project_dir}/package.json" && ! -L "${project_dir}/package.json" ]] || return 1
+  ! safe_gate_project_lane_workspace_ancestor "${project_dir}" >/dev/null || return 1
   return 0
 }
 
-# A command that selects ANOTHER project, a workspace or global mode (a selector option on the command line, or a workspace or global setting in the environment: an environment prefix does not move a local command) is
-# not a command of the pinned directory: the standing decision does not apply to it, so a pinned project cannot lend its route to
-# a different one. The lane then refuses it as it always did (and the operator may confirm that one command).
-safe_gate_project_lane_selects_elsewhere() {
-  local arg name
-  for arg in "$@"; do
-    [[ "${arg}" != "--" ]] || break
-    case "${arg}" in
-      --prefix|--prefix=*|-C|-C?*|--cwd|--cwd=*|-w|-w?*|--workspace|--workspace=*|-ws|--workspaces|--workspaces=*|--include-workspace-root|--include-workspace-root=*|--global|--global=*|-g|-g=*|--location|--location=*|--no-global|--no-location|--no-workspaces|--no-workspace) return 0 ;;
-    esac
-  done
-  while IFS= read -r name; do
-    case "${name,,}" in
-      npm_config_workspace|npm_config_workspaces|npm_config_include_workspace_root|npm_config_global|npm_config_location|npm_config_workspaces_update) return 0 ;;
-    esac
-  done < <(compgen -e)
-  return 1
+# The ONLY places the lane's hand-over statuses are raised (the structural lint checks it): the command goes to today's gate
+# (253) or is left to npm, which rejects it (252). Both return through the same non-zero path as a refusal.
+safe_gate_project_lane_hand_over_silent() {
+  SAFE_GATE_LANE_PASS=1
+  return "$(safe_gate_project_lane_handover_status)"
+}
+safe_gate_project_lane_unresolved_silent() {
+  SAFE_GATE_LANE_PASS=2
+  return "$(safe_gate_project_lane_unresolved_status)"
 }
 
-# The one-shot line. In the lane (a subshell) the caller then hands over (SAFE_GATE_LANE_PASS=1).
+# The one-shot line. In the lane (a subshell) the caller then hands over.
 safe_gate_project_lane_oneshot_line() {
-  safe_gate_err "safe: project lane: npm ${1} [lane: one-shot, $(safe_gate_lane_clean "$2")] — the closure is not judged on this route"
+  local reason="$2"
+  case "$1" in
+    dedupe|prune) reason+="; npm $1 goes to today's older differential path, which judges it where it can and refuses otherwise, with no override of its own" ;;
+  esac
+  safe_gate_err "safe: project lane: npm ${1} [lane: one-shot, $(safe_gate_lane_clean "${reason}")] — the closure is not judged on this route"
 }
 safe_gate_project_lane_oneshot() {
   safe_gate_project_lane_oneshot_line "$1" "$2"
-  SAFE_GATE_LANE_PASS=1
   # a hand-over returns through the same non-zero path as a refusal: there is no return that means "go on"
-  return "$(safe_gate_project_lane_handover_status)"
+  safe_gate_project_lane_hand_over_silent
+  return $?
 }
 # Is <file> (of the snapshot) what is committed at the head of the git work tree? 0 yes (or
 # absent from both). Otherwise 1 and SAFE_GATE_LANE_REASON says why, in words that fit the refusal.
@@ -3825,9 +3896,6 @@ safe_gate_project_lane_decide() {
   done
   # dedupe and prune go the same way: their one-shot route is today's older differential path, which judges them where it can
   # and refuses otherwise, with no override of its own (the caller falls through to it).
-  case "${verb}" in
-    dedupe|prune) reasons+=" (npm ${verb} then goes to today's older differential path, which refuses what it cannot judge)" ;;
-  esac
   safe_gate_project_lane_oneshot "${verb}" "${reasons}"
   return $?
 }
@@ -5402,7 +5470,7 @@ safe_gate_project_lane_outcome_text() {
     .outcome as $o
     | if $o.status == "unbound" then
         (.bindability.unbound[0]) as $u
-        | "the projected graph holds \(.bindability.unbound | length) entry(ies) safe cannot bind (\($u.name // $u.path)@\($u.version // "?"): \($u.reason))|the lane has no route for an unbound graph yet; no file was written"
+        | "the projected graph holds \(.bindability.unbound | length) entry(ies) safe cannot bind (\($u.name // $u.path)@\($u.version // "?"): \($u.reason))|the lane cannot judge an unbound graph; the operator can put this project on the one-shot route (a standing decision at their terminal); no file was written"
       elif $o.class == "malice" then
         (.malice[0]) as $m
         | "\(if $m.signal == "blocklist" then "blocklist entry" elif $m.signal == "socket_block" then "Socket BLOCK" else "known-malware record" end) on \($m.name)@\($m.versions | join(",")) (\($m.id // $m.reason))\(if (.malice | length) > 1 then " and \((.malice | length) - 1) more" else "" end)|remove it from the dependency graph; nothing clears malice"
@@ -5580,7 +5648,15 @@ safe_gate_project_lane_in_subshell() {
   SAFE_GATE_LANE_REFUSAL_CODE=""
   SAFE_GATE_LANE_REFUSAL_MARK=0
   SAFE_GATE_LANE_DRY=0
-  ! safe_gate_project_lane_known_dry_run "$@" || SAFE_GATE_LANE_DRY=1
+  SAFE_GATE_LANE_NOTES=""
+  safe_gate_nopt_parse "$@" || true
+  SAFE_GATE_LANE_DRY_ARG="$(safe_gate_project_lane_dry_arg "$@")"
+  if [[ "${SAFE_GATE_LANE_DRY_ARG}" == 1 ]]; then
+    SAFE_GATE_LANE_DRY=1
+  elif [[ -z "${SAFE_GATE_LANE_DRY_ARG}" && -n "${npm_config_dry_run:-}${NPM_CONFIG_DRY_RUN:-}" && "${npm_config_dry_run:-}${NPM_CONFIG_DRY_RUN:-}" != false && "${npm_config_dry_run:-}${NPM_CONFIG_DRY_RUN:-}" != 0 ]]; then
+    SAFE_GATE_LANE_DRY=1
+  fi
+  safe_gate_project_lane_ambient_notes "$@"
   # Until the binder is started a signal ends the command (the project is untouched);
   # from before it starts until its report is delivered the handler only records and
   # forwards (see safe_gate_lane_signal). The traps stay until the very end: the operator may be asked at the top level.
@@ -5781,8 +5857,8 @@ safe_gate_project_lane_run() {
   done
   arg=""
   if (( ${#before_terminator[@]} )) && safe_gate_npm_global_true "${before_terminator[@]}"; then
-    SAFE_GATE_LANE_PASS=1
-    return "$(safe_gate_project_lane_handover_status)"
+    safe_gate_project_lane_hand_over_silent
+    return $?
   fi
 
   # --- 1. route: the runtime, then npm's own word on global --------------------
@@ -5822,14 +5898,11 @@ safe_gate_project_lane_run() {
   # The operator's standing decision for this project (set at their terminal only, kept in their own store): the one-shot route,
   # with its line, before anything is read, opened or locked: today's gate then applies every guard of its own.
   local pin_rc=1 pin_why="the operator put this project on the one-shot route (safe run one-shot-project list)"
-  if ! safe_gate_project_lane_selects_elsewhere "$@"; then
+  if safe_gate_project_lane_pin_applies "$@"; then
     pin_rc=0
     safe_gate_project_lane_pin_state "${project_dir}" || pin_rc=$?
   fi
   if (( pin_rc == 0 )); then
-    case "${verb}" in
-      dedupe|prune) pin_why+="; npm ${verb} goes to today's older differential path, which judges it where it can and refuses otherwise, with no override of its own" ;;
-    esac
     safe_gate_project_lane_oneshot "${verb}" "${pin_why}"
     return $?
   elif (( pin_rc == 2 )); then
@@ -5843,7 +5916,7 @@ safe_gate_project_lane_run() {
     [[ "${cfg_arg}" != "--" ]] || break
     case "${cfg_arg}" in
       --userconfig|--userconfig=*|--globalconfig|--globalconfig=*|--prefix|--prefix=*|-C|--cache|--cache=*|--logs-dir|--logs-dir=*)
-        safe_gate_project_lane_unsupported "${verb}" "the option ${cfg_arg%%=*}, which selects a configuration file or a destination before it can be admitted" "npm will read the configuration you named at start-up, before safe has seen it"
+        safe_gate_project_lane_unsupported "${verb}" "the option ${cfg_arg%%=*}, which $(case "${cfg_arg%%=*}" in --userconfig|--globalconfig) printf 'selects a configuration file';; --prefix|-C) printf 'selects another project directory';; *) printf 'selects a storage destination';; esac) before it can be admitted"
         return $?
         ;;
     esac
@@ -5851,13 +5924,13 @@ safe_gate_project_lane_run() {
   # Variables npm's configuration loader selects its configuration files by: refused by name,
   # before the environment is replaced (safe_gate_lane_env_selectors).
   if value="$(safe_gate_lane_env_selectors)"; then
-    safe_gate_project_lane_unsupported "${verb}" "the environment variable ${value}, which selects where npm reads its configuration from and would be dropped from the environment the lane gives npm; unset it and retry" "npm will read the configuration that variable selects at start-up, before safe has seen it"
+    safe_gate_project_lane_unsupported "${verb}" "the environment variable ${value}, which selects where npm reads its configuration from and would be dropped from the environment the lane gives npm; unset it and retry"
     return $?
   fi
   # The operator-level destinations of npm in the environment are checked as
   # strings, without npm, before the first npm run.
   if value="$(safe_gate_lane_env_destinations "${project_dir}")"; then
-    safe_gate_project_lane_unsupported "${verb}" "the environment setting ${value}, which points into the project where npm would write before publication"
+    safe_gate_project_lane_unsupported_fixed "${verb}" "the environment setting ${value}, which points into the project where npm would write before publication"
     return $?
   fi
   rc=0
@@ -5869,6 +5942,7 @@ safe_gate_project_lane_run() {
     # A launcher the lane cannot follow: its provenance cannot be established (which npm, which
     # Node, from which search path), so the command refuses with the lane's line rather than
     # going to today's gate.
+    safe_gate_project_lane_note "today's gate will run an npm launcher safe could not identify (which npm, which Node, from which search path), so what runs at start-up is not established."
     safe_gate_project_lane_unsupported "${verb}" "${SAFE_GATE_LANE_REASON}"
     return $?
   fi
@@ -5920,8 +5994,8 @@ safe_gate_project_lane_run() {
     return $?
   fi
   if [[ -z "${resolved_command}" ]]; then
-    SAFE_GATE_LANE_PASS=2
-    return "$(safe_gate_project_lane_unresolved_status)"
+    safe_gate_project_lane_unresolved_silent
+    return $?
   fi
   # npm resolves the token to ANOTHER command than safe's table does: the table does not match this npm.
   # Nothing says npm rejects such a command, so it is neither left to npm nor judged under a verb npm
@@ -6038,11 +6112,11 @@ safe_gate_project_lane_run() {
   # is introduced); a link or a special file in its place is refused.
   local name
   if [[ -L "${project_dir}/package.json" || ! -f "${project_dir}/package.json" ]]; then
-    safe_gate_project_lane_unsupported "${verb}" "a project without a regular package.json (missing, a link or a special file)"
+    safe_gate_project_lane_unsupported_fixed "${verb}" "a project without a regular package.json (missing, a link or a special file)"
     return $?
   fi
   if [[ -L "${project_dir}/package-lock.json" || ( -e "${project_dir}/package-lock.json" && ! -f "${project_dir}/package-lock.json" ) ]]; then
-    safe_gate_project_lane_unsupported "${verb}" "a package-lock.json that is a link or a special file"
+    safe_gate_project_lane_unsupported_fixed "${verb}" "a package-lock.json that is a link or a special file"
     return $?
   fi
   if [[ -e "${project_dir}/npm-shrinkwrap.json" || -L "${project_dir}/npm-shrinkwrap.json" ]]; then
@@ -6050,7 +6124,7 @@ safe_gate_project_lane_run() {
     return $?
   fi
   if [[ -L "${project_dir}/.npmrc" || ( -e "${project_dir}/.npmrc" && ! -f "${project_dir}/.npmrc" ) ]]; then
-    safe_gate_project_lane_unsupported "${verb}" "a project .npmrc that is not a regular file"
+    safe_gate_project_lane_unsupported_fixed "${verb}" "a project .npmrc that is not a regular file"
     return $?
   fi
   for name in package.json package-lock.json .npmrc; do
@@ -6070,7 +6144,7 @@ safe_gate_project_lane_run() {
   # The tree root is absent or a real directory, before npm can touch it (a
   # lockfile-only command does not look at it).
   if (( ! lock_only )) && { [[ -L "${project_dir}/node_modules" ]] || { [[ -e "${project_dir}/node_modules" ]] && [[ ! -d "${project_dir}/node_modules" ]]; }; }; then
-    safe_gate_project_lane_unsupported "${verb}" "a node_modules that is a symbolic link or not a directory"
+    safe_gate_project_lane_unsupported_fixed "${verb}" "a node_modules that is a symbolic link or not a directory"
     return $?
   fi
 
@@ -6233,7 +6307,7 @@ safe_gate_project_lane_run() {
     elif (( rc == 30 )) && [[ $'\n'"${admit_text}" == *$'\n'lockfile_path_outside_tree:* ]]; then
       # UNSAFE, committed or not, and whatever else the lockfile holds (every finding is reported:
       # a link entry cannot hide it): a key outside the tree would be a path npm reads or writes
-      safe_gate_project_lane_refuse 100 "${verb}" "${lock_text} names a path outside the tree ($(printf '%s' "${admit_text}" | grep -m1 '^lockfile_path_outside_tree:' | sed 's/^[^:]*: //')), which is not covered by the project lane" "repair the lockfile and retry"
+      safe_gate_project_lane_refuse_fixed 100 "${verb}" "${lock_text} names a path outside the tree ($(printf '%s' "${admit_text}" | grep -m1 '^lockfile_path_outside_tree:' | sed 's/^[^:]*: //')), which is not covered by the project lane" "repair the lockfile and retry"
       return $?
     elif (( rc == 30 )); then
       # (a lockfile that decodes still goes through the graph check below: a link that LEAVES the
@@ -6357,11 +6431,10 @@ safe_gate_project_lane_run() {
     return $?
   fi
   printf '%s\n' "${config_json}" > "${scratch}/config.json"
+  safe_gate_project_lane_config_seen "${config_json}"
   if value="$(safe_gate_project_lane_config_reason "${config_json}")" \
       || value="$(safe_gate_project_lane_cooldown_reason "${config_json}" "${cooldown_days}" "${cooldown_excludes[@]+"${cooldown_excludes[@]}"}")"; then
-    # a dry run set by configuration is a dry run the lane KNOWS: never asked about
-    [[ "${value}" != dry-run* ]] || SAFE_GATE_LANE_DRY=1
-    safe_gate_project_lane_unsupported "${verb}" "the npm setting (${value})" "$([[ "${value}" == node-options* ]] && printf '%s' "npm would load the code its node-options names at start-up, before safe sees anything")"
+    safe_gate_project_lane_unsupported "${verb}" "the npm setting (${value})"
     return $?
   fi
   if value="$(safe_gate_project_lane_paths_reason "${config_json}" "${project_dir}")"; then
@@ -6389,6 +6462,7 @@ safe_gate_project_lane_run() {
     return $?
   }
   frozen_json="$(safe_gate_project_lane_frozen_probe "${frozen}" "${dest[@]}" ${carry[@]+"${carry[@]}"})" || frozen_json=""
+  safe_gate_project_lane_config_seen "${frozen_json}"
   if ! safe_gate_lane_one_doc 'type == "object"' "${frozen_json}"; then
     safe_gate_project_lane_refuse 100 "${verb}" "npm's configuration for the frozen installation cannot be read (audit-infrastructure breakage, not a package finding)" "fix npm configuration and retry — safe doctor"
     return $?
@@ -6399,9 +6473,7 @@ safe_gate_project_lane_run() {
   fi
   if value="$(safe_gate_project_lane_config_reason "${frozen_json}")" \
       || value="$(safe_gate_project_lane_cooldown_reason "${frozen_json}" "${cooldown_days}" "${cooldown_excludes[@]+"${cooldown_excludes[@]}"}")"; then
-    # a dry run set by configuration is a dry run the lane KNOWS: never asked about
-    [[ "${value}" != dry-run* ]] || SAFE_GATE_LANE_DRY=1
-    safe_gate_project_lane_unsupported "${verb}" "the npm setting (${value})" "$([[ "${value}" == node-options* ]] && printf '%s' "npm would load the code its node-options names at start-up, before safe sees anything")"
+    safe_gate_project_lane_unsupported "${verb}" "the npm setting (${value})"
     return $?
   fi
   if value="$(safe_gate_project_lane_paths_reason "${frozen_json}" "${project_dir}")"; then

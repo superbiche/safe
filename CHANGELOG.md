@@ -12,6 +12,13 @@
   with device and inode; no reason). `dedupe` and `prune` go to the older differential path on both routes (an established shape no
   longer refuses them). A hand-over returns through the same non-zero path as a refusal. Agent contract: a new allow flow, the
   agent rule and exit codes 100 and 102 name the confirmation and the standing command.
+  Review round: the pin is read and written only by `safe-core one-shot-store` (verified directories, one descriptor for check and read,
+  a lock over each change, announced and logged after the commit) and is honoured only for the project npm will operate on (the gate's
+  own reading of npm's arguments, a workspace root above, a lost manifest, workspace or global mode set anywhere); `safe run
+  one-shot-project` does no generic initialisation, asks on the terminal and answers a failed read with 102; a lockfile key outside the
+  tree and the lane's other safety checks are never confirmable; the dry run is read from the parsed values and every effective-
+  configuration document; the consequence the operator reads is that of the actual input; the refusal line names the standing option
+  in words, not as a command; the structural lint reads shell commands and keeps its known mutations as fixtures.
 - Project lane (still behind `install.project_lane`): the operator's terminal. At the operator's terminal only (today's
   predicate: a terminal on stdin and no recognized agent marker; an agent session is never prompted and ends as it does
   unattended, and a dry run is never prompted), each class the decision leaves at stake and the lane goes on with is resolved on
