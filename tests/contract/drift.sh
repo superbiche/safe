@@ -394,7 +394,7 @@ case_npm_option_snapshot_is_consistent_and_reads_like_nopt() {
   # names sorted and unique, letters from the known set
   for pair in "${SAFE_GATE_NPM_OPTIONS[@]}"; do
     key="${pair%%=*}"; letters="${pair#*=}"
-    [[ "${letters}" =~ ^(-|[ABSNTY]+)$ ]] || bad="${bad} ${key}(letters:${letters})"
+    [[ "${letters}" =~ ^(-|[ABSNTY]+(:[A-Za-z0-9_.,-]*)?)$ ]] || bad="${bad} ${key}(letters:${letters})"
     [[ -z "${prev}" || "${prev}" < "${key}" ]] || bad="${bad} ${key}(order)"
     prev="${key}"
   done

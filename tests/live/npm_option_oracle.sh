@@ -107,14 +107,18 @@ else
     source <(node "$ROOT/scripts/npm-option-snapshot.cjs" "$npm_dir")
     SAFE_GATE_NOPT_LOADED=""
     US=$'\x1f'; n=0; bad=0; shown=0
-    while IFS=$'\x1e' read -r argsline remain global command pkgopt; do
-      IFS="$US" read -r -a args <<<"$argsline"
+    # shellcheck source=tests/lib/npm-option-corpus.sh
+    source "$ROOT/tests/lib/npm-option-corpus.sh"
+    n=0; bad=0; shown=0
+    while IFS=$'\t' read -r f_args f_remain f_global f_command f_pkgopt f_call; do
+      npm_corpus_list "$f_args" args
+      npm_corpus_list "$f_remain" want
       safe_gate_nopt_parse "${args[@]}"
-      got="$(IFS="$US"; printf '%s' "${SAFE_GATE_NOPT_REMAIN[*]-}")"
       n=$((n + 1))
-      if [[ "$got" != "$remain" || "$SAFE_GATE_NOPT_GLOBAL" != "$global" ]]; then
+      got="$(printf '%s\x1f' "${SAFE_GATE_NOPT_REMAIN[@]}")"; wantj="$(printf '%s\x1f' "${want[@]}")"
+      if [[ "$got" != "$wantj" || "$SAFE_GATE_NOPT_GLOBAL" != "$f_global" ]]; then
         bad=$((bad + 1))
-        (( shown++ < 10 )) && printf 'DIFF %s\n' "${argsline//$US/ }"
+        (( shown++ < 10 )) && printf 'DIFF %s\n' "${f_args}"
       fi
     done < "$WORK/corpus"
     printf 'reading: %d cases, %d differ\n' "$n" "$bad"
@@ -129,7 +133,8 @@ fi
 
 # --- 3. the gate ----------------------------------------------------------------------------
 if [[ "${SAFE_ORACLE_GATE:-0}" == 1 ]]; then
-  bash "$ROOT/tests/lib/npm-option-gate-oracle.sh" --show 100000 < "$WORK/corpus" > "$WORK/gate.out" 2>&1
+  bash "$ROOT/tests/lib/npm-option-gate-oracle.sh" --show 100000 --expect "$corpus_size" < "$WORK/corpus" > "$WORK/gate.out" 2>&1
+  gate_rc=$?
   tail -n 6 "$WORK/gate.out" | sed 's/^/# /'
   known="$ROOT/tests/live/npm_option_oracle.known"
   unknown=0
@@ -142,10 +147,13 @@ if [[ "${SAFE_ORACLE_GATE:-0}" == 1 ]]; then
     done < "$known"
     (( hit )) || { unknown=$((unknown + 1)); (( unknown <= 15 )) && printf '# unlisted: %s\n' "$line"; }
   done < "$WORK/gate.out"
-  if (( unknown == 0 )); then
-    pass "for every command line of the corpus the gate refuses or agrees with npm on the command, the packages it audits and the global mode (known residual disagreements aside, tests/live/npm_option_oracle.known)"
+  # the helper's own failure (an incomplete run, a harness error, a disagreement) fails the suite even when no line is read
+  if (( gate_rc == 2 )) || ! grep -q '^oracle: [0-9]* cases' "$WORK/gate.out"; then
+    fail "the gate-level oracle did not complete (status $gate_rc)"
+  elif (( unknown == 0 && (gate_rc == 0 || $(grep -c '^DISAGREE' "$WORK/gate.out") > 0) )); then
+    pass "for every command line of the corpus the gate refuses or agrees with npm on the command, the packages it audits (name and version), the delegation, the project scan and the global mode (known residual disagreements aside, tests/live/npm_option_oracle.known)"
   else
-    fail "$unknown disagreement(s) between the gate's reading and npm's that are not listed"
+    fail "$unknown disagreement(s) between the gate's reading and npm's that are not listed (helper status $gate_rc)"
   fi
 else
   printf '# the gate-level oracle is slow: SAFE_ORACLE_GATE=1 runs it\n'

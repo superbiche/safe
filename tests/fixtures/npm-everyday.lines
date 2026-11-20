@@ -1,0 +1,50 @@
+install okpkg
+install -D okpkg
+i --save-dev okpkg
+add --save-exact okpkg
+install -g okpkg
+install --legacy-peer-deps okpkg
+install --no-audit --no-fund okpkg
+install --prefer-offline okpkg
+install --omit=dev okpkg
+install --registry=https://registry.npmjs.org/ okpkg
+--loglevel=error install okpkg
+install --loglevel=error okpkg
+install okpkg --loglevel=error
+install --prefix=dir okpkg
+install --cache=dir okpkg
+install --tag=next okpkg
+install --before=2026-01-01 okpkg
+install --install-strategy=nested okpkg
+install --cpu=x64 okpkg
+install --os=linux okpkg
+install --save-exact=true okpkg
+install --include=dev okpkg
+install -S okpkg
+install
+ci
+ci --omit=dev
+update
+update okpkg
+exec --yes cowsay
+x cowsay
+exec --package=cowsay -- cowsay hi
+exec -c "cowsay hi"
+exec --yes --package=cowsay@1.6.0 -- cowsay
+run build --silent
+run test -- --watch=false
+run build --mode=production
+run build --if-present
+view okpkg --json
+view okpkg version
+publish --access=public
+version patch --message="chore: %s"
+--version
+--help
+ls --depth=0
+outdated --json
+audit --audit-level=high
+config set registry=https://registry.npmjs.org/
+uninstall okpkg
+install --color=always okpkg
+--color=always install okpkg

@@ -23,6 +23,16 @@
   environment, `npm_config_<name>=<value>`, and the route's refusal of an unknown space-form flag says so for
   npm). A shorthand cluster that leaves a word over or gives one option another's flag as its value (`npm
   install -Cq evil` also installs a package named `warn`) is refused at the front door.
+  Second review round: the front door reads the vector whenever an argument before the terminator starts with a
+  dash; an option name is known only when exact, abbreviations and unknown names are read both ways (every
+  combination up to four); literal values (`--color=always`) are read in nopt's order; a package selector or call
+  string before the `exec` verb, a value of an interpreted option (`location`, `global`, `package`, `call`,
+  `prefix`, `registry`, `workspace`) that is empty, padded, unlisted or missing, two disagreeing settings of
+  global mode, a line break or padding in a package argument and a lone `-` all refuse. No refusal prints a
+  value, every refusal is one line and its way out works. `safe install --host --manager npm` is covered by the
+  gate's reading after its own extraction. The differential oracle now compares exact identities, the
+  delegation, the scan decision and global mode, can fail (self-test), and fails when it evaluated fewer cases
+  than it was given.
 - Project lane: `npm ci`, `npm dedupe` and `npm prune` (still behind `install.project_lane`). `ci` has no
   projection: its plan is the lockfile on disk, checked against the manifest by npm's own frozen check (`npm
   ci --dry-run`; a lockfile out of step or missing is npm's own error, shown as npm's, with npm's status),

@@ -12531,15 +12531,16 @@ case_npm_front_door_reads_an_unknown_option_both_ways() {
   pass "$FUNCNAME"
 }
 
-# With no `=` form the front door costs nothing and changes nothing.
+# With no option in the vector the front door costs nothing and changes nothing; with one it reads the vector as npm does.
 case_npm_front_door_is_free_without_an_equals_form() {
   prepare_case "npm-front-door-free"
   local out
-  out="$(bash -c 'source "$1/lib/gate-lib.sh"; safe_gate_nopt_load_called=0; safe_gate_nopt_load() { echo LOADED; }; safe_gate_npm_front_door install --save-dev -g blockme -- --json=x; echo "rc=$?"' _ "${ROOT_DIR}" 2>&1)"
+  out="$(bash -c 'source "$1/lib/gate-lib.sh"; safe_gate_nopt_load() { echo LOADED; }; safe_gate_npm_front_door install blockme okpkg@1.0.0 -- --json=x; echo "rc=$?"' _ "${ROOT_DIR}" 2>&1)"
   [[ "${out}" == "rc=0" ]] || { fail "$FUNCNAME: the option tables were read or the command was refused (${out})"; return; }
+  out="$(bash -c 'source "$1/lib/gate-lib.sh"; safe_gate_nopt_load() { echo LOADED; }; safe_gate_nopt_parse() { echo READ; SAFE_GATE_NOPT_LOOSE=(); SAFE_GATE_NOPT_CLUSTER=(); SAFE_GATE_NOPT_NEGATED=(); SAFE_GATE_NOPT_UNSTABLE=(); SAFE_GATE_NOPT_UNKNOWN=(); }; for a in --save-dev -g --Cq -x; do safe_gate_npm_front_door install "$a" blockme; done' _ "${ROOT_DIR}" 2>&1 | tr '\n' ' ')"
+  [[ "${out}" == "READ READ READ READ " ]] || { fail "$FUNCNAME: an argument that starts with a dash did not make the front door read the vector (${out})"; return; }
   pass "$FUNCNAME"
 }
-
 
 # The same front door under the audit-only pass of `mise exec -- npm …`, and for npm exec's own spellings.
 case_npm_front_door_covers_mise_exec_and_the_exec_switches() {
@@ -12562,7 +12563,7 @@ case_npm_front_door_covers_mise_exec_and_the_exec_switches() {
   SAFE_INSTALL_TEST_SCRIPT='npm exec --quiet true' run_zsh
   assert_status 0 "$FUNCNAME: quiet" || return
   # options npm does not define (pnpm's and bun's) are switches there: the next word is a package
-  for script in 'npm install --filter blockme' 'npm install --cwd blockme' 'npm install --@scope:registry blockme'; do
+  for script in 'npm install --filter blockme' 'npm install --@scope:registry blockme'; do
     : > "${LOG_FILE}"
     SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
     assert_status 104 "$FUNCNAME: ${script}" || return
@@ -12590,7 +12591,7 @@ case_npm_exec_package_then_terminator_fails_closed() {
   # package `true`: the gate does not take the terminator for the package to audit.
   SAFE_INSTALL_TEST_SCRIPT='npm exec --package -- blockme' run_zsh
   assert_status 100 "$FUNCNAME" || return
-  assert_err_contains_fragment 'is the option terminator, not a package' "$FUNCNAME" || return
+  assert_err_contains_fragment 'is empty, padded with white space, missing' "$FUNCNAME" || return
   ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: npm was delegated to"; return; }
   pass "$FUNCNAME"
 }
@@ -12602,7 +12603,7 @@ case_npm_front_door_way_out_is_the_environment_for_an_unknown_name() {
   # the refusal names the way out
   SAFE_INSTALL_TEST_SCRIPT='npm install --my-setting=1.2.3 blockme' run_zsh
   assert_status 100 "$FUNCNAME: refusal" || return
-  assert_err_contains_fragment 'npm_config_my_setting=1.2.3 npm' "$FUNCNAME: refusal" || return
+  assert_err_contains_fragment 'npm_config_my_setting=<value> npm' "$FUNCNAME: refusal" || return
   # ... and it works: the environment variable does not make the gate refuse or mis-handle the command
   npm_config_my_setting=1.2.3 SAFE_INSTALL_TEST_SCRIPT='npm install -g blockme' run_zsh
   assert_status 104 "$FUNCNAME: audited" || return
@@ -12620,12 +12621,17 @@ case_npm_front_door_way_out_is_the_environment_for_an_unknown_name() {
   assert_status 100 "$FUNCNAME: unknown flag" || return
   assert_err_contains_fragment 'npm_config_my_setting=<value> npm' "$FUNCNAME: unknown flag" || return
   assert_err_not_contains_fragment "rewrite it as" "$FUNCNAME: unknown flag" || return
-  # ... and the `=` form for a name npm defines, which works
+  # a name npm defines is read by the gate as npm reads it, in the space form or the `=` form
   SAFE_INSTALL_TEST_SCRIPT='npm --fetch-retries 3 install blockme' run_zsh
-  assert_status 100 "$FUNCNAME: known flag" || return
-  assert_err_contains_fragment "rewrite it as '--fetch-retries=<value>'" "$FUNCNAME: known flag" || return
+  assert_status 104 "$FUNCNAME: known flag, space form" || return
   SAFE_INSTALL_TEST_SCRIPT='npm --fetch-retries=3 install blockme' run_zsh
-  assert_status 104 "$FUNCNAME: the known flag's = form" || return
+  assert_status 104 "$FUNCNAME: known flag, = form" || return
+  # an abbreviation is not a name the gate knows: the way out is the full name
+  SAFE_INSTALL_TEST_SCRIPT='npm --fetch-retri 3 install blockme' run_zsh
+  assert_status 100 "$FUNCNAME: abbreviated flag" || return
+  assert_err_contains_fragment 'write the full option name npm defines' "$FUNCNAME: abbreviated flag" || return
+  SAFE_INSTALL_TEST_SCRIPT='npm --fetch-retries 3 install blockme' run_zsh
+  assert_status 104 "$FUNCNAME: full name" || return
   # the other tools' text is as it was
   SAFE_INSTALL_TEST_SCRIPT='pip --my-setting install blockme' run_zsh
   assert_err_contains_fragment "rewrite it as '--my-setting=<value>'" "$FUNCNAME: pip" || return
@@ -12638,65 +12644,13 @@ case_npm_front_door_way_out_is_the_environment_for_an_unknown_name() {
 # The gate's effects are stubbed the way the option oracle stubs them (tests/lib/npm-option-gate-oracle.sh).
 case_npm_everyday_commands_are_unchanged_by_the_front_door() {
   prepare_case "npm-everyday-unchanged"
-  local base_ref="${SAFE_TEST_BASE_REF:-origin/main}" base_lib="${CASE_DIR}/base-gate-lib.sh"
-  if ! git -C "${ROOT_DIR}" show "${base_ref}:lib/gate-lib.sh" > "${base_lib}" 2>/dev/null || [[ ! -s "${base_lib}" ]]; then
-    printf '# %s: no %s to compare with; skipped\n' "$FUNCNAME" "${base_ref}"
-    pass "$FUNCNAME"
-    return
-  fi
-  local lines="${CASE_DIR}/everyday.lines" runner="${CASE_DIR}/everyday-runner.sh" project="${CASE_DIR}/everyday-project"
-  mkdir -p "${project}"
+  # The lines and their outcomes are RECORDED (tests/fixtures/npm-everyday.{lines,expected}): the outcome of each line is
+  # what the gate did with it before the front door existed, apart from the one difference documented below. The
+  # recording does not depend on any git ref, so it holds after the change is merged.
+  local lines="${ROOT_DIR}/tests/fixtures/npm-everyday.lines" expected="${ROOT_DIR}/tests/fixtures/npm-everyday.expected"
+  local runner="${CASE_DIR}/everyday-runner.sh" project="${CASE_DIR}/everyday-project" new_out="${CASE_DIR}/everyday-new.out" count
+  mkdir -p "${project}" "${CASE_DIR}/everyday-home-b"
   printf '{"name":"everyday","version":"1.0.0"}\n' > "${project}/package.json"
-  cat > "${lines}" <<'LINES'
-install okpkg
-install -D okpkg
-i --save-dev okpkg
-add --save-exact okpkg
-install -g okpkg
-install --legacy-peer-deps okpkg
-install --no-audit --no-fund okpkg
-install --prefer-offline okpkg
-install --omit=dev okpkg
-install --registry=https://registry.npmjs.org/ okpkg
---loglevel=error install okpkg
-install --loglevel=error okpkg
-install okpkg --loglevel=error
-install --prefix=dir okpkg
-install --cache=dir okpkg
-install --tag=next okpkg
-install --before=2026-01-01 okpkg
-install --install-strategy=nested okpkg
-install --cpu=x64 okpkg
-install --os=linux okpkg
-install --save-exact=true okpkg
-install --include=dev okpkg
-install -S okpkg
-install
-ci
-ci --omit=dev
-update
-update okpkg
-exec --yes cowsay
-x cowsay
-exec --package=cowsay -- cowsay hi
-exec -c "cowsay hi"
-exec --yes --package=cowsay@1.6.0 -- cowsay
-run build --silent
-run test -- --watch=false
-run build --mode=production
-run build --if-present
-view okpkg --json
-view okpkg version
-publish --access=public
-version patch --message="chore: %s"
---version
---help
-ls --depth=0
-outdated --json
-audit --audit-level=high
-config set registry=https://registry.npmjs.org/
-uninstall okpkg
-LINES
   cat > "${runner}" <<'RUNNER'
 #!/usr/bin/env bash
 # $1 the gate library, stdin the command lines
@@ -12721,25 +12675,235 @@ while IFS= read -r line; do
   printf '%s => rc=%s | %s\n' "${line}" "$?" "$(tr '\n' ';' < "${REC}")"
 done
 RUNNER
-  local base_out="${CASE_DIR}/everyday-base.out" new_out="${CASE_DIR}/everyday-new.out" count
-  mkdir -p "${CASE_DIR}/everyday-home-a" "${CASE_DIR}/everyday-home-b"
-  bash "${runner}" "${base_lib}" "${project}" "${CASE_DIR}/everyday-home-a" < "${lines}" > "${base_out}" 2>&1
   bash "${runner}" "${ROOT_DIR}/lib/gate-lib.sh" "${project}" "${CASE_DIR}/everyday-home-b" < "${lines}" > "${new_out}" 2>&1
   count="$(wc -l < "${lines}")"
   (( count >= 30 )) || { fail "$FUNCNAME: only ${count} lines"; return; }
-  [[ "$(wc -l < "${base_out}")" == "${count}" ]] || { fail "$FUNCNAME: the base gate did not read every line ($(head -n 3 "${base_out}"))"; return; }
-  if ! diff -u "${base_out}" "${new_out}" >&2; then
-    fail "$FUNCNAME: a line reads differently through this gate than through ${base_ref}"
+  [[ "$(wc -l < "${new_out}")" == "${count}" ]] || { fail "$FUNCNAME: the gate did not read every line ($(head -n 3 "${new_out}"))"; return; }
+  if ! diff -u "${expected}" "${new_out}" >&2; then
+    fail "$FUNCNAME: a line has another outcome than the recorded one"
     return
   fi
-  printf '# %s: %s command lines, the same through both gates\n' "$FUNCNAME" "${count}"
+  printf '# %s: %s command lines, the recorded outcomes\n' "$FUNCNAME" "${count}"
   # The one difference this change makes to an everyday line: a shorthand cluster that contains -g is a global install
-  # for npm (nopt expands -gD to --global --save-dev), and so for the gate (it used to take it for a project install).
+  # for npm (nopt expands -gD to --global --save-dev), and so for the gate (it used to take it for a project install,
+  # with the project scan).
   printf 'install -gD okpkg\n' > "${CASE_DIR}/everyday-cluster.lines"
-  bash "${runner}" "${base_lib}" "${project}" "${CASE_DIR}/everyday-home-a" < "${CASE_DIR}/everyday-cluster.lines" > "${base_out}" 2>&1
   bash "${runner}" "${ROOT_DIR}/lib/gate-lib.sh" "${project}" "${CASE_DIR}/everyday-home-b" < "${CASE_DIR}/everyday-cluster.lines" > "${new_out}" 2>&1
-  grep -q 'SCAN;AUDIT okpkg;DELEGATE' "${base_out}" && grep -q 'rc=0 | AUDIT okpkg;DELEGATE npm install -gD okpkg;' "${new_out}" \
-    || { cat "${base_out}" "${new_out}" >&2; fail "$FUNCNAME: -gD is not read as a global install"; return; }
+  grep -q 'rc=0 | AUDIT okpkg;DELEGATE npm install -gD okpkg;' "${new_out}" \
+    || { cat "${new_out}" >&2; fail "$FUNCNAME: -gD is not read as a global install"; return; }
+  # optional: against another gate library (SAFE_TEST_BASE_REF names a git ref), the same lines read the same
+  if [[ -n "${SAFE_TEST_BASE_REF:-}" ]] && git -C "${ROOT_DIR}" show "${SAFE_TEST_BASE_REF}:lib/gate-lib.sh" > "${CASE_DIR}/base-gate-lib.sh" 2>/dev/null; then
+    mkdir -p "${CASE_DIR}/everyday-home-a"
+    bash "${runner}" "${CASE_DIR}/base-gate-lib.sh" "${project}" "${CASE_DIR}/everyday-home-a" < "${lines}" > "${CASE_DIR}/everyday-base.out" 2>&1
+    diff -u "${CASE_DIR}/everyday-base.out" "${expected}" >&2 || { fail "$FUNCNAME: the recorded outcomes differ from ${SAFE_TEST_BASE_REF}'s"; return; }
+  fi
+  pass "$FUNCNAME"
+}
+
+
+# The arguments the gate's extractors and npm read differently are refused (no value printed, one line, a way out).
+case_npm_argument_hygiene_refuses_what_extractors_and_npm_read_differently() {
+  prepare_case "npm-argument-hygiene"
+  local script
+  for script in "npm install \$'blockme\nokpkg'" "npm install \$'blockme\r'" "npm install ' blockme'" "npm install 'blockme '" "npm install -- ' blockme'" 'npm install -' \
+      'npm install blockme -' "npm exec \$'cowsay\n'" "npm exec ' cowsay'"; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 100 "$FUNCNAME: ${script}" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { fail "$FUNCNAME: ${script}: not one line"; return; }
+    assert_err_contains_fragment 'to allow:' "$FUNCNAME: ${script}" || return
+    ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: npm was delegated to"; return; }
+  done
+  # the way out works: one clean package per argument
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm install blockme okpkg' run_zsh
+  assert_status 104 "$FUNCNAME: the way out" || return
+  # arguments after the exec terminator are the command's own, and an operand with inner white space is fine
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT="npm exec cowsay -- ' padded ' x" run_zsh
+  assert_status 0 "$FUNCNAME: after the terminator" || return
+  pass "$FUNCNAME"
+}
+
+# The oracle can fail: its judge reports a wrong observation of each kind (a gate that agreed with everything would pass
+# any corpus), and the helper fails when it did not evaluate every case.
+case_npm_option_oracle_can_fail() {
+  prepare_case "npm-option-oracle-can-fail"
+  bash "${ROOT_DIR}/tests/lib/npm-option-gate-oracle.sh" --selftest > "${CASE_DIR}/selftest.out" 2>&1 \
+    || { cat "${CASE_DIR}/selftest.out" >&2; fail "$FUNCNAME: the self-test failed"; return; }
+  # two real cases: one the gate refuses, one it lets through; --expect a third that is not in the corpus
+  local corpus="${CASE_DIR}/corpus.tsv"
+  printf 'install,blockme\tinstall,blockme\t0\tinstall\t%%\t0\n' > "${corpus}"
+  bash "${ROOT_DIR}/tests/lib/npm-option-gate-oracle.sh" --expect 1 < "${corpus}" > "${CASE_DIR}/ok.out" 2>&1 \
+    || { cat "${CASE_DIR}/ok.out" >&2; fail "$FUNCNAME: a one-case corpus did not pass"; return; }
+  if bash "${ROOT_DIR}/tests/lib/npm-option-gate-oracle.sh" --expect 2 < "${corpus}" > "${CASE_DIR}/short.out" 2>&1; then
+    fail "$FUNCNAME: an incomplete run passed"; return
+  fi
+  grep -q 'INCOMPLETE' "${CASE_DIR}/short.out" || { fail "$FUNCNAME: the incomplete run did not say so"; return; }
+  if bash "${ROOT_DIR}/tests/lib/npm-option-gate-oracle.sh" < /dev/null > "${CASE_DIR}/empty.out" 2>&1; then
+    fail "$FUNCNAME: an empty corpus passed"; return
+  fi
+  pass "$FUNCNAME"
+}
+
+# ---- second review of the front door (ticket 1675) ---------------------------------------------------------
+
+# An exec selector written before the verb is outside what the audit reads: it refuses, with the way out.
+case_npm_exec_selector_before_the_verb_refuses() {
+  prepare_case "npm-exec-selector-before-verb"
+  local script
+  for script in 'npm --package=blockme exec cowsay' 'npm --package=blockme x cowsay' 'npm --package blockme exec cowsay' 'npm -c cowsay exec' \
+      "npm --call='cowsay hi' x" 'npm --package=okpkg exec --package=blockme cowsay' 'npm --package=okpkg exec cowsay --package=blockme' 'npm --package=blockme exec -- cowsay'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 100 "$FUNCNAME: ${script}" || return
+    assert_err_contains_fragment 'before the verb' "$FUNCNAME: ${script}" || return
+    assert_err_contains_fragment 'write it after the verb' "$FUNCNAME: ${script}" || return
+    ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: npm was delegated to"; return; }
+  done
+  # after the verb the selectors are audited, as before; a call string with no positional package names no package
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm exec --package=blockme cowsay' run_zsh
+  assert_status 104 "$FUNCNAME: after the verb" || return
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT="npm exec -c 'echo hi'" run_zsh
+  assert_status 0 "$FUNCNAME: call string only" || return
+  pass "$FUNCNAME"
+}
+
+# Values npm trims, drops or replaces are not read: global mode (and the options the gate interprets) must be exact.
+case_npm_front_door_refuses_values_npm_cleans_up() {
+  prepare_case "npm-front-door-cleans-up"
+  local script
+  # npm trims the padded value (global); the gate used to read project mode
+  for script in "npm install '--location= global ' blockme" "npm install '--location=global ' blockme" 'npm install --location=global --location blockme' \
+      'npm install --location=bogus blockme' 'npm install --location= blockme' 'npm install blockme --location' 'npm install --registry= blockme' \
+      "npm install '--prefix= dir' blockme" 'npm install blockme --prefix' 'npm install -g --no-global blockme' 'npm install --location=global --location=project blockme' \
+      'npm install --global --location=user blockme' 'npm exec --package= cowsay' "npm exec '--call= hi'"; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 100 "$FUNCNAME: ${script}" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { fail "$FUNCNAME: ${script}: not one line"; return; }
+    ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: npm was delegated to"; return; }
+    ! grep -q $'^AUDIT\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: something was audited under a reading npm does not share"; return; }
+  done
+  # exact values, both directions of the scan decision: global skips the project scan, project does not
+  printf '{"name":"scan-decision","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm install --location=global blockme' run_zsh
+  assert_status 104 "$FUNCNAME: exact global" || return
+  ! grep -q 'repo-audit' "${LOG_FILE}" || { fail "$FUNCNAME: --location=global ran the project scan"; return; }
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm install --location=project okpkg' run_zsh
+  assert_status 0 "$FUNCNAME: exact project" || return
+  grep -q 'repo-audit' "${LOG_FILE}" || { fail "$FUNCNAME: --location=project did not run the project scan"; return; }
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm install --global --location=global --global=true blockme' run_zsh
+  assert_status 104 "$FUNCNAME: the same mode three times" || return
+  pass "$FUNCNAME"
+}
+
+# nopt's literal values of a mixed type: `--color=always` is the option's.
+case_npm_front_door_reads_literal_values_of_mixed_types() {
+  prepare_case "npm-front-door-literals"
+  local script
+  for script in 'npm --color=always install blockme' 'npm --color always install blockme' 'npm install --color=always blockme' 'npm install blockme --color=always' \
+      'npm --color install blockme' 'npm install --no-color blockme' 'npm install --color=false blockme'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 104 "$FUNCNAME: ${script}" || return
+    grep -q $'^AUDIT\tpackage-audit\tblockme\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: blockme was not audited"; return; }
+  done
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm --color=always prefix' run_zsh
+  assert_status 0 "$FUNCNAME: prefix" || return
+  assert_log_contains $'REAL\tnpm\t--color=always\tprefix' "$FUNCNAME: prefix" || return
+  # a value that is not one of the literals is still loose
+  SAFE_INSTALL_TEST_SCRIPT='npm --color=blockme prefix' run_zsh
+  assert_status 100 "$FUNCNAME: not a literal" || return
+  pass "$FUNCNAME"
+}
+
+# Every way out a refusal prints works when followed literally: the advised command passes the front door and the route.
+case_npm_front_door_every_way_out_works() {
+  prepare_case "npm-front-door-ways-out"
+  local pair refused advised status
+  while IFS='|' read -r status refused advised; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${refused}" run_zsh
+    assert_status 100 "$FUNCNAME: refused: ${refused}" || return
+    ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${refused}: delegated"; return; }
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${advised}" run_zsh
+    assert_status "${status}" "$FUNCNAME: the advised command: ${advised}" || return
+  done <<'WAYS'
+104|npm --json=install blockme|npm --json install blockme
+0|npm --color=blockme prefix|npm --color prefix
+104|npm --audit=install blockme|npm --audit install blockme
+104|npm exec --no-package=blockme cowsay|npm exec --package=blockme cowsay
+104|npm install -Cq blockme|npm install -C . -q blockme
+104|npm install --location= blockme|npm install --location=global blockme
+104|npm --package=blockme exec cowsay|npm exec --package=blockme cowsay
+104|npm exec --package -- blockme|npm exec --package=blockme -- cowsay
+104|npm --editor=vi --edi=vi install blockme|npm --editor=vi install blockme
+104|npm install --zzzone=1 blockme|npm_config_zzzone=1 npm install blockme
+104|npm install -g --no-global blockme|npm install --global blockme
+WAYS
+  pass "$FUNCNAME"
+}
+
+# A refusal prints no value (a placeholder stands for it), cleans every occurrence of the option's name, and is one line.
+case_npm_front_door_refusals_print_no_value_and_one_line() {
+  prepare_case "npm-front-door-no-value"
+  local script
+  for script in 'npm --review-token=PUBLIC_FIXTURE install blockme' "npm '--my-setting=two words' install blockme" 'npm --json=PUBLIC_FIXTURE install blockme' \
+      'npm install --no-package=PUBLIC_FIXTURE blockme' "npm install '--location=PUBLIC FIXTURE' blockme" 'npm --edi=PUBLIC_FIXTURE install blockme' \
+      'npm --PUBLIC_FIXTURE install blockme'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 100 "$FUNCNAME: ${script}" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { fail "$FUNCNAME: ${script}: not one line"; return; }
+    case "${script}" in
+      *--PUBLIC_FIXTURE*) ;;
+      *) ! grep -q 'PUBLIC.FIXTURE\|two words' "${ERR_FILE}" || { fail "$FUNCNAME: ${script}: a value was printed ($(cat "${ERR_FILE}"))"; return; } ;;
+    esac
+  done
+  # a newline (or any control character) in an option's name does not make a second line
+  local out
+  out="$(bash -c 'source "$1/lib/gate-lib.sh"; for a in $'"'"'--a\\nb=1'"'"' $'"'"'--c\\td\\n=1'"'"' $'"'"'--e\\033[31mf=1'"'"'; do safe_gate_npm_front_door "$a" install blockme; safe_gate_route npm "${a%%=*}" install blockme; done' _ "${ROOT_DIR}" 2>&1 | wc -l)"
+  (( out <= 6 )) || { fail "$FUNCNAME: a control character in an option name made extra lines (${out})"; return; }
+  out="$(bash -c 'source "$1/lib/gate-lib.sh"; safe_gate_npm_front_door $'"'"'--a\\nb=1'"'"' install blockme 2>&1 | wc -l' _ "${ROOT_DIR}")"
+  [[ "${out}" == 1 ]] || { fail "$FUNCNAME: a newline in the option name: ${out} lines"; return; }
+  pass "$FUNCNAME"
+}
+
+# Abbreviated names are read both ways like unknown ones, in every combination of readings, up to four options.
+case_npm_front_door_reads_abbreviations_and_combinations() {
+  prepare_case "npm-front-door-abbrev"
+  local script
+  # --edi is npm 11's way to --editor; versions disagree, so it is read both ways: refused before a gated command, fine before an ungated one
+  SAFE_INSTALL_TEST_SCRIPT='npm --edi=vi install blockme' run_zsh
+  assert_status 100 "$FUNCNAME: abbreviation, gated" || return
+  assert_err_contains_fragment 'write the full option name' "$FUNCNAME: abbreviation, gated" || return
+  assert_err_not_contains_fragment 'npm_config_' "$FUNCNAME: abbreviation, gated" || return
+  SAFE_INSTALL_TEST_SCRIPT='npm prefix --edi=vi' run_zsh
+  assert_status 0 "$FUNCNAME: abbreviation, ungated, after the verb" || return
+  # before the verb the readings put different words in the command position
+  SAFE_INSTALL_TEST_SCRIPT='npm --edi=vi prefix' run_zsh
+  assert_status 100 "$FUNCNAME: abbreviation, before the verb" || return
+  SAFE_INSTALL_TEST_SCRIPT='npm --editor=vi install blockme' run_zsh
+  assert_status 104 "$FUNCNAME: full name" || return
+  # a mixed combination of readings is tried: all-consumed and all-split give `prefix`, one of each gives `install`
+  SAFE_INSTALL_TEST_SCRIPT='npm --zzza=prefix --zzzb=install prefix' run_zsh
+  assert_status 100 "$FUNCNAME: mixed combination" || return
+  # more than four such options refuse
+  SAFE_INSTALL_TEST_SCRIPT='npm --zzza=1 --zzzb=2 --zzzc=3 --zzzd=4 --zzze=5 prefix' run_zsh
+  assert_status 100 "$FUNCNAME: five unknown options" || return
+  assert_err_contains_fragment 'too many to read both ways' "$FUNCNAME: five unknown options" || return
+  SAFE_INSTALL_TEST_SCRIPT='npm prefix --zzza=1 --zzzb=2 --zzzc=3 --zzzd=4' run_zsh
+  assert_status 0 "$FUNCNAME: four unknown options, ungated" || return
+  SAFE_INSTALL_TEST_SCRIPT='npm prefix --zzza=1 --zzzb=2 --zzzc=3 --zzzd=4 --zzze=5' run_zsh
+  assert_status 100 "$FUNCNAME: five unknown options, ungated" || return
   pass "$FUNCNAME"
 }
 
@@ -12757,6 +12921,14 @@ main() {
     case_npm_exec_package_then_terminator_fails_closed \
     case_npm_front_door_way_out_is_the_environment_for_an_unknown_name \
     case_npm_everyday_commands_are_unchanged_by_the_front_door \
+    case_npm_exec_selector_before_the_verb_refuses \
+    case_npm_front_door_refuses_values_npm_cleans_up \
+    case_npm_front_door_reads_literal_values_of_mixed_types \
+    case_npm_front_door_every_way_out_works \
+    case_npm_front_door_refusals_print_no_value_and_one_line \
+    case_npm_front_door_reads_abbreviations_and_combinations \
+    case_npm_argument_hygiene_refuses_what_extractors_and_npm_read_differently \
+    case_npm_option_oracle_can_fail \
     case_refusal_message_contract \
     case_large_pinned_install_and_socket_rate_nontty \
     case_infra_only_warn_no_host_allow_and_needs_a_tty \
