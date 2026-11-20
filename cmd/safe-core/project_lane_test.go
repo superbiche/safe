@@ -359,17 +359,17 @@ func TestProjectDecideReadsTheSocketEvidence(t *testing.T) {
 		}
 		return path
 	}
-	adverse := write("adverse.json", `{"schema_version":1,"roots":[{"name":"p","version":"1.0.0","outcome":"adverse","gate_exit":10,"line":"WARN (score=40)","causes":["socket_low_score"],"cached":false}],"cached_blocks":[],"cache_gap":""}`)
+	adverse := write("adverse.json", `{"schema_version":1,"roots":[{"name":"p","version":"1.0.0","outcome":"adverse","gate_exit":10,"line":"WARN (score=40)","causes":["socket_low_score"],"cached":false}],"cached_blocks":[],"cache_gap":"","untied":[]}`)
 	code, stdout, stderr := runLane("project-decide", "--no-baseline", "--evidence", evidence, "--socket", adverse, after)
 	if code != 100 || !strings.Contains(stdout, `"class":"socket_root"`) {
 		t.Fatalf("adverse: code = %d, stdout = %s, stderr = %s", code, stdout, stderr)
 	}
-	blocked := write("blocked.json", `{"schema_version":1,"roots":[],"cached_blocks":[{"name":"p","version":"1.0.0","line":"BLOCK (critical supply-chain-risk alert)"}],"cache_gap":""}`)
+	blocked := write("blocked.json", `{"schema_version":1,"roots":[],"cached_blocks":[{"name":"p","version":"1.0.0","line":"BLOCK (critical supply-chain-risk alert)"}],"cache_gap":"","untied":[]}`)
 	code, stdout, _ = runLane("project-decide", "--no-baseline", "--evidence", evidence, "--socket", blocked, after)
 	if code != 104 || !strings.Contains(stdout, `"signal":"socket_block"`) {
 		t.Fatalf("cached block: code = %d, stdout = %s", code, stdout)
 	}
-	bad := write("bad.json", `{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":"","extra":1}`)
+	bad := write("bad.json", `{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":"","untied":[],"extra":1}`)
 	if code, _, _ = runLane("project-decide", "--no-baseline", "--evidence", evidence, "--socket", bad, after); code != 3 {
 		t.Fatalf("a document with an unknown member: code = %d, want 3", code)
 	}

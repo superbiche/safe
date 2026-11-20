@@ -20,7 +20,7 @@ func sroot(name, version, outcome string) SocketRoot {
 }
 
 func socketOf(roots ...SocketRoot) *SocketEvidence {
-	return &SocketEvidence{SchemaVersion: SocketSchema, Roots: roots, CachedBlocks: []SocketBlock{}}
+	return &SocketEvidence{SchemaVersion: SocketSchema, Roots: roots, CachedBlocks: []SocketBlock{}, Untied: []SocketUntied{}}
 }
 
 func decideSocket(t *testing.T, baseline, target map[string]map[string]any, sock *SocketEvidence, ev Evidence) Report {
@@ -156,7 +156,7 @@ func TestNoSocketEvidenceNoClass(t *testing.T) {
 }
 
 func TestReadSocketIsStrict(t *testing.T) {
-	good := `{"schema_version":1,"roots":[{"name":"a","version":"1.0.0","outcome":"adverse","gate_exit":10,"line":"WARN (score=40)","causes":["socket_low_score"],"cached":false}],"cached_blocks":[{"name":"b","version":"2.0.0","line":"BLOCK (critical supply-chain-risk alert)"}],"cache_gap":""}`
+	good := `{"schema_version":1,"roots":[{"name":"a","version":"1.0.0","outcome":"adverse","gate_exit":10,"line":"WARN (score=40)","causes":["socket_low_score"],"cached":false}],"cached_blocks":[{"name":"b","version":"2.0.0","line":"BLOCK (critical supply-chain-risk alert)"}],"cache_gap":"","untied":[]}`
 	if _, err := ReadSocket([]byte(good)); err != nil {
 		t.Fatalf("a good document was refused: %v", err)
 	}
@@ -193,5 +193,28 @@ func TestACachedBlockCountsForABundledMemberOfTheTarget(t *testing.T) {
 	report := decideSocket(t, nil, target, sock, evidenceOf(read("b", "2.0.0"), read("bund", "1.0.0")))
 	if report.Outcome.Class != ClassMalice || report.Outcome.Exit != ExitBlock || len(report.Malice) != 1 || report.Malice[0].Name != "bund" {
 		t.Fatalf("%+v / %+v", report.Outcome, report.Malice)
+	}
+}
+
+// A named operand the projection does not hold is missing evidence of the command (102), after what is known: a block
+// still decides first.
+func TestAnUntiedOperandIsMissingEvidenceAndAnEstablishedBlockStillDecides(t *testing.T) {
+	sock := socketOf()
+	sock.Untied = []SocketUntied{{Name: "clean", Version: "2.0.0"}}
+	report := decideSocket(t, nil, pkgs("pk", "1.0.0"), sock, evidenceOf(read("pk", "1.0.0")))
+	if report.Outcome.Class != ClassMissingEvidence || report.Outcome.Exit != ExitOperator || !strings.Contains(report.Coverage[0].Gap, "socket root not tied: clean@2.0.0") {
+		t.Fatalf("%+v / %+v", report.Outcome, report.Coverage)
+	}
+	sock.CachedBlocks = []SocketBlock{{Name: "pk", Version: "1.0.0", Line: "BLOCK (critical supply-chain-risk alert)"}}
+	if blocked := decideSocket(t, nil, pkgs("pk", "1.0.0"), sock, evidenceOf(read("pk", "1.0.0"))); blocked.Outcome.Class != ClassMalice {
+		t.Fatalf("%+v", blocked.Outcome)
+	}
+	for name, doc := range map[string]string{
+		"untied missing": `{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":""}`,
+		"untied bad row": `{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":"","untied":[{"name":"x"}]}`,
+	} {
+		if _, err := ReadSocket([]byte(doc)); err == nil {
+			t.Errorf("%s: the document was read", name)
+		}
 	}
 }

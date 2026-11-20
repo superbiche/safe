@@ -75,6 +75,15 @@ type SocketEvidence struct {
 	CachedBlocks  []SocketBlock `json:"cached_blocks"`
 	// CacheGap says why the cache could not be read ("" when it was): missing evidence.
 	CacheGap string `json:"cache_gap"`
+	// Untied are the named operands that could not be tied to a package the projected lockfile holds: nothing
+	// could be asked for them, which is a gap of the command (missing evidence), never a skipped root.
+	Untied []SocketUntied `json:"untied"`
+}
+
+// SocketUntied is a named operand the projection does not hold.
+type SocketUntied struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
 }
 
 // SocketReport is the Socket part of the decision report.
@@ -182,7 +191,7 @@ func ReadSocket(raw []byte) (SocketEvidence, error) {
 	if err := json.Unmarshal(raw, &shape); err != nil || shape == nil {
 		return SocketEvidence{}, fmt.Errorf("socket evidence: not a JSON object")
 	}
-	if err := requireKeys(shape, "", "schema_version", "roots", "cached_blocks", "cache_gap"); err != nil {
+	if err := requireKeys(shape, "", "schema_version", "roots", "cached_blocks", "cache_gap", "untied"); err != nil {
 		return SocketEvidence{}, fmt.Errorf("socket evidence: %w", err)
 	}
 	for _, list := range []struct {
@@ -191,6 +200,7 @@ func ReadSocket(raw []byte) (SocketEvidence, error) {
 	}{
 		{"roots", []string{"name", "version", "outcome", "gate_exit", "line", "causes", "cached"}},
 		{"cached_blocks", []string{"name", "version", "line"}},
+		{"untied", []string{"name", "version"}},
 	} {
 		items, ok := shape[list.key].([]any)
 		if !ok {
@@ -277,6 +287,11 @@ func (e SocketEvidence) validate() error {
 			return fmt.Errorf("cached_blocks[%d]: %s@%s is given more than once", i, block.Name, block.Version)
 		}
 		blocks[identity] = struct{}{}
+	}
+	for i, untied := range e.Untied {
+		if untied.Name == "" || untied.Version == "" || strings.ContainsAny(untied.Name+untied.Version, "\x00\n\r") {
+			return fmt.Errorf("untied[%d]: name and version are required", i)
+		}
 	}
 	if strings.ContainsAny(e.CacheGap, "\x00\n\r") {
 		return fmt.Errorf("cache_gap must be one line of text")

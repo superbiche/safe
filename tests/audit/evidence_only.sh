@@ -259,5 +259,89 @@ for mode in reflect-error reflect-success; do
   [[ -z "$(find "$CASE_CACHE" -type f 2>/dev/null)" ]] && pass "$mode: nothing was stored in the cache" || fail "$mode: the cache holds a file"
 done
 
+
+# --- 6. an inaccessible cache path is a gap; only a path shown to be absent is absent ------------------------------------
+if [[ "$(id -u)" != 0 ]]; then
+  prepare_case cache-unsearchable
+  mkdir -p "$CASE/locked/cache"
+  chmod 000 "$CASE/locked"
+  cache_read SAFE_AUDIT_SOCKET_CACHE_DIR="$CASE/locked/cache"
+  chmod 755 "$CASE/locked"
+  [[ "$(blocks_of)" == '[]' && "$(jq -r .cache_gap <<<"$OUT")" != "" ]] && pass 'a cache under a directory that cannot be searched is a gap, not an absent cache' || fail "unsearchable parent: $OUT"
+  prepare_case cache-parent-is-a-file
+  : > "$CASE/afile"
+  cache_read SAFE_AUDIT_SOCKET_CACHE_DIR="$CASE/afile/cache"
+  [[ "$(jq -r .cache_gap <<<"$OUT")" != "" ]] && pass 'a cache under a component that is not a directory is a gap' || fail "component is a file: $OUT"
+else
+  pass 'unsearchable parent: skipped as root'
+fi
+
+# --- 7. the mode is set by the parsed flag only: the environment cannot reach the ordinary audit ---------------------------
+for value in 0 1 "" yes; do
+  prepare_case "inherited-$value"
+  audit clean - fixture@1.0.0 --ecosystem npm EVIDENCE_ONLY_RUN="$value" EVIDENCE_PROGRESS_FILE="$CASE/progress"
+  inherited_rc="$RC"; inherited_out="$OUT"
+  prepare_case "inherited-control-$value"
+  audit clean - fixture@1.0.0 --ecosystem npm
+  if [[ "$inherited_rc" == "$RC" && "$RC" == 0 && "$inherited_out" == "$OUT" && ! -e "$TEST_ROOT/inherited-$value/progress" ]]; then pass "EVIDENCE_ONLY_RUN='$value' in the environment changes nothing of the ordinary cold audit (exit $RC, same output)"; else fail "EVIDENCE_ONLY_RUN='$value': exit $inherited_rc vs $RC"; fi
+done
+prepare_case inherited-flag-as-value
+audit clean - fixture@1.0.0 --ecosystem npm --registry --evidence-only
+[[ "$(ls "$CASE_AUDIT_CONFIG" "$CASE_DATA" 2>/dev/null | grep -c .)" != 0 || "$RC" != 0 ]] && pass 'the flag text as the VALUE of another option is not the flag (the ordinary start-up ran)' || fail 'the flag text as a value switched the mode on'
+
+# --- 8. the credential helper is the operator's, never the caller's PATH ---------------------------------------------------
+prepare_case helper-path
+mkdir -p "$CASE_HOME/.config/setup-new-machines/bw-env.d" "$TEST_ROOT/helperbin"
+printf 'SOCKET_SECURITY_API_TOKEN=x\n' > "$CASE_HOME/.config/setup-new-machines/bw-env.d/socket.env"
+printf '#!/usr/bin/env bash\nprintf ran >> "%s/helper.ran"\nshift 3\nexec "$@"\n' "$CASE" > "$TEST_ROOT/helperbin/bw-env-run"; chmod +x "$TEST_ROOT/helperbin/bw-env-run"
+audit clean - fixture@1.0.0 --ecosystem npm --evidence-only PATH="$TEST_ROOT/helperbin:$MOCKBIN:/usr/bin:/bin"
+if [[ "$(jq -r .outcome <<<"$OUT")" == unavailable && ! -e "$CASE/helper.ran" && "$(calls)" == 0 ]]; then pass 'a credential helper first on PATH is not run; the reading is unavailable'; else fail "helper on PATH: $OUT"; fi
+prepare_case helper-operator
+mkdir -p "$CASE_HOME/.config/setup-new-machines/bw-env.d" "$CASE_HOME/.local/bin"
+printf 'SOCKET_SECURITY_API_TOKEN=x\n' > "$CASE_HOME/.config/setup-new-machines/bw-env.d/socket.env"
+printf '#!/usr/bin/env bash\nprintf ran >> "%s/helper.ran"\nshift 3\nexec "$@"\n' "$CASE" > "$CASE_HOME/.local/bin/bw-env-run"; chmod +x "$CASE_HOME/.local/bin/bw-env-run"
+audit clean - fixture@1.0.0 --ecosystem npm --evidence-only
+if [[ "$(jq -r .outcome <<<"$OUT")" == clear && -e "$CASE/helper.ran" ]]; then pass 'the helper in the operator'"'"'s locations is the one used'; else fail "operator helper: $OUT"; fi
+
+# --- 9. the lane's call: bounded, owned scratch, completed results survive -----------------------------------------------
+# shellcheck source=lib/gate-lib.sh
+( . "$ROOT/lib/gate-lib.sh"; declare -F safe_gate_project_lane_socket_call >/dev/null ) && pass 'the lane helpers load' || fail 'the lane helpers do not load'
+lane_call() { # <mode> <request-json> <deadline> <extra env...> ; sets CALL_RC, CALL_OUT, CALL_PROGRESS, CALL_DIR, CALL_TMP
+  local mode="$1" request="$2" deadline="$3"; shift 3
+  prepare_case "call-$RANDOM"
+  CALL_DIR="$CASE/lane-scratch"; CALL_TMP="$CASE/auditor-tmp"; mkdir -p "$CALL_DIR" "$CALL_TMP"
+  printf '%s' "$request" > "$CASE/req.json"; : > "$CALL_DIR/progress"
+  CALL_RC=0
+  ( . "$ROOT/lib/gate-lib.sh"
+    export HOME="$CASE_HOME" PATH="$MOCKBIN:/usr/bin:/bin" SAFE_AUDIT_CONFIG_DIR="$CASE_AUDIT_CONFIG" SAFE_AUDIT_DATA_DIR="$CASE_DATA/audit" \
+      SAFE_RUN_CONFIG_DIR="$CASE_RUN_CONFIG" SAFE_AUDIT_SOCKET_CACHE_DIR="$CASE_CACHE" MOCK_SOCKET_LOG="$CASE_LOG" MOCK_SOCKET_MODE="$mode" \
+      SAFE_RUN_TRUST_OVERRIDE=1 TMPDIR="$CALL_TMP" "$@"
+    safe_gate_project_lane_socket_call "$SAFE_AUDIT" "$SAFE_CORE_BIN" "$CASE/req.json" "$CASE/out.json" "$deadline" "$CALL_DIR" "$CALL_DIR/progress" ) || CALL_RC=$?
+}
+two_roots='{"roots":[{"name":"fixture","version":"1.0.0"},{"name":"other","version":"1.0.0"}],"cached":[]}'
+lane_call pending '{"roots":[{"name":"fixture","version":"1.0.0"}],"cached":[]}' 2 MOCK_RELEASE_FRESH=1
+[[ "$CALL_RC" == 124 ]] && pass 'a stalled reader is ended by its deadline (124)' || fail "deadline: rc=$CALL_RC"
+[[ -z "$(ls -A "$CALL_DIR" | grep -v '^progress$')" && -z "$(ls -A "$CALL_TMP")" ]] && pass 'the call'"'"'s private directory and the temporary directory hold nothing afterwards' || fail "scratch left behind: $(ls -A "$CALL_DIR" "$CALL_TMP")"
+lane_call reflect-then-stall "$two_roots" 4 SOCKET_SECURITY_API_TOKEN="$MARKER" MOCK_SOCKET_STALL_NAME=fixture
+if [[ "$CALL_RC" == 124 ]] && ! grep -rqF "$MARKER" "$CASE" "$CALL_TMP" 2>/dev/null && [[ -z "$(ls -A "$CALL_TMP")" ]]; then pass 'the reflected marker is on no file after a deadline'; else fail "marker after a deadline (rc=$CALL_RC)"; fi
+# no deadline utility: the reader is not started
+NOTIMEOUT="$TEST_ROOT/no-timeout-bin"; mkdir -p "$NOTIMEOUT"
+for b in /usr/bin/* /bin/*; do [[ -e "$NOTIMEOUT/${b##*/}" ]] || ln -s "$b" "$NOTIMEOUT/${b##*/}" 2>/dev/null || true; done
+rm -f "$NOTIMEOUT/timeout"
+prepare_case no-timeout-utility
+printf '%s' "$two_roots" > "$CASE/req.json"
+rc=0; ( . "$ROOT/lib/gate-lib.sh"; PATH="$NOTIMEOUT" safe_gate_project_lane_socket_call "$SAFE_AUDIT" "$SAFE_CORE_BIN" "$CASE/req.json" "$CASE/out.json" 5 "$CASE" ) || rc=$?
+[[ "$rc" == 126 && ! -e "$CASE/out.json" && "$(calls)" == 0 ]] && pass 'with no deadline utility the reader is not started (126), no call is made' || fail "no timeout utility: rc=$rc"
+# completed results survive a later root's stall: the block read first is kept, the unfinished root is unavailable
+lane_call malware "$two_roots" 12 MOCK_SOCKET_STALL_NAME=other
+if [[ "$CALL_RC" == 124 ]]; then
+  printf '%s' "$two_roots" > "$CASE/req.json"
+  ( . "$ROOT/lib/gate-lib.sh"; printf '[]' > "$CASE/untied.json"
+    safe_gate_project_lane_socket_roots_doc "$CASE/req.json" "$CASE/out.json" "$CASE/doc.json" "the Socket evidence reader ran out of time" "$CALL_DIR/progress" "$CASE/untied.json" "$SAFE_CORE_BIN" )
+  [[ "$(jq -r '[.roots[] | "\(.name)=\(.outcome)"] | join(",")' "$CASE/doc.json")" == "fixture=blocked,other=unavailable" ]] && pass 'a block classified before a later root stalls survives; only the unfinished root is unavailable' || fail "progress: $(cat "$CASE/doc.json") / $(cat "$CALL_DIR/progress")"
+else
+  fail "stall after a block: rc=$CALL_RC"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

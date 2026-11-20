@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 [[ -n "${MOCK_SOCKET_LOG:-}" ]] && printf 'call\n' >> "$MOCK_SOCKET_LOG"
+# evidence-only suite: one named package whose score never arrives (the provider has already printed what it reflects)
+if [[ -n "${MOCK_SOCKET_STALL_NAME:-}" && "$*" == *"$MOCK_SOCKET_STALL_NAME"* ]]; then
+  printf '{"message":"working on it for token %s"}\n' "${SOCKET_SECURITY_API_TOKEN:-}"
+  sleep 30
+  exit 1
+fi
 # evidence-only suite: one named package whose score cannot be fetched
 if [[ -n "${MOCK_SOCKET_FAIL_NAME:-}" && "$*" == *"$MOCK_SOCKET_FAIL_NAME"* ]]; then printf '{"message":"mock failure"}\n'; exit 1; fi
 # Mirrors the real package-score envelope: `transitively` is an OBJECT

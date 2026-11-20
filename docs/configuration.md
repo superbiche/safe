@@ -301,12 +301,17 @@ pass and warnings under `environment.release_follow`.
   (`package-audit --evidence-only`), whatever the number of roots, and never for an artifact from a private origin.
   What is scored is the projected root: each named operand is tied to its direct occurrence in the projected lockfile
   (npm resolves `pkg@1.0.0+build.1` to `1.0.0`) and that occurrence's public identity is asked; an operand that cannot
-  be tied is missing evidence (102). The cooldown keeps its own exact-argument rule. The reader runs with the core
+  be tied is a coverage gap of the command (102: nothing is published, nothing is skipped; an established block still
+  decides 104 first). The cooldown keeps its own exact-argument rule. The reader runs with the core
   installed beside the dispatcher (the one the lane verified, whatever `SAFE_CORE_BIN` the caller's environment names)
   and takes the Socket tool from the operator's tool configuration (`tools.json`, then the standard install
   directories), never from `PATH`; today's gate keeps its own choice until ticket 1682. Its answer is validated before
-  it is used: exactly one consistent row per identity asked; a missing, repeated or contradictory row is missing
-  evidence (102) and a whole row beside it is kept. Each call has a deadline (the gate's own leash for one audit, plus
+  it is used, on its original bytes: one document, no member repeated at any level (`safe-core repeated-members`), the
+  complete envelope, then exactly one consistent row per identity asked; anything else is missing evidence (102) and a
+  whole row or block beside it is kept. Each call gets a private temporary directory the lane made and removes whatever
+  ends the call, and the rows a batch completed before a deadline survive (the rest are unavailable). Without a deadline
+  utility the reader is not started (102). A failed advisory reading is missing coverage too: the cached blocks are
+  still judged and decide 104 first. Each call has a deadline (the gate's own leash for one audit, plus
   the Socket part of one more audit per extra root; 120 seconds for the cache reading; `SAFE_INSTALL_TIMEOUT_SECONDS`
   overrides both): expiry is missing evidence (102), and a block already established still decides (104).
   The result is a class of the decision, after the cooldown's wait and before missing evidence, with today's exits and

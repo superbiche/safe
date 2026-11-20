@@ -20,7 +20,12 @@
   name an action that works now (retry later, or run the same install with `install.project_lane` off), and the
   host-allow hint of the install gate does not clear a Socket result on the lane until the acceptances are wired. A
   command that does not complete records nothing. The normal paths of `package-audit` and the switch-off behaviour
-  are unchanged.
+  are unchanged. Second review: a named operand the projection cannot tie is a coverage gap (102), the reader's original
+  bytes are validated (one document, no repeated member, the complete envelope; a malformed block row is a gap beside the
+  whole ones), each evidence call owns a private temporary directory removed whatever ends it, cached blocks are judged
+  even when the advisory reading failed, an inaccessible cache path is a gap (only ENOENT is absent), the mode is set by
+  the parsed flag only, a batch keeps the roots it completed before a deadline and no reader runs without a deadline
+  utility, and the credential helper is resolved from the operator's locations.
 
 - Project lane (still behind `install.project_lane`): the cooldown. npm's release-age filter is on the command line of
   every npm run of the lane at `install.cooldown_days` (with the exact versions the command names excluded by name),

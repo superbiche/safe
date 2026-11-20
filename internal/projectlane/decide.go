@@ -236,6 +236,10 @@ func Decide(in Input) Report {
 			return a.ID < b.ID
 		})
 		report.Socket, socketClass = &socketReport, &class
+		for _, untied := range in.Socket.Untied {
+			report.Coverage = append(report.Coverage, CoverageGap{Name: "", Version: "", Sides: []string{"target"},
+				Gap: "socket root not tied: " + untied.Name + "@" + untied.Version + " names no package the projected lockfile holds"})
+		}
 		if in.Socket.CacheGap != "" {
 			report.Coverage = append(report.Coverage, CoverageGap{Name: "", Version: "", Sides: []string{"target"}, Gap: "socket cache not read: " + in.Socket.CacheGap})
 		}

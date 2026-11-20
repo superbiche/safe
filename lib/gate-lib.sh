@@ -4336,20 +4336,38 @@ safe_gate_project_lane_config_diff() {
 # beside it (the one the lane verified, whatever SAFE_CORE_BIN the caller's environment holds; the auditor takes its
 # Socket tool from the operator's tool configuration, never from PATH), a closed stdin, and a deadline.
 #
-# One bounded call. $1 audit, $2 core, $3 request file, $4 output file, $5 deadline in seconds. Returns the reader's
-# status, 124 when the deadline ended it.
+# One bounded call. $1 audit, $2 core, $3 request file, $4 output file, $5 deadline in seconds, $6 the lane's scratch
+# directory (the call gets a private directory of its own below it, which it uses for every temporary file and which is
+# removed whatever ends the call), $7 optional file the reader appends each completed root to. Returns the reader's status;
+# 124 when the deadline ended it; 126 when no deadline utility exists (the reader is then not started: an unbounded call
+# is never made).
 safe_gate_project_lane_socket_call() {
-  local audit="$1" core="$2" request="$3" out="$4" deadline="$5" rc=0 socket_budget fresh_budget
+  local audit="$1" core="$2" request="$3" out="$4" deadline="$5" parent="$6" progress="${7:-}" rc=0 socket_budget fresh_budget call_dir
+  local -a progress_args=()
+  command -v timeout >/dev/null 2>&1 || return 126
+  call_dir="$(mktemp -d "${parent}/evidence-call.XXXXXX" 2>/dev/null)" || return 125
+  [[ -z "${progress}" ]] || progress_args=(--evidence-progress "${progress}")
   socket_budget="$(safe_gate_socket_budget)"
   fresh_budget="$(safe_gate_socket_fresh_scan_budget)"
-  if command -v timeout >/dev/null 2>&1; then
-    SAFE_CORE_BIN="${core}" SAFE_AUDIT_SOCKET_TIMEOUT="${socket_budget}" SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT="${fresh_budget}" \
-      timeout --kill-after=2s "${deadline}" "${audit}" package-audit --ecosystem npm --evidence-only <"${request}" >"${out}" 2>/dev/null || rc=$?
-  else
-    SAFE_CORE_BIN="${core}" SAFE_AUDIT_SOCKET_TIMEOUT="${socket_budget}" SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT="${fresh_budget}" \
-      "${audit}" package-audit --ecosystem npm --evidence-only <"${request}" >"${out}" 2>/dev/null || rc=$?
-  fi
+  TMPDIR="${call_dir}" SAFE_CORE_BIN="${core}" SAFE_AUDIT_SOCKET_TIMEOUT="${socket_budget}" SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT="${fresh_budget}" \
+    timeout --kill-after=2s "${deadline}" "${audit}" package-audit --ecosystem npm --evidence-only "${progress_args[@]}" <"${request}" >"${out}" 2>/dev/null || rc=$?
+  rm -rf -- "${call_dir}"
   return "${rc}"
+}
+
+# Why a call did not complete, for the report.
+safe_gate_project_lane_socket_why() { # <what> <rc>
+  case "$2" in
+    0) printf '' ;;
+    124|137) printf 'the %s ran out of time' "$1" ;;
+    126) printf 'no deadline utility (timeout) is available, so the %s was not started' "$1" ;;
+    *) printf 'the %s exited %s' "$1" "$2" ;;
+  esac
+}
+
+# The reader's original bytes are one JSON document with no member repeated at any level. $1 file, $2 core.
+safe_gate_project_lane_socket_framed() {
+  [[ -s "$1" ]] && "$2" repeated-members <"$1" >/dev/null 2>&1
 }
 
 # The deadline of the cache-only call (local files only: the gate's fixed overhead) and of the roots call (the gate's own
@@ -4370,38 +4388,65 @@ safe_gate_project_lane_socket_deadline() { # <cache|roots> [roots count]
   printf '%s\n' "$(( leash + ($2 > 1 ? $2 - 1 : 0) * (socket_budget * SAFE_GATE_SOCKET_ATTEMPTS + fresh_budget * SAFE_GATE_SOCKET_ATTEMPTS) ))"
 }
 
-# The cache document from the cache reader's own: the blocking results of the identities asked, each one kept when it is
-# whole; a document that is not whole is a gap and nothing else. $1 request, $2 raw answer (may be absent), $3 output,
-# $4 the reason when the call failed ("" otherwise).
+# The cache document from the cache reader's own answer. The ORIGINAL bytes are checked first (one document, no repeated
+# member, the complete envelope); a bad answer is a gap and nothing else. Inside a sound answer each block row stands on its
+# own: the whole ones for an identity asked are kept, a malformed one or one for an identity not asked is a gap beside them.
+# $1 request, $2 raw answer, $3 output, $4 why the call failed ("" otherwise), $5 core.
 safe_gate_project_lane_socket_cache_doc() {
-  local request="$1" raw="$2" out="$3" why="$4" src="${2}"
-  if [[ -n "${why}" || ! -s "${raw}" ]] || ! jq -e . "${raw}" >/dev/null 2>&1; then
+  local request="$1" raw="$2" out="$3" why="$4" core="$5" src="${2}"
+  if [[ -z "${why}" ]] && ! safe_gate_project_lane_socket_framed "${raw}" "${core}"; then
+    why="the Socket cache reader's answer is not one well-formed document"
+  fi
+  if [[ -n "${why}" ]]; then
     src="${out}.null"; printf 'null\n' >"${src}"
   fi
   jq -c --slurpfile q "${request}" --arg why "${why}" '
     ($q[0].cached) as $asked
-    | (type == "object" and .schema_version == 1 and (.cached_blocks | type == "array") and (.cache_gap | type == "string")) as $whole
-    | {schema_version: 1, roots: [],
-       cached_blocks: (if $whole then [.cached_blocks[]
-           | select(type == "object" and (.name | type == "string") and (.version | type == "string") and (.line | type == "string")
-                    and (.line | length > 0) and (.line | test("[\n\r]") | not))
-           | . as $b | select(any($asked[]; .name == $b.name and .version == $b.version))
-           | {name, version, line}] | unique else [] end),
-       cache_gap: (if $whole then (if .cache_gap != "" then .cache_gap else "" end)
+    | (type == "object" and .schema_version == 1 and (.roots | type == "array") and (.cached_blocks | type == "array")
+       and (.cache_gap | type == "string") and (.untied | type == "array")) as $whole
+    | (if $whole then [.cached_blocks[]
+         | select(type == "object" and (.name | type == "string") and (.version | type == "string") and (.line | type == "string")
+                  and (.line | length > 0) and (.line | test("[\n\r]") | not))
+         | . as $b | select(any($asked[]; .name == $b.name and .version == $b.version))
+         | {name, version, line}] | unique else [] end) as $kept
+    | {schema_version: 1, roots: [], untied: [],
+       cached_blocks: $kept,
+       cache_gap: (if $whole then
+                     (if .cache_gap != "" then .cache_gap
+                      elif ($kept | length) != (.cached_blocks | length) then "the Socket cache reader returned a block row that is not whole or not asked for"
+                      else "" end)
                    elif $why != "" then $why else "the Socket cache reader did not answer" end)}' "${src}" >"${out}" 2>/dev/null
 }
 
-# The roots document: exactly one consistent row per identity asked, nothing else. A row that is missing, repeated,
-# for another version, or contradicts itself is an unavailable result for the root that was asked (missing evidence),
-# never a clear one; the rows that are whole are kept. $1 request, $2 raw answer, $3 output, $4 why (when the call failed),
-# $5 optional file of untied roots (rows that could not be asked at all).
+# The roots document. Rows come from the reader's final answer when the call completed (checked on its original bytes:
+# one document, no repeated member, the complete envelope), and from the rows it appended as it went when the call did
+# not (each line one document). Exactly one consistent row per identity asked: a row that is missing, repeated, for another
+# version, or contradicting itself becomes an unavailable result for the root asked, never a clear one; the whole rows
+# are kept. Operands that could not be tied travel apart (`untied`): they are not asked and are missing evidence of the
+# command. $1 request, $2 raw answer, $3 output, $4 why the call failed, $5 progress file (may be absent), $6 untied
+# file, $7 core.
 safe_gate_project_lane_socket_roots_doc() {
-  local request="$1" raw="$2" out="$3" why="$4" untied="${5:-}" src="$2"
-  if [[ -n "${why}" || ! -s "${raw}" ]] || ! jq -e . "${raw}" >/dev/null 2>&1; then
-    src="${out}.null"; printf 'null\n' >"${src}"
+  local request="$1" raw="$2" out="$3" why="$4" progress="$5" untied="$6" core="$7" src="$2" kept="${3}.kept" line
+  : >"${kept}"
+  if [[ -z "${why}" ]]; then
+    if ! safe_gate_project_lane_socket_framed "${raw}" "${core}" \
+        || ! jq -e 'type == "object" and .schema_version == 1 and (.roots | type == "array") and (.cached_blocks | type == "array")
+                    and (.cache_gap | type == "string") and (.untied | type == "array")' "${raw}" >/dev/null 2>&1; then
+      why="the Socket evidence reader's answer is not one well-formed document"
+    fi
   fi
-  [[ -n "${untied}" && -s "${untied}" ]] || { untied="${out}.untied"; printf '[]\n' >"${untied}"; }
-  jq -c --slurpfile q "${request}" --slurpfile u "${untied}" --arg why "${why:-the Socket evidence reader did not answer}" '
+  if [[ -n "${why}" ]]; then
+    src="${out}.null"; printf 'null\n' >"${src}"
+    # what the reader completed before it stopped survives, each row on its own
+    if [[ -s "${progress}" ]]; then
+      while IFS= read -r line; do
+        [[ -n "${line}" ]] || continue
+        printf '%s' "${line}" | "${core}" repeated-members >/dev/null 2>&1 && printf '%s\n' "${line}" >>"${kept}"
+      done <"${progress}"
+    fi
+  fi
+  [[ -s "${untied}" ]] || printf '[]\n' >"${untied}"
+  jq -c --slurpfile q "${request}" --slurpfile u "${untied}" --slurpfile k "${kept}" --arg why "${why:-the Socket evidence reader did not answer}" '
     def exits: {"clear": 0, "adverse": 10, "unavailable": 11, "rate_limited": 12, "consent_required": 13, "pending": 14, "blocked": 20};
     def whole($r):
       ($r | type == "object")
@@ -4415,13 +4460,13 @@ safe_gate_project_lane_socket_roots_doc() {
       and (if $r.outcome == "adverse" then ($r.causes | length > 0) else true end)
       and (if $r.outcome == "rate_limited" then ($r.causes | length > 0 and all(. == "socket_rate_limited")) else true end);
     def missing($w; $line): {name: $w.name, version: $w.version, outcome: "unavailable", gate_exit: 11, line: $line, causes: [], cached: false};
-    (if type == "object" and .schema_version == 1 and (.roots | type == "array") then .roots else [] end) as $rows
+    (if type == "object" and .schema_version == 1 and (.roots | type == "array") then .roots else $k end) as $rows
     | {schema_version: 1,
-       roots: ([$q[0].roots[] as $w
+       roots: [$q[0].roots[] as $w
            | ([$rows[] | select(type == "object" and .name == $w.name and .version == $w.version)]) as $m
            | if ($m | length) == 1 and whole($m[0]) then ($m[0] | {name, version, outcome, gate_exit, line, causes, cached})
-             else missing($w; (if ($m | length) == 0 then "audit infrastructure unavailable (" + $why + ")" else "audit infrastructure unavailable (the reader answered inconsistently for this package)" end)) end]
-          + [$u[0][] | missing(.; "audit infrastructure unavailable (the named version could not be tied to the package the projected lockfile holds)")])}' "${src}" >"${out}" 2>/dev/null
+             else missing($w; (if ($m | length) == 0 then "audit infrastructure unavailable (" + $why + ")" else "audit infrastructure unavailable (the reader answered inconsistently for this package)" end)) end],
+       untied: $u[0]}' "${src}" >"${out}" 2>/dev/null
 }
 
 # A decision report that is complete and consistent, or nothing: ONE document,
@@ -4548,10 +4593,13 @@ safe_gate_project_lane_outcome_text() {
             elif $r.outcome == "pending" then "retry once Socket has scored the release, or have the operator run the same install with install.project_lane off (the lane'"'"'s own terminal answer comes with the overrides ticket)"
             else "retry once the release is older than the Socket window, or have the operator run the same install with install.project_lane off, where today'"'"'s gate asks at a terminal (the lane'"'"'s own terminal answer comes with the overrides ticket)" end)"
       elif $o.class == "missing_evidence" then
-        ([.coverage[] | select((.gap | startswith("publish time not read: ") | not) and (.gap | startswith("socket cache not read") | not))]) as $adv
+        ([.coverage[] | select((.gap | startswith("publish time not read: ") | not) and (.gap | startswith("socket cache not read") | not) and (.gap | startswith("socket root not tied") | not))]) as $adv
         | ([.coverage[] | select(.gap | startswith("socket cache not read"))]) as $sc
+        | ([.coverage[] | select(.gap | startswith("socket root not tied: "))]) as $nt
         | (.cooldown.missing // []) as $pub
-        | if ($adv | length) == 0 and ($pub | length) == 0 and ($sc | length) > 0 then
+        | if ($adv | length) == 0 and ($pub | length) == 0 and ($nt | length) > 0 then
+            "\($nt[0].gap | sub("^socket root not tied: "; "")) - the named operand could not be tied to the package npm resolved, so its Socket score was not read\(if ($nt | length) > 1 then " (and \(($nt | length) - 1) more)" else "" end)|name the exact version the lockfile will hold (without build metadata or a spelling npm normalises), then retry"
+          elif ($adv | length) == 0 and ($pub | length) == 0 and ($sc | length) > 0 then
             "the Socket cache could not be read (\(.socket.cache_gap)), so a known Socket block cannot be ruled out — audit-infrastructure breakage, not a package finding|fix the Socket cache directory or run safe doctor, then retry"
           elif ($adv | length) == 0 and ($pub | length) > 0 then
             "\($pub | length) publish time(s) could not be read, so the cooldown cannot be judged for them (first: \(if $pub[0].name == "" then $pub[0].gap else "\($pub[0].name)@\($pub[0].version): \($pub[0].gap)" end)) — audit-infrastructure breakage, not a package finding|fix connectivity or retry once the registry answers"
@@ -5610,8 +5658,15 @@ safe_gate_project_lane_run() {
   rc=0
   "${lane_audit}" scanner-batch --evidence <<<"${request}" >"${evidence}" 2>"${scratch}/evidence.err" || rc=$?
   if (( rc != 0 )); then
-    safe_gate_project_lane_refuse 102 "${verb}" "advisory evidence cannot be read (the reader exited ${rc}; audit-infrastructure breakage, not a package finding)" "fix connectivity or run safe doctor, then retry"
-    return $?
+    # A reader that fails leaves the advisory coverage (and the blocklist, which the same reader reads) MISSING; it does not
+    # end the command before what is already known is judged: the cached Socket blocks and the decision still run, and a
+    # block they establish ends the command (104) first.
+    if ! jq -ec --arg why "the advisory reader exited ${rc}" '{schema_version: 1, policy: {block_severities: ["critical"]},
+          identities: [.packages[] | {name, version, coverage: "missing", gap: $why, advisories: []}], blocklist: []}' <<<"${request}" >"${evidence}" 2>/dev/null; then
+      safe_gate_project_lane_refuse 102 "${verb}" "advisory evidence cannot be read (the reader exited ${rc}; audit-infrastructure breakage, not a package finding)" "fix connectivity or run safe doctor, then retry"
+      return $?
+    fi
+    safe_gate_err "safe: project lane: the advisory reader failed (exit ${rc}): advisory coverage and the blocklist were not read"
   fi
   # The cooldown's reading: the publish time of every introduced registry version of a public host, per exact
   # version (cached in safe's data directory), and for a named exact version inside the window the advisories it
@@ -5639,15 +5694,14 @@ safe_gate_project_lane_run() {
   fi
   rc=0
   if jq -e '.cached | length > 0' "${scratch}/socket-cache-request.json" >/dev/null 2>&1; then
-    safe_gate_project_lane_socket_call "${lane_audit}" "${safe_core}" "${scratch}/socket-cache-request.json" "${scratch}/socket-cache.raw" "$(safe_gate_project_lane_socket_deadline cache)" || rc=$?
-    socket_why=""
-    (( rc == 0 )) || socket_why="the Socket cache reader $( (( rc == 124 || rc == 137 )) && printf 'ran out of time' || printf 'exited %s' "${rc}")"
+    safe_gate_project_lane_socket_call "${lane_audit}" "${safe_core}" "${scratch}/socket-cache-request.json" "${scratch}/socket-cache.raw" "$(safe_gate_project_lane_socket_deadline cache)" "${scratch}" || rc=$?
+    socket_why="$(safe_gate_project_lane_socket_why 'Socket cache reader' "${rc}")"
   else
     : >"${scratch}/socket-cache.raw"
     socket_why=""
-    printf '{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":""}\n' >"${scratch}/socket-cache.raw"
+    printf '{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":"","untied":[]}\n' >"${scratch}/socket-cache.raw"
   fi
-  if ! safe_gate_project_lane_socket_cache_doc "${scratch}/socket-cache-request.json" "${scratch}/socket-cache.raw" "${socket_cache}" "${socket_why}" \
+  if ! safe_gate_project_lane_socket_cache_doc "${scratch}/socket-cache-request.json" "${scratch}/socket-cache.raw" "${socket_cache}" "${socket_why}" "${safe_core}" \
       || ! jq -e '.schema_version == 1' "${socket_cache}" >/dev/null 2>&1; then
     safe_gate_project_lane_refuse 100 "${verb}" "the Socket cache document cannot be assembled (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
     return $?
@@ -5697,16 +5751,18 @@ safe_gate_project_lane_run() {
     fi
     jq -c '.untied' "${scratch}/socket-roots-request.json" >"${scratch}/socket-untied.json" 2>/dev/null
     socket_why=""
+    : >"${scratch}/socket-roots.progress"
     if jq -e '.roots | length > 0' "${scratch}/socket-roots-request.json" >/dev/null 2>&1; then
       safe_gate_project_lane_socket_call "${lane_audit}" "${safe_core}" "${scratch}/socket-roots-request.json" "${scratch}/socket-roots.raw" \
-        "$(safe_gate_project_lane_socket_deadline roots "$(jq -r '.roots | length' "${scratch}/socket-roots-request.json")")" || rc=$?
-      (( rc == 0 )) || socket_why="the Socket evidence reader $( (( rc == 124 || rc == 137 )) && printf 'ran out of time' || printf 'exited %s' "${rc}")"
+        "$(safe_gate_project_lane_socket_deadline roots "$(jq -r '.roots | length' "${scratch}/socket-roots-request.json")")" "${scratch}" "${scratch}/socket-roots.progress" || rc=$?
+      socket_why="$(safe_gate_project_lane_socket_why 'Socket evidence reader' "${rc}")"
     else
-      : >"${scratch}/socket-roots.raw"
+      printf '{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":"","untied":[]}\n' >"${scratch}/socket-roots.raw"
     fi
     if jq -e '(.roots | length > 0) or (.untied | length > 0)' "${scratch}/socket-roots-request.json" >/dev/null 2>&1; then
-      if ! safe_gate_project_lane_socket_roots_doc "${scratch}/socket-roots-request.json" "${scratch}/socket-roots.raw" "${socket_roots}" "${socket_why}" "${scratch}/socket-untied.json" \
-          || ! jq -ec --slurpfile r "${socket_roots}" '.roots = $r[0].roots' "${socket_cache}" >"${socket}" 2>/dev/null; then
+      if ! safe_gate_project_lane_socket_roots_doc "${scratch}/socket-roots-request.json" "${scratch}/socket-roots.raw" "${socket_roots}" "${socket_why}" \
+            "${scratch}/socket-roots.progress" "${scratch}/socket-untied.json" "${safe_core}" \
+          || ! jq -ec --slurpfile r "${socket_roots}" '.roots = $r[0].roots | .untied = $r[0].untied' "${socket_cache}" >"${socket}" 2>/dev/null; then
         safe_gate_project_lane_refuse 100 "${verb}" "the Socket evidence cannot be assembled (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
         return $?
       fi

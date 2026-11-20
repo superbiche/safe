@@ -12,6 +12,10 @@ SAFE_AUDIT_VERSION="0.3.0"
 # Guarded against the VERSION file by tests/contract/drift.sh.
 SAFE_VERSION="${SAFE_VERSION:-1.75.0}"
 SAFE_AUDIT_NO_INIT="${SAFE_AUDIT_NO_INIT:-0}"
+# The evidence-only mode (the project lane's reading of Socket) is set by the parsed flag alone: a value inherited from
+# the environment is overwritten here, so that it can never reach the ordinary audit.
+EVIDENCE_ONLY_RUN=0
+EVIDENCE_PROGRESS_FILE=""
 SAFE_AUDIT_VERBOSE="${SAFE_AUDIT_VERBOSE:-0}"
 SAFE_AUDIT_SCAN_MODE="${SAFE_AUDIT_SCAN_MODE:-source}"
 
@@ -5774,7 +5778,6 @@ socket_cache_replay() {
   local ecosystem="$1" name="$2" version="$3" output="$4"
   SOCKET_CACHE_STALE_SCORE=""
   SOCKET_CACHE_STALE_AGE_DAYS=""
-  SOCKET_CACHE_FUTURE=""
   local ttl identity key entry fetched age now cache_dir
   ttl=$(socket_cache_ttl_seconds)
   (( ttl > 0 )) || return 1
@@ -5801,7 +5804,7 @@ socket_cache_replay() {
   age=$(( now - fetched ))
   if (( age < 0 )); then
     # an entry dated in the future is not a valid entry for the evidence-only reading
-    if [[ "${EVIDENCE_ONLY_RUN:-0}" == "1" ]]; then rm -f "$cached_result"; SOCKET_CACHE_FUTURE=1; return 1; fi
+    if [[ "${EVIDENCE_ONLY_RUN:-0}" == "1" ]]; then rm -f "$cached_result"; return 1; fi
     age=0
   fi
   if (( age > ttl )); then
@@ -5891,7 +5894,21 @@ socket_score_json() {
   # the CLI binary directly — inject it from Bitwarden via bw-env-run when the
   # helper and its mapping file exist and the token is not already in the env.
   local bw_env_run socket_mapping="$HOME/.config/setup-new-machines/bw-env.d/socket.env"
-  bw_env_run=$(PATH="$HOME/.local/bin:$PATH" command -v bw-env-run 2>/dev/null || true)
+  if [[ "${EVIDENCE_ONLY_RUN:-0}" == "1" ]]; then
+    # the evidence reading resolves the credential helper like the Socket tool: the operator's locations only, never the
+    # caller's PATH; when injection is needed and the helper is not there, the reading is unavailable
+    bw_env_run=""
+    local helper_dir
+    for helper_dir in "${TOOL_PROBE_DIRS[@]}"; do
+      if [[ -x "$helper_dir/bw-env-run" && ! -d "$helper_dir/bw-env-run" ]]; then bw_env_run="$helper_dir/bw-env-run"; break; fi
+    done
+    if [[ -z "$bw_env_run" && -z "${SOCKET_SECURITY_API_TOKEN:-}" && -f "$socket_mapping" ]]; then
+      printf '{"available":true,"status":"error","reason":"helper","note":"socket credential helper not found in the operator'"'"'s locations"}\n' > "$output"
+      return 0
+    fi
+  else
+    bw_env_run=$(PATH="$HOME/.local/bin:$PATH" command -v bw-env-run 2>/dev/null || true)
+  fi
   local can_inject=false
   [[ -n "$bw_env_run" && -f "$socket_mapping" ]] && can_inject=true
 
@@ -9554,6 +9571,9 @@ package_audit_evidence_batch() {
         '{name: $name, version: $version, outcome: "unavailable", gate_exit: 11, line: $line, causes: [], cached: false}')
     fi
     roots=$(jq -c --argjson d "$doc" '. + [$d]' <<<"$roots")
+    # each completed root is kept where the supervising process can read it: a deadline later in the batch loses
+    # nothing that was already classified
+    [[ -z "$EVIDENCE_PROGRESS_FILE" ]] || jq -c . <<<"$doc" >> "$EVIDENCE_PROGRESS_FILE" 2>/dev/null || true
   done < <(jq -c '.roots[]' <<<"$input")
   # the cache alone, no call: a blocking Socket result already cached for an artifact counts, named or not
   if [[ "$(jq '.cached | length' <<<"$input")" != 0 ]]; then
@@ -9620,7 +9640,13 @@ package_audit_cached_blocks() {
   ttl=$(socket_cache_ttl_seconds)
   if (( ttl <= 0 )); then printf '{"blocks":[],"gap":""}\n'; return 0; fi
   dir=$(socket_cache_dir)
-  if [[ ! -e "$dir" && ! -L "$dir" ]]; then printf '{"blocks":[],"gap":""}\n'; return 0; fi
+  # only a path shown to be ABSENT is absent: ENOENT is the one answer that is; a permission or input/output failure, a
+  # component that is not a directory, anything else, is a gap
+  local stat_err
+  stat_err=$(LC_ALL=C stat -- "$dir" 2>&1 >/dev/null) || {
+    if [[ "$stat_err" == *"No such file or directory"* ]]; then printf '{"blocks":[],"gap":""}\n'; return 0; fi
+    printf '{"blocks":[],"gap":"the Socket cache directory cannot be inspected"}\n'; return 0
+  }
   if [[ ! -d "$dir" || ! -r "$dir" || ! -x "$dir" ]]; then
     printf '{"blocks":[],"gap":"the Socket cache directory cannot be read"}\n'; return 0
   fi
@@ -9642,7 +9668,7 @@ package_audit_cached_blocks() {
     entry="$dir/${keys[$i]}.json"
     if [[ ! -e "$entry" && ! -L "$entry" ]]; then continue; fi       # absent: nothing cached, not a failure
     if [[ ! -f "$entry" || ! -r "$entry" ]]; then gap="a Socket cache entry cannot be read"; continue; fi
-    SOCKET_CACHE_STALE_AGE_DAYS=""; SOCKET_CACHE_FUTURE=""
+    SOCKET_CACHE_STALE_AGE_DAYS=""
     if socket_cache_replay "$ecosystem" "${names[$i]}" "${versions[$i]}" "$tmp"; then
       [[ "$(socket_classify "$tmp")" == "malware" ]] || continue
       blocks=$(jq -c --arg n "${names[$i]}" --arg v "${versions[$i]}" '. + [{name: $n, version: $v, line: "BLOCK (critical supply-chain-risk alert)"}]' <<<"$blocks")
@@ -9696,7 +9722,13 @@ package_audit_command() {
         ;;
       --evidence-only)
         evidence_only=1
+        EVIDENCE_ONLY_RUN=1
         shift
+        ;;
+      --evidence-progress)
+        [[ $# -ge 2 ]] || die "--evidence-progress needs a file"
+        EVIDENCE_PROGRESS_FILE="$2"
+        shift 2
         ;;
       --find-links-selected)
         CHECK_FIND_LINKS_SELECTED=1
@@ -9747,6 +9779,7 @@ package_audit_command() {
         ;;
     esac
   done
+  [[ -z "$EVIDENCE_PROGRESS_FILE" ]] || (( evidence_only )) || die "--evidence-progress needs --evidence-only"
   if (( evidence_only )) && [[ -z "$spec" ]]; then
     [[ -z "$gate" ]] || die "--evidence-only takes no --gate"
     package_audit_evidence_batch "${ecosystem:-npm}"
@@ -12505,6 +12538,19 @@ FILES
 EOF
 }
 
+# Whether the flag is an option of package-audit, read as its parser reads the arguments: the value of an option that
+# takes one is never the flag.
+evidence_flag_present() {
+  while (( $# > 0 )); do
+    case "$1" in
+      --evidence-only) return 0 ;;
+      --ecosystem|--installer|--npm-userconfig|--npm-globalconfig|--op|--gate|--dist-tag|--registry|--project-dir|--evidence-progress) shift 2 || return 1 ;;
+      *) shift ;;
+    esac
+  done
+  return 1
+}
+
 main() {
   ensure_dependencies
   local cmd="${1:-}"
@@ -12538,14 +12584,8 @@ main() {
   esac
   # The evidence-only reading (the project lane's) writes nothing, a cold start included: it is dispatched before the
   # initialisation that creates the registries, the host-allow log and the directories.
-  if [[ "$cmd" == "package-audit" || "$cmd" == "check" ]]; then
-    local evidence_arg
-    for evidence_arg in "$@"; do
-      if [[ "$evidence_arg" == "--evidence-only" ]]; then
-        EVIDENCE_ONLY_RUN=1
-        break
-      fi
-    done
+  if [[ "$cmd" == "package-audit" || "$cmd" == "check" ]] && evidence_flag_present "${@:2}"; then
+    EVIDENCE_ONLY_RUN=1
   fi
   if [[ "$SAFE_AUDIT_NO_INIT" != "1" && "${EVIDENCE_ONLY_RUN:-0}" != "1" ]]; then
     ensure_dirs
