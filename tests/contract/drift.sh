@@ -426,7 +426,9 @@ case_npm_option_snapshot_is_consistent_and_reads_like_nopt() {
   check 1 'evil install' 0 --no-json=evil install         # --no- makes any option Boolean
   check 1 'install evil' 0 install --jso=evil             # an abbreviated name
   check 1 'install evil' 1 --tag=-g install evil          # a String option re-reads a value that looks like a flag (here: -g)
-  check 0 'install evil' 1 --location=global install evil
+  check 0 'install evil' 0 --location=global install evil   # the location never decides the gate's global mode (npm 8.1.0 does not act on it) ...
+  safe_gate_nopt_parse --location=global install evil
+  [[ "${SAFE_GATE_NOPT_LOCGLOBAL}" == 1 ]] || bad="${bad} (--location=global is not seen as a global location)"   # ... it is seen, and the gate refuses it
   check 0 'install evil' 0 --frobnicate=x install evil    # an unknown name consumes it
   check 0 'install --json=evil' 0 install -- --json=evil  # after the terminator nothing is an option
   # the version-dependent names: each is a known option (or shorthand), has at least two distinct readings, and every
