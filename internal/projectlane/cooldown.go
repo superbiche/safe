@@ -355,7 +355,7 @@ func judgeCooldown(in Input, baseline Graph, decided *Report) (CooldownReport, e
 		if len(fixes) > 0 {
 			wait.Remediates, wait.Enforced = fixes, true
 		}
-		wait.Cleared, wait.ClearedBy = waitCleared(candidate.Identity, in, []string{"release_too_new"})
+		wait.Cleared, wait.ClearedBy = waitCleared(candidate.Identity, in, []string{"release_too_new"}, ClassWait)
 		report.Waits = append(report.Waits, wait)
 	}
 	return report, nil
@@ -366,7 +366,7 @@ func judgeCooldown(in Input, baseline Graph, decided *Report) (CooldownReport, e
 // advisory's (a local exact approval, a followed grant, a followed install
 // allowance): a release that is too young is a WARN cause of today's gate, which
 // those clear.
-func waitCleared(identity Identity, in Input, causes []string) (bool, []string) {
+func waitCleared(identity Identity, in Input, causes []string, clearClass string) (bool, []string) {
 	used := map[string]struct{}{}
 	carried := 0
 	seen := map[string]struct{}{}
@@ -380,7 +380,7 @@ func waitCleared(identity Identity, in Input, causes []string) (bool, []string) 
 		}
 		seen[marker] = struct{}{}
 		carried++
-		kind, ok := clearingAcceptance(AdvisoryAdverse, occurrence, in.Evidence, nil)
+		kind, ok := clearingAcceptance(AdvisoryAdverse, clearClass, occurrence, in.Evidence, nil)
 		if !ok {
 			kind, ok = tolerates(occurrence, in.Evidence, in.Target, causes)
 		}

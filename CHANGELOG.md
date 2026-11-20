@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- Project lane (still behind `install.project_lane`): the operator's terminal. At the operator's terminal only (today's
+  predicate: a terminal on stdin and no recognized agent marker; an agent session is never prompted and ends as it does
+  unattended, and a dry run is never prompted), each class the decision leaves at stake and the lane goes on with is resolved on
+  its own, in the decision's order, with today's own prompts: a typed override per artifact for malice (never recorded) and for
+  a blocking advisory (recorded as today's gate records it; `record name@version` also records the advisory override, never
+  for a block that is also malice, over every byte the artifact carries), ONE prompt for all adverse advisories with `[y]`,
+  `[a]`, `[N]`, today's adverse override for a wait, today's rate-limit, consent and pending prompts for Socket on a named
+  root, and the deliberate confirmation for missing evidence (an advisory reading, including one that answers something
+  unreadable, a publish time, a Socket outage: this command only, recording nothing, never `[a]`; the lockfile is then not
+  recorded as judged). A terminal read that fails authorises nothing (102 before any write; the line says what the unanswered
+  prompt left and what stands). Every class at stake is asked within one command (an answer clears its own class only), and
+  after every reading that changes the evidence the lane decides again, validates and revokes before it asks again; a decline
+  ends with the exit of the class still unresolved. An acceptance is recorded when it is given, by today's writers
+  (`record-installed` and `safe-run host-allow`, the ones beside the dispatcher, on the operator's root: the `[a]` writer runs
+  the lane-verified core and no seed directory), so the next run passes unprompted. A named root whose outcome the operator
+  confirmed is recorded after a verified publication through `record-installed` under the same eligibility as an ordinary
+  record, over the root and the bytes it carries (an inherited advisory, a bundled member, a followed authority and a root
+  not introduced exclude it) and is exportable. A cancellation at a prompt, or during the `[a]` reconfirmation, ends the
+  prompt and its writer and frees the project lock. The evidence window starts before the first evidence read and is
+  enforced before the baseline is recorded and again before the binder starts. A routing refusal, an unreadable baseline and
+  a graph the lane cannot bind have no override at the terminal yet (they end as they do unattended; the one-shot
+  confirmation is ticket 1686). No change to the agent contract: no exit code or agent-visible wording changes; the install
+  gate's own prompt helpers return 2 for a failed terminal read (every caller treats any non-zero as no).
+
 - Project lane (still behind `install.project_lane`): standing acceptances and install records, **no terminal prompt**. The
   decision takes the operator's standing acceptances (a local exact approval or pin, a followed grant, a followed install
   allowance, a followed advisory override with its signer, generation, ecosystem and source checks, the

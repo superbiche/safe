@@ -67,6 +67,8 @@ type Evidence struct {
 	// Acceptances is set by the caller from the separate acceptances input;
 	// the evidence document never carries it.
 	Acceptances []Acceptance `json:"-"`
+	// Answered is set by the caller from the confirmations: the answers given during this command (see confirmations.go).
+	Answered []Answered `json:"-"`
 }
 
 // Policy is the operator's install policy the decision applies.

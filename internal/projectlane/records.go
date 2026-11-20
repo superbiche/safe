@@ -47,7 +47,7 @@ type RecordItem struct {
 // recordsFor lists the eligible named roots of a CLEAR decision. It is empty for any other outcome.
 func recordsFor(report Report, in Input, evidence evidenceIndex) []RecordItem {
 	records := []RecordItem{}
-	if report.Outcome.Status != "clear" {
+	if report.Outcome.Status != "clear" || commandExcluded(report, in) {
 		return records
 	}
 	introduced := map[ArtifactKey]struct{}{}
@@ -69,15 +69,6 @@ func recordsFor(report Report, in Input, evidence evidenceIndex) []RecordItem {
 		for _, root := range report.Socket.Roots {
 			roots[Identity{Name: root.Name, Version: root.Version}] = root
 		}
-	}
-	// the advisories at high or above carried by an identity: of the artifact itself, or of the members its bytes carry
-	gating := func(identity Identity) bool {
-		for _, hit := range evidence[identity].Advisories {
-			if hit.Malware || severityClass(hit.Severity, blockSet) != AdvisoryBelowHigh {
-				return true
-			}
-		}
-		return false
 	}
 	// with a cooldown set, the publish time of a root is part of its evidence: an exact reading of the registry's own record
 	// (a bound from the document's last-modified time is not one). With the cooldown off (days 0) the operator has switched
@@ -105,23 +96,10 @@ func recordsFor(report Report, in Input, evidence evidenceIndex) []RecordItem {
 		if !named {
 			continue // nobody named it: no Socket reading, no record
 		}
-		read, ok := evidence[identity]
-		if !ok || read.Coverage != CoverageComplete || gating(identity) {
-			continue
-		}
-		if _, read := published[identity]; needsPublishTime && !read {
-			continue
-		}
-		// a root whose BYTES carry a high or blocking advisory, introduced or already present, is not eligible: a bundled
-		// member is the root's own bytes
-		carried := false
-		for _, member := range in.Target.Occurrences {
-			if member.CoveredBy != "" && member.coverName == identity.Name && member.coverVersion == identity.Version &&
-				strings.EqualFold(member.Host, occurrence.Host) && gating(member.Identity()) {
-				carried = true
-			}
-		}
-		if carried {
+		// one eligibility rule for both writers, over the root and the bytes it carries (a bundled member is the root's own
+		// bytes): nothing here is accepted by an answer, so any advisory at high or above on those bytes, introduced or not,
+		// excludes the root
+		if !rootBytesEligible(in, evidence, blockSet, identity, occurrence.Host, needsPublishTime, published, nil) {
 			continue
 		}
 		tolerated := false
@@ -145,6 +123,41 @@ func recordsFor(report Report, in Input, evidence evidenceIndex) []RecordItem {
 		records = append(records, item)
 	}
 	return records
+}
+
+// rootBytes is the root and every member of the same source its bytes carry.
+func rootBytes(in Input, identity Identity, host string) []Identity {
+	out := []Identity{identity}
+	for _, member := range in.Target.Occurrences {
+		if member.CoveredBy != "" && member.coverName == identity.Name && member.coverVersion == identity.Version && strings.EqualFold(member.Host, host) {
+			out = append(out, member.Identity())
+		}
+	}
+	return out
+}
+
+// rootBytesEligible is THE eligibility rule of a record, ordinary or confirmed: the root's own evidence is complete, its publish
+// time is read where a cooldown is set, and no advisory at high or above stands on any byte it carries unless `accepted` says the
+// operator accepted that exact finding in this command (the ordinary writer accepts none).
+func rootBytesEligible(in Input, evidence evidenceIndex, blockSet map[string]struct{}, identity Identity, host string, needsPublishTime bool, published map[Identity]struct{}, accepted func(member Identity, id string) bool) bool {
+	read, ok := evidence[identity]
+	if !ok || read.Coverage != CoverageComplete {
+		return false
+	}
+	if _, read := published[identity]; needsPublishTime && !read {
+		return false
+	}
+	for _, member := range rootBytes(in, identity, host) {
+		for _, hit := range evidence[member].Advisories {
+			if !hit.Malware && severityClass(hit.Severity, blockSet) == AdvisoryBelowHigh {
+				continue
+			}
+			if accepted == nil || !accepted(member, hit.ID) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func onlyTolerance(kinds []string) bool {
@@ -262,6 +275,180 @@ func wantedAcceptances(report Report, in Input) []WantedAcceptance {
 			return out[i].Version < out[j].Version
 		}
 		return out[i].Host < out[j].Host
+	})
+	return out
+}
+
+// commandExcluded says whether this command may leave any install record at all: never a command confirmed on missing evidence
+// or on a Socket outage, one that carries a malice override, or one that carries a block override (an answer to a blocking
+// advisory): the command was not judged clean, whatever its other roots are.
+func commandExcluded(report Report, in Input) bool {
+	if in.Confirmations.EvidenceGap && len(report.Coverage) > 0 {
+		return true
+	}
+	if len(in.Confirmations.Socket) > 0 {
+		return true
+	}
+	for _, item := range report.Malice {
+		if item.Overridden {
+			return true
+		}
+	}
+	for _, answer := range in.Evidence.Answered {
+		if answer.Class == ClassBlockingAdvisory {
+			return true
+		}
+	}
+	return false
+}
+
+// ConfirmedRecord is a named root whose outcome the operator confirmed, with the token today's operator-terminal record path
+// writes for it.
+type ConfirmedRecord struct {
+	Name     string `json:"name"`
+	Version  string `json:"version"`
+	Token    string `json:"token"`
+	GateExit int    `json:"gate_exit"`
+}
+
+var confirmedTokenRank = map[string]int{"WARN_TTY_OVERRIDE": 3, "GO_PENDING_CONFIRMED": 2, "GO_SOCKET_DECLINED": 1}
+var confirmedTokenExit = map[string]int{"WARN_TTY_OVERRIDE": 10, "GO_PENDING_CONFIRMED": 14, "GO_SOCKET_DECLINED": 13}
+
+// confirmedRecordsFor lists, from the FINAL decision, the named roots the operator confirmed that may be recorded after a
+// verified publication: introduced by this command, a public registry artifact, named (it has a Socket row), not rested on a
+// followed authority in any class, in a command nothing excludes.
+func confirmedRecordsFor(report Report, in Input, evidence evidenceIndex) []ConfirmedRecord {
+	out := []ConfirmedRecord{}
+	if report.Outcome.Status != "clear" || commandExcluded(report, in) || report.Socket == nil {
+		return out
+	}
+	introduced := map[Identity]struct{}{}
+	introducedKeys := map[ArtifactKey]struct{}{}
+	for _, item := range report.Difference.Introduced {
+		introducedKeys[item.ArtifactKey] = struct{}{}
+	}
+	for _, occurrence := range in.Target.Occurrences {
+		if _, isNew := introducedKeys[occurrence.Key()]; isNew && occurrence.Public && occurrence.Kind == KindRegistry && !occurrence.covered() {
+			introduced[occurrence.Identity()] = struct{}{}
+		}
+	}
+	roots := map[Identity]struct{}{}
+	for _, root := range report.Socket.Roots {
+		roots[Identity{Name: root.Name, Version: root.Version}] = struct{}{}
+	}
+	followed := func(kinds []string) bool {
+		for _, kind := range kinds {
+			if kind == AcceptFollowedGrant || kind == AcceptFollowedInstall || kind == AcceptFollowedOverride {
+				return true
+			}
+		}
+		return false
+	}
+	// the authority used for each occurrence on the root's bytes, through the covering relation: a member's followed advisory
+	// clearance is the root's
+	reliesOnFollowed := func(identity Identity, host string) bool {
+		bytes := map[Identity]struct{}{}
+		for _, member := range rootBytes(in, identity, host) {
+			bytes[member] = struct{}{}
+		}
+		for _, item := range report.Advisories.Introduced {
+			if !followed(item.ClearedBy) {
+				continue
+			}
+			for _, version := range item.Versions {
+				if _, carried := bytes[Identity{Name: item.Name, Version: version}]; carried {
+					return true
+				}
+			}
+		}
+		if report.Cooldown != nil {
+			for _, wait := range report.Cooldown.Waits {
+				if _, carried := bytes[Identity{Name: wait.Name, Version: wait.Version}]; carried && followed(wait.ClearedBy) {
+					return true
+				}
+			}
+		}
+		for _, root := range report.Socket.Roots {
+			if _, carried := bytes[Identity{Name: root.Name, Version: root.Version}]; carried && followed(root.ClearedBy) {
+				return true
+			}
+		}
+		return false
+	}
+	blockSet := map[string]struct{}{}
+	for _, severity := range in.Evidence.Policy.BlockSeverities {
+		blockSet[severity] = struct{}{}
+	}
+	needsPublishTime := in.Releases != nil && in.Releases.Policy.CooldownDays > 0
+	published := map[Identity]struct{}{}
+	if in.Releases != nil {
+		for _, reading := range in.Releases.Identities {
+			if reading.Status == ReadingRead {
+				published[Identity{Name: reading.Name, Version: reading.Version}] = struct{}{}
+			}
+		}
+	}
+	hostOfRoot := map[Identity]string{}
+	for _, occurrence := range in.Target.Occurrences {
+		if occurrence.Public && occurrence.Kind == KindRegistry && !occurrence.covered() {
+			hostOfRoot[occurrence.Identity()] = occurrence.Host
+		}
+	}
+	// the findings the operator accepted in this command: an introduced advisory of the adverse class, nothing followed
+	// cleared, on bytes the answered root carries
+	answeredAdverse := map[Identity]struct{}{}
+	for _, answer := range in.Evidence.Answered {
+		if answer.Class == ClassAdverseAdvisory {
+			answeredAdverse[Identity{Name: answer.Name, Version: answer.Version}] = struct{}{}
+		}
+	}
+	best := map[Identity]string{}
+	for _, answer := range in.Evidence.Answered {
+		if answer.Token == "" {
+			continue
+		}
+		identity := Identity{Name: answer.Name, Version: answer.Version}
+		if _, named := roots[identity]; !named {
+			continue
+		}
+		if _, isNew := introduced[identity]; !isNew {
+			continue
+		}
+		host := hostOfRoot[identity]
+		if reliesOnFollowed(identity, host) {
+			continue
+		}
+		accepted := func(member Identity, id string) bool {
+			if _, answered := answeredAdverse[identity]; !answered {
+				return false
+			}
+			for _, item := range report.Advisories.Introduced {
+				if item.ID != id || item.Name != member.Name || item.Class != AdvisoryAdverse || followed(item.ClearedBy) {
+					continue
+				}
+				for _, version := range item.Versions {
+					if version == member.Version {
+						return true
+					}
+				}
+			}
+			return false
+		}
+		if !rootBytesEligible(in, evidence, blockSet, identity, host, needsPublishTime, published, accepted) {
+			continue
+		}
+		if confirmedTokenRank[answer.Token] > confirmedTokenRank[best[identity]] {
+			best[identity] = answer.Token
+		}
+	}
+	for identity, token := range best {
+		out = append(out, ConfirmedRecord{Name: identity.Name, Version: identity.Version, Token: token, GateExit: confirmedTokenExit[token]})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].Version < out[j].Version
 	})
 	return out
 }

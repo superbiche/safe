@@ -296,6 +296,45 @@ pass and warnings under `environment.release_follow`.
   `CooldownCandidates`, holds the choice); an entry the lockfile on disk carries that the baseline does not is
   introduced, and is judged. The npm must define `min-release-age-exclude` (npm 11.17.0 or later, which the
   capability probe checks on top of the 11.12.1 floor).
+  **The operator's terminal.** At the operator's terminal (stdin is a terminal and no recognized agent marker is set:
+  today's predicate, never loosened; an answer is never read from stdin and `--yes` reaches no prompt), and only there, each
+  class the decision leaves at stake is resolved on its own, in the decision's own order, with today's prompts (the lane calls
+  the install gate's functions: it has no prompt reader of its own). **Malice:** a typed `name@version` per artifact, for this
+  command, never recorded. **Blocking advisory:** a typed `name@version` per artifact (the acceptance is recorded as today's
+  gate records it: a local approval of that exact artifact and source), or `record name@version`, which also records the
+  advisory override on the host-allow entry (advisory-only, through `safe-run host-allow add --accept-block`, which asks
+  again). **Graph not bound:** no override at the terminal (it ends as it does unattended, with its line; the one-shot confirmation
+  is a separate ticket). **Adverse advisory:** ONE prompt
+  lists every artifact and advisory; `[y]` accepts the listed exact artifacts (each recorded as an acceptance), `[a]` also
+  records a host-allow grant (npm and python, as today), `[N]` declines. **Wait:** today's adverse override. **Socket on a named
+  root:** the rate-limit approval (for this command; the approval of each exact artifact is recorded), the consent ask (`Y`
+  reads Socket again with the consent, `n` proceeds without it and records the acceptance), the pending-score confirmation, an
+  adverse finding (the adverse override), and an outage (the deliberate confirmation, for this command, recorded nowhere).
+  **Missing evidence:** the deliberate confirmation of the infrastructure ruling, for this command, recording nothing, never
+  `[a]`; the lockfile is then not recorded as judged, so what could not be judged is judged again the next time and is never
+  read as already present. A decline ends the command with the exit of the class left (104, 102 or 100). An acceptance is
+  recorded when it is given, in today's stores by today's writers (`safe audit record-installed`, `safe-run host-allow`),
+  on the operator's established root (`$HOME/.config/safe/run`: never a redirect the environment names) and with the programs
+  beside the dispatcher (the auditor inside `safe-run` included; a missing sibling `safe-run` refuses, it is never looked up on
+  the `PATH`), so the standing acceptances clear the same command the next time without a prompt. **A read from the terminal
+  that fails (end of input) authorises nothing**: it ends the command 102 before anything is written, apart from an explicit no.
+  **Each class is shown within one command:** an answer clears its own class for this command and is recorded when given, so
+  the next command reuses it; the other classes at stake on the same artifact (an advisory, then a wait, then a pending Socket
+  score) are still asked. Each prompt lists only the unresolved items of its class (an advisory over two versions with one
+  accepted lists the other); a Socket BLOCK is malice and is asked there only, once per artifact with all its signals; a block
+  that is also malice is never recordable. A named root whose outcome the operator confirmed (an adverse override, a Socket
+  consent declined, a pending score confirmed) is recorded after a verified publication through the same `record-installed`
+  (`WARN_TTY_OVERRIDE`, `GO_SOCKET_DECLINED`, `GO_PENDING_CONFIRMED`: exportable), as the FINAL decision leaves it eligible:
+  under the SAME eligibility as an ordinary record, over the root and every byte it carries: the root was introduced by the
+  command, no advisory at high or above stands on its bytes (an inherited one, a bundled member's) except one the operator
+  accepted in this command, it relies on no followed authority for any of them, and nothing excludes the command as a whole
+  (confirmed missing evidence, a confirmed Socket outage, a malice or block override record nothing). New adverse
+  evidence revokes the receipt it supersedes at once, after every reading. A routing refusal, an unreadable baseline and a graph the lane cannot bind are not asked about (no override yet). A cancellation (TERM, INT) at a prompt, or while the `[a]` grant is being reconfirmed, ends the prompt and the writer and frees the project lock; the acceptance already given stays, nothing is granted or published. A dry run, by argument or by npm's configuration, is never prompted. When
+  the prompts end the evidence may not be older than 15 minutes counted from BEFORE the first evidence read
+  (`install.lane_evidence_window_seconds` in the operator's configuration may shorten it), checked immediately before the
+  baseline is recorded and again immediately before the binder starts: otherwise the command is refused, and what was accepted stays recorded, so the
+  rerun asks nothing again. An agent session is never prompted: it ends as it does unattended.
+
   **Standing acceptances.** The decision takes the operator's standing acceptances as a document of its own, read by safe's
   own reader (`safe audit lane-acceptances`, which calls the functions today's install gate calls and has no store, format or
   rule of its own) for exactly the artifacts a first decision leaves outstanding, from the stores where the lane reads its
