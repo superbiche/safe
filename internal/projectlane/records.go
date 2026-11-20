@@ -2,11 +2,18 @@ package projectlane
 
 // Install records (spec 1625, "Records and export").
 //
-// The decision says which introduced artifacts the command may leave an install record for; the gate writes them, and only
-// after the binder reports a verified, published tree. The kinds that are eligible, as the 2026-10-13 ruling lists them:
+// The decision says which artifacts the command may leave an install record for; the gate writes them, and only after the
+// binder reports a verified, published tree. Records are for NAMED ROOTS only, as today's gate records a named install and
+// never the transitive packages a project install brings: a record is exported as an install allowance, which lets a
+// follower install that exact version by name in place of the Socket consent, pending and warning outcomes, so it must rest
+// on a Socket reading of the artifact. The kinds that are eligible:
 //
-//   - an introduced artifact whose OWN evidence is complete and clean or below high (verdict GO);
-//   - one covered by the operator's local standing tolerance (verdict WARN_TOLERATED).
+//   - a named root the command introduces whose OWN evidence is complete (its advisory reading, its publish time and its
+//     Socket reading) and clean or below high (verdict GO);
+//   - a named root cleared by the operator's local standing tolerance (verdict WARN_TOLERATED).
+//
+// Every introduced artifact nobody named is excluded, whatever its evidence; so is a root whose Socket reading is anything
+// but clear or tolerated. A bare install, update, ci, dedupe or prune names no root and records nothing.
 //
 // A third kind, a named root whose outcome the operator CONFIRMED at a terminal, is the operator terminal's ticket (1684):
 // it needs a prompt, and its place is here, next to the other two, as a record of the confirmed outcome.
@@ -67,6 +74,10 @@ func recordsFor(report Report, in Input, evidence evidenceIndex) []RecordItem {
 			continue
 		}
 		seen[identity] = struct{}{}
+		root, named := roots[identity]
+		if !named {
+			continue // nobody named it: no Socket reading, no record
+		}
 		read, ok := evidence[identity]
 		if !ok || read.Coverage != CoverageComplete {
 			continue
@@ -90,17 +101,13 @@ func recordsFor(report Report, in Input, evidence evidenceIndex) []RecordItem {
 			}
 			tolerated = append(tolerated, "release_too_new")
 		}
-		if root, named := roots[identity]; named {
-			switch {
-			case root.Outcome == SocketClear:
-				reasons = append(reasons, "socket_ok")
-			case onlyTolerance(root.ClearedBy):
-				tolerated = append(tolerated, rootCauses(in, identity)...)
-			default:
-				continue // cleared by another authority, or confirmed at a terminal (1684): not this ticket's record
-			}
-		} else {
-			reasons = append(reasons, "socket_not_scored_by_the_lane")
+		switch {
+		case root.Outcome == SocketClear:
+			reasons = append(reasons, "socket_ok")
+		case onlyTolerance(root.ClearedBy):
+			tolerated = append(tolerated, rootCauses(in, identity)...)
+		default:
+			continue // cleared by another authority, or confirmed at a terminal (1684): not this ticket's record
 		}
 		reasons = append(reasons, "blocklist_pass")
 		item := RecordItem{Name: identity.Name, Version: identity.Version, Host: occurrence.Host, Verdict: RecordClean, Reasons: reasons}

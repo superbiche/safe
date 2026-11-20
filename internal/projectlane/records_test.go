@@ -82,7 +82,8 @@ func TestRecordsAreOnlyForIntroducedArtifactsWithTheirOwnCleanEvidence(t *testin
 		read("carry", "2.0.0", hit("GHSA-old2", SeverityHigh)), read("carry", "1.0.0", hit("GHSA-old2", SeverityHigh)), gap("blind", "1.0.0"))
 	base := pkgs("kept", "1.0.0", "carry", "1.0.0")
 	target := pkgs("kept", "1.0.0", "new", "1.0.0", "low", "1.0.0", "carry", "2.0.0")
-	report := Decide(Input{Baseline: graphOf(t, base), HasBaseline: true, Target: graphOf(t, target), Evidence: ev})
+	roots := socketOf(sroot("new", "1.0.0", SocketClear), sroot("low", "1.0.0", SocketClear), sroot("carry", "2.0.0", SocketClear), sroot("kept", "1.0.0", SocketClear))
+	report := Decide(Input{Baseline: graphOf(t, base), HasBaseline: true, Target: graphOf(t, target), Evidence: ev, Socket: roots})
 	if report.Outcome.Status != "clear" {
 		t.Fatalf("%+v", report.Outcome)
 	}
@@ -92,9 +93,16 @@ func TestRecordsAreOnlyForIntroducedArtifactsWithTheirOwnCleanEvidence(t *testin
 		t.Fatalf("records = %v, want %v", got, want)
 	}
 	for _, item := range report.Records {
-		if item.Name == "low" && !reflect.DeepEqual(item.Reasons, []string{"osv_below_high_only", "socket_not_scored_by_the_lane", "blocklist_pass"}) {
+		if item.Name == "low" && !reflect.DeepEqual(item.Reasons, []string{"osv_below_high_only", "socket_ok", "blocklist_pass"}) {
 			t.Errorf("reasons = %v", item.Reasons)
 		}
+	}
+	// nobody named them: the same decision with no named root records nothing, whatever the evidence
+	if unnamed := Decide(Input{Baseline: graphOf(t, base), HasBaseline: true, Target: graphOf(t, target), Evidence: ev, Socket: socketOf()}); len(unnamed.Records) != 0 {
+		t.Fatalf("unnamed artifacts were recorded: %v", installRecordsOf(unnamed))
+	}
+	if nosocket := Decide(Input{Baseline: graphOf(t, base), HasBaseline: true, Target: graphOf(t, target), Evidence: ev}); len(nosocket.Records) != 0 {
+		t.Fatalf("a decision with no Socket reading recorded: %v", installRecordsOf(nosocket))
 	}
 	// a decision that is not clear records nothing
 	stopped := Decide(Input{Target: graphOf(t, pkgs("new", "1.0.0", "bad", "1.0.0")), Evidence: evidenceOf(read("new", "1.0.0"), read("bad", "1.0.0", hit("GHSA-x", SeverityHigh)))})
@@ -107,17 +115,17 @@ func TestRecordsFollowWhoClearedTheArtifact(t *testing.T) {
 	young := releasesOf(3, SecurityFixExempt, reading("pk", "1.0.0", 10), reading("fol", "1.0.0", 10))
 	ev := evidenceOf(read("pk", "1.0.0"), read("fol", "1.0.0"))
 	// tolerated: a WARN_TOLERATED record carrying the cause
-	r := Decide(Input{Target: graphOf(t, pkgs("pk", "1.0.0")), Evidence: ev.accepting(tolerance("pk", "1.0.0", "release_too_new")), Releases: young})
+	r := Decide(Input{Target: graphOf(t, pkgs("pk", "1.0.0")), Evidence: ev.accepting(tolerance("pk", "1.0.0", "release_too_new")), Releases: young, Socket: socketOf(sroot("pk", "1.0.0", SocketClear))})
 	if got := installRecordsOf(r); !reflect.DeepEqual(got, []string{"WARN_TOLERATED pk@1.0.0"}) || !reflect.DeepEqual(r.Records[0].Reasons, []string{"release_too_new"}) {
 		t.Fatalf("tolerated: %v %v", got, r.Records)
 	}
 	// cleared by a followed authority: another origin's decision, never recorded (and so never exported again)
-	r = Decide(Input{Target: graphOf(t, pkgs("fol", "1.0.0")), Evidence: ev.accepting(accept(AcceptFollowedInstall, "fol", "1.0.0")), Releases: young})
+	r = Decide(Input{Target: graphOf(t, pkgs("fol", "1.0.0")), Evidence: ev.accepting(accept(AcceptFollowedInstall, "fol", "1.0.0")), Releases: young, Socket: socketOf(sroot("fol", "1.0.0", SocketClear))})
 	if r.Outcome.Status != "clear" || len(r.Records) != 0 {
 		t.Fatalf("followed: %+v %v", r.Outcome, r.Records)
 	}
 	// a local approval: stored already, not a new record
-	r = Decide(Input{Target: graphOf(t, pkgs("fol", "1.0.0")), Evidence: ev.accepting(accept(AcceptLocalExact, "fol", "1.0.0")), Releases: young})
+	r = Decide(Input{Target: graphOf(t, pkgs("fol", "1.0.0")), Evidence: ev.accepting(accept(AcceptLocalExact, "fol", "1.0.0")), Releases: young, Socket: socketOf(sroot("fol", "1.0.0", SocketClear))})
 	if len(r.Records) != 0 {
 		t.Fatalf("local approval recorded: %v", r.Records)
 	}
@@ -132,7 +140,7 @@ func TestRecordsFollowWhoClearedTheArtifact(t *testing.T) {
 	}
 	// bundled members are not records of their own
 	bundled := map[string]map[string]any{"node_modules/b": entry("b", "2.0.0"), "node_modules/b/node_modules/bund": {"version": "1.0.0", "inBundle": true}}
-	r = Decide(Input{Target: graphOf(t, bundled), Evidence: evidenceOf(read("b", "2.0.0"), read("bund", "1.0.0"))})
+	r = Decide(Input{Target: graphOf(t, bundled), Evidence: evidenceOf(read("b", "2.0.0"), read("bund", "1.0.0")), Socket: socketOf(sroot("b", "2.0.0", SocketClear))})
 	if got := installRecordsOf(r); !reflect.DeepEqual(got, []string{"GO b@2.0.0"}) {
 		t.Fatalf("bundled: %v", got)
 	}

@@ -14330,17 +14330,48 @@ case_project_lane_a_record_that_cannot_be_written_is_reported_and_undoes_nothing
 case_project_lane_what_it_records_is_exportable_and_a_followers_authority_is_not() {
   skip_lockdiff_case "$FUNCNAME" || return
   lane_prepare "lane-record-export" kept@1.0.0
-  cooldown_registry_start "${CASE_DIR}" "fresh@2.0.0=10" "kept@1.0.0=2400" "clean@2.0.0=2400" "folw@1.0.0=10"
+  cooldown_registry_start "${CASE_DIR}" "fresh@2.0.0=10" "kept@1.0.0=2400" "clean@2.0.0=2400" "folw@1.0.0=10" "trans@1.0.0=2400"
   lane_seed tolerance fresh 2.0.0 release_too_new
   lane_seed followed-install folw 1.0.0
   NPM_PROJECTION_MANIFEST_JSON='{"name":"lane-test","version":"1.0.0","dependencies":{"kept":"^1.0.0","clean":"^2.0.0","fresh":"^2.0.0","folw":"^1.0.0"}}' \
-    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 fresh@2.0.0 folw@1.0.0)" lane_run 'npm install clean@2.0.0 fresh@2.0.0 folw@1.0.0'
+    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 fresh@2.0.0 folw@1.0.0 trans@1.0.0)" lane_run 'npm install clean@2.0.0 fresh@2.0.0 folw@1.0.0'
   cooldown_registry_stop
   assert_status 0 "$FUNCNAME: the command" || return
   local export_doc
   export_doc="$(HOME="${HOME_DIR}" SAFE_RUN_CONFIG_DIR="$(lane_store)" "${ROOT_DIR}/bin/safe-run" host-allow export --json 2>/dev/null)" || export_doc=""
   [[ "$(jq -c '[.install_allowances[] | "\(.ecosystem):\(.name)@\(.version) \(.verdict)"] | sort' <<<"${export_doc}" 2>/dev/null)" == '["npm:clean@2.0.0 GO","npm:fresh@2.0.0 WARN_TOLERATED"]' ]] \
-    || { fail "$FUNCNAME: the export: $(jq -c '.install_allowances' <<<"${export_doc}" 2>/dev/null)"; return; }
+    || { fail "$FUNCNAME: the export lists only the named roots, and not a transitive dependency or a followed authority: $(jq -c '.install_allowances' <<<"${export_doc}" 2>/dev/null)"; return; }
+  pass "$FUNCNAME"
+}
+
+# Records are for NAMED ROOTS only: a closure artifact nobody named has no Socket reading, and a record is exported as an install
+# allowance that a follower takes in place of the Socket consent, pending and warning outcomes.
+case_project_lane_records_are_for_named_roots_only() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  # a named install with a transitive dependency records the root, not the dependency
+  lane_prepare "lane-record-root-only" kept@1.0.0
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 trans@1.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME: a named install" || return
+  [[ "$(lane_known clean | jq -r .verdict)" == GO ]] || { fail "$FUNCNAME: the root is not recorded"; return; }
+  [[ -z "$(lane_known trans)" ]] || { fail "$FUNCNAME: a transitive dependency was recorded: $(lane_known trans)"; return; }
+  [[ "$(lane_known clean | jq -r '.reasons | join(",")')" != *socket_not_scored* ]] || { fail "$FUNCNAME: a record without a Socket reading"; return; }
+  # a bare update names no root: it records nothing, and the real exporter lists nothing
+  lane_prepare "lane-record-bare" kept@1.0.0
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.1.0 trans@1.0.0)" lane_run 'npm update'
+  assert_status 0 "$FUNCNAME: a bare update" || return
+  [[ -z "$(lane_known kept)" && -z "$(lane_known trans)" ]] || { fail "$FUNCNAME: a bare update recorded: $(lane_known kept) $(lane_known trans)"; return; }
+  # a named root whose Socket outcome a followed install allowance clears installs and records nothing
+  lane_prepare "lane-record-root-followed" kept@1.0.0
+  lane_seed followed-install clean 2.0.0
+  SAFE_AUDIT_SOCKET_OUTCOMES='{"clean@2.0.0":"consent_required"}' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME: a followed install allowance clears the consent ask" || return
+  [[ -z "$(lane_known clean)" ]] || { fail "$FUNCNAME: a followed authority was recorded: $(lane_known clean)"; return; }
+  # a named root with an adverse Socket outcome that a standing tolerance clears is the tolerated kind
+  lane_prepare "lane-record-root-tolerated" kept@1.0.0
+  lane_seed tolerance clean 2.0.0 socket_low_score
+  SAFE_AUDIT_SOCKET_OUTCOMES='{"clean@2.0.0":"adverse"}' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME: a tolerated Socket result" || return
+  [[ "$(lane_known clean | jq -r '.verdict + " " + (.reasons | join(","))')" == "WARN_TOLERATED socket_low_score" ]] || { fail "$FUNCNAME: $(lane_known clean)"; return; }
   pass "$FUNCNAME"
 }
 
@@ -14765,6 +14796,7 @@ main() {
     case_project_lane_records_a_tolerated_artifact_and_never_another_authoritys_decision \
     case_project_lane_a_record_that_cannot_be_written_is_reported_and_undoes_nothing \
     case_project_lane_what_it_records_is_exportable_and_a_followers_authority_is_not \
+    case_project_lane_records_are_for_named_roots_only \
     case_project_lane_socket_a_passing_root_records_nothing_when_the_command_does_not_complete \
     case_project_lane_socket_a_young_named_fix_installs_under_exempt_and_waits_under_enforce \
     case_project_lane_socket_a_roots_own_advisory_gates_only_when_introduced \

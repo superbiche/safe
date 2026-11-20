@@ -11,8 +11,9 @@
   it only when it covers every blocking advisory; adverse advisories, waits and Socket outcomes on a named root are cleared
   by the authorities of today's adverse warning; nothing clears malice, an unbound graph or missing evidence. After a
   verified, published tree (never for a refusal, a failed materialisation, `--dry-run` or `--package-lock-only`) the lane
-  leaves install records (`safe audit lane-record`, today's writer) for introduced artifacts whose own evidence is clean or
-  below high and for those a local tolerance cleared; never for an artifact that passed only because its advisories were
+  leaves install records (`safe audit lane-record`, today's writer) for the **named roots** the command introduced whose own
+  evidence, Socket reading included, is clean or below high, and for those a local tolerance cleared (never for a transitive
+  package nobody named: a record is exported as an install allowance, which a follower takes in place of the Socket consent); never for an artifact that passed only because its advisories were
   already present, and never for another authority's decision, so a follower never re-exports an authority. A record that
   cannot be written is reported and undoes nothing. The operator-confirmed named root is the operator-terminal ticket's.
 
