@@ -565,7 +565,7 @@ if [[ "${1:-}" == "effective-sources" ]]; then
 fi
 # The lane's two doors into the operator's stores are the REAL auditor's: the cases seed real stores in the test home.
 # SAFE_AUDIT_LANE_DOOR_STATUS makes a door fail, to show what a reader or a writer that fails leaves behind.
-if [[ "${1:-}" == "lane-acceptances" || "${1:-}" == "lane-record" ]]; then
+if [[ "${1:-}" == "lane-acceptances" ]]; then
   printf 'LANE_DOOR\t%s\tSAFE_RUN_CONFIG_DIR=%s\tSAFE_RUN_TRUST_OVERRIDE=%s\n' "$1" "${SAFE_RUN_CONFIG_DIR:-}" "${SAFE_RUN_TRUST_OVERRIDE:-}" >> "${SAFE_INSTALL_COMMAND_LOG}"
   [[ -z "${SAFE_AUDIT_LANE_DOOR_STATUS:-}" ]] || exit "${SAFE_AUDIT_LANE_DOOR_STATUS}"
   exec "${ROOT_DIR}/bin/safe-audit" "$@"
@@ -659,6 +659,12 @@ JSON
   exit "${SAFE_AUDIT_SCAN_STATUS:-0}"
 fi
 
+# The ordinary audit the lane asks about a named root (`package-audit <spec> --gate install`) is the REAL auditor's when a case
+# asks for it, with the repository's Socket/OSV mocks first on PATH; otherwise it is the plain stub (exit 0, writes nothing).
+if [[ "${1:-}" == "package-audit" && " $* " == *" --gate install "* && "${SAFE_AUDIT_REAL_GATE:-0}" == "1" ]]; then
+  printf 'REAL_GATE_AUDIT\t%s\tSAFE_AUDIT_SOCKET_CONSENT=%s\tstdin_tty=%s\n' "$2" "${SAFE_AUDIT_SOCKET_CONSENT:-}" "$([[ -t 0 ]] && echo yes || echo no)" >> "${SAFE_INSTALL_COMMAND_LOG}"
+  PATH="${SAFE_AUDIT_REAL_GATE_MOCKBIN}:${PATH}" exec "${ROOT_DIR}/bin/safe-audit" "$@"
+fi
 # Project lane Socket evidence (package-audit --evidence-only): the document the real auditor writes, scripted.
 # SAFE_AUDIT_SOCKET_OUTCOMES maps "name@version" to an outcome (default clear), SAFE_AUDIT_SOCKET_CACHED_BLOCKS
 # lists "name@version" identities whose cached result blocks, SAFE_AUDIT_SOCKET_CACHE_GAP / _STATUS / _RAW break the
@@ -1093,6 +1099,11 @@ run_zsh() {
     SAFE_AUDIT_EVIDENCE_MISSING="${SAFE_AUDIT_EVIDENCE_MISSING:-}" \
     SAFE_AUDIT_EVIDENCE_BLOCKLIST="${SAFE_AUDIT_EVIDENCE_BLOCKLIST:-}" \
     SAFE_AUDIT_LANE_DOOR_STATUS="${SAFE_AUDIT_LANE_DOOR_STATUS:-}" \
+    SAFE_AUDIT_REAL_GATE="${SAFE_AUDIT_REAL_GATE:-}" \
+    SAFE_AUDIT_REAL_GATE_MOCKBIN="${SAFE_AUDIT_REAL_GATE_MOCKBIN:-}" \
+    MOCK_SOCKET_MODE="${MOCK_SOCKET_MODE:-}" \
+    MOCK_OSV_CRITICAL="${MOCK_OSV_CRITICAL:-}" \
+    MOCK_RELEASE_FRESH="${MOCK_RELEASE_FRESH:-}" \
     SAFE_AUDIT_EVIDENCE_STATUS="${SAFE_AUDIT_EVIDENCE_STATUS:-}" \
     SAFE_AUDIT_EVIDENCE_RAW="${SAFE_AUDIT_EVIDENCE_RAW:-}" \
     SAFE_GATE_NO_EXEC="${SAFE_GATE_NO_EXEC:-}" \
@@ -1192,11 +1203,13 @@ assert_scan_targets_logged() {
   done
 }
 
-# No per-root audit ran: the project lane's one Socket evidence-only reading (`package-audit --ecosystem npm
-# --evidence-only`, which asks nothing and records nothing) is the only package-audit the log may hold.
+# No per-artifact audit of the closure ran: the project lane's Socket evidence-only readings (`package-audit --ecosystem npm
+# --evidence-only`, which ask nothing and record nothing) and, after a verified publication, today's ordinary audit of an EXACT
+# named root (`package-audit <name>@<version> --ecosystem npm --gate install --op install`) are the only package-audits the log
+# may hold.
 assert_no_per_root_audit() {
   local label="$1"
-  if grep -P '^AUDIT\tpackage-audit\t' "${LOG_FILE}" | grep -vqP '^AUDIT\tpackage-audit\t--ecosystem\tnpm\t--evidence-only(\t--evidence-progress\t[^\t]+)?$'; then
+  if grep -P '^AUDIT\tpackage-audit\t' "${LOG_FILE}" | grep -vqP '^AUDIT\tpackage-audit\t(--ecosystem\tnpm\t--evidence-only(\t--evidence-progress\t[^\t]+)?|[^\t@][^\t]*@[0-9][^\t]*\t--ecosystem\tnpm\t--gate\tinstall\t--op\tinstall)$'; then
     printf 'a per-root audit ran\nlog:\n%s\n' "$(cat "${LOG_FILE}")" >&2
     fail "${label}"
     return 1
@@ -1256,6 +1269,8 @@ assert_err_not_contains_fragment() {
 
 skip_lockdiff_case() {
   local label="$1"
+  # a case that asked the real auditor to answer the lane's ordinary audits never leaves that on for the next
+  unset SAFE_AUDIT_REAL_GATE SAFE_AUDIT_REAL_GATE_MOCKBIN
   if [[ "${SAFE_CORE_TEST_AVAILABLE}" == "1" ]]; then
     return 0
   fi
@@ -14097,14 +14112,17 @@ lane_seed() {
     pin)
       jq --arg n "${name}" --arg v "${version}" '.packages[$n] = {version: $v, ecosystem: "npm", sha: "sha512-AAAA", added: "2026-11-01"}' "${dir}/host-allow.json" > "${dir}/x" && mv "${dir}/x" "${dir}/host-allow.json" ;;
     followed-grant|followed-override)
-      jq --arg n "${name}" --arg v "${version}" '.packages[$n] = {version: $v, ecosystem: "npm", sha: "sha512-AAAA", added: "2026-11-01", followed_from: "origin1", followed_generation: "G1"}' "${dir}/host-allow.json" > "${dir}/x" && mv "${dir}/x" "${dir}/host-allow.json"
+      # as `host-allow follow` writes them: a pin carrying followed_from, followed_generation and, for an override, the
+      # override object; the ledger's generation is the statement's exported_at instant
+      jq --arg n "${name}" --arg v "${version}" --argjson ids "${ids}" '.packages[$n] = ({version: $v, ecosystem: "npm", sha: "sha512-AAAA", added: "2026-11-01", followed_from: "origin1", followed_generation: "2026-11-10T10:00:00Z"}
+        + (if ($ids | length) > 0 then {block_override: {advisories: $ids, accepted: "2026-11-10"}} else {} end))' "${dir}/host-allow.json" > "${dir}/x" && mv "${dir}/x" "${dir}/host-allow.json"
       jq --arg id "${name}@${version}" --arg gid "npm:${name}@${version}" --arg sig "${LANE_SIGNER}" --argjson ids "${ids}" '
-        .origins.origin1 = ((.origins.origin1 // {accepted: "G1", signer: $sig, applied: [], granted: [], installed: [], block_overrides: {}})
+        .origins.origin1 = ((.origins.origin1 // {accepted: "2026-11-10T10:00:00Z", signer: $sig, applied: [], granted: [], installed: [], replaced: [], refused: [], block_overrides: {}})
           | .applied += [$id] | .granted += [$gid]
           | if ($ids | length) > 0 then .block_overrides[$gid] = $ids else . end)' "${dir}/follow-state.json" > "${dir}/x" && mv "${dir}/x" "${dir}/follow-state.json" ;;
     followed-install)
       jq --arg gid "npm:${name}@${version}" --arg sig "${LANE_SIGNER}" '
-        .origins.origin1 = ((.origins.origin1 // {accepted: "G1", signer: $sig, applied: [], granted: [], installed: [], block_overrides: {}})
+        .origins.origin1 = ((.origins.origin1 // {accepted: "2026-11-10T10:00:00Z", signer: $sig, applied: [], granted: [], installed: [], replaced: [], refused: [], block_overrides: {}})
           | .installed += [$gid])' "${dir}/follow-state.json" > "${dir}/x" && mv "${dir}/x" "${dir}/follow-state.json" ;;
     tolerance)
       store="$(jq -c --argjson causes "${ids}" '.install.auto_allow_tolerate = $causes' "${dir}/config.json")" && printf '%s\n' "${store}" > "${dir}/config.json" ;;
@@ -14121,7 +14139,7 @@ lane_known() { jq -c --arg k "npm:$1" '.packages[$k] // empty' "$(lane_store)/in
 # Which standing acceptance clears which class, as the Decision table says.
 case_project_lane_acceptances_clear_a_blocking_advisory_by_the_tables_authorities() {
   skip_lockdiff_case "$FUNCNAME" || return
-  local label hits="{\"vuln@1.0.0\":${LANE_HIT_CRITICAL}}"
+  local label hits='{"vuln@1.0.0":[{"id":"GHSA-crit-0001","severity":"critical","malware":false},{"id":"GHSA-crit-0002","severity":"critical","malware":false}]}'
   for label in none approval pin followed-install followed-grant override-covering override-partial; do
     lane_prepare "lane-accept-block-${label}" kept@1.0.0
     case "${label}" in
@@ -14129,8 +14147,8 @@ case_project_lane_acceptances_clear_a_blocking_advisory_by_the_tables_authoritie
       pin) lane_seed pin vuln 1.0.0 ;;
       followed-install) lane_seed followed-install vuln 1.0.0 ;;
       followed-grant) lane_seed followed-grant vuln 1.0.0 ;;
-      override-covering) lane_seed followed-override vuln 1.0.0 GHSA-crit-0001 ;;
-      override-partial) lane_seed followed-override vuln 1.0.0 GHSA-other-9999 ;;
+      override-covering) lane_seed followed-override vuln 1.0.0 GHSA-crit-0001 GHSA-crit-0002 ;;
+      override-partial) lane_seed followed-override vuln 1.0.0 GHSA-crit-0001 ;;
     esac
     SAFE_AUDIT_EVIDENCE_HITS="${hits}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 vuln@1.0.0)" lane_run 'npm install vuln@1.0.0'
     case "${label}" in
@@ -14250,128 +14268,220 @@ case_project_lane_acceptances_come_from_the_lanes_store_root_and_a_failed_reader
   pass "$FUNCNAME"
 }
 
-# Records: after a verified materialisation, for the eligible kinds, never for what only passed because its advisories were present.
-case_project_lane_records_follow_a_verified_materialisation_and_only_it() {
+# ---- ticket 1637, second round: the lane writes no record, today's audit does ------------------------------------------------
+#
+# After a verified publication the lane asks today's auditor to audit, by its ordinary path (`package-audit --gate install`),
+# each named root the decision left eligible and the published tree holds; the audit records or does not by its own rules.
+# These cases give that audit to the lane: the real auditor, with the repository's Socket and OSV mocks first on PATH.
+
+lane_real_gate() { # the real auditor answers the lane's ordinary audits, for the rest of the case
+  export SAFE_AUDIT_REAL_GATE=1 SAFE_AUDIT_REAL_GATE_MOCKBIN="${ROOT_DIR}/tests/lib/socket-mockbin"
+}
+
+lane_config() { # <jq filter on the lane config>
+  local file
+  file="$(lane_store)/config.json"
+  jq -c "$1" "${file}" > "${file}.x" && mv "${file}.x" "${file}"
+}
+
+case_project_lane_records_are_todays_audit_of_a_named_root_after_a_verified_publication() {
   skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-record-audit" kept@1.0.0
+  lane_real_gate; NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 trans@1.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME: a named install" || return
+  # the root: recorded by the audit, with the reasons it writes (Socket not consulted for an old release says so), not by the lane
+  [[ "$(lane_known clean | jq -r '.verdict + " " + .version + " " + .source')" == "GO 2.0.0 implicit-default" ]] || { printf 'stderr:\n%s\nlog:\n%s\n' "$(cat "${ERR_FILE}")" "$(grep -v '^NODEBIN\|^CORE' "${LOG_FILE}" | cut -c1-200)" >&2; fail "$FUNCNAME: $(lane_known clean)"; return; }
+  [[ "$(lane_known clean | jq -r '.reasons | join(",")')" == "osv_clean_for_version,socket_out_of_scope,blocklist_pass" ]] || { fail "$FUNCNAME: the reasons are not today's: $(lane_known clean)"; return; }
+  [[ -z "$(lane_known trans)" && -z "$(lane_known kept)" ]] || { fail "$FUNCNAME: an artifact nobody named was recorded"; return; }
+  [[ "$(grep -c $'^REAL_GATE_AUDIT\t' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: one audit, of the one named root, was expected: $(grep REAL_GATE_AUDIT "${LOG_FILE}")"; return; }
+  grep -q $'^REAL_GATE_AUDIT\tclean@2.0.0\tSAFE_AUDIT_SOCKET_CONSENT=\tstdin_tty=no' "${LOG_FILE}" || { fail "$FUNCNAME: the audit ran with a consent or a terminal: $(grep REAL_GATE_AUDIT "${LOG_FILE}")"; return; }
+  assert_err_contains_fragment "today's audit recorded clean@2.0.0 as GO" "$FUNCNAME" || return
+  # a bare update names no root: no audit, no record
+  lane_prepare "lane-record-bare" kept@1.0.0
+  lane_real_gate; NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.1.0 trans@1.0.0)" lane_run 'npm update'
+  assert_status 0 "$FUNCNAME: a bare update" || return
+  ! grep -q $'^REAL_GATE_AUDIT\t' "${LOG_FILE}" && [[ -z "$(lane_known kept)" && -z "$(lane_known trans)" ]] || { fail "$FUNCNAME: a bare update was audited or recorded"; return; }
+  # nothing is recorded, or even audited, for a refusal, a failed materialisation, a dry run or a lockfile-only publication
   local label
-  lane_prepare "lane-record-clean" kept@1.0.0
-  NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" lane_run 'npm install clean@2.0.0 other@1.0.0'
-  assert_status 0 "$FUNCNAME: a clean command" || return
-  [[ "$(lane_known clean | jq -r '.verdict + " " + .version + " " + .source')" == "GO 2.0.0 implicit-default" ]] || { fail "$FUNCNAME: clean@2.0.0 is not recorded: $(lane_known clean)"; return; }
-  [[ "$(lane_known other | jq -r '.verdict')" == GO ]] || { fail "$FUNCNAME: other@1.0.0 is not recorded"; return; }
-  [[ -z "$(lane_known kept)" ]] || { fail "$FUNCNAME: an artifact the command did not introduce was recorded"; return; }
-  assert_err_contains_fragment 'recorded 2 install record(s)' "$FUNCNAME" || return
   for label in refusal failed-materialisation dry-run lock-only; do
     lane_prepare "lane-record-none-${label}" kept@1.0.0
     case "${label}" in
-      refusal) SAFE_AUDIT_EVIDENCE_HITS="{\"dirty@3.0.0\":${LANE_HIT_CRITICAL}}" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" \
+      refusal) lane_real_gate; SAFE_AUDIT_EVIDENCE_HITS="{\"dirty@3.0.0\":${LANE_HIT_CRITICAL}}" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" \
         NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 dirty@3.0.0)" lane_run 'npm install clean@2.0.0 dirty@3.0.0' ;;
-      failed-materialisation) NPM_CI_STATUS=7 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0' ;;
-      dry-run) NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0 --dry-run' ;;
-      lock-only) NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0 --package-lock-only' ;;
+      failed-materialisation) lane_real_gate; NPM_CI_STATUS=7 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0' ;;
+      dry-run) lane_real_gate; NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0 --dry-run' ;;
+      lock-only) lane_real_gate; NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0 --package-lock-only' ;;
     esac
-    [[ -z "$(lane_known clean)" && -z "$(lane_known dirty)" ]] || { fail "$FUNCNAME: ${label} recorded something: $(lane_known clean)"; return; }
-    [[ ! -e "$(lane_store)/install-known.json" ]] || [[ "$(jq -c '.packages' "$(lane_store)/install-known.json")" == '{}' ]] || { fail "$FUNCNAME: ${label}: the store changed"; return; }
+    [[ -z "$(lane_known clean)" && -z "$(lane_known dirty)" ]] || { fail "$FUNCNAME: ${label} recorded: $(lane_known clean)"; return; }
+    ! grep -q $'^REAL_GATE_AUDIT\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${label}: a root was audited for a record"; return; }
   done
   pass "$FUNCNAME"
 }
 
-case_project_lane_records_exclude_what_only_passed_because_its_advisories_were_present() {
+# A root the published tree does not hold (deselected) is not audited for a record.
+case_project_lane_a_named_root_absent_from_the_published_tree_is_not_recorded() {
   skip_lockdiff_case "$FUNCNAME" || return
-  # kept@1.0.0 carries a high advisory in the project; the command bumps it to 1.1.0, which carries the same one: nothing is
-  # introduced, the command passes, and nothing is recorded for it. A clean artifact added beside it is recorded.
-  lane_prepare "lane-record-present" kept@1.0.0
-  SAFE_AUDIT_EVIDENCE_HITS="{\"kept@1.0.0\":${LANE_HIT_HIGH},\"kept@1.1.0\":${LANE_HIT_HIGH}}" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" \
-    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.1.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
-  assert_status 0 "$FUNCNAME" || return
-  [[ -z "$(lane_known kept)" ]] || { fail "$FUNCNAME: kept@1.1.0 was recorded: $(lane_known kept)"; return; }
-  [[ "$(lane_known clean | jq -r .verdict)" == GO ]] || { fail "$FUNCNAME: the clean artifact was not recorded"; return; }
-  # an artifact with a below-high advisory is recorded, saying so
-  lane_prepare "lane-record-below-high" kept@1.0.0
-  SAFE_AUDIT_EVIDENCE_HITS="{\"meh@1.0.0\":${LANE_HIT_MEDIUM}}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 meh@1.0.0)" lane_run 'npm install meh@1.0.0'
-  assert_status 0 "$FUNCNAME: below high" || return
-  [[ "$(lane_known meh | jq -r '.verdict + " " + (.reasons | join(","))')" == "GO osv_below_high_only,socket_ok,blocklist_pass" ]] || { fail "$FUNCNAME: $(lane_known meh)"; return; }
+  lane_prepare "lane-record-omit-dev" kept@1.0.0
+  lane_real_gate; NPM_LOCKDIFF_EFFECTIVE_CONFIG_JSON='{"package-lock":true,"ignore-scripts":true,"omit":["dev"]}' \
+    NPM_PROJECTION_MANIFEST_JSON='{"name":"lane-test","version":"1.0.0","dependencies":{"kept":"^1.0.0"},"devDependencies":{"clean":"^2.0.0"}}' \
+    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0:dev)" lane_run 'npm install --save-dev --omit=dev clean@2.0.0'
+  assert_status 0 "$FUNCNAME: the command" || return
+  [[ ! -e "${WORK_DIR}/node_modules/clean" ]] || { fail "$FUNCNAME: the fixture tree holds the deselected root, the case proves nothing"; return; }
+  [[ -z "$(lane_known clean)" ]] || { fail "$FUNCNAME: an absent root was recorded: $(lane_known clean)"; return; }
+  ! grep -q $'^REAL_GATE_AUDIT\t' "${LOG_FILE}" || { fail "$FUNCNAME: an absent root was audited"; return; }
+  assert_err_contains_fragment 'not in the published tree' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
-case_project_lane_records_a_tolerated_artifact_and_never_another_authoritys_decision() {
+# What the ordinary audit decides, the lane does not override: clean receipts switched off, Socket switched off, no cooldown.
+case_project_lane_records_follow_the_audits_own_policy() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-record-auto-allow-off" kept@1.0.0
+  lane_config '.install.auto_allow = false'
+  lane_real_gate; NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME: auto_allow=false" || return
+  [[ -z "$(lane_known clean)" ]] || { fail "$FUNCNAME: install.auto_allow=false wrote a clean receipt: $(lane_known clean)"; return; }
+  lane_prepare "lane-record-socket-never" kept@1.0.0
+  lane_config '.install.socket.mode = "never"'
+  lane_real_gate; NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME: socket never" || return
+  [[ -z "$(lane_known clean)" ]] || { fail "$FUNCNAME: a root whose Socket reading was switched off was recorded as today's gate does not: $(lane_known clean)"; return; }
+  lane_prepare "lane-record-cooldown-zero" kept@1.0.0
+  lane_config '.install.cooldown_days = 0'
+  lane_real_gate; NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME: cooldown 0" || return
+  [[ "$(lane_known clean | jq -r .verdict)" == GO ]] || { fail "$FUNCNAME: today's gate records here: $(lane_known clean)"; return; }
+  pass "$FUNCNAME"
+}
+
+# Evidence that supersedes a receipt revokes it, by today's own rule.
+case_project_lane_a_later_block_revokes_the_receipt() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-record-revoke" kept@1.0.0
+  lane_real_gate; NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME: the first command" || return
+  [[ "$(lane_known clean | jq -r .verdict)" == GO ]] || { fail "$FUNCNAME: no receipt to revoke"; return; }
+  # the same command, now with a blocklist hit (the lane's reading and the audit's own blocked.json)
+  printf '{"packages":{"clean":{"reason":"operator blocklist"}}}\n' > "$(lane_store)/blocked.json"
+  lane_seed approval clean 2.0.0
+  lane_real_gate; SAFE_AUDIT_EVIDENCE_BLOCKLIST='[{"name":"clean","reason":"operator blocklist"}]' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 104 "$FUNCNAME: the blocklist hit" || return
+  [[ -z "$(lane_known clean)" ]] || { fail "$FUNCNAME: the receipt survives a block: $(lane_known clean)"; return; }
+  assert_err_contains_fragment 'the receipt of clean@2.0.0 was revoked' "$FUNCNAME" || return
+  # an operator's approval is not a receipt and is untouched
+  jq -e '.approvals["npm:clean"] | length == 1' "$(lane_store)/install-known.json" >/dev/null || { fail "$FUNCNAME: the operator's approval was touched"; return; }
+  # the export no longer carries it
+  local export_doc
+  export_doc="$(HOME="${HOME_DIR}" SAFE_RUN_CONFIG_DIR="$(lane_store)" "${ROOT_DIR}/bin/safe-run" host-allow export --json 2>/dev/null)" || export_doc=""
+  [[ "$(jq -c '.install_allowances' <<<"${export_doc}")" == '[]' ]] || { fail "$FUNCNAME: the export still carries it: $(jq -c '.install_allowances' <<<"${export_doc}")"; return; }
+  # nothing to revoke, nothing asked: an identity without a receipt is not audited
+  lane_prepare "lane-record-revoke-none" kept@1.0.0
+  lane_real_gate; SAFE_AUDIT_EVIDENCE_BLOCKLIST='[{"name":"clean","reason":"operator blocklist"}]' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 104 "$FUNCNAME: no receipt" || return
+  ! grep -q $'^REAL_GATE_AUDIT\t' "${LOG_FILE}" || { fail "$FUNCNAME: an identity with no receipt was audited"; return; }
+  pass "$FUNCNAME"
+}
+
+# Tolerated and followed passes are the audit's tokens; the export takes the first and never the second.
+case_project_lane_the_audit_records_a_tolerated_root_and_a_followed_root_is_never_exported() {
   skip_lockdiff_case "$FUNCNAME" || return
   lane_prepare "lane-record-tolerated" kept@1.0.0
-  cooldown_registry_start "${CASE_DIR}" "fresh@2.0.0=10" "kept@1.0.0=2400"
-  lane_seed tolerance fresh 2.0.0 release_too_new
-  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm install fresh@2.0.0'
-  assert_status 0 "$FUNCNAME: tolerated" || return
-  [[ "$(lane_known fresh | jq -r '.verdict + " " + (.reasons | join(","))')" == "WARN_TOLERATED release_too_new" ]] || { fail "$FUNCNAME: $(lane_known fresh)"; return; }
-  local label
-  for label in approval followed-install followed-grant; do
-    lane_prepare "lane-record-other-${label}" kept@1.0.0
-    lane_seed "${label}" fresh 2.0.0
-    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm install fresh@2.0.0'
-    assert_status 0 "$FUNCNAME: ${label}" || return
-    [[ -z "$(lane_known fresh)" ]] || { fail "$FUNCNAME: ${label}: another authority's decision was recorded: $(lane_known fresh)"; return; }
-  done
-  cooldown_registry_stop
-  pass "$FUNCNAME"
-}
-
-# A record that cannot be written after the publication is reported and does not undo it.
-case_project_lane_a_record_that_cannot_be_written_is_reported_and_undoes_nothing() {
-  skip_lockdiff_case "$FUNCNAME" || return
-  lane_prepare "lane-record-fails" kept@1.0.0
-  SAFE_AUDIT_LANE_DOOR_STATUS=3 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
-  assert_status 0 "$FUNCNAME" || return
-  assert_err_contains_fragment 'the installation is complete and verified, but 1 install record(s) could not be written' "$FUNCNAME" || return
-  [[ -e "${WORK_DIR}/node_modules/clean" || -d "${WORK_DIR}/node_modules" ]] || { fail "$FUNCNAME: the installation was undone"; return; }
-  [[ -z "$(lane_known clean)" ]] || { fail "$FUNCNAME: a record exists"; return; }
-  pass "$FUNCNAME"
-}
-
-# Export: what the lane records rides the next signed statement exactly as today's installs do; a follower's authority never does.
-case_project_lane_what_it_records_is_exportable_and_a_followers_authority_is_not() {
-  skip_lockdiff_case "$FUNCNAME" || return
-  lane_prepare "lane-record-export" kept@1.0.0
   cooldown_registry_start "${CASE_DIR}" "fresh@2.0.0=10" "kept@1.0.0=2400" "clean@2.0.0=2400" "folw@1.0.0=10" "trans@1.0.0=2400"
   lane_seed tolerance fresh 2.0.0 release_too_new
   lane_seed followed-install folw 1.0.0
-  NPM_PROJECTION_MANIFEST_JSON='{"name":"lane-test","version":"1.0.0","dependencies":{"kept":"^1.0.0","clean":"^2.0.0","fresh":"^2.0.0","folw":"^1.0.0"}}' \
+  lane_real_gate; MOCK_RELEASE_FRESH=1 NPM_PROJECTION_MANIFEST_JSON='{"name":"lane-test","version":"1.0.0","dependencies":{"kept":"^1.0.0","clean":"^2.0.0","fresh":"^2.0.0","folw":"^1.0.0"}}' \
     NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 fresh@2.0.0 folw@1.0.0 trans@1.0.0)" lane_run 'npm install clean@2.0.0 fresh@2.0.0 folw@1.0.0'
   cooldown_registry_stop
   assert_status 0 "$FUNCNAME: the command" || return
+  # (the audit's mock registry makes every release young, and the tolerance is by cause: today's rule, applied to both roots)
+  [[ "$(lane_known fresh | jq -r .verdict)" == WARN_TOLERATED ]] || { fail "$FUNCNAME: fresh: $(lane_known fresh)"; return; }
+  [[ -z "$(lane_known folw)" ]] && ! grep -q $'^REAL_GATE_AUDIT\tfolw@' "${LOG_FILE}" || { fail "$FUNCNAME: a root a followed authority cleared was audited for a record: $(lane_known folw)"; return; }
   local export_doc
   export_doc="$(HOME="${HOME_DIR}" SAFE_RUN_CONFIG_DIR="$(lane_store)" "${ROOT_DIR}/bin/safe-run" host-allow export --json 2>/dev/null)" || export_doc=""
-  [[ "$(jq -c '[.install_allowances[] | "\(.ecosystem):\(.name)@\(.version) \(.verdict)"] | sort' <<<"${export_doc}" 2>/dev/null)" == '["npm:clean@2.0.0 GO","npm:fresh@2.0.0 WARN_TOLERATED"]' ]] \
-    || { fail "$FUNCNAME: the export lists only the named roots, and not a transitive dependency or a followed authority: $(jq -c '.install_allowances' <<<"${export_doc}" 2>/dev/null)"; return; }
+  [[ "$(jq -c '[.install_allowances[] | "\(.name)@\(.version) \(.verdict)"] | sort' <<<"${export_doc}")" == '["clean@2.0.0 WARN_TOLERATED","fresh@2.0.0 WARN_TOLERATED"]' ]] \
+    || { fail "$FUNCNAME: the export lists only named roots the audit recorded, never a followed authority or a dependency: $(jq -c '.install_allowances' <<<"${export_doc}")"; return; }
   pass "$FUNCNAME"
 }
 
-# Records are for NAMED ROOTS only: a closure artifact nobody named has no Socket reading, and a record is exported as an install
-# allowance that a follower takes in place of the Socket consent, pending and warning outcomes.
-case_project_lane_records_are_for_named_roots_only() {
+# No command turns a caller's statement into a receipt; the number of audits is bounded.
+case_project_lane_no_command_takes_a_verdict_from_its_caller_and_the_audits_are_bounded() {
   skip_lockdiff_case "$FUNCNAME" || return
-  # a named install with a transitive dependency records the root, not the dependency
-  lane_prepare "lane-record-root-only" kept@1.0.0
-  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 trans@1.0.0)" lane_run 'npm install clean@2.0.0'
-  assert_status 0 "$FUNCNAME: a named install" || return
-  [[ "$(lane_known clean | jq -r .verdict)" == GO ]] || { fail "$FUNCNAME: the root is not recorded"; return; }
-  [[ -z "$(lane_known trans)" ]] || { fail "$FUNCNAME: a transitive dependency was recorded: $(lane_known trans)"; return; }
-  [[ "$(lane_known clean | jq -r '.reasons | join(",")')" != *socket_not_scored* ]] || { fail "$FUNCNAME: a record without a Socket reading"; return; }
-  # a bare update names no root: it records nothing, and the real exporter lists nothing
-  lane_prepare "lane-record-bare" kept@1.0.0
-  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.1.0 trans@1.0.0)" lane_run 'npm update'
-  assert_status 0 "$FUNCNAME: a bare update" || return
-  [[ -z "$(lane_known kept)" && -z "$(lane_known trans)" ]] || { fail "$FUNCNAME: a bare update recorded: $(lane_known kept) $(lane_known trans)"; return; }
-  # a named root whose Socket outcome a followed install allowance clears installs and records nothing
-  lane_prepare "lane-record-root-followed" kept@1.0.0
-  lane_seed followed-install clean 2.0.0
-  SAFE_AUDIT_SOCKET_OUTCOMES='{"clean@2.0.0":"consent_required"}' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
-  assert_status 0 "$FUNCNAME: a followed install allowance clears the consent ask" || return
-  [[ -z "$(lane_known clean)" ]] || { fail "$FUNCNAME: a followed authority was recorded: $(lane_known clean)"; return; }
-  # a named root with an adverse Socket outcome that a standing tolerance clears is the tolerated kind
-  lane_prepare "lane-record-root-tolerated" kept@1.0.0
+  prepare_case "lane-no-writer"
+  local rc=0
+  printf '{"records":[{"name":"x","version":"1.0.0","verdict":"GO","reasons":[]}]}' | HOME="${HOME_DIR}" "${ROOT_DIR}/bin/safe-audit" lane-record >"${CASE_DIR}/out" 2>&1 || rc=$?
+  [[ "${rc}" != 0 ]] && grep -q 'unknown command' "${CASE_DIR}/out" || { fail "$FUNCNAME: the dispatcher accepts lane-record: rc=${rc} $(cat "${CASE_DIR}/out")"; return; }
+  [[ ! -e "${HOME_DIR}/.config/safe/run/install-known.json" ]] || { fail "$FUNCNAME: a store appeared"; return; }
+  # seventeen named roots: sixteen audits, and the report says so
+  lane_prepare "lane-record-bound" kept@1.0.0
+  local names="" manifest lock i
+  lock="$(lane_lock kept@1.0.0)"
+  manifest='{"name":"lane-test","version":"1.0.0","dependencies":{"kept":"^1.0.0"'
+  for i in $(seq 1 17); do
+    names+=" rr${i}@1.0.0"
+    lock="$(jq -c --arg p "node_modules/rr${i}" --arg r "https://registry.npmjs.org/rr${i}/-/rr${i}-1.0.0.tgz" --arg i "$(lane_integrity "rr${i}@1.0.0")" '.packages[$p] = {version: "1.0.0", resolved: $r, integrity: $i}' <<<"${lock}")"
+    manifest+=",\"rr${i}\":\"^1.0.0\""
+  done
+  manifest+='}}'
+  lane_real_gate; NPM_PROJECTION_MANIFEST_JSON="${manifest}" NPM_LOCK_MUTATION_JSON="${lock}" lane_run "npm install${names}"
+  assert_status 0 "$FUNCNAME: seventeen roots" || return
+  [[ "$(grep -c $'^REAL_GATE_AUDIT\t' "${LOG_FILE}")" == 16 ]] || { fail "$FUNCNAME: $(grep -c $'^REAL_GATE_AUDIT\t' "${LOG_FILE}") audits instead of 16"; return; }
+  assert_err_contains_fragment '1 more named root(s) were not audited for a record (at most 16 per command)' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# Bundled bytes: an acceptance of the covering artifact clears a blocking advisory its member carries; and a covering root
+# whose bytes carry a high advisory is not recorded, introduced or inherited.
+case_project_lane_bundled_bytes_are_judged_under_their_covering_artifact() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local bundled_hit='[{"id":"GHSA-bund-0001","severity":"critical","malware":false}]' target
+  target="$(lane_lock kept@1.0.0 clean@2.0.0 | jq -c '.packages["node_modules/clean/node_modules/bund"] = {version: "1.0.0", inBundle: true}')"
+  lane_prepare "lane-bundled-none" kept@1.0.0
+  SAFE_AUDIT_EVIDENCE_HITS="{\"bund@1.0.0\":${bundled_hit}}" NPM_LOCK_MUTATION_JSON="${target}" lane_run 'npm install clean@2.0.0'
+  assert_status 104 "$FUNCNAME: no acceptance" || return
+  lane_prepare "lane-bundled-approval" kept@1.0.0
+  lane_seed approval clean 2.0.0
+  SAFE_AUDIT_EVIDENCE_HITS="{\"bund@1.0.0\":${bundled_hit}}" NPM_LOCK_MUTATION_JSON="${target}" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME: an approval of the covering artifact" || return
+  grep -q $'^LANE_DOOR\tlane-acceptances' "${LOG_FILE}" || { fail "$FUNCNAME: the reader was not asked about the covering artifact"; return; }
+  lane_prepare "lane-bundled-approval-member" kept@1.0.0
+  lane_seed approval bund 1.0.0
+  SAFE_AUDIT_EVIDENCE_HITS="{\"bund@1.0.0\":${bundled_hit}}" NPM_LOCK_MUTATION_JSON="${target}" lane_run 'npm install clean@2.0.0'
+  assert_status 104 "$FUNCNAME: an approval of a namesake does not cover bytes it does not carry" || return
+  # inherited: clean@1.0.0 already carries the bundled high advisory; the upgrade to 2.0.0 passes on it and is not recorded
+  local high='[{"id":"GHSA-bund-0002","severity":"high","malware":false}]' base
+  base="$(lane_lock kept@1.0.0 clean@1.0.0 | jq -c '.packages["node_modules/clean/node_modules/bund"] = {version: "1.0.0", inBundle: true}')"
+  lane_prepare "lane-bundled-inherited" kept@1.0.0 clean@1.0.0
+  printf '%s\n' "${base}" > "${WORK_DIR}/package-lock.json"
+  lane_commit
+  lane_real_gate; SAFE_AUDIT_EVIDENCE_HITS="{\"bund@1.0.0\":${high}}" NPM_LOCK_MUTATION_JSON="${target}" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME: the advisory is already present" || return
+  [[ -z "$(lane_known clean)" ]] || { fail "$FUNCNAME: a covering root whose bytes carry a high advisory was recorded: $(lane_known clean)"; return; }
+  pass "$FUNCNAME"
+}
+
+case_project_lane_a_tolerance_does_not_clear_a_root_that_has_an_affecting_advisory() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-tolerance-moderate" kept@1.0.0
+  lane_seed tolerance clean 2.0.0 socket_low_score
+  SAFE_AUDIT_EVIDENCE_HITS="{\"clean@2.0.0\":${LANE_HIT_MEDIUM}}" SAFE_AUDIT_SOCKET_OUTCOMES='{"clean@2.0.0":"adverse"}' \
+    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 100 "$FUNCNAME: a moderate advisory and a Socket low score" || return
+  lane_prepare "lane-tolerance-clean" kept@1.0.0
   lane_seed tolerance clean 2.0.0 socket_low_score
   SAFE_AUDIT_SOCKET_OUTCOMES='{"clean@2.0.0":"adverse"}' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
-  assert_status 0 "$FUNCNAME: a tolerated Socket result" || return
-  [[ "$(lane_known clean | jq -r '.verdict + " " + (.reasons | join(","))')" == "WARN_TOLERATED socket_low_score" ]] || { fail "$FUNCNAME: $(lane_known clean)"; return; }
+  assert_status 0 "$FUNCNAME: control, no advisory" || return
+  pass "$FUNCNAME"
+}
+
+case_project_lane_the_acceptance_reader_refuses_a_host_it_does_not_support() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_case "lane-reader-host"
+  HOME_DIR="${CASE_DIR}/home"
+  lane_seed approval clean 2.0.0
+  local out
+  out="$(printf '{"candidates":[{"name":"clean","version":"2.0.0","host":"mirror.example","blocking_advisories":[]},{"name":"clean","version":"2.0.0","host":"registry.npmjs.org","blocking_advisories":[]}]}' \
+    | HOME="${HOME_DIR}" SAFE_RUN_CONFIG_DIR="$(lane_store)" SAFE_RUN_TRUST_OVERRIDE=0 "${ROOT_DIR}/bin/safe-audit" lane-acceptances 2>/dev/null)" || out=""
+  [[ "$(jq -c '[.acceptances[] | .host]' <<<"${out}")" == '["registry.npmjs.org"]' ]] || { fail "$FUNCNAME: $(jq -c . <<<"${out}")"; return; }
   pass "$FUNCNAME"
 }
 
@@ -14791,12 +14901,15 @@ main() {
     case_project_lane_acceptances_clear_an_adverse_advisory_a_wait_and_a_socket_outcome_where_the_table_says \
     case_project_lane_acceptances_never_clear_malice_missing_evidence_or_an_unbound_graph \
     case_project_lane_acceptances_come_from_the_lanes_store_root_and_a_failed_reader_clears_nothing \
-    case_project_lane_records_follow_a_verified_materialisation_and_only_it \
-    case_project_lane_records_exclude_what_only_passed_because_its_advisories_were_present \
-    case_project_lane_records_a_tolerated_artifact_and_never_another_authoritys_decision \
-    case_project_lane_a_record_that_cannot_be_written_is_reported_and_undoes_nothing \
-    case_project_lane_what_it_records_is_exportable_and_a_followers_authority_is_not \
-    case_project_lane_records_are_for_named_roots_only \
+    case_project_lane_records_are_todays_audit_of_a_named_root_after_a_verified_publication \
+    case_project_lane_a_named_root_absent_from_the_published_tree_is_not_recorded \
+    case_project_lane_records_follow_the_audits_own_policy \
+    case_project_lane_a_later_block_revokes_the_receipt \
+    case_project_lane_the_audit_records_a_tolerated_root_and_a_followed_root_is_never_exported \
+    case_project_lane_no_command_takes_a_verdict_from_its_caller_and_the_audits_are_bounded \
+    case_project_lane_bundled_bytes_are_judged_under_their_covering_artifact \
+    case_project_lane_a_tolerance_does_not_clear_a_root_that_has_an_affecting_advisory \
+    case_project_lane_the_acceptance_reader_refuses_a_host_it_does_not_support \
     case_project_lane_socket_a_passing_root_records_nothing_when_the_command_does_not_complete \
     case_project_lane_socket_a_young_named_fix_installs_under_exempt_and_waits_under_enforce \
     case_project_lane_socket_a_roots_own_advisory_gates_only_when_introduced \

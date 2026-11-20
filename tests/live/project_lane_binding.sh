@@ -136,9 +136,8 @@ if [[ "${1:-}" == "scanner-batch" ]]; then
           blocklist: []}'
   exit 0
 fi
-# The lane's doors into the operator's stores: no standing acceptance applies, and records are acknowledged.
+# The lane's read-only door into the operator's stores: no standing acceptance applies.
 if [[ "${1:-}" == "lane-acceptances" ]]; then cat >/dev/null; printf '{"schema_version":1,"acceptances":[]}\n'; exit 0; fi
-if [[ "${1:-}" == "lane-record" ]]; then jq -r '.records | length'; exit 0; fi
 # Socket's facts on the named roots (package-audit --evidence-only): a fixture, because no Socket credential is
 # available to a live run; every named root scores clear and no block is cached.
 if [[ "${1:-}" == "package-audit" && "$*" == *"--evidence-only"* ]]; then

@@ -92,11 +92,6 @@ func TestRecordsAreOnlyForIntroducedArtifactsWithTheirOwnCleanEvidence(t *testin
 	if got := installRecordsOf(report); !reflect.DeepEqual(got, want) {
 		t.Fatalf("records = %v, want %v", got, want)
 	}
-	for _, item := range report.Records {
-		if item.Name == "low" && !reflect.DeepEqual(item.Reasons, []string{"osv_below_high_only", "socket_ok", "blocklist_pass"}) {
-			t.Errorf("reasons = %v", item.Reasons)
-		}
-	}
 	// nobody named them: the same decision with no named root records nothing, whatever the evidence
 	if unnamed := Decide(Input{Baseline: graphOf(t, base), HasBaseline: true, Target: graphOf(t, target), Evidence: ev, Socket: socketOf()}); len(unnamed.Records) != 0 {
 		t.Fatalf("unnamed artifacts were recorded: %v", installRecordsOf(unnamed))
@@ -116,7 +111,7 @@ func TestRecordsFollowWhoClearedTheArtifact(t *testing.T) {
 	ev := evidenceOf(read("pk", "1.0.0"), read("fol", "1.0.0"))
 	// tolerated: a WARN_TOLERATED record carrying the cause
 	r := Decide(Input{Target: graphOf(t, pkgs("pk", "1.0.0")), Evidence: ev.accepting(tolerance("pk", "1.0.0", "release_too_new")), Releases: young, Socket: socketOf(sroot("pk", "1.0.0", SocketClear))})
-	if got := installRecordsOf(r); !reflect.DeepEqual(got, []string{"WARN_TOLERATED pk@1.0.0"}) || !reflect.DeepEqual(r.Records[0].Reasons, []string{"release_too_new"}) {
+	if got := installRecordsOf(r); !reflect.DeepEqual(got, []string{"WARN_TOLERATED pk@1.0.0"}) {
 		t.Fatalf("tolerated: %v %v", got, r.Records)
 	}
 	// cleared by a followed authority: another origin's decision, never recorded (and so never exported again)
@@ -131,7 +126,7 @@ func TestRecordsFollowWhoClearedTheArtifact(t *testing.T) {
 	}
 	// a named root whose Socket result is clear is recorded GO with the socket reason; one cleared by a followed allowance is not
 	root := Decide(Input{Target: graphOf(t, pkgs("pk", "1.0.0")), Evidence: ev, Socket: socketOf(sroot("pk", "1.0.0", SocketClear))})
-	if got := installRecordsOf(root); !reflect.DeepEqual(got, []string{"GO pk@1.0.0"}) || root.Records[0].Reasons[1] != "socket_ok" {
+	if got := installRecordsOf(root); !reflect.DeepEqual(got, []string{"GO pk@1.0.0"}) {
 		t.Fatalf("root: %v %v", got, root.Records)
 	}
 	root = Decide(Input{Target: graphOf(t, pkgs("pk", "1.0.0")), Evidence: ev.accepting(accept(AcceptFollowedInstall, "pk", "1.0.0")), Socket: socketOf(sroot("pk", "1.0.0", SocketConsentRequired))})
@@ -174,5 +169,63 @@ func TestACoveringClearanceByTheFollowedOverrideAndTheApprovalMatchTheTable(t *t
 		if r := Decide(Input{Target: graphOf(t, pkgs("pk", "1.0.0")), Evidence: all}); r.Outcome.Status == "clear" {
 			t.Errorf("%s was cleared", name)
 		}
+	}
+}
+
+// Bundled bytes: an acceptance is for the artifact whose bytes carry the advisory, and must cover all of them.
+func TestBundledBytesAreJudgedUnderTheirCoveringArtifact(t *testing.T) {
+	target := map[string]map[string]any{"node_modules/clean": entry("clean", "2.0.0"), "node_modules/clean/node_modules/bund": {"version": "1.0.0", "inBundle": true}}
+	ev := evidenceOf(read("clean", "2.0.0"), read("bund", "1.0.0", hit("GHSA-b1", SeverityCritical), hit("GHSA-b2", SeverityCritical)))
+	for name, c := range map[string]struct {
+		acceptance Acceptance
+		clear      bool
+	}{
+		"local approval of the covering artifact":       {accept(AcceptLocalExact, "clean", "2.0.0"), true},
+		"override of the covering artifact, all":        {accept(AcceptFollowedOverride, "clean", "2.0.0", "GHSA-b1", "GHSA-b2"), true},
+		"override of the covering artifact, one of two": {accept(AcceptFollowedOverride, "clean", "2.0.0", "GHSA-b1"), false},
+		"approval of a standalone namesake":             {accept(AcceptLocalExact, "bund", "1.0.0"), false},
+	} {
+		r := Decide(Input{Target: graphOf(t, target), Evidence: ev.accepting(c.acceptance)})
+		if (r.Outcome.Status == "clear") != c.clear {
+			t.Errorf("%s: %+v", name, r.Outcome)
+		}
+	}
+	r := Decide(Input{Target: graphOf(t, target), Evidence: ev})
+	if len(r.Wanted) != 1 || r.Wanted[0].Name != "clean" || r.Wanted[0].Version != "2.0.0" || !reflect.DeepEqual(r.Wanted[0].BlockingAdvisories, []string{"GHSA-b1", "GHSA-b2"}) {
+		t.Fatalf("the acceptance reader is asked about the covering artifact with every advisory under its bytes: %+v", r.Wanted)
+	}
+	// a root whose bytes carry a high advisory is not eligible for a record, introduced or already present
+	member := evidenceOf(read("clean", "2.0.0"), read("bund", "1.0.0", hit("GHSA-h", SeverityHigh)))
+	base := map[string]map[string]any{"node_modules/clean": entry("clean", "1.0.0"), "node_modules/clean/node_modules/bund": {"version": "1.0.0", "inBundle": true}}
+	member.Identities = append(member.Identities, read("clean", "1.0.0"))
+	r = Decide(Input{Baseline: graphOf(t, base), HasBaseline: true, Target: graphOf(t, target), Evidence: member, Socket: socketOf(sroot("clean", "2.0.0", SocketClear))})
+	if r.Outcome.Status != "clear" || len(r.Records) != 0 {
+		t.Fatalf("an inherited advisory in the bytes: %+v %v", r.Outcome, r.Records)
+	}
+}
+
+// Today's tolerance applies only to an artifact with no affecting advisory.
+func TestAToleranceNeedsAnArtifactWithNoAdvisoryAtAll(t *testing.T) {
+	low := sroot("pk", "1.0.0", SocketAdverse)
+	low.Causes = []string{"socket_low_score"}
+	moderate := evidenceOf(read("pk", "1.0.0", hit("GHSA-m", SeverityModerate))).accepting(tolerance("pk", "1.0.0", "socket_low_score"))
+	if r := decideSocket(t, nil, pkgs("pk", "1.0.0"), socketOf(low), moderate); r.Outcome.Status == "clear" {
+		t.Fatalf("a tolerance cleared a Socket warning on an artifact with an affecting advisory: %+v", r.Outcome)
+	}
+	clean := evidenceOf(read("pk", "1.0.0")).accepting(tolerance("pk", "1.0.0", "socket_low_score"))
+	if r := decideSocket(t, nil, pkgs("pk", "1.0.0"), socketOf(low), clean); r.Outcome.Status != "clear" {
+		t.Fatalf("control: %+v", r.Outcome)
+	}
+}
+
+func TestTheDecisionNamesTheIdentitiesItFoundAdverseEvidenceOn(t *testing.T) {
+	ev := evidenceOf(read("a", "1.0.0", hit("GHSA-c", SeverityCritical)), read("b", "1.0.0", hit("GHSA-h", SeverityHigh)), read("c", "1.0.0"), read("m", "1.0.0")).blocklisted("m")
+	r := Decide(Input{Target: graphOf(t, pkgs("a", "1.0.0", "b", "1.0.0", "c", "1.0.0", "m", "1.0.0")), Evidence: ev, Socket: socketOf(sroot("c", "1.0.0", SocketAdverse))})
+	got := []string{}
+	for _, identity := range r.Adverse {
+		got = append(got, identity.Name+"@"+identity.Version)
+	}
+	if !reflect.DeepEqual(got, []string{"a@1.0.0", "b@1.0.0", "c@1.0.0", "m@1.0.0"}) {
+		t.Fatalf("adverse = %v", got)
 	}
 }

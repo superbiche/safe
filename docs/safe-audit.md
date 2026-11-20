@@ -677,14 +677,15 @@ appends each root's document as it completes, so a supervising process keeps wha
 batch. The mode is set by the parsed flag alone: a value of its internal variable in the environment is overwritten at
 start-up and reaches nothing. The normal paths of `package-audit` are unchanged.
 
-### Project lane doors: `lane-acceptances`, `lane-record`
+### Project lane door: `lane-acceptances`
 
-Two commands for the project lane, neither of which initialises anything. `lane-acceptances` (read-only; request on stdin:
-the artifacts a decision left outstanding) answers with the standing acceptances that apply, by calling the readers of the
-install gate (local approval and host-allow pin, followed grant, followed advisory override, followed install allowance, the
-`install.auto_allow_tolerate` tolerance) on the store root the caller pinned. `lane-record` (request on stdin: the records a
-clear decision named) writes the install receipts through the same writer as the gate (`mark_install_known`), verdicts `GO`
-and `WARN_TOLERATED` only, default-registry source. Both refuse a terminal as their input. The ordinary audit is unchanged.
+One command for the project lane, which initialises nothing and writes nothing. `lane-acceptances` (request on stdin: the
+artifacts a decision left outstanding, each with its host and the blocking advisories under its bytes) answers with the
+standing acceptances that apply, by calling the readers of the install gate (local approval and host-allow pin, followed grant,
+followed advisory override, followed install allowance, the `install.auto_allow_tolerate` tolerance) on the store root the caller
+pinned. It gives an authority only for the default registry host (the source the approvals are granted for). It refuses a
+terminal as its input. There is no command that turns a caller's statement into a receipt: the lane records by asking the
+ordinary `package-audit --gate install` about a named root. The ordinary audit is unchanged.
 
 ### Install gate mode
 

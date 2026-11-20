@@ -563,6 +563,13 @@ func tolerates(occurrence Occurrence, doc Evidence, causes []string) (string, bo
 	if occurrence.CoveredBy != "" {
 		name, version = occurrence.coverName, occurrence.coverVersion
 	}
+	// today's predicate: a tolerance applies only to an artifact with no affecting advisory at all (a moderate one
+	// included: it is informational for a GO, but a WARN with an affecting advisory is the adverse warning's decision)
+	for _, identity := range doc.Identities {
+		if identity.Name == name && identity.Version == version && len(identity.Advisories) > 0 {
+			return "", false
+		}
+	}
 	for _, acceptance := range doc.Acceptances {
 		if acceptance.Kind != AcceptLocalTolerance || acceptance.Name != name || acceptance.Version != version ||
 			occurrence.Host == "" || !strings.EqualFold(acceptance.Host, occurrence.Host) {

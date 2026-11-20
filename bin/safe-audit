@@ -8466,15 +8466,13 @@ record_installed_command() {
 
 # --- the project lane's acceptances and install records ------------------------------------------------------------------
 #
-# `lane-acceptances` (read-only) and `lane-record` (the one writer) are the lane's two doors into the operator's own stores.
-# Neither adds a store, a format or a trust rule: the first calls the readers today's install gate calls, on the artifacts
-# the decision left at stake, and the second writes through mark_install_known, the writer behind the gate's receipts. The
-# caller (the lane) pins the store root, so they read and write exactly where the lane reads its switch.
+# `lane-acceptances` is the lane's read-only door into the operator's own stores. It adds no store, format or trust rule: it
+# calls the readers today's install gate calls, on the artifacts the decision left at stake, on the store root the caller
+# pinned. There is NO command that turns a caller's statement into a receipt: the lane asks the ordinary audit
+# (`package-audit --gate install`) about a named root, and that audit records or revokes by its own evidence.
 #
 #   lane-acceptances < {"candidates":[{"name","version","host","blocking_advisories":[ids]}]}
 #       -> {"schema_version":1,"acceptances":[{kind,name,version,host,advisories,causes}]}
-#   lane-record < {"records":[{"name","version","verdict":"GO"|"WARN_TOLERATED","reasons":[...]}]}
-#       -> writes install-known (the receipts the signed export reads); prints the count recorded
 lane_acceptances_command() {
   local input candidates out='[]' cand name version host ids eco=npm tol='[]' auto_allow=true cfg
   if [[ -t 0 ]]; then die "lane-acceptances: the request is read from stdin; refusing to wait on a terminal"; fi
@@ -8497,6 +8495,9 @@ lane_acceptances_command() {
     name=$(jq -r '.name' <<<"$cand"); version=$(jq -r '.version' <<<"$cand"); host=$(jq -r '.host' <<<"$cand")
     ids=$(jq -c '.blocking_advisories' <<<"$cand")
     [[ -n "$name" && -n "$version" && -n "$host" ]] || continue
+    # the approvals and pins read here are bound to the default registry source (implicit-default): an artifact from any other
+    # host is never given an authority that was granted for another source
+    [[ "${host,,}" == "registry.npmjs.org" ]] || continue
     # a local exact approval: the source-bound consent, or an exact local host-allow pin (never a followed copy)
     if local_install_approval_matches "$eco" "$name" "$version" || local_host_allow_matches_resolved "$eco" "$name" "$version"; then
       out=$(jq -c --arg n "$name" --arg v "$version" --arg h "$host" '. + [{kind:"local_exact_approval",name:$n,version:$v,host:$h,advisories:[],causes:[]}]' <<<"$out")
@@ -8520,27 +8521,6 @@ lane_acceptances_command() {
     fi
   done < <(jq -c '.candidates[]' <<<"$input")
   jq -cn --argjson a "$out" '{schema_version: 1, acceptances: $a}'
-}
-
-lane_record_command() {
-  local input record name version verdict reasons count=0
-  if [[ -t 0 ]]; then die "lane-record: the request is read from stdin; refusing to wait on a terminal"; fi
-  input=$(cat 2>/dev/null) || input=""
-  if ! jq -e '(type == "object") and ((.records | type) == "array")
-      and ([.records[] | (.name | type == "string") and (.name | test("^[^\\s]+$")) and (.version | type == "string")
-            and (.version | test("^[0-9][A-Za-z0-9.+_-]*$"))
-            and (.verdict == "GO" or .verdict == "WARN_TOLERATED")
-            and ((.reasons | type) == "array") and ([.reasons[] | type == "string"] | all)] | all)' <<<"$input" >/dev/null 2>&1; then
-    die "lane-record: expected {\"records\":[{\"name\",\"version\",\"verdict\":\"GO|WARN_TOLERATED\",\"reasons\":[...]}]} on stdin"
-  fi
-  CHECK_EFFECTIVE_SOURCES=""
-  while IFS= read -r record; do
-    name=$(jq -r '.name' <<<"$record"); version=$(jq -r '.version' <<<"$record")
-    verdict=$(jq -r '.verdict' <<<"$record"); reasons=$(jq -c '.reasons' <<<"$record")
-    mark_install_known npm "$name" "$version" "$verdict" "$reasons" "" || die "lane-record: cannot record $name@$version"
-    count=$((count + 1))
-  done < <(jq -c '.records[]' <<<"$input")
-  printf '%s\n' "$count"
 }
 
 # Plumbing for the stale-evidence readers (install wrappers, bin/safe,
@@ -12661,17 +12641,13 @@ main() {
       return 0
       ;;
     # The project lane's own doors into the operator's stores (see lane_acceptances_command): neither initialises
-    # anything; the first reads, the second writes the receipts and nothing else.
+    # anything.
     lane-acceptances)
       shift
       lane_acceptances_command "$@"
       return 0
       ;;
-    lane-record)
-      shift
-      lane_record_command "$@"
-      return 0
-      ;;
+
   esac
   # The evidence-only reading (the project lane's) writes nothing, a cold start included: it is dispatched before the
   # initialisation that creates the registries, the host-allow log and the directories.

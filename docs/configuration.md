@@ -306,28 +306,35 @@ pass and warnings under `environment.release_follow`.
   ecosystem and source checks of the follow ledger) clears a blocking advisory only when it covers every blocking advisory
   of the artifact; a **followed grant** and a **followed install allowance** clear an adverse advisory, a wait and a Socket
   outcome, never a blocking advisory; the standing **tolerance** (`install.auto_allow_tolerate`) clears a wait or a Socket
-  result that is a WARN only when every cause of it is listed, never an advisory, never a consent ask or a pending score.
+  result that is a WARN only when every cause of it is listed and the artifact has no affecting advisory at all (today's
+  predicate), never an advisory, never a consent ask or a pending score. Bundled bytes are judged under their covering
+  artifact: an acceptance is for the artifact whose bytes carry the advisory, and a followed override must cover every
+  blocking advisory under those bytes.
   Nothing clears malice, a graph that cannot be bound or missing evidence. What nothing clears ends the command with its
   own exit, in the decision's order. There is no terminal prompt for these classes yet (the operator terminal is its own
   ticket).
 
-  **Install records.** After the binder reports a verified, published tree, and only then (a refusal, a failed
-  materialisation, `--dry-run` and `--package-lock-only` record nothing), the lane leaves one record per **named root** the
-  command introduced, in the receipts the signed export reads (`install-known.json`, through `safe audit lane-record`, which
-  writes with the same writer as today's gate): verdict `GO` for a root whose own evidence is complete (its advisory reading,
-  its publish time and its Socket reading) and carries nothing at high or above (below-high advisories are named in the
-  record), `WARN_TOLERATED` for one a standing tolerance cleared. Records are for named roots only, as today's gate records
-  a named install and never the transitive packages a project install brings: a record is exported as an install allowance,
-  which lets a follower install that exact version by name in place of the Socket consent, pending and warning outcomes, so
-  it must rest on a Socket reading of the artifact. Never recorded: an introduced artifact nobody named, whatever its
-  evidence; a root whose Socket reading is anything but clear or tolerated; one cleared by a local approval, a followed grant
-  or a followed install allowance (another decision, already stored or another origin's: a follower's authority is never
-  exported again); an artifact that passed only because its advisories were already present; anything after missing
-  evidence, a block override or the one-shot route. A bare `npm install`, `update`, `ci`, `dedupe` or `prune` names no root
-  and records nothing. The signed export takes the records as it takes today's: exact versions of the default registry. A
-  named root whose outcome the operator confirmed at a terminal is the third eligible kind and comes with the operator
-  terminal. A record that cannot be written after the publication is reported on stderr and in the audit log and undoes
-  nothing; the next command that judges the root clear records it.
+  **Install records.** The lane writes no record itself and takes no verdict from its caller: no command turns a caller's
+  statement into a receipt. After the binder reports a verified, published tree, and only then (a refusal, a failed
+  materialisation, `--dry-run` and `--package-lock-only` audit and record nothing), the lane asks today's auditor to audit,
+  by its ordinary path (`package-audit <name>@<version> --gate install`, stdin closed, no consent carried, under the gate's
+  leash), each **named root** that the decision left eligible and that the published tree holds (a root the tree does not
+  hold, deselected by `--omit` or a platform, is not audited). That audit records, or does not, by its own evidence and its
+  own rules, exactly as today's gate does for a named install: `install.auto_allow=false` writes no clean receipt; a Socket
+  reading that was not made is recorded as today's reasons say (`socket_out_of_scope`), and a Socket reading switched off is a
+  WARN that records nothing; a tolerance applies with today's own predicate (`WARN_TOLERATED`); a root a followed authority
+  clears is not audited, and a followed pass would carry a token the export never takes. The decision's eligibility
+  (`records` in the report) is a filter, necessary and not sufficient: a named root, with its own complete advisory reading,
+  nothing at high or above in the bytes it carries (a bundled member's included, introduced or already present) and a clear or
+  tolerated Socket result. Never audited for a record: an introduced artifact nobody named (a bare install, update, ci, dedupe
+  or prune names no root), a root cleared by a local approval, a followed grant or a followed install allowance, one that
+  passed only because its advisories were already present, anything after missing evidence, a block override or the one-shot
+  route. At most 16 roots are audited per command; the lane reads back what the store holds and says what was recorded.
+  **Revocation:** when the decision establishes adverse evidence on an exact identity (malice, a blocking or adverse
+  advisory, a Socket finding, a young version), the lane asks the same audit about that identity if the store holds a receipt
+  of that exact version (at most 16), and today's own rule revokes a receipt the evidence supersedes; operator approvals are
+  not receipts and are untouched. The signed export takes the receipts as it takes today's. A named root whose outcome the
+  operator confirmed at a terminal is the third eligible kind and comes with the operator terminal.
 
   **Socket on a named root.** The artifacts the command names are scored by Socket as today's per-root audit scores
   them, and nothing else is: one call of the auditor beside safe's dispatcher in its evidence-only mode

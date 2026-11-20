@@ -5,17 +5,20 @@
 - Project lane (still behind `install.project_lane`): standing acceptances and install records, **no terminal prompt**. The
   decision takes the operator's standing acceptances (a local exact approval or pin, a followed grant, a followed install
   allowance, a followed advisory override with its signer, generation, ecosystem and source checks, the
-  `install.auto_allow_tolerate` tolerance), read by safe's own reader (`safe audit lane-acceptances`: the same functions as
-  today's install gate) from the stores where the lane reads its switch, for the artifacts a first decision leaves
-  outstanding. A local approval clears a blocking advisory; a followed install allowance does not; a followed override clears
-  it only when it covers every blocking advisory; adverse advisories, waits and Socket outcomes on a named root are cleared
-  by the authorities of today's adverse warning; nothing clears malice, an unbound graph or missing evidence. After a
-  verified, published tree (never for a refusal, a failed materialisation, `--dry-run` or `--package-lock-only`) the lane
-  leaves install records (`safe audit lane-record`, today's writer) for the **named roots** the command introduced whose own
-  evidence, Socket reading included, is clean or below high, and for those a local tolerance cleared (never for a transitive
-  package nobody named: a record is exported as an install allowance, which a follower takes in place of the Socket consent); never for an artifact that passed only because its advisories were
-  already present, and never for another authority's decision, so a follower never re-exports an authority. A record that
-  cannot be written is reported and undoes nothing. The operator-confirmed named root is the operator-terminal ticket's.
+  `install.auto_allow_tolerate` tolerance), read by safe's own read-only reader (`safe audit lane-acceptances`: the same
+  functions as today's install gate, default registry host only) from the stores where the lane reads its switch, for the
+  artifacts a first decision leaves outstanding. A local approval clears a blocking advisory; a followed install allowance does
+  not; a followed override clears it only when it covers every blocking advisory under the bytes of the artifact (a bundled
+  member's included); a tolerance clears a wait or a Socket warning only on an artifact with no affecting advisory; adverse
+  advisories, waits and Socket outcomes on a named root are cleared by the authorities of today's adverse warning; nothing
+  clears malice, an unbound graph or missing evidence. **The lane writes no record itself and takes no verdict from its
+  caller.** After a verified, published tree (never for a refusal, a failed materialisation, `--dry-run` or
+  `--package-lock-only`) it asks today's auditor to audit, by its ordinary path, each named root the decision left eligible
+  and the tree holds; that audit records or does not by its own rules (clean receipts switched off, Socket not consulted, a
+  tolerance, a followed authority), and the lane reports what the store holds. When the decision establishes adverse evidence
+  on an identity that holds a receipt, the same audit revokes it by today's rule. At most 16 audits of each kind per command.
+  Nothing is recorded for a transitive package nobody named, nor for another authority's decision, so a follower never
+  re-exports an authority. The operator-confirmed named root is the operator-terminal ticket's.
 
 - Project lane (still behind `install.project_lane`): Socket on the named roots. The projected root is scored by Socket
   as today's per-root audit scores it (each named operand tied to its direct occurrence in the projected lockfile, so

@@ -1,5 +1,10 @@
 package projectlane
 
+import (
+	"sort"
+	"strings"
+)
+
 // Install records (spec 1625, "Records and export").
 //
 // The decision says which artifacts the command may leave an install record for; the gate writes them, and only after the
@@ -23,22 +28,23 @@ package projectlane
 // approval, a followed grant, a followed install allowance: that decision is already stored, or is another origin's and is
 // never exported again), a command confirmed on missing evidence, a block override, the one-shot route.
 
-// Record verdicts, the tokens `install-known.json` holds and the signed export reads.
+// Record verdicts, the tokens `install-known.json` holds and the signed export reads. The gate does not write them: it asks
+// today's auditor to audit the root, and that audit decides what it records.
 const (
 	RecordClean     = "GO"
 	RecordTolerated = "WARN_TOLERATED"
 )
 
-// RecordItem is one artifact the command may leave an install record for.
+// RecordItem is one named root the decision leaves eligible for an install record. It is a filter, never a verdict the
+// gate takes to a store.
 type RecordItem struct {
-	Name    string   `json:"name"`
-	Version string   `json:"version"`
-	Host    string   `json:"host"`
-	Verdict string   `json:"verdict"`
-	Reasons []string `json:"reasons"`
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Host    string `json:"host"`
+	Verdict string `json:"verdict"`
 }
 
-// recordsFor lists the eligible artifacts of a CLEAR decision. It is empty for any other outcome.
+// recordsFor lists the eligible named roots of a CLEAR decision. It is empty for any other outcome.
 func recordsFor(report Report, in Input, evidence evidenceIndex) []RecordItem {
 	records := []RecordItem{}
 	if report.Outcome.Status != "clear" {
@@ -64,6 +70,15 @@ func recordsFor(report Report, in Input, evidence evidenceIndex) []RecordItem {
 			roots[Identity{Name: root.Name, Version: root.Version}] = root
 		}
 	}
+	// the advisories at high or above carried by an identity: of the artifact itself, or of the members its bytes carry
+	gating := func(identity Identity) bool {
+		for _, hit := range evidence[identity].Advisories {
+			if hit.Malware || severityClass(hit.Severity, blockSet) != AdvisoryBelowHigh {
+				return true
+			}
+		}
+		return false
+	}
 	seen := map[Identity]struct{}{}
 	for _, occurrence := range in.Target.Occurrences {
 		identity := occurrence.Identity()
@@ -79,40 +94,38 @@ func recordsFor(report Report, in Input, evidence evidenceIndex) []RecordItem {
 			continue // nobody named it: no Socket reading, no record
 		}
 		read, ok := evidence[identity]
-		if !ok || read.Coverage != CoverageComplete {
+		if !ok || read.Coverage != CoverageComplete || gating(identity) {
 			continue
 		}
-		reasons := []string{"osv_clean_for_version"}
-		eligible := true
-		for _, hit := range read.Advisories {
-			if hit.Malware || severityClass(hit.Severity, blockSet) != AdvisoryBelowHigh {
-				eligible = false // the artifact itself carries an advisory at high or above, introduced or already present
-				break
+		// a root whose BYTES carry a high or blocking advisory, introduced or already present, is not eligible: a bundled
+		// member is the root's own bytes
+		carried := false
+		for _, member := range in.Target.Occurrences {
+			if member.CoveredBy != "" && member.coverName == identity.Name && member.coverVersion == identity.Version &&
+				strings.EqualFold(member.Host, occurrence.Host) && gating(member.Identity()) {
+				carried = true
 			}
-			reasons = []string{"osv_below_high_only"}
 		}
-		if !eligible {
+		if carried {
 			continue
 		}
-		tolerated := []string{}
+		tolerated := false
 		if wait, waited := waits[identity]; waited {
 			if !onlyTolerance(wait.ClearedBy) {
 				continue
 			}
-			tolerated = append(tolerated, "release_too_new")
+			tolerated = true
 		}
 		switch {
 		case root.Outcome == SocketClear:
-			reasons = append(reasons, "socket_ok")
 		case onlyTolerance(root.ClearedBy):
-			tolerated = append(tolerated, rootCauses(in, identity)...)
+			tolerated = true
 		default:
 			continue // cleared by another authority, or confirmed at a terminal (1684): not this ticket's record
 		}
-		reasons = append(reasons, "blocklist_pass")
-		item := RecordItem{Name: identity.Name, Version: identity.Version, Host: occurrence.Host, Verdict: RecordClean, Reasons: reasons}
-		if len(tolerated) > 0 {
-			item.Verdict, item.Reasons = RecordTolerated, sortedUnique(tolerated)
+		item := RecordItem{Name: identity.Name, Version: identity.Version, Host: occurrence.Host, Verdict: RecordClean}
+		if tolerated {
+			item.Verdict = RecordTolerated
 		}
 		records = append(records, item)
 	}
@@ -123,13 +136,91 @@ func onlyTolerance(kinds []string) bool {
 	return len(kinds) == 1 && kinds[0] == AcceptLocalTolerance
 }
 
-func rootCauses(in Input, identity Identity) []string {
-	if in.Socket != nil {
-		for _, root := range in.Socket.Roots {
-			if root.Name == identity.Name && root.Version == identity.Version {
-				return root.Causes
+// adverseIdentities lists the exact identities the decision established adverse evidence on, whatever the outcome: malice,
+// a blocking or adverse introduced advisory, a Socket finding on a named root, a version inside the cooldown.
+func adverseIdentities(report Report) []Identity {
+	set := map[Identity]struct{}{}
+	for _, item := range report.Malice {
+		for _, version := range item.Versions {
+			set[Identity{Name: item.Name, Version: version}] = struct{}{}
+		}
+	}
+	for _, item := range report.Advisories.Introduced {
+		if item.Class == AdvisoryBlocking || item.Class == AdvisoryAdverse {
+			for _, version := range item.Versions {
+				set[Identity{Name: item.Name, Version: version}] = struct{}{}
 			}
 		}
 	}
-	return nil
+	if report.Socket != nil {
+		for _, root := range report.Socket.Roots {
+			if root.Outcome == SocketAdverse || root.Outcome == SocketBlocked {
+				set[Identity{Name: root.Name, Version: root.Version}] = struct{}{}
+			}
+		}
+	}
+	if report.Cooldown != nil {
+		for _, wait := range report.Cooldown.Waits {
+			set[Identity{Name: wait.Name, Version: wait.Version}] = struct{}{}
+		}
+	}
+	return sortedIdentities(set)
+}
+
+// wantedAcceptances lists the artifacts whose standing acceptances the decision would use: for every item still
+// outstanding, the artifact whose bytes carry it, with the blocking advisories introduced under those bytes.
+func wantedAcceptances(report Report, in Input) []WantedAcceptance {
+	type key struct{ name, version, host string }
+	wanted := map[key]map[string]struct{}{}
+	add := func(name, version string) {
+		for _, occurrence := range in.Target.Occurrences {
+			if occurrence.Name != name || occurrence.Version != version || !occurrence.Public || occurrence.Host == "" {
+				continue
+			}
+			coverName, coverVersion := coverArtifact(occurrence)
+			k := key{coverName, coverVersion, strings.ToLower(occurrence.Host)}
+			if wanted[k] == nil {
+				wanted[k] = map[string]struct{}{}
+			}
+			for id := range report.coverBlocking[coverKey(occurrence)] {
+				wanted[k][id] = struct{}{}
+			}
+		}
+	}
+	for _, item := range report.Advisories.Introduced {
+		if item.Class == AdvisoryBelowHigh || item.Cleared {
+			continue
+		}
+		for _, version := range item.Versions {
+			add(item.Name, version)
+		}
+	}
+	if report.Cooldown != nil {
+		for _, wait := range report.Cooldown.Waits {
+			if !wait.Cleared {
+				add(wait.Name, wait.Version)
+			}
+		}
+	}
+	if report.Socket != nil {
+		for _, root := range report.Socket.Roots {
+			if !root.Cleared {
+				add(root.Name, root.Version)
+			}
+		}
+	}
+	out := make([]WantedAcceptance, 0, len(wanted))
+	for k, ids := range wanted {
+		out = append(out, WantedAcceptance{Name: k.name, Version: k.version, Host: k.host, BlockingAdvisories: sortedIDs(ids)})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		if out[i].Version != out[j].Version {
+			return out[i].Version < out[j].Version
+		}
+		return out[i].Host < out[j].Host
+	})
+	return out
 }

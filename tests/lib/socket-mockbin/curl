@@ -33,13 +33,15 @@ case "$url" in
       # windows (e.g. 4d: outside the 3d cooldown, inside the 7d Socket
       # window) without a second fresh-packument knob.
       [[ -n "${MOCK_RELEASE_AGE:-}" ]] && fresh_time="$MOCK_RELEASE_AGE"
-      printf '{"versions":{"1.0.0":{}},"time":{"1.0.0":"%s"}}\n' "$(date -u -d "$fresh_time" +%Y-%m-%dT%H:%M:%SZ)" | emit
+      # the lane suite names versions 1.0.0 to 3.0.0 of its packages: every one of them is as old (or as young) as the others
+      stamp="$(date -u -d "$fresh_time" +%Y-%m-%dT%H:%M:%SZ)"
+      printf '{"versions":{"1.0.0":{},"1.1.0":{},"2.0.0":{},"3.0.0":{}},"time":{"1.0.0":"%s","1.1.0":"%s","2.0.0":"%s","3.0.0":"%s"}}\n' "$stamp" "$stamp" "$stamp" "$stamp" | emit
     elif [[ "${MOCK_MULTI_VERSION:-0}" == "1" ]]; then
       # Two majors so two distinct project constraints resolve to two
       # distinct installable versions (RESOLVED_VERSIONS length 2).
       printf '{"versions":{"1.0.0":{},"2.0.0":{}},"dist-tags":{"latest":"2.0.0"},"time":{"1.0.0":"2020-01-01T00:00:00Z","2.0.0":"2020-06-01T00:00:00Z"}}\n' | emit
     else
-      printf '{"versions":{"1.0.0":{}},"time":{"1.0.0":"2020-01-01T00:00:00Z"}}\n' | emit
+      printf '{"versions":{"1.0.0":{},"1.1.0":{},"2.0.0":{},"3.0.0":{}},"time":{"1.0.0":"2020-01-01T00:00:00Z","1.1.0":"2020-01-01T00:00:00Z","2.0.0":"2020-01-01T00:00:00Z","3.0.0":"2020-01-01T00:00:00Z"}}\n' | emit
     fi
     ;;
 esac
