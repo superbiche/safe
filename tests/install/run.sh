@@ -660,10 +660,15 @@ fi
 if [[ "${1:-}" == "package-audit" && " $* " == *" --evidence-only "* ]]; then
   socket_input="$(cat)"
   printf 'SOCKET_REQUEST\t%s\n' "$(jq -c '{roots: ([.roots[] | "\(.name)@\(.version)"] | sort), cached: ([.cached[] | "\(.name)@\(.version)"] | sort)}' <<<"${socket_input}")" >> "${SAFE_INSTALL_COMMAND_LOG}"
+  # what the reader runs with: the core the lane verified and a closed or non-terminal stdin
+  printf 'SOCKET_ENV\tSAFE_CORE_BIN=%s\n' "${SAFE_CORE_BIN:-}" >> "${SAFE_INSTALL_COMMAND_LOG}"
   # the cache-only call (no roots) and the roots call are told apart by the status variable that targets each
   if [[ "$(jq '.roots | length' <<<"${socket_input}")" == 0 ]]; then
+    [[ -z "${SAFE_AUDIT_SOCKET_CACHE_STALL:-}" ]] || sleep "${SAFE_AUDIT_SOCKET_CACHE_STALL}"
     [[ -z "${SAFE_AUDIT_SOCKET_CACHE_STATUS:-}" ]] || exit "${SAFE_AUDIT_SOCKET_CACHE_STATUS}"
+    [[ -z "${SAFE_AUDIT_SOCKET_CACHE_RAW:-}" ]] || { printf '%s' "${SAFE_AUDIT_SOCKET_CACHE_RAW}"; exit 0; }
   else
+    [[ -z "${SAFE_AUDIT_SOCKET_STALL:-}" ]] || sleep "${SAFE_AUDIT_SOCKET_STALL}"
     [[ -z "${SAFE_AUDIT_SOCKET_STATUS:-}" ]] || exit "${SAFE_AUDIT_SOCKET_STATUS}"
     [[ -z "${SAFE_AUDIT_SOCKET_RAW:-}" ]] || { printf '%s' "${SAFE_AUDIT_SOCKET_RAW}"; exit 0; }
   fi
@@ -675,7 +680,7 @@ if [[ "${1:-}" == "package-audit" && " $* " == *" --evidence-only "* ]]; then
        roots: [$in.roots[] | . as $r | ($out["\($r.name)@\($r.version)"] // "clear") as $o
          | {name: $r.name, version: $r.version, outcome: $o, gate_exit: $exit[$o],
             line: (if $o == "clear" then "PASS (score=95)" elif $o == "adverse" then "WARN (score=40)" elif $o == "blocked" then "BLOCK (critical supply-chain-risk alert)" else "WARN (\($o))" end),
-            causes: (if $o == "adverse" then ["socket_low_score"] else [] end), cached: false}],
+            causes: (if $o == "adverse" then ["socket_low_score"] elif $o == "blocked" then ["socket_malware"] elif $o == "rate_limited" then ["socket_rate_limited"] else [] end), cached: false}],
        cached_blocks: [$in.cached[] | . as $c | select($blocks | index("\($c.name)@\($c.version)")) | {name: $c.name, version: $c.version, line: "BLOCK (critical supply-chain-risk alert)"}],
        cache_gap: $gap}'
   exit 0
@@ -13638,10 +13643,10 @@ case_project_lane_socket_every_outcome_keeps_todays_exit_and_wording() {
   local row outcome status want_word before
   for row in \
       'adverse|100|safe audit verdict WARN (Socket: WARN (score=40))' \
-      'rate_limited|102|Socket is rate-limited; accepting missing Socket scores requires the operator'"'"'s interactive terminal' \
-      'consent_required|102|fresh release inside the Socket window: an operator decides at an interactive terminal' \
+      'rate_limited|102|Socket is rate-limited, so its score is missing' \
+      'consent_required|102|fresh release inside the Socket window' \
       'pending|102|the Socket score for the fresh release is still pending, so this install is not all-green' \
-      'unavailable|102|audit infrastructure is unavailable (not a package finding); proceeding is a deliberate operator decision' \
+      'unavailable|102|audit infrastructure is unavailable (not a package finding)' \
       'blocked|104|Socket BLOCK on clean@2.0.0' \
       'clear|0|'; do
     outcome="${row%%|*}"; status="${row#*|}"; want_word="${status#*|}"; status="${status%%|*}"
@@ -13649,7 +13654,7 @@ case_project_lane_socket_every_outcome_keeps_todays_exit_and_wording() {
     before="$(lane_digests)"
     SAFE_AUDIT_SOCKET_OUTCOMES="{\"clean@2.0.0\":\"${outcome}\"}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
     assert_status "${status}" "$FUNCNAME: ${outcome}" || return
-    assert_err_contains_fragment 'safe: project lane: socket: 1 named root(s) scored (clean@2.0.0: '"${outcome}"')' "$FUNCNAME: ${outcome}: the report line" || return
+    assert_err_contains_fragment 'safe: project lane: socket: 1 named root(s) scored (clean@2.0.0: '"${outcome}" "$FUNCNAME: ${outcome}: the report line" || return
     if [[ "${status}" != 0 ]]; then
       assert_lane_final_line install "$FUNCNAME: ${outcome}" || return
       [[ "$(tail -n 1 "${ERR_FILE}")" == *"${want_word}"* ]] || { fail "$FUNCNAME: ${outcome}: the final line does not say: ${want_word}"; return; }
@@ -13817,6 +13822,104 @@ case_project_lane_socket_a_roots_own_advisory_gates_only_when_introduced() {
   SAFE_AUDIT_EVIDENCE_HITS="{\"clean@2.0.0\":${hit}}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
   assert_status 100 "$FUNCNAME: introduced" || return
   assert_err_contains_fragment 'the command introduces a high-severity advisory: clean@2.0.0 carries GHSA-root-0001' "$FUNCNAME: introduced" || return
+  pass "$FUNCNAME"
+}
+
+# ---- review of ticket 1636 (pull request 230): the lane's Socket reading, hardened ------------------------------------
+
+# What is scored is the PROJECTED root: npm resolves `clean@2.0.0+build.1` to 2.0.0, and an adverse finding on that
+# version must stop the command. An operand that cannot be tied to the package the projection holds is missing evidence.
+case_project_lane_socket_scores_the_root_the_projection_holds() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-socket-tie-build" kept@1.0.0
+  SAFE_AUDIT_SOCKET_OUTCOMES='{"clean@2.0.0":"adverse"}' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0+build.1'
+  assert_status 100 "$FUNCNAME: build metadata" || return
+  assert_log_contains $'SOCKET_REQUEST\t{"roots":["clean@2.0.0"],"cached":[]}' "$FUNCNAME: the projected identity is the one asked" || return
+  assert_err_contains_fragment 'clean@2.0.0: safe audit verdict WARN' "$FUNCNAME: build metadata" || return
+  # the projection holds another version than the operand names: it cannot be tied, so it is missing evidence
+  lane_prepare "lane-socket-tie-other" kept@1.0.0
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@3.0.0)" lane_run 'npm install clean@2.0.0'
+  [[ "$(cat "${STATUS_FILE:-/dev/null}" 2>/dev/null)" != 0 ]] || true
+  grep -qP '^SOCKET_REQUEST\t\{"roots":\["clean@2.0.0"\]' "${LOG_FILE}" && { fail "$FUNCNAME: a version the projection does not hold was scored"; return; }
+  [[ "$(tail -n 1 "${ERR_FILE}")" != "" ]] || { fail "$FUNCNAME: no final line"; return; }
+  pass "$FUNCNAME"
+}
+
+# The reader's own answer is validated: exactly one consistent row per identity asked.
+case_project_lane_socket_an_incomplete_or_contradictory_answer_is_missing_evidence() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local label raw
+  for label in empty-roots another-version clear-with-malware duplicate-rows bad-exit; do
+    case "${label}" in
+      empty-roots) raw='{"schema_version":1,"roots":[],"cached_blocks":[],"cache_gap":""}' ;;
+      another-version) raw='{"schema_version":1,"roots":[{"name":"clean","version":"2.0.1","outcome":"clear","gate_exit":0,"line":"PASS (score=95)","causes":[],"cached":false}],"cached_blocks":[],"cache_gap":""}' ;;
+      clear-with-malware) raw='{"schema_version":1,"roots":[{"name":"clean","version":"2.0.0","outcome":"clear","gate_exit":0,"line":"PASS (score=95)","causes":["socket_malware"],"cached":false}],"cached_blocks":[],"cache_gap":""}' ;;
+      duplicate-rows) raw='{"schema_version":1,"roots":[{"name":"clean","version":"2.0.0","outcome":"clear","gate_exit":0,"line":"PASS","causes":[],"cached":false},{"name":"clean","version":"2.0.0","outcome":"clear","gate_exit":0,"line":"PASS","causes":[],"cached":false}],"cached_blocks":[],"cache_gap":""}' ;;
+      bad-exit) raw='{"schema_version":1,"roots":[{"name":"clean","version":"2.0.0","outcome":"clear","gate_exit":10,"line":"PASS","causes":[],"cached":false}],"cached_blocks":[],"cache_gap":""}' ;;
+    esac
+    lane_prepare "lane-socket-answer-${label}" kept@1.0.0
+    SAFE_AUDIT_SOCKET_RAW="${raw}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+    assert_status 102 "$FUNCNAME: ${label}" || return
+    assert_lane_final_line install "$FUNCNAME: ${label}" || return
+    assert_err_contains_fragment 'audit infrastructure is unavailable (not a package finding)' "$FUNCNAME: ${label}" || return
+  done
+  # a row that is whole is kept beside one that is not: a valid block among the roots still decides (104)
+  lane_prepare "lane-socket-answer-block-beside-gap" kept@1.0.0
+  raw='{"schema_version":1,"roots":[{"name":"clean","version":"2.0.0","outcome":"blocked","gate_exit":20,"line":"BLOCK (critical supply-chain-risk alert)","causes":["socket_malware"],"cached":false}],"cached_blocks":[],"cache_gap":""}'
+  SAFE_AUDIT_SOCKET_RAW="${raw}" NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" lane_run 'npm install clean@2.0.0 other@1.0.0'
+  assert_status 104 "$FUNCNAME: a valid block beside a missing row" || return
+  assert_err_contains_fragment 'Socket BLOCK on clean@2.0.0' "$FUNCNAME: block" || return
+  pass "$FUNCNAME"
+}
+
+# The lane's evidence calls run with the core the lane verified, whatever the caller's environment names.
+case_project_lane_socket_calls_use_the_verified_core_not_the_callers() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-socket-core" kept@1.0.0
+  mkdir -p "${CASE_DIR}/fake-bin"
+  printf '#!/bin/sh\nexit 0\n' > "${CASE_DIR}/fake-bin/safe-core"; chmod +x "${CASE_DIR}/fake-bin/safe-core"
+  printf '#!/bin/sh\nexit 0\n' > "${CASE_DIR}/fake-bin/socket"; chmod +x "${CASE_DIR}/fake-bin/socket"
+  SAFE_CORE_BIN="${CASE_DIR}/fake-bin/safe-core" SAFE_TEST_PATH_MID="${CASE_DIR}/fake-bin" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  unset SAFE_TEST_PATH_MID
+  assert_status 0 "$FUNCNAME" || return
+  [[ "$(grep -c $'^SOCKET_ENV\t' "${LOG_FILE}")" == 2 ]] || { fail "$FUNCNAME: two evidence calls were expected"; return; }
+  ! grep $'^SOCKET_ENV\t' "${LOG_FILE}" | grep -vqF "SAFE_CORE_BIN=${BIN_DIR}/safe-core" || { fail "$FUNCNAME: a call ran with a core other than the one beside the dispatcher: $(grep $'^SOCKET_ENV\t' "${LOG_FILE}")"; return; }
+  pass "$FUNCNAME"
+}
+
+# A public bundled member of the target graph is read from the cache too.
+case_project_lane_socket_a_cached_block_on_a_bundled_member_is_malice() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-socket-bundled" kept@1.0.0
+  local target
+  target="$(lane_lock kept@1.0.0 clean@2.0.0 | jq -c '.packages["node_modules/clean/node_modules/bund"] = {version: "1.0.0", inBundle: true}')"
+  SAFE_AUDIT_SOCKET_CACHED_BLOCKS='["bund@1.0.0"]' NPM_LOCK_MUTATION_JSON="${target}" lane_run 'npm install clean@2.0.0'
+  assert_log_contains $'SOCKET_REQUEST\t{"roots":[],"cached":["bund@1.0.0","clean@2.0.0","kept@1.0.0"]}' "$FUNCNAME: the member is in the cache request" || return
+  assert_status 104 "$FUNCNAME" || return
+  assert_err_contains_fragment 'Socket BLOCK on bund@1.0.0' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# A reader that stalls has a deadline: its expiry is missing evidence (102), and a block already established still decides.
+case_project_lane_socket_a_reader_that_stalls_is_missing_evidence_within_its_deadline() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local start
+  lane_prepare "lane-socket-stall-roots" kept@1.0.0
+  start=$SECONDS
+  SAFE_INSTALL_TIMEOUT_SECONDS=2 SAFE_AUDIT_SOCKET_STALL=60 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 102 "$FUNCNAME: roots" || return
+  (( SECONDS - start < 40 )) || { fail "$FUNCNAME: the stalled roots call was not ended by its deadline"; return; }
+  assert_err_contains_fragment 'ran out of time' "$FUNCNAME: roots" || return
+  lane_prepare "lane-socket-stall-cache" kept@1.0.0
+  start=$SECONDS
+  SAFE_INSTALL_TIMEOUT_SECONDS=2 SAFE_AUDIT_SOCKET_CACHE_STALL=60 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 102 "$FUNCNAME: cache" || return
+  (( SECONDS - start < 40 )) || { fail "$FUNCNAME: the stalled cache call was not ended by its deadline"; return; }
+  assert_err_contains_fragment 'the Socket cache could not be read' "$FUNCNAME: cache" || return
+  lane_prepare "lane-socket-stall-then-block" kept@1.0.0
+  SAFE_INSTALL_TIMEOUT_SECONDS=2 SAFE_AUDIT_SOCKET_CACHE_STALL=60 SAFE_AUDIT_EVIDENCE_BLOCKLIST='[{"name":"clean","reason":"operator blocklist"}]' \
+    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 104 "$FUNCNAME: a block already established still decides" || return
   pass "$FUNCNAME"
 }
 

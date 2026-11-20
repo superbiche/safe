@@ -24,6 +24,7 @@ safe_test_compose_exit_trap "rm -rf \"\$TEST_ROOT\""
 . "$ROOT/tests/lib/safe-core.sh"
 safe_core_test_prepare "$ROOT" "$TEST_ROOT/safe-core" || exit 1
 MOCKBIN="$ROOT/tests/lib/socket-mockbin"
+LOCAL_MACHINE=local
 SENTINEL_TOKEN="sentinel-socket-token-7f3a91"
 
 prepare_case() {
@@ -34,6 +35,8 @@ prepare_case() {
   printf '{"install":{"cooldown_days":%s,"socket":{"mode":"%s","cache_ttl_days":7}}}\n' "${CD:-0}" "${SMODE:-always}" > "$CASE_RUN_CONFIG/config.json"
   printf '{"packages":{}}\n' > "$CASE_RUN_CONFIG/blocked.json"
   : > "$CASE_LOG"
+  # the operator's tool configuration names the Socket tool (the evidence-only reading never consults PATH for it)
+  printf '{"%s":{"socket":"%s/socket"}}\n' "$LOCAL_MACHINE" "$MOCKBIN" > "$CASE_AUDIT_CONFIG/tools.json"
 }
 
 # audit <mode> <stdin-file|-> <args...> [VAR=val ...]: the auditor, closed stdin unless a file is given; sets OUT, ERRTXT, RC.
@@ -87,28 +90,76 @@ SMODE=auto prepare_case no-prompt
 SMODE=auto audit clean - fixture@1.0.0 --ecosystem npm --evidence-only MOCK_RELEASE_FRESH=1
 if [[ "$(jq -r .outcome <<<"$OUT")" == consent_required && "$(calls)" == 0 ]]; then pass 'a consent ask is reported as consent_required, with no Socket call'; else fail "a consent ask: $OUT ($(calls) calls)"; fi
 
-# --- 3. it decides and writes nothing -----------------------------------------------------------------------------------
-# the startup-only set: what any run of the auditor leaves (its machine and tool registries, the host-allow log), taken from a
-# run that stops at its input check; an evidence-only run must leave exactly that
-for mode in clean low malware rate; do
-  prepare_case "writes-nothing-$mode"
-  audit "$mode" - --ecosystem npm --evidence-only || true
-  before="$(state)"
-  audit "$mode" - fixture@1.0.0 --ecosystem npm --evidence-only
-  [[ "$(state)" == "$before" ]] && pass "$mode: no check file, receipt, install-known, consent, grant or export was written" || fail "$mode: files changed: $(diff <(printf '%s\n' "$before") <(state))"
+# --- 3. it decides and writes nothing, from a COLD start --------------------------------------------------------------
+# The listing is of every file, directory and link under the home, data, configuration and cache trees, with size, mode
+# and the modification time to the nanosecond: a touch, a created directory or a stored cache entry all change it. It is
+# taken before the first run of the case (cold state: nothing warmed up) and after.
+tree() {
+  local d
+  for d in "$CASE_HOME" "$CASE_DATA" "$CASE_AUDIT_CONFIG" "$CASE_RUN_CONFIG" "$CASE_CACHE"; do
+    [[ -e "$d" || -L "$d" ]] || { printf 'ABSENT %s\n' "$d"; continue; }
+    find "$d" -exec stat -c '%n|%F|%s|%a|%y' {} + 2>/dev/null
+  done | sort
+}
+cold_unchanged() { # <label> <mode> <stdin|-> <audit args...>
+  local label="$1" mode="$2" input="$3"; shift 3
+  local before after
+  before="$(tree)"
+  audit "$mode" "$input" "$@"
+  after="$(tree)"
+  if [[ "$before" == "$after" ]]; then pass "cold state, $label: nothing was created, touched or stored"; else fail "cold state, $label: $(diff <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -8)"; fi
+}
+for mode in clean low malware rate auth-leaky; do
+  prepare_case "cold-$mode"
+  cold_unchanged "Socket outcome $mode" "$mode" - fixture@1.0.0 --ecosystem npm --evidence-only
 done
-# the control: the same audit WITHOUT the mode does write (so the comparison above can fail)
-prepare_case writes-control; before="$(state)"
-audit clean - fixture@1.0.0 --ecosystem npm
-[[ "$(state)" != "$before" ]] && pass 'control: the ordinary audit of the same package writes state (the listing is able to see a write)' || fail 'control: the ordinary audit wrote nothing, so the listing proves nothing'
+SMODE=auto prepare_case cold-consent
+cold_unchanged "a consent ask" clean - fixture@1.0.0 --ecosystem npm --evidence-only MOCK_RELEASE_FRESH=1
+prepare_case cold-batch
+printf '{"roots":[{"name":"fixture","version":"1.0.0"}],"cached":[{"name":"fixture","version":"1.0.0"},{"name":"other","version":"1.0.0"}]}' > "$CASE/in.json"
+cold_unchanged "the batch (roots and cache)" clean "$CASE/in.json" --ecosystem npm --evidence-only
+# the private branch: a private scope gets a read-only outcome and the private decision (an audit-log event) is not run
+prepare_case cold-private
+"$SAFE_CORE_BIN" private-trust registry-add --policy "$CASE_RUN_CONFIG/private-registries.json" --id p-npm --ecosystem npm \
+  --origin https://git.example.test:8443/api/packages/owner/npm/ --namespace '@p/*' >/dev/null
+cold_unchanged "a private identity" clean - @p/fixture@1.0.0 --ecosystem npm --evidence-only
+if [[ "$(jq -r '.outcome' <<<"$OUT" 2>/dev/null)" == unavailable && "$(jq -r '.line' <<<"$OUT" 2>/dev/null)" == *"private-origin"* && "$(calls)" == 0 ]]; then pass 'a private identity is reported unavailable (never clear), with no Socket call'; else fail "private identity: $OUT"; fi
+# the control: the ordinary audit of the same package DOES write (so the listing is able to see a write)
+prepare_case cold-control
+before="$(tree)"; audit clean - fixture@1.0.0 --ecosystem npm
+[[ "$(tree)" != "$before" ]] && pass 'control: the ordinary audit writes state on the same cold start' || fail 'control: the ordinary audit wrote nothing, so the listing proves nothing'
+prepare_case cold-control-private
+"$SAFE_CORE_BIN" private-trust registry-add --policy "$CASE_RUN_CONFIG/private-registries.json" --id p-npm --ecosystem npm \
+  --origin https://git.example.test:8443/api/packages/owner/npm/ --namespace '@p/*' >/dev/null
+before="$(tree)"; audit clean - @p/fixture@1.0.0 --ecosystem npm --gate install
+[[ "$(tree)" != "$before" ]] && pass 'control: the private decision of the ordinary audit writes (an audit-log event)' || fail 'control: the private decision wrote nothing'
 # the return point precedes every write of package_audit_command
-emit_line="$(awk '/^package_audit_command\(\) \{/{f=1} f && /package_audit_evidence_emit "\$PKG_NAME"/{print NR; exit}' "$SAFE_AUDIT")"
+emit_line="$(awk '/^package_audit_command\(\) \{/{f=1} f && /package_audit_evidence_emit "\$PKG_NAME"/{n++; if (n==2) {print NR; exit}}' "$SAFE_AUDIT")"
 first_write="$(awk '/^package_audit_command\(\) \{/{f=1} f && /result_json=|mark_install_known|record_local_install_approval|record_followed|write_check|save_receipt/{print NR; exit}' "$SAFE_AUDIT")"
 if [[ -n "$emit_line" && -n "$first_write" && "$emit_line" -lt "$first_write" ]]; then pass "the evidence emit (line $emit_line) comes before the first write (line $first_write)"; else fail "the evidence emit ($emit_line) is not before the first write ($first_write)"; fi
-# it decides nothing: --gate and the mode do not combine, and the mode never reaches the gate's allow policy
 prepare_case no-gate
 audit clean - fixture@1.0.0 --ecosystem npm --evidence-only --gate install
 [[ "$RC" != 0 ]] && pass '--evidence-only refuses --gate (it decides nothing)' || fail '--evidence-only accepted --gate'
+
+# --- 3b. the Socket tool is the operator's configured one, never the first on PATH ---------------------------------------
+FAKE="$TEST_ROOT/fakebin"; mkdir -p "$FAKE"
+printf '#!/usr/bin/env bash\nprintf '"'"'{"ok":true,"data":{"self":{"score":{"overall":95},"alerts":[{"name":"malware","severity":"critical","category":"supplyChainRisk","example":"npm/fixture@1.0.0"}]},"transitively":{"dependencyCount":0,"alerts":[],"score":{"overall":100}}}}\\n'"'"'\n' > "$FAKE/socket"
+chmod +x "$FAKE/socket"
+prepare_case tool-config
+audit clean - fixture@1.0.0 --ecosystem npm --evidence-only PATH="$FAKE:$MOCKBIN:/usr/bin:/bin"
+[[ "$(jq -r .outcome <<<"$OUT")" == clear ]] && pass 'a fake socket first on PATH does not answer for Socket (the configured tool does)' || fail "PATH socket answered: $OUT"
+prepare_case tool-none
+rm -f "$CASE_AUDIT_CONFIG/tools.json"
+audit clean - fixture@1.0.0 --ecosystem npm --evidence-only PATH="$FAKE:$MOCKBIN:/usr/bin:/bin"
+[[ "$(jq -r .outcome <<<"$OUT")" == unavailable && "$(calls)" == 0 ]] && pass 'with no tool configured the caller PATH is not consulted: Socket is unavailable (102 on the lane), never clear' || fail "no tool configured: $OUT"
+prepare_case tool-standard-dir
+rm -f "$CASE_AUDIT_CONFIG/tools.json"; mkdir -p "$CASE_HOME/.local/bin"; ln -s "$MOCKBIN/socket" "$CASE_HOME/.local/bin/socket"
+audit clean - fixture@1.0.0 --ecosystem npm --evidence-only PATH="$FAKE:/usr/bin:/bin:$MOCKBIN"
+[[ "$(jq -r .outcome <<<"$OUT")" == clear ]] && pass 'with no tool configured the standard install directories are searched' || fail "standard dir: $OUT"
+prepare_case tool-bare-name
+printf '{"%s":{"socket":"socket"}}\n' "$LOCAL_MACHINE" > "$CASE_AUDIT_CONFIG/tools.json"
+audit clean - fixture@1.0.0 --ecosystem npm --evidence-only PATH="$FAKE:/usr/bin:/bin:$MOCKBIN"
+[[ "$(jq -r .outcome <<<"$OUT")" == unavailable ]] && pass 'a configured bare name (a PATH lookup) names no tool' || fail "bare name: $OUT"
 
 # --- 4. the batch: one process, every root, the cache read with no call --------------------------------------------------
 prepare_case batch
@@ -129,24 +180,84 @@ printf '{"roots":[{"name":"fixture"}],"cached":[]}' > "$CASE/in.json"
 audit clean "$CASE/in.json" --ecosystem npm --evidence-only
 [[ "$RC" != 0 ]] && pass 'a malformed request is refused' || fail 'a malformed request was read'
 
-# the cache alone: a blocking result already cached is reported, a clean or absent one is not, and no call is made
+# --- 4b. the cache alone: every block that can be established is kept, whatever else fails ------------------------------
+seed() { # <mode> <name> : the ordinary audit stores the entry the evidence-only reading later replays
+  audit "$1" - "$2@1.0.0" --ecosystem npm
+}
+cache_read() { # <extra env...>: the cache-only request for fixture, other, never-seen
+  printf '{"roots":[],"cached":[{"name":"fixture","version":"1.0.0"},{"name":"other","version":"1.0.0"},{"name":"never-seen","version":"1.0.0"}]}' > "$CASE/in.json"
+  : > "$CASE_LOG"
+  audit clean "$CASE/in.json" --ecosystem npm --evidence-only "$@"
+}
+blocks_of() { jq -c '[.cached_blocks[] | "\(.name)@\(.version)"]' <<<"$OUT"; }
 prepare_case cache-only
-audit malware - fixture@1.0.0 --ecosystem npm --evidence-only
-audit clean - other@1.0.0 --ecosystem npm --evidence-only
-: > "$CASE_LOG"
-printf '{"roots":[],"cached":[{"name":"fixture","version":"1.0.0"},{"name":"other","version":"1.0.0"},{"name":"never-seen","version":"1.0.0"}]}' > "$CASE/in.json"
-audit malware "$CASE/in.json" --ecosystem npm --evidence-only
-if [[ "$RC" == 0 && "$(jq -c '[.cached_blocks[] | "\(.name)@\(.version)"]' <<<"$OUT")" == '["fixture@1.0.0"]' && "$(jq -r .cache_gap <<<"$OUT")" == "" && "$(calls)" == 0 ]]; then pass 'the cache is read with no call: only the cached blocking result is reported'; else fail "cache only: rc=$RC calls=$(calls) $OUT"; fi
-prepare_case cache-empty
-printf '{"roots":[],"cached":[{"name":"fixture","version":"1.0.0"}]}' > "$CASE/in.json"
-audit malware "$CASE/in.json" --ecosystem npm --evidence-only
-[[ "$(jq -c .cached_blocks <<<"$OUT")" == '[]' && "$(calls)" == 0 ]] && pass 'an empty cache is no block and costs no call' || fail "empty cache: $OUT"
+seed malware fixture; seed clean other
+cache_read
+if [[ "$RC" == 0 && "$(blocks_of)" == '["fixture@1.0.0"]' && "$(jq -r .cache_gap <<<"$OUT")" == "" && "$(calls)" == 0 ]]; then pass 'the cache is read with no call: only the cached blocking result is reported, no gap'; else fail "cache only: rc=$RC calls=$(calls) $OUT"; fi
+# through a symbolic link to the cache directory
+ln -s "$CASE_CACHE" "$CASE/cache-link"
+cache_read SAFE_AUDIT_SOCKET_CACHE_DIR="$CASE/cache-link"
+[[ "$(blocks_of)" == '["fixture@1.0.0"]' && "$(jq -r .cache_gap <<<"$OUT")" == "" ]] && pass 'the block is kept through a linked cache directory' || fail "linked directory: $OUT"
+# an unrelated broken entry beside the valid one costs nothing
+printf 'not json' > "$CASE_CACHE/0000000000000000000000000000000000000000000000000000000000000000.json"
+cache_read
+[[ "$(blocks_of)" == '["fixture@1.0.0"]' && "$(jq -r .cache_gap <<<"$OUT")" == "" ]] && pass 'an unrelated broken entry does not discard the block' || fail "unrelated broken entry: $OUT"
+# a broken entry AT a requested key is a gap, and the valid block is still kept
+other_entry="$(grep -l '"name": *"other"\|"name":"other"' "$CASE_CACHE"/*.json 2>/dev/null | head -n1)"
+: > "$other_entry"
+cache_read
+[[ "$(blocks_of)" == '["fixture@1.0.0"]' && "$(jq -r .cache_gap <<<"$OUT")" != "" ]] && pass 'a requested entry that cannot be read is a gap, and the block already read is kept' || fail "broken requested entry: $OUT"
+# a regular file where the cache directory belongs: a gap, never an empty cache
+prepare_case cache-file
+: > "$CASE/cachefile"
+cache_read SAFE_AUDIT_SOCKET_CACHE_DIR="$CASE/cachefile"
+[[ "$(blocks_of)" == '[]' && "$(jq -r .cache_gap <<<"$OUT")" != "" ]] && pass 'a regular file in the cache directory'"'"'s place is a gap' || fail "file as directory: $OUT"
+# an absent cache is nothing cached, not a gap
+prepare_case cache-absent
+cache_read
+[[ "$(blocks_of)" == '[]' && "$(jq -r .cache_gap <<<"$OUT")" == "" && "$(calls)" == 0 ]] && pass 'an absent cache directory is nothing cached, with no call' || fail "absent cache: $OUT"
+# an entry dated in the future is not valid: a gap, no block
+prepare_case cache-future
+seed malware fixture
+entry="$(ls "$CASE_CACHE"/*.json | head -n1)"
+jq -c --argjson t "$(( $(date +%s) + 86400 ))" '.fetched_at = $t' "$entry" > "$entry.new" && mv "$entry.new" "$entry"
+cache_read
+[[ "$(blocks_of)" == '[]' && "$(jq -r .cache_gap <<<"$OUT")" != "" ]] && pass 'an entry dated in the future is not valid (a gap, no block)' || fail "future entry: $OUT"
+# an expired entry gives no verdict and is not a failure
+prepare_case cache-expired
+seed malware fixture
+entry="$(ls "$CASE_CACHE"/*.json | head -n1)"
+jq -c --argjson t "$(( $(date +%s) - 40 * 86400 ))" '.fetched_at = $t' "$entry" > "$entry.new" && mv "$entry.new" "$entry"
+cache_read
+[[ "$(blocks_of)" == '[]' && "$(jq -r .cache_gap <<<"$OUT")" == "" ]] && pass 'an expired entry gives no verdict and no gap' || fail "expired entry: $OUT"
 
-# --- 5. the token never appears -----------------------------------------------------------------------------------------
-prepare_case token
-printf '{"roots":[{"name":"fixture","version":"1.0.0"}],"cached":[{"name":"fixture","version":"1.0.0"}]}' > "$CASE/in.json"
-audit auth-leaky "$CASE/in.json" --ecosystem npm --evidence-only SOCKET_SECURITY_API_TOKEN="$SENTINEL_TOKEN"
-if grep -rqF "$SENTINEL_TOKEN" "$CASE" 2>/dev/null || grep -qF "$SENTINEL_TOKEN" <<<"$OUT$ERRTXT"; then fail 'the Socket token reached an output, a cache or a file'; else pass 'the Socket token appears in no output, cache or file'; fi
+# --- 4c. the batch refuses a terminal instead of waiting on it --------------------------------------------------------------
+prepare_case tty-stdin
+set +e
+timeout 20 python3 -I -c '
+import os, pty, sys
+env = dict(os.environ)
+status = pty.spawn([sys.argv[1], "package-audit", "--ecosystem", "npm", "--evidence-only"])
+sys.exit(os.waitstatus_to_exitcode(status))' "$SAFE_AUDIT" >/dev/null 2>&1
+tty_rc=$?
+set -e
+[[ "$tty_rc" != 0 && "$tty_rc" != 124 ]] && pass 'the batch refuses a terminal as its input (it does not wait)' || fail "terminal input: rc=$tty_rc"
+
+# --- 5. the token never appears: the mock REFLECTS it, in an error and in a field of a valid success answer ---------------
+MARKER="marker-$RANDOM-not-a-credential"
+reflected="$(SOCKET_SECURITY_API_TOKEN="$MARKER" MOCK_SOCKET_MODE=reflect-error "$MOCKBIN/socket" score npm fixture@1.0.0 --json 2>/dev/null || true)"
+[[ "$reflected" == *"$MARKER"* ]] \
+  && pass 'the error mock reflects the marker (the check below can fail)' || fail 'the error mock does not reflect the marker'
+reflected="$(SOCKET_SECURITY_API_TOKEN="$MARKER" MOCK_SOCKET_MODE=reflect-success "$MOCKBIN/socket" score npm fixture@1.0.0 --json 2>/dev/null || true)"
+[[ "$reflected" == *"$MARKER"* ]] \
+  && pass 'the success mock reflects the marker in an extra field' || fail 'the success mock does not reflect the marker'
+for mode in reflect-error reflect-success; do
+  prepare_case "token-$mode"
+  printf '{"roots":[{"name":"fixture","version":"1.0.0"}],"cached":[{"name":"fixture","version":"1.0.0"}]}' > "$CASE/in.json"
+  audit "$mode" "$CASE/in.json" --ecosystem npm --evidence-only SOCKET_SECURITY_API_TOKEN="$MARKER"
+  if grep -rqF "$MARKER" "$CASE" "$TMPDIR" 2>/dev/null || grep -qF "$MARKER" <<<"$OUT$ERRTXT"; then fail "$mode: the marker reached an output, a log or a file"; else pass "$mode: the marker is in no output, log or file"; fi
+  [[ -z "$(find "$CASE_CACHE" -type f 2>/dev/null)" ]] && pass "$mode: nothing was stored in the cache" || fail "$mode: the cache holds a file"
+done
 
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

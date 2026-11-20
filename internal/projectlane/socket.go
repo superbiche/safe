@@ -115,7 +115,7 @@ func judgeSocket(in Input) (malice []MaliceItem, report SocketReport, class Clas
 	class = ClassOutcome{Class: ClassSocketRoot, Exit: ExitPolicy}
 	inTarget := map[Identity]struct{}{}
 	for _, occurrence := range in.Target.Occurrences {
-		if occurrence.Public && occurrence.Kind == KindRegistry && !occurrence.covered() {
+		if occurrence.Public {
 			inTarget[occurrence.Identity()] = struct{}{}
 		}
 	}
@@ -250,10 +250,21 @@ func (e SocketEvidence) validate() error {
 		if root.Line == "" || strings.ContainsAny(root.Line, "\x00\n\r") {
 			return fmt.Errorf("roots[%d]: the line must be one line of text", i)
 		}
+		malware := false
 		for _, cause := range root.Causes {
 			if !socketCause.MatchString(cause) {
 				return fmt.Errorf("roots[%d].causes: %q is not a Socket cause", i, cause)
 			}
+			if cause == "socket_malware" {
+				malware = true
+			}
+		}
+		// a result cannot contradict itself: clear carries no Socket cause, and a malware cause is a blocking result
+		if root.Outcome == SocketClear && len(root.Causes) > 0 {
+			return fmt.Errorf("roots[%d]: a clear result carries Socket causes", i)
+		}
+		if (root.Outcome == SocketBlocked) != malware {
+			return fmt.Errorf("roots[%d]: outcome %q and the malware cause disagree", i, root.Outcome)
 		}
 	}
 	blocks := map[Identity]struct{}{}

@@ -2,18 +2,25 @@
 
 ## Unreleased
 
-- Project lane (still behind `install.project_lane`): Socket on the named roots. The artifacts a command names are scored by
-  Socket as today's per-root audit scores them (one call of the auditor installed beside safe's dispatcher, in a new
-  evidence-only mode, `safe audit package-audit --evidence-only`: it asks nothing, decides nothing and writes no
-  install-known entry, consent, receipt or export; one process whatever the number of roots; never for an artifact
-  from a private origin). A result that is not clear is a new decision class after the cooldown's wait and before missing
-  evidence, with today's unattended exits and wording: an adverse finding 100, a rate limit, a consent ask, a pending
-  score or an unavailable audit infrastructure 102. A critical supply-chain-risk alert on a named root, or one already in
-  Socket's cache for any artifact of the target graph, is malice (104); the rest of the graph is read from the cache
-  alone and no call is made for it, and a cache that cannot be read is missing evidence (102). **There is no terminal
-  prompt in this change:** the consent ask and the rate-limit approval are stops, and the host-allow hint of the install
-  gate does not clear a Socket result on the lane until the acceptances are wired. A command that does not complete
-  records nothing. The normal paths of `package-audit` and the switch-off behaviour are unchanged.
+- Project lane (still behind `install.project_lane`): Socket on the named roots. The projected root is scored by Socket
+  as today's per-root audit scores it (each named operand tied to its direct occurrence in the projected lockfile, so
+  `pkg@1.0.0+build.1` scores `1.0.0`; an operand that cannot be tied is missing evidence): one call of the auditor
+  installed beside safe's dispatcher in its evidence-only mode (`safe audit package-audit --evidence-only`; one
+  process whatever the number of roots; never for a private-origin artifact), with the core installed beside it and
+  the Socket tool from the operator's tool configuration, never `PATH`. The mode asks nothing and writes nothing, from
+  a cold start (no registry, log, cache entry or audit-log event). The lane validates the answer (one consistent row
+  per identity asked; anything else is missing evidence, 102) and bounds both calls with a deadline (expiry is 102; a
+  block already established still decides). A result that is not clear is a new decision class after the cooldown's
+  wait and before missing evidence, with today's exits and diagnoses: an adverse finding 100; a rate limit, a consent
+  ask, a pending score or an unavailable audit infrastructure 102. A critical supply-chain-risk alert on a named root,
+  or one already in Socket's cache for any public artifact of the target graph (bundled members included; each
+  requested entry looked up on its own, a block kept whatever else fails), is malice (104); the rest of the graph is
+  read from the cache alone and no call is made for it; an unreadable or future-dated entry is missing evidence
+  (102). **There is no terminal prompt in this change:** the consent ask and the rate-limit approval are stops that
+  name an action that works now (retry later, or run the same install with `install.project_lane` off), and the
+  host-allow hint of the install gate does not clear a Socket result on the lane until the acceptances are wired. A
+  command that does not complete records nothing. The normal paths of `package-audit` and the switch-off behaviour
+  are unchanged.
 
 - Project lane (still behind `install.project_lane`): the cooldown. npm's release-age filter is on the command line of
   every npm run of the lane at `install.cooldown_days` (with the exact versions the command names excluded by name),

@@ -19,6 +19,9 @@ for arg in "$@"; do
 done
 case "${MOCK_SOCKET_MODE:-clean}" in
   clean) envelope 95 '[]' ;;
+  # evidence-only suite: answers that REFLECT the credential in the environment, as a misbehaving provider could
+  reflect-error) printf '{"message":"Unauthorized for token %s","cause":"credential %s"}\n' "${SOCKET_SECURITY_API_TOKEN:-}" "${SOCKET_SECURITY_API_TOKEN:-}"; exit 1 ;;
+  reflect-success) printf '{"ok":true,"data":{"self":{"score":{"overall":95},"alerts":[]},"transitively":{"dependencyCount":0,"alerts":[],"score":{"overall":100}}},"diagnostic":"%s"}\n' "${SOCKET_SECURITY_API_TOKEN:-}" ;;
   # Primary (1.0.0) is clean, the sibling major (2.0.0) is malicious: the exact
   # shape of the coverage gap review F1 found after GuardDog's multi-version
   # scan was removed.

@@ -298,17 +298,29 @@ pass and warnings under `environment.release_follow`.
   capability probe checks on top of the 11.12.1 floor).
   **Socket on a named root.** The artifacts the command names are scored by Socket as today's per-root audit scores
   them, and nothing else is: one call of the auditor beside safe's dispatcher in its evidence-only mode
-  (`package-audit --evidence-only`, which asks nothing, decides nothing and writes no record), whatever the number of
-  roots, and never for an artifact from a private origin. The result is a class of the decision, after the cooldown's
-  wait and before missing evidence, with today's unattended exits and final-line wording: an adverse finding (low
-  score, alerts, no record) stops 100; a rate limit, the consent ask of a fresh release, a pending score and an
-  unavailable audit infrastructure stop 102; a critical supply-chain-risk alert is malice, 104. Every other artifact of
-  the target graph is read from Socket's cache alone, with no call: a blocking result already cached for any of them is
-  malice (104), and a cache that cannot be read is missing evidence (102), never a clean one. The lane has no terminal
-  prompt for these results yet and no acceptance clears them yet: a standing acceptance clears the class in the
-  decision, but wiring them is a later ticket, so the host-allow hint of the install gate does not apply on the lane.
-  Nothing is recorded by the Socket reading (no install-known entry, consent, receipt or export): a command that does
-  not complete leaves no install record. A named root's own advisories gate only when the command introduces them.
+  (`package-audit --evidence-only`), whatever the number of roots, and never for an artifact from a private origin.
+  What is scored is the projected root: each named operand is tied to its direct occurrence in the projected lockfile
+  (npm resolves `pkg@1.0.0+build.1` to `1.0.0`) and that occurrence's public identity is asked; an operand that cannot
+  be tied is missing evidence (102). The cooldown keeps its own exact-argument rule. The reader runs with the core
+  installed beside the dispatcher (the one the lane verified, whatever `SAFE_CORE_BIN` the caller's environment names)
+  and takes the Socket tool from the operator's tool configuration (`tools.json`, then the standard install
+  directories), never from `PATH`; today's gate keeps its own choice until ticket 1682. Its answer is validated before
+  it is used: exactly one consistent row per identity asked; a missing, repeated or contradictory row is missing
+  evidence (102) and a whole row beside it is kept. Each call has a deadline (the gate's own leash for one audit, plus
+  the Socket part of one more audit per extra root; 120 seconds for the cache reading; `SAFE_INSTALL_TIMEOUT_SECONDS`
+  overrides both): expiry is missing evidence (102), and a block already established still decides (104).
+  The result is a class of the decision, after the cooldown's wait and before missing evidence, with today's exits and
+  diagnoses (the recovery text is the lane's own: it names an action that works without a prompt): an adverse finding
+  (low score, alerts, no record) stops 100; a rate limit, the consent ask of a fresh release, a pending score and an
+  unavailable audit infrastructure stop 102; a critical supply-chain-risk alert is malice, 104. Every public
+  identity of the target graph, bundled members included, is read from Socket's cache alone, with no call, each
+  requested entry on its own: a blocking result already cached for any of them is malice (104) whatever else fails; an
+  entry that is present and cannot be read, or is dated in the future, is a gap (102), never a clean cache. The
+  reading writes nothing, from a cold start (no registry, no log, no cache entry, no audit-log event). The lane has no
+  terminal prompt for these results yet and no acceptance clears them yet: the consent ask and the rate-limit approval
+  are stops, and the install gate's host-allow hint does not apply on the lane; to take the terminal answer, run the
+  same install with `install.project_lane` off, where today's gate asks. A named root's own advisories gate only when
+  the command introduces them.
   A lockfile entry the frozen installation does not build (one nothing in the manifest needs) is caught by the
   binder's tree verification before anything is published, and the refusal says to run `npm install` first.
   npm's `prune` writes its lockfile in every case where one exists. Every npm run whose output the lane reads

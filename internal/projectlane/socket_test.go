@@ -12,7 +12,11 @@ func sroot(name, version, outcome string) SocketRoot {
 		SocketRateLimited: "WARN (socket rate-limited, retry later)", SocketConsentRequired: "CONSENT (fresh release 0d old)",
 		SocketPending: "PENDING (fresh release 1.0.0, 0d old — Socket scan not yet complete)", SocketBlocked: "BLOCK (critical supply-chain-risk alert)",
 	}[outcome]
-	return SocketRoot{Name: name, Version: version, Outcome: outcome, GateExit: exit, Line: line, Causes: []string{}}
+	causes := []string{}
+	if outcome == SocketBlocked {
+		causes = []string{"socket_malware"}
+	}
+	return SocketRoot{Name: name, Version: version, Outcome: outcome, GateExit: exit, Line: line, Causes: causes}
 }
 
 func socketOf(roots ...SocketRoot) *SocketEvidence {
@@ -175,5 +179,19 @@ func TestReadSocketIsStrict(t *testing.T) {
 		if _, err := ReadSocket([]byte(doc)); err == nil {
 			t.Errorf("%s: the document was read", name)
 		}
+	}
+}
+
+// A bundled member's public standing comes from its parent: a block cached for it is malice of the target like any other.
+func TestACachedBlockCountsForABundledMemberOfTheTarget(t *testing.T) {
+	sock := socketOf()
+	sock.CachedBlocks = []SocketBlock{{Name: "bund", Version: "1.0.0", Line: "BLOCK (critical supply-chain-risk alert)"}}
+	target := map[string]map[string]any{
+		"node_modules/b":                   entry("b", "2.0.0"),
+		"node_modules/b/node_modules/bund": {"version": "1.0.0", "inBundle": true},
+	}
+	report := decideSocket(t, nil, target, sock, evidenceOf(read("b", "2.0.0"), read("bund", "1.0.0")))
+	if report.Outcome.Class != ClassMalice || report.Outcome.Exit != ExitBlock || len(report.Malice) != 1 || report.Malice[0].Name != "bund" {
+		t.Fatalf("%+v / %+v", report.Outcome, report.Malice)
 	}
 }
