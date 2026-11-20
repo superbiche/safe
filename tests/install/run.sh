@@ -565,10 +565,11 @@ if [[ "${1:-}" == "effective-sources" ]]; then
 fi
 # The lane's two doors into the operator's stores are the REAL auditor's: the cases seed real stores in the test home.
 # SAFE_AUDIT_LANE_DOOR_STATUS makes a door fail, to show what a reader or a writer that fails leaves behind.
-if [[ "${1:-}" == "lane-acceptances" || "${1:-}" == "lane-revoke" ]]; then
+if [[ "${1:-}" == "lane-acceptances" || "${1:-}" == "lane-revoke" || "${1:-}" == "record-installed" ]]; then
   printf 'LANE_DOOR\t%s\tSAFE_RUN_CONFIG_DIR=%s\tSAFE_RUN_TRUST_OVERRIDE=%s\n' "$1" "${SAFE_RUN_CONFIG_DIR:-}" "${SAFE_RUN_TRUST_OVERRIDE:-}" >> "${SAFE_INSTALL_COMMAND_LOG}"
   [[ -z "${SAFE_AUDIT_LANE_DOOR_STATUS:-}" ]] || exit "${SAFE_AUDIT_LANE_DOOR_STATUS}"
-  exec "${ROOT_DIR}/bin/safe-audit" "$@"
+  [[ "$1" != record-installed ]] || printf 'RECORD_INSTALLED_ARGS\t%s\tstdin_tty=%s\tCONFIG=%s\n' "$*" "$([[ -t 0 ]] && echo yes || echo no)" "${SAFE_RUN_CONFIG_DIR:-}" >> "${SAFE_INSTALL_COMMAND_LOG}"
+  exec "${ROOT_DIR}/bin/safe-audit" "$@" 2>>"${SAFE_INSTALL_COMMAND_LOG}"
 fi
 # A scripted private-registry check: a status and a result document.
 if [[ "${1:-}" == "private-npm-project" && -n "${SAFE_AUDIT_PRIVATE_MOCK_STATUS:-}" ]]; then
@@ -685,7 +686,7 @@ if [[ "${1:-}" == "package-audit" && " $* " == *" --evidence-only "* ]]; then
   fi
   printf 'SOCKET_REQUEST\t%s\n' "$(jq -c '{roots: ([.roots[] | "\(.name)@\(.version)"] | sort), cached: ([.cached[] | "\(.name)@\(.version)"] | sort)}' <<<"${socket_input}")" >> "${SAFE_INSTALL_COMMAND_LOG}"
   # what the reader runs with: the core the lane verified and a closed or non-terminal stdin
-  printf 'SOCKET_ENV\tSAFE_CORE_BIN=%s\n' "${SAFE_CORE_BIN:-}" >> "${SAFE_INSTALL_COMMAND_LOG}"
+  printf 'SOCKET_ENV\tSAFE_CORE_BIN=%s\tCONSENT=%s\n' "${SAFE_CORE_BIN:-}" "${SAFE_AUDIT_SOCKET_CONSENT:-}" >> "${SAFE_INSTALL_COMMAND_LOG}"
   # the cache-only call (no roots) and the roots call are told apart by the status variable that targets each
   if [[ "$(jq '.roots | length' <<<"${socket_input}")" == 0 ]]; then
     [[ -z "${SAFE_AUDIT_SOCKET_CACHE_STALL:-}" ]] || sleep "${SAFE_AUDIT_SOCKET_CACHE_STALL}"
@@ -709,10 +710,10 @@ if [[ "${1:-}" == "package-audit" && " $* " == *" --evidence-only "* ]]; then
   fi
   so_out="${SAFE_AUDIT_SOCKET_OUTCOMES:-}"; [[ -n "${so_out}" ]] || so_out='{}'
   so_blocks="${SAFE_AUDIT_SOCKET_CACHED_BLOCKS:-}"; [[ -n "${so_blocks}" ]] || so_blocks='[]'
-  jq -cn --argjson in "${socket_input}" --argjson out "${so_out}" --argjson blocks "${so_blocks}" --arg gap "${SAFE_AUDIT_SOCKET_CACHE_GAP:-}" '
+  jq -cn --argjson in "${socket_input}" --argjson out "${so_out}" --argjson blocks "${so_blocks}" --arg gap "${SAFE_AUDIT_SOCKET_CACHE_GAP:-}" --arg consent "${SAFE_AUDIT_SOCKET_CONSENT:-}" '
     {"clear": 0, "adverse": 10, "unavailable": 11, "rate_limited": 12, "consent_required": 13, "pending": 14, "blocked": 20} as $exit
     | {schema_version: 1,
-       roots: [$in.roots[] | . as $r | ($out["\($r.name)@\($r.version)"] // "clear") as $o
+       roots: [$in.roots[] | . as $r | ($out["\($r.name)@\($r.version)"] // "clear") as $o0 | (if $consent == "granted" and $o0 == "consent_required" then "clear" else $o0 end) as $o
          | {name: $r.name, version: $r.version, outcome: $o, gate_exit: $exit[$o],
             line: (if $o == "clear" then "PASS (score=95)" elif $o == "adverse" then "WARN (score=40)" elif $o == "blocked" then "BLOCK (critical supply-chain-risk alert)" else "WARN (\($o))" end),
             causes: (if $o == "adverse" then ["socket_low_score"] elif $o == "blocked" then ["socket_malware"] elif $o == "rate_limited" then ["socket_rate_limited"] else [] end), cached: false}],
@@ -1048,6 +1049,17 @@ install_lockdiff_package() {
 # is sourced into the shell — that is the point of the port, and running the
 # script under `zsh -fc` proves the gate no longer depends on shell state.
 run_zsh() {
+  # LANE_PTY=1 runs the command at an operator's terminal, as the repository's terminal cases do (a pty fed with the
+  # operator's answers, one per line, in LANE_PTY_ANSWERS): stdin and /dev/tty are the pty, the prompts appear in OUT_FILE, and
+  # stderr stays in ERR_FILE. LANE_AGENT_MARKER=1 sets a recognized agent marker in that same terminal.
+  local -a runner=("${ZSH_BIN}") script_prefix=()
+  local answers_file="${CASE_DIR:-${TMPDIR:-/tmp}}/lane-pty-answers"
+  if [[ "${LANE_PTY:-0}" == 1 ]]; then
+    printf '%s' "${LANE_PTY_ANSWERS:-}" > "${answers_file}"
+    runner=(env -u CODEX_THREAD_ID -u CODEX_CI -u CLAUDECODE -u OPENCODE ${LANE_AGENT_MARKER:+CLAUDECODE=1}
+      bash -c 'exec python3 -c "import os,pty,sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))" "$@" <"'"${answers_file}"'"' bash "${ZSH_BIN}")
+    script_prefix=('exec 2>>"'"${ERR_FILE}"'"; ')
+  fi
   (
     cd "${WORK_DIR}" || exit 99
     ROOT_DIR="${ROOT_DIR}" \
@@ -1149,7 +1161,7 @@ run_zsh() {
     NPM_LOCKDIFF_REGISTRY_CONFIG_JSON="${NPM_LOCKDIFF_REGISTRY_CONFIG_JSON:-}" \
     NPM_LOCKDIFF_CONFIG_STATUS="${NPM_LOCKDIFF_CONFIG_STATUS:-}" \
     MISE_LS_JSON="${MISE_LS_JSON:-}" \
-    "${ZSH_BIN}" -fc 'rm -f "${HOME}/.agreement-count"; printenv -0 > "${HOME}/.stub-env0" 2>/dev/null; [[ "${SAFE_INSTALL_COMPOSER_HOME_UNSET:-0}" == 1 ]] && unset COMPOSER_HOME; eval "${SAFE_INSTALL_TEST_SCRIPT}"'
+    "${runner[@]}" -fc "${script_prefix[*]}"'rm -f "${HOME}/.agreement-count"; printenv -0 > "${HOME}/.stub-env0" 2>/dev/null; [[ "${SAFE_INSTALL_COMPOSER_HOME_UNSET:-0}" == 1 ]] && unset COMPOSER_HOME; eval "${SAFE_INSTALL_TEST_SCRIPT}"'
   ) >"${OUT_FILE}" 2>"${ERR_FILE}"
   STATUS=$?
 }
@@ -14679,6 +14691,320 @@ case_project_lane_the_report_says_what_the_audit_did_and_a_block_after_publicati
   pass "$FUNCNAME"
 }
 
+# ---- ticket 1684: the operator's terminal in the lane --------------------------------------------------------------------------
+#
+# These cases drive the lane at an operator's terminal the way the repository's terminal cases do: a pty fed with the operator's
+# answers (LANE_PTY=1, LANE_PTY_ANSWERS), the prompts in OUT_FILE and stderr in ERR_FILE. Every prompt is today's own function.
+
+lane_safe_run_stub() { # a recording `safe-run` beside the dispatcher: the host-allow writers' sub-call
+  rm -f "${BIN_DIR}/safe-run"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/safe-run.argv"\n' "${CASE_DIR}" > "${BIN_DIR}/safe-run"
+  chmod +x "${BIN_DIR}/safe-run"
+}
+
+lane_tty_out() { # what the operator saw
+  tr -d '\r' < "${OUT_FILE}"
+}
+
+assert_no_prompt() {
+  local label="$1"
+  if lane_tty_out | grep -qE '\[y/N\]|\[Y/n\]|override deliberately|anything else cancels'; then
+    printf 'a prompt was shown:\n%s\n' "$(lane_tty_out)" >&2
+    fail "${label}"
+    return 1
+  fi
+}
+
+# The project as it was before the command (its lockfile and manifest as committed, no tree, no recorded baseline), so that the
+# same command can be run again: the standing acceptances, not a recorded baseline, are what must clear it.
+lane_reset_project() {
+  ( cd "${WORK_DIR}" && git checkout -q -- package.json package-lock.json && rm -rf node_modules ) >/dev/null 2>&1
+  rm -rf "${HOME_DIR}/.local/share/safe/project-lane/state/project-baseline"
+}
+
+lane_known_all() { jq -c '[.packages | to_entries[] | "\(.key):\(.value.verdict)"] | sort' "$(lane_store)/install-known.json" 2>/dev/null || printf 'null'; }
+lane_approvals() { jq -c '[(.approvals // {}) | to_entries[] | .key] | sort' "$(lane_store)/install-known.json" 2>/dev/null || printf '[]'; }
+
+TWO_RISKY_MANIFEST='{"name":"lane-test","version":"1.0.0","dependencies":{"kept":"^1.0.0","risky":"^3.0.0","risk2":"^1.0.0"}}'
+
+# Adverse advisory: ONE prompt lists every artifact, one answer accepts them; accepted, the same command passes unprompted.
+case_project_lane_tty_an_accepted_adverse_prompt_is_recorded_and_the_next_run_passes_unprompted() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-tty-adverse" kept@1.0.0
+  lane_safe_run_stub
+  local hits="{\"risky@3.0.0\":${LANE_HIT_HIGH},\"risk2@1.0.0\":${LANE_HIT_HIGH}}"
+  LANE_PTY=1 LANE_PTY_ANSWERS=$'y\n' SAFE_AUDIT_EVIDENCE_HITS="${hits}" NPM_PROJECTION_MANIFEST_JSON="${TWO_RISKY_MANIFEST}" \
+    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 risky@3.0.0 risk2@1.0.0)" lane_run 'npm install risky@3.0.0 risk2@1.0.0'
+  assert_status 0 "$FUNCNAME: accepted" || return
+  [[ "$(lane_tty_out | grep -c 'override deliberately')" == 1 ]] || { fail "$FUNCNAME: not exactly one prompt: $(lane_tty_out)"; return; }
+  lane_tty_out | grep -q 'risky@3.0.0 — GHSA-high-0001' && lane_tty_out | grep -q 'risk2@1.0.0 — GHSA-high-0001' || { fail "$FUNCNAME: the prompt does not list every artifact and advisory: $(lane_tty_out)"; return; }
+  [[ "$(lane_approvals)" == '["npm:risk2","npm:risky"]' ]] || { fail "$FUNCNAME: the acceptance was not recorded when given: $(lane_approvals)"; return; }
+  # the named roots the operator confirmed are recorded after the publication through today's record path, and exportable
+  [[ "$(lane_known risky | jq -r .verdict)" == WARN_TTY_OVERRIDE && "$(lane_known risk2 | jq -r .verdict)" == WARN_TTY_OVERRIDE ]] || { fail "$FUNCNAME: the confirmed roots are not recorded: $(lane_known_all)"; return; }
+  local export_doc
+  export_doc="$(HOME="${HOME_DIR}" SAFE_RUN_CONFIG_DIR="$(lane_store)" "${ROOT_DIR}/bin/safe-run" host-allow export --json 2>/dev/null)" || export_doc=""
+  [[ "$(jq -c '[.install_allowances[] | "\(.name) \(.verdict)"] | sort' <<<"${export_doc}")" == '["risk2 WARN_TTY_OVERRIDE","risky WARN_TTY_OVERRIDE"]' ]] || { fail "$FUNCNAME: the export: $(jq -c .install_allowances <<<"${export_doc}")"; return; }
+  # the same command again, with no terminal at all, passes and asks nothing
+  lane_reset_project
+  SAFE_AUDIT_EVIDENCE_HITS="${hits}" NPM_PROJECTION_MANIFEST_JSON="${TWO_RISKY_MANIFEST}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 risky@3.0.0 risk2@1.0.0)" lane_run 'npm install risky@3.0.0 risk2@1.0.0'
+  assert_status 0 "$FUNCNAME: the same command again, unattended" || return
+  assert_no_prompt "$FUNCNAME: the next run" || return
+  pass "$FUNCNAME"
+}
+
+case_project_lane_tty_a_declined_adverse_prompt_ends_with_the_adverse_exit_and_records_nothing() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-tty-adverse-no" kept@1.0.0
+  lane_safe_run_stub
+  local before
+  before="$(lane_digests)"
+  LANE_PTY=1 LANE_PTY_ANSWERS=$'N\n' SAFE_AUDIT_EVIDENCE_HITS="{\"risky@3.0.0\":${LANE_HIT_HIGH}}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 risky@3.0.0)" lane_run 'npm install risky@3.0.0'
+  assert_status 100 "$FUNCNAME: declined" || return
+  assert_lane_final_line install "$FUNCNAME" || return
+  [[ "$(lane_approvals)" == '[]' && "$(lane_known_all)" == 'null' || "$(lane_known_all)" == '[]' ]] || { fail "$FUNCNAME: something was recorded: $(lane_approvals) $(lane_known_all)"; return; }
+  assert_lane_untouched "${before}" "$FUNCNAME" || return
+  # [a] also records a host-allow grant, as today's gate does, through safe-run beside the dispatcher
+  lane_prepare "lane-tty-adverse-a" kept@1.0.0
+  lane_safe_run_stub
+  LANE_PTY=1 LANE_PTY_ANSWERS=$'a\n' SAFE_AUDIT_EVIDENCE_HITS="{\"risky@3.0.0\":${LANE_HIT_HIGH}}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 risky@3.0.0)" lane_run 'npm install risky@3.0.0'
+  assert_status 0 "$FUNCNAME: [a]" || return
+  grep -qx 'host-allow add risky@3.0.0' "${CASE_DIR}/safe-run.argv" || { fail "$FUNCNAME: [a] did not ask host-allow for the grant: $(cat "${CASE_DIR}/safe-run.argv" 2>/dev/null)"; return; }
+  pass "$FUNCNAME"
+}
+
+# Blocking advisory: typed name@version per artifact; once and record are today's.
+case_project_lane_tty_a_blocking_advisory_takes_a_typed_override_and_a_record() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local hits="{\"vuln@1.0.0\":${LANE_HIT_CRITICAL}}" label answer
+  for label in once record wrong; do
+    lane_prepare "lane-tty-block-${label}" kept@1.0.0
+    lane_safe_run_stub
+    case "${label}" in once) answer=$'vuln@1.0.0\n' ;; record) answer=$'record vuln@1.0.0\n' ;; wrong) answer=$'vuln@1.0.1\n' ;; esac
+    LANE_PTY=1 LANE_PTY_ANSWERS="${answer}" SAFE_AUDIT_EVIDENCE_HITS="${hits}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 vuln@1.0.0)" lane_run 'npm install vuln@1.0.0'
+    case "${label}" in
+      wrong) assert_status 104 "$FUNCNAME: a mistyped identity" || return
+        [[ "$(lane_approvals)" == '[]' ]] || { fail "$FUNCNAME: a mistyped identity recorded something"; return; } ;;
+      *) assert_status 0 "$FUNCNAME: ${label}" || return
+        lane_tty_out | grep -q 'GHSA-crit-0001' || { fail "$FUNCNAME: the prompt does not name the advisory"; return; }
+        [[ "$(lane_approvals)" == '["npm:vuln"]' ]] || { fail "$FUNCNAME: ${label}: no acceptance recorded: $(lane_approvals)"; return; }
+        # a block override is never exported: no receipt
+        [[ -z "$(lane_known vuln)" ]] || { fail "$FUNCNAME: ${label}: a block override left a receipt: $(lane_known vuln)"; return; } ;;
+    esac
+    if [[ "${label}" == record ]]; then
+      grep -qx 'host-allow add vuln@1.0.0 --accept-block' "${CASE_DIR}/safe-run.argv" || { fail "$FUNCNAME: record did not reach host-allow add --accept-block: $(cat "${CASE_DIR}/safe-run.argv" 2>/dev/null)"; return; }
+    fi
+    if [[ "${label}" == once ]]; then
+      [[ ! -e "${CASE_DIR}/safe-run.argv" ]] || { fail "$FUNCNAME: a once override recorded a host-allow entry"; return; }
+      lane_reset_project
+      SAFE_AUDIT_EVIDENCE_HITS="${hits}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 vuln@1.0.0)" lane_run 'npm install vuln@1.0.0'
+      assert_status 0 "$FUNCNAME: the same command again" || return
+      assert_no_prompt "$FUNCNAME: the same command again" || return
+    fi
+  done
+  pass "$FUNCNAME"
+}
+
+# Malice: a typed override for this command, recorded nowhere, so the same command is refused again.
+case_project_lane_tty_a_malice_override_is_for_this_command_and_records_nothing() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-tty-malice" kept@1.0.0
+  lane_safe_run_stub
+  LANE_PTY=1 LANE_PTY_ANSWERS=$'clean@2.0.0\n' SAFE_AUDIT_EVIDENCE_BLOCKLIST='[{"name":"clean","reason":"operator blocklist"}]' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME: typed" || return
+  lane_tty_out | grep -q 'never recorded' || { fail "$FUNCNAME: the prompt does not say it is never recorded"; return; }
+  [[ ! -e "$(lane_store)/install-known.json" ]] || [[ "$(lane_approvals)" == '[]' && "$(lane_known_all)" == '[]' ]] || { fail "$FUNCNAME: malice override recorded: $(lane_approvals) $(lane_known_all)"; return; }
+  [[ ! -e "${CASE_DIR}/safe-run.argv" ]] || { fail "$FUNCNAME: a host-allow entry was written"; return; }
+  lane_reset_project
+  SAFE_AUDIT_EVIDENCE_BLOCKLIST='[{"name":"clean","reason":"operator blocklist"}]' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 104 "$FUNCNAME: the same command again is refused again" || return
+  lane_prepare "lane-tty-malice-no" kept@1.0.0
+  LANE_PTY=1 LANE_PTY_ANSWERS=$'y\n' SAFE_AUDIT_EVIDENCE_BLOCKLIST='[{"name":"clean","reason":"operator blocklist"}]' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 104 "$FUNCNAME: y is not the typed identity" || return
+  pass "$FUNCNAME"
+}
+
+# Missing evidence: the deliberate confirmation, for this command, recording nothing; the lockfile is not recorded as judged.
+case_project_lane_tty_missing_evidence_is_confirmed_for_this_command_only_and_unjudged_advisories_stay_unjudged() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-tty-gap" kept@1.0.0
+  lane_safe_run_stub
+  local stored records
+  stored="$(lane_stored_digest)"; records="$(lane_record_count)"
+  LANE_PTY=1 LANE_PTY_ANSWERS=$'y\n' SAFE_AUDIT_EVIDENCE_MISSING='["clean@2.0.0"]' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME: confirmed" || return
+  lane_tty_out | grep -q 'proceed with missing evidence' || { fail "$FUNCNAME: $(lane_tty_out)"; return; }
+  lane_tty_out | grep -q '\[a\]' && { fail "$FUNCNAME: [a] was offered for missing evidence"; return; }
+  [[ "$(lane_approvals)" == '[]' && ( ! -e "$(lane_store)/install-known.json" || "$(lane_known_all)" == '[]' ) ]] || { fail "$FUNCNAME: missing evidence recorded something"; return; }
+  [[ "$(lane_stored_digest)" == "${stored}" && "$(lane_record_count)" == "${records}" ]] || { fail "$FUNCNAME: the lockfile was recorded as judged"; return; }
+  assert_err_contains_fragment 'the lockfile is not recorded as judged' "$FUNCNAME" || return
+  # a recovered reading, then: the advisory the outage left unjudged is judged as INTRODUCED, not as already present
+  lane_reset_project
+  SAFE_AUDIT_EVIDENCE_HITS="{\"clean@2.0.0\":${LANE_HIT_HIGH}}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 100 "$FUNCNAME: the recovered reading" || return
+  assert_err_contains_fragment '1 introduced at high or above' "$FUNCNAME: not already present" || return
+  # declined: the gap's exit (102)
+  lane_prepare "lane-tty-gap-no" kept@1.0.0
+  LANE_PTY=1 LANE_PTY_ANSWERS=$'n\n' SAFE_AUDIT_EVIDENCE_MISSING='["clean@2.0.0"]' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 102 "$FUNCNAME: declined" || return
+  pass "$FUNCNAME"
+}
+
+# Each class on its own, in the decision's order: a block accepted and an evidence gap declined ends with the gap's exit, and
+# accepting one never accepts another.
+case_project_lane_tty_classes_are_resolved_one_by_one_and_a_decline_ends_with_the_exit_of_the_class_left() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-tty-order" kept@1.0.0
+  lane_safe_run_stub
+  # malice typed, then the evidence gap declined: 102, and the malice answer is recorded nowhere
+  LANE_PTY=1 LANE_PTY_ANSWERS=$'clean@2.0.0\nn\n' SAFE_AUDIT_EVIDENCE_BLOCKLIST='[{"name":"clean","reason":"operator blocklist"}]' SAFE_AUDIT_EVIDENCE_MISSING='["other@1.0.0"]' \
+    NPM_PROJECTION_MANIFEST_JSON="${LANE_TWO_DEPS_MANIFEST}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0 other@1.0.0)" lane_run 'npm install clean@2.0.0 other@1.0.0'
+  assert_status 102 "$FUNCNAME: a block accepted, the gap declined" || return
+  assert_lane_final_line install "$FUNCNAME" || return
+  local out first_malice second_gap
+  out="$(lane_tty_out)"
+  first_malice="$(grep -n 'anything else cancels' <<<"${out}" | head -1 | cut -d: -f1)"; second_gap="$(grep -n 'proceed with missing evidence' <<<"${out}" | head -1 | cut -d: -f1)"
+  [[ -n "${first_malice}" && -n "${second_gap}" && "${first_malice}" -lt "${second_gap}" ]] || { fail "$FUNCNAME: the prompts are not in the decision's order: ${out}"; return; }
+  # an adverse artifact accepted, a young version (the wait class) declined: 100 (the wait), only the accepted one recorded
+  lane_prepare "lane-tty-order-wait" kept@1.0.0
+  lane_safe_run_stub
+  cooldown_registry_start "${CASE_DIR}" "fresh@2.0.0=10" "kept@1.0.0=2400" "risky@3.0.0=2400"
+  LANE_PTY=1 LANE_PTY_ANSWERS=$'y\nN\n' SAFE_AUDIT_EVIDENCE_HITS="{\"risky@3.0.0\":${LANE_HIT_HIGH}}" \
+    NPM_PROJECTION_MANIFEST_JSON='{"name":"lane-test","version":"1.0.0","dependencies":{"kept":"^1.0.0","risky":"^3.0.0","fresh":"^2.0.0"}}' \
+    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 risky@3.0.0 fresh@2.0.0)" lane_run 'npm install risky@3.0.0 fresh@2.0.0'
+  cooldown_registry_stop
+  assert_status 100 "$FUNCNAME: the wait declined" || return
+  [[ "$(lane_approvals)" == '["npm:risky"]' ]] || { fail "$FUNCNAME: accepting one class accepted another: $(lane_approvals)"; return; }
+  pass "$FUNCNAME"
+}
+
+# Wait: today's adverse override.
+case_project_lane_tty_a_wait_is_answered_with_todays_adverse_override() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-tty-wait" kept@1.0.0
+  lane_safe_run_stub
+  cooldown_registry_start "${CASE_DIR}" "fresh@2.0.0=10" "kept@1.0.0=2400"
+  LANE_PTY=1 LANE_PTY_ANSWERS=$'y\n' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm install fresh@2.0.0'
+  assert_status 0 "$FUNCNAME: accepted" || return
+  lane_tty_out | grep -q 'a version inside the cooldown' || { fail "$FUNCNAME: $(lane_tty_out)"; return; }
+  [[ "$(lane_approvals)" == '["npm:fresh"]' && "$(lane_known fresh | jq -r .verdict)" == WARN_TTY_OVERRIDE ]] || { fail "$FUNCNAME: $(lane_approvals) $(lane_known_all)"; return; }
+  lane_reset_project
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm install fresh@2.0.0'
+  cooldown_registry_stop
+  assert_status 0 "$FUNCNAME: the same command again, unattended" || return
+  assert_no_prompt "$FUNCNAME: again" || return
+  pass "$FUNCNAME"
+}
+
+# Socket on a named root: the rate limit, the consent ask, the pending score, a finding and an outage, with today's meanings.
+case_project_lane_tty_socket_outcomes_on_a_named_root_are_answered_as_todays_gate_lets_them() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local label answer outcome want_verdict want_status
+  for row in 'rate_limited|y|0||' 'rate_limited|n|102||' 'consent_required|n|0|GO_SOCKET_DECLINED|' 'consent_required|Y|0||consent' 'pending|y|0|GO_PENDING_CONFIRMED|' 'pending|n|102||' 'adverse|y|0|WARN_TTY_OVERRIDE|' 'adverse|N|100||' 'unavailable|y|0||' 'unavailable|n|102||'; do
+    IFS='|' read -r outcome answer want_status want_verdict extra <<<"${row}"
+    lane_prepare "lane-tty-socket-${outcome}-${answer}" kept@1.0.0
+    lane_safe_run_stub
+    LANE_PTY=1 LANE_PTY_ANSWERS="${answer}"$'\n' SAFE_AUDIT_SOCKET_OUTCOMES="{\"clean@2.0.0\":\"${outcome}\"}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+    assert_status "${want_status}" "$FUNCNAME: ${outcome} answered ${answer}" || return
+    if [[ -n "${want_verdict}" ]]; then
+      [[ "$(lane_known clean | jq -r .verdict)" == "${want_verdict}" ]] || { fail "$FUNCNAME: ${outcome}/${answer}: the confirmed root is not recorded as ${want_verdict}: $(lane_known clean)"; return; }
+    else
+      [[ -z "$(lane_known clean)" ]] || { fail "$FUNCNAME: ${outcome}/${answer}: a receipt was written: $(lane_known clean)"; return; }
+    fi
+    if [[ "${extra}" == consent ]]; then
+      grep -q $'^SOCKET_ENV\t.*CONSENT=granted' "${LOG_FILE}" || { fail "$FUNCNAME: consent Y did not read Socket again with the consent"; return; }
+    fi
+    if [[ "${outcome}" == unavailable && "${answer}" == y ]]; then
+      [[ "$(lane_approvals)" == '[]' ]] || { fail "$FUNCNAME: an outage confirmation was recorded"; return; }
+    fi
+    if [[ "${outcome}" == rate_limited && "${answer}" == y ]]; then
+      [[ "$(lane_approvals)" == '["npm:clean"]' ]] || { fail "$FUNCNAME: the rate-limit approval was not recorded"; return; }
+    fi
+  done
+  pass "$FUNCNAME"
+}
+
+# Graph not bound: the deliberate confirmation, then the one-shot route with its line; the lane has no one-shot for dedupe or prune.
+case_project_lane_tty_an_unbound_graph_takes_the_deliberate_confirmation_and_the_one_shot_route() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local target
+  lane_prepare "lane-tty-unbound" kept@1.0.0
+  lane_safe_run_stub
+  target="$(lane_lock kept@1.0.0 clean@2.0.0 | jq -c '.packages["node_modules/clean"].resolved = "https://evil.example/clean-2.0.0.tgz"')"
+  LANE_PTY=1 LANE_PTY_ANSWERS=$'n\n' NPM_LOCK_MUTATION_JSON="${target}" lane_run 'npm install clean@2.0.0'
+  assert_status 102 "$FUNCNAME: declined" || return
+  assert_lane_final_line install "$FUNCNAME" || return
+  lane_tty_out | grep -q 'run this command on the one-shot route' || { fail "$FUNCNAME: the confirmation was not asked: $(lane_tty_out)"; return; }
+  lane_prepare "lane-tty-unbound-yes" kept@1.0.0
+  LANE_PTY=1 LANE_PTY_ANSWERS=$'y\n' NPM_LOCK_MUTATION_JSON="${target}" lane_run 'npm install clean@2.0.0'
+  assert_err_contains_fragment '[lane: one-shot, an entry the lane cannot bind, confirmed at the operator'"'"'s terminal]' "$FUNCNAME: the one-shot line" || return
+  assert_err_contains_fragment 'the closure is not judged on this route' "$FUNCNAME" || return
+  [[ -z "$(lane_known clean)" ]] || { fail "$FUNCNAME: the one-shot confirmation was recorded"; return; }
+  pass "$FUNCNAME"
+}
+
+# An agent session is never prompted, at any class: the same terminal with a recognized agent marker ends as unattended.
+case_project_lane_tty_an_agent_session_is_never_prompted_at_any_class() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local row label want
+  for row in 'adverse|100' 'blocking|104' 'malice|104' 'gap|102' 'rate|102' 'consent|102' 'pending|102' 'unavailable|102'; do
+    IFS='|' read -r label want <<<"${row}"
+    lane_prepare "lane-tty-agent-${label}" kept@1.0.0
+    lane_safe_run_stub
+    case "${label}" in
+      adverse) SAFE_AUDIT_EVIDENCE_HITS="{\"clean@2.0.0\":${LANE_HIT_HIGH}}" ;;
+      blocking) SAFE_AUDIT_EVIDENCE_HITS="{\"clean@2.0.0\":${LANE_HIT_CRITICAL}}" ;;
+      malice) SAFE_AUDIT_EVIDENCE_BLOCKLIST='[{"name":"clean","reason":"operator blocklist"}]' ;;
+      gap) SAFE_AUDIT_EVIDENCE_MISSING='["clean@2.0.0"]' ;;
+      rate) SAFE_AUDIT_SOCKET_OUTCOMES='{"clean@2.0.0":"rate_limited"}' ;;
+      consent) SAFE_AUDIT_SOCKET_OUTCOMES='{"clean@2.0.0":"consent_required"}' ;;
+      pending) SAFE_AUDIT_SOCKET_OUTCOMES='{"clean@2.0.0":"pending"}' ;;
+      unavailable) SAFE_AUDIT_SOCKET_OUTCOMES='{"clean@2.0.0":"unavailable"}' ;;
+    esac
+    export SAFE_AUDIT_EVIDENCE_HITS SAFE_AUDIT_EVIDENCE_BLOCKLIST SAFE_AUDIT_EVIDENCE_MISSING SAFE_AUDIT_SOCKET_OUTCOMES
+    LANE_PTY=1 LANE_AGENT_MARKER=1 LANE_PTY_ANSWERS=$'y\ny\ny\nclean@2.0.0\n' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+    unset SAFE_AUDIT_EVIDENCE_HITS SAFE_AUDIT_EVIDENCE_BLOCKLIST SAFE_AUDIT_EVIDENCE_MISSING SAFE_AUDIT_SOCKET_OUTCOMES
+    assert_status "${want}" "$FUNCNAME: ${label} with an agent marker on a terminal" || return
+    assert_no_prompt "$FUNCNAME: ${label}" || return
+    [[ ! -e "$(lane_store)/install-known.json" ]] || [[ "$(lane_approvals)" == '[]' ]] || { fail "$FUNCNAME: ${label}: an agent session recorded an acceptance"; return; }
+  done
+  pass "$FUNCNAME"
+}
+
+# A dry run asks nothing (and so records nothing); the evidence the prompts rested on may not be older than the window.
+case_project_lane_tty_a_dry_run_asks_nothing_and_stale_evidence_is_not_decided_on() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-tty-dry" kept@1.0.0
+  lane_safe_run_stub
+  LANE_PTY=1 LANE_PTY_ANSWERS=$'y\n' SAFE_AUDIT_EVIDENCE_HITS="{\"risky@3.0.0\":${LANE_HIT_HIGH}}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 risky@3.0.0)" lane_run 'npm install risky@3.0.0 --dry-run'
+  assert_status 100 "$FUNCNAME: a dry run" || return
+  assert_no_prompt "$FUNCNAME: dry run" || return
+  [[ ! -e "$(lane_store)/install-known.json" ]] || [[ "$(lane_approvals)" == '[]' ]] || { fail "$FUNCNAME: a dry run recorded"; return; }
+  # with the window at zero (the operator's own configuration) the prompts have taken too long: the acceptance stays recorded, the command is refused before it binds
+  lane_prepare "lane-tty-stale" kept@1.0.0
+  lane_safe_run_stub
+  local before
+  lane_config '.install.lane_evidence_window_seconds = 0'
+  before="$(lane_digests)"
+  LANE_PTY=1 LANE_PTY_ANSWERS=$'y\n' SAFE_AUDIT_EVIDENCE_HITS="{\"risky@3.0.0\":${LANE_HIT_HIGH}}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 risky@3.0.0)" lane_run 'npm install risky@3.0.0'
+  assert_status 102 "$FUNCNAME: stale evidence" || return
+  assert_err_contains_fragment 'the evidence read before them is older than' "$FUNCNAME" || return
+  assert_lane_untouched "${before}" "$FUNCNAME" || return
+  [[ "$(lane_approvals)" == '["npm:risky"]' ]] || { fail "$FUNCNAME: the acceptance given was not kept"; return; }
+  pass "$FUNCNAME"
+}
+
+# Today's prompts are unchanged: confirm_infra with no wording argument prints what it always printed.
+case_project_lane_tty_todays_infra_prompt_is_byte_for_byte_what_it_was() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  prepare_case "lane-tty-infra-text"
+  local out
+  out="$(bash -c 'source "$1"; safe_gate_tty_printf() { local f="$1"; shift; printf "${f}" "$@"; }; safe_gate_confirm_infra pkg@1.0.0 </dev/null' _ "${ROOT_DIR}/lib/gate-lib.sh" 2>&1 || true)"
+  [[ "${out}" == "safe: audit infrastructure is unavailable for pkg@1.0.0 — infrastructure breakage, NOT a package finding.
+safe: proceeding installs pkg@1.0.0 WITHOUT the behavioral (Socket) signal; the recommended fix is to restore it (socket login / wait and retry / safe doctor).
+safe: proceed without the behavioral signal? [y/N] "* ]] || { fail "$FUNCNAME: $(printf '%s' "${out}" | head -5)"; return; }
+  pass "$FUNCNAME"
+}
+
 # The oracle can fail: its judge reports a wrong observation of each kind (a gate that agreed with everything would pass
 # any corpus), and the helper fails when it did not evaluate every case.
 case_npm_option_oracle_can_fail() {
@@ -15111,6 +15437,18 @@ main() {
     case_project_lane_a_tolerance_is_vetoed_by_an_advisory_on_a_bundled_member \
     case_project_lane_roots_come_from_the_binders_list_and_need_a_publish_time_only_with_a_cooldown \
     case_project_lane_the_report_says_what_the_audit_did_and_a_block_after_publication_is_a_finding \
+    case_project_lane_tty_an_accepted_adverse_prompt_is_recorded_and_the_next_run_passes_unprompted \
+    case_project_lane_tty_a_declined_adverse_prompt_ends_with_the_adverse_exit_and_records_nothing \
+    case_project_lane_tty_a_blocking_advisory_takes_a_typed_override_and_a_record \
+    case_project_lane_tty_a_malice_override_is_for_this_command_and_records_nothing \
+    case_project_lane_tty_missing_evidence_is_confirmed_for_this_command_only_and_unjudged_advisories_stay_unjudged \
+    case_project_lane_tty_classes_are_resolved_one_by_one_and_a_decline_ends_with_the_exit_of_the_class_left \
+    case_project_lane_tty_a_wait_is_answered_with_todays_adverse_override \
+    case_project_lane_tty_socket_outcomes_on_a_named_root_are_answered_as_todays_gate_lets_them \
+    case_project_lane_tty_an_unbound_graph_takes_the_deliberate_confirmation_and_the_one_shot_route \
+    case_project_lane_tty_an_agent_session_is_never_prompted_at_any_class \
+    case_project_lane_tty_a_dry_run_asks_nothing_and_stale_evidence_is_not_decided_on \
+    case_project_lane_tty_todays_infra_prompt_is_byte_for_byte_what_it_was \
     case_project_lane_socket_a_passing_root_records_nothing_when_the_command_does_not_complete \
     case_project_lane_socket_a_young_named_fix_installs_under_exempt_and_waits_under_enforce \
     case_project_lane_socket_a_roots_own_advisory_gates_only_when_introduced \

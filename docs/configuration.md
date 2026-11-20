@@ -296,6 +296,34 @@ pass and warnings under `environment.release_follow`.
   `CooldownCandidates`, holds the choice); an entry the lockfile on disk carries that the baseline does not is
   introduced, and is judged. The npm must define `min-release-age-exclude` (npm 11.17.0 or later, which the
   capability probe checks on top of the 11.12.1 floor).
+  **The operator's terminal.** At the operator's terminal (stdin is a terminal and no recognized agent marker is set:
+  today's predicate, never loosened; an answer is never read from stdin and `--yes` reaches no prompt), and only there, each
+  class the decision leaves at stake is resolved on its own, in the decision's own order, with today's prompts (the lane calls
+  the install gate's functions: it has no prompt reader of its own). **Malice:** a typed `name@version` per artifact, for this
+  command, never recorded. **Blocking advisory:** a typed `name@version` per artifact (the acceptance is recorded as today's
+  gate records it: a local approval of that exact artifact and source), or `record name@version`, which also records the
+  advisory override on the host-allow entry (advisory-only, through `safe-run host-allow add --accept-block`, which asks
+  again). **Graph not bound:** the deliberate confirmation, then the command runs on the one-shot route with its line (the
+  closure is not judged there; `dedupe` and `prune` have no other gate and are not offered it). **Adverse advisory:** ONE prompt
+  lists every artifact and advisory; `[y]` accepts the listed exact artifacts (each recorded as an acceptance), `[a]` also
+  records a host-allow grant (npm and python, as today), `[N]` declines. **Wait:** today's adverse override. **Socket on a named
+  root:** the rate-limit approval (for this command; the approval of each exact artifact is recorded), the consent ask (`Y`
+  reads Socket again with the consent, `n` proceeds without it and records the acceptance), the pending-score confirmation, an
+  adverse finding (the adverse override), and an outage (the deliberate confirmation, for this command, recorded nowhere).
+  **Missing evidence:** the deliberate confirmation of the infrastructure ruling, for this command, recording nothing, never
+  `[a]`; the lockfile is then not recorded as judged, so what could not be judged is judged again the next time and is never
+  read as already present. A decline ends the command with the exit of the class left (104, 102 or 100). An acceptance is
+  recorded when it is given, in today's stores by today's writers (`safe audit record-installed`, `safe-run host-allow`, both
+  the ones beside the dispatcher, on the store root the lane reads its switch from), so the standing acceptances clear the same
+  command the next time without a prompt. A named root whose outcome the operator confirmed (an adverse override, a Socket
+  consent declined, a pending score confirmed) is recorded after a verified publication through the same `record-installed`
+  (`WARN_TTY_OVERRIDE`, `GO_SOCKET_DECLINED`, `GO_PENDING_CONFIRMED`: exportable, as the 2026-10-13 ruling says); never a malice
+  override, a block override, missing evidence or the one-shot confirmation. A dry run is not prompted. While the operator
+  thinks the project lock stays held and the binder still refuses (33) if the manifest or the lockfiles changed; when the
+  prompts end the evidence read before them may not be older than 15 minutes (`install.lane_evidence_window_seconds` in the
+  operator's configuration may shorten it): otherwise the command is refused before it binds, and what was accepted stays
+  recorded, so the rerun asks nothing again. An agent session is never prompted: it ends as it does unattended.
+
   **Standing acceptances.** The decision takes the operator's standing acceptances as a document of its own, read by safe's
   own reader (`safe audit lane-acceptances`, which calls the functions today's install gate calls and has no store, format or
   rule of its own) for exactly the artifacts a first decision leaves outstanding, from the stores where the lane reads its

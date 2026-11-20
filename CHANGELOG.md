@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Project lane (still behind `install.project_lane`): the operator's terminal. At the operator's terminal only (today's
+  predicate: a terminal on stdin and no recognized agent marker; an agent session is never prompted and ends as it does
+  unattended), each class the decision leaves at stake is resolved on its own, in the decision's order, with today's own
+  prompts: a typed override per artifact for malice (never recorded) and for a blocking advisory (recorded as today's gate
+  records it; `record name@version` also records the advisory override), ONE prompt for all adverse advisories with `[y]`,
+  `[a]`, `[N]`, today's adverse override for a wait, today's rate-limit, consent and pending prompts for Socket on a named
+  root, and the deliberate confirmation for missing evidence (this command only, recording nothing, never `[a]`; the lockfile
+  is then not recorded as judged) and for a graph that cannot be bound (the command runs on the one-shot route). The decision
+  gains the answers that belong to one command alone (`project-decide --confirmations`) and says what is outstanding, class by
+  class (`outstanding`). An acceptance is recorded when it is given, by today's writers, so the next run passes unprompted; a
+  named root whose outcome the operator confirmed is recorded after a verified publication through `record-installed` and is
+  exportable. A dry run asks nothing; a prompt phase longer than 15 minutes is refused before binding (the acceptances stay
+  recorded). No change to the agent contract: no exit code or agent-visible wording changes.
+
 - Project lane (still behind `install.project_lane`): standing acceptances and install records, **no terminal prompt**. The
   decision takes the operator's standing acceptances (a local exact approval or pin, a followed grant, a followed install
   allowance, a followed advisory override with its signer, generation, ecosystem and source checks, the

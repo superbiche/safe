@@ -162,6 +162,10 @@ func judgeSocket(in Input) (malice []MaliceItem, report SocketReport, class Clas
 				causes = root.Causes
 			}
 			item.Cleared, item.ClearedBy = waitCleared(identity, in, causes)
+			if !item.Cleared && root.Outcome == SocketUnavailable && in.Confirmations.has(in.Confirmations.Socket, identity) {
+				// the operator accepted the missing Socket reading of this root for this command (an infrastructure outage)
+				item.Cleared, item.ClearedBy = true, []string{ConfirmedByOperator}
+			}
 			class.AtStake++
 			if !item.Cleared {
 				class.Outstanding++
