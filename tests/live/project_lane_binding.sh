@@ -513,13 +513,23 @@ if (( status != 0 )) && (( status == status_off )) && cmp -s "${WORK}/h-clean.er
 else
   fail "H8 (npm clean): exit ${status} (switch off: ${status_off}); $(tail -n 3 "${WORK}/h-clean.err")"
 fi
-# an option before the verb refuses before npm is asked (npm takes `prefix` for the command in `npm --json=prefix de`)
+# an option before the verb: the form npm reads differently (`npm --json=prefix de`: npm takes `prefix` for the command) is
+# refused by the gate's front door before the lane is reached, and an option whose value npm consumes is refused by the
+# lane's own line, before npm is asked about the token; npm runs neither command
 gate_in "${WORK}/h-clean" "${WORK}/h-opt" --json=prefix de
 status=$?
-if (( status == 100 )) && grep -q 'an option before the verb' "${WORK}/h-opt.err" && ! grep -q "${WORK}/h-clean" "${WORK}/h-opt.out" 2>/dev/null; then
-  pass "H9 (option before the verb): refused in the lane's form; npm did not run the command it would have taken (prefix)"
+if (( status == 100 )) && grep -q 'to allow: write the option without the value' "${WORK}/h-opt.err" && ! grep -q 'project lane' "${WORK}/h-opt.err" \
+    && ! grep -q "${WORK}/h-clean" "${WORK}/h-opt.out" 2>/dev/null; then
+  pass "H9 (option before the verb, npm reads another command): the front door refuses it in one line; npm did not run the command it would have taken (prefix)"
 else
   fail "H9: exit ${status}; $(tail -n 2 "${WORK}/h-opt.err")"
+fi
+gate_in "${WORK}/h-clean" "${WORK}/h-opt2" --loglevel=error de
+status=$?
+if (( status == 100 )) && grep -q 'an option before the verb' "${WORK}/h-opt2.err" && grep -q '\[lane: project\]' "${WORK}/h-opt2.err"; then
+  pass "H9b (option before the verb, its value consumed): the lane refuses it in its own form, before npm is asked about the token"
+else
+  fail "H9b: exit ${status}; $(tail -n 2 "${WORK}/h-opt2.err")"
 fi
 
 # I. npm's own errors, on the real npm, whatever the caller's presentation settings

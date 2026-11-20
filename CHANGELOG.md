@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+- **Fix: a bypass of the installed gate for npm `=`-form options.** npm's parser reads `--flag=value` as
+  `--flag value`, and a Boolean-typed flag leaves a value other than `true`/`false` as a positional argument:
+  `npm --json=install evil` runs `install evil`, `npm install --json=evil` installs `evil`, `npm exec
+  --json=evil` fetches and runs it, and the short forms and clusters do the same. The gate skipped every
+  `=` form as unambiguous and never audited the package (with `install.project_lane` on or off). The `npm`
+  wrapper now applies one rule before any scanner reads the arguments: a value npm consumes goes on as before;
+  one npm leaves as an argument, or re-reads as an option (`--tag=-g`), refuses (100, one line, write the option
+  without the value); an option name the snapshot of npm's option types does not know is read both ways and
+  goes on only when both readings give the same, ungated command. It covers abbreviated names, shorthands and
+  clusters, `npm exec`/`x`, and the audit-only pass under `mise exec -- npm`. Global mode is read from the same
+  reading (`-gf`, `--local false`, `--cache -g`). Found by the differential oracle against npm's own parser
+  (`tests/live/npm_option_oracle.sh`): `npm exec --yes true evil` audited `true`; `npm install --filter
+  evil` / `--@scope:registry http://…` skipped the package (options npm does not define are switches there);
+  `-p` is `--parseable`, not `--package`, in `npm exec`; `npm exec --no-package=evil` fetched a package no
+  scanner looked for (refused: `--no-` on an option that takes a value); `npm exec --package -- evil` made npm
+  fetch the package `true` (refused). An option name the snapshot does not know is read both ways, so an
+  unknown plain `--name=value` before a command the gate audits now refuses (scoped and nerf-darted keys such
+  as `--@scope:registry=…` and `--//host/:_authToken=…` are not affected; the refusal's way out is the
+  environment, `npm_config_<name>=<value>`, and the route's refusal of an unknown space-form flag says so for
+  npm). A shorthand cluster that leaves a word over or gives one option another's flag as its value (`npm
+  install -Cq evil` also installs a package named `warn`) is refused at the front door.
+  Second review round: the front door reads the vector whenever an argument before the terminator starts with a
+  dash; an option name is known only when exact, abbreviations and unknown names are read both ways (every
+  combination up to four); literal values (`--color=always`) are read in nopt's order; a package selector or call
+  string before the `exec` verb, a value of an interpreted option (`location`, `global`, `package`, `call`,
+  `prefix`, `registry`, `workspace`) that is empty, padded, unlisted or missing, two disagreeing settings of
+  global mode, a line break or padding in a package argument and a lone `-` all refuse. No refusal prints a
+  value, every refusal is one line and its way out works. `safe install --host --manager npm` is covered by the
+  gate's reading after its own extraction. The differential oracle now compares exact identities, the
+  delegation, the scan decision and global mode, can fail (self-test), and fails when it evaluated fewer cases
+  than it was given.
+  Version-dependent options: the snapshot is a union over npm 8.1 to 12.2, and an option only some versions define
+  is read differently by them (npm 8.1 and 10.9 install `evil` for `npm install --allow-git evil`; npm 11.20
+  consumes it as the option's value). Such options, abbreviations of their names included, are now read under every
+  combination of their readings (up to four; five refuse) and the command goes on only when every reading agrees on
+  the command, the packages and global mode; the way out is the value attached (`--install-strategy=nested`). The
+  space forms of the newer options (`--install-strategy nested`, `--cpu x64`, `--os linux`) therefore refuse; the `=`
+  forms pass. An npm older than the oldest reference version (8.1.0) is outside what the snapshot can vouch for.
+  Third round: `--location=global`, in any spelling, refuses on a gated command and never decides global mode (npm
+  8.1.0 parses it and does not act on it; the way out is `-g`); a negated value option followed by a word
+  (`--no-local-address 127.0.0.1 pkg`) refuses (the word before the option, or `--local-address=<value>`); the
+  line-break, padding and lone-dash checks read only what a gate extractor reads (`npm exec -- node -e '<two
+  lines>'` passes again); no refusal on the npm path prints a value, the exec auditor's attached call string
+  included, and the printed ways out work. The differential oracle compares the audited identities as exact sets in
+  both directions, requires zero delegations on a refusal, derives each reference's global mode from what that npm
+  does, and fails when its corpus producer fails.
 - Project lane: `npm ci`, `npm dedupe` and `npm prune` (still behind `install.project_lane`). `ci` has no
   projection: its plan is the lockfile on disk, checked against the manifest by npm's own frozen check (`npm
   ci --dry-run`; a lockfile out of step or missing is npm's own error, shown as npm's, with npm's status),

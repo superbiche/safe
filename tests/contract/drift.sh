@@ -383,6 +383,83 @@ case_operator_terminal_helpers_match_between_gates() {
   pass "$FUNCNAME"
 }
 
+# The npm option snapshot (the front door's tables) is internally consistent, and the reading built on it
+# behaves as nopt does on the facts the front door exists for. The live oracle (tests/live/npm_option_oracle.sh)
+# compares the snapshot and the reading with the npm the gate delegates to; this is the hermetic half.
+case_npm_option_snapshot_is_consistent_and_reads_like_nopt() {
+  # shellcheck source=/dev/null
+  source "$ROOT/lib/gate-lib.sh"
+  local pair key letters tok bad="" prev="" short exp ok
+  local LC_ALL=C
+  # names sorted and unique, letters from the known set
+  for pair in "${SAFE_GATE_NPM_OPTIONS[@]}"; do
+    key="${pair%%=*}"; letters="${pair#*=}"
+    [[ "${letters}" =~ ^(-|[ABSNTY]+(:[A-Za-z0-9_.,-]*)?)$ ]] || bad="${bad} ${key}(letters:${letters})"
+    [[ -z "${prev}" || "${prev}" < "${key}" ]] || bad="${bad} ${key}(order)"
+    prev="${key}"
+  done
+  # every option a shorthand expands to is a known option (or a negation of one)
+  safe_gate_nopt_load
+  for pair in "${SAFE_GATE_NPM_SHORTHANDS[@]}"; do
+    short="${pair%%=*}"; exp="${pair#*=}"
+    for tok in ${exp}; do
+      [[ "${tok}" == --* ]] || continue
+      key="${tok#--}"; key="${key#no-}"
+      [[ -n "${SAFE_GATE_NOPT_FLAGS[${key}]+set}" ]] || bad="${bad} ${short}->${tok}(unknown option)"
+    done
+  done
+  # nopt's facts: (arguments => the values it leaves loose; its positional arguments; global mode)
+  check() { # <expected loose count> <expected remain, space-joined> <expected global> <args...>
+    local want_loose="$1" want_remain="$2" want_global="$3"; shift 3
+    safe_gate_nopt_parse "$@"
+    [[ "${#SAFE_GATE_NOPT_LOOSE[@]}" == "${want_loose}" && "${SAFE_GATE_NOPT_REMAIN[*]-}" == "${want_remain}" && "${SAFE_GATE_NOPT_GLOBAL}" == "${want_global}" ]] \
+      || bad="${bad} [$*]=>loose:${#SAFE_GATE_NOPT_LOOSE[@]},remain:${SAFE_GATE_NOPT_REMAIN[*]-},global:${SAFE_GATE_NOPT_GLOBAL}"
+  }
+  check 1 'install evil' 0 --json=install evil            # Boolean: the value stays an argument
+  check 1 'install evil' 0 install --json=evil
+  check 0 'install evil' 0 --json=true install evil       # true/false are consumed
+  check 0 'install evil' 0 --json=false install evil
+  check 0 'install evil' 0 --registry=https://r/ install evil   # a url-typed option consumes it
+  check 0 'install evil' 1 -g install evil
+  check 1 'install evil' 1 -g=install evil                # a shorthand is the Boolean it expands to
+  check 1 'x install evil' 1 -gf=x install evil           # a cluster, the value left over
+  check 1 'evil install' 0 --no-json=evil install         # --no- makes any option Boolean
+  check 1 'install evil' 0 install --jso=evil             # an abbreviated name
+  check 1 'install evil' 1 --tag=-g install evil          # a String option re-reads a value that looks like a flag (here: -g)
+  check 0 'install evil' 0 --location=global install evil   # the location never decides the gate's global mode (npm 8.1.0 does not act on it) ...
+  safe_gate_nopt_parse --location=global install evil
+  [[ "${SAFE_GATE_NOPT_LOCGLOBAL}" == 1 ]] || bad="${bad} (--location=global is not seen as a global location)"   # ... it is seen, and the gate refuses it
+  check 0 'install evil' 0 --frobnicate=x install evil    # an unknown name consumes it
+  check 0 'install --json=evil' 0 install -- --json=evil  # after the terminator nothing is an option
+  # the version-dependent names: each is a known option (or shorthand), has at least two distinct readings, and every
+  # reading is `@` (a version that does not define it) or the same letters the union holds; the oldest reference is 8.1.0
+  local r n
+  for pair in "${SAFE_GATE_NPM_VARIANT_OPTIONS[@]}"; do
+    key="${pair%%=*}"
+    [[ -n "${SAFE_GATE_NOPT_FLAGS[${key}]+set}" ]] || bad="${bad} ${key}(variant of no known option)"
+    IFS=';' read -r -a rs <<<"${pair#*=}"
+    (( ${#rs[@]} >= 2 )) || bad="${bad} ${key}(variant with one reading)"
+    for r in "${rs[@]}"; do
+      [[ "${r}" == @ || "${r}" =~ ^(-|[ABSNTY]+)(:[A-Za-z0-9_.,-]*)?$ ]] || bad="${bad} ${key}(reading ${r})"
+    done
+  done
+  for pair in "${SAFE_GATE_NPM_VARIANT_SHORTHANDS[@]}"; do
+    key="${pair%%=*}"
+    [[ -n "${SAFE_GATE_NOPT_SHORT[${key}]+set}" ]] || bad="${bad} ${key}(variant of no known shorthand)"
+  done
+  [[ " ${SAFE_GATE_NPM_REFERENCE_VERSIONS} " == *" 8.1.0 "* ]] || bad="${bad} (the reference versions do not include 8.1.0)"
+  n=0; for pair in "${SAFE_GATE_NPM_VARIANT_OPTIONS[@]}"; do n=$((n + 1)); done
+  (( n >= 40 )) || bad="${bad} (only ${n} version-dependent options)"
+  # a version-dependent option is read every way: the five lines of the review each refuse or audit the package
+  safe_gate_npm_variant_check install --allow-git evilpkg >/dev/null 2>&1 && bad="${bad} (--allow-git evilpkg went through)"
+  safe_gate_npm_variant_check install --allow-git=none evilpkg >/dev/null 2>&1 || bad="${bad} (--allow-git=none refused)"
+  if [[ -z "${bad}" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (${bad# })"
+  fi
+}
+
 case_contract_is_valid_json
 case_contract_has_every_required_key
 case_every_exit_code_tells_an_agent_what_to_do
@@ -403,6 +480,7 @@ case_npm_classifier_snapshot_routes_every_alias
 case_npm_literal_sites_consult_the_classifier
 case_infra_cause_sets_match_between_gates
 case_operator_terminal_helpers_match_between_gates
+case_npm_option_snapshot_is_consistent_and_reads_like_nopt
 
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

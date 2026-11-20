@@ -377,6 +377,89 @@ fully inventoried. A private-registry allow on a project operation that
 carries no complete audit line is refused. With no private registry configured this costs one file test. See
 [private registries](private-registries.md).
 
+## npm's `=` forms: the front door
+
+npm's argument parser (nopt) reads `--flag=value` as the two arguments `--flag value`, and whether `value` is the
+flag's depends on the flag's **type**. For a Boolean-typed flag a value other than the words `true` and `false`
+stays a **positional argument**: `npm --json=install evil` runs `install evil`, `npm install --json=evil`
+installs `evil`, `npm exec --json=evil` fetches and runs it, and the short forms behave the same
+(`-g=install`, a cluster `-gf=evil`). A String-typed flag whose value looks like a flag (`--tag=-g`) hands the
+value back to the parser as that flag. The gate's scanners read an `=` form as one unambiguous word, so any of
+these hid the real command or package from them.
+
+Before any scanner reads the arguments, the `npm` wrapper (the `npm exec`/`x` family, the audit-only pass under
+`mise exec -- npm …`, and every other path that reads an npm argument vector) reads the vector the way nopt does
+whenever an argument before the option terminator starts with a dash (a single-dash cluster such as `--Cq` or
+`-gf` included; a vector with no such argument is not read, which costs about 3 ms on `npm --version` and 10 ms
+on `npm run build --silent` in a gated shell). Then:
+
+- A value npm consumes as the option's goes on as before. A value npm would leave as an argument, or re-read as
+  another option, refuses (exit 100, one line, no value printed: the way out is to write the option without the
+  value and keep the word as its own argument). A literal value of a mixed-type option (`--color=always`) is the
+  option's, as npm reads it. `--no-` on an option that takes a value, written with an `=`, refuses.
+- An option name is known only when it is exact (the option or its shorthand). An abbreviation or an unknown name
+  is read both ways (the value the option's, and the value an argument); with several of them every combination is
+  tried, up to four, and the command goes on only when all give the same ungated command, otherwise it refuses.
+  The way out is the full name for an abbreviation, and the environment (`npm_config_<name>=<value> npm …`, the
+  same setting for npm and the scripts it runs) for an unknown name. Scoped and nerf-darted keys
+  (`--@scope:registry=…`, `--//host/:_authToken=…`) are not affected: no npm types them.
+- A shorthand cluster that leaves a word over or gives one option another's flag as its value (`-Cq` is `--prefix
+  --loglevel warn`, so npm installs a package named `warn`) refuses; the way out is to write the options
+  separately.
+- The options the gate interprets (`location`, `global`, `package`, `call`, `prefix`, `registry`, `workspace`)
+  refuse a value that is empty, padded with white space, outside the listed values or missing, and two settings of
+  global mode that disagree refuse: npm trims, cleans or picks among them under rules the gate does not emulate.
+- `npm exec` / `x` with a package selector or call string written before the verb (`npm --package=evil exec
+  cowsay`) refuses: the audit reads the selectors after the verb, so the way out is to write them there.
+- `--location=global`, in any spelling (`--location global`, `-L global`, an abbreviation, before or after the verb),
+  refuses on a command the gate audits, and the location never decides global mode for the gate: npm 8.1.0 parses
+  the location and does not act on it (its install reads only the `global` setting; `npm --location global prefix`
+  prints the project prefix there and the installation prefix on every later npm), so the gate cannot tell whether
+  the command is global. The way out is `-g` (or `--global`), the one global form every version acts on; another
+  location (`--location=project`, `--location=user`) does not change the mode.
+- A negated option whose plain form takes a value (`--no-local-address`), followed by a word, refuses on a command
+  the gate audits: every version gives `--no-local-address 127.0.0.1` its address, and the literals of that option are
+  the interfaces of the machine, which no snapshot can hold. The way out is the word before the negated option
+  (`npm install <package> --no-local-address`) or the plain option with its value attached. An option that is
+  Boolean with fixed literals only (`--no-color`, `--no-color always`) reads the same everywhere and is not affected.
+- For the commands the gate audits, an argument holding a line break, a package argument padded with white space,
+  or a lone `-` refuses (the extractors and npm read them differently); one clean package per argument is the way
+  out. Only what a gate extractor reads is checked: after the terminator of `npm exec` the first operand is the
+  package or command to audit, and the rest are the child's own arguments, which are not read (`npm exec -- node -e
+  '<two lines>'` passes).
+- No refusal prints a value. The exec auditor's refusal of an attached call string (`-c=<call>`) names the option and
+  advises `-c <call>` or `--call=<call>`, and an abbreviation's refusal names the full option when exactly one option
+  begins with the text, and says "the option's full name" otherwise.
+
+- An option the npm versions the gate vouches for read differently (absent in one, Boolean in another, value-taking
+  in a third: `--allow-git`, `--min-release-age`, `--cpu`, `--os`, `--install-strategy`, ...) is **version-dependent**:
+  an older npm reads it as a switch and takes the next word for a package (`npm install --allow-git evil` installs
+  `evil` on npm 8.1 and 10.9, and not on 11.20), a newer one takes the word as the option's value. The vector is read
+  under every combination of the readings of the version-dependent options it names, abbreviations of their names
+  included (up to four; five refuse), and the command goes on only when every reading gives the same command, the
+  same positional arguments and the same global mode, or the command is not one the gate audits. The way out of the
+  refusal is the value attached (`--install-strategy=nested`, `--cpu=x64`): every npm version consumes an `=` value
+  for a name it does not define as Boolean, so the readings agree. The reference versions are listed in
+  `SAFE_GATE_NPM_REFERENCE_VERSIONS` (npm 8.1.0 to 12.2.1, generated by `scripts/npm-option-snapshot.cjs`); an npm
+  older than the oldest of them is outside what the snapshot can vouch for.
+
+Every refusal's way out is a command the gate accepts (one case per refusal text follows it literally in
+`tests/install/run.sh`). `safe install --host --manager npm` extracts packages on its own before the gate and then
+hands the command to the gate: a package its extraction misses (`--save=evil`, `--filter sample@1.0.0`) is audited
+by the gate's reading of the same command before npm runs (`tests/install/host_extraction_npm_reading.sh`).
+
+The reading follows a snapshot of npm's option types (`SAFE_GATE_NPM_OPTIONS`, `SAFE_GATE_NPM_SHORTHANDS` in
+`lib/gate-lib.sh`, generated by `scripts/npm-option-snapshot.cjs` over npm 8.1 to 12.2). The hermetic drift guard
+(`tests/contract/drift.sh`) checks it for consistency and against nopt's behaviour on the facts above; the live
+oracle (`tests/live/npm_option_oracle.sh`) compares it with the npm the gate delegates to, compares the bash
+reading with npm's own parser on a corpus made of the union of the names of every reference version (so a name an
+older npm does not define is tried against it as the unknown name it is), and (`SAFE_ORACLE_GATE=1`) compares the gate's whole
+reading (command, the exact audited identities, the delegation, the project scan decision and global mode) with
+npm's; it fails unless every corpus case was evaluated, and `tests/lib/npm-option-gate-oracle.sh --selftest` shows
+that its judge reports a wrong observation of each kind. Global mode is read the same way, so a shorthand
+cluster (`-gf`), `--local false` and an option that swallows a following `-g` (`--cache -g`) agree with npm.
+pnpm 12 and yarn 4 reject the form; bun consumes the value or rejects it.
+
 ## Wrapped Exec and Update Commands
 
 Exec-style subcommands that fetch and run registry packages are audited the
