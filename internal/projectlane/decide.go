@@ -79,6 +79,35 @@ type Report struct {
 	Socket  *SocketReport  `json:"socket,omitempty"`
 	Classes []ClassOutcome `json:"classes"`
 	Outcome Outcome        `json:"outcome"`
+	// Records are the named roots of a clear decision that are eligible for an install record. It is a FILTER, necessary and
+	// not sufficient: the gate asks today's auditor to audit each of them after a verified publication, and that audit
+	// records, or does not, by its own evidence (see records.go). Empty unless the decision is clear.
+	Records []RecordItem `json:"records"`
+	// Adverse are the exact identities the decision established adverse evidence on (malice, a blocking or adverse
+	// advisory, a Socket finding): the gate asks today's audit to look at them, so that a receipt the evidence supersedes
+	// is revoked by today's own rule.
+	Adverse []AdverseItem `json:"adverse"`
+	// Wanted are the artifacts whose standing acceptances the decision would use, by the relation the decision clears
+	// with: the artifact whose bytes carry the item, and every blocking advisory introduced under those bytes.
+	Wanted []WantedAcceptance `json:"wanted"`
+
+	coverBlocking map[string]map[string]struct{}
+}
+
+// AdverseItem is an exact artifact (name, version, source host) a receipt of which the decision's evidence supersedes: the
+// identity the evidence is on and the artifact whose bytes carry it.
+type AdverseItem struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Host    string `json:"host"`
+}
+
+// WantedAcceptance is one artifact an acceptance reader is asked about.
+type WantedAcceptance struct {
+	Name               string   `json:"name"`
+	Version            string   `json:"version"`
+	Host               string   `json:"host"`
+	BlockingAdvisories []string `json:"blocking_advisories"`
 }
 
 // BaselineStatus says what the difference was taken against.
@@ -207,6 +236,9 @@ func Decide(in Input) Report {
 		Advisories:    AdvisoryReport{Fixed: []FixedAdvisory{}, AlreadyPresent: []PresentAdvisory{}, Introduced: []IntroducedAdvice{}},
 		Malice:        []MaliceItem{},
 		Coverage:      []CoverageGap{},
+		Records:       []RecordItem{},
+		Adverse:       []AdverseItem{},
+		Wanted:        []WantedAcceptance{},
 	}
 	baseline := in.Baseline
 	switch {
@@ -286,6 +318,8 @@ func Decide(in Input) Report {
 	}
 	report.Classes = append(report.Classes,
 		ClassOutcome{Class: ClassMissingEvidence, Exit: ExitOperator, AtStake: len(report.Coverage), Outstanding: len(report.Coverage)})
+	report.Adverse = adverseIdentities(report, in)
+	report.Wanted = wantedAcceptances(report, in)
 	report.Outcome = Outcome{Status: "clear"}
 	for _, class := range report.Classes {
 		if class.Outstanding == 0 {
@@ -300,6 +334,7 @@ func Decide(in Input) Report {
 	if !report.Bindability.Bound {
 		report.Outcome = Outcome{Status: "unbound", Exit: ExitOperator}
 	}
+	report.Records = recordsFor(report, in, evidence)
 	return report
 }
 
@@ -422,6 +457,11 @@ func differential(report *Report, baseline, target Graph, evidence evidenceIndex
 		blockSet[severity] = struct{}{}
 	}
 
+	type pendingName struct {
+		name       string
+		introduced map[string]*advisoryFacts
+	}
+	var pending []pendingName
 	for _, name := range sortedNames {
 		beforeFacts, beforeComplete, beforeGaps := before[name].read(evidence)
 		afterFacts, afterComplete, afterGaps := after[name].read(evidence)
@@ -450,8 +490,7 @@ func differential(report *Report, baseline, target Graph, evidence evidenceIndex
 			}
 			introduced[id] = fact
 		}
-		report.Advisories.Introduced = append(report.Advisories.Introduced,
-			introducedAdvisories(name, introduced, target, doc, blockSet)...)
+		pending = append(pending, pendingName{name, introduced})
 		if afterComplete {
 			for _, id := range sortedFactIDs(beforeFacts) {
 				if _, still := afterFacts[id]; !still {
@@ -463,6 +502,61 @@ func differential(report *Report, baseline, target Graph, evidence evidenceIndex
 			}
 		}
 	}
+	// The blocking advisories introduced under the BYTES of each artifact (a bundled member's are its covering artifact's),
+	// so that an acceptance of that artifact is asked to cover all of them, whatever the names of the members.
+	report.coverBlocking = map[string]map[string]struct{}{}
+	for _, item := range pending {
+		for id, fact := range item.introduced {
+			for version, severity := range fact.versions {
+				if severityClass(severity, blockSet) != AdvisoryBlocking {
+					continue
+				}
+				for _, occurrence := range target.Occurrences {
+					if occurrence.Name != item.name || occurrence.Version != version || !occurrence.Public {
+						continue
+					}
+					key := coverKey(occurrence)
+					if report.coverBlocking[key] == nil {
+						report.coverBlocking[key] = map[string]struct{}{}
+					}
+					report.coverBlocking[key][id] = struct{}{}
+				}
+			}
+		}
+	}
+	// Once the blocking class is raised (by what is introduced) for an artifact's bytes, an override must cover EVERY blocking
+	// advisory the target's evidence shows under them, inherited ones included: as today's reader requires of a follower.
+	for _, occurrence := range target.Occurrences {
+		if _, raised := report.coverBlocking[coverKey(occurrence)]; !raised || !occurrence.Public {
+			continue
+		}
+		for _, hit := range evidence[occurrence.Identity()].Advisories {
+			if !hit.Malware && severityClass(hit.Severity, blockSet) == AdvisoryBlocking {
+				report.coverBlocking[coverKey(occurrence)][hit.ID] = struct{}{}
+			}
+		}
+	}
+	for _, item := range pending {
+		report.Advisories.Introduced = append(report.Advisories.Introduced,
+			introducedAdvisories(item.name, item.introduced, target, doc, blockSet, report.coverBlocking)...)
+	}
+}
+
+// coverKey names the artifact whose bytes an occurrence is: its covering artifact for a bundled member, itself otherwise.
+func coverKey(occurrence Occurrence) string {
+	name, version := occurrence.Name, occurrence.Version
+	if occurrence.CoveredBy != "" {
+		name, version = occurrence.coverName, occurrence.coverVersion
+	}
+	return name + "@" + version + "\x00" + strings.ToLower(occurrence.Host)
+}
+
+// coverArtifact is the artifact an acceptance is for: the covering one for a bundled member.
+func coverArtifact(occurrence Occurrence) (string, string) {
+	if occurrence.CoveredBy != "" {
+		return occurrence.coverName, occurrence.coverVersion
+	}
+	return occurrence.Name, occurrence.Version
 }
 
 func sortedFactIDs(facts map[string]*advisoryFacts) []string {
@@ -555,22 +649,7 @@ func severityClass(severity string, blockSet map[string]struct{}) string {
 // advisory that is critical at one version and high at another is a blocking
 // item for the first and an adverse item for the second, each cleared (or
 // not) by an authority of its own class and only for the artifacts it names.
-func introducedAdvisories(name string, introduced map[string]*advisoryFacts, target Graph, doc Evidence, blockSet map[string]struct{}) []IntroducedAdvice {
-	// The introduced blocking advisories of each version: what a followed
-	// advisory override must cover for that artifact. An advisory already
-	// present never gates and is never demanded.
-	blockingAt := map[string]map[string]struct{}{}
-	for id, fact := range introduced {
-		for version, severity := range fact.versions {
-			if severityClass(severity, blockSet) == AdvisoryBlocking {
-				if blockingAt[version] == nil {
-					blockingAt[version] = map[string]struct{}{}
-				}
-				blockingAt[version][id] = struct{}{}
-			}
-		}
-	}
-
+func introducedAdvisories(name string, introduced map[string]*advisoryFacts, target Graph, doc Evidence, blockSet map[string]struct{}, coverBlocking map[string]map[string]struct{}) []IntroducedAdvice {
 	ids := make([]string, 0, len(introduced))
 	for id := range introduced {
 		ids = append(ids, id)
@@ -622,7 +701,7 @@ func introducedAdvisories(name string, introduced map[string]*advisoryFacts, tar
 				}
 				seen[marker] = struct{}{}
 				carried++
-				kind, ok := clearingAcceptance(class, occurrence, doc, blockingAt[occurrence.Version])
+				kind, ok := clearingAcceptance(class, occurrence, doc, coverBlocking[coverKey(occurrence)])
 				if !ok {
 					cleared = false
 					continue

@@ -116,20 +116,29 @@ func TestDecideClassAndAcceptanceArePerArtifact(t *testing.T) {
 		}
 	})
 
-	t.Run("a followed override is checked against the introduced blocking advisories only", func(t *testing.T) {
-		// p@1 carries critical TEST-A in the baseline; p@2 carries TEST-A (already
-		// present, never gates) and a new critical TEST-B. An override that
-		// covers TEST-B clears the artifact.
+	t.Run("a followed override covers every blocking advisory under the bytes once one is introduced", func(t *testing.T) {
+		// p@1 carries critical TEST-A in the baseline; p@2 carries TEST-A (already present: it never raises the class) and a
+		// new critical TEST-B, which does. Once raised, the override must cover both, as today's reader requires of a follower.
 		evidence := evidenceOf(
 			read("p", "1.0.0", hit("TEST-A", "critical")),
 			read("p", "2.0.0", hit("TEST-A", "critical"), hit("TEST-B", "critical")),
-		).accepting(accept(AcceptFollowedOverride, "p", "2.0.0", "TEST-B"))
-		report := decideWith(t, pkgs("p", "1.0.0"), pkgs("p", "2.0.0"), Hosts{}, evidence)
-		if report.Outcome.Status != "clear" {
-			t.Fatalf("outcome = %+v, want clear; report %+v", report.Outcome, report.Advisories)
+		)
+		onlyNew := decideWith(t, pkgs("p", "1.0.0"), pkgs("p", "2.0.0"), Hosts{}, evidence.accepting(accept(AcceptFollowedOverride, "p", "2.0.0", "TEST-B")))
+		if onlyNew.Outcome.Status == "clear" {
+			t.Fatalf("an override listing only the new advisory cleared the artifact: %+v", onlyNew.Outcome)
 		}
-		if len(report.Advisories.AlreadyPresent) != 1 || report.Advisories.AlreadyPresent[0].ID != "TEST-A" {
-			t.Fatalf("already present = %+v", report.Advisories.AlreadyPresent)
+		both := decideWith(t, pkgs("p", "1.0.0"), pkgs("p", "2.0.0"), Hosts{}, evidence.accepting(accept(AcceptFollowedOverride, "p", "2.0.0", "TEST-A", "TEST-B")))
+		if both.Outcome.Status != "clear" {
+			t.Fatalf("outcome = %+v, want clear; report %+v", both.Outcome, both.Advisories)
+		}
+		if len(both.Advisories.AlreadyPresent) != 1 || both.Advisories.AlreadyPresent[0].ID != "TEST-A" {
+			t.Fatalf("already present = %+v", both.Advisories.AlreadyPresent)
+		}
+		// inherited only: nothing is introduced, the class is not raised, the outcome is what it was
+		inherited := decideWith(t, pkgs("p", "1.0.0"), pkgs("p", "2.0.0"), Hosts{}, evidenceOf(
+			read("p", "1.0.0", hit("TEST-A", "critical")), read("p", "2.0.0", hit("TEST-A", "critical"))))
+		if inherited.Outcome.Status != "clear" {
+			t.Fatalf("an inherited-only advisory gated: %+v", inherited.Outcome)
 		}
 	})
 

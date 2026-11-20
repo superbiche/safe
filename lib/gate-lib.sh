@@ -4469,6 +4469,176 @@ safe_gate_project_lane_socket_roots_doc() {
        untied: $u[0]}' "${src}" >"${out}" 2>/dev/null
 }
 
+# --- standing acceptances and install records of the lane ---------------------------------------------------------------
+#
+# The decision takes the operator's standing acceptances as a document of its own. The lane reads them with safe's own
+# reader (the auditor beside the dispatcher, `lane-acceptances`: the functions today's install gate calls, no store and no
+# rule of its own), for the artifacts a first decision leaves at stake, from the stores where the lane reads its switch
+# (never from a location the caller names), and decides again with them. A reader that fails gives NO acceptance: the class
+# stays outstanding, never cleared.
+#
+# The environment of a call into the operator's stores: the store root is the one safe_gate_trust_store_file gives, with
+# the redirect token only when that function honours it.
+safe_gate_project_lane_store_env() { # prints NUL-free "VAR=value" words, one per line
+  local file dir
+  file="$(safe_gate_trust_store_file host-allow.json)"
+  dir="$(dirname -- "${file}")"
+  printf 'SAFE_RUN_CONFIG_DIR=%s\n' "${dir}"
+  if [[ "${SAFE_RUN_TRUST_OVERRIDE:-0}" == "1" ]] && ! safe_gate_trust_store_canonical; then
+    printf 'SAFE_RUN_TRUST_OVERRIDE=1\n'
+  else
+    printf 'SAFE_RUN_TRUST_OVERRIDE=0\n'
+  fi
+}
+
+# One bounded call of an operator-store door. $1 audit, $2 door, $3 request file, $4 output file, $5 deadline.
+safe_gate_project_lane_store_call() {
+  local audit="$1" door="$2" request="$3" out="$4" deadline="$5" rc=0 word
+  local -a envs=()
+  command -v timeout >/dev/null 2>&1 || return 126
+  while IFS= read -r word; do [[ -z "${word}" ]] || envs+=("${word}"); done < <(safe_gate_project_lane_store_env)
+  env "${envs[@]}" timeout --kill-after=2s "${deadline}" "${audit}" "${door}" <"${request}" >"${out}" 2>/dev/null || rc=$?
+  return "${rc}"
+}
+
+# Decide with the standing acceptances. $1 core, $2 audit, $3 scratch, $4 target graph file, $5 report out, then the
+# arguments of `safe-core project-decide` up to and excluding the lockfile, and the lockfile last. The first decision
+# says what is outstanding; the acceptances are read for exactly those artifacts; the decision is made again with them.
+# Prints nothing, returns the decision's status.
+safe_gate_project_lane_judge() {
+  local core="$1" audit="$2" scratch="$3" graph="$4" out="$5"
+  shift 5
+  local -a decide_args=("${@:1:$#-1}")
+  local lockfile="${!#}" rc=0 asked="${scratch}/acceptances-request.json" got="${scratch}/acceptances.json" why=""
+  "${core}" project-decide "${decide_args[@]}" "${lockfile}" >"${out}" 2>"${scratch}/decide.err" || rc=$?
+  (( rc == 0 || rc == 100 || rc == 102 || rc == 104 )) || return "${rc}"
+  # what the decision wants an acceptance for: the artifact whose bytes carry each outstanding item, with every blocking
+  # advisory introduced under those bytes (the decision's own covering relation)
+  if ! jq -ec '{candidates: [.wanted[] | {name, version, host, blocking_advisories}]}' "${out}" >"${asked}" 2>/dev/null; then
+    return "${rc}"
+  fi
+  jq -e '.candidates | length > 0' "${asked}" >/dev/null 2>&1 || return "${rc}"
+  local rc2=0 rc3=0
+  safe_gate_project_lane_store_call "${audit}" lane-acceptances "${asked}" "${got}" "$(safe_gate_project_lane_socket_deadline cache)" || rc2=$?
+  if (( rc2 == 0 )); then
+    "${core}" project-decide "${decide_args[@]}" --acceptances "${got}" "${lockfile}" >"${out}.accepted" 2>"${scratch}/decide.err" || rc3=$?
+    if (( rc3 == 0 || rc3 == 100 || rc3 == 102 || rc3 == 104 )); then
+      mv -f -- "${out}.accepted" "${out}"
+      return "${rc3}"
+    fi
+    why="the decision could not read them"
+  else
+    why="the reader exited ${rc2}"
+  fi
+  # a reader that fails, or a document the decision cannot read, gives no acceptance: nothing is cleared
+  rm -f -- "${out}.accepted"
+  safe_gate_err "safe: project lane: the standing acceptances could not be read (${why}); none applies"
+  return "${rc}"
+}
+
+# One audit of an exact identity by today's auditor, by its ordinary path (`package-audit --gate install`): the audit that
+# records a named install. It runs only for a named root of a VERIFIED PUBLICATION (never to revoke: it can write). The lane
+# takes no verdict to a store itself. stdin is closed, no consent is carried (SAFE_AUDIT_SOCKET_CONSENT is removed), and the
+# call is bounded by the gate's leash. $1 audit, $2 core, $3 scratch, $4 name@version, $5 file for the audit's stderr.
+# Returns the audit's status.
+safe_gate_project_lane_audit_identity() {
+  local audit="$1" core="$2" scratch="$3" spec="$4" errfile="$5" rc=0 word call_dir socket_budget fresh_budget leash
+  local -a envs=()
+  command -v timeout >/dev/null 2>&1 || return 126
+  call_dir="$(mktemp -d "${scratch}/audit-call.XXXXXX" 2>/dev/null)" || return 125
+  while IFS= read -r word; do [[ -z "${word}" ]] || envs+=("${word}"); done < <(safe_gate_project_lane_store_env)
+  socket_budget="$(safe_gate_socket_budget)"; fresh_budget="$(safe_gate_socket_fresh_scan_budget)"
+  leash="$(safe_gate_audit_leash_seconds "${socket_budget}" "${fresh_budget}")"
+  env -u SAFE_AUDIT_SOCKET_CONSENT -u SAFE_AUDIT_RESULT_OUT -u SAFE_AUDIT_ARTIFACT_LOCKFILE "${envs[@]}" TMPDIR="${call_dir}" SAFE_CORE_BIN="${core}" \
+    SAFE_AUDIT_SOCKET_TIMEOUT="${socket_budget}" SAFE_AUDIT_SOCKET_FRESH_SCAN_TIMEOUT="${fresh_budget}" \
+    timeout --kill-after=2s "${leash}" "${audit}" package-audit "${spec}" --ecosystem npm --gate install --op install \
+    </dev/null >/dev/null 2>"${errfile}" || rc=$?
+  rm -rf -- "${call_dir}"
+  return "${rc}"
+}
+
+# The receipt (install-known) the store holds for an exact identity, as JSON, or "null". Read from the lane's store root.
+safe_gate_project_lane_receipt() { # <name> <version>
+  local file
+  file="$(dirname -- "$(safe_gate_trust_store_file host-allow.json)")/install-known.json"
+  jq -c --arg k "npm:$1" --arg v "$2" '(.packages[$k] // null) | if . != null and .version == $v then . else null end' "${file}" 2>/dev/null || printf 'null'
+}
+
+# The identities, at most this many per command, the lane asks today's audit to AUDIT after a verified publication. (There is
+# no limit on the receipts revoked: that is local and can only remove.)
+safe_gate_project_lane_audit_bound() { printf 16; }
+
+# After a verified, published tree (never before): ask today's audit about each NAMED ROOT the decision left eligible and the
+# binder reported present in the tree it published (`verification.present_direct`: the lane does not look at the tree again).
+# That audit records, or does not, by its own evidence and rules; the lane compares the receipt before and after and says what
+# changed, and prints a block or an adverse result the audit sees on a root that was just installed as a finding of its own
+# (the installation is done: the operator must be told which package and why). The exit of the command is not changed.
+# $1 audit, $2 core, $3 report, $4 scratch, $5 the binder's document.
+safe_gate_project_lane_audit_roots() {
+  local audit="$1" core="$2" report="$3" scratch="$4" bind="$5" word name version host n=0 skipped=0 absent=0 rc before after errfile label
+  jq -e '(.records | type == "array") and (.records | length > 0)' "${report}" >/dev/null 2>&1 || return 0
+  while IFS=$'\t' read -r name version host; do
+    [[ -n "${name}" ]] || continue
+    if ! jq -e --arg n "${name}" --arg v "${version}" 'any(.verification.present_direct[]?; .name == $n and .version == $v)' "${bind}" >/dev/null 2>&1; then
+      absent=$((absent + 1))
+      continue
+    fi
+    if (( n >= $(safe_gate_project_lane_audit_bound) )); then skipped=$((skipped + 1)); continue; fi
+    n=$((n + 1))
+    label="$(safe_gate_lane_clean "${name}@${version}")"
+    before="$(safe_gate_project_lane_receipt "${name}" "${version}")"
+    errfile="${scratch}/audit-${n}.err"
+    rc=0
+    safe_gate_project_lane_audit_identity "${audit}" "${core}" "${scratch}" "${name}@${version}" "${errfile}" || rc=$?
+    after="$(safe_gate_project_lane_receipt "${name}" "${version}")"
+    case "${rc}" in
+      20|10)
+        # a block, or an adverse result, on a root that is installed: said as a finding, with the audit's own words
+        safe_gate_err "safe: project lane: FINDING: ${label} is installed, and today's audit now reports $( (( rc == 20 )) && printf 'a BLOCK' || printf 'an adverse result') (exit ${rc}); the installation is done and the command's exit is unchanged"
+        while IFS= read -r word; do
+          [[ -n "${word}" ]] && safe_gate_err "safe: project lane: FINDING: ${label}: $(safe_gate_lane_clean "${word}")"
+        done < <(grep -E 'BLOCK|WARN|advisory|malware|blocklist|critical|Socket' "${errfile}" 2>/dev/null | head -n 4)
+        ;;
+    esac
+    if [[ "${after}" == "${before}" ]]; then
+      if [[ "${after}" == null ]]; then
+        safe_gate_err "safe: project lane: today's audit recorded nothing for ${label} (status ${rc})"
+      else
+        safe_gate_err "safe: project lane: today's audit left the receipt of ${label} unchanged as $(jq -r '.verdict' <<<"${after}" 2>/dev/null) (status ${rc})"
+      fi
+    elif [[ "${after}" == null ]]; then
+      safe_gate_err "safe: project lane: today's audit REMOVED the receipt of ${label} (status ${rc})"
+    else
+      safe_gate_err "safe: project lane: today's audit wrote the receipt of ${label}: $(jq -r '.verdict' <<<"${after}" 2>/dev/null) (was $(jq -r '.verdict // "none"' <<<"${before}" 2>/dev/null); status ${rc})"
+    fi
+  done < <(jq -r '.records[] | [.name, .version, .host] | @tsv' "${report}" 2>/dev/null)
+  (( absent == 0 )) || safe_gate_err "safe: project lane: ${absent} eligible named root(s) are not among the direct packages the binder verified in the published tree, so none was audited for a record"
+  (( skipped == 0 )) || safe_gate_err "safe: project lane: ${skipped} more named root(s) were not audited for a record (at most $(safe_gate_project_lane_audit_bound) per command)"
+  return 0
+}
+
+# When the decision established adverse evidence on an artifact (the identity the evidence is on and the artifact whose bytes
+# carry it), the receipts of those exact artifacts are REMOVED, by `safe audit lane-revoke`: a local operation that only
+# removes (it never audits, never reaches the network, and cannot create, promote or refresh a receipt), bound to the exact
+# version and source. No limit on their number. Operator approvals are not receipts and are untouched.
+# $1 audit, $2 report, $3 scratch.
+safe_gate_project_lane_revoke() {
+  local audit="$1" report="$2" scratch="$3" rc=0 count name version
+  jq -e '(.adverse | type == "array") and (.adverse | length > 0)' "${report}" >/dev/null 2>&1 || return 0
+  jq -c '{identities: [.adverse[] | {name, version, host}]}' "${report}" >"${scratch}/revoke-request.json" 2>/dev/null || return 0
+  safe_gate_project_lane_store_call "${audit}" lane-revoke "${scratch}/revoke-request.json" "${scratch}/revoke-out.json" "$(safe_gate_project_lane_socket_deadline cache)" || rc=$?
+  if (( rc != 0 )) || ! jq -e '.revoked | type == "array"' "${scratch}/revoke-out.json" >/dev/null 2>&1; then
+    safe_gate_err "safe: project lane: receipts this command's evidence supersedes could not be revoked (status ${rc}); they may still be exported"
+    return 0
+  fi
+  while IFS=$'\t' read -r name version; do
+    [[ -n "${name}" ]] && safe_gate_err "safe: project lane: the receipt of $(safe_gate_lane_clean "${name}@${version}") was revoked: this command's evidence supersedes it"
+  done < <(jq -r '.revoked[] | [.name, .version] | @tsv' "${scratch}/revoke-out.json")
+  count="$(jq -r '.revoked | length' "${scratch}/revoke-out.json")"
+  : "${count}"
+  return 0
+}
+
 # A decision report that is complete and consistent, or nothing: ONE document,
 # every member the rendering reads, the exit status the outcome's, and a
 # "clear" only when nothing is outstanding anywhere (no class, no coverage gap,
@@ -4486,6 +4656,8 @@ safe_gate_project_lane_report_ok() {
     and ($r.cooldown | type == "object") and ($r.cooldown.days | type == "number") and ($r.cooldown.waits | type == "array")
     and ($r.cooldown.waived | type == "array") and ($r.cooldown.missing | type == "array")
     and ($r.socket | type == "object") and ($r.socket.roots | type == "array")
+    and ($r.records | type == "array") and (if $rc == 0 then true else ($r.records | length) == 0 end)
+    and ($r.adverse | type == "array") and ($r.wanted | type == "array")
     and ($r.outcome.exit == $rc)
     and (($r.outcome.status == "clear") == ($rc == 0))
     and (if $rc == 0 then
@@ -4568,16 +4740,16 @@ safe_gate_project_lane_outcome_text() {
         | "the projected graph holds \(.bindability.unbound | length) entry(ies) safe cannot bind (\($u.name // $u.path)@\($u.version // "?"): \($u.reason))|the lane has no route for an unbound graph yet; no file was written"
       elif $o.class == "malice" then
         (.malice[0]) as $m
-        | "\(if $m.signal == "blocklist" then "blocklist entry" elif $m.signal == "socket_block" then "Socket BLOCK" else "known-malware record" end) on \($m.name)@\($m.versions | join(",")) (\($m.id // $m.reason))\(if (.malice | length) > 1 then " and \((.malice | length) - 1) more" else "" end)|remove it from the dependency graph; the project lane offers no override yet"
+        | "\(if $m.signal == "blocklist" then "blocklist entry" elif $m.signal == "socket_block" then "Socket BLOCK" else "known-malware record" end) on \($m.name)@\($m.versions | join(",")) (\($m.id // $m.reason))\(if (.malice | length) > 1 then " and \((.malice | length) - 1) more" else "" end)|remove it from the dependency graph; nothing clears malice"
       elif $o.class == "blocking_advisory" then
         (gating("blocking")) as $a
-        | "the command introduces a blocking advisory: \(ident($a[0])) carries \($a[0].id) (\($a[0].severity))\(if ($a | length) > 1 then " and \(($a | length) - 1) more" else "" end)|choose a version without it; the project lane has no acceptance step yet"
+        | "the command introduces a blocking advisory: \(ident($a[0])) carries \($a[0].id) (\($a[0].severity))\(if ($a | length) > 1 then " and \(($a | length) - 1) more" else "" end)|choose a version without it, or have the operator accept that exact artifact (a local exact approval or a followed advisory override); the terminal prompt of the lane comes with the operator-terminal ticket"
       elif $o.class == "adverse_advisory" then
         (gating("adverse")) as $a
-        | "the command introduces a high-severity advisory: \(ident($a[0])) carries \($a[0].id) (\($a[0].severity))\(if ($a | length) > 1 then " and \(($a | length) - 1) more" else "" end)|choose a version without it; the project lane has no acceptance step yet"
+        | "the command introduces a high-severity advisory: \(ident($a[0])) carries \($a[0].id) (\($a[0].severity))\(if ($a | length) > 1 then " and \(($a | length) - 1) more" else "" end)|choose a version without it, or have the operator accept that exact artifact (a local exact approval, a followed grant or a followed install allowance); the terminal prompt of the lane comes with the operator-terminal ticket"
       elif $o.class == "wait" then
         ([.cooldown.waits[] | select(.cleared | not)]) as $w
-        | "\($w[0].name)@\($w[0].version) \(if $w[0].bounded then "has no publish time of its own in the registry'"'"'s document (last modified \($w[0].published)), so it may be inside the \(.cooldown.days)-day cooldown; it is certainly old enough on \($w[0].installable)" else "was published \($w[0].published) and is inside the \(.cooldown.days)-day cooldown; it becomes installable on \($w[0].installable)" end)\(if $w[0].enforced then " (it fixes \($w[0].remediates | join(", ")), but install.cooldown_security_fix is enforce)" else "" end)\(if ($w | length) > 1 then " (and \(($w | length) - 1) more)" else "" end)|retry on or after that date, or name an older exact version; the project lane has no acceptance step for a wait yet"
+        | "\($w[0].name)@\($w[0].version) \(if $w[0].bounded then "has no publish time of its own in the registry'"'"'s document (last modified \($w[0].published)), so it may be inside the \(.cooldown.days)-day cooldown; it is certainly old enough on \($w[0].installable)" else "was published \($w[0].published) and is inside the \(.cooldown.days)-day cooldown; it becomes installable on \($w[0].installable)" end)\(if $w[0].enforced then " (it fixes \($w[0].remediates | join(", ")), but install.cooldown_security_fix is enforce)" else "" end)\(if ($w | length) > 1 then " (and \(($w | length) - 1) more)" else "" end)|retry on or after that date, or name an older exact version; a standing acceptance of that exact artifact also clears it; the terminal prompt of the lane comes with the operator-terminal ticket"
       elif $o.class == "socket_root" then
         ([.socket.roots[] | select(.cleared | not)] | (map(select(.exit == $o.exit)) + .)[0]) as $r
         | ([.socket.roots[] | select(.cleared | not)] | length) as $n
@@ -5712,7 +5884,7 @@ safe_gate_project_lane_run() {
     return $?
   }
   rc=0
-  "${safe_core}" project-decide "${baseline_args[@]}" --evidence "${evidence}" --releases "${releases}" --socket "${socket}" "${proj}/package-lock.json" >"${report}" 2>"${scratch}/decide.err" || rc=$?
+  safe_gate_project_lane_judge "${safe_core}" "${lane_audit}" "${scratch}" "${scratch}/target-graph.json" "${report}" "${baseline_args[@]}" --evidence "${evidence}" --releases "${releases}" --socket "${socket}" "${proj}/package-lock.json" || rc=$?
   if (( rc != 104 )); then
     # no block established: the publish times are read. A reader that fails, or whose document is not whole, leaves
     # the readings MISSING (102), applied after the evidence like any other missing evidence.
@@ -5769,13 +5941,13 @@ safe_gate_project_lane_run() {
     fi
     # The evidence reaches the decision exactly as the reader wrote it.
     rc=0
-    "${safe_core}" project-decide "${baseline_args[@]}" --evidence "${evidence}" --releases "${releases}" --socket "${socket}" "${proj}/package-lock.json" >"${report}" 2>"${scratch}/decide.err" || rc=$?
+    safe_gate_project_lane_judge "${safe_core}" "${lane_audit}" "${scratch}" "${scratch}/target-graph.json" "${report}" "${baseline_args[@]}" --evidence "${evidence}" --releases "${releases}" --socket "${socket}" "${proj}/package-lock.json" || rc=$?
     if (( rc == 3 )) && [[ -z "${releases_failure}" ]]; then
       # the decision could not read the reader's document: the evidence is judged all the same, the readings missing
       releases_failure="the decision could not read the reader's document"
       if safe_gate_project_lane_releases_missing "${release_request}" "${releases_failure}" "${releases}"; then
         rc=0
-        "${safe_core}" project-decide "${baseline_args[@]}" --evidence "${evidence}" --releases "${releases}" --socket "${socket}" "${proj}/package-lock.json" >"${report}" 2>"${scratch}/decide.err" || rc=$?
+        safe_gate_project_lane_judge "${safe_core}" "${lane_audit}" "${scratch}" "${scratch}/target-graph.json" "${report}" "${baseline_args[@]}" --evidence "${evidence}" --releases "${releases}" --socket "${socket}" "${proj}/package-lock.json" || rc=$?
       fi
     fi
   fi
@@ -5787,6 +5959,8 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_refuse 102 "${verb}" "the decision returned an incomplete or inconsistent report (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
     return $?
   fi
+  # Adverse evidence on an exact identity: a receipt it supersedes is revoked by today's own audit, whatever this command's end.
+  safe_gate_project_lane_revoke "${lane_audit}" "${report}" "${scratch}"
   # The versioned differential is kept in safe's data directory, which is
   # established private first; a failure to keep it is said, not hidden.
   local reports="${lane_dir}/reports"
@@ -5948,6 +6122,10 @@ safe_gate_project_lane_run() {
   safe_gate_lane_render "${scratch}/bind.err"
   safe_gate_project_lane_bind_result "${verb}" "${bind_rc}" "${scratch}/bind.json" "${lock_only}"
   rc=$?
+  if (( rc == 0 && ! lock_only )); then
+    # the tree is verified and published: only now are the install records written
+    safe_gate_project_lane_audit_roots "${lane_audit}" "${safe_core}" "${report}" "${scratch}" "${scratch}/bind.json"
+  fi
   if (( rc == 0 && lock_only )); then
     safe_gate_err "safe: project lane: --package-lock-only: the judged package.json and package-lock.json were published; no tree was installed"
   fi

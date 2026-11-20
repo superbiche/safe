@@ -8464,6 +8464,98 @@ record_installed_command() {
     "$ecosystem" "$name" "$version" "$verdict" >&2
 }
 
+# --- the project lane's acceptances and install records ------------------------------------------------------------------
+#
+# `lane-acceptances` is the lane's read-only door into the operator's own stores. It adds no store, format or trust rule: it
+# calls the readers today's install gate calls, on the artifacts the decision left at stake, on the store root the caller
+# pinned. There is NO command that turns a caller's statement into a receipt: the lane asks the ordinary audit
+# (`package-audit --gate install`) about a named root, and that audit records or revokes by its own evidence.
+#
+#   lane-acceptances < {"candidates":[{"name","version","host","blocking_advisories":[ids]}]}
+#       -> {"schema_version":1,"acceptances":[{kind,name,version,host,advisories,causes}]}
+lane_acceptances_command() {
+  local input candidates out='[]' cand name version host ids eco=npm tol='[]' auto_allow=true cfg
+  if [[ -t 0 ]]; then die "lane-acceptances: the request is read from stdin; refusing to wait on a terminal"; fi
+  input=$(cat 2>/dev/null) || input=""
+  if ! jq -e '(type == "object") and ((.candidates | type) == "array")
+      and ([.candidates[] | (.name | type == "string") and (.version | type == "string") and (.host | type == "string")
+            and ((.blocking_advisories | type) == "array") and ([.blocking_advisories[] | type == "string"] | all)] | all)' \
+      <<<"$input" >/dev/null 2>&1; then
+    die "lane-acceptances: expected {\"candidates\":[{\"name\",\"version\",\"host\",\"blocking_advisories\":[...]}]} on stdin"
+  fi
+  # a followed pin, approval or tolerance is the operator's authority only from the canonical store (or a blessed redirect)
+  trust_grant_ok "lane acceptances" || { printf '{"schema_version":1,"acceptances":[]}\n'; return 0; }
+  CHECK_EFFECTIVE_SOURCES=""
+  cfg="$(trust_store_file config.json)"
+  if [[ -r "$cfg" ]]; then
+    auto_allow=$(jq -r 'if .install.auto_allow == false then "false" else "true" end' "$cfg" 2>/dev/null) || auto_allow=true
+    tol=$(jq -c '((.install.auto_allow_tolerate // []) | if type == "array" then map(tostring) else [] end)' "$cfg" 2>/dev/null) || tol='[]'
+  fi
+  while IFS= read -r cand; do
+    name=$(jq -r '.name' <<<"$cand"); version=$(jq -r '.version' <<<"$cand"); host=$(jq -r '.host' <<<"$cand")
+    ids=$(jq -c '.blocking_advisories' <<<"$cand")
+    [[ -n "$name" && -n "$version" && -n "$host" ]] || continue
+    # the approvals and pins read here are bound to the default registry source (implicit-default): an artifact from any other
+    # host is never given an authority that was granted for another source
+    [[ "${host,,}" == "registry.npmjs.org" ]] || continue
+    # a local exact approval: the source-bound consent, or an exact local host-allow pin (never a followed copy)
+    if local_install_approval_matches "$eco" "$name" "$version" || local_host_allow_matches_resolved "$eco" "$name" "$version"; then
+      out=$(jq -c --arg n "$name" --arg v "$version" --arg h "$host" '. + [{kind:"local_exact_approval",name:$n,version:$v,host:$h,advisories:[],causes:[]}]' <<<"$out")
+    fi
+    # a followed grant, and the followed advisory override that rides on it (covers every blocking advisory or none)
+    HOST_ALLOW_RESOLVED_VERSION=""
+    if host_allow_matches_resolved "$eco" "$name" "$version" && followed_grant_lookup "$eco" "$name" "$version"; then
+      out=$(jq -c --arg n "$name" --arg v "$version" --arg h "$host" '. + [{kind:"followed_grant",name:$n,version:$v,host:$h,advisories:[],causes:[]}]' <<<"$out")
+      if [[ "$ids" != "[]" ]] && followed_block_override_covers "$eco" "$name" "$version" "$ids"; then
+        out=$(jq -c --arg n "$name" --arg v "$version" --arg h "$host" --argjson ids "$ids" \
+          '. + [{kind:"followed_advisory_override",name:$n,version:$v,host:$h,advisories:$ids,causes:[]}]' <<<"$out")
+      fi
+    fi
+    # a followed install allowance (no pin needed, never a BLOCK: the decision's table says so)
+    if [[ -f "$(followed_grant_ledger_file)" ]] && followed_install_lookup "$eco" "$name" "$version"; then
+      out=$(jq -c --arg n "$name" --arg v "$version" --arg h "$host" '. + [{kind:"followed_install_allowance",name:$n,version:$v,host:$h,advisories:[],causes:[]}]' <<<"$out")
+    fi
+    # the standing tolerance
+    if [[ "$auto_allow" == "true" && "$tol" != "[]" ]]; then
+      out=$(jq -c --arg n "$name" --arg v "$version" --arg h "$host" --argjson c "$tol" '. + [{kind:"local_tolerance",name:$n,version:$v,host:$h,advisories:[],causes:$c}]' <<<"$out")
+    fi
+  done < <(jq -c '.candidates[]' <<<"$input")
+  jq -cn --argjson a "$out" '{schema_version: 1, acceptances: $a}'
+}
+
+# `lane-revoke`: the project lane's REMOVE-ONLY operation on the install receipts. It takes exact identities (name, version,
+# host) on stdin and removes the receipt of each through revoke_install_known, the function today's audit calls when its
+# evidence supersedes a receipt. It never audits, never touches the network and never calls a writer of receipts or approvals:
+# every path through it deletes an entry or does nothing, so it grants nothing, and it can neither create, promote nor refresh
+# a receipt. A receipt is removed only when its version is the one asked and its source is implicit-default (the source of an
+# artifact of the default registry); an identity from any other host, or whose receipt is of another source, is left alone.
+# Operator approvals (the `.approvals` map) are not receipts and are untouched. No limit on the number of identities.
+#   lane-revoke < {"identities":[{"name","version","host"}]}  ->  {"revoked":[{"name","version"}]}
+lane_revoke_command() {
+  local input item name version host file revoked='[]'
+  if [[ -t 0 ]]; then die "lane-revoke: the request is read from stdin; refusing to wait on a terminal"; fi
+  input=$(cat 2>/dev/null) || input=""
+  if ! jq -e '(type == "object") and ((.identities | type) == "array")
+      and ([.identities[] | (.name | type == "string") and (.version | type == "string") and (.host | type == "string")] | all)' \
+      <<<"$input" >/dev/null 2>&1; then
+    die "lane-revoke: expected {\"identities\":[{\"name\",\"version\",\"host\"}]} on stdin"
+  fi
+  file="$INSTALL_KNOWN_FILE"
+  if [[ -f "$file" ]]; then
+    while IFS= read -r item; do
+      name=$(jq -r '.name' <<<"$item"); version=$(jq -r '.version' <<<"$item"); host=$(jq -r '.host' <<<"$item")
+      [[ -n "$name" && -n "$version" && "${host,,}" == "registry.npmjs.org" ]] || continue
+      jq -e --arg k "npm:$name" --arg v "$version" '(.packages[$k] // null) as $r
+        | $r != null and $r.version == $v and (($r.source // "implicit-default") == "implicit-default")' "$file" >/dev/null 2>&1 || continue
+      revoke_install_known npm "$name" "$version"
+      if ! jq -e --arg k "npm:$name" --arg v "$version" '(.packages[$k] // null) | . != null and .version == $v' "$file" >/dev/null 2>&1; then
+        revoked=$(jq -c --arg n "$name" --arg v "$version" '. + [{name: $n, version: $v}]' <<<"$revoked")
+      fi
+    done < <(jq -c '.identities[]' <<<"$input")
+  fi
+  jq -cn --argjson r "$revoked" '{revoked: $r}'
+}
+
 # Plumbing for the stale-evidence readers (install wrappers, bin/safe,
 # gate-lib): print the discriminated source identity this invocation would
 # audit under. Local-only — env + rc files, no network. Keeping the readers
@@ -12581,6 +12673,19 @@ main() {
       lockfile_support_command "$@"
       return 0
       ;;
+    # The project lane's own doors into the operator's stores (see lane_acceptances_command): neither initialises
+    # anything.
+    lane-acceptances)
+      shift
+      lane_acceptances_command "$@"
+      return 0
+      ;;
+    lane-revoke)
+      shift
+      lane_revoke_command "$@"
+      return 0
+      ;;
+
   esac
   # The evidence-only reading (the project lane's) writes nothing, a cold start included: it is dispatched before the
   # initialisation that creates the registries, the host-allow log and the directories.

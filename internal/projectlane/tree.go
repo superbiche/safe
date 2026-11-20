@@ -145,8 +145,19 @@ type TreeReport struct {
 	Checked       int           `json:"checked"`
 	Absent        int           `json:"absent_deselected"`
 	Problems      []TreeProblem `json:"problems"`
+	// Present are the DIRECT packages (node_modules/<name> at the top level) the verification found in the tree, each
+	// checked against its lockfile name and version: what a caller may take as installed, and the only list of it. It is
+	// empty when the verification fails.
+	Present []TreePresent `json:"present_direct"`
 	// Limits says what a passing verification does not attest.
 	Limits []string `json:"limits"`
+}
+
+// TreePresent is one direct package the verified tree holds.
+type TreePresent struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Path    string `json:"path"`
 }
 
 // VerifierLimits is the statement carried by every tree report: the verifier
@@ -500,7 +511,7 @@ func verifyTree(lockfile []byte, treeParent, treeRoot string, selection Selectio
 		return TreeReport{}, fmt.Errorf("%q is not a directory", checked)
 	}
 	v := &verifier{root: treeParent, treeRoot: treeRoot, lock: lock, sel: selection, seen: map[string]bool{}, present: map[string]bool{}}
-	report := TreeReport{SchemaVersion: TreeSchema, Selection: selection.normalized(), Problems: []TreeProblem{}, Limits: append([]string{}, VerifierLimits...)}
+	report := TreeReport{SchemaVersion: TreeSchema, Selection: selection.normalized(), Problems: []TreeProblem{}, Present: []TreePresent{}, Limits: append([]string{}, VerifierLimits...)}
 	v.report = &report
 	v.run()
 	sort.SliceStable(report.Problems, func(i, j int) bool {
@@ -511,6 +522,15 @@ func verifyTree(lockfile []byte, treeParent, treeRoot string, selection Selectio
 		return a.Problem < b.Problem
 	})
 	report.Ok = len(report.Problems) == 0
+	if report.Ok {
+		for _, key := range lock.paths {
+			entry := lock.entries[key]
+			if !v.present[key] || !strings.HasPrefix(key, "node_modules/") || strings.Contains(strings.TrimPrefix(key, "node_modules/"), "node_modules/") {
+				continue
+			}
+			report.Present = append(report.Present, TreePresent{Name: entry.expectedName, Version: entry.Version, Path: key})
+		}
+	}
 	return report, nil
 }
 

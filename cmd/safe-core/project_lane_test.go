@@ -159,7 +159,7 @@ func TestProjectDecideExitIsTheOutcomesAndAcceptancesAreSeparate(t *testing.T) {
  "blocklist":[]}`)
 	approval := func(name string) string {
 		path := filepath.Join(dir, "acceptances-"+name+".json")
-		doc := `{"schema_version":1,"acceptances":[{"kind":"local_exact_approval","name":"` + name + `","version":"1.0.0","host":"registry.npmjs.org","advisories":[]}]}`
+		doc := `{"schema_version":1,"acceptances":[{"kind":"local_exact_approval","name":"` + name + `","version":"1.0.0","host":"registry.npmjs.org","advisories":[],"causes":[]}]}`
 		if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
 			t.Fatal(err)
 		}

@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- Project lane (still behind `install.project_lane`): standing acceptances and install records, **no terminal prompt**. The
+  decision takes the operator's standing acceptances (a local exact approval or pin, a followed grant, a followed install
+  allowance, a followed advisory override with its signer, generation, ecosystem and source checks, the
+  `install.auto_allow_tolerate` tolerance), read by safe's own read-only reader (`safe audit lane-acceptances`: the same
+  functions as today's install gate, default registry host only) from the stores where the lane reads its switch, for the
+  artifacts a first decision leaves outstanding. A local approval clears a blocking advisory; a followed install allowance does
+  not; a followed override clears it only when it covers every blocking advisory under the bytes of the artifact (a bundled
+  member's included); a tolerance clears a wait or a Socket warning only on an artifact with no affecting advisory; adverse
+  advisories, waits and Socket outcomes on a named root are cleared by the authorities of today's adverse warning; nothing
+  clears malice, an unbound graph or missing evidence. **The lane writes no record itself and takes no verdict from its
+  caller.** After a verified, published tree (never for a refusal, a failed materialisation, `--dry-run` or
+  `--package-lock-only`) it asks today's auditor to audit, by its ordinary path, each named root the decision left eligible
+  and the tree holds; that audit records or does not by its own rules (clean receipts switched off, Socket not consulted, a
+  tolerance, a followed authority), and the lane reports what the store holds. When the decision establishes adverse evidence
+  on an artifact, the receipts of that identity and of the artifact whose bytes carry it are removed by a local operation that only
+  removes (`safe audit lane-revoke`: it never audits and cannot create, promote or refresh a receipt; no limit on their
+  number); the audits that can write run only after a verified publication, for the named roots the binder reports present in
+  the tree it published (`verification.present_direct`), at most 16 per command, with the publish time required only when a
+  cooldown is set. A followed override must cover every blocking advisory under the bytes once one is introduced; the tolerance
+  is vetoed by an advisory on a bundled member; the report says whether the audit wrote, left unchanged or removed a receipt,
+  and a block seen on a root just installed is a finding of its own.
+  Nothing is recorded for a transitive package nobody named, nor for another authority's decision, so a follower never
+  re-exports an authority. The operator-confirmed named root is the operator-terminal ticket's.
+
 - Project lane (still behind `install.project_lane`): Socket on the named roots. The projected root is scored by Socket
   as today's per-root audit scores it (each named operand tied to its direct occurrence in the projected lockfile, so
   `pkg@1.0.0+build.1` scores `1.0.0`; an operand that cannot be tied is missing evidence): one call of the auditor
