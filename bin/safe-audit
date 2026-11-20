@@ -9476,8 +9476,103 @@ private_python_project_command() {
   return 0
 }
 
+# --- the evidence-only mode of package-audit (the project lane's named roots) ----------------------------------------
+#
+# `package-audit --evidence-only` collects what today's per-root audit collects and decides with the SAME verdict
+# engine, then REPORTS the Socket facts and stops. It asks nothing (no prompt, stdin is closed, a consent ask is
+# a fact: consent_required), decides nothing (the verdict is not applied: the lane's decision is safe-core's) and
+# writes no record: no check file, no receipt, no install-known entry, no consent, no host-allow or followed-grant
+# record, nothing exported. It returns before the first of those writes (package_audit_command: the emit point
+# sits before `result_json` is made). What it may touch is what any reading touches: the scratch directory it
+# removes and Socket's own result cache.
+#
+#   package-audit <name>@<version> --ecosystem npm --evidence-only       one root, one document
+#   package-audit --ecosystem npm --evidence-only < {"roots":[...],"cached":[...]}
+#       the batch the lane calls ONCE: every root is audited in this process (never one safe-audit process per
+#       artifact); `cached` are identities whose Socket result is read from the cache alone, no call.
+#
+# A root's document carries the Socket outcome the gate would take for it, by the auditor's own rules: the Socket
+# causes of the verdict, the consent and pending states, and gate_exit, the exit the install gate takes for that
+# Socket result alone (0 clear, 10 adverse, 11 infrastructure, 12 rate limit, 13 consent, 14 pending, 20 block).
+package_audit_evidence_emit() { # name version resolved line causes_json consent pending cached
+  local name="$1" version="$2" resolved="$3" line="$4" causes="$5" consent="$6" pending="$7" cached="$8"
+  local socket_causes outcome gate_exit
+  socket_causes=$(jq -c '[.[] | select(startswith("socket_"))]' <<<"$causes" 2>/dev/null) || socket_causes='[]'
+  if [[ "$resolved" != "true" ]]; then
+    outcome=unavailable; gate_exit=11
+  elif jq -e 'index("socket_malware") != null' <<<"$socket_causes" >/dev/null 2>&1; then
+    outcome=blocked; gate_exit=20
+  elif [[ "$consent" == "true" ]]; then
+    outcome=consent_required; gate_exit=13
+  elif [[ "$pending" == "true" ]]; then
+    outcome=pending; gate_exit=14
+  elif [[ "$socket_causes" == "[]" ]]; then
+    outcome=clear; gate_exit=0
+  elif jq -e 'all(.[]; . == "socket_rate_limited")' <<<"$socket_causes" >/dev/null 2>&1; then
+    outcome=rate_limited; gate_exit=12
+  elif gate_warn_is_infra_only "$socket_causes"; then
+    outcome=unavailable; gate_exit=11
+  else
+    outcome=adverse; gate_exit=10
+  fi
+  jq -cn --arg name "$name" --arg version "$version" --arg outcome "$outcome" --argjson gate_exit "$gate_exit" \
+    --arg line "$line" --argjson causes "$socket_causes" --argjson cached "$cached" \
+    '{name: $name, version: $version, outcome: $outcome, gate_exit: $gate_exit, line: $line, causes: $causes, cached: $cached}'
+}
+
+package_audit_evidence_batch() {
+  local ecosystem="${1:-npm}" input roots='[]' blocks='[]' cache_gap="" root_json rc spec name version doc
+  input=$(cat 2>/dev/null) || input=""
+  if ! jq -e '(type == "object") and ((.roots | type) == "array") and ((.cached | type) == "array")
+      and ([.roots[], .cached[] | (.name | type == "string") and (.version | type == "string") and (.name | length > 0) and (.version | length > 0)] | all)' \
+      <<<"$input" >/dev/null 2>&1; then
+    die "package-audit --evidence-only: expected {\"roots\":[{\"name\":..,\"version\":..}],\"cached\":[...]} on stdin"
+  fi
+  while IFS= read -r root_json; do
+    name=$(jq -r '.name' <<<"$root_json"); version=$(jq -r '.version' <<<"$root_json")
+    rc=0
+    # one subshell per root, in THIS process: closed stdin (nothing can be asked), its own failure contained
+    doc=$( ( package_audit_command "${name}@${version}" --ecosystem "$ecosystem" --evidence-only ) </dev/null 2>/dev/null ) || rc=$?
+    if (( rc != 0 )) || ! jq -e '(type == "object") and .name == "'"$name"'" and (.outcome | type == "string")' <<<"$doc" >/dev/null 2>&1; then
+      doc=$(jq -cn --arg name "$name" --arg version "$version" --arg line "audit infrastructure unavailable (the evidence reader exited ${rc})" \
+        '{name: $name, version: $version, outcome: "unavailable", gate_exit: 11, line: $line, causes: [], cached: false}')
+    fi
+    roots=$(jq -c --argjson d "$doc" '. + [$d]' <<<"$roots")
+  done < <(jq -c '.roots[]' <<<"$input")
+  # the cache alone, no call: a blocking Socket result already cached for an artifact counts, named or not
+  if [[ "$(jq '.cached | length' <<<"$input")" != 0 ]]; then
+    blocks=$(package_audit_cached_blocks "$ecosystem" "$(jq -c '.cached' <<<"$input")") || { blocks='[]'; cache_gap="the Socket cache could not be read"; }
+  fi
+  jq -cn --argjson roots "$roots" --argjson blocks "$blocks" --arg gap "$cache_gap" \
+    '{schema_version: 1, roots: $roots, cached_blocks: $blocks, cache_gap: $gap}'
+}
+
+# The identities among $2 (a JSON list of {name,version}) whose Socket result is in the cache, replayed by the
+# auditor's own replay (socket_cache_replay) and classified by its own classifier (socket_classify); the blocking
+# ones (class malware: a critical supply-chain-risk alert) are printed as [{name,version,line}]. No call is made.
+package_audit_cached_blocks() {
+  local ecosystem="$1" wanted="$2" dir hits tmp out='[]' line name version class
+  dir=$(socket_cache_dir)
+  [[ -d "$dir" ]] || { printf '[]\n'; return 0; }
+  # one pass over the entries finds the few that name a wanted identity (the cache is small, the graph is not)
+  hits=$(find "$dir" -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null | xargs -0 -r jq -c --argjson want "$wanted" --arg eco "$ecosystem" '
+    select((.identity.ecosystem? // "") == $eco) | .identity as $i
+    | select($want | any(.name == $i.name and .version == $i.version)) | {name: $i.name, version: $i.version}' 2>/dev/null | sort -u) || return 1
+  [[ -n "$hits" ]] || { printf '[]\n'; return 0; }
+  tmp=$(mktemp "${TMPDIR:-/tmp}/safe-evidence-cache.XXXXXX") || return 1
+  while IFS= read -r line; do
+    name=$(jq -r '.name' <<<"$line"); version=$(jq -r '.version' <<<"$line")
+    socket_cache_replay "$ecosystem" "$name" "$version" "$tmp" || continue
+    class=$(socket_classify "$tmp")
+    [[ "$class" == "malware" ]] || continue
+    out=$(jq -c --arg n "$name" --arg v "$version" '. + [{name: $n, version: $v, line: "BLOCK (critical supply-chain-risk alert)"}]' <<<"$out")
+  done <<<"$hits"
+  rm -f "$tmp"
+  printf '%s\n' "$out"
+}
+
 package_audit_command() {
-  local ecosystem="" json_mode=0 spec="" op="install" gate=""
+  local ecosystem="" json_mode=0 spec="" op="install" gate="" evidence_only=0
   # Target-context selectors from the audited command line (dynamically
   # scoped: the resolver helpers read them). CHECK_EFFECTIVE_SOURCES is the
   # argv set plus any env/npmrc-configured npm source, computed at the trust
@@ -9512,6 +9607,10 @@ package_audit_command() {
         ;;
       --json)
         json_mode=1
+        shift
+        ;;
+      --evidence-only)
+        evidence_only=1
         shift
         ;;
       --find-links-selected)
@@ -9563,7 +9662,13 @@ package_audit_command() {
         ;;
     esac
   done
-  [[ -z "$spec" ]] && die "usage: safe audit package-audit <pkg>[@<version>] [--ecosystem <name>] [--installer <name>] [--op install|update] [--gate install] [--dist-tag <t>] [--registry <url>] [--project-dir <dir>] [--json]"
+  if (( evidence_only )) && [[ -z "$spec" ]]; then
+    [[ -z "$gate" ]] || die "--evidence-only takes no --gate"
+    package_audit_evidence_batch "${ecosystem:-npm}"
+    return
+  fi
+  (( ! evidence_only )) || [[ -z "$gate" ]] || die "--evidence-only takes no --gate"
+  [[ -z "$spec" ]] && die "usage: safe audit package-audit <pkg>[@<version>] [--ecosystem <name>] [--installer <name>] [--op install|update] [--gate install] [--dist-tag <t>] [--registry <url>] [--project-dir <dir>] [--json] [--evidence-only]"
   [[ "$op" == "install" || "$op" == "update" ]] || die "--op must be install or update"
   [[ -z "$gate" || "$gate" == "install" ]] || die "--gate supports only: install"
 
@@ -10172,6 +10277,18 @@ package_audit_command() {
   local warn_causes_json='[]'
   if (( ${#warn_causes[@]} > 0 )); then
     warn_causes_json=$(printf '%s\n' "${warn_causes[@]}" | jq -cR . | jq -cs .)
+  fi
+
+  # The evidence-only mode ends here: the facts are reported and nothing below this point runs. Everything
+  # below writes (the check file, the receipts, install-known, followed-grant records, local approvals) or
+  # decides (the gate's allow policy and its exits).
+  if (( evidence_only )); then
+    package_audit_evidence_emit "$PKG_NAME" "${primary_version:-}" "$( (( resolution_ok )) && printf true || printf false)" \
+      "$socket_line" "$warn_causes_json" "$( (( socket_consent_required )) && printf true || printf false)" \
+      "$( (( socket_pending )) && printf true || printf false)" \
+      "$(jq -r '(.cached // false) == true' "$socket_json" 2>/dev/null || printf false)"
+    rm -rf "$scratch"
+    return 0
   fi
 
   local result_json resolved_versions_json='[]'

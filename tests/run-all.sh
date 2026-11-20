@@ -43,6 +43,7 @@ SUITES=(
   tests/install/private_registry.sh
   tests/audit/check_version_aware.sh
   tests/audit/socket_tier.sh
+  tests/audit/evidence_only.sh
   tests/audit/tools_scan.sh
   tests/audit/smoke.sh
   tests/audit/ecosystem_audits.sh

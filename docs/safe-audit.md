@@ -652,6 +652,23 @@ decided result is also written, with `gate_exit`, to `SAFE_AUDIT_RESULT_OUT`
 when the caller sets it; the install gates use it to put the BLOCK override
 to the operator without re-running the audit.
 
+### Evidence-only mode
+
+```bash
+safe audit package-audit <pkg>@<exact version> --ecosystem npm --evidence-only          # one root, one document
+safe audit package-audit --ecosystem npm --evidence-only < {"roots":[…],"cached":[…]}  # the batch (one process)
+```
+
+The project lane's reading of Socket on the packages a command names. It collects what the per-root audit collects, with the
+same verdict engine and the same Socket cache, then reports the Socket facts and stops: it asks nothing (stdin is not
+read for an answer; a consent ask is reported as `consent_required`), decides nothing (no allow policy is applied, no
+`--gate` exit) and writes no record (no check file, receipt, install-known entry, consent, host-allow or
+followed-grant record, export). A root's document carries its `outcome` (`clear`, `adverse`, `unavailable`,
+`rate_limited`, `consent_required`, `pending`, `blocked`), `gate_exit` (the exit the install gate takes for that
+Socket result: 0, 10, 11, 12, 13, 14, 20), the Socket line, the Socket causes and whether the result came from the
+cache. The batch scores every root in the one process and, for `cached`, reads the cache alone (no call) and reports
+the blocking results found. The normal paths of `package-audit` are unchanged.
+
 ### Install gate mode
 
 The shell install wrappers and `safe install` invoke the check as a gate:

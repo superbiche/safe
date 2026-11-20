@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+outfile="" url="" data=""
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case "${args[$i]}" in
+    -o) outfile="${args[$((i + 1))]}"; i=$((i + 1)) ;;
+    -d) data="${args[$((i + 1))]}"; i=$((i + 1)) ;;
+    http*://*) url="${args[$i]}" ;;
+  esac
+done
+emit() { if [[ -n "$outfile" ]]; then cat > "$outfile"; else cat; fi; }
+case "$url" in
+  *api.osv.dev*)
+    if [[ -n "${MOCK_OSV_ECO_LOG:-}" ]]; then
+      grep -oE '"ecosystem": *"[^"]*"' <<<"$data" >> "$MOCK_OSV_ECO_LOG" 2>/dev/null || true
+    fi
+    if [[ -n "${MOCK_OSV_CRITICAL:-}" ]]; then
+      # Comma-separated ids, each a CRITICAL advisory affecting every version.
+      printf '%s' "$MOCK_OSV_CRITICAL" | tr ',' '\n' | jq -R '{id: ., database_specific: {severity: "CRITICAL"},
+        affected: [{package: {ecosystem: "npm", name: "fixture"}, ranges: [{type: "SEMVER", events: [{introduced: "0"}]}]}]}' \
+        | jq -s '{vulns: .}' | emit
+    elif [[ "${MOCK_COOLDOWN_FIX:-0}" == "1" && "$data" != *'"version"'* ]]; then
+      printf '%s\n' '{"vulns":[{"id":"GHSA-FIXED","database_specific":{"severity":"HIGH"},"affected":[{"package":{"ecosystem":"npm","name":"fixture"},"ranges":[{"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"1.0.0"}]}]}]}]}' | emit
+    else
+      printf '{"vulns":[]}\n' | emit
+    fi
+    ;;
+  *)
+    if [[ "${MOCK_RELEASE_FRESH:-0}" == "1" ]]; then
+      fresh_time="1 hour ago"
+      # MOCK_RELEASE_AGE moves the fresh release inside/outside specific
+      # windows (e.g. 4d: outside the 3d cooldown, inside the 7d Socket
+      # window) without a second fresh-packument knob.
+      [[ -n "${MOCK_RELEASE_AGE:-}" ]] && fresh_time="$MOCK_RELEASE_AGE"
+      printf '{"versions":{"1.0.0":{}},"time":{"1.0.0":"%s"}}\n' "$(date -u -d "$fresh_time" +%Y-%m-%dT%H:%M:%SZ)" | emit
+    elif [[ "${MOCK_MULTI_VERSION:-0}" == "1" ]]; then
+      # Two majors so two distinct project constraints resolve to two
+      # distinct installable versions (RESOLVED_VERSIONS length 2).
+      printf '{"versions":{"1.0.0":{},"2.0.0":{}},"dist-tags":{"latest":"2.0.0"},"time":{"1.0.0":"2020-01-01T00:00:00Z","2.0.0":"2020-06-01T00:00:00Z"}}\n' | emit
+    else
+      printf '{"versions":{"1.0.0":{}},"time":{"1.0.0":"2020-01-01T00:00:00Z"}}\n' | emit
+    fi
+    ;;
+esac

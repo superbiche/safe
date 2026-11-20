@@ -296,6 +296,19 @@ pass and warnings under `environment.release_follow`.
   `CooldownCandidates`, holds the choice); an entry the lockfile on disk carries that the baseline does not is
   introduced, and is judged. The npm must define `min-release-age-exclude` (npm 11.17.0 or later, which the
   capability probe checks on top of the 11.12.1 floor).
+  **Socket on a named root.** The artifacts the command names are scored by Socket as today's per-root audit scores
+  them, and nothing else is: one call of the auditor beside safe's dispatcher in its evidence-only mode
+  (`package-audit --evidence-only`, which asks nothing, decides nothing and writes no record), whatever the number of
+  roots, and never for an artifact from a private origin. The result is a class of the decision, after the cooldown's
+  wait and before missing evidence, with today's unattended exits and final-line wording: an adverse finding (low
+  score, alerts, no record) stops 100; a rate limit, the consent ask of a fresh release, a pending score and an
+  unavailable audit infrastructure stop 102; a critical supply-chain-risk alert is malice, 104. Every other artifact of
+  the target graph is read from Socket's cache alone, with no call: a blocking result already cached for any of them is
+  malice (104), and a cache that cannot be read is missing evidence (102), never a clean one. The lane has no terminal
+  prompt for these results yet and no acceptance clears them yet: a standing acceptance clears the class in the
+  decision, but wiring them is a later ticket, so the host-allow hint of the install gate does not apply on the lane.
+  Nothing is recorded by the Socket reading (no install-known entry, consent, receipt or export): a command that does
+  not complete leaves no install record. A named root's own advisories gate only when the command introduces them.
   A lockfile entry the frozen installation does not build (one nothing in the manifest needs) is caught by the
   binder's tree verification before anything is published, and the refusal says to run `npm install` first.
   npm's `prune` writes its lockfile in every case where one exists. Every npm run whose output the lane reads

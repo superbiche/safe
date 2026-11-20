@@ -58,6 +58,9 @@ type Input struct {
 	// Releases is the publish-time reading of the cooldown (nil: the cooldown
 	// is not judged and the report has no wait class).
 	Releases *Releases
+	// Socket is the Socket evidence of the named roots and the cached blocks (nil:
+	// Socket is not judged and the report has no socket_root class).
+	Socket *SocketEvidence
 }
 
 // Report is the decision document: everything found, classed, with what is
@@ -72,8 +75,10 @@ type Report struct {
 	Coverage      []CoverageGap  `json:"coverage"`
 	// Cooldown is the release-age judgement, present when a reading was given.
 	Cooldown *CooldownReport `json:"cooldown,omitempty"`
-	Classes  []ClassOutcome  `json:"classes"`
-	Outcome  Outcome         `json:"outcome"`
+	// Socket is the Socket judgement of the named roots, present when evidence was given.
+	Socket  *SocketReport  `json:"socket,omitempty"`
+	Classes []ClassOutcome `json:"classes"`
+	Outcome Outcome        `json:"outcome"`
 }
 
 // BaselineStatus says what the difference was taken against.
@@ -216,6 +221,25 @@ func Decide(in Input) Report {
 	report.Difference = Diff(baseline, in.Target)
 
 	report.Malice = maliceItems(in.Target, in.Evidence, evidence)
+	var socketClass *ClassOutcome
+	if in.Socket != nil {
+		blocks, socketReport, class := judgeSocket(in)
+		report.Malice = append(report.Malice, blocks...)
+		sort.Slice(report.Malice, func(i, j int) bool {
+			a, b := report.Malice[i], report.Malice[j]
+			if a.Name != b.Name {
+				return a.Name < b.Name
+			}
+			if a.Signal != b.Signal {
+				return a.Signal < b.Signal
+			}
+			return a.ID < b.ID
+		})
+		report.Socket, socketClass = &socketReport, &class
+		if in.Socket.CacheGap != "" {
+			report.Coverage = append(report.Coverage, CoverageGap{Name: "", Version: "", Sides: []string{"target"}, Gap: "socket cache not read: " + in.Socket.CacheGap})
+		}
+	}
 
 	if in.BaselineError != "" {
 		report.Coverage = append(report.Coverage, CoverageGap{
@@ -252,6 +276,9 @@ func Decide(in Input) Report {
 		}
 		report.Cooldown = &cooldown
 		report.Classes = append(report.Classes, waitClass(cooldown))
+	}
+	if socketClass != nil {
+		report.Classes = append(report.Classes, *socketClass)
 	}
 	report.Classes = append(report.Classes,
 		ClassOutcome{Class: ClassMissingEvidence, Exit: ExitOperator, AtStake: len(report.Coverage), Outstanding: len(report.Coverage)})
