@@ -13032,7 +13032,7 @@ cooldown_registry_start() {
     fi
   done
   rm -f "${dir}/reg/port"
-  python3 "${ROOT_DIR}/tests/lib/fake_registry.py" "${dir}/reg" "${dir}/reg/port" "${dir}/reg/log" &
+  python3 "${ROOT_DIR}/tests/lib/fake_registry.py" "${dir}/reg" "${dir}/reg/port" "${dir}/reg/log" >/dev/null 2>&1 &
   COOLDOWN_REG_PID=$!
   for at in $(seq 1 50); do [[ -s "${dir}/reg/port" ]] && break; sleep 0.1; done
   export LANE_RELEASES_BASE="http://127.0.0.1:$(cat "${dir}/reg/port")"
@@ -13135,6 +13135,8 @@ min-release-age-exclude that is not a list of names|. + {"min-release-age-exclud
 min-release-age-exclude that is not a list of names|. + {"min-release-age-exclude": [1]}
 min-release-age-exclude that is not the list of the exact versions the command names|. + {"min-release-age-exclude": ["evil"]}
 a before date|. + {"before": "2030-01-01T00:00:00.000Z"}
+a before date|. + {"before": false}
+a before date|. + {"before": 0}
 CONFIGS
   done
   # a field that is ABSENT is a refusal too (an absent exclusion field is not the empty list), and so is a configuration
