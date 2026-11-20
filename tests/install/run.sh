@@ -14108,7 +14108,8 @@ case_npm_front_door_reads_abbreviations_and_combinations() {
 }
 
 main() {
-  local case
+  local case defined
+  local -A registered=()
   for case in \
     case_gate_lib_missing_fails_closed \
     case_wrapper_passthrough_is_cheap \
@@ -14527,8 +14528,15 @@ main() {
     case_uninstall_cleans_shell_and_legacy_binaries \
     case_safe_run_gated_tool_delegation
   do
+    registered["$case"]=1
     "$case"
   done
+
+  # A case defined in this file and missing from the list above never runs and never fails: the suite
+  # would report a count that does not include it. Every case_ function must be registered.
+  while IFS= read -r defined; do
+    [[ -n "${registered[$defined]:-}" ]] || fail "${defined} is defined but not registered in main: it did not run"
+  done < <(declare -F | awk '$3 ~ /^case_/ {print $3}')
 
   printf '%s passed, %s failed\n' "${PASS_COUNT}" "${FAIL_COUNT}"
   [[ "${FAIL_COUNT}" -eq 0 ]]
