@@ -178,6 +178,16 @@ func outstandingClasses(report Report, in Input) []OutstandingClass {
 			maliceOn[Identity{Name: item.Name, Version: version}] = struct{}{}
 		}
 	}
+	// An artifact is mixed when ANY byte it carries has a malice signal: its own, or a bundled member's (judged apart, by the
+	// name the signal names, then attributed to the artifact whose bytes carry it).
+	maliceCarriedBy := map[Identity]struct{}{}
+	for _, occurrence := range in.Target.Occurrences {
+		if _, signalled := maliceOn[occurrence.Identity()]; !signalled {
+			continue
+		}
+		coverName, coverVersion := coverArtifact(occurrence)
+		maliceCarriedBy[Identity{Name: coverName, Version: coverVersion}] = struct{}{}
+	}
 	out := []OutstandingClass{}
 	for _, class := range report.Classes {
 		if class.Outstanding == 0 {
@@ -241,10 +251,7 @@ func outstandingClasses(report Report, in Input) []OutstandingClass {
 						coverName, coverVersion := coverArtifact(occurrence)
 						k := key{coverName, coverVersion, occurrence.Host}
 						if merged[k] == nil {
-							_, mixed := maliceOn[Identity{Name: coverName, Version: coverVersion}]
-							if !mixed {
-								_, mixed = maliceOn[occurrence.Identity()]
-							}
+							_, mixed := maliceCarriedBy[Identity{Name: coverName, Version: coverVersion}]
 							merged[k] = &OutstandingItem{Name: coverName, Version: coverVersion, Host: occurrence.Host, Advisories: []string{}, Carried: []string{}, Class: class.Class, Mixed: mixed}
 						}
 						target := merged[k]

@@ -219,16 +219,81 @@ func TestConfirmedRecordsComeFromTheFinalDecision(t *testing.T) {
 	if len(out.ConfirmedRecords) != 0 || !out.Unjudged {
 		t.Fatalf("an outage: %+v unjudged=%v", out.ConfirmedRecords, out.Unjudged)
 	}
-	// a root that relies on a followed authority in another class is not recorded; one not introduced is not either
-	foll := base().accepting(accept(AcceptFollowedGrant, "a", "1.0.0"))
-	young := releasesOf(3, SecurityFixExempt, reading("a", "1.0.0", 10))
-	fr := Decide(Input{Target: target, Evidence: func() Evidence {
-		e := foll
-		e.Acceptances = []Acceptance{accept(AcceptFollowedGrant, "a", "1.0.0")}
-		e.Answered = nil
-		return e
-	}(), Socket: socket, Releases: young, Confirmations: confirmationsOf(nil, false, nil)})
-	if len(fr.ConfirmedRecords) != 0 {
-		t.Fatalf("followed: %+v", fr.ConfirmedRecords)
+	// a root that relies on a followed authority is not recorded, and the answers stand while it is decided (a control without the
+	// followed authority is recorded, so the case bites)
+	followedOf := func(kind string) Report {
+		e := evidenceOf(read("a", "1.0.0", hit("GHSA-h", SeverityHigh)), read("b", "1.0.0")).accepting(accept(kind, "a", "1.0.0"))
+		e.Answered = []Answered{{Name: "a", Version: "1.0.0", Class: ClassAdverseAdvisory, Token: "WARN_TTY_OVERRIDE"}}
+		return Decide(Input{Target: target, Evidence: e, Socket: socket, Confirmations: confirmationsOf(nil, false, nil)})
+	}
+	if r := followedOf(AcceptLocalExact); len(r.ConfirmedRecords) != 1 {
+		t.Fatalf("control: %+v", r.ConfirmedRecords)
+	}
+	if r := followedOf(AcceptFollowedGrant); len(r.ConfirmedRecords) != 0 {
+		t.Fatalf("followed: %+v", r.ConfirmedRecords)
+	}
+}
+
+// One eligibility rule for both writers over the root and the bytes it carries: confirming an unrelated question (a pending
+// Socket score) never exports an advisory the operator did not accept, inherited or in a bundled member.
+func TestAConfirmationNeverExportsInheritedAdvisoriesOnTheRootsBytes(t *testing.T) {
+	answer := []Answered{{Name: "a", Version: "2.0.0", Class: ClassSocketRoot, Token: "GO_PENDING_CONFIRMED"}}
+	approval := accept(AcceptLocalExact, "a", "2.0.0")
+	run := func(base, target map[string]map[string]any, ev Evidence) Report {
+		ev = ev.accepting(approval)
+		ev.Answered = answer
+		return Decide(Input{Baseline: graphOf(t, base), HasBaseline: true, Target: graphOf(t, target), Evidence: ev, Socket: socketOf(sroot("a", "2.0.0", SocketPending)),
+			Confirmations: confirmationsOf(nil, false, nil)})
+	}
+	base, target := pkgs("a", "1.0.0"), pkgs("a", "2.0.0")
+	// control: nothing inherited, the confirmed root is recorded
+	if r := run(base, target, evidenceOf(read("a", "2.0.0"), read("a", "1.0.0"))); r.Outcome.Status != "clear" || len(r.ConfirmedRecords) != 1 {
+		t.Fatalf("control: %+v %+v", r.Outcome, r.ConfirmedRecords)
+	}
+	// the same high advisory in both versions: inherited, and nobody accepted it
+	inherited := evidenceOf(read("a", "2.0.0", hit("GHSA-h", SeverityHigh)), read("a", "1.0.0", hit("GHSA-h", SeverityHigh)))
+	if r := run(base, target, inherited); r.Outcome.Status != "clear" || len(r.ConfirmedRecords) != 0 {
+		t.Fatalf("inherited: %+v %+v", r.Outcome, r.ConfirmedRecords)
+	}
+	// the bundled-member shape: the member's advisory is on the root's own bytes
+	bundledBase := map[string]map[string]any{"node_modules/a": entry("a", "1.0.0"), "node_modules/a/node_modules/m": {"version": "1.0.0", "inBundle": true}}
+	bundledTarget := map[string]map[string]any{"node_modules/a": entry("a", "2.0.0"), "node_modules/a/node_modules/m": {"version": "2.0.0", "inBundle": true}}
+	member := evidenceOf(read("a", "2.0.0"), read("a", "1.0.0"), read("m", "2.0.0", hit("GHSA-h", SeverityHigh)), read("m", "1.0.0", hit("GHSA-h", SeverityHigh)))
+	if r := run(bundledBase, bundledTarget, member); r.Outcome.Status != "clear" || len(r.ConfirmedRecords) != 0 {
+		t.Fatalf("bundled member: %+v %+v", r.Outcome, r.ConfirmedRecords)
+	}
+}
+
+// A mixed block is decided over every byte the artifact carries: malice in one bundled member, a blocking advisory in another.
+func TestMixedStatusCoversEveryBundledMember(t *testing.T) {
+	target := map[string]map[string]any{"node_modules/p": entry("p", "2.0.0"), "node_modules/p/node_modules/x": {"version": "2.0.0", "inBundle": true}, "node_modules/p/node_modules/y": {"version": "2.0.0", "inBundle": true}}
+	ev := evidenceOf(read("p", "2.0.0"), read("x", "2.0.0", hit("GHSA-c", SeverityCritical)), read("y", "2.0.0")).blocklisted("y")
+	c := confirmationsOf([]Identity{{Name: "y", Version: "2.0.0"}}, false, nil)
+	r := Decide(Input{Target: graphOf(t, target), Evidence: ev, Confirmations: c})
+	if r.Outcome.Class != ClassBlockingAdvisory {
+		t.Fatalf("%+v", r.Outcome)
+	}
+	for _, class := range r.Outstanding {
+		for _, item := range class.Items {
+			if item.Name == "p" && !item.Mixed {
+				t.Fatalf("the parent carries malice in another member and is not mixed: %+v", item)
+			}
+		}
+	}
+}
+
+// The followed-authority check follows the covering relation: a member's advisory cleared by a followed grant of the covering root.
+func TestFollowedAuthorityOnABundledMemberIsTheRootsAuthority(t *testing.T) {
+	target := map[string]map[string]any{"node_modules/a": entry("a", "2.0.0"), "node_modules/a/node_modules/m": {"version": "2.0.0", "inBundle": true}}
+	decide := func(kind string) Report {
+		e := evidenceOf(read("a", "2.0.0"), read("m", "2.0.0", hit("GHSA-h", SeverityHigh))).accepting(accept(kind, "a", "2.0.0"))
+		e.Answered = []Answered{{Name: "a", Version: "2.0.0", Class: ClassAdverseAdvisory, Token: "WARN_TTY_OVERRIDE"}}
+		return Decide(Input{Target: graphOf(t, target), Evidence: e, Socket: socketOf(sroot("a", "2.0.0", SocketClear)), Confirmations: confirmationsOf(nil, false, nil)})
+	}
+	if r := decide(AcceptLocalExact); r.Outcome.Status != "clear" || len(r.ConfirmedRecords) != 1 {
+		t.Fatalf("control: %+v %+v", r.Outcome, r.ConfirmedRecords)
+	}
+	if r := decide(AcceptFollowedGrant); r.Outcome.Status != "clear" || len(r.ConfirmedRecords) != 0 {
+		t.Fatalf("followed: %+v %+v", r.Outcome, r.ConfirmedRecords)
 	}
 }

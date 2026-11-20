@@ -303,8 +303,8 @@ pass and warnings under `environment.release_follow`.
   command, never recorded. **Blocking advisory:** a typed `name@version` per artifact (the acceptance is recorded as today's
   gate records it: a local approval of that exact artifact and source), or `record name@version`, which also records the
   advisory override on the host-allow entry (advisory-only, through `safe-run host-allow add --accept-block`, which asks
-  again). **Graph not bound:** the deliberate confirmation, then the command runs on the one-shot route with its line (the
-  closure is not judged there; `dedupe` and `prune` have no other gate and are not offered it). **Adverse advisory:** ONE prompt
+  again). **Graph not bound:** no override at the terminal (it ends as it does unattended, with its line; the one-shot confirmation
+  is a separate ticket). **Adverse advisory:** ONE prompt
   lists every artifact and advisory; `[y]` accepts the listed exact artifacts (each recorded as an acceptance), `[a]` also
   records a host-allow grant (npm and python, as today), `[N]` declines. **Wait:** today's adverse override. **Socket on a named
   root:** the rate-limit approval (for this command; the approval of each exact artifact is recorded), the consent ask (`Y`
@@ -325,17 +325,14 @@ pass and warnings under `environment.release_follow`.
   that is also malice is never recordable. A named root whose outcome the operator confirmed (an adverse override, a Socket
   consent declined, a pending score confirmed) is recorded after a verified publication through the same `record-installed`
   (`WARN_TTY_OVERRIDE`, `GO_SOCKET_DECLINED`, `GO_PENDING_CONFIRMED`: exportable), as the FINAL decision leaves it eligible:
-  the root was introduced by the command, relies on no followed authority in any class, and nothing excludes the command as a
-  whole (confirmed missing evidence, a confirmed Socket outage, a malice or block override record nothing). New adverse
-  evidence revokes the receipt it supersedes at once, after every reading. **Every refusal of the lane has its deliberate
-  confirmation at the operator's terminal** (an accepted missing publish time, an unreadable baseline, a routing refusal): the
-  command then runs on the one-shot route, records nothing and advances no baseline (today's gate runs it with recording
-  switched off, and the command's own status is the answer); not offered: an established block (decided first), a dry run,
-  `dedupe` and `prune` (no other gate), and the lane's own safety refusals (its lock, directories, safe-core, a link out of the
-  project). A cancellation (TERM, INT) at a prompt ends it and frees the project lock; nothing is recorded or published. When
+  under the SAME eligibility as an ordinary record, over the root and every byte it carries: the root was introduced by the
+  command, no advisory at high or above stands on its bytes (an inherited one, a bundled member's) except one the operator
+  accepted in this command, it relies on no followed authority for any of them, and nothing excludes the command as a whole
+  (confirmed missing evidence, a confirmed Socket outage, a malice or block override record nothing). New adverse
+  evidence revokes the receipt it supersedes at once, after every reading. A routing refusal, an unreadable baseline and a graph the lane cannot bind are not asked about (no override yet). A cancellation (TERM, INT) at a prompt, or while the `[a]` grant is being reconfirmed, ends the prompt and the writer and frees the project lock; the acceptance already given stays, nothing is granted or published. A dry run, by argument or by npm's configuration, is never prompted. When
   the prompts end the evidence may not be older than 15 minutes counted from BEFORE the first evidence read
   (`install.lane_evidence_window_seconds` in the operator's configuration may shorten it), checked immediately before the
-  baseline is recorded and the binder starts: otherwise the command is refused, and what was accepted stays recorded, so the
+  baseline is recorded and again immediately before the binder starts: otherwise the command is refused, and what was accepted stays recorded, so the
   rerun asks nothing again. An agent session is never prompted: it ends as it does unattended.
 
   **Standing acceptances.** The decision takes the operator's standing acceptances as a document of its own, read by safe's

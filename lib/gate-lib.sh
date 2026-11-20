@@ -3577,10 +3577,6 @@ safe_gate_project_lane_refuse() {
   local code="$1" verb="$2" stake todo
   stake="$(safe_gate_lane_clean "$3")"
   todo="$(safe_gate_lane_clean "$4")"
-  # at the operator's terminal a refusal of the lane has its deliberate confirmation (the routing row of the spec)
-  if safe_gate_project_lane_offer_oneshot "${code}" "${verb}" "${stake}"; then
-    return 0
-  fi
   safe_gate_err "safe: BLOCKED npm ${verb} [lane: project] — ${stake}; ${todo}; details: safe explain"
   return "${code}"
 }
@@ -4726,8 +4722,11 @@ safe_gate_project_lane_as_operator() {
     SAFE_GATE_AUDIT_BIN="${audit}"
     SAFE_AUDIT_BIN="${audit}"
     SAFE_RUN_BIN="${runner}"
-    export SAFE_GATE_AUDIT_BIN SAFE_AUDIT_BIN SAFE_RUN_BIN
-    unset SAFE_RUN_PATH SAFE_AUDIT_PATH SAFE_AUDIT_SOCKET_CONSENT
+    # the verdict engine of the auditor inside safe-run is the one this lane verified, never one the environment names; the
+    # runner never initialises a missing store from a seed directory the caller names
+    SAFE_CORE_BIN="${safe_core}"
+    export SAFE_GATE_AUDIT_BIN SAFE_AUDIT_BIN SAFE_RUN_BIN SAFE_CORE_BIN
+    unset SAFE_RUN_PATH SAFE_AUDIT_PATH SAFE_AUDIT_SOCKET_CONSENT SAFE_RUN_SEED_DIR
     "$@"
   )
 }
@@ -4783,6 +4782,19 @@ safe_gate_project_lane_host_allow() {
   safe_gate_project_lane_pinned "${name}" "${version}"
 }
 
+# A host-allow writer (the [a] answer, `record`), supervised like a prompt: it runs in a child the lane waits on, and a cancellation ends
+# it and its own terminal read before the lane completes it. The install acceptance already given stays; the grant does not happen.
+safe_gate_project_lane_grant() { # <block|grant> <name> <version>
+  local what="host-allow grant"
+  [[ "$1" != block ]] || what="advisory override on the host-allow entry"
+  safe_gate_project_lane_ask /dev/null safe_gate_project_lane_host_allow "${lane_audit}" "$1" "$2" "$3"
+  if (( lane_ask_rc == 0 )); then
+    safe_gate_err "safe: project lane: the ${what} of $2@$3 was recorded"
+  else
+    safe_gate_err "safe: project lane: the ${what} of $2@$3 was NOT recorded"
+  fi
+}
+
 # The confirmations document of this command, rebuilt from the plain lists. $1 file, $2 malice tsv, $3 socket tsv, $4 gap 0|1,
 # $5 answered tsv (name, version, class, token).
 safe_gate_project_lane_confirmations() {
@@ -4818,7 +4830,7 @@ safe_gate_project_lane_say_items() { # <report> <class>
   jq -r --arg c "$2" '.outstanding[] | select(.class == $c) | .items[]
     | "  \(.name)@\(.version)"
       + (if (.advisories | length) > 0 then " — " + (.advisories | join(", ")) else "" end)
-      + (if (.carried | length) > 0 then " (carried by " + (.carried | join(", ")) + ")" else "" end)
+      + (if (.carried | length) > 0 then " (the advisory is in its bundled member " + (.carried | join(", ")) + ")" else "" end)
       + (if .detail != "" and $c != "malice" then " — " + .detail else "" end)' "$1" 2>/dev/null | while IFS= read -r line; do
     safe_gate_tty_printf '%s\n' "$(safe_gate_lane_clean "${line}")"
   done
@@ -4831,7 +4843,7 @@ safe_gate_project_lane_ask() { # <outfile> <function> [args...]
   local out="$1" pid
   shift
   : >"${out}"
-  ( "$@" ) >"${out}" &
+  ( "$@" ) <&0 >"${out}" &
   pid=$!
   SAFE_GATE_LANE_PROMPT_PID="${pid}"
   prompted=1
@@ -4850,7 +4862,12 @@ safe_gate_project_lane_answer() { # <decline text>
     0) return 0 ;;
     2)
       read_failed=1
-      decline_text="no answer could be read from your terminal (end of input), so nothing was accepted or recorded; run the command again at a terminal"
+      # what stands is said: the unanswered prompt left nothing, the answers given at earlier prompts were recorded when given
+      if [[ -s "${scratch}/answered.tsv" ]]; then
+        decline_text="no answer could be read from your terminal (end of input) at this prompt, so it accepted and recorded nothing; the answers you gave before it stand, recorded when given; run the command again at a terminal"
+      else
+        decline_text="no answer could be read from your terminal (end of input), so nothing was accepted or recorded; run the command again at a terminal"
+      fi
       return 3
       ;;
     *)
@@ -4858,6 +4875,15 @@ safe_gate_project_lane_answer() { # <decline text>
       return 1
       ;;
   esac
+}
+
+# One prompt, one outcome handler for its three results: 0 yes, 1 an explicit no (decline text $1), 3 a failed read. The prompt's
+# output (the token it echoes) is in ${scratch}/ask.out; $2 is today's prompt function, then its arguments.
+safe_gate_project_lane_query() { # <decline text> <function> [args...]
+  local decline="$1"
+  shift
+  safe_gate_project_lane_ask "${scratch}/ask.out" "$@"
+  safe_gate_project_lane_answer "${decline}"
 }
 
 # The decision, made again with the answers given so far, with the same validation and recovery as the first one. Extra
@@ -4891,14 +4917,21 @@ safe_gate_project_lane_evidence_window() {
   printf '%s' "${window}"
 }
 
+# The evidence window: expired when prompts were shown and the evidence read for this command is older than the window. Checked
+# immediately before the baseline is recorded AND again immediately before the binder is launched.
+safe_gate_project_lane_window_expired() {
+  (( prompted )) && (( SECONDS - evidence_read_at >= $(safe_gate_project_lane_evidence_window) ))
+}
+safe_gate_project_lane_window_refuse() {
+  safe_gate_project_lane_refuse 102 "${verb}" "the evidence read for this command is $(( (SECONDS - evidence_read_at) / 60 )) minute(s) old, older than the $(( $(safe_gate_project_lane_evidence_window) / 60 )) minutes the lane decides on" "rerun the command: what you accepted is recorded, so it asks nothing again"
+}
+
 # The terminal loop. Reads and sets the locals of safe_gate_project_lane_run. Returns 0 when the decision is clear (rc is 0), 1
-# when the operator declined or nothing could be resolved (rc is the exit of the class left; read_failed makes it 102), 2 when
-# the command was handed to the one-shot route (SAFE_GATE_LANE_PASS is set: the caller returns), 3 when a late reading refused
-# the command (late_rc is the status).
+# when the operator declined or nothing could be resolved (rc is the exit of the class left; read_failed makes it 102), 3 when
+# a late reading refused the command (late_rc is the status).
 safe_gate_project_lane_prompts() {
   local conf="${scratch}/confirmations.json" mal_file="${scratch}/confirm-malice.tsv" sock_file="${scratch}/confirm-socket.tsv" ans_file="${scratch}/answered.tsv"
-  local iter=0 status class signature previous="" sub=0
-  lane_offer=0
+  local iter=0 status class signature previous="" sub=0 rate_given=0
   : >"${mal_file}"; : >"${sock_file}"; : >"${ans_file}"
   safe_gate_project_lane_confirmations "${conf}" "${mal_file}" "${sock_file}" 0 "${ans_file}"
   while (( iter < 20 )); do
@@ -4917,8 +4950,8 @@ safe_gate_project_lane_prompts() {
     previous="${signature}"
     sub=0
     if [[ "${status}" == unbound ]]; then
-      safe_gate_project_lane_prompt_unbound || sub=$?
-      if (( sub == 2 )); then return 2; fi
+      # a graph the lane cannot bind has no override at the terminal (ticket 1686): it ends as it does unattended
+      sub=1
     else
       class="$(jq -r '.outcome.class' "${report}")"
       case "${class}" in
@@ -4970,8 +5003,7 @@ safe_gate_project_lane_prompt_malice() {
     doc="${scratch}/malice-${name//\//_}-${version}.json"
     safe_gate_project_lane_result_doc "${doc}" "${name}" "${version}" 20 "${class}" '[]' || return 1
     safe_gate_tty_printf '%s\n' "safe: ${name}@${version} carries: $(safe_gate_lane_clean "${signals}")"
-    safe_gate_project_lane_ask "${scratch}/ask.out" safe_gate_confirm_block npm "${doc}"
-    safe_gate_project_lane_answer "no override was typed for ${name}@${version}; the command is not installed" || return $?
+    safe_gate_project_lane_query "no override was typed for ${name}@${version}; the command is not installed" safe_gate_confirm_block npm "${doc}" || return $?
     choice="$(cat "${scratch}/ask.out")"
     [[ "${choice}" == once ]] || { decline_text="no override was typed for ${name}@${version}; the command is not installed"; return 1; }
     printf '%s\t%s\n' "${name}" "${version}" >>"${mal_file}"
@@ -4994,8 +5026,7 @@ safe_gate_project_lane_prompt_blocking() {
     safe_gate_project_lane_result_doc "${doc}" "${name}" "${version}" 20 advisory "${idlist}" || return 1
     # a block that is also malice is never recordable: the prompt does not offer `record` (any non-grant ecosystem token turns it off)
     eco=npm; [[ "${mixed}" != true ]] || eco=mixed
-    safe_gate_project_lane_ask "${scratch}/ask.out" safe_gate_confirm_block "${eco}" "${doc}"
-    safe_gate_project_lane_answer "no override was typed for ${name}@${version}; details: safe explain" || return $?
+    safe_gate_project_lane_query "no override was typed for ${name}@${version}; details: safe explain" safe_gate_confirm_block "${eco}" "${doc}" || return $?
     choice="$(cat "${scratch}/ask.out")"
     case "${choice}" in
       once|record\ *)
@@ -5004,11 +5035,7 @@ safe_gate_project_lane_prompt_blocking() {
         fi
         safe_gate_project_lane_note_answered "${name}" "${version}" blocking_advisory ""
         if [[ "${choice}" == record\ * ]]; then
-          if safe_gate_project_lane_host_allow "${lane_audit}" block "${name}" "${version}"; then
-            safe_gate_err "safe: project lane: the advisory override of ${name}@${version} was recorded on the host-allow entry"
-          else
-            safe_gate_err "safe: project lane: the advisory override of ${name}@${version} was NOT recorded on the host-allow entry"
-          fi
+          safe_gate_project_lane_grant block "${name}" "${version}"
         fi
         ;;
       *) decline_text="no override was typed for ${name}@${version}; details: safe explain"; return 1 ;;
@@ -5025,8 +5052,7 @@ safe_gate_project_lane_prompt_adverse() {
   count="$(jq -r --arg c "${class}" '[.outstanding[] | select(.class == $c) | .items[]] | length' "${report}")"
   safe_gate_tty_printf '%s\n' "safe: the command introduces $( [[ "${class}" == wait ]] && printf 'a version inside the cooldown' || printf 'high-severity advisories' ) — ${count} artifact(s):"
   safe_gate_project_lane_say_items "${report}" "${class}"
-  safe_gate_project_lane_ask "${scratch}/ask.out" safe_gate_confirm_warn "these ${count} artifact(s)" npm
-  safe_gate_project_lane_answer "you declined the override of the listed artifact(s); details: safe explain" || return $?
+  safe_gate_project_lane_query "you declined the override of the listed artifact(s); details: safe explain" safe_gate_confirm_warn "these ${count} artifact(s)" npm || return $?
   answer="$(cat "${scratch}/ask.out")"
   case "${answer}" in
     once|allow) ;;
@@ -5041,11 +5067,7 @@ safe_gate_project_lane_prompt_adverse() {
     fi
     safe_gate_project_lane_note_answered "${name}" "${version}" "${class}" WARN_TTY_OVERRIDE
     if [[ "${answer}" == allow ]]; then
-      if safe_gate_project_lane_host_allow "${lane_audit}" grant "${name}" "${version}"; then
-        safe_gate_err "safe: project lane: the host-allow grant of ${name}@${version} was recorded"
-      else
-        safe_gate_err "safe: project lane: the host-allow grant of ${name}@${version} was NOT recorded"
-      fi
+      safe_gate_project_lane_grant grant "${name}" "${version}"
     fi
   done
   return 0
@@ -5054,25 +5076,28 @@ safe_gate_project_lane_prompt_adverse() {
 # Socket on a named root: today's prompts for each outcome, with today's meaning of each answer. (A Socket BLOCK is malice:
 # it is never in this class.)
 safe_gate_project_lane_prompt_socket() {
-  local sock_file="$1" name version outcome detail answer ratelimit_done=0 ids row_ outcome_now
+  local sock_file="$1" name version outcome detail answer ids row_ outcome_now q
   local -a rows_=()
   mapfile -t rows_ < <(jq -r '.outstanding[] | select(.class == "socket_root") | .items[] | [.name, .version, .outcome, .detail, (.advisories | join(","))] | @tsv' "${report}")
-  for row_ in "${rows_[@]}"; do
+  # ONE row per call: an answer, or a reading it caused, may change the evidence, so the lane decides again (and revokes) and asks the
+  # next question from the decision's own list, never from this one
+  for row_ in "${rows_[@]:0:1}"; do
     IFS=$'\t' read -r name version outcome detail ids <<<"${row_}"
     [[ -n "${name}" ]] || continue
     case "${outcome}" in
       rate_limited)
-        if (( ! ratelimit_done )); then
-          safe_gate_project_lane_ask "${scratch}/ask.out" safe_gate_confirm_socket_command
-          safe_gate_project_lane_answer "Socket is rate-limited and you declined this command's override; wait and retry; details: safe explain" || return $?
-          ratelimit_done=1
+        if (( ! rate_given )); then
+          safe_gate_project_lane_query "Socket is rate-limited and you declined this command's override; wait and retry; details: safe explain" safe_gate_confirm_socket_command || return $?
+          rate_given=1
         fi
         safe_gate_project_lane_approve "${lane_audit}" "${scratch}" SOCKET_RATE_LIMIT_COMMAND_OVERRIDE 12 "${name}" "${version}" || safe_gate_err "safe: project lane: the acceptance of ${name}@${version} could not be recorded"
         safe_gate_project_lane_note_answered "${name}" "${version}" socket_root ""
         ;;
       consent_required)
-        safe_gate_project_lane_ask "${scratch}/ask.out" safe_gate_confirm_socket_consent "${name}@${version}"
-        if (( lane_ask_rc == 0 )); then
+        q=0
+        safe_gate_project_lane_query "unused" safe_gate_confirm_socket_consent "${name}@${version}" || q=$?
+        (( q != 3 )) || return 3
+        if (( q == 0 )); then
           safe_gate_project_lane_socket_reread "${lane_audit}" "${safe_core}" "${scratch}" "${name}" "${version}" \
             || { decline_text="the Socket check could not be read again (audit-infrastructure breakage); details: safe explain"; return 1; }
           # a clean reading after the consent writes the reusable approval today's gate writes (GO_SOCKET_CONFIRMED)
@@ -5082,44 +5107,36 @@ safe_gate_project_lane_prompt_socket() {
             safe_gate_project_lane_note_answered "${name}" "${version}" socket_root ""
           fi
         else
-          safe_gate_project_lane_answer "unused" || { (( $? == 3 )) && return 3; }
           safe_gate_err "safe: ${name}@${version} — Socket check declined for this install; proceeding on advisories, blocklist and release age."
           safe_gate_project_lane_approve "${lane_audit}" "${scratch}" GO_SOCKET_CONFIRMED 13 "${name}" "${version}" || safe_gate_err "safe: project lane: the acceptance of ${name}@${version} could not be recorded"
           safe_gate_project_lane_note_answered "${name}" "${version}" socket_root GO_SOCKET_DECLINED
         fi
         ;;
       pending)
-        safe_gate_project_lane_ask "${scratch}/ask.out" safe_gate_confirm_pending "${name}@${version}"
-        safe_gate_project_lane_answer "Socket score pending and you declined; retry once the scan completes; details: safe explain" || return $?
+        safe_gate_project_lane_query "Socket score pending and you declined; retry once the scan completes; details: safe explain" safe_gate_confirm_pending "${name}@${version}" || return $?
         safe_gate_project_lane_approve "${lane_audit}" "${scratch}" GO_SOCKET_CONFIRMED 13 "${name}" "${version}" || safe_gate_err "safe: project lane: the acceptance of ${name}@${version} could not be recorded"
         safe_gate_project_lane_note_answered "${name}" "${version}" socket_root GO_PENDING_CONFIRMED
         ;;
       adverse)
         safe_gate_tty_printf '%s\n' "safe: ${name}@${version} — Socket: $(safe_gate_lane_clean "${detail}")"
-        safe_gate_project_lane_ask "${scratch}/ask.out" safe_gate_confirm_warn "${name}@${version}" npm
-        safe_gate_project_lane_answer "you declined the override of ${name}@${version}; details: safe explain" || return $?
+        safe_gate_project_lane_query "you declined the override of ${name}@${version}; details: safe explain" safe_gate_confirm_warn "${name}@${version}" npm || return $?
         answer="$(cat "${scratch}/ask.out")"
         case "${answer}" in
           once|allow)
             safe_gate_project_lane_approve "${lane_audit}" "${scratch}" TOLERATED_WARN_TTY_OVERRIDE 15 "${name}" "${version}" || safe_gate_err "safe: project lane: the acceptance of ${name}@${version} could not be recorded"
             safe_gate_project_lane_note_answered "${name}" "${version}" socket_root WARN_TTY_OVERRIDE
             if [[ "${answer}" == allow ]]; then
-              if safe_gate_project_lane_host_allow "${lane_audit}" grant "${name}" "${version}"; then
-                safe_gate_err "safe: project lane: the host-allow grant of ${name}@${version} was recorded"
-              else
-                safe_gate_err "safe: project lane: the host-allow grant of ${name}@${version} was NOT recorded"
-              fi
+              safe_gate_project_lane_grant grant "${name}" "${version}"
             fi
             ;;
           *) decline_text="you declined the override of ${name}@${version}; details: safe explain"; return 1 ;;
         esac
         ;;
       unavailable)
-        safe_gate_project_lane_ask "${scratch}/ask.out" safe_gate_confirm_infra "${name}@${version}" \
+        safe_gate_project_lane_query "audit infrastructure is unavailable (not a package finding) and you declined to proceed without it; fix it (socket login / wait / safe doctor) and retry; details: safe explain" safe_gate_confirm_infra "${name}@${version}" \
           "safe: the Socket reading of ${name}@${version} is unavailable — audit-infrastructure breakage, NOT a package finding." \
           "safe: proceeding installs ${name}@${version} WITHOUT the behavioral (Socket) signal, for this command only; nothing is recorded, and the lockfile is not recorded as judged." \
-          "safe: proceed without the behavioral signal? [y/N] "
-        safe_gate_project_lane_answer "audit infrastructure is unavailable (not a package finding) and you declined to proceed without it; fix it (socket login / wait / safe doctor) and retry; details: safe explain" || return $?
+          "safe: proceed without the behavioral signal? [y/N] " || return $?
         printf '%s\t%s\n' "${name}" "${version}" >>"${sock_file}"
         ;;
       *) decline_text="the Socket outcome ${outcome} of ${name}@${version} has no answer at the terminal; details: safe explain"; return 1 ;;
@@ -5137,61 +5154,12 @@ safe_gate_project_lane_prompt_gap() {
   jq -r '.coverage[] | "  " + (if .name != "" then "\(.name)@\(.version): " else "" end) + .gap' "${report}" | while IFS= read -r line; do
     safe_gate_tty_printf '%s\n' "$(safe_gate_lane_clean "${line}")"
   done
-  safe_gate_project_lane_ask "${scratch}/ask.out" safe_gate_confirm_infra "this command" \
+  safe_gate_project_lane_query "evidence is missing (audit-infrastructure breakage, not a package finding) and you declined to proceed without it; fix connectivity or run safe doctor, then retry" safe_gate_confirm_infra "this command" \
     "safe: what this command introduces cannot be fully judged — audit-infrastructure breakage, NOT a package finding." \
     "safe: proceeding installs what could not be judged WITHOUT that judgement, for this command only; nothing is recorded, and the lockfile is not recorded as judged." \
-    "safe: proceed with missing evidence? [y/N] "
-  safe_gate_project_lane_answer "evidence is missing (audit-infrastructure breakage, not a package finding) and you declined to proceed without it; fix connectivity or run safe doctor, then retry" || return $?
+    "safe: proceed with missing evidence? [y/N] " || return $?
   gap_confirmed=1
   return 0
-}
-
-# Graph not bound: the deliberate confirmation; the command then runs on the one-shot route, with its line (closure not judged),
-# recording nothing. dedupe and prune have no other gate: not offered.
-safe_gate_project_lane_prompt_unbound() {
-  local first
-  case "${verb}" in dedupe|prune) decline_text="the graph cannot be bound and npm ${verb} has no other gate to send it to, so it is not offered the one-shot route (its override is a separate decision); details: safe explain"; return 1 ;; esac
-  first="$(jq -r '.bindability.unbound[0] | "\(.name // .path)@\(.version // "?"): \(.reason)"' "${report}" 2>/dev/null)"
-  safe_gate_project_lane_ask "${scratch}/ask.out" safe_gate_confirm_infra "this command" \
-    "safe: the projected graph holds an entry the project lane cannot bind ($(safe_gate_lane_clean "${first}")) — not a package finding." \
-    "safe: proceeding runs this command on the one-shot route (today's gate): the closure is NOT judged there, and nothing of it is recorded." \
-    "safe: run this command on the one-shot route? [y/N] "
-  safe_gate_project_lane_answer "the graph cannot be bound and you declined the one-shot route; details: safe explain" || return $?
-  safe_gate_project_lane_oneshot_confirmed "${verb}" "an entry the lane cannot bind, confirmed at the operator's terminal"
-  return 2
-}
-
-# The one-shot route by the operator's confirmation: the one-shot line, then the hand-over with its own reserved status, which
-# makes today's gate run the command with recording switched off (nothing is recorded, no baseline advances).
-safe_gate_project_lane_oneshot_confirmed() { # <verb> <reason>
-  safe_gate_project_lane_oneshot_line "$1" "$2"
-  SAFE_GATE_LANE_PASS=3
-  return 0
-}
-
-# A refusal of the lane at the operator's terminal offers its deliberate confirmation (the routing row of the spec): this
-# command runs on the one-shot route, records nothing and advances no baseline. Not offered: a command the operator cannot be
-# asked about (an agent session, no terminal), a dry run, dedupe and prune (no other gate), a block (decided by the classes), a
-# refusal made after the decision, and the refusals of the lane's own safety (its lock, its directories, safe-core). Returns 0
-# when the command was handed over. $1 code, $2 verb, $3 stake (clean), $4 todo (clean).
-safe_gate_project_lane_offer_oneshot() {
-  local code="$1" verb_="$2" stake="$3" read_rc=0
-  (( ${lane_offer:-0} == 1 )) || return 1
-  (( ${lane_dry:-0} == 0 )) || return 1
-  case "${verb_}" in dedupe|prune) return 1 ;; esac
-  (( code != 104 )) || return 1
-  safe_gate_operator_terminal || return 1
-  safe_gate_tty_printf '%s\n' "safe: this command would be refused: ${stake}"
-  safe_gate_project_lane_ask "${SAFE_GATE_LANE_SCRATCH:-${TMPDIR:-/tmp}}/ask.out" safe_gate_confirm_infra "this command" \
-    "safe: the project lane refuses this command (${stake}) — not a package finding." \
-    "safe: proceeding runs this command on the one-shot route (today's gate): the closure is NOT judged there, and nothing of it is recorded." \
-    "safe: run this command on the one-shot route? [y/N] "
-  read_rc="${lane_ask_rc}"
-  if (( read_rc == 0 )); then
-    safe_gate_project_lane_oneshot_confirmed "${verb_}" "${stake}"
-    return 0
-  fi
-  return 1
 }
 
 # After a verified publication: the named roots whose outcome the operator confirmed, as the FINAL decision leaves them eligible
@@ -5402,7 +5370,7 @@ safe_gate_project_lane_private_names() {
     --follow-state "$(safe_gate_trust_store_file private-follow-state.json)" \
     --config "$(safe_gate_trust_store_file config.json)" 2>/dev/null)" || matches=""
   if ! safe_gate_lane_one_doc 'type == "array"' "${matches}"; then
-    lane_offer=0 safe_gate_project_lane_refuse 100 "${verb}" "the private-registry stores cannot be read (audit-infrastructure breakage, not a package finding)" "repair them at an operator terminal and retry"
+    safe_gate_project_lane_refuse 100 "${verb}" "the private-registry stores cannot be read (audit-infrastructure breakage, not a package finding)" "repair them at an operator terminal and retry"
     return $?
   fi
   if jq -e 'length > 0' <<<"${matches}" >/dev/null 2>&1; then
@@ -5445,12 +5413,6 @@ safe_gate_project_lane_workspace_ancestor() {
 # replace a value the caller exported.
 safe_gate_project_lane_handover_status() {
   printf '253'
-}
-
-# The third reserved status: "hand this command to today's gate BY THE OPERATOR'S CONFIRMATION at the terminal": today's gate then
-# runs it with recording switched off (SAFE_AUDIT_NO_RECORDS), so that nothing of it is recorded and no baseline advances.
-safe_gate_project_lane_confirmed_handover_status() {
-  printf '251'
 }
 
 # The second reserved status: "the selected npm resolves the caller's token to no command at all:
@@ -5510,11 +5472,19 @@ safe_gate_project_lane_in_subshell() {
     exit "$(safe_gate_project_lane_handover_status)"
   elif [[ "${SAFE_GATE_LANE_PASS:-0}" == "2" ]]; then
     exit "$(safe_gate_project_lane_unresolved_status)"
-  elif [[ "${SAFE_GATE_LANE_PASS:-0}" == "3" ]]; then
-    exit "$(safe_gate_project_lane_confirmed_handover_status)"
   fi
-  (( rc != $(safe_gate_project_lane_handover_status) && rc != $(safe_gate_project_lane_unresolved_status) && rc != $(safe_gate_project_lane_confirmed_handover_status) )) || rc=1
+  (( rc != $(safe_gate_project_lane_handover_status) && rc != $(safe_gate_project_lane_unresolved_status) )) || rc=1
   exit "${rc}"
+}
+
+# A process and every descendant of it, ended (a prompt child, the writer it runs, the terminal read of that writer).
+safe_gate_lane_kill_tree() {
+  local pid="$1" child
+  for child in $(pgrep -P "${pid}" 2>/dev/null); do
+    safe_gate_lane_kill_tree "${child}"
+  done
+  kill -KILL "${pid}" 2>/dev/null
+  return 0
 }
 
 # $1 the signal, $2 the status of ending the command. Before the binder has been
@@ -5524,7 +5494,7 @@ safe_gate_lane_signal() {
   SAFE_GATE_LANE_SIGNAL="$1"
   # a prompt is ended and reaped BEFORE the cancellation completes: the lock is then free and nothing is left asking
   if [[ "${SAFE_GATE_LANE_PROMPT_PID:-}" =~ ^[0-9]+$ ]]; then
-    kill -KILL "${SAFE_GATE_LANE_PROMPT_PID}" 2>/dev/null
+    safe_gate_lane_kill_tree "${SAFE_GATE_LANE_PROMPT_PID}"
     wait "${SAFE_GATE_LANE_PROMPT_PID}" 2>/dev/null
     SAFE_GATE_LANE_PROMPT_PID=""
   fi
@@ -5649,12 +5619,7 @@ safe_gate_project_lane_run() {
   local -a specs=() carry=() proj_args=() probe_args=() frozen_args=() orig_args=("$@")
   local -a compat_reasons=() compat_cause_files=()
   local npmrc_unadmitted=0
-  local lane_offer=1 lane_dry=0 read_failed=0 lane_ask_rc=0 prompted=0 gap_confirmed=0 evidence_read_at="${SECONDS}" decline_text="" late_unread=0 late_rc=0
-  for arg in "$@"; do
-    [[ "${arg}" != "--" ]] || break
-    case "${arg}" in --dry-run|--dry-run=true) lane_dry=1 ;; esac
-  done
-  arg=""
+  local read_failed=0 lane_ask_rc=0 prompted=0 gap_confirmed=0 evidence_read_at="${SECONDS}" decline_text="" late_unread=0 late_rc=0
 
   verb="$(safe_gate_npm_canonical_command "${subcommand}")" || verb="${subcommand}"
   lane_sub="${verb} [lane: project]"
@@ -5700,13 +5665,13 @@ safe_gate_project_lane_run() {
   # removed; a path with another newline in it cannot be captured exactly and refuses, before
   # anything is opened, locked or recorded.
   if ! project_dir="$(cd -- "." 2>/dev/null && pwd -P && printf x)"; then
-    lane_offer=0 safe_gate_project_lane_refuse 100 "${verb}" "the project directory cannot be read" "retry from the project root"
+    safe_gate_project_lane_refuse 100 "${verb}" "the project directory cannot be read" "retry from the project root"
     return $?
   fi
   project_dir="${project_dir%x}"
   project_dir="${project_dir%$'\n'}"
   if [[ "${project_dir}" == *$'\n'* ]]; then
-    lane_offer=0 safe_gate_project_lane_refuse 100 "${verb}" "the project's path contains a newline, so it cannot be captured exactly (it could name a sibling directory)" "run the command from a directory whose path has no newline"
+    safe_gate_project_lane_refuse 100 "${verb}" "the project's path contains a newline, so it cannot be captured exactly (it could name a sibling directory)" "run the command from a directory whose path has no newline"
     return $?
   fi
   # safe's own storage, and the scratch, are outside the project: nothing of
@@ -5719,13 +5684,13 @@ safe_gate_project_lane_run() {
   local tmp_root
   tmp_root="$(realpath -m -- "${TMPDIR:-/tmp}" 2>/dev/null)" || tmp_root=""
   if [[ "${data_root}" != /* || "${tmp_root}" != /* ]]; then
-    lane_offer=0 safe_gate_project_lane_refuse 100 "${verb}" "safe's data or temporary directory cannot be made absolute" "set SAFE_DATA_DIR and TMPDIR to absolute paths and retry"
+    safe_gate_project_lane_refuse 100 "${verb}" "safe's data or temporary directory cannot be made absolute" "set SAFE_DATA_DIR and TMPDIR to absolute paths and retry"
     return $?
   fi
   local lane_dir="${data_root}/project-lane"
   if safe_gate_lane_inside "${data_root}" "${project_dir}" || safe_gate_lane_inside "${tmp_root}" "${project_dir}" \
       || safe_gate_lane_project_inside "${project_dir}" "${lane_dir}" || safe_gate_lane_project_inside "${project_dir}" "${tmp_root}/safe-gate-project-lane."; then
-    lane_offer=0 safe_gate_project_lane_refuse 100 "${verb}" "safe's data directory or the temporary directory overlaps the project, where the lane writes nothing before publication" "point SAFE_DATA_DIR and TMPDIR outside the project and retry"
+    safe_gate_project_lane_refuse 100 "${verb}" "safe's data directory or the temporary directory overlaps the project, where the lane writes nothing before publication" "point SAFE_DATA_DIR and TMPDIR outside the project and retry"
     return $?
   fi
   # Configuration-file selectors and destination options in the caller's arguments would
@@ -5774,14 +5739,14 @@ safe_gate_project_lane_run() {
   if [[ -L "${data_root}" ]] || ! safe_gate_lane_private_dir "${lane_dir}" || ! safe_gate_lane_private_dir "${lane_dir}/npm-cache" \
       || ! safe_gate_lane_private_dir "${lane_dir}/npm-logs" || ! safe_gate_lane_private_dir "${lane_dir}/state" \
       || ! safe_gate_lane_private_dir "${lane_dir}/reports"; then
-    lane_offer=0 safe_gate_project_lane_refuse 100 "${verb}" "safe's lane storage cannot be established as private (audit-infrastructure breakage, not a package finding)" "fix the safe data directory and retry — safe doctor"
+    safe_gate_project_lane_refuse 100 "${verb}" "safe's lane storage cannot be established as private (audit-infrastructure breakage, not a package finding)" "fix the safe data directory and retry — safe doctor"
     return $?
   fi
   # On every npm command line of the lane: an explicit cache and log destination
   # (outside the project) and no rewriting of a resolved registry host.
   local -a dest=("--cache=${lane_dir}/npm-cache" "--logs-dir=${lane_dir}/npm-logs" "--logs-max=0" "--replace-registry-host=never" "--update-notifier=false")
   scratch="$(mktemp -d "${tmp_root}/safe-gate-project-lane.XXXXXX" 2>/dev/null)" || {
-    lane_offer=0 safe_gate_project_lane_refuse 100 "${verb}" "cannot allocate lane storage (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
+    safe_gate_project_lane_refuse 100 "${verb}" "cannot allocate lane storage (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
     return $?
   }
   SAFE_GATE_LANE_SCRATCH="${scratch}"
@@ -5789,7 +5754,7 @@ safe_gate_project_lane_run() {
   proj="${scratch}/projection"
   frozen="${scratch}/frozen"
   if ! mkdir -p -- "${scratch}/neutral" "${snap}" "${proj}" "${frozen}"; then
-    lane_offer=0 safe_gate_project_lane_refuse 100 "${verb}" "cannot prepare lane storage (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
+    safe_gate_project_lane_refuse 100 "${verb}" "cannot prepare lane storage (audit-infrastructure breakage, not a package finding)" "fix temporary storage and retry"
     return $?
   fi
   # An option before the verb refuses BEFORE npm is asked what the token resolves to: safe's reading of
@@ -5820,13 +5785,13 @@ safe_gate_project_lane_run() {
   # will not run: it refuses. (No token does this on the npm the table was taken from; the live oracle
   # compares the two.)
   if [[ "${resolved_command}" != "${verb}" ]]; then
-    lane_offer=0 safe_gate_project_lane_refuse 100 "${verb}" "safe reads this command as npm ${verb} and the selected npm resolves it to npm ${resolved_command}: safe's command table does not match this npm (audit-infrastructure breakage, not a package finding)" "type the command's full name, or update safe, then retry"
+    safe_gate_project_lane_refuse 100 "${verb}" "safe reads this command as npm ${verb} and the selected npm resolves it to npm ${resolved_command}: safe's command table does not match this npm (audit-infrastructure breakage, not a package finding)" "type the command's full name, or update safe, then retry"
     return $?
   fi
   # Under `mise exec` the inner gate runs audit-only and the outer process then runs the ORIGINAL
   # command: a lane decision made there would bind nothing. The lane does not take the command over.
   if [[ "${SAFE_GATE_NO_EXEC:-}" == "1" ]]; then
-    lane_offer=0 safe_gate_project_lane_refuse 100 "${verb}" "mise exec -- npm ${verb} is not covered by the project lane: mise would run the original command after an audit that binds nothing" "run npm in the project directory instead (the mise shims select the same tools), then retry"
+    safe_gate_project_lane_refuse 100 "${verb}" "mise exec -- npm ${verb} is not covered by the project lane: mise would run the original command after an audit that binds nothing" "run npm in the project directory instead (the mise shims select the same tools), then retry"
     return $?
   fi
   for arg in "$@"; do
@@ -5851,16 +5816,16 @@ safe_gate_project_lane_run() {
   # One exclusive kernel lock on the project directory, held until this process
   # exits, dry runs included.
   if ! command -v flock >/dev/null 2>&1; then
-    lane_offer=0 safe_gate_project_lane_refuse 100 "${verb}" "flock is unavailable, so the project cannot be locked (audit-infrastructure breakage, not a package finding)" "install util-linux and retry"
+    safe_gate_project_lane_refuse 100 "${verb}" "flock is unavailable, so the project cannot be locked (audit-infrastructure breakage, not a package finding)" "install util-linux and retry"
     return $?
   fi
   if ! { exec {SAFE_GATE_LANE_LOCKFD}<"${project_dir}"; } 2>/dev/null; then
     unset SAFE_GATE_LANE_LOCKFD
-    lane_offer=0 safe_gate_project_lane_refuse 100 "${verb}" "the project directory cannot be opened for locking" "retry from a readable project root"
+    safe_gate_project_lane_refuse 100 "${verb}" "the project directory cannot be opened for locking" "retry from a readable project root"
     return $?
   fi
   if ! flock -n -x "${SAFE_GATE_LANE_LOCKFD}"; then
-    lane_offer=0 safe_gate_project_lane_refuse 100 "${verb}" "another command holds this project's lock" "wait for it to finish, then retry"
+    safe_gate_project_lane_refuse 100 "${verb}" "another command holds this project's lock" "wait for it to finish, then retry"
     return $?
   fi
   if [[ -n "${SAFE_GATE_PROJECT_DIR:-}" ]]; then
@@ -5948,7 +5913,7 @@ safe_gate_project_lane_run() {
   for name in package.json package-lock.json .npmrc; do
     [[ -f "${project_dir}/${name}" ]] || continue
     if ! safe_gate_lane_cp "${project_dir}/${name}" "${snap}/${name}"; then
-      lane_offer=0 safe_gate_project_lane_refuse 100 "${verb}" "cannot snapshot ${name} (audit-infrastructure breakage, not a package finding)" "verify the project files and retry"
+      safe_gate_project_lane_refuse 100 "${verb}" "cannot snapshot ${name} (audit-infrastructure breakage, not a package finding)" "verify the project files and retry"
       return $?
     fi
   done
@@ -5968,11 +5933,11 @@ safe_gate_project_lane_run() {
 
   safe_core="${SAFE_DIR:-}/safe-core"
   if [[ -z "${SAFE_DIR:-}" || ! -x "${safe_core}" ]]; then
-    lane_offer=0 safe_gate_project_lane_refuse 100 "${verb}" "safe-core is not installed, so the closure cannot be judged" "rerun install.sh"
+    safe_gate_project_lane_refuse 100 "${verb}" "safe-core is not installed, so the closure cannot be judged" "rerun install.sh"
     return $?
   fi
   if ! safe_core_version="$("${safe_core}" --version 2>/dev/null)" || [[ -z "${SAFE_VERSION:-}" || "${safe_core_version}" != "${SAFE_VERSION}" ]]; then
-    lane_offer=0 safe_gate_project_lane_refuse 100 "${verb}" "safe-core ${safe_core_version:-unreadable} does not match safe ${SAFE_VERSION:-unknown} (audit-infrastructure breakage, not a package finding)" "rerun install.sh"
+    safe_gate_project_lane_refuse 100 "${verb}" "safe-core ${safe_core_version:-unreadable} does not match safe ${SAFE_VERSION:-unknown} (audit-infrastructure breakage, not a package finding)" "rerun install.sh"
     return $?
   fi
   SAFE_GATE_LANE_CORE="${safe_core}"
@@ -6179,7 +6144,7 @@ safe_gate_project_lane_run() {
     [[ "${graph_label%%|*}" == baseline ]] || graph_which="the lockfile on disk"
     if jq -e '[.bindability.unbound[] | select(.reason == "link_outside_project" or .reason == "identity_invalid")] | length > 0' <<<"${graph_json}" >/dev/null 2>&1; then
       # UNSAFE, committed or not: a link that leaves the project, an identity that cannot stand in a URL
-      lane_offer=0 safe_gate_project_lane_refuse 100 "${verb}" "${graph_which} with an entry that is not safe to read ($(jq -r '[.bindability.unbound[] | select(.reason == "link_outside_project" or .reason == "identity_invalid")][0] | "\(.name)@\(.version): \(.reason)"' <<<"${graph_json}" 2>/dev/null)), which is not covered by the project lane" "repair the lockfile and retry"
+      safe_gate_project_lane_refuse 100 "${verb}" "${graph_which} with an entry that is not safe to read ($(jq -r '[.bindability.unbound[] | select(.reason == "link_outside_project" or .reason == "identity_invalid")][0] | "\(.name)@\(.version): \(.reason)"' <<<"${graph_json}" 2>/dev/null)), which is not covered by the project lane" "repair the lockfile and retry"
       return $?
     fi
     if jq -e '.bindability.bound == false' <<<"${graph_json}" >/dev/null 2>&1; then
@@ -6432,17 +6397,29 @@ safe_gate_project_lane_run() {
   rc=0
   # the evidence window starts BEFORE the first evidence read
   evidence_read_at="${SECONDS}"
+  local evidence_why=""
   "${lane_audit}" scanner-batch --evidence <<<"${request}" >"${evidence}" 2>"${scratch}/evidence.err" || rc=$?
+  if (( rc != 0 )); then
+    evidence_why="the advisory reader exited ${rc}"
+  elif ! jq -e '.schema_version == 1 and (.identities | type == "array") and (.blocklist | type == "array")' "${evidence}" >/dev/null 2>&1; then
+    # an answer that is not a result is no result: the same missing evidence as a reader that failed
+    rc=65
+    evidence_why="the advisory reader answered something unreadable"
+  fi
   if (( rc != 0 )); then
     # A reader that fails leaves the advisory coverage (and the blocklist, which the same reader reads) MISSING; it does not
     # end the command before what is already known is judged: the cached Socket blocks and the decision still run, and a
     # block they establish ends the command (104) first.
-    if ! jq -ec --arg why "the advisory reader exited ${rc}" '{schema_version: 1, policy: {block_severities: ["critical"]},
+    if ! jq -ec --arg why "${evidence_why}" '{schema_version: 1, policy: {block_severities: ["critical"]},
           identities: [.packages[] | {name, version, coverage: "missing", gap: $why, advisories: []}], blocklist: []}' <<<"${request}" >"${evidence}" 2>/dev/null; then
       safe_gate_project_lane_refuse 102 "${verb}" "advisory evidence cannot be read (the reader exited ${rc}; audit-infrastructure breakage, not a package finding)" "fix connectivity or run safe doctor, then retry"
       return $?
     fi
-    safe_gate_err "safe: project lane: the advisory reader failed (exit ${rc}): advisory coverage and the blocklist were not read"
+    if (( rc == 65 )); then
+      safe_gate_err "safe: project lane: the advisory reader answered something unreadable: advisory coverage and the blocklist were not read"
+    else
+      safe_gate_err "safe: project lane: the advisory reader failed (exit ${rc}): advisory coverage and the blocklist were not read"
+    fi
   fi
   # The cooldown's reading: the publish time of every introduced registry version of a public host, per exact
   # version (cached in safe's data directory), and for a named exact version inside the window the advisories it
@@ -6487,7 +6464,6 @@ safe_gate_project_lane_run() {
     safe_gate_project_lane_refuse 100 "${verb}" "the cooldown's readings cannot be set aside (audit-infrastructure breakage, not a package finding)" "rerun install.sh and retry"
     return $?
   }
-  lane_offer=0
   safe_gate_project_lane_decide_final
   late_unread=1
   if (( rc != 104 )); then
@@ -6567,9 +6543,7 @@ safe_gate_project_lane_run() {
   if (( rc != 0 )) && (( ! dry_run )) && safe_gate_operator_terminal; then
     local prompt_rc=0
     safe_gate_project_lane_prompts || prompt_rc=$?
-    if (( prompt_rc == 2 )); then
-      return 0
-    elif (( prompt_rc == 3 )); then
+    if (( prompt_rc == 3 )); then
       return "${late_rc}"
     elif (( prompt_rc == 0 )); then
       safe_gate_err "safe: project lane: every class left was resolved at your terminal; the decision is clear"
@@ -6655,8 +6629,8 @@ safe_gate_project_lane_run() {
   rc=0
   # The evidence the prompts' answers rest on may not be older than the window when it is used: enforced here, immediately
   # before the baseline is recorded and the binder starts (the clock started before the first evidence read).
-  if (( prompted )) && (( SECONDS - evidence_read_at >= $(safe_gate_project_lane_evidence_window) )); then
-    safe_gate_project_lane_refuse 102 "${verb}" "the evidence read for this command is $(( (SECONDS - evidence_read_at) / 60 )) minute(s) old, older than the $(( $(safe_gate_project_lane_evidence_window) / 60 )) minutes the lane decides on" "rerun the command: what you accepted is recorded, so it asks nothing again"
+  if safe_gate_project_lane_window_expired; then
+    safe_gate_project_lane_window_refuse
     return $?
   fi
   if (( gap_confirmed )) || [[ "$(jq -r '.unjudged // false' "${report}" 2>/dev/null)" == true ]]; then
@@ -6675,6 +6649,11 @@ safe_gate_project_lane_run() {
   # to it (never ends this command with the child outstanding); its real status is
   # collected, and everything it (and its npm child) prints is cleaned here.
   local bind_rc=0 bind_pid="" rc2=0
+  # a baseline write that began inside the window and ended after it does not start the binder
+  if safe_gate_project_lane_window_expired; then
+    safe_gate_project_lane_window_refuse
+    return $?
+  fi
   SAFE_GATE_LANE_DEFER=1
   SAFE_GATE_LANE_BIND_PID=""
   "${bind_cmd[@]}" >"${scratch}/bind.json" 2>"${scratch}/bind.err" </dev/null &
@@ -9184,12 +9163,6 @@ safe_gate_npm_like() {
           # command's own.
           local +x lane_rc=0
           safe_gate_project_lane_dispatch "$@" || lane_rc=$?
-          if (( lane_rc == $(safe_gate_project_lane_confirmed_handover_status) )); then
-            # the operator confirmed the one-shot route at the terminal: today's gate runs the command with recording
-            # switched off (the one switch that can only remove writes), the helper's own status is the command's
-            lane_rc="$(safe_gate_project_lane_handover_status)"
-            local -x SAFE_AUDIT_NO_RECORDS=1
-          fi
           if (( lane_rc == $(safe_gate_project_lane_unresolved_status) )); then
             # npm resolves the token to no command at all (`npm clean`): it rejects it and runs
             # nothing. For dedupe and prune the command goes straight to npm (never to the older
