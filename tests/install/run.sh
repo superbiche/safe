@@ -9296,6 +9296,8 @@ case_project_lane_success_needs_a_whole_decision_and_a_whole_bind_document() {
       assert_lane_untouched "${before}" "$FUNCNAME: ${kind}" || return
     fi
   done
+  # the plain assignments above are shell variables of this run: they must not reach the cases that follow
+  unset SAFE_AUDIT_EVIDENCE_MISSING SAFE_AUDIT_EVIDENCE_HITS
   pass "$FUNCNAME"
 }
 
@@ -14325,6 +14327,19 @@ main() {
     case_project_lane_cooldown_a_version_without_its_own_time_is_judged_by_the_last_modified_time \
     case_project_lane_cooldown_a_known_block_is_decided_before_any_publish_time_is_read \
     case_project_lane_cooldown_reads_its_advisories_from_the_reader_beside_the_dispatcher \
+    case_project_lane_socket_every_outcome_keeps_todays_exit_and_wording \
+    case_project_lane_socket_scores_the_roots_only_with_one_call \
+    case_project_lane_socket_a_cached_block_anywhere_in_the_graph_is_malice \
+    case_project_lane_socket_a_reader_that_fails_is_breakage_never_clear \
+    case_project_lane_socket_is_read_by_the_reader_beside_the_dispatcher \
+    case_project_lane_socket_a_passing_root_records_nothing_when_the_command_does_not_complete \
+    case_project_lane_socket_a_young_named_fix_installs_under_exempt_and_waits_under_enforce \
+    case_project_lane_socket_a_roots_own_advisory_gates_only_when_introduced \
+    case_project_lane_socket_scores_the_root_the_projection_holds \
+    case_project_lane_socket_an_incomplete_or_contradictory_answer_is_missing_evidence \
+    case_project_lane_socket_calls_use_the_verified_core_not_the_callers \
+    case_project_lane_socket_a_cached_block_on_a_bundled_member_is_malice \
+    case_project_lane_socket_a_reader_that_stalls_is_missing_evidence_within_its_deadline \
     case_project_lane_cooldown_every_other_failure_is_missing_evidence \
     case_project_lane_cooldown_cache_holds_only_what_safe_read \
     case_project_lane_cooldown_security_fix_waiver_is_differential \
