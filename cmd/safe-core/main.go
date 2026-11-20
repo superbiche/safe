@@ -49,6 +49,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "project-decide" {
 		return projectDecide(args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "project-releases" {
+		return projectReleases(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "project-roots" {
+		return projectRoots(args[1:], stdin, stdout, stderr)
+	}
 	if len(args) > 0 && args[0] == "project-bind" {
 		return projectBind(args[1:], stdout, stderr)
 	}
@@ -85,6 +91,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, projectGraphUsage)
 		fmt.Fprintln(stderr, projectDiffUsage)
 		fmt.Fprintln(stderr, projectDecideUsage)
+		fmt.Fprintln(stderr, projectReleasesUsage)
+		fmt.Fprintln(stderr, projectRootsUsage)
 		fmt.Fprintln(stderr, projectBindUsage)
 		fmt.Fprintln(stderr, projectBaselineUsage)
 		fmt.Fprintln(stderr, projectLockfileAdmitUsage)
