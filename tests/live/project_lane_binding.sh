@@ -172,8 +172,9 @@ resolve() { # <dir> [--min-release-age=<days>]
   jq -e '.packages["node_modules/express"].version == "5.1.0"' "${dir}/package-lock.json" >/dev/null
 }
 new_project "${WORK}/control" && new_project "${WORK}/independent" || { fail "the starting projects are written"; exit 1; }
-if resolve "${WORK}/control"; then
-  pass "the control resolution (now) succeeds and holds express@5.1.0"
+# today's resolution under the window the lane runs everything but the dated projection with in scenario B (3 days)
+if resolve "${WORK}/control" "--min-release-age=3"; then
+  pass "the control resolution (now, 3-day window) succeeds and holds express@5.1.0"
 else
   fail "the control resolution (now) succeeds: $(tail -n 3 "${WORK}/control/resolve.log")"
   exit 1
@@ -569,6 +570,9 @@ for setting in npm_config_loglevel=silly npm_config_heading=review-npm npm_confi
 done
 
 # --- scenario B: a delegate that answers differently per phase -----------------
+# B needs the lane's own window to be the one the control resolved with: 3 days, explicit (the earlier scenarios set
+# others). Only the dated projection (the recording wrapper below) is given the longer one.
+write_cooldown_config 3
 # An installation the lane follows the supported way (a launcher, the Node beside
 # it, the npm-cli.js of the same installation) whose Node is a recording wrapper:
 # the projection (the call that begins with --package-lock-only) is dated as of
@@ -757,7 +761,7 @@ if curl -fsS --max-time 60 https://registry.npmjs.org/semver -o "${sem_times}" \
   j2_before="$(sha256sum "${WORK}/j2/package.json" "${WORK}/j2/package-lock.json" | cut -d' ' -f1 | tr '\n' ' ')"
   gate_e "${WORK}/j2" install semver@7.8.6 --ignore-scripts
   status=$?
-  if (( status == 100 )) && tail -n 1 "${WORK}/j2.err" | grep -qE '^safe: BLOCKED npm install \[lane: project\] — semver@7\.8\.6 was published 2026-11-02T17:05:43Z and is inside the '"${WINDOW}"'-day cooldown; it becomes installable on 20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:]{5}Z' \
+  if (( status == 100 )) && tail -n 1 "${WORK}/j2.err" | grep -qE '^safe: BLOCKED npm install \[lane: project\] — semver@7\.8\.6 was published 2026-11-02T17:05:43Z and is inside the '"${WINDOW}"'-day cooldown; it becomes installable on 20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z' \
       && ! grep -qiE 'notarget|ETARGET' "${WORK}/j2.err" \
       && [[ "$(sha256sum "${WORK}/j2/package.json" "${WORK}/j2/package-lock.json" | cut -d' ' -f1 | tr '\n' ' ')" == "${j2_before}" && ! -e "${WORK}/j2/node_modules" ]]; then
     pass "J2 (a named young version): excluded from npm's filter by name, so safe's own reading refuses it with the date it becomes installable (not npm's ETARGET); nothing was written"

@@ -7903,14 +7903,24 @@ if [[ "${sub}" == "project-baseline" ]]; then
   exec "${real}" "$@"
 fi
 if [[ "${sub}" == "project-releases" ]]; then
-  # the cooldown's reading never reaches a real registry from a test: the registry and the advisory service are
-  # the ones the case names (LANE_RELEASES_BASE, LANE_RELEASES_OSV), else an address nothing listens on
+  # the cooldown's reading never reaches a real registry from a test: the registry is the one the case names
+  # (LANE_RELEASES_BASE), else an address nothing listens on
   req=""; prev=""
   for a in "$@"; do [[ "${prev}" != "--request" ]] || req="${a}"; prev="${a}"; done
   [[ -z "${SAFE_INSTALL_COMMAND_LOG:-}" || ! -f "${req}" ]] || printf 'RELEASES_REQUEST\t%s\n' "$(jq -c . "${req}")" >> "${SAFE_INSTALL_COMMAND_LOG}"
   [[ "${tamper}" != "releases-fails" ]] || exit 3
-  out="$("${real}" "$@" --registry-base "${LANE_RELEASES_BASE:-http://127.0.0.1:1}" --osv-url "${LANE_RELEASES_OSV:-http://127.0.0.1:1}")"
-  rc=$?
+  [[ "${tamper}" != "releases-garbled" ]] || { printf '{"schema_version":1,'; exit 0; }
+  [[ "${tamper}" != "releases-foreign-member" ]] || { printf '{"schema_version":1,"now":"2026-01-01T00:00:00Z","policy":{"cooldown_days":3,"security_fix":"exempt"},"identities":[],"extra":1}\n'; exit 0; }
+  if [[ -z "${LANE_RELEASES_BASE:-}" ]]; then
+    # no registry named: every version is an old one (a stand-in for the reader, as the advisory reader's is), so that
+    # a case about something else is not stopped by a registry nothing listens on
+    out="$(jq -c '. as $r | {schema_version: 1, now: (now | todate), policy: $r.policy, identities: (if $r.policy.cooldown_days > 0 then [$r.identities[] | . as $i
+      | {name, version, host, root: ([$r.roots[] | select(.name == $i.name and .version == $i.version)] | length > 0), status: "read", published: "1900-01-01T00:00:00Z", gap: ""}] else [] end)}' "${req}")"
+    rc=$?
+  else
+    out="$("${real}" "$@" --registry-base "${LANE_RELEASES_BASE}")"
+    rc=$?
+  fi
   [[ -z "${SAFE_INSTALL_COMMAND_LOG:-}" ]] || printf 'RELEASES_DOC\t%s\n' "$(jq -c . <<<"${out}" 2>/dev/null)" >> "${SAFE_INSTALL_COMMAND_LOG}"
   printf '%s\n' "${out}"
   exit "${rc}"
@@ -12983,12 +12993,12 @@ case_npm_exec_terminator_leaves_the_childs_arguments_alone() {
 
 # ---- the cooldown of the project lane (ticket 1635) ---------------------------------------------------------
 # A registry and an advisory service of the case's own (tests/lib/fake_registry.py): the lane's publish-time reading
-# reaches them through the test's safe-core wrapper (LANE_RELEASES_BASE, LANE_RELEASES_OSV), never a real registry.
+# reaches them through the test's safe-core wrapper (LANE_RELEASES_BASE), never a real registry.
 COOLDOWN_REG_PID=""
 cooldown_registry_stop() {
   [[ -z "${COOLDOWN_REG_PID}" ]] || { kill "${COOLDOWN_REG_PID}" 2>/dev/null; wait "${COOLDOWN_REG_PID}" 2>/dev/null; }
   COOLDOWN_REG_PID=""
-  unset LANE_RELEASES_BASE LANE_RELEASES_OSV
+  unset LANE_RELEASES_BASE
 }
 # $1 the case's directory, then `name@version=<hours ago>` words: one packument per name
 cooldown_registry_start() {
@@ -13004,10 +13014,11 @@ cooldown_registry_start() {
     [[ -f "${file}" ]] || printf '{"name":"%s","time":{}}\n' "${name}" > "${file}"
     jq -c --arg v "${version}" --arg t "${stamp}" '.time[$v] = $t' "${file}" > "${file}.new" && mv "${file}.new" "${file}"
   done
+  rm -f "${dir}/reg/port"
   python3 "${ROOT_DIR}/tests/lib/fake_registry.py" "${dir}/reg" "${dir}/reg/port" "${dir}/reg/log" &
   COOLDOWN_REG_PID=$!
   for at in $(seq 1 50); do [[ -s "${dir}/reg/port" ]] && break; sleep 0.1; done
-  export LANE_RELEASES_BASE="http://127.0.0.1:$(cat "${dir}/reg/port")" LANE_RELEASES_OSV="http://127.0.0.1:$(cat "${dir}/reg/port")"
+  export LANE_RELEASES_BASE="http://127.0.0.1:$(cat "${dir}/reg/port")"
 }
 cooldown_config() { # <days> [mode]
   printf '{"install":{"project_lane":true,"cooldown_days":%s%s}}\n' "$1" "${2:+,\"cooldown_security_fix\":\"$2\"}" > "${HOME_DIR}/.config/safe/run/config.json"
@@ -13057,7 +13068,7 @@ case_project_lane_cooldown_sets_npms_release_age_filter_on_every_run() {
 # effective configuration, which must hold exactly the window and the exclusions the lane set, and no `before`.
 case_project_lane_cooldown_cannot_be_widened_by_configuration() {
   skip_lockdiff_case "$FUNCNAME" || return
-  local label cfg
+  local cfg
   # a project .npmrc that sets the window, the exclusions or a date is not on the lane's allow-list: the command goes to
   # today's gate on the one-shot route (which has its own cooldown), and the lane's projection never runs
   for cfg in 'before=2030-01-01' 'min-release-age=0' 'min-release-age-exclude[]=evil'; do
@@ -13077,21 +13088,46 @@ case_project_lane_cooldown_cannot_be_widened_by_configuration() {
   lane_prepare "lane-cooldown-before-user" kept@1.0.0
   printf 'before=2030-01-01\n' > "${HOME_DIR}/.npmrc"
   lane_run 'npm update'
-  [[ "${STATUS}" -ne 0 ]] || { fail "$FUNCNAME: a before date in the user's npmrc was accepted"; return; }
-  assert_lane_no_delegate "$FUNCNAME: user before" || return
-  # what npm reports instead of the lane's settings is read back: a window or an exclusion that is not the lane's refuses
-  for cfg in '{"min-release-age":0}|min-release-age 0 where the cooldown sets 3' '{"min-release-age":null}|min-release-age unset' \
-      '{"min-release-age-exclude":["evil"]}|min-release-age-exclude that is not the list' '{"before":"2030-01-01T00:00:00.000Z"}|a before date'; do
-    lane_prepare "lane-cooldown-reported-${RANDOM}" kept@1.0.0
-    NPM_LOCKDIFF_EFFECTIVE_CONFIG_JSON='{"package-lock":true,"ignore-scripts":true,'"${cfg%%|*}"'}' lane_run 'npm update'
-    [[ "${STATUS}" -ne 0 ]] || { fail "$FUNCNAME: ${cfg%%|*} was accepted"; return; }
+  lane_unsupported_case "$FUNCNAME: user before" update 'a before date' || return
+  assert_err_contains_fragment 'a before date' "$FUNCNAME: user before" || return
+  rm -f "${HOME_DIR}/.npmrc"
+  # what npm reports instead of the lane's settings is read back, positively and typed. Each effective configuration is
+  # built with jq and each case asserts ITS OWN diagnostic (not any non-zero exit), for both probes
+  local base='{"package-lock":true,"ignore-scripts":true}' probe config fragment
+  for probe in effective frozen; do
+    while IFS='|' read -r fragment config; do
+      lane_prepare "lane-cooldown-${probe}-${RANDOM}" kept@1.0.0
+      : > "${LOG_FILE}"
+      config="$(jq -c "${config}" <<<"${base}")"
+      if [[ "${probe}" == effective ]]; then NPM_LOCKDIFF_EFFECTIVE_CONFIG_JSON="${config}" lane_run 'npm update'
+      else NPM_FROZEN_CONFIG_JSON="${config}" lane_run 'npm update'; fi
+      lane_unsupported_case "$FUNCNAME: ${probe}: ${fragment}" update "${fragment}" || return
+      assert_err_contains_fragment "${fragment}" "$FUNCNAME: ${probe}: ${fragment}" || return
+      assert_log_not_contains_fragment $'PROJECTION\tnpm' "$FUNCNAME: ${probe}: ${fragment}" || return
+    done <<'CONFIGS'
+min-release-age 0 where the cooldown sets 3|. + {"min-release-age": 0}
+min-release-age of type string where the cooldown sets 3|. + {"min-release-age": "3"}
+min-release-age 30 where the cooldown sets 3|. + {"min-release-age": 30}
+min-release-age-exclude that is not a list of names|. + {"min-release-age-exclude": "evil"}
+min-release-age-exclude that is not a list of names|. + {"min-release-age-exclude": null}
+min-release-age-exclude that is not a list of names|. + {"min-release-age-exclude": [1]}
+min-release-age-exclude that is not the list of the exact versions the command names|. + {"min-release-age-exclude": ["evil"]}
+a before date|. + {"before": "2030-01-01T00:00:00.000Z"}
+CONFIGS
   done
-  for cfg in '{"min-release-age":0}|min-release-age 0 where the cooldown sets 3' '{"min-release-age-exclude":["evil"]}|min-release-age-exclude that is not the list'; do
-    lane_prepare "lane-cooldown-frozen-${RANDOM}" kept@1.0.0
-    NPM_FROZEN_CONFIG_JSON='{"package-lock":true,"ignore-scripts":true,'"$(printf '%s' "${cfg%%|*}" | sed 's/^{//;s/}$//')"'}' lane_run 'npm update'
-    [[ "${STATUS}" -ne 0 ]] || { fail "$FUNCNAME: the frozen probe's ${cfg%%|*} was accepted"; return; }
-    assert_lane_no_delegate "$FUNCNAME" || return
+  # a field that is ABSENT is a refusal too (an absent exclusion field is not the empty list), and so is a configuration
+  # that is not an object
+  for config in '{"package-lock":true,"ignore-scripts":true,"min-release-age":3}|min-release-age-exclude absent' \
+      '{"package-lock":true,"ignore-scripts":true,"min-release-age-exclude":[""]}|min-release-age absent' '[1]|an effective configuration that is not an object'; do
+    lane_prepare "lane-cooldown-absent-${RANDOM}" kept@1.0.0
+    NPM_CONFIG_LIST_RAW="${config%%|*}" lane_run 'npm update'
+    [[ "${STATUS}" -ne 0 ]] || { fail "$FUNCNAME: ${config} was accepted"; return; }
+    assert_lane_no_delegate "$FUNCNAME: ${config}" || return
+    assert_log_not_contains_fragment $'PROJECTION\tnpm' "$FUNCNAME: ${config}" || return
   done
+  lane_prepare "lane-cooldown-absent-diagnostic" kept@1.0.0
+  NPM_CONFIG_LIST_RAW='{"package-lock":true,"ignore-scripts":true,"min-release-age":3}' lane_run 'npm update'
+  assert_err_contains_fragment 'min-release-age-exclude absent' "$FUNCNAME: absent exclusion" || return
   # exclusions and a zero window in the operator's own npmrc cannot widen it: the command line outranks them, and the
   # exclusion list npm reports is the lane's own
   lane_prepare "lane-cooldown-user-exclusions" kept@1.0.0
@@ -13173,75 +13209,206 @@ case_project_lane_cooldown_catches_another_young_version_and_a_young_entry_on_di
 }
 
 # A registry answer without a publish time is disclosed in the report and does not stop; a reading is cached per version.
-case_project_lane_cooldown_unreadable_publish_time_is_disclosed_and_does_not_stop() {
+# The one gap that is disclosed and does not stop: the registry answered completely for the package and holds no time for the
+# version. It is not recorded as a baseline, so that the next command reads the time again.
+case_project_lane_cooldown_a_complete_answer_without_a_time_is_disclosed_and_not_recorded() {
   skip_lockdiff_case "$FUNCNAME" || return
-  lane_prepare "lane-cooldown-unreadable" kept@1.0.0
-  # a packument with no time for the version, and a name the registry does not know
-  cooldown_registry_start "${CASE_DIR}" "other@9.9.9=1"
+  lane_prepare "lane-cooldown-no-time" kept@1.0.0
+  # the registry knows `fresh` and `other`, with no time for the versions asked
+  cooldown_registry_start "${CASE_DIR}" "fresh@9.9.9=1" "other@9.9.9=1"
   NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0 other@1.0.0)" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run 'npm update'
-  cooldown_registry_stop
   assert_status 0 "$FUNCNAME" || return
   assert_err_contains_fragment 'cooldown: publish time not read for 2 version(s), disclosed and not stopping: ' "$FUNCNAME" || return
-  assert_err_contains_fragment 'fresh@2.0.0 (the registry answered HTTP 404)' "$FUNCNAME" || return
-  assert_err_contains_fragment 'other@1.0.0 (the registry'"'"'s packument has no publish time for this version)' "$FUNCNAME" || return
-  # the registry cannot be reached at all: the same, disclosed, not stopping
-  lane_prepare "lane-cooldown-unreachable" kept@1.0.0
-  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm update'
-  assert_status 0 "$FUNCNAME: unreachable" || return
-  assert_err_contains_fragment 'the registry could not be reached' "$FUNCNAME: unreachable" || return
-  # a publish time is read once per exact version: a second command asks the registry nothing
-  lane_prepare "lane-cooldown-cache" kept@1.0.0
-  cooldown_registry_start "${CASE_DIR}" "fresh@2.0.0=10" "kept@1.0.0=2400"
-  local n1 n2
-  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm update'
-  n1="$(grep -c '^GET /fresh' "${CASE_DIR}/reg/log")"
-  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm update'
-  n2="$(grep -c '^GET /fresh' "${CASE_DIR}/reg/log")"
+  assert_err_contains_fragment 'fresh@2.0.0 (the registry answered completely for this package and holds no publish time for this version)' "$FUNCNAME" || return
+  assert_err_contains_fragment 'is not recorded as a baseline' "$FUNCNAME" || return
+  [[ -z "$(ls -A "${HOME_DIR}/.local/share/safe/project-lane/state/project-baseline" 2>/dev/null)" ]] || { fail "$FUNCNAME: a lockfile judged with a publish time missing was recorded"; return; }
   cooldown_registry_stop
-  [[ "${n1}" == 1 && "${n2}" == 1 ]] || { fail "$FUNCNAME: the packument was asked ${n1} then ${n2} times, not once"; return; }
-  assert_status 100 "$FUNCNAME: cached, still young" || return
+  # a lockfile-only run with the gap, then `ci` on the lockfile it published once the registry answers with a young time:
+  # nothing was recorded, so the baseline is the committed one and the young version waits
+  lane_prepare "lane-cooldown-gap-then-ci" kept@1.0.0
+  cooldown_registry_start "${CASE_DIR}" "fresh@9.9.9=1"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm update --package-lock-only'
+  assert_status 0 "$FUNCNAME: lockfile-only with the gap" || return
+  assert_err_contains_fragment 'is not recorded as a baseline' "$FUNCNAME: lockfile-only" || return
+  jq -e '.packages["node_modules/fresh"].version == "2.0.0"' "${WORK_DIR}/package-lock.json" >/dev/null || { fail "$FUNCNAME: the lockfile was not published"; return; }
+  cooldown_registry_start "${CASE_DIR}" "fresh@2.0.0=10"
+  : > "${LOG_FILE}"
+  lane_run 'npm ci'
+  cooldown_registry_stop
+  assert_status 100 "$FUNCNAME: ci after the registry answered" || return
+  assert_err_contains_fragment 'fresh@2.0.0 was published ' "$FUNCNAME: ci" || return
+  assert_err_not_contains_fragment 'baseline: a lockfile safe judged clear and recorded' "$FUNCNAME: ci" || return
+  pass "$FUNCNAME"
+}
+
+# Everything else that leaves a version without a time is MISSING EVIDENCE: 102, naming how many readings are missing, never
+# a pass. An answer for another package, a redirect, an error status, an unreadable answer and an unreachable registry.
+case_project_lane_cooldown_every_other_failure_is_missing_evidence() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local cause want
+  # name|how the registry misbehaves|the cause the report names
+  while IFS='|' read -r cause want; do
+    lane_prepare "lane-cooldown-fail-${RANDOM}" kept@1.0.0
+    cooldown_registry_start "${CASE_DIR}" "kept@1.0.0=2400"
+    case "${cause}" in
+      status) printf '503\n' > "${CASE_DIR}/reg/packuments/fresh.status" ;;
+      redirect) printf 'http://127.0.0.1:1/fresh\n' > "${CASE_DIR}/reg/packuments/fresh.redirect" ;;
+      wrong-package) printf '{"name":"someone-else","time":{"2.0.0":"2000-01-01T00:00:00.000Z"}}\n' > "${CASE_DIR}/reg/packuments/fresh.json" ;;
+      garbled) printf '{"name":"fresh","time":{' > "${CASE_DIR}/reg/packuments/fresh.json" ;;
+      not-found) ;;
+      unreachable) cooldown_registry_stop; export LANE_RELEASES_BASE=http://127.0.0.1:1 ;;
+    esac
+    : > "${LOG_FILE}"
+    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm update'
+    cooldown_registry_stop
+    assert_status 102 "$FUNCNAME: ${cause}" || return
+    assert_lane_final_line update "$FUNCNAME: ${cause}" || return
+    assert_err_contains_fragment '1 publish time(s) could not be read, so the cooldown cannot be judged for them (first: fresh@2.0.0: '"${want}" "$FUNCNAME: ${cause}" || return
+    assert_log_not_contains_fragment $'REAL\tnpm\tci\t--ignore-scripts' "$FUNCNAME: ${cause}" || return
+  done <<'CAUSES'
+status|the registry answered HTTP 503
+redirect|the registry answered HTTP 301
+wrong-package|the registry's answer is for another package
+garbled|the registry's answer is not a complete packument
+not-found|the registry answered HTTP 404
+unreachable|the registry could not be reached
+CAUSES
+  # the missing readings are counted
+  lane_prepare "lane-cooldown-fail-count" kept@1.0.0
+  LANE_RELEASES_BASE=http://127.0.0.1:1 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0 other@1.0.0)" lane_run 'npm update'
+  assert_status 102 "$FUNCNAME: count" || return
+  assert_err_contains_fragment '2 publish time(s) could not be read' "$FUNCNAME: count" || return
+  pass "$FUNCNAME"
+}
+
+# A reading is cached per exact version, in the lane's own store, and only what safe itself read is trusted: an entry that
+# fails the checks of the recorded lockfiles (a directory that is not private, a link, a file of another mode) or that was
+# made for another source is ignored and the registry is asked again; a good one is reused.
+case_project_lane_cooldown_cache_holds_only_what_safe_read() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local store="" source how n
+  plant() { # <source> [mode]: an entry that says fresh@2.0.0 is two years old, in the store's layout
+    local src="$1" d="${store}/$(printf '%s' "$1" | sha256sum | cut -d' ' -f1)" f
+    mkdir -p "${d}" "${store}" 2>/dev/null
+    chmod 700 "${store}" "${d}"
+    f="${d}/$(printf 'fresh\0002.0.0' | sha256sum | cut -d' ' -f1)"
+    printf '{"schema_version":1,"source":"%s","name":"fresh","version":"2.0.0","published":"2020-01-01T00:00:00Z"}\n' "${src}" > "${f}"
+    chmod "${2:-600}" "${f}"
+    printf '%s' "${f}"
+  }
+  for how in private-group-writable-store link wrong-mode other-source canonical-for-a-mirror; do
+    lane_prepare "lane-cooldown-cache-${how}" kept@1.0.0
+    store="${HOME_DIR}/.local/share/safe/project-lane/state/publish-times"
+    cooldown_registry_start "${CASE_DIR}" "fresh@2.0.0=10" "kept@1.0.0=2400"
+    source="${LANE_RELEASES_BASE}"
+    local f
+    case "${how}" in
+      private-group-writable-store) f="$(plant "${source}")"; chmod 770 "$(dirname "${f}")" ;;
+      link) f="$(plant "${source}")"; cp "${f}" "${CASE_DIR}/elsewhere"; chmod 600 "${CASE_DIR}/elsewhere"; rm -f "${f}"; ln -s "${CASE_DIR}/elsewhere" "${f}" ;;
+      wrong-mode) f="$(plant "${source}" 644)" ;;
+      other-source) plant "http://mirror.example" >/dev/null ;;
+      canonical-for-a-mirror) plant "https://registry.npmjs.org" >/dev/null ;;
+    esac
+    : > "${CASE_DIR}/reg/log"
+    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm update'
+    n="$(grep -c '^GET /fresh' "${CASE_DIR}/reg/log")"
+    cooldown_registry_stop
+    assert_status 100 "$FUNCNAME: ${how}: the planted entry cleared the wait" || return
+    assert_err_contains_fragment 'fresh@2.0.0 was published ' "$FUNCNAME: ${how}" || return
+    [[ "${n}" == 1 ]] || { fail "$FUNCNAME: ${how}: the registry was asked ${n} times, not once (the entry was trusted)"; return; }
+  done
+  # the same entry in a store that passes every check is a reading safe made: it is reused, the registry is not asked
+  lane_prepare "lane-cooldown-cache-reused" kept@1.0.0
+  store="${HOME_DIR}/.local/share/safe/project-lane/state/publish-times"
+  cooldown_registry_start "${CASE_DIR}" "fresh@2.0.0=10" "kept@1.0.0=2400"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm update'
+  assert_status 100 "$FUNCNAME: first reading" || return
+  n="$(grep -c '^GET /fresh' "${CASE_DIR}/reg/log")"
+  : > "${CASE_DIR}/reg/log"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm update'
+  cooldown_registry_stop
+  [[ "${n}" == 1 && "$(grep -c '^GET /fresh' "${CASE_DIR}/reg/log")" == 0 ]] || { fail "$FUNCNAME: the reading safe made was not reused"; return; }
+  [[ "$(stat -c %a "${store}")" == 700 ]] || { fail "$FUNCNAME: the store is not private"; return; }
   pass "$FUNCNAME"
 }
 
 # Today's security-fix exemption, with its enforce setting, for the version the caller named; a young fix nobody named is
 # not selected.
-case_project_lane_cooldown_security_fix_exemption_belongs_to_the_named_version() {
+# The security-fix exemption is differential: the named exact version must REPLACE a version of the same package in the
+# baseline and thereby remove an advisory the baseline carries for it, as the lane's own advisory reading shows.
+case_project_lane_cooldown_security_fix_waiver_is_differential() {
   skip_lockdiff_case "$FUNCNAME" || return
-  local osv='{"vulns":[{"id":"GHSA-fix-0001","affected":[{"package":{"name":"fresh","ecosystem":"npm"},"ranges":[{"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"2.0.0"}]}]}]}]}'
-  lane_prepare "lane-cooldown-fix-exempt" kept@1.0.0
-  cooldown_registry_start "${CASE_DIR}" "fresh@2.0.0=10"
-  printf '%s\n' "${osv}" > "${CASE_DIR}/reg/osv.json"
-  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm install fresh@2.0.0'
-  assert_status 0 "$FUNCNAME: named, exempt" || return
-  assert_err_contains_fragment 'waived as the security fix it names: fresh@2.0.0 (fixes GHSA-fix-0001)' "$FUNCNAME: exempt" || return
+  local hit='[{"id":"GHSA-fix-0001","severity":"high","malware":false}]' hits
+  hits="{\"fresh@1.0.0\":${hit}}"
+  # an affected upgrade: waived, and the report names what it removes
+  lane_prepare "lane-cooldown-fix-affected" kept@1.0.0 fresh@1.0.0
+  cooldown_registry_start "${CASE_DIR}" "fresh@2.0.0=10" "kept@1.0.0=2400" "fresh@1.0.0=2400"
+  SAFE_AUDIT_EVIDENCE_HITS="${hits}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm install fresh@2.0.0'
+  assert_status 0 "$FUNCNAME: affected upgrade" || return
+  assert_err_contains_fragment 'waived as the security fix it names: fresh@2.0.0 (fixes GHSA-fix-0001)' "$FUNCNAME: affected" || return
   # enforce: the wait stays and says why
-  lane_prepare "lane-cooldown-fix-enforce" kept@1.0.0
+  lane_prepare "lane-cooldown-fix-enforce" kept@1.0.0 fresh@1.0.0
   cooldown_config 3 enforce
-  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm install fresh@2.0.0'
+  SAFE_AUDIT_EVIDENCE_HITS="${hits}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm install fresh@2.0.0'
   assert_status 100 "$FUNCNAME: enforce" || return
   assert_err_contains_fragment 'it fixes GHSA-fix-0001, but install.cooldown_security_fix is enforce' "$FUNCNAME: enforce" || return
-  # the same young fix reached by an update, which names nothing, is a wait: npm's filter would not have selected it
-  lane_prepare "lane-cooldown-fix-unnamed" kept@1.0.0
- NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm update'
+  # an unaffected upgrade (the baseline's version carries no advisory): nothing is removed, the version waits
+  lane_prepare "lane-cooldown-fix-unaffected" kept@1.0.0 fresh@1.0.0
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm install fresh@2.0.0'
+  assert_status 100 "$FUNCNAME: unaffected upgrade" || return
+  assert_err_not_contains_fragment 'waived as' "$FUNCNAME: unaffected" || return
+  # a fresh add: the project has no version of it, so a fix removes nothing for the project
+  lane_prepare "lane-cooldown-fix-fresh-add" kept@1.0.0
+  SAFE_AUDIT_EVIDENCE_HITS="${hits}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm install fresh@2.0.0'
+  assert_status 100 "$FUNCNAME: fresh add" || return
+  assert_err_not_contains_fragment 'waived as' "$FUNCNAME: fresh add" || return
+  # an advisory the lane's reading no longer carries (withdrawn) is not removed by anything: the version waits
+  lane_prepare "lane-cooldown-fix-withdrawn" kept@1.0.0 fresh@1.0.0
+  SAFE_AUDIT_EVIDENCE_HITS='{}' NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm install fresh@2.0.0'
+  assert_status 100 "$FUNCNAME: withdrawn" || return
+  # the same upgrade reached by an update, which names nothing, is a wait: a young fix nobody named is not selected
+  lane_prepare "lane-cooldown-fix-unnamed" kept@1.0.0 fresh@1.0.0
+  SAFE_AUDIT_EVIDENCE_HITS="${hits}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm update'
   cooldown_registry_stop
   assert_status 100 "$FUNCNAME: unnamed" || return
   assert_err_not_contains_fragment 'waived as' "$FUNCNAME: unnamed" || return
+  # no package-level advisory question is asked of anyone: the registry saw packuments only
   pass "$FUNCNAME"
 }
 
 # The cooldown's failures are the lane's: an npm that does not define the exclusion option refuses, a reader that fails or
 # a document that lacks its members is breakage, never a pass.
-case_project_lane_cooldown_failures_are_breakage_not_a_pass() {
+# The cooldown's failures are the lane's: an npm that does not define the exclusion option refuses; a reader that fails, a
+# document that is not whole or one the decision cannot read leave the readings MISSING (102), applied after what the
+# evidence already establishes: a blocklist hit or a blocking advisory is decided first (104, the block's line).
+case_project_lane_cooldown_failures_are_breakage_and_a_known_block_comes_first() {
   skip_lockdiff_case "$FUNCNAME" || return
+  local tamper
   lane_prepare "lane-cooldown-capability" kept@1.0.0
   NODE_CAPABILITY_JSON='{"version":"11.12.1","atFloor":true,"missing":["min-release-age-exclude"]}' lane_run 'npm install clean@2.0.0'
   lane_unsupported_case "$FUNCNAME: no exclusion option" install 'an npm without the exclusion option' || return
   assert_err_contains_fragment 'does not define min-release-age-exclude' "$FUNCNAME: no exclusion option" || return
-  lane_prepare "lane-cooldown-reader-fails" kept@1.0.0
-  SAFE_CORE_TAMPER=releases-fails NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
-  assert_status 102 "$FUNCNAME: reader fails" || return
-  assert_lane_final_line install "$FUNCNAME: reader fails" || return
-  assert_err_contains_fragment 'publish times cannot be read' "$FUNCNAME: reader fails" || return
+  for tamper in releases-fails releases-garbled releases-foreign-member; do
+    lane_prepare "lane-cooldown-${tamper}" kept@1.0.0
+    SAFE_CORE_TAMPER="${tamper}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+    assert_status 102 "$FUNCNAME: ${tamper}" || return
+    assert_lane_final_line install "$FUNCNAME: ${tamper}" || return
+    assert_err_contains_fragment 'publish time(s) could not be read, so the cooldown cannot be judged for them' "$FUNCNAME: ${tamper}" || return
+    # the readings are set aside as missing; npm's frozen install never ran
+    assert_log_not_contains_fragment $'REAL\tnpm\tci\t--ignore-scripts' "$FUNCNAME: ${tamper}" || return
+    # the same failure with an established block: the block's line and exit, not the reader's
+    lane_prepare "lane-cooldown-${tamper}-block" kept@1.0.0
+    SAFE_CORE_TAMPER="${tamper}" SAFE_AUDIT_EVIDENCE_BLOCKLIST='[{"name":"clean","reason":"operator blocklist"}]' \
+      NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+    assert_status 104 "$FUNCNAME: ${tamper} with a blocklist hit" || return
+    assert_lane_final_line install "$FUNCNAME: ${tamper} with a blocklist hit" || return
+    assert_err_contains_fragment 'blocklist entry on clean@2.0.0' "$FUNCNAME: ${tamper} with a blocklist hit" || return
+    lane_prepare "lane-cooldown-${tamper}-advisory" kept@1.0.0
+    SAFE_CORE_TAMPER="${tamper}" SAFE_AUDIT_EVIDENCE_HITS="{\"clean@2.0.0\":${LANE_HIT_CRITICAL}}" \
+      NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+    assert_status 104 "$FUNCNAME: ${tamper} with a blocking advisory" || return
+    assert_err_contains_fragment 'blocking advisory' "$FUNCNAME: ${tamper} with a blocking advisory" || return
+  done
   lane_prepare "lane-cooldown-no-request" kept@1.0.0
   SAFE_CORE_TAMPER=diff-no-cooldown-request NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
   [[ "${STATUS}" -ne 0 ]] || { fail "$FUNCNAME: a difference without its cooldown request was accepted"; return; }
@@ -13250,6 +13417,63 @@ case_project_lane_cooldown_failures_are_breakage_not_a_pass() {
   SAFE_CORE_TAMPER=decide-no-cooldown NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
   [[ "${STATUS}" -ne 0 ]] || { fail "$FUNCNAME: a report without its cooldown was accepted"; return; }
   assert_lane_final_line install "$FUNCNAME: no section" || return
+  pass "$FUNCNAME"
+}
+
+# install.cooldown_days is validated as a decimal string before any arithmetic: a value the lane cannot honour refuses with a
+# configuration error that names the key, nothing is capped or wrapped; the others read as today's auditor reads them.
+case_project_lane_cooldown_days_are_validated_before_arithmetic() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local value want
+  # JSON value|the window on the command line (honoured), "refuse" when the lane cannot honour it
+  while IFS='|' read -r value want; do
+    lane_prepare "lane-cooldown-days-${RANDOM}" kept@1.0.0
+    printf '{"install":{"project_lane":true,"cooldown_days":%s}}\n' "${value}" > "${HOME_DIR}/.config/safe/run/config.json"
+    : > "${LOG_FILE}"
+    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm update'
+    if [[ "${want}" == refuse ]]; then
+      assert_status 100 "$FUNCNAME: ${value}" || return
+      assert_lane_final_line update "$FUNCNAME: ${value}" || return
+      assert_err_contains_fragment 'the configuration key install.cooldown_days is ' "$FUNCNAME: ${value}" || return
+      assert_err_contains_fragment 'which the lane cannot honour (a whole number of days from 0 to 36500)' "$FUNCNAME: ${value}" || return
+      assert_log_not_contains_fragment $'REAL\tnpm\t' "$FUNCNAME: ${value}: npm ran" || return
+    else
+      assert_status 0 "$FUNCNAME: ${value}" || return
+      grep -qP "^PROJECTION\tnpm\t.*\t--min-release-age=${want}\t" "${LOG_FILE}" || { fail "$FUNCNAME: ${value}: the window is not ${want}"; return; }
+    fi
+  done <<'VALUES'
+4000|4000
+36500|36500
+36501|refuse
+99999999999999999999|refuse
+12345678901234567890|refuse
+"99999"|refuse
+0|0
+"007"|7
+"0000000000000000000000000000000000000000042"|42
+-3|3
+3.5|3
+"soon"|3
+true|3
+null|3
+VALUES
+  pass "$FUNCNAME"
+}
+
+# The registry's fractional seconds are kept through the reading and the decision, and the retry time printed is rounded UP to
+# the second: never earlier than eligibility.
+case_project_lane_cooldown_keeps_fractional_seconds_and_rounds_the_retry_time_up() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-cooldown-precision" kept@1.0.0
+  cooldown_registry_start "${CASE_DIR}" "kept@1.0.0=2400"
+  local whole want
+  whole="$(date -u -d '10 hours ago' +%Y-%m-%dT%H:%M:%S)"
+  printf '{"name":"fresh","time":{"2.0.0":"%s.359Z"}}\n' "${whole}" > "${CASE_DIR}/reg/packuments/fresh.json"
+  want="$(date -u -d "${whole}Z + 3 days + 1 second" +%Y-%m-%dT%H:%M:%SZ)"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 fresh@2.0.0)" lane_run 'npm install fresh@2.0.0'
+  cooldown_registry_stop
+  assert_status 100 "$FUNCNAME" || return
+  assert_err_contains_fragment "fresh@2.0.0 was published ${whole}.359Z and is inside the 3-day cooldown; it becomes installable on ${want}" "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
@@ -13652,9 +13876,13 @@ main() {
     case_project_lane_cooldown_named_young_version_waits_with_the_date \
     case_project_lane_cooldown_judges_what_the_command_introduces_not_the_baseline \
     case_project_lane_cooldown_catches_another_young_version_and_a_young_entry_on_disk \
-    case_project_lane_cooldown_unreadable_publish_time_is_disclosed_and_does_not_stop \
-    case_project_lane_cooldown_security_fix_exemption_belongs_to_the_named_version \
-    case_project_lane_cooldown_failures_are_breakage_not_a_pass \
+    case_project_lane_cooldown_a_complete_answer_without_a_time_is_disclosed_and_not_recorded \
+    case_project_lane_cooldown_every_other_failure_is_missing_evidence \
+    case_project_lane_cooldown_cache_holds_only_what_safe_read \
+    case_project_lane_cooldown_security_fix_waiver_is_differential \
+    case_project_lane_cooldown_failures_are_breakage_and_a_known_block_comes_first \
+    case_project_lane_cooldown_days_are_validated_before_arithmetic \
+    case_project_lane_cooldown_keeps_fractional_seconds_and_rounds_the_retry_time_up \
     case_project_lane_ci_shows_npms_error_wherever_it_is_in_its_output \
     case_project_lane_prune_package_lock_only_refuses \
     case_project_lane_ci_report_does_not_overstate_incomplete_coverage_and_the_guard_uses_the_global_boundary \

@@ -4,14 +4,20 @@
 
 - Project lane (still behind `install.project_lane`): the cooldown. npm's release-age filter is on the command line of
   every npm run of the lane at `install.cooldown_days` (with the exact versions the command names excluded by name),
-  and the configuration probe reads the window, the exclusions and the absence of a `before` date back, so no
-  configuration can widen it. The decision is safe's own reading (`safe-core project-releases`): the publish time of
-  every introduced registry version, cached per exact version; an introduced version younger than the cooldown is the
-  Wait class (exit 100, naming the package, the version and the date it becomes installable). A named exact version
-  that fixes an advisory is waived under `cooldown_security_fix=exempt` and waits under `enforce`; another young version
-  of the same name and a young entry of a lockfile on disk that is not the baseline wait; a version already in the
-  baseline is not judged. A publish time that cannot be read is disclosed in the report and does not stop. The lane's
-  npm must define `min-release-age-exclude` (npm 11.17.0 or later).
+  and the configuration probe reads the window, the exclusions and the absence of a `before` date back (positively and
+  typed), so no configuration can widen it. The decision is safe's own reading (`safe-core project-releases`): the
+  publish time of every introduced registry version, read from the bound registry (no proxy, no redirect, the answer
+  for the package asked), cached per exact version in the lane's own store under the checks of the recorded lockfiles;
+  an introduced version younger than the cooldown is the Wait class (exit 100, naming the package, the version, its
+  publish time and the instant it becomes installable, rounded up). A registry that answered completely and holds no
+  time for the version is disclosed and does not stop (and the lockfile is not recorded as a baseline); every other
+  failure to read a time is missing evidence (102), after what the evidence already establishes. A named exact
+  version is waived under `cooldown_security_fix=exempt` only when it replaces a baseline version of the same package
+  and removes an advisory the baseline carries (and waits under `enforce`); another young version of the same name and
+  a young entry of a lockfile on disk that is not the baseline wait; a version already in the baseline is not judged.
+  `install.cooldown_days` is validated as a decimal string (at most 36500; a value the lane cannot honour is a
+  configuration error, never capped or wrapped). The lane's npm must define `min-release-age-exclude` (npm 11.17.0
+  or later). A dated invocation (`npm_config_before`) is refused: the window outranks every `before`.
 
 - **Fix: a bypass of the installed gate for npm `=`-form options.** npm's parser reads `--flag=value` as
   `--flag value`, and a Boolean-typed flag leaves a value other than `true`/`false` as a positional argument:
