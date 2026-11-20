@@ -761,7 +761,7 @@ if curl -fsS --max-time 60 https://registry.npmjs.org/semver -o "${sem_times}" \
   j2_before="$(sha256sum "${WORK}/j2/package.json" "${WORK}/j2/package-lock.json" | cut -d' ' -f1 | tr '\n' ' ')"
   gate_e "${WORK}/j2" install semver@7.8.6 --ignore-scripts
   status=$?
-  if (( status == 100 )) && tail -n 1 "${WORK}/j2.err" | grep -qE '^safe: BLOCKED npm install \[lane: project\] — semver@7\.8\.6 was published 2026-11-02T17:05:43Z and is inside the '"${WINDOW}"'-day cooldown; it becomes installable on 20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z' \
+  if (( status == 100 )) && tail -n 1 "${WORK}/j2.err" | grep -qE '^safe: BLOCKED npm install \[lane: project\] — semver@7\.8\.6 was published 2026-11-02T17:05:43\.359Z and is inside the '"${WINDOW}"'-day cooldown; it becomes installable on 20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z' \
       && ! grep -qiE 'notarget|ETARGET' "${WORK}/j2.err" \
       && [[ "$(sha256sum "${WORK}/j2/package.json" "${WORK}/j2/package-lock.json" | cut -d' ' -f1 | tr '\n' ' ')" == "${j2_before}" && ! -e "${WORK}/j2/node_modules" ]]; then
     pass "J2 (a named young version): excluded from npm's filter by name, so safe's own reading refuses it with the date it becomes installable (not npm's ETARGET); nothing was written"
