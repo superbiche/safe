@@ -842,7 +842,10 @@ safe_gate_nopt_numeric() {
 #   SAFE_GATE_NOPT_UNSTABLE    an interpreted option whose value npm would trim, drop or replace, or two settings of
 #                              global mode that disagree (the name, or `global mode`)
 #   SAFE_GATE_NOPT_SEEN        `|name|name|` the options set (after expansion and abbreviation)
-#   SAFE_GATE_NOPT_GLOBAL      0 or 1: npm's global mode: --global, or --location=global
+#   SAFE_GATE_NOPT_GLOBAL      0 or 1: npm's global mode as the gate takes it: --global only (npm 8.1.0 does not act on
+#                              --location=global, the others do: the gate never lets --location decide, see LOCGLOBAL)
+#   SAFE_GATE_NOPT_LOCGLOBAL   0 or 1: the location setting is global, in any spelling
+#   SAFE_GATE_NOPT_NEGWORD     the negated options of a type that takes a value that are followed by a word
 # With SAFE_GATE_NOPT_EXACT=1 an abbreviated option or shorthand name is read as an unknown one.
 safe_gate_nopt_parse() {
   safe_gate_nopt_load
@@ -855,7 +858,7 @@ safe_gate_nopt_parse() {
   local i n name arg orig v la no flags known isbool val consume gval="" lval="" had_eq la_set gctr=0 gbase at lits abbreviated
   for (( i=0; i<$#; i++ )); do ne+=(0); ng+=(0); nat+=("$((i + 1))"); done
   SAFE_GATE_NOPT_REMAIN=() SAFE_GATE_NOPT_REMAIN_AT=() SAFE_GATE_NOPT_LOOSE=() SAFE_GATE_NOPT_UNKNOWN=() SAFE_GATE_NOPT_UNKNOWN_AT=() SAFE_GATE_NOPT_UNKNOWN_ABBREV=()
-  SAFE_GATE_NOPT_NEGATED=() SAFE_GATE_NOPT_CLUSTER=() SAFE_GATE_NOPT_UNSTABLE=() SAFE_GATE_NOPT_SEEN="|" SAFE_GATE_NOPT_GLOBAL=0
+  SAFE_GATE_NOPT_NEGATED=() SAFE_GATE_NOPT_CLUSTER=() SAFE_GATE_NOPT_UNSTABLE=() SAFE_GATE_NOPT_SEEN="|" SAFE_GATE_NOPT_GLOBAL=0 SAFE_GATE_NOPT_LOCGLOBAL=0 SAFE_GATE_NOPT_NEGWORD=()
   i=0
   while (( i < ${#na[@]} )); do
     arg="${na[i]}"
@@ -962,6 +965,15 @@ safe_gate_nopt_parse() {
         ne[i+1]=2
         if (( ng[i+1] > 0 && ng[i+1] != ng[i] )); then SAFE_GATE_NOPT_CLUSTER+=("${gsrc[ng[i+1]]}"); fi
       fi
+      # a negated option whose plain form takes a value, followed by a word: nopt gives the word to the option or
+      # leaves it an argument by the option's type, which differs between versions and machines (`--no-local-address
+      # 127.0.0.1`: the interfaces of the machine are its literals)
+      # (an option that is Boolean with only fixed literals, `color`: always, takes its word the same way in every version
+      # on every machine, so `--no-color pkg` and `--no-color always` stay as nopt reads them)
+      if (( known )) && [[ -n "${no}" && ( "${flags}" != *B* || "${flags}" == *T* || "${flags}" == *N* ) && "${la_set}" == 1 && -n "${la}" && "${la}" != true && "${la}" != false ]] \
+          && { (( consume )) || [[ "${la}" != -* ]]; }; then
+        SAFE_GATE_NOPT_NEGWORD+=("${orig}")
+      fi
       if [[ "${name}" == global ]]; then
         gval="${val}"
         gmodes+=("$(( val == 1 ? 1 : 0 ))")
@@ -970,7 +982,7 @@ safe_gate_nopt_parse() {
         # `--no-location global`: a listed literal after a negated option is the option's value (nopt's isBool branch)
         if (( consume )) && [[ "${la}" == global || "${la}" == user || "${la}" == project ]]; then
           lval="${la}"
-          if [[ "${la}" == global ]]; then gmodes+=(1); else gmodes+=(0); fi
+          if [[ "${la}" == global ]]; then SAFE_GATE_NOPT_LOCGLOBAL=1; else gmodes+=(0); fi
         else
           SAFE_GATE_NOPT_UNSTABLE+=("${name}")
         fi
@@ -1001,7 +1013,7 @@ safe_gate_nopt_parse() {
       if (( ng[i+1] > 0 && ng[i+1] != ng[i] )); then SAFE_GATE_NOPT_CLUSTER+=("${gsrc[ng[i+1]]}"); fi
       if [[ "${name}" == location ]]; then
         lval="${la}"
-        if [[ "${la}" == global ]]; then gmodes+=(1); else gmodes+=(0); fi
+        if [[ "${la}" == global ]]; then SAFE_GATE_NOPT_LOCGLOBAL=1; else gmodes+=(0); fi
       fi
     elif [[ "${name}" == location ]]; then
       gmodes+=(0)
@@ -1012,7 +1024,8 @@ safe_gate_nopt_parse() {
   local m1=0 m0=0 m
   for m in ${gmodes[@]+"${gmodes[@]}"}; do (( m == 1 )) && m1=1 || m0=1; done
   (( m1 && m0 )) && SAFE_GATE_NOPT_UNSTABLE+=("global mode")
-  if [[ "${gval}" == 1 || "${lval}" == global ]]; then SAFE_GATE_NOPT_GLOBAL=1; fi
+  if [[ "${gval}" == 1 ]]; then SAFE_GATE_NOPT_GLOBAL=1; fi
+  if [[ "${lval}" == global ]]; then SAFE_GATE_NOPT_LOCGLOBAL=1; fi
   return 0
 }
 
@@ -1043,11 +1056,13 @@ safe_gate_nopt_known_flag() {
 # is read as npm reads it; both refuse, without printing the argument.
 safe_gate_npm_argument_hygiene() {
   local arg first=1 i
+  local linebreak_msg="safe: BLOCKED npm — an argument holds a line break, which the gate's extractors read as two arguments and npm as one; to allow: pass one package or value per argument, without line breaks, then retry; details: safe explain"
+  # what a gate extractor reads: every argument, except that after the terminator of `npm exec` only the first operand
+  # (the package or command to audit) is read: the rest are the child's own arguments (`npm exec -- node -e '<two lines>'`)
   for arg in "$@"; do
+    if [[ "${npm_class:-}" == exec && "${arg}" == -- ]]; then break; fi
     case "${arg}" in
-      *$'\n'*|*$'\r'*)
-        safe_gate_err "safe: BLOCKED npm — an argument holds a line break, which the gate's extractors read as two arguments and npm as one; to allow: pass one package or value per argument, without line breaks, then retry; details: safe explain"
-        return 100 ;;
+      *$'\n'*|*$'\r'*) safe_gate_err "${linebreak_msg}"; return 100 ;;
     esac
   done
   # an option terminator written before the command: npm reads everything after it as arguments, options included
@@ -1062,6 +1077,7 @@ safe_gate_npm_argument_hygiene() {
     arg="${SAFE_GATE_NOPT_REMAIN[i]}"
     # (for exec only the first operand names a package; the rest are the command's own arguments)
     [[ "${npm_class:-}" == exec && i -gt 1 ]] && break
+    case "${arg}" in *$'\n'*|*$'\r'*) safe_gate_err "${linebreak_msg}"; return 100 ;; esac
     if [[ "${arg}" == "-" ]]; then
       safe_gate_err "safe: BLOCKED npm — a lone dash is an argument the gate's extractors skip as a stdin marker and npm fetches as a package; to allow: name the package, or drop the dash, then retry; details: safe explain"
       return 100
@@ -1071,6 +1087,19 @@ safe_gate_npm_argument_hygiene() {
       return 100
     fi
   done
+  # --location=global, in any spelling: npm 8.1.0 parses it and does not act on it (its install reads only `global`),
+  # every later npm acts on it, so the gate cannot tell whether the command is global; `-g` is the one global form
+  if (( SAFE_GATE_NOPT_LOCGLOBAL )); then
+    safe_gate_err "safe: BLOCKED npm — the location is set to global, which npm 8.1.0 parses and does not act on (its install reads only the global setting) and later versions do, so the gate cannot tell whether the command is global; to allow: use -g (or --global) for a global command, or drop the option, then retry; details: safe explain"
+    return 100
+  fi
+  # a negated option whose plain form takes a value, followed by a word
+  if (( ${#SAFE_GATE_NOPT_NEGWORD[@]} )); then
+    local negname
+    negname="$(safe_gate_nopt_show_name "${SAFE_GATE_NOPT_NEGWORD[0]}")"
+    safe_gate_err "safe: BLOCKED npm — '${negname}' negates an option that takes a value and is followed by a word, which npm gives to the option or leaves as an argument depending on the option's type and version, so the gate cannot tell whether the word is a package; to allow: write the word before the negated option (npm install <package> ${negname}), so that nothing follows it, or give the plain option its value attached (--<name>=<value>), then retry; details: safe explain"
+    return 100
+  fi
   return 0
 }
 
@@ -1253,7 +1282,7 @@ safe_gate_npm_front_door() {
   if (( ${#SAFE_GATE_NOPT_UNSTABLE[@]} )); then
     shown="$(safe_gate_lane_clean "${SAFE_GATE_NOPT_UNSTABLE[0]}")"
     if [[ "${shown}" == "global mode" ]]; then
-      safe_gate_err "safe: BLOCKED npm — the command sets global mode twice and the settings disagree; npm keeps one of them under rules the gate does not emulate; to allow: set it once (--global, or --location=global|user|project), then retry; details: safe explain"
+      safe_gate_err "safe: BLOCKED npm — the command sets global mode twice and the settings disagree; npm keeps one of them under rules the gate does not emulate; to allow: set it once (-g or --global for global, --location=project|user otherwise), then retry; details: safe explain"
     else
       safe_gate_err "safe: BLOCKED npm — the value of '--${shown}' is empty, padded with white space, missing, or not one of its listed values, which npm trims, drops or replaces under rules the gate does not emulate; to allow: write the option with an exact value (--${shown}=<value>), then retry; details: safe explain"
     fi
@@ -1298,7 +1327,17 @@ safe_gate_npm_front_door() {
     done
     if (( ! ok )); then
       if (( abbrev_seen )); then
-        safe_gate_err "safe: BLOCKED npm — the option '${shown}' is an abbreviation (or a name the gate does not know exactly), and the value after its '=' may be npm's argument or the option's depending on the npm version, with a command that differs or is one the gate audits; to allow: write the full option name npm defines (${shown}=<value>), then retry; details: safe explain"
+        # the full name, when exactly one option begins with the text; else the option's full name, without a guess
+        local abbr_text="${unk[0]%%=*}" abbr_full="" abbr_k abbr_n=0 full_way
+        abbr_text="${abbr_text#"${abbr_text%%[!-]*}"}"
+        while [[ "${abbr_text,,}" == no-* ]]; do abbr_text="${abbr_text:3}"; done
+        if [[ "${abbr_text}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+          for abbr_k in "${!SAFE_GATE_NOPT_FLAGS[@]}"; do
+            [[ "${abbr_k}" == "${abbr_text}"* ]] && { abbr_full="${abbr_k}"; abbr_n=$((abbr_n + 1)); }
+          done
+        fi
+        if (( abbr_n == 1 )); then full_way="--${abbr_full}=<value>"; else full_way="the option's full name with its value attached (--<name>=<value>)"; fi
+        safe_gate_err "safe: BLOCKED npm — the option '${shown}' is an abbreviation (or a name the gate does not know exactly), and the value after its '=' may be npm's argument or the option's depending on the npm version, with a command that differs or is one the gate audits; to allow: write ${full_way}, then retry; details: safe explain"
       else
         local uname="${unk[0]%%=*}"
         uname="${uname#"${uname%%[!-]*}"}"
@@ -7834,7 +7873,16 @@ safe_gate_exec_gate() {
           # (--silent and --quiet are shorthands of --loglevel: no value, and not a switch that takes one)
           case "${arg}" in --silent|--quiet) ;; *) (( post_positional )) && bool_next=1 ;; esac
         else
-          safe_gate_err "safe: BLOCKED ${label} — cannot identify the package to audit past unrecognized option '${arg}'; to allow: rewrite it as '${arg}=<value>' (or pass the package via an explicit spec), then retry; details: safe explain"
+          # (the option's name only: what follows an `=` is a value, which no refusal prints)
+          local oname oway
+          oname="$(safe_gate_nopt_show_name "${arg%%=*}")"
+          if [[ "${arg}" == *=* ]]; then
+            if [[ "${arg%%=*}" == -c && "${label}" == npm* ]]; then oway="write the call as '-c <call>' or '--call=<call>'"
+            else oway="write the option and its value as two arguments ('${oname} <value>'), or its long form (--<name>=<value>)"; fi
+          else
+            oway="rewrite it as '${oname}=<value>' (or pass the package via an explicit spec)"
+          fi
+          safe_gate_err "safe: BLOCKED ${label} — cannot identify the package to audit past unrecognized option '${oname}'; to allow: ${oway}, then retry; details: safe explain"
           return 100
         fi
         ;;

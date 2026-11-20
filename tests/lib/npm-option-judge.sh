@@ -12,7 +12,10 @@
 #   J_GLOBALS[]     each answer the gate gave, in that invocation, to "is this command global"
 #   NPM_REMAIN[] NPM_GLOBAL NPM_COMMAND NPM_CLASS   npm's reading (the command is `-` when npm resolves none; the class is
 #                   what the gate's table makes of the command)
-#   EXPECTED[]      the identities npm fetches, as the gate spells an audited identity
+#   NPM_LOCGLOBAL   1 when npm's location setting is global (a gated command with it is refused: npm 8.1.0 parses it and
+#                   does not act on it, later versions do); NPM_GLOBAL is the mode THIS npm acts on
+#   EXPECTED[]      the identities npm fetches, as the gate spells an audited identity; the gate's audits must be exactly
+#                   this set (nothing missing, nothing extra), for every command, gated or not
 # Prints one `kind<TAB>detail` line per disagreement; returns their number.
 npm_oracle_judge() {
   local n=0 us=$'\x1f' joined want i e o found oname ename scan_expected=0 class="${NPM_CLASS:-}"
@@ -24,6 +27,8 @@ npm_oracle_judge() {
   if [[ "${J_RC}" == 100 ]]; then
     # a refusal is exit 100 with ONE line that is the gate's: anything else is a harness or gate error, not a refusal
     if [[ "${J_ERR_LINES}" != 1 || "${J_ERR_FIRST}" != "safe: BLOCKED "* ]]; then _dis harness-error "exit 100 with ${J_ERR_LINES} stderr lines (${J_ERR_FIRST:0:80})"; fi
+    # a refusal delegates nothing
+    if (( ${#J_DELEGATIONS[@]} )); then _dis delegation-on-refusal "${#J_DELEGATIONS[@]} delegation(s) beside a refusal"; fi
     return "${n}"
   fi
   # the gate let the command through: one delegation, of exactly the arguments given
@@ -35,20 +40,26 @@ npm_oracle_judge() {
     # a command the gate does not gate has no canonical command: the gate must make none of it, as it makes none of npm's
     want="${NPM_COMMAND}"; [[ -n "${class}" ]] || want=""
     [[ "${J_CANON}" == "${want}" ]] || _dis command "gate '${J_CANON}', npm '${NPM_COMMAND}' (class ${class:-none})"
+  fi
+  # the audited identities are EXACTLY the identities npm fetches, in both directions, whatever the command
+  for e in ${EXPECTED[@]+"${EXPECTED[@]}"}; do
+    found=0
+    for o in ${J_AUDITS[@]+"${J_AUDITS[@]}"}; do [[ "${o}" == "${e}" ]] && found=1; done
+    (( found )) || _dis package-unaudited "npm fetches '${e}'; audited: ${J_AUDITS[*]:-nothing}"
+  done
+  for o in ${J_AUDITS[@]+"${J_AUDITS[@]}"}; do
+    found=0; oname="${o%@*}"; [[ "${o}" == @*/* && "${o#@*/}" != *@* ]] && oname="${o}"
     for e in ${EXPECTED[@]+"${EXPECTED[@]}"}; do
-      found=0
-      for o in ${J_AUDITS[@]+"${J_AUDITS[@]}"}; do [[ "${o}" == "${e}" ]] && found=1; done
-      (( found )) || _dis package-unaudited "npm fetches '${e}'; audited: ${J_AUDITS[*]:-nothing}"
+      ename="${e%@*}"; [[ "${e}" == @*/* && "${e#@*/}" != *@* ]] && ename="${e}"
+      [[ "${o}" == "${e}" ]] && found=2
+      [[ "${oname}" == "${ename}" && "${o}" != "${e}" && "${found}" != 2 ]] && found=1
     done
-    for o in ${J_AUDITS[@]+"${J_AUDITS[@]}"}; do
-      found=0; oname="${o%@*}"; [[ "${o}" == @*/* && "${o#@*/}" != *@* ]] && oname="${o}"
-      for e in ${EXPECTED[@]+"${EXPECTED[@]}"}; do
-        ename="${e%@*}"; [[ "${e}" == @*/* && "${e#@*/}" != *@* ]] && ename="${e}"
-        [[ "${o}" == "${e}" ]] && found=2
-        [[ "${oname}" == "${ename}" && "${o}" != "${e}" && "${found}" != 2 ]] && found=1
-      done
-      (( found == 1 )) && _dis package-wrong-version "audited '${o}', npm fetches a different version of that name"
-    done
+    if (( found == 1 )); then _dis package-wrong-version "audited '${o}', npm fetches a different version of that name"
+    elif (( found == 0 )); then _dis package-extra "audited '${o}', which npm does not fetch (npm fetches: ${EXPECTED[*]:-nothing})"; fi
+  done
+  # a gated command whose location setting is global is refused (the one global form the gate reads is -g)
+  if [[ -n "${class}" ]] && (( ${NPM_LOCGLOBAL:-0} )); then _dis location-global-accepted "a ${class} command with a global location went through"; fi
+  if [[ "${NPM_COMMAND}" != "-" ]]; then
     case "${class}" in install|update|install-test|install-ci-test|ci) (( ! NPM_GLOBAL )) && scan_expected=1 ;; esac
     if (( J_SCANNED != scan_expected )); then _dis scan-decision "project scan ran=${J_SCANNED}, expected ${scan_expected} (npm global=${NPM_GLOBAL}, class ${class:-none})"; fi
     case "${class}" in

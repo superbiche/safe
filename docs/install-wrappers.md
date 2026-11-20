@@ -411,9 +411,25 @@ on `npm run build --silent` in a gated shell). Then:
   global mode that disagree refuse: npm trims, cleans or picks among them under rules the gate does not emulate.
 - `npm exec` / `x` with a package selector or call string written before the verb (`npm --package=evil exec
   cowsay`) refuses: the audit reads the selectors after the verb, so the way out is to write them there.
+- `--location=global`, in any spelling (`--location global`, `-L global`, an abbreviation, before or after the verb),
+  refuses on a command the gate audits, and the location never decides global mode for the gate: npm 8.1.0 parses
+  the location and does not act on it (its install reads only the `global` setting; `npm --location global prefix`
+  prints the project prefix there and the installation prefix on every later npm), so the gate cannot tell whether
+  the command is global. The way out is `-g` (or `--global`), the one global form every version acts on; another
+  location (`--location=project`, `--location=user`) does not change the mode.
+- A negated option whose plain form takes a value (`--no-local-address`), followed by a word, refuses on a command
+  the gate audits: every version gives `--no-local-address 127.0.0.1` its address, and the literals of that option are
+  the interfaces of the machine, which no snapshot can hold. The way out is the word before the negated option
+  (`npm install <package> --no-local-address`) or the plain option with its value attached. An option that is
+  Boolean with fixed literals only (`--no-color`, `--no-color always`) reads the same everywhere and is not affected.
 - For the commands the gate audits, an argument holding a line break, a package argument padded with white space,
   or a lone `-` refuses (the extractors and npm read them differently); one clean package per argument is the way
-  out. Arguments after the `exec` terminator are the command's own and are not read.
+  out. Only what a gate extractor reads is checked: after the terminator of `npm exec` the first operand is the
+  package or command to audit, and the rest are the child's own arguments, which are not read (`npm exec -- node -e
+  '<two lines>'` passes).
+- No refusal prints a value. The exec auditor's refusal of an attached call string (`-c=<call>`) names the option and
+  advises `-c <call>` or `--call=<call>`, and an abbreviation's refusal names the full option when exactly one option
+  begins with the text, and says "the option's full name" otherwise.
 
 - An option the npm versions the gate vouches for read differently (absent in one, Boolean in another, value-taking
   in a third: `--allow-git`, `--min-release-age`, `--cpu`, `--os`, `--install-strategy`, ...) is **version-dependent**:

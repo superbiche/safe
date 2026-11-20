@@ -40,6 +40,14 @@
   the command, the packages and global mode; the way out is the value attached (`--install-strategy=nested`). The
   space forms of the newer options (`--install-strategy nested`, `--cpu x64`, `--os linux`) therefore refuse; the `=`
   forms pass. An npm older than the oldest reference version (8.1.0) is outside what the snapshot can vouch for.
+  Third round: `--location=global`, in any spelling, refuses on a gated command and never decides global mode (npm
+  8.1.0 parses it and does not act on it; the way out is `-g`); a negated value option followed by a word
+  (`--no-local-address 127.0.0.1 pkg`) refuses (the word before the option, or `--local-address=<value>`); the
+  line-break, padding and lone-dash checks read only what a gate extractor reads (`npm exec -- node -e '<two
+  lines>'` passes again); no refusal on the npm path prints a value, the exec auditor's attached call string
+  included, and the printed ways out work. The differential oracle compares the audited identities as exact sets in
+  both directions, requires zero delegations on a refusal, derives each reference's global mode from what that npm
+  does, and fails when its corpus producer fails.
 - Project lane: `npm ci`, `npm dedupe` and `npm prune` (still behind `install.project_lane`). `ci` has no
   projection: its plan is the lockfile on disk, checked against the manifest by npm's own frozen check (`npm
   ci --dry-run`; a lockfile out of step or missing is npm's own error, shown as npm's, with npm's status),

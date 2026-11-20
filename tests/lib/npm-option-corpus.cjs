@@ -2,7 +2,7 @@
 // The differential corpus of the npm option oracle, read by npm's OWN parser (nopt with npm's own types
 // and shorthands, offline: nothing is installed or run). One case per line, tab separated:
 //   <arguments> TAB <npm's positional arguments> TAB <global 0|1> TAB <command or -> TAB <the values of --package>
-//   TAB <1 when --call is set>
+//   TAB <1 when --call is set> TAB <1 when the location setting is global>
 // where the command is what npm's own `deref` makes of the first positional argument. A list is its members
 // percent-encoded (every byte outside A-Za-z0-9_.:/@=+-, so a tab, a newline, a comma or a control character
 // survives), comma separated; the empty string is `%00` and the empty list is a lone `%` (see
@@ -27,6 +27,7 @@ const sampleArg = process.argv.find((a) => a.startsWith('--sample='))
 const sample = sampleArg ? Number(sampleArg.slice(9)) : (process.argv.includes('--quick') ? 4 : 1)
 const quick = sample > 1
 const nopt = require(path.join(npmDir, 'node_modules', 'nopt'))
+const npmVersion = require(path.join(npmDir, 'package.json')).version
 const abbrev = require(path.join(npmDir, 'node_modules', 'abbrev'))
 function loadDefinitions(dir) {
   for (const rel of [['node_modules', '@npmcli', 'config', 'lib', 'definitions'], ['lib', 'utils', 'config']]) {
@@ -66,11 +67,17 @@ function emit(family, args) {
   seen.add(key)
   const parsed = nopt(types, shorthands, ['node', 'npm', ...args], 2)
   const remain = parsed.argv.remain
-  const global = parsed.global === true || parsed.location === 'global'
+  // The effective global mode of THIS npm, not what its parser returns: npm 8.1.0 parses `--location global` and does not
+  // act on it (its install reads only `global`; `npm --location global prefix` prints the project prefix there and the
+  // installation prefix on every later reference: the read-only controls of tests/live/npm_option_oracle.sh), so the
+  // location counts from npm 9 on. The gate refuses a gated command whose location is global (7th field).
+  const locationActs = Number(String(npmVersion).split('.')[0]) >= 9
+  const global = parsed.global === true || (locationActs && parsed.location === 'global')
+  const locGlobal = parsed.location === 'global'
   let command = null
   try { command = deref(remain[0]) } catch (e) { command = null }
   const pkgOpt = parsed.package === undefined ? [] : [].concat(parsed.package).filter((x) => typeof x === 'string')
-  process.stdout.write([key, list(remain), global ? 1 : 0, command || '-', list(pkgOpt), parsed.call === undefined ? 0 : 1].join('\t') + '\n')
+  process.stdout.write([key, list(remain), global ? 1 : 0, command || '-', list(pkgOpt), parsed.call === undefined ? 0 : 1, locGlobal ? 1 : 0].join('\t') + '\n')
   count++
   families[family] = (families[family] || 0) + 1
 }

@@ -12585,7 +12585,7 @@ case_npm_global_mode_is_read_as_npm_reads_it() {
     for args in "-gf" "-fg" "--local=false" "--local false" "-g --no-global" "--cache -g" "--tag -g" "--registry -g" "--location=global" "-L global" "-g=false" "-g false" "-gD"; do
       safe_gate_npm_global_true install ${args} evilpkg && printf "%s=global\n" "${args}" || printf "%s=local\n" "${args}"
     done' _ "${ROOT_DIR}" 2>&1 | tr '\n' ' ')"
-  [[ "${verdicts}" == '-gf=global -fg=global --local=false=global --local false=global -g --no-global=local --cache -g=local --tag -g=global --registry -g=local --location=global=global -L global=global -g=false=local -g false=local -gD=global ' ]] \
+  [[ "${verdicts}" == '-gf=global -fg=global --local=false=global --local false=global -g --no-global=local --cache -g=local --tag -g=global --registry -g=local --location=global=local -L global=local -g=false=local -g false=local -gD=global ' ]] \
     || { fail "$FUNCNAME: ${verdicts}"; return; }
   pass "$FUNCNAME"
 }
@@ -12743,12 +12743,12 @@ case_npm_reading_decides_command_and_packages_found_by_the_oracle() {
     grep -q $'^AUDIT\tpackage-audit\tblockme\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: blockme was not audited"; return; }
     ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: npm was delegated to"; return; }
   done
-  # `--no-location global` is global mode: no project scan
+  # `--no-location global` is the location global, which the gate never takes for global mode (npm 8.1.0 does not act on it)
   printf '{"name":"scan-decision","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='npm --no-location global install blockme' run_zsh
-  assert_status 104 "$FUNCNAME: --no-location global" || return
-  ! grep -q 'repo-audit' "${LOG_FILE}" || { fail "$FUNCNAME: --no-location global ran the project scan"; return; }
+  assert_status 100 "$FUNCNAME: --no-location global" || return
+  ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: --no-location global: npm was delegated to"; return; }
   # an option terminator before the command makes every later option an argument: refused, with a way out that works
   for script in 'npm -- x -c cmd' 'npm --cache -- x -c cmd' 'npm -- install -D blockme'; do
     : > "${LOG_FILE}"
@@ -12810,6 +12810,124 @@ case_npm_version_dependent_options_are_read_every_way() {
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='npm install --cpu=x64 --os=linux --libc=glibc --allow-git=none blockme' run_zsh
   assert_status 104 "$FUNCNAME: four" || return
+  pass "$FUNCNAME"
+}
+
+# Third round (ticket 1675, review 2): the location never decides global mode for the gate; a negated value option followed
+# by a word; the printed ways out; the child's arguments after the exec terminator.
+case_npm_location_global_is_refused_and_g_is_the_way_out() {
+  prepare_case "npm-location-global"
+  local script
+  printf '{"name":"scan-decision","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
+  # npm 8.1.0 parses `--location global` and does not act on it (its `prefix` is the project's there, the installation's
+  # on every later npm): in every spelling, on a gated command, the gate refuses
+  for script in 'npm install --location global blockme' 'npm install --location=global blockme' 'npm --location global install blockme' 'npm -L global install blockme' \
+      'npm install -L=global blockme' 'npm install --locat global blockme' 'npm install --no-location global blockme' 'npm exec --location global cowsay' \
+      'npm install blockme --location=global' 'npm ci --location=global' 'npm update --location=global' 'npm dedupe --location=global'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 100 "$FUNCNAME: ${script}" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { fail "$FUNCNAME: ${script}: not one line"; return; }
+    ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: npm was delegated to"; return; }
+    ! grep -q 'repo-audit' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: the project scan ran under a global reading"; return; }
+  done
+  assert_err_contains_fragment 'use -g (or --global)' "$FUNCNAME: the way out is printed" || return
+  # the way out: -g, global, no project scan, the package audited
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm install -g blockme' run_zsh
+  assert_status 104 "$FUNCNAME: -g" || return
+  grep -q $'^AUDIT\tpackage-audit\tblockme\t' "${LOG_FILE}" || { fail "$FUNCNAME: -g: blockme was not audited"; return; }
+  ! grep -q 'repo-audit' "${LOG_FILE}" || { fail "$FUNCNAME: -g ran the project scan"; return; }
+  # another location does not change the mode: the project scan runs, both directions of the scan decision
+  for script in 'npm install --location project blockme' 'npm install --location=user blockme'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 104 "$FUNCNAME: ${script}" || return
+    grep -q 'repo-audit' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: no project scan"; return; }
+  done
+  # a command the gate does not audit is not refused
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm --location global prefix' run_zsh
+  assert_status 0 "$FUNCNAME: prefix" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_negated_value_option_followed_by_a_word_refuses() {
+  prepare_case "npm-negated-value-option"
+  local script
+  # `--no-local-address 127.0.0.1`: every reference gives the address to the option, the gate used to audit it as a package
+  # (the literals of local-address are the machine's interfaces: no list of them is shipped)
+  for script in 'npm install --no-local-address 127.0.0.1 blockme' 'npm install --no-local-address blockme' \
+      'npm install --no-registry blockme'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 100 "$FUNCNAME: ${script}" || return
+    [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { fail "$FUNCNAME: ${script}: not one line"; return; }
+    assert_err_contains_fragment 'negates an option that takes a value and is followed by a word' "$FUNCNAME: ${script}" || return
+    assert_err_not_contains_fragment '127.0.0.1' "$FUNCNAME: ${script}" || return
+    ! grep -q $'^AUDIT\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: something was audited (an address, a literal)"; return; }
+    ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: npm was delegated to"; return; }
+  done
+  # the printed ways out, followed literally: the word before the negated option; the plain option with its value attached
+  for script in 'npm install blockme --no-local-address' 'npm install blockme --no-color' 'npm install --local-address=127.0.0.1 blockme' 'npm install --color=always blockme' \
+      'npm install --no-color blockme' 'npm install --no-color always blockme' 'npm install --no-save blockme'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 104 "$FUNCNAME: way out: ${script}" || return
+    grep -q $'^AUDIT\tpackage-audit\tblockme\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: blockme was not audited"; return; }
+    [[ "$(grep -c $'^AUDIT\t' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: ${script}: more than blockme was audited"; return; }
+  done
+  pass "$FUNCNAME"
+}
+
+case_npm_exec_and_abbreviation_refusals_print_no_value_and_a_way_out_that_works() {
+  prepare_case "npm-refusal-ways-out"
+  # an attached call string: no value printed, the way out works (a call string alone names no package)
+  SAFE_INSTALL_TEST_SCRIPT='npm exec -c=PUBLIC_FIXTURE' run_zsh
+  assert_status 100 "$FUNCNAME: -c=" || return
+  [[ "$(wc -l < "${ERR_FILE}")" -eq 1 ]] || { fail "$FUNCNAME: -c=: not one line"; return; }
+  assert_err_not_contains_fragment 'PUBLIC_FIXTURE' "$FUNCNAME: -c=" || return
+  assert_err_contains_fragment "write the call as '-c <call>' or '--call=<call>'" "$FUNCNAME: -c=" || return
+  local script
+  for script in 'npm exec -c pwd' 'npm exec --call=pwd'; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 0 "$FUNCNAME: way out: ${script}" || return
+    grep -q $'^REAL\tnpm\texec' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: npm was not run"; return; }
+  done
+  # an abbreviation: the printed way out names no abbreviation as the full name
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm --edi=vi prefix' run_zsh
+  assert_status 100 "$FUNCNAME: --edi=" || return
+  assert_err_not_contains_fragment 'edi=<value>' "$FUNCNAME: --edi=" || return
+  assert_err_contains_fragment "the option's full name" "$FUNCNAME: --edi=" || return
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm --editor=vi prefix' run_zsh
+  assert_status 0 "$FUNCNAME: --editor=" || return
+  # when exactly one option begins with the text, the full name is named
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT='npm --sav=x install blockme' run_zsh
+  assert_status 100 "$FUNCNAME: --sav=" || return
+  pass "$FUNCNAME"
+}
+
+case_npm_exec_terminator_leaves_the_childs_arguments_alone() {
+  prepare_case "npm-exec-terminator-child"
+  # the child's own arguments after the terminator are not read: a line break there is JavaScript, not a package
+  SAFE_INSTALL_TEST_SCRIPT="npm exec -- node -e \$'let x = 1\nvoid x'" run_zsh
+  assert_status 0 "$FUNCNAME: exec -- node -e <two lines>" || return
+  grep -q $'^REAL\tnpm\texec' "${LOG_FILE}" || { fail "$FUNCNAME: npm was not run"; return; }
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_TEST_SCRIPT="npm exec cowsay -- node -e \$'let x = 1\nvoid x'" run_zsh
+  assert_status 0 "$FUNCNAME: exec cowsay -- <two lines>" || return
+  # a line break in an argument a gate extractor reads still refuses
+  for script in "npm install \$'blockme\nx'" "npm exec \$'cowsay\nx'" "npm exec -- \$'cowsay\nx'" "npm exec \$'--package=blockme\nx' cowsay" "npm install -- \$'blockme\nx'"; do
+    : > "${LOG_FILE}"
+    SAFE_INSTALL_TEST_SCRIPT="${script}" run_zsh
+    assert_status 100 "$FUNCNAME: ${script}" || return
+    assert_err_contains_fragment 'holds a line break' "$FUNCNAME: ${script}" || return
+    ! grep -q $'^REAL\t' "${LOG_FILE}" || { fail "$FUNCNAME: ${script}: npm was delegated to"; return; }
+  done
   pass "$FUNCNAME"
 }
 
@@ -12878,15 +12996,15 @@ case_npm_front_door_refuses_values_npm_cleans_up() {
   # exact values, both directions of the scan decision: global skips the project scan, project does not
   printf '{"name":"scan-decision","version":"1.0.0"}\n' > "${WORK_DIR}/package.json"
   : > "${LOG_FILE}"
-  SAFE_INSTALL_TEST_SCRIPT='npm install --location=global blockme' run_zsh
+  SAFE_INSTALL_TEST_SCRIPT='npm install -g blockme' run_zsh
   assert_status 104 "$FUNCNAME: exact global" || return
-  ! grep -q 'repo-audit' "${LOG_FILE}" || { fail "$FUNCNAME: --location=global ran the project scan"; return; }
+  ! grep -q 'repo-audit' "${LOG_FILE}" || { fail "$FUNCNAME: -g ran the project scan"; return; }
   : > "${LOG_FILE}"
   SAFE_INSTALL_TEST_SCRIPT='npm install --location=project okpkg' run_zsh
   assert_status 0 "$FUNCNAME: exact project" || return
   grep -q 'repo-audit' "${LOG_FILE}" || { fail "$FUNCNAME: --location=project did not run the project scan"; return; }
   : > "${LOG_FILE}"
-  SAFE_INSTALL_TEST_SCRIPT='npm install --global --location=global --global=true blockme' run_zsh
+  SAFE_INSTALL_TEST_SCRIPT='npm install --global --global=true -g blockme' run_zsh
   assert_status 104 "$FUNCNAME: the same mode three times" || return
   pass "$FUNCNAME"
 }
@@ -12930,7 +13048,7 @@ case_npm_front_door_every_way_out_works() {
 104|npm --audit=install blockme|npm --audit install blockme
 104|npm exec --no-package=blockme cowsay|npm exec --package=blockme cowsay
 104|npm install -Cq blockme|npm install -C . -q blockme
-104|npm install --location= blockme|npm install --location=global blockme
+104|npm install --location= blockme|npm install --location=project blockme
 104|npm --package=blockme exec cowsay|npm exec --package=blockme cowsay
 104|npm exec --package -- blockme|npm exec --package=blockme -- cowsay
 104|npm --editor=vi --edi=vi install blockme|npm --editor=vi install blockme
@@ -12972,7 +13090,7 @@ case_npm_front_door_reads_abbreviations_and_combinations() {
   # --edi is npm 11's way to --editor; versions disagree, so it is read both ways: refused before a gated command, fine before an ungated one
   SAFE_INSTALL_TEST_SCRIPT='npm --edi=vi install blockme' run_zsh
   assert_status 100 "$FUNCNAME: abbreviation, gated" || return
-  assert_err_contains_fragment 'write the full option name' "$FUNCNAME: abbreviation, gated" || return
+  assert_err_contains_fragment "the option's full name" "$FUNCNAME: abbreviation, gated" || return
   assert_err_not_contains_fragment 'npm_config_' "$FUNCNAME: abbreviation, gated" || return
   SAFE_INSTALL_TEST_SCRIPT='npm prefix --edi=vi' run_zsh
   assert_status 0 "$FUNCNAME: abbreviation, ungated, after the verb" || return
@@ -13017,6 +13135,10 @@ main() {
     case_npm_front_door_reads_abbreviations_and_combinations \
     case_npm_argument_hygiene_refuses_what_extractors_and_npm_read_differently \
     case_npm_option_oracle_can_fail \
+    case_npm_location_global_is_refused_and_g_is_the_way_out \
+    case_npm_negated_value_option_followed_by_a_word_refuses \
+    case_npm_exec_and_abbreviation_refusals_print_no_value_and_a_way_out_that_works \
+    case_npm_exec_terminator_leaves_the_childs_arguments_alone \
     case_npm_version_dependent_options_are_read_every_way \
     case_npm_reading_decides_command_and_packages_found_by_the_oracle \
     case_refusal_message_contract \

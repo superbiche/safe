@@ -63,7 +63,16 @@ if (( SELFTEST )); then
   right; J_CANON=install-test; expect_kind command "another command of the same family"
   right; J_SUBCMDS=(i); expect_kind command-word "another word taken for the command"
   right; J_AUDITS=(sample@2.0.0); expect_kind package-unaudited "a different version audited"
-  right; J_AUDITS=(sample@1.0.0 other@1.0.0); EXPECTED=(sample@1.0.0); expect_clean   # an extra audit of another name is an over-audit, not a miss
+  right; J_AUDITS=(sample@1.0.0 other@1.0.0); EXPECTED=(sample@1.0.0); expect_kind package-extra "an unrelated extra audit"
+  # the reviewer's two observations: `npm prefix` with the right delegation and an audit of an unrelated identity, and a
+  # delegation recorded beside a refusal
+  J_ARGS=(prefix); J_RC=0; J_ERR_LINES=0; J_ERR_FIRST=""; J_DELEGATIONS=("prefix"$'\x1f'); J_SUBCMDS=(prefix); J_CANON=""
+  J_AUDITS=(); J_SCANNED=0; J_GLOBALS=(); NPM_REMAIN=(prefix); NPM_GLOBAL=0; NPM_COMMAND=prefix; NPM_CLASS=""; NPM_LOCGLOBAL=0; EXPECTED=()
+  expect_clean
+  J_AUDITS=(extra@1.0.0); expect_kind package-extra "an audit of an ungated command"
+  J_AUDITS=(); J_RC=100; J_ERR_LINES=1; J_ERR_FIRST="safe: BLOCKED test"; expect_kind delegation-on-refusal "a delegation beside a refusal"
+  right; J_RC=100; J_ERR_LINES=1; J_ERR_FIRST="safe: BLOCKED test"; expect_kind delegation-on-refusal "a delegation beside a refusal of an install"
+  right; NPM_LOCGLOBAL=1; expect_kind location-global-accepted "a global location accepted on a gated command"
   right; J_AUDITS=(sample@2.0.0 sample@1.0.0); EXPECTED=(sample@1.0.0); expect_kind package-wrong-version "an extra version of the same name"
   right; J_AUDITS=(); expect_kind package-unaudited "nothing audited"
   right; J_DELEGATIONS=(); expect_kind delegation-count "no delegation"
@@ -75,7 +84,7 @@ if (( SELFTEST )); then
   right; J_RC=1; expect_kind harness-error "a harness error"
   right; J_RC=100; J_ERR_LINES=2; J_ERR_FIRST="safe: BLOCKED x"; expect_kind harness-error "a refusal of two lines"
   right; J_RC=100; J_ERR_LINES=1; J_ERR_FIRST="something else"; expect_kind harness-error "a refusal that is not the gate's"
-  right; J_RC=100; J_ERR_LINES=1; J_ERR_FIRST="safe: BLOCKED npm — x"; expect_clean
+  right; J_RC=100; J_ERR_LINES=1; J_ERR_FIRST="safe: BLOCKED npm — x"; J_DELEGATIONS=(); J_AUDITS=(); expect_clean
   # `ci` hides nothing: a command npm reads as ci and the gate as install
   right; NPM_COMMAND=ci; NPM_CLASS=ci; NPM_REMAIN=(ci); EXPECTED=(); expect_kind command "npm ci read as install"
   if (( failures )); then printf 'selftest: %d failure(s)\n' "${failures}"; exit 1; fi
@@ -111,11 +120,11 @@ safe_gate_npm_global_true() { local rc; safe_gate_npm_global_true_real "$@"; rc=
 
 declare -A count_kind=() seen_kind=()
 total=0 refused=0 agreed=0 disagreed=0 harness=0 over=0
-while IFS=$'\t' read -r f_args f_remain f_global f_command f_pkgopt f_call; do
+while IFS=$'\t' read -r f_args f_remain f_global f_command f_pkgopt f_call f_locglobal; do
   npm_corpus_list "${f_args}" J_ARGS
   npm_corpus_list "${f_remain}" NPM_REMAIN
   npm_corpus_list "${f_pkgopt}" pkgopt
-  NPM_GLOBAL="${f_global}"; NPM_COMMAND="${f_command}"
+  NPM_GLOBAL="${f_global}"; NPM_COMMAND="${f_command}"; NPM_LOCGLOBAL="${f_locglobal:-0}"
   total=$((total + 1))
   : > "${REC}"; : > "${WORK}/err"
   ( safe_gate_npm_like npm "${J_ARGS[@]}" ) >/dev/null 2>&1

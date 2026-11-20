@@ -122,7 +122,14 @@ if [[ -z "$references" ]]; then
   done
 fi
 node "$ROOT/tests/lib/npm-option-corpus.cjs" "$npm_dir" ${references:+--union="$references"} --sample="$sample" > "$WORK/corpus" 2>"$WORK/corpus.err"
+corpus_rc=$?
 corpus_size="$(wc -l < "$WORK/corpus")"
+# a producer that failed after writing rows must not set its own denominator
+if (( corpus_rc != 0 )); then
+  fail "the corpus producer failed (status $corpus_rc: $(head -n 1 "$WORK/corpus.err")); its output is not used"
+  printf '%s passed, %s failed\n' "$PASS" "$FAIL"
+  exit 1
+fi
 printf '# corpus: %s cases (%s)\n' "$corpus_size" "$(cat "$WORK/corpus.err")"
 if (( corpus_size < 100 )); then
   fail "the corpus is empty"
@@ -135,13 +142,17 @@ else
     # shellcheck source=tests/lib/npm-option-corpus.sh
     source "$ROOT/tests/lib/npm-option-corpus.sh"
     n=0; bad=0; shown=0
-    while IFS=$'\t' read -r f_args f_remain f_global f_command f_pkgopt f_call; do
+    npm_major="$(node -p "require('$npm_dir/package.json').version.split('.')[0]")"
+    while IFS=$'\t' read -r f_args f_remain f_global f_command f_pkgopt f_call f_locglobal; do
       npm_corpus_list "$f_args" args
       npm_corpus_list "$f_remain" want
       safe_gate_nopt_parse "${args[@]}"
       n=$((n + 1))
       got="$(printf '%s\x1f' "${SAFE_GATE_NOPT_REMAIN[@]}")"; wantj="$(printf '%s\x1f' "${want[@]}")"
-      if [[ "$got" != "$wantj" || "$SAFE_GATE_NOPT_GLOBAL" != "$f_global" ]]; then
+      # the gate's reading takes --global only; the location counts for the npm that acts on it (npm 9 and later)
+      gate_mode="$SAFE_GATE_NOPT_GLOBAL"
+      (( npm_major >= 9 )) && [[ "$SAFE_GATE_NOPT_LOCGLOBAL" == 1 ]] && gate_mode=1
+      if [[ "$got" != "$wantj" || "$gate_mode" != "$f_global" || "$SAFE_GATE_NOPT_LOCGLOBAL" != "${f_locglobal:-0}" ]]; then
         bad=$((bad + 1))
         (( shown++ < 10 )) && printf 'DIFF %s\n' "${f_args}"
       fi
@@ -154,6 +165,25 @@ else
   else
     fail "the bash reading differs from npm's parser"
   fi
+fi
+
+# --- 2b. the global-mode controls (read-only: `npm prefix` installs, fetches and runs nothing) ------------------
+# What THIS npm acts on: `npm --location global prefix` prints the installation prefix on npm 9 and later and the
+# project prefix on npm 8.1.0 (which parses the location and does not act on it); `-g` prints the installation prefix on
+# all of them. The corpus's global-mode field is derived from the same rule, so this is the control that it is true.
+ctrl_home="$WORK/ctrl-home"; ctrl_proj="$WORK/ctrl-proj"; mkdir -p "$ctrl_home" "$ctrl_proj"
+printf '{"name":"ctrl","version":"1.0.0"}\n' > "$ctrl_proj/package.json"
+node_bin="$(dirname "$(dirname "$(dirname "$npm_dir")")")/bin/node"
+[[ -x "$node_bin" ]] || node_bin="$(command -v node)"
+prefix_of() { ( cd "$ctrl_proj" && env -i HOME="$ctrl_home" PATH="$(dirname "$node_bin"):/usr/bin:/bin" "$node_bin" "$npm_dir/bin/npm-cli.js" "$@" prefix 2>/dev/null | head -n 1 ); }
+ctrl_loc="$(prefix_of --location global)"; ctrl_g="$(prefix_of -g)"; ctrl_plain="$(prefix_of)"
+npm_major="$(node -p "require('$npm_dir/package.json').version.split('.')[0]")"
+if [[ -z "$ctrl_g" || "$ctrl_g" == "$ctrl_plain" ]]; then
+  printf '# the mode controls could not tell -g from the project (%s): skipped\n' "${ctrl_g:-no output}"
+elif [[ "$ctrl_g" != "$ctrl_proj"* ]] && { { (( npm_major >= 9 )) && [[ "$ctrl_loc" == "$ctrl_g" ]]; } || { (( npm_major < 9 )) && [[ "$ctrl_loc" == "$ctrl_plain" ]]; }; }; then
+  pass "this npm acts on --location global as the corpus assumes (location acts from npm 9 on): -g and the location give the installation prefix, or the location the project's on npm 8"
+else
+  fail "this npm's mode controls disagree with the corpus rule (-g: $ctrl_g, --location global: $ctrl_loc, plain: $ctrl_plain)"
 fi
 
 # --- 3. the gate ----------------------------------------------------------------------------

@@ -1,4 +1,12 @@
 # Disagreements between the gate's reading of an npm command line and npm's own that the oracle
 # (tests/live/npm_option_oracle.sh, SAFE_ORACLE_GATE=1) finds and that are LISTED, not closed: one extended regular
 # expression per line, matched against the oracle's `DISAGREE kind: <arguments>  (<what>)` line, each with the reason it
-# stays. None today: every disagreement the oracle has found is closed.
+# stays. Every other disagreement the oracle has found is closed.
+
+# 1. `npm exec` with a call string (--call, -c) AND a positional package: the gate audits the positional, npm fetches
+#    nothing. Every reference (8.1.0 to 12.2.1) refuses the combination with its usage error before any fetch
+#    (`if (call && args.length)` in lib/exec.js / lib/commands/exec.js), so this is an over-audit, never a miss. It is kept
+#    on purpose: the gate audits what a command line names as a package wherever it could be one, so that a later npm that
+#    accepts the combination cannot fetch an unaudited name. Reproduction: `npm exec --call=true cowsay` audits cowsay.
+#    Only package-extra lines of exec/x command lines that carry --call or -c are listed.
+^DISAGREE package-extra: (exec|x)\\ .*(--call|-c)
