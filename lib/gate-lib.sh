@@ -3528,7 +3528,7 @@ safe_gate_npm_lockdiff_preflight() {
 #      tree root, registry, private origins ........................ untouched
 #   4. guards and projection in a scratch copy, with ONE npm, a controlled
 #      start-up environment and git disabled ........................ untouched
-#   5. project-diff, advisory evidence, project-decide, report ....... untouched
+#   5. project-diff, advisory evidence, publish times, project-decide ... untouched
 #      anything but "clear" refuses (104/100/102)
 #   6. project-bind: staging, frozen install, strict verification, publication;
 #      its outcome decides the exit; what it reports reaches the operator
