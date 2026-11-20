@@ -17,8 +17,9 @@ const (
 	projectReleasesUsage = "safe-core: usage: safe-core project-releases --request <file> --state-dir <dir> [--registry-base <url>]"
 	projectRootsUsage    = "safe-core: usage: safe-core project-roots < NUL-separated-package-arguments"
 	// releasesDeadline bounds all the readings of one command together; a reading still queued when it ends is
-	// missing evidence (never a gap), so it is generous: see docs/configuration.md for the measurement.
-	releasesDeadline = 15 * time.Minute
+	// missing evidence (never a gap). It is set from the measurement of docs/configuration.md: 1,300 identities
+	// took 17 s cold, so five minutes is about seventeen times that.
+	releasesDeadline = 5 * time.Minute
 )
 
 // projectReleases reads the publish time of every identity of a request (the
@@ -30,9 +31,9 @@ const (
 // --registry-base replaces the registry's address (tests, a mirror); without it a
 // packument is read from the host the identity was resolved from. The caller's
 // proxy and TLS settings are not used (see package releases). Each identity is in
-// the document as read, no_time (the registry answered completely and holds no
-// time: disclosed, not stopping) or missing (any other reason: missing
-// evidence). Exit 3 is a request that cannot be read.
+// the document as read (its own publish time), bounded (one complete answer lists
+// the version without a time of its own: the last-modified time stands in) or
+// missing (any other reason: missing evidence). Exit 3 is a request that cannot be read.
 func projectReleases(args []string, stdout, stderr io.Writer) int {
 	var requestFile, stateDir, registryBase string
 	for i := 0; i < len(args); i++ {
@@ -99,10 +100,10 @@ func projectReleases(args []string, stdout, stderr io.Writer) int {
 			_, isRoot := roots[projectlane.Identity{Name: result.Name, Version: result.Version}]
 			reading := projectlane.ReleaseReading{Name: result.Name, Version: result.Version, Host: result.Host, Root: isRoot}
 			switch {
+			case result.OK && result.Bounded:
+				reading.Status, reading.Published = projectlane.ReadingBounded, result.Published.UTC().Format(time.RFC3339Nano)
 			case result.OK:
 				reading.Status, reading.Published = projectlane.ReadingRead, result.Published.UTC().Format(time.RFC3339Nano)
-			case result.NoTime:
-				reading.Status, reading.Gap = projectlane.ReadingNoTime, "the registry answered completely for this package and holds no publish time for this version"
 			default:
 				reading.Status, reading.Gap = projectlane.ReadingMissing, strings.TrimSpace(result.Failure)
 				if reading.Gap == "" {

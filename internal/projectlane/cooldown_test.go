@@ -24,8 +24,10 @@ func releasesOf(days int, fix string, readings ...ReleaseReading) *Releases {
 }
 
 func (r ReleaseReading) root() ReleaseReading { r.Root = true; return r }
-func (r ReleaseReading) noTime(gap string) ReleaseReading {
-	r.Status, r.Published, r.Gap = ReadingNoTime, "", gap
+
+// bounded is a reading whose version the document lists without a time of its own: the last-modified time stands in
+func (r ReleaseReading) bounded(hoursOld int) ReleaseReading {
+	r.Status, r.Published, r.Gap = ReadingBounded, ago(hoursOld), ""
 	return r
 }
 func (r ReleaseReading) missing(gap string) ReleaseReading {
@@ -57,7 +59,7 @@ func TestCooldownWaitNamesPackageVersionAndDate(t *testing.T) {
 	if waits[0].Installable != "2026-11-22T16:00:00Z" || waits[0].AgeDays != 0 {
 		t.Fatalf("installable %s age %d", waits[0].Installable, waits[0].AgeDays)
 	}
-	if report.Cooldown.Checked != 2 || len(report.Cooldown.Unreadable) != 0 {
+	if report.Cooldown.Checked != 2 {
 		t.Fatalf("cooldown %+v", report.Cooldown)
 	}
 }
@@ -119,9 +121,9 @@ func TestCooldownCatchesAnotherYoungVersionOfANamedName(t *testing.T) {
 	}
 }
 
-// The security-fix waiver is differential: the named exact version must replace a version of the same package in the
-// baseline and thereby remove an advisory the baseline carries for it, as the lane's own advisory reading shows.
-func TestSecurityFixWaiverIsDifferential(t *testing.T) {
+// The security-fix waiver is differential and local: the named exact version must REPLACE, at the same place in the graph, a
+// baseline version of the same package that an advisory affects, and that advisory must be gone from the result.
+func TestSecurityFixWaiverFollowsTheReplacedVersion(t *testing.T) {
 	young := func(mode string, root bool) *Releases {
 		r := reading("pk", "2.0.0", 10)
 		r.Root = root
@@ -129,24 +131,57 @@ func TestSecurityFixWaiverIsDifferential(t *testing.T) {
 	}
 	affected := evidenceOf(read("pk", "1.0.0", hit("GHSA-a", SeverityHigh), hit("GHSA-b", SeverityModerate)), read("pk", "2.0.0"))
 	unaffected := evidenceOf(read("pk", "1.0.0"), read("pk", "2.0.0"))
+	// the reviewer's shape: the direct version is unaffected and is replaced by the named one; an AFFECTED nested version of
+	// the package disappears with its parent. The advisory is fixed, the named version removed no exposure.
+	nested := pkgs("pk", "1.0.0", "dep", "1.0.0")
+	nested["node_modules/dep/node_modules/pk"] = entry("pk", "0.9.0")
+	nestedEvidence := evidenceOf(read("pk", "1.0.0"), read("pk", "0.9.0", hit("GHSA-a", SeverityHigh)), read("pk", "2.0.0"), read("dep", "1.0.0"))
+	// a true affected replacement beside another version that stays: the named version replaces the affected direct one
+	beside := pkgs("pk", "1.0.0", "dep", "1.0.0")
+	beside["node_modules/dep/node_modules/pk"] = entry("pk", "0.8.0")
+	besideTarget := pkgs("pk", "2.0.0", "dep", "1.0.0")
+	besideTarget["node_modules/dep/node_modules/pk"] = entry("pk", "0.8.0")
+	besideEvidence := evidenceOf(read("pk", "1.0.0", hit("GHSA-a", SeverityHigh), hit("GHSA-b", SeverityModerate)), read("pk", "0.8.0"), read("pk", "2.0.0"), read("dep", "1.0.0"))
+	// an alias: the baseline holds pk (registry name) under another install name; the named version replaces it at that place
+	aliased := func(version string) map[string]map[string]any {
+		return map[string]map[string]any{"node_modules/other": with(entry("pk", version), map[string]any{"name": "pk"})}
+	}
 	cases := []struct {
-		name     string
-		baseline map[string]map[string]any
-		rel      *Releases
-		ev       Evidence
-		waived   bool
-		enforced bool
+		name             string
+		baseline, target map[string]map[string]any
+		rel              *Releases
+		ev               Evidence
+		waived           bool
+		enforced         bool
 	}{
-		{"an affected upgrade is waived and names what it removes", pkgs("pk", "1.0.0"), young(SecurityFixExempt, true), affected, true, false},
-		{"an unaffected upgrade waits", pkgs("pk", "1.0.0"), young(SecurityFixExempt, true), unaffected, false, false},
-		{"a fresh add waits", pkgs("kept", "1.0.0"), young(SecurityFixExempt, true), evidenceOf(read("kept", "1.0.0"), read("pk", "2.0.0")), false, false},
-		{"an advisory the reading no longer carries (withdrawn) waits", pkgs("pk", "1.0.0"), young(SecurityFixExempt, true), unaffected, false, false},
-		{"enforce keeps the wait and says the version fixes", pkgs("pk", "1.0.0"), young(SecurityFixEnforce, true), affected, false, true},
-		{"a version nobody named is not waived", pkgs("pk", "1.0.0"), young(SecurityFixExempt, false), affected, false, false},
-		{"no baseline: nothing is replaced", nil, young(SecurityFixExempt, true), affected, false, false},
+		{"an affected upgrade is waived and names what it removes", pkgs("pk", "1.0.0"), pkgs("pk", "2.0.0"), young(SecurityFixExempt, true), affected, true, false},
+		{"a downgrade that removes the advisory is waived", pkgs("pk", "3.0.0"), pkgs("pk", "2.0.0"),
+			young(SecurityFixExempt, true), evidenceOf(read("pk", "3.0.0", hit("GHSA-a", SeverityHigh), hit("GHSA-b", SeverityModerate)), read("pk", "2.0.0")), true, false},
+		{"an affected replacement beside another version is waived", beside, besideTarget, young(SecurityFixExempt, true), besideEvidence, true, false},
+		{"an affected NESTED version disappearing while the named one replaces an unaffected direct one waits", nested, pkgs("pk", "2.0.0", "dep", "1.0.0"),
+			young(SecurityFixExempt, true), nestedEvidence, false, false},
+		{"an unaffected upgrade waits", pkgs("pk", "1.0.0"), pkgs("pk", "2.0.0"), young(SecurityFixExempt, true), unaffected, false, false},
+		{"a fresh add waits", pkgs("kept", "1.0.0"), pkgs("pk", "2.0.0"), young(SecurityFixExempt, true), evidenceOf(read("kept", "1.0.0"), read("pk", "2.0.0")), false, false},
+		{"an advisory the reading no longer carries (withdrawn) waits", pkgs("pk", "1.0.0"), pkgs("pk", "2.0.0"), young(SecurityFixExempt, true), unaffected, false, false},
+		{"enforce keeps the wait and says the version fixes", pkgs("pk", "1.0.0"), pkgs("pk", "2.0.0"), young(SecurityFixEnforce, true), affected, false, true},
+		{"a version nobody named is not waived", pkgs("pk", "1.0.0"), pkgs("pk", "2.0.0"), young(SecurityFixExempt, false), affected, false, false},
+		{"no baseline: nothing is replaced", nil, pkgs("pk", "2.0.0"), young(SecurityFixExempt, true), affected, false, false},
+		{"the advisory is still present in another version: nothing is fixed", pkgs("pk", "1.0.0", "dep", "1.0.0"), func() map[string]map[string]any {
+			t := pkgs("pk", "2.0.0", "dep", "1.0.0")
+			t["node_modules/dep/node_modules/pk"] = entry("pk", "1.0.0")
+			return t
+		}(), young(SecurityFixExempt, true), evidenceOf(read("pk", "1.0.0", hit("GHSA-a", SeverityHigh)), read("pk", "2.0.0"), read("dep", "1.0.0")), false, false},
+		{"installed at a second place that replaced nothing: the relation cannot be told, it waits", pkgs("pk", "1.0.0"), func() map[string]map[string]any {
+			t := pkgs("pk", "2.0.0", "dep", "1.0.0")
+			t["node_modules/dep/node_modules/pk"] = entry("pk", "2.0.0")
+			return t
+		}(), young(SecurityFixExempt, true), evidenceOf(read("pk", "1.0.0", hit("GHSA-a", SeverityHigh)), read("pk", "2.0.0"), read("dep", "1.0.0")), false, false},
+		{"an alias is matched by registry identity at the same place", aliased("1.0.0"), aliased("2.0.0"), young(SecurityFixExempt, true),
+			evidenceOf(read("pk", "1.0.0", hit("GHSA-a", SeverityHigh), hit("GHSA-b", SeverityModerate)), read("pk", "2.0.0")), true, false},
+		{"the same alias but the named version installed elsewhere waits", aliased("1.0.0"), pkgs("pk", "2.0.0"), young(SecurityFixExempt, true), affected, false, false},
 	}
 	for _, c := range cases {
-		report := decideCooldown(t, c.baseline, pkgs("pk", "2.0.0"), c.rel, c.ev)
+		report := decideCooldown(t, c.baseline, c.target, c.rel, c.ev)
 		if c.waived {
 			if report.Outcome.Status != "clear" || len(report.Cooldown.Waived) != 1 || strings.Join(report.Cooldown.Waived[0].Remediates, ",") != "GHSA-a,GHSA-b" {
 				t.Errorf("%s: %+v / %+v", c.name, report.Outcome, report.Cooldown)
@@ -162,14 +197,10 @@ func TestSecurityFixWaiverIsDifferential(t *testing.T) {
 	}
 }
 
-func TestOnlyACompleteAnswerWithoutATimeIsDisclosedAndNotStopping(t *testing.T) {
-	// no_time: the registry answered completely and holds no time for the version: disclosed, not stopping
-	rel := releasesOf(3, SecurityFixExempt, reading("pk", "1.0.0", 1).noTime("the registry answered completely and holds no publish time"))
-	report := decideCooldown(t, nil, pkgs("pk", "1.0.0"), rel, evidenceOf(read("pk", "1.0.0")))
-	if report.Outcome.Status != "clear" || len(report.Cooldown.Unreadable) != 1 || len(report.Cooldown.Missing) != 0 {
-		t.Fatalf("no_time: %+v / %+v", report.Outcome, report.Cooldown)
-	}
-	// missing: any other failure, and a reading nobody made, are missing evidence (exit 102), never an old version
+// There is no gap that lets a version pass unread: anything but one complete reading is missing evidence (102), and a
+// reading nobody made is missing too. A version the document lists without a time of its own is judged by the
+// last-modified time: old enough when that is older than the cooldown, otherwise it waits until the bound is.
+func TestNoPublishTimeIsLetPassUnread(t *testing.T) {
 	for name, rel := range map[string]*Releases{
 		"a failed reading": releasesOf(3, SecurityFixExempt, reading("pk", "1.0.0", 1).missing("the registry could not be reached")),
 		"no reading":       releasesOf(3, SecurityFixExempt),
@@ -182,9 +213,22 @@ func TestOnlyACompleteAnswerWithoutATimeIsDisclosedAndNotStopping(t *testing.T) 
 			t.Errorf("%s: the missing readings are not in the coverage: %+v", name, report.Coverage)
 		}
 	}
+	// bounded: the document's last-modified time is older than the cooldown: old enough
+	old := decideCooldown(t, nil, pkgs("pk", "1.0.0"), releasesOf(3, SecurityFixExempt, reading("pk", "1.0.0", 0).bounded(24*10)), evidenceOf(read("pk", "1.0.0")))
+	if old.Outcome.Status != "clear" || len(old.Cooldown.Waits) != 0 {
+		t.Fatalf("a bound older than the cooldown: %+v / %+v", old.Outcome, old.Cooldown)
+	}
+	// bounded: the last-modified time is younger: the age cannot be told, it waits until the bound is old enough
+	young := decideCooldown(t, nil, pkgs("pk", "1.0.0"), releasesOf(3, SecurityFixExempt, reading("pk", "1.0.0", 0).bounded(5)), evidenceOf(read("pk", "1.0.0")))
+	if young.Outcome.Class != ClassWait || len(young.Cooldown.Waits) != 1 || !young.Cooldown.Waits[0].Bounded {
+		t.Fatalf("a bound younger than the cooldown: %+v / %+v", young.Outcome, young.Cooldown)
+	}
+	if young.Cooldown.Waits[0].Installable != installableText(cooldownNow.Add(-5*time.Hour), 3) {
+		t.Fatalf("the retry time is the bound plus the cooldown: %+v", young.Cooldown.Waits[0])
+	}
 	// the established blocks come first: a blocking advisory is decided before missing evidence
-	rel = releasesOf(3, SecurityFixExempt, reading("pk", "1.0.0", 1).missing("the registry could not be reached"))
-	report = decideCooldown(t, nil, pkgs("pk", "1.0.0"), rel, evidenceOf(read("pk", "1.0.0", hit("GHSA-x", SeverityCritical))))
+	rel := releasesOf(3, SecurityFixExempt, reading("pk", "1.0.0", 1).missing("the registry could not be reached"))
+	report := decideCooldown(t, nil, pkgs("pk", "1.0.0"), rel, evidenceOf(read("pk", "1.0.0", hit("GHSA-x", SeverityCritical))))
 	if report.Outcome.Class != ClassBlockingAdvisory || report.Outcome.Exit != ExitBlock {
 		t.Fatalf("a block must outrank the reader's failure: %+v", report.Outcome)
 	}
@@ -285,25 +329,28 @@ func TestReadReleasesIsStrict(t *testing.T) {
 	good := `{"schema_version":1,"now":"2026-11-20T12:00:00.5Z","policy":{"cooldown_days":3,"security_fix":"exempt"},"identities":[
 	  {"name":"a","version":"1.0.0","host":"registry.npmjs.org","root":false,"status":"read","published":"2026-11-19T10:00:00.359Z","gap":""},
 	  {"name":"b","version":"1.0.0","host":"registry.npmjs.org","root":true,"status":"missing","published":"","gap":"HTTP 500"},
-	  {"name":"c","version":"1.0.0","host":"registry.npmjs.org","root":false,"status":"no_time","published":"","gap":"holds no time"}]}`
+	  {"name":"c","version":"1.0.0","host":"registry.npmjs.org","root":false,"status":"bounded","published":"2026-11-19T11:00:00.5Z","gap":""}]}`
 	if _, err := ReadReleases([]byte(good)); err != nil {
 		t.Fatalf("a good document was refused: %v", err)
 	}
 	for name, doc := range map[string]string{
-		"not json":          `nope`,
-		"unknown member":    strings.Replace(good, `"now":`, `"extra":1,"now":`, 1),
-		"repeated member":   strings.Replace(good, `"now":"2026-11-20T12:00:00.5Z"`, `"now":"2026-11-20T12:00:00.5Z","now":"2030-01-01T00:00:00Z"`, 1),
-		"another schema":    strings.Replace(good, `"schema_version":1`, `"schema_version":2`, 1),
-		"bad mode":          strings.Replace(good, `"exempt"`, `"waive"`, 1),
-		"negative days":     strings.Replace(good, `"cooldown_days":3`, `"cooldown_days":-1`, 1),
-		"days above limit":  strings.Replace(good, `"cooldown_days":3`, `"cooldown_days":36501`, 1),
-		"read without time": strings.Replace(good, `"published":"2026-11-19T10:00:00.359Z"`, `"published":""`, 1),
-		"gap with a time":   strings.Replace(good, `"gap":"HTTP 500"`, `"gap":""`, 1),
-		"old status":        strings.Replace(good, `"status":"missing"`, `"status":"unreadable"`, 1),
-		"bad status":        strings.Replace(good, `"status":"read"`, `"status":"old"`, 1),
-		"missing member":    strings.Replace(good, `,"gap":"holds no time"}`, `}`, 1),
-		"foreign member":    strings.Replace(good, `"gap":"holds no time"}`, `"gap":"holds no time","remediates":[]}`, 1),
-		"now not a date":    strings.Replace(good, `"now":"2026-11-20T12:00:00.5Z"`, `"now":"yesterday"`, 1),
+		"not json":               `nope`,
+		"unknown member":         strings.Replace(good, `"now":`, `"extra":1,"now":`, 1),
+		"repeated member":        strings.Replace(good, `"now":"2026-11-20T12:00:00.5Z"`, `"now":"2026-11-20T12:00:00.5Z","now":"2030-01-01T00:00:00Z"`, 1),
+		"another schema":         strings.Replace(good, `"schema_version":1`, `"schema_version":2`, 1),
+		"bad mode":               strings.Replace(good, `"exempt"`, `"waive"`, 1),
+		"negative days":          strings.Replace(good, `"cooldown_days":3`, `"cooldown_days":-1`, 1),
+		"days above limit":       strings.Replace(good, `"cooldown_days":3`, `"cooldown_days":36501`, 1),
+		"read without time":      strings.Replace(good, `"published":"2026-11-19T10:00:00.359Z"`, `"published":""`, 1),
+		"gap with a time":        strings.Replace(good, `"gap":"HTTP 500"`, `"gap":""`, 1),
+		"old status":             strings.Replace(good, `"status":"missing"`, `"status":"unreadable"`, 1),
+		"bad status":             strings.Replace(good, `"status":"read"`, `"status":"old"`, 1),
+		"missing member":         strings.Replace(good, `,"gap":""}]}`, `}]}`, 1),
+		"foreign member":         strings.Replace(good, `"published":"2026-11-19T11:00:00.5Z","gap":""}`, `"published":"2026-11-19T11:00:00.5Z","gap":"","remediates":[]}`, 1),
+		"no_time is gone":        strings.Replace(good, `"status":"bounded"`, `"status":"no_time"`, 1),
+		"bounded without a time": strings.Replace(good, `"published":"2026-11-19T11:00:00.5Z","gap":""}`, `"published":"","gap":""}`, 1),
+		"bounded with a gap":     strings.Replace(good, `"published":"2026-11-19T11:00:00.5Z","gap":""}`, `"published":"2026-11-19T11:00:00.5Z","gap":"x"}`, 1),
+		"now not a date":         strings.Replace(good, `"now":"2026-11-20T12:00:00.5Z"`, `"now":"yesterday"`, 1),
 	} {
 		if _, err := ReadReleases([]byte(doc)); err == nil {
 			t.Errorf("%s: the document was read", name)

@@ -242,7 +242,7 @@ func Decide(in Input) Report {
 		if err != nil {
 			// A reading that cannot be judged is not an empty one: it is missing evidence.
 			cooldown = CooldownReport{Days: in.Releases.Policy.CooldownDays, SecurityFix: in.Releases.Policy.SecurityFix,
-				Waits: []CooldownWait{}, Waived: []CooldownWaiver{}, Unreadable: []CooldownGap{}, Missing: []CooldownGap{{Gap: err.Error()}}}
+				Waits: []CooldownWait{}, Waived: []CooldownWaiver{}, Missing: []CooldownGap{{Gap: err.Error()}}}
 		}
 		// A publish time that could not be read is missing evidence like an advisory reading that could not be.
 		for _, missing := range cooldown.Missing {

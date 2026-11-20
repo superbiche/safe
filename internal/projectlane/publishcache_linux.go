@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/superbiche/safe/internal/strictjson"
 )
 
 // The cache of publish times (spec 1625, Cooldown) holds only what safe itself
@@ -102,6 +104,12 @@ func (c PublishCache) Get(source, name, version string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	if !ownedByUs(info) || info.Mode()&(os.ModePerm|os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0o600 {
+		return time.Time{}, false
+	}
+	// the repository's exact-object validator: exactly one document, no member given twice (compared exactly), no
+	// second spelling of a field name; anything else is not an entry safe wrote
+	members, err := strictjson.ParseObject(raw)
+	if err != nil || strictjson.RejectVariants(members, "schema_version", "source", "name", "version", "published") != nil {
 		return time.Time{}, false
 	}
 	var entry publishEntry

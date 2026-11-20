@@ -18,6 +18,9 @@ func runWithStdin(stdin string, args ...string) (int, string, string) {
 	return code, stdout.String(), stderr.String()
 }
 
+// registryServer serves full metadata documents. Per package: version -> time; the special members "__name" (the
+// name the document claims), "__listed" (versions listed with no time of their own, comma separated), "__abbreviated"
+// (answer with the abbreviated shape: no time at all) and "__nomodified" shape the document.
 func registryServer(t *testing.T, times map[string]map[string]string) *httptest.Server {
 	t.Helper()
 	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -28,16 +31,31 @@ func registryServer(t *testing.T, times map[string]map[string]string) *httptest.
 			return
 		}
 		name := strings.ReplaceAll(path, "%2F", "/")
-		if _, other := doc["__name"]; other {
-			name = doc["__name"]
+		if other, ok := doc["__name"]; ok {
+			name = other
 		}
-		body := map[string]string{}
+		versions := map[string]any{}
+		timeMap := map[string]string{}
 		for k, v := range doc {
-			if k != "__name" {
-				body[k] = v
+			if strings.HasPrefix(k, "__") {
+				continue
+			}
+			versions[k] = map[string]any{}
+			timeMap[k] = v
+		}
+		for _, v := range strings.Split(doc["__listed"], ",") {
+			if v != "" {
+				versions[v] = map[string]any{}
 			}
 		}
-		json.NewEncoder(w).Encode(map[string]any{"name": name, "time": body})
+		if _, ok := doc["__nomodified"]; !ok {
+			timeMap["modified"] = "2026-11-18T13:37:02.787Z"
+		}
+		body := map[string]any{"name": name, "time": timeMap, "versions": versions}
+		if _, ok := doc["__abbreviated"]; ok {
+			body = map[string]any{"name": name, "modified": "2026-11-18T13:37:02.787Z", "versions": versions, "dist-tags": map[string]string{}}
+		}
+		json.NewEncoder(w).Encode(body)
 	}))
 	t.Cleanup(registry.Close)
 	return registry
@@ -74,18 +92,20 @@ func privateStateDir(t *testing.T) string {
 	return state
 }
 
-func TestProjectReleasesReadsTimesRootsAndTellsTheGapsApart(t *testing.T) {
+func TestProjectReleasesReadsTimesBoundsAndMissingEvidence(t *testing.T) {
 	old := "2020-01-01T00:00:00.123Z"
 	registry := registryServer(t, map[string]map[string]string{
 		"fixer":    {"1.0.1": time.Now().UTC().Add(-10 * time.Hour).Format("2006-01-02T15:04:05.000Z")},
 		"old":      {"1.0.0": old},
 		"@s%2Fp":   {"1.0.0": old},
-		"notimes":  {"9.9.9": old},
+		"listed":   {"__listed": "1.0.0", "9.9.9": old},
+		"abbrev":   {"__abbreviated": "1", "1.0.0": old},
+		"unlisted": {"9.9.9": old},
 		"impostor": {"__name": "someone-else", "1.0.0": old},
 	})
 	dir := t.TempDir()
 	state := privateStateDir(t)
-	request := releasesRequest(t, dir, 3, "exempt", []string{"fixer@1.0.1"}, "fixer@1.0.1", "old@1.0.0", "@s/p@1.0.0", "notimes@1.0.0", "impostor@1.0.0", "unknown@1.0.0")
+	request := releasesRequest(t, dir, 3, "exempt", []string{"fixer@1.0.1"}, "fixer@1.0.1", "old@1.0.0", "@s/p@1.0.0", "listed@1.0.0", "abbrev@1.0.0", "unlisted@1.0.0", "impostor@1.0.0", "unknown@1.0.0")
 	code, stdout, stderr := runLane("project-releases", "--request", request, "--state-dir", state, "--registry-base", registry.URL)
 	if code != 0 {
 		t.Fatalf("code %d: %s", code, stderr)
@@ -118,10 +138,10 @@ func TestProjectReleasesReadsTimesRootsAndTellsTheGapsApart(t *testing.T) {
 	if s := byName("@s/p@1.0.0"); s.Status != "read" {
 		t.Fatalf("scoped: %+v", s)
 	}
-	if n := byName("notimes@1.0.0"); n.Status != "no_time" || n.Published != "" || n.Gap == "" {
-		t.Fatalf("a complete answer without a time is the no_time gap: %+v", n)
+	if l := byName("listed@1.0.0"); l.Status != "bounded" || l.Published != "2026-11-18T13:37:02.787Z" || l.Gap != "" {
+		t.Fatalf("a version listed without a time is bounded by the last-modified time: %+v", l)
 	}
-	for _, name := range []string{"impostor@1.0.0", "unknown@1.0.0"} {
+	for _, name := range []string{"abbrev@1.0.0", "unlisted@1.0.0", "impostor@1.0.0", "unknown@1.0.0"} {
 		if m := byName(name); m.Status != "missing" || m.Gap == "" {
 			t.Fatalf("%s must be missing evidence: %+v", name, m)
 		}

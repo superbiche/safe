@@ -37,15 +37,19 @@ const (
 
 // Statuses of one publish-time reading.
 //
-//   - read: the registry gave the publish time.
-//   - no_time: the registry answered completely for the package and holds no time
-//     for the version. The one gap that is disclosed and does not stop.
-//   - missing: anything else that leaves the version without a time (the registry
-//     unreachable, an error status, a time or size limit, a reading never
-//     attempted, an answer for another package). Missing evidence: refuses 102.
+//   - read: one complete answer gave the version's own publish time.
+//   - bounded: one complete answer lists the version without a time of its own;
+//     Published is the document's last-modified time, which no publish time in the
+//     document can exceed. Older than the cooldown means old enough; younger, the
+//     version's age cannot be told and it waits until the bound is old enough.
+//   - missing: anything else (the registry unreachable, an error status, a time or
+//     size limit, a reading never attempted, an abbreviated or truncated answer,
+//     another package's answer, a version the answer does not list, no
+//     last-modified time). Missing evidence: refuses 102. There is no gap that
+//     lets a version pass unread.
 const (
 	ReadingRead    = "read"
-	ReadingNoTime  = "no_time"
+	ReadingBounded = "bounded"
 	ReadingMissing = "missing"
 )
 
@@ -86,8 +90,8 @@ type ReleaseRequest struct {
 }
 
 // ReleaseReading is what was read for one identity. Status "read" carries the
-// publish time (RFC 3339 with its fractional seconds); "no_time" and "missing"
-// carry the gap.
+// publish time (RFC 3339 with its fractional seconds); "bounded" the document's
+// last-modified time in its place; "missing" the gap.
 type ReleaseReading struct {
 	Name      string `json:"name"`
 	Version   string `json:"version"`
@@ -172,9 +176,6 @@ type CooldownReport struct {
 	// Waived are the named exact versions inside the cooldown that remediate an
 	// advisory, under install.cooldown_security_fix=exempt.
 	Waived []CooldownWaiver `json:"waived"`
-	// Unreadable are the identities for which the registry answered completely
-	// and holds no publish time: they are disclosed and do not stop the command.
-	Unreadable []CooldownGap `json:"unreadable"`
 	// Missing are the identities whose publish time could not be read for any
 	// other reason: missing evidence (also in the report's coverage), exit 102.
 	Missing []CooldownGap `json:"missing"`
@@ -189,6 +190,9 @@ type CooldownWait struct {
 	Installable string `json:"installable"`
 	// Root is true for a version the caller named exactly.
 	Root bool `json:"root"`
+	// Bounded is true when Published is the registry document's last-modified time, an upper bound of the
+	// version's publish time, because the document lists the version without a time of its own.
+	Bounded bool `json:"bounded"`
 	// Remediates names the advisories the version fixes when it is a named root
 	// whose exemption install.cooldown_security_fix=enforce refuses.
 	Remediates []string `json:"remediates"`
@@ -237,31 +241,54 @@ func judgeCooldown(in Input, baseline Graph, decided *Report) (CooldownReport, e
 	diff := decided.Difference
 	report := CooldownReport{
 		Days: rel.Policy.CooldownDays, SecurityFix: rel.Policy.SecurityFix,
-		Waits: []CooldownWait{}, Waived: []CooldownWaiver{}, Unreadable: []CooldownGap{}, Missing: []CooldownGap{},
+		Waits: []CooldownWait{}, Waived: []CooldownWaiver{}, Missing: []CooldownGap{},
 	}
-	// The security-fix exemption is differential: the lane's own advisory reading says which advisories the
-	// command removes (the difference's fixed advisories), and the baseline says which packages it replaces.
-	fixedBy := map[string][]string{}
+	// The security-fix exemption is differential and local: the lane's own advisory reading says which advisories
+	// the command removes (the difference's fixed advisories), the baseline says which version each place in the
+	// graph held, and the named version is waived only when it REPLACES, at the same place, a baseline version of
+	// the same package that one of those advisories affects.
+	fixedBy := map[string]map[string]struct{}{}
 	for _, fixed := range decided.Advisories.Fixed {
-		fixedBy[fixed.Name] = append(fixedBy[fixed.Name], fixed.ID)
-	}
-	baselineVersions := map[string]map[string]struct{}{}
-	for _, occurrence := range baseline.Occurrences {
-		if !occurrence.Public || occurrence.Kind != KindRegistry {
-			continue
+		if fixedBy[fixed.Name] == nil {
+			fixedBy[fixed.Name] = map[string]struct{}{}
 		}
-		if baselineVersions[occurrence.Name] == nil {
-			baselineVersions[occurrence.Name] = map[string]struct{}{}
-		}
-		baselineVersions[occurrence.Name][occurrence.Version] = struct{}{}
+		fixedBy[fixed.Name][fixed.ID] = struct{}{}
 	}
-	replacesBaselineVersion := func(identity Identity) bool {
-		for version := range baselineVersions[identity.Name] {
-			if version != identity.Version {
-				return true
+	evidence := indexEvidence(in.Evidence)
+	waiverFixes := func(identity Identity) []string {
+		held := map[string]Occurrence{} // path -> the baseline's registry occurrence of this package
+		for _, occurrence := range baseline.Occurrences {
+			if occurrence.Name == identity.Name && occurrence.Public && occurrence.Kind == KindRegistry && !occurrence.covered() {
+				held[occurrence.Path] = occurrence
 			}
 		}
-		return false
+		removed := map[string]struct{}{}
+		places := 0
+		for _, occurrence := range in.Target.Occurrences {
+			if occurrence.Name != identity.Name || occurrence.Version != identity.Version || !occurrence.Public || occurrence.Kind != KindRegistry || occurrence.covered() {
+				continue
+			}
+			places++
+			before, ok := held[occurrence.Path]
+			if !ok || before.Version == identity.Version {
+				// not a replacement at this place: the relation cannot be told, the version waits
+				return nil
+			}
+			affected := 0
+			for _, hit := range evidence[before.Identity()].Advisories {
+				if _, gone := fixedBy[identity.Name][hit.ID]; gone && !hit.Malware {
+					removed[hit.ID] = struct{}{}
+					affected++
+				}
+			}
+			if affected == 0 {
+				return nil
+			}
+		}
+		if places == 0 {
+			return nil
+		}
+		return sortedIDs(removed)
 	}
 	if rel.Policy.CooldownDays <= 0 {
 		return report, nil
@@ -291,9 +318,6 @@ func judgeCooldown(in Input, baseline Graph, decided *Report) (CooldownReport, e
 		case ReadingMissing:
 			report.Missing = append(report.Missing, CooldownGap{Name: candidate.Name, Version: candidate.Version, Gap: reading.Gap})
 			continue
-		case ReadingNoTime:
-			report.Unreadable = append(report.Unreadable, CooldownGap{Name: candidate.Name, Version: candidate.Version, Gap: reading.Gap})
-			continue
 		}
 		published, err := time.Parse(time.RFC3339, reading.Published)
 		if err != nil {
@@ -308,14 +332,14 @@ func judgeCooldown(in Input, baseline Graph, decided *Report) (CooldownReport, e
 		}
 		when := installableText(published, rel.Policy.CooldownDays)
 		stamp := published.UTC().Format(time.RFC3339Nano)
-		// The exemption belongs to the exact version the caller named, and only where the version
-		// replaces a version of the same package in the baseline and thereby removes an advisory the
-		// baseline carries for it. A young version of a package the project does not have yet fixes
-		// nothing for this project and waits; a young fix nobody named is not selected; another young
-		// version of the same name is a wait of its own.
+		// The exemption belongs to the exact version the caller named, and only where it replaces, at the same
+		// place in the graph, a baseline version of the same package that a removed advisory affects. A young
+		// version of a package the project does not have yet fixes nothing for this project and waits; so does
+		// one whose relation to the baseline cannot be told; a young fix nobody named is not selected; another
+		// young version of the same name is a wait of its own.
 		var fixes []string
-		if reading.Root && replacesBaselineVersion(candidate.Identity) {
-			fixes = sortedUnique(fixedBy[candidate.Name])
+		if reading.Root {
+			fixes = waiverFixes(candidate.Identity)
 		}
 		if len(fixes) > 0 && rel.Policy.SecurityFix == SecurityFixExempt {
 			report.Waived = append(report.Waived, CooldownWaiver{
@@ -325,7 +349,7 @@ func judgeCooldown(in Input, baseline Graph, decided *Report) (CooldownReport, e
 		}
 		wait := CooldownWait{
 			Name: candidate.Name, Version: candidate.Version, Published: stamp, AgeDays: age, Installable: when,
-			Root: reading.Root, Remediates: []string{}, ClearedBy: []string{},
+			Root: reading.Root, Bounded: reading.Status == ReadingBounded, Remediates: []string{}, ClearedBy: []string{},
 		}
 		if len(fixes) > 0 {
 			wait.Remediates, wait.Enforced = fixes, true
@@ -474,7 +498,11 @@ func (r Releases) validate() error {
 			if _, err := time.Parse(time.RFC3339, reading.Published); err != nil || reading.Gap != "" {
 				return fmt.Errorf("identities[%d]: a reading carries a publish time and no gap", i)
 			}
-		case ReadingNoTime, ReadingMissing:
+		case ReadingBounded:
+			if _, err := time.Parse(time.RFC3339, reading.Published); err != nil || reading.Gap != "" {
+				return fmt.Errorf("identities[%d]: a bounded reading carries the last-modified time and no gap", i)
+			}
+		case ReadingMissing:
 			if reading.Published != "" || reading.Gap == "" {
 				return fmt.Errorf("identities[%d]: a reading without a time carries a gap and no publish time", i)
 			}

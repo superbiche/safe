@@ -131,6 +131,12 @@ func TestPublishCacheIgnoresWhatFailsItsChecks(t *testing.T) {
 			`{"schema_version":2,"source":"https://registry.npmjs.org","name":"pk","version":"1.0.0","published":"2000-01-01T00:00:00Z"}`,
 			`{"schema_version":1,"source":"https://registry.npmjs.org","name":"pk","version":"1.0.0","published":"2000-01-01T00:00:00Z","x":1}`,
 			`{"schema_version":1,"source":"https://registry.npmjs.org","name":"pk","version":"1.0.0","published":"yesterday"}`,
+			// repeated members (the second wins in a lenient reader), a second spelling of a field, trailing data
+			`{"schema_version":1,"source":"https://registry.npmjs.org","name":"pk","version":"1.0.0","published":"2000-01-01T00:00:00Z","published":"2026-11-19T00:00:00Z"}`,
+			`{"schema_version":1,"source":"https://registry.npmjs.org","name":"pk","Name":"pk","version":"1.0.0","published":"2000-01-01T00:00:00Z"}`,
+			`{"schema_version":1,"source":"https://registry.npmjs.org","name":"pk","version":"1.0.0","Published":"2000-01-01T00:00:00Z"}`,
+			`{"schema_version":1,"source":"https://registry.npmjs.org","name":"pk","version":"1.0.0","published":"2000-01-01T00:00:00Z"} {"x":1}`,
+			`{"schema_version":1,"source":"https://registry.npmjs.org","name":"pk","version":"1.0.0","published":"2000-01-01T00:00:00Z"}}`,
 			`not json`,
 		} {
 			state := privateState(t)
