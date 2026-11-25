@@ -342,6 +342,43 @@ stub_release_age_json() {
   printf '%s' "${out}"
 }
 
+# `npm root` (the question of the standing decision, ticket 1690): the stub answers as npm 10 and later do. The target is the --prefix
+# when one is given, else the nearest workspaces root above the directory (the search does not stop at a git boundary), else the
+# nearest package.json; -g/--global (or --location=global) prints a lib/node_modules under the stub's global prefix; a workspace
+# selection is an error (the command does not support workspaces); NPM_STUB_ROOT_ANSWER / NPM_STUB_ROOT_STATUS script an answer.
+if [[ "${tool}" == "npm" ]]; then
+  stub_root_word=0
+  for arg in "$@"; do [[ "${arg}" == "root" ]] && stub_root_word=1; [[ "${arg}" == "--" ]] && break; done
+  if (( stub_root_word )); then
+    printf 'ROOT_ENV\tupdate_notifier=%s\tlogs_max=%s\tstdin_tty=%s\n' "${npm_config_update_notifier:-}" "${npm_config_logs_max:-}" "$([[ -t 0 ]] && echo yes || echo no)" >> "${SAFE_INSTALL_COMMAND_LOG}"
+    [[ -z "${NPM_STUB_ROOT_STATUS:-}" ]] || exit "${NPM_STUB_ROOT_STATUS}"
+    # a late status: the answer is printed, THEN npm exits with it (an answer from a failed run is no answer)
+    [[ -z "${NPM_STUB_ROOT_LATE_STATUS:-}" ]] || trap 'exit "${NPM_STUB_ROOT_LATE_STATUS}"' EXIT
+    if [[ -n "${NPM_STUB_ROOT_ANSWER:-}" ]]; then printf '%b\n' "${NPM_STUB_ROOT_ANSWER}"; exit 0; fi
+    stub_prefix="" stub_global=0
+    stub_prev=""
+    for arg in "$@"; do
+      [[ "${stub_prev}" != "--prefix" ]] || stub_prefix="${arg}"
+      stub_prev="${arg}"
+      case "${arg}" in
+        --prefix=*) stub_prefix="${arg#--prefix=}" ;;
+        -g|--global|--location=global) stub_global=1 ;;
+        -w|--workspace|--workspace=*|--workspaces|--workspaces=*) exit 1 ;;
+      esac
+    done
+    if (( stub_global )); then printf '%s/lib/node_modules\n' "${stub_prefix:-/nonexistent/global}"; exit 0; fi
+    if [[ -n "${stub_prefix}" ]]; then printf '%s/node_modules\n' "${stub_prefix}"; exit 0; fi
+    stub_dir="$(pwd -P)"
+    stub_hit="${stub_dir}"
+    stub_up="${stub_dir}"
+    while [[ "${stub_up}" != "/" ]]; do
+      stub_up="$(dirname -- "${stub_up}")"
+      if [[ -f "${stub_up}/package.json" ]] && jq -e '.workspaces != null' "${stub_up}/package.json" >/dev/null 2>&1; then stub_hit="${stub_up}"; break; fi
+    done
+    printf '%s/node_modules\n' "${stub_hit}"
+    exit 0
+  fi
+fi
 if [[ "${tool}" == "npm" && "${1:-}" == "config" && "${2:-}" == "list" ]]; then
   wants_json=0
   for arg in "$@"; do
@@ -1126,6 +1163,10 @@ run_zsh() {
     NPM_CI_STATUS="${NPM_CI_STATUS:-}" \
     NPM_CI_CHECK_STATUS="${NPM_CI_CHECK_STATUS:-}" \
     NPM_DEDUPE_SAVES_NOTHING="${NPM_DEDUPE_SAVES_NOTHING:-}" \
+    NPM_STUB_ROOT_ANSWER="${NPM_STUB_ROOT_ANSWER:-}" \
+    NPM_STUB_ROOT_STATUS="${NPM_STUB_ROOT_STATUS:-}" \
+    NPM_STUB_ROOT_LATE_STATUS="${NPM_STUB_ROOT_LATE_STATUS:-}" \
+    SAFE_CORE_FAKE_VERSION="${SAFE_CORE_FAKE_VERSION:-}" \
     NPM_CI_CHECK_ERROR="${NPM_CI_CHECK_ERROR:-}" \
     NPM_CI_CHECK_NOISE="${NPM_CI_CHECK_NOISE:-}" \
     NPM_PROJECTION_MANIFEST_JSON="${NPM_PROJECTION_MANIFEST_JSON:-}" \
@@ -8015,6 +8056,7 @@ lane_core_wrapper() {
 real="${SAFE_CORE_REAL:?}"
 sub="${1:-}"
 tamper="${SAFE_CORE_TAMPER:-}"
+[[ -z "${SAFE_CORE_FAKE_VERSION:-}" || "${sub}" != "--version" ]] || { printf '%s\n' "${SAFE_CORE_FAKE_VERSION}"; exit 0; }
 [[ -z "${SAFE_CORE_SLEEP_SUB:-}" || "${sub}" != "${SAFE_CORE_SLEEP_SUB}" ]] || sleep "${SAFE_CORE_SLEEP:-0}"
 if [[ "${sub}" == "project-bind" && -n "${SAFE_INSTALL_COMMAND_LOG:-}" ]]; then
   { printf 'CORE_BIND_ARGS'; for a in "$@"; do printf '\t%q' "${a}"; done; printf '\n'; } >> "${SAFE_INSTALL_COMMAND_LOG}"
@@ -15950,13 +15992,13 @@ case_project_lane_oneshot_the_lines_say_what_the_operator_can_do_and_where_the_c
   lane_run 'npm install clean@2.0.0 --save-peer-x'
   assert_err_contains_fragment 'at their terminal the operator can confirm running this one command on the one-shot route' "$FUNCNAME" || return
   assert_err_not_contains_fragment 'one-shot-project' "$FUNCNAME: no standing decision is named" || return
-  # the unbound graph says again that this refusal has no route yet
+  # the unbound graph has no confirmation for one command: its way out is the standing decision, said in words
   lane_prepare "lane-oneshot-words-unbound" kept@1.0.0
   local target
   target="$(lane_lock kept@1.0.0 clean@2.0.0 | jq -c '.packages["node_modules/clean"].resolved = "https://evil.example/clean-2.0.0.tgz"')"
   NPM_LOCK_MUTATION_JSON="${target}" lane_run 'npm install clean@2.0.0'
   assert_status 102 "$FUNCNAME: unbound" || return
-  assert_err_contains_fragment 'the lane has no route for an unbound graph yet' "$FUNCNAME: unbound" || return
+  assert_err_contains_fragment 'which has no confirmation for one command; the operator can put this project on the one-shot route' "$FUNCNAME: unbound" || return
   assert_err_not_contains_fragment 'confirm running this one command' "$FUNCNAME: unbound" || return
   # a confirmed prune: the emitted line itself names the older differential path
   lane_prepare "lane-oneshot-words-prune" kept@1.0.0
@@ -16099,6 +16141,362 @@ case_project_lane_oneshot_a_live_input_that_is_unsafe_or_not_completely_decoded_
   lane_prepare "lane-live-npmrc" kept@1.0.0; lane_safe_run_stub
   printf 'strict-ssl=false\n' > "${WORK_DIR}/.npmrc"
   oneshot_never_case "$FUNCNAME: a project .npmrc setting outside the allow-list, uncommitted" 100 'npm install clean@2.0.0' || return
+  pass "$FUNCNAME"
+}
+
+# ---- ticket 1690: the standing decision per project -----------------------------------------------------------------------------
+#
+# The lane is OFF for a pinned project: a command npm will run on it goes to today's gate before the lane looks at anything. The
+# store is written only by `safe-core one-shot-store add|remove` at the operator's terminal; the lane reads it in one place with
+# two questions: data alone (this directory or an ancestor is a pin), then npm (`npm root`, the command's own arguments).
+STANDING_OPS_PATTERN='^(PROJECTION|EVIDENCE_INPUT|EVIDENCE_NAMES|CORE_BIND_ARGS|CORE_BASELINE|RELEASES_REQUEST|SOCKET_REQUEST|SOCKET_ENV|RECORD_INSTALLED_ARGS)'
+
+# Run `safe run one-shot-project …` (the shell subcommand, with the suite's core beside it) at a terminal: $1 answers, then the
+# arguments; the directory is $PIN_CWD or the project. STATUS and OUT_FILE hold the result. LANE_AGENT_MARKER=1 sets an agent marker.
+standing_run() {
+  local answers="$1" file="${CASE_DIR}/pin-answers"
+  shift
+  printf '%s' "${answers}" > "${file}"
+  : > "${OUT_FILE}"
+  mkdir -p "${CASE_DIR}/pinbin"
+  ln -sf "${ROOT_DIR}/bin/safe-run" "${CASE_DIR}/pinbin/safe-run"
+  ln -sf "${SAFE_CORE_TEST_BIN}" "${CASE_DIR}/pinbin/safe-core"
+  (
+    cd "${PIN_CWD:-${WORK_DIR}}" || exit 99
+    env -u CODEX_THREAD_ID -u CODEX_CI -u CLAUDECODE -u OPENCODE ${LANE_AGENT_MARKER:+CLAUDECODE=1} HOME="${HOME_DIR}" PATH="/usr/bin:/bin" \
+      bash -c 'exec python3 -c "import os,pty,sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))" "$@" <"'"${file}"'"' bash "${CASE_DIR}/pinbin/safe-run" one-shot-project "$@"
+  ) > "${OUT_FILE}" 2>&1
+  STATUS=$?
+}
+
+# The same with NO terminal at all (stdin /dev/null), or with stdin a pipe.
+standing_run_plain() {
+  mkdir -p "${CASE_DIR}/pinbin"
+  ln -sf "${ROOT_DIR}/bin/safe-run" "${CASE_DIR}/pinbin/safe-run"
+  ln -sf "${SAFE_CORE_TEST_BIN}" "${CASE_DIR}/pinbin/safe-core"
+  ( cd "${PIN_CWD:-${WORK_DIR}}" && HOME="${HOME_DIR}" PATH=/usr/bin:/bin bash "${CASE_DIR}/pinbin/safe-run" one-shot-project "$@" </dev/null ) > "${OUT_FILE}" 2>&1
+  STATUS=$?
+}
+
+standing_pins() { jq -c '[.projects[].path]' "$(lane_store)/one-shot-projects.json" 2>/dev/null || printf 'null'; }
+standing_physical() { ( cd "$1" && pwd -P ); }
+
+assert_no_standing_lane_operation() { # <label>
+  if grep -qP "${STANDING_OPS_PATTERN}" "${LOG_FILE}"; then
+    printf 'a lane operation ran:\n%s\n' "$(grep -P "${STANDING_OPS_PATTERN}" "${LOG_FILE}" | cut -c1-160)" >&2
+    fail "$1"
+    return 1
+  fi
+}
+
+standing_root_asked() { grep -cP '^REAL\tnpm\t(.*\t)?root(\t|$)' "${LOG_FILE}"; }
+
+# 1. A pinned project takes the one-shot route with its line, once; the command is the original one; the lane does nothing.
+case_project_lane_standing_a_pinned_project_takes_the_one_shot_route() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-standing-route" kept@1.0.0
+  lane_safe_run_stub
+  standing_run $'y\n' add
+  [[ "${STATUS}" == 0 && "$(standing_pins)" == "[\"$(standing_physical "${WORK_DIR}")\"]" ]] || { fail "$FUNCNAME: add: ${STATUS} $(cat "${OUT_FILE}")"; return; }
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_REAL_STATUS=7 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  unset SAFE_INSTALL_REAL_STATUS
+  assert_status 7 "$FUNCNAME: the command's own status" || return
+  assert_err_contains_fragment '[lane: one-shot, the operator put this project on the one-shot route' "$FUNCNAME" || return
+  assert_err_contains_fragment 'the closure is not judged on this route' "$FUNCNAME" || return
+  [[ "$(grep -c '^safe: BLOCKED' "${ERR_FILE}")" -eq 0 ]] || { fail "$FUNCNAME: a refusal line"; return; }
+  [[ "$(standing_root_asked)" == 1 ]] || { fail "$FUNCNAME: npm was asked $(standing_root_asked) times"; return; }
+  grep -qP '^REAL\tnpm\troot\tclean@2.0.0$' "${LOG_FILE}" || { fail "$FUNCNAME: the question is not the command with its word replaced: $(grep -P '\troot' "${LOG_FILE}")"; return; }
+  grep -q $'^ROOT_ENV\tupdate_notifier=false\tlogs_max=0\tstdin_tty=no' "${LOG_FILE}" || { fail "$FUNCNAME: the question's environment: $(grep ROOT_ENV "${LOG_FILE}")"; return; }
+  [[ "$(grep -cP '^REAL\tnpm\tinstall\tclean@2.0.0' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: not one delegation"; return; }
+  assert_no_standing_lane_operation "$FUNCNAME" || return
+  [[ "$(lane_record_count)" == 0 && "$(lane_approvals)" == '[]' ]] || { fail "$FUNCNAME: a pin gave a baseline or an approval"; return; }
+  pass "$FUNCNAME"
+}
+
+# 2. No pin above this directory: no npm is run for the route; the lane goes on as it always did.
+case_project_lane_standing_a_project_that_is_not_pinned_runs_no_npm_for_the_route() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-standing-none" kept@1.0.0
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME" || return
+  [[ "$(standing_root_asked)" == 0 ]] || { fail "$FUNCNAME: npm was asked for the route of an unpinned project"; return; }
+  grep -q $'^PROJECTION\tnpm' "${LOG_FILE}" || { fail "$FUNCNAME: the lane did not run"; return; }
+  # another project pinned, this one not
+  mkdir -p "${CASE_DIR}/other"; printf '{"name":"o","version":"1.0.0"}\n' > "${CASE_DIR}/other/package.json"
+  PIN_CWD="${CASE_DIR}/other" standing_run $'y\n' add
+  [[ "${STATUS}" == 0 ]] || { fail "$FUNCNAME: add other: $(cat "${OUT_FILE}")"; return; }
+  lane_reset_project
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  [[ "$(standing_root_asked)" == 0 ]] || { fail "$FUNCNAME: npm was asked beside an unrelated pin"; return; }
+  pass "$FUNCNAME"
+}
+
+# 3. A pin is for the project npm acts on: a member (its own git repository) of a pinned or unpinned workspace root.
+case_project_lane_standing_a_pin_follows_the_project_npm_acts_on() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local root member
+  lane_prepare "lane-standing-ws" kept@1.0.0
+  lane_safe_run_stub
+  root="$(standing_physical "${WORK_DIR}")"
+  jq -c '.workspaces = ["pkg"]' "${WORK_DIR}/package.json" > "${WORK_DIR}/package.json.new" && mv "${WORK_DIR}/package.json.new" "${WORK_DIR}/package.json"
+  mkdir -p "${WORK_DIR}/pkg"; printf '{"name":"pkg","version":"1.0.0"}\n' > "${WORK_DIR}/pkg/package.json"
+  ( cd "${WORK_DIR}/pkg" && git init -q . ) >/dev/null 2>&1
+  lane_commit
+  member="${root}/pkg"
+  # the MEMBER is pinned: npm acts on the root above it, which nobody pinned: not honoured, the lane goes on
+  PIN_CWD="${member}" standing_run $'y\n' add
+  [[ "$(standing_pins)" == "[\"${member}\"]" ]] || { fail "$FUNCNAME: the member was not pinned: $(cat "${OUT_FILE}")"; return; }
+  : > "${LOG_FILE}"
+  WORK_DIR="${member}" lane_run 'npm install clean@2.0.0'
+  [[ "$(standing_root_asked)" == 1 ]] || { fail "$FUNCNAME: the member's command did not ask npm once"; return; }
+  grep -q 'the operator put this project on the one-shot route' "${ERR_FILE}" && { fail "$FUNCNAME: a pinned member lent its pin to the root npm acts on"; return; }
+  # the ROOT is pinned: a command typed in the member reaches it (an ancestor), and npm confirms it is the root it acts on
+  rm -f "$(lane_store)/one-shot-projects.json"
+  standing_run $'y\n' add
+  [[ "$(standing_pins)" == "[\"${root}\"]" ]] || { fail "$FUNCNAME: the root was not pinned"; return; }
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_REAL_STATUS=7 WORK_DIR="${member}" lane_run 'npm install clean@2.0.0'
+  grep -q 'the operator put this project on the one-shot route' "${ERR_FILE}" || { fail "$FUNCNAME: a command typed in a member of a pinned root was not served: $(tail -3 "${ERR_FILE}")"; return; }
+  pass "$FUNCNAME"
+}
+
+# 4. npm's answer is the answer: the command's own arguments reach it, an option before the verb included.
+case_project_lane_standing_the_question_carries_every_argument_of_the_command() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-standing-args" kept@1.0.0
+  lane_safe_run_stub
+  standing_run $'y\n' add
+  local project other
+  project="$(standing_physical "${WORK_DIR}")"; other="${CASE_DIR}/elsewhere"; mkdir -p "${other}"
+  # an option BEFORE the verb that points npm elsewhere: the question keeps it in place, npm's answer is the other directory
+  : > "${LOG_FILE}"
+  lane_run "npm --prefix ${other} install clean@2.0.0"
+  grep -qP "^REAL\tnpm\t--prefix\t${other}\troot\tclean@2.0.0\$" "${LOG_FILE}" || { fail "$FUNCNAME: the question lost the selector: $(grep -P '\troot' "${LOG_FILE}")"; return; }
+  grep -q 'the operator put this project on the one-shot route' "${ERR_FILE}" && { fail "$FUNCNAME: an option before the verb lent the pin to another project"; return; }
+  # the option terminator stays where it was
+  : > "${LOG_FILE}"
+  lane_run 'npm install clean@2.0.0 -- --extra'
+  grep -qP '^REAL\tnpm\troot\tclean@2.0.0\t--\t--extra$' "${LOG_FILE}" || { fail "$FUNCNAME: the terminator moved: $(grep -P '\troot' "${LOG_FILE}")"; return; }
+  # global mode (the stub prints a lib/node_modules under a prefix nobody pinned, even for the pinned directory itself)
+  : > "${LOG_FILE}"
+  lane_run "npm install clean@2.0.0 -g --prefix=${project}"
+  grep -q 'the operator put this project on the one-shot route' "${ERR_FILE}" && { fail "$FUNCNAME: a global command on the pinned prefix was served"; return; }
+  pass "$FUNCNAME"
+}
+
+# 5. An undetermined answer is no pin.
+case_project_lane_standing_an_undetermined_answer_from_npm_is_no_pin() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-standing-undetermined" kept@1.0.0
+  lane_safe_run_stub
+  standing_run $'y\n' add
+  local project row label status answer
+  project="$(standing_physical "${WORK_DIR}")"
+  for row in "an error exit|1|" "two lines||${project}/node_modules\\n${project}/node_modules" "no node_modules||${project}" "a relative line||node_modules" "another directory||/tmp/not-pinned/node_modules" "empty|0|" "a workspace selection|1|"; do
+    IFS='|' read -r label status answer <<<"${row}"
+    : > "${LOG_FILE}"
+    NPM_STUB_ROOT_STATUS="${status}" NPM_STUB_ROOT_ANSWER="${answer}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+    grep -q 'the operator put this project on the one-shot route' "${ERR_FILE}" && { fail "$FUNCNAME: ${label}: the pin was honoured"; return; }
+    grep -q $'^PROJECTION\tnpm' "${LOG_FILE}" || { fail "$FUNCNAME: ${label}: the lane did not go on"; return; }
+    lane_reset_project
+  done
+  # the right line from a run that FAILED is no answer
+  : > "${LOG_FILE}"
+  NPM_STUB_ROOT_LATE_STATUS=1 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  grep -q 'the operator put this project on the one-shot route' "${ERR_FILE}" && { fail "$FUNCNAME: an answer from a failed run was honoured"; return; }
+  lane_reset_project
+  # a core that is not the version of this safe reads no store: nothing is pinned
+  : > "${LOG_FILE}"
+  SAFE_CORE_FAKE_VERSION=0.0.0-other NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  grep -q 'the operator put this project on the one-shot route' "${ERR_FILE}" && { fail "$FUNCNAME: a core of another version was used"; return; }
+  [[ "$(standing_root_asked)" == 0 ]] || { fail "$FUNCNAME: npm was asked through a core of another version"; return; }
+  lane_reset_project
+  # control: npm names the pinned directory
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_REAL_STATUS=7 NPM_STUB_ROOT_ANSWER="${project}/node_modules" lane_run 'npm install clean@2.0.0'
+  unset SAFE_INSTALL_REAL_STATUS
+  assert_status 7 "$FUNCNAME: control" || return
+  pass "$FUNCNAME"
+}
+
+# 6. A directory replaced since the pin was made is not honoured, and the lane says so.
+case_project_lane_standing_a_replaced_directory_is_not_honoured() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-standing-replaced" kept@1.0.0
+  lane_safe_run_stub
+  standing_run $'y\n' add
+  mv "${WORK_DIR}" "${WORK_DIR}.old" && cp -a "${WORK_DIR}.old" "${WORK_DIR}"
+  standing_run '' list
+  grep -q 'not honoured (directory replaced)' "${OUT_FILE}" || { fail "$FUNCNAME: list: $(cat "${OUT_FILE}")"; return; }
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME" || return
+  assert_err_contains_fragment 'another directory stands on it now, so it is not honoured' "$FUNCNAME" || return
+  grep -q $'^PROJECTION\tnpm' "${LOG_FILE}" || { fail "$FUNCNAME: the lane did not run"; return; }
+  pass "$FUNCNAME"
+}
+
+# 7. A direct call of the writer from an agent session, or with no terminal, is refused before the store is touched.
+case_project_lane_standing_the_writer_checks_the_operators_terminal_itself() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local core="${SAFE_CORE_TEST_BIN}" cold="${CASE_DIR}/cold" rc
+  lane_prepare "lane-standing-agent" kept@1.0.0
+  mkdir -p "${cold}"
+  # the shell subcommand with an agent marker on a terminal, and with no terminal
+  LANE_AGENT_MARKER=1 standing_run $'y\n' add
+  [[ "${STATUS}" == 102 && ! -e "$(lane_store)/one-shot-projects.json" ]] || { fail "$FUNCNAME: an agent session: ${STATUS} $(cat "${OUT_FILE}")"; return; }
+  standing_run_plain add
+  [[ "${STATUS}" == 102 && ! -e "$(lane_store)/one-shot-projects.json" ]] || { fail "$FUNCNAME: no terminal: ${STATUS}"; return; }
+  # the core called DIRECTLY (what the earlier branch let pin a project): no terminal, a pipe, an agent marker on a terminal
+  ( cd "${WORK_DIR}" && "${core}" one-shot-store add --home "${cold}" </dev/null >/dev/null 2>&1 ); rc=$?
+  [[ "${rc}" == 102 && -z "$(ls -A "${cold}")" ]] || { fail "$FUNCNAME: the core from /dev/null: ${rc}"; return; }
+  ( cd "${WORK_DIR}" && printf 'y\n' | "${core}" one-shot-store remove --home "${cold}" >/dev/null 2>&1 ); rc=$?
+  [[ "${rc}" == 102 && -z "$(ls -A "${cold}")" ]] || { fail "$FUNCNAME: the core from a pipe: ${rc}"; return; }
+  printf 'y\n' > "${CASE_DIR}/ans"
+  ( cd "${WORK_DIR}" && env CLAUDECODE=1 bash -c 'exec python3 -c "import os,pty,sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))" "$@" <"'"${CASE_DIR}"'/ans"' bash "${core}" one-shot-store add --home "${cold}" >/dev/null 2>&1 ); rc=$?
+  [[ "${rc}" == 102 && -z "$(ls -A "${cold}")" ]] || { fail "$FUNCNAME: the core with an agent marker on a terminal: ${rc}"; return; }
+  # at an operator's terminal the core is plumbing: allowed, checked, and it leaves the row with its time
+  mkdir -p "${cold}/.config/safe/run"
+  ( cd "${WORK_DIR}" && env -u CLAUDECODE -u CODEX_THREAD_ID -u CODEX_CI -u OPENCODE bash -c 'exec python3 -c "import os,pty,sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))" "$@" <"'"${CASE_DIR}"'/ans"' bash "${core}" one-shot-store add --home "${cold}" >/dev/null 2>&1 ); rc=$?
+  [[ "${rc}" == 0 ]] && jq -e '.projects[0].added | test("^20")' "${cold}/.config/safe/run/one-shot-projects.json" >/dev/null || { fail "$FUNCNAME: the core at an operator's terminal: ${rc}"; return; }
+  pass "$FUNCNAME"
+}
+
+# 8. list creates nothing, and says "cannot tell" with a status of its own; a refused add takes no initialisation; the question is visible.
+case_project_lane_standing_list_creates_nothing_and_cannot_tell_has_its_own_status() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-standing-cold" kept@1.0.0
+  local cold="${CASE_DIR}/cold-home" before after
+  mkdir -p "${cold}" "${CASE_DIR}/pinbin"; ln -sf "${ROOT_DIR}/bin/safe-run" "${CASE_DIR}/pinbin/safe-run"; ln -sf "${SAFE_CORE_TEST_BIN}" "${CASE_DIR}/pinbin/safe-core"
+  before="$(find "${cold}" -printf '%p %T@\n' | sort)"
+  ( cd "${WORK_DIR}" && HOME="${cold}" PATH=/usr/bin:/bin bash "${CASE_DIR}/pinbin/safe-run" one-shot-project list </dev/null >"${OUT_FILE}" 2>&1 ); STATUS=$?
+  [[ "${STATUS}" == 0 ]] || { fail "$FUNCNAME: list on a cold home: ${STATUS}"; return; }
+  ( cd "${WORK_DIR}" && HOME="${cold}" PATH=/usr/bin:/bin bash "${CASE_DIR}/pinbin/safe-run" one-shot-project add </dev/null >/dev/null 2>&1 )
+  after="$(find "${cold}" -printf '%p %T@\n' | sort)"
+  [[ "${before}" == "${after}" ]] || { fail "$FUNCNAME: a cold home changed"; return; }
+  # a store that cannot be trusted: its own status, told apart from an empty list
+  mkdir -p "${cold}/.config/safe/run"; printf '{"projects":{}}\n' > "${cold}/.config/safe/run/one-shot-projects.json"; chmod 600 "${cold}/.config/safe/run/one-shot-projects.json"
+  ( cd "${WORK_DIR}" && HOME="${cold}" PATH=/usr/bin:/bin bash "${CASE_DIR}/pinbin/safe-run" one-shot-project list </dev/null >"${OUT_FILE}" 2>&1 ); STATUS=$?
+  [[ "${STATUS}" == 3 ]] && grep -q 'cannot be trusted' "${OUT_FILE}" || { fail "$FUNCNAME: an untrusted store: ${STATUS} $(cat "${OUT_FILE}")"; return; }
+  # a trusted empty store: 0
+  rm -f "${cold}/.config/safe/run/one-shot-projects.json"
+  ( cd "${WORK_DIR}" && HOME="${cold}" PATH=/usr/bin:/bin bash "${CASE_DIR}/pinbin/safe-run" one-shot-project list </dev/null >"${OUT_FILE}" 2>&1 ); STATUS=$?
+  [[ "${STATUS}" == 0 ]] || { fail "$FUNCNAME: an empty store: ${STATUS}"; return; }
+  # the question reaches the terminal even when stderr is captured; end of input is 102 and records nothing
+  standing_run $'\004' add
+  [[ "${STATUS}" == 102 && ! -e "$(lane_store)/one-shot-projects.json" ]] || { fail "$FUNCNAME: end of input: ${STATUS} $(cat "${OUT_FILE}")"; return; }
+  grep -q 'end of input' "${OUT_FILE}" || { fail "$FUNCNAME: the failed read is not said"; return; }
+  standing_run $'y\n' add
+  grep -q 'put them on the one-shot route? \[y/N\]' "${OUT_FILE}" && grep -q 'device' "${OUT_FILE}" || { fail "$FUNCNAME: the identity shown: $(cat "${OUT_FILE}")"; return; }
+  standing_run $'n\n' remove
+  [[ "${STATUS}" == 1 && "$(standing_pins | jq -r length)" == 1 ]] || { fail "$FUNCNAME: a declined remove: ${STATUS}"; return; }
+  pass "$FUNCNAME"
+}
+
+# 9. add, list and remove mean the same directory: a newline, a link followed by .., a backslash, a replaced path; several at once.
+case_project_lane_standing_add_list_and_remove_mean_the_same_directory() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-standing-names" kept@1.0.0
+  local base="${CASE_DIR}/dirs" nl
+  mkdir -p "${base}/x" "${base}/real/inner" "${base}"'/a\b'
+  for d in "${base}/x" "${base}/real" "${base}"'/a\b'; do printf '{}\n' > "${d}/package.json"; done
+  nl="${base}/x"$'\n'; mkdir -p "${nl}"; printf '{}\n' > "${nl}/package.json"
+  standing_run $'y\n' add "${nl}"
+  [[ "${STATUS}" != 0 && "$(standing_pins)" == 'null' ]] || { fail "$FUNCNAME: a name ending in a newline was pinned: $(standing_pins)"; return; }
+  # a link followed by `..` is the parent of what the link leads to (the kernel's reading), not the text's
+  ln -s "${base}/real/inner" "${base}/lnk"
+  standing_run $'y\n' add "${base}/lnk/.." "${base}"'/a\b'
+  [[ "${STATUS}" == 0 ]] || { fail "$FUNCNAME: add of two: ${STATUS} $(cat "${OUT_FILE}")"; return; }
+  [[ "$(standing_pins | jq -c 'sort')" == "$(jq -cn --arg a "${base}/real" --arg b "${base}"'/a\b' '[$a,$b] | sort')" ]] || { fail "$FUNCNAME: pinned $(standing_pins)"; return; }
+  standing_run '' list
+  grep -q 'honoured' "${OUT_FILE}" && ! grep -q 'directory gone' "${OUT_FILE}" || { fail "$FUNCNAME: list: $(cat "${OUT_FILE}")"; return; }
+  # an old pinned path replaced by a link: remove by the exact stored key removes the stored entry
+  rm -rf "${base}/real" && ln -s "${base}/x" "${base}/real"
+  standing_run $'y\n' remove "${base}/real"
+  [[ "${STATUS}" == 0 && "$(standing_pins | jq -c 'map(select(endswith("/real")))')" == '[]' ]] || { fail "$FUNCNAME: remove by stored key: ${STATUS} $(cat "${OUT_FILE}") $(standing_pins)"; return; }
+  # the audit log says it, once the core reported the commit
+  grep -rq 'ONE_SHOT_PROJECT_ADD' "${HOME_DIR}/.local/share" && grep -rq 'ONE_SHOT_PROJECT_REMOVE' "${HOME_DIR}/.local/share" || { fail "$FUNCNAME: the audit log has no record"; return; }
+  [[ ! -e "$(lane_store)/one-shot-projects.log" ]] || { fail "$FUNCNAME: a second log beside the store"; return; }
+  pass "$FUNCNAME"
+}
+
+# 10. A store the core cannot trust pins nothing: reached through a link, not the operator's, open to others.
+case_project_lane_standing_a_store_that_cannot_be_trusted_pins_nothing() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-standing-untrusted" kept@1.0.0
+  lane_safe_run_stub
+  standing_run $'y\n' add
+  local f="$(lane_store)/one-shot-projects.json"
+  chmod 664 "${f}"
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  [[ "$(standing_root_asked)" == 0 ]] && grep -q $'^PROJECTION\tnpm' "${LOG_FILE}" || { fail "$FUNCNAME: a group-writable store was honoured"; return; }
+  chmod 600 "${f}"
+  mkdir -p "${CASE_DIR}/checkout"; mv "${HOME_DIR}/.config/safe" "${CASE_DIR}/checkout/safe" && ln -s "${CASE_DIR}/checkout/safe" "${HOME_DIR}/.config/safe"
+  lane_reset_project
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  [[ "$(standing_root_asked)" == 0 ]] || { fail "$FUNCNAME: a store reached through a link was honoured"; return; }
+  # an environment redirect of the run directory decides nothing either
+  rm -f "${HOME_DIR}/.config/safe"; mv "${CASE_DIR}/checkout/safe" "${HOME_DIR}/.config/safe"
+  : > "${LOG_FILE}"
+  SAFE_RUN_CONFIG_DIR="${CASE_DIR}/elsewhere" SAFE_RUN_TRUST_OVERRIDE=1 lane_run 'npm install clean@2.0.0 --one-shot'
+  grep -q 'the operator put this project on the one-shot route' "${ERR_FILE}" && [[ ! -e "${CASE_DIR}/elsewhere" ]] && { fail "$FUNCNAME: an option or a redirected store chose the route"; return; }
+  pass "$FUNCNAME"
+}
+
+# 11. dedupe and prune go to the older differential path for a pinned project, and the line says so; mise exec hands over once.
+case_project_lane_standing_dedupe_prune_and_mise_exec_follow_the_pin() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-standing-verbs" kept@1.0.0
+  lane_safe_run_stub
+  standing_run $'y\n' add
+  local verb
+  for verb in dedupe prune; do
+    : > "${LOG_FILE}"
+    lane_run "npm ${verb}"
+    assert_err_contains_fragment "npm ${verb} goes to today's older differential path" "$FUNCNAME: ${verb}" || return
+    ! grep -q '\[lane: project\]' "${ERR_FILE}" || { fail "$FUNCNAME: ${verb}: a lane refusal"; return; }
+    assert_no_standing_lane_operation "$FUNCNAME: ${verb}" || return
+  done
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_REAL_STATUS=0 lane_run 'mise exec -- npm install clean@2.0.0'
+  [[ "$(grep -cP '^REAL\tmise\texec\t--\tnpm\tinstall\tclean@2.0.0' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: mise exec was not dispatched once: $(grep REAL "${LOG_FILE}")"; return; }
+  pass "$FUNCNAME"
+}
+
+# 12. Withdrawn, the project takes the lane again; with the switch off nothing changes; the unbound graph names the standing decision.
+case_project_lane_standing_a_withdrawn_project_takes_the_lane_and_the_switch_off_changes_nothing() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-standing-withdraw" kept@1.0.0
+  lane_safe_run_stub
+  standing_run $'y\n' add
+  standing_run $'y\n' remove
+  [[ "${STATUS}" == 0 && "$(standing_pins)" == '[]' ]] || { fail "$FUNCNAME: remove: ${STATUS} $(cat "${OUT_FILE}")"; return; }
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME: withdrawn" || return
+  grep -q $'^PROJECTION\tnpm' "${LOG_FILE}" || { fail "$FUNCNAME: a withdrawn project did not take the lane"; return; }
+  # switch off, pinned: today's gate, no standing line, no question
+  standing_run $'y\n' add
+  printf '{"install":{"project_lane":false}}\n' > "${HOME_DIR}/.config/safe/run/config.json"
+  : > "${LOG_FILE}"
+  lane_run 'npm install clean@2.0.0'
+  assert_err_not_contains_fragment 'one-shot' "$FUNCNAME: switch off" || return
+  [[ "$(standing_root_asked)" == 0 ]] || { fail "$FUNCNAME: the switch off asked npm"; return; }
+  printf '{"install":{"project_lane":true}}\n' > "${HOME_DIR}/.config/safe/run/config.json"
+  # the unbound graph names the standing decision, in words, as its way out
+  standing_run $'y\n' remove
+  local target
+  target="$(lane_lock kept@1.0.0 clean@2.0.0 | jq -c '.packages["node_modules/clean"].resolved = "https://evil.example/clean-2.0.0.tgz"')"
+  lane_reset_project
+  NPM_LOCK_MUTATION_JSON="${target}" lane_run 'npm install clean@2.0.0'
+  assert_status 102 "$FUNCNAME: unbound" || return
+  assert_err_contains_fragment 'the operator can put this project on the one-shot route' "$FUNCNAME: unbound" || return
+  assert_err_not_contains_fragment 'safe run one-shot-project' "$FUNCNAME: no command in the line" || return
   pass "$FUNCNAME"
 }
 
@@ -16383,6 +16781,18 @@ main() {
     case_project_lane_oneshot_the_one_outcome_handler_rules \
     case_project_lane_oneshot_a_refusal_that_is_never_confirmable_is_never_asked \
     case_project_lane_oneshot_a_cancellation_at_the_question_frees_the_lock \
+    case_project_lane_standing_a_pinned_project_takes_the_one_shot_route \
+    case_project_lane_standing_a_project_that_is_not_pinned_runs_no_npm_for_the_route \
+    case_project_lane_standing_a_pin_follows_the_project_npm_acts_on \
+    case_project_lane_standing_the_question_carries_every_argument_of_the_command \
+    case_project_lane_standing_an_undetermined_answer_from_npm_is_no_pin \
+    case_project_lane_standing_a_replaced_directory_is_not_honoured \
+    case_project_lane_standing_the_writer_checks_the_operators_terminal_itself \
+    case_project_lane_standing_list_creates_nothing_and_cannot_tell_has_its_own_status \
+    case_project_lane_standing_add_list_and_remove_mean_the_same_directory \
+    case_project_lane_standing_a_store_that_cannot_be_trusted_pins_nothing \
+    case_project_lane_standing_dedupe_prune_and_mise_exec_follow_the_pin \
+    case_project_lane_standing_a_withdrawn_project_takes_the_lane_and_the_switch_off_changes_nothing \
     case_project_lane_oneshot_each_confirmable_kind_hands_the_command_over \
     case_project_lane_oneshot_a_start_up_input_or_a_destination_is_never_confirmable_however_it_is_named \
     case_project_lane_oneshot_a_live_input_that_is_unsafe_or_not_completely_decoded_is_never_confirmable \

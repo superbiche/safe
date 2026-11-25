@@ -15,6 +15,8 @@ Rules
       lane's entry.
   R3  the hand-over status is raised only by the functions that own it, by assignment and by calling its helpers.
   R4  a refusal that carries a kind passes a kind of the closed list (safe_gate_project_lane_kinds), as a bare word.
+  R9  the standing decision is read in one place: the route is called once, from the runner; the data question and the question to
+      npm are called from the route only; the core's store is named by those two functions only.
   R5  a refusal or hand-over is never inside a pipeline, a command substitution or a subshell: what it records would be lost
       with the child shell while its owner went on (a `return` in the child does not end the owner).
   R6  the state a confirmation rests on has owners, in the whole file: the mark of a confirmable refusal is raised only by
@@ -60,6 +62,11 @@ PROMPT_CALLERS = {"safe_gate_project_lane_prompts"}
 GRANT_CALLERS = {"safe_gate_project_lane_prompt_blocking", "safe_gate_project_lane_prompt_adverse",
                  "safe_gate_project_lane_prompt_socket"}
 PROMPTS_LOOP_CALLERS = {"safe_gate_project_lane_run"}
+# R9: the standing decision is read in ONE place, with two questions asked from ONE place each
+PIN_CALLERS = {"safe_gate_project_lane_pin_route": {"safe_gate_project_lane_run"},
+               "safe_gate_project_lane_pin_here": {"safe_gate_project_lane_pin_route"},
+               "safe_gate_project_lane_pin_ask_npm": {"safe_gate_project_lane_pin_route"}}
+PIN_CORE_USERS = {"safe_gate_project_lane_pin_here", "safe_gate_project_lane_pin_ask_npm"}
 
 FN = re.compile(r"^(safe_gate_[A-Za-z0-9_]+)\(\)\s*\{")
 
@@ -121,7 +128,7 @@ def in_child_shell(bare, name):
 
 
 def command_at(text, name):
-    return re.search(r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b|!)\s*" + re.escape(name) + r"(?![A-Za-z0-9_])", text) is not None
+    return re.search(r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b|\bif\b|\belif\b|\bwhile\b|\buntil\b|!)\s*" + re.escape(name) + r"(?![A-Za-z0-9_])", text) is not None
 
 
 def returns(text):
@@ -229,8 +236,15 @@ def main(path):
             problems.append(f"{number}:{fn}:R7: the host-grant prompt is called outside the prompts that own it")
         if command_at(bare, "safe_gate_project_lane_prompts") and fn not in PROMPTS_LOOP_CALLERS:
             problems.append(f"{number}:{fn}:R7: the prompt loop is called outside the runner")
+        for name, callers in PIN_CALLERS.items():
+            if command_at(bare, name) and fn not in callers:
+                problems.append(f"{number}:{fn}:R9: {name} is called outside the one place that owns it")
+        if "one-shot-store" in text and fn not in PIN_CORE_USERS:
+            problems.append(f"{number}:{fn}:R9: the standing decision's store is named outside the two questions")
         if re.search(r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b)\s*(?:return|exit)\s+25[23](?![0-9])", bare):
             problems.append(f"{number}:{fn}:R8: a reserved status is written as a literal")
+    if len([1 for n, fn, t, b in lane if command_at(b, "safe_gate_project_lane_pin_route") and fn == "safe_gate_project_lane_run"]) != 1:
+        problems.append("0::R9: the runner does not read the standing decision exactly once")
     names = {fn for _, fn, _ in logical}
     if "safe_gate_project_lane_one_shot_question" not in names or "safe_gate_project_lane_conclude" not in names:
         problems.append("0::R2: the lane has no top-level question")

@@ -359,7 +359,39 @@ pass and warnings under `environment.release_follow`.
   published) and today's gate runs the command exactly as with the switch off, its own receipts included, after the line `[lane:
   one-shot, …] — the closure is not judged on this route` (for `dedupe` and `prune`, the older differential path, which judges them
   where it can, refuses the rest and has no override of its own). A confirmable refusal's final line says the operator can confirm at
-  their terminal. There is no standing per-project decision yet (ticket 1690). A graph the lane cannot bind has no override yet.
+  their terminal. A graph the lane cannot bind has no confirmation for one command: its way out is the standing decision below.
+
+  **The standing decision per project.** `safe run one-shot-project add [dir…] | remove [dir…|key] | list`: the lane is OFF for a
+  project, so a command npm will run on it goes to today's gate before the lane looks at anything, with the one-shot line (the
+  closure is not judged on that route; `dedupe` and `prune` go to the older differential path). It is for what the lane cannot drive
+  (an npm older than 11.17.0, an environment it refuses, a graph it cannot bind), worked on by agents who cannot confirm anything.
+  It gives no approval, no receipt and no baseline. `add` and `remove` are checked by the PROGRAM that writes the store
+  (`safe-core one-shot-store`: stdin a terminal and none of the four agent markers, else 102 before anything is touched, whoever
+  calls it), which resolves, shows the identity it will commit, asks on the terminal and commits under a lock in one invocation; the
+  shell subcommand only delegates and writes the audit log once the core reported the commit. The store,
+  `one-shot-projects.json` under the operator's established root (`$HOME/.config/safe/run`, never a redirect), is one strict,
+  bounded (64 KiB) document read and written only by the core, through verified directories and one descriptor (no link, each
+  directory the user's and closed to group and others, a file of mode 0600 with one link, a lock file checked the same way); the
+  staged file is created with its final mode; a failure before the rename says "not recorded" and a failed directory sync after it
+  says "committed and visible, durability uncertain" (exit 4). An entry is the physical path of the project directory (its bytes,
+  resolved by the kernel: `link/..` is the parent of what the link leads to) with its device and inode and the time it was added; it
+  carries no reason (the audit log attributes it). `list` is read-only and creates nothing; exit 3 means the store cannot be trusted
+  (told apart from an empty list). **How the lane reads it:** in one place, right after it captured its project directory, with two
+  questions. First, on data alone: is the directory the command runs in, or one of its ancestors, a stored pin by identity? If none
+  is, nothing more happens and no npm is run. Then npm: `npm root` with the command's own arguments (the command word replaced,
+  everything else in place, the option terminator included), run by the caller's own npm and environment because that is the command
+  that will run, with only npm's update check and debug log silenced. The pin is honoured only when npm exits 0 and prints exactly
+  one line, ending in `/node_modules`, whose directory (opened by the core, never taken as text) is itself a stored pin: so "npm
+  acts on a pinned project, in project mode" is what is checked, whatever directory the command was typed in; a global command
+  prints a `lib/node_modules` under a prefix nobody pinned. An undetermined answer is no pin. **Accepted limits:** a command that
+  selects a workspace (`-w`, `--workspaces`, or `workspace`/`workspaces` set in a file) is not served by a pin (npm gives no answer
+  for it); a pin on a workspace member is not honoured where npm acts on the root above (npm 10 and later search across a git
+  boundary; npm 8.1.0 does not search); the question runs npm's start-up once for a command under a pinned directory even when the
+  pin is then not honoured, and a caller who controls npm's start-up controls the answer (the same boundary as today's gate); a
+  remount at the same path with the same device and inode, or a reused inode, cannot be told from the pinned directory; a process
+  allowed to write files as the operator can write the store. What the real npm prints on 8.1.0, 10.9.2, 11.20.0 and 12.2.1 is held
+  by `tests/live/standing_pin_npm_oracle.sh`. `npm root` writes nothing on 8.1.0 and 11.20.0; on 10.9.2 and 12.2.1 it writes a debug
+  log and an update-check stamp and contacts the registry unless silenced, which the question's environment does.
 
   **Standing acceptances.** The decision takes the operator's standing acceptances as a document of its own, read by safe's
   own reader (`safe audit lane-acceptances`, which calls the functions today's install gate calls and has no store, format or

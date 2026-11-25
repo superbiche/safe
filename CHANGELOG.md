@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Project lane (still behind `install.project_lane`): the standing decision per project. `safe run one-shot-project add|remove|list`
+  turns the lane OFF for a project: a command npm will run on it goes to today's gate with the one-shot line before the lane looks at
+  anything (`dedupe` and `prune` to the older differential path); no approval, receipt or baseline. The store is read and written only
+  by `safe-core one-shot-store`, which checks the operator's terminal itself (a direct call from an agent session or without a
+  terminal is 102 and touches nothing), on verified directories, as one strict bounded document, with a checked lock, a staged file
+  created with its final mode, and "not recorded" told apart from "committed, durability uncertain"; an entry is the physical path
+  with device and inode. The lane asks in two steps: data alone (this directory or an ancestor is a pin; else no npm is run), then
+  `npm root` with the command's own arguments, honoured only when npm names a pinned directory in project mode. `list` creates
+  nothing and exits 3 when the store cannot be trusted. A graph the lane cannot bind names this way out. Agent contract: an
+  operator-only flow, relayed only when the operator asks for a standing decision.
 - Project lane (still behind `install.project_lane`): the operator sends ONE command to the one-shot route. Every refusal of the
   lane records itself and returns, and the final line is printed once at the lane's top level, after the lock and scratch are freed. A
   refusal is confirmable only when its site gives it an explicit kind from a closed list (a command form, a project shape, an npm

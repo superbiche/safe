@@ -3748,6 +3748,69 @@ safe_gate_project_lane_conclude() {
 # Neither a flag nor an uncommitted change can choose the weaker route, and a safety guard that
 # fails takes precedence over the compatibility route: the guards run BEFORE a one-shot.
 
+# --- the operator's standing decision per project (ticket 1690) -----------------------------------------------------------------
+# "The lane is off for this project": a command that npm will run on a pinned project goes to today's gate before the lane looks at
+# anything else, with the one-shot line. The store, its one reader and its one writer are `safe-core one-shot-store` (verified
+# directories, one descriptor for check and read, one strict document); this is where the lane READS it, once, in
+# safe_gate_project_lane_pin_route. Two questions, never one:
+#   1. on data alone: is the directory the command runs in, or one of its ancestors, a stored pin by identity? When none is, nothing
+#      more happens: no npm is run, and the lane goes on (no npm run decides the route of any project that is not under a pin);
+#   2. to npm: `npm root` with the command's own arguments, the command word replaced and everything else in place. The pin is
+#      honoured only when npm exits 0 and prints exactly one line that ends in /node_modules and whose directory (opened by the core,
+#      never taken as text) is itself a stored pin by identity: "npm acts on a pinned project, in project mode", whatever directory
+#      the command was typed in. An undetermined answer (an error, a workspace selection, a timeout, another directory) is no pin.
+# The question runs the caller's npm with the caller's environment, because that is the command that will run (the same boundary as
+# today's gate); the environment adds only what silences npm's own housekeeping (its update check, its debug log).
+safe_gate_project_lane_pin_core() {
+  local core="${SAFE_DIR:-}/safe-core"
+  [[ -n "${SAFE_DIR:-}" && -x "${core}" && "${HOME:-}" == /* ]] || return 1
+  [[ "$("${core}" --version 2>/dev/null)" == "${SAFE_VERSION:-unset}" ]] || return 1
+  printf '%s' "${core}"
+}
+
+# 0 pinned here or above, 1 none, 2 a stored path is here but another directory stands on it. Data alone: runs no npm.
+safe_gate_project_lane_pin_here() {
+  local core rc=0
+  core="$(safe_gate_project_lane_pin_core)" || return 1
+  "${core}" one-shot-store check --home "${HOME}" </dev/null >/dev/null 2>&1 || rc=$?
+  case "${rc}" in 0) return 0 ;; 2) return 2 ;; *) return 1 ;; esac
+}
+
+# 0 when npm's answer names a stored pin. $@ the command's arguments; reads SAFE_GATE_SUBCMD_IDX (the index of the command word).
+safe_gate_project_lane_pin_ask_npm() {
+  local core real
+  local -a argv=("$@")
+  core="$(safe_gate_project_lane_pin_core)" || return 1
+  (( SAFE_GATE_SUBCMD_IDX >= 1 && SAFE_GATE_SUBCMD_IDX <= ${#argv[@]} )) || return 1
+  argv[SAFE_GATE_SUBCMD_IDX-1]=root
+  real="$(safe_gate_resolve_real npm)" || return 1
+  [[ -n "${real}" ]] || return 1
+  local -a ran
+  command -v timeout >/dev/null 2>&1 || return 1
+  env npm_config_update_notifier=false npm_config_logs_max=0 timeout --kill-after=2s 10s "${real}" "${argv[@]}" </dev/null 2>/dev/null \
+    | "${core}" one-shot-store verify-root --home "${HOME}"
+  ran=("${PIPESTATUS[@]}")
+  (( ran[0] == 0 && ran[1] == 0 ))
+}
+
+# The ONLY place the lane reads the standing decision. 0 when the lane is OFF for this project (the caller hands the command over),
+# 1 when the lane goes on. $1 verb, then the command's arguments.
+safe_gate_project_lane_pin_route() {
+  local here=0
+  shift
+  safe_gate_project_lane_pin_here || here=$?
+  if (( here == 1 )); then
+    return 1
+  fi
+  if (( here == 0 )) && safe_gate_project_lane_pin_ask_npm "$@"; then
+    return 0
+  fi
+  if (( here == 2 )); then
+    safe_gate_err "safe: project lane: a one-shot decision names a path here, but another directory stands on it now, so it is not honoured (safe run one-shot-project list)"
+  fi
+  return 1
+}
+
 # The ONLY places the lane's hand-over statuses are raised (the structural lint checks it): the command goes to today's gate
 # (253) or is left to npm, which rejects it (252). Both return through the same non-zero path as a refusal.
 safe_gate_project_lane_hand_over_silent() {
@@ -5455,7 +5518,7 @@ safe_gate_project_lane_outcome_text() {
     .outcome as $o
     | if $o.status == "unbound" then
         (.bindability.unbound[0]) as $u
-        | "the projected graph holds \(.bindability.unbound | length) entry(ies) safe cannot bind (\($u.name // $u.path)@\($u.version // "?"): \($u.reason))|the lane has no route for an unbound graph yet; no file was written"
+        | "the projected graph holds \(.bindability.unbound | length) entry(ies) safe cannot bind (\($u.name // $u.path)@\($u.version // "?"): \($u.reason))|the lane cannot bind this graph, which has no confirmation for one command; the operator can put this project on the one-shot route, a standing decision at their terminal; no file was written"
       elif $o.class == "malice" then
         (.malice[0]) as $m
         | "\(if $m.signal == "blocklist" then "blocklist entry" elif $m.signal == "socket_block" then "Socket BLOCK" else "known-malware record" end) on \($m.name)@\($m.versions | join(",")) (\($m.id // $m.reason))\(if (.malice | length) > 1 then " and \((.malice | length) - 1) more" else "" end)|remove it from the dependency graph; nothing clears malice"
@@ -5850,6 +5913,12 @@ safe_gate_project_lane_run() {
   project_dir="${project_dir%$'\n'}"
   if [[ "${project_dir}" == *$'\n'* ]]; then
     safe_gate_project_lane_refuse 100 "${verb}" "the project's path contains a newline, so it cannot be captured exactly (it could name a sibling directory)" "run the command from a directory whose path has no newline"
+    return $?
+  fi
+  # The operator's standing decision for this project (a stored pin, here or above, that npm then confirms is the project it acts
+  # on): the lane is off, the command goes to today's gate before anything else is read, opened or locked.
+  if safe_gate_project_lane_pin_route "${verb}" "$@"; then
+    safe_gate_project_lane_oneshot "${verb}" "the operator put this project on the one-shot route (safe run one-shot-project list)"
     return $?
   fi
   # safe's own storage, and the scratch, are outside the project: nothing of

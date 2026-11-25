@@ -3856,6 +3856,74 @@ cmd_scripts_allow_list() {
 }
 
 # ---------------------------------------------------------------------------
+# Subcommands: one-shot-project
+# The operator's standing decision that the npm project lane is OFF for a project: its npm commands take today's gate (the one-shot
+# route), whose closure judgement is its own. The store, its one reader and its one writer live in `safe-core one-shot-store`:
+# `add` and `remove` check the operator's terminal THEMSELVES (stdin a terminal, no agent marker: 102 otherwise, before the store
+# is touched), resolve, show, ask and commit in ONE invocation; this subcommand only delegates, reports and writes the audit log
+# once the core has reported the commit. `list` is read-only and creates nothing. No generic initialisation runs for it.
+# ---------------------------------------------------------------------------
+one_shot_core() {
+  local dir
+  dir="$(cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)" || dir=""
+  [[ -n "$dir" && -x "$dir/safe-core" ]] || die "safe-core is not installed beside safe-run: rerun install.sh"
+  printf '%s/safe-core' "$dir"
+}
+
+cmd_one_shot_project() {
+  local sub="${1:-list}"
+  shift || true
+  [[ -n "${HOME:-}" && "$HOME" == /* ]] || die "HOME is not an absolute path: the operator's store cannot be located"
+  case "$sub" in
+    add|remove|rm)
+      [[ "$sub" != rm ]] || sub=remove
+      cmd_one_shot_project_change "$sub" "$@" ;;
+    list|ls|"") cmd_one_shot_project_list ;;
+    *)          die "unknown one-shot-project subcommand: $sub" ;;
+  esac
+}
+
+cmd_one_shot_project_list() {
+  local core out rc=0
+  core="$(one_shot_core)"
+  out="$("$core" one-shot-store list --home "$HOME")" || rc=$?
+  if (( rc == 3 )); then
+    err "the one-shot project store cannot be trusted as the operator's own: it is ignored, so no project is on the one-shot route (this is not an empty list)"
+    return 3
+  elif (( rc != 0 )); then
+    die "cannot read the one-shot project store"
+  fi
+  printf '%-60s %-26s %s\n' "PROJECT" "ADDED" "STATE"
+  jq -r '.[] | [(.path | tojson), .added, .state] | @tsv' <<<"$out" | while IFS=$'\t' read -r p a st; do
+    printf '%-60s %-26s %s\n' "$p" "$a" "$st"
+  done
+}
+
+cmd_one_shot_project_change() {
+  local verb="$1" core out rc=0 path event
+  shift
+  core="$(one_shot_core)"
+  # the core asks (on the operator's terminal) and commits; its standard output is the committed change
+  out="$("$core" one-shot-store "$verb" --home "$HOME" -- "$@")" || rc=$?
+  case "$rc" in
+    0|4) ;;
+    102) exit 102 ;;
+    *) err "the change was NOT recorded"; exit 1 ;;
+  esac
+  event="ONE_SHOT_PROJECT_ADD"; [[ "$verb" == add ]] || event="ONE_SHOT_PROJECT_REMOVE"
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    if [[ "$verb" == add ]]; then info "project put on the one-shot route: $path"; else info "project taken off the one-shot route: $path"; fi
+    audit_log "one-shot-project" "$path" "$event" "$(context_label)" "" 2>/dev/null \
+      || warn "the audit log could not be written for $path (the change stands: it is committed in the store)"
+  done < <(jq -r 'if (.[0] | type) == "object" then .[].path else .[] end | tojson' <<<"$out")
+  if (( rc == 4 )); then
+    warn "the change is committed and visible, but its durability is uncertain (the directory sync failed)"
+    exit 4
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Subcommands: block
 # ---------------------------------------------------------------------------
 cmd_block() {
@@ -4467,6 +4535,9 @@ SUBCOMMANDS
                                               global ignore-scripts unchanged
   scripts-allow remove <pkg>                  Revoke scripts grant
   scripts-allow list                          Show scripts grants
+  one-shot-project add [<dir>…]               Operator (TTY): the lane is off for these npm projects
+  one-shot-project remove [<dir>…|<key>]      Operator (TTY): the lane applies to them again
+  one-shot-project list                       Show them (read-only; 3 = the store cannot be trusted)
 
   block add <pkg>                             Block a package
   block remove <pkg>                          Unblock
@@ -4534,6 +4605,10 @@ main() {
           && ( "${2:-}" == "review" || "${2:-}" == "export" || "${2:-}" == "import" \
             || "${2:-}" == "follow" || "${2:-}" == "follow-signer" ) ]]; then
       :
+    elif [[ "$argv0" == "safe-run" && "${1:-}" == "one-shot-project" ]]; then
+      # The standing decision is read and written by safe-core alone: `list` creates nothing, a refused change takes no
+      # initialisation, and a successful change creates only what it needs.
+      :
     elif [[ "$argv0" == "safe-run" && "${1:-}" == "private-registry" ]]; then
       # Each private-registry write initializes state itself, after its
       # operator-TTY gate; reports and follow must not seed trust files.
@@ -4551,6 +4626,7 @@ main() {
       host-allow) shift; cmd_host_allow "$@" ;;
       private-registry) shift; cmd_private_registry "$@" ;;
       scripts-allow) shift; cmd_scripts_allow "$@" ;;
+      one-shot-project) shift; cmd_one_shot_project "$@" ;;
       block)      shift; cmd_block "$@" ;;
       audit)      shift; cmd_audit "$@" ;;
       status)     shift; cmd_status "$@" ;;

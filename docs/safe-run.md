@@ -588,6 +588,27 @@ tag_object=<sha>`. No newer tag is a quiet exit-0 no-op. Removing a signer at a
 TTY stops future release acceptance; it does not roll back an already installed
 release.
 
+## One-shot projects
+
+The npm project lane judges `install`, `update`, `ci`, `dedupe` and `prune` before they run. The operator can turn the lane OFF for a
+project (one it cannot drive: an npm older than 11.17.0, an environment it refuses, a graph it cannot bind): its npm commands then take
+today's gate with the one-shot line, and the closure is not judged on that route (`dedupe` and `prune` go to the older differential path).
+
+```bash
+safe run one-shot-project add [<dir>…]            # default: the current directory (operator TTY)
+safe run one-shot-project remove [<dir>…|<key>]   # operator TTY; by the exact stored path or by a directory
+safe run one-shot-project list                    # read-only; exit 3: the store cannot be trusted
+```
+
+`add` and `remove` are operator-only: the program that writes the store checks the terminal itself (stdin a terminal, none of the four
+agent markers; 102 otherwise, before the store is touched, even if `safe-core` is called directly), shows the identity it will commit,
+asks, and commits under a lock. A failed terminal read is 102, never a cancellation. The entry is the physical path of the directory with
+its device and inode, in `one-shot-projects.json` under `$HOME/.config/safe/run` (never a redirected root), with no reason: the audit log
+(`ONE_SHOT_PROJECT_ADD` / `ONE_SHOT_PROJECT_REMOVE`, written after the commit) records who and when. `list` creates nothing. It matters only
+while `install.project_lane` is on. Not served by a pin: a command that selects a workspace; a pin on a workspace member where npm acts on
+the root above. Accepted residuals: a remount at the same path with the same device and inode, or a reused inode, cannot be told from the
+pinned directory; a process allowed to write files as the operator can write the store.
+
 ## Scripts Allowlist
 
 `~/.npmrc` keeps `ignore-scripts=true` globally, so a package whose

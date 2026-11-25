@@ -380,6 +380,15 @@ case_operator_terminal_helpers_match_between_gates() {
       return
     fi
   done
+  # the core's writer of the standing decision (cmd/safe-core/one_shot.go) checks the same predicate itself: its marker list is the
+  # shells' list, name for name, so a fifth marker cannot be added to one and not the other
+  local shell_markers core_markers
+  shell_markers="$(sed -n '/^safe_gate_operator_terminal() {$/,/^}$/p' "$ROOT/lib/gate-lib.sh" | grep -o '[A-Z_]*:-}' | sed 's/:-}//' | tr '\n' ' ')"
+  core_markers="$(sed -n '/^var operatorMarkers = /p' "$ROOT/cmd/safe-core/one_shot.go" | grep -o '"[A-Z_]*"' | tr -d '"' | tr '\n' ' ')"
+  if [[ -z "$shell_markers" || "$shell_markers" != "$core_markers" ]]; then
+    fail "$FUNCNAME (the shells' agent markers [${shell_markers}] and the core's [${core_markers}] differ)"
+    return
+  fi
   pass "$FUNCNAME"
 }
 
@@ -523,12 +532,23 @@ k = find(r'(safe_gate_project_lane_conclude\(\) \{\n)')
 write("mark-raised-where-the-question-is-asked", src[:k.end()] + "  SAFE_GATE_LANE_REFUSAL_MARK=1\n" + src[k.end():])
 r = find(r'(safe_gate_project_lane_run\(\) \{\n)')
 write("prompt-called-outside-its-loop", src[:r.end()] + "  safe_gate_project_lane_prompt_gap || return $?\n" + src[r.end():])
+c9 = re.search(r"(safe_gate_project_lane_cleanup\(\) \{\n)", src)
+write("pin-question-asked-outside-the-route", src[:c9.end()] + "  safe_gate_project_lane_pin_ask_npm \"$@\" || return 1\n" + src[c9.end():])
+write("pin-data-question-asked-outside-the-route", src[:c9.end()] + "  safe_gate_project_lane_pin_here || return 1\n" + src[c9.end():])
+write("pin-route-called-outside-the-runner", src[:c9.end()] + "  safe_gate_project_lane_pin_route x && return 1\n" + src[c9.end():])
+write("the-store-named-outside-the-two-questions", src[:c9.end()] + "  \"${SAFE_DIR}/safe-core\" one-shot-store check --home \"${HOME}\" || return 1\n" + src[c9.end():])
+r9 = re.search(r"  if safe_gate_project_lane_pin_route \"\$\{verb\}\" \"\$@\"; then\n", src)
+assert r9, "the route call"
+write("pin-route-read-twice", src[:r9.start()] + '  if safe_gate_project_lane_pin_route "${verb}" "$@"; then :; fi\n' + src[r9.start():])
+write("pin-route-never-read", src[:r9.start()] + '  if false; then\n' + src[r9.end():])
 PY
   for name in diagnostic-with-the-word-return second-question-on-the-next-line hand-over-in-the-runner hand-over-helper-called-outside-its-owners \
       question-outside-conclude plain-return-removed return-in-a-subshell refusal-in-a-pipeline a-kind-outside-the-closed-list \
       mark-raised-outside-its-owner mark-from-a-variable mark-by-arithmetic start-up-flag-cleared start-up-flag-unset \
       phase-declared-local question-through-the-outcome-handler reserved-status-as-a-literal phase-set-back-to-routing \
-      mark-raised-where-the-question-is-asked prompt-called-outside-its-loop; do
+      mark-raised-where-the-question-is-asked prompt-called-outside-its-loop \
+      pin-question-asked-outside-the-route pin-data-question-asked-outside-the-route pin-route-called-outside-the-runner \
+      the-store-named-outside-the-two-questions pin-route-read-twice pin-route-never-read; do
     [[ -f "${dir}/${name}.sh" ]] || { bad="${bad} ${name}(missing)"; continue; }
     if python3 -I "${ROOT}/tests/contract/lane_lint.py" "${dir}/${name}.sh" >/dev/null; then
       bad="${bad} ${name}"

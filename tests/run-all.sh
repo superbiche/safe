@@ -26,6 +26,7 @@ safe_test_setup_isolation || exit 1
 SUITES=(
   tests/go/run.sh
   tests/live/npm_config_oracle.sh
+  tests/live/standing_pin_npm_oracle.sh
   tests/live/npm_spec_oracle.sh
   tests/live/npm_abbrev_oracle.sh
   tests/live/npm_option_oracle.sh
