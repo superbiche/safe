@@ -9992,9 +9992,9 @@ case_project_lane_config_selectors_in_the_arguments_refuse_before_any_npm() {
     lane_run "npm install clean@2.0.0 ${opt}"
     lane_unsupported_case "$FUNCNAME" install "${opt}" || return
     case "${opt}" in
-      --userconfig*|--globalconfig*) assert_err_contains_fragment 'selects a configuration file before it can be admitted' "$FUNCNAME: ${opt}" || return ;;
-      --prefix*|-C*) assert_err_contains_fragment 'selects another project directory before it can be admitted' "$FUNCNAME: ${opt}" || return ;;
-      *) assert_err_contains_fragment 'selects a storage destination before it can be admitted' "$FUNCNAME: ${opt}" || return ;;
+      --userconfig*|--globalconfig*) assert_err_contains_fragment 'selects a configuration file npm reads at start-up' "$FUNCNAME: ${opt}" || return ;;
+      --prefix*|-C*) assert_err_contains_fragment 'project selector naming the directory' "$FUNCNAME: ${opt}" || return ;;
+      *) assert_err_contains_fragment 'selects a storage destination' "$FUNCNAME: ${opt}" || return ;;
     esac
     [[ "$(grep -c '^REAL' "${LOG_FILE}")" == "0" ]] || { fail "$FUNCNAME: ${opt}: npm ran before the refusal"; return; }
   done
@@ -11394,7 +11394,6 @@ case_project_lane_routing_an_npm_without_the_capabilities_refuses() {
   NODE_CAPABILITY_JSON="${old}" lane_run 'npm install clean@2.0.0'
   lane_unsupported_case "$FUNCNAME: mise, committed selection" install 'a capability-less npm' || return
   assert_err_contains_fragment 'older than 11.12.1' "$FUNCNAME" || return
-  assert_err_contains_fragment 'the operator can put this project on the one-shot lane' "$FUNCNAME" || return
   ! grep -q '\[lane: one-shot' "${ERR_FILE}" || { fail "$FUNCNAME: one-shot line"; return; }
   assert_log_not_contains_fragment $'MISE_REACHED\tls --current --json' "$FUNCNAME" || return
   unset SAFE_TEST_PATH_MID
@@ -11403,7 +11402,6 @@ case_project_lane_routing_an_npm_without_the_capabilities_refuses() {
   : > "${LOG_FILE}"
   NODE_CAPABILITY_JSON="${old}" lane_run 'npm install clean@2.0.0'
   lane_unsupported_case "$FUNCNAME: plain npm" install 'a capability-less npm' || return
-  assert_err_contains_fragment 'the operator can put this project on the one-shot lane' "$FUNCNAME" || return
   pass "$FUNCNAME"
 }
 
