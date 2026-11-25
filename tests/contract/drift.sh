@@ -559,6 +559,13 @@ write("two-prefix-questions-on-one-line", src[:a.start()] + '  safe_gate_project
 write("pin-lookup-called-outside-the-bounded-route", src[:c9.end()] + '  safe_gate_project_lane_pin_lookup x || return 1\n' + src[c9.end():])
 write("pin-bounded-called-outside-the-route", src[:c9.end()] + '  safe_gate_project_lane_pin_bounded x || return 1\n' + src[c9.end():])
 write("an-unsupported-refusal-before-the-pin-lookup", src[:blk.start()] + '  safe_gate_project_lane_unsupported 100 "${verb}" "x" "y"\n  return $?\n' + src[blk.start():])
+# R10: a step of the standing route under timeout(1) sits in a process group of its own and outlives the route's one deadline
+def under_timeout(name, plain):
+    assert src.count(plain) == 1, plain
+    write(name, src.replace(plain, plain.replace('"${', 'timeout --kill-after=2s 10s "${', 1)))
+under_timeout("the-question-under-timeout", '    "${launch[@]}" "--cache=${scratch}"')
+under_timeout("the-data-question-under-timeout", '  "${core}" one-shot-store check </dev/null')
+under_timeout("the-verification-under-timeout", '  "${core}" one-shot-store verify "${prefix_answer}"')
 PY
   for name in diagnostic-with-the-word-return second-question-on-the-next-line hand-over-in-the-runner hand-over-helper-called-outside-its-owners \
       question-outside-conclude plain-return-removed return-in-a-subshell refusal-in-a-pipeline a-kind-outside-the-closed-list \
@@ -570,7 +577,8 @@ PY
       pin-route-moved-below-the-spelled-global-guards a-refusal-before-the-pin-lookup prefix-question-asked-twice-in-its-owner \
       root-question-never-asked a-question-asked-outside-its-owner \
       two-prefix-questions-on-one-line an-unsupported-refusal-before-the-pin-lookup \
-      pin-lookup-called-outside-the-bounded-route pin-bounded-called-outside-the-route; do
+      pin-lookup-called-outside-the-bounded-route pin-bounded-called-outside-the-route \
+      the-question-under-timeout the-data-question-under-timeout the-verification-under-timeout; do
     [[ -f "${dir}/${name}.sh" ]] || { bad="${bad} ${name}(missing)"; continue; }
     if python3 -I "${ROOT}/tests/contract/lane_lint.py" "${dir}/${name}.sh" >/dev/null; then
       bad="${bad} ${name}"
