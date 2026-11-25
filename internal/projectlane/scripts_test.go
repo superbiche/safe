@@ -1,10 +1,12 @@
 package projectlane
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"syscall"
 	"testing"
@@ -235,5 +237,61 @@ func TestScriptsLinkEntriesAreRefused(t *testing.T) {
 	lock := lockOf(map[string]string{"node_modules/l": `{"resolved":"../l","link":true}`})
 	if _, err := ReadScripts(ScriptsRequest{Lock: lock}); err == nil {
 		t.Fatal("a lockfile with a link entry was read")
+	}
+}
+
+// The report prints a command line the operator may paste into a shell (npm rebuild ./<install path>). Only an install path of npm's
+// own grammar reaches it: a key that carries shell syntax, an option, a traversal or a control character is not a package of the tree
+// and names nothing in the report, read from the tree or from the lockfile alone, as a package or as the host of a bundled member.
+func TestScriptsOnlyAnInstallPathReachesTheCommandLine(t *testing.T) {
+	tree := t.TempDir()
+	hostile := []string{"node_modules/x; touch pwned", "node_modules/$(id)", "node_modules/`id`", "node_modules/-rf", "node_modules/a b",
+		"node_modules/..", "node_modules/ok/../../y", "node_modules/q'uote", "node_modules/in&ner", "node_modules/@s/x;y", "node_modules/.hidden",
+		"node_modules/nl\nline", "node_modules/\x1b[31mred", "node_modules/x|y", "node_modules/x>y", "node_modules/x*", "node_modules/x\\y",
+		"node_modules/\"quoted\"", "node_modules/x=y", "node_modules/x#y", "node_modules/{a,b}", "node_modules/x!y"}
+	script := `{"scripts":{"install":"x"}}`
+	entry := entryOf("1.0.0", `,"hasInstallScript":true`)
+	member := entryOf("1.0.0", `,"hasInstallScript":true,"inBundle":true`)
+	var b strings.Builder
+	b.WriteString(`{"lockfileVersion":3,"packages":{"":{"name":"p","version":"1.0.0"},"node_modules/ok":` + entry + `,"node_modules/@s/ok":` + entry)
+	writePackage(t, tree, "ok", script)
+	writePackage(t, tree, "@s/ok", script)
+	for _, key := range hostile {
+		for _, k := range []string{key, key + "/node_modules/member"} {
+			quoted, err := json.Marshal(k)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := entry
+			if k != key {
+				body = member
+			}
+			fmt.Fprintf(&b, `,%s:%s`, quoted, body)
+		}
+		// the directory exists where the file system takes the name (never one that leaves the tree)
+		if rel := strings.TrimPrefix(key, "node_modules/"); !strings.Contains(rel, "..") {
+			dir := filepath.Join(tree, rel)
+			if os.MkdirAll(filepath.Join(dir, "node_modules", "member"), 0o755) == nil {
+				_ = os.WriteFile(filepath.Join(dir, "package.json"), []byte(script), 0o644)
+				_ = os.WriteFile(filepath.Join(dir, "node_modules", "member", "package.json"), []byte(script), 0o644)
+			}
+		}
+	}
+	b.WriteString(`}}`)
+	lock := []byte(b.String())
+	pasted := regexp.MustCompile(`^node_modules/[A-Za-z0-9@~][A-Za-z0-9._~@/-]*$`)
+	for _, req := range []ScriptsRequest{{Lock: lock, TreeRoot: tree}, {Lock: lock}} {
+		report, err := ReadScripts(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := pathsOf(report); !reflect.DeepEqual(got, []string{"node_modules/@s/ok", "node_modules/ok"}) {
+			t.Fatalf("tree %q: a key that is not an install path is in the report: %q", req.TreeRoot, got)
+		}
+		for _, p := range report.Packages {
+			if !pasted.MatchString(p.RebuildPath) || strings.Contains(p.RebuildPath, "..") || p.Host != "" {
+				t.Fatalf("tree %q: %+v", req.TreeRoot, p)
+			}
+		}
 	}
 }

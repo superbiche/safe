@@ -5616,6 +5616,35 @@ safe_gate_project_lane_previous_tree() {
   printf '%s' "${kept}"
 }
 
+# The scripts section's lines, from the core's document on stdin. This function is one jq program and starts nothing else: it is the
+# only place of the lane where the words that run scripts (npm rebuild, npm run) are written, as text for the operator (lane lint, R11).
+safe_gate_project_lane_scripts_lines() {
+  jq -r '
+    def lbl: "\(.name)@\(.version)";
+    def what: [ (if .unread then "its package.json cannot be read" else empty end),
+                (if (.events | length) > 0 then (.events | join(", ")) else empty end),
+                (if .native then "native build" else empty end),
+                (if (.host // "") != "" then "bundled in \(.host)" else empty end),
+                (if (.declared | not) and ((.events | length) > 0 or .native) then "its lockfile entry does not declare install scripts" else empty end) ] | join("; ");
+    def shown: .packages | map(lbl + (what | if . == "" then "" else " (" + . + ")" end)) | join(", ");
+    def more: if .total > (.packages | length) then ", and \(.total - (.packages | length)) more not listed" else "" end;
+    def runs($ev):
+      (if ($ev | index("install")) then ["npm run install"] else [(if ($ev | index("preinstall")) then "npm run preinstall" else empty end), (if ($ev | index("postinstall")) then "npm run postinstall" else empty end)] end)
+      + (if ($ev | index("prepublish")) then ["npm run prepublish"] else [] end)
+      + (if ($ev | index("prepare")) then ["npm run prepare"] else [(if ($ev | index("preprepare")) then "npm run preprepare" else empty end), (if ($ev | index("postprepare")) then "npm run postprepare" else empty end)] end);
+    (if .total > 0 and .source == "tree" then
+       "safe: project lane: install scripts did not run (the lane installs with scripts off): \(.total) introduced package(s) have them: \(shown)\(more)",
+       "safe: project lane: scripts: to run them: npm rebuild \([.packages[].rebuild_path] | unique | map("./" + .) | join(" "))\(if .total > (.packages | length) then " (the listed packages; npm rebuild alone covers every package)" else "" end); npm'"'"'s own script policy applies to that command"
+     elif .total > 0 then
+       "safe: project lane: scripts: no tree was published, so nothing was read from disk; the lockfile declares install scripts for \(.total) package(s) this command would introduce: \(shown)\(more)"
+     else empty end),
+    (if .root != null and ((.root.events | length) > 0 or .root.native) then
+       "safe: project lane: this project'"'"'s own install-time scripts did not run either (\(([.root.events[]] + (if .root.native then ["native build"] else [] end)) | join(", ")))"
+       + (if (runs(.root.events) | length) > 0 then "; to run them: \(runs(.root.events) | join("; ")); npm'"'"'s own script policy applies to those commands" else "" end)
+       + (if .root.native then "; the native build (binding.gyp, no install script) has no npm command of its own on npm 11.20.0 and 12.2.1" else "" end)
+     else empty end)'
+}
+
 # The scripts section (ticket 1638). The lane runs no lifecycle script; after a verified publication it says which install-time
 # scripts the command left unrun, from data only: the judged lockfile and the published tree (safe-core project-scripts), never npm's
 # messages and never a question to npm, and it does not say what npm's policy would decide. $1 the verb, $2 tree or lockfile (the
@@ -5635,30 +5664,7 @@ safe_gate_project_lane_scripts_report() {
     rc=127
   fi
   if (( rc == 0 )); then
-    lines="$(jq -r '
-      def lbl: "\(.name)@\(.version)";
-      def what: [ (if .unread then "its package.json cannot be read" else empty end),
-                  (if (.events | length) > 0 then (.events | join(", ")) else empty end),
-                  (if .native then "native build" else empty end),
-                  (if (.host // "") != "" then "bundled in \(.host)" else empty end),
-                  (if (.declared | not) and ((.events | length) > 0 or .native) then "its lockfile entry does not declare install scripts" else empty end) ] | join("; ");
-      def shown: .packages | map(lbl + (what | if . == "" then "" else " (" + . + ")" end)) | join(", ");
-      def more: if .total > (.packages | length) then ", and \(.total - (.packages | length)) more not listed" else "" end;
-      def runs($ev):
-        (if ($ev | index("install")) then ["npm run install"] else [(if ($ev | index("preinstall")) then "npm run preinstall" else empty end), (if ($ev | index("postinstall")) then "npm run postinstall" else empty end)] end)
-        + (if ($ev | index("prepublish")) then ["npm run prepublish"] else [] end)
-        + (if ($ev | index("prepare")) then ["npm run prepare"] else [(if ($ev | index("preprepare")) then "npm run preprepare" else empty end), (if ($ev | index("postprepare")) then "npm run postprepare" else empty end)] end);
-      (if .total > 0 and .source == "tree" then
-         "safe: project lane: install scripts did not run (the lane installs with scripts off): \(.total) introduced package(s) have them: \(shown)\(more)",
-         "safe: project lane: scripts: to run them: npm rebuild \([.packages[].rebuild_path] | unique | map("./" + .) | join(" "))\(if .total > (.packages | length) then " (the listed packages; npm rebuild alone covers every package)" else "" end); npm'"'"'s own script policy applies to that command"
-       elif .total > 0 then
-         "safe: project lane: scripts: no tree was published, so nothing was read from disk; the lockfile declares install scripts for \(.total) package(s) this command would introduce: \(shown)\(more)"
-       else empty end),
-      (if .root != null and ((.root.events | length) > 0 or .root.native) then
-         "safe: project lane: this project'"'"'s own install-time scripts did not run either (\(([.root.events[]] + (if .root.native then ["native build"] else [] end)) | join(", ")))"
-         + (if (runs(.root.events) | length) > 0 then "; to run them: \(runs(.root.events) | join("; ")); npm'"'"'s own script policy applies to those commands" else "" end)
-         + (if .root.native then "; the native build (binding.gyp, no install script) has no npm command of its own on npm 11.20.0 and 12.2.1" else "" end)
-       else empty end)' <<<"${doc}" 2>/dev/null)" || rc=1
+    lines="$(safe_gate_project_lane_scripts_lines <<<"${doc}" 2>/dev/null)" || rc=1
   fi
   if (( rc != 0 )); then
     safe_gate_err "safe: project lane: install scripts did not run (the lane installs with scripts off); the report of which packages have them could not be read (safe-core project-scripts exit ${rc})"

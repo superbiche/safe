@@ -20,7 +20,11 @@ Rules
   R11 the lane runs no lifecycle script (ticket 1638): every npm the lane starts carries --ignore-scripts on its own command line (the
       projections, the probe, the frozen check and the frozen installation the binder runs), npm is started by the lane's few owners
       only, no word that runs or enables scripts (rebuild, run-script, install-scripts, --allow-scripts, ...) appears as a command word or
-      an option of the lane, and the binder is given the frozen command and nothing else.
+      an option of the lane, and the binder is given the frozen command and nothing else. npm is never a bare command word of the lane
+      (it is started through the owners' resolved command only), and what an owner starts is one of the lane's three commands (config,
+      a --package-lock-only projection, ci): `npm run`, `npm exec` and the like run code whatever --ignore-scripts says. The words
+      that run scripts are written in one function, the text of the report (safe_gate_project_lane_scripts_lines), which is one jq
+      program from its first line to its last: it names no variable, function or substitution of the shell.
   R9  the standing decision is read in one place: the route is called once, from the runner; the data question and the question to
       npm are called from the route only; the core's store is named by those two functions only.
   R5  a refusal or hand-over is never inside a pipeline, a command substitution or a subshell: what it records would be lost
@@ -85,6 +89,8 @@ PIN_BOUNDED = {"safe_gate_project_lane_pin_core", "safe_gate_project_lane_pin_he
 
 # R11
 NPM_OWNERS = {"safe_gate_lane_npm_in", "safe_gate_project_lane_run", "safe_gate_project_lane_frozen_probe", "safe_gate_project_lane_frozen_check"}
+NPM_FIRST_WORDS = {"config", "--package-lock-only", "ci"}
+SCRIPT_TEXT = "safe_gate_project_lane_scripts_lines"
 SCRIPT_WORDS = re.compile(r"(?<![A-Za-z0-9_\-])(rebuild|run-script|install-scripts|approve-scripts|--allow-scripts|--strict-allow-scripts|"
                           r"--dangerously-allow-all-scripts|--no-ignore-scripts|--ignore-scripts=false)(?![A-Za-z0-9_])")
 
@@ -243,6 +249,8 @@ def main(path):
                 elif fn not in allowed:
                     problems.append(f"{number}:{fn}:R6: {name} is assigned {value!r} outside its owners")
     # R7 and R8, in the lane
+    starts = {FN.match(text).group(1): number for number, _, text in logical if FN.match(text)}
+    before = ""
     for number, fn, text, bare in lane:
         if bare.lstrip().startswith("#") or FN.match(text):
             continue
@@ -262,9 +270,22 @@ def main(path):
         if fn in PIN_BOUNDED and re.search(r"(?<![A-Za-z0-9_\-.])timeout(?![A-Za-z0-9_])", bare):
             problems.append(f"{number}:{fn}:R10: a step of the standing route runs under timeout, out of reach of the route's deadline")
         # R11: no lifecycle script in the lane
-        # (the scripts section prints the command that runs them, as text of a jq program that spans lines: it is read by the rules below)
-        if SCRIPT_WORDS.search(bare) and fn != "safe_gate_project_lane_scripts_report":
+        # (the report's text function prints the commands that run them, as a jq program that spans lines: it is held to being text)
+        if fn == SCRIPT_TEXT:
+            first = number == starts.get(fn, -1) + 1
+            if re.search(r"\$\(|`|\$\{|(?<![A-Za-z0-9_])(?:safe|SAFE)_", text) or (first and text != "  jq -r '") or (text == "}" and not before.endswith("'")):
+                problems.append(f"{number}:{fn}:R11: the report's text function is not one jq program (it names something of the shell)")
+            before = text
+            continue
+        if SCRIPT_WORDS.search(bare):
             problems.append(f"{number}:{fn}:R11: a word that runs or enables lifecycle scripts is a command word or an option of the lane")
+        if command_at(bare, "npm") or command_at(bare, "npx") or re.search(r"(?<![A-Za-z0-9_\-])(?:command|exec|env)\s+np[mx](?![A-Za-z0-9_\-])", bare):
+            problems.append(f"{number}:{fn}:R11: npm is a bare command word of the lane (the lane starts npm through its owners only)")
+        started = re.search(r"(?<![A-Za-z0-9_])safe_gate_lane_npm_in\s+\S+\s+(\S+)", bare)
+        if command_at(bare, "safe_gate_lane_npm_in") and (not started or started.group(1) not in NPM_FIRST_WORDS):
+            problems.append(f"{number}:{fn}:R11: an owner starts an npm command that is not one of the lane's three (config, a projection, ci)")
+        if bare.lstrip().startswith("frozen_args=(") and not bare.lstrip().startswith("frozen_args=(ci "):
+            problems.append(f"{number}:{fn}:R11: the frozen command is not npm ci")
         launches = command_at(bare, "safe_gate_lane_npm_in") or bare.lstrip().startswith("frozen_args=(")
         if (launches or "SAFE_GATE_LANE_NPM[@]" in text) and fn not in NPM_OWNERS and fn != "safe_gate_npm_probe_run":
             problems.append(f"{number}:{fn}:R11: npm is started outside the owners that carry --ignore-scripts")
