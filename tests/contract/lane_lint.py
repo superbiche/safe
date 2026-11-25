@@ -13,14 +13,21 @@ Rules
       safe_gate_project_lane_conclude, and its wording appears nowhere else; the confirmation prompt helper
       (safe_gate_confirm_infra) is called in the lane only from the functions allowed to ask; conclude is called only from the
       lane's entry.
-  R3  the hand-over status is raised only by the functions that own it.
+  R3  the hand-over status is raised only by the functions that own it, by assignment and by calling its helpers.
+  R4  a refusal that carries a kind passes a kind of the closed list (safe_gate_project_lane_kinds), as a bare word.
+  R5  a refusal or hand-over is never inside a pipeline, a command substitution or a subshell: what it records would be lost
+      with the child shell while its owner went on (a `return` in the child does not end the owner).
 """
 import re
 import sys
 
-REFUSALS = ("safe_gate_project_lane_refuse", "safe_gate_project_lane_refuse_fixed", "safe_gate_project_lane_unsupported",
-            "safe_gate_project_lane_unsupported_fixed", "safe_gate_project_lane_verb_refusal", "safe_gate_project_lane_window_refuse",
-            "safe_gate_project_lane_oneshot", "safe_gate_project_lane_hand_over_silent", "safe_gate_project_lane_unresolved_silent")
+REFUSALS = ("safe_gate_project_lane_refuse_kind", "safe_gate_project_lane_refuse", "safe_gate_project_lane_unsupported_kind",
+            "safe_gate_project_lane_unsupported", "safe_gate_project_lane_baseline_refuse", "safe_gate_project_lane_verb_refusal",
+            "safe_gate_project_lane_window_refuse", "safe_gate_project_lane_oneshot", "safe_gate_project_lane_hand_over_silent",
+            "safe_gate_project_lane_unresolved_silent")
+KINDED = ("safe_gate_project_lane_refuse_kind", "safe_gate_project_lane_unsupported_kind")
+HAND_OVERS = ("safe_gate_project_lane_hand_over_silent", "safe_gate_project_lane_unresolved_silent")
+HAND_OVER_CALLERS = {"safe_gate_project_lane_oneshot", "safe_gate_project_lane_conclude", "safe_gate_project_lane_run"}
 EXEMPT_BODIES = set(REFUSALS) | {"safe_gate_project_lane_decide"}  # the wrappers' own last statement is the call
 ASKERS = {"safe_gate_project_lane_one_shot_question", "safe_gate_project_lane_prompt_gap", "safe_gate_project_lane_prompt_socket"}
 PASS_OWNERS = {"safe_gate_project_lane_hand_over_silent", "safe_gate_project_lane_unresolved_silent", "safe_gate_project_lane_in_subshell"}
@@ -54,6 +61,37 @@ def strip(line):
     return "".join(out)
 
 
+def in_child_shell(bare, name):
+    """True when the call of `name` sits in a pipeline, a command substitution or a subshell of its logical line."""
+    at = re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", bare)
+    if not at:
+        return False
+    before, after = bare[: at.start()], bare[at.end():]
+    # unclosed `$(` or a bare `(` (a subshell) before the call; `${...}` and `((...))` are not
+    depth = 0
+    i = 0
+    while i < len(before):
+        two = before[i:i + 2]
+        if two == "$(" or (before[i] == "(" and before[i:i + 2] != "((") :
+            depth += 1
+        elif before[i] == ")":
+            depth -= 1
+        i += 1
+    if depth > 0:
+        return True
+    if re.search(r"\|(?!\|)\s*$", before) and not before.rstrip().endswith("||"):
+        return True
+    inner = after
+    while True:  # an argument's own substitution is the argument's business, not the call's
+        reduced = re.sub(r"\$\([^()]*\)", "", inner)
+        if reduced == inner:
+            break
+        inner = reduced
+    if re.match(r"[^|&;]*(?<!\|)\|(?!\|)", inner):
+        return True
+    return False
+
+
 def command_at(text, name):
     return re.search(r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b|!)\s*" + re.escape(name) + r"(?![A-Za-z0-9_])", text) is not None
 
@@ -81,9 +119,19 @@ def logical_lines(path):
     return lines
 
 
+def closed_kinds(logical):
+    for _, fn, text in logical:
+        if fn == "safe_gate_project_lane_kinds" and "printf" in text:
+            return set(re.findall(r"[a-z_]+", text.split("'%s\\n'", 1)[-1])) - {"printf"}
+    return set()
+
+
 def main(path):
     problems = []
     logical = logical_lines(path)
+    kinds = closed_kinds(logical)
+    if not kinds:
+        return ["0::R4: the closed list of kinds is not found"]
     lane = [(n, fn, text, strip(text)) for n, fn, text in logical if fn.startswith(("safe_gate_project_lane_", "safe_gate_lane_"))]
     for index, (number, fn, text, bare) in enumerate(lane):
         if bare.lstrip().startswith("#") or FN.match(text):
@@ -92,6 +140,8 @@ def main(path):
             continue
         for name in REFUSALS:
             if command_at(bare, name):
+                if in_child_shell(bare, name):
+                    problems.append(f"{number}:{fn}:R5: {name} is called in a pipeline, a substitution or a subshell")
                 after = bare[bare.index(name):]
                 nxt = ""
                 for later in lane[index + 1:]:
@@ -107,6 +157,15 @@ def main(path):
             problems.append(f"{number}:{fn}:R2: conclude is called outside the lane's entry")
         if command_at(bare, "safe_gate_confirm_infra") and fn not in ASKERS and not fn.startswith("safe_gate_confirm_"):
             problems.append(f"{number}:{fn}:R2: a confirmation prompt is asked in a function that may not ask")
+        for name in KINDED:
+            if command_at(bare, name):
+                match = re.search(re.escape(name) + r"\s+([A-Za-z0-9_${}\"]+)", text)
+                word = match.group(1) if match else ""
+                if word not in kinds:
+                    problems.append(f"{number}:{fn}:R4: {name} passes {word!r}, which is not a kind of the closed list")
+        for name in HAND_OVERS:
+            if command_at(bare, name) and fn not in HAND_OVER_CALLERS and fn != name:
+                problems.append(f"{number}:{fn}:R3: {name} is called outside the functions that own the hand-over")
         if QUESTION_WORDING in text and fn != "safe_gate_project_lane_one_shot_question":
             problems.append(f"{number}:{fn}:R2: the one-shot question's wording is outside its entry point")
         if re.search(r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b)\s*SAFE_GATE_LANE_PASS=", bare) and fn not in PASS_OWNERS:

@@ -292,10 +292,20 @@ func parseJudgedLockfile(raw []byte, anyVersion bool) (*judgedLock, error) {
 	}
 	lock := &judgedLock{entries: map[string]*lockEntry{}}
 	links := false
+	var undecoded error
+	undecodedKey := ""
 	for key, rawEntry := range packages {
 		entry, err := decodeEntry(rawEntry)
 		if err != nil {
-			return nil, fmt.Errorf("lockfile: packages[%q]: %w", key, err)
+			// an entry that does not decode does not end the walk: the keys are still checked, so an unsafe key is never hidden
+			// by an unreadable entry (the smallest key's error is the one reported, for a stable message)
+			if key != "" && !validTreeKey(key) {
+				lock.outside = append(lock.outside, key)
+			}
+			if undecoded == nil || key < undecodedKey {
+				undecoded, undecodedKey = fmt.Errorf("lockfile: packages[%q]: %w", key, err), key
+			}
+			continue
 		}
 		if entry.Link {
 			links = true
@@ -318,6 +328,9 @@ func parseJudgedLockfile(raw []byte, anyVersion bool) (*judgedLock, error) {
 	}
 	sort.Strings(lock.paths)
 	sort.Strings(lock.outside)
+	if undecoded != nil {
+		return lock, undecoded
+	}
 	if links {
 		return lock, ErrLinkEntries
 	}
@@ -336,7 +349,10 @@ func AdmitLockfileFindings(raw []byte) []AdmitFinding {
 	var findings []AdmitFinding
 	switch {
 	case err != nil && !errors.Is(err, ErrLinkEntries):
-		return []AdmitFinding{{ReasonLockfileUnreadable, err.Error()}}
+		findings = append(findings, AdmitFinding{ReasonLockfileUnreadable, err.Error()})
+		if lock == nil {
+			return findings
+		}
 	case errors.Is(err, ErrLinkEntries):
 		findings = append(findings, AdmitFinding{ReasonLinksNotSupported, err.Error()})
 	}
