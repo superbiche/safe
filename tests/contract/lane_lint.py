@@ -15,6 +15,10 @@ Rules
       lane's entry.
   R3  the hand-over status is raised only by the functions that own it, by assignment and by calling its helpers.
   R4  a refusal that carries a kind passes a kind of the closed list (safe_gate_project_lane_kinds), as a bare word.
+  R10 no step of the standing route runs under timeout(1): the command would sit in a process group of its own and outlive the
+      route's one deadline, which stops the route's group.
+  R9  the standing decision is read in one place: the route is called once, from the runner; the data question and the question to
+      npm are called from the route only; the core's store is named by those two functions only.
   R5  a refusal or hand-over is never inside a pipeline, a command substitution or a subshell: what it records would be lost
       with the child shell while its owner went on (a `return` in the child does not end the owner).
   R6  the state a confirmation rests on has owners, in the whole file: the mark of a confirmable refusal is raised only by
@@ -60,6 +64,20 @@ PROMPT_CALLERS = {"safe_gate_project_lane_prompts"}
 GRANT_CALLERS = {"safe_gate_project_lane_prompt_blocking", "safe_gate_project_lane_prompt_adverse",
                  "safe_gate_project_lane_prompt_socket"}
 PROMPTS_LOOP_CALLERS = {"safe_gate_project_lane_run"}
+# R9: the standing decision is read in ONE place, with two questions asked from ONE place each
+PIN_CALLERS = {"safe_gate_project_lane_pin_route": {"safe_gate_project_lane_run"},
+               "safe_gate_project_lane_pin_bounded": {"safe_gate_project_lane_pin_route"},
+               "safe_gate_project_lane_pin_lookup": {"safe_gate_project_lane_pin_bounded"},
+               "safe_gate_project_lane_pin_here": {"safe_gate_project_lane_pin_lookup"},
+               "safe_gate_project_lane_pin_ask_npm": {"safe_gate_project_lane_pin_lookup"},
+               "safe_gate_project_lane_pin_npm_line": {"safe_gate_project_lane_pin_ask_npm"}}
+RUNNER = "safe_gate_project_lane_run"
+# a call that ends the run (a refusal or a hand-over): none may come before the pin lookup but the two that capture the directory
+RUN_ENDERS = REFUSALS
+PIN_CORE_USERS = {"safe_gate_project_lane_pin_here", "safe_gate_project_lane_pin_ask_npm"}
+# R10: the functions the route's one deadline bounds; none of them may run a command under timeout(1)
+PIN_BOUNDED = {"safe_gate_project_lane_pin_core", "safe_gate_project_lane_pin_here", "safe_gate_project_lane_pin_npm_line",
+               "safe_gate_project_lane_pin_ask_npm", "safe_gate_project_lane_pin_lookup"}
 
 FN = re.compile(r"^(safe_gate_[A-Za-z0-9_]+)\(\)\s*\{")
 
@@ -121,7 +139,7 @@ def in_child_shell(bare, name):
 
 
 def command_at(text, name):
-    return re.search(r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b|!)\s*" + re.escape(name) + r"(?![A-Za-z0-9_])", text) is not None
+    return re.search(r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b|\bif\b|\belif\b|\bwhile\b|\buntil\b|!)\s*" + re.escape(name) + r"(?![A-Za-z0-9_])", text) is not None
 
 
 def returns(text):
@@ -229,8 +247,35 @@ def main(path):
             problems.append(f"{number}:{fn}:R7: the host-grant prompt is called outside the prompts that own it")
         if command_at(bare, "safe_gate_project_lane_prompts") and fn not in PROMPTS_LOOP_CALLERS:
             problems.append(f"{number}:{fn}:R7: the prompt loop is called outside the runner")
+        for name, callers in PIN_CALLERS.items():
+            if command_at(bare, name) and fn not in callers:
+                problems.append(f"{number}:{fn}:R9: {name} is called outside the one place that owns it")
+        if fn in PIN_BOUNDED and re.search(r"(?<![A-Za-z0-9_\-.])timeout(?![A-Za-z0-9_])", bare):
+            problems.append(f"{number}:{fn}:R10: a step of the standing route runs under timeout, out of reach of the route's deadline")
+        if "one-shot-store" in text and fn not in PIN_CORE_USERS:
+            problems.append(f"{number}:{fn}:R9: the standing decision's store is named outside the two questions")
         if re.search(r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b)\s*(?:return|exit)\s+25[23](?![0-9])", bare):
             problems.append(f"{number}:{fn}:R8: a reserved status is written as a literal")
+    if len([1 for n, fn, t, b in lane if command_at(b, "safe_gate_project_lane_pin_route") and fn == "safe_gate_project_lane_run"]) != 1:
+        problems.append("0::R9: the runner does not read the standing decision exactly once")
+    # R9, each question is counted at its owner: one prefix question and one root question in the helper that asks them
+    ask = [b for n, fn, t, b in lane if fn == "safe_gate_project_lane_pin_ask_npm"]
+    for word in ("prefix", "root"):
+        count = sum(len(re.findall(r"(?:^|[;&|({]|\bif\b|!)\s*safe_gate_project_lane_pin_npm_line\s+" + word + r"(?![A-Za-z0-9_])", b)) for b in ask)
+        if count != 1:
+            problems.append(f"0::R9: the {word} question is asked {count} times in its owner, not once")
+    # R9, position: the lookup follows the directory capture and precedes every lane-specific refusal or hand-over
+    run = [(n, t, b) for n, fn, t, b in lane if fn == RUNNER and not b.lstrip().startswith("#")]
+    route = [n for n, t, b in run if command_at(b, "safe_gate_project_lane_pin_route")]
+    capture = [n for n, t, b in run if "pwd -P" in t]
+    if len(route) == 1:
+        if not capture or capture[0] > route[0]:
+            problems.append("0::R9: the pin lookup comes before the directory capture")
+        # before the lookup the runner may end the run twice and no more: the capture's two refusals (the directory cannot be read, its
+        # path holds a newline), both after the capture line. Counted by position, never by the words of a diagnostic.
+        enders = [n for n, t, b in run if n < route[0] and not FN.match(t) and any(command_at(b, name) for name in RUN_ENDERS)]
+        if len(enders) != 2 or any(n < capture[0] for n in enders):
+            problems.append(f"{enders[0] if enders else 0}:{RUNNER}:R9: a refusal or hand-over comes before the pin lookup (two are the capture's own)")
     names = {fn for _, fn, _ in logical}
     if "safe_gate_project_lane_one_shot_question" not in names or "safe_gate_project_lane_conclude" not in names:
         problems.append("0::R2: the lane has no top-level question")

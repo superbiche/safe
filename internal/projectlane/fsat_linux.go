@@ -226,6 +226,45 @@ func (d *dirHandle) createExclusive(name string, content []byte, perm os.FileMod
 	return idOf(info), file.Close()
 }
 
+// afterCreateMode is a test seam: called with the file the moment it exists, before anything else is done to it.
+var afterCreateMode func(*os.File)
+
+// createExclusiveMode creates name below d, failing if it exists, with exactly the final mode perm from the first moment (the
+// mode is given to the creating call, so the file is never wider than it will stay; the creation mask can only narrow it, and
+// the mode is then set to perm). It writes content, syncs and closes.
+func (d *dirHandle) createExclusiveMode(name string, content []byte, perm os.FileMode) (fileID, error) {
+	if !validName(name) {
+		return fileID{}, fmt.Errorf("%q is not a plain name", name)
+	}
+	fd, err := syscall.Openat(d.fd(), name, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, uint32(perm.Perm()))
+	if err != nil {
+		return fileID{}, &os.PathError{Op: "openat", Path: name, Err: err}
+	}
+	file := os.NewFile(uintptr(fd), name)
+	fail := func(err error) (fileID, error) {
+		file.Close()
+		_ = os.Remove(d.procPath(name))
+		return fileID{}, err
+	}
+	if afterCreateMode != nil {
+		afterCreateMode(file)
+	}
+	if err := file.Chmod(perm.Perm()); err != nil {
+		return fail(err)
+	}
+	if _, err := file.Write(content); err != nil {
+		return fail(err)
+	}
+	if err := file.Sync(); err != nil {
+		return fail(err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return fail(err)
+	}
+	return idOf(info), file.Close()
+}
+
 func (d *dirHandle) mkdir(name string, perm uint32) error {
 	if !validName(name) {
 		return fmt.Errorf("%q is not a plain name", name)

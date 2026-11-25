@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Project lane, standing decision: the route's one deadline reaches a question in flight. No step of the route runs
+  under `timeout`, which puts its command in a process group of its own: an npm started late would have outlived the
+  deadline that stops the route's group, and written in a scratch directory already removed.
+- Project lane (still behind `install.project_lane`): the standing decision per project. `safe run one-shot-project add|remove|list`
+  turns the lane OFF for a project: a command npm will run on it goes to today's gate with the one-shot line before the lane looks at
+  anything (`dedupe` and `prune` to the older differential path); no approval, receipt or baseline. The store is read and written only
+  by `safe-core one-shot-store`, which checks the operator's terminal itself (a direct call from an agent session or without a
+  terminal is 102 and touches nothing), on verified directories, as one strict bounded document, with a checked lock, a staged file
+  created with its final mode, and "not recorded" told apart from "committed, durability uncertain"; an entry is the physical path
+  with device and inode. The lane asks in two steps, before any lane-specific refusal: data alone (this directory or an ancestor is a pin; else no
+  npm is run), then two read-only npm answers (`npm prefix` and `npm root`, the command's own arguments, put to the npm that will run in the environment
+  its delegate gets, with npm's cache and logs directory pointed at a scratch directory of safe's own by the first arguments of the
+  command line, the caller's files and environment untouched, the whole route under one deadline), honoured only when the root is exactly
+  `<prefix>/node_modules` and the prefix is a pinned directory; not used under `mise exec`. The writer's only anchor is `HOME`. `list` creates
+  nothing and exits 3 when the store cannot be trusted. A graph the lane cannot bind names this way out. Agent contract: an
+  operator-only flow, relayed only when the operator asks for a standing decision.
 - Project lane (still behind `install.project_lane`): the operator sends ONE command to the one-shot route. Every refusal of the
   lane records itself and returns, and the final line is printed once at the lane's top level, after the lock and scratch are freed. A
   refusal is confirmable only when its site gives it an explicit kind from a closed list (a command form, a project shape, an npm
@@ -13,8 +29,7 @@
   differential path, which refuses what it cannot judge and has no override of its own. A hand-over returns through the same non-zero
   path as a refusal. The core's lockfile admission reports every finding by code (an undecodable entry no longer hides an unsafe key).
   Agent contract: the agent rule and exit codes 100 and 102 describe the one-command confirmation, conditional on an eligible refusal and
-  on `install.project_lane` being on. The standing per-project decision is ticket 1690 (not in this release); a graph the lane cannot
-  bind has no override yet. The structural lint reads shell commands, rejects a refusal in a pipeline, substitution or subshell, and
+  on `install.project_lane` being on. A graph the lane cannot bind has no confirmation for one command; its way out is the standing per-project decision. The structural lint reads shell commands, rejects a refusal in a pipeline, substitution or subshell, and
   keeps its known mutations as fixtures.
 
 - Project lane (still behind `install.project_lane`): standing acceptances and install records, **no terminal prompt**. The

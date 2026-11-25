@@ -195,6 +195,63 @@ safe_gate_resolve_real() {
   printf '%s\n' "$displaced"
 }
 
+# The delegate of a tool: what the gate execs for a command it lets through. Returns the binary and the argv[0] to run it under ("" for
+# none) through the two variables NAMED by $2 and $3, which are the caller's locals: no global is written, so a variable the caller
+# exported keeps its value and its export attribute in the delegate's environment. The delegate resolve_real hands back for a node tool is often the
+# mise shim itself — a file named <tool> whose marker says tool=mise. Since 1.56.0 that shim's argv0 dispatch routes gated names back
+# into the gate, so exec'ing it here would loop: wrapper -> gate -> shim -> wrapper. Do directly what the dispatch did instead —
+# exec the real mise under the tool's argv[0], which is what mise multiplexes on — and the recursion is broken structurally rather
+# than by a skip switch a caller could forge. ONE function, for the delegate that runs the command and for the question the lane
+# puts to npm about a pinned project (it must be put to the command that will run). Returns 127 with the same diagnostics as before.
+safe_gate_resolve_delegate() {
+  local tool="$1" __out_real="$2" __out_argv0="$3" __real __real_mise __argv0=""
+  printf -v "${__out_real}" '%s' ""
+  printf -v "${__out_argv0}" '%s' ""
+  __real="$(safe_gate_resolve_real "$tool")"
+  if [[ -z "$__real" ]]; then
+    # 127 is the agent contract's "genuinely missing command" (safe explain);
+    # a policy refusal is never 127.
+    safe_gate_err "safe: gate: ${tool}: command not found (no non-wrapper ${tool} on PATH)"
+    return 127
+  fi
+  if [[ "$tool" != "mise" ]] \
+    && [[ "$(safe_gate_wrapper_marker_tool "$__real")" == "mise" ]]; then
+    __real_mise="$(safe_gate_resolve_real mise)"
+    if [[ -z "$__real_mise" ]]; then
+      safe_gate_err "safe: gate: ${tool}: command not found (its delegate is a mise shim and no non-wrapper mise is on PATH)"
+      return 127
+    fi
+    __argv0="$tool"
+    __real="$__real_mise"
+  fi
+  printf -v "${__out_real}" '%s' "${__real}"
+  printf -v "${__out_argv0}" '%s' "${__argv0}"
+}
+
+# The environment of a delegate, prepared in ONE place for everything that runs it: the command itself (safe_gate_exec_real) and the
+# question the project lane puts to npm about a pinned project, so that the question is answered in the environment the command
+# will have as far as that is known before the gate has judged the command.
+safe_gate_prepare_delegate_env() {
+  # Install-time security scanner (Bun Security Scanner API): when the safe
+  # adapter is deployed and the caller has not chosen its own scanner, point
+  # hosts that honor the contract (mise's embedded aube installer) at it.
+  # Inert everywhere else — only aube reads the variable — and deliberately
+  # injected for every delegate: any child of the delegate that ends up
+  # running an aube install inherits the gate.
+  if [[ -z "${AUBE_SECURITY_SCANNER:-}" \
+    && -f "${SAFE_CONFIG_DIR:-${HOME}/.config/safe}/scanner.mjs" ]]; then
+    export AUBE_SECURITY_SCANNER="${SAFE_CONFIG_DIR:-${HOME}/.config/safe}/scanner.mjs"
+  fi
+
+  # Bash assignment PRESERVES a pre-existing export attribute: if the caller
+  # exported any scanner name, the scan would overwrite it with the
+  # credential-bearing operational set and the delegate would inherit it
+  # (PR#30 delta-2 finding P2). De-export all five before every delegate
+  # exec — the audit child receives its values via argv flags, never env.
+  export -n SAFE_GATE_DIST_TAG SAFE_GATE_REGISTRY SAFE_GATE_PROJECT_DIR \
+    SAFE_GATE_NPM_USERCONFIG SAFE_GATE_NPM_GLOBALCONFIG SAFE_GATE_FIND_LINKS SAFE_GATE_PYTHON_ISOLATED SAFE_GATE_UV_CONFIG_FILE SAFE_GATE_PRIVATE_PY_ALLOWED 2>/dev/null || true
+}
+
 # Delegate to the real tool. Never returns. In audit-only mode
 # (SAFE_GATE_NO_EXEC=1, used when mise wraps an inner gated command: the
 # routing/audit runs, the exec is the outer tool's job) it ENDS the
@@ -215,52 +272,9 @@ safe_gate_exec_real() {
     exit 0
   fi
 
-  real="$(safe_gate_resolve_real "$tool")"
-  if [[ -z "$real" ]]; then
-    # 127 is the agent contract's "genuinely missing command" (safe explain);
-    # a policy refusal is never 127.
-    safe_gate_err "safe: gate: ${tool}: command not found (no non-wrapper ${tool} on PATH)"
-    exit 127
-  fi
+  safe_gate_resolve_delegate "$tool" real exec_argv0 || exit 127
 
-  # The delegate resolve_real hands back for a node tool is often the mise
-  # shim itself — a file named <tool> whose marker says tool=mise (see the
-  # acceptance there). Since 1.56.0 that shim's argv0 dispatch routes gated
-  # names back into the gate, so exec'ing it here would loop: wrapper -> gate
-  # -> shim -> wrapper. Do directly what the dispatch did instead — exec the
-  # real mise under the tool's argv[0], which is what mise multiplexes on —
-  # and the recursion is broken structurally rather than by a skip switch a
-  # caller could forge.
-  if [[ "$tool" != "mise" ]] \
-    && [[ "$(safe_gate_wrapper_marker_tool "$real")" == "mise" ]]; then
-    local real_mise
-    real_mise="$(safe_gate_resolve_real mise)"
-    if [[ -z "$real_mise" ]]; then
-      safe_gate_err "safe: gate: ${tool}: command not found (its delegate is a mise shim and no non-wrapper mise is on PATH)"
-      exit 127
-    fi
-    exec_argv0="$tool"
-    real="$real_mise"
-  fi
-
-  # Install-time security scanner (Bun Security Scanner API): when the safe
-  # adapter is deployed and the caller has not chosen its own scanner, point
-  # hosts that honor the contract (mise's embedded aube installer) at it.
-  # Inert everywhere else — only aube reads the variable — and deliberately
-  # injected for every delegate: any child of the delegate that ends up
-  # running an aube install inherits the gate.
-  if [[ -z "${AUBE_SECURITY_SCANNER:-}" \
-    && -f "${SAFE_CONFIG_DIR:-${HOME}/.config/safe}/scanner.mjs" ]]; then
-    export AUBE_SECURITY_SCANNER="${SAFE_CONFIG_DIR:-${HOME}/.config/safe}/scanner.mjs"
-  fi
-
-  # Bash assignment PRESERVES a pre-existing export attribute: if the caller
-  # exported any scanner name, the scan would overwrite it with the
-  # credential-bearing operational set and the delegate would inherit it
-  # (PR#30 delta-2 finding P2). De-export all five before every delegate
-  # exec — the audit child receives its values via argv flags, never env.
-  export -n SAFE_GATE_DIST_TAG SAFE_GATE_REGISTRY SAFE_GATE_PROJECT_DIR \
-    SAFE_GATE_NPM_USERCONFIG SAFE_GATE_NPM_GLOBALCONFIG SAFE_GATE_FIND_LINKS SAFE_GATE_PYTHON_ISOLATED SAFE_GATE_UV_CONFIG_FILE SAFE_GATE_PRIVATE_PY_ALLOWED 2>/dev/null || true
+  safe_gate_prepare_delegate_env
 
   # Environment names that are not valid shell identifiers (npm accepts
   # hyphenated npm_config_* keys) cannot be unset from bash: the scrub
@@ -3748,6 +3762,160 @@ safe_gate_project_lane_conclude() {
 # Neither a flag nor an uncommitted change can choose the weaker route, and a safety guard that
 # fails takes precedence over the compatibility route: the guards run BEFORE a one-shot.
 
+# --- the operator's standing decision per project (ticket 1690) -----------------------------------------------------------------
+# "The lane is off for this project": a command that npm will run on a pinned project goes to today's gate before the lane looks at
+# anything else, with the one-shot line. The store, its one reader and its one writer are `safe-core one-shot-store` (verified
+# directories, one descriptor for check and read, one strict document); this is where the lane READS it, once, in
+# safe_gate_project_lane_pin_route. Two steps, never one:
+#   1. on data alone: is the directory the command runs in, or one of its ancestors, a stored pin by identity? When none is, nothing
+#      more happens: no npm is run, and the lane goes on (no npm run decides the route of any project that is not under a pin);
+#   2. to npm, TWO read-only answers from the same npm, with the command's own arguments, environment and directory: `npm prefix`
+#      and `npm root` (the command word replaced, everything else in place). The pin is honoured only when both are one line, the
+#      root is EXACTLY the node_modules directly under the prefix (a project named `lib` under a prefix has the same local and global
+#      root: the prefix tells the mode), the prefix names a stored pin by identity (opened by the core, never taken as text) and the
+#      target's node_modules is not a link. An undetermined answer (an error, a workspace selection, a timeout, another directory)
+#      is no pin. Under `mise exec` the pin is not used (see safe_gate_project_lane_pin_route).
+# The question runs the delegate the command will run (the same resolution and the same environment preparation as the exec, mise shim
+# included), in a subshell. It points npm's cache and logs directory at a private scratch directory by the FIRST arguments of the
+# command line (see safe_gate_project_lane_pin_npm_line), so npm neither writes nor cleans anything of the operator's. The whole route
+# (core version check, resolution, both questions, verification) is under ONE deadline (safe_gate_project_lane_pin_bounded).
+safe_gate_project_lane_pin_core() {
+  local core="${SAFE_DIR:-}/safe-core"
+  [[ -n "${SAFE_DIR:-}" && -x "${core}" && "${HOME:-}" == /* ]] || return 1
+  [[ "$("${core}" --version 2>/dev/null)" == "${SAFE_VERSION:-unset}" ]] || return 1
+  printf '%s' "${core}"
+}
+
+# 0 pinned here or above, 1 none, 2 a stored path is here but another directory stands on it. Data alone: runs no npm.
+safe_gate_project_lane_pin_here() {
+  local core rc=0
+  core="$(safe_gate_project_lane_pin_core)" || return 1
+  "${core}" one-shot-store check </dev/null >/dev/null 2>&1 || rc=$?
+  case "${rc}" in 0) return 0 ;; 2) return 2 ;; *) return 1 ;; esac
+}
+
+# One answer of npm: $1 the command word to put in place of the command's own (prefix or root), $2 the scratch directory, then the
+# command's arguments. The question's own options are the FIRST arguments npm gets, each with its value attached
+# (`--cache=<scratch> --logs-dir=<scratch>/_logs --update-notifier=false`): nothing precedes them, so no option of the command can
+# take one as its value and no option terminator can turn them into operands; an option of the command later on the line still wins,
+# as it does for the command itself. They point npm's cache and logs at the scratch directory, so npm neither writes nor cleans
+# anything of the operator's (a debug log, an update-check stamp, a cache), and the update check stays off. No argument boundary is
+# computed. The environment is the delegate's (safe_gate_prepare_delegate_env after the same scrub as the exec), in a subshell, so
+# nothing leaks into the lane. Sets SAFE_GATE_PIN_ANSWER to npm's exact standard output (every byte) and returns npm's own status.
+safe_gate_project_lane_pin_npm_line() {
+  local word="$1" scratch="$2" real="" argv0="" out rc
+  shift 2
+  local -a argv=("$@")
+  SAFE_GATE_PIN_ANSWER=""
+  (( SAFE_GATE_SUBCMD_IDX >= 1 && SAFE_GATE_SUBCMD_IDX <= ${#argv[@]} )) || return 125
+  argv[SAFE_GATE_SUBCMD_IDX-1]="${word}"
+  safe_gate_resolve_delegate npm real argv0 >/dev/null 2>&1 || return 125
+  out="$(
+    safe_gate_npm_scrub_script_env
+    safe_gate_prepare_delegate_env
+    local -a launch=() env_u=()
+    local scrub_name
+    for scrub_name in ${SAFE_GATE_ENV_SCRUB[@]+"${SAFE_GATE_ENV_SCRUB[@]}"}; do env_u+=(-u "${scrub_name}"); done
+    (( ${#env_u[@]} == 0 )) || launch=(env "${env_u[@]}")
+    if [[ -n "${argv0}" ]]; then
+      launch+=("${BASH:-bash}" -c 'exec -a "$1" "$2" "${@:3}"' safe-gate "${argv0}" "${real}")
+    else
+      launch+=("${real}")
+    fi
+    "${launch[@]}" "--cache=${scratch}" "--logs-dir=${scratch}/_logs" --update-notifier=false "${argv[@]}" </dev/null 2>/dev/null | head -c 4097
+    printf 'x%d' "${PIPESTATUS[0]}"
+  )"
+  rc="${out##*x}"
+  SAFE_GATE_PIN_ANSWER="${out%x*}"
+  return "${rc}"
+}
+
+# 0 when npm's answers name a stored pin in project mode. $1 the scratch directory's name (chosen and finally removed by
+# safe_gate_project_lane_pin_bounded; made here, private; it is also removed when the subshell ends or is told to stop), then the command's
+# arguments; reads SAFE_GATE_SUBCMD_IDX. Makes the scratch directory itself (only a pinned project gets one). Runs only in the route's own subshell.
+safe_gate_project_lane_pin_ask_npm() {
+  local core prefix_answer scratch="$1" rc=0
+  shift
+  core="$(safe_gate_project_lane_pin_core)" || return 1
+  mkdir -m 700 -- "${scratch}" 2>/dev/null || return 1
+  trap 'rm -rf -- "${scratch}"' EXIT
+  trap 'rm -rf -- "${scratch}"; exit 1' HUP INT TERM
+  safe_gate_project_lane_pin_npm_line prefix "${scratch}" "$@" || return 1
+  prefix_answer="${SAFE_GATE_PIN_ANSWER}"
+  safe_gate_project_lane_pin_npm_line root "${scratch}" "$@" || return 1
+  "${core}" one-shot-store verify "${prefix_answer}" "${SAFE_GATE_PIN_ANSWER}" </dev/null >/dev/null 2>&1 || rc=$?
+  (( rc == 0 ))
+}
+
+# The lookup itself, in the route's subshell. $1 the scratch directory. 0 pinned, 1 not.
+safe_gate_project_lane_pin_lookup() {
+  local here=0 scratch="$1"
+  shift
+  safe_gate_project_lane_pin_here || here=$?
+  if (( here == 1 )); then
+    return 1
+  fi
+  if (( here == 0 )) && safe_gate_project_lane_pin_ask_npm "${scratch}" "$@"; then
+    return 0
+  fi
+  if (( here == 2 )); then
+    safe_gate_err "safe: project lane: a one-shot decision names a path here, but another directory stands on it now, so it is not honoured (safe run one-shot-project list)"
+  fi
+  return 1
+}
+
+# Milliseconds, for the route's deadline.
+safe_gate_project_lane_pin_now_ms() {
+  local t="${EPOCHREALTIME:-}"
+  if [[ -n "${t}" ]]; then printf '%s' $(( ${t//[.,]/} / 1000 )); else printf '%s' $(( SECONDS * 1000 )); fi
+}
+
+# ONE deadline for the whole route: the core's version check, the delegate's resolution, both questions and the verification run in a
+# subshell that is stopped when the budget (10 s) is spent; then there is no pin and the lane goes on. The subshell also keeps every
+# variable of the lookup (the answers, the resolver's outputs, the prepared environment) out of the lane and the gate. The scratch
+# directory of the two questions (npm's cache and logs directory for them) is private and removed here whatever ends the subshell.
+safe_gate_project_lane_pin_bounded() {
+  local pid scratch rc=0 deadline monitor=0
+  # only the NAME is chosen here (nothing is written for a project that is not pinned); the lookup makes the directory (mkdir -m 700
+  # fails on anything that exists, a link included), and this function removes it whatever ends the lookup, the deadline's KILL included
+  scratch="$(mktemp -u "${TMPDIR:-/tmp}/safe-pin.XXXXXXXX" 2>/dev/null)" || return 1
+  [[ "${scratch}" == /* ]] || return 1
+  deadline=$(( $(safe_gate_project_lane_pin_now_ms) + 10000 ))
+  # its own process group, so that the deadline stops everything the lookup started (the core, npm), not only the subshell. Nothing
+  # in the lookup runs under timeout(1): it would move its command to another process group, and a question in flight would
+  # outlive the deadline (and write in a scratch directory already removed)
+  [[ $- != *m* ]] || monitor=1
+  set -m
+  ( safe_gate_project_lane_pin_lookup "${scratch}" "$@" ) </dev/null >/dev/null &
+  pid=$!
+  (( monitor )) || set +m
+  while kill -0 "${pid}" 2>/dev/null; do
+    if (( $(safe_gate_project_lane_pin_now_ms) >= deadline )); then
+      kill -TERM -- "-${pid}" 2>/dev/null
+      sleep 0.3
+      kill -KILL -- "-${pid}" 2>/dev/null
+      wait "${pid}" 2>/dev/null
+      rm -rf -- "${scratch}"
+      return 1
+    fi
+    sleep 0.05
+  done
+  wait "${pid}" 2>/dev/null || rc=$?
+  rm -rf -- "${scratch}"
+  return "${rc}"
+}
+
+# The ONLY place the lane reads the standing decision. 0 when the lane is OFF for this project (the caller hands the command over),
+# 1 when the lane goes on. $1 verb, then the command's arguments. Under `mise exec` the inner gate sees the ambient npm while the
+# outer invocation runs the npm it selects (`mise exec node@16 -- npm …`): the question would be put to another npm than the one that
+# will run, and the two can print different roots for the same project, so the pin is NOT used there: the lane treats the command
+# as it does without a pin.
+safe_gate_project_lane_pin_route() {
+  shift
+  [[ "${SAFE_GATE_NO_EXEC:-}" != "1" ]] || return 1
+  safe_gate_project_lane_pin_bounded "$@"
+}
+
 # The ONLY places the lane's hand-over statuses are raised (the structural lint checks it): the command goes to today's gate
 # (253) or is left to npm, which rejects it (252). Both return through the same non-zero path as a refusal.
 safe_gate_project_lane_hand_over_silent() {
@@ -5455,7 +5623,7 @@ safe_gate_project_lane_outcome_text() {
     .outcome as $o
     | if $o.status == "unbound" then
         (.bindability.unbound[0]) as $u
-        | "the projected graph holds \(.bindability.unbound | length) entry(ies) safe cannot bind (\($u.name // $u.path)@\($u.version // "?"): \($u.reason))|the lane has no route for an unbound graph yet; no file was written"
+        | "the projected graph holds \(.bindability.unbound | length) entry(ies) safe cannot bind (\($u.name // $u.path)@\($u.version // "?"): \($u.reason))|the lane cannot bind this graph, which has no confirmation for one command; the operator can put this project on the one-shot route, a standing decision at their terminal; no file was written"
       elif $o.class == "malice" then
         (.malice[0]) as $m
         | "\(if $m.signal == "blocklist" then "blocklist entry" elif $m.signal == "socket_block" then "Socket BLOCK" else "known-malware record" end) on \($m.name)@\($m.versions | join(",")) (\($m.id // $m.reason))\(if (.malice | length) > 1 then " and \((.malice | length) - 1) more" else "" end)|remove it from the dependency graph; nothing clears malice"
@@ -5808,6 +5976,38 @@ safe_gate_project_lane_run() {
   # its own global branch. Every other spelling that selects or negates global mode refuses, with
   # the plain form as the way out. Global mode that comes from configuration is refused with the
   # other settings the lane cannot carry (safe_gate_project_lane_config_reason).
+  local -a before_terminator=()
+  local plain_global=0
+  for arg in "$@"; do
+    [[ "${arg}" != "--" ]] || break
+    before_terminator+=("${arg}")
+  done
+  arg=""
+  if (( ${#before_terminator[@]} )) && safe_gate_npm_global_true "${before_terminator[@]}"; then
+    plain_global=1
+  fi
+  # The physical directory is captured, and the operator's standing decision looked up, BEFORE every lane-specific refusal (the
+  # spelled-global guards below included); plain global dispatch stays first (it never consults a pin).
+  # The physical path is captured byte for byte: command substitution strips EVERY trailing
+  # newline, which could turn a directory into its sibling. One newline (the one pwd adds) is
+  # removed; a path with another newline in it cannot be captured exactly and refuses, before
+  # anything is opened, locked or recorded.
+  if (( ! plain_global )); then
+    if ! project_dir="$(cd -- "." 2>/dev/null && pwd -P && printf x)"; then
+      safe_gate_project_lane_refuse 100 "${verb}" "the project directory cannot be read" "retry from the project root"
+      return $?
+    fi
+    project_dir="${project_dir%x}"
+    project_dir="${project_dir%$'\n'}"
+    if [[ "${project_dir}" == *$'\n'* ]]; then
+      safe_gate_project_lane_refuse 100 "${verb}" "the project's path contains a newline, so it cannot be captured exactly (it could name a sibling directory)" "run the command from a directory whose path has no newline"
+      return $?
+    fi
+  fi
+  if (( ! plain_global )) && safe_gate_project_lane_pin_route "${verb}" "$@"; then
+    safe_gate_project_lane_oneshot "${verb}" "the operator put this project on the one-shot route (safe run one-shot-project list)"
+    return $?
+  fi
   local global_arg="" global_next=""
   for arg in "$@"; do
     [[ "${arg}" != "--" ]] || break
@@ -5826,32 +6026,12 @@ safe_gate_project_lane_run() {
         ;;
     esac
   done
-  local -a before_terminator=()
-  for arg in "$@"; do
-    [[ "${arg}" != "--" ]] || break
-    before_terminator+=("${arg}")
-  done
-  arg=""
-  if (( ${#before_terminator[@]} )) && safe_gate_npm_global_true "${before_terminator[@]}"; then
+  if (( plain_global )); then
     safe_gate_project_lane_hand_over_silent
     return $?
   fi
 
   # --- 1. route: the runtime, then npm's own word on global --------------------
-  # The physical path is captured byte for byte: command substitution strips EVERY trailing
-  # newline, which could turn a directory into its sibling. One newline (the one pwd adds) is
-  # removed; a path with another newline in it cannot be captured exactly and refuses, before
-  # anything is opened, locked or recorded.
-  if ! project_dir="$(cd -- "." 2>/dev/null && pwd -P && printf x)"; then
-    safe_gate_project_lane_refuse 100 "${verb}" "the project directory cannot be read" "retry from the project root"
-    return $?
-  fi
-  project_dir="${project_dir%x}"
-  project_dir="${project_dir%$'\n'}"
-  if [[ "${project_dir}" == *$'\n'* ]]; then
-    safe_gate_project_lane_refuse 100 "${verb}" "the project's path contains a newline, so it cannot be captured exactly (it could name a sibling directory)" "run the command from a directory whose path has no newline"
-    return $?
-  fi
   # safe's own storage, and the scratch, are outside the project: nothing of
   # ours is ever written into it before publication.
   # Checked in both directions: the lane's directory inside the project, or the

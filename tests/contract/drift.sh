@@ -380,6 +380,15 @@ case_operator_terminal_helpers_match_between_gates() {
       return
     fi
   done
+  # the core's writer of the standing decision (cmd/safe-core/one_shot.go) checks the same predicate itself: its marker list is the
+  # shells' list, name for name, so a fifth marker cannot be added to one and not the other
+  local shell_markers core_markers
+  shell_markers="$(sed -n '/^safe_gate_operator_terminal() {$/,/^}$/p' "$ROOT/lib/gate-lib.sh" | grep -o '[A-Z_]*:-}' | sed 's/:-}//' | tr '\n' ' ')"
+  core_markers="$(sed -n '/^var operatorMarkers = /p' "$ROOT/cmd/safe-core/one_shot.go" | grep -o '"[A-Z_]*"' | tr -d '"' | tr '\n' ' ')"
+  if [[ -z "$shell_markers" || "$shell_markers" != "$core_markers" ]]; then
+    fail "$FUNCNAME (the shells' agent markers [${shell_markers}] and the core's [${core_markers}] differ)"
+    return
+  fi
   pass "$FUNCNAME"
 }
 
@@ -523,12 +532,53 @@ k = find(r'(safe_gate_project_lane_conclude\(\) \{\n)')
 write("mark-raised-where-the-question-is-asked", src[:k.end()] + "  SAFE_GATE_LANE_REFUSAL_MARK=1\n" + src[k.end():])
 r = find(r'(safe_gate_project_lane_run\(\) \{\n)')
 write("prompt-called-outside-its-loop", src[:r.end()] + "  safe_gate_project_lane_prompt_gap || return $?\n" + src[r.end():])
+c9 = re.search(r"(safe_gate_project_lane_cleanup\(\) \{\n)", src)
+write("pin-question-asked-outside-the-route", src[:c9.end()] + "  safe_gate_project_lane_pin_ask_npm \"$@\" || return 1\n" + src[c9.end():])
+write("pin-data-question-asked-outside-the-route", src[:c9.end()] + "  safe_gate_project_lane_pin_here || return 1\n" + src[c9.end():])
+write("pin-route-called-outside-the-runner", src[:c9.end()] + "  safe_gate_project_lane_pin_route x && return 1\n" + src[c9.end():])
+write("the-store-named-outside-the-two-questions", src[:c9.end()] + "  \"${SAFE_DIR}/safe-core\" one-shot-store check --home \"${HOME}\" || return 1\n" + src[c9.end():])
+r9 = re.search(r"  if \(\( ! plain_global \)\) && safe_gate_project_lane_pin_route \"\$\{verb\}\" \"\$@\"; then\n", src)
+assert r9, "the route call"
+write("pin-route-read-twice", src[:r9.start()] + '  if (( ! plain_global )) && safe_gate_project_lane_pin_route "${verb}" "$@"; then :; fi\n' + src[r9.start():])
+write("pin-route-never-read", src[:r9.start()] + '  if false; then\n' + src[r9.end():])
+blk = re.search(r"  if \(\( ! plain_global \)\) && safe_gate_project_lane_pin_route \"\$\{verb\}\" \"\$@\"; then\n[^\n]*\n[^\n]*\n  fi\n", src)
+assert blk, "the route block"
+tail = src.replace(blk.group(0), "", 1)
+anchor = tail.index("  if (( plain_global )); then\n    safe_gate_project_lane_hand_over_silent")
+write("pin-route-moved-below-the-spelled-global-guards", tail[:anchor] + blk.group(0) + tail[anchor:])
+write("a-refusal-before-the-pin-lookup", src[:blk.start()] + '  safe_gate_project_lane_unsupported_kind command_form "${verb}" "x"\n  return $?\n' + src[blk.start():])
+a = re.search(r"  safe_gate_project_lane_pin_npm_line prefix \"\$\{scratch\}\" \"\$@\" \|\| return 1\n", src)
+assert a, "the prefix question"
+write("prefix-question-asked-twice-in-its-owner", src[:a.end()] + a.group(0) + src[a.end():])
+b = re.search(r"  safe_gate_project_lane_pin_npm_line root \"\$\{scratch\}\" \"\$@\" \|\| return 1\n", src)
+assert b, "the root question"
+write("root-question-never-asked", src[:b.start()] + src[b.end():])
+write("a-question-asked-outside-its-owner", src[:c9.end()] + '  safe_gate_project_lane_pin_npm_line root "$@" || return 1\n' + src[c9.end():])
+# the reviewer's two mutations (round two): two prefix questions on ONE logical line; a refusal of the lint's whole set before the lookup
+write("two-prefix-questions-on-one-line", src[:a.start()] + '  safe_gate_project_lane_pin_npm_line prefix "${scratch}" "$@" || return 1; safe_gate_project_lane_pin_npm_line prefix "${scratch}" "$@" || return 1\n' + src[a.end():])
+write("pin-lookup-called-outside-the-bounded-route", src[:c9.end()] + '  safe_gate_project_lane_pin_lookup x || return 1\n' + src[c9.end():])
+write("pin-bounded-called-outside-the-route", src[:c9.end()] + '  safe_gate_project_lane_pin_bounded x || return 1\n' + src[c9.end():])
+write("an-unsupported-refusal-before-the-pin-lookup", src[:blk.start()] + '  safe_gate_project_lane_unsupported 100 "${verb}" "x" "y"\n  return $?\n' + src[blk.start():])
+# R10: a step of the standing route under timeout(1) sits in a process group of its own and outlives the route's one deadline
+def under_timeout(name, plain):
+    assert src.count(plain) == 1, plain
+    write(name, src.replace(plain, plain.replace('"${', 'timeout --kill-after=2s 10s "${', 1)))
+under_timeout("the-question-under-timeout", '    "${launch[@]}" "--cache=${scratch}"')
+under_timeout("the-data-question-under-timeout", '  "${core}" one-shot-store check </dev/null')
+under_timeout("the-verification-under-timeout", '  "${core}" one-shot-store verify "${prefix_answer}"')
 PY
   for name in diagnostic-with-the-word-return second-question-on-the-next-line hand-over-in-the-runner hand-over-helper-called-outside-its-owners \
       question-outside-conclude plain-return-removed return-in-a-subshell refusal-in-a-pipeline a-kind-outside-the-closed-list \
       mark-raised-outside-its-owner mark-from-a-variable mark-by-arithmetic start-up-flag-cleared start-up-flag-unset \
       phase-declared-local question-through-the-outcome-handler reserved-status-as-a-literal phase-set-back-to-routing \
-      mark-raised-where-the-question-is-asked prompt-called-outside-its-loop; do
+      mark-raised-where-the-question-is-asked prompt-called-outside-its-loop \
+      pin-question-asked-outside-the-route pin-data-question-asked-outside-the-route pin-route-called-outside-the-runner \
+      the-store-named-outside-the-two-questions pin-route-read-twice pin-route-never-read \
+      pin-route-moved-below-the-spelled-global-guards a-refusal-before-the-pin-lookup prefix-question-asked-twice-in-its-owner \
+      root-question-never-asked a-question-asked-outside-its-owner \
+      two-prefix-questions-on-one-line an-unsupported-refusal-before-the-pin-lookup \
+      pin-lookup-called-outside-the-bounded-route pin-bounded-called-outside-the-route \
+      the-question-under-timeout the-data-question-under-timeout the-verification-under-timeout; do
     [[ -f "${dir}/${name}.sh" ]] || { bad="${bad} ${name}(missing)"; continue; }
     if python3 -I "${ROOT}/tests/contract/lane_lint.py" "${dir}/${name}.sh" >/dev/null; then
       bad="${bad} ${name}"

@@ -46,4 +46,13 @@ fi
 
 "$GO" vet ./...
 "$GO" test ./...
+
+# Every platform the repository has files for must still build safe-core: the standing decision's terminal detection once used a
+# Linux-only constant in an untagged file, and darwin stopped building without anything saying so. The binary is discarded.
+for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+  if ! GOOS="${target%/*}" GOARCH="${target#*/}" "$GO" build -o /dev/null ./cmd/safe-core; then
+    printf 'FAIL: safe-core does not build for %s\n' "${target}" >&2
+    exit 1
+  fi
+done
 printf 'go: gofmt, vet and tests passed\n'

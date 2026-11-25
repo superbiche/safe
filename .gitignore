@@ -6,6 +6,8 @@ test-output/
 coverage/
 site/
 dist/
+# `go build ./cmd/safe-core` from the repository root leaves the binary here; install.sh builds its own
+/safe-core
 PROGRESS.md
 inbox/private/
 inbox/tmp/
