@@ -119,7 +119,7 @@ func oneShotChange(verb string, store projectlane.OneShotStore, operands []strin
 			raw, _ := json.Marshal(plan.Path)
 			shown = append(shown, fmt.Sprintf("  %s  (device %d, inode %d)", raw, plan.Dev, plan.Inode))
 		}
-		fmt.Fprintln(out, "safe run: these projects will take the one-shot route for every npm command (the lane is off for them):")
+		fmt.Fprintln(out, "safe run: these projects will take the one-shot route for their plain npm commands (the lane is off for them; a workspace selection, a global command and a command under `mise exec` are not served):")
 	} else {
 		entries, err := store.ShowRemoval(operands)
 		if err != nil {

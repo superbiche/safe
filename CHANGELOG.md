@@ -9,8 +9,9 @@
   terminal is 102 and touches nothing), on verified directories, as one strict bounded document, with a checked lock, a staged file
   created with its final mode, and "not recorded" told apart from "committed, durability uncertain"; an entry is the physical path
   with device and inode. The lane asks in two steps, before any lane-specific refusal: data alone (this directory or an ancestor is a pin; else no
-  npm is run), then two read-only npm answers (`npm prefix` and `npm root`, the command's own arguments, `--update-notifier=false
-  --logs-max=0` on the command line and the caller's environment untouched), honoured only when the root is exactly
+  npm is run), then two read-only npm answers (`npm prefix` and `npm root`, the command's own arguments, put to the npm that will run in the environment
+  its delegate gets, with npm's cache and logs directory pointed at a scratch directory of safe's own by the first arguments of the
+  command line, the caller's files and environment untouched, the whole route under one deadline), honoured only when the root is exactly
   `<prefix>/node_modules` and the prefix is a pinned directory; not used under `mise exec`. The writer's only anchor is `HOME`. `list` creates
   nothing and exits 3 when the store cannot be trusted. A graph the lane cannot bind names this way out. Agent contract: an
   operator-only flow, relayed only when the operator asks for a standing decision.

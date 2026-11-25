@@ -607,7 +607,7 @@ its device and inode, in `one-shot-projects.json` under `$HOME/.config/safe/run`
 (`ONE_SHOT_PROJECT_ADD` / `ONE_SHOT_PROJECT_REMOVE`, written after the commit) records who and when. `list` creates nothing. It matters only
 while `install.project_lane` is on. The pin serves plain project commands: not served are a command that selects a workspace, a pin on a
 workspace member where npm acts on the root above, a command under `mise exec`, and a global command. The lane asks the npm that will run
-(`npm prefix` and `npm root`, housekeeping on the command line, the caller's environment untouched); the only anchor of the store is `HOME`. Accepted residuals: a remount at the same path with the same device and inode, or a reused inode, cannot be told from the
+(`npm prefix` and `npm root`, with a cache and a logs directory of safe's own in a scratch directory, the caller's environment and files untouched, under one deadline); the only anchor of the store is `HOME`. Accepted residuals: a remount at the same path with the same device and inode, or a reused inode, cannot be told from the
 pinned directory; a process allowed to write files as the operator can write the store.
 
 ## Scripts Allowlist

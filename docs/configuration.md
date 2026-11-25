@@ -328,7 +328,7 @@ pass and warnings under `environment.release_follow`.
   command, no advisory at high or above stands on its bytes (an inherited one, a bundled member's) except one the operator
   accepted in this command, it relies on no followed authority for any of them, and nothing excludes the command as a whole
   (confirmed missing evidence, a confirmed Socket outage, a malice or block override record nothing). New adverse
-  evidence revokes the receipt it supersedes at once, after every reading. A routing refusal and a baseline from history that cannot be read have their one-command confirmation (see **The one-shot route, by the operator**); a graph the lane cannot bind has no override yet. A cancellation (TERM, INT) at a prompt, or while the `[a]` grant is being reconfirmed, ends the prompt and the writer and frees the project lock; the acceptance already given stays, nothing is granted or published. A dry run, by argument or by npm's configuration, is never prompted. When
+  evidence revokes the receipt it supersedes at once, after every reading. A routing refusal and a baseline from history that cannot be read have their one-command confirmation (see **The one-shot route, by the operator**); a graph the lane cannot bind has no confirmation for one command, and its way out is the operator's standing decision for the project (**The standing decision per project**, below). A cancellation (TERM, INT) at a prompt, or while the `[a]` grant is being reconfirmed, ends the prompt and the writer and frees the project lock; the acceptance already given stays, nothing is granted or published. A dry run, by argument or by npm's configuration, is never prompted. When
   the prompts end the evidence may not be older than 15 minutes counted from BEFORE the first evidence read
   (`install.lane_evidence_window_seconds` in the operator's configuration may shorten it), checked immediately before the
   baseline is recorded and again immediately before the binder starts: otherwise the command is refused, and what was accepted stays recorded, so the
@@ -381,12 +381,22 @@ pass and warnings under `environment.release_follow`.
   over first and never consults a pin), with two kinds of question. First, on data alone: is the directory the command runs in, or one
   of its ancestors, a stored pin by identity? If none is, nothing more happens and no npm is run. Then npm, two read-only answers
   from the npm that will run the command (the command's own arguments, the command word replaced, everything else in place): `npm
-  prefix` and `npm root`. The caller's environment is not touched: npm's update check and debug log are silenced by `--update-notifier=false
-  --logs-max=0` on the command line, at the end or immediately before the option terminator (an option the caller gave stays where it
-  was). The pin is honoured only when both exit 0 and print exactly one line, the root is exactly `<prefix>/node_modules`, the
+  prefix` and `npm root`. The question never asks npm to keep no logs and never touches the caller's environment: it gives npm a cache
+  and a logs directory of safe's own, in a private scratch directory made for the two questions and removed whatever ends them (a
+  normal end, a failed question, the deadline), and keeps the update check off. These are the FIRST arguments npm gets, each with its
+  value attached (`npm --cache=<scratch> --logs-dir=<scratch>/_logs --update-notifier=false <the command's arguments, the command word
+  replaced>`): nothing precedes them, so no option of the command can take one as its value and no terminator (`--`, `---`) can
+  turn them into operands, and no argument boundary is computed. An option of the command later on the line still wins, as it does for the
+  command itself: when the command's own line names a cache or a logs directory, npm writes there as the command itself would (an
+  environment variable naming one loses to the question's options and receives nothing). `--logs-dir` is harmless where a version does
+  not define it (npm 8.1.0 keeps its logs under the cache). The question runs in the environment the delegate gets: the same scrub of
+  the caller's script policy and the same preparation of the delegate's environment (one function, shared with the exec), in a
+  subshell. What only becomes known after today's gate has judged the command is the accepted window: the scripts-allow injection
+  (`npm_config_ignore_scripts`, `npm_config_allow_scripts`, `npm_config_strict_allow_scripts`) is not in the question's environment. The pin is honoured only when both exit 0 and print exactly one line, the root is exactly `<prefix>/node_modules`, the
   prefix names a pinned directory by identity (opened by the core, never taken as text) and that directory's `node_modules` is not a
   link. The prefix is what tells global mode from project mode: a project named `lib` under a global prefix prints the same root as
-  the global tree. Each step is bounded (10 s; the whole question is a handful of steps). An undetermined answer is no pin. **Under
+  the global tree. ONE deadline (10 s) covers the whole route: the core's version check, the delegate's resolution, both questions and the verification; when
+  it expires nothing is pinned and the lane goes on. An undetermined answer is no pin. **Under
   `mise exec` the pin is not used** (the inner gate runs the ambient npm, the outer mise may run another one, so the question
   could go to the wrong npm): the command meets the lane as if nothing were pinned. The window between the question and the command
   is the ordinary one of any check made before a command (a directory replaced in it is the accepted residual below). **Accepted limits:** a command that
@@ -396,9 +406,10 @@ pass and warnings under `environment.release_follow`.
   pin is then not honoured, and a caller who controls npm's start-up controls the answer (the same boundary as today's gate); a
   remount at the same path with the same device and inode, or a reused inode, cannot be told from the pinned directory; a process
   allowed to write files as the operator can write the store. What the real npm prints on 8.1.0, 10.9.2, 11.20.0 and 12.2.1 is held
-  by `tests/live/standing_pin_npm_oracle.sh`. With the housekeeping on the command line the question writes no file and opens no
-  connection on any of the four (checked there, with an original `--logs-max=1` and an option terminator); npm 10.9.2 still creates an
-  empty `~/.npm` directory before it reads its options, which is the one trace this question can leave. The pin serves plain project
+  by `tests/live/standing_pin_npm_oracle.sh`. On a home that holds a debug log, an
+  update-check stamp and a cache, the home is byte-identical and time-stamp-identical after both questions on all four, for a plain
+  command, a failing question (a workspace selection), a trailing value-taking option with no value, `---` and a terminator; on a fresh
+  home the question writes no file and opens no internet connection. The pin serves plain project
   commands, not workspace selections, and a command that selects a workspace is not served.
 
   **Standing acceptances.** The decision takes the operator's standing acceptances as a document of its own, read by safe's

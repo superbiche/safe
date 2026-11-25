@@ -4,10 +4,12 @@ package projectlane
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -305,12 +307,32 @@ func TestOneShotReadsTheFileItChecked(t *testing.T) {
 	}
 }
 
+// Two writers really contend: the withdrawal holds the lock after it read the old document; the add is let go only once the kernel
+// shows it BLOCKED on that same lock (a waiter in /proc/locks for the lock file's inode). Both results are asserted.
 func TestOneShotWritersAreSerialised(t *testing.T) {
-	store, _ := oneShotHome(t)
+	store, home := oneShotHome(t)
 	a, b := oneShotProject(t, "a"), oneShotProject(t, "b")
 	addOne(t, store, a)
-	// a barrier, not sleeps: the withdrawal holds the lock after it read the old document until the other writer is known to be
-	// waiting for it (it has started its own change), then both finish
+	lockInfo, err := os.Stat(filepath.Join(home, ".config", "safe", "run", oneShotLockFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inode := lockInfo.Sys().(*syscall.Stat_t).Ino
+	waiting := func() bool {
+		raw, err := os.ReadFile("/proc/locks")
+		if err != nil {
+			return false
+		}
+		for _, line := range strings.Split(string(raw), "\n") {
+			if strings.Contains(line, "->") && strings.HasSuffix(strings.Fields(line)[len(strings.Fields(line))-3], fmt.Sprintf(":%d", inode)) {
+				return true
+			}
+		}
+		return false
+	}
+	if _, err := os.ReadFile("/proc/locks"); err != nil {
+		t.Skip("no /proc/locks")
+	}
 	readOld := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
@@ -321,16 +343,32 @@ func TestOneShotWritersAreSerialised(t *testing.T) {
 		})
 	}
 	defer func() { afterRead = nil }()
+	var removeErr, addErr error
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); _, _ = store.Remove([]string{a}) }()
+	go func() { defer wg.Done(); _, removeErr = store.Remove([]string{a}) }()
+	sawWaiter := false
 	go func() {
 		defer wg.Done()
 		<-readOld // the withdrawal has read the old document and holds the lock
-		close(release)
-		_ = store.Add(mustResolve(t, b))
+		plans := mustResolve(t, b)
+		done := make(chan struct{})
+		go func() { addErr = store.Add(plans); close(done) }()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) && !sawWaiter {
+			sawWaiter = waiting()
+			time.Sleep(5 * time.Millisecond)
+		}
+		close(release) // only now (or after the bound) does the first writer go on
+		<-done
 	}()
 	wg.Wait()
+	if !sawWaiter {
+		t.Fatal("the second writer never waited for the lock: the two transactions did not contend")
+	}
+	if removeErr != nil || addErr != nil {
+		t.Fatalf("a writer failed: remove %v, add %v", removeErr, addErr)
+	}
 	rows, err := store.List()
 	if err != nil || len(rows) != 1 || rows[0].Path != b {
 		t.Fatalf("a withdrawn pin came back, or the add was lost: %+v %v", rows, err)

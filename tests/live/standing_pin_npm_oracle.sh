@@ -50,50 +50,76 @@ pin() {
   done
 }
 
-# the two questions, as the lane puts them: the command with its word replaced (`root` in the arguments given here marks the word), the
-# housekeeping on the command line before the first option terminator (or at the end). Prints npm's exact bytes.
-ask() { # <node> <cwd> <word> <env…> -- <args…>
-  local node="$1" cwd="$2" word="$3" arg out rc
-  shift 3
-  local -a envs=() args=() final=() prefix_args=()
+# the two questions, put by the PRODUCTION helper (safe_gate_project_lane_pin_npm_line: the delegate, the environment preparation, the
+# options in front, the scratch directory) to the real npm: `root` in the arguments given here marks the command word. The raw
+# standard output goes to $WORK/answer.<word>; the status is npm's own.
+ask() { # <node> <cwd> <word> <scratch> <env…> -- <args…>
+  local node="$1" cwd="$2" word="$3" scratch="$4" arg index=0 i=0
+  shift 4
+  local -a envs=()
   while (( $# )) && [[ "$1" != -- ]]; do envs+=("$1"); shift; done
   shift
-  local swapped=0 placed=0
-  for arg in "$@"; do
-    if (( ! swapped )) && [[ "${arg}" == root ]]; then arg="${word}"; swapped=1; fi
-    if (( ! placed )) && [[ "${arg}" == -- ]]; then final+=(--update-notifier=false --logs-max=0); placed=1; fi
-    final+=("${arg}")
-  done
-  (( placed )) || final+=(--update-notifier=false --logs-max=0)
-  out="$(cd "${cwd}" && env -i HOME="${WORK}/home" PATH="${node}/bin:/usr/bin:/bin" ${envs[@]+"${envs[@]}"} timeout 20 npm "${final[@]}" </dev/null 2>/dev/null; printf 'x%d' "$?")"
-  rc="${out##*x}"
-  printf '%s' "${out%x*}"
-  return "${rc}"
+  for arg in "$@"; do i=$((i + 1)); [[ "${arg}" != root ]] || { index=${i}; break; }; done
+  (( index > 0 )) || return 125
+  ( cd "${cwd}" && env -i HOME="${ORACLE_HOME}" PATH="${node}/bin:/usr/bin:/bin" GATE_LIB="${ROOT}/lib/gate-lib.sh" SCRATCH="${scratch}" WORD="${word}" IDX="${index}" ANSWER="${WORK}/answer.${word}" \
+      ${envs[@]+"${envs[@]}"} bash -c 'source "${GATE_LIB}"; SAFE_GATE_SUBCMD_IDX="${IDX}"; safe_gate_project_lane_pin_npm_line "${WORD}" "${SCRATCH}" "$@"; rc=$?; printf "%s" "${SAFE_GATE_PIN_ANSWER}" > "${ANSWER}"; exit "${rc}"' bash "$@" )
 }
 
-# honoured <version> <cwd> <pin dir…> -- <env assignments…> -- <npm args…>: the core's verdict on the real npm's two answers
-honoured() {
-  local version="$1" cwd="$2" node prefix_out root_out
+# the verdict of both answers, with the raw paths and the statuses kept: sets PREFIX_RAW, ROOT_RAW, PREFIX_RC, ROOT_RC
+ORACLE_HOME="${WORK}/home"
+read_answers() { # <version> <cwd> <env…> -- <args…>
+  local version="$1" cwd="$2" node scratch
   shift 2
-  local -a pins=() envs=() args=()
+  node="${MISE}/${NODE_OF[${version}]}"
+  scratch="$(mktemp -d "${WORK}/scratch.XXXXXX")"
+  rm -f "${WORK}/answer.prefix" "${WORK}/answer.root"
+  ask "${node}" "${cwd}" prefix "${scratch}" "$@"; PREFIX_RC=$?
+  PREFIX_RAW="$(cat "${WORK}/answer.prefix" 2>/dev/null; printf x)"; PREFIX_RAW="${PREFIX_RAW%x}"
+  ask "${node}" "${cwd}" root "${scratch}" "$@"; ROOT_RC=$?
+  ROOT_RAW="$(cat "${WORK}/answer.root" 2>/dev/null; printf x)"; ROOT_RAW="${ROOT_RAW%x}"
+  rm -rf "${scratch}"
+}
+
+# honoured <version> <cwd> <pin dir…> -- <env assignments…> -- <npm args…>: 0 honoured, 1 not honoured by the core after two successful
+# answers, 2 the pin setup failed, 3 npm failed on a question (an error, which is what some rows expect)
+honoured() {
+  local version="$1" cwd="$2"
+  shift 2
+  local -a pins=() rest=()
   while (( $# )) && [[ "$1" != -- ]]; do pins+=("$1"); shift; done
   shift
-  while (( $# )) && [[ "$1" != -- ]]; do envs+=("$1"); shift; done
-  shift
-  args=("$@")
-  node="${MISE}/${NODE_OF[${version}]}"
+  rest=("$@")
   pin "${pins[@]}" || return 2
-  prefix_out="$(ask "${node}" "${cwd}" prefix ${envs[@]+"${envs[@]}"} -- "${args[@]}"; printf x)" || return 1
-  root_out="$(ask "${node}" "${cwd}" root ${envs[@]+"${envs[@]}"} -- "${args[@]}"; printf x)" || return 1
-  HOME="${STORE_HOME}" "${CORE}" one-shot-store verify "${prefix_out%x}" "${root_out%x}" >/dev/null 2>&1
+  read_answers "${version}" "${cwd}" "${rest[@]}"
+  (( PREFIX_RC == 0 && ROOT_RC == 0 )) || return 3
+  HOME="${STORE_HOME}" "${CORE}" one-shot-store verify "${PREFIX_RAW}" "${ROOT_RAW}" >/dev/null 2>&1
 }
 
-# expect <label> <want yes|no> <version> <cwd> <pins…> -- <envs> -- <npm args>
+# expect <label> <want yes|no|error> <version> <cwd> <pins…> -- <envs> -- <npm args>
 expect() {
-  local label="$1" want="$2" version="$3" got=no
+  local label="$1" want="$2" version="$3" got rc
   shift 3
-  honoured "${version}" "$@" && got=yes
-  if [[ "${got}" == "${want}" ]]; then pass "${version}: ${label}"; else fail "${version}: ${label}: honoured=${got}, want ${want}"; fi
+  honoured "${version}" "$@"; rc=$?
+  case "${rc}" in 0) got=yes ;; 1) got=no ;; 3) got=error ;; *) fail "${version}: ${label}: the setup failed (${rc})"; return ;; esac
+  if [[ "${got}" == "${want}" ]]; then pass "${version}: ${label}"; else fail "${version}: ${label}: got ${got}, want ${want}"; fi
+}
+
+# expect_paths <label> <version> <want prefix> <want root> <cwd> <pins…> -- <envs> -- <npm args>: both questions exit 0 and print exactly these
+expect_paths() {
+  local label="$1" version="$2" want_prefix="$3" want_root="$4"
+  shift 4
+  local cwd="$1"
+  shift
+  local -a pins=()
+  while (( $# )) && [[ "$1" != -- ]]; do pins+=("$1"); shift; done
+  shift
+  pin "${pins[@]}" || { fail "${version}: ${label}: the setup failed"; return; }
+  read_answers "${version}" "${cwd}" "$@"
+  if (( PREFIX_RC == 0 && ROOT_RC == 0 )) && [[ "${PREFIX_RAW}" == "${want_prefix}"$'\n' && "${ROOT_RAW}" == "${want_root}"$'\n' ]]; then
+    pass "${version}: ${label} (prefix ${want_prefix#"${WORK}"/}, root ${want_root#"${WORK}"/})"
+  else
+    fail "${version}: ${label}: statuses ${PREFIX_RC}/${ROOT_RC}, prefix [${PREFIX_RAW%$'\n'}], root [${ROOT_RAW%$'\n'}]; want [${want_prefix}] [${want_root}]"
+  fi
 }
 
 ran=0
@@ -124,7 +150,7 @@ for version in 8.1.0 10.9.2 11.20.0 12.2.1; do
     expect "location=global in the project .npmrc" no "${version}" "${P}" "${P}" -- -- root
   fi
   printf 'workspaces=true\n' > "${P}/.npmrc"
-  expect "workspaces=true in the project .npmrc is undetermined (no pin)" no "${version}" "${P}" "${P}" -- -- root
+  expect "workspaces=true in the project .npmrc: npm errors (no pin)" error "${version}" "${P}" "${P}" -- -- root
   rm -f "${P}/.npmrc"
   # the workspace member that is its own git repository
   if [[ "${version}" == 8.1.0 ]]; then
@@ -136,44 +162,93 @@ for version in 8.1.0 10.9.2 11.20.0 12.2.1; do
   fi
   expect "a pinned root, typed in the root" yes "${version}" "${R}" "${R}" -- -- root
   expect "an explicit prefix on the member beats the search" yes "${version}" "${M}" "${M}" -- -- root --prefix="${M}"
-  expect "a workspace selection is undetermined" no "${version}" "${R}" "${R}" -- -- root -w pkg
+  expect "a workspace selection: npm errors (no pin)" error "${version}" "${R}" "${R}" -- -- root -w pkg
   # an abbreviation npm reads as --prefix
   if [[ "${version}" == 12.2.1 ]]; then
-    expect "--prefi is an error on 12 (undetermined)" no "${version}" "${M}" "${M}" -- -- root --prefi="${M}"
+    expect "--prefi is an error on 12 (no pin)" error "${version}" "${M}" "${M}" -- -- root --prefi="${M}"
   else
     expect "--prefi is --prefix to npm" yes "${version}" "${M}" "${M}" -- -- root --prefi="${M}"
   fi
-  # the project named `lib` under a global prefix: the roots coincide, the prefix tells the mode (npm's own answers, per version)
-  GP="${WORK}/gp"; mkdir -p "${GP}/lib/node_modules" "${GP}/lib"
+  # the project named `lib` under a global prefix: the roots coincide, the PREFIX tells the mode. The raw paths npm printed are asserted
+  GP="${WORK}/gp"; mkdir -p "${GP}/lib/node_modules"
   printf '{"name":"lib","version":"1.0.0"}\n' > "${GP}/lib/package.json"
   GP="$(cd "${GP}" && pwd -P)"
-  expect "a project named lib under the global prefix, local mode, pinned" yes "${version}" "${GP}/lib" "${GP}/lib" -- npm_config_prefix="${GP}" -- root
-  expect "the same directory, global mode, the project pinned: the root coincides, the prefix does not" no "${version}" "${GP}/lib" "${GP}/lib" -- npm_config_prefix="${GP}" -- root -g
-  expect "global mode from the environment" no "${version}" "${GP}/lib" "${GP}/lib" -- npm_config_prefix="${GP}" npm_config_global=true -- root
-  # global mode from every configuration file
-  for place in "${P}/.npmrc" "${WORK}/home/.npmrc"; do
-    printf 'global=true\n' > "${place}"
-    expect "global=true in ${place##*/} of $(basename "$(dirname "${place}")")" no "${version}" "${P}" "${P}" -- -- root
-    rm -f "${place}"
-  done
-  printf 'global=true\n' > "${WORK}/globalrc"
-  expect "global=true in the global config file" no "${version}" "${P}" "${P}" -- npm_config_globalconfig="${WORK}/globalrc" -- root
+  expect_paths "a project named lib under the global prefix, local mode" "${version}" "${GP}/lib" "${GP}/lib/node_modules" "${GP}/lib" "${GP}/lib" -- npm_config_prefix="${GP}" -- root
+  expect_paths "the same directory, global mode: the roots coincide, the prefixes do not" "${version}" "${GP}" "${GP}/lib/node_modules" "${GP}/lib" "${GP}/lib" -- npm_config_prefix="${GP}" -- root -g
+  expect "the local pair is honoured" yes "${version}" "${GP}/lib" "${GP}/lib" -- npm_config_prefix="${GP}" -- root
+  expect "the global pair is not honoured (the project is pinned)" no "${version}" "${GP}/lib" "${GP}/lib" -- npm_config_prefix="${GP}" -- root -g
+  expect_paths "global mode from the environment" "${version}" "${GP}" "${GP}/lib/node_modules" "${GP}/lib" "${GP}/lib" -- npm_config_prefix="${GP}" npm_config_global=true -- root
+  expect "global mode from the environment is not honoured" no "${version}" "${GP}/lib" "${GP}/lib" -- npm_config_prefix="${GP}" npm_config_global=true -- root
+  # global mode from every configuration file (project, user, global), the raw paths first
+  printf 'global=true\nprefix=%s\n' "${GP}" > "${GP}/lib/.npmrc"
+  expect_paths "global=true in the project .npmrc" "${version}" "${GP}" "${GP}/lib/node_modules" "${GP}/lib" "${GP}/lib" -- -- root
+  expect "global=true in the project .npmrc is not honoured" no "${version}" "${GP}/lib" "${GP}/lib" -- -- root
+  rm -f "${GP}/lib/.npmrc"
+  printf 'global=true\nprefix=%s\n' "${GP}" > "${ORACLE_HOME}/.npmrc"
+  expect_paths "global=true in the user config file" "${version}" "${GP}" "${GP}/lib/node_modules" "${GP}/lib" "${GP}/lib" -- -- root
+  rm -f "${ORACLE_HOME}/.npmrc"
+  printf 'global=true\nprefix=%s\n' "${GP}" > "${WORK}/globalrc"
+  expect_paths "global=true in the global config file" "${version}" "${GP}" "${GP}/lib/node_modules" "${GP}/lib" "${GP}/lib" -- npm_config_globalconfig="${WORK}/globalrc" -- root
+  expect "global=true in the global config file is not honoured" no "${version}" "${GP}/lib" "${GP}/lib" -- npm_config_globalconfig="${WORK}/globalrc" -- root
   rm -f "${WORK}/globalrc"
-  # housekeeping on the command line: an earlier --logs-max=1 and an option terminator change no answer, and nothing is written or contacted
+  # an original --logs-max=1, a terminator and --- change no answer
   expect "an earlier --logs-max=1 and a terminator" yes "${version}" "${P}" "${P}" -- -- root clean@2.0.0 --logs-max=1 -- --extra
-  # a FRESH home: the question writes no file (an empty cache directory may appear: npm makes it before it reads its options)
-  FRESH="${WORK}/fresh-${version}"; rm -rf "${FRESH}"; mkdir -p "${FRESH}"
-  node="${MISE}/${NODE_OF[${version}]}"
-  : > "${WORK}/trace"
-  ( cd "${P}" && env -i HOME="${FRESH}" PATH="${node}/bin:/usr/bin:/bin" strace -f -qq -e trace=connect -o "${WORK}/trace" \
-      timeout 20 npm root clean@2.0.0 --logs-max=1 --update-notifier=false --logs-max=0 -- --extra </dev/null >/dev/null 2>&1 )
-  if [[ -z "$(find "${FRESH}" -type f | head -1)" ]] && ! grep -qE 'sin6?_port=htons\((53|80|443)\)' "${WORK}/trace"; then
-    pass "${version}: the question writes no file and opens no connection"
-  else
-    fail "${version}: the question wrote a file ($(find "${FRESH}" -type f | head -2)) or connected ($(grep -E 'sin6?_port' "${WORK}/trace" | head -2))"
-  fi
+  expect "--- is a terminator" yes "${version}" "${P}" "${P}" -- -- root clean@2.0.0 --- --extra
+  expect "a trailing option that takes a value, given none" yes "${version}" "${P}" "${P}" -- -- root clean@2.0.0 --fetch-retries
   # an option BEFORE the command word stays in place: the question is the command with its word replaced
   expect "an option before the verb moves npm's target" no "${version}" "${P}" "${P}" -- -- --prefix="${WORK}/other" root clean@2.0.0
+
+  # ---- the populated home: nothing of the operator's changes, whatever the question is -----------------------------------------
+  # The production route (the helper, in the production order) runs both questions against a home that holds a debug log, an update-check
+  # stamp and a cache; the home (names, kinds, sizes, modes, nanosecond times, contents) is byte-identical after, for a plain command, a
+  # failing question (a workspace selection), a trailing value-taking option with no value, `---` and a terminator.
+  node="${MISE}/${NODE_OF[${version}]}"
+  POP="${WORK}/pop-${version}"
+  populate() {
+    rm -rf "${POP}"; mkdir -p "${POP}/.npm/_logs" "${POP}/.npm/_cacache/content-v2"
+    printf 'old debug log\n' > "${POP}/.npm/_logs/2020-01-01T00_00_00_000Z-debug-0.log"
+    printf 'stamp\n' > "${POP}/.npm/_update-notifier-last-checked"
+    printf 'cache entry\n' > "${POP}/.npm/_cacache/content-v2/entry"
+    touch -d '2020-01-01 00:00:00.123456789' "${POP}/.npm" "${POP}/.npm/_logs" "${POP}/.npm/_logs/"* "${POP}/.npm/_update-notifier-last-checked" "${POP}/.npm/_cacache" "${POP}/.npm/_cacache/content-v2" "${POP}/.npm/_cacache/content-v2/entry"
+  }
+  snapshot() { ( cd "${POP}" && find . -printf '%p %y %s %m %T@\n' | LC_ALL=C sort; find . -type f -exec sha256sum {} + | LC_ALL=C sort ) | sha256sum | cut -d' ' -f1; }
+  for variant in "plain|clean@2.0.0 --save-exact" "a workspace selection (the question fails)|clean@2.0.0 -w nothere" "a trailing option with no value|clean@2.0.0 --fetch-retries" "---|clean@2.0.0 --- --extra" "a terminator|clean@2.0.0 -- --extra"; do
+    label="${variant%%|*}"; line="${variant#*|}"
+    populate
+    before="$(snapshot)"
+    saved_home="${ORACLE_HOME}"; ORACLE_HOME="${POP}"
+    read -r -a vargs <<<"${line}"
+    read_answers "${version}" "${P}" -- root "${vargs[@]}"
+    ORACLE_HOME="${saved_home}"
+    after="$(snapshot)"
+    if [[ "${before}" == "${after}" ]]; then pass "${version}: populated home unchanged: ${label} (statuses ${PREFIX_RC}/${ROOT_RC})"; else fail "${version}: populated home CHANGED: ${label}"; fi
+  done
+  # what is written when the caller's own line names a cache or a logs directory: npm writes there as the command itself would
+  populate; before="$(snapshot)"
+  mkdir -p "${WORK}/callers-cache"; rm -rf "${WORK}/callers-cache"/*
+  saved_home="${ORACLE_HOME}"; ORACLE_HOME="${POP}"
+  read_answers "${version}" "${P}" -- root clean@2.0.0 --cache="${WORK}/callers-cache"
+  ORACLE_HOME="${saved_home}"
+  printf '# npm %s, the caller names --cache: %s file(s) appeared in it; the home itself: %s\n' "${version}" "$(find "${WORK}/callers-cache" -type f | wc -l)" "$([[ "$(snapshot)" == "${before}" ]] && echo unchanged || echo changed)"
+  # the environment naming a cache or a logs directory loses to the question's own options
+  populate; before="$(snapshot)"
+  rm -rf "${WORK}/env-cache"; mkdir -p "${WORK}/env-cache"
+  saved_home="${ORACLE_HOME}"; ORACLE_HOME="${POP}"
+  read_answers "${version}" "${P}" npm_config_cache="${WORK}/env-cache" npm_config_logs_dir="${WORK}/env-cache/_logs" -- root clean@2.0.0
+  ORACLE_HOME="${saved_home}"
+  if [[ "$(snapshot)" == "${before}" && -z "$(find "${WORK}/env-cache" -type f | head -1)" ]]; then pass "${version}: a cache and a logs directory named by the environment receive nothing"; else fail "${version}: the environment's cache or logs directory was written"; fi
+
+  # ---- no connection, no file, on a FRESH home (the trace's own status counts; the class claimed is any internet-family connect) ----
+  FRESH="${WORK}/fresh-${version}"; rm -rf "${FRESH}"; mkdir -p "${FRESH}"
+  : > "${WORK}/trace"
+  ( cd "${P}" && env -i HOME="${FRESH}" PATH="${node}/bin:/usr/bin:/bin" GATE_LIB="${ROOT}/lib/gate-lib.sh" WD="${WORK}" \
+      strace -f -q -e trace=connect -o "${WORK}/trace" \
+      bash -c 'source "${GATE_LIB}"; SAFE_GATE_SUBCMD_IDX=1; s="$(mktemp -d "${WD}/tr.XXXXXX")"; safe_gate_project_lane_pin_npm_line root "${s}" install clean@2.0.0 --logs-max=1 -- --extra; rc=$?; rm -rf "${s}"; exit "${rc}"' </dev/null >/dev/null 2>&1 ); rc=$?
+  if (( rc == 0 )) && grep -q '+++ exited with 0 +++' "${WORK}/trace" && [[ -z "$(find "${FRESH}" -type f | head -1)" ]] && ! grep -qE 'AF_INET6?, ' "${WORK}/trace"; then
+    pass "${version}: the question writes no file and opens no internet connection (the trace ran: status 0, exit recorded)"
+  else
+    fail "${version}: the question wrote a file ($(find "${FRESH}" -type f | head -2)), connected ($(grep -E 'AF_INET' "${WORK}/trace" | head -2)) or its trace failed (status ${rc})"
+  fi
 done
 (( ran > 0 )) || { printf 'SKIP: no npm build to ask\n'; exit 0; }
 

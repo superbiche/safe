@@ -165,6 +165,7 @@ tool="$(basename -- "$0")"
 # What the process was handed, before anything is re-read (the lane's npm gets an
 # allow-listed environment, so the case's knobs travel in a file under HOME).
 stub_env_names_before="$(env | cut -d= -f1 | LC_ALL=C sort | tr '\n' ' ')"
+stub_env_dump_before="$(env | grep -v '^\(_\|SHLVL\|PWD\|OLDPWD\)=' | LC_ALL=C sort)"
 stub_env_safe_before="$(env | grep -E '^(SAFE_GATE_|BASH_FUNC_|npm_test_family=|lane_rc=)' | LC_ALL=C sort | tr '\n' ' ')"
 if [[ -n "${HOME:-}" && -r "${HOME}/.stub-env0" ]]; then
   while IFS= read -r -d '' kv; do
@@ -349,10 +350,15 @@ stub_release_age_json() {
 # NPM_STUB_ROOT_ANSWER / NPM_STUB_PREFIX_ANSWER / NPM_STUB_ROOT_STATUS / NPM_STUB_ROOT_LATE_STATUS script an answer.
 if [[ "${tool}" == "npm" ]]; then
   stub_word=""
+  # the environment this npm received (the question's and the command's are compared by the cases)
+  stub_envfile="${SAFE_INSTALL_COMMAND_LOG}.env.command"
+  for arg in "$@"; do [[ "${arg}" == "root" || "${arg}" == "prefix" ]] && stub_envfile="${SAFE_INSTALL_COMMAND_LOG}.env.question"; done
+  printf '%s\n' "${stub_env_dump_before}" > "${stub_envfile}"
   for arg in "$@"; do [[ "${arg}" == "--" ]] && break; [[ "${arg}" == "root" || "${arg}" == "prefix" ]] && stub_word="${arg}"; done
   if [[ -n "${stub_word}" ]]; then
     stub_housekeeping=no
-    [[ " $* " == *" --update-notifier=false --logs-max=0 "* || " $* " == *" --update-notifier=false --logs-max=0 -- "* ]] && stub_housekeeping=yes
+    [[ "$1" == --cache=/* && "$2" == "--logs-dir=${1#--cache=}/_logs" && "$3" == --update-notifier=false ]] && stub_housekeeping=yes
+    printf 'SCRATCH\t%s\t%s\n' "${1#--cache=}" "$(stat -c %a "${1#--cache=}" 2>/dev/null)" >> "${SAFE_INSTALL_COMMAND_LOG}"
     printf 'ROOT_ENV\t%s\tenv_update_notifier=%s\tenv_logs_max=%s\tstdin_tty=%s\tcli_housekeeping=%s\n' "${stub_word}" "${npm_config_update_notifier:-}" "${npm_config_logs_max:-}" "$([[ -t 0 ]] && echo yes || echo no)" "${stub_housekeeping}" >> "${SAFE_INSTALL_COMMAND_LOG}"
     [[ -z "${NPM_STUB_HANG:-}" ]] || sleep 60
     [[ -z "${NPM_STUB_ROOT_STATUS:-}" ]] || exit "${NPM_STUB_ROOT_STATUS}"
@@ -16225,8 +16231,8 @@ case_project_lane_standing_a_pinned_project_takes_the_one_shot_route() {
   [[ "$(grep -c '^safe: BLOCKED' "${ERR_FILE}")" -eq 0 ]] || { fail "$FUNCNAME: a refusal line"; return; }
   [[ "$(standing_root_asked)" == 2 ]] || { fail "$FUNCNAME: npm (two questions: prefix, root) was asked $(standing_root_asked) times"; return; }
   # TWO read-only answers from the same npm, each the command with its word replaced; the housekeeping is on the command line
-  grep -qP '^REAL\tnpm\troot\tclean@2.0.0\t--update-notifier=false\t--logs-max=0$' "${LOG_FILE}" || { fail "$FUNCNAME: the root question: $(grep -P '\troot' "${LOG_FILE}")"; return; }
-  grep -qP '^REAL\tnpm\tprefix\tclean@2.0.0\t--update-notifier=false\t--logs-max=0$' "${LOG_FILE}" || { fail "$FUNCNAME: the prefix question: $(grep -P '\tprefix' "${LOG_FILE}")"; return; }
+  grep -qP '^REAL\tnpm\t--cache=/\S+/safe-pin\.\S+\t--logs-dir=\S+/_logs\t--update-notifier=false\troot\tclean@2.0.0$' "${LOG_FILE}" || { fail "$FUNCNAME: the root question: $(grep -P '\troot' "${LOG_FILE}")"; return; }
+  grep -qP '^REAL\tnpm\t--cache=/\S+/safe-pin\.\S+\t--logs-dir=\S+/_logs\t--update-notifier=false\tprefix\tclean@2.0.0$' "${LOG_FILE}" || { fail "$FUNCNAME: the prefix question: $(grep -P '\tprefix' "${LOG_FILE}")"; return; }
   [[ "$(grep -c $'^ROOT_ENV\t' "${LOG_FILE}")" == 2 ]] && ! grep $'^ROOT_ENV\t' "${LOG_FILE}" | grep -qv $'env_update_notifier=\tenv_logs_max=\tstdin_tty=no\tcli_housekeeping=yes' || { fail "$FUNCNAME: the question's environment: $(grep ROOT_ENV "${LOG_FILE}")"; return; }
   [[ "$(grep -cP '^REAL\tnpm\tinstall\tclean@2.0.0' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: not one delegation"; return; }
   assert_no_standing_lane_operation "$FUNCNAME" || return
@@ -16294,12 +16300,12 @@ case_project_lane_standing_the_question_carries_every_argument_of_the_command() 
   # an option BEFORE the verb that points npm elsewhere: the question keeps it in place, npm's answer is the other directory
   : > "${LOG_FILE}"
   lane_run "npm --prefix ${other} install clean@2.0.0"
-  grep -qP "^REAL\tnpm\t--prefix\t${other}\troot\tclean@2.0.0\t--update-notifier=false\t--logs-max=0\$" "${LOG_FILE}" || { fail "$FUNCNAME: the question lost the selector: $(grep -P '\troot' "${LOG_FILE}")"; return; }
+  grep -qP "^REAL\tnpm\t--cache=/\S+/safe-pin\.\S+\t--logs-dir=\S+/_logs\t--update-notifier=false\t--prefix\t${other}\troot\tclean@2.0.0\$" "${LOG_FILE}" || { fail "$FUNCNAME: the question lost the selector: $(grep -P '\troot' "${LOG_FILE}")"; return; }
   grep -q 'the operator put this project on the one-shot route' "${ERR_FILE}" && { fail "$FUNCNAME: an option before the verb lent the pin to another project"; return; }
   # the option terminator stays where it was
   : > "${LOG_FILE}"
   lane_run 'npm install clean@2.0.0 -- --extra'
-  grep -qP '^REAL\tnpm\troot\tclean@2.0.0\t--update-notifier=false\t--logs-max=0\t--\t--extra$' "${LOG_FILE}" || { fail "$FUNCNAME: the terminator moved: $(grep -P '\troot' "${LOG_FILE}")"; return; }
+  grep -qP '^REAL\tnpm\t--cache=/\S+/safe-pin\.\S+\t--logs-dir=\S+/_logs\t--update-notifier=false\troot\tclean@2.0.0\t--\t--extra$' "${LOG_FILE}" || { fail "$FUNCNAME: the terminator moved: $(grep -P '\troot' "${LOG_FILE}")"; return; }
   # global mode (the stub prints a lib/node_modules under a prefix nobody pinned, even for the pinned directory itself)
   : > "${LOG_FILE}"
   lane_run "npm install clean@2.0.0 -g --prefix=${project}"
@@ -16526,7 +16532,7 @@ case_project_lane_standing_the_question_leaves_the_callers_environment_alone() {
   standing_add || return
   : > "${LOG_FILE}"
   npm_config_update_notifier=true npm_config_logs_max=5 lane_run 'npm install clean@2.0.0 --logs-max=1 -- --extra'
-  grep -qP '^REAL\tnpm\troot\tclean@2.0.0\t--logs-max=1\t--update-notifier=false\t--logs-max=0\t--\t--extra$' "${LOG_FILE}" || { fail "$FUNCNAME: the question's line: $(grep -P '\troot' "${LOG_FILE}")"; return; }
+  grep -qP '^REAL\tnpm\t--cache=/\S+/safe-pin\.\S+\t--logs-dir=\S+/_logs\t--update-notifier=false\troot\tclean@2.0.0\t--logs-max=1\t--\t--extra$' "${LOG_FILE}" || { fail "$FUNCNAME: the question's line: $(grep -P '\troot' "${LOG_FILE}")"; return; }
   grep -P '^ROOT_ENV\t' "${LOG_FILE}" | grep -qP 'env_update_notifier=true\tenv_logs_max=5' || { fail "$FUNCNAME: the caller's environment was changed: $(grep ROOT_ENV "${LOG_FILE}")"; return; }
   pass "$FUNCNAME"
 }
@@ -16573,9 +16579,9 @@ case_project_lane_standing_the_question_goes_through_the_delegate_the_command_wi
   printf '#!/usr/bin/env bash\nprintf "%%s|%%s\\n" "${0##*/}" "$*"\n' > "${realbin}/mise"
   chmod +x "${realbin}/mise"
   got="$(PATH="${bindir}:${shimdir}:${realbin}:/usr/bin:/bin" GATE_LIB="${ROOT_DIR}/lib/gate-lib.sh" \
-    bash -c 'source "${GATE_LIB}"; SAFE_GATE_SUBCMD_IDX=1; safe_gate_project_lane_pin_npm_line root install clean@2.0.0 -- --x; printf "%s" "${SAFE_GATE_PIN_ANSWER}"' 2>&1)"
+    bash -c 'source "${GATE_LIB}"; SAFE_GATE_SUBCMD_IDX=1; safe_gate_project_lane_pin_npm_line root /scratch install clean@2.0.0 -- --x; printf "%s" "${SAFE_GATE_PIN_ANSWER}"' 2>&1)"
   # (the stub is a script, whose $0 is its own path: argv[0] itself is the shared resolver's, held by the exec cases)
-  [[ "${got}" == 'mise|root clean@2.0.0 --update-notifier=false --logs-max=0 -- --x' ]] || { printf 'got: %s\n' "${got}" >&2; fail "$FUNCNAME: the question did not go through the shim's real mise"; return; }
+  [[ "${got}" == 'mise|--cache=/scratch --logs-dir=/scratch/_logs --update-notifier=false root clean@2.0.0 -- --x' ]] || { printf 'got: %s\n' "${got}" >&2; fail "$FUNCNAME: the question did not go through the shim's real mise"; return; }
   pass "$FUNCNAME"
 }
 
@@ -16591,6 +16597,126 @@ case_project_lane_standing_an_npm_that_never_answers_is_bounded() {
   (( SECONDS - began < 40 )) || { fail "$FUNCNAME: the question was not bounded ($((SECONDS - began)) s)"; return; }
   grep -q 'the operator put this project on the one-shot route' "${ERR_FILE}" && { fail "$FUNCNAME: an answer that never came was honoured"; return; }
   grep -q $'^PROJECTION\tnpm' "${LOG_FILE}" || { fail "$FUNCNAME: the lane did not go on"; return; }
+  pass "$FUNCNAME"
+}
+
+# 19. (review 2, findings 1 and 3) The question gives npm a cache and a logs directory of safe's own, private and removed whatever ends
+# the question; it never asks npm to keep no logs; its options are the first arguments, each with its value attached.
+case_project_lane_standing_the_question_has_a_private_scratch_and_leaves_nothing() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-standing-scratch" kept@1.0.0
+  lane_safe_run_stub
+  standing_add || return
+  local line path mode
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_REAL_STATUS=7 lane_run 'npm install clean@2.0.0 --fetch-retries'
+  unset SAFE_INSTALL_REAL_STATUS
+  [[ "$(grep -c $'^SCRATCH\t' "${LOG_FILE}")" == 2 ]] || { fail "$FUNCNAME: the two questions did not run in a scratch directory: $(grep -c SCRATCH "${LOG_FILE}")"; return; }
+  while IFS=$'\t' read -r _ path mode; do
+    [[ "${mode}" == 700 ]] || { fail "$FUNCNAME: the scratch directory was not private (${mode})"; return; }
+    [[ ! -e "${path}" ]] || { fail "$FUNCNAME: the scratch directory ${path} was left behind"; return; }
+  done < <(grep $'^SCRATCH\t' "${LOG_FILE}")
+  # the question never asks npm to keep no logs, and the options stay in front of an option that takes a value
+  ! grep -P '^REAL\tnpm\t.*\t(root|prefix)\t' "${LOG_FILE}" | grep -q -- '--logs-max' || { fail "$FUNCNAME: the question asked npm to keep no logs"; return; }
+  grep -qP '^REAL\tnpm\t--cache=\S+\t--logs-dir=\S+/_logs\t--update-notifier=false\troot\tclean@2.0.0\t--fetch-retries$' "${LOG_FILE}" || { fail "$FUNCNAME: the question's line: $(grep -P '\troot' "${LOG_FILE}")"; return; }
+  # a question that fails leaves nothing either
+  : > "${LOG_FILE}"
+  NPM_STUB_ROOT_STATUS=1 lane_run 'npm install clean@2.0.0'
+  [[ "$(grep -c $'^SCRATCH\t' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: a failed question did not stop at its first answer"; return; }
+  while IFS=$'\t' read -r _ path mode; do
+    [[ ! -e "${path}" ]] || { fail "$FUNCNAME: a failed question left ${path}"; return; }
+  done < <(grep $'^SCRATCH\t' "${LOG_FILE}")
+  # a question stopped by the deadline leaves nothing
+  lane_reset_project
+  : > "${LOG_FILE}"
+  NPM_STUB_HANG=1 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  while IFS=$'\t' read -r _ path mode; do
+    [[ ! -e "${path}" ]] || { fail "$FUNCNAME: a question stopped by the deadline left ${path}"; return; }
+  done < <(grep $'^SCRATCH\t' "${LOG_FILE}")
+  pass "$FUNCNAME"
+}
+
+# 20. (review 2, finding 2) One function prepares the environment of an npm command, for the exec and for the question: what the question
+# received is what the delegate received, except the names only known after the gate has judged the command.
+case_project_lane_standing_the_question_gets_the_environment_the_delegate_gets() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-standing-envparity" kept@1.0.0
+  lane_safe_run_stub
+  standing_add || return
+  mkdir -p "${HOME_DIR}/.config/safe"
+  printf '// scanner\n' > "${HOME_DIR}/.config/safe/scanner.mjs"
+  : > "${LOG_FILE}"; rm -f "${LOG_FILE}.env.question" "${LOG_FILE}.env.command"
+  # the caller's script policy (removed by the gate before the command) and a scanner adapter (added by it)
+  SAFE_CONFIG_DIR="${HOME_DIR}/.config/safe" npm_config_ignore_scripts=false SAFE_INSTALL_REAL_STATUS=7 lane_run 'npm install clean@2.0.0'
+  unset SAFE_INSTALL_REAL_STATUS
+  [[ -s "${LOG_FILE}.env.question" && -s "${LOG_FILE}.env.command" ]] || { fail "$FUNCNAME: no environment was recorded (question: $(wc -c < "${LOG_FILE}.env.question" 2>/dev/null), command: $(wc -c < "${LOG_FILE}.env.command" 2>/dev/null))"; return; }
+  grep -q '^AUBE_SECURITY_SCANNER=' "${LOG_FILE}.env.command" || { fail "$FUNCNAME: the delegate did not get the scanner adapter (the case proves nothing)"; return; }
+  ! grep -qi "^npm_config_ignore_scripts=" "${LOG_FILE}.env.command" || { fail "$FUNCNAME: the delegate kept the caller's script policy (the case proves nothing)"; return; }
+  ! grep -qi '^npm_config_ignore_scripts=' "${LOG_FILE}.env.question" || { fail "$FUNCNAME: the question kept the caller's script policy"; return; }
+  grep -q '^AUBE_SECURITY_SCANNER=' "${LOG_FILE}.env.question" || { fail "$FUNCNAME: the question lacked the scanner adapter"; return; }
+  # no grant is stored in this case: nothing may differ (with a scripts-allow grant, only the injected npm_config_{ignore,allow,strict_allow}_scripts)
+  local differ
+  # (the harness hands the lane's own four variables to every run as empty strings; they are not in a caller's environment)
+  differ="$(diff <(grep -v '^SAFE_GATE_LANE_\(EXTRA_ENV\|LOCKFD\|NPM\|SCRATCH\)=$' "${LOG_FILE}.env.question") <(grep -v '^SAFE_GATE_LANE_\(EXTRA_ENV\|LOCKFD\|NPM\|SCRATCH\)=$' "${LOG_FILE}.env.command") | grep '^[<>]' | sed 's/^[<>] //; s/=.*//' | sort -u || true)"
+  [[ -z "${differ}" ]] || { fail "$FUNCNAME: the question and the delegate differ in: ${differ}"; return; }
+  pass "$FUNCNAME"
+}
+
+# 21. (review 2, finding 5; the switch is off) The ordinary exec leaves the caller's variables alone: a value the caller exported
+# reaches the delegate as it was.
+case_gate_exec_leaves_the_callers_delegate_variables_alone() {
+  prepare_case "exec-caller-vars"
+  local delegates="${CASE_DIR}/delegates" out
+  mkdir -p "${delegates}"
+  printf '#!/bin/sh\nenv | grep "^SAFE_GATE_DELEGATE_" | sort\n' > "${delegates}/npm"
+  chmod +x "${delegates}/npm"
+  out="$(cd "${CASE_DIR}" && env -i HOME="${HOME_DIR}" PATH="${delegates}:/usr/bin:/bin" SAFE_GATE_DELEGATE_REAL=original-path SAFE_GATE_DELEGATE_ARGV0=original-name \
+    bash "${ROOT_DIR}/bin/safe" gate npm -- --version 2>&1)"
+  [[ "${out}" == $'SAFE_GATE_DELEGATE_ARGV0=original-name\nSAFE_GATE_DELEGATE_REAL=original-path' ]] || { printf '%s\n' "${out}" >&2; fail "$FUNCNAME: the delegate did not get the caller's values"; return; }
+  pass "$FUNCNAME"
+}
+
+# 22. (review 2, finding 4) One deadline covers the whole route, the core's version check and the delegate's resolution included: a
+# core that answers --version after 13 s, or a resolution that takes 13 s, is no pin, within the bound, and leaves nothing behind.
+case_project_lane_standing_one_deadline_covers_the_whole_route() {
+  prepare_case "lane-standing-deadline"
+  local sdir="${CASE_DIR}/safedir" began took
+  mkdir -p "${sdir}" "${CASE_DIR}/tmp"
+  cat > "${sdir}/safe-core" <<'CORE'
+#!/bin/sh
+case "$1" in
+  --version) [ -z "${SLOW_VERSION:-}" ] || sleep 13; printf '%s\n' "${SAFE_VERSION_FOR_STUB}" ;;
+  one-shot-store) [ "$2" = check ] && exit 0; exit 1 ;;
+esac
+CORE
+  chmod +x "${sdir}/safe-core"
+  local route='source "${GATE_LIB}"; SAFE_DIR="${SDIR}" SAFE_VERSION=1.0.0-test; SAFE_GATE_SUBCMD_IDX=1; [[ -z "${SLOW_RESOLVE:-}" ]] || safe_gate_resolve_delegate() { [[ "${SLOW_RESOLVE}" != stubborn ]] || trap "" TERM; sleep 13; }; safe_gate_project_lane_pin_route install install clean@2.0.0; echo "rc=$?"'
+  local slow
+  for slow in SLOW_VERSION SLOW_RESOLVE SLOW_RESOLVE_STUBBORN; do
+    began=${SECONDS}
+    out="$(env "${slow%_STUBBORN}=$([[ "${slow}" == *_STUBBORN ]] && echo stubborn || echo 1)" SAFE_VERSION_FOR_STUB=1.0.0-test HOME="${HOME_DIR}" TMPDIR="${CASE_DIR}/tmp" SDIR="${sdir}" GATE_LIB="${ROOT_DIR}/lib/gate-lib.sh" PATH="/usr/bin:/bin" bash -c "${route}" 2>&1)"
+    took=$(( SECONDS - began ))
+    [[ "${out}" == "rc=1" ]] || { fail "$FUNCNAME: ${slow}: ${out}"; return; }
+    (( took < 13 )) || { fail "$FUNCNAME: ${slow}: the route took ${took} s"; return; }
+    [[ -z "$(ls -A "${CASE_DIR}/tmp")" ]] || { fail "$FUNCNAME: ${slow}: left $(ls "${CASE_DIR}/tmp")"; return; }
+  done
+  pass "$FUNCNAME"
+}
+
+# 23. (review 2, finding 2) The scrub of the caller's script policy reaches names that are not shell identifiers (npm accepts hyphenated
+# npm_config_* keys): the question, like the exec, drops them through env -u.
+case_project_lane_standing_the_question_drops_a_hyphenated_script_policy_name() {
+  prepare_case "lane-standing-hyphen"
+  local delegates="${CASE_DIR}/delegates" got
+  mkdir -p "${delegates}"
+  printf '#!/bin/sh\nenv | grep -i "ignore.scripts" | sort\n' > "${delegates}/npm"
+  chmod +x "${delegates}/npm"
+  got="$(env 'npm_config_ignore-scripts=false' npm_config_ignore_scripts=false PATH="${delegates}:/usr/bin:/bin" HOME="${HOME_DIR}" GATE_LIB="${ROOT_DIR}/lib/gate-lib.sh" \
+    bash -c 'source "${GATE_LIB}"; SAFE_GATE_SUBCMD_IDX=1; safe_gate_project_lane_pin_npm_line root /scratch install x; printf "[%s]" "${SAFE_GATE_PIN_ANSWER}"' 2>&1)"
+  [[ "${got}" == "[]" ]] || { printf 'got: %s\n' "${got}" >&2; fail "$FUNCNAME: the question kept a script-policy name"; return; }
+  # control: the same delegate, asked directly, sees both names (the case would prove nothing otherwise)
+  got="$(env 'npm_config_ignore-scripts=false' npm_config_ignore_scripts=false "${delegates}/npm" 2>&1 | wc -l)"
+  [[ "${got}" == 2 ]] || { fail "$FUNCNAME: the control saw ${got} names"; return; }
   pass "$FUNCNAME"
 }
 
@@ -16923,6 +17049,11 @@ main() {
     case_project_lane_standing_the_pin_is_read_before_the_lane_refuses \
     case_project_lane_standing_a_node_modules_link_is_not_honoured \
     case_project_lane_standing_an_npm_that_never_answers_is_bounded \
+    case_project_lane_standing_the_question_has_a_private_scratch_and_leaves_nothing \
+    case_project_lane_standing_the_question_gets_the_environment_the_delegate_gets \
+    case_gate_exec_leaves_the_callers_delegate_variables_alone \
+    case_project_lane_standing_one_deadline_covers_the_whole_route \
+    case_project_lane_standing_the_question_drops_a_hyphenated_script_policy_name \
     case_project_lane_standing_the_question_goes_through_the_delegate_the_command_will_run \
     case_project_lane_standing_a_withdrawn_project_takes_the_lane_and_the_switch_off_changes_nothing \
     case_project_lane_oneshot_each_confirmable_kind_hands_the_command_over \
