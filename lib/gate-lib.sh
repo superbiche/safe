@@ -3790,8 +3790,7 @@ safe_gate_project_lane_pin_core() {
 safe_gate_project_lane_pin_here() {
   local core rc=0
   core="$(safe_gate_project_lane_pin_core)" || return 1
-  command -v timeout >/dev/null 2>&1 || return 1
-  timeout --kill-after=2s 10s "${core}" one-shot-store check </dev/null >/dev/null 2>&1 || rc=$?
+  "${core}" one-shot-store check </dev/null >/dev/null 2>&1 || rc=$?
   case "${rc}" in 0) return 0 ;; 2) return 2 ;; *) return 1 ;; esac
 }
 
@@ -3823,7 +3822,7 @@ safe_gate_project_lane_pin_npm_line() {
     else
       launch+=("${real}")
     fi
-    timeout --kill-after=2s 10s "${launch[@]}" "--cache=${scratch}" "--logs-dir=${scratch}/_logs" --update-notifier=false "${argv[@]}" </dev/null 2>/dev/null | head -c 4097
+    "${launch[@]}" "--cache=${scratch}" "--logs-dir=${scratch}/_logs" --update-notifier=false "${argv[@]}" </dev/null 2>/dev/null | head -c 4097
     printf 'x%d' "${PIPESTATUS[0]}"
   )"
   rc="${out##*x}"
@@ -3838,14 +3837,13 @@ safe_gate_project_lane_pin_ask_npm() {
   local core prefix_answer scratch="$1" rc=0
   shift
   core="$(safe_gate_project_lane_pin_core)" || return 1
-  command -v timeout >/dev/null 2>&1 || return 1
   mkdir -m 700 -- "${scratch}" 2>/dev/null || return 1
   trap 'rm -rf -- "${scratch}"' EXIT
   trap 'rm -rf -- "${scratch}"; exit 1' HUP INT TERM
   safe_gate_project_lane_pin_npm_line prefix "${scratch}" "$@" || return 1
   prefix_answer="${SAFE_GATE_PIN_ANSWER}"
   safe_gate_project_lane_pin_npm_line root "${scratch}" "$@" || return 1
-  timeout --kill-after=2s 10s "${core}" one-shot-store verify "${prefix_answer}" "${SAFE_GATE_PIN_ANSWER}" </dev/null >/dev/null 2>&1 || rc=$?
+  "${core}" one-shot-store verify "${prefix_answer}" "${SAFE_GATE_PIN_ANSWER}" </dev/null >/dev/null 2>&1 || rc=$?
   (( rc == 0 ))
 }
 
@@ -3883,7 +3881,9 @@ safe_gate_project_lane_pin_bounded() {
   scratch="$(mktemp -u "${TMPDIR:-/tmp}/safe-pin.XXXXXXXX" 2>/dev/null)" || return 1
   [[ "${scratch}" == /* ]] || return 1
   deadline=$(( $(safe_gate_project_lane_pin_now_ms) + 10000 ))
-  # its own process group, so that the deadline stops everything the lookup started (the core, npm), not only the subshell
+  # its own process group, so that the deadline stops everything the lookup started (the core, npm), not only the subshell. Nothing
+  # in the lookup runs under timeout(1): it would move its command to another process group, and a question in flight would
+  # outlive the deadline (and write in a scratch directory already removed)
   [[ $- != *m* ]] || monitor=1
   set -m
   ( safe_gate_project_lane_pin_lookup "${scratch}" "$@" ) </dev/null >/dev/null &

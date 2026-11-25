@@ -360,7 +360,11 @@ if [[ "${tool}" == "npm" ]]; then
     [[ "$1" == --cache=/* && "$2" == "--logs-dir=${1#--cache=}/_logs" && "$3" == --update-notifier=false ]] && stub_housekeeping=yes
     printf 'SCRATCH\t%s\t%s\n' "${1#--cache=}" "$(stat -c %a "${1#--cache=}" 2>/dev/null)" >> "${SAFE_INSTALL_COMMAND_LOG}"
     printf 'ROOT_ENV\t%s\tenv_update_notifier=%s\tenv_logs_max=%s\tstdin_tty=%s\tcli_housekeeping=%s\n' "${stub_word}" "${npm_config_update_notifier:-}" "${npm_config_logs_max:-}" "$([[ -t 0 ]] && echo yes || echo no)" "${stub_housekeeping}" >> "${SAFE_INSTALL_COMMAND_LOG}"
-    [[ -z "${NPM_STUB_HANG:-}" ]] || sleep 60
+    if [[ -n "${NPM_STUB_HANG:-}" ]]; then
+      # a beat: a question still alive this long after it began says so, then goes on hanging
+      [[ -z "${NPM_STUB_HANG_BEAT:-}" ]] || { sleep "${NPM_STUB_HANG_BEAT}"; printf 'SURVIVED\t%s\n' "${stub_word}" >> "${SAFE_INSTALL_COMMAND_LOG}"; }
+      sleep 60
+    fi
     [[ -z "${NPM_STUB_ROOT_STATUS:-}" ]] || exit "${NPM_STUB_ROOT_STATUS}"
     # a late status: the answer is printed, THEN npm exits with it (an answer from a failed run is no answer)
     [[ -z "${NPM_STUB_ROOT_LATE_STATUS:-}" ]] || trap 'exit "${NPM_STUB_ROOT_LATE_STATUS}"' EXIT
@@ -1183,6 +1187,7 @@ run_zsh() {
     NPM_STUB_PREFIX_ANSWER="${NPM_STUB_PREFIX_ANSWER:-}" \
     NPM_STUB_ROOT_STATUS="${NPM_STUB_ROOT_STATUS:-}" \
     NPM_STUB_HANG="${NPM_STUB_HANG:-}" \
+    NPM_STUB_HANG_BEAT="${NPM_STUB_HANG_BEAT:-}" \
     NPM_STUB_ROOT_LATE_STATUS="${NPM_STUB_ROOT_LATE_STATUS:-}" \
     SAFE_CORE_FAKE_VERSION="${SAFE_CORE_FAKE_VERSION:-}" \
     NPM_CI_CHECK_ERROR="${NPM_CI_CHECK_ERROR:-}" \
@@ -16600,6 +16605,29 @@ case_project_lane_standing_an_npm_that_never_answers_is_bounded() {
   pass "$FUNCNAME"
 }
 
+# 18b. The route's deadline reaches a question in flight. The data check takes 6 s here, so the question begins about 6 s into the
+# route and the deadline falls 4 s later: an npm still alive 5 s after it began has outlived the route. (A command run under
+# timeout(1) sits in a process group of its own and survives the kill of the route's group: no step of the route uses it.)
+case_project_lane_standing_the_deadline_stops_a_question_in_flight() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-standing-inflight" kept@1.0.0
+  lane_safe_run_stub
+  standing_add || return
+  local began=${SECONDS} path
+  : > "${LOG_FILE}"
+  export SAFE_CORE_SLEEP_SUB=one-shot-store SAFE_CORE_SLEEP=6
+  NPM_STUB_HANG=1 NPM_STUB_HANG_BEAT=5 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  unset SAFE_CORE_SLEEP_SUB SAFE_CORE_SLEEP
+  while (( SECONDS - began < 14 )); do sleep 1; done
+  grep -q $'^SCRATCH\t' "${LOG_FILE}" || { fail "$FUNCNAME: the question was never put, so the case proves nothing"; return; }
+  ! grep -q $'^SURVIVED\t' "${LOG_FILE}" || { fail "$FUNCNAME: an npm in flight outlived the route's deadline"; return; }
+  grep -q 'the operator put this project on the one-shot route' "${ERR_FILE}" && { fail "$FUNCNAME: an answer that never came was honoured"; return; }
+  while IFS=$'\t' read -r _ path _; do
+    [[ ! -e "${path}" ]] || { fail "$FUNCNAME: the scratch directory ${path} was left behind"; return; }
+  done < <(grep $'^SCRATCH\t' "${LOG_FILE}")
+  pass "$FUNCNAME"
+}
+
 # 19. (review 2, findings 1 and 3) The question gives npm a cache and a logs directory of safe's own, private and removed whatever ends
 # the question; it never asks npm to keep no logs; its options are the first arguments, each with its value attached.
 case_project_lane_standing_the_question_has_a_private_scratch_and_leaves_nothing() {
@@ -17049,6 +17077,7 @@ main() {
     case_project_lane_standing_the_pin_is_read_before_the_lane_refuses \
     case_project_lane_standing_a_node_modules_link_is_not_honoured \
     case_project_lane_standing_an_npm_that_never_answers_is_bounded \
+    case_project_lane_standing_the_deadline_stops_a_question_in_flight \
     case_project_lane_standing_the_question_has_a_private_scratch_and_leaves_nothing \
     case_project_lane_standing_the_question_gets_the_environment_the_delegate_gets \
     case_gate_exec_leaves_the_callers_delegate_variables_alone \

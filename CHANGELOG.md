@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Project lane, standing decision: the route's one deadline reaches a question in flight. No step of the route runs
+  under `timeout`, which puts its command in a process group of its own: an npm started late would have outlived the
+  deadline that stops the route's group, and written in a scratch directory already removed.
 - Project lane (still behind `install.project_lane`): the standing decision per project. `safe run one-shot-project add|remove|list`
   turns the lane OFF for a project: a command npm will run on it goes to today's gate with the one-shot line before the lane looks at
   anything (`dedupe` and `prune` to the older differential path); no approval, receipt or baseline. The store is read and written only
