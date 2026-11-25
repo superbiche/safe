@@ -16178,6 +16178,12 @@ standing_run_plain() {
   STATUS=$?
 }
 
+# add the project at the operator's terminal and require that it is stored: a case that goes on without the pin proves nothing
+standing_add() {
+  standing_run $'y\n' add "$@"
+  [[ "${STATUS}" == 0 && "$(standing_pins)" != null && "$(standing_pins)" != '[]' ]] || { fail "${FUNCNAME[1]}: the pin was not stored (${STATUS}): $(cat "${OUT_FILE}")"; return 1; }
+}
+
 standing_pins() { jq -c '[.projects[].path]' "$(lane_store)/one-shot-projects.json" 2>/dev/null || printf 'null'; }
 standing_physical() { ( cd "$1" && pwd -P ); }
 
@@ -16196,7 +16202,7 @@ case_project_lane_standing_a_pinned_project_takes_the_one_shot_route() {
   skip_lockdiff_case "$FUNCNAME" || return
   lane_prepare "lane-standing-route" kept@1.0.0
   lane_safe_run_stub
-  standing_run $'y\n' add
+  standing_add || return
   [[ "${STATUS}" == 0 && "$(standing_pins)" == "[\"$(standing_physical "${WORK_DIR}")\"]" ]] || { fail "$FUNCNAME: add: ${STATUS} $(cat "${OUT_FILE}")"; return; }
   : > "${LOG_FILE}"
   SAFE_INSTALL_REAL_STATUS=7 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
@@ -16255,7 +16261,7 @@ case_project_lane_standing_a_pin_follows_the_project_npm_acts_on() {
   grep -q 'the operator put this project on the one-shot route' "${ERR_FILE}" && { fail "$FUNCNAME: a pinned member lent its pin to the root npm acts on"; return; }
   # the ROOT is pinned: a command typed in the member reaches it (an ancestor), and npm confirms it is the root it acts on
   rm -f "$(lane_store)/one-shot-projects.json"
-  standing_run $'y\n' add
+  standing_add || return
   [[ "$(standing_pins)" == "[\"${root}\"]" ]] || { fail "$FUNCNAME: the root was not pinned"; return; }
   : > "${LOG_FILE}"
   SAFE_INSTALL_REAL_STATUS=7 WORK_DIR="${member}" lane_run 'npm install clean@2.0.0'
@@ -16268,7 +16274,7 @@ case_project_lane_standing_the_question_carries_every_argument_of_the_command() 
   skip_lockdiff_case "$FUNCNAME" || return
   lane_prepare "lane-standing-args" kept@1.0.0
   lane_safe_run_stub
-  standing_run $'y\n' add
+  standing_add || return
   local project other
   project="$(standing_physical "${WORK_DIR}")"; other="${CASE_DIR}/elsewhere"; mkdir -p "${other}"
   # an option BEFORE the verb that points npm elsewhere: the question keeps it in place, npm's answer is the other directory
@@ -16292,7 +16298,7 @@ case_project_lane_standing_an_undetermined_answer_from_npm_is_no_pin() {
   skip_lockdiff_case "$FUNCNAME" || return
   lane_prepare "lane-standing-undetermined" kept@1.0.0
   lane_safe_run_stub
-  standing_run $'y\n' add
+  standing_add || return
   local project row label status answer
   project="$(standing_physical "${WORK_DIR}")"
   for row in "an error exit|1|" "two lines||${project}/node_modules\\n${project}/node_modules" "no node_modules||${project}" "a relative line||node_modules" "another directory||/tmp/not-pinned/node_modules" "empty|0|" "a workspace selection|1|"; do
@@ -16327,7 +16333,7 @@ case_project_lane_standing_a_replaced_directory_is_not_honoured() {
   skip_lockdiff_case "$FUNCNAME" || return
   lane_prepare "lane-standing-replaced" kept@1.0.0
   lane_safe_run_stub
-  standing_run $'y\n' add
+  standing_add || return
   mv "${WORK_DIR}" "${WORK_DIR}.old" && cp -a "${WORK_DIR}.old" "${WORK_DIR}"
   standing_run '' list
   grep -q 'not honoured (directory replaced)' "${OUT_FILE}" || { fail "$FUNCNAME: list: $(cat "${OUT_FILE}")"; return; }
@@ -16389,7 +16395,7 @@ case_project_lane_standing_list_creates_nothing_and_cannot_tell_has_its_own_stat
   standing_run $'\004' add
   [[ "${STATUS}" == 102 && ! -e "$(lane_store)/one-shot-projects.json" ]] || { fail "$FUNCNAME: end of input: ${STATUS} $(cat "${OUT_FILE}")"; return; }
   grep -q 'end of input' "${OUT_FILE}" || { fail "$FUNCNAME: the failed read is not said"; return; }
-  standing_run $'y\n' add
+  standing_add || return
   grep -q 'put them on the one-shot route? \[y/N\]' "${OUT_FILE}" && grep -q 'device' "${OUT_FILE}" || { fail "$FUNCNAME: the identity shown: $(cat "${OUT_FILE}")"; return; }
   standing_run $'n\n' remove
   [[ "${STATUS}" == 1 && "$(standing_pins | jq -r length)" == 1 ]] || { fail "$FUNCNAME: a declined remove: ${STATUS}"; return; }
@@ -16428,7 +16434,7 @@ case_project_lane_standing_a_store_that_cannot_be_trusted_pins_nothing() {
   skip_lockdiff_case "$FUNCNAME" || return
   lane_prepare "lane-standing-untrusted" kept@1.0.0
   lane_safe_run_stub
-  standing_run $'y\n' add
+  standing_add || return
   local f="$(lane_store)/one-shot-projects.json"
   chmod 664 "${f}"
   : > "${LOG_FILE}"
@@ -16453,7 +16459,7 @@ case_project_lane_standing_dedupe_prune_and_mise_exec_follow_the_pin() {
   skip_lockdiff_case "$FUNCNAME" || return
   lane_prepare "lane-standing-verbs" kept@1.0.0
   lane_safe_run_stub
-  standing_run $'y\n' add
+  standing_add || return
   local verb
   for verb in dedupe prune; do
     : > "${LOG_FILE}"
@@ -16473,7 +16479,7 @@ case_project_lane_standing_a_withdrawn_project_takes_the_lane_and_the_switch_off
   skip_lockdiff_case "$FUNCNAME" || return
   lane_prepare "lane-standing-withdraw" kept@1.0.0
   lane_safe_run_stub
-  standing_run $'y\n' add
+  standing_add || return
   standing_run $'y\n' remove
   [[ "${STATUS}" == 0 && "$(standing_pins)" == '[]' ]] || { fail "$FUNCNAME: remove: ${STATUS} $(cat "${OUT_FILE}")"; return; }
   : > "${LOG_FILE}"
@@ -16481,7 +16487,7 @@ case_project_lane_standing_a_withdrawn_project_takes_the_lane_and_the_switch_off
   assert_status 0 "$FUNCNAME: withdrawn" || return
   grep -q $'^PROJECTION\tnpm' "${LOG_FILE}" || { fail "$FUNCNAME: a withdrawn project did not take the lane"; return; }
   # switch off, pinned: today's gate, no standing line, no question
-  standing_run $'y\n' add
+  standing_add || return
   printf '{"install":{"project_lane":false}}\n' > "${HOME_DIR}/.config/safe/run/config.json"
   : > "${LOG_FILE}"
   lane_run 'npm install clean@2.0.0'
