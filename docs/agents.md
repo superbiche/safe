@@ -165,7 +165,7 @@ safe run host-allow export --sign                                 # operator-sig
 safe run host-allow follow-signer add <fingerprint>               # pin a full GPG primary fingerprint (operator TTY)
 safe run host-allow follow [--dry-run] [--from <dir>]             # agent-permitted UNION of verified operator-signed grants; a followed exact version then installs unattended (gate exit 16)
 safe release follow [--dry-run] [--checkout <dir>]                # agent-permitted install of a verified signed safe release
-safe run one-shot-project add [<dir>…] | remove [<dir>…] | list   # operator-only standing decision (TTY, checked by the program that writes it): the npm project lane is OFF for a project, so its npm commands take today's gate and their closure is not judged by the lane; matters only while `install.project_lane` is on; `list` is read-only (exit 3: the store cannot be trusted). Never run `add` or `remove` yourself
+safe run one-shot-project add [<dir>…] | remove [<dir>…] | list   # operator-only standing decision (TTY, checked by the program that writes it): the npm project lane is OFF for a project, so its npm commands take today's gate and their closure is not judged by the lane; it is the way out of a graph the lane cannot bind (no confirmation exists for one command there); it serves plain project commands, not a workspace selection, a global command or one under `mise exec`, and it takes effect for commands run after it is stored (the lane asks npm just before each command); matters only while `install.project_lane` is on; `list` is read-only (exit 3: the store cannot be trusted). Never run `add` or `remove` yourself
 ```
 <!-- END GENERATED: allow-flows -->
 

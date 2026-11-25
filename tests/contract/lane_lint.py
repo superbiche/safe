@@ -65,7 +65,12 @@ PROMPTS_LOOP_CALLERS = {"safe_gate_project_lane_run"}
 # R9: the standing decision is read in ONE place, with two questions asked from ONE place each
 PIN_CALLERS = {"safe_gate_project_lane_pin_route": {"safe_gate_project_lane_run"},
                "safe_gate_project_lane_pin_here": {"safe_gate_project_lane_pin_route"},
-               "safe_gate_project_lane_pin_ask_npm": {"safe_gate_project_lane_pin_route"}}
+               "safe_gate_project_lane_pin_ask_npm": {"safe_gate_project_lane_pin_route"},
+               "safe_gate_project_lane_pin_npm_line": {"safe_gate_project_lane_pin_ask_npm"}}
+RUNNER = "safe_gate_project_lane_run"
+# a call that ends the run (a refusal or a hand-over): none may come before the pin lookup but the two that capture the directory
+RUN_ENDERS = ("safe_gate_project_lane_refuse", "safe_gate_project_lane_refuse_kind", "safe_gate_project_lane_unsupported_kind",
+              "safe_gate_project_lane_hand_over_silent", "safe_gate_project_lane_oneshot")
 PIN_CORE_USERS = {"safe_gate_project_lane_pin_here", "safe_gate_project_lane_pin_ask_npm"}
 
 FN = re.compile(r"^(safe_gate_[A-Za-z0-9_]+)\(\)\s*\{")
@@ -245,6 +250,24 @@ def main(path):
             problems.append(f"{number}:{fn}:R8: a reserved status is written as a literal")
     if len([1 for n, fn, t, b in lane if command_at(b, "safe_gate_project_lane_pin_route") and fn == "safe_gate_project_lane_run"]) != 1:
         problems.append("0::R9: the runner does not read the standing decision exactly once")
+    # R9, each question is counted at its owner: one prefix question and one root question in the helper that asks them
+    ask = [b for n, fn, t, b in lane if fn == "safe_gate_project_lane_pin_ask_npm"]
+    for word in ("prefix", "root"):
+        count = len([1 for b in ask if re.search(r"(?:^|[;&|({]|\bif\b|!)\s*safe_gate_project_lane_pin_npm_line\s+" + word + r"(?![A-Za-z0-9_])", b)])
+        if count != 1:
+            problems.append(f"0::R9: the {word} question is asked {count} times in its owner, not once")
+    # R9, position: the lookup follows the directory capture and precedes every lane-specific refusal or hand-over
+    run = [(n, t, b) for n, fn, t, b in lane if fn == RUNNER and not b.lstrip().startswith("#")]
+    route = [n for n, t, b in run if command_at(b, "safe_gate_project_lane_pin_route")]
+    capture = [n for n, t, b in run if "pwd -P" in t]
+    if len(route) == 1:
+        if not capture or capture[0] > route[0]:
+            problems.append("0::R9: the pin lookup comes before the directory capture")
+        for n, t, b in run:
+            if n >= route[0] or FN.match(t):
+                continue
+            if any(command_at(b, name) for name in RUN_ENDERS) and "project directory cannot be read" not in t and "contains a newline" not in t:
+                problems.append(f"{n}:{RUNNER}:R9: a refusal or hand-over comes before the pin lookup")
     names = {fn for _, fn, _ in logical}
     if "safe_gate_project_lane_one_shot_question" not in names or "safe_gate_project_lane_conclude" not in names:
         problems.append("0::R2: the lane has no top-level question")

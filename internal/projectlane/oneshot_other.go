@@ -6,6 +6,12 @@ import "errors"
 
 // The one-shot store needs descriptor-relative access: only Linux has it here. Nothing is pinned elsewhere.
 type OneShotStore struct{ Home string }
+type OneShotEntry struct {
+	Path  string `json:"path"`
+	Dev   uint64 `json:"dev"`
+	Inode uint64 `json:"inode"`
+	Added string `json:"added"`
+}
 type OneShotPlan struct {
 	Path  string `json:"path"`
 	Dev   uint64 `json:"dev"`
@@ -28,10 +34,11 @@ var (
 	ErrDurabilityUncertain = errors.New("durability uncertain")
 )
 
-func (s OneShotStore) CheckHere() int                        { return OneShotNotPin }
-func (s OneShotStore) VerifyRoot([]byte) int                 { return OneShotNotPin }
-func (s OneShotStore) List() ([]OneShotRow, error)           { return nil, errOneShot }
-func (s OneShotStore) Add([]OneShotPlan) error               { return errOneShot }
-func (s OneShotStore) Remove([]string) ([]string, error)     { return nil, errOneShot }
-func (s OneShotStore) RemoveKeys([]string) ([]string, error) { return nil, errOneShot }
-func Resolve([]string, bool) ([]OneShotPlan, error)          { return nil, errOneShot }
+func (s OneShotStore) CheckHere() int                               { return OneShotNotPin }
+func (s OneShotStore) VerifyAnswer(prefix, root []byte) int         { return OneShotNotPin }
+func (s OneShotStore) List() ([]OneShotRow, error)                  { return nil, errOneShot }
+func (s OneShotStore) Add([]OneShotPlan) error                      { return errOneShot }
+func (s OneShotStore) Remove([]string) ([]string, error)            { return nil, errOneShot }
+func (s OneShotStore) ShowRemoval([]string) ([]OneShotEntry, error) { return nil, errOneShot }
+func (s OneShotStore) RemoveEntries([]OneShotEntry) error           { return errOneShot }
+func Resolve([]string, bool) ([]OneShotPlan, error)                 { return nil, errOneShot }

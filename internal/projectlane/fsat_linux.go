@@ -226,6 +226,9 @@ func (d *dirHandle) createExclusive(name string, content []byte, perm os.FileMod
 	return idOf(info), file.Close()
 }
 
+// afterCreateMode is a test seam: called with the file the moment it exists, before anything else is done to it.
+var afterCreateMode func(*os.File)
+
 // createExclusiveMode creates name below d, failing if it exists, with exactly the final mode perm from the first moment (the
 // mode is given to the creating call, so the file is never wider than it will stay; the creation mask can only narrow it, and
 // the mode is then set to perm). It writes content, syncs and closes.
@@ -242,6 +245,9 @@ func (d *dirHandle) createExclusiveMode(name string, content []byte, perm os.Fil
 		file.Close()
 		_ = os.Remove(d.procPath(name))
 		return fileID{}, err
+	}
+	if afterCreateMode != nil {
+		afterCreateMode(file)
 	}
 	if err := file.Chmod(perm.Perm()); err != nil {
 		return fail(err)

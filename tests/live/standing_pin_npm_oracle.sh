@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # LIVE suite (ticket 1690): the question the lane asks npm about a pinned project, against the REAL npm.
 #
-# The standing decision is honoured only when `npm root <the command's own arguments>` exits 0 and prints one line, ending in
-# /node_modules, whose directory is a stored pin by identity. This suite holds what the real npm prints (the table of the design
+# The standing decision is honoured only when `npm prefix` and `npm root` (the command's own arguments, the housekeeping on the command line) both exit 0 and print
+# one line, the root being exactly <prefix>/node_modules and the prefix a stored pin by identity. This suite holds what the real npm prints (the table of the design
 # note lives HERE, not in a note) on every npm build installed under ~/.local/share/mise/installs/node: 8.1.0, 10.9.2, 11.20.0 and
 # 12.2.1 (a missing build is skipped, said). It is read-only: `npm root` in scratch directories with an isolated home; the store is
-# written by the core's own writer at a pty, in that isolated home. The verdict is the core's (`one-shot-store verify-root`).
+# written by the core's own writer at a pty, in that isolated home. The verdict is the core's (`one-shot-store verify <prefix> <root>`).
 set -uo pipefail
 
 # SAFE_TEST_ISOLATION_MARKER: every suite owns a scratch HOME and safe state.
@@ -46,13 +46,34 @@ pin() {
   local dir
   for dir in "$@"; do
     printf 'y\n' > "${WORK}/ans"
-    ( cd "${dir}" && env -u CLAUDECODE -u CODEX_THREAD_ID -u CODEX_CI -u OPENCODE bash -c 'exec python3 -c "import os,pty,sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))" "$@" <"'"${WORK}"'/ans"' bash "${CORE}" one-shot-store add --home "${STORE_HOME}" >/dev/null 2>&1 ) || return 1
+    ( cd "${dir}" && env -u CLAUDECODE -u CODEX_THREAD_ID -u CODEX_CI -u OPENCODE HOME="${STORE_HOME}" bash -c 'exec python3 -c "import os,pty,sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))" "$@" <"'"${WORK}"'/ans"' bash "${CORE}" one-shot-store add >/dev/null 2>&1 ) || return 1
   done
 }
 
-# honoured <version> <cwd> <pin dir…> -- <env assignments…> -- <npm args…>: the core's verdict on the real npm's answer
+# the two questions, as the lane puts them: the command with its word replaced (`root` in the arguments given here marks the word), the
+# housekeeping on the command line before the first option terminator (or at the end). Prints npm's exact bytes.
+ask() { # <node> <cwd> <word> <env…> -- <args…>
+  local node="$1" cwd="$2" word="$3" arg out rc
+  shift 3
+  local -a envs=() args=() final=() prefix_args=()
+  while (( $# )) && [[ "$1" != -- ]]; do envs+=("$1"); shift; done
+  shift
+  local swapped=0 placed=0
+  for arg in "$@"; do
+    if (( ! swapped )) && [[ "${arg}" == root ]]; then arg="${word}"; swapped=1; fi
+    if (( ! placed )) && [[ "${arg}" == -- ]]; then final+=(--update-notifier=false --logs-max=0); placed=1; fi
+    final+=("${arg}")
+  done
+  (( placed )) || final+=(--update-notifier=false --logs-max=0)
+  out="$(cd "${cwd}" && env -i HOME="${WORK}/home" PATH="${node}/bin:/usr/bin:/bin" ${envs[@]+"${envs[@]}"} timeout 20 npm "${final[@]}" </dev/null 2>/dev/null; printf 'x%d' "$?")"
+  rc="${out##*x}"
+  printf '%s' "${out%x*}"
+  return "${rc}"
+}
+
+# honoured <version> <cwd> <pin dir…> -- <env assignments…> -- <npm args…>: the core's verdict on the real npm's two answers
 honoured() {
-  local version="$1" cwd="$2" node out rc
+  local version="$1" cwd="$2" node prefix_out root_out
   shift 2
   local -a pins=() envs=() args=()
   while (( $# )) && [[ "$1" != -- ]]; do pins+=("$1"); shift; done
@@ -62,10 +83,9 @@ honoured() {
   args=("$@")
   node="${MISE}/${NODE_OF[${version}]}"
   pin "${pins[@]}" || return 2
-  ( cd "${cwd}" && env -i HOME="${WORK}/home" PATH="${node}/bin:/usr/bin:/bin" npm_config_update_notifier=false npm_config_logs_max=0 ${envs[@]+"${envs[@]}"} \
-      timeout 20 npm "${args[@]}" </dev/null 2>/dev/null ) | "${CORE}" one-shot-store verify-root --home "${STORE_HOME}"
-  rc=("${PIPESTATUS[@]}")
-  (( rc[0] == 0 && rc[1] == 0 ))
+  prefix_out="$(ask "${node}" "${cwd}" prefix ${envs[@]+"${envs[@]}"} -- "${args[@]}"; printf x)" || return 1
+  root_out="$(ask "${node}" "${cwd}" root ${envs[@]+"${envs[@]}"} -- "${args[@]}"; printf x)" || return 1
+  HOME="${STORE_HOME}" "${CORE}" one-shot-store verify "${prefix_out%x}" "${root_out%x}" >/dev/null 2>&1
 }
 
 # expect <label> <want yes|no> <version> <cwd> <pins…> -- <envs> -- <npm args>
@@ -122,6 +142,35 @@ for version in 8.1.0 10.9.2 11.20.0 12.2.1; do
     expect "--prefi is an error on 12 (undetermined)" no "${version}" "${M}" "${M}" -- -- root --prefi="${M}"
   else
     expect "--prefi is --prefix to npm" yes "${version}" "${M}" "${M}" -- -- root --prefi="${M}"
+  fi
+  # the project named `lib` under a global prefix: the roots coincide, the prefix tells the mode (npm's own answers, per version)
+  GP="${WORK}/gp"; mkdir -p "${GP}/lib/node_modules" "${GP}/lib"
+  printf '{"name":"lib","version":"1.0.0"}\n' > "${GP}/lib/package.json"
+  GP="$(cd "${GP}" && pwd -P)"
+  expect "a project named lib under the global prefix, local mode, pinned" yes "${version}" "${GP}/lib" "${GP}/lib" -- npm_config_prefix="${GP}" -- root
+  expect "the same directory, global mode, the project pinned: the root coincides, the prefix does not" no "${version}" "${GP}/lib" "${GP}/lib" -- npm_config_prefix="${GP}" -- root -g
+  expect "global mode from the environment" no "${version}" "${GP}/lib" "${GP}/lib" -- npm_config_prefix="${GP}" npm_config_global=true -- root
+  # global mode from every configuration file
+  for place in "${P}/.npmrc" "${WORK}/home/.npmrc"; do
+    printf 'global=true\n' > "${place}"
+    expect "global=true in ${place##*/} of $(basename "$(dirname "${place}")")" no "${version}" "${P}" "${P}" -- -- root
+    rm -f "${place}"
+  done
+  printf 'global=true\n' > "${WORK}/globalrc"
+  expect "global=true in the global config file" no "${version}" "${P}" "${P}" -- npm_config_globalconfig="${WORK}/globalrc" -- root
+  rm -f "${WORK}/globalrc"
+  # housekeeping on the command line: an earlier --logs-max=1 and an option terminator change no answer, and nothing is written or contacted
+  expect "an earlier --logs-max=1 and a terminator" yes "${version}" "${P}" "${P}" -- -- root clean@2.0.0 --logs-max=1 -- --extra
+  # a FRESH home: the question writes no file (an empty cache directory may appear: npm makes it before it reads its options)
+  FRESH="${WORK}/fresh-${version}"; rm -rf "${FRESH}"; mkdir -p "${FRESH}"
+  node="${MISE}/${NODE_OF[${version}]}"
+  : > "${WORK}/trace"
+  ( cd "${P}" && env -i HOME="${FRESH}" PATH="${node}/bin:/usr/bin:/bin" strace -f -qq -e trace=connect -o "${WORK}/trace" \
+      timeout 20 npm root clean@2.0.0 --logs-max=1 --update-notifier=false --logs-max=0 -- --extra </dev/null >/dev/null 2>&1 )
+  if [[ -z "$(find "${FRESH}" -type f | head -1)" ]] && ! grep -qE 'sin6?_port=htons\((53|80|443)\)' "${WORK}/trace"; then
+    pass "${version}: the question writes no file and opens no connection"
+  else
+    fail "${version}: the question wrote a file ($(find "${FRESH}" -type f | head -2)) or connected ($(grep -E 'sin6?_port' "${WORK}/trace" | head -2))"
   fi
   # an option BEFORE the command word stays in place: the question is the command with its word replaced
   expect "an option before the verb moves npm's target" no "${version}" "${P}" "${P}" -- -- --prefix="${WORK}/other" root clean@2.0.0

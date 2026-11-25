@@ -303,7 +303,7 @@ pass and warnings under `environment.release_follow`.
   command, never recorded. **Blocking advisory:** a typed `name@version` per artifact (the acceptance is recorded as today's
   gate records it: a local approval of that exact artifact and source), or `record name@version`, which also records the
   advisory override on the host-allow entry (advisory-only, through `safe-run host-allow add --accept-block`, which asks
-  again). **Graph not bound:** no override at the terminal (it is decided after the evidence is read, so it ends as it does unattended, with its line). **Adverse advisory:** ONE prompt
+  again). **Graph not bound:** no confirmation for one command (it is decided after the evidence is read, so it ends as it does unattended, with its line); its way out is the standing decision per project (`safe run one-shot-project add`, below). **Adverse advisory:** ONE prompt
   lists every artifact and advisory; `[y]` accepts the listed exact artifacts (each recorded as an acceptance), `[a]` also
   records a host-allow grant (npm and python, as today), `[N]` declines. **Wait:** today's adverse override. **Socket on a named
   root:** the rate-limit approval (for this command; the approval of each exact artifact is recorded), the consent ask (`Y`
@@ -376,22 +376,30 @@ pass and warnings under `environment.release_follow`.
   says "committed and visible, durability uncertain" (exit 4). An entry is the physical path of the project directory (its bytes,
   resolved by the kernel: `link/..` is the parent of what the link leads to) with its device and inode and the time it was added; it
   carries no reason (the audit log attributes it). `list` is read-only and creates nothing; exit 3 means the store cannot be trusted
-  (told apart from an empty list). **How the lane reads it:** in one place, right after it captured its project directory, with two
-  questions. First, on data alone: is the directory the command runs in, or one of its ancestors, a stored pin by identity? If none
-  is, nothing more happens and no npm is run. Then npm: `npm root` with the command's own arguments (the command word replaced,
-  everything else in place, the option terminator included), run by the caller's own npm and environment because that is the command
-  that will run, with only npm's update check and debug log silenced. The pin is honoured only when npm exits 0 and prints exactly
-  one line, ending in `/node_modules`, whose directory (opened by the core, never taken as text) is itself a stored pin: so "npm
-  acts on a pinned project, in project mode" is what is checked, whatever directory the command was typed in; a global command
-  prints a `lib/node_modules` under a prefix nobody pinned. An undetermined answer is no pin. **Accepted limits:** a command that
+  (told apart from an empty list). **How the lane reads it:** in one place, right after it captured its project directory and BEFORE
+  any lane-specific refusal (a spelled `--location=project` on a pinned project reaches today's gate; a plain `-g` command is handed
+  over first and never consults a pin), with two kinds of question. First, on data alone: is the directory the command runs in, or one
+  of its ancestors, a stored pin by identity? If none is, nothing more happens and no npm is run. Then npm, two read-only answers
+  from the npm that will run the command (the command's own arguments, the command word replaced, everything else in place): `npm
+  prefix` and `npm root`. The caller's environment is not touched: npm's update check and debug log are silenced by `--update-notifier=false
+  --logs-max=0` on the command line, at the end or immediately before the option terminator (an option the caller gave stays where it
+  was). The pin is honoured only when both exit 0 and print exactly one line, the root is exactly `<prefix>/node_modules`, the
+  prefix names a pinned directory by identity (opened by the core, never taken as text) and that directory's `node_modules` is not a
+  link. The prefix is what tells global mode from project mode: a project named `lib` under a global prefix prints the same root as
+  the global tree. Each step is bounded (10 s; the whole question is a handful of steps). An undetermined answer is no pin. **Under
+  `mise exec` the pin is not used** (the inner gate runs the ambient npm, the outer mise may run another one, so the question
+  could go to the wrong npm): the command meets the lane as if nothing were pinned. The window between the question and the command
+  is the ordinary one of any check made before a command (a directory replaced in it is the accepted residual below). **Accepted limits:** a command that
   selects a workspace (`-w`, `--workspaces`, or `workspace`/`workspaces` set in a file) is not served by a pin (npm gives no answer
   for it); a pin on a workspace member is not honoured where npm acts on the root above (npm 10 and later search across a git
-  boundary; npm 8.1.0 does not search); the question runs npm's start-up once for a command under a pinned directory even when the
+  boundary; npm 8.1.0 does not search); the question runs npm's start-up twice for a command under a pinned directory even when the
   pin is then not honoured, and a caller who controls npm's start-up controls the answer (the same boundary as today's gate); a
   remount at the same path with the same device and inode, or a reused inode, cannot be told from the pinned directory; a process
   allowed to write files as the operator can write the store. What the real npm prints on 8.1.0, 10.9.2, 11.20.0 and 12.2.1 is held
-  by `tests/live/standing_pin_npm_oracle.sh`. `npm root` writes nothing on 8.1.0 and 11.20.0; on 10.9.2 and 12.2.1 it writes a debug
-  log and an update-check stamp and contacts the registry unless silenced, which the question's environment does.
+  by `tests/live/standing_pin_npm_oracle.sh`. With the housekeeping on the command line the question writes no file and opens no
+  connection on any of the four (checked there, with an original `--logs-max=1` and an option terminator); npm 10.9.2 still creates an
+  empty `~/.npm` directory before it reads its options, which is the one trace this question can leave. The pin serves plain project
+  commands, not workspace selections, and a command that selects a workspace is not served.
 
   **Standing acceptances.** The decision takes the operator's standing acceptances as a document of its own, read by safe's
   own reader (`safe audit lane-acceptances`, which calls the functions today's install gate calls and has no store, format or

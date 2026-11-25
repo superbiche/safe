@@ -605,8 +605,9 @@ agent markers; 102 otherwise, before the store is touched, even if `safe-core` i
 asks, and commits under a lock. A failed terminal read is 102, never a cancellation. The entry is the physical path of the directory with
 its device and inode, in `one-shot-projects.json` under `$HOME/.config/safe/run` (never a redirected root), with no reason: the audit log
 (`ONE_SHOT_PROJECT_ADD` / `ONE_SHOT_PROJECT_REMOVE`, written after the commit) records who and when. `list` creates nothing. It matters only
-while `install.project_lane` is on. Not served by a pin: a command that selects a workspace; a pin on a workspace member where npm acts on
-the root above. Accepted residuals: a remount at the same path with the same device and inode, or a reused inode, cannot be told from the
+while `install.project_lane` is on. The pin serves plain project commands: not served are a command that selects a workspace, a pin on a
+workspace member where npm acts on the root above, a command under `mise exec`, and a global command. The lane asks the npm that will run
+(`npm prefix` and `npm root`, housekeeping on the command line, the caller's environment untouched); the only anchor of the store is `HOME`. Accepted residuals: a remount at the same path with the same device and inode, or a reused inode, cannot be told from the
 pinned directory; a process allowed to write files as the operator can write the store.
 
 ## Scripts Allowlist

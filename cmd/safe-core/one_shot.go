@@ -7,13 +7,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"syscall"
-	"unsafe"
 
 	"github.com/superbiche/safe/internal/projectlane"
 )
 
-// safe-core one-shot-store <check|verify-root|list|add|remove> [--home <dir>] …
+// safe-core one-shot-store <check|verify|list|add|remove> …
 //
 // The one reader and the one writer of the operator's standing decision per project (ticket 1690). `add` and `remove` check the
 // operator's terminal THEMSELVES, before they touch the store, then resolve, show, ask and commit in this one invocation: a
@@ -21,20 +19,14 @@ import (
 // delegates and reports.
 //
 // Exit statuses. check: 0 a directory here or above is pinned, 1 none, 2 a stored path is here but another directory stands on it.
-// verify-root (npm's `npm root` output on stdin): 0 honoured, 1 not. list: 0, 3 the store cannot be trusted. add/remove: 0
+// verify <prefix output> <root output> (what npm printed for `npm prefix` and `npm root`, as arguments): 0 honoured, 1 not.
+// The store is the operator's own: <home>/.config/safe/run, the home being $HOME (no other anchor can be named). list: 0, 3 the store cannot be trusted. add/remove: 0
 // committed, 1 declined or NOT recorded, 4 committed and visible but durability uncertain, 102 no operator terminal or a failed
 // terminal read, 2 usage.
 
 // operatorMarkers are the recognized agent sessions: byte-for-byte the markers of safe_gate_operator_terminal in lib/gate-lib.sh
 // and bin/safe-run (tests/contract/drift.sh keeps the three lists together).
 var operatorMarkers = []string{"CODEX_THREAD_ID", "CODEX_CI", "CLAUDECODE", "OPENCODE"}
-
-// isTerminal reports whether the file is a terminal.
-func isTerminal(file *os.File) bool {
-	var termios [64]byte
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), uintptr(syscall.TCGETS), uintptr(unsafe.Pointer(&termios[0])))
-	return errno == 0
-}
 
 // operatorTerminal: stdin is a terminal and no recognized agent marker is set (the 2026-11-02 predicate).
 func operatorTerminal(stdin io.Reader, getenv func(string) string) bool {
@@ -64,21 +56,13 @@ func ttyPrinter(stderr io.Writer) io.Writer {
 
 func oneShotStore(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "safe-core: one-shot-store: a subcommand is needed (check, verify-root, list, add, remove)")
+		fmt.Fprintln(stderr, "safe-core: one-shot-store: a subcommand is needed (check, verify, list, add, remove)")
 		return 2
 	}
 	verb, rest := args[0], args[1:]
-	home := os.Getenv("HOME")
 	var operands []string
 	for i := 0; i < len(rest); i++ {
 		switch rest[i] {
-		case "--home":
-			if i+1 >= len(rest) {
-				fmt.Fprintln(stderr, "safe-core: one-shot-store: --home needs a value")
-				return 2
-			}
-			home = rest[i+1]
-			i++
 		case "--":
 			operands = append(operands, rest[i+1:]...)
 			i = len(rest)
@@ -86,16 +70,15 @@ func oneShotStore(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 			operands = append(operands, rest[i])
 		}
 	}
-	store := projectlane.OneShotStore{Home: home}
+	store := projectlane.OneShotStore{Home: os.Getenv("HOME")}
 	switch verb {
 	case "check":
 		return store.CheckHere()
-	case "verify-root":
-		raw, err := io.ReadAll(io.LimitReader(stdin, 4097))
-		if err != nil || len(raw) > 4096 {
+	case "verify":
+		if len(operands) != 2 || len(operands[0]) > 4096 || len(operands[1]) > 4096 {
 			return projectlane.OneShotNotPin
 		}
-		return store.VerifyRoot(raw)
+		return store.VerifyAnswer([]byte(operands[0]), []byte(operands[1]))
 	case "list":
 		rows, err := store.List()
 		if err != nil {
@@ -124,6 +107,7 @@ func oneShotChange(verb string, store projectlane.OneShotStore, operands []strin
 	out := ttyPrinter(stderr)
 	var shown []string
 	var plans []projectlane.OneShotPlan
+	var removal []projectlane.OneShotEntry
 	if verb == "add" {
 		resolved, err := projectlane.Resolve(operands, true)
 		if err != nil {
@@ -137,14 +121,15 @@ func oneShotChange(verb string, store projectlane.OneShotStore, operands []strin
 		}
 		fmt.Fprintln(out, "safe run: these projects will take the one-shot route for every npm command (the lane is off for them):")
 	} else {
-		keys, err := store.RemoveKeys(operands)
+		entries, err := store.ShowRemoval(operands)
 		if err != nil {
 			fmt.Fprintln(stderr, "safe-core: one-shot-store:", err)
 			return 1
 		}
-		for _, key := range keys {
-			raw, _ := json.Marshal(key)
-			shown = append(shown, "  "+string(raw))
+		removal = entries
+		for _, entry := range entries {
+			raw, _ := json.Marshal(entry.Path)
+			shown = append(shown, fmt.Sprintf("  %s  (device %d, inode %d)", raw, entry.Dev, entry.Inode))
 		}
 		fmt.Fprintln(out, "safe run: these projects will take the lane again:")
 	}
@@ -157,17 +142,8 @@ func oneShotChange(verb string, store projectlane.OneShotStore, operands []strin
 	} else {
 		fmt.Fprint(out, "safe run: withdraw them? [y/N] ")
 	}
-	var answer string
-	tty, err := os.Open("/dev/tty")
-	if err == nil {
-		defer tty.Close()
-		line, rerr := bufio.NewReader(tty).ReadString('\n')
-		if rerr != nil && line == "" {
-			err = rerr
-		}
-		answer = trimLine(line)
-	}
-	if err != nil {
+	answer, ok := readAnswer()
+	if !ok {
 		fmt.Fprintln(stderr, "\nsafe-core: one-shot-store: no answer could be read from your terminal (end of input): nothing was recorded")
 		return 102
 	}
@@ -181,9 +157,12 @@ func oneShotChange(verb string, store projectlane.OneShotStore, operands []strin
 		cerr = store.Add(plans)
 		committed = plans
 	} else {
-		var removed []string
-		removed, cerr = store.Remove(operands)
-		committed = removed
+		cerr = store.RemoveEntries(removal)
+		keys := make([]string, 0, len(removal))
+		for _, entry := range removal {
+			keys = append(keys, entry.Path)
+		}
+		committed = keys
 	}
 	if cerr != nil && !errors.Is(cerr, projectlane.ErrDurabilityUncertain) {
 		fmt.Fprintln(stderr, "safe-core: one-shot-store:", cerr)
@@ -203,4 +182,23 @@ func trimLine(line string) string {
 		line = line[:len(line)-1]
 	}
 	return line
+}
+
+// readAnswer reads one line from the operator's terminal. ANY read error (end of input included, whatever was read before it) is a
+// failed read: no byte of a partial answer is interpreted.
+func readAnswer() (string, bool) {
+	tty, err := os.Open("/dev/tty")
+	if err != nil {
+		return "", false
+	}
+	defer tty.Close()
+	return readAnswerFrom(tty)
+}
+
+func readAnswerFrom(reader io.Reader) (string, bool) {
+	line, err := bufio.NewReader(reader).ReadString('\n')
+	if err != nil {
+		return "", false
+	}
+	return trimLine(line), true
 }

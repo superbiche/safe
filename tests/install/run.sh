@@ -342,22 +342,27 @@ stub_release_age_json() {
   printf '%s' "${out}"
 }
 
-# `npm root` (the question of the standing decision, ticket 1690): the stub answers as npm 10 and later do. The target is the --prefix
-# when one is given, else the nearest workspaces root above the directory (the search does not stop at a git boundary), else the
-# nearest package.json; -g/--global (or --location=global) prints a lib/node_modules under the stub's global prefix; a workspace
-# selection is an error (the command does not support workspaces); NPM_STUB_ROOT_ANSWER / NPM_STUB_ROOT_STATUS script an answer.
+# `npm prefix` and `npm root` (the two questions of the standing decision, ticket 1690): the stub answers as npm 10 and later do. The
+# target is the --prefix when one is given, else the nearest workspaces root above the directory (the search does not stop at a git
+# boundary), else the directory; -g/--global (or --location=global) makes the prefix the global one (--prefix, else a fixed stub
+# prefix) and the root <prefix>/lib/node_modules; a workspace selection is an error (the command does not support workspaces);
+# NPM_STUB_ROOT_ANSWER / NPM_STUB_PREFIX_ANSWER / NPM_STUB_ROOT_STATUS / NPM_STUB_ROOT_LATE_STATUS script an answer.
 if [[ "${tool}" == "npm" ]]; then
-  stub_root_word=0
-  for arg in "$@"; do [[ "${arg}" == "root" ]] && stub_root_word=1; [[ "${arg}" == "--" ]] && break; done
-  if (( stub_root_word )); then
-    printf 'ROOT_ENV\tupdate_notifier=%s\tlogs_max=%s\tstdin_tty=%s\n' "${npm_config_update_notifier:-}" "${npm_config_logs_max:-}" "$([[ -t 0 ]] && echo yes || echo no)" >> "${SAFE_INSTALL_COMMAND_LOG}"
+  stub_word=""
+  for arg in "$@"; do [[ "${arg}" == "--" ]] && break; [[ "${arg}" == "root" || "${arg}" == "prefix" ]] && stub_word="${arg}"; done
+  if [[ -n "${stub_word}" ]]; then
+    stub_housekeeping=no
+    [[ " $* " == *" --update-notifier=false --logs-max=0 "* || " $* " == *" --update-notifier=false --logs-max=0 -- "* ]] && stub_housekeeping=yes
+    printf 'ROOT_ENV\t%s\tenv_update_notifier=%s\tenv_logs_max=%s\tstdin_tty=%s\tcli_housekeeping=%s\n' "${stub_word}" "${npm_config_update_notifier:-}" "${npm_config_logs_max:-}" "$([[ -t 0 ]] && echo yes || echo no)" "${stub_housekeeping}" >> "${SAFE_INSTALL_COMMAND_LOG}"
+    [[ -z "${NPM_STUB_HANG:-}" ]] || sleep 60
     [[ -z "${NPM_STUB_ROOT_STATUS:-}" ]] || exit "${NPM_STUB_ROOT_STATUS}"
     # a late status: the answer is printed, THEN npm exits with it (an answer from a failed run is no answer)
     [[ -z "${NPM_STUB_ROOT_LATE_STATUS:-}" ]] || trap 'exit "${NPM_STUB_ROOT_LATE_STATUS}"' EXIT
-    if [[ -n "${NPM_STUB_ROOT_ANSWER:-}" ]]; then printf '%b\n' "${NPM_STUB_ROOT_ANSWER}"; exit 0; fi
-    stub_prefix="" stub_global=0
-    stub_prev=""
+    if [[ "${stub_word}" == root && -n "${NPM_STUB_ROOT_ANSWER:-}" ]]; then printf '%b\n' "${NPM_STUB_ROOT_ANSWER}"; exit 0; fi
+    if [[ "${stub_word}" == prefix && -n "${NPM_STUB_PREFIX_ANSWER:-}" ]]; then printf '%b\n' "${NPM_STUB_PREFIX_ANSWER}"; exit 0; fi
+    stub_prefix="" stub_global=0 stub_prev=""
     for arg in "$@"; do
+      [[ "${arg}" == "--" ]] && break
       [[ "${stub_prev}" != "--prefix" ]] || stub_prefix="${arg}"
       stub_prev="${arg}"
       case "${arg}" in
@@ -366,16 +371,21 @@ if [[ "${tool}" == "npm" ]]; then
         -w|--workspace|--workspace=*|--workspaces|--workspaces=*) exit 1 ;;
       esac
     done
-    if (( stub_global )); then printf '%s/lib/node_modules\n' "${stub_prefix:-/nonexistent/global}"; exit 0; fi
-    if [[ -n "${stub_prefix}" ]]; then printf '%s/node_modules\n' "${stub_prefix}"; exit 0; fi
-    stub_dir="$(pwd -P)"
-    stub_hit="${stub_dir}"
-    stub_up="${stub_dir}"
-    while [[ "${stub_up}" != "/" ]]; do
-      stub_up="$(dirname -- "${stub_up}")"
-      if [[ -f "${stub_up}/package.json" ]] && jq -e '.workspaces != null' "${stub_up}/package.json" >/dev/null 2>&1; then stub_hit="${stub_up}"; break; fi
-    done
-    printf '%s/node_modules\n' "${stub_hit}"
+    if (( stub_global )); then
+      stub_target="${stub_prefix:-/nonexistent/global}"
+      if [[ "${stub_word}" == prefix ]]; then printf '%s\n' "${stub_target}"; else printf '%s/lib/node_modules\n' "${stub_target}"; fi
+      exit 0
+    fi
+    if [[ -n "${stub_prefix}" ]]; then stub_hit="${stub_prefix}"; else
+      stub_dir="$(pwd -P)"
+      stub_hit="${stub_dir}"
+      stub_up="${stub_dir}"
+      while [[ "${stub_up}" != "/" ]]; do
+        stub_up="$(dirname -- "${stub_up}")"
+        if [[ -f "${stub_up}/package.json" ]] && jq -e '.workspaces != null' "${stub_up}/package.json" >/dev/null 2>&1; then stub_hit="${stub_up}"; break; fi
+      done
+    fi
+    if [[ "${stub_word}" == prefix ]]; then printf '%s\n' "${stub_hit}"; else printf '%s/node_modules\n' "${stub_hit}"; fi
     exit 0
   fi
 fi
@@ -1164,7 +1174,9 @@ run_zsh() {
     NPM_CI_CHECK_STATUS="${NPM_CI_CHECK_STATUS:-}" \
     NPM_DEDUPE_SAVES_NOTHING="${NPM_DEDUPE_SAVES_NOTHING:-}" \
     NPM_STUB_ROOT_ANSWER="${NPM_STUB_ROOT_ANSWER:-}" \
+    NPM_STUB_PREFIX_ANSWER="${NPM_STUB_PREFIX_ANSWER:-}" \
     NPM_STUB_ROOT_STATUS="${NPM_STUB_ROOT_STATUS:-}" \
+    NPM_STUB_HANG="${NPM_STUB_HANG:-}" \
     NPM_STUB_ROOT_LATE_STATUS="${NPM_STUB_ROOT_LATE_STATUS:-}" \
     SAFE_CORE_FAKE_VERSION="${SAFE_CORE_FAKE_VERSION:-}" \
     NPM_CI_CHECK_ERROR="${NPM_CI_CHECK_ERROR:-}" \
@@ -16195,7 +16207,7 @@ assert_no_standing_lane_operation() { # <label>
   fi
 }
 
-standing_root_asked() { grep -cP '^REAL\tnpm\t(.*\t)?root(\t|$)' "${LOG_FILE}"; }
+standing_root_asked() { grep -cP '^REAL\tnpm\t(.*\t)?(root|prefix)(\t|$)' "${LOG_FILE}"; }
 
 # 1. A pinned project takes the one-shot route with its line, once; the command is the original one; the lane does nothing.
 case_project_lane_standing_a_pinned_project_takes_the_one_shot_route() {
@@ -16211,9 +16223,11 @@ case_project_lane_standing_a_pinned_project_takes_the_one_shot_route() {
   assert_err_contains_fragment '[lane: one-shot, the operator put this project on the one-shot route' "$FUNCNAME" || return
   assert_err_contains_fragment 'the closure is not judged on this route' "$FUNCNAME" || return
   [[ "$(grep -c '^safe: BLOCKED' "${ERR_FILE}")" -eq 0 ]] || { fail "$FUNCNAME: a refusal line"; return; }
-  [[ "$(standing_root_asked)" == 1 ]] || { fail "$FUNCNAME: npm was asked $(standing_root_asked) times"; return; }
-  grep -qP '^REAL\tnpm\troot\tclean@2.0.0$' "${LOG_FILE}" || { fail "$FUNCNAME: the question is not the command with its word replaced: $(grep -P '\troot' "${LOG_FILE}")"; return; }
-  grep -q $'^ROOT_ENV\tupdate_notifier=false\tlogs_max=0\tstdin_tty=no' "${LOG_FILE}" || { fail "$FUNCNAME: the question's environment: $(grep ROOT_ENV "${LOG_FILE}")"; return; }
+  [[ "$(standing_root_asked)" == 2 ]] || { fail "$FUNCNAME: npm (two questions: prefix, root) was asked $(standing_root_asked) times"; return; }
+  # TWO read-only answers from the same npm, each the command with its word replaced; the housekeeping is on the command line
+  grep -qP '^REAL\tnpm\troot\tclean@2.0.0\t--update-notifier=false\t--logs-max=0$' "${LOG_FILE}" || { fail "$FUNCNAME: the root question: $(grep -P '\troot' "${LOG_FILE}")"; return; }
+  grep -qP '^REAL\tnpm\tprefix\tclean@2.0.0\t--update-notifier=false\t--logs-max=0$' "${LOG_FILE}" || { fail "$FUNCNAME: the prefix question: $(grep -P '\tprefix' "${LOG_FILE}")"; return; }
+  [[ "$(grep -c $'^ROOT_ENV\t' "${LOG_FILE}")" == 2 ]] && ! grep $'^ROOT_ENV\t' "${LOG_FILE}" | grep -qv $'env_update_notifier=\tenv_logs_max=\tstdin_tty=no\tcli_housekeeping=yes' || { fail "$FUNCNAME: the question's environment: $(grep ROOT_ENV "${LOG_FILE}")"; return; }
   [[ "$(grep -cP '^REAL\tnpm\tinstall\tclean@2.0.0' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: not one delegation"; return; }
   assert_no_standing_lane_operation "$FUNCNAME" || return
   [[ "$(lane_record_count)" == 0 && "$(lane_approvals)" == '[]' ]] || { fail "$FUNCNAME: a pin gave a baseline or an approval"; return; }
@@ -16257,7 +16271,7 @@ case_project_lane_standing_a_pin_follows_the_project_npm_acts_on() {
   [[ "$(standing_pins)" == "[\"${member}\"]" ]] || { fail "$FUNCNAME: the member was not pinned: $(cat "${OUT_FILE}")"; return; }
   : > "${LOG_FILE}"
   WORK_DIR="${member}" lane_run 'npm install clean@2.0.0'
-  [[ "$(standing_root_asked)" == 1 ]] || { fail "$FUNCNAME: the member's command did not ask npm once"; return; }
+  [[ "$(standing_root_asked)" == 2 ]] || { fail "$FUNCNAME: the member's command did not ask npm its two questions"; return; }
   grep -q 'the operator put this project on the one-shot route' "${ERR_FILE}" && { fail "$FUNCNAME: a pinned member lent its pin to the root npm acts on"; return; }
   # the ROOT is pinned: a command typed in the member reaches it (an ancestor), and npm confirms it is the root it acts on
   rm -f "$(lane_store)/one-shot-projects.json"
@@ -16280,12 +16294,12 @@ case_project_lane_standing_the_question_carries_every_argument_of_the_command() 
   # an option BEFORE the verb that points npm elsewhere: the question keeps it in place, npm's answer is the other directory
   : > "${LOG_FILE}"
   lane_run "npm --prefix ${other} install clean@2.0.0"
-  grep -qP "^REAL\tnpm\t--prefix\t${other}\troot\tclean@2.0.0\$" "${LOG_FILE}" || { fail "$FUNCNAME: the question lost the selector: $(grep -P '\troot' "${LOG_FILE}")"; return; }
+  grep -qP "^REAL\tnpm\t--prefix\t${other}\troot\tclean@2.0.0\t--update-notifier=false\t--logs-max=0\$" "${LOG_FILE}" || { fail "$FUNCNAME: the question lost the selector: $(grep -P '\troot' "${LOG_FILE}")"; return; }
   grep -q 'the operator put this project on the one-shot route' "${ERR_FILE}" && { fail "$FUNCNAME: an option before the verb lent the pin to another project"; return; }
   # the option terminator stays where it was
   : > "${LOG_FILE}"
   lane_run 'npm install clean@2.0.0 -- --extra'
-  grep -qP '^REAL\tnpm\troot\tclean@2.0.0\t--\t--extra$' "${LOG_FILE}" || { fail "$FUNCNAME: the terminator moved: $(grep -P '\troot' "${LOG_FILE}")"; return; }
+  grep -qP '^REAL\tnpm\troot\tclean@2.0.0\t--update-notifier=false\t--logs-max=0\t--\t--extra$' "${LOG_FILE}" || { fail "$FUNCNAME: the terminator moved: $(grep -P '\troot' "${LOG_FILE}")"; return; }
   # global mode (the stub prints a lib/node_modules under a prefix nobody pinned, even for the pinned directory itself)
   : > "${LOG_FILE}"
   lane_run "npm install clean@2.0.0 -g --prefix=${project}"
@@ -16357,16 +16371,16 @@ case_project_lane_standing_the_writer_checks_the_operators_terminal_itself() {
   standing_run_plain add
   [[ "${STATUS}" == 102 && ! -e "$(lane_store)/one-shot-projects.json" ]] || { fail "$FUNCNAME: no terminal: ${STATUS}"; return; }
   # the core called DIRECTLY (what the earlier branch let pin a project): no terminal, a pipe, an agent marker on a terminal
-  ( cd "${WORK_DIR}" && "${core}" one-shot-store add --home "${cold}" </dev/null >/dev/null 2>&1 ); rc=$?
+  ( cd "${WORK_DIR}" && HOME="${cold}" "${core}" one-shot-store add </dev/null >/dev/null 2>&1 ); rc=$?
   [[ "${rc}" == 102 && -z "$(ls -A "${cold}")" ]] || { fail "$FUNCNAME: the core from /dev/null: ${rc}"; return; }
-  ( cd "${WORK_DIR}" && printf 'y\n' | "${core}" one-shot-store remove --home "${cold}" >/dev/null 2>&1 ); rc=$?
+  ( cd "${WORK_DIR}" && printf 'y\n' | HOME="${cold}" "${core}" one-shot-store remove >/dev/null 2>&1 ); rc=$?
   [[ "${rc}" == 102 && -z "$(ls -A "${cold}")" ]] || { fail "$FUNCNAME: the core from a pipe: ${rc}"; return; }
   printf 'y\n' > "${CASE_DIR}/ans"
-  ( cd "${WORK_DIR}" && env CLAUDECODE=1 bash -c 'exec python3 -c "import os,pty,sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))" "$@" <"'"${CASE_DIR}"'/ans"' bash "${core}" one-shot-store add --home "${cold}" >/dev/null 2>&1 ); rc=$?
+  ( cd "${WORK_DIR}" && env CLAUDECODE=1 HOME="${cold}" bash -c 'exec python3 -c "import os,pty,sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))" "$@" <"'"${CASE_DIR}"'/ans"' bash "${core}" one-shot-store add >/dev/null 2>&1 ); rc=$?
   [[ "${rc}" == 102 && -z "$(ls -A "${cold}")" ]] || { fail "$FUNCNAME: the core with an agent marker on a terminal: ${rc}"; return; }
   # at an operator's terminal the core is plumbing: allowed, checked, and it leaves the row with its time
   mkdir -p "${cold}/.config/safe/run"
-  ( cd "${WORK_DIR}" && env -u CLAUDECODE -u CODEX_THREAD_ID -u CODEX_CI -u OPENCODE bash -c 'exec python3 -c "import os,pty,sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))" "$@" <"'"${CASE_DIR}"'/ans"' bash "${core}" one-shot-store add --home "${cold}" >/dev/null 2>&1 ); rc=$?
+  ( cd "${WORK_DIR}" && env -u CLAUDECODE -u CODEX_THREAD_ID -u CODEX_CI -u OPENCODE HOME="${cold}" bash -c 'exec python3 -c "import os,pty,sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))" "$@" <"'"${CASE_DIR}"'/ans"' bash "${core}" one-shot-store add >/dev/null 2>&1 ); rc=$?
   [[ "${rc}" == 0 ]] && jq -e '.projects[0].added | test("^20")' "${cold}/.config/safe/run/one-shot-projects.json" >/dev/null || { fail "$FUNCNAME: the core at an operator's terminal: ${rc}"; return; }
   pass "$FUNCNAME"
 }
@@ -16470,7 +16484,113 @@ case_project_lane_standing_dedupe_prune_and_mise_exec_follow_the_pin() {
   done
   : > "${LOG_FILE}"
   SAFE_INSTALL_REAL_STATUS=0 lane_run 'mise exec -- npm install clean@2.0.0'
-  [[ "$(grep -cP '^REAL\tmise\texec\t--\tnpm\tinstall\tclean@2.0.0' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: mise exec was not dispatched once: $(grep REAL "${LOG_FILE}")"; return; }
+  # the pin is not used under mise exec (the question would go to an npm the outer mise may not run): no question, today's refusal
+  [[ "$(standing_root_asked)" == 0 ]] || { fail "$FUNCNAME: mise exec asked npm: $(grep REAL "${LOG_FILE}")"; return; }
+  grep -q 'mise exec -- npm install is not covered by the project lane' "${ERR_FILE}" || { fail "$FUNCNAME: mise exec under a pin: $(cat "${ERR_FILE}")"; return; }
+  pass "$FUNCNAME"
+}
+
+# 13. (review of 86c5d20) npm tells the mode as well as the root: a project named `lib` under a global prefix prints the same root as the
+# global tree; only the prefix says which. Both answers must agree with the pin.
+case_project_lane_standing_the_prefix_answer_tells_global_from_local() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-standing-prefix" kept@1.0.0
+  lane_safe_run_stub
+  standing_add || return
+  local project
+  project="$(standing_physical "${WORK_DIR}")"
+  # the root is the pinned directory's, the prefix is another directory: the command does not act on the pinned project
+  : > "${LOG_FILE}"
+  NPM_STUB_ROOT_ANSWER="${project}/node_modules" NPM_STUB_PREFIX_ANSWER="/tmp/not-pinned" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  grep -q 'the operator put this project on the one-shot route' "${ERR_FILE}" && { fail "$FUNCNAME: a root alone made the pin"; return; }
+  lane_reset_project
+  # the prefix is the pinned directory but the root is not directly under it: not the project tree
+  : > "${LOG_FILE}"
+  NPM_STUB_ROOT_ANSWER="${project}/lib/node_modules" NPM_STUB_PREFIX_ANSWER="${project}" NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  grep -q 'the operator put this project on the one-shot route' "${ERR_FILE}" && { fail "$FUNCNAME: a root not under the prefix made the pin"; return; }
+  lane_reset_project
+  # control: both agree
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_REAL_STATUS=7 NPM_STUB_ROOT_ANSWER="${project}/node_modules" NPM_STUB_PREFIX_ANSWER="${project}" lane_run 'npm install clean@2.0.0'
+  unset SAFE_INSTALL_REAL_STATUS
+  assert_status 7 "$FUNCNAME: control" || return
+  pass "$FUNCNAME"
+}
+
+# 14. The caller's environment is untouched; the housekeeping is on the command line, before the option terminator; an option the caller
+# gave stays where it was.
+case_project_lane_standing_the_question_leaves_the_callers_environment_alone() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-standing-env" kept@1.0.0
+  lane_safe_run_stub
+  standing_add || return
+  : > "${LOG_FILE}"
+  npm_config_update_notifier=true npm_config_logs_max=5 lane_run 'npm install clean@2.0.0 --logs-max=1 -- --extra'
+  grep -qP '^REAL\tnpm\troot\tclean@2.0.0\t--logs-max=1\t--update-notifier=false\t--logs-max=0\t--\t--extra$' "${LOG_FILE}" || { fail "$FUNCNAME: the question's line: $(grep -P '\troot' "${LOG_FILE}")"; return; }
+  grep -P '^ROOT_ENV\t' "${LOG_FILE}" | grep -qP 'env_update_notifier=true\tenv_logs_max=5' || { fail "$FUNCNAME: the caller's environment was changed: $(grep ROOT_ENV "${LOG_FILE}")"; return; }
+  pass "$FUNCNAME"
+}
+
+# 15. The pin is looked up before any lane-specific refusal: a command the lane would refuse (a project location spelled out) on a
+# pinned project reaches today's gate.
+case_project_lane_standing_the_pin_is_read_before_the_lane_refuses() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-standing-order" kept@1.0.0
+  lane_safe_run_stub
+  standing_add || return
+  : > "${LOG_FILE}"
+  SAFE_INSTALL_REAL_STATUS=7 lane_run 'npm install clean@2.0.0 --location=project'
+  unset SAFE_INSTALL_REAL_STATUS
+  assert_status 7 "$FUNCNAME: a spelled location on a pinned project" || return
+  ! grep -q '\[lane: project\]' "${ERR_FILE}" || { fail "$FUNCNAME: a lane refusal came first: $(cat "${ERR_FILE}")"; return; }
+  pass "$FUNCNAME"
+}
+
+# 16. A node_modules that is a link is not the project's own tree: the pin is not honoured.
+case_project_lane_standing_a_node_modules_link_is_not_honoured() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-standing-nmlink" kept@1.0.0
+  lane_safe_run_stub
+  standing_add || return
+  local project
+  project="$(standing_physical "${WORK_DIR}")"
+  rm -rf "${project}/node_modules"; mkdir -p "${CASE_DIR}/other-modules"; ln -s "${CASE_DIR}/other-modules" "${project}/node_modules"
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  grep -q 'the operator put this project on the one-shot route' "${ERR_FILE}" && { fail "$FUNCNAME: a linked node_modules was honoured"; return; }
+  pass "$FUNCNAME"
+}
+
+# 17. The question goes to the npm that will run the command, found the way the exec finds it: a mise shim is run through the real mise
+# (the same resolver as the exec), and the question's words and housekeeping ride along.
+case_project_lane_standing_the_question_goes_through_the_delegate_the_command_will_run() {
+  prepare_case "lane-standing-shim"
+  local bindir="${HOME_DIR}/wrap-bin" shimdir="${HOME_DIR}/shims" realbin="${HOME_DIR}/realbin" got
+  mkdir -p "${bindir}" "${shimdir}" "${realbin}"
+  printf '#!/usr/bin/env bash\n# safe-gate-wrapper v1 tool=mise\nexec safe gate mise -- "$@"\n' > "${bindir}/mise"
+  chmod +x "${bindir}/mise"
+  ln -s "${bindir}/mise" "${shimdir}/npm"
+  printf '#!/usr/bin/env bash\nprintf "%%s|%%s\\n" "${0##*/}" "$*"\n' > "${realbin}/mise"
+  chmod +x "${realbin}/mise"
+  got="$(PATH="${bindir}:${shimdir}:${realbin}:/usr/bin:/bin" GATE_LIB="${ROOT_DIR}/lib/gate-lib.sh" \
+    bash -c 'source "${GATE_LIB}"; SAFE_GATE_SUBCMD_IDX=1; safe_gate_project_lane_pin_npm_line root install clean@2.0.0 -- --x; printf "%s" "${SAFE_GATE_PIN_ANSWER}"' 2>&1)"
+  # (the stub is a script, whose $0 is its own path: argv[0] itself is the shared resolver's, held by the exec cases)
+  [[ "${got}" == 'mise|root clean@2.0.0 --update-notifier=false --logs-max=0 -- --x' ]] || { printf 'got: %s\n' "${got}" >&2; fail "$FUNCNAME: the question did not go through the shim's real mise"; return; }
+  pass "$FUNCNAME"
+}
+
+# 18. Every step of the question is bounded: an npm that never answers is no pin, and the command goes on within the bound.
+case_project_lane_standing_an_npm_that_never_answers_is_bounded() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-standing-hang" kept@1.0.0
+  lane_safe_run_stub
+  standing_add || return
+  local began=${SECONDS}
+  : > "${LOG_FILE}"
+  NPM_STUB_HANG=1 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" lane_run 'npm install clean@2.0.0'
+  (( SECONDS - began < 40 )) || { fail "$FUNCNAME: the question was not bounded ($((SECONDS - began)) s)"; return; }
+  grep -q 'the operator put this project on the one-shot route' "${ERR_FILE}" && { fail "$FUNCNAME: an answer that never came was honoured"; return; }
+  grep -q $'^PROJECTION\tnpm' "${LOG_FILE}" || { fail "$FUNCNAME: the lane did not go on"; return; }
   pass "$FUNCNAME"
 }
 
@@ -16798,6 +16918,12 @@ main() {
     case_project_lane_standing_add_list_and_remove_mean_the_same_directory \
     case_project_lane_standing_a_store_that_cannot_be_trusted_pins_nothing \
     case_project_lane_standing_dedupe_prune_and_mise_exec_follow_the_pin \
+    case_project_lane_standing_the_prefix_answer_tells_global_from_local \
+    case_project_lane_standing_the_question_leaves_the_callers_environment_alone \
+    case_project_lane_standing_the_pin_is_read_before_the_lane_refuses \
+    case_project_lane_standing_a_node_modules_link_is_not_honoured \
+    case_project_lane_standing_an_npm_that_never_answers_is_bounded \
+    case_project_lane_standing_the_question_goes_through_the_delegate_the_command_will_run \
     case_project_lane_standing_a_withdrawn_project_takes_the_lane_and_the_switch_off_changes_nothing \
     case_project_lane_oneshot_each_confirmable_kind_hands_the_command_over \
     case_project_lane_oneshot_a_start_up_input_or_a_destination_is_never_confirmable_however_it_is_named \

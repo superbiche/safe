@@ -8,8 +8,10 @@
   by `safe-core one-shot-store`, which checks the operator's terminal itself (a direct call from an agent session or without a
   terminal is 102 and touches nothing), on verified directories, as one strict bounded document, with a checked lock, a staged file
   created with its final mode, and "not recorded" told apart from "committed, durability uncertain"; an entry is the physical path
-  with device and inode. The lane asks in two steps: data alone (this directory or an ancestor is a pin; else no npm is run), then
-  `npm root` with the command's own arguments, honoured only when npm names a pinned directory in project mode. `list` creates
+  with device and inode. The lane asks in two steps, before any lane-specific refusal: data alone (this directory or an ancestor is a pin; else no
+  npm is run), then two read-only npm answers (`npm prefix` and `npm root`, the command's own arguments, `--update-notifier=false
+  --logs-max=0` on the command line and the caller's environment untouched), honoured only when the root is exactly
+  `<prefix>/node_modules` and the prefix is a pinned directory; not used under `mise exec`. The writer's only anchor is `HOME`. `list` creates
   nothing and exits 3 when the store cannot be trusted. A graph the lane cannot bind names this way out. Agent contract: an
   operator-only flow, relayed only when the operator asks for a standing decision.
 - Project lane (still behind `install.project_lane`): the operator sends ONE command to the one-shot route. Every refusal of the
@@ -23,8 +25,7 @@
   differential path, which refuses what it cannot judge and has no override of its own. A hand-over returns through the same non-zero
   path as a refusal. The core's lockfile admission reports every finding by code (an undecodable entry no longer hides an unsafe key).
   Agent contract: the agent rule and exit codes 100 and 102 describe the one-command confirmation, conditional on an eligible refusal and
-  on `install.project_lane` being on. The standing per-project decision is ticket 1690 (not in this release); a graph the lane cannot
-  bind has no override yet. The structural lint reads shell commands, rejects a refusal in a pipeline, substitution or subshell, and
+  on `install.project_lane` being on. A graph the lane cannot bind has no confirmation for one command; its way out is the standing per-project decision. The structural lint reads shell commands, rejects a refusal in a pipeline, substitution or subshell, and
   keeps its known mutations as fixtures.
 
 - Project lane (still behind `install.project_lane`): standing acceptances and install records, **no terminal prompt**. The

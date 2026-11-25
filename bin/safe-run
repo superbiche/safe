@@ -3886,7 +3886,7 @@ cmd_one_shot_project() {
 cmd_one_shot_project_list() {
   local core out rc=0
   core="$(one_shot_core)"
-  out="$("$core" one-shot-store list --home "$HOME")" || rc=$?
+  out="$("$core" one-shot-store list)" || rc=$?
   if (( rc == 3 )); then
     err "the one-shot project store cannot be trusted as the operator's own: it is ignored, so no project is on the one-shot route (this is not an empty list)"
     return 3
@@ -3904,7 +3904,7 @@ cmd_one_shot_project_change() {
   shift
   core="$(one_shot_core)"
   # the core asks (on the operator's terminal) and commits; its standard output is the committed change
-  out="$("$core" one-shot-store "$verb" --home "$HOME" -- "$@")" || rc=$?
+  out="$("$core" one-shot-store "$verb" -- "$@")" || rc=$?
   case "$rc" in
     0|4) ;;
     102) exit 102 ;;

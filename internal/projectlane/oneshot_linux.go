@@ -184,6 +184,11 @@ func decodeOneShot(raw []byte) (oneShotDocument, error) {
 	if err := strictjson.RejectVariants(members, "schema_version", "projects"); err != nil {
 		return doc, err
 	}
+	for _, name := range []string{"schema_version", "projects"} {
+		if _, ok := members[name]; !ok {
+			return doc, fmt.Errorf("the member %q is missing", name)
+		}
+	}
 	var rows []json.RawMessage
 	if err := json.Unmarshal(members["projects"], &rows); err != nil || rows == nil {
 		return doc, errors.New("projects is not a list")
@@ -195,6 +200,17 @@ func decodeOneShot(raw []byte) (oneShotDocument, error) {
 		}
 		if err := strictjson.RejectVariants(entry, "path", "dev", "inode", "added"); err != nil {
 			return doc, err
+		}
+		// every member of the schema, with its type, before a row is used
+		for name, kind := range map[string]byte{"path": '"', "dev": '0', "inode": '0', "added": '"'} {
+			value, ok := entry[name]
+			if !ok {
+				return doc, fmt.Errorf("a row lacks the member %q", name)
+			}
+			text := strings.TrimSpace(string(value))
+			if text == "" || (kind == '"' && text[0] != '"') || (kind == '0' && (text[0] < '0' || text[0] > '9')) {
+				return doc, fmt.Errorf("the member %q of a row has the wrong type", name)
+			}
 		}
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -262,6 +278,29 @@ func (s OneShotStore) read() (oneShotDocument, error) {
 	return readOneShotFile(run)
 }
 
+// oPath is O_PATH (the same value on every Linux architecture; the standard library does not name it).
+const oPath = 0x200000
+
+// openPathDir opens a directory by a path as given (the KERNEL resolves it, never a textual clean), as a directory ONLY, path-only
+// and non-blocking: a FIFO or a device in its place is ENOTDIR at once instead of a blocking open, and a directory the operator can
+// search but not read is still opened.
+func openPathDir(path string) (*os.File, error) {
+	fd, err := syscall.Open(path, oPath|syscall.O_DIRECTORY|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	return os.NewFile(uintptr(fd), path), nil
+}
+
+// openParentPath opens the parent of an open directory the same way (path-only, never blocking).
+func openParentPath(dir *os.File) (*os.File, error) {
+	fd, err := syscall.Openat(int(dir.Fd()), "..", oPath|syscall.O_DIRECTORY|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, &os.PathError{Op: "openat", Path: "..", Err: err}
+	}
+	return os.NewFile(uintptr(fd), ".."), nil
+}
+
 // dirIdentity is what an open directory is: its kernel-reported physical path and its identity.
 func dirIdentity(file *os.File) (OneShotPlan, error) {
 	info, err := file.Stat()
@@ -285,7 +324,7 @@ func dirIdentity(file *os.File) (OneShotPlan, error) {
 // openDirAsGiven hands the operand to the KERNEL exactly as given (never a textual clean: `link/..` is the parent of what the
 // link leads to), and reports what it opened.
 func openDirAsGiven(path string) (OneShotPlan, error) {
-	file, err := os.Open(path)
+	file, err := openPathDir(path)
 	if err != nil {
 		return OneShotPlan{}, err
 	}
@@ -312,7 +351,7 @@ func (s OneShotStore) CheckHere() int {
 	if err != nil || len(doc.Projects) == 0 {
 		return OneShotNotPin
 	}
-	current, err := os.Open(".")
+	current, err := openPathDir(".")
 	if err != nil {
 		return OneShotNotPin
 	}
@@ -331,7 +370,7 @@ func (s OneShotStore) CheckHere() int {
 		if plan.Path == "/" {
 			break
 		}
-		parent, err := os.Open(fmt.Sprintf("/proc/self/fd/%d/..", current.Fd()))
+		parent, err := openParentPath(current)
 		current.Close()
 		if err != nil {
 			return result
@@ -342,30 +381,55 @@ func (s OneShotStore) CheckHere() int {
 	return result
 }
 
-// VerifyRoot is the second question: the line npm printed for `npm root`. It is honoured only when it is exactly one line, ends in
-// /node_modules, and the directory it names (opened here, never taken as text) is itself a stored pin by identity.
-func (s OneShotStore) VerifyRoot(output []byte) int {
+// oneLine returns the single line of npm's answer (exactly one line, newline-terminated, absolute, no control character), or "".
+func oneLine(output []byte) string {
 	text := string(output)
-	text = strings.TrimSuffix(text, "\n")
-	if text == "" || strings.ContainsAny(text, "\n\r\x00") || !strings.HasSuffix(text, "/node_modules") || !strings.HasPrefix(text, "/") {
-		return OneShotNotPin
+	if !strings.HasSuffix(text, "\n") {
+		return ""
 	}
-	dir := strings.TrimSuffix(text, "/node_modules")
-	if dir == "" {
-		dir = "/"
+	text = strings.TrimSuffix(text, "\n")
+	if text == "" || strings.ContainsAny(text, "\n\r\x00") || !strings.HasPrefix(text, "/") {
+		return ""
+	}
+	return text
+}
+
+// VerifyAnswer is the second question, put to npm in TWO read-only answers from the same npm, arguments, environment and directory:
+// its prefix and its root. The pin is honoured only when both are one line, the root is EXACTLY the node_modules directly under the
+// prefix (so a project named `lib` under a prefix, whose local and global roots print the same path, is told from global mode: in
+// global mode the prefix is the global one and the root is <prefix>/lib/node_modules), the prefix names a stored pin by identity
+// (the directory is opened here, never taken as text), and the target's node_modules is not a link (the tree written must be inside
+// the pinned directory). An answer of more than one line is refused before any directory is opened.
+func (s OneShotStore) VerifyAnswer(prefixOutput, rootOutput []byte) int {
+	prefix, root := oneLine(prefixOutput), oneLine(rootOutput)
+	if prefix == "" || root == "" || root != strings.TrimSuffix(prefix, "/")+"/node_modules" && !(prefix == "/" && root == "/node_modules") {
+		return OneShotNotPin
 	}
 	doc, err := s.read()
 	if err != nil {
 		return OneShotNotPin
 	}
-	plan, err := openDirAsGiven(dir)
+	dir, err := openPathDir(prefix)
 	if err != nil {
 		return OneShotNotPin
 	}
-	if found, _ := doc.lookup(plan); found {
-		return OneShotPinned
+	defer dir.Close()
+	plan, err := dirIdentity(dir)
+	if err != nil {
+		return OneShotNotPin
 	}
-	return OneShotNotPin
+	if found, _ := doc.lookup(plan); !found {
+		return OneShotNotPin
+	}
+	// node_modules, when it exists, is a directory of this directory and not a link
+	if info, err := os.Lstat(fmt.Sprintf("/proc/self/fd/%d/node_modules", dir.Fd())); err == nil {
+		if !info.IsDir() {
+			return OneShotNotPin
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return OneShotNotPin
+	}
+	return OneShotPinned
 }
 
 // List reads the whole store for a listing. A store that cannot be trusted is an error the listing reports (and nothing is pinned).
@@ -405,7 +469,7 @@ func oneShotPathOK(path string) error {
 func Resolve(dirs []string, needManifest bool) ([]OneShotPlan, error) {
 	plans := make([]OneShotPlan, 0, len(dirs))
 	for _, dir := range dirs {
-		file, err := os.Open(dir)
+		file, err := openPathDir(dir)
 		if err != nil {
 			return nil, fmt.Errorf("cannot read the directory %q: %w", dir, err)
 		}
@@ -516,54 +580,59 @@ func (s OneShotStore) Add(plans []OneShotPlan) error {
 	})
 }
 
-// RemoveKeys are the stored keys a Remove would withdraw, each operand named by its exact stored key or by a directory that the
-// kernel resolves to one. Nothing is changed.
-func (s OneShotStore) RemoveKeys(args []string) ([]string, error) {
+// ShowRemoval resolves the operands to the stored entries a withdrawal would remove, each named by its exact stored key or by a
+// directory the kernel resolves to one. Nothing is changed. What it returns is what the operator is SHOWN, and exactly what
+// RemoveEntries removes: the entries (path, device, inode, time), not the operands again.
+func (s OneShotStore) ShowRemoval(args []string) ([]OneShotEntry, error) {
 	doc, err := s.read()
 	if err != nil {
 		return nil, err
 	}
-	return removeKeys(doc, args)
+	return showRemoval(doc, args)
 }
 
-func removeKeys(doc oneShotDocument, args []string) ([]string, error) {
-	keys := make([]string, 0, len(args))
+func showRemoval(doc oneShotDocument, args []string) ([]OneShotEntry, error) {
+	shown := make([]OneShotEntry, 0, len(args))
 	for _, arg := range args {
-		key := ""
-		for _, entry := range doc.Projects {
-			if entry.Path == arg {
-				key = arg
+		var found *OneShotEntry
+		for i := range doc.Projects {
+			if doc.Projects[i].Path == arg {
+				found = &doc.Projects[i]
 			}
 		}
-		if key == "" {
+		if found == nil {
 			if plan, err := openDirAsGiven(arg); err == nil {
-				for _, entry := range doc.Projects {
-					if entry.Path == plan.Path {
-						key = plan.Path
+				for i := range doc.Projects {
+					if doc.Projects[i].Path == plan.Path {
+						found = &doc.Projects[i]
 					}
 				}
 			}
 		}
-		if key == "" {
+		if found == nil {
 			return nil, fmt.Errorf("%q is not on the one-shot route (by its stored path or its physical path): nothing was changed", arg)
 		}
-		keys = append(keys, key)
+		shown = append(shown, *found)
 	}
-	return keys, nil
+	return shown, nil
 }
 
-// Remove withdraws projects; all or nothing. It returns the keys removed (only after the commit).
-func (s OneShotStore) Remove(args []string) ([]string, error) {
-	var removed []string
-	err := s.lockedChange(func(doc oneShotDocument) (oneShotDocument, error) {
-		keys, err := removeKeys(doc, args)
-		if err != nil {
-			return doc, err
-		}
-		removed = keys
+// RemoveEntries withdraws exactly the entries that were shown, under the lock: every one must still be stored, identical, or the
+// decision changed and nothing is removed. All or nothing.
+func (s OneShotStore) RemoveEntries(shown []OneShotEntry) error {
+	return s.lockedChange(func(doc oneShotDocument) (oneShotDocument, error) {
 		drop := map[string]struct{}{}
-		for _, key := range keys {
-			drop[key] = struct{}{}
+		for _, entry := range shown {
+			stored := false
+			for _, have := range doc.Projects {
+				if have == entry {
+					stored = true
+				}
+			}
+			if !stored {
+				return doc, fmt.Errorf("the decision changed since it was shown (%q is not stored as it was): nothing was removed", entry.Path)
+			}
+			drop[entry.Path] = struct{}{}
 		}
 		kept := doc.Projects[:0:0]
 		for _, entry := range doc.Projects {
@@ -574,8 +643,24 @@ func (s OneShotStore) Remove(args []string) ([]string, error) {
 		doc.Projects = kept
 		return doc, nil
 	})
-	if err != nil && !errors.Is(err, ErrDurabilityUncertain) {
+}
+
+// Remove withdraws the operands in one step (what a test, or a caller that shows nothing, uses): ShowRemoval, then RemoveEntries.
+// It returns the keys removed.
+func (s OneShotStore) Remove(args []string) ([]string, error) {
+	shown, err := s.ShowRemoval(args)
+	if err != nil {
 		return nil, err
 	}
-	return removed, err
+	keys := make([]string, 0, len(shown))
+	for _, entry := range shown {
+		keys = append(keys, entry.Path)
+	}
+	if err := s.RemoveEntries(shown); err != nil {
+		if errors.Is(err, ErrDurabilityUncertain) {
+			return keys, err
+		}
+		return nil, err
+	}
+	return keys, nil
 }

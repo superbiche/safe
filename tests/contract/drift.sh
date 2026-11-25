@@ -537,10 +537,23 @@ write("pin-question-asked-outside-the-route", src[:c9.end()] + "  safe_gate_proj
 write("pin-data-question-asked-outside-the-route", src[:c9.end()] + "  safe_gate_project_lane_pin_here || return 1\n" + src[c9.end():])
 write("pin-route-called-outside-the-runner", src[:c9.end()] + "  safe_gate_project_lane_pin_route x && return 1\n" + src[c9.end():])
 write("the-store-named-outside-the-two-questions", src[:c9.end()] + "  \"${SAFE_DIR}/safe-core\" one-shot-store check --home \"${HOME}\" || return 1\n" + src[c9.end():])
-r9 = re.search(r"  if safe_gate_project_lane_pin_route \"\$\{verb\}\" \"\$@\"; then\n", src)
+r9 = re.search(r"  if \(\( ! plain_global \)\) && safe_gate_project_lane_pin_route \"\$\{verb\}\" \"\$@\"; then\n", src)
 assert r9, "the route call"
-write("pin-route-read-twice", src[:r9.start()] + '  if safe_gate_project_lane_pin_route "${verb}" "$@"; then :; fi\n' + src[r9.start():])
+write("pin-route-read-twice", src[:r9.start()] + '  if (( ! plain_global )) && safe_gate_project_lane_pin_route "${verb}" "$@"; then :; fi\n' + src[r9.start():])
 write("pin-route-never-read", src[:r9.start()] + '  if false; then\n' + src[r9.end():])
+blk = re.search(r"  if \(\( ! plain_global \)\) && safe_gate_project_lane_pin_route \"\$\{verb\}\" \"\$@\"; then\n[^\n]*\n[^\n]*\n  fi\n", src)
+assert blk, "the route block"
+tail = src.replace(blk.group(0), "", 1)
+anchor = tail.index("  if (( plain_global )); then\n    safe_gate_project_lane_hand_over_silent")
+write("pin-route-moved-below-the-spelled-global-guards", tail[:anchor] + blk.group(0) + tail[anchor:])
+write("a-refusal-before-the-pin-lookup", src[:blk.start()] + '  safe_gate_project_lane_unsupported_kind command_form "${verb}" "x"\n  return $?\n' + src[blk.start():])
+a = re.search(r"  safe_gate_project_lane_pin_npm_line prefix \"\$@\" \|\| return 1\n", src)
+assert a, "the prefix question"
+write("prefix-question-asked-twice-in-its-owner", src[:a.end()] + a.group(0) + src[a.end():])
+b = re.search(r"  safe_gate_project_lane_pin_npm_line root \"\$@\" \|\| return 1\n", src)
+assert b, "the root question"
+write("root-question-never-asked", src[:b.start()] + src[b.end():])
+write("a-question-asked-outside-its-owner", src[:c9.end()] + '  safe_gate_project_lane_pin_npm_line root "$@" || return 1\n' + src[c9.end():])
 PY
   for name in diagnostic-with-the-word-return second-question-on-the-next-line hand-over-in-the-runner hand-over-helper-called-outside-its-owners \
       question-outside-conclude plain-return-removed return-in-a-subshell refusal-in-a-pipeline a-kind-outside-the-closed-list \
@@ -548,7 +561,9 @@ PY
       phase-declared-local question-through-the-outcome-handler reserved-status-as-a-literal phase-set-back-to-routing \
       mark-raised-where-the-question-is-asked prompt-called-outside-its-loop \
       pin-question-asked-outside-the-route pin-data-question-asked-outside-the-route pin-route-called-outside-the-runner \
-      the-store-named-outside-the-two-questions pin-route-read-twice pin-route-never-read; do
+      the-store-named-outside-the-two-questions pin-route-read-twice pin-route-never-read \
+      pin-route-moved-below-the-spelled-global-guards a-refusal-before-the-pin-lookup prefix-question-asked-twice-in-its-owner \
+      root-question-never-asked a-question-asked-outside-its-owner; do
     [[ -f "${dir}/${name}.sh" ]] || { bad="${bad} ${name}(missing)"; continue; }
     if python3 -I "${ROOT}/tests/contract/lane_lint.py" "${dir}/${name}.sh" >/dev/null; then
       bad="${bad} ${name}"

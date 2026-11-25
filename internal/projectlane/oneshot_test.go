@@ -60,6 +60,11 @@ func inDir(t *testing.T, dir string) {
 	t.Cleanup(func() { _ = os.Chdir(old) })
 }
 
+// verify puts npm's two answers (its prefix and its root, each one line) to the store.
+func verify(store OneShotStore, prefix, root string) int {
+	return store.VerifyAnswer([]byte(prefix+"\n"), []byte(root+"\n"))
+}
+
 func storeFile(home string) string {
 	return filepath.Join(home, ".config", "safe", "run", OneShotStoreFile)
 }
@@ -80,20 +85,23 @@ func TestOneShotRoundTripAndAncestors(t *testing.T) {
 	if store.CheckHere() != OneShotPinned {
 		t.Fatal("an ancestor that is a pin was not found")
 	}
-	// the second question: npm's line must name a stored pin by identity, however the command was typed
-	if store.VerifyRoot([]byte(root+"/node_modules\n")) != OneShotPinned {
-		t.Fatal("the pinned root's line was not honoured")
+	// the second question: npm's prefix and root must name a stored pin by identity, however the command was typed
+	if verify(store, root, root+"/node_modules") != OneShotPinned {
+		t.Fatal("the pinned root's answer was not honoured")
 	}
-	for name, line := range map[string]string{
-		"the member (not a pin)": member + "/node_modules\n",
-		"a global line":          root + "/lib/node_modules\n",
-		"two lines":              root + "/node_modules\n" + root + "/node_modules\n",
-		"no node_modules":        root + "\n",
-		"a relative line":        "node_modules\n",
-		"empty":                  "",
-		"a line with a NUL":      root + "/node_modules\x00\n",
+	for name, answer := range map[string][2]string{
+		"the member (not a pin)":              {member + "\n", member + "/node_modules\n"},
+		"a global answer":                     {root + "\n", root + "/lib/node_modules\n"},
+		"two root lines":                      {root + "\n", root + "/node_modules\n" + root + "/node_modules\n"},
+		"two prefix lines":                    {root + "\n" + root + "\n", root + "/node_modules\n"},
+		"a root that is not under the prefix": {root + "\n", member + "/node_modules\n"},
+		"no node_modules":                     {root + "\n", root + "\n"},
+		"a relative line":                     {"root\n", "node_modules\n"},
+		"empty":                               {"", ""},
+		"no final newline":                    {root, root + "/node_modules"},
+		"a line with a NUL":                   {root + "\n", root + "/node_modules\x00\n"},
 	} {
-		if store.VerifyRoot([]byte(line)) == OneShotPinned {
+		if store.VerifyAnswer([]byte(answer[0]), []byte(answer[1])) == OneShotPinned {
 			t.Fatalf("%s was honoured", name)
 		}
 	}
@@ -117,11 +125,11 @@ func TestOneShotVerifyRootOpensTheDirectory(t *testing.T) {
 	if err := os.Symlink(root, link); err != nil {
 		t.Fatal(err)
 	}
-	if store.VerifyRoot([]byte(link+"/node_modules\n")) != OneShotPinned {
+	if verify(store, link, link+"/node_modules") != OneShotPinned {
 		t.Fatal("a link to the pinned directory is the pinned directory")
 	}
 	other := oneShotProject(t, "other")
-	if store.VerifyRoot([]byte(other+"/node_modules\n")) == OneShotPinned {
+	if verify(store, other, other+"/node_modules") == OneShotPinned {
 		t.Fatal("another project was honoured")
 	}
 	// a replaced directory: same path, another inode
@@ -131,7 +139,7 @@ func TestOneShotVerifyRootOpensTheDirectory(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if store.VerifyRoot([]byte(root+"/node_modules\n")) == OneShotPinned {
+	if verify(store, root, root+"/node_modules") == OneShotPinned {
 		t.Fatal("a replaced directory was honoured")
 	}
 	inDir(t, root)
@@ -301,22 +309,27 @@ func TestOneShotWritersAreSerialised(t *testing.T) {
 	store, _ := oneShotHome(t)
 	a, b := oneShotProject(t, "a"), oneShotProject(t, "b")
 	addOne(t, store, a)
-	first := true
-	var mu sync.Mutex
+	// a barrier, not sleeps: the withdrawal holds the lock after it read the old document until the other writer is known to be
+	// waiting for it (it has started its own change), then both finish
+	readOld := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
 	afterRead = func() {
-		mu.Lock()
-		slow := first
-		first = false
-		mu.Unlock()
-		if slow {
-			time.Sleep(200 * time.Millisecond)
-		}
+		once.Do(func() {
+			close(readOld)
+			<-release
+		})
 	}
 	defer func() { afterRead = nil }()
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { defer wg.Done(); _, _ = store.Remove([]string{a}) }()
-	go func() { time.Sleep(50 * time.Millisecond); defer wg.Done(); _ = store.Add(mustResolve(t, b)) }()
+	go func() {
+		defer wg.Done()
+		<-readOld // the withdrawal has read the old document and holds the lock
+		close(release)
+		_ = store.Add(mustResolve(t, b))
+	}()
 	wg.Wait()
 	rows, err := store.List()
 	if err != nil || len(rows) != 1 || rows[0].Path != b {
@@ -474,14 +487,19 @@ func TestOneShotStagedFileIsNeverWiderThanItsFinalMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer handle.Close()
-	old := syscallUmask(0)
+	old := syscallUmask(0) // the most permissive mask: the creating call's own mode is all that limits the file
 	defer syscallUmask(old)
+	var atCreation os.FileMode
+	afterCreateMode = func(file *os.File) {
+		info, _ := file.Stat()
+		atCreation = info.Mode().Perm()
+	}
+	defer func() { afterCreateMode = nil }()
 	if _, err := handle.createExclusiveMode("staged", []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(filepath.Join(run, "staged"))
-	if err != nil || info.Mode().Perm() != 0o600 {
-		t.Fatalf("mode %v %v", info.Mode(), err)
+	if atCreation != 0o600 {
+		t.Fatalf("the staged file existed with mode %v at creation", atCreation)
 	}
 }
 
@@ -524,5 +542,189 @@ func TestOneShotEveryDirectoryOfTheChainMustBeClosedToOthers(t *testing.T) {
 	}
 	if store.CheckHere() != OneShotPinned {
 		t.Fatal("control")
+	}
+}
+
+// A project named `lib` under a prefix: its local root and the global root under that prefix are the SAME path. npm's prefix tells
+// the mode: in global mode the prefix is the global one and the root is <prefix>/lib/node_modules.
+func TestOneShotPrefixTellsTheModeWhenTheRootsCoincide(t *testing.T) {
+	store, _ := oneShotHome(t)
+	prefix := oneShotProject(t, "prefixdir")
+	lib := filepath.Join(prefix, "lib")
+	if err := os.MkdirAll(lib, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lib, "package.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	addOne(t, store, prefix) // the prefix itself is pinned; the project lib is NOT
+	// global mode (-g --prefix=<prefix>): prefix <prefix>, root <prefix>/lib/node_modules: the root is not under the prefix directly
+	if verify(store, prefix, lib+"/node_modules") == OneShotPinned {
+		t.Fatal("global mode on a pinned prefix was honoured")
+	}
+	// local mode in the project lib (lib is pinned): prefix lib, root lib/node_modules
+	addOne(t, store, lib)
+	if verify(store, lib, lib+"/node_modules") != OneShotPinned {
+		t.Fatal("control: the pinned project lib in project mode")
+	}
+	// the same root with the GLOBAL prefix printed is not it
+	if verify(store, prefix, lib+"/node_modules") == OneShotPinned {
+		t.Fatal("the coincident root was honoured with another prefix")
+	}
+}
+
+// A link whose NAME holds a newline and that leads to a pinned directory is not the pinned directory's answer.
+func TestOneShotAnAnswerOfMoreThanOneLineIsRefusedBeforeAnyDirectoryIsOpened(t *testing.T) {
+	store, _ := oneShotHome(t)
+	dir := oneShotProject(t, "p")
+	addOne(t, store, dir)
+	base := t.TempDir()
+	if err := os.Symlink(dir, base+"/a\nb"); err != nil {
+		t.Skip("no newline names here")
+	}
+	if verify(store, base+"/a\nb", base+"/a\nb/node_modules") == OneShotPinned {
+		t.Fatal("a name that holds a newline reached a pinned directory")
+	}
+	if store.VerifyAnswer([]byte(base+"/a\nb\n"), []byte(base+"/a\nb/node_modules\n")) == OneShotPinned {
+		t.Fatal("two lines were read as one")
+	}
+}
+
+// The tree written must be inside the pinned directory: a node_modules that is a link is not it.
+func TestOneShotAPinWhoseNodeModulesIsALinkIsNotHonoured(t *testing.T) {
+	store, _ := oneShotHome(t)
+	dir := oneShotProject(t, "p")
+	addOne(t, store, dir)
+	if verify(store, dir, dir+"/node_modules") != OneShotPinned {
+		t.Fatal("control: no node_modules yet")
+	}
+	if err := os.MkdirAll(dir+"/node_modules", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if verify(store, dir, dir+"/node_modules") != OneShotPinned {
+		t.Fatal("control: a node_modules directory")
+	}
+	if err := os.Remove(dir + "/node_modules"); err != nil {
+		t.Fatal(err)
+	}
+	elsewhere := t.TempDir()
+	if err := os.Symlink(elsewhere, dir+"/node_modules"); err != nil {
+		t.Fatal(err)
+	}
+	if verify(store, dir, dir+"/node_modules") == OneShotPinned {
+		t.Fatal("a node_modules that leads outside the pinned directory was honoured")
+	}
+}
+
+// Every member of the schema, with its type, before a row is used.
+func TestOneShotARowWithMembersMissingOrOfTheWrongTypeIsNotAStore(t *testing.T) {
+	store, home := oneShotHome(t)
+	dir := oneShotProject(t, "p")
+	inDir(t, dir)
+	write := func(content string) {
+		if err := os.WriteFile(storeFile(home), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_ = os.Chmod(storeFile(home), 0o600)
+	}
+	for name, doc := range map[string]string{
+		"only a path":     `{"schema_version":1,"projects":[{"path":"` + dir + `"}]}`,
+		"no inode":        `{"schema_version":1,"projects":[{"path":"` + dir + `","dev":1,"added":"x"}]}`,
+		"a string device": `{"schema_version":1,"projects":[{"path":"` + dir + `","dev":"1","inode":2,"added":"x"}]}`,
+		"a numeric path":  `{"schema_version":1,"projects":[{"path":5,"dev":1,"inode":2,"added":"x"}]}`,
+		"no version":      `{"projects":[]}`,
+		"no projects":     `{"schema_version":1}`,
+	} {
+		write(doc)
+		if _, err := store.List(); err == nil {
+			t.Fatalf("%s was listed", name)
+		}
+		if store.CheckHere() != OneShotNotPin {
+			t.Fatalf("%s pinned something", name)
+		}
+	}
+}
+
+// Nothing here blocks: a pinned path that is now a FIFO is told at once, and a directory that can be searched but not read is
+// still passed by the ancestor walk.
+func TestOneShotNothingBlocksAndASearchOnlyDirectoryIsPassed(t *testing.T) {
+	store, _ := oneShotHome(t)
+	dir := oneShotProject(t, "p")
+	addOne(t, store, dir)
+	if err := os.Rename(dir, dir+".gone"); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscallMkfifo(dir); err != nil {
+		t.Skip("no fifo here")
+	}
+	done := make(chan []OneShotRow, 1)
+	go func() { rows, _ := store.List(); done <- rows }()
+	select {
+	case rows := <-done:
+		if len(rows) != 1 || rows[0].State == "honoured" {
+			t.Fatalf("%+v", rows)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("list blocked on a FIFO in place of a pinned directory")
+	}
+	// search-only ancestor: x without r
+	root := oneShotProject(t, "root")
+	addOne(t, store, root)
+	inner := filepath.Join(root, "inner")
+	if err := os.MkdirAll(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0o311); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(root, 0o755)
+	inDir(t, inner)
+	if store.CheckHere() != OneShotPinned {
+		t.Fatal("a pinned ancestor the operator can search but not read was not passed")
+	}
+}
+
+// What was shown is what is removed: when the stored entry changed between the two steps, nothing is removed.
+func TestOneShotRemovalCommitsWhatWasShown(t *testing.T) {
+	store, _ := oneShotHome(t)
+	dir := oneShotProject(t, "p")
+	addOne(t, store, dir)
+	shown, err := store.ShowRemoval([]string{dir})
+	if err != nil || len(shown) != 1 {
+		t.Fatalf("%v %v", shown, err)
+	}
+	// the decision changes between the two steps, under the SAME key: another writer withdraws the project, the directory is
+	// replaced by another one at the same path (kept alive beside it, so the inode differs), and it is pinned again
+	if _, err := store.Remove([]string{dir}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(dir, dir+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Add(mustResolve(t, dir)); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := store.List()
+	before := len(rows)
+	if err := store.RemoveEntries(shown); err == nil || !strings.Contains(err.Error(), "decision changed") {
+		t.Fatalf("a changed decision was removed: %v", err)
+	}
+	if rows, _ := store.List(); len(rows) != before {
+		t.Fatal("something was removed although the decision changed")
+	}
+	// exact-key withdrawal of a gone directory keeps working
+	gone := oneShotProject(t, "gone")
+	addOne(t, store, gone)
+	if err := os.RemoveAll(gone); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := store.Remove([]string{gone}); err != nil || len(removed) != 1 {
+		t.Fatalf("a gone directory: %v %v", removed, err)
 	}
 }
