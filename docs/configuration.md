@@ -303,8 +303,7 @@ pass and warnings under `environment.release_follow`.
   command, never recorded. **Blocking advisory:** a typed `name@version` per artifact (the acceptance is recorded as today's
   gate records it: a local approval of that exact artifact and source), or `record name@version`, which also records the
   advisory override on the host-allow entry (advisory-only, through `safe-run host-allow add --accept-block`, which asks
-  again). **Graph not bound:** no override at the terminal (it ends as it does unattended, with its line; the one-shot confirmation
-  is a separate ticket). **Adverse advisory:** ONE prompt
+  again). **Graph not bound:** no override at the terminal (it is decided after the evidence is read, so it ends as it does unattended, with its line). **Adverse advisory:** ONE prompt
   lists every artifact and advisory; `[y]` accepts the listed exact artifacts (each recorded as an acceptance), `[a]` also
   records a host-allow grant (npm and python, as today), `[N]` declines. **Wait:** today's adverse override. **Socket on a named
   root:** the rate-limit approval (for this command; the approval of each exact artifact is recorded), the consent ask (`Y`
@@ -329,11 +328,38 @@ pass and warnings under `environment.release_follow`.
   command, no advisory at high or above stands on its bytes (an inherited one, a bundled member's) except one the operator
   accepted in this command, it relies on no followed authority for any of them, and nothing excludes the command as a whole
   (confirmed missing evidence, a confirmed Socket outage, a malice or block override record nothing). New adverse
-  evidence revokes the receipt it supersedes at once, after every reading. A routing refusal, an unreadable baseline and a graph the lane cannot bind are not asked about (no override yet). A cancellation (TERM, INT) at a prompt, or while the `[a]` grant is being reconfirmed, ends the prompt and the writer and frees the project lock; the acceptance already given stays, nothing is granted or published. A dry run, by argument or by npm's configuration, is never prompted. When
+  evidence revokes the receipt it supersedes at once, after every reading. A routing refusal and a baseline from history that cannot be read have their one-command confirmation (see **The one-shot route, by the operator**); a graph the lane cannot bind has no override yet. A cancellation (TERM, INT) at a prompt, or while the `[a]` grant is being reconfirmed, ends the prompt and the writer and frees the project lock; the acceptance already given stays, nothing is granted or published. A dry run, by argument or by npm's configuration, is never prompted. When
   the prompts end the evidence may not be older than 15 minutes counted from BEFORE the first evidence read
   (`install.lane_evidence_window_seconds` in the operator's configuration may shorten it), checked immediately before the
   baseline is recorded and again immediately before the binder starts: otherwise the command is refused, and what was accepted stays recorded, so the
   rerun asks nothing again. An agent session is never prompted: it ends as it does unattended.
+
+  **The one-shot route, by the operator.** For ONE command, at the operator's terminal only. Every refusal of the lane *records*
+  itself and returns; the final line is printed once, at the lane's top level, after the lane's lock and scratch are freed. A refusal
+  is **confirmable** only when the site gives it an explicit kind from a closed list, and only in the routing phase (before the first
+  evidence reading); there is no default. The kinds, which are what the lane loses by not judging the closure: *command form* (a spelling
+  of global mode, an option before the verb, the option terminator, a workspace selection, a `--prefix`/`--cwd` selection, a combination
+  the lane does not carry, a package named to `update`, `ci`, `dedupe` or `prune`, a name with a glob character, a version that is not
+  exact, `mise exec`); *project shape* (an unsupported source or a legacy lockfile in uncommitted changes or outside git, a regular
+  `npm-shrinkwrap.json` (the question says npm would use it), no lockfile, a plan that is not lockfile version 2 or 3, an unrecognised
+  lockfile version, a private-registry name); *npm capability* (an npm that lacks what the lane needs); *baseline history* (the
+  lockfile committed at the head cannot be read, when it is not the file on disk); *npm setting* (an ordinary setting the lane cannot
+  carry). **Never confirmable**, whatever names it (an option, the environment, an effective configuration): an input npm or Node would
+  load at start-up or a storage destination, which are the configuration keys `node-options`, `script-shell`, `onload-script`,
+  `userconfig`, `globalconfig`, `cache` and `logs-dir` and the environment's `NODE_OPTIONS`, `PREFIX` and `DESTDIR` (every other key is an
+  ordinary setting; a key in doubt is on the list), a project `.npmrc` setting, a launcher the lane cannot identify; a link or special
+  file where the lane needs a regular one; a live lockfile that is unsafe (a key outside the tree, an unsafe link) or not completely
+  decoded (an entry that does not decode never hides an unsafe key: the core's admission reports every finding by code and the shell
+  branches on the code, an unsafe one first); a project inside a workspace root; the lane's own safety (its project, storage, lock and
+  programs), the reused guards, npm's own errors, and everything at or after the first evidence reading, after a decision or in the bind
+  phase. Their way out is to remove the cause, and their line names no confirmation. At the operator's terminal the lane asks once
+  (through the same outcome handler as every prompt: a failed read is 102 and no answer, an agent session is never asked) what is not
+  judged and whether to run the command on the one-shot route. The question writes nothing and hands the command to today's gate as
+  written, so it is asked whether or not the command is a dry run. Yes ends the lane at once (nothing is projected, read, recorded or
+  published) and today's gate runs the command exactly as with the switch off, its own receipts included, after the line `[lane:
+  one-shot, …] — the closure is not judged on this route` (for `dedupe` and `prune`, the older differential path, which judges them
+  where it can, refuses the rest and has no override of its own). A confirmable refusal's final line says the operator can confirm at
+  their terminal. There is no standing per-project decision yet (ticket 1690). A graph the lane cannot bind has no override yet.
 
   **Standing acceptances.** The decision takes the operator's standing acceptances as a document of its own, read by safe's
   own reader (`safe audit lane-acceptances`, which calls the functions today's install gate calls and has no store, format or
@@ -474,8 +500,8 @@ pass and warnings under `environment.release_follow`.
   is taken after every configuration probe (effective, parity, frozen, platform selection) has refused
   nothing. **An npm without the capabilities the lane needs refuses**: what selects a tool version (a
   lockfile of the version manager, a profile, the environment) cannot be established from the project, so
-  the lane reads none of it; the refusal says the operator can put the project on the one-shot lane (a
-  standing per-project decision, part of the operator-overrides work). Capability metadata that is
+  the lane reads none of it; the refusal says the operator can confirm the one-shot route for that command
+  (see **The one-shot route, by the operator** below). Capability metadata that is
   malformed (a version that is not a semantic version, definitions that are not a map of options) is a
   failed probe: a refusal. When the project's `.npmrc` was not admitted no npm of the lane reads that project: the decision
   is taken at once and today's gate applies its own checks. The command then goes to today's gate exactly

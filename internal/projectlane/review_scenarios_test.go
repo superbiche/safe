@@ -598,3 +598,24 @@ func TestReview2Point5TheLockfilesNpmWritesAreAccepted(t *testing.T) {
 		}
 	}
 }
+
+// An entry that does not decode does not hide an unsafe key: the admission reports EVERY finding, the unreadable entry and the key
+// outside the tree both, so a router that gives an unsafe result precedence sees it.
+func TestAdmissionReportsAnUnsafeKeyBesideAnUndecodableEntry(t *testing.T) {
+	raw := []byte(`{"lockfileVersion":3,"packages":{"":{"name":"x"},"node_modules/a":{"version":[1]},"../outside/pkg":{"version":"1.0.0"}}}`)
+	got := map[string]bool{}
+	for _, finding := range AdmitLockfileFindings(raw) {
+		got[finding.Reason] = true
+	}
+	if !got[ReasonLockfileUnreadable] || !got[ReasonLockfilePathsOutside] {
+		t.Fatalf("findings = %v", got)
+	}
+	// control: an undecodable entry alone is only unreadable
+	only := map[string]bool{}
+	for _, finding := range AdmitLockfileFindings([]byte(`{"lockfileVersion":3,"packages":{"node_modules/a":{"version":[1]}}}`)) {
+		only[finding.Reason] = true
+	}
+	if !only[ReasonLockfileUnreadable] || only[ReasonLockfilePathsOutside] {
+		t.Fatalf("control = %v", only)
+	}
+}

@@ -2,29 +2,20 @@
 
 ## Unreleased
 
-- Project lane (still behind `install.project_lane`): the operator's terminal. At the operator's terminal only (today's
-  predicate: a terminal on stdin and no recognized agent marker; an agent session is never prompted and ends as it does
-  unattended, and a dry run is never prompted), each class the decision leaves at stake and the lane goes on with is resolved on
-  its own, in the decision's order, with today's own prompts: a typed override per artifact for malice (never recorded) and for
-  a blocking advisory (recorded as today's gate records it; `record name@version` also records the advisory override, never
-  for a block that is also malice, over every byte the artifact carries), ONE prompt for all adverse advisories with `[y]`,
-  `[a]`, `[N]`, today's adverse override for a wait, today's rate-limit, consent and pending prompts for Socket on a named
-  root, and the deliberate confirmation for missing evidence (an advisory reading, including one that answers something
-  unreadable, a publish time, a Socket outage: this command only, recording nothing, never `[a]`; the lockfile is then not
-  recorded as judged). A terminal read that fails authorises nothing (102 before any write; the line says what the unanswered
-  prompt left and what stands). Every class at stake is asked within one command (an answer clears its own class only), and
-  after every reading that changes the evidence the lane decides again, validates and revokes before it asks again; a decline
-  ends with the exit of the class still unresolved. An acceptance is recorded when it is given, by today's writers
-  (`record-installed` and `safe-run host-allow`, the ones beside the dispatcher, on the operator's root: the `[a]` writer runs
-  the lane-verified core and no seed directory), so the next run passes unprompted. A named root whose outcome the operator
-  confirmed is recorded after a verified publication through `record-installed` under the same eligibility as an ordinary
-  record, over the root and the bytes it carries (an inherited advisory, a bundled member, a followed authority and a root
-  not introduced exclude it) and is exportable. A cancellation at a prompt, or during the `[a]` reconfirmation, ends the
-  prompt and its writer and frees the project lock. The evidence window starts before the first evidence read and is
-  enforced before the baseline is recorded and again before the binder starts. A routing refusal, an unreadable baseline and
-  a graph the lane cannot bind have no override at the terminal yet (they end as they do unattended; the one-shot
-  confirmation is ticket 1686). No change to the agent contract: no exit code or agent-visible wording changes; the install
-  gate's own prompt helpers return 2 for a failed terminal read (every caller treats any non-zero as no).
+- Project lane (still behind `install.project_lane`): the operator sends ONE command to the one-shot route. Every refusal of the
+  lane records itself and returns, and the final line is printed once at the lane's top level, after the lock and scratch are freed. A
+  refusal is confirmable only when its site gives it an explicit kind from a closed list (a command form, a project shape, an npm
+  capability, a baseline from history, an ordinary npm setting) and it was raised before the first evidence reading; an input npm or Node
+  would load at start-up, a storage destination, a link or special file where a regular one is needed, a live lockfile that is unsafe or
+  not completely decoded, the lane's own safety and the reused guards never are. At the operator's terminal the lane asks once (a failed
+  read is 102 and no answer; an agent session is never asked; asked whether or not the command is a dry run, since it writes nothing);
+  yes ends the lane at once and today's gate runs the command exactly as with the switch off. `dedupe` and `prune` go to the older
+  differential path, which refuses what it cannot judge and has no override of its own. A hand-over returns through the same non-zero
+  path as a refusal. The core's lockfile admission reports every finding by code (an undecodable entry no longer hides an unsafe key).
+  Agent contract: the agent rule and exit codes 100 and 102 describe the one-command confirmation, conditional on an eligible refusal and
+  on `install.project_lane` being on. The standing per-project decision is ticket 1690 (not in this release); a graph the lane cannot
+  bind has no override yet. The structural lint reads shell commands, rejects a refusal in a pipeline, substitution or subshell, and
+  keeps its known mutations as fixtures.
 
 - Project lane (still behind `install.project_lane`): standing acceptances and install records, **no terminal prompt**. The
   decision takes the operator's standing acceptances (a local exact approval or pin, a followed grant, a followed install

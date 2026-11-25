@@ -460,6 +460,88 @@ case_npm_option_snapshot_is_consistent_and_reads_like_nopt() {
   fi
 }
 
+# The project lane's refusals are terminal and its one question has one place (ticket 1686): tests/contract/lane_lint.py reads shell
+# COMMANDS and where they sit (quoted text blanked, continuations joined, the function tracked), not substrings of a line.
+case_lane_structure_lint_is_clean() {
+  local found
+  if found="$(python3 -I "${ROOT}/tests/contract/lane_lint.py" "${ROOT}/lib/gate-lib.sh")"; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (${found//$'\n'/; })"
+  fi
+}
+
+# The mutations that slipped through the lints of earlier rounds are kept as fixtures the lint must reject: a diagnostic that contains
+# the word `return`, a second question whose wording is on the next shell line, the hand-over status raised inside the runner or by a
+# call of its helper, a second call of the question outside conclude, a plain removed return, a `return` that sits in a subshell
+# while its owner goes on, a refusal in a pipeline, and a refusal that passes a kind outside the closed list. Also the state a
+# confirmation rests on (the mark, the phase, the start-up-input flag) written anywhere but by its owner, a question asked through
+# the outcome handler from a function that may not ask, a prompt called outside its loop, and a reserved status as a literal.
+case_lane_structure_lint_rejects_the_known_mutations() {
+  local dir="${TEST_ROOT}/lane-lint" bad="" name
+  mkdir -p "${dir}"
+  python3 -I - "${ROOT}/lib/gate-lib.sh" "${dir}" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+out = sys.argv[2]
+def write(name, text):
+    open(f"{out}/{name}.sh", "w", encoding="utf-8").write(text)
+def find(pattern):
+    m = re.search(pattern, src)
+    assert m, pattern
+    return m
+m = find(r'(safe_gate_project_lane_refuse 100 "\$\{verb\}" "admission returned no usable document[^\n]*\n)\s*return \$\?\n')
+write("diagnostic-with-the-word-return", src[:m.start()] + m.group(1) + src[m.end():])
+m = find(r'(safe_gate_project_lane_cleanup\(\) \{\n)')
+write("second-question-on-the-next-line", src[:m.end()] + '  safe_gate_confirm_infra x "a" "b" \\\n    "run this command on the one-shot route? [y/N] "\n' + src[m.end():])
+m = find(r'(safe_gate_project_lane_run\(\) \{\n)')
+write("hand-over-in-the-runner", src[:m.end()] + "  SAFE_GATE_LANE_PASS=1\n" + src[m.end():])
+c = find(r'(safe_gate_project_lane_cleanup\(\) \{\n)')
+write("hand-over-helper-called-outside-its-owners", src[:c.end()] + "  safe_gate_project_lane_hand_over_silent\n  return $?\n" + src[c.end():])
+write("question-outside-conclude", src[:m.end()] + "  safe_gate_project_lane_one_shot_question a b\n" + src[m.end():])
+m = find(r'(safe_gate_project_lane_refuse 100 "\$\{verb\}" "the project directory cannot be read"[^\n]*\n)\s*return \$\?\n')
+write("plain-return-removed", src[:m.start()] + m.group(1) + src[m.end():])
+write("return-in-a-subshell", src[:m.start()] + "    ( " + m.group(1).lstrip() .rstrip("\n") + "; return $? )\n" + src[m.end():])
+write("refusal-in-a-pipeline", src[:m.start()] + m.group(1).rstrip("\n").replace("safe_gate_project_lane_refuse 100", "safe_gate_project_lane_refuse 100", 1) + " | cat\n    return $?\n" + src[m.end():])
+m = find(r'(safe_gate_project_lane_unsupported_kind command_form "\$\{verb\}" "an option before the verb")')
+write("a-kind-outside-the-closed-list", src[:m.start()] + m.group(1).replace("command_form", "startup_input") + src[m.end():])
+# the state a confirmation rests on, its askers and the reserved statuses (R6, R7, R8)
+n = find(r'(safe_gate_project_lane_private_names\(\) \{\n)')
+def inside(name, line):
+    write(name, src[:n.end()] + line + src[n.end():])
+inside("mark-raised-outside-its-owner", "  SAFE_GATE_LANE_REFUSAL_MARK=1\n")
+inside("mark-from-a-variable", "  SAFE_GATE_LANE_REFUSAL_MARK=${one}\n")
+inside("mark-by-arithmetic", "  (( SAFE_GATE_LANE_REFUSAL_MARK = 1 ))\n")
+inside("start-up-flag-cleared", "  SAFE_GATE_LANE_CONFIG_NEVER=0\n")
+inside("start-up-flag-unset", "  unset SAFE_GATE_LANE_CONFIG_NEVER\n")
+inside("phase-declared-local", "  local SAFE_GATE_LANE_PHASE=routing\n")
+inside("question-through-the-outcome-handler", '  safe_gate_project_lane_query "declined" safe_gate_confirm_infra "this command" "a" "b" "run it? [y/N] " && return 253\n')
+inside("reserved-status-as-a-literal", "  exit 252\n")
+j = find(r'(  SAFE_GATE_LANE_PHASE=judging\n)')
+write("phase-set-back-to-routing", src[:j.end()] + "  SAFE_GATE_LANE_PHASE=routing\n" + src[j.end():])
+k = find(r'(safe_gate_project_lane_conclude\(\) \{\n)')
+write("mark-raised-where-the-question-is-asked", src[:k.end()] + "  SAFE_GATE_LANE_REFUSAL_MARK=1\n" + src[k.end():])
+r = find(r'(safe_gate_project_lane_run\(\) \{\n)')
+write("prompt-called-outside-its-loop", src[:r.end()] + "  safe_gate_project_lane_prompt_gap || return $?\n" + src[r.end():])
+PY
+  for name in diagnostic-with-the-word-return second-question-on-the-next-line hand-over-in-the-runner hand-over-helper-called-outside-its-owners \
+      question-outside-conclude plain-return-removed return-in-a-subshell refusal-in-a-pipeline a-kind-outside-the-closed-list \
+      mark-raised-outside-its-owner mark-from-a-variable mark-by-arithmetic start-up-flag-cleared start-up-flag-unset \
+      phase-declared-local question-through-the-outcome-handler reserved-status-as-a-literal phase-set-back-to-routing \
+      mark-raised-where-the-question-is-asked prompt-called-outside-its-loop; do
+    [[ -f "${dir}/${name}.sh" ]] || { bad="${bad} ${name}(missing)"; continue; }
+    if python3 -I "${ROOT}/tests/contract/lane_lint.py" "${dir}/${name}.sh" >/dev/null; then
+      bad="${bad} ${name}"
+    fi
+  done
+  if [[ -z "${bad}" ]]; then
+    pass "$FUNCNAME"
+  else
+    fail "$FUNCNAME (the lint accepted:${bad})"
+  fi
+}
+
+
 case_contract_is_valid_json
 case_contract_has_every_required_key
 case_every_exit_code_tells_an_agent_what_to_do
@@ -481,6 +563,8 @@ case_npm_literal_sites_consult_the_classifier
 case_infra_cause_sets_match_between_gates
 case_operator_terminal_helpers_match_between_gates
 case_npm_option_snapshot_is_consistent_and_reads_like_nopt
+case_lane_structure_lint_is_clean
+case_lane_structure_lint_rejects_the_known_mutations
 
 printf '\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
