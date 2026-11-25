@@ -17,6 +17,13 @@ Rules
   R4  a refusal that carries a kind passes a kind of the closed list (safe_gate_project_lane_kinds), as a bare word.
   R5  a refusal or hand-over is never inside a pipeline, a command substitution or a subshell: what it records would be lost
       with the child shell while its owner went on (a `return` in the child does not end the owner).
+  R6  the state a confirmation rests on has owners, in the whole file: the mark of a confirmable refusal is raised only by
+      safe_gate_project_lane_refuse_kind, the phase is `routing` only at the lane's entry and `judging` only in the runner, the
+      start-up-input flag is cleared only at the entry and raised only where a configuration document is read; none of these
+      names is written, unset or declared anywhere else.
+  R7  a question has askers: the lane's outcome handler (query, ask, answer) is called only from the prompt functions and the
+      one-shot question, and the prompt functions only from the loop that owns them.
+  R8  the reserved statuses are never written as literals: they are raised through their helpers only.
 """
 import re
 import sys
@@ -32,6 +39,27 @@ EXEMPT_BODIES = set(REFUSALS) | {"safe_gate_project_lane_decide"}  # the wrapper
 ASKERS = {"safe_gate_project_lane_one_shot_question", "safe_gate_project_lane_prompt_gap", "safe_gate_project_lane_prompt_socket"}
 PASS_OWNERS = {"safe_gate_project_lane_hand_over_silent", "safe_gate_project_lane_unresolved_silent", "safe_gate_project_lane_in_subshell"}
 QUESTION_WORDING = "run this command on the one-shot route"
+# R6: name -> {value pattern -> the functions that may assign it}; any other mention of the bare name is a violation
+STATE = {
+    "SAFE_GATE_LANE_REFUSAL_MARK": {"1": {"safe_gate_project_lane_refuse_kind"},
+                                    "0": {"safe_gate_project_lane_refuse", "safe_gate_project_lane_conclude",
+                                          "safe_gate_project_lane_in_subshell"}},
+    "SAFE_GATE_LANE_REFUSAL_KIND": {"*": {"safe_gate_project_lane_refuse", "safe_gate_project_lane_refuse_kind"}},
+    "SAFE_GATE_LANE_PHASE": {"routing": {"safe_gate_project_lane_in_subshell"}, "judging": {"safe_gate_project_lane_run"}},
+    "SAFE_GATE_LANE_CONFIG_NEVER": {"0": {"safe_gate_project_lane_in_subshell"}, "1": {"safe_gate_project_lane_config_seen"}},
+}
+# R7
+HANDLER = ("safe_gate_project_lane_query", "safe_gate_project_lane_ask", "safe_gate_project_lane_answer")
+HANDLER_CALLERS = {"safe_gate_project_lane_query", "safe_gate_project_lane_one_shot_question", "safe_gate_project_lane_grant",
+                   "safe_gate_project_lane_prompt_malice", "safe_gate_project_lane_prompt_blocking",
+                   "safe_gate_project_lane_prompt_adverse", "safe_gate_project_lane_prompt_socket",
+                   "safe_gate_project_lane_prompt_gap"}
+PROMPTS = ("safe_gate_project_lane_prompt_malice", "safe_gate_project_lane_prompt_blocking",
+           "safe_gate_project_lane_prompt_adverse", "safe_gate_project_lane_prompt_socket", "safe_gate_project_lane_prompt_gap")
+PROMPT_CALLERS = {"safe_gate_project_lane_prompts"}
+GRANT_CALLERS = {"safe_gate_project_lane_prompt_blocking", "safe_gate_project_lane_prompt_adverse",
+                 "safe_gate_project_lane_prompt_socket"}
+PROMPTS_LOOP_CALLERS = {"safe_gate_project_lane_run"}
 
 FN = re.compile(r"^(safe_gate_[A-Za-z0-9_]+)\(\)\s*\{")
 
@@ -170,6 +198,39 @@ def main(path):
             problems.append(f"{number}:{fn}:R2: the one-shot question's wording is outside its entry point")
         if re.search(r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b)\s*SAFE_GATE_LANE_PASS=", bare) and fn not in PASS_OWNERS:
             problems.append(f"{number}:{fn}:R3: the hand-over status is raised outside its owners")
+    # R6, over the whole file: who writes the state a confirmation rests on
+    for number, fn, text in logical:
+        bare = strip(text)
+        if bare.lstrip().startswith("#"):
+            continue
+        for name, owners in STATE.items():
+            for hit in re.finditer(r"(?<![A-Za-z0-9_{$])" + name + r"(?![A-Za-z0-9_])", bare):
+                assignment = re.match(r"=([A-Za-z0-9_]*)", bare[hit.end():])
+                if not assignment:
+                    problems.append(f"{number}:{fn}:R6: {name} is written, unset or declared outside a plain assignment")
+                    continue
+                value = assignment.group(1)
+                allowed = owners.get(value) if value in owners else owners.get("*")
+                if allowed is None:
+                    problems.append(f"{number}:{fn}:R6: {name} is given a value its owners never give ({value!r})")
+                elif fn not in allowed:
+                    problems.append(f"{number}:{fn}:R6: {name} is assigned {value!r} outside its owners")
+    # R7 and R8, in the lane
+    for number, fn, text, bare in lane:
+        if bare.lstrip().startswith("#") or FN.match(text):
+            continue
+        for name in HANDLER:
+            if command_at(bare, name) and fn not in HANDLER_CALLERS:
+                problems.append(f"{number}:{fn}:R7: the outcome handler ({name}) is called by a function that may not ask")
+        for name in PROMPTS:
+            if command_at(bare, name) and fn not in PROMPT_CALLERS:
+                problems.append(f"{number}:{fn}:R7: {name} is called outside the loop that owns the prompts")
+        if command_at(bare, "safe_gate_project_lane_grant") and fn not in GRANT_CALLERS:
+            problems.append(f"{number}:{fn}:R7: the host-grant prompt is called outside the prompts that own it")
+        if command_at(bare, "safe_gate_project_lane_prompts") and fn not in PROMPTS_LOOP_CALLERS:
+            problems.append(f"{number}:{fn}:R7: the prompt loop is called outside the runner")
+        if re.search(r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b)\s*(?:return|exit)\s+25[23](?![0-9])", bare):
+            problems.append(f"{number}:{fn}:R8: a reserved status is written as a literal")
     names = {fn for _, fn, _ in logical}
     if "safe_gate_project_lane_one_shot_question" not in names or "safe_gate_project_lane_conclude" not in names:
         problems.append("0::R2: the lane has no top-level question")
