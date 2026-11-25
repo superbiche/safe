@@ -536,6 +536,13 @@ if [[ "${tool}" == "npm" && "${1:-}" == "ci" && ${is_projection} -eq 0 && "${NPM
       [[ -n "${NPM_CI_WRONG_NAME:-}" && "${NPM_CI_WRONG_NAME%%=*}" == "${key}" ]] && name="${NPM_CI_WRONG_NAME#*=}"
       mkdir -p "${key}"
       printf '{"name":"%s","version":"%s"}\n' "${name}" "${shown_version}" > "${key}/package.json"
+      # what a package's own tree holds beyond its identity (the scripts report reads it): members of package.json by install path, files by install path
+      if [[ -n "${NPM_CI_PKG_EXTRA:-}" ]] && jq -e --arg k "${key}" 'has($k)' <<<"${NPM_CI_PKG_EXTRA}" >/dev/null 2>&1; then
+        jq -c --argjson e "$(jq -c --arg k "${key}" '.[$k]' <<<"${NPM_CI_PKG_EXTRA}")" '. + $e' "${key}/package.json" > "${key}/package.json.new" && mv "${key}/package.json.new" "${key}/package.json"
+      fi
+      for file_spec in ${NPM_CI_PKG_FILES:-}; do
+        [[ "${file_spec%%:*}" != "${key}" ]] || : > "${key}/${file_spec#*:}"
+      done
     done < <(jq -r '.packages | to_entries[] | select(.key | test("node_modules/")) | select(.value.link != true) | [.key, .value.version, (.value.name // "-"), ((.value.dev // false) | tostring)] | @tsv' package-lock.json)
   fi
   rmdir node_modules 2>/dev/null
@@ -1174,6 +1181,8 @@ run_zsh() {
     SAFE_AUDIT_SCAN_CRITICAL_PROJECT="${SAFE_AUDIT_SCAN_CRITICAL_PROJECT:-}" \
     NPM_LOCK_MUTATION_JSON="${NPM_LOCK_MUTATION_JSON:-}" \
     NPM_CI_MATERIALISE="${NPM_CI_MATERIALISE:-}" \
+    NPM_CI_PKG_EXTRA="${NPM_CI_PKG_EXTRA:-}" \
+    NPM_CI_PKG_FILES="${NPM_CI_PKG_FILES:-}" \
     NPM_CI_SKIP="${NPM_CI_SKIP:-}" \
     NPM_CI_WRONG_VERSION="${NPM_CI_WRONG_VERSION:-}" \
     NPM_CI_WRONG_NAME="${NPM_CI_WRONG_NAME:-}" \
@@ -8081,6 +8090,10 @@ sub="${1:-}"
 tamper="${SAFE_CORE_TAMPER:-}"
 [[ -z "${SAFE_CORE_FAKE_VERSION:-}" || "${sub}" != "--version" ]] || { printf '%s\n' "${SAFE_CORE_FAKE_VERSION}"; exit 0; }
 [[ -z "${SAFE_CORE_SLEEP_SUB:-}" || "${sub}" != "${SAFE_CORE_SLEEP_SUB}" ]] || sleep "${SAFE_CORE_SLEEP:-0}"
+if [[ "${sub}" == "project-scripts" ]]; then
+  [[ -z "${SAFE_INSTALL_COMMAND_LOG:-}" ]] || { printf 'CORE_SCRIPTS_ARGS'; for a in "$@"; do printf '\t%q' "${a}"; done; printf '\n'; } >> "${SAFE_INSTALL_COMMAND_LOG}"
+  [[ "${tamper}" != "scripts-fails" ]] || exit 3
+fi
 if [[ "${sub}" == "project-bind" && -n "${SAFE_INSTALL_COMMAND_LOG:-}" ]]; then
   { printf 'CORE_BIND_ARGS'; for a in "$@"; do printf '\t%q' "${a}"; done; printf '\n'; } >> "${SAFE_INSTALL_COMMAND_LOG}"
 fi
@@ -8316,6 +8329,235 @@ case_project_lane_update_that_fixes_a_critical_passes() {
   pass "$FUNCNAME"
 }
 
+# ---- ticket 1638: the lane runs no lifecycle script and says which ones it did not run --------------------------------------------
+# The report reads the judged lockfile and the published tree (safe-core project-scripts), never npm's messages. The stub's `ci` writes
+# what NPM_CI_PKG_EXTRA (members of a package's package.json, by install path) and NPM_CI_PKG_FILES (files, by install path) ask for.
+SCRIPTS_LINE='install scripts did not run (the lane installs with scripts off)'
+
+scripts_prepare() { # <name> <lock args…>: a project whose manifest has install-time scripts of its own
+  lane_prepare "$@"
+  jq -c '.scripts = {preinstall: "a", postinstall: "b", prepare: "c", test: "t"}' "${WORK_DIR}/package.json" > "${WORK_DIR}/package.json.new" && mv "${WORK_DIR}/package.json.new" "${WORK_DIR}/package.json"
+  lane_commit
+}
+
+case_project_lane_scripts_report_names_what_a_named_install_introduced() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  scripts_prepare "lane-scripts-named" kept@1.0.0
+  local target
+  target="$(lane_lock kept@1.0.0 clean@2.0.0:install)"
+  NPM_LOCK_MUTATION_JSON="${target}" NPM_PROJECTION_MANIFEST_JSON="$(jq -c '.dependencies.clean = "^2.0.0"' "${WORK_DIR}/package.json")" \
+    NPM_CI_PKG_EXTRA='{"node_modules/clean":{"scripts":{"preinstall":"x","postinstall":"y","test":"z"}}}' lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME" || return
+  assert_err_contains_fragment "${SCRIPTS_LINE}: 1 introduced package(s) have them: clean@2.0.0 (preinstall, postinstall)" "$FUNCNAME" || return
+  assert_err_contains_fragment "scripts: to run them: npm rebuild ./node_modules/clean; npm's own script policy applies to that command" "$FUNCNAME" || return
+  # an install that names packages does not run the project's own scripts: none are named
+  assert_err_not_contains_fragment "this project's own install-time scripts" "$FUNCNAME" || return
+  # nothing was run by the lane, and no override is printed
+  assert_err_not_contains_fragment 'ignore-scripts=false' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'dangerously' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_project_lane_scripts_report_names_the_projects_own_scripts_for_a_bare_install_and_ci() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  local verb
+  for verb in 'npm install' 'npm ci'; do
+    scripts_prepare "lane-scripts-root-${verb// /-}" kept@1.0.0
+    : > "${LOG_FILE}"
+    NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0)" lane_run "${verb}"
+    assert_status 0 "$FUNCNAME: ${verb}" || return
+    assert_err_contains_fragment "this project's own install-time scripts did not run either (preinstall, postinstall, prepare); to run them: npm run preinstall; npm run postinstall; npm run prepare; npm's own script policy applies to those commands" "$FUNCNAME: ${verb}" || return
+    assert_err_not_contains_fragment "${SCRIPTS_LINE}" "$FUNCNAME: ${verb}: no dependency has scripts" || return
+  done
+  # a project that defines `install` is told to run it as one command (npm run install fires its preinstall and postinstall)
+  scripts_prepare "lane-scripts-root-install" kept@1.0.0
+  jq -c '.scripts = {install: "i", preinstall: "p", prepublish: "q", preprepare: "r", postprepare: "s"}' "${WORK_DIR}/package.json" > "${WORK_DIR}/package.json.new" && mv "${WORK_DIR}/package.json.new" "${WORK_DIR}/package.json"
+  lane_commit
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0)" lane_run 'npm install'
+  assert_err_contains_fragment "(preinstall, install, prepublish, preprepare, postprepare); to run them: npm run install; npm run prepublish; npm run preprepare; npm run postprepare;" "$FUNCNAME: install defined" || return
+  pass "$FUNCNAME"
+}
+
+case_project_lane_scripts_report_ci_names_every_package_and_a_bundled_member_through_its_host() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-scripts-ci" kept@1.0.0
+  local lock
+  lock="$(lane_lock kept@1.0.0 host@1.0.0:install | jq -c '.packages["node_modules/host/node_modules/member"] = {version: "3.0.0", inBundle: true, hasInstallScript: true, resolved: "https://registry.npmjs.org/member/-/member-3.0.0.tgz", integrity: $i}' --arg i "$(lane_integrity member@3.0.0)")"
+  printf '%s\n' "${lock}" > "${WORK_DIR}/package-lock.json"
+  lane_commit
+  # the tree on disk before `ci` already holds exactly these packages, with its own record: ci builds a whole new tree, so they are all new
+  mkdir -p "${WORK_DIR}/node_modules"
+  jq -c '{name: "lane-test", lockfileVersion: 3, requires: true, packages: (.packages | del(.[""]))}' <<<"${lock}" > "${WORK_DIR}/node_modules/.package-lock.json"
+  NPM_LOCK_MUTATION_JSON="${lock}" NPM_CI_PKG_EXTRA='{"node_modules/host":{"scripts":{"install":"x"}},"node_modules/host/node_modules/member":{"scripts":{"postinstall":"y"}},"node_modules/kept":{"scripts":{"test":"t"}}}' lane_run 'npm ci'
+  assert_status 0 "$FUNCNAME" || return
+  assert_err_contains_fragment "2 introduced package(s) have them: host@1.0.0 (install), member@3.0.0 (postinstall; bundled in host@1.0.0)" "$FUNCNAME" || return
+  # the bundled member is rebuilt through its host's path, once
+  assert_err_contains_fragment "to run them: npm rebuild ./node_modules/host; npm's own script policy" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_project_lane_scripts_report_reads_the_tree_not_the_lockfile_flag() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-scripts-tree" kept@1.0.0
+  local lock
+  # the lockfile declares scripts for `flagged` (the tree has none); it does not for `hidden` (the tree has a postinstall); `gyp` has a binding.gyp
+  lock="$(lane_lock kept@1.0.0 flagged@1.0.0:install hidden@1.0.0 gyp@1.0.0 pre@1.0.0 off@1.0.0)"
+  printf '%s\n' "${lock}" > "${WORK_DIR}/package-lock.json"
+  lane_commit
+  NPM_LOCK_MUTATION_JSON="${lock}" NPM_CI_PKG_FILES='node_modules/gyp:binding.gyp node_modules/pre:binding.gyp node_modules/off:binding.gyp' \
+    NPM_CI_PKG_EXTRA='{"node_modules/hidden":{"scripts":{"postinstall":"y"}},"node_modules/pre":{"scripts":{"preinstall":"p"}},"node_modules/off":{"gypfile":false}}' lane_run 'npm ci'
+  assert_status 0 "$FUNCNAME" || return
+  # on disk: hidden (postinstall, undeclared by its lockfile entry), gyp (npm's implicit native build), pre (its own preinstall: no implicit build)
+  assert_err_contains_fragment "3 introduced package(s) have them: gyp@1.0.0 (native build; its lockfile entry does not declare install scripts), hidden@1.0.0 (postinstall; its lockfile entry does not declare install scripts), pre@1.0.0 (preinstall; its lockfile entry does not declare install scripts)" "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'flagged@' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'off@' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_project_lane_scripts_report_is_read_against_the_previous_tree() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-scripts-previous" kept@1.0.0 same@1.0.0:install moved@1.0.0:install
+  local lock
+  lock="$(lane_lock kept@1.0.0 same@1.0.0:install moved@2.0.0:install fresh@1.0.0:install)"
+  printf '%s\n' "${lock}" > "${WORK_DIR}/package-lock.json"
+  lane_commit
+  # the tree on disk before the command, with its own record: `same` is as it was, `moved` was another version
+  mkdir -p "${WORK_DIR}/node_modules"
+  lane_lock same@1.0.0:install moved@1.0.0:install | jq -c '{name: "lane-test", lockfileVersion: 3, requires: true, packages: (.packages | del(.[""]))}' > "${WORK_DIR}/node_modules/.package-lock.json"
+  NPM_LOCK_MUTATION_JSON="${lock}" NPM_CI_PKG_EXTRA='{"node_modules/same":{"scripts":{"postinstall":"a"}},"node_modules/moved":{"scripts":{"postinstall":"b"}},"node_modules/fresh":{"scripts":{"postinstall":"c"}}}' lane_run 'npm update'
+  assert_status 0 "$FUNCNAME" || return
+  assert_err_contains_fragment "2 introduced package(s) have them: fresh@1.0.0 (postinstall), moved@2.0.0 (postinstall)" "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'same@' "$FUNCNAME" || return
+  # an update never names the project's own scripts
+  assert_err_not_contains_fragment "this project's own install-time scripts" "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_project_lane_scripts_report_says_nothing_when_nothing_has_scripts() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-scripts-none" kept@1.0.0
+  # the control: a package with an install-time script in the same project says so (so that this case can fail)
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0)" NPM_CI_PKG_EXTRA='{"node_modules/kept":{"scripts":{"postinstall":"p"}}}' lane_run 'npm ci'
+  assert_err_contains_fragment 'kept@1.0.0 (postinstall' "$FUNCNAME: control" || return
+  lane_reset_project
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0)" NPM_CI_PKG_EXTRA='{"node_modules/kept":{"scripts":{"test":"t","prepare":"p"}}}' lane_run 'npm ci'
+  assert_status 0 "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'scripts' "$FUNCNAME" || return
+  # a named install in a project with its own scripts says nothing either
+  scripts_prepare "lane-scripts-none-named" kept@1.0.0
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0 clean@2.0.0)" NPM_PROJECTION_MANIFEST_JSON="$(jq -c '.dependencies.clean = "^2.0.0"' "${WORK_DIR}/package.json")" lane_run 'npm install clean@2.0.0'
+  assert_status 0 "$FUNCNAME: named" || return
+  assert_err_not_contains_fragment 'scripts' "$FUNCNAME: named" || return
+  pass "$FUNCNAME"
+}
+
+case_project_lane_scripts_report_is_bounded() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-scripts-bound" kept@1.0.0
+  local -a names=() extra=()
+  local i lock extra_json
+  for i in $(seq -w 1 30); do names+=("p${i}@1.0.0:install"); done
+  lock="$(lane_lock kept@1.0.0 "${names[@]}")"
+  printf '%s\n' "${lock}" > "${WORK_DIR}/package-lock.json"
+  lane_commit
+  extra_json="$(for i in $(seq -w 1 30); do printf '{"node_modules/p%s":{"scripts":{"install":"x"}}}\n' "${i}"; done | jq -sc 'add')"
+  NPM_LOCK_MUTATION_JSON="${lock}" NPM_CI_PKG_EXTRA="${extra_json}" lane_run 'npm ci'
+  assert_status 0 "$FUNCNAME" || return
+  assert_err_contains_fragment '30 introduced package(s) have them: p01@1.0.0 (install), p02@1.0.0 (install)' "$FUNCNAME" || return
+  assert_err_contains_fragment 'p25@1.0.0 (install), and 5 more not listed' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'p26@' "$FUNCNAME" || return
+  assert_err_contains_fragment '(the listed packages; npm rebuild alone covers every package)' "$FUNCNAME" || return
+  [[ "$(grep -o '\./node_modules/p' "${ERR_FILE}" | wc -l)" == 25 ]] || { fail "$FUNCNAME: the command names $(grep -o '\./node_modules/p' "${ERR_FILE}" | wc -l) paths, not the 25 listed"; return; }
+  pass "$FUNCNAME"
+}
+
+case_project_lane_scripts_report_for_a_dry_run_and_a_lockfile_only_command_comes_from_the_lockfile() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-scripts-dry" kept@1.0.0
+  local target flag
+  target="$(lane_lock kept@1.0.0 clean@2.0.0:install)"
+  for flag in --dry-run --package-lock-only; do
+    lane_reset_project
+    NPM_LOCK_MUTATION_JSON="${target}" NPM_PROJECTION_MANIFEST_JSON="${LANE_CLEAN_ADD_MANIFEST}" lane_run "npm install clean@2.0.0 ${flag}"
+    assert_status 0 "$FUNCNAME: ${flag}" || return
+    assert_err_contains_fragment 'scripts: no tree was published, so nothing was read from disk; the lockfile declares install scripts for 1 package(s) this command would introduce: clean@2.0.0' "$FUNCNAME: ${flag}" || return
+    assert_err_not_contains_fragment 'npm rebuild' "$FUNCNAME: ${flag}" || return
+    assert_err_not_contains_fragment "own install-time scripts" "$FUNCNAME: ${flag}" || return
+  done
+  pass "$FUNCNAME"
+}
+
+case_project_lane_scripts_report_that_cannot_be_read_is_said_and_the_command_still_succeeds() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-scripts-unread" kept@1.0.0
+  SAFE_CORE_TAMPER=scripts-fails NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0)" lane_run 'npm ci'
+  assert_status 0 "$FUNCNAME" || return
+  assert_err_contains_fragment 'install scripts did not run (the lane installs with scripts off); the report of which packages have them could not be read (safe-core project-scripts exit 3)' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# What the report prints is cleaned like every other name the lane prints: a core whose answer carries control characters, a
+# terminal escape or a credential in a name or a version reaches the operator as plain text.
+case_project_lane_scripts_report_cleans_what_it_prints() {
+  prepare_case "lane-scripts-hostile"
+  local sdir="${CASE_DIR}/safedir" got
+  mkdir -p "${sdir}"
+  cat > "${sdir}/safe-core" <<'CORE'
+#!/bin/sh
+printf '%s\n' '{"schema_version":1,"source":"tree","previous":"none","total":1,"packages":[{"path":"node_modules/evil","name":"evil\u001b[31m\u0007","version":"1.0.0\n\u009b31mx","events":["postinstall"],"native":false,"declared":true,"rebuild_path":"node_modules/evil\u001b]0;t\u0007"}],"root":null}'
+CORE
+  chmod +x "${sdir}/safe-core"
+  got="$(env GATE_LIB="${ROOT_DIR}/lib/gate-lib.sh" SDIR="${sdir}" PATH=/usr/bin:/bin bash -c 'source "${GATE_LIB}"; safe_core="${SDIR}/safe-core"; project_dir=/p; proj=/q; safe_gate_project_lane_scripts_report ci tree /dev/null "" 0' 2>&1 | cat -v)"
+  [[ "${got}" != *'^['* && "${got}" != *'^G'* && "${got}" != *'M-'* ]] || { printf '%s\n' "${got}" >&2; fail "$FUNCNAME: a control character reached the terminal"; return; }
+  [[ "${got}" == *'evil[31m'* ]] || { printf '%s\n' "${got}" >&2; fail "$FUNCNAME: the name is not printed"; return; }
+  pass "$FUNCNAME"
+}
+
+case_project_lane_scripts_report_is_not_printed_when_nothing_was_published() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-scripts-unpublished" kept@1.0.0
+  # the control: the same project, published, names the package
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0)" NPM_CI_PKG_EXTRA='{"node_modules/kept":{"scripts":{"postinstall":"x"}}}' lane_run 'npm ci'
+  assert_err_contains_fragment 'kept@1.0.0 (postinstall' "$FUNCNAME: control" || return
+  lane_reset_project
+  # the tree already in the project has a package with a script: a section printed after a failed publication would name it
+  mkdir -p "${WORK_DIR}/node_modules/kept"
+  printf '{"name":"kept","version":"1.0.0","scripts":{"postinstall":"x"}}\n' > "${WORK_DIR}/node_modules/kept/package.json"
+  NPM_CI_STATUS=1 NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0)" NPM_CI_PKG_EXTRA='{"node_modules/kept":{"scripts":{"postinstall":"x"}}}' lane_run 'npm ci'
+  [[ "${STATUS}" != 0 ]] || { fail "$FUNCNAME: the failing install succeeded (the case proves nothing)"; return; }
+  assert_err_not_contains_fragment 'install scripts did not run' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+case_project_lane_scripts_report_is_absent_with_the_switch_off() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  lane_prepare "lane-scripts-off" kept@1.0.0
+  # the control: with the switch on the same project and tree DO produce the section (so that the case can fail)
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0)" NPM_CI_PKG_EXTRA='{"node_modules/kept":{"scripts":{"postinstall":"x"}}}' lane_run 'npm ci'
+  assert_err_contains_fragment 'install scripts did not run' "$FUNCNAME: the switch on" || return
+  lane_reset_project
+  printf '{"install":{"project_lane":false}}\n' > "${HOME_DIR}/.config/safe/run/config.json"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0)" NPM_CI_PKG_EXTRA='{"node_modules/kept":{"scripts":{"postinstall":"x"}}}' lane_run 'npm ci'
+  assert_err_not_contains_fragment 'install scripts did not run' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'project lane' "$FUNCNAME" || return
+  pass "$FUNCNAME"
+}
+
+# The lane itself runs nothing: its frozen install carries --ignore-scripts, and the reader is a program of safe's own (the core), not npm.
+case_project_lane_scripts_are_off_in_the_frozen_install_and_no_script_runner_is_started() {
+  skip_lockdiff_case "$FUNCNAME" || return
+  scripts_prepare "lane-scripts-frozen" kept@1.0.0
+  : > "${LOG_FILE}"
+  NPM_LOCK_MUTATION_JSON="$(lane_lock kept@1.0.0)" lane_run 'npm install'
+  assert_status 0 "$FUNCNAME" || return
+  grep -qP '^REAL\tnpm\tci\t--ignore-scripts\t' "${LOG_FILE}" || { fail "$FUNCNAME: the frozen install does not carry --ignore-scripts"; return; }
+  [[ "$(grep -cP '^REAL\tnpm\tci\t' "${LOG_FILE}")" == 1 ]] || { fail "$FUNCNAME: the frozen install did not run exactly once"; return; }
+  assert_log_not_contains_fragment $'REAL\tnpm\trebuild' "$FUNCNAME" || return
+  assert_log_not_contains_fragment $'REAL\tnpm\trun' "$FUNCNAME" || return
+  grep -q $'^CORE_SCRIPTS_ARGS\t' "${LOG_FILE}" || { fail "$FUNCNAME: the report was not read by the core"; return; }
+  pass "$FUNCNAME"
+}
+
 case_project_lane_clean_add_in_a_project_with_findings_passes() {
   skip_lockdiff_case "$FUNCNAME" || return
   lane_prepare "lane-clean-add" kept@1.0.0 vuln@1.0.0:install
@@ -8327,8 +8569,9 @@ case_project_lane_clean_add_in_a_project_with_findings_passes() {
     lane_run 'npm install clean@2.0.0'
   assert_status 0 "$FUNCNAME" || return
   assert_err_contains_fragment '1 already present (highest: critical)' "$FUNCNAME" || return
-  assert_err_contains_fragment 'install scripts are declared by clean@2.0.0, vuln@1.0.0' "$FUNCNAME" || return
-  assert_err_contains_fragment 'scripts do not run on this lane yet' "$FUNCNAME" || return
+  # the tree this fixture publishes carries no script of any package: nothing is said about scripts, and the old decision-time line is gone
+  assert_err_not_contains_fragment 'install scripts' "$FUNCNAME" || return
+  assert_err_not_contains_fragment 'scripts do not run on this lane yet' "$FUNCNAME" || return
   grep -qP '^PROJECTION\tnpm\t--package-lock-only\t--ignore-scripts\t--no-audit\t--no-fund\t--git=/bin/false\t--allow-git=none\t--cache=\S+\t--logs-dir=\S+\t--logs-max=0\t--replace-registry-host=never\t--update-notifier=false\t--min-release-age=3\t--min-release-age-exclude=clean\t--heading=npm\t--no-color\t--loglevel=error\tinstall\tclean@2.0.0$' "${LOG_FILE}" || { fail "$FUNCNAME: the projection's command line"; return; }
   assert_log_not_contains_fragment $'REAL\tnpm\tinstall' "$FUNCNAME" || return
   [[ "$(cat "${WORK_DIR}/package.json")" == "${LANE_CLEAN_ADD_MANIFEST}" ]] || { fail "$FUNCNAME: manifest is not the judged one"; return; }
@@ -16887,6 +17130,19 @@ main() {
     case_project_lane_switch_off_leaves_the_delegate_environment_alone \
     case_project_lane_update_that_fixes_a_critical_passes \
     case_project_lane_clean_add_in_a_project_with_findings_passes \
+    case_project_lane_scripts_report_names_what_a_named_install_introduced \
+    case_project_lane_scripts_report_names_the_projects_own_scripts_for_a_bare_install_and_ci \
+    case_project_lane_scripts_report_ci_names_every_package_and_a_bundled_member_through_its_host \
+    case_project_lane_scripts_report_reads_the_tree_not_the_lockfile_flag \
+    case_project_lane_scripts_report_is_read_against_the_previous_tree \
+    case_project_lane_scripts_report_says_nothing_when_nothing_has_scripts \
+    case_project_lane_scripts_report_is_bounded \
+    case_project_lane_scripts_report_for_a_dry_run_and_a_lockfile_only_command_comes_from_the_lockfile \
+    case_project_lane_scripts_report_that_cannot_be_read_is_said_and_the_command_still_succeeds \
+    case_project_lane_scripts_report_cleans_what_it_prints \
+    case_project_lane_scripts_report_is_not_printed_when_nothing_was_published \
+    case_project_lane_scripts_report_is_absent_with_the_switch_off \
+    case_project_lane_scripts_are_off_in_the_frozen_install_and_no_script_runner_is_started \
     case_project_lane_introduced_critical_refuses_104_untouched \
     case_project_lane_introduced_high_refuses_100_untouched \
     case_project_lane_below_high_introduction_informs_and_passes \

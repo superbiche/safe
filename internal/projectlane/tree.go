@@ -187,6 +187,8 @@ type lockEntry struct {
 	CPU         json.RawMessage
 	Libc        json.RawMessage
 	Bin         json.RawMessage
+	// HasInstallScript is the member as written (the scripts report reads it, nothing else does)
+	HasInstallScript json.RawMessage
 
 	path         string
 	expectedName string
@@ -263,6 +265,7 @@ func decodeEntry(raw json.RawMessage) (lockEntry, error) {
 		}
 	}
 	entry.OS, entry.CPU, entry.Libc, entry.Bin = members["os"], members["cpu"], members["libc"], members["bin"]
+	entry.HasInstallScript = members["hasInstallScript"]
 	return entry, nil
 }
 
@@ -792,7 +795,7 @@ func (v *verifier) readManifest(dir string) (name, version, problem, detail stri
 // readFileNoFollow reads a regular file of at most limit bytes, refusing a
 // symbolic link at the final component.
 func readFileNoFollow(name string, limit int64) ([]byte, error) {
-	file, err := os.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	file, err := os.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}

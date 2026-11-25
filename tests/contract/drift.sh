@@ -558,6 +558,21 @@ write("a-question-asked-outside-its-owner", src[:c9.end()] + '  safe_gate_projec
 write("two-prefix-questions-on-one-line", src[:a.start()] + '  safe_gate_project_lane_pin_npm_line prefix "${scratch}" "$@" || return 1; safe_gate_project_lane_pin_npm_line prefix "${scratch}" "$@" || return 1\n' + src[a.end():])
 write("pin-lookup-called-outside-the-bounded-route", src[:c9.end()] + '  safe_gate_project_lane_pin_lookup x || return 1\n' + src[c9.end():])
 write("pin-bounded-called-outside-the-route", src[:c9.end()] + '  safe_gate_project_lane_pin_bounded x || return 1\n' + src[c9.end():])
+# R11 (ticket 1638): the lane runs no lifecycle script
+fz = find(r'(safe_gate_project_lane_cleanup\(\) \{\n)')
+# each fixture breaks ONE rule: a script word inside an owner of npm that carries the flag; npm started outside the owners with the flag
+# and no script word; the flag missing inside an owner; the binder given another command
+fo = find(r'(safe_gate_project_lane_frozen_check\(\) \{\n)')
+write("a-rebuild-in-the-lane", src[:fo.end()] + '  safe_gate_lane_npm_in "${frozen}" rebuild --ignore-scripts || return 1\n' + src[fo.end():])
+write("an-npm-started-outside-the-lane-owners", src[:fz.end()] + '  "${SAFE_GATE_LANE_ENV[@]}" "${SAFE_GATE_LANE_NPM[@]}" --ignore-scripts ci || return 1\n' + src[fz.end():])
+write("an-npm-without-the-flag-in-an-owner", src[:fo.end()] + '  safe_gate_lane_npm_in "${frozen}" ci || return 1\n' + src[fo.end():])
+write("scripts-enabled-by-an-option", src[:fo.end()] + '  safe_gate_lane_npm_in "${frozen}" ci --ignore-scripts --dangerously-allow-all-scripts || return 1\n' + src[fo.end():])
+fr = find(r'  frozen_args=\(ci --ignore-scripts ')
+write("frozen-install-without-ignore-scripts", src[:fr.start()] + '  frozen_args=(ci ' + src[fr.end():])
+pj = find(r'    safe_gate_lane_npm_in "\$\{proj\}" --package-lock-only --ignore-scripts ')
+write("projection-without-ignore-scripts", src[:pj.start()] + '    safe_gate_lane_npm_in "${proj}" --package-lock-only ' + src[pj.end():])
+bd = find(r'-- "\$\{SAFE_GATE_LANE_NPM\[@\]\}" "\$\{frozen_args\[@\]\}"\)')
+write("binder-given-something-else", src[:bd.start()] + '-- "${SAFE_GATE_LANE_NPM[@]}" "${proj_args[@]}")' + src[bd.end():])
 write("an-unsupported-refusal-before-the-pin-lookup", src[:blk.start()] + '  safe_gate_project_lane_unsupported 100 "${verb}" "x" "y"\n  return $?\n' + src[blk.start():])
 # R10: a step of the standing route under timeout(1) sits in a process group of its own and outlives the route's one deadline
 def under_timeout(name, plain):
@@ -578,7 +593,9 @@ PY
       root-question-never-asked a-question-asked-outside-its-owner \
       two-prefix-questions-on-one-line an-unsupported-refusal-before-the-pin-lookup \
       pin-lookup-called-outside-the-bounded-route pin-bounded-called-outside-the-route \
-      the-question-under-timeout the-data-question-under-timeout the-verification-under-timeout; do
+      the-question-under-timeout the-data-question-under-timeout the-verification-under-timeout \
+      a-rebuild-in-the-lane an-npm-started-outside-the-lane-owners an-npm-without-the-flag-in-an-owner scripts-enabled-by-an-option \
+      frozen-install-without-ignore-scripts projection-without-ignore-scripts binder-given-something-else; do
     [[ -f "${dir}/${name}.sh" ]] || { bad="${bad} ${name}(missing)"; continue; }
     if python3 -I "${ROOT}/tests/contract/lane_lint.py" "${dir}/${name}.sh" >/dev/null; then
       bad="${bad} ${name}"

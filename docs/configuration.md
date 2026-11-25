@@ -234,6 +234,27 @@ pass and warnings under `environment.release_follow`.
   advisory, 102 missing evidence or a graph safe cannot bind), for the operator
   too: this first pass has no prompt, no install record and no scripts. Any
   command or project it does not cover goes one of three ways (**routing**).
+  **Scripts.** The lane runs no lifecycle script: not a dependency's, not a bundled member's, not the project's own, and no implicit
+  native build (the frozen installation carries `--ignore-scripts`; the lane starts no other npm, never `rebuild`, and never reads
+  `allowScripts` or asks npm about `ignore-scripts`). A separate step that runs them afterwards was tried on npm 11.20.0 and 12.2.1: it
+  runs the same set of dependency scripts as a plain install, but not the project's own, not in npm's order and not with npm's handling
+  of a failure, so it cannot be shown to run exactly what today's policy runs. On a host that follows the operator's standing policy
+  (`ignore-scripts=true`) today's gate runs none either. After a verified publication the lane says which scripts did not run, from
+  data only (`safe-core project-scripts`: the judged lockfile and the published tree, never npm's messages, never a question to npm):
+  the packages the command put into the tree (new or changed against the previous tree's own record, `node_modules/.package-lock.json`;
+  every package for `ci`) that declare a `preinstall`, `install` or `postinstall` script or that npm would build natively on its own (a
+  `binding.gyp`, no `install` and no `preinstall` script, `gypfile` not false: measured on both versions), a bundled member with its
+  host; for a bare `install` and for `ci`, the project's own install-time scripts, and not for an install that names packages. The
+  report names the command that runs them (`npm rebuild ./node_modules/<name> …`, a bundled member through its host's path; `npm run
+  install`, `npm run prepare` and the others measured to fire the same events) and says that npm's own script policy applies to it; it
+  prints no option that overrides that policy. **The tree decides where the two sources disagree:** npm's own install trusts the
+  lockfile's `hasInstallScript` over what is on disk (measured: with the flag removed, `npm ci` skipped an install script that `npm
+  rebuild` runs), so a package whose files have scripts its lockfile entry does not declare is listed and marked. `--dry-run` and
+  `--package-lock-only` publish no tree: the report is then the lockfile's `hasInstallScript` alone for what the command would
+  introduce, labelled as such, and the project's own scripts are not named. At most 25 packages are listed, with the count of the
+  rest and `npm rebuild` alone for all; a name is cleaned like every other the lane prints. A command that introduced nothing with
+  scripts says nothing about scripts. Accepted limit: the previous tree's record is the project's own file (a forged one can only make
+  the report smaller, never the lane run anything).
   **How each verb yields its plan.** `install` and `update`: the original arguments resolved in the
   scratch copy, lockfile only. `dedupe` and `prune`: the same, with the verb's own arguments (npm writes
   a changed plan for `dedupe` on a project that needs it, and `prune` drops from the lockfile the entries

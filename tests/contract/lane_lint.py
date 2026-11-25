@@ -17,6 +17,10 @@ Rules
   R4  a refusal that carries a kind passes a kind of the closed list (safe_gate_project_lane_kinds), as a bare word.
   R10 no step of the standing route runs under timeout(1): the command would sit in a process group of its own and outlive the
       route's one deadline, which stops the route's group.
+  R11 the lane runs no lifecycle script (ticket 1638): every npm the lane starts carries --ignore-scripts on its own command line (the
+      projections, the probe, the frozen check and the frozen installation the binder runs), npm is started by the lane's few owners
+      only, no word that runs or enables scripts (rebuild, run-script, install-scripts, --allow-scripts, ...) appears as a command word or
+      an option of the lane, and the binder is given the frozen command and nothing else.
   R9  the standing decision is read in one place: the route is called once, from the runner; the data question and the question to
       npm are called from the route only; the core's store is named by those two functions only.
   R5  a refusal or hand-over is never inside a pipeline, a command substitution or a subshell: what it records would be lost
@@ -78,6 +82,11 @@ PIN_CORE_USERS = {"safe_gate_project_lane_pin_here", "safe_gate_project_lane_pin
 # R10: the functions the route's one deadline bounds; none of them may run a command under timeout(1)
 PIN_BOUNDED = {"safe_gate_project_lane_pin_core", "safe_gate_project_lane_pin_here", "safe_gate_project_lane_pin_npm_line",
                "safe_gate_project_lane_pin_ask_npm", "safe_gate_project_lane_pin_lookup"}
+
+# R11
+NPM_OWNERS = {"safe_gate_lane_npm_in", "safe_gate_project_lane_run", "safe_gate_project_lane_frozen_probe", "safe_gate_project_lane_frozen_check"}
+SCRIPT_WORDS = re.compile(r"(?<![A-Za-z0-9_\-])(rebuild|run-script|install-scripts|approve-scripts|--allow-scripts|--strict-allow-scripts|"
+                          r"--dangerously-allow-all-scripts|--no-ignore-scripts|--ignore-scripts=false)(?![A-Za-z0-9_])")
 
 FN = re.compile(r"^(safe_gate_[A-Za-z0-9_]+)\(\)\s*\{")
 
@@ -252,6 +261,17 @@ def main(path):
                 problems.append(f"{number}:{fn}:R9: {name} is called outside the one place that owns it")
         if fn in PIN_BOUNDED and re.search(r"(?<![A-Za-z0-9_\-.])timeout(?![A-Za-z0-9_])", bare):
             problems.append(f"{number}:{fn}:R10: a step of the standing route runs under timeout, out of reach of the route's deadline")
+        # R11: no lifecycle script in the lane
+        # (the scripts section prints the command that runs them, as text of a jq program that spans lines: it is read by the rules below)
+        if SCRIPT_WORDS.search(bare) and fn != "safe_gate_project_lane_scripts_report":
+            problems.append(f"{number}:{fn}:R11: a word that runs or enables lifecycle scripts is a command word or an option of the lane")
+        launches = command_at(bare, "safe_gate_lane_npm_in") or bare.lstrip().startswith("frozen_args=(")
+        if (launches or "SAFE_GATE_LANE_NPM[@]" in text) and fn not in NPM_OWNERS and fn != "safe_gate_npm_probe_run":
+            problems.append(f"{number}:{fn}:R11: npm is started outside the owners that carry --ignore-scripts")
+        if launches and not FN.match(text) and "--ignore-scripts" not in bare.split():
+            problems.append(f"{number}:{fn}:R11: an npm of the lane is started without --ignore-scripts")
+        if fn == RUNNER and re.search(r'-- "\$\{SAFE_GATE_LANE_NPM\[@\]\}"', text) and "${frozen_args[@]}" not in text:
+            problems.append(f"{number}:{fn}:R11: the binder is given something other than the frozen command")
         if "one-shot-store" in text and fn not in PIN_CORE_USERS:
             problems.append(f"{number}:{fn}:R9: the standing decision's store is named outside the two questions")
         if re.search(r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b)\s*(?:return|exit)\s+25[23](?![0-9])", bare):

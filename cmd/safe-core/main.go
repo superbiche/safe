@@ -70,6 +70,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "git-tree-entry" {
 		return gitTreeEntry(args[1:], stdin, stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "project-scripts" {
+		return projectScripts(args[1:], stdout, stderr)
+	}
 	if len(args) > 0 && args[0] == "project-baseline" {
 		return projectBaseline(args[1:], stdout, stderr)
 	}
@@ -102,6 +105,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, gitTreeEntryUsage)
 		fmt.Fprintln(stderr, exactVersionsUsage)
 		fmt.Fprintln(stderr, projectTreeUsage)
+		fmt.Fprintln(stderr, projectScriptsUsage)
 		return 2
 	}
 
